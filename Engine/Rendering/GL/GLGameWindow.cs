@@ -5,7 +5,8 @@ using OpenTK.Graphics.OpenGL;
 
 namespace BallisticEngine.Rendering;
 
-public class GLGameWindow : GameWindow {
+public class GLGameWindow : GameWindow
+{
     Shader defaultShader;
     Camera m_RenderCamera;
     int width, height;
@@ -13,7 +14,8 @@ public class GLGameWindow : GameWindow {
 
 
     public GLGameWindow(int width, int height) : base(GameWindowSettings.Default,
-        NativeWindowSettings.Default) {
+        NativeWindowSettings.Default)
+    {
         this.width = width;
         this.height = height;
         Title = "Oxygen Engine | Graphic API: OpenGL " + APIVersion;
@@ -22,14 +24,16 @@ public class GLGameWindow : GameWindow {
     }
 
 
-    protected override void OnResize(ResizeEventArgs e) {
+    protected override void OnResize(ResizeEventArgs e)
+    {
         base.OnResize(e);
         GL.Viewport(0, 0, e.Width, e.Height);
         this.width = e.Width;
         this.height = e.Height;
     }
 
-    protected override void OnLoad() {
+    protected override void OnLoad()
+    {
         defaultShader = new();
 
         GL.Enable(EnableCap.DepthTest);
@@ -43,9 +47,11 @@ public class GLGameWindow : GameWindow {
 
     bool fistFrame = true;
 
-    protected override void OnRenderFrame(FrameEventArgs args) {
-        if (fistFrame) {
-            Entity entity = new Entity(true);
+    protected override void OnRenderFrame(FrameEventArgs args)
+    {
+        if (fistFrame)
+        {
+            Entity entity = new Entity("", true);
             entity.AddComponent<MeshRenderer>();
             fistFrame = false;
         }
@@ -68,7 +74,8 @@ public class GLGameWindow : GameWindow {
         GL.UniformMatrix4(viewLocation, true, ref view);
         GL.UniformMatrix4(projectionLocation, true, ref projection);
 
-        foreach (IRenderTarget target in MeshRenderer.RenderTargets) {
+        foreach (IRenderTarget target in MeshRenderer.RenderTargets)
+        {
             DispatchAndRender(target);
         }
 
@@ -76,12 +83,14 @@ public class GLGameWindow : GameWindow {
         Context.SwapBuffers();
     }
 
-    protected override void OnUpdateFrame(FrameEventArgs args) {
+    protected override void OnUpdateFrame(FrameEventArgs args)
+    {
         base.OnUpdateFrame(args);
         m_RenderCamera.Update(args, this);
     }
 
-    void DispatchAndRender(IRenderTarget renderTarget) {
+    void DispatchAndRender(IRenderTarget renderTarget)
+    {
         Material material = renderTarget.Material;
         Mesh mesh = renderTarget.Mesh;
 

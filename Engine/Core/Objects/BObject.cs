@@ -1,11 +1,14 @@
 ﻿namespace BallisticEngine;
 
 // B-Object is the base class for all objects in the engine.
-public abstract class BObject {
+public abstract class BObject
+{
     // InstanceId is a unique identifier for each instance of BObject.
-    readonly Guid InstanceId = Guid.NewGuid();
+    public readonly Guid InstanceId = Guid.NewGuid();
+    public string Name = "BObject";
 
-    public override bool Equals(object? obj) {
+    public override bool Equals(object? obj)
+    {
         if (obj is null)
             return false;
 
@@ -15,5 +18,8 @@ public abstract class BObject {
     protected bool Equals(BObject other) => InstanceId.Equals(other.InstanceId);
 
     public override int GetHashCode() => InstanceId.GetHashCode();
-    protected virtual  void OnInstanceCreated(){}
+
+    protected virtual void OnInstanceCreated()
+    {
+    }
 }

@@ -5,7 +5,8 @@ public class Entity : BObject {
     public List<Behaviour> Behaviours { get; internal set; }
     public bool IsActive { get; private set; }
 
-    public Entity(bool isActive) {
+    public Entity(string name ,bool isActive = true) {
+        Name = name;
         transform = new Transform();
         transform.AttachToEntity(this);
         Behaviours = new List<Behaviour>(capacity: 4);
@@ -40,9 +41,9 @@ public class Entity : BObject {
         }
     }
 
-    internal void Update(float deltaTime) {
+    internal void Update(in float deltaTime) {
         foreach (Behaviour behaviour in Behaviours) {
-            behaviour.Tick(deltaTime);
+            behaviour.Tick(in deltaTime);
         }
     }
 
