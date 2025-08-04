@@ -4,8 +4,8 @@ using StbImageSharp;
 namespace BallisticEngine;
 
 public sealed class Texture2D : BObject, IDisposable {
-    public int ID { get; private set; }
-    private bool _isLoaded;
+    internal int ID { get; private set; }
+    bool _isLoaded;
 
     public void Bind() {
         if (!_isLoaded) {

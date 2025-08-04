@@ -5,6 +5,7 @@ public class Component : BObject {
 
     internal void AttachToEntity(Entity targetEntity) {
         entity = targetEntity;
+        OnInstanceCreated();
     }
 
     protected override void OnInstanceCreated() {

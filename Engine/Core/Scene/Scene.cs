@@ -1,11 +1,7 @@
 ﻿namespace BallisticEngine;
 
-public class Scene
+public class Scene : BObject
 {
-    // TODO: Remove this and make a scene manager that handles multiple scenes.
-    public static Scene Instance { get; private set; }
-    public HDCamera RenderCamera { get; set; }
-
     // Scene is a container for all entities in the game world.
     // It manages the lifecycle of entities and their components.
 
@@ -15,11 +11,6 @@ public class Scene
     public void RegisterEntity(Entity entity)
     {
         entities.Add(entity);
-    }
-
-    public Scene()
-    {
-        Instance = this;
     }
 
     public void RemoveEntity(Entity entity)

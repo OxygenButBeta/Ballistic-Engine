@@ -15,6 +15,7 @@
     <ItemGroup>
       <Folder Include="Core\OpenGL\" />
       <Folder Include="Physic\" />
+      <Folder Include="Shared\" />
     </ItemGroup>
 
 </Project>

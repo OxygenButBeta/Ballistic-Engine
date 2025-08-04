@@ -8,6 +8,7 @@ public interface IInputProvider
     bool IsKeyDown(Keys key);
     bool IsKeyPressed(Keys key);
     bool IsMouseButtonPressed(MouseButton button);
+    bool IsMouseButtonDown(MouseButton button);
     Vector2 ScrollDelta { get; }
-    Vector2 GetMousePosition();
+    Vector2 MousePosition{ get; }
 }

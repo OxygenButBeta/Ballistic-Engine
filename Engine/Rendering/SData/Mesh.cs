@@ -10,7 +10,7 @@ public class Mesh : BObject {
     public readonly Vector2[] UVs;
     public readonly Vector4[] Tangents;
 
-    public Mesh(in Vector3[] vertices, in int[] indices) {
+    public Mesh(in Vector3[] vertices, in int[] indices,Vector3[] normals, Vector2[] uvs) {
         Vertices = vertices;
         Indices = indices;
         UploadToGPU();

@@ -5,7 +5,13 @@ public class Entity : BObject {
     public List<Behaviour> Behaviours { get; internal set; }
     public bool IsActive { get; private set; }
 
-    public Entity(string name ,bool isActive = true) {
+    public static Entity Instantiate(string name = "Entity", bool isActive = true) {
+        Entity entity = new(name, isActive);
+        entity.OnInstanceCreated();
+        return entity;
+    }
+
+    private Entity(string name = "Entity", bool isActive = true) {
         Name = name;
         transform = new Transform();
         transform.AttachToEntity(this);
@@ -14,11 +20,10 @@ public class Entity : BObject {
     }
 
     public void AddComponent<T>() where T : Behaviour, new() {
-        T component = new T();
+        T component = new();
         component.AttachToEntity(this);
         component.OnBegin();
-            component.OnEnabled();
-
+        component.OnEnabled();
         Behaviours.Add(component);
     }
 
@@ -48,6 +53,6 @@ public class Entity : BObject {
     }
 
     protected override void OnInstanceCreated() {
-        Scene.Instance.RegisterEntity(this);
+        SceneManager.GetCurrentScene().RegisterEntity(this);
     }
 }

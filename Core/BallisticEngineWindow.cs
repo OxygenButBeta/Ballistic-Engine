@@ -7,13 +7,11 @@ using OpenTK.Windowing.Desktop;
 
 namespace BallisticEngine;
 
-class BallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWindow
-{
+class BallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWindow {
     public event Action<double> WindowUpdateCallback;
     public event Action<double> WindowRenderCallback;
 
-    public event Action OnWindowShow
-    {
+    public event Action OnWindowShow {
         add => Load += value;
         remove => Load -= value;
     }
@@ -25,38 +23,36 @@ class BallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWindow
     public int Width => width;
     public int Height => height;
 
+    public void SwapFrameBuffers() => Context.SwapBuffers();
+
 
     public BallisticEngineWindow(int width, int height) : base(GameWindowSettings.Default,
-        NativeWindowSettings.Default)
-    {
+        NativeWindowSettings.Default) {
         this.width = width;
         this.height = height;
         Title = "Ballistic Engine | Alpha 0.1.0 |";
 
         EngineTimer = new Time();
-        InputProvider = new Input(KeyboardState, MouseState);
+        InputProvider = new OpenGLInput(KeyboardState, MouseState);
 
         CenterWindow(new Vector2i(width, height));
     }
 
 
-    protected override void OnResize(ResizeEventArgs e)
-    {
+    protected override void OnResize(ResizeEventArgs e) {
         base.OnResize(e);
         GL.Viewport(0, 0, e.Width, e.Height);
         width = e.Width;
         height = e.Height;
     }
 
-    protected override void OnRenderFrame(FrameEventArgs args)
-    {
+    protected override void OnRenderFrame(FrameEventArgs args) {
         WindowRenderCallback!.Invoke(args.Time);
         base.OnRenderFrame(args);
         Context.SwapBuffers();
     }
 
-    protected override void OnUpdateFrame(FrameEventArgs args)
-    {
+    protected override void OnUpdateFrame(FrameEventArgs args) {
         WindowUpdateCallback!.Invoke(args.Time);
         base.OnUpdateFrame(args);
     }

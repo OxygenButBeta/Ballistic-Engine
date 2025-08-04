@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("BallisticEngine")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+620d6e8a5b6d55926384911e09f4792a17d9b3b0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+7fc6b721a75915ed7d8c2167d1e81a8bc3d69ffc")]
 [assembly: System.Reflection.AssemblyProductAttribute("BallisticEngine")]
 [assembly: System.Reflection.AssemblyTitleAttribute("BallisticEngine")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
