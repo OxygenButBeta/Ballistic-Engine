@@ -4,14 +4,12 @@ using OpenTK.Graphics.OpenGL4;
 namespace BallisticEngine;
 
 public class Shader : BObject, IDisposable {
-    public int ID { get; }
+    public int ID { get; private set; }
 
-    public Shader() {
-        var vertexCode = DefaultShader.VertexShader;
-        var fragmentCode = DefaultShader.FragmentShader;
-
-        var vertexShader = CompileShader(vertexCode, ShaderType.VertexShader);
-        var fragmentShader = CompileShader(fragmentCode, ShaderType.FragmentShader);
+    void CompileShader(string vert, string frag) {
+        
+        var vertexShader = CompileShader(vert, ShaderType.VertexShader);
+        var fragmentShader = CompileShader(frag, ShaderType.FragmentShader);
 
         ID = GL.CreateProgram();
         GL.AttachShader(ID, vertexShader);
@@ -26,6 +24,14 @@ public class Shader : BObject, IDisposable {
 
         GL.DeleteShader(vertexShader);
         GL.DeleteShader(fragmentShader);
+    }
+    public Shader() {
+        var vertexCode = DefaultShader.VertexShader;
+        var fragmentCode = DefaultShader.FragmentShader;
+        CompileShader(vertexCode, fragmentCode);
+    }
+    public Shader(string vertexCode, string fragmentCode) {
+        CompileShader(vertexCode, fragmentCode);
     }
 
     int CompileShader(string code, ShaderType type) {
