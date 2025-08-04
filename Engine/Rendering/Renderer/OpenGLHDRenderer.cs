@@ -8,10 +8,11 @@ public class OpenGLHDRenderer : HDRenderer {
 
     public override void Initialize() {
         window = BEngineEntry.Window;
+        return;
         GL.Enable(EnableCap.DepthTest);
-        GL.FrontFace(FrontFaceDirection.Cw);
-        GL.Enable(EnableCap.CullFace);
         GL.CullFace(TriangleFace.Back);
+        GL.Enable(EnableCap.CullFace);
+        GL.FrontFace(FrontFaceDirection.Cw);
     }
 
     public override void Render(IReadOnlyCollection<IRenderTarget> renderTargets, RenderArgs args) {
