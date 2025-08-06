@@ -35,6 +35,6 @@ public class HDCamera : Behaviour, IViewProjectionProvider {
     }
 
     internal void RenderCamera() {
-        config.Renderer.Render(Renderer.RenderTargets, new RenderArgs(viewProjectionProvider: this));
+        config.Renderer.Render(RuntimeSet<IRenderTarget>.ReadOnlyCollection, new RenderArgs(viewProjectionProvider: this));
     }
 }

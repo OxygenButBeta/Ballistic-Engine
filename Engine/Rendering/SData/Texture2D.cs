@@ -12,7 +12,7 @@ public sealed class Texture2D : BObject, IDisposable {
             gpuTexture();
             _isLoaded = true;
         }
-
+        GL.ActiveTexture(TextureUnit.Texture0);
         GL.BindTexture(TextureTarget.Texture2D, ID);
     }
 
@@ -28,7 +28,7 @@ public sealed class Texture2D : BObject, IDisposable {
     private void gpuTexture() {
         ID = GL.GenTexture();
         texture = ImageResult.FromStream(
-            File.OpenRead("Resources\\Default\\Texture.jpg"),
+            File.OpenRead("Resources\\Default\\Texture.png"),
             ColorComponents.RedGreenBlueAlpha);
         GL.ActiveTexture(TextureUnit.Texture0);
         GL.BindTexture(TextureTarget.Texture2D, ID);
@@ -39,7 +39,7 @@ public sealed class Texture2D : BObject, IDisposable {
         GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter,
             (int)TextureMagFilter.Nearest);
 
-       // StbImage.stbi_set_flip_vertically_on_load(1);
+    StbImage.stbi_set_flip_vertically_on_load(1);
         GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, texture.Width, texture.Height,
             0, PixelFormat.Rgba, PixelType.UnsignedByte, texture.Data);
         UnBind();

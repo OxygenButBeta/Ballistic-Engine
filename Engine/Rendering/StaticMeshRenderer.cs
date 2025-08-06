@@ -17,11 +17,11 @@ public class StaticMeshRenderer : Renderer {
     }
 
     protected internal override void OnEnabled() {
-        RenderTargets.Add(this);
+        RuntimeSet<IRenderTarget>.Add(this);
     }
 
     protected internal override void OnDisabled() {
-        RenderTargets.Remove(this);
+        RuntimeSet<IRenderTarget>.Remove(this);
     }
 
 }

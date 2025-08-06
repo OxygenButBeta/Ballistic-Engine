@@ -67,7 +67,7 @@ public class GLGameWindow : GameWindow {
         GL.UniformMatrix4(viewLocation, true, ref view);
         GL.UniformMatrix4(projectionLocation, true, ref projection);
 
-        foreach (IRenderTarget target in StaticMeshRenderer.RenderTargets) {
+        foreach (IRenderTarget target in RuntimeSet<IRenderTarget>.ReadOnlyCollection) {
             DispatchAndRender(target);
         }
 
@@ -88,7 +88,7 @@ public class GLGameWindow : GameWindow {
             return;
 
         material.Shader.Bind();
-        GL.BindVertexArray(mesh.VAO);
+    //    GL.BindVertexArray(mesh.VAO);
         GL.DrawElements(PrimitiveType.Triangles, mesh.Indices.Length, DrawElementsType.UnsignedInt, 0);
         GL.BindVertexArray(0);
         Console.WriteLine(m_RenderCamera.GetProjectionMatrix());

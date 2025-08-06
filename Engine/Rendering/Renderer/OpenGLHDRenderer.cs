@@ -8,7 +8,6 @@ public class OpenGLHDRenderer : HDRenderer {
 
     public override void Initialize() {
         window = BEngineEntry.Window;
-        return;
         GL.Enable(EnableCap.DepthTest);
         GL.CullFace(TriangleFace.Back);
         GL.Enable(EnableCap.CullFace);
@@ -22,29 +21,30 @@ public class OpenGLHDRenderer : HDRenderer {
 
         var anythingDrawn = false;
         foreach (IRenderTarget target in renderTargets) {
-            Material material = target.Material;
             Mesh mesh = target.Mesh;
-            material.Shader.Bind();
-            GL.ActiveTexture(TextureUnit.Texture0);
-            material.Albedo.Bind();
+            Material material = target.Material;
+
+            target.Bind();
+
 
             var viewLocation = GL.GetUniformLocation(target.Material.Shader.ID, "view");
             var projectionLocation = GL.GetUniformLocation(target.Material.Shader.ID, "projection");
             var modelLocation = GL.GetUniformLocation(target.Material.Shader.ID, "model");
             var textureUniformLocation = GL.GetUniformLocation(target.Material.Shader.ID, "texture0");
-            
+
             GL.Uniform1(textureUniformLocation, 0);
             Matrix4 WorldMatrix = target.Transform.WorldMatrix;
 
-            GL.UniformMatrix4(viewLocation, true, ref view);
-            GL.UniformMatrix4(projectionLocation, true, ref projection);
-            GL.UniformMatrix4(modelLocation, true, ref WorldMatrix);
+            GL.UniformMatrix4(viewLocation, false, ref view);
+            GL.UniformMatrix4(projectionLocation, false, ref projection);
+            GL.UniformMatrix4(modelLocation, false, ref WorldMatrix);
 
 
-            if (!mesh.IsUploaded)
+            if (!mesh.IsUploaded) {
+                Console.WriteLine("Mesh not uploaded, skipping render.");
                 continue;
+            }
 
-            GL.BindVertexArray(mesh.VAO);
             GL.DrawElements(PrimitiveType.Triangles, mesh.Indices.Length, DrawElementsType.UnsignedInt, 0);
             GL.BindVertexArray(0);
             anythingDrawn = true;

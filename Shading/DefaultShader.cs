@@ -31,7 +31,7 @@ public struct DefaultShader {
 
                 void main() 
                 {
-	              // FragColor = vec4(1f,1f,1f,1f);
-					FragColor =  texture(texture0, texCoord);
+	           // FragColor = vec4(1f,1f,1f,1f);
+					   FragColor =  texture(texture0, texCoord);
                 }";
 }
