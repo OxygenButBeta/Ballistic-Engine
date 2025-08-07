@@ -47,7 +47,7 @@ public class Shader : BObject, IDisposable {
         throw new Exception($"{type} compilation failed:\n{infoLog}");
     }
 
-    public void Bind() => GL.UseProgram(ID);
+    public void Activate() => GL.UseProgram(ID);
     public void UnBind() => GL.UseProgram(0);
     public void Dispose() => GL.DeleteProgram(ID);
 }

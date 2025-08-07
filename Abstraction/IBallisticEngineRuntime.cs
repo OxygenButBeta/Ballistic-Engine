@@ -8,4 +8,6 @@ public interface IBallisticEngineRuntime
     IEngineTimer EngineTimer { get; }
     IInputProvider InputProvider { get; }
     IWindow Window { get; }
+    RenderAsset RenderAsset { get; }
+    ILogger Logger { get; }
 }

@@ -1,17 +1,17 @@
 {
   "format": 1,
   "restore": {
-    "C:\\Users\\suley\\OneDrive\\Documents\\Projects\\Ballistic-Engine\\BallisticEngine.csproj": {}
+    "C:\\Users\\suley\\OneDrive\\Documents\\GitHub\\Ballistic-Engine\\BallisticEngine.csproj": {}
   },
   "projects": {
-    "C:\\Users\\suley\\OneDrive\\Documents\\Projects\\Ballistic-Engine\\BallisticEngine.csproj": {
+    "C:\\Users\\suley\\OneDrive\\Documents\\GitHub\\Ballistic-Engine\\BallisticEngine.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "C:\\Users\\suley\\OneDrive\\Documents\\Projects\\Ballistic-Engine\\BallisticEngine.csproj",
+        "projectUniqueName": "C:\\Users\\suley\\OneDrive\\Documents\\GitHub\\Ballistic-Engine\\BallisticEngine.csproj",
         "projectName": "BallisticEngine",
-        "projectPath": "C:\\Users\\suley\\OneDrive\\Documents\\Projects\\Ballistic-Engine\\BallisticEngine.csproj",
+        "projectPath": "C:\\Users\\suley\\OneDrive\\Documents\\GitHub\\Ballistic-Engine\\BallisticEngine.csproj",
         "packagesPath": "C:\\Users\\suley\\.nuget\\packages\\",
-        "outputPath": "C:\\Users\\suley\\OneDrive\\Documents\\Projects\\Ballistic-Engine\\obj\\",
+        "outputPath": "C:\\Users\\suley\\OneDrive\\Documents\\GitHub\\Ballistic-Engine\\obj\\",
         "projectStyle": "PackageReference",
         "fallbackFolders": [
           "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"

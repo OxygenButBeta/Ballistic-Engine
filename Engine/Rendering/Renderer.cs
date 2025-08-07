@@ -1,12 +1,12 @@
 ﻿namespace BallisticEngine;
 
 public abstract class Renderer : Behaviour, IRenderTarget {
-    public abstract Mesh Mesh { get; protected set; }
+    public abstract Mesh CommonMesh { get; protected set; }
     public abstract Material Material { get; protected set; }
     public Transform Transform => transform;
-    public void Bind() {
-        Material.Texture.Bind();
-        Material.Shader.Bind();
-        Mesh.Bind();
+    public void Select() {
+        Material.Texture.Activate();
+        Material.Shader.Activate();
+        CommonMesh.Activate();
     }
 }

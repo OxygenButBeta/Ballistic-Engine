@@ -1,6 +1,7 @@
 ﻿using System.Runtime.CompilerServices;
 using OpenTK.Graphics.OpenGL4;
 using OpenTK.Mathematics;
+namespace BallisticEngine.OpenGL.Experimental;
 
 public abstract class GPUBuffer<TTarget> : IDisposable where TTarget : struct {
     public int UID { get; protected set; }

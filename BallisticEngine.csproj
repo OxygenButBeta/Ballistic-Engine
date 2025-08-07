@@ -14,8 +14,8 @@
     </ItemGroup>
 
     <ItemGroup>
-      <Folder Include="Core\OpenGL\" />
-      <Folder Include="Physic\" />
+      <Folder Include="Abstraction\Rendering\Shading\" />
+      <Folder Include="Engine\Rendering\Renderer\" />
     </ItemGroup>
 
 </Project>

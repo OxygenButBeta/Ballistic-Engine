@@ -1,8 +1,8 @@
 {
   "version": 2,
-  "dgSpecHash": "fLGcnR+ANzM=",
+  "dgSpecHash": "F3KqaeJcVlM=",
   "success": true,
-  "projectFilePath": "C:\\Users\\suley\\OneDrive\\Documents\\Projects\\Ballistic-Engine\\BallisticEngine.csproj",
+  "projectFilePath": "C:\\Users\\suley\\OneDrive\\Documents\\GitHub\\Ballistic-Engine\\BallisticEngine.csproj",
   "expectedPackageFiles": [
     "C:\\Users\\suley\\.nuget\\packages\\assimpnet\\4.1.0\\assimpnet.4.1.0.nupkg.sha512",
     "C:\\Users\\suley\\.nuget\\packages\\microsoft.netcore.platforms\\1.1.0\\microsoft.netcore.platforms.1.1.0.nupkg.sha512",

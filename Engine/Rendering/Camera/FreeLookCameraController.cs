@@ -9,8 +9,9 @@ public class FreeLookCameraController : Behaviour {
     float mouseSensitivity = .2f;
     bool isRightMouseDown = false;
     Vector2 lastMousePosition;
-    protected internal override void OnBegin() {
-        window = BEngineEntry.Window;
+    protected internal override void OnBegin()
+    {
+        window = Window.Current;
         lastMousePosition = Input.MousePosition;
     }
 
