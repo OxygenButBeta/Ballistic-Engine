@@ -13,7 +13,6 @@ public sealed class OpenGLRenderContext : RenderContext
         if (UID == 0)
             return;
 
-
         GL.DeleteVertexArray(UID);
         UID = 0;
         RuntimeSet<RenderContext>.Remove(this);
@@ -28,7 +27,7 @@ public sealed class OpenGLRenderContext : RenderContext
         GL.BindVertexArray(UID);
     }
 
-    public override void Deselect()
+    public override void Deactivate()
     {
         if (UID == 0)
             throw new InvalidOperationException("VertexArrayObject has not been created.");

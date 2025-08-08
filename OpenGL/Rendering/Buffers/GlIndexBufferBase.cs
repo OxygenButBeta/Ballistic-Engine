@@ -2,7 +2,7 @@
 
 namespace BallisticEngine.OpenGL;
 
-public class GLIndexBuffer(RenderContext renderContext) : GLBuffer<uint>(renderContext)
+public class GlIndexBufferBase(RenderContext renderContext) : GLBufferBase<uint>(renderContext)
 {
     protected override BufferTarget Target => BufferTarget.ElementArrayBuffer;
 

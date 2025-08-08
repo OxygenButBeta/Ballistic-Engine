@@ -15,5 +15,5 @@ public abstract class RenderContext : IDisposable
 
     public abstract void Activate();
 
-    public abstract void Deselect();
+    public abstract void Deactivate();
 }

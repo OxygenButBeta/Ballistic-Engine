@@ -6,7 +6,7 @@ public class GLTime : IEngineTimer
 {
     public double DeltaTime { get; private set; }
     public double TotalTime { get; private set; }
-
+    public int CurrentFps { get; private set; }
     public void Update(double deltaTime)
     {
         DeltaTime = deltaTime;

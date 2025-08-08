@@ -2,21 +2,34 @@
 using BallisticEngine.OpenGL;
 using OpenTK.Mathematics;
 
-public sealed class OpenGLRenderAsset : RenderAsset
-{
+public sealed class OpenGLRenderAsset : RenderAsset {
+    public override bool InstancedDrawing => true;
     public override HDRenderer Renderer { get; protected set; }
 
-    public override void Initialize()
-    {
+    public override void Initialize() {
         Renderer = new OpenGLHDRenderer();
         Renderer.Initialize();
         Current = this;
     }
 
     public override RenderContext CreateRenderContext() => new OpenGLRenderContext();
-    public override GPUBuffer<uint> CreateIndexBuffer(RenderContext renderContext) => new GLIndexBuffer(renderContext);
-    public override GPUBuffer<Vector3> CreateVertexBuffer(RenderContext renderContext) => new GL3DBuffer(renderContext);
-    public override GPUBuffer<Vector2> CreateUVBuffer(RenderContext renderContext) => new GLUVBuffer2D(renderContext);
+
+    public override GPUBuffer<uint> CreateIndexBuffer(RenderContext renderContext) =>
+        new GlIndexBufferBase(renderContext);
+
+    public override GPUBuffer<Vector3> CreateVertexBuffer(RenderContext renderContext) =>
+        new Gl3DBufferBase(renderContext);
+
+    public override GPUBuffer<Vector2> CreateUVBuffer(RenderContext renderContext) =>
+        new GlUVBuffer2D(renderContext);
+
+    public override GPUBuffer<T> CreateBuffer<T>(RenderContext renderContext) {
+        return new GLBuffer<T>(renderContext);
+    }
+
+    public override InstancedBuffer CreateInstancedBuffer(RenderContext renderContext) {
+        return new GLInstancedBuffer(renderContext);
+    }
 
     public override Texture2D CreateTexture2D(string filePath, TextureType type) =>
         Texture.ImportFromFile<GLTexture2D>(filePath, type);

@@ -11,4 +11,5 @@ public interface IWindow
     void Run();
     void Close();
     void SwapFrameBuffers();
+    float FrameRate { get; }
 }

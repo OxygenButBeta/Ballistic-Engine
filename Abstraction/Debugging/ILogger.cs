@@ -2,8 +2,8 @@
 
 public interface ILogger
 {
-    void Log(string message, BObject source = null);
-    void LogError(string message, BObject source = null);
-    void LogWarning(string message, BObject source = null);
+    void Log(object message, BObject source = null);
+    void LogError(object message, BObject source = null);
+    void LogWarning(object message, BObject source = null);
     
 }

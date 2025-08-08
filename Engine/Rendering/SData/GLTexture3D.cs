@@ -10,7 +10,7 @@ public sealed class GLTexture3D : Texture3D
         throw new NotImplementedException();
     }
 
-    public override void Deselect()
+    public override void Deactivate()
     {
         throw new NotImplementedException();
     }

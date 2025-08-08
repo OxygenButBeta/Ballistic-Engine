@@ -16,15 +16,14 @@ public abstract class GPUBuffer<TDataType> : IDisposable where TDataType : struc
     protected abstract int UID { get; set; }
     protected abstract BufferTarget Target { get; }
 
-    public GPUBuffer([NotNull] RenderContext renderContext)
-    {
-        RenderContext = renderContext ?? throw new ArgumentNullException(nameof(renderContext));
+    public GPUBuffer([NotNull] RenderContext renderContext) {
+        RenderContext = renderContext;//?? throw new ArgumentNullException(nameof(renderContext));
         RuntimeSet<GPUBuffer<TDataType>>.Add(this);
     }
 
     public abstract void SetBufferData(in TDataType[] data, BufferUsageHint usageHint);
     public abstract void Create();
     public abstract void Dispose();
-    public abstract void Select();
-    public abstract void Deselect();
+    public abstract void Activate();
+    public abstract void Deactivate();
 }

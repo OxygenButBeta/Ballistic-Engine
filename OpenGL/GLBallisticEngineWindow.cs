@@ -26,13 +26,17 @@ class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWindow
     int width, height;
     public int Width => width;
     public int Height => height;
-
+  
+    
+    double elapsedTime ;
+    int frameCountInCurrentSecond ;
     public void SetFrequency(int frequency)
     {
         UpdateFrequency = frequency;
     }
 
     public void SwapFrameBuffers() => Context.SwapBuffers();
+    public float FrameRate => currentFps;
 
 
     public GLBallisticEngineWindow(int width, int height) : base(GameWindowSettings.Default,
@@ -67,6 +71,24 @@ class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWindow
     protected override void OnUpdateFrame(FrameEventArgs args)
     {
         WindowUpdateCallback!.Invoke(args.Time);
+        UpdateFrameRate(args.Time);
         base.OnUpdateFrame(args);
+    }
+
+    int currentFps;
+    void UpdateFrameRate(double deltaTime)
+    {
+        elapsedTime += deltaTime;
+        frameCountInCurrentSecond++;
+
+        if (elapsedTime >= 1.0)
+        {
+            currentFps = frameCountInCurrentSecond;
+
+            frameCountInCurrentSecond = 0;
+            elapsedTime = 0.0;
+
+            Console.Title = $"FPS: {currentFps}";
+        }
     }
 }

@@ -24,7 +24,7 @@ public sealed class GLTexture2D : Texture2D
     }
 
 
-    public override void Deselect()
+    public override void Deactivate()
     {
         GL.BindTexture(TextureTarget.Texture2D, 0);
     }
@@ -55,7 +55,7 @@ public sealed class GLTexture2D : Texture2D
             0, PixelFormat.Rgba, PixelType.UnsignedByte, rawImage.Data);
         GL.GenerateMipmap(GenerateMipmapTarget.Texture2D);
         isUploaded = true;
-        Deselect();
+        Deactivate();
     }
 
     protected override void Import(ImageResult imageResult, TextureType textureType)

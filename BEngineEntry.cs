@@ -9,9 +9,9 @@ public sealed class BEngineEntry
     public BEngineEntry(IBallisticEngineRuntime runtime)
     {
         Runtime = runtime;
-        Runtime.RenderAsset.Initialize(); // Initialize the renderer
-        Runtime.Window.SetFrequency(60); // Set the update frequency to 60Hz
         SystemAPI.Bind(Runtime);
+        Runtime.RenderAsset.Initialize(); // Initialize the renderer
+        Runtime.Window.SetFrequency(0); // Set the update frequency to 60Hz
         Runtime.WindowUpdateCallback += EngineUpdate;
         Runtime.WindowRenderCallback += EngineRender;
 
@@ -33,8 +33,15 @@ public sealed class BEngineEntry
         }
     }
 
+    int logFpsInNFrame = 60;
+    int logFpsInterval = 0;
     void EngineUpdate(double delta)
     {
+        if (logFpsInterval++ >= logFpsInNFrame)
+        {
+            logFpsInterval = 0;
+            Console.WriteLine("FPS: " + (1 / delta));
+        }
         SceneManager.Update((float)delta);
     }
 

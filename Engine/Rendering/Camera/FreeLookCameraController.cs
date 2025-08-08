@@ -18,6 +18,11 @@ public class FreeLookCameraController : Behaviour {
     protected internal override void Tick(in float deltaTime) {
         HandleMouse(deltaTime);
         HandleMovement(deltaTime);
+        if (Input.ScrollDelta.Y > 0) {
+            moveSpeed += 1f; // Scroll yukarı hareket hızını artırır
+        } else if (Input.ScrollDelta.Y < 0) {
+            moveSpeed = Math.Max(1f, moveSpeed - 1f ); // Scroll aşağı hareket hızını azaltır, minimum 1f
+        }
     }
 
     float pitch; // -90/+90 arası
