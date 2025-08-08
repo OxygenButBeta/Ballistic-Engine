@@ -1,4 +1,5 @@
 ﻿[EngineService]
-public class EngineConfigurationAsset {
+public class EngineConfigurationAsset
+{
     public readonly int DefaultBatchGroupSize = 1000;
 }

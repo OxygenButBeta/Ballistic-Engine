@@ -26,7 +26,7 @@ public abstract class GLBufferBase<TData>(RenderContext renderContext) : GPUBuff
 
     public override void Activate()
     {
-        RenderContext?.Activate();
+        RenderContext.Activate();
         GL.BindBuffer(Target, UID);
     }
 

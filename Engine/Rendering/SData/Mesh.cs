@@ -1,33 +1,42 @@
-﻿using OpenTK.Graphics.OpenGL;
-using OpenTK.Mathematics;
+﻿using OpenTK.Mathematics;
 using Assimp;
-using Assimp.Configs;
 using BallisticEngine.Shared.Runtime_Set;
 using BufferUsageHint = OpenTK.Graphics.OpenGL4.BufferUsageHint;
 
 namespace BallisticEngine;
 
-public class Mesh : BObject {
+public class Mesh : BObject
+{
     public readonly Vector3[] Vertices;
+    public readonly Vector3[] Normals;
+    public readonly Vector3[] Tangents;
     public readonly uint[] Indices;
     public readonly Vector2[] UVs;
 
     readonly GPUBuffer<Vector3> vertexBuffer;
     readonly GPUBuffer<Vector2> UVBuffer;
+    readonly GPUBuffer<Vector3> normalBuffer;
+    readonly GPUBuffer<Vector3> tangentBuffer;
     public readonly InstancedBuffer InstanceBuffer;
 
     readonly GPUBuffer<uint> indexBuffer;
     readonly RenderContext renderContext;
 
-    Mesh(in Vector3[] vertices, in uint[] indices, Vector2[] uVs, bool CreateInstanceBuffer = true) {
+    Mesh(in Vector3[] vertices, in uint[] indices, Vector2[] uVs, Vector3[] normals, Vector3[] tangents,
+        bool CreateInstanceBuffer = true)
+    {
         renderContext = RenderAsset.Current.CreateRenderContext();
+        renderContext.Activate();
         vertexBuffer = RenderAsset.Current.CreateVertexBuffer(renderContext);
         UVBuffer = RenderAsset.Current.CreateUVBuffer(renderContext);
+        normalBuffer = RenderAsset.Current.CreateNormalBuffer(renderContext);
+        tangentBuffer = RenderAsset.Current.CreateTangentBuffer(renderContext);
         indexBuffer = RenderAsset.Current.CreateIndexBuffer(renderContext);
         Vertices = vertices;
         Indices = indices;
+        Tangents = tangents;
         UVs = uVs;
-        renderContext.Activate();
+        Normals = normals;
         InstanceBuffer = RenderAsset.Current.CreateInstancedBuffer(renderContext);
         InstanceBuffer.Create();
         FillBuffers();
@@ -35,7 +44,8 @@ public class Mesh : BObject {
         Debugging.SystemLog("Texture Created ", SystemLogPriority.High);
     }
 
-    public static Mesh ImportFromFile(string filePath) {
+    public static Mesh ImportFromFile(string filePath)
+    {
         if (RuntimeCache<string, Mesh>.TryGetValue(filePath, out var cachedMesh))
             return cachedMesh;
 
@@ -50,19 +60,23 @@ public class Mesh : BObject {
         var mesh = scene.Meshes[0];
 
         var vertices = new Vector3[mesh.VertexCount];
-        for (var i = 0; i < mesh.VertexCount; i++) {
+        for (var i = 0; i < mesh.VertexCount; i++)
+        {
             Vector3D v = mesh.Vertices[i];
             vertices[i] = new Vector3(v.X, v.Y, v.Z);
         }
 
         var uvs = new Vector2[mesh.VertexCount];
-        if (mesh.TextureCoordinateChannelCount > 0 && mesh.HasTextureCoords(0)) {
-            for (var i = 0; i < mesh.VertexCount; i++) {
+        if (mesh.TextureCoordinateChannelCount > 0 && mesh.HasTextureCoords(0))
+        {
+            for (var i = 0; i < mesh.VertexCount; i++)
+            {
                 Vector3D uv = mesh.TextureCoordinateChannels[0][i];
                 uvs[i] = new Vector2(uv.X, uv.Y);
             }
         }
-        else {
+        else
+        {
             for (var i = 0; i < mesh.VertexCount; i++)
                 uvs[i] = Vector2.Zero;
         }
@@ -71,36 +85,69 @@ public class Mesh : BObject {
         var indices = new uint[triangleCount * 3];
 
         var index = 0;
-        foreach (Face face in mesh.Faces.Where(face => face.IndexCount == 3)) {
+        foreach (Face face in mesh.Faces.Where(face => face.IndexCount == 3))
+        {
             indices[index++] = (uint)face.Indices[0];
             indices[index++] = (uint)face.Indices[1];
             indices[index++] = (uint)face.Indices[2];
         }
 
-        var importedMesh = new Mesh(vertices, indices, uvs);
+        var normals = new Vector3[mesh.VertexCount];
+        if (mesh.HasNormals)
+        {
+            for (var i = 0; i < mesh.VertexCount; i++)
+            {
+                Vector3D n = mesh.Normals[i];
+                normals[i] = new Vector3(n.X, n.Y, n.Z);
+            }
+        }
+
+        var tangents = new Vector3[mesh.VertexCount];
+        if (mesh.HasTangentBasis)
+        {
+            for (var i = 0; i < mesh.VertexCount; i++)
+            {
+                Vector3D t = mesh.Tangents[i];
+                tangents[i] = new Vector3(t.X, t.Y, t.Z);
+            }
+        }
+        else
+        {
+            for (var i = 0; i < mesh.VertexCount; i++)
+                tangents[i] = Vector3.UnitX; 
+        }
+
+        var importedMesh = new Mesh(vertices, indices, uvs, normals, tangents);
         RuntimeCache<string, Mesh>.Add(filePath, importedMesh);
         return importedMesh;
     }
 
 
-    public void Activate() {
+    public void Activate()
+    {
         renderContext.Activate();
     }
 
-    public void Deactivate() {
+    public void Deactivate()
+    {
         renderContext.Deactivate();
     }
 
-    void FillBuffers() {
+    void FillBuffers()
+    {
+        normalBuffer.Create();
+        normalBuffer.SetBufferData(in Normals, BufferUsageHint.StaticDraw);
+
         UVBuffer.Create();
-        UVBuffer.SetBufferData(UVs, BufferUsageHint.StaticDraw);
+        UVBuffer.SetBufferData(in UVs, BufferUsageHint.StaticDraw);
 
         indexBuffer.Create();
         indexBuffer.SetBufferData(in Indices, BufferUsageHint.StaticDraw);
-        
+
         vertexBuffer.Create();
         vertexBuffer.SetBufferData(in Vertices, BufferUsageHint.StaticDraw);
 
-        
+        tangentBuffer.Create();
+        tangentBuffer.SetBufferData(in Tangents, BufferUsageHint.StaticDraw);
     }
 }

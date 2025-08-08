@@ -15,6 +15,7 @@ public static class RuntimeCache<TKey, TValue>
         if (DISABLE_CACHE) return;
         if (!cache.TryAdd(key, value))
         {
+            return;
             throw new ArgumentException($"Key '{key}' already exists in the cache.");
         }
     }

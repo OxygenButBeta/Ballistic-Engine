@@ -31,8 +31,7 @@ public sealed class OpenGLRenderContext : RenderContext
     {
         if (UID == 0)
             throw new InvalidOperationException("VertexArrayObject has not been created.");
-        if (!IsActiveContext)
-            return;
+        
         GL.BindVertexArray(0);
     }
 }

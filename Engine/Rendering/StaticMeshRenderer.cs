@@ -4,38 +4,23 @@ public class StaticMeshRenderer : Renderer {
     public override Mesh SharedMesh { get; protected set; }
     public override Material SharedMaterial { get; protected set; }
 
-    static int count = 0;
 
     protected internal override void OnBegin() {
-        string baseDir = AppContext.BaseDirectory; // veya Directory.GetCurrentDirectory();
-        string modelPath = Path.Combine(baseDir, "Resources", "Default", "Duck.fbx");
-        string texturePath = Path.Combine(baseDir, "Resources", "Default", "Texture.jpg");
-        if (count % 2 == 0) {
-            modelPath = Path.Combine(baseDir, "Resources", "Default", "Duck2.fbx");
-            texturePath = Path.Combine(baseDir, "Resources", "Default", "Texture2.jpg");
-            modelPath = Path.Combine(baseDir, "Resources", "Default", "Duck.fbx");
-            texturePath = Path.Combine(baseDir, "Resources", "Default", "Texture.jpg");
-        }
-        else if (count % 3 == 0) {
-            modelPath = Path.Combine(baseDir, "Resources", "Default", "Cat.fbx");
-            texturePath = Path.Combine(baseDir, "Resources", "Default", "CatText.jpg");
-        }
-        else {
-            modelPath = Path.Combine(baseDir, "Resources", "Default", "Duck2.fbx");
-            texturePath = Path.Combine(baseDir, "Resources", "Default", "Texture2.jpg");
-
-        }
-        modelPath = Path.Combine(baseDir, "Resources", "Default", "Duck2.fbx");
-        texturePath = Path.Combine(baseDir, "Resources", "Default", "Texture2.jpg");
-        count++;
+        var baseDir = AppContext.BaseDirectory; // veya Directory.GetCurrentDirectory();
+        var modelPath = Path.Combine(baseDir, "Resources", "Default", "PH.fbx");
+        var diffusePath = Path.Combine(baseDir, "Resources", "Default", "PH_DIFF.jpg");
+        var normalPath = Path.Combine(baseDir, "Resources", "Default", "PH_NOR.png");
 
         SharedMesh = Mesh.ImportFromFile(modelPath);
 
-        Texture2D defaultTexture = RenderAsset.Current.CreateTexture2D(texturePath,
+        Texture2D defaultTexture = RenderAsset.Current.CreateTexture2D(diffusePath,
             TextureType.Diffuse);
+        
+        Texture2D normalTexture = RenderAsset.Current.CreateTexture2D(normalPath,
+            TextureType.Normal);
 
         Shader defaultShader = Shader.CreateOrGetDefault();
-        SharedMaterial = Material.Create(defaultTexture, defaultShader);
+        SharedMaterial = Material.Create(defaultShader,defaultTexture,normalTexture);
     }
 
     protected internal override void OnEnabled() {

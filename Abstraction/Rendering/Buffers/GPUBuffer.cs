@@ -17,7 +17,7 @@ public abstract class GPUBuffer<TDataType> : IDisposable where TDataType : struc
     protected abstract BufferTarget Target { get; }
 
     public GPUBuffer([NotNull] RenderContext renderContext) {
-        RenderContext = renderContext;//?? throw new ArgumentNullException(nameof(renderContext));
+        RenderContext = renderContext;
         RuntimeSet<GPUBuffer<TDataType>>.Add(this);
     }
 

@@ -21,7 +21,7 @@ public class GLInstancedBuffer(RenderContext renderContext)
         UID = GL.GenBuffer();
         GL.BindBuffer(Target, UID);
         GL.BufferData(Target, (IntPtr)(sizeof(float) * 16 * 5), IntPtr.Zero, BufferUsageHint.DynamicDraw);
-        const int attribLocation = 3;
+        const int attribLocation = 5;
         for (var i = 0; i < 4; i++) {
             GL.EnableVertexAttribArray(attribLocation + i);
             GL.VertexAttribPointer(

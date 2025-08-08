@@ -37,10 +37,11 @@ public sealed class BEngineEntry
     int logFpsInterval = 0;
     void EngineUpdate(double delta)
     {
+        Runtime.EngineTimer.Update(delta);
         if (logFpsInterval++ >= logFpsInNFrame)
         {
             logFpsInterval = 0;
-            Console.WriteLine("FPS: " + (1 / delta));
+          //  Console.WriteLine("FPS: " + (1 / delta));
         }
         SceneManager.Update((float)delta);
     }

@@ -3,11 +3,11 @@ using BallisticEngine.OpenGL;
 using OpenTK.Mathematics;
 
 public sealed class OpenGLRenderAsset : RenderAsset {
-    public override bool InstancedDrawing => true;
+    public override bool InstancedDrawing => false;
     public override HDRenderer Renderer { get; protected set; }
 
     public override void Initialize() {
-        Renderer = new OpenGLHDRenderer();
+        Renderer = new GLHDRenderer();
         Renderer.Initialize();
         Current = this;
     }
@@ -18,10 +18,20 @@ public sealed class OpenGLRenderAsset : RenderAsset {
         new GlIndexBufferBase(renderContext);
 
     public override GPUBuffer<Vector3> CreateVertexBuffer(RenderContext renderContext) =>
-        new Gl3DBufferBase(renderContext);
+        new GL3DBufferBase(renderContext);
 
     public override GPUBuffer<Vector2> CreateUVBuffer(RenderContext renderContext) =>
-        new GlUVBuffer2D(renderContext);
+        new GLUVBuffer2D(renderContext);
+
+    public override GPUBuffer<Vector3> CreateNormalBuffer(RenderContext renderContext)
+    {
+        return new GLNormalBuffer(renderContext);
+    }
+
+    public override GPUBuffer<Vector3> CreateTangentBuffer(RenderContext renderContext)
+    {
+        return new GLTangentBuffer(renderContext);
+    }
 
     public override GPUBuffer<T> CreateBuffer<T>(RenderContext renderContext) {
         return new GLBuffer<T>(renderContext);

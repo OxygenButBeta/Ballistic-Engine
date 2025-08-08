@@ -2,22 +2,29 @@
 
 //Just a text structure for the shaders
 // TODO: Implement a shader loader
-public struct DefaultShader {
+public struct DefaultShader
+{
     public const string VertexShader = @"#version 330 core
                 layout (location = 0) in vec3 aPosition; // vertex coordinates
                 layout (location = 1) in vec2 aTexCoord; // texture coordinates
-				layout(location = 3) in vec4 instance_matrix_0;
-				layout(location = 4) in vec4 instance_matrix_1;
-				layout(location = 5) in vec4 instance_matrix_2;
-				layout(location = 6) in vec4 instance_matrix_3;
+				layout(location = 2) in vec3 aNormal; // normal vector
+				layout(location = 3) in vec3 aTangent; // tangent vector
+
+				layout(location = 4) in vec4 instance_matrix_0;
+				layout(location = 5) in vec4 instance_matrix_1;
+				layout(location = 6) in vec4 instance_matrix_2;
+				layout(location = 7) in vec4 instance_matrix_3;
 				
-				uniform bool isInstanced;
                 out vec2 texCoord;
+				out mat3 TBN;
 
                 // uniform variables
+				uniform bool isInstanced;
                 uniform mat4 view;
                 uniform mat4 projection;
 				uniform mat4 model;
+
+
 
                 void main() 
                 {
@@ -25,21 +32,45 @@ public struct DefaultShader {
 			        ?  transpose(mat4(instance_matrix_0, instance_matrix_1, instance_matrix_2, instance_matrix_3))
 			        : model;
 
+					vec3 T = normalize(mat3(modelMatrix) * aTangent);
+				    vec3 N = normalize(mat3(modelMatrix) * aNormal);
+				    vec3 B = normalize(cross(N, T));
+
+				    TBN = mat3(T, B, N);
+
 	               gl_Position = vec4(aPosition, 1.0) * modelMatrix * view * projection ; // coordinates
 	                texCoord = aTexCoord;
                 }";
 
     public const string FragmentShader = @"
-				#version 330 core
-				in vec2 texCoord;
+			#version 330 core
+			in vec2 texCoord;
+			in mat3 TBN;
+			
+			out vec4 FragColor;
+			uniform vec3 LightPos;
+			uniform vec3 LightColor;
 
-                out vec4 FragColor;
+			uniform sampler2D texture0; // diffuse
+			uniform sampler2D texture1; // normal map
+			uniform vec3 AmbientColor;
+			void main()
+			{
+			    vec3 normal = texture(texture1, texCoord).rgb;
+			    normal = normalize(normal * 2.0 - 1.0);
 
-                uniform sampler2D texture0;
+			    vec3 worldNormal = normalize(TBN * normal);
 
-                void main() 
-                {
-	           // FragColor = vec4(1f,1f,1f,1f);
-					   FragColor =  texture(texture0, texCoord);
-                }";
+			    vec3 lightDir = normalize(LightPos);
+
+			    float diff = max(dot(worldNormal, lightDir), 0.0);
+			    if (diff == 0) {
+			      //  diff = 0.03;
+			    }
+
+			    vec4 diffuseColor = texture(texture0, texCoord);
+
+			    vec3 lighting = AmbientColor *diff * diffuseColor.rgb * LightColor;
+				FragColor = vec4(lighting, 1.0);
+			}";
 }

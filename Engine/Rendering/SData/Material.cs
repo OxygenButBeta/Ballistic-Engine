@@ -2,24 +2,28 @@
 
 namespace BallisticEngine;
 
-public class Material : BObject {
-    public Texture2D Texture { get; set; }
+public class Material : BObject
+{
+    public Texture2D Diffuse { get; set; }
+    public Texture2D Normal { get; set; }
     public Shader Shader { get; set; }
 
-    Material(Texture2D texture, Shader shader) {
-        Texture = texture;
+    Material(Texture2D diffuse, Shader shader)
+    {
+        Diffuse = diffuse;
         Shader = shader;
         Debugging.SystemLog("Material Created", SystemLogPriority.Critical);
     }
 
-    public static Material Create(Texture2D texture, Shader shader) {
-        if (RuntimeCache<(Guid, Guid), Material>.TryGetValue((texture.InstanceId, shader.InstanceId),
-                out Material cachedMaterial)) {
+    public static Material Create(Shader shader, Texture2D diffuse, Texture2D normal)
+    {
+        if (RuntimeCache<(Guid,Guid,Guid), Material>.TryGetValue((diffuse.InstanceId, shader.InstanceId,normal.InstanceId), out Material cachedMaterial))
+        {
             return cachedMaterial;
         }
 
-        Material material = new(texture, shader);
-        RuntimeCache<(Guid, Guid), Material>.Add((texture.InstanceId, shader.InstanceId), material);
+        Material material = new(diffuse, shader);
+        RuntimeCache<(Guid, Guid), Material>.Add((diffuse.InstanceId, shader.InstanceId), material);
         return material;
     }
 }

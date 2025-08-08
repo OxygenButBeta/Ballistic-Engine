@@ -6,6 +6,7 @@ public class Rotator : Behaviour{
     public float RotationSpeed { get; set; } = 45.0f; // degrees per second
     
     protected internal override void Tick(in float delta) {
+        return;
         float deltaRotation = RotationSpeed * delta;
 
         Quaternion yRotation = Quaternion.FromEulerAngles(0, MathHelper.DegreesToRadians(deltaRotation), 0);

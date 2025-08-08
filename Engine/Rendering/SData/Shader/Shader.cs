@@ -10,12 +10,9 @@ public class Shader : BObject, IDisposable {
     static int LastAssignedUID;
     bool NeedsActivation() => UID != LastAssignedUID;
 
-    class CompiledShaderCode {
-        public readonly int ShaderUID;
-
-        public CompiledShaderCode(int shaderUid) {
-            ShaderUID = shaderUid;
-        }
+    class CompiledShaderProgram(int shaderUid)
+    {
+        public readonly int ShaderUID = shaderUid;
     }
 
     // ReSharper disable once MemberCanBePrivate.Global
@@ -42,10 +39,10 @@ public class Shader : BObject, IDisposable {
         var FragHash = FNV1a.HashStr(frag);
 
         var IsVertexShaderCompiled =
-            RuntimeCache<int, CompiledShaderCode>.TryGetValue(VertHash, out CompiledShaderCode compiledVertexShader);
+            RuntimeCache<int, CompiledShaderProgram>.TryGetValue(VertHash, out CompiledShaderProgram compiledVertexShader);
 
         var FragmentShaderCompiled =
-            RuntimeCache<int, CompiledShaderCode>.TryGetValue(FragHash, out CompiledShaderCode compiledFragmentShader);
+            RuntimeCache<int, CompiledShaderProgram>.TryGetValue(FragHash, out CompiledShaderProgram compiledFragmentShader);
 
         int VertexShaderID;
         if (IsVertexShaderCompiled) {
@@ -53,7 +50,7 @@ public class Shader : BObject, IDisposable {
         }
         else {
             VertexShaderID = CompileShader(vert, ShaderType.VertexShader);
-            RuntimeCache<int, CompiledShaderCode>.Add(VertHash, new CompiledShaderCode(VertexShaderID));
+            RuntimeCache<int, CompiledShaderProgram>.Add(VertHash, new CompiledShaderProgram(VertexShaderID));
         }
 
         int FragmentShaderID;
@@ -62,7 +59,7 @@ public class Shader : BObject, IDisposable {
         }
         else {
             FragmentShaderID = CompileShader(frag, ShaderType.FragmentShader);
-            RuntimeCache<int, CompiledShaderCode>.Add(FragHash, new CompiledShaderCode(FragmentShaderID));
+            RuntimeCache<int, CompiledShaderProgram>.Add(FragHash, new CompiledShaderProgram(FragmentShaderID));
         }
 
 
@@ -100,8 +97,8 @@ public class Shader : BObject, IDisposable {
     }
 
     public void Activate() {
-        if (!NeedsActivation()) 
-            return;
+      //  if (!NeedsActivation()) 
+        //    return;
         
         LastAssignedUID = UID;
         GL.UseProgram(UID);

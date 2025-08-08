@@ -8,13 +8,13 @@ public abstract class Renderer : Behaviour, IOpaqueDrawable {
 
     public void Activate() {
         SharedMaterial.Shader.Activate();
-        SharedMaterial.Texture.Activate();
+        SharedMaterial.Diffuse.Activate();
         SharedMesh.Activate();
     }
 
     public void Deactivate() {
         SharedMesh.Deactivate();
-        SharedMaterial.Texture.Deactivate();
+        SharedMaterial.Diffuse.Deactivate();
         SharedMaterial.Shader.Deactivate();
     }
 }

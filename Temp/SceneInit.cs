@@ -8,10 +8,10 @@ public static class SceneInit {
         cameraEntity.AddComponent<HDCamera>();
         cameraEntity.AddComponent<FreeLookCameraController>();
 
-        int columns = 200; // her satırda 10 kutu<
+        int columns = 20; // her satırda 10 kutu<
         float spacing = 4f;
 
-        for (int i = 0; i < 2000; i++)
+        for (int i = 0; i < 250; i++)
         {
             Entity meshEntity = Entity.Instantiate("Mesh");
             meshEntity.AddComponent<StaticMeshRenderer>();
@@ -22,7 +22,8 @@ public static class SceneInit {
             int z = i / columns;         // z konumu: satır sayısı kadar yukarı çık
 
             meshEntity.transform.Position = new Vector3(x * spacing, 0, z * spacing);
-       meshEntity.transform.Scale = Vector3.One * 8; 
+            meshEntity.transform.EulerAngles = new Vector3(90, 180,0);
+       meshEntity.transform.Scale = Vector3.One * 5; 
         }
 
 
