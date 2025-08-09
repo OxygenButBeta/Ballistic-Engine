@@ -49,7 +49,7 @@ public class GLHDRenderer : HDRenderer
 
             Vector3 lightPos = new Vector3(
                 MathF.Cos(angle) * radius,
-                3.0f, // Sabit yükseklik
+                3.0f, // Sabit yükseklik 
                 MathF.Sin(angle) * radius
             );
             Vector3 lightColor = new Vector3(1.0f, 0.95f, 0.85f) * 10.0f;
@@ -85,7 +85,27 @@ public class GLHDRenderer : HDRenderer
 
 
         var shaderId = shader.UID;
+        var LightPositionLocation = GL.GetUniformLocation(target.SharedMaterial.Shader.UID, "LightPos");
+        var LightColorLocation = GL.GetUniformLocation(target.SharedMaterial.Shader.UID, "LightColor");
+        var ambientColorLocation = GL.GetUniformLocation(target.SharedMaterial.Shader.UID, "AmbientColor");
+        
+        double time = Time.TotalTime * 0.5; 
+        float radius = 15.0f;
+        float angle = (float)Math.Sin(time) * MathF.PI / 3f;
 
+        
+        Vector3 lightPos = new(
+            MathF.Cos(angle) * radius,
+            3.0f, // Sabit yükseklik 
+            MathF.Sin(angle) * radius
+        );
+        Vector3 lightColor = new Vector3(1.0f, 0.95f, 0.85f) * 10.0f;
+        
+        GL.Uniform3(LightPositionLocation, lightPos);
+        GL.Uniform3(LightColorLocation, lightColor);
+        GL.Uniform3(ambientColorLocation, args.viewProjectionProvider.AmbientColor);
+        
+        
         Matrix4 view = args.viewProjectionProvider.GetViewMatrix();
         Matrix4 projection = args.viewProjectionProvider.GetProjectionMatrix();
         Matrix4 model = Matrix4.Identity;
@@ -93,11 +113,11 @@ public class GLHDRenderer : HDRenderer
         var projectionLocation = GL.GetUniformLocation(shaderId, "projection");
         var modelLocation = GL.GetUniformLocation(shaderId, "model");
         var isInstancedLocation = GL.GetUniformLocation(shaderId, "isInstanced");
+        GL.Uniform1(isInstancedLocation, 1);
 
         GL.UniformMatrix4(viewLocation, true, ref view);
         GL.UniformMatrix4(projectionLocation, true, ref projection);
         GL.UniformMatrix4(modelLocation, true, ref model);
-        GL.Uniform1(isInstancedLocation, 1);
 
         Matrix4[] matrices = batchGroup.Matrix4s.ToArray();
         target.SharedMesh.InstanceBuffer.SetBufferData(matrices, BufferUsageHint.StreamDraw);

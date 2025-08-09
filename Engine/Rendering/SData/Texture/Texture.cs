@@ -23,7 +23,7 @@ public abstract class Texture : BObject, IDisposable {
             return cachedTexture;
         }
 
-        TTargetTexture textureInstance = new TTargetTexture();
+        TTargetTexture textureInstance = new();
 
         if (RuntimeCache<string, ImageResult>.TryGetValue(path, out ImageResult cachedImage)) {
             textureInstance.Import(cachedImage, textureType);
