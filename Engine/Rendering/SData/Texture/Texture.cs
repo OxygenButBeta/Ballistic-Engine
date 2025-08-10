@@ -3,8 +3,12 @@ using StbImageSharp;
 
 namespace BallisticEngine;
 
-public abstract class Texture : BObject, IDisposable {
-    protected Texture() {
+public abstract class Texture : BObject, IDisposable, ISharedResource
+{
+    public ResourceIdentity Identity { get; private set; }
+
+    protected Texture()
+    {
         Debugging.SystemLog("Texture Created ", SystemLogPriority.Critical);
     }
 
@@ -16,20 +20,14 @@ public abstract class Texture : BObject, IDisposable {
     protected abstract void Import(ImageResult imageResult, TextureType textureType);
 
     public static TTargetTexture ImportFromFile<TTargetTexture>(string path, TextureType textureType)
-        where TTargetTexture : Texture, new() {
-        //Check if the texture is already loaded in the cache
-        if (RuntimeCache<string, TTargetTexture>.TryGetValue(path, out TTargetTexture cachedTexture)) {
-            Debugging.SystemLog("Texture loaded from cache: " + path);
-            return cachedTexture;
+        where TTargetTexture : Texture, new()
+    {
+        if (SharedResources<TTargetTexture>.TryGetResource(path, out TTargetTexture sharedTexture))
+        {
+            return sharedTexture;
         }
 
         TTargetTexture textureInstance = new();
-
-        if (RuntimeCache<string, ImageResult>.TryGetValue(path, out ImageResult cachedImage)) {
-            textureInstance.Import(cachedImage, textureType);
-            Debugging.SystemLog("Raw Texture loaded from cache: " + path);
-            return textureInstance;
-        }
 
         ImageResult texture = ImageResult.FromStream(
             File.OpenRead(path),
@@ -38,10 +36,10 @@ public abstract class Texture : BObject, IDisposable {
         if (texture is null)
             throw new FileNotFoundException($"Texture file not found at path: {path}");
 
-        RuntimeCache<string, ImageResult>.Add(path, texture);
 
         textureInstance.Import(texture, textureType);
-        RuntimeCache<string, TTargetTexture>.Add(path, textureInstance);
+        textureInstance.Identity = path;
+        SharedResources<TTargetTexture>.AddResource(textureInstance);
         return textureInstance;
     }
 }

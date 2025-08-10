@@ -19,8 +19,8 @@ public class StaticMeshRenderer : Renderer {
         Texture2D normalTexture = RenderAsset.Current.CreateTexture2D(normalPath,
             TextureType.Normal);
 
-        Shader defaultShader = Shader.CreateOrGetDefault();
-        SharedMaterial = Material.Create(defaultShader,defaultTexture,normalTexture);
+        LegacyShader defaultLegacyShader = LegacyShader.CreateOrGetDefault();
+        SharedMaterial = Material.Create(defaultLegacyShader,defaultTexture,normalTexture);
     }
 
     protected internal override void OnEnabled() {

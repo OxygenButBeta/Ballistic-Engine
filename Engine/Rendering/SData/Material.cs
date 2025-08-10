@@ -2,42 +2,46 @@
 
 namespace BallisticEngine;
 
-public class Material : BObject {
+public class Material : BObject, ISharedResource
+{
+    public ResourceIdentity Identity { get; }
     public Texture2D Diffuse { get; set; }
     public Texture2D Normal { get; set; }
-    public Shader Shader { get; set; }
+    public LegacyShader LegacyShader { get; set; }
 
-    Material(Texture2D diffuse, Shader shader) {
+    Material(Texture2D diffuse, LegacyShader legacyShader, Texture2D normal)
+    {
         Diffuse = diffuse;
-        Shader = shader;
-        Debugging.SystemLog("Material Created", SystemLogPriority.Critical);
+        Normal = normal;
+        LegacyShader = legacyShader;
+        Identity = ResourceIdentity.Combine(diffuse.Identity, legacyShader.Identity, normal.Identity);
+        SharedResources<Material>.AddResource(this);
     }
 
-    public static Material Create(Shader shader, Texture2D diffuse, Texture2D normal) {
-        if (RuntimeCache<(Guid, Guid, Guid), Material>.TryGetValue(
-                (diffuse.InstanceId, shader.InstanceId, normal.InstanceId), out Material cachedMaterial)) {
-            return cachedMaterial;
-        }
-
-        Material material = new(diffuse, shader);
-        RuntimeCache<(Guid, Guid, Guid), Material>.Add((diffuse.InstanceId, shader.InstanceId, normal.InstanceId),
-            material);
-        return material;
+    public static Material Create(LegacyShader legacyShader, Texture2D diffuse, Texture2D normal)
+    {
+        ResourceIdentity materialIdentity =
+            ResourceIdentity.Combine(diffuse.Identity, legacyShader.Identity, normal.Identity);
+        return SharedResources<Material>.TryGetResource(materialIdentity, out Material sharedMaterial)
+            ? sharedMaterial
+            : new Material(diffuse, legacyShader, normal);
     }
 
-    public void Activate() {
+    public void Activate()
+    {
         if (this.Equals(LastActivatedMaterial)) return; // Avoid reactivating the same material
         LastActivatedMaterial = this; // Update the last activated material
-        Shader.Activate();
+        LegacyShader.Activate();
         Diffuse.Activate();
-        Normal?.Activate();
+        Normal.Activate();
     }
 
-    public void Deactivate() {
+    public void Deactivate()
+    {
         if (!LastActivatedMaterial.Equals(this)) return; // Avoid deactivating a material that wasn't activated
-        Shader.Deactivate();
+        LegacyShader.Deactivate();
         Diffuse.Deactivate();
-        Normal?.Deactivate();
+        Normal.Deactivate();
     }
 
     static Material LastActivatedMaterial;

@@ -35,13 +35,13 @@ public class GLHDRenderer : HDRenderer
             Mesh mesh = target.SharedMesh;
             target.Activate();
 
-            var viewLocation = GL.GetUniformLocation(target.SharedMaterial.Shader.UID, "view");
-            var projectionLocation = GL.GetUniformLocation(target.SharedMaterial.Shader.UID, "projection");
-            var modelLocation = GL.GetUniformLocation(target.SharedMaterial.Shader.UID, "model");
+            var viewLocation = GL.GetUniformLocation(target.SharedMaterial.LegacyShader.UID, "view");
+            var projectionLocation = GL.GetUniformLocation(target.SharedMaterial.LegacyShader.UID, "projection");
+            var modelLocation = GL.GetUniformLocation(target.SharedMaterial.LegacyShader.UID, "model");
 
-            var LightPositionLocation = GL.GetUniformLocation(target.SharedMaterial.Shader.UID, "LightPos");
-            var LightColorLocation = GL.GetUniformLocation(target.SharedMaterial.Shader.UID, "LightColor");
-            var ambientColorLocation = GL.GetUniformLocation(target.SharedMaterial.Shader.UID, "AmbientColor");
+            var LightPositionLocation = GL.GetUniformLocation(target.SharedMaterial.LegacyShader.UID, "LightPos");
+            var LightColorLocation = GL.GetUniformLocation(target.SharedMaterial.LegacyShader.UID, "LightColor");
+            var ambientColorLocation = GL.GetUniformLocation(target.SharedMaterial.LegacyShader.UID, "AmbientColor");
 
             double time = Time.TotalTime * 0.5; // Daha yavaş dönüş
             float radius = 15.0f;
@@ -73,7 +73,7 @@ public class GLHDRenderer : HDRenderer
     }
 
     public override void RenderInstancing(Mesh mesh, Material material, Matrix4[] transforms, RendererArgs args) {
-        material.Shader.Activate();
+        material.LegacyShader.Activate();
         material.Diffuse.Activate();
         mesh.Activate();
     }
@@ -85,14 +85,14 @@ public class GLHDRenderer : HDRenderer
 
         IOpaqueDrawable target = batchGroup.Drawable;
         Mesh mesh = target.SharedMesh;
-        Shader shader = target.SharedMaterial.Shader;
+        LegacyShader legacyShader = target.SharedMaterial.LegacyShader;
         target.Activate();
 
 
-        var shaderId = shader.UID;
-        var LightPositionLocation = GL.GetUniformLocation(target.SharedMaterial.Shader.UID, "LightPos");
-        var LightColorLocation = GL.GetUniformLocation(target.SharedMaterial.Shader.UID, "LightColor");
-        var ambientColorLocation = GL.GetUniformLocation(target.SharedMaterial.Shader.UID, "AmbientColor");
+        var shaderId = legacyShader.UID;
+        var LightPositionLocation = GL.GetUniformLocation(target.SharedMaterial.LegacyShader.UID, "LightPos");
+        var LightColorLocation = GL.GetUniformLocation(target.SharedMaterial.LegacyShader.UID, "LightColor");
+        var ambientColorLocation = GL.GetUniformLocation(target.SharedMaterial.LegacyShader.UID, "AmbientColor");
         
         double time = Time.TotalTime * 0.5; 
         float radius = 15.0f;
