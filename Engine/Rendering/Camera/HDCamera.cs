@@ -61,7 +61,7 @@ public class HDCamera : Behaviour, IViewProjectionProvider
 
     internal void RenderCamera()
     {
-        renderer.BeginRender(new RenderArgs(viewProjectionProvider: this));
+        renderer.BeginRender(new RendererArgs(viewProjectionProvider: this));
         renderer.PostRenderCleanUp();
     }
 }

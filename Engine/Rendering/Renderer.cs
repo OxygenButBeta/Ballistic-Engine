@@ -7,14 +7,12 @@ public abstract class Renderer : Behaviour, IOpaqueDrawable {
     public bool RenderedThisFrame { get; set; }
 
     public void Activate() {
-        SharedMaterial.Shader.Activate();
-        SharedMaterial.Diffuse.Activate();
+        SharedMaterial.Activate();
         SharedMesh.Activate();
     }
 
     public void Deactivate() {
+        SharedMaterial.Deactivate();
         SharedMesh.Deactivate();
-        SharedMaterial.Diffuse.Deactivate();
-        SharedMaterial.Shader.Deactivate();
     }
 }

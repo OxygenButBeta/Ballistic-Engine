@@ -24,4 +24,21 @@ public class Material : BObject {
             material);
         return material;
     }
+
+    public void Activate() {
+        if (this.Equals(LastActivatedMaterial)) return; // Avoid reactivating the same material
+        LastActivatedMaterial = this; // Update the last activated material
+        Shader.Activate();
+        Diffuse.Activate();
+        Normal?.Activate();
+    }
+
+    public void Deactivate() {
+        if (!LastActivatedMaterial.Equals(this)) return; // Avoid deactivating a material that wasn't activated
+        Shader.Deactivate();
+        Diffuse.Deactivate();
+        Normal?.Deactivate();
+    }
+
+    static Material LastActivatedMaterial;
 }

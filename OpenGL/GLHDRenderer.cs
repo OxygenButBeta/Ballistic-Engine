@@ -20,7 +20,7 @@ public class GLHDRenderer : HDRenderer
     }
 
 
-    public override void RenderOpaque(IReadOnlyCollection<IOpaqueDrawable> renderTargets, RenderArgs args)
+    public override void RenderOpaque(IReadOnlyCollection<IOpaqueDrawable> renderTargets, RendererArgs args)
     {
         Matrix4 view = args.viewProjectionProvider.GetViewMatrix();
         Matrix4 projection = args.viewProjectionProvider.GetProjectionMatrix();
@@ -72,7 +72,12 @@ public class GLHDRenderer : HDRenderer
         Debugging.SystemLog("Total Draw Call Count: " + drawCallCount, SystemLogPriority.Medium);
     }
 
-    public override void RenderInstancing(BatchGroup<IOpaqueDrawable> batchGroup, RenderArgs args)
+    public override void RenderInstancing(Mesh mesh, Material material, Matrix4[] transforms, RendererArgs args) {
+        material.Shader.Activate();
+        material.Diffuse.Activate();
+        mesh.Activate();
+    }
+    public override void RenderInstancing(BatchGroup<IOpaqueDrawable> batchGroup, RendererArgs args)
     {
         var instanceCount = batchGroup.Matrix4s.Count;
         if (instanceCount == 0)
@@ -136,7 +141,7 @@ public class GLHDRenderer : HDRenderer
         anythingDrawnThisFrame = true;
     }
 
-    public override void BeginRender(RenderArgs args)
+    public override RenderMetrics BeginRender(RendererArgs args)
     {
         ClearColorBuffer();
 
@@ -150,6 +155,9 @@ public class GLHDRenderer : HDRenderer
 
         if (!anythingDrawnThisFrame)
             window.SwapFrameBuffers();
+
+
+        return new RenderMetrics();
     }
 
     public override void PostRenderCleanUp()
@@ -157,6 +165,8 @@ public class GLHDRenderer : HDRenderer
         foreach (IOpaqueDrawable opaqueDrawable in RuntimeSet<IOpaqueDrawable>.ReadOnlyCollection)
             opaqueDrawable.RenderedThisFrame = false;
     }
+
+
 
     void ClearColorBuffer()
     {

@@ -15,7 +15,9 @@ public abstract class BObject {
         return obj is BObject other && InstanceId.Equals(other.InstanceId);
     }
 
-    protected bool Equals(BObject other) => InstanceId.Equals(other.InstanceId);
+    protected bool Equals(BObject other) {
+        return other is not null && InstanceId.Equals(other.InstanceId);
+    }
 
     public override int GetHashCode() => InstanceId.GetHashCode();
 
