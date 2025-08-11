@@ -7,18 +7,18 @@ public class Material : BObject, ISharedResource
     public ResourceIdentity Identity { get; }
     public Texture2D Diffuse { get; set; }
     public Texture2D Normal { get; set; }
-    public LegacyShader LegacyShader { get; set; }
+    public Shader Shader { get; set; }
 
-    Material(Texture2D diffuse, LegacyShader legacyShader, Texture2D normal)
+    Material(Texture2D diffuse, Shader shader, Texture2D normal)
     {
         Diffuse = diffuse;
         Normal = normal;
-        LegacyShader = legacyShader;
-        Identity = ResourceIdentity.Combine(diffuse.Identity, legacyShader.Identity, normal.Identity);
+        Shader = shader;
+        Identity = ResourceIdentity.Combine(diffuse.Identity, shader.Identity, normal.Identity);
         SharedResources<Material>.AddResource(this);
     }
 
-    public static Material Create(LegacyShader legacyShader, Texture2D diffuse, Texture2D normal)
+    public static Material Create(Shader legacyShader, Texture2D diffuse, Texture2D normal)
     {
         ResourceIdentity materialIdentity =
             ResourceIdentity.Combine(diffuse.Identity, legacyShader.Identity, normal.Identity);
@@ -29,19 +29,23 @@ public class Material : BObject, ISharedResource
 
     public void Activate()
     {
-        if (this.Equals(LastActivatedMaterial)) return; // Avoid reactivating the same material
-        LastActivatedMaterial = this; // Update the last activated material
-        LegacyShader.Activate();
+        if (ReferenceEquals(this, LastActivatedMaterial))
+            return; 
+        LastActivatedMaterial = this; 
+        Shader.Activate();
         Diffuse.Activate();
         Normal.Activate();
     }
 
     public void Deactivate()
     {
-        if (!LastActivatedMaterial.Equals(this)) return; // Avoid deactivating a material that wasn't activated
-        LegacyShader.Deactivate();
+        if (!ReferenceEquals(this, LastActivatedMaterial))
+            return; 
+        
+        Shader.Deactivate();
         Diffuse.Deactivate();
         Normal.Deactivate();
+        LastActivatedMaterial = null;
     }
 
     static Material LastActivatedMaterial;

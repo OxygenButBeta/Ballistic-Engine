@@ -5,8 +5,7 @@ using BufferUsageHint = OpenTK.Graphics.OpenGL4.BufferUsageHint;
 
 namespace BallisticEngine;
 
-public class Mesh : BObject
-{
+public class Mesh : BObject {
     public readonly Vector3[] Vertices;
     public readonly Vector3[] Normals;
     public readonly Vector3[] Tangents;
@@ -23,8 +22,7 @@ public class Mesh : BObject
     readonly RenderContext renderContext;
 
     Mesh(in Vector3[] vertices, in uint[] indices, Vector2[] uVs, Vector3[] normals, Vector3[] tangents,
-        bool CreateInstanceBuffer = true)
-    {
+        bool CreateInstanceBuffer = true) {
         renderContext = RenderAsset.Current.CreateRenderContext();
         renderContext.Activate();
         vertexBuffer = RenderAsset.Current.CreateVertexBuffer(renderContext);
@@ -44,12 +42,11 @@ public class Mesh : BObject
         Debugging.SystemLog("Texture Created ", SystemLogPriority.High);
     }
 
-    public static Mesh ImportFromFile(string filePath)
-    {
+    public static Mesh ImportFromFile(string filePath) {
         if (RuntimeCache<string, Mesh>.TryGetValue(filePath, out var cachedMesh))
             return cachedMesh;
 
-        var context = new AssimpContext();
+        AssimpContext context = new();
 
         Assimp.Scene scene = context.ImportFile(filePath,
             PostProcessSteps.Triangulate | PostProcessSteps.FlipUVs);
@@ -57,26 +54,22 @@ public class Mesh : BObject
         if (scene == null || scene.MeshCount == 0)
             throw new IOException("Mesh import failed or no meshes found in the file.");
 
-        var mesh = scene.Meshes[0];
+        Assimp.Mesh mesh = scene.Meshes[0];
 
-        var vertices = new Vector3[mesh.VertexCount];
-        for (var i = 0; i < mesh.VertexCount; i++)
-        {
+        Vector3[] vertices = new Vector3[mesh.VertexCount];
+        for (var i = 0; i < mesh.VertexCount; i++) {
             Vector3D v = mesh.Vertices[i];
             vertices[i] = new Vector3(v.X, v.Y, v.Z);
         }
 
         var uvs = new Vector2[mesh.VertexCount];
-        if (mesh.TextureCoordinateChannelCount > 0 && mesh.HasTextureCoords(0))
-        {
-            for (var i = 0; i < mesh.VertexCount; i++)
-            {
+        if (mesh.TextureCoordinateChannelCount > 0 && mesh.HasTextureCoords(0)) {
+            for (var i = 0; i < mesh.VertexCount; i++) {
                 Vector3D uv = mesh.TextureCoordinateChannels[0][i];
                 uvs[i] = new Vector2(uv.X, uv.Y);
             }
         }
-        else
-        {
+        else {
             for (var i = 0; i < mesh.VertexCount; i++)
                 uvs[i] = Vector2.Zero;
         }
@@ -85,56 +78,47 @@ public class Mesh : BObject
         var indices = new uint[triangleCount * 3];
 
         var index = 0;
-        foreach (Face face in mesh.Faces.Where(face => face.IndexCount == 3))
-        {
+        foreach (Face face in mesh.Faces.Where(face => face.IndexCount == 3)) {
             indices[index++] = (uint)face.Indices[0];
             indices[index++] = (uint)face.Indices[1];
             indices[index++] = (uint)face.Indices[2];
         }
 
-        var normals = new Vector3[mesh.VertexCount];
-        if (mesh.HasNormals)
-        {
-            for (var i = 0; i < mesh.VertexCount; i++)
-            {
+        Vector3[] normals = new Vector3[mesh.VertexCount];
+        if (mesh.HasNormals) {
+            for (var i = 0; i < mesh.VertexCount; i++) {
                 Vector3D n = mesh.Normals[i];
                 normals[i] = new Vector3(n.X, n.Y, n.Z);
             }
         }
 
-        var tangents = new Vector3[mesh.VertexCount];
-        if (mesh.HasTangentBasis)
-        {
-            for (var i = 0; i < mesh.VertexCount; i++)
-            {
+        Vector3[] tangents = new Vector3[mesh.VertexCount];
+        if (mesh.HasTangentBasis) {
+            for (var i = 0; i < mesh.VertexCount; i++) {
                 Vector3D t = mesh.Tangents[i];
                 tangents[i] = new Vector3(t.X, t.Y, t.Z);
             }
         }
-        else
-        {
+        else {
             for (var i = 0; i < mesh.VertexCount; i++)
-                tangents[i] = Vector3.UnitX; 
+                tangents[i] = Vector3.UnitX;
         }
 
-        var importedMesh = new Mesh(vertices, indices, uvs, normals, tangents);
+        Mesh importedMesh = new Mesh(vertices, indices, uvs, normals, tangents);
         RuntimeCache<string, Mesh>.Add(filePath, importedMesh);
         return importedMesh;
     }
 
 
-    public void Activate()
-    {
+    public void Activate() {
         renderContext.Activate();
     }
 
-    public void Deactivate()
-    {
+    public void Deactivate() {
         renderContext.Deactivate();
     }
 
-    void FillBuffers()
-    {
+    void FillBuffers() {
         normalBuffer.Create();
         normalBuffer.SetBufferData(in Normals, BufferUsageHint.StaticDraw);
 

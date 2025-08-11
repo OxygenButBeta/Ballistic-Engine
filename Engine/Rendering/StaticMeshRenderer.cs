@@ -1,4 +1,6 @@
-﻿namespace BallisticEngine;
+﻿using BallisticEngine.Rendering;
+
+namespace BallisticEngine;
 
 public class StaticMeshRenderer : Renderer {
     public override Mesh SharedMesh { get; protected set; }
@@ -19,8 +21,10 @@ public class StaticMeshRenderer : Renderer {
         Texture2D normalTexture = RenderAsset.Current.CreateTexture2D(normalPath,
             TextureType.Normal);
 
-        LegacyShader defaultLegacyShader = LegacyShader.CreateOrGetDefault();
-        SharedMaterial = Material.Create(defaultLegacyShader,defaultTexture,normalTexture);
+        Shader standardShader = Graphics.CreateStandardShader(DefaultShader.VertexShader,
+            DefaultShader.FragmentShader);
+        
+        SharedMaterial = Material.Create(standardShader,defaultTexture,normalTexture);
     }
 
     protected internal override void OnEnabled() {

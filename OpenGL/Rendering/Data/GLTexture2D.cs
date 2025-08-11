@@ -70,7 +70,10 @@ public sealed class GLTexture2D : Texture2D
 
         GL.GenerateMipmap(GenerateMipmapTarget.Texture2D);
         isUploaded = true;
-
+        
+        GL.GetFloat((GetPName)All.MaxTextureMaxAnisotropyExt, out float maxAniso);
+        GL.TexParameter(TextureTarget.Texture2D, (TextureParameterName)All.TextureMaxAnisotropyExt, maxAniso);
+        
         Deactivate();
     }
 

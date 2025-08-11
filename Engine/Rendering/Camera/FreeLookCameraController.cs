@@ -4,31 +4,33 @@ using OpenTK.Windowing.GraphicsLibraryFramework;
 namespace BallisticEngine;
 
 public class FreeLookCameraController : Behaviour {
-    IWindow window;
-    float moveSpeed = 5f;
-    float mouseSensitivity = .2f;
-    bool isRightMouseDown = false;
+    float moveSpeed = 10f;
+    const float mouseSensitivity = .2f;
+    bool isRightMouseDown;
     Vector2 lastMousePosition;
+    
+    float pitch;
+    float yaw;
     protected internal override void OnBegin()
     {
-        window = Window.Current;
         lastMousePosition = Input.MousePosition;
     }
 
     protected internal override void Tick(in float deltaTime) {
-        HandleMouse(deltaTime);
+        HandleMouse();
         HandleMovement(deltaTime);
-        if (Input.ScrollDelta.Y > 0) {
-            moveSpeed += 1f; // Scroll yukarı hareket hızını artırır
-        } else if (Input.ScrollDelta.Y < 0) {
-            moveSpeed = Math.Max(1f, moveSpeed - 1f ); // Scroll aşağı hareket hızını azaltır, minimum 1f
+        switch (Input.ScrollDelta.Y) {
+            case > 0:
+                moveSpeed += 1f;
+                break;
+            case < 0:
+                moveSpeed = Math.Max(1f, moveSpeed - 1f );
+                break;
         }
     }
 
-    float pitch; // -90/+90 arası
-    float yaw;   // -sonsuz/+sonsuz arası
 
-    private void HandleMouse(float deltaTime) {
+    void HandleMouse() {
         if (Input.IsMouseButtonDown(MouseButton.Right)) {
             if (!isRightMouseDown) {
                 isRightMouseDown = true;
@@ -53,8 +55,9 @@ public class FreeLookCameraController : Behaviour {
         }
     }
 
-    private void HandleMovement(float deltaTime) {
+    void HandleMovement(float deltaTime) {
        
+        float tempSpeed = moveSpeed;
         Vector3 direction = Vector3.Zero;
 
         if (Input.IsKeyDown(Keys.W))
@@ -67,10 +70,14 @@ public class FreeLookCameraController : Behaviour {
             direction += transform.Right;
         if (Input.IsKeyDown(Keys.Space))
             direction += transform.Up;
-        if (Input.IsKeyDown(Keys.LeftShift))
+        if (Input.IsKeyDown(Keys.LeftControl))
             direction -= transform.Up;
+        if (Input.IsKeyDown(Keys.LeftShift))
+            tempSpeed *= 2f; 
+            
 
+        
         if (direction != Vector3.Zero)
-            transform.Position += direction.Normalized() * moveSpeed * deltaTime;
+            transform.Position += direction.Normalized() * tempSpeed * deltaTime;
     }
 }
