@@ -27,9 +27,9 @@ void main()
     mat4 modelMatrix = isInstanced
         ? transpose(mat4(instance_matrix_0, instance_matrix_1, instance_matrix_2, instance_matrix_3))
         : model;
-    texCoord = aTexCoord;
-   gl_Position = vec4(aPosition, 1.0) * modelMatrix * view * projection;
-return;
+   // texCoord = aTexCoord;
+   //gl_Position = vec4(aPosition, 1.0) * modelMatrix * view * projection;
+//return;
     vec3 T = normalize(mat3(modelMatrix) * aTangent);
     vec3 N = normalize(mat3(modelMatrix) * aNormal);
     vec3 B = normalize(cross(N, T)); // basit bitangent
@@ -56,8 +56,8 @@ uniform vec3 AmbientColor;
 
 void main()
 {
-   FragColor = texture(texture0, texCoord);
-return;
+  // FragColor = texture(texture0, texCoord);
+//return;
     vec3 normal = texture(texture1, texCoord).rgb;
     normal = normalize(normal * 2.0 - 1.0);
 

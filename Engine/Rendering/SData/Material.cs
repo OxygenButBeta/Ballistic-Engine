@@ -9,10 +9,12 @@ public class Material : BObject, ISharedResource {
     public Shader Shader { get; set; }
 
     Material(Texture2D diffuse, Shader shader, Texture2D normal) {
+                
+        ResourceIdentity normalIdentity = normal?.Identity ?? ResourceIdentity.Empty;
         Diffuse = diffuse;
         Normal = normal;
         Shader = shader;
-        Identity = ResourceIdentity.Combine(diffuse.Identity, shader.Identity, normal.Identity);
+        Identity = ResourceIdentity.Combine(diffuse.Identity, shader.Identity,normalIdentity);
         SharedResources<Material>.AddResource(this);
     }
 

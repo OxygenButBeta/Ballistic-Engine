@@ -22,7 +22,6 @@ public class GLHDRenderer : HDRenderer {
     public override void RenderOpaque(IReadOnlyCollection<IStaticMeshRenderer> renderTargets, RendererArgs args) {
         Matrix4 view = args.viewProjectionProvider.GetViewMatrix();
         Matrix4 projection = args.viewProjectionProvider.GetProjectionMatrix();
-        const float radius = 15.0f;
         foreach (IStaticMeshRenderer target in renderTargets) {
             if (target.RenderedThisFrame)
                 continue;
@@ -31,6 +30,21 @@ public class GLHDRenderer : HDRenderer {
             Shader shader = target.SharedMaterial.Shader;
             target.Activate();
 
+            
+            double time = Time.TotalTime * 0.5; // Daha yavaş dönüş
+            float radius = 15.0f;
+            float angle = (float)Math.Sin(time) * MathF.PI / 3f; // -60° ile +60° arası salınım (yaklaşık 120° yay)
+
+            Vector3 lightPos = new Vector3(
+                MathF.Cos(angle) * radius,
+                3.0f, // Sabit yükseklik 
+                MathF.Sin(angle) * radius
+            );
+            Vector3 lightColor = new Vector3(1.0f, 0.95f, 0.85f) * 10.0f;
+            
+            shader.SetFloat3("LightPos", lightPos);
+            shader.SetFloat3("LightColor", lightColor);
+            
             Matrix4 WorldMatrix = target.Transform.WorldMatrix;
             shader.SetMatrix4("view", ref view, true);
             shader.SetMatrix4("projection", ref projection, true);
@@ -65,6 +79,8 @@ public class GLHDRenderer : HDRenderer {
         Mesh mesh = target.SharedMesh;
         Shader shader = target.SharedMaterial.Shader;
         target.Activate();
+        
+
 
         shader.SetBool("isInstanced", true);
         shader.SetMatrix4("view", ref view, true);

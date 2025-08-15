@@ -1,7 +1,7 @@
 ﻿
 public static class SharedResources<T> where T : ISharedResource {
     static readonly Dictionary<ResourceIdentity, T> sharedResources = new();
-    const bool EnableSharedResources = true;
+    const bool EnableSharedResources = false;
 
     public static bool TryGetResource(ResourceIdentity identity, out T resource) {
         return sharedResources.TryGetValue(identity, out resource);

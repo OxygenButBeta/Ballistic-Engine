@@ -8,10 +8,10 @@ public static class SceneInit {
         cameraEntity.AddComponent<HDCamera>();
         cameraEntity.AddComponent<FreeLookCameraController>();
 
-        int columns = 100; // her satırda 10 kutu<
+        int columns = 10; // her satırda 10 kutu<
         float spacing = 4f;
 
-        for (int i = 0; i < 5000; i++) {
+        for (int i = 0; i < 3; i++) {
             Entity meshEntity = Entity.Instantiate("Mesh");
             meshEntity.AddComponent<StaticMeshRenderer>();
             meshEntity.AddComponent<Rotator>();
