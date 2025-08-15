@@ -3,23 +3,23 @@ using BallisticEngine.Rendering;
 
 public static class RendererHelpers
 {
-    public static List<BatchGroup<IOpaqueDrawable>> CreateBatchGroupsForOpaqueDrawables()
+    public static List<BatchGroup<IStaticMeshRenderer>> CreateBatchGroupsForOpaqueDrawables()
     {
-        List<BatchGroup<IOpaqueDrawable>> batchGroups = [];
+        List<BatchGroup<IStaticMeshRenderer>> batchGroups = [];
 
-        IGrouping<(Mesh SharedMesh, Material SharedMaterial), IOpaqueDrawable>[] groups = RuntimeSet<IOpaqueDrawable>.ReadOnlyCollection
+        IGrouping<(Mesh SharedMesh, Material SharedMaterial), IStaticMeshRenderer>[] groups = RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection
             .GroupBy(drawable => (drawable.SharedMesh, drawable.SharedMaterial)).ToArray();
 
-        foreach (IGrouping<(Mesh SharedMesh, Material SharedMaterial), IOpaqueDrawable> group in groups)
+        foreach (IGrouping<(Mesh SharedMesh, Material SharedMaterial), IStaticMeshRenderer> group in groups)
         {
             if (!group.Any())
                 continue;
 
-            BatchGroup<IOpaqueDrawable> batchGroup = BatchGroupPool<IOpaqueDrawable>.Rent();
+            BatchGroup<IStaticMeshRenderer> batchGroup = BatchGroupPool<IStaticMeshRenderer>.Rent();
 
             batchGroup.SetDrawable(group.First());
 
-            foreach (IOpaqueDrawable drawable in group) {
+            foreach (IStaticMeshRenderer drawable in group) {
                 batchGroup.Add(drawable);
                 drawable.RenderedThisFrame = true;
             }

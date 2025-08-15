@@ -2,15 +2,13 @@
 
 namespace BallisticEngine;
 
-public class Material : BObject, ISharedResource
-{
+public class Material : BObject, ISharedResource {
     public ResourceIdentity Identity { get; }
     public Texture2D Diffuse { get; set; }
     public Texture2D Normal { get; set; }
     public Shader Shader { get; set; }
 
-    Material(Texture2D diffuse, Shader shader, Texture2D normal)
-    {
+    Material(Texture2D diffuse, Shader shader, Texture2D normal) {
         Diffuse = diffuse;
         Normal = normal;
         Shader = shader;
@@ -18,33 +16,33 @@ public class Material : BObject, ISharedResource
         SharedResources<Material>.AddResource(this);
     }
 
-    public static Material Create(Shader legacyShader, Texture2D diffuse, Texture2D normal)
-    {
-        ResourceIdentity materialIdentity =
-            ResourceIdentity.Combine(diffuse.Identity, legacyShader.Identity, normal.Identity);
+    public static Material Create(Shader legacyShader, Texture2D diffuse, Texture2D normal = null) {
+        
+        ResourceIdentity normalIdentity = normal?.Identity ?? ResourceIdentity.Empty;
+
+        ResourceIdentity materialIdentity = ResourceIdentity.Combine(diffuse.Identity, legacyShader.Identity, normalIdentity);
+        
         return SharedResources<Material>.TryGetResource(materialIdentity, out Material sharedMaterial)
             ? sharedMaterial
             : new Material(diffuse, legacyShader, normal);
     }
 
-    public void Activate()
-    {
+    public void Activate() {
         if (ReferenceEquals(this, LastActivatedMaterial))
-            return; 
-        LastActivatedMaterial = this; 
+            return;
+        LastActivatedMaterial = this;
         Shader.Activate();
         Diffuse.Activate();
-        Normal.Activate();
+        Normal?.Activate();
     }
 
-    public void Deactivate()
-    {
+    public void Deactivate() {
         if (!ReferenceEquals(this, LastActivatedMaterial))
-            return; 
-        
+            return;
+
         Shader.Deactivate();
         Diffuse.Deactivate();
-        Normal.Deactivate();
+        Normal?.Deactivate();
         LastActivatedMaterial = null;
     }
 

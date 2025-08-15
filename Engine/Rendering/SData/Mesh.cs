@@ -25,19 +25,23 @@ public class Mesh : BObject {
         bool CreateInstanceBuffer = true) {
         renderContext = RenderAsset.Current.CreateRenderContext();
         renderContext.Activate();
+        
         vertexBuffer = RenderAsset.Current.CreateVertexBuffer(renderContext);
         UVBuffer = RenderAsset.Current.CreateUVBuffer(renderContext);
         normalBuffer = RenderAsset.Current.CreateNormalBuffer(renderContext);
         tangentBuffer = RenderAsset.Current.CreateTangentBuffer(renderContext);
         indexBuffer = RenderAsset.Current.CreateIndexBuffer(renderContext);
+        
         Vertices = vertices;
         Indices = indices;
         Tangents = tangents;
         UVs = uVs;
         Normals = normals;
+        
         InstanceBuffer = RenderAsset.Current.CreateInstancedBuffer(renderContext);
         InstanceBuffer.Create();
         FillBuffers();
+        
         renderContext.Deactivate();
         Debugging.SystemLog("Texture Created ", SystemLogPriority.High);
     }
@@ -62,7 +66,7 @@ public class Mesh : BObject {
             vertices[i] = new Vector3(v.X, v.Y, v.Z);
         }
 
-        var uvs = new Vector2[mesh.VertexCount];
+        Vector2[] uvs = new Vector2[mesh.VertexCount];
         if (mesh.TextureCoordinateChannelCount > 0 && mesh.HasTextureCoords(0)) {
             for (var i = 0; i < mesh.VertexCount; i++) {
                 Vector3D uv = mesh.TextureCoordinateChannels[0][i];
@@ -104,7 +108,7 @@ public class Mesh : BObject {
                 tangents[i] = Vector3.UnitX;
         }
 
-        Mesh importedMesh = new Mesh(vertices, indices, uvs, normals, tangents);
+        Mesh importedMesh = new(vertices, indices, uvs, normals, tangents);
         RuntimeCache<string, Mesh>.Add(filePath, importedMesh);
         return importedMesh;
     }

@@ -1,6 +1,6 @@
 ﻿using BallisticEngine;
 
-public interface IOpaqueDrawable : IDrawable {
+public interface IStaticMeshRenderer : IDrawable {
     Mesh SharedMesh { get; }
     Material SharedMaterial { get; }
     public void Activate();

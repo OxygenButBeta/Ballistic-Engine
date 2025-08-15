@@ -44,7 +44,7 @@ class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWindow
     {
         this.width = width;
         this.height = height;
-        Title = "Ballistic Engine | Alpha 0.1.0 |";
+        Title = "Ballistic ";
 
         EngineTimer = new GLTime();
         InputProvider = new GLInput(KeyboardState, MouseState);

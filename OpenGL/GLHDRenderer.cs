@@ -19,11 +19,11 @@ public class GLHDRenderer : HDRenderer {
     }
 
 
-    public override void RenderOpaque(IReadOnlyCollection<IOpaqueDrawable> renderTargets, RendererArgs args) {
+    public override void RenderOpaque(IReadOnlyCollection<IStaticMeshRenderer> renderTargets, RendererArgs args) {
         Matrix4 view = args.viewProjectionProvider.GetViewMatrix();
         Matrix4 projection = args.viewProjectionProvider.GetProjectionMatrix();
         const float radius = 15.0f;
-        foreach (IOpaqueDrawable target in renderTargets) {
+        foreach (IStaticMeshRenderer target in renderTargets) {
             if (target.RenderedThisFrame)
                 continue;
 
@@ -53,7 +53,7 @@ public class GLHDRenderer : HDRenderer {
             "Instancing is handled in RenderInstancing(BatchGroup<IOpaqueDrawable> batchGroup, RendererArgs args) method.");
     }
 
-    public override void RenderInstancing(BatchGroup<IOpaqueDrawable> batchGroup, RendererArgs args) {
+    public override void RenderInstancing(BatchGroup<IStaticMeshRenderer> batchGroup, RendererArgs args) {
         var instanceCount = batchGroup.Matrix4s.Count;
         if (instanceCount == 0)
             return;
@@ -61,7 +61,7 @@ public class GLHDRenderer : HDRenderer {
         Matrix4 view = args.viewProjectionProvider.GetViewMatrix();
         Matrix4 projection = args.viewProjectionProvider.GetProjectionMatrix();
 
-        IOpaqueDrawable target = batchGroup.Drawable;
+        IStaticMeshRenderer target = batchGroup.Drawable;
         Mesh mesh = target.SharedMesh;
         Shader shader = target.SharedMaterial.Shader;
         target.Activate();
@@ -90,11 +90,11 @@ public class GLHDRenderer : HDRenderer {
         ClearColorBuffer();
 
         if (RenderAsset.Current.InstancedDrawing) {
-            foreach (BatchGroup<IOpaqueDrawable> batchGroup in RendererHelpers.CreateBatchGroupsForOpaqueDrawables())
+            foreach (BatchGroup<IStaticMeshRenderer> batchGroup in RendererHelpers.CreateBatchGroupsForOpaqueDrawables())
                 RenderInstancing(batchGroup, args);
         }
 
-        RenderOpaque(RuntimeSet<IOpaqueDrawable>.ReadOnlyCollection, args);
+        RenderOpaque(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection, args);
 
         if (!anythingDrawnThisFrame)
             window.SwapFrameBuffers();
@@ -104,7 +104,7 @@ public class GLHDRenderer : HDRenderer {
     }
 
     public override void PostRenderCleanUp() {
-        foreach (IOpaqueDrawable opaqueDrawable in RuntimeSet<IOpaqueDrawable>.ReadOnlyCollection)
+        foreach (IStaticMeshRenderer opaqueDrawable in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
             opaqueDrawable.RenderedThisFrame = false;
     }
 
