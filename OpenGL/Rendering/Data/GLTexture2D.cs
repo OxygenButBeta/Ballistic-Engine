@@ -59,7 +59,6 @@ public sealed class GLTexture2D : Texture2D
             (int)TextureMinFilter.LinearMipmapLinear);
         GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
 
-        StbImage.stbi_set_flip_vertically_on_load(1);
 
         PixelInternalFormat internalFormat = TextureType == TextureType.Diffuse
             ? PixelInternalFormat.SrgbAlpha
