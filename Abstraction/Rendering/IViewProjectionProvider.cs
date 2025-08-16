@@ -9,4 +9,5 @@ public interface IViewProjectionProvider {
     Matrix4 GetProjectionMatrix();
     Matrix4 GetViewMatrix();
     Vector3 AmbientColor { get; }
+    Transform Transform { get; }
 }

@@ -2,19 +2,22 @@
 
 namespace BallisticEngine;
 
-public abstract class Shader : BObject, IDisposable, ISharedResource {
+public abstract class Shader : BObject, IDisposable, ISharedResource
+{
     public abstract ResourceIdentity Identity { get; }
     public abstract int UID { get; }
     static Shader ActiveShader;
     protected Shader() => SharedResources<Shader>.AddResource(this);
 
-    public void Dispose() {
+    public void Dispose()
+    {
         SharedResources<Shader>.RemoveResource(this);
         OnDispose();
     }
 
     protected abstract void OnDispose();
-    public void Activate() {
+    public void Activate()
+    {
         if (Equals(ActiveShader))
             return;
 
@@ -22,7 +25,8 @@ public abstract class Shader : BObject, IDisposable, ISharedResource {
         ActiveShader = this;
     }
 
-    public void Deactivate() {
+    public void Deactivate()
+    {
         if (!Equals(ActiveShader))
             return;
 

@@ -7,18 +7,24 @@ public static class RuntimeCache<TKey, TValue>
     where TKey : notnull
     where TValue : class
 {
+    static readonly Dictionary<TKey, TValue> cache = new();
+#if ENABLE_RESOURCE_CACHING
+    const bool DISABLE_CACHE = true;
+#else
     const bool DISABLE_CACHE = false;
-    private static readonly Dictionary<TKey, TValue> cache = new();
 
+#endif
+    
     public static void Add(TKey key, TValue value)
     {
         if (DISABLE_CACHE) return;
-        if (!cache.TryAdd(key, value))
-        {
+
+        if (cache.TryAdd(key, value))
             return;
-            throw new ArgumentException($"Key '{key}' already exists in the cache.");
-        }
+
+        throw new ArgumentException($"Key '{key}' already exists in the cache.");
     }
+
 
     public static bool TryGetValue(TKey key, out TValue value)
     {

@@ -19,12 +19,13 @@ public class Entity : BObject {
         IsActive = isActive;
     }
 
-    public void AddComponent<T>() where T : Behaviour, new() {
+    public T AddComponent<T>() where T : Behaviour, new() {
         T component = new();
         component.AttachToEntity(this);
         component.OnBegin();
         component.OnEnabled();
         Behaviours.Add(component);
+        return component;
     }
 
     public T GetComponent<T>() where T : Behaviour {

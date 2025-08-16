@@ -2,34 +2,27 @@
 
 namespace BallisticEngine;
 
-public class Material : BObject, ISharedResource {
+public class Material : BObject, ISharedResource
+{
     public ResourceIdentity Identity { get; }
     public Texture2D Diffuse { get; set; }
     public Texture2D Normal { get; set; }
     public Shader Shader { get; set; }
 
-    Material(Texture2D diffuse, Shader shader, Texture2D normal) {
-                
-        ResourceIdentity normalIdentity = normal?.Identity ?? ResourceIdentity.Empty;
+    Material(Shader shader, Texture2D diffuse, Texture2D normal)
+    {
         Diffuse = diffuse;
         Normal = normal;
         Shader = shader;
-        Identity = ResourceIdentity.Combine(diffuse.Identity, shader.Identity,normalIdentity);
-        SharedResources<Material>.AddResource(this);
     }
 
-    public static Material Create(Shader legacyShader, Texture2D diffuse, Texture2D normal = null) {
-        
-        ResourceIdentity normalIdentity = normal?.Identity ?? ResourceIdentity.Empty;
-
-        ResourceIdentity materialIdentity = ResourceIdentity.Combine(diffuse.Identity, legacyShader.Identity, normalIdentity);
-        
-        return SharedResources<Material>.TryGetResource(materialIdentity, out Material sharedMaterial)
-            ? sharedMaterial
-            : new Material(diffuse, legacyShader, normal);
+    public static Material Create(StandardShader standardShader, Texture2D diffuse, Texture2D normal = null)
+    {
+        return new Material(standardShader, diffuse, normal);
     }
 
-    public void Activate() {
+    public void Activate()
+    {
         if (ReferenceEquals(this, LastActivatedMaterial))
             return;
         LastActivatedMaterial = this;
@@ -38,7 +31,8 @@ public class Material : BObject, ISharedResource {
         Normal?.Activate();
     }
 
-    public void Deactivate() {
+    public void Deactivate()
+    {
         if (!ReferenceEquals(this, LastActivatedMaterial))
             return;
 

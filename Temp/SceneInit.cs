@@ -15,8 +15,8 @@ public static class SceneInit {
             Entity meshEntity = Entity.Instantiate("Mesh");
             meshEntity.AddComponent<StaticMeshRenderer>();
             meshEntity.AddComponent<Rotator>();
-            meshEntity.GetComponent<Rotator>().RotationSpeed = Random.Shared.Next(-90, 90);
-
+            meshEntity.GetComponent<Rotator>().RotationSpeed =  Random.Shared.Next(-20, 20);
+            meshEntity.GetComponent<Rotator>().Alpha = true;
             int x = i % columns; 
             int z = i / columns; 
 
@@ -24,5 +24,9 @@ public static class SceneInit {
             meshEntity.transform.EulerAngles = new Vector3(90, 180, 0);
             meshEntity.transform.Scale = Vector3.One * 6;
         }
+        Entity lightEntity = Entity.Instantiate("Directional Light");
+        lightEntity.AddComponent<DirectionalLight>();
+        StaticMeshRenderer.instanceCount = 1;
+        lightEntity.AddComponent<StaticMeshRenderer>();
     }
 }

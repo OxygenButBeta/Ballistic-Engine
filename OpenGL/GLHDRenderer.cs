@@ -5,12 +5,14 @@ using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
-public class GLHDRenderer : HDRenderer {
+public class GLHDRenderer : HDRenderer
+{
     IWindow window;
     bool anythingDrawnThisFrame;
 
 
-    public override void Initialize() {
+    public override void Initialize()
+    {
         window = Window.Current;
         GL.Enable(EnableCap.DepthTest);
         GL.CullFace(TriangleFace.Back);
@@ -19,36 +21,30 @@ public class GLHDRenderer : HDRenderer {
     }
 
 
-    public override void RenderOpaque(IReadOnlyCollection<IStaticMeshRenderer> renderTargets, RendererArgs args) {
+    public override void RenderOpaque(IReadOnlyCollection<IStaticMeshRenderer> renderTargets, RendererArgs args)
+    {
         Matrix4 view = args.viewProjectionProvider.GetViewMatrix();
         Matrix4 projection = args.viewProjectionProvider.GetProjectionMatrix();
-        foreach (IStaticMeshRenderer target in renderTargets) {
+        foreach (IStaticMeshRenderer target in renderTargets)
+        {
             if (target.RenderedThisFrame)
                 continue;
 
             Mesh mesh = target.SharedMesh;
             Shader shader = target.SharedMaterial.Shader;
             target.Activate();
-
             
-            double time = Time.TotalTime * 0.5; // Daha yavaş dönüş
-            float radius = 15.0f;
-            float angle = (float)Math.Sin(time) * MathF.PI / 3f; // -60° ile +60° arası salınım (yaklaşık 120° yay)
-
-            Vector3 lightPos = new Vector3(
-                MathF.Cos(angle) * radius,
-                3.0f, // Sabit yükseklik 
-                MathF.Sin(angle) * radius
-            );
-            Vector3 lightColor = new Vector3(1.0f, 0.95f, 0.85f) * 10.0f;
-            
-            shader.SetFloat3("LightPos", lightPos);
-            shader.SetFloat3("LightColor", lightColor);
+            shader.SetFloat3("LightPos", DirectionalLight.Instance.transform.EulerAngles);
+            shader.SetFloat3("LightColor", DirectionalLight.Instance.LightColor);
+            shader.SetFloat3("AmbientLight", DirectionalLight.Instance.AmbientLight);
             
             Matrix4 WorldMatrix = target.Transform.WorldMatrix;
-            shader.SetMatrix4("view", ref view, true);
-            shader.SetMatrix4("projection", ref projection, true);
-            shader.SetMatrix4("model", ref WorldMatrix, true);
+            shader.SetInt("Diffuse",0);
+            shader.SetInt("Normal", 1);
+            shader.SetMatrix4("view", ref view);
+            shader.SetMatrix4("projection", ref projection);
+            shader.SetMatrix4("model", ref WorldMatrix);
+            shader.SetFloat3("CameraPos", args.viewProjectionProvider.Transform.Position);
 
             GL.DrawElements(PrimitiveType.Triangles, mesh.Indices.Length, DrawElementsType.UnsignedInt, 0);
 
@@ -58,16 +54,19 @@ public class GLHDRenderer : HDRenderer {
         }
     }
 
-    public override void RenderSkybox(IReadOnlyCollection<ISkyboxDrawable> renderTargets, RendererArgs args) {
+    public override void RenderSkybox(IReadOnlyCollection<ISkyboxDrawable> renderTargets, RendererArgs args)
+    {
         throw new NotImplementedException();
     }
 
-    public override void RenderInstancing(Mesh mesh, Material material, Matrix4[] transforms, RendererArgs args) {
+    public override void RenderInstancing(Mesh mesh, Material material, Matrix4[] transforms, RendererArgs args)
+    {
         throw new NotImplementedException(
             "Instancing is handled in RenderInstancing(BatchGroup<IOpaqueDrawable> batchGroup, RendererArgs args) method.");
     }
 
-    public override void RenderInstancing(BatchGroup<IStaticMeshRenderer> batchGroup, RendererArgs args) {
+    public override void RenderInstancing(BatchGroup<IStaticMeshRenderer> batchGroup, RendererArgs args)
+    {
         var instanceCount = batchGroup.Matrix4s.Count;
         if (instanceCount == 0)
             return;
@@ -79,7 +78,6 @@ public class GLHDRenderer : HDRenderer {
         Mesh mesh = target.SharedMesh;
         Shader shader = target.SharedMaterial.Shader;
         target.Activate();
-        
 
 
         shader.SetBool("isInstanced", true);
@@ -102,11 +100,14 @@ public class GLHDRenderer : HDRenderer {
         anythingDrawnThisFrame = true;
     }
 
-    public override RenderMetrics BeginRender(RendererArgs args) {
+    public override RenderMetrics BeginRender(RendererArgs args)
+    {
         ClearColorBuffer();
 
-        if (RenderAsset.Current.InstancedDrawing) {
-            foreach (BatchGroup<IStaticMeshRenderer> batchGroup in RendererHelpers.CreateBatchGroupsForOpaqueDrawables())
+        if (RenderAsset.Current.InstancedDrawing)
+        {
+            foreach (BatchGroup<IStaticMeshRenderer> batchGroup in
+                     RendererHelpers.CreateBatchGroupsForOpaqueDrawables())
                 RenderInstancing(batchGroup, args);
         }
 
@@ -119,14 +120,16 @@ public class GLHDRenderer : HDRenderer {
         return new RenderMetrics();
     }
 
-    public override void PostRenderCleanUp() {
+    public override void PostRenderCleanUp()
+    {
         foreach (IStaticMeshRenderer opaqueDrawable in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
             opaqueDrawable.RenderedThisFrame = false;
     }
 
 
-    void ClearColorBuffer() {
-        GL.ClearColor(0.0f, 0.4f, 0.7f, 1f);
+    void ClearColorBuffer()
+    {
+        GL.ClearColor(0.4f, 0.55f, 0.65f, 1.0f);
         GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit |
                  ClearBufferMask.StencilBufferBit);
     }

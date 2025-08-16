@@ -1,5 +1,4 @@
-﻿using BallisticEngine.Shared.Runtime_Set;
-using OpenTK.Graphics.OpenGL;
+﻿using OpenTK.Graphics.OpenGL;
 using StbImageSharp;
 
 namespace BallisticEngine;
@@ -13,12 +12,6 @@ public sealed class GLTexture2D : Texture2D
 
     public override void Activate()
     {
-        if (!isUploaded)
-        {
-            GPUTexture();
-            isUploaded = true;
-        }
-
         GL.ActiveTexture((TextureUnit)TextureType);
         GL.BindTexture(TextureTarget.Texture2D, UID);
     }

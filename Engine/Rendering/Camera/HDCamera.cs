@@ -35,6 +35,8 @@ public class HDCamera : Behaviour, IViewProjectionProvider
     public Vector3 AmbientColor =>
         baseAmbientColor * LightIntensity;
 
+    public Transform Transform => transform;
+
     Vector3 baseAmbientColor = new Vector3(0.1f, 0.1f, 0.15f);
 
     protected internal override void Tick(in float delta)

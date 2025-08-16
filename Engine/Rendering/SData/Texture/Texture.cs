@@ -22,9 +22,9 @@ public abstract class Texture : BObject, IDisposable, ISharedResource
     public static TTargetTexture ImportFromFile<TTargetTexture>(string path, TextureType textureType)
         where TTargetTexture : Texture, new()
     {
-        if (SharedResources<TTargetTexture>.TryGetResource(path, out TTargetTexture sharedTexture))
+        if (SharedResources<TTargetTexture>.TryGetResource(path+textureType, out TTargetTexture sharedTexture))
         {
-            return sharedTexture;
+           return sharedTexture;
         }
 
         TTargetTexture textureInstance = new();
@@ -38,8 +38,8 @@ public abstract class Texture : BObject, IDisposable, ISharedResource
 
 
         textureInstance.Import(texture, textureType);
-        textureInstance.Identity = path;
-        SharedResources<TTargetTexture>.AddResource(textureInstance);
+        textureInstance.Identity = path+textureType;
+       SharedResources<TTargetTexture>.AddResource(textureInstance);
         return textureInstance;
     }
 }
