@@ -8,10 +8,10 @@ public class DirectionalLight : Behaviour
     public static DirectionalLight Instance;
     public Vector3 AmbientLight => _ambientColor * ambientIntensity;
     Vector3 _ambientColor = new Vector3(0.35f, 0.40f, 0.45f);
-    float ambientIntensity = .3f;
+    public float ambientIntensity = .2f;
     public Vector3 LightColor => _lightColor * LightIntensity;
-    readonly Vector3 _lightColor = new Vector3(1.0f, 0.95f, 0.85f);
-    float LightIntensity = 5f;
+    readonly Vector3 _lightColor = new Vector3(0.55f, 0.65f, 0.7f);
+   public float LightIntensity = 0;
 
 
     protected internal override void OnBegin()

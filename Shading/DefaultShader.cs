@@ -1,10 +1,10 @@
-﻿    namespace BallisticEngine.Rendering;
+﻿namespace BallisticEngine.Rendering;
 
-    //Just a text structure for the shaders
-    // TODO: Implement a shader loader
-    public struct DefaultShader
-    {
-        public const string VertexShader = @"#version 330 core
+//Just a text structure for the shaders
+// TODO: Implement a shader loader
+public struct DefaultShader
+{
+    public const string VertexShader = @"#version 330 core
     layout (location = 0) in vec3 aPosition; 
     layout (location = 1) in vec2 aTexCoord; 
     layout(location = 2) in vec3 aNormal; 
@@ -37,7 +37,7 @@
 
     }";
 
-        public const string FragmentShader = @"#version 330 core
+    public const string FragmentShader = @"#version 330 core
 
     in vec2 texCoord;
     in vec3 fragNormal;
@@ -50,6 +50,8 @@
     uniform vec3 LightPos;
     uniform vec3 LightColor;
     uniform vec3 AmbientLight;
+    uniform bool EnableAtmosphericScattering;
+
 uniform vec3 CameraPos;
 
     void main()
@@ -69,7 +71,18 @@ uniform vec3 CameraPos;
     vec3 reflectDir = reflect(-lightDir, normal);
     float spec = pow(max(dot(viewDir, reflectDir), 0.0), 32.0);
     vec3 specular = spec * LightColor * 0.3;
+
+if (EnableAtmosphericScattering)
+{
+float distance = length(CameraPos - fragPos);
+float fogFactor = clamp(exp(-distance * 0.02), 0.0, 1.0);
+fogFactor = mix(1.0, fogFactor, 0.7);
+vec3 fogColor = normalize(AmbientLight);
+color = mix(fogColor, color, fogFactor);
+}
+
+
     FragColor = vec4(color, 1.0);
 }
     ";
-    }
+}

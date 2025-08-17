@@ -2,14 +2,16 @@
 using BallisticEngine.OpenGL;
 using OpenTK.Mathematics;
 
-public sealed class OpenGLRenderAsset : RenderAsset {
+public sealed class OpenGLRenderAsset : RenderAsset
+{
     public override bool InstancedDrawing => false;
     public override HDRenderer Renderer { get; protected set; }
 
-    public override void Initialize() {
+    public override void Initialize()
+    {
+        Current = this;
         Renderer = new GLHDRenderer();
         Renderer.Initialize();
-        Current = this;
     }
 
     public override RenderContext CreateRenderContext() => new OpenGLRenderContext();
@@ -33,17 +35,19 @@ public sealed class OpenGLRenderAsset : RenderAsset {
         return new GLTangentBuffer(renderContext);
     }
 
-    public override GPUBuffer<T> CreateBuffer<T>(RenderContext renderContext) {
+    public override GPUBuffer<T> CreateBuffer<T>(RenderContext renderContext)
+    {
         return new GLBuffer<T>(renderContext);
     }
 
-    public override InstancedBuffer CreateInstancedBuffer(RenderContext renderContext) {
+    public override InstancedBuffer CreateInstancedBuffer(RenderContext renderContext)
+    {
         return new GLInstancedBuffer(renderContext);
     }
 
     public override Texture2D CreateTexture2D(string filePath, TextureType type) =>
         Texture.ImportFromFile<GLTexture2D>(filePath, type);
 
-    public override Texture3D CreateTexture3D(string filePath) =>
-        Texture.ImportFromFile<GLTexture3D>(filePath, TextureType.Diffuse);
+    public override Texture3D CreateTexture3D(string[] facePaths) =>
+        Texture3D.ImportFromFile<GLTexture3D>(facePaths);
 }

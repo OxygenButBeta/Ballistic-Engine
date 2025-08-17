@@ -51,5 +51,5 @@ public static class Graphics
         RenderAsset.Current.CreateTexture2D(filePath, type);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static Texture3D CreateTexture3D(string filePath) => RenderAsset.Current.CreateTexture3D(filePath);
+    public static Texture3D CreateTexture3D(string[] facePaths) => RenderAsset.Current.CreateTexture3D(facePaths);
 }

@@ -1,5 +1,6 @@
 ﻿using System.Buffers;
 using BallisticEngine.Rendering;
+using BallisticEngine.Sky;
 using OpenTK.Graphics.OpenGL4;
 using OpenTK.Mathematics;
 
@@ -11,9 +12,13 @@ public class GLHDRenderer : HDRenderer
     bool anythingDrawnThisFrame;
 
 
+    SkyboxRenderer skyboxRenderer;
+
     public override void Initialize()
     {
         window = Window.Current;
+        skyboxRenderer = new SkyboxRenderer();
+        skyboxRenderer.init();
         GL.Enable(EnableCap.DepthTest);
         GL.CullFace(TriangleFace.Back);
         GL.Enable(EnableCap.CullFace);
@@ -33,13 +38,15 @@ public class GLHDRenderer : HDRenderer
             Mesh mesh = target.SharedMesh;
             Shader shader = target.SharedMaterial.Shader;
             target.Activate();
-            
+
             shader.SetFloat3("LightPos", DirectionalLight.Instance.transform.EulerAngles);
             shader.SetFloat3("LightColor", DirectionalLight.Instance.LightColor);
-            shader.SetFloat3("AmbientLight", DirectionalLight.Instance.AmbientLight);
-            
+            shader.SetFloat3("AmbientLight",
+                DirectionalLight.Instance.ambientIntensity * skyboxRenderer.cubemapTexture.skyAmbient);
+            shader.SetBool("EnableAtmosphericScattering", skyboxRenderer.AtmosphereScattering);
+
             Matrix4 WorldMatrix = target.Transform.WorldMatrix;
-            shader.SetInt("Diffuse",0);
+            shader.SetInt("Diffuse", 0);
             shader.SetInt("Normal", 1);
             shader.SetMatrix4("view", ref view);
             shader.SetMatrix4("projection", ref projection);
@@ -113,9 +120,12 @@ public class GLHDRenderer : HDRenderer
 
         RenderOpaque(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection, args);
 
+
+        skyboxRenderer.PreRenderCallback(args);
+        skyboxRenderer.RenderSkybox();
+        skyboxRenderer.PostRenderCallback(args);
         if (!anythingDrawnThisFrame)
             window.SwapFrameBuffers();
-
 
         return new RenderMetrics();
     }
