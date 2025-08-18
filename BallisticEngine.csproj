@@ -7,7 +7,7 @@
         <Nullable>disable</Nullable>
 
         <DefineConstants>
-            fENABLE_RESOURCE_CACHING;
+            ENABLE_RESOURCE_CACHING;
         </DefineConstants>
         
     </PropertyGroup>

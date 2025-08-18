@@ -7,9 +7,9 @@ public sealed class OpenGLRenderAsset : RenderAsset {
     public override HDRenderer Renderer { get; protected set; }
 
     public override void Initialize() {
+        Current = this;
         Renderer = new GLHDRenderer();
         Renderer.Initialize();
-        Current = this;
     }
 
     public override RenderContext CreateRenderContext() => new OpenGLRenderContext();
@@ -44,6 +44,6 @@ public sealed class OpenGLRenderAsset : RenderAsset {
     public override Texture2D CreateTexture2D(string filePath, TextureType type) =>
         Texture.ImportFromFile<GLTexture2D>(filePath, type);
 
-    public override Texture3D CreateTexture3D(string filePath) =>
-        Texture.ImportFromFile<GLTexture3D>(filePath, TextureType.Diffuse);
+    public override Texture3D CreateTexture3D(string[] paths) =>
+        Texture3D.ImportCubeMapFromFile<GLTexture3D>(paths);
 }

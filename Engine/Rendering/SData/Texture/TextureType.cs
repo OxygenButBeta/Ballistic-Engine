@@ -6,6 +6,8 @@ public enum TextureType
 {
     Diffuse = TextureUnit.Texture0,
     Normal = TextureUnit.Texture1,
-    Specular = TextureUnit.Texture2,
-    Metallic = TextureUnit.Texture3
+    Metallic = TextureUnit.Texture2,
+    Roughness = TextureUnit.Texture3,
+    AO = TextureUnit.Texture4,
+    SkyBox = TextureUnit.Texture11,
 }

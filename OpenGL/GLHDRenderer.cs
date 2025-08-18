@@ -1,18 +1,20 @@
 ﻿using System.Buffers;
 using BallisticEngine.Rendering;
+using BallisticEngine.Sky;
 using OpenTK.Graphics.OpenGL4;
 using OpenTK.Mathematics;
+using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine;
 
-public class GLHDRenderer : HDRenderer
-{
+public class GLHDRenderer : HDRenderer {
     IWindow window;
     bool anythingDrawnThisFrame;
+    SkyboxRenderer skyboxRenderer;
 
-
-    public override void Initialize()
-    {
+    public override void Initialize() {
+        skyboxRenderer = new SkyboxRenderer();
+        skyboxRenderer.init();
         window = Window.Current;
         GL.Enable(EnableCap.DepthTest);
         GL.CullFace(TriangleFace.Back);
@@ -20,27 +22,37 @@ public class GLHDRenderer : HDRenderer
         GL.FrontFace(FrontFaceDirection.Ccw);
     }
 
-
-    public override void RenderOpaque(IReadOnlyCollection<IStaticMeshRenderer> renderTargets, RendererArgs args)
-    {
+    public float Metallic = 0.2f;
+    public float RoughnessValue = .5f;
+int renderMode = 0;
+    public override void RenderOpaque(IReadOnlyCollection<IStaticMeshRenderer> renderTargets, RendererArgs args) {
         Matrix4 view = args.viewProjectionProvider.GetViewMatrix();
         Matrix4 projection = args.viewProjectionProvider.GetProjectionMatrix();
-        foreach (IStaticMeshRenderer target in renderTargets)
-        {
+        foreach (IStaticMeshRenderer target in renderTargets) {
             if (target.RenderedThisFrame)
                 continue;
 
             Mesh mesh = target.SharedMesh;
             Shader shader = target.SharedMaterial.Shader;
             target.Activate();
-            
+
             shader.SetFloat3("LightPos", DirectionalLight.Instance.transform.EulerAngles);
-            shader.SetFloat3("LightColor", DirectionalLight.Instance.LightColor);
-            shader.SetFloat3("AmbientLight", DirectionalLight.Instance.AmbientLight);
-            
+            shader.SetFloat3("LightColor", skyboxRenderer.cubemapTexture.skyAmbient*DirectionalLight.Instance.LightIntensity);
+            shader.SetFloat3("AmbientLight", DirectionalLight.Instance.ambientIntensity*skyboxRenderer.cubemapTexture.skyAmbient);
+            shader.SetFloat("MetallicMultiplier", Metallic);
+            shader.SetFloat("SmoothnessMultiplier", RoughnessValue);
+
             Matrix4 WorldMatrix = target.Transform.WorldMatrix;
-            shader.SetInt("Diffuse",0);
+
+            shader.SetInt("Diffuse", 0);
             shader.SetInt("Normal", 1);
+            shader.SetInt("Metallic", 2);
+            shader.SetInt("Roughness", 3);
+            shader.SetInt("Skybox", 11);
+            shader.SetInt("AO", 4);
+            shader.SetInt("renderMode", renderMode);
+            shader.SetBool("EnableAtmosphericScattering", skyboxRenderer.AtmosphereScattering);
+
             shader.SetMatrix4("view", ref view);
             shader.SetMatrix4("projection", ref projection);
             shader.SetMatrix4("model", ref WorldMatrix);
@@ -54,19 +66,16 @@ public class GLHDRenderer : HDRenderer
         }
     }
 
-    public override void RenderSkybox(IReadOnlyCollection<ISkyboxDrawable> renderTargets, RendererArgs args)
-    {
+    public override void RenderSkybox(IReadOnlyCollection<ISkyboxDrawable> renderTargets, RendererArgs args) {
         throw new NotImplementedException();
     }
 
-    public override void RenderInstancing(Mesh mesh, Material material, Matrix4[] transforms, RendererArgs args)
-    {
+    public override void RenderInstancing(Mesh mesh, Material material, Matrix4[] transforms, RendererArgs args) {
         throw new NotImplementedException(
             "Instancing is handled in RenderInstancing(BatchGroup<IOpaqueDrawable> batchGroup, RendererArgs args) method.");
     }
 
-    public override void RenderInstancing(BatchGroup<IStaticMeshRenderer> batchGroup, RendererArgs args)
-    {
+    public override void RenderInstancing(BatchGroup<IStaticMeshRenderer> batchGroup, RendererArgs args) {
         var instanceCount = batchGroup.Matrix4s.Count;
         if (instanceCount == 0)
             return;
@@ -100,35 +109,60 @@ public class GLHDRenderer : HDRenderer
         anythingDrawnThisFrame = true;
     }
 
-    public override RenderMetrics BeginRender(RendererArgs args)
-    {
+    public override RenderMetrics BeginRender(RendererArgs args) {
         ClearColorBuffer();
 
-        if (RenderAsset.Current.InstancedDrawing)
-        {
+
+        if (RenderAsset.Current.InstancedDrawing) {
             foreach (BatchGroup<IStaticMeshRenderer> batchGroup in
                      RendererHelpers.CreateBatchGroupsForOpaqueDrawables())
                 RenderInstancing(batchGroup, args);
         }
 
         RenderOpaque(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection, args);
+        if (Input.IsKeyDown(Keys.KeyPad0)) {
+            Metallic += 0.002f;
+            Metallic = Math.Clamp(Metallic, 0f, 1f);
+        }
+
+        if (Input.IsKeyDown(Keys.KeyPad1)) {
+            Metallic -= 0.002f;
+            Metallic = Math.Clamp(Metallic, 0f, 1f);
+        }
+
+        if (Input.IsKeyDown(Keys.KeyPad2)) {
+            RoughnessValue += 0.002f;
+            RoughnessValue = Math.Clamp(RoughnessValue, 0f, 1f);
+        }
+
+        if (Input.IsKeyDown(Keys.KeyPad3)) {
+            RoughnessValue -= 0.002f;
+            RoughnessValue = Math.Clamp(RoughnessValue, 0f, 1f);
+        }
+
+        if (Input.IsKeyPressed(Keys.KeyPad5)) {
+            renderMode++;            
+            if (renderMode > 5)      
+                renderMode = 0;     
+        }
+
+        skyboxRenderer.RotUpdate();
+        skyboxRenderer.PreRenderCallback(args);
+        skyboxRenderer.RenderSkybox();
+        skyboxRenderer.PostRenderCallback(args);
 
         if (!anythingDrawnThisFrame)
             window.SwapFrameBuffers();
-
-
         return new RenderMetrics();
     }
 
-    public override void PostRenderCleanUp()
-    {
+    public override void PostRenderCleanUp() {
         foreach (IStaticMeshRenderer opaqueDrawable in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
             opaqueDrawable.RenderedThisFrame = false;
     }
 
 
-    void ClearColorBuffer()
-    {
+    void ClearColorBuffer() {
         GL.ClearColor(0.4f, 0.55f, 0.65f, 1.0f);
         GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit |
                  ClearBufferMask.StencilBufferBit);

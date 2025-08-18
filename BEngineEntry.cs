@@ -37,6 +37,7 @@ public sealed class BEngineEntry
     int logFpsInterval = 0;
     void EngineUpdate(double delta)
     {
+        Runtime.Window.SetFrequency(600);
         Runtime.EngineTimer.Update(delta);
         if (logFpsInterval++ >= logFpsInNFrame)
         {

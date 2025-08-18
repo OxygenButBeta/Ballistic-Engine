@@ -18,5 +18,5 @@ public abstract class RenderAsset
     public abstract GPUBuffer<T> CreateBuffer<T>(RenderContext renderContext) where T : unmanaged;
     public abstract InstancedBuffer CreateInstancedBuffer(RenderContext renderContext);
     public abstract Texture2D CreateTexture2D(string filePath, TextureType type);
-    public abstract Texture3D CreateTexture3D(string filePath);
+    public abstract Texture3D CreateTexture3D(string[] paths);
 }
