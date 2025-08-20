@@ -37,10 +37,11 @@ int renderMode = 0;
             target.Activate();
 
             shader.SetFloat3("LightPos", DirectionalLight.Instance.transform.EulerAngles);
-            shader.SetFloat3("LightColor", skyboxRenderer.cubemapTexture.skyAmbient*DirectionalLight.Instance.LightIntensity);
+            shader.SetFloat3("LightColor", DirectionalLight.Instance.LightIntensity * skyboxRenderer.cubemapTexture.skyAmbient);
             shader.SetFloat3("AmbientLight", DirectionalLight.Instance.ambientIntensity*skyboxRenderer.cubemapTexture.skyAmbient);
             shader.SetFloat("MetallicMultiplier", Metallic);
             shader.SetFloat("SmoothnessMultiplier", RoughnessValue);
+            shader.SetFloat("rimPower", RimPower);
 
             Matrix4 WorldMatrix = target.Transform.WorldMatrix;
 
@@ -51,8 +52,8 @@ int renderMode = 0;
             shader.SetInt("Skybox", 11);
             shader.SetInt("AO", 4);
             shader.SetInt("renderMode", renderMode);
-            shader.SetBool("EnableAtmosphericScattering", skyboxRenderer.AtmosphereScattering);
-
+            shader.SetFloat("NormalStrength",NormalStrength);
+            shader.SetBool("EnableAtmosphericScattering", fogEnabled);
             shader.SetMatrix4("view", ref view);
             shader.SetMatrix4("projection", ref projection);
             shader.SetMatrix4("model", ref WorldMatrix);
@@ -65,6 +66,9 @@ int renderMode = 0;
             anythingDrawnThisFrame = true;
         }
     }
+
+    public float NormalStrength { get; set; } = 1f;
+    public float RimPower { get; set; } = 3f;
 
     public override void RenderSkybox(IReadOnlyCollection<ISkyboxDrawable> renderTargets, RendererArgs args) {
         throw new NotImplementedException();
@@ -131,13 +135,27 @@ int renderMode = 0;
         }
 
         if (Input.IsKeyDown(Keys.KeyPad2)) {
-            RoughnessValue += 0.002f;
+            RoughnessValue += 0.02f;
             RoughnessValue = Math.Clamp(RoughnessValue, 0f, 1f);
+        }
+        if (Input.IsKeyDown(Keys.KeyPad9)) {
+            NormalStrength += 0.002f;
+        }
+
+        if (Input.IsKeyDown(Keys.KeyPad8)) {
+            NormalStrength-= 0.002f;
         }
 
         if (Input.IsKeyDown(Keys.KeyPad3)) {
-            RoughnessValue -= 0.002f;
+            RoughnessValue -= 0.02f;
             RoughnessValue = Math.Clamp(RoughnessValue, 0f, 1f);
+        }
+        
+        if (Input.IsKeyDown(Keys.KeyPadDivide)) {
+            RimPower -= 0.002f;
+        }
+        if (Input.IsKeyDown(Keys.KeyPadMultiply)) {
+            RimPower += 0.002f;
         }
 
         if (Input.IsKeyPressed(Keys.KeyPad5)) {
@@ -151,10 +169,16 @@ int renderMode = 0;
         skyboxRenderer.RenderSkybox();
         skyboxRenderer.PostRenderCallback(args);
 
+        if (Input.IsKeyPressed(Keys.P))
+        {
+            fogEnabled = !fogEnabled;
+            Console.WriteLine(fogEnabled);
+        }
         if (!anythingDrawnThisFrame)
             window.SwapFrameBuffers();
         return new RenderMetrics();
     }
+    bool fogEnabled = true;
 
     public override void PostRenderCleanUp() {
         foreach (IStaticMeshRenderer opaqueDrawable in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)

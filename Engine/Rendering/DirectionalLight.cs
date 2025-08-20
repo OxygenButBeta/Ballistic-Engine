@@ -23,20 +23,20 @@ public class DirectionalLight : Behaviour
     {
         if (Input.IsKeyDown(Keys.U))
         {
-            LightIntensity += 0.01f;
+            LightIntensity += 0.1f;
         }
         else if (Input.IsKeyDown(Keys.L))
         {
-            LightIntensity -= 0.01f;
+            LightIntensity -= 0.1f;
         }
 
         if (Input.IsKeyDown(Keys.Q))
         {
-            ambientIntensity += 0.001f;
+            ambientIntensity += 0.02f;
         }
         else if (Input.IsKeyDown(Keys.E))
         {
-            ambientIntensity -= 0.001f;
+            ambientIntensity -= 0.02f;
         }
 
 
