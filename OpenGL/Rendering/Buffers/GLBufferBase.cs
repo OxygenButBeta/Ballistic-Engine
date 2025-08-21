@@ -21,7 +21,6 @@ public abstract class GLBufferBase<TData>(RenderContext renderContext) : GPUBuff
             return;
 
         GL.DeleteBuffer(UID);
-        RuntimeSet<GPUBuffer<TData>>.Remove(this);
     }
 
     public override void Activate()

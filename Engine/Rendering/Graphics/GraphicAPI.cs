@@ -2,7 +2,7 @@
 using BallisticEngine;
 using OpenTK.Mathematics;
 
-public static class Graphics
+public static class GraphicAPI
 {
     public static StandardShader CreateStandardShader(string vertexCode, string fragmentCode)
     {
@@ -12,7 +12,6 @@ public static class Graphics
 
         return new GLStandardShader(vertexCode, fragmentCode);
     }
-
     public static HDRenderer Renderer => RenderAsset.Current.Renderer;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -23,8 +22,15 @@ public static class Graphics
         RenderAsset.Current.CreateIndexBuffer(renderContext);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static GPUBuffer<Vector3> CreateVertexBuffer(RenderContext renderContext) =>
-        RenderAsset.Current.CreateVertexBuffer(renderContext);
+    public static GPUBuffer<Vector3> CreateVertexBuffer3(RenderContext renderContext) =>
+        RenderAsset.Current.CreateVertexBuffer3(renderContext);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static GPUBuffer<Vector2> CreateVertexBuffer2(RenderContext renderContext) =>
+        RenderAsset.Current.CreateVertexBuffer2(renderContext);
+    
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static GPUBuffer<Vector2> CreateVertexBuffer2D(RenderContext renderContext) =>
+        RenderAsset.Current.CreateVertexBuffer2(renderContext);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static GPUBuffer<Vector2> CreateUVBuffer(RenderContext renderContext) =>

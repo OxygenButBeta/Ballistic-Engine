@@ -13,11 +13,13 @@
     out vec3 fragNormal;
     out vec3 fragPos;
     out mat3 fragTBN; 
+    out vec4 fragPosLightSpace;
 
     uniform bool isInstanced;
     uniform mat4 view;
     uniform mat4 projection;
     uniform mat4 model;
+    uniform mat4 lightSpaceMatrix;
 
     void main() 
     {
@@ -29,7 +31,8 @@
         vec3 N = normalize(mat3(transpose(inverse(modelMatrix))) * aNormal);
         vec3 B = normalize(cross(N, T));
         fragTBN = mat3(T, B, N);
-    
+        
+        fragPosLightSpace = lightSpaceMatrix * vec4(fragPos, 1.0);
         texCoord = aTexCoord;
         fragNormal = mat3(transpose(inverse(modelMatrix))) * aNormal; 
         fragPos = vec3(modelMatrix * vec4(aPosition,1.0));

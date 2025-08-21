@@ -39,7 +39,6 @@ public class GLInstancedBuffer(RenderContext renderContext)
 
     public override void Dispose() {
         GL.DeleteBuffer(UID);
-        RuntimeSet<InstancedBuffer>.Remove(this);
     }
 
     public override void Activate() {

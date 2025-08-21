@@ -17,19 +17,15 @@ public sealed class OpenGLRenderAsset : RenderAsset {
     public override GPUBuffer<uint> CreateIndexBuffer(RenderContext renderContext) =>
         new GlIndexBufferBase(renderContext);
 
-    public override GPUBuffer<Vector3> CreateVertexBuffer(RenderContext renderContext) =>
-        new GL3DBufferBase(renderContext);
 
     public override GPUBuffer<Vector2> CreateUVBuffer(RenderContext renderContext) =>
         new GLUVBuffer2D(renderContext);
 
-    public override GPUBuffer<Vector3> CreateNormalBuffer(RenderContext renderContext)
-    {
+    public override GPUBuffer<Vector3> CreateNormalBuffer(RenderContext renderContext) {
         return new GLNormalBuffer(renderContext);
     }
 
-    public override GPUBuffer<Vector3> CreateTangentBuffer(RenderContext renderContext)
-    {
+    public override GPUBuffer<Vector3> CreateTangentBuffer(RenderContext renderContext) {
         return new GLTangentBuffer(renderContext);
     }
 
@@ -46,4 +42,11 @@ public sealed class OpenGLRenderAsset : RenderAsset {
 
     public override Texture3D CreateTexture3D(string[] paths) =>
         Texture3D.ImportCubeMapFromFile<GLTexture3D>(paths);
+
+    public override GPUBuffer<Vector3> CreateVertexBuffer3(RenderContext renderContext) =>
+        new GL3DBufferBase(renderContext);
+
+    public override GPUBuffer<Vector2> CreateVertexBuffer2(RenderContext renderContext) {
+        return new GL2DBufferBase(renderContext);
+    }
 }

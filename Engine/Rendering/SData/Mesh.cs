@@ -28,11 +28,11 @@ public class Mesh : BObject
         renderContext = RenderAsset.Current.CreateRenderContext();
         renderContext.Activate();
 
-        vertexBuffer = Graphics.CreateVertexBuffer(renderContext);
-        UVBuffer = Graphics.CreateUVBuffer(renderContext);
-        normalBuffer = Graphics.CreateNormalBuffer(renderContext);
-        tangentBuffer = Graphics.CreateTangentBuffer(renderContext);
-        indexBuffer = Graphics.CreateIndexBuffer(renderContext);
+        vertexBuffer = GraphicAPI.CreateVertexBuffer3(renderContext);
+        UVBuffer = GraphicAPI.CreateUVBuffer(renderContext);
+        normalBuffer = GraphicAPI.CreateNormalBuffer(renderContext);
+        tangentBuffer = GraphicAPI.CreateTangentBuffer(renderContext);
+        indexBuffer = GraphicAPI.CreateIndexBuffer(renderContext);
 
         Vertices = vertices;
         Indices = indices;
@@ -40,7 +40,7 @@ public class Mesh : BObject
         UVs = uVs;
         Normals = normals;
 
-        InstanceBuffer = Graphics.CreateInstancedBuffer(renderContext);
+        InstanceBuffer = GraphicAPI.CreateInstancedBuffer(renderContext);
         InstanceBuffer.Create();
         FillBuffers();
 

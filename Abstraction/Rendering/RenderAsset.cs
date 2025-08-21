@@ -9,7 +9,7 @@ public abstract class RenderAsset
     public abstract void Initialize();
     public abstract RenderContext CreateRenderContext();
     public abstract GPUBuffer<uint> CreateIndexBuffer(RenderContext renderContext);
-    public abstract GPUBuffer<Vector3> CreateVertexBuffer(RenderContext renderContext);
+    public abstract GPUBuffer<Vector3> CreateVertexBuffer3(RenderContext renderContext);
     public abstract GPUBuffer<Vector2> CreateUVBuffer(RenderContext renderContext);
     public abstract GPUBuffer<Vector3> CreateNormalBuffer(RenderContext renderContext);
 
@@ -19,4 +19,5 @@ public abstract class RenderAsset
     public abstract InstancedBuffer CreateInstancedBuffer(RenderContext renderContext);
     public abstract Texture2D CreateTexture2D(string filePath, TextureType type);
     public abstract Texture3D CreateTexture3D(string[] paths);
+    public abstract GPUBuffer<Vector2> CreateVertexBuffer2(RenderContext renderContext);
 }

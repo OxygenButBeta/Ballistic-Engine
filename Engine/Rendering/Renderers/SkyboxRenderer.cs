@@ -71,7 +71,7 @@ public class SkyboxRenderer : ISkyboxDrawable
 
     public void init()
     {
-        renderContext = Graphics.CreateRenderContext();
+        renderContext = GraphicAPI.CreateRenderContext();
         renderContext.Activate();
 
         string rightPath = Path.Combine(AppContext.BaseDirectory, "Resources", "Default", "Sky", "right.jpg");
@@ -81,7 +81,7 @@ public class SkyboxRenderer : ISkyboxDrawable
         string frontPath = Path.Combine(AppContext.BaseDirectory, "Resources", "Default", "Sky", "front.jpg");
         string backPath = Path.Combine(AppContext.BaseDirectory, "Resources", "Default", "Sky", "back.jpg");
 
-        cubemapTexture = Graphics.CreateTexture3D([
+        cubemapTexture = GraphicAPI.CreateTexture3D([
             rightPath,
             leftPath,
             topPath,
@@ -91,10 +91,10 @@ public class SkyboxRenderer : ISkyboxDrawable
         ]);
 
 
-        cubemapVertexBuffer = Graphics.CreateVertexBuffer(renderContext);
+        cubemapVertexBuffer = GraphicAPI.CreateVertexBuffer3(renderContext);
         cubemapVertexBuffer.Create();
         cubemapVertexBuffer.SetBufferData(in skyboxVertices, BufferUsageHint.StaticDraw);
-        skyboxShader = Graphics.CreateStandardShader(skyboxVertexShader, skyboxFragmentShader);
+        skyboxShader = GraphicAPI.CreateStandardShader(skyboxVertexShader, skyboxFragmentShader);
     }
 
     public void RenderSkybox()
@@ -179,23 +179,7 @@ uniform samplerCube skybox;
 
 void main()
 {
-vec3 color = texture(skybox, TexCoords).rgb;
-
-color = vec3(1.0) - exp(-color * 1.2); 
-color *= 1.2;
-
-float contrast = 1.1;
-float brightness = 0.05;
-color = (color - 0.5) * contrast + 0.5 + brightness;
-
-float saturation = 1.2;
-vec3 gray = vec3(dot(color, vec3(0.2126, 0.7152, 0.0722)));
-color = mix(gray, color, saturation);
-
-color = pow(color, vec3(1.0/2.2));
-
-FragColor = vec4(color, 1.0);
-
+FragColor = texture(skybox, TexCoords);
 }
 ";
 }

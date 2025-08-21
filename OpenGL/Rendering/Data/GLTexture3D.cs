@@ -57,14 +57,14 @@ public sealed class GLTexture3D : Texture3D
             PixelInternalFormat internalFormat = PixelInternalFormat.Srgb; 
             PixelFormat pixelFormat = PixelFormat.Rgba;
 
-            for (int y = 0; y < img.Height; y++)
+            for (var y = 0; y < img.Height; y++)
             {
-                for (int x = 0; x < img.Width; x++)
+                for (var x = 0; x < img.Width; x++)
                 {
-                    int index = (y * img.Width + x) * 4; // RGBA
-                    float r = img.Data[index + 0] / 255f;
-                    float g = img.Data[index + 1] / 255f;
-                    float b = img.Data[index + 2] / 255f;
+                    var index = (y * img.Width + x) * 4; // RGBA
+                    var r = img.Data[index + 0] / 255f;
+                    var g = img.Data[index + 1] / 255f;
+                    var b = img.Data[index + 2] / 255f;
 
                     skyAmbient += new Vector3(r, g, b);
                     totalPixels++;

@@ -18,7 +18,6 @@ public abstract class GPUBuffer<TDataType> : IDisposable where TDataType : struc
 
     public GPUBuffer([NotNull] RenderContext renderContext) {
         RenderContext = renderContext;
-        RuntimeSet<GPUBuffer<TDataType>>.Add(this);
     }
 
     public abstract void SetBufferData(in TDataType[] data, BufferUsageHint usageHint);

@@ -13,7 +13,18 @@ public class DirectionalLight : Behaviour
     readonly Vector3 _lightColor = new(1.0f, 0.95f, 0.85f);
    public float LightIntensity = 5f;
 
+   public Matrix4 GetLightSpaceMatrix() {
+       Vector3 lightDir = transform.Forward.Normalized();
+       Vector3 lightPos = transform.Position - lightDir * 1;
 
+       Vector3 target = Vector3.Zero;
+       Vector3 up = transform.Up;
+
+       Matrix4 lightView = Matrix4.LookAt(lightPos, target, up);
+       Matrix4 lightProjection = Matrix4.CreateOrthographic(1, 1, 0.1f, 100f);
+
+       return lightProjection * lightView;
+   }
     protected internal override void OnBegin()
     {
         Instance = this;
@@ -55,4 +66,6 @@ public class DirectionalLight : Behaviour
 
         transform.EulerAngles = angles;
     }
+
+
 }

@@ -5,7 +5,7 @@ namespace BallisticEngine;
 
 public abstract class HDRenderer {
     public abstract void Initialize();
-    public abstract void RenderOpaque(IReadOnlyCollection<IStaticMeshRenderer> renderTargets, RendererArgs args);
+    public abstract void RenderOpaque(IReadOnlyCollection<IStaticMeshRenderer> renderTargets, RendererArgs args,bool isShadowPass);
     public abstract void RenderSkybox(IReadOnlyCollection<ISkyboxDrawable> renderTargets, RendererArgs args);
     public abstract void RenderInstancing(BatchGroup<IStaticMeshRenderer> batchGroup, RendererArgs args);
     public abstract RenderMetrics BeginRender(RendererArgs args);

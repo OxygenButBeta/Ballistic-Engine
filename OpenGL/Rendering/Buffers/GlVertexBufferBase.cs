@@ -13,8 +13,8 @@
             var (Size, Stride,Normalized) = GetVertexAttributes();
             UID = GL.GenBuffer();
             GL.BindBuffer(Target, UID);
+            GL.EnableVertexAttribArray(AttributeLocation);
             GL.VertexAttribPointer(AttributeLocation, Size, VertexAttribPointerType.Float, Normalized, stride: Stride,
                 IntPtr.Zero);
-            GL.EnableVertexAttribArray(AttributeLocation);
         }
     }

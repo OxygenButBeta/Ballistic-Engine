@@ -12,7 +12,6 @@ public abstract class GPUBuffer<TTarget> : IDisposable where TTarget : struct {
 
     public GPUBuffer(VertexArrayObject vertexArrayObject) {
         VertexArrayObject = vertexArrayObject;
-        RuntimeSet<GPUBuffer<TTarget>>.Add(this);
     }
 
     public void SetData<T>(T[] data, BufferUsageHint usageHint) where T : struct {
@@ -34,7 +33,6 @@ public abstract class GPUBuffer<TTarget> : IDisposable where TTarget : struct {
 
         GL.DeleteBuffer(UID);
         UID = 0;
-        RuntimeSet<GPUBuffer<TTarget>>.Remove(this);
     }
 }
 
@@ -116,7 +114,6 @@ public sealed class VertexArrayObject : IDisposable {
 
     public VertexArrayObject() {
         UID = GL.GenVertexArray();
-        RuntimeSet<VertexArrayObject>.Add(this);
     }
 
     public void Bind() {
@@ -145,6 +142,5 @@ public sealed class VertexArrayObject : IDisposable {
 
         GL.DeleteVertexArray(UID);
         UID = 0;
-        RuntimeSet<VertexArrayObject>.Remove(this);
     }
 }

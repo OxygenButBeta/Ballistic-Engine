@@ -12,4 +12,5 @@ public interface IWindow
     void Close();
     void SwapFrameBuffers();
     float FrameRate { get; }
+   public event Action<int,int> OnResizeCallback;
 }

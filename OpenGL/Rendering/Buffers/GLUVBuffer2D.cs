@@ -10,8 +10,6 @@ public class GLUVBuffer2D(RenderContext renderContext) : GlVertexBufferBase<Vect
     protected override (int Size, int Stride,bool Normalized) GetVertexAttributes() => (Size, sizeof(float) * 2,false);
     public override void Create() {
         base.Create();
-        Console.WriteLine($"[DEBUG] UVBuffer.Create() called. AttribLoc={AttributeLocation}, VAO={GL.GetInteger(GetPName.VertexArrayBinding)}, Buffer={UID}");
-
         GL.VertexAttribDivisor(AttributeLocation,0);
     }
 }

@@ -15,7 +15,6 @@ public sealed class OpenGLRenderContext : RenderContext
 
         GL.DeleteVertexArray(UID);
         UID = 0;
-        RuntimeSet<RenderContext>.Remove(this);
     }
 
     public override void Activate()

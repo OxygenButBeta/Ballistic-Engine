@@ -8,7 +8,6 @@ public class GLBuffer<TData>(RenderContext renderContext) : GLBufferBase<TData>(
     public override void Create()
     {
         UID = GL.GenBuffer();
-        RuntimeSet<GPUBuffer<TData>>.Add(this);
     }
     
 }

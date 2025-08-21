@@ -6,11 +6,6 @@ public abstract class RenderContext : IDisposable
     public abstract int UID { get; protected set; }
     protected bool IsActiveContext => activeRenderContext != this;
 
-    protected RenderContext()
-    {
-        RuntimeSet<RenderContext>.Add(this);
-    }
-
     public abstract void Dispose();
 
     public abstract void Activate();
