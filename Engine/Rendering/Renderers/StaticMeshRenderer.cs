@@ -44,12 +44,14 @@ public class StaticMeshRenderer : Renderer {
                 break;
         }
 
-        modelPath = Path.Combine(baseDir, "Resources", "Default", "PH7.fbx");
-        diffusePath = Path.Combine(baseDir, "Resources", "Default", "PH7_DIFF.png");
-        normalPath = Path.Combine(baseDir, "Resources", "Default", "PH7_NOR.png");
-        metallicPath = Path.Combine(baseDir, "Resources", "Default", "PH7_METAL.png");
-        roughnessPath = Path.Combine(baseDir, "Resources", "Default", "PH7_ROUGH.png");
-        aoPath = Path.Combine(baseDir, "Resources", "Default", "PH7_AO.png");
+        
+        modelPath = AssetDatabase.GetAssetPath("PH7.fbx");
+        diffusePath = AssetDatabase.GetAssetPath("PH7_DIFF.png");
+        normalPath = AssetDatabase.GetAssetPath("PH7_NOR.png");
+        metallicPath = AssetDatabase.GetAssetPath("PH7_METAL.png");
+        roughnessPath = AssetDatabase.GetAssetPath("PH7_ROUGH.png");
+        aoPath = AssetDatabase.GetAssetPath("PH7_AO.png");
+
 
         instanceCount = (instanceCount + 1) % 3;
         SharedMesh = Mesh.ImportFromFile(modelPath);

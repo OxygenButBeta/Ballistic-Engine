@@ -7,20 +7,15 @@ public static class DefaultShader {
     public static string FragmentShader => GetFrag();
 
     static string GetVert() {
-        return GetGLSL("Vert");
+        return GetGLSL("Vert.glsl");
     }
 
 
     static  string GetGLSL(string name) {
-        var baseDir = AppContext.BaseDirectory;
-        var shaderPath  = Path.Combine(baseDir, "Resources", "Default","Shaders", $"{name}.glsl");
-        if (!File.Exists(shaderPath)) {
-            throw new FileNotFoundException($"Shader file not found: {shaderPath}");
-        }
-        return File.ReadAllText(shaderPath);
+        return File.ReadAllText(AssetDatabase.GetAssetPath(name));
     }
 
     static string GetFrag(string filename = "DefaultShader") {
-        return  GetGLSL("Frag");
+        return  GetGLSL("Frag.glsl");
     }
 }

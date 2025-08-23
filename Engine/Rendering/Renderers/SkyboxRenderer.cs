@@ -4,64 +4,60 @@ using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine.Sky;
 
-public class SkyboxRenderer : ISkyboxDrawable
-{
+public class SkyboxRenderer : ISkyboxDrawable {
     public Transform Transform { get; }
     public bool RenderedThisFrame { get; set; }
     public bool AtmosphereScattering { get; private set; }
 
-    readonly Vector3[] skyboxVertices =
-    {
+    readonly Vector3[] skyboxVertices = {
         // Back face (+Z)
-        new Vector3(-1, -1,  1),
-        new Vector3( 1, -1,  1),
-        new Vector3( 1,  1,  1),
-        new Vector3( 1,  1,  1),
-        new Vector3(-1,  1,  1),
-        new Vector3(-1, -1,  1),
+        new Vector3(-1, -1, 1),
+        new Vector3(1, -1, 1),
+        new Vector3(1, 1, 1),
+        new Vector3(1, 1, 1),
+        new Vector3(-1, 1, 1),
+        new Vector3(-1, -1, 1),
 
         // Front face (-Z)
         new Vector3(-1, -1, -1),
-        new Vector3(-1,  1, -1),
-        new Vector3( 1,  1, -1),
-        new Vector3( 1,  1, -1),
-        new Vector3( 1, -1, -1),
+        new Vector3(-1, 1, -1),
+        new Vector3(1, 1, -1),
+        new Vector3(1, 1, -1),
+        new Vector3(1, -1, -1),
         new Vector3(-1, -1, -1),
 
         // Left face (-X)
         new Vector3(-1, -1, -1),
-        new Vector3(-1, -1,  1),
-        new Vector3(-1,  1,  1),
-        new Vector3(-1,  1,  1),
-        new Vector3(-1,  1, -1),
+        new Vector3(-1, -1, 1),
+        new Vector3(-1, 1, 1),
+        new Vector3(-1, 1, 1),
+        new Vector3(-1, 1, -1),
         new Vector3(-1, -1, -1),
 
         // Right face (+X)
-        new Vector3( 1, -1, -1),
-        new Vector3( 1,  1, -1),
-        new Vector3( 1,  1,  1),
-        new Vector3( 1,  1,  1),
-        new Vector3( 1, -1,  1),
-        new Vector3( 1, -1, -1),
+        new Vector3(1, -1, -1),
+        new Vector3(1, 1, -1),
+        new Vector3(1, 1, 1),
+        new Vector3(1, 1, 1),
+        new Vector3(1, -1, 1),
+        new Vector3(1, -1, -1),
 
         // Top face (+Y)
-        new Vector3(-1,  1, -1),
-        new Vector3(-1,  1,  1),
-        new Vector3( 1,  1,  1),
-        new Vector3( 1,  1,  1),
-        new Vector3( 1,  1, -1),
-        new Vector3(-1,  1, -1),
+        new Vector3(-1, 1, -1),
+        new Vector3(-1, 1, 1),
+        new Vector3(1, 1, 1),
+        new Vector3(1, 1, 1),
+        new Vector3(1, 1, -1),
+        new Vector3(-1, 1, -1),
 
         // Bottom face (-Y)
         new Vector3(-1, -1, -1),
-        new Vector3( 1, -1, -1),
-        new Vector3( 1, -1,  1),
-        new Vector3( 1, -1,  1),
-        new Vector3(-1, -1,  1),
+        new Vector3(1, -1, -1),
+        new Vector3(1, -1, 1),
+        new Vector3(1, -1, 1),
+        new Vector3(-1, -1, 1),
         new Vector3(-1, -1, -1)
     };
-
-
 
 
     RenderContext renderContext;
@@ -69,17 +65,17 @@ public class SkyboxRenderer : ISkyboxDrawable
     Shader skyboxShader;
     public Texture3D cubemapTexture;
 
-    public void init()
-    {
+    public void init() {
         renderContext = GraphicAPI.CreateRenderContext();
         renderContext.Activate();
 
-        string rightPath = Path.Combine(AppContext.BaseDirectory, "Resources", "Default", "Sky", "right.jpg");
-        string leftPath = Path.Combine(AppContext.BaseDirectory, "Resources", "Default", "Sky", "left.jpg");
-        string topPath = Path.Combine(AppContext.BaseDirectory, "Resources", "Default", "Sky", "top.jpg");
-        string bottomPath = Path.Combine(AppContext.BaseDirectory, "Resources", "Default", "Sky", "bottom.jpg");
-        string frontPath = Path.Combine(AppContext.BaseDirectory, "Resources", "Default", "Sky", "front.jpg");
-        string backPath = Path.Combine(AppContext.BaseDirectory, "Resources", "Default", "Sky", "back.jpg");
+
+        var rightPath = AssetDatabase.GetAssetPath("right.jpg");
+        var leftPath = AssetDatabase.GetAssetPath("left.jpg");
+        var topPath = AssetDatabase.GetAssetPath("top.jpg");
+        var bottomPath = AssetDatabase.GetAssetPath("bottom.jpg");
+        var frontPath = AssetDatabase.GetAssetPath("front.jpg");
+        var backPath = AssetDatabase.GetAssetPath("back.jpg");
 
         cubemapTexture = GraphicAPI.CreateTexture3D([
             rightPath,
@@ -97,19 +93,17 @@ public class SkyboxRenderer : ISkyboxDrawable
         skyboxShader = GraphicAPI.CreateStandardShader(skyboxVertexShader, skyboxFragmentShader);
     }
 
-    public void RenderSkybox()
-    {
+    public void RenderSkybox() {
         cubemapVertexBuffer.Activate();
         GL.DrawArrays(PrimitiveType.Triangles, 0, 36);
     }
 
-    float yaw = 0f;   // Y ekseni, sağ-sol
+    float yaw = 0f; // Y ekseni, sağ-sol
     float pitch = 0f; // X ekseni, yukarı-aşağı
 
     Matrix4 rotationMatrix = Matrix4.Identity;
 
-    public void RotUpdate()
-    {
+    public void RotUpdate() {
         // Yatay
         if (Input.IsKeyDown(Keys.C))
             yaw += 0.01f;
@@ -126,12 +120,11 @@ public class SkyboxRenderer : ISkyboxDrawable
         rotationMatrix = Matrix4.CreateRotationX(pitch) * Matrix4.CreateRotationY(yaw);
 
         // Atmosfer toggle
-        if(Input.IsKeyPressed(Keys.P))
+        if (Input.IsKeyPressed(Keys.P))
             AtmosphereScattering = !AtmosphereScattering;
     }
 
-    public void PreRenderCallback(RendererArgs args)
-    {
+    public void PreRenderCallback(RendererArgs args) {
         renderContext.Activate();
         cubemapTexture.Activate();
         skyboxShader.Activate();
@@ -147,12 +140,10 @@ public class SkyboxRenderer : ISkyboxDrawable
         GL.Disable(EnableCap.CullFace);
     }
 
-    public void PostRenderCallback(RendererArgs args)
-    {
+    public void PostRenderCallback(RendererArgs args) {
         GL.DepthMask(true);
         GL.DepthFunc(DepthFunction.Less);
         GL.Enable(EnableCap.CullFace);
-        
     }
 
     public string skyboxVertexShader = @"#version 330 core

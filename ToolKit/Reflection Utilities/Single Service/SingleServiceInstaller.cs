@@ -2,10 +2,11 @@
 
 public static class SingleServiceInstaller {
     public static void InstallAllInAssembly(Assembly asm) {
-        foreach (Type type in asm.GetTypes()) {
-            if (type.GetCustomAttribute<EngineServiceAttribute>() == null)
-                continue;
-
+        foreach (Type type in
+                 asm.GetTypes()
+                     .Where(x => x.GetCustomAttribute<EngineServiceAttribute>()! != null)
+                     .OrderBy(type => type.GetCustomAttribute<EngineServiceAttribute>()!.Priority)) {
+            
             if (type.GetConstructor(Type.EmptyTypes) == null)
                 throw new InvalidOperationException($"{type.FullName} must have a parameterless constructor.");
 
@@ -21,11 +22,10 @@ public static class SingleServiceInstaller {
                 [type],
                 null
             );
-            
+
             if (setMethod == null)
                 throw new InvalidOperationException($"Service<{type.Name}> does not have a Set method.");
             setMethod.Invoke(null, [instance]);
-            
         }
     }
 }
