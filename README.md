@@ -26,10 +26,8 @@ It is still under active development and serves as a learning and experimental g
 
 ## 🖼️ Screenshots & Videos
 
-Screenshots (16:9):
-
-<img src="https://github.com/user-attachments/assets/b0a6f0ff-ceb6-424b-92cb-0abdaebef505" width="600" />
-<img src="https://github.com/user-attachments/assets/ee589419-5371-4b64-a08b-a24ffeb6cb74" width="600" />
+<img src="https://github.com/user-attachments/assets/b0a6f0ff-ceb6-424b-92cb-0abdaebef505" width="500" />
+<img src="https://github.com/user-attachments/assets/ee589419-5371-4b64-a08b-a24ffeb6cb74" width="500" />
 
 ![Screenshot 3](https://github.com/user-attachments/assets/816fb1af-331c-4cb8-96e8-f26593459c94)
 
