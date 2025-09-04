@@ -28,8 +28,9 @@ It is still under active development and serves as a learning and experimental g
 
 Screenshots (16:9):
 
-![Screenshot 1](https://github.com/user-attachments/assets/b0a6f0ff-ceb6-424b-92cb-0abdaebef505)  
-![Screenshot 2](https://github.com/user-attachments/assets/ee589419-5371-4b64-a08b-a24ffeb6cb74)
+<img src="https://github.com/user-attachments/assets/b0a6f0ff-ceb6-424b-92cb-0abdaebef505" width="600" />
+<img src="https://github.com/user-attachments/assets/ee589419-5371-4b64-a08b-a24ffeb6cb74" width="600" />
+
 ![Screenshot 3](https://github.com/user-attachments/assets/816fb1af-331c-4cb8-96e8-f26593459c94)
 
 🎥 [Watch on YouTube](https://www.youtube.com/watch?v=6uzjT07534k)
