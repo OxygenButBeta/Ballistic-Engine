@@ -11,7 +11,7 @@ public static class SceneInit {
         int columns = 6; // her satırda 10 kutu<
         float spacing = 1f;
 
-        for (int i = 0; i < 30; i++) {
+        for (int i = 0; i < 1; i++) {
             Entity meshEntity = Entity.Instantiate("Mesh");
             meshEntity.AddComponent<StaticMeshRenderer>();
             meshEntity.AddComponent<Rotator>();

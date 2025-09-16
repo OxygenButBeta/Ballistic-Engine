@@ -82,7 +82,8 @@ void main() {
                 standardShader.SetMatrix4("lightSpaceMatrix", ref lightSpaceMatrix);
             }
             else {
-                SetUniformsForLitRender(args, shader, args.viewProjectionProvider.GetViewMatrix(), WorldMatrix, ref projection);
+                SetUniformsForLitRender(args, shader, args.viewProjectionProvider.GetViewMatrix(), WorldMatrix,
+                    ref projection);
             }
 
             GL.DrawElements(PrimitiveType.Triangles, mesh.Indices.Length, DrawElementsType.UnsignedInt, 0);
@@ -99,12 +100,13 @@ void main() {
         ref Matrix4 projection) {
         shader.SetFloat3("LightPos", -DirectionalLight.Instance.transform.Forward);
         shader.SetFloat3("LightColor",
-            DirectionalLight.Instance.LightIntensity * skyboxRenderer.cubemapTexture.skyAmbient);
+            DirectionalLight.Instance.LightIntensity * DirectionalLight.Instance.LightColor);
         shader.SetFloat3("AmbientLight",
             DirectionalLight.Instance.ambientIntensity * skyboxRenderer.cubemapTexture.skyAmbient);
         shader.SetFloat("MetallicMultiplier", Metallic);
         shader.SetFloat("SmoothnessMultiplier", RoughnessValue);
         shader.SetFloat("rimPower", RimPower);
+        shader.SetBool("NormalFlipY",true);
 
         Matrix4 lightSpaceMatrix = DirectionalLight.Instance.GetLightSpaceMatrix();
         shader.SetMatrix4("lightSpaceMatrix", ref lightSpaceMatrix);
@@ -174,7 +176,7 @@ void main() {
 
     public override RenderMetrics BeginRender(RendererArgs args) {
         ClearColorBuffer();
-        RenderOpaque(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection, args, true);
+        //  RenderOpaque(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection, args, true);
         if (RenderAsset.Current.InstancedDrawing) {
             // Disabled at the moment
             foreach (BatchGroup<IStaticMeshRenderer> batchGroup in
@@ -201,16 +203,16 @@ void main() {
     void DebugCheck() {
         if (Input.IsKeyDown(Keys.KeyPad0)) {
             Metallic += 0.002f;
-            Metallic = Math.Clamp(Metallic, 0f, 1f);
+            Metallic = Math.Clamp(Metallic, 0f, 100f);
         }
 
         if (Input.IsKeyDown(Keys.KeyPad1)) {
             Metallic -= 0.002f;
-            Metallic = Math.Clamp(Metallic, 0f, 1f);
+            Metallic = Math.Clamp(Metallic, 0f, 100f);
         }
 
         if (Input.IsKeyDown(Keys.KeyPad2)) {
-            RoughnessValue += 0.002f;
+            RoughnessValue += 0.01f;
             RoughnessValue = Math.Clamp(RoughnessValue, 0f, 1f);
         }
 
@@ -223,7 +225,7 @@ void main() {
         }
 
         if (Input.IsKeyDown(Keys.KeyPad3)) {
-            RoughnessValue -= 0.02f;
+            RoughnessValue -= 0.01f;
             RoughnessValue = Math.Clamp(RoughnessValue, 0f, 1f);
         }
 

@@ -50,8 +50,11 @@ public sealed class GLTexture2D : Texture2D {
             ? PixelInternalFormat.SrgbAlpha
             : PixelInternalFormat.Rgba;
 
-        if (TextureType is TextureType.Metallic ) {
+        if (TextureType is TextureType.Metallic or TextureType.Roughness or TextureType.AO) {
             internalFormat = PixelInternalFormat.R8;
+        }
+        else if (TextureType == TextureType.Normal) {
+            internalFormat = PixelInternalFormat.Rgb8;
         }
 
         GL.TexImage2D(TextureTarget.Texture2D, 0, internalFormat, rawImage.Width, rawImage.Height,
