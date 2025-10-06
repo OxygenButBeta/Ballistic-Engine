@@ -44,5 +44,5 @@ It is still under active development and serves as a learning and experimental g
 
 ## ⚠️ Disclaimer
 
-This is a **hobby project**, not intended for production use.  
+This is just a **hobby project**.
 The goal is to explore graphics programming, engine architecture, and game development concepts.
