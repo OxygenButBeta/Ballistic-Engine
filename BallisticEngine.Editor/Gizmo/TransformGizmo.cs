@@ -12,7 +12,8 @@ internal enum GizmoMode { Translate, Rotate, Scale }
 internal sealed class TransformGizmo {
     public GizmoMode Mode = GizmoMode.Translate;
 
-    // Hover/drag state. Axis: 0=X 1=Y 2=Z, 3=uniform (scale center).
+    // Hover/drag state. Axis: 0=X 1=Y 2=Z, 3=uniform (scale center),
+    // 4=XY plane (normal Z), 5=XZ plane (normal Y), 6=YZ plane (normal X).
     int activeAxis = -1;
     bool dragging;
     Vector3 dragStartPosition;
@@ -20,8 +21,12 @@ internal sealed class TransformGizmo {
     Vector3 dragStartScale;
     float dragStartParam;
     Vector3 dragStartRefDir;
+    Vector3 dragStartPlaneHit;
 
     static readonly Vector3[] Axes = [Vector3.UnitX, Vector3.UnitY, Vector3.UnitZ];
+
+    // Plane handles: (first axis, second axis, normal axis index).
+    static readonly (int a, int b, int normal)[] Planes = [(0, 1, 2), (0, 2, 1), (1, 2, 0)];
 
     static readonly uint[] AxisColors = [
         0xFF3A3ADD, // X red (ABGR)
@@ -76,6 +81,7 @@ internal sealed class TransformGizmo {
         Matrix4 vp, SysVec2 viewMin, SysVec2 viewSize, SysVec2 mouse) {
         if (!dragging) {
             if (activeAxis >= 0 && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
+                EditorUndo.Push(); // snapshot before the gizmo mutates the transform
                 dragging = true;
                 dragStartPosition = entity.transform.Position;
                 dragStartRotation = entity.transform.Rotation;
@@ -84,6 +90,9 @@ internal sealed class TransformGizmo {
                 MouseRay(camera, vp, viewMin, viewSize, mouse, out Vector3 rayO, out Vector3 rayD);
                 if (Mode == GizmoMode.Rotate && activeAxis < 3) {
                     dragStartRefDir = PointOnAxisPlane(origin, Axes[activeAxis], rayO, rayD);
+                }
+                else if (activeAxis >= 4) {
+                    dragStartPlaneHit = PointOnAxisPlane(origin, Axes[Planes[activeAxis - 4].normal], rayO, rayD);
                 }
                 else if (activeAxis < 3) {
                     dragStartParam = ClosestParamOnAxis(origin, Axes[activeAxis], rayO, rayD);
@@ -103,6 +112,11 @@ internal sealed class TransformGizmo {
         MouseRay(camera, vp, viewMin, viewSize, mouse, out Vector3 ro, out Vector3 rd);
 
         switch (Mode) {
+            case GizmoMode.Translate when activeAxis >= 4: {
+                Vector3 hit = PointOnAxisPlane(origin, Axes[Planes[activeAxis - 4].normal], ro, rd);
+                entity.transform.Position = dragStartPosition + (hit - dragStartPlaneHit);
+                break;
+            }
             case GizmoMode.Translate when activeAxis < 3: {
                 float t = ClosestParamOnAxis(origin, Axes[activeAxis], ro, rd);
                 Vector3 delta = Axes[activeAxis] * (t - dragStartParam);
@@ -144,6 +158,15 @@ internal sealed class TransformGizmo {
             Math.Abs(mouse.X - originPx.X) < 12f && Math.Abs(mouse.Y - originPx.Y) < 12f)
             return 3;
 
+        // Two-axis plane quads (translate only) take priority over single axes.
+        if (Mode == GizmoMode.Translate) {
+            for (var p = 0; p < Planes.Length; p++) {
+                if (ProjectPlaneQuad(origin, p, handleLength, vp, viewMin, viewSize, out SysVec2[] quad) &&
+                    PointInQuad(mouse, quad))
+                    return 4 + p;
+            }
+        }
+
         var best = -1;
         var bestDist = threshold;
 
@@ -173,6 +196,17 @@ internal sealed class TransformGizmo {
 
     void DrawArrows(ImDrawListPtr draw, Vector3 origin, float len, Matrix4 vp,
         SysVec2 viewMin, SysVec2 viewSize, SysVec2 originPx) {
+        // Plane quads first (under the axis lines).
+        for (var p = 0; p < Planes.Length; p++) {
+            if (!ProjectPlaneQuad(origin, p, len, vp, viewMin, viewSize, out SysVec2[] quad))
+                continue;
+            var baseColor = AxisColors[Planes[p].normal];
+            var fill = activeAxis == 4 + p ? (HighlightColor & 0x00FFFFFF) | 0x88000000 : (baseColor & 0x00FFFFFF) | 0x55000000;
+            draw.AddQuadFilled(quad[0], quad[1], quad[2], quad[3], fill);
+            draw.AddQuad(quad[0], quad[1], quad[2], quad[3],
+                activeAxis == 4 + p ? HighlightColor : baseColor, 1.5f);
+        }
+
         for (var i = 0; i < 3; i++) {
             if (!Project(origin + Axes[i] * len, vp, viewMin, viewSize, out SysVec2 tip))
                 continue;
@@ -181,6 +215,47 @@ internal sealed class TransformGizmo {
             draw.AddCircleFilled(tip, 6f, color);
         }
         draw.AddCircleFilled(originPx, 4f, 0xFFCCCCCC);
+    }
+
+    // The quad sits between 30% and 60% of the handle length along the plane's two axes.
+    bool ProjectPlaneQuad(Vector3 origin, int planeIndex, float len, Matrix4 vp,
+        SysVec2 viewMin, SysVec2 viewSize, out SysVec2[] quad) {
+        (int a, int b, _) = Planes[planeIndex];
+        Vector3 va = Axes[a] * len;
+        Vector3 vb = Axes[b] * len;
+
+        quad = new SysVec2[4];
+        Vector3[] corners = [
+            origin + va * 0.3f + vb * 0.3f,
+            origin + va * 0.6f + vb * 0.3f,
+            origin + va * 0.6f + vb * 0.6f,
+            origin + va * 0.3f + vb * 0.6f,
+        ];
+
+        for (var i = 0; i < 4; i++) {
+            if (!Project(corners[i], vp, viewMin, viewSize, out quad[i]))
+                return false;
+        }
+
+        return true;
+    }
+
+    static bool PointInQuad(SysVec2 p, SysVec2[] quad) {
+        // Convex polygon containment: consistent cross-product signs.
+        var sign = 0;
+        for (var i = 0; i < 4; i++) {
+            SysVec2 a = quad[i];
+            SysVec2 b = quad[(i + 1) % 4];
+            float cross = (b.X - a.X) * (p.Y - a.Y) - (b.Y - a.Y) * (p.X - a.X);
+            var s = cross > 0 ? 1 : cross < 0 ? -1 : 0;
+            if (s == 0)
+                continue;
+            if (sign == 0)
+                sign = s;
+            else if (sign != s)
+                return false;
+        }
+        return true;
     }
 
     void DrawCircles(ImDrawListPtr draw, Vector3 origin, float len, Matrix4 vp,

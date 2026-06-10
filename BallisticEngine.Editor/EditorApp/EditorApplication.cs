@@ -26,6 +26,7 @@ internal sealed class EditorApplication {
     readonly HierarchyPanel hierarchy;
     readonly InspectorPanel inspector;
     readonly AssetBrowserPanel assets;
+    readonly ConsolePanel console = new();
     readonly TransformGizmo gizmo = new();
 
     HDRenderer Renderer => RenderAsset.Current.Renderer;
@@ -80,6 +81,11 @@ internal sealed class EditorApplication {
     }
 
     void OnRender(double delta) {
+        // Build the UI FIRST (the gizmo mutates transforms there), then render the scene with
+        // this frame's values — otherwise the object trails the gizmo by one frame.
+        imgui.Update((float)delta);
+        BuildUI();
+
         if (sceneTabActive)
             RenderSceneView();
         else
@@ -89,8 +95,6 @@ internal sealed class EditorApplication {
         GL.ClearColor(0.05f, 0.05f, 0.06f, 1f);
         GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
 
-        imgui.Update((float)delta);
-        BuildUI();
         imgui.Render();
     }
 
@@ -142,7 +146,14 @@ internal sealed class EditorApplication {
     // ---- Layout -------------------------------------------------------------
 
     void BuildUI() {
-        SysVec2 display = ImGui.GetIO().DisplaySize;
+        // Global editor shortcuts.
+        ImGuiIOPtr io = ImGui.GetIO();
+        if (io.KeyCtrl && !io.WantTextInput) {
+            if (ImGui.IsKeyPressed(ImGuiKey.Z)) EditorUndo.Undo();
+            if (ImGui.IsKeyPressed(ImGuiKey.Y)) EditorUndo.Redo();
+        }
+
+        SysVec2 display = io.DisplaySize;
         float toolbarH = 44 * S;
         float leftW = Math.Clamp(display.X * 0.14f, 220 * S, 340 * S);
         float rightW = Math.Clamp(display.X * 0.18f, 300 * S, 440 * S);
@@ -161,8 +172,27 @@ internal sealed class EditorApplication {
         Panel("Inspector", new SysVec2(display.X - rightW, toolbarH), new SysVec2(rightW, display.Y - toolbarH),
             PanelFlags, inspector.DrawContents);
 
-        Panel("Assets", new SysVec2(0, display.Y - assetsH), new SysVec2(display.X - rightW, assetsH),
-            PanelFlags, assets.DrawContents);
+        BottomPanel(new SysVec2(0, display.Y - assetsH), new SysVec2(display.X - rightW, assetsH));
+    }
+
+    // Assets and Console share the bottom strip as tabs (Unity-style).
+    void BottomPanel(SysVec2 pos, SysVec2 size) {
+        ImGui.SetNextWindowPos(pos, ImGuiCond.Always);
+        ImGui.SetNextWindowSize(size, ImGuiCond.Always);
+        if (ImGui.Begin("##bottom", PanelFlags | ImGuiWindowFlags.NoTitleBar)) {
+            if (ImGui.BeginTabBar("##bottomtabs")) {
+                if (ImGui.BeginTabItem("Assets")) {
+                    assets.DrawContents();
+                    ImGui.EndTabItem();
+                }
+                if (ImGui.BeginTabItem("Console")) {
+                    console.DrawContents();
+                    ImGui.EndTabItem();
+                }
+                ImGui.EndTabBar();
+            }
+        }
+        ImGui.End();
     }
 
     static void Panel(string name, SysVec2 pos, SysVec2 size, ImGuiWindowFlags flags, Action contents) {
@@ -262,15 +292,46 @@ internal sealed class EditorApplication {
         sceneViewHovered = ImGui.IsItemHovered();
         gameViewFocused = false;
 
-        // W/E/R switch gizmo mode (only when not flying the camera, which also uses WASD).
+        // Scene-view shortcuts (not while flying — the camera uses WASD too).
         if (sceneViewHovered && !editorInput.RightMouseDown) {
-            if (ImGui.IsKeyPressed(ImGuiKey.W)) gizmo.Mode = GizmoMode.Translate;
-            if (ImGui.IsKeyPressed(ImGuiKey.E)) gizmo.Mode = GizmoMode.Rotate;
-            if (ImGui.IsKeyPressed(ImGuiKey.R)) gizmo.Mode = GizmoMode.Scale;
+            ImGuiIOPtr io = ImGui.GetIO();
+            if (!io.KeyCtrl) {
+                if (ImGui.IsKeyPressed(ImGuiKey.W)) gizmo.Mode = GizmoMode.Translate;
+                if (ImGui.IsKeyPressed(ImGuiKey.E)) gizmo.Mode = GizmoMode.Rotate;
+                if (ImGui.IsKeyPressed(ImGuiKey.R)) gizmo.Mode = GizmoMode.Scale;
+                if (ImGui.IsKeyPressed(ImGuiKey.F)) FocusSelected();
+            }
+            else if (ImGui.IsKeyPressed(ImGuiKey.F)) {
+                AlignSelectedToView();
+            }
         }
 
         if (editorState.Selected is not null)
             gizmo.Draw(editorCamera, editorState.Selected, imageMin, sceneViewSize, sceneViewHovered);
+    }
+
+    // F: frame the selected entity in the Scene view.
+    void FocusSelected() {
+        Entity selected = editorState.Selected;
+        if (selected is null)
+            return;
+
+        var target = selected.transform.WorldMatrix.ExtractTranslation();
+        var scale = selected.transform.Scale;
+        var radius = Math.Max(1f, Math.Max(scale.X, Math.Max(scale.Y, scale.Z)));
+        editorCamera.Focus(target, radius);
+    }
+
+    // Ctrl+F: move the selected entity to the editor camera (position + rotation).
+    void AlignSelectedToView() {
+        Entity selected = editorState.Selected;
+        if (selected is null)
+            return;
+
+        EditorUndo.Push();
+        Transform cam = editorCamera.Transform;
+        selected.transform.Position = cam.Position + cam.Forward * 4f;
+        selected.transform.Rotation = cam.Rotation;
     }
 
     void GameTabContents() {

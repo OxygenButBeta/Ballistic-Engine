@@ -33,11 +33,18 @@ internal sealed class AssetBrowserPanel {
         var searching = filter.Length > 0;
         var assets = AssetDatabase.EnumerateAssets().OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase);
 
-        // Folders directly under CurrentFolder, and assets directly inside it (or a flat
-        // project-wide result list while searching).
+        // Folders from disk (so empty/new folders show up), assets from the pipeline.
         var folders = new List<string>();
         var files = new List<(string path, Guid guid)>();
         var prefix = CurrentFolder + "/";
+
+        if (!searching) {
+            var currentAbsolute = AssetDatabase.Project.ResolveAbsolute(CurrentFolder);
+            if (Directory.Exists(currentAbsolute)) {
+                foreach (var dir in Directory.GetDirectories(currentAbsolute))
+                    folders.Add(prefix + Path.GetFileName(dir));
+            }
+        }
 
         foreach ((string path, Guid guid) in assets) {
             if (searching) {
@@ -46,19 +53,9 @@ internal sealed class AssetBrowserPanel {
                 continue;
             }
 
-            if (!path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            var rest = path[prefix.Length..];
-            var slash = rest.IndexOf('/');
-            if (slash >= 0) {
-                var sub = prefix + rest[..slash];
-                if (!folders.Contains(sub))
-                    folders.Add(sub);
-            }
-            else {
+            if (path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
+                !path[prefix.Length..].Contains('/'))
                 files.Add((path, guid));
-            }
         }
 
         DrawGrid(folders, files, s);
@@ -105,7 +102,64 @@ internal sealed class AssetBrowserPanel {
         if (folders.Count == 0 && files.Count == 0)
             ImGui.TextDisabled(filter.Length > 0 ? "No assets match." : "Empty folder. Drop files here to import.");
 
+        // Right-click empty space: creation + folder actions.
+        if (ImGui.BeginPopupContextWindow("##gridctx",
+                ImGuiPopupFlags.MouseButtonRight | ImGuiPopupFlags.NoOpenOverItems)) {
+            if (ImGui.MenuItem("New Folder"))
+                CreateFolder();
+            if (ImGui.MenuItem("New Material"))
+                CreateMaterial();
+            if (ImGui.MenuItem("New Scene"))
+                CreateScene();
+            ImGui.Separator();
+            if (ImGui.MenuItem("Show in Explorer"))
+                ShowInExplorer(AssetDatabase.Project.ResolveAbsolute(CurrentFolder), select: false);
+            if (ImGui.MenuItem("Refresh"))
+                AssetDatabase.Refresh();
+            ImGui.EndPopup();
+        }
+
         ImGui.EndChild();
+    }
+
+    void CreateFolder() {
+        var absolute = UniquePath(Path.Combine(AssetDatabase.Project.ResolveAbsolute(CurrentFolder), "New Folder"));
+        Directory.CreateDirectory(absolute);
+    }
+
+    void CreateMaterial() {
+        var absolute = UniquePath(Path.Combine(
+            AssetDatabase.Project.ResolveAbsolute(CurrentFolder), "New Material.mat"));
+        File.WriteAllText(absolute,
+            "{\n  \"version\": 1,\n  \"shader\": \"Assets/Default/Shaders/Standard.shader\",\n  \"textures\": {}\n}\n");
+        AssetDatabase.Refresh();
+    }
+
+    void CreateScene() {
+        var absolute = UniquePath(Path.Combine(
+            AssetDatabase.Project.ResolveAbsolute(CurrentFolder), "New Scene.scene"));
+        File.WriteAllText(absolute,
+            $"version: 1\nname: {Path.GetFileNameWithoutExtension(absolute)}\nentities: []\n");
+        AssetDatabase.Refresh();
+    }
+
+    static string UniquePath(string path) {
+        if (!File.Exists(path) && !Directory.Exists(path))
+            return path;
+
+        var dir = Path.GetDirectoryName(path)!;
+        var stem = Path.GetFileNameWithoutExtension(path);
+        var ext = Path.GetExtension(path);
+        for (var i = 1; ; i++) {
+            var candidate = Path.Combine(dir, $"{stem} {i}{ext}");
+            if (!File.Exists(candidate) && !Directory.Exists(candidate))
+                return candidate;
+        }
+    }
+
+    static void ShowInExplorer(string absolutePath, bool select) {
+        System.Diagnostics.Process.Start("explorer.exe",
+            select ? $"/select,\"{absolutePath}\"" : $"\"{absolutePath}\"");
     }
 
     static void NextCell(ref int column, int columns) {
@@ -130,6 +184,19 @@ internal sealed class AssetBrowserPanel {
 
         if (ImGui.IsItemHovered() && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
             CurrentFolder = folderPath;
+
+        if (ImGui.BeginPopupContextItem("##folderctx")) {
+            if (ImGui.MenuItem("Open"))
+                CurrentFolder = folderPath;
+            if (ImGui.MenuItem("Show in Explorer"))
+                ShowInExplorer(AssetDatabase.Project.ResolveAbsolute(folderPath), select: false);
+            ImGui.Separator();
+            if (ImGui.MenuItem("Delete Folder")) {
+                Directory.Delete(AssetDatabase.Project.ResolveAbsolute(folderPath), recursive: true);
+                AssetDatabase.Refresh();
+            }
+            ImGui.EndPopup();
+        }
 
         TileLabel(name, tile);
         ImGui.EndGroup();
@@ -162,6 +229,27 @@ internal sealed class AssetBrowserPanel {
 
         if (clicked)
             state.SelectAsset(path, guid);
+
+        if (ImGui.BeginPopupContextItem("##assetctx")) {
+            state.SelectAsset(path, guid);
+            if (ext == ".scene" && ImGui.MenuItem("Open Scene"))
+                LoadScene(path);
+            if (ImGui.MenuItem("Show in Explorer"))
+                ShowInExplorer(AssetDatabase.Project.ResolveAbsolute(path), select: true);
+            if (ImGui.MenuItem("Copy Path"))
+                ImGui.SetClipboardText(path);
+            ImGui.Separator();
+            if (ImGui.MenuItem("Delete")) {
+                var absolute = AssetDatabase.Project.ResolveAbsolute(path);
+                File.Delete(absolute);
+                var metaPath = absolute + ".meta";
+                if (File.Exists(metaPath))
+                    File.Delete(metaPath);
+                state.ClearAssetSelection();
+                AssetDatabase.Refresh();
+            }
+            ImGui.EndPopup();
+        }
 
         if (ImGui.IsItemHovered()) {
             if (ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left) && ext == ".scene")

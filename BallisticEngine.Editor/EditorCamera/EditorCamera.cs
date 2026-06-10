@@ -25,6 +25,11 @@ internal sealed class EditorCamera : IViewProjectionProvider {
     public Transform Transform => transform;
     public Vector3 AmbientColor => Vector3.One * 0.1f;
 
+    // Move so the target fills a comfortable portion of the view, keeping the current look direction.
+    public void Focus(Vector3 target, float radius) {
+        transform.Position = target - transform.Forward * Math.Max(2f, radius * 3f);
+    }
+
     public void SetAspect(float panelAspect) {
         if (panelAspect > 0f)
             aspect = panelAspect;

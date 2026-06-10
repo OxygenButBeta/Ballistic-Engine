@@ -51,7 +51,10 @@ public static class EquirectToCubemap {
                         float s10 = srcFloats[(y0 * src.Width + x1) * 4 + c];
                         float s01 = srcFloats[(y1 * src.Width + x0) * 4 + c];
                         float s11 = srcFloats[(y1 * src.Width + x1) * 4 + c];
-                        dstFloats[dst + c] = Lerp(Lerp(s00, s10, tx), Lerp(s01, s11, tx), ty);
+                        var value = Lerp(Lerp(s00, s10, tx), Lerp(s01, s11, tx), ty);
+                        // The cubemap uploads as half-float: radiance above fp16 max (~65504,
+                        // e.g. the sun disc) becomes Inf and tonemaps to NaN/black holes. Clamp.
+                        dstFloats[dst + c] = float.IsFinite(value) ? Math.Min(value, 60000f) : 60000f;
                     }
                     else {
                         float s00 = src.Pixels[(y0 * src.Width + x0) * 4 + c];

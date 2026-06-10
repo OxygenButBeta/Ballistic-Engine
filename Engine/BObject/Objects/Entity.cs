@@ -102,7 +102,8 @@ public class Entity : BObject {
 
     internal void Update(in float deltaTime) {
         foreach (Behaviour behaviour in Behaviours) {
-            behaviour.Tick(in deltaTime);
+            if (behaviour.IsActive)
+                behaviour.Tick(in deltaTime);
         }
     }
 

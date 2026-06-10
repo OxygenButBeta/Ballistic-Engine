@@ -5,195 +5,295 @@ using BallisticEngine.Serialization;
 using ImGuiNET;
 using OpenTK.Mathematics;
 using SysVec2 = System.Numerics.Vector2;
-using SysVec3 = System.Numerics.Vector3;
 using SysVec4 = System.Numerics.Vector4;
 
 namespace BallisticEngine.Editor;
 
-// Edits the selected entity: name, active, transform, and every component's reflected members.
-// Asset-reference members show as a read-only slot with a drag-drop target (guid payload).
+// Inspector: entity editing (transform + reflected component members in a clean two-column
+// layout) or asset editing (import settings / material editor) depending on the selection.
+// Asset slots support BOTH drag-drop from the Assets panel and a click-to-open picker popup.
+// Every interaction pushes an undo snapshot when it starts.
 internal sealed class InspectorPanel {
     readonly EditorState state;
+
+    // Pending asset-picker request (opened from an asset slot).
+    MemberInfo pickerMember;
+    object pickerTarget;
+    Type pickerType;
+    string pickerSearch = "";
+    bool openPicker;
 
     public InspectorPanel(EditorState state) => this.state = state;
 
     public void DrawContents() {
         if (state.HasAssetSelection) {
             DrawAssetInspector();
-            return;
         }
-
-        Entity entity = state.Selected;
-        if (entity is null) {
+        else if (state.Selected is not null) {
+            DrawEntityInspector(state.Selected);
+        }
+        else {
             ImGui.TextDisabled("Nothing selected.");
-            return;
         }
 
-        DrawEntityHeader(entity);
-        ImGui.Separator();
+        if (openPicker) {
+            openPicker = false;
+            pickerSearch = "";
+            ImGui.OpenPopup("##assetpicker");
+        }
+        DrawAssetPickerPopup();
+    }
+
+    // ---- Entity inspector ----------------------------------------------------
+
+    void DrawEntityInspector(Entity entity) {
+        var name = entity.Name ?? "";
+        bool active = entity.IsActive;
+
+        if (ImGui.Checkbox("##active", ref active)) { }
+        if (ImGui.IsItemActivated()) EditorUndo.Push();
+        if (active != entity.IsActive) entity.SetActive(active);
+
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(-1);
+        var renamed = ImGui.InputText("##name", ref name, 128);
+        if (ImGui.IsItemActivated()) EditorUndo.Push();
+        if (renamed) entity.Name = name;
+
+        ImGui.Spacing();
+
         DrawTransform(entity.transform);
 
         foreach (Behaviour behaviour in entity.Behaviours.ToArray())
             DrawComponent(entity, behaviour);
 
+        ImGui.Spacing();
         ImGui.Separator();
+        ImGui.Spacing();
         DrawAddComponent(entity);
-    }
-
-    static void DrawEntityHeader(Entity entity) {
-        var name = entity.Name ?? "";
-        if (ImGui.InputText("Name", ref name, 128))
-            entity.Name = name;
-
-        bool active = entity.IsActive;
-        if (ImGui.Checkbox("Active", ref active))
-            entity.SetActive(active);
     }
 
     static void DrawTransform(Transform transform) {
         if (!ImGui.CollapsingHeader("Transform", ImGuiTreeNodeFlags.DefaultOpen))
             return;
 
-        SysVec3 pos = ToSys(transform.Position);
-        if (ImGui.DragFloat3("Position", ref pos, 0.05f))
-            transform.Position = ToTk(pos);
+        if (BeginGrid("##transform")) {
+            SysVec3Row("Position", transform.Position, v => transform.Position = v, 0.05f);
+            SysVec3Row("Rotation", transform.EulerAngles, v => transform.EulerAngles = v, 0.5f);
+            SysVec3Row("Scale", transform.Scale, v => transform.Scale = v, 0.05f);
+            ImGui.EndTable();
+        }
 
-        SysVec3 euler = ToSys(transform.EulerAngles);
-        if (ImGui.DragFloat3("Rotation", ref euler, 0.5f))
-            transform.EulerAngles = ToTk(euler);
-
-        SysVec3 scale = ToSys(transform.Scale);
-        if (ImGui.DragFloat3("Scale", ref scale, 0.05f))
-            transform.Scale = ToTk(scale);
+        ImGui.Spacing();
     }
 
     void DrawComponent(Entity entity, Behaviour behaviour) {
         Type type = behaviour.GetType();
-        bool open = ImGui.CollapsingHeader(type.Name, ImGuiTreeNodeFlags.DefaultOpen);
+        ImGui.PushID(behaviour.InstanceId.GetHashCode());
 
-        // Right-click the header to remove the component.
-        if (ImGui.BeginPopupContextItem($"ctx_{type.Name}_{behaviour.InstanceId}")) {
+        bool open = ImGui.CollapsingHeader($"{type.Name}##hdr", ImGuiTreeNodeFlags.DefaultOpen);
+
+        if (ImGui.BeginPopupContextItem("##componentctx")) {
             if (ImGui.MenuItem("Remove Component")) {
+                EditorUndo.Push();
                 entity.RemoveComponent(behaviour);
                 ImGui.EndPopup();
+                ImGui.PopID();
                 return;
             }
             ImGui.EndPopup();
         }
 
-        if (!open)
-            return;
+        if (open) {
+            if (BeginGrid("##members")) {
+                // Enabled toggle as the first row.
+                bool enabled = behaviour.IsEnabled;
+                Row("Enabled");
+                if (ImGui.Checkbox("##enabled", ref enabled)) { }
+                if (ImGui.IsItemActivated()) EditorUndo.Push();
+                if (enabled != behaviour.IsEnabled) behaviour.IsEnabled = enabled;
 
-        ImGui.PushID(behaviour.InstanceId.GetHashCode());
+                foreach (MemberInfo member in ComponentReflection.SerializableMembers(type))
+                    DrawMember(member, behaviour);
 
-        bool enabled = behaviour.IsEnabled;
-        if (ImGui.Checkbox("Enabled", ref enabled))
-            behaviour.IsEnabled = enabled;
-
-        foreach (MemberInfo member in ComponentReflection.SerializableMembers(type))
-            DrawMember(member, behaviour);
+                ImGui.EndTable();
+            }
+            ImGui.Spacing();
+        }
 
         ImGui.PopID();
     }
 
-    static void DrawMember(MemberInfo member, object target) {
+    void DrawMember(MemberInfo member, object target) {
         Type memberType = ComponentReflection.MemberType(member);
         object value = ComponentReflection.GetValue(member, target);
-        string label = member.Name;
+
+        Row(Prettify(member.Name));
+        ImGui.PushID(member.Name);
+        ImGui.SetNextItemWidth(-1);
 
         if (typeof(BObject).IsAssignableFrom(memberType)) {
-            DrawAssetSlot(member, target, label, value as BObject, memberType);
-            return;
+            DrawAssetSlot(member, target, value as BObject, memberType);
+        }
+        else {
+            switch (value) {
+                case float f: {
+                    var changed = ImGui.DragFloat("##v", ref f, 0.05f);
+                    if (ImGui.IsItemActivated()) EditorUndo.Push();
+                    if (changed) ComponentReflection.SetValue(member, target, f);
+                    break;
+                }
+                case int i: {
+                    var changed = ImGui.DragInt("##v", ref i);
+                    if (ImGui.IsItemActivated()) EditorUndo.Push();
+                    if (changed) ComponentReflection.SetValue(member, target, i);
+                    break;
+                }
+                case bool b: {
+                    var changed = ImGui.Checkbox("##v", ref b);
+                    if (ImGui.IsItemActivated()) EditorUndo.Push();
+                    if (changed) ComponentReflection.SetValue(member, target, b);
+                    break;
+                }
+                case string s: {
+                    var str = s ?? "";
+                    var changed = ImGui.InputText("##v", ref str, 256);
+                    if (ImGui.IsItemActivated()) EditorUndo.Push();
+                    if (changed) ComponentReflection.SetValue(member, target, str);
+                    break;
+                }
+                case Vector3 v3: {
+                    var sv = new System.Numerics.Vector3(v3.X, v3.Y, v3.Z);
+                    var changed = ImGui.DragFloat3("##v", ref sv, 0.05f);
+                    if (ImGui.IsItemActivated()) EditorUndo.Push();
+                    if (changed) ComponentReflection.SetValue(member, target, new Vector3(sv.X, sv.Y, sv.Z));
+                    break;
+                }
+                case Vector2 v2: {
+                    var sv = new SysVec2(v2.X, v2.Y);
+                    var changed = ImGui.DragFloat2("##v", ref sv, 0.05f);
+                    if (ImGui.IsItemActivated()) EditorUndo.Push();
+                    if (changed) ComponentReflection.SetValue(member, target, new Vector2(sv.X, sv.Y));
+                    break;
+                }
+                case Enum e: {
+                    string[] names = Enum.GetNames(memberType);
+                    int current = Array.IndexOf(names, e.ToString());
+                    var changed = ImGui.Combo("##v", ref current, names, names.Length);
+                    if (ImGui.IsItemActivated()) EditorUndo.Push();
+                    if (changed) ComponentReflection.SetValue(member, target, Enum.Parse(memberType, names[current]));
+                    break;
+                }
+                default:
+                    ImGui.TextDisabled($"({memberType.Name})");
+                    break;
+            }
         }
 
-        switch (value) {
-            case float f: {
-                if (ImGui.DragFloat(label, ref f, 0.05f)) ComponentReflection.SetValue(member, target, f);
-                break;
-            }
-            case int i: {
-                if (ImGui.DragInt(label, ref i)) ComponentReflection.SetValue(member, target, i);
-                break;
-            }
-            case bool b: {
-                if (ImGui.Checkbox(label, ref b)) ComponentReflection.SetValue(member, target, b);
-                break;
-            }
-            case string s: {
-                var str = s ?? "";
-                if (ImGui.InputText(label, ref str, 256)) ComponentReflection.SetValue(member, target, str);
-                break;
-            }
-            case Vector3 v3: {
-                SysVec3 sv = ToSys(v3);
-                if (ImGui.DragFloat3(label, ref sv, 0.05f)) ComponentReflection.SetValue(member, target, ToTk(sv));
-                break;
-            }
-            case Vector2 v2: {
-                var sv = new SysVec2(v2.X, v2.Y);
-                if (ImGui.DragFloat2(label, ref sv, 0.05f))
-                    ComponentReflection.SetValue(member, target, new Vector2(sv.X, sv.Y));
-                break;
-            }
-            case Enum e: {
-                DrawEnum(member, target, label, e, memberType);
-                break;
-            }
-            default:
-                ImGui.TextDisabled($"{label}: ({memberType.Name})");
-                break;
-        }
+        ImGui.PopID();
     }
 
-    static void DrawEnum(MemberInfo member, object target, string label, Enum value, Type enumType) {
-        string[] names = Enum.GetNames(enumType);
-        int current = Array.IndexOf(names, value.ToString());
-        if (ImGui.Combo(label, ref current, names, names.Length))
-            ComponentReflection.SetValue(member, target, Enum.Parse(enumType, names[current]));
-    }
-
-    static void DrawAssetSlot(MemberInfo member, object target, string label, BObject asset, Type assetType) {
+    // Asset slot: shows the assigned asset; click opens the picker, or drop a tile on it.
+    void DrawAssetSlot(MemberInfo member, object target, BObject asset, Type assetType) {
         string display = asset is null
-            ? "(none)"
+            ? "None  ▾"
             : AssetDatabase.TryGetAssetGuid(asset, out Guid g)
                 ? Path.GetFileName(AssetDatabase.GuidToAssetPath(g))
                 : asset.GetType().Name;
 
-        ImGui.Button($"{display}##{label}", new SysVec2(-1, 0));
-        AcceptAssetDrop(member, target, assetType);
-        ImGui.SameLine();
-        ImGui.Text(label);
-    }
+        if (asset is null)
+            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
 
-    static unsafe void AcceptAssetDrop(MemberInfo member, object target, Type assetType) {
-        if (!ImGui.BeginDragDropTarget())
-            return;
-
-        ImGuiPayloadPtr payload = ImGui.AcceptDragDropPayload(AssetBrowserPanel.DragType);
-        if (payload.NativePtr != null && payload.Data != IntPtr.Zero) {
-            var guidText = System.Runtime.InteropServices.Marshal.PtrToStringAnsi(payload.Data, payload.DataSize);
-            if (Guid.TryParse(guidText, out Guid guid)) {
-                MethodInfo load = typeof(AssetDatabase).GetMethod(nameof(AssetDatabase.Load), [typeof(Guid)])!
-                    .MakeGenericMethod(assetType);
-                object loaded = load.Invoke(null, [guid]);
-                if (loaded is not null)
-                    ComponentReflection.SetValue(member, target, loaded);
-            }
+        if (ImGui.Button(display, new SysVec2(-1, 0))) {
+            pickerMember = member;
+            pickerTarget = target;
+            pickerType = assetType;
+            openPicker = true;
         }
 
-        ImGui.EndDragDropTarget();
+        if (asset is null)
+            ImGui.PopStyleColor();
+
+        if (AcceptGuidDrop(out Guid dropped))
+            AssignAsset(member, target, assetType, dropped);
     }
 
-    static void DrawAddComponent(Entity entity) {
-        if (ImGui.Button("Add Component", new SysVec2(-1, 0)))
-            ImGui.OpenPopup("add_component");
+    void AssignAsset(MemberInfo member, object target, Type assetType, Guid guid) {
+        EditorUndo.Push();
+        MethodInfo load = typeof(AssetDatabase).GetMethod(nameof(AssetDatabase.Load), [typeof(Guid)])!
+            .MakeGenericMethod(assetType);
+        object loaded = load.Invoke(null, [guid]);
+        if (loaded is not null)
+            ComponentReflection.SetValue(member, target, loaded);
+    }
 
-        if (!ImGui.BeginPopup("add_component"))
+    // Mini asset-picker window: search + every compatible asset; click to assign.
+    void DrawAssetPickerPopup() {
+        ImGui.SetNextWindowSize(new SysVec2(380, 420), ImGuiCond.Appearing);
+        if (!ImGui.BeginPopup("##assetpicker"))
+            return;
+
+        ImGui.TextDisabled($"Select {pickerType?.Name ?? "asset"}");
+        ImGui.SetNextItemWidth(-1);
+        ImGui.InputTextWithHint("##search", "Search...", ref pickerSearch, 128);
+        ImGui.Separator();
+
+        ImGui.BeginChild("##list");
+
+        if (ImGui.Selectable("(None)")) {
+            EditorUndo.Push();
+            ComponentReflection.SetValue(pickerMember, pickerTarget, null);
+            ImGui.CloseCurrentPopup();
+        }
+
+        string[] extensions = CompatibleExtensions(pickerType);
+        foreach ((string path, Guid guid) in AssetDatabase.EnumerateAssets()
+                     .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)) {
+            var ext = Path.GetExtension(path).ToLowerInvariant();
+            if (extensions.Length > 0 && !extensions.Contains(ext))
+                continue;
+            if (pickerSearch.Length > 0 && !path.Contains(pickerSearch, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (ImGui.Selectable($"{Path.GetFileName(path)}##{guid}")) {
+                AssignAsset(pickerMember, pickerTarget, pickerType, guid);
+                ImGui.CloseCurrentPopup();
+            }
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(path);
+        }
+
+        ImGui.EndChild();
+        ImGui.EndPopup();
+    }
+
+    static string[] CompatibleExtensions(Type assetType) {
+        if (assetType is null) return [];
+        if (typeof(Texture3D).IsAssignableFrom(assetType))
+            return [".cubemap", ".hdr", ".exr", ".png", ".jpg", ".jpeg"];
+        if (typeof(Texture2D).IsAssignableFrom(assetType))
+            return [".png", ".jpg", ".jpeg", ".tga", ".bmp", ".hdr", ".exr"];
+        if (typeof(Mesh).IsAssignableFrom(assetType))
+            return [".fbx", ".obj"];
+        if (typeof(Material).IsAssignableFrom(assetType))
+            return [".mat"];
+        if (typeof(Shader).IsAssignableFrom(assetType))
+            return [".shader"];
+        return [];
+    }
+
+    void DrawAddComponent(Entity entity) {
+        if (ImGui.Button("Add Component", new SysVec2(-1, 0)))
+            ImGui.OpenPopup("##addcomponent");
+
+        if (!ImGui.BeginPopup("##addcomponent"))
             return;
 
         foreach (ComponentEntry entry in ComponentRegistry.Menu) {
-            if (ImGui.MenuItem(entry.DisplayName))
+            if (ImGui.MenuItem(entry.DisplayName)) {
+                EditorUndo.Push();
                 entity.AddComponent(entry.Type);
+            }
         }
 
         ImGui.EndPopup();
@@ -209,8 +309,9 @@ internal sealed class InspectorPanel {
         ImGui.Text(Path.GetFileName(path));
         ImGui.TextDisabled(path);
         if (AssetDatabase.TryGetMeta(guid, out MetaFile meta))
-            ImGui.TextDisabled($"{meta.Importer}   guid:{guid:N}");
+            ImGui.TextDisabled(meta.Importer);
         ImGui.Separator();
+        ImGui.Spacing();
 
         switch (ext) {
             case ".png" or ".jpg" or ".jpeg" or ".tga" or ".bmp" or ".hdr" or ".exr":
@@ -235,22 +336,25 @@ internal sealed class InspectorPanel {
             return;
         }
 
-        TextureType current = TextureImporter.TypeFromSettings(meta.Settings);
-        string[] names = Enum.GetNames<TextureType>();
-        int index = Array.IndexOf(names, current.ToString());
-
-        if (ImGui.Combo("Texture Type", ref index, names, names.Length)) {
-            meta.Settings["textureType"] = names[index];
-            meta.Save(MetaFile.PathFor(AssetDatabase.Project.ResolveAbsolute(path)));
-            AssetDatabase.Refresh();          // settings hash changed -> reimports
-            AssetDatabase.Invalidate(guid);   // next Load picks up the new import
+        if (BeginGrid("##texsettings")) {
+            Row("Texture Type");
+            TextureType current = TextureImporter.TypeFromSettings(meta.Settings);
+            string[] names = Enum.GetNames<TextureType>();
+            int index = Array.IndexOf(names, current.ToString());
+            ImGui.SetNextItemWidth(-1);
+            if (ImGui.Combo("##textype", ref index, names, names.Length)) {
+                meta.Settings["textureType"] = names[index];
+                meta.Save(MetaFile.PathFor(AssetDatabase.Project.ResolveAbsolute(path)));
+                AssetDatabase.Refresh();
+                AssetDatabase.Invalidate(guid);
+            }
+            ImGui.EndTable();
         }
 
-        ImGui.TextDisabled("Changing the type reimports the texture. Already-loaded\nmaterials keep the old instance until the scene reloads.");
+        ImGui.Spacing();
+        ImGui.TextDisabled("Changing the type reimports. Loaded materials keep the\nold instance until the scene reloads.");
     }
 
-    // Edits the .mat definition AND the live Material instance, so changes show immediately
-    // and persist. Texture slots accept drags from the asset browser.
     void DrawMaterialEditor(string path, Guid guid) {
         var absolute = AssetDatabase.Project.ResolveAbsolute(path);
         MaterialDefinition definition;
@@ -263,24 +367,29 @@ internal sealed class InspectorPanel {
         }
 
         ImGui.TextDisabled($"Shader: {definition.Shader ?? "(none)"}");
-        ImGui.Separator();
+        ImGui.Spacing();
 
         var changed = false;
-        foreach (TextureType slot in new[] {
-                     TextureType.Diffuse, TextureType.Normal, TextureType.Metallic,
-                     TextureType.Roughness, TextureType.AO,
-                 }) {
-            definition.Textures.TryGetValue(slot.ToString(), out var reference);
-            var display = reference is null ? "(none)" : Path.GetFileName(ReferenceToPath(reference) ?? reference);
+        if (BeginGrid("##matslots")) {
+            foreach (TextureType slot in new[] {
+                         TextureType.Diffuse, TextureType.Normal, TextureType.Metallic,
+                         TextureType.Roughness, TextureType.AO,
+                     }) {
+                definition.Textures.TryGetValue(slot.ToString(), out var reference);
+                var display = reference is null
+                    ? "None"
+                    : Path.GetFileName(ReferenceToPath(reference) ?? reference);
 
-            ImGui.Button($"{display}##slot_{slot}", new SysVec2(ImGui.GetContentRegionAvail().X * 0.62f, 0));
-            if (AcceptGuidDrop(out Guid dropped)) {
-                definition.Textures[slot.ToString()] = AssetRef.FromGuid(dropped);
-                changed = true;
+                Row(slot.ToString());
+                ImGui.PushID((int)slot);
+                ImGui.Button(display, new SysVec2(-1, 0));
+                if (AcceptGuidDrop(out Guid dropped)) {
+                    definition.Textures[slot.ToString()] = AssetRef.FromGuid(dropped);
+                    changed = true;
+                }
+                ImGui.PopID();
             }
-            ImGui.SameLine();
-            ImGui.AlignTextToFramePadding();
-            ImGui.Text(slot.ToString());
+            ImGui.EndTable();
         }
 
         if (changed) {
@@ -288,7 +397,7 @@ internal sealed class InspectorPanel {
             ApplyLiveMaterial(guid, definition);
         }
 
-        ImGui.Separator();
+        ImGui.Spacing();
         ImGui.TextDisabled("Drag textures from the Assets panel onto the slots.");
     }
 
@@ -332,9 +441,49 @@ internal sealed class InspectorPanel {
         if (SceneManager.IsPlaying)
             SceneManager.StopPlay();
         SceneManager.GetCurrentScene().Clear();
-        BallisticEngine.Serialization.SceneSerializer.Load(AssetDatabase.Project.ResolveAbsolute(assetPath));
+        SceneSerializer.Load(AssetDatabase.Project.ResolveAbsolute(assetPath));
     }
 
-    static SysVec3 ToSys(Vector3 v) => new(v.X, v.Y, v.Z);
-    static Vector3 ToTk(SysVec3 v) => new(v.X, v.Y, v.Z);
+    // ---- Layout helpers --------------------------------------------------------
+
+    static bool BeginGrid(string id) {
+        if (!ImGui.BeginTable(id, 2, ImGuiTableFlags.SizingStretchProp))
+            return false;
+        ImGui.TableSetupColumn("label", ImGuiTableColumnFlags.WidthStretch, 0.38f);
+        ImGui.TableSetupColumn("value", ImGuiTableColumnFlags.WidthStretch, 0.62f);
+        return true;
+    }
+
+    // Starts a new label/value row and leaves the cursor in the value column.
+    static void Row(string label) {
+        ImGui.TableNextRow();
+        ImGui.TableSetColumnIndex(0);
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextDisabled(label);
+        ImGui.TableSetColumnIndex(1);
+        ImGui.SetNextItemWidth(-1);
+    }
+
+    static void SysVec3Row(string label, Vector3 value, Action<Vector3> apply, float speed) {
+        Row(label);
+        var sv = new System.Numerics.Vector3(value.X, value.Y, value.Z);
+        var changed = ImGui.DragFloat3($"##{label}", ref sv, speed);
+        if (ImGui.IsItemActivated()) EditorUndo.Push();
+        if (changed) apply(new Vector3(sv.X, sv.Y, sv.Z));
+    }
+
+    // "RotationEuler" -> "Rotation Euler", "lightIntensity" -> "Light Intensity"
+    static string Prettify(string name) {
+        if (string.IsNullOrEmpty(name))
+            return name;
+
+        var result = new System.Text.StringBuilder(name.Length + 4);
+        result.Append(char.ToUpperInvariant(name[0]));
+        for (var i = 1; i < name.Length; i++) {
+            if (char.IsUpper(name[i]) && !char.IsUpper(name[i - 1]))
+                result.Append(' ');
+            result.Append(name[i]);
+        }
+        return result.ToString();
+    }
 }

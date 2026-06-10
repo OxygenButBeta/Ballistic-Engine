@@ -12,11 +12,14 @@ internal sealed class HierarchyPanel {
     public void DrawContents() {
         Scene scene = SceneManager.GetCurrentScene();
 
-        if (ImGui.Button("+ Entity"))
+        if (ImGui.Button("+ Entity")) {
+            EditorUndo.Push();
             state.Select(scene.CreateEntity("Entity"));
+        }
         ImGui.SameLine();
         ImGui.BeginDisabled(state.Selected is null);
         if (ImGui.Button("Delete")) {
+            EditorUndo.Push();
             scene.DestroyEntity(state.Selected);
             state.Selected = null;
         }
