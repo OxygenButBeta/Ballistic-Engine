@@ -14,6 +14,9 @@ internal sealed class AssetBrowserPanel {
 
     readonly EditorState state;
     readonly Func<float> scale;
+    readonly ThumbnailCache thumbnails = new();
+
+    static readonly string[] ImageExtensions = [".png", ".jpg", ".jpeg", ".tga", ".bmp", ".hdr", ".exr"];
 
     string filter = "";
 
@@ -27,6 +30,7 @@ internal sealed class AssetBrowserPanel {
 
     public void DrawContents() {
         float s = scale();
+        thumbnails.Pump(); // at most one thumbnail decode per frame
         DrawNavigationBar(s);
         ImGui.Separator();
 
@@ -74,8 +78,10 @@ internal sealed class AssetBrowserPanel {
         ImGui.TextDisabled(CurrentFolder.Replace("/", "  /  "));
 
         ImGui.SameLine(ImGui.GetWindowWidth() - 320 * s);
-        if (ImGui.Button("Refresh"))
+        if (ImGui.Button("Refresh")) {
             AssetDatabase.Refresh();
+            thumbnails.InvalidateAll();
+        }
         ImGui.SameLine();
         ImGui.SetNextItemWidth(200 * s);
         ImGui.InputTextWithHint("##filter", "Search...", ref filter, 128);
@@ -176,11 +182,15 @@ internal sealed class AssetBrowserPanel {
         ImGui.PushID(folderPath);
         ImGui.BeginGroup();
 
-        ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(0.27f, 0.24f, 0.16f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(0.36f, 0.32f, 0.20f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new SysVec4(0.45f, 0.39f, 0.23f, 1f));
-        ImGui.Button("DIR", new SysVec2(tile, tile));
+        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 6f);
+        ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(0.13f, 0.13f, 0.13f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(0.19f, 0.19f, 0.19f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new SysVec4(0.23f, 0.23f, 0.23f, 1f));
+        ImGui.Button("##folder", new SysVec2(tile, tile));
         ImGui.PopStyleColor(3);
+        ImGui.PopStyleVar();
+
+        DrawFolderGlyph(ImGui.GetItemRectMin(), ImGui.GetItemRectMax());
 
         if (ImGui.IsItemHovered() && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
             CurrentFolder = folderPath;
@@ -212,14 +222,25 @@ internal sealed class AssetBrowserPanel {
 
         ImGui.PushID(path);
         ImGui.BeginGroup();
+        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 6f);
 
-        ImGui.PushStyleColor(ImGuiCol.Button, color);
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Brighten(color, 1.25f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonActive, Brighten(color, 1.45f));
-        // Button fires on RELEASE, so starting a drag does NOT change the selection —
-        // you can drag an asset onto an Inspector slot without losing what's inspected.
-        var clicked = ImGui.Button(tag, new SysVec2(tile, tile));
-        ImGui.PopStyleColor(3);
+        // Image assets render their thumbnail; everything else gets a colored tile with a tag.
+        bool clicked;
+        var thumb = ImageExtensions.Contains(ext) ? thumbnails.Get(guid) : 0;
+        if (thumb != 0) {
+            clicked = ImGui.ImageButton($"##thumb{guid}", thumb,
+                new SysVec2(tile - 8, tile - 8), new SysVec2(0, 0), new SysVec2(1, 1));
+        }
+        else {
+            ImGui.PushStyleColor(ImGuiCol.Button, color);
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Brighten(color, 1.25f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, Brighten(color, 1.45f));
+            // Button fires on RELEASE, so starting a drag does NOT change the selection —
+            // you can drag an asset onto an Inspector slot without losing what's inspected.
+            clicked = ImGui.Button(tag, new SysVec2(tile, tile));
+            ImGui.PopStyleColor(3);
+        }
+        ImGui.PopStyleVar();
 
         if (selected) {
             ImGui.GetWindowDrawList().AddRect(
@@ -269,6 +290,22 @@ internal sealed class AssetBrowserPanel {
         while (label.Length > 4 && ImGui.CalcTextSize(label).X > tile)
             label = label[..^4] + "...";
         ImGui.TextUnformatted(label);
+    }
+
+    // A simple folder glyph drawn over the tile button (tab + body).
+    static void DrawFolderGlyph(SysVec2 min, SysVec2 max) {
+        ImDrawListPtr draw = ImGui.GetWindowDrawList();
+        SysVec2 size = max - min;
+        var bodyColor = ImGui.GetColorU32(new SysVec4(0.78f, 0.63f, 0.27f, 1f));
+        var tabColor = ImGui.GetColorU32(new SysVec4(0.88f, 0.74f, 0.38f, 1f));
+
+        SysVec2 bodyMin = min + size * new SysVec2(0.18f, 0.32f);
+        SysVec2 bodyMax = min + size * new SysVec2(0.82f, 0.78f);
+        SysVec2 tabMin = min + size * new SysVec2(0.18f, 0.24f);
+        SysVec2 tabMax = min + size * new SysVec2(0.48f, 0.36f);
+
+        draw.AddRectFilled(tabMin, tabMax, tabColor, 3f);
+        draw.AddRectFilled(bodyMin, bodyMax, bodyColor, 3f);
     }
 
     static (string, SysVec4) Style(string ext) => ext switch {

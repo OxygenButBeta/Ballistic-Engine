@@ -47,6 +47,10 @@ public static class AssetDatabase {
     // The asset's .meta (importer + settings) — for the editor's asset inspector.
     public static bool TryGetMeta(Guid guid, out MetaFile meta) => pipeline.TryGetMeta(guid, out meta);
 
+    // Absolute path of the asset's Library artifact (e.g. for editor thumbnails).
+    public static bool TryGetArtifactPath(Guid guid, out string absolutePath) =>
+        pipeline.TryGetArtifactPath(guid, out absolutePath);
+
     // Drops a loaded asset from the cache so the next Load re-reads it (e.g. after a reimport).
     // Objects already holding the old instance keep it.
     public static void Invalidate(Guid guid) {

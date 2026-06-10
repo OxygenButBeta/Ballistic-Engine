@@ -1,9 +1,9 @@
 #version 330 core
 
-in vec2 TexCoords;     
-out vec4 FragColor;    
+in vec2 TexCoords;
+out vec4 FragColor;
 
-uniform sampler2D hdrTexture; 
+uniform sampler2D hdrTexture;
 
 // ACES Tonemap
 vec3 ACESFilm(vec3 x) {
@@ -20,14 +20,18 @@ float rand(vec2 co) {
     return fract(sin(dot(co, vec2(12.9898,78.233))) * 43758.5453);
 }
 
+// HDR -> display: exposure curve + ACES. Every sample that feeds later math MUST go
+// through this first; mixing raw HDR values with tonemapped ones explodes around
+// very bright pixels (sun in an EXR sky) and produces NaN holes.
+vec3 Tonemap(vec3 hdr) {
+    float exposure = 1.2;
+    vec3 c = vec3(1.0) - exp(-hdr * exposure);
+    return ACESFilm(c);
+}
+
 void main()
 {
-    vec3 color = texture(hdrTexture, TexCoords).rgb;
-
-    // 1) Exposure sabit + ACES tonemap
-    float exposure = 1.2; // biraz daha parlak
-    color = vec3(1.0) - exp(-color * exposure);
-    color = ACESFilm(color);
+    vec3 color = Tonemap(texture(hdrTexture, TexCoords).rgb);
 
     // 2) Kontrast & Saturation
     float contrast = 1.05;
@@ -41,22 +45,22 @@ void main()
     float vignette = smoothstep(0.8, 0.5, dist);
     color *= vignette;
 
-    // 4) Hafif sharpening (tek texture üzerinden unsharp mask benzeri)
+    // 4) Hafif sharpening (tonemapped samples; raw HDR here would create negatives/NaN)
     vec2 texel = 1.0 / textureSize(hdrTexture, 0);
     vec3 blur =
-        texture(hdrTexture, TexCoords + vec2(-texel.x, 0.0)).rgb +
-        texture(hdrTexture, TexCoords + vec2(texel.x, 0.0)).rgb +
-        texture(hdrTexture, TexCoords + vec2(0.0, -texel.y)).rgb +
-        texture(hdrTexture, TexCoords + vec2(0.0, texel.y)).rgb;
+        Tonemap(texture(hdrTexture, TexCoords + vec2(-texel.x, 0.0)).rgb) +
+        Tonemap(texture(hdrTexture, TexCoords + vec2(texel.x, 0.0)).rgb) +
+        Tonemap(texture(hdrTexture, TexCoords + vec2(0.0, -texel.y)).rgb) +
+        Tonemap(texture(hdrTexture, TexCoords + vec2(0.0, texel.y)).rgb);
     blur *= 0.25;
-    color = mix(blur, color, 1.2); // 1.2 = sharpen gücü
+    color = clamp(mix(blur, color, 1.2), 0.0, 1.0); // 1.2 = sharpen gücü
 
     // 5) Film Grain
     float grain = rand(TexCoords * 1280.0);
     color += (grain - 0.5) * 0.015;
 
     // 6) Gamma düzeltme
-    color = pow(color, vec3(1.0/2.2));
+    color = pow(max(color, 0.0), vec3(1.0/2.2));
 
     FragColor = vec4(color, 1.0);
 }

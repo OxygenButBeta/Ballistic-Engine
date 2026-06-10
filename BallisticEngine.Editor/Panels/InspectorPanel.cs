@@ -193,29 +193,46 @@ internal sealed class InspectorPanel {
         ImGui.PopID();
     }
 
-    // Asset slot: shows the assigned asset; click opens the picker, or drop a tile on it.
+    // Asset slot. Assigned: clicking the name PINS the asset in the Inspector (shows its
+    // asset view), the ▾ button opens the picker. Unassigned: click opens the picker.
+    // Either way the slot is a drag-drop target for browser tiles.
     void DrawAssetSlot(MemberInfo member, object target, BObject asset, Type assetType) {
-        string display = asset is null
-            ? "None  ▾"
-            : AssetDatabase.TryGetAssetGuid(asset, out Guid g)
-                ? Path.GetFileName(AssetDatabase.GuidToAssetPath(g))
-                : asset.GetType().Name;
+        Guid guid = default;
+        var hasGuid = asset is not null && AssetDatabase.TryGetAssetGuid(asset, out guid);
 
-        if (asset is null)
+        if (asset is null) {
             ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
-
-        if (ImGui.Button(display, new SysVec2(-1, 0))) {
-            pickerMember = member;
-            pickerTarget = target;
-            pickerType = assetType;
-            openPicker = true;
+            if (ImGui.Button("None  ▾", new SysVec2(-1, 0)))
+                OpenPickerFor(member, target, assetType);
+            ImGui.PopStyleColor();
+            if (AcceptGuidDrop(out Guid d0))
+                AssignAsset(member, target, assetType, d0);
+            return;
         }
 
-        if (asset is null)
-            ImGui.PopStyleColor();
+        var path = hasGuid ? AssetDatabase.GuidToAssetPath(guid) : null;
+        var display = path is not null ? Path.GetFileName(path) : asset.GetType().Name;
 
-        if (AcceptGuidDrop(out Guid dropped))
-            AssignAsset(member, target, assetType, dropped);
+        float pickerW = ImGui.GetFrameHeight() + 6;
+        if (ImGui.Button(display, new SysVec2(-pickerW - 4, 0)) && path is not null)
+            state.SelectAsset(path, guid); // pin the referenced asset in the Inspector
+        if (AcceptGuidDrop(out Guid d1))
+            AssignAsset(member, target, assetType, d1);
+        if (ImGui.IsItemHovered() && path is not null)
+            ImGui.SetTooltip(path);
+
+        ImGui.SameLine();
+        if (ImGui.Button("▾", new SysVec2(pickerW, 0)))
+            OpenPickerFor(member, target, assetType);
+        if (AcceptGuidDrop(out Guid d2))
+            AssignAsset(member, target, assetType, d2);
+    }
+
+    void OpenPickerFor(MemberInfo member, object target, Type assetType) {
+        pickerMember = member;
+        pickerTarget = target;
+        pickerType = assetType;
+        openPicker = true;
     }
 
     void AssignAsset(MemberInfo member, object target, Type assetType, Guid guid) {
