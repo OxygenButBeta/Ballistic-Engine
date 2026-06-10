@@ -1,0 +1,44 @@
+version: 1
+name: FalcorTest
+entities:
+- id: 00d80e5fcc044cf2a2474a3a267811e6
+  name: Camera
+  isActive: true
+  transform:
+    position: {x: 0, y: 2, z: -15}
+    rotation: {x: 0, y: 0.9978046, z: 0.066227265, w: 0}
+    scale: {x: 1, y: 1, z: 1}
+    parent: 
+  components:
+  - type: HDCamera
+    enabled: true
+    members: {}
+  - type: FreeLookCameraController
+    enabled: true
+    members: {}
+- id: 47c05d1e8f9e42f2ab13b5e0492feae7
+  name: Directional Light
+  isActive: true
+  transform:
+    position: {x: 0, y: 0, z: 0}
+    rotation: {x: -0.5067974, y: 0.38611445, z: 0.27122974, w: 0.7214614}
+    scale: {x: 1, y: 1, z: 1}
+    parent: 
+  components:
+  - type: DirectionalLight
+    enabled: true
+    members:
+      lightIntensity: 1.6201851
+- id: 66e7ab5c32604ca494f73f51f914dc25
+  name: PH7
+  isActive: true
+  transform:
+    position: {x: 0, y: 0, z: 0}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 1, y: 1, z: 1}
+    parent: 
+  components:
+  - type: StaticMeshRenderer
+    enabled: true
+    members:
+      sharedMesh: Assets/Default/PH7.fbx

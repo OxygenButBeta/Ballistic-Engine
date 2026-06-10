@@ -1,7 +1,7 @@
 version: 1
 name: Main
 entities:
-- id: 4686c82ec62c41468b029c5889225dff
+- id: a85a0c237e1447c5bd496a39c81e87ee
   name: Camera
   isActive: true
   transform:
@@ -16,7 +16,7 @@ entities:
   - type: FreeLookCameraController
     enabled: true
     members: {}
-- id: 3d04e8d63e0c47a7a51fa431f3783af4
+- id: 6d838be232d04c83960385ae72038f1c
   name: Mesh
   isActive: true
   transform:
@@ -35,7 +35,7 @@ entities:
     members:
       rotationSpeed: 15
       alpha: true
-- id: 286cf3f4b3c54efeb3ed449612781d37
+- id: 7ae9bd5effcf47c1a5e415ae1ff817f3
   name: Directional Light
   isActive: true
   transform:

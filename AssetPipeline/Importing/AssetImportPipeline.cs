@@ -26,7 +26,10 @@ public sealed class AssetImportPipeline {
         this.project = project;
         importers = customImporters is not null
             ? [.. customImporters]
-            : [new ModelImporter(), new TextureImporter(), new NativeAssetImporter(), new DefaultImporter()];
+            : [
+                new ModelImporter(), new TextureImporter(), new FalcorSceneImporter(),
+                new NativeAssetImporter(), new DefaultImporter()
+            ];
     }
 
     public bool TryGetMeta(Guid guid, out MetaFile meta) => metaByGuid.TryGetValue(guid, out meta);
@@ -67,7 +70,7 @@ public sealed class AssetImportPipeline {
 
             IAssetImporter importer = ResolveImporter(meta, sourceAbsolute);
 
-            if (importer.ArtifactExtension is null) {
+            if (importer.ArtifactExtension is null && !importer.RunsWithoutArtifact) {
                 upToDate++;
                 continue;
             }
@@ -142,11 +145,12 @@ public sealed class AssetImportPipeline {
         return importers.First(candidate => candidate.CanImport(extension));
     }
 
-    // Returns true when the asset was (re)imported, false when the Library artifact is already current.
+    // Returns true when the asset was (re)imported, false when its output is already current.
     bool ImportIfDirty(MetaFile meta, IAssetImporter importer, string sourceAbsolute, string assetPath) {
         var settingsHash = meta.SettingsHash();
-        var artifactRelative = $"Artifacts/{meta.Guid:N}{importer.ArtifactExtension}";
-        var artifactAbsolute = Path.Combine(project.LibraryPath, artifactRelative);
+        var hasArtifact = importer.ArtifactExtension is not null;
+        var artifactRelative = hasArtifact ? $"Artifacts/{meta.Guid:N}{importer.ArtifactExtension}" : null;
+        var artifactAbsolute = hasArtifact ? Path.Combine(project.LibraryPath, artifactRelative) : null;
         var sourceInfo = new FileInfo(sourceAbsolute);
 
         database.Entries.TryGetValue(meta.Guid, out ArtifactRecord record);
@@ -154,7 +158,7 @@ public sealed class AssetImportPipeline {
         var dirty = record is null
                     || record.ImporterVersion != importer.Version
                     || record.SettingsHash != settingsHash
-                    || !File.Exists(artifactAbsolute);
+                    || (hasArtifact && !File.Exists(artifactAbsolute));
 
         string contentHash = null;
         if (!dirty) {

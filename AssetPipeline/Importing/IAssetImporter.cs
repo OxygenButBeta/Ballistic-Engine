@@ -16,6 +16,10 @@ public interface IAssetImporter {
     // (engine-native text assets are read straight from Assets\).
     string ArtifactExtension { get; }
 
+    // True for importers that have no Library artifact but still need Import() run on change
+    // (e.g. the Falcor importer writes a sibling .scene). Default false = inert native asset.
+    bool RunsWithoutArtifact => false;
+
     JsonObject CreateDefaultSettings(string assetPath);
 
     void Import(AssetImportContext context);

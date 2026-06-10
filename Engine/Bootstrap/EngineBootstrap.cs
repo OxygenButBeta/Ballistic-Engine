@@ -26,6 +26,11 @@ public sealed class EngineBootstrap {
 
         Project = BallisticProject.Open(projectPath);
         AssetDatabase.Initialize(Project);
+
+        // Falcor .pyscene -> Ballistic .scene conversion (injected; the converter is in the Engine layer).
+        FalcorSceneImporter.Converter = (pyscene, output) =>
+            FalcorSceneConverter.Convert(pyscene, output, ResolveModelToAssetRef);
+
         AssetDatabase.Refresh();
 
         // Play/Stop uses the scene serializer to snapshot edit-mode state and restore it.
@@ -33,6 +38,20 @@ public sealed class EngineBootstrap {
         SceneManager.SnapshotRestorer = (_, yaml) => SceneSerializer.Deserialize(yaml);
 
         runtime.RenderAsset.Initialize();
+    }
+
+    // Maps an absolute model path (from a .pyscene) to an "Assets/..." reference if it lives in the
+    // project. Returns a path ref (not a guid) because the model's GUID may not be assigned yet during
+    // the same refresh; the path resolves at scene-load time once the refresh completes.
+    string ResolveModelToAssetRef(string absoluteModelPath) {
+        if (!File.Exists(absoluteModelPath))
+            return null;
+
+        var full = Path.GetFullPath(absoluteModelPath);
+        if (!full.StartsWith(Project.RootPath, StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        return Project.ToAssetPath(full);
     }
 
     // Advances the engine one frame: ticks the clock and updates the scene (scene Update is a
