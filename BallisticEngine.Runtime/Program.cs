@@ -2,9 +2,16 @@ using BallisticEngine;
 
 internal class Program {
     public static void Main(string[] args) {
-        var projectPath = args.Length > 0
-            ? Path.GetFullPath(args[0])
+        var positional = args.Where(a => !a.StartsWith("--")).ToArray();
+        var projectPath = positional.Length > 0
+            ? Path.GetFullPath(positional[0])
             : DefaultProjectPath();
+
+        // One-off: regenerate SampleProject's Main.scene, then exit.
+        if (args.Contains("--author-scene")) {
+            SceneAuthoring.AuthorMainScene(projectPath);
+            return;
+        }
 
         GLBallisticEngineWindow runtime = new(1280, 720);
         BEngineEntry engineEntry = new(runtime, projectPath);

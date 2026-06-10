@@ -1,15 +1,16 @@
 namespace BallisticEngine;
 
-// Standalone player host: brings the engine up, then runs the play-mode loop.
+// Standalone player host: brings the engine up, loads the startup scene, then runs play mode.
 public sealed class BEngineEntry {
     readonly EngineLoop loop;
 
     public BEngineEntry(IBallisticEngineRuntime runtime, string projectPath) {
-        _ = new EngineBootstrap(runtime, projectPath);
+        EngineBootstrap bootstrap = new(runtime, projectPath);
         loop = new EngineLoop(runtime);
 
-        // The player runs game logic immediately.
-        SceneManager.SetPlaying(true);
+        // Build the scene in edit mode, then enter play (fires component lifecycle).
+        bootstrap.LoadStartupScene();
+        SceneManager.StartPlay();
     }
 
     public void Run() => loop.Run();

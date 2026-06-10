@@ -1,5 +1,6 @@
 {
   "version": 1,
   "name": "SampleProject",
-  "defaultSkybox": "Assets/Default/Sky/Default.cubemap"
+  "defaultSkybox": "Assets/Default/Sky/Default.cubemap",
+  "startupScene": "Assets/Scenes/Main.scene"
 }

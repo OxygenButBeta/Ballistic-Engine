@@ -1,0 +1,51 @@
+version: 1
+name: Main
+entities:
+- id: 4686c82ec62c41468b029c5889225dff
+  name: Camera
+  isActive: true
+  transform:
+    position: {x: 0, y: 0, z: -12}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 1, y: 1, z: 1}
+    parent: 
+  components:
+  - type: HDCamera
+    enabled: true
+    members: {}
+  - type: FreeLookCameraController
+    enabled: true
+    members: {}
+- id: 3d04e8d63e0c47a7a51fa431f3783af4
+  name: Mesh
+  isActive: true
+  transform:
+    position: {x: 0, y: 0, z: 0}
+    rotation: {x: -3.090862E-08, y: 0.70710677, z: 0.70710677, w: -3.090862E-08}
+    scale: {x: 6, y: 6, z: 6}
+    parent: 
+  components:
+  - type: StaticMeshRenderer
+    enabled: true
+    members:
+      sharedMesh: guid:65cdc968de614bc882f613faf350368f
+      sharedMaterial: guid:fdea02c941f340d69015d005ab8ef0de
+  - type: Rotator
+    enabled: true
+    members:
+      rotationSpeed: 15
+      alpha: true
+- id: 286cf3f4b3c54efeb3ed449612781d37
+  name: Directional Light
+  isActive: true
+  transform:
+    position: {x: 3, y: 0.5, z: 0}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 1, y: 1, z: 1}
+    parent: 
+  components:
+  - type: DirectionalLight
+    enabled: true
+    members:
+      ambientIntensity: 0.3
+      lightIntensity: 5

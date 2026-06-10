@@ -17,6 +17,7 @@
       <PackageReference Include="AssimpNet" Version="4.1.0" />
       <PackageReference Include="OpenTK" Version="4.9.4" />
       <PackageReference Include="StbImageSharp" Version="2.30.15" />
+      <PackageReference Include="YamlDotNet" Version="18.0.0" />
     </ItemGroup>
 
     <ItemGroup>

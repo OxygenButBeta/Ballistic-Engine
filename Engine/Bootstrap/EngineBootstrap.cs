@@ -1,4 +1,5 @@
 using BallisticEngine.AssetPipeline;
+using BallisticEngine.Serialization;
 
 namespace BallisticEngine;
 
@@ -27,6 +28,19 @@ public sealed class EngineBootstrap {
         AssetDatabase.Initialize(Project);
         AssetDatabase.Refresh();
 
+        // Play/Stop uses the scene serializer to snapshot edit-mode state and restore it.
+        SceneManager.SnapshotProvider = SceneSerializer.Serialize;
+        SceneManager.SnapshotRestorer = (_, yaml) => SceneSerializer.Deserialize(yaml);
+
         runtime.RenderAsset.Initialize();
+    }
+
+    // Loads the project's StartupScene (if set) into the current scene, in edit mode.
+    public void LoadStartupScene() {
+        var startup = Project.Manifest.StartupScene;
+        if (string.IsNullOrEmpty(startup))
+            return;
+
+        SceneSerializer.Load(Project.ResolveAbsolute(startup));
     }
 }
