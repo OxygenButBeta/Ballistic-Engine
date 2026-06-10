@@ -73,6 +73,7 @@ void main() {
         io.Fonts.GetTexDataAsRGBA32(out IntPtr pixels, out int width, out int height, out _);
 
         fontTexture = GL.GenTexture();
+        GL.ActiveTexture(TextureUnit.Texture0);
         GL.BindTexture(TextureTarget.Texture2D, fontTexture);
         GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, width, height, 0,
             PixelFormat.Bgra, PixelType.UnsignedByte, pixels);
@@ -87,7 +88,11 @@ void main() {
         if (drawData.CmdListsCount == 0)
             return;
 
-        // Save GL state we modify.
+        // Save GL state we modify. The engine leaves ActiveTexture on a high unit (shadow map /
+        // skybox); ImGui's sampler reads unit 0, so we MUST switch to unit 0 before binding —
+        // otherwise the whole UI samples whatever scene texture is left on unit 0.
+        int lastActiveTexture = GL.GetInteger(GetPName.ActiveTexture);
+        GL.ActiveTexture(TextureUnit.Texture0);
         int lastProgram = GL.GetInteger(GetPName.CurrentProgram);
         int lastTexture = GL.GetInteger(GetPName.TextureBinding2D);
         int lastVao = GL.GetInteger(GetPName.VertexArrayBinding);
@@ -96,7 +101,6 @@ void main() {
         bool lastCull = GL.IsEnabled(EnableCap.CullFace);
         bool lastDepth = GL.IsEnabled(EnableCap.DepthTest);
         bool lastScissor = GL.IsEnabled(EnableCap.ScissorTest);
-        GL.GetInteger(GetPName.Viewport, out int vpX);
         var lastViewport = new int[4];
         GL.GetInteger(GetPName.Viewport, lastViewport);
 
@@ -154,6 +158,7 @@ void main() {
         GL.BindBuffer(BufferTarget.ArrayBuffer, lastArrayBuffer);
         GL.UseProgram(lastProgram);
         GL.BindTexture(TextureTarget.Texture2D, lastTexture);
+        GL.ActiveTexture((TextureUnit)lastActiveTexture);
         GL.Viewport(lastViewport[0], lastViewport[1], lastViewport[2], lastViewport[3]);
         if (!lastScissor) GL.Disable(EnableCap.ScissorTest);
         if (!lastBlend) GL.Disable(EnableCap.Blend);

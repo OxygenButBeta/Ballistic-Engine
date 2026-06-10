@@ -26,7 +26,12 @@ public class GLHDRenderer : HDRenderer {
         gameBuffer = new GLFrameBuffer(window.Width, window.Height);
         shadowMap = new GLShadowMap(window.Width, window.Height);
 
-        window.OnResizeCallback += (x, y) => frameBuffer.Resize(x, y);
+        // Track the window size only when presenting to it (player). In the editor the
+        // panels own the target sizes via ResizeSceneTarget/ResizeGameTarget.
+        window.OnResizeCallback += (x, y) => {
+            if (PresentToScreen)
+                frameBuffer.Resize(x, y);
+        };
         const string stdVert = @"
 #version 330 core
 layout(location = 0) in vec3 position;

@@ -38,7 +38,12 @@ internal sealed class EditorApplication {
         bootstrap.LoadStartupScene();
         Renderer.PresentToScreen = false; // editor presents into panels, not the screen
 
-        window.OnResizeCallback += (w, h) => imgui.WindowResized(w, h);
+        window.OnResizeCallback += (w, h) => {
+            imgui.WindowResized(w, h);
+            // Force the offscreen targets to re-sync next frame (their GL textures may have
+            // been touched by the resize; the cached sizes would otherwise skip the update).
+            sceneW = sceneH = gameW = gameH = 0;
+        };
         imgui.WindowResized(window.Width, window.Height);
 
         runtime.Window.SetFrequency(0);
