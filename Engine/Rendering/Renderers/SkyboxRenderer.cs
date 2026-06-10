@@ -69,11 +69,7 @@ public class SkyboxRenderer : ISkyboxDrawable {
         renderContext = GraphicAPI.CreateRenderContext();
         renderContext.Activate();
 
-        var skyboxRef = AssetDatabase.Project?.Manifest.DefaultSkybox;
-        if (string.IsNullOrEmpty(skyboxRef))
-            Debugging.LogWarning("No defaultSkybox set in project.json; rendering without a skybox.");
-        else
-            cubemapTexture = AssetDatabase.LoadRef<Texture3D>(skyboxRef);
+        // The cubemap comes from the scene's Skybox component (set per frame by the renderer).
 
 
         cubemapVertexBuffer = GraphicAPI.CreateVertexBuffer3(renderContext);
@@ -87,38 +83,24 @@ public class SkyboxRenderer : ISkyboxDrawable {
         GL.DrawArrays(PrimitiveType.Triangles, 0, 36);
     }
 
-    float yaw = 0f; // Y ekseni, sağ-sol
-    float pitch = 0f; // X ekseni, yukarı-aşağı
-
     Matrix4 rotationMatrix = Matrix4.Identity;
-
-    public void RotUpdate() {
-        // Yatay
-        if (Input.IsKeyDown(Keys.C))
-            yaw += 0.01f;
-        if (Input.IsKeyDown(Keys.V))
-            yaw -= 0.01f;
-
-        // Dikey
-        if (Input.IsKeyDown(Keys.N))
-            pitch += 0.01f;
-        if (Input.IsKeyDown(Keys.M))
-            pitch -= 0.01f;
-
-        // Rotasyon matrisini birleştir
-        rotationMatrix = Matrix4.CreateRotationX(pitch) * Matrix4.CreateRotationY(yaw);
-
-        // Atmosfer toggle
-        if (Input.IsKeyPressed(Keys.P))
-            AtmosphereScattering = !AtmosphereScattering;
-    }
 
     public void PreRenderCallback(RendererArgs args) {
         renderContext.Activate();
         cubemapTexture.Activate();
         skyboxShader.Activate();
-        RotUpdate();
+
+        // Orientation and exposure come from the scene's Skybox component.
+        Skybox sky = Skybox.Active;
+        var exposure = sky?.Exposure ?? 1f;
+        Vector3 euler = sky?.RotationEuler ?? Vector3.Zero;
+        rotationMatrix =
+            Matrix4.CreateRotationX(MathHelper.DegreesToRadians(euler.X)) *
+            Matrix4.CreateRotationY(MathHelper.DegreesToRadians(euler.Y)) *
+            Matrix4.CreateRotationZ(MathHelper.DegreesToRadians(euler.Z));
+
         skyboxShader.SetMatrix4("rotation", ref rotationMatrix);
+        skyboxShader.SetFloat("exposure", exposure);
         var matr = new Matrix4(new Matrix3(args.viewProjectionProvider.GetViewMatrix()));
         var projection = args.viewProjectionProvider.GetProjectionMatrix();
         skyboxShader.SetMatrix4("view", ref matr);
@@ -156,10 +138,12 @@ out vec4 FragColor;
 in vec3 TexCoords;
 
 uniform samplerCube skybox;
+uniform float exposure;
 
 void main()
 {
-FragColor = texture(skybox, TexCoords);
+    vec4 sky = texture(skybox, TexCoords);
+    FragColor = vec4(sky.rgb * exposure, sky.a);
 }
 ";
 }

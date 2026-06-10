@@ -3,7 +3,7 @@ using System.Text.Json.Nodes;
 namespace BallisticEngine.AssetPipeline;
 
 public sealed class TextureImporter : IAssetImporter {
-    static readonly string[] Extensions = [".png", ".jpg", ".jpeg", ".tga", ".bmp"];
+    static readonly string[] Extensions = [".png", ".jpg", ".jpeg", ".tga", ".bmp", ".hdr", ".exr"];
 
     public string Name => "TextureImporter";
     public int Version => 1;

@@ -11,12 +11,15 @@ public class GLHDRenderer : HDRenderer {
     IWindow window;
     bool anythingDrawnThisFrame;
     SkyboxRenderer skyboxRenderer;
-    GLFrameBuffer frameBuffer;     // Scene view (editor camera) / player present target
-    GLFrameBuffer gameBuffer;      // Game view (scene camera) — editor only
+    GLFrameBuffer frameBuffer;     // Scene view (editor camera) / player present target — HDR
+    GLFrameBuffer gameBuffer;      // Game view (scene camera) — editor only, HDR
+    GLFrameBuffer sceneDisplay;    // post-processed (tonemapped) output the editor panels sample
+    GLFrameBuffer gameDisplay;
     StandardShader standardShader;
     GLShadowMap shadowMap;
 
     GLFrameBuffer CurrentTarget => ActiveTarget == RenderTarget.Game ? gameBuffer : frameBuffer;
+    GLFrameBuffer CurrentDisplay => ActiveTarget == RenderTarget.Game ? gameDisplay : sceneDisplay;
 
     public override void Initialize() {
         skyboxRenderer = new SkyboxRenderer();
@@ -24,6 +27,8 @@ public class GLHDRenderer : HDRenderer {
         window = Window.Current;
         frameBuffer = new GLFrameBuffer(window.Width, window.Height);
         gameBuffer = new GLFrameBuffer(window.Width, window.Height);
+        sceneDisplay = new GLFrameBuffer(window.Width, window.Height);
+        gameDisplay = new GLFrameBuffer(window.Width, window.Height);
         shadowMap = new GLShadowMap(window.Width, window.Height);
 
         // Track the window size only when presenting to it (player). In the editor the
@@ -114,7 +119,7 @@ void main() {
         shader.SetFloat3("LightPos", light.Direction);
         shader.SetFloat3("LightColor", light.Color);
         shader.SetFloat3("AmbientLight",
-            light.AmbientIntensity *
+            light.AmbientIntensity * (Skybox.Active?.Exposure ?? 1f) *
             (skyboxRenderer.cubemapTexture?.skyAmbient ?? Vector3.One * 0.5f));
         shader.SetFloat("MetallicMultiplier", Metallic);
         shader.SetFloat("SmoothnessMultiplier", RoughnessValue);
@@ -188,6 +193,9 @@ void main() {
     }
 
     public override RenderMetrics BeginRender(RendererArgs args) {
+        // The scene's Skybox component drives the sky (null = no sky, default ambient).
+        skyboxRenderer.cubemapTexture = Skybox.Active is { IsActive: true } sky ? sky.Cubemap : null;
+
         ClearColorBuffer();
         //  RenderOpaque(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection, args, true);
         if (RenderAsset.Current.InstancedDrawing) {
@@ -206,31 +214,38 @@ void main() {
 
         DebugCheck();
         if (skyboxRenderer.cubemapTexture is not null) {
-            skyboxRenderer.RotUpdate();
             skyboxRenderer.PreRenderCallback(args);
             skyboxRenderer.RenderSkybox();
             skyboxRenderer.PostRenderCallback(args);
         }
 
-        if (PresentToScreen)
+        if (PresentToScreen) {
             target.DrawBufferToScreen();
-        else
+        }
+        else {
+            // Tonemap/post-process into the display buffer so editor panels show the final image.
+            target.ResolveTo(CurrentDisplay);
             GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+        }
 
         return new RenderMetrics();
     }
 
-    public override int SceneColorTextureId => frameBuffer.colorBuffer;
-    public override int GameColorTextureId => gameBuffer.colorBuffer;
+    public override int SceneColorTextureId => sceneDisplay.colorBuffer;
+    public override int GameColorTextureId => gameDisplay.colorBuffer;
 
     public override void ResizeSceneTarget(int width, int height) {
-        if (width > 0 && height > 0)
-            frameBuffer.Resize(width, height);
+        if (width <= 0 || height <= 0)
+            return;
+        frameBuffer.Resize(width, height);
+        sceneDisplay.Resize(width, height);
     }
 
     public override void ResizeGameTarget(int width, int height) {
-        if (width > 0 && height > 0)
-            gameBuffer.Resize(width, height);
+        if (width <= 0 || height <= 0)
+            return;
+        gameBuffer.Resize(width, height);
+        gameDisplay.Resize(width, height);
     }
 
     void DebugCheck() {

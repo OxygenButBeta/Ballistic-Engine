@@ -44,21 +44,35 @@ public sealed class GLTexture3D : Texture3D {
 
         for (var i = 0; i < 6; i++) {
             TextureData face = faces[i];
+            var isFloat = face.Format == TextureFormat.RGBA32F;
 
-            for (var y = 0; y < face.Height; y++) {
-                for (var x = 0; x < face.Width; x++) {
-                    var index = (y * face.Width + x) * 4; // RGBA
-                    var r = face.Pixels[index + 0] / 255f;
-                    var g = face.Pixels[index + 1] / 255f;
-                    var b = face.Pixels[index + 2] / 255f;
-
-                    ambientSum += new Vector3(r, g, b);
+            if (isFloat) {
+                ReadOnlySpan<float> data = System.Runtime.InteropServices.MemoryMarshal
+                    .Cast<byte, float>(face.Pixels);
+                for (var p = 0; p < data.Length; p += 4) {
+                    ambientSum += new Vector3(data[p], data[p + 1], data[p + 2]);
                     totalPixels++;
                 }
-            }
 
-            GL.TexImage2D(CubemapFaces[i], 0, PixelInternalFormat.Srgb, face.Width, face.Height,
-                0, PixelFormat.Rgba, PixelType.UnsignedByte, face.Pixels);
+                GL.TexImage2D(CubemapFaces[i], 0, PixelInternalFormat.Rgba16f, face.Width, face.Height,
+                    0, PixelFormat.Rgba, PixelType.Float, face.Pixels);
+            }
+            else {
+                for (var y = 0; y < face.Height; y++) {
+                    for (var x = 0; x < face.Width; x++) {
+                        var index = (y * face.Width + x) * 4; // RGBA
+                        var r = face.Pixels[index + 0] / 255f;
+                        var g = face.Pixels[index + 1] / 255f;
+                        var b = face.Pixels[index + 2] / 255f;
+
+                        ambientSum += new Vector3(r, g, b);
+                        totalPixels++;
+                    }
+                }
+
+                GL.TexImage2D(CubemapFaces[i], 0, PixelInternalFormat.Srgb, face.Width, face.Height,
+                    0, PixelFormat.Rgba, PixelType.UnsignedByte, face.Pixels);
+            }
         }
 
         skyAmbient = ambientSum / totalPixels;

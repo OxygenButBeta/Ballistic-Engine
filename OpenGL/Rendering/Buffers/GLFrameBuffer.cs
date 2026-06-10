@@ -51,13 +51,32 @@ public static class GLBufferUtilities {
         GL.Disable(EnableCap.DepthTest);
         GL.Viewport(0, 0, buffer.LenX, buffer.LenY);
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
-        
+
         buffer.Unbind();
         quadShader.Activate();
         quadShader.SetInt("hdrTexture", 31);
         renderContext.Activate();
         buffer.BindTexture();
         GL.DrawArrays(PrimitiveType.Triangles, 0, 6);
+    }
+
+    // Runs the same tonemap/post-process pass, but into another framebuffer instead of the
+    // screen. The editor uses this so its viewport panels show the final graded image, not
+    // the raw linear HDR buffer (which looks dim when sampled directly).
+    public static void ResolveTo(this IFrameBuffer source, GLFrameBuffer destination) {
+        GL.Disable(EnableCap.CullFace);
+        GL.Disable(EnableCap.DepthTest);
+
+        destination.Activate();
+        GL.Viewport(0, 0, destination.LenX, destination.LenY);
+
+        quadShader.Activate();
+        quadShader.SetInt("hdrTexture", 31);
+        renderContext.Activate();
+        source.BindTexture();
+        GL.DrawArrays(PrimitiveType.Triangles, 0, 6);
+
+        destination.Unbind();
     }
 }
 

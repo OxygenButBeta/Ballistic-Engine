@@ -1,5 +1,6 @@
 using System.Reflection;
 using BallisticEngine.AssetPipeline;
+using BallisticEngine.AssetPipeline.Loaders;
 using BallisticEngine.Serialization;
 using ImGuiNET;
 using OpenTK.Mathematics;
@@ -17,9 +18,14 @@ internal sealed class InspectorPanel {
     public InspectorPanel(EditorState state) => this.state = state;
 
     public void DrawContents() {
+        if (state.HasAssetSelection) {
+            DrawAssetInspector();
+            return;
+        }
+
         Entity entity = state.Selected;
         if (entity is null) {
-            ImGui.TextDisabled("No entity selected.");
+            ImGui.TextDisabled("Nothing selected.");
             return;
         }
 
@@ -191,6 +197,142 @@ internal sealed class InspectorPanel {
         }
 
         ImGui.EndPopup();
+    }
+
+    // ---- Asset inspector -----------------------------------------------------
+
+    void DrawAssetInspector() {
+        var path = state.SelectedAssetPath;
+        Guid guid = state.SelectedAssetGuid;
+        var ext = Path.GetExtension(path).ToLowerInvariant();
+
+        ImGui.Text(Path.GetFileName(path));
+        ImGui.TextDisabled(path);
+        if (AssetDatabase.TryGetMeta(guid, out MetaFile meta))
+            ImGui.TextDisabled($"{meta.Importer}   guid:{guid:N}");
+        ImGui.Separator();
+
+        switch (ext) {
+            case ".png" or ".jpg" or ".jpeg" or ".tga" or ".bmp" or ".hdr" or ".exr":
+                DrawTextureImportSettings(path, guid, meta);
+                break;
+            case ".mat":
+                DrawMaterialEditor(path, guid);
+                break;
+            case ".scene":
+                if (ImGui.Button("Open Scene", new SysVec2(-1, 0)))
+                    OpenScene(path);
+                break;
+            default:
+                ImGui.TextDisabled("No editable settings for this asset type.");
+                break;
+        }
+    }
+
+    static void DrawTextureImportSettings(string path, Guid guid, MetaFile meta) {
+        if (meta is null) {
+            ImGui.TextDisabled("No import settings.");
+            return;
+        }
+
+        TextureType current = TextureImporter.TypeFromSettings(meta.Settings);
+        string[] names = Enum.GetNames<TextureType>();
+        int index = Array.IndexOf(names, current.ToString());
+
+        if (ImGui.Combo("Texture Type", ref index, names, names.Length)) {
+            meta.Settings["textureType"] = names[index];
+            meta.Save(MetaFile.PathFor(AssetDatabase.Project.ResolveAbsolute(path)));
+            AssetDatabase.Refresh();          // settings hash changed -> reimports
+            AssetDatabase.Invalidate(guid);   // next Load picks up the new import
+        }
+
+        ImGui.TextDisabled("Changing the type reimports the texture. Already-loaded\nmaterials keep the old instance until the scene reloads.");
+    }
+
+    // Edits the .mat definition AND the live Material instance, so changes show immediately
+    // and persist. Texture slots accept drags from the asset browser.
+    void DrawMaterialEditor(string path, Guid guid) {
+        var absolute = AssetDatabase.Project.ResolveAbsolute(path);
+        MaterialDefinition definition;
+        try {
+            definition = PipelineJson.Read<MaterialDefinition>(absolute);
+        }
+        catch (Exception exception) {
+            ImGui.TextDisabled($"Unreadable material: {exception.Message}");
+            return;
+        }
+
+        ImGui.TextDisabled($"Shader: {definition.Shader ?? "(none)"}");
+        ImGui.Separator();
+
+        var changed = false;
+        foreach (TextureType slot in new[] {
+                     TextureType.Diffuse, TextureType.Normal, TextureType.Metallic,
+                     TextureType.Roughness, TextureType.AO,
+                 }) {
+            definition.Textures.TryGetValue(slot.ToString(), out var reference);
+            var display = reference is null ? "(none)" : Path.GetFileName(ReferenceToPath(reference) ?? reference);
+
+            ImGui.Button($"{display}##slot_{slot}", new SysVec2(ImGui.GetContentRegionAvail().X * 0.62f, 0));
+            if (AcceptGuidDrop(out Guid dropped)) {
+                definition.Textures[slot.ToString()] = AssetRef.FromGuid(dropped);
+                changed = true;
+            }
+            ImGui.SameLine();
+            ImGui.AlignTextToFramePadding();
+            ImGui.Text(slot.ToString());
+        }
+
+        if (changed) {
+            PipelineJson.Write(absolute, definition);
+            ApplyLiveMaterial(guid, definition);
+        }
+
+        ImGui.Separator();
+        ImGui.TextDisabled("Drag textures from the Assets panel onto the slots.");
+    }
+
+    static string ReferenceToPath(string reference) =>
+        AssetRef.IsGuidRef(reference, out Guid g) ? AssetDatabase.GuidToAssetPath(g) : reference;
+
+    static void ApplyLiveMaterial(Guid materialGuid, MaterialDefinition definition) {
+        var material = AssetDatabase.Load<Material>(materialGuid);
+        if (material is null)
+            return;
+
+        material.Diffuse = LoadSlot(definition, TextureType.Diffuse) ?? material.Diffuse;
+        material.Normal = LoadSlot(definition, TextureType.Normal);
+        material.Specular = LoadSlot(definition, TextureType.Metallic); // legacy naming: Specular holds the metallic map
+        material.Roughness = LoadSlot(definition, TextureType.Roughness);
+        material.AO = LoadSlot(definition, TextureType.AO);
+    }
+
+    static Texture2D LoadSlot(MaterialDefinition definition, TextureType slot) =>
+        definition.Textures.TryGetValue(slot.ToString(), out var reference) && reference is not null
+            ? AssetDatabase.LoadRef<Texture2D>(reference)
+            : null;
+
+    static unsafe bool AcceptGuidDrop(out Guid guid) {
+        guid = Guid.Empty;
+        if (!ImGui.BeginDragDropTarget())
+            return false;
+
+        ImGuiPayloadPtr payload = ImGui.AcceptDragDropPayload(AssetBrowserPanel.DragType);
+        var accepted = false;
+        if (payload.NativePtr != null && payload.Data != IntPtr.Zero) {
+            var text = System.Runtime.InteropServices.Marshal.PtrToStringAnsi(payload.Data, payload.DataSize);
+            accepted = Guid.TryParse(text, out guid);
+        }
+
+        ImGui.EndDragDropTarget();
+        return accepted;
+    }
+
+    static void OpenScene(string assetPath) {
+        if (SceneManager.IsPlaying)
+            SceneManager.StopPlay();
+        SceneManager.GetCurrentScene().Clear();
+        BallisticEngine.Serialization.SceneSerializer.Load(AssetDatabase.Project.ResolveAbsolute(assetPath));
     }
 
     static SysVec3 ToSys(Vector3 v) => new(v.X, v.Y, v.Z);

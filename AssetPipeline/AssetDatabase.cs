@@ -44,6 +44,16 @@ public static class AssetDatabase {
     // All asset (path, guid) pairs known to the project — for the asset browser.
     public static IEnumerable<KeyValuePair<string, Guid>> EnumerateAssets() => pipeline.PathToGuid;
 
+    // The asset's .meta (importer + settings) — for the editor's asset inspector.
+    public static bool TryGetMeta(Guid guid, out MetaFile meta) => pipeline.TryGetMeta(guid, out meta);
+
+    // Drops a loaded asset from the cache so the next Load re-reads it (e.g. after a reimport).
+    // Objects already holding the old instance keep it.
+    public static void Invalidate(Guid guid) {
+        if (loadedAssets.Remove(guid, out BObject asset))
+            assetToGuid.Remove(asset);
+    }
+
     public static T Load<T>(string assetPath) where T : BObject {
         if (TryGetGuid(assetPath, out Guid guid))
             return Load<T>(guid);
@@ -74,7 +84,7 @@ public static class AssetDatabase {
 
         BObject asset;
         try {
-            asset = LoadByExtension(guid, assetPath);
+            asset = LoadByExtension(guid, assetPath, typeof(T));
         }
         catch (Exception exception) {
             Debugging.LogError($"Failed to load '{assetPath}': {exception.Message}");
@@ -98,11 +108,18 @@ public static class AssetDatabase {
         return null;
     }
 
-    static BObject LoadByExtension(Guid guid, string assetPath) {
+    static BObject LoadByExtension(Guid guid, string assetPath, Type requestedType) {
         var extension = Path.GetExtension(assetPath).ToLowerInvariant();
+
+        // An image asset requested as a cubemap (Texture3D) is treated as an equirect
+        // panorama — lets a .hdr/.exr drop straight into a Skybox slot.
+        var isImage = extension is ".png" or ".jpg" or ".jpeg" or ".tga" or ".bmp" or ".hdr" or ".exr";
+        if (isImage && typeof(Texture3D).IsAssignableFrom(requestedType))
+            return EquirectCubemapLoader.Load(pipeline, guid, assetPath);
+
         return extension switch {
             ".fbx" or ".obj" => MeshLoader.Load(pipeline, guid, assetPath),
-            ".png" or ".jpg" or ".jpeg" or ".tga" or ".bmp" => TextureLoader.Load(pipeline, guid, assetPath),
+            _ when isImage => TextureLoader.Load(pipeline, guid, assetPath),
             ".shader" => ShaderProgramLoader.Load(Project, assetPath),
             ".mat" => MaterialLoader.Load(Project, assetPath),
             ".cubemap" => CubemapLoader.Load(Project, pipeline, assetPath),

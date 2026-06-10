@@ -49,3 +49,16 @@ entities:
     members:
       ambientIntensity: 0.3
       lightIntensity: 5
+- id: 5a1b2c3d4e5f60718293a4b5c6d7e8f9
+  name: Skybox
+  isActive: true
+  transform:
+    position: {x: 0, y: 0, z: 0}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 1, y: 1, z: 1}
+    parent: 
+  components:
+  - type: Skybox
+    enabled: true
+    members:
+      cubemap: Assets/Default/Sky/Default.exr

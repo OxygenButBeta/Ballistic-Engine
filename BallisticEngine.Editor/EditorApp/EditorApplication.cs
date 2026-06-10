@@ -25,7 +25,8 @@ internal sealed class EditorApplication {
 
     readonly HierarchyPanel hierarchy;
     readonly InspectorPanel inspector;
-    readonly AssetBrowserPanel assets = new();
+    readonly AssetBrowserPanel assets;
+    readonly TransformGizmo gizmo = new();
 
     HDRenderer Renderer => RenderAsset.Current.Renderer;
     float S => imgui.Scale;
@@ -46,9 +47,13 @@ internal sealed class EditorApplication {
         editorInput = new EditorInput(window);
         hierarchy = new HierarchyPanel(editorState);
         inspector = new InspectorPanel(editorState);
+        assets = new AssetBrowserPanel(editorState, () => imgui.Scale);
 
         bootstrap.LoadStartupScene();
         Renderer.PresentToScreen = false;
+
+        // Files dragged from the OS onto the editor window import into the browser's folder.
+        window.FileDrop += e => ImportDroppedFiles(e.FileNames);
 
         window.WindowState = WindowState.Maximized;
         window.OnResizeCallback += (w, h) => {
@@ -100,16 +105,37 @@ internal sealed class EditorApplication {
         Renderer.PostRenderCleanUp();
     }
 
+    // The Game view works in edit mode too: it renders from the first active HDCamera in the
+    // hierarchy (or the play-mode RenderCamera when playing).
+    HDCamera FindSceneCamera() {
+        if (SceneManager.RenderCamera is not null)
+            return SceneManager.RenderCamera;
+
+        foreach (Entity entity in SceneManager.GetCurrentScene().Entities) {
+            if (!entity.IsActive)
+                continue;
+            HDCamera cam = entity.GetComponent<HDCamera>();
+            if (cam is not null && cam.IsEnabled)
+                return cam;
+        }
+
+        return null;
+    }
+
+    readonly SceneCameraView gameCameraView = new();
+
     void RenderGameView() {
-        if (SceneManager.RenderCamera is null)
+        HDCamera camera = FindSceneCamera();
+        if (camera is null)
             return;
 
         var w = Math.Max(1, (int)gameViewSize.X);
         var h = Math.Max(1, (int)gameViewSize.Y);
         if (w != gameW || h != gameH) { Renderer.ResizeGameTarget(w, h); gameW = w; gameH = h; }
 
+        gameCameraView.Bind(camera, (float)w / h);
         Renderer.ActiveTarget = HDRenderer.RenderTarget.Game;
-        Renderer.BeginRender(new RendererArgs(SceneManager.RenderCamera));
+        Renderer.BeginRender(new RendererArgs(gameCameraView));
         Renderer.PostRenderCleanUp();
     }
 
@@ -158,6 +184,13 @@ internal sealed class EditorApplication {
         ImGui.TextDisabled("|");
         ImGui.SameLine();
         ImGui.Text(scene.Name);
+
+        ImGui.SameLine(0, 24 * S);
+        GizmoModeButton("Move", GizmoMode.Translate);
+        ImGui.SameLine();
+        GizmoModeButton("Rotate", GizmoMode.Rotate);
+        ImGui.SameLine();
+        GizmoModeButton("Scale", GizmoMode.Scale);
 
         // Center the Play/Stop control.
         float buttonW = 84 * S;
@@ -225,8 +258,19 @@ internal sealed class EditorApplication {
         if (avail.X > 0 && avail.Y > 0) sceneViewSize = avail;
 
         ImGui.Image(Renderer.SceneColorTextureId, sceneViewSize, new SysVec2(0, 1), new SysVec2(1, 0));
+        SysVec2 imageMin = ImGui.GetItemRectMin();
         sceneViewHovered = ImGui.IsItemHovered();
         gameViewFocused = false;
+
+        // W/E/R switch gizmo mode (only when not flying the camera, which also uses WASD).
+        if (sceneViewHovered && !editorInput.RightMouseDown) {
+            if (ImGui.IsKeyPressed(ImGuiKey.W)) gizmo.Mode = GizmoMode.Translate;
+            if (ImGui.IsKeyPressed(ImGuiKey.E)) gizmo.Mode = GizmoMode.Rotate;
+            if (ImGui.IsKeyPressed(ImGuiKey.R)) gizmo.Mode = GizmoMode.Scale;
+        }
+
+        if (editorState.Selected is not null)
+            gizmo.Draw(editorCamera, editorState.Selected, imageMin, sceneViewSize, sceneViewHovered);
     }
 
     void GameTabContents() {
@@ -235,15 +279,13 @@ internal sealed class EditorApplication {
 
         sceneViewHovered = false;
 
-        if (SceneManager.RenderCamera is not null) {
+        if (FindSceneCamera() is not null) {
             ImGui.Image(Renderer.GameColorTextureId, gameViewSize, new SysVec2(0, 1), new SysVec2(1, 0));
             gameViewFocused = ImGui.IsWindowFocused();
         }
         else {
             ImGui.Dummy(new SysVec2(0, avail.Y * 0.45f));
-            CenteredText(SceneManager.IsPlaying
-                ? "No camera in the scene."
-                : "Press Play to run the scene, or add an HDCamera.");
+            CenteredText("No camera in the scene. Add an HDCamera component.");
             gameViewFocused = false;
         }
     }
@@ -252,6 +294,34 @@ internal sealed class EditorApplication {
         float w = ImGui.CalcTextSize(text).X;
         ImGui.SetCursorPosX((ImGui.GetWindowWidth() - w) * 0.5f);
         ImGui.TextDisabled(text);
+    }
+
+    // Copies OS-dropped files into the browser's current folder and runs the import pipeline —
+    // each file's dedicated importer (model/texture/Falcor/...) picks it up in the refresh.
+    void ImportDroppedFiles(IReadOnlyList<string> files) {
+        var destFolder = Path.Combine(bootstrap.Project.RootPath,
+            assets.CurrentFolder.Replace('/', Path.DirectorySeparatorChar));
+        Directory.CreateDirectory(destFolder);
+
+        var copied = 0;
+        foreach (var source in files) {
+            if (!File.Exists(source)) {
+                Debugging.LogWarning($"Drop import: '{source}' is not a file (folders not supported yet).");
+                continue;
+            }
+
+            var destination = Path.Combine(destFolder, Path.GetFileName(source));
+            if (File.Exists(destination)) {
+                Debugging.LogWarning($"Drop import: '{Path.GetFileName(source)}' already exists in {assets.CurrentFolder}; skipped.");
+                continue;
+            }
+
+            File.Copy(source, destination);
+            copied++;
+        }
+
+        if (copied > 0)
+            AssetDatabase.Refresh();
     }
 
     // ImGui.NET only exposes tab-item flags on the closable overload; pass a pinned `true` and
@@ -264,6 +334,16 @@ internal sealed class EditorApplication {
 
         pinnedOpen = true;
         return ImGui.BeginTabItem(label, ref pinnedOpen, ImGuiTabItemFlags.SetSelected);
+    }
+
+    void GizmoModeButton(string label, GizmoMode mode) {
+        var active = gizmo.Mode == mode;
+        if (active)
+            ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(0.17f, 0.36f, 0.53f, 1f));
+        if (ImGui.Button(label, new SysVec2(64 * S, 0)))
+            gizmo.Mode = mode;
+        if (active)
+            ImGui.PopStyleColor();
     }
 
     void SaveScene() {
