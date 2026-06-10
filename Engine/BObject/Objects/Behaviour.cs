@@ -26,6 +26,15 @@ public class Behaviour : Component {
     protected virtual void OnEnd() {
     }
 
+    // Fires when the component is attached to an entity, in BOTH edit and play mode. Use this for
+    // editor-visible registration (e.g. adding a renderer to a draw set) — distinct from OnEnabled,
+    // which is play-mode game logic. OnDetach fires when the component/entity is torn down.
+    protected internal virtual void OnAttach() {
+    }
+
+    protected internal virtual void OnDetach() {
+    }
+
     protected internal virtual void OnEnabled() {
     }
 

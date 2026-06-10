@@ -8,11 +8,18 @@ public abstract class HDRenderer {
     // the scene stays in the offscreen color texture so a host can sample it (e.g. ImGui::Image).
     public bool PresentToScreen { get; set; } = true;
 
-    // GL id of the offscreen color texture the scene renders into (for the editor viewport).
-    public abstract int SceneColorTextureId { get; }
+    // The editor renders the scene twice per frame into two offscreen targets: the Scene view
+    // (editor camera) and the Game view (scene camera). Select which one BeginRender writes to.
+    public enum RenderTarget { Scene, Game }
+    public RenderTarget ActiveTarget { get; set; } = RenderTarget.Scene;
 
-    // Resize the offscreen render target to match the editor viewport panel.
+    // GL ids of the two offscreen color textures (for ImGui::Image in the Scene/Game panels).
+    public abstract int SceneColorTextureId { get; }
+    public abstract int GameColorTextureId { get; }
+
+    // Resize each offscreen target to match its editor panel.
     public abstract void ResizeSceneTarget(int width, int height);
+    public abstract void ResizeGameTarget(int width, int height);
 
     public abstract void Initialize();
     public abstract void RenderOpaque(IReadOnlyCollection<IStaticMeshRenderer> renderTargets, RendererArgs args,bool isShadowPass);

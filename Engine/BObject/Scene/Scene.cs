@@ -30,7 +30,7 @@ public class Scene : BObject
         return entity;
     }
 
-    // Remove an entity. In play mode also tear down its components so it leaves any RuntimeSets.
+    // Remove an entity and detach its components (so renderers leave their draw sets).
     public void DestroyEntity(Entity entity)
     {
         if (entity is null)
@@ -38,13 +38,16 @@ public class Scene : BObject
 
         if (SceneManager.IsPlaying)
             entity.FireEnd();
+        entity.DetachAll();
         entities.Remove(entity);
     }
 
-    // Empty the scene without firing lifecycle (used for edit-mode scene swaps).
-    // Play-mode teardown happens in SceneManager.StopPlay before this is called.
+    // Empty the scene, detaching every component (edit-mode scene swaps). Play-mode lifecycle
+    // teardown (FireEnd) happens in SceneManager.StopPlay before this is called.
     public void Clear()
     {
+        foreach (Entity entity in entities)
+            entity.DetachAll();
         entities.Clear();
     }
 

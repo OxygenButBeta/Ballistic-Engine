@@ -11,15 +11,19 @@ public class GLHDRenderer : HDRenderer {
     IWindow window;
     bool anythingDrawnThisFrame;
     SkyboxRenderer skyboxRenderer;
-    GLFrameBuffer frameBuffer;
+    GLFrameBuffer frameBuffer;     // Scene view (editor camera) / player present target
+    GLFrameBuffer gameBuffer;      // Game view (scene camera) — editor only
     StandardShader standardShader;
     GLShadowMap shadowMap;
+
+    GLFrameBuffer CurrentTarget => ActiveTarget == RenderTarget.Game ? gameBuffer : frameBuffer;
 
     public override void Initialize() {
         skyboxRenderer = new SkyboxRenderer();
         skyboxRenderer.init();
         window = Window.Current;
         frameBuffer = new GLFrameBuffer(window.Width, window.Height);
+        gameBuffer = new GLFrameBuffer(window.Width, window.Height);
         shadowMap = new GLShadowMap(window.Width, window.Height);
 
         window.OnResizeCallback += (x, y) => frameBuffer.Resize(x, y);
@@ -188,9 +192,10 @@ void main() {
                 RenderInstancing(batchGroup, args);
         }
 
-        frameBuffer.Activate();
+        GLFrameBuffer target = CurrentTarget;
+        target.Activate();
         ClearColorBuffer();
-        GL.Viewport(0, 0, frameBuffer.LenX, frameBuffer.LenY);
+        GL.Viewport(0, 0, target.LenX, target.LenY);
 
         RenderOpaque(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection, args, false);
 
@@ -203,7 +208,7 @@ void main() {
         }
 
         if (PresentToScreen)
-            frameBuffer.DrawBufferToScreen();
+            target.DrawBufferToScreen();
         else
             GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
 
@@ -211,10 +216,16 @@ void main() {
     }
 
     public override int SceneColorTextureId => frameBuffer.colorBuffer;
+    public override int GameColorTextureId => gameBuffer.colorBuffer;
 
     public override void ResizeSceneTarget(int width, int height) {
         if (width > 0 && height > 0)
             frameBuffer.Resize(width, height);
+    }
+
+    public override void ResizeGameTarget(int width, int height) {
+        if (width > 0 && height > 0)
+            gameBuffer.Resize(width, height);
     }
 
     void DebugCheck() {

@@ -41,6 +41,8 @@ public class Entity : BObject {
         component.AttachToEntity(this);
         Behaviours.Add(component);
 
+        component.OnAttach(); // edit + play: registration/visibility
+
         if (SceneManager.IsPlaying) {
             component.OnBegin();
             if (component.IsActive)
@@ -81,6 +83,12 @@ public class Entity : BObject {
         foreach (Behaviour behaviour in Behaviours)
             if (behaviour.IsActive)
                 behaviour.OnDisabled();
+    }
+
+    // Runs OnDetach for every component (entity removed / scene cleared, edit or play).
+    internal void DetachAll() {
+        foreach (Behaviour behaviour in Behaviours)
+            behaviour.OnDetach();
     }
 
     internal void Update(in float deltaTime) {

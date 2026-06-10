@@ -8,11 +8,14 @@ public class StaticMeshRenderer : Renderer {
     public override Mesh SharedMesh { get; set; }
     public override Material SharedMaterial { get; set; }
 
-    protected internal override void OnEnabled() {
-        RuntimeSet<IStaticMeshRenderer>.Add(this);
+    // Register for drawing as soon as we're attached (edit mode too), so the editor viewport
+    // shows the mesh without entering play.
+    protected internal override void OnAttach() {
+        if (!RuntimeSet<IStaticMeshRenderer>.Contains(this))
+            RuntimeSet<IStaticMeshRenderer>.Add(this);
     }
 
-    protected internal override void OnDisabled() {
+    protected internal override void OnDetach() {
         RuntimeSet<IStaticMeshRenderer>.Remove(this);
     }
 }

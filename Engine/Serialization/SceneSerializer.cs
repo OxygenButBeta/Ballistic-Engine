@@ -12,7 +12,6 @@ namespace BallisticEngine.Serialization;
 // via AssetDatabase.TryGetAssetGuid and load back via AssetDatabase.LoadRef. OpenTK math types
 // round-trip through the SceneYaml converters. Transform parents are wired by file-local id.
 public static class SceneSerializer {
-    const BindingFlags MemberFlags = BindingFlags.Public | BindingFlags.Instance;
 
     // ---- Serialize ---------------------------------------------------------
 
@@ -185,40 +184,18 @@ public static class SceneSerializer {
         }
     }
 
-    // ---- Member reflection -------------------------------------------------
+    // ---- Member reflection (shared with the editor inspector) --------------
 
-    // Members declared on these bases are framework plumbing (IsEnabled is already captured as
-    // the component's `enabled`; Name/transform/RenderedThisFrame are not component state).
-    static bool IsFrameworkType(Type declaringType) =>
-        declaringType == typeof(BObject) ||
-        declaringType == typeof(Component) ||
-        declaringType == typeof(Behaviour) ||
-        declaringType == typeof(Renderer);
+    static IEnumerable<MemberInfo> SerializableMembers(Type type) =>
+        ComponentReflection.SerializableMembers(type);
 
-    static IEnumerable<MemberInfo> SerializableMembers(Type type) {
-        foreach (PropertyInfo prop in type.GetProperties(MemberFlags)) {
-            if (prop.CanRead && prop.CanWrite && prop.GetIndexParameters().Length == 0 &&
-                !IsFrameworkType(prop.DeclaringType))
-                yield return prop;
-        }
-        foreach (FieldInfo field in type.GetFields(MemberFlags)) {
-            if (!field.IsInitOnly && !field.IsLiteral && !IsFrameworkType(field.DeclaringType))
-                yield return field;
-        }
-    }
-
-    static Type MemberType(MemberInfo member) =>
-        member is PropertyInfo p ? p.PropertyType : ((FieldInfo)member).FieldType;
+    static Type MemberType(MemberInfo member) => ComponentReflection.MemberType(member);
 
     static object GetMemberValue(MemberInfo member, object target) =>
-        member is PropertyInfo p ? p.GetValue(target) : ((FieldInfo)member).GetValue(target);
+        ComponentReflection.GetValue(member, target);
 
-    static void SetMemberValue(MemberInfo member, object target, object value) {
-        if (member is PropertyInfo p)
-            p.SetValue(target, value);
-        else
-            ((FieldInfo)member).SetValue(target, value);
-    }
+    static void SetMemberValue(MemberInfo member, object target, object value) =>
+        ComponentReflection.SetValue(member, target, value);
 
     static string CamelCase(string name) =>
         string.IsNullOrEmpty(name) || char.IsLower(name[0])
