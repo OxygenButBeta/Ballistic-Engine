@@ -202,8 +202,19 @@ void main() {
             skyboxRenderer.PostRenderCallback(args);
         }
 
-        frameBuffer.DrawBufferToScreen();
+        if (PresentToScreen)
+            frameBuffer.DrawBufferToScreen();
+        else
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+
         return new RenderMetrics();
+    }
+
+    public override int SceneColorTextureId => frameBuffer.colorBuffer;
+
+    public override void ResizeSceneTarget(int width, int height) {
+        if (width > 0 && height > 0)
+            frameBuffer.Resize(width, height);
     }
 
     void DebugCheck() {
