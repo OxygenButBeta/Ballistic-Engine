@@ -13,12 +13,17 @@ public static class AssetDatabase {
     static AssetImportPipeline pipeline;
     static readonly Dictionary<Guid, BObject> loadedAssets = new();
 
+    // Reverse of loadedAssets: lets scene serialization recover an asset's GUID from a loaded
+    // Mesh/Material instance. Reference identity (two distinct assets never compare equal by value).
+    static readonly Dictionary<BObject, Guid> assetToGuid = new(ReferenceEqualityComparer.Instance);
+
     public static BallisticProject Project { get; private set; }
 
     public static void Initialize(BallisticProject project) {
         Project = project;
         pipeline = new AssetImportPipeline(project);
         loadedAssets.Clear();
+        assetToGuid.Clear();
     }
 
     public static RefreshResult Refresh() => pipeline.Refresh();
@@ -27,6 +32,17 @@ public static class AssetDatabase {
         pipeline.PathToGuid.TryGetValue(Normalize(assetPath), out guid);
 
     public static string GuidToAssetPath(Guid guid) => pipeline.GuidToPath.GetValueOrDefault(guid);
+
+    // The GUID a loaded asset came from (for serializing component asset references).
+    public static bool TryGetAssetGuid(BObject asset, out Guid guid) {
+        if (asset is not null)
+            return assetToGuid.TryGetValue(asset, out guid);
+        guid = Guid.Empty;
+        return false;
+    }
+
+    // All asset (path, guid) pairs known to the project — for the asset browser.
+    public static IEnumerable<KeyValuePair<string, Guid>> EnumerateAssets() => pipeline.PathToGuid;
 
     public static T Load<T>(string assetPath) where T : BObject {
         if (TryGetGuid(assetPath, out Guid guid))
@@ -69,6 +85,7 @@ public static class AssetDatabase {
             return null;
 
         loadedAssets[guid] = asset;
+        assetToGuid[asset] = guid;
         return Typed<T>(asset, assetPath);
     }
 

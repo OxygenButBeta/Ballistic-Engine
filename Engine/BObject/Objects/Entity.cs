@@ -1,4 +1,4 @@
-﻿namespace BallisticEngine;
+namespace BallisticEngine;
 
 public class Entity : BObject {
     public Transform transform { get; internal set; }
@@ -21,11 +21,31 @@ public class Entity : BObject {
 
     public T AddComponent<T>() where T : Behaviour, new() {
         T component = new();
-        component.AttachToEntity(this);
-        component.OnBegin();
-        component.OnEnabled();
-        Behaviours.Add(component);
+        Attach(component);
         return component;
+    }
+
+    // Used by deserialization / the editor's Add Component menu (type known only at runtime).
+    public Behaviour AddComponent(Type componentType) {
+        if (!typeof(Behaviour).IsAssignableFrom(componentType))
+            throw new ArgumentException($"{componentType.Name} is not a Behaviour.", nameof(componentType));
+
+        var component = (Behaviour)Activator.CreateInstance(componentType);
+        Attach(component);
+        return component;
+    }
+
+    // In edit mode, components are attached and configured but their lifecycle does NOT run;
+    // Scene.FireBegin() runs OnBegin/OnEnabled when play starts. In play mode, fire immediately.
+    void Attach(Behaviour component) {
+        component.AttachToEntity(this);
+        Behaviours.Add(component);
+
+        if (SceneManager.IsPlaying) {
+            component.OnBegin();
+            if (component.IsActive)
+                component.OnEnabled();
+        }
     }
 
     public T GetComponent<T>() where T : Behaviour {
@@ -45,6 +65,22 @@ public class Entity : BObject {
             foreach (Behaviour behaviour in Behaviours)
                 behaviour.OnDisabled();
         }
+    }
+
+    // Runs OnBegin then OnEnabled for every component (entering play mode).
+    internal void FireBegin() {
+        foreach (Behaviour behaviour in Behaviours) {
+            behaviour.OnBegin();
+            if (behaviour.IsActive)
+                behaviour.OnEnabled();
+        }
+    }
+
+    // Runs OnDisabled for every active component (leaving play mode).
+    internal void FireEnd() {
+        foreach (Behaviour behaviour in Behaviours)
+            if (behaviour.IsActive)
+                behaviour.OnDisabled();
     }
 
     internal void Update(in float deltaTime) {
