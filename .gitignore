@@ -7,3 +7,6 @@ SampleProject/Library/
 
 # Local Claude Code session settings
 .claude/
+
+# ImGui editor layout persistence (per-machine)
+imgui.ini

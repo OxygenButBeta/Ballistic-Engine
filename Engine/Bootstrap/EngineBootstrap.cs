@@ -35,6 +35,13 @@ public sealed class EngineBootstrap {
         runtime.RenderAsset.Initialize();
     }
 
+    // Advances the engine one frame: ticks the clock and updates the scene (scene Update is a
+    // no-op unless playing). Hosts that drive their own loop (the editor) call this.
+    public void UpdateFrame(double delta) {
+        Runtime.EngineTimer.Update(delta);
+        SceneManager.Update((float)delta);
+    }
+
     // Loads the project's StartupScene (if set) into the current scene, in edit mode.
     public void LoadStartupScene() {
         var startup = Project.Manifest.StartupScene;
