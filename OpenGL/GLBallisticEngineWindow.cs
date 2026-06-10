@@ -7,7 +7,7 @@ using OpenTK.Windowing.Desktop;
 
 namespace BallisticEngine;
 
-class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWindow {
+public class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWindow {
     public event Action<double> WindowUpdateCallback;
     public event Action<double> WindowRenderCallback;
 

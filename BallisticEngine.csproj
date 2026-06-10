@@ -1,11 +1,17 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
-        <OutputType>Exe</OutputType>
+        <OutputType>Library</OutputType>
         <TargetFramework>net9.0</TargetFramework>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>disable</Nullable>
     </PropertyGroup>
+
+    <!-- The library globs **/*.cs from the repo root; keep the host exe projects out. -->
+    <ItemGroup>
+      <Compile Remove="BallisticEngine.Runtime\**\*.cs" />
+      <Compile Remove="BallisticEngine.Editor\**\*.cs" />
+    </ItemGroup>
 
     <ItemGroup>
       <PackageReference Include="AssimpNet" Version="4.1.0" />

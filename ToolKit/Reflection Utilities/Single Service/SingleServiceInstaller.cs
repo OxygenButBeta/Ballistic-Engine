@@ -1,12 +1,17 @@
 ﻿using System.Reflection;
 
 public static class SingleServiceInstaller {
+    public static void InstallAllInAssemblies(params Assembly[] assemblies) {
+        foreach (Assembly asm in assemblies)
+            InstallAllInAssembly(asm);
+    }
+
     public static void InstallAllInAssembly(Assembly asm) {
         foreach (Type type in
                  asm.GetTypes()
                      .Where(x => x.GetCustomAttribute<EngineServiceAttribute>()! != null)
                      .OrderBy(type => type.GetCustomAttribute<EngineServiceAttribute>()!.Priority)) {
-            
+
             if (type.GetConstructor(Type.EmptyTypes) == null)
                 throw new InvalidOperationException($"{type.FullName} must have a parameterless constructor.");
 

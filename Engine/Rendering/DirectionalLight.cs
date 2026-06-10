@@ -3,6 +3,34 @@ using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine;
 
+// CPU-side lighting values the renderer pushes as uniforms. Built from the active
+// DirectionalLight, or from sensible defaults when a scene has no light (edit mode / empty scene).
+public readonly struct LightUniforms {
+    public readonly Vector3 Direction;   // toward the light (-forward)
+    public readonly Vector3 Color;       // intensity * color
+    public readonly float AmbientIntensity;
+    public readonly Matrix4 LightSpaceMatrix;
+
+    public LightUniforms(Vector3 direction, Vector3 color, float ambientIntensity, Matrix4 lightSpaceMatrix) {
+        Direction = direction;
+        Color = color;
+        AmbientIntensity = ambientIntensity;
+        LightSpaceMatrix = lightSpaceMatrix;
+    }
+
+    public static LightUniforms Resolve() {
+        DirectionalLight light = DirectionalLight.Instance;
+        if (light is null)
+            return new LightUniforms(Vector3.UnitY, new Vector3(1f, 0.95f, 0.85f) * 3f, 0.3f, Matrix4.Identity);
+
+        return new LightUniforms(
+            -light.transform.Forward,
+            light.LightIntensity * light.LightColor,
+            light.ambientIntensity,
+            light.GetLightSpaceMatrix());
+    }
+}
+
 public class DirectionalLight : Behaviour
 {
     public static DirectionalLight Instance;

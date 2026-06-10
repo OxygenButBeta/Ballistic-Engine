@@ -65,7 +65,7 @@ void main() {
 
         Matrix4 view = args.viewProjectionProvider.GetViewMatrix();
         Matrix4 projection = args.viewProjectionProvider.GetProjectionMatrix();
-        Matrix4 lightSpaceMatrix = DirectionalLight.Instance.GetLightSpaceMatrix();
+        Matrix4 lightSpaceMatrix = LightUniforms.Resolve().LightSpaceMatrix;
         if (isShadowPass) {
             shadowMap.Bind();
             standardShader.Activate();
@@ -101,18 +101,18 @@ void main() {
 
     void SetUniformsForLitRender(RendererArgs args, Shader shader, Matrix4 view, Matrix4 WorldMatrix,
         ref Matrix4 projection) {
-        shader.SetFloat3("LightPos", -DirectionalLight.Instance.transform.Forward);
-        shader.SetFloat3("LightColor",
-            DirectionalLight.Instance.LightIntensity * DirectionalLight.Instance.LightColor);
+        LightUniforms light = LightUniforms.Resolve();
+        shader.SetFloat3("LightPos", light.Direction);
+        shader.SetFloat3("LightColor", light.Color);
         shader.SetFloat3("AmbientLight",
-            DirectionalLight.Instance.ambientIntensity *
+            light.AmbientIntensity *
             (skyboxRenderer.cubemapTexture?.skyAmbient ?? Vector3.One * 0.5f));
         shader.SetFloat("MetallicMultiplier", Metallic);
         shader.SetFloat("SmoothnessMultiplier", RoughnessValue);
         shader.SetFloat("rimPower", RimPower);
         shader.SetBool("NormalFlipY",true);
 
-        Matrix4 lightSpaceMatrix = DirectionalLight.Instance.GetLightSpaceMatrix();
+        Matrix4 lightSpaceMatrix = light.LightSpaceMatrix;
         shader.SetMatrix4("lightSpaceMatrix", ref lightSpaceMatrix);
         GL.ActiveTexture(TextureUnit.Texture10);
         GL.BindTexture(TextureTarget.Texture2D, shadowMap.DepthTextureId);

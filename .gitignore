@@ -1,5 +1,6 @@
-/bin/
-/obj/
+# Build output (any project, any depth)
+[Bb]in/
+[Oo]bj/
 
 # Regenerable asset import cache
 SampleProject/Library/

@@ -1,7 +1,6 @@
 using BallisticEngine;
 
 internal class Program {
-    // Entry point of ballistic engine
     public static void Main(string[] args) {
         var projectPath = args.Length > 0
             ? Path.GetFullPath(args[0])
@@ -12,7 +11,7 @@ internal class Program {
         engineEntry.Run();
     }
 
-    // bin\Debug\net9.0 -> repo root -> SampleProject
+    // BallisticEngine.Runtime\bin\Debug\net9.0 -> repo root -> SampleProject
     static string DefaultProjectPath() =>
-        Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "SampleProject"));
+        Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "SampleProject"));
 }

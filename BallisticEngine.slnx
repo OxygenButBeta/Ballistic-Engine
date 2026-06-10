@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="BallisticEngine.csproj" />
+  <Project Path="BallisticEngine.Runtime/BallisticEngine.Runtime.csproj" />
+</Solution>

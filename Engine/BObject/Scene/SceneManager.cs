@@ -3,6 +3,12 @@
 [EngineService]
 public class SceneManager {
     public static HDCamera RenderCamera { get; set; }
+
+    // When false (edit mode), the scene renders but components do not tick.
+    // Phase 2 builds StartPlay/StopPlay (snapshot + restore) on top of this.
+    public static bool IsPlaying { get; private set; }
+    public static void SetPlaying(bool playing) => IsPlaying = playing;
+
     readonly HashSet<Scene> activeScenes = new(capacity: 5);
     static SceneManager instance;
 
@@ -31,6 +37,9 @@ public class SceneManager {
     }
 
     public static void Update(float delta) {
+        if (!IsPlaying)
+            return;
+
         foreach (Scene scene in instance.activeScenes)
             scene.Update(in delta);
     }
