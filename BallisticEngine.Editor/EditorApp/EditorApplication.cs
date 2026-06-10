@@ -1,14 +1,21 @@
 using BallisticEngine.Serialization;
 using ImGuiNET;
 using OpenTK.Graphics.OpenGL4;
+using OpenTK.Windowing.Common;
 using SysVec2 = System.Numerics.Vector2;
+using SysVec4 = System.Numerics.Vector4;
 
 namespace BallisticEngine.Editor;
 
-// Drives the editor: brings the engine up, renders the scene twice per frame (Scene view via the
-// editor camera, Game view via the scene camera) into offscreen targets, and presents them in
-// ImGui panels alongside the Hierarchy, Inspector and Asset Browser.
+// Drives the editor: a fixed, DPI-scaled tiled layout (toolbar, Hierarchy, Scene/Game tabs,
+// Inspector, Assets) over the engine. The scene renders offscreen for whichever view tab is
+// active. Engine input (component Tick + renderer debug keys) only flows while playing AND the
+// Game view is focused, so editor panels never leak input into the game.
 internal sealed class EditorApplication {
+    const ImGuiWindowFlags PanelFlags =
+        ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoCollapse |
+        ImGuiWindowFlags.NoBringToFrontOnFocus | ImGuiWindowFlags.NoSavedSettings;
+
     readonly IBallisticEngineRuntime runtime;
     readonly EngineBootstrap bootstrap;
     readonly ImGuiController imgui;
@@ -21,11 +28,16 @@ internal sealed class EditorApplication {
     readonly AssetBrowserPanel assets = new();
 
     HDRenderer Renderer => RenderAsset.Current.Renderer;
+    float S => imgui.Scale;
 
     SysVec2 sceneViewSize = new(1280, 720);
     SysVec2 gameViewSize = new(1280, 720);
     int sceneW, sceneH, gameW, gameH;
     bool sceneViewHovered;
+    bool gameViewFocused;
+    bool sceneTabActive = true;
+    bool selectGameTab;
+    bool selectSceneTab = true; // explicitly select Scene on the first frame
 
     public EditorApplication(GLBallisticEngineWindow window, string projectPath) {
         runtime = window;
@@ -36,13 +48,12 @@ internal sealed class EditorApplication {
         inspector = new InspectorPanel(editorState);
 
         bootstrap.LoadStartupScene();
-        Renderer.PresentToScreen = false; // editor presents into panels, not the screen
+        Renderer.PresentToScreen = false;
 
+        window.WindowState = WindowState.Maximized;
         window.OnResizeCallback += (w, h) => {
             imgui.WindowResized(w, h);
-            // Force the offscreen targets to re-sync next frame (their GL textures may have
-            // been touched by the resize; the cached sizes would otherwise skip the update).
-            sceneW = sceneH = gameW = gameH = 0;
+            sceneW = sceneH = gameW = gameH = 0; // re-sync offscreen targets next frame
         };
         imgui.WindowResized(window.Width, window.Height);
 
@@ -53,17 +64,24 @@ internal sealed class EditorApplication {
 
     void OnUpdate(double delta) {
         editorState.ClearIfDestroyed(SceneManager.GetCurrentScene());
+
+        // Game/engine input flows only while playing with the Game view focused; editor panels
+        // and the scene camera otherwise own all input (kills the leaking debug hotkeys too).
+        Input.Enabled = SceneManager.IsPlaying && gameViewFocused;
+
         editorInput.NewFrame();
-        editorCamera.Update((float)delta, sceneViewHovered && !imgui.WantCaptureMouse, editorInput);
-        bootstrap.UpdateFrame(delta); // scene ticks only while playing
+        editorCamera.Update((float)delta, sceneViewHovered && !imgui.WantTextInput, editorInput);
+        bootstrap.UpdateFrame(delta);
     }
 
     void OnRender(double delta) {
-        RenderSceneView();
-        RenderGameView();
+        if (sceneTabActive)
+            RenderSceneView();
+        else
+            RenderGameView();
 
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
-        GL.ClearColor(0.10f, 0.10f, 0.12f, 1f);
+        GL.ClearColor(0.05f, 0.05f, 0.06f, 1f);
         GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
 
         imgui.Update((float)delta);
@@ -84,7 +102,7 @@ internal sealed class EditorApplication {
 
     void RenderGameView() {
         if (SceneManager.RenderCamera is null)
-            return; // nothing to show until a scene camera exists (e.g. during play)
+            return;
 
         var w = Math.Max(1, (int)gameViewSize.X);
         var h = Math.Max(1, (int)gameViewSize.Y);
@@ -95,63 +113,157 @@ internal sealed class EditorApplication {
         Renderer.PostRenderCleanUp();
     }
 
+    // ---- Layout -------------------------------------------------------------
+
     void BuildUI() {
-        ToolbarUI();
-        SceneViewUI();
-        GameViewUI();
-        hierarchy.Draw();
-        inspector.Draw();
-        assets.Draw();
+        SysVec2 display = ImGui.GetIO().DisplaySize;
+        float toolbarH = 44 * S;
+        float leftW = Math.Clamp(display.X * 0.14f, 220 * S, 340 * S);
+        float rightW = Math.Clamp(display.X * 0.18f, 300 * S, 440 * S);
+        float assetsH = Math.Clamp((display.Y - toolbarH) * 0.26f, 160 * S, 420 * S);
+        float centerW = display.X - leftW - rightW;
+        float centerH = display.Y - toolbarH - assetsH;
+
+        Panel("##toolbar", new SysVec2(0, 0), new SysVec2(display.X, toolbarH),
+            PanelFlags | ImGuiWindowFlags.NoTitleBar, ToolbarUI);
+
+        Panel("Hierarchy", new SysVec2(0, toolbarH), new SysVec2(leftW, display.Y - toolbarH - assetsH),
+            PanelFlags, hierarchy.DrawContents);
+
+        ViewportPanel(new SysVec2(leftW, toolbarH), new SysVec2(centerW, centerH));
+
+        Panel("Inspector", new SysVec2(display.X - rightW, toolbarH), new SysVec2(rightW, display.Y - toolbarH),
+            PanelFlags, inspector.DrawContents);
+
+        Panel("Assets", new SysVec2(0, display.Y - assetsH), new SysVec2(display.X - rightW, assetsH),
+            PanelFlags, assets.DrawContents);
     }
+
+    static void Panel(string name, SysVec2 pos, SysVec2 size, ImGuiWindowFlags flags, Action contents) {
+        ImGui.SetNextWindowPos(pos, ImGuiCond.Always);
+        ImGui.SetNextWindowSize(size, ImGuiCond.Always);
+        if (ImGui.Begin(name, flags))
+            contents();
+        ImGui.End();
+    }
+
+    // ---- Toolbar ------------------------------------------------------------
 
     void ToolbarUI() {
-        ImGui.SetNextWindowPos(new SysVec2(220, 10), ImGuiCond.FirstUseEver);
-        ImGui.SetNextWindowSize(new SysVec2(420, 70), ImGuiCond.FirstUseEver);
-        if (ImGui.Begin("Toolbar")) {
-            if (SceneManager.IsPlaying) {
-                if (ImGui.Button("Stop")) { SceneManager.StopPlay(); editorState.Selected = null; }
+        Scene scene = SceneManager.GetCurrentScene();
+
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextDisabled(bootstrap.Project.Manifest.Name);
+        ImGui.SameLine();
+        ImGui.TextDisabled("|");
+        ImGui.SameLine();
+        ImGui.Text(scene.Name);
+
+        // Center the Play/Stop control.
+        float buttonW = 84 * S;
+        ImGui.SameLine((ImGui.GetWindowWidth() - buttonW) * 0.5f);
+
+        if (SceneManager.IsPlaying) {
+            ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(0.65f, 0.27f, 0.18f, 1f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(0.78f, 0.33f, 0.22f, 1f));
+            if (ImGui.Button("Stop", new SysVec2(buttonW, 0))) {
+                SceneManager.StopPlay();
+                editorState.Selected = null;
+                selectSceneTab = true;
             }
-            else {
-                if (ImGui.Button("Play")) SceneManager.StartPlay();
-            }
-            ImGui.SameLine();
-            ImGui.Text(SceneManager.IsPlaying ? "Playing" : "Edit");
-            ImGui.SameLine();
-            if (ImGui.Button("Save")) SaveScene();
+            ImGui.PopStyleColor(2);
         }
-        ImGui.End();
+        else {
+            ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(0.18f, 0.45f, 0.25f, 1f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(0.22f, 0.56f, 0.31f, 1f));
+            if (ImGui.Button("Play", new SysVec2(buttonW, 0))) {
+                SceneManager.StartPlay();
+                selectGameTab = true;
+            }
+            ImGui.PopStyleColor(2);
+        }
+
+        // Right side: Save + FPS.
+        float rightBlock = 170 * S;
+        ImGui.SameLine(ImGui.GetWindowWidth() - rightBlock);
+        if (ImGui.Button("Save", new SysVec2(64 * S, 0)))
+            SaveScene();
+        ImGui.SameLine();
+        ImGui.TextDisabled($"{runtime.Window.FrameRate} fps");
     }
 
-    void SceneViewUI() {
-        ImGui.SetNextWindowPos(new SysVec2(220, 90), ImGuiCond.FirstUseEver);
-        ImGui.SetNextWindowSize(new SysVec2(760, 500), ImGuiCond.FirstUseEver);
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, SysVec2.Zero);
-        if (ImGui.Begin("Scene")) {
-            sceneViewHovered = ImGui.IsWindowHovered();
-            SysVec2 avail = ImGui.GetContentRegionAvail();
-            if (avail.X > 0 && avail.Y > 0) sceneViewSize = avail;
-            ImGui.Image(Renderer.SceneColorTextureId, sceneViewSize, new SysVec2(0, 1), new SysVec2(1, 0));
+    // ---- Viewport (Scene / Game tabs) ----------------------------------------
+
+    void ViewportPanel(SysVec2 pos, SysVec2 size) {
+        ImGui.SetNextWindowPos(pos, ImGuiCond.Always);
+        ImGui.SetNextWindowSize(size, ImGuiCond.Always);
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new SysVec2(1, 1));
+        if (ImGui.Begin("##viewport", PanelFlags | ImGuiWindowFlags.NoTitleBar)) {
+            if (ImGui.BeginTabBar("##viewtabs")) {
+                if (BeginTab("Scene", selectSceneTab)) {
+                    sceneTabActive = true;
+                    SceneTabContents();
+                    ImGui.EndTabItem();
+                }
+
+                if (BeginTab("Game", selectGameTab)) {
+                    sceneTabActive = false;
+                    GameTabContents();
+                    ImGui.EndTabItem();
+                }
+
+                selectSceneTab = selectGameTab = false;
+                ImGui.EndTabBar();
+            }
         }
-        else sceneViewHovered = false;
         ImGui.End();
         ImGui.PopStyleVar();
     }
 
-    void GameViewUI() {
-        ImGui.SetNextWindowPos(new SysVec2(990, 90), ImGuiCond.FirstUseEver);
-        ImGui.SetNextWindowSize(new SysVec2(380, 250), ImGuiCond.FirstUseEver);
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, SysVec2.Zero);
-        if (ImGui.Begin("Game")) {
-            SysVec2 avail = ImGui.GetContentRegionAvail();
-            if (avail.X > 0 && avail.Y > 0) gameViewSize = avail;
+    void SceneTabContents() {
+        SysVec2 avail = ImGui.GetContentRegionAvail();
+        if (avail.X > 0 && avail.Y > 0) sceneViewSize = avail;
 
-            if (SceneManager.RenderCamera is not null)
-                ImGui.Image(Renderer.GameColorTextureId, gameViewSize, new SysVec2(0, 1), new SysVec2(1, 0));
-            else
-                ImGui.TextDisabled("No scene camera. Press Play, or add an HDCamera.");
+        ImGui.Image(Renderer.SceneColorTextureId, sceneViewSize, new SysVec2(0, 1), new SysVec2(1, 0));
+        sceneViewHovered = ImGui.IsItemHovered();
+        gameViewFocused = false;
+    }
+
+    void GameTabContents() {
+        SysVec2 avail = ImGui.GetContentRegionAvail();
+        if (avail.X > 0 && avail.Y > 0) gameViewSize = avail;
+
+        sceneViewHovered = false;
+
+        if (SceneManager.RenderCamera is not null) {
+            ImGui.Image(Renderer.GameColorTextureId, gameViewSize, new SysVec2(0, 1), new SysVec2(1, 0));
+            gameViewFocused = ImGui.IsWindowFocused();
         }
-        ImGui.End();
-        ImGui.PopStyleVar();
+        else {
+            ImGui.Dummy(new SysVec2(0, avail.Y * 0.45f));
+            CenteredText(SceneManager.IsPlaying
+                ? "No camera in the scene."
+                : "Press Play to run the scene, or add an HDCamera.");
+            gameViewFocused = false;
+        }
+    }
+
+    static void CenteredText(string text) {
+        float w = ImGui.CalcTextSize(text).X;
+        ImGui.SetCursorPosX((ImGui.GetWindowWidth() - w) * 0.5f);
+        ImGui.TextDisabled(text);
+    }
+
+    // ImGui.NET only exposes tab-item flags on the closable overload; pass a pinned `true` and
+    // the SetSelected flag only on the single frame a programmatic switch is requested.
+    static bool pinnedOpen = true;
+
+    static bool BeginTab(string label, bool forceSelect) {
+        if (!forceSelect)
+            return ImGui.BeginTabItem(label);
+
+        pinnedOpen = true;
+        return ImGui.BeginTabItem(label, ref pinnedOpen, ImGuiTabItemFlags.SetSelected);
     }
 
     void SaveScene() {

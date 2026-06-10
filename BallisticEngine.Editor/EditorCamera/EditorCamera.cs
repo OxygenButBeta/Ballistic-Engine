@@ -36,23 +36,25 @@ internal sealed class EditorCamera : IViewProjectionProvider {
     public Matrix4 GetProjectionMatrix() =>
         Matrix4.CreatePerspectiveFieldOfView(MathHelper.DegreesToRadians(fovDegrees), aspect, nearPlane, farPlane);
 
-    // hovered: viewport panel is hovered AND ImGui doesn't want the mouse.
+    bool flying;
+
+    // Unity-style fly-cam: hold RMB over the Scene view to look around and move with WASDQE.
+    // Once flying, control persists while RMB stays held, even if the cursor leaves the panel.
     public void Update(float dt, bool hovered, EditorInput input) {
+        flying = input.RightMouseDown && (flying || hovered);
+        if (!flying)
+            return;
+
         if (input.ScrollY > 0) moveSpeed += 1f;
         else if (input.ScrollY < 0) moveSpeed = Math.Max(1f, moveSpeed - 1f);
 
-        if (!hovered)
-            return;
+        yaw -= input.MouseDelta.X * sensitivity;
+        pitch += input.MouseDelta.Y * sensitivity;
+        pitch = MathHelper.Clamp(pitch, -89f, 89f);
 
-        if (input.RightMouseDown) {
-            yaw -= input.MouseDelta.X * sensitivity;
-            pitch += input.MouseDelta.Y * sensitivity;
-            pitch = MathHelper.Clamp(pitch, -89f, 89f);
-
-            Quaternion qPitch = Quaternion.FromAxisAngle(Vector3.UnitX, MathHelper.DegreesToRadians(pitch));
-            Quaternion qYaw = Quaternion.FromAxisAngle(Vector3.UnitY, MathHelper.DegreesToRadians(yaw));
-            transform.Rotation = qYaw * qPitch;
-        }
+        Quaternion qPitch = Quaternion.FromAxisAngle(Vector3.UnitX, MathHelper.DegreesToRadians(pitch));
+        Quaternion qYaw = Quaternion.FromAxisAngle(Vector3.UnitY, MathHelper.DegreesToRadians(yaw));
+        transform.Rotation = qYaw * qPitch;
 
         Vector3 direction = Vector3.Zero;
         if (input.Key(EditorKey.W)) direction += transform.Forward;

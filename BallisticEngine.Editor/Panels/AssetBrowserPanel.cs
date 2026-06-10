@@ -11,15 +11,12 @@ internal sealed class AssetBrowserPanel {
 
     string filter = "";
 
-    public void Draw() {
-        ImGui.SetNextWindowPos(new System.Numerics.Vector2(220, 600), ImGuiCond.FirstUseEver);
-        ImGui.SetNextWindowSize(new System.Numerics.Vector2(760, 280), ImGuiCond.FirstUseEver);
-        if (!ImGui.Begin("Assets")) { ImGui.End(); return; }
-
+    public void DrawContents() {
         if (ImGui.Button("Refresh"))
             AssetDatabase.Refresh();
         ImGui.SameLine();
-        ImGui.InputText("Filter", ref filter, 128);
+        ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X * 0.4f);
+        ImGui.InputTextWithHint("##filter", "Filter...", ref filter, 128);
         ImGui.Separator();
 
         // Sort by path for stable grouping.
@@ -47,7 +44,6 @@ internal sealed class AssetBrowserPanel {
         }
 
         if (folderOpen) ImGui.Unindent();
-        ImGui.End();
     }
 
     static void DrawAssetRow(string path, Guid guid) {

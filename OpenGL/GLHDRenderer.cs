@@ -81,7 +81,7 @@ void main() {
         }
 
         foreach (IStaticMeshRenderer target in renderTargets) {
-            if (!target.IsRenderable)
+            if (!target.IsRenderable || !target.IsActive)
                 continue;
 
             Mesh mesh = target.SharedMesh;

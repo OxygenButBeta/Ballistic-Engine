@@ -50,6 +50,15 @@ public class Entity : BObject {
         }
     }
 
+    public void RemoveComponent(Behaviour component) {
+        if (component is null || !Behaviours.Remove(component))
+            return;
+
+        if (SceneManager.IsPlaying && component.IsActive)
+            component.OnDisabled();
+        component.OnDetach();
+    }
+
     public T GetComponent<T>() where T : Behaviour {
         foreach (Behaviour behaviour in Behaviours)
             if (behaviour is T t)

@@ -16,15 +16,10 @@ internal sealed class InspectorPanel {
 
     public InspectorPanel(EditorState state) => this.state = state;
 
-    public void Draw() {
-        ImGui.SetNextWindowPos(new SysVec2(990, 350), ImGuiCond.FirstUseEver);
-        ImGui.SetNextWindowSize(new SysVec2(380, 420), ImGuiCond.FirstUseEver);
-        if (!ImGui.Begin("Inspector")) { ImGui.End(); return; }
-
+    public void DrawContents() {
         Entity entity = state.Selected;
         if (entity is null) {
             ImGui.TextDisabled("No entity selected.");
-            ImGui.End();
             return;
         }
 
@@ -33,12 +28,10 @@ internal sealed class InspectorPanel {
         DrawTransform(entity.transform);
 
         foreach (Behaviour behaviour in entity.Behaviours.ToArray())
-            DrawComponent(behaviour);
+            DrawComponent(entity, behaviour);
 
         ImGui.Separator();
         DrawAddComponent(entity);
-
-        ImGui.End();
     }
 
     static void DrawEntityHeader(Entity entity) {
@@ -68,12 +61,24 @@ internal sealed class InspectorPanel {
             transform.Scale = ToTk(scale);
     }
 
-    void DrawComponent(Behaviour behaviour) {
+    void DrawComponent(Entity entity, Behaviour behaviour) {
         Type type = behaviour.GetType();
-        if (!ImGui.CollapsingHeader(type.Name, ImGuiTreeNodeFlags.DefaultOpen))
+        bool open = ImGui.CollapsingHeader(type.Name, ImGuiTreeNodeFlags.DefaultOpen);
+
+        // Right-click the header to remove the component.
+        if (ImGui.BeginPopupContextItem($"ctx_{type.Name}_{behaviour.InstanceId}")) {
+            if (ImGui.MenuItem("Remove Component")) {
+                entity.RemoveComponent(behaviour);
+                ImGui.EndPopup();
+                return;
+            }
+            ImGui.EndPopup();
+        }
+
+        if (!open)
             return;
 
-        ImGui.PushID(type.Name);
+        ImGui.PushID(behaviour.InstanceId.GetHashCode());
 
         bool enabled = behaviour.IsEnabled;
         if (ImGui.Checkbox("Enabled", ref enabled))

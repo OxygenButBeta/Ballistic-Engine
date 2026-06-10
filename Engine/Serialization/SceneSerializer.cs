@@ -89,6 +89,9 @@ public static class SceneSerializer {
         if (doc?.Entities is null)
             return;
 
+        if (!string.IsNullOrEmpty(doc.Name))
+            SceneManager.GetCurrentScene().Name = doc.Name;
+
         // id (file-local) -> live entity, for parent resolution in a second pass.
         var byId = new Dictionary<string, Entity>(StringComparer.Ordinal);
 
