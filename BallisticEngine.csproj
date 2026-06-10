@@ -5,11 +5,6 @@
         <TargetFramework>net9.0</TargetFramework>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>disable</Nullable>
-
-        <DefineConstants>
-            ENABLE_RESOURCE_CACHING;
-        </DefineConstants>
-        
     </PropertyGroup>
 
     <ItemGroup>
@@ -19,11 +14,7 @@
     </ItemGroup>
 
     <ItemGroup>
-      <Folder Include="Abstraction\Rendering\Shading\" />
-      <Folder Include="Engine\Rendering\Renderer\" />
+      <EmbeddedResource Include="OpenGL\Shader\Embedded\*.glsl" />
     </ItemGroup>
 
-
-    
-    
 </Project>

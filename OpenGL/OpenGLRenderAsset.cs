@@ -37,11 +37,17 @@ public sealed class OpenGLRenderAsset : RenderAsset {
         return new GLInstancedBuffer(renderContext);
     }
 
-    public override Texture2D CreateTexture2D(string filePath, TextureType type) =>
-        Texture.ImportFromFile<GLTexture2D>(filePath, type);
+    public override Texture2D CreateTexture2D(in TextureData data, TextureType type) {
+        GLTexture2D texture = new();
+        texture.Upload(in data, type);
+        return texture;
+    }
 
-    public override Texture3D CreateTexture3D(string[] paths) =>
-        Texture3D.ImportCubeMapFromFile<GLTexture3D>(paths);
+    public override Texture3D CreateCubemap(TextureData[] faces) {
+        GLTexture3D texture = new();
+        texture.UploadFaces(faces);
+        return texture;
+    }
 
     public override GPUBuffer<Vector3> CreateVertexBuffer3(RenderContext renderContext) =>
         new GL3DBufferBase(renderContext);

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "shader": "Assets/Default/Shaders/Standard.shader",
+  "textures": {
+    "Diffuse": "Assets/Default/PH7_DIFF.png",
+    "Normal": "Assets/Default/PH7_NOR.png",
+    "Metallic": "Assets/Default/PH7_METAL.png",
+    "Roughness": "Assets/Default/PH7_ROUGH.png",
+    "AO": "Assets/Default/PH7_AO.png"
+  }
+}

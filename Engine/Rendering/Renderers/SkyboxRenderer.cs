@@ -69,22 +69,11 @@ public class SkyboxRenderer : ISkyboxDrawable {
         renderContext = GraphicAPI.CreateRenderContext();
         renderContext.Activate();
 
-
-        var rightPath = AssetDatabase.GetAssetPath("right.jpg");
-        var leftPath = AssetDatabase.GetAssetPath("left.jpg");
-        var topPath = AssetDatabase.GetAssetPath("top.jpg");
-        var bottomPath = AssetDatabase.GetAssetPath("bottom.jpg");
-        var frontPath = AssetDatabase.GetAssetPath("front.jpg");
-        var backPath = AssetDatabase.GetAssetPath("back.jpg");
-
-        cubemapTexture = GraphicAPI.CreateTexture3D([
-            rightPath,
-            leftPath,
-            topPath,
-            bottomPath,
-            frontPath,
-            backPath
-        ]);
+        var skyboxRef = AssetDatabase.Project?.Manifest.DefaultSkybox;
+        if (string.IsNullOrEmpty(skyboxRef))
+            Debugging.LogWarning("No defaultSkybox set in project.json; rendering without a skybox.");
+        else
+            cubemapTexture = AssetDatabase.LoadRef<Texture3D>(skyboxRef);
 
 
         cubemapVertexBuffer = GraphicAPI.CreateVertexBuffer3(renderContext);

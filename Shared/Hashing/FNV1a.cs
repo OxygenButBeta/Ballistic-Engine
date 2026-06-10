@@ -5,7 +5,7 @@ public static class FNV1a {
         const int offsetBasis = unchecked((int)2166136261);
         var hash = offsetBasis;
         for (var i = 0; i < text.Length; i++) {
-            hash ^= i;
+            hash ^= text[i];
             hash *= fnvPrime;
         }
         return hash;

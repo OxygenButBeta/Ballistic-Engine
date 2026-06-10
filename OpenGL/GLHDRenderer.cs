@@ -72,6 +72,9 @@ void main() {
         }
 
         foreach (IStaticMeshRenderer target in renderTargets) {
+            if (!target.IsRenderable)
+                continue;
+
             Mesh mesh = target.SharedMesh;
             Shader shader = target.SharedMaterial.Shader;
             Matrix4 WorldMatrix = target.Transform.WorldMatrix;
@@ -102,7 +105,8 @@ void main() {
         shader.SetFloat3("LightColor",
             DirectionalLight.Instance.LightIntensity * DirectionalLight.Instance.LightColor);
         shader.SetFloat3("AmbientLight",
-            DirectionalLight.Instance.ambientIntensity * skyboxRenderer.cubemapTexture.skyAmbient);
+            DirectionalLight.Instance.ambientIntensity *
+            (skyboxRenderer.cubemapTexture?.skyAmbient ?? Vector3.One * 0.5f));
         shader.SetFloat("MetallicMultiplier", Metallic);
         shader.SetFloat("SmoothnessMultiplier", RoughnessValue);
         shader.SetFloat("rimPower", RimPower);
@@ -191,10 +195,12 @@ void main() {
         RenderOpaque(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection, args, false);
 
         DebugCheck();
-        skyboxRenderer.RotUpdate();
-        skyboxRenderer.PreRenderCallback(args);
-        skyboxRenderer.RenderSkybox();
-        skyboxRenderer.PostRenderCallback(args);
+        if (skyboxRenderer.cubemapTexture is not null) {
+            skyboxRenderer.RotUpdate();
+            skyboxRenderer.PreRenderCallback(args);
+            skyboxRenderer.RenderSkybox();
+            skyboxRenderer.PostRenderCallback(args);
+        }
 
         frameBuffer.DrawBufferToScreen();
         return new RenderMetrics();

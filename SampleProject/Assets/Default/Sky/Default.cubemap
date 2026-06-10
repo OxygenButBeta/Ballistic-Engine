@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "faces": {
+    "right": "Assets/Default/Sky/right.jpg",
+    "left": "Assets/Default/Sky/left.jpg",
+    "top": "Assets/Default/Sky/top.jpg",
+    "bottom": "Assets/Default/Sky/bottom.jpg",
+    "front": "Assets/Default/Sky/front.jpg",
+    "back": "Assets/Default/Sky/back.jpg"
+  }
+}

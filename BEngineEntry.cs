@@ -1,4 +1,5 @@
-﻿using System.Reflection;
+using System.Reflection;
+using BallisticEngine.AssetPipeline;
 
 namespace BallisticEngine;
 
@@ -6,17 +7,24 @@ public sealed class BEngineEntry
 {
     static IBallisticEngineRuntime Runtime;
 
-    public BEngineEntry(IBallisticEngineRuntime runtime)
+    public BEngineEntry(IBallisticEngineRuntime runtime, string projectPath)
     {
         Runtime = runtime;
         SystemAPI.Bind(Runtime);
-        Runtime.RenderAsset.Initialize(); // Initialize the renderer
-        Runtime.Window.SetFrequency(0); // Set the update frequency to 60Hz
+
+        // Deploy Single Services (before anything that might resolve them)
+        SingleServiceInstaller.InstallAllInAssembly(Assembly.GetEntryAssembly());
+
+        // Open the project and bring the Library up to date (CPU-side import only).
+        BallisticProject project = BallisticProject.Open(projectPath);
+        AssetDatabase.Initialize(project);
+        AssetDatabase.Refresh();
+
+        Runtime.RenderAsset.Initialize(); // Initialize the renderer (loads the default skybox via AssetDatabase)
+        Runtime.Window.SetFrequency(600);
         Runtime.WindowUpdateCallback += EngineUpdate;
         Runtime.WindowRenderCallback += EngineRender;
 
-        // Deploy Single Services
-        SingleServiceInstaller.InstallAllInAssembly(Assembly.GetEntryAssembly());
         //TODO : REMOVE
         SceneInit.Init();
     }
@@ -33,17 +41,9 @@ public sealed class BEngineEntry
         }
     }
 
-    int logFpsInNFrame = 60;
-    int logFpsInterval = 0;
     void EngineUpdate(double delta)
     {
-        Runtime.Window.SetFrequency(600);
         Runtime.EngineTimer.Update(delta);
-        if (logFpsInterval++ >= logFpsInNFrame)
-        {
-            logFpsInterval = 0;
-      //   Console.WriteLine("FPS: " + (1 / delta));
-        }
         SceneManager.Update((float)delta);
     }
 

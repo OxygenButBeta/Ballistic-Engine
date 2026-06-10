@@ -1,2 +1,8 @@
 /bin/
 /obj/
+
+# Regenerable asset import cache
+SampleProject/Library/
+
+# Local Claude Code session settings
+.claude/

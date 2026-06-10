@@ -53,9 +53,9 @@ public static class GraphicAPI
         RenderAsset.Current.CreateInstancedBuffer(renderContext);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static Texture2D CreateTexture2D(string filePath, TextureType type) =>
-        RenderAsset.Current.CreateTexture2D(filePath, type);
+    public static Texture2D CreateTexture2D(in TextureData data, TextureType type) =>
+        RenderAsset.Current.CreateTexture2D(in data, type);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static Texture3D CreateTexture3D(string[] paths) => RenderAsset.Current.CreateTexture3D( paths);
+    public static Texture3D CreateCubemap(TextureData[] faces) => RenderAsset.Current.CreateCubemap(faces);
 }

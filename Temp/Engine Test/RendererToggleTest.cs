@@ -1,4 +1,4 @@
-﻿using BallisticEngine;
+using BallisticEngine;
 using OpenTK.Windowing.GraphicsLibraryFramework;
 
 public class RendererToggleTest : Behaviour {
@@ -6,8 +6,9 @@ public class RendererToggleTest : Behaviour {
 
     protected internal override void OnBegin() {
         Entity entity = Entity.Instantiate("Mesh");
-        entity.AddComponent<StaticMeshRenderer>();
-        renderer = entity.GetComponent<StaticMeshRenderer>();
+        renderer = entity.AddComponent<StaticMeshRenderer>();
+        renderer.SharedMesh = AssetDatabase.Load<Mesh>("Assets/Default/PH7.fbx");
+        renderer.SharedMaterial = AssetDatabase.Load<Material>("Assets/Default/PH7.mat");
     }
 
     protected internal override void Tick(in float delta) {

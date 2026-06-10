@@ -1,19 +1,15 @@
-﻿using OpenTK.Graphics.OpenGL;
-using StbImageSharp;
+using OpenTK.Graphics.OpenGL;
 
 namespace BallisticEngine;
 
 public sealed class GLTexture2D : Texture2D {
     public override int UID { get; protected set; }
-    ImageResult rawImage;
-    TextureType TextureType;
     bool isUploaded;
 
     public override void Activate() {
-        GL.ActiveTexture((TextureUnit)TextureType);
+        GL.ActiveTexture(TextureUnit.Texture0 + (int)Type);
         GL.BindTexture(TextureTarget.Texture2D, UID);
     }
-
 
     public override void Deactivate() {
         GL.BindTexture(TextureTarget.Texture2D, 0);
@@ -24,13 +20,14 @@ public sealed class GLTexture2D : Texture2D {
             GL.DeleteTexture(UID);
     }
 
-    void GPUTexture() {
-        UID = GL.GenTexture();
+    protected internal override void Upload(in TextureData data, TextureType type) {
+        Type = type;
 
-        GL.ActiveTexture((TextureUnit)TextureType);
+        UID = GL.GenTexture();
+        GL.ActiveTexture(TextureUnit.Texture0 + (int)Type);
         GL.BindTexture(TextureTarget.Texture2D, UID);
 
-        if (TextureType == TextureType.Normal) {
+        if (Type == TextureType.Normal) {
             GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.Repeat);
             GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.Repeat);
         }
@@ -45,20 +42,19 @@ public sealed class GLTexture2D : Texture2D {
             (int)TextureMinFilter.LinearMipmapLinear);
         GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
 
-
-        PixelInternalFormat internalFormat = TextureType == TextureType.Diffuse
+        PixelInternalFormat internalFormat = Type == TextureType.Diffuse
             ? PixelInternalFormat.SrgbAlpha
             : PixelInternalFormat.Rgba;
 
-        if (TextureType is TextureType.Metallic or TextureType.Roughness or TextureType.AO) {
+        if (Type is TextureType.Metallic or TextureType.Roughness or TextureType.AO) {
             internalFormat = PixelInternalFormat.R8;
         }
-        else if (TextureType == TextureType.Normal) {
+        else if (Type == TextureType.Normal) {
             internalFormat = PixelInternalFormat.Rgb8;
         }
 
-        GL.TexImage2D(TextureTarget.Texture2D, 0, internalFormat, rawImage.Width, rawImage.Height,
-            0, PixelFormat.Rgba, PixelType.UnsignedByte, rawImage.Data);
+        GL.TexImage2D(TextureTarget.Texture2D, 0, internalFormat, data.Width, data.Height,
+            0, PixelFormat.Rgba, PixelType.UnsignedByte, data.Pixels);
 
         GL.GenerateMipmap(GenerateMipmapTarget.Texture2D);
         isUploaded = true;
@@ -67,11 +63,5 @@ public sealed class GLTexture2D : Texture2D {
         GL.TexParameter(TextureTarget.Texture2D, (TextureParameterName)All.TextureMaxAnisotropyExt, maxAniso);
 
         Deactivate();
-    }
-
-    protected override void Import(ImageResult imageResult, TextureType textureType) {
-        rawImage = imageResult;
-        TextureType = textureType;
-        GPUTexture();
     }
 }

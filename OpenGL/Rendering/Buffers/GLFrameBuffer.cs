@@ -41,8 +41,8 @@ public static class GLBufferUtilities {
 
         renderContext.Deactivate();
         
-        quadShader = GraphicAPI.CreateStandardShader(Resources.ReadResourceText("Shaders/FSQ_Vert.glsl"),
-            Resources.ReadResourceText("Shaders/FSQ_Frag.glsl"));
+        quadShader = GraphicAPI.CreateStandardShader(EmbeddedShaderSource.Read("FSQ_Vert.glsl"),
+            EmbeddedShaderSource.Read("FSQ_Frag.glsl"));
     }
 
 

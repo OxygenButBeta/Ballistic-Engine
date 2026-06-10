@@ -1,4 +1,4 @@
-﻿using BallisticEngine;
+using BallisticEngine;
 using OpenTK.Mathematics;
 
 public static class SceneInit {
@@ -8,29 +8,30 @@ public static class SceneInit {
         cameraEntity.AddComponent<HDCamera>();
         cameraEntity.AddComponent<FreeLookCameraController>();
 
-        int columns = 6; // her satırda 10 kutu<
-        float spacing = 1f;
+        // Assets come from the project; components only get them assigned.
+        // Both renderers below share the same Mesh/Material instances (AssetDatabase caches by GUID).
+        Mesh mesh = AssetDatabase.Load<Mesh>("Assets/Default/PH7.fbx");
+        Material material = AssetDatabase.Load<Material>("Assets/Default/PH7.mat");
 
-        for (int i = 0; i < 1; i++) {
-            Entity meshEntity = Entity.Instantiate("Mesh");
-            meshEntity.AddComponent<StaticMeshRenderer>();
-            meshEntity.AddComponent<Rotator>();
-            meshEntity.GetComponent<Rotator>().RotationSpeed =  Random.Shared.Next(-20, 20);
-            meshEntity.GetComponent<Rotator>().Alpha = true;
-            int x = i % columns; 
-            int z = i / columns; 
+        Entity meshEntity = Entity.Instantiate("Mesh");
+        StaticMeshRenderer meshRenderer = meshEntity.AddComponent<StaticMeshRenderer>();
+        meshRenderer.SharedMesh = mesh;
+        meshRenderer.SharedMaterial = material;
 
-            meshEntity.transform.Position = new Vector3(x * spacing, 0, z * spacing);
-            meshEntity.transform.EulerAngles = new Vector3(90, 180, 0);
-            meshEntity.transform.Scale = Vector3.One * 6;
-            if (i ==29) {
-                meshEntity.GetComponent<StaticMeshRenderer>().Lock();
-            }
-        }
+        Rotator rotator = meshEntity.AddComponent<Rotator>();
+        rotator.RotationSpeed = Random.Shared.Next(-20, 20);
+        rotator.Alpha = true;
+
+        meshEntity.transform.Position = Vector3.Zero;
+        meshEntity.transform.EulerAngles = new Vector3(90, 180, 0);
+        meshEntity.transform.Scale = Vector3.One * 6;
+
         Entity lightEntity = Entity.Instantiate("Directional Light");
         lightEntity.AddComponent<DirectionalLight>();
-        lightEntity.transform.Position = new Vector3(3,0.5f, 0 );
-        StaticMeshRenderer.instanceCount = 1;
-        lightEntity.AddComponent<StaticMeshRenderer>();
+        lightEntity.transform.Position = new Vector3(3, 0.5f, 0);
+
+        StaticMeshRenderer lightMarker = lightEntity.AddComponent<StaticMeshRenderer>();
+        lightMarker.SharedMesh = mesh;
+        lightMarker.SharedMaterial = material;
     }
 }

@@ -1,10 +1,7 @@
-﻿using BallisticEngine.Shared.Runtime_Set;
+﻿namespace BallisticEngine;
 
-namespace BallisticEngine;
-
-public class Material : BObject, ISharedResource
+public class Material : BObject
 {
-    public ResourceIdentity Identity { get; }
     public Texture2D Diffuse { get; set; }
     public Texture2D Normal { get; set; }
     public Texture2D Specular{ get; set; }
