@@ -1,4 +1,4 @@
-﻿using System.Diagnostics.CodeAnalysis;
+using System.Diagnostics.CodeAnalysis;
 using BallisticEngine;
 using OpenTK.Graphics.OpenGL4;
 using OpenTK.Mathematics;
@@ -9,7 +9,6 @@ public static class GLBufferUtilities {
     static readonly GPUBuffer<Vector2> quadBuffer;
     static readonly GPUBuffer<Vector2> quadUVBuffer;
     static readonly RenderContext renderContext;
-    static readonly StandardShader quadShader;
 
     static GLBufferUtilities() {
         Vector2[] vertices = {
@@ -40,43 +39,13 @@ public static class GLBufferUtilities {
         quadUVBuffer.SetBufferData(uvs, BufferUsageHint.StaticDraw);
 
         renderContext.Deactivate();
-        
-        quadShader = GraphicAPI.CreateStandardShader(EmbeddedShaderSource.Read("FSQ_Vert.glsl"),
-            EmbeddedShaderSource.Read("FSQ_Frag.glsl"));
     }
 
-
-    public static void DrawBufferToScreen(this IFrameBuffer buffer) {
-        GL.Disable(EnableCap.CullFace);
-        GL.Disable(EnableCap.DepthTest);
-        GL.Viewport(0, 0, buffer.LenX, buffer.LenY);
-        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
-
-        buffer.Unbind();
-        quadShader.Activate();
-        quadShader.SetInt("hdrTexture", 31);
+    // Shared fullscreen-quad VAO for every post-process pass. The caller binds its
+    // own shader and textures first.
+    public static void DrawFullscreenQuad() {
         renderContext.Activate();
-        buffer.BindTexture();
         GL.DrawArrays(PrimitiveType.Triangles, 0, 6);
-    }
-
-    // Runs the same tonemap/post-process pass, but into another framebuffer instead of the
-    // screen. The editor uses this so its viewport panels show the final graded image, not
-    // the raw linear HDR buffer (which looks dim when sampled directly).
-    public static void ResolveTo(this IFrameBuffer source, GLFrameBuffer destination) {
-        GL.Disable(EnableCap.CullFace);
-        GL.Disable(EnableCap.DepthTest);
-
-        destination.Activate();
-        GL.Viewport(0, 0, destination.LenX, destination.LenY);
-
-        quadShader.Activate();
-        quadShader.SetInt("hdrTexture", 31);
-        renderContext.Activate();
-        source.BindTexture();
-        GL.DrawArrays(PrimitiveType.Triangles, 0, 6);
-
-        destination.Unbind();
     }
 }
 
@@ -87,12 +56,21 @@ public interface IFrameBuffer {
     void Unbind();
     void BindTexture();
 }
+
 public class GLFrameBuffer : IFrameBuffer {
     readonly int frameBufferId;
+    readonly bool depthAsTexture;
     public int LenX { get; private set; }
     public int LenY { get; private set; }
     public int colorBuffer, depthBufferId = -1;
-    public GLFrameBuffer(int width, int height) {
+
+    // Valid when constructed with depthAsTexture: lets post passes (SSAO) sample scene depth.
+    public int DepthTextureId { get; private set; } = -1;
+
+    public int FrameBufferId => frameBufferId;
+
+    public GLFrameBuffer(int width, int height, bool depthAsTexture = false) {
+        this.depthAsTexture = depthAsTexture;
         frameBufferId = GL.GenFramebuffer();
         CreateBuffers(width, height);
     }
@@ -110,15 +88,36 @@ public class GLFrameBuffer : IFrameBuffer {
 
         GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
         GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.ClampToEdge);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.ClampToEdge);
         GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
             TextureTarget.Texture2D, colorBuffer, 0);
 
         // Depth Buffer
-        depthBufferId = GL.GenRenderbuffer();
-        GL.BindRenderbuffer(RenderbufferTarget.Renderbuffer, depthBufferId);
-        GL.RenderbufferStorage(RenderbufferTarget.Renderbuffer, RenderbufferStorage.DepthComponent24, width, height);
-        GL.FramebufferRenderbuffer(FramebufferTarget.Framebuffer, FramebufferAttachment.DepthAttachment,
-            RenderbufferTarget.Renderbuffer, depthBufferId);
+        if (depthAsTexture) {
+            DepthTextureId = GL.GenTexture();
+            GL.BindTexture(TextureTarget.Texture2D, DepthTextureId);
+            GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.DepthComponent24, width, height, 0,
+                PixelFormat.DepthComponent, PixelType.Float, IntPtr.Zero);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter,
+                (int)TextureMinFilter.Nearest);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter,
+                (int)TextureMagFilter.Nearest);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS,
+                (int)TextureWrapMode.ClampToEdge);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT,
+                (int)TextureWrapMode.ClampToEdge);
+            GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.DepthAttachment,
+                TextureTarget.Texture2D, DepthTextureId, 0);
+        }
+        else {
+            depthBufferId = GL.GenRenderbuffer();
+            GL.BindRenderbuffer(RenderbufferTarget.Renderbuffer, depthBufferId);
+            GL.RenderbufferStorage(RenderbufferTarget.Renderbuffer, RenderbufferStorage.DepthComponent24, width,
+                height);
+            GL.FramebufferRenderbuffer(FramebufferTarget.Framebuffer, FramebufferAttachment.DepthAttachment,
+                RenderbufferTarget.Renderbuffer, depthBufferId);
+        }
 
         // Buffer Check
         if (GL.CheckFramebufferStatus(FramebufferTarget.Framebuffer) != FramebufferErrorCode.FramebufferComplete)
@@ -137,6 +136,11 @@ public class GLFrameBuffer : IFrameBuffer {
         if (colorBuffer != 0) {
             GL.DeleteTexture(colorBuffer);
             colorBuffer = 0;
+        }
+
+        if (DepthTextureId != -1) {
+            GL.DeleteTexture(DepthTextureId);
+            DepthTextureId = -1;
         }
 
         if (depthBufferId == -1)

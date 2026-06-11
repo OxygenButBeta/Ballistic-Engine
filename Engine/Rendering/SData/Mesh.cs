@@ -11,6 +11,10 @@ public class Mesh : BObject
     public readonly uint[] Indices;
     public readonly Vector2[] UVs;
 
+    // Index-buffer ranges per source material (always at least one, spanning everything).
+    // SubMeshData.MaterialRef carries the .mat the importer generated for that range.
+    public readonly SubMeshData[] SubMeshes;
+
     readonly GPUBuffer<Vector3> vertexBuffer;
     readonly GPUBuffer<Vector2> UVBuffer;
     readonly GPUBuffer<Vector3> normalBuffer;
@@ -36,6 +40,9 @@ public class Mesh : BObject
         Tangents = data.Tangents;
         UVs = data.UVs;
         Normals = data.Normals;
+        SubMeshes = data.SubMeshes is { Length: > 0 }
+            ? data.SubMeshes
+            : [new SubMeshData(null, 0, data.Indices.Length, null)];
 
         InstanceBuffer = GraphicAPI.CreateInstancedBuffer(renderContext);
         InstanceBuffer.Create();

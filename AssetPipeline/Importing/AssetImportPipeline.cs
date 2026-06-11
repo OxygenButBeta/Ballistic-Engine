@@ -47,6 +47,34 @@ public sealed class AssetImportPipeline {
         var stopwatch = Stopwatch.StartNew();
         database = ArtifactDatabase.Load(project.ArtifactDatabasePath);
 
+        // Importers can write new source assets during a pass (the model importer generates
+        // .mat files, the Falcor importer a sibling .scene). Sweep again until a pass imports
+        // nothing, so everything produced this run is registered before we return. Later passes
+        // are cheap: unchanged assets take the size+mtime fast path.
+        const int maxPasses = 4;
+        var scanned = 0;
+        var imported = 0;
+        var upToDate = 0;
+        var failed = 0;
+
+        for (var pass = 0; pass < maxPasses; pass++) {
+            (scanned, var passImported, upToDate, failed) = RefreshPass();
+            imported += passImported;
+
+            if (passImported == 0)
+                break;
+        }
+
+        PruneOrphans();
+        WarnOrphanedMetaFiles();
+        database.Save(project.ArtifactDatabasePath);
+
+        var result = new RefreshResult(scanned, imported, upToDate, failed, stopwatch.ElapsedMilliseconds);
+        Debugging.Log(result.ToString());
+        return result;
+    }
+
+    (int Scanned, int Imported, int UpToDate, int Failed) RefreshPass() {
         guidToPath.Clear();
         pathToGuid.Clear();
         metaByGuid.Clear();
@@ -87,13 +115,7 @@ public sealed class AssetImportPipeline {
             }
         }
 
-        PruneOrphans();
-        WarnOrphanedMetaFiles();
-        database.Save(project.ArtifactDatabasePath);
-
-        var result = new RefreshResult(scanned, imported, upToDate, failed, stopwatch.ElapsedMilliseconds);
-        Debugging.Log(result.ToString());
-        return result;
+        return (scanned, imported, upToDate, failed);
     }
 
     MetaFile EnsureMeta(string sourceAbsolute, string assetPath) {

@@ -19,6 +19,7 @@ public static class FalcorSceneConverter {
         AddCamera(doc, data);
         AddLights(doc, data);
         AddModels(doc, data, pysceneAbsolutePath, resolveModelAssetPath);
+        AddSkybox(doc, data, pysceneAbsolutePath, resolveModelAssetPath);
 
         File.WriteAllText(outputAbsolutePath, SceneYaml.Serializer.Serialize(doc));
     }
@@ -101,6 +102,27 @@ public static class FalcorSceneConverter {
             entity.Components.Add(renderer);
             doc.Entities.Add(entity);
         }
+    }
+
+    // Falcor scenes use an equirect env map for sky + ambient; map it to a Skybox component
+    // when the referenced image resolves to a project asset (.hdr/.exr/etc).
+    static void AddSkybox(SceneDocument doc, FalcorSceneData data, string pysceneAbsolutePath,
+        Func<string, string> resolveAssetPath) {
+        if (string.IsNullOrEmpty(data.EnvMapPath))
+            return;
+
+        var baseDir = Path.GetDirectoryName(pysceneAbsolutePath)!;
+        var assetRef = resolveAssetPath?.Invoke(Path.Combine(baseDir, data.EnvMapPath));
+        if (assetRef is null) {
+            Debugging.LogWarning($"Falcor import: env map '{data.EnvMapPath}' not found in project; no skybox.");
+            return;
+        }
+
+        // Skybox is a SceneBehaviour (scene-wide component), not an entity component.
+        doc.SceneComponents.Add(new ComponentDocument {
+            Type = "Skybox",
+            Members = { ["cubemap"] = assetRef },
+        });
     }
 
     // Quaternion that rotates +Z (engine forward) to the given direction.

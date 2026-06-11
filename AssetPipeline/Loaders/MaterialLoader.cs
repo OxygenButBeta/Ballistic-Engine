@@ -1,14 +1,7 @@
 namespace BallisticEngine.AssetPipeline.Loaders;
 
-// .mat asset: { "version": 1, "shader": "<.shader ref>", "textures": { "Diffuse": "<ref>", ... } }
-// Texture keys are TextureType names. Missing/broken texture refs fall back to flat stand-ins;
-// a missing/broken shader makes the whole material unloadable (null).
-public sealed class MaterialDefinition {
-    public int Version { get; set; } = 1;
-    public string Shader { get; set; }
-    public Dictionary<string, string> Textures { get; set; } = new();
-}
-
+// Missing/broken texture refs fall back to flat stand-ins; a missing/broken shader makes the
+// whole material unloadable (null). The .mat shape itself lives in MaterialDefinition.cs.
 public static class MaterialLoader {
     public static Material Load(BallisticProject project, string assetPath) {
         var definition = PipelineJson.Read<MaterialDefinition>(project.ResolveAbsolute(assetPath));
@@ -19,13 +12,27 @@ public static class MaterialLoader {
             return null;
         }
 
-        return Material.Create(
+        Material material = Material.Create(
             shader,
-            Slot(definition, TextureType.Diffuse, assetPath) ?? FallbackAssets.For(TextureType.Diffuse),
+            // Unassigned diffuse renders plain white; the magenta error texture is reserved for
+            // refs that exist but fail to load (inside Slot).
+            Slot(definition, TextureType.Diffuse, assetPath) ?? FallbackAssets.PlainDiffuse(),
             Slot(definition, TextureType.Normal, assetPath),
             Slot(definition, TextureType.Metallic, assetPath),
             Slot(definition, TextureType.Roughness, assetPath),
-            Slot(definition, TextureType.AO, assetPath));
+            Slot(definition, TextureType.AO, assetPath),
+            Slot(definition, TextureType.Emissive, assetPath));
+
+        ApplyScalars(material, definition);
+        return material;
+    }
+
+    public static void ApplyScalars(Material material, MaterialDefinition definition) {
+        material.Transparent = definition.Transparent;
+        material.Opacity = Math.Clamp(definition.Opacity, 0f, 1f);
+        material.EmissiveIntensity = MathF.Max(definition.EmissiveIntensity, 0f);
+        if (definition.EmissiveColor is { Length: >= 3 } emissive)
+            material.EmissiveColor = new OpenTK.Mathematics.Vector3(emissive[0], emissive[1], emissive[2]);
     }
 
     static Texture2D Slot(MaterialDefinition definition, TextureType slot, string assetPath) {

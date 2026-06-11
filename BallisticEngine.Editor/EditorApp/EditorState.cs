@@ -4,6 +4,7 @@ namespace BallisticEngine.Editor;
 // vice versa — the Inspector shows whichever is current.
 internal sealed class EditorState {
     public Entity Selected { get; set; }
+    public SceneBehaviour SelectedSceneBehaviour { get; private set; }
     public string SelectedAssetPath { get; private set; }
     public Guid SelectedAssetGuid { get; private set; }
 
@@ -11,6 +12,14 @@ internal sealed class EditorState {
 
     public void Select(Entity entity) {
         Selected = entity;
+        SelectedSceneBehaviour = null;
+        SelectedAssetPath = null;
+        SelectedAssetGuid = Guid.Empty;
+    }
+
+    public void SelectSceneBehaviour(SceneBehaviour behaviour) {
+        SelectedSceneBehaviour = behaviour;
+        Selected = null;
         SelectedAssetPath = null;
         SelectedAssetGuid = Guid.Empty;
     }
@@ -19,6 +28,7 @@ internal sealed class EditorState {
         SelectedAssetPath = assetPath;
         SelectedAssetGuid = guid;
         Selected = null;
+        SelectedSceneBehaviour = null;
     }
 
     public void ClearAssetSelection() {
@@ -29,5 +39,7 @@ internal sealed class EditorState {
     public void ClearIfDestroyed(Scene scene) {
         if (Selected is not null && !scene.Entities.Contains(Selected))
             Selected = null;
+        if (SelectedSceneBehaviour is not null && !scene.SceneBehaviours.Contains(SelectedSceneBehaviour))
+            SelectedSceneBehaviour = null;
     }
 }

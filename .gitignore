@@ -10,3 +10,7 @@ SampleProject/Library/
 
 # ImGui editor layout persistence (per-machine)
 imgui.ini
+
+# Bistro test content (1.6 GB) — kept out of plain git until the git-lfs decision.
+# Remove this line and `git add` the folder once LFS (or plain tracking) is chosen.
+SampleProject/Assets/Default/Bistro_v5_2/

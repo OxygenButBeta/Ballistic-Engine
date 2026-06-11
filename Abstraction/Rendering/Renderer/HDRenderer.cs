@@ -13,6 +13,9 @@ public abstract class HDRenderer {
     public enum RenderTarget { Scene, Game }
     public RenderTarget ActiveTarget { get; set; } = RenderTarget.Scene;
 
+    // HDR -> display tunables (tonemap, bloom, SSAO, MSAA, grading). Shared by all targets.
+    public PostProcessSettings PostFX { get; } = new();
+
     // GL ids of the two offscreen color textures (for ImGui::Image in the Scene/Game panels).
     public abstract int SceneColorTextureId { get; }
     public abstract int GameColorTextureId { get; }

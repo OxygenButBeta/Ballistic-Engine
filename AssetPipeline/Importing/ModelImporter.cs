@@ -1,26 +1,279 @@
 using System.Text.Json.Nodes;
+using BallisticEngine.AssetPipeline.Loaders;
 
 namespace BallisticEngine.AssetPipeline;
 
+// Imports model files into a single .bmesh artifact with one submesh per source material
+// (node transforms baked in). When the source carries materials, generates a sibling
+// "<Model>_Materials" folder of .mat assets and bakes their refs into the submeshes; the
+// generated .mat files are owned by the importer and rewritten on every reimport.
+// Texture .meta files referenced by those materials get their textureType set from the slot
+// the model actually binds them to (authoritative over filename-suffix inference).
 public sealed class ModelImporter : IAssetImporter {
-    static readonly string[] Extensions = [".fbx", ".obj"];
+    static readonly string[] Extensions = [".fbx", ".obj", ".gltf", ".glb", ".dae"];
+
+    public const string DefaultShaderRef = "Assets/Default/Shaders/Standard.shader";
 
     public string Name => "ModelImporter";
-    public int Version => 1;
+    public int Version => 2;
     public string ArtifactExtension => ".bmesh";
 
     public bool CanImport(string extension) => Extensions.Contains(extension);
 
     public JsonObject CreateDefaultSettings(string assetPath) => new() {
         ["flipUVs"] = true,
-        ["meshIndex"] = 0,
+        ["meshIndex"] = -1, // -1 = whole scene merged by material; >= 0 = that one mesh, no materials
+        ["generateMaterials"] = true,
+        ["shader"] = DefaultShaderRef,
     };
 
     public void Import(AssetImportContext context) {
         var flipUVs = context.Settings?["flipUVs"]?.GetValue<bool>() ?? true;
-        var meshIndex = context.Settings?["meshIndex"]?.GetValue<int>() ?? 0;
+        var meshIndex = context.Settings?["meshIndex"]?.GetValue<int>() ?? -1;
 
-        MeshData data = AssimpMeshDecoder.Decode(context.SourceAbsolutePath, flipUVs, meshIndex);
+        if (meshIndex >= 0) {
+            // Legacy single-mesh import: geometry only, mesh-local space, no materials.
+            MeshData single = AssimpMeshDecoder.Decode(context.SourceAbsolutePath, flipUVs, meshIndex);
+            MeshArtifact.Write(context.ArtifactAbsolutePath, in single);
+            return;
+        }
+
+        DecodedModel model = AssimpMeshDecoder.DecodeScene(context.SourceAbsolutePath, flipUVs);
+
+        var generateMaterials = context.Settings?["generateMaterials"]?.GetValue<bool>() ?? true;
+        MeshData data = generateMaterials ? GenerateMaterials(context, model) : model.Mesh;
+
         MeshArtifact.Write(context.ArtifactAbsolutePath, in data);
+    }
+
+    // ---- Material generation ------------------------------------------------
+
+    // Writes one .mat per used source material and returns the mesh data with submesh
+    // MaterialRefs pointing at them. Failures degrade per-material (ref stays null).
+    static MeshData GenerateMaterials(AssetImportContext context, DecodedModel model) {
+        SubMeshData[] subMeshes = (SubMeshData[])model.Mesh.SubMeshes.Clone();
+        DecodedMaterial[] materials = model.SubMeshMaterials ?? [];
+
+        if (!TryGetProjectRoot(context, out var projectRoot)) {
+            Debugging.LogWarning($"'{context.AssetPath}': cannot determine project root; materials skipped.");
+            return model.Mesh;
+        }
+
+        var modelDirAbsolute = Path.GetDirectoryName(context.SourceAbsolutePath)!;
+        var modelStem = Path.GetFileNameWithoutExtension(context.AssetPath);
+        var materialsDirAbsolute = Path.Combine(modelDirAbsolute, $"{modelStem}_Materials");
+
+        var shaderRef = context.Settings?["shader"]?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(shaderRef))
+            shaderRef = DefaultShaderRef;
+
+        var resolver = new ModelTextureResolver(modelDirAbsolute, projectRoot);
+        var refByMaterial = new Dictionary<DecodedMaterial, string>();
+        var fileNameOwners = new Dictionary<string, DecodedMaterial>(StringComparer.OrdinalIgnoreCase);
+
+        for (var i = 0; i < subMeshes.Length && i < materials.Length; i++) {
+            DecodedMaterial material = materials[i];
+            if (material is null)
+                continue;
+
+            if (!refByMaterial.TryGetValue(material, out var materialRef)) {
+                materialRef = WriteMaterialAsset(
+                    context, material, materialsDirAbsolute, projectRoot, shaderRef, resolver, fileNameOwners);
+                refByMaterial[material] = materialRef;
+            }
+
+            if (materialRef is not null)
+                subMeshes[i] = subMeshes[i].WithMaterialRef(materialRef);
+        }
+
+        return new MeshData(model.Mesh.Vertices, model.Mesh.Indices, model.Mesh.UVs,
+            model.Mesh.Normals, model.Mesh.Tangents, subMeshes);
+    }
+
+    static string WriteMaterialAsset(AssetImportContext context, DecodedMaterial material,
+        string materialsDirAbsolute, string projectRoot, string shaderRef,
+        ModelTextureResolver resolver, Dictionary<string, DecodedMaterial> fileNameOwners) {
+        var definition = new MaterialDefinition { Shader = shaderRef };
+
+        foreach ((TextureType slot, var rawPath) in material.TexturePaths) {
+            var absolute = resolver.Resolve(rawPath);
+            if (absolute is null) {
+                Debugging.LogWarning(
+                    $"'{context.AssetPath}': material '{material.Name}' references missing texture '{rawPath}'.");
+                continue;
+            }
+
+            var textureRef = ToAssetRef(absolute, projectRoot);
+            if (textureRef is null) {
+                Debugging.LogWarning(
+                    $"'{context.AssetPath}': texture '{absolute}' is outside the project; copy it under Assets.");
+                continue;
+            }
+
+            if (!TextureImporter.SupportsExtension(Path.GetExtension(absolute).ToLowerInvariant())) {
+                Debugging.LogWarning(
+                    $"'{context.AssetPath}': texture '{textureRef}' has an unsupported format; slot {slot} skipped.");
+                continue;
+            }
+
+            EnsureTextureMeta(absolute, slot);
+            definition.Textures[slot.ToString()] = textureRef;
+        }
+
+        try {
+            Directory.CreateDirectory(materialsDirAbsolute);
+
+            var fileName = UniqueFileName(SanitizeFileName(material.Name), material, fileNameOwners);
+            var materialAbsolute = Path.Combine(materialsDirAbsolute, fileName + ".mat");
+            PipelineJson.Write(materialAbsolute, definition);
+
+            return ToAssetRef(materialAbsolute, projectRoot);
+        }
+        catch (Exception exception) {
+            Debugging.LogWarning(
+                $"'{context.AssetPath}': failed to write material '{material.Name}': {exception.Message}");
+            return null;
+        }
+    }
+
+    // Creates the texture's .meta with the slot-derived type, or corrects an existing meta whose
+    // type disagrees with how the model binds the texture (the GUID is preserved).
+    static void EnsureTextureMeta(string textureAbsolute, TextureType slot) {
+        var metaPath = MetaFile.PathFor(textureAbsolute);
+        try {
+            if (!File.Exists(metaPath)) {
+                new MetaFile {
+                    Guid = Guid.NewGuid(),
+                    Importer = "TextureImporter",
+                    Settings = new JsonObject { ["textureType"] = slot.ToString() },
+                }.Save(metaPath);
+                return;
+            }
+
+            MetaFile meta = MetaFile.Load(metaPath);
+            var current = meta.Settings?["textureType"]?.GetValue<string>();
+            if (string.Equals(current, slot.ToString(), StringComparison.OrdinalIgnoreCase))
+                return;
+
+            meta.Settings ??= new JsonObject();
+            meta.Settings["textureType"] = slot.ToString();
+            meta.Save(metaPath);
+        }
+        catch (Exception exception) {
+            Debugging.LogWarning($"Could not update meta for '{textureAbsolute}': {exception.Message}");
+        }
+    }
+
+    // ---- Path helpers -------------------------------------------------------
+
+    // SourceAbsolutePath always ends with AssetPath (same length, separators aside).
+    static bool TryGetProjectRoot(AssetImportContext context, out string projectRoot) {
+        projectRoot = null;
+        var source = context.SourceAbsolutePath;
+        var assetPath = context.AssetPath;
+        if (source is null || assetPath is null || source.Length <= assetPath.Length)
+            return false;
+
+        projectRoot = source[..^assetPath.Length].TrimEnd('\\', '/');
+        return projectRoot.Length > 0;
+    }
+
+    static string ToAssetRef(string absolutePath, string projectRoot) {
+        var relative = Path.GetRelativePath(projectRoot, Path.GetFullPath(absolutePath))
+            .Replace(Path.DirectorySeparatorChar, '/');
+        return relative.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase) ? relative : null;
+    }
+
+    static string SanitizeFileName(string name) {
+        if (string.IsNullOrWhiteSpace(name))
+            return "Material";
+
+        char[] invalid = Path.GetInvalidFileNameChars();
+        var sanitized = new string(name.Select(c => invalid.Contains(c) ? '_' : c).ToArray()).Trim();
+        return sanitized.Length > 0 ? sanitized : "Material";
+    }
+
+    // Distinct source materials that sanitize to the same file name get a numeric suffix.
+    static string UniqueFileName(string baseName, DecodedMaterial material,
+        Dictionary<string, DecodedMaterial> owners) {
+        var candidate = baseName;
+        var n = 2;
+        while (owners.TryGetValue(candidate, out DecodedMaterial owner) && !ReferenceEquals(owner, material))
+            candidate = $"{baseName}_{n++}";
+
+        owners[candidate] = material;
+        return candidate;
+    }
+}
+
+// Resolves the raw texture paths a model file reports (absolute authoring-machine paths,
+// relative paths, or bare filenames) to actual files near the model. Falls back to a lazily
+// built filename index of the model's directory tree, then its parent's.
+sealed class ModelTextureResolver {
+    readonly string modelDir;
+    readonly string projectRoot;
+    readonly Dictionary<string, string> cache = new(StringComparer.OrdinalIgnoreCase);
+    Dictionary<string, string> fileIndex; // filename -> absolute path (first hit wins)
+
+    public ModelTextureResolver(string modelDir, string projectRoot) {
+        this.modelDir = modelDir;
+        this.projectRoot = projectRoot;
+    }
+
+    public string Resolve(string rawPath) {
+        if (string.IsNullOrWhiteSpace(rawPath))
+            return null;
+
+        if (cache.TryGetValue(rawPath, out var cached))
+            return cached;
+
+        var resolved = ResolveUncached(rawPath.Replace('\\', Path.DirectorySeparatorChar)
+            .Replace('/', Path.DirectorySeparatorChar));
+        cache[rawPath] = resolved;
+        return resolved;
+    }
+
+    string ResolveUncached(string raw) {
+        var fileName = Path.GetFileName(raw);
+
+        string[] candidates = [
+            Path.Combine(modelDir, raw),
+            Path.IsPathRooted(raw) ? raw : null,
+            Path.Combine(modelDir, fileName),
+            Path.Combine(modelDir, "Textures", fileName),
+            Path.Combine(modelDir, "textures", fileName),
+        ];
+
+        foreach (var candidate in candidates) {
+            if (candidate is not null && File.Exists(candidate))
+                return Path.GetFullPath(candidate);
+        }
+
+        BuildFileIndex();
+        return fileIndex.GetValueOrDefault(fileName);
+    }
+
+    void BuildFileIndex() {
+        if (fileIndex is not null)
+            return;
+
+        fileIndex = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        IndexTree(modelDir);
+
+        // Models often live in a sibling folder of their textures ("Models/" + "Textures/");
+        // index the parent too, but never escape the project.
+        var parent = Path.GetDirectoryName(modelDir);
+        if (parent is not null && parent.StartsWith(projectRoot, StringComparison.OrdinalIgnoreCase))
+            IndexTree(parent);
+    }
+
+    void IndexTree(string root) {
+        try {
+            foreach (var file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+                fileIndex.TryAdd(Path.GetFileName(file), file);
+        }
+        catch (Exception exception) {
+            Debugging.LogWarning($"Texture search under '{root}' failed: {exception.Message}");
+        }
     }
 }

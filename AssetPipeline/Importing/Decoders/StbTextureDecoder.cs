@@ -4,13 +4,17 @@ using StbImageSharp;
 namespace BallisticEngine.AssetPipeline;
 
 // The only place in the engine that talks to StbImageSharp.
-// LDR formats (png/jpg/...) decode to RGBA8; .hdr decodes to RGBA32F; .exr goes through SharpEXR.
+// LDR formats (png/jpg/...) decode to RGBA8; .hdr decodes to RGBA32F; .exr goes through SharpEXR;
+// .dds goes through the engine's own DdsDecoder (stb has no DDS support).
 public static class StbTextureDecoder {
     public static TextureData Decode(string path) {
         var extension = Path.GetExtension(path).ToLowerInvariant();
 
         if (extension == ".exr")
             return ExrDecoder.Decode(path);
+
+        if (extension == ".dds")
+            return DdsDecoder.Decode(path);
 
         using FileStream stream = File.OpenRead(path);
 

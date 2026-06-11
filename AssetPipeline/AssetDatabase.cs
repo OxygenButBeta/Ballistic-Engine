@@ -117,12 +117,12 @@ public static class AssetDatabase {
 
         // An image asset requested as a cubemap (Texture3D) is treated as an equirect
         // panorama — lets a .hdr/.exr drop straight into a Skybox slot.
-        var isImage = extension is ".png" or ".jpg" or ".jpeg" or ".tga" or ".bmp" or ".hdr" or ".exr";
+        var isImage = extension is ".png" or ".jpg" or ".jpeg" or ".tga" or ".bmp" or ".hdr" or ".exr" or ".dds";
         if (isImage && typeof(Texture3D).IsAssignableFrom(requestedType))
             return EquirectCubemapLoader.Load(pipeline, guid, assetPath);
 
         return extension switch {
-            ".fbx" or ".obj" => MeshLoader.Load(pipeline, guid, assetPath),
+            ".fbx" or ".obj" or ".gltf" or ".glb" or ".dae" => MeshLoader.Load(pipeline, guid, assetPath),
             _ when isImage => TextureLoader.Load(pipeline, guid, assetPath),
             ".shader" => ShaderProgramLoader.Load(Project, assetPath),
             ".mat" => MaterialLoader.Load(Project, assetPath),

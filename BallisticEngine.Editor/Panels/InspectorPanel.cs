@@ -26,8 +26,15 @@ internal sealed class InspectorPanel {
     public InspectorPanel(EditorState state) => this.state = state;
 
     public void DrawContents() {
+        // Denser rows than the global style so more fits on screen.
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new SysVec2(8, 4));
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new SysVec2(8, 4));
+
         if (state.HasAssetSelection) {
             DrawAssetInspector();
+        }
+        else if (state.SelectedSceneBehaviour is not null) {
+            DrawSceneBehaviourInspector(state.SelectedSceneBehaviour);
         }
         else if (state.Selected is not null) {
             DrawEntityInspector(state.Selected);
@@ -42,6 +49,43 @@ internal sealed class InspectorPanel {
             ImGui.OpenPopup("##assetpicker");
         }
         DrawAssetPickerPopup();
+
+        ImGui.PopStyleVar(2);
+    }
+
+    // ---- Scene behaviour inspector --------------------------------------------
+
+    void DrawSceneBehaviourInspector(SceneBehaviour behaviour) {
+        Type type = behaviour.GetType();
+        ImGui.Text(type.Name);
+        ImGui.TextDisabled("Scene component");
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        ImGui.PushID(behaviour.InstanceId.GetHashCode());
+
+        if (BeginGrid("##sbmembers")) {
+            bool enabled = behaviour.IsEnabled;
+            Row("Enabled");
+            if (ImGui.Checkbox("##enabled", ref enabled)) { }
+            if (ImGui.IsItemActivated()) EditorUndo.Push();
+            if (enabled != behaviour.IsEnabled) behaviour.IsEnabled = enabled;
+
+            foreach (MemberInfo member in ComponentReflection.SerializableMembers(type))
+                DrawMember(member, behaviour);
+
+            ImGui.EndTable();
+        }
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        if (ImGui.Button("Remove", new SysVec2(-1, 0))) {
+            EditorUndo.Push();
+            SceneManager.GetCurrentScene().RemoveSceneBehaviour(behaviour);
+            state.SelectSceneBehaviour(null);
+        }
+
+        ImGui.PopID();
     }
 
     // ---- Entity inspector ----------------------------------------------------
@@ -115,6 +159,9 @@ internal sealed class InspectorPanel {
 
                 foreach (MemberInfo member in ComponentReflection.SerializableMembers(type))
                     DrawMember(member, behaviour);
+
+                if (behaviour is Renderer renderer)
+                    DrawSubMeshMaterials(renderer);
 
                 ImGui.EndTable();
             }
@@ -191,6 +238,36 @@ internal sealed class InspectorPanel {
         }
 
         ImGui.PopID();
+    }
+
+    // Multi-material meshes resolve their materials from refs baked into the mesh at import;
+    // list them read-only so an empty SharedMaterial slot isn't mistaken for "no materials".
+    // (SharedMaterial only overrides slots that have no baked ref.)
+    static void DrawSubMeshMaterials(Renderer renderer) {
+        Mesh mesh = renderer.SharedMesh;
+        if (mesh?.SubMeshes is not { Length: > 1 } subMeshes)
+            return;
+
+        for (var i = 0; i < subMeshes.Length; i++) {
+            Row(i == 0 ? $"Materials ({subMeshes.Length})" : "");
+
+            SubMeshData sub = subMeshes[i];
+            var label = string.IsNullOrEmpty(sub.Name) ? $"Submesh {i}" : sub.Name;
+            Material material = renderer.MaterialFor(i);
+
+            if (material is null) {
+                ImGui.TextDisabled($"{label} — none");
+                continue;
+            }
+
+            var reference = sub.MaterialRef;
+            if (reference is null && AssetDatabase.TryGetAssetGuid(material, out Guid guid))
+                reference = AssetDatabase.GuidToAssetPath(guid);
+
+            ImGui.TextUnformatted(Path.GetFileNameWithoutExtension(reference ?? label));
+            if (reference is not null && ImGui.IsItemHovered())
+                ImGui.SetTooltip($"{label}\n{reference}");
+        }
     }
 
     // Asset slot. Assigned: clicking the name PINS the asset in the Inspector (shows its
@@ -390,7 +467,7 @@ internal sealed class InspectorPanel {
         if (BeginGrid("##matslots")) {
             foreach (TextureType slot in new[] {
                          TextureType.Diffuse, TextureType.Normal, TextureType.Metallic,
-                         TextureType.Roughness, TextureType.AO,
+                         TextureType.Roughness, TextureType.AO, TextureType.Emissive,
                      }) {
                 definition.Textures.TryGetValue(slot.ToString(), out var reference);
                 var display = reference is null
@@ -406,6 +483,40 @@ internal sealed class InspectorPanel {
                 }
                 ImGui.PopID();
             }
+
+            // Scalar material properties (stored in the .mat next to the texture refs).
+            Row("Transparent");
+            var transparent = definition.Transparent;
+            if (ImGui.Checkbox("##mattransparent", ref transparent)) {
+                definition.Transparent = transparent;
+                changed = true;
+            }
+
+            if (definition.Transparent) {
+                Row("Opacity");
+                var opacity = definition.Opacity;
+                if (ImGui.SliderFloat("##matopacity", ref opacity, 0f, 1f)) {
+                    definition.Opacity = opacity;
+                    changed = true;
+                }
+            }
+
+            Row("Emissive Color");
+            var emissive = definition.EmissiveColor is { Length: >= 3 } c
+                ? new System.Numerics.Vector3(c[0], c[1], c[2])
+                : System.Numerics.Vector3.One;
+            if (ImGui.ColorEdit3("##matemissivecolor", ref emissive)) {
+                definition.EmissiveColor = [emissive.X, emissive.Y, emissive.Z];
+                changed = true;
+            }
+
+            Row("Emissive Intensity");
+            var emissiveIntensity = definition.EmissiveIntensity;
+            if (ImGui.DragFloat("##matemissiveintensity", ref emissiveIntensity, 0.05f, 0f, 100f)) {
+                definition.EmissiveIntensity = emissiveIntensity;
+                changed = true;
+            }
+
             ImGui.EndTable();
         }
 
@@ -428,9 +539,11 @@ internal sealed class InspectorPanel {
 
         material.Diffuse = LoadSlot(definition, TextureType.Diffuse) ?? material.Diffuse;
         material.Normal = LoadSlot(definition, TextureType.Normal);
-        material.Specular = LoadSlot(definition, TextureType.Metallic); // legacy naming: Specular holds the metallic map
+        material.Metallic = LoadSlot(definition, TextureType.Metallic);
         material.Roughness = LoadSlot(definition, TextureType.Roughness);
         material.AO = LoadSlot(definition, TextureType.AO);
+        material.Emissive = LoadSlot(definition, TextureType.Emissive);
+        MaterialLoader.ApplyScalars(material, definition);
     }
 
     static Texture2D LoadSlot(MaterialDefinition definition, TextureType slot) =>

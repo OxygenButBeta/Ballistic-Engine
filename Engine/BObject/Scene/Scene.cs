@@ -8,7 +8,38 @@ public class Scene : BObject
     // Allocating a capacity of 200 entities for the scene. to ensure efficient memory usage.
     readonly List<Entity> entities = new(capacity: 200);
 
+    // Scene-wide components (skybox, fog, ...). They live on the scene, not on entities,
+    // and appear in the editor's "Scene" hierarchy.
+    readonly List<SceneBehaviour> sceneBehaviours = new();
+
     public IReadOnlyList<Entity> Entities => entities;
+    public IReadOnlyList<SceneBehaviour> SceneBehaviours => sceneBehaviours;
+
+    public T AddSceneBehaviour<T>() where T : SceneBehaviour, new() =>
+        (T)AddSceneBehaviour(typeof(T));
+
+    public SceneBehaviour AddSceneBehaviour(Type type) {
+        if (!typeof(SceneBehaviour).IsAssignableFrom(type))
+            throw new ArgumentException($"{type.Name} is not a SceneBehaviour.", nameof(type));
+
+        var behaviour = (SceneBehaviour)Activator.CreateInstance(type);
+        sceneBehaviours.Add(behaviour);
+        behaviour.OnAttach();
+        return behaviour;
+    }
+
+    public void RemoveSceneBehaviour(SceneBehaviour behaviour) {
+        if (behaviour is null || !sceneBehaviours.Remove(behaviour))
+            return;
+        behaviour.OnDetach();
+    }
+
+    public T GetSceneBehaviour<T>() where T : SceneBehaviour {
+        foreach (SceneBehaviour behaviour in sceneBehaviours)
+            if (behaviour is T t)
+                return t;
+        return null;
+    }
 
     public void RegisterEntity(Entity entity)
     {
@@ -49,6 +80,10 @@ public class Scene : BObject
         foreach (Entity entity in entities)
             entity.DetachAll();
         entities.Clear();
+
+        foreach (SceneBehaviour behaviour in sceneBehaviours)
+            behaviour.OnDetach();
+        sceneBehaviours.Clear();
     }
 
     // Run OnBegin/OnEnabled across the whole scene (entering play mode).

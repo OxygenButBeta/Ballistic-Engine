@@ -18,6 +18,10 @@ public static class SceneSerializer {
     public static string Serialize(Scene scene) {
         var doc = new SceneDocument { Name = scene.Name };
 
+        foreach (SceneBehaviour behaviour in scene.SceneBehaviours)
+            doc.SceneComponents.Add(
+                BuildComponentDocument(ComponentRegistry.SceneNameOf(behaviour), behaviour.IsEnabled, behaviour));
+
         // Stable file-local ids from the real InstanceIds (for parent wiring).
         foreach (Entity entity in scene.Entities) {
             doc.Entities.Add(BuildEntityDocument(entity));
@@ -50,14 +54,17 @@ public static class SceneSerializer {
         return doc;
     }
 
-    static ComponentDocument BuildComponentDocument(Behaviour behaviour) {
+    static ComponentDocument BuildComponentDocument(Behaviour behaviour) =>
+        BuildComponentDocument(ComponentRegistry.NameOf(behaviour), behaviour.IsEnabled, behaviour);
+
+    static ComponentDocument BuildComponentDocument(string typeName, bool enabled, object target) {
         var doc = new ComponentDocument {
-            Type = ComponentRegistry.NameOf(behaviour),
-            Enabled = behaviour.IsEnabled,
+            Type = typeName,
+            Enabled = enabled,
         };
 
-        foreach (MemberInfo member in SerializableMembers(behaviour.GetType())) {
-            object value = GetMemberValue(member, behaviour);
+        foreach (MemberInfo member in SerializableMembers(target.GetType())) {
+            object value = GetMemberValue(member, target);
             object serialized = SerializeValue(value);
             if (serialized is not null)
                 doc.Members[CamelCase(member.Name)] = serialized;
@@ -89,8 +96,22 @@ public static class SceneSerializer {
         if (doc?.Entities is null)
             return;
 
+        Scene scene = SceneManager.GetCurrentScene();
         if (!string.IsNullOrEmpty(doc.Name))
-            SceneManager.GetCurrentScene().Name = doc.Name;
+            scene.Name = doc.Name;
+
+        // Scene-wide components first (skybox etc.).
+        foreach (ComponentDocument componentDoc in doc.SceneComponents ?? []) {
+            Type type = ComponentRegistry.ResolveScene(componentDoc.Type);
+            if (type is null) {
+                Debugging.LogWarning($"Unknown scene component '{componentDoc.Type}'; skipped.");
+                continue;
+            }
+
+            SceneBehaviour behaviour = scene.AddSceneBehaviour(type);
+            behaviour.IsEnabled = componentDoc.Enabled;
+            ApplyMembers(behaviour, type, componentDoc.Members);
+        }
 
         // id (file-local) -> live entity, for parent resolution in a second pass.
         var byId = new Dictionary<string, Entity>(StringComparer.Ordinal);
@@ -136,21 +157,24 @@ public static class SceneSerializer {
 
         Behaviour behaviour = entity.AddComponent(type);
         behaviour.IsEnabled = doc.Enabled;
+        ApplyMembers(behaviour, type, doc.Members);
+    }
 
-        if (doc.Members is null)
+    static void ApplyMembers(object target, Type type, Dictionary<string, object> members) {
+        if (members is null)
             return;
 
         var membersByName = SerializableMembers(type)
             .ToDictionary(m => CamelCase(m.Name), StringComparer.OrdinalIgnoreCase);
 
-        foreach ((string name, object raw) in doc.Members) {
+        foreach ((string name, object raw) in members) {
             if (!membersByName.TryGetValue(name, out MemberInfo member))
                 continue;
 
             Type memberType = MemberType(member);
             object value = DeserializeValue(raw, memberType);
             if (value is not null)
-                SetMemberValue(member, behaviour, value);
+                SetMemberValue(member, target, value);
         }
     }
 

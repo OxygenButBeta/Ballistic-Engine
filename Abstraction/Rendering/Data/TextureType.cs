@@ -8,5 +8,6 @@ public enum TextureType {
     Metallic = 2,
     Roughness = 3,
     AO = 4,
+    Emissive = 5,
     SkyBox = 11,
 }

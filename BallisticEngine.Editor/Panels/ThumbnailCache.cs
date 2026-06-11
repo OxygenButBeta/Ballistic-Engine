@@ -4,23 +4,27 @@ using OpenTK.Graphics.OpenGL4;
 
 namespace BallisticEngine.Editor;
 
-// Lazy thumbnail loader for the asset browser. Image assets get a 64x64 GL texture built
-// from their Library artifact — at most one per frame so the UI never hitches. HDR sources
-// are tone-mapped (Reinhard) for display.
+// Lazy thumbnail provider for the asset browser: images downscale their Library artifact,
+// meshes render a small preview (MeshPreviewRenderer). At most one thumbnail is generated per
+// frame so the UI never hitches, and results persist in Library/Thumbnails/<guid>.thumb so
+// they are NOT regenerated every session — only when the source artifact is newer.
 internal sealed class ThumbnailCache {
     const int Size = 64;
+    const uint Magic = 0x31485442; // "BTH1"
+
+    static readonly string[] MeshExtensions = [".fbx", ".obj", ".gltf", ".glb", ".dae"];
 
     readonly Dictionary<Guid, int> ready = new();
-    readonly Queue<Guid> pending = new();
+    readonly Queue<(Guid guid, string assetPath)> pending = new();
     readonly HashSet<Guid> queued = new();
 
-    // Returns the GL texture id, or 0 while the thumbnail is still loading.
-    public int Get(Guid guid) {
+    // Returns the GL texture id, or 0 while the thumbnail is still loading (or failed).
+    public int Get(Guid guid, string assetPath) {
         if (ready.TryGetValue(guid, out var texture))
             return texture;
 
         if (queued.Add(guid))
-            pending.Enqueue(guid);
+            pending.Enqueue((guid, assetPath));
         return 0;
     }
 
@@ -29,15 +33,18 @@ internal sealed class ThumbnailCache {
         if (pending.Count == 0)
             return;
 
-        Guid guid = pending.Dequeue();
+        (Guid guid, string assetPath) = pending.Dequeue();
         try {
-            ready[guid] = Build(guid);
+            ready[guid] = Load(guid, assetPath);
         }
-        catch {
-            ready[guid] = 0; // unreadable: never retry, tile falls back to the colored box
+        catch (Exception exception) {
+            ready[guid] = 0; // never retried this session; tile falls back to the colored box
+            Debugging.LogWarning($"Thumbnail failed for '{assetPath}': {exception.Message}");
         }
     }
 
+    // Drops the GL textures and re-queues; the DISK cache stays (staleness is mtime-based,
+    // so reimported assets regenerate and unchanged ones reload instantly).
     public void InvalidateAll() {
         foreach (var texture in ready.Values.Where(t => t != 0))
             GL.DeleteTexture(texture);
@@ -46,13 +53,68 @@ internal sealed class ThumbnailCache {
         pending.Clear();
     }
 
-    static int Build(Guid guid) {
+    static string ThumbnailDirectory => Path.Combine(AssetDatabase.Project.LibraryPath, "Thumbnails");
+
+    int Load(Guid guid, string assetPath) {
         if (!AssetDatabase.TryGetArtifactPath(guid, out var artifactPath))
             return 0;
 
-        TextureData data = TextureArtifact.Read(artifactPath);
-        var pixels = Downscale(in data);
+        var thumbPath = Path.Combine(ThumbnailDirectory, $"{guid:N}.thumb");
 
+        byte[] pixels = null;
+        if (File.Exists(thumbPath) &&
+            File.GetLastWriteTimeUtc(thumbPath) >= File.GetLastWriteTimeUtc(artifactPath))
+            pixels = ReadThumbFile(thumbPath);
+
+        if (pixels is null) {
+            pixels = Generate(assetPath, artifactPath);
+            if (pixels is null)
+                return 0;
+            WriteThumbFile(thumbPath, pixels);
+        }
+
+        return UploadTexture(pixels);
+    }
+
+    static byte[] Generate(string assetPath, string artifactPath) {
+        var extension = Path.GetExtension(assetPath).ToLowerInvariant();
+
+        if (MeshExtensions.Contains(extension)) {
+            MeshData mesh = MeshArtifact.Read(artifactPath);
+            return mesh.IsValid ? MeshPreviewRenderer.Render(in mesh, Size) : null;
+        }
+
+        TextureData data = TextureArtifact.Read(artifactPath);
+        return Downscale(in data);
+    }
+
+    // ---- Disk format: magic | u16 size | raw RGBA --------------------------------
+
+    static byte[] ReadThumbFile(string path) {
+        try {
+            using FileStream stream = File.OpenRead(path);
+            using BinaryReader reader = new(stream);
+            if (reader.ReadUInt32() != Magic || reader.ReadUInt16() != Size)
+                return null; // format changed: regenerate
+            var pixels = new byte[Size * Size * 4];
+            stream.ReadExactly(pixels);
+            return pixels;
+        }
+        catch {
+            return null;
+        }
+    }
+
+    static void WriteThumbFile(string path, byte[] pixels) {
+        Directory.CreateDirectory(ThumbnailDirectory);
+        using FileStream stream = File.Create(path);
+        using BinaryWriter writer = new(stream);
+        writer.Write(Magic);
+        writer.Write((ushort)Size);
+        writer.Write(pixels);
+    }
+
+    static int UploadTexture(byte[] pixels) {
         int texture = GL.GenTexture();
         GL.ActiveTexture(TextureUnit.Texture0);
         GL.BindTexture(TextureTarget.Texture2D, texture);

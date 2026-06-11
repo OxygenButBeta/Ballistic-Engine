@@ -87,12 +87,21 @@ internal sealed class AssetBrowserPanel {
         ImGui.InputTextWithHint("##filter", "Search...", ref filter, 128);
     }
 
+    float tileScale = 1f;
+    bool gridHovered;
+
     void DrawGrid(List<string> folders, List<(string path, Guid guid)> files, float s) {
-        float tile = 86 * s;
+        // Ctrl+scroll over the grid resizes the tiles (uses last frame's hover state).
+        ImGuiIOPtr io = ImGui.GetIO();
+        if (gridHovered && io.KeyCtrl && io.MouseWheel != 0)
+            tileScale = Math.Clamp(tileScale + io.MouseWheel * 0.12f, 0.55f, 2.4f);
+
+        float tile = 86 * s * tileScale;
         float cellW = tile + ImGui.GetStyle().ItemSpacing.X;
         var columns = Math.Max(1, (int)(ImGui.GetContentRegionAvail().X / cellW));
 
         ImGui.BeginChild("##grid");
+        gridHovered = ImGui.IsWindowHovered(ImGuiHoveredFlags.AllowWhenBlockedByActiveItem);
         var column = 0;
 
         foreach (var folder in folders) {
@@ -224,9 +233,11 @@ internal sealed class AssetBrowserPanel {
         ImGui.BeginGroup();
         ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 6f);
 
-        // Image assets render their thumbnail; everything else gets a colored tile with a tag.
+        // Images and meshes render a real preview; everything else gets a colored tile + tag.
         bool clicked;
-        var thumb = ImageExtensions.Contains(ext) ? thumbnails.Get(guid) : 0;
+        var hasPreview = ImageExtensions.Contains(ext) ||
+                         ext is ".fbx" or ".obj" or ".gltf" or ".glb" or ".dae";
+        var thumb = hasPreview ? thumbnails.Get(guid, path) : 0;
         if (thumb != 0) {
             clicked = ImGui.ImageButton($"##thumb{guid}", thumb,
                 new SysVec2(tile - 8, tile - 8), new SysVec2(0, 0), new SysVec2(1, 1));
@@ -285,11 +296,19 @@ internal sealed class AssetBrowserPanel {
     }
 
     static void TileLabel(string name, float tile) {
-        // Trim the label to the tile width.
-        var label = name;
-        while (label.Length > 4 && ImGui.CalcTextSize(label).X > tile)
-            label = label[..^4] + "...";
-        ImGui.TextUnformatted(label);
+        // Hard-clipped to the tile width via the draw list (text can never spill into the
+        // neighboring cell); short names are centered.
+        SysVec2 pos = ImGui.GetCursorScreenPos();
+        float height = ImGui.GetTextLineHeight();
+        SysVec2 textSize = ImGui.CalcTextSize(name);
+        float x = textSize.X < tile ? pos.X + (tile - textSize.X) * 0.5f : pos.X;
+
+        ImDrawListPtr draw = ImGui.GetWindowDrawList();
+        draw.PushClipRect(pos, new SysVec2(pos.X + tile, pos.Y + height), true);
+        draw.AddText(new SysVec2(x, pos.Y), ImGui.GetColorU32(ImGuiCol.Text), name);
+        draw.PopClipRect();
+
+        ImGui.Dummy(new SysVec2(tile, height)); // reserve exactly the tile's width
     }
 
     // A simple folder glyph drawn over the tile button (tab + body).
@@ -315,7 +334,7 @@ internal sealed class AssetBrowserPanel {
         ".mat" => ("MAT", new SysVec4(0.28f, 0.18f, 0.30f, 1f)),
         ".scene" => ("SCN", new SysVec4(0.33f, 0.21f, 0.13f, 1f)),
         ".pyscene" => ("PYS", new SysVec4(0.27f, 0.17f, 0.11f, 1f)),
-        ".shader" or ".glsl" => ("SHD", new SysVec4(0.13f, 0.28f, 0.30f, 1f)),
+        ".shader" or ".glsl" => ("</>", new SysVec4(0.13f, 0.28f, 0.30f, 1f)),
         ".cubemap" => ("SKY", new SysVec4(0.18f, 0.26f, 0.33f, 1f)),
         _ => ("FILE", new SysVec4(0.22f, 0.22f, 0.22f, 1f)),
     };

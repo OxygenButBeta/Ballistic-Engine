@@ -87,9 +87,11 @@ public static class FalcorSceneParser {
     }
 
     static void ParseModels(string source, FalcorSceneData data) {
-        // sceneBuilder.importGLTF("path"), .importOBJ("path"), import("path"), addModel("path")
+        // sceneBuilder.importScene("path") (Falcor 4.x+, e.g. ORCA scenes like Bistro),
+        // .importGLTF("path"), .importOBJ("path"), import("path"), addModel("path").
+        // Longer alternatives must precede "import" or "importScene(" never matches.
         foreach (Match m in Regex.Matches(source,
-                     @"(?:importGLTF|importOBJ|import|addModel|loadMesh)\s*\(\s*[""']([^""']+)[""']",
+                     @"(?:importScene|importGLTF|importOBJ|addModel|loadMesh|import)\s*\(\s*[""']([^""']+)[""']",
                      RegexOptions.IgnoreCase)) {
             var path = m.Groups[1].Value.Trim();
             if (path.Length > 0 && !data.ModelPaths.Contains(path))

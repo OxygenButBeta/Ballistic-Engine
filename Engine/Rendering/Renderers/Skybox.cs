@@ -1,9 +1,9 @@
 namespace BallisticEngine;
 
-// Scene-driven skybox: add this component to an entity and assign a cubemap asset (.cubemap).
-// The renderer draws the active skybox's cubemap; no skybox component (or no cubemap) means
-// no sky is drawn and default ambient lighting is used. Replaces the old project.json default.
-public class Skybox : Behaviour {
+// Scene-wide skybox: lives in the scene's SceneBehaviour list (the editor's "Scene" hierarchy),
+// not on an entity. Assign a cubemap asset (or an equirect .hdr/.exr); the renderer draws the
+// active skybox's cubemap. No skybox (or no cubemap) = no sky, default ambient lighting.
+public class Skybox : SceneBehaviour {
     public static Skybox Active { get; private set; }
 
     public Texture3D Cubemap { get; set; }

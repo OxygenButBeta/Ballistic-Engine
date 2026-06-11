@@ -1,4 +1,4 @@
-﻿using OpenTK.Mathematics;
+using OpenTK.Mathematics;
 using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine;
@@ -9,25 +9,22 @@ public readonly struct LightUniforms {
     public readonly Vector3 Direction;   // toward the light (-forward)
     public readonly Vector3 Color;       // intensity * color
     public readonly float AmbientIntensity;
-    public readonly Matrix4 LightSpaceMatrix;
 
-    public LightUniforms(Vector3 direction, Vector3 color, float ambientIntensity, Matrix4 lightSpaceMatrix) {
+    public LightUniforms(Vector3 direction, Vector3 color, float ambientIntensity) {
         Direction = direction;
         Color = color;
         AmbientIntensity = ambientIntensity;
-        LightSpaceMatrix = lightSpaceMatrix;
     }
 
     public static LightUniforms Resolve() {
         DirectionalLight light = DirectionalLight.Instance;
         if (light is null)
-            return new LightUniforms(Vector3.UnitY, new Vector3(1f, 0.95f, 0.85f) * 3f, 0.3f, Matrix4.Identity);
+            return new LightUniforms(Vector3.UnitY, new Vector3(1f, 0.95f, 0.85f) * 3f, 0.3f);
 
         return new LightUniforms(
             -light.transform.Forward,
             light.LightIntensity * light.LightColor,
-            light.ambientIntensity,
-            light.GetLightSpaceMatrix());
+            light.ambientIntensity);
     }
 }
 
@@ -39,20 +36,24 @@ public class DirectionalLight : Behaviour
     public float ambientIntensity = .3f;
     public Vector3 LightColor => _lightColor * LightIntensity;
     readonly Vector3 _lightColor = new(1.0f, 0.95f, 0.85f);
-   public float LightIntensity = 5f;
+    public float LightIntensity = 5f;
 
-   public Matrix4 GetLightSpaceMatrix() {
-       Vector3 lightDir = transform.Forward.Normalized();
-       Vector3 lightPos = transform.Position - lightDir * 1;
+    // How far from the camera the directional shadow map reaches (world units).
+    public float ShadowDistance = 60f;
+    public float ShadowBias = 0.0015f;
 
-       Vector3 target = Vector3.Zero;
-       Vector3 up = transform.Up;
+    // Register on attach so edit mode is lit/shadowed by the scene light too, not just play mode.
+    protected internal override void OnAttach()
+    {
+        Instance = this;
+    }
 
-       Matrix4 lightView = Matrix4.LookAt(lightPos, target, up);
-       Matrix4 lightProjection = Matrix4.CreateOrthographic(1, 1, 0.1f, 100f);
+    protected internal override void OnDetach()
+    {
+        if (ReferenceEquals(Instance, this))
+            Instance = null;
+    }
 
-       return lightProjection * lightView;
-   }
     protected internal override void OnBegin()
     {
         Instance = this;
@@ -94,6 +95,4 @@ public class DirectionalLight : Behaviour
 
         transform.EulerAngles = angles;
     }
-
-
 }

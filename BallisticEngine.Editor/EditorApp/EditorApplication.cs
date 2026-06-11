@@ -27,7 +27,18 @@ internal sealed class EditorApplication {
     readonly InspectorPanel inspector;
     readonly AssetBrowserPanel assets;
     readonly ConsolePanel console = new();
+    readonly StatsPanel stats = new();
     readonly TransformGizmo gizmo = new();
+
+    bool showStats;
+    bool alwaysRefresh = true;   // off = re-render the scene only when something changes
+    int forceFrames = 3;
+    float editorCpuMs;
+    readonly System.Diagnostics.Stopwatch frameWatch = new();
+
+    // UI-only until the renderer rework lands: the renderer will expose view modes.
+    int shadingMode;
+    static readonly string[] ShadingModes = ["Lit", "Unlit", "Wireframe", "Normals"];
 
     HDRenderer Renderer => RenderAsset.Current.Renderer;
     float S => imgui.Scale;
@@ -64,6 +75,7 @@ internal sealed class EditorApplication {
         imgui.WindowResized(window.Width, window.Height);
 
         runtime.Window.SetFrequency(0);
+        window.VSync = OpenTK.Windowing.Common.VSyncMode.On; // editor doesn't need uncapped fps
         runtime.WindowUpdateCallback += OnUpdate;
         runtime.WindowRenderCallback += OnRender;
     }
@@ -81,22 +93,37 @@ internal sealed class EditorApplication {
     }
 
     void OnRender(double delta) {
+        frameWatch.Restart();
+
         // Build the UI FIRST (the gizmo mutates transforms there), then render the scene with
         // this frame's values — otherwise the object trails the gizmo by one frame.
         imgui.Update((float)delta);
         BuildUI();
 
-        if (sceneTabActive)
-            RenderSceneView();
-        else
-            RenderGameView();
+        // "Always refresh" off: re-render the scene only while something is changing
+        // (playing, flying, gizmo drag, recent interaction). The last image stays on screen.
+        var renderScene = alwaysRefresh || SceneManager.IsPlaying || editorInput.RightMouseDown ||
+                          gizmo.IsInteracting || forceFrames > 0;
+        if (renderScene) {
+            if (sceneTabActive)
+                RenderSceneView();
+            else
+                RenderGameView();
+            if (forceFrames > 0)
+                forceFrames--;
+        }
 
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
         GL.ClearColor(0.05f, 0.05f, 0.06f, 1f);
         GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
 
         imgui.Render();
+
+        // Exponential moving average so the value is readable.
+        editorCpuMs = editorCpuMs * 0.9f + (float)frameWatch.Elapsed.TotalMilliseconds * 0.1f;
     }
+
+    void MarkSceneDirty() => forceFrames = 3;
 
     void RenderSceneView() {
         var w = Math.Max(1, (int)sceneViewSize.X);
@@ -149,9 +176,14 @@ internal sealed class EditorApplication {
         // Global editor shortcuts.
         ImGuiIOPtr io = ImGui.GetIO();
         if (io.KeyCtrl && !io.WantTextInput) {
-            if (ImGui.IsKeyPressed(ImGuiKey.Z)) EditorUndo.Undo();
-            if (ImGui.IsKeyPressed(ImGuiKey.Y)) EditorUndo.Redo();
+            if (ImGui.IsKeyPressed(ImGuiKey.Z)) { EditorUndo.Undo(); MarkSceneDirty(); }
+            if (ImGui.IsKeyPressed(ImGuiKey.Y)) { EditorUndo.Redo(); MarkSceneDirty(); }
         }
+
+        // Any interaction is a "scene might have changed" signal for the always-refresh-off mode.
+        if (ImGui.IsMouseClicked(ImGuiMouseButton.Left) || ImGui.IsMouseClicked(ImGuiMouseButton.Right) ||
+            ImGui.IsMouseClicked(ImGuiMouseButton.Middle) || io.MouseWheel != 0 || ImGui.IsAnyItemActive())
+            MarkSceneDirty();
 
         SysVec2 display = io.DisplaySize;
         float toolbarH = 44 * S;
@@ -173,6 +205,9 @@ internal sealed class EditorApplication {
             PanelFlags, inspector.DrawContents);
 
         BottomPanel(new SysVec2(0, display.Y - assetsH), new SysVec2(display.X - rightW, assetsH));
+
+        if (showStats)
+            stats.Draw(runtime.Window.FrameRate, editorCpuMs, sceneViewSize, S);
     }
 
     // Assets and Console share the bottom strip as tabs (Unity-style).
@@ -221,6 +256,20 @@ internal sealed class EditorApplication {
         GizmoModeButton("Rotate", GizmoMode.Rotate);
         ImGui.SameLine();
         GizmoModeButton("Scale", GizmoMode.Scale);
+
+        // Shading mode selector — UI only for now; wiring happens when the renderer
+        // rework lands (view modes are renderer-owned).
+        ImGui.SameLine(0, 24 * S);
+        ImGui.SetNextItemWidth(120 * S);
+        ImGui.Combo("##shading", ref shadingMode, ShadingModes, ShadingModes.Length);
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("View mode (applies after the render rework)");
+
+        ImGui.SameLine();
+        ImGui.Checkbox("Always Refresh", ref alwaysRefresh);
+        ImGui.SameLine();
+        if (ImGui.Button(showStats ? "Stats *" : "Stats"))
+            showStats = !showStats;
 
         // Center the Play/Stop control.
         float buttonW = 84 * S;

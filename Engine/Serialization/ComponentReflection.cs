@@ -12,6 +12,7 @@ public static class ComponentReflection {
         declaringType == typeof(BObject) ||
         declaringType == typeof(Component) ||
         declaringType == typeof(Behaviour) ||
+        declaringType == typeof(SceneBehaviour) ||
         declaringType == typeof(Renderer);
 
     public static IEnumerable<MemberInfo> SerializableMembers(Type type) {

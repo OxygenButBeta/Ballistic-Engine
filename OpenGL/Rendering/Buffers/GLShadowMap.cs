@@ -1,4 +1,4 @@
-﻿using OpenTK.Graphics.OpenGL4;
+using OpenTK.Graphics.OpenGL4;
 
 public class GLShadowMap : IFrameBuffer {
     public readonly int FrameBufferId;
@@ -13,11 +13,16 @@ public class GLShadowMap : IFrameBuffer {
         DepthTextureId = GL.GenTexture();
 
         GL.BindTexture(TextureTarget.Texture2D, DepthTextureId);
-        GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.DepthComponent,
+        GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.DepthComponent24,
             width, height, 0, PixelFormat.DepthComponent, PixelType.Float, IntPtr.Zero);
 
-        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Nearest);
-        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Nearest);
+        // Linear + compare mode: the shader samples this as sampler2DShadow, so every tap
+        // is a hardware-filtered 2x2 PCF comparison.
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureCompareMode,
+            (int)TextureCompareMode.CompareRToTexture);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureCompareFunc, (int)All.Lequal);
         GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.ClampToBorder);
         GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.ClampToBorder);
 
@@ -34,6 +39,8 @@ public class GLShadowMap : IFrameBuffer {
         var status = GL.CheckFramebufferStatus(FramebufferTarget.Framebuffer);
         if (status != FramebufferErrorCode.FramebufferComplete)
             Console.WriteLine("Shadow framebuffer not complete: " + status);
+
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
     }
 
     public void Bind() {

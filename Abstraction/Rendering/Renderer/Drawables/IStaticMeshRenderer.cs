@@ -4,7 +4,12 @@ public interface IStaticMeshRenderer : IDrawable {
     Mesh SharedMesh { get; }
     Material SharedMaterial { get; }
 
-    // False until both a mesh and a material have been assigned; the renderer skips such targets.
+    // The material a given submesh of SharedMesh renders with — the mesh's baked material for
+    // that range, or SharedMaterial as fallback. Null means the submesh is skipped.
+    Material MaterialFor(int submeshIndex);
+
+    // False until a mesh and at least one resolvable material are assigned; the renderer skips
+    // such targets.
     bool IsRenderable { get; }
 
     // Entity active && component enabled — disabling either hides the mesh.
