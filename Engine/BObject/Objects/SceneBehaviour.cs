@@ -10,10 +10,22 @@ public abstract class SceneBehaviour : BObject {
 
     public bool IsActive => IsEnabled;
 
+    // ScriptGuard bookkeeping (see Behaviour.FaultStreak) — gizmo callbacks run per frame.
+    internal int FaultStreak;
+    internal string FaultCallback;
+
     // Fired when added to / removed from a scene (edit and play mode alike).
     protected internal virtual void OnAttach() {
     }
 
     protected internal virtual void OnDetach() {
+    }
+
+    // Editor scene-view handles, mirroring Behaviour's hooks: OnDrawGizmos runs for every
+    // active scene behaviour, OnDrawGizmosSelected when picked in the hierarchy's Scene tab.
+    public virtual void OnDrawGizmos(IGizmos gizmos) {
+    }
+
+    public virtual void OnDrawGizmosSelected(IGizmos gizmos) {
     }
 }

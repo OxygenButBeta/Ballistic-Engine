@@ -85,6 +85,21 @@ public class SkyboxRenderer : ISkyboxDrawable {
 
     Matrix4 rotationMatrix = Matrix4.Identity;
 
+    // Set per frame by the renderer so the sky uses the same (jittered) projection as the
+    // geometry; without it TAA sees the sky and meshes jittering differently at silhouettes.
+    public Matrix4? ProjectionOverride;
+
+    // Pre-exposure (Frostbite-style): the camera's EV exposure multiplier, applied at the
+    // SOURCE so the fp16 HDR buffer stays in a sane ~0-10 range instead of raw physical
+    // luminance (which overflows fp16 and starves every bounded post effect). Set per frame
+    // by the renderer; the composite then tonemaps with exposure 1.
+    public float PreExposure = 1f;
+
+    // Set by the renderer while a procedural sky drives the cubemap: its exposure is baked
+    // into the texels and it is sun-oriented, so the Skybox component's exposure/rotation
+    // must NOT apply on top.
+    public bool NeutralSky;
+
     public void PreRenderCallback(RendererArgs args) {
         renderContext.Activate();
         cubemapTexture.Activate();
@@ -92,17 +107,17 @@ public class SkyboxRenderer : ISkyboxDrawable {
 
         // Orientation and exposure come from the scene's Skybox component.
         Skybox sky = Skybox.Active;
-        var exposure = sky?.Exposure ?? 1f;
-        Vector3 euler = sky?.RotationEuler ?? Vector3.Zero;
+        var exposure = NeutralSky ? 1f : sky?.Exposure ?? 1f;
+        Vector3 euler = NeutralSky ? Vector3.Zero : sky?.RotationEuler ?? Vector3.Zero;
         rotationMatrix =
             Matrix4.CreateRotationX(MathHelper.DegreesToRadians(euler.X)) *
             Matrix4.CreateRotationY(MathHelper.DegreesToRadians(euler.Y)) *
             Matrix4.CreateRotationZ(MathHelper.DegreesToRadians(euler.Z));
 
         skyboxShader.SetMatrix4("rotation", ref rotationMatrix);
-        skyboxShader.SetFloat("exposure", exposure);
+        skyboxShader.SetFloat("exposure", exposure * PreExposure);
         var matr = new Matrix4(new Matrix3(args.viewProjectionProvider.GetViewMatrix()));
-        var projection = args.viewProjectionProvider.GetProjectionMatrix();
+        Matrix4 projection = ProjectionOverride ?? args.viewProjectionProvider.GetProjectionMatrix();
         skyboxShader.SetMatrix4("view", ref matr);
         skyboxShader.SetMatrix4("projection", ref projection);
         skyboxShader.SetInt("skybox", 11);

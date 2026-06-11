@@ -11,6 +11,16 @@ SampleProject/Library/
 # ImGui editor layout persistence (per-machine)
 imgui.ini
 
-# Bistro test content (1.6 GB) — kept out of plain git until the git-lfs decision.
-# Remove this line and `git add` the folder once LFS (or plain tracking) is chosen.
+# Bistro test content (1.7 GB) — kept out of plain git until the git-lfs decision.
+# Remove these lines and `git add` the folder once LFS (or plain tracking) is chosen.
+# The folder lives at Assets/Bistro_v5_2/ now (was Assets/Default/Bistro_v5_2/ historically).
 SampleProject/Assets/Default/Bistro_v5_2/
+SampleProject/Assets/Bistro_v5_2/
+
+# Local profiler tools (Tracy viewer/capture binaries; re-download from
+# https://github.com/wolfpld/tracy/releases v0.11.1 — must match the Tracy-CSharp version)
+Tools/Tracy/
+
+
+# Game-script build intermediates (Scripts.csproj output goes to Library\, already ignored)
+SampleProject/obj/

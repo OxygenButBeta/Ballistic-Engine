@@ -16,4 +16,9 @@ public interface IInputProvider
     bool IsMouseButtonDown(MouseButton button);
     Vector2 ScrollDelta { get; }
     Vector2 MousePosition { get; }
+
+    // Per-frame mouse movement in pixels. Unlike (MousePosition - lastMousePosition) tracking, this
+    // keeps working while the cursor is GRABBED (locked to the window centre), which is exactly when
+    // first-person look needs it.
+    Vector2 MouseDelta { get; }
 }

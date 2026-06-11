@@ -31,6 +31,22 @@ internal sealed class EditorInput {
         ScrollY = m.ScrollDelta.Y;
     }
 
+    public bool CtrlDown => window.KeyboardState.IsKeyDown(Keys.LeftControl) ||
+                            window.KeyboardState.IsKeyDown(Keys.RightControl);
+
+    public bool ShiftDown => window.KeyboardState.IsKeyDown(Keys.LeftShift) ||
+                             window.KeyboardState.IsKeyDown(Keys.RightShift);
+
+    // True only on the frame `key` transitions to down (raw OpenTK edge detection — independent of
+    // ImGui focus/ownership, so global shortcuts like Ctrl+Z fire even when a panel has focus).
+    public bool KeyPressed(Keys key) =>
+        window.KeyboardState.IsKeyPressed(key);
+
+    // True while `key` is held (raw OpenTK, ImGui-focus-independent) — for held modifiers like the
+    // V vertex-snap key that arm a gizmo behaviour for as long as they're down.
+    public bool KeyDown(Keys key) =>
+        window.KeyboardState.IsKeyDown(key);
+
     public bool Key(EditorKey key) {
         KeyboardState k = window.KeyboardState;
         return key switch {

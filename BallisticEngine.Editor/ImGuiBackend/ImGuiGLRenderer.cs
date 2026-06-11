@@ -1,5 +1,5 @@
 using System.Runtime.InteropServices;
-using ImGuiNET;
+using Hexa.NET.ImGui;
 using OpenTK.Graphics.OpenGL4;
 using OpenTK.Mathematics;
 
@@ -68,28 +68,34 @@ void main() {
         RecreateFontTexture();
     }
 
-    public void RecreateFontTexture() {
+    public unsafe void RecreateFontTexture() {
         ImGuiIOPtr io = ImGui.GetIO();
-        io.Fonts.GetTexDataAsRGBA32(out IntPtr pixels, out int width, out int height, out _);
+        // Hexa's GetTexDataAsRGBA32 takes byte** / int* out-params (no managed IntPtr overload).
+        byte* pixels;
+        int width, height;
+        io.Fonts.GetTexDataAsRGBA32(&pixels, &width, &height);
 
+        if (fontTexture != 0)   // delete the previous atlas before rebuilding (DPI rescale)
+            GL.DeleteTexture(fontTexture);
         fontTexture = GL.GenTexture();
         GL.ActiveTexture(TextureUnit.Texture0);
         GL.BindTexture(TextureTarget.Texture2D, fontTexture);
         GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, width, height, 0,
-            PixelFormat.Bgra, PixelType.UnsignedByte, pixels);
+            PixelFormat.Bgra, PixelType.UnsignedByte, (IntPtr)pixels);
         GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
         GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
 
-        io.Fonts.SetTexID(fontTexture);
+        // ImTextureID wraps a u64 handle; the GL texture name is the handle.
+        io.Fonts.SetTexID(new ImTextureID((ulong)fontTexture));
         io.Fonts.ClearTexData();
     }
 
-    public void Render(ImDrawDataPtr drawData) {
+    public unsafe void Render(ImDrawDataPtr drawData) {
         if (drawData.CmdListsCount == 0)
             return;
 
         // Save GL state we modify. The engine leaves ActiveTexture on a high unit (shadow map /
-        // skybox); ImGui's sampler reads unit 0, so we MUST switch to unit 0 before binding —
+        // skybox); ImGui's sampler reads unit 0, so we MUST switch to unit 0 before binding â€”
         // otherwise the whole UI samples whatever scene texture is left on unit 0.
         int lastActiveTexture = GL.GetInteger(GetPName.ActiveTexture);
         GL.ActiveTexture(TextureUnit.Texture0);
@@ -135,17 +141,17 @@ void main() {
 
             GL.BindBuffer(BufferTarget.ArrayBuffer, vbo);
             if (vtxBytes > vboSize) { vboSize = Math.Max(vboSize * 2, vtxBytes); GL.BufferData(BufferTarget.ArrayBuffer, vboSize, IntPtr.Zero, BufferUsageHint.DynamicDraw); }
-            GL.BufferSubData(BufferTarget.ArrayBuffer, IntPtr.Zero, vtxBytes, cmdList.VtxBuffer.Data);
+            GL.BufferSubData(BufferTarget.ArrayBuffer, IntPtr.Zero, vtxBytes, (IntPtr)cmdList.VtxBuffer.Data);
 
             GL.BindBuffer(BufferTarget.ElementArrayBuffer, ebo);
             if (idxBytes > eboSize) { eboSize = Math.Max(eboSize * 2, idxBytes); GL.BufferData(BufferTarget.ElementArrayBuffer, eboSize, IntPtr.Zero, BufferUsageHint.DynamicDraw); }
-            GL.BufferSubData(BufferTarget.ElementArrayBuffer, IntPtr.Zero, idxBytes, cmdList.IdxBuffer.Data);
+            GL.BufferSubData(BufferTarget.ElementArrayBuffer, IntPtr.Zero, idxBytes, (IntPtr)cmdList.IdxBuffer.Data);
 
             int idxOffset = 0;
             for (int cmdI = 0; cmdI < cmdList.CmdBuffer.Size; cmdI++) {
-                ImDrawCmdPtr pcmd = cmdList.CmdBuffer[cmdI];
+                ImDrawCmd pcmd = cmdList.CmdBuffer[cmdI];
                 System.Numerics.Vector4 clip = pcmd.ClipRect;
-                GL.BindTexture(TextureTarget.Texture2D, (int)pcmd.TextureId);
+                GL.BindTexture(TextureTarget.Texture2D, (int)pcmd.TextureId.Handle);
                 GL.Scissor((int)clip.X, fbHeight - (int)clip.W, (int)(clip.Z - clip.X), (int)(clip.W - clip.Y));
                 GL.DrawElements(PrimitiveType.Triangles, (int)pcmd.ElemCount, DrawElementsType.UnsignedShort,
                     idxOffset * sizeof(ushort));

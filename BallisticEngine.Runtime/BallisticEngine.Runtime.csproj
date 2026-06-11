@@ -1,7 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
-        <OutputType>Exe</OutputType>
+        <!-- Console Exe for dev (`dotnet run` shows logs); the build passes -p:ShipBuild=true to publish
+             as WinExe so the SHIPPED game has no console window. Scoped to THIS project via the condition
+             so it never leaks onto the referenced engine LIBRARY (which must stay OutputType=Library). -->
+        <OutputType Condition="'$(ShipBuild)' == 'true'">WinExe</OutputType>
+        <OutputType Condition="'$(ShipBuild)' != 'true'">Exe</OutputType>
         <TargetFramework>net9.0</TargetFramework>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>disable</Nullable>
@@ -9,6 +13,7 @@
 
     <ItemGroup>
       <ProjectReference Include="..\BallisticEngine.csproj" />
+      <ProjectReference Include="..\BallisticEngine.Profiling.Tracy\BallisticEngine.Profiling.Tracy.csproj" />
     </ItemGroup>
 
 </Project>

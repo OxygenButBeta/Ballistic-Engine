@@ -8,8 +8,13 @@ namespace BallisticEngine;
 // the face direction from the quad UV, so no cube geometry or view matrices are needed.
 public static class GLEnvironmentMaps {
     public const int IrradianceSize = 32;
-    public const int PrefilterSize = 128;
-    public const int PrefilterMipCount = 5;
+    public const int PrefilterSize = 256;   // mip 0 must hold near-mirror reflections; 128 was visibly blocky
+    public const int PrefilterMipCount = 6; // 256 -> 8px, linear roughness-to-mip
+
+    // Local reflection probes (ReflectionVolume): each occupied grid cell captures a 128px cubemap,
+    // GGX-prefiltered into a slice of a cube-map array. 128 keeps a single probe ~1 MB at RGBA16F.
+    public const int ReflectionFaceRes = 128;
+    public const int ReflectionMipCount = 6; // 128 -> 4px, linear roughness-to-mip
 
     static StandardShader brdfShader;
     static StandardShader irradianceShader;
@@ -93,6 +98,9 @@ public static class GLEnvironmentMaps {
         GL.BindTexture(TextureTarget.TextureCubeMap, sourceCubemap);
         prefilterShader.SetInt("EnvironmentMap", 0);
         prefilterShader.SetFloat("SourceResolution", PrefilterSize * 4f);
+        // Sky source is already physical radiance; no rescale. (Set explicitly because the
+        // reflection-probe path below shares this shader program and changes RadianceScale.)
+        prefilterShader.SetFloat("RadianceScale", 1f);
 
         for (var mip = 0; mip < PrefilterMipCount; mip++) {
             var mipSize = PrefilterSize >> mip;
@@ -132,5 +140,67 @@ public static class GLEnvironmentMaps {
             (int)TextureWrapMode.ClampToEdge);
         GL.TexParameter(TextureTarget.TextureCubeMap, TextureParameterName.TextureMaxLevel, mipCount - 1);
         return cubemap;
+    }
+
+    // ---- Local reflection probe grid (ReflectionVolume) ----
+    // A GL_TEXTURE_CUBE_MAP_ARRAY holding one prefiltered cubemap per occupied grid cell. Cube-map
+    // arrays are core in GL 4.0+ (the window requests a 4.1 core context). A 3D image for a cube
+    // array has depth = layerCount * 6, where each consecutive group of 6 Z-slices is one cube's
+    // +X,-X,+Y,-Y,+Z,-Z faces; a face slice is addressed by layer*6 + face.
+    public static int CreateCubemapArray(int size, int mipCount, int layerCount) {
+        var array = GL.GenTexture();
+        GL.BindTexture(TextureTarget.TextureCubeMapArray, array);
+        var depth = layerCount * 6;
+        for (var mip = 0; mip < mipCount; mip++) {
+            var mipSize = Math.Max(1, size >> mip);
+            GL.TexImage3D(TextureTarget.TextureCubeMapArray, mip, PixelInternalFormat.Rgba16f,
+                mipSize, mipSize, depth, 0, PixelFormat.Rgba, PixelType.Float, IntPtr.Zero);
+        }
+
+        GL.TexParameter(TextureTarget.TextureCubeMapArray, TextureParameterName.TextureMinFilter,
+            mipCount > 1 ? (int)TextureMinFilter.LinearMipmapLinear : (int)TextureMinFilter.Linear);
+        GL.TexParameter(TextureTarget.TextureCubeMapArray, TextureParameterName.TextureMagFilter,
+            (int)TextureMagFilter.Linear);
+        GL.TexParameter(TextureTarget.TextureCubeMapArray, TextureParameterName.TextureWrapS,
+            (int)TextureWrapMode.ClampToEdge);
+        GL.TexParameter(TextureTarget.TextureCubeMapArray, TextureParameterName.TextureWrapT,
+            (int)TextureWrapMode.ClampToEdge);
+        GL.TexParameter(TextureTarget.TextureCubeMapArray, TextureParameterName.TextureWrapR,
+            (int)TextureWrapMode.ClampToEdge);
+        GL.TexParameter(TextureTarget.TextureCubeMapArray, TextureParameterName.TextureMaxLevel, mipCount - 1);
+        GL.BindTexture(TextureTarget.TextureCubeMapArray, 0);
+        return array;
+    }
+
+    // Prefilters one captured source cubemap into a single layer of an existing cube-map array,
+    // reusing the exact GGX-prefilter shader + per-mip roughness as GeneratePrefiltered. Only the
+    // FBO attachment differs: FramebufferTextureLayer targets the array's (layer*6 + face) slice.
+    // radianceScale divides the captured (pre-exposed) radiance back to physical before storing,
+    // so the cube survives auto-exposure and matches the global prefiltered map's EV. See the
+    // RadianceScale note in IBL_Prefilter.glsl.
+    public static void GeneratePrefilteredInto(int sourceCubemap, int targetArray, int arrayLayer,
+        float radianceScale, int size = ReflectionFaceRes, int mipCount = ReflectionMipCount) {
+        BeginBake();
+
+        prefilterShader.Activate();
+        GL.ActiveTexture(TextureUnit.Texture0);
+        GL.BindTexture(TextureTarget.TextureCubeMap, sourceCubemap);
+        prefilterShader.SetInt("EnvironmentMap", 0);
+        prefilterShader.SetFloat("SourceResolution", size * 4f);
+        prefilterShader.SetFloat("RadianceScale", radianceScale);
+
+        for (var mip = 0; mip < mipCount; mip++) {
+            var mipSize = Math.Max(1, size >> mip);
+            GL.Viewport(0, 0, mipSize, mipSize);
+            prefilterShader.SetFloat("Roughness", mip / (float)(mipCount - 1));
+            for (var face = 0; face < 6; face++) {
+                prefilterShader.SetInt("Face", face);
+                GL.FramebufferTextureLayer(FramebufferTarget.Framebuffer,
+                    FramebufferAttachment.ColorAttachment0, targetArray, mip, arrayLayer * 6 + face);
+                GLBufferUtilities.DrawFullscreenQuad();
+            }
+        }
+
+        EndBake();
     }
 }

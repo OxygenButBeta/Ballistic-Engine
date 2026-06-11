@@ -14,6 +14,7 @@ public sealed class FalcorSceneImporter : IAssetImporter {
     public int Version => 1;
     public string ArtifactExtension => null; // produces a project asset (.scene), not a Library artifact
     public bool RunsWithoutArtifact => true;
+    public bool GeneratesSourceAssets => true; // writes a sibling .scene
 
     public bool CanImport(string extension) => extension == ".pyscene";
 

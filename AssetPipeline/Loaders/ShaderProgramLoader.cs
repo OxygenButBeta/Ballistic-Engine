@@ -9,7 +9,11 @@ public sealed class ShaderDefinition {
 
 public static class ShaderProgramLoader {
     public static StandardShader Load(BallisticProject project, string assetPath) {
-        var definition = PipelineJson.Read<ShaderDefinition>(project.ResolveAbsolute(assetPath));
+        var definition = ContentText.ReadJson<ShaderDefinition>(project, assetPath);
+        if (definition is null) {
+            Debugging.LogError($"'{assetPath}': shader definition not found.");
+            return null;
+        }
 
         var vertexCode = ReadGlsl(project, definition.Vertex, assetPath);
         var fragmentCode = ReadGlsl(project, definition.Fragment, assetPath);
@@ -29,12 +33,12 @@ public static class ShaderProgramLoader {
             return null;
         }
 
-        var absolute = project.ResolveAbsolute(glslAssetPath);
-        if (!File.Exists(absolute)) {
+        var code = ContentText.Read(project, glslAssetPath);
+        if (code is null) {
             Debugging.LogError($"'{ownerPath}': shader source '{glslAssetPath}' does not exist.");
             return null;
         }
 
-        return File.ReadAllText(absolute);
+        return code;
     }
 }

@@ -80,6 +80,7 @@ public sealed class GLSSAOPass {
         ssaoShader.SetMatrix4("InvProjection", ref invProjection);
         ssaoShader.SetFloat("Radius", fx.SSAORadius);
         ssaoShader.SetFloat("Intensity", fx.SSAOIntensity);
+        ssaoShader.SetFloat2("TexelSize", new Vector2(1f / width, 1f / height));
         GLBufferUtilities.DrawFullscreenQuad();
 
         // Noise-hiding blur.

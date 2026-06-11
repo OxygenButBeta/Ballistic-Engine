@@ -1,0 +1,6 @@
+# Vendored third-party source (chenrensong/Yoga.Net, MIT — see LICENSE.Yoga.Net.txt). It uses
+# nullable reference-type annotations, but the engine compiles with <Nullable>disable</Nullable>,
+# which makes every `?` annotation emit CS8632. This is vendored code we don't edit, so silence the
+# noise here only — the rest of the engine's warning output stays meaningful. Scoped to this folder.
+[*.cs]
+dotnet_diagnostic.CS8632.severity = none

@@ -31,5 +31,6 @@ public class GLInput : IInputProvider {
 
     public Vector2 ScrollDelta => mouseState.ScrollDelta;
     public Vector2 MousePosition => mouseState.Position;
+    public Vector2 MouseDelta => mouseState.Delta;
 
 }

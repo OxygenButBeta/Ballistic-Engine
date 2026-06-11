@@ -24,9 +24,13 @@ public sealed class BallisticProject {
         if (!Directory.Exists(rootPath))
             throw new DirectoryNotFoundException($"Project directory not found: '{rootPath}'");
 
-        if (!Directory.Exists(Path.Combine(rootPath, "Assets")))
+        // An editable project has an Assets\ folder; a SHIPPED player project ships its content
+        // packed instead (content.pak) and has no Assets\ — accept either as a valid Ballistic project.
+        bool hasAssets = Directory.Exists(Path.Combine(rootPath, "Assets"));
+        bool isPacked = File.Exists(Path.Combine(rootPath, "content.pak"));
+        if (!hasAssets && !isPacked)
             throw new DirectoryNotFoundException(
-                $"'{rootPath}' is not a Ballistic project: it has no Assets directory.");
+                $"'{rootPath}' is not a Ballistic project: it has no Assets directory or content.pak.");
 
         var manifestPath = Path.Combine(rootPath, "project.json");
         ProjectManifest manifest;
@@ -40,7 +44,10 @@ public sealed class BallisticProject {
         }
 
         BallisticProject project = new(rootPath, manifest);
-        Directory.CreateDirectory(project.ArtifactsPath);
+        // Editable projects need the Library\Artifacts\ dir to import into; a packed player doesn't
+        // (it reads from content.pak) and must not write into its install folder.
+        if (hasAssets)
+            Directory.CreateDirectory(project.ArtifactsPath);
         return project;
     }
 

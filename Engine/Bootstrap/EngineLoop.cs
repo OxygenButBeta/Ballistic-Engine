@@ -20,11 +20,22 @@ public sealed class EngineLoop {
         }
 
         SceneManager.RenderCamera.RenderCamera();
+
+        // After the scene renders: resume any `await Coroutine.EndOfFrame()` continuations.
+        Coroutine.EndOfFramePump();
     }
 
     void Update(double delta) {
+        // Drop last frame's single-frame debug lines before this frame's Tick repopulates them.
+        // No-op in a release player (DebugDraw.Enabled is false) — only matters if a game turns it on.
+        DebugDraw.Expire();
+
         runtime.EngineTimer.Update(delta);
         SceneManager.Update((float)delta);
+
+        // Standalone player: the whole window IS the game, so the script's cursor intent always
+        // applies. (The editor resolves intent itself, with a focus veto — see EditorApplication.)
+        Cursor.Apply(allowed: true);
     }
 
     public void Run() => runtime.Window.Run();

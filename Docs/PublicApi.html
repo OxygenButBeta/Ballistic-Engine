@@ -1,0 +1,911 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ballistic Engine — Scripting API Reference</title>
+<style>
+  :root {
+    --bg:        #0d1017;
+    --bg-soft:   #141922;
+    --bg-card:   #171d28;
+    --bg-code:   #0a0d13;
+    --border:    #232b38;
+    --border-soft:#1c232f;
+    --text:      #d4dae3;
+    --text-dim:  #8b95a5;
+    --text-faint:#5a6473;
+    --accent:    #f4623a;   /* ballistic orange */
+    --accent-soft:#ff7d57;
+    --accent-bg: rgba(244,98,58,0.10);
+    --blue:      #6cb6ff;
+    --green:     #7ee787;
+    --purple:    #d2a8ff;
+    --yellow:    #f0c674;
+    --pink:      #ff9ec4;
+    --mono: "JetBrains Mono", "Cascadia Code", "SF Mono", "Consolas", ui-monospace, monospace;
+    --sans: "Inter", -apple-system, "Segoe UI", Roboto, system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent-soft); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* ---------- Layout ---------- */
+  .layout { display: grid; grid-template-columns: 290px 1fr; min-height: 100vh; }
+
+  /* ---------- Sidebar ---------- */
+  aside {
+    position: sticky; top: 0; align-self: start;
+    height: 100vh; overflow-y: auto;
+    background: var(--bg-soft);
+    border-right: 1px solid var(--border);
+    padding: 0 0 60px;
+  }
+  aside::-webkit-scrollbar { width: 8px; }
+  aside::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  .brand {
+    display: flex; align-items: center; gap: 12px;
+    padding: 22px 24px 18px;
+    position: sticky; top: 0; background: var(--bg-soft);
+    border-bottom: 1px solid var(--border-soft); z-index: 5;
+  }
+  .brand .logo {
+    width: 34px; height: 34px; border-radius: 9px; flex: none;
+    background: linear-gradient(135deg, var(--accent), #b8341a);
+    display: grid; place-items: center;
+    font-weight: 800; color: #fff; font-size: 18px;
+    box-shadow: 0 4px 14px rgba(244,98,58,0.35);
+  }
+  .brand .title { font-weight: 700; font-size: 15px; letter-spacing: .2px; }
+  .brand .sub { font-size: 11.5px; color: var(--text-faint); letter-spacing: .4px; text-transform: uppercase; }
+
+  .search-wrap { padding: 16px 18px 8px; position: sticky; top: 73px; background: var(--bg-soft); z-index: 4; }
+  #search {
+    width: 100%; padding: 9px 12px;
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    font-family: var(--sans); font-size: 13.5px;
+  }
+  #search:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
+
+  nav { padding: 6px 12px; }
+  nav .group-label {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--text-faint); font-weight: 700;
+    padding: 16px 12px 6px;
+  }
+  nav a {
+    display: block; padding: 5px 12px; border-radius: 6px;
+    color: var(--text-dim); font-size: 13.5px; line-height: 1.4;
+    border-left: 2px solid transparent;
+  }
+  nav a:hover { background: var(--bg-card); color: var(--text); text-decoration: none; }
+  nav a.active { color: var(--accent-soft); background: var(--accent-bg); border-left-color: var(--accent); font-weight: 600; }
+  nav a code { font-family: var(--mono); font-size: 12.5px; }
+
+  /* ---------- Main ---------- */
+  main { padding: 0 56px 120px; max-width: 1000px; }
+  .hero {
+    padding: 64px 0 44px; border-bottom: 1px solid var(--border-soft); margin-bottom: 12px;
+  }
+  .hero .eyebrow {
+    color: var(--accent); font-weight: 700; font-size: 12.5px;
+    letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 14px;
+  }
+  .hero h1 { font-size: 42px; line-height: 1.1; font-weight: 800; letter-spacing: -1px; margin-bottom: 18px; }
+  .hero h1 .grad {
+    background: linear-gradient(100deg, var(--accent-soft), var(--yellow));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .hero p { color: var(--text-dim); font-size: 17px; max-width: 720px; }
+  .hero .meta-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 26px; }
+  .pill {
+    font-family: var(--mono); font-size: 12px; padding: 5px 11px;
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: 20px; color: var(--text-dim);
+  }
+  .pill b { color: var(--accent-soft); font-weight: 600; }
+
+  section { padding-top: 30px; }
+  h2.section-title {
+    font-size: 13px; text-transform: uppercase; letter-spacing: 1.5px;
+    color: var(--accent); font-weight: 700; margin: 38px 0 4px;
+    padding-top: 30px;
+  }
+  .section-desc { color: var(--text-dim); margin-bottom: 8px; font-size: 14.5px; max-width: 760px; }
+
+  /* ---------- API Card ---------- */
+  .api {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 14px; margin: 22px 0; overflow: hidden;
+    scroll-margin-top: 24px;
+  }
+  .api-head {
+    padding: 18px 24px 16px; border-bottom: 1px solid var(--border-soft);
+    background: linear-gradient(180deg, rgba(255,255,255,0.015), transparent);
+  }
+  .api-head .nameline { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .api-head h3 {
+    font-family: var(--mono); font-size: 19px; font-weight: 600; color: #fff; letter-spacing: -.3px;
+  }
+  .api-head h3 .kw { color: var(--purple); font-weight: 500; }
+  .api-head h3 .base { color: var(--text-faint); font-size: 15px; font-weight: 400; }
+  .tag {
+    font-family: var(--mono); font-size: 10.5px; font-weight: 600; letter-spacing: .3px;
+    padding: 3px 8px; border-radius: 5px; text-transform: uppercase;
+  }
+  .tag.static  { background: rgba(108,182,255,.12); color: var(--blue); border:1px solid rgba(108,182,255,.25); }
+  .tag.abstract{ background: rgba(210,168,255,.12); color: var(--purple); border:1px solid rgba(210,168,255,.25); }
+  .tag.base    { background: rgba(126,231,135,.10); color: var(--green); border:1px solid rgba(126,231,135,.22); }
+  .tag.scene   { background: rgba(240,198,116,.10); color: var(--yellow); border:1px solid rgba(240,198,116,.22); }
+  .tag.struct  { background: rgba(255,158,196,.10); color: var(--pink); border:1px solid rgba(255,158,196,.22); }
+  .api-head .file { font-family: var(--mono); font-size: 12px; color: var(--text-faint); margin-top: 8px; }
+  .api-head .desc { color: var(--text-dim); font-size: 14px; margin-top: 10px; max-width: 740px; }
+
+  .api-body { padding: 6px 0 4px; }
+  table { width: 100%; border-collapse: collapse; }
+  table tr { border-bottom: 1px solid var(--border-soft); }
+  table tr:last-child { border-bottom: none; }
+  table td { padding: 11px 24px; vertical-align: top; font-size: 13.5px; }
+  table td.member { width: 48%; }
+  table td.member code {
+    font-family: var(--mono); font-size: 13px; color: var(--text); line-height: 1.5;
+    display: inline-block;
+  }
+  table td.note { color: var(--text-dim); font-size: 13px; }
+  table tr:hover { background: rgba(255,255,255,0.014); }
+
+  /* signature coloring */
+  .ty   { color: var(--blue); }
+  .nm   { color: #e9c699; }
+  .mod  { color: var(--purple); }
+  .lit  { color: var(--green); }
+  .punc { color: var(--text-faint); }
+  .prop-badge {
+    font-family: var(--mono); font-size: 9.5px; color: var(--text-faint);
+    border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; margin-left: 6px;
+    vertical-align: middle; text-transform: uppercase; letter-spacing: .4px;
+  }
+
+  /* ---------- Code blocks ---------- */
+  pre {
+    background: var(--bg-code); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px 20px; margin: 18px 0; overflow-x: auto;
+    font-family: var(--mono); font-size: 13px; line-height: 1.7;
+  }
+  pre .c { color: var(--text-faint); font-style: italic; }
+  pre .k { color: var(--purple); }
+  pre .t { color: var(--blue); }
+  pre .s { color: var(--green); }
+  pre .n { color: var(--yellow); }
+  pre .f { color: #e9c699; }
+  .callout {
+    display: flex; gap: 12px; padding: 14px 18px; border-radius: 10px;
+    margin: 18px 0; font-size: 13.5px; line-height: 1.6;
+    background: var(--accent-bg); border: 1px solid rgba(244,98,58,.25);
+  }
+  .callout .icon { flex: none; font-size: 16px; }
+  .callout b { color: var(--accent-soft); }
+  .callout.info { background: rgba(108,182,255,.07); border-color: rgba(108,182,255,.22); }
+  .callout.info b { color: var(--blue); }
+
+  .hidden { display: none !important; }
+  .nores { color: var(--text-faint); padding: 40px; text-align: center; font-style: italic; }
+
+  footer {
+    border-top: 1px solid var(--border-soft); margin-top: 60px; padding-top: 26px;
+    color: var(--text-faint); font-size: 13px;
+  }
+
+  @media (max-width: 980px) {
+    .layout { grid-template-columns: 1fr; }
+    aside { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--border); }
+    .search-wrap, .brand { position: static; }
+    main { padding: 0 22px 80px; }
+    table td.member { width: auto; display: block; }
+    table td.note { display: block; padding-top: 0; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+
+  <!-- ===================== SIDEBAR ===================== -->
+  <aside>
+    <div class="brand">
+      <div class="logo">B</div>
+      <div>
+        <div class="title">Ballistic Engine</div>
+        <div class="sub">Scripting API</div>
+      </div>
+    </div>
+    <div class="search-wrap">
+      <input id="search" type="text" placeholder="Filter API…  (e.g. Rigidbody, Raycast)" autocomplete="off">
+    </div>
+    <nav id="nav">
+      <div class="group-label">Getting Started</div>
+      <a href="#intro">Overview</a>
+      <a href="#first-script">Your first script</a>
+
+      <div class="group-label">Core</div>
+      <a href="#Behaviour"><code>Behaviour</code></a>
+      <a href="#SceneBehaviour"><code>SceneBehaviour</code></a>
+      <a href="#Entity"><code>Entity</code></a>
+      <a href="#Transform"><code>Transform</code></a>
+      <a href="#BObject"><code>BObject</code></a>
+
+      <div class="group-label">Scene &amp; Lifecycle</div>
+      <a href="#SceneManager"><code>SceneManager</code></a>
+      <a href="#Scene"><code>Scene</code></a>
+
+      <div class="group-label">Input &amp; Time</div>
+      <a href="#Input"><code>Input</code></a>
+      <a href="#Time"><code>Time</code></a>
+      <a href="#Window"><code>Window</code></a>
+
+      <div class="group-label">Physics</div>
+      <a href="#Physics"><code>Physics</code></a>
+      <a href="#RaycastHit"><code>RaycastHit</code></a>
+      <a href="#Rigidbody"><code>Rigidbody</code></a>
+      <a href="#Collider"><code>Collider</code> + shapes</a>
+      <a href="#Collision"><code>Collision</code></a>
+
+      <div class="group-label">Rendering</div>
+      <a href="#Renderer"><code>Renderer</code></a>
+      <a href="#StaticMeshRenderer"><code>StaticMeshRenderer</code></a>
+      <a href="#Lights">Lights</a>
+      <a href="#SceneEnv">Sky &amp; Lighting</a>
+      <a href="#Terrain"><code>Terrain</code></a>
+
+      <div class="group-label">Post-Processing</div>
+      <a href="#Volume"><code>Volume</code></a>
+      <a href="#VolumeComponent">Custom effects</a>
+
+      <div class="group-label">Async</div>
+      <a href="#Coroutine"><code>Coroutine</code></a>
+
+      <div class="group-label">Assets</div>
+      <a href="#AssetDatabase"><code>AssetDatabase</code></a>
+      <a href="#AssetTypes">Asset types</a>
+      <a href="#Prefab"><code>PrefabAsset</code></a>
+
+      <div class="group-label">Utility</div>
+      <a href="#Debug"><code>Debug</code></a>
+      <a href="#Layers">Layers &amp; Tags</a>
+
+      <div class="group-label">Attributes</div>
+      <a href="#Attributes">Inspector attributes</a>
+    </nav>
+  </aside>
+
+  <!-- ===================== MAIN ===================== -->
+  <main>
+    <div class="hero" data-keywords="overview intro">
+      <div class="eyebrow">Developer Reference</div>
+      <h1>The <span class="grad">Ballistic</span> scripting API</h1>
+      <p>Everything the engine exposes to game code. Write <code>.cs</code> files anywhere under your
+         project's <code>Assets/</code> folder — the engine compiles, hot-reloads, and wires them into
+         scenes and the editor with zero boilerplate. The surface deliberately mirrors Unity, so most
+         knowledge transfers directly.</p>
+      <div class="meta-row">
+        <span class="pill"><b>C#</b> · .NET&nbsp;9</span>
+        <span class="pill">Math: <b>OpenTK.Mathematics</b></span>
+        <span class="pill">Input: <b>GLFW</b> key enums</span>
+        <span class="pill">Hot reload: <b>on focus / Ctrl+R</b></span>
+      </div>
+    </div>
+
+    <!-- ============ INTRO ============ -->
+    <section id="intro" data-keywords="overview intro getting started">
+      <h2 class="section-title">Overview</h2>
+      <p class="section-desc">A game script is a class that derives from <code>Behaviour</code> (a per-entity
+        component, like Unity's <code>MonoBehaviour</code>) or <code>SceneBehaviour</code> (a scene-wide
+        component). Override lifecycle hooks to run your logic.</p>
+
+      <div class="callout info">
+        <span class="icon">&#9432;</span>
+        <div><b>Cross-assembly override rule.</b> The engine declares lifecycle hooks as
+          <code>protected internal virtual</code>, but in <i>game</i> assemblies you must override them as
+          plain <code>protected</code> (<code>Tick</code>, <code>OnBegin</code>, <code>OnCollisionEnter</code>, …).
+          C# does not allow <code>protected&nbsp;internal</code> overrides across assemblies. The signatures below
+          show the override form you should write.</div>
+      </div>
+    </section>
+
+    <section id="first-script" data-keywords="first script example hello tutorial">
+      <h2 class="section-title">Your first script</h2>
+      <p class="section-desc">Right-click in the Asset Browser → <b>New Script</b>. It auto-compiles. Drag the
+        resulting <code>.cs</code> tile onto a Hierarchy entity to add it as a component.</p>
+      <pre><span class="k">using</span> BallisticEngine<span class="punc">;</span>
+<span class="k">using</span> OpenTK.Mathematics<span class="punc">;</span>
+<span class="k">using</span> OpenTK.Windowing.GraphicsLibraryFramework<span class="punc">;</span>
+
+<span class="k">public class</span> <span class="t">Spinner</span> <span class="punc">:</span> <span class="t">Behaviour</span> <span class="punc">{</span>
+    <span class="c">// Public fields show up in the Inspector and serialize into the scene automatically.</span>
+    <span class="k">public float</span> <span class="f">DegreesPerSecond</span> <span class="punc">=</span> <span class="n">90f</span><span class="punc">;</span>
+
+    <span class="c">// Runs once, the first time this component becomes active in play mode.</span>
+    <span class="k">protected override void</span> <span class="f">OnBegin</span><span class="punc">()</span> <span class="punc">{</span>
+        Debug.<span class="f">Log</span><span class="punc">(</span><span class="s">"Spinner started on "</span> <span class="punc">+</span> Entity.Name<span class="punc">);</span>
+    <span class="punc">}</span>
+
+    <span class="c">// Runs every frame during play. `delta` is seconds since last frame.</span>
+    <span class="k">protected override void</span> <span class="f">Tick</span><span class="punc">(</span><span class="k">in float</span> delta<span class="punc">)</span> <span class="punc">{</span>
+        <span class="k">if</span> <span class="punc">(</span>Input.<span class="f">IsKeyDown</span><span class="punc">(</span>Keys.Space<span class="punc">))</span> <span class="k">return</span><span class="punc">;</span>
+        transform.Rotation <span class="punc">*=</span> Quaternion.<span class="f">FromEulerAngles</span><span class="punc">(</span><span class="n">0f</span><span class="punc">,</span> MathHelper.<span class="f">DegreesToRadians</span><span class="punc">(</span>DegreesPerSecond <span class="punc">*</span> delta<span class="punc">),</span> <span class="n">0f</span><span class="punc">);</span>
+    <span class="punc">}</span>
+<span class="punc">}</span></pre>
+      <div class="callout">
+        <span class="icon">&#9888;</span>
+        <div><b>Live reload, unlike Unity.</b> Editing scripts and alt-tabbing back recompiles without
+          stopping play. On compile errors, nothing changes (errors appear in the Console). The Play button
+          is disabled while scripts don't compile.</div>
+      </div>
+    </section>
+
+    <!-- ============ CORE ============ -->
+    <h2 class="section-title">Core base classes</h2>
+
+    <!-- Behaviour -->
+    <div class="api" id="Behaviour" data-keywords="behaviour component monobehaviour lifecycle tick onbegin getcomponent addcomponent coroutine">
+      <div class="api-head">
+        <div class="nameline">
+          <h3><span class="kw">class</span> Behaviour <span class="base">: Component</span></h3>
+          <span class="tag base">Base</span>
+        </div>
+        <div class="file">Engine/BObject/Objects/Behaviour.cs</div>
+        <div class="desc">The base class for per-entity game components — Unity's <code>MonoBehaviour</code>.
+          Derive from it, override the lifecycle hooks you need, and add public fields for inspectable, serialized state.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="ty">bool</span> <span class="nm">IsEnabled</span> <span class="punc">{ get; set; }</span></code></td><td class="note">Master enable switch. Toggling in play mode fires <code>OnEnabled</code>/<code>OnDisabled</code> lifecycle.</td></tr>
+        <tr><td class="member"><code><span class="ty">bool</span> <span class="nm">IsActive</span> <span class="prop-badge">get</span></code></td><td class="note">True when enabled <i>and</i> the entity is active all the way up the hierarchy (Unity's <code>activeInHierarchy</code>).</td></tr>
+        <tr><td class="member"><code><span class="ty">Entity</span> <span class="nm">Entity</span> <span class="prop-badge">get</span></code></td><td class="note">The owning entity (Unity's <code>gameObject</code>).</td></tr>
+        <tr><td class="member"><code><span class="ty">Transform</span> <span class="nm">transform</span> <span class="prop-badge">get</span></code></td><td class="note">Shortcut to <code>Entity.transform</code>.</td></tr>
+        <tr><td colspan="2" style="padding:8px 24px 2px;color:var(--text-faint);font-size:11px;letter-spacing:1px;text-transform:uppercase;font-weight:700;">Lifecycle hooks — override as <code style="color:var(--purple)">protected</code></td></tr>
+        <tr><td class="member"><code><span class="mod">protected</span> <span class="ty">void</span> <span class="nm">OnBegin</span><span class="punc">()</span></code></td><td class="note">Fires <b>once</b>, the first time the component becomes active in play mode (Unity's <code>Start</code>).</td></tr>
+        <tr><td class="member"><code><span class="mod">protected</span> <span class="ty">void</span> <span class="nm">OnAttach</span><span class="punc">()</span></code></td><td class="note">Fires when added to an entity, in <b>both</b> edit and play mode. Put render/registration here, never in <code>OnEnabled</code>.</td></tr>
+        <tr><td class="member"><code><span class="mod">protected</span> <span class="ty">void</span> <span class="nm">OnDetach</span><span class="punc">()</span></code></td><td class="note">Fires when removed from an entity or the scene tears down.</td></tr>
+        <tr><td class="member"><code><span class="mod">protected</span> <span class="ty">void</span> <span class="nm">OnEnabled</span><span class="punc">()</span></code></td><td class="note">Play-mode only. Fires whenever the component becomes active. May fire multiple times.</td></tr>
+        <tr><td class="member"><code><span class="mod">protected</span> <span class="ty">void</span> <span class="nm">OnDisabled</span><span class="punc">()</span></code></td><td class="note">Play-mode only. Fires when the component becomes inactive.</td></tr>
+        <tr><td class="member"><code><span class="mod">protected</span> <span class="ty">void</span> <span class="nm">Tick</span><span class="punc">(</span><span class="mod">in</span> <span class="ty">float</span> delta<span class="punc">)</span></code></td><td class="note">Per-frame update during play (Unity's <code>Update</code>). <code>delta</code> = seconds since last frame.</td></tr>
+        <tr><td class="member"><code><span class="mod">protected</span> <span class="ty">void</span> <span class="nm">FixedTick</span><span class="punc">(</span><span class="mod">in</span> <span class="ty">float</span> delta<span class="punc">)</span></code></td><td class="note">Fixed 60&nbsp;Hz physics update (Unity's <code>FixedUpdate</code>). Apply forces here.</td></tr>
+        <tr><td colspan="2" style="padding:8px 24px 2px;color:var(--text-faint);font-size:11px;letter-spacing:1px;text-transform:uppercase;font-weight:700;">Contact callbacks — play mode, override as <code style="color:var(--purple)">protected</code></td></tr>
+        <tr><td class="member"><code><span class="mod">protected</span> <span class="ty">void</span> <span class="nm">OnCollisionEnter</span><span class="punc">(</span><span class="ty">Collision</span> c<span class="punc">)</span></code></td><td class="note">Two solid bodies start touching. Also <code>OnCollisionStay</code> / <code>OnCollisionExit</code>.</td></tr>
+        <tr><td class="member"><code><span class="mod">protected</span> <span class="ty">void</span> <span class="nm">OnTriggerEnter</span><span class="punc">(</span><span class="ty">Collider</span> other<span class="punc">)</span></code></td><td class="note">A body enters a trigger collider. Also <code>OnTriggerStay</code> / <code>OnTriggerExit</code>.</td></tr>
+        <tr><td colspan="2" style="padding:8px 24px 2px;color:var(--text-faint);font-size:11px;letter-spacing:1px;text-transform:uppercase;font-weight:700;">Component lookup (forward to the entity)</td></tr>
+        <tr><td class="member"><code><span class="ty">T</span> <span class="nm">GetComponent</span><span class="punc">&lt;</span><span class="ty">T</span><span class="punc">&gt;()</span></code></td><td class="note">First component of type <code>T</code> on the same entity. Also <code>TryGetComponent</code>, <code>GetComponents</code>.</td></tr>
+        <tr><td class="member"><code><span class="ty">T</span> <span class="nm">GetComponentInChildren</span><span class="punc">&lt;</span><span class="ty">T</span><span class="punc">&gt;(</span><span class="ty">bool</span> includeInactive<span class="punc">)</span></code></td><td class="note">Search this entity and its descendants. <code>GetComponentInParent</code> searches ancestors.</td></tr>
+        <tr><td class="member"><code><span class="ty">T</span> <span class="nm">AddComponent</span><span class="punc">&lt;</span><span class="ty">T</span><span class="punc">&gt;()</span></code></td><td class="note">Add a new component to the same entity.</td></tr>
+        <tr><td colspan="2" style="padding:8px 24px 2px;color:var(--text-faint);font-size:11px;letter-spacing:1px;text-transform:uppercase;font-weight:700;">Coroutines &amp; gizmos</td></tr>
+        <tr><td class="member"><code><span class="ty">CoroutineHandle</span> <span class="nm">StartCoroutine</span><span class="punc">(</span>IEnumerator&lt;IYieldInstruction&gt;<span class="punc">)</span></code></td><td class="note">Start a classic coroutine. <code>StopCoroutine(handle)</code> stops it. (See also the <a href="#Coroutine">async API</a>.)</td></tr>
+        <tr><td class="member"><code><span class="mod">public</span> <span class="ty">void</span> <span class="nm">OnDrawGizmos</span><span class="punc">(</span><span class="ty">IGizmos</span> g<span class="punc">)</span></code></td><td class="note">Editor scene-view drawing. <code>OnDrawGizmosSelected</code> runs only for the selected entity. No-op at runtime.</td></tr>
+      </table></div>
+    </div>
+
+    <!-- SceneBehaviour -->
+    <div class="api" id="SceneBehaviour" data-keywords="scenebehaviour scene wide skybox lighting">
+      <div class="api-head">
+        <div class="nameline">
+          <h3><span class="kw">class</span> SceneBehaviour <span class="base">: BObject</span></h3>
+          <span class="tag scene">Scene-wide</span>
+        </div>
+        <div class="file">Engine/BObject/Objects/SceneBehaviour.cs</div>
+        <div class="desc">A component that lives on the <i>Scene</i> rather than an entity — for settings that affect the
+          whole world (skybox, lighting, fog). It has its own "Scene" tab in the editor hierarchy.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="ty">bool</span> <span class="nm">IsEnabled</span> <span class="punc">{ get; set; }</span></code></td><td class="note">Master enable switch; <code>IsActive</code> mirrors it.</td></tr>
+        <tr><td class="member"><code><span class="mod">protected</span> <span class="ty">void</span> <span class="nm">OnAttach</span><span class="punc">()</span> / <span class="nm">OnDetach</span><span class="punc">()</span></code></td><td class="note">Added to / removed from the scene. The conventional pattern is a <code>static Active</code> set here, read by the renderer per frame.</td></tr>
+        <tr><td class="member"><code><span class="mod">public</span> <span class="ty">void</span> <span class="nm">OnDrawGizmos</span><span class="punc">(</span><span class="ty">IGizmos</span> g<span class="punc">)</span></code></td><td class="note">Editor scene-view drawing. Also <code>OnDrawGizmosSelected</code>.</td></tr>
+      </table></div>
+    </div>
+
+    <!-- Entity -->
+    <div class="api" id="Entity" data-keywords="entity gameobject instantiate addcomponent setactive tag layer">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">class</span> Entity <span class="base">: BObject</span></h3></div>
+        <div class="file">Engine/BObject/Objects/Entity.cs</div>
+        <div class="desc">The container for components and a transform — Unity's <code>GameObject</code>.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">Entity</span> <span class="nm">Instantiate</span><span class="punc">(</span><span class="ty">string</span> name<span class="punc">=</span><span class="lit">"Entity"</span><span class="punc">,</span> <span class="ty">bool</span> isActive<span class="punc">=</span><span class="lit">true</span><span class="punc">)</span></code></td><td class="note">Create a new entity and register it in the current scene.</td></tr>
+        <tr><td class="member"><code><span class="ty">void</span> <span class="nm">SetActive</span><span class="punc">(</span><span class="ty">bool</span> isActive<span class="punc">)</span></code></td><td class="note">Toggle the entity's active state; fires component lifecycle in play mode.</td></tr>
+        <tr><td class="member"><code><span class="ty">T</span> <span class="nm">AddComponent</span><span class="punc">&lt;</span><span class="ty">T</span><span class="punc">&gt;()</span></code></td><td class="note">Add a component. Also <code>GetComponent</code>, <code>TryGetComponent</code>, <code>GetComponents</code>, <code>GetComponentInChildren/Parent</code>, <code>RemoveComponent</code>.</td></tr>
+        <tr><td class="member"><code><span class="ty">Transform</span> <span class="nm">transform</span></code></td><td class="note">The entity's transform (always present).</td></tr>
+        <tr><td class="member"><code><span class="ty">bool</span> <span class="nm">IsActive</span> / <span class="nm">IsActiveInHierarchy</span> <span class="prop-badge">get</span></code></td><td class="note">This entity's own active flag vs. true only if it and every ancestor is active.</td></tr>
+        <tr><td class="member"><code><span class="ty">bool</span> <span class="nm">IsDestroyed</span> <span class="prop-badge">get</span></code></td><td class="note">True once marked for destruction. Spawn/destroy mid-frame is safe — corpses are skipped.</td></tr>
+        <tr><td class="member"><code><span class="ty">string</span> <span class="nm">Tag</span> · <span class="ty">int</span> <span class="nm">Layer</span></code></td><td class="note">Free-form tag (default <code>"Untagged"</code>; use <code>CompareTag</code>) and the physics/render layer 0..31.</td></tr>
+        <tr><td class="member"><code><span class="ty">IEnumerable&lt;Entity&gt;</span> <span class="nm">DirectChildren</span><span class="punc">()</span></code></td><td class="note">Entities whose transform parent is this one.</td></tr>
+      </table></div>
+    </div>
+
+    <!-- Transform -->
+    <div class="api" id="Transform" data-keywords="transform position rotation scale parent world forward up right euler">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">class</span> Transform <span class="base">: Component</span></h3></div>
+        <div class="file">Engine/BObject/Objects/Transform.cs</div>
+        <div class="desc">Position, rotation, and scale in 3D, with a parent-child hierarchy. Matrices are cached with version stamps — always go through the setters.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="ty">Vector3</span> <span class="nm">Position</span> · <span class="ty">Quaternion</span> <span class="nm">Rotation</span> · <span class="ty">Vector3</span> <span class="nm">Scale</span></code></td><td class="note">Local transform relative to the parent.</td></tr>
+        <tr><td class="member"><code><span class="ty">Vector3</span> <span class="nm">EulerAngles</span></code></td><td class="note">Local rotation in degrees (get/set convenience).</td></tr>
+        <tr><td class="member"><code><span class="ty">Vector3</span> <span class="nm">Forward</span> · <span class="nm">Up</span> · <span class="nm">Right</span> <span class="prop-badge">get</span></code></td><td class="note">Direction vectors derived from <code>Rotation</code>.</td></tr>
+        <tr><td class="member"><code><span class="ty">Vector3</span> <span class="nm">WorldPosition</span> · <span class="ty">Quaternion</span> <span class="nm">WorldRotation</span></code></td><td class="note">Transform composed in world space.</td></tr>
+        <tr><td class="member"><code><span class="ty">Matrix4</span> <span class="nm">LocalMatrix</span> · <span class="nm">WorldMatrix</span> <span class="prop-badge">get</span></code></td><td class="note">Cached SRT matrices.</td></tr>
+        <tr><td class="member"><code><span class="ty">Transform?</span> <span class="nm">Parent</span> <span class="prop-badge">get</span></code></td><td class="note">The parent transform (null = world root).</td></tr>
+        <tr><td class="member"><code><span class="ty">void</span> <span class="nm">SetParent</span><span class="punc">(</span><span class="ty">Transform?</span><span class="punc">)</span> · <span class="nm">SetParentKeepingWorld</span><span class="punc">(...)</span></code></td><td class="note">Reparent (the second variant preserves world transform). <code>IsDescendantOf</code> guards against cycles.</td></tr>
+      </table></div>
+    </div>
+
+    <!-- BObject -->
+    <div class="api" id="BObject" data-keywords="bobject base instanceid name">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">abstract class</span> BObject</h3><span class="tag abstract">Abstract</span></div>
+        <div class="file">Engine/BObject/Objects/BObject.cs</div>
+        <div class="desc">The root of every engine object — identity and naming. You rarely touch it directly.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="ty">Guid</span> <span class="nm">InstanceId</span> <span class="prop-badge">get</span></code></td><td class="note">Stable unique id; round-trips through serialization so references and selection survive undo/reload.</td></tr>
+        <tr><td class="member"><code><span class="ty">string</span> <span class="nm">Name</span></code></td><td class="note">Display name.</td></tr>
+      </table></div>
+    </div>
+
+    <!-- ============ SCENE ============ -->
+    <h2 class="section-title">Scene &amp; lifecycle</h2>
+
+    <div class="api" id="SceneManager" data-keywords="scenemanager play stop loadscene isplaying rendercamera findbyinstanceid buildscenes">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">static class</span> SceneManager</h3><span class="tag static">Static</span></div>
+        <div class="file">Engine/BObject/Scene/SceneManager.cs</div>
+        <div class="desc">Play/stop state, scene loading, and runtime lookups.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">bool</span> <span class="nm">IsPlaying</span> <span class="prop-badge">get</span></code></td><td class="note">True while the game is running in play mode.</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">void</span> <span class="nm">StartPlay</span><span class="punc">()</span> · <span class="nm">StopPlay</span><span class="punc">()</span></code></td><td class="note">Enter/exit play mode. Stop restores the pre-play YAML snapshot.</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">void</span> <span class="nm">LoadScene</span><span class="punc">(</span><span class="ty">string</span> name<span class="punc">)</span> · <span class="nm">LoadScene</span><span class="punc">(</span><span class="ty">int</span> buildIndex<span class="punc">)</span></code></td><td class="note">Load a scene by name or by build index (0 = startup). Build list = <code>ProjectManifest.ScenesInBuild</code>.</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">Scene</span> <span class="nm">GetCurrentScene</span><span class="punc">()</span></code></td><td class="note">The active scene (one per host in v1).</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">HDCamera</span> <span class="nm">RenderCamera</span> <span class="punc">{ get; set; }</span></code></td><td class="note">The active render camera (set by <code>HDCamera</code> on enable).</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">BObject</span> <span class="nm">FindByInstanceId</span><span class="punc">(</span><span class="ty">Guid</span> id<span class="punc">)</span></code></td><td class="note">Resolve an entity/component/scene-behaviour by id.</td></tr>
+      </table></div>
+    </div>
+
+    <div class="api" id="Scene" data-keywords="scene entities createentity destroyentity scenebehaviour">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">class</span> Scene</h3></div>
+        <div class="file">Engine/BObject/Scene/Scene.cs</div>
+        <div class="desc">The container for all entities and scene-wide components.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="ty">IReadOnlyList&lt;Entity&gt;</span> <span class="nm">Entities</span> <span class="prop-badge">get</span></code></td><td class="note">All entities in the scene.</td></tr>
+        <tr><td class="member"><code><span class="ty">Entity</span> <span class="nm">CreateEntity</span><span class="punc">(</span><span class="ty">string</span> name<span class="punc">)</span> · <span class="ty">void</span> <span class="nm">DestroyEntity</span><span class="punc">(</span><span class="ty">Entity</span><span class="punc">)</span></code></td><td class="note">Create/remove an entity explicitly in this scene.</td></tr>
+        <tr><td class="member"><code><span class="ty">T</span> <span class="nm">AddSceneBehaviour</span><span class="punc">&lt;</span><span class="ty">T</span><span class="punc">&gt;()</span> · <span class="ty">T</span> <span class="nm">GetSceneBehaviour</span><span class="punc">&lt;</span><span class="ty">T</span><span class="punc">&gt;()</span></code></td><td class="note">Add/get a scene-wide component. Also <code>RemoveSceneBehaviour</code>.</td></tr>
+      </table></div>
+    </div>
+
+    <!-- ============ INPUT / TIME ============ -->
+    <h2 class="section-title">Input &amp; time</h2>
+
+    <div class="api" id="Input" data-keywords="input keyboard mouse keys keydown keypressed mousedelta scroll enabled">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">static class</span> Input</h3><span class="tag static">Static</span></div>
+        <div class="file">Abstraction/API Bindings/Input.cs</div>
+        <div class="desc">Keyboard, mouse, and scroll polling. Key/button enums come from
+          <code>OpenTK.Windowing.GraphicsLibraryFramework</code> (<code>Keys</code>, <code>MouseButton</code>).</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">bool</span> <span class="nm">Enabled</span> <span class="punc">{ get; set; }</span></code></td><td class="note">Master gate. The editor turns it off outside play-with-Game-view-focused so debug keys don't leak into editing.</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">bool</span> <span class="nm">IsKeyDown</span><span class="punc">(</span><span class="ty">Keys</span> key<span class="punc">)</span></code></td><td class="note">True while the key is held.</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">bool</span> <span class="nm">IsKeyPressed</span><span class="punc">(</span><span class="ty">Keys</span> key<span class="punc">)</span></code></td><td class="note">True only on the frame the key went down (one-frame pulse).</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">bool</span> <span class="nm">IsMouseButtonDown</span><span class="punc">(</span><span class="ty">MouseButton</span><span class="punc">)</span> · <span class="nm">IsMouseButtonPressed</span><span class="punc">(...)</span></code></td><td class="note">Held vs. one-frame pulse for mouse buttons.</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">Vector2</span> <span class="nm">MousePosition</span> · <span class="nm">MouseDelta</span> · <span class="nm">ScrollDelta</span></code></td><td class="note">Cursor pixel position; raw per-frame movement (for FPS look, works while grabbed); scroll wheel delta.</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">bool</span> <span class="nm">PointerInGameView</span></code></td><td class="note">True while the cursor is over the game surface (always true in the standalone player). Gate "click to capture cursor" with it.</td></tr>
+      </table></div>
+    </div>
+
+    <div class="api" id="Time" data-keywords="time deltatime totaltime">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">static class</span> Time</h3><span class="tag static">Static</span></div>
+        <div class="file">Abstraction/API Bindings/Time.cs</div>
+        <div class="desc">Frame timing.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">double</span> <span class="nm">DeltaTime</span></code></td><td class="note">Seconds elapsed this frame. (Most hooks also receive <code>delta</code> directly.)</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">double</span> <span class="nm">TotalTime</span></code></td><td class="note">Total seconds since engine start.</td></tr>
+      </table></div>
+    </div>
+
+    <div class="api" id="Window" data-keywords="window width height current">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">static class</span> Window</h3><span class="tag static">Static</span></div>
+        <div class="file">Abstraction/API Bindings/Window.cs</div>
+        <div class="desc">The active game window.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">IWindow</span> <span class="nm">Current</span> <span class="prop-badge">get</span></code></td><td class="note">Access dimensions via <code>Current.Width</code> / <code>Current.Height</code> (pixels).</td></tr>
+      </table></div>
+    </div>
+
+    <!-- ============ PHYSICS ============ -->
+    <h2 class="section-title">Physics</h2>
+    <p class="section-desc">BepuPhysics 2 behind a facade. Bodies exist <b>in play mode only</b> and step at a fixed
+      60&nbsp;Hz. Add a <code>Rigidbody</code> for a simulated body; add colliders for shapes (a collider with no
+      rigidbody becomes static level geometry).</p>
+
+    <div class="api" id="Physics" data-keywords="physics raycast gravity fixedtimestep overlapsphere overlapbox layermask">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">static class</span> Physics</h3><span class="tag static">Static</span></div>
+        <div class="file">Engine/Physics/Physics.cs</div>
+        <div class="desc">Global physics config and spatial queries — Unity's <code>Physics</code> class.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">Vector3</span> <span class="nm">Gravity</span> <span class="punc">{ get; set; }</span></code></td><td class="note">World gravity (default <code>(0, -9.81, 0)</code>).</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">float</span> <span class="nm">FixedTimestep</span> <span class="punc">{ get; set; }</span></code></td><td class="note">Step interval (default <code>1/60</code> s).</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">bool</span> <span class="nm">Raycast</span><span class="punc">(</span><span class="ty">Vector3</span> origin<span class="punc">,</span> <span class="ty">Vector3</span> dir<span class="punc">,</span> <span class="mod">out</span> <span class="ty">RaycastHit</span> hit<span class="punc">,</span> <span class="ty">float</span> maxDist<span class="punc">,</span> <span class="ty">int</span> layerMask<span class="punc">)</span></code></td><td class="note">Cast a ray; returns true on hit. The "Ignore Raycast" layer (2) is excluded by default. A no-out overload just answers "did it hit anything".</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">List&lt;Collider&gt;</span> <span class="nm">OverlapSphere</span><span class="punc">(</span><span class="ty">Vector3</span> center<span class="punc">,</span> <span class="ty">float</span> radius<span class="punc">,</span> <span class="ty">int</span> layerMask<span class="punc">)</span></code></td><td class="note">All colliders intersecting a sphere.</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">List&lt;Collider&gt;</span> <span class="nm">OverlapBox</span><span class="punc">(</span><span class="ty">Vector3</span> center<span class="punc">,</span> <span class="ty">Vector3</span> halfExtents<span class="punc">,</span> <span class="ty">Quaternion</span> orient<span class="punc">,</span> <span class="ty">int</span> layerMask<span class="punc">)</span></code></td><td class="note">All colliders intersecting an oriented box.</td></tr>
+      </table></div>
+    </div>
+
+    <div class="api" id="RaycastHit" data-keywords="raycasthit point normal distance collider rigidbody entity">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">struct</span> RaycastHit</h3><span class="tag struct">Struct</span></div>
+        <div class="file">Engine/Physics/Physics.cs</div>
+        <div class="desc">What a raycast hit, mapped back to scene objects.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="ty">Vector3</span> <span class="nm">Point</span> · <span class="nm">Normal</span></code></td><td class="note">World-space contact point and unit surface normal.</td></tr>
+        <tr><td class="member"><code><span class="ty">float</span> <span class="nm">Distance</span></code></td><td class="note">Distance from ray origin.</td></tr>
+        <tr><td class="member"><code><span class="ty">Collider</span> <span class="nm">Collider</span> · <span class="ty">Rigidbody</span> <span class="nm">Rigidbody</span> · <span class="ty">Entity</span> <span class="nm">Entity</span></code></td><td class="note">The objects hit (<code>Collider</code>/<code>Rigidbody</code> may be null for collider-less or static hits).</td></tr>
+      </table></div>
+    </div>
+
+    <div class="api" id="Rigidbody" data-keywords="rigidbody velocity addforce addimpulse mass kinematic freezerotation usegravity teleport">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">class</span> Rigidbody <span class="base">: Behaviour</span></h3></div>
+        <div class="file">Engine/Physics/Rigidbody.cs</div>
+        <div class="desc">Makes an entity physically simulated. A dynamic body owns its transform during play —
+          move it with <code>Velocity</code>/<code>AddForce</code>, not by writing the transform (that teleports it).</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="ty">float</span> <span class="nm">Mass</span> <span class="punc">{ get; set; }</span></code></td><td class="note">Mass in kg (default 1).</td></tr>
+        <tr><td class="member"><code><span class="ty">bool</span> <span class="nm">IsKinematic</span> · <span class="nm">FreezeRotation</span> · <span class="nm">UseGravity</span></code></td><td class="note">Kinematic = driven by transform/code (pushes dynamics). FreezeRotation keeps upright capsules from tipping. UseGravity default true.</td></tr>
+        <tr><td class="member"><code><span class="ty">float</span> <span class="nm">LinearDamping</span> · <span class="nm">AngularDamping</span></code></td><td class="note">Velocity drag per second.</td></tr>
+        <tr><td class="member"><code><span class="ty">Vector3</span> <span class="nm">Velocity</span> · <span class="nm">AngularVelocity</span> <span class="punc">{ get; set; }</span></code></td><td class="note">Linear (m/s) and angular (rad/s) velocity. Setting wakes the body. <span class="prop-badge">NotSerialized</span></td></tr>
+        <tr><td class="member"><code><span class="ty">void</span> <span class="nm">AddForce</span><span class="punc">(</span><span class="ty">Vector3</span><span class="punc">)</span> · <span class="nm">AddTorque</span><span class="punc">(</span><span class="ty">Vector3</span><span class="punc">)</span></code></td><td class="note">Continuous force (N) / torque (N·m), accumulated over the step.</td></tr>
+        <tr><td class="member"><code><span class="ty">void</span> <span class="nm">AddImpulse</span><span class="punc">(</span><span class="ty">Vector3</span><span class="punc">)</span> · <span class="nm">AddImpulseAtPosition</span><span class="punc">(...)</span> · <span class="nm">AddAngularImpulse</span><span class="punc">(...)</span></code></td><td class="note">Instantaneous impulses (kg·m/s). The "AtPosition" variant induces rotation.</td></tr>
+        <tr><td class="member"><code><span class="ty">void</span> <span class="nm">Teleport</span><span class="punc">(</span><span class="ty">Vector3</span> pos<span class="punc">,</span> <span class="ty">Quaternion</span> rot<span class="punc">)</span></code></td><td class="note">Instantly move a dynamic body without an interpolated sweep.</td></tr>
+      </table></div>
+    </div>
+
+    <div class="api" id="Collider" data-keywords="collider box sphere capsule mesh istrigger center friction bounciness size radius height">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">abstract class</span> Collider <span class="base">: Behaviour</span></h3><span class="tag abstract">Abstract</span></div>
+        <div class="file">Engine/Physics/Collider.cs <span style="color:var(--text-faint)">(+ BoxCollider, SphereCollider, CapsuleCollider, MeshCollider)</span></div>
+        <div class="desc">A collision shape. On the same entity as a <code>Rigidbody</code> it compounds into that body;
+          alone it becomes static geometry. Primitives auto-fit to the render mesh when first added.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="ty">Vector3</span> <span class="nm">Center</span> · <span class="ty">float</span> <span class="nm">Friction</span> · <span class="ty">float</span> <span class="nm">Bounciness</span></code></td><td class="note">Local offset; friction (default 0.6); restitution 0..1 (soft contact springs — see physics notes).</td></tr>
+        <tr><td class="member"><code><span class="ty">bool</span> <span class="nm">IsTrigger</span> <span class="punc">{ get; set; }</span></code></td><td class="note">Detect overlaps (<code>OnTrigger*</code> callbacks) without a physical response.</td></tr>
+        <tr><td class="member"><code><span class="ty">Rigidbody</span> <span class="nm">AttachedRigidbody</span></code></td><td class="note">The rigidbody on this entity, if any.</td></tr>
+        <tr><td colspan="2" style="padding:8px 24px 2px;color:var(--text-faint);font-size:11px;letter-spacing:1px;text-transform:uppercase;font-weight:700;">Shape-specific</td></tr>
+        <tr><td class="member"><code><span class="ty">BoxCollider</span> · <span class="ty">Vector3</span> <span class="nm">Size</span></code></td><td class="note">Full extents (default 1×1×1).</td></tr>
+        <tr><td class="member"><code><span class="ty">SphereCollider</span> · <span class="ty">float</span> <span class="nm">Radius</span></code></td><td class="note">Radius (default 0.5).</td></tr>
+        <tr><td class="member"><code><span class="ty">CapsuleCollider</span> · <span class="ty">float</span> <span class="nm">Radius</span><span class="punc">,</span> <span class="nm">Height</span></code></td><td class="note">Capsule along local Y (character bodies). Height includes caps.</td></tr>
+        <tr><td class="member"><code><span class="ty">MeshCollider</span> · <span class="ty">Mesh</span> <span class="nm">SharedMesh</span></code></td><td class="note"><b>Static-only</b> triangle-accurate concave collision. Null = use the entity's <code>StaticMeshRenderer</code> mesh. One-sided (solid from the front face).</td></tr>
+      </table></div>
+    </div>
+
+    <div class="api" id="Collision" data-keywords="collision contact point normal collider rigidbody entity">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">struct</span> Collision</h3><span class="tag struct">Struct</span></div>
+        <div class="file">Engine/Physics/Collision.cs</div>
+        <div class="desc">Passed to <code>OnCollisionEnter/Stay/Exit</code>.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="ty">Collider</span> <span class="nm">Collider</span> · <span class="ty">Rigidbody</span> <span class="nm">Rigidbody</span> · <span class="ty">Entity</span> <span class="nm">Entity</span></code></td><td class="note">The <i>other</i> object you collided with (Collider/Rigidbody may be null).</td></tr>
+        <tr><td class="member"><code><span class="ty">Vector3</span> <span class="nm">Point</span> · <span class="nm">Normal</span></code></td><td class="note">World contact point; unit normal pointing from the other object toward you.</td></tr>
+      </table></div>
+    </div>
+
+    <!-- ============ RENDERING ============ -->
+    <h2 class="section-title">Rendering components</h2>
+
+    <div class="api" id="Renderer" data-keywords="renderer sharedmesh sharedmaterial submeshindex material">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">abstract class</span> Renderer <span class="base">: Behaviour</span></h3><span class="tag abstract">Abstract</span></div>
+        <div class="file">Engine/Rendering/Renderer.cs</div>
+        <div class="desc">Base for drawable components.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="ty">Mesh</span> <span class="nm">SharedMesh</span> · <span class="ty">Material</span> <span class="nm">SharedMaterial</span></code></td><td class="note">The shared asset references. Leave <code>SharedMaterial</code> null to fall back to the mesh's baked per-submesh materials.</td></tr>
+        <tr><td class="member"><code><span class="ty">int</span> <span class="nm">SubMeshIndex</span></code></td><td class="note"><code>-1</code> = whole mesh; <code>&ge; 0</code> = one submesh (set by split-by-nodes model instantiation).</td></tr>
+        <tr><td class="member"><code><span class="ty">Material</span> <span class="nm">Material</span> <span class="prop-badge">get</span></code></td><td class="note">A per-renderer clone you can mutate at runtime without affecting the shared asset.</td></tr>
+      </table></div>
+    </div>
+
+    <div class="api" id="StaticMeshRenderer" data-keywords="staticmeshrenderer mesh material draw">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">class</span> StaticMeshRenderer <span class="base">: Renderer</span></h3></div>
+        <div class="file">Engine/Rendering/Renderers/StaticMeshRenderer.cs</div>
+        <div class="desc">Renders an assigned mesh with an assigned material — the workhorse drawable.</div>
+      </div>
+      <div class="api-body">
+        <pre><span class="t">var</span> r <span class="punc">=</span> entity.<span class="f">AddComponent</span><span class="t">&lt;StaticMeshRenderer&gt;</span><span class="punc">();</span>
+r.SharedMesh     <span class="punc">=</span> AssetDatabase.<span class="f">Load</span><span class="t">&lt;Mesh&gt;</span><span class="punc">(</span><span class="s">"Assets/Models/Crate.fbx"</span><span class="punc">);</span>
+r.SharedMaterial <span class="punc">=</span> AssetDatabase.<span class="f">Load</span><span class="t">&lt;Material&gt;</span><span class="punc">(</span><span class="s">"Assets/Materials/Crate.mat"</span><span class="punc">);</span></pre>
+      </div>
+    </div>
+
+    <div class="api" id="Lights" data-keywords="light directionallight pointlight spotlight illuminance lumens colortemperature range castshadows sun">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">class</span> DirectionalLight · PointLight · SpotLight <span class="base">: Behaviour</span></h3></div>
+        <div class="file">Engine/Rendering/DirectionalLight.cs · PointLight.cs · SpotLight.cs</div>
+        <div class="desc">Physically-based lights driven by real units — lux for the sun, lumens for local lights, plus a
+          Kelvin color temperature. Lights point along <code>transform.Forward</code>.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="ty">DirectionalLight</span> · <span class="ty">float</span> <span class="nm">Illuminance</span></code></td><td class="note">Sun brightness in lux (default 80000). Plus <code>ColorTemperature</code> (K), <code>AngularDiameter</code>, <code>ShadowDistance</code>. <code>static DirectionalLight Instance</code> is the scene sun.</td></tr>
+        <tr><td class="member"><code><span class="ty">PointLight</span> · <span class="ty">float</span> <span class="nm">Lumens</span><span class="punc">,</span> <span class="nm">Range</span></code></td><td class="note">Luminous power (default 1500) and reach (default 10). Plus <code>Color</code>, <code>Intensity</code>, <code>ColorTemperature</code>, <code>CastShadows</code>.</td></tr>
+        <tr><td class="member"><code><span class="ty">SpotLight</span> · <span class="ty">float</span> <span class="nm">Lumens</span><span class="punc">,</span> <span class="nm">Range</span><span class="punc">,</span> <span class="nm">InnerAngle</span><span class="punc">,</span> <span class="nm">OuterAngle</span></code></td><td class="note">Cone light. Inner = full brightness, fades to zero at outer (degrees). Plus <code>Color</code>, <code>ColorTemperature</code>, <code>CastShadows</code>.</td></tr>
+      </table></div>
+    </div>
+
+    <div class="api" id="SceneEnv" data-keywords="skybox scenelighting proceduralsky cubemap exposure ambient fog shadow hdcamera camera">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">class</span> Skybox · SceneLighting <span class="base">: SceneBehaviour</span></h3><span class="tag scene">Scene-wide</span></div>
+        <div class="file">Engine/Rendering/Renderers/Skybox.cs · Engine/Rendering/SceneLighting.cs</div>
+        <div class="desc">Scene-wide environment. Each exposes a <code>static Active</code> the renderer reads per frame.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="ty">Skybox</span> · <span class="ty">Texture3D</span> <span class="nm">Cubemap</span> · <span class="ty">float</span> <span class="nm">Exposure</span></code></td><td class="note">Sky cubemap (supports equirect .hdr/.exr) and luminance scale (default 5000). Plus <code>RotationEuler</code>.</td></tr>
+        <tr><td class="member"><code><span class="ty">SceneLighting</span> · <span class="ty">float</span> <span class="nm">AmbientIntensity</span><span class="punc">,</span> <span class="nm">ShadowStrength</span></code></td><td class="note">Ambient/reflection strength, shadow color &amp; strength, and distance fog (<code>FogEnabled/Color/Density</code>).</td></tr>
+        <tr><td class="member"><code><span class="ty">HDCamera</span> <span class="base">: Behaviour</span></code></td><td class="note">The render camera. Registers as <code>SceneManager.RenderCamera</code> when enabled; provides view/projection.</td></tr>
+      </table></div>
+    </div>
+
+    <div class="api" id="Terrain" data-keywords="terrain heightmap terrainasset generatecollider rebuild material">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">class</span> Terrain <span class="base">: Behaviour</span></h3></div>
+        <div class="file">Engine/Rendering/Terrain/Terrain.cs</div>
+        <div class="desc">Heightmap terrain. Builds a mesh from a <code>.terrain</code> asset and drives a sibling
+          <code>StaticMeshRenderer</code> (and optional <code>MeshCollider</code>).</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="ty">TerrainAsset</span> <span class="nm">Terrain3D</span> · <span class="ty">Material</span> <span class="nm">Material</span></code></td><td class="note">The height field asset and the render material (null = engine default).</td></tr>
+        <tr><td class="member"><code><span class="ty">bool</span> <span class="nm">GenerateCollider</span></code></td><td class="note">Auto-create a static <code>MeshCollider</code> (default true).</td></tr>
+        <tr><td class="member"><code><span class="ty">void</span> <span class="nm">Rebuild</span><span class="punc">()</span></code></td><td class="note">Force an immediate mesh rebuild (sculpt tools call this).</td></tr>
+      </table></div>
+    </div>
+
+    <!-- ============ POST-PROCESSING ============ -->
+    <h2 class="section-title">Post-processing volumes</h2>
+    <p class="section-desc">A Unity-style volume framework. A <code>Volume</code> component contributes a
+      <code>VolumeProfile</code> (a <code>.volume</code> asset) into a blended stack. To add a new effect,
+      subclass <code>VolumeComponent</code> with public <code>VolumeParameter</code> fields — no other wiring.</p>
+
+    <div class="api" id="Volume" data-keywords="volume isglobal priority weight blenddistance boxsize profile postprocessing">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">class</span> Volume <span class="base">: Behaviour</span></h3></div>
+        <div class="file">Engine/Rendering/Volumes/Volume.cs</div>
+        <div class="desc">Blends a profile of post-process overrides into the frame — global, or local inside a box.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="ty">bool</span> <span class="nm">IsGlobal</span> · <span class="ty">float</span> <span class="nm">Priority</span> · <span class="nm">Weight</span></code></td><td class="note">Global = everywhere; local = inside the box. Higher priority wins; weight is 0..1 master strength.</td></tr>
+        <tr><td class="member"><code><span class="ty">float</span> <span class="nm">BlendDistance</span> · <span class="ty">Vector3</span> <span class="nm">BoxSize</span></code></td><td class="note">Fade distance outside a local box, and the box size (scaled by the transform).</td></tr>
+        <tr><td class="member"><code><span class="ty">VolumeProfile</span> <span class="nm">Profile</span></code></td><td class="note">The shared <code>.volume</code> asset of overrides.</td></tr>
+      </table></div>
+    </div>
+
+    <div class="api" id="VolumeComponent" data-keywords="volumecomponent volumeparameter floatparameter clampedfloat colorparameter enumparameter custom effect override">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">class</span> VolumeComponent · VolumeParameter</h3></div>
+        <div class="file">Engine/Rendering/Volumes/VolumeComponent.cs · VolumeParameter.cs</div>
+        <div class="desc">Subclass <code>VolumeComponent</code> and declare public readonly <code>VolumeParameter</code> fields.
+          The base constructor discovers them by reflection, so blending, serialization, and editor UI all work for free.</div>
+      </div>
+      <div class="api-body">
+        <table>
+          <tr><td class="member"><code>FloatParameter · ClampedFloatParameter</code></td><td class="note">Float, optionally clamped to <code>[min,max]</code> (slider in the editor).</td></tr>
+          <tr><td class="member"><code>IntParameter · ClampedIntParameter · BoolParameter</code></td><td class="note">Integer / clamped integer / boolean.</td></tr>
+          <tr><td class="member"><code>Vector3Parameter · ColorParameter · EnumParameter&lt;T&gt;</code></td><td class="note">Vector, color (HDR flag), and enum choices.</td></tr>
+        </table>
+        <pre><span class="punc">[</span><span class="t">Component</span><span class="punc">(</span>displayName<span class="punc">:</span> <span class="s">"My Effect"</span><span class="punc">)]</span>
+<span class="k">public class</span> <span class="t">MyEffect</span> <span class="punc">:</span> <span class="t">VolumeComponent</span> <span class="punc">{</span>
+    <span class="k">public readonly</span> <span class="t">ClampedFloatParameter</span> <span class="f">Intensity</span> <span class="punc">=</span> <span class="k">new</span><span class="punc">(</span><span class="n">1f</span><span class="punc">,</span> <span class="n">0f</span><span class="punc">,</span> <span class="n">2f</span><span class="punc">);</span>
+    <span class="k">public readonly</span> <span class="t">BoolParameter</span>         <span class="f">Enabled</span>   <span class="punc">=</span> <span class="k">new</span><span class="punc">(</span><span class="k">true</span><span class="punc">);</span>
+<span class="punc">}</span></pre>
+      </div>
+    </div>
+
+    <!-- ============ ASYNC ============ -->
+    <h2 class="section-title">Async &amp; coroutines</h2>
+
+    <div class="api" id="Coroutine" data-keywords="coroutine async await nextframe delayseconds waituntil waitwhile endofframe runafter">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">static class</span> Coroutine</h3><span class="tag static">Static</span></div>
+        <div class="file">Engine/Async/Coroutine.cs</div>
+        <div class="desc">Two styles: modern <code>async/await</code> (preferred) and classic <code>IEnumerator</code> (Unity parity).</div>
+      </div>
+      <div class="api-body">
+        <table>
+          <tr><td class="member"><code><span class="mod">static</span> <span class="ty">…</span> <span class="nm">NextFrame</span><span class="punc">()</span> · <span class="nm">EndOfFrame</span><span class="punc">()</span> · <span class="nm">WaitForFixedTick</span><span class="punc">()</span></code></td><td class="note">Awaitables that resume next frame / after render / on the next fixed step.</td></tr>
+          <tr><td class="member"><code><span class="mod">static</span> <span class="ty">…</span> <span class="nm">DelaySeconds</span><span class="punc">(</span><span class="ty">float</span><span class="punc">)</span> · <span class="nm">WaitUntil</span><span class="punc">(</span><span class="ty">Func&lt;bool&gt;</span><span class="punc">)</span> · <span class="nm">WaitWhile</span><span class="punc">(...)</span></code></td><td class="note">Resume after N seconds, or once a predicate flips.</td></tr>
+          <tr><td class="member"><code><span class="mod">static</span> <span class="ty">void</span> <span class="nm">RunAfter</span><span class="punc">(</span><span class="ty">float</span><span class="punc">,</span> <span class="ty">Action</span><span class="punc">)</span> · <span class="nm">RunNextFrame</span><span class="punc">(...)</span> · <span class="nm">RunWhen</span><span class="punc">(...)</span></code></td><td class="note">One-liner schedulers with no coroutine boilerplate. <code>RunEveryFrame</code> repeats.</td></tr>
+        </table>
+        <pre><span class="k">async void</span> <span class="f">Spawn</span><span class="punc">()</span> <span class="punc">{</span>
+    <span class="k">await</span> Coroutine.<span class="f">DelaySeconds</span><span class="punc">(</span><span class="n">2f</span><span class="punc">);</span>
+    <span class="k">await</span> Coroutine.<span class="f">WaitUntil</span><span class="punc">(()</span> <span class="punc">=&gt;</span> ready<span class="punc">);</span>
+    <span class="f">DoSomething</span><span class="punc">();</span>
+<span class="punc">}</span></pre>
+      </div>
+    </div>
+
+    <!-- ============ ASSETS ============ -->
+    <h2 class="section-title">Assets</h2>
+
+    <div class="api" id="AssetDatabase" data-keywords="assetdatabase load loadref guid asset path texture mesh material">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">static class</span> AssetDatabase</h3><span class="tag static">Static</span></div>
+        <div class="file">AssetPipeline/AssetDatabase.cs</div>
+        <div class="desc">Load assets by path or GUID. Instances are cached. <b>Never throws</b> — on a missing or broken asset it
+          logs and returns null (materials substitute fallback textures).</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">T</span> <span class="nm">Load</span><span class="punc">&lt;</span><span class="ty">T</span><span class="punc">&gt;(</span><span class="ty">string</span> assetPath<span class="punc">)</span></code></td><td class="note">Load by <code>"Assets/…"</code> path. <code>T</code> is the asset type (<code>Mesh</code>, <code>Material</code>, <code>Texture2D</code>, …).</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">T</span> <span class="nm">Load</span><span class="punc">&lt;</span><span class="ty">T</span><span class="punc">&gt;(</span><span class="ty">Guid</span> guid<span class="punc">)</span></code></td><td class="note">Load by GUID (rename-proof).</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">T</span> <span class="nm">LoadRef</span><span class="punc">&lt;</span><span class="ty">T</span><span class="punc">&gt;(</span><span class="ty">string</span> reference<span class="punc">)</span></code></td><td class="note">Accepts both <code>"Assets/…"</code> and <code>"guid:&lt;32hex&gt;"</code> forms.</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">bool</span> <span class="nm">TryGetGuid</span><span class="punc">(</span><span class="ty">string</span><span class="punc">,</span> <span class="mod">out</span> <span class="ty">Guid</span><span class="punc">)</span> · <span class="ty">string</span> <span class="nm">GuidToAssetPath</span><span class="punc">(...)</span></code></td><td class="note">Resolve between paths and GUIDs.</td></tr>
+      </table></div>
+    </div>
+
+    <div class="api" id="AssetTypes" data-keywords="mesh material texture2d texture3d shader terrainasset asset types create clone">
+      <div class="api-head">
+        <div class="nameline"><h3>Loadable asset types</h3></div>
+        <div class="file">Engine/Rendering/SData/* · Engine/Rendering/Terrain/*</div>
+        <div class="desc">The GPU asset types you pass to <code>AssetDatabase.Load&lt;T&gt;</code> and assign to components.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="ty">Mesh</span></code></td><td class="note">Vertices/normals/tangents/UVs/indices + submeshes. <code>GetLocalBounds(out min, out max)</code>; <code>Mesh.Create(in MeshData)</code>.</td></tr>
+        <tr><td class="member"><code><span class="ty">Material</span></code></td><td class="note">PBR: texture slots (<code>Diffuse</code>, <code>Normal</code>, <code>Metallic</code>, <code>Roughness</code>, <code>AO</code>, <code>Emissive</code>) + scalar factors (<code>BaseColorFactor</code>, <code>MetallicFactor</code>, …), <code>Transparent</code>, <code>Cutout</code>. <code>Clone()</code> for per-renderer variants.</td></tr>
+        <tr><td class="member"><code><span class="ty">Texture2D</span> · <span class="ty">Texture3D</span></code></td><td class="note">2D texture and cubemap. Loading any image asset <i>as</i> <code>Texture3D</code> builds an equirect skybox.</td></tr>
+        <tr><td class="member"><code><span class="ty">Shader</span></code></td><td class="note">A shader program (<code>SetFloat/Float3/Matrix4/…</code>). Usually assigned via material, not authored in scripts.</td></tr>
+        <tr><td class="member"><code><span class="ty">TerrainAsset</span></code></td><td class="note">Editable height field — <code>HeightAt(x,z)</code>, <code>SetHeight(...)</code>, <code>Resolution</code>, <code>Size</code>.</td></tr>
+        <tr><td class="member"><code><span class="ty">DataAsset</span></code></td><td class="note">Base for your own data-only assets (<code>.asset</code>). Mark a subclass <code>[CreateDataAsset(...)]</code> to make it creatable from the asset browser; <code>DataAsset.CreateInstance&lt;T&gt;()</code>.</td></tr>
+      </table></div>
+    </div>
+
+    <div class="api" id="Prefab" data-keywords="prefab prefabasset instantiate blueprint">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">class</span> PrefabAsset</h3></div>
+        <div class="file">Engine/BObject/Prefab/PrefabAsset.cs</div>
+        <div class="desc">A reusable entity blueprint (a <code>.prefab</code> YAML asset).</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="ty">Entity</span> <span class="nm">Instantiate</span><span class="punc">()</span></code></td><td class="note">Spawn an instance into the current scene. Overloads take a position+rotation or a parent transform.</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">PrefabAsset</span> <span class="nm">FromEntity</span><span class="punc">(</span><span class="ty">Entity</span> root<span class="punc">)</span></code></td><td class="note">Capture an existing entity tree as a prefab.</td></tr>
+      </table></div>
+    </div>
+
+    <!-- ============ UTILITY ============ -->
+    <h2 class="section-title">Utility</h2>
+
+    <div class="api" id="Debug" data-keywords="debug log logwarning logerror assert drawline drawray drawwiresphere gizmo">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">static class</span> Debug</h3><span class="tag static">Static</span></div>
+        <div class="file">Engine/Debug/Debug.cs</div>
+        <div class="desc">Logging and debug drawing — Unity's <code>Debug</code>. Logs appear in the editor Console; draw calls
+          render in the scene view. <code>duration</code> 0 = this frame only, &gt;0 = persist for N seconds.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">void</span> <span class="nm">Log</span><span class="punc">(</span><span class="ty">object</span> msg<span class="punc">,</span> <span class="ty">BObject</span> context<span class="punc">=</span><span class="lit">null</span><span class="punc">)</span></code></td><td class="note">Also <code>LogWarning</code>, <code>LogError</code>, and <code>Assert(condition, msg)</code>.</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">void</span> <span class="nm">DrawLine</span><span class="punc">(</span><span class="ty">Vector3</span> a<span class="punc">,</span> <span class="ty">Vector3</span> b<span class="punc">,</span> <span class="ty">Vector3</span> color<span class="punc">,</span> <span class="ty">float</span> duration<span class="punc">=</span><span class="lit">0</span><span class="punc">)</span></code></td><td class="note">Draw a line. Also <code>DrawRay</code>.</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">void</span> <span class="nm">DrawWireSphere</span><span class="punc">(...)</span> · <span class="nm">DrawWireCube</span><span class="punc">(...)</span></code></td><td class="note">Wireframe debug shapes.</td></tr>
+      </table></div>
+    </div>
+
+    <div class="api" id="Layers" data-keywords="layer layermask tag tagmanager layermanager collision matrix nametolayer getmask">
+      <div class="api-head">
+        <div class="nameline"><h3><span class="kw">static class</span> LayerMask · LayerManager · TagManager</h3><span class="tag static">Static</span></div>
+        <div class="file">Engine/BObject/Tags/*.cs</div>
+        <div class="desc">Unity-style 32 layers (drive the physics collision matrix and raycast masks) and free-form tags.</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">LayerMask</span> <span class="nm">GetMask</span><span class="punc">(</span><span class="mod">params</span> <span class="ty">string[]</span> names<span class="punc">)</span></code></td><td class="note">Build a mask from layer names. Plus <code>Everything</code>, <code>Nothing</code>, <code>FromLayer(int)</code>, implicit <code>int</code> conversions.</td></tr>
+        <tr><td class="member"><code><span class="mod">static</span> <span class="ty">int</span> <span class="nm">NameToLayer</span><span class="punc">(</span><span class="ty">string</span><span class="punc">)</span> · <span class="ty">string</span> <span class="nm">LayerToName</span><span class="punc">(</span><span class="ty">int</span><span class="punc">)</span></code></td><td class="note">Resolve between layer names and indices.</td></tr>
+        <tr><td class="member"><code><span class="ty">Entity.</span><span class="nm">CompareTag</span><span class="punc">(</span><span class="ty">string</span><span class="punc">)</span></code></td><td class="note">Test an entity's tag. Defaults include <code>Player</code>, <code>Enemy</code>, <code>MainCamera</code>, <code>Respawn</code>, <code>Finish</code>.</td></tr>
+      </table></div>
+    </div>
+
+    <!-- ============ ATTRIBUTES ============ -->
+    <h2 class="section-title">Inspector &amp; serialization attributes</h2>
+    <p class="section-desc">Decorate component fields and properties to control the editor and serialization.
+      <b>Public fields and read/write properties serialize and appear in the Inspector by default</b> — these
+      attributes refine that.</p>
+
+    <div class="api" id="Attributes" data-keywords="attributes range header tooltip hideininspector notserialized readonly serializefield colorusage button foldoutgroup createdataasset component space">
+      <div class="api-head">
+        <div class="nameline"><h3>Editor attributes</h3></div>
+        <div class="file">Engine/Attributes/EditorAttributes.cs</div>
+      </div>
+      <div class="api-body"><table>
+        <tr><td class="member"><code><span class="punc">[</span><span class="ty">Range</span><span class="punc">(</span><span class="ty">float</span> min<span class="punc">,</span> <span class="ty">float</span> max<span class="punc">)]</span></code></td><td class="note">Render a numeric member as a clamped slider.</td></tr>
+        <tr><td class="member"><code><span class="punc">[</span><span class="ty">Header</span><span class="punc">(</span><span class="ty">string</span><span class="punc">)]</span> · <span class="punc">[</span><span class="ty">Tooltip</span><span class="punc">(...)</span><span class="punc">]</span> · <span class="punc">[</span><span class="ty">Space</span><span class="punc">]</span></code></td><td class="note">Section label, hover tooltip, vertical spacing.</td></tr>
+        <tr><td class="member"><code><span class="punc">[</span><span class="ty">HideInInspector</span><span class="punc">]</span></code></td><td class="note">Hide from the Inspector but <b>still serialize</b> the value.</td></tr>
+        <tr><td class="member"><code><span class="punc">[</span><span class="ty">NotSerialized</span><span class="punc">]</span></code></td><td class="note">Exclude from <b>both</b> serialization and the Inspector — for runtime-only state (e.g. <code>Rigidbody.Velocity</code>).</td></tr>
+        <tr><td class="member"><code><span class="punc">[</span><span class="ty">ReadOnly</span><span class="punc">]</span> · <span class="punc">[</span><span class="ty">SerializeField</span><span class="punc">]</span></code></td><td class="note">Show but disable editing; explicit serialize marker (public fields already serialize — Unity parity).</td></tr>
+        <tr><td class="member"><code><span class="punc">[</span><span class="ty">ColorUsage</span><span class="punc">(</span><span class="ty">bool</span> hdr<span class="punc">)]</span></code></td><td class="note">Render a <code>Vector3</code> as a color picker (<code>hdr</code> allows values &gt; 1).</td></tr>
+        <tr><td class="member"><code><span class="punc">[</span><span class="ty">FoldoutGroup</span><span class="punc">(</span><span class="ty">string</span> name<span class="punc">)]</span></code></td><td class="note">Group members into a collapsible foldout.</td></tr>
+        <tr><td class="member"><code><span class="punc">[</span><span class="ty">Button</span><span class="punc">(</span><span class="ty">string</span> label<span class="punc">)]</span></code></td><td class="note">On a parameterless method — render an Inspector button that calls it.</td></tr>
+        <tr><td class="member"><code><span class="punc">[</span><span class="ty">Component</span><span class="punc">(</span>displayName<span class="punc">,</span> menu<span class="punc">)]</span></code></td><td class="note">On a class — customize how it appears in the editor's Add Component menu.</td></tr>
+      </table></div>
+    </div>
+
+    <div id="noresults" class="nores hidden">No API matches your filter.</div>
+
+    <footer>
+      <p>Ballistic Engine — custom C# / .NET&nbsp;9 game engine. This reference covers the public scripting surface
+        available to game code under a project's <code>Assets/</code> folder.</p>
+      <p style="margin-top:8px;color:var(--text-faint)">Math types (<code>Vector3</code>, <code>Quaternion</code>,
+        <code>Matrix4</code>) come from <a href="https://opentk.net/">OpenTK.Mathematics</a>; input enums from GLFW.
+        Generated from source — signatures reflect the engine as documented.</p>
+    </footer>
+
+  </main>
+</div>
+
+<script>
+  // ---- Active-section highlight in the sidebar ----
+  const navLinks = [...document.querySelectorAll('#nav a')];
+  const linkFor = id => navLinks.find(a => a.getAttribute('href') === '#' + id);
+  const observer = new IntersectionObserver(entries => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        const id = e.target.id;
+        const link = linkFor(id);
+        if (link) {
+          navLinks.forEach(a => a.classList.remove('active'));
+          link.classList.add('active');
+        }
+      }
+    });
+  }, { rootMargin: '-10% 0px -80% 0px', threshold: 0 });
+  document.querySelectorAll('main [id]').forEach(el => observer.observe(el));
+
+  // ---- Live filter ----
+  const search = document.getElementById('search');
+  const cards = [...document.querySelectorAll('.api, section')];
+  const titles = [...document.querySelectorAll('main .section-title')];
+  const noresults = document.getElementById('noresults');
+
+  search.addEventListener('input', () => {
+    const q = search.value.trim().toLowerCase();
+    let anyVisible = false;
+    cards.forEach(card => {
+      const hay = (card.id + ' ' + (card.dataset.keywords || '') + ' ' + card.textContent).toLowerCase();
+      const show = q === '' || hay.includes(q);
+      card.classList.toggle('hidden', !show);
+      if (show) anyVisible = true;
+    });
+    // Hide section titles when nothing follows is messy to compute; just keep them, but hide all when no card matches.
+    titles.forEach(t => t.classList.toggle('hidden', q !== '' && !anyVisible));
+    noresults.classList.toggle('hidden', anyVisible);
+  });
+
+  // Keyboard: '/' focuses search
+  document.addEventListener('keydown', e => {
+    if (e.key === '/' && document.activeElement !== search) { e.preventDefault(); search.focus(); }
+    if (e.key === 'Escape') { search.value = ''; search.dispatchEvent(new Event('input')); search.blur(); }
+  });
+</script>
+</body>
+</html>

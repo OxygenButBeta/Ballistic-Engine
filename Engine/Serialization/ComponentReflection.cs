@@ -13,17 +13,41 @@ public static class ComponentReflection {
         declaringType == typeof(Component) ||
         declaringType == typeof(Behaviour) ||
         declaringType == typeof(SceneBehaviour) ||
-        declaringType == typeof(Renderer);
+        declaringType == typeof(Renderer) ||
+        declaringType == typeof(DataAsset);
 
     public static IEnumerable<MemberInfo> SerializableMembers(Type type) {
         foreach (PropertyInfo prop in type.GetProperties(Flags)) {
             if (prop.CanRead && prop.CanWrite && prop.GetIndexParameters().Length == 0 &&
-                !IsFrameworkType(prop.DeclaringType))
+                !IsFrameworkType(prop.DeclaringType) &&
+                prop.GetCustomAttribute<NotSerializedAttribute>() is null)
                 yield return prop;
         }
         foreach (FieldInfo field in type.GetFields(Flags)) {
-            if (!field.IsInitOnly && !field.IsLiteral && !IsFrameworkType(field.DeclaringType))
+            if (!field.IsInitOnly && !field.IsLiteral && !IsFrameworkType(field.DeclaringType) &&
+                field.GetCustomAttribute<NotSerializedAttribute>() is null)
                 yield return field;
+        }
+    }
+
+    // The members the editor inspector should show: the serializable set minus anything marked
+    // [HideInInspector]. Kept SEPARATE from SerializableMembers on purpose — hiding a member from
+    // the inspector must not drop it from save/load.
+    public static IEnumerable<MemberInfo> InspectorMembers(Type type) {
+        foreach (MemberInfo member in SerializableMembers(type)) {
+            if (member.GetCustomAttribute<HideInInspectorAttribute>() is null)
+                yield return member;
+        }
+    }
+
+    // Parameterless methods marked [Button]: the inspector renders each as a clickable button
+    // that invokes the method on the component (bake triggers, one-shot actions).
+    public static IEnumerable<MethodInfo> InspectorButtons(Type type) {
+        foreach (MethodInfo method in type.GetMethods(Flags)) {
+            if (method.GetParameters().Length == 0 &&
+                !IsFrameworkType(method.DeclaringType) &&
+                method.GetCustomAttribute<ButtonAttribute>() is not null)
+                yield return method;
         }
     }
 

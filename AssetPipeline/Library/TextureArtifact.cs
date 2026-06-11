@@ -32,13 +32,19 @@ public static class TextureArtifact {
 
     public static TextureData Read(string path) {
         using FileStream stream = File.OpenRead(path);
+        return Read(stream, path);
+    }
+
+    // Decodes from an already-open stream (e.g. bytes from a mounted content pack). `name` is for
+    // error messages only.
+    public static TextureData Read(Stream stream, string name = "<stream>") {
         using BinaryReader reader = new(stream);
 
         if (reader.ReadUInt32() != Magic)
-            throw new InvalidDataException($"'{path}' is not a texture artifact (bad magic).");
+            throw new InvalidDataException($"'{name}' is not a texture artifact (bad magic).");
         var version = reader.ReadUInt32();
         if (version != FormatVersion)
-            throw new InvalidDataException($"Texture artifact '{path}' has unsupported version {version}.");
+            throw new InvalidDataException($"Texture artifact '{name}' has unsupported version {version}.");
 
         var width = reader.ReadInt32();
         var height = reader.ReadInt32();

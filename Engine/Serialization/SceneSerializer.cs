@@ -35,16 +35,85 @@ public static class SceneSerializer {
         File.WriteAllText(absolutePath, Serialize(scene));
     }
 
+    // ---- Subtree capture / rebuild (shared with the prefab system) ---------
+
+    // Captures an entity AND its transform descendants into EntityDocuments (the prefab snapshot).
+    // The root's Parent ref is cleared so the subtree is self-contained; internal parent links are
+    // preserved by file-local id.
+    public static List<EntityDocument> CaptureSubtree(Entity root) {
+        var docs = new List<EntityDocument>();
+        if (root is null)
+            return docs;
+
+        var subtree = new List<Entity> { root };
+        foreach (Entity e in SceneManager.GetCurrentScene().Entities)
+            if (!ReferenceEquals(e, root) && e.transform.IsDescendantOf(root.transform))
+                subtree.Add(e);
+
+        foreach (Entity e in subtree) {
+            EntityDocument doc = BuildEntityDocument(e);
+            // Root: drop the external parent so the prefab plants at the world origin on instantiate.
+            if (ReferenceEquals(e, root))
+                doc.Transform.Parent = null;
+            docs.Add(doc);
+        }
+        return docs;
+    }
+
+    // Rebuilds a captured subtree into the current scene and returns its ROOT entity. Fresh instance
+    // ids are assigned (a prefab instantiated twice must not share identity). Lifecycle fires through
+    // the normal AddComponent path unless a deserialize is already suppressing it.
+    public static Entity InstantiateSubtree(IReadOnlyList<EntityDocument> docs) {
+        if (docs is null || docs.Count == 0)
+            return null;
+
+        var byId = new Dictionary<string, Entity>(StringComparer.Ordinal);
+        Entity root = null;
+
+        foreach (EntityDocument entityDoc in docs) {
+            Entity entity = Entity.Instantiate(entityDoc.Name ?? "Entity", entityDoc.IsActive);
+            entity.Tag = string.IsNullOrEmpty(entityDoc.Tag) ? TagManager.Untagged : entityDoc.Tag;
+            entity.Layer = entityDoc.Layer;
+            entity.transform.Position = entityDoc.Transform.Position;
+            entity.transform.Rotation = entityDoc.Transform.Rotation;
+            entity.transform.Scale = entityDoc.Transform.Scale;
+
+            if (entityDoc.Id is not null)
+                byId[entityDoc.Id] = entity;
+            root ??= entity; // first doc is the root (CaptureSubtree emits it first)
+
+            foreach (ComponentDocument componentDoc in entityDoc.Components)
+                ApplyComponent(entity, componentDoc);
+        }
+
+        // Re-wire internal parent links (root's Parent was cleared at capture).
+        foreach (EntityDocument entityDoc in docs) {
+            if (entityDoc.Transform.Parent is null || entityDoc.Id is null)
+                continue;
+            if (byId.TryGetValue(entityDoc.Id, out Entity child) &&
+                byId.TryGetValue(entityDoc.Transform.Parent, out Entity parent))
+                child.transform.SetParent(parent.transform);
+        }
+
+        return root;
+    }
+
     static EntityDocument BuildEntityDocument(Entity entity) {
         var doc = new EntityDocument {
             Id = entity.InstanceId.ToString("N"),
             Name = entity.Name,
             IsActive = entity.IsActive,
+            // Omit defaults so unauthored entities don't churn the YAML.
+            Tag = entity.Tag == TagManager.Untagged ? null : entity.Tag,
+            Layer = entity.Layer,
             Transform = new TransformDocument {
                 Position = entity.transform.Position,
                 Rotation = entity.transform.Rotation,
                 Scale = entity.transform.Scale,
-                Parent = entity.transform.Parent?.InstanceId.ToString("N"),
+                // The parent ref must be the parent ENTITY's id (byId is keyed by entity id) — NOT the
+                // parent Transform's own InstanceId. They differ (Transform is itself a BObject), so
+                // serializing the transform id left every parent lookup failing and hierarchy flat.
+                Parent = entity.transform.Parent?.Entity?.InstanceId.ToString("N"),
             },
         };
 
@@ -60,6 +129,9 @@ public static class SceneSerializer {
     static ComponentDocument BuildComponentDocument(string typeName, bool enabled, object target) {
         var doc = new ComponentDocument {
             Type = typeName,
+            // Component identity round-trips so BEvent listeners that target this component (by id)
+            // rebind after reload/undo. Only BObjects carry an InstanceId.
+            Id = target is BObject obj ? obj.InstanceId.ToString("N") : null,
             Enabled = enabled,
         };
 
@@ -73,10 +145,14 @@ public static class SceneSerializer {
         return doc;
     }
 
-    // BObject -> "guid:..."; everything else passes through (converters handle OpenTK types).
+    // BObject -> "guid:..."; BEvent -> a listener list; everything else passes through (converters
+    // handle OpenTK types).
     static object SerializeValue(object value) {
         if (value is null)
             return null;
+
+        if (value is BEvent evt)
+            return BEventYaml.Serialize(evt);
 
         if (value is BObject asset) {
             return AssetDatabase.TryGetAssetGuid(asset, out Guid guid)
@@ -89,9 +165,20 @@ public static class SceneSerializer {
 
     // ---- Deserialize -------------------------------------------------------
 
-    // Builds entities in the current scene in EDIT mode (no lifecycle). Caller is the editor or
-    // the runtime startup path; play is entered separately via SceneManager.StartPlay.
+    // Builds entities in the current scene WITHOUT running play lifecycle — even mid-play (live
+    // script reload): OnBegin must not observe default member values, so Attach's play-mode
+    // lifecycle is suppressed for the duration and the caller fires Scene.FireBegin afterwards.
     public static void Deserialize(string yaml) {
+        SceneManager.SuppressPlayLifecycle = true;
+        try {
+            DeserializeCore(yaml);
+        }
+        finally {
+            SceneManager.SuppressPlayLifecycle = false;
+        }
+    }
+
+    static void DeserializeCore(string yaml) {
         SceneDocument doc = SceneYaml.Deserializer.Deserialize<SceneDocument>(yaml);
         if (doc?.Entities is null)
             return;
@@ -118,9 +205,15 @@ public static class SceneSerializer {
 
         foreach (EntityDocument entityDoc in doc.Entities) {
             Entity entity = Entity.Instantiate(entityDoc.Name ?? "Entity", entityDoc.IsActive);
+            entity.Tag = string.IsNullOrEmpty(entityDoc.Tag) ? TagManager.Untagged : entityDoc.Tag;
+            entity.Layer = entityDoc.Layer;
             entity.transform.Position = entityDoc.Transform.Position;
             entity.transform.Rotation = entityDoc.Transform.Rotation;
             entity.transform.Scale = entityDoc.Transform.Scale;
+
+            // Restore the saved instance id so identity round-trips (editor selection survives undo).
+            if (entityDoc.Id is not null && Guid.TryParseExact(entityDoc.Id, "N", out Guid restoredId))
+                entity.InstanceId = restoredId;
 
             if (entityDoc.Id is not null)
                 byId[entityDoc.Id] = entity;
@@ -157,6 +250,10 @@ public static class SceneSerializer {
 
         Behaviour behaviour = entity.AddComponent(type);
         behaviour.IsEnabled = doc.Enabled;
+        // Restore component identity (for BEvent listeners that target this component by id). Done
+        // before ApplyMembers so a listener resolving immediately would see the final id.
+        if (doc.Id is not null && Guid.TryParseExact(doc.Id, "N", out Guid restoredId))
+            behaviour.InstanceId = restoredId;
         ApplyMembers(behaviour, type, doc.Members);
     }
 
@@ -172,6 +269,15 @@ public static class SceneSerializer {
                 continue;
 
             Type memberType = MemberType(member);
+
+            // BEvents are populated IN PLACE: the component owns the instance (a public field
+            // initialized inline, `= new()`), so we fill its listener list rather than reassign it.
+            if (typeof(BEvent).IsAssignableFrom(memberType)) {
+                if (GetMemberValue(member, target) is BEvent evt)
+                    BEventYaml.Deserialize(raw, evt);
+                continue;
+            }
+
             object value = DeserializeValue(raw, memberType);
             if (value is not null)
                 SetMemberValue(member, target, value);

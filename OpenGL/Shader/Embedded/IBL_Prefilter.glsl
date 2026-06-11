@@ -11,6 +11,12 @@ uniform int Face;
 uniform float Roughness;
 uniform float SourceResolution;
 
+// Multiplied into the output. The skybox prefilter leaves this at 1 (its source is already
+// physical radiance). Local reflection probes capture a PRE-EXPOSED scene, so they pass
+// 1/preExposure here to store PHYSICAL radiance - the shader re-applies SkyExposure at sample
+// time, so local and global specular share one EV and survive auto-exposure changes.
+uniform float RadianceScale = 1.0;
+
 const float PI = 3.14159265359;
 const uint SAMPLE_COUNT = 512u;
 
@@ -83,11 +89,15 @@ void main() {
         float saSample = 1.0 / (float(SAMPLE_COUNT) * pdf + 1e-4);
         float mipLevel = Roughness == 0.0 ? 0.0 : 0.5 * log2(saSample / saTexel);
 
-        vec3 radiance = min(textureLod(EnvironmentMap, L, mipLevel).rgb, vec3(500.0));
+        // Clamp only against fp16 overflow, NOT for firefly control: capping at 64 deleted
+        // the sun from every reflection (real suns are 1000s of times brighter than the sky,
+        // and that contrast IS the photoreal specular cue). Fireflies are handled where they
+        // belong: mip-matched source sampling here, specular AA + roughness floor at shading.
+        vec3 radiance = min(textureLod(EnvironmentMap, L, mipLevel).rgb, vec3(16384.0));
         prefiltered += radiance * NdotL;
         totalWeight += NdotL;
     }
 
     prefiltered /= max(totalWeight, 1e-4);
-    FragColor = vec4(prefiltered, 1.0);
+    FragColor = vec4(prefiltered * RadianceScale, 1.0);
 }

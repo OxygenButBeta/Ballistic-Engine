@@ -60,6 +60,7 @@ public interface IFrameBuffer {
 public class GLFrameBuffer : IFrameBuffer {
     readonly int frameBufferId;
     readonly bool depthAsTexture;
+    readonly bool withNormalAttachment;
     public int LenX { get; private set; }
     public int LenY { get; private set; }
     public int colorBuffer, depthBufferId = -1;
@@ -67,10 +68,15 @@ public class GLFrameBuffer : IFrameBuffer {
     // Valid when constructed with depthAsTexture: lets post passes (SSAO) sample scene depth.
     public int DepthTextureId { get; private set; } = -1;
 
+    // Valid when constructed with withNormalAttachment: world normal (xyz) + roughness (a),
+    // written by the PBR shader as a second render target for SSR/TAA.
+    public int NormalTextureId { get; private set; } = -1;
+
     public int FrameBufferId => frameBufferId;
 
-    public GLFrameBuffer(int width, int height, bool depthAsTexture = false) {
+    public GLFrameBuffer(int width, int height, bool depthAsTexture = false, bool withNormalAttachment = false) {
         this.depthAsTexture = depthAsTexture;
+        this.withNormalAttachment = withNormalAttachment;
         frameBufferId = GL.GenFramebuffer();
         CreateBuffers(width, height);
     }
@@ -92,6 +98,26 @@ public class GLFrameBuffer : IFrameBuffer {
         GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.ClampToEdge);
         GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
             TextureTarget.Texture2D, colorBuffer, 0);
+
+        if (withNormalAttachment) {
+            NormalTextureId = GL.GenTexture();
+            GL.BindTexture(TextureTarget.Texture2D, NormalTextureId);
+            GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba16f, width, height, 0,
+                PixelFormat.Rgba, PixelType.Float, IntPtr.Zero);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter,
+                (int)TextureMinFilter.Nearest);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter,
+                (int)TextureMagFilter.Nearest);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS,
+                (int)TextureWrapMode.ClampToEdge);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT,
+                (int)TextureWrapMode.ClampToEdge);
+            GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment1,
+                TextureTarget.Texture2D, NormalTextureId, 0);
+            GL.DrawBuffers(2, new[] {
+                DrawBuffersEnum.ColorAttachment0, DrawBuffersEnum.ColorAttachment1,
+            });
+        }
 
         // Depth Buffer
         if (depthAsTexture) {
@@ -126,16 +152,51 @@ public class GLFrameBuffer : IFrameBuffer {
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
     }
 
+    // Re-specifies the EXISTING texture objects at the new size instead of delete+recreate.
+    // Texture IDs staying stable matters: the editor's UI pass records the color texture ID
+    // BEFORE the scene renders (frame order is UI -> render -> present), so deleting the
+    // texture mid-frame made every panel draw a dead handle during a resize drag (garbage /
+    // black flicker until release). In-place realloc keeps every captured ID valid.
     public void Resize(int width, int height) {
-        ClearBuffers();
-        CreateBuffers(width, height);
-        Console.WriteLine("Framebuffer resized to {0}x{1}", width, height);
+        if (width == LenX && height == LenY)
+            return;
+        LenX = width;
+        LenY = height;
+
+        GL.BindTexture(TextureTarget.Texture2D, colorBuffer);
+        GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba16f, width, height, 0,
+            PixelFormat.Rgba, PixelType.Float, IntPtr.Zero);
+
+        if (NormalTextureId != -1) {
+            GL.BindTexture(TextureTarget.Texture2D, NormalTextureId);
+            GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba16f, width, height, 0,
+                PixelFormat.Rgba, PixelType.Float, IntPtr.Zero);
+        }
+
+        if (DepthTextureId != -1) {
+            GL.BindTexture(TextureTarget.Texture2D, DepthTextureId);
+            GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.DepthComponent24, width, height, 0,
+                PixelFormat.DepthComponent, PixelType.Float, IntPtr.Zero);
+        }
+
+        if (depthBufferId != -1) {
+            GL.BindRenderbuffer(RenderbufferTarget.Renderbuffer, depthBufferId);
+            GL.RenderbufferStorage(RenderbufferTarget.Renderbuffer, RenderbufferStorage.DepthComponent24,
+                width, height);
+        }
+
+        GL.BindTexture(TextureTarget.Texture2D, 0);
     }
 
     void ClearBuffers() {
         if (colorBuffer != 0) {
             GL.DeleteTexture(colorBuffer);
             colorBuffer = 0;
+        }
+
+        if (NormalTextureId != -1) {
+            GL.DeleteTexture(NormalTextureId);
+            NormalTextureId = -1;
         }
 
         if (DepthTextureId != -1) {

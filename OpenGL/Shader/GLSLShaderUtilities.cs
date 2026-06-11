@@ -3,7 +3,10 @@
 public static class GLSLShaderUtilities {
     public static int CompileProgram(string code, ShaderType type, bool throwOnError = true) {
         var shader = GL.CreateShader(type);
-        GL.ShaderSource(shader, ToAscii(code));
+        var source = ToAscii(code);
+        if (type == ShaderType.VertexShader)
+            source = InjectInvariantPosition(source);
+        GL.ShaderSource(shader, source);
         GL.CompileShader(shader);
         GL.GetShader(shader, ShaderParameter.CompileStatus, out var success);
 
@@ -12,6 +15,19 @@ public static class GLSLShaderUtilities {
 
         var infoLog = GL.GetShaderInfoLog(shader);
         throw new Exception($"{type} compilation failed:\n{infoLog}");
+    }
+
+    // Every vertex shader gets `invariant gl_Position;`: the z-prepass re-renders geometry
+    // with the same vertex source under a different program, and the main pass depth-tests
+    // EQUAL against that depth — the GLSL invariance guarantee is what makes the two
+    // rasterize bit-identically (without it, holes appear wherever the optimizer differs).
+    static string InjectInvariantPosition(string code) {
+        if (code.Contains("invariant gl_Position"))
+            return code;
+        var versionEnd = code.IndexOf('\n', Math.Max(code.IndexOf("#version", StringComparison.Ordinal), 0));
+        return versionEnd < 0
+            ? code
+            : code.Insert(versionEnd + 1, "invariant gl_Position;\n");
     }
 
     // GL.ShaderSource(int, string) passes the char count as the length of the UTF-8

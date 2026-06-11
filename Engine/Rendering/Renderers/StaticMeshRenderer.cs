@@ -8,6 +8,11 @@ public class StaticMeshRenderer : Renderer {
     public override Mesh SharedMesh { get; set; }
     public override Material SharedMaterial { get; set; }
 
+    // Which submesh of SharedMesh to draw; -1 = all. Set by model instantiation so each child
+    // entity renders just its own part of the shared mesh.
+    [HideInInspector]
+    public override int SubMeshIndex { get; set; } = -1;
+
     // Register for drawing as soon as we're attached (edit mode too), so the editor viewport
     // shows the mesh without entering play.
     protected internal override void OnAttach() {

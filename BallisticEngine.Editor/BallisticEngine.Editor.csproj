@@ -10,10 +10,16 @@
 
     <ItemGroup>
       <ProjectReference Include="..\BallisticEngine.csproj" />
+      <ProjectReference Include="..\BallisticEngine.Profiling.Tracy\BallisticEngine.Profiling.Tracy.csproj" />
     </ItemGroup>
 
     <ItemGroup>
-      <PackageReference Include="ImGui.NET" Version="1.91.0.1" />
+      <PackageReference Include="Hexa.NET.ImGui" Version="2.2.7" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <!-- Bundled editor UI fonts (Inter UI + Lucide icons), copied next to the exe. -->
+      <None Include="Assets\Fonts\*.ttf" CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 
 </Project>

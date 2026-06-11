@@ -15,7 +15,11 @@ public static class CubemapLoader {
     static readonly string[] FaceOrder = ["right", "left", "top", "bottom", "front", "back"];
 
     public static Texture3D Load(BallisticProject project, AssetImportPipeline pipeline, string assetPath) {
-        var definition = PipelineJson.Read<CubemapDefinition>(project.ResolveAbsolute(assetPath));
+        var definition = ContentText.ReadJson<CubemapDefinition>(project, assetPath);
+        if (definition is null) {
+            Debugging.LogError($"'{assetPath}': cubemap definition not found.");
+            return null;
+        }
 
         if (!string.IsNullOrEmpty(definition.Equirect))
             return LoadEquirect(definition, pipeline, assetPath);
@@ -33,12 +37,13 @@ public static class CubemapLoader {
                 return null;
             }
 
-            if (!pipeline.TryGetArtifactPath(guid, out var artifactPath)) {
+            if (!pipeline.TryReadArtifactBytes(guid, out var bytes)) {
                 Debugging.LogError($"'{assetPath}': face '{reference}' has no Library artifact.");
                 return null;
             }
 
-            faces[i] = TextureArtifact.Read(artifactPath);
+            using var stream = new MemoryStream(bytes);
+            faces[i] = TextureArtifact.Read(stream, reference);
         }
 
         return GraphicAPI.CreateCubemap(faces);
@@ -52,12 +57,13 @@ public static class CubemapLoader {
             return null;
         }
 
-        if (!pipeline.TryGetArtifactPath(guid, out var artifactPath)) {
+        if (!pipeline.TryReadArtifactBytes(guid, out var bytes)) {
             Debugging.LogError($"'{assetPath}': equirect '{definition.Equirect}' has no Library artifact.");
             return null;
         }
 
-        TextureData panorama = TextureArtifact.Read(artifactPath);
+        using var stream = new MemoryStream(bytes);
+        TextureData panorama = TextureArtifact.Read(stream, definition.Equirect);
         TextureData[] faces = EquirectToCubemap.Convert(in panorama, definition.FaceSize);
         return GraphicAPI.CreateCubemap(faces);
     }

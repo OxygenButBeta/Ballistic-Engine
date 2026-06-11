@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "guid": "b0e2ad6d-7de3-40df-ad07-e7eb539e3f80",
+  "importer": "ModelImporter",
+  "settings": {
+    "flipUVs": false,
+    "meshIndex": -1,
+    "generateMaterials": false,
+    "splitByNodes": false
+  }
+}

@@ -19,6 +19,8 @@ public sealed class EntityDocument {
     public string Id { get; set; }            // file-local id, used to wire transform parents
     public string Name { get; set; }
     public bool IsActive { get; set; } = true;
+    public string Tag { get; set; }           // null/"Untagged" omitted for clean diffs
+    public int Layer { get; set; }            // 0 ("Default") omitted by the serializer
     public TransformDocument Transform { get; set; } = new();
     public List<ComponentDocument> Components { get; set; } = new();
 }
@@ -32,6 +34,9 @@ public sealed class TransformDocument {
 
 public sealed class ComponentDocument {
     public string Type { get; set; }          // ComponentRegistry key
+    public string Id { get; set; }            // InstanceId (32-hex); restored on load so BEvent
+                                              // listeners targeting this component rebind across
+                                              // reload/undo. Null on legacy scenes (fresh id assigned).
     public bool Enabled { get; set; } = true;
     public Dictionary<string, object> Members { get; set; } = new();
 }

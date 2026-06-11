@@ -25,7 +25,7 @@ public sealed class OpenGLRenderAsset : RenderAsset {
         return new GLNormalBuffer(renderContext);
     }
 
-    public override GPUBuffer<Vector3> CreateTangentBuffer(RenderContext renderContext) {
+    public override GPUBuffer<Vector4> CreateTangentBuffer(RenderContext renderContext) {
         return new GLTangentBuffer(renderContext);
     }
 

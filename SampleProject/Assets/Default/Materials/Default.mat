@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "shader": "Assets/Default/Shaders/Standard.shader",
+  "textures": {
+    "Diffuse": "Assets/Default/Materials/DefaultGrey.png"
+  },
+  "transparent": false,
+  "opacity": 1,
+  "emissiveIntensity": 1,
+  "packedOrm": false,
+  "cutout": false
+}

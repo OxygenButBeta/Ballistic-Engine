@@ -3,8 +3,10 @@ using BallisticEngine.AssetPipeline.Loaders;
 
 namespace BallisticEngine.AssetPipeline;
 
-// Imports model files into a single .bmesh artifact with one submesh per source material
-// (node transforms baked in). When the source carries materials, generates a sibling
+// Imports model files into a single .bmesh artifact (node transforms baked in) with one
+// submesh per source node mesh (splitByNodes, the default for new imports — the editor can
+// then instantiate one entity per source object) or per source material (legacy merged
+// mode). When the source carries materials, generates a sibling
 // "<Model>_Materials" folder of .mat assets and bakes their refs into the submeshes; the
 // generated .mat files are owned by the importer and rewritten on every reimport.
 // Texture .meta files referenced by those materials get their textureType set from the slot
@@ -15,8 +17,13 @@ public sealed class ModelImporter : IAssetImporter {
     public const string DefaultShaderRef = "Assets/Default/Shaders/Standard.shader";
 
     public string Name => "ModelImporter";
-    public int Version => 2;
+    // v3: vec4 tangents (handedness) + scalar PBR factors in .mat
+    // v4: split-by-nodes submeshes + node hierarchy table (BMSH v5), default ON
+    public int Version => 4;
     public string ArtifactExtension => ".bmesh";
+
+    // Generates a sibling "<Model>_Materials/" folder of .mat assets.
+    public bool GeneratesSourceAssets => true;
 
     public bool CanImport(string extension) => Extensions.Contains(extension);
 
@@ -25,11 +32,17 @@ public sealed class ModelImporter : IAssetImporter {
         ["meshIndex"] = -1, // -1 = whole scene merged by material; >= 0 = that one mesh, no materials
         ["generateMaterials"] = true,
         ["shader"] = DefaultShaderRef,
+        // One submesh per source node mesh (named, with the node's transform + hierarchy
+        // table), so the editor can instantiate the model as an entity tree. ON by default —
+        // set false per asset to merge submeshes by material instead (far fewer draw calls;
+        // the right call for huge static set dressing).
+        ["splitByNodes"] = true,
     };
 
     public void Import(AssetImportContext context) {
         var flipUVs = context.Settings?["flipUVs"]?.GetValue<bool>() ?? true;
         var meshIndex = context.Settings?["meshIndex"]?.GetValue<int>() ?? -1;
+        var splitByNodes = context.Settings?["splitByNodes"]?.GetValue<bool>() ?? true;
 
         if (meshIndex >= 0) {
             // Legacy single-mesh import: geometry only, mesh-local space, no materials.
@@ -38,7 +51,7 @@ public sealed class ModelImporter : IAssetImporter {
             return;
         }
 
-        DecodedModel model = AssimpMeshDecoder.DecodeScene(context.SourceAbsolutePath, flipUVs);
+        DecodedModel model = AssimpMeshDecoder.DecodeScene(context.SourceAbsolutePath, flipUVs, splitByNodes);
 
         var generateMaterials = context.Settings?["generateMaterials"]?.GetValue<bool>() ?? true;
         MeshData data = generateMaterials ? GenerateMaterials(context, model) : model.Mesh;
@@ -87,13 +100,27 @@ public sealed class ModelImporter : IAssetImporter {
         }
 
         return new MeshData(model.Mesh.Vertices, model.Mesh.Indices, model.Mesh.UVs,
-            model.Mesh.Normals, model.Mesh.Tangents, subMeshes);
+            model.Mesh.Normals, model.Mesh.Tangents, subMeshes, model.Mesh.Nodes);
     }
 
     static string WriteMaterialAsset(AssetImportContext context, DecodedMaterial material,
         string materialsDirAbsolute, string projectRoot, string shaderRef,
         ModelTextureResolver resolver, Dictionary<string, DecodedMaterial> fileNameOwners) {
         var definition = new MaterialDefinition { Shader = shaderRef };
+
+        // Scalar PBR factors from the source material (null = unstated, loader defaults apply).
+        if (material.BaseColor is { } baseColor)
+            definition.BaseColor = [baseColor.X, baseColor.Y, baseColor.Z, baseColor.W];
+        if (material.Metallic is { } metallic)
+            definition.Metallic = metallic;
+        if (material.Roughness is { } roughness)
+            definition.Roughness = roughness;
+        if (material.EmissiveColor is { } emissiveColor)
+            definition.EmissiveColor = [emissiveColor.X, emissiveColor.Y, emissiveColor.Z];
+        if (material.Opacity is { } opacity && opacity < 0.999f) {
+            definition.Opacity = opacity;
+            definition.Transparent = true;
+        }
 
         foreach ((TextureType slot, var rawPath) in material.TexturePaths) {
             var absolute = resolver.Resolve(rawPath);
@@ -136,28 +163,34 @@ public sealed class ModelImporter : IAssetImporter {
         }
     }
 
+    // Serializes texture-.meta writes: models import in parallel, and two models referencing the
+    // same shared texture would otherwise race on the same .meta file (torn write / file-in-use).
+    static readonly object textureMetaLock = new();
+
     // Creates the texture's .meta with the slot-derived type, or corrects an existing meta whose
     // type disagrees with how the model binds the texture (the GUID is preserved).
     static void EnsureTextureMeta(string textureAbsolute, TextureType slot) {
         var metaPath = MetaFile.PathFor(textureAbsolute);
         try {
-            if (!File.Exists(metaPath)) {
-                new MetaFile {
-                    Guid = Guid.NewGuid(),
-                    Importer = "TextureImporter",
-                    Settings = new JsonObject { ["textureType"] = slot.ToString() },
-                }.Save(metaPath);
-                return;
+            lock (textureMetaLock) {
+                if (!File.Exists(metaPath)) {
+                    new MetaFile {
+                        Guid = Guid.NewGuid(),
+                        Importer = "TextureImporter",
+                        Settings = new JsonObject { ["textureType"] = slot.ToString() },
+                    }.Save(metaPath);
+                    return;
+                }
+
+                MetaFile meta = MetaFile.Load(metaPath);
+                var current = meta.Settings?["textureType"]?.GetValue<string>();
+                if (string.Equals(current, slot.ToString(), StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                meta.Settings ??= new JsonObject();
+                meta.Settings["textureType"] = slot.ToString();
+                meta.Save(metaPath);
             }
-
-            MetaFile meta = MetaFile.Load(metaPath);
-            var current = meta.Settings?["textureType"]?.GetValue<string>();
-            if (string.Equals(current, slot.ToString(), StringComparison.OrdinalIgnoreCase))
-                return;
-
-            meta.Settings ??= new JsonObject();
-            meta.Settings["textureType"] = slot.ToString();
-            meta.Save(metaPath);
         }
         catch (Exception exception) {
             Debugging.LogWarning($"Could not update meta for '{textureAbsolute}': {exception.Message}");

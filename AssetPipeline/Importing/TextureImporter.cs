@@ -18,6 +18,24 @@ public sealed class TextureImporter : IAssetImporter {
         ["textureType"] = InferTextureType(assetPath).ToString(),
     };
 
+    // Self-heal stale metas: older .meta files (created before name-based inference, or by an earlier
+    // importer) left normal/spec/rough maps tagged Diffuse — they then bind through the wrong sampler
+    // (sRGB color path instead of linear data), producing garbled surfaces. If the stored type is the
+    // DEFAULT Diffuse but the filename clearly infers a data map, correct it. Only upgrades AWAY from
+    // Diffuse, so a deliberate non-default choice is never overridden.
+    public bool UpgradeSettings(string assetPath, JsonObject settings) {
+        TextureType current = TypeFromSettings(settings);
+        if (current != TextureType.Diffuse)
+            return false;
+
+        TextureType inferred = InferTextureType(assetPath);
+        if (inferred == TextureType.Diffuse)
+            return false;
+
+        settings["textureType"] = inferred.ToString();
+        return true;
+    }
+
     // The texture type is consumed at load time (sampler slot + internal format), not baked into the artifact.
     public static TextureType TypeFromSettings(JsonObject settings) {
         var raw = settings?["textureType"]?.GetValue<string>();

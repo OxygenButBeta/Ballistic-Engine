@@ -65,7 +65,9 @@ public sealed class GLTexture3D : Texture3D {
                         var g = face.Pixels[index + 1] / 255f;
                         var b = face.Pixels[index + 2] / 255f;
 
-                        ambientSum += new Vector3(r, g, b);
+                        // The GPU samples this face through an sRGB view (linearized); average
+                        // in linear too or the CPU-side ambient is brighter than the sky.
+                        ambientSum += new Vector3(MathF.Pow(r, 2.2f), MathF.Pow(g, 2.2f), MathF.Pow(b, 2.2f));
                         totalPixels++;
                     }
                 }

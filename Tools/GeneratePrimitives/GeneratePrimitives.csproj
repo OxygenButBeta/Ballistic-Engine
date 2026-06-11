@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- One-shot generator: writes the default primitive mesh assets (Cube/Sphere/Plane) as
+       .obj source files into a project's Assets/Default/Meshes/ folder, so "Create > 3D Object"
+       references a shared, GUID-backed default asset instead of building a throwaway runtime mesh.
+       Standalone (no engine reference) so the tool has no dependency on the editor/engine build;
+       the geometry is duplicated here on purpose. Run once; re-run after editing the geometry.
+
+       Run from the repo root with: dotnet run, pointing at this project; pass an optional
+       projectPath argument (defaults to the SampleProject under the repo root). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>BallisticEngine.Tools.GeneratePrimitives</RootNamespace>
+    <!-- Keep this tool out of the engine library glob (it lives under the repo root). -->
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+</Project>

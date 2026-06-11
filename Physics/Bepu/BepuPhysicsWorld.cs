@@ -1,0 +1,478 @@
+using System.Numerics;
+using BepuPhysics;
+using BepuPhysics.Collidables;
+using BepuPhysics.CollisionDetection;
+using BepuPhysics.Constraints;
+using BepuPhysics.Trees;
+using BepuUtilities;
+using BepuUtilities.Memory;
+using static BallisticEngine.Bepu.BepuMath;
+using BepuMesh = BepuPhysics.Collidables.Mesh;
+using TkVector3 = OpenTK.Mathematics.Vector3;
+
+namespace BallisticEngine.Bepu;
+
+// IPhysicsWorld over BepuPhysics 2 (pure managed .NET, no native binaries). This module is the
+// ONLY place in the repo allowed to reference BepuPhysics — everything engine-side goes through
+// the Abstraction/Physics interfaces, mirroring how AssetPipeline owns Assimp/Stb/Magick.
+//
+// The Simulation is created lazily and torn down wholesale on Reset() (play-mode enter/leave);
+// outstanding BepuBody wrappers are invalidated so stale component references become no-ops.
+public sealed class BepuPhysicsWorld : IPhysicsWorld {
+    internal Simulation Simulation;
+    readonly BufferPool bufferPool = new();
+    readonly ThreadDispatcher dispatcher =
+        new(Math.Max(1, Environment.ProcessorCount - 2));
+
+    internal readonly BepuContactTracker Contacts;
+
+    public BepuPhysicsWorld() {
+        Contacts = new BepuContactTracker(this, dispatcher.ThreadCount);
+    }
+
+    public IReadOnlyList<PhysicsContactEvent> ContactEvents => Contacts.Events;
+
+    // Wrappers and contact materials by handle value (bodies and statics have separate
+    // handle spaces). Material reads happen from narrowphase worker threads, but nothing
+    // mutates these during Step, so plain dictionaries are safe.
+    readonly Dictionary<int, BepuBody> bodiesByHandle = new();
+    readonly Dictionary<int, BepuBody> staticsByHandle = new();
+    readonly Dictionary<int, ContactMaterial> bodyMaterials = new();
+    readonly Dictionary<int, ContactMaterial> staticMaterials = new();
+
+    internal readonly struct ContactMaterial {
+        public readonly float Friction;
+        public readonly float Bounciness;
+        public readonly bool IsTrigger;
+        public readonly int Layer;
+
+        public ContactMaterial(float friction, float bounciness, bool isTrigger = false, int layer = 0) {
+            Friction = friction;
+            Bounciness = bounciness;
+            IsTrigger = isTrigger;
+            Layer = layer;
+        }
+    }
+
+    TkVector3 gravity = new(0f, -9.81f, 0f);
+    internal Vector3 GravityNumerics = new(0f, -9.81f, 0f);
+
+    public TkVector3 Gravity {
+        get => gravity;
+        set {
+            gravity = value;
+            GravityNumerics = ToNumerics(value);
+        }
+    }
+
+    // Injected from the engine's LayerManager at bootstrap (see IPhysicsWorld). Read on narrowphase
+    // worker threads; only mutated single-threaded between steps, so the field read is safe.
+    public Func<int, int, bool> LayerCollisionMatrix { get; set; }
+
+    // Consulted by the narrowphase before generating contacts. Null predicate = collide everything.
+    internal bool LayersCollide(CollidableReference a, CollidableReference b) {
+        Func<int, int, bool> matrix = LayerCollisionMatrix;
+        if (matrix is null)
+            return true;
+        return matrix(GetMaterial(a).Layer, GetMaterial(b).Layer);
+    }
+
+    void EnsureSimulation() {
+        // 4 substeps = 240Hz effective contact integration at the engine's 60Hz fixed step:
+        // contact springs (incl. the Bounciness approximation) actually resolve instead of
+        // sitting at the stability limit, and stacks stay solid with few velocity iterations.
+        Simulation ??= Simulation.Create(
+            bufferPool,
+            new NarrowPhaseCallbacks { World = this },
+            new PoseIntegratorCallbacks { World = this },
+            new SolveDescription(velocityIterationCount: 2, substepCount: 4));
+    }
+
+    public void Step(float deltaTime) {
+        if (Simulation is null || deltaTime <= 0f)
+            return;
+
+        Simulation.Timestep(deltaTime, dispatcher);
+        Contacts.Flush(); // narrowphase workers recorded contacts during the timestep
+    }
+
+    public void Reset() {
+        foreach (BepuBody body in bodiesByHandle.Values)
+            body.Invalidate();
+        foreach (BepuBody body in staticsByHandle.Values)
+            body.Invalidate();
+
+        bodiesByHandle.Clear();
+        staticsByHandle.Clear();
+        bodyMaterials.Clear();
+        staticMaterials.Clear();
+
+        Contacts.Clear();
+        Simulation?.Dispose();
+        Simulation = null;
+        bufferPool.Clear();
+    }
+
+    // ---- Bodies -------------------------------------------------------------
+
+    public IPhysicsBody AddBody(in PhysicsBodyDescription description) {
+        if (description.Shapes is null || description.Shapes.Length == 0)
+            return null;
+
+        EnsureSimulation();
+
+        if (!TryBuildShape(in description, out TypedIndex shapeIndex, out BodyInertia inertia,
+                out Vector3 centerOffset))
+            return null;
+
+        // Compound shapes are recentered around their center of mass; the body pose must sit
+        // there, while IPhysicsBody.Position keeps reporting the entity origin.
+        Quaternion orientation = ToNumerics(description.Rotation);
+        var pose = new RigidPose(
+            ToNumerics(description.Position) + Vector3.Transform(centerOffset, orientation),
+            orientation);
+
+        var material = new ContactMaterial(description.Friction, description.Bounciness,
+            description.IsTrigger, description.Layer);
+        BepuBody wrapper;
+
+        if (description.Type == PhysicsBodyType.Static) {
+            StaticHandle handle = Simulation.Statics.Add(
+                new StaticDescription(pose.Position, pose.Orientation, shapeIndex));
+            wrapper = new BepuBody(this, handle, shapeIndex, centerOffset);
+            staticsByHandle[handle.Value] = wrapper;
+            staticMaterials[handle.Value] = material;
+        }
+        else {
+            // Continuous detection with a bounded speculative margin: a fast faller crosses
+            // more than its own size per 60Hz step and tunnels straight through thin one-sided
+            // meshes under speculative contacts alone. The sweep only runs when velocity
+            // outpaces the margin (≳6 m/s here), so slow/resting bodies pay nothing.
+            var collidable = new CollidableDescription(shapeIndex, 0.1f,
+                ContinuousDetection.Continuous(1e-3f, 1e-3f));
+
+            // FreezeRotation: zero the inverse inertia tensor so NO torque can rotate the body —
+            // the standard way to build an upright character capsule. Without it a freely-rotating
+            // capsule converts the tiniest contact asymmetry into a roll, and friction turns that
+            // roll into a phantom sideways drift (a resting player slides off on its own). Mass
+            // (inverse mass) is untouched, so it still falls and responds to linear forces.
+            if (description.Type == PhysicsBodyType.Dynamic && description.FreezeRotation)
+                inertia.InverseInertiaTensor = default;
+
+            BodyDescription bodyDescription = description.Type == PhysicsBodyType.Kinematic
+                ? BodyDescription.CreateKinematic(pose, collidable, 0.01f)
+                : BodyDescription.CreateDynamic(pose, inertia, collidable, 0.01f);
+
+            BodyHandle handle = Simulation.Bodies.Add(bodyDescription);
+            wrapper = new BepuBody(this, handle, shapeIndex, centerOffset);
+            bodiesByHandle[handle.Value] = wrapper;
+            bodyMaterials[handle.Value] = material;
+        }
+
+        return wrapper;
+    }
+
+    public void RemoveBody(IPhysicsBody body) {
+        if (body is not BepuBody bepuBody || !bepuBody.Valid || Simulation is null)
+            return;
+
+        Contacts.OnBodyRemoved(bepuBody); // queue Exits for anything it was touching
+
+        if (bepuBody.IsStatic) {
+            Simulation.Statics.Remove(bepuBody.StaticHandle);
+            staticsByHandle.Remove(bepuBody.StaticHandle.Value);
+            staticMaterials.Remove(bepuBody.StaticHandle.Value);
+        }
+        else {
+            Simulation.Bodies.Remove(bepuBody.BodyHandle);
+            bodiesByHandle.Remove(bepuBody.BodyHandle.Value);
+            bodyMaterials.Remove(bepuBody.BodyHandle.Value);
+        }
+
+        // Shapes are per-body in this engine (never shared), so dispose with the body.
+        Simulation.Shapes.RecursivelyRemoveAndDispose(bepuBody.ShapeIndex, bufferPool);
+        bepuBody.Invalidate();
+    }
+
+    internal ContactMaterial GetMaterial(CollidableReference collidable) {
+        Dictionary<int, ContactMaterial> source =
+            collidable.Mobility == CollidableMobility.Static ? staticMaterials : bodyMaterials;
+        int handle = collidable.Mobility == CollidableMobility.Static
+            ? collidable.StaticHandle.Value
+            : collidable.BodyHandle.Value;
+        return source.TryGetValue(handle, out ContactMaterial material)
+            ? material
+            : new ContactMaterial(0.6f, 0f);
+    }
+
+    // Pose of either a body or a static — used by the contact tracker on narrowphase worker
+    // threads (read-only access to pose memory during collision detection is safe).
+    internal RigidPose GetPose(CollidableReference collidable) =>
+        collidable.Mobility == CollidableMobility.Static
+            ? Simulation.Statics[collidable.StaticHandle].Pose
+            : Simulation.Bodies[collidable.BodyHandle].Pose;
+
+    // ---- Shapes -------------------------------------------------------------
+
+    bool TryBuildShape(in PhysicsBodyDescription description, out TypedIndex shapeIndex,
+        out BodyInertia inertia, out Vector3 centerOffset) {
+        shapeIndex = default;
+        inertia = default;
+        centerOffset = Vector3.Zero;
+
+        PhysicsShapePart[] parts = description.Shapes;
+        bool single = parts.Length == 1 &&
+                      parts[0].LocalPosition == TkVector3.Zero &&
+                      parts[0].LocalRotation == OpenTK.Mathematics.Quaternion.Identity;
+
+        // A mesh is concave: legal only as the sole shape of a non-dynamic body.
+        if (parts.Length == 1 && parts[0].Shape is MeshShape meshShape) {
+            if (description.Type == PhysicsBodyType.Dynamic) {
+                Debugging.LogError("Physics: mesh shapes are static/kinematic only; dynamic body rejected.");
+                return false;
+            }
+            if (!single) {
+                Debugging.LogError("Physics: mesh shapes cannot carry a local offset; center must be zero.");
+                return false;
+            }
+
+            shapeIndex = AddMesh(meshShape);
+            return true;
+        }
+
+        if (single) {
+            shapeIndex = AddConvex(parts[0].Shape, description.Mass, out inertia);
+            return shapeIndex.Exists;
+        }
+
+        // Multiple shapes or an offset single shape -> compound.
+        var builder = new CompoundBuilder(bufferPool, Simulation.Shapes, parts.Length);
+        try {
+            int added = 0;
+            foreach (PhysicsShapePart part in parts) {
+                var localPose = new RigidPose(ToNumerics(part.LocalPosition), ToNumerics(part.LocalRotation));
+                // Weight children by volume so the compound's mass distribution follows the
+                // geometry (CompoundBuilder normalizes weights into the total mass).
+                float weight = MathF.Max(1e-4f, VolumeOf(part.Shape));
+                switch (part.Shape) {
+                    case BoxShape box:
+                        builder.Add(MakeBox(box), localPose, weight);
+                        added++;
+                        break;
+                    case SphereShape sphere:
+                        builder.Add(MakeSphere(sphere), localPose, weight);
+                        added++;
+                        break;
+                    case CapsuleShape capsule:
+                        builder.Add(MakeCapsule(capsule), localPose, weight);
+                        added++;
+                        break;
+                    default:
+                        Debugging.LogWarning($"Physics: {part.Shape?.GetType().Name} is not allowed inside a compound body; part skipped.");
+                        break;
+                }
+            }
+
+            if (added == 0)
+                return false;
+
+            Buffer<CompoundChild> children;
+            if (description.Type == PhysicsBodyType.Dynamic) {
+                builder.BuildDynamicCompound(out children, out inertia, out centerOffset);
+            }
+            else {
+                builder.BuildKinematicCompound(out children, out centerOffset);
+            }
+
+            shapeIndex = Simulation.Shapes.Add(new Compound(children));
+            return true;
+        }
+        finally {
+            builder.Dispose();
+        }
+    }
+
+    TypedIndex AddConvex(PhysicsShape shape, float mass, out BodyInertia inertia) {
+        switch (shape) {
+            case BoxShape boxShape: {
+                Box box = MakeBox(boxShape);
+                inertia = box.ComputeInertia(mass);
+                return Simulation.Shapes.Add(box);
+            }
+            case SphereShape sphereShape: {
+                Sphere sphere = MakeSphere(sphereShape);
+                inertia = sphere.ComputeInertia(mass);
+                return Simulation.Shapes.Add(sphere);
+            }
+            case CapsuleShape capsuleShape: {
+                Capsule capsule = MakeCapsule(capsuleShape);
+                inertia = capsule.ComputeInertia(mass);
+                return Simulation.Shapes.Add(capsule);
+            }
+            default:
+                Debugging.LogError($"Physics: unsupported shape {shape?.GetType().Name}.");
+                inertia = default;
+                return default;
+        }
+    }
+
+    TypedIndex AddMesh(MeshShape meshShape) {
+        // Bepu mesh triangles are ONE-SIDED, solid from the side OPPOSITE the right-handed
+        // winding normal — the reverse of the engine's render convention (OpenGL CCW front
+        // faces). Swap two indices so the RENDERED front face is the solid side, Unity-style:
+        // the surface you can see is the surface that collides; backfaces pass through.
+        // (Do NOT emit both windings to fake double-sided collision: a fast impact penetrates
+        // slightly and the flipped triangle then ejects the body out the back.)
+        int triangleCount = meshShape.Indices.Length / 3;
+        bufferPool.Take(triangleCount, out Buffer<Triangle> triangles);
+        for (int i = 0; i < triangleCount; i++) {
+            triangles[i] = new Triangle(
+                ToNumerics(meshShape.Vertices[meshShape.Indices[i * 3 + 0]]),
+                ToNumerics(meshShape.Vertices[meshShape.Indices[i * 3 + 2]]),
+                ToNumerics(meshShape.Vertices[meshShape.Indices[i * 3 + 1]]));
+        }
+
+        var mesh = new BepuMesh(triangles, ToNumerics(meshShape.Scale), bufferPool);
+        return Simulation.Shapes.Add(mesh);
+    }
+
+    // Bepu shapes reject zero/negative dimensions; clamp to a millimeter.
+    const float MinDimension = 1e-3f;
+
+    static Box MakeBox(BoxShape box) => new(
+        MathF.Max(MinDimension, box.Size.X),
+        MathF.Max(MinDimension, box.Size.Y),
+        MathF.Max(MinDimension, box.Size.Z));
+
+    static Sphere MakeSphere(SphereShape sphere) => new(MathF.Max(MinDimension, sphere.Radius));
+
+    static Capsule MakeCapsule(CapsuleShape capsule) => new(
+        MathF.Max(MinDimension, capsule.Radius),
+        MathF.Max(0f, capsule.Length));
+
+    static float VolumeOf(PhysicsShape shape) => shape switch {
+        BoxShape b => MathF.Max(MinDimension, b.Size.X) * MathF.Max(MinDimension, b.Size.Y) * MathF.Max(MinDimension, b.Size.Z),
+        SphereShape s => 4f / 3f * MathF.PI * MathF.Pow(MathF.Max(MinDimension, s.Radius), 3f),
+        CapsuleShape c => MathF.PI * c.Radius * c.Radius * (4f / 3f * c.Radius + c.Length),
+        _ => 0f,
+    };
+
+    // ---- Queries ------------------------------------------------------------
+
+    struct ClosestRayHitHandler : IRayHitHandler {
+        public float T;
+        public Vector3 Normal;
+        public CollidableReference Collidable;
+        public bool Hit;
+        public int LayerMask;
+        public BepuPhysicsWorld World;
+
+        // Filter by layer mask up front so excluded layers cost nothing past the broadphase.
+        public bool AllowTest(CollidableReference collidable) =>
+            LayerMask == ~0 || (LayerMask & (1 << World.GetMaterial(collidable).Layer)) != 0;
+        public bool AllowTest(CollidableReference collidable, int childIndex) => true;
+
+        public void OnRayHit(in RayData ray, ref float maximumT, float t, in Vector3 normal,
+            CollidableReference collidable, int childIndex) {
+            maximumT = t; // clip subsequent tests to the nearest hit so far
+            if (t > T)
+                return;
+            T = t;
+            Normal = normal;
+            Collidable = collidable;
+            Hit = true;
+        }
+    }
+
+    public bool Raycast(TkVector3 origin, TkVector3 direction, float maxDistance, int layerMask,
+        out PhysicsRayHit hit) {
+        hit = default;
+        if (Simulation is null)
+            return false;
+
+        var handler = new ClosestRayHitHandler { T = float.MaxValue, LayerMask = layerMask, World = this };
+        Simulation.RayCast(ToNumerics(origin), ToNumerics(direction), maxDistance, ref handler);
+        if (!handler.Hit)
+            return false;
+
+        hit.Distance = handler.T;
+        hit.Point = origin + direction * handler.T;
+        TkVector3 normal = ToOpenTK(handler.Normal);
+        hit.Normal = normal.LengthSquared > 0f ? normal.Normalized() : -direction;
+        hit.Body = Lookup(handler.Collidable);
+        return true;
+    }
+
+    internal BepuBody Lookup(CollidableReference collidable) =>
+        collidable.Mobility == CollidableMobility.Static
+            ? staticsByHandle.GetValueOrDefault(collidable.StaticHandle.Value)
+            : bodiesByHandle.GetValueOrDefault(collidable.BodyHandle.Value);
+
+    // ---- Overlap queries ----------------------------------------------------
+
+    // Broadphase AABB sweep collecting collidables whose bounds intersect the query box, layer- and
+    // distance-filtered. v1 precision: the broadphase test is an AABB-vs-AABB overlap, then spheres
+    // do a precise center-distance refine; box queries return the AABB-level set (conservative, like
+    // Unity's OverlapBox NonAlloc fast path). Good for trigger/aggro/pickup volumes.
+    struct OverlapCollector : IBreakableForEach<CollidableReference> {
+        public BepuPhysicsWorld World;
+        public int LayerMask;
+        public List<IPhysicsBody> Results;
+
+        public bool LoopBody(CollidableReference collidable) {
+            if (LayerMask != ~0 && (LayerMask & (1 << World.GetMaterial(collidable).Layer)) == 0)
+                return true;
+            BepuBody body = World.Lookup(collidable);
+            if (body is not null && !Results.Contains(body))
+                Results.Add(body);
+            return true;
+        }
+    }
+
+    void QueryBounds(Vector3 min, Vector3 max, int layerMask, List<IPhysicsBody> results) {
+        var collector = new OverlapCollector { World = this, LayerMask = layerMask, Results = results };
+        Simulation.BroadPhase.GetOverlaps(new BoundingBox(min, max), ref collector);
+    }
+
+    public int OverlapSphere(TkVector3 center, float radius, int layerMask, List<IPhysicsBody> results) {
+        if (Simulation is null || radius <= 0f)
+            return 0;
+
+        Vector3 c = ToNumerics(center);
+        var r = new Vector3(radius);
+
+        // Gather the broadphase candidates, then refine: keep only bodies whose origin is within
+        // radius (a cheap, slightly loose sphere test — exact shape-vs-sphere would need per-shape
+        // closest-point math; this matches the conservative-then-refine contract above).
+        int before = results.Count;
+        var candidates = new List<IPhysicsBody>();
+        QueryBounds(c - r, c + r, layerMask, candidates);
+        float r2 = radius * radius;
+        foreach (IPhysicsBody body in candidates) {
+            Vector3 p = ToNumerics(body.Position);
+            if ((p - c).LengthSquared() <= r2 && !results.Contains(body))
+                results.Add(body);
+        }
+        return results.Count - before;
+    }
+
+    public int OverlapBox(TkVector3 center, TkVector3 halfExtents, OpenTK.Mathematics.Quaternion orientation,
+        int layerMask, List<IPhysicsBody> results) {
+        if (Simulation is null)
+            return 0;
+
+        // Rotated box -> its world AABB (the broadphase is AABB-based). Conservative for rotated
+        // queries; v1 accepts the slop (documented).
+        Vector3 c = ToNumerics(center);
+        Vector3 h = ToNumerics(halfExtents);
+        System.Numerics.Quaternion q = ToNumerics(orientation);
+        Vector3 ex =
+            Vector3.Abs(Vector3.Transform(new Vector3(h.X, 0, 0), q)) +
+            Vector3.Abs(Vector3.Transform(new Vector3(0, h.Y, 0), q)) +
+            Vector3.Abs(Vector3.Transform(new Vector3(0, 0, h.Z), q));
+
+        int before = results.Count;
+        QueryBounds(c - ex, c + ex, layerMask, results);
+        return results.Count - before;
+    }
+}

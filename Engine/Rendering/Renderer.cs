@@ -3,8 +3,40 @@ namespace BallisticEngine;
 public abstract class Renderer : Behaviour, IStaticMeshRenderer {
     public abstract Mesh SharedMesh { get; set; }
     public abstract Material SharedMaterial { get; set; }
+
+    // -1 = whole mesh. Concrete renderers override to serialize it (members declared on this
+    // base class are excluded from serialization by ComponentReflection).
+    public virtual int SubMeshIndex { get; set; } = -1;
     public Transform Transform => transform;
     public bool RenderedThisFrame { get; set; }
+
+    Material materialInstance;
+
+    // Unity's renderer.material: returns a per-renderer CLONE of the shared material that you can
+    // mutate (material.MetallicFactor = ..., material.BaseColorFactor = ...) without affecting the
+    // .mat asset or other renderers using it. The clone is created on first access and reused; it
+    // replaces SharedMaterial for this renderer so rendering picks it up. Because the instance isn't
+    // an asset, it serializes as null — a runtime-only override, exactly like Unity's instanced mats.
+    //
+    // Use SharedMaterial instead when you WANT to edit the asset (affecting every user of it).
+    public Material Material {
+        get {
+            if (materialInstance is not null)
+                return materialInstance;
+
+            Material source = SharedMaterial ?? MaterialFor(0);
+            if (source is null)
+                return null; // nothing to instance yet (no mesh/material assigned)
+
+            materialInstance = source.Clone();
+            SharedMaterial = materialInstance; // route this renderer's draws through the instance
+            return materialInstance;
+        }
+        set {
+            materialInstance = value;
+            SharedMaterial = value;
+        }
+    }
 
     // Materials resolved from the mesh's baked submesh refs (the .mat assets the model importer
     // generated). Rebuilt lazily whenever the mesh instance changes; entries can be null.

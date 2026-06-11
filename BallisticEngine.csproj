@@ -5,20 +5,30 @@
         <TargetFramework>net9.0</TargetFramework>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>disable</Nullable>
+        <!-- Font baking (AssetPipeline/FontBaker) calls StbTrueType's pointer-based SDF API. -->
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     </PropertyGroup>
 
-    <!-- The library globs **/*.cs from the repo root; keep the host exe projects out. -->
+    <!-- The library globs **/*.cs from the repo root; keep the host exe projects out.
+         SampleProject scripts are GAME code: they compile into GameScripts.dll via the
+         script pipeline (AssetPipeline\Scripting), never into the engine. -->
     <ItemGroup>
       <Compile Remove="BallisticEngine.Runtime\**\*.cs" />
       <Compile Remove="BallisticEngine.Editor\**\*.cs" />
+      <Compile Remove="BallisticEngine.Profiling.Tracy\**\*.cs" />
+      <Compile Remove="Tools\**\*.cs" />
+      <Compile Remove="SampleProject\**\*.cs" />
     </ItemGroup>
 
     <ItemGroup>
       <PackageReference Include="AssimpNet" Version="4.1.0" />
+      <PackageReference Include="BepuPhysics" Version="2.4.0" />
       <PackageReference Include="Magick.NET-Q16-HDRI-AnyCPU" Version="14.14.0" />
       <PackageReference Include="OpenTK" Version="4.9.4" />
       <PackageReference Include="StbImageSharp" Version="2.30.15" />
+      <PackageReference Include="StbTrueTypeSharp" Version="1.26.12" />
       <PackageReference Include="YamlDotNet" Version="18.0.0" />
+      <PackageReference Include="ZeroAllocJobScheduler" Version="1.1.2" />
     </ItemGroup>
 
     <ItemGroup>

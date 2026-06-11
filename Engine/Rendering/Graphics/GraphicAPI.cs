@@ -41,7 +41,7 @@ public static class GraphicAPI
         RenderAsset.Current.CreateNormalBuffer(renderContext);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static GPUBuffer<Vector3> CreateTangentBuffer(RenderContext renderContext) =>
+    public static GPUBuffer<Vector4> CreateTangentBuffer(RenderContext renderContext) =>
         RenderAsset.Current.CreateTangentBuffer(renderContext);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

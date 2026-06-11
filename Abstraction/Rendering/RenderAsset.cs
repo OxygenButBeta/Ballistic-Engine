@@ -13,7 +13,7 @@ public abstract class RenderAsset
     public abstract GPUBuffer<Vector2> CreateUVBuffer(RenderContext renderContext);
     public abstract GPUBuffer<Vector3> CreateNormalBuffer(RenderContext renderContext);
 
-    public abstract GPUBuffer<Vector3> CreateTangentBuffer(RenderContext renderContext);
+    public abstract GPUBuffer<Vector4> CreateTangentBuffer(RenderContext renderContext);
 
     public abstract GPUBuffer<T> CreateBuffer<T>(RenderContext renderContext) where T : unmanaged;
     public abstract InstancedBuffer CreateInstancedBuffer(RenderContext renderContext);

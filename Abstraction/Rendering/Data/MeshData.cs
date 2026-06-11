@@ -8,18 +8,24 @@ namespace BallisticEngine;
 public readonly struct MeshData {
     public readonly Vector3[] Vertices;
     public readonly Vector3[] Normals;
-    public readonly Vector3[] Tangents;
+    // xyz = tangent, w = bitangent handedness (+1/-1). Mirrored UV islands carry w = -1 so
+    // the shader reconstructs B = cross(N, T) * w instead of shading inverted bumps.
+    public readonly Vector4[] Tangents;
     public readonly Vector2[] UVs;
     public readonly uint[] Indices;
     public readonly SubMeshData[] SubMeshes;
 
-    public MeshData(Vector3[] vertices, uint[] indices, Vector2[] uvs, Vector3[] normals, Vector3[] tangents)
+    // The source model's node hierarchy (pre-order; see MeshNodeData) — lets the editor
+    // instantiate the model as a matching entity tree. Empty unless imported split-by-nodes.
+    public readonly MeshNodeData[] Nodes;
+
+    public MeshData(Vector3[] vertices, uint[] indices, Vector2[] uvs, Vector3[] normals, Vector4[] tangents)
         : this(vertices, indices, uvs, normals, tangents,
             [new SubMeshData(null, 0, indices?.Length ?? 0, null)]) {
     }
 
-    public MeshData(Vector3[] vertices, uint[] indices, Vector2[] uvs, Vector3[] normals, Vector3[] tangents,
-        SubMeshData[] subMeshes) {
+    public MeshData(Vector3[] vertices, uint[] indices, Vector2[] uvs, Vector3[] normals, Vector4[] tangents,
+        SubMeshData[] subMeshes, MeshNodeData[] nodes = null) {
         Vertices = vertices;
         Indices = indices;
         UVs = uvs;
@@ -28,6 +34,7 @@ public readonly struct MeshData {
         SubMeshes = subMeshes is { Length: > 0 }
             ? subMeshes
             : [new SubMeshData(null, 0, indices?.Length ?? 0, null)];
+        Nodes = nodes ?? [];
     }
 
     public bool IsValid => Vertices is { Length: > 0 } && Indices is { Length: > 0 };

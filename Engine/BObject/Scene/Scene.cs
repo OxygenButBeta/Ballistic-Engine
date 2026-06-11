@@ -24,14 +24,16 @@ public class Scene : BObject
 
         var behaviour = (SceneBehaviour)Activator.CreateInstance(type);
         sceneBehaviours.Add(behaviour);
-        behaviour.OnAttach();
+        try { behaviour.OnAttach(); }
+        catch (Exception e) { ScriptGuard.Report(behaviour, "OnAttach", e); }
         return behaviour;
     }
 
     public void RemoveSceneBehaviour(SceneBehaviour behaviour) {
         if (behaviour is null || !sceneBehaviours.Remove(behaviour))
             return;
-        behaviour.OnDetach();
+        try { behaviour.OnDetach(); }
+        catch (Exception e) { ScriptGuard.Report(behaviour, "OnDetach", e); }
     }
 
     public T GetSceneBehaviour<T>() where T : SceneBehaviour {
@@ -61,50 +63,83 @@ public class Scene : BObject
         return entity;
     }
 
-    // Remove an entity and detach its components (so renderers leave their draw sets).
+    // Remove an entity AND its transform descendants (children are meaningless without their
+    // parent — deleting a model root must not strand its per-mesh children), detaching all
+    // components so renderers leave their draw sets.
     public void DestroyEntity(Entity entity)
     {
         if (entity is null)
             return;
 
-        if (SceneManager.IsPlaying)
-            entity.FireEnd();
-        entity.DetachAll();
-        entities.Remove(entity);
+        // Snapshot first: removing while scanning would skip grandchildren.
+        var doomed = new List<Entity> { entity };
+        foreach (Entity other in entities)
+            if (!ReferenceEquals(other, entity) && other.transform.IsDescendantOf(entity.transform))
+                doomed.Add(other);
+
+        foreach (Entity victim in doomed)
+        {
+            victim.IsDestroyed = true; // before teardown: this frame's dispatch snapshots skip it
+            if (SceneManager.IsPlaying)
+                victim.FireEnd();
+            victim.DetachAll();
+            entities.Remove(victim);
+        }
     }
 
     // Empty the scene, detaching every component (edit-mode scene swaps). Play-mode lifecycle
     // teardown (FireEnd) happens in SceneManager.StopPlay before this is called.
     public void Clear()
     {
-        foreach (Entity entity in entities)
+        // Snapshots: a guarded OnDetach may legally remove other components/entities.
+        foreach (Entity entity in entities.ToArray())
             entity.DetachAll();
         entities.Clear();
 
-        foreach (SceneBehaviour behaviour in sceneBehaviours)
-            behaviour.OnDetach();
+        foreach (SceneBehaviour behaviour in sceneBehaviours.ToArray()) {
+            try { behaviour.OnDetach(); }
+            catch (Exception e) { ScriptGuard.Report(behaviour, "OnDetach", e); }
+        }
         sceneBehaviours.Clear();
     }
 
-    // Run OnBegin/OnEnabled across the whole scene (entering play mode).
+    // Run OnBegin/OnEnabled across the whole scene (entering play mode). Iterates a snapshot:
+    // a component's OnBegin may Instantiate new entities (e.g. a player controller spawning its
+    // camera), which appends to `entities` — that must not invalidate this enumeration. The newly
+    // spawned entities run their own lifecycle immediately via AddComponent (SceneManager.IsPlaying),
+    // so they aren't skipped.
     internal void FireBegin()
     {
-        foreach (Entity entity in entities.Where(entity => entity.IsActive))
-            entity.FireBegin();
+        foreach (Entity entity in entities.ToArray())
+            if (entity.IsActive && !entity.IsDestroyed)
+                entity.FireBegin();
     }
 
     // Run OnDisabled across the whole scene (leaving play mode).
     internal void FireEnd()
     {
-        foreach (Entity entity in entities.Where(entity => entity.IsActive))
-            entity.FireEnd();
+        foreach (Entity entity in entities.ToArray())
+            if (entity.IsActive && !entity.IsDestroyed)
+                entity.FireEnd();
     }
 
+    // Snapshot (ToArray) so a behaviour that Instantiates or Destroys an entity during Tick —
+    // a normal gameplay action (spawn a projectile, despawn on death) — doesn't invalidate this
+    // enumeration. A newly spawned entity ran its own OnBegin/OnEnabled via AddComponent already;
+    // it starts ticking next frame. An entity destroyed mid-frame stays in the snapshot but is
+    // skipped via IsDestroyed (its components already tore down).
     public void Update(in float deltaTime)
     {
-        foreach (Entity entity in entities.Where(entity => entity.IsActive))
-        {
-            entity.Update(in deltaTime);
-        }
+        foreach (Entity entity in entities.ToArray())
+            if (entity.IsActive && !entity.IsDestroyed)
+                entity.Update(in deltaTime);
+    }
+
+    // Runs FixedTick across the scene; called by the fixed-step physics loop, before each step.
+    public void FixedUpdate(in float fixedDelta)
+    {
+        foreach (Entity entity in entities.ToArray())
+            if (entity.IsActive && !entity.IsDestroyed)
+                entity.FixedUpdate(in fixedDelta);
     }
 }

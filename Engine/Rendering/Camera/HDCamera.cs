@@ -29,7 +29,14 @@ public class HDCamera : Behaviour, IViewProjectionProvider
 
     public Matrix4 GetViewMatrix()
     {
-        return Matrix4.LookAt(transform.Position, transform.Position + transform.Forward, transform.Up);
+        // World-space, not local: the camera may be PARENTED (e.g. under a player controller), so it
+        // must render from where it actually is in the world, not from its local offset near the
+        // parent's origin. WorldRotation drives the basis so look direction follows the parent too.
+        Vector3 eye = transform.WorldPosition;
+        Quaternion worldRotation = transform.WorldRotation;
+        Vector3 forward = worldRotation * Vector3.UnitZ;
+        Vector3 up = worldRotation * Vector3.UnitY;
+        return Matrix4.LookAt(eye, eye + forward, up);
     }
 
     public Vector3 AmbientColor =>
@@ -63,7 +70,57 @@ public class HDCamera : Behaviour, IViewProjectionProvider
 
     internal void RenderCamera()
     {
+        // Lazy init: OnBegin only fires in play mode, but a paused/headless host (screenshot
+        // verification) registers this camera and renders without ever entering play.
+        window ??= Window.Current;
+        renderer ??= RenderAsset.Current.Renderer;
         renderer.BeginRender(new RendererArgs(viewProjectionProvider: this));
         renderer.PostRenderCleanUp();
+    }
+
+    public override void OnDrawGizmos(IGizmos gizmos)
+    {
+        gizmos.Color = new Vector3(0.5f, 0.8f, 1f);
+        gizmos.DrawIcon(transform.Position, GizmoIcon.Camera);
+    }
+
+    public override void OnDrawGizmosSelected(IGizmos gizmos)
+    {
+        // A view-frustum wireframe reconstructed from the camera's fov/near/far. The real aspect
+        // depends on the game window at runtime; 16:9 is a representative preview shape (do NOT call
+        // GetProjectionMatrix here — it reads the live OS window size, not the editor viewport).
+        gizmos.Color = new Vector3(0.5f, 0.8f, 1f);
+
+        const float aspect = 16f / 9f;
+        float tanV = MathF.Tan(MathHelper.DegreesToRadians(45f) * 0.5f);
+        float gizmoFar = MathF.Min(farPlane, 30f); // cap so the frustum stays a usable size
+
+        Vector3 pos = transform.Position;
+        Vector3 fwd = transform.Forward, up = transform.Up, right = transform.Right;
+
+        Span<Vector3> near = stackalloc Vector3[4];
+        Span<Vector3> far = stackalloc Vector3[4];
+        Corners(pos, fwd, up, right, nearPlane, tanV, aspect, near);
+        Corners(pos, fwd, up, right, gizmoFar, tanV, aspect, far);
+
+        for (var i = 0; i < 4; i++)
+        {
+            int n = (i + 1) % 4;
+            gizmos.DrawLine(near[i], near[n]); // near rectangle
+            gizmos.DrawLine(far[i], far[n]);   // far rectangle
+            gizmos.DrawLine(near[i], far[i]);  // connecting edge
+        }
+    }
+
+    static void Corners(Vector3 pos, Vector3 fwd, Vector3 up, Vector3 right,
+        float dist, float tanV, float aspect, Span<Vector3> outCorners)
+    {
+        float h = tanV * dist;
+        float w = h * aspect;
+        Vector3 c = pos + fwd * dist;
+        outCorners[0] = c + up * h - right * w; // top-left
+        outCorners[1] = c + up * h + right * w; // top-right
+        outCorners[2] = c - up * h + right * w; // bottom-right
+        outCorners[3] = c - up * h - right * w; // bottom-left
     }
 }

@@ -3,11 +3,19 @@ using OpenTK.Mathematics;
 
 namespace BallisticEngine.AssetPipeline;
 
-// A source material's texture bindings, as authored in the model file. Paths are the raw
-// strings Assimp reports (absolute, relative, or bare filenames) — the importer resolves them.
+// A source material's texture bindings and scalar PBR factors, as authored in the model
+// file. Paths are the raw strings Assimp reports (absolute, relative, or bare filenames) —
+// the importer resolves them. Scalars are null when the source doesn't state them, so the
+// .mat writer can leave them out and the loader applies its own defaults.
 public sealed class DecodedMaterial {
     public string Name;
     public readonly Dictionary<TextureType, string> TexturePaths = new();
+
+    public Vector4? BaseColor;       // linear RGBA tint; multiplies the albedo map
+    public float? Metallic;          // glTF metallicFactor (or derived)
+    public float? Roughness;         // glTF roughnessFactor / converted shininess
+    public Vector3? EmissiveColor;   // linear RGB
+    public float? Opacity;
 }
 
 // Whole-model decode result: merged geometry (one submesh per used source material, node
@@ -46,9 +54,12 @@ public static class AssimpMeshDecoder {
         return Combine([builder]).Mesh;
     }
 
-    // Whole-scene decode: walks the node hierarchy, bakes each node's world transform into its
-    // vertices, and merges everything into one mesh with a submesh per used source material.
-    public static DecodedModel DecodeScene(string path, bool flipUVs = true) {
+    // Whole-scene decode: walks the node hierarchy and bakes each node's world transform into
+    // its vertices. splitByNodes=false merges everything into one mesh with a submesh per used
+    // source material; splitByNodes=true emits one submesh per node mesh instead (named after
+    // the node, carrying its world transform), so the editor can instantiate the model as one
+    // entity per source object.
+    public static DecodedModel DecodeScene(string path, bool flipUVs = true, bool splitByNodes = false) {
         AssimpContext context = new();
 
         PostProcessSteps steps = PostProcessSteps.Triangulate
@@ -63,47 +74,79 @@ public static class AssimpMeshDecoder {
         if (scene == null || scene.MeshCount == 0)
             throw new IOException($"Mesh import failed or no meshes found in '{path}'.");
 
-        // One builder per source material that geometry actually uses, in first-use order.
+        // Builders in first-use order with the material index each submesh renders with.
+        // Merged mode reuses one builder per material; split mode creates one per node mesh
+        // and records the node hierarchy (pre-order, so a parent always precedes its children).
+        var builders = new List<SubMeshBuilder>();
+        var builderMaterials = new List<int>();
         var builderByMaterial = new Dictionary<int, SubMeshBuilder>();
-        var materialOrder = new List<int>();
+        var nodes = new List<MeshNodeData>();
 
-        void Traverse(Node node, Matrix4 parentWorld) {
+        void Traverse(Node node, Matrix4 parentWorld, int parentIndex) {
             Matrix4 world = ToOpenTK(node.Transform) * parentWorld;
 
-            foreach (var meshIndex in node.MeshIndices) {
-                Assimp.Mesh mesh = scene.Meshes[meshIndex];
+            var nodeIndex = -1;
+            if (splitByNodes) {
+                nodeIndex = nodes.Count;
+                // Normalize empty names to null — the artifact stores "" for none, so this
+                // keeps decode → write → read an exact round-trip.
+                nodes.Add(new MeshNodeData(string.IsNullOrEmpty(node.Name) ? null : node.Name,
+                    parentIndex, ToOpenTK(node.Transform)));
+            }
+
+            for (var n = 0; n < node.MeshIndices.Count; n++) {
+                Assimp.Mesh mesh = scene.Meshes[node.MeshIndices[n]];
                 if (mesh.VertexCount == 0 || mesh.FaceCount == 0)
                     continue;
 
-                if (!builderByMaterial.TryGetValue(mesh.MaterialIndex, out SubMeshBuilder builder)) {
+                SubMeshBuilder builder;
+                if (splitByNodes) {
+                    // Assimp splits multi-material source objects into one mesh per material;
+                    // suffix those so siblings stay distinguishable in the hierarchy.
+                    builder = new SubMeshBuilder {
+                        Name = node.MeshIndices.Count > 1 ? $"{node.Name}.{n}" : node.Name,
+                        NodeTransform = world,
+                        NodeIndex = nodeIndex,
+                    };
+                    builders.Add(builder);
+                    builderMaterials.Add(mesh.MaterialIndex);
+                }
+                else if (!builderByMaterial.TryGetValue(mesh.MaterialIndex, out builder)) {
                     builder = new SubMeshBuilder();
                     builderByMaterial[mesh.MaterialIndex] = builder;
-                    materialOrder.Add(mesh.MaterialIndex);
+                    builders.Add(builder);
+                    builderMaterials.Add(mesh.MaterialIndex);
                 }
 
                 builder.Append(mesh, world);
             }
 
             foreach (Node child in node.Children)
-                Traverse(child, world);
+                Traverse(child, world, nodeIndex);
         }
 
-        Traverse(scene.RootNode, Matrix4.Identity);
+        Traverse(scene.RootNode, Matrix4.Identity, -1);
 
-        if (materialOrder.Count == 0)
+        if (builders.Count == 0)
             throw new IOException($"'{path}' contains meshes, but none are referenced by its node hierarchy.");
 
-        var builders = new List<SubMeshBuilder>(materialOrder.Count);
-        var materials = new List<DecodedMaterial>(materialOrder.Count);
-        foreach (var materialIndex in materialOrder) {
-            builders.Add(builderByMaterial[materialIndex]);
-            DecodedMaterial material = DecodeMaterial(scene, materialIndex);
-            builderByMaterial[materialIndex].Name = material?.Name;
-            materials.Add(material);
+        // One DecodedMaterial INSTANCE per source material (split mode repeats them across
+        // submeshes); the importer dedupes .mat generation by reference.
+        var materialByIndex = new Dictionary<int, DecodedMaterial>();
+        var materials = new DecodedMaterial[builders.Count];
+        for (var i = 0; i < builders.Count; i++) {
+            var materialIndex = builderMaterials[i];
+            if (!materialByIndex.TryGetValue(materialIndex, out DecodedMaterial material)) {
+                material = DecodeMaterial(scene, materialIndex);
+                materialByIndex[materialIndex] = material;
+            }
+
+            builders[i].Name ??= material?.Name;
+            materials[i] = material;
         }
 
-        DecodedModel model = Combine(builders);
-        model.SubMeshMaterials = materials.ToArray();
+        DecodedModel model = Combine(builders, nodes.ToArray());
+        model.SubMeshMaterials = materials;
         return model;
     }
 
@@ -123,8 +166,52 @@ public static class AssimpMeshDecoder {
         Map(source, decoded, TextureType.Metallic, Assimp.TextureType.Specular);
         Map(source, decoded, TextureType.Roughness, Assimp.TextureType.Shininess);
         Map(source, decoded, TextureType.AO, Assimp.TextureType.Lightmap, Assimp.TextureType.Ambient);
+        Map(source, decoded, TextureType.Emissive, Assimp.TextureType.Emissive);
 
+        DecodeScalars(source, decoded);
         return decoded;
+    }
+
+    // Scalar PBR factors. Untextured materials previously lost their authored look entirely
+    // (white, fully rough, dielectric); these carry the source factors into the .mat asset.
+    static void DecodeScalars(Assimp.Material source, DecodedMaterial decoded) {
+        if (source.HasColorDiffuse) {
+            Color4D c = source.ColorDiffuse;
+            // Skip pure-white defaults: they carry no information and would just bloat the .mat.
+            if (c.R < 0.999f || c.G < 0.999f || c.B < 0.999f || c.A < 0.999f)
+                decoded.BaseColor = new Vector4(c.R, c.G, c.B, c.A);
+        }
+
+        if (source.HasColorEmissive) {
+            Color4D e = source.ColorEmissive;
+            if (e.R > 0.001f || e.G > 0.001f || e.B > 0.001f)
+                decoded.EmissiveColor = new Vector3(e.R, e.G, e.B);
+        }
+
+        if (source.HasOpacity && source.Opacity < 0.999f)
+            decoded.Opacity = source.Opacity;
+
+        // glTF-style PBR factors live in generic material properties, not typed accessors.
+        if (TryGetFloat(source, "$mat.metallicFactor", out var metallic) ||
+            TryGetFloat(source, "$mat.gltf.pbrMetallicRoughness.metallicFactor", out metallic) ||
+            TryGetFloat(source, "$mat.reflectivity", out metallic))
+            decoded.Metallic = Math.Clamp(metallic, 0f, 1f);
+
+        if (TryGetFloat(source, "$mat.roughnessFactor", out var roughness) ||
+            TryGetFloat(source, "$mat.gltf.pbrMetallicRoughness.roughnessFactor", out roughness))
+            decoded.Roughness = Math.Clamp(roughness, 0f, 1f);
+        else if (source.HasShininess && source.Shininess > 0f)
+            // Legacy Blinn-Phong shininess -> GGX roughness (Karis' mapping).
+            decoded.Roughness = Math.Clamp(MathF.Sqrt(2f / (source.Shininess + 2f)), 0.02f, 1f);
+    }
+
+    static bool TryGetFloat(Assimp.Material source, string key, out float value) {
+        value = 0f;
+        MaterialProperty property = source.GetProperty($"{key},0,0");
+        if (property is null || property.PropertyType != PropertyType.Float)
+            return false;
+        value = property.GetFloatValue();
+        return true;
     }
 
     static void Map(Assimp.Material source, DecodedMaterial decoded, TextureType slot,
@@ -145,9 +232,11 @@ public static class AssimpMeshDecoder {
     // Accumulates transformed geometry for one output submesh.
     sealed class SubMeshBuilder {
         public string Name;
+        public Matrix4 NodeTransform = Matrix4.Identity; // node local->model (split mode only)
+        public int NodeIndex = -1;                       // into the decoded node table (split mode only)
         public readonly List<Vector3> Positions = new();
         public readonly List<Vector3> Normals = new();
-        public readonly List<Vector3> Tangents = new();
+        public readonly List<Vector4> Tangents = new(); // w = bitangent handedness
         public readonly List<Vector2> UVs = new();
         public readonly List<uint> Indices = new();
 
@@ -170,13 +259,22 @@ public static class AssimpMeshDecoder {
             for (var i = 0; i < mesh.VertexCount; i++) {
                 Positions.Add(MulPoint(ToVector3(mesh.Vertices[i]), in world));
 
-                Normals.Add(hasNormals
+                Vector3 n = hasNormals
                     ? SafeNormalize(MulVector(ToVector3(mesh.Normals[i]), in normalMatrix), Vector3.UnitY)
-                    : Vector3.UnitY);
+                    : Vector3.UnitY;
+                Normals.Add(n);
 
-                Tangents.Add(hasTangents
-                    ? SafeNormalize(MulVector(ToVector3(mesh.Tangents[i]), in linear), Vector3.UnitX)
-                    : Vector3.UnitX);
+                if (hasTangents) {
+                    Vector3 t = SafeNormalize(MulVector(ToVector3(mesh.Tangents[i]), in linear), Vector3.UnitX);
+                    // Handedness from the authored bitangent: mirrored UV islands flip it, and
+                    // reconstructing B = cross(N, T) without the sign shades inverted bumps there.
+                    Vector3 b = SafeNormalize(MulVector(ToVector3(mesh.BiTangents[i]), in linear), Vector3.UnitY);
+                    var w = Vector3.Dot(Vector3.Cross(n, t), b) < 0f ? -1f : 1f;
+                    Tangents.Add(new Vector4(t, w));
+                }
+                else {
+                    Tangents.Add(new Vector4(Vector3.UnitX, 1f));
+                }
 
                 if (hasUVs) {
                     Vector3D uv = mesh.TextureCoordinateChannels[0][i];
@@ -206,13 +304,13 @@ public static class AssimpMeshDecoder {
         }
     }
 
-    static DecodedModel Combine(List<SubMeshBuilder> builders) {
+    static DecodedModel Combine(List<SubMeshBuilder> builders, MeshNodeData[] nodes = null) {
         var vertexTotal = builders.Sum(b => b.Positions.Count);
         var indexTotal = builders.Sum(b => b.Indices.Count);
 
         var positions = new Vector3[vertexTotal];
         var normals = new Vector3[vertexTotal];
-        var tangents = new Vector3[vertexTotal];
+        var tangents = new Vector4[vertexTotal];
         var uvs = new Vector2[vertexTotal];
         var indices = new uint[indexTotal];
         var subMeshes = new SubMeshData[builders.Count];
@@ -230,14 +328,15 @@ public static class AssimpMeshDecoder {
             for (var i = 0; i < builder.Indices.Count; i++)
                 indices[indexOffset + i] = builder.Indices[i] + (uint)vertexOffset;
 
-            subMeshes[s] = new SubMeshData(builder.Name, indexOffset, builder.Indices.Count, null);
+            subMeshes[s] = new SubMeshData(builder.Name, indexOffset, builder.Indices.Count, null,
+                builder.NodeTransform, builder.NodeIndex);
 
             vertexOffset += builder.Positions.Count;
             indexOffset += builder.Indices.Count;
         }
 
         return new DecodedModel {
-            Mesh = new MeshData(positions, indices, uvs, normals, tangents, subMeshes),
+            Mesh = new MeshData(positions, indices, uvs, normals, tangents, subMeshes, nodes),
         };
     }
 

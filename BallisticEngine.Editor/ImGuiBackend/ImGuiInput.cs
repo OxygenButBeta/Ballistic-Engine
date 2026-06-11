@@ -1,4 +1,4 @@
-using ImGuiNET;
+using Hexa.NET.ImGui;
 using OpenTK.Windowing.Desktop;
 using OpenTK.Windowing.GraphicsLibraryFramework;
 
@@ -17,9 +17,12 @@ internal static class ImGuiInput {
         io.AddMouseWheelEvent(mouse.ScrollDelta.X, mouse.ScrollDelta.Y);
 
         KeyboardState kb = window.KeyboardState;
-        io.KeyCtrl = kb.IsKeyDown(Keys.LeftControl) || kb.IsKeyDown(Keys.RightControl);
-        io.KeyShift = kb.IsKeyDown(Keys.LeftShift) || kb.IsKeyDown(Keys.RightShift);
-        io.KeyAlt = kb.IsKeyDown(Keys.LeftAlt) || kb.IsKeyDown(Keys.RightAlt);
+        // Hexa exposes io.KeyCtrl/Shift/Alt as read-only — feed the modifier state through the event
+        // queue instead (AddKeyEvent on the Mod* keys is the supported path; ImGui keeps io.KeyCtrl
+        // etc. in sync internally).
+        io.AddKeyEvent(ImGuiKey.ModCtrl, kb.IsKeyDown(Keys.LeftControl) || kb.IsKeyDown(Keys.RightControl));
+        io.AddKeyEvent(ImGuiKey.ModShift, kb.IsKeyDown(Keys.LeftShift) || kb.IsKeyDown(Keys.RightShift));
+        io.AddKeyEvent(ImGuiKey.ModAlt, kb.IsKeyDown(Keys.LeftAlt) || kb.IsKeyDown(Keys.RightAlt));
 
         foreach ((Keys key, ImGuiKey imguiKey) in KeyMap)
             io.AddKeyEvent(imguiKey, kb.IsKeyDown(key));
@@ -48,7 +51,7 @@ internal static class ImGuiInput {
         for (Keys k = Keys.A; k <= Keys.Z; k++)
             list.Add((k, ImGuiKey.A + (k - Keys.A)));
         for (Keys k = Keys.D0; k <= Keys.D9; k++)
-            list.Add((k, ImGuiKey._0 + (k - Keys.D0)));
+            list.Add((k, ImGuiKey.Key0 + (k - Keys.D0)));
 
         return list.ToArray();
     }

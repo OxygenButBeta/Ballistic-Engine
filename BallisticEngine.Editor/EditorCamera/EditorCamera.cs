@@ -10,7 +10,7 @@ internal sealed class EditorCamera : IViewProjectionProvider {
 
     float pitch;
     float yaw;
-    float moveSpeed = 10f;
+    float moveSpeed = EditorPrefs.Current.CameraBaseSpeed;
     float aspect = 16f / 9f;
 
     const float nearPlane = 0.1f;
@@ -28,6 +28,30 @@ internal sealed class EditorCamera : IViewProjectionProvider {
     // Move so the target fills a comfortable portion of the view, keeping the current look direction.
     public void Focus(Vector3 target, float radius) {
         transform.Position = target - transform.Forward * Math.Max(2f, radius * 3f);
+    }
+
+    // Snap the camera to look along `direction` (e.g. the orientation gizmo's front/top/side axes),
+    // orbiting around the point it currently looks at so the framed content stays put. Derives
+    // yaw/pitch as the inverse of the Update() convention (Forward = qYaw * qPitch * UnitZ, i.e.
+    // Forward = (cosP*sinY, -sinP, cosP*cosY)).
+    public void LookDirection(Vector3 direction) {
+        if (direction.LengthSquared < 1e-6f)
+            return;
+        direction = direction.Normalized();
+
+        // Keep looking at the same focus point (a fixed distance ahead) after re-orienting.
+        const float orbitDistance = 12f;
+        Vector3 focus = transform.Position + transform.Forward * orbitDistance;
+
+        pitch = MathHelper.RadiansToDegrees(MathF.Asin(Math.Clamp(-direction.Y, -1f, 1f)));
+        pitch = MathHelper.Clamp(pitch, -90f, 90f);
+        yaw = MathHelper.RadiansToDegrees(MathF.Atan2(direction.X, direction.Z));
+
+        Quaternion qPitch = Quaternion.FromAxisAngle(Vector3.UnitX, MathHelper.DegreesToRadians(pitch));
+        Quaternion qYaw = Quaternion.FromAxisAngle(Vector3.UnitY, MathHelper.DegreesToRadians(yaw));
+        transform.Rotation = qYaw * qPitch;
+
+        transform.Position = focus - transform.Forward * orbitDistance;
     }
 
     public void SetAspect(float panelAspect) {
