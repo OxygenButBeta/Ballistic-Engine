@@ -29,8 +29,18 @@ vec3 WorldPos(vec2 uv) {
     return (InvViewMatrix * vec4(view.xyz, 1.0)).xyz;
 }
 
+// NaN/Inf -> 0. A bad value in the accumulated history is the worst kind: the EMA carries it
+// every frame, so one contaminated tap becomes a permanent black/white speckle. Scrub both the
+// incoming gather and the reprojected history so the accumulation can never hold a bad pixel.
+vec3 Sanitize(vec3 v) {
+    return mix(v, vec3(0.0), vec3(isnan(v.x) || isinf(v.x),
+                                  isnan(v.y) || isinf(v.y),
+                                  isnan(v.z) || isinf(v.z)));
+}
+
 void main() {
     vec4 current = texture(currentGI, TexCoords);
+    current.rgb = Sanitize(current.rgb);
     float depth = texture(depthTexture, TexCoords).r;
 
     // Sky: nothing to accumulate.
@@ -54,6 +64,7 @@ void main() {
     }
 
     vec4 history = texture(historyGI, prevUV);
+    history.rgb = Sanitize(history.rgb);
 
     // Neighborhood clamp - LOOSENED for a sparse 1-spp signal. A TAA-style hard clamp to the
     // raw 3x3 box is BISTABLE for GI: with 4 rays at half res, many pixels have frames where

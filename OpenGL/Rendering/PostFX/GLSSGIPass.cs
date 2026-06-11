@@ -133,24 +133,35 @@ public sealed class GLSSGIPass {
         temporalShader.SetFloat("MaxHistory", Math.Max(fx.SsgiMaxHistory, 1f) * (1f + look));
         GLBufferUtilities.DrawFullscreenQuad();
 
-        // ---- 3. Spatial denoise (reads the freshly-written history) ----
-        denoiseTarget.BindAsTarget();
-        denoiseShader.Activate();
-        BindTex(0, historyWriteTex.Texture, denoiseShader, "giTexture");
-        BindTex(1, depthTexture, denoiseShader, "depthTexture");
-        BindTex(2, normalTexture, denoiseShader, "normalTexture");
-        denoiseShader.SetMatrix4("InvProjection", ref invProjection);
-        // Widen the spatial denoise slightly with the look dial for a cleaner, more "rendered" feel.
-        denoiseShader.SetFloat("StepSize", Math.Max(fx.SsgiDenoise, 1f) * (1f + 0.5f * look));
-        denoiseShader.SetFloat("DepthSigma", 0.1f);
-        denoiseShader.SetFloat("NormalSigma", 32f);
-        GLBufferUtilities.DrawFullscreenQuad();
+        // ---- 3. Spatial denoise: a TWO-ITERATION a-trous wavelet cascade (SVGF-style) ----
+        // One pass over a sparse 4-ray-at-half-res signal leaves low-frequency blotches - the
+        // "weirdly noisy" structured grain. A second pass at 2x the tap spacing (the a-trous hole
+        // doubling) cleans those without extra blur on edges, because each pass re-applies the
+        // depth/normal/luma edge-stops. Ping-pong giTarget <-> denoiseTarget between iterations.
+        float baseStep = Math.Max(fx.SsgiDenoise, 1f) * (1f + 0.5f * look);
+        GLRenderTexture src = historyWriteTex;
+        GLRenderTexture[] pingPong = { denoiseTarget, giTarget };
+        for (var iter = 0; iter < 2; iter++) {
+            GLRenderTexture dst = pingPong[iter & 1];
+            dst.BindAsTarget();
+            denoiseShader.Activate();
+            BindTex(0, src.Texture, denoiseShader, "giTexture");
+            BindTex(1, depthTexture, denoiseShader, "depthTexture");
+            BindTex(2, normalTexture, denoiseShader, "normalTexture");
+            denoiseShader.SetMatrix4("InvProjection", ref invProjection);
+            denoiseShader.SetFloat("StepSize", baseStep * (1 << iter)); // 1x then 2x tap spacing
+            denoiseShader.SetFloat("DepthSigma", 0.1f);
+            denoiseShader.SetFloat("NormalSigma", 32f);
+            GLBufferUtilities.DrawFullscreenQuad();
+            src = dst;
+        }
+        GLRenderTexture denoisedFinal = src;
 
         // ---- 4. Combine over the full-res scene ----
         combinedTarget.BindAsTarget();
         combineShader.Activate();
         BindTex(0, colorTexture, combineShader, "sceneTexture");
-        BindTex(1, denoiseTarget.Texture, combineShader, "ssgiTexture");
+        BindTex(1, denoisedFinal.Texture, combineShader, "ssgiTexture");
         BindTex(2, aoTexture, combineShader, "aoTexture");
         BindTex(3, normalTexture, combineShader, "normalTexture");
         combineShader.SetBool("ApplyAO", aoTexture != 0);

@@ -342,6 +342,9 @@ internal sealed class InspectorPanel {
             if (behaviour is Volume volume)
                 DrawVolumeProfileSection(entity, volume);
 
+            if (behaviour is Terrain terrain)
+                DrawTerrainBrushSection(terrain);
+
             ImGui.Spacing();
         }
 
@@ -413,7 +416,7 @@ internal sealed class InspectorPanel {
     // Inline profile editing under a Volume component, Unity-style: the profile's overrides are
     // edited in place (and saved straight back to the .volume asset), or a fresh profile asset
     // can be created and assigned in one click.
-    static void DrawVolumeProfileSection(Entity entity, Volume volume) {
+    void DrawVolumeProfileSection(Entity entity, Volume volume) {
         ImGui.Spacing();
 
         if (volume.Profile is null) {
@@ -424,8 +427,63 @@ internal sealed class InspectorPanel {
         }
 
         ImGui.SeparatorText("Overrides");
-        if (VolumeProfileEditor.Draw(volume.Profile))
+        if (VolumeProfileEditor.Draw(volume.Profile)) {
             VolumeProfileEditor.SaveToAsset(volume.Profile);
+            // The viewport repaints on demand; without this a profile edit (toggle a component
+            // Active, drag contrast/saturation, ...) saves but never shows — looked "broken".
+            state.MarkViewportDirty();
+        }
+    }
+
+    // Terrain sculpting palette: a Sculpt toggle that arms the Scene-view brush, the brush mode, and
+    // radius/strength (and a target height for Flatten/Set). Drives TerrainTool's static state; the
+    // actual sculpting happens in the viewport. Not part of scene undo — brush settings are editor
+    // tool state, and each stroke pushes its own undo + saves the .terrain asset.
+    static void DrawTerrainBrushSection(Terrain terrain) {
+        ImGui.Spacing();
+
+        if (terrain.Terrain3D is null) {
+            ImGui.TextDisabled("Assign a Terrain asset to sculpt (or create one: Assets > New Terrain).");
+            TerrainTool.Armed = false;
+            return;
+        }
+
+        ImGui.SeparatorText("Sculpt");
+
+        bool armed = TerrainTool.Armed;
+        if (ImGui.Checkbox("Enable Brush", ref armed))
+            TerrainTool.Armed = armed;
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Left-drag in the Scene view to sculpt. While on, clicks paint instead of selecting.");
+
+        if (!armed)
+            return;
+
+        // Brush mode.
+        string[] modes = ["Raise", "Lower", "Smooth", "Flatten", "Set"];
+        int mode = (int)TerrainTool.Brush;
+        ImGui.SetNextItemWidth(-1);
+        if (ImGui.Combo("##terrainbrush", ref mode, modes, modes.Length))
+            TerrainTool.Brush = (TerrainSculpt.Brush)mode;
+
+        float radius = TerrainTool.Radius;
+        if (ImGui.SliderFloat("Radius", ref radius, 0.5f, 60f, "%.1f"))
+            TerrainTool.Radius = radius;
+
+        float strength = TerrainTool.Strength;
+        if (ImGui.SliderFloat("Strength", ref strength, 0.01f, 2f, "%.2f"))
+            TerrainTool.Strength = strength;
+
+        // Flatten/Set converge toward a target height (0..1 of the terrain's HeightScale).
+        if (TerrainTool.Brush is TerrainSculpt.Brush.Flatten or TerrainSculpt.Brush.Set) {
+            float target = TerrainTool.TargetHeight;
+            if (ImGui.SliderFloat("Target Height", ref target, 0f, 1f, "%.2f"))
+                TerrainTool.TargetHeight = target;
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Normalized height (x HeightScale) the brush levels toward.");
+        }
+
+        ImGui.TextDisabled("Pick Lower to dig; Smooth/Flatten to level.");
     }
 
     static void CreateProfileAsset(Entity entity, Volume volume) {

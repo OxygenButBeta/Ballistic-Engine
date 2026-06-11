@@ -66,6 +66,17 @@ float Hash(vec2 p) {
     return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
 }
 
+// Replace any NaN/Inf component with 0. The lit HDR scene (and the multi-bounce history fed
+// from it) can carry a NaN/Inf from an EXR sun or a degenerate specular highlight; gathered
+// into `bounce` it is STICKY - min/max/clamp propagate it and the temporal EMA then carries
+// the bad pixel forever, which is exactly the "weirdly noisy" black/white speckle and the
+// occasional crash. Kill it at every HDR read so nothing downstream can spread it.
+vec3 Sanitize(vec3 v) {
+    return mix(v, vec3(0.0), vec3(isnan(v.x) || isinf(v.x),
+                                  isnan(v.y) || isinf(v.y),
+                                  isnan(v.z) || isinf(v.z)));
+}
+
 // Build an orthonormal basis around n (Duff et al., branchless).
 mat3 BasisFromNormal(vec3 n) {
     float s = n.z >= 0.0 ? 1.0 : -1.0;
@@ -114,6 +125,10 @@ void main() {
         vec2 u = vec2(
             fract((float(i) + 0.5) / float(rays) + noise),
             fract(noise * 1.7 + float(i) * 0.37));
+        // Bias u.x off the extremes: at u.x ~= 1 CosineSample's z-> 0 and the disk radius -> 1,
+        // so basis*sample can be ~0 and normalize() returns NaN (a speckle seed). Clamp keeps
+        // every sample a well-defined hemisphere direction.
+        u.x = clamp(u.x, 1e-3, 0.999);
         vec3 dir = normalize(basis * CosineSample(u));
 
         vec3 rayPos = P + N * 0.05;
@@ -176,8 +191,8 @@ void main() {
             // Incoming radiance = the lit color at the hit, plus a fraction of the GI that
             // already accumulated there last frame (the cheap multi-bounce: light that
             // bounced once last frame bounces again this frame, compounding richness).
-            vec3 radiance = texture(colorTexture, hitUV).rgb
-                          + texture(historyColor, hitUV).rgb * MultiBounce;
+            vec3 radiance = Sanitize(texture(colorTexture, hitUV).rgb)
+                          + Sanitize(texture(historyColor, hitUV).rgb) * MultiBounce;
 
             // Boost bright hits so strong indirect (a sunlit wall) reads richer, Lumen-like.
             radiance *= 1.0 + BounceBoost * dot(radiance, vec3(0.333));
@@ -199,7 +214,7 @@ void main() {
             // sun disk through a window can't speckle the accumulation.
             vec3 worldDir = transpose(mat3(ViewMatrix)) * dir;
             vec3 skyDir = transpose(mat3(SkyRotation)) * worldDir;
-            vec3 sky = textureLod(EnvironmentMap, skyDir, MaxEnvMip).rgb * SkyExposure;
+            vec3 sky = Sanitize(textureLod(EnvironmentMap, skyDir, MaxEnvMip).rgb) * SkyExposure;
             float skyLum = dot(sky, vec3(0.2126, 0.7152, 0.0722));
             if (skyLum > FIREFLY_KNEE)
                 sky *= FIREFLY_KNEE / skyLum;
@@ -216,5 +231,5 @@ void main() {
     vec2 edge = min(TexCoords, 1.0 - TexCoords);
     float edgeFade = smoothstep(0.0, 0.06, min(edge.x, edge.y));
 
-    FragColor = vec4(bounce, edgeFade);
+    FragColor = vec4(Sanitize(bounce), edgeFade);
 }
