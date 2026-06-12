@@ -33,6 +33,7 @@ internal sealed class AssetBrowserPanel {
         ("Models", [".fbx", ".obj", ".gltf", ".glb", ".dae"]),
         ("Textures", [".png", ".jpg", ".jpeg", ".tga", ".bmp", ".hdr", ".exr"]),
         ("Materials", [".mat"]),
+        ("Audio", [".wav", ".wave", ".ogg"]),
         ("Shaders", [".shader", ".glsl"]),
         ("Scripts", [".cs"]),
         ("Scenes", [".scene", ".pyscene"]),
@@ -42,6 +43,10 @@ internal sealed class AssetBrowserPanel {
     // Hidden by default — intermediate/source formats that just generate other assets.
     static readonly string[] HiddenExtensions = [".pyscene"];
     bool showSourceFiles;
+
+    // The Default folder is read-only + hidden — protection logic lives in AssetOps so every site
+    // (delete/move/this panel) shares one rule.
+    static bool IsProtected(string path) => AssetOps.IsProtected(path);
 
     // Inline rename: the project-relative path being renamed + the edit buffer.
     string renamingPath;
@@ -106,8 +111,11 @@ internal sealed class AssetBrowserPanel {
         if (!searching) {
             var currentAbsolute = AssetDatabase.Project.ResolveAbsolute(CurrentFolder);
             if (Directory.Exists(currentAbsolute)) {
-                foreach (var dir in Directory.GetDirectories(currentAbsolute))
-                    folders.Add(prefix + Path.GetFileName(dir));
+                foreach (var dir in Directory.GetDirectories(currentAbsolute)) {
+                    string rel = prefix + Path.GetFileName(dir);
+                    if (IsProtected(rel)) continue;   // hide the read-only Default folder
+                    folders.Add(rel);
+                }
             }
         }
 
@@ -118,7 +126,8 @@ internal sealed class AssetBrowserPanel {
         // Source/intermediate files (Falcor .pyscene) are hidden by default — they auto-generate a
         // sibling .scene and just clutter the view. "Show Source Files" in the grid menu reveals them.
         bool Hidden(string path) =>
-            !showSourceFiles && HiddenExtensions.Contains(Path.GetExtension(path).ToLowerInvariant());
+            IsProtected(path) ||   // the Default folder's assets are never listed
+            (!showSourceFiles && HiddenExtensions.Contains(Path.GetExtension(path).ToLowerInvariant()));
 
         foreach ((string path, Guid guid) in assets) {
             if (!PassesType(path) || Hidden(path))
@@ -444,6 +453,9 @@ internal sealed class AssetBrowserPanel {
     }
 
     void DrawFolderNode(string folderPath) {
+        if (IsProtected(folderPath))
+            return;     // the read-only Default folder is hidden from the tree too
+
         var absolute = AssetDatabase.Project.ResolveAbsolute(folderPath);
         string[] subDirs;
         try {
@@ -582,11 +594,15 @@ internal sealed class AssetBrowserPanel {
     }
 
     void MoveAssets(List<Guid> guids, string targetFolder) {
+        if (IsProtected(targetFolder)) {
+            Debugging.LogWarning("The Default folder is read-only; assets can't be moved into it.");
+            return;
+        }
         var targetAbsolute = AssetDatabase.Project.ResolveAbsolute(targetFolder);
         var moved = 0;
         foreach (Guid guid in guids) {
             var assetPath = AssetDatabase.GuidToAssetPath(guid);
-            if (assetPath is null)
+            if (assetPath is null || IsProtected(assetPath))   // can't move a read-only Default asset
                 continue;
 
             var sourceAbsolute = AssetDatabase.Project.ResolveAbsolute(assetPath);
@@ -884,6 +900,10 @@ internal sealed class AssetBrowserPanel {
     }
 
     void BeginRename(string path) {
+        if (IsProtected(path)) {
+            Debugging.LogWarning("The Default folder is read-only and can't be renamed.");
+            return;
+        }
         renamingPath = path;
         renameBuffer = Path.GetFileName(path);
         renameFocusPending = true;
@@ -1304,13 +1324,19 @@ internal sealed class AssetBrowserPanel {
 
     void ClipboardCopy(bool cut) {
         clipboardPaths.Clear();
-        foreach (var (p, _) in state.SelectedAssets)
+        foreach (var (p, _) in state.SelectedAssets) {
+            if (cut && IsProtected(p)) continue;   // a read-only Default asset can't be cut (moved away)
             clipboardPaths.Add(p);
+        }
         clipboardCut = cut;
     }
 
     void ClipboardPaste() {
         if (clipboardPaths.Count == 0) return;
+        if (IsProtected(CurrentFolder)) {
+            Debugging.LogWarning("The Default folder is read-only; can't paste into it.");
+            return;
+        }
         string destDir = AssetDatabase.Project.ResolveAbsolute(CurrentFolder);
         var pasted = false;
         foreach (string srcRel in clipboardPaths.ToArray()) {
@@ -1408,6 +1434,7 @@ internal sealed class AssetBrowserPanel {
         ".fbx" or ".obj" or ".gltf" or ".glb" => ("MESH", new SysVec4(0.20f, 0.30f, 0.42f, 1f)),
         ".png" or ".jpg" or ".jpeg" or ".tga" or ".bmp" => ("TEX", new SysVec4(0.18f, 0.34f, 0.25f, 1f)),
         ".hdr" or ".exr" => ("HDR", new SysVec4(0.36f, 0.31f, 0.16f, 1f)),
+        ".wav" or ".wave" or ".ogg" => ("AUDIO", new SysVec4(0.36f, 0.18f, 0.28f, 1f)),
         ".mat" => ("MAT", new SysVec4(0.33f, 0.21f, 0.36f, 1f)),
         ".volume" => ("VOL", new SysVec4(0.36f, 0.22f, 0.32f, 1f)),
         ".scene" => ("SCENE", new SysVec4(0.38f, 0.25f, 0.15f, 1f)),
