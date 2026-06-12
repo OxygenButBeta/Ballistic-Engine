@@ -398,6 +398,9 @@ internal sealed class InspectorPanel {
             if (behaviour is Spawner spawner)
                 DrawSpawnerSection(spawner);
 
+            if (behaviour is Health health)
+                DrawHealthSection(health);
+
             if (behaviour is ParticleSystem particles)
                 DrawParticleSystemSection(particles);
 
@@ -772,6 +775,41 @@ internal sealed class InspectorPanel {
 
         if (SceneManager.IsPlaying && spawner.AliveCount > 0)
             state.MarkViewportDirty(); // keep repainting while instances live/expire
+    }
+
+    // Health: a current/max bar (green->red by fraction) + Damage/Heal/Kill/Revive test buttons so you
+    // can exercise the events without play-mode scripting. The OnDamaged/OnHealed/OnDied BEvents render
+    // their own listener editors automatically via the reflection DrawMember.
+    void DrawHealthSection(Health health) {
+        ImGui.Spacing();
+        ImGui.SeparatorText("Health");
+
+        float frac = health.HealthFraction;
+        // Manual bar (green->red by remaining fraction), so it works without ProgressBar styling.
+        var draw = ImGui.GetWindowDrawList();
+        SysVec2 p = ImGui.GetCursorScreenPos();
+        float w = MathF.Max(ImGui.GetContentRegionAvail().X, 60f);
+        const float h = 18f;
+        draw.AddRectFilled(p, p + new SysVec2(w, h), 0xFF202428, 3f);
+        var barCol = ImGui.GetColorU32(new SysVec4(1f - frac, frac, 0.12f, 1f));
+        if (frac > 0f)
+            draw.AddRectFilled(p, p + new SysVec2(w * frac, h), barCol, 3f);
+        draw.AddRect(p, p + new SysVec2(w, h), 0xFF000000, 3f);
+        string label = health.IsDead ? "DEAD" : $"{health.CurrentHealth:0} / {health.MaxHealth:0}";
+        SysVec2 ts = ImGui.CalcTextSize(label);
+        draw.AddText(p + new SysVec2((w - ts.X) * 0.5f, (h - ts.Y) * 0.5f), 0xFFFFFFFF, label);
+        ImGui.Dummy(new SysVec2(w, h));
+
+        if (ImGui.Button("Damage 10", new SysVec2(90, 0))) { health.TakeDamage(10f); state.MarkViewportDirty(); }
+        ImGui.SameLine();
+        if (ImGui.Button("Heal 10", new SysVec2(90, 0))) { health.Heal(10f); state.MarkViewportDirty(); }
+        ImGui.SameLine();
+        if (ImGui.Button("Kill", new SysVec2(70, 0))) { health.Kill(); state.MarkViewportDirty(); }
+        ImGui.SameLine();
+        if (ImGui.Button("Revive", new SysVec2(70, 0))) { health.Revive(); state.MarkViewportDirty(); }
+
+        if (!SceneManager.IsPlaying)
+            ImGui.TextDisabled("Edit-mode tests don't fire DestroyOnDeath (play only).");
     }
 
     // ParticleSystem preview: it already animates live in the editor (AdvanceAll runs every editor
