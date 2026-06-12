@@ -957,6 +957,27 @@ internal sealed class EditorApplication {
         if (id == "scene") {
             EditorPrefs prefs = EditorPrefs.Current;
 
+            // Shading-mode dropdown: Shaded / Wireframe / Normals / Depth (renderer debug views,
+            // Scene view only). Applies to the editor camera so you can inspect geometry/normals/
+            // depth without lighting. Sets Renderer.DebugViewMode and forces a repaint.
+            var modeNames = new[] { "Shaded", "Wireframe", "Normals", "Depth" };
+            var curMode = (int)Renderer.DebugViewMode;
+            var modeLabel = $"{modeNames[curMode]} {EditorIcons.ChevronDown}";
+            RightAlign(ImGui.CalcTextSize(modeLabel).X + pad2);
+            if (EditorIcons.GhostButton("shadingmode", modeLabel, "Shading / debug view mode"))
+                ImGui.OpenPopup("##shadingmode");
+            if (ImGui.BeginPopup("##shadingmode")) {
+                ImGui.TextDisabled("Shading Mode");
+                ImGui.Separator();
+                for (var i = 0; i < modeNames.Length; i++) {
+                    if (ImGui.MenuItem(modeNames[i], (string)null, curMode == i)) {
+                        Renderer.DebugViewMode = (HDRenderer.DebugView)i;
+                        editorState.MarkViewportDirty();
+                    }
+                }
+                ImGui.EndPopup();
+            }
+
             // Snap indicator chip.
             var snapOn = ImGui.GetIO().KeyCtrl;
             RightAlign(ImGui.CalcTextSize("Snap").X);

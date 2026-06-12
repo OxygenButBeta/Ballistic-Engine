@@ -33,6 +33,7 @@ public class GLHDRenderer : HDRenderer {
     GLShadowMap shadowMap;
     GLShadowMap punctualShadows;
     GLCompositePass composite;
+    StandardShader debugViewShader;   // Normals/Depth debug visualisation (editor shading dropdown)
     GLUIPass uiPass;   // screen-space game UI overlay, drawn after composite (UIDocument.Active)
     GLBloomPass bloom;
     GLSSAOPass ssao;
@@ -136,6 +137,8 @@ public class GLHDRenderer : HDRenderer {
         punctualShadows = new GLShadowMap(PunctualShadowSize, PunctualShadowSize,
             MaxShadowedSpots + MaxShadowedPoints * 6);
         composite = new GLCompositePass();
+        debugViewShader = GraphicAPI.CreateStandardShader(
+            EmbeddedShaderSource.Read("FSQ_Vert.glsl"), EmbeddedShaderSource.Read("DebugView_Frag.glsl"));
         uiPass = new GLUIPass();
         bloom = new GLBloomPass();
         ssao = new GLSSAOPass();
@@ -575,9 +578,19 @@ void main() {
             GL.Viewport(0, 0, target.LenX, target.LenY);
         }
 
+        // Wireframe debug view: draw the opaque geometry as lines. Restored to fill immediately
+        // after so post/sky/UI are unaffected. Applies to the editor's SCENE view (where the
+        // dropdown lives) or the player/headless screen — never the editor's Game view (that mirrors
+        // the shipping player image). Reachable headlessly via BALLISTIC_DEBUGVIEW.
+        bool debugEligible = ActiveTarget == RenderTarget.Scene || PresentToScreen;
+        bool wireframe = debugEligible && DebugViewMode == DebugView.Wireframe;
+        if (wireframe)
+            GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Line);
         using (timers.Time("Opaque"))
             RenderMeshes(visibleOpaque, transparentPass: false, ref view, ref renderProjection, cameraPos,
                 prepassDepth: true);
+        if (wireframe)
+            GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Fill);
 
         DebugCheck();
         if (skyboxRenderer.cubemapTexture is not null) {
@@ -695,8 +708,16 @@ void main() {
 
         // AO was applied during shading (the prepass feeds it into the ambient terms), so the
         // composite never multiplies it in.
+        // Normals/Depth debug views replace the composite with a G-buffer visualisation. Wireframe
+        // and Shaded go through the normal composite (wireframe already drew its lines above).
+        bool gbufferDebug = (ActiveTarget == RenderTarget.Scene || PresentToScreen) &&
+            (DebugViewMode == DebugView.Normals || DebugViewMode == DebugView.Depth) &&
+            target.NormalTextureId != -1;
+
         using (timers.Time("Composite")) {
-            if (PresentToScreen)
+            if (gbufferDebug)
+                RenderDebugView(target, ref renderProjection);
+            else if (PresentToScreen)
                 composite.Render(litColor, null, target.LenX, target.LenY, PostFX, bloomTexture, 0);
             else
                 composite.Render(litColor, CurrentDisplay, CurrentDisplay.LenX, CurrentDisplay.LenY, PostFX,
@@ -749,6 +770,14 @@ void main() {
     static readonly float? EnvDofFocus = EnvFloat("BALLISTIC_FX_DOF_FOCUS");
     static readonly bool? EnvContactShadows = EnvToggle("BALLISTIC_FX_CONTACTSHADOWS");
     static readonly float? EnvNormalStrength = EnvFloat("BALLISTIC_FX_NORMAL");
+    // Debug shading mode for headless screenshot verification: BALLISTIC_DEBUGVIEW=wireframe|normals|depth.
+    static readonly DebugView? EnvDebugView = Environment.GetEnvironmentVariable("BALLISTIC_DEBUGVIEW")?.ToLowerInvariant() switch {
+        "wireframe" => DebugView.Wireframe,
+        "normals" => DebugView.Normals,
+        "depth" => DebugView.Depth,
+        "shaded" => DebugView.Shaded,
+        _ => null,
+    };
 
     static bool? EnvToggle(string name) => Environment.GetEnvironmentVariable(name) switch {
         "0" => false,
@@ -760,7 +789,45 @@ void main() {
         float.TryParse(Environment.GetEnvironmentVariable(name),
             System.Globalization.CultureInfo.InvariantCulture, out float v) ? v : null;
 
+    // Renders the Normals or Depth debug view into the editor display target (replaces the composite).
+    // Reuses the target's existing G-buffer attachments — no extra geometry pass.
+    void RenderDebugView(GLFrameBuffer target, ref Matrix4 renderProjection) {
+        GL.Disable(EnableCap.CullFace);
+        GL.Disable(EnableCap.DepthTest);
+        GL.Disable(EnableCap.Blend);
+
+        // Present to the screen (player / headless) or the editor's offscreen display target.
+        int destW, destH;
+        if (PresentToScreen) {
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+            destW = target.LenX; destH = target.LenY;
+        }
+        else {
+            CurrentDisplay.Activate();
+            destW = CurrentDisplay.LenX; destH = CurrentDisplay.LenY;
+        }
+        GL.Viewport(0, 0, destW, destH);
+
+        debugViewShader.Activate();
+        GL.ActiveTexture(TextureUnit.Texture0);
+        GL.BindTexture(TextureTarget.Texture2D, target.NormalTextureId);
+        debugViewShader.SetInt("normalTexture", 0);
+        GL.ActiveTexture(TextureUnit.Texture1);
+        GL.BindTexture(TextureTarget.Texture2D, target.DepthTextureId);
+        debugViewShader.SetInt("depthTexture", 1);
+
+        Matrix4 invProjection = Matrix4.Invert(renderProjection);
+        debugViewShader.SetMatrix4("InvProjection", ref invProjection);
+        debugViewShader.SetInt("Mode", DebugViewMode == DebugView.Normals ? 1 : 2);
+        debugViewShader.SetFloat("DepthScale", 0.01f); // ~100m to full black; tweakable later
+        GLBufferUtilities.DrawFullscreenQuad();
+
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+    }
+
     void ApplyEnvOverrides() {
+        if (EnvDebugView is { } dv)
+            DebugViewMode = dv;
         if (EnvSsgi is { } ssgiOn)
             PostFX.SsgiEnabled = ssgiOn;
         if (EnvSsr is { } ssrOn)
