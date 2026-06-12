@@ -882,6 +882,9 @@ void main() {
         visibleOpaque.Clear();
         visibleTransparent.Clear();
         ExtractFrustumPlanes(ref viewProjection, cullPlanes);
+        // Same planes, kept in a dedicated buffer for the per-submesh test (ExtractFrustumPlanes is
+        // reused for shadow frustums elsewhere, which would otherwise clobber cullPlanes).
+        ExtractFrustumPlanes(ref viewProjection, submeshCullPlanes);
         var geo = new HashCode();
 
         foreach (IStaticMeshRenderer target in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
@@ -925,8 +928,13 @@ void main() {
                     for (var b = 0; b < sm.Length; b += step)
                         geo.Add(sm[b].Row3); // translation row — the bulk of per-frame motion
                 }
-                if (inView)
+                if (inView) {
                     visibleOpaque.Add(target);
+                    // For a whole-mesh renderer, refine to per-submesh visibility so off-screen parts
+                    // of one big scene mesh stop drawing. Per-submesh renderers are already whole-culled.
+                    if (target.SubMeshIndex < 0)
+                        ComputeSubmeshVisibility(target);
+                }
             }
 
             if (hasTransparent) {
@@ -994,6 +1002,54 @@ void main() {
             max = Vector3.ComponentMax(max, w);
         }
     }
+
+    // Per-submesh visibility for WHOLE-MESH renderers (SubMeshIndex -1), computed once per frame in
+    // SplitRenderables and consulted by the prepass + opaque loops so an off-screen part of a single
+    // big scene mesh (Bistro is ONE renderer with ~1600 submeshes) stops issuing draws. Keyed by the
+    // renderer; the bool[] is indexed by submesh. Whole-mesh renderers cull as one AABB otherwise, so
+    // without this the entire scene draws every frame regardless of camera direction. Per-SUBMESH
+    // renderers (SubMeshIndex >= 0) are already culled whole and never enter this map.
+    readonly Dictionary<IStaticMeshRenderer, bool[]> wholeMeshSubmeshVisible = new();
+    readonly Vector4[] submeshCullPlanes = new Vector4[6];
+
+    // Computes the per-submesh visibility mask for a whole-mesh renderer against the main view frustum.
+    void ComputeSubmeshVisibility(IStaticMeshRenderer target) {
+        Mesh mesh = target.SharedMesh;
+        SubMeshData[] subs = mesh.SubMeshes;
+        if (!wholeMeshSubmeshVisible.TryGetValue(target, out bool[] mask) || mask.Length != subs.Length) {
+            mask = new bool[subs.Length];
+            wholeMeshSubmeshVisible[target] = mask;
+        }
+
+        Matrix4 model = ModelMatrix(target, mesh);
+        for (var i = 0; i < subs.Length; i++) {
+            mesh.GetSubMeshBounds(i, out Vector3 lMin, out Vector3 lMax);
+            // World AABB of this submesh (8 corners through the model matrix).
+            var wMin = new Vector3(float.MaxValue);
+            var wMax = new Vector3(float.MinValue);
+            for (var c = 0; c < 8; c++) {
+                var corner = new Vector3(
+                    (c & 1) == 0 ? lMin.X : lMax.X,
+                    (c & 2) == 0 ? lMin.Y : lMax.Y,
+                    (c & 4) == 0 ? lMin.Z : lMax.Z);
+                Vector3 w = (new Vector4(corner, 1f) * model).Xyz;
+                wMin = Vector3.ComponentMin(wMin, w);
+                wMax = Vector3.ComponentMax(wMax, w);
+            }
+            mask[i] = AabbInFrustum(submeshCullPlanes, wMin, wMax);
+            if (!mask[i])
+                stats.SubMeshesCulled++;
+        }
+    }
+
+    // True if submesh `i` of `target` should be drawn this frame. Whole-mesh renderers consult the
+    // precomputed per-submesh mask; everything else (per-submesh renderers, or a renderer with no mask
+    // yet) draws — the caller already frustum-culled it as a whole.
+    bool SubMeshVisibleThisView(IStaticMeshRenderer target, int i) =>
+        target.SubMeshIndex >= 0 ||
+        !wholeMeshSubmeshVisible.TryGetValue(target, out bool[] mask) ||
+        (uint)i >= (uint)mask.Length ||
+        mask[i];
 
     // Fills `result` with the items whose AABB intersects the frustum of `viewProjection`.
     static void CullInto(ref Matrix4 viewProjection, List<DrawItem> items,
@@ -1324,6 +1380,10 @@ void main() {
             (int first, int end) = SubMeshRange(target, subMeshes.Length);
             for (var i = first; i < end; i++) {
                 if (target.MaterialFor(i) is not { Transparent: false } material)
+                    continue;
+                // Per-submesh frustum cull (whole-mesh renderers only) — MUST match the main opaque
+                // pass exactly so prepass depth stays bit-identical (z-prepass invariance).
+                if (!SubMeshVisibleThisView(target, i))
                     continue;
 
                 Shader prepass = PrepassShaderFor(material.Shader);
@@ -2395,6 +2455,10 @@ void main() {
             for (var i = first; i < end; i++) {
                 Material material = target.MaterialFor(i);
                 if (material is null || material.Transparent != transparentPass)
+                    continue;
+                // Per-submesh frustum cull (whole-mesh renderers only) — IDENTICAL test to the prepass
+                // so the LEqual main pass never references a submesh the prepass skipped.
+                if (!transparentPass && !SubMeshVisibleThisView(target, i))
                     continue;
 
                 material.Activate();

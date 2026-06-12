@@ -61,6 +61,8 @@ internal sealed class StatsPanel {
             Line("Instanced away", rs.DrawsSavedByInstancing.ToString(), scale);
         Line("Triangles", rs.Triangles.ToString("N0"), scale);
         Line("Renderers", $"{rs.RenderersVisible} drawn / {rs.RenderersCulled} culled / {totalRenderers}", scale);
+        if (rs.SubMeshesCulled > 0)
+            Line("Submeshes culled", rs.SubMeshesCulled.ToString(), scale);
         Line("View", $"{(int)viewSize.X} x {(int)viewSize.Y}", scale);
         if (rs.GpuPasses.Count > 0) {
             ImGui.SeparatorText("GPU");

@@ -19,6 +19,9 @@ public sealed class RenderStats {
     public long Triangles;
     public int RenderersVisible;
     public int RenderersCulled;
+    // Submeshes of whole-mesh renderers skipped by per-submesh frustum culling this frame (the big
+    // single-mesh scene win — off-screen parts of one renderer no longer issue draws).
+    public int SubMeshesCulled;
 
     // GPU time per pass for the last completed frame (milliseconds). Replaced wholesale when
     // a frame's queries drain; GpuFrameMs spans first-to-last pass including gaps between them.
@@ -33,5 +36,6 @@ public sealed class RenderStats {
         Triangles = 0;
         RenderersVisible = 0;
         RenderersCulled = 0;
+        SubMeshesCulled = 0;
     }
 }

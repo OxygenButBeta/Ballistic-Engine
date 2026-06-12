@@ -130,7 +130,7 @@ public class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWin
         Console.WriteLine($"[PerfStats] draws={rs.DrawCalls} depthDraws={rs.DepthOnlyDrawCalls} " +
             $"instanced={rs.InstancedDrawCalls} savedByInstancing={rs.DrawsSavedByInstancing} " +
             $"tris={rs.Triangles} visible={rs.RenderersVisible} culled={rs.RenderersCulled} " +
-            $"gpuFrameMs={rs.GpuFrameMs:0.000}");
+            $"submeshesCulled={rs.SubMeshesCulled} gpuFrameMs={rs.GpuFrameMs:0.000}");
         foreach ((string name, double ms) in rs.GpuPasses)
             Console.WriteLine($"[PerfStats] pass {name} = {ms:0.000} ms");
 
