@@ -439,7 +439,60 @@ internal sealed class AssetBrowserPanel {
                     guids.Add(guid);
             MoveAssets(guids, targetFolder);
         }
+
+        // Dropping a HIERARCHY entity onto a folder turns it into a .prefab there (Unity's drag-to-create-
+        // prefab). The hierarchy ships the entity's instance-id hash as the payload; resolve it back.
+        ImGuiPayloadPtr entityPayload = ImGui.AcceptDragDropPayload("BALLISTIC_ENTITY");
+        if (!entityPayload.IsNull && entityPayload.Data != null) {
+            int hash = *(int*)entityPayload.Data;
+            Entity entity = FindEntityByHash(hash);
+            if (entity is not null)
+                CreatePrefabFromEntity(entity, targetFolder);
+        }
         ImGui.EndDragDropTarget();
+    }
+
+    static Entity FindEntityByHash(int hash) {
+        Scene scene = SceneManager.GetCurrentScene();
+        if (scene is null) return null;
+        foreach (Entity e in scene.Entities)
+            if (e.InstanceId.GetHashCode() == hash) return e;
+        return null;
+    }
+
+    // Captures the entity subtree to a uniquely-named .prefab in `targetFolder` and links the LIVE scene
+    // entity to it (Entity.PrefabSource), so the hierarchy renders it as a prefab instance — then
+    // refreshes the browser so the new asset appears. Mirrors HierarchyPanel.CreatePrefab but binds the
+    // link: the import assigns the GUID, so we bind it in the post-refresh callback (runs on the main
+    // thread) once TryGetGuid resolves the freshly-imported path.
+    void CreatePrefabFromEntity(Entity entity, string targetFolder) {
+        if (AssetDatabase.Project is null) return;
+        string baseName = string.IsNullOrEmpty(entity.Name) ? "Prefab" : entity.Name;
+        string dir = AssetDatabase.Project.ResolveAbsolute(targetFolder);
+        Directory.CreateDirectory(dir);
+
+        // Unique relative path (Name, Name 1, ...): targetFolder is already project-relative.
+        string relPath = $"{targetFolder}/{baseName}.prefab";
+        string abs = Path.Combine(dir, baseName + ".prefab");
+        for (int i = 1; File.Exists(abs); i++) {
+            relPath = $"{targetFolder}/{baseName} {i}.prefab";
+            abs = Path.Combine(dir, $"{baseName} {i}.prefab");
+        }
+
+        try {
+            File.WriteAllText(abs, PrefabAsset.FromEntity(entity).ToYaml());
+            EditorUndo.Push("Create Prefab");
+            AsyncAssetImport.Request("Creating prefab...", onFinished: () => {
+                // The import stamped a .meta GUID; link the live entity so it becomes a prefab instance.
+                if (AssetDatabase.TryGetGuid(relPath, out Guid guid)) {
+                    entity.PrefabSource = guid;
+                    state.MarkViewportDirty();
+                }
+            });
+        }
+        catch (Exception e) {
+            Debugging.LogError($"Could not create prefab: {e.Message}");
+        }
     }
 
     void MoveAssets(List<Guid> guids, string targetFolder) {

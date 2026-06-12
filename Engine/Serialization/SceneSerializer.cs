@@ -55,6 +55,9 @@ public static class SceneSerializer {
             // Root: drop the external parent so the prefab plants at the world origin on instantiate.
             if (ReferenceEquals(e, root))
                 doc.Transform.Parent = null;
+            // A prefab DEFINITION never stores a prefab link (that would self-reference / nest links).
+            // The instance's link is assigned by PrefabAsset.Instantiate, not baked into the .prefab.
+            doc.PrefabSource = null;
             docs.Add(doc);
         }
         return docs;
@@ -74,6 +77,7 @@ public static class SceneSerializer {
             Entity entity = Entity.Instantiate(entityDoc.Name ?? "Entity", entityDoc.IsActive);
             entity.Tag = string.IsNullOrEmpty(entityDoc.Tag) ? TagManager.Untagged : entityDoc.Tag;
             entity.Layer = entityDoc.Layer;
+            entity.PrefabSource = Guid.TryParseExact(entityDoc.PrefabSource, "N", out Guid pfg) ? pfg : Guid.Empty;
             entity.transform.Position = entityDoc.Transform.Position;
             entity.transform.Rotation = entityDoc.Transform.Rotation;
             entity.transform.Scale = entityDoc.Transform.Scale;
@@ -106,6 +110,7 @@ public static class SceneSerializer {
             // Omit defaults so unauthored entities don't churn the YAML.
             Tag = entity.Tag == TagManager.Untagged ? null : entity.Tag,
             Layer = entity.Layer,
+            PrefabSource = entity.PrefabSource == Guid.Empty ? null : entity.PrefabSource.ToString("N"),
             Transform = new TransformDocument {
                 Position = entity.transform.Position,
                 Rotation = entity.transform.Rotation,
@@ -216,6 +221,7 @@ public static class SceneSerializer {
             Entity entity = Entity.Instantiate(entityDoc.Name ?? "Entity", entityDoc.IsActive);
             entity.Tag = string.IsNullOrEmpty(entityDoc.Tag) ? TagManager.Untagged : entityDoc.Tag;
             entity.Layer = entityDoc.Layer;
+            entity.PrefabSource = Guid.TryParseExact(entityDoc.PrefabSource, "N", out Guid pfg) ? pfg : Guid.Empty;
             entity.transform.Position = entityDoc.Transform.Position;
             entity.transform.Rotation = entityDoc.Transform.Rotation;
             entity.transform.Scale = entityDoc.Transform.Scale;
@@ -279,6 +285,7 @@ public static class SceneSerializer {
             entity.Name = doc.Name ?? entity.Name;
             entity.Tag = string.IsNullOrEmpty(doc.Tag) ? TagManager.Untagged : doc.Tag;
             entity.Layer = doc.Layer;
+            entity.PrefabSource = Guid.TryParseExact(doc.PrefabSource, "N", out Guid pfg) ? pfg : Guid.Empty;
             entity.transform.Position = doc.Transform.Position;
             entity.transform.Rotation = doc.Transform.Rotation;
             entity.transform.Scale = doc.Transform.Scale;

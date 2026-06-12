@@ -16,6 +16,16 @@ public class Entity : BObject {
     // entity level. A collider/rigidbody reads this when it builds its body.
     public int Layer { get; set; }
 
+    // GUID of the .prefab asset this entity is an INSTANCE of (Unity's prefab link), or Guid.Empty for
+    // a plain scene entity. Set when a prefab is instantiated, or when the editor converts a live entity
+    // into a prefab (drag-to-asset-browser). Serialized at the entity level so the link survives save/
+    // load; the editor uses it to render the instance distinctly and to drive Apply/Revert against the
+    // source asset. The root of an instantiated subtree carries it; descendants do not.
+    public Guid PrefabSource { get; set; } = Guid.Empty;
+
+    // True when this entity is the root of a prefab instance (has a live link to a .prefab asset).
+    public bool IsPrefabInstance => PrefabSource != Guid.Empty;
+
     // Unity's CompareTag — exact string match, null/empty safe.
     public bool CompareTag(string tag) => Tag == tag;
 

@@ -138,8 +138,9 @@ internal sealed class HierarchyPanel {
     }
 
     // Captures the entity subtree as a .prefab asset next to the asset browser's current folder, then
-    // refreshes so it appears in the browser. The live entity is left as-is (Unity creates the asset
-    // without converting the scene object into a prefab instance — v1).
+    // refreshes so it appears in the browser AND links the live entity to it (Entity.PrefabSource), so
+    // the scene object becomes a prefab instance (Unity behaviour). The GUID is assigned by the import,
+    // so the link binds in the post-refresh callback (main thread) once TryGetGuid resolves the path.
     void CreatePrefab(Entity entity) {
         if (AssetDatabase.Project is null)
             return;
@@ -149,14 +150,23 @@ internal sealed class HierarchyPanel {
         string dir = AssetDatabase.Project.ResolveAbsolute(folder);
         Directory.CreateDirectory(dir);
 
-        // Avoid clobbering an existing file: Name, Name 1, Name 2, ...
-        string path = Path.Combine(dir, baseName + ".prefab");
-        for (var i = 1; File.Exists(path); i++)
-            path = Path.Combine(dir, $"{baseName} {i}.prefab");
+        // Avoid clobbering an existing file: Name, Name 1, Name 2, ... (relative path drives the link).
+        string relPath = $"{folder}/{baseName}.prefab";
+        string abs = Path.Combine(dir, baseName + ".prefab");
+        for (var i = 1; File.Exists(abs); i++) {
+            relPath = $"{folder}/{baseName} {i}.prefab";
+            abs = Path.Combine(dir, $"{baseName} {i}.prefab");
+        }
 
         try {
-            File.WriteAllText(path, PrefabAsset.FromEntity(entity).ToYaml());
-            AsyncAssetImport.Request("Creating prefab...");
+            File.WriteAllText(abs, PrefabAsset.FromEntity(entity).ToYaml());
+            EditorUndo.Push("Create Prefab");
+            AsyncAssetImport.Request("Creating prefab...", onFinished: () => {
+                if (AssetDatabase.TryGetGuid(relPath, out Guid guid)) {
+                    entity.PrefabSource = guid;
+                    state.MarkViewportDirty();
+                }
+            });
         }
         catch (Exception e) {
             Debugging.LogError($"Could not create prefab: {e.Message}");
@@ -215,13 +225,18 @@ internal sealed class HierarchyPanel {
         if (selected) flags |= ImGuiTreeNodeFlags.Selected;
         if (children.Count == 0) flags |= ImGuiTreeNodeFlags.Leaf | ImGuiTreeNodeFlags.NoTreePushOnOpen;
 
-        if (!entity.IsActive)
-            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+        // Inactive entities grey out; otherwise a prefab-instance root tints blue (Unity's prefab
+        // colour). Inactive wins so a disabled prefab still reads as disabled.
+        bool tinted = !entity.IsActive || entity.IsPrefabInstance;
+        if (tinted)
+            ImGui.PushStyleColor(ImGuiCol.Text, !entity.IsActive
+                ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
+                : new SysVec4(0.45f, 0.66f, 1f, 1f));
 
         // Leading spaces leave room for the type icon overlaid after the arrow.
         bool open = ImGui.TreeNodeEx($"     {entity.Name}##{id}", flags);
 
-        if (!entity.IsActive)
+        if (tinted)
             ImGui.PopStyleColor();
 
         // Capture the row rect/hover NOW â€” popups and drag-drop below overwrite "last item" data.

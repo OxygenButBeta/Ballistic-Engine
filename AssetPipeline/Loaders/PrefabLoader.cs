@@ -12,7 +12,11 @@ public static class PrefabLoader {
         }
 
         try {
-            return PrefabAsset.FromYaml(yaml);
+            PrefabAsset prefab = PrefabAsset.FromYaml(yaml);
+            // Stamp the asset GUID so instances link back to this .prefab (Entity.PrefabSource).
+            if (AssetDatabase.TryGetGuid(assetPath, out Guid guid))
+                prefab.SourceGuid = guid;
+            return prefab;
         }
         catch (Exception e) {
             Debugging.LogError($"'{assetPath}': failed to parse prefab — {e.Message}");

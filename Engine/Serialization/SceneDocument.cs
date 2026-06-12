@@ -21,6 +21,8 @@ public sealed class EntityDocument {
     public bool IsActive { get; set; } = true;
     public string Tag { get; set; }           // null/"Untagged" omitted for clean diffs
     public int Layer { get; set; }            // 0 ("Default") omitted by the serializer
+    public string PrefabSource { get; set; }  // 32-hex GUID of the source .prefab if this is a prefab
+                                              // instance root; null for plain entities (omitted)
     public TransformDocument Transform { get; set; } = new();
     public List<ComponentDocument> Components { get; set; } = new();
 }

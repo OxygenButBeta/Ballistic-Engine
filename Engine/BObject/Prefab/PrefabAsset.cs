@@ -15,13 +15,24 @@ public sealed class PrefabAsset : BObject {
     // just calls Instantiate.
     public List<EntityDocument> Entities { get; }
 
+    // GUID of the .prefab asset this was loaded from (set by PrefabLoader). Stamped onto every
+    // instance's root as Entity.PrefabSource so the link resolves back to this asset. Guid.Empty for
+    // a prefab built in-memory (FromEntity) that hasn't been imported yet.
+    public Guid SourceGuid { get; set; } = Guid.Empty;
+
     public PrefabAsset(List<EntityDocument> entities) {
         Entities = entities ?? new List<EntityDocument>();
         Name = Entities.Count > 0 ? Entities[0].Name ?? "Prefab" : "Prefab";
     }
 
-    // Clones this prefab into the current scene at its authored transform; returns the root entity.
-    public Entity Instantiate() => SceneSerializer.InstantiateSubtree(Entities);
+    // Clones this prefab into the current scene at its authored transform; returns the root entity and
+    // links it back to this asset (Entity.PrefabSource) so the editor renders it as a prefab instance.
+    public Entity Instantiate() {
+        Entity root = SceneSerializer.InstantiateSubtree(Entities);
+        if (root is not null && SourceGuid != Guid.Empty)
+            root.PrefabSource = SourceGuid;
+        return root;
+    }
 
     // Clones at a specific world position/rotation (the common spawn case).
     public Entity Instantiate(Vector3 position, Quaternion rotation) {
