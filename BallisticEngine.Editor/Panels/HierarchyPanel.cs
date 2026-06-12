@@ -381,7 +381,8 @@ internal sealed class HierarchyPanel {
 
     // Maps a dropped .cs asset to its compiled component by Unity's file-name == class-name rule
     // (the registry only knows Behaviour types, so SceneBehaviours and plain classes resolve null).
-    static Type ScriptComponentType(Guid guid) {
+    // Internal so the Inspector can reuse it for its own script-drop target.
+    internal static Type ScriptComponentType(Guid guid) {
         var path = AssetDatabase.GuidToAssetPath(guid);
         if (path is null || !path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
             return null;

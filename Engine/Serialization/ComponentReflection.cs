@@ -24,9 +24,16 @@ public static class ComponentReflection {
                 yield return prop;
         }
         foreach (FieldInfo field in type.GetFields(Flags)) {
-            if (!field.IsInitOnly && !field.IsLiteral && !IsFrameworkType(field.DeclaringType) &&
-                field.GetCustomAttribute<NotSerializedAttribute>() is null)
-                yield return field;
+            if (field.IsLiteral || IsFrameworkType(field.DeclaringType) ||
+                field.GetCustomAttribute<NotSerializedAttribute>() is not null)
+                continue;
+            // `readonly` fields are normally skipped (their value can't change), EXCEPT BEvents: they're
+            // declared `public readonly BEvent OnX = new();` and populated IN PLACE (listeners added to
+            // the existing instance, never reassigned), so they must still serialize + show in the
+            // inspector. Without this carve-out a readonly BEvent field is invisible.
+            if (field.IsInitOnly && !typeof(BEvent).IsAssignableFrom(field.FieldType))
+                continue;
+            yield return field;
         }
     }
 

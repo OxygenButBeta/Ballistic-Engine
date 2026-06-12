@@ -57,23 +57,54 @@ internal static class VolumeProfileEditor {
         }
 
         ImGui.Spacing();
-        if (ImGui.Button($"{EditorIcons.Add}  Add Override", new SysVec2(-1, 0)))
+        if (ImGui.Button($"{EditorIcons.Add}  Add Override", new SysVec2(-1, 0))) {
+            addOverrideSearch = "";
             ImGui.OpenPopup("##addoverride");
+        }
 
         if (ImGui.BeginPopup("##addoverride")) {
+            // Search field (Unity's Add Override is searchable). Auto-focus on open; Enter adds the
+            // first match.
+            if (ImGui.IsWindowAppearing())
+                ImGui.SetKeyboardFocusHere();
+            ImGui.SetNextItemWidth(220);
+            ImGui.InputTextWithHint("##search", "Search...", ref addOverrideSearch, 64);
+            bool enter = ImGui.IsItemFocused() && ImGui.IsKeyPressed(ImGuiKey.Enter);
+            ImGui.Separator();
+
+            bool searching = addOverrideSearch.Length > 0;
+            bool any = false;
+            ComponentEntry? firstMatch = null;
+            ImGui.BeginChild("##addlist", new SysVec2(220, 240));
             foreach (ComponentEntry entry in ComponentRegistry.VolumeMenu) {
                 if (profile.Has(entry.Type))
                     continue;
+                if (searching && !entry.DisplayName.Contains(addOverrideSearch, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                any = true;
+                firstMatch ??= entry;
                 if (ImGui.MenuItem(entry.DisplayName)) {
                     profile.Add(entry.Type);
                     changed = true;
+                    ImGui.CloseCurrentPopup();
                 }
+            }
+            if (!any)
+                ImGui.TextDisabled(searching ? "No match." : "All overrides added.");
+            ImGui.EndChild();
+
+            if (enter && firstMatch is { } hit) {
+                profile.Add(hit.Type);
+                changed = true;
+                ImGui.CloseCurrentPopup();
             }
             ImGui.EndPopup();
         }
 
         return changed;
     }
+
+    static string addOverrideSearch = "";
 
     // Writes the profile back to its .volume source. Profile edits are asset edits (like the
     // material editor), so they save immediately and sit outside the scene-snapshot undo.

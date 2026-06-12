@@ -235,9 +235,33 @@ internal sealed class InspectorPanel {
         ImGui.SetCursorScreenPos(new SysVec2(contentX, cardMin.Y + pad + frameH + 4));
         ImGui.TextDisabled(componentCount == 1 ? "1 component" : $"{componentCount} components");
 
-        // Reserve the card's space in the layout.
+        // Reserve the card's space in the layout — and make it a SCRIPT DROP TARGET: dragging a .cs
+        // tile from the asset browser onto the header adds that component to the entity (Unity parity;
+        // the hierarchy already accepts this, the inspector didn't).
         ImGui.SetCursorScreenPos(cardMin);
         ImGui.Dummy(new SysVec2(avail.X, cardH));
+        AcceptScriptDrop(entity);
+    }
+
+    // Drop target for .cs script tiles (asset-browser drag payload = ';'-separated GUIDs). Each that
+    // resolves to a compiled Behaviour type is added as a component (skipping dupes), one undo step.
+    unsafe void AcceptScriptDrop(Entity entity) {
+        if (!ImGui.BeginDragDropTarget())
+            return;
+        ImGuiPayloadPtr payload = ImGui.AcceptDragDropPayload(AssetBrowserPanel.DragType);
+        if (!payload.IsNull && payload.Data != null) {
+            string text = System.Runtime.InteropServices.Marshal.PtrToStringAnsi((IntPtr)payload.Data, payload.DataSize);
+            bool pushed = false;
+            foreach (string part in text?.Split(';', StringSplitOptions.RemoveEmptyEntries) ?? []) {
+                if (!Guid.TryParse(part, out Guid guid)) continue;
+                Type type = HierarchyPanel.ScriptComponentType(guid);
+                if (type is null || HasComponentOfType(entity, type)) continue;
+                if (!pushed) { EditorUndo.Push("Add Script Component"); pushed = true; }
+                entity.AddComponent(type);
+            }
+            if (pushed) state.MarkViewportDirty();
+        }
+        ImGui.EndDragDropTarget();
     }
 
     // Unity-style Tag + Layer row under the entity header. Both are entity state serialized in the
@@ -2337,7 +2361,11 @@ internal sealed class InspectorPanel {
         ImGui.TableSetColumnIndex(0);
         ImGui.AlignTextToFramePadding();
         ImGui.TextDisabled(label);
+        // Tooltip on the LABEL itself (Unity-style: hover the field name), not just the "(?)" badge —
+        // this is what made [Tooltip] feel "broken" (you had to find the tiny marker).
         if (tooltip is not null) {
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(tooltip);
             ImGui.SameLine(0, 4);
             ImGui.TextDisabled("(?)");
             if (ImGui.IsItemHovered())
