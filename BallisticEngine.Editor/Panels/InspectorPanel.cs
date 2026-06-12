@@ -1056,11 +1056,42 @@ internal sealed class InspectorPanel {
         }
     }
 
+    // Draws a small amber "—" after the field label when the selected entities DISAGREE on this
+    // member's value (Unity's mixed-value dash). No-op for single selection or when all agree.
+    void DrawMixedMarker(MemberInfo member, object target, object activeValue) {
+        if (state.SelectedEntities.Count <= 1 || target is not Behaviour activeBehaviour)
+            return;
+        Type compType = activeBehaviour.GetType();
+        Entity activeEntity = activeBehaviour.Entity;
+        bool differs = false;
+        foreach (Entity e in state.SelectedEntities) {
+            if (e is null || e.IsDestroyed || ReferenceEquals(e, activeEntity))
+                continue;
+            foreach (Behaviour b in e.Behaviours) {
+                if (b.GetType() == compType) {
+                    object v = ComponentReflection.GetValue(member, b);
+                    if (!Equals(v, activeValue)) differs = true;
+                    break;
+                }
+            }
+            if (differs) break;
+        }
+        if (differs) {
+            ImGui.SameLine(0, 4);
+            ImGui.TextColored(new SysVec4(1f, 0.72f, 0.25f, 1f), "—");
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Values differ across the selection. Editing sets them all to this value.");
+        }
+    }
+
     void DrawMember(MemberInfo member, object target, MemberAttributes attrs) {
         Type memberType = ComponentReflection.MemberType(member);
         object value = ComponentReflection.GetValue(member, target);
 
         RowWithTooltip(Prettify(member.Name), attrs.Tooltip?.Text);
+        // Mixed-value marker: in a multi-selection, an amber dash when the selected entities DISAGREE
+        // on this member (the field shows the active entity's value; editing it sets them all alike).
+        DrawMixedMarker(member, target, value);
         ImGui.PushID(member.Name);
         ImGui.SetNextItemWidth(-1);
         if (attrs.ReadOnly) ImGui.BeginDisabled();
