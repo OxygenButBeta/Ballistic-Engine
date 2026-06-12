@@ -33,6 +33,8 @@ public static class DataAssetSerializer {
     static object SerializeValue(object value) {
         if (value is null)
             return null;
+        if (value is AnimationCurve curve)
+            return curve.ToCompactString();
         if (value is BObject asset)
             return AssetDatabase.TryGetAssetGuid(asset, out Guid guid) ? AssetRef.FromGuid(guid) : null;
         return value;
@@ -85,6 +87,9 @@ public static class DataAssetSerializer {
 
         if (typeof(BObject).IsAssignableFrom(targetType))
             return raw is string reference ? LoadAsset(reference, targetType) : null;
+
+        if (targetType == typeof(AnimationCurve))
+            return raw is string curveStr ? AnimationCurve.Parse(curveStr) : null;
 
         if (targetType.IsInstanceOfType(raw))
             return raw;

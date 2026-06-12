@@ -968,6 +968,14 @@ internal sealed class InspectorPanel {
                     if (changed) { ComponentReflection.SetValue(member, target, Enum.Parse(memberType, names[current])); state.MarkViewportDirty(); }
                     break;
                 }
+                case AnimationCurve curve: {
+                    // Interactive curve widget — applies to ANY AnimationCurve member with no per-
+                    // component wiring. Mutated in place (reference type), so no SetValue needed; an
+                    // undo snapshot is pushed when an edit begins.
+                    if (DrawCurveEditor(member.Name, curve))
+                        state.MarkViewportDirty();
+                    break;
+                }
                 default:
                     ImGui.TextDisabled($"({memberType.Name})");
                     break;
@@ -1014,6 +1022,137 @@ internal sealed class InspectorPanel {
         ImGui.SameLine(0, 0);
         ImGui.SetNextItemWidth(fieldW);
         return InspectorUndo.Track(label, ImGui.DragFloat(id, ref value, speed, 0, 0, "%.2f"));
+    }
+
+    // ---- AnimationCurve editor ---------------------------------------------------
+    // An interactive curve widget: a plot box that samples the curve into a polyline, draggable
+    // keyframe dots (drag to move time+value), double-click empty space to add a key, right-click a
+    // key to remove it, and preset buttons (Linear / Ease / Constant). Reusable for ANY AnimationCurve
+    // member. The curve is mutated in place; returns true when an edit happened (caller marks dirty).
+    // The plot auto-fits its value range to the keys (with a small pad) so any amplitude is visible.
+    static int curveDragKey = -1; // index of the key being dragged (-1 = none); single-widget assumption
+
+    static bool DrawCurveEditor(string id, AnimationCurve curve) {
+        bool edited = false;
+        ImGui.PushID(id);
+
+        float w = ImGui.GetContentRegionAvail().X;
+        const float height = 90f;
+        SysVec2 origin = ImGui.GetCursorScreenPos();
+        var size = new SysVec2(MathF.Max(w, 60f), height);
+        var draw = ImGui.GetWindowDrawList();
+
+        // Background + border.
+        draw.AddRectFilled(origin, origin + size, ImGui.GetColorU32(new SysVec4(0.10f, 0.11f, 0.13f, 1f)), 4f);
+        draw.AddRect(origin, origin + size, ImGui.GetColorU32(new SysVec4(0.30f, 0.32f, 0.36f, 1f)), 4f);
+
+        // Time range = [first key, last key] (default [0,1]); value range auto-fits the keys.
+        float t0 = 0f, t1 = 1f, vMin = 0f, vMax = 1f;
+        if (curve.Count > 0) {
+            t0 = curve.Keys[0].Time;
+            t1 = curve.Keys[curve.Count - 1].Time;
+            vMin = float.MaxValue; vMax = float.MinValue;
+            for (var i = 0; i < curve.Count; i++) {
+                vMin = MathF.Min(vMin, curve.Keys[i].Value);
+                vMax = MathF.Max(vMax, curve.Keys[i].Value);
+            }
+        }
+        if (t1 <= t0) t1 = t0 + 1f;
+        if (vMax <= vMin) { vMin -= 0.5f; vMax += 0.5f; }
+        float vPad = (vMax - vMin) * 0.12f;
+        vMin -= vPad; vMax += vPad;
+
+        SysVec2 ToScreen(float time, float value) {
+            float fx = (time - t0) / (t1 - t0);
+            float fy = (value - vMin) / (vMax - vMin);
+            return new SysVec2(origin.X + fx * size.X, origin.Y + (1f - fy) * size.Y);
+        }
+
+        // Zero line (if 0 is in the value range) for reference.
+        if (vMin < 0f && vMax > 0f) {
+            float zy = origin.Y + (1f - (0f - vMin) / (vMax - vMin)) * size.Y;
+            draw.AddLine(new SysVec2(origin.X, zy), new SysVec2(origin.X + size.X, zy),
+                ImGui.GetColorU32(new SysVec4(0.4f, 0.4f, 0.45f, 0.4f)));
+        }
+
+        // Sample the curve into a polyline across the box width.
+        const int Samples = 64;
+        uint curveColor = ImGui.GetColorU32(new SysVec4(0.45f, 0.85f, 1f, 1f));
+        SysVec2 prev = default;
+        for (var s = 0; s <= Samples; s++) {
+            float time = t0 + (t1 - t0) * s / Samples;
+            SysVec2 p = ToScreen(time, curve.Evaluate(time));
+            if (s > 0) draw.AddLine(prev, p, curveColor, 2f);
+            prev = p;
+        }
+
+        // An invisible button over the box captures interaction (hover/click/drag).
+        ImGui.InvisibleButton("##curvebox", size);
+        bool hovered = ImGui.IsItemHovered();
+        SysVec2 mouse = ImGui.GetMousePos();
+
+        float SnapTimeFromMouse() => t0 + (t1 - t0) * Math.Clamp((mouse.X - origin.X) / size.X, 0f, 1f);
+        float SnapValueFromMouse() => vMax - (vMax - vMin) * Math.Clamp((mouse.Y - origin.Y) / size.Y, 0f, 1f);
+
+        // Draw + hit-test keyframe dots.
+        const float dotR = 5f;
+        int hoverKey = -1;
+        for (var i = 0; i < curve.Count; i++) {
+            SysVec2 sp = ToScreen(curve.Keys[i].Time, curve.Keys[i].Value);
+            bool near = (mouse - sp).LengthSquared() <= (dotR + 3f) * (dotR + 3f);
+            if (near && hovered) hoverKey = i;
+            uint dc = (i == curveDragKey || near)
+                ? ImGui.GetColorU32(new SysVec4(1f, 0.85f, 0.3f, 1f))
+                : ImGui.GetColorU32(new SysVec4(1f, 1f, 1f, 1f));
+            draw.AddCircleFilled(sp, dotR, dc);
+        }
+
+        // Begin a drag on a key (snapshot for undo once).
+        if (hovered && hoverKey >= 0 && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
+            curveDragKey = hoverKey;
+            EditorUndo.Push($"Edit {id}");
+        }
+        // Drag the held key.
+        if (curveDragKey >= 0 && curveDragKey < curve.Count && ImGui.IsMouseDown(ImGuiMouseButton.Left)) {
+            curveDragKey = curve.MoveKey(curveDragKey, SnapTimeFromMouse(), SnapValueFromMouse());
+            edited = true;
+        }
+        if (ImGui.IsMouseReleased(ImGuiMouseButton.Left))
+            curveDragKey = -1;
+
+        // Double-click empty space adds a key on the curve at that time.
+        if (hovered && hoverKey < 0 && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) {
+            EditorUndo.Push($"Add key {id}");
+            curve.AddKey(SnapTimeFromMouse(), SnapValueFromMouse());
+            edited = true;
+        }
+        // Right-click a key removes it (keep at least one).
+        if (hovered && hoverKey >= 0 && curve.Count > 1 && ImGui.IsMouseClicked(ImGuiMouseButton.Right)) {
+            EditorUndo.Push($"Remove key {id}");
+            curve.RemoveKey(hoverKey);
+            edited = true;
+        }
+
+        // Preset buttons + key count.
+        if (ImGui.SmallButton("Linear")) { EditorUndo.Push($"Preset {id}"); Replace(curve, AnimationCurve.Linear()); edited = true; }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Ease")) { EditorUndo.Push($"Preset {id}"); Replace(curve, AnimationCurve.EaseInOut()); edited = true; }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Const")) { EditorUndo.Push($"Preset {id}"); Replace(curve, AnimationCurve.Constant()); edited = true; }
+        ImGui.SameLine();
+        ImGui.TextDisabled($"{curve.Count} keys");
+
+        ImGui.PopID();
+        return edited;
+    }
+
+    // Replaces a curve's keys with another curve's (in place — preserves the member's instance).
+    static void Replace(AnimationCurve target, AnimationCurve source) {
+        target.Clear();
+        for (var i = 0; i < source.Count; i++)
+            target.AddKey(source.Keys[i]);
+        target.PreWrap = source.PreWrap;
+        target.PostWrap = source.PostWrap;
     }
 
     // Multi-material meshes resolve their materials from refs baked into the mesh at import;

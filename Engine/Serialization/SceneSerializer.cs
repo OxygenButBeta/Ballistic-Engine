@@ -154,6 +154,11 @@ public static class SceneSerializer {
         if (value is BEvent evt)
             return BEventYaml.Serialize(evt);
 
+        // AnimationCurve serializes as a single compact string scalar (sidesteps the nested-list
+        // serializer); DeserializeValue parses it back.
+        if (value is AnimationCurve curve)
+            return curve.ToCompactString();
+
         if (value is BObject asset) {
             return AssetDatabase.TryGetAssetGuid(asset, out Guid guid)
                 ? AssetRef.FromGuid(guid)
@@ -291,6 +296,10 @@ public static class SceneSerializer {
 
         if (typeof(BObject).IsAssignableFrom(targetType))
             return raw is string reference ? LoadAsset(reference, targetType) : null;
+
+        // AnimationCurve round-trips through its compact string form.
+        if (targetType == typeof(AnimationCurve))
+            return raw is string curveStr ? AnimationCurve.Parse(curveStr) : null;
 
         // OpenTK types arrive already converted; otherwise coerce the scalar to the member type.
         if (targetType.IsInstanceOfType(raw))

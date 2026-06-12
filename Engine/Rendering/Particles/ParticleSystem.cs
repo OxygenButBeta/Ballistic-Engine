@@ -115,6 +115,11 @@ public class ParticleSystem : Behaviour {
     [Tooltip("Eases the size interpolation over lifetime. EaseOut shrinks gently at the end.")]
     public ParticleEase SizeEase { get; set; } = ParticleEase.Linear;
 
+    [Tooltip("Optional size-over-lifetime curve (X = normalized age 0..1, Y = size MULTIPLIER on " +
+             "StartSize). When it has keys it overrides the Start/EndSize+SizeEase lerp — author a " +
+             "grow-then-shrink puff, a pulse, etc. Empty = use the simple lerp above.")]
+    public AnimationCurve SizeCurve { get; set; } = new();
+
     [Tooltip("Eases the color + alpha interpolation over lifetime. EaseOut fades gently at the end.")]
     public ParticleEase ColorEase { get; set; } = ParticleEase.Linear;
 
@@ -346,7 +351,11 @@ public class ParticleSystem : Behaviour {
             float us = ApplyEase(SizeEase, u);
             Vector3 rgb = Vector3.Lerp(StartColor, EndColor, uc);
             float a = MathHelper.Lerp(StartAlpha, EndAlpha, uc);
-            float size = MathHelper.Lerp(p.StartSize, p.StartSize * SafeRatio(EndSize, StartSize), us);
+            // A curve (when authored) drives size as a MULTIPLIER on the spawn size over the
+            // normalized age; otherwise fall back to the simple Start->End lerp with its ease.
+            float size = SizeCurve is { Count: > 0 }
+                ? p.StartSize * SizeCurve.Evaluate(u)
+                : MathHelper.Lerp(p.StartSize, p.StartSize * SafeRatio(EndSize, StartSize), us);
 
             Vector4 uvRect = new(0f, 0f, 1f, 1f);
             if (animated) {
