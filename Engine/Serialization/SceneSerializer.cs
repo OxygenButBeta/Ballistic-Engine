@@ -250,6 +250,50 @@ public static class SceneSerializer {
         Deserialize(File.ReadAllText(absolutePath));
     }
 
+    // ---- Targeted (single-entity) capture/restore — for the editor's scoped undo ----------------
+    // The editor's undo can snapshot just ONE entity instead of the whole scene, so undoing a value
+    // edit doesn't tear down + rebuild every scene-wide component (which re-fired IrradianceVolume
+    // bakes, OnAttach side effects, and dropped the selection). These keep the SAME entity instance
+    // (its InstanceId and the editor's selection survive) and never touch other entities or scene
+    // components.
+
+    // Captures one entity (its transform + components) to a document, WITHOUT its descendants and
+    // keeping its real parent ref — so RestoreEntityInPlace can put it back exactly.
+    public static EntityDocument CaptureEntity(Entity entity) =>
+        entity is null ? null : BuildEntityDocument(entity);
+
+    // Restores a captured entity IN PLACE: same Entity object (identity + selection preserved), its
+    // components torn down and rebuilt from the document, transform reapplied. Returns false if the
+    // entity no longer exists (caller falls back to a full-scene restore). Parent is NOT re-wired here
+    // (a reparent is a structural change that uses full-scene undo).
+    public static bool RestoreEntityInPlace(Entity entity, EntityDocument doc) {
+        if (entity is null || doc is null || entity.IsDestroyed)
+            return false;
+
+        SceneManager.SuppressPlayLifecycle = true;
+        try {
+            // Tear down current components (OnDetach unregisters renderers/lights/etc.).
+            foreach (Behaviour behaviour in entity.Behaviours.ToArray())
+                entity.RemoveComponent(behaviour);
+
+            entity.Name = doc.Name ?? entity.Name;
+            entity.Tag = string.IsNullOrEmpty(doc.Tag) ? TagManager.Untagged : doc.Tag;
+            entity.Layer = doc.Layer;
+            entity.transform.Position = doc.Transform.Position;
+            entity.transform.Rotation = doc.Transform.Rotation;
+            entity.transform.Scale = doc.Transform.Scale;
+            if (doc.IsActive != entity.IsActive)
+                entity.SetActive(doc.IsActive);
+
+            foreach (ComponentDocument componentDoc in doc.Components)
+                ApplyComponent(entity, componentDoc);
+        }
+        finally {
+            SceneManager.SuppressPlayLifecycle = false;
+        }
+        return true;
+    }
+
     static void ApplyComponent(Entity entity, ComponentDocument doc) {
         Type type = ComponentRegistry.Resolve(doc.Type);
         if (type is null) {

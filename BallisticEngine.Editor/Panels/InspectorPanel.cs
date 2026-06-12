@@ -69,7 +69,11 @@ internal sealed class InspectorPanel {
                 ImGui.Separator();
                 ImGui.Spacing();
             }
+            // Scoped undo: ONLY for a single-entity selection (a multi-selection edit broadcasts to
+            // several entities, so it must take a full-scene snapshot to undo them all together).
+            InspectorUndo.ScopeEntity = state.SelectedEntities.Count == 1 ? state.Selected : null;
             DrawEntityInspector(state.Selected);
+            InspectorUndo.ScopeEntity = null;
         }
         else {
             DrawEmptyState();

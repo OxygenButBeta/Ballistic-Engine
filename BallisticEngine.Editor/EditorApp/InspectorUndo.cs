@@ -20,23 +20,48 @@ namespace BallisticEngine.Editor;
 internal static class InspectorUndo {
     static string pendingYaml;
     static string pendingLabel;
+    static Entity pendingEntity;
+    static bool pendingScoped;
+
+    // The entity currently being drawn in the inspector. Set by InspectorPanel before drawing an
+    // entity's members so a member edit snapshots JUST that entity (scoped undo: undoing a value tweak
+    // doesn't rebuild the whole scene → no IrradianceVolume re-bake, selection survives). Null for
+    // scene-behaviour / asset edits, which fall back to a full-scene snapshot.
+    public static Entity ScopeEntity { get; set; }
 
     // Wrap a widget's `changed` result. Returns it unchanged so call sites read naturally:
     //   bool changed = InspectorUndo.Track("Edit Speed", ImGui.DragFloat("##v", ref f, 0.05f));
     public static bool Track(string label, bool changed) {
         if (ImGui.IsItemActivated()) {
             pendingLabel = label;
-            pendingYaml = SceneSerializer.Serialize(SceneManager.GetCurrentScene());
+            pendingEntity = ScopeEntity;
+            pendingScoped = ScopeEntity is not null;
+            // Scoped: capture just the entity (cheap, side-effect-free undo). Otherwise the whole scene.
+            pendingYaml = pendingScoped ? null : SceneSerializer.Serialize(SceneManager.GetCurrentScene());
+            if (pendingScoped)
+                pendingDoc = SceneSerializer.CaptureEntity(ScopeEntity);
         }
 
-        if (ImGui.IsItemDeactivatedAfterEdit() && pendingYaml is not null) {
-            EditorUndo.PushSnapshot(pendingLabel, pendingYaml);
-            pendingYaml = null;
+        if (ImGui.IsItemDeactivatedAfterEdit()) {
+            if (pendingScoped && pendingDoc is not null)
+                EditorUndo.PushEntitySnapshot(pendingLabel, pendingEntity, pendingDoc);
+            else if (pendingYaml is not null)
+                EditorUndo.PushSnapshot(pendingLabel, pendingYaml);
+            Clear();
         }
         else if (ImGui.IsItemDeactivated()) {
-            pendingYaml = null; // aborted / no net change
+            Clear(); // aborted / no net change
         }
 
         return changed;
+    }
+
+    static BallisticEngine.Serialization.EntityDocument pendingDoc;
+
+    static void Clear() {
+        pendingYaml = null;
+        pendingDoc = null;
+        pendingEntity = null;
+        pendingScoped = false;
     }
 }
