@@ -46,6 +46,10 @@ internal static class EditorIcons {
     public const string Grid = "";   // lucide grid-3x3 (grid toggle)
     public const string Pin = "";    // lucide map-pin (component gizmos toggle)
     public const string World = "";  // lucide globe (world gizmo space)
+    public const string Lock = "";   // lucide lock (U+E10F)
+    public const string LockOpen = ""; // lucide lock-open (U+E110)
+    public const string Maximize = "";  // lucide maximize (U+E116)
+    public const string Minimize = "";  // lucide minimize (U+E11E)
 
     // The contiguous glyph range to bake (smallest..largest of the codepoints above), used by
     // ImGuiController when merging lucide.ttf. Keep in sync if icons outside this range are added.

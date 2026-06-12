@@ -139,7 +139,10 @@ public class UIDocument : Behaviour
         ApplyStyles();
     }
 
-    void ApplyStyles()
+    // Re-runs the stylesheet cascade over the whole tree. Call after building dynamic content (rows,
+    // lists) so elements added AFTER Rebuild() pick up their USS — otherwise their classes were added
+    // after the initial cascade and they'd render unstyled. Public so controllers can invoke it.
+    public void ApplyStyles()
     {
         if (Root == null) return;
         _sheet?.Apply(Root);
@@ -157,16 +160,17 @@ public class UIDocument : Behaviour
 
     // ---- per-frame ----
 
-    // Called by the host each frame (editor viewport + player). viewport is the panel's screen rect in
-    // pixels; dt is the frame delta seconds for animation (0 = no advance, e.g. a paused screenshot).
+    // Solves layout + advances animation for a render pass. `renderSize` is the pixel size of the
+    // RENDER target (the offscreen game texture in the editor, the window in the player). Does NOT
+    // process input — input needs the on-screen panel rect, which the renderer doesn't know; the host
+    // calls ProcessInput separately. Kept as UpdateFrame for the renderer's existing call.
     public void UpdateFrame(Rect viewport) => UpdateFrame(viewport, 0f);
 
     public void UpdateFrame(Rect viewport, float dt)
     {
         if (Root == null) return;
 
-        // Advance animations first so tweened/looped values (translate, opacity, colors) are current
-        // before layout + draw. The controller registers these against Animator.
+        // Advance animations first so tweened/looped values are current before layout + draw.
         if (dt > 0f) Animator.Tick(dt);
 
         // Compute the logical canvas size + scale from the scale mode, then solve layout against the
@@ -174,22 +178,27 @@ public class UIDocument : Behaviour
         // ResolvedScale as a uniform transform.
         Vector2 logical = ComputeLogicalSize(viewport.Size, out float scale);
         ResolvedScale = scale;
+        LogicalSize = logical;
 
         // Root fills the logical canvas unless the design set explicit root dimensions.
         LayoutPass.Solve(Root, logical.X, logical.Y);
-
-        // Input is hit-tested in LOGICAL space too: convert the pointer by dividing out the scale.
-        // The input module reads the Input facade; we hand it a logical-space panel rect.
-        var logicalPanel = new Rect(viewport.X, viewport.Y, logical.X, logical.Y);
-        _input.Update(Root, ScaleInputRect(viewport, logicalPanel, scale));
     }
 
-    // Translates the screen viewport into the logical panel rect the input module expects. With
-    // ScaleWithScreenSize the pointer must be mapped from screen px into logical px (divide by scale);
-    // we model that by giving the module a panel rect of the logical size positioned at the viewport
-    // origin, and the module compares against logical-space resolved boxes. The pointer itself is read
-    // from Input in screen space, so here we keep the origin and let scale fold into hit math later.
-    static Rect ScaleInputRect(Rect viewport, Rect logicalPanel, float scale) => logicalPanel;
+    // The logical canvas size from the last solve (pixels). Hosts need it to map screen-space mouse
+    // coords into the UI's logical space for input.
+    [NotSerialized] public Vector2 LogicalSize { get; private set; }
+
+    // Processes pointer input against the laid-out tree. `panelScreenRect` is where the UI's render
+    // surface sits ON SCREEN in the SAME coordinate space as Input.MousePosition (the whole window for
+    // the player; the Game-view image's screen rect for the editor). The mouse is mapped from that rect
+    // into the UI's logical space (so a UI authored at 1920×1080 hit-tests correctly regardless of the
+    // panel's on-screen size/offset). Call once per frame after UpdateFrame, only when input should be
+    // routed to the UI (e.g. editor: play mode + Game-view focused; player: always).
+    public void ProcessInput(Rect panelScreenRect)
+    {
+        if (Root == null) return;
+        _input.Update(Root, panelScreenRect, LogicalSize);
+    }
 
     Vector2 ComputeLogicalSize(Vector2 viewportPx, out float scale)
     {

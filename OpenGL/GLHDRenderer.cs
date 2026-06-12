@@ -32,6 +32,7 @@ public class GLHDRenderer : HDRenderer {
     GLShadowMap shadowMap;
     GLShadowMap punctualShadows;
     GLCompositePass composite;
+    GLUIPass uiPass;   // screen-space game UI overlay, drawn after composite (UIDocument.Active)
     GLBloomPass bloom;
     GLSSAOPass ssao;
     GLSSGIPass ssgi;
@@ -132,6 +133,7 @@ public class GLHDRenderer : HDRenderer {
         punctualShadows = new GLShadowMap(PunctualShadowSize, PunctualShadowSize,
             MaxShadowedSpots + MaxShadowedPoints * 6);
         composite = new GLCompositePass();
+        uiPass = new GLUIPass();
         bloom = new GLBloomPass();
         ssao = new GLSSAOPass();
         ssgi = new GLSSGIPass();
@@ -651,6 +653,30 @@ void main() {
                     bloomTexture, 0);
         }
 
+        // Screen-space game UI overlay on top of the composited image, into the same bound target.
+        // Shows when presenting to screen (player) or on the editor's GAME target — never the Scene
+        // view. UIDocument.Active is the set of attached game UIs.
+        bool drawUI = PresentToScreen || ActiveTarget == RenderTarget.Game;
+        if (drawUI && BallisticEngine.UI.UIDocument.Active.Count > 0) {
+            using (timers.Time("UI")) {
+                // composite.Render ends by binding framebuffer 0, so we must RE-BIND the destination
+                // the UI should land in: the default framebuffer when presenting to screen (player),
+                // or the offscreen game-display FBO in the editor (which the editor samples as the Game
+                // view texture). Without this the editor UI draws into FB 0 and is never shown.
+                int uiW, uiH;
+                if (PresentToScreen) {
+                    GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+                    uiW = target.LenX; uiH = target.LenY;
+                } else {
+                    CurrentDisplay.Activate();   // binds the game-display FBO + its viewport
+                    uiW = CurrentDisplay.LenX; uiH = CurrentDisplay.LenY;
+                }
+                GL.Viewport(0, 0, uiW, uiH);
+                RenderUIOverlay(uiW, uiH);
+                GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+            }
+        }
+
         // Every pool-acquired transient target has been consumed by now.
         GLRenderTexturePool.Shared.EndFrame();
 
@@ -707,6 +733,30 @@ void main() {
             PostFX.ContactShadowsEnabled = csOn;
         if (EnvNormalStrength is { } ns)
             NormalStrength = ns;
+    }
+
+    // Draws every active game UIDocument as a screen-space overlay into the currently-bound target
+    // (viewport already set). Each document solves its own layout against the viewport (honoring its
+    // scale mode), ticks animations, then walks its tree into the GL UI pass. Documents draw in
+    // SortOrder so higher values land on top.
+    void RenderUIOverlay(int uiW, int uiH) {
+        var docs = BallisticEngine.UI.UIDocument.Active;
+        if (docs.Count == 1) { DrawOneUI(docs[0], uiW, uiH); return; }
+        var ordered = new List<BallisticEngine.UI.UIDocument>(docs);
+        ordered.Sort((a, b) => a.SortOrder.CompareTo(b.SortOrder));
+        foreach (var doc in ordered)
+            DrawOneUI(doc, uiW, uiH);
+    }
+
+    void DrawOneUI(BallisticEngine.UI.UIDocument doc, int uiW, int uiH) {
+        if (doc.Root is null) return;
+        // Solve layout + animate, then draw. Input is NOT processed here in the editor (the editor calls
+        // ProcessInput with the Game-view's on-screen rect). When PRESENTING to screen (player), the UI
+        // surface IS the whole window, so process input here against the full window rect.
+        doc.UpdateFrame(new BallisticEngine.UI.Rect(0, 0, uiW, uiH), (float)Time.DeltaTime);
+        if (PresentToScreen)
+            doc.ProcessInput(new BallisticEngine.UI.Rect(0, 0, uiW, uiH));
+        BallisticEngine.UI.UIRenderWalker.Draw(doc, uiPass);
     }
 
     void SplitRenderables(Vector3 cameraPos, ref Matrix4 viewProjection) {

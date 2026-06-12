@@ -29,6 +29,12 @@ internal sealed class InspectorPanel {
 
     string addComponentSearch = "";
 
+    // Inspector lock (Unity's padlock): when on, the inspector pins its current entity so selecting
+    // other objects in the hierarchy/viewport doesn't change what's shown. Lock only applies to an
+    // entity selection (the common case); asset/scene-behaviour selections always follow.
+    bool locked;
+    Entity lockedEntity;
+
     public InspectorPanel(EditorState state) => this.state = state;
 
     public void DrawContents() {
@@ -36,7 +42,16 @@ internal sealed class InspectorPanel {
         ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new SysVec2(8, 4));
         ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new SysVec2(8, 4));
 
-        if (state.SelectedAssets.Count > 1) {
+        DrawLockBar();
+
+        // While locked to a still-alive entity, show IT regardless of the live selection.
+        bool showLocked = locked && lockedEntity is not null &&
+                          SceneManager.GetCurrentScene().Entities.Contains(lockedEntity);
+
+        if (showLocked) {
+            DrawEntityInspector(lockedEntity);
+        }
+        else if (state.SelectedAssets.Count > 1) {
             DrawMultiAssetInspector();
         }
         else if (state.HasAssetSelection) {
@@ -68,6 +83,29 @@ internal sealed class InspectorPanel {
         DrawAssetPickerPopup();
 
         ImGui.PopStyleVar(2);
+    }
+
+    // A slim right-aligned lock toggle at the top of the inspector. Locking pins the current entity so
+    // selecting other objects doesn't change what's shown (Unity's padlock).
+    void DrawLockBar() {
+        float btn = ImGui.GetFrameHeight();
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - btn);
+        if (locked) {
+            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.CheckMark]);
+            if (EditorIcons.GhostButtonSmall("inspectorlock", EditorIcons.Lock, "Inspector locked - click to unlock")) {
+                locked = false;
+                lockedEntity = null;
+            }
+            ImGui.PopStyleColor();
+        }
+        else {
+            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+            if (EditorIcons.GhostButtonSmall("inspectorlock", EditorIcons.LockOpen, "Lock inspector to the current entity")) {
+                lockedEntity = state.Selected;
+                locked = lockedEntity is not null;
+            }
+            ImGui.PopStyleColor();
+        }
     }
 
     // Centered hint when nothing is selected, instead of a lone text line in the corner.
@@ -870,46 +908,79 @@ internal sealed class InspectorPanel {
 
     // Mini asset-picker window: search + every compatible asset; click to assign.
     void DrawAssetPickerPopup() {
-        ImGui.SetNextWindowSize(new SysVec2(380, 420), ImGuiCond.Appearing);
+        float u = ImGui.GetFontSize();
+        ImGui.SetNextWindowSize(new SysVec2(u * 28f, u * 30f), ImGuiCond.Appearing);
         if (!ImGui.BeginPopup("##assetpicker"))
             return;
 
-        ImGui.TextDisabled($"Select {pickerType?.Name ?? "asset"}");
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new SysVec2(8, 6));
+
+        // Header: "Select <Type>" in bold + a hint of which extensions qualify.
+        string typeName = pickerType is null ? "Asset" : Prettify(pickerType.Name);
+        ImGui.PushFont(ImGuiController.Bold);
+        ImGui.TextUnformatted($"Select {typeName}");
+        ImGui.PopFont();
+
+        string[] extensions = CompatibleExtensions(pickerType);
+        if (extensions.Length > 0) {
+            ImGui.SameLine();
+            ImGui.TextDisabled($"({string.Join(" ", extensions)})");
+        }
+        ImGui.Spacing();
+
         if (ImGui.IsWindowAppearing())
             ImGui.SetKeyboardFocusHere();
         ImGui.SetNextItemWidth(-1);
-        ImGui.InputTextWithHint("##search", $"{EditorIcons.Search} Search...", ref pickerSearch, 128);
+        ImGui.InputTextWithHint("##search", $"{EditorIcons.Search} Search {typeName.ToLowerInvariant()}s...",
+            ref pickerSearch, 128);
         ImGui.Separator();
 
         ImGui.BeginChild("##list");
 
-        if (ImGui.Selectable("(None)")) {
+        // (None) clears the slot.
+        ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+        if (ImGui.Selectable($"  (None)", false, ImGuiSelectableFlags.None, new SysVec2(0, ImGui.GetFrameHeight()))) {
             EditorUndo.Push($"Clear {Prettify(pickerMember.Name)}");
             ComponentReflection.SetValue(pickerMember, pickerTarget, null);
             state.MarkViewportDirty();
             ImGui.CloseCurrentPopup();
         }
+        ImGui.PopStyleColor();
 
-        string[] extensions = CompatibleExtensions(pickerType);
+        var any = false;
         foreach ((string path, Guid guid) in AssetDatabase.EnumerateAssets()
                      .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)) {
             var ext = Path.GetExtension(path).ToLowerInvariant();
-            if (extensions.Length > 0 && !extensions.Contains(ext))
+            // Type filter: only assets whose extension matches the slot's type. (Unknown type => nothing,
+            // so an unrecognized slot never floods the picker with every asset in the project.)
+            if (!extensions.Contains(ext))
                 continue;
-            if (pickerSearch.Length > 0 && !path.Contains(pickerSearch, StringComparison.OrdinalIgnoreCase))
+            if (pickerSearch.Length > 0 &&
+                !Path.GetFileName(path).Contains(pickerSearch, StringComparison.OrdinalIgnoreCase))
                 continue;
 
+            any = true;
             (string icon, SysVec4 tint) = EditorIcons.ForAssetExtension(ext);
-            if (ImGui.Selectable($"       {Path.GetFileName(path)}##{guid}")) {
+            bool clicked = ImGui.Selectable($"      {Path.GetFileName(path)}##{guid}", false,
+                ImGuiSelectableFlags.None, new SysVec2(0, ImGui.GetFrameHeight()));
+            SysVec2 rmin = ImGui.GetItemRectMin();
+            EditorIcons.DrawAt(new SysVec2(rmin.X + 6,
+                rmin.Y + (ImGui.GetFrameHeight() - ImGui.GetTextLineHeight()) * 0.5f), icon, tint);
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(path);
+            if (clicked) {
                 AssignAsset(pickerMember, pickerTarget, pickerType, guid);
                 ImGui.CloseCurrentPopup();
             }
-            EditorIcons.DrawAt(ImGui.GetItemRectMin() + new SysVec2(4, 0), icon, tint);
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip(path);
         }
 
+        if (!any)
+            ImGui.TextDisabled(pickerSearch.Length > 0
+                ? "No matching assets."
+                : $"No {typeName.ToLowerInvariant()} assets in the project.");
+
         ImGui.EndChild();
+        ImGui.PopStyleVar();
         ImGui.EndPopup();
     }
 
@@ -940,6 +1011,12 @@ internal sealed class InspectorPanel {
             return [".mat"];
         if (typeof(Shader).IsAssignableFrom(assetType))
             return [".shader"];
+        if (typeof(TerrainAsset).IsAssignableFrom(assetType))
+            return [".terrain"];
+        if (typeof(PrefabAsset).IsAssignableFrom(assetType))
+            return [".prefab"];
+        if (typeof(DataAsset).IsAssignableFrom(assetType))
+            return [".asset"];
         return [];
     }
 

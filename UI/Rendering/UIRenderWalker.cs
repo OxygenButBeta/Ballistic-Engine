@@ -86,7 +86,7 @@ public static class UIRenderWalker
             {
                 Color = Premultiply(s.TextColor, opacity),
                 FontSize = s.FontSize,
-                Align = label.TextAlign,
+                Align = s.TextAlign ?? label.TextAlign,
                 FontFamily = s.FontFamily,
                 LetterSpacing = s.LetterSpacing,
                 HasShadow = s.HasTextShadow,

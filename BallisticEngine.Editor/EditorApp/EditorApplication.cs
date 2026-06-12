@@ -113,6 +113,9 @@ internal sealed class EditorApplication {
         EditorLayout.SetProject(bootstrap.Project.RootPath);
         EditorLayout.Load();
 
+        // Restore the Scene-view camera to wherever it was last left in this project.
+        editorCamera.RestorePose(EditorPrefs.GetLastCamera(bootstrap.Project.RootPath));
+
         Renderer.PresentToScreen = false;
 
         // Files dragged from the OS onto the editor window import into the browser's folder.
@@ -231,6 +234,7 @@ internal sealed class EditorApplication {
         editorInput.NewFrame();
         var allowCameraInput = sceneViewHovered && !imgui.WantTextInput && !AsyncAssetImport.IsBusy;
         editorCamera.Update((float)delta, allowCameraInput, editorInput);
+        MaybeSaveCameraPose((float)delta);
 
         HandleGlobalShortcuts();
 
@@ -266,6 +270,25 @@ internal sealed class EditorApplication {
 
     bool startupImportKicked;
     bool scriptsRecheckPending;
+
+    // Persist the Scene-view camera pose periodically so it survives a crash/close without a dedicated
+    // exit hook. Throttled (~1.5s) and only writes when the pose actually changed, to avoid disk churn.
+    float cameraSaveTimer;
+    string lastSavedCameraPose;
+
+    void MaybeSaveCameraPose(float delta) {
+        cameraSaveTimer += delta;
+        if (cameraSaveTimer < 1.5f)
+            return;
+        cameraSaveTimer = 0f;
+
+        string pose = editorCamera.SerializePose();
+        if (pose == lastSavedCameraPose)
+            return;
+        lastSavedCameraPose = pose;
+        EditorPrefs.SetLastCamera(bootstrap.Project.RootPath, pose);
+        EditorPrefs.Save();
+    }
 
     void OnRender(double delta) {
         frameWatch.Restart();
@@ -313,9 +336,13 @@ internal sealed class EditorApplication {
             lastCameraMatrix = camMatrix;
             MarkSceneDirty();
         }
+        // A live game UIDocument animates per frame (tweens, pulses, loading), so the Game view must
+        // keep repainting while one is active — otherwise on-demand rendering freezes the UI after the
+        // initial forceFrames run out (it builds in the controller's OnAttach but never draws again).
+        bool activeGameUI = !sceneTabActive && BallisticEngine.UI.UIDocument.Active.Count > 0;
         var renderScene = !SceneCommands.IsLoading &&
                           (alwaysRefresh || SceneManager.IsPlaying || editorInput.RightMouseDown ||
-                           gizmo.IsInteracting || forceFrames > 0 || probeBakePending);
+                           gizmo.IsInteracting || forceFrames > 0 || probeBakePending || activeGameUI);
         if (renderScene) {
             using var profileZone = Profiler.Zone("Editor.SceneRender");
             if (sceneTabActive)
@@ -920,6 +947,13 @@ internal sealed class EditorApplication {
         RightAlign(ImGui.CalcTextSize(statsLabel).X + pad2);
         ToggleIconButton($"statsbar{id}", statsLabel, ref showStats, "Statistics overlay");
 
+        // Maximize / restore the viewport (also double-click the view's dock tab, or Esc to restore).
+        string maxIcon = maximizedViewport ? EditorIcons.Minimize : EditorIcons.Maximize;
+        RightAlign(ImGui.CalcTextSize(maxIcon).X + pad2);
+        if (EditorIcons.GhostButton($"maxview{id}", maxIcon,
+                maximizedViewport ? "Restore (Esc)" : "Maximize viewport"))
+            maximizedViewport = !maximizedViewport;
+
         if (id == "scene") {
             EditorPrefs prefs = EditorPrefs.Current;
 
@@ -958,18 +992,22 @@ internal sealed class EditorApplication {
         ImGui.Separator();
     }
 
-    // Double-clicking a viewport window's title/tab strip toggles fullscreen for that view. Call right
-    // after Begin so the title-bar rect is current. Restricted to the title-bar band so a double-click
-    // on the 3D image (which drives gizmo/selection) never accidentally maximizes.
+    // Double-clicking a viewport window's tab/title strip toggles fullscreen for that view. Call right
+    // after Begin. For a DOCKED window the tab bar sits ABOVE the content origin (GetWindowPos().Y), so
+    // the hit band extends upward by ~2 frame heights to cover the dock tab; for a floating window it
+    // covers the title bar. The horizontal span is the window width. Excludes the content area so a
+    // double-click on the 3D image (gizmo/selection) never maximizes.
     void MaximizeOnTitleDoubleClick() {
         if (!ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
             return;
         SysVec2 mn = ImGui.GetWindowPos();
-        float titleH = ImGui.GetFrameHeight();
+        float w = ImGui.GetWindowSize().X;
+        float tabH = ImGui.GetFrameHeight() * 1.4f;
         SysVec2 mouse = ImGui.GetIO().MousePos;
-        bool overTitle = mouse.Y >= mn.Y && mouse.Y <= mn.Y + titleH &&
-                         mouse.X >= mn.X && mouse.X <= mn.X + ImGui.GetWindowSize().X;
-        if (overTitle && ImGui.IsWindowHovered(ImGuiHoveredFlags.RootAndChildWindows | ImGuiHoveredFlags.AllowWhenBlockedByActiveItem))
+        // Band: from a bit above the content top (the dock tab) down to the content top.
+        bool overTab = mouse.X >= mn.X && mouse.X <= mn.X + w &&
+                       mouse.Y >= mn.Y - tabH && mouse.Y <= mn.Y + 2f;
+        if (overTab)
             maximizedViewport = !maximizedViewport;
     }
 
@@ -1100,9 +1138,14 @@ internal sealed class EditorApplication {
         if (VertexSnap.Held)
             MarkSceneDirty();
 
+        // The terrain brush ring follows the cursor, so keep the viewport repainting while it's armed
+        // and the mouse is over the Scene view (same idea as VertexSnap.Held above).
+        if (TerrainTool.Armed && sceneViewHovered)
+            MarkSceneDirty();
+
         if (editorState.Selected is not null)
             gizmo.Draw(editorCamera, editorState.Selected, gizmoMin, gizmoSize,
-                sceneViewHovered && !ColliderHandles.IsInteracting);
+                sceneViewHovered && !ColliderHandles.IsInteracting && !TerrainTool.Armed);
 
         // Click-to-select (Unity-style): a clean left-click in the viewport (no drag) picks the mesh
         // under the cursor. Runs AFTER the gizmo draw so gizmo/collider hover this frame can veto the
@@ -1172,6 +1215,20 @@ internal sealed class EditorApplication {
                     ColliderHandles.Draw(collider, editorCamera, imageMin, imageSize,
                         ImGui.GetWindowDrawList(), sceneViewHovered && !gizmo.IsInteracting))
                     MarkSceneDirty();
+
+            // Terrain gets a Scene-view sculpt brush, active only while the Inspector arms it. Hover is
+            // suppressed while the transform gizmo/collider handles interact so a click can't grab both.
+            // Disarm if the selection has no terrain, so a stale Armed flag can't block click-to-select.
+            Terrain selectedTerrain = selected.GetComponent<Terrain>();
+            if (selectedTerrain is null)
+                TerrainTool.Armed = false;
+            else if (TerrainTool.Draw(selectedTerrain, editorCamera, imageMin, imageSize,
+                         ImGui.GetWindowDrawList(),
+                         sceneViewHovered && !gizmo.IsInteracting && !ColliderHandles.IsInteracting))
+                MarkSceneDirty();
+        }
+        else {
+            TerrainTool.Armed = false; // nothing selected — never leave the brush armed
         }
 
         if (editorState.SelectedSceneBehaviour is { } selectedSceneBehaviour) {
@@ -1194,7 +1251,8 @@ internal sealed class EditorApplication {
         // Conditions under which a left-press can START a pick: over the viewport, not flying, and no
         // gizmo/handle interaction is claiming the click this frame.
         bool gizmoBusy = gizmo.IsInteracting || gizmo.IsHovered ||
-                         ColliderHandles.IsInteracting || VertexSnap.Held;
+                         ColliderHandles.IsInteracting || VertexSnap.Held ||
+                         TerrainTool.Armed || TerrainTool.IsInteracting;
         bool canStart = sceneViewHovered && !editorInput.RightMouseDown && !gizmoBusy &&
                         !imgui.WantTextInput;
 
@@ -1293,6 +1351,17 @@ internal sealed class EditorApplication {
             ImGui.Image(Tex(Renderer.GameColorTextureId), dispSize, uv0, uv1);
             gameViewFocused = ImGui.IsWindowFocused();
             gameViewHovered = ImGui.IsItemHovered(); // is the MOUSE over the game image specifically
+
+            // Route pointer input to active game UIs using the game IMAGE's on-screen rect (position +
+            // displayed size), so hit-testing maps window-space mouse coords into the UI's logical space
+            // correctly — independent of the panel's offset and display scale. Gated like engine input
+            // (Input.Enabled = play mode + game focused), so editing never leaks clicks into the UI.
+            if (Input.Enabled) {
+                SysVec2 imgMin = ImGui.GetItemRectMin();
+                var panelRect = new BallisticEngine.UI.Rect(imgMin.X, imgMin.Y, dispSize.X, dispSize.Y);
+                foreach (var doc in BallisticEngine.UI.UIDocument.Active)
+                    doc.ProcessInput(panelRect);
+            }
 
             // Stats pinned to the view's top-right (no orientation cube here, so right at the top).
             if (showStats && !stats.Draw(runtime.Window.FrameRate, editorCpuMs, gameViewSize, S,

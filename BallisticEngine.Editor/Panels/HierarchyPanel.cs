@@ -503,6 +503,8 @@ internal sealed class HierarchyPanel {
             if (ImGui.MenuItem("Plane")) CreatePrimitive(scene, PrimitiveKind.Plane);
             ImGui.EndMenu();
         }
+        if (ImGui.MenuItem($"{EditorIcons.Grid} Terrain"))
+            CreateTerrain(scene);
         if (ImGui.BeginMenu($"{EditorIcons.Lightbulb} Light")) {
             if (ImGui.MenuItem("Directional Light")) CreateWithComponent<DirectionalLight>(scene, "Directional Light");
             if (ImGui.MenuItem("Point Light")) CreateWithComponent<PointLight>(scene, "Point Light");
@@ -523,6 +525,54 @@ internal sealed class HierarchyPanel {
     void CreatePrimitive(Scene scene, PrimitiveKind kind) {
         EditorUndo.Push($"Create {kind}");
         state.Select(Primitives.Create(scene, kind));
+    }
+
+    // Creates a Terrain entity AND its backing assets: a fresh .terrain heightfield next to the asset
+    // browser's current folder, plus a shared checker material in Assets/Default (generated once). Both
+    // assets import asynchronously, then bind onto the component so the terrain shows the checker
+    // immediately. The checker tiles across the terrain so the grid reads at any size.
+    void CreateTerrain(Scene scene) {
+        EditorUndo.Push("Create Terrain");
+        Entity entity = scene.CreateEntity("Terrain");
+        var terrain = (Terrain)entity.AddComponent(typeof(Terrain));
+        state.Select(entity);
+
+        string folder = CurrentAssetFolder?.Invoke() ?? "Assets";
+        string dir = AssetDatabase.Project.ResolveAbsolute(folder);
+        Directory.CreateDirectory(dir);
+        string terrainAbs = UniqueAssetPath(Path.Combine(dir, "Terrain.terrain"));
+        File.WriteAllText(terrainAbs,
+            "{\n  \"version\": 1,\n  \"resolution\": 256,\n  \"sizeX\": 100,\n  \"sizeZ\": 100,\n  \"heightScale\": 20\n}\n");
+        string terrainRel = ToProjectRelative(terrainAbs);
+
+        string materialRel = TerrainAssets.EnsureCheckerMaterial();
+
+        AsyncAssetImport.Request("Creating terrain...", onFinished: () => {
+            var asset = AssetDatabase.Load<TerrainAsset>(terrainRel);
+            if (asset is not null) terrain.Terrain3D = asset;
+            if (materialRel is not null) {
+                var mat = AssetDatabase.Load<Material>(materialRel);
+                if (mat is not null) terrain.Material = mat;
+            }
+            state.MarkViewportDirty();
+        });
+    }
+
+    static string UniqueAssetPath(string path) {
+        if (!File.Exists(path)) return path;
+        string dir = Path.GetDirectoryName(path);
+        string name = Path.GetFileNameWithoutExtension(path);
+        string ext = Path.GetExtension(path);
+        for (var i = 1; ; i++) {
+            string candidate = Path.Combine(dir, $"{name} {i}{ext}");
+            if (!File.Exists(candidate)) return candidate;
+        }
+    }
+
+    static string ToProjectRelative(string absolute) {
+        string root = AssetDatabase.Project.ResolveAbsolute("Assets");
+        string assetsRel = "Assets" + absolute[root.Length..];
+        return assetsRel.Replace('\\', '/');
     }
 
     void BeginRename(Entity entity) {

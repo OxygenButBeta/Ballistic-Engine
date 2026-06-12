@@ -97,4 +97,34 @@ internal sealed class EditorCamera : IViewProjectionProvider {
         if (direction != Vector3.Zero)
             transform.Position += direction.Normalized() * speed * dt;
     }
+
+    // "px,py,pz,pitch,yaw" — persisted per project so the Scene-view camera reopens where it was.
+    public string SerializePose() {
+        Vector3 p = transform.Position;
+        return string.Format(System.Globalization.CultureInfo.InvariantCulture,
+            "{0},{1},{2},{3},{4}", p.X, p.Y, p.Z, pitch, yaw);
+    }
+
+    // Applies a pose string produced by SerializePose. No-ops on malformed input.
+    public void RestorePose(string pose) {
+        if (string.IsNullOrEmpty(pose))
+            return;
+        var parts = pose.Split(',');
+        if (parts.Length != 5)
+            return;
+        var ci = System.Globalization.CultureInfo.InvariantCulture;
+        if (!float.TryParse(parts[0], System.Globalization.NumberStyles.Float, ci, out float px) ||
+            !float.TryParse(parts[1], System.Globalization.NumberStyles.Float, ci, out float py) ||
+            !float.TryParse(parts[2], System.Globalization.NumberStyles.Float, ci, out float pz) ||
+            !float.TryParse(parts[3], System.Globalization.NumberStyles.Float, ci, out float pi) ||
+            !float.TryParse(parts[4], System.Globalization.NumberStyles.Float, ci, out float yw))
+            return;
+
+        pitch = MathHelper.Clamp(pi, -89f, 89f);
+        yaw = yw;
+        Quaternion qPitch = Quaternion.FromAxisAngle(Vector3.UnitX, MathHelper.DegreesToRadians(pitch));
+        Quaternion qYaw = Quaternion.FromAxisAngle(Vector3.UnitY, MathHelper.DegreesToRadians(yaw));
+        transform.Rotation = qYaw * qPitch;
+        transform.Position = new Vector3(px, py, pz);
+    }
 }

@@ -222,8 +222,10 @@ public sealed class GLUIPass : IUIRenderer, IDisposable
         {
             var shadowRect = new Rect(rect.X + ts.ShadowOffsetX, rect.Y + ts.ShadowOffsetY, rect.Width, rect.Height);
             _textShader.SetFloat4("uColor", ts.ShadowColor.ToVector4());
-            // Map the CSS blur radius to an SDF spread (0..~0.45). Bigger blur -> softer, wider halo.
-            _textShader.SetFloat("uSpread", System.Math.Min(0.45f, ts.ShadowBlur * 0.01f));
+            // Map the CSS blur radius to a SMALL SDF spread. The glow must stay inside the glyph's tight
+            // quad (the quad isn't expanded), so a large spread would clip into a box — cap it low so it
+            // reads as a soft edge-glow rather than a rectangle. Drop-shadows (small blur) are unaffected.
+            _textShader.SetFloat("uSpread", System.Math.Min(0.12f, ts.ShadowBlur * 0.004f));
             font.Layout(text, ts.FontSize, shadowRect, ts.Align, ts.LetterSpacing, g =>
             {
                 _textShader.SetFloat4("uRect", new Vector4(g.X, g.Y, g.W, g.H));
