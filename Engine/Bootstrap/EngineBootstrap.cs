@@ -247,6 +247,7 @@ public sealed class EngineBootstrap {
         SceneManager.Update((float)delta);
         ParticleSystem.AdvanceAll((float)delta);   // once per frame, edit + play (editor preview)
         Audio.Update();
+        InputActions.Update();   // snapshot action down-state for next frame's press/release edges
     }
 
     // Loads the project's startup scene (ScenesInBuild[0], or the legacy StartupScene field when the

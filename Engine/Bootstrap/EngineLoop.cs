@@ -41,6 +41,10 @@ public sealed class EngineLoop {
         // After SceneManager.Update so the listener/emitter transforms are current.
         Audio.Update();
 
+        // Snapshot this frame's action down-state for next frame's GetButtonDown/Up edges. AFTER
+        // scripts Tick so a press is reported exactly one frame, Unity-style.
+        InputActions.Update();
+
         // Standalone player: the whole window IS the game, so the script's cursor intent always
         // applies. (The editor resolves intent itself, with a focus veto — see EditorApplication.)
         Cursor.Apply(allowed: true);
