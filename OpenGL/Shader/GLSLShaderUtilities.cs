@@ -33,7 +33,10 @@ public static class GLSLShaderUtilities {
     // GL.ShaderSource(int, string) passes the char count as the length of the UTF-8
     // encoded buffer, so every non-ASCII character (e.g. in comments) truncates the
     // source by a byte. GLSL is ASCII-only outside comments; degrade the rest to '?'.
-    static string ToAscii(string code) {
+    // Public so compute-shader compile paths that don't go through CompileProgram (the
+    // GPU-driven cull) can sanitize too — an em-dash in a comment truncates the tail and
+    // yields "unexpected end of file".
+    public static string ToAscii(string code) {
         if (!code.Any(c => c > 127))
             return code;
 

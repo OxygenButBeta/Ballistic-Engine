@@ -48,6 +48,21 @@ public class GLHDRenderer : HDRenderer {
     readonly GLParticlePass particlePass = new();
     readonly GLTrailPass trailPass = new();
     readonly GLProceduralSkyPass proceduralSkyPass = new();
+
+    // GPU-driven rendering (MDI + compute cull + bindless) for the whole-mesh renderer (Bistro).
+    // The CPU 30ms-vs-GPU 12ms diagnosis showed the bottleneck is per-draw CPU submit; this path
+    // collapses ~6000 DrawElements into one glMultiDrawElementsIndirectCount. Opt-out via
+    // BALLISTIC_GPUDRIVEN=0. The GPU-driven shader variants are companions to each material shader.
+    readonly OpenGL.GpuDriven.GpuDrivenRenderer gpuDriven = new();
+    readonly Dictionary<Shader, (Shader Lit, Shader Prepass)> gpuDrivenShaders = new();
+    bool gpuDrivenEnabled = Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN") != "0";
+    bool gpuDrivenReady;
+    // Scratch reused each frame when building the whole-mesh renderer's submesh metadata.
+    Matrix4[] gdModels = [];
+    Vector3[] gdLocalMin = [], gdLocalMax = [];
+    uint[] gdFirstIndex = [], gdIndexCount = [], gdMaterialId = [], gdFlags = [];
+    readonly List<Material> gdMaterials = new();
+    readonly Dictionary<Material, int> gdMaterialIndex = new();
     // Sky luminance scale of the ACTIVE sky source: the Skybox component's Exposure for HDRI
     // skies, 1 for the procedural sky (its Exposure is baked into the cubemap texels).
     float skyExposureBase = 1f;
@@ -150,6 +165,21 @@ public class GLHDRenderer : HDRenderer {
         depthOfField = new GLDepthOfFieldPass();
         autoExposure = new GLAutoExposurePass();
         brdfLut = GLEnvironmentMaps.GenerateBrdfLut();
+
+        // GPU-driven path: compile the cull compute. If the GPU/driver lacks the needed features
+        // (bindless / draw-params / count-buffer), gpuDriven.Available stays false and we silently
+        // keep the legacy CPU draw path — nothing else needs to know.
+        if (gpuDrivenEnabled) {
+            try {
+                gpuDriven.Initialize(EmbeddedShaderSource.Read("GpuCull_Comp.glsl"));
+                gpuDrivenReady = gpuDriven.Available;
+                Console.WriteLine($"[GpuDriven] {(gpuDrivenReady ? "enabled" : "unavailable — using CPU path")}.");
+            }
+            catch (Exception e) {
+                Console.WriteLine($"[GpuDriven] init failed, using CPU path: {e.Message}");
+                gpuDrivenReady = false;
+            }
+        }
 
         // Non-compare sampler for PCSS blocker-depth reads (unit 19). Border = 1 (far plane)
         // so searches past the cascade edge find no blockers.
@@ -569,6 +599,9 @@ void main() {
         screenAoTexture = 0;
         screenAoTargetSize = new Vector2(target.LenX, target.LenY);
         var aoTexture = 0;
+        // New frame for the GPU-driven path: the next eligible draw rebuilds metadata + reruns the
+        // compute cull (consumed by both prepass and opaque). Reset before the prepass.
+        gpuDrivenCulledThisFrame = false;
         using (timers.Time("DepthPrepass"))
             RenderDepthPrepass(ref view, ref renderProjection, cameraPos);
 
@@ -599,6 +632,11 @@ void main() {
                 prepassDepth: true);
         if (wireframe)
             GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Fill);
+
+        // Fence the GPU-driven persistent buffers AFTER both passes consumed them, so next frame's
+        // BeginFrame waits only if it laps the GPU (triple-buffered: it rarely does).
+        if (gpuDrivenReady && gpuDrivenCulledThisFrame)
+            gpuDriven.EndFrame();
 
         DebugCheck();
         if (skyboxRenderer.cubemapTexture is not null) {
@@ -671,13 +709,18 @@ void main() {
                 litColor = ssr.Render(targetIndex, litColor, target.DepthTextureId, target.NormalTextureId,
                     target.LenX, target.LenY, ref view, ref renderProjection, PostFX);
 
-        // Volumetric height fog + sun shafts before TAA so the temporal pass stabilizes the
-        // dithered march and bloom catches the bright shafts. sunColor is already atmosphere-
-        // attenuated (dusk shafts go golden with the sky); the skylight term is the baked
-        // sky's RAW average radiance (not ambientFallback - the AmbientIntensity dial would
-        // crush the fog's airlight to near-black), so overcast clouds gray the fog and dusk
-        // dims it: sky, clouds and fog share one energy source.
-        if (PostFX.VolumetricEnabled) {
+        // Volumetric height fog + light shafts (god-rays) before TAA so the temporal pass
+        // stabilizes the dithered march and bloom catches the bright shafts. sunColor is
+        // already atmosphere-attenuated (dusk shafts go golden with the sky); the skylight
+        // term is the baked sky's RAW average radiance (not ambientFallback - the
+        // AmbientIntensity dial would crush the fog's airlight to near-black), so overcast
+        // clouds gray the fog and dusk dims it: sky, clouds and fog share one energy source.
+        //
+        // The SAME march serves both effects: VolumetricFog supplies the physical medium, the
+        // standalone LightShafts component adds the visible god-ray boost on top. Either being
+        // enabled runs the pass; when only shafts are on, the pass uses a thin shaft-only
+        // medium so beams show without the fog veil (see GLVolumetricFogPass.Render).
+        if (PostFX.VolumetricEnabled || PostFX.LightShaftsEnabled) {
             // Airlight prefers the sky-hued upper-hemisphere average (fog veils toward
             // white-blue sky, not ground-brown); older cubemaps without it fall back.
             Vector3 skyHue = skyboxRenderer.cubemapTexture is { } skyTex
@@ -688,7 +731,7 @@ void main() {
                 litColor = volumetric.Render(targetIndex, litColor, target.DepthTextureId,
                     shadowMap.DepthTextureId, target.LenX, target.LenY, ref view, ref projection,
                     cascadeMatrices, cascadeBias, activeCascadeCount, cameraPos, sunDirection, sunColor,
-                    fogSkylight, shadowDistance, PostFX);
+                    fogSkylight, shadowDistance, PostFX, UploadPunctualLights);
         }
 
         if (taaActive) {
@@ -1350,6 +1393,45 @@ void main() {
         punctualShadowStamp = newStamp;
     }
 
+    // Pushes the gathered punctual lights + their shadow data onto an arbitrary shader, using
+    // the SAME indexed-name arrays and pre-exposed radiance as the lit pass (so a volumetric
+    // beam matches the surface lighting of the same light). The punctual shadow array binds to
+    // unit 2 here — the volumetric march already holds depth on 0 and the sun cascades on 1.
+    void UploadPunctualLights(StandardShader shader) {
+        shader.SetInt("PointLightCount", pointLightCount);
+        for (var i = 0; i < pointLightCount; i++) {
+            shader.SetFloat3(PointPositionNames[i], pointPositions[i]);
+            shader.SetFloat3(PointColorNames[i], pointColors[i]);
+            shader.SetFloat(PointRangeNames[i], pointRanges[i]);
+            shader.SetInt(PointShadowSlotNames[i], pointShadowSlots[i]);
+        }
+
+        shader.SetInt("SpotLightCount", spotLightCount);
+        for (var i = 0; i < spotLightCount; i++) {
+            shader.SetFloat3(SpotPositionNames[i], spotPositions[i]);
+            shader.SetFloat3(SpotDirectionNames[i], spotDirections[i]);
+            shader.SetFloat3(SpotColorNames[i], spotColors[i]);
+            shader.SetFloat(SpotRangeNames[i], spotRanges[i]);
+            shader.SetFloat(SpotCosInnerNames[i], spotCosInner[i]);
+            shader.SetFloat(SpotCosOuterNames[i], spotCosOuter[i]);
+            shader.SetInt(SpotShadowSlotNames[i], spotShadowSlots[i]);
+        }
+
+        for (var s = 0; s < shadowedSpotCount; s++) {
+            shader.SetMatrix4(SpotShadowMatrixNames[s], ref spotShadowMatrices[s]);
+            shader.SetFloat(SpotShadowBiasNames[s], spotShadowBiases[s]);
+        }
+        for (var p = 0; p < shadowedPointCount; p++) {
+            shader.SetFloat(PointShadowBiasNames[p], pointShadowBiases[p]);
+            for (var f = 0; f < 6; f++)
+                shader.SetMatrix4(PointShadowMatrixNames[p * 6 + f], ref pointShadowMatrices[p * 6 + f]);
+        }
+
+        GL.ActiveTexture(TextureUnit.Texture2);
+        GL.BindTexture(TextureTarget.Texture2DArray, punctualShadows.DepthTextureId);
+        shader.SetInt("PunctualShadows", 2);
+    }
+
     void RenderShadowPass() {
         using var profileZone = Profiler.Zone("HD.ShadowPass");
 
@@ -1532,6 +1614,187 @@ void main() {
         return created;
     }
 
+    // Builds (and caches) the GPU-driven lit + prepass companion programs for a material shader.
+    // The lit program is the material's OWN vertex+fragment GLSL, transformed to read the per-draw
+    // model matrix from PerDrawData[gl_DrawID] and material maps from the bindless table — so the
+    // shading is bit-identical to the legacy uniform path. Returns (null, null) on non-standard
+    // shaders, which keeps them on the CPU path.
+    (Shader Lit, Shader Prepass) GpuDrivenShaderFor(Shader materialShader) {
+        if (gpuDrivenShaders.TryGetValue(materialShader, out var cached))
+            return cached;
+
+        (Shader Lit, Shader Prepass) result = (null, null);
+        if (materialShader is StandardShader std) {
+            string vert = OpenGL.GpuDriven.GpuDrivenShaderTransform.TransformVertex(std.VertexCode);
+            string frag = OpenGL.GpuDriven.GpuDrivenShaderTransform.TransformFragment(std.FragmentCode);
+            string prepassVert = vert; // same vertex stage; only the fragment differs
+            try {
+                Shader lit = GraphicAPI.CreateStandardShader(vert, frag);
+                Shader prepass = GraphicAPI.CreateStandardShader(prepassVert,
+                    OpenGL.GpuDriven.GpuDrivenShaderTransform.PrepassFragment());
+                result = (lit, prepass);
+            }
+            catch (Exception e) {
+                Console.WriteLine($"[GpuDriven] companion shader compile failed, CPU path for this material: {e.Message}");
+                result = (null, null);
+            }
+        }
+        gpuDrivenShaders[materialShader] = result;
+        return result;
+    }
+
+    // True when `target` is the whole-mesh renderer eligible for the GPU-driven path: a single
+    // static (non-skinned) renderer drawing ALL submeshes of one mesh. Bistro is exactly this.
+    bool IsGpuDrivenEligible(IStaticMeshRenderer target) =>
+        gpuDrivenReady && target.SubMeshIndex < 0 && !target.IsSkinned &&
+        target.SharedMesh is { SubMeshes.Length: > 1 };
+
+    // Builds the per-submesh metadata + material table for the whole-mesh renderer and uploads it
+    // to the GPU-driven buffers. Idempotent: heavy work is gated inside GpuDrivenRenderer by a
+    // move/material-change check. `wantTransparent` selects which submeshes the flags mark.
+    void BuildGpuDrivenMetadata(IStaticMeshRenderer target) {
+        Mesh mesh = target.SharedMesh;
+        SubMeshData[] subs = mesh.SubMeshes;
+        int n = subs.Length;
+        if (gdModels.Length < n) {
+            gdModels = new Matrix4[n];
+            gdLocalMin = new Vector3[n];
+            gdLocalMax = new Vector3[n];
+            gdFirstIndex = new uint[n];
+            gdIndexCount = new uint[n];
+            gdMaterialId = new uint[n];
+            gdFlags = new uint[n];
+        }
+
+        // Collect the distinct material set in a stable order for the bindless table.
+        gdMaterials.Clear();
+        gdMaterialIndex.Clear();
+        Matrix4 world = target.Transform.WorldMatrix;
+
+        for (var i = 0; i < n; i++) {
+            // Model matrix — IDENTICAL to ModelMatrix() for the whole-mesh renderer, which returns
+            // plain `world` for SubMeshIndex < 0 (the inverse-node transform applies ONLY to
+            // single-submesh renderers, whose entity carries the node pivot). Using inverse-node
+            // here would double-transform the geometry AND its AABB, mis-culling everything.
+            gdModels[i] = world;
+            mesh.GetSubMeshBounds(i, out Vector3 lMin, out Vector3 lMax);
+            gdLocalMin[i] = lMin;
+            gdLocalMax[i] = lMax;
+            gdFirstIndex[i] = (uint)subs[i].IndexStart;
+            gdIndexCount[i] = (uint)subs[i].IndexCount;
+
+            Material mat = target.MaterialFor(i);
+            uint flags = 0;
+            if (mat is null) {
+                gdIndexCount[i] = 0; // unassigned range: cull it out
+            }
+            else {
+                if (mat.Cutout) flags |= (uint)OpenGL.GpuDriven.SubmeshFlags.Cutout;
+                if (mat.Transparent) flags |= (uint)OpenGL.GpuDriven.SubmeshFlags.Transparent;
+                if (!gdMaterialIndex.TryGetValue(mat, out int idx)) {
+                    idx = gdMaterials.Count;
+                    gdMaterials.Add(mat);
+                    gdMaterialIndex[mat] = idx;
+                }
+                gdMaterialId[i] = (uint)idx;
+            }
+            gdFlags[i] = flags;
+        }
+
+        // Same global debug multipliers the CPU SetMaterialUniforms folds in.
+        gpuDriven.UpdateMaterialTable(gdMaterials, Metallic, RoughnessValue, NormalStrength);
+        gpuDriven.UpdateMetadata(n, world, gdModels, gdLocalMin, gdLocalMax,
+            gdFirstIndex, gdIndexCount, gdMaterialId, gdFlags);
+    }
+
+    // Per-frame GPU-driven state. The cull compute runs ONCE per frame (shared by prepass+opaque
+    // for z-prepass invariance); these track whether it ran and which shader/renderer it used.
+    bool gpuDrivenCulledThisFrame;
+    Shader gpuDrivenShader;          // the single material shader all eligible submeshes share
+    IStaticMeshRenderer gpuDrivenTarget;
+    readonly Vector4[] gpuCullPlanes = new Vector4[6];
+
+    // The shader shared by ALL opaque submeshes of the whole-mesh renderer, or null if they don't
+    // all share ONE StandardShader with a working GPU-driven companion (then we fall back to CPU).
+    Shader DominantGpuDrivenShader(IStaticMeshRenderer target) {
+        Mesh mesh = target.SharedMesh;
+        Shader shared = null;
+        for (var i = 0; i < mesh.SubMeshes.Length; i++) {
+            Material mat = target.MaterialFor(i);
+            if (mat is null || mat.Transparent)
+                continue;
+            if (shared is null)
+                shared = mat.Shader;
+            else if (!ReferenceEquals(shared, mat.Shader))
+                return null; // mixed shaders — CPU path handles this mesh
+        }
+        return shared;
+    }
+
+    // Draws the whole-mesh renderer's opaque submeshes via GPU-driven MDI. Called from BOTH the
+    // prepass loop (prepassDepth via RenderDepthPrepass) and the opaque loop. The cull runs once
+    // (first call of the frame); both passes consume the same command buffer so depth is bit-
+    // identical. Returns false to fall back to the CPU path for this renderer.
+    bool DrawWholeMeshGpuDriven(IStaticMeshRenderer target, ref Matrix4 view, ref Matrix4 projection,
+        Vector3 cameraPos, bool isDepthPrepass) {
+        Shader shader = DominantGpuDrivenShader(target);
+        if (shader is null)
+            return false;
+        (Shader Lit, Shader Prepass) companion = GpuDrivenShaderFor(shader);
+        if (companion.Lit is null)
+            return false;
+
+        Mesh mesh = target.SharedMesh;
+
+        // Build metadata once per frame (gated internally by movement). Both passes share it.
+        if (!gpuDrivenCulledThisFrame) {
+            BuildGpuDrivenMetadata(target);
+            gpuDrivenCulledThisFrame = true;
+            gpuDrivenShader = shader;
+            gpuDrivenTarget = target;
+        }
+
+        // Frustum planes from the SAME (jittered) view-projection the draw uses. The cull is
+        // deterministic (same planes -> same command set), so the prepass and opaque cull emit
+        // identical commands -> z-prepass invariance holds even re-culling per pass.
+        Matrix4 vp = view * projection;
+        ExtractFrustumPlanes(ref vp, gpuCullPlanes);
+
+        // Cull BOTH batches FIRST into their own buffers (no write-after-read hazard). The cull is
+        // deterministic so prepass/opaque emit identical sets. NOTE: cull binds the compute program,
+        // so the render program MUST be activated AFTER the culls, right before the draws.
+        gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchSolid, gpuCullPlanes, pass: 0, cutoutFilter: 0);
+        gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchCutout, gpuCullPlanes, pass: 0, cutoutFilter: 1);
+        if (Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN_DEBUG") == "1" && !isDepthPrepass)
+            Console.WriteLine($"[GpuDriven] solid={gpuDriven.DebugReadDrawCount(0)} cutout={gpuDriven.DebugReadDrawCount(1)}");
+
+        Shader program = isDepthPrepass ? companion.Prepass : companion.Lit;
+        program.Activate();
+        SetupProgramForPass(program, ref view, ref projection, cameraPos);
+        mesh.Activate();
+
+        // Draw SOLID (backface culling ON) then CUTOUT (culling OFF — single-sided foliage cards).
+        GL.Enable(EnableCap.CullFace);
+        gpuDriven.DrawIndirectCount(OpenGL.GpuDriven.GpuDrivenRenderer.BatchSolid);
+        GL.Disable(EnableCap.CullFace);
+        gpuDriven.DrawIndirectCount(OpenGL.GpuDriven.GpuDrivenRenderer.BatchCutout);
+        GL.Enable(EnableCap.CullFace); // restore for whatever the caller draws next
+
+        mesh.Deactivate();
+
+        // Count the two multi-draws in the stats (the real per-submesh count is GPU-side).
+        if (isDepthPrepass)
+            stats.DepthOnlyDrawCalls += 2;
+        else {
+            stats.DrawCalls += 2;
+            stats.InstancedDrawCalls += 2; // surfaced as batched draws in the overlay
+        }
+
+        if (Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN_DEBUG") == "1" && !isDepthPrepass)
+            Console.WriteLine($"[GpuDriven] {(isDepthPrepass ? "PREPASS" : "OPAQUE")} solid+cutout batches drawn.");
+        return true;
+    }
+
     // True z-prepass with the SAME jittered projection and the SAME per-material vertex math
     // as the main pass. Feeds SSAO before shading AND gives the main pass exact early-z: it
     // re-tests LEqual against this depth without writing, so every opaque pixel shades once.
@@ -1550,6 +1813,17 @@ void main() {
             Mesh mesh = target.SharedMesh;
             SubMeshData[] subMeshes = mesh.SubMeshes;
 
+            // GPU-driven prepass: same single multi-draw as the opaque pass, consuming the SAME
+            // command buffer (the cull runs here, first GPU-driven draw of the frame). The vertex
+            // stage is the GPU-driven companion (identical gl_Position), so prepass depth equals
+            // the opaque depth bit-for-bit (z-prepass invariance).
+            if (gpuDrivenReady && IsGpuDrivenEligible(target) &&
+                DrawWholeMeshGpuDriven(target, ref view, ref renderProjection, cameraPos, isDepthPrepass: true)) {
+                // Restore the prepass program for any subsequent CPU-path casters this loop draws.
+                activePrepass = null;
+                continue;
+            }
+
             // Instanced runs MUST go through the same instanced vertex path as the main pass,
             // or the depth-equality contract (invariant gl_Position) breaks for them.
             var run = InstancedRunLength(visibleOpaque, t);
@@ -1560,11 +1834,15 @@ void main() {
 
                 var runCutout = runMaterial.Cutout && runMaterial.Diffuse is not null;
                 runPrepass.SetBool("AlphaCutout", runCutout);
+                // Disable culling for cutout cards OR double-sided materials. MUST mirror the main
+                // opaque pass exactly, or the depth-equality contract breaks (checkerboard holes).
+                var runNoCull = runCutout || runMaterial.DoubleSided;
                 if (runCutout) {
                     GL.ActiveTexture(TextureUnit.Texture0);
                     GL.BindTexture(TextureTarget.Texture2D, runMaterial.Diffuse.UID);
-                    GL.Disable(EnableCap.CullFace);
                 }
+                if (runNoCull)
+                    GL.Disable(EnableCap.CullFace);
 
                 mesh.Activate();
                 Matrix4[] matrices = ArrayPool<Matrix4>.Shared.Rent(run);
@@ -1580,7 +1858,7 @@ void main() {
                 runPrepass.SetBool("isInstanced", false);
                 stats.DepthOnlyDrawCalls++;
 
-                if (runCutout)
+                if (runNoCull)
                     GL.Enable(EnableCap.CullFace);
                 mesh.Deactivate();
                 t += run - 1;
@@ -1614,17 +1892,20 @@ void main() {
 
                 var cutout = material.Cutout && material.Diffuse is not null;
                 prepass.SetBool("AlphaCutout", cutout);
+                // cutout cards OR double-sided materials skip culling; MUST mirror the main pass.
+                var noCull = cutout || material.DoubleSided;
                 if (cutout) {
                     GL.ActiveTexture(TextureUnit.Texture0);
                     GL.BindTexture(TextureTarget.Texture2D, material.Diffuse.UID);
-                    GL.Disable(EnableCap.CullFace); // cards are single-sided, same as the main pass
                 }
+                if (noCull)
+                    GL.Disable(EnableCap.CullFace);
 
                 GL.DrawElements(PrimitiveType.Triangles, subMeshes[i].IndexCount, DrawElementsType.UnsignedInt,
                     (IntPtr)(subMeshes[i].IndexStart * sizeof(uint)));
                 stats.DepthOnlyDrawCalls++;
 
-                if (cutout)
+                if (noCull)
                     GL.Enable(EnableCap.CullFace);
             }
 
@@ -2631,6 +2912,19 @@ void main() {
             Mesh mesh = target.SharedMesh;
             SubMeshData[] subMeshes = mesh.SubMeshes;
 
+            // GPU-driven path: the whole-mesh renderer (Bistro, ~1600 submeshes) draws its opaque
+            // submeshes in ONE glMultiDrawElementsIndirectCount after a compute frustum cull,
+            // instead of ~1600 CPU DrawElements. Transparent submeshes still take the CPU path
+            // below (back-to-front order matters there). Metadata + cull were prepared once before
+            // this loop in PrepareGpuDriven; here we bind the right program and draw.
+            // isDepthPrepass:false — RenderMeshes is ALWAYS the lit pass (prepassDepth here means
+            // "z-prepass already laid depth, use LEqual", NOT "this is the depth prepass").
+            if (!transparentPass && gpuDrivenReady && IsGpuDrivenEligible(target) &&
+                DrawWholeMeshGpuDriven(target, ref view, ref projection, cameraPos, isDepthPrepass: false)) {
+                anythingDrawnThisFrame = true;
+                continue;
+            }
+
             // Adjacent identical (mesh, submesh, material) renderers — the opaque sort makes
             // them consecutive — collapse into ONE instanced draw. Transparency keeps its
             // per-object back-to-front order, so runs apply to the opaque pass only.
@@ -2652,7 +2946,7 @@ void main() {
 
                     mesh.Activate();
                     DrawInstancedRun(targets, t, run, mesh, subMeshes[target.SubMeshIndex],
-                        runShader, runMaterial.Cutout);
+                        runShader, runMaterial.Cutout || runMaterial.DoubleSided);
                     mesh.Deactivate();
                     t += run - 1;
                     continue;
@@ -2694,11 +2988,14 @@ void main() {
                 }
                 shader.SetMatrix4("model", ref modelMatrix);
 
-                if (material.Cutout)
-                    GL.Disable(EnableCap.CullFace); // leaf cards have no back faces
+                // leaf cards have no back faces; double-sided materials (e.g. pbrt imports, whose
+                // winding is inverted) must show both. MUST match the z-prepass cull decision.
+                var noCull = material.Cutout || material.DoubleSided;
+                if (noCull)
+                    GL.Disable(EnableCap.CullFace);
                 GL.DrawElements(PrimitiveType.Triangles, subMeshes[i].IndexCount, DrawElementsType.UnsignedInt,
                     (IntPtr)(subMeshes[i].IndexStart * sizeof(uint)));
-                if (material.Cutout)
+                if (noCull)
                     GL.Enable(EnableCap.CullFace);
                 anythingDrawnThisFrame = true;
                 stats.DrawCalls++;
@@ -2768,7 +3065,7 @@ void main() {
     // buffer (attribs 4-7), the vertex shader's isInstanced path reads them back with the
     // exact uniform-path convention so prepass/main depth equality holds.
     void DrawInstancedRun(List<IStaticMeshRenderer> list, int start, int count, Mesh mesh,
-        SubMeshData subMesh, Shader shader, bool cutout) {
+        SubMeshData subMesh, Shader shader, bool noCull) {
         Matrix4[] matrices = ArrayPool<Matrix4>.Shared.Rent(count);
         for (var i = 0; i < count; i++)
             matrices[i] = ModelMatrix(list[start + i], mesh);
@@ -2776,11 +3073,11 @@ void main() {
         ArrayPool<Matrix4>.Shared.Return(matrices);
 
         shader.SetBool("isInstanced", true);
-        if (cutout)
+        if (noCull)
             GL.Disable(EnableCap.CullFace);
         GL.DrawElementsInstanced(PrimitiveType.Triangles, subMesh.IndexCount, DrawElementsType.UnsignedInt,
             (IntPtr)(subMesh.IndexStart * sizeof(uint)), count);
-        if (cutout)
+        if (noCull)
             GL.Enable(EnableCap.CullFace);
         shader.SetBool("isInstanced", false);
 
