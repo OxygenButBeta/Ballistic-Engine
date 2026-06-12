@@ -152,6 +152,10 @@ public static class AssimpMeshDecoder {
 
     // ---- Materials ---------------------------------------------------------
 
+    // Exposed for the skin decoder, which merges by material the same way but in bind space.
+    internal static DecodedMaterial DecodeMaterialPublic(Assimp.Scene scene, int materialIndex) =>
+        DecodeMaterial(scene, materialIndex);
+
     static DecodedMaterial DecodeMaterial(Assimp.Scene scene, int materialIndex) {
         if (materialIndex < 0 || materialIndex >= scene.MaterialCount)
             return null;
@@ -343,7 +347,11 @@ public static class AssimpMeshDecoder {
     // ---- Math helpers ------------------------------------------------------
 
     // Assimp matrices are column-vector (v' = M * v); OpenTK composes row-vector (v' = v * M).
-    // Transposing converts between the conventions.
+    // Transposing converts between the conventions. Internal so the skin decoder uses the SAME
+    // conversion for bone offset matrices and animation node transforms (mixing conventions
+    // explodes the skeleton).
+    internal static Matrix4 ToOpenTKMatrix(in Matrix4x4 m) => ToOpenTK(m);
+
     static Matrix4 ToOpenTK(in Matrix4x4 m) => new(
         m.A1, m.B1, m.C1, m.D1,
         m.A2, m.B2, m.C2, m.D2,

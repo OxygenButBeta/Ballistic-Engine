@@ -19,7 +19,8 @@ public sealed class ModelImporter : IAssetImporter {
     public string Name => "ModelImporter";
     // v3: vec4 tangents (handedness) + scalar PBR factors in .mat
     // v4: split-by-nodes submeshes + node hierarchy table (BMSH v5), default ON
-    public int Version => 4;
+    // v5: skinned-mesh import (bones/weights/skeleton in BMSH v6) + sibling .banim animation assets
+    public int Version => 5;
     public string ArtifactExtension => ".bmesh";
 
     // Generates a sibling "<Model>_Materials/" folder of .mat assets.
@@ -51,12 +52,92 @@ public sealed class ModelImporter : IAssetImporter {
             return;
         }
 
-        DecodedModel model = AssimpMeshDecoder.DecodeScene(context.SourceAbsolutePath, flipUVs, splitByNodes);
-
+        var importSkin = context.Settings?["importSkin"]?.GetValue<bool>() ?? true;
         var generateMaterials = context.Settings?["generateMaterials"]?.GetValue<bool>() ?? true;
+
+        // Skinned models take the bind-space decode path (vertices NOT baked by node transform —
+        // the bones place them) and emit sibling .banim animation assets. Falls through to the
+        // static path when the model has no bones, so non-skinned imports are byte-identical to v4.
+        if (importSkin && AssimpSkinDecoder.SceneHasSkin(context.SourceAbsolutePath, flipUVs)) {
+            ImportSkinned(context, flipUVs, generateMaterials);
+            return;
+        }
+
+        DecodedModel model = AssimpMeshDecoder.DecodeScene(context.SourceAbsolutePath, flipUVs, splitByNodes);
         MeshData data = generateMaterials ? GenerateMaterials(context, model) : model.Mesh;
+        MeshArtifact.Write(context.ArtifactAbsolutePath, in data);
+    }
+
+    // ---- Skinned import -----------------------------------------------------
+
+    void ImportSkinned(AssetImportContext context, bool flipUVs, bool generateMaterials) {
+        AssimpSkinDecoder.DecodedSkinnedModel model =
+            AssimpSkinDecoder.Decode(context.SourceAbsolutePath, flipUVs);
+
+        // Wrap the skinned mesh in a DecodedModel so the existing material generator applies
+        // unchanged (it only reads SubMeshes + SubMeshMaterials and rewrites MaterialRefs).
+        var wrapped = new DecodedModel { Mesh = model.Mesh, SubMeshMaterials = model.SubMeshMaterials };
+        MeshData data = generateMaterials ? GenerateMaterials(context, wrapped) : model.Mesh;
+
+        // GenerateMaterials rebuilds MeshData from the static ctor (dropping skin) — re-attach the
+        // skin/skeleton that decode produced so the artifact carries them.
+        if (data.Skeleton.BoneCount == 0 && model.Mesh.IsSkinned)
+            data = new MeshData(data.Vertices, data.Indices, data.UVs, data.Normals, data.Tangents,
+                data.SubMeshes, data.Nodes, model.Mesh.BoneIndices, model.Mesh.BoneWeights, model.Mesh.Skeleton);
 
         MeshArtifact.Write(context.ArtifactAbsolutePath, in data);
+
+        WriteAnimationAssets(context, model.Animations);
+    }
+
+    // Writes one sibling "<Model>_Animations/<clip>.banim" per source animation, GUID-stamped via a
+    // .meta (NativeAssetImporter-style — the .banim IS the artifact, read straight back). Rewritten
+    // on every reimport, like the generated materials folder.
+    void WriteAnimationAssets(AssetImportContext context, AnimationClipData[] animations) {
+        if (animations is null || animations.Length == 0)
+            return;
+        if (!TryGetProjectRoot(context, out var projectRoot)) {
+            Debugging.LogWarning($"'{context.AssetPath}': cannot determine project root; animations skipped.");
+            return;
+        }
+
+        var modelDirAbsolute = Path.GetDirectoryName(context.SourceAbsolutePath)!;
+        var modelStem = Path.GetFileNameWithoutExtension(context.AssetPath);
+        var animationsDirAbsolute = Path.Combine(modelDirAbsolute, $"{modelStem}_Animations");
+
+        try {
+            Directory.CreateDirectory(animationsDirAbsolute);
+        }
+        catch (Exception exception) {
+            Debugging.LogWarning($"'{context.AssetPath}': cannot create animations folder: {exception.Message}");
+            return;
+        }
+
+        var usedNames = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (AnimationClipData clip in animations) {
+            var baseName = SanitizeFileName(clip.Name);
+            var fileName = baseName;
+            if (usedNames.TryGetValue(baseName, out int count)) {
+                fileName = $"{baseName}_{count + 1}";
+                usedNames[baseName] = count + 1;
+            }
+            else {
+                usedNames[baseName] = 1;
+            }
+
+            try {
+                var clipAbsolute = Path.Combine(animationsDirAbsolute, fileName + ".banim");
+                AnimationArtifact.Write(clipAbsolute, in clip);
+
+                // The .banim is read directly as its own artifact; ensure a stable GUID meta.
+                var metaPath = MetaFile.PathFor(clipAbsolute);
+                if (!File.Exists(metaPath))
+                    new MetaFile { Guid = Guid.NewGuid(), Importer = "AnimationImporter" }.Save(metaPath);
+            }
+            catch (Exception exception) {
+                Debugging.LogWarning($"'{context.AssetPath}': failed to write animation '{clip.Name}': {exception.Message}");
+            }
+        }
     }
 
     // ---- Material generation ------------------------------------------------

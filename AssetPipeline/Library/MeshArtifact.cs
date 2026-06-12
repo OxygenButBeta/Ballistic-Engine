@@ -10,15 +10,19 @@ namespace BallisticEngine.AssetPipeline;
 //   submeshes: { i32 indexStart | i32 indexCount | string name | string materialRef
 //                | nodeTransform (Matrix4, v4+) | i32 nodeIndex (v5+) } x submeshCount
 //   nodes (v5+): i32 nodeCount | { string name | i32 parentIndex | localTransform (Matrix4) }
+//   skin (v6+): u8 hasSkin; if 1:
+//       boneIndices[v] (Vector4i) | boneWeights[v] (Vector4)
+//       i32 boneCount | { string name | i32 parentIndex | inverseBind (Matrix4) | bindLocal (Matrix4) } x boneCount
 //   (strings are BinaryWriter length-prefixed; "" means none)
 // Version 1 had a reserved u32 instead of submeshCount and no submesh table; it reads back
 // as a single submesh spanning the whole index buffer. Versions 1-2 stored vec3 tangents;
 // they read back with handedness +1. Versions 1-3 had no per-submesh node transform; they
 // read back with identity (vertices are model-space baked, so rendering is unaffected).
 // Version 4 had no node hierarchy table; it reads back empty (nodeIndex -1).
+// Version 5 had no skin block; it reads back un-skinned (hasSkin implicitly 0).
 public static class MeshArtifact {
     const uint Magic = 0x48534D42; // "BMSH"
-    const uint FormatVersion = 5;
+    const uint FormatVersion = 6;
 
     public static void Write(string path, in MeshData data) {
         using FileStream stream = File.Create(path);
@@ -51,6 +55,25 @@ public static class MeshArtifact {
             writer.Write(node.Name ?? "");
             writer.Write(node.ParentIndex);
             WriteMatrix(writer, node.LocalTransform);
+        }
+
+        // Skin block (v6). A static mesh writes a single 0 byte.
+        if (data.IsSkinned) {
+            writer.Write((byte)1);
+            writer.Write(MemoryMarshal.AsBytes<Vector4i>(data.BoneIndices));
+            writer.Write(MemoryMarshal.AsBytes<Vector4>(data.BoneWeights));
+
+            SkeletonData skeleton = data.Skeleton;
+            writer.Write(skeleton.BoneCount);
+            for (var i = 0; i < skeleton.BoneCount; i++) {
+                writer.Write(skeleton.BoneNames[i] ?? "");
+                writer.Write(skeleton.ParentIndices[i]);
+                WriteMatrix(writer, skeleton.InverseBindPose[i]);
+                WriteMatrix(writer, skeleton.BindPoseLocal[i]);
+            }
+        }
+        else {
+            writer.Write((byte)0);
         }
     }
 
@@ -126,6 +149,28 @@ public static class MeshArtifact {
                 var parentIndex = reader.ReadInt32();
                 nodes[i] = new MeshNodeData(name.Length > 0 ? name : null, parentIndex, ReadMatrix(reader));
             }
+        }
+
+        // Skin block (v6+). Older artifacts have no byte here and read back un-skinned.
+        if (version >= 6 && reader.ReadByte() == 1) {
+            Vector4i[] boneIndices = ReadArray<Vector4i>(reader, vertexCount);
+            Vector4[] boneWeights = ReadArray<Vector4>(reader, vertexCount);
+
+            var boneCount = reader.ReadInt32();
+            var names = new string[boneCount];
+            var parents = new int[boneCount];
+            var inverseBind = new Matrix4[boneCount];
+            var bindLocal = new Matrix4[boneCount];
+            for (var i = 0; i < boneCount; i++) {
+                var name = reader.ReadString();
+                names[i] = name.Length > 0 ? name : null;
+                parents[i] = reader.ReadInt32();
+                inverseBind[i] = ReadMatrix(reader);
+                bindLocal[i] = ReadMatrix(reader);
+            }
+            var skeleton = new SkeletonData(names, parents, inverseBind, bindLocal);
+            return new MeshData(vertices, indices, uvs, normals, tangents, subMeshes, nodes,
+                boneIndices, boneWeights, skeleton);
         }
 
         // subMeshCount == 0 (v1 artifacts): MeshData substitutes a single full-range submesh.
