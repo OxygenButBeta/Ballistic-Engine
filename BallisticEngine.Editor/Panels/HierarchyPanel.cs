@@ -514,6 +514,57 @@ internal sealed class HierarchyPanel {
         }
         if (ImGui.MenuItem($"{EditorIcons.Camera} Camera"))
             CreateWithComponent<HDCamera>(scene, "Camera");
+
+        // Audio quick-create (a listener + a source are the common pair).
+        if (ImGui.BeginMenu($"{EditorIcons.Cloud} Audio")) {
+            if (ImGui.MenuItem("Audio Source")) CreateWithComponentNamed(scene, "Audio Source", "AudioSource");
+            if (ImGui.MenuItem("Audio Listener")) CreateWithComponentNamed(scene, "Audio Listener", "AudioListener");
+            ImGui.EndMenu();
+        }
+
+        ImGui.Separator();
+        // Every registered component, grouped by its [Component] Menu category — so an entity with ANY
+        // component (Particle System, Trail/Line Renderer, Spawner, Health, Animator, ...) is one click
+        // away, and new components appear here automatically with no per-item wiring.
+        if (ImGui.BeginMenu($"{EditorIcons.Add} Component")) {
+            DrawComponentCreateMenu(scene);
+            ImGui.EndMenu();
+        }
+    }
+
+    // Builds the "Create > Component" tree from ComponentRegistry.Menu, nesting each entry under its
+    // Menu category ("Effects", "Gameplay", "Physics", ...). Selecting one makes an entity carrying
+    // just that component.
+    void DrawComponentCreateMenu(Scene scene) {
+        // Group by the top-level menu segment (before any '/'); flat entries go to "General".
+        var groups = ComponentRegistry.Menu
+            .GroupBy(e => string.IsNullOrEmpty(e.Menu) ? "General" : e.Menu.Split('/')[0])
+            .OrderBy(g => g.Key, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var group in groups) {
+            if (ImGui.BeginMenu(group.Key)) {
+                foreach (ComponentEntry entry in group.OrderBy(e => e.DisplayName, StringComparer.OrdinalIgnoreCase)) {
+                    if (ImGui.MenuItem(entry.DisplayName)) {
+                        EditorUndo.Push($"Create {entry.DisplayName}");
+                        Entity e = scene.CreateEntity(entry.DisplayName);
+                        e.AddComponent(entry.Type);
+                        state.Select(e);
+                    }
+                }
+                ImGui.EndMenu();
+            }
+        }
+    }
+
+    // Create an entity with a component resolved by its registry NAME (for components not referenced by
+    // type in this assembly's quick-create entries).
+    void CreateWithComponentNamed(Scene scene, string name, string registryName) {
+        Type type = ComponentRegistry.Resolve(registryName);
+        if (type is null) return;
+        EditorUndo.Push($"Create {name}");
+        Entity entity = scene.CreateEntity(name);
+        entity.AddComponent(type);
+        state.Select(entity);
     }
 
     void CreateWithComponent<T>(Scene scene, string name) where T : Behaviour {
