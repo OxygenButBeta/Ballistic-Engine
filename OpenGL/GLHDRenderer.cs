@@ -624,7 +624,7 @@ void main() {
 
         // Trails: camera-facing ribbons, same HDR-buffer slot as particles (TAA + bloom), same
         // jittered projection + GL-state-restore contract.
-        if (RuntimeSet<TrailRenderer>.ReadOnlyCollection.Count > 0) {
+        if (RuntimeSet<IRibbonSource>.ReadOnlyCollection.Count > 0) {
             using var trailZone = timers.Time("Trails");
             trailPass.Render(ref view, ref renderProjection, cameraPos);
         }

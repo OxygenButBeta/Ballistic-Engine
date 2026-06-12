@@ -18,7 +18,7 @@ public struct TrailPoint {
 // Driven from the renderer (TrailRenderer.AdvanceAll), like ParticleSystem — so it also previews in
 // the editor and steps exactly once per frame.
 [Component("Trail Renderer", "Effects")]
-public class TrailRenderer : Behaviour {
+public class TrailRenderer : Behaviour, IRibbonSource {
     [Tooltip("Seconds a trail point survives before it fades out of the tail.")]
     [Range(0.05f, 30f)]
     public float Time { get; set; } = 1f;
@@ -51,7 +51,7 @@ public class TrailRenderer : Behaviour {
     public float EndAlpha { get; set; }
 
     [Tooltip("How the ribbon composites. Additive = energy/light streaks; Alpha = smoke/dust wakes.")]
-    public ParticleBlendMode BlendMode { get; set; } = ParticleBlendMode.Additive;
+    public RibbonBlendMode BlendMode { get; set; } = RibbonBlendMode.Additive;
 
     [Tooltip("Optional ribbon texture, stretched head->tail along the strip. Unassigned = flat color.")]
     public Texture2D Texture { get; set; }
@@ -72,15 +72,23 @@ public class TrailRenderer : Behaviour {
 
     protected internal override void OnAttach() {
         if (!RuntimeSet<TrailRenderer>.Contains(this))
-            RuntimeSet<TrailRenderer>.Add(this);
+            RuntimeSet<TrailRenderer>.Add(this);   // AdvanceAll iterates trails specifically
+        if (!RuntimeSet<IRibbonSource>.Contains(this))
+            RuntimeSet<IRibbonSource>.Add(this);   // the GL ribbon pass iterates all ribbon sources
     }
 
     protected internal override void OnDetach() {
         RuntimeSet<TrailRenderer>.Remove(this);
+        RuntimeSet<IRibbonSource>.Remove(this);
     }
 
     // A trail is renderable once it has at least a segment (2 points).
     public bool IsRenderable => points.Count >= 2;
+
+    // IRibbonSource: the GL ribbon pass reads these.
+    bool IRibbonSource.RibbonRenderable => points.Count >= 2;
+    RibbonBlendMode IRibbonSource.BlendMode => BlendMode;
+    Texture2D IRibbonSource.RibbonTexture => Texture;
 
     // ---- Per-frame advance --------------------------------------------------
 
@@ -139,60 +147,21 @@ public class TrailRenderer : Behaviour {
     // the pass from the normalized tail position; this just hands over positions + ages.
     public IReadOnlyList<TrailPoint> Points => points;
 
-    // One ribbon vertex the GL pass streams: world position, uv (U = head->tail, V = 0/1 edge), RGBA.
-    public struct RibbonVertex {
-        public Vector3 Position;
-        public Vector2 Uv;
-        public Vector4 Color;
-    }
-
     RibbonVertex[] ribbonScratch;
+    readonly List<Vector3> positionScratch = new(64);
 
-    // Builds a camera-facing ribbon from the point history into `vertices` as a TRIANGLE STRIP (two
-    // verts per point: left + right edge). Returns the vertex count (0 if < 2 points). Each point's
-    // side offset is perpendicular to BOTH the local segment direction and the view direction, so the
-    // strip always faces the camera; width and color lerp head(0)->tail(1) by normalized index.
+    // Builds a camera-facing ribbon from the point history (newest = head). Delegates the strip math
+    // to the shared RibbonBuilder; we only flatten our points to positions + pass our width/color.
     public int BuildRibbon(Vector3 cameraPos, out RibbonVertex[] vertices) {
-        int n = points.Count;
-        int vcount = n * 2;
-        if (ribbonScratch is null || ribbonScratch.Length < vcount)
-            ribbonScratch = new RibbonVertex[Math.Max(vcount, 8)];
+        positionScratch.Clear();
+        for (var i = 0; i < points.Count; i++)
+            positionScratch.Add(points[i].Position);
 
-        if (n < 2) {
-            vertices = ribbonScratch;
-            return 0;
-        }
-
-        for (var i = 0; i < n; i++) {
-            Vector3 pos = points[i].Position;
-
-            // Segment direction at this point (toward the neighbour), for the perpendicular.
-            Vector3 dir;
-            if (i == 0) dir = points[0].Position - points[1].Position;
-            else if (i == n - 1) dir = points[n - 2].Position - points[n - 1].Position;
-            else dir = points[i - 1].Position - points[i + 1].Position;
-            if (dir.LengthSquared < 1e-10f) dir = Vector3.UnitX;
-            dir = dir.Normalized();
-
-            Vector3 toCam = cameraPos - pos;
-            Vector3 side = Vector3.Cross(dir, toCam);
-            side = side.LengthSquared > 1e-10f ? side.Normalized() : Vector3.UnitY;
-
-            float t = n > 1 ? i / (float)(n - 1) : 0f;   // 0 = head, 1 = tail
-            float halfWidth = MathHelper.Lerp(StartWidth, EndWidth, t) * 0.5f;
-            Vector3 rgb = Vector3.Lerp(StartColor, EndColor, t);
-            float alpha = MathHelper.Lerp(StartAlpha, EndAlpha, t);
-            var color = new Vector4(rgb, alpha);
-
-            ribbonScratch[i * 2 + 0] = new RibbonVertex {
-                Position = pos + side * halfWidth, Uv = new Vector2(t, 0f), Color = color,
-            };
-            ribbonScratch[i * 2 + 1] = new RibbonVertex {
-                Position = pos - side * halfWidth, Uv = new Vector2(t, 1f), Color = color,
-            };
-        }
-
+        int count = RibbonBuilder.Build(positionScratch, positionScratch.Count, cameraPos,
+            StartWidth, EndWidth,
+            new Vector4(StartColor, StartAlpha), new Vector4(EndColor, EndAlpha),
+            ref ribbonScratch);
         vertices = ribbonScratch;
-        return vcount;
+        return count;
     }
 }

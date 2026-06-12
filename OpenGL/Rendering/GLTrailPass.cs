@@ -41,8 +41,8 @@ public sealed class GLTrailPass {
     }
 
     public void Render(ref Matrix4 view, ref Matrix4 projection, Vector3 cameraPos) {
-        var trails = RuntimeSet<TrailRenderer>.ReadOnlyCollection;
-        if (trails.Count == 0)
+        var sources = RuntimeSet<IRibbonSource>.ReadOnlyCollection;
+        if (sources.Count == 0)
             return;
 
         EnsureResources();
@@ -60,23 +60,23 @@ public sealed class GLTrailPass {
 
         GL.BindVertexArray(vao);
 
-        foreach (TrailRenderer trail in trails) {
-            if (!trail.IsActive || !trail.IsRenderable)
+        foreach (IRibbonSource ribbon in sources) {
+            if (!ribbon.IsActive || !ribbon.RibbonRenderable)
                 continue;
-            int count = trail.BuildRibbon(cameraPos, out TrailRenderer.RibbonVertex[] verts);
+            int count = ribbon.BuildRibbon(cameraPos, out RibbonVertex[] verts);
             if (count < 4)   // need at least 2 segments' worth for a visible strip
                 continue;
 
-            if (trail.BlendMode == ParticleBlendMode.Additive)
+            if (ribbon.BlendMode == RibbonBlendMode.Additive)
                 GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.One);
             else
                 GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
 
-            bool hasTex = trail.Texture is { } tex && tex.UID != 0;
+            bool hasTex = ribbon.RibbonTexture is { } tex && tex.UID != 0;
             shader.SetBool("HasTexture", hasTex);
             if (hasTex) {
                 GL.ActiveTexture(TextureUnit.Texture0);
-                GL.BindTexture(TextureTarget.Texture2D, trail.Texture.UID);
+                GL.BindTexture(TextureTarget.Texture2D, ribbon.RibbonTexture.UID);
             }
 
             Upload(verts, count);
@@ -95,12 +95,12 @@ public sealed class GLTrailPass {
     }
 
     float[] uploadScratch;
-    void Upload(TrailRenderer.RibbonVertex[] verts, int count) {
+    void Upload(RibbonVertex[] verts, int count) {
         int floats = count * 9;
         if (uploadScratch is null || uploadScratch.Length < floats)
             uploadScratch = new float[floats];
         for (var i = 0; i < count; i++) {
-            ref TrailRenderer.RibbonVertex v = ref verts[i];
+            ref RibbonVertex v = ref verts[i];
             int o = i * 9;
             uploadScratch[o + 0] = v.Position.X;
             uploadScratch[o + 1] = v.Position.Y;
