@@ -28,11 +28,12 @@ internal sealed class EditorApplication {
 
     readonly HierarchyPanel hierarchy;
     readonly InspectorPanel inspector;
-    // A SECOND inspector window (Window > Inspector (2)). Same panel, its own lock — pin one object
-    // here and keep inspecting others in the main inspector (Unity's "open a second Inspector").
-    readonly InspectorPanel inspector2;
-    bool showInspector2;
     readonly AssetBrowserPanel assets;
+
+    // EXTRA panel instances beyond the primary docked ones: the user can open as many Inspector /
+    // Entities / Assets / Console / Scene-component tabs as they want (Add Tab menu). The primary
+    // panels above stay as fields (lots of code references them); the host owns the duplicates.
+    readonly DockPanelHost extraPanels = new();
     readonly ConsolePanel console = new();
     readonly StatsPanel stats = new();
     readonly SettingsPanel settings;
@@ -109,10 +110,24 @@ internal sealed class EditorApplication {
         editorInput = new EditorInput(window);
         hierarchy = new HierarchyPanel(editorState);
         inspector = new InspectorPanel(editorState);
-        inspector2 = new InspectorPanel(editorState);
         assets = new AssetBrowserPanel(editorState, () => imgui.Scale);
         assets.RequestScriptRebuild = RebuildScripts;
         hierarchy.CurrentAssetFolder = () => assets.CurrentFolder;
+
+        // Register the duplicable panel kinds. The factory makes a FRESH instance (own lock/folder
+        // state); the draw delegate routes to its content method. The primary docked panels (the
+        // fields above) are id-0; the Add Tab menu opens extras through the host.
+        extraPanels.Register(EditorLayout.Inspector, "Inspector", EditorIcons.Wrench,
+            () => new InspectorPanel(editorState), p => ((InspectorPanel)p).DrawContents());
+        extraPanels.Register(EditorLayout.Entities, "Entities", EditorIcons.Package,
+            () => new HierarchyPanel(editorState), p => ((HierarchyPanel)p).DrawEntitiesContents());
+        extraPanels.Register(EditorLayout.SceneComponents, "Scene Components", EditorIcons.World,
+            () => new HierarchyPanel(editorState), p => ((HierarchyPanel)p).DrawSceneContents());
+        extraPanels.Register(EditorLayout.Assets, "Assets", EditorIcons.Folder,
+            () => new AssetBrowserPanel(editorState, () => imgui.Scale), p => ((AssetBrowserPanel)p).DrawContents());
+        extraPanels.Register(EditorLayout.Console, "Console", EditorIcons.Document,
+            () => new ConsolePanel(), p => ((ConsolePanel)p).DrawContents());
+        extraPanels.OnTitleStrip = MaximizePanelOnTitleDoubleClick;
         settings = new SettingsPanel(imgui.SetAccent, ApplyFrameRateLimit);
         buildPanel = new BuildPanel(bootstrap.Project);
 
@@ -607,12 +622,8 @@ internal sealed class EditorApplication {
         }
         if (showInspector) ImGui.End();
 
-        // Optional second inspector (its own lock state). Hidden until opened from the Window menu.
-        if (showInspector2 && ImGui.Begin($"Inspector (2)###Inspector2", ref showInspector2)) {
-            MaximizePanelOnTitleDoubleClick("Inspector (2)###Inspector2");
-            inspector2.DrawContents();
-        }
-        if (showInspector2) ImGui.End();
+        // Extra (duplicated) panel instances opened from the Add Tab menu.
+        extraPanels.DrawAll();
 
         if (showBottom && ImGui.Begin(EditorLayout.Assets, ref showBottom)) {
             MaximizePanelOnTitleDoubleClick(EditorLayout.Assets);
@@ -690,9 +701,19 @@ internal sealed class EditorApplication {
             ImGui.MenuItem("Entities", (string)null, ref showHierarchy);
             ImGui.MenuItem("Scene Components", (string)null, ref showSceneComponents);
             ImGui.MenuItem("Inspector", (string)null, ref showInspector);
-            ImGui.MenuItem("Inspector (2)", (string)null, ref showInspector2);
             ImGui.MenuItem("Assets", (string)null, ref showBottom);
             ImGui.MenuItem("Console", (string)null, ref showConsole);
+
+            // Open ANOTHER instance of a panel (unlimited) — same as the tab's Add Tab menu.
+            if (ImGui.BeginMenu($"{EditorIcons.Add}  Add Panel")) {
+                AddTabItem(EditorLayout.Inspector, "Inspector", ref showInspector);
+                AddTabItem(EditorLayout.Entities, "Entities", ref showHierarchy);
+                AddTabItem(EditorLayout.SceneComponents, "Scene Components", ref showSceneComponents);
+                AddTabItem(EditorLayout.Assets, "Assets", ref showBottom);
+                AddTabItem(EditorLayout.Console, "Console", ref showConsole);
+                ImGui.EndMenu();
+            }
+            ImGui.Separator();
             ImGui.MenuItem("Statistics", (string)null, ref showStats);
             ImGui.MenuItem("Profiler", (string)null, ref profilerPanel.Open);
             ImGui.MenuItem("Build", (string)null, ref buildPanel.Open);
@@ -1223,13 +1244,14 @@ internal sealed class EditorApplication {
         if (onStrip && ImGui.IsMouseClicked(ImGuiMouseButton.Right))
             ImGui.OpenPopup($"##tabctx_{panelName}");
         if (ImGui.BeginPopup($"##tabctx_{panelName}")) {
+            // Add Tab → click a kind to open ANOTHER instance of it (unlimited). Each entry shows how
+            // many are open. Singleton views (Scene/Game) aren't here — they're one-per-renderer-target.
             if (ImGui.BeginMenu($"{EditorIcons.Add}  Add Tab")) {
-                AddTabItem("Inspector", ref showInspector);
-                AddTabItem("Inspector (2)", ref showInspector2);
-                AddTabItem("Entities", ref showHierarchy);
-                AddTabItem("Scene Components", ref showSceneComponents);
-                AddTabItem("Assets", ref showBottom);
-                AddTabItem("Console", ref showConsole);
+                AddTabItem(EditorLayout.Inspector, "Inspector", ref showInspector);
+                AddTabItem(EditorLayout.Entities, "Entities", ref showHierarchy);
+                AddTabItem(EditorLayout.SceneComponents, "Scene Components", ref showSceneComponents);
+                AddTabItem(EditorLayout.Assets, "Assets", ref showBottom);
+                AddTabItem(EditorLayout.Console, "Console", ref showConsole);
                 ImGui.EndMenu();
             }
             ImGui.Separator();
@@ -1239,12 +1261,15 @@ internal sealed class EditorApplication {
         }
     }
 
-    // One "Add Tab" entry: opens the panel (sets its show flag) and focuses it; ticked + disabled when
-    // it's already open so the menu reads as a state list.
-    static void AddTabItem(string label, ref bool show) {
-        bool open = show;
-        if (ImGui.MenuItem(label, (string)null, open, !open))
-            show = true;
+    // One "Add Tab" entry: opens ANOTHER instance of the kind. If the primary (id-0) panel is closed,
+    // re-show it first; otherwise spawn an extra instance through the host. The count is shown as a hint.
+    void AddTabItem(string kindKey, string label, ref bool primaryShown) {
+        int total = (primaryShown ? 1 : 0) + extraPanels.CountOf(kindKey);
+        string hint = total > 0 ? $"{total} open" : null;
+        if (ImGui.MenuItem(label, hint)) {
+            if (!primaryShown) primaryShown = true;     // bring the main one back first
+            else extraPanels.Open(kindKey);             // already showing → add another
+        }
     }
 
     // Draws one panel filling the whole work area while maximized (anything except the viewports,
@@ -1259,7 +1284,6 @@ internal sealed class EditorApplication {
             if (name == EditorLayout.Entities) hierarchy.DrawEntitiesContents();
             else if (name == EditorLayout.SceneComponents) hierarchy.DrawSceneContents();
             else if (name == EditorLayout.Inspector) inspector.DrawContents();
-            else if (name == "Inspector (2)###Inspector2") inspector2.DrawContents();
             else if (name == EditorLayout.Assets) assets.DrawContents();
             else if (name == EditorLayout.Console) console.DrawContents();
             else {
