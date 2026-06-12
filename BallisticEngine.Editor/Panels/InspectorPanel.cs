@@ -368,7 +368,14 @@ internal sealed class InspectorPanel {
 
         bool enabled = behaviour.IsEnabled;
         bool open = ComponentHeader(Prettify(type.Name), type, ref enabled, out bool menuRequested);
-        if (enabled != behaviour.IsEnabled) { EditorUndo.Push($"Toggle {Prettify(type.Name)}"); behaviour.IsEnabled = enabled; state.MarkViewportDirty(); }
+        if (enabled != behaviour.IsEnabled) {
+            EditorUndo.Push($"Toggle {Prettify(type.Name)}");
+            behaviour.IsEnabled = enabled;
+            // Multi-selection: toggle the matching component on every selected entity too.
+            foreach (Behaviour sibling in MatchingComponents(behaviour))
+                sibling.IsEnabled = enabled;
+            state.MarkViewportDirty();
+        }
 
         if (menuRequested)
             ImGui.OpenPopup("##componentctx");
@@ -395,6 +402,9 @@ internal sealed class InspectorPanel {
 
         if (removeClicked) {
             EditorUndo.Push("Remove Component");
+            // Multi-selection: remove the matching component from every selected entity too.
+            foreach (Behaviour sibling in MatchingComponents(behaviour))
+                sibling.Entity.RemoveComponent(sibling);
             entity.RemoveComponent(behaviour);
             state.MarkViewportDirty();
             ImGui.PopID();
@@ -2322,6 +2332,23 @@ internal sealed class InspectorPanel {
             if (b.GetType() == type)
                 return true;
         return false;
+    }
+
+    // The same-type component on every OTHER selected entity (for batch enable/disable/remove). Empty
+    // for a single selection. First matching component per entity; skips the active behaviour's entity.
+    List<Behaviour> MatchingComponents(Behaviour active) {
+        var list = new List<Behaviour>();
+        if (state.SelectedEntities.Count <= 1)
+            return list;
+        Type type = active.GetType();
+        Entity activeEntity = active.Entity;
+        foreach (Entity e in state.SelectedEntities) {
+            if (e is null || e.IsDestroyed || ReferenceEquals(e, activeEntity))
+                continue;
+            foreach (Behaviour b in e.Behaviours)
+                if (b.GetType() == type) { list.Add(b); break; }
+        }
+        return list;
     }
 
     // "RotationEuler" -> "Rotation Euler", "lightIntensity" -> "Light Intensity"
