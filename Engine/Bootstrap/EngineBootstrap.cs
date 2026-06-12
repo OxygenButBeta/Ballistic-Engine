@@ -245,6 +245,7 @@ public sealed class EngineBootstrap {
     public void UpdateFrame(double delta) {
         Runtime.EngineTimer.Update(delta);
         SceneManager.Update((float)delta);
+        ParticleSystem.AdvanceAll((float)delta);   // once per frame, edit + play (editor preview)
         Audio.Update();
     }
 

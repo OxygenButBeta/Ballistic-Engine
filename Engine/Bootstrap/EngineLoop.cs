@@ -33,6 +33,10 @@ public sealed class EngineLoop {
         runtime.EngineTimer.Update(delta);
         SceneManager.Update((float)delta);
 
+        // Step particle systems once per frame (after Update so emitter transforms are current).
+        // Driven here, not from a Behaviour Tick, so it advances exactly once regardless of render count.
+        ParticleSystem.AdvanceAll((float)delta);
+
         // Push the listener pose set by AudioListener.Tick this frame and recycle finished voices.
         // After SceneManager.Update so the listener/emitter transforms are current.
         Audio.Update();
