@@ -12,6 +12,7 @@ namespace BallisticEngine.Cli;
 internal static class Program {
     static readonly IReadOnlyDictionary<string, ICommand> Commands = new ICommand[] {
         new SchemaCommand(),
+        new ValidateCommand(),
     }.ToDictionary(c => c.Name, StringComparer.Ordinal);
 
     static int Main(string[] args) {
