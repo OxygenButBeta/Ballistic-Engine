@@ -15,6 +15,8 @@ internal static class Program {
         new ValidateCommand(),
         new DescribeCommand(),
         new SceneCommand(),
+        new ImportCommand(),
+        new AssetsCommand(),
     }.ToDictionary(c => c.Name, StringComparer.Ordinal);
 
     static int Main(string[] args) {

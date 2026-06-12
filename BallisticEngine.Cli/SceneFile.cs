@@ -150,6 +150,13 @@ internal static class SceneFile {
         return null;
     }
 
+    // Project root from a CLI argument that may be the root itself or any path inside it.
+    public static string ResolveProjectRoot(string pathArg) =>
+        Directory.Exists(pathArg) && File.Exists(Path.Combine(pathArg, "project.json"))
+            ? Path.GetFullPath(pathArg)
+            : FindProjectRoot(pathArg)
+              ?? throw new Exception($"no project.json found at or above '{pathArg}'");
+
     // ---- entity addressing --------------------------------------------------
 
     // Resolves an entity by exact id, unique id prefix (>= 6 hex chars), exact name, or unique
