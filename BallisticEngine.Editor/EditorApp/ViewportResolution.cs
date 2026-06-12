@@ -19,18 +19,32 @@ internal sealed class ViewportResolution {
         ("3840 x 2160", 3840, 2160),
     ];
 
-    public static readonly string[] PresetLabels = System.Array.ConvertAll(Presets, p => p.label);
+    // The combo lists every preset plus a trailing "Custom..." entry; selecting it renders at
+    // CustomW x CustomH (editable in the bar). CustomIndex is one past the last preset.
+    public static readonly string[] PresetLabels =
+        [.. System.Array.ConvertAll(Presets, p => p.label), "Custom..."];
+    public static int CustomIndex => Presets.Length;
 
-    public int PresetIndex;          // index into Presets
+    public int PresetIndex;          // index into PresetLabels (Presets.Length == Custom)
     public float Zoom = 1f;          // 1 .. 8  image magnification (zoom INTO the rendered picture)
+    public int CustomW = 1280, CustomH = 720;
 
-    public bool IsFree => Presets[PresetIndex].w == 0;
+    public bool IsCustom => PresetIndex == CustomIndex;
+    public bool IsFree => !IsCustom && Presets[PresetIndex].w == 0;
+
+    // The fixed resolution for the current selection (custom or preset). Only valid when !IsFree.
+    (int w, int h) Fixed => IsCustom
+        ? (System.Math.Max(1, CustomW), System.Math.Max(1, CustomH))
+        : (Presets[PresetIndex].w, Presets[PresetIndex].h);
 
     // The pixel resolution to render at, given the available panel size. Zoom does NOT change this —
     // it magnifies the displayed image (samples a smaller centered region), exactly like zooming into
     // a photo: the render stays the same, you just look closer at part of it.
-    public SysVec2 RenderSize(SysVec2 panel) =>
-        IsFree ? panel : new SysVec2(Presets[PresetIndex].w, Presets[PresetIndex].h);
+    public SysVec2 RenderSize(SysVec2 panel) {
+        if (IsFree) return panel;
+        (int w, int h) = Fixed;
+        return new SysVec2(w, h);
+    }
 
     // UV rectangle (uv0, uv1) for the displayed image, accounting for zoom. At zoom 1 it's the full
     // [0,1] (V flipped, since the GL texture is bottom-up). Higher zoom samples a centered sub-region
@@ -49,7 +63,8 @@ internal sealed class ViewportResolution {
         if (IsFree)
             return (panel, SysVec2.Zero);
 
-        float targetAspect = (float)Presets[PresetIndex].w / Presets[PresetIndex].h;
+        (int fw, int fh) = Fixed;
+        float targetAspect = (float)fw / fh;
         float panelAspect = panel.X / panel.Y;
 
         SysVec2 size = panelAspect > targetAspect

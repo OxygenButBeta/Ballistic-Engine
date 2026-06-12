@@ -1006,6 +1006,20 @@ internal sealed class EditorApplication {
         ImGui.Combo($"##res{id}", ref res.PresetIndex,
             ViewportResolution.PresetLabels, ViewportResolution.PresetLabels.Length);
 
+        // Custom resolution: two editable int fields shown only when "Custom..." is selected.
+        if (res.IsCustom) {
+            ImGui.SameLine(0, 6 * S);
+            ImGui.SetNextItemWidth(60 * S);
+            ImGui.InputInt($"##cw{id}", ref res.CustomW, 0, 0);
+            ImGui.SameLine(0, 2);
+            ImGui.TextDisabled("x");
+            ImGui.SameLine(0, 2);
+            ImGui.SetNextItemWidth(60 * S);
+            ImGui.InputInt($"##ch{id}", ref res.CustomH, 0, 0);
+            res.CustomW = Math.Clamp(res.CustomW, 1, 16384);
+            res.CustomH = Math.Clamp(res.CustomH, 1, 16384);
+        }
+
         ImGui.SameLine(0, 16 * S);
         ImGui.TextDisabled($"{EditorIcons.Search}");
         ImGui.SameLine(0, 4);
@@ -1041,19 +1055,17 @@ internal sealed class EditorApplication {
         // (The maximize BUTTON was removed — double-click any panel's tab to fullscreen it, Esc to
         // restore. Works for every panel now, so a dedicated viewport button is redundant.)
 
-        if (id == "scene") {
-            EditorPrefs prefs = EditorPrefs.Current;
-
-            // Shading-mode dropdown: Shaded / Wireframe / Normals / Depth (renderer debug views,
-            // Scene view only). Applies to the editor camera so you can inspect geometry/normals/
-            // depth without lighting. Sets Renderer.DebugViewMode and forces a repaint.
+        // Shading-mode dropdown: Shaded / Wireframe / Normals / Depth (renderer debug views). Now in
+        // BOTH the Scene and Game bars (the user wanted it in the game view too). Sets the global
+        // Renderer.DebugViewMode and forces a repaint; the popup id is per-view so they don't collide.
+        {
             var modeNames = new[] { "Shaded", "Wireframe", "Normals", "Depth" };
             var curMode = (int)Renderer.DebugViewMode;
             var modeLabel = $"{modeNames[curMode]} {EditorIcons.ChevronDown}";
             RightAlign(ImGui.CalcTextSize(modeLabel).X + pad2);
-            if (EditorIcons.GhostButton("shadingmode", modeLabel, "Shading / debug view mode"))
-                ImGui.OpenPopup("##shadingmode");
-            if (ImGui.BeginPopup("##shadingmode")) {
+            if (EditorIcons.GhostButton($"shadingmode{id}", modeLabel, "Shading / debug view mode"))
+                ImGui.OpenPopup($"##shadingmode{id}");
+            if (ImGui.BeginPopup($"##shadingmode{id}")) {
                 ImGui.TextDisabled("Shading Mode");
                 ImGui.Separator();
                 for (var i = 0; i < modeNames.Length; i++) {
@@ -1064,6 +1076,10 @@ internal sealed class EditorApplication {
                 }
                 ImGui.EndPopup();
             }
+        }
+
+        if (id == "scene") {
+            EditorPrefs prefs = EditorPrefs.Current;
 
             // Snap indicator chip.
             var snapOn = ImGui.GetIO().KeyCtrl;
