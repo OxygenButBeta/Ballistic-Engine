@@ -1729,7 +1729,16 @@ internal sealed class InspectorPanel {
 
         void Add(ComponentEntry e) {
             EditorUndo.Push($"Add {e.DisplayName}");
-            entity.AddComponent(e.Type);
+            // Multi-selection: add to EVERY selected entity that doesn't already have it (Unity-style),
+            // so you can equip a whole group at once. Single selection just adds to this entity.
+            if (state.SelectedEntities.Count > 1) {
+                foreach (Entity sel in state.SelectedEntities)
+                    if (sel is { IsDestroyed: false } && !HasComponentOfType(sel, e.Type))
+                        sel.AddComponent(e.Type);
+            }
+            else {
+                entity.AddComponent(e.Type);
+            }
             state.MarkViewportDirty();
             ImGui.CloseCurrentPopup();
         }
@@ -2280,6 +2289,15 @@ internal sealed class InspectorPanel {
             apply(new Vector3(sv.X, sv.Y, sv.Z));
             state.MarkViewportDirty();
         }
+    }
+
+    // True if the entity already has a behaviour of (exactly) this type — for batch Add Component,
+    // so adding to a multi-selection skips entities that already have it (Unity-style).
+    static bool HasComponentOfType(Entity entity, Type type) {
+        foreach (Behaviour b in entity.Behaviours)
+            if (b.GetType() == type)
+                return true;
+        return false;
     }
 
     // "RotationEuler" -> "Rotation Euler", "lightIntensity" -> "Light Intensity"
