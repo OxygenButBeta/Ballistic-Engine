@@ -344,7 +344,22 @@ internal sealed class HierarchyPanel {
         string suffix = count > 1 ? $" ({count})" : "";
 
         if (count == 1 && ImGui.MenuItem("Rename", "F2")) BeginRename(entity);
-        if (count == 1 && ImGui.MenuItem($"{EditorIcons.Package}  Create Prefab")) CreatePrefab(entity);
+        if (count == 1 && !entity.IsPrefabInstance &&
+            ImGui.MenuItem($"{EditorIcons.Package}  Create Prefab")) CreatePrefab(entity);
+
+        // Prefab instance actions (Unity's right-click > Prefab submenu): Apply pushes overrides to the
+        // asset, Revert discards them, Select reveals the source .prefab in the browser.
+        if (count == 1 && entity.IsPrefabInstance && ImGui.BeginMenu($"{EditorIcons.Package}  Prefab")) {
+            if (ImGui.MenuItem("Select Asset")) {
+                string p = AssetDatabase.GuidToAssetPath(entity.PrefabSource);
+                if (p is not null) state.RequestRevealAsset(p);
+            }
+            if (ImGui.MenuItem("Apply Overrides")) PrefabInstanceOps.ApplyAll(entity);
+            if (ImGui.MenuItem("Revert Overrides")) { PrefabInstanceOps.RevertAll(entity); state.MarkViewportDirty(); }
+            ImGui.Separator();
+            if (ImGui.MenuItem("Unpack")) { EditorUndo.PushEntity("Unpack Prefab", entity); entity.PrefabSource = Guid.Empty; }
+            ImGui.EndMenu();
+        }
         if (ImGui.MenuItem($"Duplicate{suffix}", "Ctrl+D")) DuplicateSelected(scene);
         if (entity.transform.Parent is not null && ImGui.MenuItem($"Unparent{suffix}")) {
             EditorUndo.Push("Unparent");

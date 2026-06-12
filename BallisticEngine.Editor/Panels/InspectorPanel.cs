@@ -176,18 +176,65 @@ internal sealed class InspectorPanel {
         Behaviour[] behaviours = entity.Behaviours.ToArray();
         DrawEntityHeaderCard(entity, behaviours.Length);
 
+        // Prefab instance: recompute the override diff (cached per selection) and show the prefab bar
+        // with Open / Select / Apply All / Revert All (Unity's prefab instance header).
+        PrefabOverrides.Refresh(entity);
+        if (entity.IsPrefabInstance)
+            DrawPrefabInstanceBar(entity);
+
         DrawTagLayerRow(entity);
 
         ImGui.Spacing();
 
         DrawTransform(entity.transform);
 
-        foreach (Behaviour behaviour in behaviours)
-            DrawComponent(entity, behaviour);
+        var typeIndex = new Dictionary<Type, int>();
+        foreach (Behaviour behaviour in behaviours) {
+            Type bt = behaviour.GetType();
+            int idx = typeIndex.TryGetValue(bt, out int i) ? i : 0;
+            typeIndex[bt] = idx + 1;
+            DrawComponent(entity, behaviour, idx);
+        }
 
         ImGui.Spacing();
         ImGui.Spacing();
         DrawAddComponent(entity);
+        ImGui.Spacing();
+    }
+
+    // True if any member of this component differs from the prefab definition (drives the header dot).
+    static bool ComponentHasOverride(Behaviour behaviour, int typeIndex) =>
+        PrefabOverrides.ComponentHasOverride(ComponentRegistry.NameOf(behaviour), typeIndex);
+
+    // Prefab-instance header bar (Unity's blue prefab strip): the source name + Select (reveal the
+    // .prefab in the browser), Open (load it for editing), and Apply All / Revert All which push or
+    // discard this instance's overrides against the asset. Greyed when there are no overrides.
+    void DrawPrefabInstanceBar(Entity entity) {
+        string path = AssetDatabase.GuidToAssetPath(entity.PrefabSource);
+        string name = path is null ? "(missing prefab)" : Path.GetFileNameWithoutExtension(path);
+
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, new SysVec4(0.16f, 0.22f, 0.34f, 0.55f));
+        ImGui.BeginChild("##prefabbar", new SysVec2(0, ImGui.GetFrameHeight() + 10), ImGuiChildFlags.AutoResizeY);
+        ImGui.PushStyleColor(ImGuiCol.Text, new SysVec4(0.55f, 0.74f, 1f, 1f));
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextUnformatted($"{EditorIcons.Package}  Prefab: {name}");
+        ImGui.PopStyleColor();
+
+        if (path is not null) {
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Select")) state.RequestRevealAsset(path);
+        }
+
+        bool hasOverrides = PrefabOverrides.HasAnyOverride;
+        ImGui.BeginDisabled(!hasOverrides || path is null);
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Apply All")) PrefabInstanceOps.ApplyAll(entity);
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Revert All")) { PrefabInstanceOps.RevertAll(entity); state.MarkViewportDirty(); }
+        ImGui.EndDisabled();
+
+        ImGui.EndChild();
+        ImGui.PopStyleColor();
         ImGui.Spacing();
     }
 
@@ -311,6 +358,19 @@ internal sealed class InspectorPanel {
     void DrawTransform(Transform transform) {
         bool open = PlainHeader("Transform");
 
+        // Prefab override marker on the Transform header: a blue dot if any of pos/rot/scale differ
+        // from the prefab, with a right-click "Revert" per channel further down (the most common
+        // override). Drawn as a small badge after the header so it doesn't disturb layout.
+        bool posOv = PrefabOverrides.IsOverridden(PrefabOverrides.TransformPositionKey);
+        bool rotOv = PrefabOverrides.IsOverridden(PrefabOverrides.TransformRotationKey);
+        bool sclOv = PrefabOverrides.IsOverridden(PrefabOverrides.TransformScaleKey);
+        if (posOv || rotOv || sclOv) {
+            SysVec2 hp = ImGui.GetItemRectMax();
+            ImGui.GetWindowDrawList().AddCircleFilled(
+                new SysVec2(hp.X - 12, (ImGui.GetItemRectMin().Y + hp.Y) * 0.5f), 3.5f,
+                ImGui.GetColorU32(new SysVec4(0.45f, 0.66f, 1f, 1f)));
+        }
+
         // The other selected entities' transforms, if this is a multi-selection — edits apply to all
         // of them (Unity-style: a field change moves the whole group by the same DELTA, preserving
         // relative offsets). Empty for a single selection.
@@ -390,12 +450,21 @@ internal sealed class InspectorPanel {
         return open;
     }
 
-    void DrawComponent(Entity entity, Behaviour behaviour) {
+    void DrawComponent(Entity entity, Behaviour behaviour, int typeIndex = 0) {
         Type type = behaviour.GetType();
         ImGui.PushID(behaviour.InstanceId.GetHashCode());
 
         bool enabled = behaviour.IsEnabled;
         bool open = ComponentHeader(Prettify(type.Name), type, ref enabled, out bool menuRequested);
+
+        // Prefab override badge on the component header: a blue dot if ANY member of this component
+        // (matched by registry name + type-index) differs from the prefab definition.
+        if (entity.IsPrefabInstance && ComponentHasOverride(behaviour, typeIndex)) {
+            SysVec2 mx = ImGui.GetItemRectMax();
+            ImGui.GetWindowDrawList().AddCircleFilled(
+                new SysVec2(mx.X - 30, (ImGui.GetItemRectMin().Y + mx.Y) * 0.5f), 3.5f,
+                ImGui.GetColorU32(new SysVec4(0.45f, 0.66f, 1f, 1f)));
+        }
         if (enabled != behaviour.IsEnabled) {
             EditorUndo.Push($"Toggle {Prettify(type.Name)}");
             behaviour.IsEnabled = enabled;
