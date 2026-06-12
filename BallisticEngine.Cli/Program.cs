@@ -18,6 +18,7 @@ internal static class Program {
         new ImportCommand(),
         new AssetsCommand(),
         new MapCommand(),
+        new SimulateCommand(),
     }.ToDictionary(c => c.Name, StringComparer.Ordinal);
 
     static int Main(string[] args) {
