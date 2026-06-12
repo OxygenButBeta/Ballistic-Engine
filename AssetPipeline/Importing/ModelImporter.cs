@@ -58,9 +58,22 @@ public sealed class ModelImporter : IAssetImporter {
         // Skinned models take the bind-space decode path (vertices NOT baked by node transform —
         // the bones place them) and emit sibling .banim animation assets. Falls through to the
         // static path when the model has no bones, so non-skinned imports are byte-identical to v4.
-        if (importSkin && AssimpSkinDecoder.SceneHasSkin(context.SourceAbsolutePath, flipUVs)) {
-            ImportSkinned(context, flipUVs, generateMaterials);
-            return;
+        //
+        // glTF/glb skin goes through the NATIVE GltfSkinDecoder: AssimpNet 4.1.0's native build
+        // silently drops glTF2 skin data (every rigged glTF reads hasBones=false), so Assimp can't
+        // import it. FBX/other formats still use AssimpSkinDecoder, whose FBX skin support works.
+        if (importSkin) {
+            var ext = Path.GetExtension(context.SourceAbsolutePath).ToLowerInvariant();
+            if (GltfSkinDecoder.SupportsExtension(ext)) {
+                if (GltfSkinDecoder.HasSkin(context.SourceAbsolutePath)) {
+                    ImportSkinned(context, generateMaterials, GltfSkinDecoder.Decode(context.SourceAbsolutePath, flipUVs));
+                    return;
+                }
+            }
+            else if (AssimpSkinDecoder.SceneHasSkin(context.SourceAbsolutePath, flipUVs)) {
+                ImportSkinned(context, generateMaterials, AssimpSkinDecoder.Decode(context.SourceAbsolutePath, flipUVs));
+                return;
+            }
         }
 
         DecodedModel model = AssimpMeshDecoder.DecodeScene(context.SourceAbsolutePath, flipUVs, splitByNodes);
@@ -70,9 +83,10 @@ public sealed class ModelImporter : IAssetImporter {
 
     // ---- Skinned import -----------------------------------------------------
 
-    void ImportSkinned(AssetImportContext context, bool flipUVs, bool generateMaterials) {
-        AssimpSkinDecoder.DecodedSkinnedModel model =
-            AssimpSkinDecoder.Decode(context.SourceAbsolutePath, flipUVs);
+    // Shared by the glTF (native) and FBX (Assimp) skin decoders — both produce a
+    // DecodedSkinnedModel, so material generation + artifact + .banim writing is identical.
+    void ImportSkinned(AssetImportContext context, bool generateMaterials,
+        AssimpSkinDecoder.DecodedSkinnedModel model) {
 
         // Wrap the skinned mesh in a DecodedModel so the existing material generator applies
         // unchanged (it only reads SubMeshes + SubMeshMaterials and rewrites MaterialRefs).
