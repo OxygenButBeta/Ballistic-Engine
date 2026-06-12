@@ -10,7 +10,7 @@ deliberately mirror Unity (Entity/Behaviour, AssetDatabase, meta files, edit/pla
 ## Build & run
 
 ```
-dotnet build BallisticEngine.slnx          # 3 projects; the old .sln is gone
+dotnet build BallisticEngine.slnx          # 5 projects; the old .sln is gone
 dotnet run --project BallisticEngine.Runtime [projectPath]   # standalone player
 dotnet run --project BallisticEngine.Editor  [projectPath]   # ImGui editor
 ```
@@ -18,7 +18,34 @@ dotnet run --project BallisticEngine.Editor  [projectPath]   # ImGui editor
 Default project path: `<repo>\SampleProject`. Projects:
 - `BallisticEngine.csproj` (root) — engine **library**; globs all engine folders, `<Compile Remove>`s the exe subfolders.
 - `BallisticEngine.Runtime/` — thin player exe (Program + BEngineEntry over `EngineBootstrap`/`EngineLoop`).
-- `BallisticEngine.Editor/` — ImGui editor exe (ImGuiBackend/, EditorApp/, Panels/, EditorCamera/, Gizmo/).
+- `BallisticEngine.Editor/` — ImGui editor exe (ImGuiBackend/, EditorApp/, Panels/, EditorCamera/, Gizmo/, Remote/).
+- `BallisticEngine.Cli/` — `bal`, the headless agent CLI (see below).
+- `BallisticEngine.Mcp/` — stdio MCP server bridging to the editor's command port.
+
+## Agent surface (AI-operability layer, 2026-06)
+
+The engine is fully operable headlessly — **prefer these over hand-editing YAML or eyeballing
+screenshots** (each verb prints JSON, honest exit codes; `bal --help` lists all):
+
+- `bal map <project>` — orient first: scenes, script components, asset inventory.
+- `bal schema [--type X]` — component catalog from reflection (engine + game scripts); never guess members.
+- `bal scene get/set/add-entity/add-component/remove-*/find` — typed scene CRUD; one-member edit = one-line diff; ids tool-minted; refs path-form.
+- `bal validate` / `bal describe` / `bal import` / `bal assets resolve|refs|list` — checks, summaries, idempotent import, reverse-ref map.
+- `bal simulate <scene> --steps N --watch Entity[:Comp.Member] [--input script.json]` — REAL engine headless (HeadlessRuntime: scripts+physics play, no GL); numeric time series; deterministic scripted input (two runs byte-identical).
+- `bal render <scene> [--orbit N] [--idmap]` + `bal imgdiff a b [--out heatmap]` — deterministic captures, multi-view, perceptual diff (mean + 32x32-hotspot budgets).
+- `bal agents <project>` — regenerates the project's AGENTS.md (never stale: built from reflection + .meta).
+
+Env harness additions: `BALLISTIC_SCENE` (player loads any project-relative scene),
+`BALLISTIC_DETERMINISTIC=1` (TAA/SSGI/volumetric off + fixed exposure → frame 60 == frame 240
+byte-identical), `BALLISTIC_IDMAP=<path>` (entity-ID map: `<path>.json` per-entity/submesh
+screen bboxes + `<path>.bmp` segmentation — occlusion-aware "what is on screen where"),
+`BALLISTIC_SCREENSHOT_EXIT=0`. Every screenshot writes a `.stats.json` sidecar (draws/tris/
+cull/per-pass GPU ms). Logs mirror to `<project>/Library/Logs/engine.jsonl`.
+
+Live editor control: named pipe `\\.\pipe\BallisticEditor` (newline JSON `{id,method,params}` →
+`{id,result|error}`; methods in `BallisticEngine.Editor/Remote/RemoteHandlers.cs`) or the MCP
+server (16 tools). Remote mutations push EditorUndo first and mark the viewport dirty — they
+behave exactly like human edits. The pipe thread is engine-owned: survives script hot-reload.
 
 ## Layering rules (auditable by grep)
 
