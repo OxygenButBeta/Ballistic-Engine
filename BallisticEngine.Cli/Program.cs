@@ -13,6 +13,7 @@ internal static class Program {
     static readonly IReadOnlyDictionary<string, ICommand> Commands = new ICommand[] {
         new SchemaCommand(),
         new ValidateCommand(),
+        new DescribeCommand(),
     }.ToDictionary(c => c.Name, StringComparer.Ordinal);
 
     static int Main(string[] args) {
