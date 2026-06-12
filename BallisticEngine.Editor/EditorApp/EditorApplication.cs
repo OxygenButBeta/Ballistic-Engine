@@ -1097,13 +1097,21 @@ internal sealed class EditorApplication {
     void MaximizePanelOnTitleDoubleClick(string panelName) {
         if (!ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
             return;
-        SysVec2 mn = ImGui.GetWindowPos();
-        float w = ImGui.GetWindowSize().X;
-        float tabH = ImGui.GetFrameHeight() * 1.4f;
+        // Hit-test the title/tab strip purely geometrically — do NOT gate on IsWindowHovered, because a
+        // docked window's tab strip is owned by the dock-node parent, so this window is NOT "hovered"
+        // while the cursor is on its own tab (the old bug: the double-click was silently dropped).
+        // GetCursorStartPos is the content origin in window-local coords (just below the title/tab strip);
+        // window pos + that Y is where content rows begin. The strip is [windowTop .. contentTop].
         SysVec2 mouse = ImGui.GetIO().MousePos;
-        bool overTab = mouse.X >= mn.X && mouse.X <= mn.X + w &&
-                       mouse.Y >= mn.Y - tabH && mouse.Y <= mn.Y + 2f;
-        if (overTab)
+        SysVec2 winPos = ImGui.GetWindowPos();
+        float winW = ImGui.GetWindowSize().X;
+        float contentTop = winPos.Y + ImGui.GetCursorStartPos().Y;
+        // For a DOCKED window the dock tab strip sits ABOVE winPos.Y; extend the band up one frame height
+        // so a double-click on the tab itself (not just the title bar of a floating window) registers.
+        float stripTop = winPos.Y - (ImGui.IsWindowDocked() ? ImGui.GetFrameHeight() : 0f);
+        bool onStrip = mouse.X >= winPos.X && mouse.X <= winPos.X + winW &&
+                       mouse.Y >= stripTop && mouse.Y < contentTop;
+        if (onStrip)
             maximizedPanel = maximizedPanel == panelName ? null : panelName;
     }
 
