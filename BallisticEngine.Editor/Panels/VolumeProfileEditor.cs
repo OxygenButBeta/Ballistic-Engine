@@ -29,6 +29,21 @@ internal static class VolumeProfileEditor {
                 remove = component;
 
             if (open) {
+                // A disabled component contributes NOTHING to the stack (VolumeManager skips it),
+                // even if its parameters are overridden — a common "I changed it and nothing happens"
+                // trap. Warn clearly, and offer a one-click Enable.
+                if (!component.Active && HasOverrides(component)) {
+                    ImGui.PushStyleColor(ImGuiCol.Text, new SysVec4(1f, 0.72f, 0.25f, 1f));
+                    ImGui.TextWrapped($"{EditorIcons.Warning} This override is DISABLED — its parameters have no effect. " +
+                                      "Tick the checkbox by the name to enable it.");
+                    ImGui.PopStyleColor();
+                    if (ImGui.SmallButton("Enable")) {
+                        component.Active = true;
+                        changed = true;
+                    }
+                    ImGui.Spacing();
+                }
+
                 changed |= DrawAllNoneRow(component);
                 changed |= DrawParameters(component);
             }
@@ -87,6 +102,15 @@ internal static class VolumeProfileEditor {
             changed = SetAllOverrides(component, false);
 
         return changed;
+    }
+
+    // True if any parameter is overridden — used to warn when those overrides are inert because the
+    // component itself is disabled.
+    static bool HasOverrides(VolumeComponent component) {
+        foreach (VolumeComponent.ParameterSlot slot in component.Parameters)
+            if (slot.Parameter.Overridden)
+                return true;
+        return false;
     }
 
     static bool SetAllOverrides(VolumeComponent component, bool overridden) {
