@@ -284,6 +284,7 @@ public sealed class EngineBootstrap {
         // path was missing it — the "old meshes still render after switching scenes" bug.
         Scene current = SceneManager.GetCurrentScene();
         current.Clear();
+        SceneManager.ClearAllRenderSets(); // defensive: scene.Clear()'s OnDetach is best-effort
         SceneSerializer.Deserialize(yaml);
     }
 

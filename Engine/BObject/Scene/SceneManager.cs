@@ -93,8 +93,7 @@ public class SceneManager {
 
         Scene scene = GetCurrentScene();
         scene.Clear();
-        RuntimeSet<IStaticMeshRenderer>.Clear();
-        DirectionalLight.Clear();
+        ClearAllRenderSets();
 
         SceneLoader(projectRelativePath);
 
@@ -119,6 +118,22 @@ public class SceneManager {
         }
 
         instance.activeScenes.Add(scene);
+    }
+
+    // Defensively empty EVERY global render/registration set. scene.Clear() should already remove each
+    // renderer via OnDetach, but that is best-effort (an OnDetach that throws, an indirectly-managed
+    // renderer, or any edit-mode gap leaves a stale entry that keeps DRAWING — the "old scene's meshes
+    // stay on screen after a scene switch" bug). Every scene-teardown path (StopPlay, LoadScenePath,
+    // and the editor's ApplyNow) calls this so the asymmetry can't reappear. Must list ALL RuntimeSets
+    // the renderer iterates; add new ones here when a new renderable type is introduced.
+    public static void ClearAllRenderSets() {
+        RuntimeSet<IStaticMeshRenderer>.Clear();
+        RuntimeSet<PointLight>.Clear();
+        RuntimeSet<SpotLight>.Clear();
+        RuntimeSet<TrailRenderer>.Clear();
+        RuntimeSet<IRibbonSource>.Clear();
+        RuntimeSet<ParticleSystem>.Clear();
+        DirectionalLight.Clear();
     }
 
     public static Scene GetCurrentScene() {
@@ -214,11 +229,10 @@ public class SceneManager {
         scene.FireEnd();
 
         RenderCamera = null;
-        RuntimeSet<IStaticMeshRenderer>.Clear();
         scene.Clear();
+        ClearAllRenderSets();
         Physics.EndPlay(); // after Clear so component teardown saw a live world
         CoroutineRunner.Reset(); // abandon any in-flight coroutines/awaits — they don't survive Stop
-        DirectionalLight.Clear();
 
         IsPlaying = false;
         IsPaused = false;

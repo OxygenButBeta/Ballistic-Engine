@@ -104,6 +104,9 @@ internal static class SceneCommands {
             SceneManager.StopPlay();
 
         SceneManager.GetCurrentScene().Clear();
+        // Defensively clear every render set too — scene.Clear()'s per-component OnDetach is best-effort,
+        // and a leaked renderer keeps DRAWING the old scene's meshes after the switch (the reported bug).
+        SceneManager.ClearAllRenderSets();
         SceneSerializer.Deserialize(yaml);
         CurrentScenePath = assetPath;
         EditorUndo.Clear();
@@ -116,6 +119,7 @@ internal static class SceneCommands {
             SceneManager.StopPlay();
 
         SceneManager.GetCurrentScene().Clear();
+        SceneManager.ClearAllRenderSets();
         CurrentScenePath = null;
         EditorUndo.Clear();
         RememberScene(null); // no file to reopen — next launch falls back to the StartupScene
