@@ -643,38 +643,19 @@ internal sealed class EditorApplication {
         // Dockable panels — normal windows ImGui places into the dock tree. The Window-menu bools
         // double as each window's close-button state (passed by ref to Begin). Entities and Scene-
         // components are now separate dockable windows (were inner Hierarchy tabs).
-        if (showHierarchy && ImGui.Begin(EditorLayout.Entities, ref showHierarchy)) {
-            MaximizePanelOnTitleDoubleClick(EditorLayout.Entities);
-            hierarchy.DrawEntitiesContents();
-        }
-        if (showHierarchy) ImGui.End();
-
-        if (showSceneComponents && ImGui.Begin(EditorLayout.SceneComponents, ref showSceneComponents)) {
-            MaximizePanelOnTitleDoubleClick(EditorLayout.SceneComponents);
-            hierarchy.DrawSceneContents();
-        }
-        if (showSceneComponents) ImGui.End();
-
-        if (showInspector && ImGui.Begin(EditorLayout.Inspector, ref showInspector)) {
-            MaximizePanelOnTitleDoubleClick(EditorLayout.Inspector);
-            inspector.DrawContents();
-        }
-        if (showInspector) ImGui.End();
+        // IMPORTANT: once Begin() is called it MUST be paired with End(), even if Begin returns false
+        // (collapsed) OR the close button set show=false this frame. The old "if (show) End()" dropped
+        // the End() when the X was clicked (Begin already drew the content + opened a BeginChild that
+        // frame), leaving "Missing EndChild()" and corrupting all ImGui state. DrawDockPanel handles it.
+        if (showHierarchy) DrawDockPanel(EditorLayout.Entities, ref showHierarchy, hierarchy.DrawEntitiesContents);
+        if (showSceneComponents) DrawDockPanel(EditorLayout.SceneComponents, ref showSceneComponents, hierarchy.DrawSceneContents);
+        if (showInspector) DrawDockPanel(EditorLayout.Inspector, ref showInspector, inspector.DrawContents);
 
         // Extra (duplicated) panel instances opened from the Add Tab menu.
         extraPanels.DrawAll();
 
-        if (showBottom && ImGui.Begin(EditorLayout.Assets, ref showBottom)) {
-            MaximizePanelOnTitleDoubleClick(EditorLayout.Assets);
-            assets.DrawContents();
-        }
-        if (showBottom) ImGui.End();
-
-        if (showConsole && ImGui.Begin(EditorLayout.Console, ref showConsole)) {
-            MaximizePanelOnTitleDoubleClick(EditorLayout.Console);
-            console.DrawContents();
-        }
-        if (showConsole) ImGui.End();
+        if (showBottom) DrawDockPanel(EditorLayout.Assets, ref showBottom, assets.DrawContents);
+        if (showConsole) DrawDockPanel(EditorLayout.Console, ref showConsole, console.DrawContents);
 
         // Scene + Game are separate dockable windows (were inner viewport tabs).
         DrawViewportWindows();
@@ -1265,6 +1246,18 @@ internal sealed class EditorApplication {
                 maximizedPanel = null;
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip("Exit fullscreen (Esc)");
+        }
+        ImGui.End();
+    }
+
+    // Draws one dockable panel with a CORRECT Begin/End pairing: End() is always called once Begin()
+    // ran, even when Begin returns false or the close button just set `show` to false this frame. The
+    // content (+ the maximize/add-tab strip handler) only runs when Begin returned true.
+    void DrawDockPanel(string name, ref bool show, Action drawContents) {
+        bool visible = ImGui.Begin(name, ref show);
+        if (visible) {
+            MaximizePanelOnTitleDoubleClick(name);
+            drawContents();
         }
         ImGui.End();
     }
