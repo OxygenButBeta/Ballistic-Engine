@@ -1148,7 +1148,7 @@ internal sealed class AssetBrowserPanel {
         // type icon tinted by category (+ the short tag below it).
         bool clicked;
         var hasPreview = ImageExtensions.Contains(ext) ||
-                         ext is ".fbx" or ".obj" or ".gltf" or ".glb" or ".dae";
+                         ext is ".fbx" or ".obj" or ".gltf" or ".glb" or ".dae" or ".mat";
         var thumb = hasPreview ? thumbnails.Get(guid, path) : 0;
         if (thumb != 0) {
             clicked = ImGui.ImageButton($"##thumb{guid}", EditorApplication.Tex(thumb),

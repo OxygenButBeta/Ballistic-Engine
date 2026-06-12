@@ -1014,6 +1014,16 @@ internal sealed class EditorApplication {
         GizmoModeButton("Rotate", GizmoMode.Rotate, bw, "Rotate (E)");
         ImGui.SameLine(0, 2);
         GizmoModeButton("Scale", GizmoMode.Scale, bw, "Scale (R)");
+
+        // Pivot / Center toggle as a plain labelled button on the LEFT (no icon), next to the gizmo
+        // mode buttons — the user wanted it here, not as a right-side icon in the viewport bar.
+        ImGui.SameLine(0, 10 * S);
+        bool isPivot = gizmo.Pivot == GizmoPivot.Pivot;
+        if (ImGui.Button(isPivot ? "Pivot" : "Center", new SysVec2(bw * 1.3f, h)))
+            gizmo.Pivot = isPivot ? GizmoPivot.Center : GizmoPivot.Pivot;
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(isPivot ? "Handle at the entity's pivot (click for Center)"
+                                     : "Handle at the selection's center (click for Pivot)");
     }
 
     // ---- Viewport (Scene / Game tabs) ----------------------------------------
@@ -1059,14 +1069,19 @@ internal sealed class EditorApplication {
         float right = ImGui.GetWindowWidth() - 14 * S;
         void RightAlign(float w) { right -= w; ImGui.SameLine(right); right -= 6 * S; }
 
+        // FIXED-WIDTH reservations for the resolution text and the FPS button: their digit counts
+        // change every frame (1920x1080 vs 800x600, 500 fps vs 60 fps), so measuring the live string
+        // made every control to their LEFT jump around. Reserve the widest case once.
         SysVec2 rs = id == "scene" ? sceneViewSize : gameViewSize;
         var resText = $"{(int)rs.X} x {(int)rs.Y}";
-        RightAlign(ImGui.CalcTextSize(resText).X);
+        float resW = ImGui.CalcTextSize("8888 x 8888").X;
+        RightAlign(resW);
         ImGui.AlignTextToFramePadding();
         ImGui.TextDisabled(resText);
 
         var fpsLabel = $"{runtime.Window.FrameRate:0} fps {EditorIcons.ChevronDown}";
-        RightAlign(ImGui.CalcTextSize(fpsLabel).X + pad2);
+        float fpsW = ImGui.CalcTextSize($"8888 fps {EditorIcons.ChevronDown}").X + pad2;
+        RightAlign(fpsW);
         DrawFpsButton(fpsLabel);
 
         // Stats overlay toggle, Unity's Game-view "Stats" button style (the overlay's X also closes it).
@@ -1122,14 +1137,7 @@ internal sealed class EditorApplication {
                     world ? "Gizmo space: World (click for Local)" : "Gizmo space: Local (click for World)"))
                 gizmo.Space = world ? GizmoSpace.Local : GizmoSpace.World;
 
-            // Gizmo pivot toggle (Unity's Pivot/Center): pin = the entity's own origin, expand = the
-            // centre of the selection's bounds (entity + descendants).
-            var pivotMode = gizmo.Pivot == GizmoPivot.Pivot;
-            var pivotIcon = pivotMode ? EditorIcons.Pin : EditorIcons.Maximize;
-            RightAlign(ImGui.CalcTextSize(pivotIcon).X + pad2);
-            if (EditorIcons.GhostButton("gizmopivot", pivotIcon,
-                    pivotMode ? "Gizmo handle: Pivot (click for Center)" : "Gizmo handle: Center (click for Pivot)"))
-                gizmo.Pivot = pivotMode ? GizmoPivot.Center : GizmoPivot.Pivot;
+            // (Pivot/Center moved to a labelled button in the main toolbar, next to Move/Rotate/Scale.)
 
             // Component gizmos toggle.
             RightAlign(ImGui.CalcTextSize(EditorIcons.Pin).X + pad2);

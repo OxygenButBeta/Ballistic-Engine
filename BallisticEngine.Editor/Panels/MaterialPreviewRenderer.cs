@@ -123,30 +123,46 @@ uniform float roughness;
 uniform float metallic;
 void main() {
     vec3 N = normalize(n);
-    vec3 L = normalize(vec3(0.4, 0.7, 0.6));
+    vec3 L = normalize(vec3(0.45, 0.65, 0.7));
     vec3 V = vec3(0.0, 0.0, 1.0);
     vec3 H = normalize(L + V);
     vec3 albedo = baseColor.rgb;
-    float diff = max(dot(N, L), 0.0);
-    float shininess = mix(4.0, 128.0, 1.0 - roughness);
-    float spec = pow(max(dot(N, H), 0.0), shininess) * (1.0 - roughness) * 0.8;
+    // Strong, contrasty key light + a clear fill so the SPHERE FORM always reads, even for a pure
+    // white material (the old, softer lighting washed white materials to flat white). Wrap-lit so the
+    // terminator is gentle; a dark fill on the unlit side keeps the silhouette visible on a dark bg.
+    float ndl = dot(N, L);
+    float diff = clamp(ndl * 0.5 + 0.5, 0.0, 1.0);   // wrap diffuse 0..1
+    diff = diff * diff;                               // bias darker so the lit pole pops
+    float shininess = mix(8.0, 200.0, 1.0 - roughness);
+    float spec = pow(max(dot(N, H), 0.0), shininess) * (1.0 - roughness);
     vec3 specColor = mix(vec3(1.0), albedo, metallic);
-    vec3 ambient = albedo * 0.18;
-    vec3 lit = albedo * (diff * 0.85) + ambient + specColor * spec;
-    // gentle gamma so it reads like the editor viewport
+    // Rim term to outline the sphere against the background.
+    float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0) * 0.25;
+    vec3 lit = albedo * (0.12 + diff * 0.95) + specColor * spec + vec3(rim);
     lit = pow(clamp(lit, 0.0, 1.0), vec3(1.0/2.2));
     outColor = vec4(lit, 1.0);
 }";
         int v = GL.CreateShader(ShaderType.VertexShader);
         GL.ShaderSource(v, vert); GL.CompileShader(v);
+        CheckCompile(v, "material-preview vertex");
         int f = GL.CreateShader(ShaderType.FragmentShader);
         GL.ShaderSource(f, frag); GL.CompileShader(f);
+        CheckCompile(f, "material-preview fragment");
         program = GL.CreateProgram();
         GL.AttachShader(program, v);
         GL.AttachShader(program, f);
         GL.LinkProgram(program);
+        GL.GetProgram(program, GetProgramParameterName.LinkStatus, out int linked);
+        if (linked == 0)
+            Debugging.LogError($"Material preview shader link failed: {GL.GetProgramInfoLog(program)}");
         GL.DeleteShader(v);
         GL.DeleteShader(f);
+    }
+
+    static void CheckCompile(int shader, string label) {
+        GL.GetShader(shader, ShaderParameter.CompileStatus, out int ok);
+        if (ok == 0)
+            Debugging.LogError($"Material preview {label} shader compile failed: {GL.GetShaderInfoLog(shader)}");
     }
 
     // A unit UV sphere (interleaved pos/normal/uv), generated once.

@@ -35,6 +35,12 @@ internal sealed class InspectorPanel {
     bool locked;
     Entity lockedEntity;
 
+    // Distinguishes this inspector's ImGui ids from a second Inspector window's — without it both
+    // instances share ids like "inspectorlock", so toggling lock in one toggled the other (and the
+    // padlock looked dead). PushID(instanceId) at the top of DrawContents namespaces everything.
+    static int instanceCounter;
+    readonly int instanceId = instanceCounter++;
+
     public InspectorPanel(EditorState state) {
         this.state = state;
         // The standalone component window reuses our reflection member renderer.
@@ -42,6 +48,7 @@ internal sealed class InspectorPanel {
     }
 
     public void DrawContents() {
+        ImGui.PushID(instanceId);   // namespace all ids so a 2nd Inspector window doesn't collide
         // Denser rows than the global style so more fits on screen.
         ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new SysVec2(8, 4));
         ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new SysVec2(8, 4));
@@ -91,6 +98,7 @@ internal sealed class InspectorPanel {
         DrawAssetPickerPopup();
 
         ImGui.PopStyleVar(2);
+        ImGui.PopID();
     }
 
     // A slim right-aligned lock toggle at the top of the inspector. Locking pins the current entity so
@@ -2646,18 +2654,24 @@ internal sealed class InspectorPanel {
     void SysVec3Row(string label, Vector3 value, Action<Vector3> apply, float speed, bool allowUniformLock) {
         Row(label);
 
-        // Optional chain-link toggle before the fields: when on, editing ONE axis scales the others by
-        // the same ratio so the proportions stay fixed (e.g. (1,.5,1) -> edit X to 2 -> (2,1,2)).
+        // The chain-link toggle lives in the LABEL cell (column 0), right-aligned next to the fields —
+        // putting it in front of the X chip shifted Scale's fields right and broke alignment with
+        // Position/Rotation. Row() already moved us to column 1; hop back to 0, draw the lock, return.
         bool locked = allowUniformLock && uniformLocks.GetValueOrDefault(label);
         if (allowUniformLock) {
+            ImGui.TableSetColumnIndex(0);
             string icon = locked ? EditorIcons.Lock : EditorIcons.LockOpen;
+            float btn = ImGui.GetFrameHeight();
+            ImGui.SameLine();
+            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - btn);
             if (EditorIcons.GhostButtonSmall($"ulock_{label}", icon,
                     locked ? "Proportions locked - editing one axis scales the others"
                            : "Lock proportions (uniform scaling)")) {
                 uniformLocks[label] = !locked;
                 locked = !locked;
             }
-            ImGui.SameLine(0, 4);
+            ImGui.TableSetColumnIndex(1);
+            ImGui.SetNextItemWidth(-1);
         }
 
         var sv = new SysVec3(value.X, value.Y, value.Z);
