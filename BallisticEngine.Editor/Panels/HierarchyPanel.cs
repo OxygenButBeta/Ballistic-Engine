@@ -277,8 +277,28 @@ internal sealed class HierarchyPanel {
         }
 
         if (open && children.Count > 0) {
-            foreach (Entity child in children)
+            // Tree connector lines (code-editor / Unity style): a vertical guide down the indent gutter
+            // plus a short horizontal "elbow" into each child row. Drawn after the children so we know
+            // their row Ys; the vertical stops at the LAST child's elbow (Unity convention).
+            ImDrawListPtr dl = ImGui.GetWindowDrawList();
+            uint lineCol = ImGui.GetColorU32(new SysVec4(1f, 1f, 1f, 0.16f));
+            float gutterX = rowMin.X + ImGui.GetTreeNodeToLabelSpacing() * 0.5f;
+            float elbowW = ImGui.GetTreeNodeToLabelSpacing() * 0.42f;
+            float halfRow = ImGui.GetFrameHeight() * 0.5f;
+            float lastChildY = rowMin.Y;
+
+            foreach (Entity child in children) {
+                // Capture the child row's top BEFORE drawing it — a child with its own subtree changes
+                // "last item", so derive the elbow Y from the cursor (this child's row top) instead.
+                float childTopY = ImGui.GetCursorScreenPos().Y;
                 DrawEntityNode(scene, child, allEntities);
+                float midY = childTopY + halfRow;
+                dl.AddLine(new SysVec2(gutterX, midY), new SysVec2(gutterX + elbowW, midY), lineCol, 1f);
+                lastChildY = midY;
+            }
+            // Vertical guide from just under this node's row down to the last child's elbow.
+            dl.AddLine(new SysVec2(gutterX, rowMax.Y), new SysVec2(gutterX, lastChildY), lineCol, 1f);
+
             ImGui.TreePop();
         }
     }
