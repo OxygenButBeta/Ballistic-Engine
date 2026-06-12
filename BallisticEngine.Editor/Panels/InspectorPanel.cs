@@ -389,6 +389,9 @@ internal sealed class InspectorPanel {
             if (behaviour is Animator animator)
                 DrawAnimatorSection(animator);
 
+            if (behaviour is AnimatorController controller)
+                DrawAnimatorControllerSection(controller);
+
             if (behaviour is ParticleSystem particles)
                 DrawParticleSystemSection(particles);
 
@@ -619,6 +622,85 @@ internal sealed class InspectorPanel {
 
     static bool animatorPreviewPlaying;
     static float animatorPreviewTime;
+
+    // AnimatorController: a live view of the state machine. The graph is script-built (states +
+    // transitions are wired in OnBegin), so this is a runtime DEBUG/DRIVE surface — it lists the states
+    // with the current one highlighted, and renders a poker for each declared parameter (checkbox for
+    // bool, slider for float/int, a button for triggers) so you can drive the graph from the inspector
+    // in play mode without writing test code (very AI-managed-friendly: set "Speed" and watch it cross
+    // from idle->walk->run live).
+    void DrawAnimatorControllerSection(AnimatorController controller) {
+        ImGui.Spacing();
+        ImGui.SeparatorText("State Machine");
+
+        if (controller.StateCount == 0) {
+            ImGui.TextDisabled("No states. Build the graph in a script's OnBegin:");
+            ImGui.TextDisabled("  AddState(name, clip); state.To(target, param, Compare, ...)");
+            return;
+        }
+
+        if (!SceneManager.IsPlaying)
+            ImGui.TextDisabled("Enter play mode to drive the graph.");
+
+        // Current state banner.
+        string cur = controller.CurrentStateName ?? "(none)";
+        ImGui.Text("Current: ");
+        ImGui.SameLine();
+        ImGui.TextColored(new SysVec4(0.45f, 0.85f, 1f, 1f), cur);
+
+        // State list with the active one highlighted.
+        ImGui.Spacing();
+        ImGui.TextDisabled($"States ({controller.StateCount})");
+        foreach (AnimatorController.State s in controller.States) {
+            bool isCurrent = s.Name == controller.CurrentStateName;
+            string label = $"{(isCurrent ? EditorIcons.Play + " " : "   ")}{s.Name}";
+            string clipName = s.Clip is not null ? s.Clip.Name : "(no clip)";
+            if (isCurrent)
+                ImGui.TextColored(new SysVec4(0.45f, 0.85f, 1f, 1f), $"{label}  ->  {clipName}");
+            else
+                ImGui.TextDisabled($"{label}  ->  {clipName}");
+            // A click jumps to the state (play mode) — handy for testing.
+            if (SceneManager.IsPlaying && ImGui.IsItemClicked())
+                controller.Play(s.Name);
+        }
+
+        // Parameter pokers.
+        var prms = controller.Parameters;
+        if (prms.Count > 0) {
+            ImGui.Spacing();
+            ImGui.SeparatorText("Parameters");
+            foreach (var kv in prms) {
+                string name = kv.Key;
+                switch (kv.Value) {
+                    case AnimatorController.ParamKind.Bool: {
+                        bool b = controller.GetBool(name);
+                        if (ImGui.Checkbox(name, ref b)) controller.SetBool(name, b);
+                        break;
+                    }
+                    case AnimatorController.ParamKind.Trigger: {
+                        if (ImGui.Button($"{EditorIcons.Play} {name}", new SysVec2(140, 0)))
+                            controller.SetTrigger(name);
+                        ImGui.SameLine();
+                        ImGui.TextDisabled(controller.GetTrigger(name) ? "(set)" : "");
+                        break;
+                    }
+                    case AnimatorController.ParamKind.Int: {
+                        int iv = controller.GetInt(name);
+                        if (ImGui.DragInt(name, ref iv)) controller.SetInt(name, iv);
+                        break;
+                    }
+                    default: { // Float
+                        float fv = controller.GetFloat(name);
+                        if (ImGui.DragFloat(name, ref fv, 0.05f)) controller.SetFloat(name, fv);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (SceneManager.IsPlaying)
+            state.MarkViewportDirty(); // keep repainting so transitions show live
+    }
 
     // ParticleSystem preview: it already animates live in the editor (AdvanceAll runs every editor
     // frame), so this just adds a Restart (clear) + a one-shot Emit test + a live count, and keeps the
