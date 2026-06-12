@@ -36,6 +36,7 @@ public sealed class EngineLoop {
         // Step particle systems once per frame (after Update so emitter transforms are current).
         // Driven here, not from a Behaviour Tick, so it advances exactly once regardless of render count.
         ParticleSystem.AdvanceAll((float)delta);
+        TrailRenderer.AdvanceAll((float)delta);   // lay/age trail points after transforms update
 
         // Push the listener pose set by AudioListener.Tick this frame and recycle finished voices.
         // After SceneManager.Update so the listener/emitter transforms are current.

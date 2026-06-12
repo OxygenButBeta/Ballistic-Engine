@@ -246,6 +246,7 @@ public sealed class EngineBootstrap {
         Runtime.EngineTimer.Update(delta);
         SceneManager.Update((float)delta);
         ParticleSystem.AdvanceAll((float)delta);   // once per frame, edit + play (editor preview)
+        TrailRenderer.AdvanceAll((float)delta);
         Audio.Update();
         InputActions.Update();   // snapshot action down-state for next frame's press/release edges
     }
