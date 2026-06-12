@@ -40,7 +40,7 @@ public class GLHDRenderer : HDRenderer {
     GLSSAOPass ssao;
     GLSSGIPass ssgi;
     GLSSRPass ssr;
-    GLVolumetricLightPass volumetric;
+    GLVolumetricFogPass volumetric;
     GLTAAPass taa;
     GLDepthOfFieldPass depthOfField;
     GLAutoExposurePass autoExposure;
@@ -145,7 +145,7 @@ public class GLHDRenderer : HDRenderer {
         ssao = new GLSSAOPass();
         ssgi = new GLSSGIPass();
         ssr = new GLSSRPass();
-        volumetric = new GLVolumetricLightPass();
+        volumetric = new GLVolumetricFogPass();
         taa = new GLTAAPass();
         depthOfField = new GLDepthOfFieldPass();
         autoExposure = new GLAutoExposurePass();

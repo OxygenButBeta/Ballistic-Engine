@@ -8,6 +8,12 @@ namespace BallisticEngine.AssetPipeline.Loaders;
 // Save is the editor's write-back path: because AssetDatabase caches the loaded instance,
 // the inspector edits the live profile and persists it here in one step.
 public static class VolumeProfileLoader {
+    // Renamed volume components: profiles saved under the old name keep loading (and write
+    // back the new name on the next editor save).
+    static readonly Dictionary<string, string> LegacyTypeNames = new() {
+        ["VolumetricLight"] = "VolumetricFog",
+    };
+
     public static VolumeProfile Load(BallisticProject project, string assetPath) {
         var definition = ContentText.ReadJson<VolumeProfileDefinition>(project, assetPath);
         if (definition is null) {
@@ -17,7 +23,8 @@ public static class VolumeProfileLoader {
         var profile = new VolumeProfile { Name = Path.GetFileNameWithoutExtension(assetPath) };
 
         foreach (VolumeComponentDefinition componentDef in definition.Components ?? []) {
-            Type type = ComponentRegistry.ResolveVolume(componentDef.Type);
+            var typeName = LegacyTypeNames.GetValueOrDefault(componentDef.Type, componentDef.Type);
+            Type type = ComponentRegistry.ResolveVolume(typeName);
             if (type is null) {
                 Debugging.LogWarning($"'{assetPath}': unknown volume component '{componentDef.Type}'; skipped.");
                 continue;

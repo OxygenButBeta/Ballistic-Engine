@@ -1,4 +1,4 @@
-using OpenTK.Graphics.OpenGL4;
+﻿using OpenTK.Graphics.OpenGL4;
 using OpenTK.Mathematics;
 
 namespace BallisticEngine;
@@ -17,7 +17,7 @@ namespace BallisticEngine;
 // History persists per render target across frames and resets on resize. Like SSR/SSGI it
 // reconstructs world pos from the single-sample depth attachment, so it only runs with MSAA
 // off (i.e. when TAA is active) - which also lets TAA further stabilize the shafts.
-public sealed class GLVolumetricLightPass {
+public sealed class GLVolumetricFogPass {
     readonly StandardShader marchShader;
     readonly StandardShader temporalShader;
     readonly StandardShader combineShader;
@@ -35,7 +35,7 @@ public sealed class GLVolumetricLightPass {
 
     int frameIndex;
 
-    public GLVolumetricLightPass() {
+    public GLVolumetricFogPass() {
         var vert = EmbeddedShaderSource.Read("FSQ_Vert.glsl");
         marchShader = GraphicAPI.CreateStandardShader(vert, EmbeddedShaderSource.Read("Volumetric_Frag.glsl"));
         temporalShader = GraphicAPI.CreateStandardShader(vert, EmbeddedShaderSource.Read("Volumetric_Temporal.glsl"));

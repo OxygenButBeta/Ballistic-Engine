@@ -77,7 +77,7 @@ public static class VolumePostProcessing {
             fx.ContactShadowThickness = shadows.contactThickness.Value;
         }
 
-        if (stack.GetComponent<VolumetricLight>() is { } volumetric) {
+        if (stack.GetComponent<VolumetricFog>() is { } volumetric) {
             fx.VolumetricEnabled = volumetric.enabled.Value;
             fx.VolumetricIntensity = volumetric.intensity.Value;
             fx.VolumetricDensity = volumetric.density.Value;

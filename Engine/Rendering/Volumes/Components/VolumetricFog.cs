@@ -1,4 +1,4 @@
-using OpenTK.Mathematics;
+﻿using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -7,7 +7,7 @@ namespace BallisticEngine;
 // hides the scene behind it, in-scattering the atmosphere-attenuated sun (golden at dusk,
 // gone at night when a ProceduralSky drives the scene) and the baked sky's average
 // radiance as skylight — so the fog always matches the sky and clouds above it.
-public sealed class VolumetricLight : VolumeComponent {
+public sealed class VolumetricFog : VolumeComponent {
     public readonly BoolParameter enabled = new(false);
 
     [Tooltip("Master strength: fades the whole fog out below 1, boosts only the glow above 1.")]
