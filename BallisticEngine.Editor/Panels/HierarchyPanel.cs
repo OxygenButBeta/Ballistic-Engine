@@ -107,6 +107,9 @@ internal sealed class HierarchyPanel {
                     DuplicateSelected(scene);
                 if (ImGui.IsKeyPressed(ImGuiKey.Delete))
                     DeleteSelected(scene);
+                // Ctrl+Shift+G: wrap the selection in a new parent "Group" (Unity), keeping world poses.
+                if (ImGui.GetIO().KeyCtrl && ImGui.GetIO().KeyShift && ImGui.IsKeyPressed(ImGuiKey.G))
+                    GroupSelected(scene);
             }
         }
     }
@@ -134,6 +137,49 @@ internal sealed class HierarchyPanel {
             clones.Add(EntityClone.Duplicate(scene, e));
         if (clones.Count > 0)
             state.SelectEntities(clones, clones[^1]);
+        state.MarkViewportDirty();
+    }
+
+    // Ctrl+Shift+G (Unity's Group): create a new empty "Group" entity at the centre of the selection
+    // and reparent every selected entity under it, KEEPING their world poses. Only top-level selected
+    // entities are grouped (a selected child whose selected ancestor is also grouped moves with it, so
+    // it's skipped) — otherwise reparenting a child onto the group would pull it out of its parent.
+    void GroupSelected(Scene scene) {
+        var targets = state.SelectedEntities.ToArray();
+        if (targets.Length == 0) return;
+
+        // Drop any selected entity that has a selected ANCESTOR — it'll move with that ancestor.
+        var roots = new List<Entity>();
+        foreach (Entity e in targets) {
+            bool hasSelectedAncestor = false;
+            for (Transform t = e.transform.Parent; t is not null; t = t.Parent)
+                if (t.Entity is { } pe && Array.IndexOf(targets, pe) >= 0) { hasSelectedAncestor = true; break; }
+            if (!hasSelectedAncestor) roots.Add(e);
+        }
+        if (roots.Count == 0) return;
+
+        EditorUndo.Push(roots.Count == 1 ? "Group" : $"Group {roots.Count} Entities");
+
+        // Group pivot at the centre of the roots' world positions (Unity-style).
+        OpenTK.Mathematics.Vector3 centre = OpenTK.Mathematics.Vector3.Zero;
+        foreach (Entity e in roots) centre += e.transform.WorldPosition;
+        centre /= roots.Count;
+
+        Entity group = scene.CreateEntity("Group");
+        group.transform.WorldPosition = centre;
+
+        // Reparent under the common parent of the roots if they share one, so the group sits where the
+        // objects were in the hierarchy; otherwise it's a scene root.
+        Transform commonParent = roots[0].transform.Parent;
+        foreach (Entity e in roots)
+            if (!ReferenceEquals(e.transform.Parent, commonParent)) { commonParent = null; break; }
+        if (commonParent is not null)
+            group.transform.SetParentKeepingWorld(commonParent);
+
+        foreach (Entity e in roots)
+            e.transform.SetParentKeepingWorld(group.transform);
+
+        state.Select(group);
         state.MarkViewportDirty();
     }
 
@@ -361,6 +407,7 @@ internal sealed class HierarchyPanel {
             ImGui.EndMenu();
         }
         if (ImGui.MenuItem($"Duplicate{suffix}", "Ctrl+D")) DuplicateSelected(scene);
+        if (ImGui.MenuItem($"Group{suffix}", "Ctrl+Shift+G")) GroupSelected(scene);
         if (entity.transform.Parent is not null && ImGui.MenuItem($"Unparent{suffix}")) {
             EditorUndo.Push("Unparent");
             foreach (Entity e in state.SelectedEntities.ToArray())
