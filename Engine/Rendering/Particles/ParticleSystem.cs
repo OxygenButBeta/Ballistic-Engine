@@ -112,6 +112,19 @@ public class ParticleSystem : Behaviour {
     [Tooltip("Optional billboard texture. Drag an image asset; unassigned = a soft round dot.")]
     public Texture2D Texture { get; set; }
 
+    [Header("Texture sheet animation")]
+    [Tooltip("Columns in the flipbook sprite sheet. 1 = no sheet animation.")]
+    [Range(1, 32)]
+    public int SheetTilesX { get; set; } = 1;
+
+    [Tooltip("Rows in the flipbook sprite sheet. 1 = no sheet animation.")]
+    [Range(1, 32)]
+    public int SheetTilesY { get; set; } = 1;
+
+    [Tooltip("How many times the flipbook plays over a particle's lifetime (1 = play once).")]
+    [Range(0.1f, 20f)]
+    public float SheetCycles { get; set; } = 1f;
+
     // ---- Simulation state (runtime-only) ------------------------------------
 
     Particle[] pool;
@@ -294,17 +307,35 @@ public class ParticleSystem : Behaviour {
         if (instanceScratch is null || instanceScratch.Length < liveCount)
             instanceScratch = new ParticleInstance[Math.Max(liveCount, 16)];
 
+        int tilesX = Math.Max(1, SheetTilesX);
+        int tilesY = Math.Max(1, SheetTilesY);
+        int tileCount = tilesX * tilesY;
+        bool animated = tileCount > 1;
+        float invX = 1f / tilesX, invY = 1f / tilesY;
+
         for (var i = 0; i < liveCount; i++) {
             ref Particle p = ref pool[i];
             float u = p.NormalizedAge;
             Vector3 rgb = Vector3.Lerp(StartColor, EndColor, u);
             float a = MathHelper.Lerp(StartAlpha, EndAlpha, u);
             float size = MathHelper.Lerp(p.StartSize, p.StartSize * SafeRatio(EndSize, StartSize), u);
+
+            Vector4 uvRect = new(0f, 0f, 1f, 1f);
+            if (animated) {
+                // Frame index marches through the grid over the lifetime, SheetCycles times. Top-left
+                // origin (V flipped) so frame 0 is the sheet's top-left cell.
+                int frame = (int)(u * SheetCycles * tileCount) % tileCount;
+                int col = frame % tilesX;
+                int row = frame / tilesX;
+                uvRect = new Vector4(col * invX, 1f - (row + 1) * invY, invX, invY);
+            }
+
             instanceScratch[i] = new ParticleInstance {
                 Position = p.Position,
                 Size = size,
                 Color = new Vector4(rgb, a),
                 Rotation = p.Rotation,
+                UvRect = uvRect,
             };
         }
         instances = instanceScratch;

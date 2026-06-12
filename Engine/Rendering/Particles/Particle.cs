@@ -20,13 +20,16 @@ internal struct Particle {
 
 // The render-ready snapshot of one particle the GL pass streams into its instance buffer. Color and
 // size are pre-evaluated on the CPU (start->end over lifetime), so the shader stays trivial. Explicit
-// sequential layout (no padding between these blittable fields) so the GL pass can MemoryMarshal the
-// array straight into a VBO matching the vertex attribute layout: vec3 pos, float size, vec4 color,
-// float rotation = 9 floats / 36 bytes, stride 36.
+// sequential layout (no padding between these blittable fields) so the GL pass can stream the array
+// into a VBO matching the vertex attribute layout: vec3 pos, float size, vec4 color, float rotation,
+// vec4 uvRect = 13 floats / 52 bytes.
 [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
 public struct ParticleInstance {
     public Vector3 Position;
     public float Size;
     public Vector4 Color;      // RGBA, premultiplied-friendly
     public float Rotation;
+    // Sub-rect of the texture this particle samples (offset.xy, scale.xy). Whole texture = (0,0,1,1);
+    // a texture-sheet tile is a smaller cell. The shader maps the quad uv into this rect.
+    public Vector4 UvRect;
 }

@@ -10,6 +10,7 @@ layout(location = 4) in vec3 iPosition;  // world-space center
 layout(location = 5) in float iSize;     // world-space billboard size
 layout(location = 6) in vec4 iColor;     // RGBA (color/alpha pre-lerped over lifetime)
 layout(location = 7) in float iRotation; // billboard roll, radians
+layout(location = 8) in vec4 iUvRect;    // texture-sheet sub-rect: offset.xy, scale.xy
 
 out vec2 uv;
 out vec4 color;
@@ -18,7 +19,8 @@ uniform mat4 view;
 uniform mat4 projection;
 
 void main() {
-    uv = aUv;
+    // Map the quad's [0,1] uv into this particle's texture-sheet cell (whole texture = (0,0,1,1)).
+    uv = iUvRect.xy + aUv * iUvRect.zw;
     color = iColor;
 
     // Rotate the corner in the billboard plane (roll around the view direction).

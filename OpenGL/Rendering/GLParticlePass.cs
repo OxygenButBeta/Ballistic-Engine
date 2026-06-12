@@ -15,7 +15,7 @@ public sealed class GLParticlePass {
     int vao, quadVbo, quadEbo, instanceVbo;
     int instanceCapacity;   // in instances
 
-    const int InstanceStrideBytes = 9 * sizeof(float); // vec3 pos + float size + vec4 color + float rot
+    const int InstanceStrideBytes = 13 * sizeof(float); // pos(3)+size(1)+color(4)+rot(1)+uvRect(4)
 
     void EnsureResources() {
         if (shader is not null)
@@ -72,6 +72,9 @@ public sealed class GLParticlePass {
         GL.EnableVertexAttribArray(7); // iRotation (float) @ 32
         GL.VertexAttribPointer(7, 1, VertexAttribPointerType.Float, false, InstanceStrideBytes, 8 * sizeof(float));
         GL.VertexAttribDivisor(7, 1);
+        GL.EnableVertexAttribArray(8); // iUvRect (vec4) @ 36 — texture-sheet sub-rect
+        GL.VertexAttribPointer(8, 4, VertexAttribPointerType.Float, false, InstanceStrideBytes, 9 * sizeof(float));
+        GL.VertexAttribDivisor(8, 1);
 
         GL.BindVertexArray(0);
     }
@@ -137,16 +140,17 @@ public sealed class GLParticlePass {
     }
 
     float[] uploadScratch;
+    const int FloatsPerInstance = 13;
     void UploadInstances(ParticleInstance[] instances, int count) {
-        // Flatten to a float[] (9 floats per instance) and upload — the most portable path through
+        // Flatten to a float[] (13 floats per instance) and upload — the most portable path through
         // OpenTK's typed BufferData overloads (a raw struct blit via BufferSubData(byte[]) silently
         // uploaded nothing on this driver).
-        int floats = count * 9;
+        int floats = count * FloatsPerInstance;
         if (uploadScratch is null || uploadScratch.Length < floats)
             uploadScratch = new float[floats];
         for (var i = 0; i < count; i++) {
             ref ParticleInstance p = ref instances[i];
-            int o = i * 9;
+            int o = i * FloatsPerInstance;
             uploadScratch[o + 0] = p.Position.X;
             uploadScratch[o + 1] = p.Position.Y;
             uploadScratch[o + 2] = p.Position.Z;
@@ -156,6 +160,10 @@ public sealed class GLParticlePass {
             uploadScratch[o + 6] = p.Color.Z;
             uploadScratch[o + 7] = p.Color.W;
             uploadScratch[o + 8] = p.Rotation;
+            uploadScratch[o + 9] = p.UvRect.X;
+            uploadScratch[o + 10] = p.UvRect.Y;
+            uploadScratch[o + 11] = p.UvRect.Z;
+            uploadScratch[o + 12] = p.UvRect.W;
         }
 
         GL.BindBuffer(BufferTarget.ArrayBuffer, instanceVbo);
