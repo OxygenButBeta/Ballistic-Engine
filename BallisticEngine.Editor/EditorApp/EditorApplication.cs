@@ -1051,6 +1051,20 @@ internal sealed class EditorApplication {
             res.CustomW = Math.Clamp(res.CustomW, 1, 16384);
             res.CustomH = Math.Clamp(res.CustomH, 1, 16384);
         }
+        else if (res.IsCustomAspect) {
+            // Custom aspect: two small int fields for the ratio (e.g. 21 : 9). Fills the panel,
+            // letterboxed to this ratio, no fixed pixel count.
+            ImGui.SameLine(0, 6 * S);
+            ImGui.SetNextItemWidth(46 * S);
+            ImGui.InputInt($"##aw{id}", ref res.AspectW, 0, 0);
+            ImGui.SameLine(0, 2);
+            ImGui.TextDisabled(":");
+            ImGui.SameLine(0, 2);
+            ImGui.SetNextItemWidth(46 * S);
+            ImGui.InputInt($"##ah{id}", ref res.AspectH, 0, 0);
+            res.AspectW = Math.Clamp(res.AspectW, 1, 256);
+            res.AspectH = Math.Clamp(res.AspectH, 1, 256);
+        }
 
         ImGui.SameLine(0, 16 * S);
         ImGui.TextDisabled($"{EditorIcons.Search}");

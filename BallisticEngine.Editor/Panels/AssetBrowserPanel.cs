@@ -1144,6 +1144,12 @@ internal sealed class AssetBrowserPanel {
         ImGui.BeginGroup();
         ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 6f);
 
+        // A tile that's been CUT (Ctrl+X, awaiting paste) dims so you can tell it's "in the clipboard
+        // to move" — Explorer/Unity behaviour. Popped at the end of the group.
+        bool cutGhost = clipboardCut && clipboardPaths.Contains(path);
+        if (cutGhost)
+            ImGui.PushStyleVar(ImGuiStyleVar.Alpha, ImGui.GetStyle().Alpha * 0.45f);
+
         // Images and meshes render a real preview; everything else gets a dark tile with a big
         // type icon tinted by category (+ the short tag below it).
         bool clicked;
@@ -1195,6 +1201,8 @@ internal sealed class AssetBrowserPanel {
         BeginAssetDragSource(name, guid);
         if (!DrawRenameField(path, tile, isFolder: false))
             TileLabel(name, tile);
+        if (cutGhost)
+            ImGui.PopStyleVar();
         ImGui.EndGroup();
         ImGui.PopID();
     }

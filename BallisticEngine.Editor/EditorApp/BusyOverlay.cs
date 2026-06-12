@@ -20,20 +20,36 @@ internal static class BusyOverlay {
         // light-probe bake, and standalone player builds (the last two report determinate progress).
         var baking = IrradianceVolume.IsBaking;
         var buildingPlayer = BuildProgress.IsBuilding;
-        var busy = AsyncAssetImport.IsBusy || SceneCommands.IsLoading || baking || buildingPlayer;
+        var unityImport = UnityImportWindow.IsBusy;
+        var busy = AsyncAssetImport.IsBusy || SceneCommands.IsLoading || baking || buildingPlayer || unityImport;
         if (!busy)
             return;
 
         // Both the bake and the build show a determinate bar (and a taller card); an asset import
-        // is determinate once the import stage has reported its job count (Fraction >= 0).
+        // is determinate once the import stage has reported its job count (Fraction >= 0). The Unity
+        // package extract/convert reports its own determinate fraction.
         var importDeterminate = AsyncAssetImport.IsBusy && AsyncAssetImport.Fraction >= 0f;
-        var determinate = baking || buildingPlayer;
+        var determinate = baking || buildingPlayer || unityImport;
 
         ImGuiIOPtr io = ImGui.GetIO();
         SysVec2 display = io.DisplaySize;
         float dt = io.DeltaTime > 0 ? io.DeltaTime : 1f / 60f;
         anim = (anim + dt * 0.9f) % 1f;
         dots = (dots + dt) % 1.5f;
+
+        // Block ALL input to the panels behind the overlay — it's a true modal now. A full-window
+        // invisible window swallows mouse/keyboard so the user can't click/edit things behind the dim
+        // (the old foreground-draw-list overlay let clicks fall through). Topmost, no decoration.
+        ImGui.SetNextWindowPos(SysVec2.Zero);
+        ImGui.SetNextWindowSize(display);
+        ImGui.SetNextWindowBgAlpha(0f);
+        const ImGuiWindowFlags blockFlags = ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.NoMove |
+            ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.NoDocking | ImGuiWindowFlags.NoNav |
+            ImGuiWindowFlags.NoBringToFrontOnFocus;
+        ImGui.Begin("##busyblocker", blockFlags);
+        ImGui.SetWindowFocus();                 // grab focus so keyboard goes nowhere useful
+        ImGui.InvisibleButton("##busyeat", display);   // eat clicks over the whole area
+        ImGui.End();
 
         var draw = ImGui.GetForegroundDrawList();
 
@@ -53,17 +69,21 @@ internal static class BusyOverlay {
 
         // Title + animated ellipsis.
         var ellipsis = new string('.', 1 + (int)(dots / 0.5f) % 3);
-        var statusText = buildingPlayer ? BuildProgress.Status
+        var statusText = unityImport ? UnityImportWindow.BusyStatus
+            : buildingPlayer ? BuildProgress.Status
             : baking ? IrradianceVolume.BakeStatus
             : SceneCommands.IsLoading ? SceneCommands.LoadingStatus
             : AsyncAssetImport.Status;
-        var status = $"{statusText.TrimEnd('.')}{ellipsis}";
+        float textW = cardSize.X - pad * 2;
+        var status = Truncate($"{statusText.TrimEnd('.')}{ellipsis}", textW);
         draw.AddText(cardPos + new SysVec2(pad, pad),
             ImGui.GetColorU32(new SysVec4(0.92f, 0.92f, 0.95f, 1f)), status);
 
         // Subtext: the build step, the scene-load stage, the file being imported, or a reassuring note.
         var file = AsyncAssetImport.CurrentFile;
-        var sub = buildingPlayer
+        var sub = unityImport
+            ? "Extracting and converting the Unity package..."
+            : buildingPlayer
             ? (string.IsNullOrEmpty(BuildProgress.Detail) ? "Producing a standalone player..." : BuildProgress.Detail)
             : baking
                 ? "The scene keeps rendering while probes bake."
@@ -71,7 +91,7 @@ internal static class BusyOverlay {
                     ? SceneCommands.LoadingDetail
                     : string.IsNullOrEmpty(file) ? "The editor stays responsive while importing." : file;
         draw.AddText(cardPos + new SysVec2(pad, pad + 22 * s),
-            ImGui.GetColorU32(new SysVec4(0.6f, 0.6f, 0.64f, 1f)), sub);
+            ImGui.GetColorU32(new SysVec4(0.6f, 0.6f, 0.64f, 1f)), Truncate(sub, textW));
 
         // Cancel button (manual hit-test: the overlay is a foreground draw list, not a window). Sits
         // on its own row BELOW the subtext (right-aligned), above the progress bar — so the long
@@ -105,7 +125,8 @@ internal static class BusyOverlay {
         uint barFill = ImGui.GetColorU32(new SysVec4(0.26f, 0.55f, 0.95f, 1f));
         if (determinate || importDeterminate) {
             // Determinate: the bake / build / import knows roughly how far along it is.
-            float progress = buildingPlayer ? BuildProgress.Fraction
+            float progress = unityImport ? UnityImportWindow.BusyFraction
+                : buildingPlayer ? BuildProgress.Fraction
                 : baking ? IrradianceVolume.BakeProgress
                 : AsyncAssetImport.Fraction;
             float fill = Math.Clamp(progress, 0f, 1f) * barW;
@@ -120,5 +141,21 @@ internal static class BusyOverlay {
             draw.AddRectFilled(new SysVec2(x0, barMin.Y), new SysVec2(x0 + segW, barMax.Y),
                 barFill, barH * 0.5f);
         }
+    }
+
+    // Shortens text to fit maxWidth, appending an ellipsis. A long path is trimmed from the FRONT
+    // (the file name at the end is the useful part); plain status text from the back.
+    static string Truncate(string text, float maxWidth) {
+        if (string.IsNullOrEmpty(text) || ImGui.CalcTextSize(text).X <= maxWidth)
+            return text;
+        bool isPath = text.Contains('/') || text.Contains('\\');
+        if (isPath) {
+            while (text.Length > 4 && ImGui.CalcTextSize("..." + text).X > maxWidth)
+                text = text[1..];
+            return "..." + text;
+        }
+        while (text.Length > 4 && ImGui.CalcTextSize(text + "...").X > maxWidth)
+            text = text[..^1];
+        return text + "...";
     }
 }

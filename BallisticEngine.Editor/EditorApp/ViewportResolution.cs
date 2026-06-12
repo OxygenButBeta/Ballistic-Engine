@@ -19,29 +19,45 @@ internal sealed class ViewportResolution {
         ("3840 x 2160", 3840, 2160),
     ];
 
-    // The combo lists every preset plus a trailing "Custom..." entry; selecting it renders at
-    // CustomW x CustomH (editable in the bar). CustomIndex is one past the last preset.
+    // The combo lists every preset plus two trailing custom entries: "Custom..." (exact W x H) and
+    // "Custom Aspect..." (a fixed RATIO that fills the panel, like 21:9). CustomIndex is one past the
+    // last preset; CustomAspectIndex follows it.
     public static readonly string[] PresetLabels =
-        [.. System.Array.ConvertAll(Presets, p => p.label), "Custom..."];
+        [.. System.Array.ConvertAll(Presets, p => p.label), "Custom...", "Custom Aspect..."];
     public static int CustomIndex => Presets.Length;
+    public static int CustomAspectIndex => Presets.Length + 1;
 
-    public int PresetIndex;          // index into PresetLabels (Presets.Length == Custom)
+    public int PresetIndex;          // index into PresetLabels
     public float Zoom = 1f;          // 1 .. 8  image magnification (zoom INTO the rendered picture)
     public int CustomW = 1280, CustomH = 720;
+    public int AspectW = 21, AspectH = 9;   // for Custom Aspect mode
 
     public bool IsCustom => PresetIndex == CustomIndex;
-    public bool IsFree => !IsCustom && Presets[PresetIndex].w == 0;
+    public bool IsCustomAspect => PresetIndex == CustomAspectIndex;
+    public bool IsFree => !IsCustom && !IsCustomAspect && Presets[PresetIndex].w == 0;
 
-    // The fixed resolution for the current selection (custom or preset). Only valid when !IsFree.
+    // The fixed resolution for the current selection (exact-custom or preset). Only valid when the
+    // selection is a fixed RESOLUTION (not Free, not Custom Aspect).
     (int w, int h) Fixed => IsCustom
         ? (System.Math.Max(1, CustomW), System.Math.Max(1, CustomH))
         : (Presets[PresetIndex].w, Presets[PresetIndex].h);
+
+    // The target aspect (width/height) for the current selection, or 0 if Free.
+    float TargetAspect => IsCustomAspect
+        ? (float)System.Math.Max(1, AspectW) / System.Math.Max(1, AspectH)
+        : IsFree ? 0f : (float)Fixed.w / Fixed.h;
 
     // The pixel resolution to render at, given the available panel size. Zoom does NOT change this —
     // it magnifies the displayed image (samples a smaller centered region), exactly like zooming into
     // a photo: the render stays the same, you just look closer at part of it.
     public SysVec2 RenderSize(SysVec2 panel) {
         if (IsFree) return panel;
+        // Custom Aspect renders at the largest rect of that ratio that fits the panel (no fixed pixel
+        // count — it tracks the panel like Free, just letterboxed to the ratio).
+        if (IsCustomAspect) {
+            var (size, _) = DisplayRect(panel);
+            return size;
+        }
         (int w, int h) = Fixed;
         return new SysVec2(w, h);
     }
@@ -63,8 +79,7 @@ internal sealed class ViewportResolution {
         if (IsFree)
             return (panel, SysVec2.Zero);
 
-        (int fw, int fh) = Fixed;
-        float targetAspect = (float)fw / fh;
+        float targetAspect = TargetAspect;
         float panelAspect = panel.X / panel.Y;
 
         SysVec2 size = panelAspect > targetAspect
