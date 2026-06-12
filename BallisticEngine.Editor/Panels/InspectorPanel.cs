@@ -2380,6 +2380,52 @@ internal sealed class InspectorPanel {
         ImGui.TextDisabled("Changing the type reimports. Loaded materials keep the\nold instance until the scene reloads.");
     }
 
+    // Material preview thumbnail state. Re-rendered only when the material (guid) or its serialized
+    // content (hash) changes, so the GL pass runs once per edit, not per frame.
+    Guid materialPreviewGuid;
+    int materialPreviewHash;
+    int materialPreviewTex;
+    const int MaterialPreviewSize = 128;
+
+    void DrawMaterialPreview(Guid guid, MaterialDefinition definition) {
+        // cheap content fingerprint: re-render only when the serialized material changes
+        int hash = System.Text.Json.JsonSerializer.Serialize(definition, PipelineJson.Options).GetHashCode();
+        if (guid != materialPreviewGuid || hash != materialPreviewHash || materialPreviewTex == 0) {
+            try {
+                byte[] pixels = MaterialPreviewRenderer.Render(definition, MaterialPreviewSize);
+                materialPreviewTex = UploadPreviewTexture(materialPreviewTex, pixels, MaterialPreviewSize);
+                materialPreviewGuid = guid;
+                materialPreviewHash = hash;
+            }
+            catch (Exception e) {
+                Debugging.LogError($"Material preview failed: {e.Message}");
+                materialPreviewTex = 0;
+            }
+        }
+
+        if (materialPreviewTex != 0) {
+            float size = 120f;
+            float pad = (ImGui.GetContentRegionAvail().X - size) * 0.5f;
+            if (pad > 0) ImGui.SetCursorPosX(ImGui.GetCursorPosX() + pad);
+            ImGui.Image(EditorApplication.Tex(materialPreviewTex), new SysVec2(size, size));
+            ImGui.Spacing();
+        }
+    }
+
+    // Uploads RGBA pixels into a (reused) GL texture and returns its id.
+    static int UploadPreviewTexture(int existing, byte[] pixels, int size) {
+        int tex = existing != 0 ? existing : OpenTK.Graphics.OpenGL4.GL.GenTexture();
+        OpenTK.Graphics.OpenGL4.GL.BindTexture(OpenTK.Graphics.OpenGL4.TextureTarget.Texture2D, tex);
+        OpenTK.Graphics.OpenGL4.GL.TexImage2D(OpenTK.Graphics.OpenGL4.TextureTarget.Texture2D, 0,
+            OpenTK.Graphics.OpenGL4.PixelInternalFormat.Rgba, size, size, 0,
+            OpenTK.Graphics.OpenGL4.PixelFormat.Rgba, OpenTK.Graphics.OpenGL4.PixelType.UnsignedByte, pixels);
+        OpenTK.Graphics.OpenGL4.GL.TexParameter(OpenTK.Graphics.OpenGL4.TextureTarget.Texture2D,
+            OpenTK.Graphics.OpenGL4.TextureParameterName.TextureMinFilter, (int)OpenTK.Graphics.OpenGL4.TextureMinFilter.Linear);
+        OpenTK.Graphics.OpenGL4.GL.TexParameter(OpenTK.Graphics.OpenGL4.TextureTarget.Texture2D,
+            OpenTK.Graphics.OpenGL4.TextureParameterName.TextureMagFilter, (int)OpenTK.Graphics.OpenGL4.TextureMagFilter.Linear);
+        return tex;
+    }
+
     void DrawMaterialEditor(string path, Guid guid) {
         var absolute = AssetDatabase.Project.ResolveAbsolute(path);
         MaterialDefinition definition;
@@ -2390,6 +2436,10 @@ internal sealed class InspectorPanel {
             ImGui.TextDisabled($"Unreadable material: {exception.Message}");
             return;
         }
+
+        // Unity-style preview sphere: render the material to a thumbnail (re-rendered only when the
+        // material's serialized state changes), upload to a GL texture, show it centered.
+        DrawMaterialPreview(guid, definition);
 
         ImGui.TextDisabled($"Shader: {definition.Shader ?? "(none)"}");
         ImGui.Spacing();
@@ -2420,6 +2470,22 @@ internal sealed class InspectorPanel {
             }
 
             // Scalar material properties (stored in the .mat next to the texture refs).
+            // Base color: linear RGBA tint multiplying the albedo map (glTF baseColorFactor).
+            // White is the neutral "unstated" default, so it's stored as null and rendering
+            // is bit-identical to a .mat without the key.
+            Row("Base Color");
+            var baseColor = definition.BaseColor switch {
+                { Length: >= 4 } bc => new SysVec4(bc[0], bc[1], bc[2], bc[3]),
+                { Length: 3 } bc => new SysVec4(bc[0], bc[1], bc[2], 1f),
+                _ => SysVec4.One,
+            };
+            if (ImGui.ColorEdit4("##matbasecolor", ref baseColor)) {
+                definition.BaseColor = baseColor == SysVec4.One
+                    ? null
+                    : [baseColor.X, baseColor.Y, baseColor.Z, baseColor.W];
+                changed = true;
+            }
+
             // Packed ORM: metallic texture carries (occlusion, roughness, metallic) in RGB.
             // Auto-detected from "spec" file names when the .mat doesn't say explicitly.
             Row("Packed ORM");
@@ -2476,6 +2542,7 @@ internal sealed class InspectorPanel {
         if (changed) {
             PipelineJson.Write(absolute, definition);
             ApplyLiveMaterial(guid, definition);
+            state.MarkViewportDirty();
         }
 
         ImGui.Spacing();
