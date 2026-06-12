@@ -297,7 +297,55 @@ internal sealed class AssetBrowserPanel {
 
     // ---- Folder tree (left pane) ---------------------------------------------
 
+    // Favourites strip above the folder tree (Unity's left-pane Favorites): pinned folders for one-
+    // click navigation. Add via a folder's context menu ("Add to Favourites"); remove by right-click.
+    void DrawFavorites() {
+        List<string> favs = EditorPrefs.Current.FavoriteFolders;
+        if (favs.Count == 0)
+            return;
+
+        ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+        ImGui.TextUnformatted($"{EditorIcons.Pin}  Favourites");
+        ImGui.PopStyleColor();
+
+        string remove = null;
+        for (var i = 0; i < favs.Count; i++) {
+            string fav = favs[i];
+            string name = fav == "Assets" ? "Assets" : fav[(fav.LastIndexOf('/') + 1)..];
+            ImGui.PushID($"fav{i}");
+            bool current = string.Equals(fav, CurrentFolder, StringComparison.OrdinalIgnoreCase);
+            ImGui.PushStyleColor(ImGuiCol.Text, new SysVec4(0.95f, 0.82f, 0.45f, 1f));
+            ImGui.TextUnformatted(EditorIcons.Folder);
+            ImGui.PopStyleColor();
+            ImGui.SameLine(0, 6);
+            if (ImGui.Selectable($"  {name}##fav", current))
+                NavigateTo(fav);
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip($"{fav}\nRight-click to remove from favourites.");
+            if (ImGui.BeginPopupContextItem($"##favctx{i}")) {
+                if (ImGui.MenuItem("Remove from Favourites")) remove = fav;
+                ImGui.EndPopup();
+            }
+            ImGui.PopID();
+        }
+        if (remove is not null) {
+            favs.Remove(remove);
+            EditorPrefs.Save();
+        }
+        ImGui.Separator();
+    }
+
+    static bool IsFavorite(string folderPath) => EditorPrefs.Current.FavoriteFolders.Contains(folderPath);
+
+    static void ToggleFavorite(string folderPath) {
+        List<string> favs = EditorPrefs.Current.FavoriteFolders;
+        if (!favs.Remove(folderPath))
+            favs.Add(folderPath);
+        EditorPrefs.Save();
+    }
+
     void DrawFolderTree() {
+        DrawFavorites();
         DrawFolderNode("Assets");
         revealPending = false;
 
@@ -911,6 +959,8 @@ internal sealed class AssetBrowserPanel {
         if (ImGui.BeginPopupContextItem("##folderctx")) {
             if (ImGui.MenuItem("Open"))
                 NavigateTo(folderPath);
+            if (ImGui.MenuItem(IsFavorite(folderPath) ? $"{EditorIcons.Pin}  Remove from Favourites" : $"{EditorIcons.Pin}  Add to Favourites"))
+                ToggleFavorite(folderPath);
             if (ImGui.MenuItem("Rename"))
                 BeginRename(folderPath);
             if (ImGui.MenuItem("Show in Explorer"))

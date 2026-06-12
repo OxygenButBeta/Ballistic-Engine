@@ -28,6 +28,9 @@ internal sealed class EditorPrefs {
     // --- Asset browser --- width of the folder tree pane (unscaled px; multiplied by DPI scale).
     public float AssetTreeWidth { get; set; } = 190f;
 
+    // Favourite folders (project-relative "Assets/..." paths) pinned above the folder tree, Unity-style.
+    public List<string> FavoriteFolders { get; set; } = new();
+
     // --- Grid + snapping ---
     public bool ShowGrid { get; set; } = true;
     public float GridSize { get; set; } = 1f;
