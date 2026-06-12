@@ -1014,11 +1014,17 @@ void main() {
     // ComputeSubmeshVisibility (camera-independent), reused by the shadow pass to cull each submesh
     // against the per-cascade LIGHT frustum (so off-camera-but-in-cascade submeshes still cast).
     readonly Dictionary<IStaticMeshRenderer, (Vector3[] Min, Vector3[] Max)> wholeMeshSubmeshAabb = new();
+    // The model matrix the cached world AABBs were built from, per renderer — so the expensive
+    // ~1600-submesh 8-corner world transform is SKIPPED when the renderer hasn't moved (the common
+    // static-camera/static-scene case). The cheap per-submesh frustum mask still recomputes each frame
+    // (it depends on the camera, which can move while the model is still).
+    readonly Dictionary<IStaticMeshRenderer, Matrix4> wholeMeshSubmeshAabbMatrix = new();
     readonly Vector4[] submeshCullPlanes = new Vector4[6];
     readonly Vector4[] shadowSubmeshPlanes = new Vector4[6];
 
     // Computes the per-submesh visibility mask (vs the main view frustum) AND caches per-submesh world
-    // AABBs (for the shadow pass) for a whole-mesh renderer.
+    // AABBs (for the shadow pass) for a whole-mesh renderer. The world-AABB recompute is skipped when
+    // the model matrix is unchanged since last frame.
     void ComputeSubmeshVisibility(IStaticMeshRenderer target) {
         Mesh mesh = target.SharedMesh;
         SubMeshData[] subs = mesh.SubMeshes;
@@ -1026,29 +1032,39 @@ void main() {
             mask = new bool[subs.Length];
             wholeMeshSubmeshVisible[target] = mask;
         }
-        if (!wholeMeshSubmeshAabb.TryGetValue(target, out var aabb) || aabb.Min.Length != subs.Length) {
+        bool haveAabb = wholeMeshSubmeshAabb.TryGetValue(target, out var aabb) && aabb.Min.Length == subs.Length;
+        if (!haveAabb) {
             aabb = (new Vector3[subs.Length], new Vector3[subs.Length]);
             wholeMeshSubmeshAabb[target] = aabb;
         }
 
         Matrix4 model = ModelMatrix(target, mesh);
+        // Recompute world AABBs only when the renderer moved (or the cache is new/resized).
+        bool rebuildAabb = !haveAabb ||
+            !wholeMeshSubmeshAabbMatrix.TryGetValue(target, out Matrix4 lastModel) || lastModel != model;
+        if (rebuildAabb)
+            wholeMeshSubmeshAabbMatrix[target] = model;
+
         for (var i = 0; i < subs.Length; i++) {
-            mesh.GetSubMeshBounds(i, out Vector3 lMin, out Vector3 lMax);
-            // World AABB of this submesh (8 corners through the model matrix).
-            var wMin = new Vector3(float.MaxValue);
-            var wMax = new Vector3(float.MinValue);
-            for (var c = 0; c < 8; c++) {
-                var corner = new Vector3(
-                    (c & 1) == 0 ? lMin.X : lMax.X,
-                    (c & 2) == 0 ? lMin.Y : lMax.Y,
-                    (c & 4) == 0 ? lMin.Z : lMax.Z);
-                Vector3 w = (new Vector4(corner, 1f) * model).Xyz;
-                wMin = Vector3.ComponentMin(wMin, w);
-                wMax = Vector3.ComponentMax(wMax, w);
+            if (rebuildAabb) {
+                mesh.GetSubMeshBounds(i, out Vector3 lMin, out Vector3 lMax);
+                // World AABB of this submesh (8 corners through the model matrix).
+                var wMin = new Vector3(float.MaxValue);
+                var wMax = new Vector3(float.MinValue);
+                for (var c = 0; c < 8; c++) {
+                    var corner = new Vector3(
+                        (c & 1) == 0 ? lMin.X : lMax.X,
+                        (c & 2) == 0 ? lMin.Y : lMax.Y,
+                        (c & 4) == 0 ? lMin.Z : lMax.Z);
+                    Vector3 w = (new Vector4(corner, 1f) * model).Xyz;
+                    wMin = Vector3.ComponentMin(wMin, w);
+                    wMax = Vector3.ComponentMax(wMax, w);
+                }
+                aabb.Min[i] = wMin;
+                aabb.Max[i] = wMax;
             }
-            aabb.Min[i] = wMin;
-            aabb.Max[i] = wMax;
-            mask[i] = AabbInFrustum(submeshCullPlanes, wMin, wMax);
+
+            mask[i] = AabbInFrustum(submeshCullPlanes, aabb.Min[i], aabb.Max[i]);
             if (!mask[i])
                 stats.SubMeshesCulled++;
         }
