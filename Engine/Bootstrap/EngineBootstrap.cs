@@ -272,6 +272,13 @@ public sealed class EngineBootstrap {
             Debugging.LogError($"Scene '{assetPath}' not found (no loose file or content-pack entry).");
             return;
         }
+        // Tear down the OUTGOING scene before loading the new one — Deserialize ADDS to the current
+        // scene, so without this the old entities' components stay registered (RuntimeSet renderers,
+        // lights, ...) and keep drawing/leaking even though they're gone from the hierarchy. The
+        // editor's scene-open path already does this (SceneCommands.ApplyNow); the runtime LoadScene
+        // path was missing it — the "old meshes still render after switching scenes" bug.
+        Scene current = SceneManager.GetCurrentScene();
+        current.Clear();
         SceneSerializer.Deserialize(yaml);
     }
 
