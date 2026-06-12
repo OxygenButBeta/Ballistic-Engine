@@ -416,7 +416,7 @@ internal sealed class InspectorPanel {
             SysVec3Row("Scale", transform.Scale, v => {
                 Vector3 d = v - transform.Scale; transform.Scale = v;
                 foreach (Transform o in others) o.Scale += d;
-            }, 0.05f);
+            }, 0.05f, allowUniformLock: true);
             ImGui.EndTable();
         }
 
@@ -2636,13 +2636,56 @@ internal sealed class InspectorPanel {
         ImGui.SetNextItemWidth(-1);
     }
 
-    void SysVec3Row(string label, Vector3 value, Action<Vector3> apply, float speed) {
+    void SysVec3Row(string label, Vector3 value, Action<Vector3> apply, float speed) =>
+        SysVec3Row(label, value, apply, speed, allowUniformLock: false);
+
+    // Per-member "lock proportions" (Unity's chain link on Scale): the toggle state is keyed by the
+    // member label so each lockable Vector3 row remembers its own setting.
+    readonly Dictionary<string, bool> uniformLocks = new();
+
+    void SysVec3Row(string label, Vector3 value, Action<Vector3> apply, float speed, bool allowUniformLock) {
         Row(label);
+
+        // Optional chain-link toggle before the fields: when on, editing ONE axis scales the others by
+        // the same ratio so the proportions stay fixed (e.g. (1,.5,1) -> edit X to 2 -> (2,1,2)).
+        bool locked = allowUniformLock && uniformLocks.GetValueOrDefault(label);
+        if (allowUniformLock) {
+            string icon = locked ? EditorIcons.Lock : EditorIcons.LockOpen;
+            if (EditorIcons.GhostButtonSmall($"ulock_{label}", icon,
+                    locked ? "Proportions locked - editing one axis scales the others"
+                           : "Lock proportions (uniform scaling)")) {
+                uniformLocks[label] = !locked;
+                locked = !locked;
+            }
+            ImGui.SameLine(0, 4);
+        }
+
         var sv = new SysVec3(value.X, value.Y, value.Z);
+        var before = sv;
         if (AxisVec3(label, label, ref sv, speed)) {
+            if (locked)
+                sv = ApplyUniformLock(before, sv);
             apply(new Vector3(sv.X, sv.Y, sv.Z));
             state.MarkViewportDirty();
         }
+    }
+
+    // Given the value before/after an edit where exactly one axis was dragged, scale the OTHER two by
+    // the same ratio the edited axis changed by (so proportions hold). Falls back to an additive delta
+    // when the edited axis was zero (no ratio is defined). Picks the axis with the largest change.
+    static SysVec3 ApplyUniformLock(SysVec3 before, SysVec3 after) {
+        float dx = MathF.Abs(after.X - before.X), dy = MathF.Abs(after.Y - before.Y), dz = MathF.Abs(after.Z - before.Z);
+        int axis = dx >= dy && dx >= dz ? 0 : dy >= dz ? 1 : 2;   // the dragged axis
+        float oldA = axis == 0 ? before.X : axis == 1 ? before.Y : before.Z;
+        float newA = axis == 0 ? after.X : axis == 1 ? after.Y : after.Z;
+        if (MathF.Abs(newA - oldA) < 1e-9f) return after; // nothing actually changed
+
+        if (MathF.Abs(oldA) > 1e-6f) {
+            float ratio = newA / oldA;                      // proportional: multiply the others
+            return new SysVec3(before.X * ratio, before.Y * ratio, before.Z * ratio);
+        }
+        float delta = newA - oldA;                          // old axis was 0: shift the others equally
+        return new SysVec3(before.X + delta, before.Y + delta, before.Z + delta);
     }
 
     // True if a component type is a GAME script (compiled into GameScripts.dll), not an engine type.
