@@ -734,7 +734,27 @@ void main() {
             target.NormalTextureId != -1;
 
         using (timers.Time("Composite")) {
-            if (gbufferDebug)
+            // Editor-only EXTRA debug views (AO / lit / ...) — handled by a delegate that lives in the
+            // editor project, so none of this ships in a player build. Only taken in the editor (the
+            // hook is null in the player), on the Scene target, when an extra mode is selected.
+            bool editorDebug = EditorExtraDebugMode != 0 && EditorDebugComposite != null &&
+                (ActiveTarget == RenderTarget.Scene || PresentToScreen);
+            if (editorDebug) {
+                // Bind the destination ourselves (the editor delegate draws into whatever is bound) and
+                // reset state the same way RenderDebugView does, so the editor pass is self-contained.
+                if (PresentToScreen) GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+                else CurrentDisplay.Activate();
+                GL.Disable(EnableCap.CullFace);
+                GL.Disable(EnableCap.DepthTest);
+                GL.Disable(EnableCap.Blend);
+                editorDebug = EditorDebugComposite(BuildDebugFrame(target, aoTexture, litColor, ref renderProjection));
+                GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+            }
+
+            if (editorDebug) {
+                // The editor drew the composite itself; nothing more to do here.
+            }
+            else if (gbufferDebug)
                 RenderDebugView(target, ref renderProjection);
             else if (PresentToScreen)
                 composite.Render(litColor, null, target.LenX, target.LenY, PostFX, bloomTexture, 0);
@@ -810,6 +830,25 @@ void main() {
     static float? EnvFloat(string name) =>
         float.TryParse(Environment.GetEnvironmentVariable(name),
             System.Globalization.CultureInfo.InvariantCulture, out float v) ? v : null;
+
+    // Packages this frame's buffers + destination for the editor-only extra-debug delegate. The editor
+    // is responsible for binding the destination FBO (it gets the size + which one) and drawing.
+    DebugFrame BuildDebugFrame(GLFrameBuffer target, int aoTexture, int litColor, ref Matrix4 renderProjection) {
+        int destW, destH;
+        if (PresentToScreen) { destW = target.LenX; destH = target.LenY; }
+        else { destW = CurrentDisplay.LenX; destH = CurrentDisplay.LenY; }
+        return new DebugFrame {
+            NormalTexture = target.NormalTextureId,
+            DepthTexture = target.DepthTextureId,
+            AoTexture = aoTexture,
+            LitColor = litColor,
+            DestWidth = destW,
+            DestHeight = destH,
+            PresentToScreen = PresentToScreen,
+            InvProjection = Matrix4.Invert(renderProjection),
+            Mode = EditorExtraDebugMode,
+        };
+    }
 
     // Renders the Normals or Depth debug view into the editor display target (replaces the composite).
     // Reuses the target's existing G-buffer attachments — no extra geometry pass.

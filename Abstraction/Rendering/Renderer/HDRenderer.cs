@@ -20,6 +20,28 @@ public abstract class HDRenderer {
     public enum DebugView { Shaded, Wireframe, Normals, Depth }
     public DebugView DebugViewMode { get; set; } = DebugView.Shaded;
 
+    // EDITOR-ONLY extra debug visualisations (AO / lit-no-tonemap / SSGI / ... ) live in the EDITOR
+    // project, not here, so they never ship in a player build. The renderer exposes this frame's
+    // buffers through DebugFrame and asks EditorDebugComposite to draw — if it returns true it took
+    // over the composite, otherwise the normal composite runs. The hook is null in the player (nothing
+    // sets it), so this whole feature is dead weight there. The renderer NEVER references the editor
+    // assembly; the editor wires the delegate at startup.
+    public struct DebugFrame {
+        public int NormalTexture, DepthTexture, AoTexture, LitColor;   // GL texture ids for this frame
+        public int DestWidth, DestHeight;
+        public bool PresentToScreen;     // true = draw into FB 0 (player); false = the editor display FBO
+        public OpenTK.Mathematics.Matrix4 InvProjection;
+        public int Mode;                 // editor-defined extra-mode index (0 = none / not an extra view)
+    }
+
+    // Set by the editor. Returns true if it drew the composite itself (the renderer then skips its own).
+    public static Func<DebugFrame, bool> EditorDebugComposite;
+
+    // The editor sets this to a non-zero extra-mode index when its dropdown picks an AO/Lit/etc. view;
+    // 0 means "use the built-in DebugViewMode path". Lives here (not the editor) only so GLHDRenderer
+    // can read it without an editor reference; it's never set in the player.
+    public static int EditorExtraDebugMode;
+
     // HDR -> display tunables (tonemap, bloom, SSAO, MSAA, grading). Shared by all targets.
     public PostProcessSettings PostFX { get; } = new();
 

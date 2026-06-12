@@ -128,6 +128,9 @@ internal sealed class EditorApplication {
         extraPanels.Register(EditorLayout.Console, "Console", EditorIcons.Document,
             () => new ConsolePanel(), p => ((ConsolePanel)p).DrawContents());
         extraPanels.OnTitleStrip = MaximizePanelOnTitleDoubleClick;
+
+        // Wire the editor-only extra debug views (AO / Lit / Luminance) into the renderer's hook.
+        EditorDebugViews.Install();
         settings = new SettingsPanel(imgui.SetAccent, ApplyFrameRateLimit);
         buildPanel = new BuildPanel(bootstrap.Project);
 
@@ -1127,22 +1130,36 @@ internal sealed class EditorApplication {
         // (The maximize BUTTON was removed — double-click any panel's tab to fullscreen it, Esc to
         // restore. Works for every panel now, so a dedicated viewport button is redundant.)
 
-        // Shading-mode dropdown: Shaded / Wireframe / Normals / Depth (renderer debug views). Now in
-        // BOTH the Scene and Game bars (the user wanted it in the game view too). Sets the global
-        // Renderer.DebugViewMode and forces a repaint; the popup id is per-view so they don't collide.
+        // Shading-mode dropdown: the engine's Shaded / Wireframe / Normals / Depth PLUS the editor-only
+        // extra views (AO / Lit / Luminance) that live in EditorDebugViews (never in a player build).
+        // In both the Scene and Game bars; per-view popup id so they don't collide.
         {
-            var modeNames = new[] { "Shaded", "Wireframe", "Normals", "Depth" };
-            var curMode = (int)Renderer.DebugViewMode;
-            var modeLabel = $"{modeNames[curMode]} {EditorIcons.ChevronDown}";
-            RightAlign(ImGui.CalcTextSize(modeLabel).X + pad2);
+            var engineNames = new[] { "Shaded", "Wireframe", "Normals", "Depth" };
+            int extra = HDRenderer.EditorExtraDebugMode;
+            string current = extra != 0
+                ? Array.Find(EditorDebugViews.Modes, m => m.mode == extra).label
+                : engineNames[(int)Renderer.DebugViewMode];
+            var modeLabel = $"{current} {EditorIcons.ChevronDown}";
+            RightAlign(ImGui.CalcTextSize($"Ambient Occlusion {EditorIcons.ChevronDown}").X + pad2);
             if (EditorIcons.GhostButton($"shadingmode{id}", modeLabel, "Shading / debug view mode"))
                 ImGui.OpenPopup($"##shadingmode{id}");
             if (ImGui.BeginPopup($"##shadingmode{id}")) {
                 ImGui.TextDisabled("Shading Mode");
                 ImGui.Separator();
-                for (var i = 0; i < modeNames.Length; i++) {
-                    if (ImGui.MenuItem(modeNames[i], (string)null, curMode == i)) {
+                for (var i = 0; i < engineNames.Length; i++) {
+                    bool sel = extra == 0 && (int)Renderer.DebugViewMode == i;
+                    if (ImGui.MenuItem(engineNames[i], (string)null, sel)) {
                         Renderer.DebugViewMode = (HDRenderer.DebugView)i;
+                        HDRenderer.EditorExtraDebugMode = EditorDebugViews.None;   // leave any extra view
+                        editorState.MarkViewportDirty();
+                    }
+                }
+                ImGui.Separator();
+                ImGui.TextDisabled("Buffers (editor only)");
+                foreach (var (mode, label) in EditorDebugViews.Modes) {
+                    if (ImGui.MenuItem(label, (string)null, extra == mode)) {
+                        HDRenderer.EditorExtraDebugMode = mode;
+                        Renderer.DebugViewMode = HDRenderer.DebugView.Shaded; // engine renders normally; we replace composite
                         editorState.MarkViewportDirty();
                     }
                 }
