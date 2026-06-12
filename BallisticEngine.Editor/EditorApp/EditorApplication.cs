@@ -581,6 +581,33 @@ internal sealed class EditorApplication {
         SysVec2 workSize = vp.WorkSize;
 
         // Fullscreen: only the toolbar (for Play/Stop) + the maximized panel, nothing else (no docking).
+        if (maximizedPanel is not null) {
+            Panel("##toolbar", workPos, new SysVec2(workSize.X, toolbarH),
+                PanelFlags | ImGuiWindowFlags.NoTitleBar, ToolbarUI);
+            SysVec2 maxPos = workPos + new SysVec2(0, toolbarH);
+            SysVec2 maxSize = new(workSize.X, workSize.Y - toolbarH);
+            // Keep the tab-strip band clamp valid while maximized too (this block returns before the
+            // normal-path assignment runs) — else the clamp used a stale value and a maximized panel's
+            // title double-click to restore stopped working.
+            contentAreaTop = maxPos.Y;
+            if (maximizedViewport)
+                DrawMaximizedViewport(maxPos, maxSize);
+            else
+                DrawMaximizedPanel(maximizedPanel, maxPos, maxSize);
+
+            // Exit-fullscreen button just under the toolbar (so it's not Esc-only). A small floating
+            // overlay window above everything; clicking restores the docked layout.
+            DrawExitFullscreenButton(workPos, workSize, toolbarH);
+
+            settings.Draw(S);
+            profilerPanel.Draw(profiler, S);
+            buildPanel.Draw(S);
+            CurveEditorWindow.Draw(S);
+            ComponentEditorWindow.Draw(S);
+            UnityImportWindow.Draw(S);
+            DrawUnsavedPrompt();
+            return;
+        }
 
         // Fixed toolbar strip pinned under the menu bar (not dockable).
         Panel("##toolbar", workPos, new SysVec2(workSize.X, toolbarH),
@@ -638,18 +665,6 @@ internal sealed class EditorApplication {
 
         // Scene + Game are separate dockable windows (were inner viewport tabs).
         DrawViewportWindows();
-
-        // Fullscreen overlay: the dockspace + all panels above are ALWAYS submitted (so ImGui keeps the
-        // dock layout — maximizing used to skip them, which reset the layout on exit). When a panel is
-        // maximized we just draw it again, full-window, on top.
-        if (maximizedPanel is not null) {
-            SysVec2 maxPos = workPos + new SysVec2(0, toolbarH);
-            SysVec2 maxSize = new(workSize.X, workSize.Y - toolbarH);
-            contentAreaTop = maxPos.Y;
-            if (maximizedViewport) DrawMaximizedViewport(maxPos, maxSize);
-            else DrawMaximizedPanel(maximizedPanel, maxPos, maxSize);
-            DrawExitFullscreenButton(workPos, workSize, toolbarH);
-        }
 
         settings.Draw(S);
         tagsLayers.Draw(S);
