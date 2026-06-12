@@ -494,6 +494,9 @@ internal sealed class InspectorPanel {
             if (behaviour is Health health)
                 DrawHealthSection(health);
 
+            if (behaviour is BallisticEngine.UI.UIDocument uiDoc)
+                DrawUIDocumentSection(uiDoc);
+
             if (behaviour is ParticleSystem particles)
                 DrawParticleSystemSection(particles);
 
@@ -901,6 +904,40 @@ internal sealed class InspectorPanel {
     // Health: a current/max bar (green->red by fraction) + Damage/Heal/Kill/Revive test buttons so you
     // can exercise the events without play-mode scripting. The OnDamaged/OnHealed/OnDied BEvents render
     // their own listener editors automatically via the reflection DrawMember.
+    // UIDocument's Uxml/Uss are string PATHS; give them drag-drop target fields so you can drop a
+    // .uxml/.uss (or .uihtml/.uss) asset from the browser instead of typing the address (item 15).
+    void DrawUIDocumentSection(BallisticEngine.UI.UIDocument doc) {
+        ImGui.Spacing();
+        ImGui.SeparatorText("Markup & Style");
+        DrawPathDropField("UXML (markup)", doc.Uxml, [".uxml", ".uihtml", ".html"], p => doc.Uxml = p);
+        DrawPathDropField("USS (style)", doc.Uss, [".uss", ".uicss", ".css"], p => doc.Uss = p);
+        ImGui.TextDisabled("Drag a markup/style asset here, or type its Assets/... path.");
+    }
+
+    // A text field for an asset PATH that also accepts a drag-drop of a matching-extension asset (sets
+    // the field to the dropped asset's path). `exts` are the accepted extensions (lowercase, with dot).
+    void DrawPathDropField(string label, string current, string[] exts, Action<string> apply) {
+        ImGui.PushID(label);
+        ImGui.TextDisabled(label);
+        var s = current ?? "";
+        ImGui.SetNextItemWidth(-1);
+        if (ImGui.InputText("##path", ref s, 256)) {
+            EditorUndo.Push($"Edit {label}");
+            apply(s);
+            state.MarkViewportDirty();
+        }
+        // Drop target over the field: accept a single matching asset and write its path.
+        if (AcceptGuidDrop(out Guid guid)) {
+            string path = AssetDatabase.GuidToAssetPath(guid);
+            if (path is not null && exts.Any(e => path.EndsWith(e, StringComparison.OrdinalIgnoreCase))) {
+                EditorUndo.Push($"Assign {label}");
+                apply(path);
+                state.MarkViewportDirty();
+            }
+        }
+        ImGui.PopID();
+    }
+
     void DrawHealthSection(Health health) {
         ImGui.Spacing();
         ImGui.SeparatorText("Health");

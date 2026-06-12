@@ -896,6 +896,16 @@ internal sealed class EditorApplication {
                 EditorPrefs.Save();
             }
         }
+        // Custom limit (item 13): type any value; 0 = unlimited. Enter applies.
+        ImGui.Separator();
+        ImGui.TextDisabled("Custom (0 = unlimited):");
+        ImGui.SetNextItemWidth(120);
+        int custom = limit;
+        if (ImGui.InputInt("##customfps", ref custom, 5, 30, ImGuiInputTextFlags.EnterReturnsTrue)) {
+            EditorPrefs.Current.FrameRateLimit = Math.Max(0, custom);
+            ApplyFrameRateLimit();
+            EditorPrefs.Save();
+        }
         ImGui.EndPopup();
     }
 
