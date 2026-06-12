@@ -1050,12 +1050,16 @@ internal sealed class InspectorPanel {
         ImGui.Spacing();
         ImGui.SeparatorText("Preview");
 
-        if (ImGui.Button($"{EditorIcons.Refresh}  Restart", new SysVec2(110, 0)))
+        // Two equal half-width buttons that fill the row (auto-width 110px clipped the labels to
+        // "Resta.../Emit 5" in a narrow inspector); the live count goes on its own line so nothing
+        // gets squeezed off.
+        float spacing = ImGui.GetStyle().ItemSpacing.X;
+        float w = (ImGui.GetContentRegionAvail().X - spacing) * 0.5f;
+        if (ImGui.Button($"{EditorIcons.Refresh}  Restart", new SysVec2(w, 0)))
             particles.Clear();
         ImGui.SameLine();
-        if (ImGui.Button($"{EditorIcons.Play}  Emit 50", new SysVec2(110, 0)))
+        if (ImGui.Button($"{EditorIcons.Play}  Emit 50", new SysVec2(w, 0)))
             particles.Emit(50);
-        ImGui.SameLine();
         ImGui.TextDisabled($"{particles.LiveCount} live");
 
         if (particles.LiveCount > 0)
@@ -1067,9 +1071,8 @@ internal sealed class InspectorPanel {
         ImGui.Spacing();
         ImGui.SeparatorText("Preview");
 
-        if (ImGui.Button($"{EditorIcons.Refresh}  Clear", new SysVec2(110, 0)))
+        if (ImGui.Button($"{EditorIcons.Refresh}  Clear", new SysVec2(-1, 0)))
             trail.Clear();
-        ImGui.SameLine();
         ImGui.TextDisabled($"{trail.PointCount} points");
 
         if (trail.PointCount > 0)

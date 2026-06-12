@@ -530,6 +530,11 @@ internal sealed class EditorApplication {
                 DrawMaximizedViewport(maxPos, maxSize);
             else
                 DrawMaximizedPanel(maximizedPanel, maxPos, maxSize);
+
+            // Exit-fullscreen button pinned to the top-right (so it's not Esc-only). A small floating
+            // overlay window above everything; clicking restores the docked layout.
+            DrawExitFullscreenButton(workPos, workSize);
+
             settings.Draw(S);
             profilerPanel.Draw(profiler, S);
             buildPanel.Draw(S);
@@ -1109,6 +1114,23 @@ internal sealed class EditorApplication {
     // the hit band extends upward by ~2 frame heights to cover the dock tab; for a floating window it
     // covers the title bar. The horizontal span is the window width. Excludes the content area so a
     // double-click on the 3D image (gizmo/selection) never maximizes.
+    // A small "exit fullscreen" button floated at the top-right while a panel is maximized, so leaving
+    // fullscreen isn't Esc-only (the user couldn't find a way out). Clicking it clears maximizedPanel.
+    void DrawExitFullscreenButton(SysVec2 workPos, SysVec2 workSize) {
+        float btn = 30 * S;
+        float margin = 8 * S;
+        ImGui.SetNextWindowPos(new SysVec2(workPos.X + workSize.X - btn - margin, workPos.Y + margin));
+        ImGui.SetNextWindowBgAlpha(0.85f);
+        const ImGuiWindowFlags flags = ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.NoDocking |
+            ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoSavedSettings |
+            ImGuiWindowFlags.NoFocusOnAppearing | ImGuiWindowFlags.NoNav;
+        if (ImGui.Begin("##exitfullscreen", flags)) {
+            if (EditorIcons.GhostButton("exitfs", EditorIcons.Minimize, "Exit fullscreen (Esc)", btn))
+                maximizedPanel = null;
+        }
+        ImGui.End();
+    }
+
     void MaximizeOnTitleDoubleClick() => MaximizePanelOnTitleDoubleClick(
         gameViewFocused ? EditorLayout.GameView : EditorLayout.SceneView);
 
