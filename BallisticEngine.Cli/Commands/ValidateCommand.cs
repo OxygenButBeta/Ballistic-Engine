@@ -20,8 +20,9 @@ internal sealed class ValidateCommand : ICommand {
         if (!File.Exists(path))
             throw new Exception($"scene file not found: '{path}'");
 
-        // Engine catalog (GL-free reflection).
-        ComponentRegistry.Build(typeof(SceneManager).Assembly);
+        // Engine catalog + the project's precompiled game scripts, so game components don't
+        // false-positive as unknown (GL-free reflection either way).
+        SceneFile.BuildRegistry(path);
 
         SceneDocument doc;
         try {
@@ -98,31 +99,9 @@ internal sealed class ValidateCommand : ICommand {
             }
     }
 
-    // Closest registry name by case-insensitive prefix / contains / edit-distance-1, for a typo hint.
-    static string DidYouMean(string typed, IReadOnlyList<ComponentEntry> menu) {
-        string best = null;
-        int bestScore = int.MaxValue;
-        foreach (ComponentEntry e in menu) {
-            string name = e.Type.Name;
-            int score = name.StartsWith(typed, StringComparison.OrdinalIgnoreCase) ? 0
-                : name.Contains(typed, StringComparison.OrdinalIgnoreCase) ? 1
-                : Levenshtein(name.ToLowerInvariant(), typed.ToLowerInvariant());
-            if (score < bestScore) { bestScore = score; best = name; }
-        }
-        return bestScore <= 2 ? best : null; // only suggest a near match
-    }
-
-    static int Levenshtein(string a, string b) {
-        var d = new int[a.Length + 1, b.Length + 1];
-        for (var i = 0; i <= a.Length; i++) d[i, 0] = i;
-        for (var j = 0; j <= b.Length; j++) d[0, j] = j;
-        for (var i = 1; i <= a.Length; i++)
-            for (var j = 1; j <= b.Length; j++) {
-                int cost = a[i - 1] == b[j - 1] ? 0 : 1;
-                d[i, j] = Math.Min(Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1), d[i - 1, j - 1] + cost);
-            }
-        return d[a.Length, b.Length];
-    }
+    // Closest registry name, for a typo hint (shared scoring in Suggest).
+    static string DidYouMean(string typed, IReadOnlyList<ComponentEntry> menu) =>
+        Suggest.Closest(typed, menu.Select(e => e.Type.Name));
 
     record ValidateResult(bool valid, int issueCount, List<Issue> issues);
     record Issue(string message, string severity);

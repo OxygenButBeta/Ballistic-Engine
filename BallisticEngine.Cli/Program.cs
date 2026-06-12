@@ -14,6 +14,7 @@ internal static class Program {
         new SchemaCommand(),
         new ValidateCommand(),
         new DescribeCommand(),
+        new SceneCommand(),
     }.ToDictionary(c => c.Name, StringComparer.Ordinal);
 
     static int Main(string[] args) {
