@@ -976,6 +976,12 @@ internal sealed class InspectorPanel {
                         state.MarkViewportDirty();
                     break;
                 }
+                case ColorGradient gradient: {
+                    // Interactive gradient bar — same auto-apply-to-any-member story as the curve.
+                    if (DrawGradientEditor(member.Name, gradient))
+                        state.MarkViewportDirty();
+                    break;
+                }
                 default:
                     ImGui.TextDisabled($"({memberType.Name})");
                     break;
@@ -1153,6 +1159,161 @@ internal sealed class InspectorPanel {
             target.AddKey(source.Keys[i]);
         target.PreWrap = source.PreWrap;
         target.PostWrap = source.PostWrap;
+    }
+
+    // ---- Gradient editor ---------------------------------------------------------
+    // An interactive gradient bar (Unity's gradient editor, trimmed): the bar samples Evaluate across
+    // its width; COLOR stops sit as triangles BELOW the bar (drag horizontally to move, click to open a
+    // color picker, double-click empty to add, right-click to remove), ALPHA stops as triangles ABOVE
+    // (drag horizontally to move, vertical drag to change alpha). Reusable for ANY Gradient member;
+    // mutated in place; returns true on edit. The checkerboard behind the bar shows alpha.
+    static int gradColorDrag = -1, gradAlphaDrag = -1;
+    static int gradColorPick = -1; // color stop whose picker popup is open
+
+    static bool DrawGradientEditor(string id, ColorGradient g) {
+        bool edited = false;
+        ImGui.PushID(id);
+
+        float w = MathF.Max(ImGui.GetContentRegionAvail().X, 60f);
+        const float barH = 22f, stopH = 7f;
+        SysVec2 cursor = ImGui.GetCursorScreenPos();
+        SysVec2 barOrigin = cursor + new SysVec2(0f, stopH + 2f); // leave room for alpha stops above
+        var barSize = new SysVec2(w, barH);
+        var draw = ImGui.GetWindowDrawList();
+
+        // Checkerboard so alpha is visible.
+        const float check = 6f;
+        for (float x = 0; x < w; x += check)
+            for (float y = 0; y < barH; y += check) {
+                bool dark = (((int)(x / check) + (int)(y / check)) & 1) == 0;
+                uint cc = dark ? 0xFF606060 : 0xFF909090;
+                SysVec2 a = barOrigin + new SysVec2(x, y);
+                SysVec2 b = a + new SysVec2(MathF.Min(check, w - x), MathF.Min(check, barH - y));
+                draw.AddRectFilled(a, b, cc);
+            }
+
+        // Sample the gradient across the bar width into thin vertical slices.
+        const int slices = 96;
+        for (var s = 0; s < slices; s++) {
+            float t0 = (float)s / slices, t1 = (float)(s + 1) / slices;
+            Vector4 c0 = g.Evaluate(t0);
+            uint col = ImGui.GetColorU32(new SysVec4(c0.X, c0.Y, c0.Z, c0.W));
+            SysVec2 a = barOrigin + new SysVec2(t0 * w, 0f);
+            SysVec2 b = barOrigin + new SysVec2(t1 * w, barH);
+            draw.AddRectFilled(a, b, col);
+        }
+        draw.AddRect(barOrigin, barOrigin + barSize, 0xFF202224);
+
+        // Interaction surface covering the bar + both stop rows.
+        SysVec2 totalSize = new SysVec2(w, barH + stopH * 2f + 4f);
+        ImGui.SetCursorScreenPos(cursor);
+        ImGui.InvisibleButton("##gradbar", totalSize);
+        bool hovered = ImGui.IsItemHovered();
+        SysVec2 mouse = ImGui.GetMousePos();
+        float mt = Math.Clamp((mouse.X - barOrigin.X) / w, 0f, 1f);
+
+        float alphaRowY = cursor.Y;                       // alpha stops above the bar
+        float colorRowY = barOrigin.Y + barH + 2f;        // color stops below the bar
+
+        // ---- Color stops (below) ----
+        int hoverColor = -1;
+        for (var i = 0; i < g.ColorKeyCount; i++) {
+            float kx = barOrigin.X + g.ColorKeys[i].Time * w;
+            var tip = new SysVec2(kx, colorRowY);
+            var bl = new SysVec2(kx - stopH * 0.6f, colorRowY + stopH);
+            var br = new SysVec2(kx + stopH * 0.6f, colorRowY + stopH);
+            Vector3 kc = g.ColorKeys[i].Color;
+            uint fill = ImGui.GetColorU32(new SysVec4(kc.X, kc.Y, kc.Z, 1f));
+            draw.AddTriangleFilled(tip, bl, br, fill);
+            draw.AddTriangle(tip, bl, br, (i == gradColorDrag) ? 0xFF30D0FF : 0xFF202224);
+            if (hovered && MathF.Abs(mouse.X - kx) < stopH && mouse.Y >= colorRowY - 2f && mouse.Y <= colorRowY + stopH + 2f)
+                hoverColor = i;
+        }
+
+        // ---- Alpha stops (above) ----
+        int hoverAlpha = -1;
+        for (var i = 0; i < g.AlphaKeyCount; i++) {
+            float kx = barOrigin.X + g.AlphaKeys[i].Time * w;
+            var tip = new SysVec2(kx, alphaRowY + stopH);
+            var tl = new SysVec2(kx - stopH * 0.6f, alphaRowY);
+            var tr = new SysVec2(kx + stopH * 0.6f, alphaRowY);
+            float av = g.AlphaKeys[i].Alpha;
+            uint fill = ImGui.GetColorU32(new SysVec4(av, av, av, 1f));
+            draw.AddTriangleFilled(tip, tl, tr, fill);
+            draw.AddTriangle(tip, tl, tr, (i == gradAlphaDrag) ? 0xFF30D0FF : 0xFF202224);
+            if (hovered && MathF.Abs(mouse.X - kx) < stopH && mouse.Y >= alphaRowY - 2f && mouse.Y <= alphaRowY + stopH + 2f)
+                hoverAlpha = i;
+        }
+
+        // ---- Begin drags / picker / add / remove ----
+        if (hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
+            if (hoverColor >= 0) { gradColorDrag = hoverColor; EditorUndo.Push($"Edit {id}"); }
+            else if (hoverAlpha >= 0) { gradAlphaDrag = hoverAlpha; EditorUndo.Push($"Edit {id}"); }
+        }
+        // Open a color picker popup on a color-stop click-release (only if not dragged far).
+        if (hoverColor >= 0 && ImGui.IsMouseReleased(ImGuiMouseButton.Left) && gradColorDrag == hoverColor) {
+            gradColorPick = hoverColor;
+            ImGui.OpenPopup("##gradcolpick");
+        }
+
+        if (gradColorDrag >= 0 && gradColorDrag < g.ColorKeyCount && ImGui.IsMouseDown(ImGuiMouseButton.Left)) {
+            gradColorDrag = g.MoveColorKey(gradColorDrag, mt, g.ColorKeys[gradColorDrag].Color);
+            edited = true;
+        }
+        if (gradAlphaDrag >= 0 && gradAlphaDrag < g.AlphaKeyCount && ImGui.IsMouseDown(ImGuiMouseButton.Left)) {
+            gradAlphaDrag = g.MoveAlphaKey(gradAlphaDrag, mt, g.AlphaKeys[gradAlphaDrag].Alpha);
+            edited = true;
+        }
+        if (ImGui.IsMouseReleased(ImGuiMouseButton.Left)) { gradColorDrag = -1; gradAlphaDrag = -1; }
+
+        // Double-click empty space on the color row adds a color stop (sampled current color).
+        if (hovered && hoverColor < 0 && mouse.Y >= colorRowY - 2f && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) {
+            EditorUndo.Push($"Add color {id}");
+            g.AddColorKey(mt, g.EvaluateColor(mt));
+            edited = true;
+        }
+        // Double-click empty space on the alpha row adds an alpha stop.
+        if (hovered && hoverAlpha < 0 && mouse.Y <= alphaRowY + stopH + 2f && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) {
+            EditorUndo.Push($"Add alpha {id}");
+            g.AddAlphaKey(mt, g.EvaluateAlpha(mt));
+            edited = true;
+        }
+        // Right-click removes the hovered stop (keep at least one of each kind).
+        if (hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Right)) {
+            if (hoverColor >= 0 && g.ColorKeyCount > 1) { EditorUndo.Push($"Remove color {id}"); g.RemoveColorKey(hoverColor); edited = true; }
+            else if (hoverAlpha >= 0 && g.AlphaKeyCount > 1) { EditorUndo.Push($"Remove alpha {id}"); g.RemoveAlphaKey(hoverAlpha); edited = true; }
+        }
+
+        // Color picker popup for the selected color stop.
+        if (ImGui.BeginPopup("##gradcolpick")) {
+            if (gradColorPick >= 0 && gradColorPick < g.ColorKeyCount) {
+                Vector3 c = g.ColorKeys[gradColorPick].Color;
+                var sv = new SysVec3(c.X, c.Y, c.Z);
+                if (ImGui.ColorPicker3("##pick", ref sv)) {
+                    g.MoveColorKey(gradColorPick, g.ColorKeys[gradColorPick].Time, new Vector3(sv.X, sv.Y, sv.Z));
+                    edited = true;
+                }
+            }
+            ImGui.EndPopup();
+        }
+
+        // Preset buttons + counts.
+        if (ImGui.SmallButton("Fire")) { EditorUndo.Push($"Preset {id}"); ReplaceGradient(g, ColorGradient.Fire()); edited = true; }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Fade")) { EditorUndo.Push($"Preset {id}"); ReplaceGradient(g, ColorGradient.FadeOut(new Vector3(1f, 1f, 1f))); edited = true; }
+        ImGui.SameLine();
+        ImGui.TextDisabled($"{g.ColorKeyCount}c / {g.AlphaKeyCount}a");
+
+        ImGui.PopID();
+        return edited;
+    }
+
+    static void ReplaceGradient(ColorGradient target, ColorGradient source) {
+        target.Clear();
+        for (var i = 0; i < source.ColorKeyCount; i++)
+            target.AddColorKey(source.ColorKeys[i].Time, source.ColorKeys[i].Color);
+        for (var i = 0; i < source.AlphaKeyCount; i++)
+            target.AddAlphaKey(source.AlphaKeys[i].Time, source.AlphaKeys[i].Alpha);
     }
 
     // Multi-material meshes resolve their materials from refs baked into the mesh at import;

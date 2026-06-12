@@ -159,6 +159,10 @@ public static class SceneSerializer {
         if (value is AnimationCurve curve)
             return curve.ToCompactString();
 
+        // ColorGradient — same compact-string scalar approach as AnimationCurve.
+        if (value is ColorGradient gradient)
+            return gradient.ToCompactString();
+
         if (value is BObject asset) {
             return AssetDatabase.TryGetAssetGuid(asset, out Guid guid)
                 ? AssetRef.FromGuid(guid)
@@ -300,6 +304,9 @@ public static class SceneSerializer {
         // AnimationCurve round-trips through its compact string form.
         if (targetType == typeof(AnimationCurve))
             return raw is string curveStr ? AnimationCurve.Parse(curveStr) : null;
+
+        if (targetType == typeof(ColorGradient))
+            return raw is string gradientStr ? ColorGradient.Parse(gradientStr) : null;
 
         // OpenTK types arrive already converted; otherwise coerce the scalar to the member type.
         if (targetType.IsInstanceOfType(raw))

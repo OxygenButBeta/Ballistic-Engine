@@ -35,6 +35,8 @@ public static class DataAssetSerializer {
             return null;
         if (value is AnimationCurve curve)
             return curve.ToCompactString();
+        if (value is ColorGradient gradient)
+            return gradient.ToCompactString();
         if (value is BObject asset)
             return AssetDatabase.TryGetAssetGuid(asset, out Guid guid) ? AssetRef.FromGuid(guid) : null;
         return value;
@@ -90,6 +92,9 @@ public static class DataAssetSerializer {
 
         if (targetType == typeof(AnimationCurve))
             return raw is string curveStr ? AnimationCurve.Parse(curveStr) : null;
+
+        if (targetType == typeof(ColorGradient))
+            return raw is string gradientStr ? ColorGradient.Parse(gradientStr) : null;
 
         if (targetType.IsInstanceOfType(raw))
             return raw;

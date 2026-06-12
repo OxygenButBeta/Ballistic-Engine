@@ -120,6 +120,11 @@ public class ParticleSystem : Behaviour {
              "grow-then-shrink puff, a pulse, etc. Empty = use the simple lerp above.")]
     public AnimationCurve SizeCurve { get; set; } = new();
 
+    [Tooltip("Optional color+alpha over-lifetime gradient (parameter = normalized age 0..1). When it " +
+             "has keys it overrides the Start/EndColor+Alpha lerp — author fire, smoke, sparks. " +
+             "Empty = use the Start/EndColor lerp above.")]
+    public ColorGradient ColorOverLifetime { get; set; } = new();
+
     [Tooltip("Eases the color + alpha interpolation over lifetime. EaseOut fades gently at the end.")]
     public ParticleEase ColorEase { get; set; } = ParticleEase.Linear;
 
@@ -349,8 +354,19 @@ public class ParticleSystem : Behaviour {
             float u = p.NormalizedAge;
             float uc = ApplyEase(ColorEase, u);
             float us = ApplyEase(SizeEase, u);
-            Vector3 rgb = Vector3.Lerp(StartColor, EndColor, uc);
-            float a = MathHelper.Lerp(StartAlpha, EndAlpha, uc);
+            // A gradient (when authored) drives color+alpha over the normalized age; otherwise fall
+            // back to the simple Start->End color/alpha lerp with its ease.
+            Vector3 rgb;
+            float a;
+            if (ColorOverLifetime is { IsEmpty: false }) {
+                Vector4 c = ColorOverLifetime.Evaluate(u);
+                rgb = new Vector3(c.X, c.Y, c.Z);
+                a = c.W;
+            }
+            else {
+                rgb = Vector3.Lerp(StartColor, EndColor, uc);
+                a = MathHelper.Lerp(StartAlpha, EndAlpha, uc);
+            }
             // A curve (when authored) drives size as a MULTIPLIER on the spawn size over the
             // normalized age; otherwise fall back to the simple Start->End lerp with its ease.
             float size = SizeCurve is { Count: > 0 }
