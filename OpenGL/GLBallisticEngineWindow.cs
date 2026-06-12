@@ -67,7 +67,9 @@ public class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWin
         Title = "Ballistic ";
 
         EngineTimer = new GLTime();
-        InputProvider = new GLInput(KeyboardState, MouseState);
+        // JoystickStates is live on the window — pass a getter so the input provider always reads the
+        // current frame's controller state (and picks up hot-plugged pads).
+        InputProvider = new GLInput(KeyboardState, MouseState, () => JoystickStates);
 
         if (fullscreen) {
             // Borderless fullscreen on the primary monitor: cover the whole screen at its native
