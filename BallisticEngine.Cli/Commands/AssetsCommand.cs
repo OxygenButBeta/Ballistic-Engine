@@ -164,9 +164,9 @@ internal sealed class AssetsCommand : ICommand {
         return 0;
     }
 
-    // ---- shared ---------------------------------------------------------------
+    // ---- shared (MapCommand also scans the sidecars) ---------------------------
 
-    static IEnumerable<(string assetPath, MetaFile meta)> EnumerateMetas(string root) {
+    internal static IEnumerable<(string assetPath, MetaFile meta)> EnumerateMetas(string root) {
         string assetsRoot = Path.Combine(root, "Assets");
         if (!Directory.Exists(assetsRoot)) yield break;
         foreach (string metaPath in Directory.EnumerateFiles(assetsRoot, "*.meta", SearchOption.AllDirectories)) {

@@ -17,6 +17,7 @@ internal static class Program {
         new SceneCommand(),
         new ImportCommand(),
         new AssetsCommand(),
+        new MapCommand(),
     }.ToDictionary(c => c.Name, StringComparer.Ordinal);
 
     static int Main(string[] args) {

@@ -130,9 +130,10 @@ internal static class SceneFile {
     // Builds the component registry from the engine assembly PLUS the project's precompiled game
     // scripts (Library/ScriptAssemblies/GameScripts.dll, byte-loaded so the file never locks) so
     // game-script components resolve for typing and validation. Falls back to engine-only.
-    public static void BuildRegistry(string scenePath) {
+    public static void BuildRegistry(string scenePath) => BuildRegistryForRoot(FindProjectRoot(scenePath));
+
+    public static void BuildRegistryForRoot(string? root) {
         var assemblies = new List<Assembly> { typeof(SceneManager).Assembly };
-        string? root = FindProjectRoot(scenePath);
         string? dll = root is null ? null : Path.Combine(root, "Library", "ScriptAssemblies", "GameScripts.dll");
         if (dll is not null && File.Exists(dll)) {
             try { assemblies.Add(Assembly.Load(File.ReadAllBytes(dll))); }
