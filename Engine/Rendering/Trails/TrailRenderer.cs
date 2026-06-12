@@ -138,4 +138,61 @@ public class TrailRenderer : Behaviour {
     // Exposes the point history for the GL ribbon pass (newest first). Width/color are evaluated by
     // the pass from the normalized tail position; this just hands over positions + ages.
     public IReadOnlyList<TrailPoint> Points => points;
+
+    // One ribbon vertex the GL pass streams: world position, uv (U = head->tail, V = 0/1 edge), RGBA.
+    public struct RibbonVertex {
+        public Vector3 Position;
+        public Vector2 Uv;
+        public Vector4 Color;
+    }
+
+    RibbonVertex[] ribbonScratch;
+
+    // Builds a camera-facing ribbon from the point history into `vertices` as a TRIANGLE STRIP (two
+    // verts per point: left + right edge). Returns the vertex count (0 if < 2 points). Each point's
+    // side offset is perpendicular to BOTH the local segment direction and the view direction, so the
+    // strip always faces the camera; width and color lerp head(0)->tail(1) by normalized index.
+    public int BuildRibbon(Vector3 cameraPos, out RibbonVertex[] vertices) {
+        int n = points.Count;
+        int vcount = n * 2;
+        if (ribbonScratch is null || ribbonScratch.Length < vcount)
+            ribbonScratch = new RibbonVertex[Math.Max(vcount, 8)];
+
+        if (n < 2) {
+            vertices = ribbonScratch;
+            return 0;
+        }
+
+        for (var i = 0; i < n; i++) {
+            Vector3 pos = points[i].Position;
+
+            // Segment direction at this point (toward the neighbour), for the perpendicular.
+            Vector3 dir;
+            if (i == 0) dir = points[0].Position - points[1].Position;
+            else if (i == n - 1) dir = points[n - 2].Position - points[n - 1].Position;
+            else dir = points[i - 1].Position - points[i + 1].Position;
+            if (dir.LengthSquared < 1e-10f) dir = Vector3.UnitX;
+            dir = dir.Normalized();
+
+            Vector3 toCam = cameraPos - pos;
+            Vector3 side = Vector3.Cross(dir, toCam);
+            side = side.LengthSquared > 1e-10f ? side.Normalized() : Vector3.UnitY;
+
+            float t = n > 1 ? i / (float)(n - 1) : 0f;   // 0 = head, 1 = tail
+            float halfWidth = MathHelper.Lerp(StartWidth, EndWidth, t) * 0.5f;
+            Vector3 rgb = Vector3.Lerp(StartColor, EndColor, t);
+            float alpha = MathHelper.Lerp(StartAlpha, EndAlpha, t);
+            var color = new Vector4(rgb, alpha);
+
+            ribbonScratch[i * 2 + 0] = new RibbonVertex {
+                Position = pos + side * halfWidth, Uv = new Vector2(t, 0f), Color = color,
+            };
+            ribbonScratch[i * 2 + 1] = new RibbonVertex {
+                Position = pos - side * halfWidth, Uv = new Vector2(t, 1f), Color = color,
+            };
+        }
+
+        vertices = ribbonScratch;
+        return vcount;
+    }
 }

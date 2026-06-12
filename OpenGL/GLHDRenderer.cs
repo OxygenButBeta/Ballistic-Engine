@@ -44,6 +44,7 @@ public class GLHDRenderer : HDRenderer {
     GLAutoExposurePass autoExposure;
     readonly GLProbeDebugPass probeDebug = new();
     readonly GLParticlePass particlePass = new();
+    readonly GLTrailPass trailPass = new();
     readonly GLProceduralSkyPass proceduralSkyPass = new();
     // Sky luminance scale of the ACTIVE sky source: the Skybox component's Exposure for HDRI
     // skies, 1 for the procedural sky (its Exposure is baked into the cubemap texels).
@@ -619,6 +620,13 @@ void main() {
         if (RuntimeSet<ParticleSystem>.ReadOnlyCollection.Count > 0) {
             using var particleZone = timers.Time("Particles");
             particlePass.Render(ref view, ref renderProjection);
+        }
+
+        // Trails: camera-facing ribbons, same HDR-buffer slot as particles (TAA + bloom), same
+        // jittered projection + GL-state-restore contract.
+        if (RuntimeSet<TrailRenderer>.ReadOnlyCollection.Count > 0) {
+            using var trailZone = timers.Time("Trails");
+            trailPass.Render(ref view, ref renderProjection, cameraPos);
         }
 
         // Screen-space passes reconstruct from the JITTERED depth, so they get the jittered
