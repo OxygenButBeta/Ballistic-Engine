@@ -559,13 +559,41 @@ internal sealed class InspectorPanel {
         }
 
         ImGui.SeparatorText("Overrides");
+        // UNDO for volume-profile edits (bug 2b): the profile is a .volume ASSET, outside scene-undo.
+        // Snapshot before drawing; if a parameter changed, push a callback undo step when the edit
+        // SETTLES (no item active) so a slider drag is one entry, not hundreds. The before-snapshot is
+        // captured at the start of a drag (the frame the change first appears) and held until release.
+        object beforeSnap = VolumeProfileEditor.Snapshot(volume.Profile);
         if (VolumeProfileEditor.Draw(volume.Profile)) {
             VolumeProfileEditor.SaveToAsset(volume.Profile);
-            // The viewport repaints on demand; without this a profile edit (toggle a component
-            // Active, drag contrast/saturation, ...) saves but never shows — looked "broken".
             state.MarkViewportDirty();
+
+            VolumeProfile prof = volume.Profile;
+            // Remember the state from BEFORE this drag started (first changed frame).
+            volumeUndoBefore ??= volumeUndoLastClean;
+            volumeUndoBefore ??= beforeSnap;
+
+            // Commit one undo step when the interaction ends (mouse released / instantaneous widget).
+            if (!ImGui.IsAnyItemActive()) {
+                object before = volumeUndoBefore;
+                object after = VolumeProfileEditor.Snapshot(prof);
+                EditorUndo.PushCallback("Edit Volume Override",
+                    () => { VolumeProfileEditor.Restore(prof, before); VolumeProfileEditor.SaveToAsset(prof); state.MarkViewportDirty(); },
+                    () => { VolumeProfileEditor.Restore(prof, after); VolumeProfileEditor.SaveToAsset(prof); state.MarkViewportDirty(); });
+                volumeUndoBefore = null;
+            }
+        }
+        else if (!ImGui.IsAnyItemActive()) {
+            // Idle: this clean snapshot is the "before" for the next edit.
+            volumeUndoLastClean = beforeSnap;
+            volumeUndoBefore = null;
         }
     }
+
+    // Volume-profile undo bookkeeping (see DrawVolumeSection): the snapshot from before the current
+    // drag began, and the last settled (clean) snapshot to use as its baseline.
+    static object volumeUndoBefore;
+    static object volumeUndoLastClean;
 
     // Terrain sculpting palette: a Sculpt toggle that arms the Scene-view brush, the brush mode, and
     // radius/strength (and a target height for Flatten/Set). Drives TerrainTool's static state; the

@@ -13,8 +13,10 @@ internal static class EditorUndo {
     // a single-entity scoped snapshot (a value/component edit on one entity). The scoped form restores
     // JUST that entity in place, so undoing a tweak doesn't tear down + rebuild every scene-wide
     // component (which re-fired IrradianceVolume bakes and dropped the selection — bugs 2a/7).
-    readonly record struct Entry(string Label, string Yaml, Guid EntityId, EntityDocument EntityDoc) {
+    readonly record struct Entry(string Label, string Yaml, Guid EntityId, EntityDocument EntityDoc,
+        Action ApplyOld, Action ApplyNew) {
         public bool IsScoped => EntityDoc is not null;
+        public bool IsCallback => ApplyOld is not null;
     }
 
     static readonly List<Entry> undo = new();
@@ -80,7 +82,16 @@ internal static class EditorUndo {
         if (entity is null) { Push(label); return; }
 
         EntityDocument doc = SceneSerializer.CaptureEntity(entity);
-        AddEntry(new Entry(label, null, entity.InstanceId, doc));
+        AddEntry(new Entry(label, null, entity.InstanceId, doc, null, null));
+    }
+
+    // Push a CALLBACK undo step for edits that aren't scene/entity data — e.g. a volume PROFILE (a
+    // .volume asset). `applyOld` reverts to the state BEFORE the change (undo); `applyNew` re-applies
+    // the change (redo). The caller captures both snapshots around the edit.
+    public static void PushCallback(string label, Action applyOld, Action applyNew) {
+        if (SceneManager.IsPlaying || applyOld is null || applyNew is null)
+            return;
+        AddEntry(new Entry(label, null, Guid.Empty, null, applyOld, applyNew));
     }
 
     // Commit a PRE-CAPTURED snapshot under `label`. Use this for the deferred-commit pattern
@@ -90,7 +101,7 @@ internal static class EditorUndo {
     public static void PushSnapshot(string label, string yaml) {
         if (SceneManager.IsPlaying)
             return;
-        AddEntry(new Entry(label, yaml, Guid.Empty, null));
+        AddEntry(new Entry(label, yaml, Guid.Empty, null, null, null));
     }
 
     // Commit a PRE-CAPTURED single-entity snapshot (deferred-commit pattern from InspectorUndo.Track:
@@ -99,7 +110,7 @@ internal static class EditorUndo {
     public static void PushEntitySnapshot(string label, Entity entity, EntityDocument doc) {
         if (SceneManager.IsPlaying || entity is null || doc is null)
             return;
-        AddEntry(new Entry(label, null, entity.InstanceId, doc));
+        AddEntry(new Entry(label, null, entity.InstanceId, doc, null, null));
     }
 
     static void AddEntry(Entry entry) {
@@ -135,9 +146,12 @@ internal static class EditorUndo {
     // The opposite-direction entry: captures the CURRENT state in the same scope as `entry`, so
     // undo<->redo round-trip exactly. A scoped entry whose entity vanished degrades to a full snapshot.
     static Entry Inverse(Entry entry) {
+        // Callback: swap the two directions, so undo->redo->undo keeps round-tripping.
+        if (entry.IsCallback)
+            return new Entry(entry.Label, null, Guid.Empty, null, entry.ApplyNew, entry.ApplyOld);
         if (entry.IsScoped && FindEntity(entry.EntityId) is { } live)
-            return new Entry(entry.Label, null, entry.EntityId, SceneSerializer.CaptureEntity(live));
-        return new Entry(entry.Label, SceneSerializer.Serialize(SceneManager.GetCurrentScene()), Guid.Empty, null);
+            return new Entry(entry.Label, null, entry.EntityId, SceneSerializer.CaptureEntity(live), null, null);
+        return new Entry(entry.Label, SceneSerializer.Serialize(SceneManager.GetCurrentScene()), Guid.Empty, null, null, null);
     }
 
     // Applies an entry: a scoped one restores just its entity in place (selection + scene-wide
@@ -145,6 +159,10 @@ internal static class EditorUndo {
     // is a no-op (nothing to restore in place — a value edit can't have outlived its entity's deletion,
     // which would itself have been a full-snapshot undo step).
     static void Apply(Entry entry) {
+        if (entry.IsCallback) {
+            entry.ApplyOld();   // revert to the captured state (Inverse swaps directions for redo)
+            return;
+        }
         if (entry.IsScoped) {
             if (FindEntity(entry.EntityId) is { } target) {
                 object token = CaptureSelection?.Invoke();

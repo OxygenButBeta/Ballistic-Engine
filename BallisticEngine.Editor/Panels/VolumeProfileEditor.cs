@@ -329,4 +329,55 @@ internal static class VolumeProfileEditor {
         }
         return result.ToString();
     }
+
+    // ---- In-memory snapshot/restore for undo (bug 2b) ------------------------------------------
+    // A volume profile is a .volume ASSET, not scene data, so the scene-snapshot undo doesn't cover
+    // it. These capture/restore the profile's component set + each parameter's (Overridden, Value) so
+    // an edit can be pushed as a callback undo step. Value is read/written via the parameter's public
+    // `Value` property by reflection (the type is generic VolumeParameter<T>).
+
+    internal sealed class ProfileSnapshot {
+        public List<CompSnap> Components = new();
+        public sealed class CompSnap { public Type Type; public bool Active; public List<ParamSnap> Params = new(); }
+        public sealed class ParamSnap { public string Name; public bool Overridden; public object Value; }
+    }
+
+    public static object Snapshot(VolumeProfile profile) {
+        var snap = new ProfileSnapshot();
+        foreach (VolumeComponent c in profile.Components) {
+            var cs = new ProfileSnapshot.CompSnap { Type = c.GetType(), Active = c.Active };
+            foreach (VolumeComponent.ParameterSlot slot in c.Parameters)
+                cs.Params.Add(new ProfileSnapshot.ParamSnap {
+                    Name = slot.Name,
+                    Overridden = slot.Parameter.Overridden,
+                    Value = ValueProp(slot.Parameter)?.GetValue(slot.Parameter),
+                });
+            snap.Components.Add(cs);
+        }
+        return snap;
+    }
+
+    public static void Restore(VolumeProfile profile, object snapshotObj) {
+        if (snapshotObj is not ProfileSnapshot snap)
+            return;
+        // Remove components no longer in the snapshot; add ones that are missing.
+        foreach (VolumeComponent c in profile.Components.ToArray())
+            if (!snap.Components.Exists(cs => cs.Type == c.GetType()))
+                profile.Remove(c);
+        foreach (ProfileSnapshot.CompSnap cs in snap.Components) {
+            VolumeComponent c = profile.Get(cs.Type) ?? profile.Add(cs.Type);
+            c.Active = cs.Active;
+            foreach (VolumeComponent.ParameterSlot slot in c.Parameters) {
+                ProfileSnapshot.ParamSnap ps = cs.Params.Find(p => p.Name == slot.Name);
+                if (ps is null) continue;
+                slot.Parameter.Overridden = ps.Overridden;
+                System.Reflection.PropertyInfo vp = ValueProp(slot.Parameter);
+                if (vp is not null && vp.CanWrite && ps.Value is not null)
+                    vp.SetValue(slot.Parameter, ps.Value);
+            }
+        }
+    }
+
+    static System.Reflection.PropertyInfo ValueProp(VolumeParameter p) =>
+        p.GetType().GetProperty("Value");
 }
