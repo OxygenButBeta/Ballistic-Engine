@@ -46,8 +46,20 @@ internal static class MaterialPreviewRenderer {
         Matrix4 proj = Matrix4.CreatePerspectiveFieldOfView(MathHelper.DegreesToRadians(35f), 1f, 0.1f, 10f);
         Matrix4 mvp = view * proj;
 
+        // Capture + force the render state this pass needs — the engine leaves cull/blend/depth-func in
+        // whatever the last scene draw set them to, which was making the sphere vanish or composite oddly
+        // (it looked flat, not a sphere). Restored at the end.
+        bool prevCull = GL.IsEnabled(EnableCap.CullFace);
+        bool prevBlend = GL.IsEnabled(EnableCap.Blend);
+        int prevDepthFunc = GL.GetInteger(GetPName.DepthFunc);
+        int prevPolyMode = GL.GetInteger(GetPName.PolygonMode);
+
         GL.Viewport(0, 0, size, size);
         GL.Enable(EnableCap.DepthTest);
+        GL.DepthFunc(DepthFunction.Less);
+        GL.Disable(EnableCap.CullFace);   // draw both faces so winding can't hide the sphere
+        GL.Disable(EnableCap.Blend);
+        GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Fill);
         GL.ClearColor(0.13f, 0.13f, 0.15f, 1f);
         GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
 
@@ -75,8 +87,11 @@ internal static class MaterialPreviewRenderer {
         GL.BindVertexArray(prevVao);
         GL.UseProgram(prevProgram);
         GL.Viewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
-        if (!prevDepth)
-            GL.Disable(EnableCap.DepthTest);
+        if (!prevDepth) GL.Disable(EnableCap.DepthTest);
+        if (prevCull) GL.Enable(EnableCap.CullFace);
+        if (prevBlend) GL.Enable(EnableCap.Blend);
+        GL.DepthFunc((DepthFunction)prevDepthFunc);
+        GL.PolygonMode(MaterialFace.FrontAndBack, (PolygonMode)prevPolyMode);
 
         return pixels;
     }

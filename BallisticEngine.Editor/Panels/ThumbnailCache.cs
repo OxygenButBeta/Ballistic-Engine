@@ -56,8 +56,16 @@ internal sealed class ThumbnailCache {
     static string ThumbnailDirectory => Path.Combine(AssetDatabase.Project.LibraryPath, "Thumbnails");
 
     int Load(Guid guid, string assetPath) {
-        if (!AssetDatabase.TryGetArtifactPath(guid, out var artifactPath))
+        // Materials have no Library artifact (.mat is a text asset) — preview straight from the asset
+        // file. Other types render from their imported artifact.
+        bool isMaterial = Path.GetExtension(assetPath).Equals(".mat", StringComparison.OrdinalIgnoreCase);
+        string artifactPath;
+        if (isMaterial) {
+            artifactPath = AssetDatabase.Project.ResolveAbsolute(assetPath);
+        }
+        else if (!AssetDatabase.TryGetArtifactPath(guid, out artifactPath)) {
             return 0;
+        }
 
         var thumbPath = Path.Combine(ThumbnailDirectory, $"{guid:N}.thumb");
 
@@ -82,6 +90,12 @@ internal sealed class ThumbnailCache {
         if (MeshExtensions.Contains(extension)) {
             MeshData mesh = MeshArtifact.Read(artifactPath);
             return mesh.IsValid ? MeshPreviewRenderer.Render(in mesh, Size) : null;
+        }
+
+        // Material: render the preview sphere from the .mat (artifactPath is the asset file itself).
+        if (extension == ".mat") {
+            var definition = AssetPipeline.PipelineJson.Read<AssetPipeline.Loaders.MaterialDefinition>(artifactPath);
+            return MaterialPreviewRenderer.Render(definition, Size);
         }
 
         TextureData data = TextureArtifact.Read(artifactPath);
