@@ -43,6 +43,7 @@ public class GLHDRenderer : HDRenderer {
     GLDepthOfFieldPass depthOfField;
     GLAutoExposurePass autoExposure;
     readonly GLProbeDebugPass probeDebug = new();
+    readonly GLParticlePass particlePass = new();
     readonly GLProceduralSkyPass proceduralSkyPass = new();
     // Sky luminance scale of the ACTIVE sky source: the Skybox component's Exposure for HDRI
     // skies, 1 for the procedural sky (its Exposure is baked into the cubemap texels).
@@ -610,6 +611,14 @@ void main() {
             RenderMeshes(visibleTransparent, transparentPass: true, ref view, ref renderProjection, cameraPos);
             GL.DepthMask(true);
             GL.Disable(EnableCap.Blend);
+        }
+
+        // Particles: camera-facing billboards into the HDR buffer, after transparent and before the
+        // post chain, so they get TAA + bloom. Uses the JITTERED projection to match the scene depth
+        // it tests against. Off the PassData UBO / z-prepass; restores GL state on exit.
+        if (RuntimeSet<ParticleSystem>.ReadOnlyCollection.Count > 0) {
+            using var particleZone = timers.Time("Particles");
+            particlePass.Render(ref view, ref renderProjection);
         }
 
         // Screen-space passes reconstruct from the JITTERED depth, so they get the jittered
