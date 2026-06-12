@@ -19,6 +19,8 @@ internal static class Program {
         new AssetsCommand(),
         new MapCommand(),
         new SimulateCommand(),
+        new ImgDiffCommand(),
+        new RenderCommand(),
     }.ToDictionary(c => c.Name, StringComparer.Ordinal);
 
     static int Main(string[] args) {
