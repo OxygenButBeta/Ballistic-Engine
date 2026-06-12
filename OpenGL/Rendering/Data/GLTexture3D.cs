@@ -40,18 +40,21 @@ public sealed class GLTexture3D : Texture3D {
         GL.BindTexture(TextureTarget.TextureCubeMap, UID);
 
         Vector3 ambientSum = Vector3.Zero;
+        var faceAvg = new Vector3[6]; // +X, -X, +Y, -Y, +Z, -Z
         long totalPixels = 0;
 
         for (var i = 0; i < 6; i++) {
             TextureData face = faces[i];
             var isFloat = face.Format == TextureFormat.RGBA32F;
+            Vector3 faceSum = Vector3.Zero;
+            long facePixels = 0;
 
             if (isFloat) {
                 ReadOnlySpan<float> data = System.Runtime.InteropServices.MemoryMarshal
                     .Cast<byte, float>(face.Pixels);
                 for (var p = 0; p < data.Length; p += 4) {
-                    ambientSum += new Vector3(data[p], data[p + 1], data[p + 2]);
-                    totalPixels++;
+                    faceSum += new Vector3(data[p], data[p + 1], data[p + 2]);
+                    facePixels++;
                 }
 
                 GL.TexImage2D(CubemapFaces[i], 0, PixelInternalFormat.Rgba16f, face.Width, face.Height,
@@ -67,17 +70,24 @@ public sealed class GLTexture3D : Texture3D {
 
                         // The GPU samples this face through an sRGB view (linearized); average
                         // in linear too or the CPU-side ambient is brighter than the sky.
-                        ambientSum += new Vector3(MathF.Pow(r, 2.2f), MathF.Pow(g, 2.2f), MathF.Pow(b, 2.2f));
-                        totalPixels++;
+                        faceSum += new Vector3(MathF.Pow(r, 2.2f), MathF.Pow(g, 2.2f), MathF.Pow(b, 2.2f));
+                        facePixels++;
                     }
                 }
 
                 GL.TexImage2D(CubemapFaces[i], 0, PixelInternalFormat.Srgb, face.Width, face.Height,
                     0, PixelFormat.Rgba, PixelType.UnsignedByte, face.Pixels);
             }
+
+            faceAvg[i] = facePixels > 0 ? faceSum / facePixels : Vector3.Zero;
+            ambientSum += faceSum;
+            totalPixels += facePixels;
         }
 
         skyAmbient = ambientSum / totalPixels;
+        // Upper-hemisphere weighting (top face + the sky half of the sides): the hue fog
+        // airlight veils toward - the full-sphere average browns it with the ground.
+        skyAirlight = (faceAvg[2] + 0.5f * (faceAvg[0] + faceAvg[1] + faceAvg[4] + faceAvg[5])) / 3f;
 
         GL.TexParameter(TextureTarget.TextureCubeMap, TextureParameterName.TextureMagFilter,
             (int)TextureMagFilter.Linear);

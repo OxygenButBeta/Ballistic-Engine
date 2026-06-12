@@ -11,9 +11,10 @@ public sealed class GLRuntimeCubemap : Texture3D {
     public override int UID { get; protected set; }
     public int ContentVersion { get; private set; }
 
-    public void Adopt(int cubemapTextureId, Vector3 ambient) {
+    public void Adopt(int cubemapTextureId, Vector3 ambient, Vector3 airlight) {
         UID = cubemapTextureId;
         skyAmbient = ambient;
+        skyAirlight = airlight;
         Type = TextureType.SkyBox;
         ContentVersion++;
     }

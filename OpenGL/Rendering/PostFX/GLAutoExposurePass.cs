@@ -186,7 +186,12 @@ public sealed class GLAutoExposurePass {
         // Geometric mean of buffer luminance, un-pre-exposed back to absolute scene units.
         var meanLogBuffer = logSum / weightSum;
         var logSceneLum = meanLogBuffer - MathF.Log2(MathF.Max(framePreExposure, 1e-9f));
-        return logSceneLum + LuminanceToEV;
+        // Pure photographic metering maps the mean to 18% grey - technically correct, but
+        // skies and sunlit exteriors render dull (real matrix meters and other engines bias
+        // bright scenes up for exactly this reason). One stop toward bright is the
+        // difference between an 18%-grey sky and a luminous one.
+        const float pleasingBias = 1f; // stops toward brighter
+        return logSceneLum + LuminanceToEV - pleasingBias;
     }
 
     void EnsureResources() {

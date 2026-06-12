@@ -52,6 +52,8 @@ public sealed class GLProceduralSkyPass {
         hash.Add(sky.CloudAmbient);
         hash.Add(sky.CloudWindSpeed);
         hash.Add(sky.CloudWindDirection);
+        hash.Add(sky.CirrusCoverage);
+        hash.Add(sky.StarIntensity);
         hash.Add(cloudTime);
         hash.Add(res);
         var stamp = hash.ToHashCode();
@@ -126,6 +128,9 @@ public sealed class GLProceduralSkyPass {
         shader.SetFloat3("CloudWindOffset",
             new Vector3(MathF.Sin(windRadians), 0f, MathF.Cos(windRadians))
             * (sky.CloudWindSpeed * cloudTime));
+        shader.SetFloat("CloudWindAngle", windRadians);
+        shader.SetFloat("CirrusCoverage", Math.Clamp(sky.CirrusCoverage, 0f, 1f));
+        shader.SetFloat("StarIntensity", MathF.Max(sky.StarIntensity, 0f));
 
         for (var face = 0; face < 6; face++) {
             shader.SetInt("Face", face);
@@ -141,18 +146,24 @@ public sealed class GLProceduralSkyPass {
         GL.GenerateMipmap(GenerateMipmapTarget.TextureCubeMap);
         var topMip = (int)MathF.Log2(resolution);
         var texel = new float[4];
+        var faceAvg = new Vector3[6]; // +X, -X, +Y, -Y, +Z, -Z
         Vector3 ambient = Vector3.Zero;
         for (var face = 0; face < 6; face++) {
             GL.GetTexImage(TextureTarget.TextureCubeMapPositiveX + face, topMip,
                 PixelFormat.Rgba, PixelType.Float, texel);
-            ambient += new Vector3(texel[0], texel[1], texel[2]);
+            faceAvg[face] = new Vector3(texel[0], texel[1], texel[2]);
+            ambient += faceAvg[face];
         }
         GL.BindTexture(TextureTarget.TextureCubeMap, 0);
         GL.ActiveTexture(TextureUnit.Texture0);
 
+        // Airlight = upper-hemisphere weighting (top face + the sky half of the sides): the
+        // hue fog veils toward. The full-sphere ambient would brown it with the virtual ground.
+        Vector3 airlight = (faceAvg[2] + 0.5f * (faceAvg[0] + faceAvg[1] + faceAvg[4] + faceAvg[5])) / 3f;
+
         // Log the first bake only: animated clouds re-bake on a cadence and would spam.
         var firstBake = Cubemap.UID == 0;
-        Cubemap.Adopt(cubemapId, ambient / 6f);
+        Cubemap.Adopt(cubemapId, ambient / 6f, airlight);
         if (firstBake)
             Console.WriteLine("[ProceduralSky] cubemap baked.");
     }

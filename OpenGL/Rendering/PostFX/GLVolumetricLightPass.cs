@@ -3,14 +3,16 @@ using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
-// Volumetric sun scattering (god-rays / light shafts). Raymarches the camera ray against
-// the directional shadow map and accumulates Henyey-Greenstein in-scatter where the air is
-// lit, then temporally denoises and bilateral-upsamples the result over the scene.
+// Volumetric height fog + sun scattering (god-rays / light shafts). Raymarches a physical
+// exponential height fog against the directional shadow map: in-scatters the atmosphere-
+// attenuated sun plus the baked sky's average radiance (skylight), carries transmittance
+// in alpha so the combine extinguishes the scene behind the fog, then temporally denoises
+// and bilateral-upsamples the result.
 //
 // Pipeline per frame (march + temporal at half-res, combine at full-res):
 //   1. March    - dithered raymarch, shadow-map visibility per step (Volumetric_Frag)
-//   2. Temporal - reproject + accumulate last frame's scatter (Volumetric_Temporal)
-//   3. Combine  - depth-aware upsample + additive composite (Volumetric_Combine)
+//   2. Temporal - reproject + accumulate last frame's fog rgba (Volumetric_Temporal)
+//   3. Combine  - depth-aware upsample + scene*T + scatter composite (Volumetric_Combine)
 //
 // History persists per render target across frames and resets on resize. Like SSR/SSGI it
 // reconstructs world pos from the single-sample depth attachment, so it only runs with MSAA
@@ -48,7 +50,7 @@ public sealed class GLVolumetricLightPass {
     public int Render(int targetIndex, int colorTexture, int depthTexture, int shadowMapTexture,
         int width, int height, ref Matrix4 view, ref Matrix4 projection,
         Matrix4[] cascadeMatrices, Vector4 cascadeBias, int cascadeCount,
-        Vector3 cameraPos, Vector3 sunDirection, Vector3 sunColor,
+        Vector3 cameraPos, Vector3 sunDirection, Vector3 sunColor, Vector3 skyAmbient,
         float shadowDistance, PostProcessSettings fx) {
         if (depthTexture <= 0 || shadowMapTexture <= 0)
             return colorTexture;
@@ -91,14 +93,17 @@ public sealed class GLVolumetricLightPass {
         marchShader.SetInt("CascadeCount", marchCascades);
         marchShader.SetFloat3("SunDirectionWorld", sunDirection);
         marchShader.SetFloat3("SunColor", sunColor);
+        marchShader.SetFloat3("SkyAmbient", skyAmbient);
         marchShader.SetFloat3("CameraPosWorld", cameraPos);
         marchShader.SetInt("StepCount", Math.Clamp(fx.VolumetricStepCount, 8, 256));
-        marchShader.SetFloat("Anisotropy", Math.Clamp(fx.VolumetricAnisotropy, -0.95f, 0.95f));
+        marchShader.SetFloat("Anisotropy", Math.Clamp(fx.VolumetricAnisotropy, 0f, 0.95f));
         marchShader.SetFloat("Density", Math.Max(fx.VolumetricDensity, 0f));
+        marchShader.SetFloat("HeightFalloff", Math.Max(fx.VolumetricHeightFalloff, 0f));
+        marchShader.SetFloat("BaseHeight", fx.VolumetricBaseHeight);
         marchShader.SetFloat("Scattering", Math.Max(fx.VolumetricScattering, 0f));
+        marchShader.SetFloat("AmbientScatter", Math.Max(fx.VolumetricAmbientScatter, 0f));
         marchShader.SetFloat("SunGlow", Math.Max(fx.VolumetricSunGlow, 0f));
         marchShader.SetFloat("SunGlowSharpness", Math.Max(fx.VolumetricSunGlowSharpness, 1f));
-        marchShader.SetFloat("AmbientFloor", Math.Clamp(fx.VolumetricAmbientFloor, 0f, 1f));
         marchShader.SetInt("FrameIndex", frameIndex++ & 1023);
         // March only the air the shadow map actually covers, so every sample has real shadow
         // data and the shaft contrast survives. Air past this reads "lit" (no data) and would

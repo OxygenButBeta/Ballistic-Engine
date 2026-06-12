@@ -37,7 +37,7 @@ public sealed class PostProcessSettings {
     public float AutoExposureLimitMin { get; set; } = 8f;           // EV floor the meter may reach
     public float AutoExposureLimitMax { get; set; } = 17f;          // EV ceiling the meter may reach
     public float AutoExposureSpeedDarkToLight { get; set; } = 3f;   // stops/sec when the scene brightens
-    public float AutoExposureSpeedLightToDark { get; set; } = 1f;   // stops/sec when the scene darkens
+    public float AutoExposureSpeedLightToDark { get; set; } = 2.5f; // stops/sec when the scene darkens (a day->night cut spans ~10 stops; 1.0 took 10+ s to settle)
     public float HistogramFilterMin { get; set; } = 40f;            // percentile below which pixels are rejected
     public float HistogramFilterMax { get; set; } = 95f;            // percentile above which pixels are rejected
 
@@ -122,22 +122,26 @@ public sealed class PostProcessSettings {
     public float SsgiBounceBoost { get; set; }                        // retired (kept 0; IBL carries richness)
     public float SsgiAmbientFloor { get; set; }                       // retired (kept 0; physical IBL is the base)
 
-    // Volumetric sun scattering (god-rays / light shafts): raymarches the directional
-    // shadow map and accumulates in-scatter where the air is lit. Half-res march + temporal
-    // denoise; like SSR/SSGI it reconstructs from the single-sample depth, so it only runs
-    // while TAA is on / MSAA is off. Off by default (it's an atmospheric, scene-dependent look).
+    // Volumetric height fog + sun scattering (god-rays): physical exponential height fog
+    // marched against the directional shadow map. In-scatters the atmosphere-attenuated sun
+    // and the baked sky's average radiance (skylight); its transmittance EXTINGUISHES the
+    // scene behind it (real fog hides things). Half-res march + temporal denoise; like
+    // SSR/SSGI it reconstructs from the single-sample depth, so it only runs while TAA is
+    // on / MSAA is off. Off by default (it's an atmospheric, scene-dependent look).
     public bool VolumetricEnabled { get; set; }
-    public float VolumetricIntensity { get; set; } = 1f;              // master grade; linear & gentle (scatter is bounded)
-    public float VolumetricDensity { get; set; } = 0.06f;             // depth-falloff SHAPE only (near air weighted vs far); not brightness
-    public float VolumetricScattering { get; set; } = 2.5f;           // shaft brightness; at 1.0 the brightest shaft ~= 1.0 (linear, no cliff)
-    public float VolumetricAnisotropy { get; set; } = 0.76f;          // phase shape g; higher = tighter forward shafts
-    public float VolumetricSunGlow { get; set; } = 0.3f;              // extra blaze around the sun disk (bounded 0..~1)
+    public float VolumetricIntensity { get; set; } = 1f;              // master strength: fades whole fog below 1, boosts only glow above
+    public float VolumetricDensity { get; set; } = 0.002f;            // extinction sigma_t at base height (1/m); 0.002 ~= 2km visibility (light haze)
+    public float VolumetricHeightFalloff { get; set; } = 0.04f;       // 1/m: fog thins with altitude (0 = uniform medium)
+    public float VolumetricBaseHeight { get; set; }                   // world Y below which the fog is at full density
+    public float VolumetricScattering { get; set; } = 1f;             // sun in-scatter multiplier (1 = physical balance)
+    public float VolumetricAmbientScatter { get; set; } = 1f;         // skylight in-scatter multiplier (1 = physical balance)
+    public float VolumetricAnisotropy { get; set; } = 0.7f;           // forward HG lobe g; higher = tighter/brighter toward the sun
+    public float VolumetricSunGlow { get; set; } = 0.3f;              // extra blaze around the sun disk seen through fog
     public float VolumetricSunGlowSharpness { get; set; } = 48f;      // how tight the sun-disk glow is (higher = smaller/hotter)
-    public float VolumetricAmbientFloor { get; set; } = 0.25f;        // min scatter when NOT looking at sun (0 = sun-facing only, 1 = uniform)
-    public int VolumetricStepCount { get; set; } = 48;                // raymarch samples (cost vs banding)
-    public float VolumetricMaxDistance { get; set; } = 120f;          // metres the march reaches (also sky slab)
+    public int VolumetricStepCount { get; set; } = 48;                // shadowed raymarch samples (cost vs banding)
+    public float VolumetricMaxDistance { get; set; } = 120f;          // metres of shadowed march; fog continues analytically beyond
     public float VolumetricFeedback { get; set; } = 0.9f;             // temporal history weight (smoother/laggier)
-    public OpenTK.Mathematics.Vector3 VolumetricTint { get; set; } = OpenTK.Mathematics.Vector3.One; // shaft colour grade
+    public OpenTK.Mathematics.Vector3 VolumetricTint { get; set; } = OpenTK.Mathematics.Vector3.One; // in-scatter colour grade
 
     // 1 = off. Offscreen targets are recreated when this changes. Ignored while TAA is on.
     public int MsaaSamples { get; set; } = 4;

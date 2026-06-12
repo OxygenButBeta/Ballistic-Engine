@@ -81,11 +81,13 @@ public static class VolumePostProcessing {
             fx.VolumetricEnabled = volumetric.enabled.Value;
             fx.VolumetricIntensity = volumetric.intensity.Value;
             fx.VolumetricDensity = volumetric.density.Value;
+            fx.VolumetricHeightFalloff = volumetric.heightFalloff.Value;
+            fx.VolumetricBaseHeight = volumetric.baseHeight.Value;
             fx.VolumetricScattering = volumetric.scattering.Value;
+            fx.VolumetricAmbientScatter = volumetric.ambientScatter.Value;
             fx.VolumetricAnisotropy = volumetric.anisotropy.Value;
             fx.VolumetricSunGlow = volumetric.sunGlow.Value;
             fx.VolumetricSunGlowSharpness = volumetric.sunGlowSharpness.Value;
-            fx.VolumetricAmbientFloor = volumetric.ambientFloor.Value;
             fx.VolumetricStepCount = volumetric.stepCount.Value;
             fx.VolumetricMaxDistance = volumetric.maxDistance.Value;
             fx.VolumetricFeedback = volumetric.feedback.Value;

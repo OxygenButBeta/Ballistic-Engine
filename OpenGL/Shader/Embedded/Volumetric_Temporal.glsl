@@ -1,14 +1,15 @@
 #version 330 core
 
 in vec2 TexCoords;
-out vec4 FragColor; // rgb = temporally accumulated scatter, becomes next frame's history
+out vec4 FragColor; // rgb = accumulated scatter, a = accumulated transmittance; next frame's history
 
 // Temporal accumulation for the half-res volumetric scatter. The raymarch is dithered, so
 // a single frame is noisy; reprojecting last frame's result and blending it in removes the
 // noise the way SSGI_Temporal / TAA do. Volumetrics are low-frequency, so a gentle
-// neighborhood clamp is enough to keep moving shafts from ghosting.
+// neighborhood clamp is enough to keep moving shafts from ghosting. The fog transmittance
+// rides in alpha and is filtered exactly like the scatter (it is just as dithered).
 
-uniform sampler2D currentScatter;  // this frame's noisy half-res march
+uniform sampler2D currentScatter;  // this frame's noisy half-res march (rgb scatter, a trans)
 uniform sampler2D historyScatter;  // last frame's accumulated half-res result
 uniform sampler2D depthTexture;    // full-res scene depth (sampled at half-res UVs)
 
@@ -28,10 +29,10 @@ vec3 WorldPos(vec2 uv, float depth) {
 }
 
 void main() {
-    vec3 current = texture(currentScatter, TexCoords).rgb;
+    vec4 current = texture(currentScatter, TexCoords);
 
     if (!HasHistory) {
-        FragColor = vec4(current, 1.0);
+        FragColor = current;
         return;
     }
 
@@ -43,27 +44,26 @@ void main() {
 
     // Off-screen reprojection (disocclusion / camera turned): fall back to the current sample.
     if (prevClip.w <= 0.0 || any(lessThan(prevUV, vec2(0.0))) || any(greaterThan(prevUV, vec2(1.0)))) {
-        FragColor = vec4(current, 1.0);
+        FragColor = current;
         return;
     }
 
-    vec3 history = texture(historyScatter, prevUV).rgb;
+    vec4 history = texture(historyScatter, prevUV);
 
     // Soft neighborhood clamp: build a 3x3 min/max box of the current frame and clamp the
     // reprojected history into it (expanded a little so smooth gradients aren't flattened).
-    vec3 lo = current;
-    vec3 hi = current;
+    vec4 lo = current;
+    vec4 hi = current;
     vec2 texel = 1.0 / vec2(textureSize(currentScatter, 0));
     for (int x = -1; x <= 1; x++) {
         for (int y = -1; y <= 1; y++) {
-            vec3 s = texture(currentScatter, TexCoords + vec2(x, y) * texel).rgb;
+            vec4 s = texture(currentScatter, TexCoords + vec2(x, y) * texel);
             lo = min(lo, s);
             hi = max(hi, s);
         }
     }
-    vec3 ext = (hi - lo) * 0.5 + 1e-4;
+    vec4 ext = (hi - lo) * 0.5 + 1e-4;
     history = clamp(history, lo - ext, hi + ext);
 
-    vec3 blended = mix(current, history, clamp(Feedback, 0.0, 0.98));
-    FragColor = vec4(blended, 1.0);
+    FragColor = mix(current, history, clamp(Feedback, 0.0, 0.98));
 }

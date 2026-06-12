@@ -465,7 +465,14 @@ void main() {
 
         LightUniforms light = LightUniforms.Resolve();
         sunDirection = light.Direction;
-        sunColor = light.Color * preExposure;
+        // While a ProceduralSky is active, the sun that lights GEOMETRY passes through the
+        // same atmosphere the sky shows: golden-hour light reddens, the sun dims to ~zero
+        // below the horizon. The bake input above stays UNattenuated - the sky shader does
+        // its own per-path attenuation internally (attenuating both would double-redden).
+        Vector3 sunAtmosphere = proceduralActive && ProceduralSky.Active is { } skyAtm
+            ? skyAtm.SunTransmittance(sunDirection)
+            : Vector3.One;
+        sunColor = light.Color * sunAtmosphere * preExposure;
         ambientFallback = light.AmbientIntensity * skyExposureBase * preExposure *
                           (skyboxRenderer.cubemapTexture?.skyAmbient ?? Vector3.One * 0.5f);
 
@@ -664,14 +671,25 @@ void main() {
                 litColor = ssr.Render(targetIndex, litColor, target.DepthTextureId, target.NormalTextureId,
                     target.LenX, target.LenY, ref view, ref renderProjection, PostFX);
 
-        // Volumetric sun shafts before TAA so the temporal pass stabilizes the dithered march
-        // and bloom catches the bright shafts.
-        if (PostFX.VolumetricEnabled)
+        // Volumetric height fog + sun shafts before TAA so the temporal pass stabilizes the
+        // dithered march and bloom catches the bright shafts. sunColor is already atmosphere-
+        // attenuated (dusk shafts go golden with the sky); the skylight term is the baked
+        // sky's RAW average radiance (not ambientFallback - the AmbientIntensity dial would
+        // crush the fog's airlight to near-black), so overcast clouds gray the fog and dusk
+        // dims it: sky, clouds and fog share one energy source.
+        if (PostFX.VolumetricEnabled) {
+            // Airlight prefers the sky-hued upper-hemisphere average (fog veils toward
+            // white-blue sky, not ground-brown); older cubemaps without it fall back.
+            Vector3 skyHue = skyboxRenderer.cubemapTexture is { } skyTex
+                ? (skyTex.skyAirlight != Vector3.Zero ? skyTex.skyAirlight : skyTex.skyAmbient)
+                : Vector3.One * 0.5f;
+            Vector3 fogSkylight = skyExposureBase * preExposure * skyHue;
             using (timers.Time("Volumetric"))
                 litColor = volumetric.Render(targetIndex, litColor, target.DepthTextureId,
                     shadowMap.DepthTextureId, target.LenX, target.LenY, ref view, ref projection,
                     cascadeMatrices, cascadeBias, activeCascadeCount, cameraPos, sunDirection, sunColor,
-                    shadowDistance, PostFX);
+                    fogSkylight, shadowDistance, PostFX);
+        }
 
         if (taaActive) {
             using var taaZone = timers.Time("TAA");
