@@ -23,6 +23,7 @@ internal sealed class DockPanelHost {
         public int Id;                  // unique within the kind
         public object Panel;
         public bool Open = true;
+        public bool JustOpened = true;  // size + center it on its first frame (else it opens tiny)
     }
 
     readonly Dictionary<string, Kind> kinds = new();
@@ -83,6 +84,16 @@ internal sealed class DockPanelHost {
             if (!kinds.TryGetValue(inst.KindKey, out Kind kind)) { inst.Open = false; continue; }
 
             string label = Label(kind, inst);
+            // A freshly-opened, UNDOCKED window opens tiny by default — give it a sensible size and
+            // center it on the viewport for its first frame (the user then docks/resizes as they like).
+            if (inst.JustOpened) {
+                inst.JustOpened = false;
+                ImGuiViewportPtr vp = ImGui.GetMainViewport();
+                ImGui.SetNextWindowSize(new System.Numerics.Vector2(420, 540), ImGuiCond.Appearing);
+                ImGui.SetNextWindowPos(
+                    new System.Numerics.Vector2(vp.Pos.X + vp.Size.X * 0.5f, vp.Pos.Y + vp.Size.Y * 0.5f),
+                    ImGuiCond.Appearing, new System.Numerics.Vector2(0.5f, 0.5f));
+            }
             bool open = inst.Open;
             if (ImGui.Begin(label, ref open)) {
                 OnTitleStrip?.Invoke(label);
