@@ -186,11 +186,13 @@ internal sealed class AssetBrowserPanel {
     Func<string, string> newAssetContent; // name (no ext) -> file text; null = a folder (no file)
     Action newAssetPostCreate;            // e.g. RequestScriptRebuild; runs before the refresh
 
+    string pendingDefaultName = "";   // applied to newAssetName ON the popup-opening frame (see below)
+
     // Arms the generic prompt. content is null for a folder. postCreate runs after the file is written.
     void PromptNewAsset(string kind, string defaultName, string ext, Func<string, string> content,
         Action postCreate = null) {
         newAssetKind = kind;
-        newAssetName = defaultName;
+        pendingDefaultName = defaultName;
         newAssetExt = ext;
         newAssetContent = content;
         newAssetPostCreate = postCreate;
@@ -200,21 +202,32 @@ internal sealed class AssetBrowserPanel {
     void DrawNewAssetPrompt() {
         if (openNewAssetPrompt) {
             openNewAssetPrompt = false;
+            // Reset the buffer ON THE SAME FRAME as OpenPopup (the script prompt does this and works).
+            // The Hexa.NET InputText ref-string binding drops edits when the string was assigned a frame
+            // EARLIER (in PromptNewAsset) — so it must be re-assigned here, not there.
+            newAssetName = pendingDefaultName;
             ImGui.OpenPopup("##newasset");
         }
 
         ImGuiViewportPtr vp = ImGui.GetMainViewport();
         SysVec2 center = new(vp.Pos.X + vp.Size.X * 0.5f, vp.Pos.Y + vp.Size.Y * 0.5f);
         ImGui.SetNextWindowPos(center, ImGuiCond.Appearing, new SysVec2(0.5f, 0.5f));
-        if (!ImGui.BeginPopupModal("##newasset", ImGuiWindowFlags.AlwaysAutoResize))
+        PushPromptStyle();
+        if (!ImGui.BeginPopupModal("##newasset", ImGuiWindowFlags.AlwaysAutoResize)) {
+            PopPromptStyle();
             return;
+        }
 
+        // Bright title (the default text is dim/grey which read as "disabled").
+        ImGui.PushStyleColor(ImGuiCol.Text, new SysVec4(0.95f, 0.95f, 0.97f, 1f));
         ImGui.TextUnformatted($"New {newAssetKind}");
+        ImGui.PopStyleColor();
         ImGui.Separator();
-        ImGui.TextDisabled("Name:");
+        ImGui.Spacing();
+        ImGui.TextUnformatted("Name");
         if (ImGui.IsWindowAppearing())
             ImGui.SetKeyboardFocusHere();
-        ImGui.SetNextItemWidth(280);
+        ImGui.SetNextItemWidth(300);
         bool enter = ImGui.InputText("##newassetname", ref newAssetName, 96, ImGuiInputTextFlags.EnterReturnsTrue);
 
         string trimmed = newAssetName.Trim();
@@ -225,16 +238,44 @@ internal sealed class AssetBrowserPanel {
             ImGui.TextDisabled($"Creates {trimmed}{newAssetExt}");
 
         ImGui.Spacing();
-        if (ImGui.Button("Cancel", new SysVec2(120, 0)))
-            ImGui.CloseCurrentPopup();
-        ImGui.SameLine();
-        ImGui.BeginDisabled(!valid);
-        if (ImGui.Button("Create", new SysVec2(120, 0)) || (enter && valid)) {
+        PromptButtons(out bool create, valid);
+        if (create || (enter && valid)) {
             CreateNamedAsset(trimmed);
             ImGui.CloseCurrentPopup();
         }
-        ImGui.EndDisabled();
         ImGui.EndPopup();
+        PopPromptStyle();
+    }
+
+    // A lighter, roomier look for the create modals (the default was a dim, cramped box).
+    static void PushPromptStyle() {
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new SysVec2(20, 18));
+        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 5f);
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new SysVec2(8, 8));
+        ImGui.PushStyleColor(ImGuiCol.PopupBg, new SysVec4(0.16f, 0.16f, 0.19f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.FrameBg, new SysVec4(0.10f, 0.10f, 0.12f, 1f));
+    }
+
+    static void PopPromptStyle() {
+        ImGui.PopStyleColor(2);
+        ImGui.PopStyleVar(3);
+    }
+
+    // Cancel (neutral) + Create (accent-coloured) button row for the create prompts. `create` is true
+    // when Create was clicked; Cancel closes the popup itself.
+    static void PromptButtons(out bool create, bool createEnabled) {
+        create = false;
+        if (ImGui.Button("Cancel", new SysVec2(120, 0)))
+            ImGui.CloseCurrentPopup();
+        ImGui.SameLine();
+        // Coloured Create button (greyed when disabled) so it reads as the primary action.
+        ImGui.BeginDisabled(!createEnabled);
+        ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(0.20f, 0.55f, 0.30f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(0.26f, 0.66f, 0.38f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new SysVec4(0.16f, 0.46f, 0.26f, 1f));
+        create = ImGui.Button("Create", new SysVec2(120, 0));
+        ImGui.PopStyleColor(3);
+        ImGui.EndDisabled();
     }
 
     // Writes the named asset (or folder) into the current folder and imports it. Uniqueness still
@@ -273,15 +314,21 @@ internal sealed class AssetBrowserPanel {
         ImGuiViewportPtr vp = ImGui.GetMainViewport();
         SysVec2 center = new(vp.Pos.X + vp.Size.X * 0.5f, vp.Pos.Y + vp.Size.Y * 0.5f);
         ImGui.SetNextWindowPos(center, ImGuiCond.Appearing, new SysVec2(0.5f, 0.5f));
-        if (!ImGui.BeginPopupModal("##newscript", ImGuiWindowFlags.AlwaysAutoResize))
+        PushPromptStyle();
+        if (!ImGui.BeginPopupModal("##newscript", ImGuiWindowFlags.AlwaysAutoResize)) {
+            PopPromptStyle();
             return;
+        }
 
+        ImGui.PushStyleColor(ImGuiCol.Text, new SysVec4(0.95f, 0.95f, 0.97f, 1f));
         ImGui.TextUnformatted("New Script");
+        ImGui.PopStyleColor();
         ImGui.Separator();
-        ImGui.TextDisabled("Class name (= file name):");
+        ImGui.Spacing();
+        ImGui.TextUnformatted("Class name (= file name)");
         if (ImGui.IsWindowAppearing())
             ImGui.SetKeyboardFocusHere();
-        ImGui.SetNextItemWidth(280);
+        ImGui.SetNextItemWidth(300);
         bool enter = ImGui.InputText("##scriptname", ref newScriptName, 64, ImGuiInputTextFlags.EnterReturnsTrue);
 
         string className = ScriptTemplates.ClassName(newScriptName.Trim());
@@ -292,16 +339,13 @@ internal sealed class AssetBrowserPanel {
             ImGui.TextDisabled($"Creates {className}.cs : Behaviour");
 
         ImGui.Spacing();
-        if (ImGui.Button("Cancel", new SysVec2(120, 0)))
-            ImGui.CloseCurrentPopup();
-        ImGui.SameLine();
-        ImGui.BeginDisabled(!valid);
-        if (ImGui.Button("Create", new SysVec2(120, 0)) || (enter && valid)) {
+        PromptButtons(out bool create, valid);
+        if (create || (enter && valid)) {
             CreateScriptNamed(className);
             ImGui.CloseCurrentPopup();
         }
-        ImGui.EndDisabled();
         ImGui.EndPopup();
+        PopPromptStyle();
     }
 
     // Folder icon that reflects whether the folder has CONTENT: a filled (open) folder for non-empty,
