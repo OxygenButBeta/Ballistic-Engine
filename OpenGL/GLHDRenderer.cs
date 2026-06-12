@@ -842,6 +842,7 @@ void main() {
             DepthTexture = target.DepthTextureId,
             AoTexture = aoTexture,
             LitColor = litColor,
+            SsgiTexture = ssgi.LastGiTexture,
             DestWidth = destW,
             DestHeight = destH,
             PresentToScreen = PresentToScreen,

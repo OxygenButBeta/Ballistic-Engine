@@ -58,12 +58,20 @@ public sealed class GLSSGIPass {
     // the TEMPORAL reprojection: history is an accumulated, effectively jitter-free image, so
     // reprojecting with jittered matrices made the history UV wobble with the jitter sequence
     // every frame and the accumulation could never converge (THE "SSGI is broken" shimmer).
+    // The denoised, combine-PRE GI texture from the last Render (the isolated indirect light, before
+    // it's mixed into the lit colour). The editor's debug view samples it to show SSGI on its own.
+    // 0 when SSGI was skipped this frame. It's a transient pool texture, valid until EndFrame — the
+    // editor's debug composite runs before EndFrame, so it's still live there.
+    public int LastGiTexture { get; private set; }
+
     public int Render(int targetIndex, int colorTexture, int depthTexture, int normalTexture,
         int aoTexture, int width, int height, ref Matrix4 view, ref Matrix4 projection,
         ref Matrix4 projectionNoJitter,
         int envCubemap, ref Matrix4 skyRotation, float skyExposure, PostProcessSettings fx) {
-        if (depthTexture <= 0 || normalTexture <= 0)
+        if (depthTexture <= 0 || normalTexture <= 0) {
+            LastGiTexture = 0;
             return colorTexture;
+        }
 
         var halfW = Math.Max(1, width / 2);
         var halfH = Math.Max(1, height / 2);
@@ -191,6 +199,7 @@ public sealed class GLSSGIPass {
             src = dst;
         }
         GLRenderTexture denoisedFinal = src;
+        LastGiTexture = denoisedFinal.Texture;   // isolated GI for the editor debug view
 
         // ---- 4. Combine over the full-res scene ----
         combinedTarget.BindAsTarget();

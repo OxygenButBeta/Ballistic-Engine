@@ -27,7 +27,7 @@ public abstract class HDRenderer {
     // sets it), so this whole feature is dead weight there. The renderer NEVER references the editor
     // assembly; the editor wires the delegate at startup.
     public struct DebugFrame {
-        public int NormalTexture, DepthTexture, AoTexture, LitColor;   // GL texture ids for this frame
+        public int NormalTexture, DepthTexture, AoTexture, LitColor, SsgiTexture;   // GL texture ids
         public int DestWidth, DestHeight;
         public bool PresentToScreen;     // true = draw into FB 0 (player); false = the editor display FBO
         public OpenTK.Mathematics.Matrix4 InvProjection;
