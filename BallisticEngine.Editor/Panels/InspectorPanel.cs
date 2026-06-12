@@ -65,7 +65,7 @@ internal sealed class InspectorPanel {
             // hierarchy actions (delete/duplicate/reparent) apply to all selected.
             if (state.SelectedEntities.Count > 1) {
                 ImGui.TextDisabled($"{EditorIcons.Package}  {state.SelectedEntities.Count} entities selected");
-                ImGui.TextDisabled("Transform edits apply to ALL; component edits affect the active one.");
+                ImGui.TextDisabled("Edits apply to ALL selected (matching components).");
                 ImGui.Separator();
                 ImGui.Spacing();
             }
@@ -1022,6 +1022,30 @@ internal sealed class InspectorPanel {
         }
     }
 
+    // Sets a member on the active component AND, in a multi-selection, on the same-named member of the
+    // matching component (same type) of every OTHER selected entity — Unity's per-component multi-edit.
+    // Only broadcasts when `target` is a Behaviour on the active entity and >1 entity is selected; for
+    // anything else (assets, scene behaviours) it just sets the one target.
+    void ApplyMember(MemberInfo member, object target, object value) {
+        ComponentReflection.SetValue(member, target, value);
+
+        if (state.SelectedEntities.Count <= 1 || target is not Behaviour activeBehaviour)
+            return;
+        Entity activeEntity = activeBehaviour.Entity;
+        Type compType = activeBehaviour.GetType();
+        foreach (Entity e in state.SelectedEntities) {
+            if (e is null || e.IsDestroyed || ReferenceEquals(e, activeEntity))
+                continue;
+            foreach (Behaviour b in e.Behaviours) {
+                if (b.GetType() == compType) {
+                    try { ComponentReflection.SetValue(member, b, value); }
+                    catch { /* mismatched/read-only on a sibling — skip, don't break the edit */ }
+                    break; // first matching component only
+                }
+            }
+        }
+    }
+
     void DrawMember(MemberInfo member, object target, MemberAttributes attrs) {
         Type memberType = ComponentReflection.MemberType(member);
         object value = ComponentReflection.GetValue(member, target);
@@ -1052,7 +1076,7 @@ internal sealed class InspectorPanel {
                         : ImGui.DragFloat("##v", ref f, 0.05f));
                     if (changed) {
                         if (attrs.Range is { } rc) f = Math.Clamp(f, rc.Min, rc.Max);
-                        ComponentReflection.SetValue(member, target, f);
+                        ApplyMember(member, target, f);
                         state.MarkViewportDirty();
                     }
                     break;
@@ -1063,20 +1087,20 @@ internal sealed class InspectorPanel {
                         : ImGui.DragInt("##v", ref i));
                     if (changed) {
                         if (attrs.Range is { } rc) i = Math.Clamp(i, (int)rc.Min, (int)rc.Max);
-                        ComponentReflection.SetValue(member, target, i);
+                        ApplyMember(member, target, i);
                         state.MarkViewportDirty();
                     }
                     break;
                 }
                 case bool b: {
                     var changed = InspectorUndo.Track(label, ImGui.Checkbox("##v", ref b));
-                    if (changed) { ComponentReflection.SetValue(member, target, b); state.MarkViewportDirty(); }
+                    if (changed) { ApplyMember(member, target, b); state.MarkViewportDirty(); }
                     break;
                 }
                 case string s: {
                     var str = s ?? "";
                     var changed = InspectorUndo.Track(label, ImGui.InputText("##v", ref str, 256));
-                    if (changed) { ComponentReflection.SetValue(member, target, str); state.MarkViewportDirty(); }
+                    if (changed) { ApplyMember(member, target, str); state.MarkViewportDirty(); }
                     break;
                 }
                 case Vector3 v3: {
@@ -1094,20 +1118,20 @@ internal sealed class InspectorPanel {
                     else {
                         changed = AxisVec3("v3", label, ref sv, 0.05f);
                     }
-                    if (changed) { ComponentReflection.SetValue(member, target, new Vector3(sv.X, sv.Y, sv.Z)); state.MarkViewportDirty(); }
+                    if (changed) { ApplyMember(member, target, new Vector3(sv.X, sv.Y, sv.Z)); state.MarkViewportDirty(); }
                     break;
                 }
                 case Vector2 v2: {
                     var sv = new SysVec2(v2.X, v2.Y);
                     var changed = InspectorUndo.Track(label, ImGui.DragFloat2("##v", ref sv, 0.05f));
-                    if (changed) { ComponentReflection.SetValue(member, target, new Vector2(sv.X, sv.Y)); state.MarkViewportDirty(); }
+                    if (changed) { ApplyMember(member, target, new Vector2(sv.X, sv.Y)); state.MarkViewportDirty(); }
                     break;
                 }
                 case Enum e: {
                     string[] names = Enum.GetNames(memberType);
                     int current = Array.IndexOf(names, e.ToString());
                     var changed = InspectorUndo.Track(label, ImGui.Combo("##v", ref current, names, names.Length));
-                    if (changed) { ComponentReflection.SetValue(member, target, Enum.Parse(memberType, names[current])); state.MarkViewportDirty(); }
+                    if (changed) { ApplyMember(member, target, Enum.Parse(memberType, names[current])); state.MarkViewportDirty(); }
                     break;
                 }
                 case AnimationCurve curve: {
@@ -1555,7 +1579,7 @@ internal sealed class InspectorPanel {
             .MakeGenericMethod(assetType);
         object loaded = load.Invoke(null, [guid]);
         if (loaded is not null)
-            ComponentReflection.SetValue(member, target, loaded);
+            ApplyMember(member, target, loaded); // broadcasts to the multi-selection like value edits
         state.MarkViewportDirty();
     }
 
