@@ -29,6 +29,7 @@ public class GLHDRenderer : HDRenderer {
     GLFrameBuffer sceneDisplay;    // post-processed (tonemapped) output the editor panels sample
     GLFrameBuffer gameDisplay;
     StandardShader shadowDepthShader;
+    StandardShader skinnedShadowDepthShader;   // skinned variant — animated shadows
     GLShadowMap shadowMap;
     GLShadowMap punctualShadows;
     GLCompositePass composite;
@@ -186,7 +187,39 @@ void main() {
         discard;
 }
 ";
+        // Skinned shadow caster: the same depth shader plus GPU skinning, so an animated character's
+        // shadow deforms with the animation instead of being stuck at bind pose. The bone SSBO is the
+        // SAME buffer the main/prepass skinning uses (binding 1).
+        const string skinnedShadowVert = @"
+#version 460 core
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec2 aTexCoord;
+layout(location = 8) in vec4 aBoneIndices;
+layout(location = 9) in vec4 aBoneWeights;
+
+out vec2 uv;
+
+uniform mat4 model;
+uniform mat4 lightSpaceMatrix;
+
+layout(std430, binding = 1) readonly buffer BoneMatrices {
+    mat4 bones[];
+};
+
+void main() {
+    uv = aTexCoord;
+    ivec4 bi = ivec4(aBoneIndices + 0.5);
+    mat4 skin =
+        aBoneWeights.x * bones[bi.x] +
+        aBoneWeights.y * bones[bi.y] +
+        aBoneWeights.z * bones[bi.z] +
+        aBoneWeights.w * bones[bi.w];
+    vec3 skinnedPos = (skin * vec4(position, 1.0)).xyz;
+    gl_Position = lightSpaceMatrix * model * vec4(skinnedPos, 1.0);
+}
+";
         shadowDepthShader = GraphicAPI.CreateStandardShader(shadowVert, shadowFrag);
+        skinnedShadowDepthShader = GraphicAPI.CreateStandardShader(skinnedShadowVert, shadowFrag);
     }
 
     public float Metallic = 1f;
@@ -799,6 +832,15 @@ void main() {
                 opaqueItems.Add(item);
                 geo.Add(aabbMin);
                 geo.Add(aabbMax);
+                // A skinned caster's AABB is its (static) bind-pose bounds, so the geometry stamp
+                // alone wouldn't change as it animates and the cached cascades would freeze its
+                // shadow at bind pose. Fold a cheap digest of its current skinning matrices into the
+                // stamp so cascades re-render while it moves, but a paused/static pose still caches.
+                if (target.IsSkinned && target.SkinningMatrices is { Length: > 0 } sm) {
+                    int step = Math.Max(1, sm.Length / 4);
+                    for (var b = 0; b < sm.Length; b += step)
+                        geo.Add(sm[b].Row3); // translation row — the bulk of per-frame motion
+                }
                 if (inView)
                     visibleOpaque.Add(target);
             }
@@ -990,7 +1032,7 @@ void main() {
             // Each cascade draws only the casters inside its own light-space frustum — the
             // rasterizer clipped the rest anyway, so this can't change the image.
             CullInto(ref cascadeMatrices[cascade], opaqueItems, cullScratch);
-            RenderShadowCasters(cullScratch);
+            RenderShadowCasters(cullScratch, ref cascadeMatrices[cascade]);
         }
 
         // Punctual tiles only when lights/geometry changed (static scenes render these once).
@@ -999,7 +1041,7 @@ void main() {
                 punctualShadows.Bind(s);
                 shadowDepthShader.SetMatrix4("lightSpaceMatrix", ref spotShadowMatrices[s]);
                 CullInto(ref spotShadowMatrices[s], opaqueItems, cullScratch);
-                RenderShadowCasters(cullScratch);
+                RenderShadowCasters(cullScratch, ref spotShadowMatrices[s]);
             }
 
             for (var p = 0; p < shadowedPointCount; p++)
@@ -1007,7 +1049,7 @@ void main() {
                 punctualShadows.Bind(MaxShadowedSpots + p * 6 + f);
                 shadowDepthShader.SetMatrix4("lightSpaceMatrix", ref pointShadowMatrices[p * 6 + f]);
                 CullInto(ref pointShadowMatrices[p * 6 + f], opaqueItems, cullScratch);
-                RenderShadowCasters(cullScratch);
+                RenderShadowCasters(cullScratch, ref pointShadowMatrices[p * 6 + f]);
             }
         }
 
@@ -1018,12 +1060,38 @@ void main() {
         shadowMap.Unbind();
     }
 
-    void RenderShadowCasters(List<IStaticMeshRenderer> casters) {
+    // lightSpaceMatrix: the active cascade/face matrix, already set on shadowDepthShader by the
+    // caller. Skinned casters switch to skinnedShadowDepthShader (the matrix is set on it here) and
+    // bind their bone SSBO so the shadow deforms with the animation; the caller re-activates
+    // shadowDepthShader afterwards if it draws more static casters.
+    void RenderShadowCasters(List<IStaticMeshRenderer> casters, ref Matrix4 lightSpaceMatrix) {
+        bool skinnedActive = false;
         foreach (IStaticMeshRenderer target in casters) {
             Mesh mesh = target.SharedMesh;
             Matrix4 worldMatrix = ModelMatrix(target, mesh);
+
+            bool skinned = target.IsSkinned && target.SkinningMatrices is { } sm && sm.Length > 0;
+            StandardShader shader;
+            if (skinned) {
+                if (!skinnedActive) {
+                    skinnedShadowDepthShader.Activate();
+                    skinnedShadowDepthShader.SetMatrix4("lightSpaceMatrix", ref lightSpaceMatrix);
+                    skinnedActive = true;
+                }
+                shader = skinnedShadowDepthShader;
+                boneMatrices.Upload(target.SkinningMatrices, target.SkinningMatrices.Length);
+            }
+            else {
+                if (skinnedActive) {
+                    shadowDepthShader.Activate();
+                    shadowDepthShader.SetMatrix4("lightSpaceMatrix", ref lightSpaceMatrix);
+                    skinnedActive = false;
+                }
+                shader = shadowDepthShader;
+            }
+
             mesh.Activate(); // VAO only; the depth pass doesn't need the material
-            shadowDepthShader.SetMatrix4("model", ref worldMatrix);
+            shader.SetMatrix4("model", ref worldMatrix);
 
             // Only opaque submeshes cast shadows; transparent/unassigned ranges are skipped.
             SubMeshData[] subMeshes = mesh.SubMeshes;
@@ -1035,11 +1103,11 @@ void main() {
                 // Cutout casters: alpha-test the depth pass so leaves shadow as leaves,
                 // not as full quads — and skip culling, since cards are single-sided.
                 var cutout = material.Cutout && material.Diffuse is not null;
-                shadowDepthShader.SetBool("AlphaCutout", cutout);
+                shader.SetBool("AlphaCutout", cutout);
                 if (cutout) {
                     GL.ActiveTexture(TextureUnit.Texture0);
                     GL.BindTexture(TextureTarget.Texture2D, material.Diffuse.UID);
-                    shadowDepthShader.SetInt("Diffuse", 0);
+                    shader.SetInt("Diffuse", 0);
                     GL.Disable(EnableCap.CullFace);
                 }
 
@@ -1053,6 +1121,11 @@ void main() {
 
             mesh.Deactivate();
         }
+
+        // Leave shadowDepthShader active so the caller's next SetMatrix4("lightSpaceMatrix") lands on
+        // the right program (the cascade/face loops set it before each RenderShadowCasters call).
+        if (skinnedActive)
+            shadowDepthShader.Activate();
     }
 
     // Recreates the cascade array when the Shadows volume changes resolution (pow2-snapped,
@@ -1512,7 +1585,7 @@ void main() {
         job.Shadow.Bind(0);
         shadowDepthShader.SetMatrix4("lightSpaceMatrix", ref job.ShadowMatrix);
         CullInto(ref job.ShadowMatrix, opaqueItems, cullScratch);
-        RenderShadowCasters(cullScratch);
+        RenderShadowCasters(cullScratch, ref job.ShadowMatrix);
         shadowDepthShader.Deactivate();
         GL.ColorMask(true, true, true, true);
         GL.CullFace(TriangleFace.Back);
@@ -1876,7 +1949,7 @@ void main() {
         job.Shadow.Bind(0);
         shadowDepthShader.SetMatrix4("lightSpaceMatrix", ref job.ShadowMatrix);
         CullInto(ref job.ShadowMatrix, opaqueItems, cullScratch);
-        RenderShadowCasters(cullScratch);
+        RenderShadowCasters(cullScratch, ref job.ShadowMatrix);
         shadowDepthShader.Deactivate();
         GL.ColorMask(true, true, true, true);
         GL.CullFace(TriangleFace.Back);
