@@ -2,6 +2,7 @@
   <Project Path="BallisticEngine.csproj" />
   <Project Path="BallisticEngine.Cli/BallisticEngine.Cli.csproj" />
   <Project Path="BallisticEngine.Editor/BallisticEngine.Editor.csproj" />
+  <Project Path="BallisticEngine.Mcp/BallisticEngine.Mcp.csproj" />
   <Project Path="BallisticEngine.Profiling.Tracy/BallisticEngine.Profiling.Tracy.csproj" />
   <Project Path="BallisticEngine.Runtime/BallisticEngine.Runtime.csproj" />
 </Solution>

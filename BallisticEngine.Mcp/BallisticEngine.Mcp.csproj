@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- MCP server for the editor command port: a thin stdio process translating MCP tool calls
+       into named-pipe requests against the running editor (\\.\pipe\BallisticEditor). Hand-rolled
+       JSON-RPC on purpose — zero dependencies, nothing to version-chase; the protocol surface an
+       MCP client needs (initialize / tools/list / tools/call / ping) is ~200 lines. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>BallisticEngine.Mcp</AssemblyName>
+    <RootNamespace>BallisticEngine.Mcp</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+</Project>

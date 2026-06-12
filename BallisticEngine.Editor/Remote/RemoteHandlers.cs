@@ -184,9 +184,9 @@ internal static class RemoteHandlers {
         EditorUndo.Push($"Create {name} (remote)");
         Scene scene = SceneManager.GetCurrentScene();
         Entity entity = scene.CreateEntity(name);
-        if (p.TryGetProperty("position", out JsonElement pos))
+        if (p.TryGetProperty("position", out JsonElement pos) && pos.ValueKind != JsonValueKind.Null)
             entity.transform.Position = (Vector3)ConvertValue(typeof(Vector3), pos);
-        if (p.TryGetProperty("parent", out JsonElement parent))
+        if (p.TryGetProperty("parent", out JsonElement parent) && parent.ValueKind == JsonValueKind.String)
             entity.transform.SetParent(Resolve(parent.GetString()!).transform);
         Mutated();
         return new { id = entity.InstanceId.ToString("N"), name = entity.Name };
