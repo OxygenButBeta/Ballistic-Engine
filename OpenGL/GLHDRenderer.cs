@@ -34,6 +34,7 @@ public class GLHDRenderer : HDRenderer {
     GLShadowMap punctualShadows;
     GLCompositePass composite;
     StandardShader debugViewShader;   // Normals/Depth debug visualisation (editor shading dropdown)
+    StandardShader idMapShader;       // entity-ID map pass (perception layer, on-demand)
     GLUIPass uiPass;   // screen-space game UI overlay, drawn after composite (UIDocument.Active)
     GLBloomPass bloom;
     GLSSAOPass ssao;
@@ -748,6 +749,9 @@ void main() {
             }
         }
 
+        // On-demand entity-ID map (perception layer) — uses THIS frame's culling lists.
+        RenderIdMapIfRequested(target, ref view, ref renderProjection);
+
         // Every pool-acquired transient target has been consumed by now.
         GLRenderTexturePool.Shared.EndFrame();
 
@@ -830,6 +834,108 @@ void main() {
     // mid-run). TAA off (sub-pixel jitter + history), SSGI/volumetric off (temporal accumulation),
     // exposure fixed (no adaptation). Individual BALLISTIC_FX_* toggles still win — they apply after.
     static readonly bool EnvDeterministic = Environment.GetEnvironmentVariable("BALLISTIC_DETERMINISTIC") == "1";
+
+    // ---- Entity-ID map (perception layer) -----------------------------------
+    // On-demand "labeled screenshot": every visible opaque submesh draws once into an R32UI
+    // target with a unique 1-based id; IdMaps turns the readback into per-entity screen-space
+    // boxes (<path>.json) + a color-coded BMP. Player/headless path only (PresentToScreen) —
+    // editor per-view capture comes with the command port. Runs AFTER the normal frame using
+    // this frame's culling lists, so "visible" matches what the frame actually drew.
+    // v1 limits: opaque only, skinned renderers skipped (counted), cutout claims full triangles.
+    void RenderIdMapIfRequested(GLFrameBuffer target, ref Matrix4 view, ref Matrix4 renderProjection) {
+        if (!PresentToScreen)
+            return;
+        var due = IdMaps.DueThisFrame();
+        if (due is null)
+            return;
+
+        idMapShader ??= GraphicAPI.CreateStandardShader(
+            EmbeddedShaderSource.Read("IdMap_Vert.glsl"), EmbeddedShaderSource.Read("IdMap_Frag.glsl"));
+
+        int w = target.LenX, h = target.LenY;
+
+        // Throwaway R32UI + depth FBO — captures are rare, allocation cost is irrelevant.
+        int fbo = GL.GenFramebuffer();
+        int idTex = GL.GenTexture();
+        int depthRbo = GL.GenRenderbuffer();
+        GL.BindTexture(TextureTarget.Texture2D, idTex);
+        GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.R32ui, w, h, 0,
+            PixelFormat.RedInteger, PixelType.UnsignedInt, IntPtr.Zero);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Nearest);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Nearest);
+        GL.BindRenderbuffer(RenderbufferTarget.Renderbuffer, depthRbo);
+        GL.RenderbufferStorage(RenderbufferTarget.Renderbuffer, RenderbufferStorage.DepthComponent24, w, h);
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, fbo);
+        GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
+            TextureTarget.Texture2D, idTex, 0);
+        GL.FramebufferRenderbuffer(FramebufferTarget.Framebuffer, FramebufferAttachment.DepthAttachment,
+            RenderbufferTarget.Renderbuffer, depthRbo);
+
+        GL.Viewport(0, 0, w, h);
+        GL.ClearBuffer(ClearBuffer.Color, 0, new uint[] { 0u });
+        GL.ClearBuffer(ClearBuffer.Depth, 0, new[] { 1f });
+        GL.Enable(EnableCap.DepthTest);
+        GL.DepthFunc(DepthFunction.Less);
+        GL.DepthMask(true);
+        GL.Disable(EnableCap.Blend); // blending over an integer target is undefined
+        GL.Enable(EnableCap.CullFace);
+        GL.CullFace(TriangleFace.Back);
+
+        idMapShader.Activate();
+        Matrix4 viewProjection = view * renderProjection;
+
+        var legend = new List<IdMaps.Entry>();
+        int skippedSkinned = 0;
+        foreach (IStaticMeshRenderer t in visibleOpaque) {
+            if (t.IsSkinned) { skippedSkinned++; continue; }
+            Mesh mesh = t.SharedMesh;
+            SubMeshData[] subMeshes = mesh.SubMeshes;
+            Matrix4 mvp = ModelMatrix(t, mesh) * viewProjection;
+            idMapShader.SetMatrix4("mvp", ref mvp);
+
+            var entity = t.Transform?.Entity;
+            mesh.Activate();
+            (int first, int end) = SubMeshRange(t, subMeshes.Length);
+            for (int i = first; i < end; i++) {
+                if (t.MaterialFor(i) is not { Transparent: false })
+                    continue;
+                // Same per-submesh culling as the frame's opaque pass, so the report's
+                // "visible" matches what was actually drawn.
+                if (!SubMeshVisibleThisView(t, i))
+                    continue;
+                legend.Add(new IdMaps.Entry {
+                    Entity = entity?.Name,
+                    EntityId = entity?.InstanceId.ToString("N"),
+                    SubMesh = subMeshes[i].Name,
+                    SubMeshIndex = i,
+                });
+                idMapShader.SetInt("drawId", legend.Count); // 1-based; 0 = background
+                GL.DrawElements(PrimitiveType.Triangles, subMeshes[i].IndexCount,
+                    DrawElementsType.UnsignedInt, (IntPtr)(subMeshes[i].IndexStart * sizeof(uint)));
+            }
+            mesh.Deactivate();
+        }
+
+        var ids = new uint[w * h];
+        GL.ReadBuffer(ReadBufferMode.ColorAttachment0);
+        GL.ReadPixels(0, 0, w, h, PixelFormat.RedInteger, PixelType.UnsignedInt, ids);
+
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+        GL.DeleteFramebuffer(fbo);
+        GL.DeleteTexture(idTex);
+        GL.DeleteRenderbuffer(depthRbo);
+
+        foreach (IdMaps.Request request in due) {
+            try {
+                IdMaps.WriteOutputs(request.Path, w, h, ids, legend, skippedSkinned);
+                Console.WriteLine($"[IdMap] saved {w}x{h} ({legend.Count} draws) to {request.Path}.json/.bmp");
+                request.OnSaved?.Invoke(request.Path);
+            }
+            catch (Exception ex) {
+                Debugging.LogError($"IdMap to '{request.Path}' failed: {ex.Message}");
+            }
+        }
+    }
 
     void ApplyEnvOverrides() {
         if (EnvDeterministic) {

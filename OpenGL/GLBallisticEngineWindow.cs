@@ -111,18 +111,30 @@ public class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWin
     // Implemented as the first consumer of the on-demand Screenshots queue — Screenshots.Capture
     // works the same way for scripts and the editor command port, without the exit.
     static readonly string ScreenshotPath = Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT");
+    // BALLISTIC_IDMAP=<path> — entity-ID map capture (writes <path>.json + <path>.bmp; see IdMaps).
+    // Captured within one frame of the screenshot; combine with BALLISTIC_DETERMINISTIC=1 when the
+    // two must correspond exactly.
+    static readonly string IdMapPath = Environment.GetEnvironmentVariable("BALLISTIC_IDMAP");
     static readonly int ScreenshotFrame = int.TryParse(
         Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT_FRAME"), out var f) ? f : 180;
     static readonly bool ScreenshotExit = Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT_EXIT") != "0";
-    bool envScreenshotQueued;
+    bool envScreenshotQueued, envShotDone, envIdMapDone;
 
     void DrainScreenshotRequests() {
         if (!envScreenshotQueued) {
             envScreenshotQueued = true;
+            envShotDone = ScreenshotPath is null;
+            envIdMapDone = IdMapPath is null;
             if (ScreenshotPath is not null)
                 Screenshots.Capture(ScreenshotPath, ScreenshotFrame - 1, _ => {
                     PrintPerfStats();
-                    if (ScreenshotExit) Close();
+                    envShotDone = true;
+                    MaybeCloseAfterEnvCaptures();
+                });
+            if (IdMapPath is not null)
+                IdMaps.Capture(IdMapPath, ScreenshotFrame - 1, _ => {
+                    envIdMapDone = true;
+                    MaybeCloseAfterEnvCaptures();
                 });
         }
 
@@ -147,6 +159,13 @@ public class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWin
                 Debugging.LogError($"Screenshot to '{request.Path}' failed: {ex.Message}");
             }
         }
+    }
+
+    // Run-and-exit for the env capture harness: close once every REQUESTED env capture is done
+    // (a screenshot-only, idmap-only, or combined run all exit exactly once, after the last file).
+    void MaybeCloseAfterEnvCaptures() {
+        if (ScreenshotExit && envShotDone && envIdMapDone)
+            Close();
     }
 
     // Perf snapshot console lines (the original [PerfStats] contract — agents parse these).
