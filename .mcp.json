@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ballistic-editor": {
+      "command": "BallisticEngine.Mcp/bin/Debug/net9.0/BallisticEngine.Mcp.exe",
+      "args": [],
+      "env": {}
+    }
+  }
+}
