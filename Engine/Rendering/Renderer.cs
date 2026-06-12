@@ -1,3 +1,5 @@
+using OpenTK.Mathematics;
+
 namespace BallisticEngine;
 
 public abstract class Renderer : Behaviour, IStaticMeshRenderer {
@@ -9,6 +11,11 @@ public abstract class Renderer : Behaviour, IStaticMeshRenderer {
     public virtual int SubMeshIndex { get; set; } = -1;
     public Transform Transform => transform;
     public bool RenderedThisFrame { get; set; }
+
+    // Skinning hooks (IStaticMeshRenderer). Static renderers are never skinned; SkinnedMeshRenderer
+    // overrides both so the draw path uploads its per-bone matrices to the bone SSBO.
+    public virtual bool IsSkinned => false;
+    public virtual Matrix4[] SkinningMatrices => null;
 
     Material materialInstance;
 

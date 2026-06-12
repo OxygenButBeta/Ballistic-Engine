@@ -1,4 +1,5 @@
 using BallisticEngine;
+using OpenTK.Mathematics;
 
 public interface IStaticMeshRenderer : IDrawable {
     Mesh SharedMesh { get; }
@@ -19,6 +20,13 @@ public interface IStaticMeshRenderer : IDrawable {
 
     // Entity active && component enabled — disabling either hides the mesh.
     bool IsActive { get; }
+
+    // Skinning: a skinned renderer returns its per-bone skinning matrices (mesh-bind -> animated
+    // world, in mesh-local space) for THIS frame; the draw path uploads them to the bone SSBO before
+    // drawing. Static renderers return null and take the normal path. SkinningMatrices.Length ==
+    // SharedMesh.BoneCount when non-null.
+    bool IsSkinned => false;
+    Matrix4[] SkinningMatrices => null;
 
     public void Activate();
     public void Deactivate();

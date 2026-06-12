@@ -1071,6 +1071,11 @@ void main() {
     // bit-identical to the main pass, so the main pass can re-test LEqual and skip depth writes.
     readonly Dictionary<Shader, Shader> prepassShaders = new();
 
+    // One shared bone-matrix SSBO (binding 1), re-uploaded per skinned draw. The SAME buffer with
+    // the SAME contents is bound for a skinned mesh in BOTH the prepass and the main pass within a
+    // frame, so depth stays bit-identical (z-prepass invariance for skinned geometry).
+    readonly OpenGL.GLBoneMatrixBuffer boneMatrices = new();
+
     const string PrepassFrag = @"
 #version 330 core
 in vec2 texCoord;
@@ -1153,6 +1158,11 @@ void main() {
 
             Matrix4 worldMatrix = ModelMatrix(target, mesh);
             mesh.Activate();
+
+            // Skinned prepass: bind the SAME bone matrices as the main pass will (uploaded here too,
+            // identical contents) so the depth companion rasterizes bit-identically.
+            if (target.IsSkinned && target.SkinningMatrices is { } prepassSkin)
+                boneMatrices.Upload(prepassSkin, prepassSkin.Length);
 
             (int first, int end) = SubMeshRange(target, subMeshes.Length);
             for (var i = first; i < end; i++) {
@@ -2217,6 +2227,12 @@ void main() {
             Matrix4 modelMatrix = ModelMatrix(target, mesh);
             mesh.Activate();
 
+            // Skinned mesh: upload its per-bone matrices to the shared SSBO (binding 1) before the
+            // draw. The same buffer is bound here and in the prepass (same contents this frame), so
+            // depth is bit-identical.
+            if (target.IsSkinned && target.SkinningMatrices is { } skinningMatrices)
+                boneMatrices.Upload(skinningMatrices, skinningMatrices.Length);
+
             Material lastActivated = null;
             (int first, int end) = SubMeshRange(target, subMeshes.Length);
             for (var i = first; i < end; i++) {
@@ -2283,6 +2299,10 @@ void main() {
     // identical ones adjacent.
     static int InstancedRunLength(List<IStaticMeshRenderer> list, int start) {
         IStaticMeshRenderer first = list[start];
+        // Skinned meshes carry per-instance bone matrices, so they never share an instanced draw —
+        // each takes the per-object path that uploads its own bone SSBO.
+        if (first.IsSkinned)
+            return 1;
         var sub = first.SubMeshIndex;
         if (sub < 0)
             return 1;
