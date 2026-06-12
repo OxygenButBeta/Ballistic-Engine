@@ -370,7 +370,7 @@ internal sealed class HierarchyPanel {
                 continue;
             if (last is null)
                 EditorUndo.Push("Add Script Entity");
-            Entity entity = scene.CreateEntity(type.Name);
+            Entity entity = Spawn(scene, type.Name);
             entity.AddComponent(type);
             last = entity;
         }
@@ -492,11 +492,21 @@ internal sealed class HierarchyPanel {
         return flat.GetRange(ia, ib - ia + 1);
     }
 
+    // Creates a root entity and drops it at the scene-view spawn point (a short distance in front of
+    // the editor camera, refreshed each frame in EditorApplication) — Unity's create-in-front-of-the-
+    // SceneView, instead of every new object piling up at world origin. Only roots are repositioned;
+    // entities created as children inherit their parent's frame.
+    Entity Spawn(Scene scene, string name) {
+        Entity e = scene.CreateEntity(name);
+        e.transform.Position = state.SceneSpawnPoint;
+        return e;
+    }
+
     // Shared "create" submenu used by the empty-space context menu and the toolbar + button.
     void DrawCreateMenu(Scene scene) {
         if (ImGui.MenuItem("Create Empty")) {
             EditorUndo.Push("Create Empty");
-            state.Select(scene.CreateEntity("Entity"));
+            state.Select(Spawn(scene, "Entity"));
         }
         if (ImGui.BeginMenu($"{EditorIcons.Package} 3D Object")) {
             if (ImGui.MenuItem("Cube")) CreatePrimitive(scene, PrimitiveKind.Cube);
@@ -546,7 +556,7 @@ internal sealed class HierarchyPanel {
                 foreach (ComponentEntry entry in group.OrderBy(e => e.DisplayName, StringComparer.OrdinalIgnoreCase)) {
                     if (ImGui.MenuItem(entry.DisplayName)) {
                         EditorUndo.Push($"Create {entry.DisplayName}");
-                        Entity e = scene.CreateEntity(entry.DisplayName);
+                        Entity e = Spawn(scene, entry.DisplayName);
                         e.AddComponent(entry.Type);
                         state.Select(e);
                     }
@@ -562,21 +572,23 @@ internal sealed class HierarchyPanel {
         Type type = ComponentRegistry.Resolve(registryName);
         if (type is null) return;
         EditorUndo.Push($"Create {name}");
-        Entity entity = scene.CreateEntity(name);
+        Entity entity = Spawn(scene, name);
         entity.AddComponent(type);
         state.Select(entity);
     }
 
     void CreateWithComponent<T>(Scene scene, string name) where T : Behaviour {
         EditorUndo.Push($"Create {name}");
-        Entity entity = scene.CreateEntity(name);
+        Entity entity = Spawn(scene, name);
         entity.AddComponent(typeof(T));
         state.Select(entity);
     }
 
     void CreatePrimitive(Scene scene, PrimitiveKind kind) {
         EditorUndo.Push($"Create {kind}");
-        state.Select(Primitives.Create(scene, kind));
+        Entity e = Primitives.Create(scene, kind);
+        if (e is not null) e.transform.Position = state.SceneSpawnPoint;
+        state.Select(e);
     }
 
     // Creates a Terrain entity AND its backing assets: a fresh .terrain heightfield next to the asset
@@ -585,7 +597,7 @@ internal sealed class HierarchyPanel {
     // immediately. The checker tiles across the terrain so the grid reads at any size.
     void CreateTerrain(Scene scene) {
         EditorUndo.Push("Create Terrain");
-        Entity entity = scene.CreateEntity("Terrain");
+        Entity entity = Spawn(scene, "Terrain");
         var terrain = (Terrain)entity.AddComponent(typeof(Terrain));
         state.Select(entity);
 

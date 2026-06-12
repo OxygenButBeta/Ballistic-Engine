@@ -244,6 +244,12 @@ internal sealed class EditorApplication {
         editorCamera.Update((float)delta, allowCameraInput, editorInput);
         MaybeSaveCameraPose((float)delta);
 
+        // Hierarchy/menu "Create" drops new entities here — a short distance ahead of the scene camera
+        // (Unity's create-in-front-of-SceneView), not at world origin. Refreshed every frame so it
+        // tracks the current view.
+        Transform camT = editorCamera.Transform;
+        editorState.SceneSpawnPoint = camT.Position + camT.Forward * 10f;
+
         HandleGlobalShortcuts();
 
         bootstrap.UpdateFrame(delta); // component Tick runs here; a player script sets its Cursor intent

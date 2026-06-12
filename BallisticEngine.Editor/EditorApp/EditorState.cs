@@ -1,3 +1,5 @@
+using OpenTK.Mathematics;
+
 namespace BallisticEngine.Editor;
 
 // Shared selection state across panels. Selecting an entity clears the asset selection and
@@ -6,6 +8,11 @@ namespace BallisticEngine.Editor;
 // selected asset, while SelectedAssetPath/Guid stay the "active" one (shown in the Inspector).
 internal sealed class EditorState {
     Entity selected;
+
+    // Where newly-created entities should spawn — a point a short distance in front of the scene-view
+    // camera (Unity's "create in front of the SceneView"), refreshed each frame by EditorApplication
+    // from the editor camera. Panels read this instead of dropping new objects at world origin.
+    public Vector3 SceneSpawnPoint { get; set; } = Vector3.Zero;
 
     // The "active" entity — shown in the Inspector. Setting it directly (used by a few legacy sites)
     // collapses the multi-selection to just this entity, matching Unity's "click selects one".
