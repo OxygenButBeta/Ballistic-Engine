@@ -1202,24 +1202,49 @@ internal sealed class EditorApplication {
     // window the tab bar sits ABOVE the content origin, so the hit band extends upward by ~1.4 frame
     // heights; for a floating window it covers the title bar. Excludes the content area.
     void MaximizePanelOnTitleDoubleClick(string panelName) {
-        if (!ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
-            return;
         // Hit-test the title/tab strip purely geometrically — do NOT gate on IsWindowHovered, because a
         // docked window's tab strip is owned by the dock-node parent, so this window is NOT "hovered"
-        // while the cursor is on its own tab (the old bug: the double-click was silently dropped).
+        // while the cursor is on its own tab (the old bug: the interaction was silently dropped).
         // GetCursorStartPos is the content origin in window-local coords (just below the title/tab strip);
         // window pos + that Y is where content rows begin. The strip is [windowTop .. contentTop].
         SysVec2 mouse = ImGui.GetIO().MousePos;
         SysVec2 winPos = ImGui.GetWindowPos();
         float winW = ImGui.GetWindowSize().X;
         float contentTop = winPos.Y + ImGui.GetCursorStartPos().Y;
-        // For a DOCKED window the dock tab strip sits ABOVE winPos.Y; extend the band up one frame height
-        // so a double-click on the tab itself (not just the title bar of a floating window) registers.
         float stripTop = winPos.Y - (ImGui.IsWindowDocked() ? ImGui.GetFrameHeight() : 0f);
         bool onStrip = mouse.X >= winPos.X && mouse.X <= winPos.X + winW &&
                        mouse.Y >= stripTop && mouse.Y < contentTop;
-        if (onStrip)
+
+        // Double-click the strip → toggle fullscreen for this panel.
+        if (onStrip && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
             maximizedPanel = maximizedPanel == panelName ? null : panelName;
+
+        // Right-click the strip → "Add Tab" menu to open any closed panel (Unity/VS dock behaviour).
+        if (onStrip && ImGui.IsMouseClicked(ImGuiMouseButton.Right))
+            ImGui.OpenPopup($"##tabctx_{panelName}");
+        if (ImGui.BeginPopup($"##tabctx_{panelName}")) {
+            if (ImGui.BeginMenu($"{EditorIcons.Add}  Add Tab")) {
+                AddTabItem("Inspector", ref showInspector);
+                AddTabItem("Inspector (2)", ref showInspector2);
+                AddTabItem("Entities", ref showHierarchy);
+                AddTabItem("Scene Components", ref showSceneComponents);
+                AddTabItem("Assets", ref showBottom);
+                AddTabItem("Console", ref showConsole);
+                ImGui.EndMenu();
+            }
+            ImGui.Separator();
+            if (ImGui.MenuItem("Maximize / Restore", "Double-click"))
+                maximizedPanel = maximizedPanel == panelName ? null : panelName;
+            ImGui.EndPopup();
+        }
+    }
+
+    // One "Add Tab" entry: opens the panel (sets its show flag) and focuses it; ticked + disabled when
+    // it's already open so the menu reads as a state list.
+    static void AddTabItem(string label, ref bool show) {
+        bool open = show;
+        if (ImGui.MenuItem(label, (string)null, open, !open))
+            show = true;
     }
 
     // Draws one panel filling the whole work area while maximized (anything except the viewports,
