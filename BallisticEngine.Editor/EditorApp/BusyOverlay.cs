@@ -37,18 +37,24 @@ internal static class BusyOverlay {
         anim = (anim + dt * 0.9f) % 1f;
         dots = (dots + dt) % 1.5f;
 
-        // Block ALL input to the panels behind the overlay — it's a true modal now. A full-window
-        // invisible window swallows mouse/keyboard so the user can't click/edit things behind the dim
-        // (the old foreground-draw-list overlay let clicks fall through). Topmost, no decoration.
+        // Block ALL input to the panels behind the overlay — a true modal. A full-window window that is
+        // forced TO THE FRONT every frame (SetNextWindowFocus + no NoBringToFrontOnFocus, which was the
+        // bug — it kept the blocker BEHIND the panels so clicks fell through). It must be drawn AFTER
+        // every panel this frame (BusyOverlay.Draw is the last UI call) so it ends up on top. An
+        // invisible button over the whole area eats clicks; capturing keyboard focus stops typing too.
         ImGui.SetNextWindowPos(SysVec2.Zero);
         ImGui.SetNextWindowSize(display);
         ImGui.SetNextWindowBgAlpha(0f);
+        ImGui.SetNextWindowFocus();
         const ImGuiWindowFlags blockFlags = ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.NoMove |
-            ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.NoDocking | ImGuiWindowFlags.NoNav |
-            ImGuiWindowFlags.NoBringToFrontOnFocus;
+            ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.NoDocking |
+            ImGuiWindowFlags.NoNav;
         ImGui.Begin("##busyblocker", blockFlags);
-        ImGui.SetWindowFocus();                 // grab focus so keyboard goes nowhere useful
-        ImGui.InvisibleButton("##busyeat", display);   // eat clicks over the whole area
+        // A button (not InvisibleButton) so hovering it sets WantCaptureMouse, which is what actually
+        // stops the click reaching a panel; it fills the window and never does anything on click.
+        ImGui.SetCursorPos(SysVec2.Zero);
+        ImGui.InvisibleButton("##busyeat", display, ImGuiButtonFlags.MouseButtonLeft |
+            ImGuiButtonFlags.MouseButtonRight | ImGuiButtonFlags.MouseButtonMiddle);
         ImGui.End();
 
         var draw = ImGui.GetForegroundDrawList();

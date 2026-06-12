@@ -199,15 +199,15 @@ internal sealed class AssetBrowserPanel {
             ImGui.TextDisabled($"Creates {trimmed}{newAssetExt}");
 
         ImGui.Spacing();
+        if (ImGui.Button("Cancel", new SysVec2(120, 0)))
+            ImGui.CloseCurrentPopup();
+        ImGui.SameLine();
         ImGui.BeginDisabled(!valid);
         if (ImGui.Button("Create", new SysVec2(120, 0)) || (enter && valid)) {
             CreateNamedAsset(trimmed);
             ImGui.CloseCurrentPopup();
         }
         ImGui.EndDisabled();
-        ImGui.SameLine();
-        if (ImGui.Button("Cancel", new SysVec2(120, 0)))
-            ImGui.CloseCurrentPopup();
         ImGui.EndPopup();
     }
 
@@ -266,15 +266,15 @@ internal sealed class AssetBrowserPanel {
             ImGui.TextDisabled($"Creates {className}.cs : Behaviour");
 
         ImGui.Spacing();
+        if (ImGui.Button("Cancel", new SysVec2(120, 0)))
+            ImGui.CloseCurrentPopup();
+        ImGui.SameLine();
         ImGui.BeginDisabled(!valid);
         if (ImGui.Button("Create", new SysVec2(120, 0)) || (enter && valid)) {
             CreateScriptNamed(className);
             ImGui.CloseCurrentPopup();
         }
         ImGui.EndDisabled();
-        ImGui.SameLine();
-        if (ImGui.Button("Cancel", new SysVec2(120, 0)))
-            ImGui.CloseCurrentPopup();
         ImGui.EndPopup();
     }
 
