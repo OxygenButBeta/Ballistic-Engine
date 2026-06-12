@@ -1570,31 +1570,64 @@ internal sealed class EditorApplication {
     // Copies OS-dropped files into the browser's current folder and runs the import pipeline â€”
     // each file's dedicated importer (model/texture/Falcor/...) picks it up in the refresh.
     void ImportDroppedFiles(IReadOnlyList<string> files) {
+        if (files is null || files.Count == 0) {
+            Debugging.LogWarning("Drop import: the OS reported no files.");
+            return;
+        }
+
         var destFolder = Path.Combine(bootstrap.Project.RootPath,
             assets.CurrentFolder.Replace('/', Path.DirectorySeparatorChar));
         Directory.CreateDirectory(destFolder);
 
         var copied = 0;
         foreach (var source in files) {
-            if (!File.Exists(source)) {
-                Debugging.LogWarning($"Drop import: '{source}' is not a file (folders not supported yet).");
-                continue;
+            // Dropping a FOLDER copies its whole tree in (Unity parity); a file copies itself.
+            try {
+                if (Directory.Exists(source)) {
+                    CopyDirectoryInto(source, destFolder);
+                    copied++;
+                    continue;
+                }
+                if (!File.Exists(source)) {
+                    Debugging.LogWarning($"Drop import: '{source}' is neither a file nor a folder; skipped.");
+                    continue;
+                }
+                // Never silently skip a duplicate — land it under a unique name so a batch drop always
+                // imports SOMETHING (the old code skipped every name collision, which read as "nothing
+                // got added" when re-dropping the same files).
+                string destination = UniqueDropPath(Path.Combine(destFolder, Path.GetFileName(source)));
+                File.Copy(source, destination);
+                copied++;
             }
-
-            var destination = Path.Combine(destFolder, Path.GetFileName(source));
-            if (File.Exists(destination)) {
-                Debugging.LogWarning($"Drop import: '{Path.GetFileName(source)}' already exists in {assets.CurrentFolder}; skipped.");
-                continue;
+            catch (Exception e) {
+                Debugging.LogError($"Drop import failed for '{source}': {e.Message}");
             }
-
-            File.Copy(source, destination);
-            copied++;
         }
 
         if (copied > 0)
             AsyncAssetImport.Request(
-                copied == 1 ? $"Importing {Path.GetFileName(files[0])}..." : $"Importing {copied} files...",
+                copied == 1 ? $"Importing {Path.GetFileName(files[0])}..." : $"Importing {copied} items...",
                 onFinished: () => assets.InvalidateThumbnails());
+    }
+
+    // file.png -> file.png, file 1.png, file 2.png, ... (so a batch drop never collides itself away).
+    static string UniqueDropPath(string path) {
+        if (!File.Exists(path) && !Directory.Exists(path)) return path;
+        string dir = Path.GetDirectoryName(path)!, stem = Path.GetFileNameWithoutExtension(path),
+               ext = Path.GetExtension(path);
+        for (int i = 1; ; i++) {
+            string candidate = Path.Combine(dir, $"{stem} {i}{ext}");
+            if (!File.Exists(candidate) && !Directory.Exists(candidate)) return candidate;
+        }
+    }
+
+    static void CopyDirectoryInto(string sourceDir, string destParent) {
+        string dest = Path.Combine(destParent, Path.GetFileName(sourceDir.TrimEnd(Path.DirectorySeparatorChar)));
+        Directory.CreateDirectory(dest);
+        foreach (string file in Directory.GetFiles(sourceDir))
+            File.Copy(file, Path.Combine(dest, Path.GetFileName(file)), overwrite: false);
+        foreach (string sub in Directory.GetDirectories(sourceDir))
+            CopyDirectoryInto(sub, dest);
     }
 
 

@@ -695,6 +695,11 @@ internal sealed class AssetBrowserPanel {
         // Right-click empty space: creation + folder actions.
         if (ImGui.BeginPopupContextWindow("##gridctx",
                 ImGuiPopupFlags.MouseButtonRight | ImGuiPopupFlags.NoOpenOverItems)) {
+            // Paste into the current folder (empty-space right-click), enabled only when something
+            // was copied/cut.
+            if (ImGui.MenuItem($"{EditorIcons.Add}  Paste", "Ctrl+V", false, ClipboardHasContent))
+                ClipboardPaste();
+            ImGui.Separator();
             if (ImGui.MenuItem($"{EditorIcons.Folder}  New Folder"))
                 PromptNewAsset("Folder", "New Folder", "", null);
             if (ImGui.MenuItem($"{EditorIcons.Code}  New Script"))
@@ -733,6 +738,11 @@ internal sealed class AssetBrowserPanel {
                 state.SelectAssets(visibleFiles, visibleFiles[^1]);
             if (ImGui.IsKeyPressed(ImGuiKey.Delete) && state.SelectedAssets.Count > 0)
                 AssetOps.DeleteAssets(state, state.SelectedAssets, thumbnails.InvalidateAll);
+            // Explorer-style clipboard: Ctrl+C copy, Ctrl+X cut, Ctrl+V paste, Ctrl+D duplicate.
+            if (io.KeyCtrl && ImGui.IsKeyPressed(ImGuiKey.C) && state.SelectedAssets.Count > 0) ClipboardCopy(cut: false);
+            if (io.KeyCtrl && ImGui.IsKeyPressed(ImGuiKey.X) && state.SelectedAssets.Count > 0) ClipboardCopy(cut: true);
+            if (io.KeyCtrl && ImGui.IsKeyPressed(ImGuiKey.V) && ClipboardHasContent) ClipboardPaste();
+            if (io.KeyCtrl && ImGui.IsKeyPressed(ImGuiKey.D) && state.SelectedAssets.Count > 0) { ClipboardCopy(cut: false); ClipboardPaste(); }
         }
 
         ImGui.EndChild();
@@ -1088,7 +1098,10 @@ internal sealed class AssetBrowserPanel {
         ImGui.PopStyleColor(3);
         ImGui.PopStyleVar();
 
-        DrawFolderGlyph(ImGui.GetItemRectMin(), ImGui.GetItemRectMax());
+        // Full vs empty folder reads at a glance: an open, bright folder when it has content; a plain,
+        // dimmer folder when empty (FolderIcon decides from the folder's contents, cached per mtime).
+        (string fIcon, SysVec4 fTint) = FolderIcon(folderPath);
+        DrawFolderGlyph(ImGui.GetItemRectMin(), ImGui.GetItemRectMax(), fIcon, fTint);
 
         if (ImGui.IsItemHovered() && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
             NavigateTo(folderPath);
@@ -1232,6 +1245,9 @@ internal sealed class AssetBrowserPanel {
         if (count > 1) {
             ImGui.TextDisabled($"{count} assets selected");
             ImGui.Separator();
+            if (ImGui.MenuItem($"{EditorIcons.Document}  Copy", "Ctrl+C")) ClipboardCopy(cut: false);
+            if (ImGui.MenuItem("Cut", "Ctrl+X")) ClipboardCopy(cut: true);
+            if (ImGui.MenuItem($"{EditorIcons.Add}  Paste", "Ctrl+V", false, ClipboardHasContent)) ClipboardPaste();
             if (ImGui.MenuItem("Copy Paths"))
                 ImGui.SetClipboardText(string.Join('\n', state.SelectedAssets.Select(a => a.Path)));
             ImGui.Separator();
@@ -1249,6 +1265,12 @@ internal sealed class AssetBrowserPanel {
                 if (entity is not null)
                     state.Select(entity);
             }
+            ImGui.Separator();
+            if (ImGui.MenuItem($"{EditorIcons.Document}  Copy", "Ctrl+C")) ClipboardCopy(cut: false);
+            if (ImGui.MenuItem("Cut", "Ctrl+X")) ClipboardCopy(cut: true);
+            if (ImGui.MenuItem($"{EditorIcons.Add}  Paste", "Ctrl+V", false, ClipboardHasContent)) ClipboardPaste();
+            if (ImGui.MenuItem("Duplicate", "Ctrl+D")) { ClipboardCopy(cut: false); ClipboardPaste(); }
+            ImGui.Separator();
             if (ImGui.MenuItem("Rename"))
                 BeginRename(path);
             if (ImGui.MenuItem("Show in Explorer"))
@@ -1261,6 +1283,50 @@ internal sealed class AssetBrowserPanel {
         }
 
         ImGui.EndPopup();
+    }
+
+    // ---- Asset clipboard (copy / cut / paste files in the browser) -----------------------------
+    // Holds project-relative asset paths + whether this is a MOVE (cut). Paste copies each into the
+    // current folder with a unique name and imports; a cut deletes the originals after a successful
+    // paste. Separate from the OS text clipboard (which only ever holds path strings).
+    static readonly List<string> clipboardPaths = new();
+    static bool clipboardCut;
+
+    static bool ClipboardHasContent => clipboardPaths.Count > 0;
+
+    void ClipboardCopy(bool cut) {
+        clipboardPaths.Clear();
+        foreach (var (p, _) in state.SelectedAssets)
+            clipboardPaths.Add(p);
+        clipboardCut = cut;
+    }
+
+    void ClipboardPaste() {
+        if (clipboardPaths.Count == 0) return;
+        string destDir = AssetDatabase.Project.ResolveAbsolute(CurrentFolder);
+        var pasted = false;
+        foreach (string srcRel in clipboardPaths.ToArray()) {
+            string srcAbs = AssetDatabase.Project.ResolveAbsolute(srcRel);
+            if (!File.Exists(srcAbs)) continue;
+            string destAbs = UniquePath(Path.Combine(destDir, Path.GetFileName(srcAbs)));
+            try {
+                if (clipboardCut) {
+                    File.Move(srcAbs, destAbs);
+                    // Move the .meta too so the GUID (and all references) survive the move.
+                    string srcMeta = srcAbs + ".meta";
+                    if (File.Exists(srcMeta)) File.Move(srcMeta, destAbs + ".meta");
+                }
+                else {
+                    File.Copy(srcAbs, destAbs);   // a COPY gets a fresh GUID on import (no .meta carried)
+                }
+                pasted = true;
+            }
+            catch (Exception e) {
+                Debugging.LogError($"Paste failed for '{srcRel}': {e.Message}");
+            }
+        }
+        if (clipboardCut) { clipboardPaths.Clear(); clipboardCut = false; }
+        if (pasted) AsyncAssetImport.Request("Pasting assets...", onFinished: thumbnails.InvalidateAll);
     }
 
     static void TileLabel(string name, float tile) {
@@ -1280,7 +1346,7 @@ internal sealed class AssetBrowserPanel {
     }
 
     // Folder icon glyph centered on the tile (crisp: baked large in the icon atlas).
-    static unsafe void DrawFolderGlyph(SysVec2 min, SysVec2 max) {
+    static unsafe void DrawFolderGlyph(SysVec2 min, SysVec2 max, string icon, SysVec4 tint) {
         ImDrawListPtr draw = ImGui.GetWindowDrawList();
         SysVec2 size = max - min;
 
@@ -1288,13 +1354,13 @@ internal sealed class AssetBrowserPanel {
             float glyph = size.Y * 0.52f;
             draw.AddText(ImGuiController.LargeIcons, glyph,
                 new SysVec2(min.X + (size.X - glyph) * 0.5f, min.Y + (size.Y - glyph) * 0.48f),
-                ImGui.GetColorU32(new SysVec4(0.86f, 0.70f, 0.34f, 1f)), EditorIcons.Folder);
+                ImGui.GetColorU32(tint), icon);
             return;
         }
 
-        // Fallback: a simple drawn folder (tab + body).
-        var bodyColor = ImGui.GetColorU32(new SysVec4(0.78f, 0.63f, 0.27f, 1f));
-        var tabColor = ImGui.GetColorU32(new SysVec4(0.88f, 0.74f, 0.38f, 1f));
+        // Fallback: a simple drawn folder (tab + body), dimmed to the tint's alpha for empty folders.
+        var bodyColor = ImGui.GetColorU32(new SysVec4(0.78f, 0.63f, 0.27f, tint.W));
+        var tabColor = ImGui.GetColorU32(new SysVec4(0.88f, 0.74f, 0.38f, tint.W));
         draw.AddRectFilled(min + size * new SysVec2(0.18f, 0.24f), min + size * new SysVec2(0.48f, 0.36f), tabColor, 3f);
         draw.AddRectFilled(min + size * new SysVec2(0.18f, 0.32f), min + size * new SysVec2(0.82f, 0.78f), bodyColor, 3f);
     }
