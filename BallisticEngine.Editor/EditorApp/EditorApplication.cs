@@ -523,6 +523,7 @@ internal sealed class EditorApplication {
             settings.Draw(S);
             profilerPanel.Draw(profiler, S);
             buildPanel.Draw(S);
+            CurveEditorWindow.Draw(S);
             DrawUnsavedPrompt();
             return;
         }
@@ -603,6 +604,7 @@ internal sealed class EditorApplication {
         tagsLayers.Draw(S);
         profilerPanel.Draw(profiler, S);
         buildPanel.Draw(S);
+        CurveEditorWindow.Draw(S);
         DrawUnsavedPrompt();
 
         // Persist the layout whenever ImGui says it changed (drag/dock/resize/tab).

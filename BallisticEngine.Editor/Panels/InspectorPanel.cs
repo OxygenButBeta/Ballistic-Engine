@@ -1294,8 +1294,9 @@ internal sealed class InspectorPanel {
                 case AnimationCurve curve: {
                     // Interactive curve widget — applies to ANY AnimationCurve member with no per-
                     // component wiring. Mutated in place (reference type), so no SetValue needed; an
-                    // undo snapshot is pushed when an edit begins.
-                    if (DrawCurveEditor(member.Name, curve))
+                    // undo snapshot is pushed when an edit begins. The "Edit" button opens the full
+                    // standalone CurveEditorWindow; edits there fire the dirty callback to repaint.
+                    if (DrawCurveEditor(member.Name, curve, state.MarkViewportDirty))
                         state.MarkViewportDirty();
                     break;
                 }
@@ -1361,7 +1362,7 @@ internal sealed class InspectorPanel {
     // The plot auto-fits its value range to the keys (with a small pad) so any amplitude is visible.
     static int curveDragKey = -1; // index of the key being dragged (-1 = none); single-widget assumption
 
-    static bool DrawCurveEditor(string id, AnimationCurve curve) {
+    static bool DrawCurveEditor(string id, AnimationCurve curve, Action onExternalEdit = null) {
         bool edited = false;
         ImGui.PushID(id);
 
@@ -1462,12 +1463,15 @@ internal sealed class InspectorPanel {
             edited = true;
         }
 
-        // Preset buttons + key count.
+        // Preset buttons + "open full editor" + key count.
         if (ImGui.SmallButton("Linear")) { EditorUndo.Push($"Preset {id}"); Replace(curve, AnimationCurve.Linear()); edited = true; }
         ImGui.SameLine();
         if (ImGui.SmallButton("Ease")) { EditorUndo.Push($"Preset {id}"); Replace(curve, AnimationCurve.EaseInOut()); edited = true; }
         ImGui.SameLine();
         if (ImGui.SmallButton("Const")) { EditorUndo.Push($"Preset {id}"); Replace(curve, AnimationCurve.Constant()); edited = true; }
+        ImGui.SameLine();
+        if (ImGui.SmallButton($"{EditorIcons.Maximize} Edit"))
+            CurveEditorWindow.Open(curve, id, onExternalEdit ?? (() => { }));
         ImGui.SameLine();
         ImGui.TextDisabled($"{curve.Count} keys");
 
