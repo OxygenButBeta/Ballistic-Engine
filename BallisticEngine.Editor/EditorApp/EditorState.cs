@@ -72,6 +72,19 @@ internal sealed class EditorState {
         return true;
     }
 
+    // An asset path the inspector asked the asset browser to REVEAL (navigate to its folder + select
+    // it), so clicking an asset reference jumps to it in the browser instead of swapping the inspector.
+    // Set by the inspector, consumed once per frame by the asset browser (same pattern as ViewportDirty).
+    public string RevealAssetRequest { get; private set; }
+
+    public void RequestRevealAsset(string path) => RevealAssetRequest = path;
+
+    public string ConsumeRevealAsset() {
+        string p = RevealAssetRequest;
+        RevealAssetRequest = null;
+        return p;
+    }
+
     // Every selected asset, in selection order. Non-empty iff an asset selection exists;
     // single-click selection is a one-element list.
     public List<(string Path, Guid Guid)> SelectedAssets { get; } = new();

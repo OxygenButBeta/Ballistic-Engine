@@ -90,6 +90,11 @@ internal sealed class AssetBrowserPanel {
     }
 
     void DrawGridPane(float s) {
+        // The inspector may have asked to REVEAL an asset (clicking an asset reference): navigate to
+        // its folder and select it here, instead of swapping the inspector to it.
+        if (state.ConsumeRevealAsset() is { } revealPath)
+            RevealAsset(revealPath);
+
         var searching = filter.Length > 0;
         var assets = AssetDatabase.EnumerateAssets().OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase);
 
@@ -270,6 +275,19 @@ internal sealed class AssetBrowserPanel {
     // Set when navigation comes from OUTSIDE the tree (breadcrumb, back, tile double-click):
     // the tree force-opens the target's ancestors that frame so the selection is always visible.
     bool revealPending;
+
+    // Navigates to an asset's folder and selects it (the inspector "reveal asset reference" jump).
+    void RevealAsset(string assetPath) {
+        if (string.IsNullOrEmpty(assetPath))
+            return;
+        int slash = assetPath.LastIndexOf('/');
+        string folder = slash > 0 ? assetPath[..slash] : "Assets";
+        if (!string.Equals(folder, CurrentFolder, StringComparison.OrdinalIgnoreCase))
+            NavigateTo(folder);
+        filter = ""; // clear any type filter so the asset is actually visible in its folder
+        if (AssetDatabase.TryGetGuid(assetPath, out Guid guid))
+            state.SelectAsset(assetPath, guid);
+    }
 
     void NavigateTo(string folderPath) {
         CurrentFolder = folderPath;

@@ -1650,11 +1650,11 @@ internal sealed class InspectorPanel {
 
         float pickerW = ImGui.GetFrameHeight() + 6;
         if (ImGui.Button($"{icon}  {display}", new SysVec2(-pickerW - 4, 0)) && path is not null)
-            state.SelectAsset(path, guid); // pin the referenced asset in the Inspector
+            state.RequestRevealAsset(path); // jump to it in the asset browser, don't swap the inspector
         if (AcceptGuidDrop(out Guid d1))
             AssignAsset(member, target, assetType, d1);
         if (ImGui.IsItemHovered() && path is not null)
-            ImGui.SetTooltip(path);
+            ImGui.SetTooltip($"{path}\nClick to reveal in the asset browser.");
 
         ImGui.SameLine();
         if (ImGui.Button(EditorIcons.ChevronDown, new SysVec2(pickerW, 0)))
@@ -1937,18 +1937,28 @@ internal sealed class InspectorPanel {
         ImGui.Separator();
         ImGui.Spacing();
 
-        // The selection, capped so huge selections stay readable.
-        const int maxListed = 12;
-        for (var i = 0; i < assets.Count && i < maxListed; i++) {
-            (string path, _) = assets[i];
-            (string icon, SysVec4 tint) = EditorIcons.ForAssetExtension(Path.GetExtension(path).ToLowerInvariant());
-            ImGui.TextDisabled($"      {Path.GetFileName(path)}");
-            EditorIcons.DrawAt(ImGui.GetItemRectMin() + new SysVec2(4, 0), icon, tint);
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip(path);
+        // BY-TYPE breakdown instead of a flat file list: "3 Volume", "2 Terrain", ... — and clicking
+        // a type row narrows the selection to just that type (Unity-style "select all of a kind").
+        var byExt = assets
+            .GroupBy(a => Path.GetExtension(a.Path).ToLowerInvariant())
+            .OrderByDescending(g => g.Count())
+            .ToList();
+        ImGui.TextDisabled("By type (click to select just that kind):");
+        ImGui.Spacing();
+        foreach (var group in byExt) {
+            string ext = group.Key;
+            (string icon, SysVec4 tint) = EditorIcons.ForAssetExtension(ext);
+            string typeName = string.IsNullOrEmpty(ext) ? "File" : ext.TrimStart('.');
+            int n = group.Count();
+            ImGui.PushStyleColor(ImGuiCol.Text, tint);
+            ImGui.TextUnformatted(icon);
+            ImGui.PopStyleColor();
+            ImGui.SameLine(0, 6);
+            if (ImGui.Selectable($"{n}  {typeName}{(n == 1 ? "" : "s")}##type{ext}", false)) {
+                var ofType = group.ToList();
+                state.SelectAssets(ofType, ofType[^1]);
+            }
         }
-        if (assets.Count > maxListed)
-            ImGui.TextDisabled($"      ... and {assets.Count - maxListed} more");
 
         ImGui.Spacing();
 
