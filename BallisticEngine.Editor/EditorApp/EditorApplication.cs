@@ -536,15 +536,16 @@ internal sealed class EditorApplication {
             else
                 DrawMaximizedPanel(maximizedPanel, maxPos, maxSize);
 
-            // Exit-fullscreen button pinned to the top-right (so it's not Esc-only). A small floating
+            // Exit-fullscreen button just under the toolbar (so it's not Esc-only). A small floating
             // overlay window above everything; clicking restores the docked layout.
-            DrawExitFullscreenButton(workPos, workSize);
+            DrawExitFullscreenButton(workPos, workSize, toolbarH);
 
             settings.Draw(S);
             profilerPanel.Draw(profiler, S);
             buildPanel.Draw(S);
             CurveEditorWindow.Draw(S);
             ComponentEditorWindow.Draw(S);
+            UnityImportWindow.Draw(S);
             DrawUnsavedPrompt();
             return;
         }
@@ -633,6 +634,7 @@ internal sealed class EditorApplication {
         profilerPanel.Draw(profiler, S);
         buildPanel.Draw(S);
         CurveEditorWindow.Draw(S);
+        UnityImportWindow.Draw(S);
         DrawUnsavedPrompt();
 
         // Persist the layout whenever ImGui says it changed (drag/dock/resize/tab).
@@ -674,6 +676,13 @@ internal sealed class EditorApplication {
 
         if (ImGui.BeginMenu("GameObject")) {
             DrawGameObjectMenu();
+            ImGui.EndMenu();
+        }
+
+        if (ImGui.BeginMenu("Assets")) {
+            if (ImGui.MenuItem($"{EditorIcons.Refresh}  Refresh", "Ctrl+R")) RebuildScripts();
+            ImGui.Separator();
+            if (ImGui.MenuItem($"{EditorIcons.Package}  Import Unity Package...")) UnityImportWindow.Open();
             ImGui.EndMenu();
         }
 
@@ -1145,17 +1154,20 @@ internal sealed class EditorApplication {
     // double-click on the 3D image (gizmo/selection) never maximizes.
     // A small "exit fullscreen" button floated at the top-right while a panel is maximized, so leaving
     // fullscreen isn't Esc-only (the user couldn't find a way out). Clicking it clears maximizedPanel.
-    void DrawExitFullscreenButton(SysVec2 workPos, SysVec2 workSize) {
-        float btn = 30 * S;
+    void DrawExitFullscreenButton(SysVec2 workPos, SysVec2 workSize, float toolbarH) {
         float margin = 8 * S;
-        ImGui.SetNextWindowPos(new SysVec2(workPos.X + workSize.X - btn - margin, workPos.Y + margin));
-        ImGui.SetNextWindowBgAlpha(0.85f);
+        // Just below the toolbar on the LEFT (under the play/pause/step cluster), where the user
+        // expects it — a labelled button, not Esc-only.
+        ImGui.SetNextWindowPos(new SysVec2(workPos.X + margin, workPos.Y + toolbarH + margin));
+        ImGui.SetNextWindowBgAlpha(0.9f);
         const ImGuiWindowFlags flags = ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.NoDocking |
             ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoSavedSettings |
             ImGuiWindowFlags.NoFocusOnAppearing | ImGuiWindowFlags.NoNav;
         if (ImGui.Begin("##exitfullscreen", flags)) {
-            if (EditorIcons.GhostButton("exitfs", EditorIcons.Minimize, "Exit fullscreen (Esc)", btn))
+            if (ImGui.Button($"{EditorIcons.Minimize}  Exit Fullscreen"))
                 maximizedPanel = null;
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Exit fullscreen (Esc)");
         }
         ImGui.End();
     }
@@ -1200,8 +1212,14 @@ internal sealed class EditorApplication {
             if (name == EditorLayout.Entities) hierarchy.DrawEntitiesContents();
             else if (name == EditorLayout.SceneComponents) hierarchy.DrawSceneContents();
             else if (name == EditorLayout.Inspector) inspector.DrawContents();
+            else if (name == "Inspector (2)###Inspector2") inspector2.DrawContents();
             else if (name == EditorLayout.Assets) assets.DrawContents();
             else if (name == EditorLayout.Console) console.DrawContents();
+            else {
+                // Unknown panel id maximized (shouldn't happen) — give a way out so it can't get stuck.
+                ImGui.TextDisabled("This panel can't be shown fullscreen.");
+                if (ImGui.Button("Exit Fullscreen")) maximizedPanel = null;
+            }
         }
         ImGui.End();
     }
