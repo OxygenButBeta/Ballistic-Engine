@@ -59,6 +59,49 @@ public sealed class AnimationClip : BObject {
         }
     }
 
+    // Samples the clip at `timeSeconds` into separate per-bone position/rotation/scale arrays (NOT
+    // composed to matrices). This is the blendable form the Animator crossfades: two clips sampled to
+    // TRS can be lerped (pos/scale) and slerped (rot) per bone, which a matrix lerp can't do correctly.
+    // Un-keyed bones get the bind-pose component. All arrays must be length == bindLocal.Length.
+    public void SampleLocalTRS(float timeSeconds, bool loop, Matrix4[] bindLocal,
+        Vector3[] outPosition, Quaternion[] outRotation, Vector3[] outScale) {
+        int boneCount = bindLocal.Length;
+
+        // Default every bone to its bind-pose TRS; animated channels overwrite below.
+        for (var i = 0; i < boneCount; i++) {
+            outPosition[i] = bindLocal[i].ExtractTranslation();
+            outRotation[i] = bindLocal[i].ExtractRotation();
+            outScale[i] = bindLocal[i].ExtractScale();
+        }
+
+        float durationSeconds = Data.DurationSeconds;
+        float t = timeSeconds;
+        if (durationSeconds > 0f) {
+            if (loop) t %= durationSeconds;
+            else if (t > durationSeconds) t = durationSeconds;
+            if (t < 0f) t += durationSeconds;
+        }
+        float ticks = t * Data.TicksPerSecond;
+
+        foreach (BoneChannel channel in Data.Channels) {
+            if ((uint)channel.BoneIndex >= (uint)boneCount)
+                continue;
+            int b = channel.BoneIndex;
+            outPosition[b] = SampleVector(channel.PositionKeys, ticks, outPosition[b]);
+            outRotation[b] = SampleQuaternion(channel.RotationKeys, ticks, outRotation[b]);
+            outScale[b] = SampleVector(channel.ScaleKeys, ticks, outScale[b]);
+        }
+    }
+
+    // Composes per-bone TRS into local matrices (the inverse of SampleLocalTRS' decomposition).
+    public static void ComposeLocal(Vector3[] position, Quaternion[] rotation, Vector3[] scale, Matrix4[] outLocal) {
+        for (var i = 0; i < outLocal.Length; i++)
+            outLocal[i] =
+                Matrix4.CreateScale(scale[i]) *
+                Matrix4.CreateFromQuaternion(rotation[i]) *
+                Matrix4.CreateTranslation(position[i]);
+    }
+
     // ---- Key interpolation -------------------------------------------------
 
     static Vector3 SampleVector(VectorKey[] keys, float ticks, Vector3 fallback) {
