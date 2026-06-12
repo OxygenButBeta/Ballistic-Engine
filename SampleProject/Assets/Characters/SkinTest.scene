@@ -89,7 +89,6 @@ entities:
     enabled: true
     members:
       sharedMesh: Assets/Characters/CesiumMan.glb
-      sharedMaterial: Assets/Characters/CesiumSkinned.mat
   - type: Animator
     enabled: true
     members:

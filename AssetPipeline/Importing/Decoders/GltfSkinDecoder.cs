@@ -39,7 +39,8 @@ public static class GltfSkinDecoder {
 
     public static AssimpSkinDecoder.DecodedSkinnedModel Decode(string path, bool flipUVs = true) {
         (JsonElement root, byte[] bin) = LoadJson(path);
-        var doc = new GltfDoc(root, bin, Path.GetDirectoryName(Path.GetFullPath(path)));
+        var doc = new GltfDoc(root, bin, Path.GetDirectoryName(Path.GetFullPath(path)),
+            Path.GetFileNameWithoutExtension(path));
 
         SkeletonData skeleton = doc.BuildSkeleton(out var jointNodeToBone);
         MeshData mesh = doc.BuildSkinnedMesh(skeleton, jointNodeToBone, flipUVs);

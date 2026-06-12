@@ -4,5 +4,12 @@
   "textures": {},
   "transparent": false,
   "opacity": 1,
-  "emissiveIntensity": 1
+  "emissiveIntensity": 1,
+  "baseColor": [
+    0.8,
+    0.8,
+    0.8,
+    1
+  ],
+  "metallic": 0
 }

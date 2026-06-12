@@ -12,13 +12,15 @@ internal sealed class GltfDoc {
     readonly byte[] glbBin;            // GLB's BIN chunk (null for plain .gltf)
     readonly string baseDir;          // for resolving .gltf sibling .bin files
     readonly byte[][] buffers;        // resolved buffer bytes, indexed by glTF buffer index
+    readonly string modelStem;        // for naming extracted texture files
 
     const int GL_BYTE = 5120, GL_UBYTE = 5121, GL_SHORT = 5122, GL_USHORT = 5123, GL_UINT = 5125, GL_FLOAT = 5126;
 
-    public GltfDoc(JsonElement root, byte[] glbBin, string baseDir) {
+    public GltfDoc(JsonElement root, byte[] glbBin, string baseDir, string modelStem) {
         this.root = root;
         this.glbBin = glbBin;
         this.baseDir = baseDir;
+        this.modelStem = modelStem;
         buffers = ResolveBuffers();
     }
 
@@ -432,20 +434,147 @@ internal sealed class GltfDoc {
 
     List<int> materialIndexPerSubmesh;
 
-    // ---- Materials (names only; full PBR decode stays with Assimp's static path for now) ----------
+    // ---- Materials (full PBR: factors + texture maps, extracting embedded images to siblings) ------
     public DecodedMaterial[] BuildMaterials(int subMeshCount) {
         var result = new DecodedMaterial[subMeshCount];
         bool hasMaterials = root.TryGetProperty("materials", out JsonElement materials);
+        // Cache one extracted file per glTF texture index so shared textures aren't written twice.
+        var extractedByTexture = new Dictionary<int, string>();
+
         for (int i = 0; i < subMeshCount; i++) {
             int mi = materialIndexPerSubmesh != null && i < materialIndexPerSubmesh.Count ? materialIndexPerSubmesh[i] : -1;
             string name = $"Material {i}";
+            var decoded = new DecodedMaterial { Name = name };
+
             if (hasMaterials && mi >= 0 && mi < materials.GetArrayLength()) {
                 JsonElement mat = materials[mi];
-                if (mat.TryGetProperty("name", out JsonElement nm)) name = nm.GetString();
+                if (mat.TryGetProperty("name", out JsonElement nm))
+                    decoded.Name = nm.GetString();
+                DecodeMaterial(mat, decoded, extractedByTexture);
             }
-            result[i] = new DecodedMaterial { Name = name };
+            result[i] = decoded;
         }
         return result;
+    }
+
+    void DecodeMaterial(JsonElement mat, DecodedMaterial decoded, Dictionary<int, string> extracted) {
+        if (mat.TryGetProperty("pbrMetallicRoughness", out JsonElement pbr)) {
+            if (pbr.TryGetProperty("baseColorFactor", out JsonElement bcf) && bcf.GetArrayLength() == 4) {
+                float[] c = ReadFloatArray(bcf, 4);
+                // Skip pure-white (no information; lets the loader default apply).
+                if (c[0] < 0.999f || c[1] < 0.999f || c[2] < 0.999f || c[3] < 0.999f)
+                    decoded.BaseColor = new Vector4(c[0], c[1], c[2], c[3]);
+            }
+            if (pbr.TryGetProperty("metallicFactor", out JsonElement mf))
+                decoded.Metallic = Math.Clamp(mf.GetSingle(), 0f, 1f);
+            if (pbr.TryGetProperty("roughnessFactor", out JsonElement rf))
+                decoded.Roughness = Math.Clamp(rf.GetSingle(), 0f, 1f);
+
+            MapTexture(pbr, "baseColorTexture", TextureType.Diffuse, decoded, extracted);
+            // glTF packs metallic (B) + roughness (G) into one map; the engine reads it for both slots.
+            MapTexture(pbr, "metallicRoughnessTexture", TextureType.Metallic, decoded, extracted);
+            MapTexture(pbr, "metallicRoughnessTexture", TextureType.Roughness, decoded, extracted);
+        }
+
+        MapTexture(mat, "normalTexture", TextureType.Normal, decoded, extracted);
+        MapTexture(mat, "occlusionTexture", TextureType.AO, decoded, extracted);
+        MapTexture(mat, "emissiveTexture", TextureType.Emissive, decoded, extracted);
+
+        if (mat.TryGetProperty("emissiveFactor", out JsonElement ef) && ef.GetArrayLength() == 3) {
+            float[] e = ReadFloatArray(ef, 3);
+            if (e[0] > 0.001f || e[1] > 0.001f || e[2] > 0.001f)
+                decoded.EmissiveColor = new Vector3(e[0], e[1], e[2]);
+        }
+    }
+
+    // Reads a "<slot>Texture" : { "index": t } reference, extracts that glTF texture's image to a
+    // sibling file (cached), and records its absolute path under `slot`. No-op when absent.
+    void MapTexture(JsonElement owner, string property, TextureType slot, DecodedMaterial decoded,
+        Dictionary<int, string> extracted) {
+        if (decoded.TexturePaths.ContainsKey(slot))
+            return; // first map for the slot wins
+        if (!owner.TryGetProperty(property, out JsonElement texRef) || !texRef.TryGetProperty("index", out JsonElement idx))
+            return;
+        int textureIndex = idx.GetInt32();
+        string file = ExtractTextureImage(textureIndex, extracted);
+        if (file != null)
+            decoded.TexturePaths[slot] = file;
+    }
+
+    // Resolves a glTF texture -> image, writes its bytes to <modelStem>_Textures/tex<N>.<ext> next to
+    // the model, and returns the absolute path. Handles embedded (bufferView), data-URI, and external
+    // (uri) images. Returns null on failure (logged) so material decode degrades gracefully.
+    string ExtractTextureImage(int textureIndex, Dictionary<int, string> cache) {
+        if (cache.TryGetValue(textureIndex, out string cached))
+            return cached;
+
+        try {
+            if (!root.TryGetProperty("textures", out JsonElement textures) || textureIndex >= textures.GetArrayLength())
+                return null;
+            JsonElement texture = textures[textureIndex];
+            if (!texture.TryGetProperty("source", out JsonElement srcJson))
+                return null;
+            int imageIndex = srcJson.GetInt32();
+
+            JsonElement image = root.GetProperty("images")[imageIndex];
+
+            byte[] bytes;
+            string ext;
+            if (image.TryGetProperty("uri", out JsonElement uriJson)) {
+                string uri = uriJson.GetString();
+                if (uri.StartsWith("data:")) {
+                    int comma = uri.IndexOf(',');
+                    bytes = Convert.FromBase64String(uri[(comma + 1)..]);
+                    ext = uri.Contains("image/png") ? ".png" : ".jpg";
+                }
+                else {
+                    // External file already on disk: reference it directly (no extraction).
+                    string ext0 = Path.Combine(baseDir, Uri.UnescapeDataString(uri));
+                    string result = File.Exists(ext0) ? Path.GetFullPath(ext0) : null;
+                    cache[textureIndex] = result;
+                    return result;
+                }
+            }
+            else if (image.TryGetProperty("bufferView", out JsonElement bvJson)) {
+                bytes = ReadBufferView(bvJson.GetInt32());
+                string mime = image.TryGetProperty("mimeType", out JsonElement mt) ? mt.GetString() : "image/png";
+                ext = mime.Contains("jpeg") || mime.Contains("jpg") ? ".jpg" : ".png";
+            }
+            else {
+                return null;
+            }
+
+            string dir = Path.Combine(baseDir, $"{modelStem}_Textures");
+            Directory.CreateDirectory(dir);
+            string path = Path.Combine(dir, $"{modelStem}_tex{textureIndex}{ext}");
+            File.WriteAllBytes(path, bytes);
+            cache[textureIndex] = path;
+            return path;
+        }
+        catch (Exception e) {
+            Debugging.LogWarning($"glTF texture {textureIndex} extraction failed: {e.Message}");
+            cache[textureIndex] = null;
+            return null;
+        }
+    }
+
+    // Raw bytes spanned by a bufferView (used for embedded images).
+    byte[] ReadBufferView(int bufferViewIndex) {
+        JsonElement bv = BufferView(bufferViewIndex);
+        int bufferIndex = Int(bv, "buffer");
+        int offset = Int(bv, "byteOffset");
+        int length = Int(bv, "byteLength");
+        return buffers[bufferIndex].AsSpan(offset, length).ToArray();
+    }
+
+    static float[] ReadFloatArray(JsonElement arr, int count) {
+        var f = new float[count];
+        int i = 0;
+        foreach (JsonElement v in arr.EnumerateArray()) {
+            if (i >= count) break;
+            f[i++] = v.GetSingle();
+        }
+        return f;
     }
 
     // ---- Animations --------------------------------------------------------

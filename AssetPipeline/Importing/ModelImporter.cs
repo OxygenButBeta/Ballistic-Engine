@@ -15,12 +15,15 @@ public sealed class ModelImporter : IAssetImporter {
     static readonly string[] Extensions = [".fbx", ".obj", ".gltf", ".glb", ".dae"];
 
     public const string DefaultShaderRef = "Assets/Default/Shaders/Standard.shader";
+    // Skinned meshes need the GPU-skinning vertex stage; their generated materials use this shader.
+    public const string SkinnedShaderRef = "Assets/Default/Shaders/SkinnedStandard.shader";
 
     public string Name => "ModelImporter";
     // v3: vec4 tangents (handedness) + scalar PBR factors in .mat
     // v4: split-by-nodes submeshes + node hierarchy table (BMSH v5), default ON
     // v5: skinned-mesh import (bones/weights/skeleton in BMSH v6) + sibling .banim animation assets
-    public int Version => 5;
+    // v6: glTF skinned materials carry PBR textures (extracted from embedded/external images) + factors
+    public int Version => 6;
     public string ArtifactExtension => ".bmesh";
 
     // Generates a sibling "<Model>_Materials/" folder of .mat assets.
@@ -89,9 +92,10 @@ public sealed class ModelImporter : IAssetImporter {
         AssimpSkinDecoder.DecodedSkinnedModel model) {
 
         // Wrap the skinned mesh in a DecodedModel so the existing material generator applies
-        // unchanged (it only reads SubMeshes + SubMeshMaterials and rewrites MaterialRefs).
+        // unchanged (it only reads SubMeshes + SubMeshMaterials and rewrites MaterialRefs). Skinned
+        // materials use the SkinnedStandard shader (GPU skinning vertex stage).
         var wrapped = new DecodedModel { Mesh = model.Mesh, SubMeshMaterials = model.SubMeshMaterials };
-        MeshData data = generateMaterials ? GenerateMaterials(context, wrapped) : model.Mesh;
+        MeshData data = generateMaterials ? GenerateMaterials(context, wrapped, SkinnedShaderRef) : model.Mesh;
 
         // GenerateMaterials rebuilds MeshData from the static ctor (dropping skin) — re-attach the
         // skin/skeleton that decode produced so the artifact carries them.
@@ -158,7 +162,7 @@ public sealed class ModelImporter : IAssetImporter {
 
     // Writes one .mat per used source material and returns the mesh data with submesh
     // MaterialRefs pointing at them. Failures degrade per-material (ref stays null).
-    static MeshData GenerateMaterials(AssetImportContext context, DecodedModel model) {
+    static MeshData GenerateMaterials(AssetImportContext context, DecodedModel model, string shaderOverride = null) {
         SubMeshData[] subMeshes = (SubMeshData[])model.Mesh.SubMeshes.Clone();
         DecodedMaterial[] materials = model.SubMeshMaterials ?? [];
 
@@ -171,7 +175,10 @@ public sealed class ModelImporter : IAssetImporter {
         var modelStem = Path.GetFileNameWithoutExtension(context.AssetPath);
         var materialsDirAbsolute = Path.Combine(modelDirAbsolute, $"{modelStem}_Materials");
 
-        var shaderRef = context.Settings?["shader"]?.GetValue<string>();
+        // A skinned import forces the skinning shader; otherwise honor the per-asset setting.
+        var shaderRef = shaderOverride;
+        if (string.IsNullOrWhiteSpace(shaderRef))
+            shaderRef = context.Settings?["shader"]?.GetValue<string>();
         if (string.IsNullOrWhiteSpace(shaderRef))
             shaderRef = DefaultShaderRef;
 

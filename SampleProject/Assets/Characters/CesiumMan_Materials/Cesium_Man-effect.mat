@@ -1,8 +1,12 @@
 {
   "version": 1,
-  "shader": "Assets/Default/Shaders/Standard.shader",
-  "textures": {},
+  "shader": "Assets/Default/Shaders/SkinnedStandard.shader",
+  "textures": {
+    "Diffuse": "Assets/Characters/CesiumMan_Textures/CesiumMan_tex0.jpg"
+  },
   "transparent": false,
   "opacity": 1,
-  "emissiveIntensity": 1
+  "emissiveIntensity": 1,
+  "metallic": 0,
+  "roughness": 1
 }
