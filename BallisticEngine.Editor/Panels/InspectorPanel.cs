@@ -383,6 +383,12 @@ internal sealed class InspectorPanel {
             if (behaviour is Terrain terrain)
                 DrawTerrainBrushSection(terrain);
 
+            if (behaviour is AudioSource audioSource)
+                DrawAudioSourceSection(audioSource);
+
+            if (behaviour is Animator animator)
+                DrawAnimatorSection(animator);
+
             ImGui.Spacing();
         }
 
@@ -523,6 +529,80 @@ internal sealed class InspectorPanel {
 
         ImGui.TextDisabled("Pick Lower to dig; Smooth/Flatten to level.");
     }
+
+    // AudioSource preview: a Preview/Stop button so you can hear a clip without entering play mode.
+    // Uses the static Audio facade (play-mode-independent), so it works in edit mode; AudioSource.Play
+    // itself is gated to play mode. Graceful no-op when no audio device is present (headless CI).
+    static IAudioVoice audioPreviewVoice;
+    void DrawAudioSourceSection(AudioSource source) {
+        ImGui.Spacing();
+        ImGui.SeparatorText("Preview");
+
+        if (source.Clip is null) {
+            ImGui.TextDisabled("Assign a Clip to preview.");
+            return;
+        }
+
+        bool playing = audioPreviewVoice is { IsPlaying: true };
+        if (ImGui.Button(playing ? $"{EditorIcons.Pause}  Stop" : $"{EditorIcons.Play}  Preview",
+                new SysVec2(120, 0))) {
+            audioPreviewVoice?.Stop();
+            audioPreviewVoice = playing
+                ? null
+                : Audio.Play(source.Clip, source.Volume, source.Pitch, loop: false);
+        }
+        ImGui.SameLine();
+        ImGui.TextDisabled($"{source.Clip.DurationSeconds:F1}s, {source.Clip.Channels}ch, {source.Clip.SampleRate}Hz");
+
+        if (!Audio.IsAvailable)
+            ImGui.TextDisabled("(no audio device on this machine — preview is silent)");
+    }
+
+    // Animator preview: a play/pause toggle + a scrub slider that evaluates the clip in edit mode, so
+    // you can pose the skinned character without entering play. Drives Animator.EvaluatePreview, which
+    // runs the same sample->skeleton->skinning pipeline as play-mode Tick.
+    void DrawAnimatorSection(Animator animator) {
+        ImGui.Spacing();
+        ImGui.SeparatorText("Preview");
+
+        if (animator.Clip is null) {
+            ImGui.TextDisabled("Assign a Clip to preview.");
+            return;
+        }
+
+        float duration = MathF.Max(animator.Clip.DurationSeconds, 0.001f);
+
+        if (ImGui.Button(animatorPreviewPlaying ? $"{EditorIcons.Pause}  Pause" : $"{EditorIcons.Play}  Play",
+                new SysVec2(100, 0)))
+            animatorPreviewPlaying = !animatorPreviewPlaying;
+        ImGui.SameLine();
+        if (ImGui.Button($"{EditorIcons.Refresh}  Reset", new SysVec2(100, 0))) {
+            animatorPreviewTime = 0f;
+            animatorPreviewPlaying = false;
+        }
+
+        if (animatorPreviewPlaying) {
+            animatorPreviewTime += (float)Time.DeltaTime;
+            if (animator.Loop && animatorPreviewTime > duration)
+                animatorPreviewTime %= duration;
+            state.MarkViewportDirty(); // keep the viewport repainting while previewing
+        }
+
+        float t = animatorPreviewTime;
+        if (ImGui.SliderFloat("##animScrub", ref t, 0f, duration, "%.2fs")) {
+            animatorPreviewTime = t;
+            animatorPreviewPlaying = false;
+        }
+
+        // Apply the previewed pose this frame (edit mode only — play mode drives it from Tick).
+        if (!SceneManager.IsPlaying) {
+            animator.EvaluatePreview(animatorPreviewTime);
+            state.MarkViewportDirty();
+        }
+    }
+
+    static bool animatorPreviewPlaying;
+    static float animatorPreviewTime;
 
     static void CreateProfileAsset(Entity entity, Volume volume) {
         var baseName = entity.Name is { Length: > 0 } entityName ? entityName : "Volume";

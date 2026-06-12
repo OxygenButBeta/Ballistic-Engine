@@ -113,7 +113,30 @@ public class Animator : Behaviour {
 
         // Sample the incoming/active clip to TRS.
         activeClip.SampleLocalTRS(activeTime, Loop, bindLocal, posB, rotB, scaleB);
+        SolveAndApply(skeleton, boneCount, delta);
+    }
 
+    // Evaluates the serialized Clip at an absolute time and applies the pose — for EDITOR PREVIEW
+    // (the editor's Animator scrub/play), independent of play mode and crossfade. No-op without a
+    // skinned renderer + clip.
+    public void EvaluatePreview(float timeSeconds) {
+        renderer ??= GetComponent<SkinnedMeshRenderer>();
+        Mesh mesh = renderer?.SharedMesh;
+        if (Clip is null || mesh is null || !mesh.IsSkinned)
+            return;
+
+        SkeletonData skeleton = mesh.Skeleton;
+        int boneCount = skeleton.BoneCount;
+        EnsureScratch(skeleton, boneCount);
+
+        Clip.SampleLocalTRS(timeSeconds, Loop, bindLocal, posB, rotB, scaleB);
+        AnimationClip.ComposeLocal(posB, rotB, scaleB, localPose);
+        WalkAndSkin(skeleton, boneCount);
+    }
+
+    // Shared pose solve: blend the active clip's TRS (with any crossfade), compose to local, walk the
+    // skeleton, and hand skinning matrices to the renderer.
+    void SolveAndApply(SkeletonData skeleton, int boneCount, float delta) {
         if (fadeFromClip is not null) {
             // Advance + sample the outgoing clip, then blend by fade weight (0 = outgoing, 1 = active).
             fadeFromTime += delta * Speed;
@@ -135,16 +158,17 @@ public class Animator : Behaviour {
             AnimationClip.ComposeLocal(posB, rotB, scaleB, localPose);
         }
 
-        // local -> world (mesh-local). Pre-order: parent computed before child.
+        WalkAndSkin(skeleton, boneCount);
+    }
+
+    // localPose -> world (mesh-local, pre-order) -> skinning matrices -> renderer.
+    void WalkAndSkin(SkeletonData skeleton, int boneCount) {
         for (var i = 0; i < boneCount; i++) {
             int parent = skeleton.ParentIndices[i];
             worldPose[i] = parent >= 0 ? localPose[i] * worldPose[parent] : localPose[i];
         }
-
-        // skinning matrix = inverseBind * worldBone (row-vector).
         for (var i = 0; i < boneCount; i++)
             skinning[i] = skeleton.InverseBindPose[i] * worldPose[i];
-
         renderer.SetSkinningMatrices(skinning);
     }
 
