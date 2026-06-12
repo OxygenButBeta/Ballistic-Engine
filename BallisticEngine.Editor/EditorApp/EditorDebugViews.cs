@@ -15,14 +15,12 @@ internal static class EditorDebugViews {
     public const int None = 0;
     public const int AmbientOcclusion = 1;
     public const int Lit = 2;          // the HDR lit colour with no tonemap/bloom/grade
-    public const int Luminance = 3;    // perceived brightness of the lit colour
     public const int Ssgi = 4;         // the isolated indirect light (denoised GI, pre-combine)
 
     public static readonly (int mode, string label)[] Modes = [
         (AmbientOcclusion, "Ambient Occlusion"),
         (Ssgi, "Global Illumination (SSGI)"),
         (Lit, "Lit (no post)"),
-        (Luminance, "Luminance"),
     ];
 
     static int program;
@@ -47,7 +45,7 @@ internal static class EditorDebugViews {
         int src = f.Mode switch {
             AmbientOcclusion => f.AoTexture,
             Ssgi => f.SsgiTexture,
-            Lit or Luminance => f.LitColor,
+            Lit => f.LitColor,
             _ => f.LitColor,
         };
         if (src == 0 || src == -1) {
@@ -87,13 +85,11 @@ out vec4 col;
 uniform sampler2D src;
 uniform int mode;
 void main() {
-    vec3 c = texture(src, uv).rgb;
-    if (mode == 1) {            // Ambient Occlusion — single channel, show as greyscale
-        col = vec4(vec3(c.r), 1.0);
-    } else if (mode == 3) {     // Luminance of the lit colour
-        float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
-        col = vec4(vec3(l), 1.0);
+    if (mode == 1) {            // Ambient Occlusion — read ONLY the R channel and show pure greyscale
+        float a = texture(src, uv).r;   // white = unoccluded, black = occluded
+        col = vec4(a, a, a, 1.0);
     } else {                    // SSGI / Lit — tonemap lightly so HDR doesn't blow out the view
+        vec3 c = texture(src, uv).rgb;
         vec3 t = c / (c + vec3(1.0));
         col = vec4(pow(t, vec3(1.0/2.2)), 1.0);
     }
