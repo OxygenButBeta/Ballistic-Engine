@@ -825,7 +825,19 @@ void main() {
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
     }
 
+    // BALLISTIC_DETERMINISTIC=1 — capture-anytime determinism: kills every source of frame-to-frame
+    // variance so an early frame equals a late frame (no 180-frame settle wait, diffable captures
+    // mid-run). TAA off (sub-pixel jitter + history), SSGI/volumetric off (temporal accumulation),
+    // exposure fixed (no adaptation). Individual BALLISTIC_FX_* toggles still win — they apply after.
+    static readonly bool EnvDeterministic = Environment.GetEnvironmentVariable("BALLISTIC_DETERMINISTIC") == "1";
+
     void ApplyEnvOverrides() {
+        if (EnvDeterministic) {
+            PostFX.TaaEnabled = false;
+            PostFX.SsgiEnabled = false;
+            PostFX.VolumetricEnabled = false;
+            PostFX.ExposureMode = ExposureMode.Fixed;
+        }
         if (EnvDebugView is { } dv)
             DebugViewMode = dv;
         if (EnvSsgi is { } ssgiOn)

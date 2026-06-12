@@ -97,7 +97,7 @@ public class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWin
     protected override void OnRenderFrame(FrameEventArgs args) {
         using (Profiler.Zone("RenderFrame"))
             WindowRenderCallback!.Invoke(args.Time);
-        MaybeCaptureScreenshot(); // reads the backbuffer, so it must run BEFORE the swap
+        DrainScreenshotRequests(); // reads the backbuffer, so it must run BEFORE the swap
         base.OnRenderFrame(args);
         using (Profiler.Zone("SwapBuffers"))
             Context.SwapBuffers();
@@ -106,35 +106,89 @@ public class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWin
     }
 
     // BALLISTIC_SCREENSHOT=<path.bmp>: save the rendered frame number BALLISTIC_SCREENSHOT_FRAME
-    // (default 180 — enough for asset streaming, auto exposure and TAA to settle) and exit.
-    // Headless visual verification for agents/CI: run, grab the file, diff against a baseline.
+    // (default 180 — enough for asset streaming, auto exposure and TAA to settle) and exit
+    // (BALLISTIC_SCREENSHOT_EXIT=0 keeps running). Headless visual verification for agents/CI.
+    // Implemented as the first consumer of the on-demand Screenshots queue — Screenshots.Capture
+    // works the same way for scripts and the editor command port, without the exit.
     static readonly string ScreenshotPath = Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT");
     static readonly int ScreenshotFrame = int.TryParse(
         Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT_FRAME"), out var f) ? f : 180;
-    int presentedFrames;
+    static readonly bool ScreenshotExit = Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT_EXIT") != "0";
+    bool envScreenshotQueued;
 
-    void MaybeCaptureScreenshot() {
-        if (ScreenshotPath is null || ++presentedFrames != ScreenshotFrame)
+    void DrainScreenshotRequests() {
+        if (!envScreenshotQueued) {
+            envScreenshotQueued = true;
+            if (ScreenshotPath is not null)
+                Screenshots.Capture(ScreenshotPath, ScreenshotFrame - 1, _ => {
+                    PrintPerfStats();
+                    if (ScreenshotExit) Close();
+                });
+        }
+
+        var due = Screenshots.DueThisFrame();
+        if (due is null)
             return;
 
+        // One backbuffer read serves every request due this frame.
         var pixels = new byte[width * height * 3];
         GL.ReadBuffer(ReadBufferMode.Back);
         GL.PixelStore(PixelStoreParameter.PackAlignment, 1);
         GL.ReadPixels(0, 0, width, height, PixelFormat.Bgr, PixelType.UnsignedByte, pixels);
-        BmpWriter.Write(ScreenshotPath, width, height, pixels); // GL rows are bottom-up like BMP
-        Console.WriteLine($"[Screenshot] saved {width}x{height} frame {ScreenshotFrame} to {ScreenshotPath}");
 
-        // Perf snapshot alongside the image: per-pass GPU times + submission counters, so a
-        // headless agent/CI run gets numbers and pixels from the same frame.
+        foreach (Screenshots.Request request in due) {
+            try {
+                BmpWriter.Write(request.Path, width, height, pixels); // GL rows are bottom-up like BMP
+                WriteStatsSidecar(request.Path);
+                Console.WriteLine($"[Screenshot] saved {width}x{height} to {request.Path}");
+                request.OnSaved?.Invoke(request.Path);
+            }
+            catch (Exception ex) {
+                Debugging.LogError($"Screenshot to '{request.Path}' failed: {ex.Message}");
+            }
+        }
+    }
+
+    // Perf snapshot console lines (the original [PerfStats] contract — agents parse these).
+    // Invariant culture: a Turkish-locale machine was printing "0,653" and breaking float parsing.
+    static void PrintPerfStats() {
         RenderStats rs = RenderStats.Scene;
-        Console.WriteLine($"[PerfStats] draws={rs.DrawCalls} depthDraws={rs.DepthOnlyDrawCalls} " +
+        Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+            $"[PerfStats] draws={rs.DrawCalls} depthDraws={rs.DepthOnlyDrawCalls} " +
             $"instanced={rs.InstancedDrawCalls} savedByInstancing={rs.DrawsSavedByInstancing} " +
             $"tris={rs.Triangles} visible={rs.RenderersVisible} culled={rs.RenderersCulled} " +
-            $"submeshesCulled={rs.SubMeshesCulled} gpuFrameMs={rs.GpuFrameMs:0.000}");
+            $"submeshesCulled={rs.SubMeshesCulled} gpuFrameMs={rs.GpuFrameMs:0.000}"));
         foreach ((string name, double ms) in rs.GpuPasses)
-            Console.WriteLine($"[PerfStats] pass {name} = {ms:0.000} ms");
+            Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                $"[PerfStats] pass {name} = {ms:0.000} ms"));
+    }
 
-        Close();
+    // Machine-readable twin of the [PerfStats] lines, written next to every capture as
+    // <image>.stats.json — same frame as the pixels, so numbers and image always agree.
+    // Hand-built JSON (flat object) to keep the GL layer free of serializer dependencies.
+    static void WriteStatsSidecar(string imagePath) {
+        RenderStats rs = RenderStats.Scene;
+        var sb = new System.Text.StringBuilder(512);
+        sb.Append("{\n");
+        sb.Append($"  \"draws\": {rs.DrawCalls},\n");
+        sb.Append($"  \"depthDraws\": {rs.DepthOnlyDrawCalls},\n");
+        sb.Append($"  \"instanced\": {rs.InstancedDrawCalls},\n");
+        sb.Append($"  \"savedByInstancing\": {rs.DrawsSavedByInstancing},\n");
+        sb.Append($"  \"triangles\": {rs.Triangles},\n");
+        sb.Append($"  \"renderersVisible\": {rs.RenderersVisible},\n");
+        sb.Append($"  \"renderersCulled\": {rs.RenderersCulled},\n");
+        sb.Append($"  \"submeshesCulled\": {rs.SubMeshesCulled},\n");
+        sb.Append(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+            $"  \"gpuFrameMs\": {rs.GpuFrameMs:0.000},\n"));
+        sb.Append("  \"gpuPasses\": {\n");
+        for (int i = 0; i < rs.GpuPasses.Count; i++) {
+            (string name, double ms) = rs.GpuPasses[i];
+            sb.Append(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                $"    \"{name}\": {ms:0.000}"));
+            sb.Append(i < rs.GpuPasses.Count - 1 ? ",\n" : "\n");
+        }
+        sb.Append("  }\n}\n");
+        File.WriteAllText(imagePath + ".stats.json", sb.ToString());
     }
 
     protected override void OnUpdateFrame(FrameEventArgs args) {
