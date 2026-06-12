@@ -423,6 +423,29 @@ internal sealed class InspectorPanel {
             ImGui.BeginDisabled(!CanPasteInto(type));
             if (ImGui.MenuItem($"{EditorIcons.Add}  Paste Component Values")) PasteComponent(behaviour);
             ImGui.EndDisabled();
+
+            // [ContextMenu] methods (Unity's): each parameterless [ContextMenu]-marked method shows
+            // here and runs on click, ScriptGuard-protected so a throwing one can't take the editor down.
+            bool firstCtx = true;
+            foreach (MethodInfo ctxMethod in ComponentReflection.InspectorContextMenus(type)) {
+                if (firstCtx) { ImGui.Separator(); firstCtx = false; }
+                string ctxLabel = ctxMethod.GetCustomAttribute<ContextMenuAttribute>()?.Label ?? Prettify(ctxMethod.Name);
+                if (ImGui.MenuItem($"{EditorIcons.Wrench}  {ctxLabel}")) {
+                    EditorUndo.Push(ctxLabel);
+                    try { ctxMethod.Invoke(behaviour, null); }
+                    catch (Exception ex) { Debugging.LogError($"[ContextMenu] '{ctxLabel}' threw: {ex.InnerException?.Message ?? ex.Message}"); }
+                    state.MarkViewportDirty();
+                }
+            }
+
+            // Edit Script — for game-script components (compiled into GameScripts.dll), open the
+            // backing .cs in the OS's default C# editor (item 9). Engine components have no source file.
+            if (IsGameScript(type)) {
+                ImGui.Separator();
+                if (ImGui.MenuItem($"{EditorIcons.Code}  Edit Script"))
+                    OpenComponentScript(type);
+            }
+
             ImGui.Separator();
             if (ImGui.MenuItem($"{EditorIcons.Delete}  Remove Component")) removeClicked = true;
             ImGui.EndPopup();
@@ -2423,6 +2446,38 @@ internal sealed class InspectorPanel {
         if (AxisVec3(label, label, ref sv, speed)) {
             apply(new Vector3(sv.X, sv.Y, sv.Z));
             state.MarkViewportDirty();
+        }
+    }
+
+    // True if a component type is a GAME script (compiled into GameScripts.dll), not an engine type.
+    static bool IsGameScript(Type type) =>
+        type.Assembly.GetName().Name == BallisticEngine.AssetPipeline.GameScripts.AssemblyName;
+
+    // Finds the component's backing .cs (Unity's rule: file name == class name) and opens it in the OS
+    // default C# editor. Also opens the generated Scripts.csproj first so the IDE has project context.
+    static void OpenComponentScript(Type type) {
+        // Locate <TypeName>.cs anywhere under Assets via the asset database.
+        string target = null;
+        foreach (var (path, _) in AssetDatabase.EnumerateAssets()) {
+            if (path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(Path.GetFileNameWithoutExtension(path), type.Name, StringComparison.Ordinal)) {
+                target = path;
+                break;
+            }
+        }
+        if (target is null) {
+            Debugging.LogWarning($"Edit Script: no '{type.Name}.cs' found under Assets.");
+            return;
+        }
+        try {
+            // Open the project file first (IDE context), then the source file.
+            var csproj = BallisticEngine.AssetPipeline.GameScripts.EnsureProjectFile(AssetDatabase.Project);
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(csproj) { UseShellExecute = true });
+            var abs = AssetDatabase.Project.ResolveAbsolute(target);
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(abs) { UseShellExecute = true });
+        }
+        catch (Exception ex) {
+            Debugging.LogWarning($"Edit Script: {ex.Message}");
         }
     }
 

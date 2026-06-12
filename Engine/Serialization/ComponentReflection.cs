@@ -58,6 +58,17 @@ public static class ComponentReflection {
         }
     }
 
+    // Parameterless methods marked [ContextMenu]: the inspector lists each in the component's "..."
+    // context menu and invokes it on click (Unity's [ContextMenu]).
+    public static IEnumerable<MethodInfo> InspectorContextMenus(Type type) {
+        foreach (MethodInfo method in type.GetMethods(Flags)) {
+            if (method.GetParameters().Length == 0 &&
+                !IsFrameworkType(method.DeclaringType) &&
+                method.GetCustomAttribute<ContextMenuAttribute>() is not null)
+                yield return method;
+        }
+    }
+
     public static Type MemberType(MemberInfo member) =>
         member is PropertyInfo p ? p.PropertyType : ((FieldInfo)member).FieldType;
 

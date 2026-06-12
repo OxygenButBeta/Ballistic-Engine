@@ -76,6 +76,15 @@ public sealed class ButtonAttribute : Attribute {
     public ButtonAttribute(string label = null) => Label = label;
 }
 
+// Adds the decorated PARAMETERLESS method to the component's "..." / right-click context menu in the
+// inspector (Unity's [ContextMenu]). For one-shot actions you want tucked away rather than shown as a
+// full-width [Button]. Label defaults to the method name.
+[AttributeUsage(AttributeTargets.Method, AllowMultiple = false, Inherited = false)]
+public sealed class ContextMenuAttribute : Attribute {
+    public string Label { get; }
+    public ContextMenuAttribute(string label = null) => Label = label;
+}
+
 // Puts this member (and following members that share the same group name) inside a collapsible
 // foldout in the inspector. A member with a different group name, or a [Header], starts a new
 // section. Use it to categorize a component's properties (e.g. "Shadows", "Advanced").
