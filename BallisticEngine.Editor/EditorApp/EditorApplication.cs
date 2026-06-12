@@ -586,6 +586,10 @@ internal sealed class EditorApplication {
                 PanelFlags | ImGuiWindowFlags.NoTitleBar, ToolbarUI);
             SysVec2 maxPos = workPos + new SysVec2(0, toolbarH);
             SysVec2 maxSize = new(workSize.X, workSize.Y - toolbarH);
+            // Keep the tab-strip band clamp valid while maximized too (this block returns before the
+            // normal-path assignment runs) — else the clamp used a stale value and a maximized panel's
+            // title double-click to restore stopped working.
+            contentAreaTop = maxPos.Y;
             if (maximizedViewport)
                 DrawMaximizedViewport(maxPos, maxSize);
             else
