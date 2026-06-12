@@ -64,7 +64,11 @@ public abstract class Renderer : Behaviour, IStaticMeshRenderer {
 
     // The material a given submesh renders with. Single-submesh meshes honor an explicitly
     // assigned SharedMaterial first; multi-submesh meshes use their baked refs and fall back
-    // to SharedMaterial for slots without one. May return null (submesh is skipped).
+    // to SharedMaterial for slots without one. When NOTHING resolves, substitutes the magenta/black
+    // MissingMaterial so the gap is visible (Unity's missing-material pink) instead of silently
+    // skipping the submesh — set ShowMissingMaterial = false to opt out (e.g. intentional holes).
+    public static bool ShowMissingMaterial = true;
+
     public Material MaterialFor(int submeshIndex) {
         EnsureAutoMaterials();
 
@@ -72,9 +76,11 @@ public abstract class Renderer : Behaviour, IStaticMeshRenderer {
             ? autoMaterials[submeshIndex]
             : null;
 
-        if (autoMaterials is null || autoMaterials.Length <= 1)
-            return SharedMaterial ?? auto;
-        return auto ?? SharedMaterial;
+        Material resolved = (autoMaterials is null || autoMaterials.Length <= 1)
+            ? SharedMaterial ?? auto
+            : auto ?? SharedMaterial;
+
+        return resolved ?? (ShowMissingMaterial ? MissingMaterial.Get() : null);
     }
 
     void EnsureAutoMaterials() {
