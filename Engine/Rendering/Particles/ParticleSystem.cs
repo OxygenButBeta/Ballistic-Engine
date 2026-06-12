@@ -8,6 +8,16 @@ public enum ParticleBlendMode {
     Alpha,      // smoke, dust — needs back-to-front sorting
 }
 
+// Shapes the over-lifetime interpolation of a particle property (size, color). Linear = the raw
+// start->end lerp; the eased variants soften the motion (a real VFX usually wants size to ease out,
+// alpha to ease in/out). Engine-local (no UI dependency).
+public enum ParticleEase {
+    Linear,
+    EaseIn,     // slow start
+    EaseOut,    // slow end (the common "fade/shrink gently" curve)
+    EaseInOut,
+}
+
 // Where particles spawn and which way they head (all relative to the emitter's transform).
 public enum EmissionShape {
     Cone,        // from a point, within a cone around local +Y (fire, fountains)
@@ -101,6 +111,12 @@ public class ParticleSystem : Behaviour {
     [Tooltip("Alpha at death — fade out by setting this to 0.")]
     [Range(0f, 1f)]
     public float EndAlpha { get; set; }
+
+    [Tooltip("Eases the size interpolation over lifetime. EaseOut shrinks gently at the end.")]
+    public ParticleEase SizeEase { get; set; } = ParticleEase.Linear;
+
+    [Tooltip("Eases the color + alpha interpolation over lifetime. EaseOut fades gently at the end.")]
+    public ParticleEase ColorEase { get; set; } = ParticleEase.Linear;
 
     [Tooltip("How billboards composite. Additive = fire/sparks; Alpha = smoke.")]
     public ParticleBlendMode BlendMode { get; set; } = ParticleBlendMode.Additive;
@@ -316,9 +332,11 @@ public class ParticleSystem : Behaviour {
         for (var i = 0; i < liveCount; i++) {
             ref Particle p = ref pool[i];
             float u = p.NormalizedAge;
-            Vector3 rgb = Vector3.Lerp(StartColor, EndColor, u);
-            float a = MathHelper.Lerp(StartAlpha, EndAlpha, u);
-            float size = MathHelper.Lerp(p.StartSize, p.StartSize * SafeRatio(EndSize, StartSize), u);
+            float uc = ApplyEase(ColorEase, u);
+            float us = ApplyEase(SizeEase, u);
+            Vector3 rgb = Vector3.Lerp(StartColor, EndColor, uc);
+            float a = MathHelper.Lerp(StartAlpha, EndAlpha, uc);
+            float size = MathHelper.Lerp(p.StartSize, p.StartSize * SafeRatio(EndSize, StartSize), us);
 
             Vector4 uvRect = new(0f, 0f, 1f, 1f);
             if (animated) {
@@ -343,4 +361,16 @@ public class ParticleSystem : Behaviour {
     }
 
     static float SafeRatio(float end, float start) => start > 1e-6f ? end / start : 1f;
+
+    // Maps a 0..1 lerp parameter through the ease curve (cubic, closed-form — no per-frame solve).
+    // Endpoints are preserved (0->0, 1->1) so Start/End values always hit exactly.
+    static float ApplyEase(ParticleEase ease, float t) {
+        t = Math.Clamp(t, 0f, 1f);
+        return ease switch {
+            ParticleEase.EaseIn => t * t * t,
+            ParticleEase.EaseOut => 1f - MathF.Pow(1f - t, 3f),
+            ParticleEase.EaseInOut => t < 0.5f ? 4f * t * t * t : 1f - MathF.Pow(-2f * t + 2f, 3f) / 2f,
+            _ => t,
+        };
+    }
 }
