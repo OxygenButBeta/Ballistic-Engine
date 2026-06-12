@@ -395,6 +395,9 @@ internal sealed class InspectorPanel {
             if (behaviour is LightAnimator lightAnim)
                 DrawLightAnimatorSection(lightAnim);
 
+            if (behaviour is Spawner spawner)
+                DrawSpawnerSection(spawner);
+
             if (behaviour is ParticleSystem particles)
                 DrawParticleSystemSection(particles);
 
@@ -740,6 +743,36 @@ internal sealed class InspectorPanel {
 
     static bool lightAnimPreview;
     static float lightAnimPreviewClock;
+
+    // Spawner: live alive/pooled counts + a manual Spawn One / Clear. Spawning only runs in play mode
+    // (Tick), so the manual button is most useful there; in edit mode it instantiates immediately so
+    // you can preview the prefab placement, and Clear cleans those up.
+    void DrawSpawnerSection(Spawner spawner) {
+        ImGui.Spacing();
+        ImGui.SeparatorText("Spawner");
+
+        if (spawner.Prefab is null) {
+            ImGui.TextColored(new SysVec4(1f, 0.7f, 0.3f, 1f), "Assign a Prefab to spawn.");
+            return;
+        }
+
+        ImGui.Text($"Alive: {spawner.AliveCount} / {spawner.MaxAlive}");
+        ImGui.SameLine();
+        ImGui.TextDisabled($"(pooled: {spawner.PooledCount})");
+
+        if (ImGui.Button($"{EditorIcons.Play}  Spawn One", new SysVec2(120, 0))) {
+            spawner.Spawn();
+            state.MarkViewportDirty();
+        }
+        ImGui.SameLine();
+        if (ImGui.Button($"{EditorIcons.Refresh}  Clear", new SysVec2(120, 0))) {
+            spawner.Clear();
+            state.MarkViewportDirty();
+        }
+
+        if (SceneManager.IsPlaying && spawner.AliveCount > 0)
+            state.MarkViewportDirty(); // keep repainting while instances live/expire
+    }
 
     // ParticleSystem preview: it already animates live in the editor (AdvanceAll runs every editor
     // frame), so this just adds a Restart (clear) + a one-shot Emit test + a live count, and keeps the
