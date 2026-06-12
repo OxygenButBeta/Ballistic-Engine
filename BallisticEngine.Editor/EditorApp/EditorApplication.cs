@@ -1252,9 +1252,10 @@ internal sealed class EditorApplication {
     // fullscreen isn't Esc-only (the user couldn't find a way out). Clicking it clears maximizedPanel.
     void DrawExitFullscreenButton(SysVec2 workPos, SysVec2 workSize, float toolbarH) {
         float margin = 8 * S;
-        // Just below the toolbar on the LEFT (under the play/pause/step cluster), where the user
-        // expects it — a labelled button, not Esc-only.
-        ImGui.SetNextWindowPos(new SysVec2(workPos.X + margin, workPos.Y + toolbarH + margin));
+        // Centered at the TOP of the view (pivot 0.5,0), just under the toolbar — where the user
+        // expects it, out of the way of the left-side controls.
+        ImGui.SetNextWindowPos(new SysVec2(workPos.X + workSize.X * 0.5f, workPos.Y + toolbarH + margin),
+            ImGuiCond.Always, new SysVec2(0.5f, 0f));
         ImGui.SetNextWindowBgAlpha(0.9f);
         const ImGuiWindowFlags flags = ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.NoDocking |
             ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoSavedSettings |
@@ -1288,6 +1289,11 @@ internal sealed class EditorApplication {
         float stripTop = winPos.Y - (ImGui.IsWindowDocked() ? ImGui.GetFrameHeight() : 0f);
         bool onStrip = mouse.X >= winPos.X && mouse.X <= winPos.X + winW &&
                        mouse.Y >= stripTop && mouse.Y < contentTop;
+        // NEVER trigger when the cursor is over an actual widget — the strip band reaches up over the
+        // toolbar for docked windows, so double-clicking the Save/undo/dropdown buttons there used to
+        // fullscreen the view behind them. If any item is hovered, that click belongs to the item.
+        if (ImGui.IsAnyItemHovered())
+            onStrip = false;
 
         // Double-click the strip → toggle fullscreen for this panel.
         if (onStrip && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
@@ -1389,7 +1395,12 @@ internal sealed class EditorApplication {
         ImGui.SetNextWindowPos(pos, ImGuiCond.Always);
         ImGui.SetNextWindowSize(size, ImGuiCond.Always);
         if (ImGui.Begin("##viewportmax", PanelFlags | ImGuiWindowFlags.NoTitleBar)) {
-            if (sceneTabActive)
+            // Show whichever view was ACTUALLY maximized — drive off maximizedPanel, not sceneTabActive,
+            // which could be out of sync (the "maximize Scene, exit, switch to Game, things get weird"
+            // bug). Keep sceneTabActive in step so the on-demand render picks the right target.
+            bool sceneMax = maximizedPanel == EditorLayout.SceneView;
+            sceneTabActive = sceneMax;
+            if (sceneMax)
                 SceneTabContents();
             else
                 GameTabContents();
