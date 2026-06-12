@@ -15,6 +15,7 @@
     <ItemGroup>
       <Compile Remove="BallisticEngine.Runtime\**\*.cs" />
       <Compile Remove="BallisticEngine.Editor\**\*.cs" />
+      <Compile Remove="BallisticEngine.Cli\**\*.cs" />
       <Compile Remove="BallisticEngine.Profiling.Tracy\**\*.cs" />
       <Compile Remove="Tools\**\*.cs" />
       <Compile Remove="SampleProject\**\*.cs" />
