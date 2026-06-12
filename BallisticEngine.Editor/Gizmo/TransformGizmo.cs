@@ -7,6 +7,11 @@ namespace BallisticEngine.Editor;
 internal enum GizmoMode { Translate, Rotate, Scale }
 internal enum GizmoSpace { World, Local }
 
+// Where the gizmo SITS: at the entity's own transform pivot (origin), or at the CENTER of the
+// selection's bounds — the AABB of the entity and all its descendants' world positions, so a
+// hierarchy's handle sits in the middle of its parts (Unity's Pivot/Center toggle).
+internal enum GizmoPivot { Pivot, Center }
+
 // Hand-rolled transform gizmo drawn over the Scene view with the ImGui draw list.
 // Translate: drag the X/Y/Z arrows. Rotate: drag the axis circles. Scale: drag the axis cubes,
 // or the center square for uniform scale. Handles can use world or local (object) axes; holding
@@ -14,6 +19,7 @@ internal enum GizmoSpace { World, Local }
 internal sealed class TransformGizmo {
     public GizmoMode Mode = GizmoMode.Translate;
     public GizmoSpace Space = GizmoSpace.World;
+    public GizmoPivot Pivot = GizmoPivot.Pivot;
 
     // The basis the gizmo uses this frame: world axes, or the entity's axes in Local space.
     // Scale ALWAYS uses local axes (scaling along world axes is meaningless for a rotated object).
@@ -54,6 +60,26 @@ internal sealed class TransformGizmo {
         return localAxesBuffer;
     }
 
+    // Center-mode gizmo position: the AABB centre of the entity's and all its descendants' world
+    // positions. For a leaf entity this equals its pivot; for a hierarchy it sits in the middle of the
+    // parts. (A render-bounds centre would need CPU mesh data per renderer; transform-position bounds
+    // is cheap, stable, and matches "the centre of the objects inside" for authored hierarchies.)
+    static Vector3 SelectionCenter(Entity entity) {
+        Vector3 min = entity.transform.WorldPosition, max = min;
+        Scene scene = SceneManager.GetCurrentScene();
+        if (scene is not null) {
+            // Transform has no child list; find descendants by walking the scene (IsDescendantOf).
+            foreach (Entity e in scene.Entities) {
+                if (e is null || e.IsDestroyed || ReferenceEquals(e, entity)) continue;
+                if (!e.transform.IsDescendantOf(entity.transform)) continue;
+                Vector3 p = e.transform.WorldPosition;
+                min = Vector3.ComponentMin(min, p);
+                max = Vector3.ComponentMax(max, p);
+            }
+        }
+        return (min + max) * 0.5f;
+    }
+
     // Snap helpers â€” active while Ctrl is held during a drag (increments from EditorPrefs).
     static bool SnapHeld => ImGui.GetIO().KeyCtrl;
     static float Snap(float value, float increment) =>
@@ -82,7 +108,12 @@ internal sealed class TransformGizmo {
             return;
 
         Matrix4 vp = camera.GetViewMatrix() * camera.GetProjectionMatrix();
-        Vector3 origin = entity.transform.WorldMatrix.ExtractTranslation();
+        // Pivot mode: the entity's own origin. Center mode: the AABB centre of the entity + all its
+        // descendants' world positions. Both track the entity as it moves, so a drag (which applies its
+        // delta to WorldPosition, not to `origin`) stays consistent — the gizmo and pivot shift together.
+        Vector3 origin = Pivot == GizmoPivot.Center
+            ? SelectionCenter(entity)
+            : entity.transform.WorldMatrix.ExtractTranslation();
 
         if (!Project(origin, vp, viewMin, viewSize, out SysVec2 originPx))
             return; // behind the camera

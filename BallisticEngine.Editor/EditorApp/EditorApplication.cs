@@ -1079,6 +1079,15 @@ internal sealed class EditorApplication {
                     world ? "Gizmo space: World (click for Local)" : "Gizmo space: Local (click for World)"))
                 gizmo.Space = world ? GizmoSpace.Local : GizmoSpace.World;
 
+            // Gizmo pivot toggle (Unity's Pivot/Center): pin = the entity's own origin, expand = the
+            // centre of the selection's bounds (entity + descendants).
+            var pivotMode = gizmo.Pivot == GizmoPivot.Pivot;
+            var pivotIcon = pivotMode ? EditorIcons.Pin : EditorIcons.Maximize;
+            RightAlign(ImGui.CalcTextSize(pivotIcon).X + pad2);
+            if (EditorIcons.GhostButton("gizmopivot", pivotIcon,
+                    pivotMode ? "Gizmo handle: Pivot (click for Center)" : "Gizmo handle: Center (click for Pivot)"))
+                gizmo.Pivot = pivotMode ? GizmoPivot.Center : GizmoPivot.Pivot;
+
             // Component gizmos toggle.
             RightAlign(ImGui.CalcTextSize(EditorIcons.Pin).X + pad2);
             var gizmosBefore = showGizmos;
