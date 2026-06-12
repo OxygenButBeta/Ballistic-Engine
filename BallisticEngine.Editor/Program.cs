@@ -18,6 +18,9 @@ internal class Program {
 
         // JobSystem workers are foreground threads; without this the process never exits.
         JobSystem.Shutdown();
+
+        // Close the OpenAL device/context cleanly on shutdown.
+        Audio.Shutdown();
     }
 
     // BallisticEngine.Editor\bin\Debug\net9.0 -> repo root -> SampleProject

@@ -98,6 +98,11 @@ public sealed class EngineBootstrap {
         // file name (so `font-family: 'Cinzel'` resolves Cinzel.ttf), and sets a default.
         RegisterUIFonts();
 
+        // Audio backend (OpenAL), composition-root wiring like physics/renderer: components only
+        // ever see IAudioBackend. Initializes the output device now; degrades to silence (logged)
+        // if no device/driver is present (headless CI), never crashing.
+        Audio.Backend ??= new BallisticEngine.OpenALAudio.OpenALBackend();
+
         // Physics backend (Bepu), composition-root wiring like the renderer below: components
         // only ever see IPhysicsWorld. The simulation runs in play mode, driven by SceneManager.
         Physics.World ??= new BepuPhysicsWorld();
@@ -240,6 +245,7 @@ public sealed class EngineBootstrap {
     public void UpdateFrame(double delta) {
         Runtime.EngineTimer.Update(delta);
         SceneManager.Update((float)delta);
+        Audio.Update();
     }
 
     // Loads the project's startup scene (ScenesInBuild[0], or the legacy StartupScene field when the

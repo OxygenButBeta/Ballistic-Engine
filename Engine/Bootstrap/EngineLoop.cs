@@ -33,6 +33,10 @@ public sealed class EngineLoop {
         runtime.EngineTimer.Update(delta);
         SceneManager.Update((float)delta);
 
+        // Push the listener pose set by AudioListener.Tick this frame and recycle finished voices.
+        // After SceneManager.Update so the listener/emitter transforms are current.
+        Audio.Update();
+
         // Standalone player: the whole window IS the game, so the script's cursor intent always
         // applies. (The editor resolves intent itself, with a focus veto — see EditorApplication.)
         Cursor.Apply(allowed: true);

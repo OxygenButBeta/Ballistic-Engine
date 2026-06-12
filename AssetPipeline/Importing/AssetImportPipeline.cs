@@ -41,7 +41,7 @@ public sealed class AssetImportPipeline {
         importers = customImporters is not null
             ? [.. customImporters]
             : [
-                new ModelImporter(), new TextureImporter(), new FalcorSceneImporter(),
+                new ModelImporter(), new TextureImporter(), new AudioImporter(), new FalcorSceneImporter(),
                 new BlendImporter(), new TerrainImporter(), new NativeAssetImporter(), new DefaultImporter()
             ];
     }

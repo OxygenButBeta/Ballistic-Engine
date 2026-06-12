@@ -212,6 +212,7 @@ public static class AssetDatabase {
 
         return extension switch {
             ".fbx" or ".obj" or ".gltf" or ".glb" or ".dae" => MeshLoader.Load(pipeline, guid, assetPath),
+            ".wav" or ".wave" => AudioClipLoader.Load(pipeline, guid, assetPath),
             _ when isImage => TextureLoader.Load(pipeline, guid, assetPath),
             ".shader" => ShaderProgramLoader.Load(Project, assetPath),
             ".mat" => MaterialLoader.Load(Project, assetPath),
