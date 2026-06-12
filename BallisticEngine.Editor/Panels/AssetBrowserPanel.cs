@@ -129,12 +129,29 @@ internal sealed class AssetBrowserPanel {
             IsProtected(path) ||   // the Default folder's assets are never listed
             (!showSourceFiles && HiddenExtensions.Contains(Path.GetExtension(path).ToLowerInvariant()));
 
+        // Unity-style "t:Type" search: "t:material", "t:texture", "t:scene" ... filter by asset KIND
+        // (the TypeFilters categories, prefix-matched) instead of by path text. Anything else is a
+        // plain path-substring match. "t:" alone shows every asset.
+        bool MatchesFilter(string path) {
+            if (filter.StartsWith("t:", StringComparison.OrdinalIgnoreCase)) {
+                string term = filter[2..].Trim();
+                if (term.Length == 0) return true;
+                string ext = Path.GetExtension(path).ToLowerInvariant();
+                foreach (var (label, exts) in TypeFilters)
+                    if (exts.Length > 0 && label.Contains(term, StringComparison.OrdinalIgnoreCase) &&
+                        exts.Contains(ext))
+                        return true;
+                return false;
+            }
+            return path.Contains(filter, StringComparison.OrdinalIgnoreCase);
+        }
+
         foreach ((string path, Guid guid) in assets) {
             if (!PassesType(path) || Hidden(path))
                 continue;
 
             if (searching) {
-                if (path.Contains(filter, StringComparison.OrdinalIgnoreCase))
+                if (MatchesFilter(path))
                     files.Add((path, guid));
                 continue;
             }
@@ -364,7 +381,7 @@ internal sealed class AssetBrowserPanel {
             ImGui.SetTooltip("Filter by asset type (searches the whole project)");
         ImGui.SameLine(0, 4);
         ImGui.SetNextItemWidth(190 * s);
-        ImGui.InputTextWithHint("##filter", $"{EditorIcons.Search} Search...", ref filter, 128);
+        ImGui.InputTextWithHint("##filter", $"{EditorIcons.Search} Search (t:Material)...", ref filter, 128);
     }
 
     // Set when navigation comes from OUTSIDE the tree (breadcrumb, back, tile double-click):

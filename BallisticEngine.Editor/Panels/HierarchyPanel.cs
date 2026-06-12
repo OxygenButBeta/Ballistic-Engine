@@ -48,7 +48,7 @@ internal sealed class HierarchyPanel {
 
         ImGui.SameLine(0, 6);
         ImGui.SetNextItemWidth(-1);
-        ImGui.InputTextWithHint("##hiersearch", $"{EditorIcons.Search} Search...", ref search, 128);
+        ImGui.InputTextWithHint("##hiersearch", $"{EditorIcons.Search} Search (t:Component)...", ref search, 128);
 
         ImGui.Separator();
 
@@ -219,10 +219,25 @@ internal sealed class HierarchyPanel {
         }
     }
 
+    // Unity-style search: "t:ComponentName" filters to entities that HAVE a component whose type name
+    // contains the term (so "t:Light" matches PointLight/SpotLight/DirectionalLight); anything else is
+    // a plain case-insensitive name match. The "t:" term may be empty ("t:") — then any entity with at
+    // least one component matches, which is a handy "show me things with components" filter.
+    bool MatchesSearch(Entity entity) {
+        if (search.StartsWith("t:", StringComparison.OrdinalIgnoreCase)) {
+            string term = search[2..].Trim();
+            foreach (Behaviour b in entity.Behaviours)
+                if (term.Length == 0 || b.GetType().Name.Contains(term, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            return false;
+        }
+        return entity.Name.Contains(search, StringComparison.OrdinalIgnoreCase);
+    }
+
     // Search results as a flat list (hierarchy is meaningless while filtering).
     void DrawFilteredList(Entity[] entities) {
         foreach (Entity entity in entities) {
-            if (!entity.Name.Contains(search, StringComparison.OrdinalIgnoreCase))
+            if (!MatchesSearch(entity))
                 continue;
 
             var id = entity.InstanceId.GetHashCode();
