@@ -1344,8 +1344,56 @@ internal sealed class InspectorPanel {
             case ".asset":
                 DrawDataAssetInspector(path);
                 break;
+            case ".wav" or ".wave" or ".ogg":
+                DrawAudioClipAsset(path);
+                break;
+            case ".banim":
+                DrawAnimationClipAsset(path);
+                break;
             // Everything else (models, etc.): just the file header above — no clutter.
         }
+    }
+
+    // Audio asset view: a Preview/Stop button + clip stats, so you can audition a .wav/.ogg straight
+    // from the asset browser without dropping it on an AudioSource. Same Audio facade as the component
+    // preview (play-mode-independent; silent no-op with no audio device).
+    void DrawAudioClipAsset(string path) {
+        AudioClip clip = AssetDatabase.Load<AudioClip>(path);
+        if (clip is null) {
+            ImGui.TextDisabled("Could not load audio clip.");
+            return;
+        }
+
+        ImGui.SeparatorText("Preview");
+        bool playing = audioPreviewVoice is { IsPlaying: true };
+        if (ImGui.Button(playing ? $"{EditorIcons.Pause}  Stop" : $"{EditorIcons.Play}  Play",
+                new SysVec2(120, 0))) {
+            audioPreviewVoice?.Stop();
+            audioPreviewVoice = playing ? null : Audio.Play(clip);
+        }
+        ImGui.SameLine();
+        ImGui.TextDisabled($"{clip.DurationSeconds:F1}s  -  {clip.Channels}ch  -  {clip.SampleRate} Hz");
+        if (!Audio.IsAvailable)
+            ImGui.TextDisabled("(no audio device on this machine - preview is silent)");
+    }
+
+    // Animation-clip asset view: clip stats. A skeletal pose preview needs a skinned mesh to drive,
+    // which an asset-only view doesn't have - assign the clip to an Animator on a skinned entity and
+    // use the Animator scrub. Here we just summarize the clip.
+    void DrawAnimationClipAsset(string path) {
+        AnimationClip clip = AssetDatabase.Load<AnimationClip>(path);
+        if (clip is null) {
+            ImGui.TextDisabled("Could not load animation clip.");
+            return;
+        }
+
+        ImGui.SeparatorText("Animation");
+        ImGui.TextDisabled($"Duration: {clip.DurationSeconds:F2}s");
+        ImGui.TextDisabled($"Channels (animated bones): {clip.Data.Channels.Length}");
+        ImGui.TextDisabled($"Ticks/sec: {clip.TicksPerSecond:F0}");
+        ImGui.Spacing();
+        ImGui.TextWrapped("Assign this clip to an Animator on a skinned mesh, then use the Animator's " +
+            "scrub slider to preview the pose.");
     }
 
     // Prefab inspector: its captured entity tree (read-only) + an Instantiate-into-scene action.
