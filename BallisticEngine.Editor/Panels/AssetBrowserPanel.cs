@@ -147,6 +147,87 @@ internal sealed class AssetBrowserPanel {
 
         DrawGrid(folders, files, s);
         DrawNewScriptPrompt();
+        DrawNewAssetPrompt();
+    }
+
+    // Unity-style "name it first" creation for every NON-script asset (material, scene, terrain,
+    // folder, data assets): the menu item arms a prompt instead of writing "New X" immediately, so the
+    // file is named BEFORE it lands and gets imported (no "New Material.mat then rename + reimport").
+    bool openNewAssetPrompt;
+    string newAssetName = "";
+    string newAssetExt = "";              // ".mat", ".scene", "" for a folder
+    string newAssetKind = "Asset";        // shown in the prompt title
+    Func<string, string> newAssetContent; // name (no ext) -> file text; null = a folder (no file)
+    Action newAssetPostCreate;            // e.g. RequestScriptRebuild; runs before the refresh
+
+    // Arms the generic prompt. content is null for a folder. postCreate runs after the file is written.
+    void PromptNewAsset(string kind, string defaultName, string ext, Func<string, string> content,
+        Action postCreate = null) {
+        newAssetKind = kind;
+        newAssetName = defaultName;
+        newAssetExt = ext;
+        newAssetContent = content;
+        newAssetPostCreate = postCreate;
+        openNewAssetPrompt = true;
+    }
+
+    void DrawNewAssetPrompt() {
+        if (openNewAssetPrompt) {
+            openNewAssetPrompt = false;
+            ImGui.OpenPopup("##newasset");
+        }
+
+        ImGuiViewportPtr vp = ImGui.GetMainViewport();
+        SysVec2 center = new(vp.Pos.X + vp.Size.X * 0.5f, vp.Pos.Y + vp.Size.Y * 0.5f);
+        ImGui.SetNextWindowPos(center, ImGuiCond.Appearing, new SysVec2(0.5f, 0.5f));
+        if (!ImGui.BeginPopupModal("##newasset", ImGuiWindowFlags.AlwaysAutoResize))
+            return;
+
+        ImGui.TextUnformatted($"New {newAssetKind}");
+        ImGui.Separator();
+        ImGui.TextDisabled("Name:");
+        if (ImGui.IsWindowAppearing())
+            ImGui.SetKeyboardFocusHere();
+        ImGui.SetNextItemWidth(280);
+        bool enter = ImGui.InputText("##newassetname", ref newAssetName, 96, ImGuiInputTextFlags.EnterReturnsTrue);
+
+        string trimmed = newAssetName.Trim();
+        bool valid = trimmed.Length > 0 && trimmed.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
+        if (!valid && trimmed.Length > 0)
+            ImGui.TextColored(new SysVec4(1f, 0.5f, 0.4f, 1f), "Invalid file name.");
+        else
+            ImGui.TextDisabled($"Creates {trimmed}{newAssetExt}");
+
+        ImGui.Spacing();
+        ImGui.BeginDisabled(!valid);
+        if (ImGui.Button("Create", new SysVec2(120, 0)) || (enter && valid)) {
+            CreateNamedAsset(trimmed);
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.EndDisabled();
+        ImGui.SameLine();
+        if (ImGui.Button("Cancel", new SysVec2(120, 0)))
+            ImGui.CloseCurrentPopup();
+        ImGui.EndPopup();
+    }
+
+    // Writes the named asset (or folder) into the current folder and imports it. Uniqueness still
+    // applies (Name, Name 1, ...) so two same-named creates don't clobber.
+    void CreateNamedAsset(string name) {
+        string dir = AssetDatabase.Project.ResolveAbsolute(CurrentFolder);
+        string absolute = UniquePath(Path.Combine(dir, name + newAssetExt));
+        try {
+            if (newAssetContent is null) {
+                Directory.CreateDirectory(absolute);   // folder: no import needed
+                return;
+            }
+            File.WriteAllText(absolute, newAssetContent(Path.GetFileNameWithoutExtension(absolute)));
+            newAssetPostCreate?.Invoke();
+            AsyncAssetImport.Request($"Creating {newAssetKind.ToLowerInvariant()}...");
+        }
+        catch (Exception e) {
+            Debugging.LogError($"Could not create {newAssetKind}: {e.Message}");
+        }
     }
 
     // Unity-style "name it first" script creation: New Script opens a prompt for the class/file name,
@@ -254,7 +335,12 @@ internal sealed class AssetBrowserPanel {
         ImGui.SameLine();
         DrawBreadcrumb();
 
-        ImGui.SameLine(ImGui.GetWindowWidth() - 430 * s);
+        // Right-aligned toolbar cluster (view toggle, refresh, type filter, search). Clamp the start X
+        // so a NARROW panel never pushes the search box off the right edge — it shrinks toward the
+        // breadcrumb instead of vanishing.
+        float clusterW = 430 * s;
+        float startX = MathF.Max(ImGui.GetCursorPosX() + 8, ImGui.GetWindowWidth() - clusterW);
+        ImGui.SameLine(startX);
         // Grid / list view toggle.
         if (EditorIcons.GhostButton("viewmode", listView ? EditorIcons.Grid : EditorIcons.More,
                 listView ? "Switch to grid view" : "Switch to list view", 30 * s))
@@ -610,15 +696,18 @@ internal sealed class AssetBrowserPanel {
         if (ImGui.BeginPopupContextWindow("##gridctx",
                 ImGuiPopupFlags.MouseButtonRight | ImGuiPopupFlags.NoOpenOverItems)) {
             if (ImGui.MenuItem($"{EditorIcons.Folder}  New Folder"))
-                CreateFolder();
+                PromptNewAsset("Folder", "New Folder", "", null);
             if (ImGui.MenuItem($"{EditorIcons.Code}  New Script"))
                 openNewScriptPrompt = true;
             if (ImGui.MenuItem($"{EditorIcons.Color}  New Material"))
-                CreateMaterial();
+                PromptNewAsset("Material", "New Material", ".mat", _ =>
+                    "{\n  \"version\": 1,\n  \"shader\": \"Assets/Default/Shaders/Standard.shader\",\n  \"textures\": {}\n}\n");
             if (ImGui.MenuItem($"{EditorIcons.Home}  New Scene"))
-                CreateScene();
+                PromptNewAsset("Scene", "New Scene", ".scene", n =>
+                    $"version: 1\nname: {n}\nentities: []\n");
             if (ImGui.MenuItem($"{EditorIcons.Grid}  New Terrain"))
-                CreateTerrain();
+                PromptNewAsset("Terrain", "New Terrain", ".terrain", _ =>
+                    "{\n  \"version\": 1,\n  \"resolution\": 256,\n  \"sizeX\": 100,\n  \"sizeZ\": 100,\n  \"heightScale\": 20\n}\n");
             DrawDataAssetCreateMenu();
             ImGui.Separator();
             if (ImGui.MenuItem($"{EditorIcons.Code}  Open C# Project"))
@@ -920,13 +1009,11 @@ internal sealed class AssetBrowserPanel {
         if (instance is null)
             return;
 
-        // Default file name from the [CreateDataAsset] attribute, else the type name.
+        // Name it first (Unity parity), defaulting to the [CreateDataAsset] file name / type name.
         var attr = type.GetCustomAttribute<CreateDataAssetAttribute>();
         string fileName = string.IsNullOrEmpty(attr?.FileName) ? type.Name : attr.FileName;
-        var absolute = UniquePath(Path.Combine(
-            AssetDatabase.Project.ResolveAbsolute(CurrentFolder), fileName + ".asset"));
-        File.WriteAllText(absolute, DataAssetSerializer.Serialize(instance));
-        AsyncAssetImport.Request("Creating data asset...");
+        string serialized = DataAssetSerializer.Serialize(instance);   // captured for the factory
+        PromptNewAsset(attr?.DisplayName ?? type.Name, fileName, ".asset", _ => serialized);
     }
 
     static string UniquePath(string path) {
