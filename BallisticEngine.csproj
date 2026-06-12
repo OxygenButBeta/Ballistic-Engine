@@ -24,6 +24,7 @@
       <PackageReference Include="AssimpNet" Version="4.1.0" />
       <PackageReference Include="BepuPhysics" Version="2.4.0" />
       <PackageReference Include="Magick.NET-Q16-HDRI-AnyCPU" Version="14.14.0" />
+      <PackageReference Include="NVorbis" Version="0.10.5" />
       <PackageReference Include="OpenTK" Version="4.9.4" />
       <PackageReference Include="StbImageSharp" Version="2.30.15" />
       <PackageReference Include="StbTrueTypeSharp" Version="1.26.12" />

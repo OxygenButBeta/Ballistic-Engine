@@ -6,10 +6,11 @@ namespace BallisticEngine.AssetPipeline;
 // to be wired into AudioDecode) into a .baud artifact of interleaved 16-bit PCM. Same shape as
 // TextureImporter: decode at import time, write the engine-native artifact, load reads it back fast.
 public sealed class AudioImporter : IAssetImporter {
-    static readonly string[] Extensions = [".wav", ".wave"];
+    static readonly string[] Extensions = [".wav", ".wave", ".ogg"];
 
     public string Name => "AudioImporter";
-    public int Version => 1;
+    // v2: Ogg Vorbis (.ogg) decode via NVorbis.
+    public int Version => 2;
     public string ArtifactExtension => ".baud";
 
     public bool CanImport(string extension) => Extensions.Contains(extension);
@@ -35,13 +36,14 @@ public sealed class AudioImporter : IAssetImporter {
         var extension = Path.GetExtension(sourcePath).ToLowerInvariant();
         return extension switch {
             ".wav" or ".wave" => WavDecoder.Decode(sourcePath),
+            ".ogg" => OggDecoder.Decode(sourcePath),
             _ => Unsupported(sourcePath, extension),
         };
     }
 
     static AudioData Unsupported(string path, string extension) {
         Debugging.LogWarning(
-            $"Audio import: '{extension}' not yet decodable ('{Path.GetFileName(path)}'); only .wav is supported so far.");
+            $"Audio import: '{extension}' not decodable ('{Path.GetFileName(path)}'); supported: .wav, .ogg.");
         return default;
     }
 }
