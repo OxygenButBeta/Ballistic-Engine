@@ -48,7 +48,10 @@ internal sealed class EditorApplication {
     bool showInspector = true;
     bool showBottom = true;     // the Assets window
     bool showConsole = true;    // the Console window
-    bool maximizedViewport;     // double-click a view's tab to fill the window; Esc restores
+    // Double-click ANY panel's tab to fill the window with it; Esc restores. null = no panel
+    // maximized. (Was viewport-only; now works for every dockable panel.)
+    string maximizedPanel;
+    bool maximizedViewport => maximizedPanel == EditorLayout.SceneView || maximizedPanel == EditorLayout.GameView;
 
     bool showStats;
     bool alwaysRefresh = EditorPrefs.Current.AlwaysRefresh;   // off = re-render only on change
@@ -147,6 +150,11 @@ internal sealed class EditorApplication {
 
         runtime.WindowUpdateCallback += OnUpdate;
         runtime.WindowRenderCallback += OnRender;
+
+        // Remote command port (agents/MCP): a named-pipe server whose commands run on the main
+        // thread via RemoteCommandQueue.Pump() in OnRender. Engine-owned thread — survives script
+        // hot-reload and play transitions.
+        RemotePort.Start(editorState, bootstrap);
     }
 
     // A selection that can survive a scene rebuild: an entity by its (round-tripped) InstanceId, or a
@@ -296,6 +304,10 @@ internal sealed class EditorApplication {
         // Run any main-thread completion work from a finished background import (thumbnail/asset
         // cache invalidation) before building this frame's UI off the fresh asset database.
         AsyncAssetImport.PumpCompletion();
+
+        // Remote commands (agents/MCP) execute here — on the main thread, before the UI builds,
+        // so a remote edit and a human edit are indistinguishable to the rest of the frame.
+        RemoteCommandQueue.Pump();
 
         // Build the UI FIRST (the gizmo mutates transforms there), then render the scene with
         // this frame's values â€” otherwise the object trails the gizmo by one frame.
@@ -447,8 +459,8 @@ internal sealed class EditorApplication {
     void BuildUI() {
         ImGuiIOPtr io = ImGui.GetIO();
 
-        if (maximizedViewport && ImGui.IsKeyPressed(ImGuiKey.Escape))
-            maximizedViewport = false;
+        if (maximizedPanel is not null && ImGui.IsKeyPressed(ImGuiKey.Escape))
+            maximizedPanel = null;
 
         // Any interaction is a "scene might have changed" signal for the always-refresh-off mode.
         if (ImGui.IsMouseClicked(ImGuiMouseButton.Left) || ImGui.IsMouseClicked(ImGuiMouseButton.Right) ||
@@ -462,11 +474,16 @@ internal sealed class EditorApplication {
         SysVec2 workPos = vp.WorkPos;
         SysVec2 workSize = vp.WorkSize;
 
-        // Fullscreen view: only the toolbar (for Play/Stop) + the viewport, nothing else (no docking).
-        if (maximizedViewport) {
+        // Fullscreen: only the toolbar (for Play/Stop) + the maximized panel, nothing else (no docking).
+        if (maximizedPanel is not null) {
             Panel("##toolbar", workPos, new SysVec2(workSize.X, toolbarH),
                 PanelFlags | ImGuiWindowFlags.NoTitleBar, ToolbarUI);
-            DrawMaximizedViewport(workPos + new SysVec2(0, toolbarH), new SysVec2(workSize.X, workSize.Y - toolbarH));
+            SysVec2 maxPos = workPos + new SysVec2(0, toolbarH);
+            SysVec2 maxSize = new(workSize.X, workSize.Y - toolbarH);
+            if (maximizedViewport)
+                DrawMaximizedViewport(maxPos, maxSize);
+            else
+                DrawMaximizedPanel(maximizedPanel, maxPos, maxSize);
             settings.Draw(S);
             profilerPanel.Draw(profiler, S);
             buildPanel.Draw(S);
@@ -513,24 +530,34 @@ internal sealed class EditorApplication {
         // Dockable panels — normal windows ImGui places into the dock tree. The Window-menu bools
         // double as each window's close-button state (passed by ref to Begin). Entities and Scene-
         // components are now separate dockable windows (were inner Hierarchy tabs).
-        if (showHierarchy && ImGui.Begin(EditorLayout.Entities, ref showHierarchy))
+        if (showHierarchy && ImGui.Begin(EditorLayout.Entities, ref showHierarchy)) {
+            MaximizePanelOnTitleDoubleClick(EditorLayout.Entities);
             hierarchy.DrawEntitiesContents();
+        }
         if (showHierarchy) ImGui.End();
 
-        if (showSceneComponents && ImGui.Begin(EditorLayout.SceneComponents, ref showSceneComponents))
+        if (showSceneComponents && ImGui.Begin(EditorLayout.SceneComponents, ref showSceneComponents)) {
+            MaximizePanelOnTitleDoubleClick(EditorLayout.SceneComponents);
             hierarchy.DrawSceneContents();
+        }
         if (showSceneComponents) ImGui.End();
 
-        if (showInspector && ImGui.Begin(EditorLayout.Inspector, ref showInspector))
+        if (showInspector && ImGui.Begin(EditorLayout.Inspector, ref showInspector)) {
+            MaximizePanelOnTitleDoubleClick(EditorLayout.Inspector);
             inspector.DrawContents();
+        }
         if (showInspector) ImGui.End();
 
-        if (showBottom && ImGui.Begin(EditorLayout.Assets, ref showBottom))
+        if (showBottom && ImGui.Begin(EditorLayout.Assets, ref showBottom)) {
+            MaximizePanelOnTitleDoubleClick(EditorLayout.Assets);
             assets.DrawContents();
+        }
         if (showBottom) ImGui.End();
 
-        if (showConsole && ImGui.Begin(EditorLayout.Console, ref showConsole))
+        if (showConsole && ImGui.Begin(EditorLayout.Console, ref showConsole)) {
+            MaximizePanelOnTitleDoubleClick(EditorLayout.Console);
             console.DrawContents();
+        }
         if (showConsole) ImGui.End();
 
         // Scene + Game are separate dockable windows (were inner viewport tabs).
@@ -947,12 +974,8 @@ internal sealed class EditorApplication {
         RightAlign(ImGui.CalcTextSize(statsLabel).X + pad2);
         ToggleIconButton($"statsbar{id}", statsLabel, ref showStats, "Statistics overlay");
 
-        // Maximize / restore the viewport (also double-click the view's dock tab, or Esc to restore).
-        string maxIcon = maximizedViewport ? EditorIcons.Minimize : EditorIcons.Maximize;
-        RightAlign(ImGui.CalcTextSize(maxIcon).X + pad2);
-        if (EditorIcons.GhostButton($"maxview{id}", maxIcon,
-                maximizedViewport ? "Restore (Esc)" : "Maximize viewport"))
-            maximizedViewport = !maximizedViewport;
+        // (The maximize BUTTON was removed — double-click any panel's tab to fullscreen it, Esc to
+        // restore. Works for every panel now, so a dedicated viewport button is redundant.)
 
         if (id == "scene") {
             EditorPrefs prefs = EditorPrefs.Current;
@@ -1018,18 +1041,42 @@ internal sealed class EditorApplication {
     // the hit band extends upward by ~2 frame heights to cover the dock tab; for a floating window it
     // covers the title bar. The horizontal span is the window width. Excludes the content area so a
     // double-click on the 3D image (gizmo/selection) never maximizes.
-    void MaximizeOnTitleDoubleClick() {
+    void MaximizeOnTitleDoubleClick() => MaximizePanelOnTitleDoubleClick(
+        gameViewFocused ? EditorLayout.GameView : EditorLayout.SceneView);
+
+    // Double-clicking a window's tab/title strip toggles fullscreen for THAT panel (works for every
+    // dockable panel now, not just the viewports). Call right after the panel's Begin. For a DOCKED
+    // window the tab bar sits ABOVE the content origin, so the hit band extends upward by ~1.4 frame
+    // heights; for a floating window it covers the title bar. Excludes the content area.
+    void MaximizePanelOnTitleDoubleClick(string panelName) {
         if (!ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
             return;
         SysVec2 mn = ImGui.GetWindowPos();
         float w = ImGui.GetWindowSize().X;
         float tabH = ImGui.GetFrameHeight() * 1.4f;
         SysVec2 mouse = ImGui.GetIO().MousePos;
-        // Band: from a bit above the content top (the dock tab) down to the content top.
         bool overTab = mouse.X >= mn.X && mouse.X <= mn.X + w &&
                        mouse.Y >= mn.Y - tabH && mouse.Y <= mn.Y + 2f;
         if (overTab)
-            maximizedViewport = !maximizedViewport;
+            maximizedPanel = maximizedPanel == panelName ? null : panelName;
+    }
+
+    // Draws one panel filling the whole work area while maximized (anything except the viewports,
+    // which take DrawMaximizedViewport). Routes by the panel's layout name to its contents.
+    void DrawMaximizedPanel(string name, SysVec2 pos, SysVec2 size) {
+        ImGui.SetNextWindowPos(pos);
+        ImGui.SetNextWindowSize(size);
+        const ImGuiWindowFlags flags = ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove |
+            ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking;
+        if (ImGui.Begin(name, flags)) {
+            MaximizePanelOnTitleDoubleClick(name); // double-click its title again to restore
+            if (name == EditorLayout.Entities) hierarchy.DrawEntitiesContents();
+            else if (name == EditorLayout.SceneComponents) hierarchy.DrawSceneContents();
+            else if (name == EditorLayout.Inspector) inspector.DrawContents();
+            else if (name == EditorLayout.Assets) assets.DrawContents();
+            else if (name == EditorLayout.Console) console.DrawContents();
+        }
+        ImGui.End();
     }
 
     // Scene and Game are now SEPARATE dockable windows (default-tabbed together in the center dock
