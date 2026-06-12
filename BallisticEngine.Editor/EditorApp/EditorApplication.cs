@@ -388,6 +388,42 @@ internal sealed class EditorApplication {
 
         // Exponential moving average so the value is readable.
         editorCpuMs = editorCpuMs * 0.9f + (float)frameWatch.Elapsed.TotalMilliseconds * 0.1f;
+
+        // IDLE THROTTLE: when nothing is happening — not playing, no scene render, no mouse/keyboard
+        // activity, no open popup — there's no point spinning ImGui at hundreds of FPS (wasted CPU/GPU/
+        // battery for an identical frame). Drop to a low idle cap; snap back to full the instant the
+        // user does anything. Skipped when the user picked an explicit FPS cap below the idle rate.
+        UpdateIdleThrottle(renderScene, delta);
+    }
+
+    // ---- Idle frame throttle -------------------------------------------------
+    const int IdleFps = 30;          // frame cap while the editor is idle
+    double idleSeconds;              // time since the last activity (0 = active)
+
+    void UpdateIdleThrottle(bool renderedScene, double delta) {
+        ImGuiIOPtr io = ImGui.GetIO();
+        bool active = renderedScene || SceneManager.IsPlaying ||
+                      io.WantTextInput ||                         // typing in a field
+                      io.MouseDown[0] || io.MouseDown[1] || io.MouseDown[2] || // any mouse button held
+                      Math.Abs(io.MouseDelta.X) > 0.1f || Math.Abs(io.MouseDelta.Y) > 0.1f || // mouse moving
+                      io.MouseWheel != 0f ||                      // scrolling
+                      ImGui.IsAnyItemActive() ||                  // dragging a slider, etc.
+                      ImGui.IsPopupOpen("", ImGuiPopupFlags.AnyPopupId | ImGuiPopupFlags.AnyPopupLevel);
+
+        idleSeconds = active ? 0 : idleSeconds + delta;
+
+        // A short grace period after activity keeps interactions smooth (tooltips, hover fades) before
+        // dropping to the idle cap. The user's explicit cap still wins if it's already lower.
+        int userCap = EditorPrefs.Current.FrameRateLimit;
+        bool throttle = idleSeconds > 0.4 && (userCap <= 0 || userCap > IdleFps);
+        double targetFreq = throttle ? IdleFps : (userCap <= 0 ? 0 : userCap);
+        if (Math.Abs(window.UpdateFrequency - targetFreq) > 0.5) {
+            window.UpdateFrequency = targetFreq;
+            // VSync must be off for a positive cap to take effect (matches ApplyFrameRateLimit).
+            window.VSync = targetFreq > 0
+                ? OpenTK.Windowing.Common.VSyncMode.Off
+                : OpenTK.Windowing.Common.VSyncMode.Adaptive;
+        }
     }
 
     void MarkSceneDirty() => forceFrames = 3;

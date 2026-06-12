@@ -56,11 +56,6 @@ public sealed class ColorUsageAttribute : Attribute {
     public ColorUsageAttribute(bool hdr = false) => Hdr = hdr;
 }
 
-// Parity marker only. The engine already serializes public mutable fields; this attribute exists so
-// component code reads like Unity's. It has no behaviour of its own in v1.
-[AttributeUsage(AttributeTargets.Field, Inherited = false)]
-public sealed class SerializeFieldAttribute : Attribute { }
-
 // Excludes the member from BOTH scene serialization and the inspector: runtime-only state exposed
 // as a public read/write property (e.g. Rigidbody.Velocity) that must never be authored into
 // .scene files. The opposite trade-off from [HideInInspector], which keeps serialization.
