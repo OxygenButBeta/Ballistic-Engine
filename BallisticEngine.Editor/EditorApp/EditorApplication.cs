@@ -1220,6 +1220,15 @@ internal sealed class EditorApplication {
         ImGui.Image(Tex(Renderer.SceneColorTextureId), dispSize, uv0, uv1);
         SysVec2 imageMin = ImGui.GetItemRectMin();
         SysVec2 imageSize = dispSize;
+
+        // Drag assets from the browser straight onto the 3D view (Unity parity): model/prefab → spawn,
+        // script → entity-with-component, placed in front of the camera. Previously only the hierarchy
+        // and inspector accepted asset drops, so dropping onto the viewport did nothing.
+        if (ImGui.BeginDragDropTarget()) {
+            if (hierarchy.DropAssetsIntoScene())
+                MarkSceneDirty();
+            ImGui.EndDragDropTarget();
+        }
         // Hairline frame so the rendered image reads as a deliberate surface, not a raw blit.
         ImGui.GetWindowDrawList().AddRect(imageMin, imageMin + imageSize,
             ImGui.GetColorU32(new SysVec4(1, 1, 1, 0.06f)));

@@ -412,6 +412,20 @@ internal sealed class HierarchyPanel {
             state.Select(entity);
     }
 
+    // Drop target for the SCENE VIEW: call inside a BeginDragDropTarget/EndDragDropTarget block over
+    // the viewport image. Accepts the same asset payload the hierarchy does (model → instantiate,
+    // prefab → instantiate, script → entity-with-component), so assets can be dragged straight into the
+    // 3D view instead of only onto the hierarchy/inspector. Returns true if something was instantiated.
+    public bool DropAssetsIntoScene() {
+        Scene scene = SceneManager.GetCurrentScene();
+        if (scene is null || !AcceptAssetDrop(out List<Guid> droppedAssets))
+            return false;
+        InstantiateModels(scene, droppedAssets);
+        InstantiatePrefabs(droppedAssets);
+        CreateEntitiesFromScripts(scene, droppedAssets);
+        return true;
+    }
+
     void CreateEntitiesFromScripts(Scene scene, List<Guid> guids) {
         Entity last = null;
         foreach (Guid guid in guids) {
