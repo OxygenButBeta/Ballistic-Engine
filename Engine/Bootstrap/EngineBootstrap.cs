@@ -36,6 +36,11 @@ public sealed class EngineBootstrap {
 
         Project = BallisticProject.Open(projectPath);
 
+        // Structured log mirror for agents/tools: Library/Logs/engine.jsonl (editable projects
+        // only — a shipped player must not write into its install folder).
+        if (!playerMode)
+            JsonlLog.Start(Path.Combine(Project.LibraryPath, "Logs", "engine.jsonl"));
+
         // Load the project's C# game scripts. In the editor/dev runtime this compiles via `dotnet build`
         // first; in a shipped player the SDK may be absent, so load the pre-built GameScripts.dll as-is.
         // Null when the project has no scripts or they failed to compile (errors are in the log).
