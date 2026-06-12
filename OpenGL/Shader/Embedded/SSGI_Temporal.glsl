@@ -1,7 +1,8 @@
 #version 330 core
 
 in vec2 TexCoords;
-out vec4 FragColor; // rgb = accumulated GI, a = history length (frames, for the denoiser)
+layout(location = 0) out vec4 FragColor;  // rgb = accumulated GI, a = history length (for the denoiser)
+layout(location = 1) out float ViewDepth; // current view-space linear depth -> next frame's historyDepth
 
 // Temporal accumulation: the single biggest noise win. This frame's raw gather is a noisy
 // 1-spp-ish estimate; over many frames the noise averages to the true value. We reproject
@@ -12,6 +13,7 @@ out vec4 FragColor; // rgb = accumulated GI, a = history length (frames, for the
 
 uniform sampler2D currentGI;      // this frame's raw gather (noisy)
 uniform sampler2D historyGI;      // last frame's accumulated result (rgb) + history len (a)
+uniform sampler2D historyDepth;   // last frame's view-space linear depth (for disocclusion)
 uniform sampler2D depthTexture;
 uniform sampler2D normalTexture;
 
@@ -21,12 +23,17 @@ uniform mat4 PrevViewProjection;  // last frame's world -> clip
 uniform bool HasHistory;          // false on the first frame / after a resize
 uniform float MaxHistory;         // cap on accumulated frames (higher = smoother, laggier)
 
-vec3 WorldPos(vec2 uv) {
+// View-space position from a depth sample (before the world transform). Reused for both the
+// world position (temporal reprojection) and the view-space Z (disocclusion + the stored depth).
+vec3 ViewPos(vec2 uv) {
     float depth = texture(depthTexture, uv).r;
     vec4 ndc = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
     vec4 view = InvProjection * ndc;
-    view /= view.w;
-    return (InvViewMatrix * vec4(view.xyz, 1.0)).xyz;
+    return view.xyz / view.w;
+}
+
+vec3 WorldPos(vec2 uv) {
+    return (InvViewMatrix * vec4(ViewPos(uv), 1.0)).xyz;
 }
 
 // NaN/Inf -> 0. A bad value in the accumulated history is the worst kind: the EMA carries it
@@ -43,6 +50,10 @@ void main() {
     current.rgb = Sanitize(current.rgb);
     float depth = texture(depthTexture, TexCoords).r;
 
+    // Current view-space Z (negative, looking down -Z). Stored for next frame's disocclusion test.
+    float viewZ = ViewPos(TexCoords).z;
+    ViewDepth = viewZ;
+
     // Sky: nothing to accumulate.
     if (depth >= 1.0) {
         FragColor = vec4(current.rgb, 1.0);
@@ -57,6 +68,22 @@ void main() {
     // Off-screen last frame, or no history yet: start fresh.
     bool valid = HasHistory && prevClip.w > 0.0 &&
                  prevUV.x >= 0.0 && prevUV.x <= 1.0 && prevUV.y >= 0.0 && prevUV.y <= 1.0;
+
+    // DEPTH-BASED DISOCCLUSION REJECTION. Reprojecting by UV alone grabs whatever surface sat at
+    // prevUV last frame — at a silhouette under camera motion that is a DIFFERENT surface (the
+    // background behind a foreground edge, or vice-versa). Accepting it makes the colour clamp
+    // flip-flop between accept (ghost smear) and reject (raw 1-spp speckle bleeds through) — the
+    // "weirdly noisy" salt-and-pepper. Test it: prevClip.w is this world point's view-depth AS OF
+    // last frame (clip.w == -viewZ_prev for a perspective proj); historyDepth stores the view-Z
+    // that was ACTUALLY at prevUV last frame. If they disagree beyond a depth-relative tolerance,
+    // prevUV showed a different surface — reject the history and start this pixel fresh.
+    if (valid) {
+        float expectedPrevZ = -prevClip.w;                  // clip.w = -viewZ for perspective
+        float storedPrevZ = texture(historyDepth, prevUV).r;
+        float tol = max(0.05 * abs(expectedPrevZ), 0.05);   // 5% of depth, min 5cm
+        if (abs(storedPrevZ - expectedPrevZ) > tol)
+            valid = false;
+    }
 
     if (!valid) {
         FragColor = vec4(current.rgb, 1.0);

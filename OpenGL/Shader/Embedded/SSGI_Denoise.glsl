@@ -83,5 +83,10 @@ void main() {
     }
 
     vec3 denoised = wSum > 1e-4 ? sum / wSum : centre.rgb;
+    // Scrub any NaN/Inf a contaminated tap could have introduced, so the speckle can't reach the
+    // combine (and the temporal history, which is read pre-denoise, already sanitizes separately).
+    denoised = mix(denoised, vec3(0.0), vec3(isnan(denoised.x) || isinf(denoised.x),
+                                             isnan(denoised.y) || isinf(denoised.y),
+                                             isnan(denoised.z) || isinf(denoised.z)));
     FragColor = vec4(denoised, centre.a);
 }

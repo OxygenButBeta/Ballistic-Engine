@@ -37,7 +37,13 @@ const vec3 WARM = vec3(1.05, 1.00, 0.92);
 
 void main() {
     vec3 scene = texture(sceneTexture, TexCoords).rgb;
-    vec3 gi = max(texture(ssgiTexture, TexCoords).rgb, 0.0);
+    // NaN-safe: max(NaN, 0) is implementation-defined (often NaN), and a NaN here paints a black/
+    // white speckle that scene+add carries — the final gate against the "weirdly noisy" output.
+    vec3 gi = texture(ssgiTexture, TexCoords).rgb;
+    gi = mix(gi, vec3(0.0), vec3(isnan(gi.x) || isinf(gi.x),
+                                 isnan(gi.y) || isinf(gi.y),
+                                 isnan(gi.z) || isinf(gi.z)));
+    gi = max(gi, 0.0);
 
     float look = clamp(Look, 0.0, 1.0);
     float ao = ApplyAO ? clamp(texture(aoTexture, TexCoords).r, 0.0, 1.0) : 1.0;

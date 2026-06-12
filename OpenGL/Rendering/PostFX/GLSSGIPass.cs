@@ -27,6 +27,18 @@ public sealed class GLSSGIPass {
         { new(), new() },   // target 1: history A / B
     };
 
+    // View-space linear depth at each history pixel, ping-ponged in lockstep with historyTargets.
+    // The temporal pass writes it (MRT attachment 1) and reads last frame's to reject reprojected
+    // history at disocclusions (silhouettes under camera motion) — the salt-and-pepper fix.
+    readonly GLRenderTexture[,] historyDepthTargets = {
+        { new(), new() },
+        { new(), new() },
+    };
+
+    // A private FBO for the temporal MRT step (GI history + view-depth in one draw). The pooled
+    // GLRenderTexture is single-attachment, so the two history textures are attached here per frame.
+    int temporalFbo;
+
     readonly bool[] hasHistory = new bool[2];
     readonly int[] historyWrite = new int[2];   // which of the two history buffers to write
     readonly Matrix4[] prevViewProjection = new Matrix4[2];
@@ -63,18 +75,26 @@ public sealed class GLSSGIPass {
         int writeSlot = 1 - readSlot;
         GLRenderTexture historyRead = historyTargets[targetIndex, readSlot];
         GLRenderTexture historyWriteTex = historyTargets[targetIndex, writeSlot];
+        GLRenderTexture depthRead = historyDepthTargets[targetIndex, readSlot];
+        GLRenderTexture depthWriteTex = historyDepthTargets[targetIndex, writeSlot];
 
         // A resize invalidates the accumulated history (reprojection would smear).
         bool sizeKept = historyWriteTex.Ensure(halfW, halfH);
         historyRead.Ensure(halfW, halfH);
+        depthWriteTex.Ensure(halfW, halfH);
+        depthRead.Ensure(halfW, halfH);
         if (!sizeKept)
             hasHistory[targetIndex] = false;
 
         // The march samples historyRead for multi-bounce BEFORE the temporal pass validates
-        // it; a freshly-allocated texture holds undefined memory, so clear it once.
+        // it; a freshly-allocated texture holds undefined memory, so clear it once. The depth
+        // history is cleared to a far value so the first frame's disocclusion test rejects cleanly.
         if (!hasHistory[targetIndex]) {
             historyRead.BindAsTarget();
             GL.ClearColor(0f, 0f, 0f, 1f);
+            GL.Clear(ClearBufferMask.ColorBufferBit);
+            depthRead.BindAsTarget();
+            GL.ClearColor(-1e9f, 0f, 0f, 1f); // far view-Z (negative) so nothing matches it
             GL.Clear(ClearBufferMask.ColorBufferBit);
         }
 
@@ -116,13 +136,23 @@ public sealed class GLSSGIPass {
         marchShader.SetFloat("BounceBoost", Math.Max(fx.SsgiBounceBoost, 0f));
         GLBufferUtilities.DrawFullscreenQuad();
 
-        // ---- 2. Temporal accumulate (writes the new history) ----
-        historyWriteTex.BindAsTarget();
+        // ---- 2. Temporal accumulate (writes the new history GI + view-depth via MRT) ----
+        if (temporalFbo == 0)
+            temporalFbo = GL.GenFramebuffer();
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, temporalFbo);
+        GL.Viewport(0, 0, halfW, halfH);
+        GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
+            TextureTarget.Texture2D, historyWriteTex.Texture, 0);
+        GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment1,
+            TextureTarget.Texture2D, depthWriteTex.Texture, 0);
+        GL.DrawBuffers(2, new[] { DrawBuffersEnum.ColorAttachment0, DrawBuffersEnum.ColorAttachment1 });
+
         temporalShader.Activate();
         BindTex(0, giTarget.Texture, temporalShader, "currentGI");
         BindTex(1, historyRead.Texture, temporalShader, "historyGI");
         BindTex(2, depthTexture, temporalShader, "depthTexture");
         BindTex(3, normalTexture, temporalShader, "normalTexture");
+        BindTex(4, depthRead.Texture, temporalShader, "historyDepth");
         temporalShader.SetMatrix4("InvProjection", ref invProjectionNoJitter);
         temporalShader.SetMatrix4("InvViewMatrix", ref invView);
         temporalShader.SetMatrix4("PrevViewProjection", ref prevViewProjection[targetIndex]);
@@ -132,6 +162,11 @@ public sealed class GLSSGIPass {
         float look = Math.Clamp(fx.SsgiLook, 0f, 1f);
         temporalShader.SetFloat("MaxHistory", Math.Max(fx.SsgiMaxHistory, 1f) * (1f + look));
         GLBufferUtilities.DrawFullscreenQuad();
+
+        // Restore single-target draw state for the subsequent denoise/combine passes.
+        GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment1,
+            TextureTarget.Texture2D, 0, 0);
+        GL.DrawBuffer(DrawBufferMode.ColorAttachment0);
 
         // ---- 3. Spatial denoise: a TWO-ITERATION a-trous wavelet cascade (SVGF-style) ----
         // One pass over a sparse 4-ray-at-half-res signal leaves low-frequency blotches - the
