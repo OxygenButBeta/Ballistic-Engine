@@ -28,6 +28,10 @@ internal sealed class EditorApplication {
 
     readonly HierarchyPanel hierarchy;
     readonly InspectorPanel inspector;
+    // A SECOND inspector window (Window > Inspector (2)). Same panel, its own lock — pin one object
+    // here and keep inspecting others in the main inspector (Unity's "open a second Inspector").
+    readonly InspectorPanel inspector2;
+    bool showInspector2;
     readonly AssetBrowserPanel assets;
     readonly ConsolePanel console = new();
     readonly StatsPanel stats = new();
@@ -105,6 +109,7 @@ internal sealed class EditorApplication {
         editorInput = new EditorInput(window);
         hierarchy = new HierarchyPanel(editorState);
         inspector = new InspectorPanel(editorState);
+        inspector2 = new InspectorPanel(editorState);
         assets = new AssetBrowserPanel(editorState, () => imgui.Scale);
         assets.RequestScriptRebuild = RebuildScripts;
         hierarchy.CurrentAssetFolder = () => assets.CurrentFolder;
@@ -601,6 +606,13 @@ internal sealed class EditorApplication {
         }
         if (showInspector) ImGui.End();
 
+        // Optional second inspector (its own lock state). Hidden until opened from the Window menu.
+        if (showInspector2 && ImGui.Begin($"Inspector (2)###Inspector2", ref showInspector2)) {
+            MaximizePanelOnTitleDoubleClick("Inspector (2)###Inspector2");
+            inspector2.DrawContents();
+        }
+        if (showInspector2) ImGui.End();
+
         if (showBottom && ImGui.Begin(EditorLayout.Assets, ref showBottom)) {
             MaximizePanelOnTitleDoubleClick(EditorLayout.Assets);
             assets.DrawContents();
@@ -669,6 +681,7 @@ internal sealed class EditorApplication {
             ImGui.MenuItem("Entities", (string)null, ref showHierarchy);
             ImGui.MenuItem("Scene Components", (string)null, ref showSceneComponents);
             ImGui.MenuItem("Inspector", (string)null, ref showInspector);
+            ImGui.MenuItem("Inspector (2)", (string)null, ref showInspector2);
             ImGui.MenuItem("Assets", (string)null, ref showBottom);
             ImGui.MenuItem("Console", (string)null, ref showConsole);
             ImGui.MenuItem("Statistics", (string)null, ref showStats);
