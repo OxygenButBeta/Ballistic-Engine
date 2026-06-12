@@ -24,6 +24,11 @@ internal static class AsyncAssetImport {
     static volatile string currentFile;
     static int completed, total;   // import-stage counts, for a determinate progress bar
 
+    // Fires on the MAIN thread after EVERY completed refresh (after the per-request onFinished), so
+    // global post-import work — prefab propagation to live instances — runs without each caller wiring
+    // it. Kept separate from onFinished, which is per-request.
+    public static event Action AfterRefresh;
+
     public static bool IsBusy => busy;
     public static string Status => status;
 
@@ -130,6 +135,15 @@ internal static class AsyncAssetImport {
         }
         catch (Exception exception) {
             Debugging.LogError($"Post-import refresh step failed: {exception.Message}");
+        }
+
+        // A refresh just completed and its per-request callback ran — fire the global AfterRefresh so
+        // prefab propagation (and any future global post-import work) runs once per refresh.
+        try {
+            AfterRefresh?.Invoke();
+        }
+        catch (Exception exception) {
+            Debugging.LogError($"Post-import AfterRefresh step failed: {exception.Message}");
         }
     }
 

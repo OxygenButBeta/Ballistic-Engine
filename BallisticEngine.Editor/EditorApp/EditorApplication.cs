@@ -121,6 +121,10 @@ internal sealed class EditorApplication {
 
         Renderer.PresentToScreen = false;
 
+        // After any asset refresh, propagate .prefab edits into live prefab instances (overrides
+        // preserved). Idempotent: a refresh that didn't change a prefab rebuilds nothing.
+        AsyncAssetImport.AfterRefresh += PrefabPropagation.PropagateAll;
+
         // Files dragged from the OS onto the editor window import into the browser's folder.
         window.FileDrop += e => ImportDroppedFiles(e.FileNames);
 
