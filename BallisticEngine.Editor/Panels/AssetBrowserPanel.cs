@@ -187,6 +187,7 @@ internal sealed class AssetBrowserPanel {
     Action newAssetPostCreate;            // e.g. RequestScriptRebuild; runs before the refresh
 
     string pendingDefaultName = "";   // applied to newAssetName ON the popup-opening frame (see below)
+    bool focusNewAssetName;           // one-shot: focus the name field only on the first open frame
 
     // Arms the generic prompt. content is null for a folder. postCreate runs after the file is written.
     void PromptNewAsset(string kind, string defaultName, string ext, Func<string, string> content,
@@ -202,10 +203,8 @@ internal sealed class AssetBrowserPanel {
     void DrawNewAssetPrompt() {
         if (openNewAssetPrompt) {
             openNewAssetPrompt = false;
-            // Reset the buffer ON THE SAME FRAME as OpenPopup (the script prompt does this and works).
-            // The Hexa.NET InputText ref-string binding drops edits when the string was assigned a frame
-            // EARLIER (in PromptNewAsset) — so it must be re-assigned here, not there.
             newAssetName = pendingDefaultName;
+            focusNewAssetName = true;   // focus the field on the first drawn frame only (see below)
             ImGui.OpenPopup("##newasset");
         }
 
@@ -225,8 +224,13 @@ internal sealed class AssetBrowserPanel {
         ImGui.Separator();
         ImGui.Spacing();
         ImGui.TextUnformatted("Name");
-        if (ImGui.IsWindowAppearing())
+        // Focus ONLY on the first frame the popup is open. IsWindowAppearing can re-fire (AlwaysAutoResize
+        // relayouts the modal), and re-grabbing focus every frame was resetting the input -> typed text
+        // never stuck. A one-shot flag avoids that.
+        if (focusNewAssetName) {
+            focusNewAssetName = false;
             ImGui.SetKeyboardFocusHere();
+        }
         ImGui.SetNextItemWidth(300);
         bool enter = ImGui.InputText("##newassetname", ref newAssetName, 96, ImGuiInputTextFlags.EnterReturnsTrue);
 
