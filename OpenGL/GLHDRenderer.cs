@@ -1010,15 +1010,25 @@ void main() {
     // without this the entire scene draws every frame regardless of camera direction. Per-SUBMESH
     // renderers (SubMeshIndex >= 0) are already culled whole and never enter this map.
     readonly Dictionary<IStaticMeshRenderer, bool[]> wholeMeshSubmeshVisible = new();
+    // Cached per-submesh WORLD AABBs for whole-mesh renderers, recomputed each frame by
+    // ComputeSubmeshVisibility (camera-independent), reused by the shadow pass to cull each submesh
+    // against the per-cascade LIGHT frustum (so off-camera-but-in-cascade submeshes still cast).
+    readonly Dictionary<IStaticMeshRenderer, (Vector3[] Min, Vector3[] Max)> wholeMeshSubmeshAabb = new();
     readonly Vector4[] submeshCullPlanes = new Vector4[6];
+    readonly Vector4[] shadowSubmeshPlanes = new Vector4[6];
 
-    // Computes the per-submesh visibility mask for a whole-mesh renderer against the main view frustum.
+    // Computes the per-submesh visibility mask (vs the main view frustum) AND caches per-submesh world
+    // AABBs (for the shadow pass) for a whole-mesh renderer.
     void ComputeSubmeshVisibility(IStaticMeshRenderer target) {
         Mesh mesh = target.SharedMesh;
         SubMeshData[] subs = mesh.SubMeshes;
         if (!wholeMeshSubmeshVisible.TryGetValue(target, out bool[] mask) || mask.Length != subs.Length) {
             mask = new bool[subs.Length];
             wholeMeshSubmeshVisible[target] = mask;
+        }
+        if (!wholeMeshSubmeshAabb.TryGetValue(target, out var aabb) || aabb.Min.Length != subs.Length) {
+            aabb = (new Vector3[subs.Length], new Vector3[subs.Length]);
+            wholeMeshSubmeshAabb[target] = aabb;
         }
 
         Matrix4 model = ModelMatrix(target, mesh);
@@ -1036,6 +1046,8 @@ void main() {
                 wMin = Vector3.ComponentMin(wMin, w);
                 wMax = Vector3.ComponentMax(wMax, w);
             }
+            aabb.Min[i] = wMin;
+            aabb.Max[i] = wMax;
             mask[i] = AabbInFrustum(submeshCullPlanes, wMin, wMax);
             if (!mask[i])
                 stats.SubMeshesCulled++;
@@ -1205,10 +1217,19 @@ void main() {
     // bind their bone SSBO so the shadow deforms with the animation; the caller re-activates
     // shadowDepthShader afterwards if it draws more static casters.
     void RenderShadowCasters(List<IStaticMeshRenderer> casters, ref Matrix4 lightSpaceMatrix) {
+        // Frustum of THIS cascade/face in light space — used to cull individual submeshes of a
+        // whole-mesh renderer that fall outside the light's frustum. Culling against the LIGHT frustum
+        // (not the camera) keeps the invariant: an off-camera submesh inside the cascade still casts.
+        ExtractFrustumPlanes(ref lightSpaceMatrix, shadowSubmeshPlanes);
+
         bool skinnedActive = false;
         foreach (IStaticMeshRenderer target in casters) {
             Mesh mesh = target.SharedMesh;
             Matrix4 worldMatrix = ModelMatrix(target, mesh);
+            // Per-submesh world AABBs for this whole-mesh renderer (cached in SplitRenderables), or
+            // null for per-submesh renderers / when the cache isn't populated -> draw all submeshes.
+            (Vector3[] Min, Vector3[] Max)? subAabb =
+                target.SubMeshIndex < 0 && wholeMeshSubmeshAabb.TryGetValue(target, out var a) ? a : null;
 
             bool skinned = target.IsSkinned && target.SkinningMatrices is { } sm && sm.Length > 0;
             StandardShader shader;
@@ -1239,9 +1260,14 @@ void main() {
             for (var i = first; i < end; i++) {
                 if (target.MaterialFor(i) is not { Transparent: false } material)
                     continue;
+                // Per-submesh frustum cull against THIS cascade's light frustum (whole-mesh renderers
+                // only). A submesh whose world AABB is wholly outside the cascade can't cast into it.
+                if (subAabb is { } sa && (uint)i < (uint)sa.Min.Length &&
+                    !AabbInFrustum(shadowSubmeshPlanes, sa.Min[i], sa.Max[i]))
+                    continue;
 
                 // Cutout casters: alpha-test the depth pass so leaves shadow as leaves,
-                // not as full quads — and skip culling, since cards are single-sided.
+                // not as full quads — and skip backface culling, since cards are single-sided.
                 var cutout = material.Cutout && material.Diffuse is not null;
                 shader.SetBool("AlphaCutout", cutout);
                 if (cutout) {
