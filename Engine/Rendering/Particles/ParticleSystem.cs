@@ -162,6 +162,16 @@ public class ParticleSystem : Behaviour {
             Spawn();
     }
 
+    // Kills all live particles and resets emission timing (Unity's ParticleSystem.Clear). Used by the
+    // editor's restart button and by scripts that want a clean slate (e.g. on respawn).
+    public void Clear() {
+        liveCount = 0;
+        emitAccumulator = 0f;
+        emitterAge = 0f;
+        cycleTime = 0f;
+        burstFiredThisCycle = false;
+    }
+
     protected internal override void OnAttach() {
         if (!RuntimeSet<ParticleSystem>.Contains(this))
             RuntimeSet<ParticleSystem>.Add(this);

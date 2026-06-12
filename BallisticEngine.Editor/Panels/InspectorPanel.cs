@@ -389,6 +389,12 @@ internal sealed class InspectorPanel {
             if (behaviour is Animator animator)
                 DrawAnimatorSection(animator);
 
+            if (behaviour is ParticleSystem particles)
+                DrawParticleSystemSection(particles);
+
+            if (behaviour is TrailRenderer trail)
+                DrawTrailRendererSection(trail);
+
             ImGui.Spacing();
         }
 
@@ -603,6 +609,39 @@ internal sealed class InspectorPanel {
 
     static bool animatorPreviewPlaying;
     static float animatorPreviewTime;
+
+    // ParticleSystem preview: it already animates live in the editor (AdvanceAll runs every editor
+    // frame), so this just adds a Restart (clear) + a one-shot Emit test + a live count, and keeps the
+    // viewport repainting while particles are alive so you see the motion.
+    void DrawParticleSystemSection(ParticleSystem particles) {
+        ImGui.Spacing();
+        ImGui.SeparatorText("Preview");
+
+        if (ImGui.Button($"{EditorIcons.Refresh}  Restart", new SysVec2(110, 0)))
+            particles.Clear();
+        ImGui.SameLine();
+        if (ImGui.Button($"{EditorIcons.Play}  Emit 50", new SysVec2(110, 0)))
+            particles.Emit(50);
+        ImGui.SameLine();
+        ImGui.TextDisabled($"{particles.LiveCount} live");
+
+        if (particles.LiveCount > 0)
+            state.MarkViewportDirty();
+    }
+
+    // TrailRenderer preview: also animates live in the editor; add a Clear + a live point count.
+    void DrawTrailRendererSection(TrailRenderer trail) {
+        ImGui.Spacing();
+        ImGui.SeparatorText("Preview");
+
+        if (ImGui.Button($"{EditorIcons.Refresh}  Clear", new SysVec2(110, 0)))
+            trail.Clear();
+        ImGui.SameLine();
+        ImGui.TextDisabled($"{trail.PointCount} points");
+
+        if (trail.PointCount > 0)
+            state.MarkViewportDirty();
+    }
 
     static void CreateProfileAsset(Entity entity, Volume volume) {
         var baseName = entity.Name is { Length: > 0 } entityName ? entityName : "Volume";
