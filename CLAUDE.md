@@ -287,7 +287,7 @@ loop returns or the process never exits.
 - `SampleProject/Assets/Default/Bistro_v5_2/` (1.6 GB test content) is **gitignored**
   pending a git-lfs decision; `Main.scene` references it, so it must exist locally.
 - Repo already tracks ~460 MB of binaries; git-lfs migration is an agreed follow-up.
-- Known half-finished: skybox shader as C# strings, editor shading-mode dropdown is UI-only
-  (renderer view modes not wired yet), synchronous asset refresh blocks the editor window on
-  big imports (no progress UI). SSGI's temporal pass still lacks depth-based disocclusion
-  rejection (history smears on fast motion until the color clamp catches up).
+- Known half-finished: skybox shader as C# strings. (RESOLVED since this note: the editor
+  shading-mode dropdown now drives real renderer debug views — Shaded/Wireframe/Normals/Depth;
+  asset refresh runs async off the render thread with a determinate progress overlay; SSGI's
+  temporal pass now has depth-based disocclusion rejection.)

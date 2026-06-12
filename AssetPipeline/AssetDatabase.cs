@@ -69,6 +69,13 @@ public static class AssetDatabase {
         set { if (pipeline is not null) pipeline.Progress = value; }
     }
 
+    // Numeric import progress (completed, total) for a determinate progress bar. Same threading as
+    // ImportProgress (fires on the Refresh thread).
+    public static Action<int, int> ImportProgressCount {
+        get => pipeline?.ProgressCount;
+        set { if (pipeline is not null) pipeline.ProgressCount = value; }
+    }
+
     public static bool TryGetGuid(string assetPath, out Guid guid) =>
         pipeline.PathToGuid.TryGetValue(Normalize(assetPath), out guid);
 

@@ -24,7 +24,9 @@ internal static class BusyOverlay {
         if (!busy)
             return;
 
-        // Both the bake and the build show a determinate bar (and a taller card).
+        // Both the bake and the build show a determinate bar (and a taller card); an asset import
+        // is determinate once the import stage has reported its job count (Fraction >= 0).
+        var importDeterminate = AsyncAssetImport.IsBusy && AsyncAssetImport.Fraction >= 0f;
         var determinate = baking || buildingPlayer;
 
         ImGuiIOPtr io = ImGui.GetIO();
@@ -101,9 +103,11 @@ internal static class BusyOverlay {
 
         float barW = barMax.X - barMin.X;
         uint barFill = ImGui.GetColorU32(new SysVec4(0.26f, 0.55f, 0.95f, 1f));
-        if (determinate) {
-            // Determinate: the bake / build knows roughly how far along it is.
-            float progress = buildingPlayer ? BuildProgress.Fraction : IrradianceVolume.BakeProgress;
+        if (determinate || importDeterminate) {
+            // Determinate: the bake / build / import knows roughly how far along it is.
+            float progress = buildingPlayer ? BuildProgress.Fraction
+                : baking ? IrradianceVolume.BakeProgress
+                : AsyncAssetImport.Fraction;
             float fill = Math.Clamp(progress, 0f, 1f) * barW;
             if (fill > 1f)
                 draw.AddRectFilled(barMin, new SysVec2(barMin.X + fill, barMax.Y), barFill, barH * 0.5f);

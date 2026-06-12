@@ -36,6 +36,11 @@ public sealed class AssetImportPipeline {
     // runs on — the editor marshals it to the render thread itself.
     public Action<string> Progress { get; set; }
 
+    // Numeric counterpart to Progress: (completed, total) for the import stage, so the editor can
+    // draw a DETERMINATE progress bar instead of an endless indeterminate sweep. Best-effort
+    // (last-writer-wins under parallel import), same threading contract as Progress.
+    public Action<int, int> ProgressCount { get; set; }
+
     public AssetImportPipeline(BallisticProject project, IReadOnlyList<IAssetImporter> customImporters = null) {
         this.project = project;
         importers = customImporters is not null
@@ -346,7 +351,9 @@ public sealed class AssetImportPipeline {
         Parallel.For(0, jobs.Count, options, i => {
             ImportJob job = jobs[i];
             // Progress is best-effort (last writer wins) — fine for a "currently importing X" label.
-            Progress?.Invoke($"{Path.GetFileName(job.AssetPath)} ({Interlocked.Increment(ref done)}/{jobs.Count})");
+            int completed = Interlocked.Increment(ref done);
+            Progress?.Invoke($"{Path.GetFileName(job.AssetPath)} ({completed}/{jobs.Count})");
+            ProgressCount?.Invoke(completed, jobs.Count);
 
             try {
                 var importWatch = Stopwatch.StartNew();
