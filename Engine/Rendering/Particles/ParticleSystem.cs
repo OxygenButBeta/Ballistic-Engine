@@ -383,4 +383,34 @@ public class ParticleSystem : Behaviour {
             _ => t,
         };
     }
+
+    // Selected: draw the emission shape so you can see where particles spawn + which way they head,
+    // in world space (emitter transform). Cone = apex + cone along +Y; Sphere/Hemisphere = a sphere;
+    // Box = a wire box; Circle = a flat ring (approximated by a thin box on the XZ plane).
+    public override void OnDrawGizmosSelected(IGizmos gizmos) {
+        gizmos.Color = new Vector3(1f, 0.7f, 0.2f);
+        Vector3 origin = transform.WorldPosition;
+        Quaternion rot = transform.WorldRotation;
+        Vector3 up = rot * Vector3.UnitY;
+
+        switch (Shape) {
+            case EmissionShape.Cone:
+                gizmos.DrawWireCone(origin, up * MathF.Max(StartSpeed, 1f),
+                    MathHelper.Clamp(SpreadAngle, 1f, 89f));
+                break;
+            case EmissionShape.Sphere:
+                gizmos.DrawWireSphere(origin, MathF.Max(ShapeRadius, 0.05f));
+                break;
+            case EmissionShape.Hemisphere:
+                gizmos.DrawWireSphere(origin, MathF.Max(ShapeRadius, 0.05f));
+                gizmos.DrawRay(origin, up * ShapeRadius);
+                break;
+            case EmissionShape.Box:
+                gizmos.DrawWireCube(origin, BoxSize * 2f, rot);
+                break;
+            case EmissionShape.Circle:
+                gizmos.DrawWireCube(origin, new Vector3(ShapeRadius * 2f, 0.02f, ShapeRadius * 2f), rot);
+                break;
+        }
+    }
 }

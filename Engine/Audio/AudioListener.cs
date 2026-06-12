@@ -54,4 +54,10 @@ public class AudioListener : Behaviour {
         lastPosition = position;
         hasLast = true;
     }
+
+    // A camera-style marker — the listener is "the ears", usually on the camera.
+    public override void OnDrawGizmos(IGizmos gizmos) {
+        gizmos.Color = new Vector3(0.4f, 0.8f, 1f);
+        gizmos.DrawIcon(transform.WorldPosition, GizmoIcon.Camera);
+    }
 }

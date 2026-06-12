@@ -103,4 +103,23 @@ public class AudioSource : Behaviour {
             voice.Position = now;
         }
     }
+
+    // Always-on marker so an audio emitter is findable in the scene view.
+    public override void OnDrawGizmos(IGizmos gizmos) {
+        gizmos.Color = new Vector3(0.4f, 0.8f, 1f);
+        gizmos.DrawIcon(transform.WorldPosition, GizmoIcon.Light);
+    }
+
+    // Selected: the 3D falloff range — inner sphere (full volume within MinDistance) and outer sphere
+    // (silent beyond MaxDistance), Unity-style, so you can see where the sound is audible. 2D sources
+    // ignore distance, so only the marker shows.
+    public override void OnDrawGizmosSelected(IGizmos gizmos) {
+        if (!Spatial)
+            return;
+        Vector3 p = transform.WorldPosition;
+        gizmos.Color = new Vector3(0.4f, 0.8f, 1f);
+        gizmos.DrawWireSphere(p, MinDistance);
+        gizmos.Color = new Vector3(0.2f, 0.4f, 0.7f);
+        gizmos.DrawWireSphere(p, MaxDistance);
+    }
 }
