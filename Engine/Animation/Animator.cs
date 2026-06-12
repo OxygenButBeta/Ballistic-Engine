@@ -48,6 +48,34 @@ public class Animator : Behaviour {
     Vector3[] posA, posB, scaleA, scaleB;
     Quaternion[] rotA, rotB;
 
+    // ---- Animation events (Unity's AnimationEvent) ---------------------------
+    // Keyed moments in the clip's timeline that fire a callback — footsteps, weapon-fire sync, VFX
+    // triggers. A script subscribes to OnEvent and adds events by time + name. Runtime-only (the
+    // scene serializer doesn't round-trip a List<struct>; events are wired by script, like Unity's
+    // programmatic AddEvent / the clip-baked events a future importer could add).
+
+    public readonly record struct AnimationEvent(float Time, string Name);
+
+    // Fired with the event's Name when playback crosses its Time. Subscribe in OnBegin.
+    public event Action<string> OnEvent;
+
+    readonly List<AnimationEvent> events = new();
+
+    // Adds an event at `time` seconds into the clip (kept sorted by time).
+    public void AddEvent(float time, string name) {
+        var e = new AnimationEvent(MathF.Max(0f, time), name);
+        int i = events.FindIndex(x => x.Time > e.Time);
+        if (i < 0) events.Add(e);
+        else events.Insert(i, e);
+    }
+
+    public void ClearEvents() => events.Clear();
+    public int EventCount => events.Count;
+
+    // The most recently fired event's name + the time it fired (for the editor inspector / debugging).
+    [NotSerialized]
+    public string LastFiredEvent { get; private set; }
+
     protected internal override void OnBegin() {
         renderer = GetComponent<SkinnedMeshRenderer>();
         if (PlayOnAwake && Clip is not null)
@@ -108,12 +136,46 @@ public class Animator : Behaviour {
         int boneCount = skeleton.BoneCount;
         EnsureScratch(skeleton, boneCount);
 
+        float prevTime = activeTime;
         activeTime += delta * Speed;
         Time = activeTime;
+
+        FireEventsBetween(prevTime, activeTime, activeClip.DurationSeconds);
 
         // Sample the incoming/active clip to TRS.
         activeClip.SampleLocalTRS(activeTime, Loop, bindLocal, posB, rotB, scaleB);
         SolveAndApply(skeleton, boneCount, delta);
+    }
+
+    // Fires every event whose Time was crossed advancing from `from` to `to`. Loop-aware: when the
+    // clip wraps (to > duration while looping), the window is split [from, duration) + [0, wrapped) so
+    // events near the loop seam still fire exactly once per pass. Forward playback only (Speed >= 0);
+    // reverse playback skips events (v1).
+    void FireEventsBetween(float from, float to, float duration) {
+        if (events.Count == 0 || OnEvent is null || to <= from || duration <= 0f)
+            return;
+
+        if (Loop && to >= duration) {
+            float wrapped = to % duration;
+            FireWindow(from, duration);            // tail of this pass
+            // Any whole extra loops in one frame (huge dt) would each replay all events; cap at one.
+            FireWindow(0f, wrapped);               // head of the next pass
+            return;
+        }
+        FireWindow(from, to);
+    }
+
+    // Fires events in the half-open window [lo, hi). Inclusive of an event exactly at lo only when
+    // lo == 0 (the very first frame), so an event at t=0 isn't missed on the first pass.
+    void FireWindow(float lo, float hi) {
+        foreach (AnimationEvent e in events) {
+            bool inWindow = lo == 0f ? (e.Time >= lo && e.Time < hi) : (e.Time > lo && e.Time <= hi);
+            if (inWindow) {
+                LastFiredEvent = e.Name;
+                try { OnEvent?.Invoke(e.Name); }
+                catch (Exception ex) { Debugging.LogError($"Animation event '{e.Name}' handler threw: {ex}"); }
+            }
+        }
     }
 
     // Evaluates the serialized Clip at an absolute time and applies the pose — for EDITOR PREVIEW

@@ -605,6 +605,16 @@ internal sealed class InspectorPanel {
             animator.EvaluatePreview(animatorPreviewTime);
             state.MarkViewportDirty();
         }
+
+        // Animation events (script-driven). Show the count + the last fired event so you can confirm
+        // they're wired and firing in play mode.
+        if (animator.EventCount > 0) {
+            ImGui.Spacing();
+            ImGui.SeparatorText("Events");
+            ImGui.TextDisabled($"{animator.EventCount} event(s) registered");
+            if (!string.IsNullOrEmpty(animator.LastFiredEvent))
+                ImGui.TextDisabled($"Last fired: {animator.LastFiredEvent}");
+        }
     }
 
     static bool animatorPreviewPlaying;
