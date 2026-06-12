@@ -141,6 +141,101 @@ internal sealed class AssetBrowserPanel {
         }
 
         DrawGrid(folders, files, s);
+        DrawNewScriptPrompt();
+    }
+
+    // Unity-style "name it first" script creation: New Script opens a prompt for the class/file name,
+    // and ONLY on confirm is the .cs written (with that exact class name) and compiled. No more
+    // "NewScript.cs then rename" dance.
+    bool openNewScriptPrompt;
+    string newScriptName = "";
+
+    void DrawNewScriptPrompt() {
+        if (openNewScriptPrompt) {
+            openNewScriptPrompt = false;
+            newScriptName = "NewBehaviour";
+            ImGui.OpenPopup("##newscript");
+        }
+
+        // Center the modal (ImGuiViewport has no GetCenter in this binding — compute it).
+        ImGuiViewportPtr vp = ImGui.GetMainViewport();
+        SysVec2 center = new(vp.Pos.X + vp.Size.X * 0.5f, vp.Pos.Y + vp.Size.Y * 0.5f);
+        ImGui.SetNextWindowPos(center, ImGuiCond.Appearing, new SysVec2(0.5f, 0.5f));
+        if (!ImGui.BeginPopupModal("##newscript", ImGuiWindowFlags.AlwaysAutoResize))
+            return;
+
+        ImGui.TextUnformatted("New Script");
+        ImGui.Separator();
+        ImGui.TextDisabled("Class name (= file name):");
+        if (ImGui.IsWindowAppearing())
+            ImGui.SetKeyboardFocusHere();
+        ImGui.SetNextItemWidth(280);
+        bool enter = ImGui.InputText("##scriptname", ref newScriptName, 64, ImGuiInputTextFlags.EnterReturnsTrue);
+
+        string className = ScriptTemplates.ClassName(newScriptName.Trim());
+        bool valid = IsValidIdentifier(className);
+        if (!valid && newScriptName.Trim().Length > 0)
+            ImGui.TextColored(new SysVec4(1f, 0.5f, 0.4f, 1f), "Not a valid C# class name.");
+        else
+            ImGui.TextDisabled($"Creates {className}.cs : Behaviour");
+
+        ImGui.Spacing();
+        ImGui.BeginDisabled(!valid);
+        if (ImGui.Button("Create", new SysVec2(120, 0)) || (enter && valid)) {
+            CreateScriptNamed(className);
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.EndDisabled();
+        ImGui.SameLine();
+        if (ImGui.Button("Cancel", new SysVec2(120, 0)))
+            ImGui.CloseCurrentPopup();
+        ImGui.EndPopup();
+    }
+
+    // Folder icon that reflects whether the folder has CONTENT: a filled (open) folder for non-empty,
+    // a plain (thinner-tinted) folder for empty — so an empty folder reads differently at a glance
+    // (the single icon made every folder look empty). Cached per path+mtime to avoid a disk hit/frame.
+    (string icon, SysVec4 tint) FolderIcon(string folderPath) {
+        bool hasContent = FolderHasContent(folderPath);
+        SysVec4 full = new(0.95f, 0.78f, 0.42f, 1f);
+        SysVec4 empty = new(0.62f, 0.55f, 0.40f, 0.7f);
+        return hasContent ? (EditorIcons.FolderOpen, full) : (EditorIcons.Folder, empty);
+    }
+
+    readonly Dictionary<string, bool> folderContentCache = new();
+
+    bool FolderHasContent(string folderPath) {
+        if (folderContentCache.TryGetValue(folderPath, out bool cached))
+            return cached;
+        bool has = false;
+        try {
+            var abs = AssetDatabase.Project.ResolveAbsolute(folderPath);
+            // Any file (other than a lone .meta) or any subfolder = "has content".
+            has = Directory.EnumerateDirectories(abs).Any() ||
+                  Directory.EnumerateFiles(abs).Any(f => !f.EndsWith(".meta", StringComparison.OrdinalIgnoreCase));
+        }
+        catch { /* folder vanished mid-frame */ }
+        folderContentCache[folderPath] = has;
+        return has;
+    }
+
+    static bool IsValidIdentifier(string s) {
+        if (string.IsNullOrEmpty(s) || !(char.IsLetter(s[0]) || s[0] == '_'))
+            return false;
+        foreach (char c in s)
+            if (!char.IsLetterOrDigit(c) && c != '_')
+                return false;
+        return true;
+    }
+
+    // Writes <className>.cs with that class name and compiles it (Unity parity: the user named it
+    // up front, so the file + class agree immediately — no template-rename round-trip).
+    void CreateScriptNamed(string className) {
+        var absolute = UniquePath(Path.Combine(
+            AssetDatabase.Project.ResolveAbsolute(CurrentFolder), className + ".cs"));
+        File.WriteAllText(absolute, ScriptTemplates.Behaviour(Path.GetFileNameWithoutExtension(absolute)));
+        RequestScriptRebuild?.Invoke();
+        AsyncAssetImport.Request("Creating script...");
     }
 
     void DrawNavigationBar(float s) {
@@ -178,6 +273,7 @@ internal sealed class AssetBrowserPanel {
 
     void NavigateTo(string folderPath) {
         CurrentFolder = folderPath;
+        folderContentCache.Clear(); // folder contents may have changed since last visit
         revealPending = true;
     }
 
@@ -397,7 +493,7 @@ internal sealed class AssetBrowserPanel {
             if (ImGui.MenuItem($"{EditorIcons.Folder}  New Folder"))
                 CreateFolder();
             if (ImGui.MenuItem($"{EditorIcons.Code}  New Script"))
-                CreateScript();
+                openNewScriptPrompt = true;
             if (ImGui.MenuItem($"{EditorIcons.Color}  New Material"))
                 CreateMaterial();
             if (ImGui.MenuItem($"{EditorIcons.Home}  New Scene"))
@@ -478,7 +574,7 @@ internal sealed class AssetBrowserPanel {
             string name = Path.GetFileName(row.path);
             string ext = row.isFolder ? "" : Path.GetExtension(row.path).ToLowerInvariant();
             (string icon, SysVec4 tint) = row.isFolder
-                ? (EditorIcons.Folder, new SysVec4(0.95f, 0.78f, 0.42f, 1f))
+                ? FolderIcon(row.path)
                 : EditorIcons.ForAssetExtension(ext);
 
             bool selected = !row.isFolder && state.IsAssetSelected(row.guid);
