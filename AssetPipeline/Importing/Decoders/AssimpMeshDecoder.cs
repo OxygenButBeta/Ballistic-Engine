@@ -59,7 +59,11 @@ public static class AssimpMeshDecoder {
     // source material; splitByNodes=true emits one submesh per node mesh instead (named after
     // the node, carrying its world transform), so the editor can instantiate the model as one
     // entity per source object.
-    public static DecodedModel DecodeScene(string path, bool flipUVs = true, bool splitByNodes = false) {
+    // scaleFactor: explicit uniform scale baked into every vertex. <= 0 means AUTO — derive it from
+    // the file's own units (FBX UnitScaleFactor: cm-authored content like Megascans comes in 100x too
+    // big otherwise; this is Unity's default "Use File Scale" / 0.01 behavior, applied for real).
+    public static DecodedModel DecodeScene(string path, bool flipUVs = true, bool splitByNodes = false,
+        float scaleFactor = 0f) {
         AssimpContext context = new();
 
         PostProcessSteps steps = PostProcessSteps.Triangulate
@@ -74,6 +78,20 @@ public static class AssimpMeshDecoder {
         if (scene == null || scene.MeshCount == 0)
             throw new IOException($"Mesh import failed or no meshes found in '{path}'.");
 
+        // Convert the model's authoring units to engine meters. Auto mode reads the file's unit scale;
+        // an explicit positive scaleFactor overrides it. The factor seeds the root transform so it
+        // bakes uniformly into vertices AND node transforms (split-by-nodes children stay consistent).
+        float unitScale = scaleFactor > 0f ? scaleFactor : AutoUnitScale(path);
+        Matrix4 rootScale = Matrix4.CreateScale(unitScale);
+
+        // Z-UP FBX (photogrammetry/CAD exports — UpAxis=2 in the file's global settings): rotate
+        // -90° about X so up becomes +Y, matching what Unity's importer does. Without this every
+        // mesh lies tipped 90° relative to the transforms a converted Unity scene places it with
+        // (ground patches standing vertically like walls). Y-up FBX (UpAxis=1) is untouched.
+        if (Path.GetExtension(path).Equals(".fbx", StringComparison.OrdinalIgnoreCase) &&
+            FbxUnitScaleFactor.ReadUpAxis(path) == 2)
+            rootScale = Matrix4.CreateRotationX(-MathF.PI / 2f) * rootScale;
+
         // Builders in first-use order with the material index each submesh renders with.
         // Merged mode reuses one builder per material; split mode creates one per node mesh
         // and records the node hierarchy (pre-order, so a parent always precedes its children).
@@ -83,7 +101,11 @@ public static class AssimpMeshDecoder {
         var nodes = new List<MeshNodeData>();
 
         void Traverse(Node node, Matrix4 parentWorld, int parentIndex) {
-            Matrix4 world = ToOpenTK(node.Transform) * parentWorld;
+            // Fold the unit scale into the ROOT node's local transform (parentIndex == -1) so it bakes
+            // into vertices via the world chain AND into the stored hierarchy the editor instantiates
+            // from (children are relative to a now-scaled root). Non-root locals stay as authored.
+            Matrix4 local = parentIndex < 0 ? rootScale * ToOpenTK(node.Transform) : ToOpenTK(node.Transform);
+            Matrix4 world = local * parentWorld;
 
             var nodeIndex = -1;
             if (splitByNodes) {
@@ -91,7 +113,7 @@ public static class AssimpMeshDecoder {
                 // Normalize empty names to null — the artifact stores "" for none, so this
                 // keeps decode → write → read an exact round-trip.
                 nodes.Add(new MeshNodeData(string.IsNullOrEmpty(node.Name) ? null : node.Name,
-                    parentIndex, ToOpenTK(node.Transform)));
+                    parentIndex, local));
             }
 
             for (var n = 0; n < node.MeshIndices.Count; n++) {
@@ -148,6 +170,28 @@ public static class AssimpMeshDecoder {
         DecodedModel model = Combine(builders, nodes.ToArray());
         model.SubMeshMaterials = materials;
         return model;
+    }
+
+    // ---- Units -------------------------------------------------------------
+
+    // Derives the meters-per-authoring-unit factor from the file's own units. FBX's system unit is
+    // CENTIMETRES and the file records its scale in "UnitScaleFactor"; content authored in cm
+    // (Megascans, most DCC FBX exports) reads 1.0 and must be divided by 100 to land in engine
+    // metres — otherwise it imports 100x too big. Formats that are already metric (glTF/OBJ) -> 1
+    // (no change; byte-identical to the pre-units pipeline).
+    //
+    // AssimpNet 4.1.0 exposes no scene metadata, so we read UnitScaleFactor straight from the FBX
+    // (binary OR ASCII). On any parse failure we fall back to the cm default (0.01), which is correct
+    // for the overwhelming majority of FBX content and matches Unity's default behaviour.
+    static float AutoUnitScale(string path) {
+        var ext = Path.GetExtension(path).ToLowerInvariant();
+        if (ext != ".fbx")
+            return 1f; // glTF/OBJ/DAE are metric; leave untouched
+
+        double cmPerUnit = FbxUnitScaleFactor.Read(path) ?? 1.0;
+        if (cmPerUnit <= 0 || double.IsNaN(cmPerUnit) || double.IsInfinity(cmPerUnit))
+            cmPerUnit = 1.0;
+        return (float)(cmPerUnit / 100.0); // cm -> m
     }
 
     // ---- Materials ---------------------------------------------------------

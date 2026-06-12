@@ -407,14 +407,19 @@ float PointShadow(int slot, vec3 lightPos, float ndl)
 // ---------------- Normal map helper ----------------
 vec3 GetNormalFromMap(vec2 uv, vec3 geomNormal, mat3 TBN, float strength)
 {
-    vec3 n = texture(Normal, uv).rgb;
-    if (NormalFlipY) n.g = 1.0 - n.g;
-    vec3 tangentNormal = n * 2.0 - 1.0;
+    vec2 nxy = texture(Normal, uv).rg;
+    if (NormalFlipY) nxy.y = 1.0 - nxy.y;
+    // Reconstruct Z from XY rather than reading the blue channel: BC5-compressed normal maps store
+    // only X and Y (blue reads 0), and a tangent-space normal's Z is always the positive root anyway.
+    // This is identical to reading B for an uncompressed map whose Z was authored correctly, so it's
+    // safe for both the BC5 and the RGBA8-fallback paths.
+    vec2 xy = nxy * 2.0 - 1.0;
     // Scale the tangent-space XY (the bump tilt) by strength, glTF normalScale-style. This reads
     // far stronger than lerping the WORLD normal toward flat and allows strength > 1 to exaggerate
     // subtle maps past their authored amplitude (the old mix() form capped at the authored normal).
-    tangentNormal.xy *= max(strength, 0.0);
-    tangentNormal = normalize(tangentNormal);
+    xy *= max(strength, 0.0);
+    float z = sqrt(max(1.0 - dot(xy, xy), 0.0));
+    vec3 tangentNormal = normalize(vec3(xy, z));
     return normalize(TBN * tangentNormal);
 }
 

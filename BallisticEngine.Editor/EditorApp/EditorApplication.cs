@@ -61,6 +61,7 @@ internal sealed class EditorApplication {
     bool showStats;
     bool alwaysRefresh = EditorPrefs.Current.AlwaysRefresh;   // off = re-render only on change
     int forceFrames = 3;
+    bool wasLoadingScene;   // falling edge -> burst frames so auto-exposure converges after a load
     Matrix4 lastCameraMatrix = Matrix4.Identity;   // previous frame's editor-camera pose (idle-render trigger)
     SysVec2 pickPressPos;        // where LMB went down in the viewport (click-vs-drag test for picking)
     bool pickPressValid;         // the press began as a candidate select-click (not on a gizmo/handle)
@@ -155,9 +156,26 @@ internal sealed class EditorApplication {
         // script) re-checks the sources on the next update tick. The up-to-date fast path in
         // GameScripts makes this a cheap mtime scan when nothing changed.
         window.FocusedChanged += e => {
-            if (e.IsFocused)
+            if (e.IsFocused) {
                 scriptsRecheckPending = true;
+                // Force a full repaint on focus regain. With on-demand rendering the scene view is a
+                // cached offscreen texture; after an alt-tab (or minimise/restore) nothing is dirty,
+                // the camera hasn't moved and forceFrames is 0, so the scene FBO never re-renders and
+                // the whole present can come back BLACK (a stale/lost backbuffer on Windows). Re-arming
+                // forceFrames repaints the scene texture AND the backbuffer for the next few frames.
+                MarkSceneDirty();
+            }
         };
+        // A minimise/restore can also drop the surface without a focus toggle (e.g. restored by
+        // clicking the taskbar while already "focused"); repaint on un-minimise too.
+        window.Minimized += e => {
+            if (!e.IsMinimized)
+                MarkSceneDirty();
+        };
+        // GLFW raises Refresh whenever the OS says the window's contents need redrawing (uncovered,
+        // restored, moved between monitors). This is the canonical "your backbuffer is stale, repaint"
+        // signal — exactly the alt-tab-return case — so honour it directly.
+        window.Refresh += () => MarkSceneDirty();
 
         window.WindowState = WindowState.Maximized;
         window.OnResizeCallback += (w, h) => {
@@ -182,6 +200,16 @@ internal sealed class EditorApplication {
         // thread via RemoteCommandQueue.Pump() in OnRender. Engine-owned thread — survives script
         // hot-reload and play transitions.
         RemotePort.Start(editorState, bootstrap);
+
+        // Let the command port frame the Scene-view fly camera (the screenshot captures THAT view,
+        // not an HDCamera entity) — so an agent can position a shot. Runs on the main thread already.
+        RemoteHandlers.FocusCamera = (center, radius, dir) => {
+            if (dir.LengthSquared > 1e-6f)
+                editorCamera.LookDirection(dir);     // reorient first (e.g. 3/4 top view)
+            editorCamera.Focus(center, radius);
+            forceFrames = Math.Max(forceFrames, 45);  // burst so auto-exposure re-meters for the new view
+        };
+        RemoteHandlers.RequestRefresh = () => AsyncAssetImport.Request("Refreshing assets...", forceAll: true);
     }
 
     // A selection that can survive a scene rebuild: an entity by its (round-tripped) InstanceId, or a
@@ -381,6 +409,14 @@ internal sealed class EditorApplication {
             lastCameraMatrix = camMatrix;
             MarkSceneDirty();
         }
+        // Just-finished scene load: paint a burst of frames so AUTO-EXPOSURE can converge. Its meter
+        // is an async GPU readback (several frames latency) that snaps on the first target — without a
+        // burst the on-demand renderer would stop after a few frames and the scene stays at the stale
+        // EV (pitch black for a dim/interior/imported scene). Falling edge of IsLoading.
+        if (wasLoadingScene && !SceneCommands.IsLoading)
+            forceFrames = Math.Max(forceFrames, 45);
+        wasLoadingScene = SceneCommands.IsLoading;
+
         // A live game UIDocument animates per frame (tweens, pulses, loading), so the Game view must
         // keep repainting while one is active — otherwise on-demand rendering freezes the UI after the
         // initial forceFrames run out (it builds in the controller's OnAttach but never draws again).

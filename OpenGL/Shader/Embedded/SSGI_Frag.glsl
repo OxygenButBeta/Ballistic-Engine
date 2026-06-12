@@ -1,97 +1,95 @@
-#version 330 core
+#version 460 core
 
 in vec2 TexCoords;
 out vec4 FragColor; // rgb = gathered one-bounce irradiance, a = confidence (edge fade)
 
-// Screen-space global illumination: a coarse diffuse gather. For each pixel we shoot a few
-// cosine-weighted rays into the hemisphere around its normal and march them against the
-// depth buffer (the same march SSR uses). Where a ray hits geometry, the already-lit scene
-// color there is the radiance bouncing back toward this surface. The sunlit floor thus
-// lifts the shadowed column bases nearby - the directional fill a flat ambient can't give.
+// Screen-space global illumination - HORIZON GATHER WITH SECTOR VISIBILITY BITMASKS
+// (SSILVB, Therrien et al. 2023 - the technique class behind HTrace-style Unity GI).
 //
-// This pass only GATHERS; the noise it produces is cleaned by the temporal accumulation and
-// spatial denoise passes that run after it. Screen-space only: off-screen and occluded
-// surfaces contribute nothing, and the result fades out near the screen edges.
+// Instead of shooting a few stochastic hemisphere rays (noisy 1-spp signal, "first hit
+// wins", no occlusion ordering), each pixel integrates a small set of HORIZON SLICES:
+// for every slice direction we march the depth buffer both ways and maintain a 32-bit
+// occlusion bitmask over the hemisphere arc. Each sample occupies the angular sector
+// between its front face and an assumed back face (Thickness metres behind it); only
+// sectors it NEWLY occludes contribute its radiance. The result per slice is an ordered,
+// noise-free arc integral:
+//  - near occluders correctly block light from surfaces behind them (no scene-average veil)
+//  - thin geometry occludes thin sectors instead of everything behind it
+//  - the CLEAR sectors at the end are exactly the visible sky fraction, so the sky
+//    fallback is occlusion- and direction-aware instead of a flat exposure-like lift.
+// The temporal accumulation + a-trous denoise after this pass stay unchanged - they just
+// have far less noise to clean.
 
 uniform sampler2D colorTexture;   // lit HDR scene (the bounce source)
 uniform sampler2D depthTexture;
 uniform sampler2D normalTexture;  // world normal (0..1) + roughness/metal flag in alpha
 uniform sampler2D historyColor;   // last frame's COMBINED GI fill, for the multi-bounce feed
 
-// Sky fallback for rays that miss every on-screen surface (or exit the screen). Without it a
-// miss contributes ZERO, so GI collapses whenever the bright source scrolls off-screen - the
-// "works in some positions, dead in others" problem. Sampling the prefiltered environment
-// along the missed ray turns those rays into a directionally-OCCLUDED sky gather (rays that
-// hit nearby dark geometry still correctly return that geometry's radiance), so SSGI degrades
-// into bent-normal IBL instead of black. EnvMap radiance is pre-exposed via SkyExposure.
+// Sky for the UNOCCLUDED part of the hemisphere (the clear bitmask sectors). 0 = off (the
+// IBL ambient already counts the sky; raise only in closed interiors with openings). Unlike
+// the old per-missed-ray version this is occlusion-weighted, so it can never become a flat
+// frame-wide veil: a pixel staring at a wall gets none.
 uniform samplerCube EnvironmentMap;
 uniform mat4 SkyRotation;         // same rotation the skybox/IBL sampling uses
 uniform float SkyExposure;        // sky luminance scale x camera pre-exposure
-uniform float SkyFallback;        // 0..1 blend of the miss-ray sky contribution
+uniform float SkyFallback;        // 0..1 blend of the visible-sky contribution
 uniform float MaxEnvMip;          // roughest prefiltered mip (diffuse-ish cone)
 
-uniform mat4 Projection;          // unjittered camera projection
+uniform mat4 Projection;          // jittered camera projection (matches the depth buffer)
 uniform mat4 InvProjection;
 uniform mat4 ViewMatrix;
-uniform int FrameIndex;           // rotates the sample pattern each frame
-uniform int RayCount;             // active rays this frame (<= MAX_RAYS)
+uniform int FrameIndex;           // rotates the slice set each frame
+uniform int RayCount;             // horizon slices per pixel (<= MAX_SLICES)
 
-// Artistic / quality controls.
-uniform float RayLength;          // max march distance in metres (near vs far bounce)
+// Artistic / quality controls (same dials as the old march).
+uniform float RayLength;          // max gather distance in metres (near vs far bounce)
 uniform float Falloff;            // distance falloff exponent; >0 favours nearby bounce
-uniform float Thickness;          // depth-test tolerance (thin = strict, thick = forgiving)
+uniform float Thickness;          // assumed occluder thickness in metres (sector back face)
 uniform float MultiBounce;        // 0..1: how much of last frame's GI re-bounces this frame
 uniform float BounceBoost;        // amplify bright hits for a richer "final gather" feel
 
-const int MAX_RAYS = 16;          // compile-time loop bound; RayCount gates it at runtime
-const int MARCH_STEPS = 16;
-const int REFINE_STEPS = 4;
+const int MAX_SLICES = 8;         // compile-time loop bound; RayCount gates it at runtime
+const int STEPS = 8;              // depth samples per slice direction (16 per slice)
+const int SECTORS = 32;           // bitmask resolution over the hemisphere arc
 const float PI = 3.14159265359;
-const float FIREFLY_KNEE = 6.0;   // per-ray radiance luma cap (hits AND sky misses)
+const float HALF_PI = 1.57079632679;
+const float FIREFLY_KNEE = 6.0;   // per-sample radiance luma cap (hits AND sky)
 
-vec3 ViewPos(vec2 uv) {
-    float depth = texture(depthTexture, uv).r;
+vec3 ViewPosFromDepth(vec2 uv, float depth) {
     vec4 ndc = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
     vec4 view = InvProjection * ndc;
     return view.xyz / view.w;
 }
 
-vec2 ToUV(vec3 viewPos, out float w) {
-    vec4 clip = Projection * vec4(viewPos, 1.0);
-    w = clip.w;
-    return clip.xy / clip.w * 0.5 + 0.5;
+vec3 ViewPos(vec2 uv) {
+    return ViewPosFromDepth(uv, texture(depthTexture, uv).r);
 }
 
 float Hash(vec2 p) {
     return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
 }
 
-// Replace any NaN/Inf component with 0. The lit HDR scene (and the multi-bounce history fed
-// from it) can carry a NaN/Inf from an EXR sun or a degenerate specular highlight; gathered
-// into `bounce` it is STICKY - min/max/clamp propagate it and the temporal EMA then carries
-// the bad pixel forever, which is exactly the "weirdly noisy" black/white speckle and the
-// occasional crash. Kill it at every HDR read so nothing downstream can spread it.
+// MUST be a true component SELECT, never arithmetic on the bad value: mix(v, 0, flag)
+// expands to v*(1-flag) + 0*flag, and NaN*0.0 == NaN / Inf*0.0 == NaN in IEEE, so that
+// form passes the poison straight through (proven on AMD RX 9070 XT). With the temporal
+// EMA + multi-bounce feedback one bad pixel grows into a screen-eating black-noise field.
 vec3 Sanitize(vec3 v) {
-    return mix(v, vec3(0.0), vec3(isnan(v.x) || isinf(v.x),
-                                  isnan(v.y) || isinf(v.y),
-                                  isnan(v.z) || isinf(v.z)));
+    return vec3(isnan(v.x) || isinf(v.x) ? 0.0 : v.x,
+                isnan(v.y) || isinf(v.y) ? 0.0 : v.y,
+                isnan(v.z) || isinf(v.z) ? 0.0 : v.z);
 }
 
-// Build an orthonormal basis around n (Duff et al., branchless).
-mat3 BasisFromNormal(vec3 n) {
-    float s = n.z >= 0.0 ? 1.0 : -1.0;
-    float a = -1.0 / (s + n.z);
-    float b = n.x * n.y * a;
-    vec3 t = vec3(1.0 + s * n.x * n.x * a, s * b, -s * n.x);
-    vec3 bt = vec3(b, s + n.y * n.y * a, -n.y);
-    return mat3(t, bt, n);
-}
-
-// Cosine-weighted hemisphere sample in tangent space (concentric disk, lifted to z).
-vec3 CosineSample(vec2 u) {
-    float r = sqrt(u.x);
-    float phi = 2.0 * PI * u.y;
-    return vec3(r * cos(phi), r * sin(phi), sqrt(max(0.0, 1.0 - u.x)));
+// Set the bitmask sectors covered by the angular interval [a0, a1] (radians, measured from
+// the view vector, clamped to the [-PI/2, +PI/2] hemisphere window).
+uint OccludeSectors(float a0, float a1) {
+    float lo = clamp((min(a0, a1) + HALF_PI) / PI, 0.0, 1.0);
+    float hi = clamp((max(a0, a1) + HALF_PI) / PI, 0.0, 1.0);
+    int b0 = int(lo * float(SECTORS));
+    int count = clamp(int(ceil(hi * float(SECTORS))) - b0, 0, SECTORS);
+    if (count <= 0)
+        return 0u;
+    uint mask = count >= 32 ? 0xFFFFFFFFu : ((1u << uint(count)) - 1u);
+    return mask << uint(b0);
 }
 
 void main() {
@@ -105,128 +103,118 @@ void main() {
         return;
     }
 
-    vec3 P = ViewPos(TexCoords);
+    vec3 P = ViewPosFromDepth(TexCoords, depth);
     vec3 N = normalize(mat3(ViewMatrix) * worldN);
-    mat3 basis = BasisFromNormal(N);
+    vec3 V = -normalize(P); // toward the camera
 
     float rayLength = max(RayLength, 0.1);
-    float stepLength = rayLength / float(MARCH_STEPS);
 
-    // Per-pixel rotation of the sample set, advanced each frame so temporal can resolve it.
+    // Screen-space radius of the gather: rayLength metres projected at this pixel's depth.
+    // Clamped so an extreme close-up doesn't march the whole frame in 8 giant steps.
+    vec2 uvRadius = min(rayLength * 0.5 * vec2(Projection[0][0], Projection[1][1])
+                        / max(-P.z, 0.05), vec2(0.5));
+
+    // Per-pixel rotation of the slice set, advanced each frame so temporal can resolve it.
     float noise = Hash(TexCoords * vec2(textureSize(depthTexture, 0)) + float(FrameIndex) * 1.618);
+    float stepNoise = Hash(TexCoords * 911.0 + float(FrameIndex) * 2.71);
 
-    int rays = clamp(RayCount, 1, MAX_RAYS);
+    int slices = clamp(RayCount, 1, MAX_SLICES);
     vec3 bounce = vec3(0.0);
-    float weightSum = 0.0;
+    float skyVisible = 0.0;
 
-    for (int i = 0; i < MAX_RAYS; i++) {
-        if (i >= rays)
+    for (int i = 0; i < MAX_SLICES; i++) {
+        if (i >= slices)
             break;
-        vec2 u = vec2(
-            fract((float(i) + 0.5) / float(rays) + noise),
-            fract(noise * 1.7 + float(i) * 0.37));
-        // Bias u.x off the extremes: at u.x ~= 1 CosineSample's z-> 0 and the disk radius -> 1,
-        // so basis*sample can be ~0 and normalize() returns NaN (a speckle seed). Clamp keeps
-        // every sample a well-defined hemisphere direction.
-        u.x = clamp(u.x, 1e-3, 0.999);
-        vec3 dir = normalize(basis * CosineSample(u));
+        float phi = PI * (float(i) + noise) / float(slices);
+        vec2 dir2 = vec2(cos(phi), sin(phi));
 
-        vec3 rayPos = P + N * 0.05;
-        vec3 prevPos = rayPos;
-        bool hit = false;
-        vec2 hitUV = vec2(0.0);
-        float hitDist = 0.0;
+        // Slice tangent in view space: the screen direction lifted into the plane
+        // perpendicular to V, so sample angles are measured in a consistent frame.
+        vec3 sliceDir = vec3(dir2, 0.0);
+        vec3 T = normalize(sliceDir - V * dot(sliceDir, V));
 
-        for (int s = 0; s < MARCH_STEPS; s++) {
-            prevPos = rayPos;
-            rayPos += dir * stepLength;
+        uint bits = 0u;
 
-            float w;
-            vec2 uv = ToUV(rayPos, w);
-            if (w <= 0.0 || uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
-                break;
-
-            float sceneZ = ViewPos(uv).z;
-            // Tight thickness: the old (2*step + Thickness ~ 2m) window accepted any ray that
-            // slid behind ANY visible surface, so almost every ray "hit" and gathered the
-            // visible front's color — the whole frame got a scene-average GRAY VEIL instead of
-            // distinct local bounce.
-            float thick = Thickness + stepLength * 0.5;
-            if (sceneZ > rayPos.z + 0.01 && sceneZ - rayPos.z < thick) {
-                vec3 lo = prevPos;
-                vec3 hi = rayPos;
-                for (int r = 0; r < REFINE_STEPS; r++) {
-                    vec3 mid = (lo + hi) * 0.5;
-                    float mw;
-                    vec2 midUV = ToUV(mid, mw);
-                    if (ViewPos(midUV).z > mid.z + 0.01)
-                        hi = mid;
-                    else
-                        lo = mid;
-                }
-                float dummy;
-                vec2 candidateUV = ToUV(hi, dummy);
-
-                // FRONT-FACE CHECK: a real bounce surface faces the incoming ray. A "hit" on a
-                // surface pointing AWAY from the ray means we slid behind geometry the camera
-                // sees (or grazed our own surface) — its on-screen color is the wrong radiance.
-                // Reject and KEEP MARCHING: behind thin geometry the ray emerges and can still
-                // hit something real further along.
-                vec3 hitN = normalize(mat3(ViewMatrix) *
-                    (texture(normalTexture, candidateUV).rgb * 2.0 - 1.0));
-                if (dot(hitN, dir) <= -0.05) {
-                    hitUV = candidateUV;
-                    hitDist = length(hi - P);
-                    hit = true;
+        for (int j = 0; j < 2; j++) {
+            float side = j == 0 ? 1.0 : -1.0;
+            for (int s = 1; s <= STEPS; s++) {
+                // Quadratic step distribution: dense near field (where bounce matters
+                // most), sparse far field. Jitter breaks banding; temporal resolves it.
+                float t = (float(s) - 0.5 + (stepNoise - 0.5)) / float(STEPS);
+                t = t * t;
+                vec2 uv = TexCoords + side * dir2 * (t * uvRadius);
+                if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
                     break;
+
+                float sd = texture(depthTexture, uv).r;
+                if (sd >= 1.0)
+                    continue; // sky sample: occludes nothing
+
+                vec3 S = ViewPosFromDepth(uv, sd);
+                vec3 delta = S - P;
+                float dist = length(delta);
+                if (dist < 1e-4)
+                    continue;
+                vec3 w = delta / dist;
+
+                // Angles in the slice plane, measured from V (signed toward T). The sample
+                // occupies the sectors between its front face and an assumed back face
+                // Thickness metres further from the camera - thin geometry occludes thin
+                // sectors, so light correctly leaks past a railing but not past a wall.
+                vec3 deltaBack = delta + normalize(S) * max(Thickness, 0.01); // away from camera
+                float aFront = atan(dot(delta, T), dot(delta, V));
+                float aBack = atan(dot(deltaBack, T), dot(deltaBack, V));
+
+                uint sampleBits = OccludeSectors(aFront, aBack) & ~bits;
+                if (sampleBits != 0u) {
+                    float newFrac = float(bitCount(sampleBits)) / float(SECTORS);
+
+                    // Cosine-weighted: bounce arriving along w onto the surface around N.
+                    float cosW = clamp(dot(N, w), 0.0, 1.0);
+                    if (cosW > 0.0) {
+                        // Distance falloff keeps GI local (Falloff shapes the curve).
+                        float fade = pow(clamp(1.0 - dist / rayLength, 0.0, 1.0),
+                                         max(Falloff, 0.0));
+
+                        // Incoming radiance = lit color at the sample + a fraction of last
+                        // frame's GI there (cheap multi-bounce compounding).
+                        vec3 radiance = Sanitize(texture(colorTexture, uv).rgb)
+                                      + Sanitize(texture(historyColor, uv).rgb) * MultiBounce;
+                        radiance *= 1.0 + BounceBoost * dot(radiance, vec3(0.333));
+
+                        // Firefly clamp - outliers only; normal bright bounce stays intact.
+                        float lum = dot(radiance, vec3(0.2126, 0.7152, 0.0722));
+                        if (lum > FIREFLY_KNEE)
+                            radiance *= FIREFLY_KNEE / lum;
+
+                        // x2 calibrates a fully-enclosed lit arc (avg cos ~0.5) to ~L,
+                        // matching the old march's all-rays-hit magnitude so existing
+                        // profile Intensity values keep their meaning.
+                        bounce += radiance * (newFrac * 2.0) * cosW * fade;
+                    }
+                    bits |= sampleBits;
                 }
             }
         }
 
-        if (hit) {
-            // Distance falloff: nearer bounce surfaces contribute more (Falloff shapes the
-            // curve; 0 = no falloff). Keeps GI local and stops far walls flooding the frame.
-            float fade = pow(clamp(1.0 - hitDist / rayLength, 0.0, 1.0), max(Falloff, 0.0));
-
-            // Incoming radiance = the lit color at the hit, plus a fraction of the GI that
-            // already accumulated there last frame (the cheap multi-bounce: light that
-            // bounced once last frame bounces again this frame, compounding richness).
-            vec3 radiance = Sanitize(texture(colorTexture, hitUV).rgb)
-                          + Sanitize(texture(historyColor, hitUV).rgb) * MultiBounce;
-
-            // Boost bright hits so strong indirect (a sunlit wall) reads richer, Lumen-like.
-            radiance *= 1.0 + BounceBoost * dot(radiance, vec3(0.333));
-
-            // FIREFLY CLAMP - only the OUTLIERS. Leave normal bright bounce intact and only
-            // soft-cap genuine sparkle: a hard knee well above plausible diffuse radiance.
-            float hitLum = dot(radiance, vec3(0.2126, 0.7152, 0.0722));
-            if (hitLum > FIREFLY_KNEE)
-                radiance *= FIREFLY_KNEE / hitLum;
-
-            bounce += radiance * fade;
-        }
-        else if (SkyFallback > 0.0) {
-            // MISS -> sky fallback. The ray saw no on-screen geometry, so the best estimate of
-            // the incoming radiance is the environment along its direction (roughest prefiltered
-            // mip ~ a diffuse cone), not zero. This is what keeps GI alive when the bright
-            // source scrolls off-screen: the gather degrades into a directionally-occluded sky
-            // integral instead of collapsing to black. Clamped by the same firefly knee so a
-            // sun disk through a window can't speckle the accumulation.
-            vec3 worldDir = transpose(mat3(ViewMatrix)) * dir;
-            vec3 skyDir = transpose(mat3(SkyRotation)) * worldDir;
-            vec3 sky = Sanitize(textureLod(EnvironmentMap, skyDir, MaxEnvMip).rgb) * SkyExposure;
-            float skyLum = dot(sky, vec3(0.2126, 0.7152, 0.0722));
-            if (skyLum > FIREFLY_KNEE)
-                sky *= FIREFLY_KNEE / skyLum;
-            bounce += sky * SkyFallback;
-        }
-        weightSum += 1.0;   // every ray contributes now (hit radiance or sky fallback)
+        // The sectors no sample occluded are open sky for this slice.
+        skyVisible += 1.0 - float(bitCount(bits)) / float(SECTORS);
     }
 
-    // Pure per-ray mean: with the sky fallback there are no zero rays anymore, so the plain
-    // cosine-weighted Monte-Carlo average is both unbiased AND position-stable - no hit-count
-    // re-weighting hacks needed (those existed only to compensate for misses counting as 0).
-    bounce /= max(weightSum, 1.0);
+    bounce /= float(slices);
+    skyVisible /= float(slices);
+
+    // Sky through the visible fraction of the hemisphere: a diffuse-cone env sample along
+    // the surface normal, scaled by how much of the horizon is actually open. A pixel
+    // facing a wall gets ~zero - this can no longer read as a global exposure lift.
+    if (SkyFallback > 0.0) {
+        vec3 skyDir = transpose(mat3(SkyRotation)) * worldN;
+        vec3 sky = Sanitize(textureLod(EnvironmentMap, skyDir, MaxEnvMip).rgb) * SkyExposure;
+        float skyLum = dot(sky, vec3(0.2126, 0.7152, 0.0722));
+        if (skyLum > FIREFLY_KNEE)
+            sky *= FIREFLY_KNEE / skyLum;
+        bounce += sky * (SkyFallback * skyVisible);
+    }
 
     vec2 edge = min(TexCoords, 1.0 - TexCoords);
     float edgeFade = smoothstep(0.0, 0.06, min(edge.x, edge.y));

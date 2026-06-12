@@ -29,6 +29,9 @@ public sealed class GLAutoExposurePass {
         public float AdaptedEV = 15f;
         public float TargetEV;
         public bool HasTarget;
+        public bool Snapped;    // first valid meter snaps AdaptedEV to it (no multi-second ease from
+                                // a stale 15) — essential in the editor's on-demand render, which only
+                                // paints a few frames after a scene load and can't ease over seconds.
         public readonly int[] Pbos = new int[RingSize];
         public readonly nint[] Fences = new nint[RingSize];
         public readonly float[] PreExposure = new float[RingSize];
@@ -69,10 +72,16 @@ public sealed class GLAutoExposurePass {
             var lo = MathF.Min(fx.AutoExposureLimitMin, fx.AutoExposureLimitMax);
             var hi = MathF.Max(fx.AutoExposureLimitMin, fx.AutoExposureLimitMax);
             var target = Math.Clamp(state.TargetEV, lo, hi);
-            var speed = target > state.AdaptedEV
-                ? fx.AutoExposureSpeedDarkToLight
-                : fx.AutoExposureSpeedLightToDark;
-            state.AdaptedEV += (target - state.AdaptedEV) * (1f - MathF.Exp(-dt * speed));
+            if (!state.Snapped) {
+                state.AdaptedEV = target;   // first meter: snap, don't ease
+                state.Snapped = true;
+            }
+            else {
+                var speed = target > state.AdaptedEV
+                    ? fx.AutoExposureSpeedDarkToLight
+                    : fx.AutoExposureSpeedLightToDark;
+                state.AdaptedEV += (target - state.AdaptedEV) * (1f - MathF.Exp(-dt * speed));
+            }
         }
 
         fx.AdaptedExposureEV = state.AdaptedEV;

@@ -119,6 +119,17 @@ internal static class Program {
             count = a.ValueKind == JsonValueKind.Object && a.TryGetProperty("count", out JsonElement c) ? c.GetInt32() : 50,
         }),
         "scripts_rebuild" => ("scripts.rebuild", null),
+        "editor_frame" => ("editor.frame", new {
+            entity = OptStr(a, "entity"),
+            dir = OptStr(a, "dir"),
+            fit = a.ValueKind == JsonValueKind.Object && a.TryGetProperty("fit", out JsonElement f) ? (object)f.GetDouble() : 1.0,
+        }),
+        "editor_refresh" => ("editor.refresh", null),
+        "scene_component_set" => ("scene.component.set", new {
+            type = Str(a, "type"),
+            member = Str(a, "member"),
+            value = a.TryGetProperty("value", out JsonElement scv) ? (object)scv : "",
+        }),
         _ => ("", null),
     };
 
@@ -217,5 +228,14 @@ internal static class Program {
             ("settleFrames", "number", "Frames to wait before capture (default 3)", false)) },
         new { name = "console_tail", description = "Recent editor console entries (errors/warnings/info).", inputSchema = Schema(("count", "number", "How many entries (default 50)", false)) },
         new { name = "scripts_rebuild", description = "Recompile game scripts and hot-reload them (compile-first: nothing changes on errors).", inputSchema = Schema() },
+        new { name = "editor_frame", description = "Frame the Scene-view camera on an entity (or the whole scene if none given) so a screenshot shows it. The Scene view uses the editor fly camera, NOT an HDCamera entity.", inputSchema = Schema(
+            ("entity", "string", "Entity to frame; omit to frame the whole scene", false),
+            ("dir", "string", "Look direction 'x,y,z' e.g. '0.3,-0.5,1' for a 3/4 top view; omit to keep current", false),
+            ("fit", "number", "Zoom multiplier on the framed radius (1=default, <1 closer, >1 wider)", false)) },
+        new { name = "editor_refresh", description = "Force a full asset reimport (registers newly written .scene/.volume/.mat assets).", inputSchema = Schema() },
+        new { name = "scene_component_set", description = "Set a member on a scene-wide component (Skybox/ProceduralSky/SceneLighting/IrradianceVolume), e.g. tune sky exposure. Undoable.", inputSchema = Schema(
+            ("type", "string", "Scene component type, e.g. ProceduralSky", true),
+            ("member", "string", "Member name, e.g. exposure", true),
+            ("value", "string", "New value (number, 'x,y,z' vector, enum name)", true)) },
     ];
 }

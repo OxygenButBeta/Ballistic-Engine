@@ -7,39 +7,52 @@ namespace BallisticEngine.Editor;
 // The editor's remote-control surface: a named-pipe server speaking newline-delimited JSON —
 //   request:  {"id": 1, "method": "entity.create", "params": {"name": "Lamp"}}
 //   response: {"id": 1, "result": {...}}  or  {"id": 1, "error": "..."}
-// One client at a time; commands execute on the editor main thread between frames (see
-// RemoteCommandQueue). The server thread lives in ENGINE code outside the script ALC, so it
-// survives script hot-reloads and play-mode transitions — the documented failure mode of every
-// in-editor bridge in other engines. The MCP server (separate process) is a thin client of this.
+// MULTIPLE clients at once (the persistent MCP server process AND ad-hoc clients/agents) — each gets
+// its own server instance + handler thread; commands still serialize through the editor main thread
+// (RemoteCommandQueue), so concurrent clients can't corrupt state. The server thread lives in ENGINE
+// code outside the script ALC, so it survives script hot-reloads and play-mode transitions — the
+// documented failure mode of every in-editor bridge in other engines.
 internal static class RemotePort {
     public const string PipeName = "BallisticEditor";
+    const int MaxConcurrentClients = 8;     // MCP holds one persistently; leave room for agents/tools
 
     static CancellationTokenSource? cancel;
 
     public static void Start(EditorState state, EngineBootstrap bootstrap) {
         RemoteHandlers.Install(state, bootstrap);
         cancel = new CancellationTokenSource();
-        var thread = new Thread(() => ServerLoop(cancel.Token)) { IsBackground = true, Name = "RemotePort" };
+        var thread = new Thread(() => AcceptLoop(cancel.Token)) { IsBackground = true, Name = "RemotePort" };
         thread.Start();
-        Debugging.Log($@"Remote command port listening on \\.\pipe\{PipeName}");
+        Debugging.Log($@"Remote command port listening on \\.\pipe\{PipeName} (up to {MaxConcurrentClients} clients)");
     }
 
     public static void Stop() => cancel?.Cancel();
 
-    static void ServerLoop(CancellationToken token) {
+    // Accept connections forever; hand each client to its own thread so one long-lived client (MCP)
+    // never blocks another from connecting. NamedPipeServerStream needs the same maxInstances on every
+    // instance, so all share MaxConcurrentClients.
+    static void AcceptLoop(CancellationToken token) {
         while (!token.IsCancellationRequested) {
+            NamedPipeServerStream pipe;
             try {
-                using var pipe = new NamedPipeServerStream(PipeName, PipeDirection.InOut, 1,
+                pipe = new NamedPipeServerStream(PipeName, PipeDirection.InOut, MaxConcurrentClients,
                     PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
                 pipe.WaitForConnectionAsync(token).GetAwaiter().GetResult();
-                Serve(pipe);
             }
             catch (OperationCanceledException) {
                 return;
             }
             catch (Exception) {
-                // Client dropped mid-handshake or pipe hiccup — accept the next connection.
+                continue; // transient accept failure — try again
             }
+
+            // Serve this client on its own thread; the accept loop immediately waits for the next.
+            var clientThread = new Thread(() => {
+                try { Serve(pipe); }
+                catch { /* client dropped */ }
+                finally { pipe.Dispose(); }
+            }) { IsBackground = true, Name = "RemotePort.Client" };
+            clientThread.Start();
         }
     }
 

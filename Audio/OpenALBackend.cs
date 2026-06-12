@@ -1,3 +1,5 @@
+using System;
+using System.Runtime.InteropServices;
 using OpenTK.Audio.OpenAL;
 using OpenTK.Mathematics;
 
@@ -22,6 +24,18 @@ public sealed class OpenALBackend : IAudioBackend {
     readonly OpenALVoice[] pool = new OpenALVoice[VoicePoolSize];
     float masterVolume = 1f;
 
+    // ---- Live "follow the Windows default output device" (ALC_SOFT_reopen_device) -------------
+    // OpenAL binds to whatever was default WHEN the device opened; it does not auto-follow the OS
+    // default the way a WASAPI shared-mode app does. We poll the current default name each frame and,
+    // when it changes, reopen the same ALCdevice onto the new default — every voice/buffer/context
+    // survives, so playback reroutes live with no restart. Requires OpenAL-Soft 1.21+; on older libs
+    // the extension is absent and we no-op (audio just stays on the startup device, as before).
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    delegate bool ReopenDeviceSoftDelegate(ALDevice device, string deviceName, int[] attribs);
+    ReopenDeviceSoftDelegate reopenDevice;   // null when the extension is unavailable
+    string currentDefaultName;               // last-seen OS default; change triggers a reopen
+    int deviceCheckCountdown;                // throttle: only poll the default every N frames
+
     public OpenALBackend() {
         try {
             device = ALC.OpenDevice(null);   // null = system default output device
@@ -45,7 +59,9 @@ public sealed class OpenALBackend : IAudioBackend {
 
             initialized = true;
             CheckError("init");
-            Debugging.Log($"Audio: OpenAL initialized ({VoicePoolSize} voices).");
+            BindDefaultDeviceFollow();
+            Debugging.Log($"Audio: OpenAL initialized ({VoicePoolSize} voices"
+                + (reopenDevice is not null ? ", follows OS default device" : "") + ").");
         }
         catch (System.Exception e) {
             // OpenAL native lib missing (headless CI, no soundcard) must never crash the engine.
@@ -62,6 +78,30 @@ public sealed class OpenALBackend : IAudioBackend {
             masterVolume = MathHelper.Clamp(value, 0f, 1f);
             if (initialized)
                 AL.Listener(ALListenerf.Gain, masterVolume);
+        }
+    }
+
+    // Binds alcReopenDeviceSOFT (if the running OpenAL-Soft exposes it) and records the current OS
+    // default device name as the baseline to diff against. No-op on libs without the extension.
+    void BindDefaultDeviceFollow() {
+        currentDefaultName = CurrentDefaultDeviceName();
+        // The extension is per-device; checking ALDevice.Null queries the global list/extension set.
+        if (!ALC.IsExtensionPresent(device, "ALC_SOFT_reopen_device"))
+            return;
+        IntPtr fn = ALC.GetProcAddress(device, "alcReopenDeviceSOFT");
+        if (fn != IntPtr.Zero)
+            reopenDevice = Marshal.GetDelegateForFunctionPointer<ReopenDeviceSoftDelegate>(fn);
+    }
+
+    // The name OpenAL reports for the CURRENT system default output. Empty string if unknown — we
+    // treat "" specially (never reopen onto an empty name). DefaultAllDevicesSpecifier tracks the OS
+    // default and updates live as the user changes it in Windows sound settings.
+    string CurrentDefaultDeviceName() {
+        try {
+            return ALC.GetString(ALDevice.Null, AlcGetString.DefaultAllDevicesSpecifier) ?? "";
+        }
+        catch {
+            return "";
         }
     }
 
@@ -130,6 +170,35 @@ public sealed class OpenALBackend : IAudioBackend {
         // Recycle finished one-shots back into the pool.
         foreach (OpenALVoice voice in pool)
             voice.RecycleIfFinished();
+
+        FollowDefaultDeviceIfChanged();
+    }
+
+    // Polls the OS default output (throttled) and reopens the device onto it when it changes, so
+    // switching the Windows output device reroutes audio live. No-op without the extension.
+    void FollowDefaultDeviceIfChanged() {
+        if (reopenDevice is null)
+            return;
+        if (--deviceCheckCountdown > 0)   // ~ every 30 frames (twice a second) is plenty for a user action
+            return;
+        deviceCheckCountdown = 30;
+
+        string now = CurrentDefaultDeviceName();
+        if (now.Length == 0 || now == currentDefaultName)
+            return;
+
+        // Reopen the SAME device handle onto the new default. Passing the default name (not null) is
+        // what OpenAL-Soft's docs recommend; voices, buffers, and the context all carry over.
+        bool ok = reopenDevice(device, now, null);
+        if (ok) {
+            currentDefaultName = now;
+            Debugging.Log($"Audio: output device switched to '{now}'.");
+        }
+        else {
+            CheckError("ReopenDevice");
+            // Don't spin: adopt the name anyway so we don't retry the same failing reopen every tick.
+            currentDefaultName = now;
+        }
     }
 
     public void Dispose() => Teardown();

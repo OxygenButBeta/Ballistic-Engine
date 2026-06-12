@@ -52,7 +52,10 @@ public class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWin
 
     // fullscreen: borderless fullscreen at the primary monitor's resolution (shipped player). The
     // width/height become the windowed fallback size; in fullscreen the monitor's mode wins.
-    public GLBallisticEngineWindow(int width, int height, bool fullscreen = false) : base(GameWindowSettings.Default,
+    // borderless: a borderless window at width x height (no title bar, not monitor-sized) — ignored
+    // when fullscreen is set. title: the window caption (the shipped game's product name).
+    public GLBallisticEngineWindow(int width, int height, bool fullscreen = false,
+        bool borderless = false, string title = "Ballistic") : base(GameWindowSettings.Default,
         // GL 4.6 core: unlocks compute shaders + SSBOs (4.3), MultiDrawIndirect (4.3), persistent
         // mapping (4.4) and DSA (4.5) for GPU-driven rendering work. macOS (the old 4.1 ceiling)
         // is off the table for GL anyway — a future Mac path means another backend, not 4.1.
@@ -60,11 +63,16 @@ public class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWin
         new NativeWindowSettings {
             APIVersion = new Version(4, 6),
             Profile = ContextProfile.Core,
-            WindowBorder = fullscreen ? WindowBorder.Hidden : WindowBorder.Resizable,
+            WindowBorder = fullscreen || borderless ? WindowBorder.Hidden : WindowBorder.Resizable,
+            // Come up focused and in front. GLFW defaults these true, but launching from an IDE/debugger
+            // (or while another window holds focus) often leaves the window created BEHIND the launcher —
+            // these hints plus the explicit Focus() in OnLoad force it to the foreground.
+            StartFocused = true,
+            StartVisible = true,
         }) {
         this.width = width;
         this.height = height;
-        Title = "Ballistic ";
+        Title = string.IsNullOrWhiteSpace(title) ? "Ballistic" : title;
 
         EngineTimer = new GLTime();
         // JoystickStates is live on the window — pass a getter so the input provider always reads the
@@ -81,10 +89,20 @@ public class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWin
             WindowState = WindowState.Fullscreen;
         }
         else {
+            // Windowed or borderless-windowed: centre the requested size on the primary monitor.
             CenterWindow(new Vector2i(width, height));
         }
     }
 
+
+    protected override void OnLoad() {
+        base.OnLoad();
+        // Force the window to the foreground once its surface exists. Without this it can open BEHIND
+        // the launching terminal/IDE — StartFocused alone is only a creation hint the OS may ignore,
+        // so we also explicitly focus and raise after Load.
+        IsVisible = true;
+        Focus();
+    }
 
     protected override void OnResize(ResizeEventArgs e) {
         base.OnResize(e);

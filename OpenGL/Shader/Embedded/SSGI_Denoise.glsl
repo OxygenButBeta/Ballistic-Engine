@@ -19,6 +19,14 @@ uniform float StepSize;           // a-trous tap spacing in texels (wider = smoo
 uniform float DepthSigma;         // depth edge sensitivity (smaller = sharper edges kept)
 uniform float NormalSigma;        // normal edge sensitivity
 
+// True component SELECT - the old mix(v, 0, flag) form was arithmetic
+// (v*(1-flag) + 0*flag) and NaN*0.0 == NaN, so it never actually scrubbed.
+vec3 Sanitize(vec3 v) {
+    return vec3(isnan(v.x) || isinf(v.x) ? 0.0 : v.x,
+                isnan(v.y) || isinf(v.y) ? 0.0 : v.y,
+                isnan(v.z) || isinf(v.z) ? 0.0 : v.z);
+}
+
 float ViewZ(vec2 uv) {
     float depth = texture(depthTexture, uv).r;
     vec4 ndc = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
@@ -57,7 +65,9 @@ void main() {
             vec2 offset = vec2(x, y) * step * texel;
             vec2 uv = TexCoords + offset;
 
-            vec3 c = texture(giTexture, uv).rgb;
+            // Per-tap scrub: sum += c*w would be NaN even at w == 0 (NaN*0 == NaN), so one
+            // contaminated tap used to poison every pixel whose kernel touched it.
+            vec3 c = Sanitize(texture(giTexture, uv).rgb);
             vec3 n = normalize(texture(normalTexture, uv).rgb * 2.0 - 1.0);
             float z = ViewZ(uv);
             float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
@@ -82,11 +92,8 @@ void main() {
         }
     }
 
-    vec3 denoised = wSum > 1e-4 ? sum / wSum : centre.rgb;
-    // Scrub any NaN/Inf a contaminated tap could have introduced, so the speckle can't reach the
-    // combine (and the temporal history, which is read pre-denoise, already sanitizes separately).
-    denoised = mix(denoised, vec3(0.0), vec3(isnan(denoised.x) || isinf(denoised.x),
-                                             isnan(denoised.y) || isinf(denoised.y),
-                                             isnan(denoised.z) || isinf(denoised.z)));
-    FragColor = vec4(denoised, centre.a);
+    vec3 denoised = wSum > 1e-4 ? sum / wSum : Sanitize(centre.rgb);
+    // Final scrub so the speckle can't reach the combine (and the temporal history, which is
+    // read pre-denoise, already sanitizes separately).
+    FragColor = vec4(Sanitize(denoised), centre.a);
 }

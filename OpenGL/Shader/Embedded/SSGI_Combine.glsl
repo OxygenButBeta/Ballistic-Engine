@@ -39,10 +39,12 @@ void main() {
     vec3 scene = texture(sceneTexture, TexCoords).rgb;
     // NaN-safe: max(NaN, 0) is implementation-defined (often NaN), and a NaN here paints a black/
     // white speckle that scene+add carries — the final gate against the "weirdly noisy" output.
+    // True component SELECT - the old mix(gi, 0, flag) form was arithmetic
+    // (gi*(1-flag) + 0*flag) and NaN*0.0 == NaN, so it never actually scrubbed.
     vec3 gi = texture(ssgiTexture, TexCoords).rgb;
-    gi = mix(gi, vec3(0.0), vec3(isnan(gi.x) || isinf(gi.x),
-                                 isnan(gi.y) || isinf(gi.y),
-                                 isnan(gi.z) || isinf(gi.z)));
+    gi = vec3(isnan(gi.x) || isinf(gi.x) ? 0.0 : gi.x,
+              isnan(gi.y) || isinf(gi.y) ? 0.0 : gi.y,
+              isnan(gi.z) || isinf(gi.z) ? 0.0 : gi.z);
     gi = max(gi, 0.0);
 
     float look = clamp(Look, 0.0, 1.0);

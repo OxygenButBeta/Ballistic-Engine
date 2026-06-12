@@ -38,4 +38,19 @@
       <EmbeddedResource Include="OpenGL\Shader\Embedded\*.glsl" />
     </ItemGroup>
 
+    <!-- Native OpenAL runtime (OpenAL-Soft). OpenTK ships only the MANAGED bindings, which
+         DllImport "OpenAL32.dll" — Windows has no system OpenAL, so without this the audio
+         backend gracefully disables itself and every sound is silent. Shipping the DLL next to
+         the exe makes audio work out of the box for the editor, the player, and any GAME built
+         on the engine (the file flows transitively through ProjectReference to every host, and
+         CopyToPublishDirectory carries it into `dotnet publish` ship builds). -->
+    <ItemGroup>
+      <None Include="Audio\Native\OpenAL32.dll" Condition="Exists('Audio\Native\OpenAL32.dll')">
+        <Link>OpenAL32.dll</Link>
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+        <Visible>false</Visible>
+      </None>
+    </ItemGroup>
+
 </Project>

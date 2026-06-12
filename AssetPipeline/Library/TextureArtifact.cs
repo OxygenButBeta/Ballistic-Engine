@@ -3,11 +3,18 @@ using System.IO.Compression;
 namespace BallisticEngine.AssetPipeline;
 
 // Engine-native binary texture, Library\Artifacts\<guid>.btex:
-//   u32 magic 'BTEX' | u32 version | i32 width | i32 height | u8 format | u8 compression | i64 pixelByteCount
-//   payload: raw RGBA8, Deflate-compressed when compression == 1
+//   u32 magic 'BTEX' | u32 version | i32 width | i32 height | u8 format | u8 compression
+//   [v2+] i32 mipCount
+//   i64 payloadByteCount | payload
+//
+// Payload is the texel data: raw RGBA8/RGBA32F for uncompressed formats (one level), or the full
+// block-compressed mip chain (largest first) for BC formats. Deflate-compressed when compression == 1.
+//
+// v1 had no mipCount field (always one level, RGBA8/RGBA32F). It is still readable; the importer's
+// version bump regenerates old artifacts to v2 on the next refresh anyway.
 public static class TextureArtifact {
     const uint Magic = 0x58455442; // "BTEX"
-    const uint FormatVersion = 1;
+    const uint FormatVersion = 2;
 
     public static void Write(string path, in TextureData data, bool compress = true) {
         using FileStream stream = File.Create(path);
@@ -19,6 +26,7 @@ public static class TextureArtifact {
         writer.Write(data.Height);
         writer.Write((byte)data.Format);
         writer.Write((byte)(compress ? 1 : 0));
+        writer.Write(data.MipCount);
         writer.Write((long)data.Pixels.Length);
 
         if (compress) {
@@ -43,13 +51,14 @@ public static class TextureArtifact {
         if (reader.ReadUInt32() != Magic)
             throw new InvalidDataException($"'{name}' is not a texture artifact (bad magic).");
         var version = reader.ReadUInt32();
-        if (version != FormatVersion)
+        if (version is not (1 or FormatVersion))
             throw new InvalidDataException($"Texture artifact '{name}' has unsupported version {version}.");
 
         var width = reader.ReadInt32();
         var height = reader.ReadInt32();
         var format = (TextureFormat)reader.ReadByte();
         var compressed = reader.ReadByte() == 1;
+        var mipCount = version >= 2 ? reader.ReadInt32() : 1;
         var pixelByteCount = reader.ReadInt64();
 
         var pixels = new byte[pixelByteCount];
@@ -61,6 +70,6 @@ public static class TextureArtifact {
             stream.ReadExactly(pixels);
         }
 
-        return new TextureData(width, height, format, pixels);
+        return new TextureData(width, height, format, pixels, mipCount);
     }
 }

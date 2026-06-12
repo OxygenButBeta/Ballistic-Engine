@@ -76,6 +76,13 @@ internal sealed class OpenALVoice : IAudioVoice {
         set => AL.Source(Source, ALSource3f.Velocity, value.X, value.Y, value.Z);
     }
 
+    // Play-head position in seconds. Writing it seeks (OpenAL clamps to the buffer); seeking a
+    // stopped/finished one-shot just sets the offset — Play/Resume picks up from there.
+    public float TimeSeconds {
+        get => AL.GetSource(Source, ALSourcef.SecOffset);
+        set => AL.Source(Source, ALSourcef.SecOffset, value < 0f ? 0f : value);
+    }
+
     public void Stop() {
         AL.SourceStop(Source);
         Reserved = false;
@@ -108,6 +115,7 @@ internal sealed class SilentVoice : IAudioVoice {
     public float Pitch { get; set; }
     public Vector3 Position { get; set; }
     public Vector3 Velocity { get; set; }
+    public float TimeSeconds { get; set; }
     public void Stop() { }
     public void Pause() { }
     public void Resume() { }

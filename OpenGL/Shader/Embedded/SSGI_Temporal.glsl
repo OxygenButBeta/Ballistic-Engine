@@ -39,10 +39,12 @@ vec3 WorldPos(vec2 uv) {
 // NaN/Inf -> 0. A bad value in the accumulated history is the worst kind: the EMA carries it
 // every frame, so one contaminated tap becomes a permanent black/white speckle. Scrub both the
 // incoming gather and the reprojected history so the accumulation can never hold a bad pixel.
+// True component SELECT - the old mix(v, 0, flag) form was arithmetic
+// (v*(1-flag) + 0*flag) and NaN*0.0 == NaN, so it never actually scrubbed.
 vec3 Sanitize(vec3 v) {
-    return mix(v, vec3(0.0), vec3(isnan(v.x) || isinf(v.x),
-                                  isnan(v.y) || isinf(v.y),
-                                  isnan(v.z) || isinf(v.z)));
+    return vec3(isnan(v.x) || isinf(v.x) ? 0.0 : v.x,
+                isnan(v.y) || isinf(v.y) ? 0.0 : v.y,
+                isnan(v.z) || isinf(v.z) ? 0.0 : v.z);
 }
 
 void main() {
@@ -132,7 +134,9 @@ void main() {
     float boxSize = max(length(hi - lo), 0.04);            // noise floor on the box
     float drift = length(history.rgb - clampedHistory) / boxSize;
     float reset = smoothstep(1.5, 4.0, drift);             // only real disocclusion resets
-    float histLen = valid ? history.a : 1.0;
+    // history.a (the accumulated frame count) feeds alpha = 1/histLen below - a NaN here
+    // (poisoned pre-fix history) would NaN the whole EMA, so scrub it like the color.
+    float histLen = valid && !(isnan(history.a) || isinf(history.a)) ? history.a : 1.0;
     histLen = mix(histLen, 1.0, reset);                    // shorten history only on big drift
     histLen = min(histLen + 1.0, MaxHistory);
 

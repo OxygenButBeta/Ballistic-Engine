@@ -31,6 +31,69 @@ internal static class NativeDialogs {
         return result;
     }
 
+    // Opens a native "open file" dialog filtered to the given extensions. `filterName` labels the
+    // filter (e.g. "Unity Package"); `extensions` are bare extensions WITH the dot (".unitypackage").
+    // Returns the chosen absolute file path, or null on cancel / failure.
+    public static string PickFile(string title, string filterName, string[] extensions, string initialDir = null) {
+        if (!OperatingSystem.IsWindows())
+            return null;
+
+        string result = null;
+        var staThread = new Thread(() => result = PickFileSta(title, filterName, extensions, initialDir));
+        staThread.SetApartmentState(ApartmentState.STA);
+        staThread.IsBackground = true;
+        staThread.Start();
+        staThread.Join();
+        return result;
+    }
+
+    static string PickFileSta(string title, string filterName, string[] extensions, string initialDir) {
+        IFileOpenDialog dialog = null;
+        try {
+            dialog = (IFileOpenDialog)new FileOpenDialogRcw();
+
+            if (dialog.GetOptions(out uint options) != 0)
+                return null;
+            dialog.SetOptions(options | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_FILEMUSTEXIST);
+
+            if (!string.IsNullOrEmpty(title))
+                dialog.SetTitle(title);
+
+            if (extensions is { Length: > 0 }) {
+                var spec = string.Join(';', extensions.Select(e => "*" + e));
+                ComdlgFilterSpec[] filters = [
+                    new() { Name = filterName ?? "Supported", Spec = spec },
+                    new() { Name = "All Files", Spec = "*.*" },
+                ];
+                dialog.SetFileTypes((uint)filters.Length, filters);
+            }
+
+            Guid shellItemId = typeof(IShellItem).GUID;
+            if (!string.IsNullOrEmpty(initialDir) && Directory.Exists(initialDir) &&
+                SHCreateItemFromParsingName(initialDir, IntPtr.Zero, in shellItemId,
+                    out IShellItem seed) == 0 && seed is not null) {
+                dialog.SetFolder(seed);
+                Marshal.ReleaseComObject(seed);
+            }
+
+            if (dialog.Show(GetActiveWindow()) != 0)
+                return null;
+
+            if (dialog.GetResult(out IShellItem item) != 0 || item is null)
+                return null;
+            item.GetDisplayName(SIGDN_FILESYSPATH, out string path);
+            Marshal.ReleaseComObject(item);
+            return path;
+        }
+        catch {
+            return null;
+        }
+        finally {
+            if (dialog is not null)
+                Marshal.ReleaseComObject(dialog);
+        }
+    }
+
     static string PickFolderSta(string title, string initialDir) {
         IFileOpenDialog dialog = null;
         try {
@@ -76,6 +139,7 @@ internal static class NativeDialogs {
     const uint FOS_PICKFOLDERS = 0x20;
     const uint FOS_FORCEFILESYSTEM = 0x40;
     const uint FOS_PATHMUSTEXIST = 0x800;
+    const uint FOS_FILEMUSTEXIST = 0x1000;
     const uint SIGDN_FILESYSPATH = 0x80058000;
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]

@@ -757,6 +757,7 @@ internal sealed class InspectorPanel {
     // Uses the static Audio facade (play-mode-independent), so it works in edit mode; AudioSource.Play
     // itself is gated to play mode. Graceful no-op when no audio device is present (headless CI).
     static IAudioVoice audioPreviewVoice;
+    static float audioPreviewTime;   // scrub-slider position (seconds), persists between previews
     void DrawAudioSourceSection(AudioSource source) {
         ImGui.Spacing();
         ImGui.SeparatorText("Preview");
@@ -773,12 +774,46 @@ internal sealed class InspectorPanel {
             audioPreviewVoice = playing
                 ? null
                 : Audio.Play(source.Clip, source.Volume, source.Pitch, loop: false);
+            playing = !playing;
         }
         ImGui.SameLine();
         ImGui.TextDisabled($"{source.Clip.DurationSeconds:F1}s, {source.Clip.Channels}ch, {source.Clip.SampleRate}Hz");
 
+        DrawAudioScrubber(source.Clip, source.Volume, source.Pitch);
+
         if (!Audio.IsAvailable)
             ImGui.TextDisabled("(no audio device on this machine — preview is silent)");
+    }
+
+    // Time slider under the preview button: shows the play head while previewing and lets you scrub.
+    // Dragging seeks the live voice; releasing on a stopped voice restarts playback from that offset
+    // (so you can scrub a finished/idle clip to a spot and hear it from there).
+    void DrawAudioScrubber(AudioClip clip, float volume, float pitch) {
+        float duration = MathF.Max(clip.DurationSeconds, 0.001f);
+        bool live = audioPreviewVoice is { IsPlaying: true };
+
+        // While playing, the play head drives the slider; otherwise keep the last scrub position so the
+        // handle doesn't snap back to 0 between previews.
+        if (live)
+            audioPreviewTime = Math.Clamp(audioPreviewVoice.TimeSeconds, 0f, duration);
+
+        ImGui.SetNextItemWidth(-1);
+        float t = audioPreviewTime;
+        if (ImGui.SliderFloat("##audioScrub", ref t, 0f, duration, "%.2fs")) {
+            audioPreviewTime = Math.Clamp(t, 0f, duration);
+            if (audioPreviewVoice is { IsPlaying: true })
+                audioPreviewVoice.TimeSeconds = audioPreviewTime;   // seek the live voice
+            else {
+                // Scrubbing an idle clip: start a fresh voice and jump it to the scrub point.
+                audioPreviewVoice = Audio.Play(clip, volume, pitch, loop: false);
+                if (audioPreviewVoice is not null)
+                    audioPreviewVoice.TimeSeconds = audioPreviewTime;
+            }
+        }
+
+        // Keep the inspector repainting so the play head animates under on-demand rendering.
+        if (live)
+            state.MarkViewportDirty();
     }
 
     // Animator preview: a play/pause toggle + a scrub slider that evaluates the clip in edit mode, so
@@ -1941,6 +1976,8 @@ internal sealed class InspectorPanel {
             return [".png", ".jpg", ".jpeg", ".tga", ".bmp", ".hdr", ".exr"];
         if (typeof(Mesh).IsAssignableFrom(assetType))
             return [".fbx", ".obj"];
+        if (typeof(AudioClip).IsAssignableFrom(assetType))
+            return [".wav", ".wave", ".ogg"];
         if (typeof(Material).IsAssignableFrom(assetType))
             return [".mat"];
         if (typeof(Shader).IsAssignableFrom(assetType))

@@ -96,6 +96,7 @@ internal static class EditorIcons {
         ".fbx" or ".obj" or ".gltf" or ".glb" or ".dae" => (Package, TintMesh),
         ".png" or ".jpg" or ".jpeg" or ".tga" or ".bmp" => (Picture, new SysVec4(0.55f, 0.83f, 0.62f, 1f)),
         ".hdr" or ".exr" => (Picture, new SysVec4(0.95f, 0.80f, 0.45f, 1f)),
+        ".wav" or ".wave" or ".ogg" => (Play, new SysVec4(0.93f, 0.55f, 0.72f, 1f)),
         ".mat" => (Color, TintVolume),
         ".volume" => (Color, new SysVec4(0.85f, 0.60f, 0.80f, 1f)),
         ".scene" or ".pyscene" => (Home, new SysVec4(0.93f, 0.65f, 0.45f, 1f)),

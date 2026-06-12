@@ -12,11 +12,11 @@ public sealed class ScreenSpaceGlobalIllumination : VolumeComponent {
     [Tooltip("Show only the bounce SSGI adds (10x brightened). Black = no gather. Use to verify/tune GI.")]
     public readonly BoolParameter debugView = new(false);
 
-    [Tooltip("Sky light for rays that miss on-screen geometry. 0 = off (the IBL ambient already counts the sky; " +
-             "non-zero double-counts it as a gray veil). Raise only in closed interiors with openings.")]
+    [Tooltip("Sky light through the UNOCCLUDED part of the horizon (occlusion-aware - a pixel facing a wall gets none). " +
+             "0 = off; the IBL ambient already counts the sky, so keep low. Useful in interiors with openings.")]
     public readonly ClampedFloatParameter skyFallback = new(0f, 0f, 1f);
 
-    [Tooltip("Rays per pixel. Temporal + denoise keep even 2-4 clean.")]
+    [Tooltip("Horizon slices per pixel (bitmask gather). Temporal + denoise keep even 2-4 clean; >8 is clamped.")]
     public readonly ClampedIntParameter rayCount = new(4, 1, 16);
 
     [Tooltip("Temporal frames to accumulate. Higher = smoother but laggier.")]
@@ -31,7 +31,7 @@ public sealed class ScreenSpaceGlobalIllumination : VolumeComponent {
     [Tooltip("Distance falloff exponent. 0 = no falloff; higher keeps bounce local.")]
     public readonly ClampedFloatParameter falloff = new(0.5f, 0f, 4f);
 
-    [Tooltip("Depth-test tolerance during the march. Thin = strict, thick = forgiving.")]
+    [Tooltip("Assumed occluder thickness in metres. Thin lets light leak past railings/foliage; thick treats them as walls.")]
     public readonly ClampedFloatParameter thickness = new(0.5f, 0.05f, 2f);
 
     [Tooltip("Strength of the local one-bounce colour added over the IBL.")]

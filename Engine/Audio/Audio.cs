@@ -22,7 +22,11 @@ public static class Audio {
         set { if (Backend is not null) Backend.MasterVolume = value; }
     }
 
-    public static bool IsAvailable => Backend is not null;
+    // True only when a backend is injected AND it actually came up (OpenAL device + context).
+    // A backend is injected at bootstrap even on machines with no OpenAL runtime, where it
+    // gracefully self-disables — so checking `Backend is not null` would wrongly report audio as
+    // available and hide the "no device / native DLL missing" case from the editor's preview hint.
+    public static bool IsAvailable => Backend is { IsAvailable: true };
 
     // ---- One-shot playback (Unity's AudioSource.PlayClipAtPoint / PlayOneShot) ---------------
 

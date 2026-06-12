@@ -14,6 +14,11 @@ internal static class RemoteHandlers {
     static EditorState editorState = null!;
     static EngineBootstrap bootstrap = null!;
 
+    // Set by EditorApplication: frame the Scene-view camera on a world point + radius, looking along
+    // an optional direction (zero = keep current). Lets the command port / agents frame a shot — the
+    // screenshot captures the Scene view, which uses the editor's own fly camera, NOT an HDCamera.
+    public static Action<OpenTK.Mathematics.Vector3, float, OpenTK.Mathematics.Vector3> FocusCamera;
+
     static readonly object logGate = new();
     static readonly List<(DateTime Time, int Level, string Message)> logTail = new();
 
@@ -50,6 +55,12 @@ internal static class RemoteHandlers {
         "screenshot" => Screenshot(p),
         "console.tail" => ConsoleTail(p),
         "scripts.rebuild" => new { ok = bootstrap.ReloadGameScripts() },
+        "unity.import" => UnityImport(p),
+        "editor.frame" => EditorFrame(p),
+        "editor.refresh" => EditorRefresh(),
+        "scene.component.add" => SceneComponentAdd(p),
+        "scene.component.set" => SceneComponentSet(p),
+        "help" => Help(),
         _ => throw new Exception($"unknown method '{method}' — methods: editor.status, scene.describe, " +
                                  "scene.save, scene.open, entity.get/create/delete, component.add/remove/set, " +
                                  "select, play.start/stop/pause/step, undo, redo, screenshot, console.tail, scripts.rebuild"),
@@ -120,6 +131,139 @@ internal static class RemoteHandlers {
                 }).ToList(),
             };
         }
+    }
+
+    // Force a full asset reimport (registers newly-written assets like converted .scene/.volume).
+    public static Action RequestRefresh;
+    static object EditorRefresh() {
+        if (RequestRefresh is null)
+            throw new Exception("refresh not wired");
+        RequestRefresh();
+        return new { refreshing = true, note = "poll editor.status; assets reimport on a worker" };
+    }
+
+    // Add a scene-wide component (SceneBehaviour: Skybox, ProceduralSky, SceneLighting, IrradianceVolume...).
+    static object SceneComponentAdd(JsonElement p) {
+        string typeName = RequireString(p, "type");
+        Type type = ComponentRegistry.ResolveScene(typeName)
+            ?? throw new Exception($"unknown scene component '{typeName}'" + Hint(typeName,
+                ComponentRegistry.SceneMenu.Select(e => e.Type.Name)));
+        EditorUndo.Push($"Add scene {type.Name} (remote)");
+        SceneBehaviour added = SceneManager.GetCurrentScene().AddSceneBehaviour(type);
+        Mutated();
+        return new { sceneComponent = added.GetType().Name };
+    }
+
+    // Set a member on a scene-wide component, e.g. {type:"ProceduralSky", member:"exposure", value:2}.
+    // This is the lever for sky/fog/lighting tuning that previously needed hand-edited scene YAML.
+    static object SceneComponentSet(JsonElement p) {
+        string typeName = RequireString(p, "type");
+        string memberName = RequireString(p, "member");
+        JsonElement value = p.TryGetProperty("value", out JsonElement v)
+            ? v : throw new Exception("missing 'value'");
+
+        SceneBehaviour behaviour = SceneManager.GetCurrentScene().SceneBehaviours
+            .FirstOrDefault(b => b.GetType().Name.Equals(typeName, StringComparison.OrdinalIgnoreCase))
+            ?? throw new Exception($"scene has no '{typeName}' component (add it with scene.component.add)");
+
+        EditorUndo.Push($"Set scene {typeName}.{memberName} (remote)");
+        object written = SetBehaviourMember(behaviour, memberName, value);
+        Mutated();
+        return new { sceneComponent = typeName, member = memberName, value = written };
+    }
+
+    // Lists every remote method (self-describing API so an agent can discover the control surface).
+    static object Help() => new {
+        methods = new[] {
+            "editor.status", "scene.describe", "scene.save", "scene.open {path}",
+            "entity.get {entity}", "entity.create {name,...}", "entity.delete {entity}",
+            "component.add {entity,type}", "component.remove {entity,type}",
+            "component.set {entity,target,value}",
+            "scene.component.add {type}", "scene.component.set {type,member,value}",
+            "select {entity}", "play.start/stop/pause/step",
+            "undo", "redo", "screenshot {path,settle}", "console.tail {count}",
+            "scripts.rebuild", "unity.import {path,subfolder}",
+            "editor.frame {entity?,dir?,fit?}", "editor.refresh", "help",
+        },
+    };
+
+    // Frames the Scene-view camera on an entity's geometry, or the WHOLE scene when no entity is
+    // given (aggregates every renderable's world bounds). This is what makes a remote screenshot
+    // useful — the capture is the Scene view, driven by the editor fly camera. Returns the framed
+    // center/radius so a caller can reason about scale.
+    static object EditorFrame(JsonElement p) {
+        if (FocusCamera is null)
+            throw new Exception("camera framing not wired");
+
+        var obj = p.ValueKind == JsonValueKind.Object;
+        string entityName = obj && p.TryGetProperty("entity", out JsonElement e) ? e.GetString() : null;
+        // Optional "dir":"x,y,z" look direction (e.g. "0,-1,-1" for a 3/4 top view); default keeps current.
+        OpenTK.Mathematics.Vector3 dir = default;
+        if (obj && p.TryGetProperty("dir", out JsonElement d) && d.GetString() is { } ds) {
+            var parts = ds.Split(',');
+            if (parts.Length == 3 &&
+                float.TryParse(parts[0], System.Globalization.CultureInfo.InvariantCulture, out var dx) &&
+                float.TryParse(parts[1], System.Globalization.CultureInfo.InvariantCulture, out var dy) &&
+                float.TryParse(parts[2], System.Globalization.CultureInfo.InvariantCulture, out var dz))
+                dir = new OpenTK.Mathematics.Vector3(dx, dy, dz);
+        }
+        // Optional "fit" multiplier on the framed radius (1 = default, <1 = closer, >1 = wider).
+        float fit = obj && p.TryGetProperty("fit", out JsonElement f) ? (float)f.GetDouble() : 1f;
+
+        OpenTK.Mathematics.Vector3 center;
+        float radius;
+
+        if (!string.IsNullOrEmpty(entityName)) {
+            Entity target = Resolve(entityName);
+            if (!EditorBounds.TryGetWorldBounds(target, out center, out radius)) {
+                center = target.transform.WorldPosition;
+                radius = 1f;
+            }
+        }
+        else if (!TryGetSceneBounds(out center, out radius)) {
+            throw new Exception("scene has no renderable geometry to frame");
+        }
+
+        FocusCamera(center, radius * MathF.Max(0.05f, fit), dir);
+        editorState.MarkViewportDirty();
+        return new {
+            framed = true,
+            center = new { center.X, center.Y, center.Z },
+            radius,
+        };
+    }
+
+    // Aggregate world bounds of every entity with renderable geometry in the current scene.
+    static bool TryGetSceneBounds(out OpenTK.Mathematics.Vector3 center, out float radius) {
+        center = default;
+        radius = 0f;
+        var min = new OpenTK.Mathematics.Vector3(float.MaxValue);
+        var max = new OpenTK.Mathematics.Vector3(float.MinValue);
+        var any = false;
+
+        foreach (Entity entity in SceneManager.GetCurrentScene().Entities) {
+            if (!EditorBounds.TryGetWorldBounds(entity, out OpenTK.Mathematics.Vector3 c, out float r))
+                continue;
+            any = true;
+            min = OpenTK.Mathematics.Vector3.ComponentMin(min, c - new OpenTK.Mathematics.Vector3(r));
+            max = OpenTK.Mathematics.Vector3.ComponentMax(max, c + new OpenTK.Mathematics.Vector3(r));
+        }
+        if (!any)
+            return false;
+
+        center = (min + max) * 0.5f;
+        radius = (max - min).Length * 0.5f;
+        return true;
+    }
+
+    // Headless trigger for the Unity package importer (the GUI uses a native file dialog we can't
+    // drive remotely). Kicks off the same worker; poll editor.status / console.tail for progress.
+    static object UnityImport(JsonElement p) {
+        string path = RequireString(p, "path");
+        string sub = p.ValueKind == JsonValueKind.Object && p.TryGetProperty("subfolder", out JsonElement s)
+            ? s.GetString() : "Imported";
+        UnityImportWindow.ImportPackage(path, sub);
+        return new { started = true, note = "poll editor.status / console.tail; result in console" };
     }
 
     // ---- scene / play ----------------------------------------------------------
@@ -251,20 +395,25 @@ internal static class RemoteHandlers {
                 if (dot <= 0 || dot == target.Length - 1)
                     throw new Exception($"unknown target '{target}' — name|active|tag|layer|transform.*|<Component>.<Member>");
                 Behaviour behaviour = FindComponent(entity, target[..dot]);
-                string memberName = target[(dot + 1)..];
-                var members = ComponentReflection.SerializableMembers(behaviour.GetType()).ToList();
-                MemberInfo member = members.FirstOrDefault(m =>
-                        string.Equals(m.Name, memberName, StringComparison.OrdinalIgnoreCase))
-                    ?? throw new Exception($"{behaviour.GetType().Name} has no serializable member '{memberName}'"
-                        + Hint(memberName, members.Select(m => m.Name)));
-                object converted = ConvertValue(ComponentReflection.MemberType(member), value);
-                ComponentReflection.SetValue(member, behaviour, converted);
-                written = LiveJson(SafeGet(member, behaviour));
+                written = SetBehaviourMember(behaviour, target[(dot + 1)..], value);
                 break;
             }
         }
         Mutated();
         return new { entity = entity.Name, target, value = written };
+    }
+
+    // Reflection member-set shared by entity components AND scene-wide components (both have
+    // serializable members discovered the same way). Returns the live value after the set.
+    static object SetBehaviourMember(object behaviour, string memberName, JsonElement value) {
+        var members = ComponentReflection.SerializableMembers(behaviour.GetType()).ToList();
+        MemberInfo member = members.FirstOrDefault(m =>
+                string.Equals(m.Name, memberName, StringComparison.OrdinalIgnoreCase))
+            ?? throw new Exception($"{behaviour.GetType().Name} has no serializable member '{memberName}'"
+                + Hint(memberName, members.Select(m => m.Name)));
+        object converted = ConvertValue(ComponentReflection.MemberType(member), value);
+        ComponentReflection.SetValue(member, behaviour, converted);
+        return LiveJson(SafeGet(member, behaviour));
     }
 
     static object Select(string query) {

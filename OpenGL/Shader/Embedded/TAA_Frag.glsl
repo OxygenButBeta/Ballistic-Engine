@@ -26,6 +26,16 @@ uniform mat4 PrevViewProj;    // previous frame, unjittered
 uniform float Feedback;       // history weight (0..0.97)
 uniform bool ValidHistory;
 
+// NaN/Inf scrub as a true component SELECT (arithmetic forms like mix(v,0,flag) keep the
+// NaN: NaN*0.0 == NaN). TAA is a forever-feedback loop: a single poisoned history pixel is
+// re-blended every frame (the variance clip can't repair it - every NaN comparison is false)
+// and spreads through the 9-tap history resample, so both inputs must be scrubbed.
+vec3 Sanitize(vec3 v) {
+    return vec3(isnan(v.x) || isinf(v.x) ? 0.0 : v.x,
+                isnan(v.y) || isinf(v.y) ? 0.0 : v.y,
+                isnan(v.z) || isinf(v.z) ? 0.0 : v.z);
+}
+
 vec3 RGBToYCoCg(vec3 c) {
     return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b,
                 0.5  * c.r            - 0.5  * c.b,
@@ -67,7 +77,9 @@ vec3 SampleHistoryCatmullRom(vec2 uv, vec2 texSize) {
 }
 
 void main() {
-    vec3 current = texture(currentTexture, TexCoords).rgb;
+    // The scene can carry a transient NaN/Inf speckle (EXR sun, degenerate specular);
+    // unscrubbed it enters the history and sticks until the camera flushes it.
+    vec3 current = Sanitize(texture(currentTexture, TexCoords).rgb);
     if (!ValidHistory) {
         FragColor = vec4(current, 1.0);
         return;
@@ -87,7 +99,7 @@ void main() {
     }
 
     vec2 texSize = vec2(textureSize(currentTexture, 0));
-    vec3 history = RGBToYCoCg(SampleHistoryCatmullRom(prevUV, texSize));
+    vec3 history = RGBToYCoCg(Sanitize(SampleHistoryCatmullRom(prevUV, texSize)));
 
     // First/second moments of the 3x3 neighborhood in YCoCg.
     vec2 texel = 1.0 / texSize;

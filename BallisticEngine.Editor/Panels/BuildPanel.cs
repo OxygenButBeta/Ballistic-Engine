@@ -6,11 +6,14 @@ using SysVec4 = System.Numerics.Vector4;
 
 namespace BallisticEngine.Editor;
 
-// Build window (Window > Build) — Unity-style "Build Settings". An ordered "Scenes In Build" list
-// (first = startup scene), an output folder, and a Build button that produces a shippable standalone
-// player via BuildPipeline (publishes the Runtime exe self-contained + copies project content). The
-// build runs on a worker thread behind a live log so the editor stays responsive during the minutes
-// a self-contained publish takes.
+// Build window (Window > Build) — Unity-style "Build Settings" + "Player Settings" in one panel:
+//   • Player Settings  — product/company/version, icon, window mode + resolution (baked into the exe)
+//   • Scenes In Build  — ordered list (first = startup scene)
+//   • Output           — folder, self-contained toggle, configuration + target RID
+//   • Build            — runs BuildPipeline on a worker thread behind a live log; optional run-after
+//                        and open-folder-after.
+// The build runs on a worker thread behind a live log so the editor stays responsive during the
+// minutes a self-contained publish takes.
 internal sealed class BuildPanel {
     public bool Open;
 
@@ -21,15 +24,37 @@ internal sealed class BuildPanel {
     readonly List<string> scenes = new();
     bool initialized;
 
+    // ---- player settings (edited in-panel, saved into project.json) ----
+    string productName = "";
+    string companyName = "";
+    string version = "1.0.0";
+    string iconPath = "";
+    int windowModeIndex;          // 0 Fullscreen, 1 Windowed, 2 Borderless
+    int resWidth = 1920, resHeight = 1080;
+
+    // ---- output / toolchain ----
     string outputDir = "";
     bool selfContained = true;
+    int configIndex;              // 0 Release, 1 Debug
+    int ridIndex;                 // 0 win-x64, 1 win-arm64
+    static readonly string[] Configurations = { "Release", "Debug" };
+    static readonly string[] Rids = { "win-x64", "win-arm64" };
+    static readonly string[] WindowModes = { "Fullscreen", "Windowed", "Borderless" };
 
-    // ---- worker state (touched from the build thread, read on the Um thread under `gate`) ----
+    // ---- post-build actions ----
+    bool runAfterBuild;
+    bool openFolderAfterBuild = true;
+
+    // ---- worker state (touched from the build thread, read on the UI thread under `gate`) ----
     readonly object gate = new();
     readonly List<string> log = new();
     bool building;
     bool? lastSucceeded;
     string lastSummary;
+    string lastExePath;                 // set by the worker on success; drives Run / Open Folder
+    volatile bool runWhenDone;          // snapshot of runAfterBuild for the worker's completion
+    volatile bool openWhenDone;
+    string pendingLaunchExe;            // worker → UI handoff: launch this exe on the next Draw
 
     public BuildPanel(BallisticProject project) {
         this.project = project;
@@ -41,14 +66,23 @@ internal sealed class BuildPanel {
 
         EnsureInitialized();
 
-        ImGui.SetNextWindowSize(new SysVec2(560 * scale, 560 * scale), ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowSize(new SysVec2(580 * scale, 640 * scale), ImGuiCond.FirstUseEver);
         if (!ImGui.Begin($"{EditorIcons.Package}  Build", ref Open)) {
             ImGui.End();
             return;
         }
 
+        // Worker-requested launch runs here on the UI thread (Process.Start off the worker is fine too,
+        // but doing it here keeps all process spawning on one thread and lets us clear the flag safely).
+        if (pendingLaunchExe is not null) {
+            LaunchBuiltExe(pendingLaunchExe);
+            pendingLaunchExe = null;
+        }
+
+        DrawPlayerSettings(scale);
+        ImGui.Dummy(new SysVec2(0, 4 * scale));
         DrawScenesInBuild(scale);
-        ImGui.Dummy(new SysVec2(0, 6 * scale));
+        ImGui.Dummy(new SysVec2(0, 4 * scale));
         DrawOutputSection(scale);
         ImGui.Dummy(new SysVec2(0, 6 * scale));
         DrawBuildButton(scale);
@@ -67,18 +101,108 @@ internal sealed class BuildPanel {
         else if (!string.IsNullOrEmpty(project.Manifest.StartupScene))
             scenes.Add(project.Manifest.StartupScene);
 
-        outputDir = Path.Combine(project.RootPath, "Build", Sanitize(project.Manifest.Name));
+        PlayerSettings p = PlayerSettings.OrDefault(project.Manifest);
+        productName = p.ProductName ?? project.Manifest.Name;
+        companyName = p.CompanyName ?? "";
+        version = string.IsNullOrWhiteSpace(p.Version) ? "1.0.0" : p.Version;
+        iconPath = p.IconPath ?? "";
+        windowModeIndex = (int)p.WindowMode;
+        resWidth = p.Width > 0 ? p.Width : 1920;
+        resHeight = p.Height > 0 ? p.Height : 1080;
+        selfContained = p.SelfContained;
+        configIndex = Array.IndexOf(Configurations, p.Configuration); if (configIndex < 0) configIndex = 0;
+        ridIndex = Array.IndexOf(Rids, p.RuntimeIdentifier); if (ridIndex < 0) ridIndex = 0;
+
+        outputDir = Path.Combine(project.RootPath, "Build", Sanitize(productName));
+    }
+
+    // ---- Player Settings ----------------------------------------------------
+
+    void DrawPlayerSettings(float scale) {
+        if (!ImGui.CollapsingHeader($"{EditorIcons.Wrench}  Player Settings", ImGuiTreeNodeFlags.DefaultOpen))
+            return;
+
+        ImGui.Indent(8 * scale);
+
+        LabeledInput("Product Name", "##product", ref productName, 128, scale,
+            "The shipped game's name: the window title AND the published <Name>.exe.");
+        LabeledInput("Company", "##company", ref companyName, 128, scale,
+            "Embedded in the exe's file details (optional).");
+        LabeledInput("Version", "##version", ref version, 32, scale,
+            "Version baked into the exe (e.g. 1.0.0). Free-form text also allowed.");
+
+        // Icon: read-only path + Browse / Clear.
+        ImGui.TextDisabled("Icon (.ico)");
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("A .ico embedded into the exe for its taskbar/file icon. Optional.");
+        float btns = (EditorIcons.SmallButtonWidth(EditorIcons.Folder) + ImGui.GetStyle().ItemSpacing.X) * 2;
+        var iconDisplay = string.IsNullOrEmpty(iconPath) ? "(engine default)" : iconPath;
+        ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X - btns);
+        ImGui.BeginDisabled(true);
+        ImGui.InputText("##icon", ref iconDisplay, 512);
+        ImGui.EndDisabled();
+        ImGui.SameLine();
+        if (EditorIcons.GhostButtonSmall("pickicon", EditorIcons.Folder, "Pick a .ico file")) BrowseForIcon();
+        ImGui.SameLine();
+        ImGui.BeginDisabled(string.IsNullOrEmpty(iconPath));
+        if (EditorIcons.GhostButtonSmall("clearicon", EditorIcons.Delete, "Use the engine default icon")) iconPath = "";
+        ImGui.EndDisabled();
+
+        // Window mode + resolution.
+        ImGui.TextDisabled("Window");
+        ImGui.SetNextItemWidth(160 * scale);
+        ImGui.Combo("Mode##winmode", ref windowModeIndex, WindowModes, WindowModes.Length);
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Fullscreen = borderless at the monitor's resolution.\n" +
+                             "Windowed/Borderless use the resolution below.");
+
+        ImGui.BeginDisabled(windowModeIndex == 0); // resolution is irrelevant for monitor-sized fullscreen
+        ImGui.SetNextItemWidth(90 * scale);
+        ImGui.InputInt("##resw", ref resWidth, 0);
+        ImGui.SameLine();
+        ImGui.TextDisabled("x");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(90 * scale);
+        ImGui.InputInt("##resh", ref resHeight, 0);
+        ImGui.SameLine();
+        ImGui.TextDisabled("default window size");
+        ImGui.EndDisabled();
+        resWidth = Math.Clamp(resWidth, 320, 16384);
+        resHeight = Math.Clamp(resHeight, 240, 16384);
+
+        ImGui.Unindent(8 * scale);
+    }
+
+    void LabeledInput(string label, string id, ref string value, int max, float scale, string tip) {
+        ImGui.TextDisabled(label);
+        if (tip is not null && ImGui.IsItemHovered())
+            ImGui.SetTooltip(tip);
+        ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X);
+        ImGui.InputText(id, ref value, (uint)max);
+    }
+
+    void BrowseForIcon() {
+        string picked = NativeDialogs.PickFile("Select an application icon", "Icon", new[] { "ico" },
+            project.AssetsPath);
+        if (string.IsNullOrEmpty(picked))
+            return;
+        // Store project-relative when the icon lives under the project; else keep the absolute path.
+        if (picked.StartsWith(project.RootPath, StringComparison.OrdinalIgnoreCase))
+            iconPath = Path.GetRelativePath(project.RootPath, picked).Replace('\\', '/');
+        else
+            iconPath = picked;
     }
 
     // ---- Scenes In Build ----------------------------------------------------
 
     void DrawScenesInBuild(float scale) {
-        ImGui.TextDisabled("Scenes In Build");
+        if (!ImGui.CollapsingHeader($"{EditorIcons.Document}  Scenes In Build", ImGuiTreeNodeFlags.DefaultOpen))
+            return;
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("Scenes shipped with the build. The first one loads on startup.\n" +
                              "Load others at runtime with SceneManager.LoadScene(\"Name\").");
 
-        ImGui.BeginChild("##scenes", new SysVec2(0, 170 * scale), ImGuiChildFlags.Borders);
+        ImGui.BeginChild("##scenes", new SysVec2(0, 150 * scale), ImGuiChildFlags.Borders);
         if (scenes.Count == 0)
             ImGui.TextDisabled("No scenes added. Use \"Add Open Scene\" or the + below.");
 
@@ -130,8 +254,8 @@ internal sealed class BuildPanel {
         ImGui.SameLine();
         if (ImGui.Button($"{EditorIcons.Folder}  Add Scene...")) ImGui.OpenPopup("##addscene");
         ImGui.SameLine();
-        if (ImGui.Button($"{EditorIcons.Save}  Save List")) SaveManifestScenes();
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Write the list into project.json without building");
+        if (ImGui.Button($"{EditorIcons.Save}  Save Settings")) SaveManifest();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Write scenes + player settings into project.json without building");
 
         DrawAddScenePopup(scale);
     }
@@ -162,9 +286,13 @@ internal sealed class BuildPanel {
         ImGui.EndPopup();
     }
 
-    // ---- Output + build button ----------------------------------------------
+    // ---- Output + toolchain --------------------------------------------------
 
     void DrawOutputSection(float scale) {
+        if (!ImGui.CollapsingHeader($"{EditorIcons.Folder}  Output", ImGuiTreeNodeFlags.DefaultOpen))
+            return;
+
+        ImGui.Indent(8 * scale);
         ImGui.TextDisabled("Output Folder");
 
         // Field + Browse button on one row: shrink the field to leave room for the button.
@@ -177,7 +305,17 @@ internal sealed class BuildPanel {
             BrowseForOutput();
         ImGui.EndDisabled();
 
-        ImGui.Checkbox("Self-contained (bundle .NET 9 — target needs no runtime installed)", ref selfContained);
+        ImGui.Checkbox("Self-contained (bundle .NET 9 — target needs no runtime installed)", ref selfContained);
+
+        ImGui.SetNextItemWidth(140 * scale);
+        ImGui.Combo("Configuration", ref configIndex, Configurations, Configurations.Length);
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(140 * scale);
+        ImGui.Combo("Platform", ref ridIndex, Rids, Rids.Length);
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Target runtime. win-x64 for most PCs; win-arm64 for ARM Windows.");
+
+        ImGui.Unindent(8 * scale);
     }
 
     void BrowseForOutput() {
@@ -194,7 +332,13 @@ internal sealed class BuildPanel {
     }
 
     void DrawBuildButton(float scale) {
-        bool canBuild = !building && scenes.Count > 0 && !string.IsNullOrWhiteSpace(outputDir);
+        ImGui.Separator();
+        ImGui.Checkbox("Run after build", ref runAfterBuild);
+        ImGui.SameLine(0, 24 * scale);
+        ImGui.Checkbox("Open output folder when done", ref openFolderAfterBuild);
+
+        bool canBuild = !building && scenes.Count > 0 && !string.IsNullOrWhiteSpace(outputDir)
+                        && !string.IsNullOrWhiteSpace(productName);
 
         ImGui.BeginDisabled(!canBuild);
         if (ImGui.Button(building ? "Building..." : $"{EditorIcons.Package}  Build",
@@ -206,10 +350,19 @@ internal sealed class BuildPanel {
             ImGui.SameLine();
             ImGui.TextColored(EditorIcons.TintLight, "Add at least one scene to build.");
         }
+        else if (string.IsNullOrWhiteSpace(productName)) {
+            ImGui.SameLine();
+            ImGui.TextColored(EditorIcons.TintLight, "Set a Product Name.");
+        }
         else if (lastSucceeded == true) {
             ImGui.SameLine();
             if (ImGui.Button($"{EditorIcons.FolderOpen}  Open Folder", new SysVec2(0, 32 * scale)))
                 OpenOutputFolder();
+            if (lastExePath is not null && File.Exists(lastExePath)) {
+                ImGui.SameLine();
+                if (ImGui.Button($"{EditorIcons.Play}  Run", new SysVec2(0, 32 * scale)))
+                    LaunchBuiltExe(lastExePath);
+            }
         }
     }
 
@@ -245,21 +398,29 @@ internal sealed class BuildPanel {
     // ---- actions ------------------------------------------------------------
 
     void StartBuild() {
+        PlayerSettings player = CollectPlayerSettings();
         var options = new BuildPipeline.Options {
             Project = project,
             OutputDir = outputDir.Trim(),
             ScenesInBuild = scenes.ToList(),
             SelfContained = selfContained,
+            Configuration = Configurations[configIndex],
+            RuntimeIdentifier = Rids[ridIndex],
+            Player = player,
         };
 
-        // Persist the list immediately so it survives even if the build later fails.
-        SaveManifestScenes();
+        // Persist scenes + player settings immediately so they survive even if the build later fails.
+        SaveManifest();
+
+        runWhenDone = runAfterBuild;
+        openWhenDone = openFolderAfterBuild;
 
         lock (gate) {
             log.Clear();
             building = true;
             lastSucceeded = null;
             lastSummary = "Building...";
+            lastExePath = null;
         }
         BuildProgress.Begin();   // drives the full-window BusyOverlay card
 
@@ -268,16 +429,39 @@ internal sealed class BuildPanel {
             lock (gate) {
                 building = false;
                 lastSucceeded = result.Success;
+                lastExePath = result.Success ? result.ExePath : null;
                 lastSummary = result.Success
-                    ? $"{EditorIcons.Check}  Build succeeded."
+                    ? $"{EditorIcons.Check}  Build succeeded  ({Megabytes(result.TotalBytes)} MB)."
                     : $"{EditorIcons.Error}  Build failed: {result.Error}";
                 if (!result.Success && result.Error is not null)
                     log.Add(result.Error);
             }
             BuildProgress.End();
+
+            // Post-build actions (off the worker — folder open is safe anywhere; the exe launch is
+            // handed to the UI thread via pendingLaunchExe so all process spawning happens in Draw).
+            if (result.Success) {
+                if (openWhenDone)
+                    OpenFolder(result.OutputDir);
+                if (runWhenDone && result.ExePath is not null)
+                    pendingLaunchExe = result.ExePath;
+            }
         }) { IsBackground = true, Name = "BallisticBuild" };
         thread.Start();
     }
+
+    PlayerSettings CollectPlayerSettings() => new() {
+        ProductName = string.IsNullOrWhiteSpace(productName) ? project.Manifest.Name : productName.Trim(),
+        CompanyName = companyName.Trim(),
+        Version = string.IsNullOrWhiteSpace(version) ? "1.0.0" : version.Trim(),
+        IconPath = string.IsNullOrWhiteSpace(iconPath) ? null : iconPath.Trim(),
+        WindowMode = (WindowMode)windowModeIndex,
+        Width = resWidth,
+        Height = resHeight,
+        Configuration = Configurations[configIndex],
+        RuntimeIdentifier = Rids[ridIndex],
+        SelfContained = selfContained,
+    };
 
     // Each pipeline message is appended to the in-window log. Top-level phase headlines (the pipeline
     // emits one per phase, in order) advance the overlay's determinate bar; indented sub-messages
@@ -301,16 +485,33 @@ internal sealed class BuildPanel {
             ImGui.OpenPopup("##addscene");
     }
 
-    void SaveManifestScenes() {
+    void SaveManifest() {
         project.Manifest.ScenesInBuild = scenes.ToList();
         project.Manifest.StartupScene = scenes.FirstOrDefault();
+        project.Manifest.Player = CollectPlayerSettings();
         PipelineJson.Write(Path.Combine(project.RootPath, "project.json"), project.Manifest);
-        Append($"Saved {scenes.Count} scene(s) to project.json.");
+        Append($"Saved build settings to project.json ({scenes.Count} scene(s)).");
     }
 
-    void OpenOutputFolder() {
-        if (Directory.Exists(outputDir))
-            Process.Start("explorer.exe", $"\"{outputDir}\"");
+    void OpenOutputFolder() => OpenFolder(outputDir);
+
+    static void OpenFolder(string dir) {
+        if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir))
+            try { Process.Start("explorer.exe", $"\"{dir}\""); } catch { /* best effort */ }
+    }
+
+    void LaunchBuiltExe(string exePath) {
+        try {
+            // Launch with its own directory as the working dir so it finds Data\ next to the exe.
+            Process.Start(new ProcessStartInfo(exePath) {
+                WorkingDirectory = Path.GetDirectoryName(exePath),
+                UseShellExecute = true,
+            });
+            Append($"Launched {Path.GetFileName(exePath)}.");
+        }
+        catch (Exception e) {
+            Append($"Could not launch {Path.GetFileName(exePath)}: {e.Message}");
+        }
     }
 
     // ---- helpers ------------------------------------------------------------
@@ -322,6 +523,8 @@ internal sealed class BuildPanel {
             .OrderBy(p => p, StringComparer.OrdinalIgnoreCase);
 
     static string SceneName(string assetPath) => Path.GetFileNameWithoutExtension(assetPath);
+
+    static string Megabytes(long bytes) => (bytes / (1024.0 * 1024.0)).ToString("F1");
 
     static string Sanitize(string name) {
         foreach (char c in Path.GetInvalidFileNameChars())

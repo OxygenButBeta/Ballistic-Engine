@@ -10,6 +10,11 @@ namespace BallisticEngine;
 // buffers (CreateBuffer), spawns voices to play them (Play), and updates the listener pose +
 // active voices once per frame (Update). Dispose tears the device down on shutdown.
 public interface IAudioBackend : System.IDisposable {
+    // True once the backend's device/context actually came up. A backend is still injected on
+    // machines with no audio runtime (it self-disables and plays silently rather than crashing),
+    // so the engine checks THIS — not "is a backend present" — to know whether sound really works.
+    bool IsAvailable { get; }
+
     // Uploads decoded PCM to a driver-side buffer and returns an opaque handle (0 = failed).
     // The CPU AudioData can be dropped after this — the buffer owns the samples.
     int CreateBuffer(in AudioData data);
@@ -39,6 +44,7 @@ public interface IAudioVoice {
     float Pitch { get; set; }       // playback rate multiplier, 1 = normal
     Vector3 Position { get; set; }  // world-space; ignored by 2D voices
     Vector3 Velocity { get; set; }  // for Doppler; ignored by 2D voices
+    float TimeSeconds { get; set; } // play-head position in seconds; set to seek (clamped by driver)
 
     void Stop();
     void Pause();

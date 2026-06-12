@@ -81,7 +81,25 @@ loop returns or the process never exits.
 - Loading any image asset AS `Texture3D` builds an equirect cubemap (skybox from .hdr/.exr).
 - `ModelImporter` (meshIndex -1) merges the whole model with one submesh per source material
   and generates a sibling `<Model>_Materials/` folder of `.mat` assets (rewritten on reimport).
+  - **Texture auto-bind by filename convention** (v7, `TextureConventionMatcher`): when a source
+    material references NO textures of its own (Quixel Megascans / textures.com / Substance ship an
+    empty FBX material + sibling `<stem>_4K_Albedo.jpg` etc.), maps are matched by suffix
+    (Albedo/Basecolor/Diffuse→Diffuse, Normal, Roughness [preferred over Gloss — no invert path],
+    Metalness→Metallic, AO, Emissive; Opacity/Mask→Cutout). Fallback ONLY — authored refs (glTF) win.
+  - **FBX unit conversion** (v8, `FbxUnitScaleFactor`): FBX's system unit is cm. cm-authored content
+    imported 100x too big; the importer reads `UnitScaleFactor` straight from the FBX (AssimpNet 4.1.0
+    has no scene metadata) and bakes a cm→m scale into the root node's local transform (vertices AND
+    the split-by-nodes hierarchy). `scaleFactor` setting: 0 = auto from file units, >0 = forced.
+    glTF/OBJ/DAE are metric → factor 1 (byte-identical to pre-v8).
 - `.pyscene` (Falcor) imports regex-parse camera/lights/models/envmap → sibling `.scene`.
+- **Unity package import** (editor: Assets > Import Unity Package): pick a `.unitypackage` (gzip tar:
+  `<guid>/{asset,asset.meta,pathname}`) or an unpacked Unity `Assets/` folder. `UnityPackageReader`
+  extracts the path tree; `UnityYamlParser` parses `.unity`/`.prefab` (the `--- !u!<classID> &<fileID>`
+  format — GameObject/Transform/MeshFilter/MeshRenderer); `UnitySceneConverter` emits a Ballistic
+  `.scene` (transform hierarchy + StaticMeshRenderers, **LH→RH coord fix: mirror X**), resolving Unity
+  `{guid}` refs via `UnityMetaGuidMap` (Unity .meta guid → on-disk file). This is the path to an
+  ASSEMBLED layout: bare prop-pack FBX has no scene data, but a Unity package carries the dressed
+  prefab/scene. (`AssetPipeline/Unity/`, `Engine/Serialization/Unity/`, editor `UnityImportWindow`.)
 
 ## Game scripting (C#)
 
@@ -268,10 +286,13 @@ loop returns or the process never exits.
 - **Transient RT pool**: post passes `GLRenderTexturePool.Shared.Acquire()` per-frame scratch
   (released wholesale in `EndFrame`); ONLY cross-frame history (TAA/SSGI/volumetric
   accumulation) stays pass-owned. Never pool history.
-- **SSR marches at half-res**; SSR_Combine upsamples depth-aware. SSGI gather validates hits
-  (front-face check + tight thickness) — without it every ray "hits" behind a silhouette and
-  the frame gets a gray scene-average veil. `SsgiSkyFallback` defaults 0 (sky is already in
-  the IBL ambient; non-zero double-counts it).
+- **SSR marches at half-res**; SSR_Combine upsamples depth-aware. **SSGI gather = horizon
+  slices with sector visibility BITMASKS** (SSILVB-style, `SSGI_Frag.glsl`, `#version 460`):
+  per slice a 32-bit mask over the hemisphere arc gives ORDERED occlusion (near occluders
+  block far light — no scene-average veil by construction), `Thickness` = assumed occluder
+  thickness (thin geometry occludes thin sectors), and sky enters only through the visibly
+  OPEN sectors. `rayCount` now means slices (clamped to 8). `SsgiSkyFallback` still defaults
+  0 (sky is already in the IBL ambient). Temporal/denoise/combine chain unchanged.
 - **Per-pass GPU timers** (`GLGpuTimers`, timestamp queries, non-blocking ring) publish into
   `RenderStats.Scene/Game` with real draw/triangle/cull counters — the editor Stats overlay
   shows them; `Transform` caches Local/World matrices with version stamps (don't bypass the
@@ -304,6 +325,12 @@ loop returns or the process never exits.
   (`EditorUndo.Push()`; `ImGui.IsItemActivated()` for widgets).
 - Rider locks folders on Windows — `git mv`/renames of open dirs fail; copy + `git rm --cached`.
 - FSQ/post/IBL shaders are **embedded resources** under `OpenGL/Shader/Embedded/`, not assets.
+- **GLSL NaN scrubs MUST be a component SELECT (ternary), never `mix(v, 0, flag)`** — float
+  `mix` is arithmetic (`v*(1-flag) + 0*flag`) and `NaN*0 == NaN`, `Inf*0 == NaN`: proven leak
+  on AMD RX 9070 XT (driver test in `%TEMP%\bal-nan-test`). The broken form turned one Inf
+  sun/specular pixel into NaN that the SSGI temporal EMA + multi-bounce + a-trous denoise grew
+  into a screen-eating black-noise field a STATIC camera could never flush (fast motion =
+  disocclusion reject = flush). Same rule applies in every temporal-feedback shader (SSGI x4, TAA).
 - **Bepu has no restitution — bounce = SOFT undamped contact springs** (low frequency,
   damping `1-bounciness`, uncapped recovery velocity). Stiffening the spring makes impacts
   MORE inelastic (speculative contacts absorb the approach velocity). Solver runs
