@@ -392,6 +392,9 @@ internal sealed class InspectorPanel {
             if (behaviour is AnimatorController controller)
                 DrawAnimatorControllerSection(controller);
 
+            if (behaviour is LightAnimator lightAnim)
+                DrawLightAnimatorSection(lightAnim);
+
             if (behaviour is ParticleSystem particles)
                 DrawParticleSystemSection(particles);
 
@@ -701,6 +704,42 @@ internal sealed class InspectorPanel {
         if (SceneManager.IsPlaying)
             state.MarkViewportDirty(); // keep repainting so transitions show live
     }
+
+    // LightAnimator: a live preview toggle that animates the light IN EDIT MODE (so you can dial in a
+    // flicker/pulse without entering play), plus a warning if there's no light on the entity to drive.
+    // The IntensityCurve / ColorOverTime members render their curve+gradient widgets automatically via
+    // the reflection DrawMember, so this only adds the preview control.
+    void DrawLightAnimatorSection(LightAnimator lightAnim) {
+        ImGui.Spacing();
+        ImGui.SeparatorText("Preview");
+
+        bool hasLight = lightAnim.GetComponent<PointLight>() is not null
+                     || lightAnim.GetComponent<SpotLight>() is not null;
+        if (!hasLight) {
+            ImGui.TextColored(new SysVec4(1f, 0.7f, 0.3f, 1f), "No PointLight or SpotLight on this entity.");
+            ImGui.TextDisabled("Add one — the animator drives its Intensity + Color.");
+            return;
+        }
+
+        if (ImGui.Button(lightAnimPreview ? $"{EditorIcons.Pause}  Stop Preview" : $"{EditorIcons.Play}  Preview",
+                new SysVec2(140, 0))) {
+            lightAnimPreview = !lightAnimPreview;
+            if (lightAnimPreview) lightAnimPreviewClock = 0f;
+            else { lightAnim.RestoreBase(); state.MarkViewportDirty(); } // un-dim the light when stopping
+        }
+        ImGui.SameLine();
+        ImGui.TextDisabled(lightAnim.Animation.ToString());
+
+        // Drive the light in edit mode along its own preview clock (play mode runs Tick itself).
+        if (lightAnimPreview && !SceneManager.IsPlaying) {
+            lightAnimPreviewClock += (float)Time.DeltaTime;
+            lightAnim.Apply(lightAnimPreviewClock);
+            state.MarkViewportDirty();
+        }
+    }
+
+    static bool lightAnimPreview;
+    static float lightAnimPreviewClock;
 
     // ParticleSystem preview: it already animates live in the editor (AdvanceAll runs every editor
     // frame), so this just adds a Restart (clear) + a one-shot Emit test + a live count, and keeps the
