@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "guid": "4a5aa95a-592b-4772-938c-bcd2933f2996",
+  "importer": "ModelImporter",
+  "settings": {
+    "flipUVs": true,
+    "meshIndex": -1,
+    "generateMaterials": true,
+    "shader": "Assets/Default/Shaders/Standard.shader",
+    "splitByNodes": true
+  }
+}

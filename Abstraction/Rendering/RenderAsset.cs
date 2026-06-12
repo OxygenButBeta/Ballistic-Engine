@@ -15,6 +15,11 @@ public abstract class RenderAsset
 
     public abstract GPUBuffer<Vector4> CreateTangentBuffer(RenderContext renderContext);
 
+    // Skinning vertex attributes (location 8 = bone indices, 9 = weights); only skinned meshes
+    // create them. Both are Vector4 float buffers (indices are rounded to ints in the shader).
+    public abstract GPUBuffer<Vector4> CreateBoneIndexBuffer(RenderContext renderContext);
+    public abstract GPUBuffer<Vector4> CreateBoneWeightBuffer(RenderContext renderContext);
+
     public abstract GPUBuffer<T> CreateBuffer<T>(RenderContext renderContext) where T : unmanaged;
     public abstract InstancedBuffer CreateInstancedBuffer(RenderContext renderContext);
     public abstract Texture2D CreateTexture2D(in TextureData data, TextureType type);

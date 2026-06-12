@@ -29,6 +29,14 @@ public sealed class OpenGLRenderAsset : RenderAsset {
         return new GLTangentBuffer(renderContext);
     }
 
+    public override GPUBuffer<Vector4> CreateBoneIndexBuffer(RenderContext renderContext) {
+        return new GLBoneIndexBuffer(renderContext);
+    }
+
+    public override GPUBuffer<Vector4> CreateBoneWeightBuffer(RenderContext renderContext) {
+        return new GLBoneWeightBuffer(renderContext);
+    }
+
     public override GPUBuffer<T> CreateBuffer<T>(RenderContext renderContext) {
         return new GLBuffer<T>(renderContext);
     }

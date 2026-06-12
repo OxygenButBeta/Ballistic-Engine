@@ -45,6 +45,14 @@ public static class GraphicAPI
         RenderAsset.Current.CreateTangentBuffer(renderContext);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static GPUBuffer<Vector4> CreateBoneIndexBuffer(RenderContext renderContext) =>
+        RenderAsset.Current.CreateBoneIndexBuffer(renderContext);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static GPUBuffer<Vector4> CreateBoneWeightBuffer(RenderContext renderContext) =>
+        RenderAsset.Current.CreateBoneWeightBuffer(renderContext);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static GPUBuffer<T> CreateBuffer<T>(RenderContext renderContext) where T : unmanaged =>
         RenderAsset.Current.CreateBuffer<T>(renderContext);
 

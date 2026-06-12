@@ -25,10 +25,21 @@ public class Mesh : BObject
     // instantiates one entity per node so the authored tree survives.
     public readonly MeshNodeData[] Nodes;
 
+    // ---- Skinning (null/default for static meshes) --------------------------
+    // The skeleton these vertices are bound to, and per-vertex influences (CPU copies; the GPU
+    // index/weight buffers are at locations 8/9). IsSkinned gates the skinned render path.
+    public readonly SkeletonData Skeleton;
+    public readonly Vector4i[] BoneIndices;
+    public readonly Vector4[] BoneWeights;
+    public bool IsSkinned { get; }
+    public int BoneCount => Skeleton.BoneCount;
+
     readonly GPUBuffer<Vector3> vertexBuffer;
     readonly GPUBuffer<Vector2> UVBuffer;
     readonly GPUBuffer<Vector3> normalBuffer;
     readonly GPUBuffer<Vector4> tangentBuffer;
+    readonly GPUBuffer<Vector4> boneIndexBuffer;   // skinned only
+    readonly GPUBuffer<Vector4> boneWeightBuffer;  // skinned only
     public readonly InstancedBuffer InstanceBuffer;
 
     readonly GPUBuffer<uint> indexBuffer;
@@ -50,6 +61,17 @@ public class Mesh : BObject
         Tangents = data.Tangents;
         UVs = data.UVs;
         Normals = data.Normals;
+
+        // Skinning data: keep CPU copies (the Animator walks the skeleton) and, on a skinned mesh,
+        // create the bone-index/weight vertex buffers into THIS mesh's VAO (locations 8/9).
+        IsSkinned = data.IsSkinned;
+        Skeleton = data.Skeleton;
+        BoneIndices = data.BoneIndices;
+        BoneWeights = data.BoneWeights;
+        if (IsSkinned) {
+            boneIndexBuffer = GraphicAPI.CreateBoneIndexBuffer(renderContext);
+            boneWeightBuffer = GraphicAPI.CreateBoneWeightBuffer(renderContext);
+        }
         SubMeshes = data.SubMeshes is { Length: > 0 }
             ? data.SubMeshes
             : [new SubMeshData(null, 0, data.Indices.Length, null)];
@@ -161,5 +183,19 @@ public class Mesh : BObject
 
         tangentBuffer.Create();
         tangentBuffer.SetBufferData(in Tangents, BufferUsageHint.StaticDraw);
+
+        if (IsSkinned) {
+            // Bone indices upload as floats (location 8); exact for any bone count (< 2^24).
+            var indicesAsFloat = new Vector4[BoneIndices.Length];
+            for (var i = 0; i < BoneIndices.Length; i++) {
+                Vector4i b = BoneIndices[i];
+                indicesAsFloat[i] = new Vector4(b.X, b.Y, b.Z, b.W);
+            }
+            boneIndexBuffer.Create();
+            boneIndexBuffer.SetBufferData(in indicesAsFloat, BufferUsageHint.StaticDraw);
+
+            boneWeightBuffer.Create();
+            boneWeightBuffer.SetBufferData(in BoneWeights, BufferUsageHint.StaticDraw);
+        }
     }
 }
