@@ -56,6 +56,7 @@ internal sealed class EditorApplication {
     // Double-click ANY panel's tab to fill the window with it; Esc restores. null = no panel
     // maximized. (Was viewport-only; now works for every dockable panel.)
     string maximizedPanel;
+    float contentAreaTop;   // Y of the dock area's top (just under the toolbar); clamps the tab-strip band
     bool maximizedViewport => maximizedPanel == EditorLayout.SceneView || maximizedPanel == EditorLayout.GameView;
 
     bool showStats;
@@ -611,6 +612,7 @@ internal sealed class EditorApplication {
         // Full-window host window owning the central DockSpace. Transparent + chromeless so the docked
         // panels read as the whole editor; sits below the toolbar strip.
         SysVec2 hostPos = workPos + new SysVec2(0, toolbarH);
+        contentAreaTop = hostPos.Y;   // the tab-strip band must not reach above this (into the toolbar)
         SysVec2 hostSize = new(workSize.X, workSize.Y - toolbarH);
         ImGui.SetNextWindowPos(hostPos);
         ImGui.SetNextWindowSize(hostSize);
@@ -1280,13 +1282,13 @@ internal sealed class EditorApplication {
         float winW = ImGui.GetWindowSize().X;
         float contentTop = winPos.Y + ImGui.GetCursorStartPos().Y;
         float stripTop = winPos.Y - (ImGui.IsWindowDocked() ? ImGui.GetFrameHeight() : 0f);
-        bool onStrip = mouse.X >= winPos.X && mouse.X <= winPos.X + winW &&
-                       mouse.Y >= stripTop && mouse.Y < contentTop;
-        // NEVER trigger when the cursor is over an actual widget — the strip band reaches up over the
-        // toolbar for docked windows, so double-clicking the Save/undo/dropdown buttons there used to
-        // fullscreen the view behind them. If any item is hovered, that click belongs to the item.
-        if (ImGui.IsAnyItemHovered())
-            onStrip = false;
+        // CLAMP the band so it can't reach up over the toolbar — a docked viewport sits right under it,
+        // and the band's upward extension used to overlap the toolbar's Save/undo buttons, so clicking
+        // those fullscreened the view. Keeping the band below the toolbar fixes that WITHOUT killing the
+        // tab double-click (the old IsAnyItemHovered guard also blocked the tab itself).
+        stripTop = Math.Max(stripTop, contentAreaTop);
+        bool onStrip = mouse.Y >= stripTop && mouse.Y < contentTop &&
+                       mouse.X >= winPos.X && mouse.X <= winPos.X + winW;
 
         // Double-click the strip → toggle fullscreen for this panel.
         if (onStrip && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))

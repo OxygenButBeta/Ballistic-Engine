@@ -286,13 +286,17 @@ internal sealed class HierarchyPanel {
         if (selected) flags |= ImGuiTreeNodeFlags.Selected;
         if (children.Count == 0) flags |= ImGuiTreeNodeFlags.Leaf | ImGuiTreeNodeFlags.NoTreePushOnOpen;
 
-        // Inactive entities grey out; otherwise a prefab-instance root tints blue (Unity's prefab
-        // colour). Inactive wins so a disabled prefab still reads as disabled.
-        bool tinted = !entity.IsActive || entity.IsPrefabInstance;
-        if (tinted)
-            ImGui.PushStyleColor(ImGuiCol.Text, !entity.IsActive
-                ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
-                : new SysVec4(0.45f, 0.66f, 1f, 1f));
+        // Label colour priority: inactive greys out, then a prefab-instance root tints blue (Unity's
+        // prefab colour), then CHILD entities (anything with a parent) read slightly dimmer than roots
+        // so the hierarchy depth is obvious at a glance.
+        bool isChild = entity.transform.Parent is not null;
+        bool tinted = !entity.IsActive || entity.IsPrefabInstance || isChild;
+        if (tinted) {
+            SysVec4 col = !entity.IsActive ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
+                : entity.IsPrefabInstance ? new SysVec4(0.45f, 0.66f, 1f, 1f)
+                : new SysVec4(0.72f, 0.74f, 0.78f, 1f);   // child: dimmer than a root's white
+            ImGui.PushStyleColor(ImGuiCol.Text, col);
+        }
 
         // Leading spaces leave room for the type icon overlaid after the arrow.
         bool open = ImGui.TreeNodeEx($"     {entity.Name}##{id}", flags);
@@ -345,8 +349,15 @@ internal sealed class HierarchyPanel {
                 : new SysVec4(0.45f, 0.47f, 0.52f, 0.6f));
             if (EditorIcons.GhostButtonSmall($"eye{id}", EditorIcons.Eye,
                     entity.IsActive ? "Hide (deactivate)" : "Show (activate)")) {
-                EditorUndo.Push("Toggle Active");
-                entity.SetActive(!entity.IsActive);
+                bool newActive = !entity.IsActive;
+                // If the clicked row is part of the multi-selection, toggle the WHOLE selection to the
+                // same state (Unity-style); otherwise just this one.
+                var batch = selected && state.SelectedEntities.Count > 1
+                    ? state.SelectedEntities.ToArray()
+                    : new[] { entity };
+                EditorUndo.Push(batch.Length > 1 ? $"Toggle Active ({batch.Length})" : "Toggle Active");
+                foreach (Entity e in batch)
+                    if (!e.IsDestroyed) e.SetActive(newActive);
                 state.MarkViewportDirty();
             }
             ImGui.PopStyleColor();
