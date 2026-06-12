@@ -69,6 +69,17 @@ public static class ComponentReflection {
         }
     }
 
+    // Parameterless methods marked [EditorWindowExecutionPoint]: the inspector renders a window-open
+    // button that invokes the method and opens a dedicated EditorWindow for the component.
+    public static IEnumerable<MethodInfo> InspectorWindowPoints(Type type) {
+        foreach (MethodInfo method in type.GetMethods(Flags)) {
+            if (method.GetParameters().Length == 0 &&
+                !IsFrameworkType(method.DeclaringType) &&
+                method.GetCustomAttribute<EditorWindowExecutionPointAttribute>() is not null)
+                yield return method;
+        }
+    }
+
     public static Type MemberType(MemberInfo member) =>
         member is PropertyInfo p ? p.PropertyType : ((FieldInfo)member).FieldType;
 

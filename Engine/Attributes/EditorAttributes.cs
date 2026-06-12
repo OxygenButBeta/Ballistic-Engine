@@ -80,6 +80,18 @@ public sealed class ContextMenuAttribute : Attribute {
     public ContextMenuAttribute(string label = null) => Label = label;
 }
 
+// Marks a PARAMETERLESS method as an "open editor window" trigger: the inspector shows a window-style
+// button for it, and clicking opens a dedicated EditorWindow showing this component in a large, focused
+// view (Unity's custom EditorWindow entry point, reduced to "give me a big window for this component").
+// Use it for components whose authoring is awkward in the narrow inspector column (curves, graphs,
+// large tables). Title defaults to "<Component>". The method itself still runs on click (so it can set
+// up state), then the window opens.
+[AttributeUsage(AttributeTargets.Method, AllowMultiple = false, Inherited = false)]
+public sealed class EditorWindowExecutionPointAttribute : Attribute {
+    public string Title { get; }
+    public EditorWindowExecutionPointAttribute(string title = null) => Title = title;
+}
+
 // Puts this member (and following members that share the same group name) inside a collapsible
 // foldout in the inspector. A member with a different group name, or a [Header], starts a new
 // section. Use it to categorize a component's properties (e.g. "Shadows", "Advanced").

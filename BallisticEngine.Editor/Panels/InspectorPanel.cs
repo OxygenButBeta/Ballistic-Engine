@@ -35,7 +35,11 @@ internal sealed class InspectorPanel {
     bool locked;
     Entity lockedEntity;
 
-    public InspectorPanel(EditorState state) => this.state = state;
+    public InspectorPanel(EditorState state) {
+        this.state = state;
+        // The standalone component window reuses our reflection member renderer.
+        ComponentEditorWindow.Configure(DrawMemberList);
+    }
 
     public void DrawContents() {
         // Denser rows than the global style so more fits on screen.
@@ -1214,6 +1218,18 @@ internal sealed class InspectorPanel {
             var label = method.GetCustomAttribute<ButtonAttribute>()?.Label ?? method.Name;
             if (ImGui.Button($"{label}###btn_{type.Name}_{method.Name}", new SysVec2(-1, 0)))
                 method.Invoke(target, null);
+        }
+
+        // [EditorWindowExecutionPoint] methods: a window-open button that runs the method (state setup)
+        // then opens a dedicated big window for this component.
+        foreach (MethodInfo method in ComponentReflection.InspectorWindowPoints(type)) {
+            var attr = method.GetCustomAttribute<EditorWindowExecutionPointAttribute>();
+            string label = attr?.Title ?? $"Open {Prettify(type.Name)} Window";
+            if (ImGui.Button($"{EditorIcons.Maximize}  {label}###win_{type.Name}_{method.Name}", new SysVec2(-1, 0))) {
+                try { method.Invoke(target, null); }
+                catch (Exception e) { Debugging.LogError($"Editor window method threw: {e.Message}"); }
+                ComponentEditorWindow.Open(target, attr?.Title ?? Prettify(type.Name));
+            }
         }
     }
 

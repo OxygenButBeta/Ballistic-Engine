@@ -534,6 +534,7 @@ internal sealed class EditorApplication {
             profilerPanel.Draw(profiler, S);
             buildPanel.Draw(S);
             CurveEditorWindow.Draw(S);
+            ComponentEditorWindow.Draw(S);
             DrawUnsavedPrompt();
             return;
         }
