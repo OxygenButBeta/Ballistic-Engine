@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Reflection;
+using System.Text.Json;
 using BallisticEngine.Serialization;
 
 namespace BallisticEngine.Cli.Commands;
@@ -19,15 +20,20 @@ internal sealed class SimulateCommand : ICommand {
     public string Summary => "Headless play-mode run with numeric probes.";
     public string Usage =>
         """
-        Usage: bal simulate <scene.scene> [--steps N] [--watch <Entity>[:<Component>.<Member>]]... [--every K] [--quiet]
+        Usage: bal simulate <scene.scene> [--steps N] [--watch <Entity>[:<Component>.<Member>]]... [--every K]
+                            [--input script.json] [--quiet]
           --steps N   fixed 60 Hz steps to run (default 300 = 5 seconds)
           --watch     value to sample (repeatable); entity name alone = world position
           --every K   sample every K steps (default keeps <= 100 samples)
+          --input     deterministic input script: {"keys":[{"key":"W","from":0,"to":120}],
+                      "mouse":[{"deltaX":2,"deltaY":0,"from":0,"to":60}],
+                      "buttons":[{"button":"Left","from":10,"to":12}],
+                      "axes":[{"player":0,"axis":0,"value":1.0,"from":0,"to":100}]}
           --quiet     suppress engine info logs on stderr
         """;
 
     public int Run(string[] args) {
-        string? scenePath = null;
+        string? scenePath = null, inputPath = null;
         int steps = 300;
         int? every = null;
         bool quiet = false;
@@ -37,6 +43,7 @@ internal sealed class SimulateCommand : ICommand {
                 case "--steps": steps = ParseInt(Next(args, ref i, "--steps"), "--steps"); break;
                 case "--watch": watchSpecs.Add(Next(args, ref i, "--watch")); break;
                 case "--every": every = ParseInt(Next(args, ref i, "--every"), "--every"); break;
+                case "--input": inputPath = Next(args, ref i, "--input"); break;
                 case "--quiet": quiet = true; break;
                 default:
                     if (scenePath is null) scenePath = args[i];
@@ -62,8 +69,10 @@ internal sealed class SimulateCommand : ICommand {
             if (level > 0 || !quiet) Console.Error.WriteLine(message);
         };
 
+        ScriptedInput? scripted = inputPath is null ? null : LoadInputScript(inputPath);
+
         // Full engine bring-up, no window: scripts compile + load, assets import, physics binds.
-        var bootstrap = new EngineBootstrap(new HeadlessRuntime(), root);
+        var bootstrap = new EngineBootstrap(new HeadlessRuntime(scripted), root);
         try {
             Scene scene = SceneManager.GetCurrentScene();
             scene.Clear();
@@ -81,6 +90,8 @@ internal sealed class SimulateCommand : ICommand {
             foreach (Watch w in watches)
                 w.Sample(0); // initial state before the first step
             for (int step = 1; step <= steps; step++) {
+                if (scripted is not null)
+                    scripted.CurrentStep = step - 1; // script steps are 0-based
                 bootstrap.UpdateFrame(dt);
                 if (step % sampleEvery == 0 || step == steps)
                     foreach (Watch w in watches)
@@ -114,6 +125,49 @@ internal sealed class SimulateCommand : ICommand {
     static int ParseInt(string s, string flag) =>
         int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out int v)
             ? v : throw new CliUsageException($"{flag} expects an integer (got '{s}')");
+
+    // Parses the JSON input script (see Usage) into a ScriptedInput timeline. Key/button names are
+    // the OpenTK enum names ("W", "Space", "LeftShift", "Left"/"Right" for mouse), case-insensitive.
+    static ScriptedInput LoadInputScript(string path) {
+        if (!File.Exists(path))
+            throw new Exception($"input script not found: '{path}'");
+        var scripted = new ScriptedInput();
+        using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(path));
+        JsonElement root = doc.RootElement;
+
+        if (root.TryGetProperty("keys", out JsonElement keys))
+            foreach (JsonElement e in keys.EnumerateArray()) {
+                string name = e.GetProperty("key").GetString()!;
+                if (!Enum.TryParse(name, ignoreCase: true, out OpenTK.Windowing.GraphicsLibraryFramework.Keys key))
+                    throw new Exception($"unknown key '{name}' (OpenTK key names: W, Space, LeftShift, ...)");
+                scripted.AddKey(key, From(e), To(e));
+            }
+        if (root.TryGetProperty("buttons", out JsonElement buttons))
+            foreach (JsonElement e in buttons.EnumerateArray()) {
+                string name = e.GetProperty("button").GetString()!;
+                if (!Enum.TryParse(name, ignoreCase: true, out OpenTK.Windowing.GraphicsLibraryFramework.MouseButton button))
+                    throw new Exception($"unknown mouse button '{name}' (Left, Right, Middle, ...)");
+                scripted.AddMouseButton(button, From(e), To(e));
+            }
+        if (root.TryGetProperty("mouse", out JsonElement mouse))
+            foreach (JsonElement e in mouse.EnumerateArray())
+                scripted.AddMouseDelta(
+                    e.TryGetProperty("deltaX", out JsonElement dx) ? dx.GetSingle() : 0f,
+                    e.TryGetProperty("deltaY", out JsonElement dy) ? dy.GetSingle() : 0f,
+                    From(e), To(e));
+        if (root.TryGetProperty("axes", out JsonElement axes))
+            foreach (JsonElement e in axes.EnumerateArray())
+                scripted.AddAxis(
+                    e.TryGetProperty("player", out JsonElement pl) ? pl.GetInt32() : 0,
+                    e.GetProperty("axis").GetInt32(),
+                    e.GetProperty("value").GetSingle(),
+                    From(e), To(e));
+
+        return scripted;
+
+        static int From(JsonElement e) => e.TryGetProperty("from", out JsonElement v) ? v.GetInt32() : 0;
+        static int To(JsonElement e) => e.TryGetProperty("to", out JsonElement v) ? v.GetInt32() : int.MaxValue;
+    }
 
     // One watched value: an entity's world position, or any public property/field on one of its
     // components (NOT limited to serializable members — runtime-only state like Velocity is the

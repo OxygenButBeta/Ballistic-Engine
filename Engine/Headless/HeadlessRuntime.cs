@@ -17,8 +17,13 @@ public sealed class HeadlessRuntime : IBallisticEngineRuntime {
     public event Action<double> WindowRenderCallback { add { } remove { } }
     public event Action OnWindowShow { add { } remove { } }
 
+    // input: a ScriptedInput for deterministic playback (bal simulate --input), or null for
+    // no input at all.
+    public HeadlessRuntime(IInputProvider input = null) =>
+        InputProvider = input ?? new NullInput();
+
     public IEngineTimer EngineTimer { get; } = new ManualTimer();
-    public IInputProvider InputProvider { get; } = new NullInput();
+    public IInputProvider InputProvider { get; }
     public IWindow Window { get; } = new NullWindow();
     public RenderAsset RenderAsset { get; } = new NullRenderAsset();
     public ILogger Logger => null; // hosts subscribe Debugging.OnMessage instead
