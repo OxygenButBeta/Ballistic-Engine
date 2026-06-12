@@ -157,7 +157,9 @@ internal static class CurveEditorWindow {
 
         HandleZoomPan(hovered, mouse, origin, size);
 
-        // Tangent handles for the selected key (drawn first so dots sit on top).
+        // Tangent handles for the selected key are tested FIRST so a tangent grab wins over a nearby
+        // keyframe dot (the out-handle bug). The flag resets each frame.
+        tangentGrabbedThisClick = false;
         if (selectedKey >= 0 && selectedKey < target.Count)
             DrawTangentHandles(draw, ToScreen, mouse, hovered);
 
@@ -176,8 +178,9 @@ internal static class CurveEditorWindow {
             draw.AddCircle(sp, dotR, ImGui.GetColorU32(new SysVec4(0, 0, 0, 0.7f)), 0, 1.5f);
         }
 
-        // Begin dragging a key.
-        if (hovered && hoverKey >= 0 && dragTangent == 0 && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
+        // Begin dragging a key — but NOT if a tangent handle already grabbed this click.
+        if (hovered && hoverKey >= 0 && dragTangent == 0 && !tangentGrabbedThisClick &&
+            ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
             selectedKey = hoverKey;
             dragKey = hoverKey;
             PushUndo();
@@ -195,15 +198,55 @@ internal static class CurveEditorWindow {
             selectedKey = target.AddKey(TimeAt(mouse.X), ValueAt(mouse.Y));
             Changed();
         }
-        // Right-click a key removes it (keep at least one).
-        if (hovered && hoverKey >= 0 && target.Count > 1 && ImGui.IsMouseClicked(ImGuiMouseButton.Right)) {
-            PushUndo();
-            target.RemoveKey(hoverKey);
-            selectedKey = Math.Clamp(selectedKey, 0, target.Count - 1);
-            Changed();
+
+        // Right-click → context menu (Unity's curve right-click): on a key, key ops + tangent modes;
+        // on empty space, "Add Key Here". Remember the click position so Add Key lands where clicked.
+        if (hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Right)) {
+            ctxKey = hoverKey;
+            ctxTime = TimeAt(mouse.X);
+            ctxValue = ValueAt(mouse.Y);
+            ImGui.OpenPopup("##curvectx");
         }
+        DrawContextMenu();
+
         // F frames all (Unity).
         if (hovered && ImGui.IsKeyPressed(ImGuiKey.F)) FrameAll();
+    }
+
+    static int ctxKey = -1;
+    static float ctxTime, ctxValue;
+
+    static void DrawContextMenu() {
+        if (!ImGui.BeginPopup("##curvectx"))
+            return;
+
+        if (ctxKey >= 0 && ctxKey < target.Count) {
+            ImGui.TextDisabled($"Key #{ctxKey}");
+            ImGui.Separator();
+            // Tangent modes for this key (Unity's Flat / Linear / Constant + Free).
+            if (ImGui.MenuItem("Flat")) { selectedKey = ctxKey; SetTangentMode(0f, 0f); }
+            if (ImGui.MenuItem("Linear")) { selectedKey = ctxKey; SetTangentModeLinear(); }
+            if (ImGui.MenuItem("Constant (Step)")) { selectedKey = ctxKey; SetTangentMode(float.PositiveInfinity, float.PositiveInfinity); }
+            ImGui.Separator();
+            ImGui.BeginDisabled(target.Count <= 1);
+            if (ImGui.MenuItem("Delete Key")) {
+                PushUndo();
+                target.RemoveKey(ctxKey);
+                selectedKey = Math.Clamp(selectedKey, 0, target.Count - 1);
+                snapshotPushed = false;
+                Changed();
+            }
+            ImGui.EndDisabled();
+        }
+        else {
+            if (ImGui.MenuItem("Add Key Here")) {
+                PushUndo();
+                selectedKey = target.AddKey(ctxTime, ctxValue);
+                snapshotPushed = false;
+                Changed();
+            }
+        }
+        ImGui.EndPopup();
     }
 
     static void DrawGrid(ImDrawListPtr draw, SysVec2 origin, SysVec2 size, float scale) {
@@ -256,7 +299,10 @@ internal static class CurveEditorWindow {
         DrawTangentDot(draw, inP, mouse, hovered, -1);
         DrawTangentDot(draw, outP, mouse, hovered, +1);
 
-        // Drag a tangent handle: convert the cursor offset from the key into a slope.
+        // Drag a tangent handle: convert the cursor offset from the key into a slope. BOTH handles use
+        // the same forward delta math; the in-handle drags backward, so negate its delta. (The earlier
+        // out-handle bug was a hit-test one — the keyframe dot stole the click; fixed below by testing
+        // tangent dots BEFORE keyframes and using a wider grab radius.)
         if (dragTangent != 0 && ImGui.IsMouseDown(ImGuiMouseButton.Left)) {
             SysVec2 d = mouse - kp;
             if (dragTangent < 0) d = -d; // in-handle points backward
@@ -269,14 +315,19 @@ internal static class CurveEditorWindow {
     }
 
     static void DrawTangentDot(ImDrawListPtr draw, SysVec2 p, SysVec2 mouse, bool hovered, int which) {
-        const float r = 4.5f;
-        bool near = (mouse - p).LengthSquared() <= (r + 4f) * (r + 4f);
+        const float r = 5f, grab = 9f;   // wider grab than the visual radius so it's easy to catch
+        bool near = (mouse - p).LengthSquared() <= grab * grab;
         draw.AddCircleFilled(p, r, ImGui.GetColorU32(near ? new SysVec4(1f, 0.85f, 0.4f, 1f) : new SysVec4(0.9f, 0.6f, 0.3f, 1f)));
         if (hovered && near && dragTangent == 0 && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
             dragTangent = which;
+            tangentGrabbedThisClick = true;   // suppress the keyframe-drag that runs later this frame
             PushUndo();
         }
     }
+
+    // Set true when a tangent dot grabbed this frame's click, so the keyframe hit-test below skips it
+    // (the out-handle sits near its key — without this the key dot stole the drag).
+    static bool tangentGrabbedThisClick;
 
     // Screen-space unit direction of a value/time slope (accounts for the view's non-uniform scale).
     static SysVec2 SlopeDir(float slope, Func<float, float, SysVec2> toScreen) {
