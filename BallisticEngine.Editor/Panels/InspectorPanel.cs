@@ -65,7 +65,7 @@ internal sealed class InspectorPanel {
             // hierarchy actions (delete/duplicate/reparent) apply to all selected.
             if (state.SelectedEntities.Count > 1) {
                 ImGui.TextDisabled($"{EditorIcons.Package}  {state.SelectedEntities.Count} entities selected");
-                ImGui.TextDisabled("Editing the active one; hierarchy actions apply to all.");
+                ImGui.TextDisabled("Transform edits apply to ALL; component edits affect the active one.");
                 ImGui.Separator();
                 ImGui.Spacing();
             }
@@ -283,17 +283,21 @@ internal sealed class InspectorPanel {
     void DrawTransform(Transform transform) {
         bool open = PlainHeader("Transform");
 
-        // Right-click the header for Unity-style resets.
+        // The other selected entities' transforms, if this is a multi-selection — edits apply to all
+        // of them (Unity-style: a field change moves the whole group by the same DELTA, preserving
+        // relative offsets). Empty for a single selection.
+        var others = MultiTransforms(transform);
+
+        // Right-click the header for Unity-style resets (apply to the whole selection).
         if (ImGui.BeginPopupContextItem("##transformctx")) {
-            if (ImGui.MenuItem("Reset Position")) { EditorUndo.Push("Reset Position"); transform.Position = Vector3.Zero; }
-            if (ImGui.MenuItem("Reset Rotation")) { EditorUndo.Push("Reset Rotation"); transform.EulerAngles = Vector3.Zero; }
-            if (ImGui.MenuItem("Reset Scale")) { EditorUndo.Push("Reset Scale"); transform.Scale = Vector3.One; }
+            if (ImGui.MenuItem("Reset Position")) { EditorUndo.Push("Reset Position"); transform.Position = Vector3.Zero; foreach (Transform o in others) o.Position = Vector3.Zero; }
+            if (ImGui.MenuItem("Reset Rotation")) { EditorUndo.Push("Reset Rotation"); transform.EulerAngles = Vector3.Zero; foreach (Transform o in others) o.EulerAngles = Vector3.Zero; }
+            if (ImGui.MenuItem("Reset Scale")) { EditorUndo.Push("Reset Scale"); transform.Scale = Vector3.One; foreach (Transform o in others) o.Scale = Vector3.One; }
             ImGui.Separator();
             if (ImGui.MenuItem("Reset All")) {
                 EditorUndo.Push("Reset Transform");
-                transform.Position = Vector3.Zero;
-                transform.EulerAngles = Vector3.Zero;
-                transform.Scale = Vector3.One;
+                transform.Position = Vector3.Zero; transform.EulerAngles = Vector3.Zero; transform.Scale = Vector3.One;
+                foreach (Transform o in others) { o.Position = Vector3.Zero; o.EulerAngles = Vector3.Zero; o.Scale = Vector3.One; }
             }
             ImGui.EndPopup();
         }
@@ -302,13 +306,41 @@ internal sealed class InspectorPanel {
             return;
 
         if (BeginGrid("##transform")) {
-            SysVec3Row("Position", transform.Position, v => transform.Position = v, 0.05f);
-            SysVec3Row("Rotation", transform.EulerAngles, v => transform.EulerAngles = v, 0.5f);
-            SysVec3Row("Scale", transform.Scale, v => transform.Scale = v, 0.05f);
+            // The ACTIVE entity always takes the typed value verbatim (no representation drift). The
+            // OTHER selected entities receive the same DELTA, so the group moves rigidly and keeps its
+            // relative offsets. Rotation composes via QUATERNION (Euler add flips representations).
+            SysVec3Row("Position", transform.Position, v => {
+                Vector3 d = v - transform.Position; transform.Position = v;
+                foreach (Transform o in others) o.Position += d;
+            }, 0.05f);
+            SysVec3Row("Rotation", transform.EulerAngles, v => {
+                Quaternion oldQ = transform.Rotation;
+                transform.EulerAngles = v;
+                if (others.Count > 0) {
+                    Quaternion delta = transform.Rotation * Quaternion.Invert(oldQ);
+                    foreach (Transform o in others) o.Rotation = delta * o.Rotation;
+                }
+            }, 0.5f);
+            SysVec3Row("Scale", transform.Scale, v => {
+                Vector3 d = v - transform.Scale; transform.Scale = v;
+                foreach (Transform o in others) o.Scale += d;
+            }, 0.05f);
             ImGui.EndTable();
         }
 
         ImGui.Spacing();
+    }
+
+    // The transforms of the OTHER selected entities (everything except `active`), when more than one
+    // entity is selected. Used to broadcast Transform edits across a multi-selection.
+    List<Transform> MultiTransforms(Transform active) {
+        var list = new List<Transform>();
+        if (state.SelectedEntities.Count <= 1)
+            return list;
+        foreach (Entity e in state.SelectedEntities)
+            if (e?.transform is { } t && !ReferenceEquals(t, active) && !e.IsDestroyed)
+                list.Add(t);
+        return list;
     }
 
     // Framed header with an accent stripe and a bold label, no enable checkbox (Transform).
