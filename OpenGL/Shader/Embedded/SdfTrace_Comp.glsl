@@ -68,8 +68,11 @@ layout(rgba16f, binding = 0) uniform writeonly image2D OutGi;
 // ---------------------------------------------------------------------------------------
 struct SsdfInstance {
     mat4 worldToLocal;
+    mat4 world;          // local->world (MUST match the C# SdfInstance layout — the inject uses it)
     vec4 worldAabbMin;   // xyz = instance world-space AABB min (cheap pre-reject before the transform)
     vec4 worldAabbMax;   // xyz = instance world-space AABB max
+    vec4 albedo;         // xyz (used by the inject; present here so the std430 stride matches C#)
+    vec4 emissive;       // xyz
     uint slot;
     uint p0;
     uint p1;

@@ -82,6 +82,7 @@ public sealed class GLSdfGiPass : IDisposable {
     int injectProgram;  // RadianceInject_Comp — fills the surface-cache radiance atlas
     // Inject uniform locations.
     int liInstanceIndex, liSkyExposure, liFeedback, liCascadeBias, liCascadeCount, liSunDir, liSunColor;
+    int liInstanceCount, liGridMin, liGridInvCell, liGridRes;
     readonly int[] liCascadeMatrices = new int[4];
 
     // Full-res depth-aware upsample + additive composite (SdfGi_Combine.glsl). Mirrors SSR_Combine
@@ -219,6 +220,10 @@ public sealed class GLSdfGiPass : IDisposable {
         liCascadeCount = GL.GetUniformLocation(injectProgram, "CascadeCount");
         liSunDir = GL.GetUniformLocation(injectProgram, "SunDirectionWorld");
         liSunColor = GL.GetUniformLocation(injectProgram, "SunColor");
+        liInstanceCount = GL.GetUniformLocation(injectProgram, "InstanceCount");
+        liGridMin = GL.GetUniformLocation(injectProgram, "GridMin");
+        liGridInvCell = GL.GetUniformLocation(injectProgram, "GridInvCell");
+        liGridRes = GL.GetUniformLocation(injectProgram, "GridRes");
         for (var i = 0; i < 4; i++)
             liCascadeMatrices[i] = GL.GetUniformLocation(injectProgram, CascadeMatrixNames[i]);
     }
@@ -543,16 +548,23 @@ public sealed class GLSdfGiPass : IDisposable {
         Vector4 cascadeBias, int cascadeCount, Vector3 sunDirection, Vector3 sunColor, float skyExposure) {
         GL.UseProgram(injectProgram);
 
-        // The radiance atlas as a read/write image (binding 1) + the inputs the lighting needs.
+        // The radiance atlas as a read/write image (binding 1, this frame's write) + as a sampler
+        // (binding 7, the bounce-gather reads last frame's accumulated radiance).
         GL.BindImageTexture(1, atlas.RadianceTextureId, 0, true, 0,
             TextureAccess.ReadWrite, SizedInternalFormat.Rgba16f);
         BindSampler(AtlasUnit, TextureTarget.Texture3D, atlas.TextureId);
         BindSampler(IrradianceUnit, TextureTarget.TextureCubeMap, irradianceCubemap);
         BindSampler(ShadowUnit, TextureTarget.Texture2DArray, shadowMapArray);
+        BindSampler(RadianceUnit, TextureTarget.Texture3D, atlas.RadianceTextureId);
         scene.Bind();
 
         GL.Uniform1(liSkyExposure, skyExposure);
         GL.Uniform1(liFeedback, 0.9f); // sticky cache — accumulate over frames for stability/bounce
+        GL.Uniform1(liInstanceCount, (uint)scene.InstanceCount);
+        Vector3 gMin = scene.GridMin, gInv = scene.GridInvCell;
+        GL.Uniform3(liGridMin, gMin.X, gMin.Y, gMin.Z);
+        GL.Uniform3(liGridInvCell, gInv.X, gInv.Y, gInv.Z);
+        GL.Uniform1(liGridRes, scene.GridResolution);
         int cascades = Math.Min(cascadeCount, liCascadeMatrices.Length);
         for (var i = 0; i < cascades; i++)
             GL.UniformMatrix4(liCascadeMatrices[i], false, ref cascadeMatrices[i]);
