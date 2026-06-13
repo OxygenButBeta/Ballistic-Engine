@@ -79,19 +79,37 @@ public class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWin
         // current frame's controller state (and picks up hot-plugged pads).
         InputProvider = new GLInput(KeyboardState, MouseState, () => JoystickStates);
 
+        // BALLISTIC_MONITOR=<index> opens the window on that monitor (0-based) instead of the primary
+        // — handy for putting the test/editor window on a second display so it doesn't keep popping
+        // over the main one. Out-of-range / unset falls back to the primary. Opt-in: unset = default.
+        MonitorInfo targetMonitor = ResolveTargetMonitor();
+
         if (fullscreen) {
-            // Borderless fullscreen on the primary monitor: cover the whole screen at its native
+            // Borderless fullscreen on the target monitor: cover the whole screen at its native
             // resolution. (Borderless over exclusive: instant alt-tab, no mode switch flicker.)
-            var monitor = Monitors.GetPrimaryMonitor();
-            var area = monitor.ClientArea;
+            var area = targetMonitor.ClientArea;
             this.width = area.Size.X;
             this.height = area.Size.Y;
+            CurrentMonitor = targetMonitor;          // ensure fullscreen lands on the chosen display
             WindowState = WindowState.Fullscreen;
         }
         else {
-            // Windowed or borderless-windowed: centre the requested size on the primary monitor.
-            CenterWindow(new Vector2i(width, height));
+            // Windowed or borderless-windowed: centre the requested size on the target monitor.
+            var area = targetMonitor.ClientArea;
+            Location = new Vector2i(
+                area.Min.X + (area.Size.X - width) / 2,
+                area.Min.Y + (area.Size.Y - height) / 2);
         }
+    }
+
+    // Resolves the monitor to open on: BALLISTIC_MONITOR=<0-based index> picks that display (clamped
+    // to the available list); unset or out-of-range = the primary monitor (the prior behaviour).
+    static MonitorInfo ResolveTargetMonitor() {
+        var monitors = Monitors.GetMonitors();  // List<MonitorInfo>
+        string env = Environment.GetEnvironmentVariable("BALLISTIC_MONITOR");
+        if (int.TryParse(env, out int idx) && idx >= 0 && idx < monitors.Count)
+            return monitors[idx];
+        return Monitors.GetPrimaryMonitor();
     }
 
 
