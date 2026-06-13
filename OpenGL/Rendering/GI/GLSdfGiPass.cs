@@ -42,10 +42,23 @@ public sealed class GLSdfGiPass : IDisposable {
     const int NormalUnit = 2;
     const int IrradianceUnit = 3;
     const int AtlasUnit = 4;
+    const int ShadowUnit = 5;   // sampler2DArrayShadow — direct-sun visibility at SDF hits
 
-    // Master strength of the additive off-screen bounce. Plain constant fed to the composite
-    // shader (DESIGN: "SdfGiIntensity is a plain constant in the composite shader").
-    const float SdfGiIntensity = 1.0f;
+    // Neutral diffuse albedo for off-screen SDF hits (no per-hit material in v1). Mid-grey.
+    const float HitAlbedo = 0.5f;
+
+    static readonly string[] CascadeMatrixNames =
+        { "CascadeMatrices[0]", "CascadeMatrices[1]", "CascadeMatrices[2]", "CascadeMatrices[3]" };
+
+    // Master strength of the additive off-screen bounce. Tuned DOWN from 1.0 — at full strength the
+    // single-bounce fill washed already-lit surfaces flat; ~0.4 fills the shadowed recesses (the
+    // point) while keeping contrast. Overridable via BALLISTIC_SDFGI_INTENSITY for A/B tuning.
+    readonly float sdfGiIntensity = ParseIntensity();
+    static float ParseIntensity() {
+        string s = Environment.GetEnvironmentVariable("BALLISTIC_SDFGI_INTENSITY");
+        return float.TryParse(s, System.Globalization.CultureInfo.InvariantCulture, out float v)
+            ? Math.Clamp(v, 0f, 4f) : 0.4f;
+    }
 
     public bool Available { get; private set; }
 
@@ -64,8 +77,16 @@ public sealed class GLSdfGiPass : IDisposable {
     // screenshot shows the raw off-screen bounce.
     readonly bool debugView;
 
+    // BALLISTIC_SDFGI_DIAG=1: the gather outputs the per-pixel HIT FRACTION (grayscale) instead of
+    // radiance — white = every ray hit SDF geometry, black = every ray escaped to sky. Forces the
+    // debug composite so the raw value is visible. Disambiguates "rays miss" (granularity) from
+    // "radiance too dim" (needs surface cache). Implies debugView.
+    readonly bool diagMode;
+
     // Cached uniform locations (looked up once after the link).
-    int locInvProjection, locInvView, locInstanceCount, locHalfSize, locSkyExposure, locFrameIndex;
+    int locInvProjection, locInvView, locInstanceCount, locHalfSize, locSkyExposure, locFrameIndex, locDiagMode;
+    int locCascadeBias, locCascadeCount, locSunDir, locSunColor, locHitAlbedo;
+    readonly int[] locCascadeMatrices = new int[4];
 
     // Half-res RGBA16F gather output (pass-owned — small, consumed same frame; not pooled because
     // we bind it as an image, so a stable id is required). The full-res composite goes to a pooled
@@ -93,7 +114,8 @@ public sealed class GLSdfGiPass : IDisposable {
             return;
         }
 
-        debugView = Environment.GetEnvironmentVariable("BALLISTIC_SDFGI_DEBUG") == "1";
+        diagMode = Environment.GetEnvironmentVariable("BALLISTIC_SDFGI_DIAG") == "1";
+        debugView = diagMode || Environment.GetEnvironmentVariable("BALLISTIC_SDFGI_DEBUG") == "1";
 
         atlas = new GLSdfAtlas(GLSdfAtlas.DefaultSize);
         scene = new GLSdfScene();
@@ -126,6 +148,14 @@ public sealed class GLSdfGiPass : IDisposable {
         locHalfSize = GL.GetUniformLocation(program, "HalfSize");
         locSkyExposure = GL.GetUniformLocation(program, "SkyExposure");
         locFrameIndex = GL.GetUniformLocation(program, "FrameIndex");
+        locDiagMode = GL.GetUniformLocation(program, "DiagMode");
+        locCascadeBias = GL.GetUniformLocation(program, "CascadeBias");
+        locCascadeCount = GL.GetUniformLocation(program, "CascadeCount");
+        locSunDir = GL.GetUniformLocation(program, "SunDirectionWorld");
+        locSunColor = GL.GetUniformLocation(program, "SunColor");
+        locHitAlbedo = GL.GetUniformLocation(program, "HitAlbedo");
+        for (var i = 0; i < 4; i++)
+            locCascadeMatrices[i] = GL.GetUniformLocation(program, CascadeMatrixNames[i]);
     }
 
     // Bakes + uploads the SDF for every distinct mesh in the opaque set (once each, keyed by
@@ -215,6 +245,8 @@ public sealed class GLSdfGiPass : IDisposable {
     // radiance source). width/height are the FULL-res viewport. view/projection are this frame's
     // camera matrices (the shader uses their inverses for the same reconstruction SSGI/SSR use).
     public int Render(int colorTexture, int depthTex, int normalTex, int irradianceCubemap,
+        int shadowMapArray, Matrix4[] cascadeMatrices, Vector4 cascadeBias, int cascadeCount,
+        Vector3 sunDirection, Vector3 sunColor,
         int width, int height, ref Matrix4 view, ref Matrix4 projection, float skyExposure) {
         if (!Available || program == 0)
             return colorTexture;
@@ -243,6 +275,9 @@ public sealed class GLSdfGiPass : IDisposable {
         BindSampler(NormalUnit, TextureTarget.Texture2D, normalTex);
         BindSampler(IrradianceUnit, TextureTarget.TextureCubeMap, irradianceCubemap);
         BindSampler(AtlasUnit, TextureTarget.Texture3D, atlas.TextureId);
+        // Cascaded shadow map (depth texture ARRAY, sampled as sampler2DArrayShadow — the compare
+        // mode lives in the texture's parameters, set when the shadow map was created).
+        BindSampler(ShadowUnit, TextureTarget.Texture2DArray, shadowMapArray);
 
         // SDF scene SSBOs (binding 8 = instances, 9 = slot table).
         scene.Bind();
@@ -254,6 +289,18 @@ public sealed class GLSdfGiPass : IDisposable {
         GL.Uniform2(locHalfSize, halfW, halfH);
         GL.Uniform1(locSkyExposure, skyExposure);
         GL.Uniform1(locFrameIndex, frameIndex);
+        GL.Uniform1(locDiagMode, diagMode ? 1 : 0);
+
+        // Direct-sun-at-hit lighting (the bright bounce source). Same cascade/sun data the
+        // volumetric march uses, so the SDF hit's shadowing matches the lit pass.
+        int cascades = Math.Min(cascadeCount, locCascadeMatrices.Length);
+        for (var i = 0; i < cascades; i++)
+            GL.UniformMatrix4(locCascadeMatrices[i], false, ref cascadeMatrices[i]);
+        GL.Uniform4(locCascadeBias, cascadeBias);
+        GL.Uniform1(locCascadeCount, cascades);
+        GL.Uniform3(locSunDir, sunDirection);
+        GL.Uniform3(locSunColor, sunColor);
+        GL.Uniform1(locHitAlbedo, HitAlbedo);
         frameIndex++;
 
         int gx = (halfW + 7) / 8;
@@ -280,7 +327,7 @@ public sealed class GLSdfGiPass : IDisposable {
         BindCombineSampler(1, output.Texture, "giTexture");
         BindCombineSampler(2, depthTex, "depthTexture");
         combineShader.SetMatrix4("InvProjection", ref invProjection);
-        combineShader.SetFloat("SdfGiIntensity", SdfGiIntensity);
+        combineShader.SetFloat("SdfGiIntensity", sdfGiIntensity);
         combineShader.SetBool("DebugView", debugView);
         GLBufferUtilities.DrawFullscreenQuad();
 

@@ -26,8 +26,13 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 1) uniform sampler2D DepthTex;    // window depth [0,1]
 layout(binding = 2) uniform sampler2D NormalTex;   // world normal*0.5+0.5 in rgb, rough/metal in a
 
-// Baked IBL diffuse irradiance (the cheap v1 hit/miss radiance source).
+// Baked IBL diffuse irradiance (the SKY term + the miss radiance).
 layout(binding = 3) uniform samplerCube IrradianceMap;
+
+// Cascaded directional shadow map (hardware PCF compare) — same texture/convention the lit pass
+// and the volumetric march use. Lets the SDF hit evaluate DIRECT SUN visibility, so the gather
+// returns BRIGHT lit bounce (the sun is the source the dim IBL irradiance lacks) instead of dim sky.
+layout(binding = 5) uniform sampler2DArrayShadow ShadowMap;
 
 // The packed SDF atlas: one R16F 3D texture. We DON'T rely on its hardware linear filtering
 // for the sub-volume sample (a slot's neighbour bleeds across the packing boundary), so we do
@@ -84,6 +89,23 @@ uniform uint InstanceCount;  // number of valid SsdfInstance records
 uniform ivec2 HalfSize;      // output (half-res) dimensions in pixels
 uniform float SkyExposure;   // irradiance luminance scale x camera pre-exposure
 uniform int  FrameIndex;     // rotates the ray hash each frame (temporal resolves the noise)
+
+// Direct-sun lighting at the hit (the bright-bounce source). Same data the volumetric march uses.
+const int MAX_CASCADES = 4;
+uniform mat4  CascadeMatrices[MAX_CASCADES]; // world -> light clip per cascade
+uniform vec4  CascadeBias;                   // compare-space bias per cascade
+uniform int   CascadeCount;
+uniform vec3  SunDirectionWorld;             // normalized, points TOWARD the light
+uniform vec3  SunColor;                      // pre-exposed sun radiance
+// Neutral diffuse albedo for the hit surface (the SDF carries no per-hit material in v1). A mid
+// grey reflects the room's character without over-saturating; the surface cache (next) replaces
+// this with the real per-surface lit radiance.
+uniform float HitAlbedo;
+// Diagnostic: 0 = normal radiance gather; 1 = output the HIT FRACTION as grayscale (white = every
+// ray hit SDF geometry, black = every ray escaped to sky). Disambiguates "rays miss" (granularity)
+// from "radiance too dim" (needs the surface cache) when the gather looks empty. Set by the pass
+// from BALLISTIC_SDFGI_DIAG; never on in shipping.
+uniform int  DiagMode;
 
 // ---------------------------------------------------------------------------------------
 // March tuning. World-space metres.
@@ -222,6 +244,33 @@ vec3 SceneGradient(vec3 worldP) {
     return len > 1e-5 ? g / len : vec3(0.0, 1.0, 0.0);
 }
 
+// Sun visibility at a world point via the cascade that covers it (0 = shadowed, 1 = lit). Copied
+// verbatim from Volumetric_Frag.SampleSunVisibility so the SDF hit's shadowing matches the lit pass.
+float SampleSunVisibility(vec3 worldPos) {
+    for (int c = 0; c < CascadeCount && c < MAX_CASCADES; c++) {
+        vec4 clip = CascadeMatrices[c] * vec4(worldPos, 1.0);
+        float edge = max(abs(clip.x), abs(clip.y));
+        vec3 proj = clip.xyz * 0.5 + 0.5; // ortho: w == 1
+        if (edge > 1.0 || proj.z > 1.0 || proj.z < 0.0)
+            continue;
+        return texture(ShadowMap, vec4(proj.xy, float(c), proj.z - CascadeBias[c]));
+    }
+    return 1.0; // outside every cascade: lit (matches the lit shader)
+}
+
+// Lit radiance of an off-screen surface at `worldHit` with geometric normal `hitN`: direct sun
+// (cosine, shadowed) + sky irradiance, times a neutral albedo. This is single-bounce GI evaluated
+// at the hit — the bright source the dim IBL-only v1 lacked. The surface cache (next phase) will
+// replace this with real per-surface multi-bounce radiance.
+vec3 HitRadiance(vec3 worldHit, vec3 hitN) {
+    vec3 toLight = normalize(SunDirectionWorld);   // points toward the sun
+    float ndl = max(dot(hitN, toLight), 0.0);
+    float vis = SampleSunVisibility(worldHit);
+    vec3 direct = SunColor * (ndl * vis);
+    vec3 sky = Sanitize(textureLod(IrradianceMap, hitN, 0.0).rgb) * SkyExposure;
+    return HitAlbedo * (direct + sky);
+}
+
 void main() {
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
     if (px.x >= HalfSize.x || px.y >= HalfSize.y)
@@ -255,6 +304,7 @@ void main() {
     vec3 origin = worldP + worldN * max(HIT_EPS * 2.0, MIN_STEP);
 
     vec3 gathered = vec3(0.0);
+    int hitCount = 0;
 
     for (int r = 0; r < RAY_COUNT; ++r) {
         // Cosine-weighted hemisphere sample. Hash by pixel + ray index + frame so the noise
@@ -300,19 +350,26 @@ void main() {
 
         vec3 radiance;
         if (hit) {
-            // v1: approximate the lit hit by sampling the baked IBL irradiance in the hit
-            // surface's normal direction. Use the SDF gradient as the hit normal; if it
-            // degenerates, fall back to the reversed ray direction (faces the gather point).
+            hitCount++;
+            // Lit radiance at the hit = direct sun (shadowed) + sky, x neutral albedo. The SDF
+            // gradient is the hit normal; if it degenerates, face the gather point (reversed ray).
             vec3 hitN = SceneGradient(hitPoint);
             if (dot(hitN, hitN) < 1e-5)
                 hitN = -dir;
-            radiance = Sanitize(textureLod(IrradianceMap, hitN, 0.0).rgb) * SkyExposure;
+            radiance = Sanitize(HitRadiance(hitPoint, hitN));
         } else {
             // Miss: the ray escaped to sky. Sky irradiance along the ray direction.
             radiance = Sanitize(textureLod(IrradianceMap, dir, 0.0).rgb) * SkyExposure;
         }
 
         gathered += radiance;
+    }
+
+    // Diagnostic: emit the hit fraction (white = all rays hit SDF geometry) instead of radiance.
+    if (DiagMode == 1) {
+        float frac = float(hitCount) / float(RAY_COUNT);
+        imageStore(OutGi, px, vec4(frac, frac, frac, 1.0));
+        return;
     }
 
     gathered /= float(RAY_COUNT);

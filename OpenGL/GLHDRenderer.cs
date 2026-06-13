@@ -738,7 +738,9 @@ public class GLHDRenderer : HDRenderer {
             using (timers.Time("SdfGI")) {
                 sdfGi.EnsureBaked(visibleOpaque);
                 litColor = sdfGi.Render(litColor, target.DepthTextureId, target.NormalTextureId,
-                    irradianceMap, target.LenX, target.LenY, ref view, ref renderProjection,
+                    irradianceMap, shadowMap.DepthTextureId, cascadeMatrices, cascadeBias,
+                    activeCascadeCount, sunDirection, sunColor,
+                    target.LenX, target.LenY, ref view, ref renderProjection,
                     skyExposureBase * preExposure);
             }
 
