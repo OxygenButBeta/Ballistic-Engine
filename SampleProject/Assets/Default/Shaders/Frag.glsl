@@ -32,6 +32,54 @@ uniform sampler3D ProbeSH3;
 uniform samplerCubeArray ReflectionProbes;    // baked local reflection cubes, one layer per cell
 uniform isampler3D ReflectionCellToLayer;     // cell -> layer index, or -1 = fall back to skybox
 
+// --- Voxel Cone Tracing GI (UE5/Lumen-class colored multi-bounce indirect) ---
+uniform sampler3D VoxelRadianceTex;   // mipped 3D radiance grid (direct-lit, then bounced)
+uniform vec3  VoxelVolumeMin;
+uniform vec3  VoxelVolumeInvSize;     // 1 / world size
+uniform float VoxelWorldSize;         // metres per voxel
+uniform float VoxelGiIntensity;       // master strength of the cone-traced indirect
+uniform bool  UseVoxelGI;             // gate: false -> shader is unchanged (default look preserved)
+
+vec3 vctWorldToUVW(vec3 wp) { return (wp - VoxelVolumeMin) * VoxelVolumeInvSize; }
+
+vec4 vctTraceCone(vec3 origin, vec3 dir, float aperture, float maxDistM) {
+    vec3 color = vec3(0.0); float alpha = 0.0;
+    float voxel = VoxelWorldSize;
+    float dist = voxel * 1.5;
+    float maxMip = log2(float(textureSize(VoxelRadianceTex, 0).x));
+    for (int i = 0; i < 64 && dist < maxDistM && alpha < 0.95; ++i) {
+        float coneRadius = max(aperture * dist, voxel);
+        float mip = clamp(log2(coneRadius / voxel), 0.0, maxMip);
+        vec3 uvw = vctWorldToUVW(origin + dir * dist);
+        if (any(lessThan(uvw, vec3(0.0))) || any(greaterThan(uvw, vec3(1.0)))) break;
+        vec4 s = textureLod(VoxelRadianceTex, uvw, mip);
+        color += (1.0 - alpha) * s.a * s.rgb;
+        alpha += (1.0 - alpha) * s.a;
+        dist += coneRadius;
+    }
+    return vec4(color, alpha);
+}
+
+// 6 diffuse hemisphere cones around N.
+vec3 vctDiffuse(vec3 wp, vec3 N) {
+    vec3 up = abs(N.y) < 0.95 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T = normalize(cross(up, N)); vec3 B = cross(N, T);
+    const float AP = 0.577, MAXD = 24.0, SIN60 = 0.866, COS60 = 0.5;
+    vec3 o = wp + N * VoxelWorldSize * 1.5;
+    vec3 acc = vctTraceCone(o, N, AP, MAXD).rgb * 0.25;
+    for (int i = 0; i < 5; ++i) {
+        float a = float(i) * 1.2566370614;
+        vec3 dir = normalize(N * COS60 + (T * cos(a) + B * sin(a)) * SIN60);
+        acc += vctTraceCone(o, dir, AP, MAXD).rgb * 0.15;
+    }
+    return acc;
+}
+
+vec3 vctSpecular(vec3 wp, vec3 N, vec3 R, float roughness) {
+    float ap = clamp(tan(roughness * 1.5707963), 0.02, 0.577);
+    return vctTraceCone(wp + N * VoxelWorldSize * 1.5, R, ap, 32.0).rgb;
+}
+
 // --- Pass constants (std140, binding 0 via the renderer) ---
 // One block shared by every lit program and uploaded once per pass. The declaration MUST be
 // textually identical in Vert.glsl and Frag.glsl (GLSL link rule). Member names match the old
@@ -619,6 +667,19 @@ void main()
         // AmbientTint scales the diffuse ambient only; reflections stay sky-driven.
         vec3 kD = albedo * (1.0 - metallic) * max(vec3(1.0) - FssEss - Fms * Ems, vec3(0.0));
         ambientDiffuse = kD * irradiance * AmbientTint * ao;
+
+        // --- Voxel Cone Tracing GI: colored multi-bounce indirect (the Lumen look) ---
+        // Replaces the flat probe/sky irradiance with cone-traced local bounce where the voxel
+        // grid covers this point. Off (UseVoxelGI=false) -> the lines above stand unchanged.
+        if (UseVoxelGI) {
+            vec3 giDiffuse = vctDiffuse(fragPos, N) * VoxelGiIntensity;
+            // The traced bounce is the real local indirect; blend it OVER the IBL base (which is the
+            // distant/sky ambient the cones can't reach), modulated by AO so creases stay grounded.
+            ambientDiffuse = kD * (irradiance * AmbientTint + giDiffuse) * ao;
+            // Glossy: a reflection cone adds local specular bounce the sky cubemap lacks.
+            vec3 giSpec = vctSpecular(fragPos, N, R, roughness) * VoxelGiIntensity;
+            ambientSpecular += giSpec * FssEss * specOcclusion;
+        }
     }
     else {
         vec3 R = reflect(-V, N);

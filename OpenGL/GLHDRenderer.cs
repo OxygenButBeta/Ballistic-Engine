@@ -84,6 +84,14 @@ public class GLHDRenderer : HDRenderer {
     // ~0.26% shadow-edge diff): meanError 0, 0% differing pixels across frames 0/60/120/180.
     bool gpuDrivenShadows = Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN_SHADOWS") != "0";
     bool gpuDrivenReady;
+
+    // Voxel Cone Tracing GI (UE5/Lumen-class colored multi-bounce indirect). Opt-IN
+    // (BALLISTIC_VOXELGI=1) while A/B'd against the flat baked-probe ambient; voxelizes the
+    // whole-mesh scene each time the geometry/sun stamp changes, then the forward shader cone-traces
+    // the voxel radiance for indirect diffuse + glossy. Default off until it clearly beats the baseline.
+    readonly OpenGL.VoxelGI.GLVoxelGI voxelGI = new(128);
+    bool voxelGiEnabled = Environment.GetEnvironmentVariable("BALLISTIC_VOXELGI") == "1";
+    bool voxelGiReady;
     // Scratch reused each frame when building the whole-mesh renderer's submesh metadata.
     Matrix4[] gdModels = [];
     Vector3[] gdLocalMin = [], gdLocalMax = [];
@@ -205,6 +213,19 @@ public class GLHDRenderer : HDRenderer {
             catch (Exception e) {
                 Console.WriteLine($"[GpuDriven] init failed, using CPU path: {e.Message}");
                 gpuDrivenReady = false;
+            }
+        }
+
+        // Voxel Cone Tracing GI needs the GPU-driven path (it voxelizes via the same MDI draw).
+        if (voxelGiEnabled && gpuDrivenReady) {
+            try {
+                voxelGI.Initialize();
+                voxelGiReady = voxelGI.Available;
+                Console.WriteLine($"[VoxelGI] {(voxelGiReady ? "enabled" : "unavailable")}.");
+            }
+            catch (Exception e) {
+                Console.WriteLine($"[VoxelGI] init failed: {e.Message}");
+                voxelGiReady = false;
             }
         }
 
@@ -632,6 +653,13 @@ void main() {
 
         using (timers.Time("Shadows"))
             RenderShadowPass();
+
+        // Voxel GI: (re)voxelize the scene's direct-lit radiance after shadows are ready, so the
+        // forward pass can cone-trace it for colored multi-bounce indirect. Static scene => the
+        // geometry stamp gates the rebuild; the sun stamp triggers a re-voxelize when light moves.
+        if (voxelGiReady)
+            using (timers.Time("VoxelGI"))
+                RenderVoxelGI(ref view);
 
         GLFrameBuffer target = CurrentTarget;
 
@@ -2008,6 +2036,81 @@ void main() {
         return true;
     }
 
+    long voxelGiStamp = -1;
+    readonly Vector4[] voxelAllPassPlanes = new Vector4[6];
+
+    // (Re)voxelizes the whole-mesh scene's direct-lit radiance into the voxel grid when the scene
+    // geometry or the sun changed. Reuses the GPU-driven metadata + a "pass everything" cull (the
+    // GI grid must contain off-screen geometry too) and draws with the voxelize program so each
+    // fragment scatters its radiance into the 3D texture.
+    void RenderVoxelGI(ref Matrix4 view) {
+        // Find the GPU-driven-eligible whole-mesh renderer (the scene mesh).
+        IStaticMeshRenderer scene = null;
+        foreach (IStaticMeshRenderer t in visibleOpaque) {
+            if (IsGpuDrivenEligible(t) && DominantGpuDrivenShader(t) is not null) { scene = t; break; }
+        }
+        if (scene is null)
+            return;
+
+        // Build metadata first (needed to draw).
+        if (!gpuDrivenCulledThisFrame) {
+            BuildGpuDrivenMetadata(scene);
+            gpuDrivenCulledThisFrame = true;
+            gpuDrivenTarget = scene;
+        }
+        Mesh mesh = scene.SharedMesh;
+        // Camera-centered voxel volume (Lumen-style local grid): a fixed ~60 m cube around the
+        // viewer so 128^3 gives ~0.47 m voxels — fine enough to capture architecture. The whole-
+        // scene AABB (often 300 m) would make voxels 2 m+ and the GI useless. Snap the center to a
+        // voxel so the grid doesn't shimmer as the camera moves.
+        const float HALF = 30f; // 60 m cube
+        Vector3 camPos = Vector3.Zero;
+        if (Matrix4.Invert(view) is { } invView)
+            camPos = invView.Row3.Xyz;
+        float vsize = HALF * 2f / voxelGI.VoxelRes;
+        Vector3 snapped = new(
+            MathF.Round(camPos.X / vsize) * vsize,
+            MathF.Round(camPos.Y / vsize) * vsize,
+            MathF.Round(camPos.Z / vsize) * vsize);
+        Vector3 center = snapped;
+        float ext = HALF;
+        Vector3 size = new(ext * 2f);
+
+        // Re-voxelize when the snapped grid center, geometry, or sun changed; else keep the grid.
+        long stamp = (long)center.GetHashCode() ^ ((long)geometryStamp << 1) ^
+                     ((long)sunDirection.GetHashCode() << 2) ^ ((long)sunColor.GetHashCode() << 5);
+        if (stamp == voxelGiStamp)
+            return;
+        voxelGiStamp = stamp;
+        voxelGI.SetBounds(center - new Vector3(ext), size);
+
+        // "Pass everything" planes so the cull emits ALL submeshes (GI needs off-screen geo).
+        for (var i = 0; i < 6; i++)
+            voxelAllPassPlanes[i] = new Vector4(0f, 0f, 0f, 1e9f); // dot+w always >= 0
+
+        gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchSolid, voxelAllPassPlanes, 0, 0,
+            Matrix4.Identity, Matrix4.Identity, 1f, 0f, 0, 0, 0, 0, hizEnabled: false);
+        gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchCutout, voxelAllPassPlanes, 0, 1,
+            Matrix4.Identity, Matrix4.Identity, 1f, 0f, 0, 0, 0, 0, hizEnabled: false);
+
+        // Sun "toward" vector + pre-exposed colors (the voxelize frag does NdotL*shadow + sky).
+        Vector3 sunTo = -sunDirection;
+        voxelGI.VoxelizeBegin(stamp, sunTo, sunColor, ambientFallback,
+            cascadeMatrices, cascadeBias, activeCascadeCount, shadowMap.DepthTextureId);
+
+        // The voxelize program reads the per-draw model + bindless material from the SAME SSBOs the
+        // GPU-driven draw binds. DrawIndirectCount binds them and issues the MDI; both batches.
+        GL.UseProgram(voxelGI.VoxelizeProgram);
+        mesh.Activate();
+        gpuDriven.DrawIndirectCount(OpenGL.GpuDriven.GpuDrivenRenderer.BatchSolid);
+        gpuDriven.DrawIndirectCount(OpenGL.GpuDriven.GpuDrivenRenderer.BatchCutout);
+        mesh.Deactivate();
+
+        voxelGI.VoxelizeEnd();
+        if (Environment.GetEnvironmentVariable("BALLISTIC_VOXELGI_DEBUG") == "1")
+            Console.WriteLine($"[VoxelGI] voxelized: center={center} ext={ext:0.0} res={voxelGI.VoxelRes}");
+    }
+
     // True z-prepass with the SAME jittered projection and the SAME per-material vertex math
     // as the main pass. Feeds SSAO before shading AND gives the main pass exact early-z: it
     // re-tests LEqual against this depth without writing, so every opaque pixel shades once.
@@ -3370,6 +3473,8 @@ void main() {
             passData.UploadAndBind();
             if (samplerReadyPrograms.Add(shader.UID))
                 SetSamplerUniforms(shader);
+            // Voxel GI bounds/intensity change per frame -> set every pass (not once per program).
+            SetVoxelGiUniforms(shader);
         }
         else {
             SetPassUniformsLegacy(shader, ref view, ref projection, cameraPos);
@@ -3399,10 +3504,33 @@ void main() {
         shader.SetInt("ShadowCascadesRaw", 19);
         shader.SetInt("ReflectionProbes", 20);
         shader.SetInt("ReflectionCellToLayer", 21);
+        shader.SetInt("VoxelRadianceTex", 22); // voxel cone tracing GI radiance grid
     }
+
+    // Per-frame voxel GI uniforms + texture bind. Called from SetPassTextures so every lit program
+    // sees the current voxel grid. When voxel GI is off, UseVoxelGI=false leaves the shader unchanged.
+    void SetVoxelGiUniforms(Shader shader) {
+        bool on = voxelGiReady;
+        shader.SetBool("UseVoxelGI", on);
+        if (!on)
+            return;
+        Vector3 size = voxelGI.VolumeSize;
+        shader.SetFloat3("VoxelVolumeMin", voxelGI.VolumeMin);
+        shader.SetFloat3("VoxelVolumeInvSize",
+            new Vector3(1f / MathF.Max(size.X, 1e-3f), 1f / MathF.Max(size.Y, 1e-3f), 1f / MathF.Max(size.Z, 1e-3f)));
+        shader.SetFloat("VoxelWorldSize", voxelGI.VoxelWorldSize);
+        shader.SetFloat("VoxelGiIntensity", voxelGiIntensity);
+    }
+
+    float voxelGiIntensity = float.TryParse(
+        Environment.GetEnvironmentVariable("BALLISTIC_VOXELGI_INTENSITY"), out float vi) ? vi : 1.0f;
 
     // The pass-global texture binds (the units SetSamplerUniforms assigned). Once per pass.
     void SetPassTextures() {
+        if (voxelGiReady) {
+            GL.ActiveTexture(TextureUnit.Texture22);
+            GL.BindTexture(TextureTarget.Texture3D, voxelGI.RadianceTexture);
+        }
         GL.ActiveTexture(TextureUnit.Texture7);
         GL.BindTexture(TextureTarget.Texture2D, prepassDepthCopy);
         GL.ActiveTexture(TextureUnit.Texture8);
