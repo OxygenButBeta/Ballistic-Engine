@@ -186,4 +186,18 @@ public sealed class PostProcessSettings {
     public float DofFocalLength { get; set; } = 0.05f;  // 50mm-ish; larger = shallower DoF
     public float DofAperture { get; set; } = 2.8f;      // f-number; smaller = shallower DoF
     public float DofMaxCoc { get; set; } = 0.03f;       // blur-radius clamp (fraction of frame height)
+
+    // ---- Realtime GI stack (GlobalIllumination volume override) -----------------------------------
+    // The auto-fit probes + reflections + SDF-GI all run by DEFAULT (no setup); these dials let a
+    // GlobalIllumination volume tune their strength without disabling the default behaviour. All
+    // default to "current behaviour" so a no-volume scene is unchanged:
+    //   * GiProbeIntensity / GiReflectionIntensity scale the baked diffuse / specular ambient.
+    //   * GiSdfIntensityScale multiplies the SDF-GI off-screen bounce (on top of its own default,
+    //     and on top of the probe<->SDF blend the renderer already applies).
+    //   * GiSdfForceEnabled lets a volume turn the SDF-GI bounce ON without the env var (it stays
+    //     env-gated by default while it matures; a scene that wants it just adds the volume).
+    public float GiProbeIntensity { get; set; } = 1f;       // baked diffuse-probe ambient strength
+    public float GiReflectionIntensity { get; set; } = 1f;  // baked local-reflection strength (× the volume's own Intensity)
+    public float GiSdfIntensityScale { get; set; } = 1f;    // extra multiplier on the SDF-GI bounce
+    public bool GiSdfForceEnabled { get; set; }             // turn SDF-GI on without BALLISTIC_SDFGI
 }

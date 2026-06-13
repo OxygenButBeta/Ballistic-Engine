@@ -735,15 +735,18 @@ public class GLHDRenderer : HDRenderer {
         // bounce onto litColor (never darkens). Default-OFF: when BALLISTIC_SDFGI != 1 the pass is
         // Available=false and Render returns litColor unchanged, so the frame is byte-identical to
         // the committed baseline. Reconstructs from the JITTERED depth -> renderProjection (note above).
-        if (sdfGiEnabled && sdfGi.Available)
+        // SDF-GI runs when the env var is set OR a GlobalIllumination volume forces it on (it stays
+        // env-gated by default while it matures; a scene opts in via the volume override).
+        if ((sdfGiEnabled || PostFX.GiSdfForceEnabled) && sdfGi.Available)
             using (timers.Time("SdfGI")) {
                 sdfGi.EnsureBaked(visibleOpaque);
                 // PROBE<->SDF-GI BLEND: probes are the diffuse BASE (they already carry the static
                 // enclosed-interior bounce); SDF-GI AUGMENTS with the dynamic off-screen delta. When
                 // probes are active, scale SDF-GI down so the two diffuse indirect terms don't
                 // double-count (the same rule as the SSGI overlap). With no probes, SDF-GI is the
-                // only off-screen indirect, so it runs at full strength.
-                float sdfGiBlend = probeVolumeReady ? 0.5f : 1f;
+                // only off-screen indirect, so it runs at full strength. The volume's GiSdfIntensity
+                // multiplies on top so a scene can tune the dynamic bounce.
+                float sdfGiBlend = (probeVolumeReady ? 0.5f : 1f) * MathF.Max(0f, PostFX.GiSdfIntensityScale);
                 litColor = sdfGi.Render(litColor, target.DepthTextureId, target.NormalTextureId,
                     irradianceMap, shadowMap.DepthTextureId, cascadeMatrices, cascadeBias,
                     activeCascadeCount, sunDirection, sunColor,
@@ -3696,8 +3699,10 @@ public class GLHDRenderer : HDRenderer {
         b.Set("renderMode", renderMode);
 
         // The ReflectionVolume's IsActive is the live master switch: off -> the shader ignores
-        // the volume and glossy surfaces fall back to the global skybox, no re-bake needed.
-        ReflectionVolume reflVol = ReflectionVolume.Active is { IsActive: true } rv ? rv : null;
+        // the volume and glossy surfaces fall back to the global skybox, no re-bake needed. The
+        // EFFECTIVE volume is the placed one (Active), or the implicit auto-fit default when none is
+        // placed — so the default reflections light glossy surfaces with zero setup.
+        ReflectionVolume reflVol = EffectiveReflectionVolume();
         var reflectionsLive = reflectionVolumeReady && reflVol is not null;
         b.Set("ReflectionGridX", reflectionGridX);
         b.Set("ReflectionGridY", reflectionGridY);
@@ -3708,7 +3713,20 @@ public class GLHDRenderer : HDRenderer {
         b.Set("HasScreenAO", screenAoTexture != 0);
         b.Set("ReflectionBlendWithSky", reflVol?.BlendWithSky ?? false);
         b.Set("EnableAtmosphericScattering", sceneFogEnabled);
-        b.Set("ReflectionIntensityLocal", MathF.Max(reflVol?.Intensity ?? 0f, 0f));
+        // Local reflection strength × the GlobalIllumination volume's GiReflectionIntensity override.
+        b.Set("ReflectionIntensityLocal",
+            MathF.Max((reflVol?.Intensity ?? 0f) * PostFX.GiReflectionIntensity, 0f));
+        // Diffuse-probe ambient strength override (GlobalIllumination volume); 1 = unchanged.
+        b.Set("ProbeIntensity", MathF.Max(PostFX.GiProbeIntensity, 0f));
+    }
+
+    // The reflection volume that actually drives the shader this frame: a placed+active one wins;
+    // otherwise the implicit auto-fit default (when its bake has produced data). Mirrors the bake's
+    // Active-or-default fallback so the default reflections are USED, not just baked.
+    ReflectionVolume EffectiveReflectionVolume() {
+        if (ReflectionVolume.Active is { IsActive: true } rv)
+            return rv;
+        return defaultReflectionVolume;
     }
 
     // LEGACY: per-uniform upload for shaders that predate the PassData block.
@@ -3836,13 +3854,15 @@ public class GLHDRenderer : HDRenderer {
             shader.SetFloat3("ProbeVolumeInvSize", probeVolumeInvSize);
             shader.SetFloat("ProbeExposure", PostFX.ExposureMultiplier);
         }
+        // Diffuse-probe ambient strength override (GlobalIllumination volume); 1 = unchanged.
+        shader.SetFloat("ProbeIntensity", MathF.Max(PostFX.GiProbeIntensity, 0f));
 
         // Baked reflection volume: local prefiltered specular cubemaps (cube-map array + cell->layer
         // map). The cubes store PHYSICAL radiance, re-exposed by SkyExposure (already set above) at
         // sample time exactly like the global prefiltered map, so local and sky reflections match EV.
         // The component's IsActive (IsEnabled toggle) is the live master switch: off -> the shader
         // ignores the volume and glossy surfaces fall back to the global skybox, no re-bake needed.
-        ReflectionVolume reflVol = ReflectionVolume.Active is { IsActive: true } rv ? rv : null;
+        ReflectionVolume reflVol = EffectiveReflectionVolume();
         var reflectionsLive = reflectionVolumeReady && reflVol is not null;
         shader.SetBool("UseReflectionVolume", reflectionsLive);
         if (reflectionsLive) {
@@ -3858,7 +3878,8 @@ public class GLHDRenderer : HDRenderer {
             shader.SetInt("ReflectionGridY", reflectionGridY);
             shader.SetInt("ReflectionGridZ", reflectionGridZ);
             shader.SetFloat("ReflectionMaxMips", ReflectionMipCount - 1);
-            shader.SetFloat("ReflectionIntensityLocal", MathF.Max(reflVol.Intensity, 0f));
+            shader.SetFloat("ReflectionIntensityLocal",
+                MathF.Max(reflVol.Intensity * PostFX.GiReflectionIntensity, 0f));
             shader.SetBool("ReflectionBlendWithSky", reflVol.BlendWithSky);
         }
 

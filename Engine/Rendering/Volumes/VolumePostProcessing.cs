@@ -63,6 +63,13 @@ public static class VolumePostProcessing {
             fx.SsgiAmbientFloor = 0f;
         }
 
+        if (stack.GetComponent<GlobalIllumination>() is { } gi) {
+            fx.GiProbeIntensity = gi.probeIntensity.Value;
+            fx.GiReflectionIntensity = gi.reflectionIntensity.Value;
+            fx.GiSdfIntensityScale = gi.sdfIntensity.Value;
+            fx.GiSdfForceEnabled = gi.sdfForceEnabled.Value;
+        }
+
         if (stack.GetComponent<Shadows>() is { } shadows) {
             fx.ShadowMaxDistance = shadows.maxDistance.Value;
             fx.ShadowCascadeCount = shadows.cascadeCount.Value;

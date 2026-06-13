@@ -86,6 +86,7 @@ layout(std140) uniform PassData {
     bool ReflectionBlendWithSky;
     bool EnableAtmosphericScattering;
     float ReflectionIntensityLocal;
+    float ProbeIntensity;            // GlobalIllumination volume: diffuse-probe ambient strength (1 = unchanged)
 };
 
 void main()

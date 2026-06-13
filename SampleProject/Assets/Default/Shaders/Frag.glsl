@@ -96,6 +96,7 @@ layout(std140) uniform PassData {
     bool ReflectionBlendWithSky;
     bool EnableAtmosphericScattering;
     float ReflectionIntensityLocal;
+    float ProbeIntensity;            // GlobalIllumination volume: diffuse-probe ambient strength (1 = unchanged)
 };
 
 // --- Material controls (plain uniforms: these change per draw) ---
@@ -569,7 +570,8 @@ void main()
             // L1 SH irradiance reconstruction (cosine-convolved band factors baked in).
             irradiance = sh0 * 0.886227
                        + (sh1 * N.y + sh2 * N.z + sh3 * N.x) * 1.023327;
-            irradiance = max(irradiance, 0.0) * ProbeExposure;
+            // ProbeIntensity (GlobalIllumination volume) scales the probe ambient; 1 = unchanged.
+            irradiance = max(irradiance, 0.0) * ProbeExposure * ProbeIntensity;
         }
         else {
             irradiance = texture(IrradianceMap, SkyDir(N)).rgb * SkyExposure;
