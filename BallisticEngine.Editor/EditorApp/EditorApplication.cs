@@ -599,7 +599,11 @@ internal sealed class EditorApplication {
             // overlay window above everything; clicking restores the docked layout.
             DrawExitFullscreenButton(workPos, workSize, toolbarH);
 
+            // Floating tool windows stay available while a panel is fullscreen — keep this list in sync
+            // with the normal-path block below (both must draw EVERY floating window or it vanishes in
+            // one mode). tagsLayers was previously missing here, so Tags & Layers disappeared in fullscreen.
             settings.Draw(S);
+            tagsLayers.Draw(S);
             profilerPanel.Draw(profiler, S);
             buildPanel.Draw(S);
             CurveEditorWindow.Draw(S);
@@ -671,6 +675,7 @@ internal sealed class EditorApplication {
         profilerPanel.Draw(profiler, S);
         buildPanel.Draw(S);
         CurveEditorWindow.Draw(S);
+        ComponentEditorWindow.Draw(S);   // standalone component window — was only drawn while fullscreen
         UnityImportWindow.Draw(S);
         DrawUnsavedPrompt();
 
@@ -1333,6 +1338,14 @@ internal sealed class EditorApplication {
     // Draws one panel filling the whole work area while maximized (anything except the viewports,
     // which take DrawMaximizedViewport). Routes by the panel's layout name to its contents.
     void DrawMaximizedPanel(string name, SysVec2 pos, SysVec2 size) {
+        // A duplicated (Add Tab) panel's label is owned by the host, not one of the primary layout
+        // names below — route it to the host so double-clicking an extra tab can fullscreen it too
+        // (previously these hit the "can't be shown fullscreen" dead-end).
+        if (extraPanels.OwnsLabel(name)) {
+            extraPanels.DrawMaximizedInstance(name, pos, size, MaximizePanelOnTitleDoubleClick);
+            return;
+        }
+
         ImGui.SetNextWindowPos(pos);
         ImGui.SetNextWindowSize(size);
         const ImGuiWindowFlags flags = ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove |

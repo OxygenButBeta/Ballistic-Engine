@@ -113,4 +113,34 @@ internal sealed class DockPanelHost {
                 return Label(k, i);
         return null;
     }
+
+    // True if `label` belongs to one of this host's (extra-instance) windows. Used by the fullscreen
+    // router to recognise a maximized duplicated tab, which the primary-name switch can't match.
+    public bool OwnsLabel(string label) {
+        foreach (Instance i in instances)
+            if (kinds.TryGetValue(i.KindKey, out Kind k) && Label(k, i) == label)
+                return true;
+        return false;
+    }
+
+    // Draws the host instance identified by `label` as a single fixed window filling pos/size, so a
+    // duplicated panel can be shown fullscreen exactly like a primary one. `runStrip` runs the title
+    // double-click/right-click handler (so the maximized window can be restored). No-op if not found.
+    public void DrawMaximizedInstance(string label, System.Numerics.Vector2 pos, System.Numerics.Vector2 size,
+        Action<string> runStrip) {
+        foreach (Instance inst in instances) {
+            if (!kinds.TryGetValue(inst.KindKey, out Kind kind) || Label(kind, inst) != label)
+                continue;
+            ImGui.SetNextWindowPos(pos);
+            ImGui.SetNextWindowSize(size);
+            const ImGuiWindowFlags flags = ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove |
+                ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking;
+            if (ImGui.Begin(label, flags)) {
+                runStrip?.Invoke(label);
+                kind.Draw(inst.Panel);
+            }
+            ImGui.End();
+            return;
+        }
+    }
 }
