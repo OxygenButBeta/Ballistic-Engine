@@ -94,7 +94,10 @@ public class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWin
             WindowState = WindowState.Fullscreen;
         }
         else {
-            // Windowed or borderless-windowed: centre the requested size on the target monitor.
+            // Windowed or borderless-windowed: size to the request and centre on the target monitor.
+            // MUST set ClientSize explicitly — replacing CenterWindow() with a manual Location alone
+            // left the client at a tiny default (the headless screenshot then captured 640x360).
+            ClientSize = new Vector2i(width, height);
             var area = targetMonitor.ClientArea;
             Location = new Vector2i(
                 area.Min.X + (area.Size.X - width) / 2,
