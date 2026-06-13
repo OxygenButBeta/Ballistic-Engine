@@ -140,9 +140,10 @@ uniform int  DiagMode;
 // ---------------------------------------------------------------------------------------
 // March tuning. World-space metres.
 // ---------------------------------------------------------------------------------------
-const int   RAY_COUNT   = 10;     // cosine-hemisphere rays per pixel. The cache read is cheap +
-                                  // spatially coherent (stable per-surface radiance), so more rays
-                                  // cut the gather variance directly; temporal + a-trous finish it.
+const int   RAY_COUNT   = 6;      // cosine-hemisphere rays per pixel. The cache read is spatially
+                                  // coherent (stable per-surface radiance), so 6 rays + the 3-iter
+                                  // a-trous + temporal give a clean result at a much lower march cost
+                                  // than 10 (10 pushed SunTemple's dense grid to ~38ms; 6 ~halves it).
 const int   MAX_STEPS   = 48;     // sphere-trace steps per ray (raised: empty space marches coarsely)
 const float MAX_DIST    = 30.0;   // max world march distance (metres)
 const float HIT_EPS     = 0.02;   // |dist| below this = surface hit (metres)

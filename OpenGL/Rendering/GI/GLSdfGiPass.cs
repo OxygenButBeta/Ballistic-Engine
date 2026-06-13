@@ -45,6 +45,11 @@ public sealed class GLSdfGiPass : IDisposable {
     // frame spreads it over a fraction of a second — the GI just fades in over the warm-up frames.
     const int MaxBakesPerFrame = 24;
 
+    // Max instances to radiance-inject per frame (round-robin). The inject's per-voxel bounce-gather
+    // is the heaviest GI cost; amortizing it across frames keeps per-frame cost bounded while the
+    // EMA cache still converges (static view) / refreshes within a few frames (moving view).
+    const int MaxInjectsPerFrame = 96;
+
     // Image unit / sampler units the compute uses (match SdfTrace_Comp.glsl layout(binding=...)):
     //   image 0 = OutGi, sampler 1 = Depth, 2 = Normal, 3 = Irradiance cube, 4 = SDF atlas.
     const int OutGiImageUnit = 0;
@@ -236,6 +241,7 @@ public sealed class GLSdfGiPass : IDisposable {
     // the GL thread, and the bake is bounded (BakeResolution^3, BVH-accelerated, one-time per mesh).
     // For very large meshes a future pass can move the CPU bake off-thread and only TryAdd here.
     int bakesThisFrame;
+    int injectCursor;   // round-robin start index for the per-frame amortized radiance inject
 
     public void EnsureBaked(IReadOnlyList<IStaticMeshRenderer> opaque) {
         if (!Available || opaque == null)
@@ -574,9 +580,16 @@ public sealed class GLSdfGiPass : IDisposable {
         GL.Uniform3(liSunColor, sunColor);
 
         // One dispatch per instance — group counts from its brick resolution (local_size 4^3).
+        // AMORTIZED: inject only a slice of instances per frame (round-robin via injectCursor). The
+        // cache accumulates via the EMA, so a static view still fully converges and a moving view
+        // refreshes over a few frames — cutting the heavy per-voxel bounce-gather cost per frame
+        // (e.g. SunTemple's 512 instances spread over ~MaxInjectsPerFrame-sized batches).
         ReadOnlySpan<int> slots = scene.InstanceSlots;
         var atlasSlots = atlas.Slots;
-        for (var i = 0; i < slots.Length; i++) {
+        int total = slots.Length;
+        int batch = Math.Min(total, MaxInjectsPerFrame);
+        for (var k = 0; k < batch; k++) {
+            int i = (injectCursor + k) % total;
             int slot = slots[i];
             if ((uint)slot >= (uint)atlasSlots.Count)
                 continue;
@@ -584,6 +597,7 @@ public sealed class GLSdfGiPass : IDisposable {
             GL.Uniform1(liInstanceIndex, i);
             GL.DispatchCompute((res.X + 3) / 4, (res.Y + 3) / 4, (res.Z + 3) / 4);
         }
+        injectCursor = total > 0 ? (injectCursor + batch) % total : 0;
 
         // Make the radiance writes visible to the march's texture() reads.
         GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit |
