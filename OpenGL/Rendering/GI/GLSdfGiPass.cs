@@ -505,7 +505,7 @@ public sealed class GLSdfGiPass : IDisposable {
             denoisePingPong[1].Ensure(halfW, halfH);
             Matrix4 invProjNoJitterCopy = invProjNoJitter;
             GLRenderTexture src = giWriteTex;
-            for (var iter = 0; iter < 2; iter++) {
+            for (var iter = 0; iter < 3; iter++) {  // 3 iters (1,2,4) — the cache GI is low-frequency
                 GLRenderTexture dst = denoisePingPong[iter & 1];
                 dst.BindAsTarget();
                 denoiseShader.Activate();
@@ -513,7 +513,7 @@ public sealed class GLSdfGiPass : IDisposable {
                 BindCombineSampler(1, depthTex, "depthTexture");
                 BindCombineSampler(2, normalTex, "normalTexture");
                 denoiseShader.SetMatrix4("InvProjection", ref invProjNoJitterCopy);
-                denoiseShader.SetFloat("StepSize", (float)(1 << iter)); // 1, then 2 texel spacing
+                denoiseShader.SetFloat("StepSize", (float)(1 << iter)); // 1, 2, 4 texel spacing
                 denoiseShader.SetFloat("DepthSigma", 0.1f);
                 denoiseShader.SetFloat("NormalSigma", 32f);
                 GLBufferUtilities.DrawFullscreenQuad();
