@@ -280,8 +280,12 @@ loop returns or the process never exits.
     program, so re-activate the render program AFTER culls, before the MDI draws.
   - `BALLISTIC_GPUDRIVEN=0` → CPU path (byte-identical fallback). Auto-disables without bindless/
     draw-params. Verified byte-identical (meanError 0) deterministic full-FX, draws 420→3.
-  - GPU-driven shadows: opt-IN `BALLISTIC_GPUDRIVEN_SHADOWS=1` (one MDI per cascade, light-space
-    cull). ~0.26% shadow-edge pixel diff (sub-perceptual) — default off keeps the image identical.
+  - GPU-driven shadows: DEFAULT ON (`BALLISTIC_GPUDRIVEN_SHADOWS=0` to disable). One MDI per cascade
+    after a light-space compute cull — collapses the ~2358 (move-time ~11000) CPU shadow depth draws
+    to ~10 when cascade caching invalidates on camera motion. Byte-identical to the CPU shadow path
+    (the bit-exact world-AABB cull + program state-leak fix). When the whole-mesh renderer is GPU-
+    driven for BOTH camera and shadows, the CPU per-submesh cull (`ComputeSubmeshVisibility`) is
+    skipped entirely — the GPU cull replaces it.
   - Gotcha: route any NEW compute-shader compile through `GLSLShaderUtilities.ToAscii` (an em-dash
     in a comment truncates the source → "unexpected end of file"). Whole-mesh model = plain
     `WorldMatrix` for ALL submeshes (NOT inverse-node — that's per-submesh-renderer only).
