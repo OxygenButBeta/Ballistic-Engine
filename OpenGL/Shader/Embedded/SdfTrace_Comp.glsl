@@ -39,6 +39,13 @@ layout(binding = 5) uniform sampler2DArrayShadow ShadowMap;
 // manual trilinear with texelFetch on integer atlas coords.
 layout(binding = 4) uniform sampler3D SdfAtlas;
 
+// The LIT scene colour at SDF-pass time (post-opaque, pre-SSGI) — the screen-space "surface cache".
+// When an SDF hit reprojects onto a visible screen pixel, we read its REAL lit radiance here (full
+// materials, colour, already-bounced light) instead of the neutral-albedo direct estimate. This is
+// what gives colored multi-bounce and lets window light carry into a dark interior (Lumen's fast
+// path). depth-validated so an occluded/off-screen hit falls back to the direct estimate.
+layout(binding = 6) uniform sampler2D SceneColor;
+
 // Output: half-res RGBA16F. rgb = gathered off-screen indirect radiance, a = validity
 // (0 = sky/invalid pixel, 1 = a real surface that got a gather).
 layout(rgba16f, binding = 0) uniform writeonly image2D OutGi;
@@ -92,6 +99,8 @@ layout(std430, binding = 11) readonly buffer GridListBuf { uint  gridList[]; }; 
 // ---------------------------------------------------------------------------------------
 uniform mat4 InvProjection;  // clip -> view (same reconstruction SSGI/SSR use)
 uniform mat4 InvView;        // view -> world
+uniform mat4 ViewProj;       // world -> clip (this frame) — projects an SDF hit to screen for the
+                             // screen-space radiance read
 uniform uint InstanceCount;  // number of valid SsdfInstance records
 uniform ivec2 HalfSize;      // output (half-res) dimensions in pixels
 uniform float SkyExposure;   // irradiance luminance scale x camera pre-exposure
@@ -288,17 +297,44 @@ float SampleSunVisibility(vec3 worldPos) {
     return 1.0; // outside every cascade: lit (matches the lit shader)
 }
 
-// Lit radiance of an off-screen surface at `worldHit` with geometric normal `hitN`: direct sun
-// (cosine, shadowed) + sky irradiance, times a neutral albedo. This is single-bounce GI evaluated
-// at the hit — the bright source the dim IBL-only v1 lacked. The surface cache (next phase) will
-// replace this with real per-surface multi-bounce radiance.
-vec3 HitRadiance(vec3 worldHit, vec3 hitN) {
+// Direct-light estimate at an off-screen hit: neutral-albedo (sun cosine, shadowed) + sky. The
+// fallback when the hit isn't visible on screen.
+vec3 HitDirect(vec3 worldHit, vec3 hitN) {
     vec3 toLight = normalize(SunDirectionWorld);   // points toward the sun
     float ndl = max(dot(hitN, toLight), 0.0);
     float vis = SampleSunVisibility(worldHit);
     vec3 direct = SunColor * (ndl * vis);
     vec3 sky = Sanitize(textureLod(IrradianceMap, hitN, 0.0).rgb) * SkyExposure;
     return HitAlbedo * (direct + sky);
+}
+
+// Lit radiance of a surface at `worldHit`. SCREEN-SPACE FIRST (Lumen's fast path): project the hit
+// to screen; if it lands on a VISIBLE pixel (its projected view-depth matches the depth buffer, i.e.
+// the hit is the surface actually shown there, not occluded), read the REAL lit scene colour — full
+// materials, colour, already-bounced light. That carries window light into a dark interior and gives
+// colored bleed for free. If the hit is off-screen or occluded, fall back to the neutral direct
+// estimate. `hitN` is the SDF gradient (used only by the fallback).
+vec3 HitRadiance(vec3 worldHit, vec3 hitN) {
+    vec4 clip = ViewProj * vec4(worldHit, 1.0);
+    if (clip.w > 1e-4) {
+        vec3 ndc = clip.xyz / clip.w;
+        vec2 suv = ndc.xy * 0.5 + 0.5;
+        if (all(greaterThanEqual(suv, vec2(0.0))) && all(lessThanEqual(suv, vec2(1.0)))) {
+            // Depth-validate: the hit's view-Z vs the scene depth's view-Z at that pixel. Reconstruct
+            // both in view space and compare with a depth-relative tolerance (silhouette/occlusion
+            // reject — accepting a mismatch would smear a foreground surface's colour onto the hit).
+            float sceneDepth = texture(DepthTex, suv).r;
+            float hitViewZ   = ViewPosFromDepth(suv, ndc.z * 0.5 + 0.5).z; // hit's reconstructed view-Z
+            float sceneViewZ = ViewPosFromDepth(suv, sceneDepth).z;        // what's actually shown there
+            float tol = max(0.05 * abs(sceneViewZ), 0.1);           // 5% of depth, min 10cm
+            if (abs(hitViewZ - sceneViewZ) < tol) {
+                // VISIBLE hit -> read its real lit radiance from the screen (the surface cache).
+                return Sanitize(textureLod(SceneColor, suv, 0.0).rgb);
+            }
+        }
+    }
+    // Off-screen / occluded: neutral direct estimate.
+    return HitDirect(worldHit, hitN);
 }
 
 void main() {

@@ -53,6 +53,7 @@ public sealed class GLSdfGiPass : IDisposable {
     const int IrradianceUnit = 3;
     const int AtlasUnit = 4;
     const int ShadowUnit = 5;   // sampler2DArrayShadow — direct-sun visibility at SDF hits
+    const int SceneColorUnit = 6; // lit scene colour — the screen-space "surface cache" at hits
 
     // Neutral diffuse albedo for off-screen SDF hits (no per-hit material in v1). Mid-grey.
     const float HitAlbedo = 0.5f;
@@ -96,7 +97,7 @@ public sealed class GLSdfGiPass : IDisposable {
     // Cached uniform locations (looked up once after the link).
     int locInvProjection, locInvView, locInstanceCount, locHalfSize, locSkyExposure, locFrameIndex, locDiagMode;
     int locCascadeBias, locCascadeCount, locSunDir, locSunColor, locHitAlbedo;
-    int locGridMin, locGridInvCell, locGridRes;
+    int locGridMin, locGridInvCell, locGridRes, locViewProj;
     readonly int[] locCascadeMatrices = new int[4];
 
     // Half-res RGBA16F gather output (pass-owned — small, consumed same frame; not pooled because
@@ -191,6 +192,7 @@ public sealed class GLSdfGiPass : IDisposable {
         locGridMin = GL.GetUniformLocation(program, "GridMin");
         locGridInvCell = GL.GetUniformLocation(program, "GridInvCell");
         locGridRes = GL.GetUniformLocation(program, "GridRes");
+        locViewProj = GL.GetUniformLocation(program, "ViewProj");
         for (var i = 0; i < 4; i++)
             locCascadeMatrices[i] = GL.GetUniformLocation(program, CascadeMatrixNames[i]);
     }
@@ -340,6 +342,8 @@ public sealed class GLSdfGiPass : IDisposable {
         // Cascaded shadow map (depth texture ARRAY, sampled as sampler2DArrayShadow — the compare
         // mode lives in the texture's parameters, set when the shadow map was created).
         BindSampler(ShadowUnit, TextureTarget.Texture2DArray, shadowMapArray);
+        // Lit scene colour = the screen-space surface cache the march reads at visible hits.
+        BindSampler(SceneColorUnit, TextureTarget.Texture2D, colorTexture);
 
         // SDF scene SSBOs (binding 8 = instances, 9 = slot table).
         scene.Bind();
@@ -347,6 +351,10 @@ public sealed class GLSdfGiPass : IDisposable {
         // Plain uniforms set per-dispatch (NOT a UBO — the PassData UBO at binding 0 is off-limits).
         GL.UniformMatrix4(locInvProjection, false, ref invProjection);
         GL.UniformMatrix4(locInvView, false, ref invView);
+        // World->clip (this frame, jittered to match the depth buffer) for the screen-space radiance
+        // read: project an SDF hit to screen, depth-validate, sample the lit colour there.
+        Matrix4 viewProj = view * projection;
+        GL.UniformMatrix4(locViewProj, false, ref viewProj);
         GL.Uniform1(locInstanceCount, (uint)scene.InstanceCount);
         GL.Uniform2(locHalfSize, halfW, halfH);
         GL.Uniform1(locSkyExposure, skyExposure);
