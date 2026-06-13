@@ -1548,7 +1548,12 @@ void main() {
             // map (and thus the image) is unchanged. Falls through to the CPU path on any failure.
             if (gpuShadowShader is not null && gpuDrivenShadows && IsGpuDrivenEligible(target) &&
                 DrawWholeMeshShadowGpuDriven(target, ref lightSpaceMatrix)) {
-                if (skinnedActive) { shadowDepthShader.Activate(); skinnedActive = false; }
+                // Restore the CPU shadow program + its lightSpaceMatrix for any subsequent CPU
+                // casters (the GPU draw left gpuShadowShader bound). The unskinned CPU path only
+                // re-activates on a skinned->unskinned transition, so do it unconditionally here.
+                shadowDepthShader.Activate();
+                shadowDepthShader.SetMatrix4("lightSpaceMatrix", ref lightSpaceMatrix);
+                skinnedActive = false;
                 continue;
             }
 
