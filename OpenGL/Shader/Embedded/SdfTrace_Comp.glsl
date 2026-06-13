@@ -348,7 +348,7 @@ void main() {
                 break;
         }
 
-        vec3 radiance;
+        vec3 radiance = vec3(0.0);
         if (hit) {
             hitCount++;
             // Lit radiance at the hit = direct sun (shadowed) + sky, x neutral albedo. The SDF
@@ -357,10 +357,13 @@ void main() {
             if (dot(hitN, hitN) < 1e-5)
                 hitN = -dir;
             radiance = Sanitize(HitRadiance(hitPoint, hitN));
-        } else {
-            // Miss: the ray escaped to sky. Sky irradiance along the ray direction.
-            radiance = Sanitize(textureLod(IrradianceMap, dir, 0.0).rgb) * SkyExposure;
         }
+        // MISS = the ray escaped to open sky. Contribute ZERO: the sky's contribution to this
+        // surface is ALREADY in the baked IBL ambient that lit the scene color we composite onto.
+        // Re-adding sky irradiance here DOUBLE-COUNTS it — that washed the bright exterior milky
+        // (mean +21, contrast lost). This GI term is purely the OFF-SCREEN BOUNCE the IBL/SSGI
+        // miss: only real surface HITS contribute. Open scenes (mostly-miss) correctly get ~0 GI;
+        // enclosed scenes (mostly-hit) get the full colored bounce.
 
         gathered += radiance;
     }
