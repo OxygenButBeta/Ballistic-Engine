@@ -745,12 +745,15 @@ public class GLHDRenderer : HDRenderer {
             }
 
         // SSGI: AO-occluded indirect bounce, added before SSR so reflections see the GI-lifted scene.
-        // SUPPRESSED when SDF-GI is active: both are indirect-light systems, and stacking them
-        // DOUBLE-COUNTS the bounce (measured: SunTemple SSGI-only +14.8, SDFGI-only +12.6, both +28.5
-        // ~= the sum). SDF-GI is the more complete system (off-screen + multi-bounce), so when it's on
-        // it IS the GI and SSGI steps aside; with SDF-GI off, SSGI is the default GI as before.
-        bool sdfGiActive = sdfGiEnabled && sdfGi.Available;
-        if (PostFX.SsgiEnabled && !sdfGiActive)
+        // SDF-GI and SSGI are COMPLEMENTARY: SDF-GI brings the OFF-SCREEN / enclosed-interior bounce
+        // SSGI can't see; SSGI brings the on-screen near-field detail (and is what lights open
+        // exteriors, where SDF-GI's mostly-miss gather adds ~nothing). Running BOTH at the SDF-GI
+        // default intensity (0.4) keeps the overlap mild while avoiding the failure mode of fully
+        // suppressing SSGI — which DARKENED open scenes (BistroExterior 107 -> 96, GI must never
+        // darken). The earlier "double-count" (SunTemple both +28.5 ~= sum) was measured at SDF-GI
+        // intensity 1.0; at the 0.4 default the combined lift is reasonable. (A fully unified
+        // screen+SDF GI with explicit handoff is the proper long-term design; this keeps both honest.)
+        if (PostFX.SsgiEnabled)
             using (timers.Time("SSGI"))
                 litColor = ssgi.Render(targetIndex, litColor, target.DepthTextureId, target.NormalTextureId,
                     aoTexture, target.LenX, target.LenY, ref view, ref renderProjection, ref projection,
