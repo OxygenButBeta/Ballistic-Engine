@@ -65,5 +65,10 @@ void main() {
     // that the sun never hits still seed some bounce. This is the light the cone tracer gathers.
     vec3 radiance = albedo * (SunColor * NdotL * sh + SkyAmbient);
 
+    // EMISSIVE surfaces inject light into the GI directly (a glowing material lights the room —
+    // emissive-as-area-light, a hallmark of the UE5/Lumen look). flag bit4 = HasEmissive.
+    if ((m.fl & 16u) != 0u)
+        radiance += texture(sampler2D(m.eH), gs.uv).rgb * m.ef.rgb;
+
     imageStore(VoxelRadiance, vc, vec4(radiance, 1.0));
 }
