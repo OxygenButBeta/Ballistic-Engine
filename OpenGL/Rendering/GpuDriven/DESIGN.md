@@ -50,21 +50,21 @@ Compute writes commands densely (slot = atomicAdd). For each emitted command it 
 PerDrawData[slot] = { model, materialID }. The vertex shader indexes PerDrawData[gl_DrawID]
 (core in 4.6 with MDI). Frag reads materialID -> MaterialTable for bindless samplers.
 
-## Hi-Z occlusion (WIP — default OFF, BALLISTIC_GPUDRIVEN_HIZ=1 to test)
+## Hi-Z occlusion (DONE — default ON, BALLISTIC_GPUDRIVEN_HIZ=0 to disable)
 
-Infrastructure complete: GLHiZPass builds a MAX-depth mip pyramid (HiZ_Down.glsl) from the
-previous frame's depth; GpuCull_Comp's occludedByHiZ() projects each world AABB to screen via the
-pyramid's view-proj, samples the MAX occluder over the footprint, and culls when the AABB's nearest
-LINEAR view distance is behind it + a metric bias. A camera-delta gate disables it the frame after
-a big jump (reprojection/hole safety).
+GLHiZPass builds a MAX-depth mip pyramid (HiZ_Down.glsl) from the previous frame's depth;
+GpuCull_Comp's occludedByHiZ() projects each world AABB to screen via the pyramid's view-proj,
+samples the MAX occluder over the footprint, and culls when the AABB's nearest LINEAR view distance
+is behind it + a 0.25 m bias. A camera-delta gate disables it the frame after a big jump
+(reprojection/hole safety). Shadows never use Hi-Z (camera depth is the wrong projection).
 
-STATUS: over-culls in far-plane-heavy scenes (Sun Temple: solid 1000->~588 but ~86% pixel diff =
-holes). Pyramid is correct (mip0 depth min 0.9586 max 1.0 — depth is just bunched near the far
-plane). The remaining bug is in the depth COMPARE, NOT the pyramid: the window-depth->linear-Z
-reconstruction (M33/M43 coeffs) and/or the `nearDist = -(view*corner).z` need to be validated on
-the GPU (write nearDist/occluderDist for submesh 0 to a debug SSBO and read back). Likely a sign or
-a row/col element pick in the OpenTK->GLSL matrix transfer. Default OFF keeps the image byte-
-identical until this is nailed. The win is real for weak GPUs / dense interiors — worth finishing.
+VERIFIED byte-identical (0% pixel diff): Sun Temple 1000->473 draws (-53%), Bistro ~814->719.
+Two bugs found & fixed: (1) compare must be in LINEAR view distance (window depth bunches in
+[0.96,1.0] near the far plane — direct window-depth compare is precision-hostile); the reconstruction
+is |M43/(z_ndc + M33)|. (2) the pyramid BUILD leaked GL state (a stray color attachment + a texture
+left bound on unit 0 + DepthTest/CullFace disabled) that corrupted the later passes (sky/SSGI/SSR) —
+merely building it changed the image even when nothing was culled. GLHiZPass.Build now detaches +
+restores fully.
 
 ## Verification
 Anchor: e:/tmp/gpudriven/baseline.bmp (deterministic paused frame 120, 1920x1080).

@@ -114,7 +114,17 @@ void main() { FragDepth = texture(SourceDepth, TexCoords).r; }
         GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureBaseLevel, 0);
         GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMaxLevel, MipCount - 1);
 
+        // Detach the pyramid from our FBO and leave clean state: a stray color attachment or a
+        // texture left bound on unit 0 corrupts the passes that run after (sky/SSGI/SSR all sample
+        // their own textures on unit 0 and assume nothing of ours lingers). This was the bug that
+        // made merely BUILDING the pyramid change the image even when the cull dropped nothing.
+        GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
+            TextureTarget.Texture2D, 0, 0);
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+        GL.ActiveTexture(TextureUnit.Texture0);
+        GL.BindTexture(TextureTarget.Texture2D, 0);
+        GL.Enable(EnableCap.DepthTest);   // restore the defaults the build disabled
+        GL.Enable(EnableCap.CullFace);
     }
 
     // Debug: read back min/max of mip 0 and the coarsest mip's single value (blocks — debug only).

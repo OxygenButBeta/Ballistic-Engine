@@ -62,11 +62,12 @@ public class GLHDRenderer : HDRenderer {
     // Opt-out BALLISTIC_GPUDRIVEN_HIZ=0. Conservative (never false-culls a visible submesh); the
     // cull also DISABLES it for a frame after a large camera jump (the only stale-depth hole risk).
     readonly OpenGL.GpuDriven.GLHiZPass hiZ = new();
-    // Opt-IN (BALLISTIC_GPUDRIVEN_HIZ=1) while the depth-compare is finalized: the pyramid build +
-    // conservative test are wired, but the window-depth->linear reconstruction still over-culls in
-    // far-plane-heavy scenes (Sun Temple depth sits in [0.96,1.0]). Default off keeps the image
-    // byte-identical. WIP — see DESIGN.md.
-    bool gpuDrivenHiZ = Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN_HIZ") == "1";
+    // GPU occlusion culling: DEFAULT ON (BALLISTIC_GPUDRIVEN_HIZ=0 to disable). Drops submeshes whose
+    // whole AABB is behind a closer occluder, sampling a MAX-depth pyramid built from last frame's
+    // depth. Conservative (the AABB's NEAREST linear view distance vs the FARTHEST occluder + a
+    // metric bias) + a camera-delta gate that disables it one frame after a big jump. Verified
+    // byte-identical (0% pixel diff): Sun Temple 1000->473 draws, Bistro ~814->719.
+    bool gpuDrivenHiZ = Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN_HIZ") != "0";
     int hizPyramidTex;                       // last frame's pyramid (what THIS frame's cull samples)
     int hizPyramidW, hizPyramidH, hizPyramidMips;
     Matrix4 hizViewProj;                     // VP the last pyramid was built with (Hi-Z projection)
