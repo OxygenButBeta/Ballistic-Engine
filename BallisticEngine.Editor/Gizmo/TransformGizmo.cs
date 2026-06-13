@@ -192,7 +192,8 @@ internal sealed class TransformGizmo {
                     lastMouse = mouse;
                 }
                 else if (activeAxis >= 4) {
-                    dragStartPlaneHit = PointOnAxisPlane(origin, currentAxes[Planes[activeAxis - 4].normal], rayO, rayD);
+                    TryPointOnAxisPlane(origin, currentAxes[Planes[activeAxis - 4].normal], rayO, rayD,
+                        out dragStartPlaneHit);
                 }
                 else if (activeAxis < 3) {
                     dragStartParam = ClosestParamOnAxis(origin, currentAxes[activeAxis], rayO, rayD);
@@ -213,9 +214,13 @@ internal sealed class TransformGizmo {
 
         switch (Mode) {
             case GizmoMode.Translate when activeAxis >= 4: {
-                Vector3 hit = PointOnAxisPlane(dragStartOrigin, currentAxes[Planes[activeAxis - 4].normal], ro, rd);
-                Vector3 pos = dragStartPosition + (hit - dragStartPlaneHit);
-                entity.transform.WorldPosition = SnapHeld ? SnapVector(pos, EditorPrefs.Current.SnapMove) : pos;
+                // Hold position when the ray goes edge-on to the drag plane (no valid hit) instead of
+                // snapping to a zero-delta jump.
+                if (TryPointOnAxisPlane(dragStartOrigin, currentAxes[Planes[activeAxis - 4].normal], ro, rd,
+                        out Vector3 hit)) {
+                    Vector3 pos = dragStartPosition + (hit - dragStartPlaneHit);
+                    entity.transform.WorldPosition = SnapHeld ? SnapVector(pos, EditorPrefs.Current.SnapMove) : pos;
+                }
                 break;
             }
             case GizmoMode.Translate when activeAxis < 3: {
@@ -532,13 +537,21 @@ internal sealed class TransformGizmo {
         return (b * e - c * d) / denominator;
     }
 
-    // Vector from the gizmo origin to where the mouse ray hits the axis-perpendicular plane.
-    static Vector3 PointOnAxisPlane(Vector3 planeOrigin, Vector3 axis, Vector3 rayO, Vector3 rayD) {
+    // Vector from the gizmo origin to where the mouse ray hits the axis-perpendicular plane. Returns
+    // false (and a zero offset) when the ray is parallel to the plane (looking edge-on) or the hit is
+    // behind the camera — callers must hold position rather than treat the zero as a real delta, or the
+    // dragged object snaps to the origin the instant the view goes edge-on to the drag plane.
+    static bool TryPointOnAxisPlane(Vector3 planeOrigin, Vector3 axis, Vector3 rayO, Vector3 rayD,
+        out Vector3 offset) {
+        offset = Vector3.Zero;
         float denom = Vector3.Dot(rayD, axis);
         if (Math.Abs(denom) < 1e-6f)
-            return Vector3.Zero;
+            return false;
         float t = Vector3.Dot(planeOrigin - rayO, axis) / denom;
-        return t < 0 ? Vector3.Zero : rayO + rayD * t - planeOrigin;
+        if (t < 0)
+            return false;
+        offset = rayO + rayD * t - planeOrigin;
+        return true;
     }
 
 }

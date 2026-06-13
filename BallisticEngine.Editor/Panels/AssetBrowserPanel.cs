@@ -699,6 +699,29 @@ internal sealed class AssetBrowserPanel {
             onFinished: thumbnails.InvalidateAll);
     }
 
+    // Deletes a folder recursively, then re-anchors the browser if the view was inside it. Without the
+    // re-anchor, CurrentFolder would point at a now-missing directory and the grid pane would enumerate
+    // a deleted path every frame; the delete is also wrapped (Windows locks open folders — Rider, an
+    // open Explorer — so it can legitimately throw and must not corrupt the ImGui frame).
+    void DeleteFolder(string folderPath) {
+        try {
+            Directory.Delete(AssetDatabase.Project.ResolveAbsolute(folderPath), recursive: true);
+        }
+        catch (Exception e) {
+            Debugging.LogError($"Could not delete folder '{folderPath}': {e.Message}");
+            return;
+        }
+        // If we were viewing the deleted folder (or anything under it), drop back to its parent.
+        bool inside = string.Equals(CurrentFolder, folderPath, StringComparison.OrdinalIgnoreCase) ||
+                      CurrentFolder.StartsWith(folderPath + "/", StringComparison.OrdinalIgnoreCase);
+        if (inside) {
+            int slash = folderPath.LastIndexOf('/');
+            NavigateTo(slash > 0 ? folderPath[..slash] : "Assets");
+            state.ClearAssetSelection();
+        }
+        AsyncAssetImport.Request("Updating assets...", onFinished: thumbnails.InvalidateAll);
+    }
+
     // Clickable path: each segment jumps to that folder. "Assets > Default > Sky".
     void DrawBreadcrumb() {
         var segments = CurrentFolder.Split('/');
@@ -1204,10 +1227,8 @@ internal sealed class AssetBrowserPanel {
             if (ImGui.MenuItem("Show in Explorer"))
                 ShowInExplorer(AssetDatabase.Project.ResolveAbsolute(folderPath), select: false);
             ImGui.Separator();
-            if (ImGui.MenuItem("Delete Folder")) {
-                Directory.Delete(AssetDatabase.Project.ResolveAbsolute(folderPath), recursive: true);
-                AsyncAssetImport.Request("Updating assets...", onFinished: thumbnails.InvalidateAll);
-            }
+            if (ImGui.MenuItem("Delete Folder"))
+                DeleteFolder(folderPath);
             ImGui.EndPopup();
         }
 
