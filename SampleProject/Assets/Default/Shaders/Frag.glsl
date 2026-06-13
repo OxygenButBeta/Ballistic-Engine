@@ -698,11 +698,21 @@ void main()
     float alpha = AlphaBlend ? clamp(Opacity * albedoSample.a * BaseColorFactor.a, 0.0, 1.0) : 1.0;
     vec3 color = (diffuseLight + ambientDiffuse + emissive) * alpha + specularLight + ambientSpecular;
 
-    // --- Distance fog ---
+    // --- Aerial perspective (distance fog toward the SKY colour in the view direction) ---
+    // Distant geometry fades into the atmosphere BEHIND it: instead of a flat FogColor, blend
+    // toward the sky's actual colour along the view ray (bluer to the horizon, warm toward the
+    // sun) — the UE5 aerial-perspective cue that gives scenes real depth and scale. FogColor still
+    // tints it so authored fog keeps influence. The prefiltered env's coarse mip = a soft sky avg.
     if (EnableAtmosphericScattering) {
         float dist = length(CameraPos - fragPos);
         float fogFactor = clamp(1.0 - exp(-dist * FogDensity), 0.0, 1.0);
-        color = mix(color, FogColor * alpha, fogFactor);
+        vec3 viewDir = normalize(fragPos - CameraPos);
+        vec3 skyTint = UseIBL
+            ? textureLod(PrefilteredEnvMap, SkyDir(viewDir), MaxPrefilterMips * 0.6).rgb * SkyExposure
+            : FogColor;
+        // Blend the sampled sky with the authored FogColor so both contribute.
+        vec3 aerial = mix(skyTint, FogColor, 0.35);
+        color = mix(color, aerial * alpha, fogFactor);
     }
 
     FragColor = vec4(color, alpha); // linear HDR out; tonemap happens in the composite pass
