@@ -12,6 +12,12 @@ public sealed class VoxelGlobalIllumination : VolumeComponent {
              "2.0 = the tuned default; raise to make bounce obvious, lower for subtle.")]
     public readonly ClampedFloatParameter intensity = new(2.0f, 0f, 6f);
 
+    [Tooltip("How much the cone-traced bounce REPLACES the flat sky ambient in enclosed areas " +
+             "(the Lumen look). 0 = purely additive (older conservative look); 0.6 = default; 1 = the " +
+             "sky ambient fully fades out where the hemisphere is closed, so the colored local bounce " +
+             "takes over recesses. Open, sky-exposed surfaces are unaffected at any value.")]
+    public readonly ClampedFloatParameter skyReplace = new(0.6f, 0f, 1f);
+
     [Tooltip("Extra GI bounce passes after the direct pass. Each compounds another light bounce, " +
              "filling deeper interiors. 0 = single bounce, 2 = default, more = richer but costlier.")]
     public readonly ClampedIntParameter bounces = new(2, 0, 4);

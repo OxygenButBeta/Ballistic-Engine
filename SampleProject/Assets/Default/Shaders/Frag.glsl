@@ -38,6 +38,7 @@ uniform vec3  VoxelVolumeMin;
 uniform vec3  VoxelVolumeInvSize;     // 1 / world size
 uniform float VoxelWorldSize;         // metres per voxel
 uniform float VoxelGiIntensity;       // master strength of the cone-traced indirect
+uniform float VoxelGiSkyReplace;      // 0..1: how much cone coverage fades the flat sky-IBL ambient
 uniform bool  UseVoxelGI;             // gate: false -> shader is unchanged (default look preserved)
 uniform bool  VoxelGiDebug;           // show ONLY the GI bounce (brightened) for debugging
 
@@ -61,20 +62,29 @@ vec4 vctTraceCone(vec3 origin, vec3 dir, float aperture, float maxDistM) {
     return vec4(color, alpha);
 }
 
-// 6 diffuse hemisphere cones around N.
-vec3 vctDiffuse(vec3 wp, vec3 N) {
+// 6 diffuse hemisphere cones around N. Returns rgb = cone-traced bounce radiance,
+// a = the cosine-weighted coverage (accumulated cone alpha): ~0 where the hemisphere is
+// open to the sky, ~1 where nearby geometry encloses the point (a deep recess). The caller
+// uses that coverage to fade the flat sky-IBL out exactly where the sky can't physically
+// reach — so the colored local bounce takes over in enclosed interiors (the Lumen look)
+// instead of merely adding on top of a full sky ambient that over-fills shadowed pockets.
+vec4 vctDiffuseCov(vec3 wp, vec3 N) {
     vec3 up = abs(N.y) < 0.95 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
     vec3 T = normalize(cross(up, N)); vec3 B = cross(N, T);
     const float AP = 0.577, MAXD = 24.0, SIN60 = 0.866, COS60 = 0.5;
     vec3 o = wp + N * VoxelWorldSize * 1.5;
-    vec3 acc = vctTraceCone(o, N, AP, MAXD).rgb * 0.25;
+    vec4 c = vctTraceCone(o, N, AP, MAXD);
+    vec3 acc = c.rgb * 0.25; float cov = c.a * 0.25;
     for (int i = 0; i < 5; ++i) {
         float a = float(i) * 1.2566370614;
         vec3 dir = normalize(N * COS60 + (T * cos(a) + B * sin(a)) * SIN60);
-        acc += vctTraceCone(o, dir, AP, MAXD).rgb * 0.15;
+        vec4 s = vctTraceCone(o, dir, AP, MAXD);
+        acc += s.rgb * 0.15; cov += s.a * 0.15;
     }
-    return acc;
+    return vec4(acc, cov);
 }
+
+vec3 vctDiffuse(vec3 wp, vec3 N) { return vctDiffuseCov(wp, N).rgb; }
 
 vec3 vctSpecular(vec3 wp, vec3 N, vec3 R, float roughness) {
     float ap = clamp(tan(roughness * 1.5707963), 0.02, 0.577);
@@ -673,16 +683,23 @@ void main()
         // Replaces the flat probe/sky irradiance with cone-traced local bounce where the voxel
         // grid covers this point. Off (UseVoxelGI=false) -> the lines above stand unchanged.
         if (UseVoxelGI) {
-            vec3 giDiffuse = vctDiffuse(fragPos, N) * VoxelGiIntensity;
+            vec4 giTrace = vctDiffuseCov(fragPos, N);
+            vec3 giDiffuse = giTrace.rgb * VoxelGiIntensity;
             // DEBUG: show ONLY the bounce (brightened) so you can SEE where GI lands / leaks / misses.
             if (VoxelGiDebug) {
                 FragColor = vec4(giDiffuse * 4.0, 1.0);
                 NormalRough = vec4(N * 0.5 + 0.5, 1.0);
                 return;
             }
-            // The traced bounce is the real local indirect; blend it OVER the IBL base (which is the
-            // distant/sky ambient the cones can't reach), modulated by AO so creases stay grounded.
-            ambientDiffuse = kD * (irradiance * AmbientTint + giDiffuse) * ao;
+            // Coverage-weighted indirect (the Lumen look). The flat sky-IBL irradiance is only valid
+            // where the hemisphere is actually open to the sky; in an enclosed recess the cones hit
+            // nearby geometry (coverage -> 1) and that sky term is physically wrong (over-fills the
+            // pocket, washing out the colored bounce). So fade the sky IBL out by coverage and let the
+            // cone-traced bounce take over there. VoxelGiSkyReplace scales how aggressively (0 = pure
+            // additive, the old conservative look; 1 = fully replace sky where enclosed). The bounce
+            // is always added in full, so well-exposed open surfaces are unchanged (coverage ~0).
+            float skyFade = 1.0 - VoxelGiSkyReplace * clamp(giTrace.a, 0.0, 1.0);
+            ambientDiffuse = kD * (irradiance * AmbientTint * skyFade + giDiffuse) * ao;
             // Glossy: a reflection cone adds local specular bounce the sky cubemap lacks.
             vec3 giSpec = vctSpecular(fragPos, N, R, roughness) * VoxelGiIntensity;
             ambientSpecular += giSpec * FssEss * specOcclusion;

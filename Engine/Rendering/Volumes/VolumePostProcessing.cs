@@ -66,6 +66,7 @@ public static class VolumePostProcessing {
         if (stack.GetComponent<VoxelGlobalIllumination>() is { } vgi) {
             fx.VoxelGiEnabled = vgi.enabled.Value;
             fx.VoxelGiIntensity = vgi.intensity.Value;
+            fx.VoxelGiSkyReplace = vgi.skyReplace.Value;
             fx.VoxelGiBounces = vgi.bounces.Value;
             fx.VoxelGiResolution = vgi.resolution.Value;
             fx.VoxelGiVolumeSize = vgi.volumeSize.Value;
