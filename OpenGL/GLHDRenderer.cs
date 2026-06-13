@@ -56,6 +56,25 @@ public class GLHDRenderer : HDRenderer {
     readonly OpenGL.GpuDriven.GpuDrivenRenderer gpuDriven = new();
     readonly Dictionary<Shader, (Shader Lit, Shader Prepass)> gpuDrivenShaders = new();
     StandardShader gpuShadowShader;   // depth-only MDI shadow caster (per-cascade lightSpaceMatrix)
+
+    // Hi-Z occlusion: a depth pyramid built from the PREVIOUS frame's depth, sampled by the cull to
+    // drop submeshes fully behind a closer occluder (huge for dense/interior scenes on weak GPUs).
+    // Opt-out BALLISTIC_GPUDRIVEN_HIZ=0. Conservative (never false-culls a visible submesh); the
+    // cull also DISABLES it for a frame after a large camera jump (the only stale-depth hole risk).
+    readonly OpenGL.GpuDriven.GLHiZPass hiZ = new();
+    // Opt-IN (BALLISTIC_GPUDRIVEN_HIZ=1) while the depth-compare is finalized: the pyramid build +
+    // conservative test are wired, but the window-depth->linear reconstruction still over-culls in
+    // far-plane-heavy scenes (Sun Temple depth sits in [0.96,1.0]). Default off keeps the image
+    // byte-identical. WIP — see DESIGN.md.
+    bool gpuDrivenHiZ = Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN_HIZ") == "1";
+    int hizPyramidTex;                       // last frame's pyramid (what THIS frame's cull samples)
+    int hizPyramidW, hizPyramidH, hizPyramidMips;
+    Matrix4 hizViewProj;                     // VP the last pyramid was built with (Hi-Z projection)
+    Matrix4 hizView;                         // view matrix that pairs with it (for linear view Z)
+    float hizProjZZ, hizProjWZ;              // projection[2][2]/[3][2] -> window-depth->linear-Z
+    bool hizValidThisFrame;                  // false right after a big camera move (disocclusion risk)
+    Matrix4 prevCullViewProj;
+    bool prevCullViewProjValid;
     bool gpuDrivenEnabled = Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN") != "0";
     // GPU-driven shadows: DEFAULT ON (BALLISTIC_GPUDRIVEN_SHADOWS=0 to disable). One MDI per cascade
     // after a light-space compute cull instead of re-rendering all ~1600 whole-mesh casters on the
@@ -647,6 +666,17 @@ void main() {
         // New frame for the GPU-driven path: the next eligible draw rebuilds metadata + reruns the
         // compute cull (consumed by both prepass and opaque). Reset before the prepass.
         gpuDrivenCulledThisFrame = false;
+
+        // Hi-Z validity gate: the cull samples LAST frame's pyramid. If the camera barely moved, the
+        // reprojection error is sub-texel and Hi-Z is safe. After a big jump, disocclusion could let
+        // a now-visible submesh read a stale "occluded" depth -> a 1-frame hole; disable Hi-Z that
+        // frame (geometry just draws — no artifact). Cheap proxy: max abs element delta of the VP.
+        Matrix4 cullVP = view * projection; // un-jittered, matches the pyramid build
+        hizValidThisFrame = gpuDrivenHiZ && hizPyramidTex > 0 && prevCullViewProjValid &&
+                            MatrixMaxDelta(cullVP, prevCullViewProj) < 0.02f;
+        prevCullViewProj = cullVP;
+        prevCullViewProjValid = true;
+
         using (timers.Time("DepthPrepass"))
             RenderDepthPrepass(ref view, ref renderProjection, cameraPos);
 
@@ -677,6 +707,30 @@ void main() {
                 prepassDepth: true);
         if (wireframe)
             GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Fill);
+
+        // Build the Hi-Z pyramid from THIS frame's final depth for NEXT frame's cull to sample. Done
+        // after opaque so the depth is complete. Only for the main (camera) target; the un-jittered
+        // VP it pairs with is stored so the cull projects AABBs into the same space.
+        if (gpuDrivenReady && gpuDrivenHiZ && ActiveTarget != RenderTarget.Game) {
+            using var hizZone = timers.Time("HiZ");
+            hiZ.Build(target.DepthTextureId, target.LenX, target.LenY);
+            hizPyramidTex = hiZ.PyramidTexture;
+            hizPyramidW = hiZ.Width;
+            hizPyramidH = hiZ.Height;
+            hizPyramidMips = hiZ.MipCount;
+            hizViewProj = view * renderProjection; // EXACTLY what rasterized the depth (jitter incl.)
+            hizView = view;
+            // GL perspective window-depth->linear-Z coefficients (OpenTK row-major: M33, M43).
+            hizProjZZ = renderProjection.M33;
+            hizProjWZ = renderProjection.M43;
+            if (Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN_DEBUG") == "1") {
+                var (mn, mx, coarse) = hiZ.DebugStats();
+                Console.WriteLine($"[HiZ] mip0 depth min={mn:0.0000} max={mx:0.0000} coarsestMax={coarse:0.0000} mips={hiZ.MipCount}");
+            }
+            // The build bound its own FBO + program; restore the render target for the passes below.
+            target.Activate();
+            GL.Viewport(0, 0, target.LenX, target.LenY);
+        }
 
         // Fence the GPU-driven persistent buffers AFTER both passes consumed them, so next frame's
         // BeginFrame waits only if it laps the GPU (triple-buffered: it rarely does).
@@ -1870,8 +1924,15 @@ void main() {
         if (isDepthPrepass) {
             Matrix4 vp = view * projection;
             ExtractFrustumPlanes(ref vp, gpuCullPlanes);
-            gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchSolid, gpuCullPlanes, pass: 0, cutoutFilter: 0);
-            gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchCutout, gpuCullPlanes, pass: 0, cutoutFilter: 1);
+            // Hi-Z samples LAST frame's pyramid, so project AABBs with the matrix it was built with
+            // (hizViewProj). hizValidThisFrame is cleared after a big camera jump (reprojection risk).
+            bool useHiz = gpuDrivenHiZ && hizValidThisFrame && hizPyramidTex > 0;
+            gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchSolid, gpuCullPlanes, 0, 0,
+                hizViewProj, hizView, hizProjZZ, hizProjWZ,
+                hizPyramidTex, hizPyramidW, hizPyramidH, hizPyramidMips, useHiz);
+            gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchCutout, gpuCullPlanes, 0, 1,
+                hizViewProj, hizView, hizProjZZ, hizProjWZ,
+                hizPyramidTex, hizPyramidW, hizPyramidH, hizPyramidMips, useHiz);
         }
         if (Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN_DEBUG") == "1" && !isDepthPrepass)
             Console.WriteLine($"[GpuDriven] solid={gpuDriven.DebugReadDrawCount(0)} cutout={gpuDriven.DebugReadDrawCount(1)}");
@@ -1920,10 +1981,14 @@ void main() {
             gpuDrivenTarget = target;
         }
 
-        // Cull against the light-space frustum (same planes the CPU shadow path uses).
+        // Cull against the light-space frustum (same planes the CPU shadow path uses). Hi-Z OFF for
+        // shadows — the camera depth pyramid is the wrong projection for a light view (a camera-
+        // occluded caster can still cast INTO the visible scene), and shadow correctness is sacred.
         ExtractFrustumPlanes(ref lightSpaceMatrix, gpuShadowPlanes);
-        gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchSolid, gpuShadowPlanes, pass: 0, cutoutFilter: 0);
-        gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchCutout, gpuShadowPlanes, pass: 0, cutoutFilter: 1);
+        gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchSolid, gpuShadowPlanes, 0, 0,
+            Matrix4.Identity, Matrix4.Identity, 1f, 0f, 0, 0, 0, 0, hizEnabled: false);
+        gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchCutout, gpuShadowPlanes, 0, 1,
+            Matrix4.Identity, Matrix4.Identity, 1f, 0f, 0, 0, 0, 0, hizEnabled: false);
 
         gpuShadowShader.Activate();
         gpuShadowShader.SetMatrix4("lightSpaceMatrix", ref lightSpaceMatrix);
@@ -2124,6 +2189,19 @@ void main() {
     readonly Vector4[] bakeFrustum = new Vector4[6];
 
     // Gribb-Hartmann plane extraction for the row-vector convention (clip_i = v . Column_i).
+    // Max absolute per-element difference of two matrices — a cheap "did the camera move much?"
+    // proxy for the Hi-Z reprojection-safety gate.
+    static float MatrixMaxDelta(Matrix4 a, Matrix4 b) {
+        float m = 0f;
+        m = MathF.Max(m, AbsRowMax(a.Row0 - b.Row0));
+        m = MathF.Max(m, AbsRowMax(a.Row1 - b.Row1));
+        m = MathF.Max(m, AbsRowMax(a.Row2 - b.Row2));
+        m = MathF.Max(m, AbsRowMax(a.Row3 - b.Row3));
+        return m;
+    }
+    static float AbsRowMax(Vector4 v) =>
+        MathF.Max(MathF.Max(MathF.Abs(v.X), MathF.Abs(v.Y)), MathF.Max(MathF.Abs(v.Z), MathF.Abs(v.W)));
+
     static void ExtractFrustumPlanes(ref Matrix4 vp, Vector4[] planes) {
         Vector4 c0 = vp.Column0, c1 = vp.Column1, c2 = vp.Column2, c3 = vp.Column3;
         planes[0] = c3 + c0; // left

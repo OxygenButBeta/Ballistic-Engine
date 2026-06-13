@@ -43,8 +43,11 @@ public sealed class GpuDrivenRenderer : IDisposable {
     // let the compute read stale metadata → whole solid batch culled → flicker).
     int metaBuffer;                   // SubmeshMeta[]
     int metaCapacity;                 // submeshes the metaBuffer is sized for
-    int cullParamsBuffer;             // CullParams UBO (std140, 112 bytes)
-    readonly byte[] cullParamsCpu = new byte[112];
+    int cullParamsBuffer;             // CullParams UBO (std140)
+    // std140: mat4 viewProj(64) + mat4 view(64) + vec4 planes[6](96) + vec4 hizParams(16)
+    //         + vec4 linearize(16) + 4 uints(16) = 272.
+    const int CullParamsBytes = 272;
+    readonly byte[] cullParamsCpu = new byte[CullParamsBytes];
     readonly int[] cmdBuffer = new int[BatchCount];     // DrawCommand[] per batch
     readonly int[] countBuffer = new int[BatchCount];   // single uint per batch
     readonly int[] perDrawBuffer = new int[BatchCount]; // PerDrawData[] per batch
@@ -75,10 +78,9 @@ public sealed class GpuDrivenRenderer : IDisposable {
         materialBuffer = GL.GenBuffer();
         metaBuffer = GL.GenBuffer();
 
-        // CullParams UBO: 6*vec4 planes + 4 uints = 96 + 16 = 112 bytes, std140. Plain DynamicDraw.
         cullParamsBuffer = GL.GenBuffer();
         GL.BindBuffer(BufferTarget.UniformBuffer, cullParamsBuffer);
-        GL.BufferData(BufferTarget.UniformBuffer, 112, IntPtr.Zero, BufferUsageHint.DynamicDraw);
+        GL.BufferData(BufferTarget.UniformBuffer, CullParamsBytes, IntPtr.Zero, BufferUsageHint.DynamicDraw);
         GL.BindBuffer(BufferTarget.UniformBuffer, 0);
         GL.BindBuffer(BufferTarget.ShaderStorageBuffer, 0);
 
@@ -155,7 +157,11 @@ public sealed class GpuDrivenRenderer : IDisposable {
     // submesh. After this the command buffer + count buffer hold the visible draw set.
     // cutoutFilter: 0 = SOLID submeshes only, 1 = CUTOUT only (drawn separately with backface
     // culling off, like the CPU path's single-sided foliage cards).
-    public unsafe void Cull(int batch, Vector4[] frustumPlanes, uint pass, uint cutoutFilter) {
+    // hizTexture/hizW/hizH/hizMips drive the Hi-Z occlusion test; pass hizTexture<=0 or hizEnabled
+    // false to skip it (e.g. the shadow cull, or a fast-moving camera frame).
+    public unsafe void Cull(int batch, Vector4[] frustumPlanes, uint pass, uint cutoutFilter,
+        Matrix4 viewProj, Matrix4 view, float projZZ, float projWZ,
+        int hizTexture, int hizW, int hizH, int hizMips, bool hizEnabled) {
         if (!Available || currentSubmeshCount == 0)
             return;
 
@@ -164,19 +170,25 @@ public sealed class GpuDrivenRenderer : IDisposable {
         GL.BindBuffer(BufferTarget.ShaderStorageBuffer, countBuffer[batch]);
         GL.BufferSubData(BufferTarget.ShaderStorageBuffer, IntPtr.Zero, sizeof(uint), ref zero);
 
-        // Upload CullParams (std140): 6 vec4 planes, then submeshCount, pass, cutoutFilter, pad.
+        // Upload CullParams (std140): viewProj(0) | view(64) | planes[6](128) | hizParams(224) |
+        // linearize(240) | uints(256).
+        bool useHiz = hizEnabled && hizTexture > 0;
         fixed (byte* cp = cullParamsCpu) {
-            var planeSpan = new Span<Vector4>(cp, 6);
+            *(Matrix4*)cp = viewProj;
+            *(Matrix4*)(cp + 64) = view;
+            var planeSpan = new Span<Vector4>(cp + 128, 6);
             for (var i = 0; i < 6; i++)
                 planeSpan[i] = frustumPlanes[i];
-            var tail = (uint*)(cp + 96);
+            *(Vector4*)(cp + 224) = new Vector4(hizW, hizH, hizMips, useHiz ? 1f : 0f);
+            *(Vector4*)(cp + 240) = new Vector4(projZZ, projWZ, 0f, 0f);
+            var tail = (uint*)(cp + 256);
             tail[0] = (uint)currentSubmeshCount;
             tail[1] = pass;
             tail[2] = cutoutFilter;
             tail[3] = 0;
         }
         GL.BindBuffer(BufferTarget.UniformBuffer, cullParamsBuffer);
-        GL.BufferSubData(BufferTarget.UniformBuffer, IntPtr.Zero, 112, cullParamsCpu);
+        GL.BufferSubData(BufferTarget.UniformBuffer, IntPtr.Zero, CullParamsBytes, cullParamsCpu);
         GL.BindBuffer(BufferTarget.UniformBuffer, 0);
 
         // Bind this batch's buffers and dispatch. (BufferSubData above is ordered before the
@@ -187,6 +199,10 @@ public sealed class GpuDrivenRenderer : IDisposable {
         GL.BindBufferBase(BufferRangeTarget.ShaderStorageBuffer, CountBinding, countBuffer[batch]);
         GL.BindBufferBase(BufferRangeTarget.ShaderStorageBuffer, PerDrawBinding, perDrawBuffer[batch]);
         GL.BindBufferBase(BufferRangeTarget.UniformBuffer, CullParamsBinding, cullParamsBuffer);
+
+        // Hi-Z pyramid on texture unit 0 (the cull's only sampler).
+        GL.ActiveTexture(TextureUnit.Texture0);
+        GL.BindTexture(TextureTarget.Texture2D, useHiz ? hizTexture : 0);
 
         GL.UseProgram(cullProgram);
         int groups = (currentSubmeshCount + 63) / 64;
