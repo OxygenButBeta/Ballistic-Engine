@@ -74,24 +74,48 @@ public sealed class GLSdfScene : IDisposable {
         SdfSlotGpu SlotAt(int slot);
     }
 
+    // ---- Uniform spatial grid over the instances (binding 10 = cell ranges, 11 = flattened
+    // instance indices). The march maps a world point to a cell and loops ONLY that cell's
+    // instances, cutting the per-step iteration from all-N to the handful overlapping the cell —
+    // the perf fix that makes hundreds of per-submesh fields affordable.
+    public const int GridCellBinding = 10;
+    public const int GridListBinding = 11;
+    const int GridRes = 32;             // 32^3 cells
+    const int GridCellCount = GridRes * GridRes * GridRes;
+
     int instanceBuffer;     // SdfInstance[]  (binding 8)
     int slotBuffer;         // SdfSlotGpu[]   (binding 9)
+    int gridCellBuffer;     // ivec2 (start,count) per cell  (binding 10)
+    int gridListBuffer;     // uint flattened instance indices, grouped by cell  (binding 11)
     int instanceCapacity;   // SdfInstance entries the instanceBuffer is sized for
     int slotCapacity;       // SdfSlotGpu entries the slotBuffer is sized for
+    int gridListCapacity;   // uint entries the gridListBuffer is sized for
 
     SdfInstance[] instanceScratch = [];
     SdfSlotGpu[] slotScratch = [];
+    // Grid CPU scratch: per-cell (start,count) packed as 2 ints, and the flattened index list.
+    readonly int[] cellStart = new int[GridCellCount];
+    readonly int[] cellCount = new int[GridCellCount];
+    int[] cellRangesPacked = new int[GridCellCount * 2]; // (start,count) per cell, uploaded
+    uint[] gridList = [];
 
     bool initialized;
 
     public int InstanceCount { get; private set; }
     public int SlotCount { get; private set; }
 
+    // Grid bounds + inverse cell size the march needs to map a world point to a cell.
+    public Vector3 GridMin { get; private set; }
+    public Vector3 GridInvCell { get; private set; }   // 1 / cellSize per axis
+    public int GridResolution => GridRes;
+
     void EnsureBuffers() {
         if (initialized)
             return;
         instanceBuffer = GL.GenBuffer();
         slotBuffer = GL.GenBuffer();
+        gridCellBuffer = GL.GenBuffer();
+        gridListBuffer = GL.GenBuffer();
         initialized = true;
     }
 
@@ -139,7 +163,93 @@ public sealed class GLSdfScene : IDisposable {
             slotScratch[i] = atlas!.SlotAt(i);
         SlotCount = slots;
         UploadStructs(slotBuffer, slotScratch, slots, SdfSlotGpu.SizeBytes, ref slotCapacity);
+
+        // ---- Spatial grid (bindings 10/11) ----
+        BuildGrid(n);
     }
+
+    // Bins the `n` instances (their world AABBs are already in instanceScratch) into a GridRes^3
+    // uniform grid, so the march loops only the instances overlapping the current cell. Two-pass
+    // counting sort: count per cell -> prefix-sum to cell starts -> scatter instance indices.
+    void BuildGrid(int n) {
+        // Grid bounds = union of all instance world AABBs (a little padding so edge cells are safe).
+        Vector3 gmin = new(float.MaxValue), gmax = new(float.MinValue);
+        for (int i = 0; i < n; i++) {
+            gmin = Vector3.ComponentMin(gmin, instanceScratch[i].WorldAabbMin.Xyz);
+            gmax = Vector3.ComponentMax(gmax, instanceScratch[i].WorldAabbMax.Xyz);
+        }
+        if (n == 0) { gmin = Vector3.Zero; gmax = Vector3.One; }
+        Vector3 ext = Vector3.ComponentMax(gmax - gmin, new Vector3(1e-3f));
+        GridMin = gmin;
+        Vector3 cellSize = ext / GridRes;
+        GridInvCell = new Vector3(1f / cellSize.X, 1f / cellSize.Y, 1f / cellSize.Z);
+
+        Array.Clear(cellCount, 0, GridCellCount);
+
+        // Pass 1: count how many (instance, cell) pairs land in each cell.
+        long totalPairs = 0;
+        for (int i = 0; i < n; i++) {
+            CellRange(instanceScratch[i], out int x0, out int y0, out int z0, out int x1, out int y1, out int z1);
+            for (int z = z0; z <= z1; z++)
+                for (int y = y0; y <= y1; y++)
+                    for (int x = x0; x <= x1; x++) {
+                        cellCount[CellIndex(x, y, z)]++;
+                        totalPairs++;
+                    }
+        }
+
+        // Prefix-sum -> cell starts; pack (start,count) for upload.
+        if (cellRangesPacked.Length < GridCellCount * 2)
+            cellRangesPacked = new int[GridCellCount * 2];
+        int running = 0;
+        for (int c = 0; c < GridCellCount; c++) {
+            cellStart[c] = running;
+            cellRangesPacked[c * 2 + 0] = running;
+            cellRangesPacked[c * 2 + 1] = cellCount[c];
+            running += cellCount[c];
+        }
+
+        // Pass 2: scatter instance indices into the flattened list at each cell's write cursor.
+        // Reuse cellCount as the per-cell write cursor, seeded from cellStart (cellCount's counts
+        // were already folded into cellRangesPacked above, so it's free scratch now).
+        // Size the list to EXACTLY totalPairs (clamped to int — guards the cast-overflow that left a
+        // tiny array and crashed pass 2 when one frame's pairs were huge).
+        int listLen = (int)Math.Min(totalPairs, int.MaxValue);
+        if (gridList.Length < Math.Max(listLen, 1))
+            gridList = new uint[Math.Max(listLen, 16)];
+        Array.Copy(cellStart, cellCount, GridCellCount);
+        for (int i = 0; i < n; i++) {
+            CellRange(instanceScratch[i], out int x0, out int y0, out int z0, out int x1, out int y1, out int z1);
+            for (int z = z0; z <= z1; z++)
+                for (int y = y0; y <= y1; y++)
+                    for (int x = x0; x <= x1; x++) {
+                        int c = CellIndex(x, y, z);
+                        int w = cellCount[c]++;
+                        if ((uint)w < (uint)gridList.Length)   // defensive: never write OOB
+                            gridList[w] = (uint)i;
+                    }
+        }
+
+        // Upload: cell ranges (binding 10, fixed GridCellCount*2 ints) + the flattened index list
+        // (binding 11). Both blit straight into std430 (int/uint are 4B, tightly packed).
+        UploadStructs(gridCellBuffer, cellRangesPacked, GridCellCount * 2, sizeof(int), ref gridCellCapacity);
+        UploadStructs(gridListBuffer, gridList, (int)totalPairs, sizeof(uint), ref gridListCapacity);
+    }
+
+    int gridCellCapacity;
+
+    void CellRange(in SdfInstance inst, out int x0, out int y0, out int z0, out int x1, out int y1, out int z1) {
+        Vector3 lo = (inst.WorldAabbMin.Xyz - GridMin) * GridInvCell;
+        Vector3 hi = (inst.WorldAabbMax.Xyz - GridMin) * GridInvCell;
+        x0 = Math.Clamp((int)MathF.Floor(lo.X), 0, GridRes - 1);
+        y0 = Math.Clamp((int)MathF.Floor(lo.Y), 0, GridRes - 1);
+        z0 = Math.Clamp((int)MathF.Floor(lo.Z), 0, GridRes - 1);
+        x1 = Math.Clamp((int)MathF.Floor(hi.X), 0, GridRes - 1);
+        y1 = Math.Clamp((int)MathF.Floor(hi.Y), 0, GridRes - 1);
+        z1 = Math.Clamp((int)MathF.Floor(hi.Z), 0, GridRes - 1);
+    }
+
+    static int CellIndex(int x, int y, int z) => x + GridRes * (y + GridRes * z);
 
     // World-space AABB of a local box under a transform: the 8 transformed corners' extents. (A
     // rotation-aware AABB — looser than oriented bounds but correct and cheap, computed once/frame.)
@@ -180,19 +290,26 @@ public sealed class GLSdfScene : IDisposable {
         GL.BindBuffer(BufferTarget.ShaderStorageBuffer, 0);
     }
 
-    // Binds both SSBOs at their fixed bindings (8 = instances, 9 = slot table) for the march compute.
+    // Binds all four SSBOs at their fixed bindings (8 instances, 9 slot table, 10 grid cells,
+    // 11 grid index list) for the march compute.
     public void Bind() {
         if (!initialized)
             return;
         GL.BindBufferBase(BufferRangeTarget.ShaderStorageBuffer, InstanceBinding, instanceBuffer);
         GL.BindBufferBase(BufferRangeTarget.ShaderStorageBuffer, SlotTableBinding, slotBuffer);
+        GL.BindBufferBase(BufferRangeTarget.ShaderStorageBuffer, GridCellBinding, gridCellBuffer);
+        GL.BindBufferBase(BufferRangeTarget.ShaderStorageBuffer, GridListBinding, gridListBuffer);
     }
 
     public void Dispose() {
         if (instanceBuffer != 0) GL.DeleteBuffer(instanceBuffer);
         if (slotBuffer != 0) GL.DeleteBuffer(slotBuffer);
+        if (gridCellBuffer != 0) GL.DeleteBuffer(gridCellBuffer);
+        if (gridListBuffer != 0) GL.DeleteBuffer(gridListBuffer);
         instanceBuffer = 0;
         slotBuffer = 0;
+        gridCellBuffer = 0;
+        gridListBuffer = 0;
         initialized = false;
         InstanceCount = 0;
         SlotCount = 0;

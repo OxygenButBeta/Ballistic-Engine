@@ -96,6 +96,7 @@ public sealed class GLSdfGiPass : IDisposable {
     // Cached uniform locations (looked up once after the link).
     int locInvProjection, locInvView, locInstanceCount, locHalfSize, locSkyExposure, locFrameIndex, locDiagMode;
     int locCascadeBias, locCascadeCount, locSunDir, locSunColor, locHitAlbedo;
+    int locGridMin, locGridInvCell, locGridRes;
     readonly int[] locCascadeMatrices = new int[4];
 
     // Half-res RGBA16F gather output (pass-owned — small, consumed same frame; not pooled because
@@ -187,6 +188,9 @@ public sealed class GLSdfGiPass : IDisposable {
         locSunDir = GL.GetUniformLocation(program, "SunDirectionWorld");
         locSunColor = GL.GetUniformLocation(program, "SunColor");
         locHitAlbedo = GL.GetUniformLocation(program, "HitAlbedo");
+        locGridMin = GL.GetUniformLocation(program, "GridMin");
+        locGridInvCell = GL.GetUniformLocation(program, "GridInvCell");
+        locGridRes = GL.GetUniformLocation(program, "GridRes");
         for (var i = 0; i < 4; i++)
             locCascadeMatrices[i] = GL.GetUniformLocation(program, CascadeMatrixNames[i]);
     }
@@ -359,6 +363,11 @@ public sealed class GLSdfGiPass : IDisposable {
         GL.Uniform3(locSunDir, sunDirection);
         GL.Uniform3(locSunColor, sunColor);
         GL.Uniform1(locHitAlbedo, HitAlbedo);
+        // Instance grid mapping (the march loops only the current cell's instances).
+        Vector3 gMin = scene.GridMin, gInv = scene.GridInvCell;
+        GL.Uniform3(locGridMin, gMin.X, gMin.Y, gMin.Z);
+        GL.Uniform3(locGridInvCell, gInv.X, gInv.Y, gInv.Z);
+        GL.Uniform1(locGridRes, scene.GridResolution);
         frameIndex++;
 
         int gx = (halfW + 7) / 8;

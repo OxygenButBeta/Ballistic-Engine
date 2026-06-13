@@ -82,6 +82,11 @@ struct SsdfSlot {
 layout(std430, binding = 8) readonly buffer InstanceBuf { SsdfInstance instances[]; };
 layout(std430, binding = 9) readonly buffer SlotBuf     { SsdfSlot     slots[]; };
 
+// Uniform spatial grid over the instances (the perf fix): cell (start,count) into the flattened
+// index list, so the march loops ONLY the instances overlapping the current cell, not all N.
+layout(std430, binding = 10) readonly buffer GridCellBuf { ivec2 gridCells[]; }; // (start,count)/cell
+layout(std430, binding = 11) readonly buffer GridListBuf { uint  gridList[]; };   // instance indices
+
 // ---------------------------------------------------------------------------------------
 // Uniforms (plain uniforms — set per-dispatch by the C# pass, NOT a UBO).
 // ---------------------------------------------------------------------------------------
@@ -91,6 +96,11 @@ uniform uint InstanceCount;  // number of valid SsdfInstance records
 uniform ivec2 HalfSize;      // output (half-res) dimensions in pixels
 uniform float SkyExposure;   // irradiance luminance scale x camera pre-exposure
 uniform int  FrameIndex;     // rotates the ray hash each frame (temporal resolves the noise)
+
+// Instance grid mapping: a world point -> cell. GridRes^3 cells over the instances' world bounds.
+uniform vec3 GridMin;
+uniform vec3 GridInvCell;    // 1 / cellSize per axis
+uniform int  GridRes;
 
 // Direct-sun lighting at the hit (the bright-bounce source). Same data the volumetric march uses.
 const int MAX_CASCADES = 4;
@@ -216,11 +226,23 @@ float SceneSdf(vec3 worldP, out uint nearestSlot, out vec3 nearestLocal, out boo
     nearestSlot = 0u;
     nearestLocal = vec3(0.0);
     anyInside = false;
-    for (uint i = 0u; i < InstanceCount; ++i) {
+
+    // Map the world point to its grid cell. Outside the grid bounds => no instances here (the march
+    // is in empty space the grid doesn't cover). The CPU bins each instance into EVERY cell its AABB
+    // overlaps, so the single containing cell lists every candidate at this point.
+    ivec3 cell = ivec3(floor((worldP - GridMin) * GridInvCell));
+    if (any(lessThan(cell, ivec3(0))) || any(greaterThanEqual(cell, ivec3(GridRes))))
+        return d; // anyInside stays false -> the march treats this as empty (EMPTY_STEP advance)
+
+    int cellIdx = cell.x + GridRes * (cell.y + GridRes * cell.z);
+    ivec2 range = gridCells[cellIdx];   // (start, count) into gridList
+    int start = range.x, count = range.y;
+
+    for (int k = 0; k < count; ++k) {
+        uint i = gridList[start + k];
         SsdfInstance inst = instances[i];
-        // Cheap world-AABB pre-reject BEFORE the matrix transform + 8 texelFetches: skip any
-        // instance the march point isn't inside (a small margin covers the padded brick shell).
-        // This is the perf win for hundreds of per-submesh instances — most are far from any point.
+        // Cheap world-AABB pre-reject before the matrix transform + 8 texelFetches: the cell may
+        // list an instance whose AABB only clips a corner of the cell, not this exact point.
         if (any(lessThan(worldP, inst.worldAabbMin.xyz)) ||
             any(greaterThan(worldP, inst.worldAabbMax.xyz)))
             continue;
