@@ -45,6 +45,44 @@ uniform float SunGlowSharpness;        // how tight the sun-disk glow is (higher
 uniform int   FrameIndex;              // animates the dither so TAA can resolve it
 uniform float MaxDistance;             // far clamp for the SHADOWED march (analytic fog continues)
 
+// --- Light shafts / god-rays (additive, layered on top of the physical fog) ---
+// SunShafts > 0 adds an EXTRA visibility-gated in-scatter toward the sun: the physical fog
+// already in-scatters the shadowed sun, but its skylight term keeps the off-sun air bright,
+// which softens the banding the eye reads as shafts. This term re-injects that contrast
+// (lit air glows, shadowed air stays dark) WITHOUT changing extinction or the fog colour.
+uniform float SunShafts;               // 0 = pure physical fog; >0 = visible sun god-rays
+uniform float PunctualShafts;          // 0 = off; >0 = in-scatter from the point/spot lights below
+uniform bool  PunctualUseShadows;      // carve punctual shafts with the punctual shadow map
+
+// Punctual lights (same gather + pre-exposed radiance the lit shader uses). Mirrors the
+// PassData arrays so a fog beam matches the surface lighting of the same light.
+const int MAX_POINT_LIGHTS = 8;
+const int MAX_SPOT_LIGHTS = 4;
+const int MAX_SHADOWED_SPOTS = 4;
+const int MAX_SHADOWED_POINTS = 2;
+uniform sampler2DArrayShadow PunctualShadows; // 512 array: spots layers 0..3, point faces after
+
+// Uniform names match the lit shader's PassData members EXACTLY, so the renderer uploads
+// them with the same indexed-name arrays it already maintains (no parallel boilerplate).
+uniform int   PointLightCount;
+uniform vec3  PointLightPosition[MAX_POINT_LIGHTS];
+uniform vec3  PointLightColor[MAX_POINT_LIGHTS];
+uniform float PointLightRange[MAX_POINT_LIGHTS];
+uniform int   PointShadowSlot[MAX_POINT_LIGHTS];
+uniform float PointShadowBias[MAX_SHADOWED_POINTS];
+uniform mat4  PointShadowMatrix[MAX_SHADOWED_POINTS * 6];
+
+uniform int   SpotLightCount;
+uniform vec3  SpotLightPosition[MAX_SPOT_LIGHTS];
+uniform vec3  SpotLightDirection[MAX_SPOT_LIGHTS];
+uniform vec3  SpotLightColor[MAX_SPOT_LIGHTS];
+uniform float SpotLightRange[MAX_SPOT_LIGHTS];
+uniform float SpotLightCosInner[MAX_SPOT_LIGHTS];
+uniform float SpotLightCosOuter[MAX_SPOT_LIGHTS];
+uniform int   SpotShadowSlot[MAX_SPOT_LIGHTS];
+uniform float SpotShadowBias[MAX_SHADOWED_SPOTS];
+uniform mat4  SpotShadowMatrix[MAX_SHADOWED_SPOTS];
+
 const float PI = 3.14159265359;
 const float ALBEDO = 0.92;             // single-scatter albedo of the aerosol
 const float SKY_TAIL = 20000.0;        // how far the analytic fog integrates on sky pixels
@@ -109,6 +147,91 @@ float InterleavedGradientNoise(vec2 pix) {
     return fract(52.9829189 * fract(dot(pix, vec2(0.06711056, 0.00583715))));
 }
 
+// --- Punctual light scattering ---------------------------------------------------------
+// Smooth inverse-square with a range window, identical to the lit shader's DistanceAttenuation.
+float DistanceAttenuation(float dist, float range) {
+    float window = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
+    return window * window / max(dist * dist, 1e-4);
+}
+
+// Single hardware-PCF compare into the punctual array (no kernel — fog beams are soft, and
+// the temporal pass smooths the rest, so one tap keeps the per-step cost down).
+float PunctualSample(int layer, vec3 proj, float bias) {
+    return texture(PunctualShadows, vec4(proj.xy, float(layer), proj.z - bias));
+}
+
+float SpotShaftVisibility(int i, vec3 worldPos) {
+    int slot = SpotShadowSlot[i];
+    if (!PunctualUseShadows || slot < 0)
+        return 1.0;
+    vec4 clip = SpotShadowMatrix[slot] * vec4(worldPos, 1.0);
+    if (clip.w <= 0.0)
+        return 1.0;
+    vec3 proj = clip.xyz / clip.w * 0.5 + 0.5;
+    if (proj.z >= 1.0 || any(lessThan(proj.xy, vec2(0.0))) || any(greaterThan(proj.xy, vec2(1.0))))
+        return 1.0;
+    return PunctualSample(slot, proj, SpotShadowBias[slot]);
+}
+
+int CubeFace(vec3 d) {
+    vec3 a = abs(d);
+    if (a.x >= a.y && a.x >= a.z) return d.x > 0.0 ? 0 : 1;
+    if (a.y >= a.z)               return d.y > 0.0 ? 2 : 3;
+    return d.z > 0.0 ? 4 : 5;
+}
+
+float PointShaftVisibility(int i, vec3 worldPos) {
+    int slot = PointShadowSlot[i];
+    if (!PunctualUseShadows || slot < 0)
+        return 1.0;
+    int face = CubeFace(worldPos - PointLightPosition[i]);
+    vec4 clip = PointShadowMatrix[slot * 6 + face] * vec4(worldPos, 1.0);
+    if (clip.w <= 0.0)
+        return 1.0;
+    vec3 proj = clip.xyz / clip.w * 0.5 + 0.5;
+    if (proj.z >= 1.0)
+        return 1.0;
+    proj.xy = clamp(proj.xy, vec2(0.002), vec2(0.998));
+    return PunctualSample(MAX_SHADOWED_SPOTS + slot * 6 + face, proj, PointShadowBias[slot]);
+}
+
+// In-scattered radiance from every punctual light at one march sample, pre-phase-weighted
+// for the view ray. Each light is its OWN forward lobe (HG along light->sample direction),
+// distance-attenuated, cone-masked for spots, and shadow-carved when enabled — so a torch
+// glows as a halo and a spotlight paints a visible cone of light in the fog.
+vec3 PunctualInScatter(vec3 samplePos, vec3 viewDir, float g) {
+    vec3 sum = vec3(0.0);
+
+    for (int i = 0; i < PointLightCount && i < MAX_POINT_LIGHTS; i++) {
+        vec3 toLight = PointLightPosition[i] - samplePos;
+        float dist = length(toLight);
+        if (dist >= PointLightRange[i])
+            continue;
+        vec3 L = toLight / max(dist, 1e-4);
+        float phase = HG(dot(viewDir, L), g);   // forward-scatter toward each light
+        float vis = PointShaftVisibility(i, samplePos);
+        sum += PointLightColor[i] * (DistanceAttenuation(dist, PointLightRange[i]) * phase * vis);
+    }
+
+    for (int i = 0; i < SpotLightCount && i < MAX_SPOT_LIGHTS; i++) {
+        vec3 toLight = SpotLightPosition[i] - samplePos;
+        float dist = length(toLight);
+        if (dist >= SpotLightRange[i])
+            continue;
+        vec3 L = toLight / max(dist, 1e-4);
+        float cosAngle = dot(-L, normalize(SpotLightDirection[i]));
+        float cone = clamp((cosAngle - SpotLightCosOuter[i]) /
+                           max(SpotLightCosInner[i] - SpotLightCosOuter[i], 1e-4), 0.0, 1.0);
+        if (cone <= 0.0)
+            continue;
+        float phase = HG(dot(viewDir, L), g);
+        float vis = SpotShaftVisibility(i, samplePos);
+        sum += SpotLightColor[i] * (DistanceAttenuation(dist, SpotLightRange[i]) * (cone * cone) * phase * vis);
+    }
+
+    return sum;
+}
+
 void main() {
     float depth = texture(depthTexture, TexCoords).r;
 
@@ -149,6 +272,13 @@ void main() {
     // Isotropic ambient: integrating any phase over an isotropic radiance field gives the
     // field itself, so the skylight term is just SkyAmbient (no 1/4pi).
     vec3 ambSource = SkyAmbient * AmbientScatter;
+    // God-ray BOOST: directional sun in-scatter (sun radiance x forward phase), scaled by
+    // SunShafts. ADDED only where the sun is visible (x vis in the loop), so it deepens the
+    // lit/shadow contrast into readable shafts. It uses phaseSun DIRECTLY, not the fog's
+    // physical Scattering multiplier — so it works in shafts-only mode (Scattering == 0) AND,
+    // when SunShafts == 0, it's the zero vector so the physical fog march is byte-identical.
+    vec3 sunShaftSource = SunColor * (phaseSun * SunShafts);
+    bool doPunctual = PunctualShafts > 0.0 && (PointLightCount + SpotLightCount) > 0;
 
     vec3 scatter = vec3(0.0);
     float transmittance = 1.0;
@@ -160,7 +290,12 @@ void main() {
         if (sigma > 1e-6) {
             float stepT = exp(-sigma * stepLen);
             float vis = SampleSunVisibility(samplePos);
-            vec3 source = ALBEDO * (sunSource * vis + ambSource);
+            // Physical fog source (sun in-scatter gated by shadow + isotropic skylight) PLUS
+            // the additive, visibility-gated sun god-ray boost (zero when SunShafts == 0).
+            vec3 source = ALBEDO * (sunSource * vis + ambSource + sunShaftSource * vis);
+            // Punctual god-rays: in-scatter every point/spot light at this sample.
+            if (doPunctual)
+                source += ALBEDO * (PunctualInScatter(samplePos, rayDir, g) * PunctualShafts);
             scatter += source * (transmittance * (1.0 - stepT));
             transmittance *= stepT;
             if (transmittance < 0.002)
@@ -174,7 +309,10 @@ void main() {
     if (transmittance > 0.002 && surfaceDist > marchDist) {
         float tau = OpticalDepth(rayStart, rayDir, marchDist, surfaceDist);
         float tailT = exp(-tau);
-        vec3 source = ALBEDO * (sunSource + ambSource);
+        // Sun lit (no shadow data); the god-ray boost rides along so distant haze toward the
+        // sun keeps glowing instead of dimming at the march boundary. Punctual lights are
+        // local — they don't reach the analytic tail, so they're omitted here.
+        vec3 source = ALBEDO * (sunSource + ambSource + sunShaftSource);
         scatter += source * (transmittance * (1.0 - tailT));
         transmittance *= tailT;
     }

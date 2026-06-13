@@ -17,6 +17,7 @@ uniform sampler2D scatterDepth;    // NOTE: same depth, sampled at the half-res 
 uniform mat4  InvProjection;
 uniform float Intensity;           // master strength: scales scatter, eases extinction below 1
 uniform vec3  Tint;                // color grade for the in-scatter (not the extinction)
+uniform bool  Extinguish;          // true = real fog (scene * transmittance); false = additive shafts only
 
 // Linearize hardware depth to view-space distance for the bilateral weight.
 float LinearDepth(float depth) {
@@ -52,7 +53,11 @@ void main() {
     // Intensity < 1 backs the extinction off toward "no fog" in step with the scatter, so
     // the master dial fades the WHOLE effect; above 1 it only boosts the glow (extinguishing
     // more than the physical transmittance would punch black halos into the scene).
-    float transmittance = mix(1.0, clamp(fog.a, 0.0, 1.0), clamp(Intensity, 0.0, 1.0));
+    // Shafts-only mode (Extinguish == false) keeps the scene fully visible and just ADDS the
+    // beams — they're a glow, not a medium that hides geometry.
+    float transmittance = Extinguish
+        ? mix(1.0, clamp(fog.a, 0.0, 1.0), clamp(Intensity, 0.0, 1.0))
+        : 1.0;
 
     // Energy-conserving fog composite. The march already bounded the scatter (it can never
     // exceed the source radiance), so no rolloff tricks; ACES downstream handles highlights.

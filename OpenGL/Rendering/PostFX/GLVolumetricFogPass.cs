@@ -47,11 +47,16 @@ public sealed class GLVolumetricFogPass {
 
     // Returns the scene color with volumetric shafts composited in, or the input color
     // texture unchanged when prerequisites (depth / shadow map) are missing.
+    //
+    // uploadPunctual (optional): when the punctual-shaft dial is on, the renderer uses this to
+    // push the SAME point/spot light arrays + punctual shadow map it feeds the lit shader onto
+    // the march program — so a fog beam matches the surface lighting of the same light. It owns
+    // the indexed-name arrays and the shadow texture bind; the pass stays light-agnostic.
     public int Render(int targetIndex, int colorTexture, int depthTexture, int shadowMapTexture,
         int width, int height, ref Matrix4 view, ref Matrix4 projection,
         Matrix4[] cascadeMatrices, Vector4 cascadeBias, int cascadeCount,
         Vector3 cameraPos, Vector3 sunDirection, Vector3 sunColor, Vector3 skyAmbient,
-        float shadowDistance, PostProcessSettings fx) {
+        float shadowDistance, PostProcessSettings fx, Action<StandardShader> uploadPunctual = null) {
         if (depthTexture <= 0 || shadowMapTexture <= 0)
             return colorTexture;
 
@@ -97,14 +102,45 @@ public sealed class GLVolumetricFogPass {
         marchShader.SetFloat3("CameraPosWorld", cameraPos);
         marchShader.SetInt("StepCount", Math.Clamp(fx.VolumetricStepCount, 8, 256));
         marchShader.SetFloat("Anisotropy", Math.Clamp(fx.VolumetricAnisotropy, 0f, 0.95f));
-        marchShader.SetFloat("Density", Math.Max(fx.VolumetricDensity, 0f));
-        marchShader.SetFloat("HeightFalloff", Math.Max(fx.VolumetricHeightFalloff, 0f));
-        marchShader.SetFloat("BaseHeight", fx.VolumetricBaseHeight);
-        marchShader.SetFloat("Scattering", Math.Max(fx.VolumetricScattering, 0f));
-        marchShader.SetFloat("AmbientScatter", Math.Max(fx.VolumetricAmbientScatter, 0f));
         marchShader.SetFloat("SunGlow", Math.Max(fx.VolumetricSunGlow, 0f));
         marchShader.SetFloat("SunGlowSharpness", Math.Max(fx.VolumetricSunGlowSharpness, 1f));
         marchShader.SetInt("FrameIndex", frameIndex++ & 1023);
+
+        // --- Medium: the physical fog when it's on, else the shafts' own thin medium ---
+        // When VolumetricFog is enabled the march uses its physical medium unchanged (the fog
+        // look is the accurate solution). When ONLY LightShafts is on, we still need a medium
+        // to scatter the beams in, but we DON'T want the fog's hazy veil — so the medium uses
+        // the shaft density with the physical sun/sky in-scatter ZEROED: only the additive
+        // god-ray terms below light up, giving clean beams over a clear scene.
+        bool fogOn = fx.VolumetricEnabled;
+        if (fogOn) {
+            marchShader.SetFloat("Density", Math.Max(fx.VolumetricDensity, 0f));
+            marchShader.SetFloat("HeightFalloff", Math.Max(fx.VolumetricHeightFalloff, 0f));
+            marchShader.SetFloat("BaseHeight", fx.VolumetricBaseHeight);
+            marchShader.SetFloat("Scattering", Math.Max(fx.VolumetricScattering, 0f));
+            marchShader.SetFloat("AmbientScatter", Math.Max(fx.VolumetricAmbientScatter, 0f));
+        } else {
+            marchShader.SetFloat("Density", Math.Max(fx.LightShaftsDensity, 0f));
+            marchShader.SetFloat("HeightFalloff", 0f);   // uniform medium: beams reach up, not just ground haze
+            marchShader.SetFloat("BaseHeight", 0f);
+            marchShader.SetFloat("Scattering", 0f);      // no physical fog veil — shafts only
+            marchShader.SetFloat("AmbientScatter", 0f);
+        }
+
+        // --- Light shafts / god-rays (additive; driven by the standalone LightShafts comp) ---
+        bool shaftsOn = fx.LightShaftsEnabled;
+        marchShader.SetFloat("SunShafts", shaftsOn ? Math.Max(fx.LightShaftsSun, 0f) : 0f);
+        float punctualShafts = shaftsOn ? Math.Max(fx.LightShaftsPunctual, 0f) : 0f;
+        marchShader.SetFloat("PunctualShafts", punctualShafts);
+        marchShader.SetBool("PunctualUseShadows", fx.LightShaftsPunctualShadows);
+        // Only upload + loop the punctual lights when the dial is on; otherwise zero the
+        // counts so the shader skips the whole punctual path (the physical fog is untouched).
+        if (punctualShafts > 0f && uploadPunctual is not null)
+            uploadPunctual(marchShader);
+        else {
+            marchShader.SetInt("PointLightCount", 0);
+            marchShader.SetInt("SpotLightCount", 0);
+        }
         // March only the air the shadow map actually covers, so every sample has real shadow
         // data and the shaft contrast survives. Air past this reads "lit" (no data) and would
         // wash the effect flat.
@@ -133,8 +169,13 @@ public sealed class GLVolumetricFogPass {
         BindTex(2, depthTexture, combineShader, "depthTexture");
         BindTex(3, depthTexture, combineShader, "scatterDepth");
         combineShader.SetMatrix4("InvProjection", ref invProjection);
-        combineShader.SetFloat("Intensity", Math.Max(fx.VolumetricIntensity, 0f));
-        combineShader.SetFloat3("Tint", fx.VolumetricTint);
+        // Fog on: its master Intensity + tint, and it extinguishes the scene (real fog hides
+        // things). Shafts-only: the LightShafts master Intensity, neutral tint, and NO
+        // extinction — beams are additive glow over a clear scene, not a fog veil.
+        combineShader.SetFloat("Intensity",
+            fogOn ? Math.Max(fx.VolumetricIntensity, 0f) : Math.Max(fx.LightShaftsIntensity, 0f));
+        combineShader.SetFloat3("Tint", fogOn ? fx.VolumetricTint : OpenTK.Mathematics.Vector3.One);
+        combineShader.SetBool("Extinguish", fogOn);
         GLBufferUtilities.DrawFullscreenQuad();
 
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
