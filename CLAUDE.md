@@ -2,7 +2,7 @@
 
 Custom C#/.NET 9 game engine — **NOT a Unity project** despite the folder location. Stack:
 OpenTK 4.9.4 (OpenGL **4.6 core** — bumped from 4.1 in the 2026-06 renderer overhaul; unlocks
-compute/SSBOs/MultiDrawIndirect/persistent mapping/DSA for future GPU-driven work. macOS was
+compute/SSBOs/MultiDrawIndirect/persistent mapping/DSA — now USED by the GPU-driven path. macOS was
 the old 4.1 ceiling and is out of scope for GL — a Mac path means another backend), AssimpNet +
 StbImageSharp + Magick.NET (import-time only), YamlDotNet (scenes), ImGui.NET (editor). Idioms
 deliberately mirror Unity (Entity/Behaviour, AssetDatabase, meta files, edit/play split).
@@ -258,6 +258,33 @@ loop returns or the process never exits.
 
 ## Renderer pipeline (2026-06 overhaul — invariants that must not regress)
 
+- **GPU-driven path (MDI + compute cull + bindless, 2026-06, `OpenGL/Rendering/GpuDriven/`)**: the
+  WHOLE-MESH renderer (Bistro, ~1600 submeshes, `SubMeshIndex < 0`, non-skinned, single shader) is
+  drawn via `glMultiDrawElementsIndirectCount` after a GPU compute frustum cull, collapsing ~1600
+  `DrawElements` into a handful of MDI calls (CPU submit was THE bottleneck: 30ms CPU vs 12ms GPU,
+  6070 draws). Per-submesh/instanced/skinned/mixed-shader renderers keep the CPU path.
+  - `GpuDrivenRenderer` owns the buffers; `GpuCull_Comp.glsl` does the cull (positive-vertex AABB
+    test, world AABBs **pre-transformed on the CPU with the same 8-corner loop** as
+    `ComputeSubmeshVisibility` so it's bit-identical to `AabbInFrustum`). `GLPersistentBuffer` =
+    GL4.6 persistent-mapped triple-buffered fence-synced streaming. `GpuMaterialTable` = bindless
+    handles (`GL_ARB_bindless_texture`) so different materials batch into ONE draw; missing maps
+    use `DefaultTextures.Neutral` + the global metallic/roughness/normal multipliers, exactly
+    like CPU `SetMaterialUniforms`.
+  - `GpuDrivenShaderTransform` INJECTS the per-draw model (`PerDrawData[gl_DrawIDARB]`) + bindless
+    material reads into each material's OWN vert+frag GLSL by `#define` — shading is bit-identical
+    to the uniform path, so z-prepass invariance holds (prepass + opaque share the deterministic
+    cull). Bumps `#version` to 460. Prepass frag MUST reuse `SharedDecls` (cross-stage block names
+    must match). The transform must NOT touch shading math.
+  - **Two batches**: SOLID (backface cull on) + CUTOUT (cull off — single-sided foliage), separate
+    cmd/count/perdraw buffers to avoid the write-after-read hazard. The cull binds the COMPUTE
+    program, so re-activate the render program AFTER culls, before the MDI draws.
+  - `BALLISTIC_GPUDRIVEN=0` → CPU path (byte-identical fallback). Auto-disables without bindless/
+    draw-params. Verified byte-identical (meanError 0) deterministic full-FX, draws 420→3.
+  - GPU-driven shadows: opt-IN `BALLISTIC_GPUDRIVEN_SHADOWS=1` (one MDI per cascade, light-space
+    cull). ~0.26% shadow-edge pixel diff (sub-perceptual) — default off keeps the image identical.
+  - Gotcha: route any NEW compute-shader compile through `GLSLShaderUtilities.ToAscii` (an em-dash
+    in a comment truncates the source → "unexpected end of file"). Whole-mesh model = plain
+    `WorldMatrix` for ALL submeshes (NOT inverse-node — that's per-submesh-renderer only).
 - **Frame shape (single path, no MSAA)**: cull → cascaded shadows (cached) → z-prepass →
   SSAO → opaque (LEqual, no depth writes) → sky → transparent → SSGI → SSR → volumetric →
   TAA → exposure meter → bloom → composite. TAA **is** the AA; the MSAA path was deleted
