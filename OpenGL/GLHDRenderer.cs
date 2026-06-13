@@ -1711,10 +1711,35 @@ void main() {
     // Builds the per-submesh metadata + material table for the whole-mesh renderer and uploads it
     // to the GPU-driven buffers. Idempotent: heavy work is gated inside GpuDrivenRenderer by a
     // move/material-change check. `wantTransparent` selects which submeshes the flags mark.
+    IStaticMeshRenderer gdLastTarget;
+    Mesh gdLastMesh;
+    int gdLastMaterialHash;
+
     void BuildGpuDrivenMetadata(IStaticMeshRenderer target) {
         Mesh mesh = target.SharedMesh;
         SubMeshData[] subs = mesh.SubMeshes;
         int n = subs.Length;
+
+        // The metadata is gated on movement inside GpuDrivenRenderer (worldMatrix), but the target
+        // renderer, its mesh, or its material set can change WITHOUT the world matrix moving: scene
+        // reload, a different whole-mesh renderer, or a script/Ctrl+R material hot-reload (new
+        // Material instances -> new bindless handles). Detect those and force a rebuild, or the cull
+        // draws with stale materialIds / freed texture handles. The material hash folds in each
+        // submesh's resolved material reference + cutout/transparent flags.
+        var matHash = new HashCode();
+        for (var i = 0; i < n; i++) {
+            Material m = target.MaterialFor(i);
+            matHash.Add(m is null ? 0 : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(m));
+        }
+        int materialHash = matHash.ToHashCode();
+        if (!ReferenceEquals(target, gdLastTarget) || !ReferenceEquals(mesh, gdLastMesh) ||
+            materialHash != gdLastMaterialHash) {
+            gpuDriven.Invalidate();
+            gdLastTarget = target;
+            gdLastMesh = mesh;
+            gdLastMaterialHash = materialHash;
+        }
+
         if (gdModels.Length < n) {
             gdModels = new Matrix4[n];
             gdLocalMin = new Vector3[n];
