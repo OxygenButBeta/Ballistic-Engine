@@ -47,7 +47,7 @@ public sealed class AssetImportPipeline {
             ? [.. customImporters]
             : [
                 new ModelImporter(), new TextureImporter(), new AudioImporter(), new AnimationImporter(),
-                new FalcorSceneImporter(), new BlendImporter(), new TerrainImporter(),
+                new FalcorSceneImporter(), new BlendImporter(), new PbrtSceneImporter(), new TerrainImporter(),
                 new NativeAssetImporter(), new DefaultImporter()
             ];
     }
@@ -422,8 +422,27 @@ public sealed class AssetImportPipeline {
 
     IAssetImporter ResolveImporter(MetaFile meta, string sourceAbsolute) {
         IAssetImporter importer = importers.FirstOrDefault(candidate => candidate.Name == meta.Importer);
-        if (importer is not null)
+        if (importer is not null) {
+            // Self-heal a stale fallback: a file imported by the catch-all DefaultImporter before a
+            // real importer learned its extension (e.g. .ply added to ModelImporter) stays pinned to
+            // DefaultImporter by its .meta — it would never build a .bmesh and renderers load null.
+            // If a non-default importer now claims this extension, migrate to it: rewrite the .meta's
+            // importer name + reset settings to the new importer's defaults (the old "{}" lacks the
+            // model importer's flipUVs/splitByNodes/scaleFactor keys), and persist. The dirty check
+            // then reimports because the recorded importer no longer matches.
+            if (importer is DefaultImporter) {
+                IAssetImporter byExt = SelectImporterByExtension(sourceAbsolute);
+                if (byExt is not DefaultImporter) {
+                    var assetPath = project.ToAssetPath(sourceAbsolute);
+                    meta.Importer = byExt.Name;
+                    meta.Settings = byExt.CreateDefaultSettings(assetPath);
+                    meta.Save(MetaFile.PathFor(sourceAbsolute));
+                    Debugging.Log($"Migrated '{assetPath}' from DefaultImporter to {byExt.Name}.");
+                    return byExt;
+                }
+            }
             return importer;
+        }
 
         importer = SelectImporterByExtension(sourceAbsolute);
         Debugging.LogWarning(

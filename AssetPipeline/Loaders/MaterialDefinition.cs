@@ -33,4 +33,9 @@ public sealed class MaterialDefinition {
     // surface renders double-sided (foliage cards, fences). null = auto-detect from the
     // diffuse texture's file name.
     public bool? Cutout { get; set; }
+
+    // Render both faces (disable backface culling) WITHOUT alpha-testing — for geometry whose
+    // triangle winding can't be trusted (e.g. pbrt scenes, which are left-handed: their winding is
+    // opposite the engine's, so single-sided culling hides every inward face). null = default (cull).
+    public bool? DoubleSided { get; set; }
 }

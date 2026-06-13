@@ -38,6 +38,10 @@ public class Material : BObject
     // double-sided (foliage cards, fences, grates).
     public bool Cutout { get; set; }
 
+    // Render both faces (no backface culling) without alpha-testing — for geometry with untrusted
+    // winding, e.g. pbrt imports (left-handed: their winding is opposite the engine's).
+    public bool DoubleSided { get; set; }
+
     Material(Shader shader, Texture2D diffuse, Texture2D normal, Texture2D metallic, Texture2D roughness,
         Texture2D ao, Texture2D emissive)
     {
@@ -75,6 +79,7 @@ public class Material : BObject
             Opacity = Opacity,
             PackedOrm = PackedOrm,
             Cutout = Cutout,
+            DoubleSided = DoubleSided,
         };
         return copy;
     }

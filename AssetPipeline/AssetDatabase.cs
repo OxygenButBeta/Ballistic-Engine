@@ -218,7 +218,7 @@ public static class AssetDatabase {
             return EquirectCubemapLoader.Load(pipeline, guid, assetPath);
 
         return extension switch {
-            ".fbx" or ".obj" or ".gltf" or ".glb" or ".dae" => MeshLoader.Load(pipeline, guid, assetPath),
+            ".fbx" or ".obj" or ".gltf" or ".glb" or ".dae" or ".ply" => MeshLoader.Load(pipeline, guid, assetPath),
             ".wav" or ".wave" or ".ogg" => AudioClipLoader.Load(pipeline, guid, assetPath),
             ".banim" => AnimationClipLoader.Load(Project, assetPath),
             _ when isImage => TextureLoader.Load(pipeline, guid, assetPath),

@@ -71,6 +71,11 @@ public sealed class EngineBootstrap {
         BlendImporter.Converter = (blend, fbx, json, output) =>
             BlendSceneConverter.Convert(blend, fbx, json, output, ResolveModelToAssetRef);
 
+        // pbrt .pbrt (v3/v4) -> Ballistic .scene + sibling .mat files (injected; same pattern). The
+        // resolver maps referenced .ply geometry and textures (inside the project) to "Assets/..." refs.
+        PbrtSceneImporter.Converter = (pbrt, output) =>
+            PbrtSceneConverter.Convert(pbrt, output, ResolveModelToAssetRef);
+
         // A shipped player ships pre-baked content and must NOT re-import from source (sources aren't
         // even present, and there is no SDK). It mounts the content pack (artifacts + scene/material
         // text), then loads the GUID lookup tables from the loose baked metadata — without which every

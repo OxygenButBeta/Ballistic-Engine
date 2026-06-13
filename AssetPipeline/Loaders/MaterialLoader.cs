@@ -39,6 +39,7 @@ public static class MaterialLoader {
             material.EmissiveColor = new OpenTK.Mathematics.Vector3(emissive[0], emissive[1], emissive[2]);
         material.PackedOrm = ResolvePackedOrm(definition);
         material.Cutout = ResolveCutout(definition);
+        material.DoubleSided = definition.DoubleSided ?? false;
 
         // Scalar PBR factors (glTF semantics). Unstated metallic defaults to 1 with a metallic
         // map (the map drives it) and 0 without one (untextured = dielectric, not chrome).

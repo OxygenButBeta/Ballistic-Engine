@@ -12,7 +12,7 @@ namespace BallisticEngine.AssetPipeline;
 // Texture .meta files referenced by those materials get their textureType set from the slot
 // the model actually binds them to (authoritative over filename-suffix inference).
 public sealed class ModelImporter : IAssetImporter {
-    static readonly string[] Extensions = [".fbx", ".obj", ".gltf", ".glb", ".dae"];
+    static readonly string[] Extensions = [".fbx", ".obj", ".gltf", ".glb", ".dae", ".ply"];
 
     public const string DefaultShaderRef = "Assets/Default/Shaders/Standard.shader";
     // Skinned meshes need the GPU-skinning vertex stage; their generated materials use this shader.
@@ -29,7 +29,9 @@ public sealed class ModelImporter : IAssetImporter {
     //     scaleFactor setting (0 = auto from file units).
     // v9: FBX Z-up axis conversion (UpAxis=2 → -90°X bake, Unity-importer parity) — scan-pack
     //     meshes no longer lie tipped 90° relative to converted Unity scene transforms.
-    public int Version => 9;
+    // v10: .ply added (Assimp reads it) — pbrt scenes reference hundreds of .ply meshes; they were
+    //      falling through to DefaultImporter (copy-as-is, no .bmesh) so renderers loaded null meshes.
+    public int Version => 10;
     public string ArtifactExtension => ".bmesh";
 
     // Generates a sibling "<Model>_Materials/" folder of .mat assets.
