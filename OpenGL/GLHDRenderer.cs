@@ -40,6 +40,11 @@ public class GLHDRenderer : HDRenderer {
     GLSSAOPass ssao;
     GLSSGIPass ssgi;
     GLSSRPass ssr;
+    // SDF World-Space GI (P6.5) — dynamic OFF-SCREEN indirect bounce via mesh-SDF tracing.
+    // Default-OFF behind BALLISTIC_SDFGI=1; the pass reports Available=false when the flag is off,
+    // so the frame stays byte-identical to the baseline. Runs as a post pass right BEFORE SSGI.
+    OpenGL.GI.GLSdfGiPass sdfGi;
+    bool sdfGiEnabled;
     GLVolumetricFogPass volumetric;
     GLTAAPass taa;
     GLDepthOfFieldPass depthOfField;
@@ -187,6 +192,10 @@ public class GLHDRenderer : HDRenderer {
         ssao = new GLSSAOPass();
         ssgi = new GLSSGIPass();
         ssr = new GLSSRPass();
+        // SDF World-Space GI: read the gate ONCE. The pass itself also honours the flag (its ctor
+        // builds nothing GPU-side when off), so off => Available stays false => never dispatched.
+        sdfGiEnabled = Environment.GetEnvironmentVariable("BALLISTIC_SDFGI") == "1";
+        sdfGi = new OpenGL.GI.GLSdfGiPass();
         volumetric = new GLVolumetricFogPass();
         taa = new GLTAAPass();
         depthOfField = new GLDepthOfFieldPass();
@@ -718,6 +727,20 @@ public class GLHDRenderer : HDRenderer {
         // and TAA resolves jitter itself, so its history reference must be jitter-free.
         Matrix4 viewProjection = view * projection;
         var litColor = target.colorBuffer;
+
+        // SDF World-Space GI (P6.5): dynamic OFF-SCREEN indirect bounce the screen-space SSGI can't
+        // see. Runs as a post pass right BEFORE SSGI — bakes the opaque set's mesh-SDFs (once each),
+        // traces a half-res off-screen gather against them, then ADDITIVELY composites the upsampled
+        // bounce onto litColor (never darkens). Default-OFF: when BALLISTIC_SDFGI != 1 the pass is
+        // Available=false and Render returns litColor unchanged, so the frame is byte-identical to
+        // the committed baseline. Reconstructs from the JITTERED depth -> renderProjection (note above).
+        if (sdfGiEnabled && sdfGi.Available)
+            using (timers.Time("SdfGI")) {
+                sdfGi.EnsureBaked(visibleOpaque);
+                litColor = sdfGi.Render(litColor, target.DepthTextureId, target.NormalTextureId,
+                    irradianceMap, target.LenX, target.LenY, ref view, ref renderProjection,
+                    skyExposureBase * preExposure);
+            }
 
         // SSGI first: it adds AO-occluded indirect bounce to the lit color, so the
         // reflections SSR gathers afterwards see the GI-lifted scene, not the crushed one.
