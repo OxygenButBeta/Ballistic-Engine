@@ -73,14 +73,43 @@ void main() {
             radiance += texture(sampler2D(m.eH), gs.uv).rgb * m.ef.rgb;
         imageStore(VoxelRadiance, vc, vec4(radiance, 1.0));
     } else {
-        // BOUNCE pass: gather the already-injected radiance arriving along N (coarse mip = the
-        // incoming hemisphere average) and ADD this surface's reflected share. RMW so the direct
-        // light written in pass 0 is preserved and each pass compounds another bounce.
-        vec3 ahead = (gs.worldPos + N * 2.0 - VolumeMin) * VolumeInvSize;
+        // BOUNCE pass: gather the already-injected radiance arriving over the HEMISPHERE around N
+        // (5 taps: along N + 4 tilted ~60deg, each a coarse-mip average at a couple of distances),
+        // then ADD this surface's reflected share. The wider gather lets light wrap around corners
+        // and propagate deeper into interiors instead of only straight out along N. RMW preserves
+        // the direct light from pass 0 so each pass compounds another bounce.
+        vec3 up = abs(N.y) < 0.95 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        vec3 T = normalize(cross(up, N));
+        vec3 B = cross(N, T);
+        const float COS60 = 0.5, SIN60 = 0.866;
+
         vec3 incoming = vec3(0.0);
-        if (all(greaterThan(ahead, vec3(0.0))) && all(lessThan(ahead, vec3(1.0))))
-            incoming = textureLod(VoxelRadianceSampler, ahead, 2.0).rgb;
-        vec3 bounce = albedo * incoming * 0.85; // 0.85 = bounce energy retained per hop
+        float wsum = 0.0;
+        // Sample directions: N (weight 1) + 4 tilted (weight 0.6).
+        for (int d = 0; d < 5; ++d) {
+            vec3 dir; float w;
+            if (d == 0) { dir = N; w = 1.0; }
+            else {
+                float a = float(d - 1) * 1.5707963; // 90deg apart
+                dir = normalize(N * COS60 + (T * cos(a) + B * sin(a)) * SIN60);
+                w = 0.6;
+            }
+            // Two distances along the direction, at coarse mips (the hemisphere average there).
+            vec3 p1 = (gs.worldPos + dir * 1.5 - VolumeMin) * VolumeInvSize;
+            vec3 p2 = (gs.worldPos + dir * 4.0 - VolumeMin) * VolumeInvSize;
+            if (all(greaterThan(p1, vec3(0.0))) && all(lessThan(p1, vec3(1.0)))) {
+                incoming += w * textureLod(VoxelRadianceSampler, p1, 1.5).rgb;
+                wsum += w;
+            }
+            if (all(greaterThan(p2, vec3(0.0))) && all(lessThan(p2, vec3(1.0)))) {
+                incoming += w * 0.7 * textureLod(VoxelRadianceSampler, p2, 2.5).rgb;
+                wsum += w * 0.7;
+            }
+        }
+        if (wsum > 0.0)
+            incoming /= wsum;
+
+        vec3 bounce = albedo * incoming * 0.9; // 0.9 = bounce energy retained per hop
         vec4 cur = imageLoad(VoxelRadiance, vc);
         imageStore(VoxelRadiance, vc, vec4(cur.rgb + bounce, 1.0));
     }
