@@ -858,8 +858,10 @@ internal sealed class EditorApplication {
             ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(accent.X, accent.Y, accent.Z, 0.55f));
             ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(accent.X, accent.Y, accent.Z, 0.75f));
             if (ImGui.Button($"{EditorIcons.Save}  Save", new SysVec2(110 * S, 0))) {
-                SaveScene();
-                RunPending();
+                // Only proceed if the save actually succeeded — otherwise (e.g. blocked in play mode, or
+                // no scene path) we'd silently discard the unsaved changes the prompt is protecting.
+                if (SceneCommands.Save())
+                    RunPending();
             }
             ImGui.PopStyleColor(2);
             ImGui.SameLine();
