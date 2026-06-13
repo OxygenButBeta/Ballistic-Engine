@@ -286,6 +286,14 @@ loop returns or the process never exits.
     (the bit-exact world-AABB cull + program state-leak fix). When the whole-mesh renderer is GPU-
     driven for BOTH camera and shadows, the CPU per-submesh cull (`ComputeSubmeshVisibility`) is
     skipped entirely — the GPU cull replaces it.
+  - Hi-Z OCCLUSION CULLING: DEFAULT ON (`BALLISTIC_GPUDRIVEN_HIZ=0` to disable). `GLHiZPass` builds
+    a MAX-depth mip pyramid (`HiZ_Down.glsl`) from the PREVIOUS frame's depth; the cull
+    (`occludedByHiZ`) drops submeshes whose whole AABB is behind a closer occluder, comparing in
+    LINEAR view distance (window depth bunches near the far plane — direct compare over-culls) with a
+    0.25 m bias. A camera-delta gate disables it one frame after a big jump (stale-depth hole safety);
+    shadows never use it. Byte-identical (0% pixel diff): Sun Temple 1000→473 draws, Bistro ~814→719.
+    GOTCHA: the pyramid build MUST detach its color attachment + restore unit-0 binding + re-enable
+    DepthTest/CullFace, or it corrupts the later passes (sky/SSGI/SSR) even when nothing is culled.
   - Gotcha: route any NEW compute-shader compile through `GLSLShaderUtilities.ToAscii` (an em-dash
     in a comment truncates the source → "unexpected end of file"). Whole-mesh model = plain
     `WorldMatrix` for ALL submeshes (NOT inverse-node — that's per-submesh-renderer only).
