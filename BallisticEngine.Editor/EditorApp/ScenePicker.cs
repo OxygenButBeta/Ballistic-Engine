@@ -62,7 +62,9 @@ internal static class ScenePicker {
 
         (int start, int count) = IndexRange(mesh, subMeshIndex, indices.Length);
         int triangles = count / 3;
-        int stride = triangles > TriangleBudget ? triangles / TriangleBudget : 1;
+        // Ceiling division: floor (triangles / budget) leaves stride==1 for up to 2x the budget, so a
+        // 1.x-over-budget mesh would test every triangle anyway. Round up to keep tests within budget.
+        int stride = triangles > TriangleBudget ? (triangles + TriangleBudget - 1) / TriangleBudget : 1;
 
         for (int tri = 0; tri < triangles; tri += stride) {
             int i = start + tri * 3;
