@@ -278,13 +278,13 @@ public sealed class GLSdfGiPass : IDisposable {
                 continue;
 
             for (int s = from; s < to; s++) {
-                int slot = SlotForSubMesh(mesh, s);
+                Material mat = r.MaterialFor(s);
+                int slot = SlotForSubMesh(mesh, s, mat);
                 if (slot < 0)
-                    continue; // skipped (too small / cap / failed) — no GI from this submesh
+                    continue; // skipped (too small / cap / failed / cutout) — no GI from this submesh
                 // Per-instance albedo + emissive for the surface-cache inject: the brick has no
                 // per-voxel material, so one value per submesh (its material's base colour /
                 // emissive). Coarse but stable — exactly what the cached low-frequency bounce wants.
-                Material mat = r.MaterialFor(s);
                 Vector3 albedo = mat != null ? mat.BaseColorFactor.Xyz : new Vector3(0.5f);
                 Vector3 emissive = mat is { IsEmissive: true }
                     ? mat.EmissiveColor * mat.EmissiveIntensity : Vector3.Zero;
@@ -296,14 +296,23 @@ public sealed class GLSdfGiPass : IDisposable {
     }
 
     // Returns the atlas slot for one submesh, baking + packing it on first sight (keyed by
-    // (mesh, submesh)). -1 = permanently skipped (too small, over the cap, or didn't fit).
-    int SlotForSubMesh(Mesh mesh, int s) {
+    // (mesh, submesh)). -1 = permanently skipped (too small, cutout, over the cap, or didn't fit).
+    int SlotForSubMesh(Mesh mesh, int s, Material mat) {
         var key = new SubMeshKey(mesh.InstanceId, s);
         if (meshSlots.TryGetValue(key, out int existing))
             return existing;
 
         SubMeshData sm = mesh.SubMeshes[s];
         if (sm.IndexCount < 3) { meshSlots[key] = -1; return -1; }
+
+        // EXCLUDE CUTOUT (alpha-tested) materials — foliage, garlands, ivy, grates. Their geometry
+        // is THIN SHELLS that a coarse 24^3 SDF can't represent (the field becomes a noisy blob), so
+        // gather rays near them randomly hit/miss the garbage SDF and read dark/zero radiance — the
+        // black salt-and-pepper cloud (proven: it sat exactly on SunTemple's wreath + column ivy, and
+        // vanished with SDF-GI off). This is the Lumen approach: foliage is excluded from SDF tracing
+        // (Lumen handles it via screen traces / cards instead). Skipped here = no off-screen bounce
+        // FROM these surfaces, but they still receive GI and the speckle is gone.
+        if (mat is { Cutout: true }) { meshSlots[key] = -1; return -1; }
 
         // Skip negligible submeshes so the atlas budget goes to real occluders.
         mesh.GetSubMeshBounds(s, out Vector3 lo, out Vector3 hi);
@@ -511,7 +520,12 @@ public sealed class GLSdfGiPass : IDisposable {
             denoisePingPong[1].Ensure(halfW, halfH);
             Matrix4 invProjNoJitterCopy = invProjNoJitter;
             GLRenderTexture src = giWriteTex;
-            for (var iter = 0; iter < 3; iter++) {  // 3 iters (1,2,4) — the cache GI is low-frequency
+            // 4 iterations (1,2,4,8 texel spacing). The cache-bounce GI is LOW-FREQUENCY (diffuse,
+            // per-surface), so a wide a-trous is correct — it crushes the 6-ray hit/miss speckle that
+            // lingers in dark recesses (where temporal alone can't, the gather variance is highest).
+            // Edge stops loosened (DepthSigma 0.2, NormalSigma 16) so the blur crosses the speckle but
+            // still respects real depth/normal discontinuities (column edges, corners stay crisp).
+            for (var iter = 0; iter < 4; iter++) {
                 GLRenderTexture dst = denoisePingPong[iter & 1];
                 dst.BindAsTarget();
                 denoiseShader.Activate();
@@ -519,9 +533,9 @@ public sealed class GLSdfGiPass : IDisposable {
                 BindCombineSampler(1, depthTex, "depthTexture");
                 BindCombineSampler(2, normalTex, "normalTexture");
                 denoiseShader.SetMatrix4("InvProjection", ref invProjNoJitterCopy);
-                denoiseShader.SetFloat("StepSize", (float)(1 << iter)); // 1, 2, 4 texel spacing
-                denoiseShader.SetFloat("DepthSigma", 0.1f);
-                denoiseShader.SetFloat("NormalSigma", 32f);
+                denoiseShader.SetFloat("StepSize", (float)(1 << iter)); // 1, 2, 4, 8 texel spacing
+                denoiseShader.SetFloat("DepthSigma", 0.2f);
+                denoiseShader.SetFloat("NormalSigma", 16f);
                 GLBufferUtilities.DrawFullscreenQuad();
                 src = dst;
             }
@@ -552,20 +566,39 @@ public sealed class GLSdfGiPass : IDisposable {
     // Runs before the march each frame; the march then reads the cached radiance at hits.
     void InjectRadiance(int irradianceCubemap, int shadowMapArray, Matrix4[] cascadeMatrices,
         Vector4 cascadeBias, int cascadeCount, Vector3 sunDirection, Vector3 sunColor, float skyExposure) {
+        // PING-PONG + AMORTIZATION: only a round-robin SLICE of instances is injected per frame (the
+        // gather is the heavy cost). But the swap makes the WRITE volume the next readable one, so
+        // the NON-injected instances' radiance must survive. Seed the write volume with last frame's
+        // full read volume (a cheap whole-texture GPU copy) BEFORE injecting the slice over it — so
+        // un-injected bricks keep their converged radiance and only the slice advances one bounce.
+        GL.CopyImageSubData(
+            atlas.RadianceReadTextureId, ImageTarget.Texture3D, 0, 0, 0, 0,
+            atlas.RadianceWriteTextureId, ImageTarget.Texture3D, 0, 0, 0, 0,
+            atlas.Size, atlas.Size, atlas.Size);
+        GL.MemoryBarrier(MemoryBarrierFlags.TextureUpdateBarrierBit |
+                         MemoryBarrierFlags.ShaderImageAccessBarrierBit);
+
         GL.UseProgram(injectProgram);
 
-        // The radiance atlas as a read/write image (binding 1, this frame's write) + as a sampler
-        // (binding 7, the bounce-gather reads last frame's accumulated radiance).
-        GL.BindImageTexture(1, atlas.RadianceTextureId, 0, true, 0,
-            TextureAccess.ReadWrite, SizedInternalFormat.Rgba16f);
+        // PING-PONG: bind the WRITE volume as the image (binding 1, write-only this frame) and the
+        // READ volume (last frame's converged radiance) as the sampler (binding 7). The gather + EMA
+        // read the sampler only — never the image — so there's no same-frame read-during-write.
+        GL.BindImageTexture(1, atlas.RadianceWriteTextureId, 0, true, 0,
+            TextureAccess.WriteOnly, SizedInternalFormat.Rgba16f);
         BindSampler(AtlasUnit, TextureTarget.Texture3D, atlas.TextureId);
         BindSampler(IrradianceUnit, TextureTarget.TextureCubeMap, irradianceCubemap);
         BindSampler(ShadowUnit, TextureTarget.Texture2DArray, shadowMapArray);
-        BindSampler(RadianceUnit, TextureTarget.Texture3D, atlas.RadianceTextureId);
+        BindSampler(RadianceUnit, TextureTarget.Texture3D, atlas.RadianceReadTextureId);
         scene.Bind();
 
         GL.Uniform1(liSkyExposure, skyExposure);
-        GL.Uniform1(liFeedback, 0.9f); // sticky cache — accumulate over frames for stability/bounce
+        // Cache EMA weight for the OLD value. 0.9 was TOO sticky: a brick is only re-injected every
+        // ~total/MaxInjectsPerFrame frames (round-robin), so 0.9 per-inject meant ~100+ frames to
+        // converge — the cache stayed sparse/under-built, the march missed, and dark recesses got
+        // hard-0 black specks. 0.75 (25% new each inject) converges in a handful of injects while the
+        // ping-pong keeps it stable (no same-frame feedback to amplify), filling the cache so the
+        // march hits real radiance instead of the flickery screen-space miss fallback.
+        GL.Uniform1(liFeedback, 0.75f);
         GL.Uniform1(liInstanceCount, (uint)scene.InstanceCount);
         Vector3 gMin = scene.GridMin, gInv = scene.GridInvCell;
         GL.Uniform3(liGridMin, gMin.X, gMin.Y, gMin.Z);
@@ -599,9 +632,12 @@ public sealed class GLSdfGiPass : IDisposable {
         }
         injectCursor = total > 0 ? (injectCursor + batch) % total : 0;
 
-        // Make the radiance writes visible to the march's texture() reads.
+        // Make the radiance image writes visible, then flip the ping-pong: the volume just written
+        // becomes the readable one, so the march's RadianceReadTextureId sampler picks up this
+        // frame's fresh radiance.
         GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit |
                          MemoryBarrierFlags.TextureFetchBarrierBit);
+        atlas.SwapRadiance();
     }
 
     static void BindSampler(int unit, TextureTarget target, int texture) {

@@ -39,12 +39,26 @@ public sealed class GLSdfAtlas : IDisposable {
     // compute WRITES each near-surface voxel's lit radiance here, and the march READS it at a hit
     // (stable per-surface radiance, no per-pixel screen-reprojection flicker). rgb = radiance,
     // a = occupancy/confidence (0 = empty voxel, >0 = a surface voxel with valid radiance).
-    public int RadianceTextureId { get; private set; }
+    //
+    // PING-PONG: there are TWO radiance volumes. The inject READS last frame's converged radiance
+    // (RadianceReadTextureId) via a sampler and WRITES this frame's into RadianceWriteTextureId via
+    // an image — never the same texture, so the bounce-gather is a clean one-bounce-per-frame
+    // radiosity iteration with NO same-frame read-during-write (the noise/instability source). After
+    // the inject, SwapRadiance() flips them so the march (and next frame) read the fresh result.
+    public int RadianceReadTextureId => radianceTextures[radianceRead];
+    public int RadianceWriteTextureId => radianceTextures[1 - radianceRead];
+    // Back-compat alias used where "the current readable radiance" is meant (march sampler binding).
+    public int RadianceTextureId => RadianceReadTextureId;
     public int Size { get; }
 
     public IReadOnlyList<SdfSlot> Slots => slots;
 
     readonly List<SdfSlot> slots = new();
+
+    // The two ping-pong radiance volumes. radianceRead indexes the one holding last frame's
+    // converged radiance (read by the inject's gather + the march); the other is written this frame.
+    readonly int[] radianceTextures = new int[2];
+    int radianceRead;
 
     // 3D shelf cursor. Sub-volumes lay out in rows along +X; a full row stacks along +Y to form a
     // "layer"; full layers stack along +Z. shelfHeight/depth track the current row/layer extents
@@ -74,11 +88,18 @@ public sealed class GLSdfAtlas : IDisposable {
             (int)TextureWrapMode.ClampToEdge);
         GL.BindTexture(TextureTarget.Texture3D, 0);
 
-        // The parallel radiance volume (surface cache). RGBA16F, same size + slot layout. Linear so
-        // the march reads it hardware-filtered (smooth per-surface radiance). The inject compute
-        // binds it as an image and writes near-surface voxels; cleared to 0 on creation.
-        RadianceTextureId = GL.GenTexture();
-        GL.BindTexture(TextureTarget.Texture3D, RadianceTextureId);
+        // The TWO parallel radiance volumes (surface cache ping-pong). RGBA16F, same size + slot
+        // layout. Linear so the march reads them hardware-filtered (smooth per-surface radiance).
+        // The inject binds one as an image (write) and samples the other (last frame's read); cleared
+        // to 0 on creation by TexStorage's spec (driver-zeroed) — confirmed below with an explicit
+        // clear so a first-frame read can't pick up garbage.
+        for (var i = 0; i < 2; i++)
+            radianceTextures[i] = CreateRadianceVolume(size);
+    }
+
+    static int CreateRadianceVolume(int size) {
+        int tex = GL.GenTexture();
+        GL.BindTexture(TextureTarget.Texture3D, tex);
         GL.TexStorage3D(TextureTarget3d.Texture3D, 1, SizedInternalFormat.Rgba16f, size, size, size);
         GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureMinFilter,
             (int)TextureMinFilter.Linear);
@@ -90,8 +111,16 @@ public sealed class GLSdfAtlas : IDisposable {
             (int)TextureWrapMode.ClampToEdge);
         GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureWrapR,
             (int)TextureWrapMode.ClampToEdge);
+        // Explicit zero-clear (don't rely on driver-zeroed storage for a texture the inject reads
+        // before it has written a full frame).
+        GL.ClearTexImage(tex, 0, PixelFormat.Rgba, PixelType.Float, IntPtr.Zero);
         GL.BindTexture(TextureTarget.Texture3D, 0);
+        return tex;
     }
+
+    // Flip the ping-pong: the volume just written becomes the readable one. Called once per frame
+    // after the radiance inject, before the march reads RadianceTextureId.
+    public void SwapRadiance() => radianceRead = 1 - radianceRead;
 
     // Packs and uploads one mesh's SDF. Returns false (logging via Debugging.Log — NO silent
     // truncation) when the sub-volume does not fit in the remaining atlas space, or when the SDF
@@ -197,9 +226,11 @@ public sealed class GLSdfAtlas : IDisposable {
             GL.DeleteTexture(TextureId);
             TextureId = 0;
         }
-        if (RadianceTextureId != 0) {
-            GL.DeleteTexture(RadianceTextureId);
-            RadianceTextureId = 0;
+        for (var i = 0; i < radianceTextures.Length; i++) {
+            if (radianceTextures[i] != 0) {
+                GL.DeleteTexture(radianceTextures[i]);
+                radianceTextures[i] = 0;
+            }
         }
         slots.Clear();
     }

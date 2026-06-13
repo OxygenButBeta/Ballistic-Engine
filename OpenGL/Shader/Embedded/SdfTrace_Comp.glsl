@@ -485,12 +485,17 @@ void main() {
             if (cached.a > 0.01) {
                 radiance = Sanitize(cached.rgb);
             } else {
-                // Cache miss (voxel not yet filled / between bricks): fall back to the on-the-fly
-                // lit estimate so the bounce still appears while the cache warms up.
+                // Cache miss (voxel not yet filled / between bricks / geometry over the bake cap):
+                // use the SMOOTH neutral direct estimate (sun cosine + sky), NOT the screen-space
+                // HitRadiance read. The screen read flickers per-pixel on grazing/occluded hits (its
+                // sub-pixel reproject samples a neighbour depth that randomly accepts/rejects) — that
+                // was the black salt-and-pepper in the dark vaults where the cache is sparse. HitDirect
+                // has no screen sampling, so it's spatially coherent: a clean low-frequency fill that
+                // the temporal+a-trous resolve cleanly while the cache warms up / over uncovered bits.
                 vec3 hitN = SceneGradient(hitPoint);
                 if (dot(hitN, hitN) < 1e-5)
                     hitN = -dir;
-                radiance = Sanitize(HitRadiance(hitPoint, hitN));
+                radiance = Sanitize(HitDirect(hitPoint, hitN));
             }
         }
         // MISS = the ray escaped to open sky. Contribute ZERO: the sky's contribution to this

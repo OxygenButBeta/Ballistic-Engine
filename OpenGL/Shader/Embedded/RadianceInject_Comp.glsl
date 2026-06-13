@@ -15,8 +15,12 @@
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
 // The SDF atlas (read the brick's distance for occupancy + gradient) and the radiance atlas we write.
+// PING-PONG: RadianceAtlas (image, binding 1) is THIS frame's WRITE target; RadianceCache (sampler,
+// binding 7) is the SEPARATE volume holding LAST frame's converged radiance. The EMA's "old value"
+// and the bounce-gather both read the sampler — never the image — so there is no same-frame
+// read-during-write (the noise/instability source the ping-pong removes).
 layout(binding = 4) uniform sampler3D SdfAtlas;
-layout(rgba16f, binding = 1) uniform image3D RadianceAtlas;  // rgb = radiance, a = occupancy
+layout(rgba16f, binding = 1) uniform writeonly image3D RadianceAtlas;  // rgb = radiance, a = occupancy
 
 // IBL sky (the ambient term) + cascaded shadow map (sun visibility), same as the march.
 layout(binding = 3) uniform samplerCube IrradianceMap;
@@ -46,9 +50,9 @@ layout(std430, binding = 9) readonly buffer SlotBuf     { SsdfSlot     slots[]; 
 layout(std430, binding = 10) readonly buffer GridCellBuf { ivec2 gridCells[]; };
 layout(std430, binding = 11) readonly buffer GridListBuf { uint  gridList[]; };
 
-// LAST frame's radiance cache as a SAMPLER (binding 7) — the bounce-gather reads it at ray hits.
-// (RadianceAtlas image binding 1 is THIS frame's write target; reading the sampler view gives the
-// previous accumulated state, which is exactly what an iterative radiosity bounce wants.)
+// LAST frame's radiance cache as a SAMPLER (binding 7) — the SEPARATE ping-pong volume. The
+// bounce-gather reads it at ray hits AND the EMA reads this voxel's own previous value here (the
+// write image is a fresh empty volume this frame, so the "old value" must come from the sampler).
 layout(binding = 7) uniform sampler3D RadianceCache;
 
 uniform int  InstanceIndex;  // which instance this dispatch injects (one dispatch per instance)
@@ -201,8 +205,9 @@ void main() {
     float cell = max(max(cellSize.x, cellSize.y), cellSize.z);
     float d = SdfAt(atlasTexel);
     if (abs(d) > 1.5 * cell) {
-        // Empty voxel: decay any stale radiance toward 0 so it doesn't linger.
-        vec4 old = imageLoad(RadianceAtlas, atlasTexel);
+        // Empty voxel: decay last frame's value (read from the ping-pong sampler) toward 0 into the
+        // write volume so stale radiance doesn't linger but also doesn't flicker to 0 in one frame.
+        vec4 old = texelFetch(RadianceCache, atlasTexel, 0);
         imageStore(RadianceAtlas, atlasTexel, vec4(old.rgb * 0.5, old.a * 0.5));
         return;
     }
@@ -241,8 +246,10 @@ void main() {
     vec3 radiance = inst.emissive.xyz + (inst.albedo.xyz / PI) * (direct + PI * bounce);
     radiance = Sanitize(radiance);
 
-    // Temporal EMA: blend with the existing cached value for stability + crude multi-bounce buildup.
-    vec4 old = imageLoad(RadianceAtlas, atlasTexel);
+    // Temporal EMA: blend with last frame's cached value (from the ping-pong sampler, NOT the empty
+    // write image) for stability + multi-bounce buildup. Because the gather reads the same sampler,
+    // each frame adds exactly one bounce off a CONVERGED previous state — no same-frame feedback.
+    vec4 old = texelFetch(RadianceCache, atlasTexel, 0);
     vec3 blended = old.a > 0.0 ? mix(radiance, old.rgb, Feedback) : radiance;
     imageStore(RadianceAtlas, atlasTexel, vec4(Sanitize(blended), 1.0));
 }
