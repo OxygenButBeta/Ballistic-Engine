@@ -1861,17 +1861,18 @@ void main() {
             gpuDrivenTarget = target;
         }
 
-        // Frustum planes from the SAME (jittered) view-projection the draw uses. The cull is
-        // deterministic (same planes -> same command set), so the prepass and opaque cull emit
-        // identical commands -> z-prepass invariance holds even re-culling per pass.
-        Matrix4 vp = view * projection;
-        ExtractFrustumPlanes(ref vp, gpuCullPlanes);
-
-        // Cull BOTH batches FIRST into their own buffers (no write-after-read hazard). The cull is
-        // deterministic so prepass/opaque emit identical sets. NOTE: cull binds the compute program,
-        // so the render program MUST be activated AFTER the culls, right before the draws.
-        gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchSolid, gpuCullPlanes, pass: 0, cutoutFilter: 0);
-        gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchCutout, gpuCullPlanes, pass: 0, cutoutFilter: 1);
+        // Cull ONLY in the prepass (the first camera GPU-draw of the frame). The opaque pass runs
+        // right after with nothing in between that writes these buffers (the shadow pass ran BEFORE
+        // the prepass and clobbered them, which is exactly why the prepass must re-cull), so the
+        // opaque REUSES the prepass's command buffers. Same planes -> identical commands -> z-prepass
+        // invariance holds, and we halve the camera culls (4/frame -> 2). NOTE: cull binds the compute
+        // program, so the render program is activated AFTER, right before the draws.
+        if (isDepthPrepass) {
+            Matrix4 vp = view * projection;
+            ExtractFrustumPlanes(ref vp, gpuCullPlanes);
+            gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchSolid, gpuCullPlanes, pass: 0, cutoutFilter: 0);
+            gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchCutout, gpuCullPlanes, pass: 0, cutoutFilter: 1);
+        }
         if (Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN_DEBUG") == "1" && !isDepthPrepass)
             Console.WriteLine($"[GpuDriven] solid={gpuDriven.DebugReadDrawCount(0)} cutout={gpuDriven.DebugReadDrawCount(1)}");
 
