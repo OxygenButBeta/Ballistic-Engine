@@ -181,8 +181,10 @@ internal static class EditorUndo {
     }
 
     // Undo repeatedly back to a given history index (0 = newest). Used by the history dropdown.
+    // History() lists newest-first, so dropdown index k maps to undo[Count-1-k]; undoing "to" that
+    // entry means rolling back it AND everything newer than it = k+1 pops off the top of the stack.
     public static void UndoTo(int historyIndex) {
-        int steps = undo.Count - historyIndex;
+        int steps = historyIndex + 1;
         for (var i = 0; i < steps && CanUndo; i++)
             Undo();
     }

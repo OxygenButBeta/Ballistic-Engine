@@ -56,7 +56,7 @@ internal sealed class EditorInput {
             EditorKey.D => k.IsKeyDown(Keys.D),
             EditorKey.Q => k.IsKeyDown(Keys.Q),
             EditorKey.E => k.IsKeyDown(Keys.E),
-            EditorKey.Shift => k.IsKeyDown(Keys.LeftShift),
+            EditorKey.Shift => k.IsKeyDown(Keys.LeftShift) || k.IsKeyDown(Keys.RightShift),
             _ => false,
         };
     }

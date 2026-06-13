@@ -1417,7 +1417,10 @@ internal sealed class InspectorPanel {
                 }
                 case Enum e: {
                     string[] names = Enum.GetNames(memberType);
-                    int current = Array.IndexOf(names, e.ToString());
+                    // IndexOf returns -1 when the value doesn't match a single declared name (a [Flags]
+                    // combination or an out-of-range cast); fall back to the first entry so the combo
+                    // shows a valid label instead of blank.
+                    int current = Math.Max(0, Array.IndexOf(names, e.ToString()));
                     var changed = InspectorUndo.Track(label, ImGui.Combo("##v", ref current, names, names.Length));
                     if (changed) { ApplyMember(member, target, Enum.Parse(memberType, names[current])); state.MarkViewportDirty(); }
                     break;
