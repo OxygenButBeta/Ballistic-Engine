@@ -459,7 +459,14 @@ internal static class RemoteHandlers {
         string typeName = spec;
         int? index = null;
         int at = spec.IndexOf('@');
-        if (at >= 0) { typeName = spec[..at]; index = int.Parse(spec[(at + 1)..]); }
+        if (at >= 0) {
+            typeName = spec[..at];
+            string idxText = spec[(at + 1)..];
+            // Clean error for a malformed index (agent-facing API), instead of a raw .NET FormatException.
+            if (!int.TryParse(idxText, out int parsed) || parsed < 0)
+                throw new Exception($"invalid component index '{idxText}' in '{spec}' — use {typeName}@0, {typeName}@1, ...");
+            index = parsed;
+        }
 
         var matches = entity.Behaviours.Where(b =>
             string.Equals(b.GetType().Name, typeName, StringComparison.OrdinalIgnoreCase)).ToList();
