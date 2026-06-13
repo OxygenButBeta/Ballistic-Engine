@@ -24,13 +24,15 @@ public sealed class GLSdfScene : IDisposable {
     public const int InstanceBinding = 8;
     public const int SlotTableBinding = 9;
 
-    // binding 8 entry. std430: mat4 (64B) + 4 vec4 (64B) + 4 uints (16B) = 144B, multiple of 16.
+    // binding 8 entry. std430: 2 mat4 (128B) + 4 vec4 (64B) + 4 uints (16B) = 208B, multiple of 16.
     // The march pre-rejects by WorldAabbMin/Max (cheap, before the transform), then transforms a
     // world point into mesh-local space with WorldToLocal and looks up SdfSlotGpu[Slot] to sample.
-    // Albedo/Emissive feed the surface-cache radiance inject (the lit radiance at this surface).
+    // World maps a brick voxel's LOCAL position back to WORLD for the radiance inject's lighting;
+    // Albedo/Emissive feed the inject (the lit radiance at this surface).
     [StructLayout(LayoutKind.Sequential)]
     public struct SdfInstance {
-        public Matrix4 WorldToLocal; // 64B — inverse(world)
+        public Matrix4 WorldToLocal; // 64B — inverse(world); world -> mesh-local (the march)
+        public Matrix4 World;        // 64B — model->world; local -> world (the inject lighting)
         public Vector4 WorldAabbMin; // 16B — instance world-space AABB min (xyz; w unused)
         public Vector4 WorldAabbMax; // 16B — instance world-space AABB max
         public Vector4 Albedo;       // 16B — diffuse albedo (xyz; w unused) for the inject
@@ -38,9 +40,9 @@ public sealed class GLSdfScene : IDisposable {
         public uint Slot;            // index into the slot table (binding 9)
         public uint Pad0;
         public uint Pad1;
-        public uint Pad2;            // pad to 144B (multiple of 16)
+        public uint Pad2;            // pad to 208B (multiple of 16)
 
-        public const int SizeBytes = 144;
+        public const int SizeBytes = 208;
     }
 
     // binding 9 entry — mirrors GLSdfAtlas.SdfSlot for the GPU. Kept dead simple: all vec4 so the
@@ -107,6 +109,11 @@ public sealed class GLSdfScene : IDisposable {
     public int InstanceCount { get; private set; }
     public int SlotCount { get; private set; }
 
+    // The slot index of each instance [0, InstanceCount), so the radiance inject can look up each
+    // instance's brick resolution (for the per-instance dispatch group counts). Reused per frame.
+    int[] instanceSlots = [];
+    public ReadOnlySpan<int> InstanceSlots => instanceSlots.AsSpan(0, InstanceCount);
+
     // Grid bounds + inverse cell size the march needs to map a world point to a cell.
     public Vector3 GridMin { get; private set; }
     public Vector3 GridInvCell { get; private set; }   // 1 / cellSize per axis
@@ -133,11 +140,15 @@ public sealed class GLSdfScene : IDisposable {
         int count = instances is ICollection<(Matrix4, int, Vector3, Vector3)> c ? c.Count : 0;
         if (instanceScratch.Length < Math.Max(count, 1))
             instanceScratch = new SdfInstance[Math.Max(count, 16)];
+        if (instanceSlots.Length < Math.Max(count, 1))
+            instanceSlots = new int[Math.Max(count, 16)];
 
         int n = 0;
         foreach (var (world, slot, albedo, emissive) in instances) {
-            if (n >= instanceScratch.Length)
+            if (n >= instanceScratch.Length) {
                 Array.Resize(ref instanceScratch, instanceScratch.Length * 2);
+                Array.Resize(ref instanceSlots, instanceSlots.Length * 2);
+            }
             // worldToLocal: Matrix4.Invert returns the inverse (throws only on a singular matrix,
             // which a valid TRS world matrix never is).
             Matrix4 worldToLocal = Matrix4.Invert(world);
@@ -149,6 +160,7 @@ public sealed class GLSdfScene : IDisposable {
             WorldAabb(world, sl.BoundsMin.Xyz, sl.BoundsMax.Xyz, out Vector3 wMin, out Vector3 wMax);
             instanceScratch[n] = new SdfInstance {
                 WorldToLocal = worldToLocal,
+                World = world,
                 WorldAabbMin = new Vector4(wMin, 0f),
                 WorldAabbMax = new Vector4(wMax, 0f),
                 Albedo = new Vector4(albedo, 0f),
@@ -156,6 +168,7 @@ public sealed class GLSdfScene : IDisposable {
                 Slot = (uint)s,
                 Pad0 = 0, Pad1 = 0, Pad2 = 0,
             };
+            instanceSlots[n] = s;
             n++;
         }
         InstanceCount = n;

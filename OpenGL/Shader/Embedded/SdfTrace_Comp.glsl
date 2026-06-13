@@ -46,6 +46,12 @@ layout(binding = 4) uniform sampler3D SdfAtlas;
 // path). depth-validated so an occluded/off-screen hit falls back to the direct estimate.
 layout(binding = 6) uniform sampler2D SceneColor;
 
+// The SURFACE CACHE: per-surface lit radiance, stored in a 3D atlas parallel to the SDF atlas
+// (same slot layout). The radiance-inject compute fills near-surface voxels each frame; the march
+// reads it here at a hit (stable per-surface radiance — no per-pixel screen-reprojection flicker,
+// works off-screen, carries colour for bleed + multi-bounce). rgb = radiance, a = occupancy.
+layout(binding = 7) uniform sampler3D RadianceAtlas;
+
 // Output: half-res RGBA16F. rgb = gathered off-screen indirect radiance, a = validity
 // (0 = sky/invalid pixel, 1 = a real surface that got a gather).
 layout(rgba16f, binding = 0) uniform writeonly image2D OutGi;
@@ -236,6 +242,22 @@ float SampleSlot(uint slotIdx, vec3 local, out bool inside) {
     return mix(y0, y1, f.z);
 }
 
+// Reads the SURFACE CACHE radiance for slot `slotIdx` at mesh-local point `local`. Maps local ->
+// continuous cell coords (the SAME cell-center convention as SampleSlot) -> normalized atlas UVW,
+// then samples the radiance atlas with hardware trilinear. Returns rgb radiance; a (occupancy) tells
+// the caller whether this voxel was filled. textureSize gives the atlas dims for the UVW mapping.
+vec4 SampleRadiance(uint slotIdx, vec3 local) {
+    SsdfSlot sl = slots[slotIdx];
+    vec3 bmin = sl.boundsMin.xyz;
+    vec3 res  = max(sl.res.xyz, vec3(1.0));
+    vec3 cellSize = (sl.boundsMax.xyz - bmin) / res;
+    vec3 cell = (local - bmin) / cellSize - vec3(0.5);   // cell-center index, matches SampleSlot
+    cell = clamp(cell, vec3(0.0), res - vec3(1.0001));
+    vec3 atlasTexel = sl.offsetRes0.xyz + cell + vec3(0.5); // +0.5 to texel center for normalized UVW
+    vec3 uvw = atlasTexel / vec3(textureSize(RadianceAtlas, 0));
+    return texture(RadianceAtlas, uvw);
+}
+
 // Scene SDF at a WORLD point: min over all instances of (point transformed to local, sampled).
 // `nearestSlot` and `nearestLocal` report which instance was closest, for the gradient on hit.
 float SceneSdf(vec3 worldP, out uint nearestSlot, out vec3 nearestLocal, out bool anyInside) {
@@ -418,6 +440,8 @@ void main() {
         float traveled = 0.0;
         bool hit = false;
         vec3 hitPoint = p;
+        uint hitSlot = 0u;       // which instance's brick we hit (for the radiance-cache read)
+        vec3 hitLocal = vec3(0.0);
 
         for (int s = 0; s < MAX_STEPS; ++s) {
             uint nearSlot; vec3 nearLocal; bool anyInside;
@@ -432,6 +456,8 @@ void main() {
             if (anyInside && dist < HIT_EPS && traveled >= SELF_SKIP) {
                 hit = true;
                 hitPoint = p;
+                hitSlot = nearSlot;
+                hitLocal = nearLocal;
                 break;
             }
 
@@ -449,12 +475,19 @@ void main() {
         vec3 radiance = vec3(0.0);
         if (hit) {
             hitCount++;
-            // Lit radiance at the hit = direct sun (shadowed) + sky, x neutral albedo. The SDF
-            // gradient is the hit normal; if it degenerates, face the gather point (reversed ray).
-            vec3 hitN = SceneGradient(hitPoint);
-            if (dot(hitN, hitN) < 1e-5)
-                hitN = -dir;
-            radiance = Sanitize(HitRadiance(hitPoint, hitN));
+            // Read the SURFACE CACHE: stable per-surface radiance the inject pass filled at this
+            // voxel. No per-pixel screen-reprojection flicker, off-screen-capable, carries colour.
+            vec4 cached = SampleRadiance(hitSlot, hitLocal);
+            if (cached.a > 0.01) {
+                radiance = Sanitize(cached.rgb);
+            } else {
+                // Cache miss (voxel not yet filled / between bricks): fall back to the on-the-fly
+                // lit estimate so the bounce still appears while the cache warms up.
+                vec3 hitN = SceneGradient(hitPoint);
+                if (dot(hitN, hitN) < 1e-5)
+                    hitN = -dir;
+                radiance = Sanitize(HitRadiance(hitPoint, hitN));
+            }
         }
         // MISS = the ray escaped to open sky. Contribute ZERO: the sky's contribution to this
         // surface is ALREADY in the baked IBL ambient that lit the scene color we composite onto.

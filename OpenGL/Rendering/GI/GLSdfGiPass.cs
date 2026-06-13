@@ -53,7 +53,8 @@ public sealed class GLSdfGiPass : IDisposable {
     const int IrradianceUnit = 3;
     const int AtlasUnit = 4;
     const int ShadowUnit = 5;   // sampler2DArrayShadow — direct-sun visibility at SDF hits
-    const int SceneColorUnit = 6; // lit scene colour — the screen-space "surface cache" at hits
+    const int SceneColorUnit = 6; // lit scene colour — fallback radiance for unfilled hits
+    const int RadianceUnit = 7;   // surface-cache radiance atlas (3D) — stable per-surface radiance
 
     // Neutral diffuse albedo for off-screen SDF hits (no per-hit material in v1). Mid-grey.
     const float HitAlbedo = 0.5f;
@@ -77,7 +78,11 @@ public sealed class GLSdfGiPass : IDisposable {
     readonly GLSdfScene scene;
     readonly AtlasAdapter atlasAdapter;
 
-    int program;
+    int program;        // SdfTrace_Comp — the march
+    int injectProgram;  // RadianceInject_Comp — fills the surface-cache radiance atlas
+    // Inject uniform locations.
+    int liInstanceIndex, liSkyExposure, liFeedback, liCascadeBias, liCascadeCount, liSunDir, liSunColor;
+    readonly int[] liCascadeMatrices = new int[4];
 
     // Full-res depth-aware upsample + additive composite (SdfGi_Combine.glsl). Mirrors SSR_Combine
     // but ADDS (GI only lifts, never darkens) and returns the modified litColor, so the pass plugs
@@ -157,7 +162,8 @@ public sealed class GLSdfGiPass : IDisposable {
         atlasAdapter = new AtlasAdapter(atlas);
 
         program = CompileCompute(EmbeddedShaderSource.Read("SdfTrace_Comp.glsl"));
-        if (program == 0) {
+        injectProgram = CompileCompute(EmbeddedShaderSource.Read("RadianceInject_Comp.glsl"));
+        if (program == 0 || injectProgram == 0) {
             // Compile/link failed (logged by CompileCompute). Auto-disable; clean up the GPU
             // resources we already created so an unavailable pass owns nothing live.
             atlas.Dispose();
@@ -204,6 +210,17 @@ public sealed class GLSdfGiPass : IDisposable {
         locViewProj = GL.GetUniformLocation(program, "ViewProj");
         for (var i = 0; i < 4; i++)
             locCascadeMatrices[i] = GL.GetUniformLocation(program, CascadeMatrixNames[i]);
+
+        // Inject program uniforms.
+        liInstanceIndex = GL.GetUniformLocation(injectProgram, "InstanceIndex");
+        liSkyExposure = GL.GetUniformLocation(injectProgram, "SkyExposure");
+        liFeedback = GL.GetUniformLocation(injectProgram, "Feedback");
+        liCascadeBias = GL.GetUniformLocation(injectProgram, "CascadeBias");
+        liCascadeCount = GL.GetUniformLocation(injectProgram, "CascadeCount");
+        liSunDir = GL.GetUniformLocation(injectProgram, "SunDirectionWorld");
+        liSunColor = GL.GetUniformLocation(injectProgram, "SunColor");
+        for (var i = 0; i < 4; i++)
+            liCascadeMatrices[i] = GL.GetUniformLocation(injectProgram, CascadeMatrixNames[i]);
     }
 
     // Bakes + uploads the SDF for every distinct mesh in the opaque set (once each, keyed by
@@ -333,6 +350,12 @@ public sealed class GLSdfGiPass : IDisposable {
         if (scene.InstanceCount == 0 || scene.SlotCount == 0)
             return colorTexture; // nothing baked / nothing to trace — no change to the scene
 
+        // ---- 0. Radiance inject (surface cache fill) ----
+        // For each instance, fill its radiance brick with lit radiance at near-surface voxels. The
+        // march then READS this cached per-surface radiance at a hit (stable, no screen flicker).
+        InjectRadiance(irradianceCubemap, shadowMapArray, cascadeMatrices, cascadeBias, cascadeCount,
+            sunDirection, sunColor, skyExposure);
+
         // ---- 1. Half-res compute gather (rgb = off-screen indirect, a = validity) ----
         int halfW = Math.Max(1, width / 2);
         int halfH = Math.Max(1, height / 2);
@@ -358,8 +381,10 @@ public sealed class GLSdfGiPass : IDisposable {
         // Cascaded shadow map (depth texture ARRAY, sampled as sampler2DArrayShadow — the compare
         // mode lives in the texture's parameters, set when the shadow map was created).
         BindSampler(ShadowUnit, TextureTarget.Texture2DArray, shadowMapArray);
-        // Lit scene colour = the screen-space surface cache the march reads at visible hits.
+        // Lit scene colour (kept as a fallback radiance source for hits the cache hasn't filled).
         BindSampler(SceneColorUnit, TextureTarget.Texture2D, colorTexture);
+        // The surface-cache radiance atlas — the STABLE per-surface radiance the march reads at hits.
+        BindSampler(RadianceUnit, TextureTarget.Texture3D, atlas.RadianceTextureId);
 
         // SDF scene SSBOs (binding 8 = instances, 9 = slot table).
         scene.Bind();
@@ -509,6 +534,48 @@ public sealed class GLSdfGiPass : IDisposable {
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
 
         return combined.Texture;
+    }
+
+    // Fills the surface-cache radiance atlas: one dispatch per instance (group counts from its brick
+    // resolution), computing lit radiance at each near-surface voxel and temporally accumulating it.
+    // Runs before the march each frame; the march then reads the cached radiance at hits.
+    void InjectRadiance(int irradianceCubemap, int shadowMapArray, Matrix4[] cascadeMatrices,
+        Vector4 cascadeBias, int cascadeCount, Vector3 sunDirection, Vector3 sunColor, float skyExposure) {
+        GL.UseProgram(injectProgram);
+
+        // The radiance atlas as a read/write image (binding 1) + the inputs the lighting needs.
+        GL.BindImageTexture(1, atlas.RadianceTextureId, 0, true, 0,
+            TextureAccess.ReadWrite, SizedInternalFormat.Rgba16f);
+        BindSampler(AtlasUnit, TextureTarget.Texture3D, atlas.TextureId);
+        BindSampler(IrradianceUnit, TextureTarget.TextureCubeMap, irradianceCubemap);
+        BindSampler(ShadowUnit, TextureTarget.Texture2DArray, shadowMapArray);
+        scene.Bind();
+
+        GL.Uniform1(liSkyExposure, skyExposure);
+        GL.Uniform1(liFeedback, 0.9f); // sticky cache — accumulate over frames for stability/bounce
+        int cascades = Math.Min(cascadeCount, liCascadeMatrices.Length);
+        for (var i = 0; i < cascades; i++)
+            GL.UniformMatrix4(liCascadeMatrices[i], false, ref cascadeMatrices[i]);
+        GL.Uniform4(liCascadeBias, cascadeBias);
+        GL.Uniform1(liCascadeCount, cascades);
+        GL.Uniform3(liSunDir, sunDirection);
+        GL.Uniform3(liSunColor, sunColor);
+
+        // One dispatch per instance — group counts from its brick resolution (local_size 4^3).
+        ReadOnlySpan<int> slots = scene.InstanceSlots;
+        var atlasSlots = atlas.Slots;
+        for (var i = 0; i < slots.Length; i++) {
+            int slot = slots[i];
+            if ((uint)slot >= (uint)atlasSlots.Count)
+                continue;
+            Vector3i res = atlasSlots[slot].Res;
+            GL.Uniform1(liInstanceIndex, i);
+            GL.DispatchCompute((res.X + 3) / 4, (res.Y + 3) / 4, (res.Z + 3) / 4);
+        }
+
+        // Make the radiance writes visible to the march's texture() reads.
+        GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit |
+                         MemoryBarrierFlags.TextureFetchBarrierBit);
     }
 
     static void BindSampler(int unit, TextureTarget target, int texture) {
