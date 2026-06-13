@@ -28,8 +28,11 @@ public sealed class GLVoxelGI : IDisposable {
 
     // Cached uniform locations for the voxelize program.
     int uVolumeMin, uVolumeInvSize, uVoxelRes, uSunDir, uSunColor, uSkyAmbient, uCascadeCount,
-        uCascadeBias, uShadowCascades;
+        uCascadeBias, uShadowCascades, uBouncePass, uVoxelSampler;
     readonly int[] uCascadeMatrices = new int[4];
+
+    // Extra GI bounce passes after the direct pass (each compounds one more bounce). 0..2.
+    public int BouncePasses { get; set; } = 2;
 
     void CacheUniforms() {
         int L(string n) => GL.GetUniformLocation(voxelizeProgram, n);
@@ -37,6 +40,7 @@ public sealed class GLVoxelGI : IDisposable {
         uSunDir = L("SunDir"); uSunColor = L("SunColor"); uSkyAmbient = L("SkyAmbient");
         uCascadeCount = L("CascadeCount"); uCascadeBias = L("CascadeBias");
         uShadowCascades = L("ShadowCascades");
+        uBouncePass = L("BouncePass"); uVoxelSampler = L("VoxelRadianceSampler");
         for (var i = 0; i < 4; i++) uCascadeMatrices[i] = L($"CascadeMatrices[{i}]");
     }
 
@@ -120,10 +124,28 @@ public sealed class GLVoxelGI : IDisposable {
         GL.BindTexture(TextureTarget.Texture2DArray, shadowArrayTex);
         GL.Uniform1(uShadowCascades, 10);
 
-        // Bind the radiance texture as image unit 0 (writeonly rgba8).
-        GL.BindImageTexture(0, RadianceTexture, 0, true, 0, TextureAccess.WriteOnly, SizedInternalFormat.Rgba8);
+        // Direct pass (overwrite). RMW image so the bounce passes can read-modify.
+        GL.Uniform1(uBouncePass, 0);
+        GL.BindImageTexture(0, RadianceTexture, 0, true, 0, TextureAccess.ReadWrite, SizedInternalFormat.Rgba8);
 
         // Per-draw + material SSBOs are bound by the GPU-driven DrawIndirectCount the caller invokes.
+    }
+
+    // Between the direct draw and a bounce draw: mip the current radiance (so the bounce reads the
+    // hemisphere average from coarse mips), then set the bounce-pass state. The caller draws again.
+    public void BeginBouncePass(int pass) {
+        // Barrier the prior pass's image writes, then rebuild mips for the sampler reads.
+        GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
+        GL.BindTexture(TextureTarget.Texture3D, RadianceTexture);
+        GL.GenerateMipmap(GenerateMipmapTarget.Texture3D);
+
+        GL.UseProgram(voxelizeProgram);
+        GL.Uniform1(uBouncePass, pass);
+        // Sampler (unit 11) reads the just-mipped radiance; image unit 0 is the RMW target.
+        GL.ActiveTexture(TextureUnit.Texture11);
+        GL.BindTexture(TextureTarget.Texture3D, RadianceTexture);
+        GL.Uniform1(uVoxelSampler, 11);
+        GL.BindImageTexture(0, RadianceTexture, 0, true, 0, TextureAccess.ReadWrite, SizedInternalFormat.Rgba8);
     }
 
     public int VoxelizeProgram => voxelizeProgram;

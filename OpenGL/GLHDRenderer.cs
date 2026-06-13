@@ -2101,10 +2101,20 @@ void main() {
 
         // The voxelize program reads the per-draw model + bindless material from the SAME SSBOs the
         // GPU-driven draw binds. DrawIndirectCount binds them and issues the MDI; both batches.
+        // Direct pass injects sun+sky+emissive; each extra BOUNCE pass reads the mipped radiance and
+        // compounds another bounce (in-place RMW) -> deep interiors fill with light (the Lumen look).
         GL.UseProgram(voxelGI.VoxelizeProgram);
         mesh.Activate();
-        gpuDriven.DrawIndirectCount(OpenGL.GpuDriven.GpuDrivenRenderer.BatchSolid);
-        gpuDriven.DrawIndirectCount(OpenGL.GpuDriven.GpuDrivenRenderer.BatchCutout);
+        void DrawScene() {
+            gpuDriven.DrawIndirectCount(OpenGL.GpuDriven.GpuDrivenRenderer.BatchSolid);
+            gpuDriven.DrawIndirectCount(OpenGL.GpuDriven.GpuDrivenRenderer.BatchCutout);
+        }
+        DrawScene(); // direct pass (BouncePass 0)
+        for (var bp = 1; bp <= voxelGI.BouncePasses; bp++) {
+            voxelGI.BeginBouncePass(bp);
+            mesh.Activate();
+            DrawScene();
+        }
         mesh.Deactivate();
 
         voxelGI.VoxelizeEnd();

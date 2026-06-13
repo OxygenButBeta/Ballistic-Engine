@@ -14,7 +14,12 @@ in GsOut {
     flat uint materialId;
 } gs;
 
-layout(binding = 0, rgba8) uniform writeonly image3D VoxelRadiance;
+layout(binding = 0, rgba8) uniform image3D VoxelRadiance;  // readwrite for in-place bounce RMW
+// Bounce pass: read the grid's already-injected radiance (coarse mips, from the previous iteration's
+// GenerateMipmap) along the surface normal and ADD it. Each iteration = one more bounce -> deep
+// interiors fill with light. BouncePass=0 is the direct pass (overwrite); >0 adds bounce (RMW).
+uniform sampler3D VoxelRadianceSampler;
+uniform int BouncePass;
 
 struct GpuMaterial { uvec2 dH;uvec2 nH;uvec2 mH;uvec2 rH;uvec2 aH;uvec2 eH;
     vec4 bcf;vec4 ef;float mm;float rm;float ns;float op;uint fl;uint a;uint b;uint c; };
@@ -61,14 +66,22 @@ void main() {
     float NdotL = max(dot(N, SunDir), 0.0);
     float sh = NdotL > 0.0 ? sunShadow(gs.worldPos, N) : 1.0;
 
-    // Direct radiance leaving this surface (Lambertian), + a sky ambient fill so ceilings/undersides
-    // that the sun never hits still seed some bounce. This is the light the cone tracer gathers.
-    vec3 radiance = albedo * (SunColor * NdotL * sh + SkyAmbient);
-
-    // EMISSIVE surfaces inject light into the GI directly (a glowing material lights the room —
-    // emissive-as-area-light, a hallmark of the UE5/Lumen look). flag bit4 = HasEmissive.
-    if ((m.fl & 16u) != 0u)
-        radiance += texture(sampler2D(m.eH), gs.uv).rgb * m.ef.rgb;
-
-    imageStore(VoxelRadiance, vc, vec4(radiance, 1.0));
+    if (BouncePass == 0) {
+        // DIRECT pass: sun + sky + emissive leaving this surface (overwrite).
+        vec3 radiance = albedo * (SunColor * NdotL * sh + SkyAmbient);
+        if ((m.fl & 16u) != 0u)   // emissive-as-area-light (flag bit4 = HasEmissive)
+            radiance += texture(sampler2D(m.eH), gs.uv).rgb * m.ef.rgb;
+        imageStore(VoxelRadiance, vc, vec4(radiance, 1.0));
+    } else {
+        // BOUNCE pass: gather the already-injected radiance arriving along N (coarse mip = the
+        // incoming hemisphere average) and ADD this surface's reflected share. RMW so the direct
+        // light written in pass 0 is preserved and each pass compounds another bounce.
+        vec3 ahead = (gs.worldPos + N * 2.0 - VolumeMin) * VolumeInvSize;
+        vec3 incoming = vec3(0.0);
+        if (all(greaterThan(ahead, vec3(0.0))) && all(lessThan(ahead, vec3(1.0))))
+            incoming = textureLod(VoxelRadianceSampler, ahead, 2.0).rgb;
+        vec3 bounce = albedo * incoming * 0.85; // 0.85 = bounce energy retained per hop
+        vec4 cur = imageLoad(VoxelRadiance, vc);
+        imageStore(VoxelRadiance, vc, vec4(cur.rgb + bounce, 1.0));
+    }
 }
