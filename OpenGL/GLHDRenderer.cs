@@ -57,12 +57,12 @@ public class GLHDRenderer : HDRenderer {
     readonly Dictionary<Shader, (Shader Lit, Shader Prepass)> gpuDrivenShaders = new();
     StandardShader gpuShadowShader;   // depth-only MDI shadow caster (per-cascade lightSpaceMatrix)
     bool gpuDrivenEnabled = Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN") != "0";
-    // GPU-driven shadows: opt-IN (BALLISTIC_GPUDRIVEN_SHADOWS=1) while validated. The whole-mesh MDI
-    // shadow caster works and cuts shadow-pass CPU submit, but its light-frustum cull diverges very
-    // slightly from the CPU per-submesh cull (a few marginal casters in/out), shifting some shadow
-    // edges (~8% of pixels, sub-perceptual). Default off keeps the shipped image byte-identical until
-    // the cull is made bit-exact. The lit camera path is byte-identical and always on.
-    bool gpuDrivenShadows = Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN_SHADOWS") == "1";
+    // GPU-driven shadows: DEFAULT ON (BALLISTIC_GPUDRIVEN_SHADOWS=0 to disable). One MDI per cascade
+    // after a light-space compute cull instead of re-rendering all ~1600 whole-mesh casters on the
+    // CPU when the camera moves (which spiked to ~11000 depth draws). Now byte-identical to the CPU
+    // shadow path (the bit-exact world-AABB cull + the program state-leak fix closed the earlier
+    // ~0.26% shadow-edge diff): meanError 0, 0% differing pixels across frames 0/60/120/180.
+    bool gpuDrivenShadows = Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN_SHADOWS") != "0";
     bool gpuDrivenReady;
     // Scratch reused each frame when building the whole-mesh renderer's submesh metadata.
     Matrix4[] gdModels = [];
