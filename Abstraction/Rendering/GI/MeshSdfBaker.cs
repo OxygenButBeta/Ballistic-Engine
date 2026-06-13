@@ -1,0 +1,102 @@
+using OpenTK.Mathematics;
+
+namespace BallisticEngine.GI;
+
+// Bakes a MeshSdf from triangle soup. Two correctness pillars (both prior failure modes):
+//
+//   1. DISTANCE — exact unsigned distance to the nearest triangle, accelerated by a triangle BVH
+//      so a dense grid bake is seconds, not the ~19s brute-force the old path cost.
+//   2. SIGN — robust inside/outside by RAY-STAB PARITY, voted across SIX axis rays (±X/±Y/±Z).
+//      Face-normal sign fails on merged/welded meshes whose triangle windings disagree (that was
+//      the "all-teal march" bug). Parity counting is winding-agnostic; the 6-ray majority absorbs
+//      the odd grazing/edge hit that would flip a single ray.
+public static class MeshSdfBaker {
+    // Parameters controlling a bake. Padding expands the bounds so the field has exterior cells to
+    // march through before it hits the surface; resolution is the long-axis cell count (other axes
+    // scale to keep cells ~cubic).
+    public readonly struct Settings {
+        public readonly int MaxResolution;    // cells along the longest axis
+        public readonly float PaddingFraction; // bounds expansion as a fraction of the diagonal
+        public Settings(int maxResolution = 32, float paddingFraction = 0.1f) {
+            MaxResolution = Math.Clamp(maxResolution, 4, 256);
+            PaddingFraction = Math.Clamp(paddingFraction, 0f, 1f);
+        }
+        public static Settings Default => new();
+    }
+
+    public static MeshSdf Bake(MeshData mesh, Settings settings) {
+        if (!mesh.IsValid)
+            return null;
+
+        // ---- Gather triangles (whole mesh, all submeshes share one field) ----
+        Vector3[] verts = mesh.Vertices;
+        uint[] idx = mesh.Indices;
+        int triCount = idx.Length / 3;
+        if (triCount == 0)
+            return null;
+
+        var tris = new Triangle[triCount];
+        Vector3 min = new(float.MaxValue), max = new(float.MinValue);
+        for (int t = 0; t < triCount; t++) {
+            Vector3 a = verts[idx[t * 3 + 0]];
+            Vector3 b = verts[idx[t * 3 + 1]];
+            Vector3 c = verts[idx[t * 3 + 2]];
+            tris[t] = new Triangle(a, b, c);
+            min = Vector3.ComponentMin(min, Vector3.ComponentMin(a, Vector3.ComponentMin(b, c)));
+            max = Vector3.ComponentMax(max, Vector3.ComponentMax(a, Vector3.ComponentMax(b, c)));
+        }
+
+        // ---- Padded, ~cubic-celled grid ----
+        Vector3 size = max - min;
+        float diag = size.Length;
+        Vector3 pad = new(diag * settings.PaddingFraction * 0.5f);
+        // Guard against degenerate (flat) axes so the field still has a marchable shell.
+        pad += new Vector3(
+            MathF.Max(0f, (diag * 0.02f) - size.X * 0.5f),
+            MathF.Max(0f, (diag * 0.02f) - size.Y * 0.5f),
+            MathF.Max(0f, (diag * 0.02f) - size.Z * 0.5f));
+        Vector3 bMin = min - pad;
+        Vector3 bMax = max + pad;
+        Vector3 ext = bMax - bMin;
+
+        float longest = MathF.Max(ext.X, MathF.Max(ext.Y, ext.Z));
+        float cell = longest / settings.MaxResolution;
+        var res = new Vector3i(
+            Math.Max(2, (int)MathF.Ceiling(ext.X / cell)),
+            Math.Max(2, (int)MathF.Ceiling(ext.Y / cell)),
+            Math.Max(2, (int)MathF.Ceiling(ext.Z / cell)));
+        // Recompute exact bounds so cells are exactly `cell` on each side.
+        bMax = bMin + new Vector3(res.X * cell, res.Y * cell, res.Z * cell);
+
+        var bvh = new TriangleBvh(tris);
+
+        var distances = new float[res.X * res.Y * res.Z];
+        Vector3 cellSize = (bMax - bMin) / new Vector3(res.X, res.Y, res.Z);
+
+        // Parallelize over Z slabs — each cell is independent.
+        System.Threading.Tasks.Parallel.For(0, res.Z, z => {
+            for (int y = 0; y < res.Y; y++) {
+                for (int x = 0; x < res.X; x++) {
+                    Vector3 p = bMin + new Vector3(
+                        (x + 0.5f) * cellSize.X,
+                        (y + 0.5f) * cellSize.Y,
+                        (z + 0.5f) * cellSize.Z);
+                    float unsigned = MathF.Sqrt(bvh.ClosestDistanceSq(p));
+                    bool inside = bvh.IsInside(p);
+                    distances[x + res.X * (y + res.Y * z)] = inside ? -unsigned : unsigned;
+                }
+            }
+        });
+
+        return new MeshSdf(res, bMin, bMax, distances);
+    }
+
+    // ---- Triangle ----------------------------------------------------------
+    internal readonly struct Triangle {
+        public readonly Vector3 A, B, C;
+        public Triangle(Vector3 a, Vector3 b, Vector3 c) { A = a; B = b; C = c; }
+        public Vector3 Min => Vector3.ComponentMin(A, Vector3.ComponentMin(B, C));
+        public Vector3 Max => Vector3.ComponentMax(A, Vector3.ComponentMax(B, C));
+        public Vector3 Centroid => (A + B + C) * (1f / 3f);
+    }
+}
