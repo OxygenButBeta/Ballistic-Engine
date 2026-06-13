@@ -26,14 +26,24 @@ namespace BallisticEngine.OpenGL.GI;
 // Abstraction (BallisticEngine.GI / BallisticEngine). No asset I/O here — we bake straight from the
 // retained CPU geometry (Mesh.Vertices/Indices/...), so no .bmesh artifact path is needed.
 public sealed class GLSdfGiPass : IDisposable {
-    // Bound resolution for the per-mesh SDF bake (longest-axis cell count). Small on purpose — the
-    // off-screen indirect gather is low-frequency, and a coarse field keeps both the bake time and
-    // the atlas footprint bounded. 40^3 worst case ~= 0.13 MB R16F per mesh.
-    const int BakeResolution = 40;
+    // Per-SUBMESH SDF resolution (longest-axis cell count). Each submesh gets its OWN tight field
+    // instead of one coarse whole-scene brick — the fix for both the exterior spurious-hit wash and
+    // the missing interior occlusion. 24^3 is fine enough for occlusion yet small enough (~27KB R16F)
+    // to pack hundreds into the atlas.
+    const int BakeResolution = 24;
 
-    // Hard cap on distinct meshes baked into the atlas. Overflow logs once and is skipped (those
-    // renderers simply don't contribute off-screen GI; never a crash, never silent truncation).
-    const int MaxDistinctMeshes = 64;
+    // Hard cap on distinct submesh SDFs in the atlas (Bistro has ~1600 submeshes; we can't bake all).
+    // Overflow logs once and is skipped — those submeshes contribute no off-screen GI; never a crash.
+    const int MaxDistinctMeshes = 512;
+
+    // Skip submeshes whose model-space AABB diagonal is below this (metres): tiny props/detail add
+    // negligible bounce but would burn atlas slots. Keeps the cap spent on the big occluders.
+    const float MinSubMeshSize = 0.75f;
+
+    // Max submesh SDFs to BAKE per frame. The bake is synchronous on the GL thread (the atlas upload
+    // must be), so baking all ~512 at once was a 149ms first-frame stall. Amortizing a handful per
+    // frame spreads it over a fraction of a second — the GI just fades in over the warm-up frames.
+    const int MaxBakesPerFrame = 24;
 
     // Image unit / sampler units the compute uses (match SdfTrace_Comp.glsl layout(binding=...)):
     //   image 0 = OutGi, sampler 1 = Depth, 2 = Normal, 3 = Irradiance cube, 4 = SDF atlas.
@@ -111,10 +121,11 @@ public sealed class GLSdfGiPass : IDisposable {
     // static camera while staying responsive when the view moves (disocclusion shortens it anyway).
     const float MaxHistory = 16f;
 
-    // Mesh.InstanceId -> atlas slot index. The bake/upload done-set: a mesh in this map is already
-    // packed into the atlas and never re-baked. -1 marks a mesh that failed to fit (skip silently
-    // on later frames; the overflow was already logged once).
-    readonly Dictionary<Guid, int> meshSlots = new();
+    // (Mesh.InstanceId, submeshIndex) -> atlas slot index. The bake/upload done-set: a submesh in
+    // this map is already packed into the atlas and never re-baked. -1 marks one that was skipped
+    // (too small, failed to bake, or didn't fit) — skip silently on later frames.
+    readonly record struct SubMeshKey(Guid Mesh, int SubMesh);
+    readonly Dictionary<SubMeshKey, int> meshSlots = new();
     bool overflowLogged;
 
     // Scratch instance list reused across frames (allocation-light per the GLSdfScene contract).
@@ -187,68 +198,92 @@ public sealed class GLSdfGiPass : IDisposable {
     // Bake happens on the calling (GL) thread here — TryAdd issues GL calls so the upload must be on
     // the GL thread, and the bake is bounded (BakeResolution^3, BVH-accelerated, one-time per mesh).
     // For very large meshes a future pass can move the CPU bake off-thread and only TryAdd here.
+    int bakesThisFrame;
+
     public void EnsureBaked(IReadOnlyList<IStaticMeshRenderer> opaque) {
         if (!Available || opaque == null)
             return;
 
-        // ---- Bake + pack any not-yet-seen distinct meshes ----
-        for (var i = 0; i < opaque.Count; i++) {
-            IStaticMeshRenderer r = opaque[i];
-            if (r is not { IsRenderable: true })
-                continue;
-            Mesh mesh = r.SharedMesh;
-            if (mesh == null || mesh.Vertices is not { Length: > 0 } || mesh.Indices is not { Length: > 0 })
-                continue;
+        bakesThisFrame = 0; // reset the per-frame bake budget (amortizes the first-frame stall)
 
-            Guid key = mesh.InstanceId;
-            if (meshSlots.ContainsKey(key))
-                continue; // already baked (or already marked failed with -1)
-
-            if (meshSlots.Count >= MaxDistinctMeshes) {
-                if (!overflowLogged) {
-                    Debugging.Log($"[GLSdfGiPass] distinct-mesh cap {MaxDistinctMeshes} reached; " +
-                                  "remaining meshes contribute no off-screen GI (raise the cap or " +
-                                  "use per-submesh fields).");
-                    overflowLogged = true;
-                }
-                meshSlots[key] = -1; // remember the skip so we don't re-test it every frame
-                continue;
-            }
-
-            // Wrap the retained CPU geometry as a MeshData view and bake at the bounded resolution.
-            var data = new MeshData(mesh.Vertices, mesh.Indices, mesh.UVs, mesh.Normals, mesh.Tangents);
-            MeshSdf sdf = MeshSdfBaker.Bake(data, new MeshSdfBaker.Settings(BakeResolution));
-            if (sdf == null) {
-                meshSlots[key] = -1;
-                continue;
-            }
-
-            if (atlas.TryAdd(sdf, out int slot)) {
-                meshSlots[key] = slot;
-            } else {
-                // Atlas full (or the field didn't fit) — TryAdd already logged. Mark as skipped.
-                meshSlots[key] = -1;
-            }
-        }
-
-        // ---- Rebuild the instance list from the current transforms ----
+        // ---- Bake + pack any not-yet-seen submeshes; rebuild the instance list ----
+        // PER-SUBMESH: each submesh of a renderer gets its own tight SDF brick. A whole-mesh
+        // renderer (SubMeshIndex < 0, e.g. Bistro) contributes ALL its submeshes; a per-object
+        // renderer (SubMeshIndex >= 0) contributes just that one. Vertices are MODEL space, so the
+        // field's local space == model space and the GPU instance uses the renderer's WorldMatrix.
         instances.Clear();
         for (var i = 0; i < opaque.Count; i++) {
             IStaticMeshRenderer r = opaque[i];
             if (r is not { IsRenderable: true, IsActive: true })
                 continue;
             Mesh mesh = r.SharedMesh;
-            if (mesh == null)
+            if (mesh == null || mesh.Vertices is not { Length: > 0 } || mesh.Indices is not { Length: > 0 })
                 continue;
-            if (!meshSlots.TryGetValue(mesh.InstanceId, out int slot) || slot < 0)
-                continue; // not baked or didn't fit — no off-screen GI for this renderer
             Transform t = r.Transform;
             if (t == null)
                 continue;
-            instances.Add((t.WorldMatrix, slot));
+            Matrix4 world = t.WorldMatrix;
+
+            int subCount = mesh.SubMeshes?.Length ?? 0;
+            if (subCount == 0)
+                continue;
+
+            // Which submeshes does this renderer draw? -1 = all; >=0 = just that one.
+            int from = r.SubMeshIndex >= 0 ? r.SubMeshIndex : 0;
+            int to = r.SubMeshIndex >= 0 ? r.SubMeshIndex + 1 : subCount;
+            if (from < 0 || to > subCount)
+                continue;
+
+            for (int s = from; s < to; s++) {
+                int slot = SlotForSubMesh(mesh, s);
+                if (slot < 0)
+                    continue; // skipped (too small / cap / failed) — no GI from this submesh
+                instances.Add((world, slot));
+            }
         }
 
         scene.Build(instances, atlasAdapter);
+    }
+
+    // Returns the atlas slot for one submesh, baking + packing it on first sight (keyed by
+    // (mesh, submesh)). -1 = permanently skipped (too small, over the cap, or didn't fit).
+    int SlotForSubMesh(Mesh mesh, int s) {
+        var key = new SubMeshKey(mesh.InstanceId, s);
+        if (meshSlots.TryGetValue(key, out int existing))
+            return existing;
+
+        SubMeshData sm = mesh.SubMeshes[s];
+        if (sm.IndexCount < 3) { meshSlots[key] = -1; return -1; }
+
+        // Skip negligible submeshes so the atlas budget goes to real occluders.
+        mesh.GetSubMeshBounds(s, out Vector3 lo, out Vector3 hi);
+        if ((hi - lo).Length < MinSubMeshSize) { meshSlots[key] = -1; return -1; }
+
+        if (meshSlots.Count >= MaxDistinctMeshes) {
+            if (!overflowLogged) {
+                Debugging.Log($"[GLSdfGiPass] submesh-SDF cap {MaxDistinctMeshes} reached; remaining " +
+                              "submeshes contribute no off-screen GI (raise the cap or merge fields).");
+                overflowLogged = true;
+            }
+            meshSlots[key] = -1;
+            return -1;
+        }
+
+        // Out of per-frame bake budget: DON'T record a slot — return -1 for this frame only so the
+        // submesh is retried next frame. The GI fades in over a few warm-up frames instead of one
+        // big stall.
+        if (bakesThisFrame >= MaxBakesPerFrame)
+            return -1;
+        bakesThisFrame++;
+
+        MeshSdf sdf = MeshSdfBaker.BakeSubMesh(mesh.Vertices, mesh.Indices,
+            sm.IndexStart, sm.IndexCount, new MeshSdfBaker.Settings(BakeResolution));
+        if (sdf == null || !atlas.TryAdd(sdf, out int slot)) {
+            meshSlots[key] = -1; // bake failed or atlas full (TryAdd logged)
+            return -1;
+        }
+        meshSlots[key] = slot;
+        return slot;
     }
 
     // Runs the SDF-GI as a POST pass (mirroring GLSSGIPass): dispatch the half-res compute gather,

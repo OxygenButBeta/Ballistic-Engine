@@ -27,20 +27,38 @@ public static class MeshSdfBaker {
     public static MeshSdf Bake(MeshData mesh, Settings settings) {
         if (!mesh.IsValid)
             return null;
+        return BakeRange(mesh.Vertices, mesh.Indices, 0, mesh.Indices.Length, settings);
+    }
 
-        // ---- Gather triangles (whole mesh, all submeshes share one field) ----
-        Vector3[] verts = mesh.Vertices;
-        uint[] idx = mesh.Indices;
-        int triCount = idx.Length / 3;
+    // Bakes an SDF for ONE submesh: the triangles in the index range [indexStart, indexStart+
+    // indexCount) over the shared vertex array. Vertices are in MODEL space (the same space the
+    // renderer's WorldMatrix maps from), so the resulting field's mesh-local space == model space,
+    // and a GPU instance uses the renderer's plain world matrix as model->world. A tight per-submesh
+    // bounds means each object gets a FINE field instead of one coarse whole-scene brick — the fix
+    // for both the exterior spurious-hit wash and the missing interior occlusion.
+    public static MeshSdf BakeSubMesh(Vector3[] verts, uint[] idx, int indexStart, int indexCount,
+        Settings settings) {
+        if (verts == null || idx == null || indexCount < 3)
+            return null;
+        return BakeRange(verts, idx, indexStart, indexCount, settings);
+    }
+
+    static MeshSdf BakeRange(Vector3[] verts, uint[] idx, int indexStart, int indexCount,
+        Settings settings) {
+        int end = indexStart + indexCount;
+        if (verts == null || idx == null || indexStart < 0 || end > idx.Length)
+            return null;
+        int triCount = indexCount / 3;
         if (triCount == 0)
             return null;
 
         var tris = new Triangle[triCount];
         Vector3 min = new(float.MaxValue), max = new(float.MinValue);
         for (int t = 0; t < triCount; t++) {
-            Vector3 a = verts[idx[t * 3 + 0]];
-            Vector3 b = verts[idx[t * 3 + 1]];
-            Vector3 c = verts[idx[t * 3 + 2]];
+            int b0 = indexStart + t * 3;
+            Vector3 a = verts[idx[b0 + 0]];
+            Vector3 b = verts[idx[b0 + 1]];
+            Vector3 c = verts[idx[b0 + 2]];
             tris[t] = new Triangle(a, b, c);
             min = Vector3.ComponentMin(min, Vector3.ComponentMin(a, Vector3.ComponentMin(b, c)));
             max = Vector3.ComponentMax(max, Vector3.ComponentMax(a, Vector3.ComponentMax(b, c)));
