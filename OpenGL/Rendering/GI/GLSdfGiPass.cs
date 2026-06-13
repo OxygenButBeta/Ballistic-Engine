@@ -113,6 +113,11 @@ public sealed class GLSdfGiPass : IDisposable {
     // raw gather as currentGI and outputs accumulated GI (rgb) + history length (a) via MRT, plus
     // the current view-depth for next frame's disocclusion test.
     readonly StandardShader temporalShader;
+    // Edge-aware a-trous spatial denoise (SSGI_Denoise.glsl, reused): smooths the within-frame
+    // grazing-surface speckle the temporal pass can't resolve (a fixed per-pixel screen-space-read
+    // accept/reject pattern), with depth/normal edge-stops so it doesn't bleed across corners.
+    readonly StandardShader denoiseShader;
+    readonly GLRenderTexture[] denoisePingPong = { new(), new() };
     readonly GLRenderTexture[] historyGi = { new(), new() };     // ping-pong accumulated GI
     readonly GLRenderTexture[] historyDepth = { new(), new() };  // ping-pong view-space depth
     int historyWrite;            // which of the two buffers to write this frame
@@ -171,6 +176,10 @@ public sealed class GLSdfGiPass : IDisposable {
         temporalShader = GraphicAPI.CreateStandardShader(
             EmbeddedShaderSource.Read("FSQ_Vert.glsl"),
             EmbeddedShaderSource.Read("SSGI_Temporal.glsl"));
+        // Reuse the SSGI a-trous spatial denoise (kills the residual grazing-surface speckle).
+        denoiseShader = GraphicAPI.CreateStandardShader(
+            EmbeddedShaderSource.Read("FSQ_Vert.glsl"),
+            EmbeddedShaderSource.Read("SSGI_Denoise.glsl"));
 
         CacheUniformLocations();
         Available = true;
@@ -451,6 +460,29 @@ public sealed class GLSdfGiPass : IDisposable {
             historyWrite = writeSlot;
             hasHistory = true;
             prevViewProjection = viewProjNoJitter;
+
+            // ---- 2b. Edge-aware a-trous spatial denoise (2 iterations, widening tap spacing) ----
+            // Smooths the residual grazing-surface speckle while depth/normal edge-stops keep the
+            // box/wall corners crisp. Ping-pong the half-res GI through the SSGI denoiser.
+            denoisePingPong[0].Ensure(halfW, halfH);
+            denoisePingPong[1].Ensure(halfW, halfH);
+            Matrix4 invProjNoJitterCopy = invProjNoJitter;
+            GLRenderTexture src = giWriteTex;
+            for (var iter = 0; iter < 2; iter++) {
+                GLRenderTexture dst = denoisePingPong[iter & 1];
+                dst.BindAsTarget();
+                denoiseShader.Activate();
+                BindCombineSampler(0, src.Texture, "giTexture");
+                BindCombineSampler(1, depthTex, "depthTexture");
+                BindCombineSampler(2, normalTex, "normalTexture");
+                denoiseShader.SetMatrix4("InvProjection", ref invProjNoJitterCopy);
+                denoiseShader.SetFloat("StepSize", (float)(1 << iter)); // 1, then 2 texel spacing
+                denoiseShader.SetFloat("DepthSigma", 0.1f);
+                denoiseShader.SetFloat("NormalSigma", 32f);
+                GLBufferUtilities.DrawFullscreenQuad();
+                src = dst;
+            }
+            giForComposite = src.Texture;
         }
 
         // ---- 3. Full-res depth-aware upsample + additive composite onto the lit colour ----
@@ -519,6 +551,7 @@ public sealed class GLSdfGiPass : IDisposable {
         output.Dispose();
         foreach (GLRenderTexture t in historyGi) t.Dispose();
         foreach (GLRenderTexture t in historyDepth) t.Dispose();
+        foreach (GLRenderTexture t in denoisePingPong) t.Dispose();
         if (temporalFbo != 0) { GL.DeleteFramebuffer(temporalFbo); temporalFbo = 0; }
         meshSlots.Clear();
         Available = false;

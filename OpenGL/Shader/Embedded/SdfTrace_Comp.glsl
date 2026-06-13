@@ -131,7 +131,9 @@ uniform int  DiagMode;
 // ---------------------------------------------------------------------------------------
 // March tuning. World-space metres.
 // ---------------------------------------------------------------------------------------
-const int   RAY_COUNT   = 4;      // cosine-hemisphere rays per pixel
+const int   RAY_COUNT   = 6;      // cosine-hemisphere rays per pixel (the a-trous denoise + temporal
+                                  // handle the rest; 6 keeps cost down. Residual grazing-wall speckle
+                                  // is a screen-space-read VALIDITY issue, not variance — separate fix.)
 const int   MAX_STEPS   = 48;     // sphere-trace steps per ray (raised: empty space marches coarsely)
 const float MAX_DIST    = 30.0;   // max world march distance (metres)
 const float HIT_EPS     = 0.02;   // |dist| below this = surface hit (metres)
