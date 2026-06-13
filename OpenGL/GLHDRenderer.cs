@@ -3560,9 +3560,11 @@ void main() {
         // Intensity: env override wins (live tuning), else the VoxelGlobalIllumination volume value.
         shader.SetFloat("VoxelGiIntensity", EnvVoxelIntensity ?? PostFX.VoxelGiIntensity);
         // Debug view: show ONLY the bounce (brightened) so you can see what the GI contributes.
-        shader.SetBool("VoxelGiDebug", PostFX.VoxelGiDebugView);
+        // The env override lets a headless capture force the GI-only view without a volume edit.
+        shader.SetBool("VoxelGiDebug", EnvVoxelDebugView ?? PostFX.VoxelGiDebugView);
     }
 
+    static readonly bool? EnvVoxelDebugView = EnvToggle("BALLISTIC_VOXELGI_DEBUGVIEW");
     static readonly float? EnvVoxelIntensity = EnvFloat("BALLISTIC_VOXELGI_INTENSITY");
     static readonly int? EnvVoxelBounces =
         int.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_VOXELGI_BOUNCES"), out int evb) ? evb : null;
