@@ -388,7 +388,7 @@ internal static class CurveEditorWindow {
         if (DragWithUndo("Time##k", ref time, 0.01f)) { selectedKey = target.MoveKey(selectedKey, time, value); Changed(); }
         k = target.Keys[selectedKey]; value = k.Value;
         ImGui.SetNextItemWidth(-1);
-        if (DragWithUndo("Value##k", ref value, 0.01f)) { target.MoveKey(selectedKey, target.Keys[selectedKey].Time, value); Changed(); }
+        if (DragWithUndo("Value##k", ref value, 0.01f)) { selectedKey = target.MoveKey(selectedKey, target.Keys[selectedKey].Time, value); Changed(); }
 
         ImGui.Dummy(new SysVec2(0, 4));
         ImGui.TextDisabled("Tangents");

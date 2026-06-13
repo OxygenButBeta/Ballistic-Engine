@@ -246,7 +246,9 @@ internal sealed class BuildPanel {
         ImGui.EndChild();
 
         if (remove >= 0) scenes.RemoveAt(remove);
-        if (moveFrom >= 0 && moveTo >= 0 && moveTo < scenes.Count)
+        // Guard BOTH indices against the (possibly just-shrunk) list — a remove in the same pass can
+        // leave moveFrom dangling past the end.
+        if (moveFrom >= 0 && moveTo >= 0 && moveFrom < scenes.Count && moveTo < scenes.Count)
             (scenes[moveFrom], scenes[moveTo]) = (scenes[moveTo], scenes[moveFrom]);
 
         if (ImGui.Button($"{EditorIcons.Add}  Add Open Scene")) AddOpenScene();
