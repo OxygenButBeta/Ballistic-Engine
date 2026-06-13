@@ -706,7 +706,7 @@ internal sealed class EditorApplication {
 
         if (ImGui.BeginMenu("File")) {
             if (ImGui.MenuItem($"{EditorIcons.Add}  New Scene", "Ctrl+N")) GuardUnsaved(SceneCommands.New);
-            if (ImGui.MenuItem($"{EditorIcons.Save}  Save", "Ctrl+S")) SaveScene();
+            if (ImGui.MenuItem($"{EditorIcons.Save}  Save", "Ctrl+S", false, !SceneManager.IsPlaying)) SaveScene();
             ImGui.Separator();
             if (ImGui.MenuItem($"{EditorIcons.Refresh}  Rebuild Scripts", "Ctrl+R")) RebuildScripts();
             ImGui.Separator();
@@ -1000,8 +1000,13 @@ internal sealed class EditorApplication {
         ToggleIconButton("alwaysrefresh", EditorIcons.Refresh, ref alwaysRefresh,
             "Always refresh the viewport (off = re-render only on change)");
         ImGui.SameLine(0, 2);
-        if (EditorIcons.GhostButton("save", EditorIcons.Save, "Save scene (Ctrl+S)"))
+        // Save is disabled in play mode — the live scene is play-mutated and would clobber the edit
+        // scene on disk (SceneCommands.Save also guards this).
+        ImGui.BeginDisabled(SceneManager.IsPlaying);
+        if (EditorIcons.GhostButton("save", EditorIcons.Save,
+                SceneManager.IsPlaying ? "Stop play to save" : "Save scene (Ctrl+S)"))
             SaveScene();
+        ImGui.EndDisabled();
     }
 
     // FPS readout doubling as the frame-rate limiter: click to pick a preset (same options as
