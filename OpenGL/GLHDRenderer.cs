@@ -2348,19 +2348,14 @@ public class GLHDRenderer : HDRenderer {
     // scene has no bakeable geometry yet. The volume is a plain object (never serialized) so this is
     // pure runtime state — the cache key still derives from its bounds + the scene name, so a baked
     // default survives reloads exactly like a placed one.
-    IrradianceVolume EnsureDefaultProbeVolume() {
-        // Throttle: scanning every renderer's bounds each frame is wasteful for a static scene that
-        // already has a fitted default. Once we have one, only re-scan periodically (a moved scene
-        // refits within ~half a second); always scan while we don't have a default yet.
-        if (defaultProbeVolume is not null && defaultProbeRefitCountdown-- > 0)
-            return defaultProbeVolume;
-        defaultProbeRefitCountdown = 30;
-
-        // Compute the scene's bakeable AABB from renderable world bounds. To stay robust against a
-        // huge ground/terrain plane (which would balloon the grid and starve interiors of probes —
-        // the known FitToScene failure), track BOTH the full union and a "core" union that ignores
-        // any single renderer spanning more than ~4x the running median diagonal. The core bounds
-        // drive the fit; the full bounds only extend the floor down so the ground is still covered.
+    // Computes the scene's bakeable AABB for an auto-fitted GI volume. To stay robust against a huge
+    // ground/terrain plane (which would balloon the grid and starve interiors of probes — the known
+    // FitToScene failure), it tracks BOTH the full union and a "core" union that ignores any single
+    // renderer spanning more than ~4x the running median diagonal. The core bounds drive the fit; the
+    // full bounds only extend the floor down so the ground stays covered. Returns false when there's
+    // no bakeable geometry. Shared by the implicit probe + reflection default volumes.
+    static bool ComputeSceneFitBounds(out Vector3 center, out Vector3 size) {
+        center = default; size = default;
         Vector3 lo = new(float.MaxValue), hi = new(float.MinValue);
         Vector3 coreLo = new(float.MaxValue), coreHi = new(float.MinValue);
         float diagSum = 0f; int diagCount = 0; bool any = false;
@@ -2383,8 +2378,6 @@ public class GLHDRenderer : HDRenderer {
             lo = Vector3.ComponentMin(lo, wMin);
             hi = Vector3.ComponentMax(hi, wMax);
 
-            // Outlier (ground/terrain) rejection for the CORE fit: a renderer whose diagonal dwarfs
-            // the median is a giant plane — keep it out of the core bounds so it can't blow up the grid.
             float diag = (wMax - wMin).Length;
             float median = diagCount > 0 ? diagSum / diagCount : diag;
             if (diagCount < 3 || diag <= median * 4f) {
@@ -2395,18 +2388,29 @@ public class GLHDRenderer : HDRenderer {
             any = true;
         }
 
-        if (!any) {
+        if (!any)
+            return false;
+        if (coreLo.X > coreHi.X) { coreLo = lo; coreHi = hi; } // every renderer was an "outlier"
+
+        coreLo.Y = MathF.Min(coreLo.Y, lo.Y); // keep the ground floor inside the volume
+        const float pad = 2f;
+        center = (coreLo + coreHi) * 0.5f;
+        size = Vector3.ComponentMax(coreHi - coreLo + new Vector3(pad * 2f), Vector3.One * 4f);
+        return true;
+    }
+
+    IrradianceVolume EnsureDefaultProbeVolume() {
+        // Throttle: scanning every renderer's bounds each frame is wasteful for a static scene that
+        // already has a fitted default. Once we have one, only re-scan periodically (a moved scene
+        // refits within ~half a second); always scan while we don't have a default yet.
+        if (defaultProbeVolume is not null && defaultProbeRefitCountdown-- > 0)
+            return defaultProbeVolume;
+        defaultProbeRefitCountdown = 30;
+
+        if (!ComputeSceneFitBounds(out Vector3 center, out Vector3 size)) {
             defaultProbeFitTried = true;
             return null;
         }
-        if (coreLo.X > coreHi.X) { coreLo = lo; coreHi = hi; } // every renderer was an "outlier"
-
-        // Fit the grid to the CORE bounds (the buildings/props), but pull the floor down to the full
-        // bounds' floor so a ground plane is still inside the volume (probes just above it capture).
-        coreLo.Y = MathF.Min(coreLo.Y, lo.Y);
-        const float pad = 2f;
-        Vector3 center = (coreLo + coreHi) * 0.5f;
-        Vector3 size = Vector3.ComponentMax(coreHi - coreLo + new Vector3(pad * 2f), Vector3.One * 4f);
 
         // Probe density: ~1 probe per ~6 m horizontally, ~1 per ~4 m vertically, clamped to sane
         // counts. Enough that a room gets several cells (the interior-coverage fix) without a huge bake.
@@ -2431,6 +2435,36 @@ public class GLHDRenderer : HDRenderer {
             defaultProbeFitTried = true;
         }
         return defaultProbeVolume;
+    }
+
+    // Specular sibling of EnsureDefaultProbeVolume: the implicit auto-fit reflection grid used when no
+    // ReflectionVolume is placed. Same fit bounds, but a COARSER density (reflection cells are far
+    // heavier — a full cube capture + GGX prefilter each, ~1 MB VRAM per cell).
+    ReflectionVolume EnsureDefaultReflectionVolume() {
+        if (defaultReflectionVolume is not null && defaultReflectionRefitCountdown-- > 0)
+            return defaultReflectionVolume;
+        defaultReflectionRefitCountdown = 30;
+
+        if (!ComputeSceneFitBounds(out Vector3 center, out Vector3 size))
+            return null;
+
+        // ~1 cell per ~12 m horizontally, ~9 m vertically — coarse on purpose (heavy cells + VRAM).
+        int px = Math.Clamp((int)MathF.Round(size.X / 12f) + 1, 3, 10);
+        int py = Math.Clamp((int)MathF.Round(size.Y / 9f) + 1, 2, 5);
+        int pz = Math.Clamp((int)MathF.Round(size.Z / 12f) + 1, 3, 10);
+
+        int stamp = HashCode.Combine(
+            (int)center.X, (int)center.Y, (int)center.Z,
+            (int)size.X, (int)size.Y, (int)size.Z, px * 100 + py * 10 + pz);
+
+        if (defaultReflectionVolume is null || stamp != defaultReflectionStamp) {
+            defaultReflectionVolume = new ReflectionVolume {
+                Center = center, Size = size, ProbesX = px, ProbesY = py, ProbesZ = pz,
+                Bake = true,
+            };
+            defaultReflectionStamp = stamp;
+        }
+        return defaultReflectionVolume;
     }
 
     void BeginProbeBake(IrradianceVolume vol) {
@@ -2654,6 +2688,8 @@ public class GLHDRenderer : HDRenderer {
         public Vector3 Min, Size;
         public bool[] Occupied;
         public int[] CellToLayer;   // per cell: layer index, or -1 (empty / capped -> skybox)
+        public int[] Order;         // cell indices sorted CAMERA-OUTWARD (nearest first) — Cursor
+                                    // walks this so visible cells capture before far ones
         public int OccupiedCount, LayerCount;
         public IStaticMeshRenderer[] Renderers;
         public Vector3[] AabbMin, AabbMax;
@@ -2668,11 +2704,27 @@ public class GLHDRenderer : HDRenderer {
 
     ReflectionBakeJob reflectionBake;
 
+    // IMPLICIT DEFAULT reflection grid — the specular sibling of defaultProbeVolume. Same rules:
+    // synthesized + auto-fit when no ReflectionVolume is placed, never in the Hierarchy / serialized,
+    // overridden by a real placed volume. Coarser density than the diffuse probes (reflection cells
+    // are far heavier — a full cube capture + GGX prefilter each).
+    ReflectionVolume defaultReflectionVolume;
+    int defaultReflectionStamp;
+    int defaultReflectionRefitCountdown;
+
     static string ReflectionCacheKey(ReflectionVolume vol) =>
         vol.DeriveCacheKey(SceneManager.GetCurrentScene()?.Name);
 
     void StepReflectionBake(float preExposure) {
         ReflectionVolume vol = ReflectionVolume.Active is { IsActive: true } active ? active : null;
+
+        // A real placed volume wins; otherwise fall back to the IMPLICIT DEFAULT grid (auto-fit to
+        // the scene, zero setup). Dropped the moment a real volume appears.
+        if (vol is not null) {
+            defaultReflectionVolume = null;
+        } else {
+            vol = EnsureDefaultReflectionVolume();
+        }
 
         // Volume removed/disabled mid-bake: abort cleanly.
         if (reflectionBake is not null && !ReferenceEquals(reflectionBake.Volume, vol)) {
@@ -2749,7 +2801,8 @@ public class GLHDRenderer : HDRenderer {
 
         var slice = System.Diagnostics.Stopwatch.StartNew();
         while (job.Cursor < job.Total && slice.Elapsed.TotalMilliseconds < ReflectionBakeBudgetMs) {
-            var idx = job.Cursor;
+            // Walk the camera-outward order so cells near the render position capture first.
+            var idx = job.Order[job.Cursor];
             var layer = job.CellToLayer[idx];
 
             // Empty-air or capped cell: nothing to capture (the shader falls back to the skybox).
@@ -2856,11 +2909,33 @@ public class GLHDRenderer : HDRenderer {
                 job.Occupied[(z * job.Py + y) * job.Px + x] = true;
         }
 
-        // Assign a compact layer to each occupied cell until the cap; the rest get -1 (skybox).
+        // CAMERA-OUTWARD order: sort cell indices by distance of their centre from the render
+        // position (nearest first). The bake walks this, AND the layer cap is spent NEAREST-FIRST —
+        // so when occupied cells exceed MaxReflectionProbes, the camera's surroundings get real local
+        // cubemaps and only the far corners fall back to the skybox.
+        job.Order = new int[job.Total];
+        var orderDist = new float[job.Total];
+        for (var i = 0; i < job.Total; i++) {
+            job.Order[i] = i;
+            var ix = i % job.Px;
+            var iy = i / job.Px % job.Py;
+            var iz = i / (job.Px * job.Py);
+            var cellPos = job.Min + new Vector3(
+                (ix + 0.5f) / job.Px * job.Size.X,
+                (iy + 0.5f) / job.Py * job.Size.Y,
+                (iz + 0.5f) / job.Pz * job.Size.Z);
+            orderDist[i] = (cellPos - lastCameraPos).LengthSquared;
+        }
+        Array.Sort(orderDist, job.Order);
+
+        // Assign a compact layer to each occupied cell until the cap, NEAREST-FIRST (walk Order); the
+        // rest get -1 (skybox). Layer indices are independent of cell index, so this is purely about
+        // which cells win the cap.
         job.CellToLayer = new int[job.Total];
         var nextLayer = 0;
         var cappedCells = 0;
-        for (var i = 0; i < job.Total; i++) {
+        for (var o = 0; o < job.Total; o++) {
+            var i = job.Order[o];
             if (!job.Occupied[i]) {
                 job.CellToLayer[i] = -1;
             }
