@@ -143,6 +143,9 @@ const float NORMAL_EPS  = 0.05;   // finite-difference step for the SDF gradient
 const float SELF_SKIP   = 0.20;   // push the ray origin this far off the surface + ignore hits
                                   // closer than this — clears the surface's OWN coarse SDF shell so
                                   // a ray can't self-hit (the grazing-wall salt-and-pepper).
+const float MIN_ELEVATION = 0.30; // minimum sin-of-elevation off the surface for a gather ray: rays
+                                  // skimming nearly tangent sphere-trace along the surface's thin SDF
+                                  // shell and randomly self-hit (the ~50%-noisy grazing hit fraction).
 const float PI = 3.14159265359;
 
 // MUST be a true component SELECT, never arithmetic on the bad value: mix(v, 0, flag) expands
@@ -325,15 +328,23 @@ vec3 HitRadiance(vec3 worldHit, vec3 hitN) {
         vec3 ndc = clip.xyz / clip.w;
         vec2 suv = ndc.xy * 0.5 + 0.5;
         if (all(greaterThanEqual(suv, vec2(0.0))) && all(lessThanEqual(suv, vec2(1.0)))) {
-            // Depth-validate: the hit's view-Z vs the scene depth's view-Z at that pixel. Reconstruct
-            // both in view space and compare with a depth-relative tolerance (silhouette/occlusion
-            // reject — accepting a mismatch would smear a foreground surface's colour onto the hit).
+            // Occlusion-validate (ONE-SIDED). View-Z is negative looking down -Z, so a SMALLER
+            // |view-Z| (value closer to 0) is NEARER the camera. We accept the screen read unless a
+            // CLOSER occluder sits in front of the hit — i.e. reject only when the scene surface is
+            // meaningfully nearer than the hit (sceneViewZ - hitViewZ beyond a margin). A symmetric
+            // |diff| < tol test was the speckle cause: on a GRAZING wall, depth changes fast per
+            // pixel, so the hit's reprojected sub-pixel sampled a neighbour depth that differed by
+            // more than tol -> reject -> 0, while the adjacent pixel accepted -> salt-and-pepper.
+            // The one-sided test tolerates the grazing depth gradient (the hit is the visible wall
+            // or just behind it, never in front) and only rejects a genuine foreground occluder.
             float sceneDepth = texture(DepthTex, suv).r;
-            float hitViewZ   = ViewPosFromDepth(suv, ndc.z * 0.5 + 0.5).z; // hit's reconstructed view-Z
-            float sceneViewZ = ViewPosFromDepth(suv, sceneDepth).z;        // what's actually shown there
-            float tol = max(0.05 * abs(sceneViewZ), 0.1);           // 5% of depth, min 10cm
-            if (abs(hitViewZ - sceneViewZ) < tol) {
-                // VISIBLE hit -> read its real lit radiance from the screen (the surface cache).
+            float hitViewZ   = ViewPosFromDepth(suv, ndc.z * 0.5 + 0.5).z; // hit's reconstructed view-Z (<0)
+            float sceneViewZ = ViewPosFromDepth(suv, sceneDepth).z;        // what's shown there (<0)
+            float occluderMargin = max(0.15 * abs(sceneViewZ), 0.25);      // 15% of depth, min 25cm
+            // sceneViewZ > hitViewZ + margin  =>  scene surface is NEARER (closer to 0) than the hit
+            // by more than the margin  =>  a real occluder is in front  =>  reject.
+            if (sceneViewZ <= hitViewZ + occluderMargin) {
+                // No closer occluder -> the hit is visible on screen. Read its real lit radiance.
                 return Sanitize(textureLod(SceneColor, suv, 0.0).rgb);
             }
         }
@@ -388,8 +399,17 @@ void main() {
             Hash(vec2(px) + vec2(float(r) * 1.7, float(FrameIndex) * 1.618)),
             Hash(vec2(px) * 1.31 + vec2(float(r) * 2.3 + float(FrameIndex) * 0.911, 7.0)));
         float phi = 2.0 * PI * h.x;
-        float cosT = sqrt(1.0 - h.y);   // cosine-weighted: cosT = sqrt(1-xi)
-        float sinT = sqrt(h.y);
+        // Cosine-weighted hemisphere, but with a MINIMUM elevation off the surface: a ray that skims
+        // nearly tangent to the surface sphere-traces along its own (and the adjacent perpendicular
+        // wall's) thin SDF shell and randomly self-hits/misses — the ~50%-noisy hit fraction on the
+        // grazing floor/walls/ceiling (proven via the DIAG view). Clamping cosT to >= MIN_ELEVATION
+        // lifts those near-horizon rays out of the shell-skim, killing the speckle at its source.
+        // cosT = sqrt(1-h.y) is cosine-weighted (h.y=0 -> straight up, h.y=1 -> horizon). To keep
+        // cosT >= MIN_ELEVATION we need h.y <= 1 - MIN_ELEVATION^2, so remap h.y into that range.
+        float hyMax = 1.0 - MIN_ELEVATION * MIN_ELEVATION;
+        float hy = h.y * hyMax;
+        float cosT = sqrt(1.0 - hy);    // >= MIN_ELEVATION by construction
+        float sinT = sqrt(hy);
         vec3 localDir = vec3(cos(phi) * sinT, sin(phi) * sinT, cosT);
         vec3 dir = normalize(T * localDir.x + B * localDir.y + worldN * localDir.z);
 
