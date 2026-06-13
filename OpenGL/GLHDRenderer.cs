@@ -92,8 +92,12 @@ public class GLHDRenderer : HDRenderer {
     // cone trace adds 0 (== baseline ambient). Needs the GPU-driven path (shares its MDI draw).
     readonly OpenGL.VoxelGI.GLVoxelGI voxelGI = new(
         int.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_VOXELGI_RES"), out int vr) ? vr : 192);
+    // Init gate: env BALLISTIC_VOXELGI=0 disables the whole GI subsystem (skips GPU init). Otherwise
+    // it's available and the VoxelGlobalIllumination volume's `enabled` toggle controls it per-frame.
     bool voxelGiEnabled = Environment.GetEnvironmentVariable("BALLISTIC_VOXELGI") != "0";
     bool voxelGiReady;
+    // Active this frame = GPU init ok AND the volume toggle is on (env force-off still wins via init).
+    bool VoxelGiActive => voxelGiReady && PostFX.VoxelGiEnabled;
     // Scratch reused each frame when building the whole-mesh renderer's submesh metadata.
     Matrix4[] gdModels = [];
     Vector3[] gdLocalMin = [], gdLocalMax = [];
@@ -659,7 +663,7 @@ void main() {
         // Voxel GI: (re)voxelize the scene's direct-lit radiance after shadows are ready, so the
         // forward pass can cone-trace it for colored multi-bounce indirect. Static scene => the
         // geometry stamp gates the rebuild; the sun stamp triggers a re-voxelize when light moves.
-        if (voxelGiReady)
+        if (VoxelGiActive)
             using (timers.Time("VoxelGI"))
                 RenderVoxelGI(ref view);
 
@@ -2084,7 +2088,7 @@ void main() {
         // viewer so 128^3 gives ~0.47 m voxels — fine enough to capture architecture. The whole-
         // scene AABB (often 300 m) would make voxels 2 m+ and the GI useless. Snap the center to a
         // voxel so the grid doesn't shimmer as the camera moves.
-        const float HALF = 30f; // 60 m cube
+        float HALF = MathF.Max(PostFX.VoxelGiVolumeSize, 10f) * 0.5f; // volume-driven grid size
         Vector3 camPos = Vector3.Zero;
         if (Matrix4.Invert(view) is { } invView)
             camPos = invView.Row3.Xyz;
@@ -2113,6 +2117,9 @@ void main() {
             Matrix4.Identity, Matrix4.Identity, 1f, 0f, 0, 0, 0, 0, hizEnabled: false);
         gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchCutout, voxelAllPassPlanes, 0, 1,
             Matrix4.Identity, Matrix4.Identity, 1f, 0f, 0, 0, 0, 0, hizEnabled: false);
+
+        // Bounce-pass count from the volume (env override wins for live tuning).
+        voxelGI.BouncePasses = EnvVoxelBounces ?? PostFX.VoxelGiBounces;
 
         // Sun "toward" vector + pre-exposed colors (the voxelize frag does NdotL*shadow + sky).
         Vector3 sunTo = -sunDirection;
@@ -3541,7 +3548,7 @@ void main() {
     // Per-frame voxel GI uniforms + texture bind. Called from SetPassTextures so every lit program
     // sees the current voxel grid. When voxel GI is off, UseVoxelGI=false leaves the shader unchanged.
     void SetVoxelGiUniforms(Shader shader) {
-        bool on = voxelGiReady;
+        bool on = VoxelGiActive;
         shader.SetBool("UseVoxelGI", on);
         if (!on)
             return;
@@ -3550,15 +3557,19 @@ void main() {
         shader.SetFloat3("VoxelVolumeInvSize",
             new Vector3(1f / MathF.Max(size.X, 1e-3f), 1f / MathF.Max(size.Y, 1e-3f), 1f / MathF.Max(size.Z, 1e-3f)));
         shader.SetFloat("VoxelWorldSize", voxelGI.VoxelWorldSize);
-        shader.SetFloat("VoxelGiIntensity", voxelGiIntensity);
+        // Intensity: env override wins (live tuning), else the VoxelGlobalIllumination volume value.
+        shader.SetFloat("VoxelGiIntensity", EnvVoxelIntensity ?? PostFX.VoxelGiIntensity);
+        // Debug view: show ONLY the bounce (brightened) so you can see what the GI contributes.
+        shader.SetBool("VoxelGiDebug", PostFX.VoxelGiDebugView);
     }
 
-    float voxelGiIntensity = float.TryParse(
-        Environment.GetEnvironmentVariable("BALLISTIC_VOXELGI_INTENSITY"), out float vi) ? vi : 2.0f;
+    static readonly float? EnvVoxelIntensity = EnvFloat("BALLISTIC_VOXELGI_INTENSITY");
+    static readonly int? EnvVoxelBounces =
+        int.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_VOXELGI_BOUNCES"), out int evb) ? evb : null;
 
     // The pass-global texture binds (the units SetSamplerUniforms assigned). Once per pass.
     void SetPassTextures() {
-        if (voxelGiReady) {
+        if (VoxelGiActive) {
             GL.ActiveTexture(TextureUnit.Texture22);
             GL.BindTexture(TextureTarget.Texture3D, voxelGI.RadianceTexture);
         }

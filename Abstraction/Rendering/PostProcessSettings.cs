@@ -122,6 +122,15 @@ public sealed class PostProcessSettings {
     public float SsgiBounceBoost { get; set; }                        // retired (kept 0; IBL carries richness)
     public float SsgiAmbientFloor { get; set; }                       // retired (kept 0; physical IBL is the base)
 
+    // Voxel Cone Tracing GI (UE5/Lumen-class colored multi-bounce indirect). Default-on; tuned via
+    // the VoxelGlobalIllumination volume component (or the BALLISTIC_VOXELGI* env overrides).
+    public bool VoxelGiEnabled { get; set; } = true;
+    public float VoxelGiIntensity { get; set; } = 2.0f;
+    public int VoxelGiBounces { get; set; } = 2;
+    public int VoxelGiResolution { get; set; } = 192;
+    public float VoxelGiVolumeSize { get; set; } = 60f;
+    public bool VoxelGiDebugView { get; set; }
+
     // Volumetric height fog + sun scattering (god-rays): physical exponential height fog
     // marched against the directional shadow map. In-scatters the atmosphere-attenuated sun
     // and the baked sky's average radiance (skylight); its transmittance EXTINGUISHES the

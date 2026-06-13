@@ -39,6 +39,7 @@ uniform vec3  VoxelVolumeInvSize;     // 1 / world size
 uniform float VoxelWorldSize;         // metres per voxel
 uniform float VoxelGiIntensity;       // master strength of the cone-traced indirect
 uniform bool  UseVoxelGI;             // gate: false -> shader is unchanged (default look preserved)
+uniform bool  VoxelGiDebug;           // show ONLY the GI bounce (brightened) for debugging
 
 vec3 vctWorldToUVW(vec3 wp) { return (wp - VoxelVolumeMin) * VoxelVolumeInvSize; }
 
@@ -673,6 +674,12 @@ void main()
         // grid covers this point. Off (UseVoxelGI=false) -> the lines above stand unchanged.
         if (UseVoxelGI) {
             vec3 giDiffuse = vctDiffuse(fragPos, N) * VoxelGiIntensity;
+            // DEBUG: show ONLY the bounce (brightened) so you can SEE where GI lands / leaks / misses.
+            if (VoxelGiDebug) {
+                FragColor = vec4(giDiffuse * 4.0, 1.0);
+                NormalRough = vec4(N * 0.5 + 0.5, 1.0);
+                return;
+            }
             // The traced bounce is the real local indirect; blend it OVER the IBL base (which is the
             // distant/sky ambient the cones can't reach), modulated by AO so creases stay grounded.
             ambientDiffuse = kD * (irradiance * AmbientTint + giDiffuse) * ao;

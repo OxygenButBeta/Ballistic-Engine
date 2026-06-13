@@ -63,6 +63,15 @@ public static class VolumePostProcessing {
             fx.SsgiAmbientFloor = 0f;
         }
 
+        if (stack.GetComponent<VoxelGlobalIllumination>() is { } vgi) {
+            fx.VoxelGiEnabled = vgi.enabled.Value;
+            fx.VoxelGiIntensity = vgi.intensity.Value;
+            fx.VoxelGiBounces = vgi.bounces.Value;
+            fx.VoxelGiResolution = vgi.resolution.Value;
+            fx.VoxelGiVolumeSize = vgi.volumeSize.Value;
+            fx.VoxelGiDebugView = vgi.debugView.Value;
+        }
+
         if (stack.GetComponent<Shadows>() is { } shadows) {
             fx.ShadowMaxDistance = shadows.maxDistance.Value;
             fx.ShadowCascadeCount = shadows.cascadeCount.Value;
