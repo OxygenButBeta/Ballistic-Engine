@@ -123,10 +123,19 @@ vec3 GradeAt(vec2 uv) {
         color = clamp(mix(blur, color, 1.0 + Sharpen), 0.0, 1.0);
     }
 
-    // Contrast pivots around mid-grey so it adds midtone punch instead of just darkening
-    // everything: pow() alone (no pivot) pulls all values < 1 toward black.
-    if (Contrast != 1.0)
-        color = clamp(mix(vec3(0.5), color, Contrast), 0.0, 1.0);
+    // Contrast pivots around mid-grey for midtone punch. SHADOW-PRESERVING: a hard linear pivot at
+    // 0.5 pushes any pixel below mid-grey toward black, which CRUSHES underexposed scenes to nothing
+    // (Emerald Day went mean 18 -> 2). So fade the contrast strength toward 1.0 (no-op) in the deep
+    // shadows: bright/mid pixels get the full punch, near-black pixels are left alone. Keeps the look
+    // for normally-exposed scenes without destroying dim ones.
+    if (Contrast != 1.0) {
+        float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        // Only the DEEPEST shadows (< ~0.08) ease off, so a normally-exposed scene keeps full
+        // shadow punch while a near-black underexposed scene isn't crushed to nothing.
+        float shadowKeep = smoothstep(0.015, 0.09, luma);
+        float c = mix(1.0, Contrast, shadowKeep);
+        color = clamp(mix(vec3(0.5), color, c), 0.0, 1.0);
+    }
 
     if (Saturation != 1.0) {
         float gray = dot(color, vec3(0.299, 0.587, 0.114));
