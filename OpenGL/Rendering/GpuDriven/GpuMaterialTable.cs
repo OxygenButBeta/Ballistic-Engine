@@ -53,6 +53,15 @@ public sealed class GpuMaterialTable : IDisposable {
             return false;
         }
 
+        // The material set changed (often a hot-reload: old textures freed, new ones created).
+        // Release every resident handle and clear the UID cache FIRST, so we never hand the shader
+        // a bindless handle pointing at a deleted texture (a freed UID can be reused by a new
+        // texture -> stale handle -> GPU garbage/crash). Re-acquire fresh below.
+        foreach (ulong h in resident)
+            GL.Arb.MakeTextureHandleNonResident((long)h);
+        resident.Clear();
+        handleByTexture.Clear();
+
         indexByMaterial.Clear();
         table = new GpuMaterial[materials.Count];
         for (var i = 0; i < materials.Count; i++) {
