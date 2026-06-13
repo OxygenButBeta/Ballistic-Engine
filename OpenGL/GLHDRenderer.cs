@@ -3523,7 +3523,7 @@ void main() {
     }
 
     float voxelGiIntensity = float.TryParse(
-        Environment.GetEnvironmentVariable("BALLISTIC_VOXELGI_INTENSITY"), out float vi) ? vi : 1.0f;
+        Environment.GetEnvironmentVariable("BALLISTIC_VOXELGI_INTENSITY"), out float vi) ? vi : 2.0f;
 
     // The pass-global texture binds (the units SetSamplerUniforms assigned). Once per pass.
     void SetPassTextures() {
