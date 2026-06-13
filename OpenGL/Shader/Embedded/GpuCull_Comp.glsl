@@ -62,23 +62,9 @@ bool aabbInFrustum(vec3 mn, vec3 mx) {
     return true;
 }
 
-// World AABB from the local AABB + model matrix (8 corners). Matches the CPU world-AABB build
-// in ComputeSubmeshVisibility (corner * model, row-vector convention: OpenTK is row-major, so
-// the GLSL equivalent is corner-as-row => model is uploaded transposed; see the C# uploader).
-void worldAabb(in SubmeshMeta m, out vec3 wMin, out vec3 wMax) {
-    vec3 lMin = m.localAabbMin.xyz;
-    vec3 lMax = m.localAabbMax.xyz;
-    wMin = vec3(1e30);
-    wMax = vec3(-1e30);
-    for (int c = 0; c < 8; ++c) {
-        vec3 corner = vec3((c & 1) == 0 ? lMin.x : lMax.x,
-                           (c & 2) == 0 ? lMin.y : lMax.y,
-                           (c & 4) == 0 ? lMin.z : lMax.z);
-        vec3 w = (m.model * vec4(corner, 1.0)).xyz;
-        wMin = min(wMin, w);
-        wMax = max(wMax, w);
-    }
-}
+// The AABB stored in localAabbMin/Max is ALREADY in world space (the C# builder transformed it
+// with the exact 8-corner loop the CPU cull uses), so the cull tests it directly. No in-shader
+// transform => bit-identical to the CPU AabbInFrustum for BOTH the camera and the light frustum.
 
 void main() {
     uint id = gl_GlobalInvocationID.x;
@@ -104,9 +90,7 @@ void main() {
     if (cutoutFilter == 1u && !cutout)
         return;
 
-    vec3 wMin, wMax;
-    worldAabb(m, wMin, wMax);
-    if (!aabbInFrustum(wMin, wMax))
+    if (!aabbInFrustum(m.localAabbMin.xyz, m.localAabbMax.xyz))
         return;
 
     // Visible: allocate a dense slot and emit the command + per-draw record.

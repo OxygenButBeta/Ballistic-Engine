@@ -1731,9 +1731,24 @@ void main() {
             // single-submesh renderers, whose entity carries the node pivot). Using inverse-node
             // here would double-transform the geometry AND its AABB, mis-culling everything.
             gdModels[i] = world;
+            // Store the WORLD AABB, computed with the SAME 8-corner loop and accumulation order as
+            // the CPU ComputeSubmeshVisibility, so the GPU cull tests bit-identical bounds (the
+            // shader skips the transform). This makes the camera AND shadow culls match the CPU
+            // exactly — no fp32-vs-fp32 reorder flipping marginal casters at the frustum edge.
             mesh.GetSubMeshBounds(i, out Vector3 lMin, out Vector3 lMax);
-            gdLocalMin[i] = lMin;
-            gdLocalMax[i] = lMax;
+            var wMin = new Vector3(float.MaxValue);
+            var wMax = new Vector3(float.MinValue);
+            for (var c = 0; c < 8; c++) {
+                var corner = new Vector3(
+                    (c & 1) == 0 ? lMin.X : lMax.X,
+                    (c & 2) == 0 ? lMin.Y : lMax.Y,
+                    (c & 4) == 0 ? lMin.Z : lMax.Z);
+                Vector3 wc = (new Vector4(corner, 1f) * world).Xyz;
+                wMin = Vector3.ComponentMin(wMin, wc);
+                wMax = Vector3.ComponentMax(wMax, wc);
+            }
+            gdLocalMin[i] = wMin;   // now WORLD-space (name kept; the SSBO field is reused)
+            gdLocalMax[i] = wMax;
             gdFirstIndex[i] = (uint)subs[i].IndexStart;
             gdIndexCount[i] = (uint)subs[i].IndexCount;
 
