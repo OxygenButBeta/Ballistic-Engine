@@ -6,7 +6,12 @@ namespace BallisticEngine;
 
 public sealed class ColorAdjustments : VolumeComponent {
     [Tooltip("Midtone contrast around mid-grey.")]
-    public readonly ClampedFloatParameter contrast = new(1f, 0.5f, 2f);
+    // Default 1.15 (not 1.0): the ACES output crushes the scene into the midtones — Sun Temple
+    // spanned only luma 72-136, no deep shadows or bright highlights, reading flat/hazy. A modest
+    // contrast expansion around 0.5 restores the full tonal range and the photographic/UE5 punch
+    // that lets the GI bounce + material colour show (verified against the luma histogram: range
+    // 64 -> 110). A scene that wants pure-neutral can still set it back to 1.0.
+    public readonly ClampedFloatParameter contrast = new(1.15f, 0.5f, 2f);
 
     [Tooltip("Overall colour saturation.")]
     public readonly ClampedFloatParameter saturation = new(1f, 0f, 2f);

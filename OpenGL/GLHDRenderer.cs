@@ -1199,7 +1199,11 @@ void main() {
             PostFX.ContactShadowsEnabled = csOn;
         if (EnvNormalStrength is { } ns)
             NormalStrength = ns;
+        if (EnvContrast is { } ct)
+            PostFX.Contrast = ct;
     }
+
+    static readonly float? EnvContrast = EnvFloat("BALLISTIC_FX_CONTRAST");
 
     // Draws every active game UIDocument as a screen-space overlay into the currently-bound target
     // (viewport already set). Each document solves its own layout against the viewport (honoring its
