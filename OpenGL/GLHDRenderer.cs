@@ -474,6 +474,7 @@ public class GLHDRenderer : HDRenderer {
         // transparent sort. The view matrix is already world-space; using the LOCAL position
         // here silently flattened/darkened all view-dependent lighting for parented cameras.
         Vector3 cameraPos = args.viewProjectionProvider.Transform.WorldPosition;
+        lastCameraPos = cameraPos; // the probe/reflection bakes order their work camera-outward
 
         // Cull with the unjittered camera frustum (TAA jitter is sub-pixel; the AABB test
         // doesn't care). Shadow casters keep the full list — they're culled per light below.
@@ -2111,6 +2112,8 @@ public class GLHDRenderer : HDRenderer {
         public Vector3 Min, Size;
         public float[][] Sh;     // 4 channels x (Total * 4 floats)
         public bool[] Occupied;  // probes near geometry; the rest skip straight to sky SH
+        public int[] Order;      // probe indices sorted CAMERA-OUTWARD (nearest first) — Cursor walks
+                                 // this, not 0..Total, so the visible area populates before far corners
         public int CapturedCount;
         // Renderer snapshot + world AABBs (computed once): per-face frustum culling means a
         // probe in one street doesn't re-draw the whole city for every cube face.
@@ -2129,6 +2132,21 @@ public class GLHDRenderer : HDRenderer {
     // While non-zero, the lit pass samples THIS depth array as the sun shadow instead of the
     // per-view cascades (probe captures use the bake's volume-fitted map).
     int sunShadowOverride;
+
+    // Latest camera world position (cached each BeginRender) — the probe + reflection bakes order
+    // their work CAMERA-OUTWARD (nearest cells first) so the visible area lights up before the far
+    // corners, the "populate from the render position outward" the realtime auto-GI wants.
+    Vector3 lastCameraPos;
+
+    // IMPLICIT DEFAULT probe grid: when the scene has NO IrradianceVolume placed, the renderer
+    // synthesizes one (auto-fitted to scene bounds) and bakes it — so GI "just works" with zero
+    // setup (the user's "default nice fidelity"). It's a plain object, never in the Hierarchy / never
+    // serialized; a real placed IrradianceVolume (Active != null) always overrides it. Rebuilt when
+    // the scene changes (tracked by sceneStampForDefault).
+    IrradianceVolume defaultProbeVolume;
+    int defaultProbeStamp;        // hash of the fitted bounds, so a moved/changed scene refits
+    bool defaultProbeFitTried;    // don't refit every frame when the scene has no geometry yet
+    int defaultProbeRefitCountdown; // throttle the per-frame scene-bounds scan (refit every N frames)
 
     // Scratch state for per-face culling during the bake.
     readonly List<IStaticMeshRenderer> bakeVisible = new();
@@ -2177,6 +2195,15 @@ public class GLHDRenderer : HDRenderer {
         // whichever BeginRender runs is correct - gating on the Scene target stalled the bake
         // completely while the Game tab was active.
         IrradianceVolume vol = IrradianceVolume.Active is { IsActive: true } active ? active : null;
+
+        // A real placed volume wins; if there's none, fall back to the IMPLICIT DEFAULT grid the
+        // renderer auto-fits to the scene (so GI works with zero setup). The default is dropped the
+        // moment a real volume appears (so the user's placed volume takes over cleanly).
+        if (vol is not null) {
+            defaultProbeVolume = null; // a real volume took over — discard any implicit default
+        } else {
+            vol = EnsureDefaultProbeVolume();
+        }
 
         // Volume removed/disabled mid-bake: abort cleanly.
         if (probeBake is not null && !ReferenceEquals(probeBake.Volume, vol)) {
@@ -2260,7 +2287,9 @@ public class GLHDRenderer : HDRenderer {
         var slice = System.Diagnostics.Stopwatch.StartNew();
         GL.Enable(EnableCap.ScissorTest);
         while (job.Cursor < job.Total && slice.Elapsed.TotalMilliseconds < BakeBudgetMs) {
-            var idx = job.Cursor;
+            // Walk the camera-outward order, not the raw index, so probes near the render position
+            // bake first (the visible area lights up while far corners are still pending).
+            var idx = job.Order[job.Cursor];
 
             // Empty air: no geometry anywhere near this cell, so a capture would just return
             // the sky average from every direction. Write that directly and skip 6 renders.
@@ -2312,6 +2341,96 @@ public class GLHDRenderer : HDRenderer {
 
         if (job.Cursor >= job.Total)
             FinishProbeBake();
+    }
+
+    // Returns the IMPLICIT default probe volume, auto-fitting it to the current scene bounds on
+    // first sight (and refitting if the scene's bounds changed materially). Returns null when the
+    // scene has no bakeable geometry yet. The volume is a plain object (never serialized) so this is
+    // pure runtime state — the cache key still derives from its bounds + the scene name, so a baked
+    // default survives reloads exactly like a placed one.
+    IrradianceVolume EnsureDefaultProbeVolume() {
+        // Throttle: scanning every renderer's bounds each frame is wasteful for a static scene that
+        // already has a fitted default. Once we have one, only re-scan periodically (a moved scene
+        // refits within ~half a second); always scan while we don't have a default yet.
+        if (defaultProbeVolume is not null && defaultProbeRefitCountdown-- > 0)
+            return defaultProbeVolume;
+        defaultProbeRefitCountdown = 30;
+
+        // Compute the scene's bakeable AABB from renderable world bounds. To stay robust against a
+        // huge ground/terrain plane (which would balloon the grid and starve interiors of probes —
+        // the known FitToScene failure), track BOTH the full union and a "core" union that ignores
+        // any single renderer spanning more than ~4x the running median diagonal. The core bounds
+        // drive the fit; the full bounds only extend the floor down so the ground is still covered.
+        Vector3 lo = new(float.MaxValue), hi = new(float.MinValue);
+        Vector3 coreLo = new(float.MaxValue), coreHi = new(float.MinValue);
+        float diagSum = 0f; int diagCount = 0; bool any = false;
+
+        foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
+            if (r is not { IsRenderable: true, IsActive: true } || r.SharedMesh == null)
+                continue;
+            r.SharedMesh.GetLocalBounds(out Vector3 lMin, out Vector3 lMax);
+            Matrix4 world = r.Transform.WorldMatrix;
+            Vector3 wMin = new(float.MaxValue), wMax = new(float.MinValue);
+            for (var c = 0; c < 8; c++) {
+                var corner = new Vector3(
+                    (c & 1) == 0 ? lMin.X : lMax.X,
+                    (c & 2) == 0 ? lMin.Y : lMax.Y,
+                    (c & 4) == 0 ? lMin.Z : lMax.Z);
+                Vector3 w = (new Vector4(corner, 1f) * world).Xyz;
+                wMin = Vector3.ComponentMin(wMin, w);
+                wMax = Vector3.ComponentMax(wMax, w);
+            }
+            lo = Vector3.ComponentMin(lo, wMin);
+            hi = Vector3.ComponentMax(hi, wMax);
+
+            // Outlier (ground/terrain) rejection for the CORE fit: a renderer whose diagonal dwarfs
+            // the median is a giant plane — keep it out of the core bounds so it can't blow up the grid.
+            float diag = (wMax - wMin).Length;
+            float median = diagCount > 0 ? diagSum / diagCount : diag;
+            if (diagCount < 3 || diag <= median * 4f) {
+                coreLo = Vector3.ComponentMin(coreLo, wMin);
+                coreHi = Vector3.ComponentMax(coreHi, wMax);
+            }
+            diagSum += diag; diagCount++;
+            any = true;
+        }
+
+        if (!any) {
+            defaultProbeFitTried = true;
+            return null;
+        }
+        if (coreLo.X > coreHi.X) { coreLo = lo; coreHi = hi; } // every renderer was an "outlier"
+
+        // Fit the grid to the CORE bounds (the buildings/props), but pull the floor down to the full
+        // bounds' floor so a ground plane is still inside the volume (probes just above it capture).
+        coreLo.Y = MathF.Min(coreLo.Y, lo.Y);
+        const float pad = 2f;
+        Vector3 center = (coreLo + coreHi) * 0.5f;
+        Vector3 size = Vector3.ComponentMax(coreHi - coreLo + new Vector3(pad * 2f), Vector3.One * 4f);
+
+        // Probe density: ~1 probe per ~6 m horizontally, ~1 per ~4 m vertically, clamped to sane
+        // counts. Enough that a room gets several cells (the interior-coverage fix) without a huge bake.
+        int px = Math.Clamp((int)MathF.Round(size.X / 6f) + 1, 4, 24);
+        int py = Math.Clamp((int)MathF.Round(size.Y / 4f) + 1, 3, 12);
+        int pz = Math.Clamp((int)MathF.Round(size.Z / 6f) + 1, 4, 24);
+
+        // Did the fit change materially since last time? (Scene edited / first fit.) Hash the bounds
+        // + counts; refit + rebake only on change so a static scene bakes once.
+        int stamp = HashCode.Combine(
+            (int)center.X, (int)center.Y, (int)center.Z,
+            (int)size.X, (int)size.Y, (int)size.Z, px * 100 + py * 10 + pz);
+
+        if (defaultProbeVolume is null || stamp != defaultProbeStamp) {
+            // (Re)create the default volume with the fitted bounds. A new instance resets CacheChecked
+            // so the bake path auto-restores from cache (same key) or bakes fresh.
+            defaultProbeVolume = new IrradianceVolume {
+                Center = center, Size = size, ProbesX = px, ProbesY = py, ProbesZ = pz,
+                Bake = true,
+            };
+            defaultProbeStamp = stamp;
+            defaultProbeFitTried = true;
+        }
+        return defaultProbeVolume;
     }
 
     void BeginProbeBake(IrradianceVolume vol) {
@@ -2373,6 +2492,26 @@ public class GLHDRenderer : HDRenderer {
         foreach (var occupied in job.Occupied)
             if (occupied)
                 job.CapturedCount++;
+
+        // CAMERA-OUTWARD bake order: sort probe indices by distance of their cell centre from the
+        // current render position, nearest first. The time-sliced loop walks this, so the area
+        // around the camera populates before the far corners — the "from the render position
+        // outward" realtime fill. (Captured next to the bake start; the camera may move during the
+        // bake but the initial near-first ordering is what matters for the visible fade-in.)
+        job.Order = new int[job.Total];
+        var orderDist = new float[job.Total];
+        for (var i = 0; i < job.Total; i++) {
+            job.Order[i] = i;
+            var ix = i % job.Px;
+            var iy = i / job.Px % job.Py;
+            var iz = i / (job.Px * job.Py);
+            var probePos = job.Min + new Vector3(
+                (ix + 0.5f) / job.Px * job.Size.X,
+                (iy + 0.5f) / job.Py * job.Size.Y,
+                (iz + 0.5f) / job.Pz * job.Size.Z);
+            orderDist[i] = (probePos - lastCameraPos).LengthSquared;
+        }
+        Array.Sort(orderDist, job.Order); // sorts Order by ascending distance (nearest first)
 
         // Volume-fitted sun shadow, rendered ONCE (the volume and sun are static for the
         // duration of the bake; re-rendering it per slice was a full extra scene pass per frame).
