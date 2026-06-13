@@ -2,6 +2,14 @@ using OpenTK.Graphics.OpenGL4;
 
 namespace BallisticEngine.OpenGL.GpuDriven;
 
+// NOTE (2026-06): currently UNUSED. The GPU-driven path streamed its metadata/cull-params through
+// this, but COHERENT mapping only makes CPU writes VISIBLE to the GPU, it does NOT order them before
+// a compute dispatch — that needs glMemoryBarrier(CLIENT_MAPPED_BUFFER_BARRIER_BIT) after every CPU
+// write. Forgetting it raced (compute read stale metadata while the camera moved → geometry vanished,
+// commit 0f04031). The path now uses plain glBufferSubData (GL orders it for free). If you reintroduce
+// this for high-frequency streaming, you MUST add the client-mapped barrier before the consuming draw/
+// dispatch — keep that in mind before deleting it as dead code.
+//
 // A GL 4.6 persistently-mapped, N-buffered GPU buffer for per-frame streaming writes WITHOUT
 // glBufferData/glBufferSubData re-specification stalls. The buffer is allocated ONCE with
 // glBufferStorage (immutable storage) and mapped ONCE for the whole lifetime with
