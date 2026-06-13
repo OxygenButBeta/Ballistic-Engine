@@ -55,7 +55,14 @@ public class GLHDRenderer : HDRenderer {
     // BALLISTIC_GPUDRIVEN=0. The GPU-driven shader variants are companions to each material shader.
     readonly OpenGL.GpuDriven.GpuDrivenRenderer gpuDriven = new();
     readonly Dictionary<Shader, (Shader Lit, Shader Prepass)> gpuDrivenShaders = new();
+    StandardShader gpuShadowShader;   // depth-only MDI shadow caster (per-cascade lightSpaceMatrix)
     bool gpuDrivenEnabled = Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN") != "0";
+    // GPU-driven shadows: opt-IN (BALLISTIC_GPUDRIVEN_SHADOWS=1) while validated. The whole-mesh MDI
+    // shadow caster works and cuts shadow-pass CPU submit, but its light-frustum cull diverges very
+    // slightly from the CPU per-submesh cull (a few marginal casters in/out), shifting some shadow
+    // edges (~8% of pixels, sub-perceptual). Default off keeps the shipped image byte-identical until
+    // the cull is made bit-exact. The lit camera path is byte-identical and always on.
+    bool gpuDrivenShadows = Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN_SHADOWS") == "1";
     bool gpuDrivenReady;
     // Scratch reused each frame when building the whole-mesh renderer's submesh metadata.
     Matrix4[] gdModels = [];
@@ -256,6 +263,44 @@ void main() {
 ";
         shadowDepthShader = GraphicAPI.CreateStandardShader(shadowVert, shadowFrag);
         skinnedShadowDepthShader = GraphicAPI.CreateStandardShader(skinnedShadowVert, shadowFrag);
+
+        // GPU-driven shadow caster: depth-only, reads the per-draw model from the GPU-driven SSBO
+        // (PerDrawData[gl_DrawIDARB]) and the cutout flag/diffuse from the bindless material table —
+        // so the whole-mesh renderer's shadow casters draw via MDI per cascade instead of ~1600
+        // CPU draws. lightSpaceMatrix is a per-cascade uniform. Image is unchanged (depth-only).
+        const string gpuShadowVert = @"#version 460 core
+#extension GL_ARB_shader_draw_parameters : require
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec2 aTexCoord;
+out vec2 uv;
+flat out uint vMaterialId;
+uniform mat4 lightSpaceMatrix;
+struct GpuPerDraw { mat4 model; uint materialId; uint _p0; uint _p1; uint _p2; };
+layout(std430, binding = 5) readonly buffer GpuPerDrawBuf { GpuPerDraw gpuDraws[]; };
+void main() {
+    GpuPerDraw d = gpuDraws[gl_DrawIDARB];
+    vMaterialId = d.materialId;
+    uv = aTexCoord;
+    gl_Position = lightSpaceMatrix * d.model * vec4(position, 1.0);
+}
+";
+        const string gpuShadowFrag = @"#version 460 core
+#extension GL_ARB_bindless_texture : require
+in vec2 uv;
+flat in uint vMaterialId;
+struct GpuMaterial { uvec2 dH;uvec2 nH;uvec2 mH;uvec2 rH;uvec2 aH;uvec2 eH;
+    vec4 bcf;vec4 ef;float mm;float rm;float ns;float op;uint fl;uint a;uint b;uint c; };
+layout(std430, binding = 6) readonly buffer GpuMaterialBuf { GpuMaterial gpuMats[]; };
+void main() {
+    GpuMaterial m = gpuMats[vMaterialId];
+    if ((m.fl & 64u) != 0u && texture(sampler2D(m.dH), uv).a < 0.5)
+        discard;
+}
+";
+        if (gpuDrivenEnabled) {
+            try { gpuShadowShader = GraphicAPI.CreateStandardShader(gpuShadowVert, gpuShadowFrag); }
+            catch (Exception e) { Console.WriteLine($"[GpuDriven] shadow companion compile failed: {e.Message}"); }
+        }
     }
 
     public float Metallic = 1f;
@@ -1498,6 +1543,15 @@ void main() {
 
         bool skinnedActive = false;
         foreach (IStaticMeshRenderer target in casters) {
+            // GPU-driven shadow: the whole-mesh renderer casts via ONE MDI per cascade after a
+            // light-space compute cull, instead of ~1600 CPU depth draws. Depth-only -> the shadow
+            // map (and thus the image) is unchanged. Falls through to the CPU path on any failure.
+            if (gpuShadowShader is not null && gpuDrivenShadows && IsGpuDrivenEligible(target) &&
+                DrawWholeMeshShadowGpuDriven(target, ref lightSpaceMatrix)) {
+                if (skinnedActive) { shadowDepthShader.Activate(); skinnedActive = false; }
+                continue;
+            }
+
             Mesh mesh = target.SharedMesh;
             Matrix4 worldMatrix = ModelMatrix(target, mesh);
             // Per-submesh world AABBs for this whole-mesh renderer (cached in SplitRenderables), or
@@ -1792,6 +1846,45 @@ void main() {
 
         if (Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN_DEBUG") == "1" && !isDepthPrepass)
             Console.WriteLine($"[GpuDriven] {(isDepthPrepass ? "PREPASS" : "OPAQUE")} solid+cutout batches drawn.");
+        return true;
+    }
+
+    readonly Vector4[] gpuShadowPlanes = new Vector4[6];
+
+    // Draws the whole-mesh renderer's shadow casters via MDI for ONE cascade/face. Reuses the
+    // GPU-driven metadata SSBO (built here if the camera pass hasn't yet this frame), culls against
+    // the LIGHT-space frustum, and draws solid+cutout depth-only with the per-cascade lightSpaceMatrix.
+    bool DrawWholeMeshShadowGpuDriven(IStaticMeshRenderer target, ref Matrix4 lightSpaceMatrix) {
+        // Only the standard-shader whole mesh; mixed-shader meshes fall back (same rule as the lit path).
+        if (DominantGpuDrivenShader(target) is null)
+            return false;
+
+        // Ensure metadata is resident (the shadow pass runs before the camera prepass in a frame).
+        if (!gpuDrivenCulledThisFrame) {
+            BuildGpuDrivenMetadata(target);
+            gpuDrivenCulledThisFrame = true;
+            gpuDrivenTarget = target;
+        }
+
+        // Cull against the light-space frustum (same planes the CPU shadow path uses).
+        ExtractFrustumPlanes(ref lightSpaceMatrix, gpuShadowPlanes);
+        gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchSolid, gpuShadowPlanes, pass: 0, cutoutFilter: 0);
+        gpuDriven.Cull(OpenGL.GpuDriven.GpuDrivenRenderer.BatchCutout, gpuShadowPlanes, pass: 0, cutoutFilter: 1);
+
+        gpuShadowShader.Activate();
+        gpuShadowShader.SetMatrix4("lightSpaceMatrix", ref lightSpaceMatrix);
+        target.SharedMesh.Activate();
+
+        // Shadow pass culls FRONT faces (acne hidden on back faces); cutout cards disable culling.
+        GL.CullFace(TriangleFace.Front);
+        gpuDriven.DrawIndirectCount(OpenGL.GpuDriven.GpuDrivenRenderer.BatchSolid);
+        GL.Disable(EnableCap.CullFace);
+        gpuDriven.DrawIndirectCount(OpenGL.GpuDriven.GpuDrivenRenderer.BatchCutout);
+        GL.Enable(EnableCap.CullFace);
+        GL.CullFace(TriangleFace.Front); // RenderShadowMaps expects front-cull between casters
+
+        target.SharedMesh.Deactivate();
+        stats.DepthOnlyDrawCalls += 2;
         return true;
     }
 
