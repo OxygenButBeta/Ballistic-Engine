@@ -1020,6 +1020,14 @@ internal sealed class AssetBrowserPanel {
     void CommitRename(string path, string newName, bool isFolder) {
         var oldAbsolute = AssetDatabase.Project.ResolveAbsolute(path);
         var parent = Path.GetDirectoryName(oldAbsolute)!;
+        // Preserve the original file extension when the user omits it (the rename field is seeded WITH
+        // the extension, but clearing it and typing a bare name would otherwise strip the extension and
+        // break the asset — e.g. "Player.cs" -> "Enemy" with no type). Unity keeps the extension too.
+        if (!isFolder) {
+            string oldExt = Path.GetExtension(oldAbsolute);
+            if (oldExt.Length > 0 && Path.GetExtension(newName).Length == 0)
+                newName += oldExt;
+        }
         var newAbsolute = Path.Combine(parent, newName);
         if (string.Equals(oldAbsolute, newAbsolute, StringComparison.OrdinalIgnoreCase))
             return;
