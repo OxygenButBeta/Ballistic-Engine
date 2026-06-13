@@ -71,29 +71,8 @@ internal static class EditorDebugViews {
     static void EnsureResources() {
         if (program == 0) {
             // Matches the engine's shared fullscreen quad: attrib 0 = clip-space position, 1 = uv.
-            const string vert = @"#version 330 core
-layout(location = 0) in vec2 inPos;
-layout(location = 1) in vec2 inUv;
-out vec2 uv;
-void main() {
-    uv = inUv;
-    gl_Position = vec4(inPos, 0.0, 1.0);
-}";
-            const string frag = @"#version 330 core
-in vec2 uv;
-out vec4 col;
-uniform sampler2D src;
-uniform int mode;
-void main() {
-    if (mode == 1) {            // Ambient Occlusion — read ONLY the R channel and show pure greyscale
-        float a = texture(src, uv).r;   // white = unoccluded, black = occluded
-        col = vec4(a, a, a, 1.0);
-    } else {                    // SSGI / Lit — tonemap lightly so HDR doesn't blow out the view
-        vec3 c = texture(src, uv).rgb;
-        vec3 t = c / (c + vec3(1.0));
-        col = vec4(pow(t, vec3(1.0/2.2)), 1.0);
-    }
-}";
+            string vert = EmbeddedShaderSource.Read("EditorDebugView_Vert.glsl");
+            string frag = EmbeddedShaderSource.Read("EditorDebugView_Frag.glsl");
             int v = GL.CreateShader(ShaderType.VertexShader);
             GL.ShaderSource(v, vert); GL.CompileShader(v);
             CheckCompile(v, "debug-view vertex");

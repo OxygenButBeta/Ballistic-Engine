@@ -223,102 +223,26 @@ public class GLHDRenderer : HDRenderer {
             if (PresentToScreen)
                 frameBuffer.Resize(x, y);
         };
-        const string shadowVert = @"
-#version 330 core
-layout(location = 0) in vec3 position;
-layout(location = 1) in vec2 aTexCoord;
-
-out vec2 uv;
-
-uniform mat4 model;
-uniform mat4 lightSpaceMatrix;
-
-void main() {
-    uv = aTexCoord;
-    gl_Position = lightSpaceMatrix * model * vec4(position, 1.0);
-}
-";
-        const string shadowFrag = @"
-#version 330 core
-in vec2 uv;
-
-uniform bool AlphaCutout;
-uniform sampler2D Diffuse;
-
-void main() {
-    if (AlphaCutout && texture(Diffuse, uv).a < 0.5)
-        discard;
-}
-";
-        // Skinned shadow caster: the same depth shader plus GPU skinning, so an animated character's
-        // shadow deforms with the animation instead of being stuck at bind pose. The bone SSBO is the
-        // SAME buffer the main/prepass skinning uses (binding 1).
-        const string skinnedShadowVert = @"
-#version 460 core
-layout(location = 0) in vec3 position;
-layout(location = 1) in vec2 aTexCoord;
-layout(location = 8) in vec4 aBoneIndices;
-layout(location = 9) in vec4 aBoneWeights;
-
-out vec2 uv;
-
-uniform mat4 model;
-uniform mat4 lightSpaceMatrix;
-
-layout(std430, binding = 1) readonly buffer BoneMatrices {
-    mat4 bones[];
-};
-
-void main() {
-    uv = aTexCoord;
-    ivec4 bi = ivec4(aBoneIndices + 0.5);
-    mat4 skin =
-        aBoneWeights.x * bones[bi.x] +
-        aBoneWeights.y * bones[bi.y] +
-        aBoneWeights.z * bones[bi.z] +
-        aBoneWeights.w * bones[bi.w];
-    vec3 skinnedPos = (skin * vec4(position, 1.0)).xyz;
-    gl_Position = lightSpaceMatrix * model * vec4(skinnedPos, 1.0);
-}
-";
-        shadowDepthShader = GraphicAPI.CreateStandardShader(shadowVert, shadowFrag);
-        skinnedShadowDepthShader = GraphicAPI.CreateStandardShader(skinnedShadowVert, shadowFrag);
+        // Shadow caster (opaque + cutout discard) and its GPU-skinned variant share one depth
+        // fragment. Skinned variant adds GPU skinning so an animated character's shadow deforms
+        // with the animation; the bone SSBO is the SAME buffer the main/prepass skinning uses
+        // (binding 1).
+        string shadowFrag = EmbeddedShaderSource.Read("Shadow_Frag.glsl");
+        shadowDepthShader = GraphicAPI.CreateStandardShader(
+            EmbeddedShaderSource.Read("Shadow_Vert.glsl"), shadowFrag);
+        skinnedShadowDepthShader = GraphicAPI.CreateStandardShader(
+            EmbeddedShaderSource.Read("ShadowSkinned_Vert.glsl"), shadowFrag);
 
         // GPU-driven shadow caster: depth-only, reads the per-draw model from the GPU-driven SSBO
         // (PerDrawData[gl_DrawIDARB]) and the cutout flag/diffuse from the bindless material table —
         // so the whole-mesh renderer's shadow casters draw via MDI per cascade instead of ~1600
         // CPU draws. lightSpaceMatrix is a per-cascade uniform. Image is unchanged (depth-only).
-        const string gpuShadowVert = @"#version 460 core
-#extension GL_ARB_shader_draw_parameters : require
-layout(location = 0) in vec3 position;
-layout(location = 1) in vec2 aTexCoord;
-out vec2 uv;
-flat out uint vMaterialId;
-uniform mat4 lightSpaceMatrix;
-struct GpuPerDraw { mat4 model; uint materialId; uint _p0; uint _p1; uint _p2; };
-layout(std430, binding = 5) readonly buffer GpuPerDrawBuf { GpuPerDraw gpuDraws[]; };
-void main() {
-    GpuPerDraw d = gpuDraws[gl_DrawIDARB];
-    vMaterialId = d.materialId;
-    uv = aTexCoord;
-    gl_Position = lightSpaceMatrix * d.model * vec4(position, 1.0);
-}
-";
-        const string gpuShadowFrag = @"#version 460 core
-#extension GL_ARB_bindless_texture : require
-in vec2 uv;
-flat in uint vMaterialId;
-struct GpuMaterial { uvec2 dH;uvec2 nH;uvec2 mH;uvec2 rH;uvec2 aH;uvec2 eH;
-    vec4 bcf;vec4 ef;float mm;float rm;float ns;float op;uint fl;uint a;uint b;uint c; };
-layout(std430, binding = 6) readonly buffer GpuMaterialBuf { GpuMaterial gpuMats[]; };
-void main() {
-    GpuMaterial m = gpuMats[vMaterialId];
-    if ((m.fl & 64u) != 0u && texture(sampler2D(m.dH), uv).a < 0.5)
-        discard;
-}
-";
         if (gpuDrivenEnabled) {
-            try { gpuShadowShader = GraphicAPI.CreateStandardShader(gpuShadowVert, gpuShadowFrag); }
+            try {
+                gpuShadowShader = GraphicAPI.CreateStandardShader(
+                    EmbeddedShaderSource.Read("ShadowGpuDriven_Vert.glsl"),
+                    EmbeddedShaderSource.Read("ShadowGpuDriven_Frag.glsl"));
+            }
             catch (Exception e) { Console.WriteLine($"[GpuDriven] shadow companion compile failed: {e.Message}"); }
         }
     }
@@ -1711,17 +1635,7 @@ void main() {
     // frame, so depth stays bit-identical (z-prepass invariance for skinned geometry).
     readonly OpenGL.GLBoneMatrixBuffer boneMatrices = new();
 
-    const string PrepassFrag = @"
-#version 330 core
-in vec2 texCoord;
-uniform bool AlphaCutout;
-uniform sampler2D Diffuse;
-
-void main() {
-    if (AlphaCutout && texture(Diffuse, texCoord).a < 0.5)
-        discard;
-}
-";
+    static readonly string PrepassFrag = EmbeddedShaderSource.Read("Prepass_Frag.glsl");
 
     Shader PrepassShaderFor(Shader materialShader) {
         if (prepassShaders.TryGetValue(materialShader, out Shader cached))

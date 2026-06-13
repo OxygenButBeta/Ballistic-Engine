@@ -99,20 +99,8 @@ internal static class MeshPreviewRenderer {
         if (program != 0)
             return;
 
-        const string vert = @"#version 330 core
-layout(location = 0) in vec3 pos;
-layout(location = 1) in vec3 normal;
-uniform mat4 mvp;
-out vec3 n;
-void main() { gl_Position = mvp * vec4(pos, 1.0); n = normal; }";
-        const string frag = @"#version 330 core
-in vec3 n;
-out vec4 color;
-void main() {
-    vec3 l = normalize(vec3(0.5, 0.8, 0.6));
-    float d = max(dot(normalize(n), l), 0.0) * 0.75 + 0.3;
-    color = vec4(vec3(0.78, 0.80, 0.84) * d, 1.0);
-}";
+        string vert = EmbeddedShaderSource.Read("EditorMeshPreview_Vert.glsl");
+        string frag = EmbeddedShaderSource.Read("EditorMeshPreview_Frag.glsl");
         int v = GL.CreateShader(ShaderType.VertexShader);
         GL.ShaderSource(v, vert);
         GL.CompileShader(v);

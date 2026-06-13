@@ -27,16 +27,9 @@ public sealed class GLHiZPass : IDisposable {
     public GLHiZPass() {
         string vert = EmbeddedShaderSource.Read("FSQ_Vert.glsl");
         // mip 0 is a straight copy of the depth's R channel into the R32F pyramid.
-        copyShader = GraphicAPI.CreateStandardShader(vert, CopyFrag);
+        copyShader = GraphicAPI.CreateStandardShader(vert, EmbeddedShaderSource.Read("HiZ_Copy.glsl"));
         downShader = GraphicAPI.CreateStandardShader(vert, EmbeddedShaderSource.Read("HiZ_Down.glsl"));
     }
-
-    const string CopyFrag = @"#version 460 core
-in vec2 TexCoords;
-out float FragDepth;
-uniform sampler2D SourceDepth;
-void main() { FragDepth = texture(SourceDepth, TexCoords).r; }
-";
 
     void Ensure(int width, int height) {
         if (PyramidTexture != 0 && width == allocW && height == allocH)

@@ -75,7 +75,9 @@ public class SkyboxRenderer : ISkyboxDrawable {
         cubemapVertexBuffer = GraphicAPI.CreateVertexBuffer3(renderContext);
         cubemapVertexBuffer.Create();
         cubemapVertexBuffer.SetBufferData(in skyboxVertices, BufferUsageHint.StaticDraw);
-        skyboxShader = GraphicAPI.CreateStandardShader(skyboxVertexShader, skyboxFragmentShader);
+        skyboxShader = GraphicAPI.CreateStandardShader(
+            EmbeddedShaderSource.Read("Skybox_Vert.glsl"),
+            EmbeddedShaderSource.Read("Skybox_Frag.glsl"));
     }
 
     public void RenderSkybox() {
@@ -132,33 +134,4 @@ public class SkyboxRenderer : ISkyboxDrawable {
         GL.Enable(EnableCap.CullFace);
     }
 
-    public string skyboxVertexShader = @"#version 330 core
-layout (location = 0) in vec3 aPos;
-
-out vec3 TexCoords;
-
-uniform mat4 projection;
-uniform mat4 view;
-uniform mat4 rotation;
-void main()
-{
-      mat4 rotView = mat4(mat3(view)) * rotation; 
-    vec4 pos = projection * rotView * vec4(aPos, 1.0);
-    gl_Position = pos.xyww;
-    TexCoords = aPos;
-}";
-
-    public string skyboxFragmentShader = @"#version 330 core
-out vec4 FragColor;
-in vec3 TexCoords;
-
-uniform samplerCube skybox;
-uniform float exposure;
-
-void main()
-{
-    vec4 sky = texture(skybox, TexCoords);
-    FragColor = vec4(sky.rgb * exposure, sky.a);
-}
-";
 }
