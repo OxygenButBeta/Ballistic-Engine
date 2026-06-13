@@ -744,10 +744,13 @@ public class GLHDRenderer : HDRenderer {
                     ref projection, skyExposureBase * preExposure);
             }
 
-        // SSGI first: it adds AO-occluded indirect bounce to the lit color, so the
-        // reflections SSR gathers afterwards see the GI-lifted scene, not the crushed one.
-        // Reconstructs from the jittered depth -> gets renderProjection (see note above).
-        if (PostFX.SsgiEnabled)
+        // SSGI: AO-occluded indirect bounce, added before SSR so reflections see the GI-lifted scene.
+        // SUPPRESSED when SDF-GI is active: both are indirect-light systems, and stacking them
+        // DOUBLE-COUNTS the bounce (measured: SunTemple SSGI-only +14.8, SDFGI-only +12.6, both +28.5
+        // ~= the sum). SDF-GI is the more complete system (off-screen + multi-bounce), so when it's on
+        // it IS the GI and SSGI steps aside; with SDF-GI off, SSGI is the default GI as before.
+        bool sdfGiActive = sdfGiEnabled && sdfGi.Available;
+        if (PostFX.SsgiEnabled && !sdfGiActive)
             using (timers.Time("SSGI"))
                 litColor = ssgi.Render(targetIndex, litColor, target.DepthTextureId, target.NormalTextureId,
                     aoTexture, target.LenX, target.LenY, ref view, ref renderProjection, ref projection,
