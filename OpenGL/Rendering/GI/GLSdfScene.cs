@@ -24,18 +24,20 @@ public sealed class GLSdfScene : IDisposable {
     public const int InstanceBinding = 8;
     public const int SlotTableBinding = 9;
 
-    // binding 8 entry. std430: mat4 (64B, 16-aligned) + 4 uints (16B) = 80B, multiple of 16.
-    // The march transforms a world-space point into mesh-local space with WorldToLocal, then
-    // looks up SdfSlotGpu[Slot] to find the atlas sub-volume to sample.
+    // binding 8 entry. std430: mat4 (64B) + 2 vec4 (32B) + 4 uints (16B) = 112B, multiple of 16.
+    // The march pre-rejects by WorldAabbMin/Max (cheap, before the transform), then transforms a
+    // world point into mesh-local space with WorldToLocal and looks up SdfSlotGpu[Slot] to sample.
     [StructLayout(LayoutKind.Sequential)]
     public struct SdfInstance {
         public Matrix4 WorldToLocal; // 64B — inverse(world)
+        public Vector4 WorldAabbMin; // 16B — instance world-space AABB min (xyz; w unused)
+        public Vector4 WorldAabbMax; // 16B — instance world-space AABB max
         public uint Slot;            // index into the slot table (binding 9)
         public uint Pad0;
         public uint Pad1;
-        public uint Pad2;            // pad to 80B (multiple of 16)
+        public uint Pad2;            // pad to 112B (multiple of 16)
 
-        public const int SizeBytes = 80;
+        public const int SizeBytes = 112;
     }
 
     // binding 9 entry — mirrors GLSdfAtlas.SdfSlot for the GPU. Kept dead simple: all vec4 so the
@@ -111,9 +113,17 @@ public sealed class GLSdfScene : IDisposable {
             // worldToLocal: Matrix4.Invert returns the inverse (throws only on a singular matrix,
             // which a valid TRS world matrix never is).
             Matrix4 worldToLocal = Matrix4.Invert(world);
+            // World-space AABB of this instance's brick, for the march's cheap pre-reject: transform
+            // the 8 corners of the slot's mesh-local bounds by `world` and take the extents. Computed
+            // once per frame here so the per-step march only does a 6-compare box test.
+            int s = Math.Max(slot, 0);
+            SdfSlotGpu sl = s < (atlas?.SlotCount ?? 0) ? atlas!.SlotAt(s) : default;
+            WorldAabb(world, sl.BoundsMin.Xyz, sl.BoundsMax.Xyz, out Vector3 wMin, out Vector3 wMax);
             instanceScratch[n] = new SdfInstance {
                 WorldToLocal = worldToLocal,
-                Slot = (uint)Math.Max(slot, 0),
+                WorldAabbMin = new Vector4(wMin, 0f),
+                WorldAabbMax = new Vector4(wMax, 0f),
+                Slot = (uint)s,
                 Pad0 = 0, Pad1 = 0, Pad2 = 0,
             };
             n++;
@@ -129,6 +139,22 @@ public sealed class GLSdfScene : IDisposable {
             slotScratch[i] = atlas!.SlotAt(i);
         SlotCount = slots;
         UploadStructs(slotBuffer, slotScratch, slots, SdfSlotGpu.SizeBytes, ref slotCapacity);
+    }
+
+    // World-space AABB of a local box under a transform: the 8 transformed corners' extents. (A
+    // rotation-aware AABB — looser than oriented bounds but correct and cheap, computed once/frame.)
+    static void WorldAabb(Matrix4 world, Vector3 lmin, Vector3 lmax, out Vector3 wmin, out Vector3 wmax) {
+        wmin = new Vector3(float.MaxValue);
+        wmax = new Vector3(float.MinValue);
+        for (int i = 0; i < 8; i++) {
+            var corner = new Vector3(
+                (i & 1) == 0 ? lmin.X : lmax.X,
+                (i & 2) == 0 ? lmin.Y : lmax.Y,
+                (i & 4) == 0 ? lmin.Z : lmax.Z);
+            Vector3 w = (new Vector4(corner, 1f) * world).Xyz;
+            wmin = Vector3.ComponentMin(wmin, w);
+            wmax = Vector3.ComponentMax(wmax, w);
+        }
     }
 
     // Uploads the first `count` structs from `data` into `buffer`. Reallocates (BufferData) only when

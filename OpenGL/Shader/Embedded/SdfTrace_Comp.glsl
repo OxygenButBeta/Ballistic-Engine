@@ -55,6 +55,8 @@ layout(rgba16f, binding = 0) uniform writeonly image2D OutGi;
 // ---------------------------------------------------------------------------------------
 struct SsdfInstance {
     mat4 worldToLocal;
+    vec4 worldAabbMin;   // xyz = instance world-space AABB min (cheap pre-reject before the transform)
+    vec4 worldAabbMax;   // xyz = instance world-space AABB max
     uint slot;
     uint p0;
     uint p1;
@@ -216,6 +218,12 @@ float SceneSdf(vec3 worldP, out uint nearestSlot, out vec3 nearestLocal, out boo
     anyInside = false;
     for (uint i = 0u; i < InstanceCount; ++i) {
         SsdfInstance inst = instances[i];
+        // Cheap world-AABB pre-reject BEFORE the matrix transform + 8 texelFetches: skip any
+        // instance the march point isn't inside (a small margin covers the padded brick shell).
+        // This is the perf win for hundreds of per-submesh instances — most are far from any point.
+        if (any(lessThan(worldP, inst.worldAabbMin.xyz)) ||
+            any(greaterThan(worldP, inst.worldAabbMax.xyz)))
+            continue;
         vec3 local = (inst.worldToLocal * vec4(worldP, 1.0)).xyz;
         bool inside;
         float sd = SampleSlot(inst.slot, local, inside);
