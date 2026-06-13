@@ -37,8 +37,14 @@ public sealed class GpuDrivenRenderer : IDisposable {
     public const int BatchCutout = 1;
 
     int cullProgram;
-    GLPersistentBuffer metaBuf;       // SubmeshMeta[]
-    GLPersistentBuffer cullParamsBuf; // CullParams UBO (std140)
+    // Plain SSBOs (NOT persistent-mapped). Metadata is re-uploaded only on a rebuild (rare), cull
+    // params per cull — GL orders BufferData/BufferSubData before the dispatch that reads them
+    // automatically. The persistent triple-buffered variant raced (a missing client-mapped barrier
+    // let the compute read stale metadata → whole solid batch culled → flicker).
+    int metaBuffer;                   // SubmeshMeta[]
+    int metaCapacity;                 // submeshes the metaBuffer is sized for
+    int cullParamsBuffer;             // CullParams UBO (std140, 112 bytes)
+    readonly byte[] cullParamsCpu = new byte[112];
     readonly int[] cmdBuffer = new int[BatchCount];     // DrawCommand[] per batch
     readonly int[] countBuffer = new int[BatchCount];   // single uint per batch
     readonly int[] perDrawBuffer = new int[BatchCount]; // PerDrawData[] per batch
@@ -67,25 +73,31 @@ public sealed class GpuDrivenRenderer : IDisposable {
                 BufferUsageHint.DynamicDraw);
         }
         materialBuffer = GL.GenBuffer();
-        GL.BindBuffer(BufferTarget.ShaderStorageBuffer, 0);
+        metaBuffer = GL.GenBuffer();
 
-        // CullParams: 6*vec4 planes + 4 uints = 96 + 16 = 112 bytes, std140.
-        cullParamsBuf = new GLPersistentBuffer(112, RegionCount);
+        // CullParams UBO: 6*vec4 planes + 4 uints = 96 + 16 = 112 bytes, std140. Plain DynamicDraw.
+        cullParamsBuffer = GL.GenBuffer();
+        GL.BindBuffer(BufferTarget.UniformBuffer, cullParamsBuffer);
+        GL.BufferData(BufferTarget.UniformBuffer, 112, IntPtr.Zero, BufferUsageHint.DynamicDraw);
+        GL.BindBuffer(BufferTarget.UniformBuffer, 0);
+        GL.BindBuffer(BufferTarget.ShaderStorageBuffer, 0);
 
         Available = true;
     }
 
     // Ensures GPU buffers are sized for `count` submeshes. Grows by reallocating (rare — only when
-    // a new/larger mesh arrives). The metadata persistent buffer is also resized here.
+    // a new/larger mesh arrives).
     void EnsureCapacity(int count) {
-        if (count <= submeshCapacity && metaBuf is not null)
+        if (count <= submeshCapacity && metaCapacity >= count)
             return;
 
         int cap = Math.Max(count, 256);
         submeshCapacity = cap;
+        metaCapacity = cap;
 
-        metaBuf?.Dispose();
-        metaBuf = new GLPersistentBuffer(cap * SubmeshMeta.SizeBytes, RegionCount);
+        GL.BindBuffer(BufferTarget.ShaderStorageBuffer, metaBuffer);
+        GL.BufferData(BufferTarget.ShaderStorageBuffer, cap * SubmeshMeta.SizeBytes,
+            IntPtr.Zero, BufferUsageHint.DynamicDraw);
 
         for (var b = 0; b < BatchCount; b++) {
             GL.BindBuffer(BufferTarget.ShaderStorageBuffer, cmdBuffer[b]);
@@ -103,9 +115,11 @@ public sealed class GpuDrivenRenderer : IDisposable {
     // Marks the metadata as needing a rebuild (the renderer moved, or material set changed).
     public void Invalidate() => metaDirty = true;
 
-    // Builds the per-submesh metadata array on the CPU and streams it to the GPU IF dirty.
+    SubmeshMeta[] metaScratch = [];
+
+    // Builds the per-submesh metadata array on the CPU and uploads it to the GPU IF dirty.
     // `models[i]` is the per-submesh model matrix; bounds are local AABBs; matIds index the table.
-    public unsafe void UpdateMetadata(int count, Matrix4 worldMatrix,
+    public void UpdateMetadata(int count, Matrix4 worldMatrix,
         Matrix4[] models, Vector3[] localMin, Vector3[] localMax,
         uint[] firstIndex, uint[] indexCount, uint[] materialId, uint[] flags) {
         EnsureCapacity(count);
@@ -117,10 +131,10 @@ public sealed class GpuDrivenRenderer : IDisposable {
         lastWorldMatrix = worldMatrix;
         metaDirty = false;
 
-        byte* dst = metaBuf.BeginFrame();
-        var span = new Span<SubmeshMeta>(dst, count);
+        if (metaScratch.Length < count)
+            metaScratch = new SubmeshMeta[count];
         for (var i = 0; i < count; i++) {
-            span[i] = new SubmeshMeta {
+            metaScratch[i] = new SubmeshMeta {
                 Model = models[i],
                 LocalAabbMin = new Vector4(localMin[i], 0f),
                 LocalAabbMax = new Vector4(localMax[i], 0f),
@@ -130,7 +144,11 @@ public sealed class GpuDrivenRenderer : IDisposable {
                 Flags = flags[i],
             };
         }
-        metaBuf.EndFrame();
+        // Plain BufferSubData — GL orders it before the cull dispatch that reads metaBuffer.
+        GL.BindBuffer(BufferTarget.ShaderStorageBuffer, metaBuffer);
+        GL.BufferSubData(BufferTarget.ShaderStorageBuffer, IntPtr.Zero,
+            count * SubmeshMeta.SizeBytes, metaScratch);
+        GL.BindBuffer(BufferTarget.ShaderStorageBuffer, 0);
     }
 
     // Runs the cull compute: zero the count, upload frustum planes, dispatch one invocation per
@@ -147,24 +165,28 @@ public sealed class GpuDrivenRenderer : IDisposable {
         GL.BufferSubData(BufferTarget.ShaderStorageBuffer, IntPtr.Zero, sizeof(uint), ref zero);
 
         // Upload CullParams (std140): 6 vec4 planes, then submeshCount, pass, cutoutFilter, pad.
-        byte* cp = cullParamsBuf.BeginFrame();
-        var planeSpan = new Span<Vector4>(cp, 6);
-        for (var i = 0; i < 6; i++)
-            planeSpan[i] = frustumPlanes[i];
-        var tail = (uint*)(cp + 96);
-        tail[0] = (uint)currentSubmeshCount;
-        tail[1] = pass;
-        tail[2] = cutoutFilter;
-        tail[3] = 0;
-        cullParamsBuf.EndFrame();
+        fixed (byte* cp = cullParamsCpu) {
+            var planeSpan = new Span<Vector4>(cp, 6);
+            for (var i = 0; i < 6; i++)
+                planeSpan[i] = frustumPlanes[i];
+            var tail = (uint*)(cp + 96);
+            tail[0] = (uint)currentSubmeshCount;
+            tail[1] = pass;
+            tail[2] = cutoutFilter;
+            tail[3] = 0;
+        }
+        GL.BindBuffer(BufferTarget.UniformBuffer, cullParamsBuffer);
+        GL.BufferSubData(BufferTarget.UniformBuffer, IntPtr.Zero, 112, cullParamsCpu);
+        GL.BindBuffer(BufferTarget.UniformBuffer, 0);
 
-        // Bind this batch's buffers and dispatch.
-        metaBuf.BindRange(BufferRangeTarget.ShaderStorageBuffer, MetaBinding,
-            currentSubmeshCount * SubmeshMeta.SizeBytes);
+        // Bind this batch's buffers and dispatch. (BufferSubData above is ordered before the
+        // dispatch by GL, so the compute reads the freshly-written metadata/params/count.)
+        GL.BindBufferRange(BufferRangeTarget.ShaderStorageBuffer, MetaBinding, metaBuffer,
+            IntPtr.Zero, currentSubmeshCount * SubmeshMeta.SizeBytes);
         GL.BindBufferBase(BufferRangeTarget.ShaderStorageBuffer, CmdBinding, cmdBuffer[batch]);
         GL.BindBufferBase(BufferRangeTarget.ShaderStorageBuffer, CountBinding, countBuffer[batch]);
         GL.BindBufferBase(BufferRangeTarget.ShaderStorageBuffer, PerDrawBinding, perDrawBuffer[batch]);
-        cullParamsBuf.BindRange(BufferRangeTarget.UniformBuffer, CullParamsBinding, 112);
+        GL.BindBufferBase(BufferRangeTarget.UniformBuffer, CullParamsBinding, cullParamsBuffer);
 
         GL.UseProgram(cullProgram);
         int groups = (currentSubmeshCount + 63) / 64;
@@ -230,13 +252,8 @@ public sealed class GpuDrivenRenderer : IDisposable {
 
     public int MaterialIndexOf(Material m) => materialTable.IndexOf(m);
 
-    // Fences the per-frame buffers after the draws that consumed them. Only cullParamsBuf advances
-    // every frame (BeginFrame in Cull); metaBuf advances ONLY on a rebuild (its BeginFrame/EndFrame
-    // are paired inside UpdateMetadata), so it is NOT fenced here — re-fencing a region BeginFrame
-    // didn't hand out this frame would stall against stale work.
-    public void EndFrame() {
-        cullParamsBuf?.EndFrame();
-    }
+    // No-op now that the buffers are plain (GL handles ordering). Kept for the call site.
+    public void EndFrame() { }
 
     static int CompileCompute(string src) {
         int shader = GL.CreateShader(ShaderType.ComputeShader);
@@ -263,8 +280,8 @@ public sealed class GpuDrivenRenderer : IDisposable {
     }
 
     public void Dispose() {
-        metaBuf?.Dispose();
-        cullParamsBuf?.Dispose();
+        if (metaBuffer != 0) GL.DeleteBuffer(metaBuffer);
+        if (cullParamsBuffer != 0) GL.DeleteBuffer(cullParamsBuffer);
         for (var b = 0; b < BatchCount; b++) {
             if (cmdBuffer[b] != 0) GL.DeleteBuffer(cmdBuffer[b]);
             if (countBuffer[b] != 0) GL.DeleteBuffer(countBuffer[b]);
