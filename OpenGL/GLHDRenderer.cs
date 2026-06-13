@@ -85,12 +85,13 @@ public class GLHDRenderer : HDRenderer {
     bool gpuDrivenShadows = Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN_SHADOWS") != "0";
     bool gpuDrivenReady;
 
-    // Voxel Cone Tracing GI (UE5/Lumen-class colored multi-bounce indirect). Opt-IN
-    // (BALLISTIC_VOXELGI=1) while A/B'd against the flat baked-probe ambient; voxelizes the
-    // whole-mesh scene each time the geometry/sun stamp changes, then the forward shader cone-traces
-    // the voxel radiance for indirect diffuse + glossy. Default off until it clearly beats the baseline.
+    // Voxel Cone Tracing GI (UE5/Lumen-class colored multi-bounce indirect). DEFAULT ON
+    // (BALLISTIC_VOXELGI=0 to disable). Voxelizes the GPU-driven whole-mesh scene each time the
+    // geometry/sun/camera-cell stamp changes, then the forward shader cone-traces the voxel radiance
+    // for indirect diffuse + glossy. Safe when no eligible mesh exists: the grid stays empty and the
+    // cone trace adds 0 (== baseline ambient). Needs the GPU-driven path (shares its MDI draw).
     readonly OpenGL.VoxelGI.GLVoxelGI voxelGI = new(128);
-    bool voxelGiEnabled = Environment.GetEnvironmentVariable("BALLISTIC_VOXELGI") == "1";
+    bool voxelGiEnabled = Environment.GetEnvironmentVariable("BALLISTIC_VOXELGI") != "0";
     bool voxelGiReady;
     // Scratch reused each frame when building the whole-mesh renderer's submesh metadata.
     Matrix4[] gdModels = [];
