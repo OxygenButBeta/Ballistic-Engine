@@ -1,0 +1,88 @@
+# Cornell Box — canonical GI ground-truth. Closed box, open at +Z (camera side).
+# Units: metres. Box spans X[-1,1] Y[0,2] Z[-1,1]. Shell faces wind so their normals point
+# INWARD (the camera sits inside, so inner faces must be front-facing / not backface-culled).
+# Lit ONLY by the ceiling emissive quad -> surfaces outside the light's direct cone are lit
+# purely by INDIRECT bounce. GI off = black walls; GI on = color-bled fill. Unmistakable.
+mtllib CornellBox.mtl
+
+# ---- Floor (white), normal +Y (up, into the room) ----
+v -1 0 -1
+v -1 0  1
+v  1 0  1
+v  1 0 -1
+usemtl white
+f -4 -3 -2 -1
+
+# ---- Ceiling (white), normal -Y (down, into the room) ----
+v -1 2 -1
+v  1 2 -1
+v  1 2  1
+v -1 2  1
+usemtl white
+f -4 -3 -2 -1
+
+# ---- Back wall (white), normal +Z (toward camera, into the room) ----
+v -1 0 -1
+v  1 0 -1
+v  1 2 -1
+v -1 2 -1
+usemtl white
+f -4 -3 -2 -1
+
+# ---- Left wall (RED), normal +X (into the room) ----
+v -1 0 -1
+v -1 2 -1
+v -1 2  1
+v -1 0  1
+usemtl red
+f -4 -3 -2 -1
+
+# ---- Right wall (GREEN), normal -X (into the room) ----
+v 1 0 -1
+v 1 0  1
+v 1 2  1
+v 1 2 -1
+usemtl green
+f -4 -3 -2 -1
+
+# ---- Short box (white, right-front), outward-facing windings ----
+v  0.20 0.0 -0.10
+v  0.75 0.0  0.10
+v  0.55 0.0  0.65
+v  0.00 0.0  0.45
+v  0.20 0.6 -0.10
+v  0.75 0.6  0.10
+v  0.55 0.6  0.65
+v  0.00 0.6  0.45
+usemtl white
+f -4 -3 -2 -1
+f -8 -7 -6 -5
+f -5 -1 -2 -6
+f -8 -4 -1 -5
+f -7 -3 -4 -8
+f -6 -2 -3 -7
+
+# ---- Tall box (white, left-back), outward-facing windings ----
+v -0.65 0.0 -0.60
+v -0.10 0.0 -0.45
+v -0.30 0.0  0.10
+v -0.85 0.0 -0.05
+v -0.65 1.2 -0.60
+v -0.10 1.2 -0.45
+v -0.30 1.2  0.10
+v -0.85 1.2 -0.05
+usemtl white
+f -4 -3 -2 -1
+f -8 -7 -6 -5
+f -5 -1 -2 -6
+f -8 -4 -1 -5
+f -7 -3 -4 -8
+f -6 -2 -3 -7
+
+# ---- Ceiling area light (emissive), normal -Y (down) ----
+v -0.35 1.98 -0.35
+v  0.35 1.98 -0.35
+v  0.35 1.98  0.35
+v -0.35 1.98  0.35
+usemtl light
+f -4 -3 -2 -1

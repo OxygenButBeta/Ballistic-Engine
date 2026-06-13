@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "shader": "Assets/Default/Shaders/Standard.shader",
+  "textures": {},
+  "transparent": false,
+  "opacity": 1,
+  "emissiveColor": [
+    18,
+    16,
+    12
+  ],
+  "emissiveIntensity": 1,
+  "baseColor": [
+    0,
+    0,
+    0,
+    1
+  ]
+}

@@ -35,8 +35,16 @@ public static class MaterialLoader {
         material.Transparent = definition.Transparent;
         material.Opacity = Math.Clamp(definition.Opacity, 0f, 1f);
         material.EmissiveIntensity = MathF.Max(definition.EmissiveIntensity, 0f);
-        if (definition.EmissiveColor is { Length: >= 3 } emissive)
-            material.EmissiveColor = new OpenTK.Mathematics.Vector3(emissive[0], emissive[1], emissive[2]);
+        bool authoredEmissiveColor = false;
+        if (definition.EmissiveColor is { Length: >= 3 } emissive) {
+            var c = new OpenTK.Mathematics.Vector3(emissive[0], emissive[1], emissive[2]);
+            material.EmissiveColor = c;
+            authoredEmissiveColor = c.LengthSquared > 1e-6f;
+        }
+        // Emissive when there's a map OR an authored non-black colour with positive intensity. The
+        // renderer's HasEmissive gates on this, so a COLOR-ONLY emissive emits (not just textured).
+        material.IsEmissive = material.Emissive is not null ||
+                              (authoredEmissiveColor && material.EmissiveIntensity > 0f);
         material.PackedOrm = ResolvePackedOrm(definition);
         material.Cutout = ResolveCutout(definition);
 

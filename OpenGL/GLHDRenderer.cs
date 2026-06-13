@@ -3287,7 +3287,10 @@ public class GLHDRenderer : HDRenderer {
         shader.SetBool("NormalFlipY", material.NormalFlipY);
         shader.SetFloat("NormalStrength", material.NormalStrength * NormalStrength);
         shader.SetFloat3("EmissiveFactor", material.EmissiveColor * material.EmissiveIntensity);
-        shader.SetBool("HasEmissive", material.Emissive is not null);
+        // IsEmissive (map OR authored colour), not just a map — so a colour-only emissive (neon,
+        // screens, area lights, the Cornell light) emits. The default emissive texture is white, so
+        // texture(Emissive)*EmissiveFactor = the authored colour when there's no map.
+        shader.SetBool("HasEmissive", material.IsEmissive);
         shader.SetBool("AlphaBlend", material.Transparent);
         shader.SetFloat("Opacity", material.Opacity);
         shader.SetBool("AlphaCutout", material.Cutout);

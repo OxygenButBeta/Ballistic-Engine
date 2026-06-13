@@ -1,0 +1,47 @@
+version: 1
+name: CornellBox
+sceneComponents:
+- type: SceneLighting
+  id: a1000000000000000000000000000001
+  enabled: true
+  members:
+    sunIntensity: 0
+    ambientIntensity: 0
+entities:
+- id: c0000000000000000000000000000001
+  name: Camera
+  isActive: true
+  tag:
+  layer: 0
+  prefabSource:
+  transform:
+    position: {x: 0, y: 1.0, z: 3.6}
+    rotation: {x: 0, y: 1, z: 0, w: 0}
+    scale: {x: 1, y: 1, z: 1}
+    parent:
+  components:
+  - type: HDCamera
+    id: c1000000000000000000000000000001
+    enabled: true
+    members:
+      fieldOfView: 45
+      nearPlane: 0.1
+      farPlane: 100
+- id: b0000000000000000000000000000001
+  name: CornellBox
+  isActive: true
+  tag:
+  layer: 0
+  prefabSource:
+  transform:
+    position: {x: 0, y: 0, z: 0}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 1, y: 1, z: 1}
+    parent:
+  components:
+  - type: StaticMeshRenderer
+    id: b1000000000000000000000000000001
+    enabled: true
+    members:
+      sharedMesh: Assets/CornellBox/CornellBox.obj
+      subMeshIndex: -1

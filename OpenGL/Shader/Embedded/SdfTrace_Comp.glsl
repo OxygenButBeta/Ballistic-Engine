@@ -138,6 +138,9 @@ const float HIT_EPS     = 0.02;   // |dist| below this = surface hit (metres)
 const float MIN_STEP    = 0.05;   // floor on the advance so we never stall in a flat region
 const float EMPTY_STEP  = 0.75;   // coarse fixed step through space NO brick covers (sparse scenes)
 const float NORMAL_EPS  = 0.05;   // finite-difference step for the SDF gradient (metres)
+const float SELF_SKIP   = 0.20;   // push the ray origin this far off the surface + ignore hits
+                                  // closer than this — clears the surface's OWN coarse SDF shell so
+                                  // a ray can't self-hit (the grazing-wall salt-and-pepper).
 const float PI = 3.14159265359;
 
 // MUST be a true component SELECT, never arithmetic on the bad value: mix(v, 0, flag) expands
@@ -366,8 +369,12 @@ void main() {
     vec3 T = normalize(cross(up, worldN));
     vec3 B = cross(worldN, T);
 
-    // Start the march just off the surface so we don't immediately self-hit our own SDF.
-    vec3 origin = worldP + worldN * max(HIT_EPS * 2.0, MIN_STEP);
+    // Start the march well off the surface so a ray doesn't immediately self-hit the surface's OWN
+    // SDF brick (the salt-and-pepper on grazing walls: at 24^3 the brick shell is ~one cell ≈ 8cm
+    // thick, far more than the old 5cm offset, so the origin sat INSIDE its own shell and rays
+    // randomly hit/escaped). Push off by SELF_SKIP and also require the ray to TRAVEL past it before
+    // a hit counts (the SELF_SKIP gate in the march), so the surface can't shadow/hit itself.
+    vec3 origin = worldP + worldN * SELF_SKIP;
 
     vec3 gathered = vec3(0.0);
     int hitCount = 0;
@@ -397,7 +404,10 @@ void main() {
 
             // Hit when we're at (or just inside) a surface AND we were actually inside some
             // instance's volume (anyInside guards against the 1e9 "no slot covers this point").
-            if (anyInside && dist < HIT_EPS) {
+            // The traveled >= SELF_SKIP gate ignores the surface's OWN brick: at coarse 24^3 the
+            // origin starts inside its own SDF shell, so without this a grazing wall self-hits and
+            // produces the salt-and-pepper.
+            if (anyInside && dist < HIT_EPS && traveled >= SELF_SKIP) {
                 hit = true;
                 hitPoint = p;
                 break;

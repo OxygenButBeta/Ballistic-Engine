@@ -79,7 +79,7 @@ public sealed class GpuMaterialTable : IDisposable {
         if (m.Metallic is not null) flags |= (uint)GpuMaterialFlags.HasMetallic;
         if (m.Roughness is not null) flags |= (uint)GpuMaterialFlags.HasRoughness;
         if (m.NormalFlipY) flags |= (uint)GpuMaterialFlags.NormalFlipY;
-        if (m.Emissive is not null) flags |= (uint)GpuMaterialFlags.HasEmissive;
+        if (m.IsEmissive) flags |= (uint)GpuMaterialFlags.HasEmissive; // map OR authored colour
         if (m.Transparent) flags |= (uint)GpuMaterialFlags.AlphaBlend;
         if (m.Cutout) flags |= (uint)GpuMaterialFlags.AlphaCutout;
         if (m.Diffuse is not null) flags |= (uint)GpuMaterialFlags.HasDiffuse;
