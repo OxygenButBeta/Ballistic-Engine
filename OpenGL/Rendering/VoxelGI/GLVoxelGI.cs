@@ -32,7 +32,8 @@ public sealed class GLVoxelGI : IDisposable {
     readonly int[] uCascadeMatrices = new int[4];
 
     // Extra GI bounce passes after the direct pass (each compounds one more bounce). 0..2.
-    public int BouncePasses { get; set; } = 2;
+    public int BouncePasses { get; set; } =
+        int.TryParse(System.Environment.GetEnvironmentVariable("BALLISTIC_VOXELGI_BOUNCES"), out int bp) ? bp : 2;
 
     void CacheUniforms() {
         int L(string n) => GL.GetUniformLocation(voxelizeProgram, n);

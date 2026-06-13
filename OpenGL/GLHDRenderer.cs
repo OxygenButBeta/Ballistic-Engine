@@ -2046,10 +2046,14 @@ void main() {
     // GI grid must contain off-screen geometry too) and draws with the voxelize program so each
     // fragment scatters its radiance into the 3D texture.
     void RenderVoxelGI(ref Matrix4 view) {
-        // Find the GPU-driven-eligible whole-mesh renderer (the scene mesh).
+        // Find the GPU-driven-eligible whole-mesh renderer (the scene mesh). Search the FULL
+        // renderable set, NOT visibleOpaque — GI must voxelize the geometry even when the camera
+        // is looking away from it (e.g. inside an interior facing a wall), or the grid goes empty
+        // and the room stays black.
         IStaticMeshRenderer scene = null;
-        foreach (IStaticMeshRenderer t in visibleOpaque) {
-            if (IsGpuDrivenEligible(t) && DominantGpuDrivenShader(t) is not null) { scene = t; break; }
+        foreach (IStaticMeshRenderer t in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
+            if (t.IsRenderable && t.IsActive && IsGpuDrivenEligible(t) &&
+                DominantGpuDrivenShader(t) is not null) { scene = t; break; }
         }
         if (scene is null)
             return;
