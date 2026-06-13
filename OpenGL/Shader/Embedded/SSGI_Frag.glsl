@@ -194,7 +194,14 @@ void main() {
                     }
                     bits |= sampleBits;
                 }
+                // Early-out: once every sector is occluded, no later sample on this slice can
+                // contribute (sampleBits = OccludeSectors(..) & ~bits would be 0), so the rest of
+                // this slice's marching is wasted work. Bit-identical result, fewer texture fetches.
+                if (bits == 0xFFFFFFFFu)
+                    break;
             }
+            if (bits == 0xFFFFFFFFu)
+                break; // both sides of this slice are fully occluded — skip the other side too
         }
 
         // The sectors no sample occluded are open sky for this slice.
