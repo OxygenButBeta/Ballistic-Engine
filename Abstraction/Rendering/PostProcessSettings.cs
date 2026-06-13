@@ -143,6 +143,21 @@ public sealed class PostProcessSettings {
     public float VolumetricFeedback { get; set; } = 0.9f;             // temporal history weight (smoother/laggier)
     public OpenTK.Mathematics.Vector3 VolumetricTint { get; set; } = OpenTK.Mathematics.Vector3.One; // in-scatter colour grade
 
+    // --- Light Shafts / god-rays (its OWN volume component, separate from the physical fog) ---
+    // A SEPARATE effect that exists only to make light beams VISIBLE: it reuses the volumetric
+    // march machinery (half-res, shadow-gated, temporal) but adds a purely additive in-scatter
+    // — the sun's shadow contrast becomes readable shafts, and point/spot cones glow. It runs
+    // independently of VolumetricFog: if fog is also on, the shafts ride on top of it WITHOUT
+    // changing the fog's density/extinction/skylight (its physical accuracy is untouched); if
+    // fog is off, the shaft pass supplies its own thin medium so you still get beams. Off by
+    // default — turning it on is the ONLY thing that changes the frame.
+    public bool LightShaftsEnabled { get; set; }
+    public float LightShaftsSun { get; set; } = 1f;                   // sun god-ray strength: visibility-gated in-scatter toward the sun
+    public float LightShaftsPunctual { get; set; } = 1f;             // point/spot god-ray strength: in-scatter from punctual lights
+    public bool LightShaftsPunctualShadows { get; set; } = true;     // carve punctual shafts with the punctual shadow map (off = fills the whole cone)
+    public float LightShaftsDensity { get; set; } = 0.02f;           // the shaft medium's own fog density (used when VolumetricFog is off; 1/m)
+    public float LightShaftsIntensity { get; set; } = 1f;            // master multiplier on the composited shafts
+
     // 1 = off. Offscreen targets are recreated when this changes. Ignored while TAA is on.
     public int MsaaSamples { get; set; } = 4;
 
@@ -164,8 +179,11 @@ public sealed class PostProcessSettings {
     public int ContactShadowSteps { get; set; } = 12;
     public float ContactShadowThickness { get; set; } = 0.5f;  // depth window counted as a hit
 
-    // Stylistic extras, all neutral/off by default.
-    public float Contrast { get; set; } = 1f;
+    // Stylistic extras. Contrast defaults to 1.15 (not neutral): the ACES output crushes scenes
+    // into the midtones (flat/hazy look) — a modest midtone-pivot expansion restores the full tonal
+    // range + UE5 punch. This is the fallback when no ColorAdjustments volume overrides it; the
+    // volume default matches. A pure-neutral grade can set 1.0.
+    public float Contrast { get; set; } = 1.15f;
     public float Saturation { get; set; } = 1f;
     public float VignetteStrength { get; set; }
     public float VignetteRoundness { get; set; } = 1f;  // 1 = circular, 0 = aspect-following oval
