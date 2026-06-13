@@ -1196,7 +1196,15 @@ void main() {
                     visibleOpaque.Add(target);
                     // For a whole-mesh renderer, refine to per-submesh visibility so off-screen parts
                     // of one big scene mesh stop drawing. Per-submesh renderers are already whole-culled.
-                    if (target.SubMeshIndex < 0)
+                    // SKIP when the GPU-driven path owns this renderer for BOTH the camera and shadows:
+                    // the GPU compute cull replaces this ~1600-test CPU loop (+ the 8-corner world-AABB
+                    // rebuild on move), and nothing CPU-side reads the mask/AABBs then. This was the
+                    // residual per-move CPU cost after the draw-call and shadow-submit wins.
+                    // Require the FULL GPU-path gate (incl. a single dominant shader) — a mixed-shader
+                    // whole mesh falls back to the CPU draw, which needs this mask.
+                    bool gpuOwnsThis = gpuDrivenReady && gpuDrivenShadows && IsGpuDrivenEligible(target) &&
+                                       DominantGpuDrivenShader(target) is not null;
+                    if (target.SubMeshIndex < 0 && !gpuOwnsThis)
                         ComputeSubmeshVisibility(target);
                 }
             }
