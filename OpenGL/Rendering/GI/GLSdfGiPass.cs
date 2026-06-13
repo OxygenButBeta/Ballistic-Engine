@@ -136,7 +136,7 @@ public sealed class GLSdfGiPass : IDisposable {
     bool overflowLogged;
 
     // Scratch instance list reused across frames (allocation-light per the GLSdfScene contract).
-    readonly List<(Matrix4 world, int slot)> instances = new();
+    readonly List<(Matrix4 world, int slot, Vector3 albedo, Vector3 emissive)> instances = new();
 
     int frameIndex;
 
@@ -253,7 +253,14 @@ public sealed class GLSdfGiPass : IDisposable {
                 int slot = SlotForSubMesh(mesh, s);
                 if (slot < 0)
                     continue; // skipped (too small / cap / failed) — no GI from this submesh
-                instances.Add((world, slot));
+                // Per-instance albedo + emissive for the surface-cache inject: the brick has no
+                // per-voxel material, so one value per submesh (its material's base colour /
+                // emissive). Coarse but stable — exactly what the cached low-frequency bounce wants.
+                Material mat = r.MaterialFor(s);
+                Vector3 albedo = mat != null ? mat.BaseColorFactor.Xyz : new Vector3(0.5f);
+                Vector3 emissive = mat is { IsEmissive: true }
+                    ? mat.EmissiveColor * mat.EmissiveIntensity : Vector3.Zero;
+                instances.Add((world, slot, albedo, emissive));
             }
         }
 

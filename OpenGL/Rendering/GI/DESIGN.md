@@ -1,3 +1,32 @@
+# SURFACE CACHE (P7.2, IN PROGRESS 2026-06-14) — the proper fix for the screen-read speckle
+
+The per-pixel screen-space radiance read flickers (speckle). Replace it with a STABLE per-surface
+voxel radiance cache stored alongside the SDF. STATUS:
+- DONE (data plumbing, compiles): GLSdfAtlas now owns a parallel RGBA16F `RadianceTextureId`
+  (same size + slot layout as the SDF brick). GLSdfScene.SdfInstance carries Albedo + Emissive
+  (vec4 each; struct now 144B); GLSdfGiPass.EnsureBaked fills them from each submesh's material
+  (BaseColorFactor.Xyz, EmissiveColor*Intensity when IsEmissive). instances tuple is now
+  (world, slot, albedo, emissive).
+- TODO NEXT (the core, NOT yet written):
+  1. RadianceInject_Comp.glsl + a GLSdfGiPass inject step (run each frame BEFORE the march):
+     dispatch over instances; for each, iterate its brick's voxels (Res from the slot table); for a
+     NEAR-SURFACE voxel (|sdf| < ~1 cell), compute its world pos (local = boundsMin + (v+0.5)*cell;
+     world = inverse(worldToLocal)*local — pass the world matrix too, or invert on GPU), evaluate lit
+     radiance = Albedo * (SunColor*max(0,N·sun)*shadowVis + skyIrradiance) + Emissive, where N = SDF
+     gradient at the voxel. TEMPORAL-EMA blend into RadianceTextureId via imageLoad/imageStore
+     (rgb=radiance, a=occupancy). Optionally += last-frame radiance read along N for multi-bounce.
+     Bind RadianceTextureId as image (writeonly/readwrite), SDF atlas as sampler, shadow map, etc.
+     Reuse the instance grid? No — inject is per-instance-per-voxel, dispatch (sumVoxels) or
+     (instances × maxVoxels) with a bounds check.
+  2. SdfTrace_Comp HitRadiance: REPLACE the screen-space read with `texture(RadianceAtlas, atlasUVW)`
+     at the hit's local→atlas coords (same mapping as SampleSlot). Stable per-surface radiance, no
+     screen flicker, works off-screen. Keep the screen-read as an optional refinement or drop it.
+  3. Add RadianceAtlas sampler binding (unit 7) to the march; bind atlas.RadianceTextureId.
+- VERIFY on Cornell: speckle GONE, red/green walls visibly bleed onto neighbours, multi-bounce,
+  flag-OFF byte-identical. This is the proper architecture (user: don't skip proper solutions).
+
+---
+
 # SDF World-Space GI (P6.3–P6.5) — design
 
 Goal: dynamic OFF-SCREEN indirect light — the Lumen differentiator the baked IBL probes

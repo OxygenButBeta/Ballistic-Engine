@@ -24,20 +24,23 @@ public sealed class GLSdfScene : IDisposable {
     public const int InstanceBinding = 8;
     public const int SlotTableBinding = 9;
 
-    // binding 8 entry. std430: mat4 (64B) + 2 vec4 (32B) + 4 uints (16B) = 112B, multiple of 16.
+    // binding 8 entry. std430: mat4 (64B) + 4 vec4 (64B) + 4 uints (16B) = 144B, multiple of 16.
     // The march pre-rejects by WorldAabbMin/Max (cheap, before the transform), then transforms a
     // world point into mesh-local space with WorldToLocal and looks up SdfSlotGpu[Slot] to sample.
+    // Albedo/Emissive feed the surface-cache radiance inject (the lit radiance at this surface).
     [StructLayout(LayoutKind.Sequential)]
     public struct SdfInstance {
         public Matrix4 WorldToLocal; // 64B — inverse(world)
         public Vector4 WorldAabbMin; // 16B — instance world-space AABB min (xyz; w unused)
         public Vector4 WorldAabbMax; // 16B — instance world-space AABB max
+        public Vector4 Albedo;       // 16B — diffuse albedo (xyz; w unused) for the inject
+        public Vector4 Emissive;     // 16B — emissive radiance (xyz; w unused) for the inject
         public uint Slot;            // index into the slot table (binding 9)
         public uint Pad0;
         public uint Pad1;
-        public uint Pad2;            // pad to 112B (multiple of 16)
+        public uint Pad2;            // pad to 144B (multiple of 16)
 
-        public const int SizeBytes = 112;
+        public const int SizeBytes = 144;
     }
 
     // binding 9 entry — mirrors GLSdfAtlas.SdfSlot for the GPU. Kept dead simple: all vec4 so the
@@ -122,16 +125,17 @@ public sealed class GLSdfScene : IDisposable {
     // Rebuilds both SSBOs from the caller's (world, slot) instance list and the atlas slot table.
     // Call once per frame (or only when the renderer set / transforms / atlas change). Allocation-
     // light: scratch + GPU buffers are reused; GPU storage is reallocated only when the count grows.
-    public void Build(IEnumerable<(Matrix4 world, int slot)> instances, ISdfAtlas atlas) {
+    public void Build(IEnumerable<(Matrix4 world, int slot, Vector3 albedo, Vector3 emissive)> instances,
+        ISdfAtlas atlas) {
         EnsureBuffers();
 
         // ---- Instances (binding 8) ----
-        int count = instances is ICollection<(Matrix4, int)> c ? c.Count : 0;
+        int count = instances is ICollection<(Matrix4, int, Vector3, Vector3)> c ? c.Count : 0;
         if (instanceScratch.Length < Math.Max(count, 1))
             instanceScratch = new SdfInstance[Math.Max(count, 16)];
 
         int n = 0;
-        foreach (var (world, slot) in instances) {
+        foreach (var (world, slot, albedo, emissive) in instances) {
             if (n >= instanceScratch.Length)
                 Array.Resize(ref instanceScratch, instanceScratch.Length * 2);
             // worldToLocal: Matrix4.Invert returns the inverse (throws only on a singular matrix,
@@ -147,6 +151,8 @@ public sealed class GLSdfScene : IDisposable {
                 WorldToLocal = worldToLocal,
                 WorldAabbMin = new Vector4(wMin, 0f),
                 WorldAabbMax = new Vector4(wMax, 0f),
+                Albedo = new Vector4(albedo, 0f),
+                Emissive = new Vector4(emissive, 0f),
                 Slot = (uint)s,
                 Pad0 = 0, Pad1 = 0, Pad2 = 0,
             };

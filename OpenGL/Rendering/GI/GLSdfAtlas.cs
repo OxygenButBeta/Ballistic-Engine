@@ -34,6 +34,12 @@ public sealed class GLSdfAtlas : IDisposable {
     public const int DefaultSize = 256;
 
     public int TextureId { get; private set; }
+    // Parallel RGBA16F radiance volume — the SURFACE CACHE. Same dimensions + slot layout as the SDF
+    // atlas, so a brick's voxel (offset+local) addresses the SAME texel in both: the radiance-inject
+    // compute WRITES each near-surface voxel's lit radiance here, and the march READS it at a hit
+    // (stable per-surface radiance, no per-pixel screen-reprojection flicker). rgb = radiance,
+    // a = occupancy/confidence (0 = empty voxel, >0 = a surface voxel with valid radiance).
+    public int RadianceTextureId { get; private set; }
     public int Size { get; }
 
     public IReadOnlyList<SdfSlot> Slots => slots;
@@ -56,6 +62,24 @@ public sealed class GLSdfAtlas : IDisposable {
         GL.TexStorage3D(TextureTarget3d.Texture3D, 1, SizedInternalFormat.R16f, size, size, size);
         // Linear so the march can read the atlas hardware-filtered (or do manual trilinear in
         // texel space — either way ClampToEdge keeps an out-of-brick fetch on the boundary cell).
+        GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureMinFilter,
+            (int)TextureMinFilter.Linear);
+        GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureMagFilter,
+            (int)TextureMagFilter.Linear);
+        GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureWrapS,
+            (int)TextureWrapMode.ClampToEdge);
+        GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureWrapT,
+            (int)TextureWrapMode.ClampToEdge);
+        GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureWrapR,
+            (int)TextureWrapMode.ClampToEdge);
+        GL.BindTexture(TextureTarget.Texture3D, 0);
+
+        // The parallel radiance volume (surface cache). RGBA16F, same size + slot layout. Linear so
+        // the march reads it hardware-filtered (smooth per-surface radiance). The inject compute
+        // binds it as an image and writes near-surface voxels; cleared to 0 on creation.
+        RadianceTextureId = GL.GenTexture();
+        GL.BindTexture(TextureTarget.Texture3D, RadianceTextureId);
+        GL.TexStorage3D(TextureTarget3d.Texture3D, 1, SizedInternalFormat.Rgba16f, size, size, size);
         GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureMinFilter,
             (int)TextureMinFilter.Linear);
         GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureMagFilter,
@@ -172,6 +196,10 @@ public sealed class GLSdfAtlas : IDisposable {
         if (TextureId != 0) {
             GL.DeleteTexture(TextureId);
             TextureId = 0;
+        }
+        if (RadianceTextureId != 0) {
+            GL.DeleteTexture(RadianceTextureId);
+            RadianceTextureId = 0;
         }
         slots.Clear();
     }
