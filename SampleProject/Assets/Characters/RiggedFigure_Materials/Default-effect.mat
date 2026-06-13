@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "shader": "Assets/Default/Shaders/Standard.shader",
+  "shader": "Assets/Default/Shaders/SkinnedStandard.shader",
   "textures": {},
   "transparent": false,
   "opacity": 1,

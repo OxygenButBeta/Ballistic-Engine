@@ -820,7 +820,7 @@ void main() {
         // standalone LightShafts component adds the visible god-ray boost on top. Either being
         // enabled runs the pass; when only shafts are on, the pass uses a thin shaft-only
         // medium so beams show without the fog veil (see GLVolumetricFogPass.Render).
-        if (PostFX.VolumetricEnabled || PostFX.LightShaftsEnabled) {
+        if (PostFX.VolumetricEnabled) {
             // Airlight prefers the sky-hued upper-hemisphere average (fog veils toward
             // white-blue sky, not ground-brown); older cubemaps without it fall back.
             Vector3 skyHue = skyboxRenderer.cubemapTexture is { } skyTex
@@ -831,7 +831,7 @@ void main() {
                 litColor = volumetric.Render(targetIndex, litColor, target.DepthTextureId,
                     shadowMap.DepthTextureId, target.LenX, target.LenY, ref view, ref projection,
                     cascadeMatrices, cascadeBias, activeCascadeCount, cameraPos, sunDirection, sunColor,
-                    fogSkylight, shadowDistance, PostFX, UploadPunctualLights);
+                    fogSkylight, shadowDistance, PostFX);
         }
 
         if (taaActive) {
@@ -2049,7 +2049,7 @@ void main() {
                 runPrepass.SetBool("AlphaCutout", runCutout);
                 // Disable culling for cutout cards OR double-sided materials. MUST mirror the main
                 // opaque pass exactly, or the depth-equality contract breaks (checkerboard holes).
-                var runNoCull = runCutout || runMaterial.DoubleSided;
+                var runNoCull = runCutout;
                 if (runCutout) {
                     GL.ActiveTexture(TextureUnit.Texture0);
                     GL.BindTexture(TextureTarget.Texture2D, runMaterial.Diffuse.UID);
@@ -2106,7 +2106,7 @@ void main() {
                 var cutout = material.Cutout && material.Diffuse is not null;
                 prepass.SetBool("AlphaCutout", cutout);
                 // cutout cards OR double-sided materials skip culling; MUST mirror the main pass.
-                var noCull = cutout || material.DoubleSided;
+                var noCull = cutout;
                 if (cutout) {
                     GL.ActiveTexture(TextureUnit.Texture0);
                     GL.BindTexture(TextureTarget.Texture2D, material.Diffuse.UID);
@@ -3172,7 +3172,7 @@ void main() {
 
                     mesh.Activate();
                     DrawInstancedRun(targets, t, run, mesh, subMeshes[target.SubMeshIndex],
-                        runShader, runMaterial.Cutout || runMaterial.DoubleSided);
+                        runShader, runMaterial.Cutout);
                     mesh.Deactivate();
                     t += run - 1;
                     continue;
@@ -3216,7 +3216,7 @@ void main() {
 
                 // leaf cards have no back faces; double-sided materials (e.g. pbrt imports, whose
                 // winding is inverted) must show both. MUST match the z-prepass cull decision.
-                var noCull = material.Cutout || material.DoubleSided;
+                var noCull = material.Cutout;
                 if (noCull)
                     GL.Disable(EnableCap.CullFace);
                 GL.DrawElements(PrimitiveType.Triangles, subMeshes[i].IndexCount, DrawElementsType.UnsignedInt,
