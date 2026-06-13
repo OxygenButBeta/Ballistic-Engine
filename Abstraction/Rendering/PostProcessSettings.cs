@@ -184,7 +184,7 @@ public sealed class PostProcessSettings {
     // range + UE5 punch. This is the fallback when no ColorAdjustments volume overrides it; the
     // volume default matches. A pure-neutral grade can set 1.0.
     public float Contrast { get; set; } = 1.15f;
-    public float Saturation { get; set; } = 1f;
+    public float Saturation { get; set; } = 1.1f; // modest richness (UE5/filmic colour); matches the grade default
     public float VignetteStrength { get; set; }
     public float VignetteRoundness { get; set; } = 1f;  // 1 = circular, 0 = aspect-following oval
     public OpenTK.Mathematics.Vector3 VignetteColor { get; set; } = OpenTK.Mathematics.Vector3.Zero; // darken toward black by default

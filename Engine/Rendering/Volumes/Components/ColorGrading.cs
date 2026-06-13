@@ -14,7 +14,10 @@ public sealed class ColorAdjustments : VolumeComponent {
     public readonly ClampedFloatParameter contrast = new(1.15f, 0.5f, 2f);
 
     [Tooltip("Overall colour saturation.")]
-    public readonly ClampedFloatParameter saturation = new(1f, 0f, 2f);
+    // Default 1.1 (slightly rich, not neutral): a modest saturation lift gives the punchy-but-natural
+    // colour of a UE5/filmic render — the red marble, gold, foliage read more vividly without going
+    // garish (Bistro mean sat 57 -> 62). Pairs with the 1.15 contrast. Set 1.0 for pure-neutral.
+    public readonly ClampedFloatParameter saturation = new(1.1f, 0f, 2f);
 }
 
 public sealed class Vignette : VolumeComponent {
