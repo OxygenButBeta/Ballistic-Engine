@@ -17,12 +17,19 @@ namespace BallisticEngine.OpenGL.VoxelGI;
 public sealed class GLVoxelGI : IDisposable {
     public int VoxelRes { get; }
     public int RadianceTexture { get; private set; }
+    // r32ui texture VIEW aliasing RadianceTexture's mip-0 storage (same VIEW_CLASS_32_BITS as RGBA8).
+    // The direct inject binds THIS as the image and accumulates a moving average via imageAtomicCompSwap
+    // - so many fragments landing in one voxel blend their radiance instead of last-writer-wins (which
+    // collapsed the grid to a flat orange average and made GI contribute nothing).
+    public int RadianceU32View { get; private set; }
     public Vector3 VolumeMin { get; private set; }
     public Vector3 VolumeSize { get; private set; }
     public float VoxelWorldSize => VolumeSize.X / VoxelRes;
     public bool Available { get; private set; }
 
     int voxelizeProgram;            // vert+geom+frag (geometry stage = dominant-axis ortho)
+    int finalizeProgram;            // compute: count->occupancy after the atomic-average direct pass
+    int uFinalizeVoxelRes;
     int fbo;                        // empty FBO: voxelization writes via imageStore, not color
     long lastStamp = -1;
 
@@ -31,9 +38,9 @@ public sealed class GLVoxelGI : IDisposable {
         uCascadeBias, uShadowCascades, uBouncePass, uVoxelSampler;
     readonly int[] uCascadeMatrices = new int[4];
 
-    // Extra GI bounce passes after the direct pass (each compounds one more bounce). 0..2.
-    public int BouncePasses { get; set; } =
-        int.TryParse(System.Environment.GetEnvironmentVariable("BALLISTIC_VOXELGI_BOUNCES"), out int bp) ? bp : 2;
+    // Extra GI bounce passes after the direct pass (each compounds one more bounce). Set per-frame
+    // by the renderer from the VoxelGlobalIllumination volume (or its env override).
+    public int BouncePasses { get; set; } = 2;
 
     void CacheUniforms() {
         int L(string n) => GL.GetUniformLocation(voxelizeProgram, n);
@@ -66,12 +73,21 @@ public sealed class GLVoxelGI : IDisposable {
         GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureBorderColor, new[] { 0f, 0f, 0f, 0f });
         GL.BindTexture(TextureTarget.Texture3D, 0);
 
+        // r32ui alias over mip 0 for atomic moving-average injection (RGBA8 and R32UI share
+        // VIEW_CLASS_32_BITS, so a texture view reinterprets the same texels losslessly).
+        RadianceU32View = GL.GenTexture();
+        GL.TextureView(RadianceU32View, TextureTarget.Texture3D, RadianceTexture,
+            PixelInternalFormat.R32ui, 0, 1, 0, 1);
+
         fbo = GL.GenFramebuffer();
 
         // 3-stage program (vert+geom+frag) compiled directly — StandardShader is vert+frag only.
         voxelizeProgram = BuildVoxelizeProgram();
         if (voxelizeProgram != 0)
             CacheUniforms();
+        finalizeProgram = BuildComputeProgram("VoxelFinalize_Comp.glsl");
+        if (finalizeProgram != 0)
+            uFinalizeVoxelRes = GL.GetUniformLocation(finalizeProgram, "VoxelRes");
         Available = voxelizeProgram != 0 && RadianceTexture != 0;
     }
 
@@ -125,11 +141,26 @@ public sealed class GLVoxelGI : IDisposable {
         GL.BindTexture(TextureTarget.Texture2DArray, shadowArrayTex);
         GL.Uniform1(uShadowCascades, 10);
 
-        // Direct pass (overwrite). RMW image so the bounce passes can read-modify.
+        // Direct pass: atomic moving-average inject. Bind the r32ui VIEW so the frag can
+        // imageAtomicCompSwap each voxel (blend many fragments) instead of racing imageStore.
         GL.Uniform1(uBouncePass, 0);
-        GL.BindImageTexture(0, RadianceTexture, 0, true, 0, TextureAccess.ReadWrite, SizedInternalFormat.Rgba8);
+        GL.BindImageTexture(0, RadianceU32View, 0, true, 0, TextureAccess.ReadWrite, SizedInternalFormat.R32ui);
 
         // Per-draw + material SSBOs are bound by the GPU-driven DrawIndirectCount the caller invokes.
+    }
+
+    // After the DIRECT draw: convert the per-voxel sample COUNT (left in alpha by the atomic average)
+    // into occupancy (alpha=1 where written), so the cone tracer's front-to-back opacity is correct.
+    // Must run before mip-gen / bounce passes. No-op if the compute program failed to build.
+    public void FinalizeOccupancy() {
+        if (finalizeProgram == 0) return;
+        GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit);
+        GL.UseProgram(finalizeProgram);
+        GL.Uniform1(uFinalizeVoxelRes, VoxelRes);
+        GL.BindImageTexture(0, RadianceTexture, 0, true, 0, TextureAccess.ReadWrite, SizedInternalFormat.Rgba8);
+        int groups = (VoxelRes + 3) / 4;
+        GL.DispatchCompute(groups, groups, groups);
+        GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
     }
 
     // Between the direct draw and a bounce draw: mip the current radiance (so the bounce reads the
@@ -165,6 +196,31 @@ public sealed class GLVoxelGI : IDisposable {
         GL.BindTexture(TextureTarget.Texture3D, 0);
     }
 
+    // Build a single-stage compute program from an embedded .glsl (ToAscii: an em-dash in a comment
+    // truncates the source -> "unexpected end of file"). Returns 0 on failure (caller treats as no-op).
+    static int BuildComputeProgram(string file) {
+        int cs = GL.CreateShader(ShaderType.ComputeShader);
+        GL.ShaderSource(cs, GLSLShaderUtilities.ToAscii(EmbeddedShaderSource.Read(file)));
+        GL.CompileShader(cs);
+        GL.GetShader(cs, ShaderParameter.CompileStatus, out int ok);
+        if (ok == 0) {
+            Console.WriteLine($"[VoxelGI] {file} compile failed:\n{GL.GetShaderInfoLog(cs)}");
+            GL.DeleteShader(cs);
+            return 0;
+        }
+        int prog = GL.CreateProgram();
+        GL.AttachShader(prog, cs);
+        GL.LinkProgram(prog);
+        GL.GetProgram(prog, GetProgramParameterName.LinkStatus, out int lok);
+        GL.DeleteShader(cs);
+        if (lok == 0) {
+            Console.WriteLine($"[VoxelGI] {file} link failed:\n{GL.GetProgramInfoLog(prog)}");
+            GL.DeleteProgram(prog);
+            return 0;
+        }
+        return prog;
+    }
+
     static int BuildVoxelizeProgram() {
         int Compile(ShaderType type, string src) {
             int s = GL.CreateShader(type);
@@ -197,9 +253,11 @@ public sealed class GLVoxelGI : IDisposable {
     }
 
     public void Dispose() {
+        if (RadianceU32View != 0) { GL.DeleteTexture(RadianceU32View); RadianceU32View = 0; }
         if (RadianceTexture != 0) { GL.DeleteTexture(RadianceTexture); RadianceTexture = 0; }
         if (fbo != 0) { GL.DeleteFramebuffer(fbo); fbo = 0; }
         if (voxelizeProgram != 0) { GL.DeleteProgram(voxelizeProgram); voxelizeProgram = 0; }
+        if (finalizeProgram != 0) { GL.DeleteProgram(finalizeProgram); finalizeProgram = 0; }
         Available = false;
     }
 }

@@ -72,7 +72,10 @@ vec4 vctDiffuseCov(vec3 wp, vec3 N) {
     vec3 up = abs(N.y) < 0.95 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
     vec3 T = normalize(cross(up, N)); vec3 B = cross(N, T);
     const float AP = 0.577, MAXD = 24.0, SIN60 = 0.866, COS60 = 0.5;
-    vec3 o = wp + N * VoxelWorldSize * 1.5;
+    // Push the cone origin a few voxels clear of THIS surface so the first samples don't lock onto
+    // the surface's own immediate (often warm floor) voxel - that near-field self-illumination is
+    // what pooled the bounce into monochrome orange blobs at pedestal/column bases.
+    vec3 o = wp + N * VoxelWorldSize * 3.0;
     vec4 c = vctTraceCone(o, N, AP, MAXD);
     vec3 acc = c.rgb * 0.25; float cov = c.a * 0.25;
     for (int i = 0; i < 5; ++i) {
@@ -691,15 +694,27 @@ void main()
                 NormalRough = vec4(N * 0.5 + 0.5, 1.0);
                 return;
             }
-            // Coverage-weighted indirect (the Lumen look). The flat sky-IBL irradiance is only valid
-            // where the hemisphere is actually open to the sky; in an enclosed recess the cones hit
-            // nearby geometry (coverage -> 1) and that sky term is physically wrong (over-fills the
-            // pocket, washing out the colored bounce). So fade the sky IBL out by coverage and let the
-            // cone-traced bounce take over there. VoxelGiSkyReplace scales how aggressively (0 = pure
-            // additive, the old conservative look; 1 = fully replace sky where enclosed). The bounce
-            // is always added in full, so well-exposed open surfaces are unchanged (coverage ~0).
-            float skyFade = 1.0 - VoxelGiSkyReplace * clamp(giTrace.a, 0.0, 1.0);
-            ambientDiffuse = kD * (irradiance * AmbientTint * skyFade + giDiffuse) * ao;
+            // Coverage-weighted indirect (the Lumen look). In an enclosed recess the cones hit nearby
+            // geometry (coverage -> 1) and the flat sky-IBL over-fills the pocket, so we fade the sky
+            // term out by coverage and let the colored cone bounce take over (VoxelGiSkyReplace scales
+            // how aggressively). BUT the voxel bounce is coarse/patchy and can't always cover what it
+            // removes, which crushed enclosed interiors to dark when it was the only ambient source.
+            // So GI is now STRICTLY NON-DARKENING: the GI ambient is the per-channel MAX of the
+            // sky-only baseline and the coverage-faded-plus-bounce result. Replacement can only ever
+            // make a surface BRIGHTER or recolor it toward the bounce - never darker than no-GI.
+            // Make GI the PRIMARY indirect (the Lumen look), not a sliver added to a dominant IBL:
+            // where the hemisphere is enclosed (coverage -> 1) the flat sky-IBL is physically wrong
+            // (the sky can't reach a sealed pocket) so we REPLACE it with the colored cone bounce;
+            // where open (coverage -> 0) the IBL stands. The bounce is gathered dim (stored radiance
+            // is [0,1] rgba8), so it's lifted by a gather gain x the user intensity to actually carry
+            // the room. kD (albedo) tints the incoming light into reflected radiance, as for any
+            // ambient term. Non-darkening clamp keeps it from ever crushing below the no-GI baseline.
+            vec3 baseAmbient = kD * irradiance * AmbientTint * ao;        // the no-GI result (line above)
+            float cov = clamp(giTrace.a, 0.0, 1.0);
+            float skyFade = 1.0 - VoxelGiSkyReplace * cov;
+            vec3 giBounce = kD * giDiffuse * 3.0 * ao;                    // gather gain: lift dim bounce
+            vec3 giAmbient = kD * irradiance * AmbientTint * skyFade * ao + giBounce;
+            ambientDiffuse = max(giAmbient, baseAmbient);
             // Glossy: a reflection cone adds local specular bounce the sky cubemap lacks.
             vec3 giSpec = vctSpecular(fragPos, N, R, roughness) * VoxelGiIntensity;
             ambientSpecular += giSpec * FssEss * specOcclusion;

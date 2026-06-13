@@ -14,7 +14,40 @@ in GsOut {
     flat uint materialId;
 } gs;
 
-layout(binding = 0, rgba8) uniform image3D VoxelRadiance;  // readwrite for in-place bounce RMW
+// DIRECT pass binds an r32ui VIEW of the grid for atomic moving-average inject (see below).
+// BOUNCE passes bind the same storage as rgba8 for plain read-modify-write.
+layout(binding = 0, r32ui) uniform uimage3D VoxelRadianceU;  // direct pass: atomic moving-average
+layout(binding = 0, rgba8) uniform image3D  VoxelRadiance;   // bounce pass: rgba8 RMW
+
+// Pack/unpack RGBA8 <-> uint. RGB = running-average radiance (8-bit, the grid is rgba8 anyway so no
+// precision lost vs the old store), A = saturating sample count used to weight the moving average.
+uint packRGBA8(vec4 c) {
+    uvec4 q = uvec4(clamp(c, 0.0, 1.0) * 255.0 + 0.5);
+    return q.r | (q.g << 8) | (q.b << 16) | (q.a << 24);
+}
+vec4 unpackRGBA8(uint u) {
+    return vec4(float(u & 0xFFu), float((u >> 8) & 0xFFu),
+                float((u >> 16) & 0xFFu), float((u >> 24) & 0xFFu)) / 255.0;
+}
+
+// Accumulate `newColor` into voxel `vc` as a moving average. Many fragments land in one voxel; a
+// plain imageStore kept only the last (random) writer and the grid collapsed to a flat average
+// color. compSwap loops until our blended value wins, so the voxel converges to the true mean of
+// every surface that touched it - preserving per-surface color (red columns stay red, etc.).
+void atomicAverage(ivec3 vc, vec3 newColor) {
+    uint prev = imageLoad(VoxelRadianceU, vc).r;
+    uint cur = prev;
+    for (int i = 0; i < 16; ++i) {
+        vec4 dec = unpackRGBA8(cur);
+        float n = dec.a * 255.0;                 // prior sample count (0..255)
+        vec3 avg = (dec.rgb * n + newColor) / (n + 1.0);
+        float nc = min((n + 1.0) / 255.0, 1.0);  // saturating count back into alpha
+        uint packed = packRGBA8(vec4(avg, nc));
+        uint got = imageAtomicCompSwap(VoxelRadianceU, vc, cur, packed);
+        if (got == cur) break;                   // our write landed
+        cur = got;                               // contended: retry with the newer value
+    }
+}
 // Bounce pass: read the grid's already-injected radiance (coarse mips, from the previous iteration's
 // GenerateMipmap) along the surface normal and ADD it. Each iteration = one more bounce -> deep
 // interiors fill with light. BouncePass=0 is the direct pass (overwrite); >0 adds bounce (RMW).
@@ -67,11 +100,19 @@ void main() {
     float sh = NdotL > 0.0 ? sunShadow(gs.worldPos, N) : 1.0;
 
     if (BouncePass == 0) {
-        // DIRECT pass: sun + sky + emissive leaving this surface (overwrite).
-        vec3 radiance = albedo * (SunColor * NdotL * sh + SkyAmbient);
+        // DIRECT pass: the radiance this surface REFLECTS, injected as the first bounce the cone
+        // tracer gathers. Inject ONLY the directly-lit term (sun*NdotL*shadow) + emissive - NOT the
+        // sky ambient. The sky ambient is the sky itself, already supplied by the IBL in the lit
+        // shader; injecting it here made every voxel = albedo*sky (a flat warm fill that just
+        // re-added what IBL already had -> GI on/off looked identical and the grid read flat orange).
+        // True colored bounce = sunlight reflecting off the RED column reaching a shadowed wall, which
+        // only the directional term carries. A small ambient floor keeps fully-shadowed pockets from
+        // contributing literally zero (so multi-bounce has a seed) without re-flattening the grid.
+        vec3 direct = SunColor * NdotL * sh + SkyAmbient * 0.15;
+        vec3 radiance = albedo * direct;
         if ((m.fl & 16u) != 0u)   // emissive-as-area-light (flag bit4 = HasEmissive)
             radiance += texture(sampler2D(m.eH), gs.uv).rgb * m.ef.rgb;
-        imageStore(VoxelRadiance, vc, vec4(radiance, 1.0));
+        atomicAverage(vc, radiance);
     } else {
         // BOUNCE pass: gather the already-injected radiance arriving over the HEMISPHERE around N
         // (5 taps: along N + 4 tilted ~60deg, each a coarse-mip average at a couple of distances),

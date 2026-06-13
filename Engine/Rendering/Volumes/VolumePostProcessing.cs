@@ -104,6 +104,15 @@ public static class VolumePostProcessing {
             fx.VolumetricTint = volumetric.tint.Value;
         }
 
+        if (stack.GetComponent<LightShafts>() is { } shafts) {
+            fx.LightShaftsEnabled = shafts.enabled.Value;
+            fx.LightShaftsIntensity = shafts.intensity.Value;
+            fx.LightShaftsSun = shafts.sunShafts.Value;
+            fx.LightShaftsPunctual = shafts.punctualShafts.Value;
+            fx.LightShaftsPunctualShadows = shafts.punctualShadows.Value;
+            fx.LightShaftsDensity = shafts.density.Value;
+        }
+
         if (stack.GetComponent<ColorAdjustments>() is { } grade) {
             fx.Contrast = grade.contrast.Value;
             fx.Saturation = grade.saturation.Value;

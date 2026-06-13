@@ -2136,7 +2136,8 @@ void main() {
             gpuDriven.DrawIndirectCount(OpenGL.GpuDriven.GpuDrivenRenderer.BatchSolid);
             gpuDriven.DrawIndirectCount(OpenGL.GpuDriven.GpuDrivenRenderer.BatchCutout);
         }
-        DrawScene(); // direct pass (BouncePass 0)
+        DrawScene(); // direct pass (BouncePass 0) — atomic moving-average inject
+        voxelGI.FinalizeOccupancy(); // count(in alpha) -> occupancy(=1) before mips/bounce/trace
         for (var bp = 1; bp <= voxelGI.BouncePasses; bp++) {
             voxelGI.BeginBouncePass(bp);
             mesh.Activate();

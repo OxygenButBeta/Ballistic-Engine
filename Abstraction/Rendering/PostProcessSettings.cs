@@ -126,7 +126,7 @@ public sealed class PostProcessSettings {
     // the VoxelGlobalIllumination volume component (or the BALLISTIC_VOXELGI* env overrides).
     public bool VoxelGiEnabled { get; set; } = true;
     public float VoxelGiIntensity { get; set; } = 2.0f;
-    public float VoxelGiSkyReplace { get; set; } = 0.6f;              // 0 = additive (old look); >0 fades sky-IBL by cone coverage (Lumen-style enclosed bounce)
+    public float VoxelGiSkyReplace { get; set; } = 0.6f;              // 0 = additive (old look); >0 fades sky-IBL by cone coverage (Lumen-style enclosed bounce). Clamped non-darkening in the shader.
     public int VoxelGiBounces { get; set; } = 2;
     public int VoxelGiResolution { get; set; } = 192;
     public float VoxelGiVolumeSize { get; set; } = 60f;
