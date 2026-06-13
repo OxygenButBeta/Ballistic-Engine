@@ -360,11 +360,15 @@ public sealed class GLSdfGiPass : IDisposable {
     // target.NormalTextureId); irradianceCubemap is the baked IBL diffuse irradiance (hit/miss
     // radiance source). width/height are the FULL-res viewport. view/projection are this frame's
     // camera matrices (the shader uses their inverses for the same reconstruction SSGI/SSR use).
+    // intensityScale: a runtime multiplier on the additive composite strength (on TOP of the env/
+    // default sdfGiIntensity). The renderer passes < 1 when baked PROBES are active — the probes
+    // already carry the bulk of the static enclosed-interior bounce, so SDF-GI AUGMENTS (adds the
+    // dynamic off-screen delta the static probes can't) rather than double-counting the same light.
     public int Render(int colorTexture, int depthTex, int normalTex, int irradianceCubemap,
         int shadowMapArray, Matrix4[] cascadeMatrices, Vector4 cascadeBias, int cascadeCount,
         Vector3 sunDirection, Vector3 sunColor,
         int width, int height, ref Matrix4 view, ref Matrix4 projection,
-        ref Matrix4 projectionNoJitter, float skyExposure) {
+        ref Matrix4 projectionNoJitter, float skyExposure, float intensityScale = 1f) {
         if (!Available || program == 0)
             return colorTexture;
         if (scene.InstanceCount == 0 || scene.SlotCount == 0)
@@ -552,7 +556,10 @@ public sealed class GLSdfGiPass : IDisposable {
         BindCombineSampler(1, giForComposite, "giTexture");
         BindCombineSampler(2, depthTex, "depthTexture");
         combineShader.SetMatrix4("InvProjection", ref invProjection);
-        combineShader.SetFloat("SdfGiIntensity", sdfGiIntensity);
+        // The probe-aware scale folds in here so SDF-GI augments (not double-counts) baked probes.
+        // DebugView/diag bypass the scale so the raw gather stays inspectable at full strength.
+        combineShader.SetFloat("SdfGiIntensity",
+            debugView ? sdfGiIntensity : sdfGiIntensity * MathHelper.Clamp(intensityScale, 0f, 1f));
         combineShader.SetBool("DebugView", debugView);
         GLBufferUtilities.DrawFullscreenQuad();
 

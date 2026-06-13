@@ -738,11 +738,17 @@ public class GLHDRenderer : HDRenderer {
         if (sdfGiEnabled && sdfGi.Available)
             using (timers.Time("SdfGI")) {
                 sdfGi.EnsureBaked(visibleOpaque);
+                // PROBE<->SDF-GI BLEND: probes are the diffuse BASE (they already carry the static
+                // enclosed-interior bounce); SDF-GI AUGMENTS with the dynamic off-screen delta. When
+                // probes are active, scale SDF-GI down so the two diffuse indirect terms don't
+                // double-count (the same rule as the SSGI overlap). With no probes, SDF-GI is the
+                // only off-screen indirect, so it runs at full strength.
+                float sdfGiBlend = probeVolumeReady ? 0.5f : 1f;
                 litColor = sdfGi.Render(litColor, target.DepthTextureId, target.NormalTextureId,
                     irradianceMap, shadowMap.DepthTextureId, cascadeMatrices, cascadeBias,
                     activeCascadeCount, sunDirection, sunColor,
                     target.LenX, target.LenY, ref view, ref renderProjection,
-                    ref projection, skyExposureBase * preExposure);
+                    ref projection, skyExposureBase * preExposure, sdfGiBlend);
             }
 
         // SSGI: AO-occluded indirect bounce, added before SSR so reflections see the GI-lifted scene.
