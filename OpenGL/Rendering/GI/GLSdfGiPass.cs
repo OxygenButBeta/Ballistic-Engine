@@ -94,6 +94,23 @@ public sealed class GLSdfGiPass : IDisposable {
     readonly GLRenderTexture output = new();
     int outW, outH;
 
+    // ---- Temporal accumulation (P7.1) — the main noise win for the 4-ray gather ----
+    // The gather is a noisy ~1-spp estimate; reprojecting + EMA-accumulating last frame's result
+    // (rejecting disoccluded history by view-depth, exactly the SSGI temporal pattern) averages the
+    // grain to a clean image over a few frames. We reuse SSGI_Temporal.glsl verbatim: it takes the
+    // raw gather as currentGI and outputs accumulated GI (rgb) + history length (a) via MRT, plus
+    // the current view-depth for next frame's disocclusion test.
+    readonly StandardShader temporalShader;
+    readonly GLRenderTexture[] historyGi = { new(), new() };     // ping-pong accumulated GI
+    readonly GLRenderTexture[] historyDepth = { new(), new() };  // ping-pong view-space depth
+    int historyWrite;            // which of the two buffers to write this frame
+    bool hasHistory;             // false on first frame / after a resize
+    Matrix4 prevViewProjection;  // last frame's UN-jittered world->clip (for reprojection)
+    int temporalFbo;
+    // Accumulation window: higher = smoother + laggier. 16 is plenty to flush the 4-ray grain on a
+    // static camera while staying responsive when the view moves (disocclusion shortens it anyway).
+    const float MaxHistory = 16f;
+
     // Mesh.InstanceId -> atlas slot index. The bake/upload done-set: a mesh in this map is already
     // packed into the atlas and never re-baked. -1 marks a mesh that failed to fit (skip silently
     // on later frames; the overflow was already logged once).
@@ -136,6 +153,11 @@ public sealed class GLSdfGiPass : IDisposable {
         combineShader = GraphicAPI.CreateStandardShader(
             EmbeddedShaderSource.Read("FSQ_Vert.glsl"),
             EmbeddedShaderSource.Read("SdfGi_Combine.glsl"));
+
+        // Reuse the SSGI temporal accumulator verbatim (P7.1 — the main noise win).
+        temporalShader = GraphicAPI.CreateStandardShader(
+            EmbeddedShaderSource.Read("FSQ_Vert.glsl"),
+            EmbeddedShaderSource.Read("SSGI_Temporal.glsl"));
 
         CacheUniformLocations();
         Available = true;
@@ -247,7 +269,8 @@ public sealed class GLSdfGiPass : IDisposable {
     public int Render(int colorTexture, int depthTex, int normalTex, int irradianceCubemap,
         int shadowMapArray, Matrix4[] cascadeMatrices, Vector4 cascadeBias, int cascadeCount,
         Vector3 sunDirection, Vector3 sunColor,
-        int width, int height, ref Matrix4 view, ref Matrix4 projection, float skyExposure) {
+        int width, int height, ref Matrix4 view, ref Matrix4 projection,
+        ref Matrix4 projectionNoJitter, float skyExposure) {
         if (!Available || program == 0)
             return colorTexture;
         if (scene.InstanceCount == 0 || scene.SlotCount == 0)
@@ -307,24 +330,85 @@ public sealed class GLSdfGiPass : IDisposable {
         int gy = (halfH + 7) / 8;
         GL.DispatchCompute(gx, gy, 1);
 
-        // The composite reads OutGi as a sampled texture and the SSBOs are done — barrier on image
-        // access + texture fetch + storage so the writes are visible before the combine samples them.
+        // The temporal pass reads OutGi as a sampled texture and the SSBOs are done — barrier on
+        // image access + texture fetch + storage so the writes are visible before it samples them.
         GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit |
                          MemoryBarrierFlags.TextureFetchBarrierBit |
                          MemoryBarrierFlags.ShaderStorageBarrierBit);
-
-        // ---- 2. Full-res depth-aware upsample + additive composite onto the lit colour ----
-        // A transient pooled target (released wholesale in EndFrame); the upsample needs full res.
-        GLRenderTexture combined = GLRenderTexturePool.Shared.Acquire(width, height);
 
         GL.Disable(EnableCap.DepthTest);
         GL.Disable(EnableCap.CullFace);
         GL.Disable(EnableCap.Blend);
 
+        // ---- 2. Temporal accumulation (reproject + EMA, SSGI_Temporal verbatim) ----
+        // Reprojects last frame's accumulated GI to this frame, rejects disoccluded history by
+        // view-depth, and EMA-blends — averaging the 4-ray grain to a clean image over a few frames.
+        // Uses the UN-jittered projection for reprojection (the accumulated image is jitter-free).
+        // The DIAG hit-fraction view bypasses accumulation (it's not radiance) — composite raw.
+        int giForComposite = output.Texture;
+        if (!diagMode) {
+            Matrix4 invProjNoJitter = Matrix4.Invert(projectionNoJitter);
+            Matrix4 viewProjNoJitter = view * projectionNoJitter;
+
+            int readSlot = historyWrite;
+            int writeSlot = 1 - readSlot;
+            GLRenderTexture giRead = historyGi[readSlot];
+            GLRenderTexture giWriteTex = historyGi[writeSlot];
+            GLRenderTexture depthReadTex = historyDepth[readSlot];
+            GLRenderTexture depthWriteTex = historyDepth[writeSlot];
+
+            // A resize invalidates accumulated history (reprojection would smear).
+            bool sizeKept = giWriteTex.Ensure(halfW, halfH);
+            giRead.Ensure(halfW, halfH);
+            depthWriteTex.Ensure(halfW, halfH);
+            depthReadTex.Ensure(halfW, halfH);
+            if (!sizeKept)
+                hasHistory = false;
+
+            if (temporalFbo == 0)
+                temporalFbo = GL.GenFramebuffer();
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer, temporalFbo);
+            GL.Viewport(0, 0, halfW, halfH);
+            GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
+                TextureTarget.Texture2D, giWriteTex.Texture, 0);
+            GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment1,
+                TextureTarget.Texture2D, depthWriteTex.Texture, 0);
+            GL.DrawBuffers(2, new[] { DrawBuffersEnum.ColorAttachment0, DrawBuffersEnum.ColorAttachment1 });
+
+            temporalShader.Activate();
+            BindCombineSampler(0, output.Texture, "currentGI");
+            BindCombineSampler(1, giRead.Texture, "historyGI");
+            BindCombineSampler(2, depthTex, "depthTexture");
+            BindCombineSampler(3, normalTex, "normalTexture");
+            BindCombineSampler(4, depthReadTex.Texture, "historyDepth");
+            temporalShader.SetMatrix4("InvProjection", ref invProjNoJitter);
+            temporalShader.SetMatrix4("InvViewMatrix", ref invView);
+            temporalShader.SetMatrix4("PrevViewProjection", ref prevViewProjection);
+            temporalShader.SetBool("HasHistory", hasHistory);
+            temporalShader.SetFloat("MaxHistory", MaxHistory);
+            GLBufferUtilities.DrawFullscreenQuad();
+
+            // Restore single-target draw state before the composite.
+            GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment1,
+                TextureTarget.Texture2D, 0, 0);
+            GL.DrawBuffer(DrawBufferMode.ColorAttachment0);
+
+            giForComposite = giWriteTex.Texture;
+
+            // Advance temporal state for next frame.
+            historyWrite = writeSlot;
+            hasHistory = true;
+            prevViewProjection = viewProjNoJitter;
+        }
+
+        // ---- 3. Full-res depth-aware upsample + additive composite onto the lit colour ----
+        // A transient pooled target (released wholesale in EndFrame); the upsample needs full res.
+        GLRenderTexture combined = GLRenderTexturePool.Shared.Acquire(width, height);
+
         combined.BindAsTarget();
         combineShader.Activate();
         BindCombineSampler(0, colorTexture, "sceneTexture");
-        BindCombineSampler(1, output.Texture, "giTexture");
+        BindCombineSampler(1, giForComposite, "giTexture");
         BindCombineSampler(2, depthTex, "depthTexture");
         combineShader.SetMatrix4("InvProjection", ref invProjection);
         combineShader.SetFloat("SdfGiIntensity", sdfGiIntensity);
@@ -381,6 +465,9 @@ public sealed class GLSdfGiPass : IDisposable {
         atlas?.Dispose();
         scene?.Dispose();
         output.Dispose();
+        foreach (GLRenderTexture t in historyGi) t.Dispose();
+        foreach (GLRenderTexture t in historyDepth) t.Dispose();
+        if (temporalFbo != 0) { GL.DeleteFramebuffer(temporalFbo); temporalFbo = 0; }
         meshSlots.Clear();
         Available = false;
     }

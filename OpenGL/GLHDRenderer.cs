@@ -741,7 +741,7 @@ public class GLHDRenderer : HDRenderer {
                     irradianceMap, shadowMap.DepthTextureId, cascadeMatrices, cascadeBias,
                     activeCascadeCount, sunDirection, sunColor,
                     target.LenX, target.LenY, ref view, ref renderProjection,
-                    skyExposureBase * preExposure);
+                    ref projection, skyExposureBase * preExposure);
             }
 
         // SSGI first: it adds AO-occluded indirect bounce to the lit color, so the
