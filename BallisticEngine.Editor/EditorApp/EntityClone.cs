@@ -34,6 +34,12 @@ internal static class EntityClone {
         copy.transform.Position = source.transform.Position;
         copy.transform.Rotation = source.transform.Rotation;
         copy.transform.Scale = source.transform.Scale;
+        // Carry the entity-level identity Unity preserves on duplicate: tag, layer, and the prefab link
+        // (a duplicated prefab instance is still an instance of the same prefab). These aren't on the
+        // Behaviour list, so the component loop below never copies them.
+        copy.Tag = source.Tag;
+        copy.Layer = source.Layer;
+        copy.PrefabSource = source.PrefabSource;
         if (!source.IsActive)
             copy.SetActive(false);
 
