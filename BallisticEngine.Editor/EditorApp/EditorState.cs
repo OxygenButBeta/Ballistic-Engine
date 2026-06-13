@@ -140,6 +140,10 @@ internal sealed class EditorState {
     public void SelectAssets(IEnumerable<(string Path, Guid Guid)> items, (string Path, Guid Guid) active) {
         SelectedAssets.Clear();
         SelectedAssets.AddRange(items);
+        // Keep the active asset IN the selection set (mirrors SelectEntities) — otherwise the inspector's
+        // active asset wouldn't read as selected in the browser and batch ops would skip it.
+        if (!SelectedAssets.Any(a => a.Guid == active.Guid))
+            SelectedAssets.Add(active);
         SetActiveAsset(active.Path, active.Guid);
     }
 
