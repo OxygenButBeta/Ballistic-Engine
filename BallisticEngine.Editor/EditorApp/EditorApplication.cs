@@ -568,6 +568,12 @@ internal sealed class EditorApplication {
         if (maximizedPanel is not null && ImGui.IsKeyPressed(ImGuiKey.Escape))
             maximizedPanel = null;
 
+        // Drop a stale fullscreen target: if the maximized panel was closed (its Window-menu toggle
+        // turned off, or its duplicated instance closed), don't keep drawing it fullscreen forever —
+        // fall back to the normal docked layout this frame.
+        if (maximizedPanel is not null && !MaximizedPanelStillAvailable(maximizedPanel))
+            maximizedPanel = null;
+
         // Any interaction is a "scene might have changed" signal for the always-refresh-off mode.
         if (ImGui.IsMouseClicked(ImGuiMouseButton.Left) || ImGui.IsMouseClicked(ImGuiMouseButton.Right) ||
             ImGui.IsMouseClicked(ImGuiMouseButton.Middle) || io.MouseWheel != 0 || ImGui.IsAnyItemActive())
@@ -1273,9 +1279,6 @@ internal sealed class EditorApplication {
         ImGui.End();
     }
 
-    void MaximizeOnTitleDoubleClick() => MaximizePanelOnTitleDoubleClick(
-        gameViewFocused ? EditorLayout.GameView : EditorLayout.SceneView);
-
     // Double-clicking a window's tab/title strip toggles fullscreen for THAT panel (works for every
     // dockable panel now, not just the viewports). Call right after the panel's Begin. For a DOCKED
     // window the tab bar sits ABOVE the content origin, so the hit band extends upward by ~1.4 frame
@@ -1337,6 +1340,20 @@ internal sealed class EditorApplication {
 
     // Draws one panel filling the whole work area while maximized (anything except the viewports,
     // which take DrawMaximizedViewport). Routes by the panel's layout name to its contents.
+    // Whether the currently-maximized panel is still a thing we can draw fullscreen. Viewports always
+    // are; a primary dock panel is only available while its Window-menu toggle is on; a duplicated
+    // (host) instance is available while the host still owns its label. Returns false once the panel
+    // has been closed, so BuildUI can drop the stale fullscreen target.
+    bool MaximizedPanelStillAvailable(string name) {
+        if (name == EditorLayout.SceneView || name == EditorLayout.GameView) return true;
+        if (name == EditorLayout.Entities) return showHierarchy;
+        if (name == EditorLayout.SceneComponents) return showSceneComponents;
+        if (name == EditorLayout.Inspector) return showInspector;
+        if (name == EditorLayout.Assets) return showBottom;
+        if (name == EditorLayout.Console) return showConsole;
+        return extraPanels.OwnsLabel(name);
+    }
+
     void DrawMaximizedPanel(string name, SysVec2 pos, SysVec2 size) {
         // A duplicated (Add Tab) panel's label is owned by the host, not one of the primary layout
         // names below — route it to the host so double-clicking an extra tab can fullscreen it too
@@ -1379,7 +1396,10 @@ internal sealed class EditorApplication {
         // Play/stop (and scene-open) request focusing one view so it surfaces above its dock tab group.
         if (pendingFocusWindow == EditorLayout.SceneView) ImGui.SetNextWindowFocus();
         if (ImGui.Begin(EditorLayout.SceneView)) {
-            MaximizeOnTitleDoubleClick();   // double-click the Scene dock tab to (un)fullscreen
+            // Maximize THIS view explicitly — never via the shared gameViewFocused flag, which is reset
+            // to false above and only set true inside GameTabContents (after this runs), so routing the
+            // Game tab's double-click through it maximized the Scene view by mistake.
+            MaximizePanelOnTitleDoubleClick(EditorLayout.SceneView);
             // The view whose window is focused drives offscreen render selection (OnRender).
             if (ImGui.IsWindowFocused()) sceneTabActive = true;
             SceneTabContents();
@@ -1388,7 +1408,7 @@ internal sealed class EditorApplication {
 
         if (pendingFocusWindow == EditorLayout.GameView) ImGui.SetNextWindowFocus();
         if (ImGui.Begin(EditorLayout.GameView)) {
-            MaximizeOnTitleDoubleClick();   // double-click the Game dock tab to (un)fullscreen
+            MaximizePanelOnTitleDoubleClick(EditorLayout.GameView);   // (un)fullscreen the Game view
             if (ImGui.IsWindowFocused()) sceneTabActive = false;
             GameTabContents();
         }
