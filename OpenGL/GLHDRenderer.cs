@@ -1201,9 +1201,20 @@ void main() {
             NormalStrength = ns;
         if (EnvContrast is { } ct)
             PostFX.Contrast = ct;
+        if (EnvBloom is { } bl)
+            PostFX.BloomIntensity = bl;
+        if (EnvSaturation is { } sat)
+            PostFX.Saturation = sat;
+        // Debug-only material overrides (force glossy/metallic to test VCT reflections etc.).
+        if (EnvRough is { } rv) RoughnessValue = rv;
+        if (EnvMetal is { } mv) Metallic = mv;
     }
 
+    static readonly float? EnvRough = EnvFloat("BALLISTIC_FX_ROUGHNESS");
+    static readonly float? EnvMetal = EnvFloat("BALLISTIC_FX_METALLIC");
     static readonly float? EnvContrast = EnvFloat("BALLISTIC_FX_CONTRAST");
+    static readonly float? EnvBloom = EnvFloat("BALLISTIC_FX_BLOOM");
+    static readonly float? EnvSaturation = EnvFloat("BALLISTIC_FX_SATURATION");
 
     // Draws every active game UIDocument as a screen-space overlay into the currently-bound target
     // (viewport already set). Each document solves its own layout against the viewport (honoring its
