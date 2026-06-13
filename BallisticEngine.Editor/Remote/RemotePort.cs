@@ -33,16 +33,18 @@ internal static class RemotePort {
     // instance, so all share MaxConcurrentClients.
     static void AcceptLoop(CancellationToken token) {
         while (!token.IsCancellationRequested) {
-            NamedPipeServerStream pipe;
+            NamedPipeServerStream? pipe = null;
             try {
                 pipe = new NamedPipeServerStream(PipeName, PipeDirection.InOut, MaxConcurrentClients,
                     PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
                 pipe.WaitForConnectionAsync(token).GetAwaiter().GetResult();
             }
             catch (OperationCanceledException) {
+                pipe?.Dispose();
                 return;
             }
             catch (Exception) {
+                pipe?.Dispose();   // a failed WaitForConnection still leaked the OS pipe handle
                 continue; // transient accept failure — try again
             }
 
