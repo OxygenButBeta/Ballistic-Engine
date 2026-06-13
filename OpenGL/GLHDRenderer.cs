@@ -90,7 +90,8 @@ public class GLHDRenderer : HDRenderer {
     // geometry/sun/camera-cell stamp changes, then the forward shader cone-traces the voxel radiance
     // for indirect diffuse + glossy. Safe when no eligible mesh exists: the grid stays empty and the
     // cone trace adds 0 (== baseline ambient). Needs the GPU-driven path (shares its MDI draw).
-    readonly OpenGL.VoxelGI.GLVoxelGI voxelGI = new(128);
+    readonly OpenGL.VoxelGI.GLVoxelGI voxelGI = new(
+        int.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_VOXELGI_RES"), out int vr) ? vr : 192);
     bool voxelGiEnabled = Environment.GetEnvironmentVariable("BALLISTIC_VOXELGI") != "0";
     bool voxelGiReady;
     // Scratch reused each frame when building the whole-mesh renderer's submesh metadata.
