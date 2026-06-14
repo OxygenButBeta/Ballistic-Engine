@@ -74,6 +74,9 @@ internal sealed class EditorApplication {
 
     // GL texture name -> ImGui texture handle. Hexa's ImGui.Image/ImageButton take an ImTextureID
     // (u64 handle), with no implicit int conversion, so every raw GL texture id routes through here.
+    internal static ImTextureID Tex(RenderHandle handle) => new((ulong)handle.Value);
+    // Overload kept for the editor's own GL preview/thumbnail textures (raw GL ids) until the editor
+    // moves to DX12 (Phase 7); the runtime Scene/Game handles now flow as RenderHandle.
     internal static ImTextureID Tex(int glTextureId) => new((ulong)glTextureId);
 
     SysVec2 sceneViewSize = new(1280, 720);   // render resolution of the Scene offscreen target
@@ -1496,7 +1499,7 @@ internal sealed class EditorApplication {
             ImGui.SetCursorPos(ImGui.GetCursorPos() + dispOffset);
 
         (SysVec2 uv0, SysVec2 uv1) = sceneRes.ZoomUVs();
-        ImGui.Image(Tex(Renderer.SceneColorTextureId), dispSize, uv0, uv1);
+        ImGui.Image(Tex(Renderer.SceneColorHandle), dispSize, uv0, uv1);
         SysVec2 imageMin = ImGui.GetItemRectMin();
         SysVec2 imageSize = dispSize;
 
@@ -1794,7 +1797,7 @@ internal sealed class EditorApplication {
                 ImGui.SetCursorPos(ImGui.GetCursorPos() + dispOffset);
 
             (SysVec2 uv0, SysVec2 uv1) = gameRes.ZoomUVs();
-            ImGui.Image(Tex(Renderer.GameColorTextureId), dispSize, uv0, uv1);
+            ImGui.Image(Tex(Renderer.GameColorHandle), dispSize, uv0, uv1);
             gameViewFocused = ImGui.IsWindowFocused();
             gameViewHovered = ImGui.IsItemHovered(); // is the MOUSE over the game image specifically
 

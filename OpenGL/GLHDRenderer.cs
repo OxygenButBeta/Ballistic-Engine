@@ -4470,8 +4470,8 @@ public class GLHDRenderer : HDRenderer {
         anythingDrawnThisFrame = true;
     }
 
-    public override int SceneColorTextureId => sceneDisplay.colorBuffer;
-    public override int GameColorTextureId => gameDisplay.colorBuffer;
+    public override RenderHandle SceneColorHandle => new(sceneDisplay.colorBuffer);
+    public override RenderHandle GameColorHandle => new(gameDisplay.colorBuffer);
 
     public override void ResizeSceneTarget(int width, int height) {
         if (width <= 0 || height <= 0)

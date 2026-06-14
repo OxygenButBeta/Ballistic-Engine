@@ -26,8 +26,12 @@ public abstract class HDRenderer {
     // over the composite, otherwise the normal composite runs. The hook is null in the player (nothing
     // sets it), so this whole feature is dead weight there. The renderer NEVER references the editor
     // assembly; the editor wires the delegate at startup.
+    // NOTE (DX12 migration): the int texture fields below are raw GL texture ids — an editor-only
+    // DEBUG-composite path that binds G-buffer textures by GL handle. Left GL-coupled on purpose: the
+    // editor debug composite is a Phase 7 concern (editor → DX12). Not part of the runtime display
+    // contract (that's SceneColorHandle/GameColorHandle, now backend-agnostic).
     public struct DebugFrame {
-        public int NormalTexture, DepthTexture, AoTexture, LitColor, SsgiTexture;   // GL texture ids
+        public int NormalTexture, DepthTexture, AoTexture, LitColor, SsgiTexture;   // GL texture ids (editor-debug, Phase 7)
         public int DestWidth, DestHeight;
         public bool PresentToScreen;     // true = draw into FB 0 (player); false = the editor display FBO
         public OpenTK.Mathematics.Matrix4 InvProjection;
@@ -52,9 +56,11 @@ public abstract class HDRenderer {
     // HDR -> display tunables (tonemap, bloom, SSAO, MSAA, grading). Shared by all targets.
     public PostProcessSettings PostFX { get; } = new();
 
-    // GL ids of the two offscreen color textures (for ImGui::Image in the Scene/Game panels).
-    public abstract int SceneColorTextureId { get; }
-    public abstract int GameColorTextureId { get; }
+    // Opaque backend handles of the two offscreen color textures (for ImGui::Image in the Scene/Game
+    // panels). The host passes these straight to ImGui without interpreting them — GL fills its texture
+    // name, a DX12 backend its descriptor handle. (Was raw GL `int` — a backend leak into the editor.)
+    public abstract RenderHandle SceneColorHandle { get; }
+    public abstract RenderHandle GameColorHandle { get; }
 
     // Resize each offscreen target to match its editor panel.
     public abstract void ResizeSceneTarget(int width, int height);
