@@ -462,6 +462,11 @@ public class GLHDRenderer : HDRenderer {
         VolumePostProcessing.Apply(VolumeManager.Stack, PostFX);
         ApplyEnvOverrides();
 
+        // The GlobalIllumination volume override can pin the probe/reflection debug gizmos on (the
+        // editor toolbar toggle is the OTHER source; either shows them).
+        IrradianceVolume.DebugShowFromVolume = PostFX.GiDebugShowProbes;
+        ReflectionVolume.DebugShowFromVolume = PostFX.GiDebugShowReflectionProbes;
+
         // Auto exposure adapts NOW, before the first ExposureMultiplier read below: lighting
         // is pre-exposed, so this frame's EV feeds every light uniform. The target EV comes
         // from last frame's metering of this same render target (scene/game views adapt
@@ -2293,14 +2298,12 @@ public class GLHDRenderer : HDRenderer {
         // The editor renders ONE view per frame (Scene tab or Game tab), so stepping from
         // whichever BeginRender runs is correct - gating on the Scene target stalled the bake
         // completely while the Game tab was active.
-        IrradianceVolume vol = IrradianceVolume.Active is { IsActive: true } active ? active : null;
-
-        // A real placed volume wins; if there's none, fall back to the IMPLICIT DEFAULT grid the
-        // renderer auto-fits to the scene (so GI works with zero setup). The default is dropped the
-        // moment a real volume appears (so the user's placed volume takes over cleanly).
-        if (vol is not null) {
-            defaultProbeVolume = null; // a real volume took over — discard any implicit default
-        } else {
+        // ALWAYS auto-fit now: the irradiance volume is an automatic system, not a hand-placed
+        // component (it's hidden from the Add menu). Any IrradianceVolume.Active left in an OLD scene
+        // is IGNORED so behaviour is consistent — the renderer fits + bakes the implicit grid to the
+        // scene every time. (The class still deserializes for back-compat; it just no longer drives.)
+        IrradianceVolume vol;
+        {
             vol = EnsureDefaultProbeVolume();
         }
 
@@ -2593,9 +2596,11 @@ public class GLHDRenderer : HDRenderer {
 
         // Probe density: ~1 probe per ~6 m horizontally, ~1 per ~4 m vertically, clamped to sane
         // counts. Enough that a room gets several cells (the interior-coverage fix) without a huge bake.
-        int px = Math.Clamp((int)MathF.Round(size.X / 6f) + 1, 4, 24);
-        int py = Math.Clamp((int)MathF.Round(size.Y / 4f) + 1, 3, 12);
-        int pz = Math.Clamp((int)MathF.Round(size.Z / 6f) + 1, 4, 24);
+        // The GlobalIllumination volume override scales this (GiProbeDensity) — higher = finer/slower.
+        float density = MathF.Max(PostFX.GiProbeDensity, 0.05f);
+        int px = Math.Clamp((int)MathF.Round(size.X / 6f * density) + 1, 4, 32);
+        int py = Math.Clamp((int)MathF.Round(size.Y / 4f * density) + 1, 3, 16);
+        int pz = Math.Clamp((int)MathF.Round(size.Z / 6f * density) + 1, 4, 32);
 
         // Did the fit change materially since last time? (Scene edited / first fit.) Hash the bounds
         // + counts; refit + rebake only on change so a static scene bakes once.
@@ -2628,9 +2633,11 @@ public class GLHDRenderer : HDRenderer {
             return null;
 
         // ~1 cell per ~12 m horizontally, ~9 m vertically — coarse on purpose (heavy cells + VRAM).
-        int px = Math.Clamp((int)MathF.Round(size.X / 12f) + 1, 3, 10);
-        int py = Math.Clamp((int)MathF.Round(size.Y / 9f) + 1, 2, 5);
-        int pz = Math.Clamp((int)MathF.Round(size.Z / 12f) + 1, 3, 10);
+        // GlobalIllumination override scales it (GiReflectionDensity); raise sparingly (VRAM/bake cost).
+        float rDensity = MathF.Max(PostFX.GiReflectionDensity, 0.05f);
+        int px = Math.Clamp((int)MathF.Round(size.X / 12f * rDensity) + 1, 3, 12);
+        int py = Math.Clamp((int)MathF.Round(size.Y / 9f * rDensity) + 1, 2, 6);
+        int pz = Math.Clamp((int)MathF.Round(size.Z / 12f * rDensity) + 1, 3, 12);
 
         int stamp = HashCode.Combine(
             (int)center.X, (int)center.Y, (int)center.Z,
@@ -2972,15 +2979,9 @@ public class GLHDRenderer : HDRenderer {
         vol.DeriveCacheKey(SceneManager.GetCurrentScene()?.Name) + LightingFingerprint();
 
     void StepReflectionBake(float preExposure) {
-        ReflectionVolume vol = ReflectionVolume.Active is { IsActive: true } active ? active : null;
-
-        // A real placed volume wins; otherwise fall back to the IMPLICIT DEFAULT grid (auto-fit to
-        // the scene, zero setup). Dropped the moment a real volume appears.
-        if (vol is not null) {
-            defaultReflectionVolume = null;
-        } else {
-            vol = EnsureDefaultReflectionVolume();
-        }
+        // ALWAYS auto-fit (automatic system, hidden from the Add menu): ignore any placed
+        // ReflectionVolume.Active from an old scene; the renderer fits + bakes the implicit grid.
+        ReflectionVolume vol = EnsureDefaultReflectionVolume();
 
         // Volume removed/disabled mid-bake: abort cleanly.
         if (reflectionBake is not null && !ReferenceEquals(reflectionBake.Volume, vol)) {

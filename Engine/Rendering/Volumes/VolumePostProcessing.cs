@@ -69,6 +69,10 @@ public static class VolumePostProcessing {
             fx.GiSdfIntensityScale = gi.sdfIntensity.Value;
             fx.GiSdfForceEnabled = gi.sdfForceEnabled.Value;
             fx.GiAmbientFloor = gi.ambientFloor.Value;
+            fx.GiProbeDensity = gi.probeDensity.Value;
+            fx.GiReflectionDensity = gi.reflectionDensity.Value;
+            fx.GiDebugShowProbes = gi.debugShowProbes.Value;
+            fx.GiDebugShowReflectionProbes = gi.debugShowReflectionProbes.Value;
         }
 
         if (stack.GetComponent<Shadows>() is { } shadows) {

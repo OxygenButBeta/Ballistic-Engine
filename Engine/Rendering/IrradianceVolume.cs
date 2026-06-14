@@ -10,8 +10,13 @@ namespace BallisticEngine;
 // light, the sunlit rotunda knows it's full of warm bounce - indirect light that screen-space
 // GI can't provide because its sources are off-screen.
 //
-// The bake renders the scene 6x per probe, so it's an offline-style operation: tick `Bake`
-// (or save it ticked - it then re-bakes on scene load) and watch the console for progress.
+// NOTE: this is now an AUTOMATIC system, not a hand-placed component. The renderer auto-fits an
+// implicit IrradianceVolume to the scene and bakes it in realtime (camera-outward, sky-primed), so
+// diffuse probe GI "just works" with zero setup. It is HIDDEN from the Add-Component menu
+// (HideFromAddMenu) — tweak it through the GlobalIllumination VOLUME OVERRIDE (probe intensity, etc.)
+// and inspect it through the probe-debug gizmo. The class stays (the renderer's bake/cache/fit logic
+// lives here, and old scenes with a placed instance still deserialize and work).
+[Component(HideFromAddMenu = true)]
 public class IrradianceVolume : SceneBehaviour {
     public static IrradianceVolume Active { get; private set; }
 
@@ -234,11 +239,16 @@ public class IrradianceVolume : SceneBehaviour {
     // Toggled by the editor "Show Probes" debug switch. Empty-air probes draw dim RED, occupied bright
     // GREEN, so the "most of the grid is empty space" is obvious. This is the visual the probe-density
     // rework is built on: SEE where the points are before changing how they're placed.
+    // Manual toggle (Scene-view toolbar) + env default. The GlobalIllumination volume override can
+    // ALSO pin it on via DebugShowFromVolume (renderer sets it from PostFX.GiDebugShowProbes each
+    // frame), so a scene can request the overlay without the editor toggle. Either source shows it.
     public static bool DebugShowAll =
         System.Environment.GetEnvironmentVariable("BALLISTIC_PROBE_DEBUG") == "1";
+    public static bool DebugShowFromVolume;
+    public static bool DebugShowActive => DebugShowAll || DebugShowFromVolume;
     public static void DebugDrawProbes(IGizmos gizmos) {
         ProbeVizData viz = Viz;
-        if (!DebugShowAll || viz is null)
+        if (!DebugShowActive || viz is null)
             return;
         int px = viz.Px, py = viz.Py, pz = viz.Pz;
         if ((long)px * py * pz > 20000) // safety: don't flood the draw list past a sane cap

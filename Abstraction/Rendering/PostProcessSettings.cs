@@ -204,4 +204,13 @@ public sealed class PostProcessSettings {
     // the shadowed side of geometry to PURE BLACK (UE interiors always have bounce fill). Small by
     // default so lit areas are ~unchanged; raise for flatter/brighter ambient, 0 for physically-pure.
     public float GiAmbientFloor { get; set; } = 0.03f;
+
+    // Auto-fit probe-grid density multipliers (the IrradianceVolume/ReflectionVolume are automatic;
+    // these scale how finely they're sampled). 1 = default auto-fit resolution.
+    public float GiProbeDensity { get; set; } = 1f;
+    public float GiReflectionDensity { get; set; } = 1f;
+
+    // Debug gizmo toggles (also on the Scene-view toolbar): draw the probe / reflection grids.
+    public bool GiDebugShowProbes { get; set; }
+    public bool GiDebugShowReflectionProbes { get; set; }
 }

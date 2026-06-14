@@ -1244,9 +1244,8 @@ internal sealed class EditorApplication {
             ToggleIconButton("gridtoggle", EditorIcons.Grid, ref grid, "Viewport grid");
             if (grid != prefs.ShowGrid) { prefs.ShowGrid = grid; EditorPrefs.Save(); }
 
-            // Probe-grid debug toggle: shows the light-probe positions (green = occupied / near
-            // geometry, red = empty air) for the active OR implicit-default volume — without selecting
-            // anything. The visual for diagnosing probe density / placement.
+            // Light-probe debug toggle: green = occupied / near geometry, red = empty air, for the
+            // implicit auto-fit volume — without selecting anything. Diagnoses probe density/placement.
             RightAlign(ImGui.CalcTextSize(EditorIcons.Pin).X + pad2);
             var probes = IrradianceVolume.DebugShowAll;
             ToggleIconButton("probetoggle", EditorIcons.Pin, ref probes,
@@ -1254,6 +1253,15 @@ internal sealed class EditorApplication {
                     ? $"Light probes ({IrradianceVolume.DebugOccupiedCount} occupied / {IrradianceVolume.DebugTotalCount} total)"
                     : "Light probes (debug)");
             IrradianceVolume.DebugShowAll = probes;
+
+            // Reflection-probe debug toggle: cyan = local cubemap cell, dim blue = skybox-fallback cell.
+            RightAlign(ImGui.CalcTextSize(EditorIcons.Pin).X + pad2);
+            var refl = ReflectionVolume.DebugShowAll;
+            ToggleIconButton("refltoggle", EditorIcons.Pin, ref refl,
+                ReflectionVolume.DebugShowAll
+                    ? $"Reflection probes ({ReflectionVolume.DebugCapturedCount} local / {ReflectionVolume.DebugTotalCount} total)"
+                    : "Reflection probes (debug)");
+            ReflectionVolume.DebugShowAll = refl;
         }
 
         ImGui.Separator();
@@ -1537,6 +1545,14 @@ internal sealed class EditorApplication {
 
         if (showGizmos)
             DrawComponentGizmos(gizmoMin, gizmoSize);
+        else if (IrradianceVolume.DebugShowActive || ReflectionVolume.DebugShowActive) {
+            // The probe-debug overlays are their OWN tool, independent of the component-gizmo toggle —
+            // so they still draw when component gizmos are off. (When gizmos ARE on, DrawComponentGizmos
+            // already draws them.) Needs its own gizmoDrawer.Begin since DrawComponentGizmos was skipped.
+            gizmoDrawer.Begin(editorCamera, gizmoMin, gizmoSize, ImGui.GetWindowDrawList());
+            IrradianceVolume.DebugDrawProbes(gizmoDrawer);
+            ReflectionVolume.DebugDrawProbes(gizmoDrawer);
+        }
 
         // Arm vertex snapping while V is held over the viewport (raw key so it works regardless of which
         // panel has ImGui focus, suppressed while typing). On-demand rendering means we must keep
@@ -1609,10 +1625,11 @@ internal sealed class EditorApplication {
             catch (Exception e) { ScriptGuard.ReportRepeating(sceneBehaviour, "OnDrawGizmos", e); }
         }
 
-        // DEBUG: probe-grid overlay (toggle in the View menu). Always-on (not selection-gated) so the
-        // IMPLICIT DEFAULT volume's probes show too — green = occupied, red = empty air. The visual for
-        // the "6k probes, most in empty space" density work.
+        // DEBUG: probe-grid overlays (toolbar toggles / GI volume override). Always-on (not
+        // selection-gated) so the implicit auto-fit volumes show too — light probes green=occupied /
+        // red=air, reflection probes show occupied cubemap cells. The visual for the probe-density work.
         IrradianceVolume.DebugDrawProbes(gizmoDrawer);
+        ReflectionVolume.DebugDrawProbes(gizmoDrawer);
 
         if (editorState.Selected is { IsActive: true } selected) {
             foreach (Behaviour behaviour in selected.Behaviours) {

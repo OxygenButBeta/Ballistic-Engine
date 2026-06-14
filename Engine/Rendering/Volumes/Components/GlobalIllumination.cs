@@ -30,4 +30,26 @@ public sealed class GlobalIllumination : VolumeComponent {
              "interiors never crush the shadowed side of geometry to pure black. 0.03 = subtle default; " +
              "raise for flatter/brighter ambient, 0 for physically-pure (deep blacks).")]
     public readonly ClampedFloatParameter ambientFloor = new(0.03f, 0f, 0.5f);
+
+    // ---- Probe-grid density (the auto-fit IrradianceVolume / ReflectionVolume are AUTOMATIC; this
+    // scales how finely they're sampled without placing/baking a component by hand) ----
+
+    [Tooltip("Light-probe (diffuse GI) grid density multiplier. 1 = default auto-fit resolution. " +
+             "Higher = more probes (sharper indirect light, slower bake); lower = coarser (faster).")]
+    public readonly ClampedFloatParameter probeDensity = new(1f, 0.25f, 3f);
+
+    [Tooltip("Reflection-probe (specular) grid density multiplier. 1 = default. Reflection cells are " +
+             "expensive (a prefiltered cubemap each), so raise this sparingly.")]
+    public readonly ClampedFloatParameter reflectionDensity = new(1f, 0.25f, 3f);
+
+    // ---- Debug visualisation (gizmo overlays — the same toggles as the Scene-view toolbar, exposed
+    // here so a scene/volume can pin them on) ----
+
+    [Tooltip("DEBUG: draw the light-probe grid in the Scene view — GREEN = occupied (near geometry), " +
+             "RED = empty air. Shows where probes are placed and how many fall in wasted empty space.")]
+    public readonly BoolParameter debugShowProbes = new(false);
+
+    [Tooltip("DEBUG: draw the reflection-probe cells in the Scene view (occupied cubemap cells vs " +
+             "skybox-fallback cells), so you can see the specular grid coverage.")]
+    public readonly BoolParameter debugShowReflectionProbes = new(false);
 }

@@ -12,9 +12,11 @@ namespace BallisticEngine;
 // (only cells touching geometry get a real cubemap; empty-air cells fall back to the global skybox
 // IBL), bake-on-load, and cached to Library/ReflectionProbes so later loads skip the bake.
 //
-// The bake renders the scene 6x per occupied cell, so it's an offline-style operation: tick `Bake`
-// (or save it ticked - it then re-bakes on scene load) and watch the console for [ReflectionVolume]
-// progress. Reflections drive the SAME busy-overlay channel as IrradianceVolume (IsBaking/etc.).
+// NOTE: AUTOMATIC now, like IrradianceVolume — the renderer auto-fits + bakes an implicit reflection
+// grid in realtime, so local specular "just works" with zero setup. HIDDEN from the Add-Component menu
+// (HideFromAddMenu); tweak via the GlobalIllumination volume override (reflection intensity) and
+// inspect via the reflection-probe debug gizmo. Class stays for the bake/cache/fit logic + back-compat.
+[Component(HideFromAddMenu = true)]
 public class ReflectionVolume : SceneBehaviour {
     public static ReflectionVolume Active { get; private set; }
 
@@ -169,6 +171,46 @@ public class ReflectionVolume : SceneBehaviour {
     }
 
     public static ReflectionVizData Viz { get; set; }
+
+    // DEBUG overlay (sibling of IrradianceVolume's): draw the reflection-probe grid WITHOUT selecting
+    // the (now hidden) volume. CYAN = a captured local cubemap cell, dim BLUE = empty-air cell that
+    // falls back to the global skybox reflection. Sources: editor toolbar toggle (DebugShowAll) OR the
+    // GlobalIllumination volume override (DebugShowFromVolume, set by the renderer from PostFX).
+    public static bool DebugShowAll =
+        System.Environment.GetEnvironmentVariable("BALLISTIC_REFLPROBE_DEBUG") == "1";
+    public static bool DebugShowFromVolume;
+    public static bool DebugShowActive => DebugShowAll || DebugShowFromVolume;
+    public static int DebugCapturedCount, DebugTotalCount;
+    public static void DebugDrawProbes(IGizmos gizmos) {
+        ReflectionVizData viz = Viz;
+        if (!DebugShowActive || viz is null)
+            return;
+        int px = viz.Px, py = viz.Py, pz = viz.Pz;
+        if ((long)px * py * pz > 20000)
+            return;
+        Vector3 center = viz.Min + viz.Size * 0.5f;
+        gizmos.Color = new Vector3(0.6f, 0.85f, 1f);
+        gizmos.DrawWireCube(center, viz.Size, Quaternion.Identity);
+
+        const float arm = 0.15f;
+        int captured = 0;
+        for (var z = 0; z < pz; z++)
+        for (var y = 0; y < py; y++)
+        for (var x = 0; x < px; x++) {
+            var i = (z * py + y) * px + x;
+            var p = viz.Min + new Vector3(
+                (x + 0.5f) / px * viz.Size.X, (y + 0.5f) / py * viz.Size.Y, (z + 0.5f) / pz * viz.Size.Z);
+            float reach = arm;
+            bool isCaptured = viz.Captured is null || i >= viz.Captured.Length || viz.Captured[i];
+            if (isCaptured) { gizmos.Color = new Vector3(0.15f, 0.85f, 1f); captured++; }   // cyan = local cube
+            else { gizmos.Color = new Vector3(0.2f, 0.25f, 0.5f); reach = arm * 0.5f; }      // dim blue = skybox fallback
+            gizmos.DrawLine(p - Vector3.UnitX * reach, p + Vector3.UnitX * reach);
+            gizmos.DrawLine(p - Vector3.UnitY * reach, p + Vector3.UnitY * reach);
+            gizmos.DrawLine(p - Vector3.UnitZ * reach, p + Vector3.UnitZ * reach);
+        }
+        DebugCapturedCount = captured;
+        DebugTotalCount = px * py * pz;
+    }
 
     // Library/ReflectionProbes, assigned by AssetDatabase.Initialize (the engine layer doesn't
     // know the project layout). null = persistence disabled.
