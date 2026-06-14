@@ -54,18 +54,6 @@ vec3 Sanitize(vec3 v) {
                 isnan(v.z) || isinf(v.z) ? 0.0 : v.z);
 }
 
-float SampleSunVisibility(vec3 worldPos) {
-    for (int c = 0; c < CascadeCountSun && c < MAX_CASCADES; c++) {
-        vec4 clip = CascadeMatrices[c] * vec4(worldPos, 1.0);
-        float edge = max(abs(clip.x), abs(clip.y));
-        vec3 proj = clip.xyz * 0.5 + 0.5;
-        if (edge > 1.0 || proj.z > 1.0 || proj.z < 0.0)
-            continue;
-        return texture(ShadowMap, vec4(proj.xy, float(c), proj.z - CascadeBias[c]));
-    }
-    return 1.0;
-}
-
 // Distance of THIS cascade at a voxel (texelFetch on the R channel).
 float DistAt(ivec3 v) { return texelFetch(DistanceField, v, 0).r; }
 
@@ -81,6 +69,44 @@ float GdfDist(vec3 worldP, out bool inside) {
         }
     }
     return 1e9;
+}
+
+// GDF SUN OCCLUSION (interior phantom-sun fix — see SdfTrace_Comp for the full rationale). March the
+// global distance field toward the sun: hit geometry before escaping the clipmap -> shadowed; escape
+// -> lit. Used as the OUTSIDE-cascades fallback so enclosed interior voxels are correctly shadowed
+// instead of getting phantom full sun (which made BistroInterior's GI pure red). 1 = lit, 0 = occluded.
+float SunVisibilityGdf(vec3 worldPos) {
+    vec3 dir = normalize(SunDirectionWorld);
+    float cell0 = GdfCell[0];
+    vec3 p = worldPos + dir * (2.0 * cell0);
+    float traveled = 0.0;
+    const int SUN_STEPS = 40;
+    const float SUN_MAXD = 60.0;
+    for (int s = 0; s < SUN_STEPS; ++s) {
+        bool inside;
+        float d = GdfDist(p, inside);
+        if (!inside) return 1.0;                 // escaped the clipmap -> sun visible
+        if (d < 0.5 * cell0) return 0.0;         // hit an occluder -> shadowed
+        float adv = max(d, 0.5 * cell0);
+        p += dir * adv; traveled += adv;
+        if (traveled >= SUN_MAXD) return 1.0;
+    }
+    return 1.0;
+}
+
+// Sun visibility: sharp shadow map inside the cascades, GDF sun trace outside them (the phantom-sun
+// fix). The inject ALWAYS has the GDF (it's the GDF's own voxel-lighting pass), so the fallback is
+// always the trace — never the old unconditional "lit".
+float SampleSunVisibility(vec3 worldPos) {
+    for (int c = 0; c < CascadeCountSun && c < MAX_CASCADES; c++) {
+        vec4 clip = CascadeMatrices[c] * vec4(worldPos, 1.0);
+        float edge = max(abs(clip.x), abs(clip.y));
+        vec3 proj = clip.xyz * 0.5 + 0.5;
+        if (edge > 1.0 || proj.z > 1.0 || proj.z < 0.0)
+            continue;
+        return texture(ShadowMap, vec4(proj.xy, float(c), proj.z - CascadeBias[c]));
+    }
+    return SunVisibilityGdf(worldPos);
 }
 
 // Read LAST frame's radiance at a world point (finest GDF cascade containing it).

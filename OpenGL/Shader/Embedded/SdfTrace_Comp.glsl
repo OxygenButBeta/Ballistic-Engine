@@ -383,8 +383,41 @@ vec3 SceneGradient(vec3 worldP) {
     return len > 1e-5 ? g / len : vec3(0.0, 1.0, 0.0);
 }
 
-// Sun visibility at a world point via the cascade that covers it (0 = shadowed, 1 = lit). Copied
-// verbatim from Volumetric_Frag.SampleSunVisibility so the SDF hit's shadowing matches the lit pass.
+// GDF SUN OCCLUSION (the interior phantom-sun fix). The shadow cascades only cover a bounded region
+// around the camera; a point OUTSIDE them used to be assumed "lit" — which is right for far OPEN
+// ground but WRONG inside a building (BistroInterior surfaces beyond cascade range got phantom full
+// sun -> the pure-red GI). Instead, when the cascades don't cover a point, march the GLOBAL DISTANCE
+// FIELD toward the sun: if the ray hits geometry before escaping the clipmap, the point is shadowed;
+// if it escapes, it's lit. This is physically correct for BOTH cases (open ground escapes -> lit;
+// enclosed interior hits a wall/ceiling -> shadowed) and is exactly Lumen's SDF-traced far shadow.
+// Returns 1 = lit, 0 = occluded. Only meaningful when the GDF is active (UseGlobalSdf == 1).
+float SunVisibilityGdf(vec3 worldPos) {
+    vec3 dir = normalize(SunDirectionWorld); // toward the sun
+    // Start a little off the surface so we don't self-hit the originating voxel's own shell.
+    float cell0 = GlobalSdfCell[0];
+    vec3 p = worldPos + dir * (2.0 * cell0);
+    float traveled = 0.0;
+    const int SUN_STEPS = 40;
+    const float SUN_MAXD = 60.0;     // march this far toward the sun looking for an occluder
+    for (int s = 0; s < SUN_STEPS; ++s) {
+        bool inside;
+        float d = GlobalSdfSample(p, inside);
+        if (!inside)
+            return 1.0;              // left the clipmap without hitting anything -> sun is visible
+        if (d < 0.5 * cell0)
+            return 0.0;              // hit geometry -> occluded
+        float adv = max(d, 0.5 * cell0);
+        p += dir * adv; traveled += adv;
+        if (traveled >= SUN_MAXD)
+            return 1.0;              // marched far with no hit -> treat as lit
+    }
+    return 1.0;
+}
+
+// Sun visibility at a world point via the cascade that covers it (0 = shadowed, 1 = lit). Inside the
+// cascades use the (sharp) shadow map; OUTSIDE them fall back to the GDF sun trace (above) when the
+// GDF is active, so enclosed interiors beyond cascade range are correctly shadowed instead of getting
+// phantom full sun. With no GDF, the old "outside = lit" behaviour is preserved.
 float SampleSunVisibility(vec3 worldPos) {
     for (int c = 0; c < CascadeCount && c < MAX_CASCADES; c++) {
         vec4 clip = CascadeMatrices[c] * vec4(worldPos, 1.0);
@@ -394,7 +427,8 @@ float SampleSunVisibility(vec3 worldPos) {
             continue;
         return texture(ShadowMap, vec4(proj.xy, float(c), proj.z - CascadeBias[c]));
     }
-    return 1.0; // outside every cascade: lit (matches the lit shader)
+    // Outside every cascade: GDF-trace the sun (interior phantom-sun fix), else fall back to lit.
+    return UseGlobalSdf == 1 ? SunVisibilityGdf(worldPos) : 1.0;
 }
 
 // Direct-light estimate at an off-screen hit: neutral-albedo (sun cosine, shadowed) + sky. The

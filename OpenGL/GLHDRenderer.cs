@@ -840,6 +840,10 @@ public class GLHDRenderer : HDRenderer {
                         Console.WriteLine($"[GDF warm-up] frame {lumenDiagFrame}: {st} gdfActive={sdfGi.GdfActive}");
                         lumenDiagLast = st;
                     }
+                    if (lumenDiagFrame == 1 || lumenDiagFrame == 400)
+                        Console.WriteLine($"[GI exposure] frame {lumenDiagFrame}: preExposure={preExposure:F4} " +
+                            $"skyExposureBase={skyExposureBase:F4} skyExposure(passed)={skyExposureBase * preExposure:F4} " +
+                            $"sunColor=({sunColor.X:F2},{sunColor.Y:F2},{sunColor.Z:F2})");
                     lumenDiagFrame++;
                 }
                 // PROBE<->SDF-GI BLEND: probes are the diffuse BASE (they already carry the static
