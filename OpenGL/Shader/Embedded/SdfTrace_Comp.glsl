@@ -439,6 +439,48 @@ vec3 HitRadiance(vec3 worldHit, vec3 hitN) {
     return HitDirect(worldHit, hitN);
 }
 
+// LUMEN SCREEN TRACE (Phase 4a). Before a gather ray goes to the SDF march, march the DEPTH BUFFER in
+// screen space along the ray: the near field is on screen at full G-buffer detail, so a screen hit
+// gives SHARP CONTACT GI (the crisp near-surface bounce a coarse 64^3 SDF can't resolve) and reads the
+// REAL lit SceneColor radiance there — exactly Lumen's "screen trace first, SDF trace as fallback".
+// Returns true + the lit radiance on a confirmed on-screen hit; false => the caller falls to the SDF.
+// `outDist` reports how far (world metres) the screen ray traveled before the hit, so the SDF march
+// can resume from there (avoid double-counting the near field) — or MAX on a clean miss.
+bool ScreenTrace(vec3 originWorld, vec3 dirWorld, out vec3 radiance, out float outDist) {
+    radiance = vec3(0.0);
+    outDist = MAX_DIST;
+    const int ST_STEPS = 16;
+    const float ST_MAXDIST = 4.0;   // screen traces handle only the NEAR field; SDF takes the far field
+    const float ST_THICK = 0.5;     // accept a hit when the ray is within this view-Z of the surface (m)
+
+    float stepLen = ST_MAXDIST / float(ST_STEPS);
+    for (int s = 1; s <= ST_STEPS; ++s) {
+        float t = float(s) * stepLen;
+        vec3 wp = originWorld + dirWorld * t;
+        vec4 clip = ViewProj * vec4(wp, 1.0);
+        if (clip.w <= 1e-4)
+            return false; // behind camera
+        vec3 ndc = clip.xyz / clip.w;
+        if (any(lessThan(ndc.xy, vec2(-1.0))) || any(greaterThan(ndc.xy, vec2(1.0))))
+            return false; // left the screen -> let the SDF march continue off-screen
+        vec2 suv = ndc.xy * 0.5 + 0.5;
+        float sceneDepth = texture(DepthTex, suv).r;
+        if (sceneDepth >= 1.0)
+            continue; // sky pixel: nothing here
+        // Compare in view-Z: the ray sample's view-Z vs the scene surface's at that pixel.
+        float sampViewZ  = ViewPosFromDepth(suv, ndc.z * 0.5 + 0.5).z; // ray point's view-Z
+        float sceneViewZ = ViewPosFromDepth(suv, sceneDepth).z;        // shown surface view-Z (<0)
+        // Hit: the ray point is at/just behind the visible surface (within thickness) — i.e. it reached
+        // the surface from in front. (Both view-Z negative; "behind" = more negative.)
+        if (sampViewZ <= sceneViewZ + 0.01 && sampViewZ >= sceneViewZ - ST_THICK) {
+            radiance = Sanitize(textureLod(SceneColor, suv, 0.0).rgb);
+            outDist = t;
+            return true;
+        }
+    }
+    return false; // no near-field screen hit in range -> fall to the SDF march
+}
+
 void main() {
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
     if (px.x >= HalfSize.x || px.y >= HalfSize.y)
@@ -498,6 +540,20 @@ void main() {
         float sinT = sqrt(hy);
         vec3 localDir = vec3(cos(phi) * sinT, sin(phi) * sinT, cosT);
         vec3 dir = normalize(T * localDir.x + B * localDir.y + worldN * localDir.z);
+
+        // LUMEN SCREEN TRACE FIRST (Phase 4a, GDF path only — the per-mesh path keeps its own behaviour):
+        // the near field is on screen, so a screen-space depth march gives sharp contact GI from the
+        // REAL lit colour. On a screen hit, take that radiance and skip the SDF march for this ray. On a
+        // miss, the SDF march below handles the off-screen / far field. (Gated so the per-mesh atlas
+        // path, which has its own screen-radiance read, is unchanged.)
+        if (UseGlobalSdf == 1) {
+            vec3 stRad; float stDist;
+            if (ScreenTrace(origin, dir, stRad, stDist)) {
+                gathered += stRad;
+                hitCount++;
+                continue; // ray resolved on screen — next ray
+            }
+        }
 
         // Sphere-trace the world-space SDF.
         vec3 p = origin;
