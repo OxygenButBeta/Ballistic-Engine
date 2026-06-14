@@ -278,6 +278,13 @@ public class IrradianceVolume : SceneBehaviour {
     }
     public static int DebugOccupiedCount, DebugTotalCount;
 
+    // Live GI summary the renderer publishes each frame (read by the editor Stats overlay's "Global
+    // Illumination" section — the "what is the data / how is it affecting the scene" readout). Plain
+    // statics so the editor needn't be handed PostFX. ProbesEnabled/etc. reflect the active overrides.
+    public static bool StatProbesEnabled = true, StatReflectionsEnabled = true, StatLumenEnabled;
+    public static float StatProbeIntensity = 1f, StatReflectionIntensity = 1f, StatLumenIntensity = 1f;
+    public static int StatProbeGridX, StatProbeGridY, StatProbeGridZ;
+
     // ---- Baked-data persistence (Library/ProbeVolumes/<CacheId>.bpv) ----
     // Layout: magic 'BPV1' | i32 px,py,pz | center xyz | size xyz | 4 SH channels of
     // (px*py*pz*4) floats. Grid/bounds mismatches reject the file (stale cache).

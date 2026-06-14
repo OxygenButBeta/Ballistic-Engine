@@ -467,6 +467,17 @@ public class GLHDRenderer : HDRenderer {
         IrradianceVolume.DebugShowFromVolume = PostFX.GiDebugShowProbes;
         ReflectionVolume.DebugShowFromVolume = PostFX.GiDebugShowReflectionProbes;
 
+        // Publish the live GI summary for the editor Stats overlay's "Global Illumination" section.
+        IrradianceVolume.StatProbesEnabled = PostFX.GiProbesEnabled;
+        IrradianceVolume.StatReflectionsEnabled = PostFX.GiReflectionsEnabled;
+        IrradianceVolume.StatLumenEnabled = sdfGiEnabled || PostFX.GiSdfForceEnabled;
+        IrradianceVolume.StatProbeIntensity = PostFX.GiProbeIntensity;
+        IrradianceVolume.StatReflectionIntensity = PostFX.GiReflectionIntensity;
+        IrradianceVolume.StatLumenIntensity = PostFX.GiSdfIntensityScale;
+        IrradianceVolume.StatProbeGridX = probeDimX;
+        IrradianceVolume.StatProbeGridY = probeDimY;
+        IrradianceVolume.StatProbeGridZ = probeDimZ;
+
         // Auto exposure adapts NOW, before the first ExposureMultiplier read below: lighting
         // is pre-exposed, so this frame's EV feeds every light uniform. The target EV comes
         // from last frame's metering of this same render target (scene/game views adapt
@@ -2778,6 +2789,10 @@ public class GLHDRenderer : HDRenderer {
         foreach (var occupied in job.Occupied)
             if (occupied)
                 job.CapturedCount++;
+
+        // Publish occupancy for the Stats overlay readout (independent of the debug gizmo toggle).
+        IrradianceVolume.DebugOccupiedCount = job.CapturedCount;
+        IrradianceVolume.DebugTotalCount = job.Total;
 
         if (Environment.GetEnvironmentVariable("BALLISTIC_PROBE_DEBUG") == "1") {
             int subTotal = 0, wholeMesh = 0;

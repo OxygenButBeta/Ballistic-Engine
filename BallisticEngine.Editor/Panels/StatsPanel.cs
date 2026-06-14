@@ -85,6 +85,26 @@ internal sealed class StatsPanel {
                     Line(name, $"{ms:0.00} ms", scale);
         }
 
+        // Global Illumination readout — "what is the data / how is it affecting the scene": which GI
+        // systems are live, their strengths, the probe grid + occupancy, and bake progress.
+        ImGui.SeparatorText("Global Illumination");
+        int pGx = IrradianceVolume.StatProbeGridX, pGy = IrradianceVolume.StatProbeGridY, pGz = IrradianceVolume.StatProbeGridZ;
+        int pOcc = IrradianceVolume.DebugOccupiedCount, pTot = IrradianceVolume.DebugTotalCount;
+        Line("Light probes",
+            IrradianceVolume.StatProbesEnabled ? $"on  x{IrradianceVolume.StatProbeIntensity:0.0#}" : "OFF", scale);
+        if (pGx > 0)
+            Line("  probe grid", $"{pGx}x{pGy}x{pGz} = {pGx * pGy * pGz}", scale);
+        if (pTot > 0)
+            Line("  occupied / air", $"{pOcc} / {pTot - pOcc}", scale);
+        if (IrradianceVolume.IsBaking)
+            Line("  baking", $"{IrradianceVolume.BakeProgress * 100:0}%", scale);
+        Line("Reflection probes",
+            IrradianceVolume.StatReflectionsEnabled ? $"on  x{IrradianceVolume.StatReflectionIntensity:0.0#}" : "OFF", scale);
+        if (ReflectionVolume.DebugTotalCount > 0)
+            Line("  local / total", $"{ReflectionVolume.DebugCapturedCount} / {ReflectionVolume.DebugTotalCount}", scale);
+        Line("Lumen (SDF-GI)",
+            IrradianceVolume.StatLumenEnabled ? $"on  x{IrradianceVolume.StatLumenIntensity:0.0#}" : "OFF", scale);
+
         ImGui.SeparatorText("Scene");
         Line("Entities", scene.Entities.Count.ToString(), scale);
         Line("Scene components", scene.SceneBehaviours.Count.ToString(), scale);
