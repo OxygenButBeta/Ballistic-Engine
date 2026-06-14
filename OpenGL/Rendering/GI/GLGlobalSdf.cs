@@ -73,11 +73,22 @@ public sealed class GLGlobalSdf : IDisposable {
         public int Cascade; public MeshSdf Sdf; public float[] Albedo; public Vector3 Min; public float Cell;
         public int Res;        // detail resolution this bake produced (CoarseResolution or Resolution)
         public Vector3i SrcRes; // the field's own grid (== Res^3 unless degenerate) — for the upsample
+        public MeshSdfBaker.PreparedField Prepared; // the built BVH, cached for this cascade's refine (Phase 0)
     }
     Task<BakeResult> bakeTask;
     int bakeCascade = -1;
     int geometryStamp;          // hash of the opaque set's transforms+bounds; re-bake all on change
     bool stampValid;
+
+    // PHASE 0 (BVH reuse): a per-cascade PreparedField (built BVH + per-tri albedo over the cascade's
+    // world-triangle snapshot). The BVH BUILD is the dominant CPU cost on big scenes (572-900ms for
+    // 200K+ tris); KickBake used to call BakeWorldTriangles which rebuilt the BVH on EVERY bake — both
+    // the coarse warm-up AND the full-res refine of the same cascade paid it twice. Caching the prepared
+    // field per cascade (keyed by the geometry stamp it was built under) lets the coarse bake and the
+    // refine share ONE build. Invalidated wholesale on a geometry-stamp change (same as cascadeBaked).
+    readonly MeshSdfBaker.PreparedField[] preparedField = new MeshSdfBaker.PreparedField[CascadeCount];
+    readonly int[] preparedStamp = new int[CascadeCount];   // geometryStamp the prepared field was built under
+    readonly bool[] preparedValid = new bool[CascadeCount];
 
     // Voxel-lighting inject program (GlobalRadianceInject_Comp) + its cached uniform locations.
     int injectProgram;
@@ -242,6 +253,14 @@ public sealed class GLGlobalSdf : IDisposable {
                 cascadeBaked[r.Cascade] = true;
                 cascadeRes[r.Cascade] = r.Res;
                 if (r.Cascade == 0) Available = true;
+                // PHASE 0: cache the built BVH so this cascade's full-res refine reuses it (the build is
+                // the dominant cost). Keyed by the stamp it was built under; PASS 2a scroll re-bakes a
+                // moved cascade with a fresh snapshot, so the prepared field is only reused in-place.
+                if (r.Prepared != null) {
+                    preparedField[r.Cascade] = r.Prepared;
+                    preparedStamp[r.Cascade] = geometryStamp;
+                    preparedValid[r.Cascade] = true;
+                }
             }
             bakeTask = null;
             bakeCascade = -1;
@@ -254,7 +273,10 @@ public sealed class GLGlobalSdf : IDisposable {
         if (!stampValid || stamp != geometryStamp) {
             geometryStamp = stamp;
             stampValid = true;
-            for (int c = 0; c < CascadeCount; c++) { cascadeBaked[c] = false; cascadeRes[c] = 0; }
+            for (int c = 0; c < CascadeCount; c++) {
+                cascadeBaked[c] = false; cascadeRes[c] = 0;
+                preparedValid[c] = false; preparedField[c] = null; // stale BVH — geometry moved
+            }
         }
 
         // PASS 1 (warm-up priority): get a COARSE field into EVERY cascade that has none, finest-first.
@@ -396,14 +418,29 @@ public sealed class GLGlobalSdf : IDisposable {
         bakeCascade = cascade;
         bool diag = Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_DIAG") == "1";
         int triCount = worldVerts.Count / 3;
+
+        // PHASE 0 (BVH reuse): reuse this cascade's prepared field (built BVH) when it was built under the
+        // CURRENT geometry stamp AND covers a box overlapping this bake (same snapshot). The coarse warm-up
+        // built it; the full-res refine of the SAME cascade reuses it instead of rebuilding the BVH. A
+        // cascade that scrolled (PASS 2a, new box/triangles) rebuilds — its prepared field no longer matches.
+        bool reuse = preparedValid[cascade] && preparedStamp[cascade] == geometryStamp
+                     && (cascadeMin[cascade] - min).LengthSquared < 1e-6f;
+        MeshSdfBaker.PreparedField reused = reuse ? preparedField[cascade] : null;
+
         bakeTask = Task.Run(() => {
             var sw = diag ? System.Diagnostics.Stopwatch.StartNew() : null;
-            MeshSdf sdf = MeshSdfBaker.BakeWorldTriangles(worldVerts, triAlbedo, min, max, res, out float[] alb, signRays);
+            // Build the BVH once (or reuse the cached one), then bake the grid at this detail resolution.
+            MeshSdfBaker.PreparedField prep = reused ?? MeshSdfBaker.Prepare(worldVerts, triAlbedo);
+            MeshSdf sdf = null;
+            float[] alb = null;
+            if (prep != null)
+                sdf = MeshSdfBaker.BakePrepared(prep, min, max, res, out alb, signRays);
             if (sw != null)
-                Console.WriteLine($"[GDF bake] cascade {cascade} res {dr}^3 sign{signRays}, {triCount} tris -> {sw.ElapsedMilliseconds} ms");
+                Console.WriteLine($"[GDF bake] cascade {cascade} res {dr}^3 sign{signRays}, {triCount} tris" +
+                                  $"{(reused != null ? " (BVH reused)" : "")} -> {sw.ElapsedMilliseconds} ms");
             return new BakeResult {
                 Cascade = cascade, Sdf = sdf, Albedo = alb, Min = min, Cell = cell,
-                Res = dr, SrcRes = sdf?.Res ?? res
+                Res = dr, SrcRes = sdf?.Res ?? res, Prepared = prep
             };
         });
     }
