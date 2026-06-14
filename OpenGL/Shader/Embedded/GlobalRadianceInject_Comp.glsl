@@ -38,6 +38,12 @@ uniform float GdfCell[GDF_CASCADES];
 uniform float SkyExposure;
 uniform float Feedback;           // EMA weight for the OLD value (~0.9 sticky)
 uniform float BounceScale;        // multi-bounce gain (1 = normal; >1 strengthens the indirect bounce)
+// Near-surface SHELL thickness in cells: voxels with |d| <= ShellBandCells*cell carry radiance. The
+// coarse upsampled field had a naturally thick (smooth) shell; the SHARP JFA field's shell is thin
+// (1-2 cells), so the gather reads can miss it -> dim fill on fragmented scenes. Widening the lit band
+// thickens the radiance shell so the gather reliably lands in occupied voxels, WITHOUT re-coarsening
+// the distance field (which is what caused the speckle). Default 2.0 (matches the historical band).
+uniform float ShellBandCells;
 
 const int MAX_CASCADES = 4;
 uniform mat4  CascadeMatrices[MAX_CASCADES];
@@ -226,7 +232,7 @@ void main() {
     // flicker, clipmap scroll) — so the cache the gather reads kept collapsing toward 0 and rooms
     // emptied. 0.9x keeps a transiently-missed surface voxel alive ~10 frames while genuinely-empty air
     // still fades. (The near-surface band below overwrites occupied voxels with fresh radiance anyway.)
-    if (abs(d) > 2.0 * CascadeCell) {
+    if (abs(d) > ShellBandCells * CascadeCell) {
         vec4 old = texelFetch(GdfRadiance[Cascade], v, 0);
         imageStore(RadianceOut, v, vec4(old.rgb * 0.9, old.a * 0.9));
         return;

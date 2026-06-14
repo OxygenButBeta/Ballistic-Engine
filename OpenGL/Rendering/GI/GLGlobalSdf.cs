@@ -82,6 +82,17 @@ public sealed class GLGlobalSdf : IDisposable {
     // the slow CPU coarse-warm-up + never-landing refine. Default OFF until verified; the CPU path is
     // byte-for-byte the committed baseline. A/B with the env var.
     static readonly bool UseJfa = Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_JFA") == "1";
+
+    // Radiance-shell thickness in cells (inject's near-surface band). The sharp JFA field has a thin
+    // shell, so it needs a WIDER lit band (3.0) for the gather to reliably read occupied voxels; the
+    // CPU coarse-upsampled field's shell is already thick, so it keeps the historical 2.0. Env override.
+    static readonly float ShellBand = ParseShell();
+    static float ParseShell() {
+        string s = Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_SHELL");
+        if (float.TryParse(s, System.Globalization.CultureInfo.InvariantCulture, out float v))
+            return Math.Clamp(v, 1f, 8f);
+        return UseJfa ? 3.0f : 2.0f;
+    }
     Task<BakeResult> bakeTask;
     int bakeCascade = -1;
     int geometryStamp;          // hash of the opaque set's transforms+bounds; re-bake all on change
@@ -106,7 +117,7 @@ public sealed class GLGlobalSdf : IDisposable {
 
     // Voxel-lighting inject program (GlobalRadianceInject_Comp) + its cached uniform locations.
     int injectProgram;
-    int liCascade, liCascadeMin, liCascadeCell, liRes, liSkyExposure, liFeedback, liBounceScale;
+    int liCascade, liCascadeMin, liCascadeCell, liRes, liSkyExposure, liFeedback, liBounceScale, liShellBandCells;
     // Multi-bounce gain (BALLISTIC_LUMEN_BOUNCE, default 2). >1 strengthens the indirect inter-surface
     // bounce in the voxel cache so enclosed/shadowed areas fill with colored multi-bounce light. The
     // stored cache is a geometric series in bounceAlbedo*gain, so it accelerates non-linearly: on
@@ -202,6 +213,7 @@ public sealed class GLGlobalSdf : IDisposable {
         liSkyExposure = GL.GetUniformLocation(injectProgram, "SkyExposure");
         liFeedback = GL.GetUniformLocation(injectProgram, "Feedback");
         liBounceScale = GL.GetUniformLocation(injectProgram, "BounceScale");
+        liShellBandCells = GL.GetUniformLocation(injectProgram, "ShellBandCells");
         liCascadeCountSun = GL.GetUniformLocation(injectProgram, "CascadeCountSun");
         liSunDir = GL.GetUniformLocation(injectProgram, "SunDirectionWorld");
         liSunColor = GL.GetUniformLocation(injectProgram, "SunColor");
@@ -480,8 +492,13 @@ public sealed class GLGlobalSdf : IDisposable {
             if (UseJfa) {
                 var fullRes = new Vector3i(Resolution);
                 Vector3 jfaMax = min + new Vector3(cell * Resolution);
+                // Wide seed band (1.75 cells) for an accurate near-surface field (a narrow band left band
+                // voxels with no nearby seed -> inaccurate). Sign is the cost (7-ray parity x ~30-175K
+                // seeds); SdfSeedExtractor computes it from a CHEAP COARSE parity grid (32^3) sampled per
+                // seed instead of a per-seed 7-ray vote — sign is piecewise-constant so the coarse grid is
+                // accurate except at thin walls, and the cost drops to ~33K parity votes regardless of res.
                 SdfSeedExtractor.SeedGrid seeds = prep == null ? null
-                    : SdfSeedExtractor.Extract(prep, min, jfaMax, fullRes, 7);
+                    : SdfSeedExtractor.Extract(prep, min, jfaMax, fullRes, 7, 1.75f);
                 if (sw != null)
                     Console.WriteLine($"[GDF JFA] cascade {cascade} seeds {Resolution}^3, {triCount} tris" +
                                       $"{(reused != null ? " (BVH reused)" : "")}, {seeds?.SeedCount ?? 0} seeds -> {sw.ElapsedMilliseconds} ms");
@@ -629,6 +646,10 @@ public sealed class GLGlobalSdf : IDisposable {
         GL.Uniform1(liSkyExposure, skyExposure);
         GL.Uniform1(liFeedback, feedback);
         GL.Uniform1(liBounceScale, BounceScale);
+        // The SHARP JFA field has a thin (1-2 cell) surface shell — widen the lit band so the gather
+        // reliably reads occupied radiance voxels (the coarse upsampled field's shell was naturally
+        // thicker). The CPU coarse path keeps the historical 2.0. Overridable via BALLISTIC_LUMEN_SHELL.
+        GL.Uniform1(liShellBandCells, ShellBand);
         int sc = Math.Min(sunCascadeCount, 4);
         GL.Uniform1(liCascadeCountSun, sc);
         for (int i = 0; i < sc; i++)

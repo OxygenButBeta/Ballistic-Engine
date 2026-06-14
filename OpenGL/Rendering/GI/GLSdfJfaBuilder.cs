@@ -181,7 +181,7 @@ public sealed class GLSdfJfaBuilder : IDisposable {
 
         // GPU field.
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var seeds = SdfSeedExtractor.Extract(prep, boundsMin, boundsMax, res, 7);
+        var seeds = SdfSeedExtractor.Extract(prep, boundsMin, boundsMax, res, 7, 1.75f); // match runtime (7-ray, wide band)
         long seedMs = sw.ElapsedMilliseconds;
         int distTex = CreateTex(SizedInternalFormat.R16f);
         int albTex = CreateTex(SizedInternalFormat.Rgba8);

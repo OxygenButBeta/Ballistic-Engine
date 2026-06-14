@@ -107,8 +107,9 @@ public static class SdfSeedExtractor {
                 // Surface point -> CONTINUOUS VOXEL coords (cell centers at integer indices, matching
                 // MeshSdf.Sample) so the GPU flood propagates a grid-space coordinate.
                 Vector3 surfVox = (surf - boundsMin) / cellSize - new Vector3(0.5f);
-                // SIGN: the proven 7-ray parity at the voxel center (winding-agnostic). The flood
-                // propagates this seed's sign to interior/exterior voxels (constant within a region).
+                // SIGN: the proven 7-ray parity at the voxel center (winding-agnostic, robust on welded
+                // soup). The flood propagates this seed's sign to interior/exterior voxels (constant
+                // within a region). This is the seed-extraction cost; bounded by a tight band (1.75 cells).
                 float sign = prep.IsInside(p, signRays) ? -1f : 1f;
                 grid.SeedPos[idx] = new Vector4(surfVox.X, surfVox.Y, surfVox.Z, sign);
                 if (wantAlbedo) {
