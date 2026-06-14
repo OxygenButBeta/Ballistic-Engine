@@ -3130,20 +3130,30 @@ public class GLHDRenderer : HDRenderer {
         UploadReflectionCellMap(job.Px, job.Py, job.Pz, job.CellToLayer, job.Min, job.Size);
         PublishReflectionViz(job.Px, job.Py, job.Pz, job.Min, job.Size, job.Occupied);
 
-        // Read every layer's mip chain back ONCE for the disk cache (later loads skip the bake).
+        // Read every layer's mip chain back ONCE for the disk cache (later loads skip the bake). The
+        // GetTexImage MUST be on the GL thread, but the 192MB SERIALIZE + file write that follows is
+        // pure CPU/IO — run it on a BACKGROUND task so it doesn't block the GL thread for ~tens of ms
+        // at bake completion (a one-time load hitch). cubeTexels/cellToLayer are freshly-allocated CPU
+        // copies not touched again here, so the background write is race-free.
         var floatsPerLayer = ReflectionVolume.FloatsPerLayer(ReflectionCaptureRes, ReflectionMipCount);
         var cubeTexels = new float[job.LayerCount][];
         for (var l = 0; l < job.LayerCount; l++)
             cubeTexels[l] = new float[floatsPerLayer];
         ReadReflectionLayers(reflectionArray, job.LayerCount, cubeTexels);
 
-        ReflectionVolume.SaveCache(ReflectionCacheKey(job.Volume), job.Px, job.Py, job.Pz,
-            job.Volume.Center, job.Size, ReflectionCaptureRes, ReflectionMipCount, job.CellToLayer, cubeTexels);
+        // Capture by value for the background task (don't reference `job` — AbortReflectionBake nulls it).
+        string cacheKey = ReflectionCacheKey(job.Volume);
+        int cpx = job.Px, cpy = job.Py, cpz = job.Pz;
+        Vector3 cCenter = job.Volume.Center, cSize = job.Size;
+        int[] cCellToLayer = job.CellToLayer;
+        System.Threading.Tasks.Task.Run(() =>
+            ReflectionVolume.SaveCache(cacheKey, cpx, cpy, cpz, cCenter, cSize,
+                ReflectionCaptureRes, ReflectionMipCount, cCellToLayer, cubeTexels));
 
         var mb = job.LayerCount * (double)floatsPerLayer * sizeof(float) / (1024.0 * 1024.0);
         Console.WriteLine(
             $"[ReflectionVolume] bake complete: {job.LayerCount} local probes " +
-            $"({mb:F1} MB) in {job.Watch.Elapsed.TotalSeconds:F1}s (cached).");
+            $"({mb:F1} MB) in {job.Watch.Elapsed.TotalSeconds:F1}s (caching async).");
         AbortReflectionBake();
         IrradianceVolume.BakeProgress = 1f;
     }
