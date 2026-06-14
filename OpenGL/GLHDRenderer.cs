@@ -478,6 +478,15 @@ public class GLHDRenderer : HDRenderer {
         IrradianceVolume.StatProbeGridY = probeDimY;
         IrradianceVolume.StatProbeGridZ = probeDimZ;
 
+        // Editor GI ISOLATE: force the OTHER two systems off so you see one system's contribution alone
+        // (applied after the volume stack so it overrides the scene's overrides; reverts to None = normal).
+        switch (EditorGiIsolate) {
+            case GiIsolate.Probes:      PostFX.GiReflectionsEnabled = false; PostFX.GiSdfForceEnabled = false; break;
+            case GiIsolate.Reflections: PostFX.GiProbesEnabled = false;      PostFX.GiSdfForceEnabled = false; break;
+            case GiIsolate.Lumen:       PostFX.GiProbesEnabled = false;      PostFX.GiReflectionsEnabled = false;
+                                        PostFX.GiSdfForceEnabled = true; break;
+        }
+
         // Auto exposure adapts NOW, before the first ExposureMultiplier read below: lighting
         // is pre-exposed, so this frame's EV feeds every light uniform. The target EV comes
         // from last frame's metering of this same render target (scene/game views adapt

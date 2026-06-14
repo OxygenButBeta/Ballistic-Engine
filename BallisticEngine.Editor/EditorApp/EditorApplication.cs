@@ -1205,6 +1205,18 @@ internal sealed class EditorApplication {
                         editorState.MarkViewportDirty();
                     }
                 }
+
+                // GI ISOLATE: view ONE GI system's contribution at a time (forces the other two off),
+                // so you can see exactly how probes / reflections / Lumen each affect the scene.
+                ImGui.Separator();
+                ImGui.TextDisabled("GI Isolate");
+                var isolateNames = new[] { "All systems", "Only Light Probes", "Only Reflections", "Only Lumen" };
+                for (var i = 0; i < isolateNames.Length; i++) {
+                    if (ImGui.MenuItem(isolateNames[i], (string)null, (int)HDRenderer.EditorGiIsolate == i)) {
+                        HDRenderer.EditorGiIsolate = (HDRenderer.GiIsolate)i;
+                        editorState.MarkViewportDirty();
+                    }
+                }
                 ImGui.EndPopup();
             }
         }

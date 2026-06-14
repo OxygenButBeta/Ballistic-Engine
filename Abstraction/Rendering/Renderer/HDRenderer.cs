@@ -42,6 +42,13 @@ public abstract class HDRenderer {
     // can read it without an editor reference; it's never set in the player.
     public static int EditorExtraDebugMode;
 
+    // GI per-system ISOLATE for editor A/B debugging: 0 = normal (all systems per their overrides),
+    // 1 = ONLY light probes, 2 = ONLY reflection probes, 3 = ONLY Lumen. The renderer forces the other
+    // two systems off when non-zero (applied AFTER the volume stack, like the env overrides) so you can
+    // see exactly what each GI system contributes. Editor-set; never touched in the player.
+    public enum GiIsolate { None, Probes, Reflections, Lumen }
+    public static GiIsolate EditorGiIsolate;
+
     // HDR -> display tunables (tonemap, bloom, SSAO, MSAA, grading). Shared by all targets.
     public PostProcessSettings PostFX { get; } = new();
 
