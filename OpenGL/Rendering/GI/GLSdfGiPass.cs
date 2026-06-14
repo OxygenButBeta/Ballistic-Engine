@@ -311,9 +311,17 @@ public sealed class GLSdfGiPass : IDisposable {
             ptHasHistory = GL.GetUniformLocation(probeTemporalProgram, "HasHistory");
         }
         if (UseGlobalSdf)
-            // 96^3 over a 12m base cascade = 0.125m near-field cells (Lumen-class fine; 64^3/16m was
-            // 0.25m and blended adjacent walls into grey on small scenes). Outer cascades (x2 each)
-            // still reach ~96m for the far field. Background-baked so the higher res isn't a stall.
+            // GI REWORK Phase 3 (2026-06-14): resolution KEPT at 96 over a 12m base cascade.
+            // HARD-WON: this is a TEXTURE/STORAGE resolution, NOT the bake detail. The distance field bakes
+            // coarse (32^3 warm-up, upsampled into the 96^3 texture) and its full-res refine never lands
+            // (the dense whole-scene grid query is ~15s at 96^3) — BUT the parallel RADIANCE clipmap is also
+            // 96^3, so the lit near-surface shell is stored FINELY (0.125m voxels) even over a coarse
+            // distance field. That fine radiance storage is what makes rooms fill: the gather reads the
+            // shell at a 0.19m offset and hits occupied voxels. Measured: dropping to a real 48^3 OR an
+            // "honest" 32^3 texture COLLAPSED the fill ~8-200x (thinner/coarser shell -> gather rays miss
+            // between). So the speckle (the coarse DISTANCE field showing through) must be fixed by the
+            // directional/probe gather + denoise (Phases 2/4), NOT by changing this resolution. The real
+            // Lumen-class fine distance field (per-mesh MDF composition) is a later phase.
             globalSdf = new GLGlobalSdf(resolution: 96, baseExtent: 12f);
         Console.WriteLine($"[SdfGI] resources built (Lumen enabled{(UseGlobalSdf ? ", GLOBAL distance field" : "")}).");
         Available = true;

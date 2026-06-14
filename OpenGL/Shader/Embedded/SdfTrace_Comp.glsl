@@ -191,6 +191,10 @@ const float SELF_SKIP   = 0.20;   // push the ray origin this far off the surfac
 const float MIN_ELEVATION = 0.30; // minimum sin-of-elevation off the surface for a gather ray: rays
                                   // skimming nearly tangent sphere-trace along the surface's thin SDF
                                   // shell and randomly self-hit (the ~50%-noisy grazing hit fraction).
+                                  // GI REWORK Phase 3 NOTE: tried lowering this to recover rim light, but
+                                  // at the coarse 32^3 fat-shell field it COLLAPSED BistroInterior's fill
+                                  // (near-horizon rays self-hit the fat shell). It is load-bearing here;
+                                  // the proper fix is the directional/probe gather (Phases 2/4), not this clamp.
 const float PI = 3.14159265359;
 
 // MUST be a true component SELECT, never arithmetic on the bad value: mix(v, 0, flag) expands
