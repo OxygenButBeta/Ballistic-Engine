@@ -57,6 +57,22 @@ void main() {
     float widen = mix(2.0, 1.0, clamp((histLen - 1.0) / 8.0, 0.0, 1.0));
     float step = max(StepSize, 1.0) * widen;
 
+    // HOLE-FILL (GI rework): the coarse-field gather leaves BLACK pixels where every ray missed
+    // through a gap. The luma edge-stop below protects them (a near-black centre rejects its bright
+    // neighbours -> the hole stays black -> the blocky ceiling speckle). Detect a likely-hole centre
+    // (much darker than its 3x3 neighbourhood mean) and, for it, DROP the luma stop so bright
+    // neighbours fill it. A genuine dark surface (uniformly dark neighbourhood) is NOT a hole, so it
+    // keeps its luma stop and stays dark — this only fills isolated misses, never flattens real shadow.
+    float nbMax = 0.0;
+    for (int x = -1; x <= 1; x++)
+        for (int y = -1; y <= 1; y++) {
+            vec3 nc = min(Sanitize(texture(giTexture, TexCoords + vec2(x, y) * step * texel).rgb), vec3(4096.0));
+            nbMax = max(nbMax, dot(nc, vec3(0.2126, 0.7152, 0.0722)));
+        }
+    // 1 when the centre is a hole (<= 30% of the brightest neighbour, and the neighbourhood is lit),
+    // 0 for a uniformly-lit or uniformly-dark region. Lerps the luma stop off for holes.
+    float holeFill = (nbMax > 0.02) ? (1.0 - smoothstep(0.1, 0.3, centreLuma / max(nbMax, 1e-4))) : 0.0;
+
     vec3 sum = vec3(0.0);
     float wSum = 0.0;
 
@@ -92,6 +108,9 @@ void main() {
             // distant table edge blurred GI straight across the depth discontinuity (halos).
             float wDepth = exp(-abs(centreZ - z) / (DepthSigma * clamp(abs(centreZ), 1.0, 8.0) + 1e-3));
             float wLuma = exp(-abs(centreLuma - l) / (lumaSigma + 1e-3));
+            // For a hole centre, relax the luma stop toward 1 so bright neighbours fill it (only taps
+            // BRIGHTER than the centre are pulled in — a hole is dark, so this never darkens it).
+            wLuma = mix(wLuma, max(wLuma, (l >= centreLuma) ? 1.0 : wLuma), holeFill);
 
             float w = wKernel * wNormal * wDepth * wLuma;
             sum += c * w;
