@@ -548,16 +548,27 @@ vec3 TraceRay(vec3 origin, vec3 dir, out bool hit) {
     }
     if (!hit)
         return vec3(0.0); // sky miss: zero (the IBL ambient already lit the composited scene)
-    // Radiance at the hit: GDF -> global radiance clipmap (or HitDirect); per-mesh -> radiance atlas.
-    vec4 cached;
-    if (UseGlobalSdf == 1)
-        cached = UseGlobalRadiance == 1 ? GlobalRadianceAt(hitPoint) : vec4(0.0);
-    else
-        cached = SampleRadiance(hitSlot, hitLocal);
-    if (cached.a > 0.01)
-        return Sanitize(cached.rgb);
+    // Radiance at the hit: GDF -> global voxel radiance clipmap (the surface cache); per-mesh -> atlas.
     vec3 hitN = SceneGradient(hitPoint);
     if (dot(hitN, hitN) < 1e-5) hitN = -dir;
+    vec4 cached;
+    if (UseGlobalSdf == 1 && UseGlobalRadiance == 1) {
+        // The near-surface lit voxels sit just INSIDE the surface (|d| < 1.5 cell, mostly d<0). A read
+        // exactly AT the hit (d~0) trilinearly blends with the empty exterior voxels, so the occupancy
+        // alpha collapses below the gate and the cache read FAILS — the gather then fell back to the
+        // flat HitDirect estimate EVERYWHERE, so the whole surface-cache (and thus the multi-bounce it
+        // carries) was unused (the "multi-bounce doesn't exist" symptom). Sample one cascade-cell INTO
+        // the surface (opposite the gradient) where the lit voxels are solidly occupied.
+        float c0 = GlobalSdfCell[0];
+        cached = GlobalRadianceAt(hitPoint - hitN * (1.5 * c0));
+        if (cached.a <= 0.01) cached = GlobalRadianceAt(hitPoint); // fallback to the exact point
+    } else if (UseGlobalSdf == 1) {
+        cached = vec4(0.0);
+    } else {
+        cached = SampleRadiance(hitSlot, hitLocal);
+    }
+    if (cached.a > 0.001)
+        return Sanitize(cached.rgb);
     return Sanitize(HitDirect(hitPoint, hitN));
 }
 

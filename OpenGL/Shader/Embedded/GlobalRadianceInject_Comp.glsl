@@ -121,11 +121,17 @@ vec3 GdfRadianceAt(vec3 worldP) {
     return vec3(0.0);
 }
 
-// One bounce: a few cosine rays through the GDF; hit => last frame's radiance there, miss => sky.
+// One bounce: a few cosine rays sphere-traced through the GDF; hit => last frame's radiance there,
+// miss => sky. Sphere-tracing the SDF (advance by the distance value) reaches far walls in few steps;
+// the previous version was STEP-STARVED (24 steps that, near a surface, advanced only 0.5*cell≈6cm,
+// so a ray died after ~1-2m and almost never reached a wall -> the bounce was ~0 and multi-bounce
+// contributed nothing). More steps + a hit epsilon tied to the cell (not 0.5*cell) + stepping by the
+// real distance fixes the reach.
 vec3 GatherBounce(vec3 worldP, vec3 n, float cell) {
-    const int RAYS = 4;
-    const int STEPS = 24;
-    const float MAXD = 24.0;
+    const int RAYS = 6;
+    const int STEPS = 64;
+    const float MAXD = 40.0;
+    float hitEps = 0.5 * cell;        // surface proximity that counts as a hit
     vec3 up = abs(n.z) < 0.999 ? vec3(0,0,1) : vec3(1,0,0);
     vec3 T = normalize(cross(up, n));
     vec3 B = cross(n, T);
@@ -136,12 +142,15 @@ vec3 GatherBounce(vec3 worldP, vec3 n, float cell) {
         float cosT = sqrt(1.0 - a * 0.85 - 0.1);
         float sinT = sqrt(max(0.0, 1.0 - cosT*cosT));
         vec3 dir = normalize(T*cos(phi)*sinT + B*sin(phi)*sinT + n*cosT);
-        vec3 p = worldP + n * (1.0 * cell);
-        float traveled = 0.0; bool hit = false; vec3 hp = vec3(0.0);
+        vec3 p = worldP + n * (2.0 * cell);   // start clear of the origin voxel's own shell
+        float traveled = 2.0 * cell; bool hit = false; vec3 hp = vec3(0.0);
         for (int s = 0; s < STEPS; ++s) {
             bool inside; float dist = GdfDist(p, inside);
-            if (inside && dist < 0.5*cell && traveled > 1.5*cell) { hit = true; hp = p; break; }
-            float adv = inside ? max(dist, 0.5*cell) : 0.75;
+            if (!inside) {                     // left the clipmap -> sky for the rest of this ray
+                break;
+            }
+            if (dist < hitEps && traveled > 3.0 * cell) { hit = true; hp = p; break; }
+            float adv = max(dist, 0.5 * cell); // sphere-trace step, floored so we never stall
             p += dir * adv; traveled += adv;
             if (traveled >= MAXD) break;
         }
