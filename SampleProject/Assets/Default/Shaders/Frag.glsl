@@ -1,5 +1,6 @@
-#version 410 core
-// 410: samplerCubeArray (local reflection probes, ReflectionVolume) is core in GL 4.0+.
+#version 460 core
+// 460: SSBOs in the fragment stage (clustered Forward+ light lists) need GLSL 430+; the engine runs a
+// GL 4.6 core context. samplerCubeArray (local reflection probes) is core since 4.0.
 
 // --- Inputs from vertex shader ---
 in vec2 texCoord;
@@ -113,6 +114,26 @@ uniform bool HasEmissive;
 uniform bool AlphaBlend;
 uniform float Opacity;
 uniform bool AlphaCutout;      // masked materials (foliage): discard below 0.5 alpha
+
+// --- CLUSTERED FORWARD (Forward+) light lists ---
+// When UseClustered is true the fragment loops only the lights in ITS cluster (froxel) instead of
+// the capped MAX_POINT/SPOT arrays in PassData. Lights live in an SSBO (no 8/4 cap); a compute pass
+// (ClusterCull_Comp) filled the per-cluster (offset,count) grid + the flat index list. The legacy
+// PassData arrays remain for the fallback path (UseClustered=false / no SSBO support).
+struct GpuLight {
+    vec4 posRange;    // xyz world pos, w range
+    vec4 lcolor;      // xyz pre-exposed radiance, w type (0 = point, 1 = spot)
+    vec4 dirCosOuter; // xyz spot dir (world), w cosOuter
+    vec4 extra;       // x cosInner, y shadowSlot (-1 none), zw pad
+};
+layout(std430, binding = 12) readonly buffer ClusterLightBuf  { GpuLight clusterLights[]; };
+layout(std430, binding = 14) readonly buffer ClusterGridBuf   { ivec2 clusterGrid[]; };   // (offset,count)
+layout(std430, binding = 15) readonly buffer ClusterIndexBuf  { int clusterLightIndex[]; };
+uniform bool  UseClustered;
+uniform int   ClusterDimX;
+uniform int   ClusterDimY;
+uniform int   ClusterDimZ;
+uniform vec2  ClusterNearFar;   // x near, y far
 
 const float PI = 3.14159265359;
 const float EPS = 1e-6;
@@ -546,41 +567,84 @@ void main()
 
     if (renderMode == 6) { FragColor = vec4(vec3(shadow), 1.0); return; }
 
-    // Point lights.
-    for (int i = 0; i < PointLightCount; i++) {
-        vec3 toLight = PointLightPosition[i] - fragPos;
-        float dist = length(toLight);
-        if (dist > PointLightRange[i])
-            continue;
-        vec3 Lp = toLight / dist;
-        float vis = PointShadowSlot[i] >= 0
-            ? PointShadow(PointShadowSlot[i], PointLightPosition[i], clamp(dot(N, Lp), 0.0, 1.0))
-            : 1.0;
-        if (vis <= 0.001)
-            continue;
-        vec3 radiance = PointLightColor[i] * DistanceAttenuation(dist, PointLightRange[i]) * vis;
-        ShadeLight(N, V, Lp, radiance, albedo, metallic, roughness, F0, diffuseLight, specularLight);
-    }
+    if (UseClustered) {
+        // CLUSTERED FORWARD: find this fragment's cluster (screen tile + LOG depth slice, matching
+        // ClusterBuild_Comp) and shade only the lights the cull pass assigned to it. No 8/4 cap.
+        float viewZ = -(view * vec4(fragPos, 1.0)).z;        // positive view-space distance
+        float near = ClusterNearFar.x, far = ClusterNearFar.y;
+        int zSlice = int(log(max(viewZ, near) / near) / log(far / near) * float(ClusterDimZ));
+        zSlice = clamp(zSlice, 0, ClusterDimZ - 1);
+        ivec2 tile = ivec2(gl_FragCoord.xy / (ScreenSize / vec2(ClusterDimX, ClusterDimY)));
+        tile = clamp(tile, ivec2(0), ivec2(ClusterDimX - 1, ClusterDimY - 1));
+        int cluster = tile.x + ClusterDimX * (tile.y + ClusterDimY * zSlice);
 
-    // Spot lights.
-    for (int i = 0; i < SpotLightCount; i++) {
-        vec3 toLight = SpotLightPosition[i] - fragPos;
-        float dist = length(toLight);
-        if (dist > SpotLightRange[i])
-            continue;
-        vec3 Ls = toLight / dist;
-        float cosAngle = dot(-Ls, normalize(SpotLightDirection[i]));
-        float cone = clamp((cosAngle - SpotLightCosOuter[i]) /
-                           max(SpotLightCosInner[i] - SpotLightCosOuter[i], 1e-4), 0.0, 1.0);
-        if (cone <= 0.0)
-            continue;
-        float vis = SpotShadowSlot[i] >= 0
-            ? SpotShadow(SpotShadowSlot[i], clamp(dot(N, Ls), 0.0, 1.0))
-            : 1.0;
-        if (vis <= 0.001)
-            continue;
-        vec3 radiance = SpotLightColor[i] * DistanceAttenuation(dist, SpotLightRange[i]) * cone * cone * vis;
-        ShadeLight(N, V, Ls, radiance, albedo, metallic, roughness, F0, diffuseLight, specularLight);
+        ivec2 range = clusterGrid[cluster];                   // (offset, count)
+        for (int k = 0; k < range.y; k++) {
+            int li = clusterLightIndex[range.x + k];
+            GpuLight L = clusterLights[li];
+            vec3 toLight = L.posRange.xyz - fragPos;
+            float dist = length(toLight);
+            if (dist > L.posRange.w)
+                continue;
+            vec3 Ld = toLight / dist;
+            float atten = DistanceAttenuation(dist, L.posRange.w);
+            int shadowSlot = int(L.extra.y);
+
+            if (L.lcolor.w < 0.5) {
+                // POINT
+                float vis = shadowSlot >= 0
+                    ? PointShadow(shadowSlot, L.posRange.xyz, clamp(dot(N, Ld), 0.0, 1.0)) : 1.0;
+                if (vis <= 0.001) continue;
+                ShadeLight(N, V, Ld, L.lcolor.rgb * atten * vis, albedo, metallic, roughness, F0,
+                           diffuseLight, specularLight);
+            } else {
+                // SPOT
+                float cosAngle = dot(-Ld, normalize(L.dirCosOuter.xyz));
+                float cone = clamp((cosAngle - L.dirCosOuter.w) /
+                                   max(L.extra.x - L.dirCosOuter.w, 1e-4), 0.0, 1.0);
+                if (cone <= 0.0) continue;
+                float vis = shadowSlot >= 0
+                    ? SpotShadow(shadowSlot, clamp(dot(N, Ld), 0.0, 1.0)) : 1.0;
+                if (vis <= 0.001) continue;
+                ShadeLight(N, V, Ld, L.lcolor.rgb * atten * cone * cone * vis, albedo, metallic,
+                           roughness, F0, diffuseLight, specularLight);
+            }
+        }
+    } else {
+        // LEGACY capped per-fragment loops (fallback: BALLISTIC_CLUSTERED=0 / no SSBO support).
+        for (int i = 0; i < PointLightCount; i++) {
+            vec3 toLight = PointLightPosition[i] - fragPos;
+            float dist = length(toLight);
+            if (dist > PointLightRange[i])
+                continue;
+            vec3 Lp = toLight / dist;
+            float vis = PointShadowSlot[i] >= 0
+                ? PointShadow(PointShadowSlot[i], PointLightPosition[i], clamp(dot(N, Lp), 0.0, 1.0))
+                : 1.0;
+            if (vis <= 0.001)
+                continue;
+            vec3 radiance = PointLightColor[i] * DistanceAttenuation(dist, PointLightRange[i]) * vis;
+            ShadeLight(N, V, Lp, radiance, albedo, metallic, roughness, F0, diffuseLight, specularLight);
+        }
+        for (int i = 0; i < SpotLightCount; i++) {
+            vec3 toLight = SpotLightPosition[i] - fragPos;
+            float dist = length(toLight);
+            if (dist > SpotLightRange[i])
+                continue;
+            vec3 Ls = toLight / dist;
+            float cosAngle = dot(-Ls, normalize(SpotLightDirection[i]));
+            float cone = clamp((cosAngle - SpotLightCosOuter[i]) /
+                               max(SpotLightCosInner[i] - SpotLightCosOuter[i], 1e-4), 0.0, 1.0);
+            if (cone <= 0.0)
+                continue;
+            float vis = SpotShadowSlot[i] >= 0
+                ? SpotShadow(SpotShadowSlot[i], clamp(dot(N, Ls), 0.0, 1.0))
+                : 1.0;
+            if (vis <= 0.001)
+                continue;
+            vec3 radiance = SpotLightColor[i] * DistanceAttenuation(dist, SpotLightRange[i]) * cone * cone * vis;
+            ShadeLight(N, V, Ls, radiance, albedo, metallic, roughness, F0, diffuseLight, specularLight);
+        }
     }
 
     // Multi-scatter energy compensation for analytic lights (Filament): single-scatter

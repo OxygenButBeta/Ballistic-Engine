@@ -45,6 +45,11 @@ public class GLHDRenderer : HDRenderer {
     // so the frame stays byte-identical to the baseline. Runs as a post pass right BEFORE SSGI.
     OpenGL.GI.GLSdfGiPass sdfGi;
     bool sdfGiEnabled;
+    // Clustered Forward+ light culling (review #1): loops only the lights in each fragment's cluster
+    // instead of the capped 8-point/4-spot per-fragment arrays. Default-on (BALLISTIC_CLUSTERED=0
+    // falls back to the legacy capped path). Built each frame from ALL gathered scene lights.
+    OpenGL.Clustered.GLClusteredLights clustered;
+    readonly List<OpenGL.Clustered.GLClusteredLights.GpuLight> clusterLightScratch = new();
     GLVolumetricFogPass volumetric;
     GLTAAPass taa;
     GLDepthOfFieldPass depthOfField;
@@ -196,6 +201,7 @@ public class GLHDRenderer : HDRenderer {
         // builds nothing GPU-side when off), so off => Available stays false => never dispatched.
         sdfGiEnabled = Environment.GetEnvironmentVariable("BALLISTIC_SDFGI") == "1";
         sdfGi = new OpenGL.GI.GLSdfGiPass();
+        clustered = new OpenGL.Clustered.GLClusteredLights();
         volumetric = new GLVolumetricFogPass();
         taa = new GLTAAPass();
         depthOfField = new GLDepthOfFieldPass();
@@ -637,6 +643,20 @@ public class GLHDRenderer : HDRenderer {
         bool wireframe = debugEligible && DebugViewMode == DebugView.Wireframe;
         if (wireframe)
             GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Line);
+        // CLUSTERED FORWARD+: assign all gathered lights to view-frustum clusters on the GPU (compute),
+        // then bind the light SSBOs (12/14/15) so the opaque lit pass loops only each fragment's cluster
+        // lights (uncapped). Runs here — after shadows/prepass (which use other binding slots), right
+        // before opaque — so nothing clobbers the buffers. Near/far recovered from the projection.
+        if (clustered is { Available: true }) {
+            Matrix4 invProjCl = Matrix4.Invert(projection);
+            var nearV = new Vector4(0f, 0f, -1f, 1f) * invProjCl;   // NDC near -> view
+            var farV = new Vector4(0f, 0f, 1f, 1f) * invProjCl;     // NDC far  -> view
+            float near = MathF.Abs(nearV.Z / nearV.W);
+            float far = MathF.Abs(farV.Z / farV.W);
+            clusterNearFar = new Vector2(near, far);
+            clustered.Update(clusterLightScratch, target.LenX, target.LenY, near, far, ref view, ref projection);
+            clustered.Bind();
+        }
         using (timers.Time("Opaque"))
             RenderMeshes(visibleOpaque, transparentPass: false, ref view, ref renderProjection, cameraPos,
                 prepassDepth: true);
@@ -1384,25 +1404,24 @@ public class GLHDRenderer : HDRenderer {
     void GatherPunctualLights() {
         var stamp = new HashCode();
 
+        // Clustered Forward+ gathers ALL lights (uncapped) into this list; the legacy capped arrays
+        // below fill in parallel for the fallback path. Shadow slots are still a capped resource
+        // (limited shadow maps): the first MaxShadowed* lights get a slot, the rest are shadowless.
+        clusterLightScratch.Clear();
+
         pointLightCount = 0;
         shadowedPointCount = 0;
         foreach (PointLight point in RuntimeSet<PointLight>.ReadOnlyCollection) {
-            if (pointLightCount >= MaxPointLights)
-                break;
             if (!point.IsActive)
                 continue;
             Vector3 position = point.transform.WorldPosition; // parented lights shine from where they ARE
             var range = MathF.Max(point.Range, 1e-3f);
-            pointPositions[pointLightCount] = position;
-            // lumens -> candela -> radiance, pre-exposed (see the pre-exposure note in Render).
-            pointColors[pointLightCount] = point.PhysicalColor * PostFX.ExposureMultiplier;
-            pointRanges[pointLightCount] = range;
 
-            // Shadow slot: 6 cube-face matrices into the punctual array.
-            pointShadowSlots[pointLightCount] = -1;
+            // Shadow slot computed ONCE per light (shared by the cluster + legacy paths). The shadow
+            // map array is a capped resource; the first MaxShadowedPoints casters get a cube + slot.
+            int slot = -1;
             if (point.CastShadows && shadowedPointCount < MaxShadowedPoints) {
-                var slot = shadowedPointCount++;
-                pointShadowSlots[pointLightCount] = slot;
+                slot = shadowedPointCount++;
                 pointShadowBiases[slot] = MathF.Max(point.ShadowBias, 0f);
                 Matrix4 faceProj = Matrix4.CreatePerspectiveFieldOfView(
                     MathHelper.PiOver2, 1f, 0.05f, MathF.Max(range, 0.1f));
@@ -1414,47 +1433,74 @@ public class GLHDRenderer : HDRenderer {
                 stamp.Add(range);
             }
 
-            pointLightCount++;
+            // Cluster list: every active point light (uncapped).
+            if (clusterLightScratch.Count < OpenGL.Clustered.GLClusteredLights.MaxLights) {
+                clusterLightScratch.Add(new OpenGL.Clustered.GLClusteredLights.GpuLight {
+                    PosRange = new Vector4(position, range),
+                    Color = new Vector4(point.PhysicalColor * PostFX.ExposureMultiplier, 0f), // type 0 = point
+                    DirCosOuter = Vector4.Zero,
+                    Extra = new Vector4(0f, slot, 0f, 0f),
+                });
+            }
+
+            // Legacy capped arrays for the fallback path.
+            if (pointLightCount < MaxPointLights) {
+                pointPositions[pointLightCount] = position;
+                pointColors[pointLightCount] = point.PhysicalColor * PostFX.ExposureMultiplier;
+                pointRanges[pointLightCount] = range;
+                pointShadowSlots[pointLightCount] = slot;
+                pointLightCount++;
+            }
         }
 
         spotLightCount = 0;
         shadowedSpotCount = 0;
         foreach (SpotLight spot in RuntimeSet<SpotLight>.ReadOnlyCollection) {
-            if (spotLightCount >= MaxSpotLights)
-                break;
             if (!spot.IsActive)
                 continue;
             Vector3 position = spot.transform.WorldPosition; // world, not the local parent offset
             Vector3 direction = spot.transform.WorldRotation * Vector3.UnitZ;
             var range = MathF.Max(spot.Range, 1e-3f);
-            spotPositions[spotLightCount] = position;
-            spotDirections[spotLightCount] = direction;
-            spotColors[spotLightCount] = spot.PhysicalColor * PostFX.ExposureMultiplier; // pre-exposed
-            spotRanges[spotLightCount] = range;
             var inner = MathHelper.DegreesToRadians(Math.Clamp(spot.InnerAngle, 0f, 89f));
             var outer = MathHelper.DegreesToRadians(Math.Clamp(MathF.Max(spot.OuterAngle, spot.InnerAngle), 0f, 89.9f));
-            spotCosInner[spotLightCount] = MathF.Cos(inner);
-            spotCosOuter[spotLightCount] = MathF.Cos(outer);
+            float cosInner = MathF.Cos(inner), cosOuter = MathF.Cos(outer);
 
-            spotShadowSlots[spotLightCount] = -1;
+            // Shadow slot (capped shared resource): the next caster gets a slot + matrix.
+            int slot = -1;
             if (spot.CastShadows && shadowedSpotCount < MaxShadowedSpots) {
-                var slot = shadowedSpotCount++;
-                spotShadowSlots[spotLightCount] = slot;
+                slot = shadowedSpotCount++;
                 spotShadowBiases[slot] = MathF.Max(spot.ShadowBias, 0f);
                 Vector3 up = MathF.Abs(Vector3.Dot(direction, Vector3.UnitY)) > 0.99f
-                    ? Vector3.UnitZ
-                    : Vector3.UnitY;
-                Matrix4 view = Matrix4.LookAt(position, position + direction, up);
-                Matrix4 proj = Matrix4.CreatePerspectiveFieldOfView(
+                    ? Vector3.UnitZ : Vector3.UnitY;
+                Matrix4 sview = Matrix4.LookAt(position, position + direction, up);
+                Matrix4 sproj = Matrix4.CreatePerspectiveFieldOfView(
                     MathHelper.DegreesToRadians(Math.Clamp(MathF.Max(spot.OuterAngle, spot.InnerAngle),
                         1f, 89.9f)) * 2f, 1f, 0.05f, range);
-                spotShadowMatrices[slot] = view * proj;
-                stamp.Add(position);
-                stamp.Add(direction);
-                stamp.Add(range);
+                spotShadowMatrices[slot] = sview * sproj;
+                stamp.Add(position); stamp.Add(direction); stamp.Add(range);
             }
 
-            spotLightCount++;
+            // Cluster list: every active spot (uncapped).
+            if (clusterLightScratch.Count < OpenGL.Clustered.GLClusteredLights.MaxLights) {
+                clusterLightScratch.Add(new OpenGL.Clustered.GLClusteredLights.GpuLight {
+                    PosRange = new Vector4(position, range),
+                    Color = new Vector4(spot.PhysicalColor * PostFX.ExposureMultiplier, 1f), // type 1 = spot
+                    DirCosOuter = new Vector4(direction, cosOuter),
+                    Extra = new Vector4(cosInner, slot, 0f, 0f),
+                });
+            }
+
+            // Legacy capped arrays for the fallback path.
+            if (spotLightCount < MaxSpotLights) {
+                spotPositions[spotLightCount] = position;
+                spotDirections[spotLightCount] = direction;
+                spotColors[spotLightCount] = spot.PhysicalColor * PostFX.ExposureMultiplier;
+                spotRanges[spotLightCount] = range;
+                spotCosInner[spotLightCount] = cosInner;
+                spotCosOuter[spotLightCount] = cosOuter;
+                spotShadowSlots[spotLightCount] = slot;
+                spotLightCount++;
+            }
         }
 
         // Geometry fingerprint: punctual tiles re-render when meshes move/appear/rotate
@@ -3603,7 +3649,23 @@ public class GLHDRenderer : HDRenderer {
         else {
             SetPassUniformsLegacy(shader, ref view, ref projection, cameraPos);
         }
+        SetClusterUniforms(shader);
     }
+
+    // Clustered Forward+ per-program uniforms (plain, both UBO + legacy paths). Tells the lit shader
+    // whether to use the cluster light lists and the grid dimensions to locate a fragment's cluster.
+    // The SSBOs themselves are bound once per frame (BindClusterBuffers) before the opaque pass.
+    void SetClusterUniforms(Shader shader) {
+        bool on = clustered is { Available: true };
+        shader.SetBool("UseClustered", on);
+        if (on) {
+            shader.SetInt("ClusterDimX", OpenGL.Clustered.GLClusteredLights.ClusterX);
+            shader.SetInt("ClusterDimY", OpenGL.Clustered.GLClusteredLights.ClusterY);
+            shader.SetInt("ClusterDimZ", OpenGL.Clustered.GLClusteredLights.ClusterZ);
+            shader.SetFloat2("ClusterNearFar", clusterNearFar);
+        }
+    }
+    Vector2 clusterNearFar = new(0.1f, 1000f);
 
     // Texture-unit assignments are program STATE: once per program, not per pass.
     void SetSamplerUniforms(Shader shader) {
