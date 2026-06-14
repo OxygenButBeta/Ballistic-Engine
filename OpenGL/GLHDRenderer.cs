@@ -2171,7 +2171,12 @@ public class GLHDRenderer : HDRenderer {
     // finished grid is cached to Library/ProbeVolumes so later loads skip the bake entirely.
 
     const int BakeFaceRes = 32;
-    const double BakeBudgetMs = 14.0;
+    // Per-frame bake slice. 14ms DOMINATED the frame during warm-up (profiled: SunTemple ProbeBake
+    // 14.6ms of a 17.4ms frame -> a sub-60fps stutter on scene load), and if the reflection bake
+    // also runs the same frame the two could blow past 26ms. 6ms keeps the whole frame well under
+    // the 16.6ms 60fps budget while baking (render passes are ~3ms), so warm-up stays SMOOTH — it
+    // just fades in over a few more frames. Steady state is unaffected (bake finishes -> cached -> 0ms).
+    const double BakeBudgetMs = 6.0;
 
     sealed class ProbeBakeJob {
         public IrradianceVolume Volume;
@@ -2753,7 +2758,10 @@ public class GLHDRenderer : HDRenderer {
     const int ReflectionCaptureRes = GLEnvironmentMaps.ReflectionFaceRes;
     const int ReflectionMipCount = GLEnvironmentMaps.ReflectionMipCount;
     const int MaxReflectionProbes = 96;     // ~1 MB each at 128px RGBA16F x 6 mips -> ~96 MB cap
-    const double ReflectionBakeBudgetMs = 12.0;
+    // Lowered 12 -> 5ms (same reason as BakeBudgetMs): keep the warm-up frame under the 60fps budget.
+    // The probe + reflection bakes don't usually run the same frame, but if they do, 6+5 = 11ms still
+    // leaves headroom. Reflection cells are heavier per-cell so a smaller slice means ~1-2 cells/frame.
+    const double ReflectionBakeBudgetMs = 5.0;
 
     sealed class ReflectionBakeJob {
         public ReflectionVolume Volume;
