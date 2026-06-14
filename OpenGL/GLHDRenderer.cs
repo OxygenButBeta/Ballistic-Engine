@@ -862,7 +862,9 @@ public class GLHDRenderer : HDRenderer {
                     activeCascadeCount, sunDirection, sunColor,
                     target.LenX, target.LenY, ref view, ref renderProjection,
                     ref projection, skyExposureBase * preExposure, sdfGiBlend, target.AlbedoTextureId,
-                    pointLightCount, pointPositions, pointColors, pointRanges);
+                    pointLightCount, pointPositions, pointColors, pointRanges,
+                    spotLightCount, spotPositions, spotDirections, spotColors, spotRanges,
+                    spotCosInner, spotCosOuter);
             }
 
         // SSGI: AO-occluded indirect bounce, added before SSR so reflections see the GI-lifted scene.

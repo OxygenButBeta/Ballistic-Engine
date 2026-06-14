@@ -99,6 +99,13 @@ public sealed class GLGlobalSdf : IDisposable {
     readonly int[] liPointPos = new int[8];
     readonly int[] liPointColor = new int[8];
     readonly int[] liPointRange = new int[8];
+    int liSpotCount;
+    readonly int[] liSpotPos = new int[4];
+    readonly int[] liSpotDir = new int[4];
+    readonly int[] liSpotColor = new int[4];
+    readonly int[] liSpotRange = new int[4];
+    readonly int[] liSpotCosInner = new int[4];
+    readonly int[] liSpotCosOuter = new int[4];
     readonly int[] liCascadeMatrices = new int[4];
     readonly int[] liGdfMin = new int[CascadeCount];
     readonly int[] liGdfCell = new int[CascadeCount];
@@ -181,6 +188,15 @@ public sealed class GLGlobalSdf : IDisposable {
             liPointPos[i] = GL.GetUniformLocation(injectProgram, $"PointPos[{i}]");
             liPointColor[i] = GL.GetUniformLocation(injectProgram, $"PointColor[{i}]");
             liPointRange[i] = GL.GetUniformLocation(injectProgram, $"PointRange[{i}]");
+        }
+        liSpotCount = GL.GetUniformLocation(injectProgram, "SpotCount");
+        for (int i = 0; i < 4; i++) {
+            liSpotPos[i] = GL.GetUniformLocation(injectProgram, $"SpotPos[{i}]");
+            liSpotDir[i] = GL.GetUniformLocation(injectProgram, $"SpotDir[{i}]");
+            liSpotColor[i] = GL.GetUniformLocation(injectProgram, $"SpotColor[{i}]");
+            liSpotRange[i] = GL.GetUniformLocation(injectProgram, $"SpotRange[{i}]");
+            liSpotCosInner[i] = GL.GetUniformLocation(injectProgram, $"SpotCosInner[{i}]");
+            liSpotCosOuter[i] = GL.GetUniformLocation(injectProgram, $"SpotCosOuter[{i}]");
         }
         for (int i = 0; i < 4; i++)
             liCascadeMatrices[i] = GL.GetUniformLocation(injectProgram, $"CascadeMatrices[{i}]");
@@ -483,7 +499,9 @@ public sealed class GLGlobalSdf : IDisposable {
     public void InjectRadiance(int irradianceCubemap, int shadowMapArray, Matrix4[] sunCascades,
         Vector4 sunBias, int sunCascadeCount, Vector3 sunDir, Vector3 sunColor, Vector3 albedo,
         float skyExposure, float feedback,
-        int pointCount = 0, Vector3[] pointPos = null, Vector3[] pointColor = null, float[] pointRange = null) {
+        int pointCount = 0, Vector3[] pointPos = null, Vector3[] pointColor = null, float[] pointRange = null,
+        int spotCount = 0, Vector3[] spotPos = null, Vector3[] spotDir = null, Vector3[] spotColor = null,
+        float[] spotRange = null, float[] spotCosInner = null, float[] spotCosOuter = null) {
         if (!Available || injectProgram == 0)
             return;
         int c = radianceInjectCursor;
@@ -536,6 +554,17 @@ public sealed class GLGlobalSdf : IDisposable {
             GL.Uniform3(liPointPos[i], pointPos[i].X, pointPos[i].Y, pointPos[i].Z);
             GL.Uniform3(liPointColor[i], pointColor[i].X, pointColor[i].Y, pointColor[i].Z);
             GL.Uniform1(liPointRange[i], pointRange[i]);
+        }
+        // Spot lights into the surface cache.
+        int spc = spotPos == null ? 0 : Math.Min(spotCount, Math.Min(4, spotPos.Length));
+        GL.Uniform1(liSpotCount, spc);
+        for (int i = 0; i < spc; i++) {
+            GL.Uniform3(liSpotPos[i], spotPos[i].X, spotPos[i].Y, spotPos[i].Z);
+            GL.Uniform3(liSpotDir[i], spotDir[i].X, spotDir[i].Y, spotDir[i].Z);
+            GL.Uniform3(liSpotColor[i], spotColor[i].X, spotColor[i].Y, spotColor[i].Z);
+            GL.Uniform1(liSpotRange[i], spotRange[i]);
+            GL.Uniform1(liSpotCosInner[i], spotCosInner[i]);
+            GL.Uniform1(liSpotCosOuter[i], spotCosOuter[i]);
         }
 
         int g = (Resolution + 3) / 4;

@@ -524,7 +524,9 @@ public sealed class GLSdfGiPass : IDisposable {
         Vector3 sunDirection, Vector3 sunColor,
         int width, int height, ref Matrix4 view, ref Matrix4 projection,
         ref Matrix4 projectionNoJitter, float skyExposure, float intensityScale = 1f, int albedoTex = 0,
-        int pointCount = 0, Vector3[] pointPos = null, Vector3[] pointColor = null, float[] pointRange = null) {
+        int pointCount = 0, Vector3[] pointPos = null, Vector3[] pointColor = null, float[] pointRange = null,
+        int spotCount = 0, Vector3[] spotPos = null, Vector3[] spotDir = null, Vector3[] spotColor = null,
+        float[] spotRange = null, float[] spotCosInner = null, float[] spotCosOuter = null) {
         if (!Available || program == 0)
             return colorTexture;
         bool gdf = UseGlobalSdf && globalSdf is { Available: true };
@@ -589,7 +591,8 @@ public sealed class GLSdfGiPass : IDisposable {
             // (no per-voxel material in v1). Feedback 0.9 = sticky EMA for stability + multi-bounce.
             globalSdf.InjectRadiance(irradianceCubemap, shadowMapArray, cascadeMatrices, cascadeBias,
                 cascadeCount, sunDirection, sunColor, new Vector3(HitAlbedo), skyExposure, 0.9f,
-                pointCount, pointPos, pointColor, pointRange);
+                pointCount, pointPos, pointColor, pointRange,
+                spotCount, spotPos, spotDir, spotColor, spotRange, spotCosInner, spotCosOuter);
             // Diagnostic gate (BALLISTIC_LUMEN_NORADIANCE=1): force the march to use the neutral-grey
             // HitDirect estimate instead of the voxel radiance cache. Isolates whether a bad GI look is
             // in the cache (inject) or the trace/screen-trace. Default on (the cache is the real path).

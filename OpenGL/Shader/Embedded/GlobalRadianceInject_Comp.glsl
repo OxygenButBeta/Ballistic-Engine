@@ -56,6 +56,17 @@ uniform vec3  PointPos[MAX_GI_POINTS];     // world-space
 uniform vec3  PointColor[MAX_GI_POINTS];   // pre-exposed radiant intensity
 uniform float PointRange[MAX_GI_POINTS];
 
+// SPOT lights -> the surface cache (same rationale as point lights). dir = world spot axis (from the
+// light), cosInner/cosOuter = the cone angular falloff, matching the forward lit pass.
+#define MAX_GI_SPOTS 4
+uniform int   SpotCount;
+uniform vec3  SpotPos[MAX_GI_SPOTS];
+uniform vec3  SpotDir[MAX_GI_SPOTS];       // world-space, points along the cone axis
+uniform vec3  SpotColor[MAX_GI_SPOTS];
+uniform float SpotRange[MAX_GI_SPOTS];
+uniform float SpotCosInner[MAX_GI_SPOTS];
+uniform float SpotCosOuter[MAX_GI_SPOTS];
+
 const float PI = 3.14159265359;
 
 vec3 Sanitize(vec3 v) {
@@ -100,6 +111,32 @@ float SunVisibilityGdf(vec3 worldPos) {
         float adv = max(d, 0.5 * cell0);
         p += dir * adv; traveled += adv;
         if (traveled >= SUN_MAXD) return 1.0;
+    }
+    return 1.0;
+}
+
+// GDF visibility from a voxel TO a punctual light position: sphere-trace the global field along the
+// segment; if it hits an occluder before reaching the light, the voxel is shadowed from that light.
+// Without this, punctual GI bounce ignored geometry — a lamp lit voxels on the far side of a wall
+// (light leak around occluders), the punctual analogue of the thin-wall leak. 1 = lit, 0 = shadowed.
+float VisibilityToPoint(vec3 worldPos, vec3 lightPos) {
+    float cell0 = GdfCell[0];
+    vec3 toL = lightPos - worldPos;
+    float distToLight = length(toL);
+    if (distToLight < 2.0 * cell0) return 1.0;        // essentially at the light
+    vec3 dir = toL / distToLight;
+    vec3 p = worldPos + dir * (2.0 * cell0);          // step off the origin voxel's own shell
+    float traveled = 2.0 * cell0;
+    const int PT_STEPS = 32;
+    float reach = distToLight - 2.0 * cell0;           // stop short of the light itself
+    for (int s = 0; s < PT_STEPS; ++s) {
+        bool inside;
+        float d = GdfDist(p, inside);
+        if (!inside) return 1.0;                       // left the clipmap before any hit -> lit
+        if (d < 0.5 * cell0) return 0.0;               // hit an occluder between voxel and light
+        float adv = max(d, 0.5 * cell0);
+        p += dir * adv; traveled += adv;
+        if (traveled >= reach) return 1.0;             // reached the light unobstructed
     }
     return 1.0;
 }
@@ -203,8 +240,8 @@ void main() {
 
     // PUNCTUAL lights -> the surface cache. Without this a point-lit interior (no sun) gets ZERO Lumen
     // bounce (BistroInterior's lamps were absent from the GI). Inverse-square + smooth range cutout +
-    // NdotL, matching the forward lit pass. (Point-light SDF shadowing is a later refinement; for a
-    // diffuse bounce cache the unshadowed contribution already fills the room far better than nothing.)
+    // NdotL, matching the forward lit pass, NOW with GDF SHADOWING (VisibilityToPoint) so the bounce
+    // respects occluders — an unshadowed lamp lit voxels through walls (light leak around geometry).
     for (int i = 0; i < PointCount && i < MAX_GI_POINTS; ++i) {
         vec3 toL = PointPos[i] - litPos;
         float dist2 = dot(toL, toL);
@@ -215,7 +252,27 @@ void main() {
         float invSq = 1.0 / max(dist2, 0.01);                 // inverse-square
         float rr = clamp(1.0 - dist / max(PointRange[i], 1e-3), 0.0, 1.0);
         float window = rr * rr;                                // smooth range cutout
-        direct += PointColor[i] * (pndl * invSq * window);
+        float pvis = VisibilityToPoint(litPos, PointPos[i]);  // GDF shadow trace
+        direct += PointColor[i] * (pndl * invSq * window * pvis);
+    }
+
+    // SPOT lights -> the surface cache (point + a cone angular falloff), also GDF-shadowed.
+    for (int i = 0; i < SpotCount && i < MAX_GI_SPOTS; ++i) {
+        vec3 toL = SpotPos[i] - litPos;
+        float dist2 = dot(toL, toL);
+        float dist = sqrt(max(dist2, 1e-6));
+        vec3 L = toL / dist;
+        float sndl = max(dot(n, L), 0.0);
+        if (sndl <= 0.0) continue;
+        float cosA = dot(normalize(SpotDir[i]), -L);          // angle from the cone axis to this voxel
+        float cone = clamp((cosA - SpotCosOuter[i]) /
+                           max(SpotCosInner[i] - SpotCosOuter[i], 1e-3), 0.0, 1.0);
+        if (cone <= 0.0) continue;
+        float invSq = 1.0 / max(dist2, 0.01);
+        float rr = clamp(1.0 - dist / max(SpotRange[i], 1e-3), 0.0, 1.0);
+        float window = rr * rr;
+        float svis = VisibilityToPoint(litPos, SpotPos[i]);
+        direct += SpotColor[i] * (sndl * invSq * window * cone * cone * svis);
     }
 
     vec3 bounce = GatherBounce(worldP, n, CascadeCell);
