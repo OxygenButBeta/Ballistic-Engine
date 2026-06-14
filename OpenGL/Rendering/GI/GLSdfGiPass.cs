@@ -73,14 +73,18 @@ public sealed class GLSdfGiPass : IDisposable {
     static readonly string[] CascadeMatrixNames =
         { "CascadeMatrices[0]", "CascadeMatrices[1]", "CascadeMatrices[2]", "CascadeMatrices[3]" };
 
-    // Master strength of the additive off-screen bounce. Tuned DOWN from 1.0 — at full strength the
-    // single-bounce fill washed already-lit surfaces flat; ~0.4 fills the shadowed recesses (the
-    // point) while keeping contrast. Overridable via BALLISTIC_SDFGI_INTENSITY for A/B tuning.
+    // Master strength of the additive off-screen bounce. RECALIBRATED to 0.18 (from 0.4) for the
+    // PER-PIXEL receiver-albedo composite: the old 0.4 baked in a flat rho=0.3 stand-in (effective
+    // ~0.12), but the composite now multiplies by each pixel's REAL diffuse albedo — and real albedos
+    // average higher than 0.3 (esp. SunTemple's red sandstone ~0.7), which over-bounced at 0.4. 0.18
+    // restores the calibrated look on a mid-albedo surface while letting high-albedo walls bounce their
+    // true (now correctly bounded) colour. Verified on SunTemple + BistroExterior + BistroInterior
+    // (the last was railed pure-red at 0.4; now a clean moody bar). Overridable via BALLISTIC_SDFGI_INTENSITY.
     readonly float sdfGiIntensity = ParseIntensity();
     static float ParseIntensity() {
         string s = Environment.GetEnvironmentVariable("BALLISTIC_SDFGI_INTENSITY");
         return float.TryParse(s, System.Globalization.CultureInfo.InvariantCulture, out float v)
-            ? Math.Clamp(v, 0f, 4f) : 0.4f;
+            ? Math.Clamp(v, 0f, 4f) : 0.18f;
     }
 
     public bool Available { get; private set; }
@@ -514,7 +518,7 @@ public sealed class GLSdfGiPass : IDisposable {
         int shadowMapArray, Matrix4[] cascadeMatrices, Vector4 cascadeBias, int cascadeCount,
         Vector3 sunDirection, Vector3 sunColor,
         int width, int height, ref Matrix4 view, ref Matrix4 projection,
-        ref Matrix4 projectionNoJitter, float skyExposure, float intensityScale = 1f) {
+        ref Matrix4 projectionNoJitter, float skyExposure, float intensityScale = 1f, int albedoTex = 0) {
         if (!Available || program == 0)
             return colorTexture;
         bool gdf = UseGlobalSdf && globalSdf is { Available: true };
@@ -817,6 +821,12 @@ public sealed class GLSdfGiPass : IDisposable {
         BindCombineSampler(0, colorTexture, "sceneTexture");
         BindCombineSampler(1, giForComposite, "giTexture");
         BindCombineSampler(2, depthTex, "depthTexture");
+        // Per-pixel receiver albedo (the energy fix): when the G-buffer albedo target exists, the GI is
+        // multiplied by it so the bounce respects each surface's true reflectance. 0 = flat-rho fallback.
+        bool hasAlbedo = albedoTex != 0;
+        if (hasAlbedo)
+            BindCombineSampler(3, albedoTex, "albedoTexture");
+        combineShader.SetBool("HasAlbedo", hasAlbedo);
         combineShader.SetMatrix4("InvProjection", ref invProjection);
         // The probe-aware scale folds in here so SDF-GI augments (not double-counts) baked probes.
         // DebugView/diag bypass the scale so the raw gather stays inspectable at full strength.

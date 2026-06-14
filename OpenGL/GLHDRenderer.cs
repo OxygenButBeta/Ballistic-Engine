@@ -763,16 +763,20 @@ public class GLHDRenderer : HDRenderer {
         DebugCheck();
         if (skyboxRenderer.cubemapTexture is not null) {
             using var skyZone = timers.Time("Sky");
-            // The sky only writes scene color; keep the cleared "no normal" in attachment 1.
+            // The sky only writes scene color; keep the cleared "no normal"/"no albedo" in attach 1/2.
             var maskNormal = target.NormalTextureId != -1;
-            if (maskNormal)
+            if (maskNormal) {
                 GL.ColorMask(1, false, false, false, false);
+                GL.ColorMask(2, false, false, false, false); // sky has no albedo (GI reads 0 -> no bounce)
+            }
             skyboxRenderer.ProjectionOverride = renderProjection;
             skyboxRenderer.PreRenderCallback(args);
             skyboxRenderer.RenderSkybox();
             skyboxRenderer.PostRenderCallback(args);
-            if (maskNormal)
+            if (maskNormal) {
                 GL.ColorMask(1, true, true, true, true);
+                GL.ColorMask(2, true, true, true, true);
+            }
             stats.DrawCalls++;
         }
 
@@ -857,7 +861,7 @@ public class GLHDRenderer : HDRenderer {
                     irradianceMap, shadowMap.DepthTextureId, cascadeMatrices, cascadeBias,
                     activeCascadeCount, sunDirection, sunColor,
                     target.LenX, target.LenY, ref view, ref renderProjection,
-                    ref projection, skyExposureBase * preExposure, sdfGiBlend);
+                    ref projection, skyExposureBase * preExposure, sdfGiBlend, target.AlbedoTextureId);
             }
 
         // SSGI: AO-occluded indirect bounce, added before SSR so reflections see the GI-lifted scene.

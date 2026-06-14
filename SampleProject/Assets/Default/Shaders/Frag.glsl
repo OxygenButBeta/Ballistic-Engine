@@ -10,6 +10,7 @@ in mat3 fragTBN;
 
 layout(location = 0) out vec4 FragColor;
 layout(location = 1) out vec4 NormalRough; // world normal (xyz, 0..1) + roughness, for SSR/TAA
+layout(location = 2) out vec4 AlbedoGBuf;  // linear DIFFUSE albedo (rgb) for deferred GI receiver reflectance
 
 // --- Texture maps ---
 uniform sampler2D Diffuse;
@@ -945,4 +946,8 @@ void main()
     FragColor = vec4(color, alpha); // linear HDR out; tonemap happens in the composite pass
     // Alpha packs roughness + a metal flag (+2.0) so SSR can pick a sensible F0 per pixel.
     NormalRough = vec4(N * 0.5 + 0.5, roughness + (metallic > 0.5 ? 2.0 : 0.0));
+    // Diffuse albedo G-buffer for deferred GI receiver reflectance: the surface's diffuse base colour
+    // (metals reflect ~no diffuse, so fold in (1-metallic)). The GI composite multiplies its gathered
+    // irradiance by THIS so the bounce is bounded by what the surface can actually reflect.
+    AlbedoGBuf = vec4(albedo * (1.0 - metallic), 1.0);
 }

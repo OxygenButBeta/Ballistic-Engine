@@ -72,6 +72,13 @@ public class GLFrameBuffer : IFrameBuffer {
     // written by the PBR shader as a second render target for SSR/TAA.
     public int NormalTextureId { get; private set; } = -1;
 
+    // Valid when constructed with withNormalAttachment: linear DIFFUSE ALBEDO (rgb), written by the
+    // PBR shader as a THIRD render target. The deferred GI passes (SDF-GI / SSGI composite) multiply
+    // the gathered irradiance by THIS per-pixel albedo so the bounce respects each surface's true
+    // reflectance (a dark/low-albedo surface bounces little) instead of a flat constant — fixes the
+    // enclosed bright-bounce over-saturation. RGBA8 is plenty for an albedo (0..1, sRGB-ish range).
+    public int AlbedoTextureId { get; private set; } = -1;
+
     public int FrameBufferId => frameBufferId;
 
     public GLFrameBuffer(int width, int height, bool depthAsTexture = false, bool withNormalAttachment = false) {
@@ -114,8 +121,26 @@ public class GLFrameBuffer : IFrameBuffer {
                 (int)TextureWrapMode.ClampToEdge);
             GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment1,
                 TextureTarget.Texture2D, NormalTextureId, 0);
-            GL.DrawBuffers(2, new[] {
+
+            // Third target: linear diffuse albedo (RGB) for the deferred GI receiver-reflectance read.
+            AlbedoTextureId = GL.GenTexture();
+            GL.BindTexture(TextureTarget.Texture2D, AlbedoTextureId);
+            GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba8, width, height, 0,
+                PixelFormat.Rgba, PixelType.UnsignedByte, IntPtr.Zero);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter,
+                (int)TextureMinFilter.Nearest);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter,
+                (int)TextureMagFilter.Nearest);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS,
+                (int)TextureWrapMode.ClampToEdge);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT,
+                (int)TextureWrapMode.ClampToEdge);
+            GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment2,
+                TextureTarget.Texture2D, AlbedoTextureId, 0);
+
+            GL.DrawBuffers(3, new[] {
                 DrawBuffersEnum.ColorAttachment0, DrawBuffersEnum.ColorAttachment1,
+                DrawBuffersEnum.ColorAttachment2,
             });
         }
 
@@ -173,6 +198,12 @@ public class GLFrameBuffer : IFrameBuffer {
                 PixelFormat.Rgba, PixelType.Float, IntPtr.Zero);
         }
 
+        if (AlbedoTextureId != -1) {
+            GL.BindTexture(TextureTarget.Texture2D, AlbedoTextureId);
+            GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba8, width, height, 0,
+                PixelFormat.Rgba, PixelType.UnsignedByte, IntPtr.Zero);
+        }
+
         if (DepthTextureId != -1) {
             GL.BindTexture(TextureTarget.Texture2D, DepthTextureId);
             GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.DepthComponent24, width, height, 0,
@@ -197,6 +228,11 @@ public class GLFrameBuffer : IFrameBuffer {
         if (NormalTextureId != -1) {
             GL.DeleteTexture(NormalTextureId);
             NormalTextureId = -1;
+        }
+
+        if (AlbedoTextureId != -1) {
+            GL.DeleteTexture(AlbedoTextureId);
+            AlbedoTextureId = -1;
         }
 
         if (DepthTextureId != -1) {
