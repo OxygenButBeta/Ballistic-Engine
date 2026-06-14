@@ -125,8 +125,13 @@ public sealed class GLSdfGiPass : IDisposable {
     // fewer traces + the integrate/temporal kill the per-pixel gather noise. Default on with the GDF.
     const int OctRes = 8;       // octahedral tile edge per probe
     const int ProbeStep = 8;    // half-res pixels per probe edge (=> ~16 full-res px / probe)
+    // DEFAULT OFF. Honest finding: at this coarseness (8px probe blocks, 2x2 bilinear reconstruction)
+    // the screen-probe path leaves a visible LATTICE in the raw GI bounce — a clear REGRESSION vs the
+    // per-pixel gather, which is smooth + clean (and was already only ~5ms, so probes saved nothing
+    // worth that quality loss). The probe grid needs finer placement + a proper spatial filter before
+    // it can MATCH, let alone beat, per-pixel. Opt in for development with BALLISTIC_LUMEN_PROBES=1.
     static readonly bool UseProbes =
-        Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_PROBES") != "0"; // default ON
+        Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_PROBES") == "1"; // default OFF (per-pixel wins)
     readonly GLRenderTexture probeAtlas = new();  // RGBA16F octahedral radiance atlas (this frame, raw trace)
     // Per-probe octmap TEMPORAL accumulation (the convergence for 1-sample/texel/frame probes): ping-pong
     // history atlases, reproject each probe by its world pos to last frame, EMA-blend the octmap. Without
