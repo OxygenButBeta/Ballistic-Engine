@@ -772,7 +772,7 @@ public class GLHDRenderer : HDRenderer {
         if (PostFX.SsrEnabled)
             using (timers.Time("SSR"))
                 litColor = ssr.Render(targetIndex, litColor, target.DepthTextureId, target.NormalTextureId,
-                    target.LenX, target.LenY, ref view, ref renderProjection, PostFX);
+                    target.LenX, target.LenY, ref view, ref renderProjection, ref projection, PostFX);
 
         // Volumetric height fog + light shafts (god-rays) before TAA so the temporal pass
         // stabilizes the dithered march and bloom catches the bright shafts. sunColor is
