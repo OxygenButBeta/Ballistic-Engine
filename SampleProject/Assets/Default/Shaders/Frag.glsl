@@ -435,13 +435,21 @@ float SunShadow(vec3 N, vec3 L)
 // ---------------- Punctual shadows ----------------
 float PunctualPCF(int layer, vec3 proj, float bias)
 {
+    // Rotated Vogel-disk PCF (12 taps) instead of the old fixed 3x3 box: softer, dithered punctual
+    // shadows (TAA resolves the per-pixel rotation), the same softness technique the sun cascades
+    // use. The wider rotated kernel also spreads/dithers the cube-face boundary so the hard 3x3 seam
+    // is far less visible. Radius scales with ShadowSoftness. Hardware-compare taps (sampler2DArrayShadow).
     vec2 texel = 1.0 / vec2(textureSize(PunctualShadows, 0).xy);
+    float phi = InterleavedNoise(gl_FragCoord.xy) * 6.2831853;
+    float radiusTexels = clamp(ShadowSoftness * 1.5, 0.75, 6.0);
     float lit = 0.0;
-    for (int x = -1; x <= 1; x++)
-        for (int y = -1; y <= 1; y++)
-            lit += texture(PunctualShadows,
-                vec4(proj.xy + vec2(x, y) * texel, float(layer), proj.z - bias));
-    return lit / 9.0;
+    for (int i = 0; i < 12; i++) {
+        vec2 offset = VogelDisk(i, 12, phi) * radiusTexels * texel;
+        // Clamp keeps taps inside the cube face (proj.xy in [0,1]); the dithered spread hides the seam.
+        vec2 uv = clamp(proj.xy + offset, vec2(0.001), vec2(0.999));
+        lit += texture(PunctualShadows, vec4(uv, float(layer), proj.z - bias));
+    }
+    return lit / 12.0;
 }
 
 float SpotShadow(int slot, float ndl)
