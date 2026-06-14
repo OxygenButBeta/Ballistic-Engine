@@ -25,4 +25,9 @@ public sealed class GlobalIllumination : VolumeComponent {
              "var. SDF-GI stays env-gated by default while it matures; a scene that wants the dynamic " +
              "off-screen bounce just adds this override and ticks this.")]
     public readonly BoolParameter sdfForceEnabled = new(false);
+
+    [Tooltip("Ambient shadow-fill: a tiny fraction of surface albedo (AO-modulated) added so enclosed " +
+             "interiors never crush the shadowed side of geometry to pure black. 0.03 = subtle default; " +
+             "raise for flatter/brighter ambient, 0 for physically-pure (deep blacks).")]
+    public readonly ClampedFloatParameter ambientFloor = new(0.03f, 0f, 0.5f);
 }
