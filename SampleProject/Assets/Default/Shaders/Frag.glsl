@@ -300,9 +300,14 @@ uniform float ContactShadowLength;     // world-space march distance (metres)
 uniform int ContactShadowSteps;
 uniform float ContactShadowThickness;  // depth-difference window that counts as a hit (metres)
 
-float ViewZFromDepth(float d) {
+// View-space Z from a window-depth sample, given a PRECOMPUTED inverse projection. The old form
+// called inverse(projection) INSIDE this function, i.e. a full 4x4 matrix inversion per contact-
+// shadow step per pixel (ContactShadowSteps inversions/pixel) — a serious pointless cost (review).
+// inverse(projection) is loop-invariant, so the caller hoists it out and passes it here. Only the
+// z,w rows of the inverse matter for view-Z, so this is just two dot products.
+float ViewZFromDepth(float d, mat4 invP) {
     vec4 clip = vec4(0.0, 0.0, d * 2.0 - 1.0, 1.0);
-    vec4 v = inverse(projection) * clip;   // projection lives in PassData
+    vec4 v = invP * clip;
     return v.z / v.w;
 }
 
@@ -310,6 +315,7 @@ float ContactShadow(vec3 worldPos, vec3 L) {
     if (!ContactShadowsOn || ContactShadowLength <= 0.0)
         return 1.0;
 
+    mat4 invP = inverse(projection);   // ONCE per pixel, hoisted out of the march loop
     vec3 viewPos = (view * vec4(worldPos, 1.0)).xyz;
     vec3 viewL = normalize(mat3(view) * L);
     float stepLen = ContactShadowLength / float(ContactShadowSteps);
@@ -322,7 +328,7 @@ float ContactShadow(vec3 worldPos, vec3 L) {
         vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
         if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) break;
 
-        float sceneZ = ViewZFromDepth(texture(SceneDepth, uv).r);
+        float sceneZ = ViewZFromDepth(texture(SceneDepth, uv).r, invP);
         float diff = sceneZ - sampleView.z;
         if (diff > 0.003 && diff < ContactShadowThickness)
             return 0.0;
@@ -430,6 +436,28 @@ vec3 GetNormalFromMap(vec2 uv, vec3 geomNormal, mat3 TBN, float strength)
 vec3 SkyDir(vec3 d)
 {
     return transpose(mat3(SkyRotation)) * d;
+}
+
+// Box-projection parallax-corrected sample of ONE reflection-volume cell's local cube. The cube was
+// captured at the cell CENTRE; intersecting R with the cell AABB and re-aiming from the centre makes
+// adjacent cells reflect the same world point (kills cell-boundary mis-registration). Returns false
+// (no contribution) when the cell has no baked cube (layer < 0). `cell` is clamped by the caller.
+bool SampleLocalProbe(ivec3 cell, vec3 R, vec3 fragP, vec3 cellSize, float localMip, out vec3 outRgb)
+{
+    outRgb = vec3(0.0);
+    int layer = texelFetch(ReflectionCellToLayer, cell, 0).r;
+    if (layer < 0)
+        return false;
+    vec3 cellMin = ReflectionVolumeMin + vec3(cell) * cellSize;
+    vec3 cellCtr = cellMin + 0.5 * cellSize;
+    vec3 invR = 1.0 / R;
+    vec3 t1 = (cellMin            - fragP) * invR;
+    vec3 t2 = (cellMin + cellSize - fragP) * invR;
+    vec3 tmax = max(t1, t2);
+    float t = min(min(tmax.x, tmax.y), tmax.z);
+    vec3 sampleDir = (fragP + R * max(t, 0.0)) - cellCtr;
+    outRgb = textureLod(ReflectionProbes, vec4(sampleDir, float(layer)), localMip).rgb;
+    return true;
 }
 
 // ---------------- Main ----------------
@@ -610,29 +638,37 @@ void main()
             vec3 ruvw = (fragPos - ReflectionVolumeMin) * ReflectionVolumeInvSize;
             if (all(greaterThanEqual(ruvw, vec3(0.0))) && all(lessThanEqual(ruvw, vec3(1.0)))) {
                 ivec3 dims = ivec3(ReflectionGridX, ReflectionGridY, ReflectionGridZ);
-                ivec3 cell = clamp(ivec3(floor(ruvw * vec3(dims))), ivec3(0), dims - 1);
-                int layer = texelFetch(ReflectionCellToLayer, cell, 0).r;
-                if (layer >= 0) {
-                    float localMip = clamp(roughness * ReflectionMaxMips, 0.0, ReflectionMaxMips);
+                vec3 cellSize = (vec3(1.0) / ReflectionVolumeInvSize) / vec3(dims);
+                float localMip = clamp(roughness * ReflectionMaxMips, 0.0, ReflectionMaxMips);
 
-                    // BOX-PROJECTION PARALLAX CORRECTION. The cube was captured at the CELL CENTRE, so
-                    // sampling the raw reflection vector R treats it as captured at infinity — in a
-                    // ~12 m cell that mis-registers badly (smeared marble, abrupt jumps between cells
-                    // that should reflect the same world point). Intersect R with the cell's AABB and
-                    // re-aim the lookup from the cell centre to the hit point: now adjacent cells
-                    // reflect the SAME surface, removing the cell-boundary discontinuities. All inputs
-                    // derive from existing uniforms (the cube grid is axis-aligned in world space).
-                    vec3 cellSize = (vec3(1.0) / ReflectionVolumeInvSize) / vec3(dims);
-                    vec3 cellMin  = ReflectionVolumeMin + vec3(cell) * cellSize;
-                    vec3 cellCtr  = cellMin + 0.5 * cellSize;
-                    vec3 invR = 1.0 / R;                       // R is never axis-zero enough to NaN here
-                    vec3 t1 = (cellMin            - fragPos) * invR;
-                    vec3 t2 = (cellMin + cellSize - fragPos) * invR;
-                    vec3 tmax = max(t1, t2);
-                    float t = min(min(tmax.x, tmax.y), tmax.z);
-                    vec3 sampleDir = (fragPos + R * max(t, 0.0)) - cellCtr;
+                // INTER-PROBE TRILINEAR BLEND. A single cell's parallax-corrected cube is sharp, but
+                // crossing a cell boundary POPS to a different cube (the review's "adjacent cells with
+                // different layers pop with no inter-probe blend"). Sample the 2x2x2 cell neighbourhood
+                // around the fragment's CELL-CENTRE-relative position and trilinearly weight by how
+                // close the fragment is to each cell's centre — so the reflection fades smoothly across
+                // boundaries (each tap is itself box-projection parallax-corrected via SampleLocalProbe).
+                vec3 gridPos = ruvw * vec3(dims) - 0.5;        // position in CELL-CENTRE space
+                ivec3 baseCell = ivec3(floor(gridPos));
+                vec3 f = gridPos - vec3(baseCell);             // trilinear weights toward +cell
 
-                    vec3 local = textureLod(ReflectionProbes, vec4(sampleDir, float(layer)), localMip).rgb * SkyExposure;
+                vec3 localAcc = vec3(0.0);
+                float wAcc = 0.0;
+                for (int c = 0; c < 8; c++) {
+                    ivec3 off = ivec3(c & 1, (c >> 1) & 1, (c >> 2) & 1);
+                    ivec3 cc = clamp(baseCell + off, ivec3(0), dims - 1);
+                    float w = (off.x == 1 ? f.x : 1.0 - f.x)
+                            * (off.y == 1 ? f.y : 1.0 - f.y)
+                            * (off.z == 1 ? f.z : 1.0 - f.z);
+                    if (w <= 0.0) continue;
+                    vec3 tapRgb;
+                    if (SampleLocalProbe(cc, R, fragPos, cellSize, localMip, tapRgb)) {
+                        localAcc += tapRgb * w;
+                        wAcc += w;
+                    }
+                }
+
+                if (wAcc > 0.0) {
+                    vec3 local = (localAcc / wAcc) * SkyExposure;
                     // BlendWithSky: lerp from the sky reflection toward the local one by intensity
                     // (intensity>1 over-drives past the local cube). Otherwise hard-replace, scaled.
                     prefiltered = ReflectionBlendWithSky
