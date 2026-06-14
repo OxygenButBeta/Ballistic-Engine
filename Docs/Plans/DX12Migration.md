@@ -61,11 +61,17 @@ byte-exactness is kept WITHIN a single backend.
   **Verify:** every deterministic paused screenshot BYTE-IDENTICAL before/after (meanError 0).
   Baselines captured pre-Phase0: SunTemple mean (160.5,146.6,131.4); Bistro (46.0,32.3,25.9), frame 300.
 
-- **Phase 1 — DX12 device + window + clear + triangle. ~3-6 wk.**
-  Vortice DX12 plumbing: DXGI swapchain, device, command queue/allocators/lists, descriptor heaps,
-  fences, frame loop. DXGI window (HWND). **Port the deterministic screenshot readback to a DX12
-  staging-buffer CopyResource+Map — CRITICAL, the whole verification workflow depends on it.** Clear +
-  one HLSL (DXC) triangle. Windows raw-input/XInput provider to replace GLInput.
+- **Phase 1 — DX12 device + clear + triangle + readback. CORE DONE 2026-06-15 (offscreen-first).**
+  Commits: 1a (BallisticEngine.DX12 project + Vortice 3.8.3 + Dx12Probe — VERIFIED "DX12 OK: AMD Radeon
+  RX 9070 XT | DXR Tier1_1"), 1c+1e (Dx12Device: device/queue/allocator/list4/fence + ExecuteSync;
+  Dx12OffscreenTarget: RTV + Clear + GetCopyableFootprints→CopyTextureRegion→readback heap→Map→BMP,
+  VERIFIED byte-exact 204,51,102), 1d (Dx12ShaderCompiler HLSL→DXIL via Vortice.Dxc SM6.6; Triangle.hlsl
+  SV_VertexID; root sig + PSO + draw — VERIFIED RGB triangle e:/tmp/dx12_triangle.png). Vortice API
+  notes: CreateDXGIFactory1 (not Factory2+debug), generic CreateCommandList<T>, GetCopyableFootprints
+  (plural array overload), Map<byte>, ID3D12Debug in Vortice.Direct3D12.Debug.
+  STILL TODO this phase: windowed swapchain + present (1f — deferred, offscreen covers the harness);
+  Windows input provider to replace GLInput (when the windowed host arrives).
+  ORIGINAL phase scope below:
   **Verify:** `BALLISTIC_SCREENSHOT` on the dx12 backend produces a BMP + .stats.json + exit code,
   identical pipeline to GL.
 
