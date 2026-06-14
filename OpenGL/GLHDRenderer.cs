@@ -2210,6 +2210,8 @@ public class GLHDRenderer : HDRenderer {
         public bool[] Occupied;  // probes near geometry; the rest skip straight to sky SH
         public int[] Order;      // probe indices sorted CAMERA-OUTWARD (nearest first) — Cursor walks
                                  // this, not 0..Total, so the visible area populates before far corners
+        public float[] ReorderDist;       // scratch distance keys for the per-frame camera re-sort
+        public Vector3 LastReorderPos;    // camera pos at the last tail re-sort (gate: re-sort on move)
         public int CapturedCount;
         // Renderer snapshot + world AABBs (computed once): per-face frustum culling means a
         // probe in one street doesn't re-draw the whole city for every cube face.
@@ -2240,6 +2242,7 @@ public class GLHDRenderer : HDRenderer {
     // serialized; a real placed IrradianceVolume (Active != null) always overrides it. Rebuilt when
     // the scene changes (tracked by sceneStampForDefault).
     IrradianceVolume defaultProbeVolume;
+    int probeVizThrottle;         // throttles the per-frame probe gizmo-data publish during a bake
     int defaultProbeStamp;        // hash of the fitted bounds, so a moved/changed scene refits
     bool defaultProbeFitTried;    // don't refit every frame when the scene has no geometry yet
     int defaultProbeRefitCountdown; // throttle the per-frame scene-bounds scan (refit every N frames)
@@ -2380,6 +2383,31 @@ public class GLHDRenderer : HDRenderer {
                                skyExposureBase;
         Vector3 skySh0 = skyUnexposed * 3.5449f;
 
+        // CAMERA-DRIVEN re-prioritisation: the initial Order was sorted by distance to the camera at
+        // bake START, but the camera moves. Each frame, re-sort the UNBAKED TAIL (Order[Cursor..]) by
+        // distance to the CURRENT camera, so the bake always works on the probes nearest where you are
+        // NOW — fly into a new room and its probes bake next, not the far corner you queued earlier.
+        // The baked prefix [0..Cursor) is untouched (already done). Sorting only the tail keeps it
+        // cheap, and we gate on actual movement so a static camera doesn't re-sort every frame.
+        if (job.Cursor < job.Total &&
+            (lastCameraPos - job.LastReorderPos).LengthSquared > 4f) { // moved > 2 m
+            job.LastReorderPos = lastCameraPos;
+            // Build a per-INDEX distance key over the whole grid (so Array.Sort's shared index into
+            // (keys, Order) lines up), then sort only the unbaked tail range [Cursor, Total).
+            if (job.ReorderDist is null)
+                job.ReorderDist = new float[job.Total];
+            for (var k = job.Cursor; k < job.Total; k++) {
+                var pi = job.Order[k];
+                var px2 = pi % job.Px; var py2 = pi / job.Px % job.Py; var pz2 = pi / (job.Px * job.Py);
+                var pPos = job.Min + new Vector3(
+                    (px2 + 0.5f) / job.Px * job.Size.X,
+                    (py2 + 0.5f) / job.Py * job.Size.Y,
+                    (pz2 + 0.5f) / job.Pz * job.Size.Z);
+                job.ReorderDist[k] = (pPos - lastCameraPos).LengthSquared;
+            }
+            Array.Sort(job.ReorderDist, job.Order, job.Cursor, job.Total - job.Cursor);
+        }
+
         var slice = System.Diagnostics.Stopwatch.StartNew();
         GL.Enable(EnableCap.ScissorTest);
         while (job.Cursor < job.Total && slice.Elapsed.TotalMilliseconds < BakeBudgetMs) {
@@ -2436,8 +2464,15 @@ public class GLHDRenderer : HDRenderer {
         // the end — so the scene lights up and refines live as the camera-outward bake fills in, with
         // NO wait for the whole grid to finish. The grid is tiny (Total x 4 RGBA16F texels), so a full
         // TexImage3D per frame is cheap. Primed-to-sky probes (above) mean even un-reached cells are lit.
+        // NOTE: only the texture upload is needed for LIGHTING; PublishProbeViz (gizmo data, allocates
+        // + loops over every probe) is the bulk of the per-frame bake cost, so THROTTLE it (every ~15
+        // frames) instead of running it every frame — keeps the debug gizmo's occupancy view live
+        // without the full per-frame allocation+loop. Final state is published by FinishProbeBake.
         UploadProbeTextures(job.Px, job.Py, job.Pz, job.Sh, job.Min, job.Size);
-        PublishProbeViz(job.Px, job.Py, job.Pz, job.Min, job.Size, job.Sh, job.Occupied);
+        if (++probeVizThrottle >= 15) {
+            probeVizThrottle = 0;
+            PublishProbeViz(job.Px, job.Py, job.Pz, job.Min, job.Size, job.Sh, job.Occupied);
+        }
 
         IrradianceVolume.BakeProgress = job.Cursor / (float)job.Total;
         IrradianceVolume.BakeStatus = $"Baking light probes  {job.Cursor}/{job.Total}";
@@ -2460,14 +2495,16 @@ public class GLHDRenderer : HDRenderer {
     static bool ComputeSceneFitBounds(out Vector3 center, out Vector3 size) {
         center = default; size = default;
         Vector3 lo = new(float.MaxValue), hi = new(float.MinValue);
-        Vector3 coreLo = new(float.MaxValue), coreHi = new(float.MinValue);
-        float diagSum = 0f; int diagCount = 0; bool any = false;
+        bool any = false;
 
-        foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
-            if (r is not { IsRenderable: true, IsActive: true } || r.SharedMesh == null)
-                continue;
-            r.SharedMesh.GetLocalBounds(out Vector3 lMin, out Vector3 lMax);
-            Matrix4 world = r.Transform.WorldMatrix;
+        // Collect a per-PIECE world AABB list. A "piece" is a SUBMESH for a whole-mesh renderer
+        // (SunTemple is ONE renderer holding ~1000 submeshes — terrain + building all in one mesh, so
+        // its whole-mesh bounds are ~275 m and wrap the entire landscape) and the whole renderer
+        // otherwise. Fitting to pieces lets the outlier rejection below drop the few giant terrain
+        // submeshes and hug the dense building cluster — instead of one renderer = one un-rejectable box.
+        var pieceMin = new List<Vector3>();
+        var pieceMax = new List<Vector3>();
+        void AddPiece(Vector3 lMin, Vector3 lMax, Matrix4 world) {
             Vector3 wMin = new(float.MaxValue), wMax = new(float.MinValue);
             for (var c = 0; c < 8; c++) {
                 var corner = new Vector3(
@@ -2478,24 +2515,63 @@ public class GLHDRenderer : HDRenderer {
                 wMin = Vector3.ComponentMin(wMin, w);
                 wMax = Vector3.ComponentMax(wMax, w);
             }
-            lo = Vector3.ComponentMin(lo, wMin);
+            pieceMin.Add(wMin); pieceMax.Add(wMax);
+            lo = Vector3.ComponentMin(lo, wMin);   // full union (incl. terrain) for the floor extend
             hi = Vector3.ComponentMax(hi, wMax);
-
-            float diag = (wMax - wMin).Length;
-            float median = diagCount > 0 ? diagSum / diagCount : diag;
-            if (diagCount < 3 || diag <= median * 4f) {
-                coreLo = Vector3.ComponentMin(coreLo, wMin);
-                coreHi = Vector3.ComponentMax(coreHi, wMax);
-            }
-            diagSum += diag; diagCount++;
             any = true;
+        }
+
+        foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
+            if (r is not { IsRenderable: true, IsActive: true } || r.SharedMesh == null)
+                continue;
+            Mesh mesh = r.SharedMesh;
+            Matrix4 world = r.Transform.WorldMatrix;
+            if (r.SubMeshIndex < 0 && mesh.SubMeshes.Length > 1) {
+                for (var s = 0; s < mesh.SubMeshes.Length; s++) {
+                    mesh.GetSubMeshBounds(s, out Vector3 sMin, out Vector3 sMax);
+                    AddPiece(sMin, sMax, world);
+                }
+            }
+            else {
+                mesh.GetLocalBounds(out Vector3 lMin, out Vector3 lMax);
+                AddPiece(lMin, lMax, world);
+            }
         }
 
         if (!any)
             return false;
-        if (coreLo.X > coreHi.X) { coreLo = lo; coreHi = hi; } // every renderer was an "outlier"
 
-        coreLo.Y = MathF.Min(coreLo.Y, lo.Y); // keep the ground floor inside the volume
+        // Robust cluster fit: a few enormous terrain/ground pieces shouldn't balloon the grid (the
+        // known FitToScene failure — the 15 m room got ~1 cell). Take the MEDIAN piece diagonal, then
+        // union only pieces up to ~6x it: the dense building cluster drives the volume, the giant
+        // terrain slabs are excluded. (Per-piece, so it works even when the whole scene is one mesh.)
+        int n = pieceMin.Count;
+        var diags = new float[n];
+        for (var i = 0; i < n; i++)
+            diags[i] = (pieceMax[i] - pieceMin[i]).Length;
+        var sortedDiags = (float[])diags.Clone();
+        Array.Sort(sortedDiags);
+        // Cap pieces at ~5x the MEDIAN diagonal: the dense cluster of building submeshes (walls,
+        // columns, steps — all near the median) drives the volume, while the few giant terrain/ground
+        // slabs (many times the median) are excluded so the grid hugs the structure, not the landscape.
+        float medianDiag = sortedDiags[n / 2];
+        float diagCap = MathF.Max(medianDiag * 5f, 4f);
+
+        Vector3 coreLo = new(float.MaxValue), coreHi = new(float.MinValue);
+        bool anyCore = false;
+        for (var i = 0; i < n; i++) {
+            if (diags[i] <= diagCap) {
+                coreLo = Vector3.ComponentMin(coreLo, pieceMin[i]);
+                coreHi = Vector3.ComponentMax(coreHi, pieceMax[i]);
+                anyCore = true;
+            }
+        }
+        if (!anyCore) { coreLo = lo; coreHi = hi; } // everything was an outlier — fall back to full
+
+        // NOTE: deliberately NOT extending coreLo.Y down to the full terrain floor (lo.Y) — that hack
+        // ballooned the volume height to wrap the entire landscape's lowest point (~94 m). The core
+        // cluster already includes the building's own floor; a giant ground slab beneath it doesn't
+        // need probe coverage (it reads sky/bounce fine from the cluster).
         const float pad = 2f;
         center = (coreLo + coreHi) * 0.5f;
         size = Vector3.ComponentMax(coreHi - coreLo + new Vector3(pad * 2f), Vector3.One * 4f);
@@ -2621,32 +2697,80 @@ public class GLHDRenderer : HDRenderer {
         // worth capturing - a probe floating in open air sees the sky average from every
         // direction, which we can write analytically. In a city scene this skips MOST of the
         // grid, and it's where the bulk of the bake time went.
+        //
+        // CRITICAL: for a WHOLE-MESH renderer (the SunTemple is one StaticMeshRenderer holding ~1600
+        // submeshes), its single AABB spans the ENTIRE model (~190 m incl. surrounding terrain), so
+        // marking occupancy from that one box flags the WHOLE grid occupied ("6912 near geometry, 0
+        // skipped as air") — the empty-space skip never fires and you bake thousands of pointless air
+        // probes. Use the PER-SUBMESH world AABBs the renderer already computes for culling
+        // (wholeMeshSubmeshAabb) so occupancy follows the actual building surfaces, not the bounding
+        // box of the whole scene. Per-submesh renderers / non-whole-mesh fall back to the single AABB.
         job.Occupied = new bool[job.Total];
         var cell = new Vector3(job.Size.X / job.Px, job.Size.Y / job.Py, job.Size.Z / job.Pz);
-        for (var r = 0; r < job.Renderers.Length; r++) {
-            // Dilate by one cell so probes just above a roof / beside a wall still capture.
-            Vector3 wMin = job.AabbMin[r] - cell;
-            Vector3 wMax = job.AabbMax[r] + cell;
+
+        // Mark every grid cell overlapping [wMin,wMax] (already dilated by one cell) as occupied.
+        void MarkOccupied(Vector3 wMin, Vector3 wMax) {
             if (wMax.X < job.Min.X || wMin.X > job.Min.X + job.Size.X ||
                 wMax.Y < job.Min.Y || wMin.Y > job.Min.Y + job.Size.Y ||
                 wMax.Z < job.Min.Z || wMin.Z > job.Min.Z + job.Size.Z)
-                continue;
-
+                return;
             var x0 = Math.Clamp((int)((wMin.X - job.Min.X) / cell.X), 0, job.Px - 1);
             var x1 = Math.Clamp((int)((wMax.X - job.Min.X) / cell.X), 0, job.Px - 1);
             var y0 = Math.Clamp((int)((wMin.Y - job.Min.Y) / cell.Y), 0, job.Py - 1);
             var y1 = Math.Clamp((int)((wMax.Y - job.Min.Y) / cell.Y), 0, job.Py - 1);
             var z0 = Math.Clamp((int)((wMin.Z - job.Min.Z) / cell.Z), 0, job.Pz - 1);
             var z1 = Math.Clamp((int)((wMax.Z - job.Min.Z) / cell.Z), 0, job.Pz - 1);
-
             for (var z = z0; z <= z1; z++)
             for (var y = y0; y <= y1; y++)
             for (var x = x0; x <= x1; x++)
                 job.Occupied[(z * job.Py + y) * job.Px + x] = true;
         }
+
+        for (var r = 0; r < job.Renderers.Length; r++) {
+            var target = job.Renderers[r];
+            Mesh mesh = target.SharedMesh;
+            // A WHOLE-MESH renderer (SubMeshIndex < 0) holds many submeshes inside one giant model
+            // AABB. Mark occupancy from each SUBMESH's own world bounds, computed DIRECTLY from the
+            // mesh here (NOT from wholeMeshSubmeshAabb — that cache is only filled by the CPU cull,
+            // which the GPU-driven path SKIPS, so it's empty in the common case). This is what makes
+            // empty air around/inside the temple register as air instead of all-occupied.
+            if (target.SubMeshIndex < 0 && mesh is not null && mesh.SubMeshes.Length > 1) {
+                Matrix4 world = target.Transform.WorldMatrix;
+                for (var s = 0; s < mesh.SubMeshes.Length; s++) {
+                    mesh.GetSubMeshBounds(s, out Vector3 lMin, out Vector3 lMax);
+                    var wMin = new Vector3(float.MaxValue);
+                    var wMax = new Vector3(float.MinValue);
+                    for (var c = 0; c < 8; c++) {
+                        var corner = new Vector3(
+                            (c & 1) == 0 ? lMin.X : lMax.X,
+                            (c & 2) == 0 ? lMin.Y : lMax.Y,
+                            (c & 4) == 0 ? lMin.Z : lMax.Z);
+                        Vector3 w = (new Vector4(corner, 1f) * world).Xyz;
+                        wMin = Vector3.ComponentMin(wMin, w);
+                        wMax = Vector3.ComponentMax(wMax, w);
+                    }
+                    MarkOccupied(wMin - cell, wMax + cell); // dilate by one cell
+                }
+            }
+            else {
+                // Per-submesh / single-submesh renderer: its single AABB IS tight, use it directly.
+                MarkOccupied(job.AabbMin[r] - cell, job.AabbMax[r] + cell);
+            }
+        }
         foreach (var occupied in job.Occupied)
             if (occupied)
                 job.CapturedCount++;
+
+        if (Environment.GetEnvironmentVariable("BALLISTIC_PROBE_DEBUG") == "1") {
+            int subTotal = 0, wholeMesh = 0;
+            foreach (var rr in job.Renderers) {
+                var m = rr.SharedMesh;
+                if (rr.SubMeshIndex < 0 && m is not null && m.SubMeshes.Length > 1) { wholeMesh++; subTotal += m.SubMeshes.Length; }
+            }
+            Console.WriteLine($"[ProbeOccupancy] renderers={job.Renderers.Length} wholeMesh={wholeMesh} " +
+                $"submeshes={subTotal} | grid {job.Px}x{job.Py}x{job.Pz}={job.Total} occupied={job.CapturedCount} " +
+                $"air={job.Total - job.CapturedCount} | volume center={job.Min + job.Size * 0.5f} size={job.Size}");
+        }
 
         // CAMERA-OUTWARD bake order: sort probe indices by distance of their cell centre from the
         // current render position, nearest first. The time-sliced loop walks this, so the area

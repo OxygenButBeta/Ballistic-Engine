@@ -1243,6 +1243,17 @@ internal sealed class EditorApplication {
             var grid = prefs.ShowGrid;
             ToggleIconButton("gridtoggle", EditorIcons.Grid, ref grid, "Viewport grid");
             if (grid != prefs.ShowGrid) { prefs.ShowGrid = grid; EditorPrefs.Save(); }
+
+            // Probe-grid debug toggle: shows the light-probe positions (green = occupied / near
+            // geometry, red = empty air) for the active OR implicit-default volume — without selecting
+            // anything. The visual for diagnosing probe density / placement.
+            RightAlign(ImGui.CalcTextSize(EditorIcons.Pin).X + pad2);
+            var probes = IrradianceVolume.DebugShowAll;
+            ToggleIconButton("probetoggle", EditorIcons.Pin, ref probes,
+                IrradianceVolume.DebugShowAll
+                    ? $"Light probes ({IrradianceVolume.DebugOccupiedCount} occupied / {IrradianceVolume.DebugTotalCount} total)"
+                    : "Light probes (debug)");
+            IrradianceVolume.DebugShowAll = probes;
         }
 
         ImGui.Separator();
@@ -1597,6 +1608,11 @@ internal sealed class EditorApplication {
             try { sceneBehaviour.OnDrawGizmos(gizmoDrawer); }
             catch (Exception e) { ScriptGuard.ReportRepeating(sceneBehaviour, "OnDrawGizmos", e); }
         }
+
+        // DEBUG: probe-grid overlay (toggle in the View menu). Always-on (not selection-gated) so the
+        // IMPLICIT DEFAULT volume's probes show too — green = occupied, red = empty air. The visual for
+        // the "6k probes, most in empty space" density work.
+        IrradianceVolume.DebugDrawProbes(gizmoDrawer);
 
         if (editorState.Selected is { IsActive: true } selected) {
             foreach (Behaviour behaviour in selected.Behaviours) {

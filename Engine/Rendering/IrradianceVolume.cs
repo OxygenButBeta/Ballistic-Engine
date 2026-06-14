@@ -182,7 +182,10 @@ public class IrradianceVolume : SceneBehaviour {
         var px = Math.Clamp(ProbesX, 2, 64);
         var py = Math.Clamp(ProbesY, 2, 64);
         var pz = Math.Clamp(ProbesZ, 2, 64);
-        if (px * py * pz > 4096)
+        // 8192 cap (was 4096): the SunTemple auto-fit grid is 24x12x24 = 6912, which the old cap hid
+        // entirely — so the probe markers never drew and you couldn't SEE where the probes are or how
+        // many fall in empty air. This is the debug view for the "6k probes, most in empty space" work.
+        if (px * py * pz > 8192)
             return;
 
         Vector3 size = Vector3.ComponentMax(Size, Vector3.One * 0.5f);
@@ -205,12 +208,15 @@ public class IrradianceVolume : SceneBehaviour {
             if (vizMatches) {
                 var i = (z * py + y) * px + x;
                 if (!viz.Captured[i]) {
-                    gizmos.Color = new Vector3(0.3f, 0.3f, 0.32f); // skipped: empty air
-                    reach = arm * 0.4f;
+                    // EMPTY-AIR probe (no geometry near it): drawn dim RED so the wasted cells are
+                    // obvious at a glance — this is the "most of the 6k is empty space" we're hunting.
+                    gizmos.Color = new Vector3(0.8f, 0.15f, 0.12f);
+                    reach = arm * 0.5f;
                 }
                 else {
-                    Vector3 c = viz.Colors[i];
-                    gizmos.Color = new Vector3(c.X / (1f + c.X), c.Y / (1f + c.Y), c.Z / (1f + c.Z));
+                    // OCCUPIED probe (near geometry, worth capturing): bright GREEN so you can see
+                    // exactly where the useful probes sit vs the empty-air red ones.
+                    gizmos.Color = new Vector3(0.2f, 1f, 0.3f);
                 }
             }
             else {
@@ -222,6 +228,45 @@ public class IrradianceVolume : SceneBehaviour {
             gizmos.DrawLine(p - Vector3.UnitZ * reach, p + Vector3.UnitZ * reach);
         }
     }
+
+    // DEBUG: draw the latest published probe grid (Viz) WITHOUT needing the volume selected — works
+    // for the IMPLICIT DEFAULT volume too (which is never in the hierarchy, so can't be selected).
+    // Toggled by the editor "Show Probes" debug switch. Empty-air probes draw dim RED, occupied bright
+    // GREEN, so the "most of the grid is empty space" is obvious. This is the visual the probe-density
+    // rework is built on: SEE where the points are before changing how they're placed.
+    public static bool DebugShowAll =
+        System.Environment.GetEnvironmentVariable("BALLISTIC_PROBE_DEBUG") == "1";
+    public static void DebugDrawProbes(IGizmos gizmos) {
+        ProbeVizData viz = Viz;
+        if (!DebugShowAll || viz is null)
+            return;
+        int px = viz.Px, py = viz.Py, pz = viz.Pz;
+        if ((long)px * py * pz > 20000) // safety: don't flood the draw list past a sane cap
+            return;
+        Vector3 center = viz.Min + viz.Size * 0.5f;
+        gizmos.Color = new Vector3(0.75f, 1f, 0.6f);
+        gizmos.DrawWireCube(center, viz.Size, Quaternion.Identity);
+
+        const float arm = 0.12f;
+        int occupied = 0;
+        for (var z = 0; z < pz; z++)
+        for (var y = 0; y < py; y++)
+        for (var x = 0; x < px; x++) {
+            var i = (z * py + y) * px + x;
+            var p = viz.Min + new Vector3(
+                (x + 0.5f) / px * viz.Size.X, (y + 0.5f) / py * viz.Size.Y, (z + 0.5f) / pz * viz.Size.Z);
+            float reach = arm;
+            bool isOccupied = viz.Captured is null || i >= viz.Captured.Length || viz.Captured[i];
+            if (isOccupied) { gizmos.Color = new Vector3(0.2f, 1f, 0.3f); occupied++; }
+            else { gizmos.Color = new Vector3(0.85f, 0.15f, 0.12f); reach = arm * 0.5f; }
+            gizmos.DrawLine(p - Vector3.UnitX * reach, p + Vector3.UnitX * reach);
+            gizmos.DrawLine(p - Vector3.UnitY * reach, p + Vector3.UnitY * reach);
+            gizmos.DrawLine(p - Vector3.UnitZ * reach, p + Vector3.UnitZ * reach);
+        }
+        DebugOccupiedCount = occupied;
+        DebugTotalCount = px * py * pz;
+    }
+    public static int DebugOccupiedCount, DebugTotalCount;
 
     // ---- Baked-data persistence (Library/ProbeVolumes/<CacheId>.bpv) ----
     // Layout: magic 'BPV1' | i32 px,py,pz | center xyz | size xyz | 4 SH channels of
