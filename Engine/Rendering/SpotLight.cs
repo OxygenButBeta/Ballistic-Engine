@@ -38,6 +38,11 @@ public class SpotLight : Behaviour {
     [Range(0f, 100f)]
     public float Range { get; set; } = 15f;
 
+    [Tooltip("Physical radius of the emitter (world units). >0 gives a soft AREA-light specular " +
+             "highlight with real angular size (Karis representative point). 0 = delta point (default).")]
+    [Range(0f, 5f)]
+    public float SourceRadius { get; set; }
+
     // Cone angles in degrees; full brightness inside Inner, fades to zero at Outer.
     [Header("Cone")]
     [Range(0f, 90f)]

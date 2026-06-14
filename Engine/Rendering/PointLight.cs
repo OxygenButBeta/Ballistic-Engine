@@ -36,6 +36,12 @@ public class PointLight : Behaviour {
     [Range(0f, 100f)]
     public float Range { get; set; } = 10f;
 
+    [Tooltip("Physical radius of the emitter sphere (world units). >0 gives a soft AREA-light " +
+             "specular highlight with real angular size instead of a pinpoint (Karis representative " +
+             "point). 0 = a classic delta point light (default, unchanged).")]
+    [Range(0f, 5f)]
+    public float SourceRadius { get; set; }
+
     // Shadowed point lights render the scene into 6 cube faces of the punctual shadow
     // array; the renderer shadows the first few CastShadows lights (slots are limited).
     [FoldoutGroup("Shadows", defaultOpen: false)]

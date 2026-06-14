@@ -1445,7 +1445,7 @@ public class GLHDRenderer : HDRenderer {
                     PosRange = new Vector4(position, range),
                     Color = new Vector4(point.PhysicalColor * PostFX.ExposureMultiplier, 0f), // type 0 = point
                     DirCosOuter = Vector4.Zero,
-                    Extra = new Vector4(0f, slot, 0f, 0f),
+                    Extra = new Vector4(0f, slot, MathF.Max(point.SourceRadius, 0f), 0f), // z = area-light radius
                 });
             }
 
@@ -1492,7 +1492,7 @@ public class GLHDRenderer : HDRenderer {
                     PosRange = new Vector4(position, range),
                     Color = new Vector4(spot.PhysicalColor * PostFX.ExposureMultiplier, 1f), // type 1 = spot
                     DirCosOuter = new Vector4(direction, cosOuter),
-                    Extra = new Vector4(cosInner, slot, 0f, 0f),
+                    Extra = new Vector4(cosInner, slot, MathF.Max(spot.SourceRadius, 0f), 0f), // z = area radius
                 });
             }
 

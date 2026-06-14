@@ -194,6 +194,49 @@ void ShadeLight(vec3 N, vec3 V, vec3 L, vec3 radiance, vec3 albedo, float metall
     specularAcc += specular * radiance * NdotL;
 }
 
+// AREA (sphere) light shading — Karis representative point. A punctual light with a physical
+// SourceRadius is a small sphere, not a delta point: its specular highlight should have real
+// angular SIZE (a soft disc), not a pinpoint. Find the point on the light sphere closest to the
+// reflection ray and shade from there, with the Karis energy normalization so the brighter-but-
+// -wider highlight conserves energy. sourceRadius 0 -> degenerates EXACTLY to ShadeLight (the
+// representative point collapses to the light centre, the normalization -> 1), so the default
+// (radius 0) is byte-identical. `unforced` toLight = lightPos - fragPos (NOT normalized), dist.
+void ShadeLightArea(vec3 N, vec3 V, vec3 Lc, float dist, float sourceRadius, vec3 radiance,
+                    vec3 albedo, float metallic, float roughness, vec3 F0,
+                    inout vec3 diffuseAcc, inout vec3 specularAcc) {
+    float NdotL = max(dot(N, Lc), 0.0);
+    if (NdotL <= 0.0)
+        return;
+
+    // Diffuse uses the light-centre direction (area diffuse is ~the same as point diffuse here).
+    vec3 H0 = normalize(V + Lc);
+    vec3 F = FresnelSchlick(max(dot(H0, V), 0.0), F0);
+    vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
+    diffuseAcc += kD * albedo / PI * radiance * NdotL;
+
+    // Specular: representative point on the sphere of angular radius alpha = sourceRadius/dist.
+    vec3 R = reflect(-V, N);
+    vec3 toCentre = Lc;                                  // already normalized centre direction
+    vec3 centreToRay = dot(toCentre, R) * R - toCentre;  // perpendicular from centre to the ray
+    float radFrac = clamp(sourceRadius / max(dist, 1e-3), 0.0, 1.0);
+    vec3 Ls = normalize(toCentre + centreToRay * clamp(radFrac / max(length(centreToRay), 1e-4), 0.0, 1.0));
+
+    // Karis energy normalization: a wider highlight must not also be brighter. Widen the effective
+    // roughness by the light's angular size and rescale by (a/a')^2.
+    float a = max(roughness * roughness, 1e-3);
+    float aPrime = clamp(a + radFrac * 0.5, 0.0, 1.0);
+    float sphereNorm = (a / aPrime); sphereNorm *= sphereNorm;
+
+    float NdotLs = max(dot(N, Ls), 0.0);
+    vec3 H = normalize(V + Ls);
+    float NDF = DistributionGGX(N, H, roughness);
+    float Gs = GeometrySmith(N, V, Ls, roughness);
+    vec3 Fs = FresnelSchlick(max(dot(H, V), 0.0), F0);
+    float NdotV = max(dot(N, V), 0.0);
+    vec3 specular = (NDF * Gs * Fs) / max(4.0 * NdotV * NdotLs, EPS) * sphereNorm;
+    specularAcc += specular * radiance * NdotLs;
+}
+
 // Sun shading: diffuse from the disk-center direction, specular from the representative
 // point on the sun cone closest to the reflection ray (Karis), so the highlight has the
 // sun's physical angular size instead of being a dimensionless delta spike.
@@ -593,13 +636,14 @@ void main()
             float atten = DistanceAttenuation(dist, L.posRange.w);
             int shadowSlot = int(L.extra.y);
 
+            float srcRadius = L.extra.z;  // area-light emitter radius (0 = delta point)
             if (L.lcolor.w < 0.5) {
                 // POINT
                 float vis = shadowSlot >= 0
                     ? PointShadow(shadowSlot, L.posRange.xyz, clamp(dot(N, Ld), 0.0, 1.0)) : 1.0;
                 if (vis <= 0.001) continue;
-                ShadeLight(N, V, Ld, L.lcolor.rgb * atten * vis, albedo, metallic, roughness, F0,
-                           diffuseLight, specularLight);
+                ShadeLightArea(N, V, Ld, dist, srcRadius, L.lcolor.rgb * atten * vis, albedo, metallic,
+                               roughness, F0, diffuseLight, specularLight);
             } else {
                 // SPOT
                 float cosAngle = dot(-Ld, normalize(L.dirCosOuter.xyz));
@@ -609,8 +653,8 @@ void main()
                 float vis = shadowSlot >= 0
                     ? SpotShadow(shadowSlot, clamp(dot(N, Ld), 0.0, 1.0)) : 1.0;
                 if (vis <= 0.001) continue;
-                ShadeLight(N, V, Ld, L.lcolor.rgb * atten * cone * cone * vis, albedo, metallic,
-                           roughness, F0, diffuseLight, specularLight);
+                ShadeLightArea(N, V, Ld, dist, srcRadius, L.lcolor.rgb * atten * cone * cone * vis,
+                               albedo, metallic, roughness, F0, diffuseLight, specularLight);
             }
         }
     } else {
