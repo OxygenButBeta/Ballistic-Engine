@@ -119,6 +119,20 @@ public sealed class GLSdfGiPass : IDisposable {
     // "radiance too dim" (needs surface cache). Implies debugView.
     bool diagMode;
 
+    // LUMEN OCTAHEDRAL SCREEN PROBES (Phase 4b). The march runs in ProbeOctMode at the probe-atlas
+    // resolution (ProbeGrid * OctRes), tracing one hemisphere direction per atlas texel into probeAtlas;
+    // the integrate shader then BRDF-weights each probe's octmap onto the half-res output. ~ProbeStep^2
+    // fewer traces + the integrate/temporal kill the per-pixel gather noise. Default on with the GDF.
+    const int OctRes = 8;       // octahedral tile edge per probe
+    const int ProbeStep = 8;    // half-res pixels per probe edge (=> ~16 full-res px / probe)
+    static readonly bool UseProbes =
+        Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_PROBES") != "0"; // default ON
+    readonly GLRenderTexture probeAtlas = new();  // RGBA16F octahedral radiance atlas
+    StandardShader probeIntegrateShader;
+    int probeIntFbo;
+    // ProbeOct uniform locations on the march program.
+    int locProbeOctMode, locProbeAtlasSize, locOctRes, locProbeStep;
+
     // Cached uniform locations (looked up once after the link).
     int locInvProjection, locInvView, locInstanceCount, locHalfSize, locSkyExposure, locFrameIndex, locDiagMode;
     int locCascadeBias, locCascadeCount, locSunDir, locSunColor, locHitAlbedo;
@@ -226,6 +240,9 @@ public sealed class GLSdfGiPass : IDisposable {
             EmbeddedShaderSource.Read("SSGI_Denoise.glsl"));
 
         CacheUniformLocations();
+        probeIntegrateShader = GraphicAPI.CreateStandardShader(
+            EmbeddedShaderSource.Read("FSQ_Vert.glsl"),
+            EmbeddedShaderSource.Read("LumenProbeIntegrate_Frag.glsl"));
         if (UseGlobalSdf)
             // 96^3 over a 12m base cascade = 0.125m near-field cells (Lumen-class fine; 64^3/16m was
             // 0.25m and blended adjacent walls into grey on small scenes). Outer cascades (x2 each)
@@ -257,6 +274,10 @@ public sealed class GLSdfGiPass : IDisposable {
             locCascadeMatrices[i] = GL.GetUniformLocation(program, CascadeMatrixNames[i]);
 
         // Global distance field (Phase 1): per-cascade sampler + placement uniforms (array elements).
+        locProbeOctMode = GL.GetUniformLocation(program, "ProbeOctMode");
+        locProbeAtlasSize = GL.GetUniformLocation(program, "ProbeAtlasSize");
+        locOctRes = GL.GetUniformLocation(program, "OctRes");
+        locProbeStep = GL.GetUniformLocation(program, "ProbeStep");
         locUseGlobalSdf = GL.GetUniformLocation(program, "UseGlobalSdf");
         locUseGlobalRadiance = GL.GetUniformLocation(program, "UseGlobalRadiance");
         locGlobalSdfRes = GL.GetUniformLocation(program, "GlobalSdfRes");
@@ -557,9 +578,49 @@ public sealed class GLSdfGiPass : IDisposable {
         GL.Uniform1(locGridRes, scene.GridResolution);
         frameIndex++;
 
-        int gx = (halfW + 7) / 8;
-        int gy = (halfH + 7) / 8;
-        GL.DispatchCompute(gx, gy, 1);
+        // LUMEN OCTAHEDRAL SCREEN PROBES (Phase 4b): trace at the coarse probe atlas, then BRDF-integrate
+        // to the half-res output. Only the GDF path (the per-mesh path keeps the per-pixel gather).
+        bool probes = gdf && UseProbes && !diagMode;
+        int probeGridX = (halfW + ProbeStep - 1) / ProbeStep;
+        int probeGridY = (halfH + ProbeStep - 1) / ProbeStep;
+        if (probes) {
+            int atlasW = probeGridX * OctRes, atlasH = probeGridY * OctRes;
+            probeAtlas.Ensure(atlasW, atlasH);
+            // 1. Probe trace: dispatch over the atlas, OutGi = probe atlas, ProbeOctMode=1.
+            GL.BindImageTexture(OutGiImageUnit, probeAtlas.Texture, 0, false, 0,
+                TextureAccess.WriteOnly, SizedInternalFormat.Rgba16f);
+            GL.Uniform1(locProbeOctMode, 1);
+            GL.Uniform2(locProbeAtlasSize, atlasW, atlasH);
+            GL.Uniform1(locOctRes, OctRes);
+            GL.Uniform1(locProbeStep, ProbeStep);
+            GL.DispatchCompute((atlasW + 7) / 8, (atlasH + 7) / 8, 1);
+            GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
+
+            // 2. Integrate: per half-res pixel, BRDF-weighted sum of the surrounding probes' octmaps -> output.
+            GL.Disable(EnableCap.DepthTest); GL.Disable(EnableCap.CullFace); GL.Disable(EnableCap.Blend);
+            output.BindAsTarget();
+            probeIntegrateShader.Activate();
+            BindCombineSampler(0, probeAtlas.Texture, "probeAtlas");
+            BindCombineSampler(1, depthTex, "depthTexture");
+            BindCombineSampler(2, normalTex, "normalTexture");
+            Matrix4 invP = Matrix4.Invert(projection), invV = Matrix4.Invert(view);
+            probeIntegrateShader.SetMatrix4("InvProjection", ref invP);
+            probeIntegrateShader.SetMatrix4("InvView", ref invV);
+            probeIntegrateShader.SetInt("ProbeGridX", probeGridX);
+            probeIntegrateShader.SetInt("ProbeGridY", probeGridY);
+            probeIntegrateShader.SetInt("HalfDimsX", halfW);
+            probeIntegrateShader.SetInt("HalfDimsY", halfH);
+            probeIntegrateShader.SetInt("ProbeStep", ProbeStep);
+            probeIntegrateShader.SetInt("OctRes", OctRes);
+            GLBufferUtilities.DrawFullscreenQuad();
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+        }
+        else {
+            GL.Uniform1(locProbeOctMode, 0);
+            int gx = (halfW + 7) / 8;
+            int gy = (halfH + 7) / 8;
+            GL.DispatchCompute(gx, gy, 1);
+        }
 
         // The temporal pass reads OutGi as a sampled texture and the SSBOs are done — barrier on
         // image access + texture fetch + storage so the writes are visible before it samples them.
@@ -812,6 +873,7 @@ public sealed class GLSdfGiPass : IDisposable {
         scene?.Dispose();
         globalSdf?.Dispose();
         output.Dispose();
+        probeAtlas.Dispose();
         foreach (GLRenderTexture t in historyGi) t.Dispose();
         foreach (GLRenderTexture t in historyDepth) t.Dispose();
         foreach (GLRenderTexture t in denoisePingPong) t.Dispose();
