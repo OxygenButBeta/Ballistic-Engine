@@ -236,6 +236,8 @@ public class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWin
         sb.Append($"  \"renderersVisible\": {rs.RenderersVisible},\n");
         sb.Append($"  \"renderersCulled\": {rs.RenderersCulled},\n");
         sb.Append($"  \"submeshesCulled\": {rs.SubMeshesCulled},\n");
+        sb.Append($"  \"punctualLights\": {rs.PunctualLights},\n");
+        sb.Append($"  \"shadowedLights\": {rs.ShadowedLights},\n");
         sb.Append(string.Create(System.Globalization.CultureInfo.InvariantCulture,
             $"  \"gpuFrameMs\": {rs.GpuFrameMs:0.000},\n"));
         sb.Append("  \"gpuPasses\": {\n");

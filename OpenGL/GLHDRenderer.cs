@@ -1517,6 +1517,11 @@ public class GLHDRenderer : HDRenderer {
         var newStamp = stamp.ToHashCode();
         punctualShadowsDirty = newStamp != punctualShadowStamp;
         punctualShadowStamp = newStamp;
+
+        // Publish light counts for the stats sidecar / editor overlay (AI-measurable): total active
+        // punctual lights this frame (uncapped under clustered Forward+) + how many got a shadow map.
+        stats.PunctualLights = clusterLightScratch.Count;
+        stats.ShadowedLights = shadowedPointCount + shadowedSpotCount;
     }
 
     // Pushes the gathered punctual lights + their shadow data onto an arbitrary shader, using

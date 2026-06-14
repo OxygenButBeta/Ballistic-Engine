@@ -23,6 +23,12 @@ public sealed class RenderStats {
     // single-mesh scene win — off-screen parts of one renderer no longer issue draws).
     public int SubMeshesCulled;
 
+    // Punctual lighting (clustered Forward+): total active point+spot lights gathered this frame
+    // (uncapped — the clustered path loops only each cluster's subset) and how many got a shadow map
+    // (the capped shared resource). Lets an agent measure the Forward+ benefit / shadow budget.
+    public int PunctualLights;
+    public int ShadowedLights;
+
     // GPU time per pass for the last completed frame (milliseconds). Replaced wholesale when
     // a frame's queries drain; GpuFrameMs spans first-to-last pass including gaps between them.
     public readonly List<(string Name, double Ms)> GpuPasses = new();
@@ -37,5 +43,7 @@ public sealed class RenderStats {
         RenderersVisible = 0;
         RenderersCulled = 0;
         SubMeshesCulled = 0;
+        PunctualLights = 0;
+        ShadowedLights = 0;
     }
 }
