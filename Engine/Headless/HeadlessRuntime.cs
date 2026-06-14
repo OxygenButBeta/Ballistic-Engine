@@ -86,6 +86,26 @@ public sealed class HeadlessRuntime : IBallisticEngineRuntime {
         public override GPUBuffer<Vector2> CreateVertexBuffer2(RenderContext renderContext) => new NullBuffer<Vector2>(renderContext);
         public override Texture2D CreateTexture2D(in TextureData data, TextureType type) => new NullTexture2D();
         public override Texture3D CreateCubemap(TextureData[] faces) => new NullTexture3D();
+        public override StandardShader CreateStandardShader(string vertexCode, string fragmentCode) =>
+            new NullStandardShader(vertexCode, fragmentCode);
+    }
+
+    // No-op shader for headless (scripts+physics, no GL). The headless runtime never renders, so this
+    // just satisfies the RenderAsset contract; every member is a no-op.
+    sealed class NullStandardShader(string vertexCode, string fragmentCode)
+        : StandardShader(vertexCode, fragmentCode) {
+        public override int UID => 0;
+        protected override void Compile(string vertexCode, string fragmentCode) { }
+        protected override void OnDispose() { }
+        public override void SetBool(string name, bool value) { }
+        public override void SetInt(string name, int value) { }
+        public override void SetFloat(string name, float value) { }
+        public override void SetFloat2(string name, Vector2 value) { }
+        public override void SetFloat3(string name, Vector3 value) { }
+        public override void SetFloat4(string name, Vector4 value) { }
+        public override void SetMatrix4(string name, ref Matrix4 value, bool transpose = false) { }
+        protected override void ActivateShader() { }
+        protected override void DeactivateShader() { }
     }
 
     sealed class NullRenderContext : RenderContext {

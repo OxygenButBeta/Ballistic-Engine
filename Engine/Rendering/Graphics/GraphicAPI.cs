@@ -10,7 +10,9 @@ public static class GraphicAPI
                 out Shader cachedShader))
             return cachedShader as StandardShader;
 
-        return new GLStandardShader(vertexCode, fragmentCode);
+        // The active backend builds the concrete shader (GL -> GLSL program, DX12 -> HLSL) — no
+        // hardcoded GL type here, so GraphicAPI is backend-agnostic.
+        return RenderAsset.Current.CreateStandardShader(vertexCode, fragmentCode);
     }
     public static HDRenderer Renderer => RenderAsset.Current.Renderer;
 

@@ -25,4 +25,9 @@ public abstract class RenderAsset
     public abstract Texture2D CreateTexture2D(in TextureData data, TextureType type);
     public abstract Texture3D CreateCubemap(TextureData[] faces);
     public abstract GPUBuffer<Vector2> CreateVertexBuffer2(RenderContext renderContext);
+
+    // Backend-created shader program. The factory lives here (not hardcoded in GraphicAPI) so the
+    // active backend decides the concrete type — GL builds a GLSL program, a DX12 backend would build
+    // an HLSL one — exactly like the buffer/texture factories above.
+    public abstract StandardShader CreateStandardShader(string vertexCode, string fragmentCode);
 }

@@ -63,4 +63,7 @@ public sealed class OpenGLRenderAsset : RenderAsset {
     public override GPUBuffer<Vector2> CreateVertexBuffer2(RenderContext renderContext) {
         return new GL2DBufferBase(renderContext);
     }
+
+    public override StandardShader CreateStandardShader(string vertexCode, string fragmentCode) =>
+        new GLStandardShader(vertexCode, fragmentCode);
 }
