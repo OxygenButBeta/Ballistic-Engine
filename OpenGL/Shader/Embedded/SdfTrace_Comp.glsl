@@ -112,6 +112,12 @@ uniform mat4 ViewProj;       // world -> clip (this frame) — projects an SDF h
                              // screen-space radiance read
 uniform uint InstanceCount;  // number of valid SsdfInstance records
 uniform ivec2 HalfSize;      // output (half-res) dimensions in pixels
+// LUMEN octahedral screen probes (Phase 4b): when ProbeOctMode=1 the dispatch covers the probe ATLAS
+// (ProbeAtlasSize = ProbeGrid*OctRes) and OutGi IS that atlas; each texel = one probe + one oct dir.
+uniform int   ProbeOctMode;   // 0 = per-pixel gather (the original), 1 = octahedral probe trace
+uniform ivec2 ProbeAtlasSize; // probe-atlas dimensions (texels) when ProbeOctMode=1
+uniform int   OctRes;         // octahedral tile edge per probe (e.g. 8)
+uniform int   ProbeStep;      // half-res pixels per probe edge
 uniform float SkyExposure;   // irradiance luminance scale x camera pre-exposure
 uniform int  FrameIndex;     // rotates the ray hash each frame (temporal resolves the noise)
 
@@ -481,7 +487,104 @@ bool ScreenTrace(vec3 originWorld, vec3 dirWorld, out vec3 radiance, out float o
     return false; // no near-field screen hit in range -> fall to the SDF march
 }
 
+// SINGLE-RAY TRACE (shared by the per-pixel gather AND the octahedral screen probes): screen trace
+// first (near field, real lit colour), then the SDF/GDF march (off-screen far field), returning the
+// incoming radiance along `dir` from `origin`. `hit` reports whether the ray found a surface (vs sky).
+// This is the one place the trace logic lives so the per-pixel path and the probe octmap share it.
+vec3 TraceRay(vec3 origin, vec3 dir, out bool hit) {
+    hit = false;
+    // Screen trace first (GDF path) — sharp near-field from the lit scene colour.
+    if (UseGlobalSdf == 1) {
+        vec3 stRad; float stDist;
+        if (ScreenTrace(origin, dir, stRad, stDist)) { hit = true; return stRad; }
+    }
+    // Sphere-trace the world SDF / GDF for the off-screen far field.
+    vec3 p = origin;
+    float traveled = 0.0;
+    vec3 hitPoint = p; uint hitSlot = 0u; vec3 hitLocal = vec3(0.0);
+    for (int s = 0; s < MAX_STEPS; ++s) {
+        uint nearSlot; vec3 nearLocal; bool anyInside;
+        float dist = SanitizeF(SceneSdf(p, nearSlot, nearLocal, anyInside));
+        if (anyInside && dist < HIT_EPS && traveled >= SELF_SKIP) {
+            hit = true; hitPoint = p; hitSlot = nearSlot; hitLocal = nearLocal; break;
+        }
+        float advance = anyInside ? max(dist, MIN_STEP) : EMPTY_STEP;
+        p += dir * advance; traveled += advance;
+        if (traveled >= MAX_DIST) break;
+    }
+    if (!hit)
+        return vec3(0.0); // sky miss: zero (the IBL ambient already lit the composited scene)
+    // Radiance at the hit: GDF -> global radiance clipmap (or HitDirect); per-mesh -> radiance atlas.
+    vec4 cached;
+    if (UseGlobalSdf == 1)
+        cached = UseGlobalRadiance == 1 ? GlobalRadianceAt(hitPoint) : vec4(0.0);
+    else
+        cached = SampleRadiance(hitSlot, hitLocal);
+    if (cached.a > 0.01)
+        return Sanitize(cached.rgb);
+    vec3 hitN = SceneGradient(hitPoint);
+    if (dot(hitN, hitN) < 1e-5) hitN = -dir;
+    return Sanitize(HitDirect(hitPoint, hitN));
+}
+
+// ---- Octahedral hemisphere encode/decode (equal-area, Cigolle et al.) restricted to the upper
+// hemisphere in a probe's tangent frame. octUV in [0,1]^2 <-> a unit direction over the hemisphere. ----
+vec3 OctDecodeHemi(vec2 f) {
+    // Map [0,1]^2 -> [-1,1]^2, then standard oct-decode, then fold to the +Z hemisphere.
+    f = f * 2.0 - 1.0;
+    vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float t = max(-n.z, 0.0);
+    n.x += n.x >= 0.0 ? -t : t;
+    n.y += n.y >= 0.0 ? -t : t;
+    n.z = abs(n.z); // upper hemisphere
+    return normalize(n);
+}
+
+// LUMEN OCTAHEDRAL SCREEN-PROBE trace. Dispatched over the probe ATLAS (ProbeGrid*OCT texels): each
+// texel is one probe + one octahedral direction. Reconstruct the probe's surface (its representative
+// half-res pixel), decode the hemisphere direction, trace ONE ray, write the incoming radiance to the
+// atlas texel. The per-pixel integrate pass later sums each probe's octmap in the BRDF lobe.
+void ProbeOctMain() {
+    ivec2 atlasPx = ivec2(gl_GlobalInvocationID.xy);
+    if (atlasPx.x >= ProbeAtlasSize.x || atlasPx.y >= ProbeAtlasSize.y)
+        return;
+    ivec2 probe = atlasPx / OctRes;          // which screen probe
+    ivec2 octTexel = atlasPx - probe * OctRes; // texel within the probe's OCT x OCT tile
+
+    // The probe's representative HALF-RES pixel = block centre.
+    ivec2 hp = probe * ProbeStep + ProbeStep / 2;
+    hp = min(hp, HalfSize - ivec2(1));
+    vec2 uv = (vec2(hp) + 0.5) / vec2(HalfSize);
+    float depth = texture(DepthTex, uv).r;
+    vec3 worldN = texture(NormalTex, uv).rgb * 2.0 - 1.0;
+    if (depth >= 1.0 || dot(worldN, worldN) < 0.1) {
+        imageStore(OutGi, atlasPx, vec4(0.0)); // sky/invalid probe texel
+        return;
+    }
+    worldN = normalize(worldN);
+    vec3 viewP = ViewPosFromDepth(uv, depth);
+    vec3 worldP = (InvView * vec4(viewP, 1.0)).xyz;
+    vec3 up = abs(worldN.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T = normalize(cross(up, worldN));
+    vec3 B = cross(worldN, T);
+
+    // Octahedral direction for THIS texel (jitter per frame within the texel for temporal coverage).
+    vec2 jitter = vec2(Hash(vec2(atlasPx) + float(FrameIndex) * 1.61),
+                       Hash(vec2(atlasPx) * 1.7 + float(FrameIndex) * 0.91)) - 0.5;
+    vec2 octUV = (vec2(octTexel) + 0.5 + jitter * 0.9) / float(OctRes);
+    vec3 localDir = OctDecodeHemi(octUV);
+    vec3 dir = normalize(T * localDir.x + B * localDir.y + worldN * localDir.z);
+
+    vec3 origin = worldP + worldN * SELF_SKIP;
+    bool hit;
+    vec3 rad = TraceRay(origin, dir, hit);
+    // Store radiance + 1 (this texel is valid). The integrate pass weights by cos(theta) itself.
+    imageStore(OutGi, atlasPx, vec4(Sanitize(rad), 1.0));
+}
+
 void main() {
+    // OCTAHEDRAL SCREEN-PROBE mode: trace one ray per (probe, oct texel) into the probe atlas.
+    if (ProbeOctMode == 1) { ProbeOctMain(); return; }
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
     if (px.x >= HalfSize.x || px.y >= HalfSize.y)
         return;
@@ -541,91 +644,12 @@ void main() {
         vec3 localDir = vec3(cos(phi) * sinT, sin(phi) * sinT, cosT);
         vec3 dir = normalize(T * localDir.x + B * localDir.y + worldN * localDir.z);
 
-        // LUMEN SCREEN TRACE FIRST (Phase 4a, GDF path only — the per-mesh path keeps its own behaviour):
-        // the near field is on screen, so a screen-space depth march gives sharp contact GI from the
-        // REAL lit colour. On a screen hit, take that radiance and skip the SDF march for this ray. On a
-        // miss, the SDF march below handles the off-screen / far field. (Gated so the per-mesh atlas
-        // path, which has its own screen-radiance read, is unchanged.)
-        if (UseGlobalSdf == 1) {
-            vec3 stRad; float stDist;
-            if (ScreenTrace(origin, dir, stRad, stDist)) {
-                gathered += stRad;
-                hitCount++;
-                continue; // ray resolved on screen — next ray
-            }
-        }
-
-        // Sphere-trace the world-space SDF.
-        vec3 p = origin;
-        float traveled = 0.0;
-        bool hit = false;
-        vec3 hitPoint = p;
-        uint hitSlot = 0u;       // which instance's brick we hit (for the radiance-cache read)
-        vec3 hitLocal = vec3(0.0);
-
-        for (int s = 0; s < MAX_STEPS; ++s) {
-            uint nearSlot; vec3 nearLocal; bool anyInside;
-            float dist = SceneSdf(p, nearSlot, nearLocal, anyInside);
-            dist = SanitizeF(dist);
-
-            // Hit when we're at (or just inside) a surface AND we were actually inside some
-            // instance's volume (anyInside guards against the 1e9 "no slot covers this point").
-            // The traveled >= SELF_SKIP gate ignores the surface's OWN brick: at coarse 24^3 the
-            // origin starts inside its own SDF shell, so without this a grazing wall self-hits and
-            // produces the salt-and-pepper.
-            if (anyInside && dist < HIT_EPS && traveled >= SELF_SKIP) {
-                hit = true;
-                hitPoint = p;
-                hitSlot = nearSlot;
-                hitLocal = nearLocal;
-                break;
-            }
-
-            // Advance. INSIDE a brick: true sphere-trace step (max(dist, MIN_STEP)). In EMPTY space
-            // (no brick covers p, dist == 1e9) we MUST NOT teleport to infinity — march a coarse
-            // fixed step so the ray can cross the gap and enter a DIFFERENT mesh's brick (the whole
-            // point of off-screen cross-mesh bounce in sparse multi-mesh scenes).
-            float advance = anyInside ? max(dist, MIN_STEP) : EMPTY_STEP;
-            p += dir * advance;
-            traveled += advance;
-            if (traveled >= MAX_DIST)
-                break;
-        }
-
-        vec3 radiance = vec3(0.0);
-        if (hit) {
+        // Trace this ray (shared with the octahedral probe path): screen trace -> SDF/GDF march ->
+        // radiance at the hit, or zero on a sky miss (the IBL ambient already lit the composited scene).
+        bool hit;
+        vec3 radiance = TraceRay(origin, dir, hit);
+        if (hit)
             hitCount++;
-            // Radiance at the hit. GDF path: read the GLOBAL RADIANCE clipmap (Phase 2 voxel lighting —
-            // stable colored multi-bounce) when it's populated; else the direct sun+sky estimate.
-            // Per-mesh path: the per-mesh radiance atlas.
-            vec4 cached;
-            if (UseGlobalSdf == 1)
-                cached = UseGlobalRadiance == 1 ? GlobalRadianceAt(hitPoint) : vec4(0.0);
-            else
-                cached = SampleRadiance(hitSlot, hitLocal);
-            if (cached.a > 0.01) {
-                radiance = Sanitize(cached.rgb);
-            } else {
-                // Cache miss (voxel not yet filled / between bricks / geometry over the bake cap):
-                // use the SMOOTH neutral direct estimate (sun cosine + sky), NOT the screen-space
-                // HitRadiance read. The screen read flickers per-pixel on grazing/occluded hits (its
-                // sub-pixel reproject samples a neighbour depth that randomly accepts/rejects) — that
-                // was the black salt-and-pepper in the dark vaults where the cache is sparse. HitDirect
-                // has no screen sampling, so it's spatially coherent: a clean low-frequency fill that
-                // the temporal+a-trous resolve cleanly while the cache warms up / over uncovered bits.
-                vec3 hitN = SceneGradient(hitPoint);
-                if (dot(hitN, hitN) < 1e-5)
-                    hitN = -dir;
-                radiance = Sanitize(HitDirect(hitPoint, hitN));
-            }
-        }
-        // MISS = the ray escaped to open sky. Contribute ZERO: the sky's contribution to this
-        // surface is ALREADY in the baked IBL ambient that lit the scene color we composite onto.
-        // Re-adding sky irradiance here DOUBLE-COUNTS it — that washed the bright exterior milky
-        // (mean +21, contrast lost). This GI term is purely the OFF-SCREEN BOUNCE the IBL/SSGI
-        // miss: only real surface HITS contribute. Open scenes (mostly-miss) correctly get ~0 GI;
-        // enclosed scenes (mostly-hit) get the full colored bounce.
-
         gathered += radiance;
     }
 
