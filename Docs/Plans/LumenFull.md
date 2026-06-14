@@ -50,6 +50,37 @@ probes), proper H (probe interpolation + denoise)**.
   for far-field radiance + as the multi-bounce feedback into the surface cache (bounce N from bounce N-1).
 - VERIFY: multi-bounce visibly brightens enclosed interiors; far geometry contributes.
 
+### Phase 4b DETAILED DESIGN — Octahedral screen-space radiance probes (the real Lumen final gather)
+
+NOT irradiance probes (one value/probe) — DIRECTIONAL OCTAHEDRAL radiance probes, so the full-res
+integration is BRDF-weighted (correct diffuse + the basis for Lumen reflections). Concretely:
+
+- PROBE ATLAS: a 2D RGBA16F texture; each screen probe owns an OCT x OCT tile (OCT=8). Probe grid =
+  ceil(halfW/STEP) x ceil(halfH/STEP), STEP=8 half-res px/probe. Atlas = (gridX*OCT) x (gridY*OCT).
+- PROBE TRACE (extend SdfTrace_Comp with a ProbeOctMode): dispatch over the ATLAS texels. Each texel
+  -> (probe = texel/OCT, octUV = fract within tile). Reconstruct the surface at the probe's
+  representative pixel (probe*STEP + STEP/2, snapped to the nearest VALID G-buffer pixel — Lumen jitters
+  probe placement per frame + reuses the trace functions). Decode octUV -> a world direction over the
+  HEMISPHERE around the probe normal (oct-encode the hemisphere, not the full sphere — diffuse only
+  needs the hemisphere). Trace THAT ONE direction (the existing ScreenTrace->GDF->voxel-light path),
+  write incoming radiance to the atlas texel. Importance sampling: bias the oct directions toward
+  last-frame's bright texels (a later refinement; uniform-hemisphere first).
+- TEMPORAL on the probe atlas: reproject probes by their world pos, EMA-accumulate the octahedral
+  radiance (disocclusion reject). This is where probe radiance converges (few rays/frame, stable octmap).
+- INTEGRATE (new frag -> half-res output): per half-res pixel, find the 2x2 (bilinear) surrounding
+  probes; for each, INTEGRATE its octahedral map against the surface's cosine lobe (sum oct texels *
+  max(0,dot(N,dir)) * solidAngle), bilateral-weight across probes by depth+normal; that's the diffuse
+  GI. (Reflections: sample the octmap in the mirror lobe — Phase: Lumen reflections.) Then the existing
+  TAA + a-trous finish it.
+- Octahedral encode/decode: the standard equal-area oct map (Cigolle et al.) restricted to the upper
+  hemisphere in the probe's tangent frame.
+- Gate BALLISTIC_LUMEN_PROBES (default on once proven) — it REPLACES the per-half-res-pixel gather.
+- VERIFY: CornellBox noise drops dramatically + color bleed appears (the probe octmap + integrate is
+  the noise fix); SunTemple/BistroInterior stay clean; trace count ~STEP^2 lower (perf).
+- RISK: this is a large shared-shader restructure of SdfTrace_Comp.main + 1 new integrate shader + the
+  probe atlas/temporal in GLSdfGiPass. Do it as ONE focused push; keep the per-pixel path as fallback
+  until verified. The working GDF+voxel+albedo+screen-trace state (committed) must not regress.
+
 ### Phase 4 — Screen tracing + screen-space radiance probes
 - HZB screen trace first (near-field detail, cheap) before falling to SDF traces.
 - Replace per-pixel gather with a sparse **screen radiance probe** grid (~16×16px): each probe traces
