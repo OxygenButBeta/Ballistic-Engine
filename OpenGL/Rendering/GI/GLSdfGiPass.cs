@@ -124,11 +124,12 @@ public sealed class GLSdfGiPass : IDisposable {
     int locCascadeBias, locCascadeCount, locSunDir, locSunColor, locHitAlbedo;
     int locGridMin, locGridInvCell, locGridRes, locViewProj;
     readonly int[] locCascadeMatrices = new int[4];
-    // Global distance field (Phase 1) uniform locations.
-    int locUseGlobalSdf, locGlobalSdfRes;
+    // Global distance field (Phase 1) + radiance clipmap (Phase 2) uniform locations.
+    int locUseGlobalSdf, locGlobalSdfRes, locUseGlobalRadiance;
     readonly int[] locGlobalSdf = new int[GLGlobalSdf.CascadeCount];
     readonly int[] locGlobalSdfMin = new int[GLGlobalSdf.CascadeCount];
     readonly int[] locGlobalSdfCell = new int[GLGlobalSdf.CascadeCount];
+    readonly int[] locGlobalRadiance = new int[GLGlobalSdf.CascadeCount];
 
     // Half-res RGBA16F gather output (pass-owned — small, consumed same frame; not pooled because
     // we bind it as an image, so a stable id is required). The full-res composite goes to a pooled
@@ -254,11 +255,13 @@ public sealed class GLSdfGiPass : IDisposable {
 
         // Global distance field (Phase 1): per-cascade sampler + placement uniforms (array elements).
         locUseGlobalSdf = GL.GetUniformLocation(program, "UseGlobalSdf");
+        locUseGlobalRadiance = GL.GetUniformLocation(program, "UseGlobalRadiance");
         locGlobalSdfRes = GL.GetUniformLocation(program, "GlobalSdfRes");
         for (var i = 0; i < GLGlobalSdf.CascadeCount; i++) {
             locGlobalSdf[i] = GL.GetUniformLocation(program, $"GlobalSdf[{i}]");
             locGlobalSdfMin[i] = GL.GetUniformLocation(program, $"GlobalSdfMin[{i}]");
             locGlobalSdfCell[i] = GL.GetUniformLocation(program, $"GlobalSdfCell[{i}]");
+            locGlobalRadiance[i] = GL.GetUniformLocation(program, $"GlobalRadiance[{i}]");
         }
 
         // Inject program uniforms.
@@ -492,16 +495,31 @@ public sealed class GLSdfGiPass : IDisposable {
         if (!gdf)
             scene.Bind();
 
-        // GLOBAL DISTANCE FIELD: bind the 4 cascade 3D textures on units 8..11 and set their placement.
+        // GLOBAL DISTANCE FIELD: bind the 4 cascade distance textures (units 8..11) + radiance clipmap
+        // (units 12..15) and set their placement + the voxel-lighting (Phase 2) radiance read.
         const int GdfFirstUnit = 8;
+        const int GdfRadFirstUnit = 12;
         GL.Uniform1(locUseGlobalSdf, gdf ? 1 : 0);
+        GL.Uniform1(locUseGlobalRadiance, 0);
         if (gdf) {
+            // Voxel-lighting inject (one cascade/frame): light the radiance clipmap from the GDF before
+            // the march reads it. Uses the same sun/shadow/sky as the per-mesh inject; mid-grey albedo
+            // (no per-voxel material in v1). Feedback 0.9 = sticky EMA for stability + multi-bounce.
+            globalSdf.InjectRadiance(irradianceCubemap, shadowMapArray, cascadeMatrices, cascadeBias,
+                cascadeCount, sunDirection, sunColor, new Vector3(HitAlbedo), skyExposure, 0.9f);
+            GL.Uniform1(locUseGlobalRadiance, 1);
+
+            GL.UseProgram(program); // InjectRadiance bound its own program — restore the march program
             globalSdf.Bind(GdfFirstUnit);
             for (int c = 0; c < GLGlobalSdf.CascadeCount; c++) {
                 GL.Uniform1(locGlobalSdf[c], GdfFirstUnit + c);
                 Vector3 mn = globalSdf.CascadeMin(c);
                 GL.Uniform3(locGlobalSdfMin[c], mn.X, mn.Y, mn.Z);
                 GL.Uniform1(locGlobalSdfCell[c], globalSdf.CascadeCell(c));
+                // Radiance clipmap (the global surface cache the hit reads).
+                GL.ActiveTexture(TextureUnit.Texture0 + GdfRadFirstUnit + c);
+                GL.BindTexture(TextureTarget.Texture3D, globalSdf.RadianceRead(c));
+                GL.Uniform1(locGlobalRadiance[c], GdfRadFirstUnit + c);
             }
             GL.Uniform1(locGlobalSdfRes, globalSdf.Resolution);
         }

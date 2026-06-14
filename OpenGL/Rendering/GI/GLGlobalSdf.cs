@@ -37,6 +37,19 @@ public sealed class GLGlobalSdf : IDisposable {
     readonly float[] cascadeCell = new float[CascadeCount];     // world cell size (cubic) per cascade
     readonly bool[] cascadeBaked = new bool[CascadeCount];
 
+    // VOXEL LIGHTING (Lumen Phase 2): a RADIANCE clipmap parallel to the distance clipmap — same
+    // cascades, RGBA16F (rgb = lit radiance, a = surface occupancy). Each frame a compute pass lights
+    // every near-surface voxel (sun + shadow + sky + one bounce from last frame), so a GDF hit reads
+    // STABLE, COLORED, multi-bounce radiance here instead of the neutral direct estimate. Ping-pong
+    // (read last frame, write this frame) avoids same-frame feedback — the per-mesh RadianceInject pattern.
+    readonly int[] radianceA = new int[CascadeCount];  // RGBA16F radiance, ping-pong A
+    readonly int[] radianceB = new int[CascadeCount];
+    readonly int[] radianceRead = new int[CascadeCount]; // PER-cascade flag (we light one cascade/frame,
+                                                         // so a global flag would desync the others).
+    public int RadianceRead(int c) => radianceRead[c] == 0 ? radianceA[c] : radianceB[c];
+    public int RadianceWrite(int c) => radianceRead[c] == 0 ? radianceB[c] : radianceA[c];
+    void SwapRadiance(int c) => radianceRead[c] = 1 - radianceRead[c];
+
     public bool Available { get; private set; } // at least cascade 0 has been baked + uploaded once
 
     // Triangle snapshot + bake job state (background).
@@ -45,6 +58,15 @@ public sealed class GLGlobalSdf : IDisposable {
     int bakeCascade = -1;
     int geometryStamp;          // hash of the opaque set's transforms+bounds; re-bake all on change
     bool stampValid;
+
+    // Voxel-lighting inject program (GlobalRadianceInject_Comp) + its cached uniform locations.
+    int injectProgram;
+    int liCascade, liCascadeMin, liCascadeCell, liRes, liSkyExposure, liFeedback;
+    int liCascadeCountSun, liSunDir, liSunColor, liAlbedo, liCascadeBias;
+    readonly int[] liCascadeMatrices = new int[4];
+    readonly int[] liGdfMin = new int[CascadeCount];
+    readonly int[] liGdfCell = new int[CascadeCount];
+    int radianceInjectCursor; // round-robin: light one cascade per frame (amortize the dispatch cost)
 
     public GLGlobalSdf(int resolution = 64, float baseExtent = 16f) {
         Resolution = Math.Clamp(resolution, 16, 256);
@@ -64,9 +86,72 @@ public sealed class GLGlobalSdf : IDisposable {
             // rather than garbage. One float cleared via ClearTexImage.
             float far = BaseExtent * 4f;
             GL.ClearTexImage(textures[c], 0, PixelFormat.Red, PixelType.Float, ref far);
+
+            radianceA[c] = CreateRadianceTexture();
+            radianceB[c] = CreateRadianceTexture();
         }
         GL.BindTexture(TextureTarget.Texture3D, 0);
+
+        injectProgram = CompileCompute(EmbeddedShaderSource.Read("GlobalRadianceInject_Comp.glsl"));
+        if (injectProgram != 0)
+            CacheInjectLocations();
     }
+
+    static int CompileCompute(string src) {
+        int sh = GL.CreateShader(ShaderType.ComputeShader);
+        GL.ShaderSource(sh, GLSLShaderUtilities.ToAscii(src)); // em-dash sanitize (CLAUDE.md gotcha)
+        GL.CompileShader(sh);
+        GL.GetShader(sh, ShaderParameter.CompileStatus, out int ok);
+        if (ok == 0) {
+            Debugging.LogError("[GLGlobalSdf] GlobalRadianceInject compile failed:\n" + GL.GetShaderInfoLog(sh));
+            GL.DeleteShader(sh); return 0;
+        }
+        int prog = GL.CreateProgram();
+        GL.AttachShader(prog, sh);
+        GL.LinkProgram(prog);
+        GL.GetProgram(prog, GetProgramParameterName.LinkStatus, out int lok);
+        GL.DeleteShader(sh);
+        if (lok == 0) {
+            Debugging.LogError("[GLGlobalSdf] GlobalRadianceInject link failed:\n" + GL.GetProgramInfoLog(prog));
+            GL.DeleteProgram(prog); return 0;
+        }
+        return prog;
+    }
+
+    void CacheInjectLocations() {
+        liCascade = GL.GetUniformLocation(injectProgram, "Cascade");
+        liCascadeMin = GL.GetUniformLocation(injectProgram, "CascadeMin");
+        liCascadeCell = GL.GetUniformLocation(injectProgram, "CascadeCell");
+        liRes = GL.GetUniformLocation(injectProgram, "Res");
+        liSkyExposure = GL.GetUniformLocation(injectProgram, "SkyExposure");
+        liFeedback = GL.GetUniformLocation(injectProgram, "Feedback");
+        liCascadeCountSun = GL.GetUniformLocation(injectProgram, "CascadeCountSun");
+        liSunDir = GL.GetUniformLocation(injectProgram, "SunDirectionWorld");
+        liSunColor = GL.GetUniformLocation(injectProgram, "SunColor");
+        liAlbedo = GL.GetUniformLocation(injectProgram, "Albedo");
+        liCascadeBias = GL.GetUniformLocation(injectProgram, "CascadeBias");
+        for (int i = 0; i < 4; i++)
+            liCascadeMatrices[i] = GL.GetUniformLocation(injectProgram, $"CascadeMatrices[{i}]");
+        for (int i = 0; i < CascadeCount; i++) {
+            liGdfMin[i] = GL.GetUniformLocation(injectProgram, $"GdfMin[{i}]");
+            liGdfCell[i] = GL.GetUniformLocation(injectProgram, $"GdfCell[{i}]");
+        }
+    }
+
+    int CreateRadianceTexture() {
+        int tex = GL.GenTexture();
+        GL.BindTexture(TextureTarget.Texture3D, tex);
+        GL.TexStorage3D(TextureTarget3d.Texture3D, 1, SizedInternalFormat.Rgba16f, Resolution, Resolution, Resolution);
+        GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
+        GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
+        GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.ClampToEdge);
+        GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.ClampToEdge);
+        GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureWrapR, (int)TextureWrapMode.ClampToEdge);
+        GL.ClearTexImage(tex, 0, PixelFormat.Rgba, PixelType.Float, IntPtr.Zero); // start empty (a=0)
+        return tex;
+    }
+
+    public int DistanceTexture(int c) => textures[c];
 
     // Per cascade: world extent doubles each level, centered on the camera, snapped to the voxel grid.
     float ExtentOf(int cascade) => BaseExtent * (1 << cascade);
@@ -217,6 +302,67 @@ public sealed class GLGlobalSdf : IDisposable {
         return h.ToHashCode();
     }
 
+    // VOXEL LIGHTING: light the radiance clipmap from the distance clipmap (sun+shadow+sky+one bounce).
+    // Amortized — ONE cascade per call (round-robin), so the per-frame cost is bounded; the EMA keeps a
+    // static view converging and a moving view refreshing over a few frames. Called by GLSdfGiPass.Render
+    // (it has the sun/shadow/sky params), AFTER Update has placed/baked the cascades. Ping-pong: read
+    // last frame's radiance (samplers), write this frame's, then SwapRadiance so the march reads fresh.
+    public void InjectRadiance(int irradianceCubemap, int shadowMapArray, Matrix4[] sunCascades,
+        Vector4 sunBias, int sunCascadeCount, Vector3 sunDir, Vector3 sunColor, Vector3 albedo,
+        float skyExposure, float feedback) {
+        if (!Available || injectProgram == 0)
+            return;
+        int c = radianceInjectCursor;
+        radianceInjectCursor = (radianceInjectCursor + 1) % CascadeCount;
+        if (!cascadeBaked[c])
+            return;
+
+        GL.UseProgram(injectProgram);
+        // Write target: this cascade's WRITE radiance texture as image 1.
+        GL.BindImageTexture(1, RadianceWrite(c), 0, true, 0, TextureAccess.WriteOnly, SizedInternalFormat.Rgba16f);
+        // This cascade's distance field (unit 0), sky (3), sun shadow (5).
+        BindSampler(0, TextureTarget.Texture3D, textures[c]);
+        BindSampler(3, TextureTarget.TextureCubeMap, irradianceCubemap);
+        BindSampler(5, TextureTarget.Texture2DArray, shadowMapArray);
+        // The whole GDF: distances on units 6..9, LAST frame's radiance on units 10..13 (for the bounce).
+        for (int k = 0; k < CascadeCount; k++) {
+            BindSampler(6 + k, TextureTarget.Texture3D, textures[k]);
+            BindSampler(10 + k, TextureTarget.Texture3D, RadianceRead(k));
+            GL.Uniform1(GL.GetUniformLocation(injectProgram, $"GdfDistance[{k}]"), 6 + k);
+            GL.Uniform1(GL.GetUniformLocation(injectProgram, $"GdfRadiance[{k}]"), 10 + k);
+            GL.Uniform3(liGdfMin[k], cascadeMin[k].X, cascadeMin[k].Y, cascadeMin[k].Z);
+            GL.Uniform1(liGdfCell[k], cascadeCell[k]);
+        }
+        GL.Uniform1(GL.GetUniformLocation(injectProgram, "DistanceField"), 0);
+        GL.Uniform1(GL.GetUniformLocation(injectProgram, "IrradianceMap"), 3);
+        GL.Uniform1(GL.GetUniformLocation(injectProgram, "ShadowMap"), 5);
+
+        GL.Uniform1(liCascade, c);
+        GL.Uniform3(liCascadeMin, cascadeMin[c].X, cascadeMin[c].Y, cascadeMin[c].Z);
+        GL.Uniform1(liCascadeCell, cascadeCell[c]);
+        GL.Uniform1(liRes, Resolution);
+        GL.Uniform1(liSkyExposure, skyExposure);
+        GL.Uniform1(liFeedback, feedback);
+        int sc = Math.Min(sunCascadeCount, 4);
+        GL.Uniform1(liCascadeCountSun, sc);
+        for (int i = 0; i < sc; i++)
+            GL.UniformMatrix4(liCascadeMatrices[i], false, ref sunCascades[i]);
+        GL.Uniform4(liCascadeBias, sunBias);
+        GL.Uniform3(liSunDir, sunDir);
+        GL.Uniform3(liSunColor, sunColor);
+        GL.Uniform3(liAlbedo, albedo);
+
+        int g = (Resolution + 3) / 4;
+        GL.DispatchCompute(g, g, g);
+        GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
+        SwapRadiance(c); // only the cascade we just wrote flips (per-cascade ping-pong)
+    }
+
+    static void BindSampler(int unit, TextureTarget target, int texture) {
+        GL.ActiveTexture(TextureUnit.Texture0 + unit);
+        GL.BindTexture(target, texture);
+    }
+
     // Bind the cascade textures to consecutive sampler units and report placement to the shader. The
     // caller sets the matching sampler uniforms + the cascade min/cell/res uniforms.
     public void Bind(int firstUnit) {
@@ -230,8 +376,11 @@ public sealed class GLGlobalSdf : IDisposable {
     public float CascadeCell(int c) => cascadeCell[c];
 
     public void Dispose() {
-        for (int c = 0; c < CascadeCount; c++)
+        for (int c = 0; c < CascadeCount; c++) {
             if (textures[c] != 0) GL.DeleteTexture(textures[c]);
+            if (radianceA[c] != 0) GL.DeleteTexture(radianceA[c]);
+            if (radianceB[c] != 0) GL.DeleteTexture(radianceB[c]);
+        }
         Available = false;
     }
 }

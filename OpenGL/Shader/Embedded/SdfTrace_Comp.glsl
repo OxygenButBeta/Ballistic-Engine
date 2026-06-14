@@ -132,6 +132,21 @@ uniform vec3  GlobalSdfMin[GDF_CASCADES];  // world min corner of each cascade b
 uniform float GlobalSdfCell[GDF_CASCADES]; // world cell size (cubic) per cascade
 uniform int   GlobalSdfRes;                // voxels per axis per cascade
 uniform int   UseGlobalSdf;                // 1 = march the GDF clipmap; 0 = the per-instance grid
+// VOXEL LIGHTING (Phase 2): the radiance clipmap parallel to GlobalSdf. A GDF hit reads STABLE COLORED
+// multi-bounce radiance here (the global surface cache) instead of the neutral direct estimate.
+uniform sampler3D GlobalRadiance[GDF_CASCADES];
+uniform int   UseGlobalRadiance;           // 1 = read the radiance clipmap at hits; 0 = HitDirect
+
+// Reads the global radiance clipmap at a world point (finest cascade containing it). a = occupancy.
+vec4 GlobalRadianceAt(vec3 worldP) {
+    for (int c = 0; c < GDF_CASCADES; ++c) {
+        float extent = GlobalSdfCell[c] * float(GlobalSdfRes);
+        vec3 rel = (worldP - GlobalSdfMin[c]) / extent;
+        if (all(greaterThanEqual(rel, vec3(0.0))) && all(lessThanEqual(rel, vec3(1.0))))
+            return texture(GlobalRadiance[c], rel);
+    }
+    return vec4(0.0);
+}
 
 // Direct-sun lighting at the hit (the bright-bounce source). Same data the volumetric march uses.
 const int MAX_CASCADES = 4;
@@ -524,10 +539,14 @@ void main() {
         vec3 radiance = vec3(0.0);
         if (hit) {
             hitCount++;
-            // The GLOBAL DISTANCE FIELD path has NO per-mesh radiance-cache slot (that's the per-mesh
-            // atlas), so read radiance with the direct estimate (sun-at-hit + sky). The card-based
-            // surface cache for the GDF comes in Phase 2; until then HitDirect gives a coherent fill.
-            vec4 cached = UseGlobalSdf == 1 ? vec4(0.0) : SampleRadiance(hitSlot, hitLocal);
+            // Radiance at the hit. GDF path: read the GLOBAL RADIANCE clipmap (Phase 2 voxel lighting —
+            // stable colored multi-bounce) when it's populated; else the direct sun+sky estimate.
+            // Per-mesh path: the per-mesh radiance atlas.
+            vec4 cached;
+            if (UseGlobalSdf == 1)
+                cached = UseGlobalRadiance == 1 ? GlobalRadianceAt(hitPoint) : vec4(0.0);
+            else
+                cached = SampleRadiance(hitSlot, hitLocal);
             if (cached.a > 0.01) {
                 radiance = Sanitize(cached.rgb);
             } else {
