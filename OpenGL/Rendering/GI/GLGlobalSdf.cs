@@ -176,6 +176,8 @@ public sealed class GLGlobalSdf : IDisposable {
     public void Update(Vector3 cameraPos, IReadOnlyList<IStaticMeshRenderer> opaque) {
         // Finish a completed background bake: upload it (GL thread).
         if (bakeTask is { IsCompleted: true }) {
+            if (bakeTask.IsFaulted && Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_DIAG") == "1")
+                Console.WriteLine($"[GlobalSdf] bake FAULTED cascade {bakeCascade}: {bakeTask.Exception?.GetBaseException().Message}");
             BakeResult r = bakeTask.Status == TaskStatus.RanToCompletion ? bakeTask.Result : null;
             if (r is { Sdf: not null }) {
                 UploadCascade(r.Cascade, r.Sdf, r.Min, r.Cell);

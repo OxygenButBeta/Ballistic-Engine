@@ -84,6 +84,9 @@ public sealed class GLSdfGiPass : IDisposable {
     }
 
     public bool Available { get; private set; }
+    // True when the GLOBAL DISTANCE FIELD path actually ran this frame (GDF enabled + its cascade 0 is
+    // baked/available). Diagnostic: tells whether Lumen is genuinely contributing vs silently no-op.
+    public bool GdfActive => UseGlobalSdf && globalSdf is { Available: true };
 
     // LUMEN PHASE 1 — Global Distance Field clipmap. When enabled (BALLISTIC_LUMEN_GDF=1, or always
     // once Phase 1 is the default) the march samples this ONE merged field instead of the per-mesh
