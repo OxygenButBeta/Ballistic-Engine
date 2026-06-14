@@ -40,7 +40,8 @@ public sealed class GLSSRPass {
     // UN-jittered projection used for the temporal reprojection (the accumulated image is
     // jitter-free); projection is this frame's (jittered) projection the march reconstructs from.
     public int Render(int targetIndex, int colorTexture, int depthTexture, int normalTexture, int width, int height,
-        ref Matrix4 view, ref Matrix4 projection, ref Matrix4 projectionNoJitter, PostProcessSettings fx) {
+        ref Matrix4 view, ref Matrix4 projection, ref Matrix4 projectionNoJitter, float reflectionScale,
+        PostProcessSettings fx) {
         if (depthTexture <= 0 || normalTexture <= 0)
             return colorTexture;
 
@@ -74,7 +75,10 @@ public sealed class GLSSRPass {
         marchShader.SetMatrix4("Projection", ref projection);
         marchShader.SetMatrix4("InvProjection", ref invProjection);
         marchShader.SetMatrix4("ViewMatrix", ref view);
-        marchShader.SetFloat("Intensity", fx.SsrIntensity);
+        // SsrIntensity x the scene's global ReflectionIntensity so SSR shares ONE EV with the env/
+        // probe reflection it replaces (the audit's "SSR overwrites the probe reflection at a
+        // mismatched brightness" fix). reflectionScale = the renderer's reflectionIntensity.
+        marchShader.SetFloat("Intensity", fx.SsrIntensity * System.MathF.Max(reflectionScale, 0f));
         GLBufferUtilities.DrawFullscreenQuad();
 
         // 2. Temporal accumulation: reproject last frame's reflection, disocclusion-reject, EMA.
