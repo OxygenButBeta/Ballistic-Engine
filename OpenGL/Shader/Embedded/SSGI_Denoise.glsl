@@ -66,8 +66,12 @@ void main() {
             vec2 uv = TexCoords + offset;
 
             // Per-tap scrub: sum += c*w would be NaN even at w == 0 (NaN*0 == NaN), so one
-            // contaminated tap used to poison every pixel whose kernel touched it.
-            vec3 c = Sanitize(texture(giTexture, uv).rgb);
+            // contaminated tap used to poison every pixel whose kernel touched it. CLAMP each tap to a
+            // sane HDR ceiling too: the half-res GI is fp16 and the noisy 1-spp gather has firefly
+            // pixels that, accumulated over 4 widening iterations, pushed a channel past the fp16 max
+            // (65504) -> Inf -> the combine's Inf-scrub then ZEROED that channel (the "pure-red, green
+            // gone" GI). A finite ceiling keeps the denoise stable without changing the converged image.
+            vec3 c = min(Sanitize(texture(giTexture, uv).rgb), vec3(4096.0));
             vec3 n = normalize(texture(normalTexture, uv).rgb * 2.0 - 1.0);
             float z = ViewZ(uv);
             float l = dot(c, vec3(0.2126, 0.7152, 0.0722));

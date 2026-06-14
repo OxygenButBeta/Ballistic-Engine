@@ -691,9 +691,9 @@ public sealed class GLSdfGiPass : IDisposable {
             GL.Disable(EnableCap.DepthTest); GL.Disable(EnableCap.CullFace); GL.Disable(EnableCap.Blend);
             output.BindAsTarget();
             probeIntegrateShader.Activate();
-            BindCombineSampler(0, probeAtlas.Texture, "probeAtlas");
-            BindCombineSampler(1, depthTex, "depthTexture");
-            BindCombineSampler(2, normalTex, "normalTexture");
+            BindShaderSampler(probeIntegrateShader, 0, probeAtlas.Texture, "probeAtlas");
+            BindShaderSampler(probeIntegrateShader, 1, depthTex, "depthTexture");
+            BindShaderSampler(probeIntegrateShader, 2, normalTex, "normalTexture");
             Matrix4 invP = Matrix4.Invert(projection), invV = Matrix4.Invert(view);
             probeIntegrateShader.SetMatrix4("InvProjection", ref invP);
             probeIntegrateShader.SetMatrix4("InvView", ref invV);
@@ -759,11 +759,11 @@ public sealed class GLSdfGiPass : IDisposable {
             GL.DrawBuffers(2, Mrt2);
 
             temporalShader.Activate();
-            BindCombineSampler(0, output.Texture, "currentGI");
-            BindCombineSampler(1, giRead.Texture, "historyGI");
-            BindCombineSampler(2, depthTex, "depthTexture");
-            BindCombineSampler(3, normalTex, "normalTexture");
-            BindCombineSampler(4, depthReadTex.Texture, "historyDepth");
+            BindShaderSampler(temporalShader, 0, output.Texture, "currentGI");
+            BindShaderSampler(temporalShader, 1, giRead.Texture, "historyGI");
+            BindShaderSampler(temporalShader, 2, depthTex, "depthTexture");
+            BindShaderSampler(temporalShader, 3, normalTex, "normalTexture");
+            BindShaderSampler(temporalShader, 4, depthReadTex.Texture, "historyDepth");
             temporalShader.SetMatrix4("InvProjection", ref invProjNoJitter);
             temporalShader.SetMatrix4("InvViewMatrix", ref invView);
             temporalShader.SetMatrix4("PrevViewProjection", ref prevViewProjection);
@@ -799,9 +799,9 @@ public sealed class GLSdfGiPass : IDisposable {
                 GLRenderTexture dst = denoisePingPong[iter & 1];
                 dst.BindAsTarget();
                 denoiseShader.Activate();
-                BindCombineSampler(0, src.Texture, "giTexture");
-                BindCombineSampler(1, depthTex, "depthTexture");
-                BindCombineSampler(2, normalTex, "normalTexture");
+                BindShaderSampler(denoiseShader, 0, src.Texture, "giTexture");
+                BindShaderSampler(denoiseShader, 1, depthTex, "depthTexture");
+                BindShaderSampler(denoiseShader, 2, normalTex, "normalTexture");
                 denoiseShader.SetMatrix4("InvProjection", ref invProjNoJitterCopy);
                 denoiseShader.SetFloat("StepSize", (float)(1 << iter)); // 1, 2, 4, 8 texel spacing
                 denoiseShader.SetFloat("DepthSigma", 0.2f);
@@ -929,11 +929,22 @@ public sealed class GLSdfGiPass : IDisposable {
         GL.BindTexture(target, texture);
     }
 
-    void BindCombineSampler(int unit, int texture, string name) {
+    // Binds `texture` to `unit` AND sets the sampler uniform `name` to that unit ON THE GIVEN SHADER.
+    // CRITICAL: the uniform MUST be set on the shader that is actually ACTIVE for this draw. The old
+    // overload hardcoded combineShader, so the temporal/denoise/probe passes (which Activate their OWN
+    // shader) bound the texture correctly but set the sampler uniform on the inactive combineShader —
+    // leaving their own samplers at the default unit 0. In the DENOISE that meant giTexture, depthTexture
+    // AND normalTexture all read unit 0 (the GI colour) — so the normal/depth edge-stop weights were
+    // computed from GI colours as if they were normals/depths, producing garbage weights that crushed
+    // the colour to a red sludge (the "very red, thin, no real bounce" GI). Pass the active shader.
+    static void BindShaderSampler(StandardShader shader, int unit, int texture, string name) {
         GL.ActiveTexture(TextureUnit.Texture0 + unit);
         GL.BindTexture(TextureTarget.Texture2D, texture);
-        combineShader.SetInt(name, unit);
+        shader.SetInt(name, unit);
     }
+
+    void BindCombineSampler(int unit, int texture, string name) =>
+        BindShaderSampler(combineShader, unit, texture, name);
 
     static int CompileCompute(string src) {
         int shader = GL.CreateShader(ShaderType.ComputeShader);

@@ -720,9 +720,18 @@ void main() {
             if (rtrav >= MAX_DIST) break;
         }
         if (rhit) {
-            vec4 rc = SampleRadiance(rslot, rlocal);
-            vec3 reflRad = rc.a > 0.01 ? Sanitize(rc.rgb)
-                                       : Sanitize(HitDirect(rp, SceneGradient(rp)));
+            // Radiance at the reflection hit: GDF path reads the GLOBAL radiance clipmap (the per-mesh
+            // SampleRadiance has NO slots in GDF mode — slot 0 + a world-space coord read garbage, which
+            // is what reddened the whole frame: most stone is rough<0.6 so this block runs on nearly
+            // every pixel). Per-mesh path keeps SampleRadiance. Fall back to HitDirect when unfilled.
+            vec3 reflRad;
+            if (UseGlobalSdf == 1) {
+                vec4 gc = GlobalRadianceAt(rp);
+                reflRad = gc.a > 0.01 ? Sanitize(gc.rgb) : Sanitize(HitDirect(rp, SceneGradient(rp)));
+            } else {
+                vec4 rc = SampleRadiance(rslot, rlocal);
+                reflRad = rc.a > 0.01 ? Sanitize(rc.rgb) : Sanitize(HitDirect(rp, SceneGradient(rp)));
+            }
             // Mix the sharp reflection into the gather by glossiness. (The composite is additive and
             // the diffuse already carried the rough-surface bounce, so this only lifts glossy hits.)
             gathered = mix(gathered, reflRad, gloss * 0.5);
