@@ -581,10 +581,15 @@ public sealed class GLSdfGiPass : IDisposable {
         // the NON-injected instances' radiance must survive. Seed the write volume with last frame's
         // full read volume (a cheap whole-texture GPU copy) BEFORE injecting the slice over it — so
         // un-injected bricks keep their converged radiance and only the slice advances one bounce.
+        // Copy only the USED sub-volume (all bricks live in [0, UsedDepth) — the shelf allocator fills
+        // from Z=0 up), not the whole Size^3. Most of the 256^3 atlas is empty, so for a partly-filled
+        // atlas this cuts the per-frame 32MB copy roughly in proportion to how much is actually used —
+        // a big chunk of the SDF-GI pass cost (profiled ~4.7ms with SDF-GI on).
+        int usedZ = Math.Clamp(atlas.UsedDepth, 1, atlas.Size);
         GL.CopyImageSubData(
             atlas.RadianceReadTextureId, ImageTarget.Texture3D, 0, 0, 0, 0,
             atlas.RadianceWriteTextureId, ImageTarget.Texture3D, 0, 0, 0, 0,
-            atlas.Size, atlas.Size, atlas.Size);
+            atlas.Size, atlas.Size, usedZ);
         GL.MemoryBarrier(MemoryBarrierFlags.TextureUpdateBarrierBit |
                          MemoryBarrierFlags.ShaderImageAccessBarrierBit);
 

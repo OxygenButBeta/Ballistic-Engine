@@ -53,6 +53,11 @@ public sealed class GLSdfAtlas : IDisposable {
 
     public IReadOnlyList<SdfSlot> Slots => slots;
 
+    // The highest Z (depth) any packed brick reaches in the atlas — the shelf allocator fills from
+    // Z=0 up, so [0, UsedDepth) bounds ALL bricks. Lets the ping-pong copy only the used sub-volume
+    // (Size x Size x UsedDepth) instead of the whole Size^3 (most of the 256^3 atlas is empty).
+    public int UsedDepth { get; private set; }
+
     readonly List<SdfSlot> slots = new();
 
     // The two ping-pong radiance volumes. radianceRead indexes the one holding last frame's
@@ -208,6 +213,8 @@ public sealed class GLSdfAtlas : IDisposable {
         cursorX += res.X;
         if (res.Y > rowMaxY) rowMaxY = res.Y;
         if (res.Z > layerMaxZ) layerMaxZ = res.Z;
+        // Track the deepest brick extent so the ping-pong copy can skip the empty tail of the atlas.
+        if (cursorZ + res.Z > UsedDepth) UsedDepth = cursorZ + res.Z;
         return true;
     }
 
@@ -217,6 +224,7 @@ public sealed class GLSdfAtlas : IDisposable {
         slots.Clear();
         cursorX = cursorY = cursorZ = 0;
         rowMaxY = layerMaxZ = 0;
+        UsedDepth = 0;
     }
 
     public void Dispose() {
