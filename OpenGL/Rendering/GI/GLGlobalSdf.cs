@@ -74,7 +74,14 @@ public sealed class GLGlobalSdf : IDisposable {
         public int Res;        // detail resolution this bake produced (CoarseResolution or Resolution)
         public Vector3i SrcRes; // the field's own grid (== Res^3 unless degenerate) — for the upsample
         public MeshSdfBaker.PreparedField Prepared; // the built BVH, cached for this cascade's refine (Phase 0)
+        public SdfSeedExtractor.SeedGrid Seeds; // JFA seed grid (Phase 2); null on the CPU path
     }
+
+    // PHASE 2: when set, each cascade is built FULL-RES in one shot via the GPU jump-flood (CPU shell
+    // seeds on a background task -> GPU flood + resolve on the GL thread, ~tens of ms total) instead of
+    // the slow CPU coarse-warm-up + never-landing refine. Default OFF until verified; the CPU path is
+    // byte-for-byte the committed baseline. A/B with the env var.
+    static readonly bool UseJfa = Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_JFA") == "1";
     Task<BakeResult> bakeTask;
     int bakeCascade = -1;
     int geometryStamp;          // hash of the opaque set's transforms+bounds; re-bake all on change
@@ -253,7 +260,26 @@ public sealed class GLGlobalSdf : IDisposable {
             if (bakeTask.IsFaulted && Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_DIAG") == "1")
                 Console.WriteLine($"[GlobalSdf] bake FAULTED cascade {bakeCascade}: {bakeTask.Exception?.GetBaseException().Message}");
             BakeResult r = bakeTask.Status == TaskStatus.RanToCompletion ? bakeTask.Result : null;
-            if (r is { Sdf: not null }) {
+            // PHASE 2 (JFA): the background task produced a SEED grid; flood + resolve it into this
+            // cascade's distance + albedo textures on the GL thread (~tens of ms), full-res in one shot.
+            if (UseJfa && r is { Seeds: not null }) {
+                jfaBuilder ??= new GLSdfJfaBuilder(Resolution);
+                cascadeMin[r.Cascade] = r.Min;
+                cascadeCell[r.Cascade] = r.Cell;
+                float farDist = BaseExtent * 4f;
+                bool ok = jfaBuilder.Build(r.Seeds, textures[r.Cascade], albedoTex[r.Cascade], r.Cell, farDist);
+                if (ok) {
+                    cascadeBaked[r.Cascade] = true;
+                    cascadeRes[r.Cascade] = Resolution; // JFA is always full-res
+                    if (r.Cascade == 0) Available = true;
+                }
+                if (r.Prepared != null) {
+                    preparedField[r.Cascade] = r.Prepared;
+                    preparedStamp[r.Cascade] = geometryStamp;
+                    preparedValid[r.Cascade] = true;
+                }
+            }
+            else if (r is { Sdf: not null }) {
                 // The field was baked at r.Res (coarse or full); upsample to the full texture grid so
                 // the march/placement never change. A full-res bake upsamples 1:1 (a copy).
                 UploadCascade(r.Cascade, r.Sdf, r.Albedo, r.Min, r.Cell);
@@ -445,8 +471,27 @@ public sealed class GLGlobalSdf : IDisposable {
 
         bakeTask = Task.Run(() => {
             var sw = diag ? System.Diagnostics.Stopwatch.StartNew() : null;
-            // Build the BVH once (or reuse the cached one), then bake the grid at this detail resolution.
+            // Build the BVH once (or reuse the cached one).
             MeshSdfBaker.PreparedField prep = reused ?? MeshSdfBaker.Prepare(worldVerts, triAlbedo);
+
+            // PHASE 2 (JFA): produce SHELL SEEDS at full Resolution (the GPU flood fills the rest on the
+            // GL thread). No coarse stage — the JFA build is full-res in one shot. The GDF-box uses the
+            // cascade's FULL extent (cell * Resolution), so seed voxel coords map 1:1 to the texture.
+            if (UseJfa) {
+                var fullRes = new Vector3i(Resolution);
+                Vector3 jfaMax = min + new Vector3(cell * Resolution);
+                SdfSeedExtractor.SeedGrid seeds = prep == null ? null
+                    : SdfSeedExtractor.Extract(prep, min, jfaMax, fullRes, 7);
+                if (sw != null)
+                    Console.WriteLine($"[GDF JFA] cascade {cascade} seeds {Resolution}^3, {triCount} tris" +
+                                      $"{(reused != null ? " (BVH reused)" : "")}, {seeds?.SeedCount ?? 0} seeds -> {sw.ElapsedMilliseconds} ms");
+                return new BakeResult {
+                    Cascade = cascade, Seeds = seeds, Min = min, Cell = cell,
+                    Res = Resolution, SrcRes = fullRes, Prepared = prep
+                };
+            }
+
+            // CPU path: bake the grid at this detail resolution (coarse warm-up or full refine).
             MeshSdf sdf = null;
             float[] alb = null;
             if (prep != null)
