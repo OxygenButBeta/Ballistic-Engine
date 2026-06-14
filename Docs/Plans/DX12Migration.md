@@ -44,7 +44,12 @@ byte-exactness is kept WITHIN a single backend.
 
 ## Phases (each independently verifiable via the deterministic screenshot harness)
 
-- **Phase 0 — Abstraction prep (GL still the only backend). ~1-2 wk. [IN PROGRESS]**
+- **Phase 0 — Abstraction prep (GL still the only backend). ~1-2 wk. [DONE 2026-06-15]**
+  Commits 3fdb446b (shader factory→RenderAsset), Leak3 (BufferUsage enum + drop OpenTK from the buffer
+  abstraction + delete dead Engine/Rendering/SData/Buffer.cs), 4e817aa5 (RenderHandle for Scene/Game
+  display textures), 9a5d808a (BALLISTIC_BACKEND selector seam). GL path unchanged (SunTemple 160.4,
+  Bistro full draws=796/tris=521738). DebugFrame's int G-buffer texture ids left GL-coupled on purpose
+  (editor-debug, Phase 7). Original (now-historical) leak list below:
   Make the backend seam clean with ZERO behavior change. Fix three confirmed leaks:
   1. `GraphicAPI.CreateStandardShader` hardcodes `new GLStandardShader()` → route through
      `RenderAsset.Current`.
