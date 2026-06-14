@@ -46,7 +46,10 @@ public sealed class GLSdfGiPass : IDisposable {
     // Max submesh SDFs to BAKE per frame. The bake is synchronous on the GL thread (the atlas upload
     // must be), so baking all ~512 at once was a 149ms first-frame stall. Amortizing a handful per
     // frame spreads it over a fraction of a second — the GI just fades in over the warm-up frames.
-    const int MaxBakesPerFrame = 24;
+    // 64 (was 24): per-OBJECT scenes (BistroInterior, ~2000 submeshes) converged far too slowly at 24
+    // (only ~48 bricks after 1500 frames -> near-empty SDF). 64/frame fills the 512 budget in ~8
+    // frames; each bake is ~1ms BVH so the warm-up stays well under a stutter.
+    const int MaxBakesPerFrame = 64;
 
     // Max instances to radiance-inject per frame (round-robin). The inject's per-voxel bounce-gather
     // is the heaviest GI cost; amortizing it across frames keeps per-frame cost bounded while the
@@ -152,6 +155,8 @@ public sealed class GLSdfGiPass : IDisposable {
 
     // Scratch instance list reused across frames (allocation-light per the GLSdfScene contract).
     readonly List<(Matrix4 world, int slot, Vector3 albedo, Vector3 emissive)> instances = new();
+    // Scratch bake-candidate list, sorted largest-first so the atlas budget goes to big occluders.
+    readonly List<(IStaticMeshRenderer r, Mesh mesh, Matrix4 world, int sub, float worldSize)> bakeCandidates = new();
 
     int frameIndex;
 
@@ -270,7 +275,15 @@ public sealed class GLSdfGiPass : IDisposable {
         // renderer (SubMeshIndex < 0, e.g. Bistro) contributes ALL its submeshes; a per-object
         // renderer (SubMeshIndex >= 0) contributes just that one. Vertices are MODEL space, so the
         // field's local space == model space and the GPU instance uses the renderer's WorldMatrix.
-        instances.Clear();
+        // Collect every candidate submesh with its WORLD-SPACE size FIRST, then bake LARGEST-FIRST.
+        // CRITICAL for per-object scenes (BistroInterior is ~796 separate renderers — chairs, bottles,
+        // cutlery): the atlas cap (MaxDistinctMeshes) is small relative to the submesh count, and the
+        // OLD code baked in arbitrary scene order, so the budget was spent on tiny props while the big
+        // occluders that actually shape GI (walls, floor, ceiling, bar) never got bricks — the march
+        // then escaped to nothing and the gather was ZERO (proven: BistroInterior raw gather mean 0 vs
+        // SunTemple's 101). Baking biggest-first puts the budget where it matters. (A whole-mesh scene
+        // like SunTemple is unaffected — it has one renderer and its submeshes already fit.)
+        bakeCandidates.Clear();
         for (var i = 0; i < opaque.Count; i++) {
             IStaticMeshRenderer r = opaque[i];
             if (r is not { IsRenderable: true, IsActive: true })
@@ -287,25 +300,34 @@ public sealed class GLSdfGiPass : IDisposable {
             if (subCount == 0)
                 continue;
 
-            // Which submeshes does this renderer draw? -1 = all; >=0 = just that one.
             int from = r.SubMeshIndex >= 0 ? r.SubMeshIndex : 0;
             int to = r.SubMeshIndex >= 0 ? r.SubMeshIndex + 1 : subCount;
             if (from < 0 || to > subCount)
                 continue;
 
+            // World-space scale: the local-bounds diagonal scaled by the transform's lossy scale, so a
+            // big-but-far prop still ranks by its real size. Cheap proxy good enough for ordering.
+            float scaleLen = world.ExtractScale().Length;
             for (int s = from; s < to; s++) {
-                Material mat = r.MaterialFor(s);
-                int slot = SlotForSubMesh(mesh, s, mat);
-                if (slot < 0)
-                    continue; // skipped (too small / cap / failed / cutout) — no GI from this submesh
-                // Per-instance albedo + emissive for the surface-cache inject: the brick has no
-                // per-voxel material, so one value per submesh (its material's base colour /
-                // emissive). Coarse but stable — exactly what the cached low-frequency bounce wants.
-                Vector3 albedo = mat != null ? mat.BaseColorFactor.Xyz : new Vector3(0.5f);
-                Vector3 emissive = mat is { IsEmissive: true }
-                    ? mat.EmissiveColor * mat.EmissiveIntensity : Vector3.Zero;
-                instances.Add((world, slot, albedo, emissive));
+                mesh.GetSubMeshBounds(s, out Vector3 lo, out Vector3 hi);
+                float worldSize = (hi - lo).Length * scaleLen;
+                bakeCandidates.Add((r, mesh, world, s, worldSize));
             }
+        }
+        // Largest occluders first. Already-baked submeshes (in meshSlots) short-circuit in SlotForSubMesh,
+        // so re-sorting every frame is cheap and lets a newly-seen big piece still get priority.
+        bakeCandidates.Sort((a, b) => b.worldSize.CompareTo(a.worldSize));
+
+        instances.Clear();
+        foreach (var (r, mesh, world, s, _) in bakeCandidates) {
+            Material mat = r.MaterialFor(s);
+            int slot = SlotForSubMesh(mesh, s, mat);
+            if (slot < 0)
+                continue; // skipped (too small / cap / failed / cutout) — no GI from this submesh
+            Vector3 albedo = mat != null ? mat.BaseColorFactor.Xyz : new Vector3(0.5f);
+            Vector3 emissive = mat is { IsEmissive: true }
+                ? mat.EmissiveColor * mat.EmissiveIntensity : Vector3.Zero;
+            instances.Add((world, slot, albedo, emissive));
         }
 
         scene.Build(instances, atlasAdapter);
@@ -334,7 +356,11 @@ public sealed class GLSdfGiPass : IDisposable {
         mesh.GetSubMeshBounds(s, out Vector3 lo, out Vector3 hi);
         if ((hi - lo).Length < MinSubMeshSize) { meshSlots[key] = -1; return -1; }
 
-        if (meshSlots.Count >= MaxDistinctMeshes) {
+        // Cap on BAKED slots, not dict entries. The dict also holds the -1 SKIP markers (tiny/cutout/
+        // failed), so counting meshSlots.Count hit the cap at 512 ENTRIES — mostly skips — leaving only
+        // a couple dozen real bricks and a near-empty SDF (BistroInterior gathered mean 0). atlas.Slots
+        // is the real baked-brick count, so the budget now goes to 512 actual occluders.
+        if (atlas.Slots.Count >= MaxDistinctMeshes) {
             if (!overflowLogged) {
                 Debugging.Log($"[GLSdfGiPass] submesh-SDF cap {MaxDistinctMeshes} reached; remaining " +
                               "submeshes contribute no off-screen GI (raise the cap or merge fields).");
