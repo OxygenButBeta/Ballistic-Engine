@@ -86,13 +86,32 @@ CornellBox -> commit. Keep a working fallback until each is proven.
 - Multi-bounce clamp 0.55 + radiance-cache diagnostic gate (a8b25524).
 - Phantom-sun GDF sun trace (48400850) — outside-cascades sun shadowing via the GDF.
 - DEFERRED-ALBEDO G-BUFFER (1373e9d0) — per-pixel GI receiver reflectance (3rd opaque MRT). FIXED
-  BistroInterior + improved all 3 scenes. Default intensity recalibrated 0.4 -> 0.18. (Note: SSGI_Combine
+  BistroInterior over-bright + improved all 3 scenes. Intensity recalibrated 0.4 -> 0.18. (SSGI_Combine
   still uses its own flat energy gate, not the albedo G-buffer — SSGI is off under Lumen; wire it later.)
+- **SAMPLER-BINDING BUG FIX (6daf7c46)** — THE root cause of "GI is very red / thin / no real bounce".
+  GLSdfGiPass.BindCombineSampler hardcoded combineShader.SetInt, but temporal/denoise/probe passes
+  Activate their OWN shader -> their samplers stayed at default unit 0, so the DENOISE read GI-colour as
+  normals/depths -> garbage edge-stops crushed the bounce to red sludge (green/blue~0). Fix: BindShaderSampler
+  passes the ACTIVE shader. GI is now FULL-COLOUR + smooth. (SSGI was always correct — uses BindTex.)
+- **SURFACE-CACHE READ FIX (3aec9a16)** — multi-bounce was absent because the gather sampled the voxel
+  cache EXACTLY at the surface (d~0) where trilinear blended occupancy alpha to ~0, failing the gate ->
+  fell back to flat HitDirect everywhere -> cache (and its multi-bounce) unused. Fix: sample 1.5 cells
+  INTO the surface. Also reworked GatherBounce (was step-starved: 24 steps @ ~6cm died after 1-2m).
+  Multi-bounce now scales correctly (gain 1->(9,6,3), 2->(12,7,4), 3->(48,..) runaway). Default gain 2 (d42fc365).
+- **PUNCTUAL-LIGHT GI (c7415d89)** — the GDF voxel cache lit from sun+sky only, so point-lit interiors
+  got ZERO Lumen bounce (BistroInterior iso GI was (0.2,0,0)). Now point lights inject into the cache
+  (inv-sq + range cutout + NdotL, up to 8). BistroInterior iso GI -> (1.3,0.4,0.1), warm lamp bounce
+  visible. Point-light SDF SHADOWING in the cache is a TODO (currently unshadowed). Spot lights TODO too.
 
-### NEXT — the GI now looks right on all 3 scenes. Pick up the phase ladder:
-- The albedo G-buffer also unlocks correct GI on the SCREEN-PROBE path + SSGI when those come back.
-- Immediate candidates: Phase B (make Lumen the no-flag default) is the cleanest next step now that the
-  3 reference scenes are solid; or fidelity polish (motion stability, contact-GI sharpness, reflections).
+### STATE: all 3 reference scenes have genuine colored multi-bounce GI (verified isolated bounce).
+SunTemple + BistroExterior are Lumen-class; BistroInterior now has (subtle, physically-correct) lamp
+bounce. An adversarial multi-lens review workflow (wf_fc2bace5-cec) is judging quality vs real Lumen.
+
+### NEXT — pick up the phase ladder / review-driven fixes:
+- Act on the review's confirmed defects first.
+- Recheck intensity 0.18 (tuned vs the BROKEN red GI; the bounce is now genuine/richer -> may want higher).
+- Point-light + spot-light SHADOWING in the GI cache (currently unshadowed punctual bounce).
+- Phase B (make Lumen the no-flag default); then reflections, world-space radiance probes, denoise polish.
 
 ### Phase B — make GDF+per-pixel the DEFAULT GI (no flag)
 - Once warm-up is fast + quality confirmed, drop BALLISTIC_SDFGI/LUMEN_GDF gating so Lumen is the
