@@ -679,7 +679,13 @@ void main()
             vec3 sh1 = texture(ProbeSH1, probeUVW).rgb;   // linear Y
             vec3 sh2 = texture(ProbeSH2, probeUVW).rgb;   // linear Z
             vec3 sh3 = texture(ProbeSH3, probeUVW).rgb;   // linear X
-            // L1 SH irradiance reconstruction (cosine-convolved band factors baked in).
+            // L1 SH irradiance reconstruction (cosine-convolved Ramamoorthi band factors). NOTE: this
+            // gives FULL irradiance E, whereas the sky IrradianceMap (else branch) stores E/PI — a ~PI
+            // unit mismatch that makes the probe ambient brighter than the sky just outside the volume
+            // (a boundary seam). The mathematically-correct fix is /PI here, BUT this scene's exposure
+            // was calibrated around the brighter probe ambient, so /PI alone crushes the interior. The
+            // unit fix + a matching ambient REBALANCE is done together in the GI phase (Phase E) so the
+            // default interior stays well-lit; kept as-is here to preserve the user-approved look.
             irradiance = sh0 * 0.886227
                        + (sh1 * N.y + sh2 * N.z + sh3 * N.x) * 1.023327;
             // ProbeIntensity (GlobalIllumination volume) scales the probe ambient; 1 = unchanged.

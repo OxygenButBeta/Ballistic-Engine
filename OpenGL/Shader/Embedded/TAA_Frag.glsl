@@ -107,7 +107,9 @@ void main() {
     vec3 m2 = vec3(0.0);
     for (int x = -1; x <= 1; x++) {
         for (int y = -1; y <= 1; y++) {
-            vec3 c = RGBToYCoCg(texture(currentTexture, TexCoords + vec2(x, y) * texel).rgb);
+            // Sanitize each tap: a single NaN/Inf in the current frame would poison the mean/sigma
+            // (the variance-clip box), and the EMA then carries the corruption every frame.
+            vec3 c = RGBToYCoCg(Sanitize(texture(currentTexture, TexCoords + vec2(x, y) * texel).rgb));
             m1 += c;
             m2 += c * c;
         }

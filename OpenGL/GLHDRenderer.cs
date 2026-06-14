@@ -832,6 +832,11 @@ public class GLHDRenderer : HDRenderer {
         prevViewProjection[targetIndex] = viewProjection;
         prevViewProjectionValid[targetIndex] = true;
 
+        // Auto-exposure meters the SHARP, pre-DoF, pre-bloom frame: metering the depth-of-field-
+        // blurred image keys exposure off whatever happens to be out of focus (a blurred bright/dark
+        // background would swing the EV). Capture the meter source BEFORE DoF reassigns litColor.
+        int meterSource = litColor;
+
         // Depth of field AFTER TAA (blurs the resolved, antialiased image — running before TAA
         // would fight the history clamp at focus edges) and BEFORE bloom (so out-of-focus
         // highlights bloom as bokeh). Uses the UNJITTERED projection to linearize depth, like
@@ -841,12 +846,13 @@ public class GLHDRenderer : HDRenderer {
                 litColor = depthOfField.Render(litColor, target.DepthTextureId, target.LenX, target.LenY,
                     ref projection, PostFX);
 
-        // Auto exposure meters the lit, pre-bloom frame (bloom is an additive overlay; the
-        // meter wants the image's own luminance) and stores a target EV for the next frame's
-        // Adapt. PBO-buffered readback: no CPU/GPU sync stall, one frame of latency.
+        // Auto exposure meters the lit, pre-bloom, pre-DoF frame (bloom is an additive overlay and
+        // DoF is a viewing blur; the meter wants the image's own in-focus luminance) and stores a
+        // target EV for the next frame's Adapt. PBO-buffered readback: no CPU/GPU sync stall, one
+        // frame of latency.
         if (PostFX.ExposureMode != ExposureMode.Fixed)
             using (timers.Time("Exposure"))
-                autoExposure.Measure(targetIndex, litColor, preExposure, PostFX);
+                autoExposure.Measure(targetIndex, meterSource, preExposure, PostFX);
 
         var bloomTexture = 0;
         if (PostFX.BloomEnabled)

@@ -94,13 +94,16 @@ void main() {
         }
     vec3 clampedHistory = clamp(history.rgb, lo, hi);
 
-    // EMA. history.a here reuses the strength channel's high bits is NOT done — we track frame
-    // count separately is overkill for SSR; a fixed blend converges fast enough and stays simple.
-    // Blend toward the current march by 1/MaxHistory; the clamp already rejects stale ghosts.
+    // EMA on BOTH colour AND strength. The march hit/miss is binary per frame, so the raw current.a
+    // blinks between the hit strength and 0 at march boundaries — passing it straight through made the
+    // reflection STRENGTH flicker even though the colour was smoothed (the audit's correction to this
+    // pass). Accumulate the alpha too, and on a current-frame MISS hold the history colour (don't let
+    // it collapse to black) so a momentarily-lost hit fades out smoothly instead of snapping off.
     float alpha = 1.0 / max(MaxHistory, 1.0);
-    vec3 accumulated = mix(clampedHistory, current.rgb, alpha);
+    bool currentMiss = current.a < 0.001;
+    vec3 colourTarget = currentMiss ? clampedHistory : current.rgb; // hold history colour on a miss
+    vec3 accumulated = mix(clampedHistory, colourTarget, alpha);
+    float accA = mix(history.a, current.a, alpha);                  // strength fades, never blinks
 
-    // Strength: take the CURRENT frame's (it encodes this-frame fresnel/edge/rough fades, which
-    // are view-dependent and shouldn't lag); only the reflected COLOUR is temporally smoothed.
-    FragColor = vec4(Sanitize(accumulated), current.a);
+    FragColor = vec4(Sanitize(accumulated), accA);
 }
