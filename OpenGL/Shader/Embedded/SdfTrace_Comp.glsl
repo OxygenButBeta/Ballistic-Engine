@@ -518,5 +518,37 @@ void main() {
     gathered /= float(RAY_COUNT);
     gathered = Sanitize(gathered);
 
+    // GLOSSY OFF-SCREEN REFLECTION (Lumen-style): SSR only reflects ON-SCREEN geometry; a single
+    // SDF sphere-trace along the reflection vector reaches OFF-SCREEN surfaces SSR can't, reading
+    // the same stable surface-cache radiance. Weighted by how SMOOTH the surface is (rough surfaces
+    // need no sharp reflection — their off-screen bounce is already the diffuse gather above), so it
+    // adds sharp off-screen reflections to glossy surfaces only. Blended into the same additive GI
+    // output (no new buffer): for smooth surfaces it dominates, for rough it fades to ~0. The pixel's
+    // roughness is packed in the normal texture alpha (a, +2 if metallic — same as SSR_Frag).
+    float rough = nr.a - (nr.a >= 1.5 ? 2.0 : 0.0);
+    float gloss = 1.0 - smoothstep(0.05, 0.6, rough);   // smooth=1, rough(>0.6)=0
+    if (gloss > 0.01) {
+        vec3 viewDir = normalize(worldP - (InvView * vec4(0.0, 0.0, 0.0, 1.0)).xyz); // camera->point
+        vec3 refl = reflect(viewDir, worldN);
+        vec3 rp = worldP + worldN * SELF_SKIP;
+        float rtrav = 0.0; bool rhit = false; uint rslot = 0u; vec3 rlocal = vec3(0.0);
+        for (int s = 0; s < MAX_STEPS; ++s) {
+            uint ns; vec3 nl; bool any;
+            float d = SanitizeF(SceneSdf(rp, ns, nl, any));
+            if (any && d < HIT_EPS && rtrav >= SELF_SKIP) { rhit = true; rslot = ns; rlocal = nl; break; }
+            float adv = any ? max(d, MIN_STEP) : EMPTY_STEP;
+            rp += refl * adv; rtrav += adv;
+            if (rtrav >= MAX_DIST) break;
+        }
+        if (rhit) {
+            vec4 rc = SampleRadiance(rslot, rlocal);
+            vec3 reflRad = rc.a > 0.01 ? Sanitize(rc.rgb)
+                                       : Sanitize(HitDirect(rp, SceneGradient(rp)));
+            // Mix the sharp reflection into the gather by glossiness. (The composite is additive and
+            // the diffuse already carried the rough-surface bounce, so this only lifts glossy hits.)
+            gathered = mix(gathered, reflRad, gloss * 0.5);
+        }
+    }
+
     imageStore(OutGi, px, vec4(gathered, 1.0));
 }
