@@ -562,19 +562,27 @@ public class GLHDRenderer : HDRenderer {
 
         screenAoTexture = 0; // probe captures shade without screen AO (wrong camera)
 
-        // Irradiance probe bake: time-sliced (a few ms per frame, so the editor keeps painting
-        // and the busy overlay shows progress) with a VOLUME-fitted shadow map, so captures
-        // don't depend on where the editor camera happens to be mid-bake. Cached results load
-        // instead of re-baking. Runs BEFORE the view cascade fit below, which then rebuilds
-        // every cascade field the bake borrowed.
-        using (probeBake is not null ? timers.Time("ProbeBake") : default)
-            StepProbeBake(preExposure);
-        // Local reflection probe bake: same time-sliced, volume-fitted-shadow machinery as the
-        // diffuse bake, but it keeps each captured cubemap on the GPU and GGX-prefilters it into a
-        // cube-array slice (no CPU readback / SH integration). Runs after the diffuse bake so the
-        // two share one frame's shadow override; the cascade fit below rebuilds the borrowed fields.
-        using (reflectionBake is not null ? timers.Time("ReflectionBake") : default)
-            StepReflectionBake(preExposure);
+        // LUMEN OWNS THE GI: when the Lumen (GDF) path is active it is the FULL real-time GI solution —
+        // the legacy IrradianceVolume (diffuse light probes) + ReflectionVolume (specular cubemaps) are
+        // a SEPARATE GI model that double-counts with Lumen and costs the slow probe/reflection bakes.
+        // So skip BOTH bakes and don't let them contribute (UseProbeVolume/UseReflectionVolume are gated
+        // on these ready flags below). Lumen provides the diffuse bounce; Lumen reflections (later) the
+        // specular. (The classes stay for back-compat / non-Lumen scenes; they're just inert here.)
+        bool lumenOwnsGi = sdfGiEnabled || PostFX.GiSdfForceEnabled;
+        if (lumenOwnsGi) {
+            probeVolumeReady = false;
+            reflectionVolumeReady = false;
+        }
+        else {
+            // Irradiance probe bake: time-sliced, VOLUME-fitted-shadow, cached. Runs BEFORE the view
+            // cascade fit below, which then rebuilds every cascade field the bake borrowed.
+            using (probeBake is not null ? timers.Time("ProbeBake") : default)
+                StepProbeBake(preExposure);
+            // Local reflection probe bake: same machinery; keeps each captured cubemap on the GPU and
+            // GGX-prefilters it into a cube-array slice. Runs after the diffuse bake (shared shadow).
+            using (reflectionBake is not null ? timers.Time("ReflectionBake") : default)
+                StepReflectionBake(preExposure);
+        }
 
         // Cascade layout from the Shadows volume (stack defaults when no volume overrides).
         var shadowDistance = MathF.Max(PostFX.ShadowMaxDistance, 1f);
