@@ -83,12 +83,18 @@ public sealed class GLSSAOPass {
         ssaoShader.SetFloat2("TexelSize", new Vector2(1f / width, 1f / height));
         GLBufferUtilities.DrawFullscreenQuad();
 
-        // Noise-hiding blur.
+        // Noise-hiding DEPTH-AWARE (bilateral) blur — weights taps by depth similarity so AO doesn't
+        // smear across silhouettes (the halo a plain box blur leaves around objects).
         GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
             TextureTarget.Texture2D, blurTexture, 0);
         blurShader.Activate();
+        GL.ActiveTexture(TextureUnit.Texture0);
         GL.BindTexture(TextureTarget.Texture2D, aoTexture);
         blurShader.SetInt("aoTexture", 0);
+        GL.ActiveTexture(TextureUnit.Texture1);
+        GL.BindTexture(TextureTarget.Texture2D, depthTexture);
+        blurShader.SetInt("depthTexture", 1);
+        blurShader.SetMatrix4("InvProjection", ref invProjection);
         GLBufferUtilities.DrawFullscreenQuad();
 
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
