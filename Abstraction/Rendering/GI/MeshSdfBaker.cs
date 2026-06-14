@@ -51,7 +51,18 @@ public static class MeshSdfBaker {
     // cell count (cubic-ish over the box). Returns null if there are no triangles. Heavy — call on a
     // background thread (the parallel grid loop is here, but a 128^3 bake over a room is hundreds of ms).
     public static MeshSdf BakeWorldTriangles(System.Collections.Generic.List<Vector3> worldVerts,
-        Vector3 boundsMin, Vector3 boundsMax, Vector3i res) {
+        Vector3 boundsMin, Vector3 boundsMax, Vector3i res) =>
+        BakeWorldTriangles(worldVerts, null, boundsMin, boundsMax, res, out _);
+
+    // Overload that ALSO bakes a per-voxel ALBEDO field (the nearest triangle's material colour). For
+    // the Lumen voxel-lighting surface cache: a voxel bounces light tinted by its OWN surface albedo
+    // (a red wall bounces red), not one global grey. `triAlbedo` is one Vector3 (linear RGB) per
+    // TRIANGLE (worldVerts.Count/3 entries), matched by index. `albedoOut` is RGB-packed (x-fastest,
+    // 3 floats/voxel) or null if triAlbedo is null. Same distance/sign math as the base overload.
+    public static MeshSdf BakeWorldTriangles(System.Collections.Generic.List<Vector3> worldVerts,
+        System.Collections.Generic.List<Vector3> triAlbedo, Vector3 boundsMin, Vector3 boundsMax,
+        Vector3i res, out float[] albedoOut) {
+        albedoOut = null;
         int triCount = worldVerts.Count / 3;
         if (triCount == 0)
             return null;
@@ -62,6 +73,8 @@ public static class MeshSdfBaker {
         res = new Vector3i(Math.Max(2, res.X), Math.Max(2, res.Y), Math.Max(2, res.Z));
         var bvh = new TriangleBvh(tris);
         var distances = new float[res.X * res.Y * res.Z];
+        bool wantAlbedo = triAlbedo != null && triAlbedo.Count == triCount;
+        float[] albedo = wantAlbedo ? new float[res.X * res.Y * res.Z * 3] : null;
         Vector3 cellSize = (boundsMax - boundsMin) / new Vector3(res.X, res.Y, res.Z);
 
         System.Threading.Tasks.Parallel.For(0, res.Z, z => {
@@ -69,12 +82,21 @@ public static class MeshSdfBaker {
                 for (int x = 0; x < res.X; x++) {
                     Vector3 p = boundsMin + new Vector3(
                         (x + 0.5f) * cellSize.X, (y + 0.5f) * cellSize.Y, (z + 0.5f) * cellSize.Z);
-                    float unsigned = MathF.Sqrt(bvh.ClosestDistanceSq(p));
+                    int idx = x + res.X * (y + res.Y * z);
+                    float unsigned;
+                    if (wantAlbedo) {
+                        unsigned = MathF.Sqrt(bvh.ClosestDistanceSq(p, out int triIndex));
+                        Vector3 a = triIndex >= 0 ? triAlbedo[triIndex] : new Vector3(0.5f);
+                        albedo[idx * 3] = a.X; albedo[idx * 3 + 1] = a.Y; albedo[idx * 3 + 2] = a.Z;
+                    } else {
+                        unsigned = MathF.Sqrt(bvh.ClosestDistanceSq(p));
+                    }
                     bool inside = bvh.IsInside(p);
-                    distances[x + res.X * (y + res.Y * z)] = inside ? -unsigned : unsigned;
+                    distances[idx] = inside ? -unsigned : unsigned;
                 }
             }
         });
+        albedoOut = albedo;
         return new MeshSdf(res, boundsMin, boundsMax, distances);
     }
 

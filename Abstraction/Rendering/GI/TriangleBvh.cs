@@ -102,20 +102,32 @@ internal sealed class TriangleBvh {
     // ---- Closest distance (squared) ---------------------------------------
     public float ClosestDistanceSq(Vector3 p) {
         float best = float.MaxValue;
-        ClosestRecursive(0, p, ref best);
+        int dummy = -1;
+        ClosestRecursive(0, p, ref best, ref dummy, false);
         return best;
     }
 
-    void ClosestRecursive(int nodeIndex, Vector3 p, ref float best) {
+    // Variant that also reports the ORIGINAL-array index of the nearest triangle (for per-voxel
+    // material lookup — the Lumen albedo clipmap reads the nearest surface's material colour). The
+    // index is into the `tris` array as passed to the ctor (1:1 with the caller's per-triangle data).
+    public float ClosestDistanceSq(Vector3 p, out int triIndex) {
+        float best = float.MaxValue;
+        triIndex = -1;
+        ClosestRecursive(0, p, ref best, ref triIndex, true);
+        return best;
+    }
+
+    void ClosestRecursive(int nodeIndex, Vector3 p, ref float best, ref int bestTri, bool trackTri) {
         ref Node node = ref nodes[nodeIndex];
         if (AabbDistanceSq(node.Min, node.Max, p) >= best)
             return;
 
         if (IsLeaf(node)) {
             for (int i = node.Start; i < node.Start + node.Count; i++) {
-                MeshSdfBaker.Triangle t = tris[order[i]];
+                int ti = order[i];
+                MeshSdfBaker.Triangle t = tris[ti];
                 float d = PointTriangleDistanceSq(p, t.A, t.B, t.C);
-                if (d < best) best = d;
+                if (d < best) { best = d; if (trackTri) bestTri = ti; }
             }
             return;
         }
@@ -126,11 +138,11 @@ internal sealed class TriangleBvh {
         float dr = AabbDistanceSq(nodes[right].Min, nodes[right].Max, p);
         // Descend the nearer child first so `best` tightens before pruning the far one.
         if (dl <= dr) {
-            ClosestRecursive(left, p, ref best);
-            ClosestRecursive(right, p, ref best);
+            ClosestRecursive(left, p, ref best, ref bestTri, trackTri);
+            ClosestRecursive(right, p, ref best, ref bestTri, trackTri);
         } else {
-            ClosestRecursive(right, p, ref best);
-            ClosestRecursive(left, p, ref best);
+            ClosestRecursive(right, p, ref best, ref bestTri, trackTri);
+            ClosestRecursive(left, p, ref best, ref bestTri, trackTri);
         }
     }
 

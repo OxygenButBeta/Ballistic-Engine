@@ -18,6 +18,7 @@ layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 // This cascade's distance field (read: occupancy + gradient normal) and the radiance WRITE target.
 layout(binding = 0) uniform sampler3D DistanceField;                 // signed world-metre distance
 layout(rgba16f, binding = 1) uniform writeonly image3D RadianceOut;  // rgb = radiance, a = occupancy
+layout(binding = 14) uniform sampler3D AlbedoField;                  // per-voxel surface albedo (RGB)
 
 // Sky IBL (ambient/miss) + cascaded sun shadow (same convention as the march).
 layout(binding = 3) uniform samplerCube IrradianceMap;
@@ -43,8 +44,7 @@ uniform vec4  CascadeBias;
 uniform int   CascadeCountSun;    // # of SUN shadow cascades (distinct from the GDF cascades)
 uniform vec3  SunDirectionWorld;  // toward the sun
 uniform vec3  SunColor;
-uniform vec3  Albedo;             // one neutral-ish albedo for the global field (no per-voxel material
-                                  // in v1 — Phase: per-card albedo). Mid-grey reads the room's character.
+uniform vec3  Albedo;             // FALLBACK albedo when the per-voxel albedo field is empty/black.
 
 const float PI = 3.14159265359;
 
@@ -153,11 +153,17 @@ void main() {
     vec3 direct = SunColor * (ndl * vis);
     vec3 bounce = GatherBounce(worldP, n, CascadeCell);
 
+    // PER-VOXEL ALBEDO (Lumen surface-cache albedo): the nearest surface's material colour, so this
+    // voxel bounces ITS OWN colour — a red wall bounces red. Falls back to the uniform grey where the
+    // albedo field is empty (un-baked / black material).
+    vec3 albedo = texelFetch(AlbedoField, v, 0).rgb;
+    if (dot(albedo, albedo) < 1e-4) albedo = Albedo;
+
     // Energy-bounded multi-bounce (same reasoning as the per-mesh inject): clamp bounce albedo so the
     // R = direct*a + a*R_prev recurrence converges (a->1 white walls would otherwise explode), and a
     // hard cap on the stored value as a final safety. Sky enters via the gather's missed rays.
-    vec3 bounceAlbedo = min(Albedo, vec3(0.9));
-    vec3 radiance = (Albedo / PI) * direct + bounceAlbedo * bounce;
+    vec3 bounceAlbedo = min(albedo, vec3(0.9));
+    vec3 radiance = (albedo / PI) * direct + bounceAlbedo * bounce;
     radiance = Sanitize(radiance);
 
     vec4 old = texelFetch(GdfRadiance[Cascade], v, 0);

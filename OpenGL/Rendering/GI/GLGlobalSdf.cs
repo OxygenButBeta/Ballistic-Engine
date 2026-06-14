@@ -42,6 +42,10 @@ public sealed class GLGlobalSdf : IDisposable {
     // every near-surface voxel (sun + shadow + sky + one bounce from last frame), so a GDF hit reads
     // STABLE, COLORED, multi-bounce radiance here instead of the neutral direct estimate. Ping-pong
     // (read last frame, write this frame) avoids same-frame feedback — the per-mesh RadianceInject pattern.
+    // Per-voxel ALBEDO clipmap (RGBA8, the nearest surface's material colour). The voxel-lighting inject
+    // multiplies the bounce by THIS so a red wall bounces red (Lumen surface-cache albedo), not one grey.
+    readonly int[] albedoTex = new int[CascadeCount];
+
     readonly int[] radianceA = new int[CascadeCount];  // RGBA16F radiance, ping-pong A
     readonly int[] radianceB = new int[CascadeCount];
     readonly int[] radianceRead = new int[CascadeCount]; // PER-cascade flag (we light one cascade/frame,
@@ -53,7 +57,7 @@ public sealed class GLGlobalSdf : IDisposable {
     public bool Available { get; private set; } // at least cascade 0 has been baked + uploaded once
 
     // Triangle snapshot + bake job state (background).
-    sealed class BakeResult { public int Cascade; public MeshSdf Sdf; public Vector3 Min; public float Cell; }
+    sealed class BakeResult { public int Cascade; public MeshSdf Sdf; public float[] Albedo; public Vector3 Min; public float Cell; }
     Task<BakeResult> bakeTask;
     int bakeCascade = -1;
     int geometryStamp;          // hash of the opaque set's transforms+bounds; re-bake all on change
@@ -89,6 +93,15 @@ public sealed class GLGlobalSdf : IDisposable {
 
             radianceA[c] = CreateRadianceTexture();
             radianceB[c] = CreateRadianceTexture();
+
+            albedoTex[c] = GL.GenTexture();
+            GL.BindTexture(TextureTarget.Texture3D, albedoTex[c]);
+            GL.TexStorage3D(TextureTarget3d.Texture3D, 1, SizedInternalFormat.Rgba8, Resolution, Resolution, Resolution);
+            GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
+            GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
+            GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.ClampToEdge);
+            GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.ClampToEdge);
+            GL.TexParameter(TextureTarget.Texture3D, TextureParameterName.TextureWrapR, (int)TextureWrapMode.ClampToEdge);
         }
         GL.BindTexture(TextureTarget.Texture3D, 0);
 
@@ -166,6 +179,12 @@ public sealed class GLGlobalSdf : IDisposable {
             BakeResult r = bakeTask.Status == TaskStatus.RanToCompletion ? bakeTask.Result : null;
             if (r is { Sdf: not null }) {
                 UploadCascade(r.Cascade, r.Sdf, r.Min, r.Cell);
+                if (r.Albedo != null) {
+                    GL.BindTexture(TextureTarget.Texture3D, albedoTex[r.Cascade]);
+                    GL.TexSubImage3D(TextureTarget.Texture3D, 0, 0, 0, 0,
+                        r.Sdf.Res.X, r.Sdf.Res.Y, r.Sdf.Res.Z, PixelFormat.Rgb, PixelType.Float, r.Albedo);
+                    GL.BindTexture(TextureTarget.Texture3D, 0);
+                }
                 cascadeBaked[r.Cascade] = true;
                 if (r.Cascade == 0) Available = true;
             }
@@ -212,6 +231,7 @@ public sealed class GLGlobalSdf : IDisposable {
         Vector3 cullMax = max + new Vector3(cell * 2f);
 
         var worldVerts = new List<Vector3>(4096);
+        var triAlbedo = new List<Vector3>(1400); // one linear-RGB albedo per triangle (Lumen albedo field)
         for (int i = 0; i < opaque.Count; i++) {
             IStaticMeshRenderer r = opaque[i];
             if (r is not { IsRenderable: true, IsActive: true })
@@ -236,6 +256,8 @@ public sealed class GLGlobalSdf : IDisposable {
                 Material mat = r.MaterialFor(s);
                 if (mat is { Cutout: true })
                     continue; // foliage/thin shells: excluded from SDF (Lumen handles via screen traces)
+                // The submesh's material base colour (linear RGB) — the surface albedo this voxel bounces.
+                Vector3 alb = mat != null ? mat.BaseColorFactor.Xyz : new Vector3(0.5f);
                 SubMeshData sm = subs[s];
                 int end = sm.IndexStart + sm.IndexCount;
                 if (end > idx.Length)
@@ -252,6 +274,7 @@ public sealed class GLGlobalSdf : IDisposable {
                         tmax.Z < cullMin.Z || tmin.Z > cullMax.Z)
                         continue;
                     worldVerts.Add(a); worldVerts.Add(b); worldVerts.Add(cc);
+                    triAlbedo.Add(alb);
                 }
             }
         }
@@ -269,10 +292,9 @@ public sealed class GLGlobalSdf : IDisposable {
         cascadeCell[cascade] = cell;
         var res = new Vector3i(Resolution);
         bakeCascade = cascade;
-        bakeTask = Task.Run(() => new BakeResult {
-            Cascade = cascade,
-            Sdf = MeshSdfBaker.BakeWorldTriangles(worldVerts, min, max, res),
-            Min = min, Cell = cell,
+        bakeTask = Task.Run(() => {
+            MeshSdf sdf = MeshSdfBaker.BakeWorldTriangles(worldVerts, triAlbedo, min, max, res, out float[] alb);
+            return new BakeResult { Cascade = cascade, Sdf = sdf, Albedo = alb, Min = min, Cell = cell };
         });
     }
 
@@ -320,10 +342,12 @@ public sealed class GLGlobalSdf : IDisposable {
         GL.UseProgram(injectProgram);
         // Write target: this cascade's WRITE radiance texture as image 1.
         GL.BindImageTexture(1, RadianceWrite(c), 0, true, 0, TextureAccess.WriteOnly, SizedInternalFormat.Rgba16f);
-        // This cascade's distance field (unit 0), sky (3), sun shadow (5).
+        // This cascade's distance field (unit 0), sky (3), sun shadow (5), albedo field (14).
         BindSampler(0, TextureTarget.Texture3D, textures[c]);
         BindSampler(3, TextureTarget.TextureCubeMap, irradianceCubemap);
         BindSampler(5, TextureTarget.Texture2DArray, shadowMapArray);
+        BindSampler(14, TextureTarget.Texture3D, albedoTex[c]);
+        GL.Uniform1(GL.GetUniformLocation(injectProgram, "AlbedoField"), 14);
         // The whole GDF: distances on units 6..9, LAST frame's radiance on units 10..13 (for the bounce).
         for (int k = 0; k < CascadeCount; k++) {
             BindSampler(6 + k, TextureTarget.Texture3D, textures[k]);
@@ -380,7 +404,9 @@ public sealed class GLGlobalSdf : IDisposable {
             if (textures[c] != 0) GL.DeleteTexture(textures[c]);
             if (radianceA[c] != 0) GL.DeleteTexture(radianceA[c]);
             if (radianceB[c] != 0) GL.DeleteTexture(radianceB[c]);
+            if (albedoTex[c] != 0) GL.DeleteTexture(albedoTex[c]);
         }
+        if (injectProgram != 0) GL.DeleteProgram(injectProgram);
         Available = false;
     }
 }
