@@ -47,6 +47,15 @@ uniform vec3  SunDirectionWorld;  // toward the sun
 uniform vec3  SunColor;
 uniform vec3  Albedo;             // FALLBACK albedo when the per-voxel albedo field is empty/black.
 
+// PUNCTUAL (point) lights injected into the surface cache so a point-lit interior (no sun) still gets
+// Lumen bounce — real Lumen lights ALL light types into the cache. Pre-exposed colours (same units as
+// SunColor). Inverse-square falloff with a smooth range cutout, matching the forward lit pass.
+#define MAX_GI_POINTS 8
+uniform int   PointCount;
+uniform vec3  PointPos[MAX_GI_POINTS];     // world-space
+uniform vec3  PointColor[MAX_GI_POINTS];   // pre-exposed radiant intensity
+uniform float PointRange[MAX_GI_POINTS];
+
 const float PI = 3.14159265359;
 
 vec3 Sanitize(vec3 v) {
@@ -187,6 +196,24 @@ void main() {
     float ndl = max(dot(n, normalize(SunDirectionWorld)), 0.0);
     float vis = SampleSunVisibility(litPos);
     vec3 direct = SunColor * (ndl * vis);
+
+    // PUNCTUAL lights -> the surface cache. Without this a point-lit interior (no sun) gets ZERO Lumen
+    // bounce (BistroInterior's lamps were absent from the GI). Inverse-square + smooth range cutout +
+    // NdotL, matching the forward lit pass. (Point-light SDF shadowing is a later refinement; for a
+    // diffuse bounce cache the unshadowed contribution already fills the room far better than nothing.)
+    for (int i = 0; i < PointCount && i < MAX_GI_POINTS; ++i) {
+        vec3 toL = PointPos[i] - litPos;
+        float dist2 = dot(toL, toL);
+        float dist = sqrt(max(dist2, 1e-6));
+        vec3 L = toL / dist;
+        float pndl = max(dot(n, L), 0.0);
+        if (pndl <= 0.0) continue;
+        float invSq = 1.0 / max(dist2, 0.01);                 // inverse-square
+        float rr = clamp(1.0 - dist / max(PointRange[i], 1e-3), 0.0, 1.0);
+        float window = rr * rr;                                // smooth range cutout
+        direct += PointColor[i] * (pndl * invSq * window);
+    }
+
     vec3 bounce = GatherBounce(worldP, n, CascadeCell);
 
     // PER-VOXEL ALBEDO (Lumen surface-cache albedo): the nearest surface's material colour, so this

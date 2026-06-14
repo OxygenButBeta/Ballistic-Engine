@@ -95,6 +95,10 @@ public sealed class GLGlobalSdf : IDisposable {
             ? Math.Clamp(v, 0f, 8f) : 2f;
     }
     int liCascadeCountSun, liSunDir, liSunColor, liAlbedo, liCascadeBias;
+    int liPointCount;
+    readonly int[] liPointPos = new int[8];
+    readonly int[] liPointColor = new int[8];
+    readonly int[] liPointRange = new int[8];
     readonly int[] liCascadeMatrices = new int[4];
     readonly int[] liGdfMin = new int[CascadeCount];
     readonly int[] liGdfCell = new int[CascadeCount];
@@ -172,6 +176,12 @@ public sealed class GLGlobalSdf : IDisposable {
         liSunColor = GL.GetUniformLocation(injectProgram, "SunColor");
         liAlbedo = GL.GetUniformLocation(injectProgram, "Albedo");
         liCascadeBias = GL.GetUniformLocation(injectProgram, "CascadeBias");
+        liPointCount = GL.GetUniformLocation(injectProgram, "PointCount");
+        for (int i = 0; i < 8; i++) {
+            liPointPos[i] = GL.GetUniformLocation(injectProgram, $"PointPos[{i}]");
+            liPointColor[i] = GL.GetUniformLocation(injectProgram, $"PointColor[{i}]");
+            liPointRange[i] = GL.GetUniformLocation(injectProgram, $"PointRange[{i}]");
+        }
         for (int i = 0; i < 4; i++)
             liCascadeMatrices[i] = GL.GetUniformLocation(injectProgram, $"CascadeMatrices[{i}]");
         for (int i = 0; i < CascadeCount; i++) {
@@ -472,7 +482,8 @@ public sealed class GLGlobalSdf : IDisposable {
     // last frame's radiance (samplers), write this frame's, then SwapRadiance so the march reads fresh.
     public void InjectRadiance(int irradianceCubemap, int shadowMapArray, Matrix4[] sunCascades,
         Vector4 sunBias, int sunCascadeCount, Vector3 sunDir, Vector3 sunColor, Vector3 albedo,
-        float skyExposure, float feedback) {
+        float skyExposure, float feedback,
+        int pointCount = 0, Vector3[] pointPos = null, Vector3[] pointColor = null, float[] pointRange = null) {
         if (!Available || injectProgram == 0)
             return;
         int c = radianceInjectCursor;
@@ -517,6 +528,15 @@ public sealed class GLGlobalSdf : IDisposable {
         GL.Uniform3(liSunDir, sunDir);
         GL.Uniform3(liSunColor, sunColor);
         GL.Uniform3(liAlbedo, albedo);
+
+        // Punctual lights into the surface cache (so point-lit interiors get Lumen bounce).
+        int pc = pointPos == null ? 0 : Math.Min(pointCount, Math.Min(8, pointPos.Length));
+        GL.Uniform1(liPointCount, pc);
+        for (int i = 0; i < pc; i++) {
+            GL.Uniform3(liPointPos[i], pointPos[i].X, pointPos[i].Y, pointPos[i].Z);
+            GL.Uniform3(liPointColor[i], pointColor[i].X, pointColor[i].Y, pointColor[i].Z);
+            GL.Uniform1(liPointRange[i], pointRange[i]);
+        }
 
         int g = (Resolution + 3) / 4;
         GL.DispatchCompute(g, g, g);
