@@ -102,6 +102,8 @@ public sealed class GpuMaterialTable : IDisposable {
             NormalStrength = m.NormalStrength * gNormal,
             Opacity = m.Opacity,
             SpecularReflectance = m.SpecularReflectance,
+            Clearcoat = m.Clearcoat,
+            ClearcoatRoughness = m.ClearcoatRoughness,
             Flags = flags,
         };
     }

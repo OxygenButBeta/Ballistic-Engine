@@ -106,6 +106,8 @@ uniform vec4 BaseColorFactor;  // glTF baseColorFactor: tints the albedo map (an
 uniform float MetallicMultiplier;   // material metallicFactor x debug global
 uniform float RoughnessMultiplier;  // material roughnessFactor x debug global
 uniform float SpecularReflectance;  // glTF KHR_materials_specular: dielectric F0 = 0.08*this (0.5 = 4%)
+uniform float Clearcoat;            // glTF KHR_materials_clearcoat: thin lacquer layer strength (0 = none)
+uniform float ClearcoatRoughness;   // the coat's own roughness (low = sharp varnish reflection)
 uniform bool PackedOrm;        // Metallic tex = (occlusion, roughness, metallic) RGB
 uniform bool HasMetallicMap;   // metallic texture assigned (otherwise the factor stands alone)
 uniform bool HasRoughnessMap;  // separate roughness texture assigned
@@ -829,6 +831,46 @@ void main()
 
     // --- Emissive (unlit, unoccluded; bloom picks it up) ---
     vec3 emissive = HasEmissive ? texture(Emissive, texCoord).rgb * EmissiveFactor : vec3(0.0);
+
+    // --- CLEARCOAT (KHR_materials_clearcoat): a thin lacquer layer over the base — car paint,
+    // varnish, wet stone. A second GGX specular lobe with fixed F0 0.04 and its OWN low roughness
+    // (a sharp coat reflection on top of a rough base), plus it ATTENUATES the base layers by its
+    // Fresnel (energy that reflects off the coat doesn't reach the base). Clearcoat 0 = no change. ---
+    if (Clearcoat > 0.0) {
+        float ccRough = clamp(ClearcoatRoughness, 0.02, 1.0);
+        float ccF0 = 0.04;
+        float ccFresnel = ccF0 + (1.0 - ccF0) * pow(1.0 - NdotV, 5.0);
+        float ccAtten = 1.0 - Clearcoat * ccFresnel;   // base sees less light under the coat
+
+        // Coat IBL specular: prefiltered env at the coat's (low) roughness, no metal tint (the coat
+        // is dielectric). Uses the same SkyDir-rotated prefiltered map as the base reflection.
+        vec3 ccR = reflect(-V, N);
+        float ccMip = clamp(ccRough * MaxPrefilterMips, 0.0, MaxPrefilterMips);
+        vec3 ccEnv = textureLod(PrefilteredEnvMap, SkyDir(ccR), ccMip).rgb * SkyExposure;
+        vec2 ccBrdf = texture(BRDF_LUT, vec2(NdotV, ccRough)).rg;
+        vec3 ccSpecIBL = ccEnv * (ccF0 * ccBrdf.x + ccBrdf.y) * specOcclusion;
+
+        // Coat sun lobe: a sharp GGX highlight from the sun disk direction at the coat roughness.
+        vec3 ccSun = vec3(0.0);
+        {
+            vec3 Dc = normalize(LightDirection);
+            float NdotLc = max(dot(N, Dc), 0.0);
+            if (NdotLc > 0.0) {
+                vec3 Hc = normalize(V + Dc);
+                float NDFc = DistributionGGX(N, Hc, ccRough);
+                float Gc = GeometrySmith(N, V, Dc, ccRough);
+                float Fc = ccF0 + (1.0 - ccF0) * pow(1.0 - max(dot(Hc, V), 0.0), 5.0);
+                float specc = (NDFc * Gc * Fc) / max(4.0 * NdotV * NdotLc, EPS);
+                ccSun = LightColor * mix(ShadowColor, vec3(1.0), shadow) * (specc * NdotLc);
+            }
+        }
+
+        // Attenuate the base contributions, then add the coat on top.
+        diffuseLight *= ccAtten;  specularLight *= ccAtten;
+        ambientDiffuse *= ccAtten; ambientSpecular *= ccAtten;
+        ambientSpecular += ccSpecIBL * Clearcoat;
+        specularLight += ccSun * Clearcoat;
+    }
 
     // Premultiplied composition: transmission (diffuse + emissive) fades with alpha, while
     // reflections keep full strength — glass stays reflective as it becomes see-through.

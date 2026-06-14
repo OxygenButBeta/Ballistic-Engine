@@ -3622,6 +3622,8 @@ public class GLHDRenderer : HDRenderer {
         shader.SetFloat("MetallicMultiplier", material.MetallicFactor * Metallic);
         shader.SetFloat("RoughnessMultiplier", material.RoughnessFactor * RoughnessValue);
         shader.SetFloat("SpecularReflectance", material.SpecularReflectance);
+        shader.SetFloat("Clearcoat", material.Clearcoat);
+        shader.SetFloat("ClearcoatRoughness", material.ClearcoatRoughness);
         shader.SetBool("PackedOrm", material.PackedOrm);
         shader.SetBool("HasMetallicMap", material.Metallic is not null);
         shader.SetBool("HasRoughnessMap", material.Roughness is not null);

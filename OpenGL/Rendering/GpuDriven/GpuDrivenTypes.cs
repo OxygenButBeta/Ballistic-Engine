@@ -72,8 +72,8 @@ public struct GpuMaterial {
     // bit4 HasEmissive, bit5 AlphaBlend, bit6 AlphaCutout, bit7 HasDiffuse, bit8 HasNormal, bit9 HasAO
     public uint Flags;
     public float SpecularReflectance;   // glTF KHR_materials_specular (dielectric F0 = 0.08*this); was Pad0
-    public uint Pad1;
-    public uint Pad2;                   // 16B
+    public float Clearcoat;             // KHR_materials_clearcoat strength; was Pad1
+    public float ClearcoatRoughness;    // the coat's roughness; was Pad2  (16B)
 
     // 48 + 16 + 16 + 16 + 16 = 112 bytes.
     public const int SizeBytes = 112;

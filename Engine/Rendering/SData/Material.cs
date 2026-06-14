@@ -35,6 +35,12 @@ public class Material : BObject
     // for chalk/cloth. Metals ignore it (F0 = albedo). The renderer multiplies F0's dielectric base.
     public float SpecularReflectance { get; set; } = 0.5f;
 
+    // CLEARCOAT (glTF KHR_materials_clearcoat): a thin transparent lacquer layer over the base —
+    // car paint, varnish, wet surfaces. A second GGX specular lobe (fixed F0 ~0.04) with its own
+    // low roughness, plus it attenuates the base layer by its Fresnel. 0 = no coat (default, off).
+    public float Clearcoat { get; set; }
+    public float ClearcoatRoughness { get; set; } = 0.1f;
+
     // Normal map controls. FlipY = DirectX-convention map (G down), the common game-content case.
     public float NormalStrength { get; set; } = 1f;
     public bool NormalFlipY { get; set; } = true;
@@ -84,6 +90,8 @@ public class Material : BObject
             MetallicFactor = MetallicFactor,
             RoughnessFactor = RoughnessFactor,
             SpecularReflectance = SpecularReflectance,
+            Clearcoat = Clearcoat,
+            ClearcoatRoughness = ClearcoatRoughness,
             NormalStrength = NormalStrength,
             NormalFlipY = NormalFlipY,
             Transparent = Transparent,
