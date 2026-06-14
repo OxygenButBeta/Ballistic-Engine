@@ -240,6 +240,8 @@ public class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWin
         sb.Append($"  \"shadowedLights\": {rs.ShadowedLights},\n");
         sb.Append(string.Create(System.Globalization.CultureInfo.InvariantCulture,
             $"  \"gpuFrameMs\": {rs.GpuFrameMs:0.000},\n"));
+        sb.Append(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+            $"  \"cpuFrameMs\": {rs.CpuFrameMs:0.000},\n"));
         sb.Append("  \"gpuPasses\": {\n");
         for (int i = 0; i < rs.GpuPasses.Count; i++) {
             (string name, double ms) = rs.GpuPasses[i];

@@ -413,6 +413,7 @@ public class GLHDRenderer : HDRenderer {
 
     public override RenderMetrics BeginRender(RendererArgs args) {
         using var profileZone = Profiler.Zone("HD.BeginRender");
+        var cpuWatch = System.Diagnostics.Stopwatch.StartNew(); // CPU submission cost on the main thread
 
         var targetIndex = ActiveTarget == RenderTarget.Game ? 1 : 0;
         GLGpuTimers timers = gpuTimers[targetIndex];
@@ -934,6 +935,7 @@ public class GLHDRenderer : HDRenderer {
         GLRenderTexturePool.Shared.EndFrame();
 
         timers.EndFrame(stats);
+        stats.CpuFrameMs = cpuWatch.Elapsed.TotalMilliseconds; // main-thread render-submission cost
         return new RenderMetrics(stats.DrawCalls, 0, (int)stats.Triangles,
             stats.DrawsSavedByInstancing, (float)stats.GpuFrameMs);
     }

@@ -34,6 +34,11 @@ public sealed class RenderStats {
     public readonly List<(string Name, double Ms)> GpuPasses = new();
     public double GpuFrameMs;
 
+    // CPU time spent IN BeginRender (the render-submission cost on the main thread) — the budget that
+    // matters for future CPU-bound systems (anim/networking/physics). GPU pass timers don't capture
+    // this; the editor overlay + the .stats.json sidecar read it so CPU cost is AI-measurable.
+    public double CpuFrameMs;
+
     public void ResetSubmission() {
         DrawCalls = 0;
         DepthOnlyDrawCalls = 0;
