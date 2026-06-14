@@ -159,6 +159,10 @@ vec3 GatherBounce(vec3 worldP, vec3 n, float cell) {
                 break;
             }
             if (dist < hitEps && traveled > 3.0 * cell) { hit = true; hp = p; break; }
+            // THIN-WALL LEAK fix: a negative distance means the ray entered solid (crossed a surface
+            // the coarse SDF couldn't resolve as a hit) — stop here so the bounce can't pass through a
+            // thin wall and gather light from the lit far side.
+            if (dist < 0.0 && traveled > 3.0 * cell) { hit = true; hp = p; break; }
             float adv = max(dist, 0.5 * cell); // sphere-trace step, floored so we never stall
             p += dir * adv; traveled += adv;
             if (traveled >= MAXD) break;

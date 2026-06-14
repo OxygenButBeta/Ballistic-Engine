@@ -540,8 +540,17 @@ vec3 TraceRay(vec3 origin, vec3 dir, out bool hit) {
     for (int s = 0; s < MAX_STEPS; ++s) {
         uint nearSlot; vec3 nearLocal; bool anyInside;
         float dist = SanitizeF(SceneSdf(p, nearSlot, nearLocal, anyInside));
+        // Hit when near the surface (from outside) OR when the distance has gone NEGATIVE — the ray is
+        // now INSIDE solid, i.e. it just crossed a surface. The negative test is the THIN-WALL LEAK fix:
+        // a wall thinner than the SDF can resolve never makes a sampled point satisfy dist < HIT_EPS, so
+        // the ray used to step straight THROUGH it (max(dist,MIN_STEP) advance) and bring back light from
+        // the lit far side — light leaking through walls. Stopping at the negative crossing seals it.
         if (anyInside && dist < HIT_EPS && traveled >= SELF_SKIP) {
             hit = true; hitPoint = p; hitSlot = nearSlot; hitLocal = nearLocal; break;
+        }
+        if (anyInside && dist < 0.0 && traveled >= SELF_SKIP) {
+            hit = true; hitPoint = p - dir * min(-dist, MIN_STEP); // back up to the surface crossing
+            hitSlot = nearSlot; hitLocal = nearLocal; break;
         }
         float advance = anyInside ? max(dist, MIN_STEP) : EMPTY_STEP;
         p += dir * advance; traveled += advance;
