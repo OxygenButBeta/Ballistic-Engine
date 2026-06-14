@@ -490,9 +490,16 @@ vec3 HitRadiance(vec3 worldHit, vec3 hitN) {
 bool ScreenTrace(vec3 originWorld, vec3 dirWorld, out vec3 radiance, out float outDist) {
     radiance = vec3(0.0);
     outDist = MAX_DIST;
-    const int ST_STEPS = 16;
-    const float ST_MAXDIST = 4.0;   // screen traces handle only the NEAR field; SDF takes the far field
-    const float ST_THICK = 0.5;     // accept a hit when the ray is within this view-Z of the surface (m)
+    const int ST_STEPS = 12;
+    // GI REWORK Phase 0 (2026-06-14): clamp the screen trace to the NEAR field only (was 4.0m). Real
+    // Lumen screen-traces just the first ~0.5m for sharp contact bounce, then hands off to the world
+    // cache. At 4.0m the screen trace DOMINATED the mid-range and read the full lit scene colour
+    // (specular + emissive + texture + already-bounced light) AS IF it were diffuse irradiance — that
+    // is view-dependent, double-counts, and is a primary source of the flat warm wash. Mid/far bounce
+    // must come from the stable DIRECTIONAL world voxel cache (the SDF/GDF march below), not from
+    // on-screen colour reprojection.
+    const float ST_MAXDIST = 0.5;   // screen trace = sharp NEAR-field contact only; SDF/cache owns the rest
+    const float ST_THICK = 0.3;     // accept a hit when the ray is within this view-Z of the surface (m)
 
     float stepLen = ST_MAXDIST / float(ST_STEPS);
     for (int s = 1; s <= ST_STEPS; ++s) {

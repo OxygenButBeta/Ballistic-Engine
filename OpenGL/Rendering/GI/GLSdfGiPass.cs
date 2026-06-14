@@ -107,12 +107,15 @@ public sealed class GLSdfGiPass : IDisposable {
         return sb.ToString();
     }
 
-    // LUMEN PHASE 1 — Global Distance Field clipmap. When enabled (BALLISTIC_LUMEN_GDF=1, or always
-    // once Phase 1 is the default) the march samples this ONE merged field instead of the per-mesh
-    // brick grid, so fragmented per-object scenes get full coverage. Built lazily with the rest.
+    // LUMEN PHASE 1 — Global Distance Field clipmap. The march samples this ONE merged field instead
+    // of the per-mesh brick grid, so fragmented per-object scenes get full coverage. Built lazily with
+    // the rest. GI REWORK Phase 0 (2026-06-14): the GDF is now the DEFAULT GI path — the per-mesh brick
+    // path's gather reads on-screen lit colour as if it were diffuse irradiance (view-dependent, no
+    // off-screen scatter, the warm flat wash), so it can never produce real room-scale bounce. The GDF
+    // world voxel cache is the published-Lumen path. A/B back to the per-mesh path with BALLISTIC_LUMEN_GDF=0.
     GLGlobalSdf globalSdf;
     static readonly bool UseGlobalSdf =
-        Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_GDF") == "1";
+        Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_GDF") != "0";
     // Diagnostic: force the GDF march off the voxel radiance cache (use HitDirect grey instead).
     static readonly bool noRadianceCache =
         Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_NORADIANCE") == "1";

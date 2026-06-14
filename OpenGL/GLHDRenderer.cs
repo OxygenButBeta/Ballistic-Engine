@@ -45,6 +45,12 @@ public class GLHDRenderer : HDRenderer {
     // so the frame stays byte-identical to the baseline. Runs as a post pass right BEFORE SSGI.
     OpenGL.GI.GLSdfGiPass sdfGi;
     bool sdfGiEnabled;
+    // Lumen (the SDF/GDF GI) is the FULL real-time GI solution this frame — set when the env flag or the
+    // GlobalIllumination/Lumen volume override is on. When true, the legacy probe/reflection volumes go
+    // inert AND the flat AmbientFloor veil is dropped (GI REWORK Phase 0): the floor is a directionless
+    // fill that masks occlusion and competes with the directional bounce; real Lumen has no ambient floor —
+    // recesses fill with traced directional light. Kept on the non-Lumen path so legacy scenes don't crush.
+    bool LumenOwnsGi => sdfGiEnabled || PostFX.GiSdfForceEnabled;
     // Phase A GDF warm-up diagnostic (BALLISTIC_LUMEN_DIAG=1): log per-cascade bake progress for the
     // first frames so we can confirm cascade 0 is up within ~2 frames. Off by default — costs nothing.
     bool lumenDiag;
@@ -850,13 +856,14 @@ public class GLHDRenderer : HDRenderer {
                             $"sunColor=({sunColor.X:F2},{sunColor.Y:F2},{sunColor.Z:F2})");
                     lumenDiagFrame++;
                 }
-                // PROBE<->SDF-GI BLEND: probes are the diffuse BASE (they already carry the static
-                // enclosed-interior bounce); SDF-GI AUGMENTS with the dynamic off-screen delta. When
-                // probes are active, scale SDF-GI down so the two diffuse indirect terms don't
-                // double-count (the same rule as the SSGI overlap). With no probes, SDF-GI is the
-                // only off-screen indirect, so it runs at full strength. The volume's GiSdfIntensity
-                // multiplies on top so a scene can tune the dynamic bounce.
-                float sdfGiBlend = (probeVolumeReady ? 0.5f : 1f) * MathF.Max(0f, PostFX.GiSdfIntensityScale);
+                // SDF-GI STRENGTH. GI REWORK Phase 0: when Lumen owns the GI it is the SOLE diffuse
+                // indirect source (the probe volume is forced inert above), so it runs at FULL strength —
+                // the old (probeVolumeReady ? 0.5 : 1) halving assumed baked probes carried the static
+                // bounce and SDF-GI only augmented the dynamic delta, but probes don't cover off-screen
+                // dynamics and under Lumen they're off, so the 0.5 only diluted the one real GI signal.
+                // The volume's GiSdfIntensityScale still multiplies on top for per-scene tuning. (Non-Lumen
+                // scenes never reach here — wantSdfGi gates the whole block.)
+                float sdfGiBlend = MathF.Max(0f, PostFX.GiSdfIntensityScale);
                 litColor = sdfGi.Render(litColor, target.DepthTextureId, target.NormalTextureId,
                     irradianceMap, shadowMap.DepthTextureId, cascadeMatrices, cascadeBias,
                     activeCascadeCount, sunDirection, sunColor,
@@ -4217,7 +4224,10 @@ public class GLHDRenderer : HDRenderer {
         b.Set("ProbeIntensity", MathF.Max(PostFX.GiProbeIntensity, 0f));
         // Ambient floor pre-exposed to sit in the same space as the (pre-exposed) ambient diffuse,
         // so it reads as a consistent tiny shadow-fill regardless of EV (matches SkyExposure above).
-        b.Set("AmbientFloor", MathF.Max(PostFX.GiAmbientFloor, 0f) * skyExposureBase * PostFX.ExposureMultiplier);
+        // GI REWORK Phase 0: zero it when Lumen owns the GI — the directional bounce fills the recesses,
+        // and a flat floor would only mask the occlusion contrast Lumen exists to produce.
+        float ambientFloor = LumenOwnsGi ? 0f : MathF.Max(PostFX.GiAmbientFloor, 0f);
+        b.Set("AmbientFloor", ambientFloor * skyExposureBase * PostFX.ExposureMultiplier);
     }
 
     // The reflection volume that actually drives the shader this frame: a placed+active one wins;
@@ -4357,7 +4367,9 @@ public class GLHDRenderer : HDRenderer {
         }
         // Diffuse-probe ambient strength override (GlobalIllumination volume); 1 = unchanged.
         shader.SetFloat("ProbeIntensity", MathF.Max(PostFX.GiProbeIntensity, 0f));
-        shader.SetFloat("AmbientFloor", MathF.Max(PostFX.GiAmbientFloor, 0f) * skyExposureBase * PostFX.ExposureMultiplier);
+        // GI REWORK Phase 0: drop the flat ambient floor when Lumen owns the GI (see FillPassData).
+        float ambientFloorLegacy = LumenOwnsGi ? 0f : MathF.Max(PostFX.GiAmbientFloor, 0f);
+        shader.SetFloat("AmbientFloor", ambientFloorLegacy * skyExposureBase * PostFX.ExposureMultiplier);
 
         // Baked reflection volume: local prefiltered specular cubemaps (cube-map array + cell->layer
         // map). The cubes store PHYSICAL radiance, re-exposed by SkyExposure (already set above) at
