@@ -103,15 +103,35 @@ CornellBox -> commit. Keep a working fallback until each is proven.
   (inv-sq + range cutout + NdotL, up to 8). BistroInterior iso GI -> (1.3,0.4,0.1), warm lamp bounce
   visible. Point-light SDF SHADOWING in the cache is a TODO (currently unshadowed). Spot lights TODO too.
 
-### STATE: all 3 reference scenes have genuine colored multi-bounce GI (verified isolated bounce).
-SunTemple + BistroExterior are Lumen-class; BistroInterior now has (subtle, physically-correct) lamp
-bounce. An adversarial multi-lens review workflow (wf_fc2bace5-cec) is judging quality vs real Lumen.
+- **SKY-HALO FIX (bde61479)** — SdfGi_Combine now zeroes GI on sky pixels (depth>=1); the upsample's
+  1e-5 weight floor was leaking foreground GI into sky near silhouettes. + BALLISTIC_LUMEN_NOSCREEN diag.
+- **THIN-WALL LEAK FIX (038342f9)** — gather + GatherBounce now stop on a NEGATIVE distance crossing
+  (ray entered solid), not just dist<HIT_EPS. Walls thinner than the SDF could resolve were passed
+  through, leaking light from the lit far side (user-reported). Sealed BistroInterior through-floor leak.
+- **FIREFLY CLAMP (7b35bc98)** — pre-EMA clamp in SSGI_Temporal (luma to 4x 3x3 neighbourhood mean).
+  Tames isolated bright outliers; does NOT fix the dense few-ray speckle (see remaining).
 
-### NEXT — pick up the phase ladder / review-driven fixes:
-- Act on the review's confirmed defects first.
-- Recheck intensity 0.18 (tuned vs the BROKEN red GI; the bounce is now genuine/richer -> may want higher).
-- Point-light + spot-light SHADOWING in the GI cache (currently unshadowed punctual bounce).
-- Phase B (make Lumen the no-flag default); then reflections, world-space radiance probes, denoise polish.
+### ADVERSARIAL REVIEW (wf_fc2bace5-cec) — done. Verdict: "credible warm-AO-style fill, not yet real
+Lumen." Findings TRIAGED against code/measurement (review is vision-only — verify before acting):
+- F3 "no colored bleed": PARTIALLY REFUTED — measured red bleed EXISTS (floor near red marble R/G=1.46
+  vs neutral pillar 1.25). Real but subtle; masked by a global warm cast (F8).
+- F1 "isolated bounce looks like a beauty render": REAL — the gather reads surface-cache OUTGOING
+  radiance (lit appearance) + only 6 rays, so it carries surface texture detail, not a smooth diffuse
+  integral. Architectural (more samples / better integrate).
+- F6 sky halo: FIXED (bde61479). F-leak: FIXED (038342f9). F4 fireflies: PARTIAL (7b35bc98).
+- F2 point lights weak: point lights now inject (c7415d89) but interior bounce is dim; needs strength
+  + spot lights + shadowing.
+
+### REMAINING (architectural — do carefully, fresh verification each; NOT blind end-of-loop tweaks):
+- F4/F7 DENSE speckle + coarse voxel blocky artifacts: few-ray gather over the coarse GDF. Needs more
+  gather samples, stronger spatial denoise, and/or a finer clipmap level for interiors.
+- F5 FLAT AMBIENT VEIL washes occlusion: Frag.glsl line 880 `ambientDiffuse += kD*AmbientFloor*ao`
+  (GiAmbientFloor default 0.03) is a near-flat fill ignoring directional occlusion. CAUTION: it exists
+  to stop interior black-crush; lowering it risks the regression. Right fix = let the (now-working) GI
+  fill recesses so the floor can drop — needs the occlusion/denoise work first. A/B per scene.
+- F1 GI too high-frequency; F8 global warm cast (recheck if it's just warm-sun bounce vs an over-warm
+  GI tint); recheck intensity 0.18 (tuned vs the BROKEN red GI — bounce is genuine now, may want higher).
+- Point/spot SHADOWING in the cache; Phase B (no-flag default); reflections; world-space radiance probes.
 
 ### Phase B — make GDF+per-pixel the DEFAULT GI (no flag)
 - Once warm-up is fast + quality confirmed, drop BALLISTIC_SDFGI/LUMEN_GDF gating so Lumen is the
