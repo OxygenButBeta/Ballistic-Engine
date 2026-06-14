@@ -85,6 +85,13 @@ public sealed class GLSdfGiPass : IDisposable {
 
     public bool Available { get; private set; }
 
+    // LUMEN PHASE 1 — Global Distance Field clipmap. When enabled (BALLISTIC_LUMEN_GDF=1, or always
+    // once Phase 1 is the default) the march samples this ONE merged field instead of the per-mesh
+    // brick grid, so fragmented per-object scenes get full coverage. Built lazily with the rest.
+    GLGlobalSdf globalSdf;
+    static readonly bool UseGlobalSdf =
+        Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_GDF") == "1";
+
     // Not readonly: built lazily in EnsureAvailable (the first time Lumen is wanted), not the ctor.
     GLSdfAtlas atlas;
     GLSdfScene scene;
@@ -117,6 +124,11 @@ public sealed class GLSdfGiPass : IDisposable {
     int locCascadeBias, locCascadeCount, locSunDir, locSunColor, locHitAlbedo;
     int locGridMin, locGridInvCell, locGridRes, locViewProj;
     readonly int[] locCascadeMatrices = new int[4];
+    // Global distance field (Phase 1) uniform locations.
+    int locUseGlobalSdf, locGlobalSdfRes;
+    readonly int[] locGlobalSdf = new int[GLGlobalSdf.CascadeCount];
+    readonly int[] locGlobalSdfMin = new int[GLGlobalSdf.CascadeCount];
+    readonly int[] locGlobalSdfCell = new int[GLGlobalSdf.CascadeCount];
 
     // Half-res RGBA16F gather output (pass-owned — small, consumed same frame; not pooled because
     // we bind it as an image, so a stable id is required). The full-res composite goes to a pooled
@@ -213,7 +225,9 @@ public sealed class GLSdfGiPass : IDisposable {
             EmbeddedShaderSource.Read("SSGI_Denoise.glsl"));
 
         CacheUniformLocations();
-        Console.WriteLine("[SdfGI] resources built (Lumen enabled).");
+        if (UseGlobalSdf)
+            globalSdf = new GLGlobalSdf(resolution: 64, baseExtent: 16f);
+        Console.WriteLine($"[SdfGI] resources built (Lumen enabled{(UseGlobalSdf ? ", GLOBAL distance field" : "")}).");
         Available = true;
         return true;
     }
@@ -237,6 +251,15 @@ public sealed class GLSdfGiPass : IDisposable {
         locViewProj = GL.GetUniformLocation(program, "ViewProj");
         for (var i = 0; i < 4; i++)
             locCascadeMatrices[i] = GL.GetUniformLocation(program, CascadeMatrixNames[i]);
+
+        // Global distance field (Phase 1): per-cascade sampler + placement uniforms (array elements).
+        locUseGlobalSdf = GL.GetUniformLocation(program, "UseGlobalSdf");
+        locGlobalSdfRes = GL.GetUniformLocation(program, "GlobalSdfRes");
+        for (var i = 0; i < GLGlobalSdf.CascadeCount; i++) {
+            locGlobalSdf[i] = GL.GetUniformLocation(program, $"GlobalSdf[{i}]");
+            locGlobalSdfMin[i] = GL.GetUniformLocation(program, $"GlobalSdfMin[{i}]");
+            locGlobalSdfCell[i] = GL.GetUniformLocation(program, $"GlobalSdfCell[{i}]");
+        }
 
         // Inject program uniforms.
         liInstanceIndex = GL.GetUniformLocation(injectProgram, "InstanceIndex");
@@ -264,7 +287,13 @@ public sealed class GLSdfGiPass : IDisposable {
     int bakesThisFrame;
     int injectCursor;   // round-robin start index for the per-frame amortized radiance inject
 
-    public void EnsureBaked(IReadOnlyList<IStaticMeshRenderer> opaque) {
+    public void EnsureBaked(IReadOnlyList<IStaticMeshRenderer> opaque, Vector3 cameraPos = default) {
+        // Phase 1: advance the global distance field clipmap (one cascade per frame, background bake).
+        // Camera-centered, so it follows the view; re-bakes a cascade on scroll / geometry change.
+        if (UseGlobalSdf) {
+            globalSdf?.Update(cameraPos, opaque);
+            return; // GDF replaces the per-mesh bricks entirely — skip the per-submesh bake + grid build
+        }
         if (!Available || opaque == null)
             return;
 
@@ -413,14 +442,18 @@ public sealed class GLSdfGiPass : IDisposable {
         ref Matrix4 projectionNoJitter, float skyExposure, float intensityScale = 1f) {
         if (!Available || program == 0)
             return colorTexture;
-        if (scene.InstanceCount == 0 || scene.SlotCount == 0)
-            return colorTexture; // nothing baked / nothing to trace — no change to the scene
+        bool gdf = UseGlobalSdf && globalSdf is { Available: true };
+        // The GDF path traces the global field (no per-mesh instances); the per-mesh path needs baked
+        // instances. Bail only when the ACTIVE path has nothing to trace.
+        if (!gdf && (scene.InstanceCount == 0 || scene.SlotCount == 0))
+            return colorTexture;
 
-        // ---- 0. Radiance inject (surface cache fill) ----
-        // For each instance, fill its radiance brick with lit radiance at near-surface voxels. The
-        // march then READS this cached per-surface radiance at a hit (stable, no screen flicker).
-        InjectRadiance(irradianceCubemap, shadowMapArray, cascadeMatrices, cascadeBias, cascadeCount,
-            sunDirection, sunColor, skyExposure);
+        // ---- 0. Radiance inject (surface cache fill) ---- per-mesh path only (the GDF has no per-mesh
+        // radiance slots yet — Phase 2 adds card-based surface-cache radiance; for now the GDF hit uses
+        // the direct sun+sky estimate in the shader, so the inject is skipped when the GDF is active).
+        if (!gdf)
+            InjectRadiance(irradianceCubemap, shadowMapArray, cascadeMatrices, cascadeBias, cascadeCount,
+                sunDirection, sunColor, skyExposure);
 
         // ---- 1. Half-res compute gather (rgb = off-screen indirect, a = validity) ----
         // ceil (not floor): full half-res coverage of an ODD full-res height (no clamped-edge upsample
@@ -454,8 +487,24 @@ public sealed class GLSdfGiPass : IDisposable {
         // The surface-cache radiance atlas — the STABLE per-surface radiance the march reads at hits.
         BindSampler(RadianceUnit, TextureTarget.Texture3D, atlas.RadianceTextureId);
 
-        // SDF scene SSBOs (binding 8 = instances, 9 = slot table).
-        scene.Bind();
+        // SDF scene SSBOs (binding 8 = instances, 9 = slot table). Per-mesh path only — the GDF path
+        // doesn't use the instance grid, but binding it is harmless (the shader gates on UseGlobalSdf).
+        if (!gdf)
+            scene.Bind();
+
+        // GLOBAL DISTANCE FIELD: bind the 4 cascade 3D textures on units 8..11 and set their placement.
+        const int GdfFirstUnit = 8;
+        GL.Uniform1(locUseGlobalSdf, gdf ? 1 : 0);
+        if (gdf) {
+            globalSdf.Bind(GdfFirstUnit);
+            for (int c = 0; c < GLGlobalSdf.CascadeCount; c++) {
+                GL.Uniform1(locGlobalSdf[c], GdfFirstUnit + c);
+                Vector3 mn = globalSdf.CascadeMin(c);
+                GL.Uniform3(locGlobalSdfMin[c], mn.X, mn.Y, mn.Z);
+                GL.Uniform1(locGlobalSdfCell[c], globalSdf.CascadeCell(c));
+            }
+            GL.Uniform1(locGlobalSdfRes, globalSdf.Resolution);
+        }
 
         // Plain uniforms set per-dispatch (NOT a UBO — the PassData UBO at binding 0 is off-limits).
         GL.UniformMatrix4(locInvProjection, false, ref invProjection);
@@ -740,6 +789,7 @@ public sealed class GLSdfGiPass : IDisposable {
         }
         atlas?.Dispose();
         scene?.Dispose();
+        globalSdf?.Dispose();
         output.Dispose();
         foreach (GLRenderTexture t in historyGi) t.Dispose();
         foreach (GLRenderTexture t in historyDepth) t.Dispose();

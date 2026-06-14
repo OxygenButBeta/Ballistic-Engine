@@ -120,6 +120,19 @@ uniform vec3 GridMin;
 uniform vec3 GridInvCell;    // 1 / cellSize per axis
 uniform int  GridRes;
 
+// ---------------------------------------------------------------------------------------
+// GLOBAL DISTANCE FIELD (Lumen GDF, Phase 1). A clipmap of N camera-centered cascades, each a signed
+// world-distance 3D field (metres). When UseGlobalSdf=1 the march samples THIS instead of the
+// per-instance grid above — ONE field covers the whole scene, so fragmented per-object scenes get
+// full coverage (the per-mesh path leaves them empty). Sampled with hardware trilinear (a global
+// field has no slot-packing boundary, so linear filtering is safe).
+#define GDF_CASCADES 4
+uniform sampler3D GlobalSdf[GDF_CASCADES]; // signed distance (world metres) per cascade
+uniform vec3  GlobalSdfMin[GDF_CASCADES];  // world min corner of each cascade box
+uniform float GlobalSdfCell[GDF_CASCADES]; // world cell size (cubic) per cascade
+uniform int   GlobalSdfRes;                // voxels per axis per cascade
+uniform int   UseGlobalSdf;                // 1 = march the GDF clipmap; 0 = the per-instance grid
+
 // Direct-sun lighting at the hit (the bright-bounce source). Same data the volumetric march uses.
 const int MAX_CASCADES = 4;
 uniform mat4  CascadeMatrices[MAX_CASCADES]; // world -> light clip per cascade
@@ -262,13 +275,45 @@ vec4 SampleRadiance(uint slotIdx, vec3 local) {
     return texture(RadianceAtlas, uvw);
 }
 
-// Scene SDF at a WORLD point: min over all instances of (point transformed to local, sampled).
-// `nearestSlot` and `nearestLocal` report which instance was closest, for the gradient on hit.
+// Samples the GLOBAL DISTANCE FIELD clipmap at a world point: returns the signed world distance from
+// the FINEST cascade that contains the point (with hardware trilinear), or a large positive distance
+// when the point is outside every cascade (the march treats that as empty space). `inside` reports
+// whether any cascade covered the point.
+float GlobalSdfSample(vec3 worldP, out bool inside) {
+    inside = false;
+    for (int c = 0; c < GDF_CASCADES; ++c) {
+        vec3 mn = GlobalSdfMin[c];
+        float cell = GlobalSdfCell[c];
+        float extent = cell * float(GlobalSdfRes);
+        vec3 rel = (worldP - mn) / extent; // 0..1 across the cascade box
+        // Use a tiny inset so the trilinear stencil never samples outside the [0,1] texture (clamp-to-
+        // edge would otherwise smear the boundary voxel). Finest cascade wins (loop is fine->coarse).
+        if (all(greaterThanEqual(rel, vec3(0.0))) && all(lessThanEqual(rel, vec3(1.0)))) {
+            inside = true;
+            return texture(GlobalSdf[c], rel).r; // world-metre signed distance, HW trilinear
+        }
+    }
+    return 1e9;
+}
+
+// Scene SDF at a WORLD point. Two paths: the GLOBAL DISTANCE FIELD clipmap (UseGlobalSdf=1 — one
+// field, full coverage) or the per-instance brick grid (the original path). `nearestSlot` /
+// `nearestLocal` report the closest instance for the per-mesh radiance-cache read on hit; the GDF
+// path has no per-mesh slot, so it returns slot 0 and the hit uses the direct-radiance estimate
+// (HitDirect) — the surface-cache-by-cards radiance comes in Phase 2.
 float SceneSdf(vec3 worldP, out uint nearestSlot, out vec3 nearestLocal, out bool anyInside) {
     float d = 1e9;
     nearestSlot = 0u;
     nearestLocal = vec3(0.0);
     anyInside = false;
+
+    if (UseGlobalSdf == 1) {
+        bool inside;
+        float gd = GlobalSdfSample(worldP, inside);
+        anyInside = inside;
+        nearestLocal = worldP; // GDF gradient differences in world space directly
+        return inside ? gd : 1e9;
+    }
 
     // Map the world point to its grid cell. Outside the grid bounds => no instances here (the march
     // is in empty space the grid doesn't cover). The CPU bins each instance into EVERY cell its AABB
@@ -479,9 +524,10 @@ void main() {
         vec3 radiance = vec3(0.0);
         if (hit) {
             hitCount++;
-            // Read the SURFACE CACHE: stable per-surface radiance the inject pass filled at this
-            // voxel. No per-pixel screen-reprojection flicker, off-screen-capable, carries colour.
-            vec4 cached = SampleRadiance(hitSlot, hitLocal);
+            // The GLOBAL DISTANCE FIELD path has NO per-mesh radiance-cache slot (that's the per-mesh
+            // atlas), so read radiance with the direct estimate (sun-at-hit + sky). The card-based
+            // surface cache for the GDF comes in Phase 2; until then HitDirect gives a coherent fill.
+            vec4 cached = UseGlobalSdf == 1 ? vec4(0.0) : SampleRadiance(hitSlot, hitLocal);
             if (cached.a > 0.01) {
                 radiance = Sanitize(cached.rgb);
             } else {

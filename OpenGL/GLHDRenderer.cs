@@ -810,7 +810,7 @@ public class GLHDRenderer : HDRenderer {
         bool wantSdfGi = sdfGiEnabled || PostFX.GiSdfForceEnabled;
         if (wantSdfGi && sdfGi.EnsureAvailable())
             using (timers.Time("SdfGI")) {
-                sdfGi.EnsureBaked(visibleOpaque);
+                sdfGi.EnsureBaked(visibleOpaque, cameraPos);
                 // PROBE<->SDF-GI BLEND: probes are the diffuse BASE (they already carry the static
                 // enclosed-interior bounce); SDF-GI AUGMENTS with the dynamic off-screen delta. When
                 // probes are active, scale SDF-GI down so the two diffuse indirect terms don't
