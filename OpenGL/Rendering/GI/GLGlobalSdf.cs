@@ -82,13 +82,17 @@ public sealed class GLGlobalSdf : IDisposable {
     // Voxel-lighting inject program (GlobalRadianceInject_Comp) + its cached uniform locations.
     int injectProgram;
     int liCascade, liCascadeMin, liCascadeCell, liRes, liSkyExposure, liFeedback, liBounceScale;
-    // Multi-bounce gain (BALLISTIC_LUMEN_BOUNCE, default 1). >1 strengthens the indirect inter-surface
-    // bounce in the voxel cache so enclosed/shadowed areas fill with colored multi-bounce light.
+    // Multi-bounce gain (BALLISTIC_LUMEN_BOUNCE, default 2). >1 strengthens the indirect inter-surface
+    // bounce in the voxel cache so enclosed/shadowed areas fill with colored multi-bounce light. The
+    // stored cache is a geometric series in bounceAlbedo*gain, so it accelerates non-linearly: on
+    // SunTemple (isolated bounce, fixed EV) gain 1 -> (9,6,3), gain 2 -> (12,7,4) [visibly richer fill +
+    // colour, contrast kept], gain 3 -> (48,39,30) [washes out, runaway]. 2 is the sweet spot for
+    // visible Lumen-class multi-bounce without blowing out — verified on SunTemple + both Bistro scenes.
     static readonly float BounceScale = ParseBounce();
     static float ParseBounce() {
         string s = Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_BOUNCE");
         return float.TryParse(s, System.Globalization.CultureInfo.InvariantCulture, out float v)
-            ? Math.Clamp(v, 0f, 8f) : 1f;
+            ? Math.Clamp(v, 0f, 8f) : 2f;
     }
     int liCascadeCountSun, liSunDir, liSunColor, liAlbedo, liCascadeBias;
     readonly int[] liCascadeMatrices = new int[4];
