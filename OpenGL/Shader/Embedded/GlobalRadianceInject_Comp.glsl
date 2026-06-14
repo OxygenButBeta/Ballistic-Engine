@@ -37,6 +37,7 @@ uniform vec3  GdfMin[GDF_CASCADES];
 uniform float GdfCell[GDF_CASCADES];
 uniform float SkyExposure;
 uniform float Feedback;           // EMA weight for the OLD value (~0.9 sticky)
+uniform float BounceScale;        // multi-bounce gain (1 = normal; >1 strengthens the indirect bounce)
 
 const int MAX_CASCADES = 4;
 uniform mat4  CascadeMatrices[MAX_CASCADES];
@@ -195,7 +196,7 @@ void main() {
     // (SunTemple's lower-albedo stone never hit the runaway, so it's unaffected; the exterior escapes
     // to sky so it never summed the series at all.)
     vec3 bounceAlbedo = min(albedo, vec3(0.55));
-    vec3 radiance = (albedo / PI) * direct + bounceAlbedo * bounce;
+    vec3 radiance = (albedo / PI) * direct + bounceAlbedo * bounce * BounceScale;
     radiance = Sanitize(radiance);
 
     vec4 old = texelFetch(GdfRadiance[Cascade], v, 0);

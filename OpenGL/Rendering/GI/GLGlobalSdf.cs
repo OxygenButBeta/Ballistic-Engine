@@ -81,7 +81,15 @@ public sealed class GLGlobalSdf : IDisposable {
 
     // Voxel-lighting inject program (GlobalRadianceInject_Comp) + its cached uniform locations.
     int injectProgram;
-    int liCascade, liCascadeMin, liCascadeCell, liRes, liSkyExposure, liFeedback;
+    int liCascade, liCascadeMin, liCascadeCell, liRes, liSkyExposure, liFeedback, liBounceScale;
+    // Multi-bounce gain (BALLISTIC_LUMEN_BOUNCE, default 1). >1 strengthens the indirect inter-surface
+    // bounce in the voxel cache so enclosed/shadowed areas fill with colored multi-bounce light.
+    static readonly float BounceScale = ParseBounce();
+    static float ParseBounce() {
+        string s = Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_BOUNCE");
+        return float.TryParse(s, System.Globalization.CultureInfo.InvariantCulture, out float v)
+            ? Math.Clamp(v, 0f, 8f) : 1f;
+    }
     int liCascadeCountSun, liSunDir, liSunColor, liAlbedo, liCascadeBias;
     readonly int[] liCascadeMatrices = new int[4];
     readonly int[] liGdfMin = new int[CascadeCount];
@@ -154,6 +162,7 @@ public sealed class GLGlobalSdf : IDisposable {
         liRes = GL.GetUniformLocation(injectProgram, "Res");
         liSkyExposure = GL.GetUniformLocation(injectProgram, "SkyExposure");
         liFeedback = GL.GetUniformLocation(injectProgram, "Feedback");
+        liBounceScale = GL.GetUniformLocation(injectProgram, "BounceScale");
         liCascadeCountSun = GL.GetUniformLocation(injectProgram, "CascadeCountSun");
         liSunDir = GL.GetUniformLocation(injectProgram, "SunDirectionWorld");
         liSunColor = GL.GetUniformLocation(injectProgram, "SunColor");
@@ -495,6 +504,7 @@ public sealed class GLGlobalSdf : IDisposable {
         GL.Uniform1(liRes, Resolution);
         GL.Uniform1(liSkyExposure, skyExposure);
         GL.Uniform1(liFeedback, feedback);
+        GL.Uniform1(liBounceScale, BounceScale);
         int sc = Math.Min(sunCascadeCount, 4);
         GL.Uniform1(liCascadeCountSun, sc);
         for (int i = 0; i < sc; i++)
