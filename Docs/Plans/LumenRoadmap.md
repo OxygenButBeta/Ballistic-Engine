@@ -119,19 +119,25 @@ Lumen." Findings TRIAGED against code/measurement (review is vision-only — ver
   radiance (lit appearance) + only 6 rays, so it carries surface texture detail, not a smooth diffuse
   integral. Architectural (more samples / better integrate).
 - F6 sky halo: FIXED (bde61479). F-leak: FIXED (038342f9). F4 fireflies: PARTIAL (7b35bc98).
-- F2 point lights weak: point lights now inject (c7415d89) but interior bounce is dim; needs strength
-  + spot lights + shadowing.
+- F2 point lights weak: FIXED ENOUGH — point lights inject (c7415d89) + now GDF-SHADOWED + SPOT lights
+  inject too (89b3e066). Interior bounce respects occluders (no around-wall leak), proper cone falloff.
+- RELATIVE-LUMA DENOISE (47c51bb2) — exposure-robust luma edge-stop; minor smoothness refinement.
+- INTENSITY 0.18 RECHECKED — confirmed well-balanced. Swept 0.18/0.30/0.45 on SunTemple+BistroExterior:
+  auto-exposure normalizes the mean; 0.45 gives marginally more apse/recess fill and is tolerable on
+  the exterior (R/G 1.10 vs 1.096) but the gain is subtle. LEFT AT 0.18 (user-approved aesthetic
+  balance; changing it autonomously = inventing). 0.30 is a safe optional bump if more GI life wanted.
 
 ### REMAINING (architectural — do carefully, fresh verification each; NOT blind end-of-loop tweaks):
 - F4/F7 DENSE speckle + coarse voxel blocky artifacts: few-ray gather over the coarse GDF. Needs more
-  gather samples, stronger spatial denoise, and/or a finer clipmap level for interiors.
+  gather samples, stronger spatial denoise, and/or a finer clipmap level for interiors. THE big remaining
+  quality gap (the radiance-PROBE path is the real Lumen answer — sparse interpolated = inherently smooth).
 - F5 FLAT AMBIENT VEIL washes occlusion: Frag.glsl line 880 `ambientDiffuse += kD*AmbientFloor*ao`
   (GiAmbientFloor default 0.03) is a near-flat fill ignoring directional occlusion. CAUTION: it exists
   to stop interior black-crush; lowering it risks the regression. Right fix = let the (now-working) GI
   fill recesses so the floor can drop — needs the occlusion/denoise work first. A/B per scene.
-- F1 GI too high-frequency; F8 global warm cast (recheck if it's just warm-sun bounce vs an over-warm
-  GI tint); recheck intensity 0.18 (tuned vs the BROKEN red GI — bounce is genuine now, may want higher).
-- Point/spot SHADOWING in the cache; Phase B (no-flag default); reflections; world-space radiance probes.
+- F1 GI too high-frequency (gather reads surface-cache OUTGOING radiance + few rays); F8 global warm cast
+  (recheck: warm-sun bounce vs over-warm GI tint).
+- Phase B (no-flag default, retire per-mesh brick path); reflections; world-space radiance probes.
 
 ### Phase B — make GDF+per-pixel the DEFAULT GI (no flag)
 - Once warm-up is fast + quality confirmed, drop BALLISTIC_SDFGI/LUMEN_GDF gating so Lumen is the
