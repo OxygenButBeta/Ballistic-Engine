@@ -452,9 +452,16 @@ float PunctualPCF(int layer, vec3 proj, float bias)
     return lit / 12.0;
 }
 
-float SpotShadow(int slot, float ndl)
+float SpotShadow(int slot, vec3 nrm, float ndl)
 {
-    vec4 clip = SpotShadowMatrix[slot] * vec4(fragPos, 1.0);
+    // NORMAL-OFFSET BIAS: offset the sample position along the surface normal before projecting,
+    // scaled to taper off as the surface faces the light (sin of the angle ~= sqrt(1-ndl^2)).
+    // Depth-precision-independent — fixes acne + peter-panning robustly where a constant window-
+    // depth bias couldn't (the bias is authored in world units but proj.z is NON-LINEAR depth, so a
+    // flat subtract over/under-biased with distance). A small residual depth bias still backs it up.
+    float slope = sqrt(clamp(1.0 - ndl * ndl, 0.0, 1.0));
+    vec3 offsetPos = fragPos + nrm * (SpotShadowBias[slot] * 12.0 * (0.3 + slope));
+    vec4 clip = SpotShadowMatrix[slot] * vec4(offsetPos, 1.0);
     if (clip.w <= 0.0)
         return 1.0;
     vec3 proj = clip.xyz / clip.w * 0.5 + 0.5;
@@ -473,10 +480,15 @@ int CubeFace(vec3 d)
     return d.z > 0.0 ? 4 : 5;
 }
 
-float PointShadow(int slot, vec3 lightPos, float ndl)
+float PointShadow(int slot, vec3 lightPos, vec3 nrm, float ndl)
 {
-    int face = CubeFace(fragPos - lightPos);
-    vec4 clip = PointShadowMatrix[slot * 6 + face] * vec4(fragPos, 1.0);
+    // NORMAL-OFFSET BIAS (see SpotShadow): offset along the normal before projecting so the fix is
+    // depth-precision-independent (a constant window-depth bias over/under-biased with distance on
+    // the non-linear cube-face depth). The face is picked from the OFFSET position too.
+    float slope = sqrt(clamp(1.0 - ndl * ndl, 0.0, 1.0));
+    vec3 offsetPos = fragPos + nrm * (PointShadowBias[slot] * 12.0 * (0.3 + slope));
+    int face = CubeFace(offsetPos - lightPos);
+    vec4 clip = PointShadowMatrix[slot * 6 + face] * vec4(offsetPos, 1.0);
     if (clip.w <= 0.0)
         return 1.0;
     vec3 proj = clip.xyz / clip.w * 0.5 + 0.5;
@@ -651,7 +663,7 @@ void main()
             if (L.lcolor.w < 0.5) {
                 // POINT
                 float vis = shadowSlot >= 0
-                    ? PointShadow(shadowSlot, L.posRange.xyz, clamp(dot(N, Ld), 0.0, 1.0)) : 1.0;
+                    ? PointShadow(shadowSlot, L.posRange.xyz, N, clamp(dot(N, Ld), 0.0, 1.0)) : 1.0;
                 if (vis <= 0.001) continue;
                 ShadeLightArea(N, V, Ld, dist, srcRadius, L.lcolor.rgb * atten * vis, albedo, metallic,
                                roughness, F0, diffuseLight, specularLight);
@@ -662,7 +674,7 @@ void main()
                                    max(L.extra.x - L.dirCosOuter.w, 1e-4), 0.0, 1.0);
                 if (cone <= 0.0) continue;
                 float vis = shadowSlot >= 0
-                    ? SpotShadow(shadowSlot, clamp(dot(N, Ld), 0.0, 1.0)) : 1.0;
+                    ? SpotShadow(shadowSlot, N, clamp(dot(N, Ld), 0.0, 1.0)) : 1.0;
                 if (vis <= 0.001) continue;
                 ShadeLightArea(N, V, Ld, dist, srcRadius, L.lcolor.rgb * atten * cone * cone * vis,
                                albedo, metallic, roughness, F0, diffuseLight, specularLight);
@@ -677,7 +689,7 @@ void main()
                 continue;
             vec3 Lp = toLight / dist;
             float vis = PointShadowSlot[i] >= 0
-                ? PointShadow(PointShadowSlot[i], PointLightPosition[i], clamp(dot(N, Lp), 0.0, 1.0))
+                ? PointShadow(PointShadowSlot[i], PointLightPosition[i], N, clamp(dot(N, Lp), 0.0, 1.0))
                 : 1.0;
             if (vis <= 0.001)
                 continue;
@@ -696,7 +708,7 @@ void main()
             if (cone <= 0.0)
                 continue;
             float vis = SpotShadowSlot[i] >= 0
-                ? SpotShadow(SpotShadowSlot[i], clamp(dot(N, Ls), 0.0, 1.0))
+                ? SpotShadow(SpotShadowSlot[i], N, clamp(dot(N, Ls), 0.0, 1.0))
                 : 1.0;
             if (vis <= 0.001)
                 continue;
