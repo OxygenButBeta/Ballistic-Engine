@@ -82,9 +82,10 @@ public sealed class GLSdfGiPass : IDisposable {
 
     public bool Available { get; private set; }
 
-    readonly GLSdfAtlas atlas;
-    readonly GLSdfScene scene;
-    readonly AtlasAdapter atlasAdapter;
+    // Not readonly: built lazily in EnsureAvailable (the first time Lumen is wanted), not the ctor.
+    GLSdfAtlas atlas;
+    GLSdfScene scene;
+    AtlasAdapter atlasAdapter;
 
     int program;        // SdfTrace_Comp — the march
     int injectProgram;  // RadianceInject_Comp — fills the surface-cache radiance atlas
@@ -96,17 +97,17 @@ public sealed class GLSdfGiPass : IDisposable {
     // Full-res depth-aware upsample + additive composite (SdfGi_Combine.glsl). Mirrors SSR_Combine
     // but ADDS (GI only lifts, never darkens) and returns the modified litColor, so the pass plugs
     // in like GLSSGIPass — no Frag.glsl change needed.
-    readonly StandardShader combineShader;
+    StandardShader combineShader;
 
     // BALLISTIC_SDFGI_DEBUG=1: the composite outputs ONLY the gathered GI so an enclosed-scene
     // screenshot shows the raw off-screen bounce.
-    readonly bool debugView;
+    bool debugView;
 
     // BALLISTIC_SDFGI_DIAG=1: the gather outputs the per-pixel HIT FRACTION (grayscale) instead of
     // radiance — white = every ray hit SDF geometry, black = every ray escaped to sky. Forces the
     // debug composite so the raw value is visible. Disambiguates "rays miss" (granularity) from
     // "radiance too dim" (needs surface cache). Implies debugView.
-    readonly bool diagMode;
+    bool diagMode;
 
     // Cached uniform locations (looked up once after the link).
     int locInvProjection, locInvView, locInstanceCount, locHalfSize, locSkyExposure, locFrameIndex, locDiagMode;
@@ -126,11 +127,11 @@ public sealed class GLSdfGiPass : IDisposable {
     // grain to a clean image over a few frames. We reuse SSGI_Temporal.glsl verbatim: it takes the
     // raw gather as currentGI and outputs accumulated GI (rgb) + history length (a) via MRT, plus
     // the current view-depth for next frame's disocclusion test.
-    readonly StandardShader temporalShader;
+    StandardShader temporalShader;
     // Edge-aware a-trous spatial denoise (SSGI_Denoise.glsl, reused): smooths the within-frame
     // grazing-surface speckle the temporal pass can't resolve (a fixed per-pixel screen-space-read
     // accept/reject pattern), with depth/normal edge-stops so it doesn't bleed across corners.
-    readonly StandardShader denoiseShader;
+    StandardShader denoiseShader;
     readonly GLRenderTexture[] denoisePingPong = { new(), new() };
     readonly GLRenderTexture[] historyGi = { new(), new() };     // ping-pong accumulated GI
     readonly GLRenderTexture[] historyDepth = { new(), new() };  // ping-pong view-space depth
@@ -154,14 +155,25 @@ public sealed class GLSdfGiPass : IDisposable {
 
     int frameIndex;
 
+    bool buildAttempted;   // lazy-build guard: a failed build (e.g. compile error) won't retry forever
+
     public GLSdfGiPass() {
-        // Honour the default-OFF gate FIRST: if the flag is not 1 we build nothing GPU-side and
-        // report unavailable, so the pass can be constructed unconditionally by the renderer.
-        bool enabled = Environment.GetEnvironmentVariable("BALLISTIC_SDFGI") == "1";
-        if (!enabled) {
-            Available = false;
-            return;
-        }
+        // Lazy build now: the GPU resources are created the FIRST time the pass is actually requested
+        // (EnsureAvailable), NOT only when BALLISTIC_SDFGI=1 at startup. The old constructor built only
+        // under the env var and set Available=false forever otherwise — so turning Lumen on via the
+        // volume override at runtime did NOTHING (the resources never existed). If the env var IS set,
+        // build eagerly so the very first frame already has it; otherwise wait for the override.
+        if (Environment.GetEnvironmentVariable("BALLISTIC_SDFGI") == "1")
+            EnsureAvailable();
+    }
+
+    // Builds the SDF-GI GPU resources on demand (idempotent). Returns Available. Called by the renderer
+    // when the pass is wanted — either the env var (eager, in the ctor) or the Lumen/GlobalIllumination
+    // volume override flipping it on at runtime. Runs on the GL thread (the renderer's render loop).
+    public bool EnsureAvailable() {
+        if (Available || buildAttempted)
+            return Available;
+        buildAttempted = true;
 
         diagMode = Environment.GetEnvironmentVariable("BALLISTIC_SDFGI_DIAG") == "1";
         debugView = diagMode || Environment.GetEnvironmentVariable("BALLISTIC_SDFGI_DEBUG") == "1";
@@ -173,12 +185,11 @@ public sealed class GLSdfGiPass : IDisposable {
         program = CompileCompute(EmbeddedShaderSource.Read("SdfTrace_Comp.glsl"));
         injectProgram = CompileCompute(EmbeddedShaderSource.Read("RadianceInject_Comp.glsl"));
         if (program == 0 || injectProgram == 0) {
-            // Compile/link failed (logged by CompileCompute). Auto-disable; clean up the GPU
-            // resources we already created so an unavailable pass owns nothing live.
+            // Compile/link failed (logged by CompileCompute). Stay unavailable; clean up what we made.
             atlas.Dispose();
             scene.Dispose();
             Available = false;
-            return;
+            return false;
         }
 
         // Full-res additive composite (depth-aware upsample). FSQ vertex stage shared with the
@@ -197,7 +208,9 @@ public sealed class GLSdfGiPass : IDisposable {
             EmbeddedShaderSource.Read("SSGI_Denoise.glsl"));
 
         CacheUniformLocations();
+        Console.WriteLine("[SdfGI] resources built (Lumen enabled).");
         Available = true;
+        return true;
     }
 
     void CacheUniformLocations() {

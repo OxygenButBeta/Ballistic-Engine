@@ -803,9 +803,12 @@ public class GLHDRenderer : HDRenderer {
         // bounce onto litColor (never darkens). Default-OFF: when BALLISTIC_SDFGI != 1 the pass is
         // Available=false and Render returns litColor unchanged, so the frame is byte-identical to
         // the committed baseline. Reconstructs from the JITTERED depth -> renderProjection (note above).
-        // SDF-GI runs when the env var is set OR a GlobalIllumination volume forces it on (it stays
-        // env-gated by default while it matures; a scene opts in via the volume override).
-        if ((sdfGiEnabled || PostFX.GiSdfForceEnabled) && sdfGi.Available)
+        // SDF-GI (Lumen) runs when the env var is set OR the Lumen/GlobalIllumination volume override
+        // forces it on. EnsureAvailable() lazily builds the GPU resources the first time it's wanted —
+        // so flipping the Lumen override on at RUNTIME actually turns it on (the old code only built
+        // under BALLISTIC_SDFGI=1 at startup, so the override was a silent no-op).
+        bool wantSdfGi = sdfGiEnabled || PostFX.GiSdfForceEnabled;
+        if (wantSdfGi && sdfGi.EnsureAvailable())
             using (timers.Time("SdfGI")) {
                 sdfGi.EnsureBaked(visibleOpaque);
                 // PROBE<->SDF-GI BLEND: probes are the diffuse BASE (they already carry the static
