@@ -90,6 +90,13 @@ public sealed class GLGlobalSdf : IDisposable {
     readonly int[] preparedStamp = new int[CascadeCount];   // geometryStamp the prepared field was built under
     readonly bool[] preparedValid = new bool[CascadeCount];
 
+    // PHASE 1 (GPU JFA): the jump-flood SDF builder + a one-shot correctness self-test gate. The
+    // builder is created lazily on first use (BALLISTIC_LUMEN_JFA / BALLISTIC_JFA_SELFTEST). The CPU
+    // bake stays the default until the JFA path is proven; the self-test compares the two voxel-by-voxel.
+    GLSdfJfaBuilder jfaBuilder;
+    static readonly bool JfaSelfTest = Environment.GetEnvironmentVariable("BALLISTIC_JFA_SELFTEST") == "1";
+    bool jfaSelfTestDone;
+
     // Voxel-lighting inject program (GlobalRadianceInject_Comp) + its cached uniform locations.
     int injectProgram;
     int liCascade, liCascadeMin, liCascadeCell, liRes, liSkyExposure, liFeedback, liBounceScale;
@@ -260,6 +267,15 @@ public sealed class GLGlobalSdf : IDisposable {
                     preparedField[r.Cascade] = r.Prepared;
                     preparedStamp[r.Cascade] = geometryStamp;
                     preparedValid[r.Cascade] = true;
+                }
+
+                // PHASE 1 self-test: when cascade 0 has a full-res prepared field, build the JFA field
+                // over the SAME box/res and compare voxel-by-voxel against the CPU bake. One-shot.
+                if (JfaSelfTest && !jfaSelfTestDone && r.Cascade == 0 && r.Prepared != null) {
+                    jfaSelfTestDone = true;
+                    jfaBuilder ??= new GLSdfJfaBuilder(Resolution);
+                    Vector3 boxMax = cascadeMin[0] + new Vector3(cascadeCell[0] * Resolution);
+                    jfaBuilder.SelfTest(r.Prepared, cascadeMin[0], boxMax, new Vector3i(Resolution));
                 }
             }
             bakeTask = null;
@@ -651,6 +667,7 @@ public sealed class GLGlobalSdf : IDisposable {
             if (albedoTex[c] != 0) GL.DeleteTexture(albedoTex[c]);
         }
         if (injectProgram != 0) GL.DeleteProgram(injectProgram);
+        jfaBuilder?.Dispose();
         Available = false;
     }
 }

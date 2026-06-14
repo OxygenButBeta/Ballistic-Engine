@@ -83,6 +83,21 @@ public static class MeshSdfBaker {
             Tris = tris; Bvh = bvh; TriAlbedo = alb;
         }
         public int TriangleCount => Tris.Length;
+        public bool HasAlbedo => TriAlbedo != null;
+
+        // World-space AABB of triangle i (SdfSeedExtractor rasterizes each tri's AABB into the grid to
+        // find the shell voxels directly — surface-area cost, not the whole-volume ClosestPoint sweep).
+        public void TriangleBounds(int i, out Vector3 min, out Vector3 max) {
+            Triangle t = Tris[i]; min = t.Min; max = t.Max;
+        }
+
+        // GPU-JFA seed queries (SdfSeedExtractor): closest surface point + nearest-tri index, the
+        // 7-ray parity sign, and per-triangle albedo — reusing the proven BVH/parity math at the seeds.
+        public float ClosestPoint(Vector3 p, out Vector3 point, out int triIndex) =>
+            Bvh.ClosestPoint(p, out point, out triIndex);
+        public bool IsInside(Vector3 p, int signRays) => Bvh.IsInside(p, signRays);
+        public Vector3 AlbedoOf(int triIndex) =>
+            (TriAlbedo != null && triIndex >= 0 && triIndex < TriAlbedo.Count) ? TriAlbedo[triIndex] : new Vector3(0.5f);
     }
 
     // Build the BVH over a world-triangle snapshot (call once; bake at multiple resolutions after).

@@ -146,6 +146,59 @@ internal sealed class TriangleBvh {
         }
     }
 
+    // Closest SURFACE POINT to p (not just distance) + the nearest triangle index. The point is the
+    // JFA seed coordinate the GPU jump-flood propagates (SdfSeedExtractor); the triangle index feeds
+    // the per-voxel albedo. Returns dist^2. Implemented as a closest-tri descent then one point solve
+    // on the winner (the per-leaf point solve in ClosestRecursive would cost a Vector3 write per tri).
+    public float ClosestPoint(Vector3 p, out Vector3 point, out int triIndex) {
+        float distSq = ClosestDistanceSq(p, out triIndex);
+        if (triIndex >= 0) {
+            MeshSdfBaker.Triangle t = tris[triIndex];
+            point = ClosestPointOnTriangle(p, t.A, t.B, t.C);
+        } else {
+            point = p;
+        }
+        return distSq;
+    }
+
+    // Ericson closest-point-on-triangle (the point counterpart of PointTriangleDistanceSq). Same
+    // barycentric region tests; returns the closest point itself.
+    static Vector3 ClosestPointOnTriangle(Vector3 p, Vector3 a, Vector3 b, Vector3 c) {
+        Vector3 ab = b - a, ac = c - a, ap = p - a;
+        float d1 = Vector3.Dot(ab, ap), d2 = Vector3.Dot(ac, ap);
+        if (d1 <= 0f && d2 <= 0f) return a;
+
+        Vector3 bp = p - b;
+        float d3 = Vector3.Dot(ab, bp), d4 = Vector3.Dot(ac, bp);
+        if (d3 >= 0f && d4 <= d3) return b;
+
+        float vc = d1 * d4 - d3 * d2;
+        if (vc <= 0f && d1 >= 0f && d3 <= 0f) {
+            float v0 = d1 / (d1 - d3);
+            return a + v0 * ab;
+        }
+
+        Vector3 cp = p - c;
+        float d5 = Vector3.Dot(ab, cp), d6 = Vector3.Dot(ac, cp);
+        if (d6 >= 0f && d5 <= d6) return c;
+
+        float vb = d5 * d2 - d1 * d6;
+        if (vb <= 0f && d2 >= 0f && d6 <= 0f) {
+            float w0 = d2 / (d2 - d6);
+            return a + w0 * ac;
+        }
+
+        float va = d3 * d6 - d5 * d4;
+        if (va <= 0f && (d4 - d3) >= 0f && (d5 - d6) >= 0f) {
+            float w1 = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+            return b + w1 * (c - b);
+        }
+
+        float denom = 1f / (va + vb + vc);
+        float vv = vb * denom, ww = vc * denom;
+        return a + ab * vv + ac * ww;
+    }
+
     static float AabbDistanceSq(Vector3 min, Vector3 max, Vector3 p) {
         float dx = MathF.Max(MathF.Max(min.X - p.X, p.X - max.X), 0f);
         float dy = MathF.Max(MathF.Max(min.Y - p.Y, p.Y - max.Y), 0f);
