@@ -377,6 +377,7 @@ internal sealed class EditorApplication {
             imgui.Update((float)delta);
             BuildUI();
             BusyOverlay.Draw(S);
+            BusyOverlay.DrawBakeBadge(S); // non-blocking GI-bake indicator (the bake no longer modal-blocks)
         }
 
         // Kick the startup asset import on the first painted frame (not in the constructor), so the
