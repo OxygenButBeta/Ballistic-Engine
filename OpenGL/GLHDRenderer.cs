@@ -72,12 +72,23 @@ public class GLHDRenderer : HDRenderer {
     // Opt-out BALLISTIC_GPUDRIVEN_HIZ=0. Conservative (never false-culls a visible submesh); the
     // cull also DISABLES it for a frame after a large camera jump (the only stale-depth hole risk).
     readonly OpenGL.GpuDriven.GLHiZPass hiZ = new();
-    // GPU occlusion culling: DEFAULT ON (BALLISTIC_GPUDRIVEN_HIZ=0 to disable). Drops submeshes whose
-    // whole AABB is behind a closer occluder, sampling a MAX-depth pyramid built from last frame's
-    // depth. Conservative (the AABB's NEAREST linear view distance vs the FARTHEST occluder + a
-    // metric bias) + a camera-delta gate that disables it one frame after a big jump. Verified
-    // byte-identical (0% pixel diff): Sun Temple 1000->473 draws, Bistro ~814->719.
-    bool gpuDrivenHiZ = Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN_HIZ") != "0";
+    // GPU occlusion culling (Hi-Z): DEFAULT OFF (opt in with BALLISTIC_GPUDRIVEN_HIZ=1). Drops
+    // submeshes whose whole AABB is behind a closer occluder, sampling a MAX-depth pyramid built from
+    // last frame's depth.
+    //
+    // WHY OFF BY DEFAULT: it is the source of the "objects disappear when I stop moving" bug. Thin
+    // geometry (a statue, a column sliver) has a small screen footprint that passes the large-object
+    // skip guard, yet its handful of corner taps can still land on Hi-Z texels whose MAX-depth came
+    // from a slightly-closer foreground edge -> false-cull. The cull is gated to activate only when
+    // the camera is near-static (stale-depth safety), so the failure is invisible while moving and
+    // pops the instant you stop -> exactly the reported symptom. Repeated conservativeness hardening
+    // (large-footprint skip, 5-tap max, distance-scaled bias) reduced but never eliminated it.
+    //
+    // The trade isn't worth it: in the GPU-driven MDI path draw COUNT is nearly free (the whole point
+    // of MultiDrawIndirect), so occlusion culling saves only ~0.18 ms on a 2 ms frame (measured Sun
+    // Temple), while risking VISIBLE geometry vanishing. Frustum culling (the real win) stays on.
+    // Fidelity first: a perf bonus must never drop on-screen geometry. Set =1 to experiment.
+    bool gpuDrivenHiZ = Environment.GetEnvironmentVariable("BALLISTIC_GPUDRIVEN_HIZ") == "1";
     int hizPyramidTex;                       // last frame's pyramid (what THIS frame's cull samples)
     int hizPyramidW, hizPyramidH, hizPyramidMips;
     Matrix4 hizViewProj;                     // VP the last pyramid was built with (Hi-Z projection)

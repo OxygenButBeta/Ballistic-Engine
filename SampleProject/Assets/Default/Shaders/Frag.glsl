@@ -775,8 +775,26 @@ void main()
             // was calibrated around the brighter probe ambient, so /PI alone crushes the interior. The
             // unit fix + a matching ambient REBALANCE is done together in the GI phase (Phase E) so the
             // default interior stays well-lit; kept as-is here to preserve the user-approved look.
-            irradiance = sh0 * 0.886227
-                       + (sh1 * N.y + sh2 * N.z + sh3 * N.x) * 1.023327;
+            // L1 SH irradiance E(N) = DC + linear*N. The linear (directional) band can drive a SINGLE
+            // channel NEGATIVE when a probe has a strong colour gradient (e.g. a dome oculus that is
+            // red-depleted overhead): the surfaces facing away from the brighter direction reconstruct
+            // negative red, and a hard per-channel max(.,0) then ZEROS only red -> the bounce light in
+            // an enclosed apse collapses to pure green/teal ("the interior is deep teal, red ~0"). This
+            // is SH RINGING, not a colour the sky actually has.
+            //
+            // De-ring instead of clamp: limit the magnitude of the linear band, PER CHANNEL, so the
+            // reconstruction stays >= 0 over the whole sphere without killing a channel. The worst-case
+            // (most negative) reconstruction is DC*0.886 - |linear|*1.023; requiring that >= 0 gives a
+            // per-channel scale that softly shrinks an over-strong gradient toward a valid, still-
+            // directional result. Neutral/weak-gradient probes are unaffected (scale clamps to 1).
+            vec3 dc = sh0 * 0.886227;
+            vec3 linear = (sh1 * N.y + sh2 * N.z + sh3 * N.x) * 1.023327;
+            vec3 linAbs = vec3(
+                length(vec3(sh1.r, sh2.r, sh3.r)),
+                length(vec3(sh1.g, sh2.g, sh3.g)),
+                length(vec3(sh1.b, sh2.b, sh3.b))) * 1.023327;
+            vec3 deringScale = min(vec3(1.0), dc / max(linAbs, vec3(1e-4)));
+            irradiance = dc + linear * deringScale;
             // ProbeIntensity (GlobalIllumination volume) scales the probe ambient; 1 = unchanged.
             irradiance = max(irradiance, 0.0) * ProbeExposure * ProbeIntensity;
         }
