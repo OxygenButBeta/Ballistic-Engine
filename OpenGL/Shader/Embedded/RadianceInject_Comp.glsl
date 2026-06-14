@@ -240,10 +240,19 @@ void main() {
     float vis = SampleSunVisibility(litPos);
     vec3 direct = SunColor * (ndl * vis);
     vec3 bounce = GatherBounce(worldP, nWorld, cell, inst.slot);
-    // Lambert: outgoing = emissive + (albedo/PI) * incoming irradiance. (GatherBounce already
-    // averages over the cosine hemisphere, so it's the incoming radiance estimate; the albedo/PI
-    // is the diffuse BRDF. Direct sun gets the same albedo factor.)
-    vec3 radiance = inst.emissive.xyz + (inst.albedo.xyz / PI) * (direct + PI * bounce);
+
+    // ENERGY-BOUNDED MULTI-BOUNCE. The bounce term reads LAST frame's cached radiance, so the
+    // recurrence is  R = direct*a + a*R_prev  with a = albedo. For high albedo (white temple walls,
+    // a ~ 0.85-0.95) the geometric series R_inf = direct*a/(1-a) BLOWS UP as a -> 1: on a static
+    // camera the EMA keeps feeding it, energy explodes, the cache goes super-bright/colored, the
+    // additive composite floods the region, and TAA clamps it to a flat wash (objects "disappear"
+    // into a green/colored cast). REAL surfaces never reflect 100%, so clamp the bounce albedo to a
+    // physical max (0.9): the series then converges (R_inf <= direct*9) and the cache is stable for
+    // any input albedo. Direct sun keeps the true albedo (no feedback there).
+    vec3 bounceAlbedo = min(inst.albedo.xyz, vec3(0.9));
+    vec3 radiance = inst.emissive.xyz
+                  + (inst.albedo.xyz / PI) * direct      // direct: true albedo, no feedback
+                  + bounceAlbedo * bounce;               // bounce: clamped albedo, convergent (PI cancels)
     radiance = Sanitize(radiance);
 
     // Temporal EMA: blend with last frame's cached value (from the ping-pong sampler, NOT the empty
@@ -251,5 +260,11 @@ void main() {
     // each frame adds exactly one bounce off a CONVERGED previous state — no same-frame feedback.
     vec4 old = texelFetch(RadianceCache, atlasTexel, 0);
     vec3 blended = old.a > 0.0 ? mix(radiance, old.rgb, Feedback) : radiance;
-    imageStore(RadianceAtlas, atlasTexel, vec4(Sanitize(blended), 1.0));
+    // HARD SAFETY CAP on the cached radiance. The albedo clamp above makes the multi-bounce series
+    // convergent, but cap the stored value anyway so NO pathological input (a hot emissive read
+    // through the bounce, a degenerate albedo) can ever let the static-camera EMA run a brick away
+    // into the green/colored flood that swamped the frame. 32 is far above any real pre-exposed
+    // indirect radiance yet well under fp16 trouble.
+    blended = min(Sanitize(blended), vec3(32.0));
+    imageStore(RadianceAtlas, atlasTexel, vec4(blended, 1.0));
 }
