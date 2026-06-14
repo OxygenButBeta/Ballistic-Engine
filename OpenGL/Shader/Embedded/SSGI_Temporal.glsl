@@ -50,6 +50,31 @@ vec3 Sanitize(vec3 v) {
 void main() {
     vec4 current = texture(currentGI, TexCoords);
     current.rgb = Sanitize(current.rgb);
+
+    // FIREFLY CLAMP (pre-EMA). The few-ray gather throws occasional very-bright pixels (a ray that hit
+    // a bright lit voxel). Once one enters the temporal history it persists and the spatial denoiser
+    // smears it into a blob — the speckle that survives into the BistroInterior composite. Clamp the
+    // incoming pixel's LUMA to a multiple of its 3x3 neighbourhood MEAN (rescaled to preserve hue) so a
+    // lone outlier far above its surroundings is tamed before it can poison the EMA, while genuine
+    // local variation passes. Cheap 8-tap mean of the raw gather.
+    {
+        vec2 tx = 1.0 / vec2(textureSize(currentGI, 0));
+        vec3 nb = vec3(0.0);
+        nb += Sanitize(texture(currentGI, TexCoords + vec2(-1,-1)*tx).rgb);
+        nb += Sanitize(texture(currentGI, TexCoords + vec2( 0,-1)*tx).rgb);
+        nb += Sanitize(texture(currentGI, TexCoords + vec2( 1,-1)*tx).rgb);
+        nb += Sanitize(texture(currentGI, TexCoords + vec2(-1, 0)*tx).rgb);
+        nb += Sanitize(texture(currentGI, TexCoords + vec2( 1, 0)*tx).rgb);
+        nb += Sanitize(texture(currentGI, TexCoords + vec2(-1, 1)*tx).rgb);
+        nb += Sanitize(texture(currentGI, TexCoords + vec2( 0, 1)*tx).rgb);
+        nb += Sanitize(texture(currentGI, TexCoords + vec2( 1, 1)*tx).rgb);
+        float nbLuma = dot(nb / 8.0, vec3(0.2126, 0.7152, 0.0722));
+        float curLuma = dot(current.rgb, vec3(0.2126, 0.7152, 0.0722));
+        float maxLuma = nbLuma * 4.0 + 0.02;           // allow 4x the local mean (+ a small floor)
+        if (curLuma > maxLuma)
+            current.rgb *= maxLuma / max(curLuma, 1e-4); // rescale, preserve hue
+    }
+
     float depth = texture(depthTexture, TexCoords).r;
 
     // Current view-space Z (negative, looking down -Z). Stored for next frame's disocclusion test.
