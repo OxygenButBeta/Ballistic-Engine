@@ -146,9 +146,13 @@ void main()
         // is the dispersion a real lens shows and reads as a strong "photographed" cue.
         vec2 dir = uv - 0.5;
         vec2 offset = dir * ChromaticAberration * 0.01;
-        color.r = GradeAt(uv + offset).r;
+        // CLAMP the split sample UVs to the frame: an unclamped uv+offset reads PAST the screen edge
+        // (clamp-to-edge repeats the border row), which under camera motion smears a coloured fringe —
+        // a RED line along the edges (the R channel is offset OUTWARD, so it's the one that runs off).
+        // Clamping keeps the dispersion inside the frame so the edges stay clean.
+        color.r = GradeAt(clamp(uv + offset, 0.0, 1.0)).r;
         color.g = GradeAt(uv).g;
-        color.b = GradeAt(uv - offset).b;
+        color.b = GradeAt(clamp(uv - offset, 0.0, 1.0)).b;
     } else {
         color = GradeAt(uv);
     }
