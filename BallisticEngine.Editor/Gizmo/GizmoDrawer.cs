@@ -32,8 +32,36 @@ internal sealed class GizmoDrawer : IGizmos {
         GizmoMath.Project(world, vp, viewMin, viewSize, out px);
 
     public void DrawLine(Vector3 from, Vector3 to) {
-        if (P(from, out SysVec2 a) && P(to, out SysVec2 b))
+        if (P(from, out SysVec2 a) && P(to, out SysVec2 b) && ClipToView(ref a, ref b))
             draw.AddLine(a, b, Col(), 1.5f);
+    }
+
+    // Liang-Barsky clip of a screen-space segment to the Scene-view rect. Project() returns true for
+    // any point in front of the camera even if its PIXEL lands outside the viewport, so without this a
+    // gizmo line that runs off-screen bleeds across the toolbar/tabs/other panels. Clipping the segment
+    // to [viewMin, viewMin+viewSize] keeps every gizmo inside the Scene image. Returns false if the
+    // segment is fully outside.
+    bool ClipToView(ref SysVec2 a, ref SysVec2 b) {
+        float xMin = viewMin.X, yMin = viewMin.Y;
+        float xMax = viewMin.X + viewSize.X, yMax = viewMin.Y + viewSize.Y;
+        float dx = b.X - a.X, dy = b.Y - a.Y;
+        float t0 = 0f, t1 = 1f;
+        Span<float> p = stackalloc float[] { -dx, dx, -dy, dy };
+        Span<float> q = stackalloc float[] { a.X - xMin, xMax - a.X, a.Y - yMin, yMax - a.Y };
+        for (var i = 0; i < 4; i++) {
+            if (p[i] == 0f) {
+                if (q[i] < 0f) return false;          // parallel and outside this edge
+            }
+            else {
+                float r = q[i] / p[i];
+                if (p[i] < 0f) { if (r > t1) return false; if (r > t0) t0 = r; }
+                else { if (r < t0) return false; if (r < t1) t1 = r; }
+            }
+        }
+        var na = new SysVec2(a.X + t0 * dx, a.Y + t0 * dy);
+        var nb = new SysVec2(a.X + t1 * dx, a.Y + t1 * dy);
+        a = na; b = nb;
+        return true;
     }
 
     public void DrawRay(Vector3 origin, Vector3 direction) => DrawLine(origin, origin + direction);
