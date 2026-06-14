@@ -816,19 +816,20 @@ public sealed class GLSdfGiPass : IDisposable {
             hasHistory = true;
             prevViewProjection = viewProjNoJitter;
 
-            // ---- 2b. Edge-aware a-trous spatial denoise (2 iterations, widening tap spacing) ----
+            // ---- 2b. Edge-aware a-trous spatial denoise (widening tap spacing) ----
             // Smooths the residual grazing-surface speckle while depth/normal edge-stops keep the
             // box/wall corners crisp. Ping-pong the half-res GI through the SSGI denoiser.
             denoisePingPong[0].Ensure(halfW, halfH);
             denoisePingPong[1].Ensure(halfW, halfH);
             Matrix4 invProjNoJitterCopy = invProjNoJitter;
             GLRenderTexture src = giWriteTex;
-            // 4 iterations (1,2,4,8 texel spacing). The cache-bounce GI is LOW-FREQUENCY (diffuse,
-            // per-surface), so a wide a-trous is correct — it crushes the 6-ray hit/miss speckle that
-            // lingers in dark recesses (where temporal alone can't, the gather variance is highest).
-            // Edge stops loosened (DepthSigma 0.2, NormalSigma 16) so the blur crosses the speckle but
-            // still respects real depth/normal discontinuities (column edges, corners stay crisp).
-            for (var iter = 0; iter < 4; iter++) {
+            // GI REWORK Phase 4-lite: 6 iterations (1,2,4,8,16,32 texel spacing), was 4. The bounce GI is
+            // LOW-FREQUENCY (diffuse, per-surface), so a wide a-trous is correct — but the dominant artifact
+            // is the COARSE-FIELD blocky hit/miss structure, whose blocks are BIGGER than the old 8-texel
+            // reach, so they survived. The extra iterations (to 32 texels) cross those blocks. Edge stops
+            // (DepthSigma 0.2, NormalSigma 16) still respect real depth/normal discontinuities (column
+            // edges, corners stay crisp) so the wide blur doesn't bleed across silhouettes.
+            for (var iter = 0; iter < 6; iter++) {
                 GLRenderTexture dst = denoisePingPong[iter & 1];
                 dst.BindAsTarget();
                 denoiseShader.Activate();
