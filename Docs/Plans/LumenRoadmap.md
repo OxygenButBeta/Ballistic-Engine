@@ -31,12 +31,31 @@ RadianceInject) — the path used when BALLISTIC_LUMEN_GDF is off. Plus the lega
   frame hid a fully-broken (lattice) GI for many commits.
 - The octahedral SCREEN-PROBE path's lattice is in the TRACE/coarseness, not temporal/integrate/scene
   (bisected by A/B: scene clean with GI off; grid identical with temporal off; 2 integrate rewrites = 0).
-- GDF WARM-UP is SLOW on large scenes: cascade-0 background bake takes SECONDS (BistroExterior gdfActive
-  false ~frame400 -> true ~2500). During warm-up Lumen silently contributes nothing. Per-cascade full-res
-  BVH bake over the cascade triangles is the cost. Diagnostics: GLSdfGiPass.GdfActive + GLGlobalSdf
-  FAULTED log under BALLISTIC_LUMEN_DIAG. (Note: a Task that FAULTS would retry forever, Available stuck
-  false — watch for that.)
-- Energy-bounded multi-bounce is mandatory (clamp bounce albedo 0.9 + hard cap) or white walls explode.
+- GDF WARM-UP — FIXED (Phase A, commit 35e6e02c). Was SECONDS (cascade-0 full 96^3 BVH bake). Now
+  COARSE-FIRST: bake every cascade at 32^3 first (CPU-upsample into the full-res texture, march/placement
+  unchanged), mark available, then refine to 96^3 in the background. Cascade-0 coarse up ~1-3 frames after
+  geometry loads (BistroExterior ~frame101). Plus: narrow-band sign (only ray-cast the inside-test near
+  surfaces), sub-cell triangle cull (drop tris < half a voxel — shrinks the BVH build, the dominant cost;
+  SunTemple cascade3 342K->94K tris), row-parallel grid query, 3-ray coarse sign. Diagnostics:
+  GLSdfGiPass.GdfActive / GdfWarmupState + per-bake BVH/grid timing under BALLISTIC_LUMEN_DIAG. The full
+  96^3 REFINE is still ~1-6s/cascade (dense world-triangle bake is the architectural ceiling — the real
+  Lumen answer is composing per-mesh MDFs, Phase B+); but it's background and the coarse field renders
+  meanwhile. (Note: a Task that FAULTS would retry forever, Available stuck false — watch for that.)
+- GI ENERGY — the additive SDF-GI is irradiance and MUST be x receiver albedo (rho). No albedo G-buffer
+  (forward renderer), so rho was implicitly 1 -> ~3x too bright; tolerable on a DIM interior, SATURATED a
+  bright exterior red. FIXED (df8ac32e) with rho=0.3 (radiosity avg-albedo convention) in SdfGi_Combine.
+  BistroExterior fixed, SunTemple preserved. Proper per-pixel albedo = a deferred-G-buffer change (later).
+- Energy-bounded multi-bounce is mandatory or white/coloured walls explode: the voxel cache is a geometric
+  series in bounce albedo a; enclosed (no sky escape) it sums to direct*a/(1-a). CLAMP NOW 0.55 (was 0.9 =
+  10x runaway), commit a8b25524. Hard cap 32 as final safety.
+- BISTROINTERIOR pure-red GI — DIAGNOSED, NOT YET FIXED. Isolated bounce mean RGB (142, 0.2, ~3): red
+  bright, green ~ZERO. NOT the multi-bounce, NOT the radiance cache (persists with BALLISTIC_LUMEN_NORADIANCE=1,
+  i.e. HitDirect grey 0.5 albedo, which CANNOT produce green=0). So the red is in the DIRECT/SKY term: the
+  scene's ProceduralSky carries an implicit low/warm sun, and interior surfaces OUTSIDE the sun shadow
+  cascades get SampleSunVisibility==1.0 ("outside every cascade: lit") = PHANTOM full sun the sun can't
+  reach indoors. Fix (next interior/energy phase): cascade-range-aware GI sun visibility (outside cascades
+  -> treat as shadowed for enclosed interiors, but DON'T darken legit exterior surfaces — needs care + A/B).
+  Same SampleSunVisibility lives in BOTH SdfTrace_Comp.HitDirect AND GlobalRadianceInject_Comp.
 - NaN scrub must be a component SELECT, never mix(v,0,flag) (Inf/NaN*0 = NaN; AMD-proven).
 - Route compute compiles through GLSLShaderUtilities.ToAscii (em-dash truncates the source).
 - REBUILD THE EXE PROJECT (.Runtime/.Editor) after an engine change — shaders are embedded in the dll;
@@ -47,20 +66,20 @@ RadianceInject) — the path used when BALLISTIC_LUMEN_GDF is off. Plus the lega
 Each phase: implement -> verify on the ISOLATED bounce on SunTemple+BistroInterior+BistroExterior+
 CornellBox -> commit. Keep a working fallback until each is proven.
 
-### NOW (user's explicit immediate ask)
-- **DISABLE / REPLACE the legacy GI volumes that don't fit the Lumen goal:**
-  - IrradianceVolume (diffuse light probes) and ReflectionVolume (specular cubemaps) are a SEPARATE GI
-    model that conflicts/double-counts with Lumen and adds the slow probe bakes + the auto-fit volume
-    machinery the user dislikes. For now: make them INERT when Lumen is active (don't bake, don't
-    contribute, don't drive ambient), behind the Lumen-on gate. Keep the classes (back-compat) but stop
-    the renderer from running their bakes / sampling them when Lumen owns the GI. Later: delete or
-    fully fold their role into Lumen (diffuse = Lumen GI; specular = Lumen reflections).
+### DONE so far (committed)
+- Legacy IrradianceVolume + ReflectionVolume INERT when Lumen active (64027bda); separate SSGI
+  disabled when Lumen active (b672c976) — pure-Lumen isolation for testing.
+- Phase A GDF warm-up — DONE (35e6e02c): coarse-first clipmap, see WHAT WE KNOW. Cascade-0 coarse up
+  ~1-3 frames after geometry loads.
+- GI energy: receiver-reflectance rho=0.3 (df8ac32e) — exterior fixed, interior preserved.
+- Multi-bounce clamp 0.55 + radiance-cache diagnostic gate (a8b25524).
 
-### Phase A — GDF warm-up + always-on (make Lumen actually run, fast)
-- Coarser-first cascade bake (bake 32^3 instantly, refine to 96^3 over frames) OR cap triangles per
-  cascade + a faster BVH, so cascade 0 is up in 1-2 frames on ANY scene.
-- Bake more cascades during the first warm-up frames; amortize after.
-- Verify gdfActive=True within ~2 frames on BistroExterior; GI contributes immediately.
+### NEXT (the immediate problem, precisely diagnosed — see WHAT WE KNOW "BISTROINTERIOR pure-red")
+- Interior PHANTOM SUN: SampleSunVisibility returns 1.0 outside the shadow cascades, so enclosed
+  interior surfaces beyond cascade range get full (low/warm ProceduralSky) sun in the GI -> pure-red
+  BistroInterior. Fix cascade-range-aware GI sun visibility in BOTH SdfTrace_Comp.HitDirect and
+  GlobalRadianceInject_Comp, WITHOUT darkening legit exterior surfaces (careful A/B on all 3 scenes).
+  Likely belongs with Phase G (interior exposure) since it's interior-lighting-shaped.
 
 ### Phase B — make GDF+per-pixel the DEFAULT GI (no flag)
 - Once warm-up is fast + quality confirmed, drop BALLISTIC_SDFGI/LUMEN_GDF gating so Lumen is the
