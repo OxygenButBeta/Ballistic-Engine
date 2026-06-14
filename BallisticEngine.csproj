@@ -18,6 +18,7 @@
       <Compile Remove="BallisticEngine.Cli\**\*.cs" />
       <Compile Remove="BallisticEngine.Mcp\**\*.cs" />
       <Compile Remove="BallisticEngine.Profiling.Tracy\**\*.cs" />
+      <Compile Remove="BallisticEngine.DX12\**\*.cs" />
       <Compile Remove="Tools\**\*.cs" />
       <Compile Remove="SampleProject\**\*.cs" />
     </ItemGroup>

@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <!-- DirectX 12 + DXR rendering backend (DX12Migration.md). Kept a SEPARATE project — like
+         BallisticEngine.Profiling.Tracy — so the Vortice native dependency never enters the core
+         engine library; only the host exes that choose the DX12 backend reference it. -->
+    <PropertyGroup>
+        <OutputType>Library</OutputType>
+        <TargetFramework>net9.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>disable</Nullable>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="..\BallisticEngine.csproj" />
+      <!-- Vortice.Windows: idiomatic C# DX12 + DXR. Brings Vortice.DXGI / Vortice.Direct3D
+           transitively; Vortice.Dxc compiles HLSL -> DXIL in-process. -->
+      <PackageReference Include="Vortice.Direct3D12" Version="3.8.3" />
+      <PackageReference Include="Vortice.Dxc" Version="3.8.3" />
+    </ItemGroup>
+
+    <!-- HLSL shaders for the DX12 backend (embedded, mirroring OpenGL\Shader\Embedded\*.glsl). -->
+    <ItemGroup>
+      <EmbeddedResource Include="Shaders\**\*.hlsl" />
+    </ItemGroup>
+
+</Project>

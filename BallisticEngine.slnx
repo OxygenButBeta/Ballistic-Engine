@@ -1,6 +1,7 @@
 <Solution>
   <Project Path="BallisticEngine.csproj" />
   <Project Path="BallisticEngine.Cli/BallisticEngine.Cli.csproj" />
+  <Project Path="BallisticEngine.DX12/BallisticEngine.DX12.csproj" />
   <Project Path="BallisticEngine.Editor/BallisticEngine.Editor.csproj" />
   <Project Path="BallisticEngine.Mcp/BallisticEngine.Mcp.csproj" />
   <Project Path="BallisticEngine.Profiling.Tracy/BallisticEngine.Profiling.Tracy.csproj" />
