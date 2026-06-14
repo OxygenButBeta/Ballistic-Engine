@@ -127,7 +127,17 @@ public sealed class GLSdfGiPass : IDisposable {
     const int ProbeStep = 8;    // half-res pixels per probe edge (=> ~16 full-res px / probe)
     static readonly bool UseProbes =
         Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_PROBES") != "0"; // default ON
-    readonly GLRenderTexture probeAtlas = new();  // RGBA16F octahedral radiance atlas
+    readonly GLRenderTexture probeAtlas = new();  // RGBA16F octahedral radiance atlas (this frame, raw trace)
+    // Per-probe octmap TEMPORAL accumulation (the convergence for 1-sample/texel/frame probes): ping-pong
+    // history atlases, reproject each probe by its world pos to last frame, EMA-blend the octmap. Without
+    // this each probe is a noisy 1-spp estimate (the CornellBox grid/speckle).
+    readonly GLRenderTexture[] probeHistory = { new(), new() };
+    int probeHistWrite;
+    bool probeHasHistory;
+    Matrix4 probePrevViewProj;
+    int probeTemporalProgram;        // LumenProbeTemporal_Comp (octmap EMA accumulation)
+    // Temporal uniform locations.
+    int ptInvProjection, ptInvView, ptPrevVP, ptAtlasSize, ptHalfSize, ptOctRes, ptProbeStep, ptMaxHistory, ptHasHistory;
     StandardShader probeIntegrateShader;
     int probeIntFbo;
     // ProbeOct uniform locations on the march program.
@@ -243,6 +253,18 @@ public sealed class GLSdfGiPass : IDisposable {
         probeIntegrateShader = GraphicAPI.CreateStandardShader(
             EmbeddedShaderSource.Read("FSQ_Vert.glsl"),
             EmbeddedShaderSource.Read("LumenProbeIntegrate_Frag.glsl"));
+        probeTemporalProgram = CompileCompute(EmbeddedShaderSource.Read("LumenProbeTemporal_Comp.glsl"));
+        if (probeTemporalProgram != 0) {
+            ptInvProjection = GL.GetUniformLocation(probeTemporalProgram, "InvProjection");
+            ptInvView = GL.GetUniformLocation(probeTemporalProgram, "InvView");
+            ptPrevVP = GL.GetUniformLocation(probeTemporalProgram, "PrevViewProj");
+            ptAtlasSize = GL.GetUniformLocation(probeTemporalProgram, "ProbeAtlasSize");
+            ptHalfSize = GL.GetUniformLocation(probeTemporalProgram, "HalfSize");
+            ptOctRes = GL.GetUniformLocation(probeTemporalProgram, "OctRes");
+            ptProbeStep = GL.GetUniformLocation(probeTemporalProgram, "ProbeStep");
+            ptMaxHistory = GL.GetUniformLocation(probeTemporalProgram, "MaxHistory");
+            ptHasHistory = GL.GetUniformLocation(probeTemporalProgram, "HasHistory");
+        }
         if (UseGlobalSdf)
             // 96^3 over a 12m base cascade = 0.125m near-field cells (Lumen-class fine; 64^3/16m was
             // 0.25m and blended adjacent walls into grey on small scenes). Outer cascades (x2 each)
@@ -585,7 +607,12 @@ public sealed class GLSdfGiPass : IDisposable {
         int probeGridY = (halfH + ProbeStep - 1) / ProbeStep;
         if (probes) {
             int atlasW = probeGridX * OctRes, atlasH = probeGridY * OctRes;
-            probeAtlas.Ensure(atlasW, atlasH);
+            bool sizeKept = probeAtlas.Ensure(atlasW, atlasH);
+            bool h0 = probeHistory[0].Ensure(atlasW, atlasH);
+            probeHistory[1].Ensure(atlasW, atlasH);
+            if (!sizeKept || !h0) probeHasHistory = false;
+            Matrix4 viewProjNoJitter = view * projectionNoJitter;
+
             // 1. Probe trace: dispatch over the atlas, OutGi = probe atlas, ProbeOctMode=1.
             GL.BindImageTexture(OutGiImageUnit, probeAtlas.Texture, 0, false, 0,
                 TextureAccess.WriteOnly, SizedInternalFormat.Rgba16f);
@@ -595,6 +622,37 @@ public sealed class GLSdfGiPass : IDisposable {
             GL.Uniform1(locProbeStep, ProbeStep);
             GL.DispatchCompute((atlasW + 7) / 8, (atlasH + 7) / 8, 1);
             GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
+
+            // 1b. TEMPORAL: EMA-accumulate each probe's octmap vs last frame (reproject by world pos).
+            // Accumulates IN PLACE into probeAtlas (reads probeHistory[read]); then we copy the result
+            // into probeHistory[write] for next frame. Converges the 1-sample/texel probes -> clean.
+            if (probeTemporalProgram != 0) {
+                GL.UseProgram(probeTemporalProgram);
+                GL.BindImageTexture(0, probeAtlas.Texture, 0, false, 0, TextureAccess.ReadWrite, SizedInternalFormat.Rgba16f);
+                BindSampler(1, TextureTarget.Texture2D, probeHistory[probeHistWrite].Texture); // last frame's accum
+                BindSampler(2, TextureTarget.Texture2D, depthTex);
+                GL.Uniform1(GL.GetUniformLocation(probeTemporalProgram, "ProbeHistory"), 1);
+                GL.Uniform1(GL.GetUniformLocation(probeTemporalProgram, "DepthTex"), 2);
+                Matrix4 ipT = Matrix4.Invert(projection), ivT = Matrix4.Invert(view);
+                GL.UniformMatrix4(ptInvProjection, false, ref ipT);
+                GL.UniformMatrix4(ptInvView, false, ref ivT);
+                GL.UniformMatrix4(ptPrevVP, false, ref probePrevViewProj);
+                GL.Uniform2(ptAtlasSize, atlasW, atlasH);
+                GL.Uniform2(ptHalfSize, halfW, halfH);
+                GL.Uniform1(ptOctRes, OctRes);
+                GL.Uniform1(ptProbeStep, ProbeStep);
+                GL.Uniform1(ptMaxHistory, 24f);
+                GL.Uniform1(ptHasHistory, probeHasHistory ? 1 : 0);
+                GL.DispatchCompute((atlasW + 7) / 8, (atlasH + 7) / 8, 1);
+                GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
+                // Copy the accumulated atlas into this frame's history slot (next frame reads it).
+                int writeSlot = 1 - probeHistWrite;
+                GL.CopyImageSubData(probeAtlas.Texture, ImageTarget.Texture2D, 0, 0, 0, 0,
+                    probeHistory[writeSlot].Texture, ImageTarget.Texture2D, 0, 0, 0, 0, atlasW, atlasH, 1);
+                probeHistWrite = writeSlot;
+                probeHasHistory = true;
+                probePrevViewProj = viewProjNoJitter;
+            }
 
             // 2. Integrate: per half-res pixel, BRDF-weighted sum of the surrounding probes' octmaps -> output.
             GL.Disable(EnableCap.DepthTest); GL.Disable(EnableCap.CullFace); GL.Disable(EnableCap.Blend);
@@ -874,6 +932,8 @@ public sealed class GLSdfGiPass : IDisposable {
         globalSdf?.Dispose();
         output.Dispose();
         probeAtlas.Dispose();
+        foreach (var t in probeHistory) t.Dispose();
+        if (probeTemporalProgram != 0) GL.DeleteProgram(probeTemporalProgram);
         foreach (GLRenderTexture t in historyGi) t.Dispose();
         foreach (GLRenderTexture t in historyDepth) t.Dispose();
         foreach (GLRenderTexture t in denoisePingPong) t.Dispose();
