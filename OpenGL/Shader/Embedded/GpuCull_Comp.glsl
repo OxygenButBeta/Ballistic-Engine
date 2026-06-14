@@ -111,24 +111,41 @@ bool occludedByHiZ(vec3 mn, vec3 mx) {
         nearDist = min(nearDist, -(view * vec4(corner, 1.0)).z); // linear distance in front of camera
     }
 
-    // Pick the mip where the rectangle spans at most ~2 texels, so a small set of fetches covers it.
+    // Pick the mip where the rectangle spans at most ~2 texels, so the 4 corner fetches actually
+    // BOUND the footprint's max occluder. CRITICAL for conservativeness: 4 corner taps only cover
+    // the true footprint MAX if the rect is <= ~2 texels at `level`; for a BIG on-screen footprint
+    // (a near/large object — e.g. the central statue when the camera is close + static, which is
+    // exactly when Hi-Z is active) the 4 corners can MISS the near-occluder texels between them and
+    // also the far-depth texels, producing a WRONG max -> false-cull (the "statue disappears when I
+    // stop" bug). So: round the mip UP so the 2x2 corner grid genuinely spans the rect, and if the
+    // footprint is large in screen space, DON'T trust the 4-corner max — skip the cull (keep it).
     vec2 sizePx = (uvMax - uvMin) * hizParams.xy;
-    float level = ceil(log2(max(max(sizePx.x, sizePx.y), 1.0)));
+    float maxSpanPx = max(sizePx.x, sizePx.y);
+    // Large on-screen footprint: a 5-tap max can't reliably bound the true occluder set over a big
+    // rect, so the cull isn't conservative there — keep it (a big near object is rarely fully
+    // occluded anyway). This is the direct guard against the "near/large object culled when static".
+    if (maxSpanPx > 0.4 * max(hizParams.x, hizParams.y))
+        return false;
+    float level = ceil(log2(max(maxSpanPx * 0.5, 1.0))); // /2 so a 2x2 corner grid covers the rect
     level = clamp(level, 0.0, hizParams.z - 1.0);
 
-    // Farthest (MAX) occluder window-depth over the footprint.
+    // Farthest (MAX) occluder window-depth over the footprint (the 2x2 corner grid).
     float o0 = textureLod(HiZPyramid, vec2(uvMin.x, uvMin.y), level).r;
     float o1 = textureLod(HiZPyramid, vec2(uvMax.x, uvMin.y), level).r;
     float o2 = textureLod(HiZPyramid, vec2(uvMin.x, uvMax.y), level).r;
     float o3 = textureLod(HiZPyramid, vec2(uvMax.x, uvMax.y), level).r;
-    float maxOccluderDepth = max(max(o0, o1), max(o2, o3));
+    // Centre tap too — for a footprint spanning a few texels the 4 corners can straddle a near
+    // occluder and miss it; the centre catches geometry that pokes through the middle.
+    float oc = textureLod(HiZPyramid, (uvMin + uvMax) * 0.5, level).r;
+    float maxOccluderDepth = max(max(max(o0, o1), max(o2, o3)), oc);
     if (maxOccluderDepth >= 1.0)
         return false; // footprint includes sky (far clear) — never safely occluded
 
     // Compare in LINEAR distance with a metric bias (robust where window depth is bunched near 1).
+    // Bias scales with distance (window depth precision falls off far away) + a floor.
     float occluderDist = linearViewDist(maxOccluderDepth);
-    const float BIAS_METRES = 0.25;
-    return nearDist > occluderDist + BIAS_METRES;
+    float bias = max(0.5, occluderDist * 0.03);
+    return nearDist > occluderDist + bias;
 }
 
 void main() {
