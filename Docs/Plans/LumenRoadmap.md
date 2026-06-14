@@ -53,17 +53,20 @@ RadianceInject) — the path used when BALLISTIC_LUMEN_GDF is off. Plus the lega
   (march the global field toward the sun: hit -> shadowed, escape -> lit) in BOTH SdfTrace_Comp and
   GlobalRadianceInject_Comp. Real Lumen far-shadow technique; verified regression-free on SunTemple +
   BistroExterior. (Was NOT the cause of BistroInterior's red — see below.)
-- BISTROINTERIOR railed-red GI — ROOT CAUSE FOUND (via the BALLISTIC_LUMEN_DIAG exposure print), NOT YET
-  FIXED. It has NO directional light (sunColor=0), so it's not phantom sun. preExposure auto-settles to
-  ~0.0023 (a dim, high-EV interior) => raw HDR scene radiance is ~435x the displayed value. In the enclosed
-  red-walled room EVERY gather ray hits a wall and returns that surface's huge red lit radiance (screen
-  trace SceneColor / voxel cache), and the additive GI (even rho=0.3 x 0.12) DWARFS the dim receiver ->
-  red rail after tonemap. The isolated GI is pure red because the red WALLS dominate the bounce, not the
-  sky. REAL FIX = a deferred-albedo G-buffer so GI multiplies by each pixel's TRUE (low) receiver albedo
-  instead of the flat HitAlbedo=0.5 / unit assumption — the next big task (see Phase E/F). TRIED + REVERTED
-  (don't repeat): (a) removing the sky term from HitDirect/GatherBounce — made BistroExterior worse (the
-  sky was balancing the warm bounce), didn't fix interior; (b) a relative firefly clamp scene*2 — too loose
-  under the huge raw scene. NOTE this scene is ALSO a known exposure case (Fixed EV15.5 -> black).
+- BISTROINTERIOR railed-red GI — FIXED (commit 1373e9d0) via the DEFERRED-ALBEDO G-BUFFER. Root cause: the
+  GI composited irradiance with NO per-pixel receiver albedo (flat rho=0.3 stand-in). In this dim, high-EV
+  interior (preExposure ~0.0023 -> raw HDR ~435x display) every gather ray hit a red wall and returned its
+  huge red lit radiance, and the additive GI dwarfed the dim receiver -> pure-red rail (the WALLS dominate,
+  not the sky; it has NO directional light so it was never phantom sun). FIX: 3rd opaque MRT (ColorAttachment2
+  = linear diffuse albedo = albedo*(1-metallic)) in GLFrameBuffer + PBR Frag.glsl; SdfGi_Combine multiplies
+  the added GI by that per-pixel albedo (HasAlbedo; falls back to 0.3 when absent). Default intensity
+  RECALIBRATED 0.4 -> 0.18 (the old 0.4 baked in the flat 0.3; real albedos average higher — SunTemple's red
+  sandstone ~0.7 over-bounced once true albedo applied). GPU-driven path transparent to fragment outputs
+  (injects only vertex+material), verified byte-clean; sky pass masks attach 2; prepass depth-only (ColorMask).
+  Result: BistroInterior (151,9,7) railed -> (30,9,4) clean moody bar; SunTemple cream columns un-washed +
+  natural apse bounce (best yet); BistroExterior natural terracotta. No-regression with Lumen OFF confirmed.
+  (Dead ends, don't repeat: sky-removal from HitDirect/GatherBounce hurt BistroExterior; relative clamp scene*2
+  too loose.) This scene is ALSO a known exposure case (Fixed EV15.5 -> black; tested under auto-exposure).
 - NaN scrub must be a component SELECT, never mix(v,0,flag) (Inf/NaN*0 = NaN; AMD-proven).
 - Route compute compiles through GLSLShaderUtilities.ToAscii (em-dash truncates the source).
 - REBUILD THE EXE PROJECT (.Runtime/.Editor) after an engine change — shaders are embedded in the dll;
@@ -82,19 +85,14 @@ CornellBox -> commit. Keep a working fallback until each is proven.
 - GI energy: receiver-reflectance rho=0.3 (df8ac32e) — exterior fixed, interior preserved.
 - Multi-bounce clamp 0.55 + radiance-cache diagnostic gate (a8b25524).
 - Phantom-sun GDF sun trace (48400850) — outside-cascades sun shadowing via the GDF.
+- DEFERRED-ALBEDO G-BUFFER (1373e9d0) — per-pixel GI receiver reflectance (3rd opaque MRT). FIXED
+  BistroInterior + improved all 3 scenes. Default intensity recalibrated 0.4 -> 0.18. (Note: SSGI_Combine
+  still uses its own flat energy gate, not the albedo G-buffer — SSGI is off under Lumen; wire it later.)
 
-### NEXT — DEFERRED-ALBEDO G-BUFFER (the real BistroInterior fix + a fidelity enabler for all of GI)
-- Problem: GI is composited as irradiance with NO per-pixel receiver albedo (forward renderer), so it
-  uses a flat rho=0.3 stand-in. That fails the extreme case (BistroInterior: huge raw-HDR red-wall
-  bounce dwarfs the dim receiver -> red rail). Proper Lumen multiplies the gathered irradiance by the
-  surface's REAL diffuse albedo.
-- Plan: add a 3rd opaque MRT (location 2 = linear diffuse albedo, RGB) to GLFrameBuffer + the PBR
-  Frag.glsl; SdfGi_Combine (and SSGI_Combine) then multiply the added GI by that albedo instead of the
-  flat 0.3. CARE: the prepass + the GPU-DRIVEN shader injection (GpuDrivenShaderTransform) must emit/
-  declare the 3rd output consistently or the FBO-complete + draw-buffer state breaks (black viewport /
-  GPU-driven corruption — the worst regression). Make it OPTIONAL/additive + fall back to rho=0.3 when
-  absent, and regression-sweep ALL scenes (z-prepass invariance, GPU-driven byte-identical) before commit.
-  This is a focused-session change (touches the core opaque path); do NOT rush it at the tail of a turn.
+### NEXT — the GI now looks right on all 3 scenes. Pick up the phase ladder:
+- The albedo G-buffer also unlocks correct GI on the SCREEN-PROBE path + SSGI when those come back.
+- Immediate candidates: Phase B (make Lumen the no-flag default) is the cleanest next step now that the
+  3 reference scenes are solid; or fidelity polish (motion stability, contact-GI sharpness, reflections).
 
 ### Phase B — make GDF+per-pixel the DEFAULT GI (no flag)
 - Once warm-up is fast + quality confirmed, drop BALLISTIC_SDFGI/LUMEN_GDF gating so Lumen is the
