@@ -43,6 +43,41 @@ public static class MeshSdfBaker {
         return BakeRange(verts, idx, indexStart, indexCount, settings);
     }
 
+    // Bakes ONE GLOBAL field over an explicit WORLD-space box from a flat list of world-space triangles
+    // (already transformed). Unlike BakeSubMesh this does NOT fit tight bounds — the bounds are given
+    // (the scene/camera box), so the resulting field is the whole-scene distance field the global-SDF
+    // (clipmap-style) Lumen path marches as ONE texture, instead of thousands of per-object bricks. The
+    // distance/sign math is identical (BVH closest-triangle + 6-ray parity sign). `res` is the per-axis
+    // cell count (cubic-ish over the box). Returns null if there are no triangles. Heavy — call on a
+    // background thread (the parallel grid loop is here, but a 128^3 bake over a room is hundreds of ms).
+    public static MeshSdf BakeWorldTriangles(System.Collections.Generic.List<Vector3> worldVerts,
+        Vector3 boundsMin, Vector3 boundsMax, Vector3i res) {
+        int triCount = worldVerts.Count / 3;
+        if (triCount == 0)
+            return null;
+        var tris = new Triangle[triCount];
+        for (int t = 0; t < triCount; t++)
+            tris[t] = new Triangle(worldVerts[t * 3], worldVerts[t * 3 + 1], worldVerts[t * 3 + 2]);
+
+        res = new Vector3i(Math.Max(2, res.X), Math.Max(2, res.Y), Math.Max(2, res.Z));
+        var bvh = new TriangleBvh(tris);
+        var distances = new float[res.X * res.Y * res.Z];
+        Vector3 cellSize = (boundsMax - boundsMin) / new Vector3(res.X, res.Y, res.Z);
+
+        System.Threading.Tasks.Parallel.For(0, res.Z, z => {
+            for (int y = 0; y < res.Y; y++) {
+                for (int x = 0; x < res.X; x++) {
+                    Vector3 p = boundsMin + new Vector3(
+                        (x + 0.5f) * cellSize.X, (y + 0.5f) * cellSize.Y, (z + 0.5f) * cellSize.Z);
+                    float unsigned = MathF.Sqrt(bvh.ClosestDistanceSq(p));
+                    bool inside = bvh.IsInside(p);
+                    distances[x + res.X * (y + res.Y * z)] = inside ? -unsigned : unsigned;
+                }
+            }
+        });
+        return new MeshSdf(res, boundsMin, boundsMax, distances);
+    }
+
     static MeshSdf BakeRange(Vector3[] verts, uint[] idx, int indexStart, int indexCount,
         Settings settings) {
         int end = indexStart + indexCount;
