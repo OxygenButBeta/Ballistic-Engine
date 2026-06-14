@@ -12,6 +12,9 @@ namespace BallisticEngine;
 // resolve that flicker into a stable reflection. History is pass-owned (ping-pong); a resize
 // drops it.
 public sealed class GLSSRPass {
+    // Hoisted so the per-frame MRT setup doesn't allocate an array every temporal pass.
+    static readonly DrawBuffersEnum[] Mrt2 = { DrawBuffersEnum.ColorAttachment0, DrawBuffersEnum.ColorAttachment1 };
+
     readonly StandardShader marchShader;
     readonly StandardShader temporalShader;
     readonly StandardShader combineShader;
@@ -111,7 +114,7 @@ public sealed class GLSSRPass {
                 TextureTarget.Texture2D, ssrWriteTex.Texture, 0);
             GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment1,
                 TextureTarget.Texture2D, depthWriteTex.Texture, 0);
-            GL.DrawBuffers(2, new[] { DrawBuffersEnum.ColorAttachment0, DrawBuffersEnum.ColorAttachment1 });
+            GL.DrawBuffers(2, Mrt2);
 
             temporalShader.Activate();
             BindTex(temporalShader, 0, reflectionTarget.Texture, "currentSSR");

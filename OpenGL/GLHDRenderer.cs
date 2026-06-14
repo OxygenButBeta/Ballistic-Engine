@@ -367,6 +367,12 @@ public class GLHDRenderer : HDRenderer {
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
     }
 
+    // Hoisted clear-value arrays — these ran `new[] {...}` every frame in the hot path (a small but
+    // pointless per-frame GC alloc). Static so the clears reuse one array forever.
+    static readonly float[] NormalClearValue = { 0f, 0f, 0f, 1f }; // normal=0, roughness=1
+    static readonly float[] DepthClearValue = { 1f };
+    static readonly uint[] IdMapClearValue = { 0u };
+
     static readonly string[] PointPositionNames = BuildIndexedNames("PointLightPosition", MaxPointLights);
     static readonly string[] PointColorNames = BuildIndexedNames("PointLightColor", MaxPointLights);
     static readonly string[] PointRangeNames = BuildIndexedNames("PointLightRange", MaxPointLights);
@@ -596,7 +602,7 @@ public class GLHDRenderer : HDRenderer {
         GL.Viewport(0, 0, target.LenX, target.LenY);
         ClearColorBuffer();
         if (target.NormalTextureId != -1)
-            GL.ClearBuffer(ClearBuffer.Color, 1, new[] { 0f, 0f, 0f, 1f }); // no normal, roughness 1
+            GL.ClearBuffer(ClearBuffer.Color, 1, NormalClearValue); // no normal, roughness 1
 
         // Z-prepass (always on): renders depth with each material's own vertex math (invariant
         // gl_Position -> bit-identical), feeds SSAO before shading, and the main pass below
@@ -1072,8 +1078,8 @@ public class GLHDRenderer : HDRenderer {
             RenderbufferTarget.Renderbuffer, depthRbo);
 
         GL.Viewport(0, 0, w, h);
-        GL.ClearBuffer(ClearBuffer.Color, 0, new uint[] { 0u });
-        GL.ClearBuffer(ClearBuffer.Depth, 0, new[] { 1f });
+        GL.ClearBuffer(ClearBuffer.Color, 0, IdMapClearValue);
+        GL.ClearBuffer(ClearBuffer.Depth, 0, DepthClearValue);
         GL.Enable(EnableCap.DepthTest);
         GL.DepthFunc(DepthFunction.Less);
         GL.DepthMask(true);

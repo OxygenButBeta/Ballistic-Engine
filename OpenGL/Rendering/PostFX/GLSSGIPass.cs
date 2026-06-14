@@ -15,6 +15,9 @@ namespace BallisticEngine;
 // History (accumulated GI) persists per render target across frames and is reset on resize.
 // Like SSR it needs the single-sample normal/depth attachments, so it only runs with MSAA off.
 public sealed class GLSSGIPass {
+    // Hoisted so the per-frame MRT setup doesn't `new[]` an array every temporal pass (GC pressure).
+    static readonly DrawBuffersEnum[] Mrt2 = { DrawBuffersEnum.ColorAttachment0, DrawBuffersEnum.ColorAttachment1 };
+
     readonly StandardShader marchShader;
     readonly StandardShader temporalShader;
     readonly StandardShader denoiseShader;
@@ -153,7 +156,7 @@ public sealed class GLSSGIPass {
             TextureTarget.Texture2D, historyWriteTex.Texture, 0);
         GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment1,
             TextureTarget.Texture2D, depthWriteTex.Texture, 0);
-        GL.DrawBuffers(2, new[] { DrawBuffersEnum.ColorAttachment0, DrawBuffersEnum.ColorAttachment1 });
+        GL.DrawBuffers(2, Mrt2);
 
         temporalShader.Activate();
         BindTex(0, giTarget.Texture, temporalShader, "currentGI");

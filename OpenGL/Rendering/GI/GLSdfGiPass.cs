@@ -26,6 +26,9 @@ namespace BallisticEngine.OpenGL.GI;
 // Abstraction (BallisticEngine.GI / BallisticEngine). No asset I/O here — we bake straight from the
 // retained CPU geometry (Mesh.Vertices/Indices/...), so no .bmesh artifact path is needed.
 public sealed class GLSdfGiPass : IDisposable {
+    // Hoisted so the per-frame temporal MRT setup doesn't allocate an array every frame.
+    static readonly DrawBuffersEnum[] Mrt2 = { DrawBuffersEnum.ColorAttachment0, DrawBuffersEnum.ColorAttachment1 };
+
     // Per-SUBMESH SDF resolution (longest-axis cell count). Each submesh gets its OWN tight field
     // instead of one coarse whole-scene brick — the fix for both the exterior spurious-hit wash and
     // the missing interior occlusion. 24^3 is fine enough for occlusion yet small enough (~27KB R16F)
@@ -490,7 +493,7 @@ public sealed class GLSdfGiPass : IDisposable {
                 TextureTarget.Texture2D, giWriteTex.Texture, 0);
             GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment1,
                 TextureTarget.Texture2D, depthWriteTex.Texture, 0);
-            GL.DrawBuffers(2, new[] { DrawBuffersEnum.ColorAttachment0, DrawBuffersEnum.ColorAttachment1 });
+            GL.DrawBuffers(2, Mrt2);
 
             temporalShader.Activate();
             BindCombineSampler(0, output.Texture, "currentGI");
