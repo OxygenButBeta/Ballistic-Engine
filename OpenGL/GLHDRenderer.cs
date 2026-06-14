@@ -2826,7 +2826,7 @@ public class GLHDRenderer : HDRenderer {
     int defaultReflectionRefitCountdown;
 
     static string ReflectionCacheKey(ReflectionVolume vol) =>
-        vol.DeriveCacheKey(SceneManager.GetCurrentScene()?.Name);
+        vol.DeriveCacheKey(SceneManager.GetCurrentScene()?.Name) + LightingFingerprint();
 
     void StepReflectionBake(float preExposure) {
         ReflectionVolume vol = ReflectionVolume.Active is { IsActive: true } active ? active : null;
@@ -3347,7 +3347,32 @@ public class GLHDRenderer : HDRenderer {
     }
 
     static string ProbeCacheKey(IrradianceVolume vol) =>
-        vol.DeriveCacheKey(SceneManager.GetCurrentScene()?.Name);
+        vol.DeriveCacheKey(SceneManager.GetCurrentScene()?.Name) + LightingFingerprint();
+
+    // A short hash of the inputs the GI BAKE depends on but the volume geometry does NOT capture:
+    // the sun (direction/colour/intensity) and the sky source identity+version. WITHOUT this, the
+    // probe/reflection cache key is purely the grid geometry + scene name, so a cache baked under one
+    // lighting state is silently reused after the lighting changes — which is exactly how a bad bake
+    // (e.g. a teal interior captured mid-session) got FROZEN into the .bpv and re-served every run.
+    // Folding the lighting into the key means any lighting change forces a fresh, correct re-bake.
+    static string LightingFingerprint() {
+        var hash = 2166136261u;
+        void Mix(int v) { unchecked { for (var i = 0; i < 4; i++) { hash ^= (byte)(v >> (i * 8)); hash *= 16777619u; } } }
+        void MixF(float v) => Mix(BitConverter.SingleToInt32Bits(v));
+        if (DirectionalLight.Instance is not null) {
+            // The resolved sun (same path the shader + sky bake use): direction and physical radiance
+            // — every sun input that changes what a probe capture records.
+            var sun = LightUniforms.Resolve();
+            MixF(sun.Direction.X); MixF(sun.Direction.Y); MixF(sun.Direction.Z);
+            MixF(sun.Color.X); MixF(sun.Color.Y); MixF(sun.Color.Z);
+            MixF(sun.AmbientIntensity);
+        }
+        // NOTE: hash the sun's resolved direction/colour (above), NOT a sky object's GetHashCode —
+        // reference-identity hashes differ every process launch and would force a perpetual re-bake.
+        // The sun fingerprint captures the dominant lighting change; a stable key (so the cache is
+        // actually reused across launches) matters more than catching every minor sky-parameter tweak.
+        return $"_{hash:x8}";
+    }
 
     bool TryLoadProbeCache(IrradianceVolume vol) {
         int px = Math.Clamp(vol.ProbesX, 2, 64);
