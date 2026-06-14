@@ -470,6 +470,13 @@ void main()
     if (renderMode == 5) { FragColor = vec4(vec3(roughness), 1.0); return; }
 
     vec3 N = GetNormalFromMap(texCoord, normalize(fragNormal), fragTBN, NormalStrength);
+    // TWO-SIDED FOLIAGE: cutout cards (leaves) draw with backface culling OFF, so a leaf's far
+    // face reaches here with a geometric normal pointing AWAY from the camera — shading it as-is
+    // makes the leaf go flat/dark (the washed white-green cards). Flip the normal to face the
+    // viewer on a backface so both sides shade as a lit leaf. Only for cutout materials; opaque
+    // geometry is single-sided (front-culled) and unaffected.
+    if (AlphaCutout && !gl_FrontFacing)
+        N = -N;
     vec3 V = normalize(CameraPos - fragPos);
     float NdotV = max(dot(N, V), 0.0);
 
@@ -495,6 +502,19 @@ void main()
     shadow *= ContactShadow(fragPos, D);
     vec3 shadowTint = mix(ShadowColor, vec3(1.0), shadow);
     ShadeSun(N, V, D, LightColor * shadowTint, albedo, metallic, roughness, F0, diffuseLight, specularLight);
+
+    // LEAF TRANSLUCENCY (foliage back-light): a thin leaf lit from BEHIND glows — light scatters
+    // through it toward the viewer. Without this, foliage with the sun behind it reads as a flat
+    // dark/washed card (the #1 "fake foliage" tell). Cheap wrap-style transmission (Frostbite/
+    // DICE fast SSS): the term peaks when the view looks toward the sun THROUGH the leaf (-D points
+    // away from the sun, dotted with V), gated by the sun shadow so shadowed leaves don't glow. The
+    // leaf's own albedo tints it (greens stay green). Cutout-only; opaque materials are unaffected.
+    if (AlphaCutout) {
+        float backlit = pow(max(dot(V, -D), 0.0), 4.0);     // view toward the sun through the leaf
+        float wrap = max(dot(-N, D), 0.0) * 0.5 + 0.5;       // wrapped so the lit side contributes too
+        vec3 transmission = LightColor * albedo * (backlit * wrap * shadow * 1.5);
+        diffuseLight += transmission;
+    }
 
     if (renderMode == 6) { FragColor = vec4(vec3(shadow), 1.0); return; }
 
