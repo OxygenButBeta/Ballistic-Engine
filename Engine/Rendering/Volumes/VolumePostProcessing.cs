@@ -63,6 +63,9 @@ public static class VolumePostProcessing {
             fx.SsgiAmbientFloor = 0f;
         }
 
+        // Legacy monolithic GlobalIllumination override (back-compat — scenes that already use it keep
+        // working). The SPLIT overrides below (LightProbes / ReflectionProbes / Lumen) override it when
+        // both are present, so a scene can migrate one system at a time.
         if (stack.GetComponent<GlobalIllumination>() is { } gi) {
             fx.GiProbeIntensity = gi.probeIntensity.Value;
             fx.GiReflectionIntensity = gi.reflectionIntensity.Value;
@@ -73,6 +76,26 @@ public static class VolumePostProcessing {
             fx.GiReflectionDensity = gi.reflectionDensity.Value;
             fx.GiDebugShowProbes = gi.debugShowProbes.Value;
             fx.GiDebugShowReflectionProbes = gi.debugShowReflectionProbes.Value;
+        }
+
+        // Split GI overrides (the preferred, granular form). Each is independent so a scene can disable
+        // one system (e.g. "stop Lumen") without affecting the others.
+        if (stack.GetComponent<LightProbes>() is { } lp) {
+            fx.GiProbesEnabled = lp.enabled.Value;
+            fx.GiProbeIntensity = lp.intensity.Value;
+            fx.GiProbeDensity = lp.density.Value;
+            fx.GiDebugShowProbes = lp.debugShow.Value;
+        }
+        if (stack.GetComponent<ReflectionProbes>() is { } rp) {
+            fx.GiReflectionsEnabled = rp.enabled.Value;
+            fx.GiReflectionIntensity = rp.intensity.Value;
+            fx.GiReflectionDensity = rp.density.Value;
+            fx.GiDebugShowReflectionProbes = rp.debugShow.Value;
+        }
+        if (stack.GetComponent<Lumen>() is { } lumen) {
+            fx.GiLumenEnabled = lumen.enabled.Value;
+            fx.GiSdfForceEnabled = lumen.enabled.Value; // the split Lumen.enabled IS the force-on switch
+            fx.GiSdfIntensityScale = lumen.intensity.Value;
         }
 
         if (stack.GetComponent<Shadows>() is { } shadows) {

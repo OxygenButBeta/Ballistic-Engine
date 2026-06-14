@@ -213,4 +213,11 @@ public sealed class PostProcessSettings {
     // Debug gizmo toggles (also on the Scene-view toolbar): draw the probe / reflection grids.
     public bool GiDebugShowProbes { get; set; }
     public bool GiDebugShowReflectionProbes { get; set; }
+
+    // Per-system master switches (the split LightProbes / ReflectionProbes / Lumen volume overrides).
+    // Default ON for diffuse + specular probes (they run by default); Lumen default OFF (env/override-
+    // gated). Let a scene disable any one system independently — the "stop Lumen" / "kill probe ambient".
+    public bool GiProbesEnabled { get; set; } = true;
+    public bool GiReflectionsEnabled { get; set; } = true;
+    public bool GiLumenEnabled { get; set; }
 }

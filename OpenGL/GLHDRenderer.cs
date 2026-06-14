@@ -1190,7 +1190,18 @@ public class GLHDRenderer : HDRenderer {
             PostFX.ContactShadowsEnabled = csOn;
         if (EnvNormalStrength is { } ns)
             NormalStrength = ns;
+        // GI per-system master switches (A/B the split LightProbes/ReflectionProbes/Lumen overrides
+        // headlessly): BALLISTIC_GI_PROBES / _REFLECTIONS / _LUMEN = 0|1.
+        if (EnvGiProbes is { } gp) PostFX.GiProbesEnabled = gp;
+        if (EnvGiReflections is { } gr) PostFX.GiReflectionsEnabled = gr;
+        if (EnvGiLumen is { } gl) { PostFX.GiLumenEnabled = gl; PostFX.GiSdfForceEnabled = gl; }
     }
+
+    static bool? EnvBool(string name) =>
+        Environment.GetEnvironmentVariable(name) is { } v ? v == "1" : null;
+    static readonly bool? EnvGiProbes = EnvBool("BALLISTIC_GI_PROBES");
+    static readonly bool? EnvGiReflections = EnvBool("BALLISTIC_GI_REFLECTIONS");
+    static readonly bool? EnvGiLumen = EnvBool("BALLISTIC_GI_LUMEN");
 
     // Draws every active game UIDocument as a screen-space overlay into the currently-bound target
     // (viewport already set). Each document solves its own layout against the viewport (honoring its
@@ -4060,12 +4071,14 @@ public class GLHDRenderer : HDRenderer {
         // EFFECTIVE volume is the placed one (Active), or the implicit auto-fit default when none is
         // placed — so the default reflections light glossy surfaces with zero setup.
         ReflectionVolume reflVol = EffectiveReflectionVolume();
-        var reflectionsLive = reflectionVolumeReady && reflVol is not null;
+        // Per-system master switches (LightProbes / ReflectionProbes volume overrides): a disabled
+        // system falls back (probes -> flat sky IBL ambient, reflections -> global skybox reflection).
+        var reflectionsLive = reflectionVolumeReady && reflVol is not null && PostFX.GiReflectionsEnabled;
         b.Set("ReflectionGridX", reflectionGridX);
         b.Set("ReflectionGridY", reflectionGridY);
         b.Set("ReflectionGridZ", reflectionGridZ);
         b.Set("UseIBL", irradianceMap != 0);
-        b.Set("UseProbeVolume", probeVolumeReady);
+        b.Set("UseProbeVolume", probeVolumeReady && PostFX.GiProbesEnabled);
         b.Set("UseReflectionVolume", reflectionsLive);
         b.Set("HasScreenAO", screenAoTexture != 0);
         b.Set("ReflectionBlendWithSky", reflVol?.BlendWithSky ?? false);
@@ -4195,9 +4208,10 @@ public class GLHDRenderer : HDRenderer {
         shader.SetMatrix4("SkyRotation", ref skyRotation);
 
         // Baked probe volume: position-aware diffuse irradiance, re-exposed at sample time
-        // (the SH grid stores physical, un-exposed values).
-        shader.SetBool("UseProbeVolume", probeVolumeReady);
-        if (probeVolumeReady) {
+        // (the SH grid stores physical, un-exposed values). LightProbes override master switch gates it.
+        bool probesLive = probeVolumeReady && PostFX.GiProbesEnabled;
+        shader.SetBool("UseProbeVolume", probesLive);
+        if (probesLive) {
             GL.ActiveTexture(TextureUnit.Texture15);
             GL.BindTexture(TextureTarget.Texture3D, probeSH[0]);
             GL.ActiveTexture(TextureUnit.Texture16);
@@ -4224,7 +4238,7 @@ public class GLHDRenderer : HDRenderer {
         // The component's IsActive (IsEnabled toggle) is the live master switch: off -> the shader
         // ignores the volume and glossy surfaces fall back to the global skybox, no re-bake needed.
         ReflectionVolume reflVol = EffectiveReflectionVolume();
-        var reflectionsLive = reflectionVolumeReady && reflVol is not null;
+        var reflectionsLive = reflectionVolumeReady && reflVol is not null && PostFX.GiReflectionsEnabled;
         shader.SetBool("UseReflectionVolume", reflectionsLive);
         if (reflectionsLive) {
             GL.ActiveTexture(TextureUnit.Texture20);
