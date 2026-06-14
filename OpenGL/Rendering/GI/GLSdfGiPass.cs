@@ -227,7 +227,10 @@ public sealed class GLSdfGiPass : IDisposable {
 
         CacheUniformLocations();
         if (UseGlobalSdf)
-            globalSdf = new GLGlobalSdf(resolution: 64, baseExtent: 16f);
+            // 96^3 over a 12m base cascade = 0.125m near-field cells (Lumen-class fine; 64^3/16m was
+            // 0.25m and blended adjacent walls into grey on small scenes). Outer cascades (x2 each)
+            // still reach ~96m for the far field. Background-baked so the higher res isn't a stall.
+            globalSdf = new GLGlobalSdf(resolution: 96, baseExtent: 12f);
         Console.WriteLine($"[SdfGI] resources built (Lumen enabled{(UseGlobalSdf ? ", GLOBAL distance field" : "")}).");
         Available = true;
         return true;
