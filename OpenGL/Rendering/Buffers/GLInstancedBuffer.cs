@@ -6,14 +6,13 @@ using OpenTK.Mathematics;
 public class GLInstancedBuffer(RenderContext renderContext)
     : InstancedBuffer(renderContext) {
     protected override int UID { get; set; }
-    protected override BufferTarget Target => BufferTarget.ArrayBuffer;
+    // GL-internal target (not on the abstraction anymore).
+    BufferTarget Target => BufferTarget.ArrayBuffer;
 
-    public override void SetBufferData(in Matrix4[] data, BufferUsageHint usageHint) {
-        
+    public override void SetBufferData(in Matrix4[] data, BufferUsage usage) {
         Activate();
         GL.BufferData(BufferTarget.ArrayBuffer, data.Length * Unsafe.SizeOf<Matrix4>(), data,
-            BufferUsageHint.StreamDraw);
-       // Deactivate();
+            GLBuffers.Hint(usage));
     }
 
     public override void Create() {

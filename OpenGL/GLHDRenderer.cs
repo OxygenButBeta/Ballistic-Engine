@@ -2244,7 +2244,7 @@ public class GLHDRenderer : HDRenderer {
                 Matrix4[] matrices = ArrayPool<Matrix4>.Shared.Rent(run);
                 for (var k = 0; k < run; k++)
                     matrices[k] = ModelMatrix(visibleOpaque[t + k], mesh);
-                mesh.InstanceBuffer.SetBufferData(matrices, BufferUsageHint.StreamDraw);
+                mesh.InstanceBuffer.SetBufferData(matrices, BufferUsage.StreamDraw);
                 ArrayPool<Matrix4>.Shared.Return(matrices);
 
                 SubMeshData subMesh = subMeshes[target.SubMeshIndex];
@@ -3943,7 +3943,7 @@ public class GLHDRenderer : HDRenderer {
         Matrix4[] matrices = ArrayPool<Matrix4>.Shared.Rent(count);
         for (var i = 0; i < count; i++)
             matrices[i] = ModelMatrix(list[start + i], mesh);
-        mesh.InstanceBuffer.SetBufferData(matrices, BufferUsageHint.StreamDraw);
+        mesh.InstanceBuffer.SetBufferData(matrices, BufferUsage.StreamDraw);
         ArrayPool<Matrix4>.Shared.Return(matrices);
 
         shader.SetBool("isInstanced", true);
@@ -4456,7 +4456,7 @@ public class GLHDRenderer : HDRenderer {
 
         Matrix4[] array = ArrayPool<Matrix4>.Shared.Rent(batchGroup.Matrix4s.Count);
         batchGroup.Matrix4s.CopyTo(array, 0);
-        target.SharedMesh.InstanceBuffer.SetBufferData(array, BufferUsageHint.StreamDraw);
+        target.SharedMesh.InstanceBuffer.SetBufferData(array, BufferUsage.StreamDraw);
         GL.DrawElementsInstanced(
             PrimitiveType.Triangles,
             mesh.Indices.Length,

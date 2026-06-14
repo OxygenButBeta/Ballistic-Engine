@@ -35,8 +35,8 @@ public static class GLBufferUtilities {
         quadBuffer.Create();
         quadUVBuffer.Create();
 
-        quadBuffer.SetBufferData(vertices, BufferUsageHint.StaticDraw);
-        quadUVBuffer.SetBufferData(uvs, BufferUsageHint.StaticDraw);
+        quadBuffer.SetBufferData(vertices, BufferUsage.StaticDraw);
+        quadUVBuffer.SetBufferData(uvs, BufferUsage.StaticDraw);
 
         renderContext.Deactivate();
     }

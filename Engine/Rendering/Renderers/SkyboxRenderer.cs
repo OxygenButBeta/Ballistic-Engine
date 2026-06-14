@@ -74,7 +74,7 @@ public class SkyboxRenderer : ISkyboxDrawable {
 
         cubemapVertexBuffer = GraphicAPI.CreateVertexBuffer3(renderContext);
         cubemapVertexBuffer.Create();
-        cubemapVertexBuffer.SetBufferData(in skyboxVertices, BufferUsageHint.StaticDraw);
+        cubemapVertexBuffer.SetBufferData(in skyboxVertices, BufferUsage.StaticDraw);
         skyboxShader = GraphicAPI.CreateStandardShader(
             EmbeddedShaderSource.Read("Skybox_Vert.glsl"),
             EmbeddedShaderSource.Read("Skybox_Frag.glsl"));

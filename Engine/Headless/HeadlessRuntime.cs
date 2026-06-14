@@ -117,8 +117,7 @@ public sealed class HeadlessRuntime : IBallisticEngineRuntime {
 
     sealed class NullBuffer<T>(RenderContext renderContext) : GPUBuffer<T>(renderContext) where T : struct {
         protected override int UID { get; set; }
-        protected override BufferTarget Target => default;
-        public override void SetBufferData(in T[] data, BufferUsageHint usageHint) { }
+        public override void SetBufferData(in T[] data, BufferUsage usage) { }
         public override void Create() { }
         public override void Dispose() { }
         public override void Activate() { }
@@ -127,8 +126,7 @@ public sealed class HeadlessRuntime : IBallisticEngineRuntime {
 
     sealed class NullInstancedBuffer(RenderContext renderContext) : InstancedBuffer(renderContext) {
         protected override int UID { get; set; }
-        protected override BufferTarget Target => default;
-        public override void SetBufferData(in Matrix4[] data, BufferUsageHint usageHint) { }
+        public override void SetBufferData(in Matrix4[] data, BufferUsage usage) { }
         public override void Create() { }
         public override void Dispose() { }
         public override void Activate() { }

@@ -1,5 +1,4 @@
 ﻿using System.Diagnostics.CodeAnalysis;
-using OpenTK.Graphics.OpenGL4;
 
 namespace BallisticEngine;
 
@@ -14,13 +13,12 @@ public abstract class GPUBuffer<TDataType> : IDisposable where TDataType : struc
 {
     protected RenderContext RenderContext { get; private set; }
     protected abstract int UID { get; set; }
-    protected abstract BufferTarget Target { get; }
 
     public GPUBuffer([NotNull] RenderContext renderContext) {
         RenderContext = renderContext;
     }
 
-    public abstract void SetBufferData(in TDataType[] data, BufferUsageHint usageHint);
+    public abstract void SetBufferData(in TDataType[] data, BufferUsage usage);
     public abstract void Create();
     public abstract void Dispose();
     public abstract void Activate();

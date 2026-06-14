@@ -7,12 +7,13 @@ public abstract class GLBufferBase<TData>(RenderContext renderContext) : GPUBuff
     where TData : struct
 {
     protected override int UID { get; set; }
-    protected override BufferTarget Target => BufferTarget.ArrayBuffer;
+    // GL-internal target (no longer on the abstraction — it's a GL implementation detail).
+    protected virtual BufferTarget Target => BufferTarget.ArrayBuffer;
 
-    public override void SetBufferData(in TData[] data, BufferUsageHint usageHint)
+    public override void SetBufferData(in TData[] data, BufferUsage usage)
     {
         Activate();
-        GL.BufferData(Target, data.Length * Unsafe.SizeOf<TData>(), data, usageHint);
+        GL.BufferData(Target, data.Length * Unsafe.SizeOf<TData>(), data, GLBuffers.Hint(usage));
     }
 
     public override void Dispose()

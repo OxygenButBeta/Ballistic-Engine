@@ -1,5 +1,4 @@
 using OpenTK.Mathematics;
-using BufferUsageHint = OpenTK.Graphics.OpenGL4.BufferUsageHint;
 
 namespace BallisticEngine;
 
@@ -170,19 +169,19 @@ public class Mesh : BObject
     void FillBuffers()
     {
         normalBuffer.Create();
-        normalBuffer.SetBufferData(in Normals, BufferUsageHint.StaticDraw);
+        normalBuffer.SetBufferData(in Normals, BufferUsage.StaticDraw);
 
         UVBuffer.Create();
-        UVBuffer.SetBufferData(in UVs, BufferUsageHint.StaticDraw);
+        UVBuffer.SetBufferData(in UVs, BufferUsage.StaticDraw);
 
         indexBuffer.Create();
-        indexBuffer.SetBufferData(in Indices, BufferUsageHint.StaticDraw);
+        indexBuffer.SetBufferData(in Indices, BufferUsage.StaticDraw);
 
         vertexBuffer.Create();
-        vertexBuffer.SetBufferData(in Vertices, BufferUsageHint.StaticDraw);
+        vertexBuffer.SetBufferData(in Vertices, BufferUsage.StaticDraw);
 
         tangentBuffer.Create();
-        tangentBuffer.SetBufferData(in Tangents, BufferUsageHint.StaticDraw);
+        tangentBuffer.SetBufferData(in Tangents, BufferUsage.StaticDraw);
 
         if (IsSkinned) {
             // Bone indices upload as floats (location 8); exact for any bone count (< 2^24).
@@ -192,10 +191,10 @@ public class Mesh : BObject
                 indicesAsFloat[i] = new Vector4(b.X, b.Y, b.Z, b.W);
             }
             boneIndexBuffer.Create();
-            boneIndexBuffer.SetBufferData(in indicesAsFloat, BufferUsageHint.StaticDraw);
+            boneIndexBuffer.SetBufferData(in indicesAsFloat, BufferUsage.StaticDraw);
 
             boneWeightBuffer.Create();
-            boneWeightBuffer.SetBufferData(in BoneWeights, BufferUsageHint.StaticDraw);
+            boneWeightBuffer.SetBufferData(in BoneWeights, BufferUsage.StaticDraw);
         }
     }
 }
