@@ -36,6 +36,18 @@ public sealed class GLGlobalSdf : IDisposable {
     readonly Vector3[] cascadeMin = new Vector3[CascadeCount];  // world-space min corner of each cascade box
     readonly float[] cascadeCell = new float[CascadeCount];     // world cell size (cubic) per cascade
     readonly bool[] cascadeBaked = new bool[CascadeCount];
+    // Per-cascade baked DETAIL resolution (Phase A warm-up): 0 = never baked, CoarseResolution = a
+    // fast low-res field is up (Lumen contributes immediately), Resolution = fully refined. A cascade
+    // baked coarse is re-queued for a full bake so it sharpens over the next warm-up frames.
+    readonly int[] cascadeRes = new int[CascadeCount];
+
+    // WARM-UP: cascade 0 baked at full 96^3 over a big scene takes SECONDS (BVH closest-tri + sign per
+    // ~884K voxels) — during which Lumen silently contributes nothing (just IBL ambient), now that the
+    // legacy probe fallback is off. Fix: bake a COARSE field first (32^3 ≈ 33K voxels, ~27x fewer, up
+    // in a fraction of a second), CPU-upsample it into the full-res texture so the march/placement are
+    // unchanged, mark the cascade available, THEN re-bake it at full res in the background. So Lumen is
+    // live within a frame or two with a slightly soft field that sharpens over the next ~second.
+    const int CoarseResolution = 32;
 
     // VOXEL LIGHTING (Lumen Phase 2): a RADIANCE clipmap parallel to the distance clipmap — same
     // cascades, RGBA16F (rgb = lit radiance, a = surface occupancy). Each frame a compute pass lights
@@ -57,7 +69,11 @@ public sealed class GLGlobalSdf : IDisposable {
     public bool Available { get; private set; } // at least cascade 0 has been baked + uploaded once
 
     // Triangle snapshot + bake job state (background).
-    sealed class BakeResult { public int Cascade; public MeshSdf Sdf; public float[] Albedo; public Vector3 Min; public float Cell; }
+    sealed class BakeResult {
+        public int Cascade; public MeshSdf Sdf; public float[] Albedo; public Vector3 Min; public float Cell;
+        public int Res;        // detail resolution this bake produced (CoarseResolution or Resolution)
+        public Vector3i SrcRes; // the field's own grid (== Res^3 unless degenerate) — for the upsample
+    }
     Task<BakeResult> bakeTask;
     int bakeCascade = -1;
     int geometryStamp;          // hash of the opaque set's transforms+bounds; re-bake all on change
@@ -169,10 +185,12 @@ public sealed class GLGlobalSdf : IDisposable {
     // Per cascade: world extent doubles each level, centered on the camera, snapped to the voxel grid.
     float ExtentOf(int cascade) => BaseExtent * (1 << cascade);
 
-    // Called each frame on the GL thread. Decides whether a cascade needs (re)baking — because it
-    // scrolled past half a voxel since its last bake, or the scene geometry changed — and kicks ONE
-    // background bake at a time, uploading the previous result if ready. Amortized: one cascade per
-    // call, finest-first, so the near field comes up first and the cost spreads over a few frames.
+    // Called each frame on the GL thread. Kicks ONE background bake at a time (uploading the previous
+    // result if ready), in a warm-up-priority order: (1) get a COARSE field into every cascade with
+    // none, so the whole clipmap is live within a few frames; (2a) re-place any scrolled cascade coarse
+    // (instant tracking under camera motion); (2b) refine the finest still-coarse cascade to full res.
+    // So Lumen contributes within a frame or two (soft), then sharpens — instead of stalling seconds on
+    // cascade 0's full-res bake.
     public void Update(Vector3 cameraPos, IReadOnlyList<IStaticMeshRenderer> opaque) {
         // Finish a completed background bake: upload it (GL thread).
         if (bakeTask is { IsCompleted: true }) {
@@ -180,14 +198,11 @@ public sealed class GLGlobalSdf : IDisposable {
                 Console.WriteLine($"[GlobalSdf] bake FAULTED cascade {bakeCascade}: {bakeTask.Exception?.GetBaseException().Message}");
             BakeResult r = bakeTask.Status == TaskStatus.RanToCompletion ? bakeTask.Result : null;
             if (r is { Sdf: not null }) {
-                UploadCascade(r.Cascade, r.Sdf, r.Min, r.Cell);
-                if (r.Albedo != null) {
-                    GL.BindTexture(TextureTarget.Texture3D, albedoTex[r.Cascade]);
-                    GL.TexSubImage3D(TextureTarget.Texture3D, 0, 0, 0, 0,
-                        r.Sdf.Res.X, r.Sdf.Res.Y, r.Sdf.Res.Z, PixelFormat.Rgb, PixelType.Float, r.Albedo);
-                    GL.BindTexture(TextureTarget.Texture3D, 0);
-                }
+                // The field was baked at r.Res (coarse or full); upsample to the full texture grid so
+                // the march/placement never change. A full-res bake upsamples 1:1 (a copy).
+                UploadCascade(r.Cascade, r.Sdf, r.Albedo, r.Min, r.Cell);
                 cascadeBaked[r.Cascade] = true;
+                cascadeRes[r.Cascade] = r.Res;
                 if (r.Cascade == 0) Available = true;
             }
             bakeTask = null;
@@ -196,24 +211,46 @@ public sealed class GLGlobalSdf : IDisposable {
         if (bakeTask is not null)
             return; // a bake is in flight — one at a time keeps the BVH/grid cost bounded per frame
 
-        // Geometry change => invalidate every cascade (re-bake from scratch).
+        // Geometry change => invalidate every cascade (re-bake from scratch, coarse-first again).
         int stamp = GeometryStamp(opaque);
         if (!stampValid || stamp != geometryStamp) {
             geometryStamp = stamp;
             stampValid = true;
-            for (int c = 0; c < CascadeCount; c++) cascadeBaked[c] = false;
+            for (int c = 0; c < CascadeCount; c++) { cascadeBaked[c] = false; cascadeRes[c] = 0; }
         }
 
-        // Pick the FINEST cascade that needs work: never baked, or the camera scrolled it past half a
-        // voxel since its placement (clipmap scroll). Finest-first so the near field updates soonest.
+        // PASS 1 (warm-up priority): get a COARSE field into EVERY cascade that has none, finest-first.
+        // 32^3 bakes in a fraction of a second, so within ~4 frames the whole clipmap is live (Lumen
+        // contributes immediately) instead of waiting seconds for even cascade 0's full-res bake.
+        for (int c = 0; c < CascadeCount; c++) {
+            if (cascadeRes[c] != 0)
+                continue;
+            float extent = ExtentOf(c);
+            float cell = extent / Resolution;
+            Vector3 snapped = Snap(cameraPos - new Vector3(extent * 0.5f), cell);
+            KickBake(c, snapped, cell, opaque, CoarseResolution);
+            return;
+        }
+
+        // PASS 2a: any cascade the camera SCROLLED past half a voxel re-places COARSE first (instant), so
+        // a moving camera never blocks on a full bake — the field tracks the view immediately, then PASS
+        // 2b sharpens it. Scroll handling takes priority over refinement (cheap coarse re-place beats a
+        // ~1s full bake when the view is actually moving). Finest-first.
         for (int c = 0; c < CascadeCount; c++) {
             float extent = ExtentOf(c);
             float cell = extent / Resolution;
             Vector3 snapped = Snap(cameraPos - new Vector3(extent * 0.5f), cell);
-            bool needsBake = !cascadeBaked[c] ||
-                (snapped - cascadeMin[c]).Length > cell * 0.5f;
-            if (needsBake) {
-                KickBake(c, snapped, cell, opaque);
+            if ((snapped - cascadeMin[c]).Length > cell * 0.5f) {
+                cascadeRes[c] = 0;
+                KickBake(c, snapped, cell, opaque, CoarseResolution);
+                return;
+            }
+        }
+
+        // PASS 2b: nothing scrolled — refine the finest still-coarse cascade to full res, in place.
+        for (int c = 0; c < CascadeCount; c++) {
+            if (cascadeRes[c] < Resolution) {
+                KickBake(c, cascadeMin[c], cascadeCell[c], opaque, Resolution);
                 return;
             }
         }
@@ -225,12 +262,25 @@ public sealed class GLGlobalSdf : IDisposable {
     // Snapshot the opaque triangles overlapping this cascade's box (WORLD space) on the GL thread, then
     // bake the field on a background task (BVH + parallel grid). The snapshot is essential — the bake
     // can't touch engine state off-thread.
-    void KickBake(int cascade, Vector3 min, float cell, IReadOnlyList<IStaticMeshRenderer> opaque) {
+    void KickBake(int cascade, Vector3 min, float cell, IReadOnlyList<IStaticMeshRenderer> opaque,
+        int detailRes) {
         float extent = cell * Resolution;
         Vector3 max = min + new Vector3(extent);
+
         // Pad the cull box by a couple cells so triangles just outside still seed the boundary field.
         Vector3 cullMin = min - new Vector3(cell * 2f);
         Vector3 cullMax = max + new Vector3(cell * 2f);
+
+        // SUB-CELL TRIANGLE CULL (bake-cost win, geometrically safe): a triangle whose world AABB is
+        // smaller than ~half a voxel can't be RESOLVED by this grid — it falls inside one cell, where
+        // the field is already a single coarse distance. Skipping it removes it from the BVH (whose
+        // BUILD is the dominant cost on big scenes — 900ms for 342K tris) WITHOUT making holes: a wall
+        // is many triangles, so its big spanning tris remain; only tiny clutter/trim (which the coarse
+        // field flattens anyway) drops. The threshold SHRINKS with the cell, so the full-res 96^3 bake
+        // (0.125m cells) keeps nearly everything while a coarse 96m cascade (3m cells) sheds the long
+        // tail of detail tris it could never represent. cellSq compared against the AABB diagonal^2.
+        float minTriExtent = cell * 0.5f;
+        float minTriExtentSq = minTriExtent * minTriExtent;
 
         var worldVerts = new List<Vector3>(4096);
         var triAlbedo = new List<Vector3>(1400); // one linear-RGB albedo per triangle (Lumen albedo field)
@@ -275,6 +325,9 @@ public sealed class GLGlobalSdf : IDisposable {
                         tmax.Y < cullMin.Y || tmin.Y > cullMax.Y ||
                         tmax.Z < cullMin.Z || tmin.Z > cullMax.Z)
                         continue;
+                    // Sub-cell cull: skip tris smaller than ~half a voxel (unresolvable; see note above).
+                    if ((tmax - tmin).LengthSquared < minTriExtentSq)
+                        continue;
                     worldVerts.Add(a); worldVerts.Add(b); worldVerts.Add(cc);
                     triAlbedo.Add(alb);
                 }
@@ -283,7 +336,9 @@ public sealed class GLGlobalSdf : IDisposable {
 
         if (worldVerts.Count == 0) {
             // No geometry in this cascade — mark baked (the cleared far-distance field is correct: empty).
+            // An empty cascade needs no refinement, so mark it FULLY resolved (skip the PASS 2 re-bake).
             cascadeBaked[cascade] = true;
+            cascadeRes[cascade] = Resolution;
             cascadeMin[cascade] = min;
             cascadeCell[cascade] = cell;
             if (cascade == 0) Available = true;
@@ -292,24 +347,95 @@ public sealed class GLGlobalSdf : IDisposable {
 
         cascadeMin[cascade] = min;
         cascadeCell[cascade] = cell;
-        var res = new Vector3i(Resolution);
+        // Bake at the requested DETAIL resolution (coarse for warm-up, full to refine). The box stays
+        // the cascade's full world extent; only the voxel grid is coarsened, so the upsample on upload
+        // maps it 1:1 back into the full-res texture (placement unchanged).
+        int dr = Math.Clamp(detailRes, 8, Resolution);
+        var res = new Vector3i(dr);
+        // Coarse warm-up bakes use a cheaper 3-ray sign (the 7-ray vote is the per-voxel cost when large
+        // coarse cells put most voxels inside the sign band); the full-res refine uses the robust 7 rays.
+        int signRays = dr < Resolution ? 3 : 7;
         bakeCascade = cascade;
+        bool diag = Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_DIAG") == "1";
+        int triCount = worldVerts.Count / 3;
         bakeTask = Task.Run(() => {
-            MeshSdf sdf = MeshSdfBaker.BakeWorldTriangles(worldVerts, triAlbedo, min, max, res, out float[] alb);
-            return new BakeResult { Cascade = cascade, Sdf = sdf, Albedo = alb, Min = min, Cell = cell };
+            var sw = diag ? System.Diagnostics.Stopwatch.StartNew() : null;
+            MeshSdf sdf = MeshSdfBaker.BakeWorldTriangles(worldVerts, triAlbedo, min, max, res, out float[] alb, signRays);
+            if (sw != null)
+                Console.WriteLine($"[GDF bake] cascade {cascade} res {dr}^3 sign{signRays}, {triCount} tris -> {sw.ElapsedMilliseconds} ms");
+            return new BakeResult {
+                Cascade = cascade, Sdf = sdf, Albedo = alb, Min = min, Cell = cell,
+                Res = dr, SrcRes = sdf?.Res ?? res
+            };
         });
     }
 
     static Vector3 Transform(Vector3 v, Matrix4 m) => (new Vector4(v, 1f) * m).Xyz;
 
-    void UploadCascade(int cascade, MeshSdf sdf, Vector3 min, float cell) {
+    void UploadCascade(int cascade, MeshSdf sdf, float[] albedo, Vector3 min, float cell) {
         cascadeMin[cascade] = min;
         cascadeCell[cascade] = cell;
+
+        // The GPU texture is always Resolution^3. A full-res bake uploads its grid directly (the fast,
+        // byte-identical-to-before path). A COARSE warm-up bake (e.g. 32^3) is trilinearly UPSAMPLED to
+        // Resolution^3 on the CPU first — sampling a tiny field 884K times is microseconds, far below
+        // the bake itself, and keeps the march/clipmap placement unchanged (they only know the texture
+        // res). The next full-res bake of this cascade overwrites it sharp.
+        bool fullRes = sdf.Res.X == Resolution && sdf.Res.Y == Resolution && sdf.Res.Z == Resolution;
+        float[] dist = fullRes ? sdf.Distances : UpsampleDistance(sdf);
+        float[] alb = albedo == null ? null : (fullRes ? albedo : UpsampleAlbedo(sdf, albedo));
+
         GL.BindTexture(TextureTarget.Texture3D, textures[cascade]);
         // x-fastest source matches MeshSdf.Index = x + Res.X*(y + Res.Y*z); R16F narrows from float.
         GL.TexSubImage3D(TextureTarget.Texture3D, 0, 0, 0, 0,
-            sdf.Res.X, sdf.Res.Y, sdf.Res.Z, PixelFormat.Red, PixelType.Float, sdf.Distances);
+            Resolution, Resolution, Resolution, PixelFormat.Red, PixelType.Float, dist);
         GL.BindTexture(TextureTarget.Texture3D, 0);
+
+        if (alb != null) {
+            GL.BindTexture(TextureTarget.Texture3D, albedoTex[cascade]);
+            GL.TexSubImage3D(TextureTarget.Texture3D, 0, 0, 0, 0,
+                Resolution, Resolution, Resolution, PixelFormat.Rgb, PixelType.Float, alb);
+            GL.BindTexture(TextureTarget.Texture3D, 0);
+        }
+    }
+
+    // Trilinearly expand a coarse signed-distance field to the full Resolution^3 grid (warm-up only).
+    // MeshSdf.Sample reads in the field's local space at cell centers, so we sample the full grid's
+    // cell centers in the SAME box — the upsample is geometrically exact for the field it has.
+    float[] UpsampleDistance(MeshSdf sdf) {
+        var dst = new float[Resolution * Resolution * Resolution];
+        Vector3 ext = sdf.BoundsMax - sdf.BoundsMin;
+        Vector3 cellFull = ext / Resolution;
+        System.Threading.Tasks.Parallel.For(0, Resolution, z => {
+            for (int y = 0; y < Resolution; y++)
+                for (int x = 0; x < Resolution; x++) {
+                    Vector3 p = sdf.BoundsMin + new Vector3(
+                        (x + 0.5f) * cellFull.X, (y + 0.5f) * cellFull.Y, (z + 0.5f) * cellFull.Z);
+                    dst[x + Resolution * (y + Resolution * z)] = sdf.Sample(p);
+                }
+        });
+        return dst;
+    }
+
+    // Nearest-cell expand of the coarse per-voxel albedo to the full grid (RGB, x-fastest, 3 floats/
+    // voxel). Albedo is piecewise-flat per surface, so nearest is fine (and avoids smearing colours
+    // across material boundaries that trilinear would do).
+    float[] UpsampleAlbedo(MeshSdf sdf, float[] srcRgb) {
+        var dst = new float[Resolution * Resolution * Resolution * 3];
+        Vector3i s = sdf.Res;
+        System.Threading.Tasks.Parallel.For(0, Resolution, z => {
+            int sz = Math.Min(s.Z - 1, (int)((z + 0.5f) / Resolution * s.Z));
+            for (int y = 0; y < Resolution; y++) {
+                int sy = Math.Min(s.Y - 1, (int)((y + 0.5f) / Resolution * s.Y));
+                for (int x = 0; x < Resolution; x++) {
+                    int sx = Math.Min(s.X - 1, (int)((x + 0.5f) / Resolution * s.X));
+                    int si = (sx + s.X * (sy + s.Y * sz)) * 3;
+                    int di = (x + Resolution * (y + Resolution * z)) * 3;
+                    dst[di] = srcRgb[si]; dst[di + 1] = srcRgb[si + 1]; dst[di + 2] = srcRgb[si + 2];
+                }
+            }
+        });
+        return dst;
     }
 
     // Cheap stamp of the opaque set: count + each renderer's world translation + bounds. Changes when
@@ -400,6 +526,10 @@ public sealed class GLGlobalSdf : IDisposable {
 
     public Vector3 CascadeMin(int c) => cascadeMin[c];
     public float CascadeCell(int c) => cascadeCell[c];
+
+    // Diagnostic (BALLISTIC_LUMEN_DIAG): per-cascade baked DETAIL resolution (0 = none, CoarseResolution
+    // = soft warm-up field up, Resolution = fully refined). Lets the renderer log the warm-up progress.
+    public int CascadeBakedRes(int c) => cascadeRes[c];
 
     public void Dispose() {
         for (int c = 0; c < CascadeCount; c++) {

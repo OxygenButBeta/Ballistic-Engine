@@ -11,6 +11,10 @@ namespace BallisticEngine.GI;
 //      the "all-teal march" bug). Parity counting is winding-agnostic; the 6-ray majority absorbs
 //      the odd grazing/edge hit that would flip a single ray.
 public static class MeshSdfBaker {
+    // BALLISTIC_LUMEN_DIAG: split the bake into BVH-build vs grid-query timings so we can see which
+    // dominates the warm-up cost (read once — env lookups per bake would themselves show up).
+    static readonly bool BakeDiag = System.Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_DIAG") == "1";
+
     // Parameters controlling a bake. Padding expands the bounds so the field has exterior cells to
     // march through before it hits the surface; resolution is the long-axis cell count (other axes
     // scale to keep cells ~cubic).
@@ -61,41 +65,101 @@ public static class MeshSdfBaker {
     // 3 floats/voxel) or null if triAlbedo is null. Same distance/sign math as the base overload.
     public static MeshSdf BakeWorldTriangles(System.Collections.Generic.List<Vector3> worldVerts,
         System.Collections.Generic.List<Vector3> triAlbedo, Vector3 boundsMin, Vector3 boundsMax,
-        Vector3i res, out float[] albedoOut) {
-        albedoOut = null;
+        Vector3i res, out float[] albedoOut, int signRays = 7) {
+        PreparedField prep = Prepare(worldVerts, triAlbedo);
+        if (prep == null) { albedoOut = null; return null; }
+        return BakePrepared(prep, boundsMin, boundsMax, res, out albedoOut, signRays);
+    }
+
+    // A built BVH + per-triangle albedo over a triangle snapshot, ready to bake at ANY resolution.
+    // The GDF builds this ONCE per cascade snapshot (the BVH build is the dominant cost at high
+    // triangle counts — 572ms for 222K tris), then bakes a coarse field AND the full-res refine from
+    // the same handle, paying the build only once instead of twice.
+    public sealed class PreparedField {
+        internal readonly Triangle[] Tris;
+        internal readonly TriangleBvh Bvh;
+        internal readonly System.Collections.Generic.List<Vector3> TriAlbedo;
+        internal PreparedField(Triangle[] tris, TriangleBvh bvh, System.Collections.Generic.List<Vector3> alb) {
+            Tris = tris; Bvh = bvh; TriAlbedo = alb;
+        }
+        public int TriangleCount => Tris.Length;
+    }
+
+    // Build the BVH over a world-triangle snapshot (call once; bake at multiple resolutions after).
+    public static PreparedField Prepare(System.Collections.Generic.List<Vector3> worldVerts,
+        System.Collections.Generic.List<Vector3> triAlbedo) {
         int triCount = worldVerts.Count / 3;
         if (triCount == 0)
             return null;
         var tris = new Triangle[triCount];
         for (int t = 0; t < triCount; t++)
             tris[t] = new Triangle(worldVerts[t * 3], worldVerts[t * 3 + 1], worldVerts[t * 3 + 2]);
+        var swBvh = BakeDiag ? System.Diagnostics.Stopwatch.StartNew() : null;
+        var bvh = new TriangleBvh(tris);
+        if (swBvh != null) System.Console.WriteLine($"[GDF bake]   BVH build {triCount} tris -> {swBvh.ElapsedMilliseconds} ms");
+        bool wantAlb = triAlbedo != null && triAlbedo.Count == triCount;
+        return new PreparedField(tris, bvh, wantAlb ? triAlbedo : null);
+    }
+
+    // Bake a field from a PreparedField (reusing its BVH) over a world box at the given resolution.
+    public static MeshSdf BakePrepared(PreparedField prep, Vector3 boundsMin, Vector3 boundsMax,
+        Vector3i res, out float[] albedoOut, int signRays = 7) {
+        albedoOut = null;
+        if (prep == null)
+            return null;
+        Triangle[] tris = prep.Tris;
+        int triCount = tris.Length;
+        var bvh = prep.Bvh;
+        System.Collections.Generic.List<Vector3> triAlbedo = prep.TriAlbedo;
 
         res = new Vector3i(Math.Max(2, res.X), Math.Max(2, res.Y), Math.Max(2, res.Z));
-        var bvh = new TriangleBvh(tris);
         var distances = new float[res.X * res.Y * res.Z];
         bool wantAlbedo = triAlbedo != null && triAlbedo.Count == triCount;
         float[] albedo = wantAlbedo ? new float[res.X * res.Y * res.Z * 3] : null;
         Vector3 cellSize = (boundsMax - boundsMin) / new Vector3(res.X, res.Y, res.Z);
 
-        System.Threading.Tasks.Parallel.For(0, res.Z, z => {
-            for (int y = 0; y < res.Y; y++) {
-                for (int x = 0; x < res.X; x++) {
-                    Vector3 p = boundsMin + new Vector3(
-                        (x + 0.5f) * cellSize.X, (y + 0.5f) * cellSize.Y, (z + 0.5f) * cellSize.Z);
-                    int idx = x + res.X * (y + res.Y * z);
-                    float unsigned;
-                    if (wantAlbedo) {
-                        unsigned = MathF.Sqrt(bvh.ClosestDistanceSq(p, out int triIndex));
-                        Vector3 a = triIndex >= 0 ? triAlbedo[triIndex] : new Vector3(0.5f);
-                        albedo[idx * 3] = a.X; albedo[idx * 3 + 1] = a.Y; albedo[idx * 3 + 2] = a.Z;
-                    } else {
-                        unsigned = MathF.Sqrt(bvh.ClosestDistanceSq(p));
-                    }
-                    bool inside = bvh.IsInside(p);
-                    distances[idx] = inside ? -unsigned : unsigned;
+        // NARROW-BAND SIGN (Phase A warm-up speedup, EXACT): the unsigned distance is cheap (one
+        // branch-and-bound BVH descent), but the SIGN is a 7-ray parity vote — 7 more traversals,
+        // the dominant per-voxel cost. A voxel whose nearest surface is many cells away is
+        // UNAMBIGUOUSLY outside (you can't be deep inside a solid yet far from every triangle), so
+        // the ray cast is wasted there. Only run IsInside within a band of the surface; beyond it,
+        // sign = +. The band is generous (cell diagonal * a few) so no genuinely-interior voxel is
+        // missed — a thin gap between two close walls still falls inside the band. On a 96^3 cascade
+        // most voxels are empty space far from geometry, so this skips the 7-ray test for the large
+        // majority and the bake drops from seconds to a fraction of one. Distance magnitude is
+        // IDENTICAL to before (only the sign of far voxels is now trivially +, which they already were).
+        float cellDiag = cellSize.Length;            // worst-case half-cell reach
+        float bandSq = (cellDiag * 2.5f) * (cellDiag * 2.5f); // sign-test band (squared, to skip the sqrt)
+
+        var swGrid = BakeDiag ? System.Diagnostics.Stopwatch.StartNew() : null;
+        // Parallelize over Z*Y ROWS, not just Z slabs: a coarse 32^3 bake has only 32 Z-slabs, far
+        // fewer than the core count, so a slab-only split left most cores idle (the coarse-bake cost
+        // we're trying to cut). Rows give res.Y*res.Z work items (e.g. 1024 at 32^3) — full occupancy.
+        int rows = res.Y * res.Z;
+        System.Threading.Tasks.Parallel.For(0, rows, row => {
+            int y = row % res.Y;
+            int z = row / res.Y;
+            int rowBase = res.X * (y + res.Y * z);
+            for (int x = 0; x < res.X; x++) {
+                Vector3 p = boundsMin + new Vector3(
+                    (x + 0.5f) * cellSize.X, (y + 0.5f) * cellSize.Y, (z + 0.5f) * cellSize.Z);
+                int idx = rowBase + x;
+                float distSq;
+                if (wantAlbedo) {
+                    distSq = bvh.ClosestDistanceSq(p, out int triIndex);
+                    Vector3 a = triIndex >= 0 ? triAlbedo[triIndex] : new Vector3(0.5f);
+                    albedo[idx * 3] = a.X; albedo[idx * 3 + 1] = a.Y; albedo[idx * 3 + 2] = a.Z;
+                } else {
+                    distSq = bvh.ClosestDistanceSq(p);
                 }
+                float unsigned = MathF.Sqrt(distSq);
+                // Only voxels near a surface can be inside — cast rays only there; else outside (+).
+                // signRays caps the parity vote (fewer for coarse warm-up bakes — the dominant cost).
+                bool inside = distSq <= bandSq && bvh.IsInside(p, signRays);
+                distances[idx] = inside ? -unsigned : unsigned;
             }
         });
+        if (swGrid != null) System.Console.WriteLine($"[GDF bake]   grid {res.X}^3 query -> {swGrid.ElapsedMilliseconds} ms");
         albedoOut = albedo;
         return new MeshSdf(res, boundsMin, boundsMax, distances);
     }

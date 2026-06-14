@@ -88,6 +88,21 @@ public sealed class GLSdfGiPass : IDisposable {
     // baked/available). Diagnostic: tells whether Lumen is genuinely contributing vs silently no-op.
     public bool GdfActive => UseGlobalSdf && globalSdf is { Available: true };
 
+    // Diagnostic (BALLISTIC_LUMEN_DIAG): the GDF warm-up state as a compact string — Available + the
+    // per-cascade baked detail resolution (0/coarse/full). Empty when the GDF isn't in use.
+    public string GdfWarmupState() {
+        if (!UseGlobalSdf || globalSdf == null)
+            return "";
+        var sb = new System.Text.StringBuilder();
+        sb.Append("avail=").Append(globalSdf.Available ? '1' : '0').Append(" res=[");
+        for (int c = 0; c < GLGlobalSdf.CascadeCount; c++) {
+            if (c > 0) sb.Append(',');
+            sb.Append(globalSdf.CascadeBakedRes(c));
+        }
+        sb.Append(']');
+        return sb.ToString();
+    }
+
     // LUMEN PHASE 1 — Global Distance Field clipmap. When enabled (BALLISTIC_LUMEN_GDF=1, or always
     // once Phase 1 is the default) the march samples this ONE merged field instead of the per-mesh
     // brick grid, so fragmented per-object scenes get full coverage. Built lazily with the rest.

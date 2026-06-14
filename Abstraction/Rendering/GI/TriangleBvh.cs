@@ -213,9 +213,17 @@ internal sealed class TriangleBvh {
         return dirs;
     }
 
-    public bool IsInside(Vector3 p) {
+    public bool IsInside(Vector3 p) => IsInside(p, RayDirs.Length);
+
+    // maxRays caps the number of parity rays cast (clamped to the available directions). The full
+    // 7-ray vote is robust on adversarial welded geometry; a COARSE warm-up bake can afford fewer
+    // rays (3) — a temporary, soon-replaced field tolerates the occasional mis-signed voxel, and
+    // fewer ray traversals is the dominant per-voxel saving when large coarse cells put most voxels
+    // inside the sign-test band. Odd counts keep the majority untieable.
+    public bool IsInside(Vector3 p, int maxRays) {
+        int n = Math.Clamp(maxRays, 1, RayDirs.Length);
         int insideVotes = 0, voters = 0;
-        for (int r = 0; r < RayDirs.Length; r++) {
+        for (int r = 0; r < n; r++) {
             int crossings = CountCrossings(p, RayDirs[r]);
             if (crossings < 0) continue;           // ray grazed an edge — abstain
             voters++;

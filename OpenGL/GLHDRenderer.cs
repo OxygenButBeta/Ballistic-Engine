@@ -45,6 +45,11 @@ public class GLHDRenderer : HDRenderer {
     // so the frame stays byte-identical to the baseline. Runs as a post pass right BEFORE SSGI.
     OpenGL.GI.GLSdfGiPass sdfGi;
     bool sdfGiEnabled;
+    // Phase A GDF warm-up diagnostic (BALLISTIC_LUMEN_DIAG=1): log per-cascade bake progress for the
+    // first frames so we can confirm cascade 0 is up within ~2 frames. Off by default — costs nothing.
+    bool lumenDiag;
+    int lumenDiagFrame;
+    string lumenDiagLast = "";
     // Clustered Forward+ light culling (review #1): loops only the lights in each fragment's cluster
     // instead of the capped 8-point/4-spot per-fragment arrays. Default-on (BALLISTIC_CLUSTERED=0
     // falls back to the legacy capped path). Built each frame from ALL gathered scene lights.
@@ -211,6 +216,7 @@ public class GLHDRenderer : HDRenderer {
         // SDF World-Space GI: read the gate ONCE. The pass itself also honours the flag (its ctor
         // builds nothing GPU-side when off), so off => Available stays false => never dispatched.
         sdfGiEnabled = Environment.GetEnvironmentVariable("BALLISTIC_SDFGI") == "1";
+        lumenDiag = Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_DIAG") == "1";
         sdfGi = new OpenGL.GI.GLSdfGiPass();
         clustered = new OpenGL.Clustered.GLClusteredLights();
         volumetric = new GLVolumetricFogPass();
@@ -825,6 +831,17 @@ public class GLHDRenderer : HDRenderer {
         if (wantSdfGi && sdfGi.EnsureAvailable())
             using (timers.Time("SdfGI")) {
                 sdfGi.EnsureBaked(visibleOpaque, cameraPos);
+                // Phase A warm-up diagnostic: log the GDF bake progress for the first frames so we can
+                // verify cascade 0 comes up within ~2 frames (was SECONDS before coarse-first). Cheap
+                // string; gated on the diag env var so it never costs anything in a normal run.
+                if (lumenDiag && lumenDiagFrame < 600) {
+                    string st = sdfGi.GdfWarmupState();
+                    if (st.Length > 0 && st != lumenDiagLast) {
+                        Console.WriteLine($"[GDF warm-up] frame {lumenDiagFrame}: {st} gdfActive={sdfGi.GdfActive}");
+                        lumenDiagLast = st;
+                    }
+                    lumenDiagFrame++;
+                }
                 // PROBE<->SDF-GI BLEND: probes are the diffuse BASE (they already carry the static
                 // enclosed-interior bounce); SDF-GI AUGMENTS with the dynamic off-screen delta. When
                 // probes are active, scale SDF-GI down so the two diffuse indirect terms don't
