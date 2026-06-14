@@ -521,6 +521,10 @@ internal sealed class EditorApplication {
 
         Renderer.ActiveTarget = HDRenderer.RenderTarget.Scene;
         Renderer.BeginRender(new RendererArgs(editorCamera));
+        // Publish the coarse depth grid for gizmo depth-occlusion while the Scene depth is still intact
+        // (gizmos drawn later this frame dim when behind geometry). Cheap GPU-downscaled readback.
+        GizmoDepthOcclusion.Enabled = EditorPrefs.Current.ShowGizmos;
+        Renderer.ReadSceneDepthGrid();
         Renderer.PostRenderCleanUp();
     }
 

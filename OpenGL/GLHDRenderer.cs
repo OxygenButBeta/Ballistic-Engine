@@ -1179,6 +1179,56 @@ public class GLHDRenderer : HDRenderer {
         }
     }
 
+    // Reads the Scene-view depth buffer into a COARSE CPU grid for editor gizmo depth-occlusion: a
+    // gizmo point behind scene geometry draws dimmer so depth reads. To avoid the stall of a full-res
+    // depth glReadPixels, the depth is first GPU-BLIT-downscaled into a small (~160px-wide) depth FBO,
+    // then only that small buffer is read back (~14k floats). Window-depth [0,1] is stored so the gizmo
+    // compares its own NDC z directly. Scene target only. Call AFTER the scene render. No-op if disabled.
+    public override void ReadSceneDepthGrid() {
+        if (!GizmoDepthOcclusion.Enabled || ActiveTarget != RenderTarget.Scene)
+            return;
+        GLFrameBuffer target = frameBuffer;
+        if (target is null || target.FrameBufferId <= 0 || target.LenX <= 0)
+            return;
+
+        int gw = Math.Min(160, target.LenX);
+        int gh = Math.Max(1, gw * target.LenY / target.LenX);
+
+        // Small depth FBO (depth texture) we blit-downscale into.
+        if (depthGridTex == 0 || depthGridW != gw || depthGridH != gh) {
+            if (depthGridTex != 0) GL.DeleteTexture(depthGridTex);
+            depthGridTex = GL.GenTexture();
+            GL.BindTexture(TextureTarget.Texture2D, depthGridTex);
+            GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.DepthComponent24, gw, gh, 0,
+                PixelFormat.DepthComponent, PixelType.Float, IntPtr.Zero);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Nearest);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Nearest);
+            GL.BindTexture(TextureTarget.Texture2D, 0);
+            if (depthGridFbo == 0) depthGridFbo = GL.GenFramebuffer();
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer, depthGridFbo);
+            GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.DepthAttachment,
+                TextureTarget.Texture2D, depthGridTex, 0);
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+            depthGridW = gw; depthGridH = gh;
+        }
+
+        // GPU blit-downscale the scene depth into the small FBO (NEAREST — a min-style downsample isn't
+        // available for depth blit, but NEAREST at this coarseness is fine for the dimming heuristic).
+        GL.BindFramebuffer(FramebufferTarget.ReadFramebuffer, target.FrameBufferId);
+        GL.BindFramebuffer(FramebufferTarget.DrawFramebuffer, depthGridFbo);
+        GL.BlitFramebuffer(0, 0, target.LenX, target.LenY, 0, 0, gw, gh,
+            ClearBufferMask.DepthBufferBit, BlitFramebufferFilter.Nearest);
+        GL.BindFramebuffer(FramebufferTarget.ReadFramebuffer, depthGridFbo);
+        if (GizmoDepthOcclusion.Grid is null || GizmoDepthOcclusion.Grid.Length != gw * gh)
+            GizmoDepthOcclusion.Grid = new float[gw * gh];
+        GL.ReadPixels(0, 0, gw, gh, PixelFormat.DepthComponent, PixelType.Float, GizmoDepthOcclusion.Grid);
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+
+        GizmoDepthOcclusion.Width = gw;
+        GizmoDepthOcclusion.Height = gh;
+    }
+    int depthGridFbo, depthGridTex, depthGridW, depthGridH;
+
     void ApplyEnvOverrides() {
         if (EnvDeterministic) {
             PostFX.TaaEnabled = false;

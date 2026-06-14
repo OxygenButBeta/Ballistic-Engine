@@ -66,5 +66,9 @@ public abstract class HDRenderer {
     public abstract void RenderInstancing(BatchGroup<IStaticMeshRenderer> batchGroup, RendererArgs args);
     public abstract RenderMetrics BeginRender(RendererArgs args);
     public abstract void PostRenderCleanUp();
+
+    // Editor-only: publish a coarse Scene-view depth grid (into GizmoDepthOcclusion) for gizmo depth
+    // occlusion. Called after BeginRender(Scene) while the depth buffer is intact. No-op by default.
+    public virtual void ReadSceneDepthGrid() { }
     public abstract void RenderInstancing(Mesh mesh, Material material, Matrix4[] transforms, RendererArgs args);
 }

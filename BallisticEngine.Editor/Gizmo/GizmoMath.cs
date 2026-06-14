@@ -9,15 +9,21 @@ namespace BallisticEngine.Editor;
 // cube can never disagree about which way is up or which axis is which.
 internal static class GizmoMath {
     // World point -> pixel inside the viewport rect. Returns false when behind the camera.
-    public static bool Project(Vector3 world, Matrix4 vp, SysVec2 viewMin, SysVec2 viewSize, out SysVec2 pixel) {
+    public static bool Project(Vector3 world, Matrix4 vp, SysVec2 viewMin, SysVec2 viewSize, out SysVec2 pixel) =>
+        Project(world, vp, viewMin, viewSize, out pixel, out _);
+
+    // Overload that also returns the WINDOW DEPTH [0,1] (NDC z remapped) — for gizmo depth occlusion.
+    public static bool Project(Vector3 world, Matrix4 vp, SysVec2 viewMin, SysVec2 viewSize,
+        out SysVec2 pixel, out float windowDepth) {
         Vector4 clip = Vector4.TransformRow(new Vector4(world, 1f), vp);
         if (clip.W <= 1e-5f) {
-            pixel = default;
+            pixel = default; windowDepth = 1f;
             return false;
         }
 
         var ndcX = clip.X / clip.W;
         var ndcY = clip.Y / clip.W;
+        windowDepth = clip.Z / clip.W * 0.5f + 0.5f; // NDC z [-1,1] -> window depth [0,1]
         pixel = new SysVec2(
             viewMin.X + (ndcX * 0.5f + 0.5f) * viewSize.X,
             viewMin.Y + (1f - (ndcY * 0.5f + 0.5f)) * viewSize.Y);

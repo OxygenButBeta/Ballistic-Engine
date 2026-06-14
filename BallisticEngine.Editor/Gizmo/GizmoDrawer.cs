@@ -32,8 +32,50 @@ internal sealed class GizmoDrawer : IGizmos {
         GizmoMath.Project(world, vp, viewMin, viewSize, out px);
 
     public void DrawLine(Vector3 from, Vector3 to) {
-        if (P(from, out SysVec2 a) && P(to, out SysVec2 b) && ClipToView(ref a, ref b))
-            draw.AddLine(a, b, Col(), 1.5f);
+        // Clip the segment against the NEAR PLANE in clip space FIRST. A point in front of the camera
+        // (w>0) but far outside the frustum sides still projects to an enormous pixel coordinate; before
+        // this, ClipToView would trim that garbage point to the viewport EDGE and draw a spurious line
+        // sweeping across the Scene — the "gizmos explode into a spiderweb while moving" bug (a probe
+        // marker swinging past the camera as you fly). Near-clipping the 3D segment keeps both projected
+        // endpoints finite and on the correct side, so the cross marker stays a small cross.
+        Vector4 ca = Vector4.TransformRow(new Vector4(from, 1f), vp);
+        Vector4 cb = Vector4.TransformRow(new Vector4(to, 1f), vp);
+        const float wEps = 1e-4f;
+        bool aIn = ca.W > wEps, bIn = cb.W > wEps;
+        if (!aIn && !bIn)
+            return;                       // whole segment behind the camera
+        if (aIn != bIn) {
+            // One endpoint behind: move it to the near plane (w = wEps) along the segment.
+            float t = (wEps - ca.W) / (cb.W - ca.W);
+            Vector4 mid = ca + (cb - ca) * t;
+            if (aIn) cb = mid; else ca = mid;
+        }
+
+        if (!ProjOcc(ca, out SysVec2 a, out bool oa) || !ProjOcc(cb, out SysVec2 b, out bool ob))
+            return;
+        if (!ClipToView(ref a, ref b))
+            return;
+        // Dim when BOTH endpoints are occluded (a segment straddling an edge stays bright so silhouettes
+        // read). Behind-geometry gizmos draw faint so you can tell they're behind a wall, not in front.
+        float alpha = (oa && ob) ? 0.28f : 0.9f;
+        draw.AddLine(a, b, Col(alpha), 1.5f);
+    }
+
+    // Project an ALREADY clip-space point (post near-clip, so w>0) to a pixel + occlusion flag.
+    bool ProjOcc(Vector4 clip, out SysVec2 px, out bool occluded) {
+        occluded = false;
+        if (clip.W <= 1e-5f) { px = default; return false; }
+        float ndcX = clip.X / clip.W, ndcY = clip.Y / clip.W;
+        float wd = clip.Z / clip.W * 0.5f + 0.5f;
+        px = new SysVec2(
+            viewMin.X + (ndcX * 0.5f + 0.5f) * viewSize.X,
+            viewMin.Y + (1f - (ndcY * 0.5f + 0.5f)) * viewSize.Y);
+        if (GizmoDepthOcclusion.Enabled) {
+            float u = (px.X - viewMin.X) / MathF.Max(1f, viewSize.X);
+            float v = (px.Y - viewMin.Y) / MathF.Max(1f, viewSize.Y);
+            occluded = wd > GizmoDepthOcclusion.SampleWindowDepth(u, v) + 0.0005f;
+        }
+        return true;
     }
 
     // Liang-Barsky clip of a screen-space segment to the Scene-view rect. Project() returns true for
