@@ -594,7 +594,25 @@ void main()
                 int layer = texelFetch(ReflectionCellToLayer, cell, 0).r;
                 if (layer >= 0) {
                     float localMip = clamp(roughness * ReflectionMaxMips, 0.0, ReflectionMaxMips);
-                    vec3 local = textureLod(ReflectionProbes, vec4(R, float(layer)), localMip).rgb * SkyExposure;
+
+                    // BOX-PROJECTION PARALLAX CORRECTION. The cube was captured at the CELL CENTRE, so
+                    // sampling the raw reflection vector R treats it as captured at infinity — in a
+                    // ~12 m cell that mis-registers badly (smeared marble, abrupt jumps between cells
+                    // that should reflect the same world point). Intersect R with the cell's AABB and
+                    // re-aim the lookup from the cell centre to the hit point: now adjacent cells
+                    // reflect the SAME surface, removing the cell-boundary discontinuities. All inputs
+                    // derive from existing uniforms (the cube grid is axis-aligned in world space).
+                    vec3 cellSize = (vec3(1.0) / ReflectionVolumeInvSize) / vec3(dims);
+                    vec3 cellMin  = ReflectionVolumeMin + vec3(cell) * cellSize;
+                    vec3 cellCtr  = cellMin + 0.5 * cellSize;
+                    vec3 invR = 1.0 / R;                       // R is never axis-zero enough to NaN here
+                    vec3 t1 = (cellMin            - fragPos) * invR;
+                    vec3 t2 = (cellMin + cellSize - fragPos) * invR;
+                    vec3 tmax = max(t1, t2);
+                    float t = min(min(tmax.x, tmax.y), tmax.z);
+                    vec3 sampleDir = (fragPos + R * max(t, 0.0)) - cellCtr;
+
+                    vec3 local = textureLod(ReflectionProbes, vec4(sampleDir, float(layer)), localMip).rgb * SkyExposure;
                     // BlendWithSky: lerp from the sky reflection toward the local one by intensity
                     // (intensity>1 over-drives past the local cube). Otherwise hard-replace, scaled.
                     prefiltered = ReflectionBlendWithSky

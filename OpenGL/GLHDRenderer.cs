@@ -2470,6 +2470,12 @@ public class GLHDRenderer : HDRenderer {
             defaultReflectionVolume = new ReflectionVolume {
                 Center = center, Size = size, ProbesX = px, ProbesY = py, ProbesZ = pz,
                 Bake = true,
+                // Lean on the sky: the implicit default's coarse parallax-free cubes must NEVER look
+                // worse than the global skybox reflection they replace. With BlendWithSky=true,
+                // Intensity 0.6 is a real soft blend mix(sky, local, 0.6) instead of the hard replace
+                // at 1.0 — residual cell steps + the cube's haze fade toward the sharp sky. A PLACED
+                // user ReflectionVolume keeps the class default 1.0 (full local control).
+                Intensity = 0.6f,
             };
             defaultReflectionStamp = stamp;
         }
@@ -2918,10 +2924,12 @@ public class GLHDRenderer : HDRenderer {
                 job.Occupied[(z * job.Py + y) * job.Px + x] = true;
         }
 
-        // CAMERA-OUTWARD order: sort cell indices by distance of their centre from the render
-        // position (nearest first). The bake walks this, AND the layer cap is spent NEAREST-FIRST —
-        // so when occupied cells exceed MaxReflectionProbes, the camera's surroundings get real local
-        // cubemaps and only the far corners fall back to the skybox.
+        // CAMERA-OUTWARD order drives only the CAPTURE WALK (StepReflectionBake walks job.Order so
+        // near-camera cells render first — a nice visible-first fade-in). It must NOT decide WHICH
+        // cells win the layer cap: the cache key (ReflectionVolume.DeriveCacheKey) has no camera
+        // term, so a camera-dependent cap would freeze the local/sky patchwork to wherever the
+        // camera sat at first bake and break PAUSED-screenshot determinism. The cap is assigned in
+        // stable CELL-INDEX order below (camera-independent).
         job.Order = new int[job.Total];
         var orderDist = new float[job.Total];
         for (var i = 0; i < job.Total; i++) {
@@ -2937,14 +2945,15 @@ public class GLHDRenderer : HDRenderer {
         }
         Array.Sort(orderDist, job.Order);
 
-        // Assign a compact layer to each occupied cell until the cap, NEAREST-FIRST (walk Order); the
-        // rest get -1 (skybox). Layer indices are independent of cell index, so this is purely about
-        // which cells win the cap.
+        // Assign a compact layer to each occupied cell until the cap, in STABLE CELL-INDEX order (NOT
+        // camera order). Stable so the persisted map matches the camera-independent cache key and a
+        // re-bake from a new viewpoint doesn't relocate the seams. Capped cells get -1 here, then the
+        // nearest-occupied fill in FinishReflectionBake reassigns them to the closest real cube so
+        // there's NEVER a hard local<->sky cliff (the blocky-patch artifact).
         job.CellToLayer = new int[job.Total];
         var nextLayer = 0;
         var cappedCells = 0;
-        for (var o = 0; o < job.Total; o++) {
-            var i = job.Order[o];
+        for (var i = 0; i < job.Total; i++) {
             if (!job.Occupied[i]) {
                 job.CellToLayer[i] = -1;
             }
@@ -2960,7 +2969,8 @@ public class GLHDRenderer : HDRenderer {
         job.LayerCount = Math.Max(nextLayer, 1); // a 0-layer array is invalid; allocate at least 1
         if (cappedCells > 0)
             Console.WriteLine($"[ReflectionVolume] occupied cells {job.OccupiedCount} exceed cap " +
-                              $"{MaxReflectionProbes}; {cappedCells} cells fall back to skybox.");
+                              $"{MaxReflectionProbes}; {cappedCells} capped cells reuse the nearest " +
+                              "baked cube (no hard skybox cliff).");
 
         // Volume-fitted sun shadow, rendered ONCE (sun + volume static for the bake). Same as diffuse.
         Vector3 lightDir = (-sunDirection).Normalized();
@@ -3038,6 +3048,14 @@ public class GLHDRenderer : HDRenderer {
         reflectionArray = job.TargetArray;
         job.TargetArray = 0;
 
+        // NEAREST-OCCUPIED FILL: every in-bounds cell that did NOT get its own cube (empty air OR
+        // capped) is reassigned to the layer of the nearest cell that DID — so the shader never reads
+        // layer<0 inside the volume and falls hard to the sky (the blocky local<->sky cliff). Capped
+        // far cells reuse the closest real cube (a soft parallax-error step) instead of a cut. The
+        // map drives BOTH the upload and the cache, so live + cached agree; the gizmo viz still reads
+        // job.Occupied so it shows which cells are REAL captures vs filled.
+        FillNearestOccupiedLayers(job.CellToLayer, job.Px, job.Py, job.Pz);
+
         UploadReflectionCellMap(job.Px, job.Py, job.Pz, job.CellToLayer, job.Min, job.Size);
         PublishReflectionViz(job.Px, job.Py, job.Pz, job.Min, job.Size, job.Occupied);
 
@@ -3057,6 +3075,46 @@ public class GLHDRenderer : HDRenderer {
             $"({mb:F1} MB) in {job.Watch.Elapsed.TotalSeconds:F1}s (cached).");
         AbortReflectionBake();
         IrradianceVolume.BakeProgress = 1f;
+    }
+
+    // Reassigns every cell with layer == -1 (empty air or capped) to the layer of the NEAREST cell
+    // that has one, via a multi-source 3D BFS seeded from all assigned cells. After this no in-bounds
+    // cell reads layer<0, so the shader never hard-falls to the sky next to a local cube — the
+    // blocky local<->sky reflection cliff is gone; capped/empty cells reuse the closest real cube.
+    // (If NO cell got a layer — a fully-empty volume — every cell stays -1 and the whole volume
+    // correctly falls back to the global skybox.)
+    static void FillNearestOccupiedLayers(int[] cellToLayer, int px, int py, int pz) {
+        int total = px * py * pz;
+        var queue = new Queue<int>();
+        var filled = new int[total];           // the layer each cell ends up with (-1 until reached)
+        for (var i = 0; i < total; i++) {
+            filled[i] = cellToLayer[i];
+            if (cellToLayer[i] >= 0)
+                queue.Enqueue(i);              // seed BFS from every cell that has a real cube
+        }
+        if (queue.Count == 0)
+            return;                            // no cubes at all — leave everything on the skybox
+
+        // 6-neighbour BFS: the first time a -1 cell is reached, it inherits the source cell's layer,
+        // which (by BFS) is the nearest assigned cell in grid steps.
+        while (queue.Count > 0) {
+            int c = queue.Dequeue();
+            int x = c % px, y = c / px % py, z = c / (px * py);
+            int srcLayer = filled[c];
+            void Visit(int nx, int ny, int nz) {
+                if (nx < 0 || ny < 0 || nz < 0 || nx >= px || ny >= py || nz >= pz)
+                    return;
+                int n = (nz * py + ny) * px + nx;
+                if (filled[n] >= 0)
+                    return;                    // already has (or inherited) a layer
+                filled[n] = srcLayer;
+                queue.Enqueue(n);
+            }
+            Visit(x - 1, y, z); Visit(x + 1, y, z);
+            Visit(x, y - 1, z); Visit(x, y + 1, z);
+            Visit(x, y, z - 1); Visit(x, y, z + 1);
+        }
+        Array.Copy(filled, cellToLayer, total);
     }
 
     // Reads each cube-array layer's full mip chain into cubeTexels[layer], in (face, mip) order to

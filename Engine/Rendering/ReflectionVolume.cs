@@ -241,7 +241,10 @@ public class ReflectionVolume : SceneBehaviour {
     // 6 faces x (sum over mips of mipSize^2 * 4) RGBA16F floats, in (layer, face, mip) order.
     // Grid/bounds/faceRes/mipCount mismatch rejects the file (stale cache).
 
-    const uint CacheMagic = 0x31505242; // "BRP1"
+    // "BRP2": bumped from BRP1 when the cell->layer map gained the nearest-occupied fill + the
+    // camera-independent cap. Old BRP1 caches hold the unfilled, camera-dependent map (the blocky
+    // local<->sky cliff), so they must be rejected and re-baked rather than loaded.
+    const uint CacheMagic = 0x32505242; // "BRP2"
 
     static string CachePath(string id) =>
         CacheDirectory is null || string.IsNullOrEmpty(id) ? null : Path.Combine(CacheDirectory, id + ".brp");
