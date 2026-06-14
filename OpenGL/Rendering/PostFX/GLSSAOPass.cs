@@ -24,8 +24,13 @@ public sealed class GLSSAOPass {
         if (fbo == 0)
             fbo = GL.GenFramebuffer();
 
-        var w = Math.Max(1, sourceWidth / 2);
-        var h = Math.Max(1, sourceHeight / 2);
+        // Round UP (ceil): at an ODD full-res height (e.g. an editor viewport at 1009) a floor(h/2)
+        // half-res buffer covers only floor(h/2)*2 < h rows, leaving the bottom full-res row with no
+        // half-res texel beneath it — the depth-aware upsample then samples a clamped edge texel there,
+        // which under camera motion can flash a stray colour (the reported bottom-edge line). ceil
+        // fully covers the full-res extent; byte-identical for even dimensions (ceil==floor).
+        var w = Math.Max(1, (sourceWidth + 1) / 2);
+        var h = Math.Max(1, (sourceHeight + 1) / 2);
         if (aoTexture != 0 && w == width && h == height)
             return;
 

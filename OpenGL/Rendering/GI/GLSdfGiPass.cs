@@ -384,8 +384,10 @@ public sealed class GLSdfGiPass : IDisposable {
             sunDirection, sunColor, skyExposure);
 
         // ---- 1. Half-res compute gather (rgb = off-screen indirect, a = validity) ----
-        int halfW = Math.Max(1, width / 2);
-        int halfH = Math.Max(1, height / 2);
+        // ceil (not floor): full half-res coverage of an ODD full-res height (no clamped-edge upsample
+        // flash at the bottom row under motion). Byte-identical for even dimensions.
+        int halfW = Math.Max(1, (width + 1) / 2);
+        int halfH = Math.Max(1, (height + 1) / 2);
         if (output.Ensure(halfW, halfH)) { /* reused */ } // (re)allocates on size change; ignore loss
         outW = halfW;
         outH = halfH;

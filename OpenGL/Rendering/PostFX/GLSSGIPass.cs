@@ -76,8 +76,11 @@ public sealed class GLSSGIPass {
             return colorTexture;
         }
 
-        var halfW = Math.Max(1, width / 2);
-        var halfH = Math.Max(1, height / 2);
+        // ceil (not floor): full half-res coverage of an ODD full-res height so the bottom full-res
+        // row always has a half-res texel under it (no clamped-edge upsample flash under motion).
+        // Byte-identical for even dimensions.
+        var halfW = Math.Max(1, (width + 1) / 2);
+        var halfH = Math.Max(1, (height + 1) / 2);
 
         GLRenderTexture giTarget = GLRenderTexturePool.Shared.Acquire(halfW, halfH);
         GLRenderTexture denoiseTarget = GLRenderTexturePool.Shared.Acquire(halfW, halfH);

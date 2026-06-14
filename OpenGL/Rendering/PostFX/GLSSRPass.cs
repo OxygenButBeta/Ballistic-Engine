@@ -51,8 +51,11 @@ public sealed class GLSSRPass {
         // Frame-transient targets from the shared pool (released wholesale at frame end).
         // The march runs HALF-RES (32 steps x 5 refines per pixel is the most expensive
         // screen pass); the combine upsamples depth-aware, and TAA absorbs the difference.
-        var halfW = Math.Max(1, width / 2);
-        var halfH = Math.Max(1, height / 2);
+        // ceil (not floor): full half-res coverage of an ODD full-res height so the bottom full-res
+        // row always has a half-res texel under it (no clamped-edge upsample flash under motion).
+        // Byte-identical for even dimensions.
+        var halfW = Math.Max(1, (width + 1) / 2);
+        var halfH = Math.Max(1, (height + 1) / 2);
         GLRenderTexture reflectionTarget = GLRenderTexturePool.Shared.Acquire(halfW, halfH);
         GLRenderTexture combinedTarget = GLRenderTexturePool.Shared.Acquire(width, height);
 

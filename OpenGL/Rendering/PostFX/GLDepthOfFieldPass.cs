@@ -27,8 +27,10 @@ public sealed class GLDepthOfFieldPass {
         if (depthTexture <= 0)
             return colorTexture;
 
-        int halfW = System.Math.Max(1, width / 2);
-        int halfH = System.Math.Max(1, height / 2);
+        // ceil (not floor): full half-res coverage of an ODD full-res height (no clamped-edge upsample
+        // flash at the bottom row under motion). Byte-identical for even dimensions.
+        int halfW = System.Math.Max(1, (width + 1) / 2);
+        int halfH = System.Math.Max(1, (height + 1) / 2);
         GLRenderTexture cocColor = GLRenderTexturePool.Shared.Acquire(halfW, halfH);
         GLRenderTexture bokeh = GLRenderTexturePool.Shared.Acquire(halfW, halfH);
         GLRenderTexture combined = GLRenderTexturePool.Shared.Acquire(width, height);
