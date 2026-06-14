@@ -35,6 +35,14 @@ internal class Program {
 
         BallisticEngine.Profiling.TracyProfiler.TryInstall("Ballistic Runtime");
 
+        // Backend seam (DX12Migration.md): GL is the only implemented host today. When the DX12 host
+        // runtime exists it slots in here. Fail fast on an explicit BALLISTIC_BACKEND=dx12 so it's never
+        // a silent no-op falling back to GL.
+        if (RenderBackendSelector.Selected == RenderBackend.Dx12) {
+            Console.Error.WriteLine("[Backend] BALLISTIC_BACKEND=dx12 requested but the DX12 backend is " +
+                                    "not implemented yet (see Docs/Plans/DX12Migration.md). Running OpenGL.");
+        }
+
         GLBallisticEngineWindow runtime = new(player.Width, player.Height,
             fullscreen: mode == WindowMode.Fullscreen,
             borderless: mode == WindowMode.Borderless,
