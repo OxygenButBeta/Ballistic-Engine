@@ -578,8 +578,27 @@ void main()
     float ao = texture(AO, texCoord).r;
     // Screen-space AO joins the material AO with min() (Lagarde: avoids double-darkening
     // where both agree) and flows into ambient diffuse AND specular occlusion below.
-    if (HasScreenAO)
-        ao = min(ao, texture(ScreenAO, gl_FragCoord.xy / ScreenSize).r);
+    if (HasScreenAO) {
+        // DEPTH-AWARE upsample of the half-res AO: a plain bilinear tap bleeds AO across silhouettes
+        // at the half->full boundary (a halo around objects). Weight the 4 nearest AO taps by how
+        // close their full-res depth (SceneDepth, already bound) is to this fragment's — so the AO
+        // edge stays crisp. Reuses the contact-shadow ViewZFromDepth + the prepass SceneDepth.
+        mat4 invP = inverse(projection);
+        vec2 aoUV = gl_FragCoord.xy / ScreenSize;
+        vec2 aoTexel = 1.0 / (ScreenSize * 0.5);            // AO buffer is half-res
+        float centreZ = ViewZFromDepth(texture(SceneDepth, aoUV).r, invP);
+        float ssaoSum = 0.0, wSum = 0.0;
+        for (int dx = -1; dx <= 1; dx += 2)
+            for (int dy = -1; dy <= 1; dy += 2) {
+                vec2 t = aoUV + vec2(dx, dy) * 0.5 * aoTexel;
+                float tz = ViewZFromDepth(texture(SceneDepth, t).r, invP);
+                float w = 1.0 / (1.0 + abs(tz - centreZ) * 4.0);
+                ssaoSum += texture(ScreenAO, t).r * w;
+                wSum += w;
+            }
+        float ssao = wSum > 0.0 ? ssaoSum / wSum : texture(ScreenAO, aoUV).r;
+        ao = min(ao, ssao);
+    }
 
     if (renderMode == 3) { FragColor = vec4(vec3(ao), 1.0); return; }
     if (renderMode == 4) { FragColor = vec4(vec3(metallic), 1.0); return; }
