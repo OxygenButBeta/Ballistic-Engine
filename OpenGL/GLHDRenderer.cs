@@ -2432,6 +2432,13 @@ public class GLHDRenderer : HDRenderer {
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
         sunShadowOverride = 0;
 
+        // PROGRESSIVE upload: push the (partially-baked) SH grid to the GPU EVERY frame, not just at
+        // the end — so the scene lights up and refines live as the camera-outward bake fills in, with
+        // NO wait for the whole grid to finish. The grid is tiny (Total x 4 RGBA16F texels), so a full
+        // TexImage3D per frame is cheap. Primed-to-sky probes (above) mean even un-reached cells are lit.
+        UploadProbeTextures(job.Px, job.Py, job.Pz, job.Sh, job.Min, job.Size);
+        PublishProbeViz(job.Px, job.Py, job.Pz, job.Min, job.Size, job.Sh, job.Occupied);
+
         IrradianceVolume.BakeProgress = job.Cursor / (float)job.Total;
         IrradianceVolume.BakeStatus = $"Baking light probes  {job.Cursor}/{job.Total}";
 
@@ -2583,6 +2590,18 @@ public class GLHDRenderer : HDRenderer {
         job.Sh = new float[4][];
         for (var t = 0; t < 4; t++)
             job.Sh[t] = new float[job.Total * 4];
+
+        // PRIME every probe with the sky-ambient SH up front, so the volume lights the scene
+        // IMMEDIATELY (no dark gap while the bake runs) — unbaked probes read the sky fill and refine
+        // to real bounce as the camera-outward bake reaches them. c0 = L * 0.282095 * 4pi (sqrt(4pi)
+        // band-0 factor), directional bands zero. Matches the empty-air probe write below so a primed
+        // probe and a never-captured air probe are identical. Carry the SAME sky value the bake's clear
+        // uses. (preExposure divides out at upload time; store un-exposed like the captured probes.)
+        Vector3 primeSky = (skyboxRenderer.cubemapTexture?.skyAmbient ?? Vector3.One * 0.5f) *
+                           skyExposureBase * 3.5449f;
+        for (var i = 0; i < job.Total; i++)
+            StoreSH(job.Sh[0], i * 4, primeSky);
+
         job.Pixels = new float[BakeFaceRes * 6 * BakeFaceRes * 4];
         var far = MathF.Max(job.Size.Length, 10f) + 20f;
         job.CaptureProj = Matrix4.CreatePerspectiveFieldOfView(MathHelper.PiOver2, 1f, 0.05f, far);
