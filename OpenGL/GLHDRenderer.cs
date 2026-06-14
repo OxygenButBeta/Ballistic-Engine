@@ -647,7 +647,12 @@ public class GLHDRenderer : HDRenderer {
         // then bind the light SSBOs (12/14/15) so the opaque lit pass loops only each fragment's cluster
         // lights (uncapped). Runs here — after shadows/prepass (which use other binding slots), right
         // before opaque — so nothing clobbers the buffers. Near/far recovered from the projection.
-        if (clustered is { Available: true }) {
+        // PERF: skip the entire clustered path when there are NO punctual lights (e.g. a sun-only
+        // scene). The cull compute would otherwise dispatch 3456 cluster threads for nothing, and
+        // every fragment would run the cluster lookup + loop 0 lights. clusterActive=false makes the
+        // lit shader's UseClustered=false so it skips the cluster loop too.
+        clusterActive = clustered is { Available: true } && clusterLightScratch.Count > 0;
+        if (clusterActive) {
             Matrix4 invProjCl = Matrix4.Invert(projection);
             var nearV = new Vector4(0f, 0f, -1f, 1f) * invProjCl;   // NDC near -> view
             var farV = new Vector4(0f, 0f, 1f, 1f) * invProjCl;     // NDC far  -> view
@@ -3679,9 +3684,11 @@ public class GLHDRenderer : HDRenderer {
     // whether to use the cluster light lists and the grid dimensions to locate a fragment's cluster.
     // The SSBOs themselves are bound once per frame (BindClusterBuffers) before the opaque pass.
     void SetClusterUniforms(Shader shader) {
-        bool on = clustered is { Available: true };
-        shader.SetBool("UseClustered", on);
-        if (on) {
+        // clusterActive (not just Available) — false when there are 0 punctual lights, so the shader
+        // skips the cluster loop AND the cull compute is skipped this frame. With 0 lights the legacy
+        // path also loops nothing, so the result is identical.
+        shader.SetBool("UseClustered", clusterActive);
+        if (clusterActive) {
             shader.SetInt("ClusterDimX", OpenGL.Clustered.GLClusteredLights.ClusterX);
             shader.SetInt("ClusterDimY", OpenGL.Clustered.GLClusteredLights.ClusterY);
             shader.SetInt("ClusterDimZ", OpenGL.Clustered.GLClusteredLights.ClusterZ);
@@ -3689,6 +3696,7 @@ public class GLHDRenderer : HDRenderer {
         }
     }
     Vector2 clusterNearFar = new(0.1f, 1000f);
+    bool clusterActive; // this frame has >0 punctual lights AND clustering available
 
     // Texture-unit assignments are program STATE: once per program, not per pass.
     void SetSamplerUniforms(Shader shader) {
