@@ -29,6 +29,12 @@ public class Material : BObject
     public float MetallicFactor { get; set; }
     public float RoughnessFactor { get; set; } = 1f;
 
+    // Dielectric specular reflectance (glTF KHR_materials_specular): the F0 of a non-metal at
+    // normal incidence is 0.08 * SpecularReflectance, so 0.5 = F0 0.04 = the default 4% dielectric
+    // (byte-identical to the old hardcoded 0.04). Raise for gems/water/varnish (higher IOR), lower
+    // for chalk/cloth. Metals ignore it (F0 = albedo). The renderer multiplies F0's dielectric base.
+    public float SpecularReflectance { get; set; } = 0.5f;
+
     // Normal map controls. FlipY = DirectX-convention map (G down), the common game-content case.
     public float NormalStrength { get; set; } = 1f;
     public bool NormalFlipY { get; set; } = true;
@@ -77,6 +83,7 @@ public class Material : BObject
             BaseColorFactor = BaseColorFactor,
             MetallicFactor = MetallicFactor,
             RoughnessFactor = RoughnessFactor,
+            SpecularReflectance = SpecularReflectance,
             NormalStrength = NormalStrength,
             NormalFlipY = NormalFlipY,
             Transparent = Transparent,

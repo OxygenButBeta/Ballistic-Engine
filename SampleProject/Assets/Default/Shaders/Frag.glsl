@@ -104,6 +104,7 @@ layout(std140) uniform PassData {
 uniform vec4 BaseColorFactor;  // glTF baseColorFactor: tints the albedo map (and its alpha)
 uniform float MetallicMultiplier;   // material metallicFactor x debug global
 uniform float RoughnessMultiplier;  // material roughnessFactor x debug global
+uniform float SpecularReflectance;  // glTF KHR_materials_specular: dielectric F0 = 0.08*this (0.5 = 4%)
 uniform bool PackedOrm;        // Metallic tex = (occlusion, roughness, metallic) RGB
 uniform bool HasMetallicMap;   // metallic texture assigned (otherwise the factor stands alone)
 uniform bool HasRoughnessMap;  // separate roughness texture assigned
@@ -538,7 +539,9 @@ void main()
     float kernelRoughness = min(2.0 * normalVariance, 0.18);
     roughness = min(sqrt(roughness * roughness + kernelRoughness), 1.0);
 
-    vec3 F0 = mix(vec3(0.04), albedo, metallic);
+    // Dielectric F0 = 0.08 * SpecularReflectance (glTF KHR_materials_specular); 0.5 -> 0.04 (the old
+    // hardcoded 4%, byte-identical default). Metals use albedo as F0.
+    vec3 F0 = mix(vec3(0.08 * SpecularReflectance), albedo, metallic);
 
     // --- Direct lighting, diffuse and specular kept separate for premultiplied glass ---
     vec3 diffuseLight = vec3(0.0);

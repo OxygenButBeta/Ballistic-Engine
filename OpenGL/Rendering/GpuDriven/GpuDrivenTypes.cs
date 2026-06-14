@@ -71,7 +71,7 @@ public struct GpuMaterial {
     // Flags packed: bit0 PackedOrm, bit1 HasMetallic, bit2 HasRoughness, bit3 NormalFlipY,
     // bit4 HasEmissive, bit5 AlphaBlend, bit6 AlphaCutout, bit7 HasDiffuse, bit8 HasNormal, bit9 HasAO
     public uint Flags;
-    public uint Pad0;
+    public float SpecularReflectance;   // glTF KHR_materials_specular (dielectric F0 = 0.08*this); was Pad0
     public uint Pad1;
     public uint Pad2;                   // 16B
 

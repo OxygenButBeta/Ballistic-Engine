@@ -29,7 +29,7 @@ struct GpuMaterial {
     uvec2 diffuseH; uvec2 normalH; uvec2 metallicH; uvec2 roughnessH; uvec2 aoH; uvec2 emissiveH;
     vec4 baseColorFactor; vec4 emissiveFactor;
     float metallicMul; float roughnessMul; float normalStrengthM; float opacity;
-    uint flags; uint _mp0; uint _mp1; uint _mp2;
+    uint flags; float specularReflectanceM; uint _mp1; uint _mp2;
 };
 layout(std430, binding = 5) readonly buffer GpuPerDrawBuf  { GpuPerDraw gpuDraws[]; };
 layout(std430, binding = 6) readonly buffer GpuMaterialBuf { GpuMaterial gpuMats[]; };
@@ -89,6 +89,7 @@ flat in uint vMaterialId;
 #define BaseColorFactor    (_M.baseColorFactor)
 #define MetallicMultiplier (_M.metallicMul)
 #define RoughnessMultiplier (_M.roughnessMul)
+#define SpecularReflectance (_M.specularReflectanceM)
 #define NormalStrength     (_M.normalStrengthM)
 #define EmissiveFactor     (_M.emissiveFactor.rgb)
 #define Opacity            (_M.opacity)
@@ -136,6 +137,7 @@ flat in uint vMaterialId;
         "uniform vec4 BaseColorFactor;",
         "uniform float MetallicMultiplier;",
         "uniform float RoughnessMultiplier;",
+        "uniform float SpecularReflectance;",
         "uniform bool PackedOrm;",
         "uniform bool HasMetallicMap;",
         "uniform bool HasRoughnessMap;",
