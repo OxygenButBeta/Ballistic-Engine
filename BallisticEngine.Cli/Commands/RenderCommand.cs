@@ -17,11 +17,14 @@ internal sealed class RenderCommand : ICommand {
         """
         Usage: bal render <scene.scene> [--out <dir>] [--orbit N] [--center x,y,z] [--radius R]
                                         [--height H] [--frame F] [--idmap] [--play]
+                                        [--eye x,y,z] [--look x,y,z]
           --out     output directory (default: <project>/Library/Renders)
           --orbit   N camera positions on a circle around --center, looking at it
           --center  orbit target (default 0,0,0)
           --radius  orbit radius (default: the scene camera's horizontal distance to center)
           --height  orbit camera height (default: the scene camera's Y)
+          --eye     place the camera at this exact world position (reproduce a free-fly view)
+          --look    point the --eye camera at this world target (default: the scene center / --center)
           --frame   capture frame (default 30; deterministic mode converges immediately)
           --idmap   also capture the entity-ID map per shot
           --play    run play mode before capture (default: paused edit mode, bit-exact)
@@ -33,6 +36,7 @@ internal sealed class RenderCommand : ICommand {
         Vector3 center = Vector3.Zero;
         float? radius = null, height = null;
         bool idmap = false, play = false;
+        Vector3? eye = null, look = null;
         for (int i = 0; i < args.Length; i++) {
             switch (args[i]) {
                 case "--out": outDir = Next(args, ref i, "--out"); break;
@@ -40,6 +44,8 @@ internal sealed class RenderCommand : ICommand {
                 case "--center": center = SceneFile.ParseVec3(Next(args, ref i, "--center")); break;
                 case "--radius": radius = ParseFloat(Next(args, ref i, "--radius"), "--radius"); break;
                 case "--height": height = ParseFloat(Next(args, ref i, "--height"), "--height"); break;
+                case "--eye": eye = SceneFile.ParseVec3(Next(args, ref i, "--eye")); break;
+                case "--look": look = SceneFile.ParseVec3(Next(args, ref i, "--look")); break;
                 case "--frame": frame = ParseInt(Next(args, ref i, "--frame"), "--frame"); break;
                 case "--idmap": idmap = true; break;
                 case "--play": play = true; break;
@@ -59,7 +65,32 @@ internal sealed class RenderCommand : ICommand {
         Directory.CreateDirectory(outDir);
 
         var shots = new List<object>();
-        if (orbit <= 0) {
+        if (eye is { } eyePos) {
+            // EXACT-POSE capture: place the camera at --eye looking at --look (or the scene center).
+            // The cheap way to reproduce a user's free-fly viewpoint headlessly — paused captures of
+            // the serialized camera couldn't hit the angles where view-dependent artifacts show.
+            SceneFile.BuildRegistry(sceneAbs);
+            SceneDocument doc = SceneFile.Load(sceneAbs);
+            EntityDocument cam = (doc.Entities ?? [])
+                .FirstOrDefault(e => (e.Components ?? []).Any(c => string.Equals(c.Type, "HDCamera", StringComparison.OrdinalIgnoreCase)))
+                ?? throw new Exception("no entity with an HDCamera component in the scene");
+            cam.Transform ??= new TransformDocument();
+            cam.Transform.Position = eyePos;
+            cam.Transform.Rotation = LookAt(eyePos, look ?? center);
+            string tempDir = Path.Combine(root, "Library", "Temp");
+            Directory.CreateDirectory(tempDir);
+            string tempScene = Path.Combine(tempDir, "bal-eye.scene");
+            SceneFile.Save(tempScene, doc);
+            try {
+                string outPath = Path.Combine(outDir, Path.GetFileNameWithoutExtension(sceneRel) + "_eye.bmp");
+                RunPlayer(playerExe, root, "Library/Temp/bal-eye.scene", outPath, frame, idmap, play);
+                shots.Add(ShotInfo(outPath, null, idmap));
+            }
+            finally {
+                try { File.Delete(tempScene); } catch { }
+            }
+        }
+        else if (orbit <= 0) {
             string outPath = Path.Combine(outDir, Path.GetFileNameWithoutExtension(sceneRel) + ".bmp");
             RunPlayer(playerExe, root, sceneRel, outPath, frame, idmap, play);
             shots.Add(ShotInfo(outPath, null, idmap));
