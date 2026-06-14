@@ -142,6 +142,7 @@ uniform int   UseGlobalSdf;                // 1 = march the GDF clipmap; 0 = the
 // multi-bounce radiance here (the global surface cache) instead of the neutral direct estimate.
 uniform sampler3D GlobalRadiance[GDF_CASCADES];
 uniform int   UseGlobalRadiance;           // 1 = read the radiance clipmap at hits; 0 = HitDirect
+uniform int   DisableScreenTrace;          // diag: 1 = skip the screen trace (world-cache GI only)
 
 // Reads the global radiance clipmap at a world point (finest cascade containing it). a = occupancy.
 vec4 GlobalRadianceAt(vec3 worldP) {
@@ -528,7 +529,7 @@ bool ScreenTrace(vec3 originWorld, vec3 dirWorld, out vec3 radiance, out float o
 vec3 TraceRay(vec3 origin, vec3 dir, out bool hit) {
     hit = false;
     // Screen trace first (GDF path) — sharp near-field from the lit scene colour.
-    if (UseGlobalSdf == 1) {
+    if (UseGlobalSdf == 1 && DisableScreenTrace == 0) {
         vec3 stRad; float stDist;
         if (ScreenTrace(origin, dir, stRad, stDist)) { hit = true; return stRad; }
     }

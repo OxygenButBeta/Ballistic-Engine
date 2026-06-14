@@ -30,6 +30,16 @@ float LinearDepth(float d) {
 void main() {
     vec3 scene = texture(sceneTexture, TexCoords).rgb;
 
+    // SKY pixels receive ZERO GI — they are not a surface. Without this, the depth-aware upsample below
+    // can pull a foreground-geometry GI texel into a sky pixel near a silhouette (all 4 taps depth-
+    // rejected -> the 1e-5 weight floors cancel in acc/wSum and leave a foreground value), painting a
+    // bright fringe into the sky hugging rooflines/edges (the review's silhouette-halo defect). A hard
+    // sky gate is unambiguously correct and kills the halo at the source.
+    if (texture(depthTexture, TexCoords).r >= 1.0) {
+        FragColor = vec4(DebugView ? vec3(0.0) : scene, 1.0);
+        return;
+    }
+
     // Depth-aware upsample of the half-res GI buffer: each of the 4 nearest half-res texels is
     // weighted by its bilinear factor x depth similarity, so the off-screen bounce doesn't bleed
     // across silhouettes (the halo a plain bilinear upsample smears around edges).

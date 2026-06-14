@@ -116,6 +116,10 @@ public sealed class GLSdfGiPass : IDisposable {
     // Diagnostic: force the GDF march off the voxel radiance cache (use HitDirect grey instead).
     static readonly bool noRadianceCache =
         Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_NORADIANCE") == "1";
+    // Diagnostic: skip the screen trace so the gather uses ONLY the world voxel cache (true off-screen
+    // bounce). Isolates how much of the "GI" is just on-screen lit-colour reprojection (screen trace).
+    static readonly bool noScreenTrace =
+        Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_NOSCREEN") == "1";
 
     // Not readonly: built lazily in EnsureAvailable (the first time Lumen is wanted), not the ctor.
     GLSdfAtlas atlas;
@@ -179,7 +183,7 @@ public sealed class GLSdfGiPass : IDisposable {
     int locGridMin, locGridInvCell, locGridRes, locViewProj;
     readonly int[] locCascadeMatrices = new int[4];
     // Global distance field (Phase 1) + radiance clipmap (Phase 2) uniform locations.
-    int locUseGlobalSdf, locGlobalSdfRes, locUseGlobalRadiance;
+    int locUseGlobalSdf, locGlobalSdfRes, locUseGlobalRadiance, locDisableScreenTrace;
     readonly int[] locGlobalSdf = new int[GLGlobalSdf.CascadeCount];
     readonly int[] locGlobalSdfMin = new int[GLGlobalSdf.CascadeCount];
     readonly int[] locGlobalSdfCell = new int[GLGlobalSdf.CascadeCount];
@@ -332,6 +336,7 @@ public sealed class GLSdfGiPass : IDisposable {
         locProbeStep = GL.GetUniformLocation(program, "ProbeStep");
         locUseGlobalSdf = GL.GetUniformLocation(program, "UseGlobalSdf");
         locUseGlobalRadiance = GL.GetUniformLocation(program, "UseGlobalRadiance");
+        locDisableScreenTrace = GL.GetUniformLocation(program, "DisableScreenTrace");
         locGlobalSdfRes = GL.GetUniformLocation(program, "GlobalSdfRes");
         for (var i = 0; i < GLGlobalSdf.CascadeCount; i++) {
             locGlobalSdf[i] = GL.GetUniformLocation(program, $"GlobalSdf[{i}]");
@@ -589,6 +594,7 @@ public sealed class GLSdfGiPass : IDisposable {
             // HitDirect estimate instead of the voxel radiance cache. Isolates whether a bad GI look is
             // in the cache (inject) or the trace/screen-trace. Default on (the cache is the real path).
             GL.Uniform1(locUseGlobalRadiance, noRadianceCache ? 0 : 1);
+            GL.Uniform1(locDisableScreenTrace, noScreenTrace ? 1 : 0);
 
             GL.UseProgram(program); // InjectRadiance bound its own program — restore the march program
             globalSdf.Bind(GdfFirstUnit);
