@@ -159,10 +159,16 @@ void main() {
     vec3 albedo = texelFetch(AlbedoField, v, 0).rgb;
     if (dot(albedo, albedo) < 1e-4) albedo = Albedo;
 
-    // Energy-bounded multi-bounce (same reasoning as the per-mesh inject): clamp bounce albedo so the
-    // R = direct*a + a*R_prev recurrence converges (a->1 white walls would otherwise explode), and a
-    // hard cap on the stored value as a final safety. Sky enters via the gather's missed rays.
-    vec3 bounceAlbedo = min(albedo, vec3(0.9));
+    // Energy-bounded multi-bounce. The stored voxel radiance is a geometric series in the bounce
+    // albedo: in a FULLY ENCLOSED scene (no sky escape — BistroInterior's closed red room) every
+    // bounce ray hits another lit voxel, so R converges to direct*a/(1-a). At a=0.9 that's a 10x
+    // amplification — and a red wall's RED channel ran away to full saturation (the isolated bounce
+    // was railed pure red) while green/blue stayed low. A real diffuse surface reflects ~0.3-0.5, so
+    // a=0.9 was never physical; it was a too-loose explosion guard. Clamp to 0.55 -> series sum ~2.2x
+    // (correct multi-bounce: a few real bounces, not ten) so an enclosed coloured room stays bounded.
+    // (SunTemple's lower-albedo stone never hit the runaway, so it's unaffected; the exterior escapes
+    // to sky so it never summed the series at all.)
+    vec3 bounceAlbedo = min(albedo, vec3(0.55));
     vec3 radiance = (albedo / PI) * direct + bounceAlbedo * bounce;
     radiance = Sanitize(radiance);
 

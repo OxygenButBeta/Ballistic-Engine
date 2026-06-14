@@ -109,6 +109,9 @@ public sealed class GLSdfGiPass : IDisposable {
     GLGlobalSdf globalSdf;
     static readonly bool UseGlobalSdf =
         Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_GDF") == "1";
+    // Diagnostic: force the GDF march off the voxel radiance cache (use HitDirect grey instead).
+    static readonly bool noRadianceCache =
+        Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_NORADIANCE") == "1";
 
     // Not readonly: built lazily in EnsureAvailable (the first time Lumen is wanted), not the ctor.
     GLSdfAtlas atlas;
@@ -576,7 +579,10 @@ public sealed class GLSdfGiPass : IDisposable {
             // (no per-voxel material in v1). Feedback 0.9 = sticky EMA for stability + multi-bounce.
             globalSdf.InjectRadiance(irradianceCubemap, shadowMapArray, cascadeMatrices, cascadeBias,
                 cascadeCount, sunDirection, sunColor, new Vector3(HitAlbedo), skyExposure, 0.9f);
-            GL.Uniform1(locUseGlobalRadiance, 1);
+            // Diagnostic gate (BALLISTIC_LUMEN_NORADIANCE=1): force the march to use the neutral-grey
+            // HitDirect estimate instead of the voxel radiance cache. Isolates whether a bad GI look is
+            // in the cache (inject) or the trace/screen-trace. Default on (the cache is the real path).
+            GL.Uniform1(locUseGlobalRadiance, noRadianceCache ? 0 : 1);
 
             GL.UseProgram(program); // InjectRadiance bound its own program — restore the march program
             globalSdf.Bind(GdfFirstUnit);
