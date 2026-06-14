@@ -37,24 +37,25 @@ vec2 OctEncodeHemi(vec3 d) {
     return p * 0.5 + 0.5;
 }
 
-// Integrate one probe's octmap against the cosine lobe around worldN. The probe's own tangent frame is
-// rebuilt from its normal (same Frisvad branch as the trace) so the stored directions decode correctly.
-vec3 IntegrateProbe(ivec2 probe, vec3 worldN) {
-    // Probe tangent frame (must match SdfTrace_Comp.ProbeOctMain).
-    vec3 up = abs(worldN.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
-    vec3 T = normalize(cross(up, worldN));
-    vec3 B = cross(worldN, T);
+// Integrate one probe's octmap against the cosine lobe around the PIXEL normal `pixelN`. CRITICAL: the
+// octmap was TRACED in the PROBE's own tangent frame (from `probeN`), so it MUST be decoded in THAT
+// frame — decoding in the pixel's frame (the prior bug) made adjacent probes with slightly different
+// normals decode inconsistently => the visible probe-lattice GRID. We decode each texel's direction in
+// the probe frame (matching SdfTrace_Comp.ProbeOctMain), then weight by the PIXEL's cosine lobe so the
+// result is this pixel's diffuse irradiance estimate from that probe.
+vec3 IntegrateProbe(ivec2 probe, vec3 probeN, vec3 pixelN) {
+    // PROBE tangent frame (must match SdfTrace_Comp.ProbeOctMain — built from the PROBE normal).
+    vec3 up = abs(probeN.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T = normalize(cross(up, probeN));
+    vec3 B = cross(probeN, T);
 
     ivec2 atlasBase = probe * OctRes;
     vec3 sum = vec3(0.0);
     float wSum = 0.0;
-    // Walk every oct texel = a hemisphere direction; weight by the cosine of THIS pixel's normal vs the
-    // texel direction. (The probe shares the pixel's normal closely — same block — so the probe-frame
-    // direction is ~the pixel-frame direction; the cosine lobe gives the diffuse BRDF integral.)
     for (int oy = 0; oy < OctRes; ++oy)
     for (int ox = 0; ox < OctRes; ++ox) {
         vec2 octUV = (vec2(ox, oy) + 0.5) / float(OctRes);
-        // Decode the texel's hemisphere direction (mirror of OctDecodeHemi).
+        // Decode the texel's hemisphere direction (mirror of OctDecodeHemi), in the PROBE frame.
         vec2 f = octUV * 2.0 - 1.0;
         vec3 nd = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
         float t = max(-nd.z, 0.0);
@@ -62,8 +63,8 @@ vec3 IntegrateProbe(ivec2 probe, vec3 worldN) {
         nd.y += nd.y >= 0.0 ? -t : t;
         nd.z = abs(nd.z);
         nd = normalize(nd);
-        vec3 dir = T * nd.x + B * nd.y + worldN * nd.z; // world-space incoming direction
-        float cosT = max(dot(worldN, dir), 0.0);
+        vec3 dir = T * nd.x + B * nd.y + probeN * nd.z; // world-space incoming direction (probe frame)
+        float cosT = max(dot(pixelN, dir), 0.0);        // weight by the PIXEL's BRDF lobe
         if (cosT <= 0.0) continue;
         vec3 rad = texelFetch(probeAtlas, atlasBase + ivec2(ox, oy), 0).rgb;
         sum += rad * cosT;
@@ -98,14 +99,17 @@ void main() {
         vec2 probeUv = (vec2(pi) + 0.5) * float(ProbeStep) / vec2(HalfDims);
         float pd = texture(depthTexture, probeUv).r;
         if (pd >= 1.0) continue;
+        // The probe's OWN normal (at its representative pixel = the block centre ProbeOctMain used to
+        // build the probe frame). Decode the octmap in this frame; weight against the PIXEL normal `n`.
         vec3 pn = normalize(texture(normalTexture, probeUv).rgb * 2.0 - 1.0);
         float pz = LinearZ(pd);
-        float wN = pow(max(dot(n, pn), 0.0), 8.0);            // reject different-surface probes
-        float wZ = 1.0 / (1.0 + abs(z - pz) * 4.0);           // reject depth discontinuities
-        float w = wBil * wN * wZ;
-        if (w <= 1e-5) continue;
-        // Integrate the probe's octmap against THIS pixel's cosine lobe (directional, not flat).
-        sum += IntegrateProbe(pi, n) * w;
+        // Softer edge stops than before (pow 8 -> 3, depth slope 4 -> 2): too-sharp weights left only
+        // one probe contributing inside a block -> the lattice grid. Softer = neighbour probes blend
+        // smoothly across block boundaries while still rejecting genuinely different surfaces/depths.
+        float wN = pow(max(dot(n, pn), 0.0), 3.0);
+        float wZ = 1.0 / (1.0 + abs(z - pz) * 2.0);
+        float w = wBil * wN * wZ + 1e-4;        // tiny floor so a fully-rejected 2x2 still picks nearest
+        sum += IntegrateProbe(pi, pn, n) * w;   // decode in the PROBE frame (pn), weight by PIXEL lobe (n)
         wSum += w;
     }
     FragColor = wSum > 1e-4 ? vec4(sum / wSum, 1.0) : vec4(0.0);
