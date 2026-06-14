@@ -59,7 +59,7 @@ internal sealed class EditorApplication {
     float contentAreaTop;   // Y of the dock area's top (just under the toolbar); clamps the tab-strip band
     bool maximizedViewport => maximizedPanel == EditorLayout.SceneView || maximizedPanel == EditorLayout.GameView;
 
-    bool showStats;
+    bool showStats = Environment.GetEnvironmentVariable("BALLISTIC_STATS") == "1"; // auto-open for agents/CI
     bool alwaysRefresh = EditorPrefs.Current.AlwaysRefresh;   // off = re-render only on change
     int forceFrames = 3;
     bool wasLoadingScene;   // falling edge -> burst frames so auto-exposure converges after a load
