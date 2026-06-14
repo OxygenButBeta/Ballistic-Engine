@@ -1268,6 +1268,14 @@ public class GLHDRenderer : HDRenderer {
         if (EnvGiProbes is { } gp) PostFX.GiProbesEnabled = gp;
         if (EnvGiReflections is { } gr) PostFX.GiReflectionsEnabled = gr;
         if (EnvGiLumen is { } gl) { PostFX.GiLumenEnabled = gl; PostFX.GiSdfForceEnabled = gl; }
+        // Exposure overrides (diagnose dark/black interiors): BALLISTIC_EXPOSURE_MODE=auto|fixed,
+        // BALLISTIC_EV=<value> (fixed mode middle-grey EV — lower = brighter; ~15 = daylight).
+        if (Environment.GetEnvironmentVariable("BALLISTIC_EXPOSURE_MODE") is { } em)
+            PostFX.ExposureMode = em.Equals("auto", StringComparison.OrdinalIgnoreCase)
+                ? ExposureMode.Automatic : ExposureMode.Fixed;
+        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_EV"),
+                System.Globalization.CultureInfo.InvariantCulture, out float ev))
+            PostFX.ExposureEV = ev;
     }
 
     static bool? EnvBool(string name) =>

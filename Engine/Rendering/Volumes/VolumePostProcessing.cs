@@ -63,39 +63,48 @@ public static class VolumePostProcessing {
             fx.SsgiAmbientFloor = 0f;
         }
 
-        // Legacy monolithic GlobalIllumination override (back-compat — scenes that already use it keep
-        // working). The SPLIT overrides below (LightProbes / ReflectionProbes / Lumen) override it when
-        // both are present, so a scene can migrate one system at a time.
-        if (stack.GetComponent<GlobalIllumination>() is { } gi) {
-            fx.GiProbeIntensity = gi.probeIntensity.Value;
-            fx.GiReflectionIntensity = gi.reflectionIntensity.Value;
-            fx.GiSdfIntensityScale = gi.sdfIntensity.Value;
-            fx.GiSdfForceEnabled = gi.sdfForceEnabled.Value;
-            fx.GiAmbientFloor = gi.ambientFloor.Value;
-            fx.GiProbeDensity = gi.probeDensity.Value;
-            fx.GiReflectionDensity = gi.reflectionDensity.Value;
-            fx.GiDebugShowProbes = gi.debugShowProbes.Value;
-            fx.GiDebugShowReflectionProbes = gi.debugShowReflectionProbes.Value;
+        // GI overrides. CRITICAL: VolumeManager.Stack ALWAYS contains EVERY VolumeComponent type at its
+        // defaults (it's built from the whole component registry); GetComponent<T>() is never null. So a
+        // parameter only counts as "set by a profile" when its .Overridden flag is true. Earlier this
+        // applied split params on mere presence — a scene whose profile had GlobalIllumination but NOT
+        // Lumen still saw the DEFAULT Lumen (enabled=false) clobber GI.sdfForceEnabled=true, so "toggling
+        // Lumen did nothing" / SDF-GI never turned on. Now each split param wins ONLY when overridden,
+        // and the legacy GI fills a field only when no split override claimed it.
+        var lp = stack.GetComponent<LightProbes>();
+        var rp = stack.GetComponent<ReflectionProbes>();
+        var lumen = stack.GetComponent<Lumen>();
+        var gi = stack.GetComponent<GlobalIllumination>();
+
+        // Legacy GlobalIllumination (applies only its OVERRIDDEN params).
+        if (gi is not null) {
+            if (gi.ambientFloor.Overridden) fx.GiAmbientFloor = gi.ambientFloor.Value;
+            if (gi.probeIntensity.Overridden) fx.GiProbeIntensity = gi.probeIntensity.Value;
+            if (gi.probeDensity.Overridden) fx.GiProbeDensity = gi.probeDensity.Value;
+            if (gi.debugShowProbes.Overridden) fx.GiDebugShowProbes = gi.debugShowProbes.Value;
+            if (gi.reflectionIntensity.Overridden) fx.GiReflectionIntensity = gi.reflectionIntensity.Value;
+            if (gi.reflectionDensity.Overridden) fx.GiReflectionDensity = gi.reflectionDensity.Value;
+            if (gi.debugShowReflectionProbes.Overridden) fx.GiDebugShowReflectionProbes = gi.debugShowReflectionProbes.Value;
+            if (gi.sdfIntensity.Overridden) fx.GiSdfIntensityScale = gi.sdfIntensity.Value;
+            if (gi.sdfForceEnabled.Overridden) fx.GiSdfForceEnabled = gi.sdfForceEnabled.Value;
         }
 
-        // Split GI overrides (the preferred, granular form). Each is independent so a scene can disable
-        // one system (e.g. "stop Lumen") without affecting the others.
-        if (stack.GetComponent<LightProbes>() is { } lp) {
-            fx.GiProbesEnabled = lp.enabled.Value;
-            fx.GiProbeIntensity = lp.intensity.Value;
-            fx.GiProbeDensity = lp.density.Value;
-            fx.GiDebugShowProbes = lp.debugShow.Value;
+        // Split overrides (preferred) — each param wins ONLY if actually overridden in a profile, so an
+        // unconfigured default component can't clobber the legacy GI or another override.
+        if (lp is not null) {
+            if (lp.enabled.Overridden) fx.GiProbesEnabled = lp.enabled.Value;
+            if (lp.intensity.Overridden) fx.GiProbeIntensity = lp.intensity.Value;
+            if (lp.density.Overridden) fx.GiProbeDensity = lp.density.Value;
+            if (lp.debugShow.Overridden) fx.GiDebugShowProbes = lp.debugShow.Value;
         }
-        if (stack.GetComponent<ReflectionProbes>() is { } rp) {
-            fx.GiReflectionsEnabled = rp.enabled.Value;
-            fx.GiReflectionIntensity = rp.intensity.Value;
-            fx.GiReflectionDensity = rp.density.Value;
-            fx.GiDebugShowReflectionProbes = rp.debugShow.Value;
+        if (rp is not null) {
+            if (rp.enabled.Overridden) fx.GiReflectionsEnabled = rp.enabled.Value;
+            if (rp.intensity.Overridden) fx.GiReflectionIntensity = rp.intensity.Value;
+            if (rp.density.Overridden) fx.GiReflectionDensity = rp.density.Value;
+            if (rp.debugShow.Overridden) fx.GiDebugShowReflectionProbes = rp.debugShow.Value;
         }
-        if (stack.GetComponent<Lumen>() is { } lumen) {
-            fx.GiLumenEnabled = lumen.enabled.Value;
-            fx.GiSdfForceEnabled = lumen.enabled.Value; // the split Lumen.enabled IS the force-on switch
-            fx.GiSdfIntensityScale = lumen.intensity.Value;
+        if (lumen is not null) {
+            if (lumen.enabled.Overridden) { fx.GiLumenEnabled = lumen.enabled.Value; fx.GiSdfForceEnabled = lumen.enabled.Value; }
+            if (lumen.intensity.Overridden) fx.GiSdfIntensityScale = lumen.intensity.Value;
         }
 
         if (stack.GetComponent<Shadows>() is { } shadows) {
