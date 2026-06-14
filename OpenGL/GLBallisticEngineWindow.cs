@@ -70,6 +70,15 @@ public class GLBallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWin
             StartFocused = true,
             StartVisible = true,
         }) {
+        // BALLISTIC_WIDTH / BALLISTIC_HEIGHT override the requested client size (windowed only). Wired
+        // for headless agent debugging: the editor viewport is an ARBITRARY, often ODD, size while the
+        // runtime defaults to an even 1920x1080 — so artifacts that only appear at odd dimensions (e.g.
+        // a half-res post pass's bottom row at floor(h/2)*2 < h) can't be reproduced from the runtime
+        // without this. Out-of-range / unset = the requested size. Ignored under fullscreen.
+        if (int.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_WIDTH"), out var envW) && envW >= 16)
+            width = envW;
+        if (int.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_HEIGHT"), out var envH) && envH >= 16)
+            height = envH;
         this.width = width;
         this.height = height;
         Title = string.IsNullOrWhiteSpace(title) ? "Ballistic" : title;
