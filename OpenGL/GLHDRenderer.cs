@@ -572,6 +572,12 @@ public class GLHDRenderer : HDRenderer {
         if (lumenOwnsGi) {
             probeVolumeReady = false;
             reflectionVolumeReady = false;
+            // TESTING (per user): also disable the separate screen-space SSGI while Lumen owns the GI,
+            // so we evaluate PURE Lumen in isolation (SSGI is a different screen-space GI that otherwise
+            // runs alongside and muddies what Lumen alone produces). Reversible: BALLISTIC_FX_SSGI=1
+            // forces it back on; lifting this once Lumen is the verified default lets them complement.
+            if (EnvSsgi != true)
+                PostFX.SsgiEnabled = false;
         }
         else {
             // Irradiance probe bake: time-sliced, VOLUME-fitted-shadow, cached. Runs BEFORE the view
