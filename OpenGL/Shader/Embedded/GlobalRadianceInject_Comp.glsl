@@ -175,7 +175,10 @@ vec3 GdfRadianceAt(vec3 worldP) {
 // real distance fixes the reach.
 vec3 GatherBounce(vec3 worldP, vec3 n, float cell) {
     const int RAYS = 6;
-    const int STEPS = 64;
+    // GI REWORK Phase 1: STEPS 64 -> 128. Near a surface the sphere trace advances only ~0.5*cell, so 64
+    // steps died after ~1-2 rooms; 128 lets a bounce ray actually cross a room and reach the far wall that
+    // carries the multi-bounce fill. MAXD stays 40m (room/hall scale). Cost is the inject dispatch only.
+    const int STEPS = 128;
     const float MAXD = 40.0;
     float hitEps = 0.5 * cell;        // surface proximity that counts as a hit
     vec3 up = abs(n.z) < 0.999 ? vec3(0,0,1) : vec3(1,0,0);
@@ -216,10 +219,16 @@ void main() {
         return;
 
     float d = DistAt(v);
-    // Only near-surface voxels carry radiance (|d| within ~1.5 cells). Far/empty voxels decay toward 0.
-    if (abs(d) > 1.5 * CascadeCell) {
+    // Only near-surface voxels carry radiance (|d| within ~2 cells — widened from 1.5 so the band the
+    // gather reads is solidly occupied even on the coarse warm-up field; the march samples up to ~1.5
+    // cells INTO the surface). GI REWORK Phase 1: far/empty voxels decay GENTLY (0.9x, was 0.5x). The
+    // aggressive 0.5x halved a voxel's radiance every frame it was briefly missed (coarse-field gradient
+    // flicker, clipmap scroll) — so the cache the gather reads kept collapsing toward 0 and rooms
+    // emptied. 0.9x keeps a transiently-missed surface voxel alive ~10 frames while genuinely-empty air
+    // still fades. (The near-surface band below overwrites occupied voxels with fresh radiance anyway.)
+    if (abs(d) > 2.0 * CascadeCell) {
         vec4 old = texelFetch(GdfRadiance[Cascade], v, 0);
-        imageStore(RadianceOut, v, vec4(old.rgb * 0.5, old.a * 0.5));
+        imageStore(RadianceOut, v, vec4(old.rgb * 0.9, old.a * 0.9));
         return;
     }
 
@@ -292,7 +301,11 @@ void main() {
     // (correct multi-bounce: a few real bounces, not ten) so an enclosed coloured room stays bounded.
     // (SunTemple's lower-albedo stone never hit the runaway, so it's unaffected; the exterior escapes
     // to sky so it never summed the series at all.)
-    vec3 bounceAlbedo = min(albedo, vec3(0.55));
+    // GI REWORK Phase 1: clamp raised 0.55 -> 0.85 so high-albedo surfaces (red sandstone/walls) bounce
+    // their real colour in the multi-bounce series instead of being energy-starved (0.55 lost ~40% of a
+    // bright wall's bounce). The geometric series a/(1-a) at 0.85 is ~5.7x, but the per-frame EMA (0.6)
+    // and the hard 32.0 cap below bound the enclosed runaway; real diffuse walls genuinely reach ~0.7-0.8.
+    vec3 bounceAlbedo = min(albedo, vec3(0.85));
     vec3 radiance = (albedo / PI) * direct + bounceAlbedo * bounce * BounceScale;
     radiance = Sanitize(radiance);
 

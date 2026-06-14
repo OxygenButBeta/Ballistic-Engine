@@ -123,6 +123,14 @@ public sealed class GLSdfGiPass : IDisposable {
     // bounce). Isolates how much of the "GI" is just on-screen lit-colour reprojection (screen trace).
     static readonly bool noScreenTrace =
         Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_NOSCREEN") == "1";
+    // GI REWORK Phase 1: voxel-cache EMA feedback (fraction of OLD radiance kept per frame). With all
+    // cascades lit every frame, 0.6 converges in ~4-6 frames. BALLISTIC_LUMEN_FEEDBACK overrides for tuning.
+    static readonly float GdfFeedback = ParseFeedback();
+    static float ParseFeedback() {
+        string s = Environment.GetEnvironmentVariable("BALLISTIC_LUMEN_FEEDBACK");
+        return float.TryParse(s, System.Globalization.CultureInfo.InvariantCulture, out float v)
+            ? Math.Clamp(v, 0f, 0.99f) : 0.6f;
+    }
 
     // Not readonly: built lazily in EnsureAvailable (the first time Lumen is wanted), not the ctor.
     GLSdfAtlas atlas;
@@ -589,11 +597,14 @@ public sealed class GLSdfGiPass : IDisposable {
         GL.Uniform1(locUseGlobalSdf, gdf ? 1 : 0);
         GL.Uniform1(locUseGlobalRadiance, 0);
         if (gdf) {
-            // Voxel-lighting inject (one cascade/frame): light the radiance clipmap from the GDF before
-            // the march reads it. Uses the same sun/shadow/sky as the per-mesh inject; mid-grey albedo
-            // (no per-voxel material in v1). Feedback 0.9 = sticky EMA for stability + multi-bounce.
+            // Voxel-lighting inject: light the radiance clipmap from the GDF before the march reads it.
+            // Uses the same sun/shadow/sky as the per-mesh inject; mid-grey albedo (no per-voxel material
+            // in v1). GI REWORK Phase 1: with ALL cascades now lit EVERY frame, feedback 0.9 was far too
+            // sticky (~100+ frame convergence — tuned for the old 1-cascade/4-frame round-robin). 0.6 keeps
+            // 40% new radiance per frame -> converges in ~4-6 frames, while the ping-pong + the post-gather
+            // temporal filter keep it stable (no same-frame feedback to amplify). Tunable: BALLISTIC_LUMEN_FEEDBACK.
             globalSdf.InjectRadiance(irradianceCubemap, shadowMapArray, cascadeMatrices, cascadeBias,
-                cascadeCount, sunDirection, sunColor, new Vector3(HitAlbedo), skyExposure, 0.9f,
+                cascadeCount, sunDirection, sunColor, new Vector3(HitAlbedo), skyExposure, GdfFeedback,
                 pointCount, pointPos, pointColor, pointRange,
                 spotCount, spotPos, spotDir, spotColor, spotRange, spotCosInner, spotCosOuter);
             // Diagnostic gate (BALLISTIC_LUMEN_NORADIANCE=1): force the march to use the neutral-grey

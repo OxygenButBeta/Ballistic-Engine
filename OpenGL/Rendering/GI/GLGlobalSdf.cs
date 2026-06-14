@@ -109,7 +109,6 @@ public sealed class GLGlobalSdf : IDisposable {
     readonly int[] liCascadeMatrices = new int[4];
     readonly int[] liGdfMin = new int[CascadeCount];
     readonly int[] liGdfCell = new int[CascadeCount];
-    int radianceInjectCursor; // round-robin: light one cascade per frame (amortize the dispatch cost)
 
     public GLGlobalSdf(int resolution = 64, float baseExtent = 16f) {
         Resolution = Math.Clamp(resolution, 16, 256);
@@ -492,10 +491,14 @@ public sealed class GLGlobalSdf : IDisposable {
     }
 
     // VOXEL LIGHTING: light the radiance clipmap from the distance clipmap (sun+shadow+sky+one bounce).
-    // Amortized — ONE cascade per call (round-robin), so the per-frame cost is bounded; the EMA keeps a
-    // static view converging and a moving view refreshing over a few frames. Called by GLSdfGiPass.Render
-    // (it has the sun/shadow/sky params), AFTER Update has placed/baked the cascades. Ping-pong: read
-    // last frame's radiance (samplers), write this frame's, then SwapRadiance so the march reads fresh.
+    // GI REWORK Phase 1 (2026-06-14): light ALL baked cascades EVERY frame (was 1-of-4 round-robin).
+    // The round-robin meant a cascade was only re-lit every 4 frames and, combined with the sticky EMA,
+    // took 50-160 frames to converge — so rooms stayed perpetually half-lit (BistroInterior isolated
+    // bounce was ~empty). Real Lumen lights the whole surface cache each frame; convergence comes from
+    // the temporal filter AFTER the gather, not from a slow cache fill. On a high-end GPU the 4 dispatches
+    // (4x Resolution^3/64 invocations) are a few ms — acceptable per the GPU-heavy budget.
+    // Called by GLSdfGiPass.Render (it has the sun/shadow/sky params), AFTER Update has placed/baked the
+    // cascades. Ping-pong: read last frame's radiance (samplers), write this frame's, swap per cascade.
     public void InjectRadiance(int irradianceCubemap, int shadowMapArray, Matrix4[] sunCascades,
         Vector4 sunBias, int sunCascadeCount, Vector3 sunDir, Vector3 sunColor, Vector3 albedo,
         float skyExposure, float feedback,
@@ -504,36 +507,26 @@ public sealed class GLGlobalSdf : IDisposable {
         float[] spotRange = null, float[] spotCosInner = null, float[] spotCosOuter = null) {
         if (!Available || injectProgram == 0)
             return;
-        int c = radianceInjectCursor;
-        radianceInjectCursor = (radianceInjectCursor + 1) % CascadeCount;
-        if (!cascadeBaked[c])
-            return;
 
         GL.UseProgram(injectProgram);
-        // Write target: this cascade's WRITE radiance texture as image 1.
-        GL.BindImageTexture(1, RadianceWrite(c), 0, true, 0, TextureAccess.WriteOnly, SizedInternalFormat.Rgba16f);
-        // This cascade's distance field (unit 0), sky (3), sun shadow (5), albedo field (14).
-        BindSampler(0, TextureTarget.Texture3D, textures[c]);
+
+        // ---- Cascade-INDEPENDENT bindings + uniforms: set once, shared by every cascade dispatch ----
         BindSampler(3, TextureTarget.TextureCubeMap, irradianceCubemap);
         BindSampler(5, TextureTarget.Texture2DArray, shadowMapArray);
-        BindSampler(14, TextureTarget.Texture3D, albedoTex[c]);
+        GL.Uniform1(GL.GetUniformLocation(injectProgram, "IrradianceMap"), 3);
+        GL.Uniform1(GL.GetUniformLocation(injectProgram, "ShadowMap"), 5);
         GL.Uniform1(GL.GetUniformLocation(injectProgram, "AlbedoField"), 14);
-        // The whole GDF: distances on units 6..9, LAST frame's radiance on units 10..13 (for the bounce).
+        GL.Uniform1(GL.GetUniformLocation(injectProgram, "DistanceField"), 0);
+        // The whole GDF: distances on units 6..9 (for the bounce sphere-trace). The per-cascade LAST-frame
+        // radiance samplers (10..13) are re-bound INSIDE the loop so a cascade lit earlier this frame is
+        // visible to the next cascade's bounce — but the placement uniforms are cascade-independent.
         for (int k = 0; k < CascadeCount; k++) {
             BindSampler(6 + k, TextureTarget.Texture3D, textures[k]);
-            BindSampler(10 + k, TextureTarget.Texture3D, RadianceRead(k));
             GL.Uniform1(GL.GetUniformLocation(injectProgram, $"GdfDistance[{k}]"), 6 + k);
             GL.Uniform1(GL.GetUniformLocation(injectProgram, $"GdfRadiance[{k}]"), 10 + k);
             GL.Uniform3(liGdfMin[k], cascadeMin[k].X, cascadeMin[k].Y, cascadeMin[k].Z);
             GL.Uniform1(liGdfCell[k], cascadeCell[k]);
         }
-        GL.Uniform1(GL.GetUniformLocation(injectProgram, "DistanceField"), 0);
-        GL.Uniform1(GL.GetUniformLocation(injectProgram, "IrradianceMap"), 3);
-        GL.Uniform1(GL.GetUniformLocation(injectProgram, "ShadowMap"), 5);
-
-        GL.Uniform1(liCascade, c);
-        GL.Uniform3(liCascadeMin, cascadeMin[c].X, cascadeMin[c].Y, cascadeMin[c].Z);
-        GL.Uniform1(liCascadeCell, cascadeCell[c]);
         GL.Uniform1(liRes, Resolution);
         GL.Uniform1(liSkyExposure, skyExposure);
         GL.Uniform1(liFeedback, feedback);
@@ -568,9 +561,28 @@ public sealed class GLGlobalSdf : IDisposable {
         }
 
         int g = (Resolution + 3) / 4;
-        GL.DispatchCompute(g, g, g);
-        GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
-        SwapRadiance(c); // only the cascade we just wrote flips (per-cascade ping-pong)
+
+        // ---- Light EVERY baked cascade this frame ----
+        for (int c = 0; c < CascadeCount; c++) {
+            if (!cascadeBaked[c])
+                continue;
+            // Write target: this cascade's WRITE radiance texture as image 1; its distance + albedo fields.
+            GL.BindImageTexture(1, RadianceWrite(c), 0, true, 0, TextureAccess.WriteOnly, SizedInternalFormat.Rgba16f);
+            BindSampler(0, TextureTarget.Texture3D, textures[c]);
+            BindSampler(14, TextureTarget.Texture3D, albedoTex[c]);
+            // Re-bind the per-cascade LAST-frame radiance read samplers (10..13). Within this loop a cascade
+            // already swapped becomes the freshly-written one, so later cascades' bounce sees this frame's
+            // light — extra in-frame propagation, harmless to convergence (it's still EMA-blended).
+            for (int k = 0; k < CascadeCount; k++)
+                BindSampler(10 + k, TextureTarget.Texture3D, RadianceRead(k));
+            GL.Uniform1(liCascade, c);
+            GL.Uniform3(liCascadeMin, cascadeMin[c].X, cascadeMin[c].Y, cascadeMin[c].Z);
+            GL.Uniform1(liCascadeCell, cascadeCell[c]);
+
+            GL.DispatchCompute(g, g, g);
+            GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
+            SwapRadiance(c); // only the cascade we just wrote flips (per-cascade ping-pong)
+        }
     }
 
     static void BindSampler(int unit, TextureTarget target, int texture) {
