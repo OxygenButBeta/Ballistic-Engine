@@ -3845,6 +3845,9 @@ public class GLHDRenderer : HDRenderer {
             MathF.Max((reflVol?.Intensity ?? 0f) * PostFX.GiReflectionIntensity, 0f));
         // Diffuse-probe ambient strength override (GlobalIllumination volume); 1 = unchanged.
         b.Set("ProbeIntensity", MathF.Max(PostFX.GiProbeIntensity, 0f));
+        // Ambient floor pre-exposed to sit in the same space as the (pre-exposed) ambient diffuse,
+        // so it reads as a consistent tiny shadow-fill regardless of EV (matches SkyExposure above).
+        b.Set("AmbientFloor", MathF.Max(PostFX.GiAmbientFloor, 0f) * skyExposureBase * PostFX.ExposureMultiplier);
     }
 
     // The reflection volume that actually drives the shader this frame: a placed+active one wins;
@@ -3983,6 +3986,7 @@ public class GLHDRenderer : HDRenderer {
         }
         // Diffuse-probe ambient strength override (GlobalIllumination volume); 1 = unchanged.
         shader.SetFloat("ProbeIntensity", MathF.Max(PostFX.GiProbeIntensity, 0f));
+        shader.SetFloat("AmbientFloor", MathF.Max(PostFX.GiAmbientFloor, 0f) * skyExposureBase * PostFX.ExposureMultiplier);
 
         // Baked reflection volume: local prefiltered specular cubemaps (cube-map array + cell->layer
         // map). The cubes store PHYSICAL radiance, re-exposed by SkyExposure (already set above) at

@@ -87,6 +87,7 @@ layout(std140) uniform PassData {
     bool EnableAtmosphericScattering;
     float ReflectionIntensityLocal;
     float ProbeIntensity;            // GlobalIllumination volume: diffuse-probe ambient strength (1 = unchanged)
+    float AmbientFloor;              // tiny shadow-fill so interiors never crush to pure black (default ~0.03)
 };
 
 void main()

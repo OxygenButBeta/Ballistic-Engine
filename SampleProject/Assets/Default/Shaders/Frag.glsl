@@ -98,6 +98,7 @@ layout(std140) uniform PassData {
     bool EnableAtmosphericScattering;
     float ReflectionIntensityLocal;
     float ProbeIntensity;            // GlobalIllumination volume: diffuse-probe ambient strength (1 = unchanged)
+    float AmbientFloor;              // tiny shadow-fill so interiors never crush to pure black (default ~0.03)
 };
 
 // --- Material controls (plain uniforms: these change per draw) ---
@@ -812,6 +813,11 @@ void main()
         // AmbientTint scales the diffuse ambient only; reflections stay sky-driven.
         vec3 kD = albedo * (1.0 - metallic) * max(vec3(1.0) - FssEss - Fms * Ems, vec3(0.0));
         ambientDiffuse = kD * irradiance * AmbientTint * ao;
+        // AMBIENT FLOOR: enclosed interiors capture little probe ambient, so the shadowed side of
+        // geometry crushes to PURE BLACK (UE interiors never do — there's always bounce fill). Lift
+        // by a tiny fraction of the surface albedo, AO-modulated so crevices stay dark. Tunable
+        // (AmbientFloor uniform, GI volume override). Default small so lit areas are ~unchanged.
+        ambientDiffuse += kD * AmbientFloor * ao;
     }
     else {
         vec3 R = reflect(-V, N);

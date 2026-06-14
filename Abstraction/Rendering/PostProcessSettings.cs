@@ -200,4 +200,8 @@ public sealed class PostProcessSettings {
     public float GiReflectionIntensity { get; set; } = 1f;  // baked local-reflection strength (× the volume's own Intensity)
     public float GiSdfIntensityScale { get; set; } = 1f;    // extra multiplier on the SDF-GI bounce
     public bool GiSdfForceEnabled { get; set; }             // turn SDF-GI on without BALLISTIC_SDFGI
+    // Tiny ambient shadow-fill (fraction of albedo, AO-modulated) so enclosed interiors never crush
+    // the shadowed side of geometry to PURE BLACK (UE interiors always have bounce fill). Small by
+    // default so lit areas are ~unchanged; raise for flatter/brighter ambient, 0 for physically-pure.
+    public float GiAmbientFloor { get; set; } = 0.03f;
 }
