@@ -2731,10 +2731,18 @@ public class GLHDRenderer : HDRenderer {
         UploadProbeTextures(job.Px, job.Py, job.Pz, job.Sh, job.Min, job.Size);
         PublishProbeViz(job.Px, job.Py, job.Pz, job.Min, job.Size, job.Sh, job.Occupied);
 
-        // Persist under the DERIVED key (scene + grid): reopening the scene recomputes the
-        // same key and restores this file with no scene save involved.
+        // Persist under the DERIVED key (scene + grid): reopening the scene recomputes the same key
+        // and restores this file with no scene save involved. Write on a BACKGROUND task (like the
+        // reflection cache): UploadProbeTextures above already consumed job.Sh for the GPU upload, and
+        // job.Sh isn't touched again on the GL thread (AbortProbeBake doesn't reference it), so the
+        // serialize+write is race-free and off the GL thread.
         IrradianceVolume vol = job.Volume;
-        IrradianceVolume.SaveCache(ProbeCacheKey(vol), job.Px, job.Py, job.Pz, vol.Center, job.Size, job.Sh);
+        string probeKey = ProbeCacheKey(vol);
+        int ppx = job.Px, ppy = job.Py, ppz = job.Pz;
+        Vector3 pCenter = vol.Center, pSize = job.Size;
+        float[][] pSh = job.Sh;
+        System.Threading.Tasks.Task.Run(() =>
+            IrradianceVolume.SaveCache(probeKey, ppx, ppy, ppz, pCenter, pSize, pSh));
 
         Console.WriteLine(
             $"[ProbeVolume] bake complete: {job.CapturedCount} captured + " +
