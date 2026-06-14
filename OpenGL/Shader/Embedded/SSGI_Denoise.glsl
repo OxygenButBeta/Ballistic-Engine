@@ -76,12 +76,15 @@ void main() {
             float z = ViewZ(uv);
             float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
 
-            // Edge-stopping weights: kernel * normal * depth * LUMA. The luma term is what
-            // stops bright bounce (a sun shaft on the floor) from blurring across a shadow
-            // boundary onto the same flat surface - depth/normal can't see that edge because
-            // both sides are the same wall. Scaled by history length so a freshly-disoccluded
-            // (noisy) pixel blurs more freely and a converged one keeps its lighting edges.
-            float lumaSigma = 4.0 / max(histLen, 1.0);
+            // Edge-stopping weights: kernel * normal * depth * LUMA. The luma term stops bright bounce
+            // (a sun shaft on the floor) from blurring across a shadow boundary on the SAME flat surface
+            // that depth/normal can't see. It's scaled by history (a fresh pixel blurs freely) BUT the
+            // sigma must stay generous even when converged: diffuse GI is LOW-FREQUENCY, so an over-tight
+            // converged luma stop locks in the few-ray gather's high-frequency surface detail/speckle
+            // (the "beauty-render-like / dense speckle" GI). Make the sigma RELATIVE to the local luma
+            // (robust across exposure) with a floor, so within-surface detail smooths while genuine
+            // large lighting steps (>~50% luma change) still stop the blur.
+            float lumaSigma = max(0.5 * centreLuma, 0.01) * (1.0 + 2.0 / max(histLen, 1.0));
             float wKernel = kernel[x + 2] * kernel[y + 2];
             float wNormal = pow(max(dot(centreN, n), 0.0), NormalSigma);
             // Depth tolerance scales with view distance (perspective makes equal world steps
