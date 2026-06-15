@@ -11,6 +11,7 @@ namespace BallisticEngine.DX12;
 // Phase 1, the single highest-leverage thing to get right). No window needed.
 public sealed class Dx12OffscreenTarget : IDisposable {
     public const Format ColorFormat = Format.R8G8B8A8_UNorm;
+    public const Format DepthFormat = Format.D32_Float;
     public int Width { get; }
     public int Height { get; }
     public ID3D12Resource RenderTarget { get; }
@@ -18,10 +19,15 @@ public sealed class Dx12OffscreenTarget : IDisposable {
     readonly Dx12Device dev;
     readonly ID3D12DescriptorHeap rtvHeap;
     readonly CpuDescriptorHandle rtvHandle;
+    // Optional depth buffer (created when withDepth) — needed for any 3D pass.
+    readonly ID3D12Resource depthTarget;
+    readonly ID3D12DescriptorHeap dsvHeap;
+    readonly CpuDescriptorHandle dsvHandle;
+    public bool HasDepth => depthTarget != null;
     // Current resource state of the RT, tracked so transitions are correct.
     ResourceStates state = ResourceStates.RenderTarget;
 
-    public Dx12OffscreenTarget(Dx12Device device, int width, int height) {
+    public Dx12OffscreenTarget(Dx12Device device, int width, int height, bool withDepth = false) {
         dev = device;
         Width = width;
         Height = height;
@@ -38,27 +44,50 @@ public sealed class Dx12OffscreenTarget : IDisposable {
             DescriptorHeapType.RenderTargetView, 1));
         rtvHandle = rtvHeap.GetCPUDescriptorHandleForHeapStart();
         dev.Device.CreateRenderTargetView(RenderTarget, null, rtvHandle);
+
+        if (withDepth) {
+            var dDesc = ResourceDescription.Texture2D(DepthFormat, (uint)width, (uint)height,
+                mipLevels: 1, arraySize: 1);
+            dDesc.Flags = ResourceFlags.AllowDepthStencil;
+            var dClear = new ClearValue(DepthFormat, 1.0f, 0);
+            depthTarget = dev.Device.CreateCommittedResource(
+                HeapProperties.DefaultHeapProperties, HeapFlags.None, dDesc,
+                ResourceStates.DepthWrite, dClear);
+            dsvHeap = dev.Device.CreateDescriptorHeap(new DescriptorHeapDescription(
+                DescriptorHeapType.DepthStencilView, 1));
+            dsvHandle = dsvHeap.GetCPUDescriptorHandleForHeapStart();
+            dev.Device.CreateDepthStencilView(depthTarget, null, dsvHandle);
+        }
     }
 
-    // Clear to a color (linear-ish RGBA 0..1). Records + executes synchronously.
+    // Clear to a color (linear-ish RGBA 0..1), and the depth buffer to far (1.0) when present.
     public void Clear(float r, float g, float b, float a = 1f) {
         dev.ExecuteSync(cl => {
             TransitionTo(cl, ResourceStates.RenderTarget);
-            cl.OMSetRenderTargets(rtvHandle);
+            BindTargets(cl);
             cl.ClearRenderTargetView(rtvHandle, new Vortice.Mathematics.Color4(r, g, b, a));
+            if (HasDepth)
+                cl.ClearDepthStencilView(dsvHandle, ClearFlags.Depth, 1.0f, 0);
         });
     }
 
-    // Record arbitrary draw commands against this RTV (viewport/scissor set up here). Used by the
-    // triangle test and, later, the real passes. `record` runs with the RT bound and in RenderTarget state.
+    // Record arbitrary draw commands against this RTV (+DSV) (viewport/scissor set up here). `record`
+    // runs with the targets bound and the RT in RenderTarget state.
     public void RenderInto(Action<ID3D12GraphicsCommandList4> record) {
         dev.ExecuteSync(cl => {
             TransitionTo(cl, ResourceStates.RenderTarget);
             cl.RSSetViewport(0, 0, Width, Height);
             cl.RSSetScissorRect(Width, Height);
-            cl.OMSetRenderTargets(rtvHandle);
+            BindTargets(cl);
             record(cl);
         });
+    }
+
+    void BindTargets(ID3D12GraphicsCommandList4 cl) {
+        if (HasDepth)
+            cl.OMSetRenderTargets(rtvHandle, dsvHandle);
+        else
+            cl.OMSetRenderTargets(rtvHandle);
     }
 
     void TransitionTo(ID3D12GraphicsCommandList4 cl, ResourceStates target) {
@@ -135,6 +164,8 @@ public sealed class Dx12OffscreenTarget : IDisposable {
     }
 
     public void Dispose() {
+        dsvHeap?.Dispose();
+        depthTarget?.Dispose();
         rtvHeap.Dispose();
         RenderTarget.Dispose();
     }
