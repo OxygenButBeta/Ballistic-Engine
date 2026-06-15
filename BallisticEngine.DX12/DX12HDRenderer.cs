@@ -28,6 +28,21 @@ public sealed class DX12HDRenderer : HDRenderer {
     ID3D12RootSignature rootSig;
     ID3D12PipelineState pso;
 
+    // Skybox pass (background): its own root sig (CBV b0 + cube SRV t0 + clamp sampler) + PSO (LEqual,
+    // no depth write, cull none, SV_VertexID cube). Drawn after opaque in the same command list.
+    ID3D12RootSignature skyRootSig;
+    ID3D12PipelineState skyPso;
+    ID3D12Resource skyCb;          // upload heap, one SkyboxConstants, rewritten per frame
+    unsafe byte* skyCbMapped;
+    Dx12DescriptorHeap skySrvVisible;   // one cube SRV copied per frame
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct SkyboxConstants {
+        public Matrix4x4 ViewProjNoTranslate;
+        public Matrix4x4 SkyRotation;
+        public float Exposure; public Vector3 Pad;
+    }
+
     // Per-draw constant buffer ring: one upload heap sub-allocated in 256-byte slots, one slot per draw.
     ID3D12Resource cbRing;
     int cbSlotSize;
@@ -90,6 +105,50 @@ public sealed class DX12HDRenderer : HDRenderer {
         srvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
             cbSlotCount * MaterialSrvCount, shaderVisible: true);
+
+        BuildSkybox();
+    }
+
+    unsafe void BuildSkybox() {
+        // Root sig: CBV b0 + 1 cube SRV table (t0) + static clamp sampler.
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView,
+            new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
+        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
+        var sampler = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipLinear,
+            AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
+            AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        skyRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { sampler })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("Skybox.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "Skybox.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "Skybox.hlsl");
+        // Depth: test LEqual, NO write — fills only far-plane (uncovered) pixels behind opaque geometry.
+        var ds = DepthStencilDescription.Default;
+        ds.DepthWriteMask = DepthWriteMask.Zero;
+        ds.DepthFunc = ComparisonFunction.LessEqual;
+        var psoDesc = new GraphicsPipelineStateDescription {
+            RootSignature = skyRootSig, VertexShader = vs, PixelShader = ps,
+            InputLayout = null,   // SV_VertexID cube, no vertex buffer
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = RasterizerDescription.CullNone,
+            BlendState = BlendDescription.Opaque, DepthStencilState = ds,
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.ColorFormat },
+            DepthStencilFormat = Dx12OffscreenTarget.DepthFormat,
+            SampleDescription = new SampleDescription(1, 0),
+        };
+        skyPso = dev.Device.CreateGraphicsPipelineState(psoDesc);
+
+        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<SkyboxConstants>() + 255) & ~255;
+        skyCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+        skyCbMapped = skyCb.Map<byte>(0);
+        skySrvVisible = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true);
     }
 
     void BuildRootSignature() {
@@ -263,11 +322,49 @@ public sealed class DX12HDRenderer : HDRenderer {
                     slot++;
                 }
             }
+
+            // --- Skybox background (after opaque, same command list) ---
+            DrawSkybox(cl, view, proj);
         });
 
         RenderStats.Scene.DrawCalls = draws;
         RenderStats.Scene.Triangles = tris;
         return new RenderMetrics(draws, 0, (int)tris, 0, 0f);
+    }
+
+    // Draw the environment cubemap as the far-plane background (LEqual, no depth write) where opaque
+    // geometry didn't cover. No-op if the scene has no Skybox or its cubemap isn't a DX12 cube yet.
+    unsafe void DrawSkybox(ID3D12GraphicsCommandList4 cl, Matrix4x4 view, Matrix4x4 proj) {
+        if (Skybox.Active?.Cubemap is not Dx12Texture3D cube || cube.Resource is null)
+            return;
+
+        // View with translation stripped (the sky cube is centred on the camera).
+        Matrix4x4 viewNoT = view; viewNoT.M41 = 0; viewNoT.M42 = 0; viewNoT.M43 = 0;
+        OpenTK.Mathematics.Vector3 euler = Skybox.Active.RotationEuler;
+        Matrix4x4 rot = Matrix4x4.CreateRotationX(euler.X * (MathF.PI / 180f))
+                      * Matrix4x4.CreateRotationY(euler.Y * (MathF.PI / 180f))
+                      * Matrix4x4.CreateRotationZ(euler.Z * (MathF.PI / 180f));
+        // The skybox texels are HDR scaled by sky.Exposure; fold in the same pre-exposure the opaque pass
+        // uses so the sky brightness tracks the scene. (Skybox.Exposure defaults ~5000 for .hdr cubes.)
+        float skyExposure = Skybox.Active.Exposure * 1.0e-5f;
+
+        var sc = new SkyboxConstants {
+            ViewProjNoTranslate = Matrix4x4.Transpose(viewNoT * proj),
+            SkyRotation = Matrix4x4.Transpose(rot),
+            Exposure = skyExposure,
+        };
+        *(SkyboxConstants*)skyCbMapped = sc;
+
+        dev.Device.CopyDescriptorsSimple(1, skySrvVisible.Cpu(0), cube.SrvCpu,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
+
+        cl.SetGraphicsRootSignature(skyRootSig);
+        cl.SetPipelineState(skyPso);
+        cl.SetDescriptorHeaps(skySrvVisible.Heap);
+        cl.SetGraphicsRootConstantBufferView(0, skyCb.GPUVirtualAddress);
+        cl.SetGraphicsRootDescriptorTable(1, skySrvVisible.Gpu(0));
+        cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+        cl.DrawInstanced(36, 1, 0, 0);
     }
 
     // Copy one material texture's persistent SRV into the shader-visible table at `visibleSlot`. A null
