@@ -1,6 +1,5 @@
 using BallisticEngine.Serialization;
 using Hexa.NET.ImGui;
-using OpenTK.Graphics.OpenGL4;
 using OpenTK.Mathematics;
 using OpenTK.Windowing.Common;
 using OpenTK.Windowing.Desktop;
@@ -20,10 +19,8 @@ internal sealed class EditorApplication {
         ImGuiWindowFlags.NoBringToFrontOnFocus | ImGuiWindowFlags.NoSavedSettings;
 
     readonly IBallisticEngineRuntime runtime;
-    readonly GameWindow window;   // GL or DX12 host (both GameWindow + IBallisticEngineRuntime + IWindow)
+    readonly GameWindow window;   // the windowed DX12 host (GameWindow + IBallisticEngineRuntime + IWindow)
     readonly EngineBootstrap bootstrap;
-    // True when the host is the windowed DX12 swapchain: skip GL-only calls (backbuffer clear, Context VSync).
-    static bool IsDx12 => RenderBackendSelector.Selected == RenderBackend.Dx12;
     readonly ImGuiController imgui;
     readonly EditorCamera editorCamera = new();
     readonly EditorInput editorInput;
@@ -447,14 +444,8 @@ internal sealed class EditorApplication {
         if (SceneManager.IsPlaying)
             Coroutine.EndOfFramePump();
 
-        // GL clears + binds the default framebuffer here; DX12 already cleared the swapchain backbuffer in
-        // Dx12BallisticEngineWindow.OnRenderFrame (before this callback), so skip the GL path under DX12.
-        if (!IsDx12) {
-            GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
-            GL.ClearColor(0.05f, 0.05f, 0.06f, 1f);
-            GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
-        }
-
+        // The DX12 host already cleared the swapchain backbuffer in Dx12BallisticEngineWindow.OnRenderFrame
+        // (before this callback), so there's nothing to clear here.
         using (Profiler.Zone("Editor.ImGuiRender"))
             imgui.Render();
 
@@ -500,12 +491,8 @@ internal sealed class EditorApplication {
         double targetFreq = throttle ? IdleFps : (userCap <= 0 ? 0 : userCap);
         if (Math.Abs(window.UpdateFrequency - targetFreq) > 0.5) {
             window.UpdateFrequency = targetFreq;
-            // VSync must be off for a positive cap to take effect (matches ApplyFrameRateLimit). The DX12 host
-            // has no GL context (window.VSync would NRE); it presents vsync'd and the UpdateFrequency cap paces it.
-            if (!IsDx12)
-                window.VSync = targetFreq > 0
-                    ? OpenTK.Windowing.Common.VSyncMode.Off
-                    : OpenTK.Windowing.Common.VSyncMode.Adaptive;
+            // The DX12 host has no GL context (window.VSync would NRE); it presents vsync'd and the
+            // UpdateFrequency cap paces it, so there's no VSync mode to toggle here.
         }
     }
 
@@ -516,11 +503,9 @@ internal sealed class EditorApplication {
     public void ApplyFrameRateLimit() {
         int limit = EditorPrefs.Current.FrameRateLimit;
         if (limit <= 0) {
-            if (!IsDx12) window.VSync = OpenTK.Windowing.Common.VSyncMode.Adaptive;
-            window.UpdateFrequency = 0;   // uncapped; VSync paces it (DX12 presents vsync'd)
+            window.UpdateFrequency = 0;   // uncapped; the DX12 swapchain presents vsync'd, which paces it
         }
         else {
-            if (!IsDx12) window.VSync = OpenTK.Windowing.Common.VSyncMode.Off;
             window.UpdateFrequency = limit;
         }
     }

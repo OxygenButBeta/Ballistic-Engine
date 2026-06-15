@@ -12,18 +12,14 @@ internal class Program {
 
         BallisticEngine.Profiling.TracyProfiler.TryInstall("Ballistic Editor");
 
-        // Backend seam (DX12Migration.md ENDGAME 2): BALLISTIC_BACKEND=dx12 brings up the windowed DX12 host
-        // (swapchain + ImGui DX12 backend) instead of the GL window. GL is the default until the DX12 editor
-        // reaches parity (then GL is deleted). Both are GameWindow + IBallisticEngineRuntime + IWindow.
-        OpenTK.Windowing.Desktop.GameWindow window =
-            RenderBackendSelector.Selected == RenderBackend.Dx12
-                ? new Dx12BallisticEngineWindow(1600, 900)
-                : new GLBallisticEngineWindow(1600, 900);
+        // DX12-only host (GL deleted — DX12Migration.md ENDGAME 3): the windowed DX12 host (swapchain +
+        // ImGui DX12 backend) is GameWindow + IBallisticEngineRuntime + IWindow.
+        OpenTK.Windowing.Desktop.GameWindow window = new Dx12BallisticEngineWindow(1600, 900);
         _ = new EditorApplication(window, projectPath);
         try {
             window.Run();
         }
-        catch (Exception ex) when (RenderBackendSelector.Selected == RenderBackend.Dx12) {
+        catch (Exception ex) {
             // On a DX12 device-removal, surface the real cause (debug-layer messages + removed reason) instead
             // of the opaque HRESULT, so a GPU fault is diagnosable without a driver reset (run BALLISTIC_DX12_DEBUG=1).
             Console.Error.WriteLine("[DX12] FATAL: " + ex);

@@ -35,27 +35,18 @@ internal class Program {
 
         BallisticEngine.Profiling.TracyProfiler.TryInstall("Ballistic Runtime");
 
-        // Backend seam (DX12Migration.md ENDGAME 3): DX12 is the default host. With BALLISTIC_SCREENSHOT set
-        // we use the windowless headless host (deterministic offscreen capture — the verification path); a
-        // normal launch uses the windowed DX12 host (swapchain + present + Windows input). GL is reachable
-        // via BALLISTIC_BACKEND=gl only while the GL code still exists (deleted at the end of ENDGAME 3).
+        // DX12-only host (GL deleted — DX12Migration.md ENDGAME 3). With BALLISTIC_SCREENSHOT set we use the
+        // windowless headless host (deterministic offscreen capture — the verification path); a normal launch
+        // uses the windowed DX12 host (swapchain + present + Windows input).
         bool screenshotMode = Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT") is not null;
         IBallisticEngineRuntime runtime;
-        if (RenderBackendSelector.Selected == RenderBackend.Dx12) {
-            if (screenshotMode) {
-                Console.WriteLine("[Backend] DX12 host (headless — screenshot path).");
-                runtime = new Dx12HeadlessRuntime(player.Width, player.Height);
-            }
-            else {
-                Console.WriteLine("[Backend] DX12 host (windowed player).");
-                runtime = new Dx12WindowedRuntime(player.Width, player.Height,
-                    fullscreen: mode == WindowMode.Fullscreen,
-                    borderless: mode == WindowMode.Borderless,
-                    title: player.ProductName);
-            }
+        if (screenshotMode) {
+            Console.WriteLine("[Backend] DX12 host (headless — screenshot path).");
+            runtime = new Dx12HeadlessRuntime(player.Width, player.Height);
         }
         else {
-            runtime = new GLBallisticEngineWindow(player.Width, player.Height,
+            Console.WriteLine("[Backend] DX12 host (windowed player).");
+            runtime = new Dx12WindowedRuntime(player.Width, player.Height,
                 fullscreen: mode == WindowMode.Fullscreen,
                 borderless: mode == WindowMode.Borderless,
                 title: player.ProductName);

@@ -54,11 +54,10 @@ internal sealed class ImGuiController : IDisposable {
         ApplyGeometry(Scale);
         ApplyColors(EditorPrefs.Current.Accent);
 
-        // Pick the device backend. DX12 records into the editor swapchain's open UI command list; the
-        // swapchain is created after this ctor (in the window's OnLoad), so resolve it lazily at render time.
-        renderer = RenderBackendSelector.Selected == RenderBackend.Dx12
-            ? new ImGuiDx12Renderer(() => (window as Dx12BallisticEngineWindow)?.SwapChain?.CommandList)
-            : new ImGuiGLRenderer();
+        // DX12-only (GL deleted): the ImGui DX12 backend records into the editor swapchain's open UI command
+        // list; the swapchain is created after this ctor (in the window's OnLoad), so resolve it lazily at
+        // render time.
+        renderer = new ImGuiDx12Renderer(() => (window as Dx12BallisticEngineWindow)?.SwapChain?.CommandList);
         renderer.CreateDeviceResources();
 
         window.TextInput += e => ImGuiInput.OnTextInput((uint)e.Unicode);

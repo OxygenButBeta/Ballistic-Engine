@@ -2450,14 +2450,9 @@ internal sealed class InspectorPanel {
         if (guid != materialPreviewGuid || hash != materialPreviewHash || materialPreviewTex == 0) {
             try {
                 byte[] pixels = MaterialPreviewRenderer.Render(definition, MaterialPreviewSize);
-                if (IsDx12) {
-                    materialPreviewDx12?.Dispose();   // free the previous texture + its UiHeap slot
-                    materialPreviewDx12 = Dx12EditorPreview.UploadTexture(pixels, MaterialPreviewSize);
-                    materialPreviewTex = materialPreviewDx12.Handle;
-                }
-                else {
-                    materialPreviewTex = UploadPreviewTexture((int)materialPreviewTex, pixels, MaterialPreviewSize);
-                }
+                materialPreviewDx12?.Dispose();   // free the previous texture + its UiHeap slot
+                materialPreviewDx12 = Dx12EditorPreview.UploadTexture(pixels, MaterialPreviewSize);
+                materialPreviewTex = materialPreviewDx12.Handle;
                 materialPreviewGuid = guid;
                 materialPreviewHash = hash;
             }
@@ -2474,20 +2469,6 @@ internal sealed class InspectorPanel {
             ImGui.Image(EditorApplication.Tex(materialPreviewTex), new SysVec2(size, size));
             ImGui.Spacing();
         }
-    }
-
-    // Uploads RGBA pixels into a (reused) GL texture and returns its id.
-    static int UploadPreviewTexture(int existing, byte[] pixels, int size) {
-        int tex = existing != 0 ? existing : OpenTK.Graphics.OpenGL4.GL.GenTexture();
-        OpenTK.Graphics.OpenGL4.GL.BindTexture(OpenTK.Graphics.OpenGL4.TextureTarget.Texture2D, tex);
-        OpenTK.Graphics.OpenGL4.GL.TexImage2D(OpenTK.Graphics.OpenGL4.TextureTarget.Texture2D, 0,
-            OpenTK.Graphics.OpenGL4.PixelInternalFormat.Rgba, size, size, 0,
-            OpenTK.Graphics.OpenGL4.PixelFormat.Rgba, OpenTK.Graphics.OpenGL4.PixelType.UnsignedByte, pixels);
-        OpenTK.Graphics.OpenGL4.GL.TexParameter(OpenTK.Graphics.OpenGL4.TextureTarget.Texture2D,
-            OpenTK.Graphics.OpenGL4.TextureParameterName.TextureMinFilter, (int)OpenTK.Graphics.OpenGL4.TextureMinFilter.Linear);
-        OpenTK.Graphics.OpenGL4.GL.TexParameter(OpenTK.Graphics.OpenGL4.TextureTarget.Texture2D,
-            OpenTK.Graphics.OpenGL4.TextureParameterName.TextureMagFilter, (int)OpenTK.Graphics.OpenGL4.TextureMagFilter.Linear);
-        return tex;
     }
 
     void DrawMaterialEditor(string path, Guid guid) {

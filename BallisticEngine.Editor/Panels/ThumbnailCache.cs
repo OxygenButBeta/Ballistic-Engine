@@ -1,6 +1,5 @@
 using System.Runtime.InteropServices;
 using BallisticEngine.AssetPipeline;
-using OpenTK.Graphics.OpenGL4;
 
 namespace BallisticEngine.Editor;
 
@@ -57,15 +56,9 @@ internal sealed class ThumbnailCache {
     // Drops the GPU textures and re-queues; the DISK cache stays (staleness is mtime-based,
     // so reimported assets regenerate and unchanged ones reload instantly).
     public void InvalidateAll() {
-        if (IsDx12) {
-            foreach (var tex in dx12Textures.Values)
-                tex.Dispose();
-            dx12Textures.Clear();
-        }
-        else {
-            foreach (var texture in ready.Values.Where(t => t != 0))
-                GL.DeleteTexture((int)texture);
-        }
+        foreach (var tex in dx12Textures.Values)
+            tex.Dispose();
+        dx12Textures.Clear();
         ready.Clear();
         queued.Clear();
         pending.Clear();
@@ -73,15 +66,12 @@ internal sealed class ThumbnailCache {
 
     static string ThumbnailDirectory => Path.Combine(AssetDatabase.Project.LibraryPath, "Thumbnails");
 
-    // Upload the generated RGBA pixels to a GPU texture and return its ImGui handle. DX12 creates a UiHeap
-    // texture (tracked for disposal); GL creates a GL texture (its name is the handle).
+    // Upload the generated RGBA pixels to a DX12 UiHeap texture (tracked for disposal) and return its
+    // ImGui handle (the UiHeap GPU descriptor ptr).
     nint UploadHandle(Guid guid, byte[] pixels) {
-        if (IsDx12) {
-            var tex = Dx12EditorPreview.UploadTexture(pixels, Size);
-            dx12Textures[guid] = tex;
-            return tex.Handle;
-        }
-        return UploadTexture(pixels);
+        var tex = Dx12EditorPreview.UploadTexture(pixels, Size);
+        dx12Textures[guid] = tex;
+        return tex.Handle;
     }
 
     nint Load(Guid guid, string assetPath) {
@@ -155,18 +145,6 @@ internal sealed class ThumbnailCache {
         writer.Write(Magic);
         writer.Write((ushort)Size);
         writer.Write(pixels);
-    }
-
-    static int UploadTexture(byte[] pixels) {
-        int texture = GL.GenTexture();
-        GL.ActiveTexture(TextureUnit.Texture0);
-        GL.BindTexture(TextureTarget.Texture2D, texture);
-        GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, Size, Size, 0,
-            PixelFormat.Rgba, PixelType.UnsignedByte, pixels);
-        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
-        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
-        GL.BindTexture(TextureTarget.Texture2D, 0);
-        return texture;
     }
 
     static byte[] Downscale(in TextureData data) {
