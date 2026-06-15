@@ -24,6 +24,30 @@ public static class Dx12Backend {
     // the root sig must set the ...HeapDirectlyIndexed flag. Bump-allocated, Reset on a material rebuild.
     public static Dx12DescriptorHeap BindlessHeap { get; private set; }
 
+    // SHADER-VISIBLE heap dedicated to the EDITOR's ImGui present pass: the final scene/game color
+    // (DX12HDRenderer.ldr) SRV, the ImGui font atlas, and asset thumbnails/previews all live here so a
+    // SINGLE SetDescriptorHeaps(UiHeap) covers every ImGui draw and ImTextureID == a GPU descriptor ptr
+    // INTO this heap. Kept separate from BindlessHeap (which the offscreen GPU-driven passes bind) so the
+    // two never interfere — the ImGui pass runs on its own command list after the scene is done. Null in
+    // the headless/runtime path (no editor present); only the editor's swapchain host binds it.
+    public static Dx12DescriptorHeap UiHeap { get; private set; }
+
+    // Mirror a CPU-only SRV into the shader-visible UI heap; returns the slot index. The caller turns the
+    // slot into a GPU handle via UiHeap.Gpu(index) and feeds that ptr to ImGui as an ImTextureID. Re-copy
+    // into the SAME slot (RegisterUiAt) on resize to keep a stable handle without leaking slots.
+    public static int RegisterUi(CpuDescriptorHandle srcSrv) {
+        int idx = UiHeap.Allocate();
+        RegisterUiAt(idx, srcSrv);
+        return idx;
+    }
+
+    // Re-point an existing UI-heap slot at a (possibly recreated) source SRV — used when a resize rebuilds
+    // the underlying texture but the caller wants the GPU handle (ImTextureID) to stay constant.
+    public static void RegisterUiAt(int slot, CpuDescriptorHandle srcSrv) {
+        Device.Device.CopyDescriptorsSimple(1, UiHeap.Cpu(slot), srcSrv,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
+    }
+
     // Mirror a texture's persistent (CPU-only) SRV into the shader-visible bindless heap; returns the
     // bindless index the shader uses as ResourceDescriptorHeap[index]. Caller caches by texture.
     public static int RegisterBindless(CpuDescriptorHandle srcSrv) {
@@ -42,6 +66,9 @@ public static class Dx12Backend {
         // Shader-visible bindless table: a few thousand texture descriptors (whole-mesh scenes use a few
         // hundred unique maps × 6 slots). Bump-allocated; Reset() + re-register on a material-set change.
         BindlessHeap = new Dx12DescriptorHeap(device, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 16384, shaderVisible: true);
+        // Editor ImGui present heap (scene/game color + font atlas + thumbnails). Generous so a busy asset
+        // browser's thumbnails all fit; only the editor swapchain host populates it (null cost headless).
+        UiHeap = new Dx12DescriptorHeap(device, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 16384, shaderVisible: true);
     }
 
     // Map the engine's TextureFormat to a DXGI format. sRGB color maps (Diffuse/Emissive) use the
@@ -64,6 +91,8 @@ public static class Dx12Backend {
         SrvStore = null;
         BindlessHeap?.Dispose();
         BindlessHeap = null;
+        UiHeap?.Dispose();
+        UiHeap = null;
         Device = null;
     }
 }

@@ -412,8 +412,27 @@ public sealed class DX12HDRenderer : HDRenderer {
         dev = device;
     }
 
-    public override RenderHandle SceneColorHandle => RenderHandle.None;
-    public override RenderHandle GameColorHandle => RenderHandle.None;
+    // Editor viewport display: the final LDR composite (`ldr`) is mirrored into the shared shader-visible
+    // UI heap (Dx12Backend.UiHeap) so the editor's ImGui pass can sample it via ImGui.Image. SceneColorHandle/
+    // GameColorHandle return the cached GPU descriptor ptr (a trivial field read — no per-frame descriptor
+    // churn, which is banned in the hot path). Single `ldr` today, so Scene and Game alias the same texture
+    // (the editor renders one ActiveTarget per frame). RenderHandle.None until the first allocation.
+    int ldrUiSlot = -1;
+    nint ldrUiHandle;
+    public override RenderHandle SceneColorHandle => new(ldrUiHandle);
+    public override RenderHandle GameColorHandle => new(ldrUiHandle);
+    // DX12 textures are top-down → the editor must NOT flip V (unlike GL's bottom-up textures).
+    public override bool DisplayTextureTopDown => true;
+
+    // Mirror the LDR composite's SRV into the shared UI heap at a STABLE slot (re-pointed on resize so the
+    // ImGui handle stays constant). Headless registers too — harmless; the handle is just never sampled
+    // without an editor present. Requires `ldr` to have been created colorReadable (so it owns an SRV).
+    void RegisterLdrUi() {
+        if (Dx12Backend.UiHeap == null) return;
+        if (ldrUiSlot < 0) ldrUiSlot = Dx12Backend.UiHeap.Allocate();
+        Dx12Backend.RegisterUiAt(ldrUiSlot, ldr.ColorSrvCpu);
+        ldrUiHandle = (nint)Dx12Backend.UiHeap.Gpu(ldrUiSlot).Ptr;
+    }
 
     public override void ResizeSceneTarget(int width, int height) => Resize(width, height);
     public override void ResizeGameTarget(int width, int height) => Resize(width, height);
@@ -438,7 +457,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         // The HDR scene target no longer owns depth — the G-buffer owns the scene depth (deferred path).
         target = new Dx12OffscreenTarget(dev, internalW, internalH, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
-        ldr = new Dx12OffscreenTarget(dev, outputW, outputH);   // LDR composite output (display res)
+        ldr = new Dx12OffscreenTarget(dev, outputW, outputH, colorReadable: true);   // LDR composite output (display res)
+        RegisterLdrUi();
         gbuffer = new Dx12GBuffer(dev, internalW, internalH);
         motionPrevValid = false;                                // prev view*proj is stale after a realloc
         if (bloomRootSig != null) AllocBloomTargets();          // half-res bloom ping-pong follows size
@@ -505,7 +525,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         outputW = targetW; outputH = targetH;
         target = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
-        ldr = new Dx12OffscreenTarget(dev, targetW, targetH);
+        ldr = new Dx12OffscreenTarget(dev, targetW, targetH, colorReadable: true);
+        RegisterLdrUi();
         gbuffer = new Dx12GBuffer(dev, targetW, targetH);
         BuildRootSignature();
         BuildPipeline();
@@ -1568,6 +1589,12 @@ public sealed class DX12HDRenderer : HDRenderer {
             if (ssaoOn) DrawSsao(view, proj);
             DrawComposite(ssaoOn, target);
         }
+
+        // Editor display path: leave the LDR composite in PixelShaderResource so the editor's ImGui pass can
+        // sample it via SceneColorHandle/GameColorHandle THIS frame. The player (PresentToScreen) keeps it in
+        // RenderTarget for SaveFrame's readback; either way next frame's DrawComposite transitions it back.
+        if (!PresentToScreen)
+            ldr.ColorToShaderResource();
 
         // Advance the jitter phase (used by both TAA and FSR) and remember this frame's UNJITTERED view*proj
         // for next frame's motion vectors (independent of TAA, since FSR replaces TAA but still needs motion).

@@ -62,6 +62,11 @@ public abstract class HDRenderer {
     public abstract RenderHandle SceneColorHandle { get; }
     public abstract RenderHandle GameColorHandle { get; }
 
+    // Whether the Scene/Game color textures are stored top-down (row 0 = top of image). GL textures are
+    // bottom-up (false → the editor flips V when sampling them in ImGui::Image); DX12 textures are
+    // top-down (true → no flip). The editor reads this to orient the viewport image correctly per backend.
+    public virtual bool DisplayTextureTopDown => false;
+
     // Resize each offscreen target to match its editor panel.
     public abstract void ResizeSceneTarget(int width, int height);
     public abstract void ResizeGameTarget(int width, int height);

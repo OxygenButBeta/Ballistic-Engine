@@ -150,6 +150,14 @@ public sealed class Dx12Device : IDisposable {
         }
     }
 
+    // Block until the GPU has finished ALL previously-submitted queue work. Public for the swapchain:
+    // ResizeBuffers requires every backbuffer reference released AND the GPU idle, and Present in the
+    // synchronous editor model waits here so the next frame's backbuffer is safe to reuse. Takes the
+    // submit gate so it never races ExecuteSync's fenceValue increment.
+    public void Flush() {
+        lock (submitGate) WaitForGpu();
+    }
+
     void WaitForGpu() {
         ulong target = ++fenceValue;
         Queue.Signal(fence, target);
