@@ -4,13 +4,15 @@
 // bloom exist (they need the HDR signal before tonemapping). Fullscreen triangle into the LDR backbuffer.
 
 cbuffer CompositeConstants : register(b0) {
-    float Exposure;       // linear pre-tonemap scale (auto-exposure drives this; fixed stand-in for now)
+    float Exposure;       // manual exposure (used when AutoExposure < 0.5); fixed stand-in fallback
     float BloomIntensity; // 0 = no bloom
-    float2 _pad;
+    float AutoExposure;   // > 0.5 = derive exposure from the avg-luminance metering target
+    float ExposureKey;    // middle-grey key for auto-exposure (~0.18 * tuning)
 };
 
 Texture2D HdrColor : register(t0);
 Texture2D BloomTex : register(t1);
+Texture2D AvgLum   : register(t2);   // 1×1 geometric-mean scene luminance (auto-exposure metering)
 SamplerState LinearClamp : register(s0);
 
 struct VSOut { float4 Position : SV_Position; float2 Uv : TEXCOORD0; };
@@ -31,6 +33,13 @@ float4 PSMain(VSOut i) : SV_Target {
     float3 hdr = HdrColor.SampleLevel(LinearClamp, i.Uv, 0).rgb;
     if (BloomIntensity > 0.0)
         hdr += BloomTex.SampleLevel(LinearClamp, i.Uv, 0).rgb * BloomIntensity;
-    float3 mapped = ACESFilm(hdr * Exposure);
+
+    // Exposure: auto (Key / average scene luminance) or the manual constant.
+    float exposure = Exposure;
+    if (AutoExposure > 0.5) {
+        float avgLum = max(AvgLum.SampleLevel(LinearClamp, float2(0.5, 0.5), 0).r, 1e-4);
+        exposure = ExposureKey / avgLum;
+    }
+    float3 mapped = ACESFilm(hdr * exposure);
     return float4(pow(mapped, 1.0 / 2.2), 1.0);   // sRGB-encode for the UNORM backbuffer/BMP
 }
