@@ -217,8 +217,7 @@ doors (MCP/editor/runtime hooks). Native deps already vendored under native/ (OI
    members never deserialized at runtime (silent default). Punctual SHADOWS = later.
 
 **B. Screen-space post (the remaining GL post-FX, ported to DX12 — all Volume overrides):**
-5. SSR (screen-space reflections, reads G-buffer; half-res march + depth-aware upsample, GL parity).
-6. TAA (the AA; reuses jitter that FSR will also consume — plumb jitter ONCE, not double-applied).
+5. ✅ SSR — DONE. 6. ✅ TAA — DONE (Halton jitter, YCoCg variance clip, Catmull-Rom history; jitter stored for FSR reuse).
 7. Sky clouds / cirrus / stars (finish the procedural sky to GL parity).
 8. Transparents forward pass (after deferred — deferred can't blend).
 
