@@ -29,6 +29,11 @@ public sealed class DirectXRenderAsset : RenderAsset {
             bool pass = DX12.Dx12ComputeProbe.SelfTest(device);
             Environment.Exit(pass ? 0 : 1);
         }
+        // Bindless-foundation self-test door (SM6.6 ResourceDescriptorHeap) — see Dx12BindlessProbe.
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_BINDLESS_TEST") == "1") {
+            bool pass = DX12.Dx12BindlessProbe.SelfTest(device);
+            Environment.Exit(pass ? 0 : 1);
+        }
 
         Renderer = new DX12HDRenderer(device);
         Renderer.Initialize();

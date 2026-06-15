@@ -17,12 +17,31 @@ public static class Dx12Backend {
     // descriptor here at upload. The renderer copies these into a shader-visible heap per draw.
     public static Dx12DescriptorHeap SrvStore { get; private set; }
 
+    // LARGE shader-visible CBV_SRV_UAV heap for SM6.6 BINDLESS (ResourceDescriptorHeap[idx] in HLSL). The
+    // GPU-driven path mirrors each material texture's persistent SrvStore descriptor into here once; the
+    // material's stored index lets a single ExecuteIndirect draw submeshes with DIFFERENT materials (no
+    // per-draw descriptor-table rebinding). Bound via SetDescriptorHeaps for the GPU-driven geometry pass;
+    // the root sig must set the ...HeapDirectlyIndexed flag. Bump-allocated, Reset on a material rebuild.
+    public static Dx12DescriptorHeap BindlessHeap { get; private set; }
+
+    // Mirror a texture's persistent (CPU-only) SRV into the shader-visible bindless heap; returns the
+    // bindless index the shader uses as ResourceDescriptorHeap[index]. Caller caches by texture.
+    public static int RegisterBindless(CpuDescriptorHandle srcSrv) {
+        int idx = BindlessHeap.Allocate();
+        Device.Device.CopyDescriptorsSimple(1, BindlessHeap.Cpu(idx), srcSrv,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
+        return idx;
+    }
+
     public static void Initialize(Dx12Device device) {
         Device = device;
         Dx12RenderContext.Device = device;
         // 4096 persistent texture descriptors is plenty for a scene's material set (SunTemple/Bistro
         // have a few hundred unique maps). Grow if a scene ever needs more.
         SrvStore = new Dx12DescriptorHeap(device, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4096, shaderVisible: false);
+        // Shader-visible bindless table: a few thousand texture descriptors (whole-mesh scenes use a few
+        // hundred unique maps × 6 slots). Bump-allocated; Reset() + re-register on a material-set change.
+        BindlessHeap = new Dx12DescriptorHeap(device, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 16384, shaderVisible: true);
     }
 
     // Map the engine's TextureFormat to a DXGI format. sRGB color maps (Diffuse/Emissive) use the
@@ -43,6 +62,8 @@ public static class Dx12Backend {
     public static void Shutdown() {
         SrvStore?.Dispose();
         SrvStore = null;
+        BindlessHeap?.Dispose();
+        BindlessHeap = null;
         Device = null;
     }
 }
