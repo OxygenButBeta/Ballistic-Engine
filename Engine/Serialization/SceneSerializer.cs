@@ -363,8 +363,24 @@ public static class SceneSerializer {
         if (targetType.IsInstanceOfType(raw))
             return raw;
 
+        // Math types nested inside a component's `Members` dict (e.g. PointLight.Color) arrive as a
+        // raw {x,y,z,...} mapping, NOT a typed Vector — the YamlDotNet converters only fire for a
+        // strongly-typed target, and Members is Dictionary<string, object>. Convert the mapping here.
+        // (Without this, every Vector* / Quaternion COMPONENT member silently kept its default.)
+        if (raw is IDictionary<object, object> map) {
+            if (targetType == typeof(Vector2)) return new Vector2(MapF(map, "x"), MapF(map, "y"));
+            if (targetType == typeof(Vector3)) return new Vector3(MapF(map, "x"), MapF(map, "y"), MapF(map, "z"));
+            if (targetType == typeof(Vector4)) return new Vector4(MapF(map, "x"), MapF(map, "y"), MapF(map, "z"), MapF(map, "w"));
+            if (targetType == typeof(Quaternion)) return new Quaternion(MapF(map, "x"), MapF(map, "y"), MapF(map, "z"), MapF(map, "w"));
+        }
+
         return Coerce(raw, targetType);
     }
+
+    // Read a float component from a YAML mapping (values arrive as strings from YamlDotNet).
+    static float MapF(IDictionary<object, object> map, string key) =>
+        map.TryGetValue(key, out object v) && v is not null &&
+        float.TryParse(v.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out float f) ? f : 0f;
 
     static object LoadAsset(string reference, Type targetType) {
         MethodInfo loadRef = typeof(AssetDatabase).GetMethod(nameof(AssetDatabase.LoadRef))!
