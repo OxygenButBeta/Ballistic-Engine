@@ -123,13 +123,23 @@ matrices + bias; IBL/shadow SRV table now t6..t9 (shadow array t9). VERIFIED on 
 directional shadows, mean 87→66, no acne; ref dx12_suntemple_shadows.png) + Bistro. 4 cascades re-render
 every frame (caching = later perf). **DX12 lighting model now complete: PBR + sky + IBL + shadows.**
 
-**NEXT (DX12, each committable; user directive = port ALL GL features):** **volumetric fog
-(user-requested)** — froxel/raymarch height fog + light scattering, reuses the shadow cascades for
-shadowed shafts; sky clouds/cirrus/stars (follow-up to the atmosphere); rest of post-FX (bloom/TAA/SSAO/
-SSR/auto-exposure, SSGI LAST); alpha-cutout caster shadows (foliage); cascade caching (perf); interleave
-mesh verts (perf); finally editor→DX12 + delete GL wholesale (incl. the GL-shaped bind methods +
-RenderContext the DX12 path no-ops). Exposure is a fixed 1e-5 stand-in until auto-exposure. DON'T break
-the editor — it renders on GL; delete GL only at the very end.
+**🟢 DX12 VOLUMETRIC FOG (2026-06-15, user-requested):** full-screen height-fog post pass
+(VolumetricFog.hlsl) — reconstruct world pos from scene depth, raymarch toward camera through exponential
+height fog, in-scatter shadowed sun (HG phase via the cascade array) + sky ambient, analytic tail past the
+march, sun-disk glow; output (scatter, transmittance) blended over color (dest*transmittance + scatter).
+Infra: Dx12OffscreenTarget depth made TYPELESS (D32 DSV + R32 SRV) so post reads depth; DepthTo*/
+RenderColorOnly transitions. BALLISTIC_FX_VOLUMETRIC=1 forces on (GL harness parity). VERIFIED on
+BistroExterior — aerial perspective, distant buildings haze out (mean 26→38; ref dx12_bistro_fog.png).
+Single-pass at physical default density; half-res+temporal + sky-ambient readback are follow-ups.
+
+**DX12 stack now: PBR + procedural sky + IBL + cascaded shadows + volumetric fog, on 2 real scenes.**
+
+**NEXT (DX12, each committable; user directive = port ALL GL features):** post-FX tonemap pipeline —
+auto-exposure (replace the fixed 1e-5 stand-in) + bloom + TAA; then SSAO + SSR (SSGI LAST); sky
+clouds/cirrus/stars (follow-up to the atmosphere); alpha-cutout caster shadows (foliage); cascade caching
++ interleave mesh verts (perf); finally editor→DX12 + delete GL wholesale (incl. the GL-shaped bind
+methods + RenderContext the DX12 path no-ops). DON'T break the editor — it renders on GL; delete GL only
+at the very end.
 
 The frozen GL parity image: `Docs/Plans/dx12-refs/gl_suntemple_baseline.png` (mean RGB 96.7,81.9,65.6).
 
