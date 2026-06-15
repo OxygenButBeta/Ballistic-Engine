@@ -4,6 +4,47 @@ Branch: `dx12-renderer` (forked from `635584b2` on `renderer-good-baseline`; not
 the full GL renderer + the abandoned Lumen work stay on `renderer-good-baseline` as a reference
 archive and a fallback).
 
+---
+
+## ⏩ HANDOFF / RESUME POINT (read this first — 2026-06-15)
+
+**Where we are:** Phase 0 (abstraction prep) + Phase 1 core (DX12 device, raster pipeline, screenshot
+readback) + Phase 2 partial (3D lit cube: mesh buffers, depth, MVP CBV, N·L lighting) are DONE,
+COMMITTED, and VERIFIED on the `dx12-renderer` branch (12 commits since baseline). All 3 projects build
+clean (`BallisticEngine.csproj`, `BallisticEngine.Runtime`, `BallisticEngine.DX12`). GL path untouched.
+
+**The DX12 backend already works** (offscreen, no window yet): device + command queue/list/fence,
+HLSL→DXIL compile (Vortice.Dxc), root sig + PSO + draw, depth buffer, vertex/index buffers, MVP
+constant buffer, and byte-exact GPU→CPU BMP readback. Verified visually: an RGB triangle and a lit
+3D cube (e:/tmp/dx12_cube_cull.png). DXR Tier1_1 confirmed on the RX 9070 XT.
+
+**Files in BallisticEngine.DX12/:** Dx12Probe (device/DXR check), Dx12Device (device+queue+fence+
+ExecuteSync), Dx12OffscreenTarget (RTV + optional DSV depth + Clear + SaveBmp readback),
+Dx12ShaderCompiler (HLSL→DXIL), EmbeddedShaderSource (reads embedded .hlsl), Dx12TriangleTest,
+Dx12LitCubeTest, Shaders/{Triangle,LitCube}.hlsl.
+
+**Smoke-test harness:** a throwaway exe at `%TEMP%/bal-dx12-test/` (test.csproj + Program.cs) that
+ProjectReferences BallisticEngine.DX12 and runs a render → BMP. Recreate it if gone (see any commit
+message for the pattern). The real verification is BMP → PNG via PIL + `e:/tmp/rgbstat.py`.
+
+**⭐ NEXT STEP (start Phase 2d here):** build `DirectXRenderAsset : RenderAsset` + `DX12HDRenderer :
+HDRenderer` as the real second backend (the cube test proved the pieces; now wire them behind the
+abstraction). Then port the engine's real mesh upload + the minimal material to feed a real `.scene`.
+The seam is ready (Phase 0 cleaned it: RenderAsset.Current factory, RenderHandle, BufferUsage). Goal:
+render an actual engine scene (SunTemple) on DX12 and `bal imgdiff` vs GL (perceptual budget, not
+byte — see the verification note at the bottom). After that: shadows + post (Phase 3, SSGI LAST),
+GPU-driven (Phase 4), then THE PAYOFF — FSR upscaling (Phase 5) and DXR GI + NRD (Phase 6), editor
+to DX12 + retire GL (Phase 7).
+
+**Carry-overs / gotchas locked in:** System.Numerics for DX12 (SIMD + DX z∈[0,1]); TRANSPOSE matrices
+on CBV upload (HLSL float4x4 is column-major); Vortice quirks — CreateDXGIFactory1 (not Factory2+debug),
+generic CreateCommandList<T>, GetCopyableFootprints (plural, array overload), Map<T>(0,len)→Span,
+RasterizerDescription presets are CullNone/CullClockwise/CullCounterClockwise (NO CullBack), ID3D12Debug
+in Vortice.Direct3D12.Debug. Lumen NOT carried; SSGI LAST. Editor build fails while the editor is OPEN
+(DLL lock) — build it with `-p:BaseOutputPath=obj/compilecheck/` to compile-check.
+
+---
+
 ## Decision & motive (settled with the user)
 
 Migrate the RENDERER from OpenGL 4.6 (OpenTK) to **DirectX 12 + DXR** via **Vortice.Windows**.
