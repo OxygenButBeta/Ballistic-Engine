@@ -88,11 +88,20 @@ Frag.glsl; ref dx12_suntemple_pbr.png); full pre-baked mip-chain texture upload 
 E_FAIL was the shared command list, not the mip math — dedicated upload queue fixed it). SunTemple renders
 with proper specular + crisp mipped textures, brightness near baseline.
 
-**NEXT (DX12, each committable):** skybox + IBL ambient (SkyboxConstants struct, drop the per-name uniform
-API — the SkyboxRenderer is the only engine uniform caller); interleave the mesh vertex buffer (perf);
-cascaded shadows (Phase 3 start); then post-FX (tonemap/bloom/TAA/SSAO/SSR/volumetric, SSGI LAST);
-finally editor→DX12 + delete GL wholesale. Exposure is a fixed 1e-5 stand-in (BALLISTIC_DX12_EXPOSURE to
-override) until auto-exposure. Editor still renders on GL (don't break it — delete GL only at the end).
+**DONE since PBR (committed):** skybox background pass — DX12 owns its sky PSO + cube draw + a typed
+SkyboxConstants CBV (NOT the GL per-name uniform API), LEqual/no-depth-write at the far plane. Correct by
+construction; invisible in the enclosed SunTemple interior view (no far-plane pixels), so a sky-visible
+scene is needed to eyeball it.
+
+**Both backends build + run; GL has ZERO regressions** (SunTemple GL draws=3 unchanged). DX12 via
+BALLISTIC_BACKEND=dx12; GL is still default + the editor's renderer.
+
+**NEXT (DX12, each committable):** IBL ambient from the env cube (irradiance + prefilter + BRDF LUT
+precompute, replace the flat ambient — affects every pixel, biggest remaining quality gap); interleave
+the mesh vertex buffer (perf); cascaded shadows (Phase 3 start); post-FX (tonemap/bloom/TAA/SSAO/SSR/
+volumetric, SSGI LAST); finally editor→DX12 + delete GL wholesale (incl. the GL-shaped bind methods +
+RenderContext the DX12 path currently no-ops). Exposure is a fixed 1e-5 stand-in (BALLISTIC_DX12_EXPOSURE
+to override) until auto-exposure. DON'T break the editor — it renders on GL; delete GL only at the very end.
 
 The frozen GL parity image: `Docs/Plans/dx12-refs/gl_suntemple_baseline.png` (mean RGB 96.7,81.9,65.6).
 
