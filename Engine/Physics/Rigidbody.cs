@@ -36,6 +36,9 @@ public class Rigidbody : Behaviour {
     readonly List<Collider> boundColliders = new(capacity: 4);
     Vector3 pendingForce;
     Vector3 pendingTorque;
+    // Forces applied at a world point (wheel suspension, thrusters): kept as (force, point) pairs and
+    // integrated as point impulses next fixed step, so they produce the right linear AND angular push.
+    readonly List<(Vector3 Force, Vector3 Point)> pendingForcesAtPoint = new(capacity: 4);
 
     // The transform pose as of the last physics sync, re-read THROUGH the transform so the
     // next pre-step's comparison hits the same float path (untouched transform == bitwise
@@ -78,6 +81,12 @@ public class Rigidbody : Behaviour {
     // Continuous force/torque in newtons; accumulated and applied over the next fixed step(s).
     public void AddForce(Vector3 force) => pendingForce += force;
     public void AddTorque(Vector3 torque) => pendingTorque += torque;
+
+    // Continuous force in newtons applied at a WORLD point — produces both linear acceleration and a
+    // torque about the center of mass (an off-center push spins the body). Accumulated and integrated
+    // next fixed step. This is the workhorse for raycast vehicle suspension/grip and thrusters.
+    public void AddForceAtPosition(Vector3 force, Vector3 worldPoint) =>
+        pendingForcesAtPoint.Add((force, worldPoint));
 
     // Instantaneous impulses (kg·m/s).
     public void AddImpulse(Vector3 impulse) => body?.ApplyImpulse(impulse);
@@ -124,6 +133,7 @@ public class Rigidbody : Behaviour {
         boundColliders.Clear();
         pendingForce = Vector3.Zero;
         pendingTorque = Vector3.Zero;
+        pendingForcesAtPoint.Clear();
 
         Vector3 worldScale = transform.WorldMatrix.ExtractScale();
         var parts = new List<PhysicsShapePart>(capacity: 4);
@@ -260,6 +270,11 @@ public class Rigidbody : Behaviour {
         if (pendingTorque != Vector3.Zero) {
             body.ApplyAngularImpulse(pendingTorque * dt);
             pendingTorque = Vector3.Zero;
+        }
+        if (pendingForcesAtPoint.Count > 0) {
+            foreach ((Vector3 force, Vector3 point) in pendingForcesAtPoint)
+                body.ApplyImpulse(force * dt, point); // point impulse → linear + torque about COM
+            pendingForcesAtPoint.Clear();
         }
 
         // Maintenance only below — never wake a sleeping body for it. (Sleeping bodies are

@@ -424,6 +424,93 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             ? staticsByHandle.GetValueOrDefault(collidable.StaticHandle.Value)
             : bodiesByHandle.GetValueOrDefault(collidable.BodyHandle.Value);
 
+    // ---- Shape-cast (sweep) -------------------------------------------------
+
+    struct ClosestSweepHitHandler : ISweepHitHandler {
+        public float T;
+        public Vector3 Location;
+        public Vector3 Normal;
+        public CollidableReference Collidable;
+        public bool Hit;
+        public int LayerMask;
+        public BepuPhysicsWorld World;
+
+        public bool AllowTest(CollidableReference collidable) =>
+            LayerMask == ~0 || (LayerMask & (1 << World.GetMaterial(collidable).Layer)) != 0;
+        public bool AllowTest(CollidableReference collidable, int child) => true;
+
+        public void OnHit(ref float maximumT, float t, in Vector3 hitLocation, in Vector3 hitNormal,
+            CollidableReference collidable) {
+            if (t < maximumT)
+                maximumT = t; // clip the traversal to the nearest hit so far
+            if (t >= T)
+                return;
+            T = t;
+            Location = hitLocation;
+            Normal = hitNormal;
+            Collidable = collidable;
+            Hit = true;
+        }
+
+        // Shape already overlapping at the start of the sweep: treat as a zero-distance hit.
+        public void OnHitAtZeroT(ref float maximumT, CollidableReference collidable) {
+            maximumT = 0f;
+            T = 0f;
+            Location = default;
+            Normal = default;
+            Collidable = collidable;
+            Hit = true;
+        }
+    }
+
+    public bool ShapeCast(PhysicsShape shape, TkVector3 position, Quaternion rotation,
+        TkVector3 direction, float maxDistance, int layerMask, out PhysicsRayHit hit) {
+        hit = default;
+        if (Simulation is null)
+            return false;
+
+        float dirLen = direction.Length();
+        if (dirLen < 1e-6f || maxDistance <= 0f)
+            return false;
+        TkVector3 dir = direction / dirLen; // unit velocity → sweep T equals travel distance
+
+        var pose = new RigidPose(ToNumerics(position), ToNumerics(rotation));
+        var velocity = new BodyVelocity { Linear = ToNumerics(dir) };
+        var handler = new ClosestSweepHitHandler { T = float.MaxValue, LayerMask = layerMask, World = this };
+
+        // Bepu's Sweep is generic over the (unmanaged) convex shape type, so dispatch per kind.
+        // Concave meshes are not valid sweep shapes — reject them like a dynamic mesh body.
+        switch (shape) {
+            case BoxShape box:
+                Simulation.Sweep(MakeBox(box), pose, velocity, maxDistance, bufferPool, ref handler);
+                break;
+            case SphereShape sphere:
+                Simulation.Sweep(MakeSphere(sphere), pose, velocity, maxDistance, bufferPool, ref handler);
+                break;
+            case CapsuleShape capsule:
+                Simulation.Sweep(MakeCapsule(capsule), pose, velocity, maxDistance, bufferPool, ref handler);
+                break;
+            default:
+                Debugging.LogError($"Physics: ShapeCast needs a convex shape (box/sphere/capsule); got {shape?.GetType().Name}.");
+                return false;
+        }
+
+        if (!handler.Hit)
+            return false;
+
+        hit.Distance = handler.T;
+        hit.Point = position + dir * handler.T;
+        // Sweep returns the contact location too; prefer it when present (more accurate than the
+        // shape-origin projection above for an off-axis touch).
+        TkVector3 location = ToOpenTK(handler.Location);
+        if (location.LengthSquared() > 0f)
+            hit.Point = location;
+        TkVector3 normal = ToOpenTK(handler.Normal);
+        hit.Normal = normal.LengthSquared() > 0f ? normal.Normalized() : -dir;
+        hit.Body = Lookup(handler.Collidable);
+        return true;
+    }
+
     // ---- Overlap queries ----------------------------------------------------
 
     // Broadphase AABB sweep collecting collidables whose bounds intersect the query box, layer- and

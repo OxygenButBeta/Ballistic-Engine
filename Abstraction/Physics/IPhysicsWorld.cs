@@ -70,6 +70,14 @@ public interface IPhysicsWorld {
     // layerMask: only bodies whose Layer bit is set are tested (~0 = hit everything).
     bool Raycast(Vector3 origin, Vector3 direction, float maxDistance, int layerMask, out PhysicsRayHit hit);
 
+    // Shape-cast (sweep): slide a convex shape (sphere/box/capsule) from (position, rotation) along
+    // `direction` for up to maxDistance, returning the first body it touches. Unlike a ray, this has
+    // THICKNESS — it catches contacts a thin ray would miss (a wheel finding the ground, a character
+    // probing a step). hit.Distance is how far the shape traveled before contact; Point/Normal are at
+    // the touch. Mesh/concave shapes are not valid sweep shapes (convex only). layerMask as in Raycast.
+    bool ShapeCast(PhysicsShape shape, Vector3 position, Quaternion rotation, Vector3 direction,
+        float maxDistance, int layerMask, out PhysicsRayHit hit);
+
     // Overlap queries: collect every body whose shape intersects the volume and whose Layer is in
     // the mask. Results append to `results` (caller-cleared); returns the count. Used by
     // Physics.OverlapSphere/OverlapBox. Triggers are included (Unity parity).
