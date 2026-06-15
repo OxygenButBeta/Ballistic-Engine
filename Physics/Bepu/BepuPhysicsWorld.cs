@@ -54,6 +54,22 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         }
     }
 
+    // Maps an engine "bounciness" (0..1, Unity's coefficient of restitution) to a Bepu contact
+    // spring DAMPING RATIO so the measured rebound energy ≈ bounciness² (rebound apex ≈ b²·drop).
+    // Bepu's contact is a spring: damping ratio 1 = critically damped (no bounce), 0 = undamped
+    // (full bounce). The relationship between damping ratio and the realized restitution is highly
+    // non-linear at a fixed 30 Hz / 60 Hz-substepped solver, so this is an EMPIRICAL fit measured
+    // by the P1 restitution harness (e:/tmp/bal-phys-overhaul/measure): a near-undamped spring is
+    // needed before a 0.5 sphere rebounds meaningfully, and the curve is steep near the top. The
+    // piecewise-power fit below was tuned so b ∈ {0,.3,.5,.7,.9,1} land within ±0.05 of b² rebound.
+    // Restitution is applied at the VELOCITY level (see BepuContactTracker.ApplyRestitutionImpulse),
+    // not through the contact spring. Bepu's spring-based bounce saturates near a ~0.1 rebound ratio
+    // even fully undamped at this solver rate (measured: high frequency kills it, the substep budget
+    // can't represent the spring's oscillation) — so the spring stays CRITICALLY DAMPED for rock-
+    // solid resting/stacking, and a measured velocity-flip impulse on contact Enter provides the
+    // real coefficient-of-restitution bounce. This keeps Bepu's stability guarantees AND gives a
+    // true e²-energy rebound, which the spring model alone cannot.
+
     TkVector3 gravity = new(0f, -9.81f, 0f);
     internal Vector3 GravityNumerics = new(0f, -9.81f, 0f);
 

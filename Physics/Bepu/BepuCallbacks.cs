@@ -45,12 +45,12 @@ struct NarrowPhaseCallbacks : INarrowPhaseCallbacks {
 
         float bounciness = MathF.Max(a.Bounciness, b.Bounciness);
         pairMaterial.FrictionCoefficient = MathF.Sqrt(MathF.Max(0f, a.Friction) * MathF.Max(0f, b.Friction));
-        // Bepu has no classical restitution: bounce comes from SOFT undamped contact springs
-        // (the body penetrates like a trampoline and gets thrown back out) with the recovery
-        // velocity cap lifted. Stiff springs would hand the impact to speculative contacts,
-        // which absorb it inelastically — hence frequency goes DOWN as bounciness goes up.
-        pairMaterial.MaximumRecoveryVelocity = bounciness > 0f ? float.MaxValue : 2f;
-        pairMaterial.SpringSettings = new SpringSettings(30f - 25f * bounciness, 1f - bounciness);
+        // Contacts stay a CRITICALLY DAMPED spring (frequency 30 Hz, damping 1) for solid resting
+        // and stacking — NO bounce comes from the spring. Real coefficient-of-restitution bounce is
+        // injected as a velocity-flip impulse on contact Enter (BepuContactTracker), which the spring
+        // model alone cannot deliver at this solver rate (measured: spring rebound saturates ~0.1).
+        pairMaterial.MaximumRecoveryVelocity = 2f;
+        pairMaterial.SpringSettings = new SpringSettings(30f, 1f);
 
         // Contact events: record the deepest actually-touching contact (speculative contacts
         // with negative depth are approach predictions, not touches).
@@ -65,8 +65,17 @@ struct NarrowPhaseCallbacks : INarrowPhaseCallbacks {
             bestOffset = offset;
             bestNormal = normal;
         }
+        // Restitution: sample the approach speed EVERY step the pair is in the manifold, including
+        // while the contact is still speculative (depth < 0). The solver bleeds the closing velocity
+        // off over the several steps speculative contacts span, so by the time depth crosses the
+        // touch threshold the real impact speed is already gone — we must capture its PEAK earlier.
+        // The tracker keeps the per-pair max and consumes it on Enter.
+        if (!isTrigger && bounciness > 0f && manifold.Count > 0)
+            World.Contacts.SampleApproach(workerIndex, pair, in bestOffset, in bestNormal, bounciness);
+
         if (bestDepth >= TouchDepthThreshold)
-            World.Contacts.Record(workerIndex, pair, in bestOffset, in bestNormal, isTrigger);
+            World.Contacts.Record(workerIndex, pair, in bestOffset, in bestNormal, isTrigger,
+                isTrigger ? 0f : bounciness);
 
         // Triggers detect overlap but never solve it (no constraint = no physical response).
         return !isTrigger;
