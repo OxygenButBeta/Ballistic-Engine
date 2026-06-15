@@ -125,6 +125,27 @@ public sealed class DX12HDRenderer : HDRenderer {
         public Vector2 TexelSize; public Vector2 Pad2;
     }
 
+    // SSGI: SSILVB horizon-bitmask one-bounce gather (half-res) → composite into the lit HDR scene. Ported
+    // from the GL SSGI_Frag/Combine. Temporal accumulation (via the motion buffer) + OIDN denoise wrap it
+    // (step C). Driven by the ScreenSpaceGlobalIllumination VOLUME (PostFX.Ssgi*).
+    ID3D12RootSignature ssgiRootSig;        // SsgiConstants CBV(b0) + 3-SRV table + clamp sampler
+    ID3D12PipelineState ssgiGatherPso, ssgiCombinePso;
+    ID3D12Resource ssgiCb;
+    unsafe byte* ssgiCbMapped;
+    Dx12OffscreenTarget ssgiTarget;         // half-res RGBA16F raw GI (rgb + edge-fade)
+    Dx12OffscreenTarget ssgiScene;          // full-res scratch: combine writes here, copied back to `target`
+    Dx12DescriptorHeap ssgiSrvVisible;      // 3 SRVs per pass
+    int ssgiFrame;                          // slice-set rotation counter
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct SsgiConstants {
+        public Matrix4x4 Projection; public Matrix4x4 InvProjection; public Matrix4x4 ViewMatrix;
+        public Vector4 Params0;   // RayLength, Falloff, Thickness, MultiBounce
+        public Vector4 Params1;   // BounceBoost, RayCount, FrameIndex, _
+        public Vector4 Params2;   // TexelSize.xy, _, _
+        public Vector4 Combine0;  // Intensity, Look, Saturation, OcclusionPower
+        public Vector4 Tint;      // Tint.xyz, _
+    }
+
     // Transparent forward pass: after deferred + sky, draw Material.Transparent submeshes back-to-front,
     // alpha-blended, depth-testing the G-buffer depth (LEqual, no write). Full forward PBR (sun + IBL +
     // shadows + clustered punctual) sampling material maps directly (TransparentForward.hlsl).
@@ -351,6 +372,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (bloomRootSig != null) AllocBloomTargets();          // half-res bloom ping-pong follows size
         if (ssaoRootSig != null) AllocSsaoTargets();
         if (ssrRootSig != null) AllocSsrTarget();
+        if (ssgiRootSig != null) AllocSsgiTargets();
         if (taaRootSig != null) AllocTaaTargets();
         AllocFsrOutput();
     }
@@ -447,6 +469,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         BuildTransparentPass();
         BuildFog();
         BuildSsr();
+        BuildSsgi();
         BuildTaa();
         BuildComposite();
 
@@ -573,6 +596,53 @@ public sealed class DX12HDRenderer : HDRenderer {
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         // Full-res scratch for the combine output (combine reads `target`, can't read+write it).
         ssrScene = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false,
+            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
+    }
+
+    // SSGI PSOs: a half-res gather (PSGather, SSILVB horizon-bitmask) + a full-res combine (PSCombine,
+    // adds the bounce into the lit scene). One root sig: SsgiConstants CBV(b0) + a 3-SRV table + clamp.
+    unsafe void BuildSsgi() {
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 3, baseShaderRegister: 0);
+        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
+        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        ssgiRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("Ssgi.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "Ssgi.hlsl");
+        ID3D12PipelineState MakePso(string entry) => dev.Device.CreateGraphicsPipelineState(
+            new GraphicsPipelineStateDescription {
+                RootSignature = ssgiRootSig, VertexShader = vs,
+                PixelShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, entry, "Ssgi.hlsl"),
+                InputLayout = null, PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+                RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
+                DepthStencilState = DepthStencilDescription.None,
+                RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat }, DepthStencilFormat = Format.Unknown,
+                SampleDescription = new SampleDescription(1, 0),
+            });
+        ssgiGatherPso = MakePso("PSGather");
+        ssgiCombinePso = MakePso("PSCombine");
+
+        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<SsgiConstants>() + 255) & ~255;
+        ssgiCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+        ssgiCbMapped = ssgiCb.Map<byte>(0);
+        ssgiSrvVisible = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 6, shaderVisible: true);
+        AllocSsgiTargets();
+    }
+
+    void AllocSsgiTargets() {
+        ssgiTarget?.Dispose(); ssgiScene?.Dispose();
+        int w = System.Math.Max(1, targetW / 2), h = System.Math.Max(1, targetH / 2);
+        ssgiTarget = new Dx12OffscreenTarget(dev, w, h, withDepth: false,
+            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
+        ssgiScene = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
     }
 
@@ -1348,6 +1418,13 @@ public sealed class DX12HDRenderer : HDRenderer {
         // the G-buffer depth (LEqual, no write). Runs before fog/SSR/TAA so they apply over the glass. ===
         DrawTransparents(view, viewProj, camPos, lightDir, lightColor, ambient);
 
+        // --- SSGI (volume-driven screen-space GI): local one-bounce light added to the lit scene, BEFORE
+        // fog/SSR so they apply over the GI-enriched colour (matches the GL order). Step B = raw gather +
+        // composite (noisy); temporal + OIDN denoise come in step C. Door BALLISTIC_DX12_SSGI=1 (default
+        // OFF in DX12 until the denoise lands — switched to the volume gate in step D). ---
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_SSGI") == "1")
+            DrawSsgi(view, proj);
+
         // --- Volumetric fog (post pass, reads depth+shadows, blends over HDR scene color) ---
         // BALLISTIC_FX_VOLUMETRIC=1 forces it on (same harness contract as the GL backend).
         bool fogOn = PostFX.VolumetricEnabled
@@ -1702,6 +1779,67 @@ public sealed class DX12HDRenderer : HDRenderer {
         });
         ssrScene.ColorToShaderResource();
         target.CopyColorFrom(ssrScene);   // the reflected scene becomes the new scene color
+    }
+
+    // Screen-space GI (SSILVB horizon-bitmask gather): half-res gather reads the lit HDR color + G-buffer
+    // depth/normal → ssgiTarget (raw one-bounce); combine adds it into the scene (via ssgiScene scratch,
+    // copied back to `target`). Step B is gather+combine (noisy); temporal accumulation (motion buffer) +
+    // OIDN denoise wrap it in step C. Profile dials are PostFX.Ssgi* (volume-driven).
+    unsafe void DrawSsgi(Matrix4x4 view, Matrix4x4 proj) {
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        Matrix4x4.Invert(proj, out Matrix4x4 invProj);
+        var pf = PostFX;
+        int fi = ssgiFrame++ & 1023;
+        // Pre-exposure: the raw-HDR scene → viewable scale the SSGI tuning expects (matches the composite's
+        // exposure). The gather works in viewable units; the combine converts the bounce back to raw HDR.
+        float preExp = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
+            System.Globalization.CultureInfo.InvariantCulture, out float e) ? e : 1.0e-5f;
+        float invPreExp = preExp > 0f ? 1f / preExp : 0f;
+        *(SsgiConstants*)ssgiCbMapped = new SsgiConstants {
+            Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProj),
+            ViewMatrix = Matrix4x4.Transpose(view),
+            Params0 = new Vector4(pf.SsgiRayLength, pf.SsgiFalloff, pf.SsgiThickness, 0f),  // MultiBounce: step C
+            Params1 = new Vector4(MathF.Max(pf.SsgiBounceBoost, 0f), Math.Clamp(pf.SsgiRayCount, 1, 8), fi, 0f),
+            Params2 = new Vector4(1f / ssgiTarget.Width, 1f / ssgiTarget.Height, preExp, invPreExp),
+            Combine0 = new Vector4(pf.SsgiIntensity, Math.Clamp(pf.SsgiLook, 0f, 1f),
+                                   MathF.Max(pf.SsgiSaturation, 0f), MathF.Max(pf.SsgiOcclusionPower, 0f)),
+            Tint = new Vector4(pf.SsgiTint.X, pf.SsgiTint.Y, pf.SsgiTint.Z, 0f),
+        };
+
+        target.ColorToShaderResource();
+        gbuffer.DepthToShaderResource();
+
+        // Gather (half-res) → ssgiTarget. SRVs: color t0, depth t1, normal t2.
+        ssgiSrvVisible.Reset();
+        int gb = ssgiSrvVisible.AllocateRange(3);
+        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(gb + 0), target.ColorSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(gb + 1), gbuffer.DepthSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(gb + 2), gbuffer.ColorSrvCpu(1), heapType);
+        ssgiTarget.RenderColorOnly(cl => {
+            cl.SetGraphicsRootSignature(ssgiRootSig); cl.SetPipelineState(ssgiGatherPso);
+            cl.SetDescriptorHeaps(ssgiSrvVisible.Heap);
+            cl.SetGraphicsRootConstantBufferView(0, ssgiCb.GPUVirtualAddress);
+            cl.SetGraphicsRootDescriptorTable(1, ssgiSrvVisible.Gpu(gb));
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
+
+        // Combine (full-res) → ssgiScene, reading scene (t0) + GI (t1; t2 unused but bound for a valid table).
+        ssgiTarget.ColorToShaderResource();
+        int cbi = ssgiSrvVisible.AllocateRange(3);
+        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(cbi + 0), target.ColorSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(cbi + 1), ssgiTarget.ColorSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(cbi + 2), ssgiTarget.ColorSrvCpu, heapType);
+        ssgiScene.RenderColorOnly(cl => {
+            cl.SetGraphicsRootSignature(ssgiRootSig); cl.SetPipelineState(ssgiCombinePso);
+            cl.SetDescriptorHeaps(ssgiSrvVisible.Heap);
+            cl.SetGraphicsRootConstantBufferView(0, ssgiCb.GPUVirtualAddress);
+            cl.SetGraphicsRootDescriptorTable(1, ssgiSrvVisible.Gpu(cbi));
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
+        ssgiScene.ColorToShaderResource();
+        target.CopyColorFrom(ssgiScene);   // the GI-enriched scene becomes the new scene color
     }
 
     // HBAO from the G-buffer (scene depth for view-pos + world normal, both already SRVs from the deferred
