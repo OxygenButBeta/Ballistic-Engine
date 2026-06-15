@@ -2,6 +2,23 @@ I have everything needed. The reports are accurate, and the codebase is further 
 
 ---
 
+> **EXECUTION NOTE (2026-06-15, autonomous /loop — reordered from this synthesized plan):** Step 4a as
+> written ("delete bind methods → GL won't compile → retire GL from the build now") is too destructive to
+> run early, because the **EDITOR exe depends on GL for ALL its rendering** (ImGuiGLRenderer,
+> ImGuiController, Mesh/MaterialPreviewRenderer, EditorDebugViews, ThumbnailCache — ~7 files). Retiring GL
+> from the build now breaks the editor entirely, not just GLHDRenderer. Reordered to keep engine+editor
+> BUILDING throughout:
+>   1. Keep GL compiling for now (editor's ImGui host + a working renderer); give it ZERO new work.
+>   2. DX12 NO-OPS the GL-shaped bind methods (Activate/Deactivate) — cheap, harmless — instead of deleting
+>      them yet. The bind-free *deletion* defers to when GL is actually deleted.
+>   3. Build the DX12 renderer to ACTUALLY DRAW SunTemple FIRST (the prize): interleaved mesh upload (5) +
+>      material descriptor table (8) + opaque/sky pipeline (9). GL untouched meanwhile.
+>   4. THEN, once DX12 renders AND the editor's GL dependency is ported (Phase 7), delete GL wholesale —
+>      bind methods, OpenGL/, GLStandardShader (10), one clean cut.
+> Same destination; no window where engine/editor can't build. Steps 0-3 already done as written.
+
+---
+
 # Ballistic Engine — DX-Native Render Abstraction Redesign
 
 Synthesized from 5 mapping reports, **verified against live source** on branch `dx12-renderer`. Key correction to the reports: the bridge is further along than they assume — `BallisticEngine.DX12/DirectXRenderAsset.cs`, `DX12HDRenderer.cs`, `RenderBackendSelector`, `RenderHandle`, and Mesh's GPU-address accessors (`Mesh.VertexBuffer`...`Mesh.IndexBuffer`) **already exist and compile**. So this is a *finishing + cleanup* plan, not a from-scratch one. One real layering bug found: the `InstancedBuffer` base class lives in `OpenGL/` (`OpenGL/Rendering/Buffers/InstancedBuffer.cs`), not `Abstraction/` — it must move before GL is deleted or the engine won't compile.
