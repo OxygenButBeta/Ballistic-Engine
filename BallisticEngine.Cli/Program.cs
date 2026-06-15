@@ -23,6 +23,7 @@ internal static class Program {
         new RenderCommand(),
         new QueryCommand(),
         new GBufferCommand(),
+        new PerfCommand(),
         new AgentsCommand(),
     }.ToDictionary(c => c.Name, StringComparer.Ordinal);
 

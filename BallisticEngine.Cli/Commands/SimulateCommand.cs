@@ -20,10 +20,12 @@ internal sealed class SimulateCommand : ICommand {
     public string Summary => "Headless play-mode run with numeric probes.";
     public string Usage =>
         """
-        Usage: bal simulate <scene.scene> [--steps N] [--watch <Entity>[:<Component>.<Member>]]... [--every K]
-                            [--input script.json] [--quiet]
+        Usage: bal simulate <scene.scene> [--steps N] [--watch <Entity>[:<Component>.<Member>]]...
+                            [--snapshot <Entity>]... [--every K] [--input script.json] [--quiet]
           --steps N   fixed 60 Hz steps to run (default 300 = 5 seconds)
-          --watch     value to sample (repeatable); entity name alone = world position
+          --watch     value to sample over time (repeatable); entity name alone = world position
+          --snapshot  full live-state dump of an entity at the final step (repeatable): transform +
+                      every public member of every component (live runtime introspection)
           --every K   sample every K steps (default keeps <= 100 samples)
           --input     deterministic input script: {"keys":[{"key":"W","from":0,"to":120}],
                       "mouse":[{"deltaX":2,"deltaY":0,"from":0,"to":60}],
@@ -38,10 +40,12 @@ internal sealed class SimulateCommand : ICommand {
         int? every = null;
         bool quiet = false;
         var watchSpecs = new List<string>();
+        var snapshotSpecs = new List<string>();
         for (int i = 0; i < args.Length; i++) {
             switch (args[i]) {
                 case "--steps": steps = ParseInt(Next(args, ref i, "--steps"), "--steps"); break;
                 case "--watch": watchSpecs.Add(Next(args, ref i, "--watch")); break;
+                case "--snapshot": snapshotSpecs.Add(Next(args, ref i, "--snapshot")); break;
                 case "--every": every = ParseInt(Next(args, ref i, "--every"), "--every"); break;
                 case "--input": inputPath = Next(args, ref i, "--input"); break;
                 case "--quiet": quiet = true; break;
@@ -97,6 +101,14 @@ internal sealed class SimulateCommand : ICommand {
                     foreach (Watch w in watches)
                         w.Sample(step);
             }
+
+            // Live runtime introspection: a FULL snapshot of each named entity's live component state at the
+            // final step (every public member of every component, not just pre-declared watches) — captured
+            // while still in play so runtime-only values (velocities, script state) are live.
+            var snapshots = snapshotSpecs.Count > 0
+                ? snapshotSpecs.Select(spec => SnapshotEntity(scene, spec, steps)).ToList()
+                : null;
+
             SceneManager.StopPlay();
 
             Json.Write(new {
@@ -111,6 +123,7 @@ internal sealed class SimulateCommand : ICommand {
                     target = w.Spec,
                     series = w.Series,
                 }).ToList(),
+                snapshots,
             });
             return errorCount == 0 ? 0 : 1;
         }
@@ -172,6 +185,64 @@ internal sealed class SimulateCommand : ICommand {
     // One watched value: an entity's world position, or any public property/field on one of its
     // components (NOT limited to serializable members — runtime-only state like Velocity is the
     // whole point of probing).
+    // Full live-state snapshot of one entity at the current step: transform + every public member of every
+    // component, read by reflection (the introspection surface — "read any component's live values during
+    // play"). Reuses SceneFile.ToJsonValue so vectors/enums/asset refs serialize consistently with watches.
+    static object SnapshotEntity(Scene scene, string entityName, int step) {
+        Entity? entity = scene.Entities.FirstOrDefault(e =>
+            string.Equals(e.Name, entityName, StringComparison.OrdinalIgnoreCase));
+        if (entity is null) {
+            string? hint = Suggest.Closest(entityName, scene.Entities.Select(e => e.Name));
+            throw new Exception($"--snapshot: no entity named '{entityName}'"
+                + (hint is null ? "" : $" — did you mean '{hint}'?"));
+        }
+
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.Instance;
+        // Only flatten values ToJsonValue can render to a scalar/vector — primitives/enums/strings + the
+        // Vector*/Quaternion types. Engine REFERENCE values (Entity/Transform/Behaviour back-pointers, asset
+        // handles) would recurse into a cycle (Entity.transform.Entity.transform...), so they're surfaced as a
+        // short "<Type>" marker, not expanded. This is the introspection equivalent of the scene serializer's
+        // "serializable members only" rule.
+        static bool IsScalar(object? v) => v is null or string or bool or Enum or decimal
+            || (v is not null && v.GetType() is { IsPrimitive: true })
+            || v is Vector2 or Vector3 or Vector4 or Quaternion;
+
+        object ReadMember(object obj, MemberInfo m) {
+            try {
+                object? v = m is PropertyInfo p ? p.GetValue(obj) : ((FieldInfo)m).GetValue(obj);
+                return IsScalar(v) ? SceneFile.ToJsonValue(v)! : $"<{v?.GetType().Name ?? "null"}>";
+            } catch (Exception ex) { return $"<threw: {ex.InnerException?.Message ?? ex.Message}>"; }
+        }
+
+        // Skip the noisy engine base-class plumbing every Behaviour exposes (transform/entity/lifecycle flags
+        // already covered by the entity-level fields) so the snapshot is the COMPONENT's own state.
+        var skip = new HashSet<string> { "transform", "Entity", "IsActive", "IsEnabled", "gameObject", "tag", "name" };
+
+        var components = entity.Behaviours.Select(b => {
+            Type t = b.GetType();
+            var members = new Dictionary<string, object>();
+            foreach (PropertyInfo p in t.GetProperties(flags))
+                if (p.CanRead && p.GetIndexParameters().Length == 0 && !skip.Contains(p.Name))
+                    members[p.Name] = ReadMember(b, p);
+            foreach (FieldInfo f in t.GetFields(flags))
+                if (!skip.Contains(f.Name)) members[f.Name] = ReadMember(b, f);
+            return new { type = t.Name, enabled = b.IsEnabled, members };
+        }).ToList();
+
+        return new {
+            entity = entity.Name,
+            step,
+            transform = new {
+                position = SceneFile.ToJsonValue(entity.transform.Position),
+                worldPosition = SceneFile.ToJsonValue(entity.transform.WorldPosition),
+                rotationEulerDegrees = SceneFile.ToJsonValue(entity.transform.EulerAngles),
+                scale = SceneFile.ToJsonValue(entity.transform.Scale),
+            },
+            active = entity.IsActive,
+            components,
+        };
+    }
+
     sealed class Watch {
         public string Spec = "";
         public List<object> Series { get; } = new();

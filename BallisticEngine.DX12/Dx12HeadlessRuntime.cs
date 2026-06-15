@@ -128,6 +128,34 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
         RenderStats rs = RenderStats.Scene;
         Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
             $"[PerfStats] draws={rs.DrawCalls} tris={rs.Triangles} (DX12)"));
+
+        // Structured perf surface for `bal perf` (BALLISTIC_STATS_OUT=<json>): emit RenderStats as JSON so the
+        // agent does autonomous perf work from numbers, not screenshots. (Per-pass GPU timestamp queries are a
+        // renderer-track follow-up; CPU frame ms + draw/tri/cull/light counters are wired today.)
+        string statsOut = Environment.GetEnvironmentVariable("BALLISTIC_STATS_OUT");
+        if (!string.IsNullOrWhiteSpace(statsOut)) {
+            var payload = new {
+                ok = true,
+                drawCalls = rs.DrawCalls,
+                depthOnlyDrawCalls = rs.DepthOnlyDrawCalls,
+                instancedDrawCalls = rs.InstancedDrawCalls,
+                drawsSavedByInstancing = rs.DrawsSavedByInstancing,
+                triangles = rs.Triangles,
+                subMeshesCulled = rs.SubMeshesCulled,
+                punctualLights = rs.PunctualLights,
+                shadowedLights = rs.ShadowedLights,
+                cpuFrameMs = rs.CpuFrameMs,
+                gpuFrameMs = rs.GpuFrameMs,
+                gpuPasses = rs.GpuPasses.Select(p => new { name = p.Name, ms = p.Ms }).ToArray(),
+                note = rs.GpuPasses.Count == 0 ? "per-pass GPU timestamp queries not yet wired on DX12 (renderer follow-up); cpuFrameMs + counters are live" : null,
+            };
+            System.IO.File.WriteAllText(statsOut,
+                System.Text.Json.JsonSerializer.Serialize(payload,
+                    new System.Text.Json.JsonSerializerOptions {
+                        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
+                    }));
+            Console.WriteLine($"[PerfStats] wrote {statsOut} (DX12)");
+        }
     }
 
     // Host-driven clock (mirrors HeadlessRuntime.ManualTimer).

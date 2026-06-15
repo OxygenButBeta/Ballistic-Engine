@@ -1296,10 +1296,13 @@ public sealed class DX12HDRenderer : HDRenderer {
         pso = dev.Device.CreateGraphicsPipelineState(psoDesc);
     }
 
+    readonly System.Diagnostics.Stopwatch cpuFrameSw = new();
+
     public override unsafe RenderMetrics BeginRender(RendererArgs args) {
         IViewProjectionProvider vp = args.viewProjectionProvider;
         if (vp is null || target is null)
             return default;
+        cpuFrameSw.Restart();   // CPU render-submission cost (the AI-measurable frame budget)
 
         // Resolve the upscale mode (volume, or a BALLISTIC_DX12_FSR env override for headless A/B) and make
         // the internal render resolution + FSR context match it (reallocates targets only on a mode change).
@@ -1624,6 +1627,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         RenderStats.Scene.DrawCalls = draws;
         RenderStats.Scene.Triangles = tris;
         RenderStats.Scene.SubMeshesCulled = culled;
+        RenderStats.Scene.CpuFrameMs = cpuFrameSw.Elapsed.TotalMilliseconds;
         return new RenderMetrics(draws, 0, (int)tris, 0, 0f);
     }
 
