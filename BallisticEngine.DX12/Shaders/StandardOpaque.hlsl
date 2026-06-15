@@ -204,8 +204,9 @@ float4 PSMain(VSOutput i) : SV_Target {
     float3 emissive = (HasEmissive > 0.5)
         ? EmissiveMap.Sample(LinearWrap, i.Uv).rgb * EmissiveFactor : 0.0.xxx;
 
+    // Output RAW HDR radiance into the R16F scene target. Exposure + ACES tonemap + sRGB now live in the
+    // final composite pass (so auto-exposure + bloom can work on the HDR signal). The per-draw Exposure
+    // constant is no longer applied here.
     float3 litHdr = diffuse + specular + ambient + emissive;
-    float3 mapped = ACESFilm(litHdr * Exposure);
-    float3 srgb = pow(mapped, 1.0 / 2.2);   // back to sRGB for the UNORM backbuffer/BMP
-    return float4(srgb, 1.0);
+    return float4(litHdr, 1.0);
 }

@@ -127,11 +127,8 @@ VSOutput VSMain(uint vid : SV_VertexID) {
 }
 
 float4 PSMain(VSOutput i) : SV_Target {
-    float3 hdr = SkyRadiance(normalize(i.Dir));
-    // The opaque pass pre-exposes HDR by the same fixed stand-in (1e-5) before ACES; match it so the sky
-    // brightness tracks the scene. (SunRadiance here is the same lux-scaled value the sun light uses.)
-    float3 mapped = ACESFilm(hdr * 1.0e-5);
-    return float4(pow(mapped, 1.0 / 2.2), 1.0);
+    // RAW HDR sky radiance into the R16F scene target — the composite pass does exposure + ACES + sRGB.
+    return float4(SkyRadiance(normalize(i.Dir)), 1.0);
 }
 
 // ---- Env-cube BAKE: render RAW HDR sky radiance into one cube face (FSQ) for IBL convolution. ----

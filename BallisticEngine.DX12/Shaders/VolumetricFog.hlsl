@@ -129,9 +129,7 @@ float4 PSMain(VSOut i) : SV_Target {
     scatter *= Tint;
     if (any(isnan(scatter)) || any(isinf(scatter))) scatter = 0;
 
-    // The scene color is sRGB-encoded LDR (the opaque pass tonemapped already). Tonemap+encode the
-    // HDR scatter the SAME way before blending, so fog composites in the same space.
-    float3 mapped = saturate(scatter * Exposure);          // already ACES'd? no — keep simple: exposure + sRGB
-    float3 srgb = pow(saturate(scatter * Exposure), 1.0 / 2.2);
-    return float4(srgb, saturate(transmittance));
+    // Fog now composites in HDR (the scene target is R16F; the final composite tonemaps). Output RAW HDR
+    // scatter + transmittance; blend = dest*transmittance + scatter, all pre-tonemap. (Exposure unused.)
+    return float4(scatter, saturate(transmittance));
 }

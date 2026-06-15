@@ -54,7 +54,6 @@ VSOutput VSMain(uint vid : SV_VertexID) {
 }
 
 float4 PSMain(VSOutput i) : SV_Target {
-    float3 hdr = SkyMap.Sample(LinearClamp, normalize(i.Dir)).rgb * Exposure;
-    float3 srgb = pow(ACESFilm(hdr), 1.0 / 2.2);
-    return float4(srgb, 1.0);
+    // RAW HDR (× the cube's own exposure) into the R16F scene target — composite does ACES + sRGB.
+    return float4(SkyMap.Sample(LinearClamp, normalize(i.Dir)).rgb * Exposure, 1.0);
 }

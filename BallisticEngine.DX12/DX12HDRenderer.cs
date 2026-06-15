@@ -22,11 +22,21 @@ namespace BallisticEngine;
 // typed properties only.
 public sealed class DX12HDRenderer : HDRenderer {
     readonly Dx12Device dev;
-    Dx12OffscreenTarget target;
+    Dx12OffscreenTarget target;       // HDR scene color (R16F) + depth — opaque/sky/fog render here
+    Dx12OffscreenTarget ldr;          // LDR composite output (R8) — readback/display reads this
     int targetW = 1920, targetH = 1080;
 
     ID3D12RootSignature rootSig;
     ID3D12PipelineState pso;
+
+    // Final composite (HDR scene → exposure → ACES → +bloom → sRGB → LDR).
+    ID3D12RootSignature compositeRootSig;   // CompositeConstants CBV (b0) + HDR+bloom SRV table + sampler
+    ID3D12PipelineState compositePso;
+    ID3D12Resource compositeCb;
+    unsafe byte* compositeCbMapped;
+    Dx12DescriptorHeap compositeSrvVisible;  // HDR color + bloom, copied per frame
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct CompositeConstants { public float Exposure; public float BloomIntensity; public Vector2 Pad; }
 
     // Skybox pass (background): its own root sig (CBV b0 + cube SRV t0 + clamp sampler) + PSO (LEqual,
     // no depth write, cull none, SV_VertexID cube). Drawn after opaque in the same command list.
@@ -153,12 +163,17 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (width <= 0 || height <= 0) return;
         if (target != null && width == targetW && height == targetH) return;
         targetW = width; targetH = height;
-        target?.Dispose();
-        target = new Dx12OffscreenTarget(dev, width, height, withDepth: true);
+        target?.Dispose(); ldr?.Dispose();
+        target = new Dx12OffscreenTarget(dev, width, height, withDepth: true,
+            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
+        ldr = new Dx12OffscreenTarget(dev, width, height);   // LDR composite output
     }
 
     public override unsafe void Initialize() {
-        target = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: true);
+        // Scene renders RAW HDR into `target` (R16F + depth); the composite tonemaps it into `ldr` (R8).
+        target = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: true,
+            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
+        ldr = new Dx12OffscreenTarget(dev, targetW, targetH);
         BuildRootSignature();
         BuildPipeline();
 
@@ -190,6 +205,40 @@ public sealed class DX12HDRenderer : HDRenderer {
         frameCbMapped = frameCb.Map<byte>(0);
 
         BuildFog();
+        BuildComposite();
+    }
+
+    unsafe void BuildComposite() {
+        // CompositeConstants CBV (b0) + 2-SRV table (HDR color t0, bloom t1) + clamp sampler s0.
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 0);
+        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
+        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        compositeRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("Composite.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "Composite.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "Composite.hlsl");
+        compositePso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+            RootSignature = compositeRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
+            DepthStencilState = DepthStencilDescription.None,
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.ColorFormat },   // LDR output
+            DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
+        });
+
+        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<CompositeConstants>() + 255) & ~255;
+        compositeCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+        compositeCbMapped = compositeCb.Map<byte>(0);
+        compositeSrvVisible = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true);
     }
 
     unsafe void BuildFog() {
@@ -226,7 +275,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
             RasterizerState = RasterizerDescription.CullNone, BlendState = blend,
             DepthStencilState = DepthStencilDescription.None,
-            RenderTargetFormats = new[] { Dx12OffscreenTarget.ColorFormat },
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
             DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
         });
 
@@ -291,7 +340,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
             RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
             DepthStencilState = ds,
-            RenderTargetFormats = new[] { Dx12OffscreenTarget.ColorFormat },
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
             DepthStencilFormat = Dx12OffscreenTarget.DepthFormat,
             SampleDescription = new SampleDescription(1, 0),
         };
@@ -331,7 +380,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
             RasterizerState = RasterizerDescription.CullNone,
             BlendState = BlendDescription.Opaque, DepthStencilState = ds,
-            RenderTargetFormats = new[] { Dx12OffscreenTarget.ColorFormat },
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
             DepthStencilFormat = Dx12OffscreenTarget.DepthFormat,
             SampleDescription = new SampleDescription(1, 0),
         };
@@ -404,7 +453,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             RasterizerState = RasterizerDescription.CullClockwise,
             BlendState = BlendDescription.Opaque,
             DepthStencilState = DepthStencilDescription.Default,
-            RenderTargetFormats = new[] { Dx12OffscreenTarget.ColorFormat },
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
             DepthStencilFormat = Dx12OffscreenTarget.DepthFormat,
             SampleDescription = new SampleDescription(1, 0),
         };
@@ -573,16 +622,43 @@ public sealed class DX12HDRenderer : HDRenderer {
                 DrawSkybox(cl, view, proj);
         });
 
-        // --- Volumetric fog (post pass, reads depth+shadows, blends over color) ---
+        // --- Volumetric fog (post pass, reads depth+shadows, blends over HDR scene color) ---
         // BALLISTIC_FX_VOLUMETRIC=1 forces it on (same harness contract as the GL backend).
         bool fogOn = PostFX.VolumetricEnabled
             || Environment.GetEnvironmentVariable("BALLISTIC_FX_VOLUMETRIC") == "1";
         if (fogOn)
             DrawFog(view, viewProj, camPos, light);
 
+        // --- Final composite: HDR scene → exposure → ACES → sRGB → LDR ---
+        DrawComposite();
+
         RenderStats.Scene.DrawCalls = draws;
         RenderStats.Scene.Triangles = tris;
         return new RenderMetrics(draws, 0, (int)tris, 0, 0f);
+    }
+
+    // Tonemap the HDR scene target into the LDR output. Exposure is the fixed 1e-5 stand-in (auto-exposure
+    // replaces it next); bloom is added once the bloom pass exists (BloomIntensity 0 for now).
+    unsafe void DrawComposite() {
+        float exposure = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
+            System.Globalization.CultureInfo.InvariantCulture, out float e) ? e : 1.0e-5f;
+        *(CompositeConstants*)compositeCbMapped = new CompositeConstants { Exposure = exposure, BloomIntensity = 0f };
+
+        target.ColorToShaderResource();   // HDR scene color → SRV
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(0), target.ColorSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(1), target.ColorSrvCpu, heapType);  // bloom slot = HDR for now (unused, BloomIntensity 0)
+
+        ldr.RenderColorOnly(cl => {
+            cl.SetGraphicsRootSignature(compositeRootSig);
+            cl.SetPipelineState(compositePso);
+            cl.SetDescriptorHeaps(compositeSrvVisible.Heap);
+            cl.SetGraphicsRootConstantBufferView(0, compositeCb.GPUVirtualAddress);
+            cl.SetGraphicsRootDescriptorTable(1, compositeSrvVisible.Gpu(0));
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
+        target.ColorToRenderTarget();   // restore for next frame's scene render
     }
 
     // Full-screen volumetric fog: march the air toward the camera (shadowed sun + sky in-scatter),
@@ -775,7 +851,8 @@ public sealed class DX12HDRenderer : HDRenderer {
             if (r != null) r.RenderedThisFrame = false;
     }
 
-    public void SaveFrame(string path) => target?.SaveBmp(path);
+    // Readback comes from the LDR composite (R8) — the HDR scene target isn't a valid BMP source.
+    public void SaveFrame(string path) => ldr?.SaveBmp(path);
     public int Width => targetW;
     public int Height => targetH;
 

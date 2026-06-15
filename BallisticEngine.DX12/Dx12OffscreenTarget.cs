@@ -10,8 +10,12 @@ namespace BallisticEngine.DX12;
 // ReadPixels, so readback is a CopyTextureRegion into a readback heap, Map, memcpy (DX12Migration.md
 // Phase 1, the single highest-leverage thing to get right). No window needed.
 public sealed class Dx12OffscreenTarget : IDisposable {
+    // Default LDR backbuffer format (final composite / readback). The HDR scene target overrides it with
+    // R16G16B16A16_Float via the ctor `colorFormat` arg.
     public const Format ColorFormat = Format.R8G8B8A8_UNorm;
+    public const Format HdrFormat = Format.R16G16B16A16_Float;
     public const Format DepthFormat = Format.D32_Float;
+    public Format Format { get; }          // this target's actual color format
     public int Width { get; }
     public int Height { get; }
     public ID3D12Resource RenderTarget { get; }
@@ -19,6 +23,10 @@ public sealed class Dx12OffscreenTarget : IDisposable {
     readonly Dx12Device dev;
     readonly ID3D12DescriptorHeap rtvHeap;
     readonly CpuDescriptorHandle rtvHandle;
+    // Color as a shader resource — for the composite pass that reads the HDR scene color. -1 until first
+    // ColorToShaderResource()/SrvCpu use; lazily created. Lives in Dx12Backend.SrvStore.
+    int colorSrvIndex = -1;
+    public CpuDescriptorHandle ColorSrvCpu => Dx12Backend.SrvStore.Cpu(colorSrvIndex);
     // Optional depth buffer (created when withDepth) — needed for any 3D pass.
     readonly ID3D12Resource depthTarget;
     readonly ID3D12DescriptorHeap dsvHeap;
@@ -33,15 +41,17 @@ public sealed class Dx12OffscreenTarget : IDisposable {
     // Current resource state of the RT, tracked so transitions are correct.
     ResourceStates state = ResourceStates.RenderTarget;
 
-    public Dx12OffscreenTarget(Dx12Device device, int width, int height, bool withDepth = false) {
+    public Dx12OffscreenTarget(Dx12Device device, int width, int height, bool withDepth = false,
+        Format? colorFormat = null, bool colorReadable = false) {
         dev = device;
         Width = width;
         Height = height;
+        Format = colorFormat ?? ColorFormat;
 
-        var rtDesc = ResourceDescription.Texture2D(ColorFormat, (uint)width, (uint)height,
+        var rtDesc = ResourceDescription.Texture2D(Format, (uint)width, (uint)height,
             mipLevels: 1, arraySize: 1);
         rtDesc.Flags = ResourceFlags.AllowRenderTarget;
-        var clearVal = new ClearValue(ColorFormat, new Vortice.Mathematics.Color4(0, 0, 0, 1));
+        var clearVal = new ClearValue(Format, new Vortice.Mathematics.Color4(0, 0, 0, 1));
         RenderTarget = dev.Device.CreateCommittedResource(
             HeapProperties.DefaultHeapProperties, HeapFlags.None, rtDesc,
             ResourceStates.RenderTarget, clearVal);
@@ -50,6 +60,17 @@ public sealed class Dx12OffscreenTarget : IDisposable {
             DescriptorHeapType.RenderTargetView, 1));
         rtvHandle = rtvHeap.GetCPUDescriptorHandleForHeapStart();
         dev.Device.CreateRenderTargetView(RenderTarget, null, rtvHandle);
+
+        // The HDR scene target is sampled by the composite pass — give it a color SRV.
+        if (colorReadable) {
+            colorSrvIndex = Dx12Backend.SrvStore.Allocate();
+            dev.Device.CreateShaderResourceView(RenderTarget, new ShaderResourceViewDescription {
+                Format = Format,
+                ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Texture2D = new Texture2DShaderResourceView { MipLevels = 1, MostDetailedMip = 0 },
+            }, Dx12Backend.SrvStore.Cpu(colorSrvIndex));
+        }
 
         if (withDepth) {
             // Typeless so the SAME resource is both a D32 DSV and an R32_Float SRV (post passes read depth).
@@ -112,6 +133,14 @@ public sealed class Dx12OffscreenTarget : IDisposable {
             cl.OMSetRenderTargets(rtvHandle);   // no DSV — post pass doesn't test/write depth
             record(cl);
         });
+    }
+
+    // Color state transitions: the composite reads the HDR scene color as an SRV.
+    public void ColorToShaderResource() {
+        dev.ExecuteSync(cl => TransitionTo(cl, ResourceStates.PixelShaderResource));
+    }
+    public void ColorToRenderTarget() {
+        dev.ExecuteSync(cl => TransitionTo(cl, ResourceStates.RenderTarget));
     }
 
     // Depth state transitions for post passes that read scene depth as an SRV.
