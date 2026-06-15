@@ -14,6 +14,12 @@ public enum MeteringMode {
     Spot,           // only a small center circle meters
 }
 
+// Reflection technique: screen-space march or DXR ray tracing (the Reflection volume's SSR-vs-RT dropdown).
+public enum ReflectionMode {
+    ScreenSpace,   // SSR — fast, screen-bounded
+    RayTraced,     // DXR — off-screen + sky reflect correctly (falls back to SSR without DXR)
+}
+
 // Temporal upscaling quality (FSR). Each mode is a fixed per-dimension render-resolution ratio; the
 // upscaler reconstructs the display resolution. Higher ratio = lower internal res = faster, softer.
 public enum UpscaleMode {
@@ -89,6 +95,7 @@ public sealed class PostProcessSettings {
     // the sky cubemap. Requires the normal attachment (unavailable in the MSAA path).
     public bool SsrEnabled { get; set; } = true;
     public float SsrIntensity { get; set; } = 1f;
+    public ReflectionMode ReflectionMode { get; set; } = ReflectionMode.ScreenSpace;  // SSR or DXR (Reflection volume)
 
     // Screen-space global illumination: a coarse one-bounce diffuse gather that adds
     // indirect fill light from sunlit on-screen surfaces into shadowed areas (the

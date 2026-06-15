@@ -45,6 +45,7 @@ public static class VolumePostProcessing {
         if (stack.GetComponent<ScreenSpaceReflections>() is { } ssr) {
             fx.SsrEnabled = ssr.enabled.Value;
             fx.SsrIntensity = ssr.intensity.Value;
+            fx.ReflectionMode = ssr.mode.Value;
         }
 
         if (stack.GetComponent<ScreenSpaceGlobalIllumination>() is { } ssgi) {

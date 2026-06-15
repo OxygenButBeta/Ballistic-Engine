@@ -176,6 +176,23 @@ public sealed class DX12HDRenderer : HDRenderer {
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct RtShadowConstants { public Matrix4x4 InvViewProj; public Vector3 SunDir; public float NormalBias; }
 
+    // --- DXR ray-traced reflections (Reflection volume SSR-vs-RT dropdown: PostFX.ReflectionMode) ---
+    // Reuses Dx12SceneAS + the SSR reflection target (ssrTarget) + the SSR combine (ssrCombinePso): the RT
+    // pass writes (reflected color, strength) into ssrTarget, then the existing depth-aware Fresnel combine
+    // mixes it into the scene. DxrReflections.hlsl shades misses as the sky/IBL cube and hits as ambient
+    // grey (full per-instance material shade = follow-up). Mirror rays are deterministic → no denoise yet.
+    ID3D12RootSignature rtReflRootSig;          // CBV(b0) + table{SRV t0 TLAS,t1 depth,t2 normal,t3 mat,t4 irr,t5 pref; UAV u0} + s0
+    ID3D12StateObject rtReflPso;
+    ID3D12Resource rtReflSbt, rtReflCb;
+    unsafe byte* rtReflCbMapped;
+    Dx12DescriptorHeap rtReflHeap;              // 7 descriptors (rebuilt per frame)
+    bool rtReflBuilt;
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct RtReflConstants {
+        public Matrix4x4 InvViewProj; public Vector3 CameraPos; public float Intensity;
+        public float PrefilterMaxMip; public float NormalBias; public Vector2 Pad;
+    }
+
     // Transparent forward pass: after deferred + sky, draw Material.Transparent submeshes back-to-front,
     // alpha-blended, depth-testing the G-buffer depth (LEqual, no write). Full forward PBR (sun + IBL +
     // shadows + clustered punctual) sampling material maps directly (TransparentForward.hlsl).
@@ -623,8 +640,9 @@ public sealed class DX12HDRenderer : HDRenderer {
     void AllocSsrTarget() {
         ssrTarget?.Dispose(); ssrScene?.Dispose();
         int w = System.Math.Max(1, targetW / 2), h = System.Math.Max(1, targetH / 2);
+        // allowUav so RT reflections can write it via a UAV (SSR still writes it via the RTV).
         ssrTarget = new Dx12OffscreenTarget(dev, w, h, withDepth: false,
-            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
+            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
         // Full-res scratch for the combine output (combine reads `target`, can't read+write it).
         ssrScene = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
@@ -1490,9 +1508,16 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (fogOn)
             DrawFog(view, viewProj, camPos, light);
 
-        // --- SSR (volume-driven screen-space reflections, reads the G-buffer; lerps into the scene color) ---
-        if (PostFX.SsrEnabled && PostFX.SsrIntensity > 0f)
-            DrawSsr(view, proj);
+        // --- Reflections (volume-driven, SSR vs RT). RT reflections trace the scene BVH (off-screen + sky
+        // correct), reusing the SSR reflection target + combine; SSR is the screen-space fallback. ---
+        if (PostFX.SsrEnabled && PostFX.SsrIntensity > 0f) {
+            string rtrEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RT_REFLECTIONS");
+            bool rtReflWanted = rtrEnv == "1" || (rtrEnv != "0" && PostFX.ReflectionMode == ReflectionMode.RayTraced);
+            if (rtReflWanted && EnsureRtReflections())
+                DrawRtReflections(view, viewProj, proj, camPos);
+            else
+                DrawSsr(view, proj);
+        }
 
         bool ssaoOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SSAO") != "0";
 
@@ -1963,8 +1988,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (rtShadowBuilt) return true;
         rtShadowBuilt = true;
 
-        device5 = dev.Device.QueryInterface<ID3D12Device5>();
-        sceneAS = new Dx12SceneAS(dev);
+        if (device5 == null) device5 = dev.Device.QueryInterface<ID3D12Device5>();
+        if (sceneAS == null) sceneAS = new Dx12SceneAS(dev);
 
         // Global root sig: CBV(b0) + table {SRV t0 TLAS, t1 depth, t2 normal; UAV u0 mask}.
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
@@ -2050,6 +2075,138 @@ public sealed class DX12HDRenderer : HDRenderer {
         });
         rtShadowMask.ColorToShaderResource();
         rtShadowsThisFrame = true;
+    }
+
+    // Lazily build the DXR reflection pipeline. Reuses device5 + sceneAS (created by whichever RT effect ran
+    // first). Returns false (→ SSR fallback) when DXR is unavailable.
+    unsafe bool EnsureRtReflections() {
+        if (!dxrChecked) {
+            dxrChecked = true;
+            try {
+                var opt5 = dev.Device.CheckFeatureSupport<FeatureDataD3D12Options5>(Vortice.Direct3D12.Feature.Options5);
+                dxrAvailable = opt5.RaytracingTier >= RaytracingTier.Tier1_0;
+            } catch { dxrAvailable = false; }
+            if (!dxrAvailable) Console.WriteLine("[RTReflections] DXR unavailable — using SSR.");
+        }
+        if (!dxrAvailable) return false;
+        if (rtReflBuilt) return true;
+        rtReflBuilt = true;
+
+        if (device5 == null) device5 = dev.Device.QueryInterface<ID3D12Device5>();
+        if (sceneAS == null) sceneAS = new Dx12SceneAS(dev);
+
+        // CBV(b0) + table {SRV t0-t5, UAV u0} + static clamp sampler s0.
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 6, baseShaderRegister: 0);
+        var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);
+        var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange), ShaderVisibility.All);
+        var samp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        rtReflRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, table }, new[] { samp })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("DxrReflections.hlsl");
+        byte[] dxil = Dx12ShaderCompiler.Compile(DxcShaderStage.Library, hlsl, "", "DxrReflections.hlsl");
+        var subs = new[] {
+            new StateSubObject(new DxilLibraryDescription(dxil,
+                new ExportDescription("RayGen"), new ExportDescription("Miss"), new ExportDescription("ClosestHit"))),
+            new StateSubObject(new HitGroupDescription("HitGroup", HitGroupType.Triangles, "", "ClosestHit", "")),
+            new StateSubObject(new RaytracingShaderConfig(16, 8)),   // payload = float3 color + float roughness
+            new StateSubObject(new RaytracingPipelineConfig(1)),
+            new StateSubObject(new GlobalRootSignature(rtReflRootSig)),
+        };
+        rtReflPso = device5.CreateStateObject(new StateObjectDescription(StateObjectType.RaytracingPipeline, subs));
+
+        using ID3D12StateObjectProperties props = rtReflPso.QueryInterface<ID3D12StateObjectProperties>();
+        uint idSize = Vortice.Direct3D12.D3D12.ShaderIdentifierSizeInBytes;
+        rtReflSbt = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer(RtSbtSlot * 3), ResourceStates.GenericRead);
+        byte* sp = rtReflSbt.Map<byte>(0);
+        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 0 * RtSbtSlot, (void*)props.GetShaderIdentifier("RayGen"), idSize);
+        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 1 * RtSbtSlot, (void*)props.GetShaderIdentifier("Miss"), idSize);
+        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 2 * RtSbtSlot, (void*)props.GetShaderIdentifier("HitGroup"), idSize);
+        rtReflSbt.Unmap(0);
+
+        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<RtReflConstants>() + 255) & ~255;
+        rtReflCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+        rtReflCbMapped = rtReflCb.Map<byte>(0);
+        rtReflHeap = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 7, shaderVisible: true);
+        return true;
+    }
+
+    // RT reflections: trace a reflection ray per pixel → ssrTarget (reflected color + strength), then reuse
+    // the SSR combine (depth-aware upsample + Fresnel lerp into the scene). Replaces the SSR march.
+    unsafe void DrawRtReflections(Matrix4x4 view, Matrix4x4 viewProj, Matrix4x4 proj, Vector3 camPos) {
+        sceneAS.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection);
+        if (!sceneAS.Valid) { DrawSsr(view, proj); return; }   // no geometry → fall back to SSR
+
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
+        *(RtReflConstants*)rtReflCbMapped = new RtReflConstants {
+            InvViewProj = Matrix4x4.Transpose(invVP), CameraPos = camPos, Intensity = PostFX.SsrIntensity,
+            PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f, NormalBias = 0.05f,
+        };
+
+        // The G-buffer is in the combined shader-read state; color (target) bring to SRV for the combine.
+        target.ColorToShaderResource();
+
+        sceneAS.CreateTlasSrv(rtReflHeap.Cpu(0));
+        dev.Device.CopyDescriptorsSimple(1, rtReflHeap.Cpu(1), gbuffer.DepthSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, rtReflHeap.Cpu(2), gbuffer.ColorSrvCpu(1), heapType);   // world normal
+        dev.Device.CopyDescriptorsSimple(1, rtReflHeap.Cpu(3), gbuffer.ColorSrvCpu(2), heapType);   // material
+        dev.Device.CopyDescriptorsSimple(1, rtReflHeap.Cpu(4), ibl.IrradianceSrv, heapType);
+        dev.Device.CopyDescriptorsSimple(1, rtReflHeap.Cpu(5), ibl.PrefilterSrv, heapType);
+        dev.Device.CreateUnorderedAccessView(ssrTarget.RenderTarget, null, new UnorderedAccessViewDescription {
+            Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+        }, rtReflHeap.Cpu(6));
+
+        ssrTarget.ColorToUnorderedAccess();
+        uint idSize = Vortice.Direct3D12.D3D12.ShaderIdentifierSizeInBytes;
+        dev.ExecuteSync(cl => {
+            cl.SetDescriptorHeaps(rtReflHeap.Heap);
+            cl.SetComputeRootSignature(rtReflRootSig);
+            cl.SetPipelineState1(rtReflPso);
+            cl.SetComputeRootConstantBufferView(0, rtReflCb.GPUVirtualAddress);
+            cl.SetComputeRootDescriptorTable(1, rtReflHeap.Gpu(0));
+            cl.DispatchRays(new DispatchRaysDescription {
+                Width = (uint)ssrTarget.Width, Height = (uint)ssrTarget.Height, Depth = 1,
+                RayGenerationShaderRecord = new GpuVirtualAddressRange { StartAddress = rtReflSbt.GPUVirtualAddress, SizeInBytes = idSize },
+                MissShaderTable = new GpuVirtualAddressRangeAndStride { StartAddress = rtReflSbt.GPUVirtualAddress + RtSbtSlot, SizeInBytes = idSize, StrideInBytes = idSize },
+                HitGroupTable = new GpuVirtualAddressRangeAndStride { StartAddress = rtReflSbt.GPUVirtualAddress + 2 * RtSbtSlot, SizeInBytes = idSize, StrideInBytes = idSize },
+            });
+        });
+        ssrTarget.ColorToShaderResource();
+
+        // Reuse the SSR combine (depth-aware upsample + Fresnel lerp into the scene color).
+        Matrix4x4.Invert(proj, out Matrix4x4 invProj);
+        *(SsrConstants*)ssrCbMapped = new SsrConstants {
+            Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProj),
+            ViewMatrix = Matrix4x4.Transpose(view), Intensity = PostFX.SsrIntensity,
+            TexelSize = new Vector2(1f / ssrTarget.Width, 1f / ssrTarget.Height),
+        };
+        gbuffer.DepthToShaderResource();
+        ssrSrvVisible.Reset();
+        int cb = ssrSrvVisible.AllocateRange(5);
+        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 0), target.ColorSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 1), gbuffer.DepthSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 2), gbuffer.ColorSrvCpu(1), heapType);
+        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 3), gbuffer.ColorSrvCpu(2), heapType);
+        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 4), ssrTarget.ColorSrvCpu, heapType);
+        ssrScene.RenderColorOnly(cl => {
+            cl.SetGraphicsRootSignature(ssrRootSig); cl.SetPipelineState(ssrCombinePso);
+            cl.SetDescriptorHeaps(ssrSrvVisible.Heap);
+            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress);
+            cl.SetGraphicsRootDescriptorTable(1, ssrSrvVisible.Gpu(cb));
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
+        ssrScene.ColorToShaderResource();
+        target.CopyColorFrom(ssrScene);
     }
 
     // HBAO from the G-buffer (scene depth for view-pos + world normal, both already SRVs from the deferred
