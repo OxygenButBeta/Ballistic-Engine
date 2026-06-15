@@ -24,6 +24,12 @@ public sealed class Dx12OffscreenTarget : IDisposable {
     readonly ID3D12DescriptorHeap dsvHeap;
     readonly CpuDescriptorHandle dsvHandle;
     public bool HasDepth => depthTarget != null;
+    // Depth as a shader resource (R32_Float SRV over the typeless depth) — for post passes that read
+    // scene depth (volumetric fog). Allocated in Dx12Backend.SrvStore; -1 until withDepth.
+    int depthSrvIndex = -1;
+    public CpuDescriptorHandle DepthSrvCpu => Dx12Backend.SrvStore.Cpu(depthSrvIndex);
+    public ID3D12Resource DepthResource => depthTarget;
+    ResourceStates depthState = ResourceStates.DepthWrite;
     // Current resource state of the RT, tracked so transitions are correct.
     ResourceStates state = ResourceStates.RenderTarget;
 
@@ -46,7 +52,8 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         dev.Device.CreateRenderTargetView(RenderTarget, null, rtvHandle);
 
         if (withDepth) {
-            var dDesc = ResourceDescription.Texture2D(DepthFormat, (uint)width, (uint)height,
+            // Typeless so the SAME resource is both a D32 DSV and an R32_Float SRV (post passes read depth).
+            var dDesc = ResourceDescription.Texture2D(Format.R32_Typeless, (uint)width, (uint)height,
                 mipLevels: 1, arraySize: 1);
             dDesc.Flags = ResourceFlags.AllowDepthStencil;
             var dClear = new ClearValue(DepthFormat, 1.0f, 0);
@@ -56,7 +63,18 @@ public sealed class Dx12OffscreenTarget : IDisposable {
             dsvHeap = dev.Device.CreateDescriptorHeap(new DescriptorHeapDescription(
                 DescriptorHeapType.DepthStencilView, 1));
             dsvHandle = dsvHeap.GetCPUDescriptorHandleForHeapStart();
-            dev.Device.CreateDepthStencilView(depthTarget, null, dsvHandle);
+            dev.Device.CreateDepthStencilView(depthTarget,
+                new DepthStencilViewDescription {
+                    Format = DepthFormat, ViewDimension = DepthStencilViewDimension.Texture2D,
+                }, dsvHandle);
+
+            depthSrvIndex = Dx12Backend.SrvStore.Allocate();
+            dev.Device.CreateShaderResourceView(depthTarget, new ShaderResourceViewDescription {
+                Format = Format.R32_Float,
+                ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Texture2D = new Texture2DShaderResourceView { MipLevels = 1, MostDetailedMip = 0 },
+            }, Dx12Backend.SrvStore.Cpu(depthSrvIndex));
         }
     }
 
@@ -80,6 +98,35 @@ public sealed class Dx12OffscreenTarget : IDisposable {
             cl.RSSetScissorRect(Width, Height);
             BindTargets(cl);
             record(cl);
+        });
+    }
+
+    // Post pass: bind ONLY the color RTV (no depth) + the viewport, run `record` (a fullscreen draw
+    // that reads depth/shadows as SRVs and blends over color). Depth must already be in
+    // PixelShaderResource (call DepthToShaderResource first). Separate ExecuteSync.
+    public void RenderColorOnly(Action<ID3D12GraphicsCommandList4> record) {
+        dev.ExecuteSync(cl => {
+            TransitionTo(cl, ResourceStates.RenderTarget);
+            cl.RSSetViewport(0, 0, Width, Height);
+            cl.RSSetScissorRect(Width, Height);
+            cl.OMSetRenderTargets(rtvHandle);   // no DSV — post pass doesn't test/write depth
+            record(cl);
+        });
+    }
+
+    // Depth state transitions for post passes that read scene depth as an SRV.
+    public void DepthToShaderResource() {
+        if (!HasDepth || depthState == ResourceStates.PixelShaderResource) return;
+        dev.ExecuteSync(cl => {
+            cl.ResourceBarrierTransition(depthTarget, depthState, ResourceStates.PixelShaderResource);
+            depthState = ResourceStates.PixelShaderResource;
+        });
+    }
+    public void DepthToWrite() {
+        if (!HasDepth || depthState == ResourceStates.DepthWrite) return;
+        dev.ExecuteSync(cl => {
+            cl.ResourceBarrierTransition(depthTarget, depthState, ResourceStates.DepthWrite);
+            depthState = ResourceStates.DepthWrite;
         });
     }
 

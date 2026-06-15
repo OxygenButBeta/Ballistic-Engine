@@ -108,6 +108,27 @@ public sealed class DX12HDRenderer : HDRenderer {
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct ShadowConstants { public Matrix4x4 LightMvp; }
 
+    // Volumetric fog (full-screen post pass, blended over scene color).
+    ID3D12RootSignature fogRootSig;     // FogConstants CBV (b0) + depth+shadow SRV table (t0,t1) + sampler
+    ID3D12PipelineState fogPso;
+    ID3D12Resource fogCb;
+    unsafe byte* fogCbMapped;
+    Dx12DescriptorHeap fogSrvVisible;   // depth + shadow array, copied per frame
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct FogConstants {
+        public Matrix4x4 InvViewProj;
+        public Matrix4x4 Cascade0, Cascade1, Cascade2, Cascade3;
+        public Vector4 CascadeBias;
+        public Vector3 CameraPos; public float CascadeCountF;
+        public Vector3 SunDirection; public float Density;
+        public Vector3 SunColor; public float HeightFalloff;
+        public Vector3 SkyAmbient; public float BaseHeight;
+        public Vector3 Tint; public float Anisotropy;
+        public float Scattering, AmbientScatter, SunGlow, SunGlowSharpness;
+        public float StepCount, MaxDistance, ShadowMapTexel, Exposure;
+    }
+
     // Per-frame constants (b1) shared by every opaque draw: the cascade matrices + shadow params.
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     unsafe struct FrameConstants {
@@ -167,6 +188,54 @@ public sealed class DX12HDRenderer : HDRenderer {
         frameCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)frameCbSize), ResourceStates.GenericRead);
         frameCbMapped = frameCb.Map<byte>(0);
+
+        BuildFog();
+    }
+
+    unsafe void BuildFog() {
+        // FogConstants CBV (b0) + a 2-SRV table (depth t0, shadow array t1) + clamp sampler s0.
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 0);
+        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
+        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        fogRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("VolumetricFog.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "VolumetricFog.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "VolumetricFog.hlsl");
+
+        // Blend: dest = dest * srcAlpha(transmittance) + src(scatter). Classic over-fog composite.
+        var blend = BlendDescription.Opaque;
+        var rt0 = blend.RenderTarget[0];
+        rt0.BlendEnable = true;
+        rt0.SourceBlend = Blend.One;
+        rt0.DestinationBlend = Blend.SourceAlpha;
+        rt0.BlendOperation = BlendOperation.Add;
+        rt0.SourceBlendAlpha = Blend.Zero;
+        rt0.DestinationBlendAlpha = Blend.Zero;
+        rt0.BlendOperationAlpha = BlendOperation.Add;
+        blend.RenderTarget[0] = rt0;
+
+        fogPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+            RootSignature = fogRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = RasterizerDescription.CullNone, BlendState = blend,
+            DepthStencilState = DepthStencilDescription.None,
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.ColorFormat },
+            DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
+        });
+
+        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<FogConstants>() + 255) & ~255;
+        fogCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+        fogCbMapped = fogCb.Map<byte>(0);
+        fogSrvVisible = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true);
     }
 
     unsafe void BuildShadows() {
@@ -504,9 +573,60 @@ public sealed class DX12HDRenderer : HDRenderer {
                 DrawSkybox(cl, view, proj);
         });
 
+        // --- Volumetric fog (post pass, reads depth+shadows, blends over color) ---
+        // BALLISTIC_FX_VOLUMETRIC=1 forces it on (same harness contract as the GL backend).
+        bool fogOn = PostFX.VolumetricEnabled
+            || Environment.GetEnvironmentVariable("BALLISTIC_FX_VOLUMETRIC") == "1";
+        if (fogOn)
+            DrawFog(view, viewProj, camPos, light);
+
         RenderStats.Scene.DrawCalls = draws;
         RenderStats.Scene.Triangles = tris;
         return new RenderMetrics(draws, 0, (int)tris, 0, 0f);
+    }
+
+    // Full-screen volumetric fog: march the air toward the camera (shadowed sun + sky in-scatter),
+    // blend (scatter, transmittance) over the scene color. Reads scene depth + shadow cascades as SRVs.
+    unsafe void DrawFog(Matrix4x4 view, Matrix4x4 viewProj, Vector3 camPos, LightUniforms light) {
+        Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
+        // Crude sky-ambient for fog in-scatter (engine-radiance scale; the fog Exposure constant matches
+        // the opaque pre-exposure). A proper average-irradiance readback is a follow-up.
+        Vector3 skyAmbient = new Vector3(2000f, 2200f, 2600f);
+        var pf = PostFX;
+        var fc = new FogConstants {
+            InvViewProj = Matrix4x4.Transpose(invVP),
+            Cascade0 = Matrix4x4.Transpose(cascadeMatrices[0]), Cascade1 = Matrix4x4.Transpose(cascadeMatrices[1]),
+            Cascade2 = Matrix4x4.Transpose(cascadeMatrices[2]), Cascade3 = Matrix4x4.Transpose(cascadeMatrices[3]),
+            CascadeBias = new Vector4(0.0015f, 0.0020f, 0.0030f, 0.0050f),
+            CameraPos = camPos, CascadeCountF = CascadeCount,
+            SunDirection = ToNumerics(light.Direction), Density = pf.VolumetricDensity,
+            SunColor = ToNumerics(light.Color), HeightFalloff = pf.VolumetricHeightFalloff,
+            SkyAmbient = skyAmbient, BaseHeight = pf.VolumetricBaseHeight,
+            Tint = ToNumerics(pf.VolumetricTint), Anisotropy = pf.VolumetricAnisotropy,
+            Scattering = pf.VolumetricScattering * pf.VolumetricIntensity,
+            AmbientScatter = pf.VolumetricAmbientScatter * pf.VolumetricIntensity,
+            SunGlow = pf.VolumetricSunGlow, SunGlowSharpness = pf.VolumetricSunGlowSharpness,
+            StepCount = pf.VolumetricStepCount, MaxDistance = pf.VolumetricMaxDistance,
+            ShadowMapTexel = 1f / ShadowMapSize, Exposure = 1.0e-5f,   // match the opaque pre-exposure
+        };
+        *(FogConstants*)fogCbMapped = fc;
+
+        // depth → SRV, shadow array already SRV from RenderShadows. Copy both into the fog heap.
+        target.DepthToShaderResource();
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(0), target.DepthSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(1), shadowMap.SrvCpu, heapType);
+
+        target.RenderColorOnly(cl => {
+            cl.SetGraphicsRootSignature(fogRootSig);
+            cl.SetPipelineState(fogPso);
+            cl.SetDescriptorHeaps(fogSrvVisible.Heap);
+            cl.SetGraphicsRootConstantBufferView(0, fogCb.GPUVirtualAddress);
+            cl.SetGraphicsRootDescriptorTable(1, fogSrvVisible.Gpu(0));
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
+        target.DepthToWrite();   // restore for next frame's opaque pass
     }
 
     // Draw the environment cubemap as the far-plane background (LEqual, no depth write) where opaque
