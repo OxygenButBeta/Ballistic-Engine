@@ -1440,10 +1440,14 @@ public sealed class DX12HDRenderer : HDRenderer {
         DrawTransparents(view, viewProj, camPos, lightDir, lightColor, ambient);
 
         // --- SSGI (volume-driven screen-space GI): local one-bounce light added to the lit scene, BEFORE
-        // fog/SSR so they apply over the GI-enriched colour (matches the GL order). Step B = raw gather +
-        // composite (noisy); temporal + OIDN denoise come in step C. Door BALLISTIC_DX12_SSGI=1 (default
-        // OFF in DX12 until the denoise lands — switched to the volume gate in step D). ---
-        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_SSGI") == "1")
+        // fog/SSR so they apply over the GI-enriched colour (matches the GL order). Gather (SSILVB) +
+        // motion-buffer temporal accumulation + OIDN denoise. Driven by the ScreenSpaceGlobalIllumination
+        // VOLUME (PostFX.SsgiEnabled); BALLISTIC_DX12_SSGI=1/0 force-overrides for A/B + perf. NOTE: the OIDN
+        // denoise round-trip is currently a CPU readback (slow); the zero-copy D3D12<->HIP path is the perf
+        // follow-up (BALLISTIC_DX12_SSGI_OIDN=0 = fast temporal-only meanwhile). ---
+        string ssgiEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SSGI");
+        bool ssgiOn = ssgiEnv == "1" || (ssgiEnv != "0" && PostFX.SsgiEnabled);
+        if (ssgiOn)
             DrawSsgi(view, proj);
 
         // --- Volumetric fog (post pass, reads depth+shadows, blends over HDR scene color) ---
