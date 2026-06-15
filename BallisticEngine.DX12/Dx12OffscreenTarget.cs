@@ -262,6 +262,76 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         }
     }
 
+    // Read the RGB channels of this RGBA16F target back to a CPU float array (length >= Width*Height*3),
+    // converting half->float. For the OIDN denoise round-trip (D3D12 texture -> host -> OIDN). Restores the
+    // target to RenderTarget after. Slow (blocking readback) — the zero-copy D3D12<->HIP path is the perf
+    // follow-up. Assumes the R16G16B16A16_Float format (8 bytes/pixel).
+    public unsafe void ReadColorRgb(float[] dst) {
+        var footprints = new PlacedSubresourceFootPrint[1];
+        var rowCounts = new uint[1]; var rowSizes = new ulong[1];
+        dev.Device.GetCopyableFootprints(RenderTarget.Description, 0, 1, 0,
+            footprints, rowCounts, rowSizes, out ulong totalBytes);
+        PlacedSubresourceFootPrint fp = footprints[0];
+        int rowPitch = (int)fp.Footprint.RowPitch;
+        using ID3D12Resource readback = dev.Device.CreateCommittedResource(
+            HeapProperties.ReadbackHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
+        dev.ExecuteSync(cl => {
+            TransitionTo(cl, ResourceStates.CopySource);
+            cl.CopyTextureRegion(new TextureCopyLocation(readback, fp), 0, 0, 0,
+                new TextureCopyLocation(RenderTarget, 0), null);
+            TransitionTo(cl, ResourceStates.RenderTarget);
+        });
+        byte* mapped = readback.Map<byte>(0);
+        try {
+            int w = Width, h = Height;
+            for (int y = 0; y < h; y++) {
+                Half* row = (Half*)(mapped + (long)y * rowPitch);
+                int o = y * w * 3;
+                for (int x = 0; x < w; x++) {
+                    dst[o + x * 3 + 0] = (float)row[x * 4 + 0];
+                    dst[o + x * 3 + 1] = (float)row[x * 4 + 1];
+                    dst[o + x * 3 + 2] = (float)row[x * 4 + 2];
+                }
+            }
+        } finally { readback.Unmap(0); }
+    }
+
+    // Upload a CPU float RGB array (length >= Width*Height*3) into this RGBA16F target (alpha = 1),
+    // converting float->half. Leaves the target in PixelShaderResource (ready to sample). Pairs with
+    // ReadColorRgb for the OIDN round-trip.
+    public unsafe void WriteColorRgb(float[] src) {
+        var footprints = new PlacedSubresourceFootPrint[1];
+        var rowCounts = new uint[1]; var rowSizes = new ulong[1];
+        dev.Device.GetCopyableFootprints(RenderTarget.Description, 0, 1, 0,
+            footprints, rowCounts, rowSizes, out ulong totalBytes);
+        PlacedSubresourceFootPrint fp = footprints[0];
+        int rowPitch = (int)fp.Footprint.RowPitch;
+        using ID3D12Resource upload = dev.Device.CreateCommittedResource(
+            HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer(totalBytes), ResourceStates.GenericRead);
+        byte* mapped = upload.Map<byte>(0);
+        int w = Width, h = Height;
+        Half one = (Half)1f;
+        for (int y = 0; y < h; y++) {
+            Half* row = (Half*)(mapped + (long)y * rowPitch);
+            int o = y * w * 3;
+            for (int x = 0; x < w; x++) {
+                row[x * 4 + 0] = (Half)src[o + x * 3 + 0];
+                row[x * 4 + 1] = (Half)src[o + x * 3 + 1];
+                row[x * 4 + 2] = (Half)src[o + x * 3 + 2];
+                row[x * 4 + 3] = one;
+            }
+        }
+        upload.Unmap(0);
+        dev.ExecuteSync(cl => {
+            TransitionTo(cl, ResourceStates.CopyDest);
+            cl.CopyTextureRegion(new TextureCopyLocation(RenderTarget, 0), 0, 0, 0,
+                new TextureCopyLocation(upload, fp), null);
+            TransitionTo(cl, ResourceStates.PixelShaderResource);
+        });
+    }
+
     unsafe void WriteBmp(string path, byte* src, int rowPitch) {
         int w = Width, h = Height;
         int rowBytes = w * 3;

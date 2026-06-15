@@ -134,11 +134,17 @@ public sealed class DX12HDRenderer : HDRenderer {
     unsafe byte* ssgiCbMapped;
     Dx12OffscreenTarget ssgiTarget;         // half-res RGBA16F raw GI (rgb + edge-fade)
     Dx12OffscreenTarget ssgiHistoryA, ssgiHistoryB;  // half-res ping-pong accumulated GI (rgb + history len)
+    Dx12OffscreenTarget ssgiDenoised;       // half-res OIDN output (the GL a-trous replacement)
     Dx12OffscreenTarget ssgiScene;          // full-res scratch: combine writes here, copied back to `target`
     Dx12DescriptorHeap ssgiSrvVisible;      // 3 SRVs per pass
     int ssgiFrame;                          // slice-set rotation counter
     bool ssgiHistWriteB;                    // temporal ping-pong toggle
     bool ssgiHistValid;                     // false on first frame / resize
+    // OIDN spatial denoise (replaces the GL a-trous). Readback round-trip (D3D12 -> host floats -> OIDN ->
+    // upload); the zero-copy D3D12<->HIP shared-buffer path is the perf follow-up. Created lazily on first use.
+    Dx12OidnDenoiser ssgiOidn;
+    bool ssgiOidnTried;
+    float[] ssgiCpuColor, ssgiCpuOut;       // host float3 buffers sized to the half-res GI
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct SsgiConstants {
         public Matrix4x4 Projection; public Matrix4x4 InvProjection; public Matrix4x4 ViewMatrix;
@@ -645,6 +651,7 @@ public sealed class DX12HDRenderer : HDRenderer {
 
     void AllocSsgiTargets() {
         ssgiTarget?.Dispose(); ssgiScene?.Dispose(); ssgiHistoryA?.Dispose(); ssgiHistoryB?.Dispose();
+        ssgiDenoised?.Dispose();
         int w = System.Math.Max(1, targetW / 2), h = System.Math.Max(1, targetH / 2);
         ssgiTarget = new Dx12OffscreenTarget(dev, w, h, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
@@ -652,9 +659,12 @@ public sealed class DX12HDRenderer : HDRenderer {
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         ssgiHistoryB = new Dx12OffscreenTarget(dev, w, h, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
+        ssgiDenoised = new Dx12OffscreenTarget(dev, w, h, withDepth: false,
+            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         ssgiScene = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
-        ssgiHistValid = false;   // accumulated history is stale after a (re)allocation
+        ssgiHistValid = false;       // accumulated history is stale after a (re)allocation
+        ssgiCpuColor = ssgiCpuOut = null;   // host buffers re-size to the new half-res
     }
 
     // Geometry pass PSO: same vertex layout + per-draw CBV(b0) + 6 material SRVs(t0..t5) as the forward
@@ -1856,12 +1866,31 @@ public sealed class DX12HDRenderer : HDRenderer {
             cl.DrawInstanced(3, 1, 0, 0);
         });
 
-        // Combine (full-res) → ssgiScene, reading scene (t0) + accumulated GI (t1; t2 unused, valid descriptor).
-        histWrite.ColorToShaderResource();
+        // OIDN spatial denoise (replaces the GL a-trous): readback the accumulated half-res GI → OIDN HDR
+        // RT filter → upload to ssgiDenoised. The combine reads the denoised result. Slow per-frame round-
+        // trip (zero-copy D3D12↔HIP is the perf follow-up); BALLISTIC_DX12_SSGI_OIDN=0 falls back to the
+        // raw temporal result for A/B. Degrades gracefully if the OIDN DLLs aren't present.
+        Dx12OffscreenTarget giForCombine = histWrite;
+        bool oidnOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SSGI_OIDN") != "0";
+        if (oidnOn) {
+            if (!ssgiOidnTried) { ssgiOidnTried = true; ssgiOidn = new Dx12OidnDenoiser(); }
+            if (ssgiOidn != null && ssgiOidn.Valid) {
+                int w = ssgiTarget.Width, h = ssgiTarget.Height, n = w * h * 3;
+                if (ssgiCpuColor == null || ssgiCpuColor.Length != n) { ssgiCpuColor = new float[n]; ssgiCpuOut = new float[n]; }
+                histWrite.ReadColorRgb(ssgiCpuColor);
+                if (ssgiOidn.DenoiseHdr(ssgiCpuColor, null, null, ssgiCpuOut, w, h)) {
+                    ssgiDenoised.WriteColorRgb(ssgiCpuOut);   // leaves ssgiDenoised in PixelShaderResource
+                    giForCombine = ssgiDenoised;
+                }
+            }
+        }
+        if (ReferenceEquals(giForCombine, histWrite)) histWrite.ColorToShaderResource();   // temporal-only path
+
+        // Combine (full-res) → ssgiScene, reading scene (t0) + (denoised) GI (t1; t2 unused, valid descriptor).
         int cbi = ssgiSrvVisible.AllocateRange(3);
         dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(cbi + 0), target.ColorSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(cbi + 1), histWrite.ColorSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(cbi + 2), histWrite.ColorSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(cbi + 1), giForCombine.ColorSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(cbi + 2), giForCombine.ColorSrvCpu, heapType);
         ssgiScene.RenderColorOnly(cl => {
             cl.SetGraphicsRootSignature(ssgiRootSig); cl.SetPipelineState(ssgiCombinePso);
             cl.SetDescriptorHeaps(ssgiSrvVisible.Heap);
