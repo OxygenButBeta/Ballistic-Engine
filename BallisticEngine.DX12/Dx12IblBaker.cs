@@ -50,7 +50,7 @@ public sealed class Dx12IblBaker : IDisposable {
     public CpuDescriptorHandle BrdfSrv => Dx12Backend.SrvStore.Cpu(brdfSrvIndex);
     public int PrefilterMipCount => PrefilterMips;
 
-    // ProcSkyConstants must match ProceduralSky.hlsl's cbuffer (and DX12HDRenderer's copy).
+    // ProcSkyConstants must match ProceduralSky.hlsl's cbuffer (and DX12HDRenderer's copy) byte-for-byte.
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct ProcSkyConstants {
         public Matrix4x4 ViewProjNoTranslate;
@@ -58,7 +58,12 @@ public sealed class Dx12IblBaker : IDisposable {
         public Vector3 SunRadiance; public float SunDiskIntensity;
         public Vector3 GroundAlbedo; public float AirDensity;
         public float Haze, HazeAnisotropy, OzoneDensity, MultiScatter;
-        public float Exposure, BakeFace; public Vector2 Pad;
+        public float Exposure, BakeFace; public Vector2 Pad0;
+        // Volumetric clouds + cirrus + stars (GL Sky_Procedural.glsl parity).
+        public float CloudsEnabled, CloudCoverage, CloudDensity, CloudAltitude;
+        public float CloudThickness, CloudScale, CloudDetail, CloudAmbient;
+        public Vector3 CloudWindOffset; public float CloudWindAngle;
+        public float CirrusCoverage, StarIntensity; public Vector2 Pad1;
     }
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct IblConstants { public int Face; public float Roughness; public float SourceResolution; public float Pad; }
@@ -151,12 +156,19 @@ public sealed class Dx12IblBaker : IDisposable {
     // Re-bake the IBL maps if the sky params changed. `sun`/atmosphere come from the scene. Runs its own
     // ExecuteUpload (separate command list from the render path).
     public unsafe void EnsureBaked(ProceduralSky sky, Vector3 sunDir, Vector3 sunRadiance, float sunAngularRadius) {
+        float cloudTime = Dx12SkyCloudParams.CloudTime(sky);
         int stamp = System.HashCode.Combine(
             System.HashCode.Combine(sunDir.X, sunDir.Y, sunDir.Z, sunRadiance.X),
             System.HashCode.Combine(sky.AirDensity, sky.Haze, sky.OzoneDensity, sky.MultipleScattering),
-            System.HashCode.Combine(sky.Exposure, sky.SunDiskIntensity, sky.GroundColor.X, sunAngularRadius));
+            System.HashCode.Combine(sky.Exposure, sky.SunDiskIntensity, sky.GroundColor.X, sunAngularRadius),
+            System.HashCode.Combine(sky.CloudsEnabled, sky.CloudCoverage, sky.CloudDensity, sky.CloudAltitude),
+            System.HashCode.Combine(sky.CloudThickness, sky.CloudScale, sky.CloudDetail, sky.CloudAmbient),
+            System.HashCode.Combine(sky.CirrusCoverage, sky.StarIntensity, sky.CloudWindDirection, cloudTime));
         if (stamp == paramStamp && HasBaked) return;
         paramStamp = stamp;
+
+        Vector3 windOffset = Dx12SkyCloudParams.WindOffset(sky, cloudTime);
+        float windAngle = Dx12SkyCloudParams.WindRadians(sky);
 
         // Fill 6 env-bake CBVs (one per face).
         int skyCbSize = (System.Runtime.InteropServices.Marshal.SizeOf<ProcSkyConstants>() + 255) & ~255;
@@ -170,6 +182,16 @@ public sealed class Dx12IblBaker : IDisposable {
                 HazeAnisotropy = Math.Clamp(sky.HazeAnisotropy, 0f, 0.99f),
                 OzoneDensity = MathF.Max(sky.OzoneDensity, 0f), MultiScatter = MathF.Max(sky.MultipleScattering, 1f),
                 Exposure = MathF.Max(sky.Exposure, 0f), BakeFace = face,
+                // Volumetric clouds + cirrus + stars (clamps mirror GLProceduralSkyPass).
+                CloudsEnabled = sky.CloudsEnabled ? 1f : 0f, CloudCoverage = Math.Clamp(sky.CloudCoverage, 0f, 1f),
+                CloudDensity = MathF.Max(sky.CloudDensity, 0f),
+                CloudAltitude = Math.Clamp(sky.CloudAltitude, 600f, 20000f),
+                CloudThickness = Math.Clamp(sky.CloudThickness, 100f, 20000f),
+                CloudScale = MathF.Max(sky.CloudScale, 0.05f), CloudDetail = Math.Clamp(sky.CloudDetail, 0f, 1f),
+                CloudAmbient = MathF.Max(sky.CloudAmbient, 0f),
+                CloudWindOffset = windOffset, CloudWindAngle = windAngle,
+                CirrusCoverage = Math.Clamp(sky.CirrusCoverage, 0f, 1f),
+                StarIntensity = MathF.Max(sky.StarIntensity, 0f),
             };
             *(ProcSkyConstants*)(procSkyCbMapped + face * skyCbSize) = sc;
         }

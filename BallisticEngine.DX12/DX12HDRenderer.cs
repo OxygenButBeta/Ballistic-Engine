@@ -167,6 +167,7 @@ public sealed class DX12HDRenderer : HDRenderer {
     ID3D12Resource procSkyCb;
     unsafe byte* procSkyCbMapped;
 
+    // MUST match ProceduralSky.hlsl's cbuffer AND Dx12IblBaker.ProcSkyConstants byte-for-byte.
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct ProcSkyConstants {
         public Matrix4x4 ViewProjNoTranslate;
@@ -174,7 +175,12 @@ public sealed class DX12HDRenderer : HDRenderer {
         public Vector3 SunRadiance; public float SunDiskIntensity;
         public Vector3 GroundAlbedo; public float AirDensity;
         public float Haze, HazeAnisotropy, OzoneDensity, MultiScatter;
-        public float Exposure; public Vector3 Pad;
+        public float Exposure, BakeFace; public Vector2 Pad0;
+        // Volumetric clouds + cirrus + stars (GL Sky_Procedural.glsl parity).
+        public float CloudsEnabled, CloudCoverage, CloudDensity, CloudAltitude;
+        public float CloudThickness, CloudScale, CloudDetail, CloudAmbient;
+        public Vector3 CloudWindOffset; public float CloudWindAngle;
+        public float CirrusCoverage, StarIntensity; public Vector2 Pad1;
     }
 
     // Per-draw constant buffer ring: one upload heap sub-allocated in 256-byte slots, one slot per draw.
@@ -1545,6 +1551,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         sunDir = Vector3.Normalize(sunDir);
         float sunAngularRadius = (DirectionalLight.Instance?.AngularDiameter ?? 0.53f) * 0.5f * (MathF.PI / 180f);
 
+        float cloudTime = Dx12SkyCloudParams.CloudTime(sky);
         var sc = new ProcSkyConstants {
             ViewProjNoTranslate = Matrix4x4.Transpose(viewNoT * proj),
             SunDirection = sunDir, SunAngularRadius = MathF.Max(sunAngularRadius, 1e-4f),
@@ -1553,6 +1560,14 @@ public sealed class DX12HDRenderer : HDRenderer {
             Haze = MathF.Max(sky.Haze, 0f), HazeAnisotropy = Math.Clamp(sky.HazeAnisotropy, 0f, 0.99f),
             OzoneDensity = MathF.Max(sky.OzoneDensity, 0f), MultiScatter = MathF.Max(sky.MultipleScattering, 1f),
             Exposure = MathF.Max(sky.Exposure, 0f),
+            // Volumetric clouds + cirrus + stars (clamps mirror GLProceduralSkyPass).
+            CloudsEnabled = sky.CloudsEnabled ? 1f : 0f, CloudCoverage = Math.Clamp(sky.CloudCoverage, 0f, 1f),
+            CloudDensity = MathF.Max(sky.CloudDensity, 0f), CloudAltitude = Math.Clamp(sky.CloudAltitude, 600f, 20000f),
+            CloudThickness = Math.Clamp(sky.CloudThickness, 100f, 20000f), CloudScale = MathF.Max(sky.CloudScale, 0.05f),
+            CloudDetail = Math.Clamp(sky.CloudDetail, 0f, 1f), CloudAmbient = MathF.Max(sky.CloudAmbient, 0f),
+            CloudWindOffset = Dx12SkyCloudParams.WindOffset(sky, cloudTime),
+            CloudWindAngle = Dx12SkyCloudParams.WindRadians(sky),
+            CirrusCoverage = Math.Clamp(sky.CirrusCoverage, 0f, 1f), StarIntensity = MathF.Max(sky.StarIntensity, 0f),
         };
         *(ProcSkyConstants*)procSkyCbMapped = sc;
 
