@@ -101,6 +101,34 @@ public sealed class DX12HDRenderer : HDRenderer {
         public Vector2 TexelSize; public Vector2 Pad2;
     }
 
+    // Transparent forward pass: after deferred + sky, draw Material.Transparent submeshes back-to-front,
+    // alpha-blended, depth-testing the G-buffer depth (LEqual, no write). Full forward PBR (sun + IBL +
+    // shadows + clustered punctual) sampling material maps directly (TransparentForward.hlsl).
+    ID3D12RootSignature transparentRootSig;  // b0 TransparentConstants + b1 FrameConstants + 6-SRV material table + 7-SRV lighting table + 2 samplers
+    ID3D12PipelineState transparentPso;
+    ID3D12Resource transparentCb;            // per-draw TransparentConstants ring
+    unsafe byte* transparentCbMapped;
+    int transparentCbSlotSize, transparentCbSlotCount;
+    Dx12DescriptorHeap transparentSrvVisible; // per frame: 7 lighting SRVs + 6 material SRVs per draw
+    readonly List<(IStaticMeshRenderer r, int submesh, float dist)> transparentItems = new();
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct TransparentConstants {
+        public Matrix4x4 Mvp;
+        public Matrix4x4 Model;
+        public Matrix4x4 View;
+        public Vector3 LightDir; public float Exposure;
+        public Vector3 LightColor; public float Metallic;
+        public Vector3 Ambient; public float Roughness;
+        public Vector3 CameraPos; public float SpecularReflectance;
+        public Vector4 BaseColorFactor;
+        public Vector3 EmissiveFactor; public float HasEmissive;
+        public float NormalStrength, NormalFlipY, HasMetallicMap, HasRoughnessMap;
+        public float PackedOrm, Cutout, UseIBL, PrefilterMaxMip;
+        public float Opacity, PunctualCount; public Vector2 ScreenSize;
+        public Vector2 ClusterNearFar; public Vector2 Pad;
+    }
+
     // Camera projection near/far — shared by the projection build AND the froxel log-Z grid (must match).
     const float CameraNear = 0.1f, CameraFar = 1000f;
 
@@ -328,6 +356,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         frameCbMapped = frameCb.Map<byte>(0);
 
         BuildDeferredLighting();
+        BuildTransparentPass();
         BuildFog();
         BuildSsr();
         BuildTaa();
@@ -504,6 +533,66 @@ public sealed class DX12HDRenderer : HDRenderer {
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 12, shaderVisible: true);
 
         clusteredLights = new Dx12ClusteredLights(dev);
+    }
+
+    // Transparent forward PSO: same 4-stream vertex layout as the geometry pass, but a PIXEL shader that
+    // shades forward (TransparentForward.hlsl) and ALPHA-BLENDS (SrcAlpha/InvSrcAlpha) with depth-test
+    // LEqual + NO depth write against the G-buffer depth. Root sig: b0 per-draw TransparentConstants,
+    // b1 per-frame FrameConstants, table0 = 6 material SRVs (t0..t5), table1 = 7 lighting SRVs (t6..t12:
+    // irradiance/prefilter/BRDF/shadow + cluster lights/grid/index), s0 wrap + s1 clamp.
+    unsafe void BuildTransparentPass() {
+        var drawCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var frameCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.Pixel);
+        var matRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, MaterialSrvCount, baseShaderRegister: 0);
+        var matTable = new RootParameter1(new RootDescriptorTable1(matRange), ShaderVisibility.Pixel);
+        var lightRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 7, baseShaderRegister: 6);
+        var lightTable = new RootParameter1(new RootDescriptorTable1(lightRange), ShaderVisibility.Pixel);
+        var wrap = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap,
+            AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 16,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        var clamp = new StaticSamplerDescription(ShaderVisibility.Pixel, 1, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        transparentRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.AllowInputAssemblerInputLayout,
+                new[] { drawCbv, frameCbv, matTable, lightTable }, new[] { wrap, clamp })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("TransparentForward.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "TransparentForward.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "TransparentForward.hlsl");
+        var layout = new InputLayoutDescription(
+            new InputElementDescription("POSITION", 0, Format.R32G32B32_Float, 0, 0),
+            new InputElementDescription("NORMAL", 0, Format.R32G32B32_Float, 0, 1),
+            new InputElementDescription("TEXCOORD", 0, Format.R32G32_Float, 0, 2),
+            new InputElementDescription("TANGENT", 0, Format.R32G32B32A32_Float, 0, 3));
+        // Depth test LEqual, NO write (the G-buffer depth occludes; transparents don't write depth — sort
+        // handles their order). Straight alpha blend over the HDR scene (composite tonemaps later).
+        var ds = DepthStencilDescription.Default;
+        ds.DepthWriteMask = DepthWriteMask.Zero;
+        ds.DepthFunc = ComparisonFunction.LessEqual;
+        transparentPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+            RootSignature = transparentRootSig, VertexShader = vs, PixelShader = ps, InputLayout = layout,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = RasterizerDescription.CullClockwise,   // back-face cull (forward parity)
+            BlendState = new BlendDescription(Blend.SourceAlpha, Blend.InverseSourceAlpha),
+            DepthStencilState = ds,
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
+            DepthStencilFormat = Dx12GBuffer.DepthFormat, SampleDescription = new SampleDescription(1, 0),
+        });
+
+        transparentCbSlotSize = (System.Runtime.InteropServices.Marshal.SizeOf<TransparentConstants>() + 255) & ~255;
+        transparentCbSlotCount = 2048;   // transparent submesh draws per frame ceiling
+        transparentCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)((long)transparentCbSlotSize * transparentCbSlotCount)), ResourceStates.GenericRead);
+        transparentCbMapped = transparentCb.Map<byte>(0);
+        // Per frame: 7 lighting SRVs (bound once) + 6 material SRVs per draw.
+        transparentSrvVisible = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
+            7 + transparentCbSlotCount * MaterialSrvCount, shaderVisible: true);
     }
 
     unsafe void BuildComposite() {
@@ -1003,6 +1092,9 @@ public sealed class DX12HDRenderer : HDRenderer {
                     if (!AabbInFrustum(lmin, lmax, model)) { culled++; continue; }
                     Material mat = r.MaterialFor(s);
                     if (mat is null) continue;
+                    // Transparent submeshes can't be deferred-shaded (no blending in a G-buffer) — they're
+                    // drawn FORWARD after deferred lighting + sky (DrawTransparents). Skip them here.
+                    if (mat.Transparent) continue;
                     if (slot >= cbSlotCount) break;
 
                     bool hasMetal = mat.Metallic is not null;
@@ -1067,6 +1159,10 @@ public sealed class DX12HDRenderer : HDRenderer {
             else
                 DrawSkybox(cl, view, proj);
         });
+
+        // === TRANSPARENTS: forward, back-to-front, alpha-blended over the HDR scene + sky, depth-testing
+        // the G-buffer depth (LEqual, no write). Runs before fog/SSR/TAA so they apply over the glass. ===
+        DrawTransparents(view, viewProj, camPos, lightDir, lightColor, ambient);
 
         // --- Volumetric fog (post pass, reads depth+shadows, blends over HDR scene color) ---
         // BALLISTIC_FX_VOLUMETRIC=1 forces it on (same harness contract as the GL backend).
@@ -1160,6 +1256,129 @@ public sealed class DX12HDRenderer : HDRenderer {
             cl.SetGraphicsRootDescriptorTable(2, deferredSrvVisible.Gpu(b));
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
+        });
+    }
+
+    // Forward transparent pass (clustered-deferred can't blend a G-buffer, so transparents are FORWARD).
+    // Collects every Material.Transparent submesh (frustum-culled), sorts back-to-front by world-space
+    // submesh-center distance, then draws each alpha-blended over the HDR scene + sky, depth-testing the
+    // G-buffer depth (LEqual, no write). Full forward PBR (sun + IBL + shadows + clustered punctual),
+    // sampling material maps directly. The per-frame lighting SRVs (IBL/shadow/cluster) bind once.
+    unsafe void DrawTransparents(Matrix4x4 view, Matrix4x4 viewProj, Vector3 camPos,
+                                 Vector3 lightDir, Vector3 lightColor, Vector3 ambient) {
+        // 1) Gather transparent submeshes (per-submesh frustum cull, like the geometry pass).
+        transparentItems.Clear();
+        foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
+            if (r is null || !r.IsActive || !r.IsRenderable) continue;
+            Mesh mesh = r.SharedMesh;
+            if (mesh is null) continue;
+            Matrix4x4 model = ToNumerics(r.Transform.WorldMatrix);
+            int only = r.SubMeshIndex;
+            int first = only >= 0 ? only : 0;
+            int last = only >= 0 ? only : mesh.SubMeshes.Length - 1;
+            for (int s = first; s <= last; s++) {
+                if ((uint)s >= (uint)mesh.SubMeshes.Length) break;
+                if (mesh.SubMeshes[s].IndexCount <= 0) continue;
+                Material mat = r.MaterialFor(s);
+                if (mat is null || !mat.Transparent) continue;
+                mesh.GetSubMeshBounds(s, out GLVector3 lmin, out GLVector3 lmax);
+                if (!AabbInFrustum(lmin, lmax, model)) continue;
+                // world-space submesh center for the back-to-front sort
+                var localCenter = new Vector3((lmin.X + lmax.X) * 0.5f, (lmin.Y + lmax.Y) * 0.5f, (lmin.Z + lmax.Z) * 0.5f);
+                Vector3 worldCenter = Vector3.Transform(localCenter, model);
+                transparentItems.Add((r, s, (worldCenter - camPos).LengthSquared()));
+            }
+        }
+        if (transparentItems.Count == 0) return;
+
+        // Back-to-front: farthest first (descending squared distance).
+        transparentItems.Sort((a, c) => c.dist.CompareTo(a.dist));
+
+        // 2) Per-frame lighting SRVs (t6..t12: irradiance, prefilter, BRDF, shadow + cluster lights/grid/index).
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        transparentSrvVisible.Reset();
+        int lightBase = transparentSrvVisible.AllocateRange(7);
+        dev.Device.CopyDescriptorsSimple(1, transparentSrvVisible.Cpu(lightBase + 0), ibl.IrradianceSrv, heapType);
+        dev.Device.CopyDescriptorsSimple(1, transparentSrvVisible.Cpu(lightBase + 1), ibl.PrefilterSrv, heapType);
+        dev.Device.CopyDescriptorsSimple(1, transparentSrvVisible.Cpu(lightBase + 2), ibl.BrdfSrv, heapType);
+        dev.Device.CopyDescriptorsSimple(1, transparentSrvVisible.Cpu(lightBase + 3), shadowMap.SrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, transparentSrvVisible.Cpu(lightBase + 4), clusteredLights.LightSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, transparentSrvVisible.Cpu(lightBase + 5), clusteredLights.GridSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, transparentSrvVisible.Cpu(lightBase + 6), clusteredLights.IndexSrvCpu, heapType);
+
+        var fallbackDiffuse = DefaultTextures.Neutral(TextureType.Diffuse) as Dx12Texture2D;
+        float prefMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f;
+        float useIbl = iblActiveThisFrame ? 1f : 0f;
+        float punctualCount = clusteredLights.LightCount;
+        int tslot = 0;
+
+        // 3) Draw back-to-front into the HDR color, depth-testing the G-buffer depth (already DepthRead).
+        target.RenderColorWithExternalDepth(gbuffer.DsvHandle, cl => {
+            cl.SetGraphicsRootSignature(transparentRootSig);
+            cl.SetPipelineState(transparentPso);
+            cl.SetDescriptorHeaps(transparentSrvVisible.Heap);
+            cl.SetGraphicsRootConstantBufferView(1, frameCb.GPUVirtualAddress);
+            cl.SetGraphicsRootDescriptorTable(3, transparentSrvVisible.Gpu(lightBase));
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+
+            foreach (var item in transparentItems) {
+                if (tslot >= transparentCbSlotCount) break;
+                IStaticMeshRenderer r = item.r;
+                Mesh mesh = r.SharedMesh;
+                var vb = mesh.VertexBuffer as Dx12Buffer<GLVector3>;
+                var ib = mesh.IndexBuffer as Dx12IndexBuffer;
+                var nb = mesh.NormalBuffer as Dx12Buffer<GLVector3>;
+                var ub = mesh.UvBuffer as Dx12Buffer<OpenTK.Mathematics.Vector2>;
+                var tb = mesh.TangentBuffer as Dx12Buffer<OpenTK.Mathematics.Vector4>;
+                if (vb?.Resource is null || ib?.Resource is null ||
+                    nb?.Resource is null || ub?.Resource is null || tb?.Resource is null) continue;
+                SubMeshData sub = mesh.SubMeshes[item.submesh];
+                Material mat = r.MaterialFor(item.submesh);
+                if (mat is null) continue;
+
+                Matrix4x4 model = ToNumerics(r.Transform.WorldMatrix);
+                Matrix4x4 mvp = model * viewProj;
+                bool hasMetal = mat.Metallic is not null;
+                bool hasRough = mat.Roughness is not null;
+                var c = new TransparentConstants {
+                    Mvp = Matrix4x4.Transpose(mvp), Model = Matrix4x4.Transpose(model),
+                    View = Matrix4x4.Transpose(view),
+                    LightDir = lightDir, Exposure = 1f, LightColor = lightColor, Metallic = mat.MetallicFactor,
+                    Ambient = ambient, Roughness = mat.RoughnessFactor,
+                    CameraPos = camPos, SpecularReflectance = mat.SpecularReflectance,
+                    BaseColorFactor = ToNumerics(mat.BaseColorFactor),
+                    EmissiveFactor = ToNumerics(mat.EmissiveColor) * mat.EmissiveIntensity,
+                    HasEmissive = mat.IsEmissive ? 1f : 0f,
+                    NormalStrength = mat.NormalStrength, NormalFlipY = mat.NormalFlipY ? 1f : 0f,
+                    HasMetallicMap = hasMetal ? 1f : 0f, HasRoughnessMap = hasRough ? 1f : 0f,
+                    PackedOrm = mat.PackedOrm ? 1f : 0f, Cutout = mat.Cutout ? 1f : 0f,
+                    UseIBL = useIbl, PrefilterMaxMip = prefMaxMip,
+                    Opacity = mat.Opacity, PunctualCount = punctualCount,
+                    ScreenSize = new Vector2(targetW, targetH), ClusterNearFar = new Vector2(CameraNear, CameraFar),
+                };
+                *(TransparentConstants*)(transparentCbMapped + (long)tslot * transparentCbSlotSize) = c;
+                cl.SetGraphicsRootConstantBufferView(0,
+                    transparentCb.GPUVirtualAddress + (ulong)((long)tslot * transparentCbSlotSize));
+
+                int matBase = transparentSrvVisible.AllocateRange(MaterialSrvCount);
+                BindSrvInto(transparentSrvVisible, matBase + 0, mat.Diffuse, TextureType.Diffuse, fallbackDiffuse);
+                BindSrvInto(transparentSrvVisible, matBase + 1, mat.Normal, TextureType.Normal, null);
+                BindSrvInto(transparentSrvVisible, matBase + 2, mat.Metallic, TextureType.Metallic, null);
+                BindSrvInto(transparentSrvVisible, matBase + 3, mat.Roughness, TextureType.Roughness, null);
+                BindSrvInto(transparentSrvVisible, matBase + 4, mat.AO, TextureType.AO, null);
+                BindSrvInto(transparentSrvVisible, matBase + 5, mat.Emissive, TextureType.Emissive, null);
+                cl.SetGraphicsRootDescriptorTable(2, transparentSrvVisible.Gpu(matBase));
+
+                Span<VertexBufferView> vbViews = stackalloc VertexBufferView[4];
+                vbViews[0] = new VertexBufferView(vb.GpuAddress, (uint)vb.ByteSize, (uint)vb.Stride);
+                vbViews[1] = new VertexBufferView(nb.GpuAddress, (uint)nb.ByteSize, (uint)nb.Stride);
+                vbViews[2] = new VertexBufferView(ub.GpuAddress, (uint)ub.ByteSize, (uint)ub.Stride);
+                vbViews[3] = new VertexBufferView(tb.GpuAddress, (uint)tb.ByteSize, (uint)tb.Stride);
+                cl.IASetVertexBuffers(0, vbViews);
+                cl.IASetIndexBuffer(new IndexBufferView(ib.GpuAddress, (uint)ib.ByteSize, Format.R32_UInt));
+                cl.DrawIndexedInstanced((uint)sub.IndexCount, 1, (uint)sub.IndexStart, 0, 0);
+                tslot++;
+            }
         });
     }
 
@@ -1582,11 +1801,14 @@ public sealed class DX12HDRenderer : HDRenderer {
     // texture resolves to that slot's neutral default (DefaultTextures.Neutral) so the descriptor is
     // always valid — matching the GL Material.Activate fallback (metallic 0, roughness 1, AO 1, flat +Z
     // normal, dark emissive). `explicitFallback` lets diffuse use a white fallback.
-    void BindSrv(int visibleSlot, Texture2D tex, TextureType type, Dx12Texture2D explicitFallback) {
+    void BindSrv(int visibleSlot, Texture2D tex, TextureType type, Dx12Texture2D explicitFallback)
+        => BindSrvInto(srvVisible, visibleSlot, tex, type, explicitFallback);
+
+    void BindSrvInto(Dx12DescriptorHeap heap, int slot, Texture2D tex, TextureType type, Dx12Texture2D explicitFallback) {
         var dx = (tex as Dx12Texture2D)
                  ?? explicitFallback
                  ?? (DefaultTextures.Neutral(type) as Dx12Texture2D);
-        dev.Device.CopyDescriptorsSimple(1, srvVisible.Cpu(visibleSlot), dx.SrvCpu,
+        dev.Device.CopyDescriptorsSimple(1, heap.Cpu(slot), dx.SrvCpu,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
     }
 
