@@ -578,4 +578,68 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         QueryBounds(c - ex, c + ex, layerMask, results);
         return results.Count - before;
     }
+
+    // ---- Precise overlap (narrowphase shape test) ---------------------------
+
+    // Collects EVERY body the swept shape touches at (or very near) zero distance — i.e. true
+    // overlaps with the query shape, not just AABB candidates. A near-zero-distance sweep reports
+    // every initially-overlapping collidable through OnHit (t≈0) / OnHitAtZeroT; we keep all of them
+    // (layer-filtered, deduplicated) instead of clipping to the nearest like a cast.
+    struct OverlapSweepCollector : ISweepHitHandler {
+        public BepuPhysicsWorld World;
+        public int LayerMask;
+        public List<IPhysicsBody> Results;
+
+        public bool AllowTest(CollidableReference collidable) =>
+            LayerMask == ~0 || (LayerMask & (1 << World.GetMaterial(collidable).Layer)) != 0;
+        public bool AllowTest(CollidableReference collidable, int child) => true;
+
+        const float OverlapEpsilon = 1e-3f; // a hit within this travel distance counts as an overlap
+
+        void Add(CollidableReference collidable) {
+            BepuBody body = World.Lookup(collidable);
+            if (body is not null && !Results.Contains(body))
+                Results.Add(body);
+        }
+
+        public void OnHit(ref float maximumT, float t, in Vector3 hitLocation, in Vector3 hitNormal,
+            CollidableReference collidable) {
+            // Do NOT lower maximumT — we want to keep visiting every overlapping leaf, not converge on
+            // the nearest. Only count hits already touching at the start of the sweep.
+            if (t <= OverlapEpsilon)
+                Add(collidable);
+        }
+
+        public void OnHitAtZeroT(ref float maximumT, CollidableReference collidable) => Add(collidable);
+    }
+
+    public int OverlapShape(PhysicsShape shape, TkVector3 position, Quaternion rotation, int layerMask,
+        List<IPhysicsBody> results) {
+        if (Simulation is null)
+            return 0;
+
+        var pose = new RigidPose(ToNumerics(position), ToNumerics(rotation));
+        // A short sweep in an arbitrary direction; only the zero-distance (initial overlap) hits are
+        // kept, so the direction is irrelevant. Velocity is unit so maxT is a distance.
+        var velocity = new BodyVelocity { Linear = new Vector3(0f, -1f, 0f) };
+        var handler = new OverlapSweepCollector { World = this, LayerMask = layerMask, Results = results };
+        const float tinySweep = 1e-3f;
+
+        int before = results.Count;
+        switch (shape) {
+            case BoxShape box:
+                Simulation.Sweep(MakeBox(box), pose, velocity, tinySweep, bufferPool, ref handler);
+                break;
+            case SphereShape sphere:
+                Simulation.Sweep(MakeSphere(sphere), pose, velocity, tinySweep, bufferPool, ref handler);
+                break;
+            case CapsuleShape capsule:
+                Simulation.Sweep(MakeCapsule(capsule), pose, velocity, tinySweep, bufferPool, ref handler);
+                break;
+            default:
+                Debugging.LogError($"Physics: OverlapShape needs a convex shape (box/sphere/capsule); got {shape?.GetType().Name}.");
+                return 0;
+        }
+        return results.Count - before;
+    }
 }

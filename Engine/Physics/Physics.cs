@@ -99,6 +99,23 @@ public static class Physics {
         return ToColliders(bodies);
     }
 
+    // PRECISE overlap: only colliders whose SHAPE truly intersects the convex query shape (Bepu's
+    // narrowphase, no AABB/rotation false positives). Costlier than OverlapSphere/OverlapBox above —
+    // reach for it when correctness matters (a tight fit test, a melee hitbox). Convex query only.
+    public static List<Collider> OverlapSpherePrecise(Vector3 center, float radius, int layerMask = ~0) =>
+        OverlapShape(new SphereShape(radius), center, Quaternion.Identity, layerMask);
+
+    public static List<Collider> OverlapBoxPrecise(Vector3 center, Vector3 halfExtents,
+        Quaternion orientation, int layerMask = ~0) =>
+        OverlapShape(new BoxShape(halfExtents * 2f), center, orientation, layerMask);
+
+    static List<Collider> OverlapShape(PhysicsShape shape, Vector3 position, Quaternion rotation,
+        int layerMask) {
+        var bodies = new List<IPhysicsBody>();
+        World?.OverlapShape(shape, position, rotation, layerMask, bodies);
+        return ToColliders(bodies);
+    }
+
     static List<Collider> ToColliders(List<IPhysicsBody> bodies) {
         var result = new List<Collider>(bodies.Count);
         foreach (IPhysicsBody body in bodies) {

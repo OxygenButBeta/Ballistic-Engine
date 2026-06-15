@@ -81,8 +81,18 @@ public interface IPhysicsWorld {
     // Overlap queries: collect every body whose shape intersects the volume and whose Layer is in
     // the mask. Results append to `results` (caller-cleared); returns the count. Used by
     // Physics.OverlapSphere/OverlapBox. Triggers are included (Unity parity).
+    //
+    // These are the CONSERVATIVE (broadphase-AABB) fast path: a body whose AABB overlaps the query
+    // but whose shape does not can be a false positive. Good for trigger/aggro/pickup volumes.
     int OverlapSphere(Vector3 center, float radius, int layerMask, List<IPhysicsBody> results);
     int OverlapBox(Vector3 center, Vector3 halfExtents, Quaternion orientation, int layerMask,
+        List<IPhysicsBody> results);
+
+    // PRECISE overlap: returns only bodies whose SHAPE actually intersects the convex query shape
+    // (sphere/box/capsule), using Bepu's narrowphase, not just AABBs. No corner/rotation false
+    // positives. More expensive than the broadphase path above — use when correctness matters (a
+    // tight fit check, a melee hitbox). Mesh/concave query shapes are rejected (convex only).
+    int OverlapShape(PhysicsShape shape, Vector3 position, Quaternion rotation, int layerMask,
         List<IPhysicsBody> results);
 
     // Drops every body and shape (leaving/entering play mode). Outstanding IPhysicsBody
