@@ -181,6 +181,11 @@ public sealed class PostProcessSettings {
     public int ContactShadowSteps { get; set; } = 12;
     public float ContactShadowThickness { get; set; } = 0.5f;  // depth window counted as a hit
 
+    // Ray-traced sun shadows (DX12 + DXR only): trace a shadow ray per pixel against the scene BVH instead
+    // of the cascaded shadow maps. Off by default (opt-in via the Shadows volume; falls back to cascades
+    // on non-RT GPUs).
+    public bool RayTracedShadows { get; set; }
+
     // Stylistic extras, all neutral/off by default.
     public float Contrast { get; set; } = 1f;
     public float Saturation { get; set; } = 1f;

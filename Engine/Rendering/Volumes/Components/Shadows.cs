@@ -46,4 +46,9 @@ public sealed class Shadows : VolumeComponent {
 
     [Tooltip("Depth difference (metres) that counts as a contact-shadow hit.")]
     public readonly ClampedFloatParameter contactThickness = new(0.5f, 0.05f, 2f);
+
+    [Tooltip("Ray-traced sun shadows (DX12 + DXR only): trace a shadow ray per pixel against the scene " +
+             "acceleration structure instead of cascaded shadow maps. Sharp + contact-accurate, no cascade " +
+             "peter-panning. Falls back to the cascades on GPUs without ray tracing.")]
+    public readonly BoolParameter rayTracedShadows = new(false);
 }

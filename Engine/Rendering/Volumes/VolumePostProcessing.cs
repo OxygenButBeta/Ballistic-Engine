@@ -124,6 +124,7 @@ public static class VolumePostProcessing {
             fx.ContactShadowLength = shadows.contactLength.Value;
             fx.ContactShadowSteps = shadows.contactSteps.Value;
             fx.ContactShadowThickness = shadows.contactThickness.Value;
+            fx.RayTracedShadows = shadows.rayTracedShadows.Value;
         }
 
         if (stack.GetComponent<VolumetricFog>() is { } volumetric) {

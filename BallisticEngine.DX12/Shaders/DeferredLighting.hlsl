@@ -19,7 +19,8 @@ cbuffer LightConstants : register(b0) {
     float    PunctualCount;                       // active punctual lights (0 = skip the clustered path)
     float2   ScreenSize;                          // render-target pixel size (for the froxel tile lookup)
     float2   ClusterNearFar;                      // near/far the froxel log-Z grid was built with
-    float2   Pad3;
+    float    UseRtShadows;                        // >0.5 = sample the RT shadow mask instead of cascade PCF
+    float    Pad3;
 };
 
 // Froxel grid dims — must match Dx12ClusteredLights (16x9x24, log-Z).
@@ -54,6 +55,7 @@ struct GpuLight {
 StructuredBuffer<GpuLight> ClusterLights : register(t9);
 Buffer<int2>               ClusterGrid   : register(t10);  // per-cluster {offset, count}
 Buffer<uint>               ClusterIndex  : register(t11);  // flat light-index list
+Texture2D RtShadowMask     : register(t12);                // ray-traced sun shadow (1 lit / 0 shadowed)
 SamplerState LinearClamp : register(s0);
 
 static const float PI = 3.14159265359;
@@ -201,7 +203,8 @@ float4 PSMain(VSOut i) : SV_Target {
     float NdotL = max(dot(N, D), 0.0);
     float3 diffuse = 0, specular = 0;
     if (NdotL > 0.0) {
-        float shadow = SunShadow(N, D, worldPos);
+        float shadow = (UseRtShadows > 0.5) ? RtShadowMask.SampleLevel(LinearClamp, i.Uv, 0).r
+                                            : SunShadow(N, D, worldPos);
         float3 radiance = LightColor * shadow;
         float3 H = normalize(V + D);
         float NDF = DistributionGGX(N, H, roughness);

@@ -131,12 +131,15 @@ public sealed class Dx12GBuffer : IDisposable {
         });
     }
 
-    // Transition every G-buffer color + depth to PixelShaderResource so the deferred lighting pass (and
-    // SSAO) can sample them. Single ExecuteSync — all barriers batched.
+    // Transition every G-buffer color + depth to a combined PIXEL|NON_PIXEL shader-resource state so BOTH
+    // the deferred/SSAO/SSR pixel passes AND the DXR (compute-stage) ray passes can sample them — RT shaders
+    // require NON_PIXEL_SHADER_RESOURCE. The combined state is a superset, so pixel reads stay valid and the
+    // output is unchanged (a barrier never affects pixels). Single ExecuteSync.
+    const ResourceStates ShaderRead = ResourceStates.PixelShaderResource | ResourceStates.NonPixelShaderResource;
     public void ToShaderResource() {
         dev.ExecuteSync(cl => {
-            for (int i = 0; i < RtCount; i++) ColorTransition(cl, i, ResourceStates.PixelShaderResource);
-            DepthTransition(cl, ResourceStates.PixelShaderResource);
+            for (int i = 0; i < RtCount; i++) ColorTransition(cl, i, ShaderRead);
+            DepthTransition(cl, ShaderRead);
         });
     }
 

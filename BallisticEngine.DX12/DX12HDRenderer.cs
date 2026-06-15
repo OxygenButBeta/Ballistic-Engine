@@ -83,7 +83,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         public float PunctualCount;
         public Vector2 ScreenSize;
         public Vector2 ClusterNearFar;
-        public Vector2 Pad3;
+        public float UseRtShadows; public float Pad3;
     }
 
     // Clustered punctual lights (point/spot) shaded in the deferred pass.
@@ -155,6 +155,26 @@ public sealed class DX12HDRenderer : HDRenderer {
         public Vector4 Tint;      // Tint.xyz, _
         public Vector4 Params3;   // HasHistory, MaxHistory, _, _
     }
+
+    // --- DXR ray-traced sun shadows (volume-driven: Shadows.rayTracedShadows / PostFX.RayTracedShadows) ---
+    // A scene BLAS/TLAS (Dx12SceneAS) + an RT pass (DxrShadows.hlsl) that traces one shadow ray per pixel
+    // toward the sun → a full-res R8 mask the deferred lighting multiplies into the sun term (UseRtShadows).
+    // Built lazily on first use; falls back to the cascaded CSM when DXR is unavailable. Hard shadows are
+    // deterministic (no denoise); soft penumbra + OIDN is a follow-up.
+    Dx12SceneAS sceneAS;
+    ID3D12Device5 device5;
+    bool dxrChecked, dxrAvailable;
+    ID3D12RootSignature rtShadowRootSig;        // CBV(b0) + table{SRV t0 TLAS, t1 depth, t2 normal; UAV u0 mask}
+    ID3D12StateObject rtShadowPso;
+    ID3D12Resource rtShadowSbt, rtShadowCb;
+    unsafe byte* rtShadowCbMapped;
+    Dx12OffscreenTarget rtShadowMask;           // full-res R8 (1 lit / 0 shadowed), UAV + SRV
+    Dx12DescriptorHeap rtShadowHeap;            // 4 descriptors (rebuilt per frame)
+    bool rtShadowBuilt;
+    bool rtShadowsThisFrame;
+    const int RtSbtSlot = 64;                   // shader-table record alignment
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct RtShadowConstants { public Matrix4x4 InvViewProj; public Vector3 SunDir; public float NormalBias; }
 
     // Transparent forward pass: after deferred + sky, draw Material.Transparent submeshes back-to-front,
     // alpha-blended, depth-testing the G-buffer depth (LEqual, no write). Full forward PBR (sun + IBL +
@@ -384,6 +404,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (ssrRootSig != null) AllocSsrTarget();
         if (ssgiRootSig != null) AllocSsgiTargets();
         if (taaRootSig != null) AllocTaaTargets();
+        if (rtShadowMask != null) AllocRtShadowMask();
         AllocFsrOutput();
     }
 
@@ -716,8 +737,9 @@ public sealed class DX12HDRenderer : HDRenderer {
     unsafe void BuildDeferredLighting() {
         var lightCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Pixel);
         var frameCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.Pixel);
-        // 12 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8) + cluster lights/grid/index (t9..t11).
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 12, baseShaderRegister: 0);
+        // 13 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster lights/grid/index
+        // (t9..t11), RT shadow mask (t12).
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 13, baseShaderRegister: 0);
         var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
         var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
@@ -745,7 +767,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         deferredCbMapped = deferredCb.Map<byte>(0);
         deferredSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 12, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 13, shaderVisible: true);
 
         clusteredLights = new Dx12ClusteredLights(dev);
     }
@@ -1423,6 +1445,17 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         // === DEFERRED LIGHTING: read the G-buffer + depth → PBR sun + IBL + shadows + punctual → HDR. ===
         gbuffer.ToShaderResource();
+
+        // === RT SUN SHADOWS (volume-driven; DXR): trace one shadow ray per pixel against the scene BVH into
+        // a mask the deferred sun term reads (replaces the cascade PCF). Opt-in via the Shadows volume's RT
+        // checkbox or BALLISTIC_DX12_RT_SHADOWS=1; falls back to cascades if DXR is unavailable. Runs after
+        // the G-buffer is readable, before deferred lighting. ===
+        rtShadowsThisFrame = false;
+        string rtsEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RT_SHADOWS");
+        bool rtShadowsWanted = rtsEnv == "1" || (rtsEnv != "0" && PostFX.RayTracedShadows);
+        if (rtShadowsWanted && EnsureRtShadows())
+            DrawRtShadows(viewProj, lightDir);
+
         DrawDeferredLighting(view, viewProj, camPos, lightDir, lightColor, ambient);
 
         // === SKY: draw into the HDR color at the far plane, depth-testing the G-buffer depth (LEqual,
@@ -1525,12 +1558,13 @@ public sealed class DX12HDRenderer : HDRenderer {
             PunctualCount = clusteredLights.LightCount,
             ScreenSize = new Vector2(targetW, targetH),
             ClusterNearFar = new Vector2(CameraNear, CameraFar),
+            UseRtShadows = rtShadowsThisFrame ? 1f : 0f,
         };
 
-        // Copy the 12 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8) + cluster
-        // lights/grid/index (t9..t11).
+        // Copy the 13 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster
+        // lights/grid/index (t9..t11), RT shadow mask (t12).
         deferredSrvVisible.Reset();
-        int b = deferredSrvVisible.AllocateRange(12);
+        int b = deferredSrvVisible.AllocateRange(13);
         // Only the 4 SHADED G-buffer RTs feed lighting (G0..G3 → t0..t3); the motion RT (RT4) is for TAA/FSR.
         for (int i = 0; i < Dx12GBuffer.ShadedRtCount; i++)
             dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + i), gbuffer.ColorSrvCpu(i), heapType);
@@ -1542,6 +1576,9 @@ public sealed class DX12HDRenderer : HDRenderer {
         dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 9), clusteredLights.LightSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 10), clusteredLights.GridSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 11), clusteredLights.IndexSrvCpu, heapType);
+        // RT shadow mask (t12) — the real mask when RT shadows ran this frame, else a valid unused fallback.
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 12),
+            rtShadowMask != null ? rtShadowMask.ColorSrvCpu : gbuffer.DepthSrvCpu, heapType);
 
         target.RenderColorOnlyCleared(cl => {
             cl.SetGraphicsRootSignature(deferredRootSig);
@@ -1908,6 +1945,111 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         ssgiHistWriteB = !ssgiHistWriteB;   // ping-pong; this frame's accumulation is next frame's history
         ssgiHistValid = true;
+    }
+
+    // Lazily build the DXR sun-shadow pipeline (scene AS owner, RT PSO, SBT, mask, heap) on first use.
+    // Returns false (→ cascade fallback) if DXR is unavailable on this GPU. Uses the source-verified Vortice
+    // 3.8.3 DXR API (same as Dx12DxrProbe).
+    unsafe bool EnsureRtShadows() {
+        if (!dxrChecked) {
+            dxrChecked = true;
+            try {
+                var opt5 = dev.Device.CheckFeatureSupport<FeatureDataD3D12Options5>(Vortice.Direct3D12.Feature.Options5);
+                dxrAvailable = opt5.RaytracingTier >= RaytracingTier.Tier1_0;
+            } catch { dxrAvailable = false; }
+            if (!dxrAvailable) Console.WriteLine("[RTShadows] DXR unavailable — using cascaded shadows.");
+        }
+        if (!dxrAvailable) return false;
+        if (rtShadowBuilt) return true;
+        rtShadowBuilt = true;
+
+        device5 = dev.Device.QueryInterface<ID3D12Device5>();
+        sceneAS = new Dx12SceneAS(dev);
+
+        // Global root sig: CBV(b0) + table {SRV t0 TLAS, t1 depth, t2 normal; UAV u0 mask}.
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 3, baseShaderRegister: 0);
+        var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);
+        var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange), ShaderVisibility.All);
+        rtShadowRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, table })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("DxrShadows.hlsl");
+        byte[] dxil = Dx12ShaderCompiler.Compile(DxcShaderStage.Library, hlsl, "", "DxrShadows.hlsl");
+        var subs = new[] {
+            new StateSubObject(new DxilLibraryDescription(dxil,
+                new ExportDescription("RayGen"), new ExportDescription("Miss"), new ExportDescription("ClosestHit"))),
+            new StateSubObject(new HitGroupDescription("HitGroup", HitGroupType.Triangles, "", "ClosestHit", "")),
+            new StateSubObject(new RaytracingShaderConfig(4, 8)),   // payload = uint Occluded
+            new StateSubObject(new RaytracingPipelineConfig(1)),
+            new StateSubObject(new GlobalRootSignature(rtShadowRootSig)),
+        };
+        rtShadowPso = device5.CreateStateObject(new StateObjectDescription(StateObjectType.RaytracingPipeline, subs));
+
+        using ID3D12StateObjectProperties props = rtShadowPso.QueryInterface<ID3D12StateObjectProperties>();
+        uint idSize = Vortice.Direct3D12.D3D12.ShaderIdentifierSizeInBytes;
+        rtShadowSbt = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer(RtSbtSlot * 3), ResourceStates.GenericRead);
+        byte* sp = rtShadowSbt.Map<byte>(0);
+        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 0 * RtSbtSlot, (void*)props.GetShaderIdentifier("RayGen"), idSize);
+        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 1 * RtSbtSlot, (void*)props.GetShaderIdentifier("Miss"), idSize);
+        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 2 * RtSbtSlot, (void*)props.GetShaderIdentifier("HitGroup"), idSize);
+        rtShadowSbt.Unmap(0);
+
+        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<RtShadowConstants>() + 255) & ~255;
+        rtShadowCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+        rtShadowCbMapped = rtShadowCb.Map<byte>(0);
+        rtShadowHeap = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4, shaderVisible: true);
+        AllocRtShadowMask();
+        return true;
+    }
+
+    void AllocRtShadowMask() {
+        rtShadowMask?.Dispose();
+        rtShadowMask = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false,
+            colorFormat: Format.R8_UNorm, colorReadable: true, allowUav: true);
+    }
+
+    // RT sun shadows: ensure the scene AS, then DispatchRays one shadow ray per pixel → rtShadowMask. The
+    // mask is left in PixelShaderResource for the deferred pass (UseRtShadows). viewProj is the JITTERED
+    // matrix the depth was rendered with (matches DrawDeferredLighting's world-pos reconstruction).
+    unsafe void DrawRtShadows(Matrix4x4 viewProj, Vector3 lightDir) {
+        sceneAS.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection);
+        if (!sceneAS.Valid) return;
+
+        Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
+        Vector3 sun = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
+        *(RtShadowConstants*)rtShadowCbMapped = new RtShadowConstants {
+            InvViewProj = Matrix4x4.Transpose(invVP), SunDir = sun, NormalBias = 0.05f,
+        };
+
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        sceneAS.CreateTlasSrv(rtShadowHeap.Cpu(0));
+        dev.Device.CopyDescriptorsSimple(1, rtShadowHeap.Cpu(1), gbuffer.DepthSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, rtShadowHeap.Cpu(2), gbuffer.ColorSrvCpu(1), heapType);  // world normal
+        dev.Device.CreateUnorderedAccessView(rtShadowMask.RenderTarget, null, new UnorderedAccessViewDescription {
+            Format = Format.R8_UNorm, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+        }, rtShadowHeap.Cpu(3));
+
+        rtShadowMask.ColorToUnorderedAccess();
+        uint idSize = Vortice.Direct3D12.D3D12.ShaderIdentifierSizeInBytes;
+        dev.ExecuteSync(cl => {
+            cl.SetDescriptorHeaps(rtShadowHeap.Heap);
+            cl.SetComputeRootSignature(rtShadowRootSig);
+            cl.SetPipelineState1(rtShadowPso);
+            cl.SetComputeRootConstantBufferView(0, rtShadowCb.GPUVirtualAddress);
+            cl.SetComputeRootDescriptorTable(1, rtShadowHeap.Gpu(0));
+            cl.DispatchRays(new DispatchRaysDescription {
+                Width = (uint)targetW, Height = (uint)targetH, Depth = 1,
+                RayGenerationShaderRecord = new GpuVirtualAddressRange { StartAddress = rtShadowSbt.GPUVirtualAddress, SizeInBytes = idSize },
+                MissShaderTable = new GpuVirtualAddressRangeAndStride { StartAddress = rtShadowSbt.GPUVirtualAddress + RtSbtSlot, SizeInBytes = idSize, StrideInBytes = idSize },
+                HitGroupTable = new GpuVirtualAddressRangeAndStride { StartAddress = rtShadowSbt.GPUVirtualAddress + 2 * RtSbtSlot, SizeInBytes = idSize, StrideInBytes = idSize },
+            });
+        });
+        rtShadowMask.ColorToShaderResource();
+        rtShadowsThisFrame = true;
     }
 
     // HBAO from the G-buffer (scene depth for view-pos + world normal, both already SRVs from the deferred
