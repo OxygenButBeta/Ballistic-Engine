@@ -942,9 +942,13 @@ public sealed class DX12HDRenderer : HDRenderer {
         *(FrameConstants*)frameCbMapped = fc;
 
         int draws = 0;
+        int culled = 0;
         long tris = 0;
         srvVisible.Reset();
         int slot = 0;
+
+        // Camera frustum planes from the UNJITTERED viewProj — per-submesh cull in the geometry pass.
+        ExtractFrustumPlanes(viewProjUnjittered);
 
         var fallbackDiffuse = DefaultTextures.Neutral(TextureType.Diffuse) as Dx12Texture2D;
 
@@ -988,6 +992,9 @@ public sealed class DX12HDRenderer : HDRenderer {
                     if ((uint)s >= (uint)mesh.SubMeshes.Length) break;
                     SubMeshData sub = mesh.SubMeshes[s];
                     if (sub.IndexCount <= 0) continue;
+                    // Per-submesh frustum cull (camera frustum from the UNJITTERED viewProj).
+                    mesh.GetSubMeshBounds(s, out GLVector3 lmin, out GLVector3 lmax);
+                    if (!AabbInFrustum(lmin, lmax, model)) { culled++; continue; }
                     Material mat = r.MaterialFor(s);
                     if (mat is null) continue;
                     if (slot >= cbSlotCount) break;
@@ -1081,6 +1088,7 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         RenderStats.Scene.DrawCalls = draws;
         RenderStats.Scene.Triangles = tris;
+        RenderStats.Scene.SubMeshesCulled = culled;
         return new RenderMetrics(draws, 0, (int)tris, 0, 0f);
     }
 
@@ -1473,6 +1481,9 @@ public sealed class DX12HDRenderer : HDRenderer {
         int slot = 0;
         var fills = new System.Collections.Generic.List<(int cascade, Dx12Buffer<GLVector3> vb, Dx12IndexBuffer ib, int start, int count, int cbSlot)>();
         for (int c = 0; c < CascadeCount; c++) {
+            // Cull shadow casters against THIS cascade's light frustum (a caster off-screen for the camera
+            // but inside this cascade still casts — that's why we cull per the LIGHT frustum, not the camera).
+            ExtractFrustumPlanes(cascadeMatrices[c]);
             foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
                 if (r is null || !r.IsActive || !r.IsRenderable) continue;
                 Mesh mesh = r.SharedMesh; if (mesh is null) continue;
@@ -1487,6 +1498,8 @@ public sealed class DX12HDRenderer : HDRenderer {
                     if ((uint)s >= (uint)mesh.SubMeshes.Length) break;
                     SubMeshData sub = mesh.SubMeshes[s];
                     if (sub.IndexCount <= 0) continue;
+                    mesh.GetSubMeshBounds(s, out GLVector3 lmin, out GLVector3 lmax);
+                    if (!AabbInFrustum(lmin, lmax, model)) continue;   // outside this cascade
                     if (slot >= shadowCbSlotCount) break;
                     *(ShadowConstants*)(shadowCbMapped + (long)slot * shadowCbSlotSize) =
                         new ShadowConstants { LightMvp = Matrix4x4.Transpose(lightMvp) };
@@ -1578,6 +1591,55 @@ public sealed class DX12HDRenderer : HDRenderer {
     public override void RenderSkybox(IReadOnlyCollection<ISkyboxDrawable> renderTargets, RendererArgs args) { }
     public override void RenderInstancing(BatchGroup<IStaticMeshRenderer> batchGroup, RendererArgs args) { }
     public override void RenderInstancing(Mesh mesh, Material material, GLMatrix4[] transforms, RendererArgs args) { }
+
+    // --- Frustum culling (CPU, per submesh) ------------------------------------------------------------
+    // 6 frustum planes (xyz = normal, w = d) extracted from a row-major view*proj (Gribb-Hartmann). Tested
+    // with the positive-vertex / 8-corner-AABB rule. Mirrors the GL per-submesh cull so the geometry pass
+    // and shadow pass only draw what the (camera or light) frustum can see.
+    readonly Vector4[] frustumPlanes = new Vector4[6];
+
+    void ExtractFrustumPlanes(Matrix4x4 m) {
+        // Row-major System.Numerics: rows are (M11..M14), (M21..M24), ... Gribb-Hartmann combines rows.
+        // left = row4 + row1, right = row4 - row1, bottom = row4 + row2, top = row4 - row2,
+        // near = row3 (DX z[0,1]: near = row3, not row4+row3), far = row4 - row3.
+        Vector4 r1 = new(m.M11, m.M21, m.M31, m.M41);
+        Vector4 r2 = new(m.M12, m.M22, m.M32, m.M42);
+        Vector4 r3 = new(m.M13, m.M23, m.M33, m.M43);
+        Vector4 r4 = new(m.M14, m.M24, m.M34, m.M44);
+        frustumPlanes[0] = r4 + r1;   // left
+        frustumPlanes[1] = r4 - r1;   // right
+        frustumPlanes[2] = r4 + r2;   // bottom
+        frustumPlanes[3] = r4 - r2;   // top
+        frustumPlanes[4] = r3;        // near (DX: z >= 0)
+        frustumPlanes[5] = r4 - r3;   // far
+        for (int i = 0; i < 6; i++) {
+            Vector3 n = new(frustumPlanes[i].X, frustumPlanes[i].Y, frustumPlanes[i].Z);
+            float len = n.Length();
+            if (len > 1e-6f) frustumPlanes[i] /= len;
+        }
+    }
+
+    // True if the world-space AABB (8 corners of the local box transformed by `model`) is at least partly
+    // inside the frustum. Positive-vertex test: for each plane, if the farthest-along-the-normal corner is
+    // behind the plane, the whole box is outside.
+    bool AabbInFrustum(GLVector3 localMin, GLVector3 localMax, Matrix4x4 model) {
+        // Transform the 8 corners to world, take their AABB (cheap + matches the GL whole-corner loop).
+        Vector3 wlo = new(float.MaxValue), whi = new(float.MinValue);
+        for (int c = 0; c < 8; c++) {
+            var lc = new Vector3((c & 1) == 0 ? localMin.X : localMax.X,
+                                 (c & 2) == 0 ? localMin.Y : localMax.Y,
+                                 (c & 4) == 0 ? localMin.Z : localMax.Z);
+            Vector3 w = Vector3.Transform(lc, model);
+            wlo = Vector3.Min(wlo, w); whi = Vector3.Max(whi, w);
+        }
+        for (int i = 0; i < 6; i++) {
+            Vector4 p = frustumPlanes[i];
+            // Positive vertex (farthest along the plane normal).
+            Vector3 pv = new(p.X >= 0 ? whi.X : wlo.X, p.Y >= 0 ? whi.Y : wlo.Y, p.Z >= 0 ? whi.Z : wlo.Z);
+            if (p.X * pv.X + p.Y * pv.Y + p.Z * pv.Z + p.W < 0f) return false;   // fully outside this plane
+        }
+        return true;
+    }
 
     static Matrix4x4 ToNumerics(GLMatrix4 m) => new(
         m.M11, m.M12, m.M13, m.M14,
