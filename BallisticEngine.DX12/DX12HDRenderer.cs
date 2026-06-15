@@ -44,6 +44,17 @@ public sealed class DX12HDRenderer : HDRenderer {
     Dx12OffscreenTarget lumTarget;      // 1×1 R16F, color-readable
     Dx12DescriptorHeap lumSrvVisible;   // HDR color SRV copied per frame
 
+    // Bloom: bright-pass + separable blur at half-res, fed into the composite (Bloom.hlsl).
+    ID3D12RootSignature bloomRootSig;   // BloomConstants CBV (b0) + 1 source SRV (t0) + sampler
+    ID3D12PipelineState bloomBrightPso, bloomBlurHPso, bloomBlurVPso;
+    Dx12OffscreenTarget bloomA, bloomB; // half-res R16F ping-pong
+    ID3D12Resource bloomCb;
+    unsafe byte* bloomCbMapped;
+    Dx12DescriptorHeap bloomSrvVisible; // source SRV per sub-pass (3 slots)
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct BloomConstants { public float Threshold; public Vector2 TexelSize; public float Pad; }
+    bool bloomThisFrame;
+
     // Skybox pass (background): its own root sig (CBV b0 + cube SRV t0 + clamp sampler) + PSO (LEqual,
     // no depth write, cull none, SV_VertexID cube). Drawn after opaque in the same command list.
     ID3D12RootSignature skyRootSig;
@@ -173,6 +184,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         target = new Dx12OffscreenTarget(dev, width, height, withDepth: true,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         ldr = new Dx12OffscreenTarget(dev, width, height);   // LDR composite output
+        if (bloomRootSig != null) AllocBloomTargets();       // half-res bloom ping-pong follows size
     }
 
     public override unsafe void Initialize() {
@@ -277,6 +289,52 @@ public sealed class DX12HDRenderer : HDRenderer {
             colorFormat: Format.R16_Float, colorReadable: true);
         lumSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true);
+
+        BuildBloom();
+    }
+
+    unsafe void BuildBloom() {
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
+        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
+        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        bloomRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("Bloom.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "Bloom.hlsl");
+        ID3D12PipelineState MakePso(string entry) => dev.Device.CreateGraphicsPipelineState(
+            new GraphicsPipelineStateDescription {
+                RootSignature = bloomRootSig, VertexShader = vs,
+                PixelShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, entry, "Bloom.hlsl"),
+                InputLayout = null, PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+                RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
+                DepthStencilState = DepthStencilDescription.None,
+                RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat }, DepthStencilFormat = Format.Unknown,
+                SampleDescription = new SampleDescription(1, 0),
+            });
+        bloomBrightPso = MakePso("PSBrightPass");
+        bloomBlurHPso = MakePso("PSBlurH");
+        bloomBlurVPso = MakePso("PSBlurV");
+
+        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<BloomConstants>() + 255) & ~255;
+        bloomCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+        bloomCbMapped = bloomCb.Map<byte>(0);
+        bloomSrvVisible = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true);
+        AllocBloomTargets();
+    }
+
+    void AllocBloomTargets() {
+        bloomA?.Dispose(); bloomB?.Dispose();
+        int w = System.Math.Max(1, targetW / 2), h = System.Math.Max(1, targetH / 2);
+        bloomA = new Dx12OffscreenTarget(dev, w, h, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
+        bloomB = new Dx12OffscreenTarget(dev, w, h, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
     }
 
     unsafe void BuildFog() {
@@ -675,8 +733,37 @@ public sealed class DX12HDRenderer : HDRenderer {
         return new RenderMetrics(draws, 0, (int)tris, 0, 0f);
     }
 
-    // Tonemap the HDR scene target into the LDR output. Exposure is the fixed 1e-5 stand-in (auto-exposure
-    // replaces it next); bloom is added once the bloom pass exists (BloomIntensity 0 for now).
+    // Bloom: bright-pass the HDR (target, already in SRV state) → bloomA; blur H (bloomA→bloomB);
+    // blur V (bloomB→bloomA). Result lands in bloomA at half-res for the composite to add.
+    unsafe void DrawBloom() {
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        float texW = 1f / bloomA.Width, texH = 1f / bloomA.Height;
+
+        void Pass(ID3D12PipelineState pso, Dx12OffscreenTarget src, Dx12OffscreenTarget dst, int srvSlot,
+            Vector2 texel, float threshold) {
+            *(BloomConstants*)bloomCbMapped = new BloomConstants { Threshold = threshold, TexelSize = texel };
+            src.ColorToShaderResource();
+            dev.Device.CopyDescriptorsSimple(1, bloomSrvVisible.Cpu(srvSlot), src.ColorSrvCpu, heapType);
+            dst.RenderColorOnly(cl => {
+                cl.SetGraphicsRootSignature(bloomRootSig);
+                cl.SetPipelineState(pso);
+                cl.SetDescriptorHeaps(bloomSrvVisible.Heap);
+                cl.SetGraphicsRootConstantBufferView(0, bloomCb.GPUVirtualAddress);
+                cl.SetGraphicsRootDescriptorTable(1, bloomSrvVisible.Gpu(srvSlot));
+                cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+                cl.DrawInstanced(3, 1, 0, 0);
+            });
+        }
+
+        // Bright-pass reads the full-res HDR scene (already in SRV state from DrawComposite).
+        Pass(bloomBrightPso, target, bloomA, 0, new Vector2(texW, texH), 1.0f);
+        Pass(bloomBlurHPso, bloomA, bloomB, 1, new Vector2(texW, texH), 0f);
+        Pass(bloomBlurVPso, bloomB, bloomA, 2, new Vector2(texW, texH), 0f);
+        bloomA.ColorToShaderResource();   // ready for the composite to sample
+    }
+
+    // Tonemap the HDR scene target into the LDR output. Auto-exposure drives the exposure; bloom (if on)
+    // is added in. The bloom pass runs first (inside this), reading the HDR scene.
     unsafe void DrawComposite() {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
 
@@ -700,17 +787,21 @@ public sealed class DX12HDRenderer : HDRenderer {
             lumTarget.ColorToShaderResource();
         }
 
-        // ExposureKey: middle-grey target ~0.18, then the lux→display scale the manual 1e-5 implied
-        // (the HDR scene is in physical radiance ~1e5). Key chosen so a typical scene lands near 0.18.
+        // Bloom: bright-pass + blur the HDR into bloomA (half-res). On by default; BALLISTIC_DX12_BLOOM=0 off.
+        bool bloomOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_BLOOM") != "0";
+        if (bloomOn) DrawBloom();
+
+        // ExposureKey: middle-grey target ~0.18 (the HDR scene is physical radiance; auto-meter rescales).
         *(CompositeConstants*)compositeCbMapped = new CompositeConstants {
             Exposure = manual ? manualExp : 1.0e-5f,
-            BloomIntensity = 0f,
+            BloomIntensity = bloomOn ? 0.6f : 0f,
             AutoExposure = manual ? 0f : 1f,
             ExposureKey = 0.18f,
         };
 
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(0), target.ColorSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(1), target.ColorSrvCpu, heapType);  // bloom slot = HDR (unused, BloomIntensity 0)
+        dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(1),
+            bloomOn ? bloomA.ColorSrvCpu : target.ColorSrvCpu, heapType);   // bloom slot
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(2),
             manual ? target.ColorSrvCpu : lumTarget.ColorSrvCpu, heapType);
 
