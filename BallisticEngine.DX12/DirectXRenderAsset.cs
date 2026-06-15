@@ -41,6 +41,12 @@ public sealed class DirectXRenderAsset : RenderAsset {
             bool pass = DX12.Dx12FsrUpscaler.SelfTest(device);
             Environment.Exit(pass ? 0 : 1);
         }
+        // OIDN denoiser self-test door (BALLISTIC_DX12_OIDN_TEST=1): loads OpenImageDenoise + device DLLs,
+        // denoises a synthetic noisy HDR image and checks the noise dropped. Proves the P/Invoke + deploy.
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_OIDN_TEST") == "1") {
+            bool pass = DX12.Dx12OidnDenoiser.SelfTest();
+            Environment.Exit(pass ? 0 : 1);
+        }
 
         Renderer = new DX12HDRenderer(device);
         Renderer.Initialize();
