@@ -23,4 +23,14 @@ public abstract class GPUBuffer<TDataType> : IDisposable where TDataType : struc
     public abstract void Dispose();
     public abstract void Activate();
     public abstract void Deactivate();
+
+    // GPU-address accessors for backends that bind buffers per-draw (DX12) rather than via a bound VAO
+    // (GL). The renderer reads these to build vertex/index buffer views without knowing the concrete
+    // backend type. The GL backend draws off VAO state and never reads them, so the base defaults are
+    // fine there; the DX12 buffer overrides with its committed resource's address/size. (Part of the
+    // DX-native abstraction redesign — Docs/Plans/dx-native-abstraction-redesign.md.)
+    public virtual ulong GpuAddress => 0;
+    public virtual int ElementCount => 0;
+    public virtual int Stride => 0;
+    public virtual int ByteSize => ElementCount * Stride;
 }

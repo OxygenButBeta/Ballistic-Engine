@@ -15,10 +15,11 @@ public class Dx12Buffer<T> : GPUBuffer<T> where T : unmanaged {
 
     ID3D12Resource resource;
     public ID3D12Resource Resource => resource;
-    public int ElementCount { get; private set; }
-    public unsafe int Stride => sizeof(T);
-    public int ByteSize => ElementCount * Stride;
-    public ulong GpuAddress => resource?.GPUVirtualAddress ?? 0;
+    int elementCount;
+    public override int ElementCount => elementCount;
+    public override unsafe int Stride => sizeof(T);
+    public override int ByteSize => elementCount * Stride;
+    public override ulong GpuAddress => resource?.GPUVirtualAddress ?? 0;
 
     // Vertex buffers go to VertexAndConstantBuffer state; the index subclass overrides to IndexBuffer.
     protected virtual ResourceStates FinalState => ResourceStates.VertexAndConstantBuffer;
@@ -33,10 +34,10 @@ public class Dx12Buffer<T> : GPUBuffer<T> where T : unmanaged {
         resource?.Dispose();
         if (data is null || data.Length == 0) {
             resource = null;
-            ElementCount = 0;
+            elementCount = 0;
             return;
         }
-        ElementCount = data.Length;
+        elementCount = data.Length;
         resource = Dx12RenderContext.Device.CreateDefaultBuffer<T>(data, FinalState);
         resource.Name = $"{typeof(T).Name}Buffer#{UID}";
     }

@@ -16,10 +16,11 @@ public sealed class Dx12InstancedBuffer : InstancedBuffer {
 
     ID3D12Resource resource;
     int capacityElems;   // allocated capacity in matrices
-    public int ElementCount { get; private set; }
+    int elementCount;
+    public override int ElementCount => elementCount;
     public ID3D12Resource Resource => resource;
-    public ulong GpuAddress => resource?.GPUVirtualAddress ?? 0;
-    public unsafe int Stride => sizeof(Matrix4x4);   // 64 bytes
+    public override ulong GpuAddress => resource?.GPUVirtualAddress ?? 0;
+    public override unsafe int Stride => sizeof(Matrix4x4);   // 64 bytes
 
     public Dx12InstancedBuffer(RenderContext renderContext) : base(renderContext) {
         UID = nextId++;
@@ -32,7 +33,7 @@ public sealed class Dx12InstancedBuffer : InstancedBuffer {
     // vertex shader the same way, so the transpose convention must match (handled at fill time there).
     public override unsafe void SetBufferData(in OpenTK.Mathematics.Matrix4[] data, BufferUsage usage) {
         int count = data?.Length ?? 0;
-        ElementCount = count;
+        elementCount = count;
         if (count == 0)
             return;
 
