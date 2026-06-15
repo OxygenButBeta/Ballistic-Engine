@@ -43,51 +43,54 @@ public sealed class Dx12Texture2D : Texture2D {
             return;
 
         Format format = Dx12Backend.ToDxgi(data.Format, type);
-
-        // MIP 0 ONLY for now (first light). The full pre-baked BC mip chain upload had a copy bug that
-        // surfaced as E_FAIL on 2048² BC1/BC3 with 12 mips (the sub-4×4 block-row math vs the D3D
-        // footprint); uploading just the base level is guaranteed correct and gets the scene rendering.
-        // Full mip-chain upload (better minification quality) is a tracked follow-up.
-        const int mipCount = 1;
+        int mipCount = Math.Max(1, data.MipCount);   // pre-baked chain (BC) or 1 (uncompressed)
 
         var desc = ResourceDescription.Texture2D(format, (uint)data.Width, (uint)data.Height,
-            arraySize: 1, mipLevels: mipCount);
+            arraySize: 1, mipLevels: (ushort)mipCount);
         resource = Dx12Backend.Device.Device.CreateCommittedResource(
             HeapProperties.DefaultHeapProperties, HeapFlags.None, desc, ResourceStates.CopyDest);
         resource.Name = $"Tex2D#{UID}({type})";
 
-        // Footprint of mip 0 (256-byte-aligned row pitch in the upload buffer).
-        var footprints = new PlacedSubresourceFootPrint[1];
-        var rowCounts = new uint[1];
-        var rowSizes = new ulong[1];
-        Dx12Backend.Device.Device.GetCopyableFootprints(desc, 0, 1, 0,
+        // Footprints for every mip — DX12 demands 256-byte-aligned upload row pitches per subresource.
+        var footprints = new PlacedSubresourceFootPrint[mipCount];
+        var rowCounts = new uint[mipCount];
+        var rowSizes = new ulong[mipCount];
+        Dx12Backend.Device.Device.GetCopyableFootprints(desc, 0, (uint)mipCount, 0,
             footprints, rowCounts, rowSizes, out ulong totalBytes);
-        PlacedSubresourceFootPrint fp = footprints[0];
 
         using ID3D12Resource upload = Dx12Backend.Device.Device.CreateCommittedResource(
             HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer(totalBytes), ResourceStates.GenericRead);
 
-        // Copy mip 0's tightly-packed source rows into the aligned upload layout.
+        // Copy each mip's tightly-packed source rows (block-rows for BC) into the aligned upload layout.
+        // The source chain is largest-first (TextureMipLayout); use rowSizes/rowCounts from D3D so BC
+        // sub-4×4 mips copy the right block-row count. Now safe under the dedicated upload queue (the
+        // earlier multi-mip E_FAIL was the SHARED command list, not this math).
         byte* dst = upload.Map<byte>(0);
-        long srcRowBytes = (long)rowSizes[0];
-        int rows = (int)rowCounts[0];
-        long dstRowPitch = fp.Footprint.RowPitch;
         fixed (byte* srcBase = data.Pixels) {
-            for (int r = 0; r < rows; r++)
-                System.Buffer.MemoryCopy(
-                    srcBase + r * srcRowBytes, dst + (long)fp.Offset + r * dstRowPitch,
-                    srcRowBytes, srcRowBytes);
+            for (int mip = 0; mip < mipCount; mip++) {
+                PlacedSubresourceFootPrint fp = footprints[mip];
+                long srcOffset = TextureMipLayout.LevelOffset(data.Width, data.Height, mip, data.Format);
+                long srcRowBytes = (long)rowSizes[mip];
+                int rows = (int)rowCounts[mip];
+                long dstRowPitch = fp.Footprint.RowPitch;
+                byte* dstMip = dst + (long)fp.Offset;
+                byte* srcMip = srcBase + srcOffset;
+                for (int r = 0; r < rows; r++)
+                    System.Buffer.MemoryCopy(srcMip + r * srcRowBytes, dstMip + r * dstRowPitch,
+                        srcRowBytes, srcRowBytes);
+            }
         }
         upload.Unmap(0);
 
-        // The copy runs on the DEDICATED upload command list (separate from the render path's list).
-        // Sharing one command list between BeginRender and interleaved asset uploads was corrupting both
-        // (texture CopyTextureRegion E_FAILed). See Dx12Device.ExecuteUpload.
+        // The copy runs on the DEDICATED upload command list (separate from the render path's list) —
+        // sharing one list between BeginRender and interleaved uploads corrupted both. See ExecuteUpload.
         Dx12Backend.Device.ExecuteUpload(cl => {
-            var d = new TextureCopyLocation(resource, 0);
-            var s = new TextureCopyLocation(upload, fp);
-            cl.CopyTextureRegion(d, 0, 0, 0, s, null);
+            for (int mip = 0; mip < mipCount; mip++) {
+                var d = new TextureCopyLocation(resource, (uint)mip);
+                var s = new TextureCopyLocation(upload, footprints[mip]);
+                cl.CopyTextureRegion(d, 0, 0, 0, s, null);
+            }
             cl.ResourceBarrierTransition(resource, ResourceStates.CopyDest, ResourceStates.PixelShaderResource);
         });
 
@@ -96,7 +99,7 @@ public sealed class Dx12Texture2D : Texture2D {
             Format = format,
             ViewDimension = ShaderResourceViewDimension.Texture2D,
             Shader4ComponentMapping = ShaderComponentMapping.Default,
-            Texture2D = new Texture2DShaderResourceView { MipLevels = 1, MostDetailedMip = 0 },
+            Texture2D = new Texture2DShaderResourceView { MipLevels = (uint)mipCount, MostDetailedMip = 0 },
         };
         Dx12Backend.Device.Device.CreateShaderResourceView(resource, srvDesc, Dx12Backend.SrvStore.Cpu(srvIndex));
     }
