@@ -43,6 +43,22 @@ public sealed class DX12HDRenderer : HDRenderer {
         public float Exposure; public Vector3 Pad;
     }
 
+    // Procedural sky pass (atmosphere marched per-pixel; no cubemap, no SRV — pure ALU).
+    ID3D12RootSignature procSkyRootSig;
+    ID3D12PipelineState procSkyPso;
+    ID3D12Resource procSkyCb;
+    unsafe byte* procSkyCbMapped;
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct ProcSkyConstants {
+        public Matrix4x4 ViewProjNoTranslate;
+        public Vector3 SunDirection; public float SunAngularRadius;
+        public Vector3 SunRadiance; public float SunDiskIntensity;
+        public Vector3 GroundAlbedo; public float AirDensity;
+        public float Haze, HazeAnisotropy, OzoneDensity, MultiScatter;
+        public float Exposure; public Vector3 Pad;
+    }
+
     // Per-draw constant buffer ring: one upload heap sub-allocated in 256-byte slots, one slot per draw.
     ID3D12Resource cbRing;
     int cbSlotSize;
@@ -107,6 +123,37 @@ public sealed class DX12HDRenderer : HDRenderer {
             cbSlotCount * MaterialSrvCount, shaderVisible: true);
 
         BuildSkybox();
+        BuildProcSky();
+    }
+
+    unsafe void BuildProcSky() {
+        // CBV-only root sig (the atmosphere is pure ALU — no textures).
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView,
+            new RootDescriptor1(0, 0), ShaderVisibility.All);
+        procSkyRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("ProceduralSky.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "ProceduralSky.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "ProceduralSky.hlsl");
+        var ds = DepthStencilDescription.Default;
+        ds.DepthWriteMask = DepthWriteMask.Zero;
+        ds.DepthFunc = ComparisonFunction.LessEqual;
+        var psoDesc = new GraphicsPipelineStateDescription {
+            RootSignature = procSkyRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
+            DepthStencilState = ds,
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.ColorFormat },
+            DepthStencilFormat = Dx12OffscreenTarget.DepthFormat,
+            SampleDescription = new SampleDescription(1, 0),
+        };
+        procSkyPso = dev.Device.CreateGraphicsPipelineState(psoDesc);
+
+        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<ProcSkyConstants>() + 255) & ~255;
+        procSkyCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+        procSkyCbMapped = procSkyCb.Map<byte>(0);
     }
 
     unsafe void BuildSkybox() {
@@ -323,8 +370,12 @@ public sealed class DX12HDRenderer : HDRenderer {
                 }
             }
 
-            // --- Skybox background (after opaque, same command list) ---
-            DrawSkybox(cl, view, proj);
+            // --- Sky background (after opaque, same command list) ---
+            // ProceduralSky takes precedence over an asset cubemap Skybox (matches the GL renderer).
+            if (ProceduralSky.Active is not null)
+                DrawProcSky(cl, view, proj, light);
+            else
+                DrawSkybox(cl, view, proj);
         });
 
         RenderStats.Scene.DrawCalls = draws;
@@ -363,6 +414,36 @@ public sealed class DX12HDRenderer : HDRenderer {
         cl.SetDescriptorHeaps(skySrvVisible.Heap);
         cl.SetGraphicsRootConstantBufferView(0, skyCb.GPUVirtualAddress);
         cl.SetGraphicsRootDescriptorTable(1, skySrvVisible.Gpu(0));
+        cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+        cl.DrawInstanced(36, 1, 0, 0);
+    }
+
+    // Draw the procedural atmosphere as the far-plane background (pure-ALU march by view direction).
+    unsafe void DrawProcSky(ID3D12GraphicsCommandList4 cl, Matrix4x4 view, Matrix4x4 proj, LightUniforms light) {
+        ProceduralSky sky = ProceduralSky.Active;
+        if (sky is null) return;
+
+        Matrix4x4 viewNoT = view; viewNoT.M41 = 0; viewNoT.M42 = 0; viewNoT.M43 = 0;
+        // Sun: DirectionalLight drives it (LightUniforms.Direction is TOWARD the light = toward the sun).
+        Vector3 sunDir = ToNumerics(light.Direction);
+        if (sunDir.LengthSquared() < 1e-8f) sunDir = Vector3.UnitY;
+        sunDir = Vector3.Normalize(sunDir);
+        float sunAngularRadius = (DirectionalLight.Instance?.AngularDiameter ?? 0.53f) * 0.5f * (MathF.PI / 180f);
+
+        var sc = new ProcSkyConstants {
+            ViewProjNoTranslate = Matrix4x4.Transpose(viewNoT * proj),
+            SunDirection = sunDir, SunAngularRadius = MathF.Max(sunAngularRadius, 1e-4f),
+            SunRadiance = ToNumerics(light.Color), SunDiskIntensity = MathF.Max(sky.SunDiskIntensity, 0f),
+            GroundAlbedo = ToNumerics(sky.GroundColor), AirDensity = MathF.Max(sky.AirDensity, 0f),
+            Haze = MathF.Max(sky.Haze, 0f), HazeAnisotropy = Math.Clamp(sky.HazeAnisotropy, 0f, 0.99f),
+            OzoneDensity = MathF.Max(sky.OzoneDensity, 0f), MultiScatter = MathF.Max(sky.MultipleScattering, 1f),
+            Exposure = MathF.Max(sky.Exposure, 0f),
+        };
+        *(ProcSkyConstants*)procSkyCbMapped = sc;
+
+        cl.SetGraphicsRootSignature(procSkyRootSig);
+        cl.SetPipelineState(procSkyPso);
+        cl.SetGraphicsRootConstantBufferView(0, procSkyCb.GPUVirtualAddress);
         cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
         cl.DrawInstanced(36, 1, 0, 0);
     }
