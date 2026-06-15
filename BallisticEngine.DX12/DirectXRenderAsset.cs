@@ -34,6 +34,13 @@ public sealed class DirectXRenderAsset : RenderAsset {
             bool pass = DX12.Dx12BindlessProbe.SelfTest(device);
             Environment.Exit(pass ? 0 : 1);
         }
+        // FSR upscaler self-test door (BALLISTIC_DX12_FSR_TEST=1): loads the FidelityFX loader+provider
+        // DLLs, creates an upscale context, and queries the render resolution per quality mode, then exits.
+        // Proves the P/Invoke ABI + native DLL deployment before FSR is wired into the frame.
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_FSR_TEST") == "1") {
+            bool pass = DX12.Dx12FsrUpscaler.SelfTest(device);
+            Environment.Exit(pass ? 0 : 1);
+        }
 
         Renderer = new DX12HDRenderer(device);
         Renderer.Initialize();

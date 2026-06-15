@@ -24,4 +24,17 @@
       <EmbeddedResource Include="Shaders\**\*.hlsl" />
     </ItemGroup>
 
+    <!-- FSR upscaler runtime DLLs: the loader dispatches to the upscaler provider (and uses AGS on AMD).
+         They MUST sit next to the exe (the loader resolves the provider by name from its own dir). Copied
+         to this project's output and flowed transitively to the referencing exe. DLLs are gitignored
+         (native/README.md re-fetch script); the copy is Condition'd so a clean checkout without them still
+         builds (FSR just self-disables at runtime). Framegeneration/radiancecache DLLs are NOT copied
+         (unused by upscaling, ~39 MB). -->
+    <ItemGroup Condition="Exists('..\native\fsr\bin\amd_fidelityfx_loader_dx12.dll')">
+      <None Include="..\native\fsr\bin\amd_fidelityfx_loader_dx12.dll;..\native\fsr\bin\amd_fidelityfx_upscaler_dx12.dll;..\native\fsr\bin\amd_ags_x64.dll">
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        <Link>%(Filename)%(Extension)</Link>
+      </None>
+    </ItemGroup>
+
 </Project>
