@@ -29,6 +29,32 @@ public sealed class DX12HDRenderer : HDRenderer {
     ID3D12RootSignature rootSig;
     ID3D12PipelineState pso;
 
+    // --- Clustered-deferred path ---
+    // Geometry pass: writes the fat G-buffer (4 MRT) with the same vertex transform + material sampling as
+    // the old forward opaque, but NO lighting (GBuffer.hlsl). Reuses the per-draw DrawConstants CBV (b0) +
+    // 6 material SRVs (t0..t5) — same root sig shape as the forward path minus the IBL/shadow/frame params.
+    Dx12GBuffer gbuffer;
+    ID3D12RootSignature gbufferRootSig;
+    ID3D12PipelineState gbufferPso;
+
+    // Deferred lighting pass: fullscreen, reads the G-buffer + depth → PBR sun + IBL + shadows → HDR target
+    // (DeferredLighting.hlsl). The lighting math moved here out of the material shader.
+    ID3D12RootSignature deferredRootSig;   // LightConstants CBV(b0) + FrameConstants CBV(b1) + 9-SRV table(t0..t8) + sampler
+    ID3D12PipelineState deferredPso;
+    ID3D12Resource deferredCb;
+    unsafe byte* deferredCbMapped;
+    Dx12DescriptorHeap deferredSrvVisible;  // 9 SRVs copied per frame: G0..G3, depth, irradiance, prefilter, BRDF, shadow
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct LightConstants {
+        public Matrix4x4 InvViewProj;
+        public Vector3 LightDir; public float Pad0;
+        public Vector3 LightColor; public float Pad1;
+        public Vector3 Ambient; public float Pad2;
+        public Vector3 CameraPos; public float UseIBL;
+        public float PrefilterMaxMip; public float Pad3, Pad4, Pad5;
+    }
+
     // Final composite (HDR scene → exposure → ACES → +bloom → sRGB → LDR).
     ID3D12RootSignature compositeRootSig;   // CompositeConstants CBV (b0) + HDR+bloom SRV table + sampler
     ID3D12PipelineState compositePso;
@@ -67,7 +93,7 @@ public sealed class DX12HDRenderer : HDRenderer {
     Dx12DescriptorHeap ssaoSrvVisible;  // depth/AO source per sub-pass (3 slots)
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct SsaoConstants {
-        public Matrix4x4 Projection; public Matrix4x4 InvProjection;
+        public Matrix4x4 Projection; public Matrix4x4 InvProjection; public Matrix4x4 View;
         public float Radius; public float Intensity; public Vector2 TexelSize;
     }
 
@@ -196,21 +222,26 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (width <= 0 || height <= 0) return;
         if (target != null && width == targetW && height == targetH) return;
         targetW = width; targetH = height;
-        target?.Dispose(); ldr?.Dispose();
-        target = new Dx12OffscreenTarget(dev, width, height, withDepth: true,
+        target?.Dispose(); ldr?.Dispose(); gbuffer?.Dispose();
+        // The HDR scene target no longer owns depth — the G-buffer owns the scene depth (deferred path).
+        target = new Dx12OffscreenTarget(dev, width, height, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         ldr = new Dx12OffscreenTarget(dev, width, height);   // LDR composite output
+        gbuffer = new Dx12GBuffer(dev, width, height);
         if (bloomRootSig != null) AllocBloomTargets();       // half-res bloom ping-pong follows size
         if (ssaoRootSig != null) AllocSsaoTargets();
     }
 
     public override unsafe void Initialize() {
-        // Scene renders RAW HDR into `target` (R16F + depth); the composite tonemaps it into `ldr` (R8).
-        target = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: true,
+        // Clustered-deferred: geometry → G-buffer (owns scene depth) → deferred lighting → HDR `target`
+        // (color only) → sky/fog/post → composite into `ldr` (R8). `target` no longer owns depth.
+        target = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         ldr = new Dx12OffscreenTarget(dev, targetW, targetH);
+        gbuffer = new Dx12GBuffer(dev, targetW, targetH);
         BuildRootSignature();
         BuildPipeline();
+        BuildGeometryPass();
 
         cbSlotSize = (System.Runtime.InteropServices.Marshal.SizeOf<DrawConstants>() + 255) & ~255;
         cbSlotCount = 8192;   // submesh draws per frame ceiling (SunTemple ~hundreds)
@@ -239,8 +270,80 @@ public sealed class DX12HDRenderer : HDRenderer {
             ResourceDescription.Buffer((ulong)frameCbSize), ResourceStates.GenericRead);
         frameCbMapped = frameCb.Map<byte>(0);
 
+        BuildDeferredLighting();
         BuildFog();
         BuildComposite();
+    }
+
+    // Geometry pass PSO: same vertex layout + per-draw CBV(b0) + 6 material SRVs(t0..t5) as the forward
+    // opaque path, but the pixel shader (GBuffer.hlsl) writes the 4-MRT fat G-buffer instead of shading.
+    void BuildGeometryPass() {
+        // b0 = per-draw DrawConstants (root CBV); table0 = 6 material SRVs t0..t5; s0 wrap sampler.
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView,
+            new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var matRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, MaterialSrvCount, baseShaderRegister: 0);
+        var matTable = new RootParameter1(new RootDescriptorTable1(matRange), ShaderVisibility.Pixel);
+        var wrap = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap,
+            AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 16,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        gbufferRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.AllowInputAssemblerInputLayout,
+                new[] { cbv, matTable }, new[] { wrap })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("GBuffer.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "GBuffer.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "GBuffer.hlsl");
+        var layout = new InputLayoutDescription(
+            new InputElementDescription("POSITION", 0, Format.R32G32B32_Float, 0, 0),
+            new InputElementDescription("NORMAL", 0, Format.R32G32B32_Float, 0, 1),
+            new InputElementDescription("TEXCOORD", 0, Format.R32G32_Float, 0, 2),
+            new InputElementDescription("TANGENT", 0, Format.R32G32B32A32_Float, 0, 3));
+        gbufferPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+            RootSignature = gbufferRootSig, VertexShader = vs, PixelShader = ps, InputLayout = layout,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = RasterizerDescription.CullClockwise,   // back-face cull, CCW-from-front (forward parity)
+            BlendState = BlendDescription.Opaque, DepthStencilState = DepthStencilDescription.Default,
+            RenderTargetFormats = Dx12GBuffer.ColorFormats,
+            DepthStencilFormat = Dx12GBuffer.DepthFormat, SampleDescription = new SampleDescription(1, 0),
+        });
+    }
+
+    // Deferred lighting PSO: fullscreen triangle, LightConstants CBV(b0) + FrameConstants CBV(b1) +
+    // 9-SRV table(t0..t8: G0..G3, depth, irradiance, prefilter, BRDF, shadow) + clamp sampler.
+    unsafe void BuildDeferredLighting() {
+        var lightCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Pixel);
+        var frameCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.Pixel);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 9, baseShaderRegister: 0);
+        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
+        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        deferredRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None,
+                new[] { lightCbv, frameCbv, srvTable }, new[] { samp })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("DeferredLighting.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "DeferredLighting.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "DeferredLighting.hlsl");
+        deferredPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+            RootSignature = deferredRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
+            DepthStencilState = DepthStencilDescription.None,
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
+            DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
+        });
+
+        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<LightConstants>() + 255) & ~255;
+        deferredCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+        deferredCbMapped = deferredCb.Map<byte>(0);
+        deferredSrvVisible = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 9, shaderVisible: true);
     }
 
     unsafe void BuildComposite() {
@@ -281,7 +384,8 @@ public sealed class DX12HDRenderer : HDRenderer {
 
     unsafe void BuildSsao() {
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
+        // 2-SRV table: main pass = depth(t0) + G-buffer world normal(t1); blur passes = AO(t0).
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 0);
         var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
         var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
             Filter = Filter.MinMagMipPoint, AddressU = TextureAddressMode.Clamp,
@@ -311,8 +415,10 @@ public sealed class DX12HDRenderer : HDRenderer {
         ssaoCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         ssaoCbMapped = ssaoCb.Map<byte>(0);
+        // Main pass binds a 2-SRV run (depth+normal); each blur binds a 2-SRV run (AO at t0, t1 unused).
+        // 3 runs × 2 = 6 contiguous slots.
         ssaoSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 6, shaderVisible: true);
         AllocSsaoTargets();
     }
 
@@ -671,29 +777,17 @@ public sealed class DX12HDRenderer : HDRenderer {
         int draws = 0;
         long tris = 0;
         srvVisible.Reset();
-        // The IBL/shadow table is ALWAYS 4 contiguous SRVs at t6..t9 (a command list binds one CBV/SRV
-        // heap, so material + this share srvVisible). Slots: irradiance, prefilter, BRDF, shadow array.
-        // When IBL is off, the cube/LUT slots get neutral fallbacks (UseIBL=0 makes the shader ignore them).
-        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        int iblBase = srvVisible.AllocateRange(4);
-        // The baker's cubes/LUT are always allocated (valid SRVs) even before the first bake; when IBL is
-        // off the shader ignores them via UseIBL=0. Shadow array is always real.
-        dev.Device.CopyDescriptorsSimple(1, srvVisible.Cpu(iblBase + 0), ibl.IrradianceSrv, heapType);
-        dev.Device.CopyDescriptorsSimple(1, srvVisible.Cpu(iblBase + 1), ibl.PrefilterSrv, heapType);
-        dev.Device.CopyDescriptorsSimple(1, srvVisible.Cpu(iblBase + 2), ibl.BrdfSrv, heapType);
-        dev.Device.CopyDescriptorsSimple(1, srvVisible.Cpu(iblBase + 3), shadowMap.SrvCpu, heapType);
         int slot = 0;
 
         var fallbackDiffuse = DefaultTextures.Neutral(TextureType.Diffuse) as Dx12Texture2D;
 
-        target.RenderIntoCleared(0.0f, 0.0f, 0.0f, cl => {
-            cl.SetGraphicsRootSignature(rootSig);
-            cl.SetPipelineState(pso);
+        // === GEOMETRY PASS: fill the fat G-buffer (no lighting — GBuffer.hlsl writes albedo/normal/ORM/
+        // emissive + depth). Same vertex transform + material sampling as the old forward opaque. ===
+        gbuffer.RenderGeometry(cl => {
+            cl.SetGraphicsRootSignature(gbufferRootSig);
+            cl.SetPipelineState(gbufferPso);
             cl.SetDescriptorHeaps(srvVisible.Heap);
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            // Bind the IBL/shadow table (param 2) + per-frame CBV (param 3) once — same for every draw.
-            cl.SetGraphicsRootDescriptorTable(2, srvVisible.Gpu(iblBase));
-            cl.SetGraphicsRootConstantBufferView(3, frameCb.GPUVirtualAddress);
 
             foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
                 if (r is null || !r.IsActive || !r.IsRenderable) continue;
@@ -734,6 +828,9 @@ public sealed class DX12HDRenderer : HDRenderer {
                     bool hasMetal = mat.Metallic is not null;
                     bool hasRough = mat.Roughness is not null;
                     bool emissive = mat.IsEmissive;
+                    // The G-buffer geometry shader reads the material-shaping fields (factors, maps, flags);
+                    // the per-light fields (LightDir/LightColor/Ambient/Exposure) are unused here (they live
+                    // in the deferred pass now) but the struct is shared, so they're filled harmlessly.
                     var c = new DrawConstants {
                         Mvp = Matrix4x4.Transpose(mvp),
                         Model = Matrix4x4.Transpose(model),
@@ -754,8 +851,7 @@ public sealed class DX12HDRenderer : HDRenderer {
                     cl.SetGraphicsRootConstantBufferView(0,
                         cbRing.GPUVirtualAddress + (ulong)((long)slot * cbSlotSize));
 
-                    // Copy the 6 material SRVs into a contiguous shader-visible table region (t0..t5).
-                    // Null slots resolve to the type's neutral default so every descriptor is valid.
+                    // 6 material SRVs (t0..t5); null slots resolve to neutral defaults.
                     int tableStart = srvVisible.AllocateRange(MaterialSrvCount);
                     BindSrv(tableStart + 0, mat.Diffuse, TextureType.Diffuse, fallbackDiffuse);
                     BindSrv(tableStart + 1, mat.Normal, TextureType.Normal, null);
@@ -771,9 +867,16 @@ public sealed class DX12HDRenderer : HDRenderer {
                     slot++;
                 }
             }
+        });
 
-            // --- Sky background (after opaque, same command list) ---
-            // ProceduralSky takes precedence over an asset cubemap Skybox (matches the GL renderer).
+        // === DEFERRED LIGHTING: read the G-buffer + depth → PBR sun + IBL + shadows → HDR `target`. ===
+        gbuffer.ToShaderResource();
+        DrawDeferredLighting(viewProj, camPos, lightDir, lightColor, ambient);
+
+        // === SKY: draw into the HDR color at the far plane, depth-testing the G-buffer depth (LEqual,
+        // no write). ProceduralSky takes precedence over an asset cubemap Skybox (matches GL). ===
+        gbuffer.DepthToReadOnly();
+        target.RenderColorWithExternalDepth(gbuffer.DsvHandle, cl => {
             if (ProceduralSky.Active is not null)
                 DrawProcSky(cl, view, proj, light);
             else
@@ -789,7 +892,7 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         // --- SSAO (HBAO from depth → half-res AO, multiplied in the composite) ---
         bool ssaoOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SSAO") != "0";
-        if (ssaoOn) DrawSsao(proj);
+        if (ssaoOn) DrawSsao(view, proj);
 
         // --- Final composite: HDR scene → exposure → ACES → sRGB → LDR ---
         DrawComposite(ssaoOn);
@@ -799,17 +902,58 @@ public sealed class DX12HDRenderer : HDRenderer {
         return new RenderMetrics(draws, 0, (int)tris, 0, 0f);
     }
 
-    // HBAO from scene depth → blurred half-res AO in ssaoA. Depth must be SRV (DrawSsao transitions it).
-    unsafe void DrawSsao(Matrix4x4 proj) {
+    // Fullscreen deferred lighting: read the G-buffer (G0..G3 + depth, already in SRV state) + IBL +
+    // shadow cascades, shade Cook-Torrance sun + split-sum IBL, write RAW HDR into `target`. Mirrors the
+    // forward StandardOpaque shading exactly — only the inputs come from the G-buffer instead of vertices.
+    unsafe void DrawDeferredLighting(Matrix4x4 viewProj, Vector3 camPos, Vector3 lightDir, Vector3 lightColor, Vector3 ambient) {
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
+        *(LightConstants*)deferredCbMapped = new LightConstants {
+            InvViewProj = Matrix4x4.Transpose(invVP),
+            LightDir = lightDir, LightColor = lightColor, Ambient = ambient, CameraPos = camPos,
+            UseIBL = iblActiveThisFrame ? 1f : 0f,
+            PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f,
+        };
+
+        // Copy the 9 SRVs into the shader-visible table: G0..G3, depth, irradiance, prefilter, BRDF, shadow.
+        deferredSrvVisible.Reset();
+        int b = deferredSrvVisible.AllocateRange(9);
+        for (int i = 0; i < Dx12GBuffer.RtCount; i++)
+            dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + i), gbuffer.ColorSrvCpu(i), heapType);
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 4), gbuffer.DepthSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 5), ibl.IrradianceSrv, heapType);
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 6), ibl.PrefilterSrv, heapType);
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 7), ibl.BrdfSrv, heapType);
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 8), shadowMap.SrvCpu, heapType);
+
+        target.RenderColorOnlyCleared(cl => {
+            cl.SetGraphicsRootSignature(deferredRootSig);
+            cl.SetPipelineState(deferredPso);
+            cl.SetDescriptorHeaps(deferredSrvVisible.Heap);
+            cl.SetGraphicsRootConstantBufferView(0, deferredCb.GPUVirtualAddress);
+            cl.SetGraphicsRootConstantBufferView(1, frameCb.GPUVirtualAddress);
+            cl.SetGraphicsRootDescriptorTable(2, deferredSrvVisible.Gpu(b));
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
+    }
+
+    // HBAO from the G-buffer (scene depth for view-pos + world normal, both already SRVs from the deferred
+    // pass) → blurred half-res AO in ssaoA. No depth-reconstructed normal anymore — the real surface normal
+    // comes straight from the G-buffer (sharper, silhouette-correct). View transforms the world normal into
+    // view space for the horizon march.
+    unsafe void DrawSsao(Matrix4x4 view, Matrix4x4 proj) {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Matrix4x4.Invert(proj, out Matrix4x4 invProj);
-        target.DepthToShaderResource();
+        gbuffer.DepthToShaderResource();   // no-op if fog already moved it
         *(SsaoConstants*)ssaoCbMapped = new SsaoConstants {
             Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProj),
+            View = Matrix4x4.Transpose(view),
             Radius = 0.5f, Intensity = 1.0f, TexelSize = new Vector2(1f / ssaoA.Width, 1f / ssaoA.Height),
         };
-        // Main AO pass: depth → ssaoA.
-        dev.Device.CopyDescriptorsSimple(1, ssaoSrvVisible.Cpu(0), target.DepthSrvCpu, heapType);
+        // Main AO pass: depth(t0) + G-buffer world normal(t1) → ssaoA. Uses slots 0,1.
+        dev.Device.CopyDescriptorsSimple(1, ssaoSrvVisible.Cpu(0), gbuffer.DepthSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, ssaoSrvVisible.Cpu(1), gbuffer.ColorSrvCpu(1), heapType);
         ssaoA.RenderColorOnly(cl => {
             cl.SetGraphicsRootSignature(ssaoRootSig); cl.SetPipelineState(ssaoPso);
             cl.SetDescriptorHeaps(ssaoSrvVisible.Heap);
@@ -818,10 +962,12 @@ public sealed class DX12HDRenderer : HDRenderer {
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
         });
-        // Blur H (ssaoA→ssaoB), Blur V (ssaoB→ssaoA).
+        // Blur H (ssaoA→ssaoB), Blur V (ssaoB→ssaoA). Each binds a 2-slot run (AO at t0; t1 unused but
+        // copied so the descriptor is valid). Runs at slots 2 and 4.
         void Blur(ID3D12PipelineState pso, Dx12OffscreenTarget src, Dx12OffscreenTarget dst, int srvSlot) {
             src.ColorToShaderResource();
             dev.Device.CopyDescriptorsSimple(1, ssaoSrvVisible.Cpu(srvSlot), src.ColorSrvCpu, heapType);
+            dev.Device.CopyDescriptorsSimple(1, ssaoSrvVisible.Cpu(srvSlot + 1), src.ColorSrvCpu, heapType);
             dst.RenderColorOnly(cl => {
                 cl.SetGraphicsRootSignature(ssaoRootSig); cl.SetPipelineState(pso);
                 cl.SetDescriptorHeaps(ssaoSrvVisible.Heap);
@@ -831,10 +977,9 @@ public sealed class DX12HDRenderer : HDRenderer {
                 cl.DrawInstanced(3, 1, 0, 0);
             });
         }
-        Blur(ssaoBlurHPso, ssaoA, ssaoB, 1);
-        Blur(ssaoBlurVPso, ssaoB, ssaoA, 2);
+        Blur(ssaoBlurHPso, ssaoA, ssaoB, 2);
+        Blur(ssaoBlurVPso, ssaoB, ssaoA, 4);
         ssaoA.ColorToShaderResource();
-        target.DepthToWrite();
     }
 
     // Bloom: bright-pass the HDR (target, already in SRV state) → bloomA; blur H (bloomA→bloomB);
@@ -951,10 +1096,11 @@ public sealed class DX12HDRenderer : HDRenderer {
         };
         *(FogConstants*)fogCbMapped = fc;
 
-        // depth → SRV, shadow array already SRV from RenderShadows. Copy both into the fog heap.
-        target.DepthToShaderResource();
+        // depth → SRV (G-buffer owns it), shadow array already SRV from RenderShadows. Copy both into the
+        // fog heap. After the sky pass the G-buffer depth is in DepthRead; bring it to PixelShaderResource.
+        gbuffer.DepthToShaderResource();
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(0), target.DepthSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(0), gbuffer.DepthSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(1), shadowMap.SrvCpu, heapType);
 
         target.RenderColorOnly(cl => {
@@ -966,7 +1112,6 @@ public sealed class DX12HDRenderer : HDRenderer {
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
         });
-        target.DepthToWrite();   // restore for next frame's opaque pass
     }
 
     // Draw the environment cubemap as the far-plane background (LEqual, no depth write) where opaque

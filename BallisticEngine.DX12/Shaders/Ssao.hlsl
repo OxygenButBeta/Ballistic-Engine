@@ -10,13 +10,15 @@
 cbuffer SsaoConstants : register(b0) {
     float4x4 Projection;     // camera projection (DX z[0,1]), transposed on upload
     float4x4 InvProjection;  // its inverse, transposed
+    float4x4 View;           // world → view (transposed) — to rotate the G-buffer world normal to view space
     float Radius;            // world-space falloff radius
     float Intensity;         // AO strength
     float2 TexelSize;        // 1 / AO-buffer size
 };
 
-Texture2D DepthTex : register(t0);
-Texture2D AoTex    : register(t0);   // alias for the blur passes (same register, different bind)
+Texture2D DepthTex  : register(t0);
+Texture2D AoTex     : register(t0);   // alias for the blur passes (same register, different bind)
+Texture2D NormalTex : register(t1);   // G-buffer world normal (packed [0,1]) — main pass only
 SamplerState PointClamp : register(s0);
 
 static const float PI = 3.14159265359;
@@ -42,14 +44,11 @@ float3 ViewPos(float2 uv) {
     return v.xyz / v.w;
 }
 
-float3 ReconstructNormal(float2 uv, float3 P) {
-    float3 pL = ViewPos(uv - float2(TexelSize.x, 0));
-    float3 pR = ViewPos(uv + float2(TexelSize.x, 0));
-    float3 pD = ViewPos(uv - float2(0, TexelSize.y));
-    float3 pU = ViewPos(uv + float2(0, TexelSize.y));
-    float3 dx = abs(pR.z - P.z) < abs(P.z - pL.z) ? (pR - P) : (P - pL);
-    float3 dy = abs(pU.z - P.z) < abs(P.z - pD.z) ? (pU - P) : (P - pD);
-    return normalize(cross(dx, dy));
+// The view-space surface normal, straight from the G-buffer world normal (no depth-derivative
+// reconstruction — sharper + silhouette-correct). Rotate world → view by the View matrix's 3x3.
+float3 ViewNormal(float2 uv) {
+    float3 nWorld = normalize(NormalTex.SampleLevel(PointClamp, uv, 0).rgb * 2.0 - 1.0);
+    return normalize(mul(float4(nWorld, 0.0), View).xyz);
 }
 
 float4 PSMain(VSOut i) : SV_Target {
@@ -60,7 +59,7 @@ float4 PSMain(VSOut i) : SV_Target {
     // View Z is negative looking forward (RH). Project the world radius to a pixel march length.
     float radiusPx = Radius / max(-P.z, 1e-3) * (0.5 / TexelSize.y);
     radiusPx = clamp(radiusPx, 2.0, 0.3 / TexelSize.y);
-    float3 N = ReconstructNormal(i.Uv, P);
+    float3 N = ViewNormal(i.Uv);
 
     float noise = Rand(i.Uv * 197.0);
     float occlusion = 0.0;

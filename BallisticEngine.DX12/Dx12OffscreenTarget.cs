@@ -135,6 +135,32 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         });
     }
 
+    // Like RenderColorOnly but clears the color to black first — the deferred lighting pass discards sky
+    // pixels (depth==far), so they must be a known black for the subsequent sky pass to overwrite.
+    public void RenderColorOnlyCleared(Action<ID3D12GraphicsCommandList4> record) {
+        dev.ExecuteSync(cl => {
+            TransitionTo(cl, ResourceStates.RenderTarget);
+            cl.RSSetViewport(0, 0, Width, Height);
+            cl.RSSetScissorRect(Width, Height);
+            cl.OMSetRenderTargets(rtvHandle);
+            cl.ClearRenderTargetView(rtvHandle, new Vortice.Mathematics.Color4(0, 0, 0, 1));
+            record(cl);
+        });
+    }
+
+    // Like RenderColorOnly but also binds an EXTERNAL depth-stencil view (the deferred sky pass draws
+    // into the HDR color while depth-testing against the G-buffer depth, which this target doesn't own).
+    // The external depth must already be in a DSV-bindable state (DepthRead for a no-write LEqual test).
+    public void RenderColorWithExternalDepth(CpuDescriptorHandle dsv, Action<ID3D12GraphicsCommandList4> record) {
+        dev.ExecuteSync(cl => {
+            TransitionTo(cl, ResourceStates.RenderTarget);
+            cl.RSSetViewport(0, 0, Width, Height);
+            cl.RSSetScissorRect(Width, Height);
+            cl.OMSetRenderTargets(new[] { rtvHandle }, dsv);
+            record(cl);
+        });
+    }
+
     // Color state transitions: the composite reads the HDR scene color as an SRV.
     public void ColorToShaderResource() {
         dev.ExecuteSync(cl => TransitionTo(cl, ResourceStates.PixelShaderResource));
