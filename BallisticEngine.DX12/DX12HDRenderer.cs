@@ -212,6 +212,10 @@ public sealed class DX12HDRenderer : HDRenderer {
     unsafe byte* rtGiCbMapped, rtGiSunCbMapped;
     Dx12DescriptorHeap rtGiHeap;                // 6 descriptors (rebuilt per frame)
     Dx12RtGeometry rtGeometry;                  // P1: per-instance index/normal/uv/tri-material SRVs (bindless)
+    Dx12Ddgi ddgi;                              // P2: DDGI world-probe radiance cache (BALLISTIC_DX12_DDGI=1)
+    bool ddgiLogged;
+    bool? ddgiOn;
+    bool DdgiEnabled => ddgiOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI") == "1";
     bool rtGiBuilt;
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct RtGiConstants { public Matrix4x4 InvViewProj; public Matrix4x4 ViewProj; public Vector4 Params; }  // preExp, rayLength, _, frameIdx
@@ -1611,7 +1615,7 @@ public sealed class DX12HDRenderer : HDRenderer {
                       : ssgiEnv == "0" ? GiMode.Off
                       : ssgiEnv == "1" ? GiMode.ScreenSpace
                       : PostFX.GiMode;
-        if (giMode == GiMode.RayTraced) { if (EnsureRtGi()) TimePass("GI:RT", () => DrawRtGi(view, viewProj, proj, lightDir, lightColor)); else TimePass("GI:SSGI", () => DrawSsgi(view, proj)); }
+        if (giMode == GiMode.RayTraced) { if (EnsureRtGi()) TimePass("GI:RT", () => DrawRtGi(view, viewProj, proj, lightDir, lightColor, camPos)); else TimePass("GI:SSGI", () => DrawSsgi(view, proj)); }
         else if (giMode == GiMode.ScreenSpace) TimePass("GI:SSGI", () => DrawSsgi(view, proj));
 
         // --- Volumetric fog (post pass, reads depth+shadows, blends over HDR scene color) ---
@@ -2469,9 +2473,26 @@ public sealed class DX12HDRenderer : HDRenderer {
     // then the SHARED SSGI resolve (temporal + OIDN + combine). viewProj is the JITTERED matrix (matches the
     // depth); proj drives the SSGI dials/combine. lightDir/lightColor = the sun (raw HDR) for the world-space
     // hit re-shading (P1). EnsureMaterialTable + rtGeometry.Ensure MUST run before this (bindless ids).
-    unsafe void DrawRtGi(Matrix4x4 view, Matrix4x4 viewProj, Matrix4x4 proj, Vector3 lightDir, Vector3 lightColor) {
+    unsafe void DrawRtGi(Matrix4x4 view, Matrix4x4 viewProj, Matrix4x4 proj, Vector3 lightDir, Vector3 lightColor, Vector3 camPos) {
         sceneAS.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection);
         if (!sceneAS.Valid) { DrawSsgi(view, proj); return; }   // no geometry → fall back to SSGI
+
+        // --- P2.0: DDGI world-probe radiance cache (BALLISTIC_DX12_DDGI=1). Allocate the probe atlases +
+        // snap the camera-centered grid. Update/blend/gather compute passes land in P2.1+; for now this is
+        // inert (no image change) — verifying the grid + atlas foundation. ---
+        if (DdgiEnabled) {
+            if (ddgi == null) ddgi = new Dx12Ddgi(dev);
+            ddgi.EnsureAllocated();
+            ddgi.Update(camPos);
+            if (!ddgiLogged) {
+                ddgiLogged = true;
+                Vector3 o = ddgi.Origin;
+                Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                    $"[DDGI] grid {Dx12Ddgi.ProbesX}x{Dx12Ddgi.ProbesY}x{Dx12Ddgi.ProbesZ}={Dx12Ddgi.ProbeCount} probes; " +
+                    $"origin=({o.X:0.#},{o.Y:0.#},{o.Z:0.#}) spacing={ddgi.Spacing.X:0.#}m covers ~{ddgi.Spacing.X*(Dx12Ddgi.ProbesX-1):0}x{ddgi.Spacing.Y*(Dx12Ddgi.ProbesY-1):0}x{ddgi.Spacing.Z*(Dx12Ddgi.ProbesZ-1):0}m; " +
+                    $"irrAtlas={Dx12Ddgi.IrradianceAtlasW}x{Dx12Ddgi.IrradianceAtlasH} depthAtlas={Dx12Ddgi.DepthAtlasW}x{Dx12Ddgi.DepthAtlasH}"));
+            }
+        }
         // The bindless material table (byte-identical to the raster G-buffer) feeds the world-space hit
         // shading. The geometry pass builds it only when gpuDrivenOn — ensure it here too (stamp-cached no-op
         // if already built) so RT-GI works with the CPU geometry path. Then the per-instance geometry SRVs.
