@@ -301,7 +301,7 @@ internal static class Program {
             ("dir", "string", "Look direction 'x,y,z' e.g. '0.3,-0.5,1' for a 3/4 top view; omit to keep current", false),
             ("fit", "number", "Zoom multiplier on the framed radius (1=default, <1 closer, >1 wider)", false)) },
         new { name = "editor_refresh", description = "Force a full asset reimport (registers newly written .scene/.volume/.mat assets).", inputSchema = Schema() },
-        new { name = "scene_component_set", description = "Set a member on a scene-wide component (Skybox/ProceduralSky/SceneLighting/IrradianceVolume), e.g. tune sky exposure. Undoable.", inputSchema = Schema(
+        new { name = "scene_component_set", description = "Set a member on a scene-wide component (Skybox/ProceduralSky/SceneLighting), e.g. tune sky exposure. Undoable.", inputSchema = Schema(
             ("type", "string", "Scene component type, e.g. ProceduralSky", true),
             ("member", "string", "Member name, e.g. exposure", true),
             ("value", "string", "New value (number, 'x,y,z' vector, enum name)", true)) },

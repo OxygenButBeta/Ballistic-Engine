@@ -227,37 +227,8 @@ public sealed class PostProcessSettings {
     public float DofAperture { get; set; } = 2.8f;      // f-number; smaller = shallower DoF
     public float DofMaxCoc { get; set; } = 0.03f;       // blur-radius clamp (fraction of frame height)
 
-    // ---- Realtime GI stack (GlobalIllumination volume override) -----------------------------------
-    // The auto-fit probes + reflections + SDF-GI all run by DEFAULT (no setup); these dials let a
-    // GlobalIllumination volume tune their strength without disabling the default behaviour. All
-    // default to "current behaviour" so a no-volume scene is unchanged:
-    //   * GiProbeIntensity / GiReflectionIntensity scale the baked diffuse / specular ambient.
-    //   * GiSdfIntensityScale multiplies the SDF-GI off-screen bounce (on top of its own default,
-    //     and on top of the probe<->SDF blend the renderer already applies).
-    //   * GiSdfForceEnabled lets a volume turn the SDF-GI bounce ON without the env var (it stays
-    //     env-gated by default while it matures; a scene that wants it just adds the volume).
-    public float GiProbeIntensity { get; set; } = 1f;       // baked diffuse-probe ambient strength
-    public float GiReflectionIntensity { get; set; } = 1f;  // baked local-reflection strength (× the volume's own Intensity)
-    public float GiSdfIntensityScale { get; set; } = 1f;    // extra multiplier on the SDF-GI bounce
-    public bool GiSdfForceEnabled { get; set; }             // turn SDF-GI on without BALLISTIC_SDFGI
-    // Tiny ambient shadow-fill (fraction of albedo, AO-modulated) so enclosed interiors never crush
-    // the shadowed side of geometry to PURE BLACK (UE interiors always have bounce fill). Small by
-    // default so lit areas are ~unchanged; raise for flatter/brighter ambient, 0 for physically-pure.
-    public float GiAmbientFloor { get; set; } = 0.03f;
-
-    // Auto-fit probe-grid density multipliers (the IrradianceVolume/ReflectionVolume are automatic;
-    // these scale how finely they're sampled). 1 = default auto-fit resolution.
-    public float GiProbeDensity { get; set; } = 1f;
-    public float GiReflectionDensity { get; set; } = 1f;
-
-    // Debug gizmo toggles (also on the Scene-view toolbar): draw the probe / reflection grids.
-    public bool GiDebugShowProbes { get; set; }
-    public bool GiDebugShowReflectionProbes { get; set; }
-
-    // Per-system master switches (the split LightProbes / ReflectionProbes / Lumen volume overrides).
-    // Default ON for diffuse + specular probes (they run by default); Lumen default OFF (env/override-
-    // gated). Let a scene disable any one system independently — the "stop Lumen" / "kill probe ambient".
-    public bool GiProbesEnabled { get; set; } = true;
-    public bool GiReflectionsEnabled { get; set; } = true;
-    public bool GiLumenEnabled { get; set; }
+    // (The old GL realtime-GI stack fields — GiProbeIntensity / GiReflection* / GiSdf* / GiAmbientFloor /
+    // GiProbesEnabled / GiLumenEnabled / GiDebugShow* — were deleted in the P0.5 GI consolidation. They
+    // drove the GL probe/SDF baker, which is gone; DX12 GI is the unified GlobalIllumination volume
+    // (Ssgi* + GiMode + ReflectionMode above). No reader remained.)
 }
