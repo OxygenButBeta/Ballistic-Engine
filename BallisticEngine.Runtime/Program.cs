@@ -35,15 +35,24 @@ internal class Program {
 
         BallisticEngine.Profiling.TracyProfiler.TryInstall("Ballistic Runtime");
 
-        // Backend seam (DX12Migration.md): BALLISTIC_BACKEND=dx12 brings up the DX12 host instead of the
-        // GL window. The DX12 host is currently HEADLESS (no swapchain) — it serves the screenshot
-        // verification path; a windowed DX12 host (present + Windows input) comes later. GL is the default
-        // host until the DX12 path reaches parity (then GL is deleted).
+        // Backend seam (DX12Migration.md ENDGAME 3): DX12 is the default host. With BALLISTIC_SCREENSHOT set
+        // we use the windowless headless host (deterministic offscreen capture — the verification path); a
+        // normal launch uses the windowed DX12 host (swapchain + present + Windows input). GL is reachable
+        // via BALLISTIC_BACKEND=gl only while the GL code still exists (deleted at the end of ENDGAME 3).
+        bool screenshotMode = Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT") is not null;
         IBallisticEngineRuntime runtime;
         if (RenderBackendSelector.Selected == RenderBackend.Dx12) {
-            Console.WriteLine("[Backend] DX12 host (headless — screenshot path). " +
-                              "Set BALLISTIC_SCREENSHOT to capture a frame.");
-            runtime = new Dx12HeadlessRuntime(player.Width, player.Height);
+            if (screenshotMode) {
+                Console.WriteLine("[Backend] DX12 host (headless — screenshot path).");
+                runtime = new Dx12HeadlessRuntime(player.Width, player.Height);
+            }
+            else {
+                Console.WriteLine("[Backend] DX12 host (windowed player).");
+                runtime = new Dx12WindowedRuntime(player.Width, player.Height,
+                    fullscreen: mode == WindowMode.Fullscreen,
+                    borderless: mode == WindowMode.Borderless,
+                    title: player.ProductName);
+            }
         }
         else {
             runtime = new GLBallisticEngineWindow(player.Width, player.Height,

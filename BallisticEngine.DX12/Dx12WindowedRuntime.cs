@@ -84,6 +84,12 @@ public sealed class Dx12WindowedRuntime : GameWindow, IBallisticEngineRuntime, I
         Focus();
         width = ClientSize.X; height = ClientSize.Y;
         swapChain = new Dx12SwapChain(Dx12Backend.Device, GetHwnd(), width, height);
+        // The player present is a CopyResource(backbuffer, ldr) — it REQUIRES the renderer's LDR target to be
+        // the exact backbuffer size. The renderer initializes at a hardcoded 1920x1080 default; sync it to the
+        // real client size now (before the first OnRenderFrame) so the first present never copies mismatched
+        // sizes, even if OnResize hasn't fired yet. (The renderer exists: DirectXRenderAsset.Initialize ran
+        // during bootstrap, before Run/OnLoad.)
+        (RenderAsset.Current.Renderer as DX12HDRenderer)?.ResizeSceneTarget(width, height);
     }
 
     unsafe nint GetHwnd() => GLFW.GetWin32Window(WindowPtr);
