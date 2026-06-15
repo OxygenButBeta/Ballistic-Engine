@@ -147,13 +147,18 @@ BALLISTIC_DX12_BLOOM=0 off) — soft glow on bright surfaces. Refs dx12_*_autoex
 **MODE: full-auto /loop (user: "start full auto mod /loop") — work→commit→work, self-paced, no pausing
 between features until the migration is done or the user stops.**
 
-**DX12 stack now: PBR + sky + IBL + shadows + fog + HDR + auto-exposure + bloom, on 2 scenes.**
+**🟢 DX12 SSAO (2026-06-15):** HBAO from depth (Ssao.hlsl — view pos+normal from depth, horizon-elevation
+slices) → half-res R8 AO + separable blur, multiplied into the HDR color in the composite (UseAo;
+BALLISTIC_DX12_SSAO=0 off). VERIFIED SunTemple — contact darkening in crevices/column bases/arches, flat
+surfaces untouched (ref dx12_suntemple_ssao.png). Composite SRV table now 4 (HDR/bloom/avgLum/AO).
 
-**NEXT (DX12, each committable; port ALL GL features):** SSAO (reuses the depth SRV, high single-frame
-ROI — do before TAA); SSR; TAA (jitter + motion vectors + history — harder to verify on single shots);
-SSGI (LAST per directive); sky clouds/cirrus/stars; alpha-cutout caster shadows; cascade caching +
-interleave mesh verts (perf); finally editor→DX12 + delete GL wholesale (incl. the GL-shaped bind methods
-+ RenderContext the DX12 path no-ops). DON'T break the editor — it renders on GL; delete GL only at the end.
+**DX12 stack now: PBR + sky + IBL + shadows + fog + HDR + auto-exposure + bloom + SSAO, on 2 scenes.**
+
+**NEXT (full-auto /loop; port ALL GL features):** SSR (screen-space reflections — march the depth/HDR in
+screen space; reuses depth SRV); TAA (jitter + motion vectors + history buffer — harder to verify on single
+shots, lower ROI); SSGI (LAST per directive); sky clouds/cirrus/stars; alpha-cutout caster shadows; cascade
+caching + interleave mesh verts (perf); finally editor→DX12 + delete GL wholesale (incl. the GL-shaped bind
+methods + RenderContext the DX12 path no-ops). DON'T break the editor — it renders on GL; delete GL last.
 
 The frozen GL parity image: `Docs/Plans/dx12-refs/gl_suntemple_baseline.png` (mean RGB 96.7,81.9,65.6).
 
