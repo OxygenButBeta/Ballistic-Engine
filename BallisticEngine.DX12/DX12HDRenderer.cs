@@ -361,7 +361,17 @@ public sealed class DX12HDRenderer : HDRenderer {
         BuildSsr();
         BuildTaa();
         BuildComposite();
+
+        // GPU-driven geometry path (compute cull + ExecuteIndirect + bindless) for whole-mesh renderers.
+        // DEFAULT ON (byte-identical to the CPU path, verified on Bistro + SunTemple); BALLISTIC_DX12_GPUDRIVEN=0
+        // falls back to the per-submesh CPU draw loop. Mirrors the GL BALLISTIC_GPUDRIVEN convention.
+        gpuDrivenOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GPUDRIVEN") != "0";
+        gpuDriven = new Dx12GpuDrivenRenderer(dev);
     }
+
+    Dx12GpuDrivenRenderer gpuDriven;
+    bool gpuDrivenOn;
+    readonly System.Collections.Generic.List<IStaticMeshRenderer> wholeMeshRenderers = new();
 
     unsafe void BuildTaa() {
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
@@ -1045,6 +1055,16 @@ public sealed class DX12HDRenderer : HDRenderer {
         // Camera frustum planes from the UNJITTERED viewProj — per-submesh cull in the geometry pass.
         ExtractFrustumPlanes(viewProjUnjittered);
 
+        // GPU-driven: collect whole-mesh renderers (SubMeshIndex < 0) — their opaque submeshes are culled +
+        // drawn via compute + ExecuteIndirect instead of the per-submesh CPU loop below.
+        wholeMeshRenderers.Clear();
+        if (gpuDrivenOn) {
+            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
+                if (r is { IsActive: true, IsRenderable: true } && r.SubMeshIndex < 0 && r.SharedMesh != null)
+                    wholeMeshRenderers.Add(r);
+            gpuDriven.EnsureMaterialTable(wholeMeshRenderers);
+        }
+
         var fallbackDiffuse = DefaultTextures.Neutral(TextureType.Diffuse) as Dx12Texture2D;
 
         // === GEOMETRY PASS: fill the fat G-buffer (no lighting — GBuffer.hlsl writes albedo/normal/ORM/
@@ -1057,6 +1077,8 @@ public sealed class DX12HDRenderer : HDRenderer {
 
             foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
                 if (r is null || !r.IsActive || !r.IsRenderable) continue;
+                // Whole-mesh renderers are GPU-driven (compute cull + ExecuteIndirect) — skip them here.
+                if (gpuDrivenOn && r.SubMeshIndex < 0) continue;
                 Mesh mesh = r.SharedMesh;
                 if (mesh is null) continue;
 
@@ -1138,6 +1160,14 @@ public sealed class DX12HDRenderer : HDRenderer {
                     tris += sub.IndexCount / 3;
                     slot++;
                 }
+            }
+
+            // GPU-driven whole-mesh geometry: compute cull + ExecuteIndirect + bindless materials, into the
+            // same G-buffer. Uses the JITTERED viewProj for the per-draw Mvp (matches the CPU path) and the
+            // UNJITTERED frustum planes for culling (byte-identical visible set).
+            if (gpuDrivenOn && wholeMeshRenderers.Count > 0) {
+                draws += gpuDriven.RenderInto(cl, wholeMeshRenderers, viewProj, frustumPlanes);
+                tris += gpuDriven.LastTris;
             }
         });
 
