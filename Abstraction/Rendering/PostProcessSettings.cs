@@ -20,6 +20,13 @@ public enum ReflectionMode {
     RayTraced,     // DXR — off-screen + sky reflect correctly (falls back to SSR without DXR)
 }
 
+// Global-illumination technique (the GI volume's Off/SSGI/RT-GI dropdown).
+public enum GiMode {
+    Off,           // no GI bounce
+    ScreenSpace,   // SSGI (SSILVB screen-space gather)
+    RayTraced,     // DXR ray-traced GI (off-screen-aware; falls back to SSGI without DXR)
+}
+
 // Temporal upscaling quality (FSR). Each mode is a fixed per-dimension render-resolution ratio; the
 // upscaler reconstructs the display resolution. Higher ratio = lower internal res = faster, softer.
 public enum UpscaleMode {
@@ -102,6 +109,7 @@ public sealed class PostProcessSettings {
     // directional bounce a flat ambient term can't provide). Like SSR it needs the normal
     // attachment, so it only runs while TAA is on / MSAA is off.
     public bool SsgiEnabled { get; set; } = true;
+    public GiMode GiMode { get; set; } = GiMode.ScreenSpace;   // GI volume dropdown: Off / SSGI / RT-GI (DXR)
 
     // -- Quality / noise --
     // Rays per pixel: with temporal accumulation + the denoiser, even 2-4 stays clean.

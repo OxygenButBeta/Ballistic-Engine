@@ -6,6 +6,10 @@ namespace BallisticEngine;
 public sealed class ScreenSpaceGlobalIllumination : VolumeComponent {
     public readonly BoolParameter enabled = new(true);
 
+    [Tooltip("GI technique: Off, Screen Space (SSGI), or Ray Traced (DX12 + DXR; off-screen-aware one-bounce " +
+             "GI, falls back to SSGI on GPUs without ray tracing). All denoised with OIDN.")]
+    public readonly EnumParameter<GiMode> mode = new(GiMode.ScreenSpace);
+
     [Tooltip("Cinematic look strength on the local bounce (saturation + warmth).")]
     public readonly ClampedFloatParameter look = new(0.6f, 0f, 1f);
 

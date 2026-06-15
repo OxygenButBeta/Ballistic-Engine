@@ -193,6 +193,22 @@ public sealed class DX12HDRenderer : HDRenderer {
         public float PrefilterMaxMip; public float NormalBias; public Vector2 Pad;
     }
 
+    // --- DXR ray-traced GI (GI volume Off/SSGI/RT-GI enum: PostFX.GiMode) ---
+    // DxrGi.hlsl cosine-samples one hemisphere ray per pixel → the raw one-bounce GI in ssgiTarget; then the
+    // SHARED SSGI pipeline (motion temporal + OIDN + combine) cleans + adds it. RT GI just replaces the
+    // SSILVB gather. Reuses device5 + sceneAS.
+    ID3D12RootSignature rtGiRootSig;            // CBV(b0) + table{SRV t0 TLAS,t1 depth,t2 normal,t3 irr,t4 pref; UAV u0} + s0
+    ID3D12StateObject rtGiPso;
+    ID3D12Resource rtGiSbt, rtGiCb;
+    unsafe byte* rtGiCbMapped;
+    Dx12DescriptorHeap rtGiHeap;                // 6 descriptors (rebuilt per frame)
+    bool rtGiBuilt;
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct RtGiConstants { public Matrix4x4 InvViewProj; public Matrix4x4 ViewProj; public Vector4 Params; }  // preExp, rayLength, _, frameIdx
+
+    float SsgiPreExposure() => float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
+        System.Globalization.CultureInfo.InvariantCulture, out float e) ? e : 1.0e-5f;
+
     // Transparent forward pass: after deferred + sky, draw Material.Transparent submeshes back-to-front,
     // alpha-blended, depth-testing the G-buffer depth (LEqual, no write). Full forward PBR (sun + IBL +
     // shadows + clustered punctual) sampling material maps directly (TransparentForward.hlsl).
@@ -692,8 +708,9 @@ public sealed class DX12HDRenderer : HDRenderer {
         ssgiTarget?.Dispose(); ssgiScene?.Dispose(); ssgiHistoryA?.Dispose(); ssgiHistoryB?.Dispose();
         ssgiDenoised?.Dispose();
         int w = System.Math.Max(1, targetW / 2), h = System.Math.Max(1, targetH / 2);
+        // allowUav so the RT-GI gather can write it via a UAV (the SSGI gather still uses the RTV).
         ssgiTarget = new Dx12OffscreenTarget(dev, w, h, withDepth: false,
-            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
+            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
         ssgiHistoryA = new Dx12OffscreenTarget(dev, w, h, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         ssgiHistoryB = new Dx12OffscreenTarget(dev, w, h, withDepth: false,
@@ -1496,10 +1513,16 @@ public sealed class DX12HDRenderer : HDRenderer {
         // VOLUME (PostFX.SsgiEnabled); BALLISTIC_DX12_SSGI=1/0 force-overrides for A/B + perf. NOTE: the OIDN
         // denoise round-trip is currently a CPU readback (slow); the zero-copy D3D12<->HIP path is the perf
         // follow-up (BALLISTIC_DX12_SSGI_OIDN=0 = fast temporal-only meanwhile). ---
+        // GI: Off / SSGI / RT-GI (the GI volume dropdown; env doors override). RT-GI traces the scene BVH;
+        // both SSGI and RT-GI share the temporal + OIDN + combine resolve. RT-GI falls back to SSGI w/o DXR.
         string ssgiEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SSGI");
-        bool ssgiOn = ssgiEnv == "1" || (ssgiEnv != "0" && PostFX.SsgiEnabled);
-        if (ssgiOn)
-            DrawSsgi(view, proj);
+        string rtgiEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RT_GI");
+        GiMode giMode = rtgiEnv == "1" ? GiMode.RayTraced
+                      : ssgiEnv == "0" ? GiMode.Off
+                      : ssgiEnv == "1" ? GiMode.ScreenSpace
+                      : PostFX.GiMode;
+        if (giMode == GiMode.RayTraced) { if (EnsureRtGi()) DrawRtGi(view, viewProj, proj); else DrawSsgi(view, proj); }
+        else if (giMode == GiMode.ScreenSpace) DrawSsgi(view, proj);
 
         // --- Volumetric fog (post pass, reads depth+shadows, blends over HDR scene color) ---
         // BALLISTIC_FX_VOLUMETRIC=1 forces it on (same harness contract as the GL backend).
@@ -1874,32 +1897,11 @@ public sealed class DX12HDRenderer : HDRenderer {
     // OIDN denoise wrap it in step C. Profile dials are PostFX.Ssgi* (volume-driven).
     unsafe void DrawSsgi(Matrix4x4 view, Matrix4x4 proj) {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        Matrix4x4.Invert(proj, out Matrix4x4 invProj);
-        var pf = PostFX;
-        int fi = ssgiFrame++ & 1023;
-        // Pre-exposure: the raw-HDR scene → viewable scale the SSGI tuning expects (matches the composite's
-        // exposure). The gather works in viewable units; the combine converts the bounce back to raw HDR.
-        float preExp = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
-            System.Globalization.CultureInfo.InvariantCulture, out float e) ? e : 1.0e-5f;
-        float invPreExp = preExp > 0f ? 1f / preExp : 0f;
-        *(SsgiConstants*)ssgiCbMapped = new SsgiConstants {
-            Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProj),
-            ViewMatrix = Matrix4x4.Transpose(view),
-            Params0 = new Vector4(pf.SsgiRayLength, pf.SsgiFalloff, pf.SsgiThickness, 0f),  // MultiBounce: step C
-            Params1 = new Vector4(MathF.Max(pf.SsgiBounceBoost, 0f), Math.Clamp(pf.SsgiRayCount, 1, 8), fi, 0f),
-            Params2 = new Vector4(1f / ssgiTarget.Width, 1f / ssgiTarget.Height, preExp, invPreExp),
-            Combine0 = new Vector4(pf.SsgiIntensity, Math.Clamp(pf.SsgiLook, 0f, 1f),
-                                   MathF.Max(pf.SsgiSaturation, 0f), MathF.Max(pf.SsgiOcclusionPower, 0f)),
-            Tint = new Vector4(pf.SsgiTint.X, pf.SsgiTint.Y, pf.SsgiTint.Z, 0f),
-            Params3 = new Vector4(ssgiHistValid ? 1f : 0f, MathF.Max(pf.SsgiMaxHistory, 1f), 0f, 0f),
-        };
+        FillSsgiConstants(view, proj);
 
         target.ColorToShaderResource();
         gbuffer.DepthToShaderResource();
         // motion RT (gbuffer RT4) is already PixelShaderResource (ToShaderResource transitioned all colors).
-
-        Dx12OffscreenTarget histRead = ssgiHistWriteB ? ssgiHistoryA : ssgiHistoryB;
-        Dx12OffscreenTarget histWrite = ssgiHistWriteB ? ssgiHistoryB : ssgiHistoryA;
 
         // Gather (half-res) → ssgiTarget. SRVs: color t0, depth t1, normal t2.
         ssgiSrvVisible.Reset();
@@ -1916,7 +1918,42 @@ public sealed class DX12HDRenderer : HDRenderer {
             cl.DrawInstanced(3, 1, 0, 0);
         });
 
+        SsgiResolveAndCombine();   // temporal (motion) + OIDN denoise + composite into the scene
+    }
+
+    // Fill the shared SsgiConstants CBV (dials + matrices + pre-exposure + history flag). Used by the SSGI
+    // gather AND the RT-GI gather (temporal/combine read it). Returns this frame's rotation index.
+    unsafe int FillSsgiConstants(Matrix4x4 view, Matrix4x4 proj) {
+        Matrix4x4.Invert(proj, out Matrix4x4 invProj);
+        var pf = PostFX;
+        int fi = ssgiFrame++ & 1023;
+        float preExp = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
+            System.Globalization.CultureInfo.InvariantCulture, out float e) ? e : 1.0e-5f;
+        float invPreExp = preExp > 0f ? 1f / preExp : 0f;
+        *(SsgiConstants*)ssgiCbMapped = new SsgiConstants {
+            Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProj),
+            ViewMatrix = Matrix4x4.Transpose(view),
+            Params0 = new Vector4(pf.SsgiRayLength, pf.SsgiFalloff, pf.SsgiThickness, 0f),
+            Params1 = new Vector4(MathF.Max(pf.SsgiBounceBoost, 0f), Math.Clamp(pf.SsgiRayCount, 1, 8), fi, 0f),
+            Params2 = new Vector4(1f / ssgiTarget.Width, 1f / ssgiTarget.Height, preExp, invPreExp),
+            Combine0 = new Vector4(pf.SsgiIntensity, Math.Clamp(pf.SsgiLook, 0f, 1f),
+                                   MathF.Max(pf.SsgiSaturation, 0f), MathF.Max(pf.SsgiOcclusionPower, 0f)),
+            Tint = new Vector4(pf.SsgiTint.X, pf.SsgiTint.Y, pf.SsgiTint.Z, 0f),
+            Params3 = new Vector4(ssgiHistValid ? 1f : 0f, MathF.Max(pf.SsgiMaxHistory, 1f), 0f, 0f),
+        };
+        return fi;
+    }
+
+    // Shared GI resolve tail: motion-buffer temporal accumulation + OIDN denoise + composite into the scene.
+    // ssgiTarget holds the raw (noisy) one-bounce GI (from either the SSILVB gather or the RT gather); the
+    // SsgiConstants CBV must already be filled. Used by both DrawSsgi and DrawRtGi.
+    unsafe void SsgiResolveAndCombine() {
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        Dx12OffscreenTarget histRead = ssgiHistWriteB ? ssgiHistoryA : ssgiHistoryB;
+        Dx12OffscreenTarget histWrite = ssgiHistWriteB ? ssgiHistoryB : ssgiHistoryA;
+
         // Temporal (half-res) → histWrite. SRVs: currentGI t0, historyGI t1, motion t2 (gbuffer RT4).
+        ssgiSrvVisible.Reset();
         ssgiTarget.ColorToShaderResource();
         histRead.ColorToShaderResource();
         int tb = ssgiSrvVisible.AllocateRange(3);
@@ -1953,6 +1990,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (ReferenceEquals(giForCombine, histWrite)) histWrite.ColorToShaderResource();   // temporal-only path
 
         // Combine (full-res) → ssgiScene, reading scene (t0) + (denoised) GI (t1; t2 unused, valid descriptor).
+        target.ColorToShaderResource();   // scene must be readable (no-op if the gather already set it)
         int cbi = ssgiSrvVisible.AllocateRange(3);
         dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(cbi + 0), target.ColorSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(cbi + 1), giForCombine.ColorSrvCpu, heapType);
@@ -2207,6 +2245,114 @@ public sealed class DX12HDRenderer : HDRenderer {
         });
         ssrScene.ColorToShaderResource();
         target.CopyColorFrom(ssrScene);
+    }
+
+    // Lazily build the DXR GI pipeline. Reuses device5 + sceneAS. Returns false (→ SSGI fallback) without DXR.
+    unsafe bool EnsureRtGi() {
+        if (!dxrChecked) {
+            dxrChecked = true;
+            try {
+                var opt5 = dev.Device.CheckFeatureSupport<FeatureDataD3D12Options5>(Vortice.Direct3D12.Feature.Options5);
+                dxrAvailable = opt5.RaytracingTier >= RaytracingTier.Tier1_0;
+            } catch { dxrAvailable = false; }
+            if (!dxrAvailable) Console.WriteLine("[RTGI] DXR unavailable — using SSGI.");
+        }
+        if (!dxrAvailable) return false;
+        if (rtGiBuilt) return true;
+        rtGiBuilt = true;
+
+        if (device5 == null) device5 = dev.Device.QueryInterface<ID3D12Device5>();
+        if (sceneAS == null) sceneAS = new Dx12SceneAS(dev);
+
+        // CBV(b0) + table {SRV t0-t4, UAV u0} + static clamp sampler s0.
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 5, baseShaderRegister: 0);
+        var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);
+        var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange), ShaderVisibility.All);
+        var samp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        rtGiRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, table }, new[] { samp })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("DxrGi.hlsl");
+        byte[] dxil = Dx12ShaderCompiler.Compile(DxcShaderStage.Library, hlsl, "", "DxrGi.hlsl");
+        var subs = new[] {
+            new StateSubObject(new DxilLibraryDescription(dxil,
+                new ExportDescription("RayGen"), new ExportDescription("Miss"), new ExportDescription("ClosestHit"))),
+            new StateSubObject(new HitGroupDescription("HitGroup", HitGroupType.Triangles, "", "ClosestHit", "")),
+            new StateSubObject(new RaytracingShaderConfig(16, 8)),
+            new StateSubObject(new RaytracingPipelineConfig(1)),
+            new StateSubObject(new GlobalRootSignature(rtGiRootSig)),
+        };
+        rtGiPso = device5.CreateStateObject(new StateObjectDescription(StateObjectType.RaytracingPipeline, subs));
+
+        using ID3D12StateObjectProperties props = rtGiPso.QueryInterface<ID3D12StateObjectProperties>();
+        uint idSize = Vortice.Direct3D12.D3D12.ShaderIdentifierSizeInBytes;
+        rtGiSbt = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer(RtSbtSlot * 3), ResourceStates.GenericRead);
+        byte* sp = rtGiSbt.Map<byte>(0);
+        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 0 * RtSbtSlot, (void*)props.GetShaderIdentifier("RayGen"), idSize);
+        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 1 * RtSbtSlot, (void*)props.GetShaderIdentifier("Miss"), idSize);
+        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 2 * RtSbtSlot, (void*)props.GetShaderIdentifier("HitGroup"), idSize);
+        rtGiSbt.Unmap(0);
+
+        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<RtGiConstants>() + 255) & ~255;
+        rtGiCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+        rtGiCbMapped = rtGiCb.Map<byte>(0);
+        rtGiHeap = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 6, shaderVisible: true);
+        return true;
+    }
+
+    // RT global illumination: trace a cosine-hemisphere ray per pixel → raw one-bounce GI in ssgiTarget,
+    // then the SHARED SSGI resolve (temporal + OIDN + combine). viewProj is the JITTERED matrix (matches the
+    // depth); proj drives the SSGI dials/combine.
+    unsafe void DrawRtGi(Matrix4x4 view, Matrix4x4 viewProj, Matrix4x4 proj) {
+        sceneAS.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection);
+        if (!sceneAS.Valid) { DrawSsgi(view, proj); return; }   // no geometry → fall back to SSGI
+
+        int fi = FillSsgiConstants(view, proj);   // dials + matrices for the shared temporal/combine
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
+        *(RtGiConstants*)rtGiCbMapped = new RtGiConstants {
+            InvViewProj = Matrix4x4.Transpose(invVP), ViewProj = Matrix4x4.Transpose(viewProj),
+            Params = new Vector4(SsgiPreExposure(), MathF.Max(PostFX.SsgiRayLength, 0.1f), 0f, fi),
+        };
+
+        // G-buffer is in the combined shader-read state (RT compute-stage can read depth+normal); the lit
+        // scene color is the bounce source (project the hit back to it), so bring it to SRV.
+        target.ColorToShaderResource();
+        sceneAS.CreateTlasSrv(rtGiHeap.Cpu(0));
+        dev.Device.CopyDescriptorsSimple(1, rtGiHeap.Cpu(1), gbuffer.DepthSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, rtGiHeap.Cpu(2), gbuffer.ColorSrvCpu(1), heapType);   // world normal
+        dev.Device.CopyDescriptorsSimple(1, rtGiHeap.Cpu(3), ibl.IrradianceSrv, heapType);        // off-screen fallback
+        dev.Device.CopyDescriptorsSimple(1, rtGiHeap.Cpu(4), target.ColorSrvCpu, heapType);       // lit scene color
+        dev.Device.CreateUnorderedAccessView(ssgiTarget.RenderTarget, null, new UnorderedAccessViewDescription {
+            Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+        }, rtGiHeap.Cpu(5));
+
+        ssgiTarget.ColorToUnorderedAccess();
+        uint idSize = Vortice.Direct3D12.D3D12.ShaderIdentifierSizeInBytes;
+        dev.ExecuteSync(cl => {
+            cl.SetDescriptorHeaps(rtGiHeap.Heap);
+            cl.SetComputeRootSignature(rtGiRootSig);
+            cl.SetPipelineState1(rtGiPso);
+            cl.SetComputeRootConstantBufferView(0, rtGiCb.GPUVirtualAddress);
+            cl.SetComputeRootDescriptorTable(1, rtGiHeap.Gpu(0));
+            cl.DispatchRays(new DispatchRaysDescription {
+                Width = (uint)ssgiTarget.Width, Height = (uint)ssgiTarget.Height, Depth = 1,
+                RayGenerationShaderRecord = new GpuVirtualAddressRange { StartAddress = rtGiSbt.GPUVirtualAddress, SizeInBytes = idSize },
+                MissShaderTable = new GpuVirtualAddressRangeAndStride { StartAddress = rtGiSbt.GPUVirtualAddress + RtSbtSlot, SizeInBytes = idSize, StrideInBytes = idSize },
+                HitGroupTable = new GpuVirtualAddressRangeAndStride { StartAddress = rtGiSbt.GPUVirtualAddress + 2 * RtSbtSlot, SizeInBytes = idSize, StrideInBytes = idSize },
+            });
+        });
+        ssgiTarget.ColorToShaderResource();
+
+        SsgiResolveAndCombine();   // shared: motion temporal + OIDN + composite
     }
 
     // HBAO from the G-buffer (scene depth for view-pos + world normal, both already SRVs from the deferred

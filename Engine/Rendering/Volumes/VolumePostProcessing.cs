@@ -50,6 +50,7 @@ public static class VolumePostProcessing {
 
         if (stack.GetComponent<ScreenSpaceGlobalIllumination>() is { } ssgi) {
             fx.SsgiEnabled = ssgi.enabled.Value;
+            fx.GiMode = ssgi.enabled.Value ? ssgi.mode.Value : GiMode.Off;
             fx.SsgiLook = ssgi.look.Value;
             fx.SsgiDebugView = ssgi.debugView.Value;
             fx.SsgiSkyFallback = ssgi.skyFallback.Value;
