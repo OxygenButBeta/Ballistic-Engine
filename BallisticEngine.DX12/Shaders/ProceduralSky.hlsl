@@ -14,7 +14,7 @@ cbuffer ProcSkyConstants : register(b0) {
     float3   SunRadiance;   float SunDiskIntensity;    // sun color*illuminance (engine units); disk scale
     float3   GroundAlbedo;  float AirDensity;          // virtual ground reflectance; Rayleigh mult
     float    Haze;          float HazeAnisotropy; float OzoneDensity; float MultiScatter;
-    float    Exposure;      float3 _pad;
+    float    Exposure;      float BakeFace;  float2 _pad;   // BakeFace: cube face index for the env bake
 };
 
 static const float PI = 3.14159265359;
@@ -132,4 +132,29 @@ float4 PSMain(VSOutput i) : SV_Target {
     // brightness tracks the scene. (SunRadiance here is the same lux-scaled value the sun light uses.)
     float3 mapped = ACESFilm(hdr * 1.0e-5);
     return float4(pow(mapped, 1.0 / 2.2), 1.0);
+}
+
+// ---- Env-cube BAKE: render RAW HDR sky radiance into one cube face (FSQ) for IBL convolution. ----
+// Same atmosphere math, no tonemap/exposure-fold beyond SkyRadiance's own Exposure, so the irradiance/
+// prefilter passes integrate true radiance. Face index comes from the CBV's BakeFace slot.
+float3 EnvFaceDir(int face, float2 uv) {
+    float2 st = uv * 2.0 - 1.0;
+    if (face == 0) return float3( 1.0, -st.y, -st.x);
+    if (face == 1) return float3(-1.0, -st.y,  st.x);
+    if (face == 2) return float3( st.x,  1.0,  st.y);
+    if (face == 3) return float3( st.x, -1.0, -st.y);
+    if (face == 4) return float3( st.x, -st.y,  1.0);
+    return float3(-st.x, -st.y, -1.0);
+}
+struct VSBakeOut { float4 Position : SV_Position; float2 Uv : TEXCOORD0; };
+VSBakeOut VSEnvBake(uint vid : SV_VertexID) {
+    VSBakeOut o;
+    float2 uv = float2((vid << 1) & 2, vid & 2);
+    o.Position = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.Uv = uv;
+    return o;
+}
+float4 PSEnvBake(VSBakeOut i) : SV_Target {
+    float3 dir = normalize(EnvFaceDir((int)BakeFace, i.Uv));
+    return float4(SkyRadiance(dir), 1.0);
 }

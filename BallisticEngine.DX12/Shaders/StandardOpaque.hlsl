@@ -22,7 +22,7 @@ cbuffer DrawConstants : register(b0) {
     float4   BaseColorFactor;     // glTF base-color tint (rgb; a for cutout later)
     float3   EmissiveFactor; float HasEmissive;     // emissive color*intensity; >0.5 = emit
     float    NormalStrength; float NormalFlipY; float HasMetallicMap; float HasRoughnessMap;
-    float    PackedOrm;      float Cutout;          float _pad0; float _pad1;
+    float    PackedOrm;      float Cutout;          float UseIBL; float PrefilterMaxMip;
 };
 
 Texture2D DiffuseMap   : register(t0);
@@ -31,7 +31,13 @@ Texture2D MetallicMap  : register(t2);
 Texture2D RoughnessMap : register(t3);
 Texture2D AOMap        : register(t4);
 Texture2D EmissiveMap  : register(t5);
-SamplerState LinearWrap : register(s0);
+// IBL set (per-frame, second descriptor table): cosine-irradiance cube, GGX-prefiltered specular cube,
+// split-sum BRDF LUT. Bound only when UseIBL > 0.5 (the scene has a baked environment).
+TextureCube IrradianceMap   : register(t6);
+TextureCube PrefilterMap    : register(t7);
+Texture2D   BrdfLut         : register(t8);
+SamplerState LinearWrap  : register(s0);
+SamplerState LinearClamp : register(s1);
 
 struct VSInput {
     float3 Pos     : POSITION;   // slot 0
@@ -76,6 +82,10 @@ float GeometrySmith(float3 N, float3 V, float3 L, float rough) {
 }
 float3 FresnelSchlick(float cosT, float3 F0) {
     return F0 + (1.0 - F0) * pow(1.0 - cosT, 5.0);
+}
+float3 FresnelSchlickRoughness(float cosT, float3 F0, float rough) {
+    float3 Fr = max((1.0 - rough).xxx, F0);
+    return F0 + (Fr - F0) * pow(1.0 - cosT, 5.0);
 }
 
 // World normal from the tangent-space normal map (BC5-safe: reconstruct Z from XY). Mirrors GL
@@ -130,8 +140,27 @@ float4 PSMain(VSOutput i) : SV_Target {
         specular = spec * LightColor * NdotL;
     }
 
-    // Flat ambient (IBL stand-in next milestone), occluded by AO.
-    float3 ambient = Ambient * albedo * ao;
+    // --- Ambient: split-sum IBL when a baked environment exists, flat fill otherwise ---
+    float NdotVamb = max(dot(N, V), 0.0);
+    float3 ambient;
+    if (UseIBL > 0.5) {
+        // Diffuse: cosine-convolved irradiance. The irradiance map stores E (PI-convolved at bake),
+        // so multiply by albedo*kD directly (no /PI here).
+        float3 Famb = FresnelSchlickRoughness(NdotVamb, F0, roughness);
+        float3 kD = (1.0 - Famb) * (1.0 - metallic);
+        float3 irradiance = IrradianceMap.SampleLevel(LinearClamp, N, 0).rgb;
+        float3 ambientDiffuse = kD * irradiance * albedo * ao;
+        // Specular: prefiltered env (roughness→mip) × split-sum BRDF (scale,bias) on F0.
+        float3 R = reflect(-V, N);
+        float mip = clamp(roughness * PrefilterMaxMip, 0.0, PrefilterMaxMip);
+        float3 prefiltered = PrefilterMap.SampleLevel(LinearClamp, R, mip).rgb;
+        float2 brdf = BrdfLut.SampleLevel(LinearClamp, float2(NdotVamb, roughness), 0).rg;
+        float3 ambientSpecular = prefiltered * (Famb * brdf.x + brdf.y) * ao;
+        ambient = ambientDiffuse + ambientSpecular;
+    }
+    else {
+        ambient = Ambient * albedo * ao;   // flat fill fallback
+    }
     float3 emissive = (HasEmissive > 0.5)
         ? EmissiveMap.Sample(LinearWrap, i.Uv).rgb * EmissiveFactor : 0.0.xxx;
 

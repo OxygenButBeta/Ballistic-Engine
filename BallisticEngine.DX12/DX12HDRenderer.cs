@@ -81,11 +81,16 @@ public sealed class DX12HDRenderer : HDRenderer {
         public Vector4 BaseColorFactor;
         public Vector3 EmissiveFactor; public float HasEmissive;
         public float NormalStrength, NormalFlipY, HasMetallicMap, HasRoughnessMap;
-        public float PackedOrm, Cutout, Pad0, Pad1;
+        public float PackedOrm, Cutout, UseIBL, PrefilterMaxMip;
     }
 
     // The 6 material maps in HLSL register(t0..t5) order.
     const int MaterialSrvCount = 6;
+
+    // IBL: baker (env→irradiance/prefilter/BRDF) + a per-frame 3-SRV shader-visible table (t6..t8).
+    Dx12IblBaker ibl;
+    Dx12DescriptorHeap iblSrvVisible;   // 3 contiguous SRVs copied per frame
+    bool iblActiveThisFrame;
 
     public DX12HDRenderer(Dx12Device device) {
         dev = device;
@@ -124,6 +129,11 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         BuildSkybox();
         BuildProcSky();
+
+        ibl = new Dx12IblBaker(dev);
+        // 3 IBL SRVs (irradiance/prefilter/BRDF) copied contiguously per frame into a shader-visible heap.
+        iblSrvVisible = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true);
     }
 
     unsafe void BuildProcSky() {
@@ -199,27 +209,31 @@ public sealed class DX12HDRenderer : HDRenderer {
     }
 
     void BuildRootSignature() {
-        // b0 = per-draw constants (root CBV); table0 = 6 SRVs (diffuse/normal/metallic/roughness/AO/
-        // emissive) at t0..t5; static sampler s0.
+        // b0 = per-draw constants (root CBV);
+        // table0 (param 1) = 6 material SRVs t0..t5 (per draw);
+        // table1 (param 2) = 3 IBL SRVs t6..t8 (irradiance cube / prefilter cube / BRDF LUT, per frame);
+        // static samplers: s0 wrap (material), s1 clamp (IBL/sky).
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView,
             new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, MaterialSrvCount, baseShaderRegister: 0);
-        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
+        var matRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, MaterialSrvCount, baseShaderRegister: 0);
+        var matTable = new RootParameter1(new RootDescriptorTable1(matRange), ShaderVisibility.Pixel);
+        var iblRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 3, baseShaderRegister: 6);
+        var iblTable = new RootParameter1(new RootDescriptorTable1(iblRange), ShaderVisibility.Pixel);
 
-        var sampler = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
-            Filter = Filter.MinMagMipLinear,
-            AddressU = TextureAddressMode.Wrap,
-            AddressV = TextureAddressMode.Wrap,
-            AddressW = TextureAddressMode.Wrap,
-            MaxAnisotropy = 16,
-            ComparisonFunction = ComparisonFunction.Never,
-            MinLOD = 0,
-            MaxLOD = float.MaxValue,
+        var wrap = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap,
+            AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 16,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        var clamp = new StaticSamplerDescription(ShaderVisibility.Pixel, 1, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
         };
 
         var desc = new RootSignatureDescription1(
             RootSignatureFlags.AllowInputAssemblerInputLayout,
-            new[] { cbv, srvTable }, new[] { sampler });
+            new[] { cbv, matTable, iblTable }, new[] { wrap, clamp });
         rootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(desc));
     }
 
@@ -282,9 +296,30 @@ public sealed class DX12HDRenderer : HDRenderer {
         float exposure = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
             System.Globalization.CultureInfo.InvariantCulture, out float e) ? e : 1.0e-5f;
 
+        // IBL: bake the env→irradiance/prefilter/BRDF from the procedural sky (re-bakes only on param
+        // change). Runs its OWN upload command list before the render command list — must be outside
+        // RenderIntoCleared (which holds the render list). Only when a ProceduralSky is active.
+        iblActiveThisFrame = false;
+        if (ProceduralSky.Active is { } pSky) {
+            Vector3 sunDir = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
+            float sunAngR = (DirectionalLight.Instance?.AngularDiameter ?? 0.53f) * 0.5f * (MathF.PI / 180f);
+            ibl.EnsureBaked(pSky, sunDir, lightColor, sunAngR);
+            iblActiveThisFrame = ibl.HasBaked;
+        }
+
         int draws = 0;
         long tris = 0;
         srvVisible.Reset();
+        // Reserve the first 3 slots of the (single) shader-visible heap for the per-frame IBL table
+        // (t6..t8) — a command list binds only ONE CBV/SRV heap, so material + IBL share srvVisible.
+        int iblBase = -1;
+        if (iblActiveThisFrame) {
+            iblBase = srvVisible.AllocateRange(3);
+            var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+            dev.Device.CopyDescriptorsSimple(1, srvVisible.Cpu(iblBase + 0), ibl.IrradianceSrv, heapType);
+            dev.Device.CopyDescriptorsSimple(1, srvVisible.Cpu(iblBase + 1), ibl.PrefilterSrv, heapType);
+            dev.Device.CopyDescriptorsSimple(1, srvVisible.Cpu(iblBase + 2), ibl.BrdfSrv, heapType);
+        }
         int slot = 0;
 
         var fallbackDiffuse = DefaultTextures.Neutral(TextureType.Diffuse) as Dx12Texture2D;
@@ -294,6 +329,9 @@ public sealed class DX12HDRenderer : HDRenderer {
             cl.SetPipelineState(pso);
             cl.SetDescriptorHeaps(srvVisible.Heap);
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            // Bind the IBL table (param 2) once per frame (same for every draw).
+            if (iblActiveThisFrame)
+                cl.SetGraphicsRootDescriptorTable(2, srvVisible.Gpu(iblBase));
 
             foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
                 if (r is null || !r.IsActive || !r.IsRenderable) continue;
@@ -347,6 +385,8 @@ public sealed class DX12HDRenderer : HDRenderer {
                         NormalStrength = mat.NormalStrength, NormalFlipY = mat.NormalFlipY ? 1f : 0f,
                         HasMetallicMap = hasMetal ? 1f : 0f, HasRoughnessMap = hasRough ? 1f : 0f,
                         PackedOrm = mat.PackedOrm ? 1f : 0f, Cutout = mat.Cutout ? 1f : 0f,
+                        UseIBL = iblActiveThisFrame ? 1f : 0f,
+                        PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f,
                     };
                     *(DrawConstants*)(cbMapped + (long)slot * cbSlotSize) = c;
                     cl.SetGraphicsRootConstantBufferView(0,
