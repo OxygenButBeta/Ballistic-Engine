@@ -138,16 +138,22 @@ target). Fog blends in HDR now. Byte-equivalent output (SunTemple unchanged) —
 auto-exposure + bloom exist. Infra: Dx12OffscreenTarget color format parameterized (HdrFormat) + color
 SRV + Color/Depth transitions; HDR scene target + LDR composite target; SaveFrame reads LDR.
 
-**DX12 stack now: PBR + procedural sky + IBL + cascaded shadows + volumetric fog + HDR/tonemap composite.**
+**🟢 DX12 AUTO-EXPOSURE + BLOOM (2026-06-15):** auto-exposure (LumAverage.hlsl → 1×1 geometric-mean
+luminance → composite exposure = 0.18/avgLum; manual override BALLISTIC_DX12_EXPOSURE) — both scenes
+auto-meter to ~140 with ZERO per-scene tuning (Bistro dusk dramatically improved). Bloom (Bloom.hlsl:
+bright-pass + separable Gaussian, half-res ping-pong) added in the composite (intensity 0.6;
+BALLISTIC_DX12_BLOOM=0 off) — soft glow on bright surfaces. Refs dx12_*_autoexposure / suntemple_bloom.
 
-**NEXT (DX12, each committable; user directive = port ALL GL features):** auto-exposure (luminance
-reduction → drives the composite Exposure, replace the fixed 1e-5 stand-in — the Composite pass already
-has the Exposure slot wired); bloom (bright-pass + blur, add into the composite's BloomTex/BloomIntensity
-— already wired); TAA; then SSAO + SSR (SSGI LAST); sky clouds/cirrus/stars; alpha-cutout caster shadows;
-cascade caching + interleave mesh verts (perf); finally editor→DX12 + delete GL wholesale (incl. the
-GL-shaped bind methods + RenderContext the DX12 path no-ops). DON'T break the editor — it renders on GL;
-delete GL only
-at the very end.
+**MODE: full-auto /loop (user: "start full auto mod /loop") — work→commit→work, self-paced, no pausing
+between features until the migration is done or the user stops.**
+
+**DX12 stack now: PBR + sky + IBL + shadows + fog + HDR + auto-exposure + bloom, on 2 scenes.**
+
+**NEXT (DX12, each committable; port ALL GL features):** SSAO (reuses the depth SRV, high single-frame
+ROI — do before TAA); SSR; TAA (jitter + motion vectors + history — harder to verify on single shots);
+SSGI (LAST per directive); sky clouds/cirrus/stars; alpha-cutout caster shadows; cascade caching +
+interleave mesh verts (perf); finally editor→DX12 + delete GL wholesale (incl. the GL-shaped bind methods
++ RenderContext the DX12 path no-ops). DON'T break the editor — it renders on GL; delete GL only at the end.
 
 The frozen GL parity image: `Docs/Plans/dx12-refs/gl_suntemple_baseline.png` (mean RGB 96.7,81.9,65.6).
 
