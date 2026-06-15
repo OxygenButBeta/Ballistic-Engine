@@ -55,7 +55,28 @@ below (kept for history). Concretely:
   per-phase *verification* changes from "imgdiff vs GL" to "looks right + .stats.json sane". SSGI still
   last.
 
-## ⏩ HANDOFF / RESUME POINT (read this first — 2026-06-15)
+## ⏩ HANDOFF / RESUME POINT (read this first — UPDATED 2026-06-15, autonomous /loop)
+
+**Active work: the DX-NATIVE ABSTRACTION REDESIGN** — full plan + the authoritative 10-step execution
+sequence is in `Docs/Plans/dx-native-abstraction-redesign.md` (source-verified, from a 5-agent call-site
+map). GL is being deleted; build DX-native, no back-compat. Working autonomously in /loop, commit each step.
+
+**Steps DONE (committed on `dx12-renderer`):**
+- Step 0 — moved `InstancedBuffer` base OpenGL/ → Abstraction/ (layering fix so deleting GL won't break the build).
+- Step 1 — promoted `GpuAddress/ElementCount/Stride/ByteSize` onto the `GPUBuffer<T>` base (renderer reads addresses without casting).
+- Step 2 — dropped dead `RenderAsset.InstancedDrawing`.
+- Step 3 — **DX12 headless host works**: `BALLISTIC_BACKEND=dx12` → `Dx12HeadlessRuntime` (real DirectXRenderAsset device + offscreen target, windowless) drives the engine loop, captures at `BALLISTIC_SCREENSHOT_FRAME`, reads the DX12 target back to BMP. VERIFIED: SunTemple brings up the device, loads the scene, runs BeginRender, writes a valid 1920x1080 BMP (clear color, draws=0 — renderer is still a shell). Made `IEngineTimer.Update` public for the out-of-assembly host. Runtime now refs BallisticEngine.DX12.
+
+**NEXT — Step 4a:** make Material/Texture/Mesh/Shader/GPUBuffer/RenderContext BIND-FREE (delete all
+Activate/Deactivate + `Material.LastActivatedMaterial`); this breaks GLHDRenderer compile → retire GL
+from the build (drop OpenGL/ + GLStandardShader from the engine .csproj compile set, default backend to
+DX12). Then Step 5 interleave mesh vertex buffer, 6 remove RenderContext, 7 SkyboxRenderer→constants +
+drop per-name uniform API, 8 DX12 material table (port GpuMaterialTable semantics), 9 SunTemple opaque+sky
+renders (eyeball vs frozen baseline `Docs/Plans/dx12-refs/gl_suntemple_baseline.png`), 10 delete OpenGL.
+
+The frozen GL parity image: `Docs/Plans/dx12-refs/gl_suntemple_baseline.png` (mean RGB 96.7,81.9,65.6).
+
+--- (historical resume point below — superseded by the steps above) ---
 
 **Where we are:** Phase 0 (abstraction prep) + Phase 1 core (DX12 device, raster pipeline, screenshot
 readback) + Phase 2 partial (3D lit cube: mesh buffers, depth, MVP CBV, N·L lighting) are DONE,
