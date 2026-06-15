@@ -50,9 +50,15 @@ public class Rigidbody : Behaviour {
     Quaternion syncedRotation;
     bool hasSyncedPose;
 
-    // The collider reported as "the other collider" when something hits this body (contact
-    // events are per-body; v1 doesn't resolve which compound child was struck).
+    // The collider reported as "the other collider" when a contact event can't pin down the exact
+    // compound child (solid contacts: Bepu's reduced manifold doesn't carry a reliable child index).
     internal Collider PrimaryCollider => boundColliders.Count > 0 ? boundColliders[0] : null;
+
+    // Resolve a compound child index (from a contact event) back to the originating collider.
+    // boundColliders is built in the same order children are added to the compound (P5), so the
+    // index lines up. childIndex < 0 (unknown — solid top-level path) falls back to the primary.
+    internal Collider ColliderForChild(int childIndex) =>
+        childIndex >= 0 && childIndex < boundColliders.Count ? boundColliders[childIndex] : PrimaryCollider;
 
     // ---- Runtime API (play mode; harmless defaults/no-ops in edit mode) -----
 
@@ -137,31 +143,16 @@ public class Rigidbody : Behaviour {
 
         Vector3 worldScale = transform.WorldMatrix.ExtractScale();
         var parts = new List<PhysicsShapePart>(capacity: 4);
-        foreach (Behaviour behaviour in entity.Behaviours) {
-            if (behaviour is not Collider collider || !collider.IsEnabled)
-                continue;
-            if (!collider.ValidForDynamic) {
-                Debugging.LogWarning(
-                    $"Physics: {collider.GetType().Name} on '{entity.Name}' is static-only and is ignored by its Rigidbody.");
-                continue;
-            }
 
-            PhysicsShape shape = collider.BuildShape(worldScale);
-            if (shape is null)
-                continue;
+        // Colliders on THIS entity sit at the body origin (no relative offset beyond their Center).
+        foreach (Behaviour behaviour in entity.Behaviours)
+            TryAddCollider(behaviour as Collider, worldScale, Vector3.Zero, Quaternion.Identity, parts);
 
-            // If this collider already created a standalone static body (it was enabled before this
-            // Rigidbody existed), drop it — it would otherwise overlap our dynamic body and the pair
-            // would eject each other on the first step.
-            collider.ReleaseStaticBodyForRigidbody();
-
-            // Trigger state is now PER-COLLIDER (P4): a body can mix solid and trigger colliders.
-            // The backend filters each compound child by its own flag — solid children push, trigger
-            // children only report overlap. No more all-trigger/all-solid collapse.
-            parts.Add(new PhysicsShapePart(shape, collider.Center * worldScale, Quaternion.Identity,
-                collider.IsTrigger));
-            boundColliders.Add(collider);
-        }
+        // P5: colliders on CHILD entities also contribute, posed relative to the body root — so a car
+        // chassis can carry bumper/roof colliders on child transforms, a character its limb colliders.
+        // The walk stops at any nested Rigidbody (that child owns its own body). The compound child
+        // index lines up with boundColliders order, so contact events resolve to the right collider.
+        GatherChildColliders(entity, worldScale, parts);
 
         if (parts.Count == 0) {
             Debugging.LogWarning(
@@ -189,6 +180,63 @@ public class Rigidbody : Behaviour {
         if (body is not null) {
             body.UserData = this;
             RefreshSyncedPose();
+        }
+    }
+
+    // Adds one collider to the compound at a local pose (relative to the body root). localPosition/
+    // localRotation place a CHILD-entity collider; for same-entity colliders both are identity and
+    // only the collider's own Center offsets it. Appends to boundColliders so the compound child
+    // index (= add order) maps back to the originating collider for contact resolution.
+    void TryAddCollider(Collider collider, Vector3 worldScale, Vector3 localPosition,
+        Quaternion localRotation, List<PhysicsShapePart> parts) {
+        if (collider is null || !collider.IsEnabled)
+            return;
+        if (!collider.ValidForDynamic) {
+            Debugging.LogWarning(
+                $"Physics: {collider.GetType().Name} on '{collider.Entity.Name}' is static-only and is ignored by its Rigidbody.");
+            return;
+        }
+
+        PhysicsShape shape = collider.BuildShape(worldScale);
+        if (shape is null)
+            return;
+
+        // Drop any standalone static body the collider made before this Rigidbody existed, so it
+        // doesn't overlap our dynamic body and eject on the first step.
+        collider.ReleaseStaticBodyForRigidbody();
+
+        // The collider's own Center is in its local space; rotate it into the body frame and add the
+        // child's relative position. Trigger state is per-collider (P4).
+        Vector3 center = localPosition + Vector3.Transform(collider.Center * worldScale, localRotation);
+        parts.Add(new PhysicsShapePart(shape, center, localRotation, collider.IsTrigger));
+        boundColliders.Add(collider);
+    }
+
+    // Recursively gathers colliders from child entities, posed relative to the body root. Stops at any
+    // child that has its own Rigidbody (that subtree is a separate body). The relative pose is the
+    // child's world transform expressed in the root's frame: inverse(rootWorld) * childWorld.
+    void GatherChildColliders(Entity root, Vector3 worldScale, List<PhysicsShapePart> parts) {
+        Matrix4 invRoot = transform.WorldMatrix.Inverted();
+        GatherFrom(root);
+
+        void GatherFrom(Entity parent) {
+            foreach (Entity child in parent.DirectChildren()) {
+                if (!child.IsActiveInHierarchy)
+                    continue;
+                // A child with its own Rigidbody owns its body; don't fold its colliders into ours.
+                if (child.GetComponent<Rigidbody>() is not null)
+                    continue;
+
+                Matrix4 relative = child.transform.WorldMatrix * invRoot;
+                Vector3 localPosition = relative.ExtractTranslation();
+                Quaternion localRotation = Quaternion.Normalize(
+                    Quaternion.CreateFromRotationMatrix(relative));
+
+                foreach (Behaviour behaviour in child.Behaviours)
+                    TryAddCollider(behaviour as Collider, worldScale, localPosition, localRotation, parts);
+
+                GatherFrom(child); // recurse deeper (grandchildren), still stopping at nested bodies
+            }
         }
     }
 

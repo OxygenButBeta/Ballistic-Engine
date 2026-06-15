@@ -205,18 +205,22 @@ public static class Physics {
             PhysicsContactEvent contactEvent = events[i];
             var ownerA = contactEvent.A?.UserData as Behaviour;
             var ownerB = contactEvent.B?.UserData as Behaviour;
-            DispatchToEntity(ownerA, ownerB, in contactEvent, contactEvent.Normal);
-            DispatchToEntity(ownerB, ownerA, in contactEvent, -contactEvent.Normal);
+            // The OTHER collider for A's callbacks is B's struck child (ChildB), and vice versa.
+            DispatchToEntity(ownerA, ownerB, in contactEvent, contactEvent.Normal, contactEvent.ChildB);
+            DispatchToEntity(ownerB, ownerA, in contactEvent, -contactEvent.Normal, contactEvent.ChildA);
         }
     }
 
     static void DispatchToEntity(Behaviour receiver, Behaviour other, in PhysicsContactEvent contactEvent,
-        Vector3 normalTowardReceiver) {
+        Vector3 normalTowardReceiver, int otherChildIndex) {
         Entity entity = receiver?.Entity;
         if (entity is null)
             return;
 
-        Collider otherCollider = other as Collider ?? (other as Rigidbody)?.PrimaryCollider;
+        // Resolve the exact child collider that was struck (P5) when the other side is a Rigidbody;
+        // a standalone Collider is itself the other collider.
+        Collider otherCollider = other as Collider
+            ?? (other as Rigidbody)?.ColliderForChild(otherChildIndex);
         var collision = new Collision(
             otherCollider,
             other as Rigidbody ?? otherCollider?.AttachedRigidbody,

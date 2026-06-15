@@ -35,6 +35,9 @@ public struct PhysicsContactEvent {
     public Vector3 Point;    // world-space representative contact point (last known, for Exit)
     public Vector3 Normal;   // unit normal pointing from B toward A
     public bool IsTrigger;   // at least one side is a trigger; the overlap was not solved
+    public int ChildA;       // compound child index on A that touched (0 for single-shape bodies)
+    public int ChildB;       // compound child index on B that touched — lets the engine resolve the
+                             // exact child collider that was struck, not just the body's first one
 }
 
 public struct PhysicsRayHit {

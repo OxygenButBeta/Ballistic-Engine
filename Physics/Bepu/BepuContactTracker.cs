@@ -32,6 +32,7 @@ sealed class BepuContactTracker {
 
     struct TrackedPair {
         public BepuBody A, B;
+        public int ChildA, ChildB; // -1 when unknown (solid top-level path); real index for triggers
         public TkVector3 Point, Normal;
         public bool IsTrigger;
     }
@@ -118,9 +119,12 @@ sealed class BepuContactTracker {
     // Called from narrowphase worker threads — each worker owns its buffer, no locks. Records a
     // TOUCHING contact (depth past the threshold) for Enter/Stay/Exit. The restitution approach
     // speed is tracked separately via SampleApproach (it must be captured pre-touch, before the
-    // solver damps it), so this just stamps the combined restitution onto the record.
+    // solver damps it), so this just stamps the combined restitution onto the record. childA/childB
+    // default to -1 ("which child unknown"): the top-level solid path cannot reliably decode the
+    // source child from Bepu's reduced manifold, so solid compound contacts resolve to the body's
+    // primary collider. Trigger contacts come through RecordChild with the real indices.
     public void Record(int workerIndex, CollidablePair pair, in NumVector3 offsetFromA,
-        in NumVector3 normal, bool isTrigger, float restitution, int childA = 0, int childB = 0) {
+        in NumVector3 normal, bool isTrigger, float restitution, int childA = -1, int childB = -1) {
         workerContacts[workerIndex].Add(new ContactRecord {
             A = pair.A,
             B = pair.B,
@@ -210,6 +214,8 @@ sealed class BepuContactTracker {
             var pair = new TrackedPair {
                 A = bodyA,
                 B = bodyB,
+                ChildA = record.ChildA,
+                ChildB = record.ChildB,
                 Point = ToOpenTK(record.Point),
                 Normal = ToOpenTK(record.Normal),
                 IsTrigger = record.IsTrigger,
@@ -334,5 +340,7 @@ sealed class BepuContactTracker {
         Point = pair.Point,
         Normal = pair.Normal,
         IsTrigger = pair.IsTrigger,
+        ChildA = pair.ChildA,
+        ChildB = pair.ChildB,
     };
 }
