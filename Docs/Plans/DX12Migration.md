@@ -82,10 +82,17 @@ build early would break the editor exe — see Docs/Plans/dx-native-abstraction-
 Current order keeps engine+editor BUILDING: DX12 no-ops the GL-shaped bind methods instead of deleting
 them; GL stays compiling (editor host) with zero new work; build DX12 up to parity FIRST, delete GL last.
 
-**NEXT (DX12 quality, each committable):** normal/roughness/metallic/AO maps → fuller PBR; skybox + IBL
-ambient (SkyboxConstants struct, drop the per-name uniform API); full BC mip-chain upload (currently
-mip-0-only); interleave the mesh vertex buffer; then shadows + post-FX (Phase 3, SSGI last). Editor→DX12
-+ GL deletion is the final phase.
+**DONE since first light (committed):** full PBR (Cook-Torrance GGX direct sun + 6 material maps
+diffuse/normal/metallic/roughness/AO/emissive, glTF factors, normal mapping, ORM, cutout — mirrors GL
+Frag.glsl; ref dx12_suntemple_pbr.png); full pre-baked mip-chain texture upload (the earlier multi-mip
+E_FAIL was the shared command list, not the mip math — dedicated upload queue fixed it). SunTemple renders
+with proper specular + crisp mipped textures, brightness near baseline.
+
+**NEXT (DX12, each committable):** skybox + IBL ambient (SkyboxConstants struct, drop the per-name uniform
+API — the SkyboxRenderer is the only engine uniform caller); interleave the mesh vertex buffer (perf);
+cascaded shadows (Phase 3 start); then post-FX (tonemap/bloom/TAA/SSAO/SSR/volumetric, SSGI LAST);
+finally editor→DX12 + delete GL wholesale. Exposure is a fixed 1e-5 stand-in (BALLISTIC_DX12_EXPOSURE to
+override) until auto-exposure. Editor still renders on GL (don't break it — delete GL only at the end).
 
 The frozen GL parity image: `Docs/Plans/dx12-refs/gl_suntemple_baseline.png` (mean RGB 96.7,81.9,65.6).
 
