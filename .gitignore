@@ -21,6 +21,13 @@ SampleProject/Assets/Bistro_v5_2/
 # https://github.com/wolfpld/tracy/releases v0.11.1 — must match the Tracy-CSharp version)
 Tools/Tracy/
 
+# Native DLLs for the DX12 renderer (OIDN denoiser + FSR upscaler). Re-fetch via native/README.md.
+# Headers + README stay tracked (they pin the P/Invoke contract); the big runtime DLLs/libs/exes don't.
+native/**/*.dll
+native/**/*.lib
+native/**/*.exe
+native/**/*.pdb
+
 
 # Game-script build intermediates (Scripts.csproj output goes to Library\, already ignored)
 SampleProject/obj/
