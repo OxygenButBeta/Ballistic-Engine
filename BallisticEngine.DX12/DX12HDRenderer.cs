@@ -37,6 +37,19 @@ public sealed class DX12HDRenderer : HDRenderer {
     ID3D12RootSignature gbufferRootSig;
     ID3D12PipelineState gbufferPso;
 
+    // Motion vectors: a per-pass CBV (b1) shared by BOTH geometry passes (CPU GBuffer.hlsl + GPU-driven
+    // GBufferBindless.hlsl) holding the UNJITTERED current + previous frame view*proj. The geometry PS
+    // reprojects each surface's world position through both to write a jitter-free screen-space motion
+    // vector (prevUV - currUV) into the G-buffer's RG16F motion target — consumed by TAA and the FSR
+    // upscaler. Camera reprojection (correct for static geometry, which is all of the heavy test content);
+    // per-object motion for animated/physics renderers is a follow-up (would bake a prev model per draw).
+    ID3D12Resource motionCb;
+    unsafe byte* motionCbMapped;
+    Matrix4x4 motionPrevViewProj;   // previous frame's UNJITTERED view*proj
+    bool motionPrevValid;
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct MotionConstants { public Matrix4x4 ViewProjCur; public Matrix4x4 ViewProjPrev; }
+
     // Deferred lighting pass: fullscreen, reads the G-buffer + depth → PBR sun + IBL + shadows → HDR target
     // (DeferredLighting.hlsl). The lighting math moved here out of the material shader.
     ID3D12RootSignature deferredRootSig;   // LightConstants CBV(b0) + FrameConstants CBV(b1) + 9-SRV table(t0..t8) + sampler
@@ -77,11 +90,9 @@ public sealed class DX12HDRenderer : HDRenderer {
     bool taaWriteB;                     // ping-pong toggle
     bool taaHistoryValid;
     int taaFrame;                       // jitter phase counter
-    Matrix4x4 taaPrevViewProj;          // previous frame's UNJITTERED view*proj
     Vector2 currentJitter;              // this frame's sub-pixel jitter (pixels) — exposed for FSR reuse
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct TaaConstants {
-        public Matrix4x4 CurrInvViewProj; public Matrix4x4 PrevViewProj;
         public float Feedback; public float ValidHistory; public Vector2 TexelSize;
     }
 
@@ -311,6 +322,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         ldr = new Dx12OffscreenTarget(dev, width, height);   // LDR composite output
         gbuffer = new Dx12GBuffer(dev, width, height);
+        motionPrevValid = false;                             // prev view*proj is stale after a resize
         if (bloomRootSig != null) AllocBloomTargets();       // half-res bloom ping-pong follows size
         if (ssaoRootSig != null) AllocSsaoTargets();
         if (ssrRootSig != null) AllocSsrTarget();
@@ -487,13 +499,17 @@ public sealed class DX12HDRenderer : HDRenderer {
     }
 
     // Geometry pass PSO: same vertex layout + per-draw CBV(b0) + 6 material SRVs(t0..t5) as the forward
-    // opaque path, but the pixel shader (GBuffer.hlsl) writes the 4-MRT fat G-buffer instead of shading.
-    void BuildGeometryPass() {
-        // b0 = per-draw DrawConstants (root CBV); table0 = 6 material SRVs t0..t5; s0 wrap sampler.
+    // opaque path, but the pixel shader (GBuffer.hlsl) writes the 5-MRT fat G-buffer (+ motion) instead of
+    // shading. Adds a per-pass MotionConstants CBV(b1) for the motion-vector reprojection.
+    unsafe void BuildGeometryPass() {
+        // b0 = per-draw DrawConstants (root CBV); table0 = 6 material SRVs t0..t5; b1 = MotionConstants
+        // (per pass); s0 wrap sampler.
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView,
             new RootDescriptor1(0, 0), ShaderVisibility.All);
         var matRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, MaterialSrvCount, baseShaderRegister: 0);
         var matTable = new RootParameter1(new RootDescriptorTable1(matRange), ShaderVisibility.Pixel);
+        var motionCbv = new RootParameter1(RootParameterType.ConstantBufferView,
+            new RootDescriptor1(1, 0), ShaderVisibility.Pixel);
         var wrap = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap,
             AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 16,
@@ -501,7 +517,12 @@ public sealed class DX12HDRenderer : HDRenderer {
         };
         gbufferRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(RootSignatureFlags.AllowInputAssemblerInputLayout,
-                new[] { cbv, matTable }, new[] { wrap })));
+                new[] { cbv, matTable, motionCbv }, new[] { wrap })));
+
+        int motionCbSize = (System.Runtime.InteropServices.Marshal.SizeOf<MotionConstants>() + 255) & ~255;
+        motionCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)motionCbSize), ResourceStates.GenericRead);
+        motionCbMapped = motionCb.Map<byte>(0);
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("GBuffer.hlsl");
         byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "GBuffer.hlsl");
@@ -1025,6 +1046,14 @@ public sealed class DX12HDRenderer : HDRenderer {
         }
         Matrix4x4 viewProj = view * proj;   // JITTERED — geometry/SSR/etc. render with this
 
+        // Motion-vector constants (b1): UNJITTERED current + previous view*proj. First frame (or after a
+        // resize) has no valid previous frame → use the current matrix so motion = 0 everywhere.
+        Matrix4x4 viewProjPrevForMotion = motionPrevValid ? motionPrevViewProj : viewProjUnjittered;
+        *(MotionConstants*)motionCbMapped = new MotionConstants {
+            ViewProjCur = Matrix4x4.Transpose(viewProjUnjittered),
+            ViewProjPrev = Matrix4x4.Transpose(viewProjPrevForMotion),
+        };
+
         Vector3 camPos = ToNumerics(vp.Transform.WorldPosition);
         LightUniforms light = LightUniforms.Resolve();
         Vector3 lightDir = ToNumerics(light.Direction);
@@ -1105,6 +1134,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             cl.SetGraphicsRootSignature(gbufferRootSig);
             cl.SetPipelineState(gbufferPso);
             cl.SetDescriptorHeaps(srvVisible.Heap);
+            cl.SetGraphicsRootConstantBufferView(2, motionCb.GPUVirtualAddress);   // b1 motion (per pass)
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
 
             foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
@@ -1199,7 +1229,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             // UNJITTERED frustum planes for culling (byte-identical visible set).
             if (gpuDrivenOn && wholeMeshRenderers.Count > 0) {
                 draws += gpuDriven.RenderInto(cl, wholeMeshRenderers, viewProj, frustumPlanes,
-                    viewProjUnjittered, view, CameraNear, CameraFar);
+                    viewProjUnjittered, view, CameraNear, CameraFar, motionCb.GPUVirtualAddress);
                 tris += gpuDriven.LastTris;
             }
         });
@@ -1245,9 +1275,9 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (PostFX.SsrEnabled && PostFX.SsrIntensity > 0f)
             DrawSsr(view, proj);
 
-        // --- TAA (volume-driven; the AA — resolves the jittered frame vs reprojected history) ---
+        // --- TAA (volume-driven; the AA — resolves the jittered frame vs motion-reprojected history) ---
         if (taaOn)
-            DrawTaa(viewProjUnjittered);
+            DrawTaa();
         else
             taaHistoryValid = false;   // keep history fresh for when TAA turns back on
 
@@ -1257,6 +1287,11 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         // --- Final composite: HDR scene → exposure → ACES → sRGB → LDR ---
         DrawComposite(ssaoOn);
+
+        // Remember this frame's UNJITTERED view*proj for next frame's motion vectors (independent of TAA,
+        // since FSR replaces TAA but still needs motion).
+        motionPrevViewProj = viewProjUnjittered;
+        motionPrevValid = true;
 
         RenderStats.Scene.DrawCalls = draws;
         RenderStats.Scene.Triangles = tris;
@@ -1306,7 +1341,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         // lights/grid/index (t9..t11).
         deferredSrvVisible.Reset();
         int b = deferredSrvVisible.AllocateRange(12);
-        for (int i = 0; i < Dx12GBuffer.RtCount; i++)
+        // Only the 4 SHADED G-buffer RTs feed lighting (G0..G3 → t0..t3); the motion RT (RT4) is for TAA/FSR.
+        for (int i = 0; i < Dx12GBuffer.ShadedRtCount; i++)
             dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + i), gbuffer.ColorSrvCpu(i), heapType);
         dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 4), gbuffer.DepthSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 5), ibl.IrradianceSrv, heapType);
@@ -1452,31 +1488,28 @@ public sealed class DX12HDRenderer : HDRenderer {
         });
     }
 
-    // TAA (volume-driven): resolve the jittered HDR scene against the reprojected history. Reads the
-    // current HDR color (target) + history + G-buffer depth, writes the resolved color into the new history
-    // buffer, then copies it back to `target` so the composite tonemaps the AA'd result. Reprojection uses
-    // the UNJITTERED matrices. History ping-pongs; invalidated on resize / first frame.
-    unsafe void DrawTaa(Matrix4x4 viewProjUnjittered) {
+    // TAA (volume-driven): resolve the jittered HDR scene against the motion-reprojected history. Reads the
+    // current HDR color (target) + history + G-buffer motion vectors, writes the resolved color into the new
+    // history buffer, then copies it back to `target` so the composite tonemaps the AA'd result. Reprojection
+    // is a per-pixel motion-vector add (jitter-free). History ping-pongs; invalidated on resize / first frame.
+    unsafe void DrawTaa() {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        Matrix4x4.Invert(viewProjUnjittered, out Matrix4x4 invVP);
         Dx12OffscreenTarget history = taaWriteB ? taaHistoryA : taaHistoryB;   // read from the OTHER buffer
         Dx12OffscreenTarget writeHist = taaWriteB ? taaHistoryB : taaHistoryA;
 
         *(TaaConstants*)taaCbMapped = new TaaConstants {
-            CurrInvViewProj = Matrix4x4.Transpose(invVP),
-            PrevViewProj = Matrix4x4.Transpose(taaPrevViewProj),
             Feedback = PostFX.TaaFeedback, ValidHistory = taaHistoryValid ? 1f : 0f,
             TexelSize = new Vector2(1f / targetW, 1f / targetH),
         };
 
         target.ColorToShaderResource();
         history.ColorToShaderResource();
-        gbuffer.DepthToShaderResource();
+        // Motion RT is already PixelShaderResource (gbuffer.ToShaderResource transitioned all colors).
         taaSrvVisible.Reset();
         int b = taaSrvVisible.AllocateRange(3);
         dev.Device.CopyDescriptorsSimple(1, taaSrvVisible.Cpu(b + 0), target.ColorSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, taaSrvVisible.Cpu(b + 1), history.ColorSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, taaSrvVisible.Cpu(b + 2), gbuffer.DepthSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, taaSrvVisible.Cpu(b + 2), gbuffer.ColorSrvCpu(Dx12GBuffer.MotionRtIndex), heapType);
         writeHist.RenderColorOnly(cl => {
             cl.SetGraphicsRootSignature(taaRootSig); cl.SetPipelineState(taaPso);
             cl.SetDescriptorHeaps(taaSrvVisible.Heap);
@@ -1490,7 +1523,6 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         taaWriteB = !taaWriteB;
         taaHistoryValid = true;
-        taaPrevViewProj = viewProjUnjittered;
         taaFrame++;
     }
 

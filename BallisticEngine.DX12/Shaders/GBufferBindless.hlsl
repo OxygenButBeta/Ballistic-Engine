@@ -6,6 +6,13 @@
 
 cbuffer DrawIndexCB : register(b0) { uint DrawIndex; uint3 _pad0; };   // set per indirect command
 
+// Per-pass motion constants (b1): UNJITTERED current + previous frame view*proj (transposed). Identical
+// to GBuffer.hlsl — the PS reprojects PosW through both for a jitter-free motion vector (TAA + FSR).
+cbuffer MotionConstants : register(b1) {
+    float4x4 ViewProjCur;    // current frame, UNJITTERED (transposed)
+    float4x4 ViewProjPrev;   // previous frame, UNJITTERED (transposed)
+};
+
 struct PerDraw { float4x4 Mvp; float4x4 Model; uint MaterialId; uint3 _pad; };
 struct GpuMaterial {
     uint DiffuseIdx, NormalIdx, MetallicIdx, RoughnessIdx;
@@ -36,7 +43,16 @@ struct GBufferOut {
     float4 Normal   : SV_Target1;
     float4 Material  : SV_Target2;
     float4 Emissive : SV_Target3;
+    float2 Motion   : SV_Target4;   // screen-space motion (prevUV - currUV), UNJITTERED
 };
+
+float2 ScreenMotion(float3 posW) {
+    float4 clipCur  = mul(float4(posW, 1.0), ViewProjCur);
+    float4 clipPrev = mul(float4(posW, 1.0), ViewProjPrev);
+    float2 uvCur  = (clipCur.xy  / clipCur.w)  * float2(0.5, -0.5) + 0.5;
+    float2 uvPrev = (clipPrev.xy / clipPrev.w) * float2(0.5, -0.5) + 0.5;
+    return uvPrev - uvCur;
+}
 
 VSOutput VSMain(VSInput v) {
     PerDraw pd = PerDraws[DrawIndex];
@@ -92,5 +108,6 @@ GBufferOut PSMain(VSOutput i) {
     o.Normal   = float4(N * 0.5 + 0.5, 1.0);
     o.Material = float4(metallic, roughness, ao, m.Cutout > 0.5 ? 1.0 : 0.0);
     o.Emissive = float4(emissive, 1.0);
+    o.Motion   = ScreenMotion(i.PosW);
     return o;
 }

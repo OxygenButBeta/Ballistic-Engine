@@ -1,14 +1,15 @@
 // Temporal anti-aliasing for the DX12 deferred renderer, ported from the GL TAA_Frag. Reprojects last
-// frame's accumulated image with the camera matrices (depth-based, camera-motion reprojection) and blends
-// it with the jittered current frame. YCoCg variance clipping + Catmull-Rom history resample + luma-
-// adaptive feedback (same quality features as the GL path). Operates on the HDR scene color before tonemap.
+// frame's accumulated image using the G-buffer MOTION vectors (prevUV - currUV, written by the geometry
+// pass) and blends it with the jittered current frame. YCoCg variance clipping + Catmull-Rom history
+// resample + luma-adaptive feedback (same quality features as the GL path). Operates on the HDR scene
+// color before tonemap.
 //
-// Jitter is applied to the camera PROJECTION on the CPU (the whole frame is jittered); the matrices here
-// are UNJITTERED (reprojection must use stable matrices). Volume-driven feedback (PostFX.TaaFeedback).
+// Jitter is applied to the camera PROJECTION on the CPU (the whole frame is jittered); the motion vectors
+// are jitter-free (computed from the UNJITTERED view*proj), so reprojection is a stable per-pixel add.
+// Volume-driven feedback (PostFX.TaaFeedback). Motion-based reprojection also tracks dynamic geometry,
+// unlike the old depth+matrix camera-only reprojection.
 
 cbuffer TaaConstants : register(b0) {
-    float4x4 CurrInvViewProj;  // current frame, UNJITTERED (transposed)
-    float4x4 PrevViewProj;     // previous frame, UNJITTERED (transposed)
     float    Feedback;         // history weight (0..0.97)
     float    ValidHistory;     // >0.5 = blend, else passthrough (first frame / camera cut)
     float2   TexelSize;        // 1 / render size
@@ -16,7 +17,7 @@ cbuffer TaaConstants : register(b0) {
 
 Texture2D CurrentTex : register(t0);
 Texture2D HistoryTex : register(t1);
-Texture2D DepthTex   : register(t2);
+Texture2D MotionTex  : register(t2);   // RG = screen-space motion (prevUV - currUV)
 SamplerState LinearClamp : register(s0);
 
 struct VSOut { float4 Position : SV_Position; float2 Uv : TEXCOORD0; };
@@ -76,14 +77,10 @@ float4 PSMain(VSOut i) : SV_Target {
     if (ValidHistory < 0.5)
         return float4(current, 1.0);
 
-    // Reproject this pixel into last frame's screen space (DX NDC: z in [0,1], y flip).
-    float depth = DepthTex.SampleLevel(LinearClamp, i.Uv, 0).r;
-    float4 ndc = float4(i.Uv.x * 2.0 - 1.0, (1.0 - i.Uv.y) * 2.0 - 1.0, depth, 1.0);
-    float4 world = mul(ndc, CurrInvViewProj); world /= world.w;
-    float4 prevClip = mul(world, PrevViewProj);
-    float2 prevUV = prevClip.xy / prevClip.w;
-    prevUV = float2(prevUV.x * 0.5 + 0.5, 0.5 - prevUV.y * 0.5);
-    if (prevUV.x < 0.0 || prevUV.x > 1.0 || prevUV.y < 0.0 || prevUV.y > 1.0 || prevClip.w <= 0.0)
+    // Reproject this pixel into last frame's screen space using the motion vector (prevUV - currUV).
+    float2 motion = MotionTex.SampleLevel(LinearClamp, i.Uv, 0).rg;
+    float2 prevUV = i.Uv + motion;
+    if (prevUV.x < 0.0 || prevUV.x > 1.0 || prevUV.y < 0.0 || prevUV.y > 1.0)
         return float4(current, 1.0);
 
     float2 texSize = 1.0 / TexelSize;

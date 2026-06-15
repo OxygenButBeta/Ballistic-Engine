@@ -22,6 +22,14 @@ cbuffer DrawConstants : register(b0) {
     float    PackedOrm;      float Cutout;       float UseIBL; float PrefilterMaxMip;
 };
 
+// Per-pass motion constants (b1): UNJITTERED current + previous frame view*proj (transposed). The pixel
+// shader reprojects the surface's world position through both to get a jitter-free screen-space motion
+// vector (prevUV - currUV) for TAA + FSR. Same for every draw this frame.
+cbuffer MotionConstants : register(b1) {
+    float4x4 ViewProjCur;    // current frame, UNJITTERED (transposed)
+    float4x4 ViewProjPrev;   // previous frame, UNJITTERED (transposed)
+};
+
 Texture2D DiffuseMap   : register(t0);
 Texture2D NormalMap    : register(t1);
 Texture2D MetallicMap  : register(t2);
@@ -45,7 +53,18 @@ struct GBufferOut {
     float4 Normal   : SV_Target1;   // rgb world normal, a = emissive strength flag
     float4 Material : SV_Target2;   // r metallic, g roughness, b ao, a = cutout flag
     float4 Emissive : SV_Target3;   // rgb emissive radiance (added directly in lighting)
+    float2 Motion   : SV_Target4;   // screen-space motion (prevUV - currUV), UNJITTERED
 };
+
+// Jitter-free screen-space motion from the surface world position (perspective-correct via PosW). On a
+// static frame ViewProjCur == ViewProjPrev so the two clips are bit-identical -> motion exactly 0.
+float2 ScreenMotion(float3 posW) {
+    float4 clipCur  = mul(float4(posW, 1.0), ViewProjCur);
+    float4 clipPrev = mul(float4(posW, 1.0), ViewProjPrev);
+    float2 uvCur  = (clipCur.xy  / clipCur.w)  * float2(0.5, -0.5) + 0.5;
+    float2 uvPrev = (clipPrev.xy / clipPrev.w) * float2(0.5, -0.5) + 0.5;
+    return uvPrev - uvCur;
+}
 
 VSOutput VSMain(VSInput v) {
     VSOutput o;
@@ -90,5 +109,6 @@ GBufferOut PSMain(VSOutput i) {
     o.Normal   = float4(N * 0.5 + 0.5, 1.0);             // store [0,1]-packed world normal
     o.Material = float4(metallic, roughness, ao, Cutout > 0.5 ? 1.0 : 0.0);
     o.Emissive = float4(emissive, 1.0);
+    o.Motion   = ScreenMotion(i.PosW);
     return o;
 }

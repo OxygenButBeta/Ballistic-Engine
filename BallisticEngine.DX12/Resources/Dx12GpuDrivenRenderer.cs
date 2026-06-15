@@ -144,11 +144,13 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, cullHlsl, "CSMain", "GpuCull.hlsl"),
         });
 
-        // --- Draw root sig: root const b0 (DrawIndex) + SRV t0 (PerDraws) + SRV t1 (GpuMaterials) + bindless ---
+        // --- Draw root sig: root const b0 (DrawIndex) + SRV t0 (PerDraws) + SRV t1 (GpuMaterials) +
+        // CBV b1 (MotionConstants, per pass — matches the CPU GBuffer.hlsl b1) + bindless ---
         var drawParams = new[] {
             new RootParameter1(new RootConstants(0, 0, 1), ShaderVisibility.Vertex),
             new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.Vertex),
             new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(1, 0), ShaderVisibility.Pixel),
+            new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.Pixel),
         };
         var wrap = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap,
@@ -282,7 +284,8 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     // ExecuteIndirect count for stats.
     public unsafe int RenderInto(ID3D12GraphicsCommandList4 cl, List<IStaticMeshRenderer> wholeMesh,
                                  Matrix4x4 viewProj, Vector4[] frustumPlanes,
-                                 Matrix4x4 viewProjUnjittered, Matrix4x4 view, float near, float far) {
+                                 Matrix4x4 viewProjUnjittered, Matrix4x4 view, float near, float far,
+                                 ulong motionCbAddress) {
         // Group by mesh; build the flat SubmeshMeta array (per frame: Mvp depends on the camera).
         var groups = new List<(Dx12Buffer<GLVector3> vb, Dx12Buffer<GLVector3> nb,
             Dx12Buffer<OpenTK.Mathematics.Vector2> ub, Dx12Buffer<OpenTK.Mathematics.Vector4> tb,
@@ -374,6 +377,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         cl.SetPipelineState(drawPso);
         cl.SetGraphicsRootShaderResourceView(1, perDraws.GPUVirtualAddress);
         cl.SetGraphicsRootShaderResourceView(2, materials.GPUVirtualAddress);
+        cl.SetGraphicsRootConstantBufferView(3, motionCbAddress);   // b1 motion (per pass)
         cl.IASetPrimitiveTopology(Vortice.Direct3D.PrimitiveTopology.TriangleList);
         for (int g = 0; g < groups.Count; g++) {
             var gp = groups[g];

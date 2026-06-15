@@ -15,15 +15,20 @@ namespace BallisticEngine.DX12;
 //   RT1 R16G16B16A16_Float   : world normal.xyz packed [0,1] (a = unused)
 //   RT2 R8G8B8A8_UNorm       : metallic, roughness, ao, (a = cutout flag)
 //   RT3 R16G16B16A16_Float   : emissive radiance.rgb (HDR, added directly in lighting)
+//   RT4 R16G16_Float         : screen-space motion vectors (prevUV - currUV, UNJITTERED) — TAA + FSR
 // RT0 is sRGB so the SRGB albedo round-trips like a sampled diffuse map; normal/emissive are float so the
-// normal keeps precision and emissive stays HDR. The metallic/roughness/ao pack is linear UNORM.
+// normal keeps precision and emissive stays HDR. The metallic/roughness/ao pack is linear UNORM. Motion is
+// linear RG (UV-space delta, top-left origin); FSR consumes it with motionVectorScale = (renderW, renderH).
 public sealed class Dx12GBuffer : IDisposable {
-    public const int RtCount = 4;
+    public const int RtCount = 5;          // total MRTs (4 shaded + 1 motion)
+    public const int ShadedRtCount = 4;    // G0..G3 — the surface attributes the deferred lighting pass reads
+    public const int MotionRtIndex = 4;    // RG16F screen-space motion (TAA reprojection + FSR upscaler)
     public static readonly Format[] ColorFormats = {
         Format.R8G8B8A8_UNorm_SRgb,     // albedo + specF0
         Format.R16G16B16A16_Float,      // world normal
         Format.R8G8B8A8_UNorm,          // metallic/roughness/ao/flags
         Format.R16G16B16A16_Float,      // emissive (HDR)
+        Format.R16G16_Float,            // motion vectors (prevUV - currUV)
     };
     public const Format DepthFormat = Format.D32_Float;
 
