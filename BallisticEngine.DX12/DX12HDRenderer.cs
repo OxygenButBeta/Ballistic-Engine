@@ -38,16 +38,23 @@ public sealed class DX12HDRenderer : HDRenderer {
     // the root descriptor table at it. Reset each frame.
     Dx12DescriptorHeap srvVisible;
 
-    // Matches StandardOpaque.hlsl's cbuffer DrawConstants byte-for-byte.
+    // Matches StandardOpaque.hlsl's cbuffer DrawConstants byte-for-byte (16-byte-aligned rows).
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct DrawConstants {
         public Matrix4x4 Mvp;
         public Matrix4x4 Model;
-        public Vector3 LightDir; public float Pad0;
-        public Vector3 LightColor; public float Pad1;
-        public Vector3 Ambient; public float Exposure;
+        public Vector3 LightDir; public float Exposure;
+        public Vector3 LightColor; public float Metallic;
+        public Vector3 Ambient; public float Roughness;
+        public Vector3 CameraPos; public float SpecularReflectance;
         public Vector4 BaseColorFactor;
+        public Vector3 EmissiveFactor; public float HasEmissive;
+        public float NormalStrength, NormalFlipY, HasMetallicMap, HasRoughnessMap;
+        public float PackedOrm, Cutout, Pad0, Pad1;
     }
+
+    // The 6 material maps in HLSL register(t0..t5) order.
+    const int MaterialSrvCount = 6;
 
     public DX12HDRenderer(Dx12Device device) {
         dev = device;
@@ -79,16 +86,18 @@ public sealed class DX12HDRenderer : HDRenderer {
             ResourceDescription.Buffer((ulong)(cbSlotSize * cbSlotCount)), ResourceStates.GenericRead);
         cbMapped = cbRing.Map<byte>(0);
 
+        // 6 SRVs per draw (the material table) — size the ring for the worst-case draw count.
         srvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
-            cbSlotCount, shaderVisible: true);
+            cbSlotCount * MaterialSrvCount, shaderVisible: true);
     }
 
     void BuildRootSignature() {
-        // b0 = per-draw constants (root CBV); table0 = 1 SRV (diffuse) at t0; static sampler s0.
+        // b0 = per-draw constants (root CBV); table0 = 6 SRVs (diffuse/normal/metallic/roughness/AO/
+        // emissive) at t0..t5; static sampler s0.
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView,
             new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, MaterialSrvCount, baseShaderRegister: 0);
         var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
 
         var sampler = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
@@ -154,6 +163,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             45f * (MathF.PI / 180f), (float)targetW / targetH, 0.1f, 1000f);
         Matrix4x4 viewProj = view * proj;
 
+        Vector3 camPos = ToNumerics(vp.Transform.WorldPosition);
         LightUniforms light = LightUniforms.Resolve();
         Vector3 lightDir = ToNumerics(light.Direction);
         Vector3 lightColor = ToNumerics(light.Color);
@@ -161,9 +171,10 @@ public sealed class DX12HDRenderer : HDRenderer {
         // The sun radiance is HDR (lux-scaled, ~80000); a fixed pre-exposure brings it into a viewable
         // range before the ACES tonemap (the GL path auto-meters EV100; this is a constant stand-in for
         // first light). Tunable via BALLISTIC_DX12_EXPOSURE while dialing against the frozen baseline.
-        // 4e-6 lands SunTemple's mean brightness within noise of the GL baseline (mean ~96 vs 96.7).
+        // 1e-5 lands the PBR path (energy-conserving ÷π diffuse) near the GL baseline brightness; the DX12
+        // image is intentionally a touch dimmer (no IBL ambient / shadows yet — those are next milestones).
         float exposure = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
-            System.Globalization.CultureInfo.InvariantCulture, out float e) ? e : 4.0e-6f;
+            System.Globalization.CultureInfo.InvariantCulture, out float e) ? e : 1.0e-5f;
 
         int draws = 0;
         long tris = 0;
@@ -214,22 +225,37 @@ public sealed class DX12HDRenderer : HDRenderer {
                     if (mat is null) continue;
                     if (slot >= cbSlotCount) break;
 
+                    bool hasMetal = mat.Metallic is not null;
+                    bool hasRough = mat.Roughness is not null;
+                    bool emissive = mat.IsEmissive;
                     var c = new DrawConstants {
                         Mvp = Matrix4x4.Transpose(mvp),
                         Model = Matrix4x4.Transpose(model),
-                        LightDir = lightDir, LightColor = lightColor,
-                        Ambient = ambient, Exposure = exposure,
+                        LightDir = lightDir, Exposure = exposure,
+                        LightColor = lightColor, Metallic = mat.MetallicFactor,
+                        Ambient = ambient, Roughness = mat.RoughnessFactor,
+                        CameraPos = camPos, SpecularReflectance = mat.SpecularReflectance,
                         BaseColorFactor = ToNumerics(mat.BaseColorFactor),
+                        EmissiveFactor = ToNumerics(mat.EmissiveColor) * mat.EmissiveIntensity,
+                        HasEmissive = emissive ? 1f : 0f,
+                        NormalStrength = mat.NormalStrength, NormalFlipY = mat.NormalFlipY ? 1f : 0f,
+                        HasMetallicMap = hasMetal ? 1f : 0f, HasRoughnessMap = hasRough ? 1f : 0f,
+                        PackedOrm = mat.PackedOrm ? 1f : 0f, Cutout = mat.Cutout ? 1f : 0f,
                     };
                     *(DrawConstants*)(cbMapped + (long)slot * cbSlotSize) = c;
                     cl.SetGraphicsRootConstantBufferView(0,
                         cbRing.GPUVirtualAddress + (ulong)((long)slot * cbSlotSize));
 
-                    var diffuse = (mat.Diffuse as Dx12Texture2D) ?? fallbackDiffuse;
-                    int srvSlot = srvVisible.Allocate();
-                    dev.Device.CopyDescriptorsSimple(1, srvVisible.Cpu(srvSlot), diffuse.SrvCpu,
-                        DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
-                    cl.SetGraphicsRootDescriptorTable(1, srvVisible.Gpu(srvSlot));
+                    // Copy the 6 material SRVs into a contiguous shader-visible table region (t0..t5).
+                    // Null slots resolve to the type's neutral default so every descriptor is valid.
+                    int tableStart = srvVisible.AllocateRange(MaterialSrvCount);
+                    BindSrv(tableStart + 0, mat.Diffuse, TextureType.Diffuse, fallbackDiffuse);
+                    BindSrv(tableStart + 1, mat.Normal, TextureType.Normal, null);
+                    BindSrv(tableStart + 2, mat.Metallic, TextureType.Metallic, null);
+                    BindSrv(tableStart + 3, mat.Roughness, TextureType.Roughness, null);
+                    BindSrv(tableStart + 4, mat.AO, TextureType.AO, null);
+                    BindSrv(tableStart + 5, mat.Emissive, TextureType.Emissive, null);
+                    cl.SetGraphicsRootDescriptorTable(1, srvVisible.Gpu(tableStart));
 
                     cl.DrawIndexedInstanced((uint)sub.IndexCount, 1, (uint)sub.IndexStart, 0, 0);
                     draws++;
@@ -242,6 +268,18 @@ public sealed class DX12HDRenderer : HDRenderer {
         RenderStats.Scene.DrawCalls = draws;
         RenderStats.Scene.Triangles = tris;
         return new RenderMetrics(draws, 0, (int)tris, 0, 0f);
+    }
+
+    // Copy one material texture's persistent SRV into the shader-visible table at `visibleSlot`. A null
+    // texture resolves to that slot's neutral default (DefaultTextures.Neutral) so the descriptor is
+    // always valid — matching the GL Material.Activate fallback (metallic 0, roughness 1, AO 1, flat +Z
+    // normal, dark emissive). `explicitFallback` lets diffuse use a white fallback.
+    void BindSrv(int visibleSlot, Texture2D tex, TextureType type, Dx12Texture2D explicitFallback) {
+        var dx = (tex as Dx12Texture2D)
+                 ?? explicitFallback
+                 ?? (DefaultTextures.Neutral(type) as Dx12Texture2D);
+        dev.Device.CopyDescriptorsSimple(1, srvVisible.Cpu(visibleSlot), dx.SrvCpu,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
     }
 
     public override void PostRenderCleanUp() {
