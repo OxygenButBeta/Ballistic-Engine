@@ -132,13 +132,21 @@ RenderColorOnly transitions. BALLISTIC_FX_VOLUMETRIC=1 forces on (GL harness par
 BistroExterior — aerial perspective, distant buildings haze out (mean 26→38; ref dx12_bistro_fog.png).
 Single-pass at physical default density; half-res+temporal + sky-ambient readback are follow-ups.
 
-**DX12 stack now: PBR + procedural sky + IBL + cascaded shadows + volumetric fog, on 2 real scenes.**
+**🟢 DX12 HDR PIPELINE (2026-06-15):** scene renders RAW HDR into an R16F target (material/sky/fog no
+longer tonemap inline); a single Composite.hlsl pass does exposure→ACES→sRGB→LDR (the readback/display
+target). Fog blends in HDR now. Byte-equivalent output (SunTemple unchanged) — the foundation that lets
+auto-exposure + bloom exist. Infra: Dx12OffscreenTarget color format parameterized (HdrFormat) + color
+SRV + Color/Depth transitions; HDR scene target + LDR composite target; SaveFrame reads LDR.
 
-**NEXT (DX12, each committable; user directive = port ALL GL features):** post-FX tonemap pipeline —
-auto-exposure (replace the fixed 1e-5 stand-in) + bloom + TAA; then SSAO + SSR (SSGI LAST); sky
-clouds/cirrus/stars (follow-up to the atmosphere); alpha-cutout caster shadows (foliage); cascade caching
-+ interleave mesh verts (perf); finally editor→DX12 + delete GL wholesale (incl. the GL-shaped bind
-methods + RenderContext the DX12 path no-ops). DON'T break the editor — it renders on GL; delete GL only
+**DX12 stack now: PBR + procedural sky + IBL + cascaded shadows + volumetric fog + HDR/tonemap composite.**
+
+**NEXT (DX12, each committable; user directive = port ALL GL features):** auto-exposure (luminance
+reduction → drives the composite Exposure, replace the fixed 1e-5 stand-in — the Composite pass already
+has the Exposure slot wired); bloom (bright-pass + blur, add into the composite's BloomTex/BloomIntensity
+— already wired); TAA; then SSAO + SSR (SSGI LAST); sky clouds/cirrus/stars; alpha-cutout caster shadows;
+cascade caching + interleave mesh verts (perf); finally editor→DX12 + delete GL wholesale (incl. the
+GL-shaped bind methods + RenderContext the DX12 path no-ops). DON'T break the editor — it renders on GL;
+delete GL only
 at the very end.
 
 The frozen GL parity image: `Docs/Plans/dx12-refs/gl_suntemple_baseline.png` (mean RGB 96.7,81.9,65.6).
