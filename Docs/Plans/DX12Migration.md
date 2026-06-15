@@ -67,12 +67,25 @@ map). GL is being deleted; build DX-native, no back-compat. Working autonomously
 - Step 2 — dropped dead `RenderAsset.InstancedDrawing`.
 - Step 3 — **DX12 headless host works**: `BALLISTIC_BACKEND=dx12` → `Dx12HeadlessRuntime` (real DirectXRenderAsset device + offscreen target, windowless) drives the engine loop, captures at `BALLISTIC_SCREENSHOT_FRAME`, reads the DX12 target back to BMP. VERIFIED: SunTemple brings up the device, loads the scene, runs BeginRender, writes a valid 1920x1080 BMP (clear color, draws=0 — renderer is still a shell). Made `IEngineTimer.Update` public for the out-of-assembly host. Runtime now refs BallisticEngine.DX12.
 
-**NEXT — Step 4a:** make Material/Texture/Mesh/Shader/GPUBuffer/RenderContext BIND-FREE (delete all
-Activate/Deactivate + `Material.LastActivatedMaterial`); this breaks GLHDRenderer compile → retire GL
-from the build (drop OpenGL/ + GLStandardShader from the engine .csproj compile set, default backend to
-DX12). Then Step 5 interleave mesh vertex buffer, 6 remove RenderContext, 7 SkyboxRenderer→constants +
-drop per-name uniform API, 8 DX12 material table (port GpuMaterialTable semantics), 9 SunTemple opaque+sky
-renders (eyeball vs frozen baseline `Docs/Plans/dx12-refs/gl_suntemple_baseline.png`), 10 delete OpenGL.
+**🟢 DX12 FIRST LIGHT ACHIEVED (2026-06-15):** `BALLISTIC_BACKEND=dx12` renders SunTemple end-to-end —
+1056 submesh draws, 606k tris, per-material diffuse + directional N·L + ambient, ACES-tonemapped, depth-
+tested, BMP readback. Visually correct + brightness-matched to the GL baseline (mean ~95.5 vs 96.7).
+Refs: `Docs/Plans/dx12-refs/dx12_suntemple_firstlight.png` vs `gl_suntemple_baseline.png`. The DX-native
+abstraction (Steps 0-3) carries it: DX12HDRenderer.BeginRender iterates RuntimeSet<IStaticMeshRenderer>
+(no per-frame reflection), per-draw CBV + per-material SRV descriptor table, root sig CBV(b0)+SRV(t0)+
+sampler, HLSL StandardOpaque. **THE hard bug:** texture CopyTextureRegion E_FAILed in-engine only —
+asset uploads shared ONE command list with BeginRender; fix = dedicated upload allocator/list/fence
+(Dx12Device.ExecuteUpload). Debug layer off by default (not installed here; unsafe under concurrent create).
+
+**Reordered from the synthesized 10-step plan** (editor depends on GL for ImGui, so retiring GL from the
+build early would break the editor exe — see Docs/Plans/dx-native-abstraction-redesign.md execution note).
+Current order keeps engine+editor BUILDING: DX12 no-ops the GL-shaped bind methods instead of deleting
+them; GL stays compiling (editor host) with zero new work; build DX12 up to parity FIRST, delete GL last.
+
+**NEXT (DX12 quality, each committable):** normal/roughness/metallic/AO maps → fuller PBR; skybox + IBL
+ambient (SkyboxConstants struct, drop the per-name uniform API); full BC mip-chain upload (currently
+mip-0-only); interleave the mesh vertex buffer; then shadows + post-FX (Phase 3, SSGI last). Editor→DX12
++ GL deletion is the final phase.
 
 The frozen GL parity image: `Docs/Plans/dx12-refs/gl_suntemple_baseline.png` (mean RGB 96.7,81.9,65.6).
 
