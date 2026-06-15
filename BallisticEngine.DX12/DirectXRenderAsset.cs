@@ -47,6 +47,12 @@ public sealed class DirectXRenderAsset : RenderAsset {
             bool pass = DX12.Dx12OidnDenoiser.SelfTest();
             Environment.Exit(pass ? 0 : 1);
         }
+        // DXR foundation self-test door (BALLISTIC_DX12_DXR_TEST=1): builds a tiny BLAS/TLAS + RT PSO + SBT
+        // and DispatchRays a triangle, verifying hit/miss. Proves the ray-tracing pipeline before RT effects.
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_DXR_TEST") == "1") {
+            bool pass = DX12.Dx12DxrProbe.SelfTest(device);
+            Environment.Exit(pass ? 0 : 1);
+        }
 
         Renderer = new DX12HDRenderer(device);
         Renderer.Initialize();
