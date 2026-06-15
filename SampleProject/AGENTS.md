@@ -16,9 +16,12 @@ This is a **Ballistic Engine** project (custom C#/.NET 9 engine, Unity-like idio
 | `bal validate <scene>` | Static check: types, members, refs — run after any scene change. |
 | `bal import <project>` | Idempotent asset import (run after adding files externally). |
 | `bal assets resolve/refs/list` | Path<->guid, reverse references ("what breaks if I touch this"). |
-| `bal simulate <scene> --steps N --watch Entity [--input script.json]` | Headless play with numeric probes + scripted input. Assert behavior from DATA. |
+| `bal simulate <scene> --steps N --watch Entity [--snapshot Entity] [--input script.json]` | Headless play with numeric probes + scripted input; `--snapshot` = full live component state. Assert behavior from DATA. |
 | `bal render <scene> [--orbit N] [--idmap]` | Deterministic screenshots; multi-view orbit; entity-ID maps. |
 | `bal imgdiff <a> <b> [--out heatmap]` | Perceptual diff with mean + hotspot budgets. |
+| `bal query <op> <scene> --points/--pairs` | SPATIAL PERCEPTION over the scene geometry (DXR ray queries): occupancy (inside solid?), classify (open/enclosed/solid), nudge (occupied->free space), rooms (visibility clusters), visibility (clear line of sight). Ask the 3D world, don't guess from pixels. |
+| `bal gbuffer <scene> [--out dir]` | Dump raw depth/world-normal/albedo (.bin + manifest.json) — read geometry directly, not the tonemapped pixel. |
+| `bal perf <scene>` | Render-perf stats JSON (draws/tris/cull/lights/cpuFrameMs) for autonomous perf work. |
 | `bal agents <project>` | Regenerate this file. |
 
 Player env-var harness (`dotnet run --project BallisticEngine.Runtime <project>`):
@@ -40,26 +43,26 @@ Structured logs: `Library/Logs/engine.jsonl` (one JSON object per line, truncate
 ## This project
 
 ### Scenes
-- `Assets/Bistro_v5_2/BistroExterior.scene` **(startup)**
+- `Assets/Bistro_v5_2/BistroExterior.scene`
 - `Assets/Bistro_v5_2/BistroInterior_Wine.scene`
 - `Assets/Characters/SkinTest.scene`
-- `Assets/EmeraldSquare_v4_1/EmeraldSquare_Day.scene`
-- `Assets/EmeraldSquare_v4_1/EmeraldSquare_Dusk.scene`
-- `Assets/Scripts/PlayerTest.scene`
-- `Assets/SunTemple_v4/SunTemple/SunTemple.scene`
-- `Assets/UI Porting/BlackHollow/BlackHollowMenu.scene`
+- `Assets/CornellBox/CornellBox.scene`
+- `Assets/LightTest/LightTest.scene`
+- `Assets/SkyTest/SkyTest.scene`
+- `Assets/SkyTest/SkyTestNight.scene`
+- `Assets/TransparentTest/TransparentTest.scene`
+- `Assets/Temple/SunTemple_v4/SunTemple/SunTemple.scene`
 
 ### Game-script components
-`BlackHollowMenu`, `EffectsDemo`, `EventEmitter`, `EventReceiver`, `NewScript`, `Orbiter`, `PlayerController`, `Shit`, `TestBir`, `Trigger`, `TriggerLog`, `Weapon`, `YarakScript` — details via `bal schema --type <Name>`. Source: .cs files under `Assets/`.
+`NewScript` — details via `bal schema --type <Name>`. Source: .cs files under `Assets/`.
 
-### Assets (2009 total)
+### Assets (1296 total)
 - AnimationImporter: 2
-- DefaultImporter: 42
-- FalcorSceneImporter: 5
+- DefaultImporter: 18
+- FalcorSceneImporter: 3
 - ModelImporter: 11
-- NativeAssetImporter: 791
-- TerrainImporter: 3
-- TextureImporter: 1155
+- NativeAssetImporter: 473
+- TextureImporter: 789
 
 ## Working rules
 - Reference assets by PATH (`Assets/...`), never invent guids; ids are minted by the tools.

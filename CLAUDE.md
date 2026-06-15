@@ -31,8 +31,11 @@ screenshots** (each verb prints JSON, honest exit codes; `bal --help` lists all)
 - `bal schema [--type X]` — component catalog from reflection (engine + game scripts); never guess members.
 - `bal scene get/set/add-entity/add-component/remove-*/find` — typed scene CRUD; one-member edit = one-line diff; ids tool-minted; refs path-form.
 - `bal validate` / `bal describe` / `bal import` / `bal assets resolve|refs|list` — checks, summaries, idempotent import, reverse-ref map.
-- `bal simulate <scene> --steps N --watch Entity[:Comp.Member] [--input script.json]` — REAL engine headless (HeadlessRuntime: scripts+physics play, no GL); numeric time series; deterministic scripted input (two runs byte-identical).
+- `bal simulate <scene> --steps N --watch Entity[:Comp.Member] [--snapshot Entity] [--input script.json]` — REAL engine headless (HeadlessRuntime: scripts+physics play, no GL); numeric time series; `--snapshot` = full live component state at the final step (introspection); deterministic scripted input (two runs byte-identical).
 - `bal render <scene> [--orbit N] [--idmap]` + `bal imgdiff a b [--out heatmap]` — deterministic captures, multi-view, perceptual diff (mean + 32x32-hotspot budgets).
+- `bal query <op> <scene> --points/--pairs` — SPATIAL PERCEPTION (GpuSceneQuery: inline DXR RayQuery over the scene TLAS, headless, deterministic): `occupancy` (inside solid?), `classify` (open/enclosed/solid), `nudge` (occupied→free space), `rooms` (visibility clusters), `visibility` (clear line of sight per A>B pair). The agent asks the 3D world instead of guessing from pixels (`BallisticEngine.DX12/Query/`, proposal `Docs/Plans/gpu-scene-query-api-proposal.md`).
+- `bal gbuffer <scene> [--out dir]` — raw G-buffer dump (depth.bin R32F / normal.bin RGBA16F packed N*0.5+0.5 / albedo.bin RGBA8 + manifest.json) so the agent reads geometry directly, not the tonemapped pixel.
+- `bal perf <scene>` — render-perf stats JSON (draws/tris/cull/lights/cpuFrameMs; per-pass GPU ms is a DX12 follow-up).
 - `bal agents <project>` — regenerates the project's AGENTS.md (never stale: built from reflection + .meta).
 
 Env harness additions: `BALLISTIC_SCENE` (player loads any project-relative scene),
@@ -177,6 +180,18 @@ loop returns or the process never exits.
   Volume component and in the `.volume` asset view (`VolumeProfileEditor`).
 - `Input.Enabled` is the master gate — the editor disables engine input outside
   play-with-Game-view-focused, so component debug keys don't leak into editing.
+- **Editor inspector = ONE attribute-driven drawer pipeline** (`BallisticEngine.Editor/Panels/Inspector/`):
+  component members AND volume parameters both render through a shared `DrawerRegistry` + `IInspectorGui` +
+  decorator chain (this replaced the two old hardcoded type-switches in `InspectorPanel.DrawMember` /
+  `VolumeProfileEditor.DrawParameter`, which used to drift). **When designing ANY inspector/editor window,
+  author with the attributes — do NOT hand-roll widgets or a new type-switch.** Layout/semantics:
+  `[Header]/[Space]/[Tooltip]/[FoldoutGroup]/[Range]/[ColorUsage]/[ReadOnly]/[LabelText]/[PropertyOrder]`;
+  conditionals `[ShowIf]/[HideIf]/[EnableIf]/[DisableIf]` (name a sibling member, optional `==` value;
+  VolumeParameter siblings auto-unwrap to `.Value`) — e.g. hide a dial unless a mode enum matches. A NEW
+  value type = register one `ITypeDrawer` (works in BOTH paths at once); a NEW cross-cutting behaviour = an
+  `IPropertyDecorator`. Attributes live in the engine assembly (`Engine/Attributes/`, plain
+  `System.Attribute`, zero ImGui); only the editor interprets them. Defaults are byte-identical, so adding
+  an attribute is always opt-in.
 
 ## Physics (BepuPhysics 2 behind `IPhysicsWorld`)
 

@@ -50,9 +50,12 @@ internal sealed class AgentsCommand : ICommand {
         sb.AppendLine("| `bal validate <scene>` | Static check: types, members, refs — run after any scene change. |");
         sb.AppendLine("| `bal import <project>` | Idempotent asset import (run after adding files externally). |");
         sb.AppendLine("| `bal assets resolve/refs/list` | Path<->guid, reverse references (\"what breaks if I touch this\"). |");
-        sb.AppendLine("| `bal simulate <scene> --steps N --watch Entity [--input script.json]` | Headless play with numeric probes + scripted input. Assert behavior from DATA. |");
+        sb.AppendLine("| `bal simulate <scene> --steps N --watch Entity [--snapshot Entity] [--input script.json]` | Headless play with numeric probes + scripted input; `--snapshot` = full live component state. Assert behavior from DATA. |");
         sb.AppendLine("| `bal render <scene> [--orbit N] [--idmap]` | Deterministic screenshots; multi-view orbit; entity-ID maps. |");
         sb.AppendLine("| `bal imgdiff <a> <b> [--out heatmap]` | Perceptual diff with mean + hotspot budgets. |");
+        sb.AppendLine("| `bal query <op> <scene> --points/--pairs` | SPATIAL PERCEPTION over the scene geometry (DXR ray queries): occupancy (inside solid?), classify (open/enclosed/solid), nudge (occupied->free space), rooms (visibility clusters), visibility (clear line of sight). Ask the 3D world, don't guess from pixels. |");
+        sb.AppendLine("| `bal gbuffer <scene> [--out dir]` | Dump raw depth/world-normal/albedo (.bin + manifest.json) — read geometry directly, not the tonemapped pixel. |");
+        sb.AppendLine("| `bal perf <scene>` | Render-perf stats JSON (draws/tris/cull/lights/cpuFrameMs) for autonomous perf work. |");
         sb.AppendLine("| `bal agents <project>` | Regenerate this file. |");
         sb.AppendLine();
         sb.AppendLine("Player env-var harness (`dotnet run --project BallisticEngine.Runtime <project>`):");
