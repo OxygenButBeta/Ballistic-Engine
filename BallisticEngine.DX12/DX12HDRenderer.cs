@@ -366,11 +366,17 @@ public sealed class DX12HDRenderer : HDRenderer {
         // DEFAULT ON (byte-identical to the CPU path, verified on Bistro + SunTemple); BALLISTIC_DX12_GPUDRIVEN=0
         // falls back to the per-submesh CPU draw loop. Mirrors the GL BALLISTIC_GPUDRIVEN convention.
         gpuDrivenOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GPUDRIVEN") != "0";
+        // Hi-Z occlusion cull: DEFAULT ON (verified byte-identical + culls 894->224 submeshes on SunTemple);
+        // BALLISTIC_DX12_GPUDRIVEN_HIZ=0 disables it. Mirrors the GL BALLISTIC_GPUDRIVEN_HIZ convention.
+        hizWanted = gpuDrivenOn && Environment.GetEnvironmentVariable("BALLISTIC_DX12_GPUDRIVEN_HIZ") != "0";
         gpuDriven = new Dx12GpuDrivenRenderer(dev);
     }
 
     Dx12GpuDrivenRenderer gpuDriven;
     bool gpuDrivenOn;
+    bool hizWanted;
+    Vector3 hizLastCamPos;
+    bool hizPrimed;     // false until we have a valid previous-frame depth (first frame / after a big jump)
     readonly System.Collections.Generic.List<IStaticMeshRenderer> wholeMeshRenderers = new();
 
     unsafe void BuildTaa() {
@@ -1067,6 +1073,18 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (gpuDrivenOn)
             gpuDriven.EnsureMaterialTable(wholeMeshRenderers);
 
+        // Hi-Z: build the occlusion pyramid from the PREVIOUS frame's depth (before the geometry pass clears
+        // it). Camera-delta gate: disable for one frame after a big jump (stale depth) + the first frame.
+        bool hizEnabled = false;
+        if (hizWanted && wholeMeshRenderers.Count > 0) {
+            float camDelta = (camPos - hizLastCamPos).Length();
+            hizEnabled = hizPrimed && camDelta < 2.0f;
+            hizLastCamPos = camPos;
+            hizPrimed = true;
+            gbuffer.DepthToNonPixelShaderResource();
+            gpuDriven.BuildHiZ(gbuffer.DepthSrvCpu, targetW, targetH, hizEnabled);
+        }
+
         var fallbackDiffuse = DefaultTextures.Neutral(TextureType.Diffuse) as Dx12Texture2D;
 
         // === GEOMETRY PASS: fill the fat G-buffer (no lighting — GBuffer.hlsl writes albedo/normal/ORM/
@@ -1168,10 +1186,18 @@ public sealed class DX12HDRenderer : HDRenderer {
             // same G-buffer. Uses the JITTERED viewProj for the per-draw Mvp (matches the CPU path) and the
             // UNJITTERED frustum planes for culling (byte-identical visible set).
             if (gpuDrivenOn && wholeMeshRenderers.Count > 0) {
-                draws += gpuDriven.RenderInto(cl, wholeMeshRenderers, viewProj, frustumPlanes);
+                draws += gpuDriven.RenderInto(cl, wholeMeshRenderers, viewProj, frustumPlanes,
+                    viewProjUnjittered, view, CameraNear, CameraFar);
                 tris += gpuDriven.LastTris;
             }
         });
+
+        // Hi-Z debug door: how many whole-mesh submeshes survived the GPU cull (frustum + Hi-Z occlusion).
+        if (gpuDrivenOn && wholeMeshRenderers.Count > 0
+            && Environment.GetEnvironmentVariable("BALLISTIC_DX12_HIZ_DEBUG") == "1") {
+            var (vis, tot) = gpuDriven.DebugVisibleCount();
+            Console.WriteLine($"[HiZDebug] visible submeshes {vis}/{tot} (hizEnabled={(hizEnabled ? 1 : 0)})");
+        }
 
         // === CLUSTERED PUNCTUAL LIGHTS: gather active point/spot lights + CPU froxel-cull (before the
         // deferred pass reads the result). Lights are raw HDR (NOT pre-exposed — composite meters them,

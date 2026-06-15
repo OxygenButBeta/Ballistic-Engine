@@ -141,6 +141,8 @@ public sealed class Dx12GBuffer : IDisposable {
     public void DepthToReadOnly() => dev.ExecuteSync(cl => DepthTransition(cl, ResourceStates.DepthRead));
     public void DepthToWrite() => dev.ExecuteSync(cl => DepthTransition(cl, ResourceStates.DepthWrite));
     public void DepthToShaderResource() => dev.ExecuteSync(cl => DepthTransition(cl, ResourceStates.PixelShaderResource));
+    // Compute-readable (for the Hi-Z pyramid build, which reads the previous frame's depth in a CS).
+    public void DepthToNonPixelShaderResource() => dev.ExecuteSync(cl => DepthTransition(cl, ResourceStates.NonPixelShaderResource));
 
     void ColorTransition(ID3D12GraphicsCommandList4 cl, int i, ResourceStates target) {
         if (colorState[i] == target) return;

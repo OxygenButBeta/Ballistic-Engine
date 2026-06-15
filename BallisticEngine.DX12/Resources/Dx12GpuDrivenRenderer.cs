@@ -22,9 +22,15 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
 
     readonly Dx12Device dev;
 
-    // Cull (compute): CullParams CBV(b0) + Metas SRV(t0) + Commands/Counter/PerDraws UAV(u0/u1/u2).
+    // Cull (compute): CullParams CBV(b0) + Metas SRV(t0) + Commands/PerDraws UAV(u0/u1). cullRootSig is the
+    // PLAIN one (shadow cull); geoCullRootSig adds a point sampler + bindless flag for the Hi-Z pyramid read.
     ID3D12RootSignature cullRootSig;
+    ID3D12RootSignature geoCullRootSig;
     ID3D12PipelineState cullPso;
+    // Hi-Z occlusion (camera geometry cull only).
+    Dx12HiZ hiz;
+    int hizBindlessIndex = -1;
+    bool hizOnThisFrame;
     // GPU-driven G-buffer draw: DrawIndex root const(b0) + PerDraws SRV(t0) + GpuMaterials SRV(t1) + bindless.
     ID3D12RootSignature drawRootSig;
     ID3D12PipelineState drawPso;
@@ -35,7 +41,8 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     ID3D12Resource commands;        // DEFAULT UAV — indirect draw commands (one slot per submesh, in order)
     ID3D12Resource perDraws;        // DEFAULT UAV — per-draw Mvp/Model/MaterialId
     ID3D12Resource materials;       unsafe byte* materialsMapped;   // GpuMaterial[] (built on material change)
-    int cullParamSlotSize;
+    int cullParamSlotSize;       // shadow CullParams slot
+    int geoCullParamSlotSize;    // geometry GeoCullParams slot (bigger — has the Hi-Z fields)
     int metaStride, perDrawStride, materialStride;
     public long LastTris;        // triangles fed to the GPU cull this frame (pre-cull upper bound, for stats)
     public int LastSubmeshes;    // submeshes fed to the GPU cull this frame
@@ -59,6 +66,16 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     }
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct CullParams { public Vector4 P0, P1, P2, P3, P4, P5; public uint SubmeshCount, OutBase, Pad0, Pad1; }
+    // Geometry cull params (matches GpuCull.hlsl's bigger cbuffer — adds the Hi-Z fields).
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct GeoCullParams {
+        public Vector4 P0, P1, P2, P3, P4, P5;
+        public uint SubmeshCount, OutBase, HizEnabled, HizIndex;
+        public Matrix4x4 ViewProj;   // unjittered
+        public Matrix4x4 View;
+        public Vector4 HizParams;    // x=w, y=h, z=mipCount, w=near
+        public Vector4 HizFar;       // x=far
+    }
 
     // Material table cache (rebuilt when the material set changes).
     readonly Dictionary<Material, int> materialIds = new();
@@ -95,10 +112,11 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         AllocateBuffers();
         BuildShadowPipelines();
         AllocateShadowBuffers();
+        hiz = new Dx12HiZ(dev);
     }
 
     unsafe void BuildPipelines() {
-        // --- Cull root sig: CBV b0 + SRV t0 (Metas) + UAV u0 (Commands) + UAV u1 (PerDraws) ---
+        // --- Cull root sig (PLAIN, used by the SHADOW cull): CBV b0 + SRV t0 + UAV u0/u1 ---
         var cullParams = new[] {
             new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All),
             new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.All),
@@ -107,9 +125,22 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         };
         cullRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(RootSignatureFlags.None, cullParams)));
+
+        // --- Geometry cull root sig: same + a static point sampler (s0) + directly-indexed flag so the
+        // cull can sample the Hi-Z pyramid via ResourceDescriptorHeap[HizIndex]. ---
+        var pointClamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) {
+            Filter = Filter.MinMagMipPoint, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        geoCullRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(
+                RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
+                cullParams, new[] { pointClamp })));
+
         string cullHlsl = EmbeddedShaderSource.ReadHlsl("GpuCull.hlsl");
         cullPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription {
-            RootSignature = cullRootSig,
+            RootSignature = geoCullRootSig,
             ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, cullHlsl, "CSMain", "GpuCull.hlsl"),
         });
 
@@ -169,8 +200,9 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         metaMapped = metaUpload.Map<byte>(0);
 
         cullParamSlotSize = (System.Runtime.InteropServices.Marshal.SizeOf<CullParams>() + 255) & ~255;
+        geoCullParamSlotSize = (System.Runtime.InteropServices.Marshal.SizeOf<GeoCullParams>() + 255) & ~255;
         cullParamUpload = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)(cullParamSlotSize * MaxGroups)), ResourceStates.GenericRead);
+            ResourceDescription.Buffer((ulong)(geoCullParamSlotSize * MaxGroups)), ResourceStates.GenericRead);
         cullParamMapped = cullParamUpload.Map<byte>(0);
 
         materials = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
@@ -191,6 +223,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         materialIds.Clear();
         bindlessIds.Clear();
         materialCount = 0;
+        hizBindlessIndex = -1;   // the Hi-Z SRV lived in the bindless heap that was just reset — re-register
 
         foreach (var r in wholeMesh) {
             Mesh mesh = r.SharedMesh; if (mesh is null) continue;
@@ -230,11 +263,26 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         return idx;
     }
 
+    // Build the Hi-Z pyramid from the previous frame's G-buffer depth (must already be NonPixelShaderResource).
+    // `enabled` = the camera-delta gate (false 1 frame after a big jump, and on the first frame). Own ExecuteSync.
+    public void BuildHiZ(CpuDescriptorHandle depthSrvCpu, int w, int h, bool enabled) {
+        hizOnThisFrame = enabled;
+        if (!enabled) return;
+        hiz.Ensure(w, h);
+        if (hizBindlessIndex < 0) {
+            hizBindlessIndex = Dx12Backend.BindlessHeap.Allocate();
+            hiz.CreateAllMipsSrv(Dx12Backend.BindlessHeap.Cpu(hizBindlessIndex));
+        }
+        dev.ExecuteSync(cl => hiz.Build(cl, depthSrvCpu));
+    }
+
     // Record the cull + ExecuteIndirect for all whole-mesh groups into the geometry command list (which has
     // the G-buffer MRT + viewport already bound). `frustumPlanes` are the SAME 6 normalized planes the CPU
-    // cull uses (from the unjittered viewProj). Returns the submesh draw upper-bound for stats.
+    // cull uses (from viewProjUnjittered). viewProjUnjittered/view drive the Hi-Z occlusion test. Returns the
+    // ExecuteIndirect count for stats.
     public unsafe int RenderInto(ID3D12GraphicsCommandList4 cl, List<IStaticMeshRenderer> wholeMesh,
-                                 Matrix4x4 viewProj, Vector4[] frustumPlanes) {
+                                 Matrix4x4 viewProj, Vector4[] frustumPlanes,
+                                 Matrix4x4 viewProjUnjittered, Matrix4x4 view, float near, float far) {
         // Group by mesh; build the flat SubmeshMeta array (per frame: Mvp depends on the camera).
         var groups = new List<(Dx12Buffer<GLVector3> vb, Dx12Buffer<GLVector3> nb,
             Dx12Buffer<OpenTK.Mathematics.Vector2> ub, Dx12Buffer<OpenTK.Mathematics.Vector4> tb,
@@ -283,13 +331,16 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             }
             int groupTotal = total - groupBase;
             if (groupTotal == 0) continue;
-            // Fill this group's CullParams slot.
-            var cp = new CullParams {
+            // Fill this group's GeoCullParams slot (planes + Hi-Z fields).
+            var cp = new GeoCullParams {
                 P0 = frustumPlanes[0], P1 = frustumPlanes[1], P2 = frustumPlanes[2],
                 P3 = frustumPlanes[3], P4 = frustumPlanes[4], P5 = frustumPlanes[5],
                 SubmeshCount = (uint)groupTotal, OutBase = (uint)groupBase,
+                HizEnabled = hizOnThisFrame ? 1u : 0u, HizIndex = (uint)Math.Max(hizBindlessIndex, 0),
+                ViewProj = Matrix4x4.Transpose(viewProjUnjittered), View = Matrix4x4.Transpose(view),
+                HizParams = new Vector4(hiz.Width, hiz.Height, hiz.MipCount, near), HizFar = new Vector4(far, 0, 0, 0),
             };
-            *(CullParams*)(cullParamMapped + (long)groupCount * cullParamSlotSize) = cp;
+            *(GeoCullParams*)(cullParamMapped + (long)groupCount * geoCullParamSlotSize) = cp;
             groups.Add((vb, nb, ub, tb, ib, groupBase, groupTotal));
             groupCount++;
         }
@@ -299,14 +350,17 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         cl.ResourceBarrierTransition(commands, ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess);
         cl.ResourceBarrierTransition(perDraws, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
 
-        // 2) Cull dispatch per group (writes Commands + PerDraws; one slot per submesh, in order).
-        cl.SetComputeRootSignature(cullRootSig);
+        // 2) Cull dispatch per group (writes Commands + PerDraws; one slot per submesh, in order). Bind the
+        // bindless heap FIRST (the cull samples the Hi-Z pyramid via ResourceDescriptorHeap; gotcha: before
+        // the root sig). The same heap stays bound for the bindless GBuffer draw below.
+        cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);
+        cl.SetComputeRootSignature(geoCullRootSig);
         cl.SetPipelineState(cullPso);
         cl.SetComputeRootShaderResourceView(1, metaUpload.GPUVirtualAddress);
         cl.SetComputeRootUnorderedAccessView(2, commands.GPUVirtualAddress);
         cl.SetComputeRootUnorderedAccessView(3, perDraws.GPUVirtualAddress);
         for (int g = 0; g < groups.Count; g++) {
-            cl.SetComputeRootConstantBufferView(0, cullParamUpload.GPUVirtualAddress + (ulong)((long)g * cullParamSlotSize));
+            cl.SetComputeRootConstantBufferView(0, cullParamUpload.GPUVirtualAddress + (ulong)((long)g * geoCullParamSlotSize));
             cl.Dispatch((uint)((groups[g].count + 63) / 64), 1, 1);
         }
 
@@ -488,6 +542,25 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         }
     }
 
+    // Debug door (BALLISTIC_DX12_HIZ_DEBUG=1): read back the geometry command buffer after the cull and
+    // count how many submeshes survived (InstanceCount == 1). Proves the GPU cull (frustum + Hi-Z) is
+    // actually dropping draws, not silently passing everything. Blocks — debug only.
+    public unsafe (int visible, int total) DebugVisibleCount() {
+        int total = LastSubmeshes;
+        if (total <= 0) return (0, 0);
+        using ID3D12Resource rb = dev.CreateReadbackBuffer(total * DrawCmdStride);
+        dev.ExecuteSync(cl => {
+            cl.ResourceBarrierTransition(commands, ResourceStates.IndirectArgument, ResourceStates.CopySource);
+            cl.CopyBufferRegion(rb, 0, commands, 0, (ulong)((long)total * DrawCmdStride));
+            cl.ResourceBarrierTransition(commands, ResourceStates.CopySource, ResourceStates.IndirectArgument);
+        });
+        Span<uint> cmds = rb.Map<uint>(0, total * 6);   // 6 uints per command; [2] = InstanceCount
+        int visible = 0;
+        for (int i = 0; i < total; i++) if (cmds[i * 6 + 2] == 1u) visible++;
+        rb.Unmap(0);
+        return (visible, total);
+    }
+
     static void WorldAabb(GLVector3 localMin, GLVector3 localMax, Matrix4x4 model, out Vector3 lo, out Vector3 hi) {
         lo = new Vector3(float.MaxValue); hi = new Vector3(float.MinValue);
         for (int c = 0; c < 8; c++) {
@@ -505,9 +578,10 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     static Vector4 ToNum(OpenTK.Mathematics.Vector4 v) => new(v.X, v.Y, v.Z, v.W);
 
     public void Dispose() {
-        cullRootSig?.Dispose(); cullPso?.Dispose(); drawRootSig?.Dispose(); drawPso?.Dispose();
+        cullRootSig?.Dispose(); geoCullRootSig?.Dispose(); cullPso?.Dispose(); drawRootSig?.Dispose(); drawPso?.Dispose();
         cmdSig?.Dispose(); commands?.Dispose(); perDraws?.Dispose();
         metaUpload?.Dispose(); cullParamUpload?.Dispose(); materials?.Dispose();
+        hiz?.Dispose();
         shadowCullPso?.Dispose(); shadowDrawRootSig?.Dispose(); shadowDrawPso?.Dispose(); shadowCmdSig?.Dispose();
         shadowCommands?.Dispose(); shadowPerDraws?.Dispose(); shadowMetaUpload?.Dispose(); shadowCullParamUpload?.Dispose();
     }
