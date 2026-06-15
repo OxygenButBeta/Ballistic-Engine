@@ -36,8 +36,16 @@ Texture2D EmissiveMap  : register(t5);
 TextureCube IrradianceMap   : register(t6);
 TextureCube PrefilterMap    : register(t7);
 Texture2D   BrdfLut         : register(t8);
+Texture2DArray ShadowCascades : register(t9);   // sun cascade depth (R32_Float), manual PCF
 SamplerState LinearWrap  : register(s0);
 SamplerState LinearClamp : register(s1);
+
+// Per-frame: cascade matrices + shadow params (b1).
+cbuffer FrameConstants : register(b1) {
+    float4x4 Cascade0, Cascade1, Cascade2, Cascade3;
+    float4   CascadeBias;
+    float    CascadeCountF; float ShadowsEnabled; float ShadowMapTexel; float CascadeBlend;
+};
 
 struct VSInput {
     float3 Pos     : POSITION;   // slot 0
@@ -107,6 +115,36 @@ float3 ACESFilm(float3 x) {
     return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
 }
 
+float CascadeMatrixApply(int c, float3 worldPos, out float3 proj) {
+    float4x4 m = c == 0 ? Cascade0 : (c == 1 ? Cascade1 : (c == 2 ? Cascade2 : Cascade3));
+    float4 clip = mul(float4(worldPos, 1.0), m);   // ortho → w == 1
+    proj = clip.xyz;                                // DX ortho: z already in [0,1]
+    proj.xy = proj.xy * float2(0.5, -0.5) + 0.5;    // clip xy [-1,1] → uv [0,1] (y flipped)
+    return max(abs(clip.x), abs(clip.y));           // edge for cascade-fit test
+}
+
+// 3×3 PCF sun shadow: first cascade the pixel falls in, manual compare against the R32 depth.
+float SunShadow(float3 N, float3 L, float3 worldPos) {
+    if (ShadowsEnabled < 0.5) return 1.0;
+    float ndl = saturate(dot(N, L));
+    int count = (int)CascadeCountF;
+    for (int c = 0; c < count; c++) {
+        float3 proj;
+        float edge = CascadeMatrixApply(c, worldPos, proj);
+        if (edge > 1.0 || proj.z > 1.0 || proj.z < 0.0) continue;
+        float bias = max(CascadeBias[c] * (1.0 - ndl), CascadeBias[c] * 0.1);
+        float lit = 0.0;
+        [unroll] for (int dy = -1; dy <= 1; dy++)
+        [unroll] for (int dx = -1; dx <= 1; dx++) {
+            float2 uv = proj.xy + float2(dx, dy) * ShadowMapTexel;
+            float d = ShadowCascades.SampleLevel(LinearClamp, float3(uv, (float)c), 0).r;
+            lit += (proj.z - bias) <= d ? 1.0 : 0.0;
+        }
+        return lit / 9.0;
+    }
+    return 1.0;   // beyond all cascades: lit
+}
+
 float4 PSMain(VSOutput i) : SV_Target {
     float4 albedoSample = DiffuseMap.Sample(LinearWrap, i.Uv);
     if (Cutout > 0.5 && albedoSample.a < 0.5) discard;
@@ -129,6 +167,8 @@ float4 PSMain(VSOutput i) : SV_Target {
     float NdotL = max(dot(N, D), 0.0);
     float3 diffuse = 0, specular = 0;
     if (NdotL > 0.0) {
+        float shadow = SunShadow(N, D, i.PosW);   // 1 = lit, 0 = shadowed
+        float3 radiance = LightColor * shadow;
         float3 H = normalize(V + D);
         float NDF = DistributionGGX(N, H, roughness);
         float G = GeometrySmith(N, V, D, roughness);
@@ -136,8 +176,8 @@ float4 PSMain(VSOutput i) : SV_Target {
         float NdotV = max(dot(N, V), 0.0);
         float3 spec = (NDF * G * F) / max(4.0 * NdotV * NdotL, EPS);
         float3 kD = (1.0 - F) * (1.0 - metallic);
-        diffuse = kD * albedo / PI * LightColor * NdotL;
-        specular = spec * LightColor * NdotL;
+        diffuse = kD * albedo / PI * radiance * NdotL;
+        specular = spec * radiance * NdotL;
     }
 
     // --- Ambient: split-sum IBL when a baked environment exists, flat fill otherwise ---

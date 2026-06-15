@@ -92,6 +92,32 @@ public sealed class DX12HDRenderer : HDRenderer {
     Dx12DescriptorHeap iblSrvVisible;   // 3 contiguous SRVs copied per frame
     bool iblActiveThisFrame;
 
+    // Sun cascaded shadows.
+    const int CascadeCount = 4;
+    const int ShadowMapSize = 2048;
+    Dx12ShadowMap shadowMap;
+    ID3D12RootSignature shadowRootSig;     // ShadowConstants CBV (b0)
+    ID3D12PipelineState shadowPso;
+    ID3D12Resource shadowCb;               // per (cascade,submesh) LightMvp slots, upload heap
+    unsafe byte* shadowCbMapped;
+    int shadowCbSlotSize, shadowCbSlotCount;
+    readonly Matrix4x4[] cascadeMatrices = new Matrix4x4[CascadeCount];
+    readonly float[] cascadeDepthRanges = new float[CascadeCount];
+    bool shadowsThisFrame;
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct ShadowConstants { public Matrix4x4 LightMvp; }
+
+    // Per-frame constants (b1) shared by every opaque draw: the cascade matrices + shadow params.
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    unsafe struct FrameConstants {
+        public Matrix4x4 Cascade0, Cascade1, Cascade2, Cascade3;
+        public Vector4 CascadeBias;        // per-cascade depth-compare bias
+        public float CascadeCountF; public float ShadowsEnabled; public float ShadowMapTexel; public float CascadeBlend;
+    }
+    ID3D12Resource frameCb;
+    unsafe byte* frameCbMapped;
+
     public DX12HDRenderer(Dx12Device device) {
         dev = device;
     }
@@ -134,6 +160,48 @@ public sealed class DX12HDRenderer : HDRenderer {
         // 3 IBL SRVs (irradiance/prefilter/BRDF) copied contiguously per frame into a shader-visible heap.
         iblSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true);
+
+        BuildShadows();
+
+        int frameCbSize = (System.Runtime.InteropServices.Marshal.SizeOf<FrameConstants>() + 255) & ~255;
+        frameCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)frameCbSize), ResourceStates.GenericRead);
+        frameCbMapped = frameCb.Map<byte>(0);
+    }
+
+    unsafe void BuildShadows() {
+        shadowMap = new Dx12ShadowMap(dev, ShadowMapSize, CascadeCount);
+
+        // Depth-only PSO: ShadowConstants CBV (b0), POSITION-only input, depth bias to cut acne.
+        shadowRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.AllowInputAssemblerInputLayout, new[] {
+                new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Vertex) })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("ShadowDepth.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "ShadowDepth.hlsl");
+        var layout = new InputLayoutDescription(
+            new InputElementDescription("POSITION", 0, Format.R32G32B32_Float, 0, 0));
+        var raster = RasterizerDescription.CullClockwise;   // cull back faces (same winding as opaque)
+        raster.DepthBias = 2000;            // constant slope-scaled bias to fight shadow acne
+        raster.SlopeScaledDepthBias = 2.5f;
+        raster.DepthBiasClamp = 0f;
+        var psoDesc = new GraphicsPipelineStateDescription {
+            RootSignature = shadowRootSig, VertexShader = vs, PixelShader = default,   // depth-only, no PS
+            InputLayout = layout, PrimitiveTopologyType = PrimitiveTopologyType.Triangle,
+            SampleMask = uint.MaxValue, RasterizerState = raster, BlendState = BlendDescription.Opaque,
+            DepthStencilState = DepthStencilDescription.Default,
+            RenderTargetFormats = System.Array.Empty<Format>(),     // no color targets
+            DepthStencilFormat = Dx12ShadowMap.DepthFormat,
+            SampleDescription = new SampleDescription(1, 0),
+        };
+        shadowPso = dev.Device.CreateGraphicsPipelineState(psoDesc);
+
+        shadowCbSlotSize = (System.Runtime.InteropServices.Marshal.SizeOf<ShadowConstants>() + 255) & ~255;
+        // CascadeCount × submesh draws per frame.
+        shadowCbSlotCount = CascadeCount * 4096;
+        shadowCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)((long)shadowCbSlotSize * shadowCbSlotCount)), ResourceStates.GenericRead);
+        shadowCbMapped = shadowCb.Map<byte>(0);
     }
 
     unsafe void BuildProcSky() {
@@ -211,14 +279,17 @@ public sealed class DX12HDRenderer : HDRenderer {
     void BuildRootSignature() {
         // b0 = per-draw constants (root CBV);
         // table0 (param 1) = 6 material SRVs t0..t5 (per draw);
-        // table1 (param 2) = 3 IBL SRVs t6..t8 (irradiance cube / prefilter cube / BRDF LUT, per frame);
+        // table1 (param 2) = 4 SRVs t6..t9: irradiance cube / prefilter cube / BRDF LUT / shadow array (frame);
+        // b1 (param 3) = per-frame FrameConstants (cascade matrices + shadow params);
         // static samplers: s0 wrap (material), s1 clamp (IBL/sky).
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView,
             new RootDescriptor1(0, 0), ShaderVisibility.All);
         var matRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, MaterialSrvCount, baseShaderRegister: 0);
         var matTable = new RootParameter1(new RootDescriptorTable1(matRange), ShaderVisibility.Pixel);
-        var iblRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 3, baseShaderRegister: 6);
+        var iblRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 4, baseShaderRegister: 6);
         var iblTable = new RootParameter1(new RootDescriptorTable1(iblRange), ShaderVisibility.Pixel);
+        var frameCbv = new RootParameter1(RootParameterType.ConstantBufferView,
+            new RootDescriptor1(1, 0), ShaderVisibility.Pixel);
 
         var wrap = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap,
@@ -233,7 +304,7 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         var desc = new RootSignatureDescription1(
             RootSignatureFlags.AllowInputAssemblerInputLayout,
-            new[] { cbv, matTable, iblTable }, new[] { wrap, clamp });
+            new[] { cbv, matTable, iblTable, frameCbv }, new[] { wrap, clamp });
         rootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(desc));
     }
 
@@ -296,9 +367,11 @@ public sealed class DX12HDRenderer : HDRenderer {
         float exposure = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
             System.Globalization.CultureInfo.InvariantCulture, out float e) ? e : 1.0e-5f;
 
+        // Shadows first: render the sun cascades' depth (own upload command list) before opaque.
+        RenderShadows(view, proj, light);
+
         // IBL: bake the env→irradiance/prefilter/BRDF from the procedural sky (re-bakes only on param
-        // change). Runs its OWN upload command list before the render command list — must be outside
-        // RenderIntoCleared (which holds the render list). Only when a ProceduralSky is active.
+        // change). Own upload command list, before the render list. Only when a ProceduralSky is active.
         iblActiveThisFrame = false;
         if (ProceduralSky.Active is { } pSky) {
             Vector3 sunDir = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
@@ -307,19 +380,32 @@ public sealed class DX12HDRenderer : HDRenderer {
             iblActiveThisFrame = ibl.HasBaked;
         }
 
+        // Per-frame constants (b1): cascade matrices + shadow params.
+        var fc = new FrameConstants {
+            Cascade0 = Matrix4x4.Transpose(cascadeMatrices[0]),
+            Cascade1 = Matrix4x4.Transpose(cascadeMatrices[1]),
+            Cascade2 = Matrix4x4.Transpose(cascadeMatrices[2]),
+            Cascade3 = Matrix4x4.Transpose(cascadeMatrices[3]),
+            CascadeBias = new Vector4(0.0015f, 0.0020f, 0.0030f, 0.0050f),
+            CascadeCountF = CascadeCount, ShadowsEnabled = shadowsThisFrame ? 1f : 0f,
+            ShadowMapTexel = 1f / ShadowMapSize, CascadeBlend = 0.1f,
+        };
+        *(FrameConstants*)frameCbMapped = fc;
+
         int draws = 0;
         long tris = 0;
         srvVisible.Reset();
-        // Reserve the first 3 slots of the (single) shader-visible heap for the per-frame IBL table
-        // (t6..t8) — a command list binds only ONE CBV/SRV heap, so material + IBL share srvVisible.
-        int iblBase = -1;
-        if (iblActiveThisFrame) {
-            iblBase = srvVisible.AllocateRange(3);
-            var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-            dev.Device.CopyDescriptorsSimple(1, srvVisible.Cpu(iblBase + 0), ibl.IrradianceSrv, heapType);
-            dev.Device.CopyDescriptorsSimple(1, srvVisible.Cpu(iblBase + 1), ibl.PrefilterSrv, heapType);
-            dev.Device.CopyDescriptorsSimple(1, srvVisible.Cpu(iblBase + 2), ibl.BrdfSrv, heapType);
-        }
+        // The IBL/shadow table is ALWAYS 4 contiguous SRVs at t6..t9 (a command list binds one CBV/SRV
+        // heap, so material + this share srvVisible). Slots: irradiance, prefilter, BRDF, shadow array.
+        // When IBL is off, the cube/LUT slots get neutral fallbacks (UseIBL=0 makes the shader ignore them).
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        int iblBase = srvVisible.AllocateRange(4);
+        // The baker's cubes/LUT are always allocated (valid SRVs) even before the first bake; when IBL is
+        // off the shader ignores them via UseIBL=0. Shadow array is always real.
+        dev.Device.CopyDescriptorsSimple(1, srvVisible.Cpu(iblBase + 0), ibl.IrradianceSrv, heapType);
+        dev.Device.CopyDescriptorsSimple(1, srvVisible.Cpu(iblBase + 1), ibl.PrefilterSrv, heapType);
+        dev.Device.CopyDescriptorsSimple(1, srvVisible.Cpu(iblBase + 2), ibl.BrdfSrv, heapType);
+        dev.Device.CopyDescriptorsSimple(1, srvVisible.Cpu(iblBase + 3), shadowMap.SrvCpu, heapType);
         int slot = 0;
 
         var fallbackDiffuse = DefaultTextures.Neutral(TextureType.Diffuse) as Dx12Texture2D;
@@ -329,9 +415,9 @@ public sealed class DX12HDRenderer : HDRenderer {
             cl.SetPipelineState(pso);
             cl.SetDescriptorHeaps(srvVisible.Heap);
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            // Bind the IBL table (param 2) once per frame (same for every draw).
-            if (iblActiveThisFrame)
-                cl.SetGraphicsRootDescriptorTable(2, srvVisible.Gpu(iblBase));
+            // Bind the IBL/shadow table (param 2) + per-frame CBV (param 3) once — same for every draw.
+            cl.SetGraphicsRootDescriptorTable(2, srvVisible.Gpu(iblBase));
+            cl.SetGraphicsRootConstantBufferView(3, frameCb.GPUVirtualAddress);
 
             foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
                 if (r is null || !r.IsActive || !r.IsRenderable) continue;
@@ -456,6 +542,70 @@ public sealed class DX12HDRenderer : HDRenderer {
         cl.SetGraphicsRootDescriptorTable(1, skySrvVisible.Gpu(0));
         cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
         cl.DrawInstanced(36, 1, 0, 0);
+    }
+
+    // Render the sun cascades' depth (one depth-array layer per cascade) before the opaque pass. Uses the
+    // dedicated upload command list (separate from the render list), then leaves the array as an SRV the
+    // opaque shader samples. Re-renders every frame (cascade caching is a later optimization).
+    unsafe void RenderShadows(Matrix4x4 camView, Matrix4x4 camProj, LightUniforms light) {
+        shadowsThisFrame = false;
+        if (DirectionalLight.Instance is null) return;   // no sun → no shadows
+
+        Vector3 sunTravel = -ToNumerics(light.Direction);   // light.Direction is TOWARD the light
+        if (sunTravel.LengthSquared() < 1e-8f) return;
+        float shadowDistance = DirectionalLight.Instance.ShadowDistance;
+        Dx12ShadowMath.ComputeCascades(camView, camProj, sunTravel, shadowDistance, ShadowMapSize,
+            cascadeMatrices, cascadeDepthRanges);
+
+        // Fill per (cascade, submesh) LightMvp constants, mirroring the opaque iteration.
+        int slot = 0;
+        var fills = new System.Collections.Generic.List<(int cascade, Dx12Buffer<GLVector3> vb, Dx12IndexBuffer ib, int start, int count, int cbSlot)>();
+        for (int c = 0; c < CascadeCount; c++) {
+            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
+                if (r is null || !r.IsActive || !r.IsRenderable) continue;
+                Mesh mesh = r.SharedMesh; if (mesh is null) continue;
+                if (mesh.VertexBuffer is not Dx12Buffer<GLVector3> vb || vb.Resource is null) continue;
+                if (mesh.IndexBuffer is not Dx12IndexBuffer ib || ib.Resource is null) continue;
+                Matrix4x4 model = ToNumerics(r.Transform.WorldMatrix);
+                Matrix4x4 lightMvp = model * cascadeMatrices[c];
+                int only = r.SubMeshIndex;
+                int first = only >= 0 ? only : 0;
+                int last = only >= 0 ? only : mesh.SubMeshes.Length - 1;
+                for (int s = first; s <= last; s++) {
+                    if ((uint)s >= (uint)mesh.SubMeshes.Length) break;
+                    SubMeshData sub = mesh.SubMeshes[s];
+                    if (sub.IndexCount <= 0) continue;
+                    if (slot >= shadowCbSlotCount) break;
+                    *(ShadowConstants*)(shadowCbMapped + (long)slot * shadowCbSlotSize) =
+                        new ShadowConstants { LightMvp = Matrix4x4.Transpose(lightMvp) };
+                    fills.Add((c, vb, ib, sub.IndexStart, sub.IndexCount, slot));
+                    slot++;
+                }
+            }
+        }
+        if (fills.Count == 0) return;
+
+        dev.ExecuteUpload(cl => {
+            shadowMap.ToDepthWrite(cl);
+            cl.SetGraphicsRootSignature(shadowRootSig);
+            cl.SetPipelineState(shadowPso);
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            int cur = -1;
+            for (int c = 0; c < CascadeCount; c++) {
+                shadowMap.RenderCascade(cl, c, cc => {
+                    foreach (var f in fills) {
+                        if (f.cascade != c) continue;
+                        cc.SetGraphicsRootConstantBufferView(0,
+                            shadowCb.GPUVirtualAddress + (ulong)((long)f.cbSlot * shadowCbSlotSize));
+                        cc.IASetVertexBuffers(0, new VertexBufferView(f.vb.GpuAddress, (uint)f.vb.ByteSize, (uint)f.vb.Stride));
+                        cc.IASetIndexBuffer(new IndexBufferView(f.ib.GpuAddress, (uint)f.ib.ByteSize, Format.R32_UInt));
+                        cc.DrawIndexedInstanced((uint)f.count, 1, (uint)f.start, 0, 0);
+                    }
+                });
+            }
+            shadowMap.ToShaderResource(cl);
+        });
+        shadowsThisFrame = true;
     }
 
     // Draw the procedural atmosphere as the far-plane background (pure-ALU march by view direction).
