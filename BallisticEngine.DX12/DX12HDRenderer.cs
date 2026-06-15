@@ -36,7 +36,10 @@ public sealed class DX12HDRenderer : HDRenderer {
     unsafe byte* compositeCbMapped;
     Dx12DescriptorHeap compositeSrvVisible;  // HDR color + bloom + avg-lum, copied per frame
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct CompositeConstants { public float Exposure; public float BloomIntensity; public float AutoExposure; public float ExposureKey; }
+    struct CompositeConstants {
+        public float Exposure; public float BloomIntensity; public float AutoExposure; public float ExposureKey;
+        public float UseAo; public Vector3 Pad2;
+    }
 
     // Auto-exposure: a 1×1 R16F target holding the geometric-mean scene luminance (LumAverage.hlsl).
     ID3D12RootSignature lumRootSig;     // 1 HDR SRV (t0) + sampler
@@ -54,6 +57,19 @@ public sealed class DX12HDRenderer : HDRenderer {
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct BloomConstants { public float Threshold; public Vector2 TexelSize; public float Pad; }
     bool bloomThisFrame;
+
+    // SSAO: HBAO from depth → half-res AO target (+ separable blur), multiplied in the composite.
+    ID3D12RootSignature ssaoRootSig;    // SsaoConstants CBV (b0) + 1 SRV (t0: depth, then AO for blur) + sampler
+    ID3D12PipelineState ssaoPso, ssaoBlurHPso, ssaoBlurVPso;
+    Dx12OffscreenTarget ssaoA, ssaoB;   // half-res R8 ping-pong
+    ID3D12Resource ssaoCb;
+    unsafe byte* ssaoCbMapped;
+    Dx12DescriptorHeap ssaoSrvVisible;  // depth/AO source per sub-pass (3 slots)
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct SsaoConstants {
+        public Matrix4x4 Projection; public Matrix4x4 InvProjection;
+        public float Radius; public float Intensity; public Vector2 TexelSize;
+    }
 
     // Skybox pass (background): its own root sig (CBV b0 + cube SRV t0 + clamp sampler) + PSO (LEqual,
     // no depth write, cull none, SV_VertexID cube). Drawn after opaque in the same command list.
@@ -185,6 +201,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         ldr = new Dx12OffscreenTarget(dev, width, height);   // LDR composite output
         if (bloomRootSig != null) AllocBloomTargets();       // half-res bloom ping-pong follows size
+        if (ssaoRootSig != null) AllocSsaoTargets();
     }
 
     public override unsafe void Initialize() {
@@ -227,9 +244,9 @@ public sealed class DX12HDRenderer : HDRenderer {
     }
 
     unsafe void BuildComposite() {
-        // CompositeConstants CBV (b0) + 3-SRV table (HDR t0, bloom t1, avg-lum t2) + clamp sampler s0.
+        // CompositeConstants CBV (b0) + 4-SRV table (HDR t0, bloom t1, avg-lum t2, AO t3) + clamp sampler s0.
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 3, baseShaderRegister: 0);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 4, baseShaderRegister: 0);
         var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
         var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
@@ -256,9 +273,54 @@ public sealed class DX12HDRenderer : HDRenderer {
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         compositeCbMapped = compositeCb.Map<byte>(0);
         compositeSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4, shaderVisible: true);
 
         BuildLumAverage();
+        BuildSsao();
+    }
+
+    unsafe void BuildSsao() {
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
+        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
+        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipPoint, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        ssaoRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("Ssao.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "Ssao.hlsl");
+        ID3D12PipelineState MakePso(string entry) => dev.Device.CreateGraphicsPipelineState(
+            new GraphicsPipelineStateDescription {
+                RootSignature = ssaoRootSig, VertexShader = vs,
+                PixelShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, entry, "Ssao.hlsl"),
+                InputLayout = null, PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+                RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
+                DepthStencilState = DepthStencilDescription.None,
+                RenderTargetFormats = new[] { Format.R8_UNorm }, DepthStencilFormat = Format.Unknown,
+                SampleDescription = new SampleDescription(1, 0),
+            });
+        ssaoPso = MakePso("PSMain");
+        ssaoBlurHPso = MakePso("PSBlurH");
+        ssaoBlurVPso = MakePso("PSBlurV");
+
+        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<SsaoConstants>() + 255) & ~255;
+        ssaoCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+        ssaoCbMapped = ssaoCb.Map<byte>(0);
+        ssaoSrvVisible = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true);
+        AllocSsaoTargets();
+    }
+
+    void AllocSsaoTargets() {
+        ssaoA?.Dispose(); ssaoB?.Dispose();
+        int w = System.Math.Max(1, targetW / 2), h = System.Math.Max(1, targetH / 2);
+        ssaoA = new Dx12OffscreenTarget(dev, w, h, withDepth: false, colorFormat: Format.R8_UNorm, colorReadable: true);
+        ssaoB = new Dx12OffscreenTarget(dev, w, h, withDepth: false, colorFormat: Format.R8_UNorm, colorReadable: true);
     }
 
     unsafe void BuildLumAverage() {
@@ -725,12 +787,54 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (fogOn)
             DrawFog(view, viewProj, camPos, light);
 
+        // --- SSAO (HBAO from depth → half-res AO, multiplied in the composite) ---
+        bool ssaoOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SSAO") != "0";
+        if (ssaoOn) DrawSsao(proj);
+
         // --- Final composite: HDR scene → exposure → ACES → sRGB → LDR ---
-        DrawComposite();
+        DrawComposite(ssaoOn);
 
         RenderStats.Scene.DrawCalls = draws;
         RenderStats.Scene.Triangles = tris;
         return new RenderMetrics(draws, 0, (int)tris, 0, 0f);
+    }
+
+    // HBAO from scene depth → blurred half-res AO in ssaoA. Depth must be SRV (DrawSsao transitions it).
+    unsafe void DrawSsao(Matrix4x4 proj) {
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        Matrix4x4.Invert(proj, out Matrix4x4 invProj);
+        target.DepthToShaderResource();
+        *(SsaoConstants*)ssaoCbMapped = new SsaoConstants {
+            Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProj),
+            Radius = 0.5f, Intensity = 1.0f, TexelSize = new Vector2(1f / ssaoA.Width, 1f / ssaoA.Height),
+        };
+        // Main AO pass: depth → ssaoA.
+        dev.Device.CopyDescriptorsSimple(1, ssaoSrvVisible.Cpu(0), target.DepthSrvCpu, heapType);
+        ssaoA.RenderColorOnly(cl => {
+            cl.SetGraphicsRootSignature(ssaoRootSig); cl.SetPipelineState(ssaoPso);
+            cl.SetDescriptorHeaps(ssaoSrvVisible.Heap);
+            cl.SetGraphicsRootConstantBufferView(0, ssaoCb.GPUVirtualAddress);
+            cl.SetGraphicsRootDescriptorTable(1, ssaoSrvVisible.Gpu(0));
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
+        // Blur H (ssaoA→ssaoB), Blur V (ssaoB→ssaoA).
+        void Blur(ID3D12PipelineState pso, Dx12OffscreenTarget src, Dx12OffscreenTarget dst, int srvSlot) {
+            src.ColorToShaderResource();
+            dev.Device.CopyDescriptorsSimple(1, ssaoSrvVisible.Cpu(srvSlot), src.ColorSrvCpu, heapType);
+            dst.RenderColorOnly(cl => {
+                cl.SetGraphicsRootSignature(ssaoRootSig); cl.SetPipelineState(pso);
+                cl.SetDescriptorHeaps(ssaoSrvVisible.Heap);
+                cl.SetGraphicsRootConstantBufferView(0, ssaoCb.GPUVirtualAddress);
+                cl.SetGraphicsRootDescriptorTable(1, ssaoSrvVisible.Gpu(srvSlot));
+                cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+                cl.DrawInstanced(3, 1, 0, 0);
+            });
+        }
+        Blur(ssaoBlurHPso, ssaoA, ssaoB, 1);
+        Blur(ssaoBlurVPso, ssaoB, ssaoA, 2);
+        ssaoA.ColorToShaderResource();
+        target.DepthToWrite();
     }
 
     // Bloom: bright-pass the HDR (target, already in SRV state) → bloomA; blur H (bloomA→bloomB);
@@ -764,7 +868,7 @@ public sealed class DX12HDRenderer : HDRenderer {
 
     // Tonemap the HDR scene target into the LDR output. Auto-exposure drives the exposure; bloom (if on)
     // is added in. The bloom pass runs first (inside this), reading the HDR scene.
-    unsafe void DrawComposite() {
+    unsafe void DrawComposite(bool ssaoOn) {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
 
         // Manual exposure override (BALLISTIC_DX12_EXPOSURE) disables auto-exposure; else auto-meter.
@@ -797,6 +901,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             BloomIntensity = bloomOn ? 0.6f : 0f,
             AutoExposure = manual ? 0f : 1f,
             ExposureKey = 0.18f,
+            UseAo = ssaoOn ? 1f : 0f,
         };
 
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(0), target.ColorSrvCpu, heapType);
@@ -804,6 +909,8 @@ public sealed class DX12HDRenderer : HDRenderer {
             bloomOn ? bloomA.ColorSrvCpu : target.ColorSrvCpu, heapType);   // bloom slot
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(2),
             manual ? target.ColorSrvCpu : lumTarget.ColorSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(3),
+            ssaoOn ? ssaoA.ColorSrvCpu : target.ColorSrvCpu, heapType);     // AO slot
 
         ldr.RenderColorOnly(cl => {
             cl.SetGraphicsRootSignature(compositeRootSig);

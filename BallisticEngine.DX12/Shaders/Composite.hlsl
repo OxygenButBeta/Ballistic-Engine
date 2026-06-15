@@ -8,11 +8,14 @@ cbuffer CompositeConstants : register(b0) {
     float BloomIntensity; // 0 = no bloom
     float AutoExposure;   // > 0.5 = derive exposure from the avg-luminance metering target
     float ExposureKey;    // middle-grey key for auto-exposure (~0.18 * tuning)
+    float UseAo;          // > 0.5 = multiply by the SSAO texture
+    float3 _pad2;
 };
 
 Texture2D HdrColor : register(t0);
 Texture2D BloomTex : register(t1);
 Texture2D AvgLum   : register(t2);   // 1×1 geometric-mean scene luminance (auto-exposure metering)
+Texture2D AoTex    : register(t3);   // screen-space AO (1 = unoccluded); UseAo gates it
 SamplerState LinearClamp : register(s0);
 
 struct VSOut { float4 Position : SV_Position; float2 Uv : TEXCOORD0; };
@@ -31,6 +34,10 @@ float3 ACESFilm(float3 x) {
 
 float4 PSMain(VSOut i) : SV_Target {
     float3 hdr = HdrColor.SampleLevel(LinearClamp, i.Uv, 0).rgb;
+    if (UseAo > 0.5) {
+        float ao = AoTex.SampleLevel(LinearClamp, i.Uv, 0).r;
+        hdr *= ao;   // forward-path approximation: dim the lit color by AO (before bloom adds glow)
+    }
     if (BloomIntensity > 0.0)
         hdr += BloomTex.SampleLevel(LinearClamp, i.Uv, 0).rgb * BloomIntensity;
 
