@@ -2831,6 +2831,36 @@ public sealed class DX12HDRenderer : HDRenderer {
 
     // Readback comes from the LDR composite (R8) — the HDR scene target isn't a valid BMP source.
     public void SaveFrame(string path) => ldr?.SaveBmp(path);
+
+    // Raw G-buffer dump for the agent's "raw perception" (`bal gbuffer`): writes depth (linear-ish window
+    // depth, R32F), world normal (RGBA16F, packed N*0.5+0.5), and albedo (RGBA8 sRGB) as raw little-endian
+    // .bin files + a manifest.json describing dims/format/encoding so the agent can decode them. Reads the
+    // G-buffer AFTER a frame (resources are in ShaderRead state). Returns the manifest object (for the CLI).
+    public object DumpGBuffer(string dir) {
+        if (gbuffer == null) return new { ok = false, error = "no g-buffer (renderer not initialized)" };
+        System.IO.Directory.CreateDirectory(dir);
+        int w = gbuffer.Width, h = gbuffer.Height;
+
+        byte[] depth  = gbuffer.ReadbackRaw(-1, out int depthBpp);                 // R32_Float, 4 B/px
+        byte[] normal = gbuffer.ReadbackRaw(1, out int normalBpp);                 // RGBA16F, 8 B/px (packed)
+        byte[] albedo = gbuffer.ReadbackRaw(0, out int albedoBpp);                 // RGBA8 sRGB, 4 B/px
+
+        System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "depth.bin"), depth);
+        System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "normal.bin"), normal);
+        System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "albedo.bin"), albedo);
+
+        return new {
+            ok = true, width = w, height = h,
+            buffers = new object[] {
+                new { name = "depth",  file = "depth.bin",  format = "R32_Float", bytesPerPixel = depthBpp,
+                      encoding = "window depth [0,1]; world pos = unproject(uv, depth) via InvViewProj" },
+                new { name = "normal", file = "normal.bin", format = "R16G16B16A16_Float", bytesPerPixel = normalBpp,
+                      encoding = "world normal PACKED as N*0.5+0.5 in RGB (half floats); unpack N = rgb*2-1" },
+                new { name = "albedo", file = "albedo.bin", format = "R8G8B8A8_UNorm_sRGB", bytesPerPixel = albedoBpp,
+                      encoding = "albedo.rgb sRGB; a = specular F0" },
+            },
+        };
+    }
     // Output (display/readback) resolution — equals the internal render res unless FSR is upscaling.
     public int Width => outputW;
     public int Height => outputH;

@@ -21,6 +21,8 @@ internal static class Program {
         new SimulateCommand(),
         new ImgDiffCommand(),
         new RenderCommand(),
+        new QueryCommand(),
+        new GBufferCommand(),
         new AgentsCommand(),
     }.ToDictionary(c => c.Name, StringComparer.Ordinal);
 

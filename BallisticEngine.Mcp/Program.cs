@@ -62,6 +62,12 @@ internal static class Program {
         string tool = p.GetProperty("name").GetString() ?? "";
         JsonElement args = p.TryGetProperty("arguments", out JsonElement a) ? a : default;
 
+        // CLI-backed tools (scene_query / scene_gbuffer): run the `bal` CLI headlessly (no editor needed) —
+        // GpuSceneQuery + raw G-buffer. The editor's LIVE query surface is deferred (it touches the GPU
+        // surface that hung before), so these shell out to the proven device-free CLI subprocess path.
+        if (tool is "scene_query" or "scene_gbuffer")
+            return RunCliTool(id, tool, args);
+
         string method;
         object? pipeParams;
         try { (method, pipeParams) = MapTool(tool, args); }
@@ -83,6 +89,68 @@ internal static class Program {
 
     static object ToolText(string text, bool isError) =>
         new { content = new[] { new { type = "text", text } }, isError };
+
+    // ---- CLI-backed tools (scene_query / scene_gbuffer) -> `bal` subprocess ---------
+
+    static object RunCliTool(JsonElement id, string tool, JsonElement a) {
+        try {
+            string scene = Str(a, "scene");
+            var args = new List<string>();
+            if (tool == "scene_query") {
+                args.Add("query");
+                args.Add(Str(a, "op"));
+                args.Add(scene);
+                string? points = OptStr(a, "points");
+                string? pairs = OptStr(a, "pairs");
+                if (points is not null) { args.Add("--points"); args.Add(points); }
+                if (pairs is not null) { args.Add("--pairs"); args.Add(pairs); }
+            } else { // scene_gbuffer
+                args.Add("gbuffer");
+                args.Add(scene);
+                string? outDir = OptStr(a, "out");
+                if (outDir is not null) { args.Add("--out"); args.Add(outDir); }
+            }
+            (int code, string stdout, string stderr) = RunCli(args);
+            return Result(id, ToolText(stdout.Length > 0 ? stdout
+                : (code == 0 ? "(ok, no output)" : $"bal exited {code}: {stderr}"), isError: code != 0));
+        } catch (Exception ex) {
+            return Result(id, ToolText(ex.Message, isError: true));
+        }
+    }
+
+    static (int, string, string) RunCli(List<string> args) {
+        string bal = FindBalExe();
+        var psi = new System.Diagnostics.ProcessStartInfo {
+            FileName = bal, UseShellExecute = false,
+            RedirectStandardOutput = true, RedirectStandardError = true,
+        };
+        foreach (string s in args) psi.ArgumentList.Add(s);
+        using var proc = System.Diagnostics.Process.Start(psi)!;
+        string stdout = proc.StandardOutput.ReadToEnd();
+        string stderr = proc.StandardError.ReadToEnd();
+        if (!proc.WaitForExit(300_000)) { try { proc.Kill(true); } catch { } throw new Exception("bal timed out"); }
+        return (proc.ExitCode, stdout, stderr);
+    }
+
+    // bal.exe sits next to this MCP server's build output, or in the engine repo build tree.
+    static string FindBalExe() {
+        string local = Path.Combine(AppContext.BaseDirectory, "bal.exe");
+        if (File.Exists(local)) return local;
+        string? engineRoot = Environment.GetEnvironmentVariable("BALLISTIC_ENGINE_ROOT");
+        if (engineRoot is null) {
+            DirectoryInfo? dir = new(AppContext.BaseDirectory);
+            for (int i = 0; dir is not null && i < 8; i++, dir = dir.Parent)
+                if (File.Exists(Path.Combine(dir.FullName, "BallisticEngine.slnx"))) { engineRoot = dir.FullName; break; }
+        }
+        if (engineRoot is not null) {
+            string config = AppContext.BaseDirectory.Contains($"{Path.DirectorySeparatorChar}Release{Path.DirectorySeparatorChar}") ? "Release" : "Debug";
+            foreach (string c in new[] { config, config == "Debug" ? "Release" : "Debug" }) {
+                string exe = Path.Combine(engineRoot, "BallisticEngine.Cli", "bin", c, "net9.0", "bal.exe");
+                if (File.Exists(exe)) return exe;
+            }
+        }
+        throw new Exception("bal.exe not found (build BallisticEngine.Cli or set BALLISTIC_ENGINE_ROOT)");
+    }
 
     // Tool name + MCP arguments -> command-port method + params (mostly pass-through).
     static (string method, object? p) MapTool(string tool, JsonElement a) => tool switch {
@@ -237,5 +305,13 @@ internal static class Program {
             ("type", "string", "Scene component type, e.g. ProceduralSky", true),
             ("member", "string", "Member name, e.g. exposure", true),
             ("value", "string", "New value (number, 'x,y,z' vector, enum name)", true)) },
+        new { name = "scene_query", description = "Spatial perception over a scene's geometry (headless ray queries over the DXR TLAS — the agent's 'eyes'). op=occupancy (is each point inside solid?), classify (open/enclosed/solid), nudge (move occupied points to free space), rooms (visibility-cluster labels), visibility (clear line of sight per A>B pair). Takes a scene FILE path; runs headlessly (no editor needed). Returns JSON.", inputSchema = Schema(
+            ("op", "string", "occupancy | classify | nudge | rooms | visibility", true),
+            ("scene", "string", "Scene file path, e.g. Assets/Scenes/Level1.scene", true),
+            ("points", "string", "Semicolon-separated world points 'x,y,z; x,y,z' (occupancy/classify/nudge/rooms)", false),
+            ("pairs", "string", "Semicolon-separated A>B pairs 'ax,ay,az>bx,by,bz; ...' (visibility)", false)) },
+        new { name = "scene_gbuffer", description = "Dump the raw G-buffer (depth/world-normal/albedo) of a scene so the agent can read geometry directly, not just the tonemapped pixel. Renders one deterministic frame headlessly; writes depth.bin/normal.bin/albedo.bin + manifest.json (dims/format/decode notes). Returns the file paths.", inputSchema = Schema(
+            ("scene", "string", "Scene file path, e.g. Assets/Scenes/Level1.scene", true),
+            ("out", "string", "Output directory (default: <project>/Library/GBuffer)", false)) },
     ];
 }

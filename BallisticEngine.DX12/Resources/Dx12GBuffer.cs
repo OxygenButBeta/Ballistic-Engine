@@ -153,6 +153,52 @@ public sealed class Dx12GBuffer : IDisposable {
     // Compute-readable (for the Hi-Z pyramid build, which reads the previous frame's depth in a CS).
     public void DepthToNonPixelShaderResource() => dev.ExecuteSync(cl => DepthTransition(cl, ResourceStates.NonPixelShaderResource));
 
+    // Raw G-buffer readback for the agent's "raw perception" (`bal gbuffer`). Copies a G-buffer subresource
+    // to a CPU byte array (tightly packed, row-pitch padding removed). Transitions the resource to CopySource
+    // and back to its prior state, so it's safe to call after a frame (resources are in ShaderRead state).
+    // `which`: -1 = depth (R32_Float, 4 B/px), 0..RtCount-1 = a color MRT (its ColorFormats[which]).
+    public unsafe byte[] ReadbackRaw(int which, out int bytesPerPixel) {
+        ID3D12Resource res = which < 0 ? depth : colors[which];
+        ResourceDescription resDesc = res.Description;
+        var fps = new PlacedSubresourceFootPrint[1]; var rc = new uint[1]; var rs = new ulong[1];
+        dev.Device.GetCopyableFootprints(resDesc, 0, 1, 0, fps, rc, rs, out ulong totalBytes);
+        int rowPitch = (int)fps[0].Footprint.RowPitch;
+        int rowBytes = (int)rs[0];
+        bytesPerPixel = rowBytes / Width;
+
+        using ID3D12Resource readback = dev.Device.CreateCommittedResource(
+            HeapProperties.ReadbackHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
+
+        // Depth's SRV format is R32_Float but the resource is typeless — the copy uses the resource as-is.
+        ResourceStates prior = which < 0 ? depthState : colorState[which];
+        dev.ExecuteSync(cl => {
+            Transition(cl, res, ref prior, ResourceStates.CopySource, which);
+            cl.CopyTextureRegion(new TextureCopyLocation(readback, fps[0]), 0, 0, 0,
+                new TextureCopyLocation(res, 0), null);
+        });
+        // Restore the resource's tracked state (prior was mutated by Transition; put it back).
+        ResourceStates restoreTo = which < 0 ? ResourceStates.NonPixelShaderResource
+                                             : (ResourceStates.PixelShaderResource | ResourceStates.NonPixelShaderResource);
+        dev.ExecuteSync(cl => Transition(cl, res, ref prior, restoreTo, which));
+
+        var dst = new byte[(long)Width * Height * bytesPerPixel];
+        byte* mapped = readback.Map<byte>(0);
+        try {
+            for (int y = 0; y < Height; y++)
+                System.Runtime.InteropServices.Marshal.Copy(
+                    (IntPtr)(mapped + (long)y * rowPitch), dst, y * Width * bytesPerPixel, Width * bytesPerPixel);
+        } finally { readback.Unmap(0); }
+        return dst;
+    }
+
+    void Transition(ID3D12GraphicsCommandList4 cl, ID3D12Resource res, ref ResourceStates cur, ResourceStates target, int which) {
+        if (cur == target) return;
+        cl.ResourceBarrierTransition(res, cur, target);
+        cur = target;
+        if (which < 0) depthState = target; else colorState[which] = target;
+    }
+
     void ColorTransition(ID3D12GraphicsCommandList4 cl, int i, ResourceStates target) {
         if (colorState[i] == target) return;
         cl.ResourceBarrierTransition(colors[i], colorState[i], target);

@@ -41,16 +41,25 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
         const double dt = 1.0 / 60.0;   // fixed step — deterministic frames for verification
 
         // Run until the screenshot frame, render it, save, exit. With no screenshot requested, run a few
-        // frames then stop (nothing to present without a swapchain).
-        int lastFrame = ScreenshotPath is not null ? ScreenshotFrame : 5;
+        // frames then stop (nothing to present without a swapchain). Query mode also needs a frame or two so
+        // the AS-feeding RuntimeSet<IStaticMeshRenderer> is populated before the query runs.
+        bool queryMode = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("BALLISTIC_QUERY"));
+        int lastFrame = ScreenshotPath is not null ? ScreenshotFrame : (queryMode ? 3 : 5);
         for (int frame = 1; frame <= lastFrame; frame++) {
             WindowUpdateCallback?.Invoke(dt);
             WindowRenderCallback?.Invoke(dt);
 
             if (ScreenshotPath is not null && frame == ScreenshotFrame) {
                 SaveScreenshot();
-                if (ScreenshotExit) return;
+                if (ScreenshotExit && !queryMode) return;
             }
+        }
+
+        // Scene-query mode for `bal query` (BALLISTIC_QUERY=<spec.json> -> BALLISTIC_QUERY_OUT): run the query
+        // against the live scene TLAS and write the result JSON, then exit. Same subprocess pattern as render.
+        if (queryMode && RenderAsset.Current.Renderer is DX12HDRenderer qr) {
+            DX12.Dx12QueryMode.Run(qr);
+            return;
         }
 
         // GpuSceneQuery real-scene smoke probe (BALLISTIC_DX12_SCENEQUERY_SMOKE="x,y,z;x,y,z;..."): after the
@@ -97,10 +106,22 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
             r.SaveFrame(ScreenshotPath);
             Console.WriteLine($"[Screenshot] saved {r.Width}x{r.Height} to {ScreenshotPath} (DX12)");
             PrintPerfStats();
+            GBufferDump(r);
         }
         else {
             Console.Error.WriteLine("[Screenshot] DX12 renderer not active; nothing saved.");
         }
+    }
+
+    // Raw G-buffer dump for `bal gbuffer` (BALLISTIC_GBUFFER_DUMP=<dir>): after the frame, write depth/normal/
+    // albedo as raw .bin + a manifest.json the agent decodes. Runs in the screenshot path (a frame is rendered).
+    static void GBufferDump(DX12HDRenderer r) {
+        string dir = Environment.GetEnvironmentVariable("BALLISTIC_GBUFFER_DUMP");
+        if (string.IsNullOrWhiteSpace(dir)) return;
+        object manifest = r.DumpGBuffer(dir);
+        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "manifest.json"),
+            System.Text.Json.JsonSerializer.Serialize(manifest));
+        Console.WriteLine($"[GBuffer] dumped depth/normal/albedo to {dir} (DX12)");
     }
 
     static void PrintPerfStats() {
