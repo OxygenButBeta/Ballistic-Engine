@@ -42,8 +42,9 @@ public abstract class HDRenderer {
     public static Func<DebugFrame, bool> EditorDebugComposite;
 
     // The editor sets this to a non-zero extra-mode index when its dropdown picks an AO/Lit/etc. view;
-    // 0 means "use the built-in DebugViewMode path". Lives here (not the editor) only so GLHDRenderer
-    // can read it without an editor reference; it's never set in the player.
+    // 0 means "use the built-in DebugViewMode path". Lives here (not the editor) only so the renderer
+    // can read it without an editor reference; it's never set in the player. (DX12 extra-view compositing
+    // is not yet ported — see EditorDebugViews; the built-in DebugViewMode path works.)
     public static int EditorExtraDebugMode;
 
     // GI per-system ISOLATE for editor A/B debugging: 0 = normal (all systems per their overrides),
