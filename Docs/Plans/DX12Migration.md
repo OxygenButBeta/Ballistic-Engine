@@ -195,16 +195,59 @@ sky depth-test reorder works on the open exterior. Refs dx12_suntemple_deferred.
 **DX12 stack now: clustered-deferred geometry+lighting + sky + IBL + shadows + fog + HDR + auto-exposure +
 bloom + SSAO, on 2 scenes. Still SUN-ONLY (no punctual lights yet) — that's the next step (clustering).**
 
-**NEXT (full-auto /loop; finish CLUSTERED DEFERRED, then port ALL GL features):**
+## 🗺️ FULL ROADMAP (autonomous /loop, 2026-06-15 — rewritten per the user's standing directives)
+
+Governing rules (see the memory [[dx12-standing-directives-2026-06-15]]): EVERY feature is a Volume-
+framework override (no hardcoded tunable consts — RT ray length / GI mode / denoiser strength all live in
+volume params; RT exposed via UI: Shadow→checkbox, GI→enum dropdown, Reflection→SSR/RT dropdown). OIDN for
+ALL denoise. FSR4 upscaling (fall back FSR3.1). Performance is mandatory — port the GL perf wins (GPU-driven
+ExecuteIndirect, GPU compute cull, Hi-Z, cascade caching, instancing). Delete GL + OpenTK.Mathematics +
+OpenAL LAST (editor→DX12 first; math migration incremental, each step builds+commits). Build + KEEP test
+doors (MCP/editor/runtime hooks). Native deps already vendored under native/ (OIDN 2.5.0, FFX SDK 2.2.0).
+
+**A. Clustered deferred (finish the opaque architecture):**
 1. ~~G-buffer geometry pass~~ DONE.
 2. ~~Deferred lighting pass (sun+IBL+shadows)~~ DONE.
 3. ~~SSAO reads G-buffer normal~~ DONE.
-4. **CLUSTERED PUNCTUAL LIGHTS (point/spot, froxel cull) in the deferred pass — DX12 has NONE yet (sun
-   only).** Lights come from RuntimeSet<PointLight>/<SpotLight>; check the GL GLClusteredLights port for
-   the froxel grid + per-cluster light-index list. Add a punctual-light loop to DeferredLighting.hlsl
-   (same Cook-Torrance BRDF, point/spot attenuation), fed by a light SSBO/CBV + cluster index buffer.
-5. SSR (reads G-buffer); TAA; SSGI (LAST); transparents forward pass; sky clouds/stars; perf.
-6. Finally editor→DX12 + delete GL wholesale. DON'T break the editor — it renders on GL; delete GL last.
+4. **CLUSTERED PUNCTUAL LIGHTS (point/spot, froxel cull) — IN PROGRESS.** 16×9×24 log-Z froxels (GL
+   parity), GpuLight 64B struct, per-cluster {offset,count} grid + flat index list, point/spot Cook-Torrance
+   + attenuation + cone in DeferredLighting.hlsl. CPU cull first (faithful — same shader contract), GPU
+   compute cull is a later perf step. Lights from RuntimeSet<PointLight>/<SpotLight>. Punctual SHADOWS later.
+
+**B. Screen-space post (the remaining GL post-FX, ported to DX12 — all Volume overrides):**
+5. SSR (screen-space reflections, reads G-buffer; half-res march + depth-aware upsample, GL parity).
+6. TAA (the AA; reuses jitter that FSR will also consume — plumb jitter ONCE, not double-applied).
+7. Sky clouds / cirrus / stars (finish the procedural sky to GL parity).
+8. Transparents forward pass (after deferred — deferred can't blend).
+
+**C. Performance (mandatory — port the GL GPU-driven stack to DX12):**
+9. GPU-driven path: ExecuteIndirect (= glMultiDrawElementsIndirectCount) + GPU compute frustum cull +
+   bindless (SM6.6 ResourceDescriptorHeap). Convert the geometry pass + shadow cascades.
+10. Hi-Z occlusion culling (max-depth pyramid from prev-frame depth), cascade caching, instancing sort.
+11. Convert the CPU froxel light cull (step 4) to a GPU compute cull.
+
+**D. Upscaling (PAYOFF 1):**
+12. FSR4 upscaling via the FFX host API (native/fsr) — internal-res HDR + depth + motion vectors + jitter →
+    upscaled output. P/Invoke the FFX loader/dispatch. Volume override (quality/perf/ultra-perf modes).
+
+**E. SSGI (LAST screen-space GI, per directive — after all the above):**
+13. SSGI (horizon-bitmask gather, GL parity) — the last screen-space technique. Volume override.
+
+**F. DXR ray tracing (PAYOFF 2 — after SSGI):**
+14. Acceleration structures (BLAS/TLAS), RT PSO, shader binding table, DispatchRays.
+15. RT Shadows — Shadow volume override CHECKBOX toggles RT vs cascaded-CSM.
+16. RT Reflections — Reflection volume override dropdown (SSR vs RT). Denoise via OIDN.
+17. RT GI — GI volume override enum dropdown (Off / SSGI / RT-GI). Denoise via OIDN.
+18. OIDN integration (native/oidn) — the shared denoiser for all RT signals. P/Invoke; HIP(AMD)+CPU.
+
+**G. Editor + teardown (LAST — irreversible, do only when DX12 is at parity):**
+19. Editor ImGui → DX12 (vertex/index stream + font texture + scissor; the 2 preview renderers;
+    ThumbnailCache; EditorDebugViews). Runtime produces DX12 scene textures for ImGui::Image.
+20. DELETE OpenGL/ wholesale. Then migrate OpenTK.Mathematics → System.Numerics engine-wide (incremental,
+    starting with Transform; each step builds+commits). Then replace OpenAL audio with a new backend.
+    End state: zero OpenTK / zero OpenGL references (grep-verifiable).
+
+The frozen GL parity image: `Docs/Plans/dx12-refs/gl_suntemple_baseline.png` (mean RGB 96.7,81.9,65.6).
 
 The frozen GL parity image: `Docs/Plans/dx12-refs/gl_suntemple_baseline.png` (mean RGB 96.7,81.9,65.6).
 
