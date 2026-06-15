@@ -1,4 +1,3 @@
-using OpenTK.Graphics.OpenGL4; // enum types only (BufferTarget/BufferUsageHint) — no GL calls here
 using OpenTK.Mathematics;
 using OpenTK.Windowing.GraphicsLibraryFramework;
 

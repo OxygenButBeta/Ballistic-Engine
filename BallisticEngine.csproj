@@ -35,10 +35,6 @@
       <PackageReference Include="ZeroAllocJobScheduler" Version="1.1.2" />
     </ItemGroup>
 
-    <ItemGroup>
-      <EmbeddedResource Include="OpenGL\Shader\Embedded\*.glsl" />
-    </ItemGroup>
-
     <!-- Native OpenAL runtime (OpenAL-Soft). OpenTK ships only the MANAGED bindings, which
          DllImport "OpenAL32.dll" — Windows has no system OpenAL, so without this the audio
          backend gracefully disables itself and every sound is silent. Shipping the DLL next to
