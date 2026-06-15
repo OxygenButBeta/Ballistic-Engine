@@ -214,6 +214,7 @@ public sealed class DX12HDRenderer : HDRenderer {
     Dx12RtGeometry rtGeometry;                  // P1: per-instance index/normal/uv/tri-material SRVs (bindless)
     Dx12Ddgi ddgi;                              // P2: DDGI world-probe radiance cache (BALLISTIC_DX12_DDGI=1)
     bool ddgiLogged;
+    bool ddgiDebugDumped;                        // BALLISTIC_DX12_DDGI_DEBUG=1: one-shot atlas readback stats
     bool? ddgiOn;
     bool DdgiEnabled => ddgiOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI") == "1";
     bool rtGiBuilt;
@@ -2469,6 +2470,11 @@ public sealed class DX12HDRenderer : HDRenderer {
     // frame. The table root param points at this base; bindless reads index the same heap by their slot.
     const int RtGiTableBase = 16384 - 8;
 
+    // DDGI trace pass (P2.1) reserves its OWN 2-slot tail below RtGi's: [0] = TLAS SRV (t0), [1] = irradiance
+    // cube SRV (t3), so the trace root table's two ranges map to adjacent bindless-tail descriptors. Below
+    // RtGiTableBase (16376) so the two reservations never collide; materials bump from 0 and never reach here.
+    const int DdgiTableBase = 16384 - 12;   // slots 16372, 16373
+
     // RT global illumination: trace a cosine-hemisphere ray per pixel → raw one-bounce GI in ssgiTarget,
     // then the SHARED SSGI resolve (temporal + OIDN + combine). viewProj is the JITTERED matrix (matches the
     // depth); proj drives the SSGI dials/combine. lightDir/lightColor = the sun (raw HDR) for the world-space
@@ -2477,12 +2483,13 @@ public sealed class DX12HDRenderer : HDRenderer {
         sceneAS.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection);
         if (!sceneAS.Valid) { DrawSsgi(view, proj); return; }   // no geometry → fall back to SSGI
 
-        // --- P2.0: DDGI world-probe radiance cache (BALLISTIC_DX12_DDGI=1). Allocate the probe atlases +
-        // snap the camera-centered grid. Update/blend/gather compute passes land in P2.1+; for now this is
-        // inert (no image change) — verifying the grid + atlas foundation. ---
+        // --- DDGI world-probe radiance cache (BALLISTIC_DX12_DDGI=1). P2.0 allocates the probe atlases + snaps
+        // the camera-centered grid; P2.1 (below, after the bindless table is written) runs the trace+blend
+        // probe-update passes. The atlases are written but not yet read (the gather lands in P2.2), so this is
+        // still image-inert — verifying the update pipeline (non-zero, smooth probe tiles + no device-removal). ---
         if (DdgiEnabled) {
             if (ddgi == null) ddgi = new Dx12Ddgi(dev);
-            ddgi.EnsureAllocated();
+            ddgi.Build();
             ddgi.Update(camPos);
             if (!ddgiLogged) {
                 ddgiLogged = true;
@@ -2490,7 +2497,7 @@ public sealed class DX12HDRenderer : HDRenderer {
                 Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
                     $"[DDGI] grid {Dx12Ddgi.ProbesX}x{Dx12Ddgi.ProbesY}x{Dx12Ddgi.ProbesZ}={Dx12Ddgi.ProbeCount} probes; " +
                     $"origin=({o.X:0.#},{o.Y:0.#},{o.Z:0.#}) spacing={ddgi.Spacing.X:0.#}m covers ~{ddgi.Spacing.X*(Dx12Ddgi.ProbesX-1):0}x{ddgi.Spacing.Y*(Dx12Ddgi.ProbesY-1):0}x{ddgi.Spacing.Z*(Dx12Ddgi.ProbesZ-1):0}m; " +
-                    $"irrAtlas={Dx12Ddgi.IrradianceAtlasW}x{Dx12Ddgi.IrradianceAtlasH} depthAtlas={Dx12Ddgi.DepthAtlasW}x{Dx12Ddgi.DepthAtlasH}"));
+                    $"irrAtlas={Dx12Ddgi.IrradianceAtlasW}x{Dx12Ddgi.IrradianceAtlasH} depthAtlas={Dx12Ddgi.DepthAtlasW}x{Dx12Ddgi.DepthAtlasH}; {Dx12Ddgi.RaysPerProbe} rays/probe"));
             }
         }
         // The bindless material table (byte-identical to the raster G-buffer) feeds the world-space hit
@@ -2510,6 +2517,32 @@ public sealed class DX12HDRenderer : HDRenderer {
         *(RtGiSun*)rtGiSunCbMapped = new RtGiSun {
             SunDir = sunDir, NormalBias = 0.03f, SunColor = lightColor, LightCount = clusteredLights.LightCount,
         };
+
+        // --- P2.1 DDGI probe update (trace+blend). Reuses the SAME bindless heap + root-SRV addresses + the
+        // RtGiSun CBV as the RT-GI pass, so the probe hit-shading is byte-identical to DxrGi. Writes the trace
+        // table's 2 descriptors (TLAS@DdgiTableBase, irr cube@+1) into the bindless tail, then dispatches in
+        // its own ExecuteSync (each DX12 pass = its own submit; lets GI:DDGI be timed separately). Atlases are
+        // written but not yet read (gather = P2.2) → image still inert; this validates the update pipeline. ---
+        if (DdgiEnabled && ddgi != null && ddgi.Allocated) {
+            Dx12DescriptorHeap bh = Dx12Backend.BindlessHeap;
+            sceneAS.CreateTlasSrv(bh.Cpu(DdgiTableBase + 0));                                              // t0 TLAS
+            dev.Device.CopyDescriptorsSimple(1, bh.Cpu(DdgiTableBase + 1), ibl.IrradianceSrv,
+                DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);              // t3 irr cube
+            // Own stopwatch (NOT TimePass — nesting it inside the outer GI:RT TimePass would clobber the shared
+            // passSw and corrupt GI:RT's reading). Each DX12 pass is its own ExecuteSync = its GPU wall-time.
+            var ddgiSw = GiTimingEnabled ? System.Diagnostics.Stopwatch.StartNew() : null;
+            dev.ExecuteSync(cl => {
+                cl.SetDescriptorHeaps(bh.Heap);
+                ddgi.DispatchDdgi(cl, bh, bh.Gpu(DdgiTableBase),
+                    rtGiSunCb.GPUVirtualAddress, gpuDriven.MaterialsGpuAddress,
+                    rtGeometry.InstancesGpuAddress, clusteredLights.LightBufGpuAddress,
+                    hysteresis: 0.97f, intensity: MathF.Max(PostFX.SsgiIntensity, 0f));
+            });
+            if (ddgiSw != null) { ddgiSw.Stop(); RenderStats.Scene.GpuPasses.Add(("GI:DDGI", ddgiSw.Elapsed.TotalMilliseconds)); }
+            if (!ddgiDebugDumped && Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_DEBUG") == "1") {
+                ddgiDebugDumped = true; ddgi.DumpIrradianceStats();
+            }
+        }
 
         // G-buffer is in the combined shader-read state (RT compute-stage can read depth+normal); the lit
         // scene color is the bounce source (project the hit back to it), so bring it to SRV. The 6 table
