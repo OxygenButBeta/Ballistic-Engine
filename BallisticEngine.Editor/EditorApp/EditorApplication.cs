@@ -395,8 +395,7 @@ internal sealed class EditorApplication {
         // Skip the scene render while a deferred open is pending â€” the scene is about to be replaced.
         // A probe bake counts as "changing": its time-sliced job only advances inside the scene
         // render, so without this it crawls one slice per click instead of one per frame.
-        var probeBakePending = IrradianceVolume.IsBaking ||
-                               IrradianceVolume.Active is { IsActive: true, Bake: true };
+        var probeBakePending = ProbeRenderState.IsBaking;
         // A panel edit that changes the scene's appearance (light toggle, entity disable, component
         // value, add/remove component) flags the viewport dirty; pick that up here so the on-demand
         // renderer paints the change instead of leaving the previous frame frozen. IsAnyItemActive
@@ -1260,21 +1259,21 @@ internal sealed class EditorApplication {
             // Light-probe debug toggle: green = occupied / near geometry, red = empty air, for the
             // implicit auto-fit volume — without selecting anything. Diagnoses probe density/placement.
             RightAlign(ImGui.CalcTextSize(EditorIcons.Pin).X + pad2);
-            var probes = IrradianceVolume.DebugShowAll;
+            var probes = ProbeRenderState.ProbeShowAll;
             ToggleIconButton("probetoggle", EditorIcons.Pin, ref probes,
-                IrradianceVolume.DebugShowAll
-                    ? $"Light probes ({IrradianceVolume.DebugOccupiedCount} occupied / {IrradianceVolume.DebugTotalCount} total)"
+                ProbeRenderState.ProbeShowAll
+                    ? $"Light probes ({ProbeRenderState.ProbeOccupiedCount} occupied / {ProbeRenderState.ProbeTotalCount} total)"
                     : "Light probes (debug)");
-            IrradianceVolume.DebugShowAll = probes;
+            ProbeRenderState.ProbeShowAll = probes;
 
             // Reflection-probe debug toggle: cyan = local cubemap cell, dim blue = skybox-fallback cell.
             RightAlign(ImGui.CalcTextSize(EditorIcons.Pin).X + pad2);
-            var refl = ReflectionVolume.DebugShowAll;
+            var refl = ProbeRenderState.ReflectionShowAll;
             ToggleIconButton("refltoggle", EditorIcons.Pin, ref refl,
-                ReflectionVolume.DebugShowAll
-                    ? $"Reflection probes ({ReflectionVolume.DebugCapturedCount} local / {ReflectionVolume.DebugTotalCount} total)"
+                ProbeRenderState.ReflectionShowAll
+                    ? $"Reflection probes ({ProbeRenderState.ReflectionCapturedCount} local / {ProbeRenderState.ReflectionTotalCount} total)"
                     : "Reflection probes (debug)");
-            ReflectionVolume.DebugShowAll = refl;
+            ProbeRenderState.ReflectionShowAll = refl;
         }
 
         ImGui.Separator();
@@ -1558,13 +1557,13 @@ internal sealed class EditorApplication {
 
         if (showGizmos)
             DrawComponentGizmos(gizmoMin, gizmoSize);
-        else if (IrradianceVolume.DebugShowActive || ReflectionVolume.DebugShowActive) {
+        else if (ProbeRenderState.AnyDebugActive) {
             // The probe-debug overlays are their OWN tool, independent of the component-gizmo toggle —
             // so they still draw when component gizmos are off. (When gizmos ARE on, DrawComponentGizmos
             // already draws them.) Needs its own gizmoDrawer.Begin since DrawComponentGizmos was skipped.
             gizmoDrawer.Begin(editorCamera, gizmoMin, gizmoSize, ImGui.GetWindowDrawList());
-            IrradianceVolume.DebugDrawProbes(gizmoDrawer);
-            ReflectionVolume.DebugDrawProbes(gizmoDrawer);
+            ProbeRenderState.DrawProbes(gizmoDrawer);
+            ProbeRenderState.DrawReflections(gizmoDrawer);
         }
 
         // Arm vertex snapping while V is held over the viewport (raw key so it works regardless of which
@@ -1641,8 +1640,8 @@ internal sealed class EditorApplication {
         // DEBUG: probe-grid overlays (toolbar toggles / GI volume override). Always-on (not
         // selection-gated) so the implicit auto-fit volumes show too — light probes green=occupied /
         // red=air, reflection probes show occupied cubemap cells. The visual for the probe-density work.
-        IrradianceVolume.DebugDrawProbes(gizmoDrawer);
-        ReflectionVolume.DebugDrawProbes(gizmoDrawer);
+        ProbeRenderState.DrawProbes(gizmoDrawer);
+        ProbeRenderState.DrawReflections(gizmoDrawer);
 
         if (editorState.Selected is { IsActive: true } selected) {
             foreach (Behaviour behaviour in selected.Behaviours) {
@@ -1676,12 +1675,8 @@ internal sealed class EditorApplication {
         if (editorState.SelectedSceneBehaviour is { } selectedSceneBehaviour) {
             try { selectedSceneBehaviour.OnDrawGizmosSelected(gizmoDrawer); }
             catch (Exception e) { ScriptGuard.ReportRepeating(selectedSceneBehaviour, "OnDrawGizmosSelected", e); }
-
-            // Irradiance volumes get draggable face handles for resizing the box in-view.
-            if (selectedSceneBehaviour is IrradianceVolume irradianceVolume &&
-                VolumeBoundsHandles.Draw(irradianceVolume, editorCamera, imageMin, imageSize,
-                    ImGui.GetWindowDrawList(), sceneViewHovered))
-                MarkSceneDirty();
+            // (The IrradianceVolume box-resize handles were removed with the GL probe baker — P0.5. The
+            // unified GlobalIllumination volume is a global post-process override with no in-world bounds.)
         }
     }
 

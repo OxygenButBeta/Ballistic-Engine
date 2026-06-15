@@ -42,76 +42,36 @@ public static class VolumePostProcessing {
             fx.UpscaleSharpness = upscale.sharpness.Value;
         }
 
-        if (stack.GetComponent<ScreenSpaceReflections>() is { } ssr) {
-            fx.SsrEnabled = ssr.enabled.Value;
-            fx.SsrIntensity = ssr.intensity.Value;
-            fx.ReflectionMode = ssr.mode.Value;
-        }
-
-        if (stack.GetComponent<ScreenSpaceGlobalIllumination>() is { } ssgi) {
-            fx.SsgiEnabled = ssgi.enabled.Value;
-            fx.GiMode = ssgi.enabled.Value ? ssgi.mode.Value : GiMode.Off;
-            fx.SsgiLook = ssgi.look.Value;
-            fx.SsgiDebugView = ssgi.debugView.Value;
-            fx.SsgiSkyFallback = ssgi.skyFallback.Value;
-            fx.SsgiRayCount = ssgi.rayCount.Value;
-            fx.SsgiMaxHistory = ssgi.maxHistory.Value;
-            fx.SsgiDenoise = ssgi.denoise.Value;
-            fx.SsgiRayLength = ssgi.rayLength.Value;
-            fx.SsgiFalloff = ssgi.falloff.Value;
-            fx.SsgiThickness = ssgi.thickness.Value;
-            fx.SsgiIntensity = ssgi.intensity.Value;
-            fx.SsgiTint = ssgi.tint.Value;
-            fx.SsgiSaturation = ssgi.saturation.Value;
-            fx.SsgiOcclusionPower = ssgi.occlusionPower.Value;
-            fx.SsgiMultiBounce = ssgi.multiBounce.Value;
-            // Retired dials (IBL carries the ambient base now); pinned to 0, no volume override.
+        // THE unified Global Illumination volume — indirect light only (diffuse GI + reflections).
+        // Replaced the old ScreenSpaceGlobalIllumination + ScreenSpaceReflections + the dead GL
+        // probe/Lumen split overrides (P0.5 consolidation). The two Mode dropdowns each carry their own
+        // Off, so the enable bool is derived from the mode (no separate enable param to keep in sync).
+        if (stack.GetComponent<GlobalIllumination>() is { } gi) {
+            // Diffuse GI.
+            fx.GiMode = gi.giMode.Value;
+            fx.SsgiEnabled = gi.giMode.Value != GiMode.Off;
+            fx.SsgiIntensity = gi.intensity.Value;
+            fx.SsgiDebugView = gi.giIsolate.Value;
+            // Reflections (Off maps to SsrEnabled=false; the renderer's SSR-vs-RT gate keeps working).
+            fx.ReflectionMode = gi.reflectionsMode.Value;
+            fx.SsrEnabled = gi.reflectionsMode.Value != ReflectionMode.Off;
+            fx.SsrIntensity = gi.reflectionsIntensity.Value;
+            // Advanced bounce / temporal / look dials.
+            fx.SsgiRayLength = gi.rayLength.Value;
+            fx.SsgiFalloff = gi.falloff.Value;
+            fx.SsgiThickness = gi.thickness.Value;
+            fx.SsgiMultiBounce = gi.multiBounce.Value;
+            fx.SsgiOcclusionPower = gi.occlusionPower.Value;
+            fx.SsgiSkyFallback = gi.skyFallback.Value;
+            fx.SsgiRayCount = gi.rayCount.Value;
+            fx.SsgiMaxHistory = gi.maxHistory.Value;
+            fx.SsgiDenoise = gi.denoise.Value;
+            fx.SsgiLook = gi.look.Value;
+            fx.SsgiTint = gi.tint.Value;
+            fx.SsgiSaturation = gi.saturation.Value;
+            // Retired dials (IBL carries the ambient base now); pinned, no volume override.
             fx.SsgiBounceBoost = 0f;
             fx.SsgiAmbientFloor = 0f;
-        }
-
-        // GI overrides. CRITICAL: VolumeManager.Stack ALWAYS contains EVERY VolumeComponent type at its
-        // defaults (it's built from the whole component registry); GetComponent<T>() is never null. So a
-        // parameter only counts as "set by a profile" when its .Overridden flag is true. Earlier this
-        // applied split params on mere presence — a scene whose profile had GlobalIllumination but NOT
-        // Lumen still saw the DEFAULT Lumen (enabled=false) clobber GI.sdfForceEnabled=true, so "toggling
-        // Lumen did nothing" / SDF-GI never turned on. Now each split param wins ONLY when overridden,
-        // and the legacy GI fills a field only when no split override claimed it.
-        var lp = stack.GetComponent<LightProbes>();
-        var rp = stack.GetComponent<ReflectionProbes>();
-        var lumen = stack.GetComponent<Lumen>();
-        var gi = stack.GetComponent<GlobalIllumination>();
-
-        // Legacy GlobalIllumination (applies only its OVERRIDDEN params).
-        if (gi is not null) {
-            if (gi.ambientFloor.Overridden) fx.GiAmbientFloor = gi.ambientFloor.Value;
-            if (gi.probeIntensity.Overridden) fx.GiProbeIntensity = gi.probeIntensity.Value;
-            if (gi.probeDensity.Overridden) fx.GiProbeDensity = gi.probeDensity.Value;
-            if (gi.debugShowProbes.Overridden) fx.GiDebugShowProbes = gi.debugShowProbes.Value;
-            if (gi.reflectionIntensity.Overridden) fx.GiReflectionIntensity = gi.reflectionIntensity.Value;
-            if (gi.reflectionDensity.Overridden) fx.GiReflectionDensity = gi.reflectionDensity.Value;
-            if (gi.debugShowReflectionProbes.Overridden) fx.GiDebugShowReflectionProbes = gi.debugShowReflectionProbes.Value;
-            if (gi.sdfIntensity.Overridden) fx.GiSdfIntensityScale = gi.sdfIntensity.Value;
-            if (gi.sdfForceEnabled.Overridden) fx.GiSdfForceEnabled = gi.sdfForceEnabled.Value;
-        }
-
-        // Split overrides (preferred) — each param wins ONLY if actually overridden in a profile, so an
-        // unconfigured default component can't clobber the legacy GI or another override.
-        if (lp is not null) {
-            if (lp.enabled.Overridden) fx.GiProbesEnabled = lp.enabled.Value;
-            if (lp.intensity.Overridden) fx.GiProbeIntensity = lp.intensity.Value;
-            if (lp.density.Overridden) fx.GiProbeDensity = lp.density.Value;
-            if (lp.debugShow.Overridden) fx.GiDebugShowProbes = lp.debugShow.Value;
-        }
-        if (rp is not null) {
-            if (rp.enabled.Overridden) fx.GiReflectionsEnabled = rp.enabled.Value;
-            if (rp.intensity.Overridden) fx.GiReflectionIntensity = rp.intensity.Value;
-            if (rp.density.Overridden) fx.GiReflectionDensity = rp.density.Value;
-            if (rp.debugShow.Overridden) fx.GiDebugShowReflectionProbes = rp.debugShow.Value;
-        }
-        if (lumen is not null) {
-            if (lumen.enabled.Overridden) { fx.GiLumenEnabled = lumen.enabled.Value; fx.GiSdfForceEnabled = lumen.enabled.Value; }
-            if (lumen.intensity.Overridden) fx.GiSdfIntensityScale = lumen.intensity.Value;
         }
 
         if (stack.GetComponent<Shadows>() is { } shadows) {

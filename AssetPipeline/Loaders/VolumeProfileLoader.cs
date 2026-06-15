@@ -11,6 +11,29 @@ public static class VolumeProfileLoader {
     // back the new name on the next editor save).
     static readonly Dictionary<string, string> LegacyTypeNames = new() {
         ["VolumetricLight"] = "VolumetricFog",
+        // P0.5 GI consolidation: the old ScreenSpaceGlobalIllumination + ScreenSpaceReflections folded
+        // into ONE unified GlobalIllumination volume. Both old type names remap to it; if a profile has
+        // BOTH, they merge into the one instance (profile.Add returns the existing instance). The dead
+        // GL probe overrides (the old monolithic GlobalIllumination's probe/SDF params, LightProbes,
+        // ReflectionProbes, Lumen) are NOT remapped — they warn-and-skip (those settings were GL-only).
+        ["ScreenSpaceGlobalIllumination"] = "GlobalIllumination",
+        ["ScreenSpaceReflections"] = "GlobalIllumination",
+    };
+
+    // Per-old-type parameter renames for the GI consolidation: a parameter stored under its old name in
+    // an old-typed component binds to the new field name on the unified GlobalIllumination. Keyed by the
+    // ORIGINAL on-disk type name (before the LegacyTypeNames remap) so the two sources stay disambiguated.
+    // Names not listed bind unchanged (most carried over with identical names); names with no new field
+    // are dropped (e.g. the old `enabled` — the new volume derives enable from the Mode dropdowns).
+    static readonly Dictionary<string, Dictionary<string, string>> LegacyParameterNames = new() {
+        ["ScreenSpaceGlobalIllumination"] = new() {
+            ["mode"] = "giMode",
+            ["debugView"] = "giIsolate",
+        },
+        ["ScreenSpaceReflections"] = new() {
+            ["mode"] = "reflectionsMode",
+            ["intensity"] = "reflectionsIntensity",
+        },
     };
 
     public static VolumeProfile Load(BallisticProject project, string assetPath) {
@@ -29,14 +52,27 @@ public static class VolumeProfileLoader {
                 continue;
             }
 
+            bool alreadyPresent = profile.Has(type);
             VolumeComponent component = profile.Add(type);
-            component.Active = componentDef.Active;
+            // A merge target (two old types → one new, e.g. SSGI + SSR → GlobalIllumination) stays active
+            // if EITHER source was active; a fresh component takes its source's Active straight.
+            component.Active = alreadyPresent ? component.Active || componentDef.Active : componentDef.Active;
 
             if (componentDef.Parameters is null)
                 continue;
 
+            // Old-name → new-field renames for this on-disk type (GI consolidation); empty for the rest.
+            LegacyParameterNames.TryGetValue(componentDef.Type, out Dictionary<string, string> paramRenames);
+
             foreach (VolumeComponent.ParameterSlot slot in component.Parameters) {
-                if (!componentDef.Parameters.TryGetValue(slot.Name, out VolumeParameterDefinition parameterDef))
+                // Find the file key that feeds this slot: the renamed old name if one maps here, else the
+                // slot's own name. (A merge skips slots a source doesn't carry — its keys stay default.)
+                string fileKey = slot.Name;
+                if (paramRenames is not null)
+                    foreach (var (oldName, newName) in paramRenames)
+                        if (newName == slot.Name) { fileKey = oldName; break; }
+
+                if (!componentDef.Parameters.TryGetValue(fileKey, out VolumeParameterDefinition parameterDef))
                     continue;
 
                 slot.Parameter.Overridden = parameterDef.Overridden;

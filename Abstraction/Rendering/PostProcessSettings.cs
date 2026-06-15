@@ -14,10 +14,13 @@ public enum MeteringMode {
     Spot,           // only a small center circle meters
 }
 
-// Reflection technique: screen-space march or DXR ray tracing (the Reflection volume's SSR-vs-RT dropdown).
+// Reflections technique (the unified GI volume's Reflections-Mode dropdown). Off mirrors GiMode.Off so
+// the two indirect dropdowns read alike. NOTE: ScreenSpace/RayTraced keep their original ordinals (0/1)
+// so existing .volume profiles that stored the enum BY VALUE still resolve; Off is appended last (=2).
 public enum ReflectionMode {
     ScreenSpace,   // SSR — fast, screen-bounded
     RayTraced,     // DXR — off-screen + sky reflect correctly (falls back to SSR without DXR)
+    Off,           // no reflections (IBL/skybox reflection only)
 }
 
 // Global-illumination technique (the GI volume's Off/SSGI/RT-GI dropdown).

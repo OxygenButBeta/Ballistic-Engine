@@ -25,9 +25,10 @@ public static class AssetDatabase {
         loadedAssets.Clear();
         assetToGuid.Clear();
 
-        // The engine layer can't know the project layout; hand it the probe-bake cache homes.
-        IrradianceVolume.CacheDirectory = Path.Combine(project.LibraryPath, "ProbeVolumes");
-        ReflectionVolume.CacheDirectory = Path.Combine(project.LibraryPath, "ReflectionProbes");
+        // The engine layer can't know the project layout; hand it the probe-bake cache homes. (Inert on
+        // DX12 — no baker writes them; kept for a future probe fallback, GI plan P7.)
+        ProbeRenderState.ProbeCacheDirectory = Path.Combine(project.LibraryPath, "ProbeVolumes");
+        ProbeRenderState.ReflectionCacheDirectory = Path.Combine(project.LibraryPath, "ReflectionProbes");
     }
 
     // forceAll = true rebuilds every Library artifact from source (Unity's "Reimport All").

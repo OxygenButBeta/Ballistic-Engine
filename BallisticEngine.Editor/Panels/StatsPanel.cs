@@ -88,22 +88,22 @@ internal sealed class StatsPanel {
         // Global Illumination readout — "what is the data / how is it affecting the scene": which GI
         // systems are live, their strengths, the probe grid + occupancy, and bake progress.
         ImGui.SeparatorText("Global Illumination");
-        int pGx = IrradianceVolume.StatProbeGridX, pGy = IrradianceVolume.StatProbeGridY, pGz = IrradianceVolume.StatProbeGridZ;
-        int pOcc = IrradianceVolume.DebugOccupiedCount, pTot = IrradianceVolume.DebugTotalCount;
+        int pGx = ProbeRenderState.ProbeGridX, pGy = ProbeRenderState.ProbeGridY, pGz = ProbeRenderState.ProbeGridZ;
+        int pOcc = ProbeRenderState.ProbeOccupiedCount, pTot = ProbeRenderState.ProbeTotalCount;
         Line("Light probes",
-            IrradianceVolume.StatProbesEnabled ? $"on  x{IrradianceVolume.StatProbeIntensity:0.0#}" : "OFF", scale);
+            ProbeRenderState.ProbesEnabled ? $"on  x{ProbeRenderState.ProbeIntensity:0.0#}" : "OFF", scale);
         if (pGx > 0)
             Line("  probe grid", $"{pGx}x{pGy}x{pGz} = {pGx * pGy * pGz}", scale);
         if (pTot > 0)
             Line("  occupied / air", $"{pOcc} / {pTot - pOcc}", scale);
-        if (IrradianceVolume.IsBaking)
-            Line("  baking", $"{IrradianceVolume.BakeProgress * 100:0}%", scale);
+        if (ProbeRenderState.IsBaking)
+            Line("  baking", $"{ProbeRenderState.BakeProgress * 100:0}%", scale);
         Line("Reflection probes",
-            IrradianceVolume.StatReflectionsEnabled ? $"on  x{IrradianceVolume.StatReflectionIntensity:0.0#}" : "OFF", scale);
-        if (ReflectionVolume.DebugTotalCount > 0)
-            Line("  local / total", $"{ReflectionVolume.DebugCapturedCount} / {ReflectionVolume.DebugTotalCount}", scale);
+            ProbeRenderState.ReflectionsEnabled ? $"on  x{ProbeRenderState.ReflectionIntensity:0.0#}" : "OFF", scale);
+        if (ProbeRenderState.ReflectionTotalCount > 0)
+            Line("  local / total", $"{ProbeRenderState.ReflectionCapturedCount} / {ProbeRenderState.ReflectionTotalCount}", scale);
         Line("Lumen (SDF-GI)",
-            IrradianceVolume.StatLumenEnabled ? $"on  x{IrradianceVolume.StatLumenIntensity:0.0#}" : "OFF", scale);
+            ProbeRenderState.LumenEnabled ? $"on  x{ProbeRenderState.LumenIntensity:0.0#}" : "OFF", scale);
 
         ImGui.SeparatorText("Scene");
         Line("Entities", scene.Entities.Count.ToString(), scale);

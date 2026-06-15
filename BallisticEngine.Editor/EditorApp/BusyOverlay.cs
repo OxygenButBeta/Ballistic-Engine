@@ -129,7 +129,7 @@ internal static class BusyOverlay {
     // shown WHILE the light-probe bake runs (which no longer blocks the UI). The user keeps editing;
     // this just tells them GI is refining in the background. Drawn on the foreground list, no input eat.
     public static void DrawBakeBadge(float s) {
-        if (!IrradianceVolume.IsBaking)
+        if (!ProbeRenderState.IsBaking)
             return;
         var draw = ImGui.GetForegroundDrawList();
         SysVec2 display = ImGui.GetIO().DisplaySize;
@@ -139,7 +139,7 @@ internal static class BusyOverlay {
             ImGui.GetColorU32(new SysVec4(0.10f, 0.10f, 0.12f, 0.92f)), 6 * s);
         draw.AddRect(pos, pos + new SysVec2(w, h),
             ImGui.GetColorU32(new SysVec4(1f, 1f, 1f, 0.08f)), 6 * s);
-        float prog = Math.Clamp(IrradianceVolume.BakeProgress, 0f, 1f);
+        float prog = Math.Clamp(ProbeRenderState.BakeProgress, 0f, 1f);
         var label = $"Baking GI  {(int)(prog * 100)}%";
         draw.AddText(pos + new SysVec2(10 * s, 5 * s),
             ImGui.GetColorU32(new SysVec4(0.85f, 0.88f, 0.95f, 1f)), label);

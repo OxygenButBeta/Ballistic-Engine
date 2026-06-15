@@ -1,55 +1,101 @@
 namespace BallisticEngine;
 
-// Global Illumination volume override. The realtime GI stack — auto-fit irradiance probes
-// (diffuse base), auto-fit reflection probes (specular), and the SDF-GI off-screen bounce — all
-// run by DEFAULT with zero setup. This component does NOT switch them on; it lets a scene TWEAK
-// their strength (and optionally force the still-env-gated SDF-GI bounce on without the env var).
+// THE unified Global Illumination volume — the single override for INDIRECT light (diffuse GI +
+// reflections), Lumen-style. It consolidates what used to be three+ separate volumes (the old
+// ScreenSpaceGlobalIllumination, ScreenSpaceReflections, and the dead GL probe/Lumen overrides) into
+// one clean front door:
 //
-// Every parameter defaults to "current behaviour", so a scene with this override but nothing
-// changed renders identically to a scene without it (the volume-framework contract: stack defaults
-// mirror PostProcessSettings defaults). Add it, flip a dial, the auto-GI keeps working in realtime.
+//   GI Mode          Off | Screen-Space | Ray-Traced (Lumen)   — the diffuse indirect bounce technique
+//   Reflections Mode Off | Screen-Space | Ray-Traced           — the specular indirect technique
+//   + intensities, with the fiddly bounce/temporal/denoise dials tucked into an Advanced foldout.
+//
+// DOCTRINE: no front-door knob sprawl (the APV anti-pattern). The two mode dropdowns + two intensities
+// are all most scenes touch; everything else has a good default and lives under Advanced. DIRECT light
+// (sun/sky/exposure/shadows) is NOT here — it stays in its own components; this volume is indirect-only.
+//
+// Defaults mirror the engine PostProcessSettings defaults, so a scene that adds this override but
+// changes nothing renders byte-identically to a scene without it (the volume-framework contract).
+//
+// MIGRATION: profiles authored against the old "ScreenSpaceGlobalIllumination" / "ScreenSpaceReflections"
+// type names are remapped to this type on load (VolumeProfileLoader.LegacyTypeNames); matching parameter
+// names carry their values over, so existing .volume assets keep their GI/reflection settings.
 public sealed class GlobalIllumination : VolumeComponent {
-    [Tooltip("Strength of the baked diffuse light-probe ambient (the auto-fit IrradianceVolume). " +
-             "1 = physical. Lower fades toward the flat sky IBL; higher over-drives the probe bounce.")]
-    public readonly ClampedFloatParameter probeIntensity = new(1f, 0f, 4f);
+    // ---- Diffuse GI (the indirect one-bounce light) ----
+    [Tooltip("Diffuse global illumination technique. Off = IBL ambient only; Screen-Space = SSGI " +
+             "(fast, screen-bounded one-bounce); Ray-Traced = DXR off-screen-aware one-bounce (Lumen), " +
+             "falls back to Screen-Space on GPUs without ray tracing. All denoised with OIDN.")]
+    public readonly EnumParameter<GiMode> giMode = new(GiMode.ScreenSpace);
 
-    [Tooltip("Strength of the baked local reflections (the auto-fit ReflectionVolume), multiplied " +
-             "onto the volume's own Intensity. 1 = physical; lower fades toward the global skybox reflection.")]
-    public readonly ClampedFloatParameter reflectionIntensity = new(1f, 0f, 4f);
+    [Tooltip("Strength of the indirect diffuse bounce added over the IBL ambient base.")]
+    public readonly ClampedFloatParameter intensity = new(1f, 0f, 4f);
 
-    [Tooltip("Extra multiplier on the SDF-GI off-screen dynamic bounce (on top of its own default " +
-             "and the probe<->SDF blend). 0 = no SDF bounce; 1 = default; >1 punches the dynamic GI.")]
-    public readonly ClampedFloatParameter sdfIntensity = new(1f, 0f, 4f);
+    // ---- Specular GI (reflections) ----
+    [Tooltip("Reflections technique. Off = IBL/skybox reflection only; Screen-Space = SSR (fast, " +
+             "screen-bounded); Ray-Traced = DXR (off-screen geometry + sky reflect correctly), falls " +
+             "back to Screen-Space without ray tracing.")]
+    public readonly EnumParameter<ReflectionMode> reflectionsMode = new(ReflectionMode.ScreenSpace);
 
-    [Tooltip("Force the SDF-GI off-screen bounce ON for this scene without the BALLISTIC_SDFGI env " +
-             "var. SDF-GI stays env-gated by default while it matures; a scene that wants the dynamic " +
-             "off-screen bounce just adds this override and ticks this.")]
-    public readonly BoolParameter sdfForceEnabled = new(false);
+    [Tooltip("Strength of reflections on smooth surfaces.")]
+    public readonly ClampedFloatParameter reflectionsIntensity = new(1f, 0f, 2f);
 
-    [Tooltip("Ambient shadow-fill: a tiny fraction of surface albedo (AO-modulated) added so enclosed " +
-             "interiors never crush the shadowed side of geometry to pure black. 0.03 = subtle default; " +
-             "raise for flatter/brighter ambient, 0 for physically-pure (deep blacks).")]
-    public readonly ClampedFloatParameter ambientFloor = new(0.03f, 0f, 0.5f);
+    // ---- Debug ----
+    [Tooltip("GI-isolate view: show ONLY the indirect bounce this GI pass adds (not the lit scene). " +
+             "Black = no bounce here. The way to verify + tune GI — judge it by the isolated bounce.")]
+    public readonly BoolParameter giIsolate = new(false);
 
-    // ---- Probe-grid density (the auto-fit IrradianceVolume / ReflectionVolume are AUTOMATIC; this
-    // scales how finely they're sampled without placing/baking a component by hand) ----
+    // ================= ADVANCED (good defaults; most scenes never touch these) =================
+    [Header("Advanced — Diffuse Bounce")]
+    [FoldoutGroup("Advanced")]
+    [Tooltip("Max gather distance in metres (near vs far bounce reach).")]
+    public readonly ClampedFloatParameter rayLength = new(12f, 1f, 40f);
 
-    [Tooltip("Light-probe (diffuse GI) grid density multiplier. 1 = default auto-fit resolution. " +
-             "Higher = more probes (sharper indirect light, slower bake); lower = coarser (faster).")]
-    public readonly ClampedFloatParameter probeDensity = new(1f, 0.25f, 3f);
+    [FoldoutGroup("Advanced")]
+    [Tooltip("Distance falloff exponent. 0 = no falloff; higher keeps bounce local.")]
+    public readonly ClampedFloatParameter falloff = new(0.5f, 0f, 4f);
 
-    [Tooltip("Reflection-probe (specular) grid density multiplier. 1 = default. Reflection cells are " +
-             "expensive (a prefiltered cubemap each), so raise this sparingly.")]
-    public readonly ClampedFloatParameter reflectionDensity = new(1f, 0.25f, 3f);
+    [FoldoutGroup("Advanced")]
+    [Tooltip("Assumed occluder thickness in metres. Thin lets light leak past railings/foliage; " +
+             "thick treats them as walls.")]
+    public readonly ClampedFloatParameter thickness = new(0.5f, 0.05f, 2f);
 
-    // ---- Debug visualisation (gizmo overlays — the same toggles as the Scene-view toolbar, exposed
-    // here so a scene/volume can pin them on) ----
+    [FoldoutGroup("Advanced")]
+    [Tooltip("Fraction of last frame's GI that re-bounces (fake multi-bounce).")]
+    public readonly ClampedFloatParameter multiBounce = new(0.5f, 0f, 1f);
 
-    [Tooltip("DEBUG: draw the light-probe grid in the Scene view — GREEN = occupied (near geometry), " +
-             "RED = empty air. Shows where probes are placed and how many fall in wasted empty space.")]
-    public readonly BoolParameter debugShowProbes = new(false);
+    [FoldoutGroup("Advanced")]
+    [Tooltip("How hard AO bites the bounce.")]
+    public readonly ClampedFloatParameter occlusionPower = new(0.6f, 0f, 2f);
 
-    [Tooltip("DEBUG: draw the reflection-probe cells in the Scene view (occupied cubemap cells vs " +
-             "skybox-fallback cells), so you can see the specular grid coverage.")]
-    public readonly BoolParameter debugShowReflectionProbes = new(false);
+    [FoldoutGroup("Advanced")]
+    [Tooltip("Sky light through the UNOCCLUDED part of the horizon (occlusion-aware — a pixel facing a " +
+             "wall gets none). 0 = off; the IBL ambient already counts the sky, so keep low. Useful in " +
+             "interiors with openings.")]
+    public readonly ClampedFloatParameter skyFallback = new(0f, 0f, 1f);
+
+    [FoldoutGroup("Advanced")]
+    [Tooltip("Horizon slices per pixel (bitmask gather). Temporal + denoise keep even 2–4 clean; " +
+             ">8 is clamped. (Screen-Space mode only.)")]
+    public readonly ClampedIntParameter rayCount = new(4, 1, 16);
+
+    [Header("Advanced — Temporal / Denoise")]
+    [FoldoutGroup("Advanced")]
+    [Tooltip("Temporal frames to accumulate. Higher = smoother but laggier.")]
+    public readonly ClampedFloatParameter maxHistory = new(24f, 1f, 64f);
+
+    [FoldoutGroup("Advanced")]
+    [Tooltip("Spatial denoiser tap spacing. Wider = smoother.")]
+    public readonly ClampedFloatParameter denoise = new(2f, 1f, 8f);
+
+    [Header("Advanced — Look")]
+    [FoldoutGroup("Advanced")]
+    [Tooltip("Cinematic look strength on the local bounce (saturation + warmth).")]
+    public readonly ClampedFloatParameter look = new(0.6f, 0f, 1f);
+
+    [FoldoutGroup("Advanced")]
+    [Tooltip("Tint multiplier on the bounce.")]
+    public readonly ColorParameter tint = new(Vector3.One);
+
+    [FoldoutGroup("Advanced")]
+    [Tooltip("Bounce colour punch.")]
+    public readonly ClampedFloatParameter saturation = new(1f, 0f, 2f);
 }
