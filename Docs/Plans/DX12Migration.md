@@ -96,12 +96,23 @@ scene is needed to eyeball it.
 **Both backends build + run; GL has ZERO regressions** (SunTemple GL draws=3 unchanged). DX12 via
 BALLISTIC_BACKEND=dx12; GL is still default + the editor's renderer.
 
-**NEXT (DX12, each committable):** IBL ambient from the env cube (irradiance + prefilter + BRDF LUT
-precompute, replace the flat ambient — affects every pixel, biggest remaining quality gap); interleave
-the mesh vertex buffer (perf); cascaded shadows (Phase 3 start); post-FX (tonemap/bloom/TAA/SSAO/SSR/
-volumetric, SSGI LAST); finally editor→DX12 + delete GL wholesale (incl. the GL-shaped bind methods +
-RenderContext the DX12 path currently no-ops). Exposure is a fixed 1e-5 stand-in (BALLISTIC_DX12_EXPOSURE
-to override) until auto-exposure. DON'T break the editor — it renders on GL; delete GL only at the very end.
+**🟢 DX12 PROCEDURAL SKY (2026-06-15):** ported Sky_Procedural.glsl clean-sky path — Rayleigh+Mie+ozone
+atmosphere + sun disk + ground, marched PER-PIXEL in the far-plane skybox pass (pure ALU, CBV-only — no
+cubemap bake, unlike GL). Driven by the scene DirectionalLight + ProceduralSky params. VERIFIED on
+BistroExterior (1591 draws / 2.8M tris — the engine's big exterior): atmosphere visible, composition
+matches GL. Refs dx12_bistro_proceduralsky.png vs gl_bistro_baseline.png. ProceduralSky.Active wins over
+a cubemap Skybox (GL parity). DX12 now renders TWO real scenes (SunTemple interior + Bistro exterior).
+
+**USER DIRECTIVE (standing): port ALL the GL renderer features to DX12** over time — procedural sky (done),
+then volumetric fog (explicitly named), and the rest. Feature-by-feature, commit each.
+
+**NEXT (DX12, each committable):** IBL ambient (irradiance + prefilter + BRDF LUT — needs an env source;
+either bake the procedural sky to a cubemap + convolve, or analytic sky-ambient — biggest quality gap,
+both scenes are dark without it); cascaded shadows (Phase 3); **volumetric fog (user-requested)**; sky
+clouds/cirrus/stars (follow-up to the atmosphere); rest of post-FX (bloom/TAA/SSAO/SSR/auto-exposure,
+SSGI LAST); interleave mesh verts (perf); finally editor→DX12 + delete GL wholesale (incl. the GL-shaped
+bind methods + RenderContext the DX12 path no-ops). Exposure is a fixed 1e-5 stand-in until auto-exposure.
+DON'T break the editor — it renders on GL; delete GL only at the very end.
 
 The frozen GL parity image: `Docs/Plans/dx12-refs/gl_suntemple_baseline.png` (mean RGB 96.7,81.9,65.6).
 
