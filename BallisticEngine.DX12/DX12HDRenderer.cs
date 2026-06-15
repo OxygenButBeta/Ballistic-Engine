@@ -63,6 +63,28 @@ public sealed class DX12HDRenderer : HDRenderer {
     // Clustered punctual lights (point/spot) shaded in the deferred pass.
     Dx12ClusteredLights clusteredLights;
 
+    // TAA: jittered rendering + reprojected history accumulation (the AA; also smooths SSR/SSAO noise).
+    // The jitter is applied to the camera projection (whole frame); reprojection uses UNJITTERED matrices.
+    // Driven by the AntiAliasing VOLUME (PostFX.TaaEnabled / TaaFeedback). The jitter offset is reused by
+    // the FSR upscaler later (plumbed once here).
+    ID3D12RootSignature taaRootSig;     // TaaConstants CBV(b0) + 3-SRV table(current/history/depth) + sampler
+    ID3D12PipelineState taaPso;
+    ID3D12Resource taaCb;
+    unsafe byte* taaCbMapped;
+    Dx12OffscreenTarget taaHistoryA, taaHistoryB;   // ping-pong accumulated HDR history
+    Dx12OffscreenTarget taaResolved;                // this frame's TAA output (→ history + copied to target)
+    Dx12DescriptorHeap taaSrvVisible;   // 3 SRVs per frame
+    bool taaWriteB;                     // ping-pong toggle
+    bool taaHistoryValid;
+    int taaFrame;                       // jitter phase counter
+    Matrix4x4 taaPrevViewProj;          // previous frame's UNJITTERED view*proj
+    Vector2 currentJitter;              // this frame's sub-pixel jitter (pixels) — exposed for FSR reuse
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct TaaConstants {
+        public Matrix4x4 CurrInvViewProj; public Matrix4x4 PrevViewProj;
+        public float Feedback; public float ValidHistory; public Vector2 TexelSize;
+    }
+
     // SSR: half-res view-space reflection march (reads HDR color + G-buffer) → combine (depth-aware
     // upsample, lerp into the HDR color). Driven by the ScreenSpaceReflections VOLUME (PostFX.Ssr*).
     ID3D12RootSignature ssrRootSig;     // SsrConstants CBV(b0) + 5-SRV table(color/depth/normal/material/ssr) + sampler
@@ -258,6 +280,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (bloomRootSig != null) AllocBloomTargets();       // half-res bloom ping-pong follows size
         if (ssaoRootSig != null) AllocSsaoTargets();
         if (ssrRootSig != null) AllocSsrTarget();
+        if (taaRootSig != null) AllocTaaTargets();
     }
 
     public override unsafe void Initialize() {
@@ -301,7 +324,60 @@ public sealed class DX12HDRenderer : HDRenderer {
         BuildDeferredLighting();
         BuildFog();
         BuildSsr();
+        BuildTaa();
         BuildComposite();
+    }
+
+    unsafe void BuildTaa() {
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 3, baseShaderRegister: 0);
+        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
+        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        taaRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("Taa.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "Taa.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "Taa.hlsl");
+        taaPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+            RootSignature = taaRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
+            DepthStencilState = DepthStencilDescription.None,
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat }, DepthStencilFormat = Format.Unknown,
+            SampleDescription = new SampleDescription(1, 0),
+        });
+
+        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<TaaConstants>() + 255) & ~255;
+        taaCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+        taaCbMapped = taaCb.Map<byte>(0);
+        taaSrvVisible = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true);
+        AllocTaaTargets();
+    }
+
+    void AllocTaaTargets() {
+        taaHistoryA?.Dispose(); taaHistoryB?.Dispose(); taaResolved?.Dispose();
+        taaHistoryA = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
+        taaHistoryB = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
+        taaResolved = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
+        taaHistoryValid = false;   // history is stale after a resize
+    }
+
+    // Standard 8-phase Halton(2,3) sub-pixel jitter in pixel units (-0.5..0.5). Reused by FSR later.
+    static Vector2 JitterOffset(int frameIndex) {
+        int i = (frameIndex % 8) + 1;
+        return new Vector2(Halton(i, 2) - 0.5f, Halton(i, 3) - 0.5f);
+    }
+    static float Halton(int index, int b) {
+        float r = 0f, f = 1f;
+        while (index > 0) { f /= b; r += f * (index % b); index /= b; }
+        return r;
     }
 
     unsafe void BuildSsr() {
@@ -812,7 +888,20 @@ public sealed class DX12HDRenderer : HDRenderer {
         Matrix4x4 view = ToNumerics(vp.GetViewMatrix());
         Matrix4x4 proj = Matrix4x4.CreatePerspectiveFieldOfView(
             45f * (MathF.PI / 180f), (float)targetW / targetH, CameraNear, CameraFar);
-        Matrix4x4 viewProj = view * proj;
+        // UNJITTERED view*proj — used for TAA reprojection (must be stable) + the froxel/SSR/post math.
+        Matrix4x4 viewProjUnjittered = view * proj;
+
+        // TAA jitter: offset the projection by a sub-pixel Halton amount so the whole frame (geometry +
+        // SSR + shadows) is consistently jittered; the TAA pass resolves it against the unjittered history.
+        // Plumbed ONCE here — FSR reuses currentJitter. Off when the volume disables TAA.
+        bool taaOn = PostFX.TaaEnabled;
+        currentJitter = taaOn ? JitterOffset(taaFrame) : Vector2.Zero;
+        if (taaOn) {
+            // NDC offset = 2 * pixelJitter / screen. DX clip y is up, so subtract for the +y pixel dir.
+            proj.M31 += 2f * currentJitter.X / targetW;
+            proj.M32 -= 2f * currentJitter.Y / targetH;
+        }
+        Matrix4x4 viewProj = view * proj;   // JITTERED — geometry/SSR/etc. render with this
 
         Vector3 camPos = ToNumerics(vp.Transform.WorldPosition);
         LightUniforms light = LightUniforms.Resolve();
@@ -977,6 +1066,12 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (PostFX.SsrEnabled && PostFX.SsrIntensity > 0f)
             DrawSsr(view, proj);
 
+        // --- TAA (volume-driven; the AA — resolves the jittered frame vs reprojected history) ---
+        if (taaOn)
+            DrawTaa(viewProjUnjittered);
+        else
+            taaHistoryValid = false;   // keep history fresh for when TAA turns back on
+
         // --- SSAO (HBAO from depth → half-res AO, multiplied in the composite) ---
         bool ssaoOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SSAO") != "0";
         if (ssaoOn) DrawSsao(view, proj);
@@ -1052,6 +1147,48 @@ public sealed class DX12HDRenderer : HDRenderer {
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
         });
+    }
+
+    // TAA (volume-driven): resolve the jittered HDR scene against the reprojected history. Reads the
+    // current HDR color (target) + history + G-buffer depth, writes the resolved color into the new history
+    // buffer, then copies it back to `target` so the composite tonemaps the AA'd result. Reprojection uses
+    // the UNJITTERED matrices. History ping-pongs; invalidated on resize / first frame.
+    unsafe void DrawTaa(Matrix4x4 viewProjUnjittered) {
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        Matrix4x4.Invert(viewProjUnjittered, out Matrix4x4 invVP);
+        Dx12OffscreenTarget history = taaWriteB ? taaHistoryA : taaHistoryB;   // read from the OTHER buffer
+        Dx12OffscreenTarget writeHist = taaWriteB ? taaHistoryB : taaHistoryA;
+
+        *(TaaConstants*)taaCbMapped = new TaaConstants {
+            CurrInvViewProj = Matrix4x4.Transpose(invVP),
+            PrevViewProj = Matrix4x4.Transpose(taaPrevViewProj),
+            Feedback = PostFX.TaaFeedback, ValidHistory = taaHistoryValid ? 1f : 0f,
+            TexelSize = new Vector2(1f / targetW, 1f / targetH),
+        };
+
+        target.ColorToShaderResource();
+        history.ColorToShaderResource();
+        gbuffer.DepthToShaderResource();
+        taaSrvVisible.Reset();
+        int b = taaSrvVisible.AllocateRange(3);
+        dev.Device.CopyDescriptorsSimple(1, taaSrvVisible.Cpu(b + 0), target.ColorSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, taaSrvVisible.Cpu(b + 1), history.ColorSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, taaSrvVisible.Cpu(b + 2), gbuffer.DepthSrvCpu, heapType);
+        writeHist.RenderColorOnly(cl => {
+            cl.SetGraphicsRootSignature(taaRootSig); cl.SetPipelineState(taaPso);
+            cl.SetDescriptorHeaps(taaSrvVisible.Heap);
+            cl.SetGraphicsRootConstantBufferView(0, taaCb.GPUVirtualAddress);
+            cl.SetGraphicsRootDescriptorTable(1, taaSrvVisible.Gpu(b));
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
+        writeHist.ColorToShaderResource();
+        target.CopyColorFrom(writeHist);   // the resolved AA'd color becomes the scene color
+
+        taaWriteB = !taaWriteB;
+        taaHistoryValid = true;
+        taaPrevViewProj = viewProjUnjittered;
+        taaFrame++;
     }
 
     // Screen-space reflections (volume-driven): half-res view-space march reads the lit HDR color +
