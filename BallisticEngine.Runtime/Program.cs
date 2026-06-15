@@ -35,18 +35,22 @@ internal class Program {
 
         BallisticEngine.Profiling.TracyProfiler.TryInstall("Ballistic Runtime");
 
-        // Backend seam (DX12Migration.md): GL is the only implemented host today. When the DX12 host
-        // runtime exists it slots in here. Fail fast on an explicit BALLISTIC_BACKEND=dx12 so it's never
-        // a silent no-op falling back to GL.
+        // Backend seam (DX12Migration.md): BALLISTIC_BACKEND=dx12 brings up the DX12 host instead of the
+        // GL window. The DX12 host is currently HEADLESS (no swapchain) — it serves the screenshot
+        // verification path; a windowed DX12 host (present + Windows input) comes later. GL is the default
+        // host until the DX12 path reaches parity (then GL is deleted).
+        IBallisticEngineRuntime runtime;
         if (RenderBackendSelector.Selected == RenderBackend.Dx12) {
-            Console.Error.WriteLine("[Backend] BALLISTIC_BACKEND=dx12 requested but the DX12 backend is " +
-                                    "not implemented yet (see Docs/Plans/DX12Migration.md). Running OpenGL.");
+            Console.WriteLine("[Backend] DX12 host (headless — screenshot path). " +
+                              "Set BALLISTIC_SCREENSHOT to capture a frame.");
+            runtime = new Dx12HeadlessRuntime(player.Width, player.Height);
         }
-
-        GLBallisticEngineWindow runtime = new(player.Width, player.Height,
-            fullscreen: mode == WindowMode.Fullscreen,
-            borderless: mode == WindowMode.Borderless,
-            title: player.ProductName);
+        else {
+            runtime = new GLBallisticEngineWindow(player.Width, player.Height,
+                fullscreen: mode == WindowMode.Fullscreen,
+                borderless: mode == WindowMode.Borderless,
+                title: player.ProductName);
+        }
         BEngineEntry engineEntry = new(runtime, projectPath, playerMode);
         engineEntry.Run();
 
