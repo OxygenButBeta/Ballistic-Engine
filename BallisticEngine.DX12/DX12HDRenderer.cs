@@ -24,7 +24,20 @@ public sealed class DX12HDRenderer : HDRenderer {
     readonly Dx12Device dev;
     Dx12OffscreenTarget target;       // HDR scene color (R16F) + depth — opaque/sky/fog render here
     Dx12OffscreenTarget ldr;          // LDR composite output (R8) — readback/display reads this
+    // targetW/targetH = the INTERNAL (render) resolution: the scene + all post passes render here. When FSR
+    // is off this equals the output resolution. When FSR is on it's the (smaller) FSR render resolution and
+    // the upscaler reconstructs outputW/outputH. ldr is always at output resolution.
     int targetW = 1920, targetH = 1080;
+    int outputW = 1920, outputH = 1080;
+
+    // FSR temporal upscaling: render at targetW/H (internal) -> fsrOutput (output res). Replaces TAA when
+    // active. fsrUnavailable latches if the native DLLs fail to load (clean checkout) so we stop retrying.
+    Dx12FsrUpscaler fsr;
+    Dx12OffscreenTarget fsrOutput;    // HDR (R16F), output res, UAV-writable — FSR's reconstructed color
+    bool fsrActive;
+    bool fsrUnavailable;
+    UpscaleMode currentUpscaleMode = UpscaleMode.Off;
+    const float FovYRadians = 45f * (MathF.PI / 180f);   // matches the projection's vertical FOV
 
     ID3D12RootSignature rootSig;
     ID3D12PipelineState pso;
@@ -314,24 +327,87 @@ public sealed class DX12HDRenderer : HDRenderer {
 
     void Resize(int width, int height) {
         if (width <= 0 || height <= 0) return;
-        if (target != null && width == targetW && height == targetH) return;
-        targetW = width; targetH = height;
+        if (target != null && width == outputW && height == outputH) return;
+        outputW = width; outputH = height;
+        // Reset to native (internal == output); BeginRender's EnsureUpscaleTargets re-derives the internal
+        // render resolution from the volume's UpscaleMode and reallocates if FSR wants a smaller render res.
+        fsrActive = false;
+        currentUpscaleMode = UpscaleMode.Off;
+        fsr?.Dispose(); fsr = null;
+        AllocateResolutionTargets(width, height);
+    }
+
+    // (Re)allocate every resolution-dependent target. internalW/H = the render resolution (scene + all post
+    // passes); ldr + fsrOutput are at the output resolution. Called on resize and on an FSR mode change.
+    void AllocateResolutionTargets(int internalW, int internalH) {
+        targetW = internalW; targetH = internalH;
         target?.Dispose(); ldr?.Dispose(); gbuffer?.Dispose();
         // The HDR scene target no longer owns depth — the G-buffer owns the scene depth (deferred path).
-        target = new Dx12OffscreenTarget(dev, width, height, withDepth: false,
+        target = new Dx12OffscreenTarget(dev, internalW, internalH, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
-        ldr = new Dx12OffscreenTarget(dev, width, height);   // LDR composite output
-        gbuffer = new Dx12GBuffer(dev, width, height);
-        motionPrevValid = false;                             // prev view*proj is stale after a resize
-        if (bloomRootSig != null) AllocBloomTargets();       // half-res bloom ping-pong follows size
+        ldr = new Dx12OffscreenTarget(dev, outputW, outputH);   // LDR composite output (display res)
+        gbuffer = new Dx12GBuffer(dev, internalW, internalH);
+        motionPrevValid = false;                                // prev view*proj is stale after a realloc
+        if (bloomRootSig != null) AllocBloomTargets();          // half-res bloom ping-pong follows size
         if (ssaoRootSig != null) AllocSsaoTargets();
         if (ssrRootSig != null) AllocSsrTarget();
         if (taaRootSig != null) AllocTaaTargets();
+        AllocFsrOutput();
+    }
+
+    void AllocFsrOutput() {
+        fsrOutput?.Dispose();
+        // Output-resolution HDR target FSR writes via UAV and the composite reads via SRV.
+        fsrOutput = new Dx12OffscreenTarget(dev, outputW, outputH, withDepth: false,
+            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
+    }
+
+    // Map the volume UpscaleMode to an FSR quality id.
+    static uint FsrQuality(UpscaleMode m) => m switch {
+        UpscaleMode.NativeAA => FfxApi.QualityNativeAA,
+        UpscaleMode.Quality => FfxApi.QualityQuality,
+        UpscaleMode.Balanced => FfxApi.QualityBalanced,
+        UpscaleMode.Performance => FfxApi.QualityPerformance,
+        UpscaleMode.UltraPerformance => FfxApi.QualityUltraPerformance,
+        _ => FfxApi.QualityQuality,
+    };
+
+    // Ensure the internal render resolution + FSR context match the requested upscale mode. Reallocates the
+    // internal-res targets (and recreates the FSR context) only when the mode actually changes. If the FSR
+    // DLLs can't load it latches off and renders native (graceful degrade on a clean checkout).
+    void EnsureUpscaleTargets(UpscaleMode mode) {
+        bool wantFsr = mode != UpscaleMode.Off && !fsrUnavailable;
+        int wantIW = outputW, wantIH = outputH;
+        if (wantFsr) {
+            try { (wantIW, wantIH) = Dx12FsrUpscaler.RenderResolutionFor(outputW, outputH, FsrQuality(mode)); }
+            catch (Exception e) {
+                Console.WriteLine($"[FSR] unavailable, rendering native: {e.Message}");
+                fsrUnavailable = true; wantFsr = false; wantIW = outputW; wantIH = outputH;
+            }
+        }
+        if (target != null && wantIW == targetW && wantIH == targetH && fsrActive == wantFsr) {
+            currentUpscaleMode = mode;
+            return;   // nothing to reallocate
+        }
+        AllocateResolutionTargets(wantIW, wantIH);
+        if (wantFsr) {
+            try {
+                fsr?.Dispose();
+                fsr = new Dx12FsrUpscaler(dev, wantIW, wantIH, outputW, outputH);
+            } catch (Exception e) {
+                Console.WriteLine($"[FSR] context create failed, rendering native: {e.Message}");
+                fsrUnavailable = true; wantFsr = false;
+            }
+        }
+        fsrActive = wantFsr;
+        currentUpscaleMode = mode;
     }
 
     public override unsafe void Initialize() {
         // Clustered-deferred: geometry → G-buffer (owns scene depth) → deferred lighting → HDR `target`
         // (color only) → sky/fog/post → composite into `ldr` (R8). `target` no longer owns depth.
+        // At init internal == output (FSR off); EnsureUpscaleTargets adjusts once a volume requests FSR.
+        outputW = targetW; outputH = targetH;
         target = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         ldr = new Dx12OffscreenTarget(dev, targetW, targetH);
@@ -384,6 +460,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         // Cascade caching: DEFAULT ON (BALLISTIC_DX12_SHADOW_CACHE=0 disables).
         shadowCacheOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SHADOW_CACHE") != "0";
         gpuDriven = new Dx12GpuDrivenRenderer(dev);
+
+        AllocFsrOutput();   // output-res UAV target for FSR (allocated even when off — cheap, simplifies resize)
     }
 
     Dx12GpuDrivenRenderer gpuDriven;
@@ -1024,22 +1102,28 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (vp is null || target is null)
             return default;
 
+        // Resolve the upscale mode (volume, or a BALLISTIC_DX12_FSR env override for headless A/B) and make
+        // the internal render resolution + FSR context match it (reallocates targets only on a mode change).
+        // Done FIRST since it can change targetW/targetH (the projection aspect + jitter scale read them).
+        EnsureUpscaleTargets(ResolveUpscaleMode());
+
         // Camera. The provider's view (LookAt) is convention-agnostic — convert 1:1. Rebuild the
         // projection DX-style (RH, z in [0,1]) since the provider's is OpenTK GL-convention (z in [-1,1]).
         Matrix4x4 view = ToNumerics(vp.GetViewMatrix());
         Matrix4x4 proj = Matrix4x4.CreatePerspectiveFieldOfView(
-            45f * (MathF.PI / 180f), (float)targetW / targetH, CameraNear, CameraFar);
-        Matrix4x4 projUnjittered = proj;   // before the TAA jitter — the shadow cascade fit uses this (stable
+            FovYRadians, (float)targetW / targetH, CameraNear, CameraFar);
+        Matrix4x4 projUnjittered = proj;   // before the jitter — the shadow cascade fit uses this (stable
                                            // across frames so cascade caching works; shadows shouldn't jitter)
-        // UNJITTERED view*proj — used for TAA reprojection (must be stable) + the froxel/SSR/post math.
+        // UNJITTERED view*proj — used for motion vectors + the froxel/SSR/post math.
         Matrix4x4 viewProjUnjittered = view * proj;
 
-        // TAA jitter: offset the projection by a sub-pixel Halton amount so the whole frame (geometry +
-        // SSR + shadows) is consistently jittered; the TAA pass resolves it against the unjittered history.
-        // Plumbed ONCE here — FSR reuses currentJitter. Off when the volume disables TAA.
-        bool taaOn = PostFX.TaaEnabled;
-        currentJitter = taaOn ? JitterOffset(taaFrame) : Vector2.Zero;
-        if (taaOn) {
+        // Sub-pixel jitter: offset the projection by a Halton amount so the whole frame (geometry + SSR +
+        // shadows) is consistently jittered; TAA/FSR resolve it against history. FSR REPLACES TAA but still
+        // needs jitter (it reconstructs from jittered frames). currentJitter is reused by the FSR dispatch.
+        bool taaOn = PostFX.TaaEnabled && !fsrActive;
+        bool jitterOn = taaOn || fsrActive;
+        currentJitter = jitterOn ? JitterOffset(taaFrame) : Vector2.Zero;
+        if (jitterOn) {
             // NDC offset = 2 * pixelJitter / screen. DX clip y is up, so subtract for the +y pixel dir.
             proj.M31 += 2f * currentJitter.X / targetW;
             proj.M32 -= 2f * currentJitter.Y / targetH;
@@ -1275,21 +1359,25 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (PostFX.SsrEnabled && PostFX.SsrIntensity > 0f)
             DrawSsr(view, proj);
 
-        // --- TAA (volume-driven; the AA — resolves the jittered frame vs motion-reprojected history) ---
-        if (taaOn)
-            DrawTaa();
-        else
-            taaHistoryValid = false;   // keep history fresh for when TAA turns back on
-
-        // --- SSAO (HBAO from depth → half-res AO, multiplied in the composite) ---
         bool ssaoOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SSAO") != "0";
-        if (ssaoOn) DrawSsao(view, proj);
 
-        // --- Final composite: HDR scene → exposure → ACES → sRGB → LDR ---
-        DrawComposite(ssaoOn);
+        if (fsrActive) {
+            // --- FSR upscale path (replaces TAA): SSAO (internal res) → FSR reconstruct internal→output
+            //     HDR → composite at output res. ---
+            if (ssaoOn) DrawSsao(view, proj);
+            RunFsr();
+            DrawComposite(ssaoOn, fsrOutput);
+        } else {
+            // --- Native path: TAA → SSAO → composite (all at the single shared resolution). ---
+            if (taaOn) DrawTaa();
+            else taaHistoryValid = false;   // keep history fresh for when TAA turns back on
+            if (ssaoOn) DrawSsao(view, proj);
+            DrawComposite(ssaoOn, target);
+        }
 
-        // Remember this frame's UNJITTERED view*proj for next frame's motion vectors (independent of TAA,
-        // since FSR replaces TAA but still needs motion).
+        // Advance the jitter phase (used by both TAA and FSR) and remember this frame's UNJITTERED view*proj
+        // for next frame's motion vectors (independent of TAA, since FSR replaces TAA but still needs motion).
+        if (jitterOn) taaFrame++;
         motionPrevViewProj = viewProjUnjittered;
         motionPrevValid = true;
 
@@ -1523,7 +1611,43 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         taaWriteB = !taaWriteB;
         taaHistoryValid = true;
-        taaFrame++;
+        // taaFrame advances once per frame in BeginRender (shared by TAA + FSR jitter).
+    }
+
+    // The active upscale mode: the volume's PostFX.UpscaleMode, overridable by BALLISTIC_DX12_FSR for
+    // headless A/B (off/nativeaa/quality/balanced/performance/ultra) — a kept test door.
+    UpscaleMode ResolveUpscaleMode() {
+        string env = Environment.GetEnvironmentVariable("BALLISTIC_DX12_FSR");
+        if (string.IsNullOrEmpty(env)) return PostFX.UpscaleMode;
+        return env.Trim().ToLowerInvariant() switch {
+            "0" or "off" => UpscaleMode.Off,
+            "1" or "native" or "nativeaa" => UpscaleMode.NativeAA,
+            "quality" or "q" => UpscaleMode.Quality,
+            "balanced" or "b" => UpscaleMode.Balanced,
+            "performance" or "perf" or "p" => UpscaleMode.Performance,
+            "ultra" or "ultraperformance" or "up" => UpscaleMode.UltraPerformance,
+            _ => PostFX.UpscaleMode,
+        };
+    }
+
+    // FSR temporal upscale: reconstruct the output-resolution HDR from the internal-res HDR color + depth +
+    // motion + jitter. Replaces TAA. Inputs are transitioned to a shader-read state and the output to UAV;
+    // the FFX DX12 backend restores imported resources to those declared states at dispatch end, so the
+    // engine's per-resource state trackers stay consistent.
+    unsafe void RunFsr() {
+        target.ColorToShaderResource();      // internal HDR scene -> PixelShaderResource
+        gbuffer.DepthToShaderResource();      // depth -> PixelShaderResource
+        // motion RT is already PixelShaderResource (gbuffer.ToShaderResource transitioned all colors).
+        fsrOutput.ColorToUnorderedAccess();
+        bool reset = !motionPrevValid;        // first frame after a (re)allocation = reset the history
+        dev.ExecuteSync(cl => {
+            fsr.Dispatch(cl, target.RenderTarget, gbuffer.DepthResource,
+                gbuffer.MotionResource, fsrOutput.RenderTarget,
+                targetW, targetH, new Dx12FsrUpscaler.Vector2Jitter(currentJitter.X, currentJitter.Y),
+                16.6667f, reset, PostFX.UpscaleSharpness > 0f, PostFX.UpscaleSharpness,
+                CameraNear, CameraFar, FovYRadians);
+        });
+        fsrOutput.ColorToShaderResource();    // ready for the composite to sample
     }
 
     // Screen-space reflections (volume-driven): half-res view-space march reads the lit HDR color +
@@ -1624,9 +1748,10 @@ public sealed class DX12HDRenderer : HDRenderer {
         ssaoA.ColorToShaderResource();
     }
 
-    // Bloom: bright-pass the HDR (target, already in SRV state) → bloomA; blur H (bloomA→bloomB);
-    // blur V (bloomB→bloomA). Result lands in bloomA at half-res for the composite to add.
-    unsafe void DrawBloom() {
+    // Bloom: bright-pass the HDR `src` (already in SRV state) → bloomA; blur H (bloomA→bloomB);
+    // blur V (bloomB→bloomA). Result lands in bloomA at half-res for the composite to add. `src` is the
+    // scene HDR (native) or the FSR-upscaled HDR (so bloom is at output res when upscaling).
+    unsafe void DrawBloom(Dx12OffscreenTarget src) {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         float texW = 1f / bloomA.Width, texH = 1f / bloomA.Height;
 
@@ -1646,27 +1771,28 @@ public sealed class DX12HDRenderer : HDRenderer {
             });
         }
 
-        // Bright-pass reads the full-res HDR scene (already in SRV state from DrawComposite).
-        Pass(bloomBrightPso, target, bloomA, 0, new Vector2(texW, texH), 1.0f);
+        // Bright-pass reads the HDR scene (already in SRV state from DrawComposite).
+        Pass(bloomBrightPso, src, bloomA, 0, new Vector2(texW, texH), 1.0f);
         Pass(bloomBlurHPso, bloomA, bloomB, 1, new Vector2(texW, texH), 0f);
         Pass(bloomBlurVPso, bloomB, bloomA, 2, new Vector2(texW, texH), 0f);
         bloomA.ColorToShaderResource();   // ready for the composite to sample
     }
 
-    // Tonemap the HDR scene target into the LDR output. Auto-exposure drives the exposure; bloom (if on)
-    // is added in. The bloom pass runs first (inside this), reading the HDR scene.
-    unsafe void DrawComposite(bool ssaoOn) {
+    // Tonemap the HDR `hdr` source (the native scene target, or the FSR-upscaled output) into the LDR
+    // output at OUTPUT resolution. Auto-exposure drives the exposure; bloom (if on) runs first (inside
+    // this), reading the same HDR source. Sources at internal/half res are sampled by UV (resolution-safe).
+    unsafe void DrawComposite(bool ssaoOn, Dx12OffscreenTarget hdr) {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
 
         // Manual exposure override (BALLISTIC_DX12_EXPOSURE) disables auto-exposure; else auto-meter.
         bool manual = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
             System.Globalization.CultureInfo.InvariantCulture, out float manualExp);
 
-        target.ColorToShaderResource();   // HDR scene color → SRV (for both the lum pass and composite)
+        hdr.ColorToShaderResource();   // HDR source → SRV (for both the lum pass and composite)
 
         if (!manual) {
-            // Auto-exposure metering: reduce the HDR scene to a 1×1 geometric-mean luminance.
-            dev.Device.CopyDescriptorsSimple(1, lumSrvVisible.Cpu(0), target.ColorSrvCpu, heapType);
+            // Auto-exposure metering: reduce the HDR source to a 1×1 geometric-mean luminance.
+            dev.Device.CopyDescriptorsSimple(1, lumSrvVisible.Cpu(0), hdr.ColorSrvCpu, heapType);
             lumTarget.RenderColorOnly(cl => {
                 cl.SetGraphicsRootSignature(lumRootSig);
                 cl.SetPipelineState(lumPso);
@@ -1680,7 +1806,7 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         // Bloom: bright-pass + blur the HDR into bloomA (half-res). On by default; BALLISTIC_DX12_BLOOM=0 off.
         bool bloomOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_BLOOM") != "0";
-        if (bloomOn) DrawBloom();
+        if (bloomOn) DrawBloom(hdr);
 
         // ExposureKey: middle-grey target ~0.18 (the HDR scene is physical radiance; auto-meter rescales).
         *(CompositeConstants*)compositeCbMapped = new CompositeConstants {
@@ -1691,13 +1817,13 @@ public sealed class DX12HDRenderer : HDRenderer {
             UseAo = ssaoOn ? 1f : 0f,
         };
 
-        dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(0), target.ColorSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(0), hdr.ColorSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(1),
-            bloomOn ? bloomA.ColorSrvCpu : target.ColorSrvCpu, heapType);   // bloom slot
+            bloomOn ? bloomA.ColorSrvCpu : hdr.ColorSrvCpu, heapType);   // bloom slot
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(2),
-            manual ? target.ColorSrvCpu : lumTarget.ColorSrvCpu, heapType);
+            manual ? hdr.ColorSrvCpu : lumTarget.ColorSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(3),
-            ssaoOn ? ssaoA.ColorSrvCpu : target.ColorSrvCpu, heapType);     // AO slot
+            ssaoOn ? ssaoA.ColorSrvCpu : hdr.ColorSrvCpu, heapType);     // AO slot
 
         ldr.RenderColorOnly(cl => {
             cl.SetGraphicsRootSignature(compositeRootSig);
@@ -1709,7 +1835,10 @@ public sealed class DX12HDRenderer : HDRenderer {
             cl.DrawInstanced(3, 1, 0, 0);
         });
         if (!manual) lumTarget.ColorToRenderTarget();
-        target.ColorToRenderTarget();   // restore for next frame's scene render
+        // Restore the INTERNAL scene target to RenderTarget for next frame's geometry/deferred pass (FSR
+        // left it in PixelShaderResource; in the native path hdr == target). fsrOutput stays in shader-read
+        // — RunFsr transitions it to UAV next frame from any state.
+        target.ColorToRenderTarget();
     }
 
     // Full-screen volumetric fog: march the air toward the camera (shadowed sun + sky in-scatter),
@@ -1961,8 +2090,9 @@ public sealed class DX12HDRenderer : HDRenderer {
 
     // Readback comes from the LDR composite (R8) — the HDR scene target isn't a valid BMP source.
     public void SaveFrame(string path) => ldr?.SaveBmp(path);
-    public int Width => targetW;
-    public int Height => targetH;
+    // Output (display/readback) resolution — equals the internal render res unless FSR is upscaling.
+    public int Width => outputW;
+    public int Height => outputH;
 
     // Internal pipeline steps — no engine/editor caller (BeginRender draws opaques itself).
     public override void RenderOpaque(IReadOnlyCollection<IStaticMeshRenderer> renderTargets,

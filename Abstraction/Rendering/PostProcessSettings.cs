@@ -14,6 +14,17 @@ public enum MeteringMode {
     Spot,           // only a small center circle meters
 }
 
+// Temporal upscaling quality (FSR). Each mode is a fixed per-dimension render-resolution ratio; the
+// upscaler reconstructs the display resolution. Higher ratio = lower internal res = faster, softer.
+public enum UpscaleMode {
+    Off,              // native-resolution render (no upscaler)
+    NativeAA,         // 1.0x — FSR temporal AA at native res (replaces TAA, no resolution gain)
+    Quality,          // 1.5x per dimension
+    Balanced,         // 1.7x
+    Performance,      // 2.0x
+    UltraPerformance, // 3.0x
+}
+
 // Tunables for the HDR -> display pipeline. Neutral by default: only exposure,
 // ACES tonemapping and gamma always run; everything stylistic is opt-in so the
 // calibrated PBR output isn't silently distorted.
@@ -67,6 +78,12 @@ public sealed class PostProcessSettings {
     // (MSAA is forced off while TAA runs) and also smooths specular/SSAO/SSR noise.
     public bool TaaEnabled { get; set; } = true;
     public float TaaFeedback { get; set; } = 0.9f; // history weight; higher = smoother, more ghosting
+
+    // Temporal upscaling (AMD FidelityFX FSR, DX12 only). Renders the scene at a lower internal
+    // resolution and reconstructs the display resolution from jittered frames + motion vectors. When
+    // active it REPLACES TAA (FSR does its own temporal AA). Off = native-res render (current behavior).
+    public UpscaleMode UpscaleMode { get; set; } = UpscaleMode.Off;
+    public float UpscaleSharpness { get; set; } = 0.5f;   // RCAS sharpening, 0 = none .. 1 = max
 
     // Screen-space reflections: smooth surfaces reflect the actual scene instead of only
     // the sky cubemap. Requires the normal attachment (unavailable in the MSAA path).

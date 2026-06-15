@@ -81,9 +81,12 @@ public sealed class Dx12FsrUpscaler : IDisposable {
         var disp = new FfxApi.DispatchDescUpscale {
             Header = new FfxApi.Header { Type = FfxApi.DescTypeDispatchUpscale, PNext = IntPtr.Zero },
             CommandList = cl.NativePointer,
-            Color  = MakeResource(color,  FfxApi.StatePixelComputeRead, UsageReadOnly),
-            Depth  = MakeResource(depth,  FfxApi.StatePixelComputeRead, UsageDepthTarget),
-            MotionVectors = MakeResource(motion, FfxApi.StatePixelComputeRead, UsageReadOnly),
+            // Inputs are in D3D PIXEL_SHADER_RESOURCE (StatePixelRead) — the renderer transitioned them with
+            // ColorToShaderResource/DepthToShaderResource. The state field must match the ACTUAL state so
+            // FSR's internal barrier from it is valid; FSR restores imported resources to it at the end.
+            Color  = MakeResource(color,  FfxApi.StatePixelRead, UsageReadOnly),
+            Depth  = MakeResource(depth,  FfxApi.StatePixelRead, UsageDepthTarget),
+            MotionVectors = MakeResource(motion, FfxApi.StatePixelRead, UsageReadOnly),
             Exposure = default, Reactive = default, TransparencyAndComposition = default,
             Output = MakeResource(output, FfxApi.StateUnorderedAccess, UsageUav),
             // FSR sample: jitterOffset = negated pixel jitter; projection got +2*jx/W, -2*jy/H.
@@ -98,7 +101,7 @@ public sealed class Dx12FsrUpscaler : IDisposable {
             CameraNear = cameraNear, CameraFar = cameraFar, CameraFovAngleVertical = fovYRadians,
             ViewSpaceToMetersFactor = 0f, Flags = 0,
         };
-        uint rc = FfxApi.ffxDispatch(context, (IntPtr)(&disp));
+        uint rc = FfxApi.ffxDispatch(ref context, (IntPtr)(&disp));
         return rc == FfxApi.ReturnOk;
     }
 
@@ -128,8 +131,9 @@ public sealed class Dx12FsrUpscaler : IDisposable {
     static uint FfxFormat(Format f) => f switch {
         Format.R16G16B16A16_Float => 4,
         Format.R16G16_Float => 18,
-        Format.R32_Float or Format.D32_Float => 28,
-        Format.R32_Typeless => 37,
+        // Our depth resource is R32_Typeless (D32 DSV + R32_Float SRV). FSR creates a view from this
+        // description, and a TYPELESS format can't form a view — report R32_FLOAT (the depth's view format).
+        Format.R32_Float or Format.D32_Float or Format.R32_Typeless => 28,
         Format.R8G8B8A8_UNorm => 10,
         Format.R8G8B8A8_UNorm_SRgb => 12,
         Format.R11G11B10_Float => 16,

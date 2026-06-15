@@ -108,6 +108,7 @@ public sealed class Dx12GBuffer : IDisposable {
     public CpuDescriptorHandle DepthSrvCpu => Dx12Backend.SrvStore.Cpu(depthSrv);
     public CpuDescriptorHandle DsvHandle => dsvHandle;
     public ID3D12Resource DepthResource => depth;
+    public ID3D12Resource MotionResource => colors[MotionRtIndex];   // RG16F motion (FSR input)
 
     CpuDescriptorHandle RtvHandle(int i) => new(rtvHeap.GetCPUDescriptorHandleForHeapStart(), i, rtvInc);
 

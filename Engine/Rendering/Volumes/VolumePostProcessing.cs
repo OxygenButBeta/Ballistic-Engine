@@ -37,6 +37,11 @@ public static class VolumePostProcessing {
             fx.MsaaSamples = aa.msaaSamples.Value;
         }
 
+        if (stack.GetComponent<Upscaling>() is { } upscale) {
+            fx.UpscaleMode = upscale.mode.Value;
+            fx.UpscaleSharpness = upscale.sharpness.Value;
+        }
+
         if (stack.GetComponent<ScreenSpaceReflections>() is { } ssr) {
             fx.SsrEnabled = ssr.enabled.Value;
             fx.SsrIntensity = ssr.intensity.Value;

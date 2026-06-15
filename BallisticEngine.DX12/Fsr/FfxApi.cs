@@ -138,12 +138,14 @@ internal static class FfxApi {
     [DllImport(Loader, CallingConvention = CallingConvention.Cdecl)]
     public static extern uint ffxDestroyContext(ref IntPtr context, IntPtr memCb);
 
+    // NOTE: configure/query/dispatch take ffxContext* (a POINTER to the handle), not the handle value.
+    // ffxQuery for a GLOBAL (context-less) query is called with a null pointer (IntPtr.Zero) — valid.
     [DllImport(Loader, CallingConvention = CallingConvention.Cdecl)]
-    public static extern uint ffxConfigure(IntPtr context, IntPtr desc);
+    public static extern uint ffxConfigure(ref IntPtr context, IntPtr desc);
 
     [DllImport(Loader, CallingConvention = CallingConvention.Cdecl)]
-    public static extern uint ffxQuery(IntPtr context, IntPtr desc);
+    public static extern uint ffxQuery(IntPtr context, IntPtr desc);   // pass IntPtr.Zero for the global query
 
     [DllImport(Loader, CallingConvention = CallingConvention.Cdecl)]
-    public static extern uint ffxDispatch(IntPtr context, IntPtr desc);
+    public static extern uint ffxDispatch(ref IntPtr context, IntPtr desc);
 }

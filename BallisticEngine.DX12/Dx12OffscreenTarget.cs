@@ -42,7 +42,7 @@ public sealed class Dx12OffscreenTarget : IDisposable {
     ResourceStates state = ResourceStates.RenderTarget;
 
     public Dx12OffscreenTarget(Dx12Device device, int width, int height, bool withDepth = false,
-        Format? colorFormat = null, bool colorReadable = false) {
+        Format? colorFormat = null, bool colorReadable = false, bool allowUav = false) {
         dev = device;
         Width = width;
         Height = height;
@@ -50,7 +50,8 @@ public sealed class Dx12OffscreenTarget : IDisposable {
 
         var rtDesc = ResourceDescription.Texture2D(Format, (uint)width, (uint)height,
             mipLevels: 1, arraySize: 1);
-        rtDesc.Flags = ResourceFlags.AllowRenderTarget;
+        // AllowUnorderedAccess for targets a compute pass (e.g. the FSR upscaler) writes via UAV.
+        rtDesc.Flags = ResourceFlags.AllowRenderTarget | (allowUav ? ResourceFlags.AllowUnorderedAccess : ResourceFlags.None);
         var clearVal = new ClearValue(Format, new Vortice.Mathematics.Color4(0, 0, 0, 1));
         RenderTarget = dev.Device.CreateCommittedResource(
             HeapProperties.DefaultHeapProperties, HeapFlags.None, rtDesc,
@@ -179,6 +180,10 @@ public sealed class Dx12OffscreenTarget : IDisposable {
     }
     public void ColorToRenderTarget() {
         dev.ExecuteSync(cl => TransitionTo(cl, ResourceStates.RenderTarget));
+    }
+    // For a UAV-capable target a compute pass writes (FSR output). Created with allowUav.
+    public void ColorToUnorderedAccess() {
+        dev.ExecuteSync(cl => TransitionTo(cl, ResourceStates.UnorderedAccess));
     }
 
     // Depth state transitions for post passes that read scene depth as an SRV.
