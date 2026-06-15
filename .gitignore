@@ -17,6 +17,13 @@ imgui.ini
 SampleProject/Assets/Default/Bistro_v5_2/
 SampleProject/Assets/Bistro_v5_2/
 
+# SampleProject test content — keep ONLY Assets/Default (engine default assets). Everything else under
+# Assets/ (Characters, CornellBox, LightTest, SkyTest, TransparentTest, Entity Profile volumes, Temple,
+# Bistro, ...) is throwaway test-project source — files stay on disk, just not tracked in git.
+SampleProject/Assets/*
+!SampleProject/Assets/Default/
+SampleProject/Assets/Default/Bistro_v5_2/
+
 # Local profiler tools (Tracy viewer/capture binaries; re-download from
 # https://github.com/wolfpld/tracy/releases v0.11.1 — must match the Tracy-CSharp version)
 Tools/Tracy/
