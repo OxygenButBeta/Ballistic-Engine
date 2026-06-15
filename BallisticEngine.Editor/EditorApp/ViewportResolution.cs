@@ -62,15 +62,16 @@ internal sealed class ViewportResolution {
         return new SysVec2(w, h);
     }
 
-    // UV rectangle (uv0, uv1) for the displayed image, accounting for zoom. At zoom 1 it's the full
-    // [0,1] (V flipped, since the GL texture is bottom-up). Higher zoom samples a centered sub-region
-    // — that's the "look closer" magnification. Returns flipped-V UVs ready for ImGui.Image.
-    public (SysVec2 uv0, SysVec2 uv1) ZoomUVs() {
+    // UV rectangle (uv0, uv1) for the displayed image, accounting for zoom. At zoom 1 it's the full [0,1].
+    // Higher zoom samples a centered sub-region — that's the "look closer" magnification. `flipV` flips the
+    // V axis for bottom-up textures (GL); DX12 textures are top-down so it passes false (no flip).
+    public (SysVec2 uv0, SysVec2 uv1) ZoomUVs(bool flipV) {
         float z = System.Math.Max(1f, Zoom);
         float half = 0.5f / z;                 // half-extent of the sampled region around center (0.5)
         float lo = 0.5f - half, hi = 0.5f + half;
-        // V is flipped (top-left origin for ImGui vs bottom-left for GL): uv0.Y = hi, uv1.Y = lo.
-        return (new SysVec2(lo, hi), new SysVec2(hi, lo));
+        return flipV
+            ? (new SysVec2(lo, hi), new SysVec2(hi, lo))   // bottom-up (GL): uv0.Y = hi, uv1.Y = lo
+            : (new SysVec2(lo, lo), new SysVec2(hi, hi));  // top-down (DX12): no flip
     }
 
     // The on-screen rectangle: for Free Aspect it fills the panel; for a fixed resolution it's the

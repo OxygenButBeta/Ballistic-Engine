@@ -3,6 +3,7 @@ using Hexa.NET.ImGui;
 using OpenTK.Graphics.OpenGL4;
 using OpenTK.Mathematics;
 using OpenTK.Windowing.Common;
+using OpenTK.Windowing.Desktop;
 using Keys = OpenTK.Windowing.GraphicsLibraryFramework.Keys;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec4 = System.Numerics.Vector4;
@@ -19,8 +20,10 @@ internal sealed class EditorApplication {
         ImGuiWindowFlags.NoBringToFrontOnFocus | ImGuiWindowFlags.NoSavedSettings;
 
     readonly IBallisticEngineRuntime runtime;
-    readonly GLBallisticEngineWindow window;
+    readonly GameWindow window;   // GL or DX12 host (both GameWindow + IBallisticEngineRuntime + IWindow)
     readonly EngineBootstrap bootstrap;
+    // True when the host is the windowed DX12 swapchain: skip GL-only calls (backbuffer clear, Context VSync).
+    static bool IsDx12 => RenderBackendSelector.Selected == RenderBackend.Dx12;
     readonly ImGuiController imgui;
     readonly EditorCamera editorCamera = new();
     readonly EditorInput editorInput;
@@ -94,8 +97,8 @@ internal sealed class EditorApplication {
     // separate dockable windows, "select tab" means focus that window so it surfaces above its dock node.
     string pendingFocusWindow = EditorLayout.SceneView;
 
-    public EditorApplication(GLBallisticEngineWindow window, string projectPath) {
-        runtime = window;
+    public EditorApplication(GameWindow window, string projectPath) {
+        runtime = (IBallisticEngineRuntime)window;
 
         // Record every main-thread zone for the Profiler panel, forwarding to Tracy if
         // Program.cs installed it (BALLISTIC_TRACY=1).
@@ -104,7 +107,7 @@ internal sealed class EditorApplication {
 
         // Defer the (slow) asset import: bring the window up first, then refresh asynchronously behind
         // the busy overlay. The startup scene loads once that first import completes (see OnRender).
-        bootstrap = new EngineBootstrap(window, projectPath, deferAssetRefresh: true);
+        bootstrap = new EngineBootstrap(runtime, projectPath, deferAssetRefresh: true);
 
         // The editor consumes runtime debug lines (Debug.DrawLine/DrawRay) via the gizmo drawer;
         // turning this on makes the engine-side buffer actually record (a shipped player leaves it
@@ -182,11 +185,11 @@ internal sealed class EditorApplication {
         window.Refresh += () => MarkSceneDirty();
 
         window.WindowState = WindowState.Maximized;
-        window.OnResizeCallback += (w, h) => {
+        runtime.Window.OnResizeCallback += (w, h) => {
             imgui.WindowResized(w, h);
             sceneW = sceneH = gameW = gameH = 0; // re-sync offscreen targets next frame
         };
-        imgui.WindowResized(window.Width, window.Height);
+        imgui.WindowResized(runtime.Window.Width, runtime.Window.Height);
 
         this.window = window;
         ApplyFrameRateLimit();
@@ -296,7 +299,7 @@ internal sealed class EditorApplication {
         // cursor is already locked (then it's pinned to the game's centre). A script gates click-to-
         // recapture on this, so clicking the Inspector â€” pointer NOT over the game image â€” never grabs
         // the cursor back. (The standalone player leaves PointerInGameView at its default true.)
-        Input.PointerInGameView = gameViewHovered || window.CursorMode == CursorMode.Locked;
+        Input.PointerInGameView = gameViewHovered || runtime.Window.CursorMode == CursorMode.Locked;
 
         editorInput.NewFrame();
         var allowCameraInput = sceneViewHovered && !imgui.WantTextInput && !AsyncAssetImport.IsBusy;
@@ -444,9 +447,13 @@ internal sealed class EditorApplication {
         if (SceneManager.IsPlaying)
             Coroutine.EndOfFramePump();
 
-        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
-        GL.ClearColor(0.05f, 0.05f, 0.06f, 1f);
-        GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
+        // GL clears + binds the default framebuffer here; DX12 already cleared the swapchain backbuffer in
+        // Dx12BallisticEngineWindow.OnRenderFrame (before this callback), so skip the GL path under DX12.
+        if (!IsDx12) {
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+            GL.ClearColor(0.05f, 0.05f, 0.06f, 1f);
+            GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
+        }
 
         using (Profiler.Zone("Editor.ImGuiRender"))
             imgui.Render();
@@ -493,10 +500,12 @@ internal sealed class EditorApplication {
         double targetFreq = throttle ? IdleFps : (userCap <= 0 ? 0 : userCap);
         if (Math.Abs(window.UpdateFrequency - targetFreq) > 0.5) {
             window.UpdateFrequency = targetFreq;
-            // VSync must be off for a positive cap to take effect (matches ApplyFrameRateLimit).
-            window.VSync = targetFreq > 0
-                ? OpenTK.Windowing.Common.VSyncMode.Off
-                : OpenTK.Windowing.Common.VSyncMode.Adaptive;
+            // VSync must be off for a positive cap to take effect (matches ApplyFrameRateLimit). The DX12 host
+            // has no GL context (window.VSync would NRE); it presents vsync'd and the UpdateFrequency cap paces it.
+            if (!IsDx12)
+                window.VSync = targetFreq > 0
+                    ? OpenTK.Windowing.Common.VSyncMode.Off
+                    : OpenTK.Windowing.Common.VSyncMode.Adaptive;
         }
     }
 
@@ -507,11 +516,11 @@ internal sealed class EditorApplication {
     public void ApplyFrameRateLimit() {
         int limit = EditorPrefs.Current.FrameRateLimit;
         if (limit <= 0) {
-            window.VSync = OpenTK.Windowing.Common.VSyncMode.Adaptive;
-            window.UpdateFrequency = 0;   // uncapped; VSync paces it
+            if (!IsDx12) window.VSync = OpenTK.Windowing.Common.VSyncMode.Adaptive;
+            window.UpdateFrequency = 0;   // uncapped; VSync paces it (DX12 presents vsync'd)
         }
         else {
-            window.VSync = OpenTK.Windowing.Common.VSyncMode.Off;
+            if (!IsDx12) window.VSync = OpenTK.Windowing.Common.VSyncMode.Off;
             window.UpdateFrequency = limit;
         }
     }
@@ -1498,7 +1507,7 @@ internal sealed class EditorApplication {
         if (dispOffset.X > 0 || dispOffset.Y > 0)
             ImGui.SetCursorPos(ImGui.GetCursorPos() + dispOffset);
 
-        (SysVec2 uv0, SysVec2 uv1) = sceneRes.ZoomUVs();
+        (SysVec2 uv0, SysVec2 uv1) = sceneRes.ZoomUVs(!Renderer.DisplayTextureTopDown);
         ImGui.Image(Tex(Renderer.SceneColorHandle), dispSize, uv0, uv1);
         SysVec2 imageMin = ImGui.GetItemRectMin();
         SysVec2 imageSize = dispSize;
@@ -1796,7 +1805,7 @@ internal sealed class EditorApplication {
             if (dispOffset.X > 0 || dispOffset.Y > 0)
                 ImGui.SetCursorPos(ImGui.GetCursorPos() + dispOffset);
 
-            (SysVec2 uv0, SysVec2 uv1) = gameRes.ZoomUVs();
+            (SysVec2 uv0, SysVec2 uv1) = gameRes.ZoomUVs(!Renderer.DisplayTextureTopDown);
             ImGui.Image(Tex(Renderer.GameColorHandle), dispSize, uv0, uv1);
             gameViewFocused = ImGui.IsWindowFocused();
             gameViewHovered = ImGui.IsItemHovered(); // is the MOUSE over the game image specifically

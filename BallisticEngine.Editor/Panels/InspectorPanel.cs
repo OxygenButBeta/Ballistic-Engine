@@ -2439,6 +2439,10 @@ internal sealed class InspectorPanel {
     const int MaterialPreviewSize = 128;
 
     void DrawMaterialPreview(Guid guid, MaterialDefinition definition) {
+        // DX12 editor: the material preview uses a GL FBO + GL texture, invalid for the DX12 ImGui backend.
+        // Skip it (the inspector just omits the sphere). TEMPORARY — removed when the DX12 preview port lands.
+        if (RenderBackendSelector.Selected == RenderBackend.Dx12)
+            return;
         // cheap content fingerprint: re-render only when the serialized material changes
         int hash = System.Text.Json.JsonSerializer.Serialize(definition, PipelineJson.Options).GetHashCode();
         if (guid != materialPreviewGuid || hash != materialPreviewHash || materialPreviewTex == 0) {

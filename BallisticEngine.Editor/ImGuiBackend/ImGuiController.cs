@@ -17,7 +17,9 @@ internal sealed class ImGuiController : IDisposable {
     public static ImFontPtr LargeIcons { get; private set; }
     public static bool HasIcons { get; private set; }
     readonly GameWindow window;
-    readonly ImGuiGLRenderer renderer = new();
+    // GL or DX12 device backend, chosen by the active render backend. The DX12 backend records into the
+    // editor swapchain's open UI command list (resolved lazily — the swapchain is created after this ctor).
+    readonly IImGuiRenderer renderer;
     readonly ImGuiContextPtr context;
     bool frameBegun;
 
@@ -52,6 +54,11 @@ internal sealed class ImGuiController : IDisposable {
         ApplyGeometry(Scale);
         ApplyColors(EditorPrefs.Current.Accent);
 
+        // Pick the device backend. DX12 records into the editor swapchain's open UI command list; the
+        // swapchain is created after this ctor (in the window's OnLoad), so resolve it lazily at render time.
+        renderer = RenderBackendSelector.Selected == RenderBackend.Dx12
+            ? new ImGuiDx12Renderer(() => (window as Dx12BallisticEngineWindow)?.SwapChain?.CommandList)
+            : new ImGuiGLRenderer();
         renderer.CreateDeviceResources();
 
         window.TextInput += e => ImGuiInput.OnTextInput((uint)e.Unicode);

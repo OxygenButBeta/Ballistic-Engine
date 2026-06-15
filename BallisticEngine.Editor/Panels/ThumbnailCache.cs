@@ -20,6 +20,12 @@ internal sealed class ThumbnailCache {
 
     // Returns the GL texture id, or 0 while the thumbnail is still loading (or failed).
     public int Get(Guid guid, string assetPath) {
+        // DX12 editor: GL thumbnail textures aren't valid for the DX12 ImGui backend (a GL name fed as a
+        // descriptor ptr would be garbage). Return 0 so the browser draws type-icon tiles. TEMPORARY —
+        // removed when the DX12 thumbnail pipeline lands (the next ENDGAME-2 step ports the previews+upload).
+        if (RenderBackendSelector.Selected == RenderBackend.Dx12)
+            return 0;
+
         if (ready.TryGetValue(guid, out var texture))
             return texture;
 

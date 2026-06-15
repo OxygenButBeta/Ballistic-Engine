@@ -12,7 +12,13 @@ internal class Program {
 
         BallisticEngine.Profiling.TracyProfiler.TryInstall("Ballistic Editor");
 
-        GLBallisticEngineWindow window = new(1600, 900);
+        // Backend seam (DX12Migration.md ENDGAME 2): BALLISTIC_BACKEND=dx12 brings up the windowed DX12 host
+        // (swapchain + ImGui DX12 backend) instead of the GL window. GL is the default until the DX12 editor
+        // reaches parity (then GL is deleted). Both are GameWindow + IBallisticEngineRuntime + IWindow.
+        OpenTK.Windowing.Desktop.GameWindow window =
+            RenderBackendSelector.Selected == RenderBackend.Dx12
+                ? new Dx12BallisticEngineWindow(1600, 900)
+                : new GLBallisticEngineWindow(1600, 900);
         _ = new EditorApplication(window, projectPath);
         window.Run();
 

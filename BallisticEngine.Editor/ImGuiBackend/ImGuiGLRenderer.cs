@@ -8,7 +8,7 @@ namespace BallisticEngine.Editor;
 // Minimal Dear ImGui OpenGL3 renderer for OpenTK. Uploads ImDrawData each frame into a
 // growable VBO/EBO and draws with a small ortho shader, honoring per-command clip rects and
 // texture bindings. Saves/restores the GL state it touches because it shares the engine's context.
-internal sealed class ImGuiGLRenderer : IDisposable {
+internal sealed class ImGuiGLRenderer : IImGuiRenderer {
     int vao, vbo, ebo;
     int shader, attribLocationTex, attribLocationProj, attribLocationPos, attribLocationUV, attribLocationColor;
     int fontTexture;
