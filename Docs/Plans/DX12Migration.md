@@ -176,17 +176,33 @@ slices) → half-res R8 AO + separable blur, multiplied into the HDR color in th
 BALLISTIC_DX12_SSAO=0 off). VERIFIED SunTemple — contact darkening in crevices/column bases/arches, flat
 surfaces untouched (ref dx12_suntemple_ssao.png). Composite SRV table now 4 (HDR/bloom/avgLum/AO).
 
-**DX12 stack now: PBR + sky + IBL + shadows + fog + HDR + auto-exposure + bloom + SSAO, on 2 scenes —
-but the OPAQUE PASS IS SINGLE-PASS FORWARD (sun only). Architecture decision: move to CLUSTERED DEFERRED
-(see the decision block at the top). The post-FX above survives; the opaque pass gets re-architected.**
+**🟢 DX12 DEFERRED — GEOMETRY + LIGHTING PASS DONE (2026-06-15):** the single-pass forward opaque is
+REPLACED by the first half of the clustered-deferred architecture. (1) Geometry pass fills the fat
+G-buffer (Dx12GBuffer: RT0 albedo+specF0 sRGB / RT1 world-normal R16F / RT2 metallic-roughness-ao-flags /
+RT3 emissive R16F + a typeless depth D32 DSV+R32 SRV shared by lighting/SSAO/fog) — wires the previously-
+unwired GBuffer.hlsl PSO, same vertex layout + per-draw DrawConstants CBV + 6 material SRVs as the forward
+path. (2) ONE fullscreen DeferredLighting.hlsl pass reconstructs world pos from depth+InvViewProj and runs
+the EXACT forward Cook-Torrance sun + split-sum IBL + cascaded PCF shadow math on G-buffer inputs → HDR
+target (lighting moved OUT of the material shader). The HDR scene target no longer owns depth (G-buffer
+does); sky draws AFTER deferred lighting via target.RenderColorWithExternalDepth (HDR color + G-buffer DSV,
+LEqual no-write); fog/SSAO read the G-buffer depth. (3) SSAO rewired to the REAL G-buffer world-normal
+(rotated to view space) — dropped the depth-derivative reconstruct hack. The whole post-FX/atmosphere stack
+(shadows/IBL/sky/fog/HDR/auto-exposure/bloom/SSAO/composite) SURVIVED unchanged. VERIFIED headless (paused,
+frame 120): SunTemple deferred mean (162.1,156.7,150.0) vs prior forward SSAO ref (161.6,156.2,149.5) —
+brightness-identical, geometry/shadows/normals/sky all correct; BistroExterior clean (1591 draws/2.8M tris),
+sky depth-test reorder works on the open exterior. Refs dx12_suntemple_deferred.png / dx12_bistro_deferred.png.
 
-**NEXT (full-auto /loop; CLUSTERED DEFERRED re-architecture, then port ALL GL features):**
-1. G-buffer geometry pass — fat MRT (albedo / world-normal / ORM-material / depth); split StandardOpaque
-   into a geometry-WRITE shader (no lighting, just G-buffer outputs).
-2. Deferred lighting pass — fullscreen, reads G-buffer → PBR sun + IBL + shadows → HDR target (the
-   lighting math moves out of the material shader into one screen-space pass).
-3. Rewire SSAO to read the G-buffer world-normal (drop the depth-reconstruct hack).
-4. Clustered punctual lights (point/spot, froxel cull) in the deferred pass — DX12 has NONE yet (sun only).
+**DX12 stack now: clustered-deferred geometry+lighting + sky + IBL + shadows + fog + HDR + auto-exposure +
+bloom + SSAO, on 2 scenes. Still SUN-ONLY (no punctual lights yet) — that's the next step (clustering).**
+
+**NEXT (full-auto /loop; finish CLUSTERED DEFERRED, then port ALL GL features):**
+1. ~~G-buffer geometry pass~~ DONE.
+2. ~~Deferred lighting pass (sun+IBL+shadows)~~ DONE.
+3. ~~SSAO reads G-buffer normal~~ DONE.
+4. **CLUSTERED PUNCTUAL LIGHTS (point/spot, froxel cull) in the deferred pass — DX12 has NONE yet (sun
+   only).** Lights come from RuntimeSet<PointLight>/<SpotLight>; check the GL GLClusteredLights port for
+   the froxel grid + per-cluster light-index list. Add a punctual-light loop to DeferredLighting.hlsl
+   (same Cook-Torrance BRDF, point/spot attenuation), fed by a light SSBO/CBV + cluster index buffer.
 5. SSR (reads G-buffer); TAA; SSGI (LAST); transparents forward pass; sky clouds/stars; perf.
 6. Finally editor→DX12 + delete GL wholesale. DON'T break the editor — it renders on GL; delete GL last.
 
