@@ -16,7 +16,7 @@ cbuffer SsgiConstants : register(b0) {
     float4 Params2;  // xy = gather texel size (1/halfRes), z = preExposure, w = 1/preExposure
     float4 Combine0; // x=Intensity y=Look z=Saturation w=OcclusionPower
     float4 Tint;     // xyz = bounce tint
-    float4 Params3;  // x=HasHistory y=MaxHistory z/w=(unused) — temporal
+    float4 Params3;  // x=HasHistory y=MaxHistory z=IsolateMode w=(unused) — temporal + debug
 };
 
 Texture2D ColorTex  : register(t0);   // gather: lit HDR scene  | combine: scene
@@ -241,5 +241,13 @@ float4 PSCombine(VSOut input) : SV_Target {
     gi *= Tint.xyz * Intensity;
     // Bounce is in pre-exposed (viewable) units; convert back to raw HDR before adding to the raw scene.
     float3 add = clamp(gi, 0.0, 8.0) * edgeFade * Params2.w;
+
+    // GI-ISOLATE debug view (Params3.z > 0.5): output ONLY the indirect bounce `add` (the SSGI/RT-GI
+    // contribution), NOT scene+add. This is THE measurement antidote — judging GI on the bright composite
+    // hides it; here every pixel's value IS the indirect light this pass added (raw HDR, the composite
+    // tonemaps it like everything else). A black isolate frame = GI contributes nothing here.
+    if (Params3.z > 0.5)
+        return float4(add, 1.0);
+
     return float4(scene + add, 1.0);
 }

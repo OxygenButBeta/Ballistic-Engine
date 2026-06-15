@@ -218,6 +218,14 @@ public sealed class DX12HDRenderer : HDRenderer {
     float SsgiPreExposure() => float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
         System.Globalization.CultureInfo.InvariantCulture, out float e) ? e : 1.0e-5f;
 
+    // GI-ISOLATE debug view (P0 measurement harness): when on, the SSGI/RT-GI combine outputs ONLY the
+    // indirect bounce it adds (not scene+bounce) so the indirect contribution is directly visible + diffable
+    // in enclosed interiors — the antidote the GI plan is built around (judge GI by the isolated bounce, never
+    // the composite mean). Env door BALLISTIC_DX12_GI_ISOLATE=1 (headless A/B); the editor can drive it later
+    // via PostFX. Falls back to the volume's SsgiDebugView so the existing inspector toggle works headless too.
+    bool GiIsolateOn() =>
+        Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_ISOLATE") == "1" || PostFX.SsgiDebugView;
+
     // Transparent forward pass: after deferred + sky, draw Material.Transparent submeshes back-to-front,
     // alpha-blended, depth-testing the G-buffer depth (LEqual, no write). Full forward PBR (sun + IBL +
     // shadows + clustered punctual) sampling material maps directly (TransparentForward.hlsl).
@@ -1298,11 +1306,33 @@ public sealed class DX12HDRenderer : HDRenderer {
 
     readonly System.Diagnostics.Stopwatch cpuFrameSw = new();
 
+    // Per-pass GPU timing (P0 GI measurement harness). Every DX12 pass is its own ExecuteSync = submit + a
+    // blocking WaitForGpu (Dx12Device.ExecuteSync), so a CPU stopwatch around a pass's calls measures that
+    // pass's GPU wall-time directly (the queue is idle between passes). Not a timestamp-query GPU-exclusive
+    // number — it includes submit + fence-wait overhead — but for "is RT-GI 2ms or 20ms?" it is honest and
+    // sufficient, and it needs zero query-heap plumbing through every ExecuteSync. Enable with
+    // BALLISTIC_DX12_GI_TIMING=1 (or any BALLISTIC_STATS_OUT run). Recorded into RenderStats.GpuPasses, which
+    // the .stats.json / `bal perf` sidecar already serializes.
+    readonly System.Diagnostics.Stopwatch passSw = new();
+    bool? giTimingOn;
+    bool GiTimingEnabled => giTimingOn ??= (Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_TIMING") == "1"
+        || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("BALLISTIC_STATS_OUT")));
+
+    // Run `body`, and if GI timing is on, record its GPU wall-time under `name` in RenderStats.GpuPasses.
+    void TimePass(string name, Action body) {
+        if (!GiTimingEnabled) { body(); return; }
+        passSw.Restart();
+        body();
+        passSw.Stop();
+        RenderStats.Scene.GpuPasses.Add((name, passSw.Elapsed.TotalMilliseconds));
+    }
+
     public override unsafe RenderMetrics BeginRender(RendererArgs args) {
         IViewProjectionProvider vp = args.viewProjectionProvider;
         if (vp is null || target is null)
             return default;
         cpuFrameSw.Restart();   // CPU render-submission cost (the AI-measurable frame budget)
+        if (GiTimingEnabled) RenderStats.Scene.GpuPasses.Clear();   // fresh per-pass GPU timings each frame
 
         // Resolve the upscale mode (volume, or a BALLISTIC_DX12_FSR env override for headless A/B) and make
         // the internal render resolution + FSR context match it (reallocates targets only on a mode change).
@@ -1575,8 +1605,8 @@ public sealed class DX12HDRenderer : HDRenderer {
                       : ssgiEnv == "0" ? GiMode.Off
                       : ssgiEnv == "1" ? GiMode.ScreenSpace
                       : PostFX.GiMode;
-        if (giMode == GiMode.RayTraced) { if (EnsureRtGi()) DrawRtGi(view, viewProj, proj); else DrawSsgi(view, proj); }
-        else if (giMode == GiMode.ScreenSpace) DrawSsgi(view, proj);
+        if (giMode == GiMode.RayTraced) { if (EnsureRtGi()) TimePass("GI:RT", () => DrawRtGi(view, viewProj, proj)); else TimePass("GI:SSGI", () => DrawSsgi(view, proj)); }
+        else if (giMode == GiMode.ScreenSpace) TimePass("GI:SSGI", () => DrawSsgi(view, proj));
 
         // --- Volumetric fog (post pass, reads depth+shadows, blends over HDR scene color) ---
         // BALLISTIC_FX_VOLUMETRIC=1 forces it on (same harness contract as the GL backend).
@@ -2000,7 +2030,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             Combine0 = new Vector4(pf.SsgiIntensity, Math.Clamp(pf.SsgiLook, 0f, 1f),
                                    MathF.Max(pf.SsgiSaturation, 0f), MathF.Max(pf.SsgiOcclusionPower, 0f)),
             Tint = new Vector4(pf.SsgiTint.X, pf.SsgiTint.Y, pf.SsgiTint.Z, 0f),
-            Params3 = new Vector4(ssgiHistValid ? 1f : 0f, MathF.Max(pf.SsgiMaxHistory, 1f), 0f, 0f),
+            Params3 = new Vector4(ssgiHistValid ? 1f : 0f, MathF.Max(pf.SsgiMaxHistory, 1f), GiIsolateOn() ? 1f : 0f, 0f),
         };
         return fi;
     }
