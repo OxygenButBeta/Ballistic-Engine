@@ -115,9 +115,18 @@ correct lift (facades/cobbles/foliage lit, not flat-dark; mean 25→32; ref dx12
 (no ProceduralSky) uses the flat-ambient fallback, unchanged. DX12 now: PBR + procedural sky + split-sum
 IBL + mipped textures, on 2 real scenes.
 
-**NEXT (DX12, each committable; user directive = port ALL GL features):** cascaded shadows (Phase 3 — the
-next big visual gap: sun shadow maps + PCF); **volumetric fog (user-requested)**; sky clouds/cirrus/stars
-(follow-up to the atmosphere); rest of post-FX (bloom/TAA/SSAO/SSR/auto-exposure, SSGI LAST); interleave
+**🟢 DX12 CASCADED SHADOWS (2026-06-15):** sun shadow maps — Dx12ShadowMath (4-cascade frustum-slab fit
++ texel snap, DX ortho z[0,1]) + Dx12ShadowMap (D32 depth array, DSV/layer, R32 array SRV) + depth-only
+PSO (ShadowDepth.hlsl, slope-scaled bias) rendered per cascade on the upload list; opaque SunShadow() =
+first-cascade select + 3×3 PCF, multiplies the direct sun. Per-frame FrameConstants CBV (b1) = cascade
+matrices + bias; IBL/shadow SRV table now t6..t9 (shadow array t9). VERIFIED on SunTemple (clear
+directional shadows, mean 87→66, no acne; ref dx12_suntemple_shadows.png) + Bistro. 4 cascades re-render
+every frame (caching = later perf). **DX12 lighting model now complete: PBR + sky + IBL + shadows.**
+
+**NEXT (DX12, each committable; user directive = port ALL GL features):** **volumetric fog
+(user-requested)** — froxel/raymarch height fog + light scattering, reuses the shadow cascades for
+shadowed shafts; sky clouds/cirrus/stars (follow-up to the atmosphere); rest of post-FX (bloom/TAA/SSAO/
+SSR/auto-exposure, SSGI LAST); alpha-cutout caster shadows (foliage); cascade caching (perf); interleave
 mesh verts (perf); finally editor→DX12 + delete GL wholesale (incl. the GL-shaped bind methods +
 RenderContext the DX12 path no-ops). Exposure is a fixed 1e-5 stand-in until auto-exposure. DON'T break
 the editor — it renders on GL; delete GL only at the very end.
