@@ -6,6 +6,31 @@ archive and a fallback).
 
 ---
 
+## 🔻 STRATEGY CHANGE #2 (2026-06-15, user) — REDESIGN THE ABSTRACTION DX-NATIVE FIRST
+
+User: "şu anki soyutlamalar pek iyi değil, çok amatörce yazıldı; bizi zor patikalara sokuyorsa
+değiştirmekten çekinme çünkü zaten DX'e geçiyoruz, GL iptal." + "full kontrol sende, ben AFK, /loop."
+
+So: do NOT bridge the DX12 backend onto the GL-shaped abstraction. REDESIGN the render abstraction to
+be DX-native FIRST, then build the renderer on it. GL is cancelled — zero back-compat obligation. The
+GL-isms to remove (each forced ugly no-op/wrapper code in the first bridge attempt, now reverted):
+  - `RenderContext` == a VAO. DX12 has no VAO → the concept should not exist (or become a trivial device
+    carrier with no Activate/Deactivate).
+  - `GPUBuffer<T>.Activate/Deactivate` (VAO-bind model) → no-ops in DX12. Drop the bind model; buffers
+    expose GPU address + size, the renderer binds per-draw.
+  - `Shader` per-name uniform API (SetMatrix4/SetFloat3/ActivateShader...) → constant buffers +
+    descriptor tables in DX12. The DX12 shader was a 100% no-op stub faking this. Replace the model.
+  - Four SEPARATE vertex buffers (pos/normal/uv/tangent) → DX12 wants ONE interleaved vertex buffer +
+    one upload. Cleaner and faster.
+  - `Texture.Activate/Deactivate` (texture-unit binding) + `protected internal Upload` (cross-assembly
+    wrapper hack) → descriptor-based binding; a clean public upload entry.
+  - `Material.Activate/Deactivate` (binds units + a `LastActivatedMaterial` static) → a material is a
+    descriptor table the renderer points at.
+Approach: map the FULL abstraction surface + every engine call-site (Mesh/Material/GraphicAPI/
+SkyboxRenderer + others) → design the DX-native seam → migrate the engine types onto it → build the DX12
+backend on it. Working autonomously in /loop: commit each increment. (First-bridge files Dx12*.cs are
+being reworked onto the new seam, not kept as-is.)
+
 ## 🔻 STRATEGY CHANGE (2026-06-15, user directive) — FULL DX12, NOT side-by-side
 
 The user decided: **GL will be deleted at the end anyway, and maintaining two backends in parallel is

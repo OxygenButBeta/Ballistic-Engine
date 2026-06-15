@@ -23,6 +23,10 @@ public sealed class Dx12Texture2D : Texture2D {
         UID = nextId++;
     }
 
+    // The engine's Upload is protected-internal; from this SEPARATE assembly DirectXRenderAsset only sees
+    // `protected`, which it can't call (it isn't a subclass). This public wrapper is the factory's entry.
+    public void UploadPublic(in TextureData data, TextureType type) => Upload(in data, type);
+
     // `protected` (not `protected internal`): cross-assembly override of the engine's protected-internal
     // Upload — the `internal` half isn't visible from the DX12 assembly (same C# rule as game scripts).
     protected override unsafe void Upload(in TextureData data, TextureType type) {

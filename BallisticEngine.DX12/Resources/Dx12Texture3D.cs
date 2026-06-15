@@ -21,6 +21,9 @@ public sealed class Dx12Texture3D : Texture3D {
         Type = TextureType.SkyBox;
     }
 
+    // Public entry for the factory (UploadFaces is protected from this assembly — see Dx12Texture2D).
+    public void UploadFacesPublic(TextureData[] faces) => UploadFaces(faces);
+
     // `protected` (not `protected internal`): cross-assembly override rule (see Dx12Texture2D.Upload).
     protected override unsafe void UploadFaces(TextureData[] faces) {
         if (faces is null || faces.Length != 6 || !faces[0].IsValid)
