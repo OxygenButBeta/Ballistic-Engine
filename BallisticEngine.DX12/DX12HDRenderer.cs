@@ -459,6 +459,13 @@ public sealed class DX12HDRenderer : HDRenderer {
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         ldr = new Dx12OffscreenTarget(dev, outputW, outputH, colorReadable: true);   // LDR composite output (display res)
         RegisterLdrUi();
+        // Editor display: the editor's ImGui pass samples ldr (SceneColorHandle) EVERY frame, including
+        // before the scene first composites (long async import). Leave it sample-ready (PixelShaderResource)
+        // so it's never sampled as an SRV while in RenderTarget state — that undefined access hangs the GPU
+        // over many frames (DXGI_ERROR_DEVICE_HUNG). Composite transitions PSR->RT->PSR per frame thereafter.
+        // Unconditional (not gated on PresentToScreen): the editor sets PresentToScreen=false AFTER Initialize,
+        // and it's harmless headless (SaveBmp transitions from any state).
+        ldr.ColorToShaderResource();
         gbuffer = new Dx12GBuffer(dev, internalW, internalH);
         motionPrevValid = false;                                // prev view*proj is stale after a realloc
         if (bloomRootSig != null) AllocBloomTargets();          // half-res bloom ping-pong follows size
@@ -527,6 +534,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         ldr = new Dx12OffscreenTarget(dev, targetW, targetH, colorReadable: true);
         RegisterLdrUi();
+        ldr.ColorToShaderResource();   // sample-safe before first composite (see AllocateResolutionTargets)
         gbuffer = new Dx12GBuffer(dev, targetW, targetH);
         BuildRootSignature();
         BuildPipeline();

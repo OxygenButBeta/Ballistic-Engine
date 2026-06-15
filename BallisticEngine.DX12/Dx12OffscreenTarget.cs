@@ -351,6 +351,38 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         });
     }
 
+    // Read an RGBA8 (R8G8B8A8_UNorm) color target back to a tightly-packed CPU byte[] (w*h*4), TOP-DOWN
+    // (row 0 = top). For the editor's mesh/material thumbnail previews (render to this target, read back).
+    // Restores RenderTarget after. Assumes the default ColorFormat (4 bytes/pixel).
+    public unsafe byte[] ReadColorRgba8() {
+        var footprints = new PlacedSubresourceFootPrint[1];
+        var rowCounts = new uint[1]; var rowSizes = new ulong[1];
+        dev.Device.GetCopyableFootprints(RenderTarget.Description, 0, 1, 0,
+            footprints, rowCounts, rowSizes, out ulong totalBytes);
+        PlacedSubresourceFootPrint fp = footprints[0];
+        int rowPitch = (int)fp.Footprint.RowPitch;
+
+        using ID3D12Resource readback = dev.Device.CreateCommittedResource(
+            HeapProperties.ReadbackHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
+
+        dev.ExecuteSync(cl => {
+            TransitionTo(cl, ResourceStates.CopySource);
+            cl.CopyTextureRegion(new TextureCopyLocation(readback, fp), 0, 0, 0,
+                new TextureCopyLocation(RenderTarget, 0), null);
+            TransitionTo(cl, ResourceStates.RenderTarget);
+        });
+
+        var dst = new byte[Width * Height * 4];
+        byte* mapped = readback.Map<byte>(0);
+        try {
+            for (int y = 0; y < Height; y++)
+                System.Runtime.InteropServices.Marshal.Copy(
+                    (IntPtr)(mapped + (long)y * rowPitch), dst, y * Width * 4, Width * 4);
+        } finally { readback.Unmap(0); }
+        return dst;
+    }
+
     unsafe void WriteBmp(string path, byte* src, int rowPitch) {
         int w = Width, h = Height;
         int rowBytes = w * 3;

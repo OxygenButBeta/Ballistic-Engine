@@ -37,13 +37,24 @@ public sealed class Dx12DescriptorHeap : IDisposable {
     // persistent heap. The ring heap calls Reset() per frame so it never overflows under normal load.
     // Locked: the persistent SRV store is allocated from texture uploads on JobSystem worker threads.
     readonly object gate = new();
+    // Freed slots for reuse (Free pushes, Allocate pops first). Lets the editor UI heap recycle thumbnail
+    // descriptors across asset-browser invalidations without leaking the bump cursor toward the cap.
+    readonly Stack<int> freeList = new();
     public int Allocate() {
         lock (gate) {
+            if (freeList.Count > 0)
+                return freeList.Pop();
             if (cursor >= capacity)
                 throw new InvalidOperationException(
                     $"Descriptor heap full ({capacity}). Grow the heap or reset it per frame.");
             return cursor++;
         }
+    }
+
+    // Return a slot to the free list for reuse (the descriptor itself is overwritten on the next Allocate
+    // that reuses the slot via CopyDescriptorsSimple). Only valid for heaps allocated via Allocate().
+    public void Free(int index) {
+        lock (gate) freeList.Push(index);
     }
 
     // Reserve `count` CONTIGUOUS slots (for a material's descriptor table); returns the first index.

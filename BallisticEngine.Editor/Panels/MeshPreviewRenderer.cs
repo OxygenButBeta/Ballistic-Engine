@@ -10,6 +10,8 @@ internal static class MeshPreviewRenderer {
     static int program;
 
     public static byte[] Render(in MeshData data, int size) {
+        if (RenderBackendSelector.Selected == RenderBackend.Dx12)
+            return Dx12EditorPreview.RenderMesh(in data, size);
         EnsureProgram();
 
         // GL state we touch and must restore (called mid-UI-frame on the shared context).

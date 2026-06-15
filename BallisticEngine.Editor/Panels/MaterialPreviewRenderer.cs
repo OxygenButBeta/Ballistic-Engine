@@ -17,6 +17,8 @@ internal static class MaterialPreviewRenderer {
     static int sphereVao, sphereVbo, sphereEbo, sphereIndexCount;
 
     public static byte[] Render(MaterialDefinition material, int size) {
+        if (RenderBackendSelector.Selected == RenderBackend.Dx12)
+            return Dx12EditorPreview.RenderMaterial(material, size);
         EnsureProgram();
         EnsureSphere();
 

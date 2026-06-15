@@ -58,8 +58,11 @@ internal sealed class AssetBrowserPanel {
     readonly List<(string path, Guid guid)> visibleFiles = new();
     Guid anchorGuid;
 
-    // Project-relative with forward slashes, e.g. "Assets" or "Assets/Default/Sky".
-    public string CurrentFolder { get; private set; } = "Assets";
+    // Project-relative with forward slashes, e.g. "Assets" or "Assets/Default/Sky". BALLISTIC_EDITOR_FOLDER
+    // opens the browser at a given folder on launch — a test door so headless captures can land on a folder
+    // with previewable assets (thumbnails/material previews) without manual navigation.
+    public string CurrentFolder { get; private set; } =
+        Environment.GetEnvironmentVariable("BALLISTIC_EDITOR_FOLDER") is { Length: > 0 } f ? f : "Assets";
 
     // Set by EditorApplication: synchronously recompiles + hot-reloads game scripts. Invoked
     // after creating/renaming a .cs so the component shows up in Add Component immediately.

@@ -2435,20 +2435,29 @@ internal sealed class InspectorPanel {
     // content (hash) changes, so the GL pass runs once per edit, not per frame.
     Guid materialPreviewGuid;
     int materialPreviewHash;
-    int materialPreviewTex;
+    nint materialPreviewTex;     // ImGui handle: GL texture name or DX12 UiHeap descriptor ptr
+    Dx12EditorPreview.Dx12EditorTexture materialPreviewDx12;   // DX12 backing (disposed on re-render)
     const int MaterialPreviewSize = 128;
+    static bool IsDx12 => RenderBackendSelector.Selected == RenderBackend.Dx12;
 
     void DrawMaterialPreview(Guid guid, MaterialDefinition definition) {
-        // DX12 editor: the material preview uses a GL FBO + GL texture, invalid for the DX12 ImGui backend.
-        // Skip it (the inspector just omits the sphere). TEMPORARY — removed when the DX12 preview port lands.
-        if (RenderBackendSelector.Selected == RenderBackend.Dx12)
+        // DX12: the material-preview GPU render (Dx12EditorPreview) hangs the GPU under load — DISABLED until
+        // root-caused (the inspector just omits the sphere). Re-enable with the thumbnail path once verified.
+        if (IsDx12)
             return;
         // cheap content fingerprint: re-render only when the serialized material changes
         int hash = System.Text.Json.JsonSerializer.Serialize(definition, PipelineJson.Options).GetHashCode();
         if (guid != materialPreviewGuid || hash != materialPreviewHash || materialPreviewTex == 0) {
             try {
                 byte[] pixels = MaterialPreviewRenderer.Render(definition, MaterialPreviewSize);
-                materialPreviewTex = UploadPreviewTexture(materialPreviewTex, pixels, MaterialPreviewSize);
+                if (IsDx12) {
+                    materialPreviewDx12?.Dispose();   // free the previous texture + its UiHeap slot
+                    materialPreviewDx12 = Dx12EditorPreview.UploadTexture(pixels, MaterialPreviewSize);
+                    materialPreviewTex = materialPreviewDx12.Handle;
+                }
+                else {
+                    materialPreviewTex = UploadPreviewTexture((int)materialPreviewTex, pixels, MaterialPreviewSize);
+                }
                 materialPreviewGuid = guid;
                 materialPreviewHash = hash;
             }

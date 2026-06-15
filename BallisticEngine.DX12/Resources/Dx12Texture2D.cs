@@ -16,6 +16,10 @@ public sealed class Dx12Texture2D : Texture2D {
     ID3D12Resource resource;
     int srvIndex = -1;
     public ID3D12Resource Resource => resource;
+    // True once a valid persistent SRV exists (Upload succeeded). False for a texture whose data was invalid
+    // — sampling SrvCpu when -1 yields a descriptor before the heap start (GPU device-removal). Callers that
+    // copy SrvCpu into a shader-visible table MUST check this and substitute a fallback when false.
+    public bool HasSrv => srvIndex >= 0;
     // CPU handle of this texture's persistent SRV — the renderer copies it into the shader-visible heap.
     public CpuDescriptorHandle SrvCpu => Dx12Backend.SrvStore.Cpu(srvIndex);
 

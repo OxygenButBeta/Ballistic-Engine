@@ -78,9 +78,9 @@ internal sealed class EditorApplication {
     // GL texture name -> ImGui texture handle. Hexa's ImGui.Image/ImageButton take an ImTextureID
     // (u64 handle), with no implicit int conversion, so every raw GL texture id routes through here.
     internal static ImTextureID Tex(RenderHandle handle) => new((ulong)handle.Value);
-    // Overload kept for the editor's own GL preview/thumbnail textures (raw GL ids) until the editor
-    // moves to DX12 (Phase 7); the runtime Scene/Game handles now flow as RenderHandle.
-    internal static ImTextureID Tex(int glTextureId) => new((ulong)glTextureId);
+    // Overload for the editor's own preview/thumbnail textures: a GL texture name (GL backend) or a DX12
+    // UiHeap GPU descriptor ptr (DX12). nint holds both; the active ImGui backend interprets it.
+    internal static ImTextureID Tex(nint editorTextureHandle) => new((ulong)editorTextureHandle);
 
     SysVec2 sceneViewSize = new(1280, 720);   // render resolution of the Scene offscreen target
     SysVec2 gameViewSize = new(1280, 720);     // render resolution of the Game offscreen target

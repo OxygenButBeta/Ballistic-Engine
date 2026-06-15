@@ -20,7 +20,23 @@ internal class Program {
                 ? new Dx12BallisticEngineWindow(1600, 900)
                 : new GLBallisticEngineWindow(1600, 900);
         _ = new EditorApplication(window, projectPath);
-        window.Run();
+        try {
+            window.Run();
+        }
+        catch (Exception ex) when (RenderBackendSelector.Selected == RenderBackend.Dx12) {
+            // On a DX12 device-removal, surface the real cause (debug-layer messages + removed reason) instead
+            // of the opaque HRESULT, so a GPU fault is diagnosable without a driver reset (run BALLISTIC_DX12_DEBUG=1).
+            Console.Error.WriteLine("[DX12] FATAL: " + ex);
+            try {
+                BallisticEngine.DX12.Dx12Device d = BallisticEngine.DX12.Dx12Backend.Device;
+                if (d != null) {
+                    Console.Error.WriteLine("[DX12] DeviceRemovedReason: " + d.Device.DeviceRemovedReason);
+                    Console.Error.WriteLine("[DX12] DebugMessages:\n" + d.DrainDebugMessages());
+                }
+            }
+            catch { /* best-effort diagnostics */ }
+            throw;
+        }
 
         // JobSystem workers are foreground threads; without this the process never exits.
         JobSystem.Shutdown();
