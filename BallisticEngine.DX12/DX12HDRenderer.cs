@@ -369,6 +369,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         // Hi-Z occlusion cull: DEFAULT ON (verified byte-identical + culls 894->224 submeshes on SunTemple);
         // BALLISTIC_DX12_GPUDRIVEN_HIZ=0 disables it. Mirrors the GL BALLISTIC_GPUDRIVEN_HIZ convention.
         hizWanted = gpuDrivenOn && Environment.GetEnvironmentVariable("BALLISTIC_DX12_GPUDRIVEN_HIZ") != "0";
+        // Cascade caching: DEFAULT ON (BALLISTIC_DX12_SHADOW_CACHE=0 disables).
+        shadowCacheOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SHADOW_CACHE") != "0";
         gpuDriven = new Dx12GpuDrivenRenderer(dev);
     }
 
@@ -378,6 +380,13 @@ public sealed class DX12HDRenderer : HDRenderer {
     Vector3 hizLastCamPos;
     bool hizPrimed;     // false until we have a valid previous-frame depth (first frame / after a big jump)
     readonly System.Collections.Generic.List<IStaticMeshRenderer> wholeMeshRenderers = new();
+
+    // Cascade caching: skip re-rendering the sun cascades when the texel-snapped fit matrices AND the caster
+    // geometry are unchanged (the depth-array layers are retained → byte-identical; big win for a static camera).
+    bool shadowCacheOn;
+    readonly Matrix4x4[] lastCascadeMatrices = new Matrix4x4[CascadeCount];
+    int lastCasterStamp;
+    bool shadowMapEverRendered;
 
     unsafe void BuildTaa() {
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
@@ -999,6 +1008,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         Matrix4x4 view = ToNumerics(vp.GetViewMatrix());
         Matrix4x4 proj = Matrix4x4.CreatePerspectiveFieldOfView(
             45f * (MathF.PI / 180f), (float)targetW / targetH, CameraNear, CameraFar);
+        Matrix4x4 projUnjittered = proj;   // before the TAA jitter — the shadow cascade fit uses this (stable
+                                           // across frames so cascade caching works; shadows shouldn't jitter)
         // UNJITTERED view*proj — used for TAA reprojection (must be stable) + the froxel/SSR/post math.
         Matrix4x4 viewProjUnjittered = view * proj;
 
@@ -1035,8 +1046,9 @@ public sealed class DX12HDRenderer : HDRenderer {
                     wholeMeshRenderers.Add(r);
         }
 
-        // Shadows first: render the sun cascades' depth (own upload command list) before opaque.
-        RenderShadows(view, proj, light);
+        // Shadows first: render the sun cascades' depth (own upload command list) before opaque. Fit with the
+        // UNJITTERED proj so the cascades are stable frame-to-frame (cascade caching + no TAA shadow jitter).
+        RenderShadows(view, projUnjittered, light);
 
         // IBL: bake the env→irradiance/prefilter/BRDF from the procedural sky (re-bakes only on param
         // change). Own upload command list, before the render list. Only when a ProceduralSky is active.
@@ -1747,9 +1759,25 @@ public sealed class DX12HDRenderer : HDRenderer {
         cl.DrawInstanced(36, 1, 0, 0);
     }
 
+    // Hash of all active shadow-caster transforms — changes when geometry moves/appears (so cascade caching
+    // re-renders). Camera/sun motion is caught separately by the cascade fit matrices. No reflection (typed).
+    int ComputeShadowCasterStamp() {
+        var h = new System.HashCode();
+        foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
+            if (r is null || !r.IsActive || !r.IsRenderable) continue;
+            GLMatrix4 m = r.Transform.WorldMatrix;
+            h.Add(m.M11); h.Add(m.M12); h.Add(m.M13); h.Add(m.M14);
+            h.Add(m.M21); h.Add(m.M22); h.Add(m.M23); h.Add(m.M24);
+            h.Add(m.M31); h.Add(m.M32); h.Add(m.M33); h.Add(m.M34);
+            h.Add(m.M41); h.Add(m.M42); h.Add(m.M43); h.Add(m.M44);
+            h.Add(r.SubMeshIndex);
+        }
+        return h.ToHashCode();
+    }
+
     // Render the sun cascades' depth (one depth-array layer per cascade) before the opaque pass. Uses the
     // dedicated upload command list (separate from the render list), then leaves the array as an SRV the
-    // opaque shader samples. Re-renders every frame (cascade caching is a later optimization).
+    // opaque shader samples. Cascade caching skips the pass when nothing the shadows depend on changed.
     unsafe void RenderShadows(Matrix4x4 camView, Matrix4x4 camProj, LightUniforms light) {
         shadowsThisFrame = false;
         if (DirectionalLight.Instance is null) return;   // no sun → no shadows
@@ -1759,6 +1787,23 @@ public sealed class DX12HDRenderer : HDRenderer {
         float shadowDistance = DirectionalLight.Instance.ShadowDistance;
         Dx12ShadowMath.ComputeCascades(camView, camProj, sunTravel, shadowDistance, ShadowMapSize,
             cascadeMatrices, cascadeDepthRanges);
+
+        // Cascade caching: if every cascade's fit matrix AND the caster geometry are unchanged since the last
+        // render, the shadow-map layers still hold valid depth — skip the whole pass (byte-identical). The
+        // big static-camera win. Camera/sun motion changes the fit matrices; geometry motion changes the stamp.
+        int casterStamp = ComputeShadowCasterStamp();
+        bool cascadesUnchanged = shadowMapEverRendered && casterStamp == lastCasterStamp;
+        for (int c = 0; cascadesUnchanged && c < CascadeCount; c++)
+            cascadesUnchanged &= cascadeMatrices[c].Equals(lastCascadeMatrices[c]);
+        if (shadowCacheOn && cascadesUnchanged) {
+            shadowsThisFrame = true;   // the cached shadow map is still valid
+            if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_SHADOW_CACHE_DEBUG") == "1")
+                Console.WriteLine("[ShadowCache] cascades unchanged — skipped re-render.");
+            return;
+        }
+        lastCasterStamp = casterStamp;
+        for (int c = 0; c < CascadeCount; c++) lastCascadeMatrices[c] = cascadeMatrices[c];
+        shadowMapEverRendered = true;
 
         // Fill per (cascade, submesh) LightMvp constants, mirroring the opaque iteration.
         int slot = 0;
