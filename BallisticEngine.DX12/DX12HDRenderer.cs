@@ -48,12 +48,23 @@ public sealed class DX12HDRenderer : HDRenderer {
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct LightConstants {
         public Matrix4x4 InvViewProj;
+        public Matrix4x4 View;
         public Vector3 LightDir; public float Pad0;
         public Vector3 LightColor; public float Pad1;
         public Vector3 Ambient; public float Pad2;
         public Vector3 CameraPos; public float UseIBL;
-        public float PrefilterMaxMip; public float Pad3, Pad4, Pad5;
+        public float PrefilterMaxMip;
+        public float PunctualCount;
+        public Vector2 ScreenSize;
+        public Vector2 ClusterNearFar;
+        public Vector2 Pad3;
     }
+
+    // Clustered punctual lights (point/spot) shaded in the deferred pass.
+    Dx12ClusteredLights clusteredLights;
+
+    // Camera projection near/far — shared by the projection build AND the froxel log-Z grid (must match).
+    const float CameraNear = 0.1f, CameraFar = 1000f;
 
     // Final composite (HDR scene → exposure → ACES → +bloom → sRGB → LDR).
     ID3D12RootSignature compositeRootSig;   // CompositeConstants CBV (b0) + HDR+bloom SRV table + sampler
@@ -315,7 +326,8 @@ public sealed class DX12HDRenderer : HDRenderer {
     unsafe void BuildDeferredLighting() {
         var lightCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Pixel);
         var frameCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.Pixel);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 9, baseShaderRegister: 0);
+        // 12 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8) + cluster lights/grid/index (t9..t11).
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 12, baseShaderRegister: 0);
         var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
         var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
@@ -343,7 +355,9 @@ public sealed class DX12HDRenderer : HDRenderer {
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         deferredCbMapped = deferredCb.Map<byte>(0);
         deferredSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 9, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 12, shaderVisible: true);
+
+        clusteredLights = new Dx12ClusteredLights(dev);
     }
 
     unsafe void BuildComposite() {
@@ -733,7 +747,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         // projection DX-style (RH, z in [0,1]) since the provider's is OpenTK GL-convention (z in [-1,1]).
         Matrix4x4 view = ToNumerics(vp.GetViewMatrix());
         Matrix4x4 proj = Matrix4x4.CreatePerspectiveFieldOfView(
-            45f * (MathF.PI / 180f), (float)targetW / targetH, 0.1f, 1000f);
+            45f * (MathF.PI / 180f), (float)targetW / targetH, CameraNear, CameraFar);
         Matrix4x4 viewProj = view * proj;
 
         Vector3 camPos = ToNumerics(vp.Transform.WorldPosition);
@@ -869,9 +883,14 @@ public sealed class DX12HDRenderer : HDRenderer {
             }
         });
 
-        // === DEFERRED LIGHTING: read the G-buffer + depth → PBR sun + IBL + shadows → HDR `target`. ===
+        // === CLUSTERED PUNCTUAL LIGHTS: gather active point/spot lights + CPU froxel-cull (before the
+        // deferred pass reads the result). Lights are raw HDR (NOT pre-exposed — composite meters them,
+        // same as the sun). ===
+        GatherPunctualLights(view, proj);
+
+        // === DEFERRED LIGHTING: read the G-buffer + depth → PBR sun + IBL + shadows + punctual → HDR. ===
         gbuffer.ToShaderResource();
-        DrawDeferredLighting(viewProj, camPos, lightDir, lightColor, ambient);
+        DrawDeferredLighting(view, viewProj, camPos, lightDir, lightColor, ambient);
 
         // === SKY: draw into the HDR color at the far plane, depth-testing the G-buffer depth (LEqual,
         // no write). ProceduralSky takes precedence over an asset cubemap Skybox (matches GL). ===
@@ -902,22 +921,48 @@ public sealed class DX12HDRenderer : HDRenderer {
         return new RenderMetrics(draws, 0, (int)tris, 0, 0f);
     }
 
+    // Gather the scene's active point/spot lights into the clustered light buffer + CPU froxel-cull. Reads
+    // typed properties only (no reflection). Radiance is RAW HDR PhysicalColor (NOT pre-exposed — the DX12
+    // composite auto-meters it, exactly like the sun), unlike the GL path which pre-exposes at upload.
+    void GatherPunctualLights(Matrix4x4 view, Matrix4x4 proj) {
+        clusteredLights.BeginGather();
+        foreach (PointLight p in RuntimeSet<PointLight>.ReadOnlyCollection) {
+            if (p is null || !p.IsActive) continue;
+            clusteredLights.AddPoint(ToNumerics(p.transform.WorldPosition), p.Range,
+                ToNumerics(p.PhysicalColor), p.SourceRadius);
+        }
+        foreach (SpotLight s in RuntimeSet<SpotLight>.ReadOnlyCollection) {
+            if (s is null || !s.IsActive) continue;
+            Vector3 dir = ToNumerics(s.transform.WorldRotation * GLVector3.UnitZ);
+            float inner = Math.Clamp(s.InnerAngle, 0f, 89f) * (MathF.PI / 180f);
+            float outer = Math.Clamp(MathF.Max(s.OuterAngle, s.InnerAngle), 0f, 89.9f) * (MathF.PI / 180f);
+            clusteredLights.AddSpot(ToNumerics(s.transform.WorldPosition), dir, s.Range,
+                ToNumerics(s.PhysicalColor), MathF.Cos(inner), MathF.Cos(outer), s.SourceRadius);
+        }
+        clusteredLights.Cull(view, proj, targetW, targetH, CameraNear, CameraFar);
+    }
+
     // Fullscreen deferred lighting: read the G-buffer (G0..G3 + depth, already in SRV state) + IBL +
-    // shadow cascades, shade Cook-Torrance sun + split-sum IBL, write RAW HDR into `target`. Mirrors the
-    // forward StandardOpaque shading exactly — only the inputs come from the G-buffer instead of vertices.
-    unsafe void DrawDeferredLighting(Matrix4x4 viewProj, Vector3 camPos, Vector3 lightDir, Vector3 lightColor, Vector3 ambient) {
+    // shadow cascades, shade Cook-Torrance sun + split-sum IBL + clustered punctual lights, write RAW HDR
+    // into `target`. Mirrors the forward StandardOpaque shading — only the inputs come from the G-buffer.
+    unsafe void DrawDeferredLighting(Matrix4x4 view, Matrix4x4 viewProj, Vector3 camPos, Vector3 lightDir, Vector3 lightColor, Vector3 ambient) {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
         *(LightConstants*)deferredCbMapped = new LightConstants {
             InvViewProj = Matrix4x4.Transpose(invVP),
+            View = Matrix4x4.Transpose(view),
             LightDir = lightDir, LightColor = lightColor, Ambient = ambient, CameraPos = camPos,
             UseIBL = iblActiveThisFrame ? 1f : 0f,
             PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f,
+            PunctualCount = clusteredLights.LightCount,
+            ScreenSize = new Vector2(targetW, targetH),
+            ClusterNearFar = new Vector2(CameraNear, CameraFar),
         };
 
-        // Copy the 9 SRVs into the shader-visible table: G0..G3, depth, irradiance, prefilter, BRDF, shadow.
+        // Copy the 12 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8) + cluster
+        // lights/grid/index (t9..t11).
         deferredSrvVisible.Reset();
-        int b = deferredSrvVisible.AllocateRange(9);
+        int b = deferredSrvVisible.AllocateRange(12);
         for (int i = 0; i < Dx12GBuffer.RtCount; i++)
             dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + i), gbuffer.ColorSrvCpu(i), heapType);
         dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 4), gbuffer.DepthSrvCpu, heapType);
@@ -925,6 +970,9 @@ public sealed class DX12HDRenderer : HDRenderer {
         dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 6), ibl.PrefilterSrv, heapType);
         dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 7), ibl.BrdfSrv, heapType);
         dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 8), shadowMap.SrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 9), clusteredLights.LightSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 10), clusteredLights.GridSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 11), clusteredLights.IndexSrvCpu, heapType);
 
         target.RenderColorOnlyCleared(cl => {
             cl.SetGraphicsRootSignature(deferredRootSig);

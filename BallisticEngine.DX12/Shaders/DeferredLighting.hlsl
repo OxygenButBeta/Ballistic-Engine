@@ -9,13 +9,23 @@
 
 cbuffer LightConstants : register(b0) {
     float4x4 InvViewProj;    // unproject screen+depth → world (transposed on upload)
+    float4x4 View;           // world → view (transposed) — to find a pixel's froxel from its view depth
     float3   LightDir;       float Pad0;          // TO the light, normalized, world space
     float3   LightColor;     float Pad1;          // sun radiance (HDR)
     float3   Ambient;        float Pad2;          // flat ambient fill (IBL stand-in)
     float3   CameraPos;      float UseIBL;        // world camera pos; >0.5 = sample baked IBL
-    // shadow params (cascade matrices in FrameConstants b1):
-    float    PrefilterMaxMip; float Pad3, Pad4, Pad5;
+    float    PrefilterMaxMip;
+    // clustered punctual lights:
+    float    PunctualCount;                       // active punctual lights (0 = skip the clustered path)
+    float2   ScreenSize;                          // render-target pixel size (for the froxel tile lookup)
+    float2   ClusterNearFar;                      // near/far the froxel log-Z grid was built with
+    float2   Pad3;
 };
+
+// Froxel grid dims — must match Dx12ClusteredLights (16x9x24, log-Z).
+static const int ClusterDimX = 16;
+static const int ClusterDimY = 9;
+static const int ClusterDimZ = 24;
 
 // Per-frame cascade matrices + shadow params (shared layout with the forward FrameConstants, b1).
 cbuffer FrameConstants : register(b1) {
@@ -33,6 +43,17 @@ TextureCube IrradianceMap   : register(t5);
 TextureCube PrefilterMap    : register(t6);
 Texture2D   BrdfLut         : register(t7);
 Texture2DArray ShadowCascades : register(t8);   // sun cascade depth (R32_Float), manual PCF
+
+// Clustered punctual lights (faithful to the GL clustered path).
+struct GpuLight {
+    float4 PosRange;     // xyz world pos, w range
+    float4 Color;        // xyz radiance (HDR), w type (0 point / 1 spot)
+    float4 DirCosOuter;  // xyz spot dir, w cosOuter
+    float4 Extra;        // x cosInner, y shadowSlot, z sourceRadius, w pad
+};
+StructuredBuffer<GpuLight> ClusterLights : register(t9);
+Buffer<int2>               ClusterGrid   : register(t10);  // per-cluster {offset, count}
+Buffer<uint>               ClusterIndex  : register(t11);  // flat light-index list
 SamplerState LinearClamp : register(s0);
 
 static const float PI = 3.14159265359;
@@ -105,6 +126,56 @@ float3 WorldPosFromDepth(float2 uv, float depth) {
     return w.xyz / w.w;
 }
 
+// Inverse-square distance attenuation with a smooth range cutoff (windowing), GL parity. range = light.w.
+float DistanceAttenuation(float dist, float range) {
+    float d2 = dist * dist;
+    float inv = 1.0 / max(d2, 1e-4);
+    float t = saturate(1.0 - pow(dist / range, 4.0));
+    return inv * t * t;
+}
+
+// One punctual light (point or spot) via the SAME Cook-Torrance BRDF as the sun. radiance already folds
+// attenuation × cone. No punctual shadows yet (shadowSlot is -1 for now).
+float3 ShadePunctual(GpuLight L, float3 N, float3 V, float3 worldPos, float3 albedo,
+                     float metallic, float roughness, float3 F0) {
+    float3 toLight = L.PosRange.xyz - worldPos;
+    float dist = length(toLight);
+    if (dist > L.PosRange.w) return 0.0.xxx;          // range cull
+    float3 Ld = toLight / max(dist, 1e-4);
+    float atten = DistanceAttenuation(dist, L.PosRange.w);
+    if (atten <= 0.0) return 0.0.xxx;
+
+    float3 radiance = L.Color.rgb * atten;
+    if (L.Color.w >= 0.5) {                            // spot: cone falloff
+        float cosA = dot(-Ld, normalize(L.DirCosOuter.xyz));
+        float cone = saturate((cosA - L.DirCosOuter.w) / max(L.Extra.x - L.DirCosOuter.w, 1e-4));
+        if (cone <= 0.0) return 0.0.xxx;
+        radiance *= cone * cone;
+    }
+
+    float NdotL = max(dot(N, Ld), 0.0);
+    if (NdotL <= 0.0) return 0.0.xxx;
+    float3 H = normalize(V + Ld);
+    float NDF = DistributionGGX(N, H, roughness);
+    float G = GeometrySmith(N, V, Ld, roughness);
+    float3 F = FresnelSchlick(max(dot(H, V), 0.0), F0);
+    float NdotV = max(dot(N, V), 0.0);
+    float3 spec = (NDF * G * F) / max(4.0 * NdotV * NdotL, EPS);
+    float3 kD = (1.0 - F) * (1.0 - metallic);
+    return (kD * albedo / PI + spec) * radiance * NdotL;
+}
+
+// This pixel's froxel index from screen pixel + view-space depth (log-Z), matching Dx12ClusteredLights.
+int ClusterIndexFor(float2 pixel, float3 worldPos) {
+    float viewZ = -mul(float4(worldPos, 1.0), View).z;   // positive view distance
+    float near = ClusterNearFar.x, far = ClusterNearFar.y;
+    int zSlice = (int)(log(max(viewZ, near) / near) / log(far / near) * (float)ClusterDimZ);
+    zSlice = clamp(zSlice, 0, ClusterDimZ - 1);
+    int2 tile = (int2)(pixel / (ScreenSize / float2(ClusterDimX, ClusterDimY)));
+    tile = clamp(tile, int2(0, 0), int2(ClusterDimX - 1, ClusterDimY - 1));
+    return tile.x + ClusterDimX * (tile.y + ClusterDimY * zSlice);
+}
+
 float4 PSMain(VSOut i) : SV_Target {
     float depth = DepthTex.SampleLevel(LinearClamp, i.Uv, 0).r;
     if (depth >= 1.0) discard;   // sky / unwritten: leave the cleared target for the sky pass
@@ -143,6 +214,17 @@ float4 PSMain(VSOut i) : SV_Target {
         specular = spec * radiance * NdotL;
     }
 
+    // --- Clustered punctual lights (point/spot) ---
+    float3 punctual = 0.0.xxx;
+    if (PunctualCount > 0.5) {
+        int cluster = ClusterIndexFor(i.Position.xy, worldPos);
+        int2 range = ClusterGrid[cluster];   // {offset, count}
+        for (int k = 0; k < range.y; k++) {
+            uint li = ClusterIndex[range.x + k];
+            punctual += ShadePunctual(ClusterLights[li], N, V, worldPos, albedo, metallic, roughness, F0);
+        }
+    }
+
     // Ambient: split-sum IBL when baked, flat fill otherwise.
     float NdotVamb = max(dot(N, V), 0.0);
     float3 ambient;
@@ -162,6 +244,6 @@ float4 PSMain(VSOut i) : SV_Target {
         ambient = Ambient * albedo * ao;
     }
 
-    float3 litHdr = diffuse + specular + ambient + emissive;
+    float3 litHdr = diffuse + specular + punctual + ambient + emissive;
     return float4(litHdr, 1.0);
 }

@@ -1,0 +1,173 @@
+version: 1
+name: LightTest
+sceneComponents: []
+entities:
+- id: aaaa0000000000000000000000000001
+  name: Camera
+  isActive: true
+  tag:
+  layer: 0
+  prefabSource:
+  transform:
+    position: {x: 0, y: 12, z: 0.01}
+    rotation: {x: 0.7071, y: 0, z: 0, w: 0.7071}
+    scale: {x: 1, y: 1, z: 1}
+    parent:
+  components:
+  - type: HDCamera
+    id: aaaa0000000000000000000000000002
+    enabled: true
+    members: {}
+- id: aaaa0000000000000000000000000003
+  name: Dim Sun
+  isActive: true
+  tag:
+  layer: 0
+  prefabSource:
+  transform:
+    position: {x: 0, y: 10, z: 0}
+    rotation: {x: -0.383, y: 0, z: 0, w: 0.924}
+    scale: {x: 1, y: 1, z: 1}
+    parent:
+  components:
+  - type: DirectionalLight
+    id: aaaa0000000000000000000000000004
+    enabled: true
+    members:
+      Illuminance: 60
+      ColorTemperature: 6500
+      ambientIntensity: 0.01
+- id: aaaa0000000000000000000000000010
+  name: Ground
+  isActive: true
+  tag:
+  layer: 0
+  prefabSource:
+  transform:
+    position: {x: 0, y: 0, z: 0}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 8, y: 1, z: 8}
+    parent:
+  components:
+  - type: StaticMeshRenderer
+    id: aaaa0000000000000000000000000011
+    enabled: true
+    members:
+      sharedMesh: Assets/Default/Meshes/Plane.obj
+      subMeshIndex: -1
+      sharedMaterial: Assets/Default/Materials/Default.mat
+- id: aaaa0000000000000000000000000020
+  name: Sphere Center
+  isActive: true
+  tag:
+  layer: 0
+  prefabSource:
+  transform:
+    position: {x: 0, y: 0.6, z: 0}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 1, y: 1, z: 1}
+    parent:
+  components:
+  - type: StaticMeshRenderer
+    id: aaaa0000000000000000000000000021
+    enabled: true
+    members:
+      sharedMesh: Assets/Default/Meshes/Sphere.obj
+      subMeshIndex: -1
+      sharedMaterial: Assets/Default/Materials/Default.mat
+- id: aaaa0000000000000000000000000100
+  name: Point Red
+  isActive: true
+  tag:
+  layer: 0
+  prefabSource:
+  transform:
+    position: {x: -4, y: 1.0, z: 0}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 1, y: 1, z: 1}
+    parent:
+  components:
+  - type: PointLight
+    id: aaaa0000000000000000000000000101
+    enabled: true
+    members:
+      color: {x: 1, y: 0.1, z: 0.1}
+      lumens: 40
+      intensity: 1
+      colorTemperature: 6500
+      range: 5
+      sourceRadius: 0
+      castShadows: false
+      shadowBias: 0.002
+- id: aaaa0000000000000000000000000110
+  name: Point Green
+  isActive: true
+  tag:
+  layer: 0
+  prefabSource:
+  transform:
+    position: {x: 0, y: 1.0, z: 0}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 1, y: 1, z: 1}
+    parent:
+  components:
+  - type: PointLight
+    id: aaaa0000000000000000000000000111
+    enabled: true
+    members:
+      color: {x: 0.1, y: 1, z: 0.1}
+      lumens: 40
+      intensity: 1
+      colorTemperature: 6500
+      range: 5
+      sourceRadius: 0
+      castShadows: false
+      shadowBias: 0.002
+- id: aaaa0000000000000000000000000120
+  name: Point Blue
+  isActive: true
+  tag:
+  layer: 0
+  prefabSource:
+  transform:
+    position: {x: 4, y: 1.0, z: 0}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 1, y: 1, z: 1}
+    parent:
+  components:
+  - type: PointLight
+    id: aaaa0000000000000000000000000121
+    enabled: true
+    members:
+      color: {x: 0.15, y: 0.3, z: 1}
+      lumens: 40
+      intensity: 1
+      colorTemperature: 6500
+      range: 5
+      sourceRadius: 0
+      castShadows: false
+      shadowBias: 0.002
+- id: aaaa0000000000000000000000000200
+  name: Point Yellow Front
+  isActive: true
+  tag:
+  layer: 0
+  prefabSource:
+  transform:
+    position: {x: 0, y: 1.0, z: 4}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 1, y: 1, z: 1}
+    parent:
+  components:
+  - type: PointLight
+    id: aaaa0000000000000000000000000201
+    enabled: true
+    members:
+      color: {x: 1, y: 0.85, z: 0.1}
+      lumens: 40
+      intensity: 1
+      colorTemperature: 6500
+      range: 5
+      sourceRadius: 0
+      castShadows: false
+      shadowBias: 0.002
