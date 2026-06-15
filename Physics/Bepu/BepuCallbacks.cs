@@ -81,9 +81,47 @@ struct NarrowPhaseCallbacks : INarrowPhaseCallbacks {
         return !isTrigger;
     }
 
+    // Per-child manifold callback — fires for each compound child sub-pair BEFORE the top-level
+    // generic, and is the ONLY place Bepu hands us the child index. If either side's child is a
+    // trigger, we record the overlap as a trigger event and return FALSE so that child contributes
+    // NO contacts to the pair reduction → no constraint → no physical push, while solid siblings
+    // (which return true) still solve normally. This is what makes a single body mix solid and
+    // trigger colliders, Unity-style. Non-trigger children fall through to the solver untouched.
     public bool ConfigureContactManifold(int workerIndex, CollidablePair pair, int childIndexA,
-        int childIndexB, ref ConvexContactManifold manifold) =>
-        true;
+        int childIndexB, ref ConvexContactManifold manifold) {
+        bool childTrigger = World.GetChildTrigger(pair.A, childIndexA) ||
+                            World.GetChildTrigger(pair.B, childIndexB);
+        if (!childTrigger)
+            return true; // solid child: keep its contacts for the pair-level solve
+
+        // Trigger child: record the overlap (deepest touching contact) as a trigger event, then drop
+        // it from the solve. Use the child indices in the key so this trigger event is distinct from
+        // any solid sibling's event on the same body pair.
+        if (manifold.Count > 0) {
+            float bestDepth = float.MinValue;
+            Vector3 bestOffset = default, bestNormal = default;
+            for (var i = 0; i < manifold.Count; i++) {
+                manifold.GetContact(i, out Vector3 offset, out Vector3 normal, out float depth, out _);
+                if (depth <= bestDepth)
+                    continue;
+                bestDepth = depth;
+                bestOffset = offset;
+                bestNormal = normal;
+            }
+            if (bestDepth >= TouchDepthThreshold) {
+                // Convex-manifold offsets are relative to child A's pose / the pair frame; resolve to
+                // world the same way the top-level path does.
+                Vector3 worldPoint = World.GetPose(pair.A).Position + bestOffset;
+                World.Contacts.RecordChild(workerIndex, pair, childIndexA, childIndexB,
+                    in worldPoint, in bestNormal, isTrigger: true);
+            }
+        }
+        // Empty the child manifold AND return false: returning false alone left the contacts in the
+        // reduced pair manifold (the trigger child still pushed the body — measured), so explicitly
+        // zero the count so this child contributes nothing to the solver.
+        manifold.Count = 0;
+        return false; // no constraint from a trigger child
+    }
 
     public void Dispose() {
     }

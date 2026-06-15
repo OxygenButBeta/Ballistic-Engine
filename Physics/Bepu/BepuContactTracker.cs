@@ -22,6 +22,8 @@ sealed class BepuContactTracker {
 
     struct ContactRecord {
         public CollidableReference A, B;
+        public int ChildA, ChildB; // compound child indices (0 for single-shape); distinguish a
+                                    // body pair's trigger sub-contact from its solid one
         public NumVector3 Point;   // world space, at narrowphase time
         public NumVector3 Normal;  // from B toward A (the abstraction contract)
         public bool IsTrigger;
@@ -34,6 +36,20 @@ sealed class BepuContactTracker {
         public bool IsTrigger;
     }
 
+    // Event key: a body pair PLUS the child sub-pair, so one Rigidbody with a solid child and a
+    // trigger child reports both separately instead of one masking the other. Solid (whole-pair)
+    // contacts use child indices (0,0)-style from the top-level path; per-child trigger contacts use
+    // the real compound child indices. Ordered to match KeyOf's handle ordering for determinism.
+    // IComparable so Flush can sort keys into a deterministic, worker-schedule-independent event order.
+    readonly record struct PairKey(ulong Bodies, int ChildA, int ChildB) : IComparable<PairKey> {
+        public int CompareTo(PairKey other) {
+            int c = Bodies.CompareTo(other.Bodies);
+            if (c != 0) return c;
+            c = ChildA.CompareTo(other.ChildA);
+            return c != 0 ? c : ChildB.CompareTo(other.ChildB);
+        }
+    }
+
     // One approach-speed sample taken inside narrowphase (possibly while still speculative), used to
     // capture the PEAK closing velocity before the solver bleeds it off. Merged per-pair in Flush.
     struct ApproachSample {
@@ -44,18 +60,18 @@ sealed class BepuContactTracker {
 
     readonly List<ContactRecord>[] workerContacts;
     readonly List<ApproachSample>[] workerApproaches;
-    readonly Dictionary<ulong, TrackedPair> trackedPairs = new();
+    readonly Dictionary<PairKey, TrackedPair> trackedPairs = new();
     readonly List<PhysicsContactEvent> events = new();
     readonly List<PhysicsContactEvent> pendingExits = new();
 
-    // Per-pair peak approach speed (+ the contact point/normal of that peak), persisted across steps
-    // until the pair either Enters (consumed) or stops sampling (cleared). Keyed like trackedPairs.
+    // Per-BODY-pair peak approach speed (restitution is a whole-body property, no child split needed).
+    // Persisted across steps until the pair Enters (consumed) or stops sampling (cleared).
     readonly Dictionary<ulong, ApproachSample> approachPeaks = new();
 
     // Flush scratch, reused every step.
-    readonly Dictionary<ulong, ContactRecord> mergedPairs = new();
-    readonly List<ulong> sortedKeys = new();
-    readonly List<ulong> staleKeys = new();
+    readonly Dictionary<PairKey, ContactRecord> mergedPairs = new();
+    readonly List<PairKey> sortedKeys = new();
+    readonly List<PairKey> staleKeys = new();
     readonly HashSet<ulong> approachedThisStep = new();
     readonly List<ulong> staleApproachKeys = new();
 
@@ -104,10 +120,12 @@ sealed class BepuContactTracker {
     // speed is tracked separately via SampleApproach (it must be captured pre-touch, before the
     // solver damps it), so this just stamps the combined restitution onto the record.
     public void Record(int workerIndex, CollidablePair pair, in NumVector3 offsetFromA,
-        in NumVector3 normal, bool isTrigger, float restitution) {
+        in NumVector3 normal, bool isTrigger, float restitution, int childA = 0, int childB = 0) {
         workerContacts[workerIndex].Add(new ContactRecord {
             A = pair.A,
             B = pair.B,
+            ChildA = childA,
+            ChildB = childB,
             Point = world.GetPose(pair.A).Position + offsetFromA,
             Normal = normal,
             IsTrigger = isTrigger,
@@ -115,10 +133,34 @@ sealed class BepuContactTracker {
         });
     }
 
+    // Per-child overload: a single compound child touched another collidable. Used by the per-child
+    // narrowphase to report a trigger child's overlap as its OWN event (distinct from a solid
+    // sibling's). The contact point/normal come straight from the per-child convex manifold.
+    public void RecordChild(int workerIndex, CollidablePair pair, int childA, int childB,
+        in NumVector3 worldPoint, in NumVector3 normal, bool isTrigger) {
+        workerContacts[workerIndex].Add(new ContactRecord {
+            A = pair.A,
+            B = pair.B,
+            ChildA = childA,
+            ChildB = childB,
+            Point = worldPoint,
+            Normal = normal,
+            IsTrigger = isTrigger,
+            Restitution = 0f, // triggers never bounce
+        });
+    }
+
     static ulong KeyOf(CollidableReference a, CollidableReference b) =>
         a.Packed <= b.Packed
             ? ((ulong)a.Packed << 32) | b.Packed
             : ((ulong)b.Packed << 32) | a.Packed;
+
+    // Full event key: body pair + child sub-pair, child indices ordered to match the handle ordering
+    // so the same physical sub-contact always hashes identically regardless of A/B argument order.
+    static PairKey PairKeyOf(in ContactRecord r) =>
+        r.A.Packed <= r.B.Packed
+            ? new PairKey(KeyOf(r.A, r.B), r.ChildA, r.ChildB)
+            : new PairKey(KeyOf(r.A, r.B), r.ChildB, r.ChildA);
 
     // Single-threaded, immediately after Simulation.Timestep: merge the worker buffers, diff
     // against the tracked set, and rewrite the event list for this step.
@@ -132,7 +174,9 @@ sealed class BepuContactTracker {
         mergedPairs.Clear();
         foreach (List<ContactRecord> buffer in workerContacts) {
             foreach (ContactRecord record in buffer)
-                mergedPairs.TryAdd(KeyOf(record.A, record.B), record); // compounds: one event per body pair
+                // One event per (body pair, child sub-pair): a solid child and a trigger child of the
+                // same body pair are distinct keys, so neither masks the other.
+                mergedPairs.TryAdd(PairKeyOf(in record), record);
             buffer.Clear();
         }
 
@@ -155,7 +199,7 @@ sealed class BepuContactTracker {
         sortedKeys.AddRange(mergedPairs.Keys);
         sortedKeys.Sort();
 
-        foreach (ulong key in sortedKeys) {
+        foreach (PairKey key in sortedKeys) {
             ContactRecord record = mergedPairs[key];
             BepuBody bodyA = world.Lookup(record.A);
             BepuBody bodyB = world.Lookup(record.B);
@@ -177,12 +221,12 @@ sealed class BepuContactTracker {
             // contacts bleed the closing velocity off before depth crosses the touch threshold). The
             // contact spring is critically damped (no spring bounce), so this impulse is the entire
             // rebound — a true e²-energy restitution. Once only, on Enter: re-applying on Stay would
-            // pump energy into a resting body.
-            if (!known) {
-                if (!record.IsTrigger && record.Restitution > 0f &&
-                    approachPeaks.TryGetValue(key, out ApproachSample peak))
-                    ApplyRestitutionImpulse(bodyA, bodyB, record.Restitution, in peak);
-                approachPeaks.Remove(key); // consumed on Enter; a fresh approach re-seeds it
+            // pump energy into a resting body. Restitution is a whole-BODY property, so peaks key by
+            // the body pair (key.Bodies), not the child sub-pair.
+            if (!known && !record.IsTrigger && record.Restitution > 0f &&
+                approachPeaks.TryGetValue(key.Bodies, out ApproachSample peak)) {
+                ApplyRestitutionImpulse(bodyA, bodyB, record.Restitution, in peak);
+                approachPeaks.Remove(key.Bodies); // consumed on Enter; a fresh approach re-seeds it
             }
 
             events.Add(MakeEvent(known ? PhysicsContactPhase.Stay : PhysicsContactPhase.Enter, in pair));
@@ -191,7 +235,7 @@ sealed class BepuContactTracker {
         // Pairs that stopped reporting: separation (Exit) — unless every involved body is
         // static or asleep, in which case the contact persists and the pair just went dormant.
         staleKeys.Clear();
-        foreach ((ulong key, TrackedPair pair) in trackedPairs) {
+        foreach ((PairKey key, TrackedPair pair) in trackedPairs) {
             if (mergedPairs.ContainsKey(key))
                 continue;
             bool valid = pair.A.Valid && pair.B.Valid;
@@ -202,7 +246,7 @@ sealed class BepuContactTracker {
         }
 
         staleKeys.Sort();
-        foreach (ulong key in staleKeys) {
+        foreach (PairKey key in staleKeys) {
             TrackedPair pair = trackedPairs[key];
             trackedPairs.Remove(key);
             events.Add(MakeEvent(PhysicsContactPhase.Exit, in pair));
@@ -259,12 +303,12 @@ sealed class BepuContactTracker {
     // next flush, with last-known contact data — Unity fires Exit on destroy too).
     public void OnBodyRemoved(BepuBody body) {
         staleKeys.Clear();
-        foreach ((ulong key, TrackedPair pair) in trackedPairs)
+        foreach ((PairKey key, TrackedPair pair) in trackedPairs)
             if (ReferenceEquals(pair.A, body) || ReferenceEquals(pair.B, body))
                 staleKeys.Add(key);
 
         staleKeys.Sort();
-        foreach (ulong key in staleKeys) {
+        foreach (PairKey key in staleKeys) {
             TrackedPair pair = trackedPairs[key];
             trackedPairs.Remove(key);
             pendingExits.Add(MakeEvent(PhysicsContactPhase.Exit, in pair));

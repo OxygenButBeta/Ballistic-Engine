@@ -155,7 +155,11 @@ public class Rigidbody : Behaviour {
             // would eject each other on the first step.
             collider.ReleaseStaticBodyForRigidbody();
 
-            parts.Add(new PhysicsShapePart(shape, collider.Center * worldScale, Quaternion.Identity));
+            // Trigger state is now PER-COLLIDER (P4): a body can mix solid and trigger colliders.
+            // The backend filters each compound child by its own flag — solid children push, trigger
+            // children only report overlap. No more all-trigger/all-solid collapse.
+            parts.Add(new PhysicsShapePart(shape, collider.Center * worldScale, Quaternion.Identity,
+                collider.IsTrigger));
             boundColliders.Add(collider);
         }
 
@@ -164,19 +168,6 @@ public class Rigidbody : Behaviour {
                 $"Physics: Rigidbody on '{entity.Name}' has no usable collider; simulating as a 0.1m sphere.");
             parts.Add(new PhysicsShapePart(new SphereShape(0.1f), Vector3.Zero, Quaternion.Identity));
         }
-
-        // Trigger state is per-BODY in v1 (one Bepu collidable per Rigidbody): the body is a
-        // trigger only when EVERY bound collider is one. Mixing trigger and solid colliders
-        // on one entity needs per-child filtering we don't have yet — warn and stay solid.
-        var anyTrigger = false;
-        bool allTrigger = boundColliders.Count > 0;
-        foreach (Collider collider in boundColliders) {
-            anyTrigger |= collider.IsTrigger;
-            allTrigger &= collider.IsTrigger;
-        }
-        if (anyTrigger && !allTrigger)
-            Debugging.LogWarning(
-                $"Physics: '{entity.Name}' mixes trigger and solid colliders on one Rigidbody; not supported in v1 — the whole body stays SOLID.");
 
         Collider material = boundColliders.Count > 0 ? boundColliders[0] : null;
         var description = new PhysicsBodyDescription {
@@ -187,7 +178,9 @@ public class Rigidbody : Behaviour {
             Friction = material?.Friction ?? 0.6f,
             Bounciness = material?.Bounciness ?? 0f,
             FreezeRotation = FreezeRotation,
-            IsTrigger = allTrigger,
+            // Per-collider triggers handle mixed bodies now; the body-wide flag is set only when
+            // EVERY collider is a trigger (a pure trigger volume — slightly cheaper, same result).
+            IsTrigger = boundColliders.Count > 0 && boundColliders.TrueForAll(c => c.IsTrigger),
             Layer = entity.Layer,
             Shapes = parts.ToArray(),
         };

@@ -40,6 +40,14 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
     readonly Dictionary<int, ContactMaterial> bodyMaterials = new();
     readonly Dictionary<int, ContactMaterial> staticMaterials = new();
 
+    // Per-compound-child trigger flags, indexed by COMPOUND CHILD INDEX (= CompoundBuilder add
+    // order, 1:1 with the order children were added in TryBuildShape — NOT the description.Shapes
+    // index, since unsupported parts are skipped). A single body can mix solid and trigger children;
+    // the narrowphase consults this per child to decide solve-vs-overlap. Single-shape bodies get a
+    // one-element array (childIndex 0). Read on worker threads; never mutated during Step.
+    readonly Dictionary<int, bool[]> bodyChildTriggers = new();
+    readonly Dictionary<int, bool[]> staticChildTriggers = new();
+
     internal readonly struct ContactMaterial {
         public readonly float Friction;
         public readonly float Bounciness;
@@ -122,6 +130,8 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         staticsByHandle.Clear();
         bodyMaterials.Clear();
         staticMaterials.Clear();
+        bodyChildTriggers.Clear();
+        staticChildTriggers.Clear();
 
         Contacts.Clear();
         Simulation?.Dispose();
@@ -138,7 +148,7 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         EnsureSimulation();
 
         if (!TryBuildShape(in description, out TypedIndex shapeIndex, out BodyInertia inertia,
-                out Vector3 centerOffset))
+                out Vector3 centerOffset, out bool[] childTriggers))
             return null;
 
         // Compound shapes are recentered around their center of mass; the body pose must sit
@@ -158,6 +168,7 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             wrapper = new BepuBody(this, handle, shapeIndex, centerOffset);
             staticsByHandle[handle.Value] = wrapper;
             staticMaterials[handle.Value] = material;
+            staticChildTriggers[handle.Value] = childTriggers;
         }
         else {
             // Continuous detection with a bounded speculative margin: a fast faller crosses
@@ -183,6 +194,7 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             wrapper = new BepuBody(this, handle, shapeIndex, centerOffset);
             bodiesByHandle[handle.Value] = wrapper;
             bodyMaterials[handle.Value] = material;
+            bodyChildTriggers[handle.Value] = childTriggers;
         }
 
         return wrapper;
@@ -198,11 +210,13 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             Simulation.Statics.Remove(bepuBody.StaticHandle);
             staticsByHandle.Remove(bepuBody.StaticHandle.Value);
             staticMaterials.Remove(bepuBody.StaticHandle.Value);
+            staticChildTriggers.Remove(bepuBody.StaticHandle.Value);
         }
         else {
             Simulation.Bodies.Remove(bepuBody.BodyHandle);
             bodiesByHandle.Remove(bepuBody.BodyHandle.Value);
             bodyMaterials.Remove(bepuBody.BodyHandle.Value);
+            bodyChildTriggers.Remove(bepuBody.BodyHandle.Value);
         }
 
         // Shapes are per-body in this engine (never shared), so dispose with the body.
@@ -221,6 +235,21 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             : new ContactMaterial(0.6f, 0f);
     }
 
+    // Is child `childIndex` of this collidable a trigger? childIndex is the compound child index
+    // Bepu hands the per-child narrowphase (= our build order). Out-of-range / missing → not a
+    // trigger. A whole-body trigger (legacy PhysicsBodyDescription.IsTrigger) also makes every
+    // child a trigger via the material flag, so callers OR this with GetMaterial(...).IsTrigger.
+    internal bool GetChildTrigger(CollidableReference collidable, int childIndex) {
+        Dictionary<int, bool[]> source =
+            collidable.Mobility == CollidableMobility.Static ? staticChildTriggers : bodyChildTriggers;
+        int handle = collidable.Mobility == CollidableMobility.Static
+            ? collidable.StaticHandle.Value
+            : collidable.BodyHandle.Value;
+        return source.TryGetValue(handle, out bool[] triggers)
+               && childIndex >= 0 && childIndex < triggers.Length
+               && triggers[childIndex];
+    }
+
     // Pose of either a body or a static — used by the contact tracker on narrowphase worker
     // threads (read-only access to pose memory during collision detection is safe).
     internal RigidPose GetPose(CollidableReference collidable) =>
@@ -231,10 +260,11 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
     // ---- Shapes -------------------------------------------------------------
 
     bool TryBuildShape(in PhysicsBodyDescription description, out TypedIndex shapeIndex,
-        out BodyInertia inertia, out Vector3 centerOffset) {
+        out BodyInertia inertia, out Vector3 centerOffset, out bool[] childTriggers) {
         shapeIndex = default;
         inertia = default;
         centerOffset = Vector3.Zero;
+        childTriggers = null;
 
         PhysicsShapePart[] parts = description.Shapes;
         bool single = parts.Length == 1 &&
@@ -253,16 +283,21 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             }
 
             shapeIndex = AddMesh(meshShape);
+            childTriggers = [parts[0].IsTrigger]; // single shape → child index 0
             return true;
         }
 
         if (single) {
             shapeIndex = AddConvex(parts[0].Shape, description.Mass, out inertia);
+            childTriggers = [parts[0].IsTrigger];
             return shapeIndex.Exists;
         }
 
-        // Multiple shapes or an offset single shape -> compound.
+        // Multiple shapes or an offset single shape -> compound. Build the trigger flags in the SAME
+        // order children are actually added (skipped parts don't get a compound child, so this stays
+        // 1:1 with the compound's child index — the index Bepu hands the per-child narrowphase).
         var builder = new CompoundBuilder(bufferPool, Simulation.Shapes, parts.Length);
+        var triggerList = new List<bool>(parts.Length);
         try {
             int added = 0;
             foreach (PhysicsShapePart part in parts) {
@@ -273,14 +308,17 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
                 switch (part.Shape) {
                     case BoxShape box:
                         builder.Add(MakeBox(box), localPose, weight);
+                        triggerList.Add(part.IsTrigger);
                         added++;
                         break;
                     case SphereShape sphere:
                         builder.Add(MakeSphere(sphere), localPose, weight);
+                        triggerList.Add(part.IsTrigger);
                         added++;
                         break;
                     case CapsuleShape capsule:
                         builder.Add(MakeCapsule(capsule), localPose, weight);
+                        triggerList.Add(part.IsTrigger);
                         added++;
                         break;
                     default:
@@ -291,6 +329,7 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
 
             if (added == 0)
                 return false;
+            childTriggers = triggerList.ToArray();
 
             Buffer<CompoundChild> children;
             if (description.Type == PhysicsBodyType.Dynamic) {
