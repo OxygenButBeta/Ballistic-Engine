@@ -83,7 +83,7 @@ public sealed class Dx12LitCubeTest : IDisposable {
             InputLayout = layout,
             PrimitiveTopologyType = PrimitiveTopologyType.Triangle,
             SampleMask = uint.MaxValue,
-            RasterizerState = RasterizerDescription.CullBack, // back-face cull (cube faces wound CCW-from-outside)
+            RasterizerState = RasterizerDescription.CullClockwise, // back-face cull (cube wound CCW-from-outside)
             BlendState = BlendDescription.Opaque,
             DepthStencilState = DepthStencilDescription.Default,           // depth test + write, less
             RenderTargetFormats = new[] { Dx12OffscreenTarget.ColorFormat },
