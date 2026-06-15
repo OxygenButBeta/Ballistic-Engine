@@ -31,6 +31,7 @@ internal class Program {
                 BallisticEngine.DX12.Dx12Device d = BallisticEngine.DX12.Dx12Backend.Device;
                 if (d != null) {
                     Console.Error.WriteLine("[DX12] DeviceRemovedReason: " + d.Device.DeviceRemovedReason);
+                    Console.Error.WriteLine("[DX12] DRED: " + d.DrainDredReport());
                     Console.Error.WriteLine("[DX12] DebugMessages:\n" + d.DrainDebugMessages());
                 }
             }

@@ -46,6 +46,18 @@ public sealed class Dx12Device : IDisposable {
         }
         // (D3D12GetDebugInterface<T>(out T) is the Result overload — checked above.)
 
+        // DRED (Device Removed Extended Data) — diagnoses GPU HANGS/device-removals WITHOUT the debug-layer
+        // SDK (which isn't installed here): on a removal, DrainDredReport() reports the GPU PAGE-FAULT VA
+        // (non-zero = the GPU accessed freed/invalid memory — use-after-free or a bad descriptor). Auto-
+        // breadcrumbs have a per-command GPU cost, so it's OFF unless BALLISTIC_DX12_DRED=1. Must precede
+        // device creation. See [[gpu-hang-launch-safety]] (the DX12 thumbnail hang this is for).
+        dredEnabled = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DRED") == "1";
+        if (dredEnabled && D3D12GetDebugInterface(out ID3D12DeviceRemovedExtendedDataSettings dred).Success) {
+            dred.SetAutoBreadcrumbsEnablement(DredEnablement.ForcedOn);
+            dred.SetPageFaultEnablement(DredEnablement.ForcedOn);
+            dred.Dispose();
+        }
+
         using IDXGIFactory4 factory = CreateDXGIFactory1<IDXGIFactory4>();
         IDXGIAdapter1 adapter = PickHardwareAdapter(factory);
         Device = D3D12CreateDevice<ID3D12Device2>(adapter, FeatureLevel.Level_12_0);
@@ -72,6 +84,23 @@ public sealed class Dx12Device : IDisposable {
         // E_FAIL instead of the opaque HRESULT. Stored-message log only; no break-on-error.
         if (enableDebugLayer)
             infoQueue = Device.QueryInterfaceOrNull<ID3D12InfoQueue>();
+    }
+
+    readonly bool dredEnabled;
+    // On a device-removal, report the GPU page-fault from DRED: a non-zero PageFaultVA means a GPU command
+    // dereferenced freed/invalid memory (use-after-free / bad descriptor) — the decisive clue for a hang.
+    // Best-effort + fully guarded so the crash handler never throws over the real exception.
+    public string DrainDredReport() {
+        if (!dredEnabled) return "(DRED off — run with BALLISTIC_DX12_DRED=1)";
+        try {
+            using var dred = Device.QueryInterfaceOrNull<ID3D12DeviceRemovedExtendedData>();
+            if (dred is null) return "(DRED unavailable on this device/OS)";
+            dred.GetPageFaultAllocationOutput(out DredPageFaultOutput pf);
+            return $"PageFaultVA=0x{pf.PageFaultVA:X} " +
+                   "(VA!=0 => GPU touched freed/invalid memory: use-after-free or bad descriptor; " +
+                   "auto-breadcrumbs are in the Watson dump / debugger)";
+        }
+        catch (Exception e) { return "DRED read failed: " + e.Message; }
     }
 
     ID3D12InfoQueue infoQueue;
