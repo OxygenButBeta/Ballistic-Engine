@@ -6,6 +6,30 @@ archive and a fallback).
 
 ---
 
+## 🔻 ARCHITECTURE DECISION (2026-06-15, user) — CLUSTERED DEFERRED ("Deferred+")
+
+The DX12 renderer is **clustered deferred** (tiled/clustered deferred shading), NOT forward and NOT
+forward+. User: "we should go with clustered deferred, deferred+". This DELIBERATELY DIVERGES from the GL
+renderer (which is z-prepass clustered Forward+) — GL parity is NOT the goal; GL is being deleted, so we
+build the right DX architecture instead. Rationale: (1) a fat G-buffer is the natural input for the DXR
+GI endgame (Phase 6 dispatches rays from G-buffer surfaces); (2) clustered light culling shades many
+punctual lights in one screen-space pass; (3) SSAO/SSR/SSGI read real G-buffer normals/material instead
+of reconstructing from depth.
+
+**Shape:** geometry pass → fat G-buffer MRT (albedo, world-normal, ORM/material, + depth) → clustered
+light cull (froxels: sun + all punctual) → ONE deferred lighting pass (reads G-buffer, writes HDR) →
+sky → fog → post (SSAO/SSR/bloom/exposure, SSGI last) → composite. Transparents are a separate forward
+pass after deferred (deferred can't do blending) — a later concern.
+
+**Migration impact (the forward post-FX already built mostly survives):** the HDR target, composite,
+auto-exposure, bloom, shadows, IBL bake, procedural sky, volumetric fog all stay. What CHANGES: the
+opaque pass splits into geometry(→G-buffer) + deferred-lighting; SSAO/SSR switch from depth-reconstructed
+normals to the G-buffer normal; punctual lights get added in the deferred pass (clustered). The current
+single-pass-forward opaque is the thing being replaced. The DX-native abstraction + all infra
+(Dx12CubeTarget, ShadowMap, OffscreenTarget, descriptor heaps) carry over unchanged.
+
+---
+
 ## 🔻 STRATEGY CHANGE #2 (2026-06-15, user) — REDESIGN THE ABSTRACTION DX-NATIVE FIRST
 
 User: "şu anki soyutlamalar pek iyi değil, çok amatörce yazıldı; bizi zor patikalara sokuyorsa
@@ -152,13 +176,19 @@ slices) → half-res R8 AO + separable blur, multiplied into the HDR color in th
 BALLISTIC_DX12_SSAO=0 off). VERIFIED SunTemple — contact darkening in crevices/column bases/arches, flat
 surfaces untouched (ref dx12_suntemple_ssao.png). Composite SRV table now 4 (HDR/bloom/avgLum/AO).
 
-**DX12 stack now: PBR + sky + IBL + shadows + fog + HDR + auto-exposure + bloom + SSAO, on 2 scenes.**
+**DX12 stack now: PBR + sky + IBL + shadows + fog + HDR + auto-exposure + bloom + SSAO, on 2 scenes —
+but the OPAQUE PASS IS SINGLE-PASS FORWARD (sun only). Architecture decision: move to CLUSTERED DEFERRED
+(see the decision block at the top). The post-FX above survives; the opaque pass gets re-architected.**
 
-**NEXT (full-auto /loop; port ALL GL features):** SSR (screen-space reflections — march the depth/HDR in
-screen space; reuses depth SRV); TAA (jitter + motion vectors + history buffer — harder to verify on single
-shots, lower ROI); SSGI (LAST per directive); sky clouds/cirrus/stars; alpha-cutout caster shadows; cascade
-caching + interleave mesh verts (perf); finally editor→DX12 + delete GL wholesale (incl. the GL-shaped bind
-methods + RenderContext the DX12 path no-ops). DON'T break the editor — it renders on GL; delete GL last.
+**NEXT (full-auto /loop; CLUSTERED DEFERRED re-architecture, then port ALL GL features):**
+1. G-buffer geometry pass — fat MRT (albedo / world-normal / ORM-material / depth); split StandardOpaque
+   into a geometry-WRITE shader (no lighting, just G-buffer outputs).
+2. Deferred lighting pass — fullscreen, reads G-buffer → PBR sun + IBL + shadows → HDR target (the
+   lighting math moves out of the material shader into one screen-space pass).
+3. Rewire SSAO to read the G-buffer world-normal (drop the depth-reconstruct hack).
+4. Clustered punctual lights (point/spot, froxel cull) in the deferred pass — DX12 has NONE yet (sun only).
+5. SSR (reads G-buffer); TAA; SSGI (LAST); transparents forward pass; sky clouds/stars; perf.
+6. Finally editor→DX12 + delete GL wholesale. DON'T break the editor — it renders on GL; delete GL last.
 
 The frozen GL parity image: `Docs/Plans/dx12-refs/gl_suntemple_baseline.png` (mean RGB 96.7,81.9,65.6).
 
