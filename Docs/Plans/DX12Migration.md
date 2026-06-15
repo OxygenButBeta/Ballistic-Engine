@@ -209,10 +209,12 @@ doors (MCP/editor/runtime hooks). Native deps already vendored under native/ (OI
 1. ~~G-buffer geometry pass~~ DONE.
 2. ~~Deferred lighting pass (sun+IBL+shadows)~~ DONE.
 3. ~~SSAO reads G-buffer normal~~ DONE.
-4. **CLUSTERED PUNCTUAL LIGHTS (point/spot, froxel cull) — IN PROGRESS.** 16×9×24 log-Z froxels (GL
-   parity), GpuLight 64B struct, per-cluster {offset,count} grid + flat index list, point/spot Cook-Torrance
-   + attenuation + cone in DeferredLighting.hlsl. CPU cull first (faithful — same shader contract), GPU
-   compute cull is a later perf step. Lights from RuntimeSet<PointLight>/<SpotLight>. Punctual SHADOWS later.
+4. ✅ **CLUSTERED PUNCTUAL LIGHTS — DONE (2026-06-15).** 16×9×24 log-Z froxels (GL parity), GpuLight 64B
+   struct, per-cluster {offset,count} grid + flat index list, point/spot Cook-Torrance + attenuation + cone
+   in DeferredLighting.hlsl. CPU cull (faithful — same shader contract as a future GPU compute cull). Lights
+   from RuntimeSet<PointLight>/<SpotLight>, raw-HDR PhysicalColor. Verified (LightTest scene — 4 colored
+   pools correct; SunTemple byte-identical). ALSO fixed an engine-wide bug: Vector*/Quaternion component
+   members never deserialized at runtime (silent default). Punctual SHADOWS = later.
 
 **B. Screen-space post (the remaining GL post-FX, ported to DX12 — all Volume overrides):**
 5. SSR (screen-space reflections, reads G-buffer; half-res march + depth-aware upsample, GL parity).
