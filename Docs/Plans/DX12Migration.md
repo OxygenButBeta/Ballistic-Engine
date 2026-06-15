@@ -6,6 +6,30 @@ archive and a fallback).
 
 ---
 
+## 🔻 STRATEGY CHANGE (2026-06-15, user directive) — FULL DX12, NOT side-by-side
+
+The user decided: **GL will be deleted at the end anyway, and maintaining two backends in parallel is
+not worth it — think full-DX-focused.** This SUPERSEDES the "side-by-side / GL parity oracle" strategy
+below (kept for history). Concretely:
+
+- **No two-backend maintenance.** We do NOT keep GL byte-identical, do NOT `bal imgdiff` every DX phase
+  against a live GL backend, and do NOT preserve the abstraction seam *for GL's sake*.
+- **GL is dead-man-walking, not the oracle.** GL code stays in the repo only so the engine keeps running
+  while DX12 is incomplete; it gets ZERO new work and is deleted once DX12 reaches parity. The user chose
+  "delete GL now, full DX" — so the GL *host/runtime path* is being retired; the GL renderer files come
+  out as DX12 replaces each piece (not one big-bang delete that bricks the engine).
+- **Parity oracle is now a frozen IMAGE, not a backend.** A GL SunTemple capture is saved as a permanent
+  PNG reference (`e:/tmp/gl_suntemple_baseline.png`, mean RGB (96.7, 81.9, 65.6), 1920x1080, frame 120,
+  deterministic paused). DX12 output is judged by EYE + plausibility against that image (color balance,
+  geometry, shadow direction), not a numeric cross-backend diff.
+- **The abstraction seam (RenderAsset/HDRenderer) is kept where it's load-bearing for ENGINE types**
+  (Mesh/Material call `RenderAsset.Current.Create*`; HDCamera calls `renderer.BeginRender`). It is NOT
+  kept pristine to host a second backend. Flatten it opportunistically as GL leaves (Phase 7 work that
+  can now start earlier). Don't over-invest in keeping it backend-neutral.
+- Phases below still hold in ORDER (mesh→material→shadows→post→GPU-driven→FSR→DXR-GI); only the
+  per-phase *verification* changes from "imgdiff vs GL" to "looks right + .stats.json sane". SSGI still
+  last.
+
 ## ⏩ HANDOFF / RESUME POINT (read this first — 2026-06-15)
 
 **Where we are:** Phase 0 (abstraction prep) + Phase 1 core (DX12 device, raster pipeline, screenshot

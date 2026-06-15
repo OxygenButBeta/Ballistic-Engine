@@ -79,6 +79,33 @@ public sealed class Dx12Device : IDisposable {
         }
     }
 
+    // Create a DEFAULT-heap buffer of `byteSize` seeded with `data`, via a temporary upload heap +
+    // CopyBufferRegion (the GPU-local path the real renderer wants — vs the cube test's upload-heap
+    // shortcut). Synchronous: blocks until the copy completes, then the upload heap is freed. The
+    // returned resource is left in `finalState` (e.g. VertexAndConstantBuffer / IndexBuffer).
+    public unsafe ID3D12Resource CreateDefaultBuffer<T>(ReadOnlySpan<T> data, ResourceStates finalState)
+        where T : unmanaged {
+        int byteSize = data.Length * sizeof(T);
+        ID3D12Resource dest = Device.CreateCommittedResource(
+            HeapProperties.DefaultHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)byteSize), ResourceStates.Common);
+
+        using ID3D12Resource upload = Device.CreateCommittedResource(
+            HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)byteSize), ResourceStates.GenericRead);
+
+        Span<T> mapped = upload.Map<T>(0, data.Length);
+        data.CopyTo(mapped);
+        upload.Unmap(0);
+
+        ExecuteSync(cl => {
+            cl.ResourceBarrierTransition(dest, ResourceStates.Common, ResourceStates.CopyDest);
+            cl.CopyBufferRegion(dest, 0, upload, 0, (ulong)byteSize);
+            cl.ResourceBarrierTransition(dest, ResourceStates.CopyDest, finalState);
+        });
+        return dest;
+    }
+
     public void Dispose() {
         WaitForGpu();
         fenceEvent.Dispose();
