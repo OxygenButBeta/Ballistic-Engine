@@ -255,6 +255,20 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         }
     }
 
+    // RT exposure: the DXR GI/reflection hit shaders decode the hit material BYTE-IDENTICALLY to the raster
+    // G-buffer, so they reuse THIS exact bindless material table (no parallel build → no drift). The table is
+    // a root SRV in the raster draw; here we hand the RT pass its GPU address + the Material→id map so it can
+    // build a per-triangle MaterialId buffer (Dx12RtGeometry) that resolves the same ids GBufferBindless uses.
+    public ulong MaterialsGpuAddress => materials?.GPUVirtualAddress ?? 0;
+    public int MaterialCount => materialCount;
+    public bool TryMaterialId(Material mat, out int id) {
+        if (mat is not null) return materialIds.TryGetValue(mat, out id);
+        id = 0; return false;
+    }
+    // The material-table stamp — Dx12RtGeometry rebuilds its per-triangle buffer when this changes (a new
+    // material set means the ids it baked are stale).
+    public int MaterialTableStamp => tableStamp;
+
     // Resolve a material map to a bindless index (real texture or the neutral fallback — matches CPU BindSrv).
     int Bindless(Texture2D tex, TextureType type) {
         var dx = (tex as Dx12Texture2D) ?? (DefaultTextures.Neutral(type) as Dx12Texture2D);

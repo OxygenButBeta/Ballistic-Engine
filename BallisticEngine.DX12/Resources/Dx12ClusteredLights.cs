@@ -70,6 +70,9 @@ public sealed class Dx12ClusteredLights : IDisposable {
 
     public int LightCount => lightCount;
     public CpuDescriptorHandle LightSrvCpu => Dx12Backend.SrvStore.Cpu(lightSrv);
+    // The raw light-buffer GPU address (StructuredBuffer<GpuLight>) for the DXR GI hit shader, which loops
+    // ALL gathered punctual lights at a hit point (no froxel grid — that's view-space; hits are off-screen).
+    public ulong LightBufGpuAddress => lightBuf?.GPUVirtualAddress ?? 0;
     public CpuDescriptorHandle GridSrvCpu => Dx12Backend.SrvStore.Cpu(gridSrv);
     public CpuDescriptorHandle IndexSrvCpu => Dx12Backend.SrvStore.Cpu(indexSrv);
 

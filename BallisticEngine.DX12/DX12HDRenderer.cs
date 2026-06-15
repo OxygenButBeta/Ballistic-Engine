@@ -206,14 +206,20 @@ public sealed class DX12HDRenderer : HDRenderer {
     // DxrGi.hlsl cosine-samples one hemisphere ray per pixel → the raw one-bounce GI in ssgiTarget; then the
     // SHARED SSGI pipeline (motion temporal + OIDN + combine) cleans + adds it. RT GI just replaces the
     // SSILVB gather. Reuses device5 + sceneAS.
-    ID3D12RootSignature rtGiRootSig;            // CBV(b0) + table{SRV t0 TLAS,t1 depth,t2 normal,t3 irr,t4 pref; UAV u0} + s0
+    ID3D12RootSignature rtGiRootSig;            // CBV b0/b1 + table{t0-t4,u0} + SRV t5 materials + t6 instances + bindless
     ID3D12StateObject rtGiPso;
-    ID3D12Resource rtGiSbt, rtGiCb;
-    unsafe byte* rtGiCbMapped;
+    ID3D12Resource rtGiSbt, rtGiCb, rtGiSunCb;
+    unsafe byte* rtGiCbMapped, rtGiSunCbMapped;
     Dx12DescriptorHeap rtGiHeap;                // 6 descriptors (rebuilt per frame)
+    Dx12RtGeometry rtGeometry;                  // P1: per-instance index/normal/uv/tri-material SRVs (bindless)
     bool rtGiBuilt;
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct RtGiConstants { public Matrix4x4 InvViewProj; public Matrix4x4 ViewProj; public Vector4 Params; }  // preExp, rayLength, _, frameIdx
+    // P1 world-radiance hit shading: the sun + normal bias for the hit's direct-light term + shadow ray,
+    // plus the punctual-light count (the hit shader loops all gathered point/spot lights — scenes lit only
+    // by a point light, like the Bistro interior, get no bounce from sun/IBL alone).
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct RtGiSun { public Vector3 SunDir; public float NormalBias; public Vector3 SunColor; public float LightCount; }
 
     float SsgiPreExposure() => float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
         System.Globalization.CultureInfo.InvariantCulture, out float e) ? e : 1.0e-5f;
@@ -1605,7 +1611,7 @@ public sealed class DX12HDRenderer : HDRenderer {
                       : ssgiEnv == "0" ? GiMode.Off
                       : ssgiEnv == "1" ? GiMode.ScreenSpace
                       : PostFX.GiMode;
-        if (giMode == GiMode.RayTraced) { if (EnsureRtGi()) TimePass("GI:RT", () => DrawRtGi(view, viewProj, proj)); else TimePass("GI:SSGI", () => DrawSsgi(view, proj)); }
+        if (giMode == GiMode.RayTraced) { if (EnsureRtGi()) TimePass("GI:RT", () => DrawRtGi(view, viewProj, proj, lightDir, lightColor)); else TimePass("GI:SSGI", () => DrawSsgi(view, proj)); }
         else if (giMode == GiMode.ScreenSpace) TimePass("GI:SSGI", () => DrawSsgi(view, proj));
 
         // --- Volumetric fog (post pass, reads depth+shadows, blends over HDR scene color) ---
@@ -2388,18 +2394,33 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (device5 == null) device5 = dev.Device.QueryInterface<ID3D12Device5>();
         if (sceneAS == null) sceneAS = new Dx12SceneAS(dev);
 
-        // CBV(b0) + table {SRV t0-t4, UAV u0} + static clamp sampler s0.
-        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        // P1 world-radiance hit shading: the closest-hit shader decodes the hit MATERIAL bindlessly (exactly
+        // like GBufferBindless), so the root sig must allow ResourceDescriptorHeap[] indexing
+        // (SamplerHeapDirectlyIndexed not needed — we use a static sampler). Layout:
+        //   CBV b0 RtGiConstants | CBV b1 RtGiSun (sun dir/color + frame) | table{SRV t0-t4, UAV u0} |
+        //   SRV t5 GpuMaterials (root) | SRV t6 RtInstance[] (root) + static clamp + wrap samplers.
+        var cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var cbv1 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.All);
         var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 5, baseShaderRegister: 0);
         var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);
         var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange), ShaderVisibility.All);
-        var samp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) {
+        var matSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(5, 0), ShaderVisibility.All);
+        var instSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(6, 0), ShaderVisibility.All);
+        var lightSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All);  // punctual lights
+        var clampSamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
             AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
             ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
         };
+        var wrapSamp = new StaticSamplerDescription(ShaderVisibility.All, 1, 0) {   // albedo texture sampling
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap,
+            AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
         rtGiRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, table }, new[] { samp })));
+            new RootSignatureDescription1(
+                RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
+                new[] { cbv0, cbv1, table, matSrv, instSrv, lightSrv }, new[] { clampSamp, wrapSamp })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("DxrGi.hlsl");
         byte[] dxil = Dx12ShaderCompiler.Compile(DxcShaderStage.Library, hlsl, "", "DxrGi.hlsl");
@@ -2427,17 +2448,35 @@ public sealed class DX12HDRenderer : HDRenderer {
         rtGiCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         rtGiCbMapped = rtGiCb.Map<byte>(0);
+        int sunSize = (System.Runtime.InteropServices.Marshal.SizeOf<RtGiSun>() + 255) & ~255;
+        rtGiSunCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)sunSize), ResourceStates.GenericRead);
+        rtGiSunCbMapped = rtGiSunCb.Map<byte>(0);
         rtGiHeap = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 6, shaderVisible: true);
+        rtGeometry = new Dx12RtGeometry(dev);
         return true;
     }
 
+    // The 6 RT-GI table descriptors (t0 TLAS, t1 depth, t2 normal, t3 irradiance, t4 scene color, u0 output)
+    // must live in the SAME heap as the bindless material/geometry SRVs (only one CBV/SRV/UAV heap binds at a
+    // time, and the hit shader's ResourceDescriptorHeap[] reads the bindless heap). So they get a RESERVED
+    // tail range of the BindlessHeap (16384 cap; materials bump from 0 and never reach here), written each
+    // frame. The table root param points at this base; bindless reads index the same heap by their slot.
+    const int RtGiTableBase = 16384 - 8;
+
     // RT global illumination: trace a cosine-hemisphere ray per pixel → raw one-bounce GI in ssgiTarget,
     // then the SHARED SSGI resolve (temporal + OIDN + combine). viewProj is the JITTERED matrix (matches the
-    // depth); proj drives the SSGI dials/combine.
-    unsafe void DrawRtGi(Matrix4x4 view, Matrix4x4 viewProj, Matrix4x4 proj) {
+    // depth); proj drives the SSGI dials/combine. lightDir/lightColor = the sun (raw HDR) for the world-space
+    // hit re-shading (P1). EnsureMaterialTable + rtGeometry.Ensure MUST run before this (bindless ids).
+    unsafe void DrawRtGi(Matrix4x4 view, Matrix4x4 viewProj, Matrix4x4 proj, Vector3 lightDir, Vector3 lightColor) {
         sceneAS.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection);
         if (!sceneAS.Valid) { DrawSsgi(view, proj); return; }   // no geometry → fall back to SSGI
+        // The bindless material table (byte-identical to the raster G-buffer) feeds the world-space hit
+        // shading. The geometry pass builds it only when gpuDrivenOn — ensure it here too (stamp-cached no-op
+        // if already built) so RT-GI works with the CPU geometry path. Then the per-instance geometry SRVs.
+        gpuDriven.EnsureMaterialTable(wholeMeshRenderers);
+        rtGeometry.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection, gpuDriven);
 
         int fi = FillSsgiConstants(view, proj);   // dials + matrices for the shared temporal/combine
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
@@ -2446,27 +2485,37 @@ public sealed class DX12HDRenderer : HDRenderer {
             InvViewProj = Matrix4x4.Transpose(invVP), ViewProj = Matrix4x4.Transpose(viewProj),
             Params = new Vector4(SsgiPreExposure(), MathF.Max(PostFX.SsgiRayLength, 0.1f), 0f, fi),
         };
+        Vector3 sunDir = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
+        *(RtGiSun*)rtGiSunCbMapped = new RtGiSun {
+            SunDir = sunDir, NormalBias = 0.03f, SunColor = lightColor, LightCount = clusteredLights.LightCount,
+        };
 
         // G-buffer is in the combined shader-read state (RT compute-stage can read depth+normal); the lit
-        // scene color is the bounce source (project the hit back to it), so bring it to SRV.
+        // scene color is the bounce source (project the hit back to it), so bring it to SRV. The 6 table
+        // descriptors go into the BindlessHeap's reserved tail so the bindless hit shading shares the heap.
         target.ColorToShaderResource();
-        sceneAS.CreateTlasSrv(rtGiHeap.Cpu(0));
-        dev.Device.CopyDescriptorsSimple(1, rtGiHeap.Cpu(1), gbuffer.DepthSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, rtGiHeap.Cpu(2), gbuffer.ColorSrvCpu(1), heapType);   // world normal
-        dev.Device.CopyDescriptorsSimple(1, rtGiHeap.Cpu(3), ibl.IrradianceSrv, heapType);        // off-screen fallback
-        dev.Device.CopyDescriptorsSimple(1, rtGiHeap.Cpu(4), target.ColorSrvCpu, heapType);       // lit scene color
+        Dx12DescriptorHeap bindless = Dx12Backend.BindlessHeap;
+        sceneAS.CreateTlasSrv(bindless.Cpu(RtGiTableBase + 0));
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtGiTableBase + 1), gbuffer.DepthSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtGiTableBase + 2), gbuffer.ColorSrvCpu(1), heapType);   // world normal
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtGiTableBase + 3), ibl.IrradianceSrv, heapType);        // off-screen fallback
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtGiTableBase + 4), target.ColorSrvCpu, heapType);       // lit scene color
         dev.Device.CreateUnorderedAccessView(ssgiTarget.RenderTarget, null, new UnorderedAccessViewDescription {
             Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
-        }, rtGiHeap.Cpu(5));
+        }, bindless.Cpu(RtGiTableBase + 5));
 
         ssgiTarget.ColorToUnorderedAccess();
         uint idSize = Vortice.Direct3D12.D3D12.ShaderIdentifierSizeInBytes;
         dev.ExecuteSync(cl => {
-            cl.SetDescriptorHeaps(rtGiHeap.Heap);
+            cl.SetDescriptorHeaps(bindless.Heap);   // bindless heap = the bound CBV/SRV/UAV heap (table + ResourceDescriptorHeap[])
             cl.SetComputeRootSignature(rtGiRootSig);
             cl.SetPipelineState1(rtGiPso);
             cl.SetComputeRootConstantBufferView(0, rtGiCb.GPUVirtualAddress);
-            cl.SetComputeRootDescriptorTable(1, rtGiHeap.Gpu(0));
+            cl.SetComputeRootConstantBufferView(1, rtGiSunCb.GPUVirtualAddress);
+            cl.SetComputeRootDescriptorTable(2, bindless.Gpu(RtGiTableBase));
+            cl.SetComputeRootShaderResourceView(3, gpuDriven.MaterialsGpuAddress);    // t5 GpuMaterials
+            cl.SetComputeRootShaderResourceView(4, rtGeometry.InstancesGpuAddress);   // t6 RtInstance[]
+            cl.SetComputeRootShaderResourceView(5, clusteredLights.LightBufGpuAddress);  // t7 punctual lights
             cl.DispatchRays(new DispatchRaysDescription {
                 Width = (uint)ssgiTarget.Width, Height = (uint)ssgiTarget.Height, Depth = 1,
                 RayGenerationShaderRecord = new GpuVirtualAddressRange { StartAddress = rtGiSbt.GPUVirtualAddress, SizeInBytes = idSize },
