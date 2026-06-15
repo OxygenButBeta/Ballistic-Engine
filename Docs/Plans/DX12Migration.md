@@ -42,6 +42,16 @@ Cross-API frames will NOT be byte-identical to GL (different rasterizer rules). 
 cross-backend diffs is a SMALL PERCEPTUAL BUDGET (mean + 32x32 hotspot, like `bal imgdiff`), while
 byte-exactness is kept WITHIN a single backend.
 
+## Math library (decided 2026-06-15)
+
+The DX12 backend uses **System.Numerics** (NOT OpenTK.Mathematics): SIMD-accelerated, and DX-convention
+(`Matrix4x4.CreatePerspectiveFieldOfView`/`CreateLookAt` are right-handed with NDC z ∈ [0,1], exactly
+what DX12 wants — OpenTK's are GL z ∈ [-1,1]). The engine CORE stays on OpenTK.Mathematics; mesh/
+transform data is converted at the backend boundary. HARD-WON convention: HLSL `float4x4` constant
+buffers are COLUMN-major by default but System.Numerics is row-major in memory — **`Matrix4x4.Transpose()`
+on upload**, then `mul(float4(pos,1), MVP)` in HLSL matches the CPU math. (Skipping the transpose was
+the "cube fills the whole frame" bug.)
+
 ## Phases (each independently verifiable via the deterministic screenshot harness)
 
 - **Phase 0 — Abstraction prep (GL still the only backend). ~1-2 wk. [DONE 2026-06-15]**
