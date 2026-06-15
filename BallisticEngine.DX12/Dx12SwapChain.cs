@@ -123,6 +123,27 @@ public sealed class Dx12SwapChain : IDisposable {
         swapChain.Present(vsync ? 1u : 0u, PresentFlags.None);
     }
 
+    // The PLAYER present (no ImGui): blit the renderer's final LDR color straight into the backbuffer, then
+    // flip. `source` must be R8G8B8A8_UNORM at the SAME size as the backbuffer (the windowed host resizes the
+    // renderer to the window) and IN RENDER_TARGET state (the player path leaves ldr there) — it's restored
+    // to RenderTarget after, keeping the Dx12OffscreenTarget's own state tracking consistent. One command
+    // list + GPU flush (the synchronous model), then Present.
+    public void PresentTexture(ID3D12Resource source, bool vsync) {
+        currentIndex = (int)swapChain.CurrentBackBufferIndex;
+        uiAllocator.Reset();
+        uiList.Reset(uiAllocator, null);
+        ID3D12Resource bb = backBuffers[currentIndex];
+        uiList.ResourceBarrierTransition(bb, ResourceStates.Present, ResourceStates.CopyDest);
+        uiList.ResourceBarrierTransition(source, ResourceStates.RenderTarget, ResourceStates.CopySource);
+        uiList.CopyResource(bb, source);
+        uiList.ResourceBarrierTransition(source, ResourceStates.CopySource, ResourceStates.RenderTarget);
+        uiList.ResourceBarrierTransition(bb, ResourceStates.CopyDest, ResourceStates.Present);
+        uiList.Close();
+        dev.Queue.ExecuteCommandList(uiList);
+        dev.Flush();
+        swapChain.Present(vsync ? 1u : 0u, PresentFlags.None);
+    }
+
     // Flush the GPU, release backbuffer references (required by ResizeBuffers), resize, recreate RTVs.
     public void Resize(int width, int height) {
         width = Math.Max(1, width); height = Math.Max(1, height);

@@ -421,6 +421,12 @@ public sealed class DX12HDRenderer : HDRenderer {
     nint ldrUiHandle;
     public override RenderHandle SceneColorHandle => new(ldrUiHandle);
     public override RenderHandle GameColorHandle => new(ldrUiHandle);
+
+    // The final composited LDR color resource (R8G8B8A8_UNORM). The windowed DX12 player host blits this
+    // straight into the swapchain backbuffer (PresentToScreen path); the editor samples it via the UI heap.
+    public ID3D12Resource DisplayResource => ldr?.RenderTarget;
+    public int DisplayWidth => outputW;
+    public int DisplayHeight => outputH;
     // DX12 textures are top-down → the editor must NOT flip V (unlike GL's bottom-up textures).
     public override bool DisplayTextureTopDown => true;
 
