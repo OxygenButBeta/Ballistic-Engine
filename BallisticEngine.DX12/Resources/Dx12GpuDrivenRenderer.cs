@@ -66,13 +66,35 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     int materialCount;
     int tableStamp = -1;
 
+    // --- GPU-driven sun shadows (depth-only, per cascade) ---
+    const int ShadowCascades = 4;
+    const int ShadowCapacity = ShadowCascades * Capacity;
+    ID3D12PipelineState shadowCullPso;       // reuses cullRootSig (CBV b0 + SRV t0 + UAV u0/u1)
+    ID3D12RootSignature shadowDrawRootSig;   // root const b0 (DrawIndex) + SRV t0 (ShadowPerDraws)
+    ID3D12PipelineState shadowDrawPso;       // depth-only, slope bias (matches CPU shadow PSO)
+    ID3D12CommandSignature shadowCmdSig;
+    ID3D12Resource shadowMetaUpload;   unsafe byte* shadowMetaMapped;
+    ID3D12Resource shadowCullParamUpload; unsafe byte* shadowCullParamMapped;
+    ID3D12Resource shadowCommands;     // DEFAULT UAV
+    ID3D12Resource shadowPerDraws;     // DEFAULT UAV
+    int shadowMetaStride;
+    readonly List<(int cascade, Dx12Buffer<GLVector3> vb, Dx12IndexBuffer ib, int baseIdx, int count)> shadowSlices = new();
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct ShadowMeta { public Matrix4x4 LightMvp; public Vector4 AabbMin, AabbMax; public uint FirstIndex, IndexCount, Pad0, Pad1; }
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct ShadowPerDraw { public Matrix4x4 LightMvp; }
+
     public Dx12GpuDrivenRenderer(Dx12Device device) {
         dev = device;
         metaStride = System.Runtime.InteropServices.Marshal.SizeOf<SubmeshMeta>();
         perDrawStride = System.Runtime.InteropServices.Marshal.SizeOf<PerDraw>();
         materialStride = System.Runtime.InteropServices.Marshal.SizeOf<GpuMaterial>();
+        shadowMetaStride = System.Runtime.InteropServices.Marshal.SizeOf<ShadowMeta>();
         BuildPipelines();
         AllocateBuffers();
+        BuildShadowPipelines();
+        AllocateShadowBuffers();
     }
 
     unsafe void BuildPipelines() {
@@ -317,6 +339,155 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         return groups.Count;   // ExecuteIndirect calls submitted (the CPU-submit win: ~1600 draws -> a few)
     }
 
+    unsafe void BuildShadowPipelines() {
+        string cullHlsl = EmbeddedShaderSource.ReadHlsl("GpuCullShadow.hlsl");
+        shadowCullPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription {
+            RootSignature = cullRootSig,   // same layout: CBV b0 + SRV t0 + UAV u0/u1
+            ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, cullHlsl, "CSMain", "GpuCullShadow.hlsl"),
+        });
+
+        // Draw root sig: root const b0 (DrawIndex) + SRV t0 (ShadowPerDraws). Depth-only, no samplers.
+        var drawParams = new[] {
+            new RootParameter1(new RootConstants(0, 0, 1), ShaderVisibility.Vertex),
+            new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.Vertex),
+        };
+        shadowDrawRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.AllowInputAssemblerInputLayout, drawParams)));
+
+        string drawHlsl = EmbeddedShaderSource.ReadHlsl("ShadowDepthIndirect.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, drawHlsl, "VSMain", "ShadowDepthIndirect.hlsl");
+        var layout = new InputLayoutDescription(
+            new InputElementDescription("POSITION", 0, Vortice.DXGI.Format.R32G32B32_Float, 0, 0));
+        var raster = RasterizerDescription.CullClockwise;     // matches the CPU shadow PSO bias exactly
+        raster.DepthBias = 2000; raster.SlopeScaledDepthBias = 2.5f; raster.DepthBiasClamp = 0f;
+        shadowDrawPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+            RootSignature = shadowDrawRootSig, VertexShader = vs, PixelShader = default, InputLayout = layout,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = raster, BlendState = BlendDescription.Opaque, DepthStencilState = DepthStencilDescription.Default,
+            RenderTargetFormats = Array.Empty<Vortice.DXGI.Format>(),
+            DepthStencilFormat = Dx12ShadowMap.DepthFormat, SampleDescription = new Vortice.DXGI.SampleDescription(1, 0),
+        });
+
+        var argConstant = new IndirectArgumentDescription { Type = IndirectArgumentType.Constant };
+        argConstant.Constant.RootParameterIndex = 0;
+        argConstant.Constant.DestOffsetIn32BitValues = 0;
+        argConstant.Constant.Num32BitValuesToSet = 1;
+        var argDraw = new IndirectArgumentDescription { Type = IndirectArgumentType.DrawIndexed };
+        shadowCmdSig = dev.Device.CreateCommandSignature<ID3D12CommandSignature>(
+            new CommandSignatureDescription(DrawCmdStride, new[] { argConstant, argDraw }), shadowDrawRootSig);
+    }
+
+    unsafe void AllocateShadowBuffers() {
+        shadowCommands = dev.CreateUavBuffer<byte>(new byte[ShadowCapacity * DrawCmdStride], ResourceStates.IndirectArgument);
+        shadowPerDraws = dev.CreateUavBuffer<ShadowPerDraw>(new ShadowPerDraw[ShadowCapacity], ResourceStates.NonPixelShaderResource);
+        shadowMetaUpload = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)((long)shadowMetaStride * ShadowCapacity)), ResourceStates.GenericRead);
+        shadowMetaMapped = shadowMetaUpload.Map<byte>(0);
+        shadowCullParamUpload = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)((long)cullParamSlotSize * ShadowCascades * MaxGroups)), ResourceStates.GenericRead);
+        shadowCullParamMapped = shadowCullParamUpload.Map<byte>(0);
+    }
+
+    // Build the per-cascade SubmeshMeta + dispatch the shadow culls (records into `cl`). Must run BEFORE the
+    // per-cascade depth draws. Mirrors the CPU shadow caster set EXACTLY (every submesh with IndexCount > 0,
+    // no material filter — depth-only) so the shadow maps are byte-identical. Stores the slices for
+    // DrawShadowCascade. cascadeMatrices = the 4 light-space view*proj matrices.
+    public unsafe void BuildShadowCull(ID3D12GraphicsCommandList4 cl, List<IStaticMeshRenderer> wholeMesh,
+                                       Matrix4x4[] cascadeMatrices) {
+        shadowSlices.Clear();
+        var byMesh = new Dictionary<Mesh, List<IStaticMeshRenderer>>();
+        foreach (var r in wholeMesh) {
+            Mesh m = r.SharedMesh; if (m is null) continue;
+            if (!byMesh.TryGetValue(m, out var list)) { list = new(); byMesh[m] = list; }
+            list.Add(r);
+        }
+
+        int total = 0, sliceCount = 0;
+        var planes = new Vector4[6];
+        for (int c = 0; c < ShadowCascades; c++) {
+            ExtractPlanes(cascadeMatrices[c], planes);
+            foreach (var kv in byMesh) {
+                if (sliceCount >= ShadowCascades * MaxGroups) break;
+                Mesh mesh = kv.Key;
+                var vb = mesh.VertexBuffer as Dx12Buffer<GLVector3>;
+                var ib = mesh.IndexBuffer as Dx12IndexBuffer;
+                if (vb?.Resource is null || ib?.Resource is null) continue;
+                int sliceBase = total;
+                foreach (var r in kv.Value) {
+                    Matrix4x4 model = ToNum(r.Transform.WorldMatrix);
+                    Matrix4x4 lightMvp = Matrix4x4.Transpose(model * cascadeMatrices[c]);
+                    for (int s = 0; s < mesh.SubMeshes.Length && total < ShadowCapacity; s++) {
+                        SubMeshData sub = mesh.SubMeshes[s];
+                        if (sub.IndexCount <= 0) continue;
+                        mesh.GetSubMeshBounds(s, out GLVector3 lmin, out GLVector3 lmax);
+                        WorldAabb(lmin, lmax, model, out Vector3 wlo, out Vector3 whi);
+                        *(ShadowMeta*)(shadowMetaMapped + (long)total * shadowMetaStride) = new ShadowMeta {
+                            LightMvp = lightMvp, AabbMin = new Vector4(wlo, 0), AabbMax = new Vector4(whi, 0),
+                            FirstIndex = (uint)sub.IndexStart, IndexCount = (uint)sub.IndexCount,
+                        };
+                        total++;
+                    }
+                }
+                int count = total - sliceBase;
+                if (count == 0) continue;
+                var cp = new CullParams {
+                    P0 = planes[0], P1 = planes[1], P2 = planes[2], P3 = planes[3], P4 = planes[4], P5 = planes[5],
+                    SubmeshCount = (uint)count, OutBase = (uint)sliceBase,
+                };
+                *(CullParams*)(shadowCullParamMapped + (long)sliceCount * cullParamSlotSize) = cp;
+                shadowSlices.Add((c, vb, ib, sliceBase, count));
+                sliceCount++;
+            }
+        }
+        if (shadowSlices.Count == 0) return;
+
+        cl.ResourceBarrierTransition(shadowCommands, ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess);
+        cl.ResourceBarrierTransition(shadowPerDraws, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+        cl.SetComputeRootSignature(cullRootSig);
+        cl.SetPipelineState(shadowCullPso);
+        cl.SetComputeRootShaderResourceView(1, shadowMetaUpload.GPUVirtualAddress);
+        cl.SetComputeRootUnorderedAccessView(2, shadowCommands.GPUVirtualAddress);
+        cl.SetComputeRootUnorderedAccessView(3, shadowPerDraws.GPUVirtualAddress);
+        for (int i = 0; i < shadowSlices.Count; i++) {
+            cl.SetComputeRootConstantBufferView(0, shadowCullParamUpload.GPUVirtualAddress + (ulong)((long)i * cullParamSlotSize));
+            cl.Dispatch((uint)((shadowSlices[i].count + 63) / 64), 1, 1);
+        }
+        cl.ResourceBarrierTransition(shadowCommands, ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument);
+        cl.ResourceBarrierTransition(shadowPerDraws, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+    }
+
+    // ExecuteIndirect this cascade's shadow slices into the currently-bound cascade DSV (inside RenderCascade).
+    public void DrawShadowCascade(ID3D12GraphicsCommandList4 cl, int cascade) {
+        bool any = false;
+        for (int i = 0; i < shadowSlices.Count; i++) if (shadowSlices[i].cascade == cascade) { any = true; break; }
+        if (!any) return;
+        cl.SetGraphicsRootSignature(shadowDrawRootSig);
+        cl.SetPipelineState(shadowDrawPso);
+        cl.SetGraphicsRootShaderResourceView(1, shadowPerDraws.GPUVirtualAddress);
+        cl.IASetPrimitiveTopology(Vortice.Direct3D.PrimitiveTopology.TriangleList);
+        for (int i = 0; i < shadowSlices.Count; i++) {
+            var sl = shadowSlices[i];
+            if (sl.cascade != cascade) continue;
+            cl.IASetVertexBuffers(0, new VertexBufferView(sl.vb.GpuAddress, (uint)sl.vb.ByteSize, (uint)sl.vb.Stride));
+            cl.IASetIndexBuffer(new IndexBufferView(sl.ib.GpuAddress, (uint)sl.ib.ByteSize, Vortice.DXGI.Format.R32_UInt));
+            cl.ExecuteIndirect(shadowCmdSig, (uint)sl.count, shadowCommands, (ulong)((long)sl.baseIdx * DrawCmdStride), null, 0);
+        }
+    }
+
+    // Gribb-Hartmann frustum planes from a row-major view*proj — identical to DX12HDRenderer.ExtractFrustumPlanes.
+    static void ExtractPlanes(Matrix4x4 m, Vector4[] p) {
+        Vector4 r1 = new(m.M11, m.M21, m.M31, m.M41);
+        Vector4 r2 = new(m.M12, m.M22, m.M32, m.M42);
+        Vector4 r3 = new(m.M13, m.M23, m.M33, m.M43);
+        Vector4 r4 = new(m.M14, m.M24, m.M34, m.M44);
+        p[0] = r4 + r1; p[1] = r4 - r1; p[2] = r4 + r2; p[3] = r4 - r2; p[4] = r3; p[5] = r4 - r3;
+        for (int i = 0; i < 6; i++) {
+            var n = new Vector3(p[i].X, p[i].Y, p[i].Z);
+            float len = n.Length();
+            if (len > 1e-6f) p[i] /= len;
+        }
+    }
+
     static void WorldAabb(GLVector3 localMin, GLVector3 localMax, Matrix4x4 model, out Vector3 lo, out Vector3 hi) {
         lo = new Vector3(float.MaxValue); hi = new Vector3(float.MinValue);
         for (int c = 0; c < 8; c++) {
@@ -337,5 +508,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         cullRootSig?.Dispose(); cullPso?.Dispose(); drawRootSig?.Dispose(); drawPso?.Dispose();
         cmdSig?.Dispose(); commands?.Dispose(); perDraws?.Dispose();
         metaUpload?.Dispose(); cullParamUpload?.Dispose(); materials?.Dispose();
+        shadowCullPso?.Dispose(); shadowDrawRootSig?.Dispose(); shadowDrawPso?.Dispose(); shadowCmdSig?.Dispose();
+        shadowCommands?.Dispose(); shadowPerDraws?.Dispose(); shadowMetaUpload?.Dispose(); shadowCullParamUpload?.Dispose();
     }
 }

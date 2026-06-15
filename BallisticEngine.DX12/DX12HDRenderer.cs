@@ -1021,6 +1021,14 @@ public sealed class DX12HDRenderer : HDRenderer {
         float exposure = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
             System.Globalization.CultureInfo.InvariantCulture, out float e) ? e : 1.0e-5f;
 
+        // GPU-driven: collect whole-mesh renderers once (used by BOTH the shadow pass and the geometry pass).
+        wholeMeshRenderers.Clear();
+        if (gpuDrivenOn) {
+            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
+                if (r is { IsActive: true, IsRenderable: true } && r.SubMeshIndex < 0 && r.SharedMesh != null)
+                    wholeMeshRenderers.Add(r);
+        }
+
         // Shadows first: render the sun cascades' depth (own upload command list) before opaque.
         RenderShadows(view, proj, light);
 
@@ -1055,15 +1063,9 @@ public sealed class DX12HDRenderer : HDRenderer {
         // Camera frustum planes from the UNJITTERED viewProj — per-submesh cull in the geometry pass.
         ExtractFrustumPlanes(viewProjUnjittered);
 
-        // GPU-driven: collect whole-mesh renderers (SubMeshIndex < 0) — their opaque submeshes are culled +
-        // drawn via compute + ExecuteIndirect instead of the per-submesh CPU loop below.
-        wholeMeshRenderers.Clear();
-        if (gpuDrivenOn) {
-            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
-                if (r is { IsActive: true, IsRenderable: true } && r.SubMeshIndex < 0 && r.SharedMesh != null)
-                    wholeMeshRenderers.Add(r);
+        // GPU-driven: whole-mesh renderers were collected before RenderShadows; build their bindless table.
+        if (gpuDrivenOn)
             gpuDriven.EnsureMaterialTable(wholeMeshRenderers);
-        }
 
         var fallbackDiffuse = DefaultTextures.Neutral(TextureType.Diffuse) as Dx12Texture2D;
 
@@ -1741,6 +1743,8 @@ public sealed class DX12HDRenderer : HDRenderer {
             ExtractFrustumPlanes(cascadeMatrices[c]);
             foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
                 if (r is null || !r.IsActive || !r.IsRenderable) continue;
+                // Whole-mesh casters are GPU-driven (per-cascade compute cull + ExecuteIndirect) — skip here.
+                if (gpuDrivenOn && r.SubMeshIndex < 0) continue;
                 Mesh mesh = r.SharedMesh; if (mesh is null) continue;
                 if (mesh.VertexBuffer is not Dx12Buffer<GLVector3> vb || vb.Resource is null) continue;
                 if (mesh.IndexBuffer is not Dx12IndexBuffer ib || ib.Resource is null) continue;
@@ -1763,16 +1767,19 @@ public sealed class DX12HDRenderer : HDRenderer {
                 }
             }
         }
-        if (fills.Count == 0) return;
+        bool gpuShadows = gpuDrivenOn && wholeMeshRenderers.Count > 0;
+        if (fills.Count == 0 && !gpuShadows) return;
 
         dev.ExecuteUpload(cl => {
+            // GPU-driven whole-mesh casters: per-cascade compute cull (must precede the depth draws).
+            if (gpuShadows) gpuDriven.BuildShadowCull(cl, wholeMeshRenderers, cascadeMatrices);
             shadowMap.ToDepthWrite(cl);
-            cl.SetGraphicsRootSignature(shadowRootSig);
-            cl.SetPipelineState(shadowPso);
-            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            int cur = -1;
             for (int c = 0; c < CascadeCount; c++) {
                 shadowMap.RenderCascade(cl, c, cc => {
+                    // CPU per-submesh casters for this cascade.
+                    cc.SetGraphicsRootSignature(shadowRootSig);
+                    cc.SetPipelineState(shadowPso);
+                    cc.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
                     foreach (var f in fills) {
                         if (f.cascade != c) continue;
                         cc.SetGraphicsRootConstantBufferView(0,
@@ -1781,6 +1788,8 @@ public sealed class DX12HDRenderer : HDRenderer {
                         cc.IASetIndexBuffer(new IndexBufferView(f.ib.GpuAddress, (uint)f.ib.ByteSize, Format.R32_UInt));
                         cc.DrawIndexedInstanced((uint)f.count, 1, (uint)f.start, 0, 0);
                     }
+                    // GPU-driven whole-mesh casters for this cascade (ExecuteIndirect into the same layer).
+                    if (gpuShadows) gpuDriven.DrawShadowCascade(cc, c);
                 });
             }
             shadowMap.ToShaderResource(cl);
