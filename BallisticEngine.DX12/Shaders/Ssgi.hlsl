@@ -16,6 +16,7 @@ cbuffer SsgiConstants : register(b0) {
     float4 Params2;  // xy = gather texel size (1/halfRes), z = preExposure, w = 1/preExposure
     float4 Combine0; // x=Intensity y=Look z=Saturation w=OcclusionPower
     float4 Tint;     // xyz = bounce tint
+    float4 Params3;  // x=HasHistory y=MaxHistory z/w=(unused) — temporal
 };
 
 Texture2D ColorTex  : register(t0);   // gather: lit HDR scene  | combine: scene
@@ -149,6 +150,75 @@ float4 PSGather(VSOut input) : SV_Target {
     float2 edge = min(uv0, 1.0 - uv0);
     float edgeFade = smoothstep(0.0, 0.06, min(edge.x, edge.y));
     return float4(Sanitize(bounce), edgeFade);
+}
+
+// Temporal accumulation: the biggest noise win. Reproject last frame's accumulated GI via the MOTION
+// buffer (prevUV = uv + motion — jitter-free, tracks dynamic geometry) and EMA-blend with this frame's
+// raw gather. Neighborhood clamp + pre/post firefly clamps keep the history from holding outliers. Ported
+// from GL SSGI_Temporal (depth+matrix reprojection swapped for the motion buffer). For this pass:
+// ColorTex(t0)=currentGI, DepthTex(t1)=historyGI (rgb + history length in a), NormalTex(t2)=motion (rg).
+float4 PSTemporal(VSOut input) : SV_Target {
+    float2 uv = input.Uv;
+    float2 texel = Params2.xy;
+    float hasHistory = Params3.x, maxHistory = max(Params3.y, 1.0);
+
+    float3 current = Sanitize(ColorTex.SampleLevel(LinearClamp, uv, 0).rgb);
+
+    // Pre-EMA firefly clamp: rescale a lone bright pixel's luma toward its 3x3 neighbourhood mean.
+    {
+        float3 nb = 0.0.xxx;
+        nb += Sanitize(ColorTex.SampleLevel(LinearClamp, uv + float2(-1,-1) * texel, 0).rgb);
+        nb += Sanitize(ColorTex.SampleLevel(LinearClamp, uv + float2( 0,-1) * texel, 0).rgb);
+        nb += Sanitize(ColorTex.SampleLevel(LinearClamp, uv + float2( 1,-1) * texel, 0).rgb);
+        nb += Sanitize(ColorTex.SampleLevel(LinearClamp, uv + float2(-1, 0) * texel, 0).rgb);
+        nb += Sanitize(ColorTex.SampleLevel(LinearClamp, uv + float2( 1, 0) * texel, 0).rgb);
+        nb += Sanitize(ColorTex.SampleLevel(LinearClamp, uv + float2(-1, 1) * texel, 0).rgb);
+        nb += Sanitize(ColorTex.SampleLevel(LinearClamp, uv + float2( 0, 1) * texel, 0).rgb);
+        nb += Sanitize(ColorTex.SampleLevel(LinearClamp, uv + float2( 1, 1) * texel, 0).rgb);
+        float nbLuma = dot(nb / 8.0, float3(0.2126, 0.7152, 0.0722));
+        float curLuma = dot(current, float3(0.2126, 0.7152, 0.0722));
+        float maxLuma = nbLuma * 4.0 + 0.02;
+        if (curLuma > maxLuma) current *= maxLuma / max(curLuma, 1e-4);
+    }
+
+    float2 motion = NormalTex.SampleLevel(LinearClamp, uv, 0).rg;   // prevUV - currUV
+    float2 prevUV = uv + motion;
+    bool valid = hasHistory > 0.5 && prevUV.x >= 0.0 && prevUV.x <= 1.0 && prevUV.y >= 0.0 && prevUV.y <= 1.0;
+    if (!valid)
+        return float4(current, 1.0);
+
+    float4 history = DepthTex.SampleLevel(LinearClamp, prevUV, 0);
+    history.rgb = Sanitize(history.rgb);
+
+    // Loosened neighbourhood clamp (3x box + epsilon floor) so history rides through miss-frames.
+    float3 lo = current, hi = current;
+    [unroll] for (int x = -1; x <= 1; x++)
+    [unroll] for (int y = -1; y <= 1; y++) {
+        float3 c = Sanitize(ColorTex.SampleLevel(LinearClamp, uv + float2(x, y) * texel, 0).rgb);
+        lo = min(lo, c); hi = max(hi, c);
+    }
+    float3 boxCenter = (lo + hi) * 0.5;
+    float3 boxExtent = (hi - lo) * 0.5 * 3.0 + 0.03.xxx;
+    lo = max(boxCenter - boxExtent, 0.0.xxx);
+    hi = boxCenter + boxExtent;
+    float3 clampedHistory = clamp(history.rgb, lo, hi);
+
+    float boxSize = max(length(hi - lo), 0.04);
+    float drift = length(history.rgb - clampedHistory) / boxSize;
+    float reset = smoothstep(1.5, 4.0, drift);
+    float histLen = (isnan(history.a) || isinf(history.a)) ? 1.0 : history.a;
+    histLen = lerp(histLen, 1.0, reset);
+    histLen = min(histLen + 1.0, maxHistory);
+
+    float alpha = 1.0 / histLen;
+    float3 accumulated = lerp(clampedHistory, current, alpha);
+
+    // Post-EMA firefly cap: keep the accumulated luma within a small multiple of the local box max.
+    float accLuma = dot(accumulated, float3(0.2126, 0.7152, 0.0722));
+    float capLuma = dot(hi, float3(0.2126, 0.7152, 0.0722)) * 1.5 + 0.05;
+    if (accLuma > capLuma) accumulated *= capLuma / max(accLuma, 1e-4);
+
+    return float4(accumulated, histLen);
 }
 
 // Composite: add the (denoised) one-bounce GI on top of the IBL-lit scene. Bounded refinement — energy-
