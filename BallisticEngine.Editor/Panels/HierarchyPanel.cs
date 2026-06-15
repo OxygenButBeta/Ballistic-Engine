@@ -161,7 +161,7 @@ internal sealed class HierarchyPanel {
         EditorUndo.Push(roots.Count == 1 ? "Group" : $"Group {roots.Count} Entities");
 
         // Group pivot at the centre of the roots' world positions (Unity-style).
-        OpenTK.Mathematics.Vector3 centre = OpenTK.Mathematics.Vector3.Zero;
+        Vector3 centre = Vector3.Zero;
         foreach (Entity e in roots) centre += e.transform.WorldPosition;
         centre /= roots.Count;
 

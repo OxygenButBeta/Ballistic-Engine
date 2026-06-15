@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -260,8 +259,8 @@ public class ParticleSystem : Behaviour {
 
         // Pick a LOCAL spawn offset + emission direction per shape (around local +Y), then world it.
         ShapeSample(out Vector3 localPos, out Vector3 localDir);
-        Vector3 position = worldOrigin + worldRot * localPos;
-        Vector3 dir = worldRot * localDir;
+        Vector3 position = worldOrigin + Vector3.Transform(localPos, worldRot);
+        Vector3 dir = Vector3.Transform(localDir, worldRot);
 
         float sizeJ = 1f + Random.Range(-SizeJitter, SizeJitter);
 
@@ -416,7 +415,7 @@ public class ParticleSystem : Behaviour {
         gizmos.Color = new Vector3(1f, 0.7f, 0.2f);
         Vector3 origin = transform.WorldPosition;
         Quaternion rot = transform.WorldRotation;
-        Vector3 up = rot * Vector3.UnitY;
+        Vector3 up = Vector3.Transform(Vector3.UnitY, rot);
 
         switch (Shape) {
             case EmissionShape.Cone:

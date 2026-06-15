@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -129,7 +128,7 @@ public class TrailRenderer : Behaviour, IRibbonSource {
             head.Position = pos;
             points[0] = head;
         }
-        if ((pos - lastSample).LengthSquared >= MinVertexDistance * MinVertexDistance) {
+        if ((pos - lastSample).LengthSquared() >= MinVertexDistance * MinVertexDistance) {
             points.Insert(0, new TrailPoint { Position = pos, Age = 0f });
             lastSample = pos;
         }

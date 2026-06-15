@@ -1,6 +1,5 @@
 using BallisticEngine.AssetPipeline;
 using BallisticEngine.Serialization;
-using OpenTK.Mathematics;
 
 // Converts the JSON sidecar the Blender export script produces (cameras + lights, plus a flag for
 // the sibling .fbx mesh) into a Ballistic .scene (YAML). Builds the SceneDocument directly — no live
@@ -191,7 +190,7 @@ public static class BlendSceneConverter {
     // rot*UnitY == up. Built directly from an orthonormalized basis rather than via Matrix4.LookAt
     // (which uses OpenGL's look-down-(-Z) view convention and would invert the engine's +Z forward).
     static Quaternion LookRotation(Vector3 forward, Vector3 up) {
-        if (forward.LengthSquared < 1e-12f)
+        if (forward.LengthSquared() < 1e-12f)
             return Quaternion.Identity;
 
         forward = forward.Normalized();
@@ -215,7 +214,7 @@ public static class BlendSceneConverter {
     }
 
     static Vector3 NormalizeOr(Vector3 v, Vector3 fallback) =>
-        v.LengthSquared > 1e-12f ? v.Normalized() : fallback;
+        v.LengthSquared() > 1e-12f ? v.Normalized() : fallback;
 
     // ---- Light unit mapping --------------------------------------------------
 

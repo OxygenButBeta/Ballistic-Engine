@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -54,12 +53,12 @@ public static class RibbonBuilder {
             if (i == 0) dir = points[0] - points[1];
             else if (i == count - 1) dir = points[count - 2] - points[count - 1];
             else dir = points[i - 1] - points[i + 1];
-            if (dir.LengthSquared < 1e-10f) dir = Vector3.UnitX;
+            if (dir.LengthSquared() < 1e-10f) dir = Vector3.UnitX;
             dir = dir.Normalized();
 
             Vector3 toCam = cameraPos - pos;
             Vector3 side = Vector3.Cross(dir, toCam);
-            side = side.LengthSquared > 1e-10f ? side.Normalized() : Vector3.UnitY;
+            side = side.LengthSquared() > 1e-10f ? side.Normalized() : Vector3.UnitY;
 
             float t = count > 1 ? i / (float)(count - 1) : 0f;   // 0 = start, 1 = end
             float halfWidth = MathHelper.Lerp(startWidth, endWidth, t) * 0.5f;

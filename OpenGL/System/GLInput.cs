@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine.Core.GL;
@@ -35,9 +34,9 @@ public class GLInput : IInputProvider {
         return mouseState.IsButtonDown(button);
     }
 
-    public Vector2 ScrollDelta => mouseState.ScrollDelta;
-    public Vector2 MousePosition => mouseState.Position;
-    public Vector2 MouseDelta => mouseState.Delta;
+    public Vector2 ScrollDelta => new Vector2(mouseState.ScrollDelta.X, mouseState.ScrollDelta.Y);
+    public Vector2 MousePosition => new Vector2(mouseState.Position.X, mouseState.Position.Y);
+    public Vector2 MouseDelta => new Vector2(mouseState.Delta.X, mouseState.Delta.Y);
 
     // ---- Gamepad ----
 

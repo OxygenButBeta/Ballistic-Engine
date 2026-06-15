@@ -31,9 +31,9 @@ public sealed class UnityTransform {
     public long FileId;
     public long GameObjectId;
     public long FatherId;               // parent transform fileID, 0 = root
-    public OpenTK.Mathematics.Vector3 LocalPosition;
-    public OpenTK.Mathematics.Quaternion LocalRotation = OpenTK.Mathematics.Quaternion.Identity;
-    public OpenTK.Mathematics.Vector3 LocalScale = OpenTK.Mathematics.Vector3.One;
+    public Vector3 LocalPosition;
+    public Quaternion LocalRotation = Quaternion.Identity;
+    public Vector3 LocalScale = Vector3.One;
     public readonly List<long> ChildIds = new();
 }
 
@@ -61,9 +61,9 @@ public sealed class UnityPrefabInstance {
     public string Name;                 // name override, if any
     public bool Active = true;
 
-    public OpenTK.Mathematics.Vector3 LocalPosition;
-    public OpenTK.Mathematics.Quaternion LocalRotation = OpenTK.Mathematics.Quaternion.Identity;
-    public OpenTK.Mathematics.Vector3 LocalScale = OpenTK.Mathematics.Vector3.One;
+    public Vector3 LocalPosition;
+    public Quaternion LocalRotation = Quaternion.Identity;
+    public Vector3 LocalScale = Vector3.One;
 }
 
 // A Unity reference: a local fileID plus, for cross-file refs, the target asset's GUID.

@@ -1,5 +1,4 @@
 using BallisticEngine;
-using OpenTK.Mathematics;
 
 public interface IStaticMeshRenderer : IDrawable {
     Mesh SharedMesh { get; }

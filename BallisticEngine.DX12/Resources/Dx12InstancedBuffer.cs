@@ -31,7 +31,7 @@ public sealed class Dx12InstancedBuffer : InstancedBuffer {
     // OpenTK.Matrix4 in -> upload as System.Numerics row-major 4x4 (16 floats, same memory layout).
     // The renderer transposes per-draw matrices on the CBV path; instanced matrices are read in the
     // vertex shader the same way, so the transpose convention must match (handled at fill time there).
-    public override unsafe void SetBufferData(in OpenTK.Mathematics.Matrix4[] data, BufferUsage usage) {
+    public override unsafe void SetBufferData(in Matrix4[] data, BufferUsage usage) {
         int count = data?.Length ?? 0;
         elementCount = count;
         if (count == 0)
@@ -39,15 +39,8 @@ public sealed class Dx12InstancedBuffer : InstancedBuffer {
 
         EnsureCapacity(count);
         Span<Matrix4x4> dst = resource.Map<Matrix4x4>(0, count);
-        for (int i = 0; i < count; i++) {
-            OpenTK.Mathematics.Matrix4 m = data[i];
-            // OpenTK is row-major; copy element-wise into a System.Numerics row-major matrix.
-            dst[i] = new Matrix4x4(
-                m.M11, m.M12, m.M13, m.M14,
-                m.M21, m.M22, m.M23, m.M24,
-                m.M31, m.M32, m.M33, m.M34,
-                m.M41, m.M42, m.M43, m.M44);
-        }
+        for (int i = 0; i < count; i++)
+            dst[i] = data[i];   // both row-major System.Numerics 4x4; the per-draw transpose is handled at fill time
         resource.Unmap(0);
     }
 

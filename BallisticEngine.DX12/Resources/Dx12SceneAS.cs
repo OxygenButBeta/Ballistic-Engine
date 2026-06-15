@@ -5,8 +5,8 @@ using System.Runtime.InteropServices;
 using Vortice.Direct3D12;
 using Vortice.DXGI;
 using Vortice.Mathematics;
-using GLMatrix4 = OpenTK.Mathematics.Matrix4;
-using GLVector3 = OpenTK.Mathematics.Vector3;
+using GLMatrix4 = System.Numerics.Matrix4x4;   // engine math is System.Numerics now
+using GLVector3 = System.Numerics.Vector3;
 
 namespace BallisticEngine.DX12;
 

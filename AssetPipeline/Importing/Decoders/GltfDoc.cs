@@ -1,5 +1,4 @@
 using System.Text.Json;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.AssetPipeline;
 
@@ -298,11 +297,11 @@ internal sealed class GltfDoc {
         //   bindLocal[j]  = globalBind[j] * inverse(globalBind[parent])   (root: just globalBind[j])
         var globalBind = new Matrix4[boneCount];
         for (int b = 0; b < boneCount; b++)
-            globalBind[b] = Matrix4.Invert(inverseBind[b]);
+            globalBind[b] = inverseBind[b].Inverted();
         for (int b = 0; b < boneCount; b++) {
             bindLocal[b] = parents[b] < 0
                 ? globalBind[b]
-                : globalBind[b] * Matrix4.Invert(globalBind[parents[b]]);
+                : globalBind[b] * globalBind[parents[b]].Inverted();
         }
 
         // Re-order to PRE-ORDER (parent < child) so the engine's single-pass world walk is valid.

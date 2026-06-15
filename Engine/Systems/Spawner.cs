@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -97,7 +96,7 @@ public sealed class Spawner : Behaviour {
 
         Vector3 pos = transform.WorldPosition + RandomPointInArea();
         Quaternion rot = RandomYaw
-            ? Quaternion.FromAxisAngle(Vector3.UnitY, Random.Range(0f, MathF.Tau))
+            ? Quaternion.CreateFromAxisAngle(Vector3.UnitY, Random.Range(0f, MathF.Tau))
             : transform.WorldRotation;
 
         Entity e = TakeFromPool();

@@ -1,5 +1,4 @@
 using Hexa.NET.ImGui;
-using OpenTK.Mathematics;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec4 = System.Numerics.Vector4;
 
@@ -38,8 +37,8 @@ internal sealed class GizmoDrawer : IGizmos {
         // sweeping across the Scene — the "gizmos explode into a spiderweb while moving" bug (a probe
         // marker swinging past the camera as you fly). Near-clipping the 3D segment keeps both projected
         // endpoints finite and on the correct side, so the cross marker stays a small cross.
-        Vector4 ca = Vector4.TransformRow(new Vector4(from, 1f), vp);
-        Vector4 cb = Vector4.TransformRow(new Vector4(to, 1f), vp);
+        Vector4 ca = Vector4.Transform(new Vector4(from, 1f), vp);
+        Vector4 cb = Vector4.Transform(new Vector4(to, 1f), vp);
         const float wEps = 1e-4f;
         bool aIn = ca.W > wEps, bIn = cb.W > wEps;
         if (!aIn && !bIn)
@@ -130,7 +129,7 @@ internal sealed class GizmoDrawer : IGizmos {
     }
 
     public void DrawWireCone(Vector3 apex, Vector3 direction, float halfAngleDegrees) {
-        float height = direction.Length;
+        float height = direction.Length();
         if (height < 1e-4f)
             return;
 

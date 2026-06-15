@@ -1,5 +1,4 @@
 using System.IO.Compression;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.AssetPipeline;
 

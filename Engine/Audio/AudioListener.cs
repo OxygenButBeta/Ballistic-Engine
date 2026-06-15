@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -45,8 +44,8 @@ public class AudioListener : Behaviour {
 
         var state = new AudioListenerState {
             Position = position,
-            Forward = rotation * Vector3.UnitZ,
-            Up = rotation * Vector3.UnitY,
+            Forward = Vector3.Transform(Vector3.UnitZ, rotation),
+            Up = Vector3.Transform(Vector3.UnitY, rotation),
             Velocity = hasLast && delta > 0f ? (position - lastPosition) / delta : Vector3.Zero,
         };
         Audio.SetListener(in state);

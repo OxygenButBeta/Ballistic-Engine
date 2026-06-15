@@ -2,8 +2,8 @@ using BepuPhysics;
 using BepuPhysics.Collidables;
 using static BallisticEngine.Bepu.BepuMath;
 using NumVector3 = System.Numerics.Vector3;
-using TkQuaternion = OpenTK.Mathematics.Quaternion;
-using TkVector3 = OpenTK.Mathematics.Vector3;
+using TkQuaternion = System.Numerics.Quaternion;   // engine math is System.Numerics now (was OpenTK)
+using TkVector3 = System.Numerics.Vector3;
 
 namespace BallisticEngine.Bepu;
 

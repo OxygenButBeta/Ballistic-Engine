@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -47,12 +46,12 @@ public class Volume : Behaviour {
 
         Vector3 local = Vector3.Transform(
             cameraPosition - world.ExtractTranslation(),
-            Quaternion.Invert(transform.WorldRotation));
-        Vector3 outside = Vector3.ComponentMax(
+            Quaternion.Inverse(transform.WorldRotation));
+        Vector3 outside = Vector3.Max(
             new Vector3(MathF.Abs(local.X), MathF.Abs(local.Y), MathF.Abs(local.Z)) - half,
             Vector3.Zero);
 
-        float distance = outside.Length;
+        float distance = outside.Length();
         if (distance <= 0f)
             return 1f;
 

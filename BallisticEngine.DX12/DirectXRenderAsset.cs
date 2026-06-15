@@ -1,5 +1,4 @@
 using BallisticEngine.DX12;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 

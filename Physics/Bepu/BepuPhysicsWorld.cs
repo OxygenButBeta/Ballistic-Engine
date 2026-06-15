@@ -8,7 +8,7 @@ using BepuUtilities;
 using BepuUtilities.Memory;
 using static BallisticEngine.Bepu.BepuMath;
 using BepuMesh = BepuPhysics.Collidables.Mesh;
-using TkVector3 = OpenTK.Mathematics.Vector3;
+using TkVector3 = System.Numerics.Vector3;   // engine math is System.Numerics now (was OpenTK)
 
 namespace BallisticEngine.Bepu;
 
@@ -223,7 +223,7 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         PhysicsShapePart[] parts = description.Shapes;
         bool single = parts.Length == 1 &&
                       parts[0].LocalPosition == TkVector3.Zero &&
-                      parts[0].LocalRotation == OpenTK.Mathematics.Quaternion.Identity;
+                      parts[0].LocalRotation == Quaternion.Identity;
 
         // A mesh is concave: legal only as the sole shape of a non-dynamic body.
         if (parts.Length == 1 && parts[0].Shape is MeshShape meshShape) {
@@ -398,7 +398,7 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         hit.Distance = handler.T;
         hit.Point = origin + direction * handler.T;
         TkVector3 normal = ToOpenTK(handler.Normal);
-        hit.Normal = normal.LengthSquared > 0f ? normal.Normalized() : -direction;
+        hit.Normal = normal.LengthSquared() > 0f ? normal.Normalized() : -direction;
         hit.Body = Lookup(handler.Collidable);
         return true;
     }
@@ -456,7 +456,7 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         return results.Count - before;
     }
 
-    public int OverlapBox(TkVector3 center, TkVector3 halfExtents, OpenTK.Mathematics.Quaternion orientation,
+    public int OverlapBox(TkVector3 center, TkVector3 halfExtents, System.Numerics.Quaternion orientation,
         int layerMask, List<IPhysicsBody> results) {
         if (Simulation is null)
             return 0;

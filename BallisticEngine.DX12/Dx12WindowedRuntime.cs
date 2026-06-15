@@ -1,7 +1,6 @@
 using BallisticEngine.Core.GL;            // GLTime, GLInput (OpenTK input/timer — not GL-API-coupled)
 using BallisticEngine.DX12;               // Dx12Backend, Dx12SwapChain
 using BallisticEngine.GLImplementation;   // GLLogger
-using OpenTK.Mathematics;
 using OpenTK.Windowing.Common;
 using OpenTK.Windowing.Desktop;
 using OpenTK.Windowing.GraphicsLibraryFramework;
@@ -74,7 +73,7 @@ public sealed class Dx12WindowedRuntime : GameWindow, IBallisticEngineRuntime, I
             WindowState = WindowState.Fullscreen;
         }
         else {
-            ClientSize = new Vector2i(width, height);
+            ClientSize = new OpenTK.Mathematics.Vector2i(width, height);   // window API uses OpenTK's Vector2i
         }
     }
 

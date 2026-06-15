@@ -249,7 +249,7 @@ internal static class VolumeProfileEditor {
                 var value = new System.Numerics.Vector3(c.Value.X, c.Value.Y, c.Value.Z);
                 var flags = c.Hdr ? ImGuiColorEditFlags.Hdr | ImGuiColorEditFlags.Float : ImGuiColorEditFlags.None;
                 if (ImGui.ColorEdit3("##v", ref value, flags)) {
-                    c.Value = new OpenTK.Mathematics.Vector3(value.X, value.Y, value.Z);
+                    c.Value = new Vector3(value.X, value.Y, value.Z);
                     changed = true;
                 }
                 break;
@@ -257,7 +257,7 @@ internal static class VolumeProfileEditor {
             case Vector3Parameter v3: {
                 var value = new System.Numerics.Vector3(v3.Value.X, v3.Value.Y, v3.Value.Z);
                 if (ImGui.DragFloat3("##v", ref value, 0.05f)) {
-                    v3.Value = new OpenTK.Mathematics.Vector3(value.X, value.Y, value.Z);
+                    v3.Value = new Vector3(value.X, value.Y, value.Z);
                     changed = true;
                 }
                 break;

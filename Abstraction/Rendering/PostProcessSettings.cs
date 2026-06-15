@@ -147,7 +147,7 @@ public sealed class PostProcessSettings {
     // only adds the local one-bounce colour - intensity ~1 (not the old 1.5 that compensated
     // for a missing ambient base). AmbientFloor/BounceBoost are retired: the IBL is the floor. --
     public float SsgiIntensity { get; set; } = 1f;                    // local-bounce strength
-    public OpenTK.Mathematics.Vector3 SsgiTint { get; set; } = OpenTK.Mathematics.Vector3.One; // bounce colour
+    public Vector3 SsgiTint { get; set; } = Vector3.One; // bounce colour
     public float SsgiSaturation { get; set; } = 1f;                   // bounce colour punch
     public float SsgiOcclusionPower { get; set; } = 0.6f;             // how hard AO bites the bounce
     public float SsgiMultiBounce { get; set; } = 0.5f;                // re-bounce fraction (fake multi-bounce)
@@ -173,7 +173,7 @@ public sealed class PostProcessSettings {
     public int VolumetricStepCount { get; set; } = 48;                // shadowed raymarch samples (cost vs banding)
     public float VolumetricMaxDistance { get; set; } = 120f;          // metres of shadowed march; fog continues analytically beyond
     public float VolumetricFeedback { get; set; } = 0.9f;             // temporal history weight (smoother/laggier)
-    public OpenTK.Mathematics.Vector3 VolumetricTint { get; set; } = OpenTK.Mathematics.Vector3.One; // in-scatter colour grade
+    public Vector3 VolumetricTint { get; set; } = Vector3.One; // in-scatter colour grade
 
     // 1 = off. Offscreen targets are recreated when this changes. Ignored while TAA is on.
     public int MsaaSamples { get; set; } = 4;
@@ -206,7 +206,7 @@ public sealed class PostProcessSettings {
     public float Saturation { get; set; } = 1f;
     public float VignetteStrength { get; set; }
     public float VignetteRoundness { get; set; } = 1f;  // 1 = circular, 0 = aspect-following oval
-    public OpenTK.Mathematics.Vector3 VignetteColor { get; set; } = OpenTK.Mathematics.Vector3.Zero; // darken toward black by default
+    public Vector3 VignetteColor { get; set; } = Vector3.Zero; // darken toward black by default
     public float FilmGrain { get; set; }
     public float Sharpen { get; set; }
 

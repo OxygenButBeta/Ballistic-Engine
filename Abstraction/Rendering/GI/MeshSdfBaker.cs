@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.GI;
 
@@ -143,7 +142,7 @@ public static class MeshSdfBaker {
         // most voxels are empty space far from geometry, so this skips the 7-ray test for the large
         // majority and the bake drops from seconds to a fraction of one. Distance magnitude is
         // IDENTICAL to before (only the sign of far voxels is now trivially +, which they already were).
-        float cellDiag = cellSize.Length;            // worst-case half-cell reach
+        float cellDiag = cellSize.Length();            // worst-case half-cell reach
         float bandSq = (cellDiag * 2.5f) * (cellDiag * 2.5f); // sign-test band (squared, to skip the sqrt)
 
         var swGrid = BakeDiag ? System.Diagnostics.Stopwatch.StartNew() : null;
@@ -196,13 +195,13 @@ public static class MeshSdfBaker {
             Vector3 b = verts[idx[b0 + 1]];
             Vector3 c = verts[idx[b0 + 2]];
             tris[t] = new Triangle(a, b, c);
-            min = Vector3.ComponentMin(min, Vector3.ComponentMin(a, Vector3.ComponentMin(b, c)));
-            max = Vector3.ComponentMax(max, Vector3.ComponentMax(a, Vector3.ComponentMax(b, c)));
+            min = Vector3.Min(min, Vector3.Min(a, Vector3.Min(b, c)));
+            max = Vector3.Max(max, Vector3.Max(a, Vector3.Max(b, c)));
         }
 
         // ---- Padded, ~cubic-celled grid ----
         Vector3 size = max - min;
-        float diag = size.Length;
+        float diag = size.Length();
         Vector3 pad = new(diag * settings.PaddingFraction * 0.5f);
         // Guard against degenerate (flat) axes so the field still has a marchable shell.
         pad += new Vector3(
@@ -249,8 +248,8 @@ public static class MeshSdfBaker {
     internal readonly struct Triangle {
         public readonly Vector3 A, B, C;
         public Triangle(Vector3 a, Vector3 b, Vector3 c) { A = a; B = b; C = c; }
-        public Vector3 Min => Vector3.ComponentMin(A, Vector3.ComponentMin(B, C));
-        public Vector3 Max => Vector3.ComponentMax(A, Vector3.ComponentMax(B, C));
+        public Vector3 Min => Vector3.Min(A, Vector3.Min(B, C));
+        public Vector3 Max => Vector3.Max(A, Vector3.Max(B, C));
         public Vector3 Centroid => (A + B + C) * (1f / 3f);
     }
 }

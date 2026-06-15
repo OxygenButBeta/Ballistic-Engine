@@ -2,7 +2,6 @@ using System.Globalization;
 using System.Reflection;
 using System.Text.Json;
 using BallisticEngine.Serialization;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.Editor;
 
@@ -17,7 +16,7 @@ internal static class RemoteHandlers {
     // Set by EditorApplication: frame the Scene-view camera on a world point + radius, looking along
     // an optional direction (zero = keep current). Lets the command port / agents frame a shot — the
     // screenshot captures the Scene view, which uses the editor's own fly camera, NOT an HDCamera.
-    public static Action<OpenTK.Mathematics.Vector3, float, OpenTK.Mathematics.Vector3> FocusCamera;
+    public static Action<Vector3, float, Vector3> FocusCamera;
 
     static readonly object logGate = new();
     static readonly List<(DateTime Time, int Level, string Message)> logTail = new();
@@ -198,19 +197,19 @@ internal static class RemoteHandlers {
         var obj = p.ValueKind == JsonValueKind.Object;
         string entityName = obj && p.TryGetProperty("entity", out JsonElement e) ? e.GetString() : null;
         // Optional "dir":"x,y,z" look direction (e.g. "0,-1,-1" for a 3/4 top view); default keeps current.
-        OpenTK.Mathematics.Vector3 dir = default;
+        Vector3 dir = default;
         if (obj && p.TryGetProperty("dir", out JsonElement d) && d.GetString() is { } ds) {
             var parts = ds.Split(',');
             if (parts.Length == 3 &&
                 float.TryParse(parts[0], System.Globalization.CultureInfo.InvariantCulture, out var dx) &&
                 float.TryParse(parts[1], System.Globalization.CultureInfo.InvariantCulture, out var dy) &&
                 float.TryParse(parts[2], System.Globalization.CultureInfo.InvariantCulture, out var dz))
-                dir = new OpenTK.Mathematics.Vector3(dx, dy, dz);
+                dir = new Vector3(dx, dy, dz);
         }
         // Optional "fit" multiplier on the framed radius (1 = default, <1 = closer, >1 = wider).
         float fit = obj && p.TryGetProperty("fit", out JsonElement f) ? (float)f.GetDouble() : 1f;
 
-        OpenTK.Mathematics.Vector3 center;
+        Vector3 center;
         float radius;
 
         if (!string.IsNullOrEmpty(entityName)) {
@@ -234,25 +233,25 @@ internal static class RemoteHandlers {
     }
 
     // Aggregate world bounds of every entity with renderable geometry in the current scene.
-    static bool TryGetSceneBounds(out OpenTK.Mathematics.Vector3 center, out float radius) {
+    static bool TryGetSceneBounds(out Vector3 center, out float radius) {
         center = default;
         radius = 0f;
-        var min = new OpenTK.Mathematics.Vector3(float.MaxValue);
-        var max = new OpenTK.Mathematics.Vector3(float.MinValue);
+        var min = new Vector3(float.MaxValue);
+        var max = new Vector3(float.MinValue);
         var any = false;
 
         foreach (Entity entity in SceneManager.GetCurrentScene().Entities) {
-            if (!EditorBounds.TryGetWorldBounds(entity, out OpenTK.Mathematics.Vector3 c, out float r))
+            if (!EditorBounds.TryGetWorldBounds(entity, out Vector3 c, out float r))
                 continue;
             any = true;
-            min = OpenTK.Mathematics.Vector3.ComponentMin(min, c - new OpenTK.Mathematics.Vector3(r));
-            max = OpenTK.Mathematics.Vector3.ComponentMax(max, c + new OpenTK.Mathematics.Vector3(r));
+            min = Vector3.Min(min, c - new Vector3(r));
+            max = Vector3.Max(max, c + new Vector3(r));
         }
         if (!any)
             return false;
 
         center = (min + max) * 0.5f;
-        radius = (max - min).Length * 0.5f;
+        radius = (max - min).Length() * 0.5f;
         return true;
     }
 
@@ -502,7 +501,7 @@ internal static class RemoteHandlers {
         if (t == typeof(Vector3)) { float[] c = Components(value, 3); return new Vector3(c[0], c[1], c[2]); }
         if (t == typeof(Quaternion)) { // Euler degrees in, engine convention
             float[] c = Components(value, 3);
-            return Quaternion.FromEulerAngles(
+            return BQuaternion.FromEulerAngles(
                 MathHelper.DegreesToRadians(c[0]), MathHelper.DegreesToRadians(c[1]), MathHelper.DegreesToRadians(c[2]));
         }
         if (typeof(BObject).IsAssignableFrom(t)) {

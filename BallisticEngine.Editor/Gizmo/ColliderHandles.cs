@@ -1,5 +1,4 @@
 using Hexa.NET.ImGui;
-using OpenTK.Mathematics;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec4 = System.Numerics.Vector4;
 
@@ -39,7 +38,7 @@ internal static class ColliderHandles {
         Transform transform = collider.transform;
         Vector3 scale = transform.WorldMatrix.ExtractScale();
         Quaternion rotation = transform.WorldRotation;
-        Vector3 shapeCenter = transform.WorldPosition + rotation * (collider.Center * scale);
+        Vector3 shapeCenter = transform.WorldPosition + Vector3.Transform(collider.Center * scale, rotation);
 
         return collider switch {
             BoxCollider box => DrawBox(box, shapeCenter, rotation, scale, vp, viewMin, viewSize, draw, viewHovered),
@@ -56,7 +55,7 @@ internal static class ColliderHandles {
             Vector3 localAxis = Axes[f];
             var axisIndex = f / 2;
             float axisScale = MathF.Max(MathF.Abs(scale[axisIndex]), 1e-5f);
-            Vector3 worldDir = rotation * localAxis;
+            Vector3 worldDir = Vector3.Transform(localAxis, rotation);
             Vector3 facePos = shapeCenter + worldDir * (box.Size[axisIndex] * 0.5f * axisScale);
 
             if (HandleSquare(box, f, facePos, worldDir, vp, viewMin, viewSize, draw, viewHovered, out float worldDelta)) {
@@ -88,7 +87,7 @@ internal static class ColliderHandles {
 
         var changed = false;
         for (var f = 0; f < 6; f++) {
-            Vector3 worldDir = rotation * Axes[f];
+            Vector3 worldDir = Vector3.Transform(Axes[f], rotation);
             Vector3 handlePos = shapeCenter + worldDir * (sphere.Radius * radiusScale);
 
             if (HandleSquare(sphere, f, handlePos, worldDir, vp, viewMin, viewSize, draw, viewHovered, out float worldDelta))
@@ -109,7 +108,7 @@ internal static class ColliderHandles {
 
         var changed = false;
         for (var f = 0; f < 6; f++) {
-            Vector3 worldDir = rotation * Axes[f];
+            Vector3 worldDir = Vector3.Transform(Axes[f], rotation);
             bool isHeightHandle = f is 2 or 3; // Â±Y tips; Â±X/Â±Z rim handles edit the radius
             Vector3 handlePos = shapeCenter + worldDir * (isHeightHandle
                 ? capsule.Height * 0.5f * heightScale

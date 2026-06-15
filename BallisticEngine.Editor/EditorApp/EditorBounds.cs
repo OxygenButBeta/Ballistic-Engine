@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.Editor;
 
@@ -22,7 +21,7 @@ internal static class EditorBounds {
         }
 
         center = (min + max) * 0.5f;
-        radius = MathF.Max(0.001f, ((max - min) * 0.5f).Length);
+        radius = MathF.Max(0.001f, ((max - min) * 0.5f).Length());
         return true;
     }
 
@@ -49,9 +48,9 @@ internal static class EditorBounds {
                 (i & 1) == 0 ? lo.X : hi.X,
                 (i & 2) == 0 ? lo.Y : hi.Y,
                 (i & 4) == 0 ? lo.Z : hi.Z);
-            Vector3 worldCorner = Vector3.TransformPosition(corner, world);
-            min = Vector3.ComponentMin(min, worldCorner);
-            max = Vector3.ComponentMax(max, worldCorner);
+            Vector3 worldCorner = Vector3.Transform(corner, world);
+            min = Vector3.Min(min, worldCorner);
+            max = Vector3.Max(max, worldCorner);
         }
 
         any = true;

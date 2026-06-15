@@ -1,5 +1,4 @@
 using System.Text.Json;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.AssetPipeline.Loaders;
 

@@ -1,5 +1,4 @@
 using OpenTK.Audio.OpenAL;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.OpenALAudio;
 
@@ -67,12 +66,14 @@ internal sealed class OpenALVoice : IAudioVoice {
     }
 
     public Vector3 Position {
-        get => AL.GetSource(Source, ALSource3f.Position);
+        // OpenTK's AL.GetSource(ALSource3f) returns an OpenTK Vector3; read the components into the
+        // engine's System.Numerics Vector3 via the out-param overload (no cross-type conversion).
+        get { AL.GetSource(Source, ALSource3f.Position, out float x, out float y, out float z); return new Vector3(x, y, z); }
         set => AL.Source(Source, ALSource3f.Position, value.X, value.Y, value.Z);
     }
 
     public Vector3 Velocity {
-        get => AL.GetSource(Source, ALSource3f.Velocity);
+        get { AL.GetSource(Source, ALSource3f.Velocity, out float x, out float y, out float z); return new Vector3(x, y, z); }
         set => AL.Source(Source, ALSource3f.Velocity, value.X, value.Y, value.Z);
     }
 

@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 using SysVec2 = System.Numerics.Vector2;
 
 namespace BallisticEngine.Editor;
@@ -34,8 +33,8 @@ internal static class ScenePicker {
             // and AABB/vertex data are already local). The inverse-world maps the world ray to local.
             if (!TryInvert(world, out Matrix4 invWorld))
                 continue;
-            Vector3 localO = Vector3.TransformPosition(ro, invWorld);
-            Vector3 localDir = Vector3.TransformVector(rd, invWorld);   // not normalized: keeps t in world units
+            Vector3 localO = Vector3.Transform(ro, invWorld);
+            Vector3 localDir = Vector3.TransformNormal(rd, invWorld);   // not normalized: keeps t in world units
 
             // Broad phase: skip the whole mesh if the ray misses its local AABB.
             mesh.GetLocalBounds(out Vector3 lo, out Vector3 hi);
@@ -144,11 +143,11 @@ internal static class ScenePicker {
     }
 
     static bool TryInvert(Matrix4 m, out Matrix4 inverse) {
-        if (MathF.Abs(m.Determinant) < 1e-12f) {
+        if (MathF.Abs(m.GetDeterminant()) < 1e-12f) {
             inverse = Matrix4.Identity;
             return false;
         }
-        inverse = Matrix4.Invert(m);
+        inverse = m.Inverted();
         return true;
     }
 }

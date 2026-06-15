@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 using BallisticEngine.AssetPipeline;
 
 namespace BallisticEngine.Editor;

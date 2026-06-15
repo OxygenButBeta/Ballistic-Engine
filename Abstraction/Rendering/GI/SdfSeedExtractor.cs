@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.GI;
 
@@ -60,7 +59,7 @@ public static class SdfSeedExtractor {
             return grid;
 
         Vector3 cellSize = grid.CellSize;
-        float cellDiag = cellSize.Length;
+        float cellDiag = cellSize.Length();
         float band = bandCells * cellDiag;
         float bandSq = band * band;
         bool wantAlbedo = prep.HasAlbedo;

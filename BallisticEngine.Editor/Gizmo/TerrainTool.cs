@@ -1,5 +1,4 @@
 using Hexa.NET.ImGui;
-using OpenTK.Mathematics;
 using SysVec2 = System.Numerics.Vector2;
 
 namespace BallisticEngine.Editor;
@@ -55,8 +54,8 @@ internal static class TerrainTool {
 
         SysVec2 mouse = ImGui.GetMousePos();
         GizmoMath.MouseRay(vp, viewMin, viewSize, mouse, out Vector3 worldOrigin, out Vector3 worldDir);
-        Vector3 localOrigin = Vector3.TransformPosition(worldOrigin, invWorld);
-        Vector3 localDir = Vector3.TransformVector(worldDir, invWorld).Normalized();
+        Vector3 localOrigin = Vector3.Transform(worldOrigin, invWorld);
+        Vector3 localDir = Vector3.TransformNormal(worldDir, invWorld).Normalized();
 
         hadHit = false;
         if (viewHovered || sculpting) {
@@ -126,7 +125,7 @@ internal static class TerrainTool {
             float lx = centerLocal.X + MathF.Cos(a) * Radius;
             float lz = centerLocal.Z + MathF.Sin(a) * Radius;
             float ly = TerrainSculpt.SurfaceHeight(asset, lx, lz, halfX, halfZ) + 0.05f;
-            Vector3 wp = Vector3.TransformPosition(new Vector3(lx, ly, lz), world);
+            Vector3 wp = Vector3.Transform(new Vector3(lx, ly, lz), world);
 
             if (GizmoMath.Project(wp, vp, viewMin, viewSize, out SysVec2 px)) {
                 if (hasPrev)
@@ -140,7 +139,7 @@ internal static class TerrainTool {
         }
 
         // Center marker.
-        Vector3 cWorld = Vector3.TransformPosition(
+        Vector3 cWorld = Vector3.Transform(
             new Vector3(centerLocal.X,
                 TerrainSculpt.SurfaceHeight(asset, centerLocal.X, centerLocal.Z, halfX, halfZ) + 0.05f,
                 centerLocal.Z), world);
@@ -157,11 +156,11 @@ internal static class TerrainTool {
     };
 
     static bool TryInvert(Matrix4 m, out Matrix4 inverse) {
-        if (MathF.Abs(m.Determinant) < 1e-12f) {
+        if (MathF.Abs(m.GetDeterminant()) < 1e-12f) {
             inverse = Matrix4.Identity;
             return false;
         }
-        inverse = Matrix4.Invert(m);
+        inverse = m.Inverted();
         return true;
     }
 }

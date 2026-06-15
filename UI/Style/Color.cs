@@ -1,6 +1,5 @@
 using System;
 using System.Globalization;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.UI;
 

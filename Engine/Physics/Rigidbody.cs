@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -293,7 +292,7 @@ public class Rigidbody : Behaviour {
         Vector3 deltaPosition = targetPosition - body.Position;
         Vector3 angularVelocity = AngularVelocityBetween(body.Rotation, targetRotation, dt);
 
-        bool moved = deltaPosition.LengthSquared > 1e-12f || angularVelocity.LengthSquared > 1e-12f;
+        bool moved = deltaPosition.LengthSquared() > 1e-12f || angularVelocity.LengthSquared() > 1e-12f;
         if (!moved && !body.IsAwake)
             return;
 
@@ -304,11 +303,19 @@ public class Rigidbody : Behaviour {
     }
 
     static Vector3 AngularVelocityBetween(Quaternion from, Quaternion to, float dt) {
-        Quaternion delta = to * Quaternion.Invert(from);
+        Quaternion delta = to * Quaternion.Inverse(from);
         if (delta.W < 0f) // shortest arc
             delta = new Quaternion(-delta.X, -delta.Y, -delta.Z, -delta.W);
 
-        delta.ToAxisAngle(out Vector3 axis, out float angle);
+        // Extract axis/angle from the (shortest-arc) quaternion: angle = 2*acos(W),
+        // axis = (X,Y,Z) / sin(angle/2).
+        delta = Quaternion.Normalize(delta);
+        float w = MathHelper.Clamp(delta.W, -1f, 1f);
+        float angle = 2f * MathF.Acos(w);
+        float sinHalf = MathF.Sqrt(MathF.Max(0f, 1f - w * w));
+        Vector3 axis = sinHalf > 1e-6f
+            ? new Vector3(delta.X, delta.Y, delta.Z) / sinHalf
+            : Vector3.UnitX;
         if (angle < 1e-6f || float.IsNaN(axis.X))
             return Vector3.Zero;
         return axis * (angle / dt);

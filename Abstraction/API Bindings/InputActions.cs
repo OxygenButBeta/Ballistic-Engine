@@ -1,5 +1,4 @@
 using System.Collections.Generic;
-using OpenTK.Mathematics;
 using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine;
@@ -65,7 +64,7 @@ public static class InputActions {
     // keyboard movement isn't faster than straight.
     public static Vector2 GetVector(string xAxis, string yAxis) {
         var v = new Vector2(GetAxis(xAxis), GetAxis(yAxis));
-        return v.LengthSquared > 1f ? v.Normalized() : v;
+        return v.LengthSquared() > 1f ? v.Normalized() : v;
     }
 
     // True while any bound input for the action is held. Unknown name -> false.

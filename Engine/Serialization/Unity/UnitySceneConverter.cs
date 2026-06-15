@@ -1,7 +1,6 @@
 using BallisticEngine.AssetPipeline;
 using BallisticEngine.AssetPipeline.Unity;
 using BallisticEngine.Serialization;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -287,8 +286,8 @@ public static class UnitySceneConverter {
 
     static Quaternion LookRotation(Vector3 forward) {
         Vector3 up = Math.Abs(Vector3.Dot(forward, Vector3.UnitY)) > 0.99f ? Vector3.UnitX : Vector3.UnitY;
-        Matrix4 look = Matrix4.LookAt(Vector3.Zero, forward, up);
-        look.Invert();
+        Matrix4 look = BMatrix.LookAt(Vector3.Zero, forward, up);
+        look = look.Inverted();
         return look.ExtractRotation();
     }
 

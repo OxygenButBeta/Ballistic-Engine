@@ -1,6 +1,5 @@
 using BallisticEngine.Serialization;
 using Hexa.NET.ImGui;
-using OpenTK.Mathematics;
 using OpenTK.Windowing.Common;
 using OpenTK.Windowing.Desktop;
 using Keys = OpenTK.Windowing.GraphicsLibraryFramework.Keys;
@@ -208,7 +207,7 @@ internal sealed class EditorApplication {
         // Let the command port frame the Scene-view fly camera (the screenshot captures THAT view,
         // not an HDCamera entity) — so an agent can position a shot. Runs on the main thread already.
         RemoteHandlers.FocusCamera = (center, radius, dir) => {
-            if (dir.LengthSquared > 1e-6f)
+            if (dir.LengthSquared() > 1e-6f)
                 editorCamera.LookDirection(dir);     // reorient first (e.g. 3/4 top view)
             editorCamera.Focus(center, radius);
             forceFrames = Math.Max(forceFrames, 45);  // burst so auto-exposure re-meters for the new view

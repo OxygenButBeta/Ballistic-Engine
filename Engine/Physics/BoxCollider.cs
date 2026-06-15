@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -16,7 +15,7 @@ public class BoxCollider : Collider {
         if (!TryGetRenderMeshBounds(out Vector3 min, out Vector3 max))
             return;
         Center = (min + max) * 0.5f;
-        Size = Vector3.ComponentMax(max - min, new Vector3(0.001f));
+        Size = Vector3.Max(max - min, new Vector3(0.001f));
     }
 
     public override void OnDrawGizmosSelected(IGizmos gizmos) {

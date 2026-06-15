@@ -1,5 +1,4 @@
 using Assimp;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.AssetPipeline;
 
@@ -394,9 +393,9 @@ public static class AssimpMeshDecoder {
     // Transposing converts between the conventions. Internal so the skin decoder uses the SAME
     // conversion for bone offset matrices and animation node transforms (mixing conventions
     // explodes the skeleton).
-    internal static Matrix4 ToOpenTKMatrix(in Matrix4x4 m) => ToOpenTK(m);
+    internal static Matrix4 ToOpenTKMatrix(in Assimp.Matrix4x4 m) => ToOpenTK(m);
 
-    static Matrix4 ToOpenTK(in Matrix4x4 m) => new(
+    static Matrix4 ToOpenTK(in Assimp.Matrix4x4 m) => new(
         m.A1, m.B1, m.C1, m.D1,
         m.A2, m.B2, m.C2, m.D2,
         m.A3, m.B3, m.C3, m.D3,
@@ -415,7 +414,7 @@ public static class AssimpMeshDecoder {
         v.X * m.M13 + v.Y * m.M23 + v.Z * m.M33);
 
     static Vector3 SafeNormalize(Vector3 v, Vector3 fallback) {
-        var length = v.Length;
+        var length = v.Length();
         return length > 1e-12f ? v / length : fallback;
     }
 }

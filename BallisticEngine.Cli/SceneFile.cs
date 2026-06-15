@@ -1,7 +1,6 @@
 using System.Globalization;
 using System.Reflection;
 using BallisticEngine.Serialization;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.Cli;
 
@@ -266,7 +265,7 @@ internal static class SceneFile {
 
     // Engine convention (Transform.EulerAngles): degrees in, Quaternion.FromEulerAngles(radians).
     public static Quaternion EulerDegreesToQuaternion(Vector3 degrees) =>
-        Quaternion.FromEulerAngles(
+        BQuaternion.FromEulerAngles(
             MathHelper.DegreesToRadians(degrees.X),
             MathHelper.DegreesToRadians(degrees.Y),
             MathHelper.DegreesToRadians(degrees.Z));

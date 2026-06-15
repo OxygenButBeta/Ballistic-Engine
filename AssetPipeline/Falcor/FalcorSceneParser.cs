@@ -1,6 +1,5 @@
 using System.Globalization;
 using System.Text.RegularExpressions;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.AssetPipeline;
 
@@ -124,7 +123,7 @@ public static class FalcorSceneParser {
         float.TryParse(s.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out value);
 
     static Vector3 Normalize(Vector3 v, out float magnitude) {
-        magnitude = v.Length;
+        magnitude = v.Length();
         return magnitude > 1e-5f ? v / magnitude : Vector3.One;
     }
 }

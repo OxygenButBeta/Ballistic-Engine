@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine;
@@ -10,7 +9,7 @@ public class Rotator : Behaviour {
 
     protected internal override void Tick(in float delta) {
         float deltaRotation = RotationSpeed * delta;
-        Quaternion zRotation = Quaternion.FromEulerAngles(0, 0, MathHelper.DegreesToRadians(deltaRotation));
+        Quaternion zRotation = BQuaternion.FromEulerAngles(0, 0, MathHelper.DegreesToRadians(deltaRotation));
         transform.Rotation *= zRotation;
 
         if (!Alpha)

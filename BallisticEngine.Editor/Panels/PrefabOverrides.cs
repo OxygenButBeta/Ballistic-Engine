@@ -113,9 +113,9 @@ internal static class PrefabOverrides {
         }
     }
 
-    static bool Equal(OpenTK.Mathematics.Vector3 a, OpenTK.Mathematics.Vector3 b) =>
-        (a - b).LengthSquared < 1e-10f;
-    static bool Equal(OpenTK.Mathematics.Quaternion a, OpenTK.Mathematics.Quaternion b) =>
+    static bool Equal(Vector3 a, Vector3 b) =>
+        (a - b).LengthSquared() < 1e-10f;
+    static bool Equal(Quaternion a, Quaternion b) =>
         MathF.Abs(a.X - b.X) < 1e-5f && MathF.Abs(a.Y - b.Y) < 1e-5f &&
         MathF.Abs(a.Z - b.Z) < 1e-5f && MathF.Abs(a.W - b.W) < 1e-5f;
 

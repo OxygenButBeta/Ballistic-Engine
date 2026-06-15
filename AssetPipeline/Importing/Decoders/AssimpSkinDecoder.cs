@@ -1,7 +1,4 @@
 using Assimp;
-using OpenTK.Mathematics;
-using Matrix4 = OpenTK.Mathematics.Matrix4;
-using Quaternion = OpenTK.Mathematics.Quaternion;
 
 namespace BallisticEngine.AssetPipeline;
 
@@ -316,5 +313,5 @@ public static class AssimpSkinDecoder {
     // ---- Conversions -------------------------------------------------------
 
     static Vector3 ToVec3(in Vector3D v) => new(v.X, v.Y, v.Z);
-    static Quaternion ToQuat(in Assimp.Quaternion q) => new(q.X, q.Y, q.Z, q.W);
+    static System.Numerics.Quaternion ToQuat(in Assimp.Quaternion q) => new(q.X, q.Y, q.Z, q.W);
 }

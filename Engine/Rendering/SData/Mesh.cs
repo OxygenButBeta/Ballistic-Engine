@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -92,8 +91,8 @@ public class Mesh : BObject
         for (var i = 0; i < SubMeshes.Length; i++) {
             Matrix4 node = SubMeshes[i].NodeTransform;
             // Guard degenerate matrices (default-constructed SubMeshData is all zeros).
-            InverseNodeTransforms[i] = Math.Abs(node.Determinant) > 1e-12f
-                ? Matrix4.Invert(node)
+            InverseNodeTransforms[i] = Math.Abs(node.GetDeterminant()) > 1e-12f
+                ? node.Inverted()
                 : Matrix4.Identity;
         }
 
@@ -124,8 +123,8 @@ public class Mesh : BObject
             var lo = new Vector3(float.MaxValue);
             var hi = new Vector3(float.MinValue);
             foreach (Vector3 v in Vertices) {
-                lo = Vector3.ComponentMin(lo, v);
-                hi = Vector3.ComponentMax(hi, v);
+                lo = Vector3.Min(lo, v);
+                hi = Vector3.Max(hi, v);
             }
             boundsMin = lo;
             boundsMax = hi;
@@ -155,8 +154,8 @@ public class Mesh : BObject
                 int start = SubMeshes[s].IndexStart, end = start + SubMeshes[s].IndexCount;
                 for (var i = start; i < end; i++) {
                     Vector3 v = Vertices[Indices[i]];
-                    lo = Vector3.ComponentMin(lo, v);
-                    hi = Vector3.ComponentMax(hi, v);
+                    lo = Vector3.Min(lo, v);
+                    hi = Vector3.Max(hi, v);
                 }
                 // Degenerate (empty) ranges collapse to a point so they cull away cleanly.
                 subBoundsMin[s] = SubMeshes[s].IndexCount > 0 ? lo : Vector3.Zero;

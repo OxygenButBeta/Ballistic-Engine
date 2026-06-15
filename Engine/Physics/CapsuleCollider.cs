@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -37,9 +36,9 @@ public class CapsuleCollider : Collider {
         float halfSegment = MathF.Max(0f, Height * MathF.Abs(scale.Y) - 2f * radius) * 0.5f;
 
         Vector3 center = GizmoCenter;
-        Vector3 up = transform.WorldRotation * Vector3.UnitY;
-        Vector3 right = transform.WorldRotation * Vector3.UnitX;
-        Vector3 forward = transform.WorldRotation * Vector3.UnitZ;
+        Vector3 up = Vector3.Transform(Vector3.UnitY, transform.WorldRotation);
+        Vector3 right = Vector3.Transform(Vector3.UnitX, transform.WorldRotation);
+        Vector3 forward = Vector3.Transform(Vector3.UnitZ, transform.WorldRotation);
         Vector3 top = center + up * halfSegment;
         Vector3 bottom = center - up * halfSegment;
 

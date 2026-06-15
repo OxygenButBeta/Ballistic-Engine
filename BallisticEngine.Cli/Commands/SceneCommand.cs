@@ -1,5 +1,4 @@
 using BallisticEngine.Serialization;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.Cli.Commands;
 

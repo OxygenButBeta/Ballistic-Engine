@@ -1,7 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
 using OpenTK.Audio.OpenAL;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.OpenALAudio;
 

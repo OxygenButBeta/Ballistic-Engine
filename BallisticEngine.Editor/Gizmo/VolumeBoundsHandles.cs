@@ -1,5 +1,4 @@
 using Hexa.NET.ImGui;
-using OpenTK.Mathematics;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec4 = System.Numerics.Vector4;
 

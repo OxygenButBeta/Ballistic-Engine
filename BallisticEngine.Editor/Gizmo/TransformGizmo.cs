@@ -1,5 +1,4 @@
 using Hexa.NET.ImGui;
-using OpenTK.Mathematics;
 using SysVec2 = System.Numerics.Vector2;
 
 namespace BallisticEngine.Editor;
@@ -73,8 +72,8 @@ internal sealed class TransformGizmo {
                 if (e is null || e.IsDestroyed || ReferenceEquals(e, entity)) continue;
                 if (!e.transform.IsDescendantOf(entity.transform)) continue;
                 Vector3 p = e.transform.WorldPosition;
-                min = Vector3.ComponentMin(min, p);
-                max = Vector3.ComponentMax(max, p);
+                min = Vector3.Min(min, p);
+                max = Vector3.Max(max, p);
             }
         }
         return (min + max) * 0.5f;
@@ -128,7 +127,7 @@ internal sealed class TransformGizmo {
         // Constant on-screen gizmo size: scale the world-space handle length so its projection
         // stays ~Npx regardless of distance (N from EditorPrefs).
         var camPos = camera.Transform.Position;
-        float distance = Math.Max(0.01f, (origin - camPos).Length);
+        float distance = Math.Max(0.01f, (origin - camPos).Length());
         float worldPerPixel = GizmoMath.WorldSizePerPixel(distance, viewSize.Y);
         float handleLength = EditorPrefs.Current.GizmoSize * worldPerPixel;
 
@@ -238,8 +237,8 @@ internal sealed class TransformGizmo {
                 const float sens = 0.01f;
                 Vector3 camUp = camera.Transform.Up;
                 Vector3 camRight = camera.Transform.Right;
-                Quaternion delta = Quaternion.FromAxisAngle(camUp, d.X * sens) *
-                                   Quaternion.FromAxisAngle(camRight, d.Y * sens);
+                Quaternion delta = Quaternion.CreateFromAxisAngle(camUp, d.X * sens) *
+                                   Quaternion.CreateFromAxisAngle(camRight, d.Y * sens);
                 entity.transform.WorldRotation = delta * entity.transform.WorldRotation;
                 break;
             }
@@ -264,7 +263,7 @@ internal sealed class TransformGizmo {
                     angle = MathHelper.DegreesToRadians(
                         Snap(MathHelper.RadiansToDegrees(angle), EditorPrefs.Current.SnapRotate));
 
-                entity.transform.WorldRotation = Quaternion.FromAxisAngle(axis.Normalized(), angle) * dragStartRotation;
+                entity.transform.WorldRotation = Quaternion.CreateFromAxisAngle(axis.Normalized(), angle) * dragStartRotation;
                 break;
             }
             case GizmoMode.Scale: {

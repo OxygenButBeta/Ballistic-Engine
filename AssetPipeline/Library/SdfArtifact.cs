@@ -1,5 +1,4 @@
 using System.Runtime.InteropServices;
-using OpenTK.Mathematics;
 using BallisticEngine.GI;
 
 namespace BallisticEngine.AssetPipeline;

@@ -2,7 +2,7 @@ using BepuPhysics.Collidables;
 using BepuPhysics.CollisionDetection;
 using static BallisticEngine.Bepu.BepuMath;
 using NumVector3 = System.Numerics.Vector3;
-using TkVector3 = OpenTK.Mathematics.Vector3;
+using TkVector3 = System.Numerics.Vector3;   // engine math is System.Numerics now (was OpenTK)
 
 namespace BallisticEngine.Bepu;
 

@@ -1,6 +1,5 @@
 ﻿using System.Runtime.CompilerServices;
 using BallisticEngine;
-using OpenTK.Mathematics;
 
 public static class GraphicAPI
 {

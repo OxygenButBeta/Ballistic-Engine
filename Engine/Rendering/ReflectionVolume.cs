@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -144,9 +143,9 @@ public class ReflectionVolume : SceneBehaviour {
                     (c & 1) == 0 ? lMin.X : lMax.X,
                     (c & 2) == 0 ? lMin.Y : lMax.Y,
                     (c & 4) == 0 ? lMin.Z : lMax.Z);
-                Vector3 w = (new Vector4(corner, 1f) * world).Xyz;
-                lo = Vector3.ComponentMin(lo, w);
-                hi = Vector3.ComponentMax(hi, w);
+                Vector3 w = Vector4.Transform(new Vector4(corner, 1f), world).Xyz();
+                lo = Vector3.Min(lo, w);
+                hi = Vector3.Max(hi, w);
             }
             any = true;
         }
@@ -155,7 +154,7 @@ public class ReflectionVolume : SceneBehaviour {
             return;
         const float padding = 2f;
         Center = (lo + hi) * 0.5f;
-        Size = Vector3.ComponentMax(hi - lo + new Vector3(padding * 2f), Vector3.One * 2f);
+        Size = Vector3.Max(hi - lo + new Vector3(padding * 2f), Vector3.One * 2f);
     }
 
     // ---- Live bake progress: reflections SHARE IrradianceVolume's overlay channel (IsBaking/
@@ -240,14 +239,14 @@ public class ReflectionVolume : SceneBehaviour {
         if (px * py * pz > 4096)
             return;
 
-        Vector3 size = Vector3.ComponentMax(Size, Vector3.One * 0.5f);
+        Vector3 size = Vector3.Max(Size, Vector3.One * 0.5f);
         Vector3 min = Center - size * 0.5f;
 
         // Baked data available for THIS grid: captured cells draw bright, skipped empty-air cells
         // draw as faint gray dots (those fall back to the global skybox reflection).
         ReflectionVizData viz = Viz;
         var vizMatches = viz is not null && viz.Px == px && viz.Py == py && viz.Pz == pz &&
-                         (viz.Min - min).LengthSquared < 1e-3f;
+                         (viz.Min - min).LengthSquared() < 1e-3f;
 
         const float arm = 0.12f;
         for (var z = 0; z < pz; z++)
@@ -318,7 +317,7 @@ public class ReflectionVolume : SceneBehaviour {
                 return false;
             var cachedCenter = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
             var cachedSize = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
-            if ((cachedCenter - center).LengthSquared > 1e-4f || (cachedSize - size).LengthSquared > 1e-4f)
+            if ((cachedCenter - center).LengthSquared() > 1e-4f || (cachedSize - size).LengthSquared() > 1e-4f)
                 return false;
             if (reader.ReadInt32() != faceRes || reader.ReadInt32() != mipCount)
                 return false;

@@ -3,7 +3,6 @@ using BallisticEngine.AssetPipeline;
 using BallisticEngine.AssetPipeline.Loaders;
 using BallisticEngine.Serialization;
 using Hexa.NET.ImGui;
-using OpenTK.Mathematics;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec3 = System.Numerics.Vector3;
 using SysVec4 = System.Numerics.Vector4;
@@ -417,7 +416,7 @@ internal sealed class InspectorPanel {
                 Quaternion oldQ = transform.Rotation;
                 transform.EulerAngles = v;
                 if (others.Count > 0) {
-                    Quaternion delta = transform.Rotation * Quaternion.Invert(oldQ);
+                    Quaternion delta = transform.Rotation * Quaternion.Inverse(oldQ);
                     foreach (Transform o in others) o.Rotation = delta * o.Rotation;
                 }
             }, 0.5f);

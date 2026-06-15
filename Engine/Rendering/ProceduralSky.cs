@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -122,7 +121,7 @@ public class ProceduralSky : SceneBehaviour {
         const float betaM = 3.996e-6f;
         Vector3 betaO = new(0.650e-6f, 1.881e-6f, 0.085e-6f);
 
-        if (sunDirection.LengthSquared < 1e-8f)
+        if (sunDirection.LengthSquared() < 1e-8f)
             return Vector3.One;
         Vector3 dir = sunDirection.Normalized();
         Vector3 origin = new(0f, Rp + 500f, 0f);
@@ -131,13 +130,13 @@ public class ProceduralSky : SceneBehaviour {
         // below the horizon that optical depth explodes and transmittance goes to ~0,
         // which is exactly the wanted "sun has set" behaviour).
         float b = Vector3.Dot(origin, dir);
-        float exit = -b + MathF.Sqrt(MathF.Max(b * b - (origin.LengthSquared - Ra * Ra), 0f));
+        float exit = -b + MathF.Sqrt(MathF.Max(b * b - (origin.LengthSquared() - Ra * Ra), 0f));
         float seg = exit / Steps;
 
         Vector3 depths = Vector3.Zero; // (rayleigh, mie, ozone) integrated path densities
         for (var j = 0; j < Steps; j++) {
             Vector3 p = origin + dir * ((j + 0.5f) * seg);
-            float h = MathF.Max(p.Length - Rp, 0f);
+            float h = MathF.Max(p.Length() - Rp, 0f);
             depths.X += MathF.Exp(-h / Hr) * seg;
             depths.Y += MathF.Exp(-h / Hm) * seg;
             depths.Z += MathF.Max(0f, 1f - MathF.Abs(h - 25000f) / 15000f) * seg;

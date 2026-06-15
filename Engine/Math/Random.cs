@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -39,7 +38,7 @@ public static class Random {
             Vector3 p;
             do {
                 p = new Vector3(Signed, Signed, Signed);
-            } while (p.LengthSquared > 1f);
+            } while (p.LengthSquared() > 1f);
             return p;
         }
     }
@@ -48,7 +47,7 @@ public static class Random {
     public static Vector3 OnUnitSphere {
         get {
             Vector3 p = InsideUnitSphere;
-            float len = p.Length;
+            float len = p.Length();
             return len < Mathf.Epsilon ? Vector3.UnitY : p / len;
         }
     }
@@ -59,7 +58,7 @@ public static class Random {
             Vector2 p;
             do {
                 p = new Vector2(Signed, Signed);
-            } while (p.LengthSquared > 1f);
+            } while (p.LengthSquared() > 1f);
             return p;
         }
     }

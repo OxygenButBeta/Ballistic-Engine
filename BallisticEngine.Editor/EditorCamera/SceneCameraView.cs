@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.Editor;
 
@@ -25,5 +24,5 @@ internal sealed class SceneCameraView : IViewProjectionProvider {
     public Matrix4 GetViewMatrix() => camera.GetViewMatrix();
 
     public Matrix4 GetProjectionMatrix() =>
-        Matrix4.CreatePerspectiveFieldOfView(MathHelper.DegreesToRadians(FovYDegrees), aspect, NearPlane, FarPlane);
+        BMatrix.CreatePerspectiveFieldOfView(MathHelper.DegreesToRadians(FovYDegrees), aspect, NearPlane, FarPlane);
 }

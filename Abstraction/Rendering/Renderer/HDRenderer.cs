@@ -1,5 +1,4 @@
 ﻿using BallisticEngine.Rendering;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -34,7 +33,7 @@ public abstract class HDRenderer {
         public int NormalTexture, DepthTexture, AoTexture, LitColor, SsgiTexture;   // GL texture ids (editor-debug, Phase 7)
         public int DestWidth, DestHeight;
         public bool PresentToScreen;     // true = draw into FB 0 (player); false = the editor display FBO
-        public OpenTK.Mathematics.Matrix4 InvProjection;
+        public Matrix4 InvProjection;
         public int Mode;                 // editor-defined extra-mode index (0 = none / not an extra view)
     }
 

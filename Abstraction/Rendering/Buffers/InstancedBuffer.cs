@@ -1,5 +1,4 @@
 using BallisticEngine;
-using OpenTK.Mathematics;
 
 // Per-instance model-matrix buffer. Lives in Abstraction/ (not OpenGL/) because the abstraction itself
 // references it (RenderAsset.CreateInstancedBuffer) and the engine holds one per Mesh (Mesh.InstanceBuffer)

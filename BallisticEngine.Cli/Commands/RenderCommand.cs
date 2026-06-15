@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
 using BallisticEngine.Serialization;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.Cli.Commands;
 
@@ -106,7 +105,7 @@ internal sealed class RenderCommand : ICommand {
             camera.Transform ??= new TransformDocument();
 
             Vector3 original = camera.Transform.Position;
-            float r = radius ?? MathF.Max(1f, new Vector2(original.X - center.X, original.Z - center.Z).Length);
+            float r = radius ?? MathF.Max(1f, new Vector2(original.X - center.X, original.Z - center.Z).Length());
             float y = height ?? original.Y;
 
             string tempDir = Path.Combine(root, "Library", "Temp");

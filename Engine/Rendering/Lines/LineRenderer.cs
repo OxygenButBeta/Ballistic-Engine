@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -103,7 +102,7 @@ public class LineRenderer : Behaviour, IRibbonSource {
         if (UseLocalSpace) {
             Matrix4 world = transform.WorldMatrix;
             for (var i = 0; i < Points.Count; i++)
-                worldScratch.Add(Vector3.TransformPosition(Points[i], world));
+                worldScratch.Add(Vector3.Transform(Points[i], world));
         }
         else {
             for (var i = 0; i < Points.Count; i++)
@@ -125,9 +124,9 @@ public class LineRenderer : Behaviour, IRibbonSource {
             return;
         gizmos.Color = StartColor;
         Matrix4 world = UseLocalSpace ? transform.WorldMatrix : Matrix4.Identity;
-        Vector3 prev = UseLocalSpace ? Vector3.TransformPosition(Points[0], world) : Points[0];
+        Vector3 prev = UseLocalSpace ? Vector3.Transform(Points[0], world) : Points[0];
         for (var i = 1; i < Points.Count; i++) {
-            Vector3 cur = UseLocalSpace ? Vector3.TransformPosition(Points[i], world) : Points[i];
+            Vector3 cur = UseLocalSpace ? Vector3.Transform(Points[i], world) : Points[i];
             gizmos.DrawLine(prev, cur);
             prev = cur;
         }

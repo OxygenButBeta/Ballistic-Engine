@@ -1,5 +1,4 @@
 using System.Globalization;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.AssetPipeline.Unity;
 

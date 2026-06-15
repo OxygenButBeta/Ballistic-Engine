@@ -1,18 +1,13 @@
 namespace BallisticEngine.Bepu;
 
-// OpenTK <-> System.Numerics conversions. The engine speaks OpenTK.Mathematics everywhere;
-// BepuPhysics speaks System.Numerics. Keep ALL conversions here so the rest of the backend
-// reads cleanly.
+// Engine <-> BepuPhysics math conversions. Both now speak System.Numerics (the engine migrated off
+// OpenTK.Mathematics in ENDGAME 3 step 4, and BepuPhysics was always System.Numerics), so these are
+// identity passthroughs — kept so the rest of the backend's call sites read unchanged (and so a future
+// type split, if any, has one place to live). Distinct names (ToNumerics/ToOpenTK) over the same
+// signature are legal; overload resolution is by name.
 static class BepuMath {
-    public static System.Numerics.Vector3 ToNumerics(in OpenTK.Mathematics.Vector3 v) =>
-        new(v.X, v.Y, v.Z);
-
-    public static OpenTK.Mathematics.Vector3 ToOpenTK(in System.Numerics.Vector3 v) =>
-        new(v.X, v.Y, v.Z);
-
-    public static System.Numerics.Quaternion ToNumerics(in OpenTK.Mathematics.Quaternion q) =>
-        new(q.X, q.Y, q.Z, q.W);
-
-    public static OpenTK.Mathematics.Quaternion ToOpenTK(in System.Numerics.Quaternion q) =>
-        new(q.X, q.Y, q.Z, q.W);
+    public static Vector3 ToNumerics(in Vector3 v) => v;
+    public static Vector3 ToOpenTK(in Vector3 v) => v;
+    public static Quaternion ToNumerics(in Quaternion q) => q;
+    public static Quaternion ToOpenTK(in Quaternion q) => q;
 }

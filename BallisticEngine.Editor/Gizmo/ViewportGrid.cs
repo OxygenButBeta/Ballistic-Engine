@@ -1,5 +1,4 @@
 using Hexa.NET.ImGui;
-using OpenTK.Mathematics;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec4 = System.Numerics.Vector4;
 
@@ -92,5 +91,5 @@ internal static class ViewportGrid {
     }
 
     static float Clip(Vector3 world, Matrix4 vp) =>
-        Vector4.TransformRow(new Vector4(world, 1f), vp).W;
+        Vector4.Transform(new Vector4(world, 1f), vp).W;
 }

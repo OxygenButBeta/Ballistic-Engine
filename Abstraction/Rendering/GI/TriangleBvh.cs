@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.GI;
 
@@ -44,8 +43,8 @@ internal sealed class TriangleBvh {
         Vector3 min = new(float.MaxValue), max = new(float.MinValue);
         for (int i = start; i < start + count; i++) {
             MeshSdfBaker.Triangle t = tris[order[i]];
-            min = Vector3.ComponentMin(min, t.Min);
-            max = Vector3.ComponentMax(max, t.Max);
+            min = Vector3.Min(min, t.Min);
+            max = Vector3.Max(max, t.Max);
         }
         node.Min = min;
         node.Max = max;
@@ -210,37 +209,37 @@ internal sealed class TriangleBvh {
     static float PointTriangleDistanceSq(Vector3 p, Vector3 a, Vector3 b, Vector3 c) {
         Vector3 ab = b - a, ac = c - a, ap = p - a;
         float d1 = Vector3.Dot(ab, ap), d2 = Vector3.Dot(ac, ap);
-        if (d1 <= 0f && d2 <= 0f) return (p - a).LengthSquared;
+        if (d1 <= 0f && d2 <= 0f) return (p - a).LengthSquared();
 
         Vector3 bp = p - b;
         float d3 = Vector3.Dot(ab, bp), d4 = Vector3.Dot(ac, bp);
-        if (d3 >= 0f && d4 <= d3) return (p - b).LengthSquared;
+        if (d3 >= 0f && d4 <= d3) return (p - b).LengthSquared();
 
         float vc = d1 * d4 - d3 * d2;
         if (vc <= 0f && d1 >= 0f && d3 <= 0f) {
             float v0 = d1 / (d1 - d3);
-            return (p - (a + v0 * ab)).LengthSquared;
+            return (p - (a + v0 * ab)).LengthSquared();
         }
 
         Vector3 cp = p - c;
         float d5 = Vector3.Dot(ab, cp), d6 = Vector3.Dot(ac, cp);
-        if (d6 >= 0f && d5 <= d6) return (p - c).LengthSquared;
+        if (d6 >= 0f && d5 <= d6) return (p - c).LengthSquared();
 
         float vb = d5 * d2 - d1 * d6;
         if (vb <= 0f && d2 >= 0f && d6 <= 0f) {
             float w0 = d2 / (d2 - d6);
-            return (p - (a + w0 * ac)).LengthSquared;
+            return (p - (a + w0 * ac)).LengthSquared();
         }
 
         float va = d3 * d6 - d5 * d4;
         if (va <= 0f && (d4 - d3) >= 0f && (d5 - d6) >= 0f) {
             float w1 = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-            return (p - (b + w1 * (c - b))).LengthSquared;
+            return (p - (b + w1 * (c - b))).LengthSquared();
         }
 
         float denom = 1f / (va + vb + vc);
         float vv = vb * denom, ww = vc * denom;
-        return (p - (a + ab * vv + ac * ww)).LengthSquared;
+        return (p - (a + ab * vv + ac * ww)).LengthSquared();
     }
 
     // ---- Inside test: parity majority over GENERIC (non-axis) rays --------

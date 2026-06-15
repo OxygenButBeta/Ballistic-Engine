@@ -1,5 +1,4 @@
 using BallisticEngine;
-using OpenTK.Mathematics;
 using OpenTK.Windowing.GraphicsLibraryFramework;
 
 // Xbox-style gamepad buttons; the int values are the standard GLFW/SDL gamepad button indices, so a
@@ -79,6 +78,6 @@ public static class Input
         if (!Enabled)
             return Vector2.Zero;
         var v = new Vector2(Provider.GetGamepadAxis(player, (int)xAxis), -Provider.GetGamepadAxis(player, (int)yAxis));
-        return v.Length < StickDeadzone ? Vector2.Zero : v;
+        return v.Length() < StickDeadzone ? Vector2.Zero : v;
     }
 }

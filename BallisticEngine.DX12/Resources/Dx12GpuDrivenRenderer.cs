@@ -3,8 +3,8 @@ using System.Collections.Generic;
 using System.Numerics;
 using Vortice.Direct3D12;
 using Vortice.Dxc;
-using GLMatrix4 = OpenTK.Mathematics.Matrix4;
-using GLVector3 = OpenTK.Mathematics.Vector3;
+using GLMatrix4 = System.Numerics.Matrix4x4;   // engine math is System.Numerics now; ToNum(...) is an identity copy
+using GLVector3 = System.Numerics.Vector3;
 
 namespace BallisticEngine.DX12;
 
@@ -288,7 +288,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
                                  ulong motionCbAddress) {
         // Group by mesh; build the flat SubmeshMeta array (per frame: Mvp depends on the camera).
         var groups = new List<(Dx12Buffer<GLVector3> vb, Dx12Buffer<GLVector3> nb,
-            Dx12Buffer<OpenTK.Mathematics.Vector2> ub, Dx12Buffer<OpenTK.Mathematics.Vector4> tb,
+            Dx12Buffer<Vector2> ub, Dx12Buffer<Vector4> tb,
             Dx12IndexBuffer ib, int baseIdx, int count)>();
         var byMesh = new Dictionary<Mesh, List<IStaticMeshRenderer>>();
         foreach (var r in wholeMesh) {
@@ -305,8 +305,8 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             var vb = mesh.VertexBuffer as Dx12Buffer<GLVector3>;
             var ib = mesh.IndexBuffer as Dx12IndexBuffer;
             var nb = mesh.NormalBuffer as Dx12Buffer<GLVector3>;
-            var ub = mesh.UvBuffer as Dx12Buffer<OpenTK.Mathematics.Vector2>;
-            var tb = mesh.TangentBuffer as Dx12Buffer<OpenTK.Mathematics.Vector4>;
+            var ub = mesh.UvBuffer as Dx12Buffer<Vector2>;
+            var tb = mesh.TangentBuffer as Dx12Buffer<Vector4>;
             if (vb?.Resource is null || ib?.Resource is null || nb?.Resource is null ||
                 ub?.Resource is null || tb?.Resource is null) continue;
 
@@ -579,7 +579,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     static Matrix4x4 ToNum(GLMatrix4 m) => new(
         m.M11, m.M12, m.M13, m.M14, m.M21, m.M22, m.M23, m.M24,
         m.M31, m.M32, m.M33, m.M34, m.M41, m.M42, m.M43, m.M44);
-    static Vector4 ToNum(OpenTK.Mathematics.Vector4 v) => new(v.X, v.Y, v.Z, v.W);
+    static Vector4 ToNum(Vector4 v) => v;
 
     public void Dispose() {
         cullRootSig?.Dispose(); geoCullRootSig?.Dispose(); cullPso?.Dispose(); drawRootSig?.Dispose(); drawPso?.Dispose();

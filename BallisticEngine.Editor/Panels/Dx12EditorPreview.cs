@@ -4,7 +4,7 @@ using BallisticEngine.DX12;
 using Vortice.Direct3D12;
 using Vortice.Dxc;
 using Vortice.DXGI;
-using GLVec3 = OpenTK.Mathematics.Vector3;
+using GLVec3 = System.Numerics.Vector3;   // engine math is System.Numerics now
 using SNM = System.Numerics;
 
 namespace BallisticEngine.Editor;
@@ -225,9 +225,9 @@ internal static class Dx12EditorPreview {
 
     static (GLVec3 center, float radius) Bounds(GLVec3[] vertices) {
         GLVec3 min = vertices[0], max = vertices[0];
-        foreach (GLVec3 v in vertices) { min = GLVec3.ComponentMin(min, v); max = GLVec3.ComponentMax(max, v); }
+        foreach (GLVec3 v in vertices) { min = GLVec3.Min(min, v); max = GLVec3.Max(max, v); }
         GLVec3 center = (min + max) * 0.5f;
-        float radius = Math.Max(0.01f, (max - min).Length * 0.5f);
+        float radius = Math.Max(0.01f, (max - min).Length() * 0.5f);
         return (center, radius);
     }
 

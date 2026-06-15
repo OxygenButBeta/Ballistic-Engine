@@ -1,7 +1,6 @@
 using System.Globalization;
 using System.Reflection;
 using BallisticEngine.AssetPipeline;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.Serialization;
 

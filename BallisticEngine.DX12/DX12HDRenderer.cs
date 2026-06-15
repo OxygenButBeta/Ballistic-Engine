@@ -5,8 +5,8 @@ using Vortice.Direct3D;
 using Vortice.Direct3D12;
 using Vortice.Dxc;
 using Vortice.DXGI;
-using GLMatrix4 = OpenTK.Mathematics.Matrix4;
-using GLVector3 = OpenTK.Mathematics.Vector3;
+using GLMatrix4 = System.Numerics.Matrix4x4;   // engine math is System.Numerics now; ToNumerics(...) is an identity copy
+using GLVector3 = System.Numerics.Vector3;
 
 namespace BallisticEngine;
 
@@ -1425,8 +1425,8 @@ public sealed class DX12HDRenderer : HDRenderer {
                 var vb = mesh.VertexBuffer as Dx12Buffer<GLVector3>;
                 var ib = mesh.IndexBuffer as Dx12IndexBuffer;
                 var nb = mesh.NormalBuffer as Dx12Buffer<GLVector3>;
-                var ub = mesh.UvBuffer as Dx12Buffer<OpenTK.Mathematics.Vector2>;
-                var tb = mesh.TangentBuffer as Dx12Buffer<OpenTK.Mathematics.Vector4>;
+                var ub = mesh.UvBuffer as Dx12Buffer<Vector2>;
+                var tb = mesh.TangentBuffer as Dx12Buffer<Vector4>;
                 if (vb?.Resource is null || ib?.Resource is null ||
                     nb?.Resource is null || ub?.Resource is null || tb?.Resource is null) continue;
 
@@ -1634,7 +1634,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         }
         foreach (SpotLight s in RuntimeSet<SpotLight>.ReadOnlyCollection) {
             if (s is null || !s.IsActive) continue;
-            Vector3 dir = ToNumerics(s.transform.WorldRotation * GLVector3.UnitZ);
+            Vector3 dir = Vector3.Transform(Vector3.UnitZ, s.transform.WorldRotation);
             float inner = Math.Clamp(s.InnerAngle, 0f, 89f) * (MathF.PI / 180f);
             float outer = Math.Clamp(MathF.Max(s.OuterAngle, s.InnerAngle), 0f, 89.9f) * (MathF.PI / 180f);
             clusteredLights.AddSpot(ToNumerics(s.transform.WorldPosition), dir, s.Range,
@@ -1761,8 +1761,8 @@ public sealed class DX12HDRenderer : HDRenderer {
                 var vb = mesh.VertexBuffer as Dx12Buffer<GLVector3>;
                 var ib = mesh.IndexBuffer as Dx12IndexBuffer;
                 var nb = mesh.NormalBuffer as Dx12Buffer<GLVector3>;
-                var ub = mesh.UvBuffer as Dx12Buffer<OpenTK.Mathematics.Vector2>;
-                var tb = mesh.TangentBuffer as Dx12Buffer<OpenTK.Mathematics.Vector4>;
+                var ub = mesh.UvBuffer as Dx12Buffer<Vector2>;
+                var tb = mesh.TangentBuffer as Dx12Buffer<Vector4>;
                 if (vb?.Resource is null || ib?.Resource is null ||
                     nb?.Resource is null || ub?.Resource is null || tb?.Resource is null) continue;
                 SubMeshData sub = mesh.SubMeshes[item.submesh];
@@ -2629,7 +2629,7 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         // View with translation stripped (the sky cube is centred on the camera).
         Matrix4x4 viewNoT = view; viewNoT.M41 = 0; viewNoT.M42 = 0; viewNoT.M43 = 0;
-        OpenTK.Mathematics.Vector3 euler = Skybox.Active.RotationEuler;
+        Vector3 euler = Skybox.Active.RotationEuler;
         Matrix4x4 rot = Matrix4x4.CreateRotationX(euler.X * (MathF.PI / 180f))
                       * Matrix4x4.CreateRotationY(euler.Y * (MathF.PI / 180f))
                       * Matrix4x4.CreateRotationZ(euler.Z * (MathF.PI / 180f));
@@ -2892,5 +2892,5 @@ public sealed class DX12HDRenderer : HDRenderer {
         m.M31, m.M32, m.M33, m.M34,
         m.M41, m.M42, m.M43, m.M44);
     static Vector3 ToNumerics(GLVector3 v) => new(v.X, v.Y, v.Z);
-    static Vector4 ToNumerics(OpenTK.Mathematics.Vector4 v) => new(v.X, v.Y, v.Z, v.W);
+    static Vector4 ToNumerics(Vector4 v) => v;
 }

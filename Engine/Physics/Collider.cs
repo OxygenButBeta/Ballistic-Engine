@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -62,16 +61,16 @@ public abstract class Collider : Behaviour {
                 return false;
             Matrix4 inverseNode = mesh.InverseNodeTransforms[subMeshIndex];
             for (int i = 0; i < subMesh.IndexCount; i++) {
-                Vector3 v = Vector3.TransformPosition(
+                Vector3 v = Vector3.Transform(
                     mesh.Vertices[mesh.Indices[subMesh.IndexStart + i]], inverseNode);
-                min = Vector3.ComponentMin(min, v);
-                max = Vector3.ComponentMax(max, v);
+                min = Vector3.Min(min, v);
+                max = Vector3.Max(max, v);
             }
         }
         else {
             foreach (Vector3 v in mesh.Vertices) {
-                min = Vector3.ComponentMin(min, v);
-                max = Vector3.ComponentMax(max, v);
+                min = Vector3.Min(min, v);
+                max = Vector3.Max(max, v);
             }
         }
 
@@ -139,5 +138,5 @@ public abstract class Collider : Behaviour {
 
     // World-space pose of the shape, for gizmos.
     private protected Vector3 GizmoCenter =>
-        transform.WorldPosition + transform.WorldRotation * (Center * transform.WorldMatrix.ExtractScale());
+        transform.WorldPosition + Vector3.Transform(Center * transform.WorldMatrix.ExtractScale(), transform.WorldRotation);
 }
