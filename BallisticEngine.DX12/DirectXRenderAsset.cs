@@ -23,6 +23,13 @@ public sealed class DirectXRenderAsset : RenderAsset {
         device = new Dx12Device(enableDebugLayer: debugLayer);
         Dx12Backend.Initialize(device);
 
+        // Compute-foundation self-test door (BALLISTIC_DX12_COMPUTE_TEST=1): verify the compute PSO + UAV +
+        // InterlockedAdd + readback path the GPU-driven cull is built on, then exit. Isolated harness.
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_COMPUTE_TEST") == "1") {
+            bool pass = DX12.Dx12ComputeProbe.SelfTest(device);
+            Environment.Exit(pass ? 0 : 1);
+        }
+
         Renderer = new DX12HDRenderer(device);
         Renderer.Initialize();
     }

@@ -186,6 +186,44 @@ public sealed class Dx12Device : IDisposable {
         return result;
     }
 
+    // Create a DEFAULT-heap buffer with UNORDERED-ACCESS allowed (the GPU-driven cull writes its indirect
+    // draw commands + atomic counter into these), seeded with `data`, left in `finalState`
+    // (UnorderedAccess for compute writes, or IndirectArgument when fed straight to ExecuteIndirect).
+    // Same upload-heap copy path as CreateDefaultBuffer; the only difference is ResourceFlags + that the
+    // resource can later be transitioned to UnorderedAccess / IndirectArgument.
+    public unsafe ID3D12Resource CreateUavBuffer<T>(ReadOnlySpan<T> data, ResourceStates finalState)
+        where T : unmanaged {
+        ID3D12Resource result = null;
+        int byteSize = data.Length * sizeof(T);
+        lock (uploadGate) {
+            ID3D12Resource dest = Device.CreateCommittedResource(
+                HeapProperties.DefaultHeapProperties, HeapFlags.None,
+                ResourceDescription.Buffer((ulong)byteSize, ResourceFlags.AllowUnorderedAccess),
+                ResourceStates.Common);
+
+            using ID3D12Resource upload = Device.CreateCommittedResource(
+                HeapProperties.UploadHeapProperties, HeapFlags.None,
+                ResourceDescription.Buffer((ulong)byteSize), ResourceStates.GenericRead);
+            Span<T> mapped = upload.Map<T>(0, data.Length);
+            data.CopyTo(mapped);
+            upload.Unmap(0);
+
+            ExecuteUpload(cl => {
+                cl.ResourceBarrierTransition(dest, ResourceStates.Common, ResourceStates.CopyDest);
+                cl.CopyBufferRegion(dest, 0, upload, 0, (ulong)byteSize);
+                cl.ResourceBarrierTransition(dest, ResourceStates.CopyDest, finalState);
+            });
+            result = dest;
+        }
+        return result;
+    }
+
+    // A READBACK-heap buffer (CPU-mappable, always CopyDest) for reading GPU results back — used by the
+    // compute self-test and any GPU->CPU buffer readback.
+    public ID3D12Resource CreateReadbackBuffer(int byteSize) =>
+        Device.CreateCommittedResource(HeapProperties.ReadbackHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)byteSize), ResourceStates.CopyDest);
+
     public void Dispose() {
         WaitForGpu();
         fenceEvent.Dispose();
