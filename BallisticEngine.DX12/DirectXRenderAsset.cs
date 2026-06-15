@@ -16,9 +16,11 @@ public sealed class DirectXRenderAsset : RenderAsset {
 
     public override void Initialize() {
         Current = this;
-        // Debug layer on in Debug builds — catches the silent device-removals that are the classic DX12
-        // crash (same default as the smoke tests). The device + descriptor store back every resource.
-        device = new Dx12Device(enableDebugLayer: true);
+        // Debug layer OFF by default: the D3D12 debug layer is not reliably thread-safe under the heavy
+        // concurrent resource creation the engine's worker-thread asset loading does (it spuriously
+        // E_FAILs CreateCommittedResource). Opt in with BALLISTIC_DX12_DEBUG=1 for single-threaded debugging.
+        bool debugLayer = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DEBUG") == "1";
+        device = new Dx12Device(enableDebugLayer: debugLayer);
         Dx12Backend.Initialize(device);
 
         Renderer = new DX12HDRenderer(device);

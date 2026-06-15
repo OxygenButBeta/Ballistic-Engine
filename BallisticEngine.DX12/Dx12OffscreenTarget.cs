@@ -83,6 +83,21 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         });
     }
 
+    // Clear color+depth, then record draws — the whole frame in ONE command-list submission (one
+    // ExecuteSync), which the per-frame renderer wants (vs Clear() + RenderInto() = two submits).
+    public void RenderIntoCleared(float r, float g, float b, Action<ID3D12GraphicsCommandList4> record) {
+        dev.ExecuteSync(cl => {
+            TransitionTo(cl, ResourceStates.RenderTarget);
+            cl.RSSetViewport(0, 0, Width, Height);
+            cl.RSSetScissorRect(Width, Height);
+            BindTargets(cl);
+            cl.ClearRenderTargetView(rtvHandle, new Vortice.Mathematics.Color4(r, g, b, 1f));
+            if (HasDepth)
+                cl.ClearDepthStencilView(dsvHandle, ClearFlags.Depth, 1.0f, 0);
+            record(cl);
+        });
+    }
+
     void BindTargets(ID3D12GraphicsCommandList4 cl) {
         if (HasDepth)
             cl.OMSetRenderTargets(rtvHandle, dsvHandle);

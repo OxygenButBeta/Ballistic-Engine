@@ -35,20 +35,26 @@ public sealed class Dx12DescriptorHeap : IDisposable {
 
     // Reserve one slot; returns its index. Throws when full (a real cap, not a silent wrap) for the
     // persistent heap. The ring heap calls Reset() per frame so it never overflows under normal load.
+    // Locked: the persistent SRV store is allocated from texture uploads on JobSystem worker threads.
+    readonly object gate = new();
     public int Allocate() {
-        if (cursor >= capacity)
-            throw new InvalidOperationException(
-                $"Descriptor heap full ({capacity}). Grow the heap or reset it per frame.");
-        return cursor++;
+        lock (gate) {
+            if (cursor >= capacity)
+                throw new InvalidOperationException(
+                    $"Descriptor heap full ({capacity}). Grow the heap or reset it per frame.");
+            return cursor++;
+        }
     }
 
     // Reserve `count` CONTIGUOUS slots (for a material's descriptor table); returns the first index.
     public int AllocateRange(int count) {
-        if (cursor + count > capacity)
-            cursor = 0;   // ring wrap (shader-visible per-draw heap)
-        int start = cursor;
-        cursor += count;
-        return start;
+        lock (gate) {
+            if (cursor + count > capacity)
+                cursor = 0;   // ring wrap (shader-visible per-draw heap)
+            int start = cursor;
+            cursor += count;
+            return start;
+        }
     }
 
     public void Reset() => cursor = 0;

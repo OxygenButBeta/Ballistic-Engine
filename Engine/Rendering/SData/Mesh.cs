@@ -44,6 +44,18 @@ public class Mesh : BObject
     readonly GPUBuffer<uint> indexBuffer;
     readonly RenderContext renderContext;
 
+    // Buffer accessors for backends that bind buffers per-draw rather than via a bound VAO. The GL
+    // backend draws off the VAO state set up in Activate() and never touches these; the DX12 backend
+    // casts them to its concrete buffer type to read GPU addresses and build vertex/index buffer views
+    // at draw time. Read-only — the buffers are filled once at construction.
+    public GPUBuffer<Vector3> VertexBuffer => vertexBuffer;
+    public GPUBuffer<Vector3> NormalBuffer => normalBuffer;
+    public GPUBuffer<Vector2> UvBuffer => UVBuffer;
+    public GPUBuffer<Vector4> TangentBuffer => tangentBuffer;
+    public GPUBuffer<uint> IndexBuffer => indexBuffer;
+    public GPUBuffer<Vector4> BoneIndexBuffer => boneIndexBuffer;
+    public GPUBuffer<Vector4> BoneWeightBuffer => boneWeightBuffer;
+
     Mesh(in MeshData data)
     {
         renderContext = RenderAsset.Current.CreateRenderContext();
