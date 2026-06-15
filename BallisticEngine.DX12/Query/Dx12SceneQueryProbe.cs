@@ -132,6 +132,23 @@ public static class Dx12SceneQueryProbe {
             var cls = query.ClassifySpace(new[] { inside, farOpen });
             ok &= Check("classify: centre is Solid", cls[0] == GpuSceneQuery.SpaceClass.Solid);
             ok &= Check("classify: far point is Open", cls[1] == GpuSceneQuery.SpaceClass.Open);
+
+            // nudge: the box centre is moved OUT to free space (no longer occupied).
+            Vector3[] nudged = query.NudgeToFreeSpace(new[] { inside });
+            bool[] nudgedOcc = query.OccupancyAt(new[] { nudged[0] });
+            ok &= Check($"nudge: centre moved to free space ({nudged[0].X:0.##},{nudged[0].Y:0.##},{nudged[0].Z:0.##})",
+                nudgedOcc[0] == false && nudged[0] != inside);
+
+            // visibility clusters: two points on the +X side of the box vs two on the -X side, kept inside the
+            // box's y-extent (|y|<=0.5) so every CROSS-side sightline passes through the cube and is blocked,
+            // while each same-side vertical pair has clear LOS. -> exactly 2 rooms.
+            var roomPts = new[] {
+                new Vector3( 3, 0, 0), new Vector3( 3, 0.5f, 0),   // +X side
+                new Vector3(-3, 0, 0), new Vector3(-3, 0.5f, 0),   // -X side
+            };
+            int[] rooms = query.VisibilityClusters(roomPts);
+            bool twoRooms = rooms[0] == rooms[1] && rooms[2] == rooms[3] && rooms[0] != rooms[2];
+            ok &= Check($"clusters: +X and -X sides are 2 separate rooms (labels {rooms[0]},{rooms[1]},{rooms[2]},{rooms[3]})", twoRooms);
         } catch (Exception e) {
             ok = false;
             Console.WriteLine($"[SceneQueryTest] FAIL (exception): {e.Message}\n{e.StackTrace}");

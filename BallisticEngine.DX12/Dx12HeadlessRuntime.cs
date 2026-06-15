@@ -79,10 +79,17 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
         using DX12.GpuSceneQuery q = r.CreateSceneQuery();
         bool[] occ = q.OccupancyAt(pts);
         DX12.GpuSceneQuery.SpaceClass[] cls = q.ClassifySpace(pts);
+        Vector3[] nudged = q.NudgeToFreeSpace(pts);
+        int[] rooms = q.VisibilityClusters(pts);
         Console.WriteLine($"[SceneQuerySmoke] available={q.Available} renderers populated, {pts.Count} points:");
-        for (int i = 0; i < pts.Count; i++)
-            Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
-                $"  ({pts[i].X:0.##},{pts[i].Y:0.##},{pts[i].Z:0.##}) -> occupied={occ[i]} class={cls[i]}"));
+        for (int i = 0; i < pts.Count; i++) {
+            string line = System.FormattableString.Invariant(
+                $"  ({pts[i].X:0.##},{pts[i].Y:0.##},{pts[i].Z:0.##}) -> occupied={occ[i]} class={cls[i]} room={rooms[i]}");
+            if (occ[i])
+                line += System.FormattableString.Invariant(
+                    $" nudged->({nudged[i].X:0.##},{nudged[i].Y:0.##},{nudged[i].Z:0.##})");
+            Console.WriteLine(line);
+        }
     }
 
     void SaveScreenshot() {

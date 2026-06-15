@@ -94,6 +94,7 @@ RWStructuredBuffer<uint>   OutFlags : register(u0);   // occupancy/visibility/cl
 
 struct VisPair { float3 A; float3 B; };
 StructuredBuffer<VisPair>  InPairs  : register(t2);   // visibility: a/b pair per element
+RWStructuredBuffer<float3> OutPoints : register(u1);  // nudge: corrected free-space position per element
 
 [numthreads(64, 1, 1)]
 void Occupancy(uint3 tid : SV_DispatchThreadID) {
@@ -139,4 +140,41 @@ void Classify(uint3 tid : SV_DispatchThreadID) {
     // (the APV anti-pattern: zero front-door knobs). 0.5 = "more than half the hemisphere is walled".
     float frac = (float)hits / (float)K;
     OutFlags[i] = (frac >= 0.5) ? CLASS_ENCLOSED : CLASS_OPEN;
+}
+
+// First-hit distance from p along dir (ProbeRadius if nothing within reach). Deterministic single ray.
+float FirstHitDist(float3 p, float3 dir) {
+    RayDesc ray;
+    ray.Origin = p + dir * RayBias;
+    ray.Direction = dir;
+    ray.TMin = 0.0;
+    ray.TMax = ProbeRadius;
+    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
+    q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
+    q.Proceed();
+    return (q.CommittedStatus() != COMMITTED_NOTHING) ? (RayBias + q.CommittedRayT()) : ProbeRadius;
+}
+
+// --- Nudge: move an occupied point into free space along the fixed direction with the NEAREST surface exit
+// (the shortest path out of solid), placing it just past that surface. A free point is returned unchanged.
+// Deterministic: the K probe directions are the same closed-form Fibonacci sphere; ties broken by index.
+[numthreads(64, 1, 1)]
+void Nudge(uint3 tid : SV_DispatchThreadID) {
+    uint i = tid.x;
+    if (i >= Count) return;
+    float3 p = InPoints[i];
+    if (!InsideSolid(p, ProbeRadius)) { OutPoints[i] = p; return; }   // already free
+
+    const uint K = 32u;
+    float bestT = ProbeRadius + 1.0;
+    float3 bestDir = float3(0, 1, 0);
+    [loop] for (uint k = 0; k < K; k++) {
+        float3 dir = FibSphereDir(k, K);
+        float t = FirstHitDist(p, dir);
+        if (t < bestT) { bestT = t; bestDir = dir; }   // nearest exit = shortest way out
+    }
+    // Step just past the nearest surface (a small margin beyond the exit). If nothing was hit within reach
+    // (bestT == ProbeRadius), the point is effectively unbounded -> leave it (can't improve deterministically).
+    float margin = max(4.0 * RayBias, 0.1);
+    OutPoints[i] = (bestT <= ProbeRadius) ? (p + bestDir * (bestT + margin)) : p;
 }

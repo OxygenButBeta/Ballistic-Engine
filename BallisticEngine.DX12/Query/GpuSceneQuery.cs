@@ -28,7 +28,7 @@ public sealed class GpuSceneQuery : IDisposable {
     readonly bool ownsSceneAS;
 
     ID3D12RootSignature rootSig;
-    ID3D12PipelineState psoOccupancy, psoVisibility, psoClassify;
+    ID3D12PipelineState psoOccupancy, psoVisibility, psoClassify, psoNudge;
     Dx12DescriptorHeap tlasHeap;        // single shader-visible slot: the TLAS AS-SRV
     bool dxrAvailable, checkedDxr, built;
 
@@ -64,15 +64,17 @@ public sealed class GpuSceneQuery : IDisposable {
         if (!dxrAvailable) return false;
         if (built) return true;
 
-        // Root sig: table0 = SRV t0 (TLAS), root SRV t1 (points), root SRV t2 (pairs), root UAV u0 (out),
-        // root constants b0 (QueryConstants, 4 dwords). Unused root descriptors per pass get a safe address.
+        // Root sig: table0 = SRV t0 (TLAS), root SRV t1 (points), root SRV t2 (pairs), root UAV u0 (flags),
+        // root UAV u1 (nudged points), CBV b0 (QueryConstants). Unused root descriptors per pass get a safe
+        // address (a valid GPU VA the shader never reads — keeps the debug layer quiet).
         var tlasRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
         var prms = new[] {
             new RootParameter1(new RootDescriptorTable1(tlasRange), ShaderVisibility.All),               // 0: t0 TLAS
             new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(1, 0), ShaderVisibility.All), // 1: t1 points
             new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(2, 0), ShaderVisibility.All), // 2: t2 pairs
-            new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(0, 0), ShaderVisibility.All),// 3: u0 out
-            new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All), // 4: b0 consts (CBV)
+            new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(0, 0), ShaderVisibility.All),// 3: u0 flags
+            new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(1, 0), ShaderVisibility.All),// 4: u1 points
+            new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All), // 5: b0 consts (CBV)
         };
         rootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(RootSignatureFlags.None, prms)));
@@ -81,6 +83,7 @@ public sealed class GpuSceneQuery : IDisposable {
         psoOccupancy  = MakePso(hlsl, "Occupancy");
         psoVisibility = MakePso(hlsl, "Visibility");
         psoClassify   = MakePso(hlsl, "Classify");
+        psoNudge      = MakePso(hlsl, "Nudge");
 
         tlasHeap = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true);
@@ -139,6 +142,53 @@ public sealed class GpuSceneQuery : IDisposable {
         return result;
     }
 
+    // Per point: if it lies inside solid, the nearest free-space position just past the nearest surface;
+    // a point already in free space is returned unchanged. Deterministic (fixed Fibonacci probe directions).
+    // Empty scene -> points returned unchanged.
+    public Vector3[] NudgeToFreeSpace(IReadOnlyList<Vector3> points, float probeRadius = DefaultProbeRadius) {
+        int n = points.Count;
+        var result = new Vector3[n];
+        for (int i = 0; i < n; i++) result[i] = points[i];
+        if (n == 0 || !EnsureBuilt() || !EnsureScene()) return result;
+        return DispatchNudge(points, probeRadius);
+    }
+
+    // Room segmentation: label each point with a cluster id so two points that can SEE each other (directly
+    // or transitively) share a label, and points separated by walls get different labels. Builds the pairwise
+    // visibility graph on the GPU (upper-triangle pairs) then connected-components (union-find) on the CPU.
+    // O(n^2) rays — intended for probe-grid-scale n (hundreds), not millions. Empty scene -> all label 0.
+    public int[] VisibilityClusters(IReadOnlyList<Vector3> points) {
+        int n = points.Count;
+        var labels = new int[n];
+        if (n == 0) return labels;
+        if (!EnsureBuilt() || !EnsureScene()) return labels;   // no geometry -> one big open room
+
+        // Upper-triangle pairs (i<j). For modest n this is fine; the GPU batches them in one dispatch.
+        var pairs = new List<(Vector3, Vector3)>(n * (n - 1) / 2);
+        var ij = new List<(int, int)>(pairs.Capacity);
+        for (int i = 0; i < n; i++)
+            for (int j = i + 1; j < n; j++) { pairs.Add((points[i], points[j])); ij.Add((i, j)); }
+
+        bool[] vis = pairs.Count == 0 ? Array.Empty<bool>() : Visibility(pairs);
+
+        // Union-find: union i,j when mutually visible.
+        var parent = new int[n];
+        for (int i = 0; i < n; i++) parent[i] = i;
+        int Find(int x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
+        void Union(int a, int b) { int ra = Find(a), rb = Find(b); if (ra != rb) parent[ra] = rb; }
+        for (int k = 0; k < vis.Length; k++)
+            if (vis[k]) { var (a, b) = ij[k]; Union(a, b); }
+
+        // Compact root ids -> dense 0..m labels (stable by first-seen order for determinism).
+        var rootToLabel = new Dictionary<int, int>();
+        for (int i = 0; i < n; i++) {
+            int r = Find(i);
+            if (!rootToLabel.TryGetValue(r, out int lbl)) { lbl = rootToLabel.Count; rootToLabel[r] = lbl; }
+            labels[i] = lbl;
+        }
+        return labels;
+    }
+
     // ---- dispatch plumbing ----------------------------------------------------
 
     unsafe uint[] RunPoints(ID3D12PipelineState pso, IReadOnlyList<Vector3> points, float probeRadius) {
@@ -157,37 +207,47 @@ public sealed class GpuSceneQuery : IDisposable {
         return Dispatch(pso, inBuf, inBuf, n, DefaultProbeRadius);   // points slot unused; bind inBuf as a safe address
     }
 
-    // Core: bind TLAS + points (t1) + pairs (t2) + out UAV (u0) + consts, dispatch one thread per element,
-    // read the uint result buffer back. pointsBuf and pairsBuf may alias the same resource (the shader only
-    // reads the one it needs); binding a valid address for both keeps the debug layer quiet.
+    // Build the per-dispatch CBV (256-byte aligned, the DX12 CBV rule), bind the common root params (TLAS,
+    // points t1, pairs t2, CBV b0), and rebuild the TLAS SRV into the heap slot. The caller binds the output
+    // UAVs (u0/u1) and the dispatch+copy. pointsBuf/pairsBuf may alias (the shader reads only the one it
+    // needs); a valid address for both keeps the debug layer quiet.
+    unsafe ID3D12Resource MakeConstants(int count, float probeRadius) {
+        var consts = new QueryConstants {
+            Count = (uint)count, ProbeRadius = probeRadius, RayBias = DefaultRayBias, Pad = 0,
+        };
+        ID3D12Resource cb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties,
+            HeapFlags.None, ResourceDescription.Buffer(256), ResourceStates.GenericRead);
+        byte* p = cb.Map<byte>(0); *(QueryConstants*)p = consts; cb.Unmap(0);
+        return cb;
+    }
+
+    void BindCommon(ID3D12GraphicsCommandList4 cl, ID3D12PipelineState pso, ID3D12Resource pointsBuf,
+        ID3D12Resource pairsBuf, ID3D12Resource cb) {
+        if (testTlasWriter != null) testTlasWriter(tlasHeap.Cpu(0));
+        else sceneAS.CreateTlasSrv(tlasHeap.Cpu(0));
+        cl.SetDescriptorHeaps(tlasHeap.Heap);
+        cl.SetComputeRootSignature(rootSig);
+        cl.SetPipelineState(pso);
+        cl.SetComputeRootDescriptorTable(0, tlasHeap.Gpu(0));
+        cl.SetComputeRootShaderResourceView(1, pointsBuf.GPUVirtualAddress);
+        cl.SetComputeRootShaderResourceView(2, pairsBuf.GPUVirtualAddress);
+        cl.SetComputeRootConstantBufferView(5, cb.GPUVirtualAddress);
+    }
+
+    // uint-flag passes (occupancy / visibility / classify): result in u0; u1 gets a tiny dummy so the root
+    // sig is fully bound. Reads the uint[count] result back.
     unsafe uint[] Dispatch(ID3D12PipelineState pso, ID3D12Resource pointsBuf, ID3D12Resource pairsBuf,
         int count, float probeRadius) {
         var zeros = new uint[count];
         using ID3D12Resource outBuf = dev.CreateUavBuffer<uint>(zeros, ResourceStates.UnorderedAccess);
+        using ID3D12Resource dummyPts = dev.CreateUavBuffer<Vector3>(new Vector3[1], ResourceStates.UnorderedAccess);
         using ID3D12Resource outRb = dev.CreateReadbackBuffer(count * sizeof(uint));
-
-        // Constants in a tiny upload-heap CBV (256-byte aligned, the DX12 CBV rule). Same pattern as the
-        // RT shadow/GI passes (SetComputeRootConstantBufferView).
-        var consts = new QueryConstants {
-            Count = (uint)count, ProbeRadius = probeRadius, RayBias = DefaultRayBias, Pad = 0,
-        };
-        using ID3D12Resource cb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties,
-            HeapFlags.None, ResourceDescription.Buffer(256), ResourceStates.GenericRead);
-        { byte* p = cb.Map<byte>(0); *(QueryConstants*)p = consts; cb.Unmap(0); }
-
-        // The TLAS SRV is rebuilt into the heap slot each call (descriptors are transient; the TLAS persists).
-        if (testTlasWriter != null) testTlasWriter(tlasHeap.Cpu(0));
-        else sceneAS.CreateTlasSrv(tlasHeap.Cpu(0));
+        using ID3D12Resource cb = MakeConstants(count, probeRadius);
 
         dev.ExecuteSync(cl => {
-            cl.SetDescriptorHeaps(tlasHeap.Heap);
-            cl.SetComputeRootSignature(rootSig);
-            cl.SetPipelineState(pso);
-            cl.SetComputeRootDescriptorTable(0, tlasHeap.Gpu(0));
-            cl.SetComputeRootShaderResourceView(1, pointsBuf.GPUVirtualAddress);
-            cl.SetComputeRootShaderResourceView(2, pairsBuf.GPUVirtualAddress);
-            cl.SetComputeRootUnorderedAccessView(3, outBuf.GPUVirtualAddress);
-            cl.SetComputeRootConstantBufferView(4, cb.GPUVirtualAddress);
+            BindCommon(cl, pso, pointsBuf, pairsBuf, cb);
+            cl.SetComputeRootUnorderedAccessView(3, outBuf.GPUVirtualAddress);       // u0 flags
+            cl.SetComputeRootUnorderedAccessView(4, dummyPts.GPUVirtualAddress);     // u1 unused
             cl.Dispatch((uint)((count + 63) / 64), 1, 1);
             cl.ResourceBarrierTransition(outBuf, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
             cl.CopyBufferRegion(outRb, 0, outBuf, 0, (ulong)(count * sizeof(uint)));
@@ -200,9 +260,36 @@ public sealed class GpuSceneQuery : IDisposable {
         return result;
     }
 
+    // Nudge pass: corrected positions in u1 (float3); u0 gets a tiny dummy. Reads the Vector3[count] back.
+    unsafe Vector3[] DispatchNudge(IReadOnlyList<Vector3> points, float probeRadius) {
+        int count = points.Count;
+        var pts = new Vector3[count];
+        for (int i = 0; i < count; i++) pts[i] = points[i];
+        using ID3D12Resource inBuf = dev.CreateDefaultBuffer<Vector3>(pts, ResourceStates.NonPixelShaderResource);
+        using ID3D12Resource outBuf = dev.CreateUavBuffer<Vector3>(new Vector3[count], ResourceStates.UnorderedAccess);
+        using ID3D12Resource dummyFlags = dev.CreateUavBuffer<uint>(new uint[1], ResourceStates.UnorderedAccess);
+        using ID3D12Resource outRb = dev.CreateReadbackBuffer(count * sizeof(float) * 3);
+        using ID3D12Resource cb = MakeConstants(count, probeRadius);
+
+        dev.ExecuteSync(cl => {
+            BindCommon(cl, psoNudge, inBuf, inBuf, cb);
+            cl.SetComputeRootUnorderedAccessView(3, dummyFlags.GPUVirtualAddress);   // u0 unused
+            cl.SetComputeRootUnorderedAccessView(4, outBuf.GPUVirtualAddress);       // u1 points
+            cl.Dispatch((uint)((count + 63) / 64), 1, 1);
+            cl.ResourceBarrierTransition(outBuf, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+            cl.CopyBufferRegion(outRb, 0, outBuf, 0, (ulong)(count * sizeof(float) * 3));
+        });
+
+        var result = new Vector3[count];
+        Span<Vector3> mapped = outRb.Map<Vector3>(0, count);
+        mapped.CopyTo(result);
+        outRb.Unmap(0);
+        return result;
+    }
+
     public void Dispose() {
         rootSig?.Dispose();
-        psoOccupancy?.Dispose(); psoVisibility?.Dispose(); psoClassify?.Dispose();
+        psoOccupancy?.Dispose(); psoVisibility?.Dispose(); psoClassify?.Dispose(); psoNudge?.Dispose();
         tlasHeap?.Dispose();
         if (ownsSceneAS) sceneAS?.Dispose();
     }
