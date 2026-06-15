@@ -140,11 +140,20 @@ public sealed class DX12HDRenderer : HDRenderer {
     int ssgiFrame;                          // slice-set rotation counter
     bool ssgiHistWriteB;                    // temporal ping-pong toggle
     bool ssgiHistValid;                     // false on first frame / resize
-    // OIDN spatial denoise (replaces the GL a-trous). Readback round-trip (D3D12 -> host floats -> OIDN ->
-    // upload); the zero-copy D3D12<->HIP shared-buffer path is the perf follow-up. Created lazily on first use.
+    // OIDN spatial denoise (replaces the GL a-trous). Two paths: a ZERO-COPY GPU path (OIDN's HIP device
+    // imports a D3D12 shared buffer; per frame = 2 GPU texture<->buffer copies + an in-place GPU denoise, no
+    // CPU readback) when SharedCapable, else the CPU readback round-trip (D3D12 -> host floats -> OIDN ->
+    // upload). Created lazily on first use; the shared path falls back to readback if the HIP import fails.
     Dx12OidnDenoiser ssgiOidn;
     bool ssgiOidnTried;
-    float[] ssgiCpuColor, ssgiCpuOut;       // host float3 buffers sized to the half-res GI
+    float[] ssgiCpuColor, ssgiCpuOut;       // host float3 buffers sized to the half-res GI (readback path)
+    Dx12OidnGpuPath ssgiOidnGpu;            // zero-copy GPU pack/unpack denoise (shared float buffer)
+    bool ssgiSharedFailed;                   // shared path failed once → stick to readback forever
+    bool ssgiOidnForceReadback;              // BALLISTIC_DX12_OIDN_READBACK=1 → force the CPU path (A/B door)
+    bool ssgiOidnTiming;                     // BALLISTIC_DX12_OIDN_TIMING=1 → log avg denoise ms (perf A/B)
+    bool ssgiOidnEnvRead;
+    readonly System.Diagnostics.Stopwatch ssgiOidnSw = new();
+    double ssgiOidnAccumMs; int ssgiOidnAccumFrames;
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct SsgiConstants {
         public Matrix4x4 Projection; public Matrix4x4 InvProjection; public Matrix4x4 ViewMatrix;
@@ -707,6 +716,8 @@ public sealed class DX12HDRenderer : HDRenderer {
     void AllocSsgiTargets() {
         ssgiTarget?.Dispose(); ssgiScene?.Dispose(); ssgiHistoryA?.Dispose(); ssgiHistoryB?.Dispose();
         ssgiDenoised?.Dispose();
+        // The zero-copy OIDN GPU path's shared buffer + dst-UAV are sized to the half-res GI; its Ensure(w,h)
+        // detects the size change and rebuilds them on the next OIDN use (ssgiSharedFailed stays latched).
         int w = System.Math.Max(1, targetW / 2), h = System.Math.Max(1, targetH / 2);
         // allowUav so the RT-GI gather can write it via a UAV (the SSGI gather still uses the RTV).
         ssgiTarget = new Dx12OffscreenTarget(dev, w, h, withDepth: false,
@@ -716,7 +727,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         ssgiHistoryB = new Dx12OffscreenTarget(dev, w, h, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         ssgiDenoised = new Dx12OffscreenTarget(dev, w, h, withDepth: false,
-            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
+            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);  // OIDN GPU unpack writes it
         ssgiScene = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         ssgiHistValid = false;       // accumulated history is stale after a (re)allocation
@@ -1969,21 +1980,54 @@ public sealed class DX12HDRenderer : HDRenderer {
             cl.DrawInstanced(3, 1, 0, 0);
         });
 
-        // OIDN spatial denoise (replaces the GL a-trous): readback the accumulated half-res GI → OIDN HDR
-        // RT filter → upload to ssgiDenoised. The combine reads the denoised result. Slow per-frame round-
-        // trip (zero-copy D3D12↔HIP is the perf follow-up); BALLISTIC_DX12_SSGI_OIDN=0 falls back to the
-        // raw temporal result for A/B. Degrades gracefully if the OIDN DLLs aren't present.
+        // OIDN spatial denoise (replaces the GL a-trous). Preferred: the ZERO-COPY GPU path — OIDN's HIP
+        // device shares a D3D12 buffer, so we copy the GI texture into it on the GPU, denoise in place on the
+        // GPU, and copy back, with NO CPU readback (the readback/upload + Map was the cost). Fallback: the CPU
+        // readback round-trip (host floats -> OIDN -> upload). BALLISTIC_DX12_SSGI_OIDN=0 skips denoise (A/B);
+        // degrades gracefully if the OIDN DLLs aren't present.
         Dx12OffscreenTarget giForCombine = histWrite;
         bool oidnOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SSGI_OIDN") != "0";
         if (oidnOn) {
-            if (!ssgiOidnTried) { ssgiOidnTried = true; ssgiOidn = new Dx12OidnDenoiser(); }
+            if (!ssgiOidnEnvRead) {
+                ssgiOidnEnvRead = true;
+                ssgiOidnForceReadback = Environment.GetEnvironmentVariable("BALLISTIC_DX12_OIDN_READBACK") == "1";
+                ssgiOidnTiming = Environment.GetEnvironmentVariable("BALLISTIC_DX12_OIDN_TIMING") == "1";
+            }
+            if (!ssgiOidnTried) { ssgiOidnTried = true; ssgiOidn = new Dx12OidnDenoiser(dev.AdapterLuidBytes); }
             if (ssgiOidn != null && ssgiOidn.Valid) {
-                int w = ssgiTarget.Width, h = ssgiTarget.Height, n = w * h * 3;
-                if (ssgiCpuColor == null || ssgiCpuColor.Length != n) { ssgiCpuColor = new float[n]; ssgiCpuOut = new float[n]; }
-                histWrite.ReadColorRgb(ssgiCpuColor);
-                if (ssgiOidn.DenoiseHdr(ssgiCpuColor, null, null, ssgiCpuOut, w, h)) {
-                    ssgiDenoised.WriteColorRgb(ssgiCpuOut);   // leaves ssgiDenoised in PixelShaderResource
-                    giForCombine = ssgiDenoised;
+                int w = ssgiTarget.Width, h = ssgiTarget.Height;
+                bool usedZeroCopy = false;
+                if (ssgiOidnTiming) ssgiOidnSw.Restart();
+                // Zero-copy GPU denoise (no CPU round-trip): pack the GI texture into a shared FLOAT buffer on
+                // the GPU, OIDN denoises it in place on the GPU, unpack back — float precision, ~12x faster.
+                if (ssgiOidn.SharedCapable && !ssgiSharedFailed && !ssgiOidnForceReadback) {
+                    if (ssgiOidnGpu == null) ssgiOidnGpu = new Dx12OidnGpuPath(dev);
+                    if (ssgiOidnGpu.Ensure(ssgiOidn, ssgiDenoised.RenderTarget, w, h)) {
+                        histWrite.ColorToNonPixelShaderResource();   // GI texture as a compute SRV
+                        ssgiDenoised.ColorToUnorderedAccess();        // denoise target as a compute UAV
+                        ssgiOidnGpu.Pack(histWrite.ColorSrvCpu);      // GPU: texture -> shared float buf
+                        if (ssgiOidn.ExecuteShared()) {               // GPU: OIDN denoise in place
+                            ssgiOidnGpu.Unpack();                     // GPU: shared float buf -> texture
+                            ssgiDenoised.ColorToShaderResource();     // for the combine
+                            giForCombine = ssgiDenoised; usedZeroCopy = true;
+                        } else { ssgiSharedFailed = true; }           // HIP execute failed → readback from now on
+                    } else { ssgiSharedFailed = true; }               // import failed → readback from now on
+                }
+                // CPU readback fallback (shared path unavailable/failed/forced off this frame).
+                if (ReferenceEquals(giForCombine, histWrite)) {
+                    int n = w * h * 3;
+                    if (ssgiCpuColor == null || ssgiCpuColor.Length != n) { ssgiCpuColor = new float[n]; ssgiCpuOut = new float[n]; }
+                    histWrite.ReadColorRgb(ssgiCpuColor);
+                    if (ssgiOidn.DenoiseHdr(ssgiCpuColor, null, null, ssgiCpuOut, w, h)) {
+                        ssgiDenoised.WriteColorRgb(ssgiCpuOut);   // leaves ssgiDenoised in PixelShaderResource
+                        giForCombine = ssgiDenoised;
+                    }
+                }
+                if (ssgiOidnTiming && !ReferenceEquals(giForCombine, histWrite)) {
+                    ssgiOidnSw.Stop();
+                    ssgiOidnAccumMs += ssgiOidnSw.Elapsed.TotalMilliseconds; ssgiOidnAccumFrames++;
+                    if (ssgiOidnAccumFrames % 30 == 0)
+                        Console.WriteLine($"[OIDN] denoise avg {ssgiOidnAccumMs / ssgiOidnAccumFrames:F2}ms/frame over {ssgiOidnAccumFrames} ({(usedZeroCopy ? "ZERO-COPY" : "READBACK")})");
                 }
             }
         }

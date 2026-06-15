@@ -18,6 +18,9 @@ namespace BallisticEngine.DX12;
 public sealed class Dx12Device : IDisposable {
     public ID3D12Device2 Device { get; }
     public ID3D12CommandQueue Queue { get; }
+    // The 8-byte LUID of the adapter the device was created on (DXGI AdapterDesc1.AdapterLuid as raw bytes).
+    // Lets OIDN create a HIP device on the SAME physical GPU (oidnNewDeviceByLUID) for zero-copy buffer sharing.
+    public byte[] AdapterLuidBytes { get; }
 
     readonly ID3D12CommandAllocator allocator;
     readonly ID3D12GraphicsCommandList4 commandList; // 4 = supports DXR DispatchRays later
@@ -47,6 +50,9 @@ public sealed class Dx12Device : IDisposable {
         IDXGIAdapter1 adapter = PickHardwareAdapter(factory);
         Device = D3D12CreateDevice<ID3D12Device2>(adapter, FeatureLevel.Level_12_0);
         adapter.Dispose();
+        // The adapter LUID as raw 8 bytes (little-endian) for OIDN HIP device matching (oidnNewDeviceByLUID).
+        // ID3D12Device.AdapterLuid is the 64-bit LUID; its byte layout IS the native LUID struct.
+        AdapterLuidBytes = BitConverter.GetBytes(Device.AdapterLuid);
 
         Queue = Device.CreateCommandQueue(new CommandQueueDescription(CommandListType.Direct));
         allocator = Device.CreateCommandAllocator(CommandListType.Direct);

@@ -181,6 +181,10 @@ public sealed class Dx12OffscreenTarget : IDisposable {
     public void ColorToRenderTarget() {
         dev.ExecuteSync(cl => TransitionTo(cl, ResourceStates.RenderTarget));
     }
+    // For a COMPUTE shader to read the color as an SRV (e.g. the OIDN GPU pack reads the GI texture).
+    public void ColorToNonPixelShaderResource() {
+        dev.ExecuteSync(cl => TransitionTo(cl, ResourceStates.NonPixelShaderResource));
+    }
     // For a UAV-capable target a compute pass writes (FSR output). Created with allowUav.
     public void ColorToUnorderedAccess() {
         dev.ExecuteSync(cl => TransitionTo(cl, ResourceStates.UnorderedAccess));
@@ -266,6 +270,11 @@ public sealed class Dx12OffscreenTarget : IDisposable {
     // converting half->float. For the OIDN denoise round-trip (D3D12 texture -> host -> OIDN). Restores the
     // target to RenderTarget after. Slow (blocking readback) — the zero-copy D3D12<->HIP path is the perf
     // follow-up. Assumes the R16G16B16A16_Float format (8 bytes/pixel).
+    // Cached readback/upload heaps — CreateCommittedResource on a readback/upload heap every frame was a
+    // dominant cost of the OIDN host round-trip; reuse one buffer of each per target (recreated on resize).
+    ID3D12Resource cachedReadback, cachedUpload;
+    ulong cachedReadbackBytes, cachedUploadBytes;
+
     public unsafe void ReadColorRgb(float[] dst) {
         var footprints = new PlacedSubresourceFootPrint[1];
         var rowCounts = new uint[1]; var rowSizes = new ulong[1];
@@ -273,9 +282,14 @@ public sealed class Dx12OffscreenTarget : IDisposable {
             footprints, rowCounts, rowSizes, out ulong totalBytes);
         PlacedSubresourceFootPrint fp = footprints[0];
         int rowPitch = (int)fp.Footprint.RowPitch;
-        using ID3D12Resource readback = dev.Device.CreateCommittedResource(
-            HeapProperties.ReadbackHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
+        if (cachedReadback == null || cachedReadbackBytes != totalBytes) {
+            cachedReadback?.Dispose();
+            cachedReadback = dev.Device.CreateCommittedResource(
+                HeapProperties.ReadbackHeapProperties, HeapFlags.None,
+                ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
+            cachedReadbackBytes = totalBytes;
+        }
+        ID3D12Resource readback = cachedReadback;
         dev.ExecuteSync(cl => {
             TransitionTo(cl, ResourceStates.CopySource);
             cl.CopyTextureRegion(new TextureCopyLocation(readback, fp), 0, 0, 0,
@@ -307,9 +321,14 @@ public sealed class Dx12OffscreenTarget : IDisposable {
             footprints, rowCounts, rowSizes, out ulong totalBytes);
         PlacedSubresourceFootPrint fp = footprints[0];
         int rowPitch = (int)fp.Footprint.RowPitch;
-        using ID3D12Resource upload = dev.Device.CreateCommittedResource(
-            HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer(totalBytes), ResourceStates.GenericRead);
+        if (cachedUpload == null || cachedUploadBytes != totalBytes) {
+            cachedUpload?.Dispose();
+            cachedUpload = dev.Device.CreateCommittedResource(
+                HeapProperties.UploadHeapProperties, HeapFlags.None,
+                ResourceDescription.Buffer(totalBytes), ResourceStates.GenericRead);
+            cachedUploadBytes = totalBytes;
+        }
+        ID3D12Resource upload = cachedUpload;
         byte* mapped = upload.Map<byte>(0);
         int w = Width, h = Height;
         Half one = (Half)1f;
@@ -368,6 +387,8 @@ public sealed class Dx12OffscreenTarget : IDisposable {
     }
 
     public void Dispose() {
+        cachedReadback?.Dispose();
+        cachedUpload?.Dispose();
         dsvHeap?.Dispose();
         depthTarget?.Dispose();
         rtvHeap.Dispose();
