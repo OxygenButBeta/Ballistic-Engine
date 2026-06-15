@@ -161,6 +161,18 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         });
     }
 
+    // Copy another same-size/format target's color into THIS target's color (e.g. SSR combine wrote to a
+    // scratch, copy it back so the rest of the pipeline keeps reading this target). Handles transitions.
+    public void CopyColorFrom(Dx12OffscreenTarget src) {
+        dev.ExecuteSync(cl => {
+            TransitionTo(cl, ResourceStates.CopyDest);
+            src.TransitionTo(cl, ResourceStates.CopySource);
+            cl.CopyResource(RenderTarget, src.RenderTarget);
+            TransitionTo(cl, ResourceStates.RenderTarget);
+            src.TransitionTo(cl, ResourceStates.RenderTarget);
+        });
+    }
+
     // Color state transitions: the composite reads the HDR scene color as an SRV.
     public void ColorToShaderResource() {
         dev.ExecuteSync(cl => TransitionTo(cl, ResourceStates.PixelShaderResource));
