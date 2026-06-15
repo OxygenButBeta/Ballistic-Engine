@@ -70,7 +70,6 @@ public sealed class HeadlessRuntime : IBallisticEngineRuntime {
     sealed class NullRenderAsset : RenderAsset {
         public NullRenderAsset() => Current = this;
 
-        public override bool InstancedDrawing => false;
         public override HDRenderer Renderer { get => null; protected set { } }
         public override void Initialize() { }
         public override RenderContext CreateRenderContext() => new NullRenderContext();

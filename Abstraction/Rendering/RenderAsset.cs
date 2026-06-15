@@ -4,7 +4,6 @@ using OpenTK.Mathematics;
 public abstract class RenderAsset
 {
     public static RenderAsset Current { get; protected set; }
-    public abstract bool InstancedDrawing { get; }
     public abstract HDRenderer Renderer { get; protected set; }
     public abstract void Initialize();
     public abstract RenderContext CreateRenderContext();

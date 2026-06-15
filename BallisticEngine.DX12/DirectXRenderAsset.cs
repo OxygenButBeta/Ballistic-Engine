@@ -10,9 +10,6 @@ namespace BallisticEngine;
 //
 // Full-DX strategy: this is THE backend going forward (GL is being retired), not a side-by-side peer.
 public sealed class DirectXRenderAsset : RenderAsset {
-    // Per-submesh draws for Phase 2d (instancing comes online with the instanced opaque path later);
-    // matches OpenGLRenderAsset's staged rollout (it also reports false).
-    public override bool InstancedDrawing => false;
     public override HDRenderer Renderer { get; protected set; }
 
     Dx12Device device;

@@ -3,7 +3,6 @@ using BallisticEngine.OpenGL;
 using OpenTK.Mathematics;
 
 public sealed class OpenGLRenderAsset : RenderAsset {
-    public override bool InstancedDrawing => false;
     public override HDRenderer Renderer { get; protected set; }
 
     public override void Initialize() {
