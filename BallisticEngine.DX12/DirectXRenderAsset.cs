@@ -52,6 +52,12 @@ public sealed class DirectXRenderAsset : RenderAsset {
             bool pass = DX12.Dx12DxrProbe.SelfTest(device);
             Environment.Exit(pass ? 0 : 1);
         }
+        // GpuSceneQuery self-test door (BALLISTIC_DX12_SCENEQUERY_TEST=1): builds a known box AS and verifies
+        // the inline-RayQuery occupancy/visibility/classify primitives + determinism against ground truth.
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_SCENEQUERY_TEST") == "1") {
+            bool pass = DX12.Dx12SceneQueryProbe.SelfTest(device);
+            Environment.Exit(pass ? 0 : 1);
+        }
 
         Renderer = new DX12HDRenderer(device);
         Renderer.Initialize();

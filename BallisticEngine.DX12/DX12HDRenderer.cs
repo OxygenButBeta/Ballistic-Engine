@@ -427,6 +427,11 @@ public sealed class DX12HDRenderer : HDRenderer {
     public ID3D12Resource DisplayResource => ldr?.RenderTarget;
     public int DisplayWidth => outputW;
     public int DisplayHeight => outputH;
+
+    // Spatial-query substrate (the AI agent's "eyes"): a GpuSceneQuery over the scene TLAS. Created on
+    // demand (not per-frame) — the headless `bal query` path + the editor live-query surface use it. Owns
+    // its OWN Dx12SceneAS so queries work with RT render effects off. See GpuSceneQuery / the proposal doc.
+    public GpuSceneQuery CreateSceneQuery() => new GpuSceneQuery(dev);
     // DX12 textures are top-down → the editor must NOT flip V (unlike GL's bottom-up textures).
     public override bool DisplayTextureTopDown => true;
 

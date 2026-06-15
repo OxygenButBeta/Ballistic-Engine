@@ -52,6 +52,37 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
                 if (ScreenshotExit) return;
             }
         }
+
+        // GpuSceneQuery real-scene smoke probe (BALLISTIC_DX12_SCENEQUERY_SMOKE="x,y,z;x,y,z;..."): after the
+        // scene has rendered (the AS-feeding RuntimeSet<IStaticMeshRenderer> is populated), build a
+        // GpuSceneQuery over the REAL scene TLAS and print occupancy + classify for each given world point.
+        // Validates the production AS-from-renderers path that the self-test door (synthetic box) can't.
+        SceneQuerySmoke();
+    }
+
+    static void SceneQuerySmoke() {
+        string spec = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SCENEQUERY_SMOKE");
+        if (string.IsNullOrWhiteSpace(spec)) return;
+        if (RenderAsset.Current.Renderer is not DX12HDRenderer r) return;
+
+        var pts = new List<Vector3>();
+        foreach (string tok in spec.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)) {
+            string[] c = tok.Split(',');
+            if (c.Length == 3
+                && float.TryParse(c[0], System.Globalization.CultureInfo.InvariantCulture, out float x)
+                && float.TryParse(c[1], System.Globalization.CultureInfo.InvariantCulture, out float y)
+                && float.TryParse(c[2], System.Globalization.CultureInfo.InvariantCulture, out float z))
+                pts.Add(new Vector3(x, y, z));
+        }
+        if (pts.Count == 0) { Console.WriteLine("[SceneQuerySmoke] no valid points in spec"); return; }
+
+        using DX12.GpuSceneQuery q = r.CreateSceneQuery();
+        bool[] occ = q.OccupancyAt(pts);
+        DX12.GpuSceneQuery.SpaceClass[] cls = q.ClassifySpace(pts);
+        Console.WriteLine($"[SceneQuerySmoke] available={q.Available} renderers populated, {pts.Count} points:");
+        for (int i = 0; i < pts.Count; i++)
+            Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                $"  ({pts[i].X:0.##},{pts[i].Y:0.##},{pts[i].Z:0.##}) -> occupied={occ[i]} class={cls[i]}"));
     }
 
     void SaveScreenshot() {
