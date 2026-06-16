@@ -180,6 +180,12 @@ public static class Physics {
             foreach (Rigidbody rigidbody in RuntimeSet<Rigidbody>.ReadOnlyCollection)
                 rigidbody.PrePhysicsStep(FixedTimestep);
 
+            // Standalone (Rigidbody-less) colliders teleport their static body to follow any runtime
+            // transform edit (gizmo/inspector/script) so moving level geometry at play time actually
+            // moves its collision. No-op for colliders that are part of a Rigidbody compound.
+            foreach (Collider collider in RuntimeSet<Collider>.ReadOnlyCollection)
+                collider.SyncStaticBodyToTransform();
+
             World.Step(FixedTimestep);
 
             foreach (Rigidbody rigidbody in RuntimeSet<Rigidbody>.ReadOnlyCollection)
