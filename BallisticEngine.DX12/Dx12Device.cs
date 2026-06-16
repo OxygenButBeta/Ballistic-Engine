@@ -40,15 +40,46 @@ public sealed class Dx12Device : IDisposable {
     // frame into, submitted ONCE at EndFrame (vs the legacy ~40 ExecuteSync→WaitForGpu full GPU flushes, one
     // per pass + per transition). Dedicated objects (not the shared `commandList`) so a concurrent worker-thread
     // ExecuteSync (e.g. a cubemap upload) using the shared list can never corrupt the open frame list and vice
-    // versa — both submit to the one Queue, which serializes execution. P0a keeps a single WaitForGpu at
-    // EndFrame (no overlap yet); P0b N-buffers these for CPU↔GPU overlap. While a frame is open, ExecuteSync
+    // versa — both submit to the one Queue, which serializes execution. While a frame is open, ExecuteSync
     // calls ON THE FRAME-OWNING THREAD record into frameList instead of submitting; off-thread/no-frame calls
     // take the legacy synchronous path. Disabled by BALLISTIC_DX12_PIPELINED=0 (legacy per-call submit+wait).
-    readonly ID3D12CommandAllocator frameAllocator;
-    readonly ID3D12GraphicsCommandList4 frameList;
+    //
+    // P0b — FRAME-IN-FLIGHT OVERLAP: the frame ALLOCATOR is N-buffered (frameAllocators[FramesInFlight]) and
+    // EndFrame SIGNALS a dedicated frameFence instead of WaitForGpu, so the CPU records frame N+1 while the GPU
+    // still renders frame N (real CPU↔GPU overlap, unlocked once P0c stops the present from full-Flush'ing).
+    // BeginFrame advances `frameSlot` round-robin and waits ONLY for the frame that last used that slot
+    // (FramesInFlight frames ago — already done in steady state) before reusing its allocator. `frameSlot` is
+    // ALSO the index every per-frame CPU-mapped upload buffer + shader-visible descriptor heap offsets into
+    // (FrameSlot, read by Dx12DescriptorHeap + the renderer's CB writes) so the CPU never stomps data the GPU
+    // is still reading from frame N. DEFAULT-heap GPU-only resources (cull UAVs, indirect command buffers) need
+    // NO N-buffering: the single command queue executes serially, so frame N's reads of them complete before
+    // frame N+1's command list begins. Only the CPU-written-ahead uploads + descriptor copies are hazards.
+    // The SEPARATE frameFence (not the shared `fence`) keeps the per-slot completion targets from being
+    // perturbed by interleaved ExecuteSyncImmediate/ExecuteUpload WaitForGpu increments. When pipelining is OFF
+    // (BALLISTIC_DX12_PIPELINED=0) FramesInFlight==1, BeginFrame uses slot 0 always, and EndFrame waits — so
+    // the whole P0b machinery collapses to the P0a single-slot single-wait path (byte-identical fallback).
+    const int MaxFramesInFlight = 3;
+    readonly ID3D12CommandAllocator[] frameAllocators;   // [FramesInFlight] round-robin per frame
+    readonly ID3D12GraphicsCommandList4 frameList;       // one list object (reset each BeginFrame; only the allocator is N-buffered)
+    readonly ID3D12Fence frameFence;                     // SEPARATE from `fence`: per-slot frame-completion targets
+    ulong frameFenceValue;
+    readonly ulong[] frameFenceTargets;                  // [FramesInFlight] the frameFence value the GPU reaches when that slot's frame is done
+    readonly System.Threading.AutoResetEvent frameFenceEvent = new(false);
+    int frameSlot;                  // 0..FramesInFlight-1, advanced each BeginFrame; the per-frame upload/heap index
     bool frameOpen;                 // a frame is recording into frameList (set by BeginFrame, cleared by EndFrame)
     int frameThreadId;              // only this thread's ExecuteSync calls redirect into frameList
     readonly bool pipelinedFrames;  // BALLISTIC_DX12_PIPELINED != "0" (default ON)
+
+    // The number of frames the CPU may run ahead of the GPU = the multiplier for every per-frame CPU-mapped
+    // upload buffer + shader-visible descriptor heap. 1 when pipelining is off (P0a fallback). Read by the
+    // renderer (CB allocation) and Dx12DescriptorHeap (capacity * FramesInFlight) so a single knob N-buffers
+    // everything consistently. P0b ships N=2 (CPU at most one frame ahead through the present); MaxFramesInFlight
+    // is 3 so bumping to N=3 after P0c proves the CPU outruns the GPU by >1 frame is a one-line change.
+    public int FramesInFlight { get; }
+
+    // The current frame's slot (0..FramesInFlight-1). Frozen for the WHOLE frame (advances only in BeginFrame),
+    // so every per-frame CPU write between BeginFrame and EndFrame lands in the same slab the GPU will read.
+    public int FrameSlot => frameSlot;
 
     // SEPARATE upload allocator/list/fence so asset uploads (textures, buffers) never share command-list
     // state with the per-frame render path. Sharing one list between BeginRender's ExecuteSync and the
@@ -115,13 +146,20 @@ public sealed class Dx12Device : IDisposable {
         uploadList.Close();
         uploadFence = Device.CreateFence(0, FenceFlags.None);
 
-        // P0a frame list (see field comment). Created OPEN like the others → close so the first BeginFrame
-        // Reset is uniform. Submitted on the shared render `fence` (one queue, one wait at EndFrame).
-        frameAllocator = Device.CreateCommandAllocator(CommandListType.Direct);
-        frameList = Device.CreateCommandList<ID3D12GraphicsCommandList4>(
-            CommandListType.Direct, frameAllocator, null);
-        frameList.Close();
+        // P0a/P0b frame list + N-buffered allocators (see field comment). FramesInFlight = N when pipelining is
+        // on (default 2 — the CPU runs at most one frame ahead through the present; bump to 3 after P0c), else 1
+        // (the P0a single-slot fallback). The list is created OPEN like the others → close so the first BeginFrame
+        // Reset is uniform. EndFrame submits on the dedicated `frameFence` (signal-not-wait when pipelining).
         pipelinedFrames = Environment.GetEnvironmentVariable("BALLISTIC_DX12_PIPELINED") != "0";
+        FramesInFlight = pipelinedFrames ? 2 : 1;   // P0b N=2; raise to 3 (≤ MaxFramesInFlight) post-P0c if the CPU outruns the GPU by >1 frame
+        frameAllocators = new ID3D12CommandAllocator[FramesInFlight];
+        for (int i = 0; i < FramesInFlight; i++)
+            frameAllocators[i] = Device.CreateCommandAllocator(CommandListType.Direct);
+        frameList = Device.CreateCommandList<ID3D12GraphicsCommandList4>(
+            CommandListType.Direct, frameAllocators[0], null);
+        frameList.Close();
+        frameFence = Device.CreateFence(0, FenceFlags.None);
+        frameFenceTargets = new ulong[FramesInFlight];   // all 0 → the first N BeginFrames never wait (slots fresh)
 
         // Debug info queue (if the debug layer loaded): lets us print the REAL D3D12 message text on an
         // E_FAIL instead of the opaque HRESULT. Stored-message log only; no break-on-error.
@@ -201,29 +239,54 @@ public sealed class Dx12Device : IDisposable {
         }
     }
 
-    // P0a — open the per-frame command list. Subsequent ExecuteSync calls on THIS thread record into it
-    // instead of submitting. No-op (legacy per-pass submit) when BALLISTIC_DX12_PIPELINED=0. The GPU is idle
-    // here (EndFrame waited last frame; first frame the lists are freshly closed), so resetting the allocator
-    // is safe. Must be paired with EndFrame; nesting is not supported (one frame in flight in P0a).
+    // P0a/P0b — open the per-frame command list on the next round-robin slot. Subsequent ExecuteSync calls on
+    // THIS thread record into it instead of submitting. No-op (legacy per-pass submit) when
+    // BALLISTIC_DX12_PIPELINED=0. P0b: advance `frameSlot`, then WAIT for the frame that last used this slot
+    // (FramesInFlight frames ago — already finished in steady state; target 0 the first N frames → no wait)
+    // before resetting its allocator, so the GPU isn't still reading commands out of memory we're about to
+    // recycle. At FramesInFlight==1 this reduces to "wait for the single previous frame", i.e. the P0a behaviour
+    // (EndFrame already signalled it). frameSlot advances ONLY here, so it's frozen for the whole frame — every
+    // per-frame CPU-mapped upload + descriptor copy this frame indexes the same slab the GPU will read. Must be
+    // paired with EndFrame; nesting is not supported (the slot would advance mid-frame).
     public void BeginFrame() {
         if (!pipelinedFrames || frameOpen) return;
-        frameAllocator.Reset();
-        frameList.Reset(frameAllocator, null);
+        frameSlot = (frameSlot + 1) % FramesInFlight;
+        WaitFrameFence(frameFenceTargets[frameSlot]);   // the GPU finished the frame that last used this allocator
+        frameAllocators[frameSlot].Reset();
+        frameList.Reset(frameAllocators[frameSlot], null);
         frameThreadId = Environment.CurrentManagedThreadId;
         frameOpen = true;
     }
 
-    // P0a — close, submit ONCE, and wait for the whole recorded frame. (P0b will drop the wait for CPU↔GPU
-    // overlap via N-buffered allocators/fences.) Safe to call when no frame is open (no-op). Returns true if
-    // a frame was actually submitted (so the caller knows the legacy per-pass path was bypassed).
+    // P0a/P0b — close + submit the recorded frame ONCE. P0b: SIGNAL the dedicated frameFence (record the value
+    // this slot's frame will reach) and RETURN — no WaitForGpu, so the CPU can immediately start recording the
+    // next frame while the GPU drains this one (real overlap, once P0c stops the present from full-Flush'ing).
+    // At FramesInFlight==1 we additionally WAIT (collapses to the P0a single-submit single-wait frame — the
+    // byte-identical fallback). Safe to call when no frame is open (no-op). Returns true if a frame was submitted.
     public bool EndFrame() {
         if (!frameOpen) return false;
         frameOpen = false;
         frameList.Close();
         Queue.ExecuteCommandList(frameList);
-        WaitForGpu();
+        ulong target = ++frameFenceValue;
+        Queue.Signal(frameFence, target);
+        frameFenceTargets[frameSlot] = target;
+        if (FramesInFlight == 1) WaitFrameFence(target);   // P0a fallback: no overlap, drain before returning
         return true;
     }
+
+    // Block until the GPU has signalled frameFence to at least `target`. Used by BeginFrame (per-slot recycle
+    // gate), the FramesInFlight==1 EndFrame, and Flush (so a swapchain resize/present sees the frame drained).
+    void WaitFrameFence(ulong target) {
+        if (target == 0 || frameFence.CompletedValue >= target) return;
+        frameFence.SetEventOnCompletion(target, frameFenceEvent.SafeWaitHandle.DangerousGetHandle());
+        frameFenceEvent.WaitOne();
+    }
+
+    // The latest submitted frame's completion target — Flush()/swapchain present wait on this so an overlapped
+    // frame (signalled only on frameFence, not the shared `fence`) is fully drained before ResizeBuffers/Present.
+    public ulong LastFrameFenceTarget => frameFenceValue;
+    public void WaitForFrame(ulong target) => WaitFrameFence(target);
 
     // P0a — true while a pipelined frame is recording on the current thread (passes can branch on it if they
     // must do a real GPU round-trip mid-frame; readbacks use ExecuteSyncImmediate which handles this).
@@ -252,9 +315,14 @@ public sealed class Dx12Device : IDisposable {
             Queue.ExecuteCommandList(commandList);
             WaitForGpu();
         }
-        if (reopen) {   // continue recording the rest of the frame into a fresh segment
-            frameAllocator.Reset();
-            frameList.Reset(frameAllocator, null);
+        if (reopen) {   // continue recording the rest of the frame into a fresh segment ON THE SAME SLOT
+            // The pre-flush segment was submitted AND waited (WaitForGpu above), so the GPU is done reading
+            // this slot's allocator → resetting it is safe. The slot does NOT advance (advancing mid-frame
+            // would split one logical frame across two upload/descriptor slabs — the post-flush passes would
+            // read a different slot than the pre-flush passes wrote). Per-frame mapped uploads + descriptors
+            // already written this frame stay valid (only the command allocator is reset, not the upload heaps).
+            frameAllocators[frameSlot].Reset();
+            frameList.Reset(frameAllocators[frameSlot], null);
             frameOpen = true;
         }
     }
@@ -305,6 +373,11 @@ public sealed class Dx12Device : IDisposable {
         lock (submitGate)
             lock (uploadGate) {
                 WaitForGpu();
+                // P0b: an overlapped frame is signalled ONLY on frameFence (EndFrame no longer advances the
+                // shared `fence`), so WaitForGpu alone would let Flush return while a frame submit is still in
+                // flight on the GPU — ResizeBuffers/present would then free/reuse backbuffers under an active
+                // read. Drain the latest frame too. (No-op when no frame ran or it already completed.)
+                WaitFrameFence(frameFenceValue);
                 ulong uTarget = ++uploadFenceValue;
                 Queue.Signal(uploadFence, uTarget);
                 if (uploadFence.CompletedValue < uTarget) {
@@ -396,10 +469,13 @@ public sealed class Dx12Device : IDisposable {
 
     public void Dispose() {
         WaitForGpu();
+        WaitFrameFence(frameFenceValue);   // P0b: drain any overlapped frame (signalled only on frameFence)
         fenceEvent.Dispose();
         fence.Dispose();
+        frameFenceEvent.Dispose();
+        frameFence.Dispose();
         frameList.Dispose();
-        frameAllocator.Dispose();
+        foreach (var a in frameAllocators) a.Dispose();
         commandList.Dispose();
         allocator.Dispose();
         uploadEvent.Dispose();
