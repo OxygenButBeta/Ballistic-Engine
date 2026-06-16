@@ -218,14 +218,19 @@ public sealed class DX12HDRenderer : HDRenderer {
     bool? ddgiOn;
     bool DdgiEnabled => ddgiOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI") == "1";
 
-    // Phase 4: screen-space radiance probes (final gather). When on (AND DDGI is on — the screen-probe rays
-    // hand off to the DDGI world cache for the far field), the per-pixel DDGI gather is REPLACED by a
-    // downsampled screen-probe gather (Place→Trace→Blend→Integrate). BALLISTIC_DX12_SCREENPROBE=1; byte-
-    // identical off (the DDGI gather path is unchanged when this is off). P4.0: uniform rays + naive upsample.
+    // Phase 4: screen-space radiance probes (final gather). When DDGI is on, the screen-probe gather
+    // (Place→Trace→Blend→Integrate, bilateral-upsampled, miss → DDGI world cache) is the DEFAULT near/mid-field
+    // GI source — DDGI is the far-field cache. This is the published Lumen screen-trace → world-cache hierarchy.
+    // Phase 4 is hardened (bilateral + deterministic + budgeted + measured LESS noisy than the per-pixel DDGI
+    // gather), so it is now PRIMARY (2026-06-16 flip). THREE-STATE door: unset / "1" → screen probes (default);
+    // ONLY "0" → the per-pixel DDGI gather fallback. SCREENPROBE=0 reproduces the exact pre-flip DDGI-gather
+    // image (the byte-identical regression oracle). DDGI-on only — with DDGI off this path is untouched (the
+    // screen-probe trace needs the DDGI field for its far-field ray-miss handoff). P4.0: uniform rays + naive
+    // upsample; P4.1: bilateral integrate + E→L energy fix; P4.3: determinism + budget.
     Dx12ScreenProbe screenProbe;
     bool screenProbeLogged;
     bool? screenProbeOn;
-    bool ScreenProbeEnabled => screenProbeOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_SCREENPROBE") == "1";
+    bool ScreenProbeEnabled => screenProbeOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_SCREENPROBE") != "0";
     bool rtGiBuilt;
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct RtGiConstants { public Matrix4x4 InvViewProj; public Matrix4x4 ViewProj; public Vector4 Params; }  // preExp, rayLength, _, frameIdx
@@ -2618,13 +2623,14 @@ public sealed class DX12HDRenderer : HDRenderer {
             // The compute gather/place reads depth as SRV t0 → NON_PIXEL state (shared by both GI sources below).
             gbuffer.DepthToNonPixelShaderResource();
 
-            // --- PHASE 4: screen-space radiance probes (BALLISTIC_DX12_SCREENPROBE=1). REPLACES the per-pixel
-            // DDGI gather with a DOWNSAMPLED screen-probe final gather: Place (one probe per 16x16 tile, snapped
-            // to the G-buffer surface) → Trace (64 short hemisphere rays, miss → DDGI field) → Blend (rays →
-            // octahedral radiance tile) → Integrate (nearest-probe upsample → ssgiTarget). The screen probes are
-            // the near/mid field; the DDGI cache we just updated is the far field (the trace's ray-miss handoff).
-            // Same ssgiTarget contract → the shared resolve composites it (and GI-isolate shows it). The DDGI
-            // gather below is the fallback when this is off (byte-identical-off). ---
+            // --- PHASE 4: screen-space radiance probes (DEFAULT when DDGI is on; BALLISTIC_DX12_SCREENPROBE=0
+            // opts out to the per-pixel DDGI gather below). Runs a DOWNSAMPLED screen-probe final gather: Place
+            // (one probe per 16x16 tile, snapped to the G-buffer surface) → Trace (64 short hemisphere rays,
+            // miss → DDGI field) → Blend (rays → octahedral radiance tile) → Integrate (bilateral 2x2-probe
+            // upsample → ssgiTarget). The screen probes are the near/mid field; the DDGI cache we just updated is
+            // the far field (the trace's ray-miss handoff) — the published Lumen screen-trace → world-cache
+            // hierarchy. Same ssgiTarget contract → the shared resolve composites it (and GI-isolate shows it).
+            // The DDGI gather below is the SCREENPROBE=0 fallback (reproduces the pre-flip image byte-for-byte). ---
             if (ScreenProbeEnabled) {
                 DrawScreenProbeGather(invVP);
                 SsgiResolveAndCombine();

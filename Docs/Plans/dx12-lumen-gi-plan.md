@@ -131,7 +131,8 @@ deleted — commit 1b0485ad.)
 - Downsampled screen probes (1 per 16x16 tile, 8x8 octahedral radiance, 64 cosine-hemisphere rays), bilateral
   depth+normal upsample to full-res, instead of per-pixel 1-spp rays. The screen probes are the near/mid field;
   on ray miss they hand off to the DDGI world cache (P2) — Lumen's screen-trace -> world-cache hierarchy. So
-  Phase 4 sits IN FRONT of DDGI, not replacing it. Behind BALLISTIC_DX12_SCREENPROBE=1 (requires DDGI on).
+  Phase 4 sits IN FRONT of DDGI, not replacing it. NOW THE DEFAULT GI gather when DDGI is on (PRIMARY flip
+  2026-06-16); BALLISTIC_DX12_SCREENPROBE=0 opts out to the per-pixel DDGI gather (the byte-identical fallback).
 - Sub-phases: P4.0 Place+Trace(uniform,miss->DDGI)+Blend+naive upsample (34559588) -> P4.1 bilateral
   depth+normal integrate (kills 16x16 blockiness + silhouette halos) + far-field E->L=E/PI energy fix (2e5ddfaa)
   -> P4.3 determinism wiring + 1660 budget lock (1ef182c6).
@@ -147,8 +148,16 @@ deleted — commit 1b0485ad.)
   scene ever demands it.
 - VERIFIED: noise drops vs per-pixel (above); perf 0.63ms (cheaper, amortised); detail preserved on bilateral
   upsample (SunTemple isolate smooth, per-surface detail, no halos); Bistro leak test PASS; determinism SHA256
-  frame-independent. DECISION (user): screen-probe-PRIMARY flip DEFERRED until Phase 4 hardened (now is — but
-  kept opt-in pending the user's go); DDGI-gather stays the default look meanwhile.
+  frame-independent.
+- **PRIMARY FLIP DONE & VERIFIED (2026-06-16).** Screen probes are now the DEFAULT near/mid-field GI gather
+  when DDGI is on (DDGI = the far-field cache); the per-pixel DDGI gather is the BALLISTIC_DX12_SCREENPROBE=0
+  fallback. One-line three-state flip (ScreenProbeEnabled: `!= "0"`) + comments — no new GPU resources/barriers/
+  shaders. **BYTE-IDENTICAL-OFF PROVEN: SCREENPROBE=0 SHA256 == the pre-flip HEAD default, bit-for-bit**
+  (3A9506C0...). A/B (paused f24, RX 9070 XT, DRED on, 4 clean launches no removal/hang): SunTemple GI-isolate
+  default 30.7 (smooth, per-surface detail — floor mosaic/column capitals/statue folds, red-pedestal bleed)
+  vs DDGI-gather fallback 21.7 (flatter, coarse-grid fill) -> the screen-probe look is strictly richer. Bistro
+  interior LEAK TEST PASS (99.8% near-black, bounce contained, no wall bleed, mean 3.4 == fallback). Audit
+  wf_5cb47cb8 GO (3/3, 0 blockers; byte-identical-off oracle + barrier brackets + handoff re-verified).
 
 **Phase 5 — World radiance cache (far-field stability).**
 - DDGI-style world-space irradiance probes (auto-placed via the GpuSceneQuery substrate — invisible,

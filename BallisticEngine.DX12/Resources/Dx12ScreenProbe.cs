@@ -15,10 +15,11 @@ namespace BallisticEngine.DX12;
 // off to the DDGI world cache (the far-field radiance) — exactly Lumen's screen-trace -> world-cache hierarchy.
 // So this work sits IN FRONT of the DDGI cache we already built (P2): screen probes = near/mid, DDGI = far.
 //
-// P4.0 (this cut): Place -> Trace (uniform cosine-hemisphere rays, miss->DDGI) -> Blend (rays -> octahedral
-// tile + border) -> Integrate (NAIVE nearest-probe upsample -> ssgiTarget). Importance sampling (P4.2) and the
-// bilateral depth+normal upsample (P4.1) are later sub-phases. Gated behind BALLISTIC_DX12_SCREENPROBE=1; the
-// renderer falls back to the per-pixel DDGI gather when it's off, so this is byte-identical-off.
+// Pipeline: Place -> Trace (cosine-hemisphere rays = diffuse-BRDF importance sample, miss->DDGI) -> Blend
+// (rays -> octahedral tile + border) -> Integrate (BILATERAL 2x2-probe depth+normal upsample -> ssgiTarget).
+// Phase 4 COMPLETE (P4.0 place/trace/blend, P4.1 bilateral + E->L energy fix, P4.3 determinism+budget; P4.2
+// importance resolved by measurement). This is now the DEFAULT GI gather when DDGI is on; BALLISTIC_DX12_
+// SCREENPROBE=0 opts out to the per-pixel DDGI gather (which reproduces the pre-flip image byte-for-byte).
 //
 // The probe grid + atlas are RESIZE-AWARE (sized from the render resolution like the SSGI targets). All compute
 // passes run as their own ExecuteSync (each DX12 pass = its own submit), so each can be GPU-timed separately.
@@ -181,8 +182,8 @@ public sealed class Dx12ScreenProbe : IDisposable {
     }
 
     // ---- The full Phase-4 dispatch (Place -> Trace -> Blend -> Integrate). Called by the renderer inside
-    // DrawRtGi when BALLISTIC_DX12_SCREENPROBE=1 AND DDGI is on (the screen-probe rays need the DDGI field for
-    // the far-field handoff). All the bindless/RT addresses + the DDGI atlas SRVs are supplied by the renderer
+    // DrawRtGi by DEFAULT when DDGI is on (BALLISTIC_DX12_SCREENPROBE=0 opts out); the screen-probe rays need
+    // the DDGI field for the far-field handoff. All the bindless/RT addresses + the DDGI atlas SRVs are supplied by the renderer
     // (it owns the BindlessHeap reservation + the DDGI resource). Each sub-pass is its own ExecuteSync. ----
 
     // PLACE: probePos/probeNormal from the G-buffer. depthSrv/normalSrv are CPU handles copied into placeHeap.
