@@ -248,11 +248,14 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
         // the ray direction (the far-field radiance arriving from this direction). Lumen's screen->world
         // continuation. Plus the open sky through the cube (the DDGI field already folds sky into open probes,
         // but at the grid boundary the cube is the honest far term).
-        // P4.0: the world cache IS the far-field radiance (the DDGI field already folds the sky into open
-        // probes). No sky term added — the dead `+ sky*0.0` was the named NaN*0 black-hole anti-pattern
-        // ([[ssgi-nan-mix-scrub]]: NaN*0==NaN, Inf*0==NaN), so it's gone. P4.1 may add a grid-boundary sky term.
+        // The world cache IS the far-field radiance (the DDGI field folds the sky into open probes). The field
+        // is IRRADIANCE E (the DDGI gather forms albedo*E); but here it's the incoming RADIANCE L along ONE ray
+        // direction, which the blend then cosine-integrates over 64 rays. Converting E->L for a Lambertian
+        // far surface is L = E/PI (P4.1 energy fix — without it the blend's cosine re-integration double-counts,
+        // which is why the P4.0 SunTemple isolate read ~2x bright). No sky term (the dead `+ sky*0.0` was the
+        // NaN*0 black-hole anti-pattern [[ssgi-nan-mix-scrub]], removed in P4.0).
         float3 farPoint = probePos + dir * rd.TMax;
-        radiance = Sanitize(SampleDdgiField(farPoint, -dir));
+        radiance = Sanitize(SampleDdgiField(farPoint, -dir) / PI);
         dist = rd.TMax;
     }
     RayData[id] = float4(radiance, dist);
