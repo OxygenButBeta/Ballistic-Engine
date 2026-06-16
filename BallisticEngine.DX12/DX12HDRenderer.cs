@@ -1748,7 +1748,12 @@ public sealed class DX12HDRenderer : HDRenderer {
             var st = skyForSun.SunTransmittance(new System.Numerics.Vector3(lightDir.X, lightDir.Y, lightDir.Z));
             lightColor *= new Vector3(st.X, st.Y, st.Z);
         }
-        Vector3 ambient = ToNumerics(vp.AmbientColor) * MathF.Max(0.05f, light.AmbientIntensity);
+        // Honor the AUTHORED ambient. The old MathF.Max(0.05f, …) floor OVERRODE a scene's explicit choice:
+        // CornellBox authors ambientIntensity 0 (a pure direct/GI test) and LightTest 0.01 (a dark point-light
+        // stage), but the floor forced both to 5%, washing CornellBox milky-grey and lifting LightTest's black.
+        // SceneLighting defaults AmbientIntensity to 1.0, so scenes that want ambient already have plenty; a
+        // scene that sets it low/zero means it. (IBL/GI add the real bounce ambient at their own stages.)
+        Vector3 ambient = ToNumerics(vp.AmbientColor) * light.AmbientIntensity;
         // The sun radiance is HDR (lux-scaled, ~80000); a fixed pre-exposure brings it into a viewable
         // range before the ACES tonemap (the GL path auto-meters EV100; this is a constant stand-in for
         // first light). Tunable via BALLISTIC_DX12_EXPOSURE while dialing against the frozen baseline.
