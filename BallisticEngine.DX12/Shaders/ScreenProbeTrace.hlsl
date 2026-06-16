@@ -24,7 +24,7 @@ cbuffer ScreenProbeConstants : register(b0) {
     float4x4 InvViewProj;
     float4 SpParams0;   // x probesX y probesY z downsample w frameIndex
     float4 SpParams1;   // x screenW y screenH z maxRayDist w preExposure
-    float4 SpParams2;   // x irrTexels y normalBias z intensity w (unused)
+    float4 SpParams2;   // x irrTexels y normalBias z intensity w emissiveEnable
 };
 cbuffer RtGiSun : register(b1) {
     float3 SunDir;   float NormalBias;
@@ -198,13 +198,22 @@ float3 ShadeHit(RayQuery<RAY_FLAG_FORCE_OPAQUE> q, float3 rayDir) {
     Texture2D diffuseMap = ResourceDescriptorHeap[m.DiffuseIdx];
     float3 albedo = min(diffuseMap.SampleLevel(LinearWrap, uv, 0).rgb * m.BaseColorFactor.rgb, 0.9.xxx);
 
+    // Emissive self-emission L_e (emissive-as-GI-source): emissive surfaces act as area lights in the bounce.
+    // Byte-identical decode to GBufferBindless (emissiveMap*EmissiveFactor, gated on HasEmissive); added OUTSIDE
+    // the albedo product (no /PI, no albedo multiply). Gated by SpParams2.w (emissiveEnable) for the A/B door.
+    float3 emissive = 0.0.xxx;
+    if (SpParams2.w > 0.5 && m.HasEmissive > 0.5) {
+        Texture2D emissiveMap = ResourceDescriptorHeap[m.EmissiveIdx];
+        emissive = emissiveMap.SampleLevel(LinearWrap, uv, 0).rgb * m.EmissiveFactor.rgb;
+    }
+
     float3 hit = q.WorldRayOrigin() + q.CommittedRayT() * rayDir;
     float ndl = saturate(dot(Ng, normalize(SunDir)));
     float3 sun = SunColor * ndl * (ndl > 0.0 ? Visibility(hit, Ng, normalize(SunDir), 1e4) : 0.0);
     float3 punctual = PunctualDiffuse(hit, Ng);
     float3 ambient = SampleDdgiField(hit, Ng);   // far-field multi-bounce from the world cache
 
-    float3 radiance = albedo * (sun + punctual + ambient);
+    float3 radiance = albedo * (sun + punctual + ambient) + emissive;
     float luma = dot(radiance, float3(0.2126, 0.7152, 0.0722));
     if (luma > 1.0e5) radiance *= 1.0e5 / max(luma, 1e-4);
     return Sanitize(min(radiance, 60000.0.xxx));

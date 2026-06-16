@@ -233,6 +233,17 @@ public sealed class DX12HDRenderer : HDRenderer {
     bool? ddgiOn;
     bool DdgiEnabled => ddgiOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI") == "1";
 
+    // Emissive-as-GI-source (GI track follow-up): emissive surfaces act as area lights in the indirect
+    // bounce. At each GI ray hit the shader adds the hit's self-emission L_e (emissiveMap*EmissiveFactor)
+    // on TOP of albedo*(sun+punctual+ambient) — the published DDGI/RTXGI/Lumen technique (no /PI, no albedo
+    // multiply: emission is already outgoing radiance). DEFAULT ON (it's a correctness fix — emissive lit
+    // the scene directly via the G-buffer but cast NO indirect light). The flag rides a spare CBV slot in
+    // each of the 4 GI hit shaders' b0 (no root-sig change), so BALLISTIC_DX12_GI_EMISSIVE=0 is a clean
+    // byte-identical-off A/B. NO double-count: the directly-visible emissive comes from the G-buffer Emissive
+    // MRT on the camera pixel; the GI term adds emission only at off-screen bounce hits on OTHER surfaces.
+    bool? giEmissiveOn;
+    bool GiEmissiveEnabled => giEmissiveOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_EMISSIVE") != "0";
+
     // P6.0 MOTION-stability harness (Phase 6): a DETERMINISTIC scripted camera orbit so the motion-dump
     // sequence has GENUINE camera movement — the only way reprojection + disocclusion (the real "boiling"
     // conditions) appear; a static camera only tests EMA convergence. BALLISTIC_DX12_GI_ORBIT=<deg/frame>
@@ -277,7 +288,7 @@ public sealed class DX12HDRenderer : HDRenderer {
 
     bool rtGiBuilt;
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct RtGiConstants { public Matrix4x4 InvViewProj; public Matrix4x4 ViewProj; public Vector4 Params; }  // preExp, rayLength, _, frameIdx
+    struct RtGiConstants { public Matrix4x4 InvViewProj; public Matrix4x4 ViewProj; public Vector4 Params; }  // preExp, rayLength, emissiveEnable, frameIdx
     // P1 world-radiance hit shading: the sun + normal bias for the hit's direct-light term + shadow ray,
     // plus the punctual-light count (the hit shader loops all gathered point/spot lights — scenes lit only
     // by a point light, like the Bistro interior, get no bounce from sun/IBL alone).
@@ -2514,6 +2525,8 @@ public sealed class DX12HDRenderer : HDRenderer {
             InvViewProj = Matrix4x4.Transpose(invVP), CameraPos = camPos, Intensity = PostFX.SsrIntensity,
             PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f, NormalBias = 0.05f,
             UseDdgi = useDdgi ? 1f : 0f,
+            // Pad0 = emissiveEnable — reflected emissive surfaces (neon in a mirror) light up when >0.5.
+            Pad0 = GiEmissiveEnabled ? 1f : 0f,
         };
         Vector3 sunDir = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
         *(RtGiSun*)rtReflSunCbMapped = new RtGiSun {
@@ -2751,7 +2764,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
         *(RtGiConstants*)rtGiCbMapped = new RtGiConstants {
             InvViewProj = Matrix4x4.Transpose(invVP), ViewProj = Matrix4x4.Transpose(viewProj),
-            Params = new Vector4(SsgiPreExposure(), MathF.Max(PostFX.SsgiRayLength, 0.1f), 0f, fi),
+            // Params.z = emissiveEnable (was unused) — the GI hit adds emissive self-emission when >0.5.
+            Params = new Vector4(SsgiPreExposure(), MathF.Max(PostFX.SsgiRayLength, 0.1f), GiEmissiveEnabled ? 1f : 0f, fi),
         };
         Vector3 sunDir = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
         *(RtGiSun*)rtGiSunCbMapped = new RtGiSun {
@@ -2764,6 +2778,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         // its own ExecuteSync (each DX12 pass = its own submit; lets GI:DDGI be timed separately). Atlases are
         // written but not yet read (gather = P2.2) → image still inert; this validates the update pipeline. ---
         if (DdgiEnabled && ddgi != null && ddgi.Allocated) {
+            ddgi.EmissiveEnabled = GiEmissiveEnabled;
             Dx12DescriptorHeap bh = Dx12Backend.BindlessHeap;
             var ddgiHeapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
             sceneAS.CreateTlasSrv(bh.Cpu(DdgiTableBase + 0));                                              // t0 TLAS
@@ -2894,6 +2909,7 @@ public sealed class DX12HDRenderer : HDRenderer {
     // view-projection (we transpose for the shaders, matching the DDGI gather convention).
     unsafe void DrawScreenProbeGather(Matrix4x4 invVP) {
         if (screenProbe == null) screenProbe = new Dx12ScreenProbe(dev);
+        screenProbe.EmissiveEnabled = GiEmissiveEnabled;
         screenProbe.EnsureAllocated(ssgiTarget.Width, ssgiTarget.Height);
         screenProbe.Build();
 

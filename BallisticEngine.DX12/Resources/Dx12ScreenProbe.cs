@@ -99,6 +99,11 @@ public sealed class Dx12ScreenProbe : IDisposable {
         public Vector4 Params;          // x irrTexels, y normalBias, z/w pad
     }
 
+    // Emissive-as-GI-source: when set, the screen-probe trace's ShadeHit adds the hit's self-emission L_e
+    // (rides SpParams2.w → ScreenProbeTrace emissiveEnable). Set by the renderer from BALLISTIC_DX12_GI_EMISSIVE
+    // (default ON). Default true so a missing setter = the correct on behaviour.
+    public bool EmissiveEnabled = true;
+
     public bool Allocated => radianceTex != null;
     public long GridVramBytes {
         get {
@@ -169,7 +174,8 @@ public sealed class Dx12ScreenProbe : IDisposable {
             InvViewProj = invViewProjTransposed,
             SpParams0 = new Vector4(probesX, probesY, Downsample, seed),
             SpParams1 = new Vector4(screenW, screenH, maxRayDist, preExposure),
-            SpParams2 = new Vector4(OctTexels, 0.05f, intensity, 0f),
+            // SpParams2.w = emissiveEnable (was pad) — the trace adds emissive self-emission at hits when >0.5.
+            SpParams2 = new Vector4(OctTexels, 0.05f, intensity, EmissiveEnabled ? 1f : 0f),
         };
         // Mirror the DDGI grid fields the trace needs for the far-field sample. DdgiConstants packs the same
         // grid layout; copy the relevant float4s (irrTexels = Params0.x, normalBias = Params1.y).

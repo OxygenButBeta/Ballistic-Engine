@@ -201,6 +201,18 @@ float3 ShadeHit(RayQuery<RAY_FLAG_FORCE_OPAQUE> q, float3 rayDir, out bool backf
     Texture2D diffuseMap = ResourceDescriptorHeap[m.DiffuseIdx];
     float3 albedo = min(diffuseMap.SampleLevel(LinearWrap, uv, 0).rgb * m.BaseColorFactor.rgb, 0.9.xxx);
 
+    // Emissive self-emission L_e (emissive-as-GI-source): emissive surfaces are area lights in the bounce.
+    // Sampled byte-identically to the raster GBufferBindless decode (emissiveMap*EmissiveFactor, gated on
+    // HasEmissive); the emissive SRV is already in the bound bindless heap. ADDED OUTSIDE the albedo product
+    // below (self-emission is independent of the surface's reflectance — NO /PI, NO albedo multiply). Gated by
+    // Params2.w (emissiveEnable) for the byte-identical A/B door. Emissive is a CONSTANT additive source, so it
+    // does NOT compound through the multi-bounce feedback (unlike the field-driven ambient term).
+    float3 emissive = 0.0.xxx;
+    if (Params2.w > 0.5 && m.HasEmissive > 0.5) {
+        Texture2D emissiveMap = ResourceDescriptorHeap[m.EmissiveIdx];
+        emissive = emissiveMap.SampleLevel(LinearWrap, uv, 0).rgb * m.EmissiveFactor.rgb;
+    }
+
     float3 hit = q.WorldRayOrigin() + q.CommittedRayT() * rayDir;
     float ndl = saturate(dot(Ng, normalize(SunDir)));
     float3 sun = SunColor * ndl * (ndl > 0.0 ? Visibility(hit, Ng, normalize(SunDir), 1e4) : 0.0);
@@ -225,7 +237,7 @@ float3 ShadeHit(RayQuery<RAY_FLAG_FORCE_OPAQUE> q, float3 rayDir, out bool backf
     } else {
         ambient = Irradiance.SampleLevel(LinearClamp, Ng, 0).rgb;
     }
-    float3 radiance = albedo * (sun + punctual + ambient);
+    float3 radiance = albedo * (sun + punctual + ambient) + emissive;
 
     // Luma clamp (the firefly cap) THEN a per-channel cap below the fp16 atlas ceiling (~65504) — the luma
     // clamp alone can leave one channel > fp16 max → a +Inf store; the atlas read-side Sanitize heals it next

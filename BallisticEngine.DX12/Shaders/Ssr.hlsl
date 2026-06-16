@@ -121,6 +121,17 @@ float LinearDepth(float d) {
     return v.z / v.w;
 }
 
+// Component-SELECT NaN/Inf scrub (never mix(v,0,flag): NaN*0==NaN, Inf*0==NaN — the proven AMD leak,
+// [[ssgi-nan-mix-scrub]]). Defense-in-depth on the SSR read side (the SSGI combine already does this on its
+// read): a reflection-hit shader is capped at the source, but this guards any future unbounded write from
+// becoming a screen-eating Inf/NaN field via the bilinear acc + lerp + bloom downsample.
+float4 SanitizeSsr(float4 v) {
+    return float4(isnan(v.x) || isinf(v.x) ? 0.0 : v.x,
+                  isnan(v.y) || isinf(v.y) ? 0.0 : v.y,
+                  isnan(v.z) || isinf(v.z) ? 0.0 : v.z,
+                  isnan(v.w) || isinf(v.w) ? 0.0 : v.w);
+}
+
 // --- Combine pass: depth-aware upsample of the half-res SSR + lerp into the full-res scene color. ---
 float4 PSCombine(VSOut i) : SV_Target {
     float3 scene = ColorTex.SampleLevel(LinearClamp, i.Uv, 0).rgb;
@@ -139,7 +150,7 @@ float4 PSCombine(VSOut i) : SV_Target {
         float tapZ = LinearDepth(DepthTex.SampleLevel(LinearClamp, uv, 0).r);
         float wDepth = 1.0 / (1.0 + abs(tapZ - centerZ) * 2.0);
         float w = wBilinear * wDepth + 1e-5;
-        acc += SsrTex.SampleLevel(LinearClamp, uv, 0) * w;
+        acc += SanitizeSsr(SsrTex.SampleLevel(LinearClamp, uv, 0)) * w;
         wSum += w;
     }
     float4 ssr = acc / wSum;

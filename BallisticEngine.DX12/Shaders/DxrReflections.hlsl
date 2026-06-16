@@ -44,7 +44,7 @@ RWTexture2D<float4> Output  : register(u0);
 cbuffer ReflConstants : register(b0) {
     float4x4 InvViewProj;    // screen+depth → world (JITTERED, transposed)
     float3 CameraPos; float Intensity;
-    float PrefilterMaxMip; float NormalBias; float UseDdgi; float Pad0;  // UseDdgi: 1 = sample the cache at hits
+    float PrefilterMaxMip; float NormalBias; float UseDdgi; float Pad0;  // UseDdgi: 1=sample cache at hits; Pad0=emissiveEnable (1=add emissive L_e at hits)
 };
 cbuffer RtGiSun : register(b1) {
     float3 SunDir;     float SunNormalBias;   // TO the sun (normalized), world; bias = shadow-ray origin offset
@@ -250,6 +250,15 @@ void ClosestHit(inout ReflPayload p, in BuiltInTriangleIntersectionAttributes at
     Texture2D diffuseMap = ResourceDescriptorHeap[m.DiffuseIdx];
     float3 albedo = min(diffuseMap.SampleLevel(LinearWrap, uv, 0).rgb * m.BaseColorFactor.rgb, 0.9.xxx);
 
+    // Emissive self-emission L_e (emissive-as-GI-source): an emissive surface seen IN a reflection lights up
+    // (neon in a mirror). Byte-identical decode to GBufferBindless (emissiveMap*EmissiveFactor, gated on
+    // HasEmissive); added OUTSIDE the albedo product (no /PI, no albedo multiply). Gated by Pad0 (emissiveEnable).
+    float3 emissive = 0.0.xxx;
+    if (Pad0 > 0.5 && m.HasEmissive > 0.5) {
+        Texture2D emissiveMap = ResourceDescriptorHeap[m.EmissiveIdx];
+        emissive = emissiveMap.SampleLevel(LinearWrap, uv, 0).rgb * m.EmissiveFactor.rgb;
+    }
+
     float3 hit = WorldRayOrigin() + RayTCurrent() * WorldRayDirection();
 
     // Direct light at the hit (sun + punctual, each shadow-rayed). RAW HDR — the SSR combine does NOT pre-expose
@@ -262,10 +271,14 @@ void ClosestHit(inout ReflPayload p, in BuiltInTriangleIntersectionAttributes at
     // Ambient at the hit = the DDGI world cache (its OWN multi-bounce GI; the field already folds in sky, so do
     // NOT add the IBL cube on top when DDGI is bound). Falls back to the flat IBL irradiance cube without DDGI.
     float3 ambient = UseDdgi > 0.5 ? SampleDdgiField(hit, Ng) : Irradiance.SampleLevel(LinearClamp, Ng, 0).rgb;
-    float3 radiance = albedo * (sun + punctual + ambient);
+    float3 radiance = albedo * (sun + punctual + ambient) + emissive;
 
     // Soft luminance clamp (NOT saturate — that crushes the ~1e5 HDR). Tame fireflies, then ternary Sanitize.
+    // Per-channel cap below the fp16 ceiling (~65504) BEFORE Sanitize: the +emissive term is UNBOUNDED
+    // (EmissiveFactor is raw HDR, added outside the albedo<=0.9 product), and the luma clamp alone can leave a
+    // single channel > fp16 max → a finite +Inf store into the half-res RGBA16F ssrTarget that the SSR combine
+    // would spread (no read-side scrub there). The min() caps at the source. Matches DdgiTrace/ScreenProbeTrace.
     float luma = dot(radiance, float3(0.2126, 0.7152, 0.0722));
     if (luma > 1.0e5) radiance *= 1.0e5 / max(luma, 1e-4);
-    p.Color = Sanitize(radiance);
+    p.Color = Sanitize(min(radiance, 60000.0.xxx));
 }

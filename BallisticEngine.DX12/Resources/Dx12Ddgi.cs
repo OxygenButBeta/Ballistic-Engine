@@ -74,7 +74,7 @@ public sealed class Dx12Ddgi : IDisposable {
         public Vector4 ProbeDims;        // xyz = (ProbesX,ProbesY,ProbesZ) as floats, w = ProbeCount
         public Vector4 Params0;          // x=irrTexels y=depthTexels z=hysteresis w=frameIndex
         public Vector4 Params1;          // x=maxRayDist y=normalBias z=feedbackEnable w=intensity
-        public Vector4 Params2;          // P2.5 round-robin: x=updateFraction(N) y=phase(0..N-1) z=fullUpdate(1/0) w=pad
+        public Vector4 Params2;          // P2.5 round-robin: x=updateFraction(N) y=phase(0..N-1) z=fullUpdate(1/0) w=emissiveEnable
     }
 
     // --- P2.1 probe-update plumbing ---
@@ -122,6 +122,12 @@ public sealed class Dx12Ddgi : IDisposable {
         }
     }
     bool warmedUp;   // the one-shot warm-up has run (guards the first DispatchDdgi only)
+
+    // Emissive-as-GI-source: when set, the trace's ShadeHit adds the hit surface's self-emission L_e so
+    // emissive surfaces act as area lights in the probe field (rides Params2.w → DdgiTrace emissiveEnable).
+    // Set by the renderer from BALLISTIC_DX12_GI_EMISSIVE (default ON). Default true so a missing setter
+    // = the correct on behaviour.
+    public bool EmissiveEnabled = true;
 
     // RayData[probe*RaysPerProbe + ray] = (radiance.rgb, hitDistance), written by the trace pass, read by the
     // blend pass. ProbeCount*144*16B = ~4.7 MB — sized once for the static grid; persistent UAV.
@@ -199,7 +205,8 @@ public sealed class Dx12Ddgi : IDisposable {
             ProbeDims = new Vector4(ProbesX, ProbesY, ProbesZ, ProbeCount),
             Params0 = new Vector4(IrradianceTexels, DepthTexels, hysteresis, frameIndex),
             Params1 = new Vector4(40f, 0.25f, feedback ? 1f : 0f, intensity),
-            Params2 = new Vector4(full ? 1 : n, phase, full ? 1f : 0f, 0f),
+            // Params2.w = emissiveEnable (was pad) — the trace adds emissive self-emission at hits when >0.5.
+            Params2 = new Vector4(full ? 1 : n, phase, full ? 1f : 0f, EmissiveEnabled ? 1f : 0f),
         };
     }
 

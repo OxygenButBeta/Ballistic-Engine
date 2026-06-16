@@ -26,7 +26,7 @@ RWTexture2D<float4> Output  : register(u0);
 cbuffer GiConstants : register(b0) {
     float4x4 InvViewProj;          // screen+depth → world (JITTERED, transposed)
     float4x4 ViewProj;             // world → clip (JITTERED, transposed)
-    float4 Params;                 // x=PreExposure y=RayLength z=(unused) w=FrameIndex
+    float4 Params;                 // x=PreExposure y=RayLength z=emissiveEnable w=FrameIndex
 };
 cbuffer RtGiSun : register(b1) {
     float3 SunDir;     float NormalBias;   // TO the sun (normalized), world; bias = shadow-ray origin offset
@@ -185,6 +185,15 @@ void ClosestHit(inout GiPayload p, in BuiltInTriangleIntersectionAttributes attr
     float3 albedo = diffuseMap.SampleLevel(LinearWrap, uv, 0).rgb * m.BaseColorFactor.rgb;
     albedo = min(albedo, 0.9.xxx);   // energy clamp (DDGI maxAlbedo) — no runaway in the feedback loop
 
+    // Emissive self-emission L_e (emissive-as-GI-source): emissive surfaces act as area lights in the bounce.
+    // Byte-identical decode to GBufferBindless (emissiveMap*EmissiveFactor, gated on HasEmissive); added OUTSIDE
+    // the albedo product (no /PI, no albedo multiply). Gated by Params.z (emissiveEnable) for the A/B door.
+    float3 emissive = 0.0.xxx;
+    if (Params.z > 0.5 && m.HasEmissive > 0.5) {
+        Texture2D emissiveMap = ResourceDescriptorHeap[m.EmissiveIdx];
+        emissive = emissiveMap.SampleLevel(LinearWrap, uv, 0).rgb * m.EmissiveFactor.rgb;
+    }
+
     float3 hit = WorldRayOrigin() + RayTCurrent() * WorldRayDirection();
 
     // --- Direct light at the hit (sun + punctual, each shadow-ray-occluded) + sky IBL ambient. SunColor +
@@ -193,7 +202,7 @@ void ClosestHit(inout GiPayload p, in BuiltInTriangleIntersectionAttributes attr
     float3 sun = SunColor * ndl * (ndl > 0.0 ? Visibility(hit, Ng, normalize(SunDir), 1e4) : 0.0);
     float3 punctual = PunctualDiffuse(hit, Ng);                        // point/spot lights (e.g. the Bistro lamp)
     float3 ambient = Irradiance.SampleLevel(LinearClamp, Ng, 0).rgb;   // diffuse sky irradiance at the hit
-    float3 radiance = albedo * (sun + punctual + ambient);
+    float3 radiance = albedo * (sun + punctual + ambient) + emissive;
 
     // Soft luminance clamp (NOT saturate — that would crush the ~1e5 HDR). Tame fireflies before the shared
     // temporal+OIDN feedback chain. Then pre-expose like the old hit shading (Params.x).
