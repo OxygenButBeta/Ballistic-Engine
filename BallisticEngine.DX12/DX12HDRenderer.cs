@@ -320,7 +320,7 @@ public sealed class DX12HDRenderer : HDRenderer {
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct CompositeConstants {
         public float ExposureMul; public float BloomIntensity; public float AutoExposure; public float LegacyMul;
-        public float Compensation; public float UseAo; public Vector2 Pad2;
+        public float Compensation; public float UseAo; public float Tonemap; public float Pad2;
     }
 
     // Auto-exposure: a 1×1 R16F target holding the metered exposure EV100 (LumAverage.hlsl).
@@ -3107,6 +3107,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         bool bloomOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_BLOOM") != "0";
         if (bloomOn) DrawBloom(hdr);
 
+        // Tonemap: AgX by default (graceful highlight desaturation, the "less çiğ" look); ACES via the door.
+        bool acesTonemap = Environment.GetEnvironmentVariable("BALLISTIC_DX12_TONEMAP") == "aces";
         *(CompositeConstants*)compositeCbMapped = new CompositeConstants {
             ExposureMul = exposureMul,
             BloomIntensity = bloomOn ? 0.6f : 0f,
@@ -3114,6 +3116,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             LegacyMul = pf.Exposure,
             Compensation = pf.ExposureCompensation,
             UseAo = ssaoOn ? 1f : 0f,
+            Tonemap = acesTonemap ? 1f : 0f,
         };
 
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(0), hdr.ColorSrvCpu, heapType);
