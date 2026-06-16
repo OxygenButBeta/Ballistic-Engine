@@ -37,6 +37,12 @@ public class PlayerController : NetworkBehaviour {
         // otherwise OnStartLocalPlayer will (it calls TrySetupInput). Either order lands once.
         if (IsOwner)
             TrySetupInput();
+
+        // P6 possession-REPLICATION: on the SERVER, replicate this possession so the OWNING client
+        // auto-builds the same controller+input pipeline (no hand-wiring) and observers link the refs. A
+        // no-op off-server / when not networked. The client side runs Possess via the replicated message
+        // (HandlePossess), so this never re-broadcasts there (OnServerPossess gates on IsServer).
+        Network.Manager?.OnServerPossess(this, pawn);
     }
 
     public void Unpossess() {
@@ -45,6 +51,7 @@ public class PlayerController : NetworkBehaviour {
         Pawn p = Pawn;
         Pawn = null;
         p.FireUnpossessed();
+        Network.Manager?.OnServerUnpossess(this);   // P6: replicate the unpossess (server-side only)
     }
 
     // OnStartLocalPlayer fires ONLY on the input authority (NetworkBehaviour.DriveNetSpawn gates it on

@@ -102,6 +102,24 @@ public abstract class NetworkBehaviour : Behaviour {
     // next SerializeState diffs against). Called by the network tick after a successful send. No-op base.
     public virtual void CaptureNetworkBaseline() { }
 
+    // P6 PER-CLIENT BASELINE swap (plan §13 late-join). The component holds ONE delta baseline; per-client
+    // replication needs SerializeState to diff against each CLIENT's last-acked values. The manager swaps
+    // the active baseline around a per-client serialize: __SetNetBaseline(C's saved baseline) ->
+    // SerializeState (the bytes are C's delta) -> __GetNetBaseline() to record what C now has pending.
+    // The token is the generated baseline struct, BOXED — on the 20 Hz send path (per client/object), NOT
+    // the per-tick hot path, so the box is acceptable and there is NO reflection. The generator overrides
+    // these; the base returns/accepts null (a no-[Networked] component carries no baseline). The token is
+    // OPAQUE to the manager — it only round-trips it, never inspects fields.
+    public virtual object __GetNetBaseline() => null;
+    public virtual void __SetNetBaseline(object token) { }
+
+    // P6: true when the live [Networked] values equal the given baseline TOKEN — lets the per-client flush
+    // SKIP a quiescent object entirely (0 bytes) without a probe-and-rewind. A reflection-free typed compare
+    // the generator emits (it knows the fields); the base (no [Networked]) is trivially equal. Token is the
+    // boxed __NetBaseline struct from __GetNetBaseline; a mismatched/null token compares not-equal (safe —
+    // it just sends the delta).
+    public virtual bool __NetStateEquals(object token) => true;
+
     // ---- net-strand drivers (called by the phase runner / Network.Spawn, NOT by FireEnable) --------
     // Drive OnSpawned + role hooks IN ORDER, before the Unity strand. Idempotent: a second call (the
     // object touched by both Phase 1 and a later path) is a no-op via NetBegun. ScriptGuard-firewalled

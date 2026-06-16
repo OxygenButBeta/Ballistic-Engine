@@ -56,8 +56,17 @@ public sealed class NetworkBehaviourGenerator : IIncrementalGenerator {
             }
         }
 
-        if (fields.Count == 0 && rpcs.Count == 0)
-            return null;   // a NetworkBehaviour with no replicated state/RPCs — generate nothing (§11 scoping)
+        if (fields.Count == 0 && rpcs.Count == 0) {
+            // A NetworkBehaviour with no [Networked]/[Rpc] members. P6: if it is declared `partial` it still
+            // wants a typeId + registration so it can be mirror-SPAWNED (possession-replication: a bare
+            // PlayerController/Pawn must build a client mirror via typeId->factory). We emit ONLY the
+            // lightweight registration (no baseline/serialize machinery — there is no state). A NON-partial
+            // bare NetworkBehaviour generates nothing (§11 scoping preserved — it can't be a partial target
+            // and is not meant to replicate as its own identity, e.g. a pure RPC-relay helper).
+            bool isPartial = decl.Modifiers.Any(m => m.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.PartialKeyword));
+            if (!isPartial)
+                return null;
+        }
 
         return new NetTarget(
             symbol.ContainingNamespace.IsGlobalNamespace ? null : symbol.ContainingNamespace.ToDisplayString(),
@@ -272,6 +281,38 @@ public sealed class NetworkBehaviourGenerator : IIncrementalGenerator {
             sb.AppendLine($"            __netBaseline.{f.Name} = this.{f.Name};");
         sb.AppendLine("        }");
         sb.AppendLine();
+
+        // P6 PER-CLIENT BASELINE swap (plan §13 late-join): the component carries ONE delta baseline
+        // (__netBaseline), but per-client replication needs SerializeState to diff against a DIFFERENT
+        // baseline per client. So the manager SWAPS the active baseline around each per-client serialize:
+        // Set(C's baseline) -> SerializeState -> the bytes are C's delta -> save the post-send baseline as
+        // C's pending (Get). Get/Set box the baseline struct — on the 20Hz SEND path (per client, per
+        // object), NOT the per-tick hot path, so the box is acceptable (the standing rule is per-FRAME/
+        // per-DRAW reflection-free; this is neither, and there is no reflection). A no-[Networked] type
+        // returns/accepts null (the base no-ops).
+        sb.AppendLine("        public override object __GetNetBaseline() => __netBaseline;");
+        sb.AppendLine("        public override void __SetNetBaseline(object __b) {");
+        sb.AppendLine("            if (__b is __NetBaseline __v) __netBaseline = __v;");
+        sb.AppendLine("        }");
+        sb.AppendLine();
+
+        // P6: live == the given baseline token? Lets the per-client flush skip a quiescent object (0 bytes)
+        // without a probe/rewind. A null/foreign token compares not-equal (safe — sends the delta).
+        sb.AppendLine("        public override bool __NetStateEquals(object __b) {");
+        sb.AppendLine("            if (__b is not __NetBaseline __v) return false;");
+        if (t.Fields.Count == 0) {
+            sb.AppendLine("            return true;");
+        } else {
+            sb.Append("            return ");
+            for (int i = 0; i < t.Fields.Count; i++) {
+                if (i > 0) sb.Append(" && ");
+                sb.Append($"__NetEq(this.{t.Fields[i].Name}, __v.{t.Fields[i].Name})");
+            }
+            sb.AppendLine(";");
+        }
+        sb.AppendLine("        }");
+        sb.AppendLine();
+
         // A small typed equality helper so the changemask comparison is a value compare (no boxing).
         sb.AppendLine("        private static bool __NetEq<TVal>(TVal a, TVal b) =>");
         sb.AppendLine("            System.Collections.Generic.EqualityComparer<TVal>.Default.Equals(a, b);");

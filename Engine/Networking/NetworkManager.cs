@@ -70,6 +70,7 @@ public sealed class NetworkManager {
         LocalConnection = Connection.None;
         ServerConnection = Connection.None;
         objects.Clear();
+        clientState.Clear();
         predicted.Clear();
         nextPredictKey = 1;
         SendClock.Reset();
@@ -92,6 +93,12 @@ public sealed class NetworkManager {
     // server, addressed implicitly by Send to its single peer.
     readonly List<Connection> clients = new();
     public IReadOnlyList<Connection> Clients => clients;
+
+    // P6 PER-CLIENT replication state (plan §13 late-join): connection -> its delta baseline + pending +
+    // send sequence. Created at join (HandleHandshake), dropped at disconnect. SERVER-side only. The
+    // FlushStateDown loop diffs each object vs THIS client's baseline (the baseline-swap), so staggered
+    // joiners each get exactly the deltas since THEIR last ack (proven in %TEMP%\bal-baseline-test 16/16).
+    readonly Dictionary<Connection, ClientReplState> clientState = new();
 
     // The client-side MIRROR table (P3): netId -> the locally-built proxy object, so an incoming Snapshot
     // can find the object to apply state to, and a Despawn can tear it down. Distinct from `objects`
@@ -122,6 +129,7 @@ public sealed class NetworkManager {
 
     void OnPeerDisconnected(Connection c) {
         clients.Remove(c);
+        clientState.Remove(c);   // P6: drop this client's per-client baseline/pending (no leak, no send)
         // P7 (ConnectionToken reconnect) keeps the pawn alive on a TTL; P3 just drops the registration.
     }
 
@@ -137,6 +145,8 @@ public sealed class NetworkManager {
             case NetMessage.Snapshot:    HandleSnapshot(ref r); break;
             case NetMessage.Rpc:         HandleRpc(source, ref r); break;
             case NetMessage.Input:       HandleInput(source, ref r); break;
+            case NetMessage.Ack:         HandleAck(source, ref r); break;
+            case NetMessage.Possess:     HandlePossess(ref r); break;
         }
     }
 
@@ -174,11 +184,48 @@ public sealed class NetworkManager {
             return;
         }
         Transport.Send(source, NetworkWire.HandshakeOk(source.Id), Channel.Reliable);
-        // The client passed the drift check — replicate every already-spawned object to it (late-join
-        // baseline, the P6 path in miniature: a full Spawn per live object), then fire the join flow.
-        foreach (NetworkObject obj in objects.All())
+
+        // P6: create this client's per-client replication state. A late joiner gets CURRENT state
+        // ATOMICALLY — a full Spawn per live object (the baseline delivered at spawn, §8.5) — and the
+        // server SEEDS the client's delta baseline to exactly those current values, so its first delta
+        // diffs against what it actually holds (not a zero/global baseline that would re-send everything
+        // or, worse, skip a change it never saw). This is the §13 "late joiner gets current state
+        // atomically at spawn"; the per-client baseline (proven in %TEMP%\bal-baseline-test) makes
+        // staggered joins each correct.
+        var state = new ClientReplState();
+        clientState[source] = state;
+        foreach (NetworkObject obj in objects.All()) {
             SendSpawnTo(source, obj);
+            SeedClientBaseline(state, obj);
+        }
+        // P6 possession-replication late-join: replay the current possession links so a joiner sees who
+        // controls what (and, if it owns a controller, auto-builds its input). Spawns went first (above) so
+        // the controller/pawn mirrors exist when these Reliable Possess messages apply.
+        SendPossessionsTo(source);
         OnPlayerJoined?.Invoke(source);
+    }
+
+    // Seed (or re-seed) one client's per-client baseline for an object to its CURRENT [Networked] values —
+    // the late-join / new-spawn baseline. Captures the live values into the component's __netBaseline first
+    // (so the token reflects the current state, not a stale one), then snapshots the token per component.
+    static void SeedClientBaseline(ClientReplState state, NetworkObject obj) {
+        if (obj?.Entity is null)
+            return;
+        foreach (Behaviour b in obj.Entity.Behaviours.ToArray())
+            if (b is NetworkBehaviour { HasNetworkedState: true } nb) {
+                nb.CaptureNetworkBaseline();                  // __netBaseline := live values
+                state.SeedBaseline(obj.NetId, nb.__GetNetBaseline());   // token snapshot of the current state
+            }
+    }
+
+    // P6 SERVER: a client acked a snapshot frontier — advance THAT client's per-client baseline (promote
+    // everything sent at seq <= acked into the acked baseline), so the next delta diffs against what the
+    // client now holds. A dropped (unacked) snapshot never advances the baseline, so its change re-sends
+    // next flush (latest-wins recovery). Server-only; a client ignores acks (it never sends snapshots).
+    void HandleAck(Connection source, ref BitReader r) {
+        uint ackedSeq = r.ReadUInt();
+        if (clientState.TryGetValue(source, out ClientReplState state))
+            state.Ack(ackedSeq);
     }
 
     // CLIENT: the server accepted us; adopt the connection id it assigned (our LocalConnection).
@@ -257,6 +304,8 @@ public sealed class NetworkManager {
     // server state (just applied), TRIM acked inputs, REPLAY the unacknowledged ones. A SimulatedProxy
     // (no input authority) just takes the state as-is (interpolation is P5c).
     void HandleSnapshot(ref BitReader r) {
+        uint snapshotSeq = r.ReadUInt();   // P6: the per-client send frontier — ACK it so the server
+                                           // advances OUR baseline (after applying the batch below).
         while (!r.AtEnd && r.BitLength - r.BitPos >= 96) {   // at least netId+seq+typeId remain
             int netId = r.ReadInt();
             uint lastProcessedSeq = r.ReadUInt();   // P5b: the server's ack frontier for this object
@@ -304,6 +353,13 @@ public sealed class NetworkManager {
                 obj.Interpolator.Receive(obj.InterpClock, tr.Position, tr.Rotation);
             }
         }
+
+        // P6: ACK the per-client frontier so the server advances OUR baseline (the next delta diffs against
+        // what we now hold). Reliable-ordered — a lost ack just means the server re-sends the unacked delta
+        // until an ack lands (latest-wins recovery). A host's local client never reaches here (no wire send
+        // to self); only a real remote client acks. Guarded on a valid server connection.
+        if (ServerConnection.IsValid)
+            Transport.Send(ServerConnection, NetworkWire.Ack(snapshotSeq), Channel.Reliable);
     }
 
     static NetworkBehaviour FindNetworkBehaviour(NetworkObject obj, int typeId) {
@@ -635,20 +691,27 @@ public sealed class NetworkManager {
                 catch (Exception e) { ScriptGuard.Report(nb, "NetworkTick", e); }
     }
 
-    // Serialize every spawned, state-carrying object's DELTA snapshot (changemask + changed fields vs its
-    // captured baseline, §11) into one payload, then re-baseline. P3 frames this behind a Snapshot tag and
-    // sends it Unreliable to every client. CaptureNetworkBaseline runs AFTER the write so the next send
-    // diffs against what we just sent.
+    // P6 PER-CLIENT delta snapshot (plan §13 late-join): build a snapshot batch FOR ONE CLIENT, diffing
+    // each object against THAT client's acked baseline (the baseline-swap: __SetNetBaseline the client's
+    // saved token -> SerializeState produces the client's delta -> __GetNetBaseline records what the client
+    // will hold once it acks, stashed as pending under this send's seq). An object whose live state equals
+    // the client's baseline is OMITTED entirely (the strongest 1-bit-unchanged: a quiescent object costs 0).
     //
-    // P3 SCOPE BOUNDARY (the ONE global-baseline limitation, by design): the baseline is per-OBJECT and
-    // GLOBAL, not per-client. A late joiner gets a FULL spawn snapshot (SendSpawnTo) at join, then rides
-    // the shared delta stream — correct for a single observer (proven in %TEMP%\bal-net-twoproc). With
-    // MULTIPLE clients joining at different times, a per-CLIENT ack baseline is needed so each gets exactly
-    // the deltas since ITS last ack — that is explicitly P6 (late-join baseline, §13). P3 demonstrates the
-    // wire path; P6 makes the baseline per-client. Documented so a future session doesn't mistake the
-    // global baseline for a bug.
+    // This REPLACED P3's single global SerializeStateSnapshot. The global baseline was correct for ONE
+    // observer but wrong for staggered joiners (a delta sent only to client A advanced the shared baseline
+    // so client B never learned it). The per-client model gives each client exactly the deltas since ITS
+    // last ack — proven necessary (the global model demonstrably fails the staggered case) in
+    // %TEMP%\bal-baseline-test (16/16). The frame leads with the per-client send SEQ the client echoes in
+    // its Ack; the server advances the client's baseline only on that ack.
     BitWriter snapshotWriter = new();
 
+    // The bytes of the LAST per-client snapshot built (diagnostics/harness). Object count = how many rode.
+    public int LastSnapshotObjectCount { get; private set; }
+
+    // Legacy/diagnostic single-baseline snapshot (P2): serialize every state-carrying object's delta vs its
+    // OWN __netBaseline, then re-baseline. NOT the per-client send path (that is SerializeStateSnapshotFor)
+    // — kept for the P2.5 "the snapshot includes the spawned object" in-engine check and any tool that wants
+    // a quick global dump. The real wire path is per-client (FlushStateDown). No per-client seq header.
     public ReadOnlySpan<byte> SerializeStateSnapshot() {
         snapshotWriter.Reset();
         int written = 0;
@@ -656,12 +719,12 @@ public sealed class NetworkManager {
             if (obj?.Entity is null)
                 continue;
             foreach (Behaviour b in obj.Entity.Behaviours.ToArray()) {
-                if (b is NetworkBehaviour nb && nb.HasNetworkedState) {
-                    snapshotWriter.WriteInt(obj.NetId);           // which object (P3 maps this on the wire)
-                    snapshotWriter.WriteUInt(obj.LastProcessedSeq); // P5b: ack frontier for the reconcile
-                    snapshotWriter.WriteInt(nb.NetworkTypeId);    // which component type
-                    nb.SerializeState(snapshotWriter);            // changemask + changed fields
-                    nb.CaptureNetworkBaseline();                  // re-baseline for the next delta
+                if (b is NetworkBehaviour { HasNetworkedState: true } nb) {
+                    snapshotWriter.WriteInt(obj.NetId);
+                    snapshotWriter.WriteUInt(obj.LastProcessedSeq);
+                    snapshotWriter.WriteInt(nb.NetworkTypeId);
+                    nb.SerializeState(snapshotWriter);
+                    nb.CaptureNetworkBaseline();
                     written++;
                 }
             }
@@ -670,29 +733,81 @@ public sealed class NetworkManager {
         return snapshotWriter.AsSpan();
     }
 
-    public int LastSnapshotObjectCount { get; private set; }
+    ReadOnlySpan<byte> SerializeStateSnapshotFor(ClientReplState state, uint sendSeq) {
+        snapshotWriter.Reset();
+        snapshotWriter.WriteUInt(sendSeq);   // P6: the per-client frontier the client acks
+        int written = 0;
+        Dictionary<int, object> sentThisSeq = null;
+        foreach (NetworkObject obj in objects.All()) {
+            if (obj?.Entity is null)
+                continue;
+            foreach (Behaviour b in obj.Entity.Behaviours.ToArray()) {
+                if (b is not NetworkBehaviour { HasNetworkedState: true } nb)
+                    continue;
+                // Swap in THIS client's baseline for the object so SerializeState diffs against it. A client
+                // that has never seen this object (a brand-new spawn the seed-on-spawn path didn't precede)
+                // has no baseline token -> leave the component's own baseline (the swap is a no-op), which is
+                // safe: the seed-on-spawn path normally sets it; absent that the delta is vs whatever the
+                // component holds, and the change still rides.
+                object clientBaseline = state.Baseline.TryGetValue(obj.NetId, out object t) ? t : null;
+                if (clientBaseline is not null)
+                    nb.__SetNetBaseline(clientBaseline);
+
+                // Skip an object that is QUIESCENT for this client (live == its acked baseline) — the
+                // strongest 1-bit-unchanged form (the whole object costs 0). A reflection-free typed compare
+                // the generator emits; no probe/rewind. Then serialize the delta + record the post-send token.
+                if (clientBaseline is not null && nb.__NetStateEquals(clientBaseline))
+                    continue;
+
+                snapshotWriter.WriteInt(obj.NetId);
+                snapshotWriter.WriteUInt(obj.LastProcessedSeq);   // P5b: ack frontier for the reconcile
+                snapshotWriter.WriteInt(nb.NetworkTypeId);
+                nb.SerializeState(snapshotWriter);                // changemask + changed fields vs client baseline
+
+                // Record what this client WILL hold once it acks this seq (the post-send token). Capture the
+                // baseline = live so __GetNetBaseline returns the just-sent values; promoted into the client's
+                // acked baseline on its Ack.
+                nb.CaptureNetworkBaseline();
+                (sentThisSeq ??= new())[obj.NetId] = nb.__GetNetBaseline();
+                written++;
+            }
+        }
+        if (sentThisSeq is not null)
+            state.Pending[sendSeq] = sentThisSeq;
+        LastSnapshotObjectCount = written;
+        return snapshotWriter.AsSpan();
+    }
 
     void FlushStateDown() {
         StateSnapshotsSent++;
         if (clients.Count == 0)
             return;   // no remote observers (a loopback host shares the process — nothing to send to self)
 
-        // Frame the delta batch behind a Snapshot tag and send it Unreliable (latest-wins, §12.1) to every
-        // observing client. SerializeStateSnapshot re-baselines as it writes, so the NEXT flush deltas
-        // against what we just sent (the last-ack model; per-client ack tracking is P6).
-        ReadOnlySpan<byte> batch = SerializeStateSnapshot();
-        if (LastSnapshotObjectCount == 0)
-            return;   // nothing dirty this send — skip the packet entirely
-        byte[] framed = new byte[batch.Length + 1];
-        framed[0] = (byte)NetMessage.Snapshot;
-        batch.CopyTo(framed.AsSpan(1));
-        foreach (Connection c in clients)
+        // Build + send a SEPARATE per-client delta frame (each diffed against that client's acked baseline).
+        // Unreliable (latest-wins, §12.1) — a dropped frame's change re-sends next flush since the client's
+        // baseline only advances on its Ack. A client with nothing dirty for it gets no packet.
+        foreach (Connection c in clients) {
+            if (!clientState.TryGetValue(c, out ClientReplState state))
+                continue;   // not yet handshaken (no baseline) — it gets its full state at join
+            uint sendSeq = state.SendSeq + 1;
+            ReadOnlySpan<byte> batch = SerializeStateSnapshotFor(state, sendSeq);
+            if (LastSnapshotObjectCount == 0)
+                continue;   // nothing changed for this client this send — skip the packet entirely
+            state.SendSeq = sendSeq;
+            byte[] framed = new byte[batch.Length + 1];
+            framed[0] = (byte)NetMessage.Snapshot;
+            batch.CopyTo(framed.AsSpan(1));
             Transport.Send(c, framed, Channel.Unreliable);
+        }
     }
 
     // Send a full Spawn of one object to one client (the join-baseline + each new spawn). Reliable —
     // a missed spawn means the client never builds the mirror. Walks the entity's NetworkBehaviours and
-    // sends a Spawn per state-carrying component (P3: one component per object is the common case).
+    // sends a Spawn per REGISTERED component (NetworkTypeId != 0). P6: this now includes a no-[Networked]
+    // mirror-able type (a partial PlayerController/Pawn) so possession-replication can build the right
+    // controller type on the client via typeId->factory — not just state-carrying components (P3's filter).
+    // SerializeFullState is a no-op for a no-state type, so the frame just carries an empty baseline.
+    // Contract: one registered NetworkBehaviour per NetworkObject (pawn and controller are SEPARATE objects).
     void SendSpawnTo(Connection client, NetworkObject obj, uint predictKey = 0) {
         if (obj?.Entity is null)
             return;
@@ -701,15 +816,22 @@ public sealed class NetworkManager {
         // non-owner from spuriously linking an unrelated predicted object to the same key.
         uint keyForClient = predictKey != 0 && obj.Owner.IsValid && obj.Owner.Equals(client) ? predictKey : 0u;
         foreach (Behaviour b in obj.Entity.Behaviours.ToArray())
-            if (b is NetworkBehaviour nb && nb.HasNetworkedState)
+            if (b is NetworkBehaviour nb && nb.NetworkTypeId != 0)
                 Transport.Send(client, NetworkWire.Spawn(obj.NetId, nb.NetworkTypeId, obj.Owner.Id, nb, keyForClient),
                     Channel.Reliable);
     }
 
-    // Broadcast a spawn to every connected client (called from the server spawn path).
+    // Broadcast a spawn to every connected client (called from the server spawn path). P6: seed each
+    // client's per-client baseline to the new object's current values (the spawn carried a FULL snapshot,
+    // so the client now holds those values — the first delta must diff against them, not a default/global
+    // baseline). Mirrors the join path (HandleHandshake seeds existing objects; this seeds a NEW one for
+    // already-connected clients).
     void BroadcastSpawn(NetworkObject obj, uint predictKey = 0) {
-        foreach (Connection c in clients)
+        foreach (Connection c in clients) {
             SendSpawnTo(c, obj, predictKey);
+            if (clientState.TryGetValue(c, out ClientReplState state))
+                SeedClientBaseline(state, obj);
+        }
     }
 
     // Broadcast a despawn (Reliable) so every client tears its mirror down.
@@ -886,6 +1008,8 @@ public sealed class NetworkManager {
         foreach (Behaviour b in netObj.Entity.Behaviours.ToArray())
             if (b is NetworkBehaviour nb)
                 nb.DriveNetDespawn();
+        foreach (ClientReplState state in clientState.Values)
+            state.Forget(netId);   // P6: drop the despawned object from every client's baseline/pending
         objects.Remove(netId);   // bumps the slot generation -> stale NetworkRefs null out
         netObj.IsSpawned = false;
         netObj.NetId = 0;
@@ -920,6 +1044,95 @@ public sealed class NetworkManager {
         foreach (Behaviour b in netObj.Entity.Behaviours.ToArray())
             if (b is NetworkBehaviour nb)
                 nb.DriveOwnershipChanged(prev, next);
+    }
+
+    // ---- possession-replication (P6, plan §6/§4e) -------------------------------------------------
+    // Called by PlayerController.Possess on the SERVER (both authoritative ends of the possession pair are
+    // spawned NetworkObjects). The server already wired the link locally; this REPLICATES it so the owning
+    // client AUTO-builds its controller's input pipeline (no hand-wiring — the P5b/c/d/f harness scope
+    // boundary closed) and every observer links Pawn.Controller consistently. Idempotent / no-op off-server.
+    internal void OnServerPossess(PlayerController controller, Pawn pawn) {
+        if (!IsServer)
+            return;
+        NetworkObject cObj = controller?.NetworkObject;
+        NetworkObject pObj = pawn?.NetworkObject;
+        if (cObj is not { IsSpawned: true } || pObj is not { IsSpawned: true })
+            return;   // both must be spawned to address them by netId — Phase-1/spawn order guarantees this
+        BroadcastPossess(cObj.NetId, pObj.NetId);
+    }
+
+    internal void OnServerUnpossess(PlayerController controller) {
+        if (!IsServer)
+            return;
+        NetworkObject cObj = controller?.NetworkObject;
+        if (cObj is { IsSpawned: true })
+            BroadcastPossess(cObj.NetId, 0);   // pawnNetId 0 = unpossess
+    }
+
+    void BroadcastPossess(int controllerNetId, int pawnNetId) {
+        byte[] msg = NetworkWire.Possess(controllerNetId, pawnNetId);
+        foreach (Connection c in clients)
+            Transport.Send(c, msg, Channel.Reliable);
+    }
+
+    // Replay the CURRENT possession links to one joining client (late-join, plan §5/§6): walk spawned
+    // PlayerControllers that possess a pawn and send each as a Possess message, so the joiner links them
+    // (and, if it owns one, auto-builds input). Called from the join flow after spawns are sent.
+    void SendPossessionsTo(Connection client) {
+        foreach (NetworkObject obj in objects.All()) {
+            if (obj?.Entity is null)
+                continue;
+            foreach (Behaviour b in obj.Entity.Behaviours.ToArray())
+                if (b is PlayerController { Pawn: { } pawn } pc && pc.NetworkObject is { IsSpawned: true } cObj
+                    && pawn.NetworkObject is { IsSpawned: true } pObj)
+                    Transport.Send(client, NetworkWire.Possess(cObj.NetId, pObj.NetId), Channel.Reliable);
+        }
+    }
+
+    // CLIENT: apply a replicated possession. Resolve the controller + pawn mirrors and link them locally via
+    // the SAME PlayerController.Possess the server ran — so on the OWNING client Possess's owner-gated
+    // TrySetupInput builds the InputComponent (via the controller's CreateInputComponent seam) AND the
+    // prediction InputBuffer, with zero hand-wiring. pawnNetId 0 = unpossess. A controller/pawn whose spawn
+    // hasn't arrived yet is skipped (Reliable spawns precede this Reliable message in practice; a benign
+    // miss self-heals if the server re-sends on the next relevant event).
+    void HandlePossess(ref BitReader r) {
+        int controllerNetId = r.ReadInt();
+        int pawnNetId = r.ReadInt();
+        NetworkObject cObj = objects.Resolve(controllerNetId);
+        PlayerController pc = FindPlayerController(cObj);
+        if (pc is null) {
+            Debugging.LogWarning($"Network: Possess for unknown controller netId {controllerNetId} — dropped.");
+            return;
+        }
+        if (pawnNetId == 0) {
+            pc.Unpossess();
+            return;
+        }
+        NetworkObject pObj = objects.Resolve(pawnNetId);
+        Pawn pawn = FindPawn(pObj);
+        if (pawn is null) {
+            Debugging.LogWarning($"Network: Possess for unknown pawn netId {pawnNetId} — dropped.");
+            return;
+        }
+        pc.Possess(pawn);   // owner-gated TrySetupInput fires inside Possess on the input authority (§7)
+    }
+
+    static PlayerController FindPlayerController(NetworkObject obj) {
+        if (obj?.Entity is null)
+            return null;
+        foreach (Behaviour b in obj.Entity.Behaviours.ToArray())
+            if (b is PlayerController pc)
+                return pc;
+        return null;
+    }
+
+    static Pawn FindPawn(NetworkObject obj) {
+        if (obj?.Entity is null)
+            return null;
+        foreach (Behaviour b in obj.Entity.Behaviours.ToArray())
+            if (b is Pawn p)
+                return p;
+        return null;
     }
 
     internal NetworkObject Resolve(int netId) => objects.Resolve(netId);

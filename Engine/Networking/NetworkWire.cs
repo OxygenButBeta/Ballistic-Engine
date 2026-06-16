@@ -18,6 +18,8 @@ public enum NetMessage : byte {
     Snapshot = 5,    // server->client: a batch of [netId, typeId, delta-state] for dirty objects
     Rpc = 6,         // either direction: netId + typeId + methodId + packed args -> dispatch + invoke (P4)
     Input = 7,       // client->server: a batch of the owner's per-tick NetworkInput (the UP stream, P5b)
+    Ack = 8,         // client->server: "I applied snapshot through seq N" -> advance THIS client's per-client baseline (P6)
+    Possess = 9,     // server->client: controllerNetId possesses pawnNetId -> the client auto-links + (owner) sets up input (P6)
 }
 
 // Static read/write helpers over BitWriter/BitReader for the frame headers. The per-object STATE bytes
@@ -108,6 +110,30 @@ public static class NetworkWire {
         w.WriteByte((byte)Math.Min(batch.Length, 255));
         for (int i = 0; i < batch.Length && i < 255; i++)
             batch[i].Write(w);
+        return w.AsSpan().ToArray();
+    }
+
+    // P6: a client's ACK of the per-client snapshot frontier it has applied. The server advances THAT
+    // client's per-client delta baseline to what it sent at <= seq (so the next delta diffs against what the
+    // client now holds). Reliable-ordered so a lost ack doesn't strand the baseline (it just re-sends the
+    // unacked delta until an ack lands — the §13 latest-wins recovery). Tiny (tag + uint).
+    public static byte[] Ack(uint snapshotSeq) {
+        var w = new BitWriter();
+        w.WriteByte((byte)NetMessage.Ack);
+        w.WriteUInt(snapshotSeq);
+        return w.AsSpan().ToArray();
+    }
+
+    // P6 POSSESSION-REPLICATION (plan §6/§4e): the server tells clients that controllerNetId now possesses
+    // pawnNetId. The owning client AUTO-builds the possession (links pc.Pawn <-> pawn.Controller and, being
+    // the input authority, sets up its InputComponent via CreateInputComponent) — so a real game no longer
+    // hand-wires the owning client's controller (the P5b/c/d/f harness scope boundary). Other clients link
+    // the references too (so Pawn.Controller is consistent everywhere). pawnNetId 0 = unpossess. Reliable.
+    public static byte[] Possess(int controllerNetId, int pawnNetId) {
+        var w = new BitWriter();
+        w.WriteByte((byte)NetMessage.Possess);
+        w.WriteInt(controllerNetId);
+        w.WriteInt(pawnNetId);
         return w.AsSpan().ToArray();
     }
 
