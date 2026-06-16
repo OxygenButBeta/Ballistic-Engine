@@ -29,6 +29,18 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
         Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT_FRAME"), out int f) ? f : 180;
     static readonly bool ScreenshotExit = Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT_EXIT") != "0";
 
+    // GI Phase-6 MOTION-stability harness (BALLISTIC_DX12_GI_MOTION_DUMP=<dir>): instead of one capture, save a
+    // SEQUENCE of the last K consecutive frames (frame_00.bmp … frame_{K-1}.bmp) so a python helper can measure
+    // frame-to-frame "boiling" (mean abs delta of consecutive GI-isolate frames). The point of Phase 6 is
+    // "stable under motion / no boiling", which a single PAUSED capture cannot show. Run this with a STATIC
+    // serialized camera + temporal ACTIVE (i.e. NOT BALLISTIC_DETERMINISTIC, which makes the temporal pass a
+    // pass-through) + GI-isolate on + exposure pinned: a STABLE temporal chain → consecutive deltas decay toward
+    // 0; a BOILING chain → deltas stay high. The total frame count runs to ScreenshotFrame so the field is
+    // converged before the dumped window; the last K frames are written. K = BALLISTIC_DX12_GI_MOTION_FRAMES (8).
+    static readonly string MotionDumpDir = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_MOTION_DUMP");
+    static readonly int MotionDumpFrames = int.TryParse(
+        Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_MOTION_FRAMES"), out int mf) && mf > 0 ? mf : 8;
+
     public Dx12HeadlessRuntime(int width = 1920, int height = 1080) {
         window = new HeadlessWindow(width, height, this);
         Window = window;
@@ -44,10 +56,21 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
         // frames then stop (nothing to present without a swapchain). Query mode also needs a frame or two so
         // the AS-feeding RuntimeSet<IStaticMeshRenderer> is populated before the query runs.
         bool queryMode = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("BALLISTIC_QUERY"));
-        int lastFrame = ScreenshotPath is not null ? ScreenshotFrame : (queryMode ? 3 : 5);
+        bool motionMode = !string.IsNullOrWhiteSpace(MotionDumpDir);
+        // Motion harness runs to ScreenshotFrame total (field converged), dumping the LAST MotionDumpFrames.
+        int motionTotal = motionMode ? Math.Max(ScreenshotFrame, MotionDumpFrames) : 0;
+        int lastFrame = motionMode ? motionTotal
+            : ScreenshotPath is not null ? ScreenshotFrame
+            : queryMode ? 3 : 5;
         for (int frame = 1; frame <= lastFrame; frame++) {
             WindowUpdateCallback?.Invoke(dt);
             WindowRenderCallback?.Invoke(dt);
+
+            if (motionMode && frame > motionTotal - MotionDumpFrames) {
+                SaveMotionFrame(frame - (motionTotal - MotionDumpFrames) - 1);   // 0-based index in the window
+                if (frame == motionTotal) { Console.WriteLine($"[GI-Motion] dumped {MotionDumpFrames} frames to {MotionDumpDir}"); return; }
+                continue;   // skip the single-shot screenshot logic while dumping the sequence
+            }
 
             if (ScreenshotPath is not null && frame == ScreenshotFrame) {
                 SaveScreenshot();
@@ -111,6 +134,18 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
         else {
             Console.Error.WriteLine("[Screenshot] DX12 renderer not active; nothing saved.");
         }
+    }
+
+    // P6.0 motion harness: save one frame of the consecutive-frame sequence as frame_NN.bmp into MotionDumpDir.
+    void SaveMotionFrame(int index) {
+        if (RenderAsset.Current.Renderer is not DX12HDRenderer r) {
+            Console.Error.WriteLine("[GI-Motion] DX12 renderer not active; nothing saved.");
+            return;
+        }
+        System.IO.Directory.CreateDirectory(MotionDumpDir);
+        string path = System.IO.Path.Combine(MotionDumpDir,
+            string.Create(System.Globalization.CultureInfo.InvariantCulture, $"frame_{index:00}.bmp"));
+        r.SaveFrame(path);
     }
 
     // Raw G-buffer dump for `bal gbuffer` (BALLISTIC_GBUFFER_DUMP=<dir>): after the frame, write depth/normal/

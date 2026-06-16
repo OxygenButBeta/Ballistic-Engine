@@ -36,11 +36,13 @@ internal class Program {
         BallisticEngine.Profiling.TracyProfiler.TryInstall("Ballistic Runtime");
 
         // DX12-only host (GL deleted — DX12Migration.md ENDGAME 3). With BALLISTIC_SCREENSHOT (deterministic
-        // offscreen capture) OR BALLISTIC_QUERY (the `bal query` scene-query path) set, we use the windowless
-        // headless host — both are agent/verification paths that must NEVER open a window (a stray window the
-        // user could fullscreen-toggle crashed the swapchain). A normal launch uses the windowed DX12 host.
+        // offscreen capture), BALLISTIC_QUERY (the `bal query` scene-query path), or BALLISTIC_DX12_GI_MOTION_DUMP
+        // (the Phase-6 motion-stability sequence harness) set, we use the windowless headless host — all are
+        // agent/verification paths that must NEVER open a window (a stray window the user could fullscreen-toggle
+        // crashed the swapchain). A normal launch uses the windowed DX12 host.
         bool headlessMode = Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT") is not null
-                            || Environment.GetEnvironmentVariable("BALLISTIC_QUERY") is not null;
+                            || Environment.GetEnvironmentVariable("BALLISTIC_QUERY") is not null
+                            || Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_MOTION_DUMP") is not null;
         IBallisticEngineRuntime runtime;
         if (headlessMode) {
             Console.WriteLine("[Backend] DX12 host (headless — screenshot/query path).");

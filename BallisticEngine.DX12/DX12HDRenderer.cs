@@ -225,6 +225,24 @@ public sealed class DX12HDRenderer : HDRenderer {
     bool? ddgiOn;
     bool DdgiEnabled => ddgiOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI") == "1";
 
+    // P6.0 MOTION-stability harness (Phase 6): a DETERMINISTIC scripted camera orbit so the motion-dump
+    // sequence has GENUINE camera movement — the only way reprojection + disocclusion (the real "boiling"
+    // conditions) appear; a static camera only tests EMA convergence. BALLISTIC_DX12_GI_ORBIT=<deg/frame>
+    // (0 = off) rotates the camera around a pivot in front of it by that yaw each frame, rebuilding the view —
+    // so geometry, motion vectors (history reprojection), camPos (DDGI snap) and lighting all see one coherent
+    // moving camera. Applied at the renderer level (before view derives everything) so it composes with any GI
+    // mode. Off by default → zero effect on every existing capture. The orbit frame index = the SSGI frame
+    // counter (advances once per render), so two runs are byte-identical. Pivot distance is tunable too.
+    float? giOrbitDeg;
+    float GiOrbitDegPerFrame => giOrbitDeg ??= float.TryParse(
+        Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_ORBIT"),
+        System.Globalization.CultureInfo.InvariantCulture, out float d) ? d : 0f;
+    float? giOrbitPivot;
+    float GiOrbitPivotDist => giOrbitPivot ??= float.TryParse(
+        Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_ORBIT_PIVOT"),
+        System.Globalization.CultureInfo.InvariantCulture, out float p) && p > 0f ? p : 6f;
+    int giOrbitFrame;   // advances once per rendered frame while the orbit is active
+
     // Phase 4: screen-space radiance probes (final gather). When DDGI is on, the screen-probe gather
     // (Place→Trace→Blend→Integrate, bilateral-upsampled, miss → DDGI world cache) is the DEFAULT near/mid-field
     // GI source — DDGI is the far-field cache. This is the published Lumen screen-trace → world-cache hierarchy.
@@ -279,6 +297,28 @@ public sealed class DX12HDRenderer : HDRenderer {
     // via PostFX. Falls back to the volume's SsgiDebugView so the existing inspector toggle works headless too.
     bool GiIsolateOn() =>
         Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_ISOLATE") == "1" || PostFX.SsgiDebugView;
+
+    // P6.0 motion harness: rotate the view by a cumulative scripted yaw around a pivot in front of the camera,
+    // so the dumped sequence has GENUINE camera motion (reprojection + disocclusion = the real boiling test).
+    // No-op when BALLISTIC_DX12_GI_ORBIT is unset/0 (returns the input view unchanged → every existing capture
+    // is byte-identical). Deterministic: the yaw = giOrbitFrame * degPerFrame, frame index advances once per
+    // call, so two runs match. Rebuilds via BMatrix.LookAt (the exact convention the renderer's view expects),
+    // so motion vectors / camPos / lighting all derive from one coherent orbited camera.
+    Matrix4x4 ApplyGiOrbit(Matrix4x4 view) {
+        float degPerFrame = GiOrbitDegPerFrame;
+        if (degPerFrame == 0f) return view;
+        if (!Matrix4x4.Invert(view, out Matrix4x4 invView)) return view;
+        Vector3 eye = invView.Translation;
+        // LookAt basis lives in invView rows: forward = -Z basis.
+        Vector3 fwd = -Vector3.Normalize(new Vector3(invView.M31, invView.M32, invView.M33));
+        Vector3 pivot = eye + fwd * GiOrbitPivotDist;
+        float yaw = (giOrbitFrame++) * degPerFrame * (MathF.PI / 180f);   // cumulative; advances per frame
+        // Rotate the eye around the pivot's WORLD-up axis (Y) so the orbit reads like a natural camera pan/arc.
+        Matrix4x4 rot = Matrix4x4.CreateFromAxisAngle(Vector3.UnitY, yaw);
+        Vector3 newEye = pivot + Vector3.Transform(eye - pivot, rot);
+        Vector3 newTarget = pivot;   // keep looking at the pivot → the scene stays framed as it orbits
+        return BMatrix.LookAt(newEye, newTarget, Vector3.UnitY);
+    }
 
     // Transparent forward pass: after deferred + sky, draw Material.Transparent submeshes back-to-front,
     // alpha-blended, depth-testing the G-buffer depth (LEqual, no write). Full forward PBR (sun + IBL +
@@ -1419,6 +1459,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         // Camera. The provider's view (LookAt) is convention-agnostic — convert 1:1. Rebuild the
         // projection DX-style (RH, z in [0,1]) since the provider's is OpenTK GL-convention (z in [-1,1]).
         Matrix4x4 view = ToNumerics(vp.GetViewMatrix());
+        view = ApplyGiOrbit(view);   // P6.0 motion harness: deterministic scripted orbit (no-op unless GI_ORBIT set)
         Matrix4x4 proj = Matrix4x4.CreatePerspectiveFieldOfView(
             FovYRadians, (float)targetW / targetH, CameraNear, CameraFar);
         Matrix4x4 projUnjittered = proj;   // before the jitter — the shadow cascade fit uses this (stable
@@ -1451,7 +1492,11 @@ public sealed class DX12HDRenderer : HDRenderer {
             ViewProjPrev = Matrix4x4.Transpose(viewProjPrevForMotion),
         };
 
-        Vector3 camPos = ToNumerics(vp.Transform.WorldPosition);
+        // camPos from the (possibly orbited) view so DDGI grid-snap + lighting follow the harness camera, not
+        // the un-orbited serialized transform. For an un-orbited frame this equals vp.Transform.WorldPosition.
+        Vector3 camPos = GiOrbitDegPerFrame != 0f && Matrix4x4.Invert(view, out Matrix4x4 invViewForPos)
+            ? invViewForPos.Translation
+            : ToNumerics(vp.Transform.WorldPosition);
         LightUniforms light = LightUniforms.Resolve();
         Vector3 lightDir = ToNumerics(light.Direction);
         Vector3 lightColor = ToNumerics(light.Color);

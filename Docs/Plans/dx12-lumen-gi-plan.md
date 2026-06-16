@@ -159,15 +159,49 @@ deleted — commit 1b0485ad.)
   interior LEAK TEST PASS (99.8% near-black, bounce contained, no wall bleed, mean 3.4 == fallback). Audit
   wf_5cb47cb8 GO (3/3, 0 blockers; byte-identical-off oracle + barrier brackets + handoff re-verified).
 
-**Phase 5 — World radiance cache (far-field stability).**
-- DDGI-style world-space irradiance probes (auto-placed via the GpuSceneQuery substrate — invisible,
-  tuning-free) for stable, cheap distant GI; screen/RT traces fall back to it at range.
-- Verify: far-field stable + cheaper; no light leak (visibility-aware, per the GpuSceneQuery plan).
+**Phase 5 — World radiance cache / SURFELS (far-field stability). [DEFERRED 2026-06-16 — user chose Phase 6+8 first.]**
+> **DECISION (2026-06-16, user, after adversarial research wf_81bc0ec0):** DEFER surfels; do Phase 6 then Phase 8
+> first. The "DDGI now → surfels later" fork still holds, but the research's honest finding is that on the engine's
+> INTERIOR fixtures (SunTemple, BistroInterior_Wine) surfels are a MARGINAL, mostly-OFF-SCREEN win: the engine
+> already ships the exact two-level radiance-cache hierarchy GIBS is one variant of (screen-probe PRIMARY →
+> DDGI far-field cache), and DDGI already produces the enclosed-room bounce GL-Lumen failed (BistroInterior
+> 17.4→27.3, SunTemple 78→97). ~60-70% of a surfel build is free via the proven rayData producer-swap + the
+> identical `DdgiTrace.ShadeHit` loop — BUT the genuinely-new parts (GPU spatial hash grid + screen-driven
+> spawn/coverage + atomic free-list + GPU compaction) are the HIGHEST device-removal-hazard class the project
+> could add (a TDR once hard-crashed the PC), AND are exactly the passes GIBS hides on an async-compute queue
+> that this FULLY SYNCHRONOUS renderer (every pass = ExecuteSync + WaitForGpu) structurally cannot overlap →
+> ~0.5-1.5ms of un-hideable serial cost ON TOP of a DDGI trace that already extrapolates to ~1.5-2ms on a
+> GTX-1660 (near-saturating the hard ≤2ms GI budget). Phase 6 (denoise/temporal) + Phase 8 (reflections) are
+> both UNBUILT, both fit the 1660 budget, and both deliver visible EVERY-FRAME wins on the current fixtures —
+> strictly more visible benefit. **Revisit surfels (the measurement-gated `minimal-surfel-reusing-ddgi` build:
+> P5.0 dev-card go/no-go like P7.2a → persistent buffer+hash grid → spawn/recycle → trace producer-swap →
+> gather+leak) when content scales PAST the ~30m camera-centered DDGI box, where the fixed grid actually breaks.**
+- (when reopened) DDGI-style or surfel world-space cache for stable, cheap distant GI; screen/RT traces fall
+  back to it at range. Surface-anchored surfels = adaptive density + no grid-straddles-a-wall leak (but their
+  own disc-radius/silhouette leak class), the defensible win on large/streamed content. Research: wf_81bc0ec0.
 
-**Phase 6 — Denoise + temporal tuning.**
+**Phase 6 — Denoise + temporal tuning. [IN PROGRESS 2026-06-16 — chosen next after the Phase 5 deferral.]**
 - OIDN (zero-copy, done) on the gather + temporal reprojection (motion buffer). Apply the hard-won temporal
   rules (ternary NaN scrub, pre-exposure consistency, disocclusion rejection).
-- Verify: converged + stable under motion; no boiling; no NaN black holes.
+- The chain ALREADY EXISTS and honors the lessons (Ssgi.hlsl PSTemporal: motion reproject + neighbourhood clamp
+  + pre/post firefly clamp + box-drift disocclusion reset + ternary Sanitize; OIDN zero-copy GPU path with CPU
+  readback fallback). Phase 6 = TUNING + the known gaps, not a from-scratch build.
+- **SUB-PLAN (user-approved 2026-06-16 — "Guided OIDN + motion-test harness"):**
+  - **P6.0 — MOTION-stability measurement harness FIRST** (the Phase-6 antidote, like P0 was for the track).
+    PAUSED captures can't show temporal stability/boiling. Build a way to capture a live-temporal sequence
+    (scripted orbit OR static-camera live-temporal play frames) + a frame-to-frame "boiling" metric (mean abs
+    delta of the GI-isolate between consecutive frames) so "stable under motion" is MEASURED, not eyeballed.
+    Behind a BALLISTIC_DX12_* door; deterministic paused capture stays byte-identical.
+  - **P6.1 — Guided OIDN (albedo + normal AOVs).** OIDN currently denoises UNGUIDED (color-only) in BOTH paths
+    (zero-copy Pack sends color only; CPU readback passes null,null). Feed the (half-res) G-buffer ALBEDO (RT0)
+    + WORLD-NORMAL (RT1) as OIDN guide buffers — the standard edge-preserving win. The API wrapper already
+    supports albedo/normal filter images (DenoiseHdr args + setFilterImage); the zero-copy path needs 2 extra
+    shared float buffers + pack shaders; the readback path just needs the existing null args filled. Behind a
+    door (BALLISTIC_DX12_OIDN_GUIDE=0 = unguided fallback) so it's A/B-able + byte-identical-off provable.
+  - **P6.2 — Temporal A/B tune + verify no boiling under motion** using the P6.0 harness. Tune the EMA only if
+    the metric shows boiling; do NOT rewrite the already-correct temporal pass (gold-plating). Final judgement:
+    motion-boiling metric improves (or holds) with guided OIDN; GI-isolate edges sharper; paused byte-identical.
+- Verify: converged + stable under motion; no boiling; no NaN black holes; byte-identical deterministic capture.
 
 **Phase 7 — Low-end / no-RT fallback. [★ DONE AT THE FLOOR 2026-06-16 — ships SSGI+IBL+SSAO; the raster-DDGI proxy
 was built + measured NON-VIABLE (~2ms/probe) and user chose to stop at P7.1. See P7.2b below.]**
