@@ -238,6 +238,17 @@ public sealed class DX12HDRenderer : HDRenderer {
     bool screenProbeLogged;
     bool? screenProbeOn;
     bool ScreenProbeEnabled => screenProbeOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_SCREENPROBE") != "0";
+
+    // P7.2 NO-RT DDGI probe update (rasterized cube-relit far-field for GPUs without HW ray tracing).
+    // P7.2a is MEASUREMENT-ONLY: BALLISTIC_DX12_NORT_PROBES=1 renders ONE probe (6 cube faces) at the camera +
+    // times it (the user-demanded go/no-go gate before any grid wiring); _DEBUG=1 blits the albedo cube to
+    // ssgiTarget. NO rayData/blend/grid yet. See Dx12RasterProbe.cs.
+    Dx12RasterProbe rasterProbe;
+    bool rasterProbeLogged;
+    bool? nortProbesOn;
+    bool NortProbesEnabled => nortProbesOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_NORT_PROBES") == "1";
+    Dx12DescriptorHeap rasterProbeDbgHeap;   // 2 descriptors (cube SRV @0, ssgiTarget UAV @1), rebuilt per use
+
     bool rtGiBuilt;
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct RtGiConstants { public Matrix4x4 InvViewProj; public Matrix4x4 ViewProj; public Vector4 Params; }  // preExp, rayLength, _, frameIdx
@@ -357,11 +368,15 @@ public sealed class DX12HDRenderer : HDRenderer {
         public float Exposure; public Vector3 Pad;
     }
 
-    // Procedural sky pass (atmosphere marched per-pixel; no cubemap, no SRV — pure ALU).
+    // Procedural sky pass. The FAST background path samples the baked env cube (procSkyBgPso, one cube fetch
+    // per pixel); procSkyPso is the per-pixel atmosphere/cloud march, kept only as the fallback for the frame
+    // before any env cube has been baked. Both share procSkyRootSig (CBV b0 + cube SRV table t0 + sampler s0).
     ID3D12RootSignature procSkyRootSig;
-    ID3D12PipelineState procSkyPso;
+    ID3D12PipelineState procSkyPso;      // fallback: full SkyRadiance() march
+    ID3D12PipelineState procSkyBgPso;    // primary: sample the baked env cube
     ID3D12Resource procSkyCb;
     unsafe byte* procSkyCbMapped;
+    Dx12DescriptorHeap procSkyEnvSrvVisible;   // env cube SRV copied per frame for the background sample
 
     // MUST match ProceduralSky.hlsl's cbuffer AND Dx12IblBaker.ProcSkyConstants byte-for-byte.
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
@@ -1215,15 +1230,25 @@ public sealed class DX12HDRenderer : HDRenderer {
     }
 
     unsafe void BuildProcSky() {
-        // CBV-only root sig (the atmosphere is pure ALU — no textures).
+        // Root sig: ProcSky CBV (b0) + env cube SRV table (t0) + a linear-clamp sampler (s0). The CBV still
+        // drives the march fallback; the SRV/sampler feed the fast env-cube background sample.
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView,
             new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
+        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
+        var sampler = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipLinear,
+            AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
+            AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
         procSkyRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv })));
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { sampler })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("ProceduralSky.hlsl");
         byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "ProceduralSky.hlsl");
         byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "ProceduralSky.hlsl");
+        byte[] psBg = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSBackground", "ProceduralSky.hlsl");
         var ds = DepthStencilDescription.Default;
         ds.DepthWriteMask = DepthWriteMask.Zero;
         ds.DepthFunc = ComparisonFunction.LessEqual;
@@ -1237,11 +1262,15 @@ public sealed class DX12HDRenderer : HDRenderer {
             SampleDescription = new SampleDescription(1, 0),
         };
         procSkyPso = dev.Device.CreateGraphicsPipelineState(psoDesc);
+        psoDesc.PixelShader = psBg;
+        procSkyBgPso = dev.Device.CreateGraphicsPipelineState(psoDesc);
 
         int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<ProcSkyConstants>() + 255) & ~255;
         procSkyCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         procSkyCbMapped = procSkyCb.Map<byte>(0);
+        procSkyEnvSrvVisible = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true);
     }
 
     unsafe void BuildSkybox() {
@@ -1668,6 +1697,11 @@ public sealed class DX12HDRenderer : HDRenderer {
         }
         if (giMode == GiMode.RayTraced) { if (EnsureRtGi()) TimePass("GI:RT", () => DrawRtGi(view, viewProj, proj, lightDir, lightColor, camPos)); else TimePass("GI:SSGI", () => DrawSsgi(view, proj)); }
         else if (giMode == GiMode.ScreenSpace) TimePass("GI:SSGI", () => DrawSsgi(view, proj));
+
+        // P7.2a NO-RT RASTER PROBE measurement (BALLISTIC_DX12_NORT_PROBES=1): render ONE probe (6 cube faces) at
+        // the camera + time it — the go/no-go gate before any grid wiring. Independent of giMode/RT (pure raster).
+        // _DEBUG=1 blits the albedo cube into ssgiTarget (so the GI-isolate capture shows it). Standalone; no grid.
+        if (NortProbesEnabled) DrawRasterProbeMeasure(camPos);
 
         // --- Volumetric fog (post pass, reads depth+shadows, blends over HDR scene color) ---
         // BALLISTIC_FX_VOLUMETRIC=1 forces it on (same harness contract as the GL backend).
@@ -2766,6 +2800,127 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (sw != null) { sw.Stop(); RenderStats.Scene.GpuPasses.Add(("GI:ScreenProbe", sw.Elapsed.TotalMilliseconds)); }
     }
 
+    // P7.2a MEASUREMENT: render ONE DDGI probe at the camera position (6 cube faces of a small G-buffer) and
+    // time it — the go/no-go gate for the rasterized no-RT probe update before any grid wiring (the naive full
+    // grid is 12,288 geometry passes/frame; even amortized it is borderline on a GTX-1660). NO rayData/blend/grid.
+    // _DEBUG=1 blits the albedo cube (equirect) into ssgiTarget so the GI-isolate capture shows the rasterized
+    // probe is correct geometry. The per-face geometry is the SAME per-submesh loop as the camera G-buffer (lean
+    // variant: probe PSO writes albedo+normal+depth only, no lighting fields, no GPU-driven whole-mesh path —
+    // that's a P7.2c add). One ExecuteSync (all 6 faces batched). Returns leaving ssgiTarget untouched unless debug.
+    unsafe void DrawRasterProbeMeasure(Vector3 camPos) {
+        if (rasterProbe == null) rasterProbe = new Dx12RasterProbe(dev);
+        rasterProbe.Build();
+
+        var fallbackDiffuse = DefaultTextures.Neutral(TextureType.Diffuse) as Dx12Texture2D;
+
+        // The per-face draw: run the per-submesh opaque loop with the probe-face viewProj into the bound RTV/DSV.
+        // Lean DrawConstants (lighting fields zeroed — the probe G-buffer is unlit; relit in P7.2b). Per-submesh
+        // frustum cull vs the probe face frustum. Reuses srvVisible (this frame's material heap) + the CBV ring.
+        // probeDrawSlot indexes a SEPARATE region of the CBV ring (starting high) so it can't collide with the
+        // camera geometry pass's slots this frame.
+        int probeDraws = 0;
+        int probeDrawSlot = cbSlotCount / 2;   // upper half of the CBV ring — disjoint from camera-pass slots
+        void DrawFace(ID3D12GraphicsCommandList4 cl, Matrix4x4 faceVP) {
+            cl.SetGraphicsRootSignature(rasterProbe.GeoRootSig);
+            cl.SetPipelineState(rasterProbe.GeoPso);
+            cl.SetDescriptorHeaps(srvVisible.Heap);
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            ExtractFrustumPlanes(faceVP);   // sets frustumPlanes used by AabbInFrustum (camera frustum already consumed)
+
+            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
+                if (r is null || !r.IsActive || !r.IsRenderable) continue;
+                Mesh mesh = r.SharedMesh;
+                if (mesh is null) continue;
+                var vb = mesh.VertexBuffer as Dx12Buffer<GLVector3>;
+                var ib = mesh.IndexBuffer as Dx12IndexBuffer;
+                var nb = mesh.NormalBuffer as Dx12Buffer<GLVector3>;
+                var ub = mesh.UvBuffer as Dx12Buffer<Vector2>;
+                var tb = mesh.TangentBuffer as Dx12Buffer<Vector4>;
+                if (vb?.Resource is null || ib?.Resource is null || nb?.Resource is null ||
+                    ub?.Resource is null || tb?.Resource is null) continue;
+
+                Matrix4x4 model = ToNumerics(r.Transform.WorldMatrix);
+                Matrix4x4 mvp = model * faceVP;
+                Span<VertexBufferView> vbViews = stackalloc VertexBufferView[4];
+                vbViews[0] = new VertexBufferView(vb.GpuAddress, (uint)vb.ByteSize, (uint)vb.Stride);
+                vbViews[1] = new VertexBufferView(nb.GpuAddress, (uint)nb.ByteSize, (uint)nb.Stride);
+                vbViews[2] = new VertexBufferView(ub.GpuAddress, (uint)ub.ByteSize, (uint)ub.Stride);
+                vbViews[3] = new VertexBufferView(tb.GpuAddress, (uint)tb.ByteSize, (uint)tb.Stride);
+                cl.IASetVertexBuffers(0, vbViews);
+                cl.IASetIndexBuffer(new IndexBufferView(ib.GpuAddress, (uint)ib.ByteSize, Format.R32_UInt));
+
+                int only = r.SubMeshIndex;
+                int first = only >= 0 ? only : 0;
+                int last = only >= 0 ? only : mesh.SubMeshes.Length - 1;
+                for (int s = first; s <= last; s++) {
+                    if ((uint)s >= (uint)mesh.SubMeshes.Length) break;
+                    SubMeshData sub = mesh.SubMeshes[s];
+                    if (sub.IndexCount <= 0) continue;
+                    mesh.GetSubMeshBounds(s, out GLVector3 lmin, out GLVector3 lmax);
+                    if (!AabbInFrustum(lmin, lmax, model)) continue;
+                    Material mat = r.MaterialFor(s);
+                    if (mat is null || mat.Transparent) continue;
+                    if (probeDrawSlot >= cbSlotCount) break;
+
+                    var c = new DrawConstants {
+                        Mvp = Matrix4x4.Transpose(mvp), Model = Matrix4x4.Transpose(model),
+                        BaseColorFactor = ToNumerics(mat.BaseColorFactor),
+                        Cutout = mat.Cutout ? 1f : 0f, HasEmissive = mat.IsEmissive ? 1f : 0f,
+                    };
+                    *(DrawConstants*)(cbMapped + (long)probeDrawSlot * cbSlotSize) = c;
+                    cl.SetGraphicsRootConstantBufferView(0, cbRing.GPUVirtualAddress + (ulong)((long)probeDrawSlot * cbSlotSize));
+
+                    int tableStart = srvVisible.AllocateRange(Dx12RasterProbe.MaterialSrvCount);
+                    BindSrv(tableStart + 0, mat.Diffuse, TextureType.Diffuse, fallbackDiffuse);
+                    BindSrv(tableStart + 1, mat.Normal, TextureType.Normal, null);
+                    BindSrv(tableStart + 2, mat.Metallic, TextureType.Metallic, null);
+                    BindSrv(tableStart + 3, mat.Roughness, TextureType.Roughness, null);
+                    BindSrv(tableStart + 4, mat.AO, TextureType.AO, null);
+                    BindSrv(tableStart + 5, mat.Emissive, TextureType.Emissive, null);
+                    cl.SetGraphicsRootDescriptorTable(1, srvVisible.Gpu(tableStart));
+
+                    cl.DrawIndexedInstanced((uint)sub.IndexCount, 1, (uint)sub.IndexStart, 0, 0);
+                    probeDrawSlot++; probeDraws++;
+                }
+            }
+        }
+
+        // Give the probe pass a CLEAN material-SRV ring: it runs AFTER the camera/SSGI passes (which consumed
+        // part of srvVisible) and records all 6 faces into ONE command list. Resetting the cursor here (safe —
+        // every prior pass is its own drained ExecuteSync, so no camera descriptor is GPU-live) keeps the 6 faces'
+        // AllocateRange(6) calls from lapping the 49152-slot heap within this single un-drained submission on a
+        // heavy scene (audit's one bounded hazard). Mirrors the camera-pass Reset (the geometry pass does the same).
+        srvVisible.Reset();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        dev.ExecuteSync(cl => rasterProbe.RenderOneProbe(cl, camPos, DrawFace));
+        sw.Stop();
+        RenderStats.Scene.GpuPasses.Add(("GI:RasterProbe1", sw.Elapsed.TotalMilliseconds));
+
+        if (!rasterProbeLogged) {
+            rasterProbeLogged = true;
+            int perFace = probeDraws / 6;
+            Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                $"[RASTERPROBE] P7.2a measure: 1 probe x 6 faces @ {Dx12RasterProbe.FaceRes}px = {probeDraws} draws " +
+                $"(~{perFace}/face) in {sw.Elapsed.TotalMilliseconds:0.000}ms (dev card). VRAM {rasterProbe.VramBytes/1024.0:0.0}KB. " +
+                $"Extrapolate: 128 probes/frame ~= {sw.Elapsed.TotalMilliseconds*128:0.0}ms naive (before proxy/cull tuning)."));
+        }
+
+        // Debug: equirect-blit the albedo cube into ssgiTarget so the GI-isolate capture shows the probe geometry.
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_NORT_PROBES_DEBUG") == "1") {
+            if (rasterProbeDbgHeap == null)
+                rasterProbeDbgHeap = new Dx12DescriptorHeap(dev,
+                    DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true);
+            var ht = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+            dev.Device.CopyDescriptorsSimple(1, rasterProbeDbgHeap.Cpu(0), rasterProbe.AlbedoCubeSrv, ht);
+            dev.Device.CreateUnorderedAccessView(ssgiTarget.RenderTarget, null, new UnorderedAccessViewDescription {
+                Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+            }, rasterProbeDbgHeap.Cpu(1));
+            ssgiTarget.ColorToUnorderedAccess();
+            dev.ExecuteSync(cl => rasterProbe.DebugBlit(cl, rasterProbeDbgHeap, ssgiTarget.Width, ssgiTarget.Height, SsgiPreExposure()));
+            ssgiTarget.ColorToShaderResource();
+        }
+    }
+
     // HBAO from the G-buffer (scene depth for view-pos + world normal, both already SRVs from the deferred
     // pass) → blurred half-res AO in ssaoA. No depth-reconstructed normal anymore — the real surface normal
     // comes straight from the G-buffer (sharper, silhouette-correct). View transforms the world normal into
@@ -3124,9 +3279,24 @@ public sealed class DX12HDRenderer : HDRenderer {
         *(ProcSkyConstants*)procSkyCbMapped = sc;
 
         cl.SetGraphicsRootSignature(procSkyRootSig);
-        cl.SetPipelineState(procSkyPso);
         cl.SetGraphicsRootConstantBufferView(0, procSkyCb.GPUVirtualAddress);
         cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+
+        // FAST PATH: the IBL baker already rendered the full SkyRadiance() kernel (atmosphere + clouds +
+        // cirrus + stars + sun disk) into the env cube this frame — sample it instead of marching the whole
+        // atmosphere again for every screen pixel. One cube fetch/pixel vs thousands of ALU/pixel; this was
+        // the FPS sink. Only the first frame (before any bake) falls back to the per-pixel PSMain march.
+        // BALLISTIC_DX12_SKY_MARCH=1 forces the old per-pixel march (A/B + escape hatch).
+        bool forceMarch = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SKY_MARCH") == "1";
+        if (!forceMarch && iblActiveThisFrame && ibl is { HasBaked: true }) {
+            dev.Device.CopyDescriptorsSimple(1, procSkyEnvSrvVisible.Cpu(0), ibl.EnvSrv,
+                DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
+            cl.SetPipelineState(procSkyBgPso);
+            cl.SetDescriptorHeaps(procSkyEnvSrvVisible.Heap);
+            cl.SetGraphicsRootDescriptorTable(1, procSkyEnvSrvVisible.Gpu(0));
+        } else {
+            cl.SetPipelineState(procSkyPso);
+        }
         cl.DrawInstanced(36, 1, 0, 0);
     }
 

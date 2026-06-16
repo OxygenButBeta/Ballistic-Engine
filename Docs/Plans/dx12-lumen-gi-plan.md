@@ -200,10 +200,28 @@ deleted — commit 1b0485ad.)
   dramatic off-screen "window-behind-camera" hole the research warns about needs an ADVERSARIAL camera; it's a
   principle to fix (P7.2 raster-DDGI), not a catastrophe on these views. So P7.2 is a QUALITY-CEILING build, not a
   rescue. Captures e:/tmp/p4flip/p71_*.
-- **P7.2 — rasterized probe G-buffer capture (no relight).** Per-probe small (16-32px) cubemap G-buffer
-  (depth/normal/albedo) into the EXISTING DDGI octahedral textures, time-sliced round-robin, FIXED deterministic
-  order. Debug-view one probe's G-buffer. **MEASURE probes/frame inside the 1660 budget** (the unmeasured risk —
-  this is the go/no-go gate; grid/time-slice chosen from the number, not guessed). Cubemap (6 draws, simple) first.
+- **P7.2 — rasterized probe G-buffer capture (no relight).** Design (research wf_8c41941d + adversarial audit
+  wf_bc98efc7): the DDGI cache is decoupled from its ray source by the rayData buffer, so P7.2 swaps the PRODUCER
+  of rayData (raster+relight per probe instead of inline RayQuery), reusing ~99% of the cache (blend/gather/
+  Chebyshev/multibounce/round-robin/warm-up/determinism). User chose cube-6-faces (correct first) + measure-one-
+  probe-first.
+  - **P7.2a DONE & VERIFIED — the go/no-go MEASUREMENT (the gate the user demanded).** Dx12RasterProbe.cs +
+    RasterProbe.hlsl/RasterProbeDebug.hlsl: render ONE probe at the camera as 6 cube faces of a 24px G-buffer
+    (albedo+normal+depth), reusing the per-submesh draw loop with a probe-face viewProj; NO rayData/blend/grid.
+    Behind BALLISTIC_DX12_NORT_PROBES=1 (+_DEBUG=1 blit). Audit GO (synth refuted 6/7 "blockers" as predicated on
+    a false frame-pipelining premise — the renderer is fully synchronous ExecuteSync; applied the 1 real fix:
+    srvVisible.Reset() before the probe pass to stop intra-list descriptor-ring wrap on heavy scenes). VERIFIED
+    (SunTemple, paused f24, RX 9070 XT, DRED on, CLEAN no removal/hang): **★ 1 probe × 6 faces = 949 draws (~158/
+    face) in 7.483ms on the DEV CARD → 128 probes/frame ≈ 958ms. FULL-GEOMETRY RASTER IS NON-VIABLE** (even ~16
+    probes/frame ≈ 120ms; a GTX-1660 is worse). VERDICT: a reduced-geometry PROXY is MANDATORY (confirms the
+    research) — P7.2b/c must NOT use full per-submesh geometry. Captures e:/tmp/p4flip/p72a_*.
+  - **P7.2b (NEXT) — REDUCED-GEOMETRY PROXY + relight + resolve → rayData[probe 0], blend, verify atlas.** The 7.5ms
+    number forces the proxy decision FIRST (research-sanctioned): options = coarse LOD / merged whole-mesh at a low
+    cull threshold / a single low-poly proxy mesh / much lower probe count. Pick + measure the proxy cost, THEN add
+    DdgiRasterRelight.hlsl (sun+shadow+IBL+last-frame-DDGI, copied from DdgiTrace hit shading) + DdgiRasterResolve.hlsl
+    (cube→144 rays), fill rayData[probe 0], run the EXISTING blend, DumpIrradianceStats to confirm non-zero/smooth/no NaN.
+  - **P7.2c — grid + round-robin + sleeping** (probes-this-phase × 6 faces with the proxy, the full DispatchDdgi blend,
+    GiMode wired into the !HasHardwareRayTracing block). **P7.2d — warm-up + determinism + budget lock.**
 - **P7.3 — probe relight + octahedral irradiance projection (Layer 2 live).** Relight the captured G-buffer
   (sun+sky+punctual), project to octahedral irradiance, feed the UNCHANGED DDGI gather. Single-bounce. Verify the
   off-screen hole is FILLED in Bistro interior; DDGI Chebyshev visibility ON → no leak through walls.
