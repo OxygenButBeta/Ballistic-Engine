@@ -432,6 +432,19 @@ float4 PSMain(VSOutput i) : SV_Target {
     return float4(SkyRadiance(normalize(i.Dir)), 1.0);
 }
 
+// ---- BACKGROUND via the baked env cube (the FAST path the renderer uses) ----
+// SkyRadiance() is a full atmosphere + cloud raymarch (thousands of ALU/pixel) - far too costly to run for
+// every screen pixel the sky covers. The IBL baker already renders that exact kernel into a 256^2 env cube
+// each time the sky params change; here we just SAMPLE it by view direction, collapsing the per-pixel cost
+// to a single cube fetch (the GL path bakes a cube and samples it the same way). DrawProcSky falls back to
+// PSMain only when no env cube has been baked yet.
+TextureCube SkyEnv : register(t0);
+SamplerState SkyEnvSampler : register(s0);
+
+float4 PSBackground(VSOutput i) : SV_Target {
+    return float4(SkyEnv.SampleLevel(SkyEnvSampler, normalize(i.Dir), 0.0).rgb, 1.0);
+}
+
 // ---- Env-cube BAKE: render RAW HDR sky radiance into one cube face (FSQ) for IBL convolution. ----
 // Same SkyRadiance kernel (clouds/cirrus/stars included), so the IBL + reflections see the full sky.
 float3 EnvFaceDir(int face, float2 uv) {

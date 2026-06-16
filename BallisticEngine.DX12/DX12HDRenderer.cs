@@ -419,15 +419,23 @@ public sealed class DX12HDRenderer : HDRenderer {
     Dx12DescriptorHeap compositeSrvVisible;  // HDR color + bloom + avg-lum, copied per frame
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct CompositeConstants {
-        public float Exposure; public float BloomIntensity; public float AutoExposure; public float ExposureKey;
-        public float UseAo; public float MinExposure; public float MaxExposure; public float Pad2;
+        public float ExposureMul; public float BloomIntensity; public float AutoExposure; public float LegacyMul;   // row 0
+        public float Compensation; public float UseAo; public float Tonemap; public float Contrast;                 // row 1
+        public float Saturation; public float Sharpen; public float VignetteStrength; public float VignetteRoundness; // row 2
+        public float ChromaticAberration; public float LensDistortion; public float FilmGrain; public float GrainTime; // row 3
+        public Vector3 VignetteColor; public float Pad3;                                                            // row 4
+        public Vector2 ScreenSize; public Vector2 Pad4;                                                             // row 5
     }
 
-    // Auto-exposure: a 1×1 R16F target holding the geometric-mean scene luminance (LumAverage.hlsl).
-    ID3D12RootSignature lumRootSig;     // 1 HDR SRV (t0) + sampler
+    // Auto-exposure: a 1×1 R16F target holding the metered exposure EV100 (LumAverage.hlsl).
+    ID3D12RootSignature lumRootSig;     // LumConstants CBV (b0) + 1 HDR SRV (t0) + sampler
     ID3D12PipelineState lumPso;
     Dx12OffscreenTarget lumTarget;      // 1×1 R16F, color-readable
     Dx12DescriptorHeap lumSrvVisible;   // HDR color SRV copied per frame
+    ID3D12Resource lumCb;
+    unsafe byte* lumCbMapped;
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct LumConstants { public float LimitMin; public float LimitMax; public Vector2 Pad; }
 
     // Bloom: bright-pass + separable blur at half-res, fed into the composite (Bloom.hlsl).
     ID3D12RootSignature bloomRootSig;   // BloomConstants CBV (b0) + 1 source SRV (t0) + sampler
@@ -527,6 +535,9 @@ public sealed class DX12HDRenderer : HDRenderer {
     Dx12DescriptorHeap iblSrvVisible;   // 3 contiguous SRVs copied per frame
     bool iblActiveThisFrame;
 
+    // Sky-atmosphere LUTs (Hillaire 2020), SEPARATE from the IBL baker: v1 = Transmittance LUT.
+    Dx12SkyLuts skyLuts;
+
     // Sun cascaded shadows.
     const int CascadeCount = 4;
     const int ShadowMapSize = 2048;
@@ -562,6 +573,23 @@ public sealed class DX12HDRenderer : HDRenderer {
         public Vector3 Tint; public float Anisotropy;
         public float Scattering, AmbientScatter, SunGlow, SunGlowSharpness;
         public float StepCount, MaxDistance, ShadowMapTexel, Exposure;
+    }
+
+    // Aerial perspective (full-screen post pass; atmospheric haze on distant opaque geometry). SEPARATE pass —
+    // does NOT touch the deferred lighting shader. Blended over scene color like fog (dst*transmittance + src).
+    ID3D12RootSignature apRootSig;      // ApConstants CBV (b0) + depth SRV (t0) + sampler
+    ID3D12PipelineState apPso;
+    ID3D12Resource apCb;
+    unsafe byte* apCbMapped;
+    Dx12DescriptorHeap apSrvVisible;    // scene depth, copied per frame
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct ApConstants {
+        public Matrix4x4 InvViewProj;
+        public Vector3 CameraPos; public float Strength;
+        public Vector3 SunDirection; public float Distance;
+        public Vector3 SunRadiance; public float HazeAniso;
+        public Vector3 SkyTint; public float AirDensity;
+        public float Haze, MaxDistance, Exposure, Pad;
     }
 
     // Per-frame constants (b1) shared by every opaque draw: the cascade matrices + shadow params.
@@ -740,6 +768,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         BuildProcSky();
 
         ibl = new Dx12IblBaker(dev);
+        skyLuts = new Dx12SkyLuts(dev);
         // 3 IBL SRVs (irradiance/prefilter/BRDF) copied contiguously per frame into a shader-visible heap.
         iblSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true);
@@ -754,6 +783,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         BuildDeferredLighting();
         BuildTransparentPass();
         BuildFog();
+        BuildAerialPerspective();
         BuildSsr();
         BuildSsgi();
         BuildTaa();
@@ -1227,7 +1257,8 @@ public sealed class DX12HDRenderer : HDRenderer {
     }
 
     unsafe void BuildLumAverage() {
-        // 1 HDR SRV (t0) + clamp sampler; outputs the 1×1 average-luminance target (auto-exposure metering).
+        // LumConstants CBV (b0) + 1 HDR SRV (t0) + clamp sampler; outputs the 1×1 metered-EV100 target.
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Pixel);
         var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
         var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
         var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
@@ -1236,7 +1267,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
         };
         lumRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { srvTable }, new[] { samp })));
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumAverage.hlsl");
         byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "LumAverage.hlsl");
@@ -1254,6 +1285,11 @@ public sealed class DX12HDRenderer : HDRenderer {
             colorFormat: Format.R16_Float, colorReadable: true);
         lumSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true);
+
+        int lumCbSize = (System.Runtime.InteropServices.Marshal.SizeOf<LumConstants>() + 255) & ~255;
+        lumCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)lumCbSize), ResourceStates.GenericRead);
+        lumCbMapped = lumCb.Map<byte>(0);
 
         BuildBloom();
     }
@@ -1346,6 +1382,52 @@ public sealed class DX12HDRenderer : HDRenderer {
         fogCbMapped = fogCb.Map<byte>(0);
         fogSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true);
+    }
+
+    unsafe void BuildAerialPerspective() {
+        // ApConstants CBV (b0) + a 1-SRV table (depth t0) + clamp sampler s0.
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
+        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
+        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        apRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("AerialPerspective.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "AerialPerspective.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "AerialPerspective.hlsl");
+
+        // Same composite as fog: dest = dest*srcAlpha(transmittance) + src(inscatter).
+        var blend = BlendDescription.Opaque;
+        var rt0 = blend.RenderTarget[0];
+        rt0.BlendEnable = true;
+        rt0.SourceBlend = Blend.One;
+        rt0.DestinationBlend = Blend.SourceAlpha;
+        rt0.BlendOperation = BlendOperation.Add;
+        rt0.SourceBlendAlpha = Blend.Zero;
+        rt0.DestinationBlendAlpha = Blend.Zero;
+        rt0.BlendOperationAlpha = BlendOperation.Add;
+        blend.RenderTarget[0] = rt0;
+
+        apPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+            RootSignature = apRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = RasterizerDescription.CullNone, BlendState = blend,
+            DepthStencilState = DepthStencilDescription.None,
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
+            DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
+        });
+
+        int apCbSize = (System.Runtime.InteropServices.Marshal.SizeOf<ApConstants>() + 255) & ~255;
+        apCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)apCbSize), ResourceStates.GenericRead);
+        apCbMapped = apCb.Map<byte>(0);
+        apSrvVisible = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true);
     }
 
     unsafe void BuildShadows() {
@@ -1625,6 +1707,15 @@ public sealed class DX12HDRenderer : HDRenderer {
         LightUniforms light = LightUniforms.Resolve();
         Vector3 lightDir = ToNumerics(light.Direction);
         Vector3 lightColor = ToNumerics(light.Color);
+        // Golden hour (P4): a ProceduralSky reddens/dims the directional sun by the SAME atmosphere it shows.
+        // ProceduralSky.SunTransmittance was never called on DX12 — the sun was the raw white-balanced colour
+        // at every elevation. Multiply it in here so geometry, the IBL bake and the sun disk all warm + fade
+        // at low sun. BALLISTIC_DX12_SKY_TLUT=0 keeps the old (un-reddened) sun for A/B.
+        bool tlutOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SKY_TLUT") != "0";
+        if (tlutOn && ProceduralSky.Active is { } skyForSun && lightDir.LengthSquared() > 1e-8f) {
+            var st = skyForSun.SunTransmittance(new System.Numerics.Vector3(lightDir.X, lightDir.Y, lightDir.Z));
+            lightColor *= new Vector3(st.X, st.Y, st.Z);
+        }
         Vector3 ambient = ToNumerics(vp.AmbientColor) * MathF.Max(0.05f, light.AmbientIntensity);
         // The sun radiance is HDR (lux-scaled, ~80000); a fixed pre-exposure brings it into a viewable
         // range before the ACES tonemap (the GL path auto-meters EV100; this is a constant stand-in for
@@ -1652,6 +1743,9 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (ProceduralSky.Active is { } pSky) {
             Vector3 sunDir = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
             float sunAngR = (DirectionalLight.Instance?.AngularDiameter ?? 0.53f) * 0.5f * (MathF.PI / 180f);
+            // Transmittance LUT (re-bakes only on atmosphere-param change). Drives P5/P6 + the future shader
+            // sun-tint; the CPU sun-reddening above already uses the analytic SunTransmittance.
+            skyLuts.EnsureBaked(pSky.AirDensity, pSky.Haze, pSky.OzoneDensity);
             ibl.EnsureBaked(pSky, sunDir, lightColor, sunAngR);
             iblActiveThisFrame = ibl.HasBaked;
         }
@@ -1956,6 +2050,15 @@ public sealed class DX12HDRenderer : HDRenderer {
             else
                 DrawSkybox(cl, view, proj);
         });
+
+        // === AERIAL PERSPECTIVE: atmospheric haze on distant opaque geometry (#1 scale cue), blended over the
+        // sky+opaque HDR before transparents/fog. Separate pass — never touches deferred lighting. Only when a
+        // ProceduralSky drives the atmosphere; BALLISTIC_DX12_AP=0 disables it. ===
+        bool apOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_AP") != "0";
+        if (apOn && ProceduralSky.Active is not null) {
+            Vector3 apSunDir = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
+            DrawAerialPerspective(viewProj, camPos, apSunDir, lightColor);
+        }
 
         // === TRANSPARENTS: forward, back-to-front, alpha-blended over the HDR scene + sky, depth-testing
         // the G-buffer depth (LEqual, no write). Runs before fog/SSR/TAA so they apply over the glass. ===
@@ -3448,47 +3551,39 @@ public sealed class DX12HDRenderer : HDRenderer {
     // Tonemap the HDR `hdr` source (the native scene target, or the FSR-upscaled output) into the LDR
     // output at OUTPUT resolution. Auto-exposure drives the exposure; bloom (if on) runs first (inside
     // this), reading the same HDR source. Sources at internal/half res are sampled by UV (resolution-safe).
-    // Calibration anchor that maps the engine's physical exposure multiplier (1/(1.2·2^EV), the same dial the
-    // GL path uses) into the DX12 composite's multiplier space. The DX12 scene radiance is pre-scaled by an
-    // arbitrary ~1e-5 fudge (NOT true lux), so the EV dial can't be applied 1:1 — this constant re-anchors it.
-    // Chosen empirically: at the default EV15 it lands the composite multiplier at ~1.6e-5, the measured
-    // correct exposure for the Bistro interior (dark-but-readable, no veil). Higher EV = darker, in real stops.
-    const float ExposureEvCalibration = 0.63f;
-
+    // Exposure: the sky-atmosphere P1 path resolves PostFX.ExposureMultiplier (EV100) directly — no extra
+    // re-anchoring constant; the metering/clamp moved into LumAverage (LumConstants.LimitMin/Max).
     unsafe void DrawComposite(bool ssaoOn, Dx12OffscreenTarget hdr) {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
 
-        // Exposure source, in priority order:
-        //  1. BALLISTIC_DX12_EXPOSURE env  — explicit fixed multiplier (A/B + the headless capture recipe).
-        //  2. The Exposure VOLUME (PostFX) — the editor's exposure dial. THIS is the path that was missing on
-        //     DX12: the composite hardcoded 0.18/avgLum and never read PostFX.ExposureEV/Mode, so editing the
-        //     Exposure volume did nothing AND a near-black scene blew out to a milky veil. BALLISTIC_DX12_
-        //     EXPOSURE_VOLUME=0 restores the old hardcoded auto-meter (A/B escape hatch).
-        //  3. Fallback fixed 1e-5 (legacy stand-in) when the volume path is disabled.
-        bool envManual = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
-            System.Globalization.CultureInfo.InvariantCulture, out float envExp);
-        bool useVolume = !envManual
-            && Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_VOLUME") != "0";
-
-        // Fixed-mode volume exposure resolves to a constant multiplier (no metering pass). Automatic modes
-        // still meter, but clamped to the volume's EV limits (limitMin/limitMax) instead of running away.
-        bool volumeAuto = useVolume && PostFX.ExposureMode != ExposureMode.Fixed;
-        bool manual = envManual || (useVolume && !volumeAuto);
-        float manualExp = envManual ? envExp
-            : useVolume ? PostFX.ExposureMultiplier * ExposureEvCalibration
-            : 1.0e-5f;
-        bool runMeter = !manual;   // only the auto-meter path needs the 1×1 luminance reduction
+        // Exposure (P1): physical EV100 from the Exposure volume. Three sources, in priority:
+        //   1. BALLISTIC_DX12_EXPOSURE env var — raw multiplier override (escape hatch / deterministic capture).
+        //   2. Exposure volume Fixed mode — resolve PostProcessSettings.ExposureMultiplier CPU-side (no meter).
+        //   3. Automatic / AutomaticHistogram — run the 1×1 metering pass (writes the metered EV100); the
+        //      composite shader turns that EV into the multiplier (same 1/(1.2*2^(EV-comp)) formula).
+        var pf = PostFX;
+        bool manual = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
+            System.Globalization.CultureInfo.InvariantCulture, out float manualExp);
+        // BALLISTIC_DX12_AUTOEXP=1 forces Automatic metering even with no Exposure volume (A/B test door).
+        bool forceAuto = Environment.GetEnvironmentVariable("BALLISTIC_DX12_AUTOEXP") == "1";
+        bool useMeter = !manual && (forceAuto || pf.ExposureMode != ExposureMode.Fixed);
+        // Resolved CPU multiplier for the manual / Fixed paths (Automatic resolves it in the shader from the EV).
+        float exposureMul = manual ? manualExp : pf.ExposureMultiplier;
 
         hdr.ColorToShaderResource();   // HDR source → SRV (for both the lum pass and composite)
 
-        if (runMeter) {
-            // Auto-exposure metering: reduce the HDR source to a 1×1 geometric-mean luminance.
+        if (useMeter) {
+            // Auto-exposure metering: reduce the HDR source to a 1×1 metered EV100 (LumAverage.hlsl).
+            *(LumConstants*)lumCbMapped = new LumConstants {
+                LimitMin = pf.AutoExposureLimitMin, LimitMax = pf.AutoExposureLimitMax,
+            };
             dev.Device.CopyDescriptorsSimple(1, lumSrvVisible.Cpu(0), hdr.ColorSrvCpu, heapType);
             lumTarget.RenderColorOnly(cl => {
                 cl.SetGraphicsRootSignature(lumRootSig);
                 cl.SetPipelineState(lumPso);
                 cl.SetDescriptorHeaps(lumSrvVisible.Heap);
-                cl.SetGraphicsRootDescriptorTable(0, lumSrvVisible.Gpu(0));
+                cl.SetGraphicsRootConstantBufferView(0, lumCb.GPUVirtualAddress);
+                cl.SetGraphicsRootDescriptorTable(1, lumSrvVisible.Gpu(0));
                 cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
                 cl.DrawInstanced(3, 1, 0, 0);
             });
@@ -3499,30 +3594,40 @@ public sealed class DX12HDRenderer : HDRenderer {
         bool bloomOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_BLOOM") != "0";
         if (bloomOn) DrawBloom(hdr);
 
-        // Auto-meter clamp (used only when the volume is in an Automatic mode, or the volume path is off and
-        // the legacy meter runs). The meter computes exposure = ExposureKey / avgLum (Composite.hlsl); avgLum
-        // floors at 1e-4 (LumAverage.hlsl), so without a clamp a near-black scene runs to 0.18/1e-4 = 1800x
-        // and blows out. Bound it to the volume's EV limits (converted through the same calibration), so the
-        // meter respects limitMin (brightest = largest multiplier) / limitMax (darkest = smallest).
-        float EvToMul(float ev) => (1f / (1.2f * MathF.Pow(2f, ev))) * ExposureEvCalibration;
-        float meterMin = volumeAuto ? EvToMul(PostFX.AutoExposureLimitMax) : 0f;          // darkest EV → min mul
-        float meterMax = volumeAuto ? EvToMul(PostFX.AutoExposureLimitMin) : 1.0e-3f;     // brightest EV → max mul
-        // ExposureKey: middle-grey target ~0.18 (the HDR scene is physical radiance; auto-meter rescales).
+        // Tonemap: AgX by default (graceful highlight desaturation, the "less çiğ" look); ACES via the door.
+        bool acesTonemap = Environment.GetEnvironmentVariable("BALLISTIC_DX12_TONEMAP") == "aces";
+        // Film grain is time-dependent → frozen (0) under deterministic capture so paused frames stay diffable.
+        float grainTime = DeterministicCapture ? 0f : (ssgiFrame & 1023);
+        // Stylistic grade comes from the volume stack (all neutral by default). BALLISTIC_DX12_GRADE_DEMO=1 is
+        // an A/B door that applies a mild cinematic film look (a sensible starting grade) when no ColorAdjustments
+        // volume is authored — proves the grade chain and shows what a light touch buys.
+        bool gradeDemo = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GRADE_DEMO") == "1";
+        float contrast = gradeDemo ? 1.12f : pf.Contrast;
+        float saturation = gradeDemo ? 1.15f : pf.Saturation;
+        float vignette = gradeDemo ? 0.25f : pf.VignetteStrength;
         *(CompositeConstants*)compositeCbMapped = new CompositeConstants {
-            Exposure = manualExp,
+            ExposureMul = exposureMul,
             BloomIntensity = bloomOn ? 0.6f : 0f,
-            AutoExposure = manual ? 0f : 1f,
-            ExposureKey = 0.18f,
+            AutoExposure = useMeter ? 1f : 0f,
+            LegacyMul = pf.Exposure,
+            Compensation = pf.ExposureCompensation,
             UseAo = ssaoOn ? 1f : 0f,
-            MinExposure = meterMin,
-            MaxExposure = meterMax,
+            Tonemap = acesTonemap ? 1f : 0f,
+            // Stylistic grade (all neutral by default → byte-identical when untouched); ported from the GL composite.
+            Contrast = contrast, Saturation = saturation,
+            Sharpen = pf.Sharpen,
+            VignetteStrength = vignette, VignetteRoundness = pf.VignetteRoundness,
+            VignetteColor = ToNumerics(pf.VignetteColor),
+            ChromaticAberration = pf.ChromaticAberration, LensDistortion = pf.LensDistortion,
+            FilmGrain = DeterministicCapture ? 0f : pf.FilmGrain, GrainTime = grainTime,
+            ScreenSize = new Vector2(outputW, outputH),
         };
 
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(0), hdr.ColorSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(1),
             bloomOn ? bloomA.ColorSrvCpu : hdr.ColorSrvCpu, heapType);   // bloom slot
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(2),
-            runMeter ? lumTarget.ColorSrvCpu : hdr.ColorSrvCpu, heapType);
+            useMeter ? lumTarget.ColorSrvCpu : hdr.ColorSrvCpu, heapType);   // metered-EV slot (Automatic only)
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(3),
             ssaoOn ? ssaoA.ColorSrvCpu : hdr.ColorSrvCpu, heapType);     // AO slot
 
@@ -3535,11 +3640,53 @@ public sealed class DX12HDRenderer : HDRenderer {
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
         });
-        if (runMeter) lumTarget.ColorToRenderTarget();
+        if (useMeter) lumTarget.ColorToRenderTarget();
         // Restore the INTERNAL scene target to RenderTarget for next frame's geometry/deferred pass (FSR
         // left it in PixelShaderResource; in the native path hdr == target). fsrOutput stays in shader-read
         // — RunFsr transitions it to UAV next frame from any state.
         target.ColorToRenderTarget();
+    }
+
+    // Aerial perspective: blend the atmosphere's distance haze over opaque geometry (the #1 scale/realism cue).
+    // A full-screen analytic single-scattering pass — a SEPARATE pass that does NOT touch deferred lighting.
+    // Runs after the sky, before transparents/fog. In RAW HDR radiance (composites before the tonemap). The
+    // Strength/Distance dials are env-tunable; BALLISTIC_DX12_AP=0 disables it (byte-identical off).
+    unsafe void DrawAerialPerspective(Matrix4x4 viewProj, Vector3 camPos, Vector3 sunDir, Vector3 sunRadiance) {
+        Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
+        var pSky = ProceduralSky.Active;
+        // Sky-colour ambient tint for haze in shadow (Rayleigh-blue, engine-radiance scale).
+        Vector3 skyTint = sunRadiance * new Vector3(0.10f, 0.16f, 0.32f);
+
+        float strength = 1f;
+        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_AP_STRENGTH"),
+            System.Globalization.CultureInfo.InvariantCulture, out float s)) strength = s;
+
+        float distance = 1200f;  // haze half-distance in metres (scene-scale; env-tunable below)
+        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_AP_DISTANCE"),
+            System.Globalization.CultureInfo.InvariantCulture, out float dd)) distance = dd;
+        *(ApConstants*)apCbMapped = new ApConstants {
+            InvViewProj = Matrix4x4.Transpose(invVP),
+            CameraPos = camPos, Strength = strength,
+            SunDirection = sunDir, Distance = distance,
+            SunRadiance = sunRadiance, HazeAniso = pSky is not null ? Math.Clamp(pSky.HazeAnisotropy, 0f, 0.95f) : 0.8f,
+            SkyTint = skyTint, AirDensity = pSky is not null ? MathF.Max(pSky.AirDensity, 0f) : 1f,
+            Haze = pSky is not null ? MathF.Max(pSky.Haze, 0f) : 1f,
+            MaxDistance = 60000f, Exposure = 1f,
+        };
+
+        gbuffer.DepthToShaderResource();
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        dev.Device.CopyDescriptorsSimple(1, apSrvVisible.Cpu(0), gbuffer.DepthSrvCpu, heapType);
+
+        target.RenderColorOnly(cl => {
+            cl.SetGraphicsRootSignature(apRootSig);
+            cl.SetPipelineState(apPso);
+            cl.SetDescriptorHeaps(apSrvVisible.Heap);
+            cl.SetGraphicsRootConstantBufferView(0, apCb.GPUVirtualAddress);
+            cl.SetGraphicsRootDescriptorTable(1, apSrvVisible.Gpu(0));
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
     }
 
     // Full-screen volumetric fog: march the air toward the camera (shadowed sun + sky in-scatter),
