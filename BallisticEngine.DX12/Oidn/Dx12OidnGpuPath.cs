@@ -27,6 +27,7 @@ public sealed class Dx12OidnGpuPath : IDisposable {
     Dx12DescriptorHeap heap;        // 0=srcTex SRV, 1=buf UAV, 2=buf SRV, 3=dstTex UAV
     int w, h;
     bool ready;
+    static int shareSeq;            // process-wide counter → unique shared-handle names (avoid 0x887A002C)
     const int SrvSrcTex = 0, UavBuf = 1, SrvBuf = 2, UavDstTex = 3;
 
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
@@ -80,7 +81,14 @@ public sealed class Dx12OidnGpuPath : IDisposable {
         sharedBuf = dev.Device.CreateCommittedResource(
             HeapProperties.DefaultHeapProperties, HeapFlags.Shared, bufDesc, ResourceStates.Common);
         sharedBuf.Name = "OidnSharedFloatBuf";
-        sharedHandle = dev.Device.CreateSharedHandle(sharedBuf, null, "BallisticOidnSharedFloat");
+        // The shared-handle name MUST be unique per process+instance: a FIXED name ("BallisticOidnSharedFloat")
+        // fails with DXGI_ERROR_NAME_ALREADY_EXISTS (0x887A002C) if a prior/concurrent process still holds it, and
+        // also if Ensure() re-creates the buffer on resize before the old handle is closed. The name is only used
+        // to OPEN the handle by name (which we never do — we import the IntPtr directly), so it can be anything
+        // unique; PID + a monotonic counter guarantees no collision across runs or within a run.
+        string shareName = string.Create(System.Globalization.CultureInfo.InvariantCulture,
+            $"BallisticOidnSharedFloat_{Environment.ProcessId}_{System.Threading.Interlocked.Increment(ref shareSeq)}");
+        sharedHandle = dev.Device.CreateSharedHandle(sharedBuf, null, shareName);
         if (sharedHandle == IntPtr.Zero) { ReleaseShared(); return false; }
         // OIDN reads it as FLOAT3 (skip the .a), pixelByteStride 16, rowByteStride W*16.
         if (!oidn.ImportSharedBuffer(sharedHandle, bytes, w, h, w * 16)) { ReleaseShared(); return false; }
