@@ -173,6 +173,13 @@ public sealed class DX12HDRenderer : HDRenderer {
     Dx12SceneAS sceneAS;
     ID3D12Device5 device5;
     bool dxrChecked, dxrAvailable;
+    bool noRtWarned;                            // P7.0: log the no-RT downgrade once, not every frame
+    // P7.0: one-time log when RayTraced GI/reflections/shadows are auto-downgraded for lack of HW ray tracing.
+    void WarnNoRtOnce() {
+        if (noRtWarned) return;
+        noRtWarned = true;
+        Console.WriteLine("[DX12] No hardware ray tracing — RayTraced GI/reflections/shadows downgraded to screen-space fallbacks (SSGI/SSR/cascades).");
+    }
     ID3D12RootSignature rtShadowRootSig;        // CBV(b0) + table{SRV t0 TLAS, t1 depth, t2 normal; UAV u0 mask}
     ID3D12StateObject rtShadowPso;
     ID3D12Resource rtShadowSbt, rtShadowCb;
@@ -1650,6 +1657,15 @@ public sealed class DX12HDRenderer : HDRenderer {
                       : ssgiEnv == "0" ? GiMode.Off
                       : ssgiEnv == "1" ? GiMode.ScreenSpace
                       : PostFX.GiMode;
+        // P7.0 NO-RT AUTO-DOWNGRADE: on a GPU without hardware ray tracing (the audience floor; or BALLISTIC_DX12_
+        // FORCE_NORT=1 on the dev card), RayTraced GI → ScreenSpace BEFORE EnsureRtGi/DrawRtGi touch the DXR path.
+        // This is ABSOLUTE — even the BALLISTIC_DX12_RT_GI=1 force door loses to it, because a forced RT path on a
+        // non-DXR device is the device-removal/PC-crash hazard ([[gpu-hang-launch-safety]]). EnsureRtGi already
+        // returns false without RT, so GI was guarded; this makes the intent explicit + logs once for all 3 effects.
+        if (!dev.HasHardwareRayTracing) {
+            if (giMode == GiMode.RayTraced) giMode = GiMode.ScreenSpace;
+            WarnNoRtOnce();
+        }
         if (giMode == GiMode.RayTraced) { if (EnsureRtGi()) TimePass("GI:RT", () => DrawRtGi(view, viewProj, proj, lightDir, lightColor, camPos)); else TimePass("GI:SSGI", () => DrawSsgi(view, proj)); }
         else if (giMode == GiMode.ScreenSpace) TimePass("GI:SSGI", () => DrawSsgi(view, proj));
 
@@ -2188,10 +2204,7 @@ public sealed class DX12HDRenderer : HDRenderer {
     unsafe bool EnsureRtShadows() {
         if (!dxrChecked) {
             dxrChecked = true;
-            try {
-                var opt5 = dev.Device.CheckFeatureSupport<FeatureDataD3D12Options5>(Vortice.Direct3D12.Feature.Options5);
-                dxrAvailable = opt5.RaytracingTier >= RaytracingTier.Tier1_0;
-            } catch { dxrAvailable = false; }
+            dxrAvailable = dev.HasHardwareRayTracing;   // eager device-wide flag (FORCE_NORT-aware)
             if (!dxrAvailable) Console.WriteLine("[RTShadows] DXR unavailable — using cascaded shadows.");
         }
         if (!dxrAvailable) return false;
@@ -2292,10 +2305,7 @@ public sealed class DX12HDRenderer : HDRenderer {
     unsafe bool EnsureRtReflections() {
         if (!dxrChecked) {
             dxrChecked = true;
-            try {
-                var opt5 = dev.Device.CheckFeatureSupport<FeatureDataD3D12Options5>(Vortice.Direct3D12.Feature.Options5);
-                dxrAvailable = opt5.RaytracingTier >= RaytracingTier.Tier1_0;
-            } catch { dxrAvailable = false; }
+            dxrAvailable = dev.HasHardwareRayTracing;   // eager device-wide flag (FORCE_NORT-aware)
             if (!dxrAvailable) Console.WriteLine("[RTReflections] DXR unavailable — using SSR.");
         }
         if (!dxrAvailable) return false;
@@ -2423,10 +2433,7 @@ public sealed class DX12HDRenderer : HDRenderer {
     unsafe bool EnsureRtGi() {
         if (!dxrChecked) {
             dxrChecked = true;
-            try {
-                var opt5 = dev.Device.CheckFeatureSupport<FeatureDataD3D12Options5>(Vortice.Direct3D12.Feature.Options5);
-                dxrAvailable = opt5.RaytracingTier >= RaytracingTier.Tier1_0;
-            } catch { dxrAvailable = false; }
+            dxrAvailable = dev.HasHardwareRayTracing;   // eager device-wide flag (FORCE_NORT-aware)
             if (!dxrAvailable) Console.WriteLine("[RTGI] DXR unavailable — using SSGI.");
         }
         if (!dxrAvailable) return false;

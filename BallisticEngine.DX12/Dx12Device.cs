@@ -22,6 +22,14 @@ public sealed class Dx12Device : IDisposable {
     // Lets OIDN create a HIP device on the SAME physical GPU (oidnNewDeviceByLUID) for zero-copy buffer sharing.
     public byte[] AdapterLuidBytes { get; }
 
+    // Hardware ray-tracing (DXR Tier 1.0+) support, queried ONCE at device creation. The renderer reads this
+    // eagerly to AUTO-DOWNGRADE RayTraced GI/reflections/shadows to their screen-space fallbacks on a no-RT GPU
+    // (the audience floor — GTX-1660-class cards often lack RT). A FORCED RT path on a non-DXR device is exactly
+    // the device-removal/PC-crash hazard the downgrade prevents ([[gpu-hang-launch-safety]]). The old per-effect
+    // lazy CheckFeatureSupport checks now read this flag. BALLISTIC_DX12_FORCE_NORT=1 reports false even on an
+    // RT-capable GPU — the dev-machine A/B door for the no-RT fallback (the dev card has RT, so it won't crash).
+    public bool HasHardwareRayTracing { get; }
+
     readonly ID3D12CommandAllocator allocator;
     readonly ID3D12GraphicsCommandList4 commandList; // 4 = supports DXR DispatchRays later
     readonly ID3D12Fence fence;
@@ -65,6 +73,19 @@ public sealed class Dx12Device : IDisposable {
         // The adapter LUID as raw 8 bytes (little-endian) for OIDN HIP device matching (oidnNewDeviceByLUID).
         // ID3D12Device.AdapterLuid is the 64-bit LUID; its byte layout IS the native LUID struct.
         AdapterLuidBytes = BitConverter.GetBytes(Device.AdapterLuid);
+
+        // Query DXR support ONCE (Options5.RaytracingTier >= Tier1_0). FORCE_NORT pins it false for the no-RT
+        // fallback A/B on the (RT-capable) dev card. Wrapped — CheckFeatureSupport can throw on old runtimes.
+        bool rt = false;
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_FORCE_NORT") != "1") {
+            try {
+                var opt5 = Device.CheckFeatureSupport<FeatureDataD3D12Options5>(Vortice.Direct3D12.Feature.Options5);
+                rt = opt5.RaytracingTier >= RaytracingTier.Tier1_0;
+            } catch { rt = false; }
+        }
+        HasHardwareRayTracing = rt;
+        Console.WriteLine(rt ? "[DX12] Hardware ray tracing: AVAILABLE (DXR Tier 1.0+)"
+                             : "[DX12] Hardware ray tracing: NOT available — RayTraced GI/reflections/shadows will use screen-space fallbacks.");
 
         Queue = Device.CreateCommandQueue(new CommandQueueDescription(CommandListType.Direct));
         allocator = Device.CreateCommandAllocator(CommandListType.Direct);

@@ -169,10 +169,43 @@ deleted — commit 1b0485ad.)
   rules (ternary NaN scrub, pre-exposure consistency, disocclusion rejection).
 - Verify: converged + stable under motion; no boiling; no NaN black holes.
 
-**Phase 7 — Low-end / no-RT fallback.**
-- For GPUs without HW RT (the audience floor): **SSGI + IBL ambient + SSAO** as the reliable cheap path (or a
-  probe-only DDGI variant). **NOT** the voxel/SDF mess. Auto-selected by capability.
-- Verify: acceptable GI + good perf on a no-RT profile; graceful, not broken.
+**Phase 7 — Low-end / no-RT fallback. [IN PROGRESS — user-chosen next phase 2026-06-16; full-floor scope.]**
+> **THE HONEST FINDING (research wf_12e5d5b6):** "just SSGI + IBL + SSAO" is NOT an acceptable floor — SSILVB's
+> own paper: *"if direct light leaves the screen, the indirect lighting disappears"* (a room lit from behind the
+> camera goes black). The published fix (Unity HDRP: SSGI *"falls back to APV / Reflection Probes to gather
+> lighting not present on the screen"*) is THREE LAYERS: near-field SSGI + a far-field probe grid + IBL/SSAO floor.
+> Both shipping no-HW-RT GI paths (Lumen software = Global Distance Field; Flax = software DDGI vs Global SDF)
+> reduce to the FORBIDDEN voxel/SDF family. The non-forbidden far-field the DDGI authors themselves list:
+> **rasterized cube-relit DDGI** — keep our DDGI octahedral irradiance textures + per-pixel gather UNCHANGED,
+> replace only the probe UPDATE (render a small cubemap G-buffer per probe → relight → octahedral project; NO
+> rays, NO SDF). Reuses the entire Phase-2 DDGI infra "minus the trace". User chose the FULL floor (gate +
+> raster-DDGI), with P7.2+ a MEASURED go/no-go after P7.0 reports the GTX-1660 probe budget.
+- **P7.0 — capability gate + measurement/test harness. DONE & VERIFIED (this session).** Eager
+  `Dx12Device.HasHardwareRayTracing` (Options5.RaytracingTier>=Tier1_0, queried ONCE at device init); the 3 lazy
+  `EnsureRt{Gi,Shadows,Reflections}` checks now read it (was triplicated CheckFeatureSupport). AUTO-DOWNGRADE at
+  the GI dispatch: no HW RT → RayTraced GI→ScreenSpace, ABSOLUTE (even BALLISTIC_DX12_RT_GI=1 loses — a forced RT
+  path on a non-DXR device is the device-removal/PC-crash hazard); reflections/shadows fall back via their
+  Ensure* returning false; one-time `[DX12] No hardware ray tracing — downgraded...` log. **Test door
+  BALLISTIC_DX12_FORCE_NORT=1** pins the flag false on the RT-capable dev card (won't crash) → the no-RT path is
+  A/B-able on dev hardware. VERIFIED (RX 9070 XT, DRED on): RT-available path BYTE-IDENTICAL to pre-P7.0
+  (24E6A874… — gate is a no-op when RT present); FORCE_NORT=1 logs the downgrade + runs SSGI (no SCREENPROBE/DDGI),
+  CLEAN exit no device-removal even with RT_GI=1 forced; no-RT GI-isolate = valid SSGI bounce (SunTemple mean 20.4,
+  not black) vs RT 30.7. This ships the safety fix even if the floor stops here.
+- **P7.1 — wire the SSGI+IBL+SSAO floor as the explicit no-RT GiMode + measure on the 1660 budget.** Confirm the
+  three existing passes compose coherently; GI-isolate shows the on-screen bounce; document the expected off-screen
+  darkening (the honest hole P7.2 fixes). NOTE much of P7.1 already falls out of P7.0 (FORCE_NORT → SSGI runs).
+- **P7.2 — rasterized probe G-buffer capture (no relight).** Per-probe small (16-32px) cubemap G-buffer
+  (depth/normal/albedo) into the EXISTING DDGI octahedral textures, time-sliced round-robin, FIXED deterministic
+  order. Debug-view one probe's G-buffer. **MEASURE probes/frame inside the 1660 budget** (the unmeasured risk —
+  this is the go/no-go gate; grid/time-slice chosen from the number, not guessed). Cubemap (6 draws, simple) first.
+- **P7.3 — probe relight + octahedral irradiance projection (Layer 2 live).** Relight the captured G-buffer
+  (sun+sky+punctual), project to octahedral irradiance, feed the UNCHANGED DDGI gather. Single-bounce. Verify the
+  off-screen hole is FILLED in Bistro interior; DDGI Chebyshev visibility ON → no leak through walls.
+- **P7.4 — multi-bounce (prev-frame probe irradiance into relight) + energy clamp** (the SSGI-EMA NaN/runaway
+  guard, ternary scrub — [[ssgi-nan-mix-scrub]]). A/B vs single-bounce in enclosed interiors; no over-brighten.
+- **P7.5 (optional) — RSM sun first-bounce booster** only if P7.3/P7.4 under-captures the sun's directional bounce.
+- Env doors: BALLISTIC_DX12_FORCE_NORT (the gate A/B), BALLISTIC_DX12_NORT_PROBES=0|1 (Layer 2). Judge by GI-isolate
+  in SunTemple + Bistro interior. Verify: acceptable GI + good perf on a no-RT profile; graceful, not broken.
 
 **Phase 8 — Reflections via the surface cache (bonus, unifies with existing RT reflections).**
 - Lumen reflections reuse the surface cache + RT; fold the existing DX12 RT reflections into this so rough
