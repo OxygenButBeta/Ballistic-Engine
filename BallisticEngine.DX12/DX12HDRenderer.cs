@@ -808,6 +808,11 @@ public sealed class DX12HDRenderer : HDRenderer {
         hizWanted = gpuDrivenOn && Environment.GetEnvironmentVariable("BALLISTIC_DX12_GPUDRIVEN_HIZ") != "0";
         // Cascade caching: DEFAULT ON (BALLISTIC_DX12_SHADOW_CACHE=0 disables).
         shadowCacheOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SHADOW_CACHE") != "0";
+        // Resolve the per-feature doors ONCE (the BALLISTIC_DX12_MINIMAL switch + cached env reads).
+        doors = Dx12RenderDoors.Resolve();
+        if (doors.Minimal)
+            Console.WriteLine("[DX12] BARE-MINIMUM render: G-buffer + deferred (sun/punctual) + composite only. " +
+                              "Re-enable per pass with BALLISTIC_DX12_{SHADOWS,SKY,IBL,SSAO,BLOOM,AP,VOLUMES}=1 / BALLISTIC_FX_VOLUMETRIC=1.");
         gpuDriven = new Dx12GpuDrivenRenderer(dev);
 
         AllocFsrOutput();   // output-res UAV target for FSR (allocated even when off — cheap, simplifies resize)
@@ -816,6 +821,9 @@ public sealed class DX12HDRenderer : HDRenderer {
     Dx12GpuDrivenRenderer gpuDriven;
     bool gpuDrivenOn;
     bool hizWanted;
+    // Cached per-feature on/off doors (resolved once at init from the BALLISTIC_DX12_*/_FX_* env vars).
+    // Implements the BALLISTIC_DX12_MINIMAL "bare minimum" diagnostic switch + kills the per-frame env churn.
+    Dx12RenderDoors doors;
     Vector3 hizLastCamPos;
     bool hizPrimed;     // false until we have a valid previous-frame depth (first frame / after a big jump)
     readonly System.Collections.Generic.List<IStaticMeshRenderer> wholeMeshRenderers = new();
@@ -1687,7 +1695,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         // dependent history → non-diffable). FSR also needs jitter, so deterministic mode assumes FSR off
         // (the capture recipe sets BALLISTIC_DX12_FSR=off). Edges are aliased in deterministic captures — the
         // documented trade for frame-independence (same as the GL contract).
-        bool taaOn = PostFX.TaaEnabled && !fsrActive && !DeterministicCapture;
+        bool taaOn = PostFX.TaaEnabled && !fsrActive && !DeterministicCapture && !doors.Minimal;
         bool jitterOn = taaOn || fsrActive;
         currentJitter = jitterOn ? JitterOffset(taaFrame) : Vector2.Zero;
         if (jitterOn) {
@@ -1723,7 +1731,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         // EDITING the Exposure (or any) volume did NOTHING and PostFX sat at its constructor defaults (EV15).
         // The composite, fog, SSGI, etc. read PostFX, so this must run before them. BALLISTIC_DX12_VOLUMES=0
         // restores the old unwired behaviour (PostFX = defaults) for A/B.
-        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_VOLUMES") != "0") {
+        if (doors.Volumes) {
             VolumeManager.Update(camPos);
             VolumePostProcessing.Apply(VolumeManager.Stack, PostFX);
         }
@@ -1759,12 +1767,17 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         // Shadows first: render the sun cascades' depth (own upload command list) before opaque. Fit with the
         // UNJITTERED proj so the cascades are stable frame-to-frame (cascade caching + no TAA shadow jitter).
-        RenderShadows(view, projUnjittered, light);
+        // doors.Shadows = off under BARE-MINIMUM (the deferred shadow term hard-1.0s via fc.ShadowsEnabled below).
+        if (doors.Shadows)
+            RenderShadows(view, projUnjittered, light);
+        else
+            shadowsThisFrame = false;
 
         // IBL: bake the env→irradiance/prefilter/BRDF from the procedural sky (re-bakes only on param
         // change). Own upload command list, before the render list. Only when a ProceduralSky is active.
+        // doors.Ibl = off under BARE-MINIMUM → UseIBL=0 → deferred uses the flat-fill ambient branch.
         iblActiveThisFrame = false;
-        if (ProceduralSky.Active is { } pSky) {
+        if (doors.Ibl && ProceduralSky.Active is { } pSky) {
             Vector3 sunDir = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
             float sunAngR = (DirectionalLight.Instance?.AngularDiameter ?? 0.53f) * 0.5f * (MathF.PI / 180f);
             // Transmittance LUT (re-bakes only on atmosphere-param change). Drives P5/P6 + the future shader
@@ -2075,19 +2088,21 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         // === SKY: draw into the HDR color at the far plane, depth-testing the G-buffer depth (LEqual,
         // no write). ProceduralSky takes precedence over an asset cubemap Skybox (matches GL). ===
+        // doors.Sky = off under BARE-MINIMUM → the background keeps the HDR clear color (a solid backdrop;
+        // lit geometry still composites correctly — this just removes the sky pass to isolate it).
         gbuffer.DepthToReadOnly();
-        target.RenderColorWithExternalDepth(gbuffer.DsvHandle, cl => {
-            if (ProceduralSky.Active is not null)
-                DrawProcSky(cl, view, proj, light);
-            else
-                DrawSkybox(cl, view, proj);
-        });
+        if (doors.Sky)
+            target.RenderColorWithExternalDepth(gbuffer.DsvHandle, cl => {
+                if (ProceduralSky.Active is not null)
+                    DrawProcSky(cl, view, proj, light);
+                else
+                    DrawSkybox(cl, view, proj);
+            });
 
         // === AERIAL PERSPECTIVE: atmospheric haze on distant opaque geometry (#1 scale cue), blended over the
         // sky+opaque HDR before transparents/fog. Separate pass — never touches deferred lighting. Only when a
         // ProceduralSky drives the atmosphere; BALLISTIC_DX12_AP=0 disables it. ===
-        bool apOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_AP") != "0";
-        if (apOn && ProceduralSky.Active is not null) {
+        if (doors.AerialPersp && ProceduralSky.Active is not null) {
             Vector3 apSunDir = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
             DrawAerialPerspective(viewProj, camPos, apSunDir, lightColor);
         }
@@ -2106,9 +2121,12 @@ public sealed class DX12HDRenderer : HDRenderer {
         // both SSGI and RT-GI share the temporal + OIDN + combine resolve. RT-GI falls back to SSGI w/o DXR.
         string ssgiEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SSGI");
         string rtgiEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RT_GI");
+        // doors.Minimal forces GI Off (the stage harness re-enables with BALLISTIC_DX12_SSGI=1 / _RT_GI=1,
+        // which set giMode below exactly as before since they take precedence over the Minimal default).
         GiMode giMode = rtgiEnv == "1" ? GiMode.RayTraced
-                      : ssgiEnv == "0" ? GiMode.Off
                       : ssgiEnv == "1" ? GiMode.ScreenSpace
+                      : ssgiEnv == "0" ? GiMode.Off
+                      : doors.Minimal ? GiMode.Off
                       : PostFX.GiMode;
         // P7.0 NO-RT AUTO-DOWNGRADE: on a GPU without hardware ray tracing (the audience floor; or BALLISTIC_DX12_
         // FORCE_NORT=1 on the dev card), RayTraced GI → ScreenSpace BEFORE EnsureRtGi/DrawRtGi touch the DXR path.
@@ -2129,14 +2147,16 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         // --- Volumetric fog (post pass, reads depth+shadows, blends over HDR scene color) ---
         // BALLISTIC_FX_VOLUMETRIC=1 forces it on (same harness contract as the GL backend).
-        bool fogOn = PostFX.VolumetricEnabled
-            || Environment.GetEnvironmentVariable("BALLISTIC_FX_VOLUMETRIC") == "1";
+        // doors.Fog already folds in BALLISTIC_FX_VOLUMETRIC==1; under MINIMAL PostFX.VolumetricEnabled is
+        // also gated off (the volume bridge doesn't run), so fog is off unless BALLISTIC_FX_VOLUMETRIC=1.
+        bool fogOn = (!doors.Minimal && PostFX.VolumetricEnabled) || doors.Fog;
         if (fogOn)
             DrawFog(view, viewProj, camPos, light);
 
         // --- Reflections (volume-driven, SSR vs RT). RT reflections trace the scene BVH (off-screen + sky
         // correct), reusing the SSR reflection target + combine; SSR is the screen-space fallback. ---
-        if (PostFX.SsrEnabled && PostFX.SsrIntensity > 0f) {
+        // doors.Minimal forces SSR off (re-enabled at the SSR stage via the Ssr volume / a forced PostFX).
+        if (!doors.Minimal && PostFX.SsrEnabled && PostFX.SsrIntensity > 0f) {
             string rtrEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RT_REFLECTIONS");
             bool rtReflWanted = rtrEnv == "1" || (rtrEnv != "0" && PostFX.ReflectionMode == ReflectionMode.RayTraced);
             if (rtReflWanted && EnsureRtReflections())
@@ -2145,7 +2165,7 @@ public sealed class DX12HDRenderer : HDRenderer {
                 DrawSsr(view, proj);
         }
 
-        bool ssaoOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SSAO") != "0";
+        bool ssaoOn = doors.Ssao;
 
         if (fsrActive) {
             // --- FSR upscale path (replaces TAA): SSAO (internal res) → FSR reconstruct internal→output
@@ -3761,7 +3781,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         }
 
         // Bloom: bright-pass + blur the HDR into bloomA (half-res). On by default; BALLISTIC_DX12_BLOOM=0 off.
-        bool bloomOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_BLOOM") != "0";
+        bool bloomOn = doors.Bloom;
         if (bloomOn) DrawBloom(hdr);
 
         // Tonemap: AgX by default (graceful highlight desaturation, the "less çiğ" look); ACES via the door.
