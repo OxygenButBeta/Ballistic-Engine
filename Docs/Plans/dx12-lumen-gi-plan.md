@@ -127,10 +127,28 @@ deleted — commit 1b0485ad.)
   to avoid runaway (the SSGI-EMA black-hole failure class). Shipped in the SAME commit as the feedback loop.
 - Verify: shadowed rooms are not pitch black; second-bounce color bleed visible; no energy explosion.
 
-**Phase 4 — Final gather via screen-space radiance probes.**
-- Downsampled screen probes, importance-sampled hemisphere integration, instead of per-pixel 1-spp rays.
-  Cheaper + far less noise to denoise.
-- Verify: noise drops pre-denoise; perf improves vs per-pixel; detail preserved on upsample.
+**Phase 4 — Final gather via screen-space radiance probes. [BUILT 2026-06-16 — P4.0/P4.1/P4.3 committed.]**
+- Downsampled screen probes (1 per 16x16 tile, 8x8 octahedral radiance, 64 cosine-hemisphere rays), bilateral
+  depth+normal upsample to full-res, instead of per-pixel 1-spp rays. The screen probes are the near/mid field;
+  on ray miss they hand off to the DDGI world cache (P2) — Lumen's screen-trace -> world-cache hierarchy. So
+  Phase 4 sits IN FRONT of DDGI, not replacing it. Behind BALLISTIC_DX12_SCREENPROBE=1 (requires DDGI on).
+- Sub-phases: P4.0 Place+Trace(uniform,miss->DDGI)+Blend+naive upsample (34559588) -> P4.1 bilateral
+  depth+normal integrate (kills 16x16 blockiness + silhouette halos) + far-field E->L=E/PI energy fix (2e5ddfaa)
+  -> P4.3 determinism wiring + 1660 budget lock (1ef182c6).
+- **P4.2 (importance sampling) — RESOLVED BY MEASUREMENT, not built as a separate pass.** The plan called for
+  "importance-sampled hemisphere integration"; we ALREADY cosine-weight the hemisphere rays, which IS the
+  diffuse-BRDF importance sample (the half of product-importance that matters for diffuse GI). MEASURED raw
+  pre-denoise noise (noise/mean, GI-isolate): SunTemple DDGI-gather 0.0183 -> screen-probe 0.0120 (-35%); Bistro
+  0.0779 -> 0.0581 (-25%). The screen-probe gather is ALREADY less noisy than the per-pixel DDGI gather — the
+  Phase-4 bar ("noise drops pre-denoise") is met+exceeded with cosine-BRDF-IS. Full PRODUCT importance sampling
+  (BRDF x last-frame-lighting CDF: a GenerateRays pass + ping-pong prev-atlas) pays off only when noise is HIGH
+  (per-pixel 1-spp); here noise is already low + OIDN-cleaned, so it's deferred as a future refinement (a new
+  GPU-hang surface for a marginal win = gold-plating, against the execution discipline). Revisit if a high-noise
+  scene ever demands it.
+- VERIFIED: noise drops vs per-pixel (above); perf 0.63ms (cheaper, amortised); detail preserved on bilateral
+  upsample (SunTemple isolate smooth, per-surface detail, no halos); Bistro leak test PASS; determinism SHA256
+  frame-independent. DECISION (user): screen-probe-PRIMARY flip DEFERRED until Phase 4 hardened (now is — but
+  kept opt-in pending the user's go); DDGI-gather stays the default look meanwhile.
 
 **Phase 5 — World radiance cache (far-field stability).**
 - DDGI-style world-space irradiance probes (auto-placed via the GpuSceneQuery substrate — invisible,
