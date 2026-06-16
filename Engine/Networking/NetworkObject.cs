@@ -116,4 +116,27 @@ public sealed class NetworkObject : Behaviour {
     internal long PredictConfirmDeadline { get; set; }
 
     public bool IsPredictedSpawn => PredictKey != 0;
+
+    // ---- lag compensation (P8a, §9 item 9 / §13) --------------------------------------------------
+    // SERVER side: the hitbox radius this object presents to lag-compensated raycasts. 0 (default) = NOT
+    // lag-comp-tracked — most objects don't need it; a player pawn opts in (set it on spawn). When > 0 the
+    // network tick records this object's pose into PoseHistory each tick, and a lag-compensated shot can
+    // rewind it to a past tick (favor-the-shooter, §9.9). A sphere hitbox keeps the rewind/restore exact +
+    // headless-testable (real hitscan against a dedicated hitbox, decoupled from the Bepu world that only
+    // syncs at fixed-step boundaries and needs GL); a capsule/box refinement is a later extension.
+    [NotSerialized]
+    public float LagHitboxRadius { get; set; }
+
+    public bool IsLagCompensated => LagHitboxRadius > 0f;
+
+    // SERVER side: the ring of historical poses (one per tick) this object's hitbox is rewound against. Lazily
+    // created when the object is first recorded (only for IsLagCompensated objects). null on a client / an
+    // untracked object — the rewind only ever runs on the server (the authority that resolves hits).
+    [NotSerialized]
+    internal PoseHistory LagHistory { get; set; }
+
+    // Observability (P8a): the number of historical poses currently buffered for this object's hitbox — 0
+    // when untracked or not yet recorded. Tools/tests read it to confirm the ring is accruing; the rewind
+    // itself is server-internal.
+    public int LagHistoryCount => LagHistory?.Count ?? 0;
 }

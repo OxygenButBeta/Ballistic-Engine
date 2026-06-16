@@ -1,3 +1,4 @@
+using System.Numerics;
 using BallisticEngine.Networking;
 using BallisticEngine.Loopback;
 
@@ -91,6 +92,39 @@ public static class Network {
 
     // Drop ownership back to the server (Connection.None).
     public static void RemoveOwnership(NetworkObject netObj) => Manager?.RemoveOwnership(netObj);
+
+    // ---- lag compensation (P8a, plan §9 item 9 / §13) — favor-the-shooter hitscan -----------------
+    // The render-tick a LOCAL hitscan shot should carry UP to the server: the PAST server-moment the
+    // client's screen actually showed (it renders proxies InterpDelay ticks behind the latest server tick,
+    // P5c). The game reads this when firing — `weapon.Fire(origin, dir, Network.RenderTick)` — and the
+    // server's To.Server impl passes it to LagCompensatedRaycast so the shot is resolved as the shooter saw
+    // it. On a host/server this is the current tick (the host renders the authoritative present).
+    public static double RenderTick => Manager?.RenderTick ?? 0;
+
+    // The current authoritative server tick (the fixed-step counter); on a client it trails via snapshots.
+    public static uint ServerTick => Manager?.ServerTick ?? 0;
+
+    // SERVER-side lag-compensated hitscan (§9.9): rewind every OTHER lag-compensated pawn's hitbox to the
+    // pose it occupied at `renderTick` (clamped to the server's max rewind), run the ray, restore — so a
+    // shot the shooter saw connect HITS even though the target has since moved. Call from inside a
+    // [Rpc(To.Server)] shot impl, passing the renderTick the client carried up. A pawn opts into being a
+    // target by setting NetworkObject.LagHitboxRadius > 0 (a sphere hitbox) on spawn. Returns the nearest hit.
+    public static bool LagCompensatedRaycast(Vector3 origin, Vector3 direction, double renderTick,
+        NetworkObject shooter, out LagRaycastHit hit) {
+        if (Manager is null) { hit = default; return false; }
+        return Manager.LagCompensatedRaycast(origin, direction, renderTick, shooter, out hit);
+    }
+
+    // Tuning knobs (§9.9): the interp delay the render-tick is derived from (MUST match the proxy
+    // interpolation delay), and the server-side max rewind (anti-abuse + the history ring length).
+    public static double InterpDelayTicks {
+        get => Manager?.InterpDelayTicks ?? 0;
+        set { if (Manager is not null) Manager.InterpDelayTicks = value; }
+    }
+    public static int MaxRewindTicks {
+        get => Manager?.MaxRewindTicks ?? 0;
+        set { if (Manager is not null) Manager.MaxRewindTicks = value; }
+    }
 
     // ---- RPC dispatch (plan §4b, P4) — called by the GENERATED partial-void stub, not by hand ------
     // The generated method body packs its args into a BitWriter then calls this; the manager routes per the

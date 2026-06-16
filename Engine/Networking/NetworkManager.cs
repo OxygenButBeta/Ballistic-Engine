@@ -78,6 +78,7 @@ public sealed class NetworkManager {
         InputStream.Reset();
         PredictionTicks = 0;
         IsReplaying = false;
+        LastServerTick = 0;   // P8a: the client's view of the server tick (drives RenderTick)
         snapshotWriter.Reset();
         sceneStateWriter.Reset();   // P7: the entity-less GameState flush buffer
         connectionTokens.Clear();   // P7: reconnect bookkeeping
@@ -349,6 +350,7 @@ public sealed class NetworkManager {
     void HandleSnapshot(ref BitReader r) {
         uint snapshotSeq = r.ReadUInt();   // P6: the per-client send frontier — ACK it so the server
                                            // advances OUR baseline (after applying the batch below).
+        LastServerTick = r.ReadUInt();     // P8a: the server tick this snapshot reflects — drives RenderTick.
         while (!r.AtEnd && r.BitLength - r.BitPos >= 96) {   // at least netId+seq+typeId remain
             int netId = r.ReadInt();
             uint lastProcessedSeq = r.ReadUInt();   // P5b: the server's ack frontier for this object
@@ -559,6 +561,98 @@ public sealed class NetworkManager {
     // would fire spuriously every rollback. The generated [OnChanged] dispatch (and game code) reads this.
     public bool IsReplaying { get; private set; }
 
+    // ---- lag compensation (P8a, plan §9 item 9 / §13) ---------------------------------------------
+    // CLIENT side: the latest server tick observed in a snapshot (HandleSnapshot reads it). RenderTick =
+    // this − InterpDelayTicks is the PAST server-moment the client's screen shows (it renders proxies
+    // InterpDelay back, P5c) — the time a hitscan shot carries UP so the server rewinds to what the shooter
+    // saw (§9.9). 0 before the first snapshot.
+    public uint LastServerTick { get; private set; }
+
+    // The interpolation delay (ticks) the client renders proxies behind the latest server tick — MUST match
+    // the SnapshotInterpolator's InterpDelay (P5c) so RenderTick lines up with what was actually drawn. The
+    // shot's render-tick is derived from it, so it's the lag-comp/interp coupling knob.
+    public double InterpDelayTicks { get; set; } = SnapshotInterpolator.DefaultInterpDelayTicks;
+
+    // SERVER side: how far back (ticks) a client may ask to rewind. Caps an abusive claim (a cheat asking to
+    // rewind 10s to snipe a target that was elsewhere long ago) AND bounds the PoseHistory ring length.
+    // ~1s at 60Hz covers any realistic RTT+interp; tune per game.
+    public int MaxRewindTicks { get; set; } = 60;
+
+    // The current authoritative server tick (the fixed-step counter). On a client this trails via LastServerTick.
+    public uint ServerTick => (uint)SendClock.LocalTick;
+
+    // The render-tick a LOCAL shot should carry UP (CLIENT): the past server-moment the screen showed. On a
+    // host/server this is just the current tick (no interp delay — the host renders the authoritative present).
+    public double RenderTick => IsServer ? ServerTick : Math.Max(0, (double)LastServerTick - InterpDelayTicks);
+
+    // SERVER: record every lag-compensated object's CURRENT pose into its PoseHistory for THIS tick, so a
+    // later shot can rewind it (favor-the-shooter). Called once per fixed tick from PredictTick (server-only).
+    // Only objects that opted in (LagHitboxRadius > 0) are tracked — most objects pay nothing. Reflection-free:
+    // a typed walk + a transform read. The ring is sized to MaxRewindTicks (+ a small margin for the
+    // fractional render-tick bracket) so it never grows unbounded.
+    void RecordLagCompHistory() {
+        uint tick = (uint)SendClock.LocalTick;
+        foreach (NetworkObject obj in objects.All()) {
+            if (obj is not { IsSpawned: true, IsLagCompensated: true } || obj.Entity is null)
+                continue;
+            obj.LagHistory ??= new PoseHistory(MaxRewindTicks + 4);
+            obj.LagHistory.Record(tick, obj.Entity.transform.Position);
+        }
+    }
+
+    // The server caps how far back a client may rewind (anti-abuse) and never rewinds into the future.
+    // Returns the effective render-tick used. Public so a tool/test can predict the clamp.
+    public double ClampRenderTick(double renderTick) {
+        double now = SendClock.LocalTick;
+        double oldest = now - MaxRewindTicks;
+        if (renderTick < oldest) return oldest;
+        if (renderTick > now) return now;   // clock skew / cheat — never rewind forward
+        return renderTick;
+    }
+
+    // SERVER: a lag-compensated hitscan raycast (plan §9.9 / §13 P8a — favor-the-shooter). Rewinds every
+    // OTHER lag-compensated pawn's hitbox to the pose it interpolates at the (clamped) renderTick, runs a
+    // ray-vs-hitbox test against the rewound world, then RESTORES the live poses — so the shot is resolved
+    // as the shooter SAW it, not against where the targets have since moved. The shooter's OWN pawn is never
+    // rewound. Returns the nearest hit. Call from inside a To.Server shot RPC (where RenderTick rode up).
+    //
+    // NOTE the rewind is against a dedicated SPHERE hitbox (LagHitboxRadius), NOT the Bepu world — Bepu only
+    // syncs body poses at fixed-step boundaries and needs GL, so a transform-rewound Physics.Raycast wouldn't
+    // see the moved body and wouldn't run headless. A dedicated hitbox is also how real lag-comp works (it
+    // rewinds hitboxes, not the whole physics scene) and keeps this deterministic + headless-verifiable.
+    public bool LagCompensatedRaycast(Vector3 origin, Vector3 direction, double renderTick,
+        NetworkObject shooter, out LagRaycastHit hit) {
+        hit = default;
+        if (!IsServer || direction == Vector3.Zero)
+            return false;
+        Vector3 dir = Vector3.Normalize(direction);
+        double effective = ClampRenderTick(renderTick);
+
+        NetworkObject best = null;
+        float bestT = float.MaxValue;
+        Vector3 bestPoint = default;
+        foreach (NetworkObject obj in objects.All()) {
+            if (obj is not { IsSpawned: true, IsLagCompensated: true } || obj.Entity is null)
+                continue;
+            if (ReferenceEquals(obj, shooter))
+                continue;   // never rewind/hit the shooter's own pawn
+
+            // REWIND: the hitbox center is the pose this pawn occupied at the render-tick (its history),
+            // not the live transform. No mutation of the transform — we test against the sampled point, so
+            // there is nothing to restore (the §3 "restore" check is structurally satisfied — the live pose
+            // is never touched). The history may be empty (just spawned) → fall back to the live pose.
+            Vector3 center = obj.LagHistory is { Count: > 0 } h ? h.SampleAt(effective)
+                                                                : obj.Entity.transform.Position;
+            if (LagHitbox.RaySphere(origin, dir, center, obj.LagHitboxRadius, out float t) && t < bestT) {
+                bestT = t; best = obj; bestPoint = origin + dir * t;
+            }
+        }
+        if (best is null)
+            return false;
+        hit = new LagRaycastHit(best, bestT, bestPoint);
+        return true;
+    }
+
     // ---- the transport pump (once per FRAME) ------------------------------------------------------
     // Drains incoming / flushes outgoing on the socket — the IterateIncoming/IterateOutgoing brackets
     // (plan §8.2). Render-frame cadence is correct here (it is I/O, not simulation). The per-TICK
@@ -580,6 +674,11 @@ public sealed class NetworkManager {
 
         uint seq = (uint)SendClock.LocalTick;   // this tick's seq (the replay index, == LocalTick)
         PredictionTicks++;
+
+        // P8a: record every lag-compensated pawn's pose for THIS tick BEFORE the sim moves them, so a shot
+        // arriving later can rewind to where targets were when the shooter saw them (server-only, §9.9).
+        if (IsServer)
+            RecordLagCompHistory();
 
         foreach (NetworkObject obj in objects.All()) {
             if (obj?.Entity is null)
@@ -783,7 +882,11 @@ public sealed class NetworkManager {
 
     ReadOnlySpan<byte> SerializeStateSnapshotFor(ClientReplState state, uint sendSeq) {
         snapshotWriter.Reset();
-        snapshotWriter.WriteUInt(sendSeq);   // P6: the per-client frontier the client acks
+        snapshotWriter.WriteUInt(sendSeq);                  // P6: the per-client frontier the client acks
+        snapshotWriter.WriteUInt((uint)SendClock.LocalTick);  // P8a: the server tick this snapshot reflects —
+                                                            // the client tracks it so RenderTick = serverTick −
+                                                            // InterpDelay is the past server-moment its screen
+                                                            // shows, which a lag-comp shot carries up (§9.9).
         int written = 0;
         Dictionary<int, object> sentThisSeq = null;
         foreach (NetworkObject obj in objects.All()) {
