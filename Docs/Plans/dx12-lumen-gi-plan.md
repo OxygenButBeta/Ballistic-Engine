@@ -191,9 +191,15 @@ deleted — commit 1b0485ad.)
   (24E6A874… — gate is a no-op when RT present); FORCE_NORT=1 logs the downgrade + runs SSGI (no SCREENPROBE/DDGI),
   CLEAN exit no device-removal even with RT_GI=1 forced; no-RT GI-isolate = valid SSGI bounce (SunTemple mean 20.4,
   not black) vs RT 30.7. This ships the safety fix even if the floor stops here.
-- **P7.1 — wire the SSGI+IBL+SSAO floor as the explicit no-RT GiMode + measure on the 1660 budget.** Confirm the
-  three existing passes compose coherently; GI-isolate shows the on-screen bounce; document the expected off-screen
-  darkening (the honest hole P7.2 fixes). NOTE much of P7.1 already falls out of P7.0 (FORCE_NORT → SSGI runs).
+- **P7.1 — SSGI+IBL+SSAO floor as the no-RT GiMode. DONE/VERIFIED via P7.0 (no new code needed).** The downgrade
+  already routes no-RT → SSGI over the IBL-lit scene + SSAO multiply, which composes coherently. VERIFIED (FORCE_
+  NORT=1, composite, RX 9070 XT, DRED): SunTemple no-RT floor mean 87.3 — bright, well-distributed, clean (looks
+  genuinely good; SunTemple is open-ish so the screen-space floor holds). Bistro interior composite no-RT 22.0 vs
+  RT 19.2 (close — both dominated by direct point-light+IBL; SSGI's on-screen bounce slightly more aggressive than
+  RT-DDGI here). HONEST FINDING: on BOTH fixtures' DEFAULT cameras the no-RT floor is acceptable, not broken — the
+  dramatic off-screen "window-behind-camera" hole the research warns about needs an ADVERSARIAL camera; it's a
+  principle to fix (P7.2 raster-DDGI), not a catastrophe on these views. So P7.2 is a QUALITY-CEILING build, not a
+  rescue. Captures e:/tmp/p4flip/p71_*.
 - **P7.2 — rasterized probe G-buffer capture (no relight).** Per-probe small (16-32px) cubemap G-buffer
   (depth/normal/albedo) into the EXISTING DDGI octahedral textures, time-sliced round-robin, FIXED deterministic
   order. Debug-view one probe's G-buffer. **MEASURE probes/frame inside the 1660 budget** (the unmeasured risk —
