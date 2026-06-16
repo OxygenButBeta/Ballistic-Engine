@@ -300,9 +300,38 @@ was built + measured NON-VIABLE (~2ms/probe) and user chose to stop at P7.1. See
     assumed a viable proxy). Env doors kept: BALLISTIC_DX12_FORCE_NORT (gate A/B), NORT_PROBES + NORT_PROBES_PROXY
     (the measurement door). NEXT on the GI track: Phase 5 surfels / Phase 6 denoise / Phase 8 reflections (RT path).
 
-**Phase 8 — Reflections via the surface cache (bonus, unifies with existing RT reflections).**
-- Lumen reflections reuse the surface cache + RT; fold the existing DX12 RT reflections into this so rough
-  reflections sample the surface cache (consistent GI + reflections).
+**Phase 8 — Reflections via the world cache (unifies GI + reflections). [★ P8.0 DONE 2026-06-16.]**
+- Lumen reflections reuse the radiance cache + RT; we fold the existing DX12 RT reflections into the DDGI WORLD
+  CACHE so reflection-ray HITS are shaded with the SAME world-radiance estimator the diffuse GI uses (Lumen
+  "Hit Lighting"), and the reflected surface's own indirect bounce comes from the same cache (multi-bounce
+  reflections, free). Research+critic: wf_48eda70d (published Lumen arch + the /PI energy trap). Our world cache
+  is a DIFFUSE octahedral IRRADIANCE field (not a directional radiance cache) — so the RIGHT technique is
+  trace-then-shade (the hit's ambient = the field), NOT sample-the-field-along-R (that needs /PI AND
+  double-counts where the diffuse pass already lights rough surfaces — DEFERRED as an energy trap).
+- **P8.0 DONE & COMMITTED — the core win.** DxrReflections.hlsl ClosestHit replaced the placeholder grey
+  (Irradiance*0.5) with the real world-radiance hit shading: `albedo*(sun*NdotL*shadowRay + punctual(shadow-rayed)
+  + ambient)` where `ambient = SampleDdgiField(hit,Ng)` (the DDGI field when bound; IBL cube fallback when off) —
+  byte-identical in math to DdgiTrace.ShadeHit / DxrGi.ClosestHit (bindless geo + 2-sided normal + albedo clamp
+  0.9 + luma clamp 1e5 + ternary Sanitize). NO /PI (E used as the receiver's hemisphere irradiance, forming
+  albedo*E — matches DdgiGather's no-/PI convention), NO sky double-count (field-only when DDGI on). Reuses the
+  existing RT PSO (grew the root sig: HeapDirectlyIndexed + CBV b1 sun / b2 grid + table t0-t6 + root SRV
+  t7-t10 mats/instances/lights/ProbeState; reserved bindless tail RtReflTableBase=16352..16359). Mirror rays
+  stay deterministic → no denoiser. ssrTarget + SSR combine contract UNCHANGED. Door = the existing
+  BALLISTIC_DX12_RT_REFLECTIONS (RayTraced reflection mode). De-risk: 22/22 shaders CPU-compile; 4-reviewer
+  adversarial wiring audit (wf_1b047c41) = GO, 0 device-removal blockers, applied C1 (depth NonPixel transition,
+  mirror DrawRtGi — was missing) + C2 (Texture2D inert t6 when DDGI off, kills a validation warning). VERIFIED
+  (RX 9070 XT, DRED, 5 clean launches NO removal/hang/PageFault): SunTemple floor/statue/pedestal show real
+  COLORED LIT reflections (red pedestal bleeds into the floor, off-screen columns reflected — vs the old grey);
+  A/B vs SSR = 59.7% px changed, means 91.1 vs 91.4 (no blowout/double-count); Bistro interior coherent warm
+  restaurant, no wall-bleed/NaN (leak holds), 19.4% px changed, means 18.3/19.2. DETERMINISM PROVEN: SunTemple
+  det f24 == f240 SHA256 BYTE-IDENTICAL. Budget Reflections:RT 1.51ms (SunTemple) / 2.07ms (Bistro) dev card.
+- **P8.1 (DEFERRED — budget lock, only if measured over budget on a 1660):** lower MAX_ROUGHNESS 0.6→0.4 (Lumen's
+  documented optimization), cap the punctual shadow-ray loop in the reflection variant (sun-only), optional
+  quarter-res. Door BALLISTIC_DX12_RT_REFL_BUDGET. NOT built — reflections are a separate optional effect from
+  the ≤2ms diffuse-GI budget (a 1660 uses SSR); reopen only with a measured over-budget on real weak HW.
+- **DEFERRED (gold-plating / traps):** rough-tail field-along-R term (the /PI energy trap), GGX-jittered glossy
+  rays + reflection denoiser (reintroduces noise the deterministic mirror design avoids), true directional
+  surface cache (mesh cards = forbidden authoring), recursive reflection rays (DDGI ambient already = multi-bounce).
 
 ---
 
