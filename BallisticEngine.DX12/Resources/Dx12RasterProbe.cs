@@ -220,6 +220,46 @@ public sealed class Dx12RasterProbe : IDisposable {
         To(cl, ref normalState, normalCube, ResourceStates.PixelShaderResource);
     }
 
+    // P7.2b: render ONE probe at `probePos`, 6 faces, via the GPU-DRIVEN PROXY (Dx12GpuDrivenRenderer's lean
+    // probe PSO — ~1 ExecuteIndirect/mesh-group/face instead of P7.2a's 158 per-submesh draws/face). The caller
+    // MUST have already built the per-face meta (gpuDriven.ProbeBuildFaceMeta(wholeMesh, FaceMatrices(probePos))).
+    // `drawFace(cl, faceIndex)` runs gpuDriven.RenderIntoProbeFace(cl, faceIndex) into the bound face RTV/DSV. This
+    // method owns the cube state + per-face RTV/DSV/viewport/clear (identical to RenderOneProbe); the delegate only
+    // issues the GPU-driven cull+draw. One command list (all 6 faces batched — the probe buffers are per-face
+    // disjoint slices, so no upload-heap aliasing). Returns leaving the cubes in PixelShaderResource.
+    public void RenderOneProbeGpuDriven(ID3D12GraphicsCommandList4 cl, Vector3 probePos,
+        Action<ID3D12GraphicsCommandList4, int> drawFace) {
+        To(cl, ref albedoState, albedoCube, ResourceStates.RenderTarget);
+        To(cl, ref normalState, normalCube, ResourceStates.RenderTarget);
+        // depthCube stays DepthWrite (DSV-only, never read) — no transition.
+
+        cl.RSSetViewport(0, 0, FaceRes, FaceRes);
+        cl.RSSetScissorRect(FaceRes, FaceRes);
+        Span<CpuDescriptorHandle> rtvs = stackalloc CpuDescriptorHandle[2];
+        for (int f = 0; f < 6; f++) {
+            CpuDescriptorHandle dsv = DsvHandle(f);
+            rtvs[0] = RtvHandle(f * 2 + 0); rtvs[1] = RtvHandle(f * 2 + 1);
+            cl.OMSetRenderTargets(rtvs, dsv);
+            cl.ClearRenderTargetView(RtvHandle(f * 2 + 0), new Vortice.Mathematics.Color4(0, 0, 0, 0));
+            cl.ClearRenderTargetView(RtvHandle(f * 2 + 1), new Vortice.Mathematics.Color4(0.5f, 0.5f, 0.5f, 1f));
+            cl.ClearDepthStencilView(dsv, ClearFlags.Depth, 1.0f, 0);
+            drawFace(cl, f);
+        }
+
+        To(cl, ref albedoState, albedoCube, ResourceStates.PixelShaderResource);
+        To(cl, ref normalState, normalCube, ResourceStates.PixelShaderResource);
+    }
+
+    // The probe-cube G-buffer formats — the GPU-driven proxy PSO (Dx12GpuDrivenRenderer.BuildProbePipeline) must
+    // match these exactly (the OM RenderTargetFormats gate) or the indirect draw is device-removal.
+    public static Format ProbeAlbedoFormat => AlbedoFmt;
+    public static Format ProbeNormalFormat => NormalFmt;
+    public static Format ProbeDepthFormat => DepthFmt;
+
+    // The probe-face near/far the proxy meta must use (same as RenderOneProbe's FaceMatrices(pos, 0.05, 60)).
+    public const float FaceNear = 0.05f;
+    public const float FaceFar = 60f;
+
     // P7.2a debug: equirect-unwrap the albedo cube into `output` (ssgiTarget UAV). `outputUav`/`cubeSrv` are CPU
     // handles the caller copies into `heap` (a small shader-visible heap: slot0 = cube SRV, slot1 = output UAV).
     public unsafe void DebugBlit(ID3D12GraphicsCommandList4 cl, Dx12DescriptorHeap heap, int w, int h, float exposureScale) {

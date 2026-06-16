@@ -2811,6 +2811,16 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (rasterProbe == null) rasterProbe = new Dx12RasterProbe(dev);
         rasterProbe.Build();
 
+        // P7.2b PROXY path (BALLISTIC_DX12_NORT_PROBES_PROXY=1): drive the probe cube via the GPU-DRIVEN whole-mesh
+        // proxy (Dx12GpuDrivenRenderer's lean probe PSO) — ~1 ExecuteIndirect/mesh-group/face vs P7.2a's 158
+        // per-submesh draws/face. A/B the two cost numbers against the same probe. Only the WHOLE-MESH renderers
+        // feed the proxy (SubMeshIndex<0 — the ~1600-submesh Bistro mass = 100% of the P7.2a cost); non-whole-mesh
+        // renderers are rare and deferred (P7.2c can add them back via the per-submesh loop if a fixture needs it).
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_NORT_PROBES_PROXY") == "1") {
+            DrawRasterProbeMeasureProxy(camPos);
+            return;
+        }
+
         var fallbackDiffuse = DefaultTextures.Neutral(TextureType.Diffuse) as Dx12Texture2D;
 
         // The per-face draw: run the per-submesh opaque loop with the probe-face viewProj into the bound RTV/DSV.
@@ -2906,6 +2916,54 @@ public sealed class DX12HDRenderer : HDRenderer {
         }
 
         // Debug: equirect-blit the albedo cube into ssgiTarget so the GI-isolate capture shows the probe geometry.
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_NORT_PROBES_DEBUG") == "1") {
+            if (rasterProbeDbgHeap == null)
+                rasterProbeDbgHeap = new Dx12DescriptorHeap(dev,
+                    DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true);
+            var ht = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+            dev.Device.CopyDescriptorsSimple(1, rasterProbeDbgHeap.Cpu(0), rasterProbe.AlbedoCubeSrv, ht);
+            dev.Device.CreateUnorderedAccessView(ssgiTarget.RenderTarget, null, new UnorderedAccessViewDescription {
+                Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+            }, rasterProbeDbgHeap.Cpu(1));
+            ssgiTarget.ColorToUnorderedAccess();
+            dev.ExecuteSync(cl => rasterProbe.DebugBlit(cl, rasterProbeDbgHeap, ssgiTarget.Width, ssgiTarget.Height, SsgiPreExposure()));
+            ssgiTarget.ColorToShaderResource();
+        }
+    }
+
+    // P7.2b PROXY measurement: render ONE probe at the camera via the GPU-driven whole-mesh proxy (lean probe PSO,
+    // ~1 ExecuteIndirect/mesh-group/face) and time it — the go/no-go cost vs P7.2a's 7.483ms/probe per-submesh
+    // floor. Build the bindless material table (stamp-cached; the lean shader reads GpuMaterials[matId] + bindless
+    // diffuse) + the probe pipeline + the per-face meta ONCE, then RenderOneProbeGpuDriven batches all 6 faces.
+    unsafe void DrawRasterProbeMeasureProxy(Vector3 camPos) {
+        gpuDriven.EnsureMaterialTable(wholeMeshRenderers);
+        gpuDriven.BuildProbePipeline(Dx12RasterProbe.ProbeAlbedoFormat,
+            Dx12RasterProbe.ProbeNormalFormat, Dx12RasterProbe.ProbeDepthFormat);
+
+        Span<Matrix4x4> faceVPs = stackalloc Matrix4x4[6];
+        Dx12RasterProbe.FaceMatrices(camPos, Dx12RasterProbe.FaceNear, Dx12RasterProbe.FaceFar, faceVPs);
+        gpuDriven.ProbeBuildFaceMeta(wholeMeshRenderers, faceVPs);
+
+        int probeExecs = 0;
+        void DrawFace(ID3D12GraphicsCommandList4 cl, int face) {
+            probeExecs += gpuDriven.RenderIntoProbeFace(cl, face);
+        }
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        dev.ExecuteSync(cl => rasterProbe.RenderOneProbeGpuDriven(cl, camPos, DrawFace));
+        sw.Stop();
+        RenderStats.Scene.GpuPasses.Add(("GI:RasterProbeProxy", sw.Elapsed.TotalMilliseconds));
+
+        if (!rasterProbeLogged) {
+            rasterProbeLogged = true;
+            Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                $"[RASTERPROBE] P7.2b PROXY measure: 1 probe x 6 faces @ {Dx12RasterProbe.FaceRes}px = {probeExecs} " +
+                $"ExecuteIndirect (~{probeExecs / 6.0:0.0}/face), {gpuDriven.ProbeLastTris} tris fed in " +
+                $"{sw.Elapsed.TotalMilliseconds:0.000}ms (dev card) vs P7.2a 7.483ms/probe per-submesh. " +
+                $"Extrapolate: 128 probes/frame ~= {sw.Elapsed.TotalMilliseconds*128:0.0}ms naive (round-robin cuts this)."));
+        }
+
+        // Debug blit (same as P7.2a) — show the proxy-rasterized albedo cube so the geometry is visibly correct.
         if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_NORT_PROBES_DEBUG") == "1") {
             if (rasterProbeDbgHeap == null)
                 rasterProbeDbgHeap = new Dx12DescriptorHeap(dev,

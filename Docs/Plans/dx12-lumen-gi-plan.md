@@ -169,7 +169,8 @@ deleted — commit 1b0485ad.)
   rules (ternary NaN scrub, pre-exposure consistency, disocclusion rejection).
 - Verify: converged + stable under motion; no boiling; no NaN black holes.
 
-**Phase 7 — Low-end / no-RT fallback. [IN PROGRESS — user-chosen next phase 2026-06-16; full-floor scope.]**
+**Phase 7 — Low-end / no-RT fallback. [★ DONE AT THE FLOOR 2026-06-16 — ships SSGI+IBL+SSAO; the raster-DDGI proxy
+was built + measured NON-VIABLE (~2ms/probe) and user chose to stop at P7.1. See P7.2b below.]**
 > **THE HONEST FINDING (research wf_12e5d5b6):** "just SSGI + IBL + SSAO" is NOT an acceptable floor — SSILVB's
 > own paper: *"if direct light leaves the screen, the indirect lighting disappears"* (a room lit from behind the
 > camera goes black). The published fix (Unity HDRP: SSGI *"falls back to APV / Reflection Probes to gather
@@ -215,21 +216,36 @@ deleted — commit 1b0485ad.)
     face) in 7.483ms on the DEV CARD → 128 probes/frame ≈ 958ms. FULL-GEOMETRY RASTER IS NON-VIABLE** (even ~16
     probes/frame ≈ 120ms; a GTX-1660 is worse). VERDICT: a reduced-geometry PROXY is MANDATORY (confirms the
     research) — P7.2b/c must NOT use full per-submesh geometry. Captures e:/tmp/p4flip/p72a_*.
-  - **P7.2b (NEXT) — REDUCED-GEOMETRY PROXY + relight + resolve → rayData[probe 0], blend, verify atlas.** The 7.5ms
-    number forces the proxy decision FIRST (research-sanctioned): options = coarse LOD / merged whole-mesh at a low
-    cull threshold / a single low-poly proxy mesh / much lower probe count. Pick + measure the proxy cost, THEN add
-    DdgiRasterRelight.hlsl (sun+shadow+IBL+last-frame-DDGI, copied from DdgiTrace hit shading) + DdgiRasterResolve.hlsl
-    (cube→144 rays), fill rayData[probe 0], run the EXISTING blend, DumpIrradianceStats to confirm non-zero/smooth/no NaN.
-  - **P7.2c — grid + round-robin + sleeping** (probes-this-phase × 6 faces with the proxy, the full DispatchDdgi blend,
-    GiMode wired into the !HasHardwareRayTracing block). **P7.2d — warm-up + determinism + budget lock.**
-- **P7.3 — probe relight + octahedral irradiance projection (Layer 2 live).** Relight the captured G-buffer
-  (sun+sky+punctual), project to octahedral irradiance, feed the UNCHANGED DDGI gather. Single-bounce. Verify the
-  off-screen hole is FILLED in Bistro interior; DDGI Chebyshev visibility ON → no leak through walls.
-- **P7.4 — multi-bounce (prev-frame probe irradiance into relight) + energy clamp** (the SSGI-EMA NaN/runaway
-  guard, ternary scrub — [[ssgi-nan-mix-scrub]]). A/B vs single-bounce in enclosed interiors; no over-brighten.
-- **P7.5 (optional) — RSM sun first-bounce booster** only if P7.3/P7.4 under-captures the sun's directional bounce.
-- Env doors: BALLISTIC_DX12_FORCE_NORT (the gate A/B), BALLISTIC_DX12_NORT_PROBES=0|1 (Layer 2). Judge by GI-isolate
-  in SunTemple + Bistro interior. Verify: acceptable GI + good perf on a no-RT profile; graceful, not broken.
+  - **★ P7.2b DONE & MEASURED — the proxy WORKS but is NON-VIABLE for a per-frame budget; user chose STOP-AT-P7.1.**
+    Built the user-chosen MERGED WHOLE-MESH LOW-CULL proxy (option a, lean-PSO): `GBufferProbeBindless.hlsl` (lean
+    2-MRT bindless probe shader = GBufferBindless minus tangent/motion; PS emits albedo + world-normal only, no b1
+    motion) + `Dx12GpuDrivenRenderer.{BuildProbePipeline, ProbeBuildFaceMeta, RenderIntoProbeFace}` (a 2nd lean
+    `probeDrawPso` built against the EXISTING drawRootSig so cmdSig is reused, RenderTargetFormats={albedo,normal}
+    matching the probe cube; reuses the compute cull + ExecuteIndirect + bindless material table; own
+    probeCommands/probePerDraws/probeMeta/probeCullParam buffers sized 6×Capacity for disjoint per-face slices;
+    HizEnabled=0; WorldAabb cached once/submesh, per-face Mvp re-stamped) + `Dx12RasterProbe.RenderOneProbeGpuDriven`
+    (drives the 6 faces via the proxy). EXACTLY mirrors the proven GPU-driven SHADOW path (2nd PSO, different RT
+    formats, reused cull). Behind BALLISTIC_DX12_NORT_PROBES=1 + **BALLISTIC_DX12_NORT_PROBES_PROXY=1** (A/B vs P7.2a).
+    De-risk: 18/18 shaders CPU-compile (incl the lean shader); 4-reviewer adversarial wiring audit (wf_141f46c5) GO,
+    0 device-removal-class bugs, 0 required fixes (refuted format-mismatch / unbound-b1 / Hi-Z-stub-read /
+    buffer-overflow / barrier-desync — all verified safe; off-by-one confirmed: f=5 max write 49151 < ProbeCapacity
+    49152). **VERIFIED (SunTemple, paused f24, RX 9070 XT, DRED on, 3 CLEAN launches no removal/hang): proxy collapses
+    949 draws/probe → 6 ExecuteIndirect/probe (1/face); cost 1.76–2.32ms/probe vs P7.2a 7.483ms = 3.2–4× faster.**
+    ★ BUT STILL NON-VIABLE per-frame: 128 probes ≈ 225ms; round-robin 1/8 (~16/frame) ≈ 30ms; even 1 probe/frame ≈
+    2ms = the ENTIRE ≤2ms GI budget (and a GTX-1660 is slower than this dev card). ROOT CAUSE of the floor: at 24px
+    the PIXEL cost is ~0 but the VERTEX throughput is full — 606k whole-mesh tris × 6 faces ≈ 3.6M vert invocations/
+    probe (the AABB cull only drops whole submeshes OUTSIDE each face frustum; a probe inside the temple sees most
+    geometry across its 6 faces). Resolution can't shrink this; only DRASTICALLY fewer tris (a true low-poly proxy /
+    aggressive LOD — which "merged whole-mesh" explicitly is NOT) would. Captures e:/tmp/p72b/.
+  - **★ USER DECISION (2026-06-16): STOP AT P7.1 — ship the SSGI+IBL+SSAO floor as the no-RT GI path.** P7.1's floor
+    already looks good on both fixtures' default cameras (re-verified: SunTemple no-RT composite = bright marble,
+    lit floor mosaic, clear architecture). P7.2 was always a quality-ceiling build for enclosed/off-screen-lit rooms,
+    not a rescue, and the proxy doesn't fit a mid-card budget. The off-screen-only-lit-room hole stays a DOCUMENTED
+    no-RT limitation. P7.2b's proxy + measurement are KEPT (committed) as the reusable building block + the cost gate
+    the plan demanded — not deleted; a future true-low-poly-proxy effort (reopening the proxy-type decision) could
+    build on it. **PHASE 7 (no-RT fallback) = DONE at the floor.** P7.2c/d, P7.3/P7.4/P7.5 are NOT pursued (they
+    assumed a viable proxy). Env doors kept: BALLISTIC_DX12_FORCE_NORT (gate A/B), NORT_PROBES + NORT_PROBES_PROXY
+    (the measurement door). NEXT on the GI track: Phase 5 surfels / Phase 6 denoise / Phase 8 reflections (RT path).
 
 **Phase 8 — Reflections via the surface cache (bonus, unifies with existing RT reflections).**
 - Lumen reflections reuse the surface cache + RT; fold the existing DX12 RT reflections into this so rough
