@@ -183,8 +183,26 @@ public sealed class Dx12Device : IDisposable {
     // ResizeBuffers requires every backbuffer reference released AND the GPU idle, and Present in the
     // synchronous editor model waits here so the next frame's backbuffer is safe to reuse. Takes the
     // submit gate so it never races ExecuteSync's fenceValue increment.
+    //
+    // Waits on BOTH the render fence AND the upload fence: asset uploads run on JobSystem WORKER threads
+    // via ExecuteUpload (its own fence) and submit to the SAME queue. A resize/ResizeBuffers that only
+    // waited the render fence would proceed while a worker's CopyTextureRegion is still in flight on the
+    // GPU — freeing backbuffers/targets under an active GPU read → device removal (the 4K->1080p hang).
     public void Flush() {
-        lock (submitGate) WaitForGpu();
+        // Hold uploadGate too so no worker ExecuteUpload starts between the two waits, then drain BOTH the
+        // render queue and any in-flight worker uploads (they share this queue). The upload drain lives here
+        // (not in WaitForGpu) so ExecuteSync/Dispose — which call WaitForGpu under submitGate only — never
+        // touch uploadFenceValue unguarded and race a concurrent ExecuteUpload.
+        lock (submitGate)
+            lock (uploadGate) {
+                WaitForGpu();
+                ulong uTarget = ++uploadFenceValue;
+                Queue.Signal(uploadFence, uTarget);
+                if (uploadFence.CompletedValue < uTarget) {
+                    uploadFence.SetEventOnCompletion(uTarget, uploadEvent.SafeWaitHandle.DangerousGetHandle());
+                    uploadEvent.WaitOne();
+                }
+            }
     }
 
     void WaitForGpu() {

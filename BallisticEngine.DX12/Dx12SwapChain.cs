@@ -120,7 +120,21 @@ public sealed class Dx12SwapChain : IDisposable {
     // Flip the presented backbuffer to the screen. syncInterval 1 = vsync, 0 = uncapped (the host's idle
     // throttle paces it via the window's UpdateFrequency, like the GL path).
     public void Present(bool vsync) {
-        swapChain.Present(vsync ? 1u : 0u, PresentFlags.None);
+        CheckPresent(swapChain.Present(vsync ? 1u : 0u, PresentFlags.None));
+    }
+
+    // Present returns an HRESULT (PreserveSig) — DON'T swallow it. On a device-removal/reset (e.g. a TDR
+    // after a cross-monitor resize) surface the real reason + DRED page-fault instead of letting the next
+    // call cascade into a full desktop lock-up. Throws so Program.cs's handler prints the diagnosis.
+    void CheckPresent(SharpGen.Runtime.Result r) {
+        if (r.Success) return;
+        if (r.Code == Vortice.DXGI.ResultCode.DeviceRemoved.Code ||
+            r.Code == Vortice.DXGI.ResultCode.DeviceReset.Code) {
+            Debugging.LogError($"[DX12] Present device-removed: reason={dev.Device.DeviceRemovedReason} " +
+                               $"DRED={dev.DrainDredReport()}");
+            r.CheckError();   // throw the device-removed HRESULT
+        }
+        // Non-fatal (e.g. OCCLUDED when minimised) — ignore; the next frame re-presents.
     }
 
     // The PLAYER present (no ImGui): blit the renderer's final LDR color straight into the backbuffer, then
@@ -141,16 +155,23 @@ public sealed class Dx12SwapChain : IDisposable {
         uiList.Close();
         dev.Queue.ExecuteCommandList(uiList);
         dev.Flush();
-        swapChain.Present(vsync ? 1u : 0u, PresentFlags.None);
+        CheckPresent(swapChain.Present(vsync ? 1u : 0u, PresentFlags.None));
     }
 
     // Flush the GPU, release backbuffer references (required by ResizeBuffers), resize, recreate RTVs.
     public void Resize(int width, int height) {
         width = Math.Max(1, width); height = Math.Max(1, height);
         if (width == Width && height == Height) return;
-        dev.Flush();
+        dev.Flush();   // drains render + worker uploads — ResizeBuffers needs the GPU fully idle
         for (int i = 0; i < bufferCount; i++) { backBuffers[i]?.Dispose(); backBuffers[i] = null; }
-        swapChain.ResizeBuffers((uint)bufferCount, (uint)width, (uint)height, BackbufferFormat, SwapChainFlags.None);
+        try {
+            swapChain.ResizeBuffers((uint)bufferCount, (uint)width, (uint)height, BackbufferFormat, SwapChainFlags.None);
+        }
+        catch (Exception e) {
+            Debugging.LogError($"[DX12] ResizeBuffers failed ({width}x{height}): {e.Message} " +
+                               $"reason={dev.Device.DeviceRemovedReason} DRED={dev.DrainDredReport()}");
+            throw;
+        }
         Width = width; Height = height;
         CreateBackBufferRtvs();
     }

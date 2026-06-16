@@ -482,6 +482,11 @@ public sealed class DX12HDRenderer : HDRenderer {
     // (Re)allocate every resolution-dependent target. internalW/H = the render resolution (scene + all post
     // passes); ldr + fsrOutput are at the output resolution. Called on resize and on an FSR mode change.
     void AllocateResolutionTargets(int internalW, int internalH) {
+        // GPU MUST be idle before freeing the old targets: a resize (e.g. dragging the editor from the 4K
+        // to the 1080p monitor) reallocates these while the previous frame's commands may still read them.
+        // Disposing under an active GPU read is a use-after-free → TDR → DXGI_ERROR_DEVICE_REMOVED. Flush
+        // also drains in-flight worker uploads (see Dx12Device.Flush). Realloc is rare (resize / FSR mode).
+        dev.Flush();
         targetW = internalW; targetH = internalH;
         target?.Dispose(); ldr?.Dispose(); gbuffer?.Dispose();
         // The HDR scene target no longer owns depth — the G-buffer owns the scene depth (deferred path).
