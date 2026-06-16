@@ -63,6 +63,14 @@ public abstract class NetworkBehaviour : Behaviour {
     // lands (P5). P0 declares it so the contract is stable; the network tick wires it in P2+.
     protected internal virtual void NetworkTick() { }
 
+    // Called right after a received snapshot applied [Networked] state (DeserializeState) — the seam to
+    // map replicated logical state onto PRESENTATION (e.g. write a [Networked] position onto the
+    // transform). Runs on EVERY machine that receives state (proxies + the autonomous owner pre-replay),
+    // so a SimulatedProxy's transform reflects the new state and the P5c interpolator can buffer it. The
+    // base is a no-op; a pawn that keeps its renderable pose in [Networked] fields overrides this. Distinct
+    // from NetworkTick (which SIMULATES) — this only PRESENTS already-applied state.
+    protected internal virtual void OnStateApplied() { }
+
     // ---- replication surface (plan §11 — the source generator OVERRIDES these) ---------------------
     // A NetworkBehaviour subtype carrying [Networked] fields gets a generated PARTIAL that overrides
     // these to a concrete, reflection-free body (changemask + delta vs the captured baseline). The base

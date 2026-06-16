@@ -242,14 +242,26 @@ public sealed class NetworkManager {
                 break;
             }
             target.DeserializeState(ref r);   // SNAP: apply the authoritative state (step 1 of reconcile)
+            try { target.OnStateApplied(); }  // map the just-applied state onto presentation (transform)
+            catch (Exception e) { ScriptGuard.Report(target, "OnStateApplied", e); }
 
             // P5b RECONCILE: only the AUTONOMOUS PROXY (the owning client) trims + replays. The server
             // snapshot just overwrote the predicted state with truth; now re-derive the present from the
-            // in-flight (unacked) inputs. A SimulatedProxy / server-owned object skips this.
+            // in-flight (unacked) inputs.
             if (obj.HasInputAuthority && !obj.HasStateAuthority) {
                 obj.LastProcessedSeq = lastProcessedSeq;
                 PlayerController pc = FindController(obj);
                 pc?.Reconcile(lastProcessedSeq, _ => DriveNetworkTick(obj));
+            }
+            // P5c INTERPOLATION: a SimulatedProxy (neither authority) does NOT simulate — it BUFFERS the
+            // just-applied pose for smooth interpolation. The state-apply above may have moved the
+            // transform (if the game maps state->transform) or not; either way we snapshot the transform
+            // RESULT, so interpolation is decoupled from how the game writes its pose. PredictTick then
+            // renders the lerped pose each tick. Stamp with the proxy's current interp clock.
+            else if (obj.IsSimulatedProxy && obj.Entity is not null) {
+                obj.Interpolator ??= new SnapshotInterpolator();
+                Transform tr = obj.Entity.transform;
+                obj.Interpolator.Receive(obj.InterpClock, tr.Position, tr.Rotation);
             }
         }
     }
@@ -446,7 +458,12 @@ public sealed class NetworkManager {
                 ApplyServerInput(obj);
                 DriveNetworkTick(obj);
             }
-            // else: a SimulatedProxy (neither authority) — interpolated, does NOT tick (P5c).
+            else {
+                // SimulatedProxy (neither authority) — INTERPOLATED, never simulated locally (P5c). Advance
+                // the proxy's interp clock and render the remote pose InterpDelay ticks in the past, lerping
+                // between buffered snapshots — smooth under loss/jitter. The transform write IS the render.
+                InterpolateProxy(obj);
+            }
         }
 
         // Asymmetric UP: record EVERY tick's input on the local owner stream (the per-tick contract; the
@@ -521,6 +538,22 @@ public sealed class NetworkManager {
         if (batch.Length == 0)
             return;
         Transport.Send(ServerConnection, NetworkWire.Input(obj.NetId, batch), Channel.Reliable);
+    }
+
+    // P5c: advance a SimulatedProxy's interp clock and apply the interpolated remote pose to its transform.
+    // The proxy renders InterpDelay ticks in the PAST (between two buffered snapshots) — smooth even when
+    // snapshots arrive irregularly under loss/jitter. Until the buffer has data the transform is untouched
+    // (it sits at its spawn pose). The transform write here is the proxy's entire per-tick work.
+    static void InterpolateProxy(NetworkObject obj) {
+        if (obj.Entity is null || obj.Interpolator is null)
+            return;
+        obj.InterpClock += 1.0;   // one interp-clock tick per fixed step (the local render time axis)
+        if (obj.Interpolator.TrySample(obj.InterpClock, out var pos, out var rot)) {
+            Transform tr = obj.Entity.transform;
+            tr.Position = pos;
+            tr.Rotation = rot;
+        }
+        obj.Interpolator.Trim(obj.InterpClock);
     }
 
     static PlayerController FindController(NetworkObject obj) {

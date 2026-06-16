@@ -77,4 +77,17 @@ public sealed class NetworkObject : Behaviour {
     internal BallisticEngine.Networking.NetworkInput LastServerInput { get; set; }
     [NotSerialized]
     internal bool HaveLastServerInput { get; set; }
+
+    // CLIENT side, SimulatedProxy only (P5c, plan §13): the pose-interpolation buffer. A proxy is neither
+    // authority — it does NOT simulate locally; it renders the remote pose ~InterpDelay ticks in the past,
+    // lerping between received snapshots (smooth under loss/jitter). Lazily created on the first snapshot
+    // for a proxy object; null for an authority/owner object (which simulates, never interpolates).
+    [NotSerialized]
+    internal SnapshotInterpolator Interpolator { get; set; }
+
+    // CLIENT side: the proxy's own monotonic interpolation clock (advanced once per fixed tick) — the
+    // time axis the interpolator renders in the past against. Independent of the server tick (a local
+    // render clock), so it stays smooth regardless of when snapshots actually arrive.
+    [NotSerialized]
+    internal double InterpClock { get; set; }
 }
