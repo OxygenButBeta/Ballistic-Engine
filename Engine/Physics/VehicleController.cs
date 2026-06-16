@@ -24,9 +24,10 @@ namespace BallisticEngine;
 [Component("Vehicle Controller", "Physics")]
 public class VehicleController : Behaviour {
     [Header("Drive")]
-    [Tooltip("How hard the car accelerates toward top speed (m/s² at full throttle off the line). Punchy.")]
-    [Range(1f, 60f)]
-    public float Acceleration { get; set; } = 16f;
+    [Tooltip("Peak engine pull (m/s² at the torque sweet-spot, full throttle). The gearbox shapes how " +
+             "this is delivered across the rev range; higher = punchier overall.")]
+    [Range(1f, 80f)]
+    public float EnginePower { get; set; } = 26f;
 
     [Tooltip("Top forward speed (m/s).")]
     [Range(1f, 120f)]
@@ -36,18 +37,39 @@ public class VehicleController : Behaviour {
     [Range(1f, 60f)]
     public float MaxReverseSpeed { get; set; } = 14f;
 
-    [Tooltip("Acceleration taper near top speed. 1 = pulls hard all the way, higher = strong launch then " +
-             "eases off as it approaches MaxSpeed (a believable power curve).")]
-    [Range(1f, 4f)]
-    public float PowerCurve { get; set; } = 2f;
-
     [Tooltip("Service-brake deceleration (m/s²) when you brake (throttle opposing motion).")]
     [Range(2f, 80f)]
-    public float BrakeDecel { get; set; } = 28f;
+    public float BrakeDecel { get; set; } = 30f;
 
     [Tooltip("Engine braking (m/s²) when coasting with no throttle — a natural lift-off slow-down.")]
     [Range(0f, 20f)]
     public float CoastDecel { get; set; } = 4f;
+
+    [Header("Gearbox (automatic)")]
+    [Tooltip("Number of forward gears. Each gear pulls hard then the revs climb to the shift point and " +
+             "it changes up (a brief torque dip) — the readable, non-linear 'car' acceleration.")]
+    [Range(1, 8)]
+    public int GearCount { get; set; } = 5;
+
+    [Tooltip("Engine revs (0..1 of redline) at which it shifts UP. Lower = short-shifts early (relaxed), " +
+             "higher = holds each gear to the redline (sporty).")]
+    [Range(0.5f, 1f)]
+    public float UpshiftRpm { get; set; } = 0.92f;
+
+    [Tooltip("Engine revs (0..1) at which it shifts DOWN when slowing. Below the upshift point so it " +
+             "doesn't hunt between gears.")]
+    [Range(0.1f, 0.7f)]
+    public float DownshiftRpm { get; set; } = 0.32f;
+
+    [Tooltip("Gear-change time in seconds — the brief torque cut you feel on each shift. 0 = instant " +
+             "(no shift feel), ~0.25 = a clear shift kick.")]
+    [Range(0f, 0.8f)]
+    public float ShiftTime { get; set; } = 0.22f;
+
+    [Tooltip("Spread of the torque curve across the rev range. The engine pulls hardest in the mid-revs " +
+             "and tapers near idle and redline; this controls how peaky that is. 1 = broad, 3 = peaky.")]
+    [Range(1f, 3f)]
+    public float TorqueCurve { get; set; } = 1.6f;
 
     [Header("Steering")]
     [Tooltip("Maximum steer angle of the steered wheels at low speed (degrees).")]
@@ -121,11 +143,27 @@ public class VehicleController : Behaviour {
     float steerVelocity;  // SmoothDamp state for the steer angle
     bool reversing;       // latched drive intent so a slide can't flip the drive direction mid-slide
 
+    // Gearbox state.
+    int gear = 1;         // current forward gear (1..GearCount); reverse uses a separate model
+    float shiftTimer;     // >0 while mid-shift (torque cut); counts down
+    float engineRpm;      // current engine revs, 0..1 of redline (smoothed, for readout + torque)
+
+    // ---- Runtime readouts (HUD / SFX / camera) — [NotSerialized] keeps them out of YAML + inspector ----
+
     // The current smoothed steer, normalized to [-1,1] (right positive). Read by the ChaseCamera to
-    // lead the aim into corners. [NotSerialized] keeps it out of the scene YAML and inspector.
+    // lead the aim into corners.
     [NotSerialized]
     public float CurrentSteerNormalized =>
         MaxSteerAngle > 0f ? MathHelper.Clamp(steer / (MaxSteerAngle * Mathf.Deg2Rad), -1f, 1f) : 0f;
+
+    // Current gear (1..GearCount forward, 0 = neutral/idle, -1 = reverse) — for a HUD readout.
+    [NotSerialized] public int CurrentGear { get; private set; }
+    // Engine revs as a 0..1 fraction of redline — for a tachometer HUD / engine-pitch SFX.
+    [NotSerialized] public float EngineRpm => engineRpm;
+    // Forward ground speed in m/s — for a speedometer HUD.
+    [NotSerialized]
+    public float SpeedKmh => chassis is not null
+        ? new Vector3(chassis.Velocity.X, 0f, chassis.Velocity.Z).Length() * 3.6f : 0f;
 
     protected internal override void OnAttach() {
         chassis = GetComponent<Rigidbody>();
@@ -251,20 +289,23 @@ public class VehicleController : Behaviour {
         angVel.Y = MathHelper.Clamp(angVel.Y, -turnCap, turnCap);
         chassis.AngularVelocity = angVel;
 
-        // --- Speed: ease the signed speed toward the throttle target. Uses the actual horizontal speed
-        // (signedSpeed) as the start so a turn never bleeds it. ----------------------------------------
+        // --- Speed: ease the signed speed toward the throttle target. The forward pull comes from the
+        // automatic gearbox (UpdateGearbox), which makes acceleration non-linear and car-like. Uses the
+        // actual horizontal speed (signedSpeed) as the start so a turn never bleeds it. -----------------
         float targetSpeed, accel;
         if (throttle > 0.01f && !reversing) {
-            float headroom = MathHelper.Clamp(1f - MathF.Max(0f, signedSpeed) / MaxSpeed, 0f, 1f);
             targetSpeed = throttle * MaxSpeed;
-            accel = Acceleration * MathF.Pow(headroom, PowerCurve) + 0.5f; // +floor so it always creeps off 0
+            accel = throttle * UpdateGearbox(MathF.Max(0f, signedSpeed), dt) + 0.5f; // +floor: always creeps off 0
         } else if (throttle < -0.01f && reversing) {
+            // Reverse: single gear, simple taper (no gearbox feel backwards).
+            CurrentGear = -1; engineRpm = MathHelper.Clamp(-signedSpeed / MaxReverseSpeed, 0f, 1f);
             float headroom = MathHelper.Clamp(1f - MathF.Max(0f, -signedSpeed) / MaxReverseSpeed, 0f, 1f);
             targetSpeed = throttle * MaxReverseSpeed; // negative
-            accel = Acceleration * 0.7f * MathF.Pow(headroom, PowerCurve) + 0.5f;
+            accel = EnginePower * 0.55f * headroom + 0.5f;
         } else {
             targetSpeed = 0f;                          // coasting: engine-brake toward a stop
             accel = CoastDecel;
+            UpdateGearboxIdle(MathF.Max(0f, signedSpeed), dt);
         }
         // Braking: throttle opposing motion decelerates hard and straight (toward a stop, not past it).
         if (throttle * signedSpeed < -0.01f)
@@ -300,6 +341,66 @@ public class VehicleController : Behaviour {
         Vector3 tangentialVel = vel - groundNormal * Vector3.Dot(vel, groundNormal);
         Vector3 deltaV = targetVel - tangentialVel;
         chassis.AddForce(deltaV * (chassis.Mass / dt));
+    }
+
+    // Automatic gearbox. Returns the forward acceleration (m/s²) available THIS step, shaped by the
+    // gear + engine-rev torque curve so acceleration is non-linear and car-like: each gear pulls hard
+    // off its low end, the revs climb to the upshift point, it changes up (a brief torque cut you feel),
+    // and the next gear pulls again from lower revs. Reads/advances gear/engineRpm/shiftTimer state.
+    float UpdateGearbox(float forwardSpeed, float dt) {
+        int gears = Math.Max(1, GearCount);
+        gear = Math.Clamp(gear, 1, gears);
+
+        // Each gear covers an equal slice of the speed range; the engine revs map the car's speed within
+        // the current gear's slice to 0..1 (idle..redline). A geometric-ish spacing would be more
+        // realistic, but equal slices read clearly and tune simply.
+        float gearTop = MaxSpeed * gear / gears;
+        float gearBottom = MaxSpeed * (gear - 1) / gears;
+        float span = MathF.Max(0.1f, gearTop - gearBottom);
+        float revs = MathHelper.Clamp((forwardSpeed - gearBottom) / span, 0f, 1.2f);
+
+        // Advance a shift in progress (torque is cut while shifting).
+        if (shiftTimer > 0f)
+            shiftTimer = MathF.Max(0f, shiftTimer - dt);
+
+        // Auto up/down shift (not while already shifting). Upshift near redline; downshift when the revs
+        // fall below the downshift point, so the gears don't hunt.
+        if (shiftTimer <= 0f) {
+            if (revs >= UpshiftRpm && gear < gears) { gear++; shiftTimer = ShiftTime; }
+            else if (revs <= DownshiftRpm && gear > 1) { gear--; shiftTimer = ShiftTime; }
+        }
+
+        // Recompute revs for the (possibly new) gear and smooth them for the readout / SFX.
+        gearTop = MaxSpeed * gear / gears;
+        gearBottom = MaxSpeed * (gear - 1) / gears;
+        span = MathF.Max(0.1f, gearTop - gearBottom);
+        float targetRevs = MathHelper.Clamp((forwardSpeed - gearBottom) / span, 0f, 1f);
+        engineRpm += (targetRevs - engineRpm) * (1f - MathF.Exp(-12f * dt));
+        CurrentGear = gear;
+
+        // Torque curve: a smooth hump that peaks in the mid-revs and tapers toward idle and redline —
+        // sin(π·revs) shaped by TorqueCurve. A small floor keeps low-rev pull alive (drivability).
+        float hump = MathF.Pow(MathF.Sin(MathHelper.Clamp(engineRpm, 0f, 1f) * MathF.PI), 1f / TorqueCurve);
+        float torque = 0.35f + 0.65f * hump;
+        float shiftCut = shiftTimer > 0f ? 0.1f : 1f; // torque drops to ~10% during a shift (the "kick")
+        return EnginePower * torque * shiftCut;
+    }
+
+    // Keep the gearbox readout sane when coasting/braking (no throttle): bleed revs toward idle and let
+    // the gear drop as the car slows, so the HUD doesn't freeze on the last driven gear.
+    void UpdateGearboxIdle(float forwardSpeed, float dt) {
+        int gears = Math.Max(1, GearCount);
+        gear = Math.Clamp(gear, 1, gears);
+        float gearBottom = MaxSpeed * (gear - 1) / gears;
+        if (forwardSpeed < gearBottom && gear > 1)
+            gear--;
+        float gearTop = MaxSpeed * gear / gears;
+        float span = MathF.Max(0.1f, gearTop - MaxSpeed * (gear - 1) / gears);
+        float targetRevs = forwardSpeed > 0.2f
+            ? MathHelper.Clamp((forwardSpeed - MaxSpeed * (gear - 1) / gears) / span, 0f, 1f) : 0f;
+        engineRpm += (targetRevs - engineRpm) * (1f - MathF.Exp(-6f * dt));
+        if (shiftTimer > 0f) shiftTimer = MathF.Max(0f, shiftTimer - dt);
+        CurrentGear = forwardSpeed > 0.2f ? gear : 0;
     }
 
     // Anti-roll keeps the car upright in hard corners; downforce presses it into the road at speed.
