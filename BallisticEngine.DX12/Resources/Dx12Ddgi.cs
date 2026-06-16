@@ -65,10 +65,54 @@ public sealed class Dx12Ddgi : IDisposable {
         public Vector4 ProbeDims;        // xyz = (ProbesX,ProbesY,ProbesZ) as floats, w = ProbeCount
         public Vector4 Params0;          // x=irrTexels y=depthTexels z=hysteresis w=frameIndex
         public Vector4 Params1;          // x=maxRayDist y=normalBias z=feedbackEnable w=intensity
+        public Vector4 Params2;          // P2.5 round-robin: x=updateFraction(N) y=phase(0..N-1) z=fullUpdate(1/0) w=pad
     }
 
     // --- P2.1 probe-update plumbing ---
     public const int RaysPerProbe = 144;   // MUST match DdgiTrace/DdgiBlend HLSL (SphericalFibonacci ray count)
+
+    // --- P2.5 GTX-1660 budget lock: ROUND-ROBIN probe update. Trace/blend/classify only the probes whose phase
+    // matches this frame (probe % UpdateFraction == phase); the rest keep last frame's atlas (DDGI is built for
+    // exactly this — the field is temporally stable, so a probe that's a few frames stale is fine). This cuts
+    // the per-frame ray + shade cost by UpdateFraction (1/8 default = 256 of 2048 probes/frame, ~37k rays vs
+    // ~295k), to hold ≤~2ms GI on a weak-RT card (the 1660 has ~5-8x weaker RT than the RX 9070 XT dev card, so
+    // the dev-card cost is targeted very low — conservative extrapolation). Env door retunes it (1/4 if motion
+    // lag shows). UpdateFraction=1 → every probe every frame (the pre-P2.5 behaviour). The full grid refreshes
+    // every UpdateFraction frames; convergence is well under 0.5s at 60fps for the default. ---
+    int? updateFractionEnv;
+    int UpdateFraction {
+        get {
+            if (updateFractionEnv == null) {
+                updateFractionEnv = int.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_UPDATE_FRACTION"),
+                    out int n) && n >= 1 ? n : 8;
+            }
+            return updateFractionEnv.Value;
+        }
+    }
+
+    // P2.5 determinism: on the CAPTURE path (BALLISTIC_SCREENSHOT set), the EMA-accumulated probe field is only
+    // partially converged at a paused frame N → the captured image depends on the exact SCREENSHOT_FRAME and is
+    // a transient, not the steady state. Warm-up runs the probe update many times (each its own submit) in the
+    // FIRST DDGI frame, FULL-grid (round-robin disabled so every probe converges), so the captured image is the
+    // converged field — byte-deterministic + independent of the capture frame. Default iterations cover the
+    // hysteresis 0.97 settling (~1/(1-0.97)=33 effective samples; 64 gives margin). Off in play (cost is one-
+    // shot, not per-frame). BALLISTIC_DX12_DDGI_WARMUP=0 disables; =N overrides the count.
+    int? warmupEnv;
+    int WarmupIterations {
+        get {
+            if (warmupEnv == null) {
+                string raw = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_WARMUP");
+                if (int.TryParse(raw, out int n)) warmupEnv = Math.Max(0, n);
+                // Default ON only for a PAUSED capture (the deterministic-diff use case — static camera, so the
+                // converged-then-frozen field is sampled at the right probe positions). A moving/play screenshot
+                // gets live round-robin updates instead (no point converging a field the camera will leave).
+                else warmupEnv = (Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT") != null
+                    && Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT_PAUSED") == "1") ? 64 : 0;
+            }
+            return warmupEnv.Value;
+        }
+    }
+    bool warmedUp;   // the one-shot warm-up has run (guards the first DispatchDdgi only)
 
     // RayData[probe*RaysPerProbe + ray] = (radiance.rgb, hitDistance), written by the trace pass, read by the
     // blend pass. ProbeCount*144*16B = ~4.7 MB — sized once for the static grid; persistent UAV.
@@ -134,17 +178,59 @@ public sealed class Dx12Ddgi : IDisposable {
 
     // Params1 = (maxRayDist, normalBias, feedbackEnable, intensity). feedbackEnable>0.5 → the trace reads
     // last frame's irradiance FIELD at each hit (P2.3 multi-bounce); 0 → flat IBL-cube ambient (1-bounce).
-    public DdgiConstants Constants(int frameIndex, float hysteresis, float intensity, bool feedback) => new() {
-        OriginSpacingX = new Vector4(Origin, Spacing.X),
-        SpacingYZ = new Vector4(Spacing.Y, Spacing.Z, 0, 0),
-        ProbeDims = new Vector4(ProbesX, ProbesY, ProbesZ, ProbeCount),
-        Params0 = new Vector4(IrradianceTexels, DepthTexels, hysteresis, frameIndex),
-        Params1 = new Vector4(40f, 0.25f, feedback ? 1f : 0f, intensity),
-    };
+    // Params2 = round-robin (updateFraction N, phase = frameIndex % N, fullUpdate flag). fullUpdate=1 → every
+    // probe traces/blends this dispatch (warm-up + UpdateFraction==1); else only probes with probe%N==phase.
+    public DdgiConstants Constants(int frameIndex, float hysteresis, float intensity, bool feedback, bool fullUpdate) {
+        int n = UpdateFraction;
+        bool full = fullUpdate || n <= 1;
+        int phase = full ? 0 : ((frameIndex % n) + n) % n;
+        return new() {
+            OriginSpacingX = new Vector4(Origin, Spacing.X),
+            SpacingYZ = new Vector4(Spacing.Y, Spacing.Z, 0, 0),
+            ProbeDims = new Vector4(ProbesX, ProbesY, ProbesZ, ProbeCount),
+            Params0 = new Vector4(IrradianceTexels, DepthTexels, hysteresis, frameIndex),
+            Params1 = new Vector4(40f, 0.25f, feedback ? 1f : 0f, intensity),
+            Params2 = new Vector4(full ? 1 : n, phase, full ? 1f : 0f, 0f),
+        };
+    }
 
     // World position of probe (px,py,pz) — for the debug gizmo + the update pass.
     public Vector3 ProbePosition(int px, int py, int pz) =>
         Origin + new Vector3(px * Spacing.X, py * Spacing.Y, pz * Spacing.Z);
+
+    // P2.5 budget readout: how many probes trace per frame at the current round-robin setting, and the GRID's
+    // persistent VRAM footprint (atlases + RayData + ProbeState) — checked FIRST per the plan (VRAM-budget the
+    // grid before cutting cost), so the GTX-1660's smaller VRAM is never blown. RayData is sized for the FULL
+    // grid (round-robin reuses its slots), so it doesn't shrink with UpdateFraction — but it's small (~4.7MB).
+    public int CurrentUpdateFraction => UpdateFraction;
+    public int ProbesPerFrame => Math.Max(1, ProbeCount / Math.Max(1, UpdateFraction));
+    public long GridVramBytes {
+        get {
+            long irr = (long)IrradianceAtlasW * IrradianceAtlasH * 8;   // RGBA16F
+            long dep = (long)DepthAtlasW * DepthAtlasH * 4;            // RG16F
+            long ray = (long)ProbeCount * RaysPerProbe * 16;          // float4
+            long st = (long)ProbeCount * 16;                          // float4 ProbeState
+            return irr + dep + ray + st;
+        }
+    }
+
+    // P2.5 capture-path determinism. WarmupEnabled (BALLISTIC_SCREENSHOT set, or _WARMUP=N) means we converge
+    // the field once and then FREEZE it — the per-frame round-robin update is skipped so the captured image is
+    // byte-IDENTICAL regardless of SCREENSHOT_FRAME (each render frame would otherwise nudge the field by one
+    // more round-robin step → frame-dependent). In play this is false (the field updates live every frame).
+    public bool WarmupEnabled => WarmupIterations > 0;
+
+    // Warm-up driver: on the FIRST DDGI frame, replay the FULL-grid update WarmupIterations times (each its own
+    // submit — never one giant command list, TDR watchdog) so the EMA field converges within one rendered frame.
+    // Returns true if warm-up ran (this call only). Idempotent: subsequent calls return false.
+    public bool TryWarmUp(Action runOneFullUpdate) {
+        if (warmedUp) return false;
+        warmedUp = true;
+        int iters = WarmupIterations;
+        if (iters <= 0) return false;
+        for (int i = 0; i < iters; i++) runOneFullUpdate();
+        return true;
+    }
 
     // Build the trace + blend compute PSOs and the RayData buffer (once). The atlas UAVs are registered into
     // blendHeap here too (persistent atlases → persistent descriptors). Idempotent.
@@ -289,10 +375,10 @@ public sealed class Dx12Ddgi : IDisposable {
     public unsafe void DispatchDdgi(ID3D12GraphicsCommandList4 cl,
         Dx12DescriptorHeap bindless, GpuDescriptorHandle traceTableGpu,
         ulong sunCbAddress, ulong materialsAddr, ulong instancesAddr, ulong lightsAddr,
-        float hysteresis, float intensity, bool feedback) {
+        float hysteresis, float intensity, bool feedback, bool fullUpdate = false) {
         // Frame 0 has no field yet → force the 1-bounce IBL ambient regardless of the requested feedback.
         bool fb = feedback && frameCounter > 0;
-        *(DdgiConstants*)constCbMapped = Constants(frameCounter, hysteresis, intensity, fb);
+        *(DdgiConstants*)constCbMapped = Constants(frameCounter, hysteresis, intensity, fb, fullUpdate);
         frameCounter++;
 
         // P2.3 multi-bounce: the trace reads the irradiance atlas (t4) → SRV state for the trace dispatch.

@@ -229,6 +229,17 @@ public sealed class DX12HDRenderer : HDRenderer {
     float SsgiPreExposure() => float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
         System.Globalization.CultureInfo.InvariantCulture, out float e) ? e : 1.0e-5f;
 
+    // BALLISTIC_DETERMINISTIC=1 — byte-deterministic, frame-INDEPENDENT captures (the documented "frame 60 ==
+    // frame 240" contract; `bal render`/`bal gbuffer` set it). On DX12 this had NO consumer (it was a GL-only
+    // implementation), so TAA's per-frame Halton jitter + the SSGI/DDGI temporal EMA left captures frame-count-
+    // dependent — defeating P2.5's DDGI warm-up freeze downstream. Wired here (P2.5): kill TAA jitter (force
+    // taaOn off → no sub-pixel G-buffer perturbation, no jitter-history EMA) + make the SSGI temporal pass a
+    // pass-through (HasHistory=0 → the resolve returns the current GI directly, no frame-count-dependent EMA).
+    // Exposure is already pinned by BALLISTIC_DX12_EXPOSURE. Result: every captured frame is identical regardless
+    // of SCREENSHOT_FRAME, so DDGI (and any GI) captures are truly diffable across builds.
+    bool? deterministicOn;
+    bool DeterministicCapture => deterministicOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DETERMINISTIC") == "1";
+
     // GI-ISOLATE debug view (P0 measurement harness): when on, the SSGI/RT-GI combine outputs ONLY the
     // indirect bounce it adds (not scene+bounce) so the indirect contribution is directly visible + diffable
     // in enclosed interiors — the antidote the GI plan is built around (judge GI by the isolated bounce, never
@@ -1368,7 +1379,11 @@ public sealed class DX12HDRenderer : HDRenderer {
         // Sub-pixel jitter: offset the projection by a Halton amount so the whole frame (geometry + SSR +
         // shadows) is consistently jittered; TAA/FSR resolve it against history. FSR REPLACES TAA but still
         // needs jitter (it reconstructs from jittered frames). currentJitter is reused by the FSR dispatch.
-        bool taaOn = PostFX.TaaEnabled && !fsrActive;
+        // Deterministic capture: TAA off (its Halton jitter perturbs the G-buffer + accumulates a frame-count-
+        // dependent history → non-diffable). FSR also needs jitter, so deterministic mode assumes FSR off
+        // (the capture recipe sets BALLISTIC_DX12_FSR=off). Edges are aliased in deterministic captures — the
+        // documented trade for frame-independence (same as the GL contract).
+        bool taaOn = PostFX.TaaEnabled && !fsrActive && !DeterministicCapture;
         bool jitterOn = taaOn || fsrActive;
         currentJitter = jitterOn ? JitterOffset(taaFrame) : Vector2.Zero;
         if (jitterOn) {
@@ -2046,7 +2061,10 @@ public sealed class DX12HDRenderer : HDRenderer {
             Combine0 = new Vector4(pf.SsgiIntensity, Math.Clamp(pf.SsgiLook, 0f, 1f),
                                    MathF.Max(pf.SsgiSaturation, 0f), MathF.Max(pf.SsgiOcclusionPower, 0f)),
             Tint = new Vector4(pf.SsgiTint.X, pf.SsgiTint.Y, pf.SsgiTint.Z, 0f),
-            Params3 = new Vector4(ssgiHistValid ? 1f : 0f, MathF.Max(pf.SsgiMaxHistory, 1f), GiIsolateOn() ? 1f : 0f, 0f),
+            // HasHistory=0 in deterministic capture → PSTemporal returns the current GI directly (the SSGI/DDGI
+            // temporal EMA is frame-count-dependent → would defeat byte-diffable captures). For DDGI the gather
+            // is already noise-free so skipping temporal costs nothing; for SSGI the OIDN spatial denoise still runs.
+            Params3 = new Vector4((ssgiHistValid && !DeterministicCapture) ? 1f : 0f, MathF.Max(pf.SsgiMaxHistory, 1f), GiIsolateOn() ? 1f : 0f, 0f),
         };
         return fi;
     }
@@ -2503,6 +2521,11 @@ public sealed class DX12HDRenderer : HDRenderer {
                     $"[DDGI] grid {Dx12Ddgi.ProbesX}x{Dx12Ddgi.ProbesY}x{Dx12Ddgi.ProbesZ}={Dx12Ddgi.ProbeCount} probes; " +
                     $"origin=({o.X:0.#},{o.Y:0.#},{o.Z:0.#}) spacing={ddgi.Spacing.X:0.#}m covers ~{ddgi.Spacing.X*(Dx12Ddgi.ProbesX-1):0}x{ddgi.Spacing.Y*(Dx12Ddgi.ProbesY-1):0}x{ddgi.Spacing.Z*(Dx12Ddgi.ProbesZ-1):0}m; " +
                     $"irrAtlas={Dx12Ddgi.IrradianceAtlasW}x{Dx12Ddgi.IrradianceAtlasH} depthAtlas={Dx12Ddgi.DepthAtlasW}x{Dx12Ddgi.DepthAtlasH}; {Dx12Ddgi.RaysPerProbe} rays/probe"));
+                // P2.5 budget readout: round-robin fraction + per-frame probe/ray count + persistent grid VRAM
+                // (VRAM-budgeted FIRST per the plan — the GTX-1660's smaller VRAM must never be blown).
+                Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                    $"[DDGI] round-robin 1/{ddgi.CurrentUpdateFraction}: {ddgi.ProbesPerFrame} probes/frame x {Dx12Ddgi.RaysPerProbe} = {ddgi.ProbesPerFrame*Dx12Ddgi.RaysPerProbe} rays/frame; " +
+                    $"grid VRAM {ddgi.GridVramBytes/(1024.0*1024.0):0.0} MB"));
             }
         }
         // The bindless material table (byte-identical to the raster G-buffer) feeds the world-space hit
@@ -2541,18 +2564,38 @@ public sealed class DX12HDRenderer : HDRenderer {
                 Shader4ComponentMapping = ShaderComponentMapping.Default,
                 Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
             }, bh.Cpu(DdgiTableBase + 2));
-            // Own stopwatch (NOT TimePass — nesting it inside the outer GI:RT TimePass would clobber the shared
-            // passSw and corrupt GI:RT's reading). Each DX12 pass is its own ExecuteSync = its GPU wall-time.
-            var ddgiSw = GiTimingEnabled ? System.Diagnostics.Stopwatch.StartNew() : null;
-            dev.ExecuteSync(cl => {
+            // One trace+blend+classify cycle (its own submit). `full` = warm-up / round-robin off (every probe).
+            // Reuses the descriptors written above (TLAS/cube/prev-irr stay valid across the warm-up replays).
+            void RunDdgiUpdate(bool full) => dev.ExecuteSync(cl => {
                 cl.SetDescriptorHeaps(bh.Heap);
                 ddgi.DispatchDdgi(cl, bh, bh.Gpu(DdgiTableBase),
                     rtGiSunCb.GPUVirtualAddress, gpuDriven.MaterialsGpuAddress,
                     rtGeometry.InstancesGpuAddress, clusteredLights.LightBufGpuAddress,
                     hysteresis: 0.97f, intensity: MathF.Max(PostFX.SsgiIntensity, 0f),
-                    feedback: true);   // P2.3 multi-bounce
+                    feedback: true,         // P2.3 multi-bounce
+                    fullUpdate: full);
             });
-            if (ddgiSw != null) { ddgiSw.Stop(); RenderStats.Scene.GpuPasses.Add(("GI:DDGI", ddgiSw.Elapsed.TotalMilliseconds)); }
+
+            // --- P2.5 WARM-UP (capture-path determinism): on the FIRST DDGI frame, converge the field by
+            // replaying the update many times (each its own submit — never one giant command list) FULL-grid, so
+            // a paused screenshot is the STEADY STATE, byte-deterministic + independent of SCREENSHOT_FRAME. No-op
+            // in play (TryWarmUp returns false unless BALLISTIC_SCREENSHOT is set / _WARMUP overrides). ---
+            ddgi.TryWarmUp(() => RunDdgiUpdate(full: true));
+
+            // Own stopwatch (NOT TimePass — nesting it inside the outer GI:RT TimePass would clobber the shared
+            // passSw and corrupt GI:RT's reading). Each DX12 pass is its own ExecuteSync = its GPU wall-time.
+            // FREEZE on the PAUSED capture path: once warmed up, skip the per-frame round-robin update so every
+            // captured frame reads the SAME converged atlas (one more update would make the image frame-dependent).
+            // Gated on the paused capture (static camera → the frozen atlas is sampled at the correct, unchanged
+            // probe positions). A MOVING capture (or play) keeps updating live — freezing a moving camera would
+            // sample a stale-pose atlas as the grid re-snaps (audit Finding C).
+            // WarmupEnabled is now itself gated on the paused capture (Dx12Ddgi.WarmupIterations), so freeze ==
+            // WarmupEnabled: warm-up converged the field, then we hold it. Play/moving captures keep updating live.
+            if (!ddgi.WarmupEnabled) {
+                var ddgiSw = GiTimingEnabled ? System.Diagnostics.Stopwatch.StartNew() : null;
+                RunDdgiUpdate(full: false);   // the per-frame round-robin update (1/N probes)
+                if (ddgiSw != null) { ddgiSw.Stop(); RenderStats.Scene.GpuPasses.Add(("GI:DDGI", ddgiSw.Elapsed.TotalMilliseconds)); }
+            }
             if (!ddgiDebugDumped && Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_DEBUG") == "1") {
                 ddgiDebugDumped = true; ddgi.DumpIrradianceStats();
             }

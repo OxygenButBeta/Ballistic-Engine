@@ -23,7 +23,17 @@ cbuffer DdgiConstants : register(b0) {
     float4 ProbeDims;        // xyz (ProbesX,ProbesY,ProbesZ), w ProbeCount
     float4 Params0;          // x irrTexels, y depthTexels, z hysteresis, w frameIndex
     float4 Params1;          // x maxRayDist, y normalBias, z feedbackEnable w intensity
+    float4 Params2;          // P2.5 round-robin: x updateFraction(N), y phase, z fullUpdate(1/0), w pad
 };
+
+// P2.5 ROUND-ROBIN: a probe is updated this frame only if its phase matches (probe % N == phase), unless the
+// dispatch is a full update (warm-up / N==1). Inactive probes early-out before tracing → the cost cut. The
+// blend + classify passes apply the SAME test so stale RayData is never re-integrated into the EMA field.
+bool ProbeActiveThisFrame(uint probe) {
+    if (Params2.z > 0.5) return true;                     // fullUpdate
+    uint n = max((uint)Params2.x, 1u);
+    return (probe % n) == (uint)Params2.y;
+}
 cbuffer RtGiSun : register(b1) {
     float3 SunDir;   float NormalBias;
     float3 SunColor; float LightCount;
@@ -233,6 +243,10 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
     if (id >= total) return;
     uint probe = id / rays;
     uint ray = id % rays;
+
+    // P2.5 round-robin: skip probes not in this frame's phase (they keep last frame's RayData, which the blend
+    // also skips — so the atlas tile is untouched). The expensive RayQuery below never runs for them.
+    if (!ProbeActiveThisFrame(probe)) return;
 
     float3 probePos = ProbeWorldPos(probe);
     float jitter = Hash1(probe * 31u + (uint)Params0.w * 2654435761u);

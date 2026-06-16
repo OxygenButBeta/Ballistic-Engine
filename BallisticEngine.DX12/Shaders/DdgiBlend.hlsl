@@ -15,7 +15,17 @@ cbuffer DdgiConstants : register(b0) {
     float4 OriginSpacingX; float4 SpacingYZ; float4 ProbeDims;
     float4 Params0;          // x irrTexels, y depthTexels, z hysteresis, w frameIndex
     float4 Params1;          // x maxRayDist, y normalBias, z feedbackEnable, w intensity
+    float4 Params2;          // P2.5 round-robin: x updateFraction(N), y phase, z fullUpdate(1/0), w pad
 };
+
+// P2.5 ROUND-ROBIN: blend/classify only the probes traced this frame (probe % N == phase), unless a full
+// update (warm-up / N==1). MUST match DdgiTrace.ProbeActiveThisFrame exactly — blending a probe whose RayData
+// is stale would EMA garbage into its tile. Inactive tiles keep last frame's atlas value untouched.
+bool ProbeActiveThisFrame(uint probe) {
+    if (Params2.z > 0.5) return true;
+    uint n = max((uint)Params2.x, 1u);
+    return (probe % n) == (uint)Params2.y;
+}
 StructuredBuffer<float4> RayData : register(t0);   // [probe * RaysPerProbe + ray] = (radiance, dist)
 RWTexture2D<float4> IrradianceAtlas : register(u0);   // CSIrradiance target
 RWTexture2D<float2> DepthAtlas      : register(u1);   // CSDepth target (distinct register; one bound per pass)
@@ -87,6 +97,7 @@ void CSIrradiance(uint3 dtid : SV_DispatchThreadID) {
     uint2 px = dtid.xy;
     TexelInfo info = Locate(px, IRR_TEXELS);
     if (!info.valid) return;
+    if (!ProbeActiveThisFrame(info.probe)) return;   // P2.5 round-robin: keep stale tile, don't EMA stale rays
 
     float3 texelDir = OctDecode(info.localUv);
     float jitter = Hash1(info.probe * 31u + (uint)Params0.w * 2654435761u);
@@ -102,12 +113,15 @@ void CSIrradiance(uint3 dtid : SV_DispatchThreadID) {
     float3 result = SanitizeIrr(sum / max(wsum, 1e-4));
 
     float hyst = Params0.z;
-    float3 prev = SanitizeIrr(IrradianceAtlas[px].rgb);
-    // First frame (frameIndex 0) hard-sets; else EMA. (Atlas starts at 0 → hyst would crawl up; the warm-up
-    // gate in P2.5 fixes the deterministic path. For now low hysteresis converges fast.) Both result+prev are
-    // scrubbed (ternary, NOT mix*0) — once P2.3 feedback loops the atlas back through the trace, a single NaN
-    // would otherwise stick in the EMA forever (the [[ssgi-nan-mix-scrub]] black-hole class).
-    float3 blended = (Params0.w < 0.5) ? result : lerp(result, prev, hyst);
+    float4 prev4 = IrradianceAtlas[px];
+    float3 prev = SanitizeIrr(prev4.rgb);
+    // Hard-set on a probe's FIRST write (the atlas tile's alpha is the written-flag: init 0, the blend writes
+    // 1.0), else EMA. PER-PROBE first-touch (not the global frame 0) so a round-robin probe whose first update
+    // lands on a non-zero frame still snaps to its value instead of crawling up from black over ~33 frames.
+    // Both result+prev are ternary-scrubbed (NOT mix*0) — once P2.3 feedback loops the atlas back through the
+    // trace, one NaN would otherwise stick in the EMA forever ([[ssgi-nan-mix-scrub]] black-hole class).
+    bool firstWrite = (Params0.w < 0.5) || (prev4.a < 0.5);
+    float3 blended = firstWrite ? result : lerp(result, prev, hyst);
     IrradianceAtlas[px] = float4(blended, 1.0);
 }
 
@@ -116,6 +130,7 @@ void CSDepth(uint3 dtid : SV_DispatchThreadID) {
     uint2 px = dtid.xy;
     TexelInfo info = Locate(px, DEPTH_TEXELS);
     if (!info.valid) return;
+    if (!ProbeActiveThisFrame(info.probe)) return;   // P2.5 round-robin (must match CSIrradiance)
 
     float3 texelDir = OctDecode(info.localUv);
     float jitter = Hash1(info.probe * 31u + (uint)Params0.w * 2654435761u);
@@ -135,7 +150,11 @@ void CSDepth(uint3 dtid : SV_DispatchThreadID) {
 
     float hyst = Params0.z;
     float2 prev = SanitizeDepth(DepthAtlas[px]);
-    float2 blended = (Params0.w < 0.5) ? result : lerp(result, prev, hyst);
+    // Per-probe first-touch: a never-written depth tile reads mean=0 (any real surface or open-sky probe stores
+    // mean>0 within maxRayDist), so prev.x<=0 means uninitialised → hard-set (matches CSIrradiance's alpha
+    // flag), so round-robin probes don't crawl up from 0 over ~33 frames.
+    bool firstWrite = (Params0.w < 0.5) || (prev.x <= 0.0);
+    float2 blended = firstWrite ? result : lerp(result, prev, hyst);
     DepthAtlas[px] = blended;
 }
 
@@ -200,6 +219,9 @@ void CSBorderDepth(uint3 dtid : SV_DispatchThreadID) { BorderCopy(dtid.xy, DEPTH
 void CSClassify(uint3 dtid : SV_DispatchThreadID) {
     uint probe = dtid.x;
     if (probe >= (uint)ProbeDims.w) return;
+    // P2.5 round-robin: classify only probes traced this frame (their RayData is fresh). Inactive probes keep
+    // last frame's ProbeState — correct, since they weren't re-traced (same as the atlas tiles).
+    if (!ProbeActiveThisFrame(probe)) return;
 
     float jitter = Hash1(probe * 31u + (uint)Params0.w * 2654435761u);
     float3 spacing = float3(OriginSpacingX.w, SpacingYZ.x, SpacingYZ.y);

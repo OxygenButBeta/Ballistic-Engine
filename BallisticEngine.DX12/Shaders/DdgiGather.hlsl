@@ -19,6 +19,8 @@ cbuffer DdgiConstants : register(b0) {
     float4 ProbeDims;        // xyz (ProbesX,ProbesY,ProbesZ), w ProbeCount
     float4 Params0;          // x irrTexels, y depthTexels, z hysteresis, w frameIndex
     float4 Params1;          // x maxRayDist, y normalBias, z feedbackEnable, w intensity
+    float4 Params2;          // P2.5 round-robin (unused by the gather — it reads the persistent atlas every
+                             // frame for every pixel; present only to match the DdgiConstants CBV layout)
 };
 cbuffer DdgiGatherExtra : register(b1) {
     float4x4 InvViewProj;    // screen+depth -> world (jittered, transposed)
