@@ -2703,7 +2703,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         var ddgiGrid = ddgi.GridConstants();
         screenProbe.PrepareConstants(Matrix4x4.Transpose(invVP),
             maxRayDist: MathF.Max(PostFX.SsgiRayLength, 3f),   // SHORT near/mid-field ray (DDGI handles far)
-            preExposure: SsgiPreExposure(), intensity: MathF.Max(PostFX.SsgiIntensity, 0f), ddgiGrid);
+            preExposure: SsgiPreExposure(), intensity: MathF.Max(PostFX.SsgiIntensity, 0f),
+            deterministic: DeterministicCapture, ddgiGrid);
 
         if (!screenProbeLogged) {
             screenProbeLogged = true;

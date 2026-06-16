@@ -156,12 +156,17 @@ public sealed class Dx12ScreenProbe : IDisposable {
         unsafe { ddgiGridMapped = ddgiGridCb.Map<byte>(0); }
     }
 
-    // Fill the shared ScreenProbeConstants + the DDGI grid CBV for this frame.
+    // Fill the shared ScreenProbeConstants + the DDGI grid CBV for this frame. `deterministic` (the capture
+    // path's BALLISTIC_DETERMINISTIC) PINS the ray-jitter frame seed to a fixed value so the screen-probe atlas
+    // is frame-INDEPENDENT (the captured image is identical regardless of SCREENSHOT_FRAME — the P2.5 contract,
+    // since the probe is recomputed from scratch each frame with no cross-frame accumulation, only the seed
+    // varies). In play it uses the live frameCounter so the jitter rotates + the downstream temporal converges.
     unsafe void FillConstants(Matrix4x4 invViewProjTransposed, float maxRayDist, float preExposure, float intensity,
-        in Dx12Ddgi.DdgiConstants ddgiC) {
+        bool deterministic, in Dx12Ddgi.DdgiConstants ddgiC) {
+        int seed = deterministic ? 0 : frameCounter;
         *(ScreenProbeConstants*)spCbMapped = new ScreenProbeConstants {
             InvViewProj = invViewProjTransposed,
-            SpParams0 = new Vector4(probesX, probesY, Downsample, frameCounter),
+            SpParams0 = new Vector4(probesX, probesY, Downsample, seed),
             SpParams1 = new Vector4(screenW, screenH, maxRayDist, preExposure),
             SpParams2 = new Vector4(OctTexels, 0.05f, intensity, 0f),
         };
@@ -291,8 +296,8 @@ public sealed class Dx12ScreenProbe : IDisposable {
     }
 
     public unsafe void PrepareConstants(Matrix4x4 invViewProjTransposed, float maxRayDist, float preExposure,
-        float intensity, in Dx12Ddgi.DdgiConstants ddgiC) =>
-        FillConstants(invViewProjTransposed, maxRayDist, preExposure, intensity, ddgiC);
+        float intensity, bool deterministic, in Dx12Ddgi.DdgiConstants ddgiC) =>
+        FillConstants(invViewProjTransposed, maxRayDist, preExposure, intensity, deterministic, ddgiC);
 
     // ---- builders ----
     unsafe void BuildPlace() {
