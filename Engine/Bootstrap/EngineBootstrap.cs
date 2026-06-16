@@ -243,6 +243,10 @@ public sealed class EngineBootstrap {
         // module initializers re-register on load. (Clearing the InputRegistry alone is necessary, not
         // sufficient — §8.6.2's symmetry note.)
         NetworkReplicationRegistry.ClearForReload();
+        // P7: the THIRD host-side static root (gate 0c / §8.6.2) — the ENTITY-LESS GameState replication
+        // table holds a descriptor per game-defined GameState subtype (registered by the generator's
+        // [ModuleInitializer], the IReplicated path). Same leak class as the two above if not cleared.
+        SceneReplicationRegistry.ClearForReload();
         Network.Manager?.Stop();
         GameScripts.Unload();
 

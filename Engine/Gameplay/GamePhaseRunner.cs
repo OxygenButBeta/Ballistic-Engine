@@ -60,9 +60,12 @@ public static class GamePhaseRunner {
         }
 
         // ---- Phase 2: client-only HUD init (binds to the local player, which now exists) ------------
+        // RunInit binds the local PlayerController / PlayerState (resolved now that Phase 1 possessed the
+        // player) BEFORE calling the game's Init() override — so the override reads HUD.Controller /
+        // HUD.PlayerState directly (the P7 HUD binding seam).
         HUD hud = Find<HUD>(scene);
         if (hud is not null) {
-            try { hud.Init(); }
+            try { hud.RunInit(); }
             catch (Exception e) { ScriptGuard.Report(hud, "Init", e); }
         }
 

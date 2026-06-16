@@ -79,6 +79,12 @@ public sealed class NetworkManager {
         PredictionTicks = 0;
         IsReplaying = false;
         snapshotWriter.Reset();
+        sceneStateWriter.Reset();   // P7: the entity-less GameState flush buffer
+        connectionTokens.Clear();   // P7: reconnect bookkeeping
+        orphans.Clear();
+        // PersistentToken is NOT cleared here — a reconnect flow sets it before StartClient, and Stop runs
+        // BEFORE StartClient (StartClient calls Stop first); clearing it would erase the reclaim token. The
+        // facade's SetReconnectToken sets it after Stop, so the next connect presents it.
     }
 
     void WireTransport() {
@@ -121,16 +127,26 @@ public sealed class NetworkManager {
         }
         else {
             // Client connected to the server — remember the server's peer handle (a To.Server RPC sends
-            // here), then send our layout digest so the server can reject drift.
+            // here), then send our layout digest + (P7) our PERSISTENT ConnectionToken so the server can
+            // reject drift AND reclaim our orphaned pawn on a reconnect. None on a first join (the server
+            // mints one we then persist via HandshakeOk).
             ServerConnection = c;
-            Transport.Send(c, NetworkWire.Handshake(NetworkWire.LayoutDigest()), Channel.Reliable);
+            Transport.Send(c, NetworkWire.Handshake(NetworkWire.LayoutDigest(), PersistentToken), Channel.Reliable);
         }
     }
 
+    // SERVER: on a peer disconnect, KEEP the player's pawn(s) spawned and record a reconnect ORPHAN keyed
+    // by the connection's ConnectionToken with a TTL (plan §8.5.5, the approved decision). Ownership ->
+    // server (OnOwnershipChanged fires; OnSpawned subscriptions survive — NOT despawn+respawn). A reconnect
+    // presenting the same token reclaims the pawn (HandleHandshake); an expired orphan is swept (despawned).
+    // The reclaim/TTL ALGORITHM was proven in %TEMP%\bal-reconnect-test before this integration.
     void OnPeerDisconnected(Connection c) {
         clients.Remove(c);
-        clientState.Remove(c);   // P6: drop this client's per-client baseline/pending (no leak, no send)
-        // P7 (ConnectionToken reconnect) keeps the pawn alive on a TTL; P3 just drops the registration.
+        clientState.Remove(c);   // drop this client's per-client baseline/pending (no leak, no send)
+
+        if (IsServer && connectionTokens.TryGetValue(c, out ConnectionToken token) && token.IsValid)
+            RecordReconnectOrphan(c, token);
+        connectionTokens.Remove(c);
     }
 
     void OnPayload(Connection source, ReadOnlySpan<byte> payload, Channel channel) {
@@ -147,6 +163,8 @@ public sealed class NetworkManager {
             case NetMessage.Input:       HandleInput(source, ref r); break;
             case NetMessage.Ack:         HandleAck(source, ref r); break;
             case NetMessage.Possess:     HandlePossess(ref r); break;
+            case NetMessage.SceneState:  HandleSceneState(source, ref r); break;
+            case NetMessage.SceneAck:    HandleSceneAck(source, ref r); break;
         }
     }
 
@@ -176,6 +194,7 @@ public sealed class NetworkManager {
     // mismatch -> explicit error, do NOT spawn (a silent desync is exactly what the guard prevents).
     void HandleHandshake(Connection source, ref BitReader r) {
         int clientDigest = r.ReadInt();
+        ConnectionToken presented = NetworkWire.ReadToken(ref r);   // P7: the client's persistent token
         if (clientDigest != NetworkWire.LayoutDigest()) {
             Debugging.LogError(
                 $"Network: {source} rejected — [Networked] layout digest mismatch (drifted build). " +
@@ -183,7 +202,21 @@ public sealed class NetworkManager {
             OnLayoutMismatch?.Invoke(source);
             return;
         }
-        Transport.Send(source, NetworkWire.HandshakeOk(source.Id), Channel.Reliable);
+
+        // P7 RECONNECT (§8.5.5): if the client presented a token that matches a live reconnect orphan,
+        // RECLAIM — transfer the orphaned pawn's ownership BACK to this NEW connection (the auto-reclaim
+        // default, user-approved), clear the orphan, and DON'T re-spawn (the pawn stayed spawned, so
+        // OnSpawned subscriptions are intact). A first join (None / unknown token) mints a fresh token the
+        // client persists for a future reconnect. Either way `token` is the identity the server now uses.
+        ConnectionToken token = presented;
+        bool reclaimed = false;
+        if (presented.IsValid && TryReclaimOrphan(source, presented))
+            reclaimed = true;
+        else if (!presented.IsValid)
+            token = MintToken();
+        connectionTokens[source] = token;
+
+        Transport.Send(source, NetworkWire.HandshakeOk(source.Id, token), Channel.Reliable);
 
         // P6: create this client's per-client replication state. A late joiner gets CURRENT state
         // ATOMICALLY — a full Spawn per live object (the baseline delivered at spawn, §8.5) — and the
@@ -202,6 +235,12 @@ public sealed class NetworkManager {
         // controls what (and, if it owns a controller, auto-builds its input). Spawns went first (above) so
         // the controller/pawn mirrors exist when these Reliable Possess messages apply.
         SendPossessionsTo(source);
+
+        // P7 GameState late-join (§13 atomic): send the CURRENT GameState as a full snapshot + seed this
+        // client's GameState baseline to those values, so its first scene-state delta diffs against what it
+        // holds (it missed nothing). Reliable — the entity-less twin of the per-object spawn baseline above.
+        SeedAndSendSceneStateTo(source, state);
+
         OnPlayerJoined?.Invoke(source);
     }
 
@@ -228,10 +267,14 @@ public sealed class NetworkManager {
             state.Ack(ackedSeq);
     }
 
-    // CLIENT: the server accepted us; adopt the connection id it assigned (our LocalConnection).
+    // CLIENT: the server accepted us; adopt the connection id it assigned (our LocalConnection) AND (P7)
+    // PERSIST the ConnectionToken the server is using for us — so a future reconnect presents it to reclaim
+    // our pawn (§8.5.5). On a first join this is the freshly-minted token; on a reconnect it echoes the one
+    // we presented. A real client would write this to disk / a session store; here it lives on the manager.
     void HandleHandshakeOk(Connection source, ref BitReader r) {
         int assignedId = r.ReadInt();
         LocalConnection = new Connection(assignedId);
+        PersistentToken = NetworkWire.ReadToken(ref r);
     }
 
     // CLIENT: build a mirror of a server-spawned object (typeId -> factory, no reflection). Owner +
@@ -580,6 +623,11 @@ public sealed class NetworkManager {
         // bullet vanishes cleanly — OnDespawned, no orphan). A confirm (HandleSpawn link) removes it first.
         SweepPredictedRollbacks();
 
+        // P7: sweep any reconnect orphan whose TTL expired (the player did not come back) — despawn its
+        // held pawn(s). A reconnect within the window already reclaimed + cleared it (HandleHandshake).
+        if (IsServer)
+            SweepReconnectOrphans();
+
         // Asymmetric UP: record EVERY tick's input on the local owner stream (the per-tick contract; the
         // actual per-object wire send happened above). FlushBatch on the boundary keeps the stream bounded.
         InputStream.RecordInput(seq);
@@ -799,6 +847,172 @@ public sealed class NetworkManager {
             batch.CopyTo(framed.AsSpan(1));
             Transport.Send(c, framed, Channel.Unreliable);
         }
+
+        FlushSceneStateDown();   // P7: the entity-less GameState carve-out, same per-client cadence
+    }
+
+    // ---- P7: entity-less GameState replication (the §2/§10 carve-out) ------------------------------
+    // GameState is the ONE type that replicates WITHOUT a NetworkObject/netId. The network tick collects
+    // every active IReplicated SceneBehaviour, addressed by a small fixed ReplicationId (assigned from the
+    // deterministic active order — AssignReplicationIds), and runs the SAME per-client baseline flush the
+    // entity path uses (over ClientReplState.SceneBaseline, a SEPARATE id space). Proven entity-less in
+    // %TEMP%\bal-scenestate-test (21/21) before this integration; the wire shape is byte-identical to the
+    // NetworkBehaviour delta, so the per-client baseline + the layout-digest drift guard carry over.
+
+    // Collect the active IReplicated scene-behaviours of the current scene (today: GameState). Cheap: a
+    // single SceneBehaviours walk, no per-tick reflection (the type test is a pattern match). Ordered by
+    // a stable key so ReplicationId is deterministic across machines (both ends see the same id->object).
+    static readonly List<IReplicated> replScratch = new();
+    static List<IReplicated> CollectSceneReplicated() {
+        replScratch.Clear();
+        Scene scene = SceneManager.GetCurrentScene();
+        if (scene is null)
+            return replScratch;
+        foreach (SceneBehaviour sb in scene.SceneBehaviours)
+            if (sb is IReplicated { HasReplicatedState: true } r)
+                replScratch.Add(r);
+        // Deterministic order: by ReplicationTypeId then type name — stable across machines (a scene has at
+        // most a handful of IReplicated, so the sort is negligible and runs only on the send boundary).
+        replScratch.Sort((a, b) => {
+            int c = a.ReplicationTypeId.CompareTo(b.ReplicationTypeId);
+            return c != 0 ? c : string.CompareOrdinal(a.GetType().FullName, b.GetType().FullName);
+        });
+        return replScratch;
+    }
+
+    // Assign each active IReplicated its ReplicationId from the deterministic order (idempotent — re-runs
+    // each collection, stable result). GameState gets id 0, a 2nd IReplicated id 1, etc. Both ends run the
+    // SAME assignment so a [replicationId][delta] block dispatches to the matching object without a handshake.
+    static void AssignReplicationIds(List<IReplicated> list) {
+        for (int i = 0; i < list.Count; i++)
+            if (list[i] is GameState gs)
+                gs.ReplicationId = i;
+            else
+                SetReplicationId(list[i], i);   // a future non-GameState IReplicated — reflection-free seam
+    }
+
+    // A non-GameState IReplicated would expose its own internal setter; today GameState is the only one, so
+    // this is a guarded no-op (the id is read-only on the interface). Kept so adding a 2nd IReplicated type
+    // is a one-line change here, not a redesign.
+    static void SetReplicationId(IReplicated r, int id) { /* GameState is the only impl in P7 */ }
+
+    // Per-client GameState delta flush — the entity-less twin of SerializeStateSnapshotFor. Swap in this
+    // client's GameState baseline, skip a quiescent object (0 bytes), else serialize the delta + record the
+    // post-send token under this scene-seq's pending. Returns the block count. Frame: [sceneSeq][count] then
+    // [replicationId][delta] per dirty object.
+    //
+    // The frame leads with an explicit block COUNT (not AtEnd-driven parsing) because the bit-packed deltas
+    // are NOT byte-aligned — byte-padding after the last block could otherwise read as a phantom id-0 block
+    // (and id 0 IS GameState). The count makes the receive loop exact. Two-pass: build blocks into a scratch
+    // writer (we don't know the count until we've diffed each object), then frame [seq][count][blocks].
+    static readonly BitWriter sceneBlocks = new();
+    int SerializeSceneStateFor(ClientReplState state, uint sceneSeq, List<IReplicated> list) {
+        sceneBlocks.Reset();
+        int written = 0;
+        Dictionary<int, object> sentThisSeq = null;
+        foreach (IReplicated r in list) {
+            object clientBaseline = state.SceneBaseline.TryGetValue(r.ReplicationId, out object t) ? t : null;
+            if (clientBaseline is not null)
+                r.__SetReplBaseline(clientBaseline);
+            if (clientBaseline is not null && r.__ReplStateEquals(clientBaseline))
+                continue;   // quiescent for this client (the strongest 1-bit-unchanged: 0 bytes)
+
+            sceneBlocks.WriteInt(r.ReplicationId);
+            r.Serialize(sceneBlocks);                   // changemask + changed fields vs the client baseline
+            r.CaptureReplBaseline();                    // baseline := live -> __GetReplBaseline = the just-sent values
+            (sentThisSeq ??= new())[r.ReplicationId] = r.__GetReplBaseline();
+            written++;
+        }
+        if (sentThisSeq is not null)
+            state.ScenePending[sceneSeq] = sentThisSeq;
+
+        sceneStateWriter.Reset();
+        sceneStateWriter.WriteUInt(sceneSeq);
+        sceneStateWriter.WriteInt(written);             // the explicit block count (exact receive loop)
+        ReadOnlySpan<byte> blocks = sceneBlocks.AsSpan();
+        // Append the bit-packed block bytes after the byte-aligned header. The header is whole 32-bit words,
+        // so the blocks resume byte-aligned (a block's first read is the 32-bit replicationId, then the
+        // bit-packed delta — the receiver reads exactly `written` blocks, never a phantom).
+        for (int i = 0; i < blocks.Length; i++)
+            sceneStateWriter.WriteByte(blocks[i]);
+        return written;
+    }
+
+    BitWriter sceneStateWriter = new();
+
+    void FlushSceneStateDown() {
+        List<IReplicated> list = CollectSceneReplicated();
+        if (list.Count == 0 || clients.Count == 0)
+            return;
+        AssignReplicationIds(list);
+        foreach (Connection c in clients) {
+            if (!clientState.TryGetValue(c, out ClientReplState state))
+                continue;
+            uint sceneSeq = state.SceneSendSeq + 1;
+            int blocks = SerializeSceneStateFor(state, sceneSeq, list);
+            if (blocks == 0)
+                continue;   // nothing changed for this client — skip the packet
+            state.SceneSendSeq = sceneSeq;
+            ReadOnlySpan<byte> batch = sceneStateWriter.AsSpan();
+            byte[] framed = new byte[batch.Length + 1];
+            framed[0] = (byte)NetMessage.SceneState;
+            batch.CopyTo(framed.AsSpan(1));
+            Transport.Send(c, framed, Channel.Unreliable);   // latest-wins; a drop re-sends (baseline un-advanced)
+        }
+    }
+
+    // Seed (or re-seed) one client's GameState baseline to the CURRENT values for every active IReplicated
+    // (the late-join atomic snapshot — §13). Captures live into the baseline first so the token reflects
+    // current state, then sends a FULL snapshot block per object Reliable (so the joiner holds it before any
+    // delta) and records the token. Called from the join flow.
+    void SeedAndSendSceneStateTo(Connection client, ClientReplState state) {
+        List<IReplicated> list = CollectSceneReplicated();
+        if (list.Count == 0)
+            return;
+        AssignReplicationIds(list);
+        var w = new BitWriter();
+        w.WriteByte((byte)NetMessage.SceneState);
+        w.WriteUInt(0);             // the join snapshot rides seq 0 (the client acks it -> baseline established)
+        w.WriteInt(list.Count);     // the explicit block count (every object: a FULL snapshot)
+        foreach (IReplicated r in list) {
+            w.WriteInt(r.ReplicationId);
+            r.SerializeFull(w);
+            r.CaptureReplBaseline();
+            state.SeedScene(r.ReplicationId, r.__GetReplBaseline());
+        }
+        Transport.Send(client, w.AsSpan().ToArray(), Channel.Reliable);   // atomic, Reliable (a join baseline)
+    }
+
+    // CLIENT: apply a GameState scene-state batch — dispatch each [replicationId][delta] block onto the
+    // matching local IReplicated (by ReplicationId, NOT order — both ends assign the same ids), then ACK so
+    // the server advances OUR GameState baseline. The frame leads with an explicit block COUNT so parsing is
+    // exact (the bit-packed deltas are not byte-aligned; an AtEnd loop could read phantom byte-padding as a
+    // bogus id-0 block). An unknown id stops parsing (a block is variable-length, can't skip) — latest-wins
+    // self-heals on the next send (the join Reliable snapshot establishes the ids first in practice).
+    void HandleSceneState(Connection source, ref BitReader r) {
+        uint sceneSeq = r.ReadUInt();
+        int count = r.ReadInt();
+        List<IReplicated> list = CollectSceneReplicated();
+        AssignReplicationIds(list);
+        for (int b = 0; b < count; b++) {
+            int id = r.ReadInt();
+            IReplicated target = null;
+            foreach (IReplicated x in list)
+                if (x.ReplicationId == id) { target = x; break; }
+            if (target is null)
+                break;   // unknown id — can't skip a variable-length block; stop (self-heals next send)
+            target.Deserialize(ref r);
+        }
+        if (ServerConnection.IsValid)
+            Transport.Send(ServerConnection, NetworkWire.SceneAck(sceneSeq), Channel.Reliable);
+    }
+
+    // SERVER: a client acked the GameState frontier — advance THAT client's GameState baseline (its own seq
+    // space). Server-only (a client never sends scene-state down).
+    void HandleSceneAck(Connection source, ref BitReader r) {
+        uint ackedSeq = r.ReadUInt();
+        if (clientState.TryGetValue(source, out ClientReplState state))
+            state.AckScene(ackedSeq);
     }
 
     // Send a full Spawn of one object to one client (the join-baseline + each new spawn). Reliable —
@@ -1040,6 +1254,94 @@ public sealed class NetworkManager {
     // Drop ownership back to the server (Connection.None) — the orphan/return case.
     public void RemoveOwnership(NetworkObject netObj) => TransferOwnership(netObj, Connection.None);
 
+    // ---- P7: ConnectionToken reconnect window (plan §8.5.5 / §9.8) --------------------------------
+    // The disconnect/reconnect edge-case class (§9 item 8): identity = a PERSISTENT ConnectionToken, NOT
+    // the transport id. On disconnect the player's pawn STAYS spawned (ownership -> server, OnOwnershipChanged
+    // fires, OnSpawned subscriptions survive); a reconnect presenting the same token within the TTL reclaims
+    // it (ownership -> the new connection). Auto-reclaim is the framework DEFAULT (user-approved). Expired
+    // orphans are swept (despawned — the player truly left). Proven in %TEMP%\bal-reconnect-test (26/26).
+
+    // SERVER: connection -> the ConnectionToken it presented at handshake (its persistent identity). Dropped
+    // on disconnect (after recording the orphan). The source of truth for "which token owns this connection".
+    readonly Dictionary<Connection, ConnectionToken> connectionTokens = new();
+
+    // SERVER: token -> a reclaimable orphan (a spawned-but-server-owned pawn awaiting reclaim, + its TTL
+    // deadline tick). A reconnect with the matching token transfers ownership back; the sweep despawns
+    // expired ones. Keyed by token so a NEW transport id reclaims the SAME pawn (the §9.8 point).
+    sealed class ReconnectOrphan { public List<NetworkObject> Pawns; public long Expiry; }
+    readonly Dictionary<ConnectionToken, ReconnectOrphan> orphans = new();
+
+    // CLIENT: the persistent token to present at the next connect (None = first join, the server mints one
+    // we then persist from HandshakeOk). Set externally before a RECONNECT (Network.SetReconnectToken) so
+    // the reconnecting client reclaims its pawn. A real client persists this to disk between sessions.
+    public ConnectionToken PersistentToken { get; set; } = ConnectionToken.None;
+
+    // The reconnect-window TTL in fixed ticks (~30s at 60Hz). A disconnected player has this long to come
+    // back and reclaim its pawn before the orphan is swept. Tunable per game (a lobby may want longer).
+    public long ReconnectTtlTicks { get; set; } = 60 * 30;
+
+    // SERVER-side mint counter for first-join tokens (distinct per process via the seed). Monotonic.
+    ulong mintCounter;
+    ConnectionToken MintToken() => ConnectionToken.Mint(MintSeed, mintCounter++);
+    // A per-process seed so two servers never mint colliding tokens. Derived from the topology + a fixed
+    // salt (Date.Now is banned in harness contexts; this is deterministic-enough for collision avoidance —
+    // tokens only need to be distinct WITHIN one server's lifetime, which the counter guarantees).
+    ulong MintSeed => 0xC2B2AE3D27D4EB4FUL ^ (ulong)(LocalConnection.Id + 1);
+
+    // Raised when a reconnect reclaimed an orphaned pawn (diagnostics / the §6 rejoin hook). prev arg = the
+    // reclaiming connection. A GameMode override can re-bind HUD / announce the rejoin here.
+    public Action<Connection> OnPlayerReconnected { get; set; }
+
+    // SERVER: record the disconnecting connection's owned pawns as a reclaimable orphan. Ownership -> server
+    // (NOT despawn) so OnOwnershipChanged fires and the §8.5 subscriptions survive. A connection with no
+    // owned pawn records an empty orphan (still reclaimable so a rejoin is recognized; harmless).
+    void RecordReconnectOrphan(Connection c, ConnectionToken token) {
+        var pawns = new List<NetworkObject>();
+        foreach (NetworkObject obj in objects.All())
+            if (obj is { IsSpawned: true } && obj.Owner.IsValid && obj.Owner.Equals(c)) {
+                TransferOwnership(obj, Connection.None);   // ownership -> server (OnOwnershipChanged fires)
+                pawns.Add(obj);
+            }
+        orphans[token] = new ReconnectOrphan { Pawns = pawns, Expiry = SendClock.LocalTick + ReconnectTtlTicks };
+    }
+
+    // SERVER: a reconnect presented `token`. If a live orphan matches, transfer every orphaned pawn's
+    // ownership BACK to the new connection (the SAME objects — no respawn) and clear the orphan. Returns
+    // true on a reclaim. OnOwnershipChanged fires (server -> newConn) on each reclaimed pawn.
+    bool TryReclaimOrphan(Connection newConn, ConnectionToken token) {
+        if (!orphans.TryGetValue(token, out ReconnectOrphan o))
+            return false;
+        orphans.Remove(token);
+        foreach (NetworkObject pawn in o.Pawns)
+            if (pawn is { IsSpawned: true })
+                TransferOwnership(pawn, newConn);          // ownership -> the reconnecting player (auto-reclaim)
+        OnPlayerReconnected?.Invoke(newConn);
+        return true;
+    }
+
+    // Sweep expired reconnect orphans (the player did NOT come back in time) — despawn each orphaned pawn
+    // (graceful teardown, §8.5.3: OnDespawned fires). Called once per fixed tick from PredictTick. A
+    // deadline compare per orphan (a handful at most) — no per-tick cost when none exist.
+    void SweepReconnectOrphans() {
+        if (orphans.Count == 0)
+            return;
+        List<ConnectionToken> expired = null;
+        foreach (var kv in orphans)
+            if (SendClock.LocalTick >= kv.Value.Expiry)
+                (expired ??= new()).Add(kv.Key);
+        if (expired is null)
+            return;
+        foreach (ConnectionToken t in expired) {
+            foreach (NetworkObject pawn in orphans[t].Pawns)
+                if (pawn is { IsSpawned: true })
+                    Despawn(pawn);                          // the player truly left -> graceful teardown
+            orphans.Remove(t);
+        }
+    }
+
+    public int ReconnectOrphanCount => orphans.Count;
+    public bool HasReconnectOrphan(ConnectionToken token) => orphans.ContainsKey(token);
+
     static void FireOwnershipChanged(NetworkObject netObj, Connection prev, Connection next) {
         foreach (Behaviour b in netObj.Entity.Behaviours.ToArray())
             if (b is NetworkBehaviour nb)
@@ -1137,4 +1439,38 @@ public sealed class NetworkManager {
 
     internal NetworkObject Resolve(int netId) => objects.Resolve(netId);
     public int SpawnedCount => objects.Count;
+
+    // ---- P7: local-player resolution (the HUD binding seam, plan §2/§5 Phase 2) -------------------
+    // The PlayerController this machine OWNS (input authority) — the "local player". On a host its own
+    // pawn's controller; on a client the controller it was possessed into. Null on a dedicated server (no
+    // local player) or before possession. A reflection-free walk over spawned objects (a handful of
+    // controllers; runs at HUD.Init / on demand, never per-frame). HUD.Init binds to this.
+    public PlayerController LocalPlayerController() {
+        foreach (NetworkObject obj in objects.All()) {
+            if (obj?.Entity is null || !obj.IsOwner)
+                continue;
+            foreach (Behaviour b in obj.Entity.Behaviours.ToArray())
+                if (b is PlayerController pc)
+                    return pc;
+        }
+        return null;
+    }
+
+    // The PlayerState for the local player — the one on the local controller's entity, or (if the player
+    // info lives on a dedicated entity) the PlayerState owned by the local connection. Null when none.
+    public PlayerState LocalPlayerState() {
+        // Prefer the PlayerState sibling of the local controller (the common layout).
+        PlayerController pc = LocalPlayerController();
+        if (pc?.Entity is not null && pc.Entity.GetComponent<PlayerState>() is { } sibling)
+            return sibling;
+        // Else any PlayerState owned by the local connection (a dedicated player-info entity).
+        foreach (NetworkObject obj in objects.All()) {
+            if (obj?.Entity is null || !obj.IsOwner)
+                continue;
+            foreach (Behaviour b in obj.Entity.Behaviours.ToArray())
+                if (b is PlayerState ps)
+                    return ps;
+        }
+        return null;
+    }
 }

@@ -21,6 +21,36 @@ public static class Network {
 
     public static Connection LocalConnection => Manager?.LocalConnection ?? Connection.None;
 
+    // ---- P7: local-player resolution (the HUD binding seam, plan §2/§5 Phase 2) -------------------
+    // The PlayerController / PlayerState this machine OWNS (the local player) — HUD.Init binds to these.
+    // Null on a dedicated server or before possession. Reflection-free; call at HUD.Init / on demand.
+    public static PlayerController LocalPlayerController => Manager?.LocalPlayerController();
+    public static PlayerState LocalPlayerState => Manager?.LocalPlayerState();
+
+    // ---- P7: reconnect (ConnectionToken, §8.5.5 / §9.8) -------------------------------------------
+    // The persistent token the LOCAL client presents at the next connect. A first join leaves it None
+    // (the server mints one, delivered back via HandshakeOk and stored here). To RECONNECT and reclaim the
+    // pawn, persist this token across the disconnect (a real client writes it to disk), then set it before
+    // StartClient. Server-side: a presented token that matches a live reconnect orphan transfers the pawn's
+    // ownership back automatically (the framework default).
+    public static ConnectionToken ReconnectToken {
+        get => Manager?.PersistentToken ?? ConnectionToken.None;
+        set { if (Manager is not null) Manager.PersistentToken = value; }
+    }
+
+    // The reconnect window TTL in fixed ticks (server-side). A disconnected player has this long to reclaim.
+    public static long ReconnectTtlTicks {
+        get => Manager?.ReconnectTtlTicks ?? 0;
+        set { if (Manager is not null) Manager.ReconnectTtlTicks = value; }
+    }
+
+    // Fired on the SERVER when a reconnect reclaimed an orphaned pawn (the rejoin hook — re-bind HUD,
+    // announce). The arg is the reclaiming connection.
+    public static Action<Connection> OnPlayerReconnected {
+        get => Manager?.OnPlayerReconnected;
+        set { if (Manager is not null) Manager.OnPlayerReconnected = value; }
+    }
+
     // ---- bring-up (server-authoritative lifecycle) ------------------------------------------------
     // Single-player / listen-server over loopback by default (D5): SP = host, same code path as MP.
     public static void StartHost(ITransport transport = null) =>

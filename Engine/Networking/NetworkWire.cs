@@ -20,6 +20,8 @@ public enum NetMessage : byte {
     Input = 7,       // client->server: a batch of the owner's per-tick NetworkInput (the UP stream, P5b)
     Ack = 8,         // client->server: "I applied snapshot through seq N" -> advance THIS client's per-client baseline (P6)
     Possess = 9,     // server->client: controllerNetId possesses pawnNetId -> the client auto-links + (owner) sets up input (P6)
+    SceneState = 10, // server->client: a batch of [replicationId, delta] for dirty IReplicated GameState (P7, entity-less)
+    SceneAck = 11,   // client->server: "I applied scene-state through seq N" -> advance the GameState baseline (P7)
 }
 
 // Static read/write helpers over BitWriter/BitReader for the frame headers. The per-object STATE bytes
@@ -36,21 +38,41 @@ public static class NetworkWire {
         int digest = 0;
         foreach (NetworkTypeDescriptor d in NetworkReplicationRegistry.All)
             digest ^= WireCodec.Fnv(d.TypeId.ToString(), d.LayoutHash.ToString());
+        // P7: the entity-less GameState path folds in too (a drifted GameState [Networked] layout is an
+        // explicit handshake error, not a silent desync — §8.6.1). Same XOR fold (order-independent).
+        foreach (SceneReplDescriptor d in SceneReplicationRegistry.All)
+            digest ^= WireCodec.Fnv(d.TypeId.ToString(), d.LayoutHash.ToString());
         return digest;
     }
 
     // ---- message builders (each returns the framed payload bytes) ---------------------------------
-    public static byte[] Handshake(int layoutDigest) {
+    // The connect handshake carries the layout digest (gate 0c drift reject) AND (P7) the client's
+    // PERSISTENT ConnectionToken (§9.8) — None on a first join (the server mints one), or the token the
+    // client kept across a disconnect so the server reclaims its orphaned pawn (§8.5.5).
+    public static byte[] Handshake(int layoutDigest, ConnectionToken token = default) {
         var w = new BitWriter();
         w.WriteByte((byte)NetMessage.Handshake);
         w.WriteInt(layoutDigest);
+        w.WriteUInt((uint)(token.Hi >> 32)); w.WriteUInt((uint)token.Hi);
+        w.WriteUInt((uint)(token.Lo >> 32)); w.WriteUInt((uint)token.Lo);
         return w.AsSpan().ToArray();
     }
 
-    public static byte[] HandshakeOk(int assignedConnectionId) {
+    public static ConnectionToken ReadToken(ref BitReader r) {
+        ulong hi = ((ulong)r.ReadUInt() << 32) | r.ReadUInt();
+        ulong lo = ((ulong)r.ReadUInt() << 32) | r.ReadUInt();
+        return new ConnectionToken(hi, lo);
+    }
+
+    // server->client accept: the assigned connection id AND (P7) the ConnectionToken the server is using
+    // for this client (the one it presented, or the freshly-minted one for a first join) — the client
+    // PERSISTS this so a future reconnect presents it to reclaim its pawn (§8.5.5).
+    public static byte[] HandshakeOk(int assignedConnectionId, ConnectionToken token = default) {
         var w = new BitWriter();
         w.WriteByte((byte)NetMessage.HandshakeOk);
         w.WriteInt(assignedConnectionId);
+        w.WriteUInt((uint)(token.Hi >> 32)); w.WriteUInt((uint)token.Hi);
+        w.WriteUInt((uint)(token.Lo >> 32)); w.WriteUInt((uint)token.Lo);
         return w.AsSpan().ToArray();
     }
 
@@ -121,6 +143,15 @@ public static class NetworkWire {
         var w = new BitWriter();
         w.WriteByte((byte)NetMessage.Ack);
         w.WriteUInt(snapshotSeq);
+        return w.AsSpan().ToArray();
+    }
+
+    // P7: a client's ACK of the entity-less GameState scene-state frontier (its own seq space, distinct
+    // from the object Ack). Advances THIS client's GameState per-client baseline. Reliable-ordered.
+    public static byte[] SceneAck(uint sceneSeq) {
+        var w = new BitWriter();
+        w.WriteByte((byte)NetMessage.SceneAck);
+        w.WriteUInt(sceneSeq);
         return w.AsSpan().ToArray();
     }
 
