@@ -98,6 +98,12 @@ public interface IPhysicsWorld {
     int OverlapShape(PhysicsShape shape, Vector3 position, Quaternion rotation, int layerMask,
         List<IPhysicsBody> results);
 
+    // Joints/constraints (P6). Binds two bodies (or one body to the world when BodyB is null) with a
+    // BallSocket/Hinge/Weld/Spring/Slider constraint. Returns null (after logging) if it can't be
+    // built — e.g. a missing body. Remove a constraint BEFORE removing either of its bodies.
+    IPhysicsConstraint AddConstraint(in PhysicsConstraintDescription description);
+    void RemoveConstraint(IPhysicsConstraint constraint);
+
     // Drops every body and shape (leaving/entering play mode). Outstanding IPhysicsBody
     // references become inert no-ops.
     void Reset();

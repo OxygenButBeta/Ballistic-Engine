@@ -33,6 +33,11 @@ public class Rigidbody : Behaviour {
     public float AngularDamping { get; set; } = 0.05f;
 
     IPhysicsBody body;
+
+    // The live physics body, exposed to Joint components so a constraint can bind to it. Null in edit
+    // mode or before the body is created; Joints must tolerate that (they create lazily once it exists).
+    internal IPhysicsBody InternalBody => body;
+
     readonly List<Collider> boundColliders = new(capacity: 4);
     Vector3 pendingForce;
     Vector3 pendingTorque;

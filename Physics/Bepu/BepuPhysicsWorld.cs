@@ -48,6 +48,10 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
     readonly Dictionary<int, bool[]> bodyChildTriggers = new();
     readonly Dictionary<int, bool[]> staticChildTriggers = new();
 
+    // Live constraints (P6 joints). Tracked so Reset can invalidate outstanding wrappers; the handle
+    // itself lives in Bepu's solver.
+    readonly List<BepuConstraint> constraints = new();
+
     internal readonly struct ContactMaterial {
         public readonly float Friction;
         public readonly float Bounciness;
@@ -125,6 +129,10 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             body.Invalidate();
         foreach (BepuBody body in staticsByHandle.Values)
             body.Invalidate();
+
+        foreach (BepuConstraint constraint in constraints)
+            constraint.Invalidate();
+        constraints.Clear();
 
         bodiesByHandle.Clear();
         staticsByHandle.Clear();
@@ -462,6 +470,150 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         collidable.Mobility == CollidableMobility.Static
             ? staticsByHandle.GetValueOrDefault(collidable.StaticHandle.Value)
             : bodiesByHandle.GetValueOrDefault(collidable.BodyHandle.Value);
+
+    // ---- Constraints (joints, P6) -------------------------------------------
+
+    public IPhysicsConstraint AddConstraint(in PhysicsConstraintDescription description) {
+        if (Simulation is null)
+            return null;
+
+        // Bepu constraints are body-to-body and need a DYNAMIC/KINEMATIC body handle (statics can't be
+        // constrained). BodyA must be a non-static body.
+        if (description.BodyA is not BepuBody bodyA || !bodyA.Valid || bodyA.IsStatic) {
+            Debugging.LogError("Physics: AddConstraint needs a non-static Rigidbody as body A.");
+            return null;
+        }
+        BodyHandle handleA = bodyA.BodyHandle;
+
+        // Body B: either another non-static body, or a private kinematic ANCHOR body created at the
+        // world anchor point (Bepu can't constrain to a static, so a zero-mass kinematic stands in for
+        // "the world"). The anchor is shapeless — it exists only to host the constraint.
+        BodyHandle handleB;
+        BodyHandle anchorBody = default;
+        bool hasAnchor = false;
+        if (description.BodyB is BepuBody bodyB && bodyB.Valid && !bodyB.IsStatic) {
+            handleB = bodyB.BodyHandle;
+        }
+        else {
+            // World anchor at body A's world anchor position (so LocalAnchorB = 0 lines up).
+            Vector3 worldAnchor = ToNumerics(bodyA.Position) +
+                Vector3.Transform(ToNumerics(description.LocalAnchorA), ToNumerics(bodyA.Rotation));
+            anchorBody = Simulation.Bodies.Add(
+                BodyDescription.CreateKinematic(new RigidPose(worldAnchor), default, -1f));
+            handleB = anchorBody;
+            hasAnchor = true;
+        }
+
+        SpringSettings spring = SpringFor(description);
+        ConstraintHandle handle = BuildConstraint(in description, handleA, handleB, spring);
+        if (handle.Value < 0) {
+            if (hasAnchor)
+                Simulation.Bodies.Remove(anchorBody);
+            return null;
+        }
+
+        var wrapper = new BepuConstraint(this, handle, anchorBody, hasAnchor, bodyA,
+            description.BodyB as BepuBody);
+        constraints.Add(wrapper);
+        return wrapper;
+    }
+
+    // Wake a constrained body on joint removal and seed one step of gravity so Bepu doesn't instantly
+    // re-sleep it (a zero-velocity body that just lost its support would otherwise freeze in mid-air).
+    void WakeAndNudge(BepuBody body) {
+        if (body is null || body.IsStatic || !Simulation.Bodies.BodyExists(body.BodyHandle))
+            return;
+        // A body that slept while a joint held it lives in a SLEEPING SET; just flipping Awake on the
+        // BodyReference doesn't pull it back into the active set, so the next Step still skips it.
+        // Simulation.Awakener does the real island transition. Then seed a step of gravity so Bepu
+        // doesn't immediately re-sleep a body whose velocity is still ~0.
+        Simulation.Awakener.AwakenBody(body.BodyHandle);
+        body.LinearVelocity += GravityNumerics * (1f / 60f);
+    }
+
+    static SpringSettings SpringFor(in PhysicsConstraintDescription d) =>
+        d.Frequency > 0f ? new SpringSettings(d.Frequency, d.DampingRatio)
+                         : new SpringSettings(30f, 1f); // rigid default
+
+    ConstraintHandle BuildConstraint(in PhysicsConstraintDescription d, BodyHandle a, BodyHandle b,
+        SpringSettings spring) {
+        Vector3 offsetA = ToNumerics(d.LocalAnchorA);
+        Vector3 offsetB = ToNumerics(d.LocalAnchorB);
+        switch (d.Type) {
+            case PhysicsConstraintType.BallSocket:
+                return Simulation.Solver.Add(a, b, new BallSocket {
+                    LocalOffsetA = offsetA, LocalOffsetB = offsetB, SpringSettings = spring,
+                });
+
+            case PhysicsConstraintType.Hinge: {
+                Vector3 axis = SafeAxis(d.Axis);
+                return Simulation.Solver.Add(a, b, new Hinge {
+                    LocalOffsetA = offsetA, LocalHingeAxisA = axis,
+                    LocalOffsetB = offsetB, LocalHingeAxisB = axis,
+                    SpringSettings = spring,
+                });
+            }
+
+            case PhysicsConstraintType.Fixed: {
+                // Weld locks the CURRENT relative pose of B in A's frame: LocalOffset = where B's
+                // origin sits in A-local right now, LocalOrientation = B's orientation in A-local.
+                // (Anchor offsets aren't used — a weld fixes the whole bodies, not two points.)
+                RigidPose poseA = Simulation.Bodies[a].Pose;
+                RigidPose poseB = Simulation.Bodies[b].Pose;
+                Quaternion invOrientA = Quaternion.Conjugate(poseA.Orientation);
+                Vector3 localOffset = Vector3.Transform(poseB.Position - poseA.Position, invOrientA);
+                Quaternion localOrientation = Quaternion.Normalize(
+                    Quaternion.Concatenate(poseB.Orientation, invOrientA));
+                return Simulation.Solver.Add(a, b, new Weld {
+                    LocalOffset = localOffset,
+                    LocalOrientation = localOrientation,
+                    SpringSettings = spring,
+                });
+            }
+
+            case PhysicsConstraintType.Spring: {
+                float target = MathF.Max(0f, d.TargetDistance);
+                return Simulation.Solver.Add(a, b,
+                    new DistanceServo(offsetA, offsetB, target, spring, ServoSettings.Default));
+            }
+
+            case PhysicsConstraintType.Slider:
+                return Simulation.Solver.Add(a, b, new PointOnLineServo {
+                    LocalOffsetA = offsetA, LocalOffsetB = offsetB,
+                    LocalDirection = SafeAxis(d.Axis),
+                    ServoSettings = ServoSettings.Default, SpringSettings = spring,
+                });
+
+            default:
+                Debugging.LogError($"Physics: unsupported constraint type {d.Type}.");
+                return new ConstraintHandle(-1);
+        }
+    }
+
+    static Vector3 SafeAxis(Vector3 axis) {
+        float len = axis.Length();
+        return len > 1e-6f ? axis / len : Vector3.UnitY;
+    }
+
+    public void RemoveConstraint(IPhysicsConstraint constraint) {
+        if (constraint is not BepuConstraint bepu || !bepu.IsValid || Simulation is null)
+            return;
+
+        Simulation.Solver.Remove(bepu.Handle);
+        if (bepu.HasAnchor)
+            Simulation.Bodies.Remove(bepu.AnchorBody);
+
+        // Wake the freed bodies AFTER removing the constraint: a body that slept while the joint held
+        // it in place (velocity ≈ 0) would otherwise stay asleep — and asleep bodies skip gravity
+        // integration, so it would hang frozen in mid-air instead of falling. Just setting Awake isn't
+        // enough: Bepu re-sleeps a zero-velocity body almost immediately, so also seed one step of
+        // gravity so the next timestep sees it moving and keeps it active.
+        WakeAndNudge(bepu.BodyA);
+        WakeAndNudge(bepu.BodyB);
+
+        constraints.Remove(bepu);
+        bepu.Invalidate();
+    }
 
     // ---- Shape-cast (sweep) -------------------------------------------------
 
