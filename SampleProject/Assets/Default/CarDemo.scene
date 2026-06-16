@@ -2,7 +2,7 @@ version: 1
 name: Scene
 sceneComponents:
 - type: ProceduralSky
-  id: e769f34afca24b9480f6711c972de2f3
+  id: db92502832574069999e785b327ee159
   enabled: true
   members:
     exposure: 1
@@ -28,7 +28,7 @@ sceneComponents:
     cirrusCoverage: 0.3
     starIntensity: 1
 - type: SceneLighting
-  id: b330c1f12a234605801467ac6d9cfd42
+  id: bb3c3b724f1b49a1a5d321e8a64a3a2f
   enabled: true
   members:
     ambientColor: {x: 1, y: 1, z: 1}
@@ -102,24 +102,7 @@ entities:
   - type: VehicleController
     id: f485236d86684cfb94f259b77d5b85c8
     enabled: true
-    members:
-      motorForce: 6000
-      reverseForce: 3000
-      brakeForce: 20000
-      maxSpeed: 35
-      accelCurve: 2
-      maxSteerAngle: 32
-      highSpeedSteerScale: 0.4
-      steerResponse: 12
-      steerReturn: 20
-      antiRoll: 40000
-      downforce: 2000
-      yawResponse: 25
-      maxYawRate: 1.6
-      wheelbase: 3
-      arcadeGrip: 16
-      frontWheelDrive: false
-      rearWheelDrive: true
+    members: {}
 - id: 0c9306babb344538b20e5a00f3d42c49
   name: WheelFL
   isActive: true
@@ -140,11 +123,6 @@ entities:
       suspensionTravel: 0.3
       suspensionStiffness: 18000
       suspensionDamping: 2500
-      sidewaysGrip: 0
-      gripBudget: 3
-      gripRelax: 0.5
-      forwardGrip: 1
-      rollingResistance: 0.04
 - id: 45c4dcaf88ef4207a0b14ad2399a9cb5
   name: WheelFR
   isActive: true
@@ -165,11 +143,6 @@ entities:
       suspensionTravel: 0.3
       suspensionStiffness: 18000
       suspensionDamping: 2500
-      sidewaysGrip: 0
-      gripBudget: 3
-      gripRelax: 0.5
-      forwardGrip: 1
-      rollingResistance: 0.04
 - id: c8c13986008b4068a18969134a2c8eb5
   name: WheelRL
   isActive: true
@@ -190,11 +163,6 @@ entities:
       suspensionTravel: 0.3
       suspensionStiffness: 18000
       suspensionDamping: 2500
-      sidewaysGrip: 0
-      gripBudget: 3
-      gripRelax: 0.5
-      forwardGrip: 1
-      rollingResistance: 0.04
 - id: a58b0f5d6d5c4eca9723aed72f656d8e
   name: WheelRR
   isActive: true
@@ -215,11 +183,6 @@ entities:
       suspensionTravel: 0.3
       suspensionStiffness: 18000
       suspensionDamping: 2500
-      sidewaysGrip: 0
-      gripBudget: 3
-      gripRelax: 0.5
-      forwardGrip: 1
-      rollingResistance: 0.04
 - id: 9846974dbe38441d887e72cd840897e3
   name: MainCamera
   isActive: true
@@ -247,7 +210,7 @@ entities:
       positionSmooth: 8
       rotationSmooth: 12
       speedPullback: 3
-      pullbackAtSpeed: 35
+      referenceSpeed: 38
 - id: 4badeb9d29c24fe4a560fc8e3272babb
   name: Sun
   isActive: true
@@ -384,6 +347,20 @@ entities:
       terrain3D: guid:246545e3ddbd45cf9ac9e07a66582aee
       material: guid:996ace4a785a413c987eeaf368e11000
       generateCollider: true
+  - type: StaticMeshRenderer
+    id: 8944ea8d0d1648d5b52f53960915cbc7
+    enabled: true
+    members:
+      sharedMaterial: guid:996ace4a785a413c987eeaf368e11000
+      subMeshIndex: -1
+  - type: MeshCollider
+    id: 1341611920164599945419050f758330
+    enabled: true
+    members:
+      center: {x: 0, y: 0, z: 0}
+      friction: 0.6
+      bounciness: 0
+      isTrigger: false
   - type: StaticMeshRenderer
     id: 2ec429c6c5ef44ae977650b1cf0b7777
     enabled: true
@@ -548,6 +525,34 @@ entities:
     id: e5b4ff1536fe4260932cb1f41bc78787
     enabled: true
     members:
+      center: {x: 0, y: 0, z: 0}
+      friction: 0.6
+      bounciness: 0
+      isTrigger: false
+- id: d90d508c6d36494ab0a163d68f916cb6
+  name: Cube
+  isActive: true
+  tag: 
+  layer: 0
+  prefabSource: 
+  transform:
+    position: {x: -0.6962457, y: 1.0635505, z: 6.9782095}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 9.457285, y: 2.13, z: 2.13}
+    parent: 
+  components:
+  - type: StaticMeshRenderer
+    id: d9092dfb1d00465f9d62d5e34d31069a
+    enabled: true
+    members:
+      sharedMesh: guid:1373de82334d41269f8bb0028d678db9
+      sharedMaterial: guid:c13c6e1f320940ce81adcdcbda99e5b7
+      subMeshIndex: -1
+  - type: BoxCollider
+    id: fe5c331568ce4d429bc09a756f55fcb9
+    enabled: true
+    members:
+      size: {x: 1, y: 1, z: 1}
       center: {x: 0, y: 0, z: 0}
       friction: 0.6
       bounciness: 0
