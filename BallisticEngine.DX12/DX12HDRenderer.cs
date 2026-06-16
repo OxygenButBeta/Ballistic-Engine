@@ -2530,9 +2530,17 @@ public sealed class DX12HDRenderer : HDRenderer {
         // written but not yet read (gather = P2.2) → image still inert; this validates the update pipeline. ---
         if (DdgiEnabled && ddgi != null && ddgi.Allocated) {
             Dx12DescriptorHeap bh = Dx12Backend.BindlessHeap;
+            var ddgiHeapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
             sceneAS.CreateTlasSrv(bh.Cpu(DdgiTableBase + 0));                                              // t0 TLAS
-            dev.Device.CopyDescriptorsSimple(1, bh.Cpu(DdgiTableBase + 1), ibl.IrradianceSrv,
-                DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);              // t3 irr cube
+            dev.Device.CopyDescriptorsSimple(1, bh.Cpu(DdgiTableBase + 1), ibl.IrradianceSrv, ddgiHeapType); // t3 irr cube
+            // t4 = LAST frame's irradiance atlas (P2.3 multi-bounce feedback). The trace samples it as the hit
+            // ambient; DispatchDdgi transitions it UAV→SRV→UAV around the trace within its command list.
+            dev.Device.CreateShaderResourceView(ddgi.IrradianceTex, new ShaderResourceViewDescription {
+                Format = Format.R16G16B16A16_Float,
+                ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
+            }, bh.Cpu(DdgiTableBase + 2));
             // Own stopwatch (NOT TimePass — nesting it inside the outer GI:RT TimePass would clobber the shared
             // passSw and corrupt GI:RT's reading). Each DX12 pass is its own ExecuteSync = its GPU wall-time.
             var ddgiSw = GiTimingEnabled ? System.Diagnostics.Stopwatch.StartNew() : null;
@@ -2541,7 +2549,8 @@ public sealed class DX12HDRenderer : HDRenderer {
                 ddgi.DispatchDdgi(cl, bh, bh.Gpu(DdgiTableBase),
                     rtGiSunCb.GPUVirtualAddress, gpuDriven.MaterialsGpuAddress,
                     rtGeometry.InstancesGpuAddress, clusteredLights.LightBufGpuAddress,
-                    hysteresis: 0.97f, intensity: MathF.Max(PostFX.SsgiIntensity, 0f));
+                    hysteresis: 0.97f, intensity: MathF.Max(PostFX.SsgiIntensity, 0f),
+                    feedback: true);   // P2.3 multi-bounce
             });
             if (ddgiSw != null) { ddgiSw.Stop(); RenderStats.Scene.GpuPasses.Add(("GI:DDGI", ddgiSw.Elapsed.TotalMilliseconds)); }
             if (!ddgiDebugDumped && Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_DEBUG") == "1") {

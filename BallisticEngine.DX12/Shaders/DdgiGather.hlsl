@@ -18,7 +18,7 @@ cbuffer DdgiConstants : register(b0) {
     float4 SpacingYZ;        // x spacing.y, y spacing.z
     float4 ProbeDims;        // xyz (ProbesX,ProbesY,ProbesZ), w ProbeCount
     float4 Params0;          // x irrTexels, y depthTexels, z hysteresis, w frameIndex
-    float4 Params1;          // x maxRayDist, y normalBias, z viewBias, w intensity
+    float4 Params1;          // x maxRayDist, y normalBias, z feedbackEnable, w intensity
 };
 cbuffer DdgiGatherExtra : register(b1) {
     float4x4 InvViewProj;    // screen+depth -> world (jittered, transposed)

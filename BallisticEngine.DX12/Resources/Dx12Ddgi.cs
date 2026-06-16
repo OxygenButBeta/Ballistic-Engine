@@ -64,7 +64,7 @@ public sealed class Dx12Ddgi : IDisposable {
         public Vector4 SpacingYZ;        // x = spacing.y, y = spacing.z, z/w = pad
         public Vector4 ProbeDims;        // xyz = (ProbesX,ProbesY,ProbesZ) as floats, w = ProbeCount
         public Vector4 Params0;          // x=irrTexels y=depthTexels z=hysteresis w=frameIndex
-        public Vector4 Params1;          // x=maxRayDist y=normalBias z=viewBias w=intensity
+        public Vector4 Params1;          // x=maxRayDist y=normalBias z=feedbackEnable w=intensity
     }
 
     // --- P2.1 probe-update plumbing ---
@@ -130,12 +130,14 @@ public sealed class Dx12Ddgi : IDisposable {
         Origin = snapped - half;
     }
 
-    public DdgiConstants Constants(int frameIndex, float hysteresis, float intensity) => new() {
+    // Params1 = (maxRayDist, normalBias, feedbackEnable, intensity). feedbackEnable>0.5 → the trace reads
+    // last frame's irradiance FIELD at each hit (P2.3 multi-bounce); 0 → flat IBL-cube ambient (1-bounce).
+    public DdgiConstants Constants(int frameIndex, float hysteresis, float intensity, bool feedback) => new() {
         OriginSpacingX = new Vector4(Origin, Spacing.X),
         SpacingYZ = new Vector4(Spacing.Y, Spacing.Z, 0, 0),
         ProbeDims = new Vector4(ProbesX, ProbesY, ProbesZ, ProbeCount),
         Params0 = new Vector4(IrradianceTexels, DepthTexels, hysteresis, frameIndex),
-        Params1 = new Vector4(40f, 0.25f, 0.1f, intensity),
+        Params1 = new Vector4(40f, 0.25f, feedback ? 1f : 0f, intensity),
     };
 
     // World position of probe (px,py,pz) — for the debug gizmo + the update pass.
@@ -153,16 +155,19 @@ public sealed class Dx12Ddgi : IDisposable {
         var zero = new Vector4[ProbeCount * RaysPerProbe];
         rayData = dev.CreateUavBuffer<Vector4>(zero, ResourceStates.UnorderedAccess);
 
-        // --- TRACE root sig (mirrors DxrGi). The TLAS + irradiance cube are NON-CONTIGUOUS registers (t0,t3)
-        // so the table holds TWO descriptor ranges; they're written to ADJACENT bindless-tail slots so one
-        // GPU base handle covers both (range 0 → slot+0 = t0, range 1 → slot+1 = t3). ---
+        // --- TRACE root sig (mirrors DxrGi). The TLAS + irr cube + prev-irradiance-atlas are NON-CONTIGUOUS
+        // registers (t0,t3,t4) so the table holds THREE ranges, written to ADJACENT bindless-tail slots so one
+        // GPU base handle covers all (range 0→slot+0=t0 TLAS, 1→slot+1=t3 cube, 2→slot+2=t4 prev irr atlas).
+        // t4 = LAST frame's irradiance atlas for the P2.3 multi-bounce feedback. ---
         var t_cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
         var t_cbv1 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.All);
         var tlasRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0,  // t0
             registerSpace: 0, offsetInDescriptorsFromTableStart: 0);
         var cubeRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 3,  // t3
             registerSpace: 0, offsetInDescriptorsFromTableStart: 1);
-        var t_table = new RootParameter1(new RootDescriptorTable1(tlasRange, cubeRange), ShaderVisibility.All);
+        var prevIrrRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 4,  // t4
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 2);
+        var t_table = new RootParameter1(new RootDescriptorTable1(tlasRange, cubeRange, prevIrrRange), ShaderVisibility.All);
         var t_mat = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(5, 0), ShaderVisibility.All);
         var t_inst = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(6, 0), ShaderVisibility.All);
         var t_light = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All);
@@ -258,28 +263,41 @@ public sealed class Dx12Ddgi : IDisposable {
     // Must be called from inside DrawRtGi AFTER EnsureMaterialTable + rtGeometry.Ensure (bindless ids fresh)
     // and AFTER the RtGi reserved-tail descriptors are written, with the SAME bindless heap bound. The caller
     // supplies the shared root-SRV addresses (materials/instances/lights), the irradiance cube SRV, and the
-    // RtGiSun CBV address. `traceTableGpu` is the GPU handle of the 2-descriptor bindless-tail base ([0]=TLAS,
-    // [1]=irr cube) the caller has already written; the trace table root param points there. The atlases stay
-    // UnorderedAccess state (caller transitions to SRV before the gather pass — P2.2).
+    // RtGiSun CBV address. `traceTableGpu` is the GPU handle of the 3-descriptor bindless-tail base ([0]=TLAS,
+    // [1]=irr cube, [2]=prev irradiance atlas) the caller has already written; the trace table root param
+    // points there. The atlases stay UnorderedAccess on exit (caller transitions to SRV for the gather — P2.2).
+    // P2.3: when `feedback` is true the trace reads the irradiance atlas as SRV t4 (last frame's field) for
+    // multi-bounce — so it's transitioned UnorderedAccess→NonPixelShaderResource for the trace, then back to
+    // UnorderedAccess for the blend write within this same command list.
     public unsafe void DispatchDdgi(ID3D12GraphicsCommandList4 cl,
         Dx12DescriptorHeap bindless, GpuDescriptorHandle traceTableGpu,
         ulong sunCbAddress, ulong materialsAddr, ulong instancesAddr, ulong lightsAddr,
-        float hysteresis, float intensity) {
-        *(DdgiConstants*)constCbMapped = Constants(frameCounter, hysteresis, intensity);
+        float hysteresis, float intensity, bool feedback) {
+        // Frame 0 has no field yet → force the 1-bounce IBL ambient regardless of the requested feedback.
+        bool fb = feedback && frameCounter > 0;
+        *(DdgiConstants*)constCbMapped = Constants(frameCounter, hysteresis, intensity, fb);
         frameCounter++;
+
+        // P2.3 multi-bounce: the trace reads the irradiance atlas (t4) → SRV state for the trace dispatch.
+        if (fb)
+            cl.ResourceBarrierTransition(irradianceTex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
 
         // --- TRACE: ProbeCount*RaysPerProbe threads, 64/group. RayData UAV starts in UnorderedAccess. ---
         cl.SetComputeRootSignature(traceRootSig);
         cl.SetPipelineState(tracePso);
         cl.SetComputeRootConstantBufferView(0, constCb.GPUVirtualAddress);  // b0 DdgiConstants
         cl.SetComputeRootConstantBufferView(1, sunCbAddress);              // b1 RtGiSun
-        cl.SetComputeRootDescriptorTable(2, traceTableGpu);               // t0 TLAS + t3 irr cube
+        cl.SetComputeRootDescriptorTable(2, traceTableGpu);               // t0 TLAS + t3 irr cube + t4 prev irr atlas
         cl.SetComputeRootShaderResourceView(3, materialsAddr);            // t5 GpuMaterials
         cl.SetComputeRootShaderResourceView(4, instancesAddr);           // t6 RtInstance[]
         cl.SetComputeRootShaderResourceView(5, lightsAddr);             // t7 Lights
         cl.SetComputeRootUnorderedAccessView(6, rayData.GPUVirtualAddress);  // u0 RayData
         int totalThreads = ProbeCount * RaysPerProbe;
         cl.Dispatch((uint)((totalThreads + 63) / 64), 1, 1);
+
+        // Trace done reading the irradiance atlas → back to UnorderedAccess for the blend write below.
+        if (fb)
+            cl.ResourceBarrierTransition(irradianceTex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
 
         // RayData write → read barrier before blend.
         cl.ResourceBarrierUnorderedAccessView(rayData);

@@ -14,7 +14,7 @@
 cbuffer DdgiConstants : register(b0) {
     float4 OriginSpacingX; float4 SpacingYZ; float4 ProbeDims;
     float4 Params0;          // x irrTexels, y depthTexels, z hysteresis, w frameIndex
-    float4 Params1;          // x maxRayDist, y normalBias, z viewBias, w intensity
+    float4 Params1;          // x maxRayDist, y normalBias, z feedbackEnable, w intensity
 };
 StructuredBuffer<float4> RayData : register(t0);   // [probe * RaysPerProbe + ray] = (radiance, dist)
 RWTexture2D<float4> IrradianceAtlas : register(u0);   // CSIrradiance target
@@ -25,6 +25,16 @@ static const uint RAYS_PER_PROBE = 144u;
 static const uint IRR_TEXELS = 6u;
 static const uint DEPTH_TEXELS = 16u;
 static const uint BORDER = 1u;
+
+// Ternary component-select NaN/Inf scrub (NEVER mix(v,0,flag) — NaN*0==NaN, the proven AMD black-hole bug).
+float3 SanitizeIrr(float3 v) {
+    return float3(isnan(v.x) || isinf(v.x) ? 0.0 : v.x,
+                  isnan(v.y) || isinf(v.y) ? 0.0 : v.y,
+                  isnan(v.z) || isinf(v.z) ? 0.0 : v.z);
+}
+float2 SanitizeDepth(float2 v) {
+    return float2(isnan(v.x) || isinf(v.x) ? 0.0 : v.x, isnan(v.y) || isinf(v.y) ? 0.0 : v.y);
+}
 
 // --- Octahedral mapping: [0,1]^2 tile UV (no border) → unit direction. ---
 float3 OctDecode(float2 f) {
@@ -88,12 +98,14 @@ void CSIrradiance(uint3 dtid : SV_DispatchThreadID) {
         sum += RayData[info.probe * RAYS_PER_PROBE + r].rgb * w;
         wsum += w;
     }
-    float3 result = sum / max(wsum, 1e-4);
+    float3 result = SanitizeIrr(sum / max(wsum, 1e-4));
 
     float hyst = Params0.z;
-    float3 prev = IrradianceAtlas[px].rgb;
+    float3 prev = SanitizeIrr(IrradianceAtlas[px].rgb);
     // First frame (frameIndex 0) hard-sets; else EMA. (Atlas starts at 0 → hyst would crawl up; the warm-up
-    // gate in P2.5 fixes the deterministic path. For now low hysteresis converges fast.)
+    // gate in P2.5 fixes the deterministic path. For now low hysteresis converges fast.) Both result+prev are
+    // scrubbed (ternary, NOT mix*0) — once P2.3 feedback loops the atlas back through the trace, a single NaN
+    // would otherwise stick in the EMA forever (the [[ssgi-nan-mix-scrub]] black-hole class).
     float3 blended = (Params0.w < 0.5) ? result : lerp(result, prev, hyst);
     IrradianceAtlas[px] = float4(blended, 1.0);
 }
@@ -116,10 +128,10 @@ void CSDepth(uint3 dtid : SV_DispatchThreadID) {
         sum += float2(dist, dist * dist) * w;
         wsum += w;
     }
-    float2 result = sum / max(wsum, 1e-4);
+    float2 result = SanitizeDepth(sum / max(wsum, 1e-4));
 
     float hyst = Params0.z;
-    float2 prev = DepthAtlas[px];
+    float2 prev = SanitizeDepth(DepthAtlas[px]);
     float2 blended = (Params0.w < 0.5) ? result : lerp(result, prev, hyst);
     DepthAtlas[px] = blended;
 }
