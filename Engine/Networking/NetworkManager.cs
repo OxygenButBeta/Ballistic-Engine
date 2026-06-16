@@ -71,6 +71,8 @@ public sealed class NetworkManager {
         objects.Clear();
         SendClock.Reset();
         StateSnapshotsSent = 0;
+        InputStream.Reset();
+        PredictionTicks = 0;
         snapshotWriter.Reset();
     }
 
@@ -350,26 +352,91 @@ public sealed class NetworkManager {
     // Count of state-DOWN snapshot flushes — the send cadence the harness asserts (proves the divisor).
     public int StateSnapshotsSent { get; private set; }
 
-    // Drains incoming, runs NetworkTick on the state authority, and flushes a state snapshot DOWN on the
-    // send boundary (the divisor cadence). Called once per fixed step by SceneManager. P0 only pumped the
-    // transport; P2 adds the NetworkTick dispatch + the asymmetric down-state flush.
-    public void Tick() {
-        Transport?.Poll();
+    // The per-tick UP stream — every fixed tick's input batched at the send cadence, never starved
+    // (plan §8.2 / §14 item 3). P5a fills it from the owner's CapturePredictionInput; the actual wire
+    // up-send is P5b's reconcile concern (the server needs every tick). Exposed counters let the harness
+    // assert the asymmetric rate holds (per-tick record / batched flush).
+    public InputUpStream InputStream { get; private set; } = new();
+
+    // The monotonic LocalTick the prediction loop has advanced — the seq stamped on captured input and
+    // the replay index (plan §8.2). Equals SendClock.LocalTick (one counter, no second clock).
+    public uint LocalTick => (uint)SendClock.LocalTick;
+
+    // The number of prediction ticks driven this session (the fixed-tick count the harness asserts is
+    // bound to the 60 Hz accumulator, NOT the render frame rate — the L2 fix).
+    public int PredictionTicks { get; private set; }
+
+    // ---- the transport pump (once per FRAME) ------------------------------------------------------
+    // Drains incoming / flushes outgoing on the socket — the IterateIncoming/IterateOutgoing brackets
+    // (plan §8.2). Render-frame cadence is correct here (it is I/O, not simulation). The per-TICK
+    // simulation work is PredictTick, bound to the fixed step.
+    public void PollTransport() => Transport?.Poll();
+
+    // ---- the prediction tick (once per FIXED STEP, plan §8.2) -------------------------------------
+    // Bound to the existing 60 Hz accumulator via SceneManager's FixedTickScenes (L2 — no second clock).
+    // The canonical bracket runs here (input capture → NetworkTick → down-flush), BEFORE the physics
+    // step that follows in Physics.Advance. P5a:
+    //   - the input authority (owner) CAPTURES input as data, buffers it by seq, predicts its own
+    //     objects locally THIS tick (zero round-trip = zero input lag);
+    //   - the server drives NetworkTick on the objects it has state authority over (authoritative sim);
+    //   - the asymmetric down-state flush lands on the send boundary.
+    // No server correction yet (P5b). Reflection-free: virtual NetworkTick calls + a cached owner walk.
+    public void PredictTick(float step) {
         if (IsOffline)
             return;
 
-        // The single simulation step (§4c) — only on the state authority (the server/host). A proxy does
-        // not mutate state (P5 adds owner prediction). Reflection-free: a virtual call per spawned object.
-        if (IsServer)
-            foreach (NetworkObject obj in objects.All())
-                DriveNetworkTick(obj);
+        uint seq = (uint)SendClock.LocalTick;   // this tick's seq (the replay index, == LocalTick)
+        PredictionTicks++;
 
-        // State DOWN on the send boundary (the divisor cadence) — pack each dirty object's delta snapshot.
-        // P2 builds + measures the snapshot over loopback; the wire send is P3. The asymmetry (down here,
-        // input up per-tick on the client) is correct FROM THE START (the §14-item-3 functional guard).
+        // OWNER PREDICTION: each input-authority object captures its tick input + predicts locally. We
+        // drive it through the possessing PlayerController (which owns the InputComponent + buffer), then
+        // run the object's NetworkTick so the predicted pawn integrates THIS tick's input immediately.
+        foreach (NetworkObject obj in objects.All()) {
+            if (obj?.Entity is null || !obj.HasInputAuthority)
+                continue;
+            CapturePredictionInputFor(obj, seq);
+        }
+
+        // NETWORK TICK dispatch (§4c — the single simulation step). On the state authority (server/host)
+        // every spawned object ticks (authoritative). For an input-authority object on a pure client
+        // (no state authority), the owner still ticks it locally — that IS the prediction. A proxy with
+        // neither authority does NOT tick (it is interpolated, P5c). Deduped so a host (both authorities)
+        // ticks each object exactly once.
+        foreach (NetworkObject obj in objects.All()) {
+            if (obj?.Entity is null)
+                continue;
+            bool shouldTick = obj.HasStateAuthority || obj.HasInputAuthority;
+            if (shouldTick)
+                DriveNetworkTick(obj);
+        }
+
+        // Asymmetric UP: record EVERY tick's input (never gated by the divisor — the load-bearing rule),
+        // flush the batch on the send boundary. The wire up-send is P5b; P5a proves the rate is honored.
+        InputStream.RecordInput(seq);
+
+        // State DOWN on the send boundary (the divisor cadence) — pack each dirty object's delta snapshot
+        // and flush to clients. Input UP flushes on the SAME boundary but carries all buffered ticks.
         bool sendBoundary = SendClock.Advance();
-        if (sendBoundary && IsServer)
-            FlushStateDown();
+        if (sendBoundary) {
+            if (IsServer)
+                FlushStateDown();
+            InputStream.FlushBatch();
+        }
+    }
+
+    // Drive the prediction input capture for one input-authority object via its possessing controller.
+    // A PlayerController owns the InputComponent + InputBuffer; a possessed Pawn defers to its Controller.
+    // The captured input also feeds the UP stream's per-tick record (above). No reflection — a typed walk.
+    void CapturePredictionInputFor(NetworkObject obj, uint seq) {
+        foreach (Behaviour b in obj.Entity.Behaviours.ToArray()) {
+            if (b is PlayerController pc) {
+                pc.CapturePredictionInput(seq);
+                return;
+            }
+            // A possessed Pawn routes through its Controller (the input owner) — capture once there.
+            if (b is Pawn { Controller: { } controller })
+                controller.CapturePredictionInput(seq);
+        }
     }
 
     static void DriveNetworkTick(NetworkObject obj) {

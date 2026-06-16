@@ -187,10 +187,13 @@ public class SceneManager {
         // (The coroutine fixed pump runs inside Physics.Advance, before each step's FixedTick.)
         Physics.Advance(delta, FixedTickScenes);
 
-        // Network tick (plan §8.2): pump the transport once per frame so the loopback host stays live.
-        // No-op when Offline (no GameMode / no host). The full IterateIncoming → NetworkTick → reconcile
-        // → IterateOutgoing bracket lands with replication (P2+); P0 just keeps the socket drained.
-        Network.Manager?.Tick();
+        // Network: drain the transport ONCE per frame (the socket pump, plan §8.2 IterateIncoming/
+        // Outgoing). No-op when Offline. The per-TICK network work (input capture, NetworkTick, the
+        // asymmetric down-state flush) does NOT live here — it runs inside the fixed-step loop above
+        // (FixedTickScenes → Network.PredictTick), bound to the existing 60 Hz accumulator (L2: one
+        // fixed tick = the network clock, no second clock). Running it per-frame would tie the net tick
+        // to render rate — the exact desync L2 exists to prevent.
+        Network.Manager?.PollTransport();
 
         // Pump coroutines/async continuations BEFORE the scene Tick so a resume scheduled last frame
         // (and any await DelaySeconds that elapses this frame) runs with this frame's state, ahead of
@@ -204,6 +207,13 @@ public class SceneManager {
     static readonly Action<float> FixedTickScenes = step => {
         foreach (Scene scene in instance.activeScenes)
             scene.FixedUpdate(in step);
+
+        // The network prediction tick (plan §8.2) runs ONCE per fixed step, BEFORE the physics step that
+        // follows it in Physics.Advance — the canonical bracket "NetworkTick (sample input, predict, sim)
+        // → physics step". Bound to the existing 60 Hz accumulator (L2). No-op when Offline. The owner
+        // captures input + predicts here; the server drives state-authority NetworkTicks; the asymmetric
+        // down-state flush lands on the send boundary (the divisor cadence).
+        Network.Manager?.PredictTick(step);
     };
 
     // Enter play mode: snapshot the current (edit-mode) scene, then run component lifecycle.

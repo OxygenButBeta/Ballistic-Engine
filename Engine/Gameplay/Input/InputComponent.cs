@@ -1,6 +1,7 @@
 using System.Numerics;
 using BallisticEngine.InputSystem;
 using BallisticEngine.Gameplay.Input;
+using BallisticEngine.Networking;
 
 namespace BallisticEngine;
 
@@ -67,6 +68,45 @@ public sealed class InputComponent {
             k.Evaluate(source, enabled);
     }
 
+    // ---- per-TICK capture AS DATA (plan §7.5 — the prediction substrate, P5a) ----------------------
+    // Snapshot the CURRENT bound input into a NetworkInput at the fixed-tick cadence — the data form of
+    // the same input the events fire on. The developer never calls this (they only see events); the
+    // framework (PlayerController's fixed-tick prediction step) calls it to buffer + (P5b) replay + send
+    // up. There is no TryGetInput exposed — this is internal plumbing, not API surface.
+    //
+    // Move = the FIRST subscribed Axis2D action's composed value (the canonical movement axis — WASD /
+    // left stick). Buttons = a bitfield where each subscribed Button action occupies one bit in
+    // SUBSCRIPTION ORDER (stable within a session; assigned once at SetupInput). The trigger is NOT
+    // resolved here (a Hold/Tap edge is event semantics, not per-tick state) — a button bit is simply
+    // "active this tick", which is what a deterministic NetworkTick re-simulates against. seq stamps the
+    // current LocalTick. Allocation-free, no reflection (the standing hot-path rule).
+    public NetworkInput Capture(uint seq) {
+        bool enabled = source.Enabled;
+        Vector2 move = Vector2.Zero;
+        uint buttons = 0;
+        int bit = 0;
+
+        foreach (ActionSub sub in actions) {
+            switch (sub.ValueType) {
+                case InputValueType.Axis2D:
+                    if (move == Vector2.Zero)   // first Axis2D wins as the movement axis
+                        move = enabled ? sub.SampleAxis2(source) : Vector2.Zero;
+                    break;
+                case InputValueType.Button:
+                    if (bit < 32) {
+                        if (enabled && sub.SampleButtonActive(source))
+                            buttons |= 1u << bit;
+                        bit++;
+                    }
+                    break;
+                // Axis1D is not part of the P5a movement substrate (triggers/scroll are cosmetic-rate);
+                // folded in later if a predicted action needs it.
+            }
+        }
+
+        return new NetworkInput(seq, move, buttons);
+    }
+
     bool Validate(InputAction action, InputValueType expected, string method) {
         if (action is null) {
             Debugging.LogError($"InputComponent.{method}: action is null.");
@@ -96,6 +136,16 @@ public sealed class InputComponent {
             this.callback = callback;
             this.explicitPhase = explicitPhase;
         }
+
+        // The action's value shape — lets Capture() pick the movement axis vs button bits without a
+        // device read (subscription-time metadata, no per-tick reflection).
+        public InputValueType ValueType => action.Value;
+
+        // Read-only per-tick samples for Capture() (the data form, §7.5). These do NOT mutate the
+        // edge/hold state EvaluateButton tracks — they are pure current-state reads, so calling Capture
+        // alongside Sample never disturbs trigger resolution.
+        public System.Numerics.Vector2 SampleAxis2(IInputSource source) => InputEval.Axis2(action, source);
+        public bool SampleButtonActive(IInputSource source) => InputEval.ButtonActive(action, source);
 
         public void Evaluate(IInputSource source, bool enabled, in float delta) {
             switch (action.Value) {
