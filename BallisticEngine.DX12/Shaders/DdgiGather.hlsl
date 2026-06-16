@@ -30,6 +30,7 @@ Texture2D<float4> Normal    : register(t1);   // primary-surface world normal pa
 Texture2D<float4> Albedo    : register(t2);   // G-buffer RT0 (albedo.rgb + specF0.a)
 Texture2D<float4> IrrAtlas  : register(t3);
 Texture2D<float2> DepthAtlas : register(t4);
+StructuredBuffer<float4> ProbeState : register(t5);   // P2.4: per-probe (relocation offset.xyz, active)
 RWTexture2D<float4> Output  : register(u0);   // ssgiTarget (pre-exposed GI)
 SamplerState LinearClamp : register(s0);
 
@@ -65,9 +66,14 @@ float2 ProbeAtlasUv(uint px, uint py, uint pz, float3 dir, uint texels, float2 a
     return texelXY / atlasSize;
 }
 
-// Probe world position (matches DdgiTrace ProbeWorldPos).
+// Flat probe index (matches DdgiTrace ProbeWorldPos / blend Locate flatten).
+uint ProbeIndex(uint px, uint py, uint pz) {
+    return (pz * (uint)ProbeDims.y + py) * (uint)ProbeDims.x + px;
+}
+// Probe world position + the P2.4 relocation offset (matches DdgiTrace ProbeWorldPos).
 float3 ProbeWorldPos(uint px, uint py, uint pz) {
-    return OriginSpacingX.xyz + float3(px * OriginSpacingX.w, py * SpacingYZ.x, pz * SpacingYZ.y);
+    float3 basePos = OriginSpacingX.xyz + float3(px * OriginSpacingX.w, py * SpacingYZ.x, pz * SpacingYZ.y);
+    return basePos + ProbeState[ProbeIndex(px, py, pz)].xyz;
 }
 
 [numthreads(8, 8, 1)]
@@ -110,6 +116,10 @@ void CSGather(uint3 dtid : SV_DispatchThreadID) {
         int3 c = baseCoord + off;
         if (any(c < 0) || any(c >= dims)) continue;
         uint cx = (uint)c.x, cy = (uint)c.y, cz = (uint)c.z;
+
+        // P2.4: skip probes classified INACTIVE (buried in geometry → garbage field). The remaining cell
+        // probes still light the point; the trilinear renormalizes by sumW.
+        if (ProbeState[ProbeIndex(cx, cy, cz)].w < 0.5) continue;
 
         float3 probePos = ProbeWorldPos(cx, cy, cz);
         float3 toProbe = probePos - biasPos;   // biasPos: shared origin for cell pick + Chebyshev (RTXGI)

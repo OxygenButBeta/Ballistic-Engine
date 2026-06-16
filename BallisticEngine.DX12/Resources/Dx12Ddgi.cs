@@ -87,7 +87,9 @@ public sealed class Dx12Ddgi : IDisposable {
     ID3D12RootSignature blendRootSig;
     ID3D12PipelineState blendIrrPso, blendDepthPso;
     ID3D12PipelineState borderIrrPso, borderDepthPso;   // P2.2 octahedral border-wrap (same root sig as blend)
-    Dx12DescriptorHeap blendHeap;       // 2 UAVs: [0]=irradiance (u0), [1]=depth (u1)
+    ID3D12PipelineState classifyPso;    // P2.4 probe classification + relocation (same root sig as blend)
+    Dx12DescriptorHeap blendHeap;       // 3 UAVs: [0]=irradiance (u0), [1]=depth (u1), [2]=ProbeState (u2)
+    ID3D12Resource probeState;          // P2.4: ProbeCount float4 {relocation offset.xyz, active}
 
     // P2.2 GATHER pass (DdgiGather.hlsl): per-pixel, reads G-buffer + the two atlases → albedo*E into
     // ssgiTarget. Self-contained heap (5 SRVs depth/normal/albedo/irrAtlas/depthAtlas + 1 UAV ssgiTarget),
@@ -171,6 +173,7 @@ public sealed class Dx12Ddgi : IDisposable {
         var t_mat = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(5, 0), ShaderVisibility.All);
         var t_inst = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(6, 0), ShaderVisibility.All);
         var t_light = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All);
+        var t_probe = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(8, 0), ShaderVisibility.All);  // t8 ProbeState (P2.4)
         var t_uav = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(0, 0), ShaderVisibility.All);  // u0 RayData
         var clampSamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
@@ -185,7 +188,7 @@ public sealed class Dx12Ddgi : IDisposable {
         traceRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { t_cbv0, t_cbv1, t_table, t_mat, t_inst, t_light, t_uav },
+                new[] { t_cbv0, t_cbv1, t_table, t_mat, t_inst, t_light, t_probe, t_uav },
                 new[] { clampSamp, wrapSamp })));
 
         string traceHlsl = EmbeddedShaderSource.ReadHlsl("DdgiTrace.hlsl");
@@ -193,12 +196,13 @@ public sealed class Dx12Ddgi : IDisposable {
         tracePso = dev.Device.CreateComputePipelineState(
             new ComputePipelineStateDescription { RootSignature = traceRootSig, ComputeShader = traceCs });
 
-        // --- BLEND root sig: CBV b0, root SRV t0 RayData, table covering BOTH UAVs (u0 irr + u1 depth) so one
-        // root sig serves both entry points. The table base is blendHeap slot 0, so u0→heap[0]=irr,
-        // u1→heap[1]=depth; CSIrradiance writes only u0, CSDepth only u1 (each ignores the other). ---
+        // --- BLEND root sig: CBV b0, root SRV t0 RayData, table covering 3 UAVs (u0 irr + u1 depth + u2
+        // ProbeState) so ONE root sig serves all blend-family entry points. Table base = blendHeap slot 0, so
+        // u0→heap[0]=irr, u1→heap[1]=depth, u2→heap[2]=ProbeState; each shader writes only its own register
+        // (CSIrradiance u0, CSDepth u1, CSClassify u2; CSBorder* read+write u0/u1). ---
         var b_cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
         var b_srv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.All);  // t0 RayData
-        var b_uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 2, baseShaderRegister: 0);  // u0 irr + u1 depth
+        var b_uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 3, baseShaderRegister: 0);  // u0 irr + u1 depth + u2 ProbeState
         var b_table = new RootParameter1(new RootDescriptorTable1(b_uavRange), ShaderVisibility.All);
         blendRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(RootSignatureFlags.None, new[] { b_cbv, b_srv, b_table })));
@@ -208,6 +212,7 @@ public sealed class Dx12Ddgi : IDisposable {
         byte[] depCs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, blendHlsl, "CSDepth", "DdgiBlend.hlsl");
         byte[] borIrrCs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, blendHlsl, "CSBorderIrr", "DdgiBlend.hlsl");
         byte[] borDepCs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, blendHlsl, "CSBorderDepth", "DdgiBlend.hlsl");
+        byte[] classifyCs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, blendHlsl, "CSClassify", "DdgiBlend.hlsl");
         blendIrrPso = dev.Device.CreateComputePipelineState(
             new ComputePipelineStateDescription { RootSignature = blendRootSig, ComputeShader = irrCs });
         blendDepthPso = dev.Device.CreateComputePipelineState(
@@ -216,28 +221,40 @@ public sealed class Dx12Ddgi : IDisposable {
             new ComputePipelineStateDescription { RootSignature = blendRootSig, ComputeShader = borIrrCs });
         borderDepthPso = dev.Device.CreateComputePipelineState(
             new ComputePipelineStateDescription { RootSignature = blendRootSig, ComputeShader = borDepCs });
+        classifyPso = dev.Device.CreateComputePipelineState(
+            new ComputePipelineStateDescription { RootSignature = blendRootSig, ComputeShader = classifyCs });
 
         // blendHeap: 2 persistent UAV descriptors for the two atlases (irradiance@slot0 = u0, depth@slot1 = u1)
         // laid out CONTIGUOUSLY so the blend root sig's 2-descriptor table (base = slot 0) maps u0→irr,
         // u1→depth for BOTH entry points. CSIrradiance writes only u0; CSDepth writes only u1.
         blendHeap = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true);
         dev.Device.CreateUnorderedAccessView(irradianceTex, null, new UnorderedAccessViewDescription {
             Format = Format.R16G16B16A16_Float, ViewDimension = UnorderedAccessViewDimension.Texture2D,
         }, blendHeap.Cpu(0));
         dev.Device.CreateUnorderedAccessView(depthTex, null, new UnorderedAccessViewDescription {
             Format = Format.R16G16_Float, ViewDimension = UnorderedAccessViewDimension.Texture2D,
         }, blendHeap.Cpu(1));
+        // P2.4 ProbeState UAV (u2, blendHeap slot 2): ProbeCount float4 {offset.xyz, active}, seeded active=1
+        // so all probes light correctly BEFORE the first classify pass runs.
+        var probeSeed = new Vector4[ProbeCount];
+        for (int i = 0; i < ProbeCount; i++) probeSeed[i] = new Vector4(0, 0, 0, 1);
+        probeState = dev.CreateUavBuffer<Vector4>(probeSeed, ResourceStates.UnorderedAccess);
+        dev.Device.CreateUnorderedAccessView(probeState, null, new UnorderedAccessViewDescription {
+            Format = Format.Unknown, ViewDimension = UnorderedAccessViewDimension.Buffer,
+            Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = ProbeCount, StructureByteStride = 16 },
+        }, blendHeap.Cpu(2));
 
         int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<DdgiConstants>() + 255) & ~255;
         constCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         constCbMapped = constCb.Map<byte>(0);
 
-        // --- P2.2 GATHER root sig: CBV b0 (grid) + CBV b1 (extra) + table {t0..t4 SRV, u0 UAV} + linear-clamp. ---
+        // --- P2.2/P2.4 GATHER root sig: CBV b0 (grid) + CBV b1 (extra) + table {t0..t5 SRV, u0 UAV} +
+        // linear-clamp. t5 = ProbeState (P2.4 relocation offset + active flag). ---
         var g_cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
         var g_cbv1 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.All);
-        var g_srv = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 5, baseShaderRegister: 0);
+        var g_srv = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 6, baseShaderRegister: 0);   // t0..t5
         var g_uav = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);
         var g_table = new RootParameter1(new RootDescriptorTable1(g_srv, g_uav), ShaderVisibility.All);
         var g_samp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) {
@@ -252,7 +269,7 @@ public sealed class Dx12Ddgi : IDisposable {
         gatherPso = dev.Device.CreateComputePipelineState(
             new ComputePipelineStateDescription { RootSignature = gatherRootSig, ComputeShader = gatherCs });
         gatherHeap = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 6, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 7, shaderVisible: true);  // 6 SRV + 1 UAV
         int gcbSize = (System.Runtime.InteropServices.Marshal.SizeOf<DdgiGatherExtra>() + 255) & ~255;
         gatherCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)gcbSize), ResourceStates.GenericRead);
@@ -281,6 +298,9 @@ public sealed class Dx12Ddgi : IDisposable {
         // P2.3 multi-bounce: the trace reads the irradiance atlas (t4) → SRV state for the trace dispatch.
         if (fb)
             cl.ResourceBarrierTransition(irradianceTex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+        // P2.4: the trace reads ProbeState (t8, last frame's classification) as a root SRV → NonPixelSRV state;
+        // the classify pass writes it back as a UAV at the end of this command list.
+        cl.ResourceBarrierTransition(probeState, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
 
         // --- TRACE: ProbeCount*RaysPerProbe threads, 64/group. RayData UAV starts in UnorderedAccess. ---
         cl.SetComputeRootSignature(traceRootSig);
@@ -291,13 +311,16 @@ public sealed class Dx12Ddgi : IDisposable {
         cl.SetComputeRootShaderResourceView(3, materialsAddr);            // t5 GpuMaterials
         cl.SetComputeRootShaderResourceView(4, instancesAddr);           // t6 RtInstance[]
         cl.SetComputeRootShaderResourceView(5, lightsAddr);             // t7 Lights
-        cl.SetComputeRootUnorderedAccessView(6, rayData.GPUVirtualAddress);  // u0 RayData
+        cl.SetComputeRootShaderResourceView(6, probeState.GPUVirtualAddress);  // t8 ProbeState (P2.4)
+        cl.SetComputeRootUnorderedAccessView(7, rayData.GPUVirtualAddress);  // u0 RayData
         int totalThreads = ProbeCount * RaysPerProbe;
         cl.Dispatch((uint)((totalThreads + 63) / 64), 1, 1);
 
         // Trace done reading the irradiance atlas → back to UnorderedAccess for the blend write below.
         if (fb)
             cl.ResourceBarrierTransition(irradianceTex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+        // Trace done reading ProbeState → back to UnorderedAccess for the classify write at the end.
+        cl.ResourceBarrierTransition(probeState, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
 
         // RayData write → read barrier before blend.
         cl.ResourceBarrierUnorderedAccessView(rayData);
@@ -334,6 +357,14 @@ public sealed class Dx12Ddgi : IDisposable {
 
         cl.ResourceBarrierUnorderedAccessView(irradianceTex);
         cl.ResourceBarrierUnorderedAccessView(depthTex);
+
+        // --- P2.4 CLASSIFY (1 thread/probe): reduce RayData → ProbeState (active + relocation offset). Same
+        // blend root sig + heap (t0 RayData still NonPixelSRV, u2 ProbeState in UnorderedAccess). The 3-UAV
+        // table is already bound at blendHeap.Gpu(0); CSClassify writes only u2. ---
+        cl.SetPipelineState(classifyPso);
+        cl.Dispatch((uint)((ProbeCount + 63) / 64), 1, 1);
+        cl.ResourceBarrierUnorderedAccessView(probeState);
+
         // Restore the bindless heap for whatever the caller does next (it bound bindless before us).
         cl.SetDescriptorHeaps(bindless.Heap);
         cl.ResourceBarrierTransition(rayData, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
@@ -353,7 +384,8 @@ public sealed class Dx12Ddgi : IDisposable {
             InvViewProj = invViewProjTransposed,
             GParams = new Vector4(preExposure, screenW, screenH, 0f),
         };
-        // Build the gather heap: t0 depth, t1 normal, t2 albedo, t3 irrAtlas, t4 depthAtlas, u0 ssgiTarget.
+        // Build the gather heap: t0 depth, t1 normal, t2 albedo, t3 irrAtlas, t4 depthAtlas, t5 ProbeState,
+        // u0 ssgiTarget (slot 6).
         gatherHeap.Reset();
         dev.Device.CopyDescriptorsSimple(1, gatherHeap.Cpu(0), depthSrv, heapType);
         dev.Device.CopyDescriptorsSimple(1, gatherHeap.Cpu(1), normalSrv, heapType);
@@ -368,12 +400,18 @@ public sealed class Dx12Ddgi : IDisposable {
             Shader4ComponentMapping = ShaderComponentMapping.Default,
             Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
         }, gatherHeap.Cpu(4));
+        dev.Device.CreateShaderResourceView(probeState, new ShaderResourceViewDescription {   // t5 ProbeState
+            Format = Format.Unknown, ViewDimension = ShaderResourceViewDimension.Buffer,
+            Shader4ComponentMapping = ShaderComponentMapping.Default,
+            Buffer = new BufferShaderResourceView { FirstElement = 0, NumElements = ProbeCount, StructureByteStride = 16 },
+        }, gatherHeap.Cpu(5));
         dev.Device.CreateUnorderedAccessView(ssgiTargetRes, null, new UnorderedAccessViewDescription {
             Format = Format.R16G16B16A16_Float, ViewDimension = UnorderedAccessViewDimension.Texture2D,
-        }, gatherHeap.Cpu(5));
+        }, gatherHeap.Cpu(6));
 
         cl.ResourceBarrierTransition(irradianceTex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
         cl.ResourceBarrierTransition(depthTex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+        cl.ResourceBarrierTransition(probeState, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
         cl.SetDescriptorHeaps(gatherHeap.Heap);
         cl.SetComputeRootSignature(gatherRootSig);
         cl.SetPipelineState(gatherPso);
@@ -383,6 +421,7 @@ public sealed class Dx12Ddgi : IDisposable {
         cl.Dispatch((uint)((screenW + 7) / 8), (uint)((screenH + 7) / 8), 1);
         cl.ResourceBarrierTransition(irradianceTex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
         cl.ResourceBarrierTransition(depthTex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+        cl.ResourceBarrierTransition(probeState, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
     }
 
     // DEBUG (BALLISTIC_DX12_DDGI_DEBUG=1): read the irradiance atlas back to the CPU and report min/max/mean +
@@ -443,6 +482,8 @@ public sealed class Dx12Ddgi : IDisposable {
         blendDepthPso?.Dispose(); blendDepthPso = null;
         borderIrrPso?.Dispose(); borderIrrPso = null;
         borderDepthPso?.Dispose(); borderDepthPso = null;
+        classifyPso?.Dispose(); classifyPso = null;
+        probeState?.Dispose(); probeState = null;
         blendRootSig?.Dispose(); blendRootSig = null;
         blendHeap?.Dispose(); blendHeap = null;
         gatherPso?.Dispose(); gatherPso = null;

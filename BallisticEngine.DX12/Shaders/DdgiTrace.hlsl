@@ -44,6 +44,7 @@ struct GpuLight { float4 PosRange; float4 Color; float4 DirCosOuter; float4 Extr
 StructuredBuffer<GpuMaterial> GpuMaterials : register(t5);
 StructuredBuffer<RtInstance>  RtInstances  : register(t6);
 StructuredBuffer<GpuLight>    Lights       : register(t7);
+StructuredBuffer<float4>      ProbeState   : register(t8);  // P2.4: per-probe (relocation offset.xyz, active)
 
 static const float PI = 3.14159265359;
 
@@ -69,12 +70,13 @@ float Hash1(uint s) {
     return float(s & 0x7fffffffu) / float(0x7fffffff);
 }
 
-// Probe (px,py,pz) world position from the flat probe index.
+// Probe (px,py,pz) world position from the flat probe index, + the P2.4 relocation offset.
 float3 ProbeWorldPos(uint probe) {
     uint px = probe % (uint)ProbeDims.x;
     uint py = (probe / (uint)ProbeDims.x) % (uint)ProbeDims.y;
     uint pz = probe / ((uint)ProbeDims.x * (uint)ProbeDims.y);
-    return OriginSpacingX.xyz + float3(px * OriginSpacingX.w, py * SpacingYZ.x, pz * SpacingYZ.y);
+    float3 basePos = OriginSpacingX.xyz + float3(px * OriginSpacingX.w, py * SpacingYZ.x, pz * SpacingYZ.y);
+    return basePos + ProbeState[probe].xyz;
 }
 
 // Inline visibility ray (shadow). 1 lit / 0 occluded.
@@ -125,7 +127,9 @@ float2 TraceOctEncode(float3 dir) {
     return uv * 0.5 + 0.5;
 }
 float3 ProbePos(uint px, uint py, uint pz) {
-    return OriginSpacingX.xyz + float3(px * OriginSpacingX.w, py * SpacingYZ.x, pz * SpacingYZ.y);
+    float3 basePos = OriginSpacingX.xyz + float3(px * OriginSpacingX.w, py * SpacingYZ.x, pz * SpacingYZ.y);
+    uint probe = (pz * (uint)ProbeDims.y + py) * (uint)ProbeDims.x + px;   // matches ProbeWorldPos flatten
+    return basePos + ProbeState[probe].xyz;
 }
 float3 SampleIrradianceField(float3 worldPos, float3 N) {
     float3 spacing = float3(OriginSpacingX.w, SpacingYZ.x, SpacingYZ.y);
@@ -160,7 +164,11 @@ float3 SampleIrradianceField(float3 worldPos, float3 N) {
 }
 
 // Shade a committed RayQuery hit in world space (mirrors DxrGi.hlsl ClosestHit). Returns radiance (RAW HDR).
-float3 ShadeHit(RayQuery<RAY_FLAG_FORCE_OPAQUE> q, float3 rayDir) {
+// `backface` (out) = the ray hit the SOLID/back side (the probe is on the buried side) — derived from the
+// geometric normal vs the ray, NOT from DXR CommittedTriangleFrontFace (that uses the fixed spec winding,
+// which is INVERTED vs this engine's RH/CCW-from-front convention — DXR has no projection winding flip). The
+// same two-sided dot test used everywhere in DxrGi/DDGI, so it's convention-independent.
+float3 ShadeHit(RayQuery<RAY_FLAG_FORCE_OPAQUE> q, float3 rayDir, out bool backface) {
     uint instId = q.CommittedInstanceID();
     uint prim = q.CommittedPrimitiveIndex();
     float2 bc2 = q.CommittedTriangleBarycentrics();
@@ -175,7 +183,8 @@ float3 ShadeHit(RayQuery<RAY_FLAG_FORCE_OPAQUE> q, float3 rayDir) {
     uint i0 = indices[prim * 3 + 0], i1 = indices[prim * 3 + 1], i2 = indices[prim * 3 + 2];
     float3 nObj = normalize(normals[i0] * bary.x + normals[i1] * bary.y + normals[i2] * bary.z);
     float3 Ng = normalize(mul((float3x3)q.CommittedObjectToWorld3x4(), nObj));
-    if (dot(Ng, rayDir) > 0.0) Ng = -Ng;   // two-sided
+    backface = dot(Ng, rayDir) > 0.0;      // ray hit the solid/back side → probe is buried on this ray
+    if (backface) Ng = -Ng;                // two-sided: face the incoming ray for shading
     float2 uv = uvs[i0] * bary.x + uvs[i1] * bary.y + uvs[i2] * bary.z;
 
     GpuMaterial m = GpuMaterials[triMat[prim]];
@@ -237,8 +246,14 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
 
     float3 radiance; float dist;
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
-        radiance = ShadeHit(q, dir);
-        dist = q.CommittedRayT();
+        // P2.4 classification signal: a BACKFACE hit (ray left the probe through the SOLID side of a surface)
+        // means the probe is (partly) buried in geometry. ShadeHit reports it from dot(geometricNormal,rayDir)
+        // — convention-independent, NOT DXR CommittedTriangleFrontFace (inverted vs this engine's winding).
+        // Encode it as a NEGATIVE distance so the classify pass counts backfaces per probe (CSDepth abs()'s it
+        // for the moments). Front/sky hits keep a positive distance.
+        bool backface;
+        radiance = ShadeHit(q, dir, backface);
+        dist = backface ? -max(q.CommittedRayT(), 1e-4) : q.CommittedRayT();
     } else {
         radiance = Irradiance.SampleLevel(LinearClamp, dir, 0).rgb;   // sky
         dist = Params1.x;                                              // far (open)

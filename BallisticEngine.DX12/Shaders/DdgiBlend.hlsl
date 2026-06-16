@@ -19,6 +19,7 @@ cbuffer DdgiConstants : register(b0) {
 StructuredBuffer<float4> RayData : register(t0);   // [probe * RaysPerProbe + ray] = (radiance, dist)
 RWTexture2D<float4> IrradianceAtlas : register(u0);   // CSIrradiance target
 RWTexture2D<float2> DepthAtlas      : register(u1);   // CSDepth target (distinct register; one bound per pass)
+RWStructuredBuffer<float4> ProbeState : register(u2); // CSClassify target: xyz = relocation offset (world), w = active(1/0)
 
 static const float PI = 3.14159265359;
 static const uint RAYS_PER_PROBE = 144u;
@@ -124,7 +125,9 @@ void CSDepth(uint3 dtid : SV_DispatchThreadID) {
         float3 rayDir = SphericalFibonacci(r, RAYS_PER_PROBE, jitter);
         float w = pow(max(dot(texelDir, rayDir), 0.0), 50.0);   // sharpened: depth wants the near-axis rays
         if (w <= 0.0) continue;
-        float dist = min(RayData[info.probe * RAYS_PER_PROBE + r].a, Params1.x);
+        // abs(): P2.4 encodes backface hits as a NEGATIVE distance for classification; the depth MOMENTS need
+        // the geometric (unsigned) distance.
+        float dist = min(abs(RayData[info.probe * RAYS_PER_PROBE + r].a), Params1.x);
         sum += float2(dist, dist * dist) * w;
         wsum += w;
     }
@@ -183,3 +186,59 @@ void CSBorderIrr(uint3 dtid : SV_DispatchThreadID) { BorderCopy(dtid.xy, IRR_TEX
 
 [numthreads(8, 8, 1)]
 void CSBorderDepth(uint3 dtid : SV_DispatchThreadID) { BorderCopy(dtid.xy, DEPTH_TEXELS, true); }
+
+// --- P2.4 CLASSIFICATION + RELOCATION (1 thread per probe). Reduce over the probe's rays:
+//   * BACKFACE ratio (rays that hit the solid side, encoded as negative distance by the trace): a probe with
+//     >30% backfaces is buried in geometry → mark INACTIVE (the gather skips it; the field around it stays
+//     valid because the other 7 cell probes still contribute). This kills the dead-probe darkening + leak.
+//   * RELOCATION offset: push the probe AWAY from near front-face hits (toward open space) + away from the
+//     mean backface direction, clamped to +-40% of the cell so the probe never crosses into a neighbour cell
+//     (RTXGI ProbeRelocation). The offset is RELATIVE to the base grid position; trace/gather add it.
+// Writes ProbeState[probe] = (offset.xyz, active). The offset is SMOOTHED toward the previous frame's so it
+// doesn't jitter (temporal stability) — except the active flag, which is set fresh each frame.
+[numthreads(64, 1, 1)]
+void CSClassify(uint3 dtid : SV_DispatchThreadID) {
+    uint probe = dtid.x;
+    if (probe >= (uint)ProbeDims.w) return;
+
+    float jitter = Hash1(probe * 31u + (uint)Params0.w * 2654435761u);
+    float3 spacing = float3(OriginSpacingX.w, SpacingYZ.x, SpacingYZ.y);
+    float cell = min(spacing.x, min(spacing.y, spacing.z));
+    float nearThresh = cell * 0.5;          // a front face this close = the probe is cramped, push off it
+
+    uint backfaces = 0, hits = 0;
+    float3 push = 0.0.xxx;
+    [loop] for (uint r = 0; r < RAYS_PER_PROBE; r++) {
+        float3 dir = SphericalFibonacci(r, RAYS_PER_PROBE, jitter);
+        float d = RayData[probe * RAYS_PER_PROBE + r].a;
+        if (abs(d) >= Params1.x) continue;   // sky / far miss = open, no contribution to classification
+        hits++;
+        if (d < 0.0) {                        // backface hit → push strongly toward where the geometry ISN'T
+            backfaces++;
+            push -= dir * 1.0;                // away from the buried side
+        } else if (d < nearThresh) {          // near front face → gentle push away
+            push -= dir * (1.0 - d / nearThresh) * 0.5;
+        }
+    }
+
+    float backRatio = hits > 0u ? float(backfaces) / float(hits) : 0.0;
+    float active = backRatio > 0.30 ? 0.0 : 1.0;
+
+    // Scale the push into world units, clamp to +-40% of the cell. Zero it for inactive probes (no point
+    // relocating a buried probe — it's skipped anyway, and a fresh trace next frame may re-classify it active).
+    float3 offset = 0.0.xxx;
+    if (active > 0.5 && hits > 0u) {
+        offset = (push / float(hits)) * cell;            // mean push, scaled by cell size
+        float maxOff = 0.40 * cell;
+        float len = length(offset);
+        if (len > maxOff) offset *= maxOff / max(len, 1e-5);
+    }
+    offset = SanitizeIrr(offset);
+
+    // Temporal smoothing of the offset (not the active flag) so it converges instead of jittering frame to
+    // frame. Frame 0 hard-sets.
+    float4 prev = ProbeState[probe];
+    float3 prevOff = SanitizeIrr(prev.xyz);
+    float3 smoothed = (Params0.w < 0.5) ? offset : lerp(offset, prevOff, 0.9);
+    ProbeState[probe] = float4(smoothed, active);
+}
