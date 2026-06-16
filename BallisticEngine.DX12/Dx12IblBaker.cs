@@ -13,7 +13,9 @@ namespace BallisticEngine.DX12;
 //
 // Re-bakes only when the sun/atmosphere params change (a hash stamp), so a static scene pays once.
 public sealed class Dx12IblBaker : IDisposable {
-    const int EnvRes = 128;
+    const int EnvRes = 256;   // raw HDR sky cube; also the background source (DrawProcSky samples it instead
+                              // of marching per-pixel), so it's bumped 128→256 to keep the sun disk / stars
+                              // crisp. Re-baked only on param change, so the larger faces are nearly free.
     const int IrradianceRes = 32;
     const int PrefilterRes = 128;
     const int PrefilterMips = 5;
@@ -45,6 +47,10 @@ public sealed class Dx12IblBaker : IDisposable {
 
     int paramStamp = -1;
     public bool HasBaked { get; private set; }
+    // Raw HDR sky-radiance env cube (full SkyRadiance: atmosphere + clouds + cirrus + stars + sun disk).
+    // DrawProcSky samples THIS as the far-plane background — one cube fetch per pixel instead of marching
+    // the atmosphere/clouds anew for every screen pixel.
+    public CpuDescriptorHandle EnvSrv => envCube.SrvCpu;
     public CpuDescriptorHandle IrradianceSrv => irradianceCube.SrvCpu;
     public CpuDescriptorHandle PrefilterSrv => prefilterCube.SrvCpu;
     public CpuDescriptorHandle BrdfSrv => Dx12Backend.SrvStore.Cpu(brdfSrvIndex);
