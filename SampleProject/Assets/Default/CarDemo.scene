@@ -1,0 +1,113 @@
+version: 1
+name: Scene
+sceneComponents: []
+entities:
+- id: 362ce5ee44d943e586b4cd730433ffa5
+  name: Ground
+  isActive: true
+  tag: 
+  layer: 0
+  prefabSource: 
+  transform:
+    position: {x: 0, y: 0, z: 0}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 1, y: 1, z: 1}
+    parent: 
+  components:
+  - type: BoxCollider
+    id: c2a0d8375ca74e128b270c0f2a5eb018
+    enabled: true
+    members:
+      size: {x: 200, y: 1, z: 200}
+- id: 705c34c9062a44c78848c4c26ad33455
+  name: Car
+  isActive: true
+  tag: 
+  layer: 0
+  prefabSource: 
+  transform:
+    position: {x: 0, y: 2, z: 0}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 1, y: 1, z: 1}
+    parent: 
+  components:
+  - type: Rigidbody
+    id: cd3bea26aeca4f76b003ec8bddb5fa59
+    enabled: true
+    members:
+      mass: 800
+  - type: BoxCollider
+    id: 529869623d9f4374bdfe0e73aa7b8912
+    enabled: true
+    members:
+      size: {x: 2, y: 0.6, z: 4}
+  - type: VehicleController
+    id: 3f1fce99be5a4e4c866dbe42c2172456
+    enabled: true
+    members:
+      motorForce: 6000
+      maxSpeed: 20
+- id: 0c9306babb344538b20e5a00f3d42c49
+  name: WheelFL
+  isActive: true
+  tag: 
+  layer: 0
+  prefabSource: 
+  transform:
+    position: {x: -1, y: -0.3, z: 1.5}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 1, y: 1, z: 1}
+    parent: 705c34c9062a44c78848c4c26ad33455
+  components:
+  - type: WheelCollider
+    id: 35dd0ed084a9456299b63ca5c1700cb8
+    enabled: true
+    members: {}
+- id: 45c4dcaf88ef4207a0b14ad2399a9cb5
+  name: WheelFR
+  isActive: true
+  tag: 
+  layer: 0
+  prefabSource: 
+  transform:
+    position: {x: 1, y: -0.3, z: 1.5}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 1, y: 1, z: 1}
+    parent: 705c34c9062a44c78848c4c26ad33455
+  components:
+  - type: WheelCollider
+    id: 2a79b01b0d9d4635ab81304c49931d0c
+    enabled: true
+    members: {}
+- id: c8c13986008b4068a18969134a2c8eb5
+  name: WheelRL
+  isActive: true
+  tag: 
+  layer: 0
+  prefabSource: 
+  transform:
+    position: {x: -1, y: -0.3, z: -1.5}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 1, y: 1, z: 1}
+    parent: 705c34c9062a44c78848c4c26ad33455
+  components:
+  - type: WheelCollider
+    id: 8e686083ad9e4e2b8d30f8f997f80cf2
+    enabled: true
+    members: {}
+- id: a58b0f5d6d5c4eca9723aed72f656d8e
+  name: WheelRR
+  isActive: true
+  tag: 
+  layer: 0
+  prefabSource: 
+  transform:
+    position: {x: 1, y: -0.3, z: -1.5}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 1, y: 1, z: 1}
+    parent: 705c34c9062a44c78848c4c26ad33455
+  components:
+  - type: WheelCollider
+    id: e5571404053b4532b4f32026710dec7d
+    enabled: true
+    members: {}
