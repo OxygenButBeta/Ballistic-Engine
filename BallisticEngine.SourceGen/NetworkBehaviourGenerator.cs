@@ -139,6 +139,7 @@ public sealed class NetworkBehaviourGenerator : IIncrementalGenerator {
 
         EmitBaseline(sb, t);
         EmitSerialize(sb, t);
+        EmitSerializeFull(sb, t);
         EmitDeserialize(sb, t);
         EmitCaptureBaseline(sb, t);
         EmitRegistration(sb, t, typeId, layoutHash, rpcMethodIds);
@@ -178,6 +179,21 @@ public sealed class NetworkBehaviourGenerator : IIncrementalGenerator {
         sb.AppendLine();
     }
 
+    static void EmitSerializeFull(StringBuilder sb, NetTarget t) {
+        // A FULL snapshot: the changemask is all-set, every field written. DeserializeState reads it back
+        // identically (it just sees every mask bit set). This is the spawn / late-join baseline path.
+        sb.AppendLine("        public override void SerializeFullState(BitWriter __w) {");
+        if (t.Fields.Count == 0) { sb.AppendLine("        }"); sb.AppendLine(); return; }
+        uint fullMask = t.Fields.Count == 32 ? 0xFFFFFFFFu : (1u << t.Fields.Count) - 1u;
+        sb.AppendLine($"            __w.WriteBits({fullMask}u, {t.Fields.Count});");
+        for (int i = 0; i < t.Fields.Count; i++) {
+            NetField f = t.Fields[i];
+            sb.AppendLine($"            {WriteCall(f, $"this.{f.Name}")};");
+        }
+        sb.AppendLine("        }");
+        sb.AppendLine();
+    }
+
     static void EmitDeserialize(StringBuilder sb, NetTarget t) {
         sb.AppendLine("        public override void DeserializeState(ref BitReader __r) {");
         if (t.Fields.Count == 0) { sb.AppendLine("        }"); sb.AppendLine(); return; }
@@ -212,7 +228,11 @@ public sealed class NetworkBehaviourGenerator : IIncrementalGenerator {
         sb.AppendLine("        [ModuleInitializer]");
         sb.AppendLine($"        internal static void __NetRegister() {{");
         sb.AppendLine($"            BallisticEngine.NetworkReplicationRegistry.Register(");
-        sb.AppendLine($"                new BallisticEngine.NetworkTypeDescriptor({typeId}, {layoutHash}, \"{t.FullName}\", {rpcArray}));");
+        sb.AppendLine($"                new BallisticEngine.NetworkTypeDescriptor({typeId}, {layoutHash}, \"{t.FullName}\", {rpcArray},");
+        // The concrete type builds the client-side mirror (P3 spawn replication) via Entity.AddComponent
+        // (Type). The generator knows the type at codegen, so the spawn path resolves it without a reflection
+        // SCAN (one typeof). The Type handle is a script-ALC root dropped by ClearForReload like the rest.
+        sb.AppendLine($"                    typeof({t.FullName})));");
         sb.AppendLine("        }");
     }
 

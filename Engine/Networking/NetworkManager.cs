@@ -74,11 +74,147 @@ public sealed class NetworkManager {
         Transport.OnReceived = OnPayload;
     }
 
-    // P0 stubs — the loopback path needs no per-event logic yet (no remote peers, no wire state).
-    // P3 fills these (a real client connecting triggers GameMode.OnPlayerJoined, etc.).
-    void OnPeerConnected(Connection c) { }
-    void OnPeerDisconnected(Connection c) { }
-    void OnPayload(Connection source, ReadOnlySpan<byte> payload, Channel channel) { }
+    // ---- connection registry (P3) -----------------------------------------------------------------
+    // The server's list of connected clients (who to send snapshots/spawns to). On a host the local
+    // client is NOT here (it shares the process — no wire send to self). A pure client has only the
+    // server, addressed implicitly by Send to its single peer.
+    readonly List<Connection> clients = new();
+    public IReadOnlyList<Connection> Clients => clients;
+
+    // The client-side MIRROR table (P3): netId -> the locally-built proxy object, so an incoming Snapshot
+    // can find the object to apply state to, and a Despawn can tear it down. Distinct from `objects`
+    // (which on the server is the authoritative set; on a pure client it IS the mirror set — a client
+    // registers each mirror into `objects` too so NetworkRef resolves locally).
+    // P3 over the wire fires OnPlayerJoined for a real connecting client (the §6 join flow = Phase 1).
+    public Action<Connection> OnPlayerJoined { get; set; }
+
+    // Raised when the handshake layout-digest mismatches (gate 0c) — a peer on a drifted build. The host
+    // surfaces this as an explicit error instead of a silent desync (§8.6.1).
+    public Action<Connection> OnLayoutMismatch { get; set; }
+
+    void OnPeerConnected(Connection c) {
+        if (IsServer) {
+            // A client connected. Register it; the §6 join flow (GameMode.OnPlayerJoined = Phase 1 for a
+            // late joiner) runs once the handshake validates — we wait for the client's Handshake message
+            // so a drifted peer never reaches spawn. (The client sends Handshake immediately on connect.)
+            if (!clients.Contains(c))
+                clients.Add(c);
+        }
+        else {
+            // Client connected to the server — send our layout digest so the server can reject drift.
+            Transport.Send(c, NetworkWire.Handshake(NetworkWire.LayoutDigest()), Channel.Reliable);
+        }
+    }
+
+    void OnPeerDisconnected(Connection c) {
+        clients.Remove(c);
+        // P7 (ConnectionToken reconnect) keeps the pawn alive on a TTL; P3 just drops the registration.
+    }
+
+    void OnPayload(Connection source, ReadOnlySpan<byte> payload, Channel channel) {
+        byte tag = NetworkWire.ReadTag(payload);
+        var r = new BitReader(payload);
+        r.ReadByte();   // consume the tag
+        switch ((NetMessage)tag) {
+            case NetMessage.Handshake:   HandleHandshake(source, ref r); break;
+            case NetMessage.HandshakeOk: HandleHandshakeOk(source, ref r); break;
+            case NetMessage.Spawn:       HandleSpawn(ref r); break;
+            case NetMessage.Despawn:     HandleDespawn(ref r); break;
+            case NetMessage.Snapshot:    HandleSnapshot(ref r); break;
+        }
+    }
+
+    // SERVER: validate the client's layout digest (gate 0c). Match -> accept + run the §6 join flow;
+    // mismatch -> explicit error, do NOT spawn (a silent desync is exactly what the guard prevents).
+    void HandleHandshake(Connection source, ref BitReader r) {
+        int clientDigest = r.ReadInt();
+        if (clientDigest != NetworkWire.LayoutDigest()) {
+            Debugging.LogError(
+                $"Network: {source} rejected — [Networked] layout digest mismatch (drifted build). " +
+                "A coordinated reload (all peers on the same build) is required (plan §8.6.1).");
+            OnLayoutMismatch?.Invoke(source);
+            return;
+        }
+        Transport.Send(source, NetworkWire.HandshakeOk(source.Id), Channel.Reliable);
+        // The client passed the drift check — replicate every already-spawned object to it (late-join
+        // baseline, the P6 path in miniature: a full Spawn per live object), then fire the join flow.
+        foreach (NetworkObject obj in objects.All())
+            SendSpawnTo(source, obj);
+        OnPlayerJoined?.Invoke(source);
+    }
+
+    // CLIENT: the server accepted us; adopt the connection id it assigned (our LocalConnection).
+    void HandleHandshakeOk(Connection source, ref BitReader r) {
+        int assignedId = r.ReadInt();
+        LocalConnection = new Connection(assignedId);
+    }
+
+    // CLIENT: build a mirror of a server-spawned object (typeId -> factory, no reflection). Owner +
+    // authority resolve per the §4d.1 truth-table from THIS machine's view, so the owner sees an
+    // AutonomousProxy and a watcher a SimulatedProxy (plan §6).
+    void HandleSpawn(ref BitReader r) {
+        int netId = r.ReadInt();
+        int typeId = r.ReadInt();
+        int ownerId = r.ReadInt();
+        if (!NetworkReplicationRegistry.TryGet(typeId, out NetworkTypeDescriptor desc) || desc.ComponentType is null) {
+            Debugging.LogError($"Network: spawn for unknown typeId {typeId} — no client type registered.");
+            return;
+        }
+        Entity entity = Entity.Instantiate($"Net#{netId}");
+        var mirror = (NetworkBehaviour)entity.AddComponent(desc.ComponentType);
+        NetworkObject netObj = entity.GetComponent<NetworkObject>() ?? entity.AddComponent<NetworkObject>();
+
+        var owner = new Connection(ownerId);
+        netObj.Owner = owner;
+        netObj.Authority = ResolveAuthority(Topology, LocalConnection, owner);
+        netObj.IsSpawned = true;
+        netObj.NetId = netId;
+        objects.AddWithId(netId, netObj);   // register under the SERVER's netId so snapshots address it
+
+        // Apply the full baseline that rode with the spawn, then drive the net strand (OnSpawned, §8.5).
+        mirror.DeserializeState(ref r);
+        mirror.CaptureNetworkBaseline();
+        DriveNetSpawnStrand(netObj.Entity);
+    }
+
+    void HandleDespawn(ref BitReader r) {
+        int netId = r.ReadInt();
+        NetworkObject obj = objects.Resolve(netId);
+        if (obj is null)
+            return;
+        foreach (Behaviour b in obj.Entity.Behaviours.ToArray())
+            if (b is NetworkBehaviour nb)
+                nb.DriveNetDespawn();
+        objects.Remove(netId);
+        obj.IsSpawned = false;
+        SceneManager.GetCurrentScene()?.DestroyEntity(obj.Entity);
+    }
+
+    // CLIENT: apply a delta-snapshot batch — for each [netId, typeId, delta] find the mirror and apply.
+    void HandleSnapshot(ref BitReader r) {
+        while (!r.AtEnd && r.BitLength - r.BitPos >= 64) {   // at least netId+typeId remain
+            int netId = r.ReadInt();
+            int typeId = r.ReadInt();
+            NetworkObject obj = objects.Resolve(netId);
+            NetworkBehaviour target = FindNetworkBehaviour(obj, typeId);
+            if (target is null) {
+                // Unknown object (spawn not yet received / already despawned) — we cannot skip a
+                // variable-length field block safely, so stop parsing this batch (snapshots are
+                // Unreliable + latest-wins, so a dropped batch self-heals next send).
+                break;
+            }
+            target.DeserializeState(ref r);
+        }
+    }
+
+    static NetworkBehaviour FindNetworkBehaviour(NetworkObject obj, int typeId) {
+        if (obj?.Entity is null)
+            return null;
+        foreach (Behaviour b in obj.Entity.Behaviours.ToArray())
+            if (b is NetworkBehaviour nb && nb.HasNetworkedState && nb.NetworkTypeId == typeId)
+                return nb;
+        return null;
+    }
 
     // ---- the tick seam (plan §8.2) ----------------------------------------------------------------
     // The ASYMMETRIC send-rate clock (§8.2 / §14 item 3): simulate at the fixed 60 Hz step but flush
@@ -121,10 +257,17 @@ public sealed class NetworkManager {
     }
 
     // Serialize every spawned, state-carrying object's DELTA snapshot (changemask + changed fields vs its
-    // captured baseline, §11) into one payload, then re-baseline. P2 over loopback: build + measure + (in
-    // a host) apply locally is a no-op since server==client; the real cross-peer apply is P3. Returns the
-    // packed payload so the harness can assert size/cadence. CaptureNetworkBaseline runs AFTER the write so
-    // the next tick diffs against what we just sent (the last-ack model; true ack tracking is P3/P6).
+    // captured baseline, §11) into one payload, then re-baseline. P3 frames this behind a Snapshot tag and
+    // sends it Unreliable to every client. CaptureNetworkBaseline runs AFTER the write so the next send
+    // diffs against what we just sent.
+    //
+    // P3 SCOPE BOUNDARY (the ONE global-baseline limitation, by design): the baseline is per-OBJECT and
+    // GLOBAL, not per-client. A late joiner gets a FULL spawn snapshot (SendSpawnTo) at join, then rides
+    // the shared delta stream — correct for a single observer (proven in %TEMP%\bal-net-twoproc). With
+    // MULTIPLE clients joining at different times, a per-CLIENT ack baseline is needed so each gets exactly
+    // the deltas since ITS last ack — that is explicitly P6 (late-join baseline, §13). P3 demonstrates the
+    // wire path; P6 makes the baseline per-client. Documented so a future session doesn't mistake the
+    // global baseline for a bug.
     BitWriter snapshotWriter = new();
 
     public ReadOnlySpan<byte> SerializeStateSnapshot() {
@@ -150,12 +293,48 @@ public sealed class NetworkManager {
     public int LastSnapshotObjectCount { get; private set; }
 
     void FlushStateDown() {
-        ReadOnlySpan<byte> snapshot = SerializeStateSnapshot();
         StateSnapshotsSent++;
-        // P3: Transport.Send(client, snapshot, Channel.Unreliable) to each observer. P2 (loopback host):
-        // server and client are the same process, so there is nothing to send to — the snapshot is built
-        // and measured (proving the cadence + the format), and the down-apply is exercised in the harness.
-        _ = snapshot;
+        if (clients.Count == 0)
+            return;   // no remote observers (a loopback host shares the process — nothing to send to self)
+
+        // Frame the delta batch behind a Snapshot tag and send it Unreliable (latest-wins, §12.1) to every
+        // observing client. SerializeStateSnapshot re-baselines as it writes, so the NEXT flush deltas
+        // against what we just sent (the last-ack model; per-client ack tracking is P6).
+        ReadOnlySpan<byte> batch = SerializeStateSnapshot();
+        if (LastSnapshotObjectCount == 0)
+            return;   // nothing dirty this send — skip the packet entirely
+        byte[] framed = new byte[batch.Length + 1];
+        framed[0] = (byte)NetMessage.Snapshot;
+        batch.CopyTo(framed.AsSpan(1));
+        foreach (Connection c in clients)
+            Transport.Send(c, framed, Channel.Unreliable);
+    }
+
+    // Send a full Spawn of one object to one client (the join-baseline + each new spawn). Reliable —
+    // a missed spawn means the client never builds the mirror. Walks the entity's NetworkBehaviours and
+    // sends a Spawn per state-carrying component (P3: one component per object is the common case).
+    void SendSpawnTo(Connection client, NetworkObject obj) {
+        if (obj?.Entity is null)
+            return;
+        foreach (Behaviour b in obj.Entity.Behaviours.ToArray())
+            if (b is NetworkBehaviour nb && nb.HasNetworkedState)
+                Transport.Send(client, NetworkWire.Spawn(obj.NetId, nb.NetworkTypeId, obj.Owner.Id, nb),
+                    Channel.Reliable);
+    }
+
+    // Broadcast a spawn to every connected client (called from the server spawn path).
+    void BroadcastSpawn(NetworkObject obj) {
+        foreach (Connection c in clients)
+            SendSpawnTo(c, obj);
+    }
+
+    // Broadcast a despawn (Reliable) so every client tears its mirror down.
+    void BroadcastDespawn(int netId) {
+        if (clients.Count == 0)
+            return;
+        byte[] msg = NetworkWire.Despawn(netId);
+        foreach (Connection c in clients)
+            Transport.Send(c, msg, Channel.Reliable);
     }
 
     // ---- server-authoritative spawn (plan §6 / §8.5) ----------------------------------------------
@@ -191,6 +370,15 @@ public sealed class NetworkManager {
         // any Unity strand. The caller (phase runner / Network.Spawn runtime path) handles the Unity
         // strand afterward with the suppression dance.
         DriveNetSpawnStrand(netObj.Entity);
+
+        // Replicate the spawn to every connected client (P3): a full Spawn so each builds the mirror
+        // (owner->AutonomousProxy, others->SimulatedProxy per the §4d.1 table, resolved on each machine).
+        // The Spawn carries a FULL snapshot; capture the baseline right after so the next delta-snapshot
+        // diffs against it. A loopback host has no remote clients, so this is a no-op there (SP path).
+        BroadcastSpawn(netObj);
+        foreach (Behaviour b in netObj.Entity.Behaviours.ToArray())
+            if (b is NetworkBehaviour { HasNetworkedState: true } nb)
+                nb.CaptureNetworkBaseline();
         return netObj;
     }
 
@@ -231,10 +419,12 @@ public sealed class NetworkManager {
     public void Despawn(NetworkObject netObj) {
         if (netObj is null || !netObj.IsSpawned)
             return;
+        int netId = netObj.NetId;
+        BroadcastDespawn(netId);   // tell clients FIRST (while NetId is still valid) to tear the mirror down
         foreach (Behaviour b in netObj.Entity.Behaviours.ToArray())
             if (b is NetworkBehaviour nb)
                 nb.DriveNetDespawn();
-        objects.Remove(netObj.NetId);   // bumps the slot generation -> stale NetworkRefs null out
+        objects.Remove(netId);   // bumps the slot generation -> stale NetworkRefs null out
         netObj.IsSpawned = false;
         netObj.NetId = 0;
         netObj.Authority = NetworkAuthority.None;

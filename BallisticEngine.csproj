@@ -27,6 +27,11 @@
     <ItemGroup>
       <PackageReference Include="AssimpNet" Version="4.1.0" />
       <PackageReference Include="BepuPhysics" Version="2.4.0" />
+      <!-- The networking transport (plan §12.1). Pure-managed, MIT, no native build — quarantined to
+           Networking/LiteNetLib/ exactly like BepuPhysics is quarantined to Physics/Bepu (the ONLY
+           folder allowed to reference it; grep-auditable per CLAUDE.md layering). API pinned + proven
+           over a real localhost socket in %TEMP%\bal-litenetlib-test before integration. -->
+      <PackageReference Include="LiteNetLib" Version="2.1.4" />
       <PackageReference Include="Magick.NET-Q16-HDRI-AnyCPU" Version="14.14.0" />
       <PackageReference Include="NVorbis" Version="0.10.5" />
       <PackageReference Include="OpenTK" Version="4.9.4" />

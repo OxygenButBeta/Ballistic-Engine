@@ -42,18 +42,23 @@ public static class NetworkReplicationRegistry {
 
 // The per-type wire descriptor the generator fills (plan §11). RPC dispatch is the (typeId, methodId) →
 // invoke table (P2 generates the table/stubs; the wire transport for RPCs is P4). The replication side is
-// the layout hash for the handshake guard (gate 0c). No Type/delegate cached against the script-ALC
-// beyond what ClearForReload drops.
+// the layout hash for the handshake guard (gate 0c). The Factory builds a client-side MIRROR of a spawned
+// object from its typeId (P3 spawn replication) — a `() => new T()` the generator emits (it knows the
+// concrete type), so there is NO reflection on the spawn path. The delegate IS a script-ALC root, so it
+// is dropped by ClearForReload like everything else here.
 public readonly struct NetworkTypeDescriptor {
     public readonly int TypeId;        // FNV of the full type name — the wire typeId
     public readonly int LayoutHash;    // FNV of the [Networked] field layout — the handshake drift guard
     public readonly string TypeName;   // for diagnostics / the editor net badge (not on the wire)
     public readonly int[] RpcMethodIds; // the (typeId, methodId) dispatch keys this type declares (P4 wire)
+    public readonly Type ComponentType;  // the concrete NetworkBehaviour type — builds the client mirror (P3)
 
-    public NetworkTypeDescriptor(int typeId, int layoutHash, string typeName, int[] rpcMethodIds) {
+    public NetworkTypeDescriptor(int typeId, int layoutHash, string typeName, int[] rpcMethodIds,
+        Type componentType = null) {
         TypeId = typeId;
         LayoutHash = layoutHash;
         TypeName = typeName;
         RpcMethodIds = rpcMethodIds ?? Array.Empty<int>();
+        ComponentType = componentType;
     }
 }

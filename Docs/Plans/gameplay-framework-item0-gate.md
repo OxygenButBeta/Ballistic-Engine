@@ -1,8 +1,8 @@
 # Gameplay Framework — ITEM 0 GATE (mechanism + proof)
 
-**Status:** GATE ✅ (f71d9b9d) + **P0 ✅** (f06d831a) + **P1 ✅** (b855239a) + **P2 ✅ IMPLEMENTED &
-VERIFIED.** The mechanism this doc settled is ported into the engine and proven against shipped code, now
-through P2 (source generator + `[Networked]` bit-packed delta state + asymmetric send-rate).
+**Status:** GATE ✅ (f71d9b9d) + **P0 ✅** (f06d831a) + **P1 ✅** (b855239a) + **P2 ✅** (9a9e0ef5) +
+**P3 ✅ IMPLEMENTED & VERIFIED.** The mechanism this doc settled is ported into the engine and proven
+against shipped code, now through P3 (LiteNetLib transport — real socket, two processes, state on the wire).
 
 **Verify — in-engine headless harness `%TEMP%\bal-gameplay-test` (GameplayP0.csproj, ProjectReference to the
 engine; drives the REAL Behaviour.FireEnable / GamePhaseRunner / Network.Spawn / authority resolution):
@@ -31,10 +31,29 @@ engine; drives the REAL Behaviour.FireEnable / GamePhaseRunner / Network.Spawn /
   modeled (`InputUpStream`) so P5 can't inherit a conflated rate. Gate-0c extended: the replication registry
   is the 2nd host-side root, cleared in `ReloadGameScripts` alongside `InputRegistry`.
 
+- **P3**: LiteNetLib transport (§12.1) — the real socket. `LiteNetLibTransport : ITransport` in
+  `Networking/LiteNetLib/`, quarantined exactly like `Physics/Bepu` (the ONLY file referencing the
+  LiteNetLib NuGet, which sits on the engine csproj alongside BepuPhysics). The 2.1.4 API was PINNED +
+  proven over a localhost socket in an ISOLATED harness `%TEMP%\bal-litenetlib-test` BEFORE the impl (repo
+  discipline). `NetworkManager`'s P0 stubs became a real wire protocol (`NetworkWire`): a 1-byte-tagged
+  frame (Handshake/Spawn/Despawn/Snapshot) inside the transport's opaque payload. The connect **handshake
+  carries the layout digest** (gate 0c — the P2 `NetworkLayoutHash` finally rides the wire; a drifted peer
+  is rejected with an explicit error, not a silent desync, §8.6.1). Server `Spawn` broadcasts a **full**
+  snapshot (the generated `SerializeFullState` — a delta would be empty at spawn since live==baseline) so
+  the client builds a **mirror** via the typeId→Type factory (registered by the generator, no reflection
+  scan); authority resolves per-machine via the §4d.1 table (owner→AutonomousProxy, watcher→SimulatedProxy).
+  `FlushStateDown` sends the delta snapshot batch Unreliable to every client at the send-rate; `Despawn`
+  broadcasts Reliable. **Verify: a REAL TWO-PROCESS test (`%TEMP%\bal-net-twoproc`) — server + client as
+  separate OS processes over a localhost socket — a `[Networked] int` crosses the wire as BOTH the spawn
+  baseline (137) AND a mid-stream delta snapshot (200).** P3 scope boundary: the delta baseline is global
+  per-object (correct for a single observer); a per-CLIENT ack baseline for staggered multi-client joins is
+  explicitly P6 (late-join, §13) — documented in `SerializeStateSnapshot`, not a bug.
+
 `bal schema` confirms the registry auto-discovers every framework type (§10 free discovery). Full slnx builds 0
-errors. **The P2 wire format was proven byte-for-byte in an ISOLATED harness `%TEMP%\bal-netserde-test`
-(repo discipline) BEFORE engine integration**, then re-proven against the REAL generated code in the in-engine
-harness. **NEXT = P3** (LiteNetLib transport — two processes; state crosses the wire under the packet budget).
+errors. Each phase's wire format was proven in an ISOLATED `%TEMP%\bal-*-test` harness BEFORE engine
+integration (P2 serializer / P3 transport), then re-proven against the real engine. **NEXT = P4**
+(`[Rpc(To.X)]` reliable/unreliable, owner-gated server RPCs — the dispatch table P2 already generates rides
+the Reliable channel) → then **P5 prediction (the hard multi-week core)**.
 
 ---
 

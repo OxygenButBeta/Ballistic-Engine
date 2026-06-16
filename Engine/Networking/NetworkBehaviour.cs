@@ -76,10 +76,16 @@ public abstract class NetworkBehaviour : Behaviour {
     public virtual int NetworkTypeId => 0;
     public virtual int NetworkLayoutHash => 0;
 
-    // Write the changemask + only-changed [Networked] fields vs the captured baseline (delta, §11). On a
-    // full send (late-join / first snapshot) the generated body treats the baseline as zero so every
-    // field ships. No-op on the base.
+    // Write the changemask + only-changed [Networked] fields vs the captured baseline (delta, §11). No-op
+    // on the base. Use SerializeFullState for a spawn/late-join baseline (every field, no diff).
     public virtual void SerializeState(BitWriter writer) { }
+
+    // Write EVERY [Networked] field unconditionally (a full snapshot, all changemask bits set) — the
+    // spawn / late-join baseline (§8.5: "OnSpawned = baseline delivered atomically"). A delta serialize
+    // here would be wrong: right after spawn the baseline already equals the live state, so the delta
+    // changemask is empty and the mirror would start at field defaults. DeserializeState reads it back
+    // identically (the mask is just all-set). No-op on the base.
+    public virtual void SerializeFullState(BitWriter writer) { }
 
     // Read a changemask + apply only the changed fields (clear bits keep the current value). No-op base.
     public virtual void DeserializeState(ref BitReader reader) { }

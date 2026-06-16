@@ -41,6 +41,26 @@ internal sealed class NetworkObjectRegistry {
         return Pack(slot, s.Generation);
     }
 
+    // Insert at the EXACT netId a remote peer assigned (the client mirror path, P3): the server owns netId
+    // allocation, the client must register its mirror under the SAME (slot, generation) so a Snapshot
+    // addressed by netId resolves locally and a NetworkRef matches across the wire. Grows the slot array
+    // to fit the slot; idempotent if the same identity is already there.
+    public void AddWithId(int netId, NetworkObject obj) {
+        int slot = netId & SlotMask;
+        int generation = Generation(netId);
+        if (slot <= 0)
+            return;
+        while (slot >= slots.Length)
+            Array.Resize(ref slots, slots.Length * 2);
+        if (slot >= highWater)
+            highWater = slot + 1;
+        ref Slot s = ref slots[slot];
+        if (s.Object is null)
+            count++;
+        s.Object = obj;
+        s.Generation = generation == 0 ? 1 : generation;
+    }
+
     // Remove by netId. Bumps the slot's generation so every NetworkRef to the old identity now reads
     // null. The slot is recycled for a future Add (possibly a different object — the generation keeps
     // the two identities distinct, the §8.5.4 pooling invariant).
