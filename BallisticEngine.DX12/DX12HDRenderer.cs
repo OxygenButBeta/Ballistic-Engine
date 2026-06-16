@@ -319,8 +319,12 @@ public sealed class DX12HDRenderer : HDRenderer {
     Dx12DescriptorHeap compositeSrvVisible;  // HDR color + bloom + avg-lum, copied per frame
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct CompositeConstants {
-        public float ExposureMul; public float BloomIntensity; public float AutoExposure; public float LegacyMul;
-        public float Compensation; public float UseAo; public float Tonemap; public float Pad2;
+        public float ExposureMul; public float BloomIntensity; public float AutoExposure; public float LegacyMul;   // row 0
+        public float Compensation; public float UseAo; public float Tonemap; public float Contrast;                 // row 1
+        public float Saturation; public float Sharpen; public float VignetteStrength; public float VignetteRoundness; // row 2
+        public float ChromaticAberration; public float LensDistortion; public float FilmGrain; public float GrainTime; // row 3
+        public Vector3 VignetteColor; public float Pad3;                                                            // row 4
+        public Vector2 ScreenSize; public Vector2 Pad4;                                                             // row 5
     }
 
     // Auto-exposure: a 1×1 R16F target holding the metered exposure EV100 (LumAverage.hlsl).
@@ -3109,6 +3113,15 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         // Tonemap: AgX by default (graceful highlight desaturation, the "less çiğ" look); ACES via the door.
         bool acesTonemap = Environment.GetEnvironmentVariable("BALLISTIC_DX12_TONEMAP") == "aces";
+        // Film grain is time-dependent → frozen (0) under deterministic capture so paused frames stay diffable.
+        float grainTime = DeterministicCapture ? 0f : (ssgiFrame & 1023);
+        // Stylistic grade comes from the volume stack (all neutral by default). BALLISTIC_DX12_GRADE_DEMO=1 is
+        // an A/B door that applies a mild cinematic film look (a sensible starting grade) when no ColorAdjustments
+        // volume is authored — proves the grade chain and shows what a light touch buys.
+        bool gradeDemo = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GRADE_DEMO") == "1";
+        float contrast = gradeDemo ? 1.12f : pf.Contrast;
+        float saturation = gradeDemo ? 1.15f : pf.Saturation;
+        float vignette = gradeDemo ? 0.25f : pf.VignetteStrength;
         *(CompositeConstants*)compositeCbMapped = new CompositeConstants {
             ExposureMul = exposureMul,
             BloomIntensity = bloomOn ? 0.6f : 0f,
@@ -3117,6 +3130,14 @@ public sealed class DX12HDRenderer : HDRenderer {
             Compensation = pf.ExposureCompensation,
             UseAo = ssaoOn ? 1f : 0f,
             Tonemap = acesTonemap ? 1f : 0f,
+            // Stylistic grade (all neutral by default → byte-identical when untouched); ported from the GL composite.
+            Contrast = contrast, Saturation = saturation,
+            Sharpen = pf.Sharpen,
+            VignetteStrength = vignette, VignetteRoundness = pf.VignetteRoundness,
+            VignetteColor = ToNumerics(pf.VignetteColor),
+            ChromaticAberration = pf.ChromaticAberration, LensDistortion = pf.LensDistortion,
+            FilmGrain = DeterministicCapture ? 0f : pf.FilmGrain, GrainTime = grainTime,
+            ScreenSize = new Vector2(outputW, outputH),
         };
 
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(0), hdr.ColorSrvCpu, heapType);

@@ -9,14 +9,32 @@
 //     into the multiplier with the same formula, so the EV dials/limits in the Exposure volume drive DX12.
 
 cbuffer CompositeConstants : register(b0) {
+    // row 0
     float ExposureMul;    // resolved multiplier for Manual/Fixed (and the legacy manual override)
     float BloomIntensity; // 0 = no bloom
     float AutoExposure;   // > 0.5 = derive the multiplier from the metered-EV target (Automatic mode)
     float LegacyMul;      // PostProcessSettings.Exposure (raw manual multiplier on top of EV; 1 = untouched)
+    // row 1
     float Compensation;   // exposure compensation in stops (Automatic mode applies it on top of the metered EV)
     float UseAo;          // > 0.5 = multiply by the SSAO texture
     float Tonemap;        // 0 = AgX (default), 1 = ACES (BALLISTIC_DX12_TONEMAP=aces A/B door)
-    float _pad2;
+    float Contrast;       // 1 = neutral; midtone contrast around 0.5
+    // row 2
+    float Saturation;     // 1 = neutral
+    float Sharpen;        // 0 = off; unsharp-mask strength
+    float VignetteStrength; // 0 = off
+    float VignetteRoundness; // 1 = circular, 0 = frame-aspect oval
+    // row 3
+    float ChromaticAberration; // 0 = off; lateral RGB split toward the edge
+    float LensDistortion;      // 0 = off; barrel(+)/pincushion(-)
+    float FilmGrain;           // 0 = off (display-referred)
+    float GrainTime;           // animates the grain (0 under deterministic capture)
+    // row 4
+    float3 VignetteColor;      // colour the edges fade toward (usually black)
+    float _pad3;
+    // row 5
+    float2 ScreenSize;         // output pixel size (CA / vignette / grain / sharpen)
+    float2 _pad4;
 };
 
 Texture2D HdrColor : register(t0);
@@ -89,25 +107,87 @@ float3 LinearToSrgb(float3 c) {
                   c.z < 0.0031308 ? lo.z : hi.z);
 }
 
-float4 PSMain(VSOut i) : SV_Target {
-    float3 hdr = HdrColor.SampleLevel(LinearClamp, i.Uv, 0).rgb;
-    if (UseAo > 0.5) {
-        float ao = AoTex.SampleLevel(LinearClamp, i.Uv, 0).r;
-        hdr *= ao;   // forward-path approximation: dim the lit color by AO (before bloom adds glow)
-    }
-    if (BloomIntensity > 0.0)
-        hdr += BloomTex.SampleLevel(LinearClamp, i.Uv, 0).rgb * BloomIntensity;
-
-    // Exposure multiplier: resolved CPU-side for Manual/Fixed; from the metered EV100 for Automatic.
-    float exposure = ExposureMul;
+// Resolve the per-frame exposure multiplier once (same for every sample — Automatic reads a 1×1 EV).
+float ResolveExposure() {
     if (AutoExposure > 0.5) {
         float ev = MeteredEv.SampleLevel(LinearClamp, float2(0.5, 0.5), 0).r;
-        exposure = LegacyMul / (1.2 * exp2(ev - Compensation));   // == PostProcessSettings.ExposureMultiplier
+        return LegacyMul / (1.2 * exp2(ev - Compensation));   // == PostProcessSettings.ExposureMultiplier
     }
-    float3 exposed = max(hdr * exposure, 0.0);   // tonemappers want non-negative input (AgX log2, ACES)
+    return ExposureMul;
+}
 
-    // AgX (default) desaturates highlights toward white — far less "çiğ" than ACES on saturated sky/sun.
-    // ACES stays available via BALLISTIC_DX12_TONEMAP=aces for A/B.
-    float3 mapped = (Tonemap > 0.5) ? ACESFilm(exposed) : AgX(exposed);
-    return float4(LinearToSrgb(mapped), 1.0);    // exact piecewise sRGB OETF for the UNORM backbuffer/BMP
+// HDR → exposed → tonemapped color (still LINEAR, pre-sRGB) at a UV. The sharpen/CA passes call this for
+// NEIGHBOUR pixels so every grade sample is post-tonemap — never mix raw HDR with tonemapped (NaN gotcha).
+float3 ToneMapAt(float2 uv, float exposure) {
+    float3 hdr = HdrColor.SampleLevel(LinearClamp, uv, 0).rgb;
+    if (UseAo > 0.5)
+        hdr *= AoTex.SampleLevel(LinearClamp, uv, 0).r;   // forward AO approximation (before bloom glow)
+    if (BloomIntensity > 0.0)
+        hdr += BloomTex.SampleLevel(LinearClamp, uv, 0).rgb * BloomIntensity;
+    float3 exposed = max(hdr * exposure, 0.0);            // tonemappers want non-negative input
+    return (Tonemap > 0.5) ? ACESFilm(exposed) : AgX(exposed);
+}
+
+// Barrel(+)/pincushion(-) lens distortion: warp the sample UV around the centre.
+float2 DistortUv(float2 uv) {
+    if (abs(LensDistortion) < 1e-4) return uv;
+    float2 c = uv - 0.5;
+    float r2 = dot(c, c);
+    return 0.5 + c * (1.0 + LensDistortion * r2);
+}
+
+float Hash(float2 p) { return frac(sin(dot(p, float2(12.9898, 78.233))) * 43758.5453); }
+
+float4 PSMain(VSOut i) : SV_Target {
+    float exposure = ResolveExposure();
+    float2 uv = DistortUv(i.Uv);
+
+    // Tonemapped colour, with optional lateral chromatic aberration (per-channel UV split toward the edge).
+    float3 color;
+    if (ChromaticAberration > 1e-4) {
+        float2 dir = (uv - 0.5);
+        float2 off = dir * (ChromaticAberration * 0.004);   // grows with distance from centre
+        color.r = ToneMapAt(clamp(uv + off, 0.0, 1.0), exposure).r;
+        color.g = ToneMapAt(uv, exposure).g;
+        color.b = ToneMapAt(clamp(uv - off, 0.0, 1.0), exposure).b;
+    } else {
+        color = ToneMapAt(uv, exposure);
+    }
+
+    // Sharpening: unsharp mask on TONEMAPPED neighbours (4-tap cross). Never on raw HDR (NaN around the sun).
+    if (Sharpen > 1e-4) {
+        float2 px = 1.0 / max(ScreenSize, 1.0);
+        float3 blur = ToneMapAt(uv + float2(px.x, 0), exposure) + ToneMapAt(uv - float2(px.x, 0), exposure)
+                    + ToneMapAt(uv + float2(0, px.y), exposure) + ToneMapAt(uv - float2(0, px.y), exposure);
+        blur *= 0.25;
+        color = color + (color - blur) * Sharpen;
+    }
+
+    // Contrast around mid-grey (pivot 0.5, not a black-crushing power) + saturation around luma.
+    if (abs(Contrast - 1.0) > 1e-4)
+        color = lerp((0.5).xxx, color, Contrast);
+    if (abs(Saturation - 1.0) > 1e-4) {
+        float luma = dot(color, float3(0.2126, 0.7152, 0.0722));
+        color = lerp(luma.xxx, color, Saturation);
+    }
+    color = max(color, 0.0);
+
+    // Vignette: radial darken toward VignetteColor, aspect-aware roundness (1 = circular, 0 = frame oval).
+    if (VignetteStrength > 1e-4) {
+        float2 c = i.Uv - 0.5;
+        float aspect = ScreenSize.x / max(ScreenSize.y, 1.0);
+        c.x *= lerp(aspect, 1.0, VignetteRoundness);
+        float v = smoothstep(0.8, 0.35, length(c) * 1.2);
+        color = lerp(VignetteColor, color, lerp(1.0, v, VignetteStrength));
+    }
+
+    float3 srgb = LinearToSrgb(color);    // exact piecewise sRGB OETF for the UNORM backbuffer/BMP
+
+    // Film grain: display-referred (added AFTER sRGB so its amplitude is perceptually uniform, not exploding
+    // in shadows). Frozen to 0 under deterministic capture (GrainTime=0 → static, FilmGrain=0).
+    if (FilmGrain > 1e-4) {
+        float n = Hash(i.Uv * ScreenSize + GrainTime) - 0.5;
+        srgb += n * FilmGrain;
+    }
+    return float4(saturate(srgb), 1.0);
 }
