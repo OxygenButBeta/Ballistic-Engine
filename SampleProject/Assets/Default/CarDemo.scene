@@ -75,7 +75,7 @@ entities:
   layer: 0
   prefabSource: 
   transform:
-    position: {x: 0, y: 4.4430246, z: 0}
+    position: {x: -15, y: 2.2, z: -15}
     rotation: {x: 0, y: 0, z: 0, w: 1}
     scale: {x: 1, y: 1, z: 1}
     parent: 

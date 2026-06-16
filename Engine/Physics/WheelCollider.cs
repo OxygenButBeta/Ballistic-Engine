@@ -23,7 +23,7 @@ public class WheelCollider : Behaviour {
     [Header("Suspension")]
     [Tooltip("How far the suspension can extend below the mount, in metres.")]
     [Range(0.01f, 1f)]
-    public float SuspensionTravel { get; set; } = 0.3f;
+    public float SuspensionTravel { get; set; } = 0.45f;
 
     [Tooltip("Spring stiffness holding the chassis up (N per metre of compression). Higher = stiffer ride; " +
              "lower = more visible squat/dive/roll (the GTA-sport default has a little body movement). " +

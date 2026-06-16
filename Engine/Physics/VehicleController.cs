@@ -27,7 +27,7 @@ public class VehicleController : Behaviour {
     [Tooltip("Peak engine pull (m/s² at the torque sweet-spot, full throttle). The gearbox shapes how " +
              "this is delivered across the rev range; higher = punchier overall.")]
     [Range(1f, 80f)]
-    public float EnginePower { get; set; } = 26f;
+    public float EnginePower { get; set; } = 34f;
 
     [Tooltip("Top forward speed (m/s).")]
     [Range(1f, 120f)]
@@ -342,38 +342,43 @@ public class VehicleController : Behaviour {
         if (handbrake)
             accel = MathF.Max(accel, HandbrakeDecel);
 
-        float newSigned = Mathf.MoveTowards(signedSpeed, targetSpeed, accel * dt);
+        // --- Drive along the car's OWN body axes (not the averaged ground normal). The car's forward
+        // pitches up/down with the terrain (the suspension tilts the chassis to the slope), so driving
+        // along it naturally climbs a hill — and because the basis is the car's own stable orientation, it
+        // does NOT jitter on bumpy ground the way a per-step averaged ground normal does (which made the
+        // car bog down and crawl on the terrain). carForward = drive axis, carRight = grip axis.
+        Vector3 carFwd = chassisT.Forward;
+        Vector3 carRight = chassisT.Right;
 
-        // The drive direction = the heading, projected onto the GROUND PLANE so it points up/down the
-        // slope (so the car climbs a ramp instead of pushing flat into it). On flat ground this is just
-        // the heading. Reverse flips it.
-        Vector3 driveDirH = headingDir * (newSigned >= 0f ? 1f : -1f);
-        Vector3 slopeDir = driveDirH - groundNormal * Vector3.Dot(driveDirH, groundNormal);
-        slopeDir = slopeDir.LengthSquared() > 1e-6f ? slopeDir.Normalized() : driveDirH;
+        float forwardVel = Vector3.Dot(vel, carFwd);
+        float rightVel = Vector3.Dot(vel, carRight);
 
-        // The in-plane direction perpendicular to the drive (the "sideways" the tyres resist).
-        Vector3 sideDir = Vector3.Cross(groundNormal, slopeDir);
-        sideDir = sideDir.LengthSquared() > 1e-6f ? sideDir.Normalized() : Vector3.Zero;
+        // FORWARD = a real engine FORCE (not a velocity set). A velocity-targeting force is self-limiting:
+        // against a kerb/step it reaches the target speed in the air-gap, the obstacle eats it, and there's
+        // no sustained push to climb over — that's why the car bogged and couldn't get up small steps. A
+        // constant force keeps pushing into the obstacle until the car climbs it (GTA-style), and is still
+        // naturally speed-limited because `accel` tapers to 0 near top speed (gearbox) and reverses sign
+        // when overspeed. We also brake/coast via the same signed force toward the target.
+        float driveAccel;
+        if (MathF.Abs(targetSpeed) < 0.01f) {
+            // Coast / brake: decelerate the forward velocity toward 0 at `accel` (capped so it can't add
+            // reverse motion this step).
+            driveAccel = -MathF.Sign(forwardVel) * MathF.Min(accel, MathF.Abs(forwardVel) / dt);
+        } else if (forwardVel * MathF.Sign(targetSpeed) > MathF.Abs(targetSpeed)) {
+            // Over the target speed in the drive direction: ease back down (engine/redline limit).
+            driveAccel = MathF.Sign(targetSpeed) * -CoastDecel;
+        } else {
+            // Under target: push toward it with the (gearbox-shaped) acceleration. Full force — this is
+            // what claws the car over kerbs and up slopes.
+            driveAccel = MathF.Sign(targetSpeed) * accel;
+        }
+        chassis.AddForce(carFwd * (driveAccel * chassis.Mass));
 
-        // Decompose the CURRENT velocity into along-slope (forward), sideways, and normal parts. We drive
-        // the forward part toward the target and DAMP the sideways part (grip) — but we do NOT overwrite
-        // the whole vector. That's the key fix: forcing the entire in-plane velocity to a flat-ish target
-        // destroyed the up-the-ramp climbing momentum (the car wedged at the lip and scrubbed to a stop)
-        // and killed the launch arc. Decomposing lets the car climb and fly while still cornering on rails.
-        float forwardVel = Vector3.Dot(vel, slopeDir);
-        float sideVel = Vector3.Dot(vel, sideDir);
-
-        // Forward: accelerate toward the target speed along the slope (newSigned is the eased target).
-        float newForward = newSigned;            // already eased toward the throttle target above
-        // Sideways: bleed it out by grip (handbrake loosens it for a drift). This is the on-rails feel —
-        // it cancels sideways slide without touching the forward/climb or the vertical motion.
+        // GRIP = cancel the sideways (body-right) slip as a velocity change (this part SHOULD be a precise
+        // velocity correction — it's friction, not propulsion). Handbrake loosens it for a drift.
         float grip = handbrake ? Grip * HandbrakeGrip : Grip;
-        float newSide = sideVel * MathF.Exp(-grip * dt);
-
-        // Reassemble: change only the forward + sideways in-plane components; leave the normal component
-        // (gravity, suspension, the launch off a ramp) entirely free so jumps and bumps work.
-        Vector3 deltaV = slopeDir * (newForward - forwardVel) + sideDir * (newSide - sideVel);
-        chassis.AddForce(deltaV * (chassis.Mass / dt));
+        float newRight = rightVel * MathF.Exp(-grip * dt);
+        chassis.AddForce(carRight * ((newRight - rightVel) * chassis.Mass / dt));
     }
 
     // Automatic gearbox. Returns the forward acceleration (m/s²) available THIS step, shaped by the
