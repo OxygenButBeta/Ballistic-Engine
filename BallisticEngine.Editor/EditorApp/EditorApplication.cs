@@ -1580,7 +1580,7 @@ internal sealed class EditorApplication {
 
         if (editorState.Selected is not null)
             gizmo.Draw(editorCamera, editorState.Selected, gizmoMin, gizmoSize,
-                sceneViewHovered && !ColliderHandles.IsInteracting && !TerrainTool.Armed);
+                sceneViewHovered && !ColliderHandles.IsInteracting && !WheelHandles.IsInteracting && !TerrainTool.Armed);
 
         // Click-to-select (Unity-style): a clean left-click in the viewport (no drag) picks the mesh
         // under the cursor. Runs AFTER the gizmo draw so gizmo/collider hover this frame can veto the
@@ -1657,6 +1657,14 @@ internal sealed class EditorApplication {
                         ImGui.GetWindowDrawList(), sceneViewHovered && !gizmo.IsInteracting))
                     MarkSceneDirty();
 
+            // WheelColliders get drag handles for radius + suspension travel (the wheel circle and
+            // travel line they draw are their own OnDrawGizmosSelected). Same hover suppression.
+            foreach (Behaviour behaviour in selected.Behaviours)
+                if (behaviour is WheelCollider wheel &&
+                    WheelHandles.Draw(wheel, editorCamera, imageMin, imageSize,
+                        ImGui.GetWindowDrawList(), sceneViewHovered && !gizmo.IsInteracting && !ColliderHandles.IsInteracting))
+                    MarkSceneDirty();
+
             // Terrain gets a Scene-view sculpt brush, active only while the Inspector arms it. Hover is
             // suppressed while the transform gizmo/collider handles interact so a click can't grab both.
             // Disarm if the selection has no terrain, so a stale Armed flag can't block click-to-select.
@@ -1688,7 +1696,7 @@ internal sealed class EditorApplication {
         // Conditions under which a left-press can START a pick: over the viewport, not flying, and no
         // gizmo/handle interaction is claiming the click this frame.
         bool gizmoBusy = gizmo.IsInteracting || gizmo.IsHovered ||
-                         ColliderHandles.IsInteracting || VertexSnap.Held ||
+                         ColliderHandles.IsInteracting || WheelHandles.IsInteracting || VertexSnap.Held ||
                          TerrainTool.Armed || TerrainTool.IsInteracting;
         bool canStart = sceneViewHovered && !editorInput.RightMouseDown && !gizmoBusy &&
                         !imgui.WantTextInput;

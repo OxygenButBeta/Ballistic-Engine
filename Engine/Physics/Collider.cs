@@ -24,6 +24,14 @@ public abstract class Collider : Behaviour {
 
     IPhysicsBody staticBody; // owned only when this entity has no Rigidbody
 
+    // Last pose the standalone static body was synced to. A mismatch on a fixed step means something
+    // moved the transform during play (gizmo drag, inspector, a script) — the static body is teleported
+    // to follow, so moving a Rigidbody-less collider at runtime actually moves its collision (Unity
+    // parity). Without this the shape stayed at its spawn pose while the visual moved away.
+    Vector3 syncedPosition;
+    Quaternion syncedRotation;
+    bool hasSyncedPose;
+
     public Rigidbody AttachedRigidbody => entity?.GetComponent<Rigidbody>();
 
     // Shape in body-local space with the world scale baked in. May return null (after logging)
@@ -88,14 +96,38 @@ public abstract class Collider : Behaviour {
             CreateStaticBody();
         else
             rigidbody.NotifyColliderChanged();
+
+        if (!RuntimeSet<Collider>.Contains(this))
+            RuntimeSet<Collider>.Add(this); // so Physics.Advance can sync a moved static body
     }
 
     protected internal override void OnDisabled() {
+        RuntimeSet<Collider>.Remove(this);
         DestroyStaticBody();
         AttachedRigidbody?.NotifyColliderChanged();
     }
 
-    protected internal override void OnDetach() => DestroyStaticBody();
+    protected internal override void OnDetach() {
+        RuntimeSet<Collider>.Remove(this);
+        DestroyStaticBody();
+    }
+
+    // Called by Physics.Advance before each fixed step. A standalone static body follows runtime
+    // transform edits (gizmo/inspector/script) by teleporting to the new pose — no-op when this collider
+    // is part of a Rigidbody compound (no staticBody) or when nothing moved (bitwise pose match).
+    internal void SyncStaticBodyToTransform() {
+        if (staticBody is null)
+            return;
+        Vector3 position = transform.WorldPosition;
+        Quaternion rotation = transform.WorldRotation;
+        if (hasSyncedPose && position == syncedPosition && rotation == syncedRotation)
+            return;
+        staticBody.Position = position;
+        staticBody.Rotation = rotation;
+        syncedPosition = position;
+        syncedRotation = rotation;
+        hasSyncedPose = true;
+    }
 
     void CreateStaticBody() {
         if (staticBody is not null || Physics.World is null)
@@ -118,8 +150,12 @@ public abstract class Collider : Behaviour {
         };
 
         staticBody = Physics.World.AddBody(in description);
-        if (staticBody is not null)
+        if (staticBody is not null) {
             staticBody.UserData = this;
+            syncedPosition = transform.WorldPosition;
+            syncedRotation = transform.WorldRotation;
+            hasSyncedPose = true;
+        }
     }
 
     void DestroyStaticBody() {
