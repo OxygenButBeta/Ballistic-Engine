@@ -47,31 +47,37 @@ public static class VolumePostProcessing {
         // probe/Lumen split overrides (P0.5 consolidation). The two Mode dropdowns each carry their own
         // Off, so the enable bool is derived from the mode (no separate enable param to keep in sync).
         if (stack.GetComponent<GlobalIllumination>() is { } gi) {
+            // MASTER SWITCH: enabled=false is a HARD STOP for the whole Lumen stack. We force every GI/
+            // reflection mode to Off here (overriding the dropdowns) so EVERY downstream reader — SSGI,
+            // RT-GI, SSR, RT-reflections, DDGI, screen probes, emissive-as-GI — sees "off" with no extra
+            // wiring. The renderer also hard-gates DDGI/screen-probe allocation on these same fields.
+            bool on = gi.enabled.Value;
+
             // Diffuse GI.
-            fx.GiMode = gi.giMode.Value;
-            fx.SsgiEnabled = gi.giMode.Value != GiMode.Off;
+            fx.GiMode = on ? gi.giMode.Value : GiMode.Off;
+            fx.SsgiEnabled = on && gi.giMode.Value != GiMode.Off;
             fx.SsgiIntensity = gi.intensity.Value;
-            fx.SsgiDebugView = gi.giIsolate.Value;
+            fx.SsgiDebugView = on && gi.giIsolate.Value;
+            fx.GiEmissive = on && gi.emissiveAsGi.Value;   // emissive surfaces as area lights in the bounce
+            // Ray-Traced GI quality (DDGI world cache + screen probes). Part of the hard kill: off when the
+            // master switch is off, so the whole Lumen world/screen-probe machinery stops too.
+            fx.Ddgi = on && gi.worldRadianceCache.Value;
+            fx.ScreenProbes = on && gi.screenProbes.Value;
             // Reflections (Off maps to SsrEnabled=false; the renderer's SSR-vs-RT gate keeps working).
-            fx.ReflectionMode = gi.reflectionsMode.Value;
-            fx.SsrEnabled = gi.reflectionsMode.Value != ReflectionMode.Off;
+            fx.ReflectionMode = on ? gi.reflectionsMode.Value : ReflectionMode.Off;
+            fx.SsrEnabled = on && gi.reflectionsMode.Value != ReflectionMode.Off;
             fx.SsrIntensity = gi.reflectionsIntensity.Value;
-            // Advanced bounce / temporal / look dials.
+            // Advanced bounce / temporal / look dials (every one is consumed by the DX12 SSGI/RT-GI path).
             fx.SsgiRayLength = gi.rayLength.Value;
             fx.SsgiFalloff = gi.falloff.Value;
             fx.SsgiThickness = gi.thickness.Value;
-            fx.SsgiMultiBounce = gi.multiBounce.Value;
+            fx.SsgiBounceBoost = gi.bounceBoost.Value;   // shader Params1.x (was hardcoded 0)
             fx.SsgiOcclusionPower = gi.occlusionPower.Value;
-            fx.SsgiSkyFallback = gi.skyFallback.Value;
             fx.SsgiRayCount = gi.rayCount.Value;
             fx.SsgiMaxHistory = gi.maxHistory.Value;
-            fx.SsgiDenoise = gi.denoise.Value;
             fx.SsgiLook = gi.look.Value;
             fx.SsgiTint = gi.tint.Value;
             fx.SsgiSaturation = gi.saturation.Value;
-            // Retired dials (IBL carries the ambient base now); pinned, no volume override.
-            fx.SsgiBounceBoost = 0f;
-            fx.SsgiAmbientFloor = 0f;
         }
 
         if (stack.GetComponent<Shadows>() is { } shadows) {

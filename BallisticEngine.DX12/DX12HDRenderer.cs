@@ -230,8 +230,15 @@ public sealed class DX12HDRenderer : HDRenderer {
     Dx12Ddgi ddgi;                              // P2: DDGI world-probe radiance cache (BALLISTIC_DX12_DDGI=1)
     bool ddgiLogged;
     bool ddgiDebugDumped;                        // BALLISTIC_DX12_DDGI_DEBUG=1: one-shot atlas readback stats
-    bool? ddgiOn;
-    bool DdgiEnabled => ddgiOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI") == "1";
+    // Volume drives it (PostFX.Ddgi, the GI volume's World Radiance Cache toggle); the BALLISTIC_DX12_DDGI
+    // env door still force-overrides for the A/B harness ("1" on, "0" off). Door read once; volume read live.
+    string ddgiEnvCached; bool ddgiEnvRead;
+    bool DdgiEnabled {
+        get {
+            if (!ddgiEnvRead) { ddgiEnvCached = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI"); ddgiEnvRead = true; }
+            return ddgiEnvCached is null ? PostFX.Ddgi : ddgiEnvCached == "1";
+        }
+    }
 
     // Emissive-as-GI-source (GI track follow-up): emissive surfaces act as area lights in the indirect
     // bounce. At each GI ray hit the shader adds the hit's self-emission L_e (emissiveMap*EmissiveFactor)
@@ -241,8 +248,21 @@ public sealed class DX12HDRenderer : HDRenderer {
     // each of the 4 GI hit shaders' b0 (no root-sig change), so BALLISTIC_DX12_GI_EMISSIVE=0 is a clean
     // byte-identical-off A/B. NO double-count: the directly-visible emissive comes from the G-buffer Emissive
     // MRT on the camera pixel; the GI term adds emission only at off-screen bounce hits on OTHER surfaces.
-    bool? giEmissiveOn;
-    bool GiEmissiveEnabled => giEmissiveOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_EMISSIVE") != "0";
+    // Volume drives the default (PostFX.GiEmissive, from the GlobalIllumination volume's Emissive-as-GI
+    // toggle); the BALLISTIC_DX12_GI_EMISSIVE env door still force-overrides for the headless A/B harness
+    // (=0 off, anything else on). When the door is UNSET the volume value wins. The door string is read
+    // once (it can't change mid-process); the volume value is read live so editor edits take effect.
+    string giEmissiveEnvCached;
+    bool giEmissiveEnvRead;
+    bool GiEmissiveEnabled {
+        get {
+            if (!giEmissiveEnvRead) {
+                giEmissiveEnvCached = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_EMISSIVE");
+                giEmissiveEnvRead = true;
+            }
+            return giEmissiveEnvCached is null ? PostFX.GiEmissive : giEmissiveEnvCached != "0";
+        }
+    }
 
     // P6.0 MOTION-stability harness (Phase 6): a DETERMINISTIC scripted camera orbit so the motion-dump
     // sequence has GENUINE camera movement — the only way reprojection + disocclusion (the real "boiling"
@@ -273,8 +293,16 @@ public sealed class DX12HDRenderer : HDRenderer {
     // upsample; P4.1: bilateral integrate + E→L energy fix; P4.3: determinism + budget.
     Dx12ScreenProbe screenProbe;
     bool screenProbeLogged;
-    bool? screenProbeOn;
-    bool ScreenProbeEnabled => screenProbeOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_SCREENPROBE") != "0";
+    // Volume drives it (PostFX.ScreenProbes, the GI volume's Screen Probes toggle); the BALLISTIC_DX12_
+    // SCREENPROBE env door still force-overrides for the A/B harness ("0" off, anything else on). When the
+    // door is UNSET the volume value wins. Door read once; volume read live (editor edits take effect).
+    string screenProbeEnvCached; bool screenProbeEnvRead;
+    bool ScreenProbeEnabled {
+        get {
+            if (!screenProbeEnvRead) { screenProbeEnvCached = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SCREENPROBE"); screenProbeEnvRead = true; }
+            return screenProbeEnvCached is null ? PostFX.ScreenProbes : screenProbeEnvCached != "0";
+        }
+    }
 
     // P7.2 NO-RT DDGI probe update (rasterized cube-relit far-field for GPUs without HW ray tracing).
     // P7.2a is MEASUREMENT-ONLY: BALLISTIC_DX12_NORT_PROBES=1 renders ONE probe (6 cube faces) at the camera +
@@ -379,7 +407,7 @@ public sealed class DX12HDRenderer : HDRenderer {
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct CompositeConstants {
         public float Exposure; public float BloomIntensity; public float AutoExposure; public float ExposureKey;
-        public float UseAo; public Vector3 Pad2;
+        public float UseAo; public float MinExposure; public float MaxExposure; public float Pad2;
     }
 
     // Auto-exposure: a 1×1 R16F target holding the geometric-mean scene luminance (LumAverage.hlsl).
@@ -1516,6 +1544,17 @@ public sealed class DX12HDRenderer : HDRenderer {
         Vector3 camPos = GiOrbitDegPerFrame != 0f && Matrix4x4.Invert(view, out Matrix4x4 invViewForPos)
             ? invViewForPos.Translation
             : ToNumerics(vp.Transform.WorldPosition);
+
+        // Blend the scene's active Volumes into PostFX once per frame (exposure/bloom/SSGI/etc.). This is the
+        // ONLY bridge from the volume framework to the live render settings — it was never wired on DX12, so
+        // EDITING the Exposure (or any) volume did NOTHING and PostFX sat at its constructor defaults (EV15).
+        // The composite, fog, SSGI, etc. read PostFX, so this must run before them. BALLISTIC_DX12_VOLUMES=0
+        // restores the old unwired behaviour (PostFX = defaults) for A/B.
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_VOLUMES") != "0") {
+            VolumeManager.Update(camPos);
+            VolumePostProcessing.Apply(VolumeManager.Stack, PostFX);
+        }
+
         LightUniforms light = LightUniforms.Resolve();
         Vector3 lightDir = ToNumerics(light.Direction);
         Vector3 lightColor = ToNumerics(light.Color);
@@ -3223,16 +3262,40 @@ public sealed class DX12HDRenderer : HDRenderer {
     // Tonemap the HDR `hdr` source (the native scene target, or the FSR-upscaled output) into the LDR
     // output at OUTPUT resolution. Auto-exposure drives the exposure; bloom (if on) runs first (inside
     // this), reading the same HDR source. Sources at internal/half res are sampled by UV (resolution-safe).
+    // Calibration anchor that maps the engine's physical exposure multiplier (1/(1.2·2^EV), the same dial the
+    // GL path uses) into the DX12 composite's multiplier space. The DX12 scene radiance is pre-scaled by an
+    // arbitrary ~1e-5 fudge (NOT true lux), so the EV dial can't be applied 1:1 — this constant re-anchors it.
+    // Chosen empirically: at the default EV15 it lands the composite multiplier at ~1.6e-5, the measured
+    // correct exposure for the Bistro interior (dark-but-readable, no veil). Higher EV = darker, in real stops.
+    const float ExposureEvCalibration = 0.63f;
+
     unsafe void DrawComposite(bool ssaoOn, Dx12OffscreenTarget hdr) {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
 
-        // Manual exposure override (BALLISTIC_DX12_EXPOSURE) disables auto-exposure; else auto-meter.
-        bool manual = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
-            System.Globalization.CultureInfo.InvariantCulture, out float manualExp);
+        // Exposure source, in priority order:
+        //  1. BALLISTIC_DX12_EXPOSURE env  — explicit fixed multiplier (A/B + the headless capture recipe).
+        //  2. The Exposure VOLUME (PostFX) — the editor's exposure dial. THIS is the path that was missing on
+        //     DX12: the composite hardcoded 0.18/avgLum and never read PostFX.ExposureEV/Mode, so editing the
+        //     Exposure volume did nothing AND a near-black scene blew out to a milky veil. BALLISTIC_DX12_
+        //     EXPOSURE_VOLUME=0 restores the old hardcoded auto-meter (A/B escape hatch).
+        //  3. Fallback fixed 1e-5 (legacy stand-in) when the volume path is disabled.
+        bool envManual = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
+            System.Globalization.CultureInfo.InvariantCulture, out float envExp);
+        bool useVolume = !envManual
+            && Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_VOLUME") != "0";
+
+        // Fixed-mode volume exposure resolves to a constant multiplier (no metering pass). Automatic modes
+        // still meter, but clamped to the volume's EV limits (limitMin/limitMax) instead of running away.
+        bool volumeAuto = useVolume && PostFX.ExposureMode != ExposureMode.Fixed;
+        bool manual = envManual || (useVolume && !volumeAuto);
+        float manualExp = envManual ? envExp
+            : useVolume ? PostFX.ExposureMultiplier * ExposureEvCalibration
+            : 1.0e-5f;
+        bool runMeter = !manual;   // only the auto-meter path needs the 1×1 luminance reduction
 
         hdr.ColorToShaderResource();   // HDR source → SRV (for both the lum pass and composite)
 
-        if (!manual) {
+        if (runMeter) {
             // Auto-exposure metering: reduce the HDR source to a 1×1 geometric-mean luminance.
             dev.Device.CopyDescriptorsSimple(1, lumSrvVisible.Cpu(0), hdr.ColorSrvCpu, heapType);
             lumTarget.RenderColorOnly(cl => {
@@ -3250,20 +3313,30 @@ public sealed class DX12HDRenderer : HDRenderer {
         bool bloomOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_BLOOM") != "0";
         if (bloomOn) DrawBloom(hdr);
 
+        // Auto-meter clamp (used only when the volume is in an Automatic mode, or the volume path is off and
+        // the legacy meter runs). The meter computes exposure = ExposureKey / avgLum (Composite.hlsl); avgLum
+        // floors at 1e-4 (LumAverage.hlsl), so without a clamp a near-black scene runs to 0.18/1e-4 = 1800x
+        // and blows out. Bound it to the volume's EV limits (converted through the same calibration), so the
+        // meter respects limitMin (brightest = largest multiplier) / limitMax (darkest = smallest).
+        float EvToMul(float ev) => (1f / (1.2f * MathF.Pow(2f, ev))) * ExposureEvCalibration;
+        float meterMin = volumeAuto ? EvToMul(PostFX.AutoExposureLimitMax) : 0f;          // darkest EV → min mul
+        float meterMax = volumeAuto ? EvToMul(PostFX.AutoExposureLimitMin) : 1.0e-3f;     // brightest EV → max mul
         // ExposureKey: middle-grey target ~0.18 (the HDR scene is physical radiance; auto-meter rescales).
         *(CompositeConstants*)compositeCbMapped = new CompositeConstants {
-            Exposure = manual ? manualExp : 1.0e-5f,
+            Exposure = manualExp,
             BloomIntensity = bloomOn ? 0.6f : 0f,
             AutoExposure = manual ? 0f : 1f,
             ExposureKey = 0.18f,
             UseAo = ssaoOn ? 1f : 0f,
+            MinExposure = meterMin,
+            MaxExposure = meterMax,
         };
 
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(0), hdr.ColorSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(1),
             bloomOn ? bloomA.ColorSrvCpu : hdr.ColorSrvCpu, heapType);   // bloom slot
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(2),
-            manual ? hdr.ColorSrvCpu : lumTarget.ColorSrvCpu, heapType);
+            runMeter ? lumTarget.ColorSrvCpu : hdr.ColorSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(3),
             ssaoOn ? ssaoA.ColorSrvCpu : hdr.ColorSrvCpu, heapType);     // AO slot
 
@@ -3276,7 +3349,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
         });
-        if (!manual) lumTarget.ColorToRenderTarget();
+        if (runMeter) lumTarget.ColorToRenderTarget();
         // Restore the INTERNAL scene target to RenderTarget for next frame's geometry/deferred pass (FSR
         // left it in PixelShaderResource; in the native path hdr == target). fsrOutput stays in shader-read
         // — RunFsr transitions it to UAV next frame from any state.

@@ -345,8 +345,10 @@ loop returns or the process never exits.
   per slice a 32-bit mask over the hemisphere arc gives ORDERED occlusion (near occluders
   block far light — no scene-average veil by construction), `Thickness` = assumed occluder
   thickness (thin geometry occludes thin sectors), and sky enters only through the visibly
-  OPEN sectors. `rayCount` now means slices (clamped to 8). `SsgiSkyFallback` still defaults
-  0 (sky is already in the IBL ambient). Temporal/denoise/combine chain unchanged.
+  OPEN sectors. `rayCount` now means slices (clamped to 8). (The GL-era `SsgiSkyFallback`/
+  `SsgiDenoise`/`SsgiMultiBounce` dials were dropped in the DX12 GI-volume consolidation — the
+  DX12 SSGI shader has no slot for them; OIDN replaced the a-trous denoise.) Temporal/combine
+  chain unchanged.
 - **Per-pass GPU timers** (`GLGpuTimers`, timestamp queries, non-blocking ring) publish into
   `RenderStats.Scene/Game` with real draw/triangle/cull counters — the editor Stats overlay
   shows them; `Transform` caches Local/World matrices with version stamps (don't bypass the

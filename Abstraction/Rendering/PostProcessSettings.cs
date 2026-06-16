@@ -114,11 +114,28 @@ public sealed class PostProcessSettings {
     public bool SsgiEnabled { get; set; } = true;
     public GiMode GiMode { get; set; } = GiMode.ScreenSpace;   // GI volume dropdown: Off / SSGI / RT-GI (DXR)
 
+    // Emissive-as-GI source: emissive surfaces act as area lights in the indirect bounce (the DDGI/
+    // RTXGI/Lumen technique — at each GI ray hit the shader adds the hit's self-emission). DEFAULT true
+    // (a correctness fix: emissive lit the camera pixel via the G-buffer but cast no indirect light).
+    // The renderer reads this via GiEmissiveEnabled; BALLISTIC_DX12_GI_EMISSIVE=0/1 still force-overrides
+    // for the headless A/B harness. No double-count: directly-visible emissive is the G-buffer; this adds
+    // emission only at off-screen bounce hits on OTHER surfaces.
+    public bool GiEmissive { get; set; } = true;
+
+    // --- Ray-Traced GI quality (only consumed when GiMode == RayTraced) ---
+    // DDGI world-probe radiance cache: caches off-screen bounce so RT-GI gathers multi-bounce far-field
+    // light. DEFAULT false (matches the old BALLISTIC_DX12_DDGI == "1" gate — off unless asked). The
+    // BALLISTIC_DX12_DDGI env door still force-overrides for the A/B harness; unset = this drives.
+    public bool Ddgi { get; set; }
+
+    // Screen-space radiance probes: the near/mid-field final gather (DDGI-on only). DEFAULT true (matches
+    // the old BALLISTIC_DX12_SCREENPROBE != "0" gate). BALLISTIC_DX12_SCREENPROBE still force-overrides.
+    public bool ScreenProbes { get; set; } = true;
+
     // -- Quality / noise --
     // Rays per pixel: with temporal accumulation + the denoiser, even 2-4 stays clean.
     public int SsgiRayCount { get; set; } = 4;
     public float SsgiMaxHistory { get; set; } = 24f;  // temporal frames to accumulate (smoother/laggier)
-    public float SsgiDenoise { get; set; } = 2f;      // spatial denoiser tap spacing (wider = smoother)
 
     // -- Ray shape --
     public float SsgiRayLength { get; set; } = 12f;   // metres; near vs far bounce reach
@@ -136,26 +153,14 @@ public sealed class PostProcessSettings {
     // is actually contributing, and to tune ray length/intensity against real output.
     public bool SsgiDebugView { get; set; }
 
-    // Sky contribution for rays that miss every on-screen surface (0..1). DEFAULT 0: the
-    // forward shader's IBL irradiance already integrates the FULL sky, so adding sky again on
-    // every missed ray double-counts it — in open scenes most rays miss, and SSGI degenerated
-    // into a flat gray veil over the whole frame (washed contrast, milky shadows). The old
-    // non-zero default predates the IBL-as-ambient-base refactor, when a zero miss made GI
-    // collapse wherever the bright source left the screen; the IBL base killed that failure
-    // mode, leaving only the double-count. The dial remains for windowless interiors where a
-    // directional sky gather through openings can be worth it.
-    public float SsgiSkyFallback { get; set; }
-
-    // -- Bounce strength (advanced). SSGI is now a REFINEMENT on the physical IBL base, so it
-    // only adds the local one-bounce colour - intensity ~1 (not the old 1.5 that compensated
-    // for a missing ambient base). AmbientFloor/BounceBoost are retired: the IBL is the floor. --
+    // -- Bounce strength (advanced). SSGI is a REFINEMENT on the physical IBL base, so it only
+    // adds the local one-bounce colour - intensity ~1 (not the old 1.5 that compensated for a
+    // missing ambient base). --
     public float SsgiIntensity { get; set; } = 1f;                    // local-bounce strength
     public Vector3 SsgiTint { get; set; } = Vector3.One; // bounce colour
     public float SsgiSaturation { get; set; } = 1f;                   // bounce colour punch
     public float SsgiOcclusionPower { get; set; } = 0.6f;             // how hard AO bites the bounce
-    public float SsgiMultiBounce { get; set; } = 0.5f;                // re-bounce fraction (fake multi-bounce)
-    public float SsgiBounceBoost { get; set; }                        // retired (kept 0; IBL carries richness)
-    public float SsgiAmbientFloor { get; set; }                       // retired (kept 0; physical IBL is the base)
+    public float SsgiBounceBoost { get; set; }                        // super-linear gain on bright source pixels (volume: bounceBoost; shader Params1.x)
 
     // Volumetric height fog + sun scattering (god-rays): physical exponential height fog
     // marched against the directional shadow map. In-scatters the atmosphere-attenuated sun

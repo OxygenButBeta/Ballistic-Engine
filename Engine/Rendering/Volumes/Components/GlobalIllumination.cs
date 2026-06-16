@@ -20,6 +20,13 @@ namespace BallisticEngine;
 // type names are remapped to this type on load (VolumeProfileLoader.LegacyTypeNames); matching parameter
 // names carry their values over, so existing .volume assets keep their GI/reflection settings.
 public sealed class GlobalIllumination : VolumeComponent {
+    // ---- Master switch ----
+    [Tooltip("Master enable for the ENTIRE indirect-lighting (Lumen) system. Off = a hard stop: NO diffuse " +
+             "GI (SSGI/RT-GI), NO reflections (SSR/RT), NO DDGI world cache, NO screen probes, NO emissive-as-GI. " +
+             "The scene falls back to the IBL ambient + skybox reflection only. Default ON (byte-identical to a " +
+             "scene with no override). This is THE way to fully turn Lumen off from the volume.")]
+    public readonly BoolParameter enabled = new(true);
+
     // ---- Diffuse GI (the indirect one-bounce light) ----
     [Tooltip("Diffuse global illumination technique. Off = IBL ambient only; Screen-Space = SSGI " +
              "(fast, screen-bounded one-bounce); Ray-Traced = DXR off-screen-aware one-bounce (Lumen), " +
@@ -29,6 +36,12 @@ public sealed class GlobalIllumination : VolumeComponent {
     [Tooltip("Strength of the indirect diffuse bounce added over the IBL ambient base.")]
     public readonly ClampedFloatParameter intensity = new(1f, 0f, 4f);
 
+    [Tooltip("Emissive surfaces act as area lights in the indirect bounce — a glowing sign or lava " +
+             "spills coloured light onto nearby walls, not just onto the camera pixel. On by default " +
+             "(the Lumen/RTXGI behaviour). No effect when GI Mode is Off.")]
+    [HideIf("giMode", GiMode.Off)]
+    public readonly BoolParameter emissiveAsGi = new(true);
+
     // ---- Specular GI (reflections) ----
     [Tooltip("Reflections technique. Off = IBL/skybox reflection only; Screen-Space = SSR (fast, " +
              "screen-bounded); Ray-Traced = DXR (off-screen geometry + sky reflect correctly), falls " +
@@ -37,6 +50,21 @@ public sealed class GlobalIllumination : VolumeComponent {
 
     [Tooltip("Strength of reflections on smooth surfaces.")]
     public readonly ClampedFloatParameter reflectionsIntensity = new(1f, 0f, 2f);
+
+    // ---- Ray-Traced quality (only relevant when GI Mode = Ray-Traced) ----
+    [Tooltip("DDGI world-probe radiance cache: a grid of probes that caches off-screen bounce light so " +
+             "the Ray-Traced GI gathers MULTI-bounce far-field light (light from rooms/geometry the camera " +
+             "can't see). Off = single-bounce screen-aware RT-GI only. Lumen's world radiance cache. " +
+             "Ray-Traced GI only.")]
+    [ShowIf("giMode", GiMode.RayTraced)]
+    public readonly BoolParameter worldRadianceCache = new(false);
+
+    [Tooltip("Screen-space radiance probes: the near/mid-field final-gather (Place->Trace->Blend->Integrate) " +
+             "that hands far-field ray-misses to the DDGI world cache — Lumen's screen-trace -> world-cache " +
+             "hierarchy. Off = the per-pixel DDGI gather fallback. Needs the World Radiance Cache on. " +
+             "Ray-Traced GI only.")]
+    [ShowIf("giMode", GiMode.RayTraced)]
+    public readonly BoolParameter screenProbes = new(true);
 
     // ---- Debug ----
     [Tooltip("GI-isolate view: show ONLY the indirect bounce this GI pass adds (not the lit scene). " +
@@ -59,32 +87,23 @@ public sealed class GlobalIllumination : VolumeComponent {
     public readonly ClampedFloatParameter thickness = new(0.5f, 0.05f, 2f);
 
     [FoldoutGroup("Advanced")]
-    [Tooltip("Fraction of last frame's GI that re-bounces (fake multi-bounce).")]
-    public readonly ClampedFloatParameter multiBounce = new(0.5f, 0f, 1f);
+    [Tooltip("Boosts the bounce of brighter source pixels (a soft super-linear gain on radiant surfaces). " +
+             "0 = physically neutral. Screen-Space mode.")]
+    public readonly ClampedFloatParameter bounceBoost = new(0f, 0f, 4f);
 
     [FoldoutGroup("Advanced")]
     [Tooltip("How hard AO bites the bounce.")]
     public readonly ClampedFloatParameter occlusionPower = new(0.6f, 0f, 2f);
 
     [FoldoutGroup("Advanced")]
-    [Tooltip("Sky light through the UNOCCLUDED part of the horizon (occlusion-aware — a pixel facing a " +
-             "wall gets none). 0 = off; the IBL ambient already counts the sky, so keep low. Useful in " +
-             "interiors with openings.")]
-    public readonly ClampedFloatParameter skyFallback = new(0f, 0f, 1f);
-
-    [FoldoutGroup("Advanced")]
     [Tooltip("Horizon slices per pixel (bitmask gather). Temporal + denoise keep even 2–4 clean; " +
              ">8 is clamped. (Screen-Space mode only.)")]
     public readonly ClampedIntParameter rayCount = new(4, 1, 16);
 
-    [Header("Advanced — Temporal / Denoise")]
+    [Header("Advanced — Temporal")]
     [FoldoutGroup("Advanced")]
     [Tooltip("Temporal frames to accumulate. Higher = smoother but laggier.")]
     public readonly ClampedFloatParameter maxHistory = new(24f, 1f, 64f);
-
-    [FoldoutGroup("Advanced")]
-    [Tooltip("Spatial denoiser tap spacing. Wider = smoother.")]
-    public readonly ClampedFloatParameter denoise = new(2f, 1f, 8f);
 
     [Header("Advanced — Look")]
     [FoldoutGroup("Advanced")]

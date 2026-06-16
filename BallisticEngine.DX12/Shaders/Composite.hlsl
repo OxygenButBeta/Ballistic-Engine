@@ -9,7 +9,9 @@ cbuffer CompositeConstants : register(b0) {
     float AutoExposure;   // > 0.5 = derive exposure from the avg-luminance metering target
     float ExposureKey;    // middle-grey key for auto-exposure (~0.18 * tuning)
     float UseAo;          // > 0.5 = multiply by the SSAO texture
-    float3 _pad2;
+    float MinExposure;    // auto-exposure lower clamp (0 = none)
+    float MaxExposure;    // auto-exposure upper clamp (caps the dark-scene runaway; FLT_MAX = none)
+    float _pad2;
 };
 
 Texture2D HdrColor : register(t0);
@@ -41,11 +43,13 @@ float4 PSMain(VSOut i) : SV_Target {
     if (BloomIntensity > 0.0)
         hdr += BloomTex.SampleLevel(LinearClamp, i.Uv, 0).rgb * BloomIntensity;
 
-    // Exposure: auto (Key / average scene luminance) or the manual constant.
+    // Exposure: auto (Key / average scene luminance) or the manual constant. The auto path is CLAMPED to
+    // [MinExposure, MaxExposure] — without the upper clamp a near-black scene meters avgLum at its 1e-4 floor
+    // and exposure runs to 0.18/1e-4 = 1800x, blowing the frame to a milky-white veil (the dark-scene bug).
     float exposure = Exposure;
     if (AutoExposure > 0.5) {
         float avgLum = max(AvgLum.SampleLevel(LinearClamp, float2(0.5, 0.5), 0).r, 1e-4);
-        exposure = ExposureKey / avgLum;
+        exposure = clamp(ExposureKey / avgLum, MinExposure, MaxExposure);
     }
     float3 mapped = ACESFilm(hdr * exposure);
     return float4(pow(mapped, 1.0 / 2.2), 1.0);   // sRGB-encode for the UNORM backbuffer/BMP

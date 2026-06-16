@@ -11,7 +11,7 @@ cbuffer SsgiConstants : register(b0) {
     float4x4 Projection;     // jittered, transposed
     float4x4 InvProjection;  // jittered, transposed
     float4x4 ViewMatrix;     // transposed (world dir -> view)
-    float4 Params0;  // x=RayLength y=Falloff z=Thickness w=MultiBounce
+    float4 Params0;  // x=RayLength y=Falloff z=Thickness w=(reserved)
     float4 Params1;  // x=BounceBoost y=RayCount z=FrameIndex w=(unused)
     float4 Params2;  // xy = gather texel size (1/halfRes), z = preExposure, w = 1/preExposure
     float4 Combine0; // x=Intensity y=Look z=Saturation w=OcclusionPower
@@ -68,7 +68,7 @@ uint OccludeSectors(float a0, float a1) {
 
 float4 PSGather(VSOut input) : SV_Target {
     float2 uv0 = input.Uv;
-    float RayLength = Params0.x, Falloff = Params0.y, Thickness = Params0.z, MultiBounce = Params0.w;
+    float RayLength = Params0.x, Falloff = Params0.y, Thickness = Params0.z;
     float BounceBoost = Params1.x;
     int RayCount = (int)Params1.y;
     int FrameIndex = (int)Params1.z;
@@ -131,8 +131,7 @@ float4 PSGather(VSOut input) : SV_Target {
                         // range so FIREFLY_KNEE + the gather magnitude match the ported tuning. The combine
                         // converts the resulting bounce back to raw HDR before adding it to the scene.
                         float3 radiance = Sanitize(ColorTex.SampleLevel(LinearClamp, uv, 0).rgb) * Params2.z;
-                        // (multi-bounce history fed in step C; MultiBounce=0 here folds it out.)
-                        radiance *= 1.0 + BounceBoost * dot(radiance, 0.333.xxx);
+                        radiance *= 1.0 + BounceBoost * dot(radiance, 0.333.xxx);   // BounceBoost = GI volume dial
                         float lum = dot(radiance, float3(0.2126, 0.7152, 0.0722));
                         if (lum > FIREFLY_KNEE) radiance *= FIREFLY_KNEE / lum;
                         bounce += radiance * (newFrac * 2.0) * cosW * fade;
