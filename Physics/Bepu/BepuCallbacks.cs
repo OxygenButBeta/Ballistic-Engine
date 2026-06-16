@@ -49,7 +49,15 @@ struct NarrowPhaseCallbacks : INarrowPhaseCallbacks {
         // and stacking — NO bounce comes from the spring. Real coefficient-of-restitution bounce is
         // injected as a velocity-flip impulse on contact Enter (BepuContactTracker), which the spring
         // model alone cannot deliver at this solver rate (measured: spring rebound saturates ~0.1).
-        pairMaterial.MaximumRecoveryVelocity = 2f;
+        //
+        // MaximumRecoveryVelocity caps how fast a body is pushed OUT of an existing penetration. The old
+        // 2 m/s was needlessly timid — only ~3 cm/step of pop-out — so a heavy body that DID punch into a
+        // static mesh (a fast car clipping its belly on a terrain crest) un-sank far too slowly. Recovery
+        // velocity adds NO bounce (restitution is the separate velocity-flip impulse) and never fires on a
+        // resting/stacked contact (depth ≈ 0), so raising it is safe for stacking and resting stability;
+        // it only governs how briskly a real overlap is corrected. 4 m/s clears a deep clip in a few steps
+        // without being a "pop" that flings a lightly-touching body.
+        pairMaterial.MaximumRecoveryVelocity = 4f;
         pairMaterial.SpringSettings = new SpringSettings(30f, 1f);
 
         // Contact events: record the deepest actually-touching contact (speculative contacts

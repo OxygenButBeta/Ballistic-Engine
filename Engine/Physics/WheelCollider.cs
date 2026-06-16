@@ -205,6 +205,32 @@ public class WheelCollider : Behaviour {
                           - SuspensionDamping * upSpeed;
         springForce = MathF.Max(0f, springForce);
         chassis.AddForceAtPosition(up * springForce, ContactPoint);
+
+        // BUMP STOP — keep the chassis from riding low enough to bury its rigid box belly in the terrain.
+        // Past full travel the spring only saturates at ~one wheel-load, far too soft to keep pace with a
+        // steep crest taken at speed: the suspension stays bottomed, the chassis lags the rising ground,
+        // and the box punches DOWN through the mesh and SINKS (measured ~0.45 m on CarDemo's wavy terrain;
+        // a bare box with no suspension rides the very same waves cleanly at the same speed, so this is a
+        // SUSPENSION ride-height problem, not Bepu's box-vs-mesh collision).
+        //
+        // overCompression = how far the ground has risen above the bottomed wheel — exactly how far the
+        // chassis must climb THIS instant to stop the wheel (and the belly above it) from burying. The fix
+        // is a recovery constraint, NOT a positional spring: drive the contact's up-velocity toward just
+        // enough to clear the over-compression in one step, but CAP that target at a firm bump-stop speed.
+        // The cap is the whole trick — a positional spring does positive work every step the car climbs
+        // and pumps it into a ~3 m CATAPULT (measured), whereas raising velocity only toward a capped
+        // target can never add more than is needed to clear the current penetration, so it firms the ride
+        // without ever launching. Only acts when over-compressed (0 in normal driving) and only ever
+        // pushes UP (never pulls the chassis down).
+        float overCompression = MathF.Max(0f, Radius - groundDistance);
+        if (overCompression > 0f) {
+            const float bumpStopSpeed = 4f;                          // firm, non-explosive recovery (m/s)
+            float targetUp = MathF.Min(overCompression / dt, bumpStopSpeed);
+            if (upSpeed < targetUp) {
+                float bumpForce = (targetUp - upSpeed) * (chassis.Mass / WheelCount()) / dt;
+                chassis.AddForceAtPosition(up * bumpForce, ContactPoint);
+            }
+        }
     }
 
     Vector3 VelocityAt(Vector3 worldPoint) {
