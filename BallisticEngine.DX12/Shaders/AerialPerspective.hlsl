@@ -16,7 +16,7 @@ cbuffer ApConstants : register(b0) {
     float3   SunDirection;  float Distance;       // toward the sun (normalized); fade distance scale (m)
     float3   SunRadiance;   float HazeAniso;      // sun colour*illuminance (engine units); Mie phase g
     float3   SkyTint;       float AirDensity;     // ambient sky in-scatter colour; Rayleigh multiplier
-    float    Haze;          float MaxDistance;    float Exposure; float _padAp;  // Mie mult; clamp dist; pre-exp match
+    float    Haze;          float MaxDistance;    float NearFade; float _padAp;  // Mie mult; clamp dist; near-field fade-in (m)
 };
 
 static const float PI = 3.14159265359;
@@ -61,7 +61,13 @@ float4 PSMain(VSOut i) : SV_Target {
     // Optical depth, scene-scale calibrated. The raw Rayleigh betas only matter over kilometres; scenes are
     // tens-to-hundreds of metres, so Distance is the artistic HALF-DISTANCE (metres at which haze is strong)
     // and the per-channel COLOUR comes from the beta ratio (Rayleigh's blue tilt). grey = how much haze total.
-    float grey = (dist / max(Distance, 1.0)) * Strength;          // ~1 at Distance, grows beyond
+    // NEAR-FIELD FADE (V3, fixes D2 — the blue veil over interiors): the in-scatter colour is the lux-scaled
+    // sky radiance (SkyTint ≈ sunRadiance*blue, thousands of units), so even a tiny optical depth at interior
+    // distances (~10 m) painted a visible blue veil on every opaque pixel. Fade the haze in over [NearFade,
+    // 2*NearFade] m so short-range / enclosed geometry gets ~zero aerial perspective while distant vistas keep
+    // the full atmosphere cue. NearFade=0 restores the pre-V3 linear-from-zero behaviour (kill-switch).
+    float nearFade = (NearFade > 0.0) ? smoothstep(NearFade, 2.0 * NearFade, dist) : 1.0;
+    float grey = (dist / max(Distance, 1.0)) * Strength * nearFade; // ~1 at Distance, grows beyond; ~0 near camera
     float3 betaColR = (BetaR * AirDensity) / max(BetaR.r, 1e-9);  // normalized Rayleigh colour (blue-biased)
     float3 betaColM = (float3)(1.11 * Haze);                      // Mie is grey
     float3 tauR = grey * betaColR;

@@ -590,7 +590,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         public Vector3 SunDirection; public float Distance;
         public Vector3 SunRadiance; public float HazeAniso;
         public Vector3 SkyTint; public float AirDensity;
-        public float Haze, MaxDistance, Exposure, Pad;
+        public float Haze, MaxDistance, NearFade, Pad;   // NearFade: haze fades in over [NearFade, 2*NearFade] m (V3)
     }
 
     // Per-frame constants (b1) shared by every opaque draw: the cascade matrices + shadow params.
@@ -3703,6 +3703,12 @@ public sealed class DX12HDRenderer : HDRenderer {
         float distance = 1200f;  // haze half-distance in metres (scene-scale; env-tunable below)
         if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_AP_DISTANCE"),
             System.Globalization.CultureInfo.InvariantCulture, out float dd)) distance = dd;
+        // V3 (fixes D2): fade the haze in over [NearFade, 2*NearFade] m so interiors / short views get ~no aerial
+        // perspective (the lux-scaled SkyTint painted a blue veil on every opaque pixel even at ~10 m). 25 m fades
+        // it in across 25–50 m: enclosed rooms stay clean, distant vistas keep the cue. =0 restores pre-V3 (door).
+        float nearFade = 25f;
+        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_AP_NEARFADE"),
+            System.Globalization.CultureInfo.InvariantCulture, out float nf)) nearFade = nf;
         *(ApConstants*)apCbMapped = new ApConstants {
             InvViewProj = Matrix4x4.Transpose(invVP),
             CameraPos = camPos, Strength = strength,
@@ -3710,7 +3716,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             SunRadiance = sunRadiance, HazeAniso = pSky is not null ? Math.Clamp(pSky.HazeAnisotropy, 0f, 0.95f) : 0.8f,
             SkyTint = skyTint, AirDensity = pSky is not null ? MathF.Max(pSky.AirDensity, 0f) : 1f,
             Haze = pSky is not null ? MathF.Max(pSky.Haze, 0f) : 1f,
-            MaxDistance = 60000f, Exposure = 1f,
+            MaxDistance = 60000f, NearFade = nearFade,
         };
 
         gbuffer.DepthToShaderResource();
