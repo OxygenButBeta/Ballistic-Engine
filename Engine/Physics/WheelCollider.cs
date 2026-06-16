@@ -208,4 +208,60 @@ public class WheelCollider : Behaviour {
         hit = default;
         return false;
     }
+
+    // ---- Editor gizmos ------------------------------------------------------------------------------
+    // Drawn for the selected entity (Unity's OnDrawGizmosSelected). Shows the wheel radius circle, the
+    // suspension travel line (mount → full droop, with the rest mark), and — in play mode — the live
+    // ground contact + where the wheel currently sits. Lets you see the suspension geometry at a glance
+    // (and is what the inspector drag-handles edit). Pure IGizmos lines, no editor dependency.
+    public override void OnDrawGizmosSelected(IGizmos gizmos) {
+        Transform t = transform;
+        Vector3 up = t.Up;
+        Vector3 mount = t.WorldPosition;
+        Vector3 forward = t.Forward;
+        Vector3 right = t.Right;
+
+        // Steer the drawn circle so it visually matches the wheel heading.
+        Quaternion steer = Quaternion.CreateFromAxisAngle(up, SteerAngle);
+        Vector3 wheelFwd = Vector3.Transform(forward, steer);
+
+        // Wheel centre: where the mesh sits (mount dropped by the suspension; rest position in edit mode).
+        float drop = SceneManager.IsPlaying ? SuspensionDrop : SuspensionTravel * SuspensionRestFraction;
+        Vector3 centre = mount - up * drop;
+
+        // The wheel radius circle, in the wheel's plane (spanned by forward and up), drawn as segments.
+        gizmos.Color = IsGrounded || !SceneManager.IsPlaying ? new Vector3(0.4f, 0.9f, 1f) : new Vector3(1f, 0.6f, 0.2f);
+        DrawCircle(gizmos, centre, wheelFwd, up, Radius);
+
+        // Suspension travel line: from the mount (full compression) down to full droop, with a tick at
+        // the rest length so you can see how much squat/droom room there is.
+        Vector3 droopEnd = mount - up * SuspensionTravel;
+        gizmos.Color = new Vector3(0.6f, 0.6f, 0.65f);
+        gizmos.DrawLine(mount, droopEnd);
+        Vector3 restPos = mount - up * (SuspensionTravel * SuspensionRestFraction);
+        DrawTick(gizmos, restPos, right, 0.12f);
+        DrawTick(gizmos, mount, right, 0.08f);
+        DrawTick(gizmos, droopEnd, right, 0.08f);
+
+        // Live ground contact (play mode): a small marker at the contact point.
+        if (SceneManager.IsPlaying && IsGrounded) {
+            gizmos.Color = new Vector3(0.3f, 1f, 0.4f);
+            DrawTick(gizmos, ContactPoint, right, 0.15f);
+            DrawTick(gizmos, ContactPoint, wheelFwd, 0.15f);
+        }
+    }
+
+    static void DrawCircle(IGizmos gizmos, Vector3 centre, Vector3 axisA, Vector3 axisB, float radius) {
+        const int seg = 24;
+        Vector3 prev = centre + axisA * radius;
+        for (var i = 1; i <= seg; i++) {
+            float a = i / (float)seg * MathF.Tau;
+            Vector3 p = centre + (axisA * MathF.Cos(a) + axisB * MathF.Sin(a)) * radius;
+            gizmos.DrawLine(prev, p);
+            prev = p;
+        }
+    }
+
+    static void DrawTick(IGizmos gizmos, Vector3 at, Vector3 dir, float half) =>
+        gizmos.DrawLine(at - dir * half, at + dir * half);
 }

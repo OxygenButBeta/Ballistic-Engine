@@ -451,4 +451,58 @@ public class VehicleController : Behaviour {
 
     static float ReadAxis(Keys positive, Keys negative) =>
         (Input.IsKeyDown(positive) ? 1f : 0f) - (Input.IsKeyDown(negative) ? 1f : 0f);
+
+    // ---- Editor gizmos ------------------------------------------------------------------------------
+    // Shows the car's heading (blue), its current velocity (green), and the commanded turn direction
+    // (yellow arc) at the chassis — a debug/feel aid while tuning. Heading always; velocity + turn only
+    // in play. Pure IGizmos lines, no editor dependency.
+    public override void OnDrawGizmosSelected(IGizmos gizmos) {
+        Transform t = transform;
+        Vector3 origin = t.WorldPosition + Vector3.UnitY * 0.4f;
+        Vector3 fwd = t.Forward;
+        var flatFwd = new Vector3(fwd.X, 0f, fwd.Z);
+        flatFwd = flatFwd.LengthSquared() > 1e-6f ? flatFwd.Normalized() : Vector3.UnitZ;
+
+        // Heading arrow (blue) — where the nose points.
+        gizmos.Color = new Vector3(0.3f, 0.6f, 1f);
+        DrawArrow(gizmos, origin, flatFwd, 3f);
+
+        if (!SceneManager.IsPlaying || chassis is null)
+            return;
+
+        // Velocity arrow (green) — where the car is actually going (the gap to heading is the slip/drift).
+        Vector3 vel = chassis.Velocity;
+        var horiz = new Vector3(vel.X, 0f, vel.Z);
+        if (horiz.Length() > 0.5f) {
+            gizmos.Color = new Vector3(0.3f, 1f, 0.4f);
+            DrawArrow(gizmos, origin, horiz.Normalized(), MathF.Min(horiz.Length() * 0.15f, 6f));
+        }
+
+        // Turn indicator (yellow) — the side the car is steering toward, length ~ steer amount.
+        float steerN = CurrentSteerNormalized;
+        if (MathF.Abs(steerN) > 0.02f) {
+            Vector3 right = t.Right;
+            var flatRight = new Vector3(right.X, 0f, right.Z);
+            if (flatRight.LengthSquared() > 1e-6f) {
+                gizmos.Color = new Vector3(1f, 0.85f, 0.2f);
+                DrawArrow(gizmos, origin + flatFwd * 2f, flatRight.Normalized() * MathF.Sign(steerN),
+                    MathF.Abs(steerN) * 1.5f);
+            }
+        }
+    }
+
+    static void DrawArrow(IGizmos gizmos, Vector3 origin, Vector3 dir, float length) {
+        if (dir.LengthSquared() < 1e-6f || length < 0.05f)
+            return;
+        dir = dir.Normalized();
+        Vector3 tip = origin + dir * length;
+        gizmos.DrawLine(origin, tip);
+        // Two small barbs at the tip, in the horizontal plane.
+        Vector3 side = Vector3.Cross(dir, Vector3.UnitY);
+        if (side.LengthSquared() < 1e-6f) side = Vector3.UnitX;
+        side = side.Normalized();
+        float b = MathF.Min(0.4f, length * 0.25f);
+        gizmos.DrawLine(tip, tip - dir * b + side * b * 0.6f);
+        gizmos.DrawLine(tip, tip - dir * b - side * b * 0.6f);
+    }
 }
