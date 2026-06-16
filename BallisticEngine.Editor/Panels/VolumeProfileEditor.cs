@@ -1,5 +1,6 @@
 using System.Reflection;
 using BallisticEngine.AssetPipeline.Loaders;
+using BallisticEngine.Editor.Inspector;
 using Hexa.NET.ImGui;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec4 = System.Numerics.Vector4;
@@ -155,6 +156,13 @@ internal static class VolumeProfileEditor {
         return changed;
     }
 
+    // The shared inspector drawer pipeline (Odin-style): the SAME value drawers + conditional/ordering
+    // attributes the component inspector uses, so the two paths can't drift. ImGuiVolumeGui draws the
+    // per-parameter override checkbox + label and disables the value cell when not overridden;
+    // [ShowIf]/[HideIf] on a parameter field hide its row.
+    static readonly DrawerPipeline pipeline = DrawerPipeline.CreateDefault();
+    static readonly ImGuiVolumeGui volumeGui = new();
+
     static bool DrawParameters(VolumeComponent component) {
         if (!ImGui.BeginTable("##params", 2, ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.PadOuterX))
             return false;
@@ -162,8 +170,12 @@ internal static class VolumeProfileEditor {
         ImGui.TableSetupColumn("value", ImGuiTableColumnFlags.WidthStretch, 0.55f);
 
         var changed = false;
-        foreach (VolumeComponent.ParameterSlot slot in component.Parameters)
-            changed |= DrawParameter(slot);
+        // [PropertyOrder] sorts (stable: default 0 keeps declaration order).
+        foreach (VolumeComponent.ParameterSlot slot in System.Linq.Enumerable.OrderBy(
+                     component.Parameters, s => MemberAttributes.For(s.Field).Order)) {
+            changed |= pipeline.Draw(new VolumeParamProperty(slot, component), volumeGui);
+            changed |= volumeGui.TakeOverrideChanged();   // toggling the override checkbox is also a change
+        }
 
         ImGui.EndTable();
         ImGui.Spacing();
@@ -185,92 +197,8 @@ internal static class VolumeProfileEditor {
             exposure.limitMax.Value = exposure.limitMin.Value;
     }
 
-    static bool DrawParameter(VolumeComponent.ParameterSlot slot) {
-        VolumeParameter parameter = slot.Parameter;
-        var changed = false;
-
-        ImGui.TableNextRow();
-        ImGui.TableSetColumnIndex(0);
-        ImGui.PushID(slot.Name);
-
-        bool overridden = parameter.Overridden;
-        if (ImGui.Checkbox("##override", ref overridden)) {
-            parameter.Overridden = overridden;
-            changed = true;
-        }
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip(overridden ? "Overriding. Click to use the default." : "Click to override this parameter.");
-
-        ImGui.SameLine();
-        ImGui.AlignTextToFramePadding();
-        ImGui.TextDisabled(Prettify(slot.Name));
-        if (slot.Field.GetCustomAttribute<TooltipAttribute>() is { } tooltip && ImGui.IsItemHovered())
-            ImGui.SetTooltip(tooltip.Text);
-
-        ImGui.TableSetColumnIndex(1);
-        ImGui.SetNextItemWidth(-1);
-
-        bool disabled = !parameter.Overridden;
-        if (disabled) ImGui.BeginDisabled();
-
-        // Clamped/Color subtypes first; the base-type cases catch the rest of each family.
-        switch (parameter) {
-            case IEnumParameter e: {
-                var index = e.Index;
-                if (ImGui.Combo("##v", ref index, e.Names, e.Names.Length)) { e.Index = index; changed = true; }
-                break;
-            }
-            case BoolParameter b: {
-                var value = b.Value;
-                if (ImGui.Checkbox("##v", ref value)) { b.Value = value; changed = true; }
-                break;
-            }
-            case ClampedIntParameter ci: {
-                var value = ci.Value;
-                if (ImGui.SliderInt("##v", ref value, ci.Min, ci.Max)) { ci.Value = value; changed = true; }
-                break;
-            }
-            case IntParameter i: {
-                var value = i.Value;
-                if (ImGui.DragInt("##v", ref value)) { i.Value = value; changed = true; }
-                break;
-            }
-            case ClampedFloatParameter cf: {
-                var value = cf.Value;
-                if (ImGui.SliderFloat("##v", ref value, cf.Min, cf.Max)) { cf.Value = value; changed = true; }
-                break;
-            }
-            case FloatParameter f: {
-                var value = f.Value;
-                if (ImGui.DragFloat("##v", ref value, 0.05f)) { f.Value = value; changed = true; }
-                break;
-            }
-            case ColorParameter c: {
-                var value = new System.Numerics.Vector3(c.Value.X, c.Value.Y, c.Value.Z);
-                var flags = c.Hdr ? ImGuiColorEditFlags.Hdr | ImGuiColorEditFlags.Float : ImGuiColorEditFlags.None;
-                if (ImGui.ColorEdit3("##v", ref value, flags)) {
-                    c.Value = new Vector3(value.X, value.Y, value.Z);
-                    changed = true;
-                }
-                break;
-            }
-            case Vector3Parameter v3: {
-                var value = new System.Numerics.Vector3(v3.Value.X, v3.Value.Y, v3.Value.Z);
-                if (ImGui.DragFloat3("##v", ref value, 0.05f)) {
-                    v3.Value = new Vector3(value.X, value.Y, value.Z);
-                    changed = true;
-                }
-                break;
-            }
-            default:
-                ImGui.TextDisabled($"({parameter.GetType().Name})");
-                break;
-        }
-
-        if (disabled) ImGui.EndDisabled();
-        ImGui.PopID();
-        return changed;
-    }
+    // (The per-parameter value switch is gone — DrawParameters now runs every slot through the shared
+    // DrawerPipeline + ImGuiVolumeGui, the same value drawers the component inspector uses.)
 
     // Compact framed header with an Active checkbox overlaid after the arrow (the inline version
     // of InspectorPanel's component header) and a "..." menu button on the right edge. Remove

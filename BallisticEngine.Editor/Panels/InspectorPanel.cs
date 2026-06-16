@@ -1,6 +1,7 @@
 using System.Reflection;
 using BallisticEngine.AssetPipeline;
 using BallisticEngine.AssetPipeline.Loaders;
+using BallisticEngine.Editor.Inspector;
 using BallisticEngine.Serialization;
 using Hexa.NET.ImGui;
 using SysVec2 = System.Numerics.Vector2;
@@ -16,8 +17,15 @@ namespace BallisticEngine.Editor;
 //
 // Styling: an entity header card, component headers with type icon + tinted stripe + overlaid
 // enable checkbox + a "..." menu, and Unity-style colored X/Y/Z chips on vector rows.
-internal sealed class InspectorPanel {
+internal sealed class InspectorPanel : IComponentInspectorHost {
     readonly EditorState state;
+
+    // Shared inspector drawer pipeline (Odin-style): one registry of value drawers + the conditional/
+    // ordering attributes serve BOTH the component inspector (here) and the volume profile editor. The
+    // component path keeps its own row/foldout chrome and drives a drawer directly through componentGui;
+    // the volume path runs the full DrawerPipeline. See BallisticEngine.Editor.Inspector.
+    readonly DrawerRegistry memberRegistry = DrawerRegistry.CreatePrimitive();
+    readonly ImGuiComponentGui componentGui;
 
     // Pending asset-picker request (opened from an asset slot).
     MemberInfo pickerMember;
@@ -42,9 +50,18 @@ internal sealed class InspectorPanel {
 
     public InspectorPanel(EditorState state) {
         this.state = state;
+        componentGui = new ImGuiComponentGui(this);
         // The standalone component window reuses our reflection member renderer.
         ComponentEditorWindow.Configure(DrawMemberList);
     }
+
+    // IComponentInspectorHost: lets the shared ImGuiComponentGui adapter reuse this panel's existing
+    // helpers (row layout, mixed-value marker, the styled X/Y/Z vector widget, per-widget undo).
+    void IComponentInspectorHost.RowWithTooltip(string label, string tooltip) => RowWithTooltip(label, tooltip);
+    void IComponentInspectorHost.DrawMixedMarker(MemberInfo member, object target, object value) => DrawMixedMarker(member, target, value);
+    bool IComponentInspectorHost.AxisVec3(string id, string label, ref SysVec3 v, float speed) => AxisVec3(id, label, ref v, speed);
+    bool IComponentInspectorHost.TrackUndo(string label, bool changed) => InspectorUndo.Track(label, changed);
+    void IComponentInspectorHost.MarkViewportDirty() => state.MarkViewportDirty();
 
     public void DrawContents() {
         ImGui.PushID(instanceId);   // namespace all ids so a 2nd Inspector window doesn't collide
@@ -1226,8 +1243,16 @@ internal sealed class InspectorPanel {
             groupOpen = true;
         }
 
-        foreach (MemberInfo member in ComponentReflection.InspectorMembers(type)) {
+        // [PropertyOrder] reorders members (stable sort: default 0 keeps declaration order, so a
+        // component that doesn't use it renders exactly as before).
+        foreach (MemberInfo member in System.Linq.Enumerable.OrderBy(
+                     ComponentReflection.InspectorMembers(type), m => MemberAttributes.For(m).Order)) {
             MemberAttributes attrs = MemberAttributes.For(member);
+
+            // [ShowIf]/[HideIf]: skip a hidden member entirely, before any header/space/foldout chrome.
+            if (!Conditions.Visible(attrs.Conditionals, target))
+                continue;
+
             string group = attrs.Foldout?.Name;
 
             // Leaving the current foldout group (different/no group, or a new header) closes it.
@@ -1334,18 +1359,21 @@ internal sealed class InspectorPanel {
         Type memberType = ComponentReflection.MemberType(member);
         object value = ComponentReflection.GetValue(member, target);
 
-        RowWithTooltip(Prettify(member.Name), attrs.Tooltip?.Text);
+        string display = attrs.LabelText?.Text ?? Prettify(member.Name);   // [LabelText] override
+        RowWithTooltip(display, attrs.Tooltip?.Text);
         // Mixed-value marker: in a multi-selection, an amber dash when the selected entities DISAGREE
         // on this member (the field shows the active entity's value; editing it sets them all alike).
         DrawMixedMarker(member, target, value);
         ImGui.PushID(member.Name);
         ImGui.SetNextItemWidth(-1);
-        if (attrs.ReadOnly) ImGui.BeginDisabled();
+        // [ReadOnly] + [EnableIf]/[DisableIf] gate the value widget (the label stays enabled).
+        bool memberDisabled = attrs.ReadOnly || Conditions.Disabled(attrs.Conditionals, target);
+        if (memberDisabled) ImGui.BeginDisabled();
 
         // Every edit auto-registers ONE undo step via InspectorUndo.Track (snapshot on edit-begin,
         // commit on edit-end) — no per-widget EditorUndo.Push, so no case can forget it. Each change
         // also marks the viewport dirty (on-demand render) since a value edit can alter the picture.
-        string label = $"Edit {Prettify(member.Name)}";
+        string label = $"Edit {display}";
 
         if (typeof(BEvent).IsAssignableFrom(memberType)) {
             // Serialized event (UnityEvent-style): a multi-row listener editor. The component owns
@@ -1355,97 +1383,31 @@ internal sealed class InspectorPanel {
         else if (typeof(BObject).IsAssignableFrom(memberType)) {
             DrawAssetSlot(member, target, value as BObject, memberType);
         }
+        else if (value is AnimationCurve curve) {
+            // Interactive curve widget — applies to ANY AnimationCurve member with no per-component
+            // wiring. Mutated in place (reference type); the "Edit" button opens the standalone window.
+            if (DrawCurveEditor(member.Name, curve, state.MarkViewportDirty))
+                state.MarkViewportDirty();
+        }
+        else if (value is ColorGradient gradient) {
+            // Interactive gradient bar — same auto-apply-to-any-member story as the curve.
+            if (DrawGradientEditor(member.Name, gradient))
+                state.MarkViewportDirty();
+        }
+        else if (memberRegistry.Resolve(memberType) is { } drawer) {
+            // Shared value drawers (float/int/bool/string/enum/Vector2/Vector3) — the SAME registry the
+            // volume profile editor uses, so the two paths can't drift. componentGui wraps each widget in
+            // InspectorUndo.Track; the MemberProperty setter is ApplyMember (multi-select) + dirty.
+            // Range/[ColorUsage] are carried on the IProperty, so slider-vs-drag and color-vs-axis match.
+            componentGui.SetUndoLabel(label);
+            drawer.Draw(new MemberProperty(member, target,
+                v => { ApplyMember(member, target, v); state.MarkViewportDirty(); }), componentGui);
+        }
         else {
-            switch (value) {
-                case float f: {
-                    bool changed = InspectorUndo.Track(label, attrs.Range is { } r
-                        ? ImGui.SliderFloat("##v", ref f, r.Min, r.Max)
-                        : ImGui.DragFloat("##v", ref f, 0.05f));
-                    if (changed) {
-                        if (attrs.Range is { } rc) f = Math.Clamp(f, rc.Min, rc.Max);
-                        ApplyMember(member, target, f);
-                        state.MarkViewportDirty();
-                    }
-                    break;
-                }
-                case int i: {
-                    bool changed = InspectorUndo.Track(label, attrs.Range is { } r
-                        ? ImGui.SliderInt("##v", ref i, (int)r.Min, (int)r.Max)
-                        : ImGui.DragInt("##v", ref i));
-                    if (changed) {
-                        if (attrs.Range is { } rc) i = Math.Clamp(i, (int)rc.Min, (int)rc.Max);
-                        ApplyMember(member, target, i);
-                        state.MarkViewportDirty();
-                    }
-                    break;
-                }
-                case bool b: {
-                    var changed = InspectorUndo.Track(label, ImGui.Checkbox("##v", ref b));
-                    if (changed) { ApplyMember(member, target, b); state.MarkViewportDirty(); }
-                    break;
-                }
-                case string s: {
-                    var str = s ?? "";
-                    var changed = InspectorUndo.Track(label, ImGui.InputText("##v", ref str, 256));
-                    if (changed) { ApplyMember(member, target, str); state.MarkViewportDirty(); }
-                    break;
-                }
-                case Vector3 v3: {
-                    var sv = new SysVec3(v3.X, v3.Y, v3.Z);
-                    // [ColorUsage] (or a "...Color" name) gets a color picker; HDR allows >1.
-                    var isColor = attrs.ColorUsage is not null ||
-                                  member.Name.EndsWith("Color", StringComparison.Ordinal);
-                    bool changed;
-                    if (isColor) {
-                        var flags = attrs.ColorUsage?.Hdr == true
-                            ? ImGuiColorEditFlags.Hdr | ImGuiColorEditFlags.Float
-                            : ImGuiColorEditFlags.None;
-                        changed = InspectorUndo.Track(label, ImGui.ColorEdit3("##v", ref sv, flags));
-                    }
-                    else {
-                        changed = AxisVec3("v3", label, ref sv, 0.05f);
-                    }
-                    if (changed) { ApplyMember(member, target, new Vector3(sv.X, sv.Y, sv.Z)); state.MarkViewportDirty(); }
-                    break;
-                }
-                case Vector2 v2: {
-                    var sv = new SysVec2(v2.X, v2.Y);
-                    var changed = InspectorUndo.Track(label, ImGui.DragFloat2("##v", ref sv, 0.05f));
-                    if (changed) { ApplyMember(member, target, new Vector2(sv.X, sv.Y)); state.MarkViewportDirty(); }
-                    break;
-                }
-                case Enum e: {
-                    string[] names = Enum.GetNames(memberType);
-                    // IndexOf returns -1 when the value doesn't match a single declared name (a [Flags]
-                    // combination or an out-of-range cast); fall back to the first entry so the combo
-                    // shows a valid label instead of blank.
-                    int current = Math.Max(0, Array.IndexOf(names, e.ToString()));
-                    var changed = InspectorUndo.Track(label, ImGui.Combo("##v", ref current, names, names.Length));
-                    if (changed) { ApplyMember(member, target, Enum.Parse(memberType, names[current])); state.MarkViewportDirty(); }
-                    break;
-                }
-                case AnimationCurve curve: {
-                    // Interactive curve widget — applies to ANY AnimationCurve member with no per-
-                    // component wiring. Mutated in place (reference type), so no SetValue needed; an
-                    // undo snapshot is pushed when an edit begins. The "Edit" button opens the full
-                    // standalone CurveEditorWindow; edits there fire the dirty callback to repaint.
-                    if (DrawCurveEditor(member.Name, curve, state.MarkViewportDirty))
-                        state.MarkViewportDirty();
-                    break;
-                }
-                case ColorGradient gradient: {
-                    // Interactive gradient bar — same auto-apply-to-any-member story as the curve.
-                    if (DrawGradientEditor(member.Name, gradient))
-                        state.MarkViewportDirty();
-                    break;
-                }
-                default:
-                    ImGui.TextDisabled($"({memberType.Name})");
-                    break;
-            }
+            ImGui.TextDisabled($"({memberType.Name})");
         }
 
-        if (attrs.ReadOnly) ImGui.EndDisabled();
+        if (memberDisabled) ImGui.EndDisabled();
         ImGui.PopID();
     }
 
