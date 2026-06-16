@@ -132,7 +132,30 @@ public sealed class NetworkManager {
             case NetMessage.Despawn:     HandleDespawn(ref r); break;
             case NetMessage.Snapshot:    HandleSnapshot(ref r); break;
             case NetMessage.Rpc:         HandleRpc(source, ref r); break;
+            case NetMessage.Input:       HandleInput(source, ref r); break;
         }
+    }
+
+    // SERVER (P5b): a client's input batch arrived UP. Enqueue each input on the target object's inbox
+    // (consumed one per tick by ApplyServerInput, in seq order). Owner-checked: a client may only send
+    // input for an object it owns (the closed trust boundary — a client can't drive someone else's pawn).
+    void HandleInput(Connection source, ref BitReader r) {
+        int netId = r.ReadInt();
+        int count = r.ReadByte();
+        NetworkObject obj = objects.Resolve(netId);
+        // Validate ownership BEFORE buffering (don't let a non-owner inject input). Still parse the bytes
+        // so the reader stays aligned for any following frame (frames are sent one-per-payload here, so a
+        // bad one is simply dropped, but we read its inputs out regardless).
+        bool accept = obj is not null && obj.IsSpawned && obj.Owner.IsValid && obj.Owner.Equals(source);
+        if (accept)
+            obj.ServerInputInbox ??= new Queue<NetworkInput>();
+        for (int i = 0; i < count; i++) {
+            NetworkInput input = NetworkInput.Read(ref r);
+            if (accept && input.Seq > obj.LastProcessedSeq)
+                obj.ServerInputInbox.Enqueue(input);
+        }
+        if (!accept)
+            Debugging.LogWarning($"Network: input batch for object {netId} from {source} rejected (not the owner).");
     }
 
     // SERVER: validate the client's layout digest (gate 0c). Match -> accept + run the §6 join flow;
@@ -201,10 +224,14 @@ public sealed class NetworkManager {
         SceneManager.GetCurrentScene()?.DestroyEntity(obj.Entity);
     }
 
-    // CLIENT: apply a delta-snapshot batch — for each [netId, typeId, delta] find the mirror and apply.
+    // CLIENT: apply a delta-snapshot batch — for each [netId, lastProcessedSeq, typeId, delta] find the
+    // mirror, apply the authoritative state, then (P5b) RECONCILE input-authority objects: snap to the
+    // server state (just applied), TRIM acked inputs, REPLAY the unacknowledged ones. A SimulatedProxy
+    // (no input authority) just takes the state as-is (interpolation is P5c).
     void HandleSnapshot(ref BitReader r) {
-        while (!r.AtEnd && r.BitLength - r.BitPos >= 64) {   // at least netId+typeId remain
+        while (!r.AtEnd && r.BitLength - r.BitPos >= 96) {   // at least netId+seq+typeId remain
             int netId = r.ReadInt();
+            uint lastProcessedSeq = r.ReadUInt();   // P5b: the server's ack frontier for this object
             int typeId = r.ReadInt();
             NetworkObject obj = objects.Resolve(netId);
             NetworkBehaviour target = FindNetworkBehaviour(obj, typeId);
@@ -214,7 +241,16 @@ public sealed class NetworkManager {
                 // Unreliable + latest-wins, so a dropped batch self-heals next send).
                 break;
             }
-            target.DeserializeState(ref r);
+            target.DeserializeState(ref r);   // SNAP: apply the authoritative state (step 1 of reconcile)
+
+            // P5b RECONCILE: only the AUTONOMOUS PROXY (the owning client) trims + replays. The server
+            // snapshot just overwrote the predicted state with truth; now re-derive the present from the
+            // in-flight (unacked) inputs. A SimulatedProxy / server-owned object skips this.
+            if (obj.HasInputAuthority && !obj.HasStateAuthority) {
+                obj.LastProcessedSeq = lastProcessedSeq;
+                PlayerController pc = FindController(obj);
+                pc?.Reconcile(lastProcessedSeq, _ => DriveNetworkTick(obj));
+            }
         }
     }
 
@@ -388,34 +424,37 @@ public sealed class NetworkManager {
         uint seq = (uint)SendClock.LocalTick;   // this tick's seq (the replay index, == LocalTick)
         PredictionTicks++;
 
-        // OWNER PREDICTION: each input-authority object captures its tick input + predicts locally. We
-        // drive it through the possessing PlayerController (which owns the InputComponent + buffer), then
-        // run the object's NetworkTick so the predicted pawn integrates THIS tick's input immediately.
-        foreach (NetworkObject obj in objects.All()) {
-            if (obj?.Entity is null || !obj.HasInputAuthority)
-                continue;
-            CapturePredictionInputFor(obj, seq);
-        }
-
-        // NETWORK TICK dispatch (§4c — the single simulation step). On the state authority (server/host)
-        // every spawned object ticks (authoritative). For an input-authority object on a pure client
-        // (no state authority), the owner still ticks it locally — that IS the prediction. A proxy with
-        // neither authority does NOT tick (it is interpolated, P5c). Deduped so a host (both authorities)
-        // ticks each object exactly once.
         foreach (NetworkObject obj in objects.All()) {
             if (obj?.Entity is null)
                 continue;
-            bool shouldTick = obj.HasStateAuthority || obj.HasInputAuthority;
-            if (shouldTick)
+
+            if (obj.HasInputAuthority) {
+                // OWNER PREDICTION (the AutonomousProxy, or a host's own pawn): capture this tick's input
+                // as data, buffer it by seq, predict locally THIS tick (zero round-trip = zero input lag).
+                CapturePredictionInputFor(obj, seq);
                 DriveNetworkTick(obj);
+                // CLIENT (not the server): send the input UP so the server can authoritatively simulate it.
+                if (!IsServer)
+                    SendInputUp(obj);
+            }
+            else if (obj.HasStateAuthority) {
+                // SERVER, an object it owns truth for but does NOT input (a remote client's pawn): consume
+                // the next received input from the inbox (one per tick — the authoritative cadence), feed
+                // it to the controller's CurrentInput, then NetworkTick. Input-starved => re-apply the last
+                // (extrapolate) so the sim keeps moving (plan §8.2). Server-owned (no owner) world/AI
+                // objects have no inbox — they just tick. This is the authoritative half of the reconcile.
+                ApplyServerInput(obj);
+                DriveNetworkTick(obj);
+            }
+            // else: a SimulatedProxy (neither authority) — interpolated, does NOT tick (P5c).
         }
 
-        // Asymmetric UP: record EVERY tick's input (never gated by the divisor — the load-bearing rule),
-        // flush the batch on the send boundary. The wire up-send is P5b; P5a proves the rate is honored.
+        // Asymmetric UP: record EVERY tick's input on the local owner stream (the per-tick contract; the
+        // actual per-object wire send happened above). FlushBatch on the boundary keeps the stream bounded.
         InputStream.RecordInput(seq);
 
         // State DOWN on the send boundary (the divisor cadence) — pack each dirty object's delta snapshot
-        // and flush to clients. Input UP flushes on the SAME boundary but carries all buffered ticks.
+        // (now carrying lastProcessedSeq for the reconcile) and flush to clients.
         bool sendBoundary = SendClock.Advance();
         if (sendBoundary) {
             if (IsServer)
@@ -437,6 +476,63 @@ public sealed class NetworkManager {
             if (b is Pawn { Controller: { } controller })
                 controller.CapturePredictionInput(seq);
         }
+    }
+
+    // SERVER side (P5b): consume the next buffered input for an object the server owns truth for but a
+    // remote client inputs. One per tick (the authoritative cadence); skip already-processed seqs (a
+    // re-sent batch can carry old ones). Input-starved => re-apply the last (extrapolate). Sets the
+    // possessing controller's CurrentInput so the pawn's NetworkTick reads the authoritative input, and
+    // stamps LastProcessedSeq so the snapshot DOWN tells the client what to ack.
+    void ApplyServerInput(NetworkObject obj) {
+        PlayerController pc = FindController(obj);
+        if (pc is null)
+            return;   // a server-owned world/AI object with no controller — nothing to apply, just ticks
+        Queue<NetworkInput> inbox = obj.ServerInputInbox;
+        if (inbox is not null) {
+            while (inbox.Count > 0 && inbox.Peek().Seq <= obj.LastProcessedSeq)
+                inbox.Dequeue();   // drop already-processed (re-sent under loss)
+            if (inbox.Count > 0) {
+                NetworkInput input = inbox.Dequeue();
+                obj.LastServerInput = input;
+                obj.HaveLastServerInput = true;
+                obj.LastProcessedSeq = input.Seq;
+                pc.SetServerInput(input);
+                return;
+            }
+        }
+        // input-starved: extrapolate with the last known input (do NOT advance LastProcessedSeq).
+        if (obj.HaveLastServerInput)
+            pc.SetServerInput(obj.LastServerInput);
+    }
+
+    // Send the owner's buffered input batch UP to the server (P5b). The batch carries EVERY tick since the
+    // last send (asymmetric up-rate: per-tick recorded, batched, none dropped). Reliable-ordered so the
+    // server is never input-starved. Only on the send boundary (the divisor cadence) — see PredictTick's
+    // caller; here we send whatever the controller buffered that the server hasn't acked.
+    void SendInputUp(NetworkObject obj) {
+        if (!SendClock.IsBoundary || !ServerConnection.IsValid)
+            return;
+        PlayerController pc = FindController(obj);
+        if (pc?.InputBuffer is null)
+            return;
+        // Send the unacked window (everything past the server's last ack). InputBuffer holds exactly the
+        // unacked inputs after each reconcile trims it, so send them all — the server dedups by seq.
+        NetworkInput[] batch = pc.InputBuffer.InOrder().ToArray();
+        if (batch.Length == 0)
+            return;
+        Transport.Send(ServerConnection, NetworkWire.Input(obj.NetId, batch), Channel.Reliable);
+    }
+
+    static PlayerController FindController(NetworkObject obj) {
+        if (obj?.Entity is null)
+            return null;
+        foreach (Behaviour b in obj.Entity.Behaviours.ToArray()) {
+            if (b is PlayerController pc)
+                return pc;
+            if (b is Pawn { Controller: { } controller })
+                return controller;
+        }
+        return null;
     }
 
     static void DriveNetworkTick(NetworkObject obj) {
@@ -471,6 +567,7 @@ public sealed class NetworkManager {
             foreach (Behaviour b in obj.Entity.Behaviours.ToArray()) {
                 if (b is NetworkBehaviour nb && nb.HasNetworkedState) {
                     snapshotWriter.WriteInt(obj.NetId);           // which object (P3 maps this on the wire)
+                    snapshotWriter.WriteUInt(obj.LastProcessedSeq); // P5b: ack frontier for the reconcile
                     snapshotWriter.WriteInt(nb.NetworkTypeId);    // which component type
                     nb.SerializeState(snapshotWriter);            // changemask + changed fields
                     nb.CaptureNetworkBaseline();                  // re-baseline for the next delta

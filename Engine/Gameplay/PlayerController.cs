@@ -106,4 +106,35 @@ public class PlayerController : NetworkBehaviour {
         CurrentInput = input;
         return input;
     }
+
+    // SERVER side (P5b): feed an authoritative input (received from the owning client, consumed one per
+    // tick by NetworkManager.ApplyServerInput) into CurrentInput so the pawn's NetworkTick simulates it.
+    // The server does NOT buffer or predict — it is the truth; it just applies the client's intent.
+    internal void SetServerInput(NetworkInput input) => CurrentInput = input;
+
+    // ---- reconcile (P5b, plan §8.2 OnPreReconcile -> replay -> OnPostReconcile) --------------------
+    // Called by the framework on the AUTONOMOUS PROXY (the owning client) after a server snapshot has been
+    // applied to the possessed pawn's [Networked] state (the SNAP to authority). Steps 2-3 of the reconcile:
+    //   2. TRIM every input the server has already processed (ackedSeq).
+    //   3. REPLAY the remaining (unacknowledged) inputs in seq order, re-running the pawn's NetworkTick
+    //      against each — re-deriving the present from the authoritative base + the in-flight inputs.
+    // After this the pawn reflects: server truth + every input the server hasn't seen yet = convergence,
+    // no permanent drift (proven in %TEMP%\bal-reconcile-test). Deterministic on one machine (§8.2). The
+    // caller supplies how to re-run a tick against one input (so the manager owns the NetworkTick dispatch).
+    internal void Reconcile(uint ackedSeq, Action<NetworkInput> replayTick) {
+        if (InputBuffer is null)
+            return;
+        InputBuffer.AckThrough(ackedSeq);          // 2. drop acked
+        LastReplayCount = 0;
+        foreach (NetworkInput input in InputBuffer.InOrder()) {   // 3. replay unacked, in seq order
+            CurrentInput = input;                  // the pawn's NetworkTick reads CurrentInput
+            replayTick(input);
+            LastReplayCount++;
+        }
+    }
+
+    // The number of inputs replayed in the last reconcile (the unacked window) — a P5e/observability
+    // signal (a growing window means the server is falling behind / the lookback cap is near).
+    [NotSerialized]
+    public int LastReplayCount { get; private set; }
 }

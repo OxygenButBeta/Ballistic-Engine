@@ -55,4 +55,26 @@ public sealed class NetworkObject : Behaviour {
     public bool IsOwner => HasInputAuthority;
 
     public int OwnerId => Owner.Id;
+
+    // ---- prediction/reconcile (P5b, plan §8.2) ----------------------------------------------------
+    // SERVER side: the queue of per-tick inputs received from the owning client (the UP stream), awaiting
+    // authoritative apply — one input consumed per fixed tick. NotSerialized: runtime-only, server-only.
+    // null on a client / a server-owned object (no remote input source). Lazily created on first input.
+    [NotSerialized]
+    internal Queue<BallisticEngine.Networking.NetworkInput> ServerInputInbox { get; set; }
+
+    // SERVER side: the highest input seq this object has authoritatively processed — stamped into the
+    // state snapshot DOWN so the owning client can TRIM acked inputs + REPLAY the rest (the reconcile).
+    // CLIENT side: the last-processed-seq received from the server (the ack frontier for AckThrough).
+    // Public getter (observability — the ack frontier a tool/test reads), framework-only setter.
+    [NotSerialized]
+    public uint LastProcessedSeq { get; internal set; }
+
+    // SERVER side: the last input actually applied — re-applied (extrapolated) on an input-starved tick so
+    // the authoritative sim keeps moving rather than freezing (plan §8.2; the client's replay stays the
+    // authority on the unacked window). Valid once HaveLastServerInput is true.
+    [NotSerialized]
+    internal BallisticEngine.Networking.NetworkInput LastServerInput { get; set; }
+    [NotSerialized]
+    internal bool HaveLastServerInput { get; set; }
 }

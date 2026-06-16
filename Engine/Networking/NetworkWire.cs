@@ -17,6 +17,7 @@ public enum NetMessage : byte {
     Despawn = 4,     // server->client: netId -> tear down the mirror
     Snapshot = 5,    // server->client: a batch of [netId, typeId, delta-state] for dirty objects
     Rpc = 6,         // either direction: netId + typeId + methodId + packed args -> dispatch + invoke (P4)
+    Input = 7,       // client->server: a batch of the owner's per-tick NetworkInput (the UP stream, P5b)
 }
 
 // Static read/write helpers over BitWriter/BitReader for the frame headers. The per-object STATE bytes
@@ -90,6 +91,20 @@ public static class NetworkWire {
         w.AsSpan().CopyTo(combined);
         args.CopyTo(combined.AsSpan(w.ByteLength));
         return combined;
+    }
+
+    // The input UP frame (P5b, plan §8.2 / §14 item 3): the owner's netId + a batch of per-tick
+    // NetworkInputs since the last send boundary. Sent Reliable-ordered so the server never misses a tick
+    // (input-starvation = the server can't simulate the in-between ticks). The batch carries ALL buffered
+    // ticks (asymmetric up-rate: per-tick recorded, batched on the boundary, none dropped).
+    public static byte[] Input(int netId, ReadOnlySpan<NetworkInput> batch) {
+        var w = new BitWriter();
+        w.WriteByte((byte)NetMessage.Input);
+        w.WriteInt(netId);
+        w.WriteByte((byte)Math.Min(batch.Length, 255));
+        for (int i = 0; i < batch.Length && i < 255; i++)
+            batch[i].Write(w);
+        return w.AsSpan().ToArray();
     }
 
     public static byte ReadTag(ReadOnlySpan<byte> payload) =>

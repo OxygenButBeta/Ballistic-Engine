@@ -25,6 +25,10 @@ public sealed class SendRateClock {
         Divisor = divisor;
     }
 
+    // Whether the CURRENT LocalTick is a send boundary (before Advance increments it). Lets the input-UP
+    // send (P5b) test the same boundary the down-state flush rides without double-advancing the clock.
+    public bool IsBoundary => LocalTick % Divisor == 0;
+
     // Advance one fixed tick. Returns whether a SEND boundary falls on this tick — the down-state flush
     // AND the up-input batch flush share the cadence, but carry DIFFERENT amounts (state: this snapshot;
     // input: all ticks since the last boundary). Boundaries land on tick 0, Divisor, 2*Divisor, ...
