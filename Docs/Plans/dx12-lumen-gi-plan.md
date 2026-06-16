@@ -192,12 +192,22 @@ deleted — commit 1b0485ad.)
     (scripted orbit OR static-camera live-temporal play frames) + a frame-to-frame "boiling" metric (mean abs
     delta of the GI-isolate between consecutive frames) so "stable under motion" is MEASURED, not eyeballed.
     Behind a BALLISTIC_DX12_* door; deterministic paused capture stays byte-identical.
-  - **P6.1 — Guided OIDN (albedo + normal AOVs).** OIDN currently denoises UNGUIDED (color-only) in BOTH paths
-    (zero-copy Pack sends color only; CPU readback passes null,null). Feed the (half-res) G-buffer ALBEDO (RT0)
-    + WORLD-NORMAL (RT1) as OIDN guide buffers — the standard edge-preserving win. The API wrapper already
-    supports albedo/normal filter images (DenoiseHdr args + setFilterImage); the zero-copy path needs 2 extra
-    shared float buffers + pack shaders; the readback path just needs the existing null args filled. Behind a
-    door (BALLISTIC_DX12_OIDN_GUIDE=0 = unguided fallback) so it's A/B-able + byte-identical-off provable.
+  - **P6.1 — Guided OIDN (albedo + normal AOVs). DONE & COMMITTED — kept OPT-IN (user, marginal win measured).**
+    OIDN denoised UNGUIDED (color-only). Added the (half-res) G-buffer ALBEDO (RT0) + WORLD-NORMAL (RT1) as OIDN
+    guide AOVs on the ZERO-COPY path: CSPackAux packs them into 2 more shared float4 buffers, imported as the
+    filter's "albedo"/"normal" images (filter rebuilt ONCE with guides; PackAux re-packs each frame). Readback
+    path stays unguided (rare non-HIP fallback; guiding it = CPU readback of 2 full-res G-buffer textures, not
+    worth it). Behind BALLISTIC_DX12_OIDN_GUIDE=1 (default OFF → byte-identical to pre-P6.1). De-risk: 21/21
+    shaders CPU-compile; 5-reviewer adversarial wiring audit (wf_31b87367) = **GO, device-removal risk NONE, 0
+    required fixes** (root sig↔shader registers exact, sizing self-consistent no-OOB, lifecycle sound); applied
+    2 recommended fixes (graceful-degrade a guide-commit failure to unguided instead of killing the color filter;
+    free unused aux buffers on the rare import-failure branch). **HONEST RESULT (measured, 4 DRED-guarded CLEAN
+    launches no removal): the win is MARGINAL on these fixtures** — SSGI GI-isolate guided-vs-unguided meanAbsDiff
+    0.15/255 (max 39), horiz HF energy 0.7177 vs 0.7213 (slightly cleaner), boiling metric unchanged (2.556 both),
+    ~0 extra cost (PackAux negligible; denoise ~7-10ms both). ROOT CAUSE: the GI is already low-noise by the time
+    OIDN runs (half-res + temporal EMA + the screen-probe gather is inherently clean per P4.2) — guides help most
+    on a NOISY 1-spp signal we don't have here. User chose KEEP OPT-IN (correct + cheap cushion for noisier
+    content, no default flip, no claim of a big win). Phase 6's real value = the P6.0 motion harness + P6.2.
   - **P6.2 — Temporal A/B tune + verify no boiling under motion** using the P6.0 harness. Tune the EMA only if
     the metric shows boiling; do NOT rewrite the already-correct temporal pass (gold-plating). Final judgement:
     motion-boiling metric improves (or holds) with guided OIDN; GI-isolate edges sharper; paused byte-identical.

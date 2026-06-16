@@ -18,6 +18,11 @@ public sealed class Dx12OidnDenoiser : IDisposable {
     // Zero-copy state: an OIDN buffer aliasing a D3D12 shared resource + an in-place HDR RT filter over it.
     IntPtr sharedBuf;
     IntPtr sharedFilter;
+    // P6.1 GUIDED denoise: OIDN buffers aliasing the D3D12 shared ALBEDO/NORMAL aux resources. Bound to the
+    // shared filter as "albedo"/"normal" guide images so the denoise preserves edges. Imported separately
+    // (ImportAuxBuffers) and the filter is REBUILT to reference them. Null when denoising unguided.
+    IntPtr sharedAlbedoBuf, sharedNormalBuf;
+    int auxW, auxH, auxRowPitch;
 
     // adapterLuid (8 bytes from Dx12Device.AdapterLuidBytes): prefer a LUID-matched device so OIDN's HIP
     // device is the SAME GPU as the D3D12 adapter (required for buffer sharing). Falls back to the Default
@@ -58,15 +63,56 @@ public sealed class Dx12OidnDenoiser : IDisposable {
         sharedBuf = OidnApi.oidnNewSharedBufferFromWin32Handle(device,
             OidnApi.OIDN_EXTERNAL_MEMORY_TYPE_FLAG_D3D12_RESOURCE, d3d12SharedHandle, IntPtr.Zero, (nuint)byteSize);
         if (sharedBuf == IntPtr.Zero || !CheckError()) { ReleaseShared(); return false; }
+        auxW = w; auxH = h; auxRowPitch = rowPitchBytes;
+        return RebuildSharedFilter();
+    }
+
+    // P6.1: import the shared ALBEDO + NORMAL aux buffers and REBUILD the filter to use them as guide images.
+    // Call AFTER ImportSharedBuffer. IDEMPOTENT — re-imports + rebuilds the filter ONLY on the first call (or
+    // after a release/resize); the filter commit JITs the denoise network (~tens of ms) so it must NOT happen
+    // every frame. Returns false (→ caller falls back to UNGUIDED, still valid) if either import fails. The aux
+    // buffers are the same half-res + float4 stride as the color buffer.
+    public bool ImportAuxBuffers(IntPtr albedoHandle, IntPtr normalHandle, ulong byteSize) {
+        if (device == IntPtr.Zero || !SharedCapable || sharedBuf == IntPtr.Zero) return false;
+        if (SharedGuided) return true;   // already imported + filter rebuilt with guides — per-frame no-op
+        sharedAlbedoBuf = OidnApi.oidnNewSharedBufferFromWin32Handle(device,
+            OidnApi.OIDN_EXTERNAL_MEMORY_TYPE_FLAG_D3D12_RESOURCE, albedoHandle, IntPtr.Zero, (nuint)byteSize);
+        sharedNormalBuf = OidnApi.oidnNewSharedBufferFromWin32Handle(device,
+            OidnApi.OIDN_EXTERNAL_MEMORY_TYPE_FLAG_D3D12_RESOURCE, normalHandle, IntPtr.Zero, (nuint)byteSize);
+        if (sharedAlbedoBuf == IntPtr.Zero || sharedNormalBuf == IntPtr.Zero || !CheckError()) { ReleaseAux(); RebuildSharedFilter(); return false; }
+        return RebuildSharedFilter();   // rebuild WITH the guides (once)
+    }
+
+    // (Re)build the in-place shared HDR RT filter over the current color buffer, binding albedo/normal guides
+    // when they're imported. OIDN reads each as FLOAT3 over the same half-res float4-strided buffer.
+    bool RebuildSharedFilter() {
+        if (sharedFilter != IntPtr.Zero) { OidnApi.oidnReleaseFilter(sharedFilter); sharedFilter = IntPtr.Zero; }
         sharedFilter = OidnApi.oidnNewFilter(device, "RT");
-        OidnApi.oidnSetFilterImage(sharedFilter, "color", sharedBuf, OidnApi.Format.Float3, (nuint)w, (nuint)h, 0, 16, (nuint)rowPitchBytes);
-        OidnApi.oidnSetFilterImage(sharedFilter, "output", sharedBuf, OidnApi.Format.Float3, (nuint)w, (nuint)h, 0, 16, (nuint)rowPitchBytes);
+        OidnApi.oidnSetFilterImage(sharedFilter, "color", sharedBuf, OidnApi.Format.Float3, (nuint)auxW, (nuint)auxH, 0, 16, (nuint)auxRowPitch);
+        if (sharedAlbedoBuf != IntPtr.Zero)
+            OidnApi.oidnSetFilterImage(sharedFilter, "albedo", sharedAlbedoBuf, OidnApi.Format.Float3, (nuint)auxW, (nuint)auxH, 0, 16, (nuint)auxRowPitch);
+        if (sharedNormalBuf != IntPtr.Zero)
+            OidnApi.oidnSetFilterImage(sharedFilter, "normal", sharedNormalBuf, OidnApi.Format.Float3, (nuint)auxW, (nuint)auxH, 0, 16, (nuint)auxRowPitch);
+        OidnApi.oidnSetFilterImage(sharedFilter, "output", sharedBuf, OidnApi.Format.Float3, (nuint)auxW, (nuint)auxH, 0, 16, (nuint)auxRowPitch);
         OidnApi.oidnSetFilterBool(sharedFilter, "hdr", true);
         OidnApi.oidnSetFilterInt(sharedFilter, "quality", (int)OidnApi.Quality.Balanced);
         OidnApi.oidnCommitFilter(sharedFilter);
-        if (!CheckError()) { ReleaseShared(); return false; }
-        return true;
+        if (CheckError()) return true;
+        // Commit failed. If we HAD guides, the failure may be the guide setup → DROP the guides and retry an
+        // UNGUIDED commit ONCE (graceful degradation, audit fix): keep the COLOR zero-copy path alive rather
+        // than tearing it down for the whole session. Only if the unguided rebuild ALSO fails do we give up
+        // (ReleaseShared → the caller falls back to CPU readback). Without this, a guide-commit failure killed
+        // the color filter (ReleaseShared) even though the color path alone was fine.
+        bool hadGuides = sharedAlbedoBuf != IntPtr.Zero || sharedNormalBuf != IntPtr.Zero;
+        if (hadGuides) {
+            ReleaseAux();
+            return RebuildSharedFilter();   // recurse once, now guide-free (hadGuides is false next time)
+        }
+        ReleaseShared();
+        return false;
     }
+
+    public bool SharedGuided => sharedAlbedoBuf != IntPtr.Zero && sharedNormalBuf != IntPtr.Zero;
 
     // Execute the in-place shared-buffer denoise on the GPU (no CPU round-trip). The D3D12 copy that filled
     // the shared buffer must already be complete — the caller's ExecuteSync blocks on the GPU, so it is.
@@ -85,6 +131,12 @@ public sealed class Dx12OidnDenoiser : IDisposable {
     void ReleaseShared() {
         if (sharedFilter != IntPtr.Zero) { OidnApi.oidnReleaseFilter(sharedFilter); sharedFilter = IntPtr.Zero; }
         if (sharedBuf != IntPtr.Zero) { OidnApi.oidnReleaseBuffer(sharedBuf); sharedBuf = IntPtr.Zero; }
+        ReleaseAux();
+    }
+
+    void ReleaseAux() {
+        if (sharedAlbedoBuf != IntPtr.Zero) { OidnApi.oidnReleaseBuffer(sharedAlbedoBuf); sharedAlbedoBuf = IntPtr.Zero; }
+        if (sharedNormalBuf != IntPtr.Zero) { OidnApi.oidnReleaseBuffer(sharedNormalBuf); sharedNormalBuf = IntPtr.Zero; }
     }
 
     // Cached readback-path resources: an OIDN filter is EXPENSIVE to commit (it JIT-allocates the denoise

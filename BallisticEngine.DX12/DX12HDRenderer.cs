@@ -151,6 +151,8 @@ public sealed class DX12HDRenderer : HDRenderer {
     bool ssgiSharedFailed;                   // shared path failed once → stick to readback forever
     bool ssgiOidnForceReadback;              // BALLISTIC_DX12_OIDN_READBACK=1 → force the CPU path (A/B door)
     bool ssgiOidnTiming;                     // BALLISTIC_DX12_OIDN_TIMING=1 → log avg denoise ms (perf A/B)
+    bool ssgiOidnGuide;                      // P6.1 BALLISTIC_DX12_OIDN_GUIDE=1 → albedo+normal AOV guides
+    bool ssgiAuxFailed;                       // aux import failed once → denoise unguided forever (graceful)
     bool ssgiOidnEnvRead;
     readonly System.Diagnostics.Stopwatch ssgiOidnSw = new();
     double ssgiOidnAccumMs; int ssgiOidnAccumFrames;
@@ -2215,6 +2217,10 @@ public sealed class DX12HDRenderer : HDRenderer {
                 ssgiOidnEnvRead = true;
                 ssgiOidnForceReadback = Environment.GetEnvironmentVariable("BALLISTIC_DX12_OIDN_READBACK") == "1";
                 ssgiOidnTiming = Environment.GetEnvironmentVariable("BALLISTIC_DX12_OIDN_TIMING") == "1";
+                // P6.1 GUIDED denoise: feed OIDN the G-buffer albedo+normal as AOV guides (edge-preserving). Door
+                // defaults OFF for this first cut (byte-identical-off = the proven baseline); flips to default-on
+                // after the A/B verifies it's strictly better. =1 → guided; unset/=0 → unguided (the old path).
+                ssgiOidnGuide = Environment.GetEnvironmentVariable("BALLISTIC_DX12_OIDN_GUIDE") == "1";
             }
             if (!ssgiOidnTried) { ssgiOidnTried = true; ssgiOidn = new Dx12OidnDenoiser(dev.AdapterLuidBytes); }
             if (ssgiOidn != null && ssgiOidn.Valid) {
@@ -2226,6 +2232,17 @@ public sealed class DX12HDRenderer : HDRenderer {
                 if (ssgiOidn.SharedCapable && !ssgiSharedFailed && !ssgiOidnForceReadback) {
                     if (ssgiOidnGpu == null) ssgiOidnGpu = new Dx12OidnGpuPath(dev);
                     if (ssgiOidnGpu.Ensure(ssgiOidn, ssgiDenoised.RenderTarget, w, h)) {
+                        // P6.1: build + import the albedo/normal AOV guides ONCE (per size), then pack them from
+                        // the G-buffer each frame so OIDN denoises EDGE-AWARE. If aux setup fails, fall through to
+                        // the unguided filter (still valid). Gated on the door; off → byte-identical to pre-P6.1.
+                        if (ssgiOidnGuide && !ssgiAuxFailed) {
+                            // The G-buffer color RTs sit in the combined Pixel|NonPixel shader-read state from
+                            // the deferred pass (same state the DDGI/screen-probe gather reads them in), so the
+                            // PackAux compute SRV reads of RT0 albedo / RT1 normal are already valid — no barrier.
+                            if (ssgiOidnGpu.EnsureAux() && ssgiOidn.ImportAuxBuffers(ssgiOidnGpu.AlbedoHandle, ssgiOidnGpu.NormalHandle, ssgiOidnGpu.AuxByteSize)) {
+                                ssgiOidnGpu.PackAux(gbuffer.ColorSrvCpu(0), gbuffer.ColorSrvCpu(1), target.Width, target.Height);
+                            } else { ssgiOidnGpu.ReleaseAux(); ssgiAuxFailed = true; }   // import failed → free unused aux buffers + go unguided
+                        }
                         histWrite.ColorToNonPixelShaderResource();   // GI texture as a compute SRV
                         ssgiDenoised.ColorToUnorderedAccess();        // denoise target as a compute UAV
                         ssgiOidnGpu.Pack(histWrite.ColorSrvCpu);      // GPU: texture -> shared float buf
@@ -2236,7 +2253,11 @@ public sealed class DX12HDRenderer : HDRenderer {
                         } else { ssgiSharedFailed = true; }           // HIP execute failed → readback from now on
                     } else { ssgiSharedFailed = true; }               // import failed → readback from now on
                 }
-                // CPU readback fallback (shared path unavailable/failed/forced off this frame).
+                // CPU readback fallback (shared path unavailable/failed/forced off this frame). NOTE: P6.1's
+                // guided AOVs ride the ZERO-COPY path (the one that runs on RT/HIP cards); the readback path is
+                // the rare non-HIP fallback and stays UNGUIDED (null albedo/normal) — guiding it would mean
+                // reading back + downsampling 2 full-res G-buffer textures on the CPU each frame, a large cost
+                // for a path that's already the slow fallback. DenoiseHdr already supports the guides if needed.
                 if (ReferenceEquals(giForCombine, histWrite)) {
                     int n = w * h * 3;
                     if (ssgiCpuColor == null || ssgiCpuColor.Length != n) { ssgiCpuColor = new float[n]; ssgiCpuOut = new float[n]; }
