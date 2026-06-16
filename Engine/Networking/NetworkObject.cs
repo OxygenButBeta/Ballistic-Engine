@@ -90,4 +90,15 @@ public sealed class NetworkObject : Behaviour {
     // render clock), so it stays smooth regardless of when snapshots actually arrive.
     [NotSerialized]
     internal double InterpClock { get; set; }
+
+    // CLIENT side, AUTONOMOUS PROXY only (P5d, plan §13): the visible-correction smoother. P5b's reconcile
+    // SNAPS the transform to the authoritative+replayed pose; when the prediction was WRONG (a
+    // misprediction), that snap is a visible pop. The smoother carries a decaying render OFFSET so the
+    // correction eases in over a few frames instead of popping. Lazily created on the first correction.
+    [NotSerialized]
+    internal PredictionSmoother Smoother { get; set; }
+
+    // Observability (P5d): true while a misprediction correction is being eased in (a non-zero smoothing
+    // offset is decaying). Tools/tests read this; the value is the smoother's active flag.
+    public bool IsSmoothingCorrection => Smoother is { IsActive: true };
 }

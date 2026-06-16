@@ -1,3 +1,4 @@
+using System.Numerics;
 using BallisticEngine.Networking;
 
 namespace BallisticEngine;
@@ -245,13 +246,25 @@ public sealed class NetworkManager {
             try { target.OnStateApplied(); }  // map the just-applied state onto presentation (transform)
             catch (Exception e) { ScriptGuard.Report(target, "OnStateApplied", e); }
 
-            // P5b RECONCILE: only the AUTONOMOUS PROXY (the owning client) trims + replays. The server
-            // snapshot just overwrote the predicted state with truth; now re-derive the present from the
-            // in-flight (unacked) inputs.
+            // P5b RECONCILE + P5d SMOOTHING: only the AUTONOMOUS PROXY (the owning client) trims + replays.
+            // The server snapshot just overwrote the predicted state with truth; now re-derive the present
+            // from the in-flight (unacked) inputs, then ease in any misprediction error.
             if (obj.HasInputAuthority && !obj.HasStateAuthority) {
                 obj.LastProcessedSeq = lastProcessedSeq;
                 PlayerController pc = FindController(obj);
-                pc?.Reconcile(lastProcessedSeq, _ => DriveNetworkTick(obj));
+                if (pc is not null) {
+                    // P5d: capture what the render showed BEFORE the correction; run the reconcile under the
+                    // IsReplaying flag (so [OnChanged] stays silent during re-derivation, not a real change);
+                    // then set the smoother so a misprediction eases in over the next frames, not a pop.
+                    Vector3 renderedBefore = obj.Entity?.transform.Position ?? Vector3.Zero;
+                    IsReplaying = true;
+                    pc.Reconcile(lastProcessedSeq, _ => DriveNetworkTick(obj));
+                    IsReplaying = false;
+                    if (obj.Entity is not null) {
+                        obj.Smoother ??= new PredictionSmoother();
+                        obj.Smoother.OnCorrection(renderedBefore, obj.Entity.transform.Position);
+                    }
+                }
             }
             // P5c INTERPOLATION: a SimulatedProxy (neither authority) does NOT simulate — it BUFFERS the
             // just-applied pose for smooth interpolation. The state-apply above may have moved the
@@ -414,6 +427,12 @@ public sealed class NetworkManager {
     // bound to the 60 Hz accumulator, NOT the render frame rate — the L2 fix).
     public int PredictionTicks { get; private set; }
 
+    // ReplicateState (P5d, plan §4b/§13 — Fusion's current-vs-replayed distinction): true ONLY during a
+    // reconcile's replay sub-ticks. [OnChanged] handlers check this and stay SILENT during replay — the
+    // state is being re-derived from buffered inputs, not genuinely changing, so a naive per-set callback
+    // would fire spuriously every rollback. The generated [OnChanged] dispatch (and game code) reads this.
+    public bool IsReplaying { get; private set; }
+
     // ---- the transport pump (once per FRAME) ------------------------------------------------------
     // Drains incoming / flushes outgoing on the socket — the IterateIncoming/IterateOutgoing brackets
     // (plan §8.2). Render-frame cadence is correct here (it is I/O, not simulation). The per-TICK
@@ -445,6 +464,14 @@ public sealed class NetworkManager {
                 // as data, buffer it by seq, predict locally THIS tick (zero round-trip = zero input lag).
                 CapturePredictionInputFor(obj, seq);
                 DriveNetworkTick(obj);
+                // P5d: ease in any pending misprediction correction (a decaying render offset on the
+                // transform) so a server correction doesn't pop — bounded per-frame step. No-op when the
+                // prediction was correct (offset 0). Only meaningful on a true AutonomousProxy (a host owns
+                // truth, so its predictions are authoritative — no correction to smooth).
+                if (obj.Smoother is { IsActive: true } && !obj.HasStateAuthority && obj.Entity is not null) {
+                    Vector3 off = obj.Smoother.Decay();
+                    obj.Entity.transform.Position += off;
+                }
                 // CLIENT (not the server): send the input UP so the server can authoritatively simulate it.
                 if (!IsServer)
                     SendInputUp(obj);
