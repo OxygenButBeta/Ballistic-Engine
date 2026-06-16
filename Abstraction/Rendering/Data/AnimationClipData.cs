@@ -29,12 +29,20 @@ public readonly struct AnimationClipData {
 // component) — the sampler then uses the bind-pose value for that component.
 public readonly struct BoneChannel {
     public readonly int BoneIndex;
+    // The source bone's NAME, kept so a clip can be RETARGETED onto a different skeleton (e.g. a Mixamo
+    // animation FBX played on a separately-imported character) by matching names instead of the fragile
+    // import-order index. Empty for v1 .banim artifacts (pre-retarget) — those only work on the same order.
+    public readonly string BoneName;
     public readonly VectorKey[] PositionKeys;
     public readonly QuaternionKey[] RotationKeys;
     public readonly VectorKey[] ScaleKeys;
 
-    public BoneChannel(int boneIndex, VectorKey[] positionKeys, QuaternionKey[] rotationKeys, VectorKey[] scaleKeys) {
+    public BoneChannel(int boneIndex, VectorKey[] positionKeys, QuaternionKey[] rotationKeys, VectorKey[] scaleKeys)
+        : this(boneIndex, null, positionKeys, rotationKeys, scaleKeys) { }
+
+    public BoneChannel(int boneIndex, string boneName, VectorKey[] positionKeys, QuaternionKey[] rotationKeys, VectorKey[] scaleKeys) {
         BoneIndex = boneIndex;
+        BoneName = boneName ?? "";
         PositionKeys = positionKeys ?? System.Array.Empty<VectorKey>();
         RotationKeys = rotationKeys ?? System.Array.Empty<QuaternionKey>();
         ScaleKeys = scaleKeys ?? System.Array.Empty<VectorKey>();

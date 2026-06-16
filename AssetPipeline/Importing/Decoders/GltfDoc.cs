@@ -578,7 +578,7 @@ internal sealed class GltfDoc {
 
     // ---- Animations --------------------------------------------------------
 
-    public AnimationClipData[] BuildAnimations(Dictionary<int, int> jointNodeToBone) {
+    public AnimationClipData[] BuildAnimations(Dictionary<int, int> jointNodeToBone, string[] boneNames = null) {
         if (!root.TryGetProperty("animations", out JsonElement animations))
             return [];
 
@@ -629,8 +629,10 @@ internal sealed class GltfDoc {
                 continue;
 
             var channels = new List<BoneChannel>();
-            foreach ((int bone, var tracks) in byBone)
-                channels.Add(new BoneChannel(bone, tracks.pos.ToArray(), tracks.rot.ToArray(), tracks.scale.ToArray()));
+            foreach ((int bone, var tracks) in byBone) {
+                string boneName = boneNames is not null && (uint)bone < (uint)boneNames.Length ? boneNames[bone] : "";
+                channels.Add(new BoneChannel(bone, boneName, tracks.pos.ToArray(), tracks.rot.ToArray(), tracks.scale.ToArray()));
+            }
 
             // glTF animation times are in SECONDS; store as ticks with ticksPerSecond = 1 so the
             // engine's seconds<->ticks math is a no-op.

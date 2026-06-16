@@ -43,7 +43,7 @@ public static class GltfSkinDecoder {
 
         SkeletonData skeleton = doc.BuildSkeleton(out var jointNodeToBone);
         MeshData mesh = doc.BuildSkinnedMesh(skeleton, jointNodeToBone, flipUVs);
-        AnimationClipData[] animations = doc.BuildAnimations(jointNodeToBone);
+        AnimationClipData[] animations = doc.BuildAnimations(jointNodeToBone, skeleton.BoneNames);
 
         return new AssimpSkinDecoder.DecodedSkinnedModel {
             Mesh = mesh,
