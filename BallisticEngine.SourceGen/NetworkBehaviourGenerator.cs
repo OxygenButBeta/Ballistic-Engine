@@ -349,12 +349,19 @@ public sealed class NetworkBehaviourGenerator : IIncrementalGenerator {
         sb.AppendLine("        }");
         sb.AppendLine("        public override bool __ReplStateEquals(object __b) {");
         sb.AppendLine("            if (__b is not __NetBaseline __v) return false;");
-        sb.Append("            return ");
-        for (int i = 0; i < t.Fields.Count; i++) {
-            if (i > 0) sb.Append(" && ");
-            sb.Append($"__NetEq(this.{t.Fields[i].Name}, __v.{t.Fields[i].Name})");
+        // Guard the 0-field case so it emits `return true;` not `return ;` (a non-void return needs a value) —
+        // matches the NetworkBehaviour path. A 0-field SceneReplicated is filtered out before emit today, so
+        // this is defensive: it keeps the emitted code valid if that gate ever changes.
+        if (t.Fields.Count == 0) {
+            sb.AppendLine("            return true;");
+        } else {
+            sb.Append("            return ");
+            for (int i = 0; i < t.Fields.Count; i++) {
+                if (i > 0) sb.Append(" && ");
+                sb.Append($"__NetEq(this.{t.Fields[i].Name}, __v.{t.Fields[i].Name})");
+            }
+            sb.AppendLine(";");
         }
-        sb.AppendLine(";");
         sb.AppendLine("        }");
         sb.AppendLine();
 

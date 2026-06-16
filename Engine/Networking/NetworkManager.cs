@@ -101,6 +101,10 @@ public sealed class NetworkManager {
     readonly List<Connection> clients = new();
     public IReadOnlyList<Connection> Clients => clients;
 
+    // Entity names already warned about the multi-networked-behaviour contract (warn ONCE per offending
+    // entity name, not every spawn — avoids log spam if a violating prefab is spawned repeatedly).
+    readonly HashSet<string> warnedMultiNet = new();
+
     // P6 PER-CLIENT replication state (plan §13 late-join): connection -> its delta baseline + pending +
     // send sequence. Created at join (HandleHandshake), dropped at disconnect. SERVER-side only. The
     // FlushStateDown loop diffs each object vs THIS client's baseline (the baseline-swap), so staggered
@@ -1391,6 +1395,14 @@ public sealed class NetworkManager {
         // strand afterward with the suppression dance.
         DriveNetSpawnStrand(netObj.Entity);
 
+        // CONTRACT (loud, §3 Grade-2): exactly ONE registered NetworkBehaviour per NetworkObject — the
+        // framework puts pawn / controller / player-state on SEPARATE entities by design. The spawn/mirror
+        // path (SendSpawnTo sends one Spawn frame per behaviour; HandleSpawn builds a fresh entity per frame)
+        // and the per-client baseline (keyed by netId) both assume this, so two registered networked
+        // behaviours on one entity would mirror as two colliding entities + a starved baseline. Warn once so
+        // the violation is visible at spawn rather than surfacing as a silent multi-client desync downstream.
+        WarnIfMultipleNetworkedBehaviours(netObj.Entity);
+
         // Replicate the spawn to every connected client (P3): a full Spawn so each builds the mirror
         // (owner->AutonomousProxy, others->SimulatedProxy per the §4d.1 table, resolved on each machine).
         // The Spawn carries a FULL snapshot + the echoed predictKey (P5f, 0 = normal); capture the baseline
@@ -1401,6 +1413,23 @@ public sealed class NetworkManager {
             if (b is NetworkBehaviour { HasNetworkedState: true } nb)
                 nb.CaptureNetworkBaseline();
         return netObj;
+    }
+
+    // Enforce "one registered NetworkBehaviour per NetworkObject" loudly (the contract SendSpawnTo + the
+    // per-client baseline both rely on). A registered behaviour has a non-zero NetworkTypeId (a [Networked]
+    // or [Rpc] generated type, or a partial mirror-spawnable one). Warns ONCE per entity name.
+    void WarnIfMultipleNetworkedBehaviours(Entity entity) {
+        if (entity is null)
+            return;
+        int registered = 0;
+        foreach (Behaviour b in entity.Behaviours)
+            if (b is NetworkBehaviour { NetworkTypeId: not 0 })
+                registered++;
+        if (registered > 1 && warnedMultiNet.Add(entity.Name))
+            Debugging.LogWarning(
+                $"Network: entity '{entity.Name}' has {registered} registered NetworkBehaviours. The framework " +
+                "supports ONE per NetworkObject (put pawn/controller/player-state on SEPARATE entities). " +
+                "Multiple will mirror as colliding entities + a starved per-client baseline.");
     }
 
     // The §4d.1 truth-table, as a PURE function of (this machine's topology, this machine's connection,
