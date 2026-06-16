@@ -15,17 +15,33 @@ namespace BallisticEngine.DX12;
 public sealed class Dx12DescriptorHeap : IDisposable {
     public ID3D12DescriptorHeap Heap { get; }
     readonly uint increment;   // Vortice: GetDescriptorHandleIncrementSize returns uint
-    readonly int capacity;
-    int cursor;
+    readonly int capacity;     // PER-FRAME-SLOT logical capacity (the physical heap is capacity*framesInFlight)
+    int cursor;                // SLOT-LOCAL bump cursor (0..capacity); Cpu/Gpu rebase it by the frame slot
     readonly CpuDescriptorHandle cpuStart;
     readonly GpuDescriptorHandle gpuStart;   // only valid when shader-visible
     public bool ShaderVisible { get; }
 
-    public Dx12DescriptorHeap(Dx12Device dev, DescriptorHeapType type, int capacity, bool shaderVisible) {
+    // P0b — N-BUFFERING. A per-frame shader-visible heap the CPU re-fills every frame would, once the CPU runs
+    // ahead of the GPU, overwrite the descriptors frame N's draws are still reading. Passing framesInFlight=N
+    // (= dev.FramesInFlight) sizes the physical heap N× and offsets EVERY handle by `dev.FrameSlot * capacity`,
+    // so frame N and frame N+1 occupy DISJOINT descriptor ranges. The offset lives in the Cpu()/Gpu() ACCESSORS
+    // (not in Reset) so it applies uniformly to BOTH usage styles with zero call-site changes: cursor-based
+    // heaps (Reset → AllocateRange → Cpu(returnedIndex)) AND fixed-index heaps (Cpu(0), Cpu(1), … never Reset).
+    // framesInFlight=1 (default) → base is always 0 → byte-identical to the pre-P0b single-slab heap. Persistent
+    // heaps (the SrvStore "home" heap, bindless, editor UI), RT/GI/HiZ/OIDN heaps, and the IBL-baker heap stay
+    // at 1: they're either process-lifetime, written under a synchronous flush, or off-limits (Lumen).
+    readonly Dx12Device dev;
+    readonly int framesInFlight;
+    int Base => dev.FrameSlot * capacity;   // slot offset in descriptors; 0 when framesInFlight==1 (FrameSlot stays 0)
+
+    public Dx12DescriptorHeap(Dx12Device dev, DescriptorHeapType type, int capacity, bool shaderVisible,
+                              int framesInFlight = 1) {
+        this.dev = dev;
         this.capacity = capacity;
+        this.framesInFlight = Math.Max(1, framesInFlight);
         ShaderVisible = shaderVisible;
         Heap = dev.Device.CreateDescriptorHeap(new DescriptorHeapDescription(
-            type, (uint)capacity,
+            type, (uint)(capacity * this.framesInFlight),
             shaderVisible ? DescriptorHeapFlags.ShaderVisible : DescriptorHeapFlags.None));
         increment = dev.Device.GetDescriptorHandleIncrementSize(type);
         cpuStart = Heap.GetCPUDescriptorHandleForHeapStart();
@@ -68,14 +84,15 @@ public sealed class Dx12DescriptorHeap : IDisposable {
         }
     }
 
-    public void Reset() => cursor = 0;
+    public void Reset() => cursor = 0;   // slot-LOCAL rewind; Cpu/Gpu add the per-frame Base offset
 
     // Vortice handle-offset ctor: (baseHandle, int offsetInDescriptors, uint descriptorIncrementSize).
+    // `index` is SLOT-LOCAL (0..capacity); Base rebases it into this frame's slot (0 when framesInFlight==1).
     public CpuDescriptorHandle Cpu(int index) =>
-        new(cpuStart, index, increment);
+        new(cpuStart, Base + index, increment);
 
     public GpuDescriptorHandle Gpu(int index) =>
-        new(gpuStart, index, increment);
+        new(gpuStart, Base + index, increment);
 
     public void Dispose() => Heap.Dispose();
 }
