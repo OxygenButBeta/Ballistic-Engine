@@ -89,8 +89,9 @@ public class WheelCollider : Behaviour {
     bool wheelMeshResolved;
     float rollAngle; // accumulated rolling angle (rad) about the wheel's spin axis
 
-    // Render-frame visual: roll the wheel mesh by ground speed and turn it by the steer angle, so the
-    // wheels visibly spin and the front wheels point where you steer. Pure cosmetic (no physics).
+    // Render-frame visual: place the wheel mesh ON the ground (it follows the suspension travel instead
+    // of being stuck at the fixed mount, which made wheels float or sink into terrain as the suspension
+    // moved), roll it by ground speed, and steer the front wheels. Pure cosmetic (no physics).
     protected internal override void Tick(in float delta) {
         if (!SceneManager.IsPlaying || delta <= 0f)
             return;
@@ -107,20 +108,31 @@ public class WheelCollider : Behaviour {
         if (wheelMesh is null)
             return;
 
-        chassis ??= entity.GetComponentInParent<Rigidbody>();
-        // Rolling: angular speed = forward ground speed / radius. Sign from the wheel's forward axis.
-        float forwardSpeed = chassis is not null
-            ? Vector3.Dot(chassis.Velocity, transform.Forward)
-            : 0f;
-        rollAngle += forwardSpeed / MathF.Max(0.05f, Radius) * delta;
-        // Keep the accumulated angle bounded to [-π, π] so the float never drifts large.
-        rollAngle -= MathF.Tau * MathF.Round(rollAngle / MathF.Tau);
+        Transform t = transform;
+        Vector3 up = t.Up;
 
-        // Compose: steer about local up (Y), then roll about local right (X). The mesh's local rotation
-        // is fully driven here, so it reads the live steer + roll without touching the collider transform.
+        // POSITION: sit the wheel centre one radius above the suspension contact (so it rests on the
+        // ground and rides up/down with the suspension). When airborne, hang it at full droop from the
+        // mount. The mesh is a child of the wheel entity, so convert the world target to the child's
+        // local space via the wheel entity's inverse world matrix.
+        Vector3 worldTarget = IsGrounded
+            ? ContactPoint + up * Radius
+            : t.WorldPosition - up * SuspensionTravel;
+        wheelMesh.WorldPosition = worldTarget;
+
+        // ROLL: angular speed = forward ground speed / radius, about the wheel's spin AXLE. The axle is
+        // the wheel's RIGHT axis (left-right), so rolling is a rotation about local X.
+        chassis ??= entity.GetComponentInParent<Rigidbody>();
+        float forwardSpeed = chassis is not null ? Vector3.Dot(chassis.Velocity, t.Forward) : 0f;
+        rollAngle += forwardSpeed / MathF.Max(0.05f, Radius) * delta;
+        rollAngle -= MathF.Tau * MathF.Round(rollAngle / MathF.Tau); // keep in [-π, π]
+
+        // Steer about the wheel's up (Y), THEN roll about its right (X). Applied as the mesh's WORLD
+        // rotation off the wheel entity's world rotation so it matches the car's orientation on slopes.
+        Quaternion baseRot = t.WorldRotation;
         Quaternion steer = Quaternion.CreateFromAxisAngle(Vector3.UnitY, SteerAngle);
         Quaternion roll = Quaternion.CreateFromAxisAngle(Vector3.UnitX, rollAngle);
-        wheelMesh.Rotation = steer * roll;
+        wheelMesh.WorldRotation = baseRot * steer * roll;
     }
 
     protected internal override void FixedTick(in float dt) {
