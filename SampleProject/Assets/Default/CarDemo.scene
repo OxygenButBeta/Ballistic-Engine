@@ -2,13 +2,43 @@ version: 1
 name: Scene
 sceneComponents:
 - type: ProceduralSky
-  id: 068e3eeeb7c64c73be42cd8fa96481c2
+  id: e769f34afca24b9480f6711c972de2f3
   enabled: true
-  members: {}
+  members:
+    exposure: 1
+    airDensity: 1
+    haze: 1
+    hazeAnisotropy: 0.8
+    ozoneDensity: 1
+    groundColor: {x: 0.25, y: 0.24, z: 0.22}
+    multipleScattering: 2.2
+    sunDiskIntensity: 1
+    resolution: 256
+    cloudsEnabled: true
+    cloudCoverage: 0.45
+    cloudDensity: 1
+    cloudAltitude: 1500
+    cloudThickness: 2600
+    cloudScale: 1
+    cloudDetail: 0.5
+    cloudAmbient: 1
+    cloudWindSpeed: 5
+    cloudWindDirection: 0
+    cloudUpdateInterval: 0
+    cirrusCoverage: 0.3
+    starIntensity: 1
 - type: SceneLighting
-  id: 6bb91e53795e47d09cb93390c32ae5c8
+  id: b330c1f12a234605801467ac6d9cfd42
   enabled: true
-  members: {}
+  members:
+    ambientColor: {x: 1, y: 1, z: 1}
+    ambientIntensity: 1
+    reflectionIntensity: 1
+    shadowColor: {x: 0, y: 0, z: 0}
+    shadowStrength: 1
+    fogEnabled: false
+    fogColor: {x: 0.6, y: 0.7, z: 0.9}
+    fogDensity: 0.0015
 entities:
 - id: 362ce5ee44d943e586b4cd730433ffa5
   name: Ground
@@ -27,12 +57,17 @@ entities:
     enabled: true
     members:
       size: {x: 1, y: 1, z: 1}
+      center: {x: 0, y: 0, z: 0}
+      friction: 0.6
+      bounciness: 0
+      isTrigger: false
   - type: StaticMeshRenderer
     id: b2943f56e99249a1902a63799ee208b5
     enabled: true
     members:
-      sharedMesh: Assets/Default/Meshes/Cube.obj
-      sharedMaterial: Assets/Default/Materials/Default.mat
+      sharedMesh: guid:1373de82334d41269f8bb0028d678db9
+      sharedMaterial: guid:c13c6e1f320940ce81adcdcbda99e5b7
+      subMeshIndex: -1
 - id: 705c34c9062a44c78848c4c26ad33455
   name: Car
   isActive: true
@@ -40,7 +75,7 @@ entities:
   layer: 0
   prefabSource: 
   transform:
-    position: {x: 0, y: 1.7, z: 0}
+    position: {x: 0, y: 4.4430246, z: 0}
     rotation: {x: 0, y: 0, z: 0, w: 1}
     scale: {x: 1, y: 1, z: 1}
     parent: 
@@ -50,12 +85,20 @@ entities:
     enabled: true
     members:
       mass: 800
+      isKinematic: false
       freezeRotation: false
+      useGravity: true
+      linearDamping: 0
+      angularDamping: 0.05
   - type: BoxCollider
     id: 529869623d9f4374bdfe0e73aa7b8912
     enabled: true
     members:
       size: {x: 2, y: 0.6, z: 4}
+      center: {x: 0, y: 0, z: 0}
+      friction: 0.6
+      bounciness: 0
+      isTrigger: false
   - type: VehicleController
     id: f485236d86684cfb94f259b77d5b85c8
     enabled: true
@@ -64,14 +107,19 @@ entities:
       reverseForce: 3000
       brakeForce: 20000
       maxSpeed: 35
+      accelCurve: 2
       maxSteerAngle: 32
       highSpeedSteerScale: 0.4
       steerResponse: 12
-      yawResponse: 10
-      maxYawRate: 1.6
-      arcadeGrip: 16
+      steerReturn: 20
       antiRoll: 40000
       downforce: 2000
+      yawResponse: 25
+      maxYawRate: 1.6
+      wheelbase: 3
+      arcadeGrip: 16
+      frontWheelDrive: false
+      rearWheelDrive: true
 - id: 0c9306babb344538b20e5a00f3d42c49
   name: WheelFL
   isActive: true
@@ -88,11 +136,15 @@ entities:
     id: 35dd0ed084a9456299b63ca5c1700cb8
     enabled: true
     members:
-      gripBudget: 3
+      radius: 0.35
+      suspensionTravel: 0.3
       suspensionStiffness: 18000
       suspensionDamping: 2500
       sidewaysGrip: 0
+      gripBudget: 3
       gripRelax: 0.5
+      forwardGrip: 1
+      rollingResistance: 0.04
 - id: 45c4dcaf88ef4207a0b14ad2399a9cb5
   name: WheelFR
   isActive: true
@@ -109,11 +161,15 @@ entities:
     id: 2a79b01b0d9d4635ab81304c49931d0c
     enabled: true
     members:
-      gripBudget: 3
+      radius: 0.35
+      suspensionTravel: 0.3
       suspensionStiffness: 18000
       suspensionDamping: 2500
       sidewaysGrip: 0
+      gripBudget: 3
       gripRelax: 0.5
+      forwardGrip: 1
+      rollingResistance: 0.04
 - id: c8c13986008b4068a18969134a2c8eb5
   name: WheelRL
   isActive: true
@@ -130,11 +186,15 @@ entities:
     id: 8e686083ad9e4e2b8d30f8f997f80cf2
     enabled: true
     members:
-      gripBudget: 3
+      radius: 0.35
+      suspensionTravel: 0.3
       suspensionStiffness: 18000
       suspensionDamping: 2500
       sidewaysGrip: 0
+      gripBudget: 3
       gripRelax: 0.5
+      forwardGrip: 1
+      rollingResistance: 0.04
 - id: a58b0f5d6d5c4eca9723aed72f656d8e
   name: WheelRR
   isActive: true
@@ -151,11 +211,15 @@ entities:
     id: e5571404053b4532b4f32026710dec7d
     enabled: true
     members:
-      gripBudget: 3
+      radius: 0.35
+      suspensionTravel: 0.3
       suspensionStiffness: 18000
       suspensionDamping: 2500
       sidewaysGrip: 0
+      gripBudget: 3
       gripRelax: 0.5
+      forwardGrip: 1
+      rollingResistance: 0.04
 - id: 9846974dbe38441d887e72cd840897e3
   name: MainCamera
   isActive: true
@@ -176,11 +240,14 @@ entities:
     id: ece841d344f046a698684ca1ff588223
     enabled: true
     members:
+      targetName: ''
       distance: 8
       height: 3.5
+      lookHeight: 1
       positionSmooth: 8
       rotationSmooth: 12
       speedPullback: 3
+      pullbackAtSpeed: 35
 - id: 4badeb9d29c24fe4a560fc8e3272babb
   name: Sun
   isActive: true
@@ -196,7 +263,13 @@ entities:
   - type: DirectionalLight
     id: 247675e6abfe474c9aa04b71357863ec
     enabled: true
-    members: {}
+    members:
+      ambientIntensity: 0.3
+      illuminance: 80000
+      colorTemperature: 5500
+      angularDiameter: 0.53
+      shadowDistance: 60
+      shadowBias: 0.0015
 - id: 3ba6367396a84e51b57c3fa0d7ef347e
   name: Body
   isActive: true
@@ -213,8 +286,9 @@ entities:
     id: 6a9f017832704ac4b0976f7ff6304e9a
     enabled: true
     members:
-      sharedMesh: Assets/Default/Meshes/Cube.obj
-      sharedMaterial: Assets/Default/Materials/Default.mat
+      sharedMesh: guid:1373de82334d41269f8bb0028d678db9
+      sharedMaterial: guid:c13c6e1f320940ce81adcdcbda99e5b7
+      subMeshIndex: -1
 - id: 28241471a2e54acf8cf99edc71174c5b
   name: WheelFLMesh
   isActive: true
@@ -231,8 +305,9 @@ entities:
     id: 6375b0d096e9462dbd029799b0df05ad
     enabled: true
     members:
-      sharedMesh: Assets/Default/Meshes/Sphere.obj
-      sharedMaterial: Assets/Default/Materials/Default.mat
+      sharedMesh: guid:f6372b95f56f4f029d948791a97ddd22
+      sharedMaterial: guid:996ace4a785a413c987eeaf368e11000
+      subMeshIndex: -1
 - id: 3a11e8bc2e394c37bf93cebe6e1f94a4
   name: WheelFRMesh
   isActive: true
@@ -249,8 +324,9 @@ entities:
     id: b39db115bf5644548efd141b1ac937d2
     enabled: true
     members:
-      sharedMesh: Assets/Default/Meshes/Sphere.obj
-      sharedMaterial: Assets/Default/Materials/Default.mat
+      sharedMesh: guid:f6372b95f56f4f029d948791a97ddd22
+      sharedMaterial: guid:996ace4a785a413c987eeaf368e11000
+      subMeshIndex: -1
 - id: bae0efefe89346c2be56e212cf5d33f1
   name: WheelRLMesh
   isActive: true
@@ -267,8 +343,9 @@ entities:
     id: 890f74e30df74acc85346fa0ce409ab2
     enabled: true
     members:
-      sharedMesh: Assets/Default/Meshes/Sphere.obj
-      sharedMaterial: Assets/Default/Materials/Default.mat
+      sharedMesh: guid:f6372b95f56f4f029d948791a97ddd22
+      sharedMaterial: guid:996ace4a785a413c987eeaf368e11000
+      subMeshIndex: -1
 - id: b5b4ee61d9894882ab16c03d5c212a91
   name: WheelRRMesh
   isActive: true
@@ -285,5 +362,193 @@ entities:
     id: 36d6ed8e303c49dda345c4baad36a77b
     enabled: true
     members:
-      sharedMesh: Assets/Default/Meshes/Sphere.obj
-      sharedMaterial: Assets/Default/Materials/Default.mat
+      sharedMesh: guid:f6372b95f56f4f029d948791a97ddd22
+      sharedMaterial: guid:996ace4a785a413c987eeaf368e11000
+      subMeshIndex: -1
+- id: 31404b44f4f244418632a497cabab3b8
+  name: Terrain
+  isActive: true
+  tag: 
+  layer: 0
+  prefabSource: 
+  transform:
+    position: {x: 2.6673987, y: 0.87366533, z: 2.2582116}
+    rotation: {x: 0, y: 0, z: 0, w: 1}
+    scale: {x: 1, y: 1, z: 1}
+    parent: 
+  components:
+  - type: Terrain
+    id: eed995b175794e7aa9bdb82929cb9db5
+    enabled: true
+    members:
+      terrain3D: guid:246545e3ddbd45cf9ac9e07a66582aee
+      material: guid:996ace4a785a413c987eeaf368e11000
+      generateCollider: true
+  - type: StaticMeshRenderer
+    id: 2ec429c6c5ef44ae977650b1cf0b7777
+    enabled: true
+    members:
+      sharedMaterial: guid:996ace4a785a413c987eeaf368e11000
+      subMeshIndex: -1
+  - type: MeshCollider
+    id: da06aa07528042f4b4b414a1daabb881
+    enabled: true
+    members:
+      center: {x: 0, y: 0, z: 0}
+      friction: 0.6
+      bounciness: 0
+      isTrigger: false
+  - type: StaticMeshRenderer
+    id: e3d4ac5cfd1f40fea4207df7880c9cf9
+    enabled: true
+    members:
+      sharedMaterial: guid:996ace4a785a413c987eeaf368e11000
+      subMeshIndex: -1
+  - type: MeshCollider
+    id: 4dc48f642e51452e809fb97646f75b34
+    enabled: true
+    members:
+      center: {x: 0, y: 0, z: 0}
+      friction: 0.6
+      bounciness: 0
+      isTrigger: false
+  - type: StaticMeshRenderer
+    id: 43ac8aebda394ecd900ace57a3a35ece
+    enabled: true
+    members:
+      sharedMaterial: guid:996ace4a785a413c987eeaf368e11000
+      subMeshIndex: -1
+  - type: MeshCollider
+    id: 2ea9a7eba7174fce9210905d6cf1ea31
+    enabled: true
+    members:
+      center: {x: 0, y: 0, z: 0}
+      friction: 0.6
+      bounciness: 0
+      isTrigger: false
+  - type: StaticMeshRenderer
+    id: e42949aa1b1d4bb48709cd99af128731
+    enabled: true
+    members:
+      sharedMaterial: guid:996ace4a785a413c987eeaf368e11000
+      subMeshIndex: -1
+  - type: MeshCollider
+    id: aff67917f9f6476ca694113d49c04f12
+    enabled: true
+    members:
+      center: {x: 0, y: 0, z: 0}
+      friction: 0.6
+      bounciness: 0
+      isTrigger: false
+  - type: StaticMeshRenderer
+    id: 525d7d2696bd41ffacad47623f69f2b2
+    enabled: true
+    members:
+      sharedMaterial: guid:996ace4a785a413c987eeaf368e11000
+      subMeshIndex: -1
+  - type: MeshCollider
+    id: 9368dfe2bc294fb9b8f64854625d1a28
+    enabled: true
+    members:
+      center: {x: 0, y: 0, z: 0}
+      friction: 0.6
+      bounciness: 0
+      isTrigger: false
+  - type: StaticMeshRenderer
+    id: 4471c4a10b984ff592a61d7f3afdc78e
+    enabled: true
+    members:
+      sharedMaterial: guid:996ace4a785a413c987eeaf368e11000
+      subMeshIndex: -1
+  - type: MeshCollider
+    id: 11f602601604416aa744fff0f9b4b58a
+    enabled: true
+    members:
+      center: {x: 0, y: 0, z: 0}
+      friction: 0.6
+      bounciness: 0
+      isTrigger: false
+  - type: StaticMeshRenderer
+    id: 3ae28f1a091c4129a4992c01659c23ba
+    enabled: true
+    members:
+      sharedMaterial: guid:996ace4a785a413c987eeaf368e11000
+      subMeshIndex: -1
+  - type: MeshCollider
+    id: 595ec1abc8814da29b1e3ea692ccd22b
+    enabled: true
+    members:
+      center: {x: 0, y: 0, z: 0}
+      friction: 0.6
+      bounciness: 0
+      isTrigger: false
+  - type: StaticMeshRenderer
+    id: 026bf60c16c849c185fa3e9256133237
+    enabled: true
+    members:
+      sharedMaterial: guid:996ace4a785a413c987eeaf368e11000
+      subMeshIndex: -1
+  - type: MeshCollider
+    id: 90e75e719a0d47608f22e911cfc8f97b
+    enabled: true
+    members:
+      center: {x: 0, y: 0, z: 0}
+      friction: 0.6
+      bounciness: 0
+      isTrigger: false
+  - type: StaticMeshRenderer
+    id: db2c3a1202d74466895abcbc131311dd
+    enabled: true
+    members:
+      sharedMaterial: guid:996ace4a785a413c987eeaf368e11000
+      subMeshIndex: -1
+  - type: MeshCollider
+    id: cc17fcdfac244ccfb5385640c8d5268b
+    enabled: true
+    members:
+      center: {x: 0, y: 0, z: 0}
+      friction: 0.6
+      bounciness: 0
+      isTrigger: false
+  - type: StaticMeshRenderer
+    id: 018a8f83af6a46e0a3e9b4f9c32e7278
+    enabled: true
+    members:
+      sharedMaterial: guid:996ace4a785a413c987eeaf368e11000
+      subMeshIndex: -1
+  - type: MeshCollider
+    id: b6aa960697944847968c4d30d684c149
+    enabled: true
+    members:
+      center: {x: 0, y: 0, z: 0}
+      friction: 0.6
+      bounciness: 0
+      isTrigger: false
+  - type: StaticMeshRenderer
+    id: b437ab921de54046863870f77c079f84
+    enabled: true
+    members:
+      sharedMaterial: guid:996ace4a785a413c987eeaf368e11000
+      subMeshIndex: -1
+  - type: MeshCollider
+    id: b22d6868cdd24428b5758447b6c41809
+    enabled: true
+    members:
+      center: {x: 0, y: 0, z: 0}
+      friction: 0.6
+      bounciness: 0
+      isTrigger: false
+  - type: StaticMeshRenderer
+    id: ec09f7ea318f41fcbdfc3fa5601f56e1
+    enabled: true
+    members:
+      sharedMaterial: guid:996ace4a785a413c987eeaf368e11000
+      subMeshIndex: -1
+  - type: MeshCollider
+    id: e5b4ff1536fe4260932cb1f41bc78787
+    enabled: true
+    members:
+      center: {x: 0, y: 0, z: 0}
+      friction: 0.6
+      bounciness: 0
+      isTrigger: false

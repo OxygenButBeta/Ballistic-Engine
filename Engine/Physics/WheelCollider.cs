@@ -84,6 +84,45 @@ public class WheelCollider : Behaviour {
 
     int WheelCount() => Math.Max(1, SharedWheelCount);
 
+    // Visual spin/steer of the wheel MESH (a child entity, e.g. "WheelFLMesh"). Cached on first Tick.
+    Transform wheelMesh;
+    bool wheelMeshResolved;
+    float rollAngle; // accumulated rolling angle (rad) about the wheel's spin axis
+
+    // Render-frame visual: roll the wheel mesh by ground speed and turn it by the steer angle, so the
+    // wheels visibly spin and the front wheels point where you steer. Pure cosmetic (no physics).
+    protected internal override void Tick(in float delta) {
+        if (!SceneManager.IsPlaying || delta <= 0f)
+            return;
+        if (!wheelMeshResolved) {
+            // First child with a StaticMeshRenderer is the visual wheel.
+            foreach (Entity child in entity.DirectChildren()) {
+                if (child.GetComponent<StaticMeshRenderer>() is not null) {
+                    wheelMesh = child.transform;
+                    break;
+                }
+            }
+            wheelMeshResolved = true;
+        }
+        if (wheelMesh is null)
+            return;
+
+        chassis ??= entity.GetComponentInParent<Rigidbody>();
+        // Rolling: angular speed = forward ground speed / radius. Sign from the wheel's forward axis.
+        float forwardSpeed = chassis is not null
+            ? Vector3.Dot(chassis.Velocity, transform.Forward)
+            : 0f;
+        rollAngle += forwardSpeed / MathF.Max(0.05f, Radius) * delta;
+        // Keep the accumulated angle bounded to [-π, π] so the float never drifts large.
+        rollAngle -= MathF.Tau * MathF.Round(rollAngle / MathF.Tau);
+
+        // Compose: steer about local up (Y), then roll about local right (X). The mesh's local rotation
+        // is fully driven here, so it reads the live steer + roll without touching the collider transform.
+        Quaternion steer = Quaternion.CreateFromAxisAngle(Vector3.UnitY, SteerAngle);
+        Quaternion roll = Quaternion.CreateFromAxisAngle(Vector3.UnitX, rollAngle);
+        wheelMesh.Rotation = steer * roll;
+    }
+
     protected internal override void FixedTick(in float dt) {
         if (!SceneManager.IsPlaying)
             return;
@@ -134,11 +173,15 @@ public class WheelCollider : Behaviour {
         springForce = MathF.Max(0f, springForce);
         chassis.AddForceAtPosition(up * springForce, ContactPoint);
 
-        // The friction budget scales with how hard this tyre presses the ground (the spring force).
-        // A planted wheel grips hard; a wheel going light in a corner grips less — natural weight
-        // transfer for free. A small floor keeps a momentarily-light wheel from going fully to ice.
+        // The friction budget is based on the wheel's STABLE STATIC LOAD (its share of the car's
+        // weight), NOT the instantaneous springForce. springForce includes the damper term
+        // (-SuspensionDamping*upSpeed): on tilting terrain the suspension bobs, upSpeed spikes, and the
+        // damper drove springForce — and thus the budget — to ~0, clamping drive to a crawl that never
+        // recovered (the post-turn "stall"). Using the static load keeps a grounded wheel's grip/drive
+        // budget steady; springForce only adds a little EXTRA budget for genuine weight transfer (a
+        // squatting wheel grips a bit more), never subtracts below the stable floor.
         float loadPerWheel = chassis.Mass * Physics.Gravity.Length() / WheelCount();
-        float normalLoad = MathF.Max(springForce, loadPerWheel * 0.25f);
+        float normalLoad = loadPerWheel + MathF.Max(0f, springForce - loadPerWheel) * 0.5f;
         float frictionBudget = GripBudget * normalLoad;
 
         // --- Lateral grip: cancel the sideways slip toward zero, RELAXED over a few steps. ---------
@@ -190,18 +233,16 @@ public class WheelCollider : Behaviour {
         float remaining = MathF.Sqrt(MathF.Max(0f, maxImpulse * maxImpulse - longImpulse * longImpulse));
         float latImpulse = MathHelper.Clamp(desiredLatImpulse, -remaining, remaining);
 
-        // Apply as forces (the Rigidbody integrates AddForceAtPosition as force*dt = impulse).
-        // LATERAL grip is applied at a RAISED point — the contact lifted toward the chassis centre of
-        // mass (the "roll centre") — so cornering force doesn't barrel-roll the car. A lateral force at
-        // the ground contact (0.5 m below the COM) makes a big roll moment; with four wheels pushing
-        // the same way it became a self-sustaining barrel roll that bled off all forward speed. Raising
-        // the application point to the COM height removes that moment while keeping the same linear
-        // grip — exactly how a high roll centre / stiff anti-roll bar plants an arcade car.
-        // LONGITUDINAL force stays at the contact so squat-under-accel / dive-under-brake pitch reads.
+        // Apply lateral + longitudinal grip at a RAISED point — the contact lifted to the chassis centre
+        // of mass (the "roll centre"). A grip force at the ground contact (0.5 m below the COM) makes a
+        // big moment: lateral force barrel-rolls the car, and a hard BRAKE force pitches/yaws it so the
+        // car lurches sideways when you slam the brakes. Applying both at COM height removes those
+        // moments while keeping the exact same linear accel/brake/grip — the planted arcade feel. (We
+        // give up squat/dive pitch realism, which an arcade car doesn't need and which caused the lurch.)
         Vector3 com = chassis.transform.WorldPosition;
-        Vector3 lateralPoint = new Vector3(ContactPoint.X, com.Y, ContactPoint.Z);
-        chassis.AddForceAtPosition(right * (latImpulse / dt), lateralPoint);
-        chassis.AddForceAtPosition(forward * (longImpulse / dt), ContactPoint);
+        var gripPoint = new Vector3(ContactPoint.X, com.Y, ContactPoint.Z);
+        chassis.AddForceAtPosition(right * (latImpulse / dt), gripPoint);
+        chassis.AddForceAtPosition(forward * (longImpulse / dt), gripPoint);
 
         MotorForce = BrakeForce = 0f; // consumed
         Handbrake = false;

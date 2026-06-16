@@ -65,11 +65,12 @@ public class VehicleController : Behaviour {
     [Range(0f, 50000f)]
     public float Downforce { get; set; } = 2000f;
 
-    [Tooltip("Yaw response: how fast the car's turn rate reaches what the steering commands (per " +
-             "second). High = instant, crisp arcade turn-in; lower = heavier. The nose tracks this " +
-             "exactly (no overshoot), and the grip turns the velocity with it, so it never spins out.")]
-    [Range(2f, 30f)]
-    public float YawResponse { get; set; } = 10f;
+    [Tooltip("Yaw response: how hard the car's turn rate is driven to what the steering commands (per " +
+             "second). Also the stiffness of the closed yaw loop — high values actively CANCEL any yaw " +
+             "drift (from anti-roll/terrain/uneven grip) when you're going straight, so the car holds " +
+             "its line instead of self-steering. High = instant, crisp turn-in AND dead-straight tracking.")]
+    [Range(2f, 40f)]
+    public float YawResponse { get; set; } = 25f;
 
     [Tooltip("Maximum turn rate (rad/s) — caps how fast the car can rotate so a hard corner stays tight " +
              "but never spins the car so fast it rolls over. ~1.5 = tight arcade; lower = wider, calmer.")]
@@ -128,7 +129,9 @@ public class VehicleController : Behaviour {
 
         float throttle = ReadAxis(Keys.W, Keys.S) + Input.GetLeftStick().Y;
         throttle = MathHelper.Clamp(throttle, -1f, 1f);
-        float steerInput = ReadAxis(Keys.D, Keys.A) + Input.GetLeftStick().X;
+        // D = steer right, A = steer left. The minus flips the raw axis so it matches what the driver
+        // sees behind the chase camera in this engine's yaw/right convention (A/D were reversed without).
+        float steerInput = -(ReadAxis(Keys.D, Keys.A) + Input.GetLeftStick().X);
         steerInput = MathHelper.Clamp(steerInput, -1f, 1f);
         bool handbrake = Input.IsKeyDown(Keys.Space);
 
@@ -162,20 +165,30 @@ public class VehicleController : Behaviour {
         targetYawRate = MathHelper.Clamp(targetYawRate, -MaxYawRate, MaxYawRate);
 
         // --- Motor: punchy launch that tapers toward top speed. Forward and reverse handled apart.
+        // headroom uses |signedSpeed| only as a top-speed limiter, never to cut drive: when the car is
+        // sliding backward relative to its nose (signedSpeed < 0) but the driver holds W, we still want
+        // FULL forward drive to recover — so clamp headroom to [0,1] from the forward speed only.
         float motor = 0f;
         if (throttle > 0.01f) {
-            float headroom = MathHelper.Clamp(1f - signedSpeed / MaxSpeed, 0f, 1f);
+            float fwdSpeed = MathF.Max(0f, signedSpeed); // ignore backward slip for the taper
+            float headroom = MathHelper.Clamp(1f - fwdSpeed / MaxSpeed, 0f, 1f);
             motor = throttle * MotorForce * MathF.Pow(headroom, AccelCurve);
         } else if (throttle < -0.01f) {
             float reverseTop = MaxSpeed * 0.5f; // reverse tops out slower
-            float headroom = MathHelper.Clamp(1f + signedSpeed / reverseTop, 0f, 1f);
+            float backSpeed = MathF.Max(0f, -signedSpeed);
+            float headroom = MathHelper.Clamp(1f - backSpeed / reverseTop, 0f, 1f);
             motor = throttle * ReverseForce * MathF.Pow(headroom, AccelCurve);
         }
 
-        // Brake when the throttle clearly opposes forward motion (press S while rolling forward = brake,
-        // not instant reverse). Requires a real forward/back speed so a momentary slip (signedSpeed
-        // dipping negative mid-corner) can't false-trigger the brakes and bog the car.
-        bool braking = MathF.Abs(throttle) > 0.01f && signedSpeed * throttle < -1.5f;
+        // Brake ONLY on the player pressing the OPPOSITE of their latched drive intent while still
+        // rolling that way (hold S while driving forward = brake). It must NOT use signedSpeed alone:
+        // in a hard corner the car can slide so its nose points away from its velocity (signedSpeed goes
+        // negative) while you hold W — that used to be read as "braking", cut the motor, and the car got
+        // stuck crawling and could never re-accelerate (the post-turn stall). Keying off drive INTENT
+        // (reversing latch) means W always drives forward; only a real S-while-going-forward brakes.
+        bool brakeForward = !reversing && throttle < -0.01f && signedSpeed > 1.5f;   // S while going fwd
+        bool brakeReverse = reversing && throttle > 0.01f && signedSpeed < -1.5f;     // W while going back
+        bool braking = brakeForward || brakeReverse;
         if (braking)
             motor = 0f;
 
@@ -215,63 +228,70 @@ public class VehicleController : Behaviour {
     // slip-projected speed) for the yaw target keeps it from whipsawing. Pitch/roll stay with the
     // suspension + anti-roll, so bumps and lean still read physically.
     void ApplyArcadeHandling(Transform chassisT, float dt) {
-        // 1) YAW: drive the body's yaw rate toward what the steering commands (framerate-correct, no
-        //    overshoot). Set only the yaw component of angular velocity; pitch/roll stay with the
-        //    suspension. This rotates the NOSE crisply to the asked-for turn rate.
+        // Everything here is applied as TORQUE / FORCE only (never a direct velocity/angular-velocity
+        // write). Direct writes wake the body and fight the Rigidbody's between-step pose-diff teleport
+        // (an external transform/velocity change is treated like a gizmo drag), which under the editor's
+        // variable timestep produced the "teleport backward" pops and the steering glitching out after
+        // a key release. Accumulated forces integrate cleanly through Bepu's solver — smooth and stable.
+
+        // 1) YAW: a torque that drives the body's yaw rate toward what the steering commands. Drives the
+        //    ERROR to zero (also self-straightens the car after a brake/bump kicks the tail out — target
+        //    is 0 when not steering). The torque is CLAMPED so a sudden big error (slamming the brakes,
+        //    a kerb) can't spike into a violent lurch — that capped, error-seeking torque is what makes
+        //    hard braking settle straight instead of snapping sideways.
         Vector3 yawAxis = chassisT.Up;
-        Vector3 angVel = chassis.AngularVelocity;
-        float yawRate = Vector3.Dot(angVel, yawAxis);
-        float yawBlend = 1f - MathF.Exp(-YawResponse * dt);
-        float newYaw = MathHelper.Lerp(yawRate, targetYawRate, yawBlend);
-        chassis.AngularVelocity = angVel + yawAxis * (newYaw - yawRate);
+        float yawRate = Vector3.Dot(chassis.AngularVelocity, yawAxis);
+        float yawError = targetYawRate - yawRate;
+        float yawTorque = yawError * YawResponse * chassis.Mass;
+        float maxYawTorque = MaxYawRate * YawResponse * chassis.Mass; // cap at "correct one full target/step"
+        yawTorque = MathHelper.Clamp(yawTorque, -maxYawTorque, maxYawTorque);
+        chassis.AddTorque(yawAxis * yawTorque);
 
-        // 2) GRIP: rotate the velocity vector toward the car's ACTUAL heading (read from the transform,
-        //    so the direction sign is always correct), PRESERVING its magnitude. This is the no-skating
-        //    feel: the car keeps its speed but its trajectory follows where the nose now points. Reading
-        //    the real forward direction (rather than rotating by a hand-computed yaw angle) keeps the
-        //    turn direction correct regardless of the euler/quaternion sign conventions.
+        // 2) GRIP: a force that cancels the car's SIDEWAYS velocity so the trajectory follows the nose
+        //    (no skating). Applied at the centre of mass (a pure force — no roll/yaw side effect). The
+        //    cancel is rate-limited by ArcadeGrip (fraction of the lateral slip removed per second), so
+        //    it can never produce a one-frame impulse big enough to fling the car (the old bug). It only
+        //    touches the SIDEWAYS component, so it never brakes forward speed.
+        Vector3 right = chassisT.Right;
         Vector3 vel = chassis.Velocity;
-        var horiz = new Vector3(vel.X, 0f, vel.Z);
-        float speed = horiz.Length();
-        if (speed < 0.3f)
-            return;
-
-        Vector3 fwd = chassisT.Forward;
-        var horizFwd = new Vector3(fwd.X, 0f, fwd.Z);
-        if (horizFwd.LengthSquared() < 1e-6f)
-            return;
-        horizFwd = horizFwd.Normalized();
-
-        // Realign toward forward, or backward when reversing — keyed off the LATCHED drive intent (not
-        // the velocity-vs-heading dot, which flips past 90° of slip and would make the grip yank the car
-        // around). So the grip always pulls the trajectory toward the nose the driver is heading.
-        Vector3 desiredDir = reversing ? -horizFwd : horizFwd;
-
-        // Blend the velocity direction toward the heading by ArcadeGrip (per-second rate via exp), then
-        // restore the original speed — a pure redirection, never a brake.
-        float gripBlend = 1f - MathF.Exp(-ArcadeGrip * dt);
-        Vector3 newDir = Vector3.Normalize(Vector3.Lerp(horiz / speed, desiredDir, gripBlend));
-        Vector3 newHoriz = newDir * speed;
-        Vector3 deltaV = newHoriz - horiz;
-        chassis.AddForce(deltaV * (chassis.Mass / dt));
+        float lateralSpeed = Vector3.Dot(vel, right);
+        float killFraction = 1f - MathF.Exp(-ArcadeGrip * dt); // 0..1, framerate-correct
+        float targetDeltaV = -lateralSpeed * killFraction;     // how much sideways v to shed this step
+        chassis.AddForce(right * (targetDeltaV * chassis.Mass / dt));
     }
 
     // Anti-roll keeps the car upright in hard corners; downforce presses it into the road at speed so
     // grip climbs with velocity. Both are gentle, framerate-correct torques/forces — they plant the
     // car without overriding the player.
     void ApplyStability(Transform chassisT, float speedFraction, float dt) {
-        Vector3 up = chassisT.Up;
-
-        // Anti-roll: torque that rotates the body's up axis back toward world up, damped by roll rate.
         Vector3 worldUp = Vector3.UnitY;
-        Vector3 tiltAxis = Vector3.Cross(up, worldUp); // axis to rotate around; |.| = sin(tilt)
-        float tilt = MathF.Asin(MathHelper.Clamp(tiltAxis.Length(), 0f, 1f));
-        if (tilt > 1e-4f) {
-            Vector3 axis = tiltAxis / tiltAxis.Length();
-            // Spring toward upright minus damping along the same axis (critically-ish damped).
-            float rollRate = Vector3.Dot(chassis.AngularVelocity, axis);
-            Vector3 torque = axis * (AntiRoll * tilt) - axis * (AntiRoll * 0.15f * rollRate);
-            chassis.AddTorque(torque);
+        Vector3 com = chassisT.WorldPosition;
+
+        // Anti-roll / anti-pitch as VERTICAL FORCE PAIRS — a real anti-roll bar, NOT a body torque.
+        // A torque about a tilted axis leaks into YAW: the chassis box's inertia is very non-uniform
+        // (Iyaw ~ 4.6x Iroll), so Bepu maps the torque through I^-1 and the result isn't parallel to
+        // the axis — it gains a world-up (yaw) component. On tilting terrain that ran every frame and
+        // the car self-steered ("goes weird after a while"). Equal-and-opposite VERTICAL forces at
+        // laterally/longitudinally symmetric points produce a roll/pitch-only couple that CANNOT make
+        // a net world-up torque — zero yaw leak by construction, while still levelling the car.
+        Vector3 right = chassisT.Right;
+        Vector3 fwd = chassisT.Forward;
+
+        // ROLL ONLY: keep the car from tipping SIDEWAYS. Lateral lean = how far the car's right axis
+        // points up/down; push the low side up / high side down with a vertical couple at the track
+        // edges, damped by the roll rate. We deliberately do NOT level PITCH — a car should follow the
+        // terrain's slope nose-up/down; forcing pitch flat fought the hills and pitched the car wildly.
+        // The offset points use the HORIZONTAL projection of `right` (no vertical component): a vertical
+        // force at a point that is also offset VERTICALLY would make a yaw torque, which is the self-
+        // steering-on-terrain bug. Horizontal offset + vertical force = pure roll couple, zero yaw.
+        Vector3 rightFlat = new Vector3(right.X, 0f, right.Z);
+        if (rightFlat.LengthSquared() > 1e-6f) {
+            rightFlat = rightFlat.Normalized();
+            float rollLean = Vector3.Dot(right, worldUp);              // +ve = right side up (rolled left)
+            float rollRate = Vector3.Dot(chassis.AngularVelocity, fwd); // roll about the forward axis
+            float rollForce = (-rollLean * AntiRoll) - (rollRate * AntiRoll * 0.1f);
+            chassis.AddForceAtPosition(worldUp * rollForce, com + rightFlat * 1f);   // ~track half-width
+            chassis.AddForceAtPosition(worldUp * -rollForce, com - rightFlat * 1f);
         }
 
         // Downforce: push straight down, scaling with speed² for a racing feel (grip earns its keep).
