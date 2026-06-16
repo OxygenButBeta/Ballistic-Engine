@@ -192,7 +192,10 @@ public sealed class Dx12OidnGpuPath : IDisposable {
         var hType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         dev.Device.CopyDescriptorsSimple(1, auxHeap.Cpu(SrvGAlbedo), gAlbedoSrv, hType);
         dev.Device.CopyDescriptorsSimple(1, auxHeap.Cpu(SrvGNormal), gNormalSrv, hType);
-        dev.ExecuteSync(cl => {
+        // P0a: ExecuteSyncImmediate — OIDN's HIP device reads these shared aux buffers right after; the D3D12
+        // pack MUST have executed first (not just be recorded in the open pipelined frame), else OIDN guides on
+        // stale data. The D3D12↔HIP shared-buffer boundary is a genuine mid-frame sync point (GI-only).
+        dev.ExecuteSyncImmediate(cl => {
             cl.SetDescriptorHeaps(auxHeap.Heap);
             cl.SetComputeRootSignature(packAuxRootSig);
             cl.SetPipelineState(packAuxPso);
@@ -218,7 +221,10 @@ public sealed class Dx12OidnGpuPath : IDisposable {
     public unsafe void Pack(CpuDescriptorHandle srcTexSrv) {
         dev.Device.CopyDescriptorsSimple(1, heap.Cpu(SrvSrcTex), srcTexSrv,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
-        dev.ExecuteSync(cl => {
+        // P0a: ExecuteSyncImmediate — OIDN's HIP device reads the shared float buffer this writes right after
+        // (ExecuteShared), so the D3D12 pack must have EXECUTED, not just be recorded in the open pipelined
+        // frame list. The cross-device (D3D12↔HIP) shared-buffer handoff is a real mid-frame sync (GI-only).
+        dev.ExecuteSyncImmediate(cl => {
             cl.SetDescriptorHeaps(heap.Heap);
             cl.SetComputeRootSignature(packRootSig);
             cl.SetPipelineState(packPso);

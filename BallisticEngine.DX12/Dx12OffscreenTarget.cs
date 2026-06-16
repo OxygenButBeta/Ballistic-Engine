@@ -250,7 +250,7 @@ public sealed class Dx12OffscreenTarget : IDisposable {
             HeapProperties.ReadbackHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
 
-        dev.ExecuteSync(cl => {
+        dev.ExecuteSyncImmediate(cl => {   // readback: must flush an open pipelined frame so the copy sees it
             TransitionTo(cl, ResourceStates.CopySource);
             var dst = new TextureCopyLocation(readback, footprint);
             var src = new TextureCopyLocation(RenderTarget, 0);
@@ -290,7 +290,7 @@ public sealed class Dx12OffscreenTarget : IDisposable {
             cachedReadbackBytes = totalBytes;
         }
         ID3D12Resource readback = cachedReadback;
-        dev.ExecuteSync(cl => {
+        dev.ExecuteSyncImmediate(cl => {   // readback: flush an open pipelined frame so the copy sees this frame
             TransitionTo(cl, ResourceStates.CopySource);
             cl.CopyTextureRegion(new TextureCopyLocation(readback, fp), 0, 0, 0,
                 new TextureCopyLocation(RenderTarget, 0), null);
@@ -343,7 +343,7 @@ public sealed class Dx12OffscreenTarget : IDisposable {
             }
         }
         upload.Unmap(0);
-        dev.ExecuteSync(cl => {
+        dev.ExecuteSyncImmediate(cl => {   // CPU→GPU upload mid-frame (OIDN CPU path): flush so ordering holds
             TransitionTo(cl, ResourceStates.CopyDest);
             cl.CopyTextureRegion(new TextureCopyLocation(RenderTarget, 0), 0, 0, 0,
                 new TextureCopyLocation(upload, fp), null);
@@ -366,7 +366,7 @@ public sealed class Dx12OffscreenTarget : IDisposable {
             HeapProperties.ReadbackHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
 
-        dev.ExecuteSync(cl => {
+        dev.ExecuteSyncImmediate(cl => {   // readback (editor thumbnail): flush any open frame before the copy
             TransitionTo(cl, ResourceStates.CopySource);
             cl.CopyTextureRegion(new TextureCopyLocation(readback, fp), 0, 0, 0,
                 new TextureCopyLocation(RenderTarget, 0), null);

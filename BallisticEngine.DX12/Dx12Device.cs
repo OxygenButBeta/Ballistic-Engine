@@ -36,6 +36,20 @@ public sealed class Dx12Device : IDisposable {
     ulong fenceValue;
     readonly System.Threading.AutoResetEvent fenceEvent = new(false);
 
+    // P0a — PIPELINED FRAME: a SEPARATE allocator + command list the per-frame render path records the WHOLE
+    // frame into, submitted ONCE at EndFrame (vs the legacy ~40 ExecuteSync→WaitForGpu full GPU flushes, one
+    // per pass + per transition). Dedicated objects (not the shared `commandList`) so a concurrent worker-thread
+    // ExecuteSync (e.g. a cubemap upload) using the shared list can never corrupt the open frame list and vice
+    // versa — both submit to the one Queue, which serializes execution. P0a keeps a single WaitForGpu at
+    // EndFrame (no overlap yet); P0b N-buffers these for CPU↔GPU overlap. While a frame is open, ExecuteSync
+    // calls ON THE FRAME-OWNING THREAD record into frameList instead of submitting; off-thread/no-frame calls
+    // take the legacy synchronous path. Disabled by BALLISTIC_DX12_PIPELINED=0 (legacy per-call submit+wait).
+    readonly ID3D12CommandAllocator frameAllocator;
+    readonly ID3D12GraphicsCommandList4 frameList;
+    bool frameOpen;                 // a frame is recording into frameList (set by BeginFrame, cleared by EndFrame)
+    int frameThreadId;              // only this thread's ExecuteSync calls redirect into frameList
+    readonly bool pipelinedFrames;  // BALLISTIC_DX12_PIPELINED != "0" (default ON)
+
     // SEPARATE upload allocator/list/fence so asset uploads (textures, buffers) never share command-list
     // state with the per-frame render path. Sharing one list between BeginRender's ExecuteSync and the
     // interleaved asset uploads was the suspected cause of the texture CopyTextureRegion E_FAILs.
@@ -101,6 +115,14 @@ public sealed class Dx12Device : IDisposable {
         uploadList.Close();
         uploadFence = Device.CreateFence(0, FenceFlags.None);
 
+        // P0a frame list (see field comment). Created OPEN like the others → close so the first BeginFrame
+        // Reset is uniform. Submitted on the shared render `fence` (one queue, one wait at EndFrame).
+        frameAllocator = Device.CreateCommandAllocator(CommandListType.Direct);
+        frameList = Device.CreateCommandList<ID3D12GraphicsCommandList4>(
+            CommandListType.Direct, frameAllocator, null);
+        frameList.Close();
+        pipelinedFrames = Environment.GetEnvironmentVariable("BALLISTIC_DX12_PIPELINED") != "0";
+
         // Debug info queue (if the debug layer loaded): lets us print the REAL D3D12 message text on an
         // E_FAIL instead of the opaque HRESULT. Stored-message log only; no break-on-error.
         if (enableDebugLayer)
@@ -161,6 +183,14 @@ public sealed class Dx12Device : IDisposable {
     // fastest — the per-frame render path is single-threaded on the main thread and pays nothing extra).
     readonly object submitGate = new();
     public void ExecuteSync(Action<ID3D12GraphicsCommandList4> record) {
+        // P0a: while a pipelined frame is open ON THIS (the frame-owning) thread, just record into the open
+        // frame list — no submit, no wait. The frame submits once at EndFrame. Off-thread callers (worker
+        // uploads) and the no-frame case fall through to the legacy synchronous submit+wait below. No lock
+        // needed for the frame-list append: frameList is touched only by the frame thread, single-threaded.
+        if (frameOpen && Environment.CurrentManagedThreadId == frameThreadId) {
+            record(frameList);
+            return;
+        }
         lock (submitGate) {
             allocator.Reset();
             commandList.Reset(allocator, null);
@@ -168,6 +198,64 @@ public sealed class Dx12Device : IDisposable {
             commandList.Close();
             Queue.ExecuteCommandList(commandList);
             WaitForGpu();
+        }
+    }
+
+    // P0a — open the per-frame command list. Subsequent ExecuteSync calls on THIS thread record into it
+    // instead of submitting. No-op (legacy per-pass submit) when BALLISTIC_DX12_PIPELINED=0. The GPU is idle
+    // here (EndFrame waited last frame; first frame the lists are freshly closed), so resetting the allocator
+    // is safe. Must be paired with EndFrame; nesting is not supported (one frame in flight in P0a).
+    public void BeginFrame() {
+        if (!pipelinedFrames || frameOpen) return;
+        frameAllocator.Reset();
+        frameList.Reset(frameAllocator, null);
+        frameThreadId = Environment.CurrentManagedThreadId;
+        frameOpen = true;
+    }
+
+    // P0a — close, submit ONCE, and wait for the whole recorded frame. (P0b will drop the wait for CPU↔GPU
+    // overlap via N-buffered allocators/fences.) Safe to call when no frame is open (no-op). Returns true if
+    // a frame was actually submitted (so the caller knows the legacy per-pass path was bypassed).
+    public bool EndFrame() {
+        if (!frameOpen) return false;
+        frameOpen = false;
+        frameList.Close();
+        Queue.ExecuteCommandList(frameList);
+        WaitForGpu();
+        return true;
+    }
+
+    // P0a — true while a pipelined frame is recording on the current thread (passes can branch on it if they
+    // must do a real GPU round-trip mid-frame; readbacks use ExecuteSyncImmediate which handles this).
+    public bool FrameOpen => frameOpen && Environment.CurrentManagedThreadId == frameThreadId;
+
+    // P0a — a synchronous submit+wait that WORKS mid-frame: readbacks (SaveBmp/ReadColorRgb/…) and any pass
+    // that must see GPU results immediately call this. If a pipelined frame is open on this thread, the
+    // recorded-so-far commands are flushed FIRST (close+submit+wait) so ordering is preserved and the
+    // readback observes everything drawn this frame, then `record` runs synchronously, then a FRESH frame
+    // segment reopens so the rest of the frame keeps pipelining. Without an open frame it's plain ExecuteSync.
+    public void ExecuteSyncImmediate(Action<ID3D12GraphicsCommandList4> record) {
+        bool reopen = false;
+        if (frameOpen && Environment.CurrentManagedThreadId == frameThreadId) {
+            // Flush what the frame has recorded so far so `record`'s copy/readback sees it on the GPU.
+            frameOpen = false;
+            frameList.Close();
+            Queue.ExecuteCommandList(frameList);
+            WaitForGpu();
+            reopen = true;
+        }
+        lock (submitGate) {
+            allocator.Reset();
+            commandList.Reset(allocator, null);
+            record(commandList);
+            commandList.Close();
+            Queue.ExecuteCommandList(commandList);
+            WaitForGpu();
+        }
+        if (reopen) {   // continue recording the rest of the frame into a fresh segment
+            frameAllocator.Reset();
+            frameList.Reset(frameAllocator, null);
+            frameOpen = true;
         }
     }
 
@@ -310,6 +398,8 @@ public sealed class Dx12Device : IDisposable {
         WaitForGpu();
         fenceEvent.Dispose();
         fence.Dispose();
+        frameList.Dispose();
+        frameAllocator.Dispose();
         commandList.Dispose();
         allocator.Dispose();
         uploadEvent.Dispose();

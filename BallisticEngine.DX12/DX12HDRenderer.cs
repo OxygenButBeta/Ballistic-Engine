@@ -452,6 +452,7 @@ public sealed class DX12HDRenderer : HDRenderer {
     Dx12OffscreenTarget bloomA, bloomB; // half-res R16F ping-pong
     ID3D12Resource bloomCb;
     unsafe byte* bloomCbMapped;
+    int bloomCbStride;                  // P0a: 256-aligned per-sub-pass slot stride (3 slots — see DrawBloom)
     Dx12DescriptorHeap bloomSrvVisible; // source SRV per sub-pass (3 slots)
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct BloomConstants { public float Threshold; public Vector2 TexelSize; public float Pad; }
@@ -1334,9 +1335,13 @@ public sealed class DX12HDRenderer : HDRenderer {
         bloomBlurHPso = MakePso("PSBlurH");
         bloomBlurVPso = MakePso("PSBlurV");
 
-        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<BloomConstants>() + 255) & ~255;
+        // P0a: 3 sub-passes (bright/blurH/blurV) write DIFFERENT BloomConstants but all read one CB. With the
+        // pipelined frame they record into ONE list submitted together, so a single shared CB would let the
+        // CPU's 3rd write stomp the value the GPU's 1st draw still needs. Give each sub-pass its own 256-aligned
+        // slot. (Non-pipelined this was masked because each pass submitted+waited.)
+        bloomCbStride = (System.Runtime.InteropServices.Marshal.SizeOf<BloomConstants>() + 255) & ~255;
         bloomCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+            ResourceDescription.Buffer((ulong)(bloomCbStride * 3)), ResourceStates.GenericRead);
         bloomCbMapped = bloomCb.Map<byte>(0);
         bloomSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true);
@@ -1769,6 +1774,14 @@ public sealed class DX12HDRenderer : HDRenderer {
             iblActiveThisFrame = ibl.HasBaked;
         }
 
+        // P0a — OPEN the pipelined frame command list. Everything from here (Hi-Z, geometry, deferred, sky,
+        // transparents, GI, post, composite) records into ONE list submitted once at EndFrame, replacing the
+        // ~40 per-pass ExecuteSync→WaitForGpu full GPU flushes. Shadows + the IBL bake above already ran on
+        // their OWN upload lists (ExecuteUpload) so they're outside this. Readbacks mid-frame (OIDN CPU path,
+        // exposure-debug) use ExecuteSyncImmediate, which flushes the open list first. No-op when
+        // BALLISTIC_DX12_PIPELINED=0 (then every pass submits+waits as before — the byte-identical fallback).
+        dev.BeginFrame();
+
         // Per-frame constants (b1): cascade matrices + shadow params.
         var fc = new FrameConstants {
             Cascade0 = Matrix4x4.Transpose(cascadeMatrices[0]),
@@ -2154,6 +2167,12 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (!PresentToScreen)
             ldr.ColorToShaderResource();
 
+        // P0a — CLOSE the pipelined frame: submit the whole recorded list ONCE + wait. (P0b drops the wait for
+        // CPU↔GPU overlap.) No-op when pipelining is off / no frame was opened. After this the GPU is idle, so
+        // SaveFrame's readback (headless) and PresentToScreen (player) — which run AFTER BeginRender returns —
+        // see a fully-rendered frame via their own ExecuteSyncImmediate/synchronous path.
+        dev.EndFrame();
+
         // Advance the jitter phase (used by both TAA and FSR) and remember this frame's UNJITTERED view*proj
         // for next frame's motion vectors (independent of TAA, since FSR replaces TAA but still needs motion).
         if (jitterOn) taaFrame++;
@@ -2530,7 +2549,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             cl.DrawInstanced(3, 1, 0, 0);
         });
 
-        SsgiResolveAndCombine();   // temporal (motion) + OIDN denoise + composite into the scene
+        SsgiResolveAndCombine(resetRing: false);   // gather already Reset()+used slots 0-2; resolve continues 3-8
     }
 
     // Fill the shared SsgiConstants CBV (dials + matrices + pre-exposure + history flag). Used by the SSGI
@@ -2562,13 +2581,19 @@ public sealed class DX12HDRenderer : HDRenderer {
     // Shared GI resolve tail: motion-buffer temporal accumulation + OIDN denoise + composite into the scene.
     // ssgiTarget holds the raw (noisy) one-bounce GI (from either the SSILVB gather or the RT gather); the
     // SsgiConstants CBV must already be filled. Used by both DrawSsgi and DrawRtGi.
-    unsafe void SsgiResolveAndCombine() {
+    // P0a: `resetRing` — reset the ssgiSrvVisible ring at the START of the resolve. DrawSsgi passes FALSE (its
+    // gather already Reset()+used slots 0-2; the resolve continues at 3-8 — the heap is sized 9 = one frame).
+    // DrawRtGi passes TRUE (it didn't touch the ring before the resolve, so the resolve owns it from slot 0).
+    // The hazard this fixes: under the pipelined single-list submit, recorded-but-not-yet-executed draws still
+    // reference their descriptor slots — a mid-resolve Reset() (the old code) let the temporal pass overwrite
+    // the gather's slots → the gather sampled the wrong SRVs. Now slots never alias within a frame.
+    unsafe void SsgiResolveAndCombine(bool resetRing = true) {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Dx12OffscreenTarget histRead = ssgiHistWriteB ? ssgiHistoryA : ssgiHistoryB;
         Dx12OffscreenTarget histWrite = ssgiHistWriteB ? ssgiHistoryB : ssgiHistoryA;
 
         // Temporal (half-res) → histWrite. SRVs: currentGI t0, historyGI t1, motion t2 (gbuffer RT4).
-        ssgiSrvVisible.Reset();
+        if (resetRing) ssgiSrvVisible.Reset();
         ssgiTarget.ColorToShaderResource();
         histRead.ColorToShaderResource();
         int tb = ssgiSrvVisible.AllocateRange(3);
@@ -3155,7 +3180,14 @@ public sealed class DX12HDRenderer : HDRenderer {
             }, bh.Cpu(DdgiTableBase + 2));
             // One trace+blend+classify cycle (its own submit). `full` = warm-up / round-robin off (every probe).
             // Reuses the descriptors written above (TLAS/cube/prev-irr stay valid across the warm-up replays).
-            void RunDdgiUpdate(bool full) => dev.ExecuteSync(cl => {
+            // P0a: ExecuteSyncImmediate (NOT the frame-list append) — the DDGI multi-bounce feedback reads the
+            // PREVIOUS update's atlas, and the warm-up replays this MANY times each reading the last (line below:
+            // "each its own submit — never one giant command list"). Recording them all into the open pipelined
+            // frame list would defer every iteration to one submit, so each would read the STALE pre-frame atlas
+            // → the field never converges (a GI-internal read-after-write the algorithm depends on). Immediate
+            // flush keeps each iteration's completion exactly as the non-pipelined path had it. This is a submit/
+            // sync fix, NOT a change to the DDGI algorithm. Still cheap: 1 flush/frame for the round-robin.
+            void RunDdgiUpdate(bool full) => dev.ExecuteSyncImmediate(cl => {
                 cl.SetDescriptorHeaps(bh.Heap);
                 ddgi.DispatchDdgi(cl, bh, bh.Gpu(DdgiTableBase),
                     rtGiSunCb.GPUVirtualAddress, gpuDriven.MaterialsGpuAddress,
@@ -3561,14 +3593,17 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         void Pass(ID3D12PipelineState pso, Dx12OffscreenTarget src, Dx12OffscreenTarget dst, int srvSlot,
             Vector2 texel, float threshold) {
-            *(BloomConstants*)bloomCbMapped = new BloomConstants { Threshold = threshold, TexelSize = texel };
+            // P0a: write THIS sub-pass's constants to its own CB slot (srvSlot doubles as the CB slot) + bind
+            // that slot's GPU address, so the pipelined single-list submit doesn't let later writes stomp it.
+            *(BloomConstants*)(bloomCbMapped + srvSlot * bloomCbStride) =
+                new BloomConstants { Threshold = threshold, TexelSize = texel };
             src.ColorToShaderResource();
             dev.Device.CopyDescriptorsSimple(1, bloomSrvVisible.Cpu(srvSlot), src.ColorSrvCpu, heapType);
             dst.RenderColorOnly(cl => {
                 cl.SetGraphicsRootSignature(bloomRootSig);
                 cl.SetPipelineState(pso);
                 cl.SetDescriptorHeaps(bloomSrvVisible.Heap);
-                cl.SetGraphicsRootConstantBufferView(0, bloomCb.GPUVirtualAddress);
+                cl.SetGraphicsRootConstantBufferView(0, bloomCb.GPUVirtualAddress + (ulong)(srvSlot * bloomCbStride));
                 cl.SetGraphicsRootDescriptorTable(1, bloomSrvVisible.Gpu(srvSlot));
                 cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
                 cl.DrawInstanced(3, 1, 0, 0);
@@ -3600,7 +3635,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             Vortice.Direct3D12.HeapProperties.ReadbackHeapProperties, Vortice.Direct3D12.HeapFlags.None,
             Vortice.Direct3D12.ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
         lumTarget.ColorToRenderTarget();   // SRV → RT so the next transition is from a known state
-        dev.ExecuteSync(cl => {
+        dev.ExecuteSyncImmediate(cl => {   // readback: flush an open pipelined frame so the copy sees this frame
             cl.ResourceBarrierTransition(lumTarget.RenderTarget, ResourceStates.RenderTarget, ResourceStates.CopySource);
             cl.CopyTextureRegion(new Vortice.Direct3D12.TextureCopyLocation(rb, fp), 0, 0, 0,
                 new Vortice.Direct3D12.TextureCopyLocation(lumTarget.RenderTarget, 0), null);
@@ -3632,7 +3667,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             Vortice.Direct3D12.HeapProperties.ReadbackHeapProperties, Vortice.Direct3D12.HeapFlags.None,
             Vortice.Direct3D12.ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
         t.ColorToRenderTarget();   // PixelShaderResource → RT so the copy transition starts from a known state
-        dev.ExecuteSync(cl => {
+        dev.ExecuteSyncImmediate(cl => {   // readback: flush an open pipelined frame so the copy sees this frame
             cl.ResourceBarrierTransition(t.RenderTarget, ResourceStates.RenderTarget, ResourceStates.CopySource);
             cl.CopyTextureRegion(new Vortice.Direct3D12.TextureCopyLocation(rb, fp), 0, 0, 0,
                 new Vortice.Direct3D12.TextureCopyLocation(t.RenderTarget, 0), null);
