@@ -297,7 +297,7 @@ public static class AssimpSkinDecoder {
                 for (var i = 0; i < scaleKeys.Length; i++)
                     scaleKeys[i] = new VectorKey((float)channel.ScalingKeys[i].Time, ToVec3(channel.ScalingKeys[i].Value));
 
-                channels.Add(new BoneChannel(boneIndex, posKeys, rotKeys, scaleKeys));
+                channels.Add(new BoneChannel(boneIndex, channel.NodeName, posKeys, rotKeys, scaleKeys));
             }
 
             if (channels.Count == 0)

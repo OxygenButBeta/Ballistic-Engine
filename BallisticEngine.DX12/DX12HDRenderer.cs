@@ -50,6 +50,19 @@ public sealed class DX12HDRenderer : HDRenderer {
     ID3D12RootSignature gbufferRootSig;
     ID3D12PipelineState gbufferPso;
 
+    // GPU SKINNING into the same G-buffer. A skinned mesh (SkinnedMeshRenderer, IsSkinned) carries 2 extra
+    // vertex streams (bone indices as floats / weights) and an Animator feeds per-bone skinning matrices
+    // each frame. The skinned PSO (GBufferSkinned.hlsl) skins pos/normal/tangent in the vertex stage before
+    // the model transform; the pixel stage is byte-identical to GBuffer.hlsl so deferred shading matches a
+    // static mesh exactly. The bone matrices ride in a per-frame upload ring bound as a root SRV (t6).
+    ID3D12RootSignature skinnedGbufferRootSig;
+    ID3D12PipelineState skinnedGbufferPso;
+    ID3D12Resource boneMatrixRing;          // upload heap: transposed float4x4[] per skinned draw
+    unsafe byte* boneMatrixMapped;
+    int boneMatrixSlotSize;                  // bytes per skinned draw (maxBones * 64, 256-aligned)
+    int boneMatrixSlotCount;                 // skinned draws per frame ceiling
+    const int MaxBonesPerDraw = 256;         // skeleton bone ceiling for one skinned mesh
+
     // Motion vectors: a per-pass CBV (b1) shared by BOTH geometry passes (CPU GBuffer.hlsl + GPU-driven
     // GBufferBindless.hlsl) holding the UNJITTERED current + previous frame view*proj. The geometry PS
     // reprojects each surface's world position through both to write a jitter-free screen-space motion
@@ -721,6 +734,8 @@ public sealed class DX12HDRenderer : HDRenderer {
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
             cbSlotCount * MaterialSrvCount, shaderVisible: true);
 
+        BuildSkinnedGeometryPass();
+
         BuildSkybox();
         BuildProcSky();
 
@@ -974,6 +989,58 @@ public sealed class DX12HDRenderer : HDRenderer {
             RenderTargetFormats = Dx12GBuffer.ColorFormats,
             DepthStencilFormat = Dx12GBuffer.DepthFormat, SampleDescription = new SampleDescription(1, 0),
         });
+    }
+
+    // Skinned-geometry PSO: same G-buffer target/state as BuildGeometryPass, but the vertex stage skins by
+    // per-bone matrices (GBufferSkinned.hlsl). Root sig adds a bone-matrix SRV (t6, root SRV) on top of the
+    // static layout (b0 DrawConstants, table0 = 6 material SRVs, b1 MotionConstants). Input layout adds two
+    // streams: BLENDINDICES (slot 4) + BLENDWEIGHT (slot 5), each a float4 buffer the mesh already uploads.
+    unsafe void BuildSkinnedGeometryPass() {
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView,
+            new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var matRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, MaterialSrvCount, baseShaderRegister: 0);
+        var matTable = new RootParameter1(new RootDescriptorTable1(matRange), ShaderVisibility.Pixel);
+        var motionCbv = new RootParameter1(RootParameterType.ConstantBufferView,
+            new RootDescriptor1(1, 0), ShaderVisibility.Pixel);
+        // Bone matrices as a root SRV at t6 (vertex-visible) — a raw GPU address, no descriptor-heap slot.
+        var boneSrv = new RootParameter1(RootParameterType.ShaderResourceView,
+            new RootDescriptor1(6, 0), ShaderVisibility.Vertex);
+        var wrap = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap,
+            AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 16,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        skinnedGbufferRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.AllowInputAssemblerInputLayout,
+                new[] { cbv, matTable, motionCbv, boneSrv }, new[] { wrap })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("GBufferSkinned.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "GBufferSkinned.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "GBufferSkinned.hlsl");
+        var layout = new InputLayoutDescription(
+            new InputElementDescription("POSITION", 0, Format.R32G32B32_Float, 0, 0),
+            new InputElementDescription("NORMAL", 0, Format.R32G32B32_Float, 0, 1),
+            new InputElementDescription("TEXCOORD", 0, Format.R32G32_Float, 0, 2),
+            new InputElementDescription("TANGENT", 0, Format.R32G32B32A32_Float, 0, 3),
+            new InputElementDescription("BLENDINDICES", 0, Format.R32G32B32A32_Float, 0, 4),
+            new InputElementDescription("BLENDWEIGHT", 0, Format.R32G32B32A32_Float, 0, 5));
+        skinnedGbufferPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+            RootSignature = skinnedGbufferRootSig, VertexShader = vs, PixelShader = ps, InputLayout = layout,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = RasterizerDescription.CullClockwise,
+            BlendState = BlendDescription.Opaque, DepthStencilState = DepthStencilDescription.Default,
+            RenderTargetFormats = Dx12GBuffer.ColorFormats,
+            DepthStencilFormat = Dx12GBuffer.DepthFormat, SampleDescription = new SampleDescription(1, 0),
+        });
+
+        // Per-frame bone-matrix upload ring: one MaxBonesPerDraw-matrix slot per skinned draw.
+        boneMatrixSlotSize = (MaxBonesPerDraw * 64 + 255) & ~255;   // 64 bytes per float4x4
+        boneMatrixSlotCount = 64;                                    // skinned characters per frame ceiling
+        boneMatrixRing = dev.Device.CreateCommittedResource(
+            HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)((long)boneMatrixSlotSize * boneMatrixSlotCount)),
+            ResourceStates.GenericRead);
+        boneMatrixMapped = boneMatrixRing.Map<byte>(0);
     }
 
     // Deferred lighting PSO: fullscreen triangle, LightConstants CBV(b0) + FrameConstants CBV(b1) +
@@ -1641,6 +1708,8 @@ public sealed class DX12HDRenderer : HDRenderer {
                 if (r is null || !r.IsActive || !r.IsRenderable) continue;
                 // Whole-mesh renderers are GPU-driven (compute cull + ExecuteIndirect) — skip them here.
                 if (gpuDrivenOn && r.SubMeshIndex < 0) continue;
+                // Skinned meshes draw in the dedicated skinned block below (different PSO + bone matrices).
+                if (r.IsSkinned) continue;
                 Mesh mesh = r.SharedMesh;
                 if (mesh is null) continue;
 
@@ -1722,6 +1791,123 @@ public sealed class DX12HDRenderer : HDRenderer {
                     tris += sub.IndexCount / 3;
                     slot++;
                 }
+            }
+
+            // === SKINNED geometry: same G-buffer, but the skinned PSO skins each vertex by per-bone matrices
+            // (an Animator on the entity supplies SkinningMatrices; bind pose / identity otherwise). Switch the
+            // root sig + PSO once, then draw every skinned renderer with the 6-stream layout + a bone SRV. ===
+            int boneSlot = 0;
+            bool skinnedStateSet = false;
+            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
+                if (r is null || !r.IsActive || !r.IsRenderable || !r.IsSkinned) continue;
+                Mesh mesh = r.SharedMesh;
+                if (mesh is null || !mesh.IsSkinned) continue;
+                if (boneSlot >= boneMatrixSlotCount || slot >= cbSlotCount) break;
+
+                var vb = mesh.VertexBuffer as Dx12Buffer<GLVector3>;
+                var ib = mesh.IndexBuffer as Dx12IndexBuffer;
+                var nb = mesh.NormalBuffer as Dx12Buffer<GLVector3>;
+                var ub = mesh.UvBuffer as Dx12Buffer<Vector2>;
+                var tb = mesh.TangentBuffer as Dx12Buffer<Vector4>;
+                var bib = mesh.BoneIndexBuffer as Dx12Buffer<Vector4>;
+                var bwb = mesh.BoneWeightBuffer as Dx12Buffer<Vector4>;
+                if (vb?.Resource is null || ib?.Resource is null || nb?.Resource is null ||
+                    ub?.Resource is null || tb?.Resource is null ||
+                    bib?.Resource is null || bwb?.Resource is null) continue;
+
+                // Upload this draw's bone matrices (TRANSPOSED — the shader uses row-vector mul). The renderer
+                // hands us mesh-local skinning matrices (inverseBind * worldBone); identity == bind pose.
+                Matrix4[] skin = r.SkinningMatrices;
+                int boneCount = skin is null ? 0 : System.Math.Min(skin.Length, MaxBonesPerDraw);
+                byte* dst = boneMatrixMapped + (long)boneSlot * boneMatrixSlotSize;
+                var mptr = (Matrix4x4*)dst;
+                for (int b = 0; b < boneCount; b++)
+                    mptr[b] = Matrix4x4.Transpose(ToNumerics(skin[b]));
+                // Any unset slot stays whatever was there; only indices < boneCount are referenced by weights.
+                ulong boneGpuAddr = boneMatrixRing.GPUVirtualAddress + (ulong)((long)boneSlot * boneMatrixSlotSize);
+
+                if (!skinnedStateSet) {
+                    cl.SetGraphicsRootSignature(skinnedGbufferRootSig);
+                    cl.SetPipelineState(skinnedGbufferPso);
+                    cl.SetDescriptorHeaps(srvVisible.Heap);
+                    cl.SetGraphicsRootConstantBufferView(2, motionCb.GPUVirtualAddress);   // b1 motion
+                    cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+                    skinnedStateSet = true;
+                }
+                cl.SetGraphicsRootShaderResourceView(3, boneGpuAddr);   // t6 bone matrices (root SRV)
+
+                Matrix4x4 model = ToNumerics(r.Transform.WorldMatrix);
+                Matrix4x4 mvp = model * viewProj;
+
+                Span<VertexBufferView> sViews = stackalloc VertexBufferView[6];
+                sViews[0] = new VertexBufferView(vb.GpuAddress, (uint)vb.ByteSize, (uint)vb.Stride);
+                sViews[1] = new VertexBufferView(nb.GpuAddress, (uint)nb.ByteSize, (uint)nb.Stride);
+                sViews[2] = new VertexBufferView(ub.GpuAddress, (uint)ub.ByteSize, (uint)ub.Stride);
+                sViews[3] = new VertexBufferView(tb.GpuAddress, (uint)tb.ByteSize, (uint)tb.Stride);
+                sViews[4] = new VertexBufferView(bib.GpuAddress, (uint)bib.ByteSize, (uint)bib.Stride);
+                sViews[5] = new VertexBufferView(bwb.GpuAddress, (uint)bwb.ByteSize, (uint)bwb.Stride);
+                cl.IASetVertexBuffers(0, sViews);
+                cl.IASetIndexBuffer(new IndexBufferView(ib.GpuAddress, (uint)ib.ByteSize, Format.R32_UInt));
+
+                int sOnly = r.SubMeshIndex;
+                int sFirst = sOnly >= 0 ? sOnly : 0;
+                int sLast = sOnly >= 0 ? sOnly : mesh.SubMeshes.Length - 1;
+                for (int s = sFirst; s <= sLast; s++) {
+                    if ((uint)s >= (uint)mesh.SubMeshes.Length) break;
+                    SubMeshData sub = mesh.SubMeshes[s];
+                    if (sub.IndexCount <= 0) continue;
+                    // No frustum cull here: a skinned mesh's static bind-pose bounds don't bound the animated
+                    // pose, and skinned meshes are few. Draw them all.
+                    Material mat = r.MaterialFor(s);
+                    if (mat is null) continue;
+                    if (mat.Transparent) continue;
+                    if (slot >= cbSlotCount) break;
+
+                    bool hasMetal = mat.Metallic is not null;
+                    bool hasRough = mat.Roughness is not null;
+                    bool emissive = mat.IsEmissive;
+                    var c = new DrawConstants {
+                        Mvp = Matrix4x4.Transpose(mvp),
+                        Model = Matrix4x4.Transpose(model),
+                        LightDir = lightDir, Exposure = exposure,
+                        LightColor = lightColor, Metallic = mat.MetallicFactor,
+                        Ambient = ambient, Roughness = mat.RoughnessFactor,
+                        CameraPos = camPos, SpecularReflectance = mat.SpecularReflectance,
+                        BaseColorFactor = ToNumerics(mat.BaseColorFactor),
+                        EmissiveFactor = ToNumerics(mat.EmissiveColor) * mat.EmissiveIntensity,
+                        HasEmissive = emissive ? 1f : 0f,
+                        NormalStrength = mat.NormalStrength, NormalFlipY = mat.NormalFlipY ? 1f : 0f,
+                        HasMetallicMap = hasMetal ? 1f : 0f, HasRoughnessMap = hasRough ? 1f : 0f,
+                        PackedOrm = mat.PackedOrm ? 1f : 0f, Cutout = mat.Cutout ? 1f : 0f,
+                        UseIBL = iblActiveThisFrame ? 1f : 0f,
+                        PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f,
+                    };
+                    *(DrawConstants*)(cbMapped + (long)slot * cbSlotSize) = c;
+                    cl.SetGraphicsRootConstantBufferView(0,
+                        cbRing.GPUVirtualAddress + (ulong)((long)slot * cbSlotSize));
+
+                    int tableStart = srvVisible.AllocateRange(MaterialSrvCount);
+                    BindSrv(tableStart + 0, mat.Diffuse, TextureType.Diffuse, fallbackDiffuse);
+                    BindSrv(tableStart + 1, mat.Normal, TextureType.Normal, null);
+                    BindSrv(tableStart + 2, mat.Metallic, TextureType.Metallic, null);
+                    BindSrv(tableStart + 3, mat.Roughness, TextureType.Roughness, null);
+                    BindSrv(tableStart + 4, mat.AO, TextureType.AO, null);
+                    BindSrv(tableStart + 5, mat.Emissive, TextureType.Emissive, null);
+                    cl.SetGraphicsRootDescriptorTable(1, srvVisible.Gpu(tableStart));
+
+                    cl.DrawIndexedInstanced((uint)sub.IndexCount, 1, (uint)sub.IndexStart, 0, 0);
+                    draws++;
+                    tris += sub.IndexCount / 3;
+                    slot++;
+                }
+                boneSlot++;
+            }
+
+            // Restore the static G-buffer state for any passes after this callback that assume it.
+            if (skinnedStateSet) {
+                cl.SetGraphicsRootSignature(gbufferRootSig);
+                cl.SetPipelineState(gbufferPso);
+                cl.SetGraphicsRootConstantBufferView(2, motionCb.GPUVirtualAddress);
             }
 
             // GPU-driven whole-mesh geometry: compute cull + ExecuteIndirect + bindless materials, into the

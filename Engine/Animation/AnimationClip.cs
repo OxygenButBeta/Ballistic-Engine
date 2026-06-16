@@ -92,6 +92,71 @@ public sealed class AnimationClip : BObject {
         }
     }
 
+    // Returns a copy of this clip whose channels are REMAPPED onto `targetSkeleton` by bone NAME — the runtime
+    // retarget that makes a Mixamo animation FBX play on a separately-imported character with the same rig but a
+    // different bone import order. Channels whose name has no match in the target are dropped. Requires the clip
+    // to carry bone names (v2+ .banim); a nameless clip (v1) is returned unchanged (assumed same-order). Pure;
+    // the caller caches the result (one retarget per clip+skeleton pair).
+    public AnimationClip RetargetTo(SkeletonData targetSkeleton) {
+        BoneChannel[] src = Data.Channels;
+        if (src is null || src.Length == 0) return this;
+
+        // If no channel carries a name, this is a v1 clip — nothing to remap by; play as-is (same-order).
+        bool hasNames = false;
+        for (int i = 0; i < src.Length; i++)
+            if (!string.IsNullOrEmpty(src[i].BoneName)) { hasNames = true; break; }
+        if (!hasNames) return this;
+
+        var remapped = new List<BoneChannel>(src.Length);
+        for (int i = 0; i < src.Length; i++) {
+            BoneChannel c = src[i];
+            int targetIndex = targetSkeleton.IndexOf(c.BoneName);
+            if (targetIndex < 0) continue;   // a bone the target rig doesn't have — drop the channel
+            remapped.Add(new BoneChannel(targetIndex, c.BoneName, c.PositionKeys, c.RotationKeys, c.ScaleKeys));
+        }
+
+        var data = new AnimationClipData(Data.Name, Data.DurationTicks, Data.TicksPerSecond, remapped.ToArray());
+        return new AnimationClip(data, Name);
+    }
+
+    // True when the clip already matches `targetSkeleton` (every named channel's index equals the target's index
+    // for that name) — so RetargetTo would be a no-op and the caller can skip caching a copy.
+    public bool MatchesSkeleton(SkeletonData targetSkeleton) {
+        BoneChannel[] src = Data.Channels;
+        if (src is null) return true;
+        for (int i = 0; i < src.Length; i++) {
+            BoneChannel c = src[i];
+            if (string.IsNullOrEmpty(c.BoneName)) continue;
+            if (targetSkeleton.IndexOf(c.BoneName) != c.BoneIndex) return false;
+        }
+        return true;
+    }
+
+    // Samples ONE bone's local position + rotation at `timeSeconds` (root-motion extraction needs only the
+    // root channel, so sampling the whole skeleton would be wasteful). Falls back to `bindPos`/`bindRot` for
+    // an un-keyed component. Time is looped into [0, duration) when `loop`.
+    public void SampleBoneLocal(float timeSeconds, int boneIndex, bool loop,
+        Vector3 bindPos, Quaternion bindRot, out Vector3 position, out Quaternion rotation) {
+        position = bindPos;
+        rotation = bindRot;
+
+        float durationSeconds = Data.DurationSeconds;
+        float t = timeSeconds;
+        if (durationSeconds > 0f) {
+            if (loop) t %= durationSeconds;
+            else if (t > durationSeconds) t = durationSeconds;
+            if (t < 0f) t += durationSeconds;
+        }
+        float ticks = t * Data.TicksPerSecond;
+
+        foreach (BoneChannel channel in Data.Channels) {
+            if (channel.BoneIndex != boneIndex) continue;
+            position = SampleVector(channel.PositionKeys, ticks, bindPos);
+            rotation = SampleQuaternion(channel.RotationKeys, ticks, bindRot);
+            return;
+        }
+    }
+
     // Composes per-bone TRS into local matrices (the inverse of SampleLocalTRS' decomposition).
     public static void ComposeLocal(Vector3[] position, Quaternion[] rotation, Vector3[] scale, Matrix4[] outLocal) {
         for (var i = 0; i < outLocal.Length; i++)
