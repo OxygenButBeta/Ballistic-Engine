@@ -1,20 +1,18 @@
 
 namespace BallisticEngine;
 
-// A raycast (arcade) suspension wheel — the workhorse of the vehicle demo (P7). Each wheel casts a
-// ray/sphere down from its mount, and when grounded applies, at the contact point on the chassis
-// Rigidbody (via AddForceAtPosition, P2):
-//   * a suspension SPRING + DAMPER force along the wheel's up axis (holds the body off the ground),
-//   * a lateral GRIP force that CANCELS sideways slip (so the car corners on rails, not skates),
-//   * a longitudinal MOTOR/BRAKE force from the controller (drive and stop).
-// It owns no body of its own; it reads the chassis Rigidbody from its parent (or this entity). This
-// is the industry-standard approach (Unity's WheelCollider) — stable, fast, tunable.
+// A raycast (arcade) suspension wheel for the vehicle controller. Each wheel casts a sphere down from
+// its mount and, when grounded, applies a suspension SPRING + DAMPER force along its up axis (holds the
+// chassis off the ground and gives visible squat/dive/roll), reports its ground contact, and animates
+// the visual wheel mesh (sit on the ground, roll by speed, steer). It owns no body of its own; it reads
+// the chassis Rigidbody from its parent (or this entity).
 //
-// ARCADE rewrite (GTA / Need-for-Speed feel): the lateral model is no longer a soft force
-// proportional to slip — it computes the IMPULSE that would zero the sideways velocity at the
-// contact this step and applies a (grip-scaled) fraction of it, clamped to a generous friction
-// budget. At Grip 1.0 the tyre is glued: the car goes exactly where it's pointed, no ice-skating.
-// Longitudinal traction is handled the same way so power lands instead of spinning out.
+// HORIZONTAL dynamics (drive, brake, grip, steering) are owned by the VehicleController, which uses a
+// velocity-steering ARCADE model: the heading turns at a controlled rate and the car's velocity is
+// rotated to follow the nose while its SPEED is preserved. That is what keeps the car on rails AND
+// keeps its speed through a corner — the structural cure for the scrub-to-stall and snap-spin failure
+// modes that a per-wheel tyre-force model is prone to. So the wheel deliberately does NOT apply drive
+// or lateral forces; it does suspension + grounding only. The controller reads IsGrounded/ContactPoint.
 [Component("Wheel Collider", "Physics")]
 public class WheelCollider : Behaviour {
     [Header("Wheel")]
@@ -27,54 +25,32 @@ public class WheelCollider : Behaviour {
     [Range(0.01f, 1f)]
     public float SuspensionTravel { get; set; } = 0.3f;
 
-    [Tooltip("Spring stiffness holding the chassis up (N per metre of compression).")]
+    [Tooltip("Spring stiffness holding the chassis up (N per metre of compression). Higher = stiffer ride.")]
     [Range(0f, 200000f)]
-    public float SuspensionStiffness { get; set; } = 45000f;
+    public float SuspensionStiffness { get; set; } = 35000f;
 
     [Tooltip("Suspension damping (N per m/s of compression speed) — kills bounce. Stiff = planted.")]
     [Range(0f, 20000f)]
-    public float SuspensionDamping { get; set; } = 6000f;
+    public float SuspensionDamping { get; set; } = 4500f;
 
-    [Header("Grip")]
-    [Tooltip("Sideways grip: how much of the per-step lateral slip is cancelled. " +
-             "0 = ice (drifts forever), 1 = glued (no slide at all). Arcade default is sticky.")]
-    [Range(0f, 1f)]
-    public float SidewaysGrip { get; set; } = 1f;
+    [Tooltip("Where the spring rests when the car sits still, as a fraction of travel (0 = fully extended, " +
+             "0.5 = mid-travel). Resting at mid-travel leaves room to both squat and droop, so the " +
+             "suspension visibly works in both directions over bumps.")]
+    [Range(0.1f, 0.9f)]
+    public float SuspensionRestFraction { get; set; } = 0.5f;
 
-    [Tooltip("Friction budget as a multiple of the wheel's vertical load. Higher = the tyre can " +
-             "hold harder cornering before it ever lets go. Arcade cars run high.")]
-    [Range(0.5f, 6f)]
-    public float GripBudget { get; set; } = 3f;
-
-    [Tooltip("How fast lateral grip builds: fraction of sideways slip cancelled per step (0..1). " +
-             "1 = instant (stiff, but a steered wheel can whip the car into a spin); ~0.3 = the tyre " +
-             "relaxes over a few steps — planted and stable. Lower if the car feels twitchy/spinny.")]
-    [Range(0.05f, 1f)]
-    public float GripRelax { get; set; } = 0.3f;
-
-    [Tooltip("Forward traction: how much of the drive/brake force the tyre can put down (1 = full " +
-             "grip, lower = wheelspin/longer stops). The friction circle still caps the total.")]
-    [Range(0.1f, 1f)]
-    public float ForwardGrip { get; set; } = 1f;
-
-    [Tooltip("Rolling resistance applied to forward velocity when coasting (no throttle/brake).")]
-    [Range(0f, 1f)]
-    public float RollingResistance { get; set; } = 0.04f;
-
-    // ---- Runtime readouts (set each FixedTick; useful for wheel-mesh animation / VFX) -----
+    // ---- Runtime readouts (set each FixedTick; read by the controller + used for wheel-mesh / VFX) ----
     [NotSerialized] public bool IsGrounded { get; private set; }
     [NotSerialized] public float Compression { get; private set; } // 0 = extended, 1 = bottomed out
     [NotSerialized] public Vector3 ContactPoint { get; private set; }
-    [NotSerialized] public float LateralSlip { get; private set; } // |sideways m/s| at the contact
+    [NotSerialized] public Vector3 ContactNormal { get; private set; }
+    [NotSerialized] public float ForwardSpeed { get; private set; } // signed roll speed (for visual roll)
 
     Rigidbody chassis;
 
-    // Drive (+forward) / brake torque set by the VehicleController each step; consumed in FixedTick.
-    internal float MotorForce;
-    internal float BrakeForce;
-    internal float SteerAngle; // radians, applied to this wheel's forward/right basis
-    internal bool Handbrake;   // this wheel is hand-braked (locks longitudinal, lets the rear step out)
-    // How many wheels share the chassis load — set by the VehicleController; defaults to 4 (a car).
+    // Set by the VehicleController each step (consumed by the visual): the steer angle of this wheel.
+    internal float SteerAngle; // radians
+    // How many wheels share the chassis load — set by the controller; defaults to 4 (a car).
     internal int SharedWheelCount = 4;
 
     protected internal override void OnAttach() {
@@ -90,13 +66,12 @@ public class WheelCollider : Behaviour {
     float rollAngle; // accumulated rolling angle (rad) about the wheel's spin axis
 
     // Render-frame visual: place the wheel mesh ON the ground (it follows the suspension travel instead
-    // of being stuck at the fixed mount, which made wheels float or sink into terrain as the suspension
-    // moved), roll it by ground speed, and steer the front wheels. Pure cosmetic (no physics).
+    // of being stuck at the fixed mount, so wheels don't float or sink as the suspension moves), roll it
+    // by ground speed, and steer the steered wheels. Pure cosmetic (no physics).
     protected internal override void Tick(in float delta) {
         if (!SceneManager.IsPlaying || delta <= 0f)
             return;
         if (!wheelMeshResolved) {
-            // First child with a StaticMeshRenderer is the visual wheel.
             foreach (Entity child in entity.DirectChildren()) {
                 if (child.GetComponent<StaticMeshRenderer>() is not null) {
                     wheelMesh = child.transform;
@@ -111,24 +86,19 @@ public class WheelCollider : Behaviour {
         Transform t = transform;
         Vector3 up = t.Up;
 
-        // POSITION: sit the wheel centre one radius above the suspension contact (so it rests on the
-        // ground and rides up/down with the suspension). When airborne, hang it at full droop from the
-        // mount. The mesh is a child of the wheel entity, so convert the world target to the child's
-        // local space via the wheel entity's inverse world matrix.
+        // POSITION: sit the wheel centre one radius above the suspension contact (rides up/down with the
+        // suspension). When airborne, hang it at full droop from the mount.
         Vector3 worldTarget = IsGrounded
             ? ContactPoint + up * Radius
             : t.WorldPosition - up * SuspensionTravel;
         wheelMesh.WorldPosition = worldTarget;
 
-        // ROLL: angular speed = forward ground speed / radius, about the wheel's spin AXLE. The axle is
-        // the wheel's RIGHT axis (left-right), so rolling is a rotation about local X.
-        chassis ??= entity.GetComponentInParent<Rigidbody>();
-        float forwardSpeed = chassis is not null ? Vector3.Dot(chassis.Velocity, t.Forward) : 0f;
-        rollAngle += forwardSpeed / MathF.Max(0.05f, Radius) * delta;
+        // ROLL about the spin AXLE (the wheel's right axis → local X): angular speed = ground speed / r.
+        rollAngle += ForwardSpeed / MathF.Max(0.05f, Radius) * delta;
         rollAngle -= MathF.Tau * MathF.Round(rollAngle / MathF.Tau); // keep in [-π, π]
 
-        // Steer about the wheel's up (Y), THEN roll about its right (X). Applied as the mesh's WORLD
-        // rotation off the wheel entity's world rotation so it matches the car's orientation on slopes.
+        // Steer about the wheel's up (Y), THEN roll about its right (X), off the wheel entity's world
+        // rotation so it matches the car's orientation on slopes.
         Quaternion baseRot = t.WorldRotation;
         Quaternion steer = Quaternion.CreateFromAxisAngle(Vector3.UnitY, SteerAngle);
         Quaternion roll = Quaternion.CreateFromAxisAngle(Vector3.UnitX, rollAngle);
@@ -149,115 +119,42 @@ public class WheelCollider : Behaviour {
         Vector3 up = t.Up;
         Vector3 mount = t.WorldPosition;
 
-        // Steering rotates the wheel's heading about the up axis.
-        Quaternion steer = Quaternion.CreateFromAxisAngle(up, SteerAngle);
-        Vector3 forward = Vector3.Transform(t.Forward, steer);
-        Vector3 right = Vector3.Transform(t.Right, steer);
+        // The visual roll uses the chassis forward speed (steering only turns the mesh, not the roll axis).
+        Quaternion steerRot = Quaternion.CreateFromAxisAngle(up, SteerAngle);
+        Vector3 forward = Vector3.Transform(t.Forward, steerRot);
 
         // Cast a sphere straight down from the mount over the full travel + radius. The sphere has
-        // thickness, so a thin ray can't slip past an edge (P2 sweep). The mount usually sits inside
-        // the chassis collider, so the cast would hit the car's OWN body first — skip any hit on the
-        // chassis Rigidbody and re-cast from just below it.
+        // thickness, so a thin ray can't slip past an edge (P2 sweep). The mount usually sits inside the
+        // chassis collider, so skip any hit on the car's OWN body and re-cast from below it.
         float castLength = SuspensionTravel + Radius;
         IsGrounded = CastIgnoringChassis(mount, -up, castLength, out RaycastHit hit);
 
+        ForwardSpeed = Vector3.Dot(chassis.Velocity, forward);
+
         if (!IsGrounded) {
             Compression = 0f;
-            LateralSlip = 0f;
             ContactPoint = mount - up * castLength;
-            MotorForce = BrakeForce = 0f;
+            ContactNormal = up;
             return;
         }
 
         ContactPoint = hit.Point;
-        // Compression: how far the suspension is pushed up from full extension.
+        ContactNormal = hit.Normal;
         float distance = hit.Distance;
         float compressionMetres = MathHelper.Clamp(castLength - distance, 0f, SuspensionTravel);
         Compression = compressionMetres / SuspensionTravel;
 
-        // Suspension velocity (compression speed) along the up axis, from the chassis velocity at the
-        // contact point. body velocity at a point = linear + angular x r.
+        // Body velocity at the contact = linear + angular × r; its up-component is the compression speed.
         Vector3 pointVelocity = VelocityAt(ContactPoint);
         float upSpeed = Vector3.Dot(pointVelocity, up);
 
-        // Spring force up, damper opposes compression speed. Clamped to push (never pull the car down).
-        float springForce = SuspensionStiffness * compressionMetres - SuspensionDamping * upSpeed;
+        // Suspension: spring toward the REST length, damper opposes compression speed. Resting at mid-
+        // travel leaves room to squat (accel/landing) and droop (over a crest) so it visibly works both
+        // ways. Clamped to push only (never pull the car down).
+        float restMetres = SuspensionTravel * SuspensionRestFraction;
+        float springForce = SuspensionStiffness * (compressionMetres - restMetres) - SuspensionDamping * upSpeed;
         springForce = MathF.Max(0f, springForce);
         chassis.AddForceAtPosition(up * springForce, ContactPoint);
-
-        // The friction budget is based on the wheel's STABLE STATIC LOAD (its share of the car's
-        // weight), NOT the instantaneous springForce. springForce includes the damper term
-        // (-SuspensionDamping*upSpeed): on tilting terrain the suspension bobs, upSpeed spikes, and the
-        // damper drove springForce — and thus the budget — to ~0, clamping drive to a crawl that never
-        // recovered (the post-turn "stall"). Using the static load keeps a grounded wheel's grip/drive
-        // budget steady; springForce only adds a little EXTRA budget for genuine weight transfer (a
-        // squatting wheel grips a bit more), never subtracts below the stable floor.
-        float loadPerWheel = chassis.Mass * Physics.Gravity.Length() / WheelCount();
-        float normalLoad = loadPerWheel + MathF.Max(0f, springForce - loadPerWheel) * 0.5f;
-        float frictionBudget = GripBudget * normalLoad;
-
-        // --- Lateral grip: cancel the sideways slip toward zero, RELAXED over a few steps. ---------
-        // Working in impulse space (force * dt) lets us aim at "kill the slip" then clamp to the
-        // friction circle. But cancelling the WHOLE slip every step is an infinitely-stiff tyre: on a
-        // STEERED wheel that makes a violent yaw moment and the car's nose out-rotates its velocity (a
-        // spin). So we cancel only a FRACTION per step (SidewaysGrip × GripRelax) — the tyre builds its
-        // force over ~3-4 steps, which is both more realistic and stable. GripRelax keeps the front
-        // wheels from whipping the body around while the grip is still very sticky (slip decays fast).
-        float lateralSpeed = Vector3.Dot(pointVelocity, right);
-        LateralSlip = MathF.Abs(lateralSpeed);
-        float effMass = chassis.Mass / WheelCount();
-        float desiredLatImpulse = -lateralSpeed * effMass * SidewaysGrip * GripRelax;
-
-        // --- Longitudinal traction: drive/brake plus a slip-cancel so power tracks straight. ------
-        float forwardSpeed = Vector3.Dot(pointVelocity, forward);
-        // Drive/brake/handbrake produce a target longitudinal impulse. ForwardGrip scales how much of
-        // the drive force the tyre puts down (lower = wheelspin); the friction circle still caps it.
-        float driveImpulse = MotorForce * dt * ForwardGrip;
-        float longCancel = 0f;
-        if (Handbrake) {
-            // Lock the wheel: cancel forward roll entirely (rear handbrake → the tail can rotate out
-            // while the lateral grip there is also gone-ish; here we keep lateral so it's controllable).
-            longCancel = -forwardSpeed * effMass;
-            driveImpulse = 0f;
-        } else if (BrakeForce > 0f) {
-            // Brake toward a stop, never past it (no reverse-launch from over-braking).
-            float maxStop = -forwardSpeed * effMass;
-            float brakeImp = -MathF.Sign(forwardSpeed) * BrakeForce * dt;
-            longCancel = MathF.Abs(brakeImp) > MathF.Abs(maxStop) ? maxStop : brakeImp;
-            driveImpulse = 0f;
-        } else if (MathF.Abs(MotorForce) < 1e-3f) {
-            // Coasting: gentle rolling resistance only. RollingResistance is the fraction of forward
-            // momentum shed PER SECOND (so it's framerate-independent and small) — a rolling wheel
-            // must NOT cancel forward speed per-step or the car crawls. Forward traction is about not
-            // SLIDING (lateral), so it deliberately doesn't drag a freely-rolling wheel here.
-            longCancel = -forwardSpeed * effMass * RollingResistance * dt;
-        }
-        // Under power: the drive impulse lands directly; traction is limited by the friction circle below.
-        float desiredLongImpulse = driveImpulse + longCancel;
-
-        // --- Friction circle: the combined tyre impulse can't exceed the budget this step. --------
-        // DRIVE traction is reserved FIRST so the car can always power through a corner (arcade feel —
-        // a strict lateral-first priority starved the drive in hard turns and the car bogged to a
-        // crawl). Longitudinal takes its share, lateral gets the rest of the circle. The budget is
-        // generous (GripBudget × load), so lateral grip is still very sticky in normal cornering.
-        float maxImpulse = frictionBudget * dt;
-        float longImpulse = MathHelper.Clamp(desiredLongImpulse, -maxImpulse, maxImpulse);
-        float remaining = MathF.Sqrt(MathF.Max(0f, maxImpulse * maxImpulse - longImpulse * longImpulse));
-        float latImpulse = MathHelper.Clamp(desiredLatImpulse, -remaining, remaining);
-
-        // Apply lateral + longitudinal grip at a RAISED point — the contact lifted to the chassis centre
-        // of mass (the "roll centre"). A grip force at the ground contact (0.5 m below the COM) makes a
-        // big moment: lateral force barrel-rolls the car, and a hard BRAKE force pitches/yaws it so the
-        // car lurches sideways when you slam the brakes. Applying both at COM height removes those
-        // moments while keeping the exact same linear accel/brake/grip — the planted arcade feel. (We
-        // give up squat/dive pitch realism, which an arcade car doesn't need and which caused the lurch.)
-        Vector3 com = chassis.transform.WorldPosition;
-        var gripPoint = new Vector3(ContactPoint.X, com.Y, ContactPoint.Z);
-        chassis.AddForceAtPosition(right * (latImpulse / dt), gripPoint);
-        chassis.AddForceAtPosition(forward * (longImpulse / dt), gripPoint);
-
-        MotorForce = BrakeForce = 0f; // consumed
-        Handbrake = false;
     }
 
     Vector3 VelocityAt(Vector3 worldPoint) {
@@ -265,9 +162,8 @@ public class WheelCollider : Behaviour {
         return chassis.Velocity + Vector3.Cross(chassis.AngularVelocity, r);
     }
 
-    // Sphere-cast down for the ground, skipping the chassis's own body (the mount sits inside it).
-    // If the first hit is the chassis, restart the cast just past that hit so the wheel finds the
-    // actual ground below, not the car it's bolted to.
+    // Sphere-cast down for the ground, skipping the chassis's own body (the mount sits inside it). If the
+    // first hit is the chassis, restart just past it so the wheel finds the actual ground below.
     bool CastIgnoringChassis(Vector3 origin, Vector3 dir, float maxDistance, out RaycastHit hit) {
         Vector3 start = origin;
         float remaining = maxDistance;
@@ -275,8 +171,7 @@ public class WheelCollider : Behaviour {
             if (!Physics.SphereCast(start, Radius * 0.5f, dir, out hit, remaining, Physics.DefaultRaycastLayers))
                 return false;
             if (!ReferenceEquals(hit.Rigidbody, chassis)) {
-                // Report the hit distance measured from the ORIGINAL origin so suspension maths line up.
-                hit.Distance = Vector3.Dot(hit.Point - origin, dir);
+                hit.Distance = Vector3.Dot(hit.Point - origin, dir); // measure from the ORIGINAL origin
                 return true;
             }
             float step = hit.Distance + 0.01f;
