@@ -20,11 +20,14 @@ public sealed class Exposure : VolumeComponent {
              "or a small center spot.")]
     public readonly EnumParameter<MeteringMode> metering = new(MeteringMode.CenterWeighted);
 
+    // V1: re-anchored for the lux-scaled DX12 radiance (the meter's LuxMeterAnchor is +8). A correctly-exposed
+    // lux-calibrated scene meters to EV~16; this window brackets it. The old [8,17] let dark scenes open to
+    // EV8 (M~3.3e-3) and blow out (CornellBox/LightTest). 13..19 ≈ M 1.4e-4 .. 1.2e-6 (day↔night still spans it).
     [Tooltip("Lowest EV auto exposure may adapt to (how far it opens up in the dark).")]
-    public readonly ClampedFloatParameter limitMin = new(8f, 0f, 20f);
+    public readonly ClampedFloatParameter limitMin = new(13f, 0f, 22f);
 
     [Tooltip("Highest EV auto exposure may adapt to (how far it stops down in bright light).")]
-    public readonly ClampedFloatParameter limitMax = new(17f, 0f, 20f);
+    public readonly ClampedFloatParameter limitMax = new(19f, 0f, 22f);
 
     [Tooltip("Adaptation speed in stops/second when the scene gets brighter (eyes adjust fast).")]
     public readonly ClampedFloatParameter speedDarkToLight = new(3f, 0.1f, 20f);

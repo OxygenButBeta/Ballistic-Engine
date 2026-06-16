@@ -61,8 +61,12 @@ public sealed class PostProcessSettings {
     // metered EV. Fixed mode ignores all of this and uses ExposureEV directly.
     public ExposureMode ExposureMode { get; set; } = ExposureMode.Fixed;
     public MeteringMode MeteringMode { get; set; } = MeteringMode.CenterWeighted;
-    public float AutoExposureLimitMin { get; set; } = 8f;           // EV floor the meter may reach
-    public float AutoExposureLimitMax { get; set; } = 17f;          // EV ceiling the meter may reach
+    // V1: re-anchored for the lux-scaled DX12 radiance (the meter's LuxMeterAnchor is +8, ~6 stops above the
+    // old cd/m² anchor). A correctly-exposed lux-calibrated scene meters to EV~16; this window brackets that
+    // (dark scenes open to ~13 = M~1.4e-4, bright scenes stop down to ~19) instead of the old [8,17] that let
+    // dark scenes open to EV8 = M~3.3e-3 and blow out (CornellBox/LightTest). Day↔night still spans the window.
+    public float AutoExposureLimitMin { get; set; } = 13f;          // EV floor the meter may reach
+    public float AutoExposureLimitMax { get; set; } = 19f;          // EV ceiling the meter may reach
     public float AutoExposureSpeedDarkToLight { get; set; } = 3f;   // stops/sec when the scene brightens
     public float AutoExposureSpeedLightToDark { get; set; } = 2.5f; // stops/sec when the scene darkens (a day->night cut spans ~10 stops; 1.0 took 10+ s to settle)
     public float HistogramFilterMin { get; set; } = 40f;            // percentile below which pixels are rejected

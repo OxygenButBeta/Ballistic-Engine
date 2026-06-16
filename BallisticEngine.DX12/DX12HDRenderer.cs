@@ -431,11 +431,12 @@ public sealed class DX12HDRenderer : HDRenderer {
     ID3D12RootSignature lumRootSig;     // LumConstants CBV (b0) + 1 HDR SRV (t0) + sampler
     ID3D12PipelineState lumPso;
     Dx12OffscreenTarget lumTarget;      // 1×1 R16F, color-readable
+    bool exposureDebugDumped;           // V1: one-shot BALLISTIC_DX12_EXPOSURE_DEBUG avgLum readback latch
     Dx12DescriptorHeap lumSrvVisible;   // HDR color SRV copied per frame
     ID3D12Resource lumCb;
     unsafe byte* lumCbMapped;
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct LumConstants { public float LimitMin; public float LimitMax; public Vector2 Pad; }
+    struct LumConstants { public float LimitMin; public float LimitMax; public float Calibrated; public float Pad; }
 
     // Bloom: bright-pass + separable blur at half-res, fed into the composite (Bloom.hlsl).
     ID3D12RootSignature bloomRootSig;   // BloomConstants CBV (b0) + 1 source SRV (t0) + sampler
@@ -3553,6 +3554,36 @@ public sealed class DX12HDRenderer : HDRenderer {
     // this), reading the same HDR source. Sources at internal/half res are sampled by UV (resolution-safe).
     // Exposure: the sky-atmosphere P1 path resolves PostFX.ExposureMultiplier (EV100) directly — no extra
     // re-anchoring constant; the metering/clamp moved into LumAverage (LumConstants.LimitMin/Max).
+    // V1 one-shot calibration probe: read the 1×1 R16F meter target (currently holding raw geomean luminance,
+    // Calibrated=2) back to the CPU and print it + the EVs each anchor would produce. Lets us ground-truth the
+    // exposure constant against the actual lux-scaled radiance instead of guessing. BALLISTIC_DX12_EXPOSURE_DEBUG=1.
+    unsafe void DumpMeteredLuminance(PostProcessSettings pf) {
+        var footprints = new Vortice.Direct3D12.PlacedSubresourceFootPrint[1];
+        var rowCounts = new uint[1]; var rowSizes = new ulong[1];
+        dev.Device.GetCopyableFootprints(lumTarget.RenderTarget.Description, 0, 1, 0,
+            footprints, rowCounts, rowSizes, out ulong totalBytes);
+        Vortice.Direct3D12.PlacedSubresourceFootPrint fp = footprints[0];
+        using ID3D12Resource rb = dev.Device.CreateCommittedResource(
+            Vortice.Direct3D12.HeapProperties.ReadbackHeapProperties, Vortice.Direct3D12.HeapFlags.None,
+            Vortice.Direct3D12.ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
+        lumTarget.ColorToRenderTarget();   // SRV → RT so the next transition is from a known state
+        dev.ExecuteSync(cl => {
+            cl.ResourceBarrierTransition(lumTarget.RenderTarget, ResourceStates.RenderTarget, ResourceStates.CopySource);
+            cl.CopyTextureRegion(new Vortice.Direct3D12.TextureCopyLocation(rb, fp), 0, 0, 0,
+                new Vortice.Direct3D12.TextureCopyLocation(lumTarget.RenderTarget, 0), null);
+            cl.ResourceBarrierTransition(lumTarget.RenderTarget, ResourceStates.CopySource, ResourceStates.RenderTarget);
+        });
+        Half* p = rb.Map<Half>(0);
+        float avgLum = (float)p[0];
+        rb.Unmap(0);
+        float greyEv = MathF.Log2(MathF.Max(avgLum, 1e-8f)) - MathF.Log2(0.18f * 1.2f);
+        float legacyEv = MathF.Log2(MathF.Max(avgLum, 1e-6f)) + 3f - 1f;
+        Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+            $"[EXP-DBG] geomean avgLum={avgLum:0.000000}  greyAnchorEV={greyEv:0.00}  legacyEV={legacyEv:0.00}  " +
+            $"limits=[{pf.AutoExposureLimitMin},{pf.AutoExposureLimitMax}]  " +
+            $"M(greyClamped)={1f / (1.2f * MathF.Pow(2f, Math.Clamp(greyEv, pf.AutoExposureLimitMin, pf.AutoExposureLimitMax))):0.00000000}"));
+    }
+
     unsafe void DrawComposite(bool ssaoOn, Dx12OffscreenTarget hdr) {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
 
@@ -3574,8 +3605,15 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         if (useMeter) {
             // Auto-exposure metering: reduce the HDR source to a 1×1 metered EV100 (LumAverage.hlsl).
+            // V1: the meter is grey-anchored (self-calibrating to the lux-scaled DX12 radiance) by default;
+            // BALLISTIC_DX12_EXPOSURE_CALIB=0 restores the legacy photometric anchor (the pre-V1 blow-out) for A/B.
+            bool calibrated = Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_CALIB") != "0";
+            // V1 diagnostic: BALLISTIC_DX12_EXPOSURE_DEBUG=1 makes the meter emit raw geomean luminance into the
+            // 1×1 target (Calibrated=2), read back once below to ground-truth the calibration constant.
+            bool expDebug = !exposureDebugDumped && Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_DEBUG") == "1";
             *(LumConstants*)lumCbMapped = new LumConstants {
                 LimitMin = pf.AutoExposureLimitMin, LimitMax = pf.AutoExposureLimitMax,
+                Calibrated = expDebug ? 2f : (calibrated ? 1f : 0f),
             };
             dev.Device.CopyDescriptorsSimple(1, lumSrvVisible.Cpu(0), hdr.ColorSrvCpu, heapType);
             lumTarget.RenderColorOnly(cl => {
@@ -3588,6 +3626,7 @@ public sealed class DX12HDRenderer : HDRenderer {
                 cl.DrawInstanced(3, 1, 0, 0);
             });
             lumTarget.ColorToShaderResource();
+            if (expDebug) { exposureDebugDumped = true; DumpMeteredLuminance(pf); }
         }
 
         // Bloom: bright-pass + blur the HDR into bloomA (half-res). On by default; BALLISTIC_DX12_BLOOM=0 off.
