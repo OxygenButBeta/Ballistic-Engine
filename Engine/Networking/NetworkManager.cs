@@ -21,6 +21,11 @@ public sealed class NetworkManager {
     // gets its id from the transport handshake (P3).
     public Connection LocalConnection { get; private set; } = Connection.None;
 
+    // CLIENT-side: the connection handle that addresses the SERVER (the server's peer id from this
+    // client's view, captured on connect). A To.Server RPC sends here. On a host/server this is unused
+    // (the server runs To.Server RPCs locally). Connection.None until connected.
+    public Connection ServerConnection { get; private set; } = Connection.None;
+
     public bool IsServer => Topology is NetworkTopology.Server or NetworkTopology.Host;
     public bool IsClient => Topology is NetworkTopology.Client or NetworkTopology.Host;
     public bool IsHost   => Topology is NetworkTopology.Host;
@@ -62,6 +67,7 @@ public sealed class NetworkManager {
         Transport = null;
         Topology = NetworkTopology.Offline;
         LocalConnection = Connection.None;
+        ServerConnection = Connection.None;
         objects.Clear();
         SendClock.Reset();
         StateSnapshotsSent = 0;
@@ -101,7 +107,9 @@ public sealed class NetworkManager {
                 clients.Add(c);
         }
         else {
-            // Client connected to the server — send our layout digest so the server can reject drift.
+            // Client connected to the server — remember the server's peer handle (a To.Server RPC sends
+            // here), then send our layout digest so the server can reject drift.
+            ServerConnection = c;
             Transport.Send(c, NetworkWire.Handshake(NetworkWire.LayoutDigest()), Channel.Reliable);
         }
     }
@@ -121,6 +129,7 @@ public sealed class NetworkManager {
             case NetMessage.Spawn:       HandleSpawn(ref r); break;
             case NetMessage.Despawn:     HandleDespawn(ref r); break;
             case NetMessage.Snapshot:    HandleSnapshot(ref r); break;
+            case NetMessage.Rpc:         HandleRpc(source, ref r); break;
         }
     }
 
@@ -215,6 +224,122 @@ public sealed class NetworkManager {
                 return nb;
         return null;
     }
+
+    // ---- RPC send/receive (plan §4b / §9.5, P4) ---------------------------------------------------
+    // The OUTGOING side — called by the generated partial-void stub body. It pre-packed the args into a
+    // BitWriter; we decide FROM THIS MACHINE whether to execute the dev method locally and/or send a frame,
+    // per the declared To.X target. The routing is the byte-for-byte logic proven in %TEMP%\bal-rpc-test.
+    // No RPC return (L1): the stub is `void`; a request→response is RPC-up + [Networked] state-down.
+    public void SendRpc(NetworkBehaviour self, int methodId, RpcTarget target, bool reliable,
+        ReadOnlySpan<byte> args) {
+        NetworkObject obj = self?.NetworkObject;
+        if (obj is null || !obj.IsSpawned) {
+            Debugging.LogWarning("Network.SendRpc on an unspawned object — ignored (RPCs are valid only while spawned).");
+            return;
+        }
+        Channel channel = reliable ? Channel.Reliable : Channel.Unreliable;
+        switch (target) {
+            case RpcTarget.Server:
+                // client → server. If WE are the server (host/dedicated), execute locally attributing the
+                // local connection (the owner-check passes for a host's own object); else send UP.
+                if (IsServer)
+                    InvokeRpcLocally(self, methodId, target, args, caller: LocalConnection);
+                else
+                    Transport.Send(ServerConnection, NetworkWire.Rpc(obj.NetId, self.NetworkTypeId, methodId, args), channel);
+                break;
+
+            case RpcTarget.Owner:
+                // server → the owning client only. A CLIENT calling this is misuse (only the server emits
+                // owner/all RPCs) — drop + log, never send (closed trust boundary).
+                if (!IsServer) { WarnClientCalledServerRpc(target); return; }
+                if (obj.Owner.IsValid && obj.Owner.Equals(LocalConnection))
+                    InvokeRpcLocally(self, methodId, target, args, caller: LocalConnection);  // host owns it
+                else if (obj.Owner.IsValid)
+                    Transport.Send(obj.Owner, NetworkWire.Rpc(obj.NetId, self.NetworkTypeId, methodId, args), channel);
+                break;
+
+            case RpcTarget.All:
+                // server → every observing client AND run locally (the server is an observer too). A CLIENT
+                // calling this is misuse — drop + log.
+                if (!IsServer) { WarnClientCalledServerRpc(target); return; }
+                InvokeRpcLocally(self, methodId, target, args, caller: LocalConnection);       // local run
+                byte[] frame = NetworkWire.Rpc(obj.NetId, self.NetworkTypeId, methodId, args);
+                foreach (Connection c in clients)
+                    Transport.Send(c, frame, channel);
+                break;
+        }
+    }
+
+    // Execute an RPC on THIS machine (a host running its own To.Server/Owner/All, or the server's To.All
+    // local run). Re-reads the freshly-packed args through the SAME invoker the wire arrival uses, so local
+    // and remote execution are byte-identical. For a To.Server local run we still apply the owner-check so
+    // the trust boundary is identical to the wire path (a host's local call passes: caller == owner).
+    void InvokeRpcLocally(NetworkBehaviour self, int methodId, RpcTarget target, ReadOnlySpan<byte> args,
+        Connection caller) {
+        if (!NetworkReplicationRegistry.TryGetRpc(self.NetworkTypeId, methodId, out NetworkRpcEntry entry)) {
+            Debugging.LogError($"Network: local RPC dispatch for unknown methodId {methodId} on {self.GetType().Name}.");
+            return;
+        }
+        if (target == RpcTarget.Server && !OwnerCheckPasses(self.NetworkObject, caller)) {
+            Debugging.LogWarning($"Network: To.Server RPC rejected — caller {caller} does not own the object.");
+            return;
+        }
+        var r = new BitReader(args);
+        self.RpcCaller = caller;
+        try { entry.Invoke(self, ref r, caller); }
+        catch (Exception e) { ScriptGuard.Report(self, "Rpc", e); }
+        finally { self.RpcCaller = Connection.None; }
+    }
+
+    // The INCOMING side — a framed RPC arrived from `source`. Resolve the object + component mirror, look
+    // the method up in the registry (reflection-free), enforce the owner-check for a client→server RPC,
+    // then deserialize args + invoke. The methodId's DECLARED target drives the owner-check decision.
+    void HandleRpc(Connection source, ref BitReader r) {
+        int netId = r.ReadInt();
+        int typeId = r.ReadInt();
+        int methodId = r.ReadInt();
+        NetworkObject obj = objects.Resolve(netId);
+        NetworkBehaviour target = FindNetworkBehaviourForRpc(obj, typeId);
+        if (target is null) {
+            // No mirror (spawn not yet received / already despawned) — drop. RPCs ride Reliable so a true
+            // ordering gap is rare; a despawn race is a benign drop (the object is gone).
+            Debugging.LogWarning($"Network: RPC for unknown object netId {netId} typeId {typeId} — dropped.");
+            return;
+        }
+        if (!NetworkReplicationRegistry.TryGetRpc(typeId, methodId, out NetworkRpcEntry entry)) {
+            Debugging.LogWarning($"Network: RPC for unknown methodId {methodId} on typeId {typeId} — dropped.");
+            return;
+        }
+        // The closed trust boundary (§4b/§9.5): a client→server RPC executes ONLY if `source` owns the
+        // object. The server NEVER runs a client's To.Server RPC for an object it does not own.
+        if (IsServer && entry.Target == RpcTarget.Server && !OwnerCheckPasses(obj, source)) {
+            Debugging.LogWarning(
+                $"Network: To.Server RPC '{methodId}' from {source} REJECTED — not the object's owner (cheat guard).");
+            return;
+        }
+        target.RpcCaller = source;
+        try { entry.Invoke(target, ref r, source); }
+        catch (Exception e) { ScriptGuard.Report(target, "Rpc", e); }
+        finally { target.RpcCaller = Connection.None; }
+    }
+
+    // An RPC may target a NetworkBehaviour with NO [Networked] state (RPC-only component), so this does NOT
+    // gate on HasNetworkedState (unlike the snapshot lookup) — it matches purely on the wire typeId.
+    static NetworkBehaviour FindNetworkBehaviourForRpc(NetworkObject obj, int typeId) {
+        if (obj?.Entity is null)
+            return null;
+        foreach (Behaviour b in obj.Entity.Behaviours.ToArray())
+            if (b is NetworkBehaviour nb && nb.NetworkTypeId == typeId)
+                return nb;
+        return null;
+    }
+
+    static bool OwnerCheckPasses(NetworkObject obj, Connection caller) =>
+        obj is not null && obj.Owner.IsValid && obj.Owner.Equals(caller);
+
+    static void WarnClientCalledServerRpc(RpcTarget target) =>
+        Debugging.LogWarning(
+            $"Network: a client called a To.{target} RPC — only the server sends Owner/All RPCs. Dropped (plan §4b).");
 
     // ---- the tick seam (plan §8.2) ----------------------------------------------------------------
     // The ASYMMETRIC send-rate clock (§8.2 / §14 item 3): simulate at the fixed 60 Hz step but flush

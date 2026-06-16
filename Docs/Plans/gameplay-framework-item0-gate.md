@@ -1,12 +1,13 @@
 # Gameplay Framework — ITEM 0 GATE (mechanism + proof)
 
 **Status:** GATE ✅ (f71d9b9d) + **P0 ✅** (f06d831a) + **P1 ✅** (b855239a) + **P2 ✅** (9a9e0ef5) +
-**P3 ✅ IMPLEMENTED & VERIFIED.** The mechanism this doc settled is ported into the engine and proven
-against shipped code, now through P3 (LiteNetLib transport — real socket, two processes, state on the wire).
+**P3 ✅** (f8a9cf9f) + **P4 ✅ IMPLEMENTED & VERIFIED.** The mechanism this doc settled is ported into the
+engine and proven against shipped code, now through P4 (`[Rpc(To.X)]` over the wire — RPCs cross a real
+socket both directions and invoke on the right machine, owner-checked).
 
 **Verify — in-engine headless harness `%TEMP%\bal-gameplay-test` (GameplayP0.csproj, ProjectReference to the
-engine; drives the REAL Behaviour.FireEnable / GamePhaseRunner / Network.Spawn / authority resolution):
-65/65 PASS, exit 0.**
+engine; drives the REAL Behaviour.FireEnable / GamePhaseRunner / Network.Spawn / authority resolution /
+generated RPC dispatch): 109/109 PASS, exit 0.**
 - **P0** (the §13 three gates + more): (a) a GameMode scene spawns + possesses a controllable pawn with
   owner-routed SetupInput; (b) a no-GameMode scene runs today's exact OnBegin/OnEnabled path (no OnSpawned,
   stays Offline) — the narrow byte-identity invariant; (c) net strand strictly before Unity strand, OnEnabled
@@ -49,11 +50,34 @@ engine; drives the REAL Behaviour.FireEnable / GamePhaseRunner / Network.Spawn /
   per-object (correct for a single observer); a per-CLIENT ack baseline for staggered multi-client joins is
   explicitly P6 (late-join, §13) — documented in `SerializeStateSnapshot`, not a bug.
 
+- **P4**: `[Rpc(To.Server/Owner/All)]` over the wire (§4b/§9.5). The source generator (extended) parses each
+  `[Rpc]` method's target + `Reliable` flag + typed parameter list, and — for the owner-chosen Fusion-like
+  ergonomic — emits the **partial-void send stub** (the dev declares `[Rpc(To.Server)] public partial void
+  Fire(Vector3 dir);` with NO body + writes `FireImpl(Vector3 dir)` with the logic; the call site is just
+  `weapon.Fire(dir)`). The stub packs the args via `WireCodec` (the same bit packing as `[Networked]`) and
+  routes through `Network.SendRpc`; a reflection-free `__Invoke_<Name>` deserializes + calls the impl;
+  `NetworkRpcEntry[]` (methodId/target/reliable/invoker) registers per type into `NetworkReplicationRegistry`
+  (replacing P2's bare `int[] RpcMethodIds`). Routing (proven byte-for-byte in `%TEMP%\bal-rpc-test` FIRST):
+  **To.Server** = client→server, owner-checked by default (the server runs it ONLY if the caller owns the
+  object — the closed trust boundary; a non-owner is rejected + logged, never run); **To.Owner** = server→the
+  owning client only; **To.All** = server→every client + a local run on the server. A client calling
+  Owner/All is dropped (only the server emits them). Reliable by default; `Reliable=false` → the Unreliable
+  channel. **No RPC return (L1)** — the stub is void; request→response stays RPC-up + `[Networked]`
+  state-down + `[OnChanged]`. `RpcCaller` exposes who fired (valid only inside an impl). `NetMessage.Rpc`
+  is the wire frame (`[netId][typeId][methodId][args]`), used in BOTH directions; the receiver looks the
+  method's declared target up to apply the right owner-check. **Verify: the two-process socket test
+  (`%TEMP%\bal-net-twoproc`) now proves an RPC crosses a REAL LiteNetLib socket BOTH ways — a client
+  `To.Server Shoot(dir)` runs ON THE SERVER with the wire-crossed Vector3 + owner-check passing, and a server
+  `To.All Announce(round)` runs ON THE CLIENT.** RPC-only components (no `[Networked]` state) on a
+  state-less object don't replicate a client mirror in P4 (no Spawn carries them) — out of P4 scope; real
+  RPC-bearing objects carry state too (the common pawn/weapon shape, which is what's tested).
+
 `bal schema` confirms the registry auto-discovers every framework type (§10 free discovery). Full slnx builds 0
 errors. Each phase's wire format was proven in an ISOLATED `%TEMP%\bal-*-test` harness BEFORE engine
-integration (P2 serializer / P3 transport), then re-proven against the real engine. **NEXT = P4**
-(`[Rpc(To.X)]` reliable/unreliable, owner-gated server RPCs — the dispatch table P2 already generates rides
-the Reliable channel) → then **P5 prediction (the hard multi-week core)**.
+integration (P2 serializer / P3 transport / P4 RPC dispatch), then re-proven against the real engine. **NEXT =
+P5 prediction (the hard 50%+ multi-week core — predict-self/reconcile/interp/rollback/resim/predicted-spawn,
+each its own isolated harness)** → then P6 late-join baseline (per-client), P7 GameState/reconnect,
+P8 lag-comp/interest.
 
 ---
 

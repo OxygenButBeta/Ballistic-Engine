@@ -45,6 +45,16 @@ public static class Network {
     // Drop ownership back to the server (Connection.None).
     public static void RemoveOwnership(NetworkObject netObj) => Manager?.RemoveOwnership(netObj);
 
+    // ---- RPC dispatch (plan §4b, P4) — called by the GENERATED partial-void stub, not by hand ------
+    // The generated method body packs its args into a BitWriter then calls this; the manager routes per the
+    // declared To.X target (To.Server up / To.Owner+To.All down) and runs the dev method on the right
+    // machine, owner-checked by default for To.Server (the closed trust boundary). NO RPC return (L1):
+    // request→response is RPC-up + [Networked] state-down + [OnChanged]. Game code never calls this
+    // directly — it calls the typed stub (`weapon.Fire(dir)`) the generator emits.
+    public static void SendRpc(NetworkBehaviour self, int methodId, RpcTarget target, bool reliable,
+        ReadOnlySpan<byte> args) =>
+        Manager?.SendRpc(self, methodId, target, reliable, args);
+
     // The §4d.1 truth-table as a pure function — predict the authority a machine with the given
     // (topology, localConnection) holds over an object with the given owner. Exposed because it's the
     // canonical role definition: tooling/agents can predict "who runs this code" for any peer without a

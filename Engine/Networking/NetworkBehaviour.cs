@@ -143,6 +143,13 @@ public abstract class NetworkBehaviour : Behaviour {
         catch (Exception e) { ScriptGuard.Report(this, "OnOwnershipChanged", e); }
     }
 
+    // The connection the CURRENTLY-EXECUTING RPC was attributed to (plan §4b, P4) — valid ONLY inside an
+    // RPC impl body (the framework sets it right before invoking, the generated Invoke_<Name>). For a
+    // To.Server RPC this is the owning client that fired it (the owner-check already passed), so the server
+    // can attribute the action ("who shot"). For To.Owner/To.All it is the server. Connection.None outside
+    // an RPC. A property, not an impl parameter, so RPC impl signatures stay identical to the public method.
+    public Connection RpcCaller { get; internal set; } = Connection.None;
+
     // A generational handle to this component's object (§8.4) — store this, not a raw reference, for a
     // cross-object link that must null out when the target despawns.
     public NetworkRef<TSelf> AsRef<TSelf>() where TSelf : NetworkBehaviour =>

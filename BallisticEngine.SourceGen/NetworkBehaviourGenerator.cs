@@ -51,7 +51,8 @@ public sealed class NetworkBehaviourGenerator : IIncrementalGenerator {
                 if (f is not null) fields.Add(f.Value);
             }
             else if (member is IMethodSymbol method && HasAttr(method, RpcAttr)) {
-                rpcs.Add(new NetRpc(method.Name));
+                NetRpc? rpc = MapRpc(method);
+                if (rpc is not null) rpcs.Add(rpc.Value);
             }
         }
 
@@ -113,6 +114,65 @@ public sealed class NetworkBehaviourGenerator : IIncrementalGenerator {
         float f => f, double d => (float)d, int i => i, _ => 0f,
     };
 
+    // Map an [Rpc(To.X, Reliable=...)] method to a wire RPC (plan §4b, P4). Captures the target (the ctor
+    // arg), reliability (named arg, default true), and the typed parameter list (same WireKind map as a
+    // [Networked] field). Returns null + emits a diagnostic for a method that breaks the contract:
+    //   - must be `partial` (the generator supplies the body — the chosen Fusion-like ergonomic)
+    //   - must return void (L1 — there is NO RPC return; request→response is RPC-up + state-down)
+    //   - every parameter must be a supported wire type
+    static NetRpc? MapRpc(IMethodSymbol method) {
+        AttributeData attr = method.GetAttributes().First(a => a.AttributeClass?.ToDisplayString() == RpcAttr);
+
+        // To.X — the single ctor argument (RpcTarget enum: 0=Server, 1=Owner, 2=All).
+        int target = 0;
+        if (attr.ConstructorArguments.Length > 0 && attr.ConstructorArguments[0].Value is int t)
+            target = t;
+
+        // Reliable — named arg, default true (reliable by default; Rpc.Unreliable opt-in for spammy FX).
+        bool reliable = true;
+        foreach (KeyValuePair<string, TypedConstant> na in attr.NamedArguments)
+            if (na.Key == "Reliable" && na.Value.Value is bool b)
+                reliable = b;
+
+        // The method must be partial + void (the generator emits the body; L1 = no return). A non-partial
+        // or non-void [Rpc] is a contract break — skip it (the C# compiler also errors on a partial decl
+        // with no impl, so a partial-void with no body is the only valid form, which is exactly what we fill).
+        if (method.ReturnType.SpecialType != SpecialType.System_Void)
+            return null;   // L1: an RPC returns nothing
+        if (!method.IsPartialDefinition)
+            return null;   // the body is generated; the dev declares it partial (chosen ergonomic)
+
+        var args = new List<NetField>();
+        foreach (IParameterSymbol p in method.Parameters) {
+            NetField? f = MapArg(p);
+            if (f is null)
+                return null;   // an unsupported arg type — skip the whole method (a diagnostic is a follow-up)
+            args.Add(f.Value);
+        }
+
+        return new NetRpc(method.Name, target, reliable, args);
+    }
+
+    // Map one RPC parameter to a wire field (reusing the field kind map — same supported set as [Networked]:
+    // bool/byte/int/uint/float/Vector2/Vector3/Quaternion). RPC args are full-precision (no per-arg quantize
+    // token in P4 — quantization is a [Networked]-field concern; a quantized RPC arg is a follow-up).
+    static NetField? MapArg(IParameterSymbol p) {
+        WireKind kind = p.Type.ToDisplayString() switch {
+            "bool" => WireKind.Bool,
+            "byte" => WireKind.Byte,
+            "int" => WireKind.Int,
+            "uint" => WireKind.UInt,
+            "float" => WireKind.Float,
+            "System.Numerics.Vector2" => WireKind.Vector2,
+            "System.Numerics.Vector3" => WireKind.Vector3,
+            "System.Numerics.Quaternion" => WireKind.Quaternion,
+            _ => WireKind.Unsupported,
+        };
+        if (kind == WireKind.Unsupported)
+            return null;
+        return new NetField(p.Name, kind, quantized: false, 0f, 0f, 0);
+    }
+
     // ---- emission ----------------------------------------------------------------------------------
     static void Emit(SourceProductionContext spc, NetTarget t) {
         var sb = new StringBuilder();
@@ -130,7 +190,6 @@ public sealed class NetworkBehaviourGenerator : IIncrementalGenerator {
         // typeId + layout hash (computed at codegen time with the SAME FNV the engine ships).
         int typeId = Fnv(new[] { t.FullName });
         int layoutHash = Fnv(t.Fields.Select(LayoutToken).ToArray());
-        var rpcMethodIds = t.Rpcs.Select(r => FnvString(r.Name)).ToArray();
 
         sb.AppendLine($"        public override bool HasNetworkedState => {(t.Fields.Count > 0 ? "true" : "false")};");
         sb.AppendLine($"        public override int NetworkTypeId => {typeId};");
@@ -142,7 +201,8 @@ public sealed class NetworkBehaviourGenerator : IIncrementalGenerator {
         EmitSerializeFull(sb, t);
         EmitDeserialize(sb, t);
         EmitCaptureBaseline(sb, t);
-        EmitRegistration(sb, t, typeId, layoutHash, rpcMethodIds);
+        EmitRpcs(sb, t);                 // P4: partial-void send stubs + reflection-free invokers
+        EmitRegistration(sb, t, typeId, layoutHash);
 
         sb.AppendLine("    }");
         if (hasNs) sb.AppendLine("}");
@@ -218,13 +278,61 @@ public sealed class NetworkBehaviourGenerator : IIncrementalGenerator {
         sb.AppendLine();
     }
 
-    static void EmitRegistration(StringBuilder sb, NetTarget t, int typeId, int layoutHash, int[] rpcMethodIds) {
+    // P4: for each [Rpc] method emit (a) the partial-void STUB body — pack args + route via Network.SendRpc;
+    // (b) a reflection-free INVOKER — deserialize args + call the dev's <Name>Impl. The dev declares the
+    // method `partial` (no body) and writes `<Name>Impl(<same args>)` with the logic; `RpcCaller` exposes
+    // who fired it. This is the Fusion-like ergonomic the owner chose — the call site is just `weapon.Fire(dir)`.
+    static void EmitRpcs(StringBuilder sb, NetTarget t) {
+        if (t.Rpcs.Count == 0)
+            return;
+        string[] targetEnum = { "Server", "Owner", "All" };
+        foreach (NetRpc rpc in t.Rpcs) {
+            int methodId = FnvString(rpc.Name);
+            string sig = string.Join(", ", rpc.Args.Select(a => $"{ArgClrType(a.Kind)} {a.Name}"));
+            string callArgs = string.Join(", ", rpc.Args.Select(a => a.Name));
+
+            // (a) the partial method body — pack args into a fresh BitWriter, hand the bytes to the router.
+            sb.AppendLine($"        // [Rpc(To.{targetEnum[rpc.Target]}{(rpc.Reliable ? "" : ", Reliable=false")})] generated send stub.");
+            sb.AppendLine($"        public partial void {rpc.Name}({sig}) {{");
+            sb.AppendLine("            var __aw = new BitWriter();");
+            foreach (NetField a in rpc.Args)
+                sb.AppendLine($"            {WriteCall(a, a.Name, "__aw")};");
+            sb.AppendLine($"            BallisticEngine.Network.SendRpc(this, {methodId}, " +
+                          $"BallisticEngine.Networking.RpcTarget.{targetEnum[rpc.Target]}, {(rpc.Reliable ? "true" : "false")}, __aw.AsSpan());");
+            sb.AppendLine("        }");
+
+            // (b) the invoker — static so it's a cheap method-group delegate; reads args then calls <Name>Impl.
+            sb.AppendLine($"        private static void __Invoke_{rpc.Name}(BallisticEngine.NetworkBehaviour __self, ref BitReader __r, Connection __caller) {{");
+            for (int i = 0; i < rpc.Args.Count; i++) {
+                NetField a = rpc.Args[i];
+                sb.AppendLine($"            {ArgClrType(a.Kind)} {a.Name} = {ReadCall(a)};");
+            }
+            sb.AppendLine($"            (({t.TypeName})__self).{rpc.Name}Impl({callArgs});");
+            sb.AppendLine("        }");
+            sb.AppendLine();
+        }
+    }
+
+    static string ArgClrType(WireKind k) => ClrType(k);
+
+    static void EmitRegistration(StringBuilder sb, NetTarget t, int typeId, int layoutHash) {
         // A [ModuleInitializer] registers this type's wire metadata into NetworkReplicationRegistry once
         // at module load (the only sanctioned reflection-free registration, §11). The registry is cleared
         // at the hot-reload boundary (gate 0c) so the next ALC re-registers.
-        string rpcArray = rpcMethodIds.Length == 0
-            ? "System.Array.Empty<int>()"
-            : "new int[] { " + string.Join(", ", rpcMethodIds.Select(id => id + "")) + " }";
+        //
+        // The RPC table (P4) = one NetworkRpcEntry per [Rpc] method: (methodId, target, reliable, invoker).
+        // The invoker is a static method-group delegate the dispatch path calls with NO reflection (§11).
+        string[] targetEnum = { "Server", "Owner", "All" };
+        string rpcArray;
+        if (t.Rpcs.Count == 0) {
+            rpcArray = "System.Array.Empty<BallisticEngine.NetworkRpcEntry>()";
+        } else {
+            var entries = t.Rpcs.Select(r =>
+                $"new BallisticEngine.NetworkRpcEntry({FnvString(r.Name)}, " +
+                $"BallisticEngine.Networking.RpcTarget.{targetEnum[r.Target]}, {(r.Reliable ? "true" : "false")}, " +
+                $"__Invoke_{r.Name})");
+            rpcArray = "new BallisticEngine.NetworkRpcEntry[] { " + string.Join(", ", entries) + " }";
+        }
         sb.AppendLine("        [ModuleInitializer]");
         sb.AppendLine($"        internal static void __NetRegister() {{");
         sb.AppendLine($"            BallisticEngine.NetworkReplicationRegistry.Register(");
@@ -237,9 +345,10 @@ public sealed class NetworkBehaviourGenerator : IIncrementalGenerator {
     }
 
     // ---- per-field codec calls (BYTE-IDENTICAL to the harness-proven WireCodec) --------------------
-    static string WriteCall(NetField f, string expr) => f.Quantized
-        ? $"WireCodec.WriteQ(__w, {expr}, {Lit(f.Min)}, {Lit(f.Max)}, {f.Bits})"
-        : $"WireCodec.Write(__w, {expr})";
+    // `writer` names the BitWriter local (the state serializers use __w; the RPC arg packer uses __aw).
+    static string WriteCall(NetField f, string expr, string writer = "__w") => f.Quantized
+        ? $"WireCodec.WriteQ({writer}, {expr}, {Lit(f.Min)}, {Lit(f.Max)}, {f.Bits})"
+        : $"WireCodec.Write({writer}, {expr})";
 
     static string ReadCall(NetField f) => f.Kind switch {
         WireKind.Bool => "WireCodec.ReadBool(ref __r)",
@@ -317,7 +426,12 @@ public sealed class NetworkBehaviourGenerator : IIncrementalGenerator {
 
     readonly struct NetRpc {
         public readonly string Name;
-        public NetRpc(string name) => Name = name;
+        public readonly int Target;          // RpcTarget: 0=Server, 1=Owner, 2=All
+        public readonly bool Reliable;
+        public readonly IReadOnlyList<NetField> Args;   // typed parameter list (wire-packed)
+        public NetRpc(string name, int target, bool reliable, IReadOnlyList<NetField> args) {
+            Name = name; Target = target; Reliable = reliable; Args = args;
+        }
     }
 
     sealed class NetTarget {

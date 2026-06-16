@@ -16,6 +16,7 @@ public enum NetMessage : byte {
     Spawn = 3,       // server->client: netId + typeId + owner + full baseline state -> build the mirror
     Despawn = 4,     // server->client: netId -> tear down the mirror
     Snapshot = 5,    // server->client: a batch of [netId, typeId, delta-state] for dirty objects
+    Rpc = 6,         // either direction: netId + typeId + methodId + packed args -> dispatch + invoke (P4)
 }
 
 // Static read/write helpers over BitWriter/BitReader for the frame headers. The per-object STATE bytes
@@ -69,6 +70,26 @@ public static class NetworkWire {
         w.WriteByte((byte)NetMessage.Despawn);
         w.WriteInt(netId);
         return w.AsSpan().ToArray();
+    }
+
+    // An RPC frame (P4, plan §4b): the target object + method, then the packed args (the generated send
+    // stub wrote `args` via WireCodec — this only frames the header around them). The SAME frame format is
+    // used in BOTH directions (client->server To.Server, server->client To.Owner/To.All) — the receiver
+    // looks the methodId's declared target up in the registry to apply the right owner-check. Reliability
+    // is the channel the SENDER picks (the [Rpc] Reliable flag), not part of the bytes.
+    public static byte[] Rpc(int netId, int typeId, int methodId, ReadOnlySpan<byte> args) {
+        var w = new BitWriter();
+        w.WriteByte((byte)NetMessage.Rpc);
+        w.WriteInt(netId);
+        w.WriteInt(typeId);
+        w.WriteInt(methodId);
+        // Append the pre-packed arg bytes bit-for-bit. The args were written by a fresh BitWriter starting
+        // at bit 0, so they are byte-aligned blocks; copy them after the (byte-aligned) header. The reader
+        // resumes at the same bit offset because every header field is a whole 32 bits.
+        var combined = new byte[w.ByteLength + args.Length];
+        w.AsSpan().CopyTo(combined);
+        args.CopyTo(combined.AsSpan(w.ByteLength));
+        return combined;
     }
 
     public static byte ReadTag(ReadOnlySpan<byte> payload) =>
