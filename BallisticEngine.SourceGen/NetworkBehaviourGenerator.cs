@@ -25,6 +25,21 @@ public sealed class NetworkBehaviourGenerator : IIncrementalGenerator {
     const string NetworkedAttr = "BallisticEngine.NetworkedAttribute";
     const string RpcAttr = "BallisticEngine.RpcAttribute";
 
+    // The replication changemask is a single `uint` (one bit per [Networked] field) written via
+    // `BitWriter.WriteBits(__mask, FieldCount)`, which caps at 32 bits. Past 32 fields the `1u << i`
+    // mask bits wrap (C# masks the shift count to 5 bits → field 32 collides with field 0) AND
+    // WriteBits(_, >32) throws at runtime — a SILENT-then-crashing failure. Fail the BUILD loudly
+    // instead, so the dev splits the component (or this becomes a `ulong`/multi-chunk mask later).
+    const int MaxNetworkedFields = 32;
+    static readonly DiagnosticDescriptor TooManyNetworkedFields = new(
+        id: "BNET001",
+        title: "Too many [Networked] fields",
+        messageFormat: "'{0}' declares {1} [Networked] fields; the replication changemask supports at most "
+            + MaxNetworkedFields + ". Split the replicated state across multiple NetworkBehaviours.",
+        category: "BallisticEngine.Networking",
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
     public void Initialize(IncrementalGeneratorInitializationContext context) {
         var candidates = context.SyntaxProvider.CreateSyntaxProvider(
             predicate: static (node, _) => node is ClassDeclarationSyntax c && c.BaseList is not null,
@@ -209,6 +224,12 @@ public sealed class NetworkBehaviourGenerator : IIncrementalGenerator {
 
     // ---- emission ----------------------------------------------------------------------------------
     static void Emit(SourceProductionContext spc, NetTarget t) {
+        if (t.Fields.Count > MaxNetworkedFields) {
+            // The uint changemask can't address more than 32 fields (see MaxNetworkedFields). Report a build
+            // error and emit nothing for this type — a wrapped mask would silently desync, then crash.
+            spc.ReportDiagnostic(Diagnostic.Create(TooManyNetworkedFields, Location.None, t.FullName, t.Fields.Count));
+            return;
+        }
         if (t.SceneReplicated) { EmitSceneReplicated(spc, t); return; }   // P7: the entity-less GameState path
 
         var sb = new StringBuilder();

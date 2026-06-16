@@ -41,9 +41,13 @@ public sealed class BitWriter {
         WriteBits(BitConverter.SingleToUInt32Bits(value), 32);
 
     // Quantize a float in [min,max] to `bits` (the ~mm packing of §11). Out-of-range clamps.
+    // NOTE: the level count is computed with a 64-bit shift — `(1u << 32) - 1` wraps to 0 in C#
+    // (the shift count is masked to 5 bits, so `1u << 32 == 1u`), which would collapse EVERY value of a
+    // `bits == 32` field to `min`. `[Networked]` documents Bits 1..32 as valid, so 32 must round-trip.
     public void WriteQuantized(float value, float min, float max, int bits) {
         float t = max > min ? Math.Clamp((value - min) / (max - min), 0f, 1f) : 0f;
-        uint q = (uint)Math.Round(t * ((1u << bits) - 1));
+        uint levels = (uint)((1UL << bits) - 1UL);
+        uint q = (uint)Math.Round(t * levels);
         WriteBits(q, bits);
     }
 
