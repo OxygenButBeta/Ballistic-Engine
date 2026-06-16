@@ -187,6 +187,14 @@ public class SceneManager {
         // (The coroutine fixed pump runs inside Physics.Advance, before each step's FixedTick.)
         Physics.Advance(delta, FixedTickScenes);
 
+        // Network: drain the transport ONCE per frame (the socket pump, plan §8.2 IterateIncoming/
+        // Outgoing). No-op when Offline. The per-TICK network work (input capture, NetworkTick, the
+        // asymmetric down-state flush) does NOT live here — it runs inside the fixed-step loop above
+        // (FixedTickScenes → Network.PredictTick), bound to the existing 60 Hz accumulator (L2: one
+        // fixed tick = the network clock, no second clock). Running it per-frame would tie the net tick
+        // to render rate — the exact desync L2 exists to prevent.
+        Network.Manager?.PollTransport();
+
         // Pump coroutines/async continuations BEFORE the scene Tick so a resume scheduled last frame
         // (and any await DelaySeconds that elapses this frame) runs with this frame's state, ahead of
         // the components that may depend on it.
@@ -199,6 +207,13 @@ public class SceneManager {
     static readonly Action<float> FixedTickScenes = step => {
         foreach (Scene scene in instance.activeScenes)
             scene.FixedUpdate(in step);
+
+        // The network prediction tick (plan §8.2) runs ONCE per fixed step, BEFORE the physics step that
+        // follows it in Physics.Advance — the canonical bracket "NetworkTick (sample input, predict, sim)
+        // → physics step". Bound to the existing 60 Hz accumulator (L2). No-op when Offline. The owner
+        // captures input + predicts here; the server drives state-authority NetworkTicks; the asymmetric
+        // down-state flush lands on the send boundary (the divisor cadence).
+        Network.Manager?.PredictTick(step);
     };
 
     // Enter play mode: snapshot the current (edit-mode) scene, then run component lifecycle.
@@ -217,7 +232,16 @@ public class SceneManager {
         Physics.BeginPlay(); // fresh world before components create bodies in OnEnabled
         CoroutineRunner.Reset(); // no coroutines carry over from a previous session
         IsPlaying = true;
-        scene.FireBegin();
+
+        // Gameplay framework (plan §5): if the scene declares a GameMode, run the ordered phases
+        // (GameMode → Player → HUD → everyone-else) instead of the bare FireBegin. The runner drives the
+        // net strand in Phases 0-2 and fires the SINGLE Unity strand in Phase 3 (the B1/B2 fix). With NO
+        // GameMode this branch is never taken and play-start is byte-identical to before — the opt-in,
+        // zero-regression contract. GamePhaseRunner is engine code (Engine/Gameplay), so no injection.
+        if (GamePhaseRunner.HasGameMode(scene))
+            GamePhaseRunner.Run(scene);
+        else
+            scene.FireBegin();
     }
 
     // Leave play mode: tear down components, clear runtime state, restore the snapshot.
@@ -232,6 +256,7 @@ public class SceneManager {
         scene.Clear();
         ClearAllRenderSets();
         Physics.EndPlay(); // after Clear so component teardown saw a live world
+        Network.Stop(); // tear down the loopback/host started by the phase runner — back to Offline
         CoroutineRunner.Reset(); // abandon any in-flight coroutines/awaits — they don't survive Stop
 
         IsPlaying = false;

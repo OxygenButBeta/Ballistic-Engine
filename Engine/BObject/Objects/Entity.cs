@@ -101,10 +101,8 @@ public class Entity : BObject {
             return;
 
         component.IsDetached = true; // in-flight dispatch snapshots skip it from here on
-        if (SceneManager.IsPlaying && component.IsActive) {
-            try { component.OnDisabled(); }
-            catch (Exception e) { ScriptGuard.Report(component, "OnDisabled", e); }
-        }
+        if (SceneManager.IsPlaying && component.IsActive)
+            component.FireDisable();
         try { component.OnDetach(); }
         catch (Exception e) { ScriptGuard.Report(component, "OnDetach", e); }
     }
@@ -201,8 +199,7 @@ public class Entity : BObject {
                 behaviour.FireEnable();
             }
             else {
-                try { behaviour.OnDisabled(); }
-                catch (Exception e) { ScriptGuard.Report(behaviour, "OnDisabled", e); }
+                behaviour.FireDisable();
             }
         }
     }
@@ -244,8 +241,7 @@ public class Entity : BObject {
         foreach (Behaviour behaviour in Behaviours.ToArray()) {
             if (behaviour.IsDetached || !behaviour.IsActive)
                 continue;
-            try { behaviour.OnDisabled(); }
-            catch (Exception e) { ScriptGuard.Report(behaviour, "OnDisabled", e); }
+            behaviour.FireDisable();
         }
     }
 
