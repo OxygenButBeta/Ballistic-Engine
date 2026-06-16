@@ -13,9 +13,9 @@ public sealed class NetworkManager {
     public ITransport Transport { get; private set; }
     public NetworkTopology Topology { get; private set; } = NetworkTopology.Offline;
 
-    // netId -> object. Internal: the §3 no-public-netId rule. Slot 0 unused (0 = "unspawned").
-    readonly Dictionary<int, NetworkObject> objects = new();
-    int nextNetId = 1;
+    // netId -> object, a GENERATIONAL slot array (§8.4) so NetworkRef.Value resolves in O(1) with a
+    // generation check — the mechanism that makes "null on despawn" real. Internal (no public netId, §3).
+    readonly NetworkObjectRegistry objects = new();
 
     // The local connection's identity. In a loopback host this is Connection.Local; a remote client
     // gets its id from the transport handshake (P3).
@@ -63,7 +63,6 @@ public sealed class NetworkManager {
         Topology = NetworkTopology.Offline;
         LocalConnection = Connection.None;
         objects.Clear();
-        nextNetId = 1;
     }
 
     void WireTransport() {
@@ -109,11 +108,10 @@ public sealed class NetworkManager {
         if (netObj.IsSpawned)
             return netObj;
 
-        netObj.NetId = nextNetId++;
         netObj.Owner = owner;
-        netObj.Authority = ResolveAuthority(owner);
+        netObj.Authority = ResolveAuthority(Topology, LocalConnection, owner);
         netObj.IsSpawned = true;
-        objects[netObj.NetId] = netObj;
+        netObj.NetId = objects.Add(netObj);   // packed (slot, generation) — the NetworkRef handle key
 
         // Drive the net strand on EVERY NetworkBehaviour of the entity, in declaration order, before
         // any Unity strand. The caller (phase runner / Network.Spawn runtime path) handles the Unity
@@ -122,19 +120,29 @@ public sealed class NetworkManager {
         return netObj;
     }
 
-    // P0 authority resolution (loopback-correct; P1 promotes to the per-machine §4d.1 truth-table):
-    // the server/host always has State authority over what it spawns; the owning connection has Input
-    // authority. On a host, an object owned by the local connection gets Both.
-    NetworkAuthority ResolveAuthority(Connection owner) {
+    // The §4d.1 truth-table, as a PURE function of (this machine's topology, this machine's connection,
+    // the object's owner). One place authority is decided, for every machine — so when P3 brings real
+    // remote peers, each computes its OWN role by calling this with its own (topology, localConn). The
+    // two orthogonal axes (L3), never collapsed:
+    //   State authority — the SERVER (and a host, which IS a server) owns the truth. A pure client never
+    //                     has it. This is why IsProxy is false on a host for EVERYTHING (the host-corner).
+    //   Input authority — the machine whose local connection == the object's owner drives its input.
+    //                     On a dedicated server an object owned by a remote client gives Input to that
+    //                     client's machine, NOT the server. A server-owned (None) object gives Input to
+    //                     nobody. A host owning an object locally gets BOTH (its own pawn).
+    internal static NetworkAuthority ResolveAuthority(
+        NetworkTopology topology, Connection localConnection, Connection owner) {
         NetworkAuthority a = NetworkAuthority.None;
-        if (IsServer)
+
+        // State: the server/host owns truth for everything it tracks.
+        if (topology is NetworkTopology.Server or NetworkTopology.Host)
             a |= NetworkAuthority.State;
-        bool ownedLocally = owner.IsValid && owner.Equals(LocalConnection);
-        // A dedicated-server object with a remote owner has Input authority on the OWNER's machine,
-        // not here; in loopback the owner IS the local connection, so Input lands locally. (P1 makes
-        // this per-machine; P0 is single-process so "here" == "the owner's machine" when owned locally.)
-        if (ownedLocally || (IsHost && owner.Equals(Connection.Local)))
+
+        // Input: this machine is the owning connection. Connection.None (server-owned) is owned by no
+        // machine, so no Input authority anywhere. A host's local connection is Connection.Local.
+        if (owner.IsValid && owner.Equals(localConnection))
             a |= NetworkAuthority.Input;
+
         return a;
     }
 
@@ -144,19 +152,50 @@ public sealed class NetworkManager {
                 nb.DriveNetSpawn();
     }
 
-    // Despawn (server-authoritative). Fires OnDespawned on every NetworkBehaviour, then frees the slot.
+    // Despawn (server-authoritative). Fires OnDespawned on every NetworkBehaviour, then frees the slot —
+    // bumping its generation so every NetworkRef to this identity now reads null (§8.4).
     public void Despawn(NetworkObject netObj) {
         if (netObj is null || !netObj.IsSpawned)
             return;
         foreach (Behaviour b in netObj.Entity.Behaviours.ToArray())
             if (b is NetworkBehaviour nb)
                 nb.DriveNetDespawn();
-        objects.Remove(netObj.NetId);
+        objects.Remove(netObj.NetId);   // bumps the slot generation -> stale NetworkRefs null out
         netObj.IsSpawned = false;
         netObj.NetId = 0;
         netObj.Authority = NetworkAuthority.None;
+        netObj.Owner = Connection.None;
     }
 
-    internal NetworkObject Resolve(int netId) => objects.GetValueOrDefault(netId);
+    // ---- ownership transfer (server-only, replicated; plan §4d) -----------------------------------
+    // Move INPUT authority to a new connection at runtime — pick-up items, vehicle-enter, detachable
+    // turrets. Server-only to call (a client can't grant itself ownership — the closed trust boundary);
+    // the change replicates and fires OnOwnershipChanged on affected peers. P1: the local re-resolve +
+    // callback; the replication of the change rides the wire in P3.
+    public void TransferOwnership(NetworkObject netObj, Connection newOwner) {
+        if (netObj is null || !netObj.IsSpawned)
+            return;
+        if (!IsServer) {
+            Debugging.LogWarning("TransferOwnership is server-only — a client cannot grant itself ownership.");
+            return;
+        }
+        Connection prev = netObj.Owner;
+        if (prev.Equals(newOwner))
+            return;
+        netObj.Owner = newOwner;
+        netObj.Authority = ResolveAuthority(Topology, LocalConnection, newOwner);
+        FireOwnershipChanged(netObj, prev, newOwner);
+    }
+
+    // Drop ownership back to the server (Connection.None) — the orphan/return case.
+    public void RemoveOwnership(NetworkObject netObj) => TransferOwnership(netObj, Connection.None);
+
+    static void FireOwnershipChanged(NetworkObject netObj, Connection prev, Connection next) {
+        foreach (Behaviour b in netObj.Entity.Behaviours.ToArray())
+            if (b is NetworkBehaviour nb)
+                nb.DriveOwnershipChanged(prev, next);
+    }
+
+    internal NetworkObject Resolve(int netId) => objects.Resolve(netId);
     public int SpawnedCount => objects.Count;
 }

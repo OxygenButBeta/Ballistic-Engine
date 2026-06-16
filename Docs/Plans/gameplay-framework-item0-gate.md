@@ -1,17 +1,24 @@
 # Gameplay Framework — ITEM 0 GATE (mechanism + proof)
 
-**Status:** GATE ✅ SETTLED (commit f71d9b9d) + **P0 ✅ IMPLEMENTED & VERIFIED.** The mechanism this doc
-settled is now ported into the engine and proven against shipped code.
+**Status:** GATE ✅ (f71d9b9d) + **P0 ✅** (f06d831a) + **P1 ✅ IMPLEMENTED & VERIFIED.** The mechanism this
+doc settled is ported into the engine and proven against shipped code, now through P1 (full roles).
 
-**P0 verify (the §13 three gates + more) — in-engine headless harness `%TEMP%\bal-gameplay-test`
-(GameplayP0.csproj, ProjectReference to the engine; drives the REAL Behaviour.FireEnable / GamePhaseRunner /
-Network.Spawn): 41/41 PASS, exit 0.** Proves (a) a GameMode scene spawns + possesses a controllable pawn with
-owner-routed SetupInput; (b) a no-GameMode scene runs today's exact OnBegin/OnEnabled path (no OnSpawned, stays
-Offline) — the narrow byte-identity invariant; (c) net strand strictly before Unity strand, OnEnabled exactly
-once; plus the §4d.1 host-corner (IsProxy=false on a host), a proxy never reaching SetupInput, the 0c registry
-clear, a disable/re-enable regression check, and framework-component serializer round-trip. `bal schema`
-confirms the registry auto-discovers GameMode/Pawn/PlayerController/HUD/GameState/PlayerState/NetworkObject
-(§10 free discovery). Full slnx builds 0 errors. **NEXT = P1** (full roles/NetworkRef/ownership transfer).
+**Verify — in-engine headless harness `%TEMP%\bal-gameplay-test` (GameplayP0.csproj, ProjectReference to the
+engine; drives the REAL Behaviour.FireEnable / GamePhaseRunner / Network.Spawn / authority resolution):
+65/65 PASS, exit 0.**
+- **P0** (the §13 three gates + more): (a) a GameMode scene spawns + possesses a controllable pawn with
+  owner-routed SetupInput; (b) a no-GameMode scene runs today's exact OnBegin/OnEnabled path (no OnSpawned,
+  stays Offline) — the narrow byte-identity invariant; (c) net strand strictly before Unity strand, OnEnabled
+  exactly once; plus a proxy never reaching SetupInput, the 0c registry clear, a disable/re-enable regression
+  check, and framework-component serializer round-trip.
+- **P1**: the full §4d.1 role truth-table — ALL 8 cells (dedicated/host/owner/other × client-pawn/world/
+  host-pawn) including the host-corner (IsProxy=false on a host); the generational `NetworkRef<T>` (null on
+  despawn via generation mismatch, NOT dangling, + the pooling invariant: an old handle stays null even when
+  its slot is reused by a new identity); `TransferOwnership`/`RemoveOwnership` (server-only) flipping
+  IsOwner/input-authority and firing `OnOwnershipChanged`.
+
+`bal schema` confirms the registry auto-discovers every framework type (§10 free discovery). Full slnx builds 0
+errors. **NEXT = P2** (Roslyn source generator + `[Networked]` bit-packed delta state, separate send-rate).
 
 ---
 

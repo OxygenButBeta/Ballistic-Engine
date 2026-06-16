@@ -6,12 +6,12 @@ namespace BallisticEngine;
 // [Networked] state of every NetworkBehaviour on the same entity lives under it. A Behaviour, so the
 // editor/serializer/registry discover it free (§10).
 //
-// P0 scope (the B3 skeleton, §14 0b): identity (netId, owner), the role flags, IsSpawned, and the
-// spawn/despawn marks. Full authority arrives in P1 (the §4d.1 truth-table); in loopback the local
-// host has Both authority over its own objects, so the skeleton resolves trivially-correctly today.
+// Authority is the full §4d.1 truth-table (P1): resolved per-machine from (topology, localConnection,
+// owner) by NetworkManager.ResolveAuthority — the same function every machine runs with its own inputs,
+// so roles are correct on a dedicated server, a host, the owning client, and a watching client alike.
 //
-// netId is INTERNAL — never a public field (§3). Game code addresses objects by typed reference; the
-// generational NetworkRef<T> handle (§8.4) that nulls on despawn is a P1 deliverable.
+// netId is INTERNAL — never a public field (§3). Game code addresses objects by a generational
+// NetworkRef<T> handle (§8.4) that nulls on despawn. The netId packs (slot, generation).
 [Component("Network Object", "Networking")]
 public sealed class NetworkObject : Behaviour {
     // Registry slot assigned at spawn (Network.Spawn). 0 = unspawned. Internal: the §3 no-public-netId
@@ -29,10 +29,10 @@ public sealed class NetworkObject : Behaviour {
     [NotSerialized]
     public bool IsSpawned { get; internal set; }
 
-    // ---- authority (the two orthogonal axes, L3) --------------------------------------------------
-    // P0: resolved from the topology + owner at spawn and cached. Server/host has State authority over
-    // objects it spawns; the owning connection has Input authority. P1 promotes this to the full
-    // per-machine truth-table; the API shape is final here so callers never change.
+    // ---- authority (the two orthogonal axes, L3 / the §4d.1 truth-table) --------------------------
+    // Resolved per-machine at spawn (and on TransferOwnership) by NetworkManager.ResolveAuthority and
+    // cached. Never collapsed into one flag — that collapse is the root of the "who runs this code" /
+    // "IsOwner on host" edge-case class.
     [NotSerialized]
     public NetworkAuthority Authority { get; internal set; } = NetworkAuthority.None;
 
@@ -43,8 +43,15 @@ public sealed class NetworkObject : Behaviour {
     // host always has State authority). Precisely L3, not "I don't drive its input".
     public bool IsProxy => !HasStateAuthority && !HasInputAuthority;
 
-    // IsOwner: this machine is the input authority / owning connection. In loopback the local host
-    // owns its own objects, so this is trivially correct. Derived, never a stored third flag.
+    // The two PROXY KINDS the table distinguishes (the corner the earlier draft left undefined):
+    //   AutonomousProxy — the owning client: predicts + reads input, but the server owns truth.
+    //                     !State && Input. (Not a proxy in the IsProxy sense — it has Input authority.)
+    //   SimulatedProxy  — a watching client: neither authority, interpolated. Exactly IsProxy.
+    public bool IsAutonomousProxy => !HasStateAuthority && HasInputAuthority;
+    public bool IsSimulatedProxy => IsProxy;
+
+    // IsOwner: this machine is the input authority / owning connection. Derived, never a stored third
+    // flag (FishNet's host trap, designed out — on a host this is correct because Owner == LocalConn).
     public bool IsOwner => HasInputAuthority;
 
     public int OwnerId => Owner.Id;

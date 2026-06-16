@@ -33,6 +33,8 @@ public abstract class NetworkBehaviour : Behaviour {
     public bool HasStateAuthority => NetworkObject?.HasStateAuthority ?? false;
     public bool HasInputAuthority => NetworkObject?.HasInputAuthority ?? false;
     public bool IsProxy          => NetworkObject is null || NetworkObject.IsProxy;
+    public bool IsAutonomousProxy => NetworkObject?.IsAutonomousProxy ?? false;
+    public bool IsSimulatedProxy => NetworkObject is null || NetworkObject.IsSimulatedProxy;
     public Connection Owner      => NetworkObject?.Owner ?? Connection.None;
 
     // ---- net-strand callbacks (virtual; subclasses override) --------------------------------------
@@ -50,6 +52,12 @@ public abstract class NetworkBehaviour : Behaviour {
     protected internal virtual void OnStartServer() { }
     protected internal virtual void OnStartClient() { }
     protected internal virtual void OnStartLocalPlayer() { }
+
+    // Ownership transitions (plan §4e) — fires on the server + affected peers when input authority moves
+    // (TransferOwnership: pick-up, vehicle-enter, reconnect). prev/next are the old/new owner. By the
+    // time this fires, IsOwner/HasInputAuthority already reflect `next`, so the body reads the new role
+    // directly. Use it to (de)activate owner-only systems — e.g. wire input when you BECOME the owner.
+    protected internal virtual void OnOwnershipChanged(Connection previous, Connection next) { }
 
     // The single simulation step (plan §4c) — the only place [Networked] state mutates, once prediction
     // lands (P5). P0 declares it so the contract is stable; the network tick wires it in P2+.
@@ -94,4 +102,18 @@ public abstract class NetworkBehaviour : Behaviour {
         try { OnDespawned(); }
         catch (Exception e) { ScriptGuard.Report(this, "OnDespawned", e); }
     }
+
+    // Drive OnOwnershipChanged (TransferOwnership). The NetworkObject's Authority/Owner are already
+    // updated, so the callback observes the NEW role. Only fires on a spawned object (NetBegun).
+    internal void DriveOwnershipChanged(Connection previous, Connection next) {
+        if (!NetBegun)
+            return;
+        try { OnOwnershipChanged(previous, next); }
+        catch (Exception e) { ScriptGuard.Report(this, "OnOwnershipChanged", e); }
+    }
+
+    // A generational handle to this component's object (§8.4) — store this, not a raw reference, for a
+    // cross-object link that must null out when the target despawns.
+    public NetworkRef<TSelf> AsRef<TSelf>() where TSelf : NetworkBehaviour =>
+        NetworkObject is { IsSpawned: true } no ? new NetworkRef<TSelf>(no.NetId) : default;
 }

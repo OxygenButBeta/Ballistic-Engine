@@ -36,8 +36,26 @@ public static class Network {
 
     public static void Despawn(NetworkObject netObj) => Manager?.Despawn(netObj);
 
+    // ---- ownership transfer (server-only, replicated; plan §4d) -----------------------------------
+    // Move input authority to a new connection (pick-up, vehicle-enter, detachable turret). Server-only
+    // — a client cannot grant itself ownership. Fires OnOwnershipChanged on the affected objects.
+    public static void TransferOwnership(NetworkObject netObj, Connection newOwner) =>
+        Manager?.TransferOwnership(netObj, newOwner);
+
+    // Drop ownership back to the server (Connection.None).
+    public static void RemoveOwnership(NetworkObject netObj) => Manager?.RemoveOwnership(netObj);
+
+    // The §4d.1 truth-table as a pure function — predict the authority a machine with the given
+    // (topology, localConnection) holds over an object with the given owner. Exposed because it's the
+    // canonical role definition: tooling/agents can predict "who runs this code" for any peer without a
+    // live object, and it's the testable form of L3. The live path (spawn / TransferOwnership) calls the
+    // same function, so this never drifts from real role resolution.
+    public static NetworkAuthority ResolveRole(
+        NetworkTopology topology, Connection localConnection, Connection owner) =>
+        NetworkManager.ResolveAuthority(topology, localConnection, owner);
+
     // Resolve a netId to its object (internal — game code never sees a raw netId, §3). The generational
-    // NetworkRef<T> handle that nulls on despawn is built on this in P1.
+    // NetworkRef<T> handle (§8.4) that nulls on despawn is built on this.
     internal static NetworkObject Resolve(int netId) => Manager?.Resolve(netId);
 
     static NetworkManager Require() =>
