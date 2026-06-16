@@ -429,15 +429,22 @@ public sealed class DX12HDRenderer : HDRenderer {
     }
 
     // Auto-exposure: a 1×1 R16F target holding the metered exposure EV100 (LumAverage.hlsl).
-    ID3D12RootSignature lumRootSig;     // LumConstants CBV (b0) + 1 HDR SRV (t0) + sampler
+    ID3D12RootSignature lumRootSig;     // LumConstants CBV (b0) + 2 SRVs (t0 HDR, t1 prev-EV) + sampler
     ID3D12PipelineState lumPso;
-    Dx12OffscreenTarget lumTarget;      // 1×1 R16F, color-readable
+    // V1b: TWO 1×1 R16F targets, ping-ponged each frame — the meter reads last frame's adapted EV (history)
+    // and writes this frame's adapted EV. lumTarget = the one written THIS frame (composite reads it);
+    // lumHistory = last frame's. Swapped after the pass. Avoids a per-frame GPU→CPU readback stall.
+    Dx12OffscreenTarget lumTarget, lumHistory;
+    bool lumHistoryValid;               // V1b: false until the first metered frame populates history → snap (Reset)
     bool exposureDebugDumped;           // V1: one-shot BALLISTIC_DX12_EXPOSURE_DEBUG avgLum readback latch
-    Dx12DescriptorHeap lumSrvVisible;   // HDR color SRV copied per frame
+    Dx12DescriptorHeap lumSrvVisible;   // [0]=HDR color SRV, [1]=prev-EV history SRV, copied per frame
     ID3D12Resource lumCb;
     unsafe byte* lumCbMapped;
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct LumConstants { public float LimitMin; public float LimitMax; public float Calibrated; public float Pad; }
+    struct LumConstants {
+        public float LimitMin; public float LimitMax; public float Calibrated; public float DeltaTime;
+        public float SpeedDarkToLight; public float SpeedLightToDark; public float Reset; public float Pad;
+    }
 
     // Bloom: bright-pass + separable blur at half-res, fed into the composite (Bloom.hlsl).
     ID3D12RootSignature bloomRootSig;   // BloomConstants CBV (b0) + 1 source SRV (t0) + sampler
@@ -1259,9 +1266,10 @@ public sealed class DX12HDRenderer : HDRenderer {
     }
 
     unsafe void BuildLumAverage() {
-        // LumConstants CBV (b0) + 1 HDR SRV (t0) + clamp sampler; outputs the 1×1 metered-EV100 target.
+        // LumConstants CBV (b0) + 2 SRVs (t0 HDR scene, t1 prev-EV history) + clamp sampler; outputs the 1×1
+        // adapted-EV100 target. The 2 SRVs are one contiguous table range (t0..t1) over the visible heap.
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Pixel);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 0);
         var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
         var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
@@ -1285,8 +1293,10 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         lumTarget = new Dx12OffscreenTarget(dev, 1, 1, withDepth: false,
             colorFormat: Format.R16_Float, colorReadable: true);
+        lumHistory = new Dx12OffscreenTarget(dev, 1, 1, withDepth: false,  // V1b: ping-pong partner (prev adapted EV)
+            colorFormat: Format.R16_Float, colorReadable: true);
         lumSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true);
 
         int lumCbSize = (System.Runtime.InteropServices.Marshal.SizeOf<LumConstants>() + 255) & ~255;
         lumCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
@@ -3607,6 +3617,35 @@ public sealed class DX12HDRenderer : HDRenderer {
             $"M(greyClamped)={1f / (1.2f * MathF.Pow(2f, Math.Clamp(greyEv, pf.AutoExposureLimitMin, pf.AutoExposureLimitMax))):0.00000000}"));
     }
 
+    // V1b eye-adaptation trace (BALLISTIC_DX12_EXPOSURE_EMA_DEBUG=1): read back the 1×1 adapted-EV target this
+    // frame and log it, so the per-frame easing curve is observable headlessly (it should ramp toward the
+    // metered EV at the configured stops/sec, not jump). DEBUG-ONLY — the readback stalls, so it's gated off
+    // by default and never runs on the production path. `t` is the just-written target (PixelShaderResource).
+    int emaDebugFrame;
+    unsafe void DumpAdaptedEv(Dx12OffscreenTarget t) {
+        var footprints = new Vortice.Direct3D12.PlacedSubresourceFootPrint[1];
+        var rowCounts = new uint[1]; var rowSizes = new ulong[1];
+        dev.Device.GetCopyableFootprints(t.RenderTarget.Description, 0, 1, 0,
+            footprints, rowCounts, rowSizes, out ulong totalBytes);
+        Vortice.Direct3D12.PlacedSubresourceFootPrint fp = footprints[0];
+        using ID3D12Resource rb = dev.Device.CreateCommittedResource(
+            Vortice.Direct3D12.HeapProperties.ReadbackHeapProperties, Vortice.Direct3D12.HeapFlags.None,
+            Vortice.Direct3D12.ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
+        t.ColorToRenderTarget();   // PixelShaderResource → RT so the copy transition starts from a known state
+        dev.ExecuteSync(cl => {
+            cl.ResourceBarrierTransition(t.RenderTarget, ResourceStates.RenderTarget, ResourceStates.CopySource);
+            cl.CopyTextureRegion(new Vortice.Direct3D12.TextureCopyLocation(rb, fp), 0, 0, 0,
+                new Vortice.Direct3D12.TextureCopyLocation(t.RenderTarget, 0), null);
+            cl.ResourceBarrierTransition(t.RenderTarget, ResourceStates.CopySource, ResourceStates.PixelShaderResource);
+        });
+        Half* p = rb.Map<Half>(0);
+        float adaptedEv = (float)p[0];
+        rb.Unmap(0);
+        Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+            $"[EMA-DBG] frame={++emaDebugFrame}  adaptedEV={adaptedEv:0.0000}  dt={(float)Time.DeltaTime:0.0000}  " +
+            $"speedUp={PostFX.AutoExposureSpeedDarkToLight}  speedDown={PostFX.AutoExposureSpeedLightToDark}"));
+    }
+
     unsafe void DrawComposite(bool ssaoOn, Dx12OffscreenTarget hdr) {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
 
@@ -3626,19 +3665,45 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         hdr.ColorToShaderResource();   // HDR source → SRV (for both the lum pass and composite)
 
+        // V1b: the physical 1×1 target holding THIS frame's adapted EV (captured pre-swap so the composite
+        // SRV + the frame-end RT transition keep pointing at it after the ping-pong swaps the fields).
+        Dx12OffscreenTarget meteredEvTarget = lumTarget;
         if (useMeter) {
-            // Auto-exposure metering: reduce the HDR source to a 1×1 metered EV100 (LumAverage.hlsl).
+            // Auto-exposure metering: reduce the HDR source to a 1×1 adapted EV100 (LumAverage.hlsl).
             // V1: the meter is grey-anchored (self-calibrating to the lux-scaled DX12 radiance) by default;
             // BALLISTIC_DX12_EXPOSURE_CALIB=0 restores the legacy photometric anchor (the pre-V1 blow-out) for A/B.
             bool calibrated = Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_CALIB") != "0";
             // V1 diagnostic: BALLISTIC_DX12_EXPOSURE_DEBUG=1 makes the meter emit raw geomean luminance into the
             // 1×1 target (Calibrated=2), read back once below to ground-truth the calibration constant.
             bool expDebug = !exposureDebugDumped && Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_DEBUG") == "1";
+            // V1b eye-adaptation EMA. Reset (snap to metered EV, no ease) when: deterministic capture (keeps
+            // paused frames byte-identical to the pre-V1b instantaneous meter — the oracle), the FIRST metered
+            // frame (history uninitialized — easing up from EV 0 would flash dark→correct), or the debug probe
+            // (it emits raw avgLum, which must not be temporally eased). Eased frames need the real frame dt.
+            // BALLISTIC_DX12_EXPOSURE_EMA=0 forces instantaneous (the pre-V1b behaviour) for A/B.
+            bool emaOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_EMA") != "0";
+            // V1b debug: BALLISTIC_DX12_EXPOSURE_EMA_SEED=<ev> seeds the FIRST frame's history to a deliberately-
+            // off EV (instead of snapping to metered) so the easing curve toward the true metered EV is
+            // observable headlessly. Debug-only; never set on the production path.
+            if (!lumHistoryValid && !expDebug && emaOn
+                && float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_EMA_SEED"),
+                    System.Globalization.CultureInfo.InvariantCulture, out float seedEv)) {
+                lumHistory.Clear(seedEv, seedEv, seedEv);   // R16F: only R matters (the seeded prev EV)
+                lumHistoryValid = true;                     // skip the first-frame snap so the seeded value eases
+            }
+            bool reset = DeterministicCapture || !lumHistoryValid || expDebug || !emaOn;
             *(LumConstants*)lumCbMapped = new LumConstants {
                 LimitMin = pf.AutoExposureLimitMin, LimitMax = pf.AutoExposureLimitMax,
                 Calibrated = expDebug ? 2f : (calibrated ? 1f : 0f),
+                DeltaTime = (float)Time.DeltaTime,
+                SpeedDarkToLight = pf.AutoExposureSpeedDarkToLight,
+                SpeedLightToDark = pf.AutoExposureSpeedLightToDark,
+                Reset = reset ? 1f : 0f,
             };
+            // t0 = HDR scene; t1 = last frame's adapted EV (the ping-pong partner, already in PixelShaderResource).
             dev.Device.CopyDescriptorsSimple(1, lumSrvVisible.Cpu(0), hdr.ColorSrvCpu, heapType);
+            dev.Device.CopyDescriptorsSimple(1, lumSrvVisible.Cpu(1), lumHistory.ColorSrvCpu, heapType);
+            lumHistory.ColorToShaderResource();   // ensure the history is sampleable as t1 (no-op after frame 1)
             lumTarget.RenderColorOnly(cl => {
                 cl.SetGraphicsRootSignature(lumRootSig);
                 cl.SetPipelineState(lumPso);
@@ -3648,8 +3713,16 @@ public sealed class DX12HDRenderer : HDRenderer {
                 cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
                 cl.DrawInstanced(3, 1, 0, 0);
             });
-            lumTarget.ColorToShaderResource();
+            lumTarget.ColorToShaderResource();    // composite reads it AND it becomes next frame's history t1
+            meteredEvTarget = lumTarget;          // the target holding THIS frame's adapted EV (pre-swap)
             if (expDebug) { exposureDebugDumped = true; DumpMeteredLuminance(pf); }
+            // V1b ping-pong: this frame's written target becomes next frame's history; the old history (now in
+            // PixelShaderResource) becomes next frame's render target. The composite + the frame-end RT
+            // transition below reference `meteredEvTarget` (NOT lumTarget) so the swap doesn't misroute them.
+            else { (lumTarget, lumHistory) = (lumHistory, lumTarget); lumHistoryValid = true; }
+            // V1b debug trace (off by default; stalls — never on the production path): log the adapted EV.
+            if (!expDebug && Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_EMA_DEBUG") == "1")
+                DumpAdaptedEv(meteredEvTarget);
         }
 
         // Bloom: bright-pass + blur the HDR into bloomA (half-res). On by default; BALLISTIC_DX12_BLOOM=0 off.
@@ -3689,7 +3762,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(1),
             bloomOn ? bloomA.ColorSrvCpu : hdr.ColorSrvCpu, heapType);   // bloom slot
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(2),
-            useMeter ? lumTarget.ColorSrvCpu : hdr.ColorSrvCpu, heapType);   // metered-EV slot (Automatic only)
+            useMeter ? meteredEvTarget.ColorSrvCpu : hdr.ColorSrvCpu, heapType);   // adapted-EV slot (Automatic only)
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(3),
             ssaoOn ? ssaoA.ColorSrvCpu : hdr.ColorSrvCpu, heapType);     // AO slot
 
@@ -3702,7 +3775,11 @@ public sealed class DX12HDRenderer : HDRenderer {
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
         });
-        if (useMeter) lumTarget.ColorToRenderTarget();
+        // Restore THIS frame's adapted-EV target (just consumed as the composite SRV) to RenderTarget — the
+        // legacy V1 frame-end tidy. With the V1b ping-pong it's now the `lumHistory` field; next frame the
+        // meter reads it as the t1 SRV (its own ColorToShaderResource handles that transition) and renders
+        // into the OTHER target. The state tracker makes either order valid; this keeps it consistent.
+        if (useMeter) meteredEvTarget.ColorToRenderTarget();
         // Restore the INTERNAL scene target to RenderTarget for next frame's geometry/deferred pass (FSR
         // left it in PixelShaderResource; in the native path hdr == target). fsrOutput stays in shader-read
         // — RunFsr transitions it to UAV next frame from any state.

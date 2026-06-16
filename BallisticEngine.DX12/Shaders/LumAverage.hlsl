@@ -19,14 +19,29 @@
 // LEGACY (Calibrated == 0, BALLISTIC_DX12_EXPOSURE_CALIB=0 kill-switch): the old cd/m² photometric anchor (+2),
 // kept for A/B and to prove the byte-identical pre-V1 fallback. EV100 = log2(lum) + LuminanceToEV - PleasingBias.
 //
-// Eye-adaptation EMA (temporal smoothing of the metered EV so Automatic doesn't flicker in motion) plus
-// metering-weight modes / histogram percentile rejection are still a follow-up (V1b) — this is the
-// instantaneous geometric mean, which is correct + stable for the static deterministic-capture path.
+// V1b EYE-ADAPTATION EMA (temporal smoothing so Automatic doesn't flicker frame-to-frame in motion):
+// the pass now also reads the PREVIOUS frame's adapted EV from a 1×1 history SRV (t1, ping-ponged on the
+// CPU — no readback) and eases the adapted EV toward this frame's instantaneous metered EV at the volume's
+// adaptation rate. The ease is FRAME-RATE-INDEPENDENT in stops/second: alpha = 1 - exp(-dt * speed), with a
+// faster rate when the scene brightens (eyes open quickly, SpeedDarkToLight) than when it darkens
+// (SpeedLightToDark) — the photographic eye-adaptation asymmetry, matching the Exposure volume's two speed
+// dials. Both endpoints are post-clamp, so the eased EV stays inside [LimitMin, LimitMax]. When Reset > 0.5
+// (the FIRST metered frame after start/resize, OR any deterministic capture) the EMA is BYPASSED and the
+// adapted EV snaps to the metered EV — so BALLISTIC_DETERMINISTIC paused captures stay byte-identical to the
+// pre-V1b instantaneous meter (the deterministic-capture oracle is preserved). Metering-weight modes /
+// histogram percentile rejection are still a follow-up — this is the geometric mean + temporal smoothing.
 
 cbuffer LumConstants : register(b0) {
     float LimitMin;       // EV floor the meter may adapt to (AutoExposureLimitMin)
     float LimitMax;       // EV ceiling (AutoExposureLimitMax)
     float Calibrated;     // > 0.5 = lux-anchored EV (V1 fix); 0 = legacy cd/m² EV; > 1.5 = DEBUG emit avgLum
+    float DeltaTime;      // V1b: frame delta in seconds (for the stops/sec eye-adaptation ease)
+    // EV is INVERSE brightness (higher EV = darker image). Scene gets BRIGHTER → meter stops DOWN → metered
+    // EV rises (meteredEv > prevEv) → use SpeedDarkToLight (eyes adjust fast to brightness). Scene DARKENS →
+    // metered EV falls → use SpeedLightToDark (eyes adjust slowly to the dark).
+    float SpeedDarkToLight; // V1b: stops/sec when the scene brightens (meteredEv > prevEv) — fast
+    float SpeedLightToDark; // V1b: stops/sec when the scene darkens (meteredEv < prevEv) — slow
+    float Reset;          // V1b: > 0.5 = snap to metered EV (first frame / deterministic), no temporal ease
     float _padLum;
 };
 
@@ -34,6 +49,7 @@ cbuffer LumConstants : register(b0) {
 static const float LuxMeterAnchor = 8.0;
 
 Texture2D HdrColor : register(t0);
+Texture2D PrevAdaptedEv : register(t1);   // V1b: 1×1 history — last frame's adapted EV (ping-ponged, no readback)
 SamplerState LinearClamp : register(s0);
 
 static const float LuminanceToEV = 3.0;   // log2(100/12.5) — the S/K photometric constant (matches the GL path)
@@ -75,5 +91,16 @@ float4 PSMain(VSOut i) : SV_Target {
         ? log2(max(avgLum, 1e-8)) + LuxMeterAnchor                // lux-anchored EV100 (V1 fix)
         : log2(max(avgLum, 1e-6)) + LuminanceToEV - PleasingBias; // legacy cd/m² photometric (kill-switch)
     meteredEv = clamp(meteredEv, LimitMin, LimitMax);
-    return float4(meteredEv, meteredEv, meteredEv, 1.0);
+
+    // V1b eye-adaptation EMA: ease from last frame's adapted EV toward this frame's metered EV. Both are
+    // post-clamp, so the result stays in [LimitMin, LimitMax]. Reset (first frame / deterministic) snaps —
+    // byte-identical to the pre-V1b instantaneous meter. Frame-rate-independent: alpha = 1 - exp(-dt*speed).
+    float prevEv = PrevAdaptedEv.SampleLevel(LinearClamp, float2(0.5, 0.5), 0).r;
+    float adaptedEv = meteredEv;
+    if (Reset <= 0.5) {
+        float speed = (meteredEv > prevEv) ? SpeedDarkToLight : SpeedLightToDark;  // brighten fast, darken slow
+        float alpha = saturate(1.0 - exp(-max(DeltaTime, 0.0) * max(speed, 0.0)));
+        adaptedEv = prevEv + (meteredEv - prevEv) * alpha;
+    }
+    return float4(adaptedEv, adaptedEv, adaptedEv, 1.0);
 }
