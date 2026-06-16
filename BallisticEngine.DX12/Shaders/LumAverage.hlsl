@@ -1,14 +1,26 @@
-// Auto-exposure luminance reduction for the DX12 backend. A single fullscreen pass into a 1×1 R16F
-// target: sample a coarse grid of the HDR scene, average the LOG luminance (geometric mean — the
-// standard exposure metering, robust to a few bright pixels), and write exp(avg) = the scene's average
-// luminance. The composite reads this 1×1 texel and derives exposure = Key / avgLum. No compute/UAV/
-// readback — just one tiny RTV pass; deterministic, fine for the headless screenshot path.
+// Auto-exposure metering for the DX12 backend. A single fullscreen pass into a 1×1 R16F target that holds
+// the metered exposure EV100 (NOT a raw luminance anymore): sample a coarse grid of the HDR scene, geometric-
+// mean the luminance (log space — the standard exposure metering, robust to a few bright pixels), convert
+// that to a metered EV100 and clamp it to the auto limits. The composite reads this 1×1 EV and builds the
+// exposure multiplier 1/(1.2 * 2^EV) — exactly the PostProcessSettings.ExposureMultiplier formula.
 //
-// (A mip-pyramid or compute reduction would be more precise/cheaper at high res; this grid average is
-// plenty for metering and keeps the infrastructure minimal — a follow-up can upgrade it.)
+// CRITICAL (DX12 vs GL): the DX12 HDR scene target holds RAW physical radiance (it is NOT pre-exposed, unlike
+// the GL path that multiplies the light uniforms CPU-side). So the meter reads ABSOLUTE luminance directly —
+// it does NOT divide a pre-exposure back out. EV100 = -log2(lum) + LuminanceToEV, no preExposure term, or the
+// EV would shift ~16 stops. Eye-adaptation EMA + metering-weight modes / histogram are a follow-up; this is
+// the geometric mean (MeteringMode.Average), which is plenty for the common case.
+
+cbuffer LumConstants : register(b0) {
+    float LimitMin;       // EV floor the meter may adapt to (AutoExposureLimitMin)
+    float LimitMax;       // EV ceiling (AutoExposureLimitMax)
+    float2 _padLum;
+};
 
 Texture2D HdrColor : register(t0);
 SamplerState LinearClamp : register(s0);
+
+static const float LuminanceToEV = 3.0;   // log2(100/12.5) — the S/K photometric constant (matches the GL path)
+static const float PleasingBias  = 1.0;   // +1 stop toward brighter (skies read less dull) — GL parity
 
 struct VSOut { float4 Position : SV_Position; float2 Uv : TEXCOORD0; };
 VSOut VSMain(uint vid : SV_VertexID) {
@@ -33,6 +45,12 @@ float4 PSMain(VSOut i) : SV_Target {
             n++;
         }
     }
-    float avgLum = exp(logSum / n);            // geometric mean luminance
-    return float4(avgLum, avgLum, avgLum, 1.0);
+    float avgLum = exp(logSum / max(n, 1));     // geometric mean luminance (absolute, raw radiance)
+
+    // Metered EV100 from absolute scene luminance: EV100 = log2(L * S/K), S/K=100/12.5 → +LuminanceToEV.
+    // Brighter scene → HIGHER EV → smaller multiplier (darker image), the photographic convention. NO
+    // preExposure term (the DX12 buffer is raw radiance) — see header. PleasingBias lifts +1 stop.
+    float meteredEv = log2(max(avgLum, 1e-6)) + LuminanceToEV - PleasingBias;
+    meteredEv = clamp(meteredEv, LimitMin, LimitMax);
+    return float4(meteredEv, meteredEv, meteredEv, 1.0);
 }

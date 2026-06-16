@@ -319,15 +319,19 @@ public sealed class DX12HDRenderer : HDRenderer {
     Dx12DescriptorHeap compositeSrvVisible;  // HDR color + bloom + avg-lum, copied per frame
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct CompositeConstants {
-        public float Exposure; public float BloomIntensity; public float AutoExposure; public float ExposureKey;
-        public float UseAo; public Vector3 Pad2;
+        public float ExposureMul; public float BloomIntensity; public float AutoExposure; public float LegacyMul;
+        public float Compensation; public float UseAo; public Vector2 Pad2;
     }
 
-    // Auto-exposure: a 1×1 R16F target holding the geometric-mean scene luminance (LumAverage.hlsl).
-    ID3D12RootSignature lumRootSig;     // 1 HDR SRV (t0) + sampler
+    // Auto-exposure: a 1×1 R16F target holding the metered exposure EV100 (LumAverage.hlsl).
+    ID3D12RootSignature lumRootSig;     // LumConstants CBV (b0) + 1 HDR SRV (t0) + sampler
     ID3D12PipelineState lumPso;
     Dx12OffscreenTarget lumTarget;      // 1×1 R16F, color-readable
     Dx12DescriptorHeap lumSrvVisible;   // HDR color SRV copied per frame
+    ID3D12Resource lumCb;
+    unsafe byte* lumCbMapped;
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct LumConstants { public float LimitMin; public float LimitMax; public Vector2 Pad; }
 
     // Bloom: bright-pass + separable blur at half-res, fed into the composite (Bloom.hlsl).
     ID3D12RootSignature bloomRootSig;   // BloomConstants CBV (b0) + 1 source SRV (t0) + sampler
@@ -1073,7 +1077,8 @@ public sealed class DX12HDRenderer : HDRenderer {
     }
 
     unsafe void BuildLumAverage() {
-        // 1 HDR SRV (t0) + clamp sampler; outputs the 1×1 average-luminance target (auto-exposure metering).
+        // LumConstants CBV (b0) + 1 HDR SRV (t0) + clamp sampler; outputs the 1×1 metered-EV100 target.
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Pixel);
         var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
         var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
         var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
@@ -1082,7 +1087,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
         };
         lumRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { srvTable }, new[] { samp })));
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumAverage.hlsl");
         byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "LumAverage.hlsl");
@@ -1100,6 +1105,11 @@ public sealed class DX12HDRenderer : HDRenderer {
             colorFormat: Format.R16_Float, colorReadable: true);
         lumSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true);
+
+        int lumCbSize = (System.Runtime.InteropServices.Marshal.SizeOf<LumConstants>() + 255) & ~255;
+        lumCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)lumCbSize), ResourceStates.GenericRead);
+        lumCbMapped = lumCb.Map<byte>(0);
 
         BuildBloom();
     }
@@ -3059,20 +3069,34 @@ public sealed class DX12HDRenderer : HDRenderer {
     unsafe void DrawComposite(bool ssaoOn, Dx12OffscreenTarget hdr) {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
 
-        // Manual exposure override (BALLISTIC_DX12_EXPOSURE) disables auto-exposure; else auto-meter.
+        // Exposure (P1): physical EV100 from the Exposure volume. Three sources, in priority:
+        //   1. BALLISTIC_DX12_EXPOSURE env var — raw multiplier override (escape hatch / deterministic capture).
+        //   2. Exposure volume Fixed mode — resolve PostProcessSettings.ExposureMultiplier CPU-side (no meter).
+        //   3. Automatic / AutomaticHistogram — run the 1×1 metering pass (writes the metered EV100); the
+        //      composite shader turns that EV into the multiplier (same 1/(1.2*2^(EV-comp)) formula).
+        var pf = PostFX;
         bool manual = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
             System.Globalization.CultureInfo.InvariantCulture, out float manualExp);
+        // BALLISTIC_DX12_AUTOEXP=1 forces Automatic metering even with no Exposure volume (A/B test door).
+        bool forceAuto = Environment.GetEnvironmentVariable("BALLISTIC_DX12_AUTOEXP") == "1";
+        bool useMeter = !manual && (forceAuto || pf.ExposureMode != ExposureMode.Fixed);
+        // Resolved CPU multiplier for the manual / Fixed paths (Automatic resolves it in the shader from the EV).
+        float exposureMul = manual ? manualExp : pf.ExposureMultiplier;
 
         hdr.ColorToShaderResource();   // HDR source → SRV (for both the lum pass and composite)
 
-        if (!manual) {
-            // Auto-exposure metering: reduce the HDR source to a 1×1 geometric-mean luminance.
+        if (useMeter) {
+            // Auto-exposure metering: reduce the HDR source to a 1×1 metered EV100 (LumAverage.hlsl).
+            *(LumConstants*)lumCbMapped = new LumConstants {
+                LimitMin = pf.AutoExposureLimitMin, LimitMax = pf.AutoExposureLimitMax,
+            };
             dev.Device.CopyDescriptorsSimple(1, lumSrvVisible.Cpu(0), hdr.ColorSrvCpu, heapType);
             lumTarget.RenderColorOnly(cl => {
                 cl.SetGraphicsRootSignature(lumRootSig);
                 cl.SetPipelineState(lumPso);
                 cl.SetDescriptorHeaps(lumSrvVisible.Heap);
-                cl.SetGraphicsRootDescriptorTable(0, lumSrvVisible.Gpu(0));
+                cl.SetGraphicsRootConstantBufferView(0, lumCb.GPUVirtualAddress);
+                cl.SetGraphicsRootDescriptorTable(1, lumSrvVisible.Gpu(0));
                 cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
                 cl.DrawInstanced(3, 1, 0, 0);
             });
@@ -3083,12 +3107,12 @@ public sealed class DX12HDRenderer : HDRenderer {
         bool bloomOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_BLOOM") != "0";
         if (bloomOn) DrawBloom(hdr);
 
-        // ExposureKey: middle-grey target ~0.18 (the HDR scene is physical radiance; auto-meter rescales).
         *(CompositeConstants*)compositeCbMapped = new CompositeConstants {
-            Exposure = manual ? manualExp : 1.0e-5f,
+            ExposureMul = exposureMul,
             BloomIntensity = bloomOn ? 0.6f : 0f,
-            AutoExposure = manual ? 0f : 1f,
-            ExposureKey = 0.18f,
+            AutoExposure = useMeter ? 1f : 0f,
+            LegacyMul = pf.Exposure,
+            Compensation = pf.ExposureCompensation,
             UseAo = ssaoOn ? 1f : 0f,
         };
 
@@ -3096,7 +3120,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(1),
             bloomOn ? bloomA.ColorSrvCpu : hdr.ColorSrvCpu, heapType);   // bloom slot
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(2),
-            manual ? hdr.ColorSrvCpu : lumTarget.ColorSrvCpu, heapType);
+            useMeter ? lumTarget.ColorSrvCpu : hdr.ColorSrvCpu, heapType);   // metered-EV slot (Automatic only)
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(3),
             ssaoOn ? ssaoA.ColorSrvCpu : hdr.ColorSrvCpu, heapType);     // AO slot
 
@@ -3109,7 +3133,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
         });
-        if (!manual) lumTarget.ColorToRenderTarget();
+        if (useMeter) lumTarget.ColorToRenderTarget();
         // Restore the INTERNAL scene target to RenderTarget for next frame's geometry/deferred pass (FSR
         // left it in PixelShaderResource; in the native path hdr == target). fsrOutput stays in shader-read
         // — RunFsr transitions it to UAV next frame from any state.
