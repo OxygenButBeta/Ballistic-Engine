@@ -217,6 +217,15 @@ public sealed class DX12HDRenderer : HDRenderer {
     bool ddgiDebugDumped;                        // BALLISTIC_DX12_DDGI_DEBUG=1: one-shot atlas readback stats
     bool? ddgiOn;
     bool DdgiEnabled => ddgiOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI") == "1";
+
+    // Phase 4: screen-space radiance probes (final gather). When on (AND DDGI is on — the screen-probe rays
+    // hand off to the DDGI world cache for the far field), the per-pixel DDGI gather is REPLACED by a
+    // downsampled screen-probe gather (Place→Trace→Blend→Integrate). BALLISTIC_DX12_SCREENPROBE=1; byte-
+    // identical off (the DDGI gather path is unchanged when this is off). P4.0: uniform rays + naive upsample.
+    Dx12ScreenProbe screenProbe;
+    bool screenProbeLogged;
+    bool? screenProbeOn;
+    bool ScreenProbeEnabled => screenProbeOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_SCREENPROBE") == "1";
     bool rtGiBuilt;
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct RtGiConstants { public Matrix4x4 InvViewProj; public Matrix4x4 ViewProj; public Vector4 Params; }  // preExp, rayLength, _, frameIdx
@@ -2496,7 +2505,13 @@ public sealed class DX12HDRenderer : HDRenderer {
     // DDGI trace pass (P2.1) reserves its OWN 2-slot tail below RtGi's: [0] = TLAS SRV (t0), [1] = irradiance
     // cube SRV (t3), so the trace root table's two ranges map to adjacent bindless-tail descriptors. Below
     // RtGiTableBase (16376) so the two reservations never collide; materials bump from 0 and never reach here.
-    const int DdgiTableBase = 16384 - 12;   // slots 16372, 16373
+    const int DdgiTableBase = 16384 - 12;   // slots 16372, 16373, 16374
+
+    // Phase 4 screen-probe TRACE reserves its OWN 3-slot tail below DDGI's: [0] = TLAS (t0), [1] = irr cube
+    // (t3), [2] = DDGI irradiance atlas (t4, the far-field handoff). Slots 16368/16369/16370 — below
+    // DdgiTableBase (16372) so the three reservations (ScreenProbe < DDGI < RtGi) never collide; materials bump
+    // from 0 and never reach here.
+    const int ScreenProbeTableBase = 16384 - 16;   // slots 16368, 16369, 16370
 
     // RT global illumination: trace a cosine-hemisphere ray per pixel → raw one-bounce GI in ssgiTarget,
     // then the SHARED SSGI resolve (temporal + OIDN + combine). viewProj is the JITTERED matrix (matches the
@@ -2600,12 +2615,27 @@ public sealed class DX12HDRenderer : HDRenderer {
                 ddgiDebugDumped = true; ddgi.DumpIrradianceStats();
             }
 
+            // The compute gather/place reads depth as SRV t0 → NON_PIXEL state (shared by both GI sources below).
+            gbuffer.DepthToNonPixelShaderResource();
+
+            // --- PHASE 4: screen-space radiance probes (BALLISTIC_DX12_SCREENPROBE=1). REPLACES the per-pixel
+            // DDGI gather with a DOWNSAMPLED screen-probe final gather: Place (one probe per 16x16 tile, snapped
+            // to the G-buffer surface) → Trace (64 short hemisphere rays, miss → DDGI field) → Blend (rays →
+            // octahedral radiance tile) → Integrate (nearest-probe upsample → ssgiTarget). The screen probes are
+            // the near/mid field; the DDGI cache we just updated is the far field (the trace's ray-miss handoff).
+            // Same ssgiTarget contract → the shared resolve composites it (and GI-isolate shows it). The DDGI
+            // gather below is the fallback when this is off (byte-identical-off). ---
+            if (ScreenProbeEnabled) {
+                DrawScreenProbeGather(invVP);
+                SsgiResolveAndCombine();
+                return;
+            }
+
             // --- P2.2 DDGI GATHER: per-pixel sample the probe field (8-probe trilinear + Chebyshev leak test)
             // → albedo*E pre-exposed into ssgiTarget, REPLACING the RT per-pixel ray-march as the GI source
             // (the plan: DDGI is the world cache; SSGI stays the near-field companion). Then the shared
             // SsgiResolveAndCombine composites it (and GI-isolate shows it). G-buffer depth/normal/albedo are
             // in the combined shader-read state from the deferred pass. ---
-            gbuffer.DepthToNonPixelShaderResource();   // compute gather reads depth as SRV t0 → NON_PIXEL state
             ssgiTarget.ColorToUnorderedAccess();
             var gatherSw = GiTimingEnabled ? System.Diagnostics.Stopwatch.StartNew() : null;
             dev.ExecuteSync(cl => {
@@ -2655,6 +2685,71 @@ public sealed class DX12HDRenderer : HDRenderer {
         ssgiTarget.ColorToShaderResource();
 
         SsgiResolveAndCombine();   // shared: motion temporal + OIDN + composite
+    }
+
+    // PHASE 4 (P4.0): the screen-space radiance probe final gather. Runs the 4 sub-passes — Place, Trace,
+    // Blend, Integrate — leaving the (raw, pre-exposed) GI in ssgiTarget for the shared SsgiResolveAndCombine.
+    // Called from DrawRtGi only when ScreenProbeEnabled AND DDGI is on/allocated (the trace hands off to the
+    // DDGI world cache for its far field). The DDGI field was already updated this frame above, so the
+    // screen-probe rays sample a current cache. G-buffer depth is in NonPixelShaderResource on entry; albedo +
+    // normal are in the combined shader-read state from the deferred pass. invVP is the UN-transposed inverse
+    // view-projection (we transpose for the shaders, matching the DDGI gather convention).
+    unsafe void DrawScreenProbeGather(Matrix4x4 invVP) {
+        if (screenProbe == null) screenProbe = new Dx12ScreenProbe(dev);
+        screenProbe.EnsureAllocated(ssgiTarget.Width, ssgiTarget.Height);
+        screenProbe.Build();
+
+        // Per-frame constants: the screen-probe grid + the DDGI grid description the trace samples on miss.
+        var ddgiGrid = ddgi.GridConstants();
+        screenProbe.PrepareConstants(Matrix4x4.Transpose(invVP),
+            maxRayDist: MathF.Max(PostFX.SsgiRayLength, 3f),   // SHORT near/mid-field ray (DDGI handles far)
+            preExposure: SsgiPreExposure(), intensity: MathF.Max(PostFX.SsgiIntensity, 0f), ddgiGrid);
+
+        if (!screenProbeLogged) {
+            screenProbeLogged = true;
+            Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                $"[SCREENPROBE] grid {screenProbe.ProbesX}x{screenProbe.ProbesY}={screenProbe.ProbeCount} probes " +
+                $"(1 per {Dx12ScreenProbe.Downsample}x{Dx12ScreenProbe.Downsample} px); {Dx12ScreenProbe.OctTexels}x{Dx12ScreenProbe.OctTexels} octahedral, " +
+                $"{Dx12ScreenProbe.RaysPerProbe} rays/probe = {screenProbe.ProbeCount * Dx12ScreenProbe.RaysPerProbe} rays/frame; " +
+                $"VRAM {screenProbe.GridVramBytes / (1024.0 * 1024.0):0.0} MB"));
+        }
+
+        var sw = GiTimingEnabled ? System.Diagnostics.Stopwatch.StartNew() : null;
+
+        // PLACE: probePos/probeNormal from the G-buffer (depth NonPixelSRV, normal = G-buffer RT1).
+        screenProbe.DispatchPlace(gbuffer.DepthSrvCpu, gbuffer.ColorSrvCpu(1));
+
+        // TRACE: write the 3-descriptor bindless tail block ([0] TLAS, [1] irr cube, [2] DDGI atlas), then
+        // dispatch with the shared bindless geo/material addresses (same as the DDGI/RT-GI pass).
+        Dx12DescriptorHeap bh = Dx12Backend.BindlessHeap;
+        var ddgiHeapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        sceneAS.CreateTlasSrv(bh.Cpu(ScreenProbeTableBase + 0));                                               // t0 TLAS
+        dev.Device.CopyDescriptorsSimple(1, bh.Cpu(ScreenProbeTableBase + 1), ibl.IrradianceSrv, ddgiHeapType); // t3 irr cube
+        dev.Device.CreateShaderResourceView(ddgi.IrradianceTex, new ShaderResourceViewDescription {            // t4 DDGI atlas
+            Format = Format.R16G16B16A16_Float, ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
+            Shader4ComponentMapping = ShaderComponentMapping.Default,
+            Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
+        }, bh.Cpu(ScreenProbeTableBase + 2));
+        // The DDGI atlas is in UnorderedAccess (left so by DispatchDdgi) → the trace reads it as a NonPixelSRV.
+        dev.ExecuteSync(cl => cl.ResourceBarrierTransition(ddgi.IrradianceTex,
+            ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource));
+        screenProbe.DispatchTrace(bh, bh.Gpu(ScreenProbeTableBase),
+            rtGiSunCb.GPUVirtualAddress, gpuDriven.MaterialsGpuAddress, rtGeometry.InstancesGpuAddress,
+            clusteredLights.LightBufGpuAddress, ddgi.ProbeStateGpuAddress);
+        // DDGI atlas back to UnorderedAccess for next frame's DDGI blend.
+        dev.ExecuteSync(cl => cl.ResourceBarrierTransition(ddgi.IrradianceTex,
+            ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess));
+
+        // BLEND: rays → octahedral radiance tile (+ border).
+        screenProbe.DispatchBlend();
+
+        // INTEGRATE: full-res nearest-probe upsample → ssgiTarget (pre-exposed albedo*E).
+        ssgiTarget.ColorToUnorderedAccess();
+        screenProbe.DispatchIntegrate(gbuffer.DepthSrvCpu, gbuffer.ColorSrvCpu(1), gbuffer.ColorSrvCpu(0),
+            ssgiTarget.RenderTarget, ssgiTarget.Width, ssgiTarget.Height);
+        ssgiTarget.ColorToShaderResource();
+
+        if (sw != null) { sw.Stop(); RenderStats.Scene.GpuPasses.Add(("GI:ScreenProbe", sw.Elapsed.TotalMilliseconds)); }
     }
 
     // HBAO from the G-buffer (scene depth for view-pos + world normal, both already SRVs from the deferred

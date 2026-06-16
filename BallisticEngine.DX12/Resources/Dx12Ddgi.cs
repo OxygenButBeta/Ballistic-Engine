@@ -48,6 +48,15 @@ public sealed class Dx12Ddgi : IDisposable {
     public ID3D12Resource DepthTex => depthTex;
     ID3D12Resource irradianceTex, depthTex;
 
+    // GPU address of the per-probe ProbeState buffer (relocation offset + active flag), for OTHER passes that
+    // sample the DDGI field (Phase 4 screen-probe trace's far-field handoff). Null until Build().
+    public ulong ProbeStateGpuAddress => probeState?.GPUVirtualAddress ?? 0;
+
+    // The grid description for THIS frame (origin/spacing/dims + the irrTexels & normalBias the gather uses) —
+    // so a consumer that samples the DDGI field (Phase 4) can build the matching grid CBV. Cheap struct copy;
+    // intensity/feedback/round-robin fields are irrelevant to a pure field SAMPLE and left at neutral.
+    public DdgiConstants GridConstants() => Constants(frameCounter, 0.97f, 1f, false, true);
+
     // --- Grid placement (world space). Origin = the corner probe; spacing = metres between probes. The grid
     // is camera-centered: re-snapped each frame to the camera so coverage follows the view (a single clipmap
     // cascade for now). ProbeSpacing sets the covered volume = spacing * (probes-1) per axis.
