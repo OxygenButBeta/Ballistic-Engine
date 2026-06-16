@@ -123,3 +123,51 @@ void CSDepth(uint3 dtid : SV_DispatchThreadID) {
     float2 blended = (Params0.w < 0.5) ? result : lerp(result, prev, hyst);
     DepthAtlas[px] = blended;
 }
+
+// --- P2.2 octahedral BORDER-WRAP. The gather (DdgiGather.hlsl) samples each tile with a LINEAR sampler over
+// the 1px border, so the border must replicate the octahedral wrap of the opposite interior edge. For a tile
+// of side TILE = texels + 2*BORDER, the standard DDGI/RTXGI border copy (Majercik 2019, RTXGI ProbeBorder):
+//   - the 4 corners copy the diagonally-opposite INTERIOR corner texel;
+//   - each edge texel copies the opposite-edge interior texel in REVERSED order (the octahedral seam mirrors).
+// One thread per border texel (interior texels early-out). Run AFTER CSIrradiance/CSDepth, per atlas; the
+// texel size (6 irr / 16 depth) comes from DdgiConstants so one shader serves both atlases via two PSOs.
+void BorderCopy(uint2 px, uint texels, bool isDepth) {
+    uint tile = texels + 2u * BORDER;
+    uint2 inTile = px % tile;
+    uint2 tileOrigin = (px / tile) * tile;
+    // Interior texels are handled by CSIrradiance/CSDepth — skip.
+    bool border = inTile.x < BORDER || inTile.y < BORDER || inTile.x >= tile - BORDER || inTile.y >= tile - BORDER;
+    if (!border) return;
+    // Validate this tile maps to a real probe (the atlas has padding tiles past ProbesX*ProbesZ x ProbesY).
+    uint2 t = px / tile;
+    uint probesXZ = (uint)ProbeDims.x * (uint)ProbeDims.z;
+    if (t.x >= probesXZ || t.y >= (uint)ProbeDims.y) return;
+
+    uint last = tile - 1u;                 // index of the far border row/col
+    uint hi = texels;                       // index of the last interior texel (BORDER + texels - 1 = texels)
+    bool cx = inTile.x == 0u || inTile.x == last;   // on a vertical (left/right) border
+    bool cy = inTile.y == 0u || inTile.y == last;   // on a horizontal (top/bottom) border
+    uint2 src;
+    if (cx && cy) {
+        // Corner → diagonally-opposite interior corner.
+        src = uint2(inTile.x == 0u ? hi : BORDER, inTile.y == 0u ? hi : BORDER);
+    } else if (cy) {
+        // Top/bottom edge → opposite edge, reversed along X (octahedral seam mirror).
+        uint mirroredX = last - inTile.x;       // reverse within [0,last]; interior of the SAME row stays
+        src = uint2(mirroredX, inTile.y == 0u ? BORDER : hi);
+    } else {
+        // Left/right edge → opposite edge, reversed along Y.
+        uint mirroredY = last - inTile.y;
+        src = uint2(inTile.x == 0u ? BORDER : hi, mirroredY);
+    }
+    uint2 dstG = tileOrigin + inTile;
+    uint2 srcG = tileOrigin + src;
+    if (isDepth) DepthAtlas[dstG] = DepthAtlas[srcG];
+    else         IrradianceAtlas[dstG] = IrradianceAtlas[srcG];
+}
+
+[numthreads(8, 8, 1)]
+void CSBorderIrr(uint3 dtid : SV_DispatchThreadID) { BorderCopy(dtid.xy, IRR_TEXELS, false); }
+
+[numthreads(8, 8, 1)]
+void CSBorderDepth(uint3 dtid : SV_DispatchThreadID) { BorderCopy(dtid.xy, DEPTH_TEXELS, true); }

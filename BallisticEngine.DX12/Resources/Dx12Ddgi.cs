@@ -86,7 +86,20 @@ public sealed class Dx12Ddgi : IDisposable {
     // shader-visible heap (irr at slot 0 = u0, depth at slot 1 = u1).
     ID3D12RootSignature blendRootSig;
     ID3D12PipelineState blendIrrPso, blendDepthPso;
+    ID3D12PipelineState borderIrrPso, borderDepthPso;   // P2.2 octahedral border-wrap (same root sig as blend)
     Dx12DescriptorHeap blendHeap;       // 2 UAVs: [0]=irradiance (u0), [1]=depth (u1)
+
+    // P2.2 GATHER pass (DdgiGather.hlsl): per-pixel, reads G-buffer + the two atlases → albedo*E into
+    // ssgiTarget. Self-contained heap (5 SRVs depth/normal/albedo/irrAtlas/depthAtlas + 1 UAV ssgiTarget),
+    // rebuilt per frame because ssgiTarget can resize. Root sig: CBV b0 (grid) + CBV b1 (InvVP+preExp) +
+    // table {t0..t4 SRV, u0 UAV} + static linear-clamp sampler.
+    ID3D12RootSignature gatherRootSig;
+    ID3D12PipelineState gatherPso;
+    Dx12DescriptorHeap gatherHeap;       // 6 descriptors, rebuilt each gather
+    ID3D12Resource gatherCb;             // DdgiGatherExtra (InvViewProj + preExp + screen)
+    unsafe byte* gatherCbMapped;
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct DdgiGatherExtra { public Matrix4x4 InvViewProj; public Vector4 GParams; }   // GParams: preExp, w, h, _
 
     // CBV for the per-dispatch DdgiConstants (upload heap, mapped, refilled each frame).
     ID3D12Resource constCb;
@@ -188,10 +201,16 @@ public sealed class Dx12Ddgi : IDisposable {
         string blendHlsl = EmbeddedShaderSource.ReadHlsl("DdgiBlend.hlsl");
         byte[] irrCs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, blendHlsl, "CSIrradiance", "DdgiBlend.hlsl");
         byte[] depCs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, blendHlsl, "CSDepth", "DdgiBlend.hlsl");
+        byte[] borIrrCs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, blendHlsl, "CSBorderIrr", "DdgiBlend.hlsl");
+        byte[] borDepCs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, blendHlsl, "CSBorderDepth", "DdgiBlend.hlsl");
         blendIrrPso = dev.Device.CreateComputePipelineState(
             new ComputePipelineStateDescription { RootSignature = blendRootSig, ComputeShader = irrCs });
         blendDepthPso = dev.Device.CreateComputePipelineState(
             new ComputePipelineStateDescription { RootSignature = blendRootSig, ComputeShader = depCs });
+        borderIrrPso = dev.Device.CreateComputePipelineState(
+            new ComputePipelineStateDescription { RootSignature = blendRootSig, ComputeShader = borIrrCs });
+        borderDepthPso = dev.Device.CreateComputePipelineState(
+            new ComputePipelineStateDescription { RootSignature = blendRootSig, ComputeShader = borDepCs });
 
         // blendHeap: 2 persistent UAV descriptors for the two atlases (irradiance@slot0 = u0, depth@slot1 = u1)
         // laid out CONTIGUOUSLY so the blend root sig's 2-descriptor table (base = slot 0) maps u0→irr,
@@ -209,6 +228,30 @@ public sealed class Dx12Ddgi : IDisposable {
         constCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         constCbMapped = constCb.Map<byte>(0);
+
+        // --- P2.2 GATHER root sig: CBV b0 (grid) + CBV b1 (extra) + table {t0..t4 SRV, u0 UAV} + linear-clamp. ---
+        var g_cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var g_cbv1 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.All);
+        var g_srv = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 5, baseShaderRegister: 0);
+        var g_uav = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);
+        var g_table = new RootParameter1(new RootDescriptorTable1(g_srv, g_uav), ShaderVisibility.All);
+        var g_samp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        gatherRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { g_cbv0, g_cbv1, g_table }, new[] { g_samp })));
+        string gatherHlsl = EmbeddedShaderSource.ReadHlsl("DdgiGather.hlsl");
+        byte[] gatherCs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, gatherHlsl, "CSGather", "DdgiGather.hlsl");
+        gatherPso = dev.Device.CreateComputePipelineState(
+            new ComputePipelineStateDescription { RootSignature = gatherRootSig, ComputeShader = gatherCs });
+        gatherHeap = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 6, shaderVisible: true);
+        int gcbSize = (System.Runtime.InteropServices.Marshal.SizeOf<DdgiGatherExtra>() + 255) & ~255;
+        gatherCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)gcbSize), ResourceStates.GenericRead);
+        gatherCbMapped = gatherCb.Map<byte>(0);
     }
 
     // Run the probe update: TRACE (rays/probe → RayData) then BLEND (RayData → irradiance + depth atlases).
@@ -260,11 +303,68 @@ public sealed class Dx12Ddgi : IDisposable {
         cl.SetPipelineState(blendDepthPso);
         cl.Dispatch((uint)((DepthAtlasW + 7) / 8), (uint)((DepthAtlasH + 7) / 8), 1);
 
+        // Interior must be done before the border copies READ it → UAV barrier between blend and border.
+        cl.ResourceBarrierUnorderedAccessView(irradianceTex);
+        cl.ResourceBarrierUnorderedAccessView(depthTex);
+
+        // --- P2.2 octahedral BORDER-WRAP: replicate edge texels so the gather's bilinear sampling wraps. Same
+        // root sig + heap as blend (each border shader reads+writes only its own atlas UAV). ---
+        cl.SetPipelineState(borderIrrPso);
+        cl.Dispatch((uint)((IrradianceAtlasW + 7) / 8), (uint)((IrradianceAtlasH + 7) / 8), 1);
+        cl.SetPipelineState(borderDepthPso);
+        cl.Dispatch((uint)((DepthAtlasW + 7) / 8), (uint)((DepthAtlasH + 7) / 8), 1);
+
         cl.ResourceBarrierUnorderedAccessView(irradianceTex);
         cl.ResourceBarrierUnorderedAccessView(depthTex);
         // Restore the bindless heap for whatever the caller does next (it bound bindless before us).
         cl.SetDescriptorHeaps(bindless.Heap);
         cl.ResourceBarrierTransition(rayData, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+    }
+
+    // P2.2 GATHER (own ExecuteSync, called by DrawRtGi when DDGI is on). Reads the G-buffer (depth/normal/
+    // albedo SRVs supplied by the caller) + the two probe atlases, writes albedo*E pre-exposed into ssgiTarget
+    // (the caller then runs SsgiResolveAndCombine). The atlases are in UnorderedAccess on entry (left so by
+    // DispatchDdgi) → transitioned to NonPixelShaderResource for the SRV read here, then back to UnorderedAccess
+    // for next frame's blend. ssgiTarget must be in UnorderedAccess on entry (caller's ColorToUnorderedAccess).
+    public unsafe void DispatchGather(ID3D12GraphicsCommandList4 cl,
+        CpuDescriptorHandle depthSrv, CpuDescriptorHandle normalSrv, CpuDescriptorHandle albedoSrv,
+        ID3D12Resource ssgiTargetRes, int screenW, int screenH,
+        Matrix4x4 invViewProjTransposed, float preExposure) {
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        *(DdgiGatherExtra*)gatherCbMapped = new DdgiGatherExtra {
+            InvViewProj = invViewProjTransposed,
+            GParams = new Vector4(preExposure, screenW, screenH, 0f),
+        };
+        // Build the gather heap: t0 depth, t1 normal, t2 albedo, t3 irrAtlas, t4 depthAtlas, u0 ssgiTarget.
+        gatherHeap.Reset();
+        dev.Device.CopyDescriptorsSimple(1, gatherHeap.Cpu(0), depthSrv, heapType);
+        dev.Device.CopyDescriptorsSimple(1, gatherHeap.Cpu(1), normalSrv, heapType);
+        dev.Device.CopyDescriptorsSimple(1, gatherHeap.Cpu(2), albedoSrv, heapType);
+        dev.Device.CreateShaderResourceView(irradianceTex, new ShaderResourceViewDescription {
+            Format = Format.R16G16B16A16_Float, ViewDimension = ShaderResourceViewDimension.Texture2D,
+            Shader4ComponentMapping = ShaderComponentMapping.Default,
+            Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
+        }, gatherHeap.Cpu(3));
+        dev.Device.CreateShaderResourceView(depthTex, new ShaderResourceViewDescription {
+            Format = Format.R16G16_Float, ViewDimension = ShaderResourceViewDimension.Texture2D,
+            Shader4ComponentMapping = ShaderComponentMapping.Default,
+            Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
+        }, gatherHeap.Cpu(4));
+        dev.Device.CreateUnorderedAccessView(ssgiTargetRes, null, new UnorderedAccessViewDescription {
+            Format = Format.R16G16B16A16_Float, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+        }, gatherHeap.Cpu(5));
+
+        cl.ResourceBarrierTransition(irradianceTex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+        cl.ResourceBarrierTransition(depthTex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+        cl.SetDescriptorHeaps(gatherHeap.Heap);
+        cl.SetComputeRootSignature(gatherRootSig);
+        cl.SetPipelineState(gatherPso);
+        cl.SetComputeRootConstantBufferView(0, constCb.GPUVirtualAddress);    // b0 grid (filled by DispatchDdgi this frame)
+        cl.SetComputeRootConstantBufferView(1, gatherCb.GPUVirtualAddress);   // b1 extra
+        cl.SetComputeRootDescriptorTable(2, gatherHeap.Gpu(0));
+        cl.Dispatch((uint)((screenW + 7) / 8), (uint)((screenH + 7) / 8), 1);
+        cl.ResourceBarrierTransition(irradianceTex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+        cl.ResourceBarrierTransition(depthTex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
     }
 
     // DEBUG (BALLISTIC_DX12_DDGI_DEBUG=1): read the irradiance atlas back to the CPU and report min/max/mean +
@@ -323,8 +423,14 @@ public sealed class Dx12Ddgi : IDisposable {
         traceRootSig?.Dispose(); traceRootSig = null;
         blendIrrPso?.Dispose(); blendIrrPso = null;
         blendDepthPso?.Dispose(); blendDepthPso = null;
+        borderIrrPso?.Dispose(); borderIrrPso = null;
+        borderDepthPso?.Dispose(); borderDepthPso = null;
         blendRootSig?.Dispose(); blendRootSig = null;
         blendHeap?.Dispose(); blendHeap = null;
+        gatherPso?.Dispose(); gatherPso = null;
+        gatherRootSig?.Dispose(); gatherRootSig = null;
+        gatherHeap?.Dispose(); gatherHeap = null;
+        if (gatherCb != null) { gatherCb.Unmap(0); gatherCb.Dispose(); gatherCb = null; }
         if (constCb != null) { constCb.Unmap(0); constCb.Dispose(); constCb = null; }
         built = false;
     }

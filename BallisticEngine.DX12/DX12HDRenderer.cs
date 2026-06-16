@@ -2547,6 +2547,24 @@ public sealed class DX12HDRenderer : HDRenderer {
             if (!ddgiDebugDumped && Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_DEBUG") == "1") {
                 ddgiDebugDumped = true; ddgi.DumpIrradianceStats();
             }
+
+            // --- P2.2 DDGI GATHER: per-pixel sample the probe field (8-probe trilinear + Chebyshev leak test)
+            // → albedo*E pre-exposed into ssgiTarget, REPLACING the RT per-pixel ray-march as the GI source
+            // (the plan: DDGI is the world cache; SSGI stays the near-field companion). Then the shared
+            // SsgiResolveAndCombine composites it (and GI-isolate shows it). G-buffer depth/normal/albedo are
+            // in the combined shader-read state from the deferred pass. ---
+            gbuffer.DepthToNonPixelShaderResource();   // compute gather reads depth as SRV t0 → NON_PIXEL state
+            ssgiTarget.ColorToUnorderedAccess();
+            var gatherSw = GiTimingEnabled ? System.Diagnostics.Stopwatch.StartNew() : null;
+            dev.ExecuteSync(cl => {
+                ddgi.DispatchGather(cl, gbuffer.DepthSrvCpu, gbuffer.ColorSrvCpu(1), gbuffer.ColorSrvCpu(0),
+                    ssgiTarget.RenderTarget, ssgiTarget.Width, ssgiTarget.Height,
+                    Matrix4x4.Transpose(invVP), SsgiPreExposure());
+            });
+            if (gatherSw != null) { gatherSw.Stop(); RenderStats.Scene.GpuPasses.Add(("GI:DDGIGather", gatherSw.Elapsed.TotalMilliseconds)); }
+            ssgiTarget.ColorToShaderResource();
+            SsgiResolveAndCombine();   // shared: motion temporal + OIDN + composite
+            return;
         }
 
         // G-buffer is in the combined shader-read state (RT compute-stage can read depth+normal); the lit
