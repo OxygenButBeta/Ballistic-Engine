@@ -195,20 +195,26 @@ public class VehicleController : Behaviour {
         if (throttle < -0.05f) reversing = true;
         else if (throttle > 0.05f) reversing = false;
 
-        // --- Steer the steered wheels (visual) + count grounded wheels. --------------------------------
+        // --- Steer the steered wheels (visual) + count grounded wheels + average the ground normal. ----
         Vector3 chassisPos = chassisT.WorldPosition;
         int grounded = 0;
+        Vector3 groundNormal = Vector3.Zero;
         foreach (WheelCollider wheel in wheels) {
             bool isFront = Vector3.Dot(wheel.transform.WorldPosition - chassisPos, forwardDir) >= 0f;
             wheel.SteerAngle = (isFront && FrontWheelSteer) ? steer
                              : (!isFront && RearWheelSteer) ? -steer : 0f;
-            if (wheel.IsGrounded)
+            if (wheel.IsGrounded) {
                 grounded++;
+                groundNormal += wheel.ContactNormal;
+            }
         }
+        // The average ground normal (world up if somehow zero) — the drive velocity is projected onto
+        // this plane so the car climbs a ramp instead of wedging its horizontal push into the slope.
+        groundNormal = groundNormal.LengthSquared() > 1e-6f ? groundNormal.Normalized() : Vector3.UnitY;
 
         // --- Horizontal arcade dynamics + stability, only while on the wheels (no mid-air control). ----
         if (grounded > 0) {
-            ApplyArcadeDrive(chassisT, horiz, speed, signedSpeed, throttle, handbrake, dt);
+            ApplyArcadeDrive(chassisT, vel, horiz, speed, signedSpeed, throttle, handbrake, groundNormal, dt);
             ApplyStability(chassisT, speedFraction);
         }
     }
@@ -216,8 +222,8 @@ public class VehicleController : Behaviour {
     // The on-rails arcade core. Heading turns at a clamped rate; speed eases toward the throttle target
     // from the ACTUAL speed (never bled by a turn); the velocity direction is rotated to follow the nose
     // while preserving that speed. The result corners on rails and keeps its speed, and can never spin.
-    void ApplyArcadeDrive(Transform chassisT, Vector3 horiz, float speed, float signedSpeed,
-        float throttle, bool handbrake, float dt) {
+    void ApplyArcadeDrive(Transform chassisT, Vector3 vel, Vector3 horiz, float speed, float signedSpeed,
+        float throttle, bool handbrake, Vector3 groundNormal, float dt) {
         Vector3 fwd = chassisT.Forward;
         var headingDir = new Vector3(fwd.X, 0f, fwd.Z);
         if (headingDir.LengthSquared() < 1e-6f)
@@ -273,17 +279,26 @@ public class VehicleController : Behaviour {
         // The handbrake drops the grip so the tail steps out into a controllable drift. -----------------
         float grip = handbrake ? Grip * HandbrakeGrip : Grip;
         Vector3 driveDir = headingDir * (newSigned >= 0f ? 1f : -1f);
-        Vector3 currentDir = speed > 0.2f ? horiz / speed : driveDir;
+        Vector3 currentHorizDir = speed > 0.2f ? horiz / speed : driveDir;
         float gripBlend = 1f - MathF.Exp(-grip * dt);
-        Vector3 dir = currentDir + (driveDir - currentDir) * gripBlend;
+        Vector3 dir = currentHorizDir + (driveDir - currentHorizDir) * gripBlend;
         if (dir.LengthSquared() < 1e-6f)
             dir = driveDir;
         dir = dir.Normalized();
-        Vector3 targetHoriz = dir * MathF.Abs(newSigned);
 
-        // Apply the change as a force so it plays nice with Bepu (the vertical component is untouched, so
-        // gravity, suspension, jumps and falling all still work).
-        Vector3 deltaV = targetHoriz - horiz;
+        // Project the (horizontal) drive direction onto the GROUND PLANE so the velocity points up/down
+        // the slope — this is what lets the car climb a ramp instead of wedging its flat push into the
+        // hill (the velocity gains the vertical component the slope needs). On flat ground the normal is
+        // world-up and this is a no-op. We keep the same target SPEED along the slope.
+        Vector3 slopeDir = dir - groundNormal * Vector3.Dot(dir, groundNormal);
+        slopeDir = slopeDir.LengthSquared() > 1e-6f ? slopeDir.Normalized() : dir;
+        Vector3 targetVel = slopeDir * MathF.Abs(newSigned);
+
+        // Apply the change only to the velocity IN THE GROUND PLANE (the tangential part). The component
+        // along the ground normal — falling onto the ground, the suspension pushing the body up, a jump —
+        // is left entirely to gravity + the suspension, so the car still settles, bumps and airborne work.
+        Vector3 tangentialVel = vel - groundNormal * Vector3.Dot(vel, groundNormal);
+        Vector3 deltaV = targetVel - tangentialVel;
         chassis.AddForce(deltaV * (chassis.Mass / dt));
     }
 

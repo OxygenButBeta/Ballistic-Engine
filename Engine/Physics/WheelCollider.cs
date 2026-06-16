@@ -39,12 +39,22 @@ public class WheelCollider : Behaviour {
     [Range(0.1f, 0.9f)]
     public float SuspensionRestFraction { get; set; } = 0.5f;
 
+    [Tooltip("Extra distance below full droop that the wheel probes for ground, in metres. The margin " +
+             "catches a rising hill a frame early so the wheel doesn't punch through the slope at speed. " +
+             "Raise it if wheels still clip into steep ground when driving fast; 0 = exact (can tunnel).")]
+    [Range(0f, 2f)]
+    public float GroundProbeMargin { get; set; } = 0.5f;
+
     // ---- Runtime readouts (set each FixedTick; read by the controller + used for wheel-mesh / VFX) ----
     [NotSerialized] public bool IsGrounded { get; private set; }
     [NotSerialized] public float Compression { get; private set; } // 0 = extended, 1 = bottomed out
     [NotSerialized] public Vector3 ContactPoint { get; private set; }
     [NotSerialized] public Vector3 ContactNormal { get; private set; }
     [NotSerialized] public float ForwardSpeed { get; private set; } // signed roll speed (for visual roll)
+    // How far the wheel CENTRE is dropped below the mount along the suspension axis, in metres, clamped
+    // to [0, SuspensionTravel]. The single source of truth for the visual wheel position so it can never
+    // clip up into the body or sink below full droop. 0 = bottomed out (wheel at the mount), travel = droop.
+    [NotSerialized] public float SuspensionDrop { get; private set; }
 
     Rigidbody chassis;
 
@@ -86,12 +96,11 @@ public class WheelCollider : Behaviour {
         Transform t = transform;
         Vector3 up = t.Up;
 
-        // POSITION: sit the wheel centre one radius above the suspension contact (rides up/down with the
-        // suspension). When airborne, hang it at full droop from the mount.
-        Vector3 worldTarget = IsGrounded
-            ? ContactPoint + up * Radius
-            : t.WorldPosition - up * SuspensionTravel;
-        wheelMesh.WorldPosition = worldTarget;
+        // POSITION: the wheel centre rides along the suspension axis, dropped from the mount by the
+        // current suspension length. SuspensionDrop is the single source of truth (set in FixedTick and
+        // CLAMPED to [0, travel]) so the wheel can never climb above the mount into the body, nor fall
+        // past full droop — the two ways the mesh used to clip into the car / sink through the ground.
+        wheelMesh.WorldPosition = t.WorldPosition - up * SuspensionDrop;
 
         // ROLL about the spin AXLE (the wheel's right axis → local X): angular speed = ground speed / r.
         rollAngle += ForwardSpeed / MathF.Max(0.05f, Radius) * delta;
@@ -123,36 +132,52 @@ public class WheelCollider : Behaviour {
         Quaternion steerRot = Quaternion.CreateFromAxisAngle(up, SteerAngle);
         Vector3 forward = Vector3.Transform(t.Forward, steerRot);
 
-        // Cast a sphere straight down from the mount over the full travel + radius. The sphere has
-        // thickness, so a thin ray can't slip past an edge (P2 sweep). The mount usually sits inside the
-        // chassis collider, so skip any hit on the car's OWN body and re-cast from below it.
-        float castLength = SuspensionTravel + Radius;
+        // Cast a sphere straight down from the mount looking for the ground. The sphere has thickness so
+        // a thin ray can't slip past an edge (P2 sweep). The cast probes a generous margin BELOW full
+        // droop (travel + radius + a margin): the extra reach is what catches the ground a frame early
+        // when climbing a hill at speed, instead of the wheel punching through before the next step.
+        // The mount usually sits inside the chassis collider, so skip any hit on the car's OWN body.
+        float restLength = SuspensionTravel + Radius;            // mount→ground distance at full droop
+        float castLength = restLength + GroundProbeMargin;       // probe a bit further to avoid tunneling
         IsGrounded = CastIgnoringChassis(mount, -up, castLength, out RaycastHit hit);
 
         ForwardSpeed = Vector3.Dot(chassis.Velocity, forward);
 
         if (!IsGrounded) {
             Compression = 0f;
-            ContactPoint = mount - up * castLength;
+            SuspensionDrop = SuspensionTravel;                   // hang at full droop
+            ContactPoint = mount - up * restLength;
             ContactNormal = up;
             return;
         }
 
+        // groundDistance = mount→surface along the cast. The wheel CENTRE sits one radius above the
+        // surface, so its drop below the mount is (groundDistance - radius), clamped to [0, travel].
+        // Clamping is what makes penetration impossible: a ground higher than full compression pins the
+        // drop at 0 (wheel at the mount) and the spring saturates to push the body up, rather than the
+        // wheel mesh sliding up into the body.
         ContactPoint = hit.Point;
         ContactNormal = hit.Normal;
-        float distance = hit.Distance;
-        float compressionMetres = MathHelper.Clamp(castLength - distance, 0f, SuspensionTravel);
+        float groundDistance = hit.Distance;
+        SuspensionDrop = MathHelper.Clamp(groundDistance - Radius, 0f, SuspensionTravel);
+        float compressionMetres = SuspensionTravel - SuspensionDrop; // 0 = extended, travel = bottomed
         Compression = compressionMetres / SuspensionTravel;
 
         // Body velocity at the contact = linear + angular × r; its up-component is the compression speed.
         Vector3 pointVelocity = VelocityAt(ContactPoint);
         float upSpeed = Vector3.Dot(pointVelocity, up);
 
-        // Suspension: spring toward the REST length, damper opposes compression speed. Resting at mid-
-        // travel leaves room to squat (accel/landing) and droop (over a crest) so it visibly works both
-        // ways. Clamped to push only (never pull the car down).
+        // Suspension force = a PRELOAD that exactly balances this wheel's static weight share at the rest
+        // length, plus the spring's deviation from rest, minus the damper. Preloading to the static load
+        // means the car settles at SuspensionRestFraction REGARDLESS of stiffness — so ride height is
+        // decoupled from firmness, and the spring always has headroom both ways (it isn't sitting near
+        // bottomed-out just because the stiffness is low, which is what made the wheels bottom on bumps).
+        // Stiffness now only controls how FIRM the ride is; clamped to push only (never pull the car down).
         float restMetres = SuspensionTravel * SuspensionRestFraction;
-        float springForce = SuspensionStiffness * (compressionMetres - restMetres) - SuspensionDamping * upSpeed;
+        float staticLoad = chassis.Mass * Physics.Gravity.Length() / WheelCount();
+        float springForce = staticLoad
+                          + SuspensionStiffness * (compressionMetres - restMetres)
+                          - SuspensionDamping * upSpeed;
         springForce = MathF.Max(0f, springForce);
         chassis.AddForceAtPosition(up * springForce, ContactPoint);
     }
