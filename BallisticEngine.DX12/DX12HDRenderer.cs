@@ -435,6 +435,9 @@ public sealed class DX12HDRenderer : HDRenderer {
     Dx12DescriptorHeap iblSrvVisible;   // 3 contiguous SRVs copied per frame
     bool iblActiveThisFrame;
 
+    // Sky-atmosphere LUTs (Hillaire 2020), SEPARATE from the IBL baker: v1 = Transmittance LUT.
+    Dx12SkyLuts skyLuts;
+
     // Sun cascaded shadows.
     const int CascadeCount = 4;
     const int ShadowMapSize = 2048;
@@ -646,6 +649,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         BuildProcSky();
 
         ibl = new Dx12IblBaker(dev);
+        skyLuts = new Dx12SkyLuts(dev);
         // 3 IBL SRVs (irradiance/prefilter/BRDF) copied contiguously per frame into a shader-visible heap.
         iblSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true);
@@ -1469,6 +1473,15 @@ public sealed class DX12HDRenderer : HDRenderer {
         LightUniforms light = LightUniforms.Resolve();
         Vector3 lightDir = ToNumerics(light.Direction);
         Vector3 lightColor = ToNumerics(light.Color);
+        // Golden hour (P4): a ProceduralSky reddens/dims the directional sun by the SAME atmosphere it shows.
+        // ProceduralSky.SunTransmittance was never called on DX12 — the sun was the raw white-balanced colour
+        // at every elevation. Multiply it in here so geometry, the IBL bake and the sun disk all warm + fade
+        // at low sun. BALLISTIC_DX12_SKY_TLUT=0 keeps the old (un-reddened) sun for A/B.
+        bool tlutOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SKY_TLUT") != "0";
+        if (tlutOn && ProceduralSky.Active is { } skyForSun && lightDir.LengthSquared() > 1e-8f) {
+            var st = skyForSun.SunTransmittance(new System.Numerics.Vector3(lightDir.X, lightDir.Y, lightDir.Z));
+            lightColor *= new Vector3(st.X, st.Y, st.Z);
+        }
         Vector3 ambient = ToNumerics(vp.AmbientColor) * MathF.Max(0.05f, light.AmbientIntensity);
         // The sun radiance is HDR (lux-scaled, ~80000); a fixed pre-exposure brings it into a viewable
         // range before the ACES tonemap (the GL path auto-meters EV100; this is a constant stand-in for
@@ -1496,6 +1509,9 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (ProceduralSky.Active is { } pSky) {
             Vector3 sunDir = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
             float sunAngR = (DirectionalLight.Instance?.AngularDiameter ?? 0.53f) * 0.5f * (MathF.PI / 180f);
+            // Transmittance LUT (re-bakes only on atmosphere-param change). Drives P5/P6 + the future shader
+            // sun-tint; the CPU sun-reddening above already uses the analytic SunTransmittance.
+            skyLuts.EnsureBaked(pSky.AirDensity, pSky.Haze, pSky.OzoneDensity);
             ibl.EnsureBaked(pSky, sunDir, lightColor, sunAngR);
             iblActiveThisFrame = ibl.HasBaked;
         }
