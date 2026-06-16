@@ -3950,9 +3950,12 @@ public sealed class DX12HDRenderer : HDRenderer {
         Matrix4x4 rot = Matrix4x4.CreateRotationX(euler.X * (MathF.PI / 180f))
                       * Matrix4x4.CreateRotationY(euler.Y * (MathF.PI / 180f))
                       * Matrix4x4.CreateRotationZ(euler.Z * (MathF.PI / 180f));
-        // The skybox texels are HDR scaled by sky.Exposure; fold in the same pre-exposure the opaque pass
-        // uses so the sky brightness tracks the scene. (Skybox.Exposure defaults ~5000 for .hdr cubes.)
-        float skyExposure = Skybox.Active.Exposure * 1.0e-5f;
+        // The skybox texels are HDR scaled by sky.Exposure into RAW radiance, exactly like ProceduralSky
+        // (DrawProcSky writes raw SunRadiance ~80000 and the composite auto-meters it). The old `* 1.0e-5f`
+        // pre-divided the cube sky 100000x BELOW the composite's lux-scaled metering range → the sky crushed
+        // to black (the exterior's "black sky"). Skybox.Exposure (~5000) alone lands an HDRI peak (~1) in the
+        // same raw-radiance band as the procedural sky, so the metered exposure resolves it correctly.
+        float skyExposure = Skybox.Active.Exposure;
 
         var sc = new SkyboxConstants {
             ViewProjNoTranslate = Matrix4x4.Transpose(viewNoT * proj),
