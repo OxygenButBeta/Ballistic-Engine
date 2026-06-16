@@ -74,7 +74,7 @@ public sealed class DX12HDRenderer : HDRenderer {
     Matrix4x4 motionPrevViewProj;   // previous frame's UNJITTERED view*proj
     bool motionPrevValid;
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct MotionConstants { public Matrix4x4 ViewProjCur; public Matrix4x4 ViewProjPrev; }
+    struct MotionConstants { public Matrix4x4 ViewProjCur; public Matrix4x4 ViewProjPrev; public float NormalLodBias; public Vector3 PadMotion; }
 
     // Deferred lighting pass: fullscreen, reads the G-buffer + depth → PBR sun + IBL + shadows → HDR target
     // (DeferredLighting.hlsl). The lighting math moved here out of the material shader.
@@ -96,7 +96,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         public float PunctualCount;
         public Vector2 ScreenSize;
         public Vector2 ClusterNearFar;
-        public float UseRtShadows; public float Pad3;
+        public float UseRtShadows; public float SpecClamp;   // SpecClamp: max per-light specular luma (V2 firefly cap; 0 = off)
+        public float SpecAaStrength; public float Pad4, Pad5, Pad6;   // V2: geometric specular AA strength (0 = off)
     }
 
     // Clustered punctual lights (point/spot) shaded in the deferred pass.
@@ -1684,9 +1685,16 @@ public sealed class DX12HDRenderer : HDRenderer {
         // Motion-vector constants (b1): UNJITTERED current + previous view*proj. First frame (or after a
         // resize) has no valid previous frame → use the current matrix so motion = 0 everywhere.
         Matrix4x4 viewProjPrevForMotion = motionPrevValid ? motionPrevViewProj : viewProjUnjittered;
+        // V2 (fixes D3): normal-map LOD bias — sample normal maps slightly coarser to clean up the residual
+        // aliasing the new upload-time mip chain (Dx12Texture2D) doesn't fully catch. Default +0.5 (gentle —
+        // the mip chain does the heavy lifting; preserves detail). BALLISTIC_DX12_NORMAL_LOD_BIAS tunes it.
+        float normalLodBias = 0.5f;
+        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_NORMAL_LOD_BIAS"),
+            System.Globalization.CultureInfo.InvariantCulture, out float nlb)) normalLodBias = nlb;
         *(MotionConstants*)motionCbMapped = new MotionConstants {
             ViewProjCur = Matrix4x4.Transpose(viewProjUnjittered),
             ViewProjPrev = Matrix4x4.Transpose(viewProjPrevForMotion),
+            NormalLodBias = normalLodBias,
         };
 
         // camPos from the (possibly orbited) view so DDGI grid-snap + lighting follow the harness camera, not
@@ -2176,6 +2184,16 @@ public sealed class DX12HDRenderer : HDRenderer {
     unsafe void DrawDeferredLighting(Matrix4x4 view, Matrix4x4 viewProj, Vector3 camPos, Vector3 lightDir, Vector3 lightColor, Vector3 ambient) {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
+        // V2 specular firefly cap (per-light specular luma clamp). Default on; BALLISTIC_DX12_SPEC_CLAMP tunes it
+        // (0 = off, byte-identical to pre-V2). Lux-ish radiance scale → a high cap that only bites texel spikes.
+        float specClampValue = 8000f;
+        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_SPEC_CLAMP"),
+            System.Globalization.CultureInfo.InvariantCulture, out float sc)) specClampValue = sc;
+        // V2 geometric specular AA: roughen noisy normals to kill normal-map sparkle. Default on; tune/disable
+        // via BALLISTIC_DX12_SPEC_AA (0 = off, byte-identical). Strength scales the normal-derivative variance.
+        float specAaValue = 2f;
+        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_SPEC_AA"),
+            System.Globalization.CultureInfo.InvariantCulture, out float sa)) specAaValue = sa;
         *(LightConstants*)deferredCbMapped = new LightConstants {
             InvViewProj = Matrix4x4.Transpose(invVP),
             View = Matrix4x4.Transpose(view),
@@ -2186,6 +2204,11 @@ public sealed class DX12HDRenderer : HDRenderer {
             ScreenSize = new Vector2(targetW, targetH),
             ClusterNearFar = new Vector2(CameraNear, CameraFar),
             UseRtShadows = rtShadowsThisFrame ? 1f : 0f,
+            // V2: per-light specular luma cap (firefly bound). The radiance scale is lux-ish (sun ~80000), so the
+            // cap is high — it only bites single-texel NDF spikes, not broad highlights. BALLISTIC_DX12_SPEC_CLAMP
+            // tunes it; =0 disables (byte-identical). Default 8000 (≈ a tenth of the sun radiance — outliers only).
+            SpecClamp = specClampValue,
+            SpecAaStrength = specAaValue,
         };
 
         // Copy the 13 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster

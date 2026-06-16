@@ -151,9 +151,12 @@ float SunShadow(float3 N, float3 L, float3 worldPos) {
     return 1.0;
 }
 
-float DistanceAttenuation(float dist, float range) {
-    float d2 = dist * dist;
-    float inv = 1.0 / max(d2, 1e-4);
+// V2 (fixes D3): spherical-source window `1/(d² + r²)` — finite near-field, no 1/max(d²,1e-4) firefly spike;
+// identical to 1/d² once d ≫ r. Matches DeferredLighting.hlsl so opaque + transparent punctuals shade alike.
+float DistanceAttenuation(float dist, float range, float sourceRadius) {
+    const float rMin = 0.05;                                  // 5 cm floor so a delta light can't singularly spike
+    float r = max(sourceRadius, rMin);
+    float inv = 1.0 / (dist * dist + r * r);
     float t = saturate(1.0 - pow(dist / range, 4.0));
     return inv * t * t;
 }
@@ -164,7 +167,7 @@ float3 ShadePunctual(GpuLight L, float3 N, float3 V, float3 worldPos, float3 alb
     float dist = length(toLight);
     if (dist > L.PosRange.w) return 0.0.xxx;
     float3 Ld = toLight / max(dist, 1e-4);
-    float atten = DistanceAttenuation(dist, L.PosRange.w);
+    float atten = DistanceAttenuation(dist, L.PosRange.w, L.Extra.z);   // Extra.z = SourceRadius (V2 near-field window)
     if (atten <= 0.0) return 0.0.xxx;
 
     float3 radiance = L.Color.rgb * atten;

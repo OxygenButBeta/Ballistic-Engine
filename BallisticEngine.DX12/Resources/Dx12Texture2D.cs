@@ -41,13 +41,23 @@ public sealed class Dx12Texture2D : Texture2D {
         Dx12Backend.Device.RunExclusive(() => UploadCore(in d, type));
     }
 
-    unsafe void UploadCore(in TextureData data, TextureType type) {
+    unsafe void UploadCore(in TextureData data0, TextureType type) {
         Type = type;
-        if (!data.IsValid)
+        if (!data0.IsValid)
             return;
 
+        // V2 (fixes D3 — normal-map aliasing sparkle): the GL path called GenerateMipmap on upload; the DX12 port
+        // never did, so a single-level RGBA8 texture (most Bistro maps fall through the importer's no-BC path with
+        // MipCount=1) reached the GPU with ONE mip → no filtering → normal maps aliased into a crawling speckle
+        // (and color/roughness shimmered). Build the box-filtered mip chain here for uncompressed RGBA8 so the
+        // sampler's LOD selection (and the G-buffer NormalLodBias) actually has coarser levels to fetch. BC
+        // textures already carry a baked chain from CompressWithMips; RGBA32F (HDR env) stays single-level.
+        TextureData data = (data0.MipCount <= 1 && data0.Format == TextureFormat.RGBA8
+                            && data0.Width >= 2 && data0.Height >= 2)
+            ? GenerateRgba8Mips(in data0) : data0;
+
         Format format = Dx12Backend.ToDxgi(data.Format, type);
-        int mipCount = Math.Max(1, data.MipCount);   // pre-baked chain (BC) or 1 (uncompressed)
+        int mipCount = Math.Max(1, data.MipCount);   // pre-baked chain (BC), generated above (RGBA8), or 1
 
         var desc = ResourceDescription.Texture2D(format, (uint)data.Width, (uint)data.Height,
             arraySize: 1, mipLevels: (ushort)mipCount);
@@ -106,6 +116,39 @@ public sealed class Dx12Texture2D : Texture2D {
             Texture2D = new Texture2DShaderResourceView { MipLevels = (uint)mipCount, MostDetailedMip = 0 },
         };
         Dx12Backend.Device.Device.CreateShaderResourceView(resource, srvDesc, Dx12Backend.SrvStore.Cpu(srvIndex));
+    }
+
+    // Build a box-filtered RGBA8 mip chain (largest-first, concatenated) from a single-level RGBA8 image, so
+    // single-mip material textures get proper LOD filtering on the GPU (V2 D3 fix). Mirrors the importer's
+    // CompressWithMips downsample, but uncompressed and at upload time (fixes already-imported content with no
+    // re-import). sRGB-correctness is approximated by a straight average — the existing importer mip path does
+    // the same; a fully correct linear-space average is a follow-up if banding shows.
+    static TextureData GenerateRgba8Mips(in TextureData src) {
+        int levels = 1;
+        for (int w = src.Width, h = src.Height; w > 1 || h > 1; w = Math.Max(1, w >> 1), h = Math.Max(1, h >> 1))
+            levels++;
+        long total = TextureMipLayout.ChainBytes(src.Width, src.Height, levels, TextureFormat.RGBA8);
+        var chain = new byte[total];
+        Array.Copy(src.Pixels, chain, Math.Min(src.Pixels.Length, (long)src.Width * src.Height * 4));
+
+        for (int level = 1; level < levels; level++) {
+            var (dw, dh) = TextureMipLayout.LevelSize(src.Width, src.Height, level);
+            var (sw, sh) = TextureMipLayout.LevelSize(src.Width, src.Height, level - 1);
+            long srcOff = TextureMipLayout.LevelOffset(src.Width, src.Height, level - 1, TextureFormat.RGBA8);
+            long dstOff = TextureMipLayout.LevelOffset(src.Width, src.Height, level, TextureFormat.RGBA8);
+            for (int y = 0; y < dh; y++) {
+                int sy0 = Math.Min(y * 2, sh - 1), sy1 = Math.Min(y * 2 + 1, sh - 1);
+                for (int x = 0; x < dw; x++) {
+                    int sx0 = Math.Min(x * 2, sw - 1), sx1 = Math.Min(x * 2 + 1, sw - 1);
+                    long p00 = srcOff + ((long)sy0 * sw + sx0) * 4, p10 = srcOff + ((long)sy0 * sw + sx1) * 4;
+                    long p01 = srcOff + ((long)sy1 * sw + sx0) * 4, p11 = srcOff + ((long)sy1 * sw + sx1) * 4;
+                    long d = dstOff + ((long)y * dw + x) * 4;
+                    for (int c = 0; c < 4; c++)
+                        chain[d + c] = (byte)((chain[p00 + c] + chain[p10 + c] + chain[p01 + c] + chain[p11 + c] + 2) / 4);
+                }
+            }
+        }
+        return new TextureData(src.Width, src.Height, TextureFormat.RGBA8, chain, levels);
     }
 
     public override void Activate() { /* DX12 binds by descriptor table at draw time */ }

@@ -5,7 +5,8 @@ namespace BallisticEngine;
 // For block-compressed formats (BC1/BC3/BC5), Pixels holds the full mip chain concatenated
 // largest-first and MipCount says how many levels are present; each level's dimensions and byte
 // length are derived from Width/Height/Format (see TextureMipLayout). Uncompressed RGBA8/RGBA32F
-// is a single level (MipCount 1) — the GPU generates its mips on upload as before.
+// arrives single-level (MipCount 1); the backend builds the mip chain at upload time (the DX12
+// path does this in Dx12Texture2D — the old GL GenerateMipmap equivalent, restored for D3).
 public readonly struct TextureData {
     public readonly int Width;
     public readonly int Height;

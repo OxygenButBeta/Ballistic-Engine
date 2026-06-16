@@ -20,8 +20,21 @@ cbuffer LightConstants : register(b0) {
     float2   ScreenSize;                          // render-target pixel size (for the froxel tile lookup)
     float2   ClusterNearFar;                      // near/far the froxel log-Z grid was built with
     float    UseRtShadows;                        // >0.5 = sample the RT shadow mask instead of cascade PCF
-    float    Pad3;
+    float    SpecClamp;                            // V2: max per-light specular LUMA (0 = off); caps NDF fireflies
+    float    SpecAaStrength;                       // V2: geometric specular AA strength (0 = off); roughens noisy normals
+    float    Pad4, Pad5, Pad6;
 };
+
+// V2 specular firefly clamp (fixes D3): a normal-mapped surface lit by a sharp light produces single-pixel
+// GGX NDF spikes (the half-vector momentarily aligns with a texel normal) → crawling specular sparkles, which
+// V1's correct exposure made stark on the Bistro brick. Bound each light's specular contribution by luma so a
+// lone texel can't blow up, WITHOUT dimming a broad highlight (the clamp only bites the outliers). SpecClamp=0
+// disables it (byte-identical). Applied per light (sun + each punctual) so the cap is on the per-source spike.
+float3 ClampSpecular(float3 spec, float maxLuma) {
+    if (maxLuma <= 0.0) return spec;
+    float luma = dot(spec, float3(0.2126, 0.7152, 0.0722));
+    return (luma > maxLuma) ? spec * (maxLuma / luma) : spec;
+}
 
 // Froxel grid dims — must match Dx12ClusteredLights (16x9x24, log-Z).
 static const int ClusterDimX = 16;
@@ -128,10 +141,19 @@ float3 WorldPosFromDepth(float2 uv, float depth) {
     return w.xyz / w.w;
 }
 
-// Inverse-square distance attenuation with a smooth range cutoff (windowing), GL parity. range = light.w.
-float DistanceAttenuation(float dist, float range) {
-    float d2 = dist * dist;
-    float inv = 1.0 / max(d2, 1e-4);
+// Inverse-square distance attenuation with a smooth range cutoff (windowing). range = light.w.
+// V2 (fixes D3 — fireflies clustered AT light fixtures): the old `1/max(d², 1e-4)` floor let a surface
+// ~1 cm from a light receive a ~10000× radiance pop (1e-4 m² = (1 cm)²) — the lamp-shade interior in the
+// Bistro point lights blew up into a crawling speckle field, which V1's correct exposure made stark. The
+// physical fix is the spherical-source ("representative point" / Karis) window `1/(d² + r²)`: finite at
+// d=0 (max 1/r²), smooth, and IDENTICAL to `1/d²` once d ≫ r (so anything past ~5·r is unchanged — lights
+// at normal stand-off, e.g. LightTest, stay byte-identical). r = the light's SourceRadius, floored at
+// rMin so a delta light (SourceRadius=0, the common authored case) still can't singularly spike up close.
+// sourceRadius arrives in GpuLight.Extra.z; rMin keeps the bound even when it's 0.
+float DistanceAttenuation(float dist, float range, float sourceRadius) {
+    const float rMin = 0.05;                                  // 5 cm: caps near-field atten at 1/0.0025 = 400
+    float r = max(sourceRadius, rMin);
+    float inv = 1.0 / (dist * dist + r * r);                  // spherical-source window (no singularity)
     float t = saturate(1.0 - pow(dist / range, 4.0));
     return inv * t * t;
 }
@@ -144,7 +166,7 @@ float3 ShadePunctual(GpuLight L, float3 N, float3 V, float3 worldPos, float3 alb
     float dist = length(toLight);
     if (dist > L.PosRange.w) return 0.0.xxx;          // range cull
     float3 Ld = toLight / max(dist, 1e-4);
-    float atten = DistanceAttenuation(dist, L.PosRange.w);
+    float atten = DistanceAttenuation(dist, L.PosRange.w, L.Extra.z);   // Extra.z = SourceRadius (V2 near-field window)
     if (atten <= 0.0) return 0.0.xxx;
 
     float3 radiance = L.Color.rgb * atten;
@@ -164,7 +186,9 @@ float3 ShadePunctual(GpuLight L, float3 N, float3 V, float3 worldPos, float3 alb
     float NdotV = max(dot(N, V), 0.0);
     float3 spec = (NDF * G * F) / max(4.0 * NdotV * NdotL, EPS);
     float3 kD = (1.0 - F) * (1.0 - metallic);
-    return (kD * albedo / PI + spec) * radiance * NdotL;
+    float3 diffuseTerm = kD * albedo / PI * radiance * NdotL;
+    float3 specTerm = ClampSpecular(spec * radiance * NdotL, SpecClamp);   // V2: bound punctual specular fireflies
+    return diffuseTerm + specTerm;
 }
 
 // This pixel's froxel index from screen pixel + view-space depth (log-Z), matching Dx12ClusteredLights.
@@ -194,6 +218,22 @@ float4 PSMain(VSOut i) : SV_Target {
     float roughness = clamp(g2.g, 0.045, 1.0);
     float ao = g2.b;
 
+    // GEOMETRIC SPECULAR ANTI-ALIASING (V2, fixes D3 — the crawling sparkle on normal-mapped surfaces). The
+    // high-frequency tiled normal maps (Bistro brick/stone) alias under-sampled: adjacent screen pixels get
+    // wildly different G-buffer normals (measured std ~0.14 on a flat wall), so the GGX lobe peaks on lone
+    // texels → fireflies that TAA can't fully flush. Kaplanyan/Tokuyoshi fix: estimate the normal's screen-
+    // space variance from its derivatives and fold it into the roughness (in α=roughness² space), widening the
+    // specular lobe exactly where the normal is noisy and leaving smooth surfaces untouched. SpecAaStrength=0
+    // disables it (byte-identical). The deferred pass reads the G-buffer normal, so ddx/ddy here = the on-screen
+    // normal variation directly. This is a SHADING-quality fix; it does NOT alter the z-prepass (depth-only).
+    if (SpecAaStrength > 0.0) {
+        float3 dNdx = ddx(N), dNdy = ddy(N);
+        float variance = SpecAaStrength * (dot(dNdx, dNdx) + dot(dNdy, dNdy));
+        float kernelRough2 = min(variance, 0.25);            // clamp the added α² so a silhouette edge can't over-roughen
+        float alpha = roughness * roughness;
+        roughness = clamp(sqrt(saturate(alpha + kernelRough2)), 0.045, 1.0);
+    }
+
     float3 worldPos = WorldPosFromDepth(i.Uv, depth);
     float3 V = normalize(CameraPos - worldPos);
 
@@ -214,7 +254,7 @@ float4 PSMain(VSOut i) : SV_Target {
         float3 spec = (NDF * G * F) / max(4.0 * NdotV * NdotL, EPS);
         float3 kD = (1.0 - F) * (1.0 - metallic);
         diffuse = kD * albedo / PI * radiance * NdotL;
-        specular = spec * radiance * NdotL;
+        specular = ClampSpecular(spec * radiance * NdotL, SpecClamp);   // V2: bound sun specular fireflies
     }
 
     // --- Clustered punctual lights (point/spot) ---

@@ -28,6 +28,8 @@ cbuffer DrawConstants : register(b0) {
 cbuffer MotionConstants : register(b1) {
     float4x4 ViewProjCur;    // current frame, UNJITTERED (transposed)
     float4x4 ViewProjPrev;   // previous frame, UNJITTERED (transposed)
+    float    NormalLodBias;  // V2: positive = sample normal maps coarser (kills normal-map aliasing sparkle)
+    float3   _padMotion;
 };
 
 Texture2D DiffuseMap   : register(t0);
@@ -77,7 +79,9 @@ VSOutput VSMain(VSInput v) {
 }
 
 float3 NormalFromMap(float2 uv, float3 Ngeom, float3 T, float bitangentSign) {
-    float2 nxy = NormalMap.Sample(LinearWrap, uv).rg;
+    // V2 (fixes D3 — normal-map aliasing sparkle): NormalLodBias samples the normal map coarser so tiled
+    // high-frequency normals average instead of feeding per-pixel noise into the G-buffer. Albedo untouched.
+    float2 nxy = NormalMap.SampleBias(LinearWrap, uv, NormalLodBias).rg;
     if (NormalFlipY > 0.5) nxy.y = 1.0 - nxy.y;
     float2 xy = (nxy * 2.0 - 1.0) * max(NormalStrength, 0.0);
     float z = sqrt(max(1.0 - dot(xy, xy), 0.0));
