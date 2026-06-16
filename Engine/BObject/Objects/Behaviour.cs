@@ -27,8 +27,7 @@ public class Behaviour : Component {
                 FireEnable();
             }
             else {
-                try { OnDisabled(); }
-                catch (Exception exception) { ScriptGuard.Report(this, "OnDisabled", exception); }
+                FireDisable();
             }
         }
     }
@@ -50,6 +49,16 @@ public class Behaviour : Component {
     // (or left) disabled defers its OnBegin until it's first enabled; this flag tracks that so it
     // never double-fires and never gets skipped. Reset to false only by a full play teardown.
     internal bool HasBegun;
+
+    // Gameplay-framework lifecycle (ITEM 0 gate / §5 phase runner): OnEnabled fires at most ONCE per
+    // activation. Without this, FireEnable's OnEnabled is UNCONDITIONAL — so the phase runner, which
+    // activates a framework component in Phase 1 (net strand) and again in Phase 3's scene.FireBegin
+    // (Unity strand), would double-fire OnEnabled. HasEnabled goes true on the first OnEnabled and is
+    // cleared on OnDisabled, so a later re-enable fires OnEnabled again (today's semantics). For every
+    // EXISTING component this is byte-identical: they activate exactly once via FireBegin, so the flag
+    // flips on that single call and changes nothing. Proven in %TEMP%\bal-gate-test (Docs/Plans/
+    // gameplay-framework-item0-gate.md).
+    internal bool HasEnabled;
 
     // Active = this component is enabled AND its entity is active all the way up the parent chain
     // (Unity's activeInHierarchy). The renderer's light/volume/draw gather loops test this, so a
@@ -116,8 +125,24 @@ public class Behaviour : Component {
             try { OnBegin(); }
             catch (Exception e) { ScriptGuard.Report(this, "OnBegin", e); }
         }
+        // Idempotent per activation (see HasEnabled): a second FireEnable within the same active span —
+        // e.g. the §5 phase runner touching a framework component in both Phase 1 and Phase 3 — must NOT
+        // re-fire OnEnabled. Cleared by FireDisable, so re-enable-after-disable still fires it.
+        if (HasEnabled)
+            return;
+        HasEnabled = true;
         try { OnEnabled(); }
         catch (Exception e) { ScriptGuard.Report(this, "OnEnabled", e); }
+    }
+
+    // The single OnDisabled dispatch site (the symmetric partner of FireEnable). Clears HasEnabled so a
+    // later re-enable fires OnEnabled again. Every place that disables an active component routes here
+    // (the IsEnabled setter, Entity.SetActive, RemoveComponent, FireEnd) so the HasEnabled invariant —
+    // true exactly while OnEnabled has fired and OnDisabled has not — always holds.
+    internal void FireDisable() {
+        HasEnabled = false;
+        try { OnDisabled(); }
+        catch (Exception e) { ScriptGuard.Report(this, "OnDisabled", e); }
     }
 
     protected internal virtual void Tick(in float delta) {

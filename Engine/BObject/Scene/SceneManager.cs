@@ -187,6 +187,11 @@ public class SceneManager {
         // (The coroutine fixed pump runs inside Physics.Advance, before each step's FixedTick.)
         Physics.Advance(delta, FixedTickScenes);
 
+        // Network tick (plan §8.2): pump the transport once per frame so the loopback host stays live.
+        // No-op when Offline (no GameMode / no host). The full IterateIncoming → NetworkTick → reconcile
+        // → IterateOutgoing bracket lands with replication (P2+); P0 just keeps the socket drained.
+        Network.Manager?.Tick();
+
         // Pump coroutines/async continuations BEFORE the scene Tick so a resume scheduled last frame
         // (and any await DelaySeconds that elapses this frame) runs with this frame's state, ahead of
         // the components that may depend on it.
@@ -217,7 +222,16 @@ public class SceneManager {
         Physics.BeginPlay(); // fresh world before components create bodies in OnEnabled
         CoroutineRunner.Reset(); // no coroutines carry over from a previous session
         IsPlaying = true;
-        scene.FireBegin();
+
+        // Gameplay framework (plan §5): if the scene declares a GameMode, run the ordered phases
+        // (GameMode → Player → HUD → everyone-else) instead of the bare FireBegin. The runner drives the
+        // net strand in Phases 0-2 and fires the SINGLE Unity strand in Phase 3 (the B1/B2 fix). With NO
+        // GameMode this branch is never taken and play-start is byte-identical to before — the opt-in,
+        // zero-regression contract. GamePhaseRunner is engine code (Engine/Gameplay), so no injection.
+        if (GamePhaseRunner.HasGameMode(scene))
+            GamePhaseRunner.Run(scene);
+        else
+            scene.FireBegin();
     }
 
     // Leave play mode: tear down components, clear runtime state, restore the snapshot.
@@ -232,6 +246,7 @@ public class SceneManager {
         scene.Clear();
         ClearAllRenderSets();
         Physics.EndPlay(); // after Clear so component teardown saw a live world
+        Network.Stop(); // tear down the loopback/host started by the phase runner — back to Offline
         CoroutineRunner.Reset(); // abandon any in-flight coroutines/awaits — they don't survive Stop
 
         IsPlaying = false;

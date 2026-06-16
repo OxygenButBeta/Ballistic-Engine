@@ -1,7 +1,21 @@
 # Gameplay Framework — ITEM 0 GATE (mechanism + proof)
 
-**Status:** GATE deliverable for the gameplay-framework build (§14 Item 0 of
-[`gameplay-framework-plan.md`](gameplay-framework-plan.md)). Settled as a ~1-page mechanism + an isolated
+**Status:** GATE ✅ SETTLED (commit f71d9b9d) + **P0 ✅ IMPLEMENTED & VERIFIED.** The mechanism this doc
+settled is now ported into the engine and proven against shipped code.
+
+**P0 verify (the §13 three gates + more) — in-engine headless harness `%TEMP%\bal-gameplay-test`
+(GameplayP0.csproj, ProjectReference to the engine; drives the REAL Behaviour.FireEnable / GamePhaseRunner /
+Network.Spawn): 41/41 PASS, exit 0.** Proves (a) a GameMode scene spawns + possesses a controllable pawn with
+owner-routed SetupInput; (b) a no-GameMode scene runs today's exact OnBegin/OnEnabled path (no OnSpawned, stays
+Offline) — the narrow byte-identity invariant; (c) net strand strictly before Unity strand, OnEnabled exactly
+once; plus the §4d.1 host-corner (IsProxy=false on a host), a proxy never reaching SetupInput, the 0c registry
+clear, a disable/re-enable regression check, and framework-component serializer round-trip. `bal schema`
+confirms the registry auto-discovers GameMode/Pawn/PlayerController/HUD/GameState/PlayerState/NetworkObject
+(§10 free discovery). Full slnx builds 0 errors. **NEXT = P1** (full roles/NetworkRef/ownership transfer).
+
+---
+
+**The gate itself (below) was settled FIRST** as a ~1-page mechanism + an isolated
 callback-ordering harness, **with engine code untouched** — exactly the mesh-SDF / 37-check-physics discipline
 (isolated correctness proof BEFORE engine integration).
 
