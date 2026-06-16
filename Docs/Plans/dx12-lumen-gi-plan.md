@@ -333,6 +333,29 @@ was built + measured NON-VIABLE (~2ms/probe) and user chose to stop at P7.1. See
   rays + reflection denoiser (reintroduces noise the deterministic mirror design avoids), true directional
   surface cache (mesh cards = forbidden authoring), recursive reflection rays (DDGI ambient already = multi-bounce).
 
+**EMISSIVE-AS-GI-SOURCE — DONE & COMMITTED (b95ccee5, 2026-06-16).** Emissive surfaces now act as area
+lights in the indirect bounce (the published DDGI/RTXGI/Lumen technique — Majercik 2019 §4.2-4.3, RTXGI CHS
+emissive, Lumen "Emissive Light Source"). At each GI ray hit, `radiance = albedo*(sun+punctual+ambient) +
+emissive`, emissive added RAW (NO /PI, NO albedo multiply — self-emission is outgoing radiance), decoded
+byte-identically to the raster GBufferBindless (`HasEmissive ? emissiveMap.SampleLevel(uv)*EmissiveFactor : 0`).
+Four lockstep hit-shading sites: DdgiTrace (world cache), ScreenProbeTrace (PRIMARY gather), DxrGi
+(SCREENPROBE=0 fallback), DxrReflections (emitters in mirrors). Emissive is a CONSTANT additive source → no
+multi-bounce runaway; no double-count (directly-visible emissive = G-buffer on the camera pixel; the GI term
+= off-screen bounce hits on OTHER surfaces). Door `BALLISTIC_DX12_GI_EMISSIVE` (default ON, correctness fix)
+rides a SPARE slot in each shader's existing b0 CBV (Params2.w / Params.z / SpParams2.w / ReflConstants.Pad0) —
+NO root-sig/resource change, hang-surface unchanged, `=0` byte-identical-off. Research wf_131bd51d (GO) +
+adversarial audit wf_7c0c8f40 (5 reviewers) found 1 BLOCKER: DxrReflections lacked the per-channel min(60000)
+fp16 cap (luma-only clamp + no preExposure) → unbounded emissive could store +Inf into the half-res RGBA16F
+ssrTarget that the SSR combine spreads (no read-side scrub) = the Inf/NaN black-hole class; FIXED at source +
+defense-in-depth SanitizeSsr on the SSR-combine read (ternary, never mix*0). Verified (RX 9070 XT, DRED, ~14
+guarded launches, NO removal): emissive feeds the DDGI world cache PROPORTIONALLY on real textured-emissive
+content (BistroInterior lanterns: atlas mean delta 0.00005 @intensity1 → 0.00234 @40, warm R>G>B bounce =
+2700K color); determinism preserved (SunTemple isolate f24==f240 SHA256 byte-identical, emissive ON). KNOWN
+FOLLOW-UP (pre-existing, NOT this change): COLOR-ONLY emissive on SEPARATE single-submesh whole-mesh renderers
+isn't resolved by the RT trace's per-triangle MaterialId mapping (Dx12RtGeometry) while the raster G-buffer is
+— textured emissive on imported/merged meshes (the real content path) works; likely affects albedo color-bleed
+from such geometry too.
+
 ---
 
 ## 4. Verification & measurement doctrine (the antidote)
