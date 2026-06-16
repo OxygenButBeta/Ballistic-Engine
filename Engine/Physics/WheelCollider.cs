@@ -5,10 +5,16 @@ namespace BallisticEngine;
 // ray/sphere down from its mount, and when grounded applies, at the contact point on the chassis
 // Rigidbody (via AddForceAtPosition, P2):
 //   * a suspension SPRING + DAMPER force along the wheel's up axis (holds the body off the ground),
-//   * a lateral GRIP force opposing sideways slip (so the car corners instead of skating),
+//   * a lateral GRIP force that CANCELS sideways slip (so the car corners on rails, not skates),
 //   * a longitudinal MOTOR/BRAKE force from the controller (drive and stop).
 // It owns no body of its own; it reads the chassis Rigidbody from its parent (or this entity). This
 // is the industry-standard approach (Unity's WheelCollider) — stable, fast, tunable.
+//
+// ARCADE rewrite (GTA / Need-for-Speed feel): the lateral model is no longer a soft force
+// proportional to slip — it computes the IMPULSE that would zero the sideways velocity at the
+// contact this step and applies a (grip-scaled) fraction of it, clamped to a generous friction
+// budget. At Grip 1.0 the tyre is glued: the car goes exactly where it's pointed, no ice-skating.
+// Longitudinal traction is handled the same way so power lands instead of spinning out.
 [Component("Wheel Collider", "Physics")]
 public class WheelCollider : Behaviour {
     [Header("Wheel")]
@@ -22,26 +28,44 @@ public class WheelCollider : Behaviour {
     public float SuspensionTravel { get; set; } = 0.3f;
 
     [Tooltip("Spring stiffness holding the chassis up (N per metre of compression).")]
-    [Range(0f, 100000f)]
-    public float SuspensionStiffness { get; set; } = 30000f;
+    [Range(0f, 200000f)]
+    public float SuspensionStiffness { get; set; } = 45000f;
 
-    [Tooltip("Suspension damping (N per m/s of compression speed) — kills bounce.")]
-    [Range(0f, 10000f)]
-    public float SuspensionDamping { get; set; } = 4000f;
+    [Tooltip("Suspension damping (N per m/s of compression speed) — kills bounce. Stiff = planted.")]
+    [Range(0f, 20000f)]
+    public float SuspensionDamping { get; set; } = 6000f;
 
     [Header("Grip")]
-    [Tooltip("Sideways grip: how hard the tyre resists lateral slip. 0 = ice, 1 = glued.")]
+    [Tooltip("Sideways grip: how much of the per-step lateral slip is cancelled. " +
+             "0 = ice (drifts forever), 1 = glued (no slide at all). Arcade default is sticky.")]
     [Range(0f, 1f)]
-    public float SidewaysGrip { get; set; } = 0.8f;
+    public float SidewaysGrip { get; set; } = 1f;
+
+    [Tooltip("Friction budget as a multiple of the wheel's vertical load. Higher = the tyre can " +
+             "hold harder cornering before it ever lets go. Arcade cars run high.")]
+    [Range(0.5f, 6f)]
+    public float GripBudget { get; set; } = 3f;
+
+    [Tooltip("How fast lateral grip builds: fraction of sideways slip cancelled per step (0..1). " +
+             "1 = instant (stiff, but a steered wheel can whip the car into a spin); ~0.3 = the tyre " +
+             "relaxes over a few steps — planted and stable. Lower if the car feels twitchy/spinny.")]
+    [Range(0.05f, 1f)]
+    public float GripRelax { get; set; } = 0.3f;
+
+    [Tooltip("Forward traction: how much of the drive/brake force the tyre can put down (1 = full " +
+             "grip, lower = wheelspin/longer stops). The friction circle still caps the total.")]
+    [Range(0.1f, 1f)]
+    public float ForwardGrip { get; set; } = 1f;
 
     [Tooltip("Rolling resistance applied to forward velocity when coasting (no throttle/brake).")]
     [Range(0f, 1f)]
-    public float RollingResistance { get; set; } = 0.05f;
+    public float RollingResistance { get; set; } = 0.04f;
 
     // ---- Runtime readouts (set each FixedTick; useful for wheel-mesh animation / VFX) -----
     [NotSerialized] public bool IsGrounded { get; private set; }
     [NotSerialized] public float Compression { get; private set; } // 0 = extended, 1 = bottomed out
     [NotSerialized] public Vector3 ContactPoint { get; private set; }
+    [NotSerialized] public float LateralSlip { get; private set; } // |sideways m/s| at the contact
 
     Rigidbody chassis;
 
@@ -49,6 +73,7 @@ public class WheelCollider : Behaviour {
     internal float MotorForce;
     internal float BrakeForce;
     internal float SteerAngle; // radians, applied to this wheel's forward/right basis
+    internal bool Handbrake;   // this wheel is hand-braked (locks longitudinal, lets the rear step out)
     // How many wheels share the chassis load — set by the VehicleController; defaults to 4 (a car).
     internal int SharedWheelCount = 4;
 
@@ -57,7 +82,7 @@ public class WheelCollider : Behaviour {
         chassis = GetComponent<Rigidbody>() ?? entity.GetComponentInParent<Rigidbody>();
     }
 
-    int WheelCount() => SharedWheelCount;
+    int WheelCount() => Math.Max(1, SharedWheelCount);
 
     protected internal override void FixedTick(in float dt) {
         if (!SceneManager.IsPlaying)
@@ -66,6 +91,8 @@ public class WheelCollider : Behaviour {
             chassis ??= entity.GetComponentInParent<Rigidbody>();
             return;
         }
+        if (dt <= 0f)
+            return;
 
         Transform t = transform;
         Vector3 up = t.Up;
@@ -85,6 +112,7 @@ public class WheelCollider : Behaviour {
 
         if (!IsGrounded) {
             Compression = 0f;
+            LateralSlip = 0f;
             ContactPoint = mount - up * castLength;
             MotorForce = BrakeForce = 0f;
             return;
@@ -106,26 +134,77 @@ public class WheelCollider : Behaviour {
         springForce = MathF.Max(0f, springForce);
         chassis.AddForceAtPosition(up * springForce, ContactPoint);
 
-        // Lateral grip: oppose the sideways slip. A per-wheel share of the chassis weight makes the
-        // grip critically damped without a stiff per-step velocity-cancel (which oscillated). The
-        // force is clamped to the available friction (grip * supported load) so it can't launch the
-        // car sideways — a simplified linear tyre, not Pacejka, but stable.
-        float lateralSpeed = Vector3.Dot(pointVelocity, right);
-        float loadPerWheel = chassis.Mass * 9.81f / MathF.Max(1, WheelCount());
-        float maxGrip = SidewaysGrip * loadPerWheel;
-        float gripForce = MathHelper.Clamp(-lateralSpeed * loadPerWheel, -maxGrip, maxGrip);
-        chassis.AddForceAtPosition(right * gripForce, ContactPoint);
+        // The friction budget scales with how hard this tyre presses the ground (the spring force).
+        // A planted wheel grips hard; a wheel going light in a corner grips less — natural weight
+        // transfer for free. A small floor keeps a momentarily-light wheel from going fully to ice.
+        float loadPerWheel = chassis.Mass * Physics.Gravity.Length() / WheelCount();
+        float normalLoad = MathF.Max(springForce, loadPerWheel * 0.25f);
+        float frictionBudget = GripBudget * normalLoad;
 
-        // Longitudinal: drive/brake from the controller, plus rolling resistance when coasting.
+        // --- Lateral grip: cancel the sideways slip toward zero, RELAXED over a few steps. ---------
+        // Working in impulse space (force * dt) lets us aim at "kill the slip" then clamp to the
+        // friction circle. But cancelling the WHOLE slip every step is an infinitely-stiff tyre: on a
+        // STEERED wheel that makes a violent yaw moment and the car's nose out-rotates its velocity (a
+        // spin). So we cancel only a FRACTION per step (SidewaysGrip × GripRelax) — the tyre builds its
+        // force over ~3-4 steps, which is both more realistic and stable. GripRelax keeps the front
+        // wheels from whipping the body around while the grip is still very sticky (slip decays fast).
+        float lateralSpeed = Vector3.Dot(pointVelocity, right);
+        LateralSlip = MathF.Abs(lateralSpeed);
+        float effMass = chassis.Mass / WheelCount();
+        float desiredLatImpulse = -lateralSpeed * effMass * SidewaysGrip * GripRelax;
+
+        // --- Longitudinal traction: drive/brake plus a slip-cancel so power tracks straight. ------
         float forwardSpeed = Vector3.Dot(pointVelocity, forward);
-        float longForce = MotorForce;
-        if (BrakeForce > 0f)
-            longForce -= MathF.Sign(forwardSpeed) * MathF.Min(BrakeForce, MathF.Abs(forwardSpeed) * loadPerWheel);
-        else if (MathF.Abs(MotorForce) < 1e-3f)
-            longForce -= forwardSpeed * RollingResistance * loadPerWheel;
-        chassis.AddForceAtPosition(forward * longForce, ContactPoint);
+        // Drive/brake/handbrake produce a target longitudinal impulse. ForwardGrip scales how much of
+        // the drive force the tyre puts down (lower = wheelspin); the friction circle still caps it.
+        float driveImpulse = MotorForce * dt * ForwardGrip;
+        float longCancel = 0f;
+        if (Handbrake) {
+            // Lock the wheel: cancel forward roll entirely (rear handbrake → the tail can rotate out
+            // while the lateral grip there is also gone-ish; here we keep lateral so it's controllable).
+            longCancel = -forwardSpeed * effMass;
+            driveImpulse = 0f;
+        } else if (BrakeForce > 0f) {
+            // Brake toward a stop, never past it (no reverse-launch from over-braking).
+            float maxStop = -forwardSpeed * effMass;
+            float brakeImp = -MathF.Sign(forwardSpeed) * BrakeForce * dt;
+            longCancel = MathF.Abs(brakeImp) > MathF.Abs(maxStop) ? maxStop : brakeImp;
+            driveImpulse = 0f;
+        } else if (MathF.Abs(MotorForce) < 1e-3f) {
+            // Coasting: gentle rolling resistance only. RollingResistance is the fraction of forward
+            // momentum shed PER SECOND (so it's framerate-independent and small) — a rolling wheel
+            // must NOT cancel forward speed per-step or the car crawls. Forward traction is about not
+            // SLIDING (lateral), so it deliberately doesn't drag a freely-rolling wheel here.
+            longCancel = -forwardSpeed * effMass * RollingResistance * dt;
+        }
+        // Under power: the drive impulse lands directly; traction is limited by the friction circle below.
+        float desiredLongImpulse = driveImpulse + longCancel;
+
+        // --- Friction circle: the combined tyre impulse can't exceed the budget this step. --------
+        // DRIVE traction is reserved FIRST so the car can always power through a corner (arcade feel —
+        // a strict lateral-first priority starved the drive in hard turns and the car bogged to a
+        // crawl). Longitudinal takes its share, lateral gets the rest of the circle. The budget is
+        // generous (GripBudget × load), so lateral grip is still very sticky in normal cornering.
+        float maxImpulse = frictionBudget * dt;
+        float longImpulse = MathHelper.Clamp(desiredLongImpulse, -maxImpulse, maxImpulse);
+        float remaining = MathF.Sqrt(MathF.Max(0f, maxImpulse * maxImpulse - longImpulse * longImpulse));
+        float latImpulse = MathHelper.Clamp(desiredLatImpulse, -remaining, remaining);
+
+        // Apply as forces (the Rigidbody integrates AddForceAtPosition as force*dt = impulse).
+        // LATERAL grip is applied at a RAISED point — the contact lifted toward the chassis centre of
+        // mass (the "roll centre") — so cornering force doesn't barrel-roll the car. A lateral force at
+        // the ground contact (0.5 m below the COM) makes a big roll moment; with four wheels pushing
+        // the same way it became a self-sustaining barrel roll that bled off all forward speed. Raising
+        // the application point to the COM height removes that moment while keeping the same linear
+        // grip — exactly how a high roll centre / stiff anti-roll bar plants an arcade car.
+        // LONGITUDINAL force stays at the contact so squat-under-accel / dive-under-brake pitch reads.
+        Vector3 com = chassis.transform.WorldPosition;
+        Vector3 lateralPoint = new Vector3(ContactPoint.X, com.Y, ContactPoint.Z);
+        chassis.AddForceAtPosition(right * (latImpulse / dt), lateralPoint);
+        chassis.AddForceAtPosition(forward * (longImpulse / dt), ContactPoint);
 
         MotorForce = BrakeForce = 0f; // consumed
+        Handbrake = false;
     }
 
     Vector3 VelocityAt(Vector3 worldPoint) {
