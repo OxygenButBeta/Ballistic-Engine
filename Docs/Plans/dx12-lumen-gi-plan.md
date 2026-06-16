@@ -208,10 +208,19 @@ deleted — commit 1b0485ad.)
     OIDN runs (half-res + temporal EMA + the screen-probe gather is inherently clean per P4.2) — guides help most
     on a NOISY 1-spp signal we don't have here. User chose KEEP OPT-IN (correct + cheap cushion for noisier
     content, no default flip, no claim of a big win). Phase 6's real value = the P6.0 motion harness + P6.2.
-  - **P6.2 — Temporal A/B tune + verify no boiling under motion** using the P6.0 harness. Tune the EMA only if
-    the metric shows boiling; do NOT rewrite the already-correct temporal pass (gold-plating). Final judgement:
-    motion-boiling metric improves (or holds) with guided OIDN; GI-isolate edges sharper; paused byte-identical.
+  - **P6.2 — Temporal motion-stability VERIFIED (no EMA tuning needed). ★ PHASE 6 COMPLETE.** Ran the P6.0
+    orbit harness on BOTH fixtures. The GI-ISOLATE bounce (what Phase 6 judges) is STABLE under motion on both:
+    consecutive-frame deltas DECAY (SunTemple ratio 0.68, Bistro 0.85) — the EMA settles toward the motion floor,
+    not amplifying. Per-frame max + 99.9th percentile are BOUNDED and DECREASING across the sequence (SunTemple
+    isolate max 100→92, Bistro 20→17) → NO runaway EMA, NO growing noise field (the classic SSGI-EMA black-hole
+    failure mode is absent). The composite's larger deltas (~6.4 on Bistro) are legitimate scene-geometry motion
+    under the orbit, not GI boiling (the isolate is 0.44). CONCLUSION: the temporal pass already honors every
+    hard-won lesson (motion reproject + neighbourhood clamp + pre/post firefly clamp + box-drift disocclusion
+    reset + ternary Sanitize) and is MEASURABLY stable → tuning it would be gold-plating (the agreed bar: tune
+    ONLY if boiling shows; it doesn't). The verification IS the deliverable. 4 DRED-guarded launches, no removal.
 - Verify: converged + stable under motion; no boiling; no NaN black holes; byte-identical deterministic capture.
+  ★ ALL MET. **PHASE 6 (denoise/temporal) DONE: P6.0 motion harness (committed) + P6.1 guided OIDN (opt-in,
+  committed) + P6.2 motion-stability verified. NEXT on the GI track = Phase 8 (RT reflections via the cache).**
 
 **Phase 7 — Low-end / no-RT fallback. [★ DONE AT THE FLOOR 2026-06-16 — ships SSGI+IBL+SSAO; the raster-DDGI proxy
 was built + measured NON-VIABLE (~2ms/probe) and user chose to stop at P7.1. See P7.2b below.]**
