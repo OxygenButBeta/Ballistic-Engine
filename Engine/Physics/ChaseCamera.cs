@@ -58,6 +58,13 @@ public class ChaseCamera : Behaviour {
     [Range(1f, 40f)]
     public float RotationSmooth { get; set; } = 13f;
 
+    [Tooltip("How fast the camera SWINGS AROUND behind the car when it turns, per second. This is the " +
+             "fix for 'the camera turns weirdly': the camera TRAILS the car's rotation instead of rigidly " +
+             "staying behind it, so a sharp turn shows the car from the side for a moment, then the camera " +
+             "eases in behind. Lower = lazier/more cinematic swing; higher = sticks behind more tightly.")]
+    [Range(0.5f, 12f)]
+    public float OrbitSmooth { get; set; } = 3.5f;
+
     [Header("Speed feel")]
     [Tooltip("Extra metres the camera pulls back at the target's top speed (sense of speed). 0 = off.")]
     [Range(0f, 15f)]
@@ -76,6 +83,7 @@ public class ChaseCamera : Behaviour {
     VehicleController targetCar; // for the steer lead (optional)
     Vector3 smoothedPosition;    // exponentially-damped camera position
     Vector3 smoothedLookAt;      // exponentially-damped look target
+    float followYaw;             // the camera's TRAILING heading (radians), eased toward the car's heading
     bool initialised;
 
     protected internal override void OnAttach() => ResolveTarget();
@@ -111,11 +119,23 @@ public class ChaseCamera : Behaviour {
 
         Vector3 targetPos = target.WorldPosition;
         Vector3 fwd = target.Forward;
-        // "Behind" tracks the car's HEADING (flattened to the ground so the camera doesn't dip when the
-        // car pitches over a bump), never its velocity — so the camera doesn't flip during reverse/drift.
+        // The car's heading yaw (flattened to the ground so the camera doesn't dip over bumps).
         Vector3 flatFwd = new Vector3(fwd.X, 0f, fwd.Z);
         flatFwd = flatFwd.LengthSquared() > 1e-6f ? flatFwd.Normalized() : Vector3.UnitZ;
-        Vector3 flatBack = -flatFwd;
+        float carYaw = MathF.Atan2(flatFwd.X, flatFwd.Z);
+
+        // TRAILING follow-yaw: the camera's own heading eases toward the car's, so the camera SWINGS
+        // around behind the car instead of rigidly snapping behind it. This is the fix for "the camera
+        // turns weirdly" — a sharp turn now shows the car from the side for a beat, then the camera eases
+        // in behind. Eased on the shortest arc (LerpAngle in degrees) so it never spins the long way.
+        if (!initialised) {
+            followYaw = carYaw;
+        } else {
+            float t = 1f - MathF.Exp(-OrbitSmooth * delta);
+            followYaw = Mathf.LerpAngle(followYaw * Mathf.Rad2Deg, carYaw * Mathf.Rad2Deg, t) * Mathf.Deg2Rad;
+        }
+        Vector3 camFwd = new Vector3(MathF.Sin(followYaw), 0f, MathF.Cos(followYaw)); // trailing heading
+        Vector3 flatBack = -camFwd;
 
         // Speed-driven framing: pull back and lead the aim further the faster the car is going.
         float speedFraction = 0f;
@@ -127,22 +147,24 @@ public class ChaseCamera : Behaviour {
         float pullback = SpeedPullback * speedFraction;
         float lookAhead = LookAhead + SpeedLookAhead * speedFraction;
 
-        // Steer lead: bias the aim toward the inside of the turn so corners open up on-screen.
+        // Steer lead: bias the aim toward the inside of the turn so corners open up on-screen. SCALED BY
+        // SPEED so it's gone at a crawl — at low speed a sharp A/D shouldn't whip the camera sideways
+        // (the user's "düşük hızda keskin dönüş mantıksız"); it only leads once you're actually moving.
         Vector3 steerLead = Vector3.Zero;
-        if (targetCar is not null && SteerLookAhead > 0f && targetCar.MaxSteerAngle > 0f) {
+        if (targetCar is not null && SteerLookAhead > 0f && targetCar.MaxSteerAngle > 0f && speedFraction > 0.01f) {
             Vector3 right = target.Right;
             var flatRight = new Vector3(right.X, 0f, right.Z);
             if (flatRight.LengthSquared() > 1e-6f) {
                 flatRight = flatRight.Normalized();
-                // Normalised steer in [-1,1] from the car's current smoothed wheel angle.
-                float steerNorm = MathHelper.Clamp(
-                    targetCar.CurrentSteerNormalized, -1f, 1f);
-                steerLead = flatRight * (steerNorm * SteerLookAhead);
+                float steerNorm = MathHelper.Clamp(targetCar.CurrentSteerNormalized, -1f, 1f);
+                steerLead = flatRight * (steerNorm * SteerLookAhead * speedFraction);
             }
         }
 
+        // The aim leads along the camera's trailing heading too (so it doesn't jump when the car flicks).
+        Vector3 aimFwd = camFwd;
         Vector3 desiredPos = targetPos + flatBack * (Distance + pullback) + Vector3.UnitY * Height;
-        Vector3 desiredLook = targetPos + flatFwd * lookAhead + steerLead + Vector3.UnitY * LookHeight;
+        Vector3 desiredLook = targetPos + aimFwd * lookAhead + steerLead + Vector3.UnitY * LookHeight;
 
         if (!initialised) {
             smoothedPosition = desiredPos;
