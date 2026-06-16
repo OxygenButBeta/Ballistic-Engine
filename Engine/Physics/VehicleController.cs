@@ -145,6 +145,17 @@ public class VehicleController : Behaviour {
     [Range(1f, 3f)]
     public float HandbrakeTurnBoost { get; set; } = 1.6f;
 
+    [Header("Flip recovery")]
+    [Tooltip("Self-right with A/D when flipped (GTA-style): when the car lands on its side or roof, hold A " +
+             "or D and it rolls that way back onto its wheels. Arcade torque — only engages when actually " +
+             "rolled over. The R / gamepad-Y key still snaps it upright in place. Default on.")]
+    public bool SelfRight { get; set; } = true;
+
+    [Tooltip("How strongly A/D rolls the car back over when it's flipped (angular accel, rad/s²). Higher = " +
+             "flips back faster.")]
+    [Range(1f, 30f)]
+    public float SelfRightStrength { get; set; } = 9f;
+
     Rigidbody chassis;
     readonly List<WheelCollider> wheels = new();
     float steer;          // current steer angle (radians), smoothed toward the input
@@ -236,6 +247,34 @@ public class VehicleController : Behaviour {
         float towardCentre = MathF.Abs(targetSteer) < MathF.Abs(steer) ? 1f : 0f;
         float smoothTime = MathHelper.Lerp(SteerTime, SteerReturnTime, towardCentre);
         steer = Mathf.SmoothDamp(steer, targetSteer, ref steerVelocity, smoothTime, dt);
+
+        // --- Self-right (GTA-style): when the car is rolled onto its side/roof, A/D rolls it back over.
+        // Engages only when actually tipped (the car's up axis is far from world-up); applies an arcade
+        // roll torque about the body-forward axis toward the pressed side, plus a gentle auto-assist so it
+        // keeps coming back even without input once it's badly flipped. Doesn't touch normal driving.
+        float upDot = Vector3.Dot(chassisT.Up, Vector3.UnitY); // 1 = upright, 0 = on its side, -1 = roof
+        if (SelfRight && upDot < 0.7f) {
+            // Roll the car upright. Axis = up × worldUp brings the car's up toward world-up from ANY
+            // orientation; near fully inverted that cross is ~0 (unstable balance) so bias a roll about
+            // body-forward to commit to a side — A/D pick it, else a default. We drive the roll RATE toward
+            // a target along that axis (decisive flip, doesn't spin forever). While righting we RETURN —
+            // no drive/grip fights it — so the car cleanly rolls back onto its wheels (GTA-style).
+            Vector3 axis = Vector3.Cross(chassisT.Up, Vector3.UnitY);
+            float steerBias = MathF.Abs(steerInput) > 0.05f ? -steerInput : 1f;
+            float invert = 1f - MathF.Min(1f, axis.Length()); // ~1 when inverted/on-roof, 0 when on its side
+            axis += chassisT.Forward * (steerBias * invert);
+            if (axis.LengthSquared() > 1e-6f) {
+                Vector3 dir = axis.Normalized();
+                const float flipRate = 4.5f;                               // rad/s flip speed
+                float curRate = Vector3.Dot(chassis.AngularVelocity, dir);
+                chassis.AddTorque(dir * ((flipRate - curRate) * SelfRightStrength * chassis.Mass));
+                // Kill off-axis spin + horizontal drift so it settles upright in place rather than sliding.
+                Vector3 ang = chassis.AngularVelocity;
+                chassis.AngularVelocity = dir * Vector3.Dot(ang, dir); // keep only the roll-about-axis spin
+                chassis.Velocity = new Vector3(chassis.Velocity.X * 0.9f, chassis.Velocity.Y, chassis.Velocity.Z * 0.9f);
+            }
+            return; // don't drive while righting
+        }
 
         // --- Latched drive intent so a slide can't flip forward/back mid-corner. -----------------------
         if (throttle < -0.05f) reversing = true;
@@ -342,43 +381,43 @@ public class VehicleController : Behaviour {
         if (handbrake)
             accel = MathF.Max(accel, HandbrakeDecel);
 
-        // --- Drive along the car's OWN body axes (not the averaged ground normal). The car's forward
-        // pitches up/down with the terrain (the suspension tilts the chassis to the slope), so driving
-        // along it naturally climbs a hill — and because the basis is the car's own stable orientation, it
-        // does NOT jitter on bumpy ground the way a per-step averaged ground normal does (which made the
-        // car bog down and crawl on the terrain). carForward = drive axis, carRight = grip axis.
+        // --- Drive in the HORIZONTAL plane along the car's heading. The force is applied horizontally
+        // (the heading flattened to the ground), NOT along the pitched body-forward. Two reasons, both
+        // fixing reported issues:
+        //   * A pitched-forward force has an UPWARD component on a slope that flings a light car off small
+        //     bumps at low speed ("düşük hızda fazla uçuyor"). A horizontal force never launches the car.
+        //   * The taper is measured on HORIZONTAL speed, so on a slope the motor keeps a constant
+        //     horizontal push while gravity's downhill component bleeds that speed — the car SLOWS going
+        //     uphill (steeper = slower), which is the realistic GTA feel ("yokuşta da hızlanıyordu").
+        // A sustained horizontal force still climbs: the slope redirects it into the climb via the wheels'
+        // normal force, and it keeps pushing into a kerb until the car rides over it.
         Vector3 carFwd = chassisT.Forward;
-        Vector3 carRight = chassisT.Right;
+        var driveAxis = new Vector3(carFwd.X, 0f, carFwd.Z);
+        driveAxis = driveAxis.LengthSquared() > 1e-6f ? driveAxis.Normalized() : headingDir;
 
-        float forwardVel = Vector3.Dot(vel, carFwd);
-        float rightVel = Vector3.Dot(vel, carRight);
-
-        // FORWARD = a real engine FORCE (not a velocity set). A velocity-targeting force is self-limiting:
-        // against a kerb/step it reaches the target speed in the air-gap, the obstacle eats it, and there's
-        // no sustained push to climb over — that's why the car bogged and couldn't get up small steps. A
-        // constant force keeps pushing into the obstacle until the car climbs it (GTA-style), and is still
-        // naturally speed-limited because `accel` tapers to 0 near top speed (gearbox) and reverses sign
-        // when overspeed. We also brake/coast via the same signed force toward the target.
+        float forwardVel = Vector3.Dot(horiz, driveAxis); // horizontal speed along the heading
         float driveAccel;
         if (MathF.Abs(targetSpeed) < 0.01f) {
-            // Coast / brake: decelerate the forward velocity toward 0 at `accel` (capped so it can't add
-            // reverse motion this step).
+            // Coast / brake: decelerate the horizontal forward velocity toward 0 (capped, no reverse kick).
             driveAccel = -MathF.Sign(forwardVel) * MathF.Min(accel, MathF.Abs(forwardVel) / dt);
         } else if (forwardVel * MathF.Sign(targetSpeed) > MathF.Abs(targetSpeed)) {
-            // Over the target speed in the drive direction: ease back down (engine/redline limit).
+            // Over the target horizontal speed (e.g. rolling downhill): ease back down (engine limit).
             driveAccel = MathF.Sign(targetSpeed) * -CoastDecel;
         } else {
-            // Under target: push toward it with the (gearbox-shaped) acceleration. Full force — this is
-            // what claws the car over kerbs and up slopes.
+            // Under target: full (gearbox-shaped) push. On a slope gravity opposes this horizontal force,
+            // so the car naturally slows the steeper it climbs.
             driveAccel = MathF.Sign(targetSpeed) * accel;
         }
-        chassis.AddForce(carFwd * (driveAccel * chassis.Mass));
+        chassis.AddForce(driveAxis * (driveAccel * chassis.Mass));
 
-        // GRIP = cancel the sideways (body-right) slip as a velocity change (this part SHOULD be a precise
-        // velocity correction — it's friction, not propulsion). Handbrake loosens it for a drift.
+        // GRIP = cancel the sideways slip (along the horizontal right of the heading) as a precise velocity
+        // correction (friction, not propulsion). Horizontal so it never fights the vertical motion. The
+        // handbrake loosens it for a drift.
+        Vector3 sideAxis = new Vector3(driveAxis.Z, 0f, -driveAxis.X); // horizontal, perpendicular to drive
+        float rightVel = Vector3.Dot(horiz, sideAxis);
         float grip = handbrake ? Grip * HandbrakeGrip : Grip;
         float newRight = rightVel * MathF.Exp(-grip * dt);
-        chassis.AddForce(carRight * ((newRight - rightVel) * chassis.Mass / dt));
+        chassis.AddForce(sideAxis * ((newRight - rightVel) * chassis.Mass / dt));
     }
 
     // Automatic gearbox. Returns the forward acceleration (m/s²) available THIS step, shaped by the
