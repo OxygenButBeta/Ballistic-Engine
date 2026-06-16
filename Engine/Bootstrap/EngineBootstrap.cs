@@ -236,6 +236,13 @@ public sealed class EngineBootstrap {
         // Network is reset on StopPlay; a LIVE reload also drops the spawned-object table so no script
         // pawn/controller type lingers (the scene.Clear above despawned them; this empties the registry).
         BallisticEngine.InputSystem.InputRegistry.ClearForReload();
+        // The SECOND new host-side static root (gate 0c / §8.6.2): the network replication table holds a
+        // descriptor per game-defined NetworkBehaviour subtype (registered by the source generator's
+        // [ModuleInitializer]). It MUST also clear before Unload, or a script-ALC pawn/controller type's
+        // registration pins the old assembly — the same leak InputRegistry would cause. The new assembly's
+        // module initializers re-register on load. (Clearing the InputRegistry alone is necessary, not
+        // sufficient — §8.6.2's symmetry note.)
+        NetworkReplicationRegistry.ClearForReload();
         Network.Manager?.Stop();
         GameScripts.Unload();
 

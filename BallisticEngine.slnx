@@ -6,4 +6,5 @@
   <Project Path="BallisticEngine.Mcp/BallisticEngine.Mcp.csproj" />
   <Project Path="BallisticEngine.Profiling.Tracy/BallisticEngine.Profiling.Tracy.csproj" />
   <Project Path="BallisticEngine.Runtime/BallisticEngine.Runtime.csproj" />
+  <Project Path="BallisticEngine.SourceGen/BallisticEngine.SourceGen.csproj" />
 </Solution>

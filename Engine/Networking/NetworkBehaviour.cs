@@ -63,6 +63,31 @@ public abstract class NetworkBehaviour : Behaviour {
     // lands (P5). P0 declares it so the contract is stable; the network tick wires it in P2+.
     protected internal virtual void NetworkTick() { }
 
+    // ---- replication surface (plan §11 — the source generator OVERRIDES these) ---------------------
+    // A NetworkBehaviour subtype carrying [Networked] fields gets a generated PARTIAL that overrides
+    // these to a concrete, reflection-free body (changemask + delta vs the captured baseline). The base
+    // is a no-op so a NetworkBehaviour with NO [Networked] fields pays nothing and ships nothing — the
+    // generator only touches types that declare replicated state (§11's scoping). The network tick calls
+    // these polymorphically, so dispatch is a virtual call, never reflection.
+    //
+    // HasNetworkedState lets the tick skip non-replicating components without a type test; the generator
+    // sets it true in the override. TypeId/LayoutHash are 0 on the base (only generated types carry them).
+    public virtual bool HasNetworkedState => false;
+    public virtual int NetworkTypeId => 0;
+    public virtual int NetworkLayoutHash => 0;
+
+    // Write the changemask + only-changed [Networked] fields vs the captured baseline (delta, §11). On a
+    // full send (late-join / first snapshot) the generated body treats the baseline as zero so every
+    // field ships. No-op on the base.
+    public virtual void SerializeState(BitWriter writer) { }
+
+    // Read a changemask + apply only the changed fields (clear bits keep the current value). No-op base.
+    public virtual void DeserializeState(ref BitReader reader) { }
+
+    // Capture the current [Networked] values as this object's delta baseline (the last-ACK snapshot the
+    // next SerializeState diffs against). Called by the network tick after a successful send. No-op base.
+    public virtual void CaptureNetworkBaseline() { }
+
     // ---- net-strand drivers (called by the phase runner / Network.Spawn, NOT by FireEnable) --------
     // Drive OnSpawned + role hooks IN ORDER, before the Unity strand. Idempotent: a second call (the
     // object touched by both Phase 1 and a later path) is a no-op via NetBegun. ScriptGuard-firewalled

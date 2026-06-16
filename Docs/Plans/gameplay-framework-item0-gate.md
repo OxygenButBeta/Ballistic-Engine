@@ -1,7 +1,8 @@
 # Gameplay Framework — ITEM 0 GATE (mechanism + proof)
 
-**Status:** GATE ✅ (f71d9b9d) + **P0 ✅** (f06d831a) + **P1 ✅ IMPLEMENTED & VERIFIED.** The mechanism this
-doc settled is ported into the engine and proven against shipped code, now through P1 (full roles).
+**Status:** GATE ✅ (f71d9b9d) + **P0 ✅** (f06d831a) + **P1 ✅** (b855239a) + **P2 ✅ IMPLEMENTED &
+VERIFIED.** The mechanism this doc settled is ported into the engine and proven against shipped code, now
+through P2 (source generator + `[Networked]` bit-packed delta state + asymmetric send-rate).
 
 **Verify — in-engine headless harness `%TEMP%\bal-gameplay-test` (GameplayP0.csproj, ProjectReference to the
 engine; drives the REAL Behaviour.FireEnable / GamePhaseRunner / Network.Spawn / authority resolution):
@@ -17,8 +18,23 @@ engine; drives the REAL Behaviour.FireEnable / GamePhaseRunner / Network.Spawn /
   its slot is reused by a new identity); `TransferOwnership`/`RemoveOwnership` (server-only) flipping
   IsOwner/input-authority and firing `OnOwnershipChanged`.
 
+- **P2**: the Roslyn source generator (`BallisticEngine.SourceGen`, quarantined like Networking/LiteNetLib
+  per §12.2 — the ONLY project referencing Microsoft.CodeAnalysis, attached as an *analyzer*). It scans
+  `NetworkBehaviour` subtypes and emits, per type with `[Networked]`/`[Rpc]` members, a browsable partial
+  (the §11 advantage over IL weaving): `SerializeState`/`DeserializeState` (a FieldCount-bit changemask +
+  only-changed fields vs a captured baseline — unchanged ≈ 1 bit/field), `CaptureNetworkBaseline`,
+  `NetworkTypeId`/`NetworkLayoutHash` (FNV, codegen-time == runtime), and a `[ModuleInitializer]`
+  registration into `NetworkReplicationRegistry`. `[Networked]` attribute (server-write default; the loud
+  `[Networked(Authority.Owner)]` token; **opt-in** quantization via `Min/Max/Bits`, bare float = full 32-bit
+  lossless). The **asymmetric send-rate** seam (§14 item 3): `SendRateClock` throttles state DOWN to the
+  divisor (default 60 Hz sim / 3 = 20 Hz) in the real `NetworkManager.Tick`; the per-tick input-UP stream is
+  modeled (`InputUpStream`) so P5 can't inherit a conflated rate. Gate-0c extended: the replication registry
+  is the 2nd host-side root, cleared in `ReloadGameScripts` alongside `InputRegistry`.
+
 `bal schema` confirms the registry auto-discovers every framework type (§10 free discovery). Full slnx builds 0
-errors. **NEXT = P2** (Roslyn source generator + `[Networked]` bit-packed delta state, separate send-rate).
+errors. **The P2 wire format was proven byte-for-byte in an ISOLATED harness `%TEMP%\bal-netserde-test`
+(repo discipline) BEFORE engine integration**, then re-proven against the REAL generated code in the in-engine
+harness. **NEXT = P3** (LiteNetLib transport — two processes; state crosses the wire under the packet budget).
 
 ---
 

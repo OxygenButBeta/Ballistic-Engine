@@ -63,6 +63,9 @@ public sealed class NetworkManager {
         Topology = NetworkTopology.Offline;
         LocalConnection = Connection.None;
         objects.Clear();
+        SendClock.Reset();
+        StateSnapshotsSent = 0;
+        snapshotWriter.Reset();
     }
 
     void WireTransport() {
@@ -78,10 +81,81 @@ public sealed class NetworkManager {
     void OnPayload(Connection source, ReadOnlySpan<byte> payload, Channel channel) { }
 
     // ---- the tick seam (plan §8.2) ----------------------------------------------------------------
-    // Drains incoming, (later) runs NetworkTick + reconcile, sends outgoing. P0: just pumps the
-    // transport so the loopback pair stays live. Called once per fixed step by SceneManager.
+    // The ASYMMETRIC send-rate clock (§8.2 / §14 item 3): simulate at the fixed 60 Hz step but flush
+    // state DOWN only every Divisor-th tick (20 Hz). Input UP is per-tick (P5) — the up-stream lives on
+    // the predicting client; P2 lays the down path so P5 can't inherit a conflated rate. Default 20 Hz.
+    public SendRateClock SendClock { get; private set; } = new();
+
+    // Count of state-DOWN snapshot flushes — the send cadence the harness asserts (proves the divisor).
+    public int StateSnapshotsSent { get; private set; }
+
+    // Drains incoming, runs NetworkTick on the state authority, and flushes a state snapshot DOWN on the
+    // send boundary (the divisor cadence). Called once per fixed step by SceneManager. P0 only pumped the
+    // transport; P2 adds the NetworkTick dispatch + the asymmetric down-state flush.
     public void Tick() {
         Transport?.Poll();
+        if (IsOffline)
+            return;
+
+        // The single simulation step (§4c) — only on the state authority (the server/host). A proxy does
+        // not mutate state (P5 adds owner prediction). Reflection-free: a virtual call per spawned object.
+        if (IsServer)
+            foreach (NetworkObject obj in objects.All())
+                DriveNetworkTick(obj);
+
+        // State DOWN on the send boundary (the divisor cadence) — pack each dirty object's delta snapshot.
+        // P2 builds + measures the snapshot over loopback; the wire send is P3. The asymmetry (down here,
+        // input up per-tick on the client) is correct FROM THE START (the §14-item-3 functional guard).
+        bool sendBoundary = SendClock.Advance();
+        if (sendBoundary && IsServer)
+            FlushStateDown();
+    }
+
+    static void DriveNetworkTick(NetworkObject obj) {
+        if (obj?.Entity is null)
+            return;
+        foreach (Behaviour b in obj.Entity.Behaviours.ToArray())
+            if (b is NetworkBehaviour nb)
+                try { nb.NetworkTick(); }
+                catch (Exception e) { ScriptGuard.Report(nb, "NetworkTick", e); }
+    }
+
+    // Serialize every spawned, state-carrying object's DELTA snapshot (changemask + changed fields vs its
+    // captured baseline, §11) into one payload, then re-baseline. P2 over loopback: build + measure + (in
+    // a host) apply locally is a no-op since server==client; the real cross-peer apply is P3. Returns the
+    // packed payload so the harness can assert size/cadence. CaptureNetworkBaseline runs AFTER the write so
+    // the next tick diffs against what we just sent (the last-ack model; true ack tracking is P3/P6).
+    BitWriter snapshotWriter = new();
+
+    public ReadOnlySpan<byte> SerializeStateSnapshot() {
+        snapshotWriter.Reset();
+        int written = 0;
+        foreach (NetworkObject obj in objects.All()) {
+            if (obj?.Entity is null)
+                continue;
+            foreach (Behaviour b in obj.Entity.Behaviours.ToArray()) {
+                if (b is NetworkBehaviour nb && nb.HasNetworkedState) {
+                    snapshotWriter.WriteInt(obj.NetId);           // which object (P3 maps this on the wire)
+                    snapshotWriter.WriteInt(nb.NetworkTypeId);    // which component type
+                    nb.SerializeState(snapshotWriter);            // changemask + changed fields
+                    nb.CaptureNetworkBaseline();                  // re-baseline for the next delta
+                    written++;
+                }
+            }
+        }
+        LastSnapshotObjectCount = written;
+        return snapshotWriter.AsSpan();
+    }
+
+    public int LastSnapshotObjectCount { get; private set; }
+
+    void FlushStateDown() {
+        ReadOnlySpan<byte> snapshot = SerializeStateSnapshot();
+        StateSnapshotsSent++;
+        // P3: Transport.Send(client, snapshot, Channel.Unreliable) to each observer. P2 (loopback host):
+        // server and client are the same process, so there is nothing to send to — the snapshot is built
+        // and measured (proving the cadence + the format), and the down-apply is exercised in the harness.
+        _ = snapshot;
     }
 
     // ---- server-authoritative spawn (plan §6 / §8.5) ----------------------------------------------
