@@ -25,13 +25,16 @@ public class WheelCollider : Behaviour {
     [Range(0.01f, 1f)]
     public float SuspensionTravel { get; set; } = 0.3f;
 
-    [Tooltip("Spring stiffness holding the chassis up (N per metre of compression). Higher = stiffer ride.")]
+    [Tooltip("Spring stiffness holding the chassis up (N per metre of compression). Higher = stiffer ride; " +
+             "lower = more visible squat/dive/roll (the GTA-sport default has a little body movement). " +
+             "Ride height is decoupled from this (the spring is preloaded to the car's weight).")]
     [Range(0f, 200000f)]
-    public float SuspensionStiffness { get; set; } = 35000f;
+    public float SuspensionStiffness { get; set; } = 30000f;
 
-    [Tooltip("Suspension damping (N per m/s of compression speed) — kills bounce. Stiff = planted.")]
+    [Tooltip("Suspension damping (N per m/s of compression speed) — kills bounce. Higher = more planted/" +
+             "less wallowy.")]
     [Range(0f, 20000f)]
-    public float SuspensionDamping { get; set; } = 4500f;
+    public float SuspensionDamping { get; set; } = 4000f;
 
     [Tooltip("Where the spring rests when the car sits still, as a fraction of travel (0 = fully extended, " +
              "0.5 = mid-travel). Resting at mid-travel leaves room to both squat and droop, so the " +
@@ -96,11 +99,26 @@ public class WheelCollider : Behaviour {
         Transform t = transform;
         Vector3 up = t.Up;
 
-        // POSITION: the wheel centre rides along the suspension axis, dropped from the mount by the
-        // current suspension length. SuspensionDrop is the single source of truth (set in FixedTick and
-        // CLAMPED to [0, travel]) so the wheel can never climb above the mount into the body, nor fall
-        // past full droop — the two ways the mesh used to clip into the car / sink through the ground.
-        wheelMesh.WorldPosition = t.WorldPosition - up * SuspensionDrop;
+        // POSITION: when grounded, sit the wheel centre exactly ONE RADIUS above the ground contact so
+        // the tyre rests ON the surface — never sinking into it. (The previous "mount − drop" form let the
+        // wheel bottom punch below the ground whenever the suspension bottomed out, because the drop was
+        // clamped at the mount while the ground was closer than the radius — that was the visible
+        // penetration.) The centre is allowed to rise a little ABOVE the mount when the suspension is
+        // fully compressed (the tyre tucking up into the wheel well), but not unboundedly. When airborne
+        // the wheel hangs at full droop from the mount.
+        Vector3 worldTarget;
+        if (IsGrounded) {
+            worldTarget = ContactPoint + up * Radius;
+            // Cap the upward travel so a momentary deep contact can't shoot the wheel through the roof:
+            // it may rise up to (full compression) above the mount's rest, no further.
+            float maxRise = Radius * 0.5f;
+            float aboveMount = Vector3.Dot(worldTarget - t.WorldPosition, up);
+            if (aboveMount > maxRise)
+                worldTarget = t.WorldPosition + up * maxRise;
+        } else {
+            worldTarget = t.WorldPosition - up * SuspensionTravel; // full droop
+        }
+        wheelMesh.WorldPosition = worldTarget;
 
         // ROLL about the spin AXLE (the wheel's right axis → local X): angular speed = ground speed / r.
         rollAngle += ForwardSpeed / MathF.Max(0.05f, Radius) * delta;
@@ -139,9 +157,17 @@ public class WheelCollider : Behaviour {
         // The mount usually sits inside the chassis collider, so skip any hit on the car's OWN body.
         float restLength = SuspensionTravel + Radius;            // mount→ground distance at full droop
         float castLength = restLength + GroundProbeMargin;       // probe a bit further to avoid tunneling
-        IsGrounded = CastIgnoringChassis(mount, -up, castLength, out RaycastHit hit);
+        bool hitGround = CastIgnoringChassis(mount, -up, castLength, out RaycastHit hit);
 
         ForwardSpeed = Vector3.Dot(chassis.Velocity, forward);
+
+        // GROUNDED means the wheel is actually within suspension range of the ground (groundDistance ≤
+        // full droop) — NOT merely that the probe (which reaches a margin further to avoid tunneling)
+        // found something. This is the difference between "driving on the ground" and "the ground is
+        // still 0.4 m below me after a jump". Conflating them pinned the car to the ground off a ramp
+        // (the controller kept applying its on-rails grip while the car should have been flying).
+        float groundDistance = hitGround ? hit.Distance : float.MaxValue;
+        IsGrounded = hitGround && groundDistance <= restLength + 0.02f;
 
         if (!IsGrounded) {
             Compression = 0f;
@@ -158,7 +184,6 @@ public class WheelCollider : Behaviour {
         // wheel mesh sliding up into the body.
         ContactPoint = hit.Point;
         ContactNormal = hit.Normal;
-        float groundDistance = hit.Distance;
         SuspensionDrop = MathHelper.Clamp(groundDistance - Radius, 0f, SuspensionTravel);
         float compressionMetres = SuspensionTravel - SuspensionDrop; // 0 = extended, travel = bottomed
         Compression = compressionMetres / SuspensionTravel;

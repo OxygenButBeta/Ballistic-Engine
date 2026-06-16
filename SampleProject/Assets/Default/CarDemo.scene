@@ -121,8 +121,8 @@ entities:
     members:
       radius: 0.35
       suspensionTravel: 0.3
-      suspensionStiffness: 45000
-      suspensionDamping: 5000
+      suspensionStiffness: 30000
+      suspensionDamping: 4000
 - id: 45c4dcaf88ef4207a0b14ad2399a9cb5
   name: WheelFR
   isActive: true
@@ -141,8 +141,8 @@ entities:
     members:
       radius: 0.35
       suspensionTravel: 0.3
-      suspensionStiffness: 45000
-      suspensionDamping: 5000
+      suspensionStiffness: 30000
+      suspensionDamping: 4000
 - id: c8c13986008b4068a18969134a2c8eb5
   name: WheelRL
   isActive: true
@@ -161,8 +161,8 @@ entities:
     members:
       radius: 0.35
       suspensionTravel: 0.3
-      suspensionStiffness: 45000
-      suspensionDamping: 5000
+      suspensionStiffness: 30000
+      suspensionDamping: 4000
 - id: a58b0f5d6d5c4eca9723aed72f656d8e
   name: WheelRR
   isActive: true
@@ -181,8 +181,8 @@ entities:
     members:
       radius: 0.35
       suspensionTravel: 0.3
-      suspensionStiffness: 45000
-      suspensionDamping: 5000
+      suspensionStiffness: 30000
+      suspensionDamping: 4000
 - id: 9846974dbe38441d887e72cd840897e3
   name: MainCamera
   isActive: true

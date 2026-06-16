@@ -104,9 +104,10 @@ public class VehicleController : Behaviour {
 
     [Header("Grip")]
     [Tooltip("How fast the car's velocity realigns to its heading, per second. High = glued on rails (goes " +
-             "exactly where it points); lower = loose/driftier. This is the 'no ice-skating' knob.")]
+             "exactly where it points); lower = loose/driftier. This is the 'no ice-skating' knob. The GTA " +
+             "balanced-sport default keeps a touch of slide so it feels weighty, not on a track.")]
     [Range(1f, 30f)]
-    public float Grip { get; set; } = 14f;
+    public float Grip { get; set; } = 11f;
 
     [Tooltip("Which wheels steer: front (a normal car). Rear-steer adds 4-wheel steering for tighter turns.")]
     public bool FrontWheelSteer { get; set; } = true;
@@ -114,13 +115,20 @@ public class VehicleController : Behaviour {
 
     [Header("Stability")]
     [Tooltip("Anti-roll: a vertical force pair at the track edges that resists body roll in hard corners " +
-             "(N per unit of lateral lean). Keeps the car from tipping without forcing pitch flat on hills.")]
+             "(N per unit of lateral lean). Keeps the car from tipping without forcing pitch flat on hills. " +
+             "The GTA-sport default leaves a little visible body LEAN in corners (raise it to stiffen).")]
     [Range(0f, 200000f)]
-    public float AntiRoll { get; set; } = 30000f;
+    public float AntiRoll { get; set; } = 20000f;
 
     [Tooltip("Downforce pressed into the road at top speed (N), scaling with speed² — grip climbs with speed.")]
     [Range(0f, 50000f)]
-    public float Downforce { get; set; } = 3000f;
+    public float Downforce { get; set; } = 2200f;
+
+    [Tooltip("Air control: how strongly you can pitch/roll the car WHILE AIRBORNE (off a ramp) to set up " +
+             "the landing (m/s² of angular nudge). The car still flies on pure momentum — this only tilts " +
+             "it. W/S = nose down/up, A/D = roll. 0 = no air control (pure physics flight).")]
+    [Range(0f, 8f)]
+    public float AirControl { get; set; } = 2.5f;
 
     [Header("Handbrake / drift")]
     [Tooltip("Grip fraction while the handbrake is held (lower = the tail steps out further / longer slide). " +
@@ -250,11 +258,32 @@ public class VehicleController : Behaviour {
         // this plane so the car climbs a ramp instead of wedging its horizontal push into the slope.
         groundNormal = groundNormal.LengthSquared() > 1e-6f ? groundNormal.Normalized() : Vector3.UnitY;
 
-        // --- Horizontal arcade dynamics + stability, only while on the wheels (no mid-air control). ----
+        // --- Grounded: the on-rails arcade drive + stability. Airborne: free flight + light air control.
+        // The split is the GTA feel — off a ramp the car FLIES (momentum kept, no grip pinning it down),
+        // and you can pitch/roll it a little in the air to set up the landing.
         if (grounded > 0) {
             ApplyArcadeDrive(chassisT, vel, horiz, speed, signedSpeed, throttle, handbrake, groundNormal, dt);
             ApplyStability(chassisT, speedFraction);
+        } else {
+            ApplyAirControl(chassisT, throttle, steerInput, dt);
         }
+    }
+
+    // Airborne control (GTA-style): the car flies on pure momentum + gravity — NO horizontal velocity is
+    // touched, so a ramp launch keeps all its speed and arc. The only inputs are gentle attitude torques
+    // to set up the landing: throttle pitches the nose (W = nose down to dive, S = nose up), steer rolls
+    // it (A/D = barrel toward that side). Light, capped, and damped so it's a nudge, not a flight sim.
+    void ApplyAirControl(Transform chassisT, float throttle, float steerInput, float dt) {
+        if (AirControl <= 0f)
+            return;
+        Vector3 pitchAxis = chassisT.Right;   // nose up/down about the car's right axis
+        Vector3 rollAxis = chassisT.Forward;  // barrel-roll about the car's forward axis
+        float gain = AirControl * chassis.Mass;
+        // Pitch: W (throttle +) drops the nose, S raises it — the natural "point where you're going" feel.
+        chassis.AddTorque(pitchAxis * (-throttle * gain));
+        chassis.AddTorque(rollAxis * (steerInput * gain));
+        // Damp the angular velocity a touch so the inputs settle instead of spinning up.
+        chassis.AngularVelocity *= 1f / (1f + dt * 1.5f);
     }
 
     // The on-rails arcade core. Heading turns at a clamped rate; speed eases toward the throttle target
@@ -315,31 +344,35 @@ public class VehicleController : Behaviour {
 
         float newSigned = Mathf.MoveTowards(signedSpeed, targetSpeed, accel * dt);
 
-        // --- Direction: rotate the velocity to follow the heading, preserving the new speed. Grip sets
-        // how fast it snaps to the nose (so a flick still reads as a touch of slide, not a teleport).
-        // The handbrake drops the grip so the tail steps out into a controllable drift. -----------------
+        // The drive direction = the heading, projected onto the GROUND PLANE so it points up/down the
+        // slope (so the car climbs a ramp instead of pushing flat into it). On flat ground this is just
+        // the heading. Reverse flips it.
+        Vector3 driveDirH = headingDir * (newSigned >= 0f ? 1f : -1f);
+        Vector3 slopeDir = driveDirH - groundNormal * Vector3.Dot(driveDirH, groundNormal);
+        slopeDir = slopeDir.LengthSquared() > 1e-6f ? slopeDir.Normalized() : driveDirH;
+
+        // The in-plane direction perpendicular to the drive (the "sideways" the tyres resist).
+        Vector3 sideDir = Vector3.Cross(groundNormal, slopeDir);
+        sideDir = sideDir.LengthSquared() > 1e-6f ? sideDir.Normalized() : Vector3.Zero;
+
+        // Decompose the CURRENT velocity into along-slope (forward), sideways, and normal parts. We drive
+        // the forward part toward the target and DAMP the sideways part (grip) — but we do NOT overwrite
+        // the whole vector. That's the key fix: forcing the entire in-plane velocity to a flat-ish target
+        // destroyed the up-the-ramp climbing momentum (the car wedged at the lip and scrubbed to a stop)
+        // and killed the launch arc. Decomposing lets the car climb and fly while still cornering on rails.
+        float forwardVel = Vector3.Dot(vel, slopeDir);
+        float sideVel = Vector3.Dot(vel, sideDir);
+
+        // Forward: accelerate toward the target speed along the slope (newSigned is the eased target).
+        float newForward = newSigned;            // already eased toward the throttle target above
+        // Sideways: bleed it out by grip (handbrake loosens it for a drift). This is the on-rails feel —
+        // it cancels sideways slide without touching the forward/climb or the vertical motion.
         float grip = handbrake ? Grip * HandbrakeGrip : Grip;
-        Vector3 driveDir = headingDir * (newSigned >= 0f ? 1f : -1f);
-        Vector3 currentHorizDir = speed > 0.2f ? horiz / speed : driveDir;
-        float gripBlend = 1f - MathF.Exp(-grip * dt);
-        Vector3 dir = currentHorizDir + (driveDir - currentHorizDir) * gripBlend;
-        if (dir.LengthSquared() < 1e-6f)
-            dir = driveDir;
-        dir = dir.Normalized();
+        float newSide = sideVel * MathF.Exp(-grip * dt);
 
-        // Project the (horizontal) drive direction onto the GROUND PLANE so the velocity points up/down
-        // the slope — this is what lets the car climb a ramp instead of wedging its flat push into the
-        // hill (the velocity gains the vertical component the slope needs). On flat ground the normal is
-        // world-up and this is a no-op. We keep the same target SPEED along the slope.
-        Vector3 slopeDir = dir - groundNormal * Vector3.Dot(dir, groundNormal);
-        slopeDir = slopeDir.LengthSquared() > 1e-6f ? slopeDir.Normalized() : dir;
-        Vector3 targetVel = slopeDir * MathF.Abs(newSigned);
-
-        // Apply the change only to the velocity IN THE GROUND PLANE (the tangential part). The component
-        // along the ground normal — falling onto the ground, the suspension pushing the body up, a jump —
-        // is left entirely to gravity + the suspension, so the car still settles, bumps and airborne work.
-        Vector3 tangentialVel = vel - groundNormal * Vector3.Dot(vel, groundNormal);
-        Vector3 deltaV = targetVel - tangentialVel;
+        // Reassemble: change only the forward + sideways in-plane components; leave the normal component
+        // (gravity, suspension, the launch off a ramp) entirely free so jumps and bumps work.
+        Vector3 deltaV = slopeDir * (newForward - forwardVel) + sideDir * (newSide - sideVel);
         chassis.AddForce(deltaV * (chassis.Mass / dt));
     }
 
