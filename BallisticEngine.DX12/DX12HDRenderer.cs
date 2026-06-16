@@ -475,6 +475,23 @@ public sealed class DX12HDRenderer : HDRenderer {
         public float StepCount, MaxDistance, ShadowMapTexel, Exposure;
     }
 
+    // Aerial perspective (full-screen post pass; atmospheric haze on distant opaque geometry). SEPARATE pass —
+    // does NOT touch the deferred lighting shader. Blended over scene color like fog (dst*transmittance + src).
+    ID3D12RootSignature apRootSig;      // ApConstants CBV (b0) + depth SRV (t0) + sampler
+    ID3D12PipelineState apPso;
+    ID3D12Resource apCb;
+    unsafe byte* apCbMapped;
+    Dx12DescriptorHeap apSrvVisible;    // scene depth, copied per frame
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct ApConstants {
+        public Matrix4x4 InvViewProj;
+        public Vector3 CameraPos; public float Strength;
+        public Vector3 SunDirection; public float Distance;
+        public Vector3 SunRadiance; public float HazeAniso;
+        public Vector3 SkyTint; public float AirDensity;
+        public float Haze, MaxDistance, Exposure, Pad;
+    }
+
     // Per-frame constants (b1) shared by every opaque draw: the cascade matrices + shadow params.
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     unsafe struct FrameConstants {
@@ -664,6 +681,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         BuildDeferredLighting();
         BuildTransparentPass();
         BuildFog();
+        BuildAerialPerspective();
         BuildSsr();
         BuildSsgi();
         BuildTaa();
@@ -1212,6 +1230,52 @@ public sealed class DX12HDRenderer : HDRenderer {
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true);
     }
 
+    unsafe void BuildAerialPerspective() {
+        // ApConstants CBV (b0) + a 1-SRV table (depth t0) + clamp sampler s0.
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
+        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
+        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        apRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("AerialPerspective.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "AerialPerspective.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "AerialPerspective.hlsl");
+
+        // Same composite as fog: dest = dest*srcAlpha(transmittance) + src(inscatter).
+        var blend = BlendDescription.Opaque;
+        var rt0 = blend.RenderTarget[0];
+        rt0.BlendEnable = true;
+        rt0.SourceBlend = Blend.One;
+        rt0.DestinationBlend = Blend.SourceAlpha;
+        rt0.BlendOperation = BlendOperation.Add;
+        rt0.SourceBlendAlpha = Blend.Zero;
+        rt0.DestinationBlendAlpha = Blend.Zero;
+        rt0.BlendOperationAlpha = BlendOperation.Add;
+        blend.RenderTarget[0] = rt0;
+
+        apPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+            RootSignature = apRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = RasterizerDescription.CullNone, BlendState = blend,
+            DepthStencilState = DepthStencilDescription.None,
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
+            DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
+        });
+
+        int apCbSize = (System.Runtime.InteropServices.Marshal.SizeOf<ApConstants>() + 255) & ~255;
+        apCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)apCbSize), ResourceStates.GenericRead);
+        apCbMapped = apCb.Map<byte>(0);
+        apSrvVisible = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true);
+    }
+
     unsafe void BuildShadows() {
         shadowMap = new Dx12ShadowMap(dev, ShadowMapSize, CascadeCount);
 
@@ -1697,6 +1761,15 @@ public sealed class DX12HDRenderer : HDRenderer {
             else
                 DrawSkybox(cl, view, proj);
         });
+
+        // === AERIAL PERSPECTIVE: atmospheric haze on distant opaque geometry (#1 scale cue), blended over the
+        // sky+opaque HDR before transparents/fog. Separate pass — never touches deferred lighting. Only when a
+        // ProceduralSky drives the atmosphere; BALLISTIC_DX12_AP=0 disables it. ===
+        bool apOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_AP") != "0";
+        if (apOn && ProceduralSky.Active is not null) {
+            Vector3 apSunDir = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
+            DrawAerialPerspective(viewProj, camPos, apSunDir, lightColor);
+        }
 
         // === TRANSPARENTS: forward, back-to-front, alpha-blended over the HDR scene + sky, depth-testing
         // the G-buffer depth (LEqual, no write). Runs before fog/SSR/TAA so they apply over the glass. ===
@@ -3178,6 +3251,48 @@ public sealed class DX12HDRenderer : HDRenderer {
         // left it in PixelShaderResource; in the native path hdr == target). fsrOutput stays in shader-read
         // — RunFsr transitions it to UAV next frame from any state.
         target.ColorToRenderTarget();
+    }
+
+    // Aerial perspective: blend the atmosphere's distance haze over opaque geometry (the #1 scale/realism cue).
+    // A full-screen analytic single-scattering pass — a SEPARATE pass that does NOT touch deferred lighting.
+    // Runs after the sky, before transparents/fog. In RAW HDR radiance (composites before the tonemap). The
+    // Strength/Distance dials are env-tunable; BALLISTIC_DX12_AP=0 disables it (byte-identical off).
+    unsafe void DrawAerialPerspective(Matrix4x4 viewProj, Vector3 camPos, Vector3 sunDir, Vector3 sunRadiance) {
+        Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
+        var pSky = ProceduralSky.Active;
+        // Sky-colour ambient tint for haze in shadow (Rayleigh-blue, engine-radiance scale).
+        Vector3 skyTint = sunRadiance * new Vector3(0.10f, 0.16f, 0.32f);
+
+        float strength = 1f;
+        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_AP_STRENGTH"),
+            System.Globalization.CultureInfo.InvariantCulture, out float s)) strength = s;
+
+        float distance = 1200f;  // haze half-distance in metres (scene-scale; env-tunable below)
+        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_AP_DISTANCE"),
+            System.Globalization.CultureInfo.InvariantCulture, out float dd)) distance = dd;
+        *(ApConstants*)apCbMapped = new ApConstants {
+            InvViewProj = Matrix4x4.Transpose(invVP),
+            CameraPos = camPos, Strength = strength,
+            SunDirection = sunDir, Distance = distance,
+            SunRadiance = sunRadiance, HazeAniso = pSky is not null ? Math.Clamp(pSky.HazeAnisotropy, 0f, 0.95f) : 0.8f,
+            SkyTint = skyTint, AirDensity = pSky is not null ? MathF.Max(pSky.AirDensity, 0f) : 1f,
+            Haze = pSky is not null ? MathF.Max(pSky.Haze, 0f) : 1f,
+            MaxDistance = 60000f, Exposure = 1f,
+        };
+
+        gbuffer.DepthToShaderResource();
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        dev.Device.CopyDescriptorsSimple(1, apSrvVisible.Cpu(0), gbuffer.DepthSrvCpu, heapType);
+
+        target.RenderColorOnly(cl => {
+            cl.SetGraphicsRootSignature(apRootSig);
+            cl.SetPipelineState(apPso);
+            cl.SetDescriptorHeaps(apSrvVisible.Heap);
+            cl.SetGraphicsRootConstantBufferView(0, apCb.GPUVirtualAddress);
+            cl.SetGraphicsRootDescriptorTable(1, apSrvVisible.Gpu(0));
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
     }
 
     // Full-screen volumetric fog: march the air toward the camera (shadowed sun + sky in-scatter),
