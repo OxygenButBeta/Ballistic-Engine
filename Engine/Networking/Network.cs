@@ -126,6 +126,36 @@ public static class Network {
         set { if (Manager is not null) Manager.MaxRewindTicks = value; }
     }
 
+    // ---- interest management (P8b, plan §14 item 14) — per-connection AOI culling ------------------
+    // OFF by default (every object replicates to every client — byte-identical to pre-P8b). Turn ON to cull
+    // replication by area-of-interest: an out-of-interest object isn't flushed to a client (a scale/bandwidth
+    // subsystem). An AOI transition fires OnInterestLost/OnInterestGained on the object — NOT despawn
+    // (relevancy != disconnect; the object stays spawned, subscriptions intact). A pawn opts into a custom
+    // bubble via NetworkObject.RelevancyRadius, or AlwaysRelevant to bypass AOI (its own pawn, a global object).
+    public static bool InterestManagement {
+        get => Manager?.InterestManagement ?? false;
+        set { if (Manager is not null) Manager.InterestManagement = value; }
+    }
+
+    // The default AOI radius for an object with RelevancyRadius == 0 (the common per-game bubble).
+    public static float DefaultRelevancyRadius {
+        get => Manager?.DefaultRelevancyRadius ?? 0;
+        set { if (Manager is not null) Manager.DefaultRelevancyRadius = value; }
+    }
+
+    // Observability (P8b): is `obj` currently in connection `c`'s area of interest? Reads the per-client
+    // relevancy frontier (populated only while interest management is on). A tool/test seam.
+    public static bool IsInInterest(Connection c, NetworkObject obj) =>
+        Manager?.IsInInterest(c, obj) ?? false;
+
+    // The relevancy DECISION as a pure function (the ResolveRole pattern) — predict whether an object with
+    // the given (alwaysRelevant, owned-by-the-viewer) flags and position is relevant to a viewer at `view`
+    // (hasView=false => the viewer has no pawn). The live cull calls the SAME function, so this never drifts
+    // — it's the testable form of the §14-item-14 AOI rule.
+    public static bool IsRelevant(bool alwaysRelevant, bool ownedByViewer, bool hasView,
+        Vector3 view, Vector3 objectPos, float radius) =>
+        NetworkManager.IsRelevantPure(alwaysRelevant, ownedByViewer, hasView, view, objectPos, radius);
+
     // ---- RPC dispatch (plan §4b, P4) — called by the GENERATED partial-void stub, not by hand ------
     // The generated method body packs its args into a BitWriter then calls this; the manager routes per the
     // declared To.X target (To.Server up / To.Owner+To.All down) and runs the dev method on the right

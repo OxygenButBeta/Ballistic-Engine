@@ -32,6 +32,18 @@ sealed class ClientReplState {
 
     public uint SendSeq;   // last assigned per-client snapshot seq (incremented per flush that sends something)
 
+    // P8b INTEREST MANAGEMENT (plan §14 item 14): the set of netIds currently in THIS client's area of
+    // interest (the relevancy frontier — a transition is its diff each Evaluate). An out-of-interest object
+    // is omitted from this client's flush (the per-client cull). When interest management is OFF (the
+    // default) this is unused — every object flushes (byte-identical to pre-P8b).
+    public readonly HashSet<int> Relevant = new();
+
+    // P8b: netIds that RE-ENTERED interest this evaluation — flagged so the next flush sends a FULL snapshot
+    // (the late-join re-seed), because the object changed while out of interest so this client's baseline is
+    // stale. Cleared once the re-seed flush lands. Without this, the resumed delta would diff against the
+    // stale baseline and silently skip the missed change.
+    public readonly HashSet<int> ReseedOnRegain = new();
+
     // Seed (or re-seed) this client's baseline for one object to a token — used at join (the atomic
     // late-join baseline = the spawn's current values) and when an object is first spawned for the client.
     public void SeedBaseline(int netId, object token) => Baseline[netId] = token;
@@ -71,5 +83,7 @@ sealed class ClientReplState {
         Baseline.Remove(netId);
         foreach (var p in Pending.Values)
             p.Remove(netId);
+        Relevant.Remove(netId);        // P8b: drop interest bookkeeping for a despawned object
+        ReseedOnRegain.Remove(netId);
     }
 }

@@ -139,4 +139,17 @@ public sealed class NetworkObject : Behaviour {
     // when untracked or not yet recorded. Tools/tests read it to confirm the ring is accruing; the rewind
     // itself is server-internal.
     public int LagHistoryCount => LagHistory?.Count ?? 0;
+
+    // ---- interest management (P8b, §14 item 14) ---------------------------------------------------
+    // SERVER side, when interest management is ON (Network.InterestManagement): this object is replicated to
+    // a client only while within RelevancyRadius of that client's view (its owned pawn's position), unless
+    // AlwaysRelevant. 0 RelevancyRadius = fall back to the manager's default radius. AlwaysRelevant bypasses
+    // AOI entirely (a global object — the player's own pawn, a HUD-driving PlayerState). Both NotSerialized
+    // (runtime replication policy, never persisted). When interest management is OFF (the default), every
+    // object is relevant to every client — byte-identical to the pre-P8b flush.
+    [NotSerialized]
+    public float RelevancyRadius { get; set; }
+
+    [NotSerialized]
+    public bool AlwaysRelevant { get; set; }
 }

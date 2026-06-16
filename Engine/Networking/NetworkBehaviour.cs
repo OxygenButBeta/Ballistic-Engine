@@ -63,6 +63,17 @@ public abstract class NetworkBehaviour : Behaviour {
     // lands (P5). P0 declares it so the contract is stable; the network tick wires it in P2+.
     protected internal virtual void NetworkTick() { }
 
+    // ---- interest management (P8b, plan §14 item 14) ----------------------------------------------
+    // Fired when this object leaves / re-enters a particular CLIENT's area of interest (AOI culling). The
+    // APPROVED decision (§14 item 14 (b)): an AOI transition is NOT a despawn — the object STAYS spawned,
+    // its lifecycle + OnSpawned subscriptions intact; only its replication to that one client pauses.
+    // Relevancy != disconnect, so these are SEPARATE from OnSpawned/OnDespawned (which would tear down the
+    // subscriptions). Server-side, per affected client. A game uses them to pause/resume per-client cosmetic
+    // work (e.g. stop streaming a distant prop's animation to a client that can't see it). The base is a
+    // no-op so an object that doesn't care pays nothing.
+    protected internal virtual void OnInterestLost() { }
+    protected internal virtual void OnInterestGained() { }
+
     // Called right after a received snapshot applied [Networked] state (DeserializeState) — the seam to
     // map replicated logical state onto PRESENTATION (e.g. write a [Networked] position onto the
     // transform). Runs on EVERY machine that receives state (proxies + the autonomous owner pre-replay),
@@ -167,6 +178,19 @@ public abstract class NetworkBehaviour : Behaviour {
             return;
         try { OnOwnershipChanged(previous, next); }
         catch (Exception e) { ScriptGuard.Report(this, "OnOwnershipChanged", e); }
+    }
+
+    // Drive the P8b AOI transitions (a client's interest in this object changed). Firewalled like the other
+    // dispatch sites. Only on a spawned object (an interest change is meaningless before spawn / after despawn).
+    internal void DriveInterestLost() {
+        if (!NetBegun) return;
+        try { OnInterestLost(); }
+        catch (Exception e) { ScriptGuard.Report(this, "OnInterestLost", e); }
+    }
+    internal void DriveInterestGained() {
+        if (!NetBegun) return;
+        try { OnInterestGained(); }
+        catch (Exception e) { ScriptGuard.Report(this, "OnInterestGained", e); }
     }
 
     // The connection the CURRENTLY-EXECUTING RPC was attributed to (plan §4b, P4) — valid ONLY inside an

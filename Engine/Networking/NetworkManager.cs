@@ -581,6 +581,99 @@ public sealed class NetworkManager {
     // The current authoritative server tick (the fixed-step counter). On a client this trails via LastServerTick.
     public uint ServerTick => (uint)SendClock.LocalTick;
 
+    // ---- interest management (P8b, plan §14 item 14) ----------------------------------------------
+    // OFF by default — every object is relevant to every client (the per-client flush is byte-identical to
+    // pre-P8b). Turn ON to cull replication per connection by area-of-interest (a spatial bubble around each
+    // client's owned pawn) — a scale/bandwidth subsystem (NOT hit-detection, which is P8a). The APPROVED
+    // decision (§14 item 14 (b)): an AOI transition fires OnInterestLost/Gained — NOT despawn (relevancy !=
+    // disconnect; the object stays spawned, subscriptions intact). Proven in %TEMP%\bal-interest-test.
+    public bool InterestManagement { get; set; }
+
+    // The default AOI radius for an object whose RelevancyRadius is 0 (the common per-game bubble). Tune per
+    // game; an AlwaysRelevant object ignores it entirely.
+    public float DefaultRelevancyRadius { get; set; } = 50f;
+
+    // The view position of a connection's AOI = its owned pawn's transform position (a reflection-free walk
+    // over spawned objects for one owned by `c` with an entity). Connection.None (a connection with no pawn
+    // yet) has no view → everything non-AlwaysRelevant is out of its interest until it owns a pawn. Cheap
+    // (a handful of owned objects); runs only on the send boundary when interest management is on.
+    bool TryConnectionView(Connection c, out Vector3 view) {
+        foreach (NetworkObject obj in objects.All())
+            if (obj is { IsSpawned: true } && obj.Entity is not null && obj.Owner.IsValid && obj.Owner.Equals(c)) {
+                view = obj.Entity.transform.Position;
+                return true;
+            }
+        view = default;
+        return false;
+    }
+
+    // Is `obj` relevant to connection `c` right now? AlwaysRelevant bypasses AOI; an object the connection
+    // OWNS is always relevant (you always replicate a client its own pawn); otherwise within the (object or
+    // default) radius of the connection's view. A connection with no view (no pawn yet) sees only
+    // AlwaysRelevant + owned objects.
+    bool RelevantTo(Connection c, NetworkObject obj) {
+        bool owned = obj.Owner.IsValid && obj.Owner.Equals(c);
+        bool hasView = TryConnectionView(c, out Vector3 view);
+        float radius = obj.RelevancyRadius > 0f ? obj.RelevancyRadius : DefaultRelevancyRadius;
+        return IsRelevantPure(obj.AlwaysRelevant, owned, hasView, view,
+            obj.Entity?.transform.Position ?? default, radius);
+    }
+
+    // The relevancy DECISION as a pure function (the ResolveAuthority pattern — one place the rule lives,
+    // exposed via Network.IsRelevant so a tool/test verifies it without a live registry, and the live path
+    // calls the SAME function so it never drifts). AlwaysRelevant OR owned-by-the-viewer => relevant; else,
+    // only if the viewer has a pawn (a view) AND the object is within radius of it. A viewer with no pawn
+    // sees only AlwaysRelevant + owned objects.
+    internal static bool IsRelevantPure(bool alwaysRelevant, bool ownedByViewer, bool hasView,
+        Vector3 view, Vector3 objectPos, float radius) {
+        if (alwaysRelevant || ownedByViewer)
+            return true;
+        if (!hasView)
+            return false;
+        return (objectPos - view).LengthSquared() <= radius * radius;
+    }
+
+    // SERVER: recompute every connected client's relevancy set and fire OnInterestLost/Gained on the DIFF —
+    // the §14-item-14 transition events (NOT despawn). A newly-relevant object is flagged for a full re-seed
+    // on the next flush (its baseline for this client is stale/absent — the late-join machinery). Called on
+    // the send boundary, before FlushStateDown, only when interest management is on. Reflection-free.
+    void EvaluateInterest() {
+        foreach (Connection c in clients) {
+            if (!clientState.TryGetValue(c, out ClientReplState state))
+                continue;
+            // gained: in `objects`, relevant now, not in the previous set.
+            foreach (NetworkObject obj in objects.All()) {
+                if (obj is not { IsSpawned: true } || obj.Entity is null)
+                    continue;
+                bool now = RelevantTo(c, obj);
+                bool was = state.Relevant.Contains(obj.NetId);
+                if (now && !was) {
+                    state.Relevant.Add(obj.NetId);
+                    state.ReseedOnRegain.Add(obj.NetId);   // stale baseline -> full re-seed next flush
+                    DriveInterest(obj, gained: true);
+                }
+                else if (!now && was) {
+                    state.Relevant.Remove(obj.NetId);
+                    DriveInterest(obj, gained: false);
+                }
+            }
+        }
+    }
+
+    static void DriveInterest(NetworkObject obj, bool gained) {
+        foreach (Behaviour b in obj.Entity.Behaviours.ToArray())
+            if (b is NetworkBehaviour nb) {
+                if (gained) nb.DriveInterestGained();
+                else nb.DriveInterestLost();
+            }
+    }
+
+    // Observability (P8b): is `obj` currently in `c`'s area of interest (the relevancy frontier)? A
+    // tool/test reads it. False when interest management is off would be misleading, so it reports the
+    // tracked set (which is only populated while management is on).
+    public bool IsInInterest(Connection c, NetworkObject obj) =>
+        obj is not null && clientState.TryGetValue(c, out ClientReplState s) && s.Relevant.Contains(obj.NetId);
+
     // The render-tick a LOCAL shot should carry UP (CLIENT): the past server-moment the screen showed. On a
     // host/server this is just the current tick (no interp delay — the host renders the authoritative present).
     public double RenderTick => IsServer ? ServerTick : Math.Max(0, (double)LastServerTick - InterpDelayTicks);
@@ -735,8 +828,12 @@ public sealed class NetworkManager {
         // (now carrying lastProcessedSeq for the reconcile) and flush to clients.
         bool sendBoundary = SendClock.Advance();
         if (sendBoundary) {
-            if (IsServer)
+            if (IsServer) {
+                if (InterestManagement)
+                    EvaluateInterest();   // P8b: recompute relevancy + fire OnInterestLost/Gained BEFORE the
+                                          // flush (so this send respects the just-updated per-client sets)
                 FlushStateDown();
+            }
             InputStream.FlushBatch();
         }
     }
@@ -892,9 +989,32 @@ public sealed class NetworkManager {
         foreach (NetworkObject obj in objects.All()) {
             if (obj?.Entity is null)
                 continue;
+            // P8b: when interest management is on, CULL an out-of-interest object entirely (0 bytes for this
+            // client — the per-connection AOI filter). Relevant is the just-evaluated set (EvaluateInterest
+            // ran before this flush). When management is off, Relevant is unused and every object passes.
+            if (InterestManagement && !state.Relevant.Contains(obj.NetId))
+                continue;
+            // P8b: did this object just RE-ENTER interest? If so, it changed while culled, so this client's
+            // baseline is stale — send a FULL snapshot (the late-join re-seed), NOT a delta against the stale
+            // baseline (which would silently skip the missed change). Cleared once sent.
+            bool reseed = InterestManagement && state.ReseedOnRegain.Remove(obj.NetId);
             foreach (Behaviour b in obj.Entity.Behaviours.ToArray()) {
                 if (b is not NetworkBehaviour { HasNetworkedState: true } nb)
                     continue;
+
+                if (reseed) {
+                    // Full snapshot on re-gain — every field, ignoring the stale per-client baseline. Then
+                    // capture the baseline = live so subsequent deltas diff against what the client now holds.
+                    snapshotWriter.WriteInt(obj.NetId);
+                    snapshotWriter.WriteUInt(obj.LastProcessedSeq);
+                    snapshotWriter.WriteInt(nb.NetworkTypeId);
+                    nb.SerializeFullState(snapshotWriter);
+                    nb.CaptureNetworkBaseline();
+                    (sentThisSeq ??= new())[obj.NetId] = nb.__GetNetBaseline();
+                    written++;
+                    continue;
+                }
+
                 // Swap in THIS client's baseline for the object so SerializeState diffs against it. A client
                 // that has never seen this object (a brand-new spawn the seed-on-spawn path didn't precede)
                 // has no baseline token -> leave the component's own baseline (the swap is a no-op), which is
