@@ -239,11 +239,15 @@ float4 MarchClouds(float3 o, float3 d, float mu, out float midT) {
     // sun color at the layer (one atmosphere evaluation: golden/red clouds at dusk for free)
     float3 sunTint = exp(-Extinction(SunDepths(o + d * t0))) * SunRadiance;
 
-    // skylight inside the cloud: Rayleigh-hued but heavily whitened, dims through twilight
+    // skylight inside the cloud: Rayleigh-hued but heavily whitened, dims through twilight.
+    // The coefficient is the share of the sun's radiance that returns as ambient skylight fill — physically a
+    // few percent, not 0.22. At 0.22 (and CloudAmbient 1) every cloud glowed with ~15% of full-sun white
+    // radiance, so a half-covered sky read as a flat milky veil under AgX (the desaturated highlight band).
+    // 0.05 keeps the shadowed undersides lifted without bleaching the whole hemisphere.
     float3 ambientHue = BetaR * AirDensity + (float3)(BetaM * Haze * 0.5);
     ambientHue /= max(max(ambientHue.r, max(ambientHue.g, ambientHue.b)), 1e-9);
     ambientHue = lerp(ambientHue, (float3)1.0, 0.5);
-    float3 ambient = SunRadiance * ambientHue * 0.22 * CloudAmbient
+    float3 ambient = SunRadiance * ambientHue * 0.05 * CloudAmbient
                    * smoothstep(-0.05, 0.35, SunDirection.y);
 
     // triple-lobe phase: forward + soft backscatter + a tight silver-lining spike + a wide multi-scatter lobe
@@ -379,8 +383,23 @@ float3 SkyRadiance(float3 dir) {
         }
     }
 
-    float3 sky = (sumR * BetaR * AirDensity * phaseR + sumM * BetaM * Haze * phaseM)
-               * SunRadiance * max(MultiScatter, 1.0);
+    // Single scattering: directional, phase-weighted. Multiple scattering is added SEPARATELY below — folding
+    // it into a flat gain on this term (the old `* max(MultiScatter,1)`) scaled the achromatic Mie haze along
+    // with the molecular blue and pushed the whole hemisphere into the tonemapper's desaturated highlight band,
+    // washing the sky milky-white. Real multiple scattering is near-isotropic and dominated by the molecular
+    // (Rayleigh) layer — so it lifts the blue sky brightness without bleaching it.
+    float3 singleR = sumR * BetaR * AirDensity * phaseR;
+    float3 singleM = sumM * BetaM * Haze * phaseM;
+    float3 sky = (singleR + singleM) * SunRadiance;
+
+    // Multiple scattering (Hillaire-style cheap approximation): an isotropic, Rayleigh-weighted glow whose
+    // strength is the (MultiScatter-1) excess. Uses the isotropic phase 1/4pi (multiply-scattered light has
+    // lost its directionality) and only a small share of the Mie integral, so haze brightens the sky without
+    // greying it. MultiScatter 1 = single-scatter only (this whole term is 0).
+    float msGain = max(MultiScatter - 1.0, 0.0);
+    float3 msR = sumR * BetaR * AirDensity;
+    float3 msM = sumM * BetaM * Haze * 0.25;          // haze contributes far less diffuse glow than air
+    sky += (msR + msM) * (1.0 / (4.0 * PI)) * msGain * SunRadiance;
     float3 viewTrans = exp(-Extinction(viewDepths));
 
     if (ground) {

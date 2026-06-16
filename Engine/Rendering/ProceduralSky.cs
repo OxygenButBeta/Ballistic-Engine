@@ -56,9 +56,9 @@ public class ProceduralSky : SceneBehaviour {
     // reflections, IBL ambient and SSGI exactly like the clear-sky gradient does.
     public bool CloudsEnabled { get; set; } = true;
 
-    // Sky fraction the clouds occupy: 0 = clear, ~0.5 = scattered cumulus, 1 = overcast.
+    // Sky fraction the clouds occupy: 0 = clear, ~0.35 = scattered cumulus, ~0.6 = broken, 1 = overcast.
     [Range(0f, 1f)]
-    public float CloudCoverage { get; set; } = 0.45f;
+    public float CloudCoverage { get; set; } = 0.35f;
 
     // Extinction multiplier inside the clouds: low = wispy and translucent, high = dense
     // cauliflower cores with hard self-shadowing.
@@ -100,7 +100,7 @@ public class ProceduralSky : SceneBehaviour {
     // Thin icy streak sheet near 7.5 km, aligned with the wind and drifting ~2.5x faster
     // (jet stream). Baked into the same cubemap, so reflections and the IBL see it. 0 = clear.
     [Range(0f, 1f)]
-    public float CirrusCoverage { get; set; } = 0.3f;
+    public float CirrusCoverage { get; set; } = 0.15f;
 
     [Header("Night")]
     // Procedural starfield fading in once the sun drops a few degrees below the horizon.
