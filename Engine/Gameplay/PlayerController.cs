@@ -126,15 +126,22 @@ public class PlayerController : NetworkBehaviour {
             return;
         InputBuffer.AckThrough(ackedSeq);          // 2. drop acked
         LastReplayCount = 0;
-        foreach (NetworkInput input in InputBuffer.InOrder()) {   // 3. replay unacked, in seq order
+        // 3. REPLAY the unacked inputs in seq order. P5e RESIM COST CONTROL: the replay is bounded by the
+        // InputBuffer's LOOKBACK CAP (it holds at most DefaultLookbackCap unacked inputs, dropping the
+        // oldest past it). So a long packet gap can NEVER make this loop replay hundreds of ticks in one
+        // frame (a hitch) — at worst it replays the cap (~32 ticks ≈ 0.5 s), and the dropped-oldest error
+        // is corrected by the next snapshot. Proven in %TEMP%\bal-resim-test (9/9). InputBuffer.Dropped
+        // surfaces when the cap bit (a sustained stall / the server falling behind).
+        foreach (NetworkInput input in InputBuffer.InOrder()) {
             CurrentInput = input;                  // the pawn's NetworkTick reads CurrentInput
             replayTick(input);
             LastReplayCount++;
         }
     }
 
-    // The number of inputs replayed in the last reconcile (the unacked window) — a P5e/observability
-    // signal (a growing window means the server is falling behind / the lookback cap is near).
+    // The number of inputs replayed in the last reconcile (the unacked window) — bounded by the P5e
+    // lookback cap. A LastReplayCount pinned at the cap (+ InputBuffer.Dropped climbing) means the server
+    // is falling behind / a sustained stall — the resim stays cost-capped regardless.
     [NotSerialized]
     public int LastReplayCount { get; private set; }
 }

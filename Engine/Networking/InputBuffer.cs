@@ -16,8 +16,15 @@ public sealed class InputBuffer {
     int head;      // index of the next write slot
     int count;     // live entries
 
-    // 256 entries ≈ 4.3 s at 60 Hz — far past any realistic unacked window before P5e's lookback cap.
-    public InputBuffer(int capacity = 256) {
+    // P5e LOOKBACK CAP: the buffer holds at most DefaultLookbackCap unacked inputs; pushing past it DROPS
+    // the oldest (counted in Dropped). This is the resimulation-cost bound — Reconcile replays the buffer,
+    // so capping the buffer caps the per-reconcile replay work and PREVENTS a long packet gap from
+    // replaying hundreds of ticks in one frame (a hitch). 32 ticks ≈ 530 ms at 60 Hz — well past a normal
+    // RTT, so it only bites after a real stall, where dropping the oldest (a small error the next snapshot
+    // corrects) is the right trade vs a frame-stalling resim. Proven in %TEMP%\bal-resim-test (9/9).
+    public const int DefaultLookbackCap = 32;
+
+    public InputBuffer(int capacity = DefaultLookbackCap) {
         this.capacity = Math.Max(1, capacity);
         ring = new NetworkInput[this.capacity];
     }
