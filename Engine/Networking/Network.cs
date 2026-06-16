@@ -36,6 +36,23 @@ public static class Network {
 
     public static void Despawn(NetworkObject netObj) => Manager?.Despawn(netObj);
 
+    // ---- predicted spawn (P5f, §8.5.1) ------------------------------------------------------------
+    // CLIENT-side predicted spawn: create a networked object INSTANTLY (a fired bullet) before the server
+    // round-trip, tagged with a prediction key. The triggering RPC must carry the returned key UP so the
+    // server echoes it on the authoritative spawn → the client LINKS (no duplicate, OnSpawned fires once)
+    // rather than building a second mirror. If the server rejects the action (no echo within the rollback
+    // window), the predicted object is destroyed cleanly. On a host this is a plain Spawn (key 0 — the
+    // authority does not predict). Returns (object, key).
+    public static (NetworkObject obj, uint key) PredictSpawn(Entity entity, Connection owner = default) =>
+        Require().PredictSpawn(entity, owner);
+
+    // SERVER-side answer to a predicted spawn (P5f): spawn the authoritative object ECHOING the prediction
+    // key the client's RPC carried up, so the owning client LINKS it to its predicted object (no
+    // duplicate). Call from inside a To.Server RPC impl (the dev passes the key arg through). owner
+    // defaults to the firing client (RpcCaller) when left default at the call site.
+    public static NetworkObject SpawnPredicted(Entity entity, uint predictKey, Connection owner = default) =>
+        Require().SpawnPredicted(entity, predictKey, owner);
+
     // ---- ownership transfer (server-only, replicated; plan §4d) -----------------------------------
     // Move input authority to a new connection (pick-up, vehicle-enter, detachable turret). Server-only
     // — a client cannot grant itself ownership. Fires OnOwnershipChanged on the affected objects.

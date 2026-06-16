@@ -54,12 +54,16 @@ public static class NetworkWire {
 
     // Spawn carries the object identity + a FULL state snapshot (every field, vs a zero baseline) so the
     // client mirror starts correct (the §8.5 "OnSpawned = baseline delivered atomically" invariant).
-    public static byte[] Spawn(int netId, int typeId, int ownerId, NetworkBehaviour state) {
+    // P5f: it also carries the echoed PREDICTION KEY — non-zero when this authoritative spawn answers a
+    // client's predicted spawn (§8.5.1), so the owning client LINKS it to its predicted object instead of
+    // building a duplicate. 0 = a normal (non-predicted) spawn.
+    public static byte[] Spawn(int netId, int typeId, int ownerId, NetworkBehaviour state, uint predictKey = 0) {
         var w = new BitWriter();
         w.WriteByte((byte)NetMessage.Spawn);
         w.WriteInt(netId);
         w.WriteInt(typeId);
         w.WriteInt(ownerId);
+        w.WriteUInt(predictKey);   // P5f: 0 = normal spawn; non-zero = echoes a client's predicted spawn
         // FULL snapshot (every field, mask all-set) — NOT a delta. A delta would be empty here because the
         // server captured the baseline at spawn (live == baseline), so the mirror would start at defaults.
         state.SerializeFullState(w);

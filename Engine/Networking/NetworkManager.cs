@@ -70,10 +70,13 @@ public sealed class NetworkManager {
         LocalConnection = Connection.None;
         ServerConnection = Connection.None;
         objects.Clear();
+        predicted.Clear();
+        nextPredictKey = 1;
         SendClock.Reset();
         StateSnapshotsSent = 0;
         InputStream.Reset();
         PredictionTicks = 0;
+        IsReplaying = false;
         snapshotWriter.Reset();
     }
 
@@ -191,10 +194,34 @@ public sealed class NetworkManager {
         int netId = r.ReadInt();
         int typeId = r.ReadInt();
         int ownerId = r.ReadInt();
+        uint predictKey = r.ReadUInt();   // P5f: non-zero echoes a client's predicted spawn (§8.5.1)
         if (!NetworkReplicationRegistry.TryGet(typeId, out NetworkTypeDescriptor desc) || desc.ComponentType is null) {
             Debugging.LogError($"Network: spawn for unknown typeId {typeId} — no client type registered.");
             return;
         }
+
+        // P5f CONFIRM-LINK: if this authoritative spawn echoes a key we predicted, LINK it to the existing
+        // predicted object — adopt the netId, clear the prediction, DO NOT build a duplicate or re-fire
+        // OnSpawned (it already fired on the predicted copy). The §8.5.1 reconcile-link.
+        if (predictKey != 0 && predicted.TryGetValue(predictKey, out NetworkObject pred) && pred.Entity is not null) {
+            predicted.Remove(predictKey);
+            pred.PredictKey = 0;
+            pred.PredictConfirmDeadline = 0;
+            pred.NetId = netId;
+            pred.Owner = new Connection(ownerId);
+            pred.Authority = ResolveAuthority(Topology, LocalConnection, pred.Owner);
+            objects.AddWithId(netId, pred);   // now addressable by the server's netId
+            // Apply the authoritative baseline onto the predicted instance + re-baseline. No OnSpawned.
+            foreach (Behaviour b in pred.Entity.Behaviours.ToArray())
+                if (b is NetworkBehaviour { HasNetworkedState: true } nb && nb.NetworkTypeId == typeId) {
+                    nb.DeserializeState(ref r);
+                    try { nb.OnStateApplied(); } catch (Exception e) { ScriptGuard.Report(nb, "OnStateApplied", e); }
+                    nb.CaptureNetworkBaseline();
+                }
+            return;
+        }
+
+        // Normal (non-predicted) spawn — build a fresh mirror.
         Entity entity = Entity.Instantiate($"Net#{netId}");
         var mirror = (NetworkBehaviour)entity.AddComponent(desc.ComponentType);
         NetworkObject netObj = entity.GetComponent<NetworkObject>() ?? entity.AddComponent<NetworkObject>();
@@ -493,6 +520,10 @@ public sealed class NetworkManager {
             }
         }
 
+        // P5f: roll back any predicted spawn whose confirm window expired (a rejected/mispredicted shot's
+        // bullet vanishes cleanly — OnDespawned, no orphan). A confirm (HandleSpawn link) removes it first.
+        SweepPredictedRollbacks();
+
         // Asymmetric UP: record EVERY tick's input on the local owner stream (the per-tick contract; the
         // actual per-object wire send happened above). FlushBatch on the boundary keeps the stream bounded.
         InputStream.RecordInput(seq);
@@ -662,19 +693,23 @@ public sealed class NetworkManager {
     // Send a full Spawn of one object to one client (the join-baseline + each new spawn). Reliable —
     // a missed spawn means the client never builds the mirror. Walks the entity's NetworkBehaviours and
     // sends a Spawn per state-carrying component (P3: one component per object is the common case).
-    void SendSpawnTo(Connection client, NetworkObject obj) {
+    void SendSpawnTo(Connection client, NetworkObject obj, uint predictKey = 0) {
         if (obj?.Entity is null)
             return;
+        // P5f: only the OWNING client gets the echoed prediction key (it holds the predicted object to
+        // link); other observers get key 0 (a normal spawn — they never predicted it). This prevents a
+        // non-owner from spuriously linking an unrelated predicted object to the same key.
+        uint keyForClient = predictKey != 0 && obj.Owner.IsValid && obj.Owner.Equals(client) ? predictKey : 0u;
         foreach (Behaviour b in obj.Entity.Behaviours.ToArray())
             if (b is NetworkBehaviour nb && nb.HasNetworkedState)
-                Transport.Send(client, NetworkWire.Spawn(obj.NetId, nb.NetworkTypeId, obj.Owner.Id, nb),
+                Transport.Send(client, NetworkWire.Spawn(obj.NetId, nb.NetworkTypeId, obj.Owner.Id, nb, keyForClient),
                     Channel.Reliable);
     }
 
     // Broadcast a spawn to every connected client (called from the server spawn path).
-    void BroadcastSpawn(NetworkObject obj) {
+    void BroadcastSpawn(NetworkObject obj, uint predictKey = 0) {
         foreach (Connection c in clients)
-            SendSpawnTo(c, obj);
+            SendSpawnTo(c, obj, predictKey);
     }
 
     // Broadcast a despawn (Reliable) so every client tears its mirror down.
@@ -705,8 +740,85 @@ public sealed class NetworkManager {
         return SpawnObject(netObj, owner.IsValid ? owner : Connection.None);
     }
 
+    // ---- predicted spawn (P5f, §8.5.1) ------------------------------------------------------------
+    // The CLIENT-side predicted spawn table: prediction key -> the local predicted object awaiting an
+    // authoritative confirm. HandleSpawn links/clears; the rollback sweep destroys expired ones.
+    readonly Dictionary<uint, NetworkObject> predicted = new();
+    uint nextPredictKey = 1;
+    const int PredictRollbackWindowTicks = 30;   // ~500ms at 60Hz — confirm within this, else roll back
+
+    // Spawn a PREDICTED object on the CLIENT, INSTANTLY, with no server baseline (§8.5.1 — the one place
+    // "OnSpawned == baseline delivered" does not hold). Mints a prediction key, marks the object predicted,
+    // drives OnSpawned ONCE locally, and registers it by key. The triggering RPC (e.g. a To.Server Fire)
+    // must carry the returned key UP so the server can echo it on the authoritative spawn → the client
+    // LINKS rather than duplicating (HandleSpawn). If no confirm arrives within the rollback window the
+    // object is destroyed (a mispredicted/rejected shot). Returns (object, key).
+    //
+    // Server/host: a predicted spawn is just a real spawn (it already IS the authority) — so on a host this
+    // delegates to Spawn and returns key 0 (no prediction needed; nothing to reconcile).
+    public (NetworkObject obj, uint key) PredictSpawn(Entity entity, Connection owner = default) {
+        if (entity is null)
+            throw new ArgumentNullException(nameof(entity));
+        if (IsServer) {
+            // The authority does not predict — it spawns for real and there is no key to reconcile.
+            return (Spawn(entity, owner), 0u);
+        }
+        NetworkObject netObj = entity.GetComponent<NetworkObject>() ?? entity.AddComponent<NetworkObject>();
+        uint key = nextPredictKey++;
+        netObj.PredictKey = key;
+        netObj.PredictConfirmDeadline = SendClock.LocalTick + PredictRollbackWindowTicks;
+        netObj.Owner = LocalConnection;                       // the predicting client owns its prediction
+        netObj.Authority = ResolveAuthority(Topology, LocalConnection, LocalConnection);
+        netObj.IsSpawned = true;                              // locally live (no netId until confirmed)
+        predicted[key] = netObj;
+        DriveNetSpawnStrand(netObj.Entity);                   // OnSpawned fires ONCE on the predicted copy
+        return (netObj, key);
+    }
+
+    // Roll back any predicted spawn whose confirm window expired (the server never echoed its key — the
+    // shot was rejected / mispredicted). Destroys the predicted object cleanly (OnDespawned). Called once
+    // per fixed tick from PredictTick. No orphan, no duplicate.
+    void SweepPredictedRollbacks() {
+        if (predicted.Count == 0)
+            return;
+        List<uint> expired = null;
+        foreach (var kv in predicted)
+            if (SendClock.LocalTick >= kv.Value.PredictConfirmDeadline) {
+                (expired ??= new()).Add(kv.Key);
+            }
+        if (expired is null)
+            return;
+        foreach (uint key in expired) {
+            NetworkObject obj = predicted[key];
+            predicted.Remove(key);
+            foreach (Behaviour b in obj.Entity.Behaviours.ToArray())
+                if (b is NetworkBehaviour nb)
+                    nb.DriveNetDespawn();                     // OnDespawned on rollback
+            obj.IsSpawned = false;
+            obj.PredictKey = 0;
+            SceneManager.GetCurrentScene()?.DestroyEntity(obj.Entity);
+        }
+    }
+
+    public int PendingPredictedSpawns => predicted.Count;
+
+    // SERVER (P5f): spawn the authoritative object in response to a client's PREDICTED spawn, ECHOING the
+    // prediction key the triggering RPC carried up. The owning client matches the key and LINKS this spawn
+    // to its predicted object (no duplicate). Called from inside a To.Server RPC impl where RpcCaller is
+    // the firing client (the natural owner). key 0 would be a normal spawn — use Spawn for that.
+    public NetworkObject SpawnPredicted(Entity entity, uint predictKey, Connection owner = default) {
+        if (entity is null)
+            throw new ArgumentNullException(nameof(entity));
+        if (!IsServer) {
+            Debugging.LogWarning("SpawnPredicted is server-only — the client predicts via Network.PredictSpawn.");
+            return null;
+        }
+        NetworkObject netObj = entity.GetComponent<NetworkObject>() ?? entity.AddComponent<NetworkObject>();
+        return SpawnObject(netObj, owner.IsValid ? owner : Connection.None, predictKey);
+    }
+
     // Spawn an already-constructed NetworkObject (used by GameMode possession of a scene-placed pawn).
-    internal NetworkObject SpawnObject(NetworkObject netObj, Connection owner) {
+    internal NetworkObject SpawnObject(NetworkObject netObj, Connection owner, uint predictKey = 0) {
         if (netObj.IsSpawned)
             return netObj;
 
@@ -722,9 +834,10 @@ public sealed class NetworkManager {
 
         // Replicate the spawn to every connected client (P3): a full Spawn so each builds the mirror
         // (owner->AutonomousProxy, others->SimulatedProxy per the §4d.1 table, resolved on each machine).
-        // The Spawn carries a FULL snapshot; capture the baseline right after so the next delta-snapshot
-        // diffs against it. A loopback host has no remote clients, so this is a no-op there (SP path).
-        BroadcastSpawn(netObj);
+        // The Spawn carries a FULL snapshot + the echoed predictKey (P5f, 0 = normal); capture the baseline
+        // right after so the next delta-snapshot diffs against it. A loopback host has no remote clients,
+        // so the broadcast is a no-op there (SP path).
+        BroadcastSpawn(netObj, predictKey);
         foreach (Behaviour b in netObj.Entity.Behaviours.ToArray())
             if (b is NetworkBehaviour { HasNetworkedState: true } nb)
                 nb.CaptureNetworkBaseline();

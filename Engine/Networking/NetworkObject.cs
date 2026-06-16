@@ -101,4 +101,19 @@ public sealed class NetworkObject : Behaviour {
     // Observability (P5d): true while a misprediction correction is being eased in (a non-zero smoothing
     // offset is decaying). Tools/tests read this; the value is the smoother's active flag.
     public bool IsSmoothingCorrection => Smoother is { IsActive: true };
+
+    // ---- predicted spawn (P5f, §8.5.1) ------------------------------------------------------------
+    // CLIENT side: the spawn-prediction KEY this object was predicted under (0 = a normal server spawn,
+    // not predicted). Set by Network.PredictSpawn; cleared to 0 when the authoritative spawn LINKS to it
+    // (confirm) — the §8.5.1 reconcile-link. While non-zero the object is a predicted-but-unconfirmed copy
+    // with no server baseline (the one place "OnSpawned == baseline delivered" does NOT hold).
+    [NotSerialized]
+    public uint PredictKey { get; internal set; }
+
+    // CLIENT side: the tick by which this predicted spawn must be confirmed by an authoritative spawn, or
+    // it is ROLLED BACK (destroyed). Set by Network.PredictSpawn. 0 = not a pending prediction.
+    [NotSerialized]
+    internal long PredictConfirmDeadline { get; set; }
+
+    public bool IsPredictedSpawn => PredictKey != 0;
 }
