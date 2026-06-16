@@ -770,7 +770,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         // 6 SRVs per draw (the material table) — size the ring for the worst-case draw count.
         srvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
-            cbSlotCount * MaterialSrvCount, shaderVisible: true);
+            cbSlotCount * MaterialSrvCount, shaderVisible: true, framesInFlight: dev.FramesInFlight);
 
         BuildSkinnedGeometryPass();
 
@@ -781,7 +781,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         skyLuts = new Dx12SkyLuts(dev);
         // 3 IBL SRVs (irradiance/prefilter/BRDF) copied contiguously per frame into a shader-visible heap.
         iblSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true, framesInFlight: dev.FramesInFlight);
 
         BuildShadows();
 
@@ -856,7 +856,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         taaCbMapped = taaCb.Map<byte>(0);
         taaSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true, framesInFlight: dev.FramesInFlight);
         AllocTaaTargets();
     }
 
@@ -911,7 +911,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         ssrCbMapped = ssrCb.Map<byte>(0);
         ssrSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 10, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 10, shaderVisible: true, framesInFlight: dev.FramesInFlight);
         AllocSsrTarget();
     }
 
@@ -962,7 +962,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         ssgiCbMapped = ssgiCb.Map<byte>(0);
         // 3 SRVs each for gather + temporal + combine = 9 contiguous slots per frame.
         ssgiSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 9, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 9, shaderVisible: true, framesInFlight: dev.FramesInFlight);
         AllocSsgiTargets();
     }
 
@@ -1118,7 +1118,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         deferredCbMapped = deferredCb.Map<byte>(0);
         deferredSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 13, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 13, shaderVisible: true, framesInFlight: dev.FramesInFlight);
 
         clusteredLights = new Dx12ClusteredLights(dev);
     }
@@ -1180,7 +1180,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         // Per frame: 7 lighting SRVs (bound once) + 6 material SRVs per draw.
         transparentSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
-            7 + transparentCbSlotCount * MaterialSrvCount, shaderVisible: true);
+            7 + transparentCbSlotCount * MaterialSrvCount, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
     unsafe void BuildComposite() {
@@ -1213,7 +1213,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         compositeCbMapped = compositeCb.Map<byte>(0);
         compositeSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4, shaderVisible: true, framesInFlight: dev.FramesInFlight);
 
         BuildLumAverage();
         BuildSsao();
@@ -1255,7 +1255,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         // Main pass binds a 2-SRV run (depth+normal); each blur binds a 2-SRV run (AO at t0, t1 unused).
         // 3 runs × 2 = 6 contiguous slots.
         ssaoSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 6, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 6, shaderVisible: true, framesInFlight: dev.FramesInFlight);
         AllocSsaoTargets();
     }
 
@@ -1297,7 +1297,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         lumHistory = new Dx12OffscreenTarget(dev, 1, 1, withDepth: false,  // V1b: ping-pong partner (prev adapted EV)
             colorFormat: Format.R16_Float, colorReadable: true);
         lumSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true, framesInFlight: dev.FramesInFlight);
 
         int lumCbSize = (System.Runtime.InteropServices.Marshal.SizeOf<LumConstants>() + 255) & ~255;
         lumCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
@@ -1344,7 +1344,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             ResourceDescription.Buffer((ulong)(bloomCbStride * 3)), ResourceStates.GenericRead);
         bloomCbMapped = bloomCb.Map<byte>(0);
         bloomSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true, framesInFlight: dev.FramesInFlight);
         AllocBloomTargets();
     }
 
@@ -1398,7 +1398,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         fogCbMapped = fogCb.Map<byte>(0);
         fogSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
     unsafe void BuildAerialPerspective() {
@@ -1444,7 +1444,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             ResourceDescription.Buffer((ulong)apCbSize), ResourceStates.GenericRead);
         apCbMapped = apCb.Map<byte>(0);
         apSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
     unsafe void BuildShadows() {
@@ -1523,7 +1523,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         procSkyCbMapped = procSkyCb.Map<byte>(0);
         procSkyEnvSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
     unsafe void BuildSkybox() {
@@ -1565,7 +1565,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         skyCbMapped = skyCb.Map<byte>(0);
         skySrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
     void BuildRootSignature() {

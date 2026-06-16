@@ -60,7 +60,14 @@ public sealed class Dx12Device : IDisposable {
     // the whole P0b machinery collapses to the P0a single-slot single-wait path (byte-identical fallback).
     const int MaxFramesInFlight = 3;
     readonly ID3D12CommandAllocator[] frameAllocators;   // [FramesInFlight] round-robin per frame
-    readonly ID3D12GraphicsCommandList4 frameList;       // one list object (reset each BeginFrame; only the allocator is N-buffered)
+    // P0b — one command LIST per slot too (not just the allocator): with EndFrame signalling-not-waiting, the
+    // CPU loops to the next BeginFrame and Reset()s the list while the PRIOR submission may still be executing
+    // on the GPU. Resetting an in-flight command list is undefined behaviour in D3D12 (corruption / removal).
+    // BeginFrame's per-slot fence wait guarantees THIS slot's previous frame finished before reuse, so a
+    // per-slot list is safe to reset; a single shared list would be reset every frame regardless of which
+    // slot's submission is in flight. `frameList` is the active slot's list (set in BeginFrame).
+    readonly ID3D12GraphicsCommandList4[] frameLists;    // [FramesInFlight]
+    ID3D12GraphicsCommandList4 frameList;                // == frameLists[frameSlot] while a frame is open
     readonly ID3D12Fence frameFence;                     // SEPARATE from `fence`: per-slot frame-completion targets
     ulong frameFenceValue;
     readonly ulong[] frameFenceTargets;                  // [FramesInFlight] the frameFence value the GPU reaches when that slot's frame is done
@@ -146,18 +153,28 @@ public sealed class Dx12Device : IDisposable {
         uploadList.Close();
         uploadFence = Device.CreateFence(0, FenceFlags.None);
 
-        // P0a/P0b frame list + N-buffered allocators (see field comment). FramesInFlight = N when pipelining is
-        // on (default 2 — the CPU runs at most one frame ahead through the present; bump to 3 after P0c), else 1
-        // (the P0a single-slot fallback). The list is created OPEN like the others → close so the first BeginFrame
-        // Reset is uniform. EndFrame submits on the dedicated `frameFence` (signal-not-wait when pipelining).
+        // P0a/P0b frame list + N-buffered allocators (see field comment). `pipelinedFrames` (the P0a single-
+        // recorded-list-per-frame win) is ON by default. CPU↔GPU OVERLAP (FramesInFlight>1 → EndFrame
+        // signals-not-waits so the CPU runs ahead) is GATED OFF by default and only enabled by the explicit
+        // opt-in BALLISTIC_DX12_OVERLAP=1, because it requires EVERY per-frame CPU-written upload + descriptor
+        // heap to be N-buffered first — until P0b's resource N-buffering is COMPLETE+verified, running ahead
+        // stomps data the GPU is still reading (a cross-frame race that escalated to a TDR/PC crash during
+        // bring-up). With overlap off, FramesInFlight==1: BeginFrame uses one slot, EndFrame WAITS — the proven
+        // P0a single-submit single-wait frame. BALLISTIC_DX12_PIPELINED=0 disables even P0a (legacy per-pass
+        // submit). One command LIST + allocator per slot → resetting an in-flight list is impossible (each
+        // slot's reuse is fence-gated in BeginFrame). EndFrame submits on the dedicated `frameFence`.
         pipelinedFrames = Environment.GetEnvironmentVariable("BALLISTIC_DX12_PIPELINED") != "0";
-        FramesInFlight = pipelinedFrames ? 2 : 1;   // P0b N=2; raise to 3 (≤ MaxFramesInFlight) post-P0c if the CPU outruns the GPU by >1 frame
+        bool overlap = pipelinedFrames && Environment.GetEnvironmentVariable("BALLISTIC_DX12_OVERLAP") == "1";
+        FramesInFlight = overlap ? 2 : 1;   // P0b overlap N=2 (opt-in); 1 = no overlap (EndFrame waits). Raise to 3 (≤ MaxFramesInFlight) post-P0c.
         frameAllocators = new ID3D12CommandAllocator[FramesInFlight];
-        for (int i = 0; i < FramesInFlight; i++)
+        frameLists = new ID3D12GraphicsCommandList4[FramesInFlight];
+        for (int i = 0; i < FramesInFlight; i++) {
             frameAllocators[i] = Device.CreateCommandAllocator(CommandListType.Direct);
-        frameList = Device.CreateCommandList<ID3D12GraphicsCommandList4>(
-            CommandListType.Direct, frameAllocators[0], null);
-        frameList.Close();
+            frameLists[i] = Device.CreateCommandList<ID3D12GraphicsCommandList4>(
+                CommandListType.Direct, frameAllocators[i], null);
+            frameLists[i].Close();   // created OPEN → close so the first BeginFrame Reset is uniform
+        }
+        frameList = frameLists[0];
         frameFence = Device.CreateFence(0, FenceFlags.None);
         frameFenceTargets = new ulong[FramesInFlight];   // all 0 → the first N BeginFrames never wait (slots fresh)
 
@@ -251,7 +268,8 @@ public sealed class Dx12Device : IDisposable {
     public void BeginFrame() {
         if (!pipelinedFrames || frameOpen) return;
         frameSlot = (frameSlot + 1) % FramesInFlight;
-        WaitFrameFence(frameFenceTargets[frameSlot]);   // the GPU finished the frame that last used this allocator
+        WaitFrameFence(frameFenceTargets[frameSlot]);   // the GPU finished the frame that last used this slot's allocator+list
+        frameList = frameLists[frameSlot];
         frameAllocators[frameSlot].Reset();
         frameList.Reset(frameAllocators[frameSlot], null);
         frameThreadId = Environment.CurrentManagedThreadId;
@@ -474,7 +492,7 @@ public sealed class Dx12Device : IDisposable {
         fence.Dispose();
         frameFenceEvent.Dispose();
         frameFence.Dispose();
-        frameList.Dispose();
+        foreach (var l in frameLists) l.Dispose();
         foreach (var a in frameAllocators) a.Dispose();
         commandList.Dispose();
         allocator.Dispose();
