@@ -46,6 +46,10 @@ internal static class EditorIcons {
     public const string Grid = "";   // lucide grid-3x3 (grid toggle)
     public const string Pin = "";    // lucide map-pin (component gizmos toggle)
     public const string World = "";  // lucide globe (world gizmo space)
+    public const string Lock = "";   // lucide lock (U+E10F)
+    public const string LockOpen = ""; // lucide lock-open (U+E110)
+    public const string Maximize = "";  // lucide maximize (U+E116)
+    public const string Minimize = "";  // lucide minimize (U+E11E)
 
     // The contiguous glyph range to bake (smallest..largest of the codepoints above), used by
     // ImGuiController when merging lucide.ttf. Keep in sync if icons outside this range are added.
@@ -92,6 +96,7 @@ internal static class EditorIcons {
         ".fbx" or ".obj" or ".gltf" or ".glb" or ".dae" => (Package, TintMesh),
         ".png" or ".jpg" or ".jpeg" or ".tga" or ".bmp" => (Picture, new SysVec4(0.55f, 0.83f, 0.62f, 1f)),
         ".hdr" or ".exr" => (Picture, new SysVec4(0.95f, 0.80f, 0.45f, 1f)),
+        ".wav" or ".wave" or ".ogg" => (Play, new SysVec4(0.93f, 0.55f, 0.72f, 1f)),
         ".mat" => (Color, TintVolume),
         ".volume" => (Color, new SysVec4(0.85f, 0.60f, 0.80f, 1f)),
         ".scene" or ".pyscene" => (Home, new SysVec4(0.93f, 0.65f, 0.45f, 1f)),

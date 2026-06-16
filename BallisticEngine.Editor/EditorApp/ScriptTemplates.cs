@@ -25,7 +25,6 @@ internal static class ScriptTemplates {
     public static string Behaviour(string fileStem) =>
         $$"""
         using BallisticEngine;
-        using OpenTK.Mathematics;
 
         namespace Game;
 

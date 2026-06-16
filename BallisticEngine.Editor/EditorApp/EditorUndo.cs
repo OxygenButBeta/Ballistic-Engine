@@ -9,7 +9,15 @@ namespace BallisticEngine.Editor;
 internal static class EditorUndo {
     const int Capacity = 100;
 
-    readonly record struct Entry(string Label, string Yaml);
+    // An undo entry is EITHER a whole-scene YAML snapshot (structural changes: add/remove/reparent) OR
+    // a single-entity scoped snapshot (a value/component edit on one entity). The scoped form restores
+    // JUST that entity in place, so undoing a tweak doesn't tear down + rebuild every scene-wide
+    // component (which re-fired IrradianceVolume bakes and dropped the selection — bugs 2a/7).
+    readonly record struct Entry(string Label, string Yaml, Guid EntityId, EntityDocument EntityDoc,
+        Action ApplyOld, Action ApplyNew) {
+        public bool IsScoped => EntityDoc is not null;
+        public bool IsCallback => ApplyOld is not null;
+    }
 
     static readonly List<Entry> undo = new();
     static readonly List<Entry> redo = new();
@@ -64,6 +72,28 @@ internal static class EditorUndo {
         PushSnapshot(label, SceneSerializer.Serialize(SceneManager.GetCurrentScene()));
     }
 
+    // Snapshot a SINGLE entity (its components + transform) before a value edit on it. Undoing this
+    // restores just that entity in place — no whole-scene rebuild, so unrelated scene components
+    // (IrradianceVolume bakes!) aren't disturbed and the selection survives. Falls back to a full
+    // scene snapshot if the entity is null. Call BEFORE mutating.
+    public static void PushEntity(string label, Entity entity) {
+        if (SceneManager.IsPlaying)
+            return;
+        if (entity is null) { Push(label); return; }
+
+        EntityDocument doc = SceneSerializer.CaptureEntity(entity);
+        AddEntry(new Entry(label, null, entity.InstanceId, doc, null, null));
+    }
+
+    // Push a CALLBACK undo step for edits that aren't scene/entity data — e.g. a volume PROFILE (a
+    // .volume asset). `applyOld` reverts to the state BEFORE the change (undo); `applyNew` re-applies
+    // the change (redo). The caller captures both snapshots around the edit.
+    public static void PushCallback(string label, Action applyOld, Action applyNew) {
+        if (SceneManager.IsPlaying || applyOld is null || applyNew is null)
+            return;
+        AddEntry(new Entry(label, null, Guid.Empty, null, applyOld, applyNew));
+    }
+
     // Commit a PRE-CAPTURED snapshot under `label`. Use this for the deferred-commit pattern
     // (InspectorUndo.Track): the snapshot was taken when an edit BEGAN — before any value changed —
     // and is committed only when the edit FINISHES with a real change, so one drag / typing session
@@ -71,8 +101,20 @@ internal static class EditorUndo {
     public static void PushSnapshot(string label, string yaml) {
         if (SceneManager.IsPlaying)
             return;
+        AddEntry(new Entry(label, yaml, Guid.Empty, null, null, null));
+    }
 
-        undo.Add(new Entry(label, yaml));
+    // Commit a PRE-CAPTURED single-entity snapshot (deferred-commit pattern from InspectorUndo.Track:
+    // the doc was captured when the edit BEGAN — before the value changed — and committed when it
+    // FINISHED with a real change). Scoped restore, like PushEntity.
+    public static void PushEntitySnapshot(string label, Entity entity, EntityDocument doc) {
+        if (SceneManager.IsPlaying || entity is null || doc is null)
+            return;
+        AddEntry(new Entry(label, null, entity.InstanceId, doc, null, null));
+    }
+
+    static void AddEntry(Entry entry) {
+        undo.Add(entry);
         if (undo.Count > Capacity)
             undo.RemoveAt(0);
         redo.Clear();
@@ -84,8 +126,8 @@ internal static class EditorUndo {
             return;
 
         Entry entry = undo[^1];
-        redo.Add(new Entry(entry.Label, SceneSerializer.Serialize(SceneManager.GetCurrentScene())));
-        Restore(entry.Yaml);
+        redo.Add(Inverse(entry));   // capture the CURRENT state (same scope) for redo
+        Apply(entry);
         undo.RemoveAt(undo.Count - 1);
         IsDirty = true;
     }
@@ -95,15 +137,54 @@ internal static class EditorUndo {
             return;
 
         Entry entry = redo[^1];
-        undo.Add(new Entry(entry.Label, SceneSerializer.Serialize(SceneManager.GetCurrentScene())));
-        Restore(entry.Yaml);
+        undo.Add(Inverse(entry));
+        Apply(entry);
         redo.RemoveAt(redo.Count - 1);
         IsDirty = true;
     }
 
+    // The opposite-direction entry: captures the CURRENT state in the same scope as `entry`, so
+    // undo<->redo round-trip exactly. A scoped entry whose entity vanished degrades to a full snapshot.
+    static Entry Inverse(Entry entry) {
+        // Callback: swap the two directions, so undo->redo->undo keeps round-tripping.
+        if (entry.IsCallback)
+            return new Entry(entry.Label, null, Guid.Empty, null, entry.ApplyNew, entry.ApplyOld);
+        if (entry.IsScoped && FindEntity(entry.EntityId) is { } live)
+            return new Entry(entry.Label, null, entry.EntityId, SceneSerializer.CaptureEntity(live), null, null);
+        return new Entry(entry.Label, SceneSerializer.Serialize(SceneManager.GetCurrentScene()), Guid.Empty, null, null, null);
+    }
+
+    // Applies an entry: a scoped one restores just its entity in place (selection + scene-wide
+    // components untouched); a full one rebuilds the whole scene. A scoped entry whose entity is gone
+    // is a no-op (nothing to restore in place — a value edit can't have outlived its entity's deletion,
+    // which would itself have been a full-snapshot undo step).
+    static void Apply(Entry entry) {
+        if (entry.IsCallback) {
+            entry.ApplyOld();   // revert to the captured state (Inverse swaps directions for redo)
+            return;
+        }
+        if (entry.IsScoped) {
+            if (FindEntity(entry.EntityId) is { } target) {
+                object token = CaptureSelection?.Invoke();
+                SceneSerializer.RestoreEntityInPlace(target, entry.EntityDoc);
+                RestoreSelection?.Invoke(token);
+            }
+            return;
+        }
+        Restore(entry.Yaml);
+    }
+
+    static Entity FindEntity(Guid id) {
+        foreach (Entity e in SceneManager.GetCurrentScene().Entities)
+            if (e.InstanceId == id) return e;
+        return null;
+    }
+
     // Undo repeatedly back to a given history index (0 = newest). Used by the history dropdown.
+    // History() lists newest-first, so dropdown index k maps to undo[Count-1-k]; undoing "to" that
+    // entry means rolling back it AND everything newer than it = k+1 pops off the top of the stack.
     public static void UndoTo(int historyIndex) {
-        int steps = undo.Count - historyIndex;
+        int steps = historyIndex + 1;
         for (var i = 0; i < steps && CanUndo; i++)
             Undo();
     }

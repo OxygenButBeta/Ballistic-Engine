@@ -14,7 +14,11 @@ public static class DefaultTextures {
         (byte r, byte g, byte b) = type switch {
             TextureType.Normal => ((byte)128, (byte)128, (byte)255),
             TextureType.Metallic => ((byte)0, (byte)0, (byte)0),
-            TextureType.Emissive => ((byte)0, (byte)0, (byte)0),
+            // WHITE (not black): a color-only emissive material (Ke, no map — neon, screens, area
+            // lights, the Cornell light) binds this default and the shader does
+            // texture(Emissive)*EmissiveFactor, so white*factor = the authored color. Gated by
+            // HasEmissive, so a material WITHOUT emissive never samples it.
+            TextureType.Emissive => ((byte)255, (byte)255, (byte)255),
             _ => ((byte)255, (byte)255, (byte)255), // diffuse / roughness / AO
         };
 

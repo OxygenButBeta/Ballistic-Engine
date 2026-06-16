@@ -1,4 +1,3 @@
-﻿using OpenTK.Mathematics;
 using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine;
@@ -45,8 +44,8 @@ public class FreeLookCameraController : Behaviour {
 
             pitch = MathHelper.Clamp(pitch, -89f, 89f);
 
-            Quaternion qPitch = Quaternion.FromAxisAngle(Vector3.UnitX, MathHelper.DegreesToRadians(pitch));
-            Quaternion qYaw = Quaternion.FromAxisAngle(Vector3.UnitY, MathHelper.DegreesToRadians(yaw));
+            Quaternion qPitch = Quaternion.CreateFromAxisAngle(Vector3.UnitX, MathHelper.DegreesToRadians(pitch));
+            Quaternion qYaw = Quaternion.CreateFromAxisAngle(Vector3.UnitY, MathHelper.DegreesToRadians(yaw));
 
             transform.Rotation = qYaw * qPitch;
 

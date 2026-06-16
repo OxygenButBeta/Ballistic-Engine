@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -157,7 +156,7 @@ public static class Mathf {
 
     public static Vector3 MoveTowards(Vector3 current, Vector3 target, float maxDistanceDelta) {
         Vector3 delta = target - current;
-        float dist = delta.Length;
+        float dist = delta.Length();
         if (dist <= maxDistanceDelta || dist < Epsilon)
             return target;
         return current + delta / dist * maxDistanceDelta;

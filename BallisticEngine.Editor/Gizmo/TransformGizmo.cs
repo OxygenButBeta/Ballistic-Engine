@@ -1,11 +1,15 @@
 using Hexa.NET.ImGui;
-using OpenTK.Mathematics;
 using SysVec2 = System.Numerics.Vector2;
 
 namespace BallisticEngine.Editor;
 
 internal enum GizmoMode { Translate, Rotate, Scale }
 internal enum GizmoSpace { World, Local }
+
+// Where the gizmo SITS: at the entity's own transform pivot (origin), or at the CENTER of the
+// selection's bounds — the AABB of the entity and all its descendants' world positions, so a
+// hierarchy's handle sits in the middle of its parts (Unity's Pivot/Center toggle).
+internal enum GizmoPivot { Pivot, Center }
 
 // Hand-rolled transform gizmo drawn over the Scene view with the ImGui draw list.
 // Translate: drag the X/Y/Z arrows. Rotate: drag the axis circles. Scale: drag the axis cubes,
@@ -14,6 +18,7 @@ internal enum GizmoSpace { World, Local }
 internal sealed class TransformGizmo {
     public GizmoMode Mode = GizmoMode.Translate;
     public GizmoSpace Space = GizmoSpace.World;
+    public GizmoPivot Pivot = GizmoPivot.Pivot;
 
     // The basis the gizmo uses this frame: world axes, or the entity's axes in Local space.
     // Scale ALWAYS uses local axes (scaling along world axes is meaningless for a rotated object).
@@ -54,6 +59,26 @@ internal sealed class TransformGizmo {
         return localAxesBuffer;
     }
 
+    // Center-mode gizmo position: the AABB centre of the entity's and all its descendants' world
+    // positions. For a leaf entity this equals its pivot; for a hierarchy it sits in the middle of the
+    // parts. (A render-bounds centre would need CPU mesh data per renderer; transform-position bounds
+    // is cheap, stable, and matches "the centre of the objects inside" for authored hierarchies.)
+    static Vector3 SelectionCenter(Entity entity) {
+        Vector3 min = entity.transform.WorldPosition, max = min;
+        Scene scene = SceneManager.GetCurrentScene();
+        if (scene is not null) {
+            // Transform has no child list; find descendants by walking the scene (IsDescendantOf).
+            foreach (Entity e in scene.Entities) {
+                if (e is null || e.IsDestroyed || ReferenceEquals(e, entity)) continue;
+                if (!e.transform.IsDescendantOf(entity.transform)) continue;
+                Vector3 p = e.transform.WorldPosition;
+                min = Vector3.Min(min, p);
+                max = Vector3.Max(max, p);
+            }
+        }
+        return (min + max) * 0.5f;
+    }
+
     // Snap helpers â€” active while Ctrl is held during a drag (increments from EditorPrefs).
     static bool SnapHeld => ImGui.GetIO().KeyCtrl;
     static float Snap(float value, float increment) =>
@@ -82,7 +107,12 @@ internal sealed class TransformGizmo {
             return;
 
         Matrix4 vp = camera.GetViewMatrix() * camera.GetProjectionMatrix();
-        Vector3 origin = entity.transform.WorldMatrix.ExtractTranslation();
+        // Pivot mode: the entity's own origin. Center mode: the AABB centre of the entity + all its
+        // descendants' world positions. Both track the entity as it moves, so a drag (which applies its
+        // delta to WorldPosition, not to `origin`) stays consistent — the gizmo and pivot shift together.
+        Vector3 origin = Pivot == GizmoPivot.Center
+            ? SelectionCenter(entity)
+            : entity.transform.WorldMatrix.ExtractTranslation();
 
         if (!Project(origin, vp, viewMin, viewSize, out SysVec2 originPx))
             return; // behind the camera
@@ -97,7 +127,7 @@ internal sealed class TransformGizmo {
         // Constant on-screen gizmo size: scale the world-space handle length so its projection
         // stays ~Npx regardless of distance (N from EditorPrefs).
         var camPos = camera.Transform.Position;
-        float distance = Math.Max(0.01f, (origin - camPos).Length);
+        float distance = Math.Max(0.01f, (origin - camPos).Length());
         float worldPerPixel = GizmoMath.WorldSizePerPixel(distance, viewSize.Y);
         float handleLength = EditorPrefs.Current.GizmoSize * worldPerPixel;
 
@@ -161,7 +191,8 @@ internal sealed class TransformGizmo {
                     lastMouse = mouse;
                 }
                 else if (activeAxis >= 4) {
-                    dragStartPlaneHit = PointOnAxisPlane(origin, currentAxes[Planes[activeAxis - 4].normal], rayO, rayD);
+                    TryPointOnAxisPlane(origin, currentAxes[Planes[activeAxis - 4].normal], rayO, rayD,
+                        out dragStartPlaneHit);
                 }
                 else if (activeAxis < 3) {
                     dragStartParam = ClosestParamOnAxis(origin, currentAxes[activeAxis], rayO, rayD);
@@ -182,9 +213,13 @@ internal sealed class TransformGizmo {
 
         switch (Mode) {
             case GizmoMode.Translate when activeAxis >= 4: {
-                Vector3 hit = PointOnAxisPlane(dragStartOrigin, currentAxes[Planes[activeAxis - 4].normal], ro, rd);
-                Vector3 pos = dragStartPosition + (hit - dragStartPlaneHit);
-                entity.transform.WorldPosition = SnapHeld ? SnapVector(pos, EditorPrefs.Current.SnapMove) : pos;
+                // Hold position when the ray goes edge-on to the drag plane (no valid hit) instead of
+                // snapping to a zero-delta jump.
+                if (TryPointOnAxisPlane(dragStartOrigin, currentAxes[Planes[activeAxis - 4].normal], ro, rd,
+                        out Vector3 hit)) {
+                    Vector3 pos = dragStartPosition + (hit - dragStartPlaneHit);
+                    entity.transform.WorldPosition = SnapHeld ? SnapVector(pos, EditorPrefs.Current.SnapMove) : pos;
+                }
                 break;
             }
             case GizmoMode.Translate when activeAxis < 3: {
@@ -202,8 +237,8 @@ internal sealed class TransformGizmo {
                 const float sens = 0.01f;
                 Vector3 camUp = camera.Transform.Up;
                 Vector3 camRight = camera.Transform.Right;
-                Quaternion delta = Quaternion.FromAxisAngle(camUp, d.X * sens) *
-                                   Quaternion.FromAxisAngle(camRight, d.Y * sens);
+                Quaternion delta = Quaternion.CreateFromAxisAngle(camUp, d.X * sens) *
+                                   Quaternion.CreateFromAxisAngle(camRight, d.Y * sens);
                 entity.transform.WorldRotation = delta * entity.transform.WorldRotation;
                 break;
             }
@@ -228,7 +263,7 @@ internal sealed class TransformGizmo {
                     angle = MathHelper.DegreesToRadians(
                         Snap(MathHelper.RadiansToDegrees(angle), EditorPrefs.Current.SnapRotate));
 
-                entity.transform.WorldRotation = Quaternion.FromAxisAngle(axis.Normalized(), angle) * dragStartRotation;
+                entity.transform.WorldRotation = Quaternion.CreateFromAxisAngle(axis.Normalized(), angle) * dragStartRotation;
                 break;
             }
             case GizmoMode.Scale: {
@@ -501,13 +536,21 @@ internal sealed class TransformGizmo {
         return (b * e - c * d) / denominator;
     }
 
-    // Vector from the gizmo origin to where the mouse ray hits the axis-perpendicular plane.
-    static Vector3 PointOnAxisPlane(Vector3 planeOrigin, Vector3 axis, Vector3 rayO, Vector3 rayD) {
+    // Vector from the gizmo origin to where the mouse ray hits the axis-perpendicular plane. Returns
+    // false (and a zero offset) when the ray is parallel to the plane (looking edge-on) or the hit is
+    // behind the camera — callers must hold position rather than treat the zero as a real delta, or the
+    // dragged object snaps to the origin the instant the view goes edge-on to the drag plane.
+    static bool TryPointOnAxisPlane(Vector3 planeOrigin, Vector3 axis, Vector3 rayO, Vector3 rayD,
+        out Vector3 offset) {
+        offset = Vector3.Zero;
         float denom = Vector3.Dot(rayD, axis);
         if (Math.Abs(denom) < 1e-6f)
-            return Vector3.Zero;
+            return false;
         float t = Vector3.Dot(planeOrigin - rayO, axis) / denom;
-        return t < 0 ? Vector3.Zero : rayO + rayD * t - planeOrigin;
+        if (t < 0)
+            return false;
+        offset = rayO + rayD * t - planeOrigin;
+        return true;
     }
 
 }

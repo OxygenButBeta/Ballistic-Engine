@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <!-- DirectX 12 + DXR rendering backend (DX12Migration.md). Kept a SEPARATE project — like
+         BallisticEngine.Profiling.Tracy — so the Vortice native dependency never enters the core
+         engine library; only the host exes that choose the DX12 backend reference it. -->
+    <PropertyGroup>
+        <OutputType>Library</OutputType>
+        <TargetFramework>net9.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>disable</Nullable>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="..\BallisticEngine.csproj" />
+      <!-- Vortice.Windows: idiomatic C# DX12 + DXR. Brings Vortice.DXGI / Vortice.Direct3D
+           transitively; Vortice.Dxc compiles HLSL -> DXIL in-process. -->
+      <PackageReference Include="Vortice.Direct3D12" Version="3.8.3" />
+      <PackageReference Include="Vortice.Dxc" Version="3.8.3" />
+    </ItemGroup>
+
+    <!-- HLSL shaders for the DX12 backend (embedded, mirroring OpenGL\Shader\Embedded\*.glsl). -->
+    <ItemGroup>
+      <EmbeddedResource Include="Shaders\**\*.hlsl" />
+    </ItemGroup>
+
+    <!-- FSR upscaler runtime DLLs: the loader dispatches to the upscaler provider (and uses AGS on AMD).
+         They MUST sit next to the exe (the loader resolves the provider by name from its own dir). Copied
+         to this project's output and flowed transitively to the referencing exe. DLLs are gitignored
+         (native/README.md re-fetch script); the copy is Condition'd so a clean checkout without them still
+         builds (FSR just self-disables at runtime). Framegeneration/radiancecache DLLs are NOT copied
+         (unused by upscaling, ~39 MB). -->
+    <ItemGroup Condition="Exists('..\native\fsr\bin\amd_fidelityfx_loader_dx12.dll')">
+      <None Include="..\native\fsr\bin\amd_fidelityfx_loader_dx12.dll;..\native\fsr\bin\amd_fidelityfx_upscaler_dx12.dll;..\native\fsr\bin\amd_ags_x64.dll">
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        <Link>%(Filename)%(Extension)</Link>
+      </None>
+    </ItemGroup>
+
+    <!-- OIDN (Intel Open Image Denoise) runtime DLLs: the API DLL loads core (weights) + a device DLL
+         (CPU fallback + HIP for AMD) + TBB. All must sit next to the exe. Condition'd + flowed transitively
+         like the FSR DLLs. The .exe tools (oidnDenoise/Benchmark/Test) are skipped. -->
+    <ItemGroup Condition="Exists('..\native\oidn\bin\OpenImageDenoise.dll')">
+      <None Include="..\native\oidn\bin\*.dll">
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        <Link>%(Filename)%(Extension)</Link>
+      </None>
+    </ItemGroup>
+
+</Project>

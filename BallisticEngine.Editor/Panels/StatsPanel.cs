@@ -16,6 +16,11 @@ internal sealed class StatsPanel {
         ImGui.SetNextWindowPos(
             new SysVec2(anchorMin.X + anchorSize.X - 10 * scale, anchorMin.Y + topOffset),
             ImGuiCond.Always, new SysVec2(1, 0));   // pivot top-right: grows leftward/downward
+        // Cap the window height to the space below the anchor so it can't spill past the bottom of the
+        // view (it was overflowing onto the asset browser). AlwaysAutoResize still auto-fits width and
+        // height UP TO this cap; past it, the inner content scrolls (see the BeginChild below).
+        float maxH = Math.Max(140 * scale, viewSize.Y - topOffset - 12 * scale);
+        ImGui.SetNextWindowSizeConstraints(new SysVec2(0, 0), new SysVec2(float.MaxValue, maxH));
         ImGui.SetNextWindowBgAlpha(0.88f);
         ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 8f);
         ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new SysVec2(12 * scale, 9 * scale));
@@ -50,6 +55,14 @@ internal sealed class StatsPanel {
             open = false;
         ImGui.PopStyleColor();
 
+        // The stats body in a height-capped, scrollable child so a long list (every GPU pass + scene
+        // counts) scrolls instead of pushing the window off the bottom of the view. Fixed height = the
+        // space below the title; if the content is shorter it just leaves a little room, if longer it
+        // scrolls. Width 0 = fill the auto-sized window.
+        float bodyH = maxH - 38 * scale;
+        ImGui.BeginChild("##statsbody", new SysVec2(300 * scale, bodyH), ImGuiChildFlags.None,
+            ImGuiWindowFlags.NoBackground);
+
         ImGui.SeparatorText("Timing");
         Line("FPS", $"{fps:0}", scale);
         Line("Frame", $"{(fps > 0 ? 1000f / fps : 0):0.00} ms", scale);
@@ -61,6 +74,8 @@ internal sealed class StatsPanel {
             Line("Instanced away", rs.DrawsSavedByInstancing.ToString(), scale);
         Line("Triangles", rs.Triangles.ToString("N0"), scale);
         Line("Renderers", $"{rs.RenderersVisible} drawn / {rs.RenderersCulled} culled / {totalRenderers}", scale);
+        if (rs.SubMeshesCulled > 0)
+            Line("Submeshes culled", rs.SubMeshesCulled.ToString(), scale);
         Line("View", $"{(int)viewSize.X} x {(int)viewSize.Y}", scale);
         if (rs.GpuPasses.Count > 0) {
             ImGui.SeparatorText("GPU");
@@ -70,11 +85,32 @@ internal sealed class StatsPanel {
                     Line(name, $"{ms:0.00} ms", scale);
         }
 
+        // Global Illumination readout — "what is the data / how is it affecting the scene": which GI
+        // systems are live, their strengths, the probe grid + occupancy, and bake progress.
+        ImGui.SeparatorText("Global Illumination");
+        int pGx = ProbeRenderState.ProbeGridX, pGy = ProbeRenderState.ProbeGridY, pGz = ProbeRenderState.ProbeGridZ;
+        int pOcc = ProbeRenderState.ProbeOccupiedCount, pTot = ProbeRenderState.ProbeTotalCount;
+        Line("Light probes",
+            ProbeRenderState.ProbesEnabled ? $"on  x{ProbeRenderState.ProbeIntensity:0.0#}" : "OFF", scale);
+        if (pGx > 0)
+            Line("  probe grid", $"{pGx}x{pGy}x{pGz} = {pGx * pGy * pGz}", scale);
+        if (pTot > 0)
+            Line("  occupied / air", $"{pOcc} / {pTot - pOcc}", scale);
+        if (ProbeRenderState.IsBaking)
+            Line("  baking", $"{ProbeRenderState.BakeProgress * 100:0}%", scale);
+        Line("Reflection probes",
+            ProbeRenderState.ReflectionsEnabled ? $"on  x{ProbeRenderState.ReflectionIntensity:0.0#}" : "OFF", scale);
+        if (ProbeRenderState.ReflectionTotalCount > 0)
+            Line("  local / total", $"{ProbeRenderState.ReflectionCapturedCount} / {ProbeRenderState.ReflectionTotalCount}", scale);
+        Line("Lumen (SDF-GI)",
+            ProbeRenderState.LumenEnabled ? $"on  x{ProbeRenderState.LumenIntensity:0.0#}" : "OFF", scale);
+
         ImGui.SeparatorText("Scene");
         Line("Entities", scene.Entities.Count.ToString(), scale);
         Line("Scene components", scene.SceneBehaviours.Count.ToString(), scale);
         Line("Managed mem", $"{GC.GetTotalMemory(false) / (1024.0 * 1024.0):0.0} MB", scale);
 
+        ImGui.EndChild();
         ImGui.End();
         ImGui.PopStyleColor();
         ImGui.PopStyleVar(2);

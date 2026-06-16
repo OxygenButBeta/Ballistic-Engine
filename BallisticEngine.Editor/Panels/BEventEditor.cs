@@ -122,7 +122,20 @@ internal static class BEventEditor {
         if (ImGui.Button(label, new SysVec2(-1, 0)))
             ImGui.OpenPopup("##targetpick");
 
+        // DRAG-DROP: drop an entity from the Hierarchy straight onto the target button (no need to
+        // open the list and find it). Sets the entity as the target.
+        if (AcceptEntityDrop(out Entity dropped)) {
+            SetTarget(listener, dropped);
+            changed = true;
+        }
+
         if (ImGui.BeginPopup("##targetpick")) {
+            // SEARCH: filter the entity/component list by name (large scenes had no way to find one).
+            if (ImGui.IsWindowAppearing()) { targetSearch = ""; ImGui.SetKeyboardFocusHere(); }
+            ImGui.SetNextItemWidth(240);
+            ImGui.InputTextWithHint("##targetsearch", $"{EditorIcons.Search} Search...", ref targetSearch, 64);
+            ImGui.Separator();
+
             if (ImGui.Selectable("None")) {
                 EditorUndo.Push("Set Event Target");
                 listener.TargetId = Guid.Empty;
@@ -131,26 +144,50 @@ internal static class BEventEditor {
             }
             ImGui.Separator();
 
+            ImGui.BeginChild("##targetlist", new SysVec2(240, 320));
+            bool searching = targetSearch.Length > 0;
+            bool Match(string s) => !searching || s.Contains(targetSearch, StringComparison.OrdinalIgnoreCase);
             foreach (Entity entity in SceneManager.GetCurrentScene().Entities) {
                 ImGui.PushID(entity.InstanceId.GetHashCode());
 
                 // The entity itself as a target (for Entity.SetActive etc.).
-                if (ImGui.Selectable($"{EditorIcons.Package}  {entity.Name}")) {
+                if (Match(entity.Name ?? "") && ImGui.Selectable($"{EditorIcons.Package}  {entity.Name}")) {
                     SetTarget(listener, entity);
                     changed = true;
                 }
-                // Its components, indented.
+                // Its components, indented. Match against "Entity/Component" so a component search hits.
                 foreach (Behaviour behaviour in entity.Behaviours) {
-                    if (ImGui.Selectable($"        {EditorIcons.Wrench}  {Pretty(behaviour.GetType())}##{behaviour.InstanceId}")) {
+                    string comp = Pretty(behaviour.GetType());
+                    if ((Match(comp) || Match($"{entity.Name}/{comp}")) &&
+                        ImGui.Selectable($"        {EditorIcons.Wrench}  {comp}##{behaviour.InstanceId}")) {
                         SetTarget(listener, behaviour);
                         changed = true;
                     }
                 }
                 ImGui.PopID();
             }
+            ImGui.EndChild();
             ImGui.EndPopup();
         }
         return changed;
+    }
+
+    static string targetSearch = "";
+
+    // Accepts a Hierarchy entity-drag payload (int = entity InstanceId hash) onto the current item and
+    // resolves it back to the live entity. Mirrors HierarchyPanel's EntityDragType + hash payload.
+    static unsafe bool AcceptEntityDrop(out Entity entity) {
+        entity = null;
+        if (!ImGui.BeginDragDropTarget())
+            return false;
+        ImGuiPayloadPtr payload = ImGui.AcceptDragDropPayload("BALLISTIC_ENTITY");
+        if (!payload.IsNull && payload.Data != null) {
+            int hash = *(int*)payload.Data;
+            foreach (Entity e in SceneManager.GetCurrentScene().Entities)
+                if (e.InstanceId.GetHashCode() == hash) { entity = e; break; }
+        }
+        ImGui.EndDragDropTarget();
+        return entity is not null;
     }
 
     static void SetTarget(PersistentListener listener, BObject target) {

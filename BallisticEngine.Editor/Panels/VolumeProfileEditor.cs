@@ -1,5 +1,6 @@
 using System.Reflection;
 using BallisticEngine.AssetPipeline.Loaders;
+using BallisticEngine.Editor.Inspector;
 using Hexa.NET.ImGui;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec4 = System.Numerics.Vector4;
@@ -29,6 +30,21 @@ internal static class VolumeProfileEditor {
                 remove = component;
 
             if (open) {
+                // A disabled component contributes NOTHING to the stack (VolumeManager skips it),
+                // even if its parameters are overridden — a common "I changed it and nothing happens"
+                // trap. Warn clearly, and offer a one-click Enable.
+                if (!component.Active && HasOverrides(component)) {
+                    ImGui.PushStyleColor(ImGuiCol.Text, new SysVec4(1f, 0.72f, 0.25f, 1f));
+                    ImGui.TextWrapped($"{EditorIcons.Warning} This override is DISABLED — its parameters have no effect. " +
+                                      "Tick the checkbox by the name to enable it.");
+                    ImGui.PopStyleColor();
+                    if (ImGui.SmallButton("Enable")) {
+                        component.Active = true;
+                        changed = true;
+                    }
+                    ImGui.Spacing();
+                }
+
                 changed |= DrawAllNoneRow(component);
                 changed |= DrawParameters(component);
             }
@@ -42,23 +58,54 @@ internal static class VolumeProfileEditor {
         }
 
         ImGui.Spacing();
-        if (ImGui.Button($"{EditorIcons.Add}  Add Override", new SysVec2(-1, 0)))
+        if (ImGui.Button($"{EditorIcons.Add}  Add Override", new SysVec2(-1, 0))) {
+            addOverrideSearch = "";
             ImGui.OpenPopup("##addoverride");
+        }
 
         if (ImGui.BeginPopup("##addoverride")) {
+            // Search field (Unity's Add Override is searchable). Auto-focus on open; Enter adds the
+            // first match.
+            if (ImGui.IsWindowAppearing())
+                ImGui.SetKeyboardFocusHere();
+            ImGui.SetNextItemWidth(220);
+            ImGui.InputTextWithHint("##search", "Search...", ref addOverrideSearch, 64);
+            bool enter = ImGui.IsItemFocused() && ImGui.IsKeyPressed(ImGuiKey.Enter);
+            ImGui.Separator();
+
+            bool searching = addOverrideSearch.Length > 0;
+            bool any = false;
+            ComponentEntry? firstMatch = null;
+            ImGui.BeginChild("##addlist", new SysVec2(220, 240));
             foreach (ComponentEntry entry in ComponentRegistry.VolumeMenu) {
                 if (profile.Has(entry.Type))
                     continue;
+                if (searching && !entry.DisplayName.Contains(addOverrideSearch, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                any = true;
+                firstMatch ??= entry;
                 if (ImGui.MenuItem(entry.DisplayName)) {
                     profile.Add(entry.Type);
                     changed = true;
+                    ImGui.CloseCurrentPopup();
                 }
+            }
+            if (!any)
+                ImGui.TextDisabled(searching ? "No match." : "All overrides added.");
+            ImGui.EndChild();
+
+            if (enter && firstMatch is { } hit) {
+                profile.Add(hit.Type);
+                changed = true;
+                ImGui.CloseCurrentPopup();
             }
             ImGui.EndPopup();
         }
 
         return changed;
     }
+
+    static string addOverrideSearch = "";
 
     // Writes the profile back to its .volume source. Profile edits are asset edits (like the
     // material editor), so they save immediately and sit outside the scene-snapshot undo.
@@ -89,6 +136,15 @@ internal static class VolumeProfileEditor {
         return changed;
     }
 
+    // True if any parameter is overridden — used to warn when those overrides are inert because the
+    // component itself is disabled.
+    static bool HasOverrides(VolumeComponent component) {
+        foreach (VolumeComponent.ParameterSlot slot in component.Parameters)
+            if (slot.Parameter.Overridden)
+                return true;
+        return false;
+    }
+
     static bool SetAllOverrides(VolumeComponent component, bool overridden) {
         var changed = false;
         foreach (VolumeComponent.ParameterSlot slot in component.Parameters) {
@@ -100,6 +156,13 @@ internal static class VolumeProfileEditor {
         return changed;
     }
 
+    // The shared inspector drawer pipeline (Odin-style): the SAME value drawers + conditional/ordering
+    // attributes the component inspector uses, so the two paths can't drift. ImGuiVolumeGui draws the
+    // per-parameter override checkbox + label and disables the value cell when not overridden;
+    // [ShowIf]/[HideIf] on a parameter field hide its row.
+    static readonly DrawerPipeline pipeline = DrawerPipeline.CreateDefault();
+    static readonly ImGuiVolumeGui volumeGui = new();
+
     static bool DrawParameters(VolumeComponent component) {
         if (!ImGui.BeginTable("##params", 2, ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.PadOuterX))
             return false;
@@ -107,8 +170,12 @@ internal static class VolumeProfileEditor {
         ImGui.TableSetupColumn("value", ImGuiTableColumnFlags.WidthStretch, 0.55f);
 
         var changed = false;
-        foreach (VolumeComponent.ParameterSlot slot in component.Parameters)
-            changed |= DrawParameter(slot);
+        // [PropertyOrder] sorts (stable: default 0 keeps declaration order).
+        foreach (VolumeComponent.ParameterSlot slot in System.Linq.Enumerable.OrderBy(
+                     component.Parameters, s => MemberAttributes.For(s.Field).Order)) {
+            changed |= pipeline.Draw(new VolumeParamProperty(slot, component), volumeGui);
+            changed |= volumeGui.TakeOverrideChanged();   // toggling the override checkbox is also a change
+        }
 
         ImGui.EndTable();
         ImGui.Spacing();
@@ -130,92 +197,8 @@ internal static class VolumeProfileEditor {
             exposure.limitMax.Value = exposure.limitMin.Value;
     }
 
-    static bool DrawParameter(VolumeComponent.ParameterSlot slot) {
-        VolumeParameter parameter = slot.Parameter;
-        var changed = false;
-
-        ImGui.TableNextRow();
-        ImGui.TableSetColumnIndex(0);
-        ImGui.PushID(slot.Name);
-
-        bool overridden = parameter.Overridden;
-        if (ImGui.Checkbox("##override", ref overridden)) {
-            parameter.Overridden = overridden;
-            changed = true;
-        }
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip(overridden ? "Overriding. Click to use the default." : "Click to override this parameter.");
-
-        ImGui.SameLine();
-        ImGui.AlignTextToFramePadding();
-        ImGui.TextDisabled(Prettify(slot.Name));
-        if (slot.Field.GetCustomAttribute<TooltipAttribute>() is { } tooltip && ImGui.IsItemHovered())
-            ImGui.SetTooltip(tooltip.Text);
-
-        ImGui.TableSetColumnIndex(1);
-        ImGui.SetNextItemWidth(-1);
-
-        bool disabled = !parameter.Overridden;
-        if (disabled) ImGui.BeginDisabled();
-
-        // Clamped/Color subtypes first; the base-type cases catch the rest of each family.
-        switch (parameter) {
-            case IEnumParameter e: {
-                var index = e.Index;
-                if (ImGui.Combo("##v", ref index, e.Names, e.Names.Length)) { e.Index = index; changed = true; }
-                break;
-            }
-            case BoolParameter b: {
-                var value = b.Value;
-                if (ImGui.Checkbox("##v", ref value)) { b.Value = value; changed = true; }
-                break;
-            }
-            case ClampedIntParameter ci: {
-                var value = ci.Value;
-                if (ImGui.SliderInt("##v", ref value, ci.Min, ci.Max)) { ci.Value = value; changed = true; }
-                break;
-            }
-            case IntParameter i: {
-                var value = i.Value;
-                if (ImGui.DragInt("##v", ref value)) { i.Value = value; changed = true; }
-                break;
-            }
-            case ClampedFloatParameter cf: {
-                var value = cf.Value;
-                if (ImGui.SliderFloat("##v", ref value, cf.Min, cf.Max)) { cf.Value = value; changed = true; }
-                break;
-            }
-            case FloatParameter f: {
-                var value = f.Value;
-                if (ImGui.DragFloat("##v", ref value, 0.05f)) { f.Value = value; changed = true; }
-                break;
-            }
-            case ColorParameter c: {
-                var value = new System.Numerics.Vector3(c.Value.X, c.Value.Y, c.Value.Z);
-                var flags = c.Hdr ? ImGuiColorEditFlags.Hdr | ImGuiColorEditFlags.Float : ImGuiColorEditFlags.None;
-                if (ImGui.ColorEdit3("##v", ref value, flags)) {
-                    c.Value = new OpenTK.Mathematics.Vector3(value.X, value.Y, value.Z);
-                    changed = true;
-                }
-                break;
-            }
-            case Vector3Parameter v3: {
-                var value = new System.Numerics.Vector3(v3.Value.X, v3.Value.Y, v3.Value.Z);
-                if (ImGui.DragFloat3("##v", ref value, 0.05f)) {
-                    v3.Value = new OpenTK.Mathematics.Vector3(value.X, value.Y, value.Z);
-                    changed = true;
-                }
-                break;
-            }
-            default:
-                ImGui.TextDisabled($"({parameter.GetType().Name})");
-                break;
-        }
-
-        if (disabled) ImGui.EndDisabled();
-        ImGui.PopID();
-        return changed;
-    }
+    // (The per-parameter value switch is gone — DrawParameters now runs every slot through the shared
+    // DrawerPipeline + ImGuiVolumeGui, the same value drawers the component inspector uses.)
 
     // Compact framed header with an Active checkbox overlaid after the arrow (the inline version
     // of InspectorPanel's component header) and a "..." menu button on the right edge. Remove
@@ -274,4 +257,55 @@ internal static class VolumeProfileEditor {
         }
         return result.ToString();
     }
+
+    // ---- In-memory snapshot/restore for undo (bug 2b) ------------------------------------------
+    // A volume profile is a .volume ASSET, not scene data, so the scene-snapshot undo doesn't cover
+    // it. These capture/restore the profile's component set + each parameter's (Overridden, Value) so
+    // an edit can be pushed as a callback undo step. Value is read/written via the parameter's public
+    // `Value` property by reflection (the type is generic VolumeParameter<T>).
+
+    internal sealed class ProfileSnapshot {
+        public List<CompSnap> Components = new();
+        public sealed class CompSnap { public Type Type; public bool Active; public List<ParamSnap> Params = new(); }
+        public sealed class ParamSnap { public string Name; public bool Overridden; public object Value; }
+    }
+
+    public static object Snapshot(VolumeProfile profile) {
+        var snap = new ProfileSnapshot();
+        foreach (VolumeComponent c in profile.Components) {
+            var cs = new ProfileSnapshot.CompSnap { Type = c.GetType(), Active = c.Active };
+            foreach (VolumeComponent.ParameterSlot slot in c.Parameters)
+                cs.Params.Add(new ProfileSnapshot.ParamSnap {
+                    Name = slot.Name,
+                    Overridden = slot.Parameter.Overridden,
+                    Value = ValueProp(slot.Parameter)?.GetValue(slot.Parameter),
+                });
+            snap.Components.Add(cs);
+        }
+        return snap;
+    }
+
+    public static void Restore(VolumeProfile profile, object snapshotObj) {
+        if (snapshotObj is not ProfileSnapshot snap)
+            return;
+        // Remove components no longer in the snapshot; add ones that are missing.
+        foreach (VolumeComponent c in profile.Components.ToArray())
+            if (!snap.Components.Exists(cs => cs.Type == c.GetType()))
+                profile.Remove(c);
+        foreach (ProfileSnapshot.CompSnap cs in snap.Components) {
+            VolumeComponent c = profile.Get(cs.Type) ?? profile.Add(cs.Type);
+            c.Active = cs.Active;
+            foreach (VolumeComponent.ParameterSlot slot in c.Parameters) {
+                ProfileSnapshot.ParamSnap ps = cs.Params.Find(p => p.Name == slot.Name);
+                if (ps is null) continue;
+                slot.Parameter.Overridden = ps.Overridden;
+                System.Reflection.PropertyInfo vp = ValueProp(slot.Parameter);
+                if (vp is not null && vp.CanWrite && ps.Value is not null)
+                    vp.SetValue(slot.Parameter, ps.Value);
+            }
+        }
+    }
+
+    static System.Reflection.PropertyInfo ValueProp(VolumeParameter p) =>
+        p.GetType().GetProperty("Value");
 }

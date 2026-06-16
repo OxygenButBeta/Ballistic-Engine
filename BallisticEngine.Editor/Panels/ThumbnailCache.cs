@@ -1,6 +1,5 @@
 using System.Runtime.InteropServices;
 using BallisticEngine.AssetPipeline;
-using OpenTK.Graphics.OpenGL4;
 
 namespace BallisticEngine.Editor;
 
@@ -14,12 +13,23 @@ internal sealed class ThumbnailCache {
 
     static readonly string[] MeshExtensions = [".fbx", ".obj", ".gltf", ".glb", ".dae"];
 
-    readonly Dictionary<Guid, int> ready = new();
+    // The ImGui texture handle: a GL texture name (GL backend) or a DX12 UiHeap GPU descriptor ptr (DX12).
+    readonly Dictionary<Guid, nint> ready = new();
+    // DX12-only: the backing texture per thumbnail (resource + UiHeap slot) so InvalidateAll can free both.
+    readonly Dictionary<Guid, Dx12EditorPreview.Dx12EditorTexture> dx12Textures = new();
     readonly Queue<(Guid guid, string assetPath)> pending = new();
     readonly HashSet<Guid> queued = new();
 
-    // Returns the GL texture id, or 0 while the thumbnail is still loading (or failed).
-    public int Get(Guid guid, string assetPath) {
+    static bool IsDx12 => RenderBackendSelector.Selected == RenderBackend.Dx12;
+
+    // Returns the ImGui texture handle, or 0 while the thumbnail is still loading (or failed).
+    public nint Get(Guid guid, string assetPath) {
+        // DX12: the thumbnail/material-preview GPU path (Dx12EditorPreview) hangs the GPU (DXGI_ERROR_DEVICE_HUNG)
+        // under load — DISABLED until root-caused (icon-tile fallback, the committed-safe behavior). The preview/
+        // upload code below stays in the tree for the fix. Re-enable by removing this guard once verified safe.
+        if (IsDx12)
+            return 0;
+
         if (ready.TryGetValue(guid, out var texture))
             return texture;
 
@@ -43,11 +53,12 @@ internal sealed class ThumbnailCache {
         }
     }
 
-    // Drops the GL textures and re-queues; the DISK cache stays (staleness is mtime-based,
+    // Drops the GPU textures and re-queues; the DISK cache stays (staleness is mtime-based,
     // so reimported assets regenerate and unchanged ones reload instantly).
     public void InvalidateAll() {
-        foreach (var texture in ready.Values.Where(t => t != 0))
-            GL.DeleteTexture(texture);
+        foreach (var tex in dx12Textures.Values)
+            tex.Dispose();
+        dx12Textures.Clear();
         ready.Clear();
         queued.Clear();
         pending.Clear();
@@ -55,9 +66,25 @@ internal sealed class ThumbnailCache {
 
     static string ThumbnailDirectory => Path.Combine(AssetDatabase.Project.LibraryPath, "Thumbnails");
 
-    int Load(Guid guid, string assetPath) {
-        if (!AssetDatabase.TryGetArtifactPath(guid, out var artifactPath))
+    // Upload the generated RGBA pixels to a DX12 UiHeap texture (tracked for disposal) and return its
+    // ImGui handle (the UiHeap GPU descriptor ptr).
+    nint UploadHandle(Guid guid, byte[] pixels) {
+        var tex = Dx12EditorPreview.UploadTexture(pixels, Size);
+        dx12Textures[guid] = tex;
+        return tex.Handle;
+    }
+
+    nint Load(Guid guid, string assetPath) {
+        // Materials have no Library artifact (.mat is a text asset) — preview straight from the asset
+        // file. Other types render from their imported artifact.
+        bool isMaterial = Path.GetExtension(assetPath).Equals(".mat", StringComparison.OrdinalIgnoreCase);
+        string artifactPath;
+        if (isMaterial) {
+            artifactPath = AssetDatabase.Project.ResolveAbsolute(assetPath);
+        }
+        else if (!AssetDatabase.TryGetArtifactPath(guid, out artifactPath)) {
             return 0;
+        }
 
         var thumbPath = Path.Combine(ThumbnailDirectory, $"{guid:N}.thumb");
 
@@ -73,7 +100,7 @@ internal sealed class ThumbnailCache {
             WriteThumbFile(thumbPath, pixels);
         }
 
-        return UploadTexture(pixels);
+        return UploadHandle(guid, pixels);
     }
 
     static byte[] Generate(string assetPath, string artifactPath) {
@@ -82,6 +109,12 @@ internal sealed class ThumbnailCache {
         if (MeshExtensions.Contains(extension)) {
             MeshData mesh = MeshArtifact.Read(artifactPath);
             return mesh.IsValid ? MeshPreviewRenderer.Render(in mesh, Size) : null;
+        }
+
+        // Material: render the preview sphere from the .mat (artifactPath is the asset file itself).
+        if (extension == ".mat") {
+            var definition = AssetPipeline.PipelineJson.Read<AssetPipeline.Loaders.MaterialDefinition>(artifactPath);
+            return MaterialPreviewRenderer.Render(definition, Size);
         }
 
         TextureData data = TextureArtifact.Read(artifactPath);
@@ -112,18 +145,6 @@ internal sealed class ThumbnailCache {
         writer.Write(Magic);
         writer.Write((ushort)Size);
         writer.Write(pixels);
-    }
-
-    static int UploadTexture(byte[] pixels) {
-        int texture = GL.GenTexture();
-        GL.ActiveTexture(TextureUnit.Texture0);
-        GL.BindTexture(TextureTarget.Texture2D, texture);
-        GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, Size, Size, 0,
-            PixelFormat.Rgba, PixelType.UnsignedByte, pixels);
-        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
-        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
-        GL.BindTexture(TextureTarget.Texture2D, 0);
-        return texture;
     }
 
     static byte[] Downscale(in TextureData data) {

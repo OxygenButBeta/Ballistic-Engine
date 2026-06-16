@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 using SysVec2 = System.Numerics.Vector2;
 
 namespace BallisticEngine.Editor;
@@ -117,9 +116,11 @@ internal static class VertexSnap {
         if (count == 0)
             return false;
 
-        int stride = count > PerMeshBudget ? count / PerMeshBudget : 1;
+        // Ceiling division: floor (count / budget) leaves stride==1 for counts up to 2x the budget,
+        // so a 1.x-over-budget mesh would sample every vertex anyway. Round up to keep samples <= budget.
+        int stride = count > PerMeshBudget ? (count + PerMeshBudget - 1) / PerMeshBudget : 1;
         for (int i = 0; i < count; i += stride) {
-            Vector3 worldVertex = Vector3.TransformPosition(vertices[i], world);
+            Vector3 worldVertex = Vector3.Transform(vertices[i], world);
             if (!GizmoMath.Project(worldVertex, vp, viewMin, viewSize, out SysVec2 pixel))
                 continue;
 

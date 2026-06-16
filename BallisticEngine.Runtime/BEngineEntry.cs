@@ -24,7 +24,14 @@ public sealed class BEngineEntry {
         // BALLISTIC_SCREENSHOT_PAUSED=1 stays in edit mode: no scripts, no physics, the camera
         // exactly as serialized — deterministic frames for agent/CI screenshot comparison
         // (gameplay sim time at a fixed frame number varies run to run, play-mode shots don't diff).
-        bootstrap.LoadStartupScene();
+        // BALLISTIC_SCENE=<project-relative .scene path> loads that scene instead of the startup
+        // scene (agents verify ANY scene without editing project.json; pairs with the screenshot/
+        // idmap harness — bal render uses it for orbit captures via Library/Temp scene copies).
+        string sceneOverride = Environment.GetEnvironmentVariable("BALLISTIC_SCENE");
+        if (string.IsNullOrEmpty(sceneOverride))
+            bootstrap.LoadStartupScene();
+        else
+            SceneManager.SceneLoader!.Invoke(sceneOverride.Replace('\\', '/'));
         if (Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT_PAUSED") != "1") {
             SceneManager.StartPlay();
         }

@@ -1,7 +1,6 @@
 using System.Globalization;
 using System.Reflection;
 using BallisticEngine.AssetPipeline;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.Serialization;
 
@@ -55,6 +54,9 @@ public static class SceneSerializer {
             // Root: drop the external parent so the prefab plants at the world origin on instantiate.
             if (ReferenceEquals(e, root))
                 doc.Transform.Parent = null;
+            // A prefab DEFINITION never stores a prefab link (that would self-reference / nest links).
+            // The instance's link is assigned by PrefabAsset.Instantiate, not baked into the .prefab.
+            doc.PrefabSource = null;
             docs.Add(doc);
         }
         return docs;
@@ -74,6 +76,7 @@ public static class SceneSerializer {
             Entity entity = Entity.Instantiate(entityDoc.Name ?? "Entity", entityDoc.IsActive);
             entity.Tag = string.IsNullOrEmpty(entityDoc.Tag) ? TagManager.Untagged : entityDoc.Tag;
             entity.Layer = entityDoc.Layer;
+            entity.PrefabSource = Guid.TryParseExact(entityDoc.PrefabSource, "N", out Guid pfg) ? pfg : Guid.Empty;
             entity.transform.Position = entityDoc.Transform.Position;
             entity.transform.Rotation = entityDoc.Transform.Rotation;
             entity.transform.Scale = entityDoc.Transform.Scale;
@@ -106,6 +109,7 @@ public static class SceneSerializer {
             // Omit defaults so unauthored entities don't churn the YAML.
             Tag = entity.Tag == TagManager.Untagged ? null : entity.Tag,
             Layer = entity.Layer,
+            PrefabSource = entity.PrefabSource == Guid.Empty ? null : entity.PrefabSource.ToString("N"),
             Transform = new TransformDocument {
                 Position = entity.transform.Position,
                 Rotation = entity.transform.Rotation,
@@ -153,6 +157,15 @@ public static class SceneSerializer {
 
         if (value is BEvent evt)
             return BEventYaml.Serialize(evt);
+
+        // AnimationCurve serializes as a single compact string scalar (sidesteps the nested-list
+        // serializer); DeserializeValue parses it back.
+        if (value is AnimationCurve curve)
+            return curve.ToCompactString();
+
+        // ColorGradient — same compact-string scalar approach as AnimationCurve.
+        if (value is ColorGradient gradient)
+            return gradient.ToCompactString();
 
         if (value is BObject asset) {
             return AssetDatabase.TryGetAssetGuid(asset, out Guid guid)
@@ -207,6 +220,7 @@ public static class SceneSerializer {
             Entity entity = Entity.Instantiate(entityDoc.Name ?? "Entity", entityDoc.IsActive);
             entity.Tag = string.IsNullOrEmpty(entityDoc.Tag) ? TagManager.Untagged : entityDoc.Tag;
             entity.Layer = entityDoc.Layer;
+            entity.PrefabSource = Guid.TryParseExact(entityDoc.PrefabSource, "N", out Guid pfg) ? pfg : Guid.Empty;
             entity.transform.Position = entityDoc.Transform.Position;
             entity.transform.Rotation = entityDoc.Transform.Rotation;
             entity.transform.Scale = entityDoc.Transform.Scale;
@@ -239,6 +253,51 @@ public static class SceneSerializer {
         }
 
         Deserialize(File.ReadAllText(absolutePath));
+    }
+
+    // ---- Targeted (single-entity) capture/restore — for the editor's scoped undo ----------------
+    // The editor's undo can snapshot just ONE entity instead of the whole scene, so undoing a value
+    // edit doesn't tear down + rebuild every scene-wide component (which re-fired IrradianceVolume
+    // bakes, OnAttach side effects, and dropped the selection). These keep the SAME entity instance
+    // (its InstanceId and the editor's selection survive) and never touch other entities or scene
+    // components.
+
+    // Captures one entity (its transform + components) to a document, WITHOUT its descendants and
+    // keeping its real parent ref — so RestoreEntityInPlace can put it back exactly.
+    public static EntityDocument CaptureEntity(Entity entity) =>
+        entity is null ? null : BuildEntityDocument(entity);
+
+    // Restores a captured entity IN PLACE: same Entity object (identity + selection preserved), its
+    // components torn down and rebuilt from the document, transform reapplied. Returns false if the
+    // entity no longer exists (caller falls back to a full-scene restore). Parent is NOT re-wired here
+    // (a reparent is a structural change that uses full-scene undo).
+    public static bool RestoreEntityInPlace(Entity entity, EntityDocument doc) {
+        if (entity is null || doc is null || entity.IsDestroyed)
+            return false;
+
+        SceneManager.SuppressPlayLifecycle = true;
+        try {
+            // Tear down current components (OnDetach unregisters renderers/lights/etc.).
+            foreach (Behaviour behaviour in entity.Behaviours.ToArray())
+                entity.RemoveComponent(behaviour);
+
+            entity.Name = doc.Name ?? entity.Name;
+            entity.Tag = string.IsNullOrEmpty(doc.Tag) ? TagManager.Untagged : doc.Tag;
+            entity.Layer = doc.Layer;
+            entity.PrefabSource = Guid.TryParseExact(doc.PrefabSource, "N", out Guid pfg) ? pfg : Guid.Empty;
+            entity.transform.Position = doc.Transform.Position;
+            entity.transform.Rotation = doc.Transform.Rotation;
+            entity.transform.Scale = doc.Transform.Scale;
+            if (doc.IsActive != entity.IsActive)
+                entity.SetActive(doc.IsActive);
+
+            foreach (ComponentDocument componentDoc in doc.Components)
+                ApplyComponent(entity, componentDoc);
+        }
+        finally {
+            SceneManager.SuppressPlayLifecycle = false;
+        }
+        return true;
     }
 
     static void ApplyComponent(Entity entity, ComponentDocument doc) {
@@ -292,12 +351,35 @@ public static class SceneSerializer {
         if (typeof(BObject).IsAssignableFrom(targetType))
             return raw is string reference ? LoadAsset(reference, targetType) : null;
 
+        // AnimationCurve round-trips through its compact string form.
+        if (targetType == typeof(AnimationCurve))
+            return raw is string curveStr ? AnimationCurve.Parse(curveStr) : null;
+
+        if (targetType == typeof(ColorGradient))
+            return raw is string gradientStr ? ColorGradient.Parse(gradientStr) : null;
+
         // OpenTK types arrive already converted; otherwise coerce the scalar to the member type.
         if (targetType.IsInstanceOfType(raw))
             return raw;
 
+        // Math types nested inside a component's `Members` dict (e.g. PointLight.Color) arrive as a
+        // raw {x,y,z,...} mapping, NOT a typed Vector — the YamlDotNet converters only fire for a
+        // strongly-typed target, and Members is Dictionary<string, object>. Convert the mapping here.
+        // (Without this, every Vector* / Quaternion COMPONENT member silently kept its default.)
+        if (raw is IDictionary<object, object> map) {
+            if (targetType == typeof(Vector2)) return new Vector2(MapF(map, "x"), MapF(map, "y"));
+            if (targetType == typeof(Vector3)) return new Vector3(MapF(map, "x"), MapF(map, "y"), MapF(map, "z"));
+            if (targetType == typeof(Vector4)) return new Vector4(MapF(map, "x"), MapF(map, "y"), MapF(map, "z"), MapF(map, "w"));
+            if (targetType == typeof(Quaternion)) return new Quaternion(MapF(map, "x"), MapF(map, "y"), MapF(map, "z"), MapF(map, "w"));
+        }
+
         return Coerce(raw, targetType);
     }
+
+    // Read a float component from a YAML mapping (values arrive as strings from YamlDotNet).
+    static float MapF(IDictionary<object, object> map, string key) =>
+        map.TryGetValue(key, out object v) && v is not null &&
+        float.TryParse(v.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out float f) ? f : 0f;
 
     static object LoadAsset(string reference, Type targetType) {
         MethodInfo loadRef = typeof(AssetDatabase).GetMethod(nameof(AssetDatabase.LoadRef))!

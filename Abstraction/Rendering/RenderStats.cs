@@ -19,11 +19,25 @@ public sealed class RenderStats {
     public long Triangles;
     public int RenderersVisible;
     public int RenderersCulled;
+    // Submeshes of whole-mesh renderers skipped by per-submesh frustum culling this frame (the big
+    // single-mesh scene win — off-screen parts of one renderer no longer issue draws).
+    public int SubMeshesCulled;
+
+    // Punctual lighting (clustered Forward+): total active point+spot lights gathered this frame
+    // (uncapped — the clustered path loops only each cluster's subset) and how many got a shadow map
+    // (the capped shared resource). Lets an agent measure the Forward+ benefit / shadow budget.
+    public int PunctualLights;
+    public int ShadowedLights;
 
     // GPU time per pass for the last completed frame (milliseconds). Replaced wholesale when
     // a frame's queries drain; GpuFrameMs spans first-to-last pass including gaps between them.
     public readonly List<(string Name, double Ms)> GpuPasses = new();
     public double GpuFrameMs;
+
+    // CPU time spent IN BeginRender (the render-submission cost on the main thread) — the budget that
+    // matters for future CPU-bound systems (anim/networking/physics). GPU pass timers don't capture
+    // this; the editor overlay + the .stats.json sidecar read it so CPU cost is AI-measurable.
+    public double CpuFrameMs;
 
     public void ResetSubmission() {
         DrawCalls = 0;
@@ -33,5 +47,8 @@ public sealed class RenderStats {
         Triangles = 0;
         RenderersVisible = 0;
         RenderersCulled = 0;
+        SubMeshesCulled = 0;
+        PunctualLights = 0;
+        ShadowedLights = 0;
     }
 }

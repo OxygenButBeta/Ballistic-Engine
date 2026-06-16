@@ -91,6 +91,10 @@ public static class ComponentRegistry {
         names[key] = type;
 
         ComponentAttribute attr = type.GetCustomAttribute<ComponentAttribute>();
+        // HideFromAddMenu: keep the name->type mapping (above) so existing scenes still deserialize and
+        // the renderer can resolve it, but DON'T list it in the Add-Component menu — it's automatic now.
+        if (attr is { HideFromAddMenu: true })
+            return;
         entries.Add(new ComponentEntry(
             attr?.DisplayName ?? type.Name,
             attr?.Menu ?? string.Empty,

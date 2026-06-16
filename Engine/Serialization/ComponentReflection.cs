@@ -24,9 +24,16 @@ public static class ComponentReflection {
                 yield return prop;
         }
         foreach (FieldInfo field in type.GetFields(Flags)) {
-            if (!field.IsInitOnly && !field.IsLiteral && !IsFrameworkType(field.DeclaringType) &&
-                field.GetCustomAttribute<NotSerializedAttribute>() is null)
-                yield return field;
+            if (field.IsLiteral || IsFrameworkType(field.DeclaringType) ||
+                field.GetCustomAttribute<NotSerializedAttribute>() is not null)
+                continue;
+            // `readonly` fields are normally skipped (their value can't change), EXCEPT BEvents: they're
+            // declared `public readonly BEvent OnX = new();` and populated IN PLACE (listeners added to
+            // the existing instance, never reassigned), so they must still serialize + show in the
+            // inspector. Without this carve-out a readonly BEvent field is invisible.
+            if (field.IsInitOnly && !typeof(BEvent).IsAssignableFrom(field.FieldType))
+                continue;
+            yield return field;
         }
     }
 
@@ -47,6 +54,28 @@ public static class ComponentReflection {
             if (method.GetParameters().Length == 0 &&
                 !IsFrameworkType(method.DeclaringType) &&
                 method.GetCustomAttribute<ButtonAttribute>() is not null)
+                yield return method;
+        }
+    }
+
+    // Parameterless methods marked [ContextMenu]: the inspector lists each in the component's "..."
+    // context menu and invokes it on click (Unity's [ContextMenu]).
+    public static IEnumerable<MethodInfo> InspectorContextMenus(Type type) {
+        foreach (MethodInfo method in type.GetMethods(Flags)) {
+            if (method.GetParameters().Length == 0 &&
+                !IsFrameworkType(method.DeclaringType) &&
+                method.GetCustomAttribute<ContextMenuAttribute>() is not null)
+                yield return method;
+        }
+    }
+
+    // Parameterless methods marked [EditorWindowExecutionPoint]: the inspector renders a window-open
+    // button that invokes the method and opens a dedicated EditorWindow for the component.
+    public static IEnumerable<MethodInfo> InspectorWindowPoints(Type type) {
+        foreach (MethodInfo method in type.GetMethods(Flags)) {
+            if (method.GetParameters().Length == 0 &&
+                !IsFrameworkType(method.DeclaringType) &&
+                method.GetCustomAttribute<EditorWindowExecutionPointAttribute>() is not null)
                 yield return method;
         }
     }

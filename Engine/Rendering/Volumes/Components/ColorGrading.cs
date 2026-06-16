@@ -20,7 +20,7 @@ public sealed class Vignette : VolumeComponent {
     public readonly ClampedFloatParameter roundness = new(1f, 0f, 1f);
 
     [Tooltip("Colour the edges fade toward (usually black).")]
-    public readonly ColorParameter color = new(OpenTK.Mathematics.Vector3.Zero);
+    public readonly ColorParameter color = new(Vector3.Zero);
 }
 
 public sealed class LensEffects : VolumeComponent {

@@ -48,7 +48,7 @@ internal sealed class HierarchyPanel {
 
         ImGui.SameLine(0, 6);
         ImGui.SetNextItemWidth(-1);
-        ImGui.InputTextWithHint("##hiersearch", $"{EditorIcons.Search} Search...", ref search, 128);
+        ImGui.InputTextWithHint("##hiersearch", $"{EditorIcons.Search} Search (t:Component)...", ref search, 128);
 
         ImGui.Separator();
 
@@ -107,6 +107,9 @@ internal sealed class HierarchyPanel {
                     DuplicateSelected(scene);
                 if (ImGui.IsKeyPressed(ImGuiKey.Delete))
                     DeleteSelected(scene);
+                // Ctrl+Shift+G: wrap the selection in a new parent "Group" (Unity), keeping world poses.
+                if (ImGui.GetIO().KeyCtrl && ImGui.GetIO().KeyShift && ImGui.IsKeyPressed(ImGuiKey.G))
+                    GroupSelected(scene);
             }
         }
     }
@@ -137,9 +140,53 @@ internal sealed class HierarchyPanel {
         state.MarkViewportDirty();
     }
 
+    // Ctrl+Shift+G (Unity's Group): create a new empty "Group" entity at the centre of the selection
+    // and reparent every selected entity under it, KEEPING their world poses. Only top-level selected
+    // entities are grouped (a selected child whose selected ancestor is also grouped moves with it, so
+    // it's skipped) — otherwise reparenting a child onto the group would pull it out of its parent.
+    void GroupSelected(Scene scene) {
+        var targets = state.SelectedEntities.ToArray();
+        if (targets.Length == 0) return;
+
+        // Drop any selected entity that has a selected ANCESTOR — it'll move with that ancestor.
+        var roots = new List<Entity>();
+        foreach (Entity e in targets) {
+            bool hasSelectedAncestor = false;
+            for (Transform t = e.transform.Parent; t is not null; t = t.Parent)
+                if (t.Entity is { } pe && Array.IndexOf(targets, pe) >= 0) { hasSelectedAncestor = true; break; }
+            if (!hasSelectedAncestor) roots.Add(e);
+        }
+        if (roots.Count == 0) return;
+
+        EditorUndo.Push(roots.Count == 1 ? "Group" : $"Group {roots.Count} Entities");
+
+        // Group pivot at the centre of the roots' world positions (Unity-style).
+        Vector3 centre = Vector3.Zero;
+        foreach (Entity e in roots) centre += e.transform.WorldPosition;
+        centre /= roots.Count;
+
+        Entity group = scene.CreateEntity("Group");
+        group.transform.WorldPosition = centre;
+
+        // Reparent under the common parent of the roots if they share one, so the group sits where the
+        // objects were in the hierarchy; otherwise it's a scene root.
+        Transform commonParent = roots[0].transform.Parent;
+        foreach (Entity e in roots)
+            if (!ReferenceEquals(e.transform.Parent, commonParent)) { commonParent = null; break; }
+        if (commonParent is not null)
+            group.transform.SetParentKeepingWorld(commonParent);
+
+        foreach (Entity e in roots)
+            e.transform.SetParentKeepingWorld(group.transform);
+
+        state.Select(group);
+        state.MarkViewportDirty();
+    }
+
     // Captures the entity subtree as a .prefab asset next to the asset browser's current folder, then
-    // refreshes so it appears in the browser. The live entity is left as-is (Unity creates the asset
-    // without converting the scene object into a prefab instance — v1).
+    // refreshes so it appears in the browser AND links the live entity to it (Entity.PrefabSource), so
+    // the scene object becomes a prefab instance (Unity behaviour). The GUID is assigned by the import,
+    // so the link binds in the post-refresh callback (main thread) once TryGetGuid resolves the path.
     void CreatePrefab(Entity entity) {
         if (AssetDatabase.Project is null)
             return;
@@ -149,24 +196,48 @@ internal sealed class HierarchyPanel {
         string dir = AssetDatabase.Project.ResolveAbsolute(folder);
         Directory.CreateDirectory(dir);
 
-        // Avoid clobbering an existing file: Name, Name 1, Name 2, ...
-        string path = Path.Combine(dir, baseName + ".prefab");
-        for (var i = 1; File.Exists(path); i++)
-            path = Path.Combine(dir, $"{baseName} {i}.prefab");
+        // Avoid clobbering an existing file: Name, Name 1, Name 2, ... (relative path drives the link).
+        string relPath = $"{folder}/{baseName}.prefab";
+        string abs = Path.Combine(dir, baseName + ".prefab");
+        for (var i = 1; File.Exists(abs); i++) {
+            relPath = $"{folder}/{baseName} {i}.prefab";
+            abs = Path.Combine(dir, $"{baseName} {i}.prefab");
+        }
 
         try {
-            File.WriteAllText(path, PrefabAsset.FromEntity(entity).ToYaml());
-            AsyncAssetImport.Request("Creating prefab...");
+            File.WriteAllText(abs, PrefabAsset.FromEntity(entity).ToYaml());
+            EditorUndo.Push("Create Prefab");
+            AsyncAssetImport.Request("Creating prefab...", onFinished: () => {
+                if (AssetDatabase.TryGetGuid(relPath, out Guid guid)) {
+                    entity.PrefabSource = guid;
+                    state.MarkViewportDirty();
+                }
+            });
         }
         catch (Exception e) {
             Debugging.LogError($"Could not create prefab: {e.Message}");
         }
     }
 
+    // Unity-style search: "t:ComponentName" filters to entities that HAVE a component whose type name
+    // contains the term (so "t:Light" matches PointLight/SpotLight/DirectionalLight); anything else is
+    // a plain case-insensitive name match. The "t:" term may be empty ("t:") — then any entity with at
+    // least one component matches, which is a handy "show me things with components" filter.
+    bool MatchesSearch(Entity entity) {
+        if (search.StartsWith("t:", StringComparison.OrdinalIgnoreCase)) {
+            string term = search[2..].Trim();
+            foreach (Behaviour b in entity.Behaviours)
+                if (term.Length == 0 || b.GetType().Name.Contains(term, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            return false;
+        }
+        return entity.Name.Contains(search, StringComparison.OrdinalIgnoreCase);
+    }
+
     // Search results as a flat list (hierarchy is meaningless while filtering).
     void DrawFilteredList(Entity[] entities) {
         foreach (Entity entity in entities) {
-            if (!entity.Name.Contains(search, StringComparison.OrdinalIgnoreCase))
+            if (!MatchesSearch(entity))
                 continue;
 
             var id = entity.InstanceId.GetHashCode();
@@ -215,13 +286,22 @@ internal sealed class HierarchyPanel {
         if (selected) flags |= ImGuiTreeNodeFlags.Selected;
         if (children.Count == 0) flags |= ImGuiTreeNodeFlags.Leaf | ImGuiTreeNodeFlags.NoTreePushOnOpen;
 
-        if (!entity.IsActive)
-            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+        // Label colour priority: inactive greys out, then a prefab-instance root tints blue (Unity's
+        // prefab colour), then CHILD entities (anything with a parent) read slightly dimmer than roots
+        // so the hierarchy depth is obvious at a glance.
+        bool isChild = entity.transform.Parent is not null;
+        bool tinted = !entity.IsActive || entity.IsPrefabInstance || isChild;
+        if (tinted) {
+            SysVec4 col = !entity.IsActive ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
+                : entity.IsPrefabInstance ? new SysVec4(0.45f, 0.66f, 1f, 1f)
+                : new SysVec4(0.72f, 0.74f, 0.78f, 1f);   // child: dimmer than a root's white
+            ImGui.PushStyleColor(ImGuiCol.Text, col);
+        }
 
         // Leading spaces leave room for the type icon overlaid after the arrow.
         bool open = ImGui.TreeNodeEx($"     {entity.Name}##{id}", flags);
 
-        if (!entity.IsActive)
+        if (tinted)
             ImGui.PopStyleColor();
 
         // Capture the row rect/hover NOW â€” popups and drag-drop below overwrite "last item" data.
@@ -269,16 +349,43 @@ internal sealed class HierarchyPanel {
                 : new SysVec4(0.45f, 0.47f, 0.52f, 0.6f));
             if (EditorIcons.GhostButtonSmall($"eye{id}", EditorIcons.Eye,
                     entity.IsActive ? "Hide (deactivate)" : "Show (activate)")) {
-                EditorUndo.Push("Toggle Active");
-                entity.SetActive(!entity.IsActive);
+                bool newActive = !entity.IsActive;
+                // If the clicked row is part of the multi-selection, toggle the WHOLE selection to the
+                // same state (Unity-style); otherwise just this one.
+                var batch = selected && state.SelectedEntities.Count > 1
+                    ? state.SelectedEntities.ToArray()
+                    : new[] { entity };
+                EditorUndo.Push(batch.Length > 1 ? $"Toggle Active ({batch.Length})" : "Toggle Active");
+                foreach (Entity e in batch)
+                    if (!e.IsDestroyed) e.SetActive(newActive);
                 state.MarkViewportDirty();
             }
             ImGui.PopStyleColor();
         }
 
         if (open && children.Count > 0) {
-            foreach (Entity child in children)
+            // Tree connector lines (code-editor / Unity style): a vertical guide down the indent gutter
+            // plus a short horizontal "elbow" into each child row. Drawn after the children so we know
+            // their row Ys; the vertical stops at the LAST child's elbow (Unity convention).
+            ImDrawListPtr dl = ImGui.GetWindowDrawList();
+            uint lineCol = ImGui.GetColorU32(new SysVec4(1f, 1f, 1f, 0.16f));
+            float gutterX = rowMin.X + ImGui.GetTreeNodeToLabelSpacing() * 0.5f;
+            float elbowW = ImGui.GetTreeNodeToLabelSpacing() * 0.42f;
+            float halfRow = ImGui.GetFrameHeight() * 0.5f;
+            float lastChildY = rowMin.Y;
+
+            foreach (Entity child in children) {
+                // Capture the child row's top BEFORE drawing it — a child with its own subtree changes
+                // "last item", so derive the elbow Y from the cursor (this child's row top) instead.
+                float childTopY = ImGui.GetCursorScreenPos().Y;
                 DrawEntityNode(scene, child, allEntities);
+                float midY = childTopY + halfRow;
+                dl.AddLine(new SysVec2(gutterX, midY), new SysVec2(gutterX + elbowW, midY), lineCol, 1f);
+                lastChildY = midY;
+            }
+            // Vertical guide from just under this node's row down to the last child's elbow.
+            dl.AddLine(new SysVec2(gutterX, rowMax.Y), new SysVec2(gutterX, lastChildY), lineCol, 1f);
+
             ImGui.TreePop();
         }
     }
@@ -309,8 +416,24 @@ internal sealed class HierarchyPanel {
         string suffix = count > 1 ? $" ({count})" : "";
 
         if (count == 1 && ImGui.MenuItem("Rename", "F2")) BeginRename(entity);
-        if (count == 1 && ImGui.MenuItem($"{EditorIcons.Package}  Create Prefab")) CreatePrefab(entity);
+        if (count == 1 && !entity.IsPrefabInstance &&
+            ImGui.MenuItem($"{EditorIcons.Package}  Create Prefab")) CreatePrefab(entity);
+
+        // Prefab instance actions (Unity's right-click > Prefab submenu): Apply pushes overrides to the
+        // asset, Revert discards them, Select reveals the source .prefab in the browser.
+        if (count == 1 && entity.IsPrefabInstance && ImGui.BeginMenu($"{EditorIcons.Package}  Prefab")) {
+            if (ImGui.MenuItem("Select Asset")) {
+                string p = AssetDatabase.GuidToAssetPath(entity.PrefabSource);
+                if (p is not null) state.RequestRevealAsset(p);
+            }
+            if (ImGui.MenuItem("Apply Overrides")) PrefabInstanceOps.ApplyAll(entity);
+            if (ImGui.MenuItem("Revert Overrides")) { PrefabInstanceOps.RevertAll(entity); state.MarkViewportDirty(); }
+            ImGui.Separator();
+            if (ImGui.MenuItem("Unpack")) { EditorUndo.PushEntity("Unpack Prefab", entity); entity.PrefabSource = Guid.Empty; }
+            ImGui.EndMenu();
+        }
         if (ImGui.MenuItem($"Duplicate{suffix}", "Ctrl+D")) DuplicateSelected(scene);
+        if (ImGui.MenuItem($"Group{suffix}", "Ctrl+Shift+G")) GroupSelected(scene);
         if (entity.transform.Parent is not null && ImGui.MenuItem($"Unparent{suffix}")) {
             EditorUndo.Push("Unparent");
             foreach (Entity e in state.SelectedEntities.ToArray())
@@ -362,6 +485,20 @@ internal sealed class HierarchyPanel {
             state.Select(entity);
     }
 
+    // Drop target for the SCENE VIEW: call inside a BeginDragDropTarget/EndDragDropTarget block over
+    // the viewport image. Accepts the same asset payload the hierarchy does (model → instantiate,
+    // prefab → instantiate, script → entity-with-component), so assets can be dragged straight into the
+    // 3D view instead of only onto the hierarchy/inspector. Returns true if something was instantiated.
+    public bool DropAssetsIntoScene() {
+        Scene scene = SceneManager.GetCurrentScene();
+        if (scene is null || !AcceptAssetDrop(out List<Guid> droppedAssets))
+            return false;
+        InstantiateModels(scene, droppedAssets);
+        InstantiatePrefabs(droppedAssets);
+        CreateEntitiesFromScripts(scene, droppedAssets);
+        return true;
+    }
+
     void CreateEntitiesFromScripts(Scene scene, List<Guid> guids) {
         Entity last = null;
         foreach (Guid guid in guids) {
@@ -370,7 +507,7 @@ internal sealed class HierarchyPanel {
                 continue;
             if (last is null)
                 EditorUndo.Push("Add Script Entity");
-            Entity entity = scene.CreateEntity(type.Name);
+            Entity entity = Spawn(scene, type.Name);
             entity.AddComponent(type);
             last = entity;
         }
@@ -381,7 +518,8 @@ internal sealed class HierarchyPanel {
 
     // Maps a dropped .cs asset to its compiled component by Unity's file-name == class-name rule
     // (the registry only knows Behaviour types, so SceneBehaviours and plain classes resolve null).
-    static Type ScriptComponentType(Guid guid) {
+    // Internal so the Inspector can reuse it for its own script-drop target.
+    internal static Type ScriptComponentType(Guid guid) {
         var path = AssetDatabase.GuidToAssetPath(guid);
         if (path is null || !path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
             return null;
@@ -491,11 +629,21 @@ internal sealed class HierarchyPanel {
         return flat.GetRange(ia, ib - ia + 1);
     }
 
+    // Creates a root entity and drops it at the scene-view spawn point (a short distance in front of
+    // the editor camera, refreshed each frame in EditorApplication) — Unity's create-in-front-of-the-
+    // SceneView, instead of every new object piling up at world origin. Only roots are repositioned;
+    // entities created as children inherit their parent's frame.
+    Entity Spawn(Scene scene, string name) {
+        Entity e = scene.CreateEntity(name);
+        e.transform.Position = state.SceneSpawnPoint;
+        return e;
+    }
+
     // Shared "create" submenu used by the empty-space context menu and the toolbar + button.
     void DrawCreateMenu(Scene scene) {
         if (ImGui.MenuItem("Create Empty")) {
             EditorUndo.Push("Create Empty");
-            state.Select(scene.CreateEntity("Entity"));
+            state.Select(Spawn(scene, "Entity"));
         }
         if (ImGui.BeginMenu($"{EditorIcons.Package} 3D Object")) {
             if (ImGui.MenuItem("Cube")) CreatePrimitive(scene, PrimitiveKind.Cube);
@@ -503,6 +651,8 @@ internal sealed class HierarchyPanel {
             if (ImGui.MenuItem("Plane")) CreatePrimitive(scene, PrimitiveKind.Plane);
             ImGui.EndMenu();
         }
+        if (ImGui.MenuItem($"{EditorIcons.Grid} Terrain"))
+            CreateTerrain(scene);
         if (ImGui.BeginMenu($"{EditorIcons.Lightbulb} Light")) {
             if (ImGui.MenuItem("Directional Light")) CreateWithComponent<DirectionalLight>(scene, "Directional Light");
             if (ImGui.MenuItem("Point Light")) CreateWithComponent<PointLight>(scene, "Point Light");
@@ -511,18 +661,119 @@ internal sealed class HierarchyPanel {
         }
         if (ImGui.MenuItem($"{EditorIcons.Camera} Camera"))
             CreateWithComponent<HDCamera>(scene, "Camera");
+
+        // Audio quick-create (a listener + a source are the common pair).
+        if (ImGui.BeginMenu($"{EditorIcons.Cloud} Audio")) {
+            if (ImGui.MenuItem("Audio Source")) CreateWithComponentNamed(scene, "Audio Source", "AudioSource");
+            if (ImGui.MenuItem("Audio Listener")) CreateWithComponentNamed(scene, "Audio Listener", "AudioListener");
+            ImGui.EndMenu();
+        }
+
+        ImGui.Separator();
+        // Every registered component, grouped by its [Component] Menu category — so an entity with ANY
+        // component (Particle System, Trail/Line Renderer, Spawner, Health, Animator, ...) is one click
+        // away, and new components appear here automatically with no per-item wiring.
+        if (ImGui.BeginMenu($"{EditorIcons.Add} Component")) {
+            DrawComponentCreateMenu(scene);
+            ImGui.EndMenu();
+        }
+    }
+
+    // Builds the "Create > Component" tree from ComponentRegistry.Menu, nesting each entry under its
+    // Menu category ("Effects", "Gameplay", "Physics", ...). Selecting one makes an entity carrying
+    // just that component.
+    void DrawComponentCreateMenu(Scene scene) {
+        // Group by the top-level menu segment (before any '/'); flat entries go to "General".
+        var groups = ComponentRegistry.Menu
+            .GroupBy(e => string.IsNullOrEmpty(e.Menu) ? "General" : e.Menu.Split('/')[0])
+            .OrderBy(g => g.Key, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var group in groups) {
+            if (ImGui.BeginMenu(group.Key)) {
+                foreach (ComponentEntry entry in group.OrderBy(e => e.DisplayName, StringComparer.OrdinalIgnoreCase)) {
+                    if (ImGui.MenuItem(entry.DisplayName)) {
+                        EditorUndo.Push($"Create {entry.DisplayName}");
+                        Entity e = Spawn(scene, entry.DisplayName);
+                        e.AddComponent(entry.Type);
+                        state.Select(e);
+                    }
+                }
+                ImGui.EndMenu();
+            }
+        }
+    }
+
+    // Create an entity with a component resolved by its registry NAME (for components not referenced by
+    // type in this assembly's quick-create entries).
+    void CreateWithComponentNamed(Scene scene, string name, string registryName) {
+        Type type = ComponentRegistry.Resolve(registryName);
+        if (type is null) return;
+        EditorUndo.Push($"Create {name}");
+        Entity entity = Spawn(scene, name);
+        entity.AddComponent(type);
+        state.Select(entity);
     }
 
     void CreateWithComponent<T>(Scene scene, string name) where T : Behaviour {
         EditorUndo.Push($"Create {name}");
-        Entity entity = scene.CreateEntity(name);
+        Entity entity = Spawn(scene, name);
         entity.AddComponent(typeof(T));
         state.Select(entity);
     }
 
     void CreatePrimitive(Scene scene, PrimitiveKind kind) {
         EditorUndo.Push($"Create {kind}");
-        state.Select(Primitives.Create(scene, kind));
+        Entity e = Primitives.Create(scene, kind);
+        if (e is not null) e.transform.Position = state.SceneSpawnPoint;
+        state.Select(e);
+    }
+
+    // Creates a Terrain entity AND its backing assets: a fresh .terrain heightfield next to the asset
+    // browser's current folder, plus a shared checker material in Assets/Default (generated once). Both
+    // assets import asynchronously, then bind onto the component so the terrain shows the checker
+    // immediately. The checker tiles across the terrain so the grid reads at any size.
+    void CreateTerrain(Scene scene) {
+        EditorUndo.Push("Create Terrain");
+        Entity entity = Spawn(scene, "Terrain");
+        var terrain = (Terrain)entity.AddComponent(typeof(Terrain));
+        state.Select(entity);
+
+        string folder = CurrentAssetFolder?.Invoke() ?? "Assets";
+        string dir = AssetDatabase.Project.ResolveAbsolute(folder);
+        Directory.CreateDirectory(dir);
+        string terrainAbs = UniqueAssetPath(Path.Combine(dir, "Terrain.terrain"));
+        File.WriteAllText(terrainAbs,
+            "{\n  \"version\": 1,\n  \"resolution\": 256,\n  \"sizeX\": 100,\n  \"sizeZ\": 100,\n  \"heightScale\": 20\n}\n");
+        string terrainRel = ToProjectRelative(terrainAbs);
+
+        string materialRel = TerrainAssets.EnsureCheckerMaterial();
+
+        AsyncAssetImport.Request("Creating terrain...", onFinished: () => {
+            var asset = AssetDatabase.Load<TerrainAsset>(terrainRel);
+            if (asset is not null) terrain.Terrain3D = asset;
+            if (materialRel is not null) {
+                var mat = AssetDatabase.Load<Material>(materialRel);
+                if (mat is not null) terrain.Material = mat;
+            }
+            state.MarkViewportDirty();
+        });
+    }
+
+    static string UniqueAssetPath(string path) {
+        if (!File.Exists(path)) return path;
+        string dir = Path.GetDirectoryName(path);
+        string name = Path.GetFileNameWithoutExtension(path);
+        string ext = Path.GetExtension(path);
+        for (var i = 1; ; i++) {
+            string candidate = Path.Combine(dir, $"{name} {i}{ext}");
+            if (!File.Exists(candidate)) return candidate;
+        }
+    }
+
+    static string ToProjectRelative(string absolute) {
+        string root = AssetDatabase.Project.ResolveAbsolute("Assets");
+        string assetsRel = "Assets" + absolute[root.Length..];
+        return assetsRel.Replace('\\', '/');
     }
 
     void BeginRename(Entity entity) {

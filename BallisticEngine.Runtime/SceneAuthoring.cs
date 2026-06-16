@@ -1,5 +1,4 @@
 using BallisticEngine.Serialization;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -8,7 +7,9 @@ namespace BallisticEngine;
 // Kept in the Runtime so the player exe can regenerate the sample scene without the editor.
 internal static class SceneAuthoring {
     public static void AuthorMainScene(string projectPath) {
-        GLBallisticEngineWindow runtime = new(1280, 720);
+        // No GPU/window needed — authoring just builds entities and serializes them. The headless host
+        // bootstraps the engine end-to-end (assets load via the null render asset) without a swapchain.
+        HeadlessRuntime runtime = new();
         EngineBootstrap bootstrap = new(runtime, projectPath);
 
         Scene scene = SceneManager.GetCurrentScene();
@@ -39,7 +40,5 @@ internal static class SceneAuthoring {
         var outputPath = bootstrap.Project.ResolveAbsolute("Assets/Scenes/Main.scene");
         SceneSerializer.Save(scene, outputPath);
         Console.WriteLine($"Authored scene: {outputPath}");
-
-        runtime.Close();
     }
 }

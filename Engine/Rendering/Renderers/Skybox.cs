@@ -16,7 +16,7 @@ public class Skybox : SceneBehaviour {
     public float Exposure { get; set; } = 5000f;
 
     // Sky orientation in degrees (Y = spin the horizon).
-    public OpenTK.Mathematics.Vector3 RotationEuler { get; set; }
+    public Vector3 RotationEuler { get; set; }
 
     protected internal override void OnAttach() {
         Active = this;

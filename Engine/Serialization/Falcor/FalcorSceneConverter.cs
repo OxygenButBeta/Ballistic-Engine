@@ -1,6 +1,5 @@
 using BallisticEngine.AssetPipeline;
 using BallisticEngine.Serialization;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -29,7 +28,7 @@ public static class FalcorSceneConverter {
 
         // Orient the camera to look from Position toward Target.
         Vector3 forward = (cam.Target - cam.Position);
-        Quaternion rotation = forward.LengthSquared > 1e-6f
+        Quaternion rotation = forward.LengthSquared() > 1e-6f
             ? LookRotation(forward.Normalized())
             : Quaternion.Identity;
 
@@ -47,7 +46,7 @@ public static class FalcorSceneConverter {
     static void AddLights(SceneDocument doc, FalcorSceneData data) {
         var index = 0;
         foreach (FalcorLight light in data.Lights) {
-            Quaternion rotation = light.Direction.LengthSquared > 1e-6f
+            Quaternion rotation = light.Direction.LengthSquared() > 1e-6f
                 ? LookRotation(light.Direction.Normalized())
                 : Quaternion.Identity;
 
@@ -128,9 +127,9 @@ public static class FalcorSceneConverter {
     // Quaternion that rotates +Z (engine forward) to the given direction.
     static Quaternion LookRotation(Vector3 forward) {
         Vector3 up = Math.Abs(Vector3.Dot(forward, Vector3.UnitY)) > 0.99f ? Vector3.UnitX : Vector3.UnitY;
-        Matrix4 look = Matrix4.LookAt(Vector3.Zero, forward, up);
+        Matrix4 look = BMatrix.LookAt(Vector3.Zero, forward, up);
         // LookAt builds a view matrix (world->view); invert to get the camera's world rotation.
-        look.Invert();
+        look = look.Inverted();
         return look.ExtractRotation();
     }
 

@@ -1,5 +1,3 @@
-using OpenTK.Mathematics;
-using BufferUsageHint = OpenTK.Graphics.OpenGL4.BufferUsageHint;
 
 namespace BallisticEngine;
 
@@ -25,14 +23,37 @@ public class Mesh : BObject
     // instantiates one entity per node so the authored tree survives.
     public readonly MeshNodeData[] Nodes;
 
+    // ---- Skinning (null/default for static meshes) --------------------------
+    // The skeleton these vertices are bound to, and per-vertex influences (CPU copies; the GPU
+    // index/weight buffers are at locations 8/9). IsSkinned gates the skinned render path.
+    public readonly SkeletonData Skeleton;
+    public readonly Vector4i[] BoneIndices;
+    public readonly Vector4[] BoneWeights;
+    public bool IsSkinned { get; }
+    public int BoneCount => Skeleton.BoneCount;
+
     readonly GPUBuffer<Vector3> vertexBuffer;
     readonly GPUBuffer<Vector2> UVBuffer;
     readonly GPUBuffer<Vector3> normalBuffer;
     readonly GPUBuffer<Vector4> tangentBuffer;
+    readonly GPUBuffer<Vector4> boneIndexBuffer;   // skinned only
+    readonly GPUBuffer<Vector4> boneWeightBuffer;  // skinned only
     public readonly InstancedBuffer InstanceBuffer;
 
     readonly GPUBuffer<uint> indexBuffer;
     readonly RenderContext renderContext;
+
+    // Buffer accessors for backends that bind buffers per-draw rather than via a bound VAO. The GL
+    // backend draws off the VAO state set up in Activate() and never touches these; the DX12 backend
+    // casts them to its concrete buffer type to read GPU addresses and build vertex/index buffer views
+    // at draw time. Read-only — the buffers are filled once at construction.
+    public GPUBuffer<Vector3> VertexBuffer => vertexBuffer;
+    public GPUBuffer<Vector3> NormalBuffer => normalBuffer;
+    public GPUBuffer<Vector2> UvBuffer => UVBuffer;
+    public GPUBuffer<Vector4> TangentBuffer => tangentBuffer;
+    public GPUBuffer<uint> IndexBuffer => indexBuffer;
+    public GPUBuffer<Vector4> BoneIndexBuffer => boneIndexBuffer;
+    public GPUBuffer<Vector4> BoneWeightBuffer => boneWeightBuffer;
 
     Mesh(in MeshData data)
     {
@@ -50,6 +71,17 @@ public class Mesh : BObject
         Tangents = data.Tangents;
         UVs = data.UVs;
         Normals = data.Normals;
+
+        // Skinning data: keep CPU copies (the Animator walks the skeleton) and, on a skinned mesh,
+        // create the bone-index/weight vertex buffers into THIS mesh's VAO (locations 8/9).
+        IsSkinned = data.IsSkinned;
+        Skeleton = data.Skeleton;
+        BoneIndices = data.BoneIndices;
+        BoneWeights = data.BoneWeights;
+        if (IsSkinned) {
+            boneIndexBuffer = GraphicAPI.CreateBoneIndexBuffer(renderContext);
+            boneWeightBuffer = GraphicAPI.CreateBoneWeightBuffer(renderContext);
+        }
         SubMeshes = data.SubMeshes is { Length: > 0 }
             ? data.SubMeshes
             : [new SubMeshData(null, 0, data.Indices.Length, null)];
@@ -59,8 +91,8 @@ public class Mesh : BObject
         for (var i = 0; i < SubMeshes.Length; i++) {
             Matrix4 node = SubMeshes[i].NodeTransform;
             // Guard degenerate matrices (default-constructed SubMeshData is all zeros).
-            InverseNodeTransforms[i] = Math.Abs(node.Determinant) > 1e-12f
-                ? Matrix4.Invert(node)
+            InverseNodeTransforms[i] = Math.Abs(node.GetDeterminant()) > 1e-12f
+                ? node.Inverted()
                 : Matrix4.Identity;
         }
 
@@ -91,8 +123,8 @@ public class Mesh : BObject
             var lo = new Vector3(float.MaxValue);
             var hi = new Vector3(float.MinValue);
             foreach (Vector3 v in Vertices) {
-                lo = Vector3.ComponentMin(lo, v);
-                hi = Vector3.ComponentMax(hi, v);
+                lo = Vector3.Min(lo, v);
+                hi = Vector3.Max(hi, v);
             }
             boundsMin = lo;
             boundsMax = hi;
@@ -122,8 +154,8 @@ public class Mesh : BObject
                 int start = SubMeshes[s].IndexStart, end = start + SubMeshes[s].IndexCount;
                 for (var i = start; i < end; i++) {
                     Vector3 v = Vertices[Indices[i]];
-                    lo = Vector3.ComponentMin(lo, v);
-                    hi = Vector3.ComponentMax(hi, v);
+                    lo = Vector3.Min(lo, v);
+                    hi = Vector3.Max(hi, v);
                 }
                 // Degenerate (empty) ranges collapse to a point so they cull away cleanly.
                 subBoundsMin[s] = SubMeshes[s].IndexCount > 0 ? lo : Vector3.Zero;
@@ -148,18 +180,32 @@ public class Mesh : BObject
     void FillBuffers()
     {
         normalBuffer.Create();
-        normalBuffer.SetBufferData(in Normals, BufferUsageHint.StaticDraw);
+        normalBuffer.SetBufferData(in Normals, BufferUsage.StaticDraw);
 
         UVBuffer.Create();
-        UVBuffer.SetBufferData(in UVs, BufferUsageHint.StaticDraw);
+        UVBuffer.SetBufferData(in UVs, BufferUsage.StaticDraw);
 
         indexBuffer.Create();
-        indexBuffer.SetBufferData(in Indices, BufferUsageHint.StaticDraw);
+        indexBuffer.SetBufferData(in Indices, BufferUsage.StaticDraw);
 
         vertexBuffer.Create();
-        vertexBuffer.SetBufferData(in Vertices, BufferUsageHint.StaticDraw);
+        vertexBuffer.SetBufferData(in Vertices, BufferUsage.StaticDraw);
 
         tangentBuffer.Create();
-        tangentBuffer.SetBufferData(in Tangents, BufferUsageHint.StaticDraw);
+        tangentBuffer.SetBufferData(in Tangents, BufferUsage.StaticDraw);
+
+        if (IsSkinned) {
+            // Bone indices upload as floats (location 8); exact for any bone count (< 2^24).
+            var indicesAsFloat = new Vector4[BoneIndices.Length];
+            for (var i = 0; i < BoneIndices.Length; i++) {
+                Vector4i b = BoneIndices[i];
+                indicesAsFloat[i] = new Vector4(b.X, b.Y, b.Z, b.W);
+            }
+            boneIndexBuffer.Create();
+            boneIndexBuffer.SetBufferData(in indicesAsFloat, BufferUsage.StaticDraw);
+
+            boneWeightBuffer.Create();
+            boneWeightBuffer.SetBufferData(in BoneWeights, BufferUsage.StaticDraw);
+        }
     }
 }

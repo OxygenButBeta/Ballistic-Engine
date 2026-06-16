@@ -1,8 +1,7 @@
 using BallisticEngine.Serialization;
 using Hexa.NET.ImGui;
-using OpenTK.Graphics.OpenGL4;
-using OpenTK.Mathematics;
 using OpenTK.Windowing.Common;
+using OpenTK.Windowing.Desktop;
 using Keys = OpenTK.Windowing.GraphicsLibraryFramework.Keys;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec4 = System.Numerics.Vector4;
@@ -19,7 +18,7 @@ internal sealed class EditorApplication {
         ImGuiWindowFlags.NoBringToFrontOnFocus | ImGuiWindowFlags.NoSavedSettings;
 
     readonly IBallisticEngineRuntime runtime;
-    readonly GLBallisticEngineWindow window;
+    readonly GameWindow window;   // the windowed DX12 host (GameWindow + IBallisticEngineRuntime + IWindow)
     readonly EngineBootstrap bootstrap;
     readonly ImGuiController imgui;
     readonly EditorCamera editorCamera = new();
@@ -29,6 +28,11 @@ internal sealed class EditorApplication {
     readonly HierarchyPanel hierarchy;
     readonly InspectorPanel inspector;
     readonly AssetBrowserPanel assets;
+
+    // EXTRA panel instances beyond the primary docked ones: the user can open as many Inspector /
+    // Entities / Assets / Console / Scene-component tabs as they want (Add Tab menu). The primary
+    // panels above stay as fields (lots of code references them); the host owns the duplicates.
+    readonly DockPanelHost extraPanels = new();
     readonly ConsolePanel console = new();
     readonly StatsPanel stats = new();
     readonly SettingsPanel settings;
@@ -48,11 +52,16 @@ internal sealed class EditorApplication {
     bool showInspector = true;
     bool showBottom = true;     // the Assets window
     bool showConsole = true;    // the Console window
-    bool maximizedViewport;     // double-click a view's tab to fill the window; Esc restores
+    // Double-click ANY panel's tab to fill the window with it; Esc restores. null = no panel
+    // maximized. (Was viewport-only; now works for every dockable panel.)
+    string maximizedPanel;
+    float contentAreaTop;   // Y of the dock area's top (just under the toolbar); clamps the tab-strip band
+    bool maximizedViewport => maximizedPanel == EditorLayout.SceneView || maximizedPanel == EditorLayout.GameView;
 
-    bool showStats;
+    bool showStats = Environment.GetEnvironmentVariable("BALLISTIC_STATS") == "1"; // auto-open for agents/CI
     bool alwaysRefresh = EditorPrefs.Current.AlwaysRefresh;   // off = re-render only on change
     int forceFrames = 3;
+    bool wasLoadingScene;   // falling edge -> burst frames so auto-exposure converges after a load
     Matrix4 lastCameraMatrix = Matrix4.Identity;   // previous frame's editor-camera pose (idle-render trigger)
     SysVec2 pickPressPos;        // where LMB went down in the viewport (click-vs-drag test for picking)
     bool pickPressValid;         // the press began as a candidate select-click (not on a gizmo/handle)
@@ -64,7 +73,10 @@ internal sealed class EditorApplication {
 
     // GL texture name -> ImGui texture handle. Hexa's ImGui.Image/ImageButton take an ImTextureID
     // (u64 handle), with no implicit int conversion, so every raw GL texture id routes through here.
-    internal static ImTextureID Tex(int glTextureId) => new((ulong)glTextureId);
+    internal static ImTextureID Tex(RenderHandle handle) => new((ulong)handle.Value);
+    // Overload for the editor's own preview/thumbnail textures: a GL texture name (GL backend) or a DX12
+    // UiHeap GPU descriptor ptr (DX12). nint holds both; the active ImGui backend interprets it.
+    internal static ImTextureID Tex(nint editorTextureHandle) => new((ulong)editorTextureHandle);
 
     SysVec2 sceneViewSize = new(1280, 720);   // render resolution of the Scene offscreen target
     SysVec2 gameViewSize = new(1280, 720);     // render resolution of the Game offscreen target
@@ -81,8 +93,8 @@ internal sealed class EditorApplication {
     // separate dockable windows, "select tab" means focus that window so it surfaces above its dock node.
     string pendingFocusWindow = EditorLayout.SceneView;
 
-    public EditorApplication(GLBallisticEngineWindow window, string projectPath) {
-        runtime = window;
+    public EditorApplication(GameWindow window, string projectPath) {
+        runtime = (IBallisticEngineRuntime)window;
 
         // Record every main-thread zone for the Profiler panel, forwarding to Tracy if
         // Program.cs installed it (BALLISTIC_TRACY=1).
@@ -91,7 +103,7 @@ internal sealed class EditorApplication {
 
         // Defer the (slow) asset import: bring the window up first, then refresh asynchronously behind
         // the busy overlay. The startup scene loads once that first import completes (see OnRender).
-        bootstrap = new EngineBootstrap(window, projectPath, deferAssetRefresh: true);
+        bootstrap = new EngineBootstrap(runtime, projectPath, deferAssetRefresh: true);
 
         // The editor consumes runtime debug lines (Debug.DrawLine/DrawRay) via the gizmo drawer;
         // turning this on makes the engine-side buffer actually record (a shipped player leaves it
@@ -105,6 +117,24 @@ internal sealed class EditorApplication {
         assets = new AssetBrowserPanel(editorState, () => imgui.Scale);
         assets.RequestScriptRebuild = RebuildScripts;
         hierarchy.CurrentAssetFolder = () => assets.CurrentFolder;
+
+        // Register the duplicable panel kinds. The factory makes a FRESH instance (own lock/folder
+        // state); the draw delegate routes to its content method. The primary docked panels (the
+        // fields above) are id-0; the Add Tab menu opens extras through the host.
+        extraPanels.Register(EditorLayout.Inspector, "Inspector", EditorIcons.Wrench,
+            () => new InspectorPanel(editorState), p => ((InspectorPanel)p).DrawContents());
+        extraPanels.Register(EditorLayout.Entities, "Entities", EditorIcons.Package,
+            () => new HierarchyPanel(editorState), p => ((HierarchyPanel)p).DrawEntitiesContents());
+        extraPanels.Register(EditorLayout.SceneComponents, "Scene Components", EditorIcons.World,
+            () => new HierarchyPanel(editorState), p => ((HierarchyPanel)p).DrawSceneContents());
+        extraPanels.Register(EditorLayout.Assets, "Assets", EditorIcons.Folder,
+            () => new AssetBrowserPanel(editorState, () => imgui.Scale), p => ((AssetBrowserPanel)p).DrawContents());
+        extraPanels.Register(EditorLayout.Console, "Console", EditorIcons.Document,
+            () => new ConsolePanel(), p => ((ConsolePanel)p).DrawContents());
+        extraPanels.OnTitleStrip = MaximizePanelOnTitleDoubleClick;
+
+        // Wire the editor-only extra debug views (AO / Lit / Luminance) into the renderer's hook.
+        EditorDebugViews.Install();
         settings = new SettingsPanel(imgui.SetAccent, ApplyFrameRateLimit);
         buildPanel = new BuildPanel(bootstrap.Project);
 
@@ -113,7 +143,14 @@ internal sealed class EditorApplication {
         EditorLayout.SetProject(bootstrap.Project.RootPath);
         EditorLayout.Load();
 
+        // Restore the Scene-view camera to wherever it was last left in this project.
+        editorCamera.RestorePose(EditorPrefs.GetLastCamera(bootstrap.Project.RootPath));
+
         Renderer.PresentToScreen = false;
+
+        // After any asset refresh, propagate .prefab edits into live prefab instances (overrides
+        // preserved). Idempotent: a refresh that didn't change a prefab rebuilds nothing.
+        AsyncAssetImport.AfterRefresh += PrefabPropagation.PropagateAll;
 
         // Files dragged from the OS onto the editor window import into the browser's folder.
         window.FileDrop += e => ImportDroppedFiles(e.FileNames);
@@ -122,16 +159,33 @@ internal sealed class EditorApplication {
         // script) re-checks the sources on the next update tick. The up-to-date fast path in
         // GameScripts makes this a cheap mtime scan when nothing changed.
         window.FocusedChanged += e => {
-            if (e.IsFocused)
+            if (e.IsFocused) {
                 scriptsRecheckPending = true;
+                // Force a full repaint on focus regain. With on-demand rendering the scene view is a
+                // cached offscreen texture; after an alt-tab (or minimise/restore) nothing is dirty,
+                // the camera hasn't moved and forceFrames is 0, so the scene FBO never re-renders and
+                // the whole present can come back BLACK (a stale/lost backbuffer on Windows). Re-arming
+                // forceFrames repaints the scene texture AND the backbuffer for the next few frames.
+                MarkSceneDirty();
+            }
         };
+        // A minimise/restore can also drop the surface without a focus toggle (e.g. restored by
+        // clicking the taskbar while already "focused"); repaint on un-minimise too.
+        window.Minimized += e => {
+            if (!e.IsMinimized)
+                MarkSceneDirty();
+        };
+        // GLFW raises Refresh whenever the OS says the window's contents need redrawing (uncovered,
+        // restored, moved between monitors). This is the canonical "your backbuffer is stale, repaint"
+        // signal — exactly the alt-tab-return case — so honour it directly.
+        window.Refresh += () => MarkSceneDirty();
 
         window.WindowState = WindowState.Maximized;
-        window.OnResizeCallback += (w, h) => {
+        runtime.Window.OnResizeCallback += (w, h) => {
             imgui.WindowResized(w, h);
             sceneW = sceneH = gameW = gameH = 0; // re-sync offscreen targets next frame
         };
-        imgui.WindowResized(window.Width, window.Height);
+        imgui.WindowResized(runtime.Window.Width, runtime.Window.Height);
 
         this.window = window;
         ApplyFrameRateLimit();
@@ -144,6 +198,21 @@ internal sealed class EditorApplication {
 
         runtime.WindowUpdateCallback += OnUpdate;
         runtime.WindowRenderCallback += OnRender;
+
+        // Remote command port (agents/MCP): a named-pipe server whose commands run on the main
+        // thread via RemoteCommandQueue.Pump() in OnRender. Engine-owned thread — survives script
+        // hot-reload and play transitions.
+        RemotePort.Start(editorState, bootstrap);
+
+        // Let the command port frame the Scene-view fly camera (the screenshot captures THAT view,
+        // not an HDCamera entity) — so an agent can position a shot. Runs on the main thread already.
+        RemoteHandlers.FocusCamera = (center, radius, dir) => {
+            if (dir.LengthSquared() > 1e-6f)
+                editorCamera.LookDirection(dir);     // reorient first (e.g. 3/4 top view)
+            editorCamera.Focus(center, radius);
+            forceFrames = Math.Max(forceFrames, 45);  // burst so auto-exposure re-meters for the new view
+        };
+        RemoteHandlers.RequestRefresh = () => AsyncAssetImport.Request("Refreshing assets...", forceAll: true);
     }
 
     // A selection that can survive a scene rebuild: an entity by its (round-tripped) InstanceId, or a
@@ -226,11 +295,18 @@ internal sealed class EditorApplication {
         // cursor is already locked (then it's pinned to the game's centre). A script gates click-to-
         // recapture on this, so clicking the Inspector â€” pointer NOT over the game image â€” never grabs
         // the cursor back. (The standalone player leaves PointerInGameView at its default true.)
-        Input.PointerInGameView = gameViewHovered || window.CursorMode == CursorMode.Locked;
+        Input.PointerInGameView = gameViewHovered || runtime.Window.CursorMode == CursorMode.Locked;
 
         editorInput.NewFrame();
         var allowCameraInput = sceneViewHovered && !imgui.WantTextInput && !AsyncAssetImport.IsBusy;
         editorCamera.Update((float)delta, allowCameraInput, editorInput);
+        MaybeSaveCameraPose((float)delta);
+
+        // Hierarchy/menu "Create" drops new entities here — a short distance ahead of the scene camera
+        // (Unity's create-in-front-of-SceneView), not at world origin. Refreshed every frame so it
+        // tracks the current view.
+        Transform camT = editorCamera.Transform;
+        editorState.SceneSpawnPoint = camT.Position + camT.Forward * 10f;
 
         HandleGlobalShortcuts();
 
@@ -267,6 +343,25 @@ internal sealed class EditorApplication {
     bool startupImportKicked;
     bool scriptsRecheckPending;
 
+    // Persist the Scene-view camera pose periodically so it survives a crash/close without a dedicated
+    // exit hook. Throttled (~1.5s) and only writes when the pose actually changed, to avoid disk churn.
+    float cameraSaveTimer;
+    string lastSavedCameraPose;
+
+    void MaybeSaveCameraPose(float delta) {
+        cameraSaveTimer += delta;
+        if (cameraSaveTimer < 1.5f)
+            return;
+        cameraSaveTimer = 0f;
+
+        string pose = editorCamera.SerializePose();
+        if (pose == lastSavedCameraPose)
+            return;
+        lastSavedCameraPose = pose;
+        EditorPrefs.SetLastCamera(bootstrap.Project.RootPath, pose);
+        EditorPrefs.Save();
+    }
+
     void OnRender(double delta) {
         frameWatch.Restart();
 
@@ -274,12 +369,17 @@ internal sealed class EditorApplication {
         // cache invalidation) before building this frame's UI off the fresh asset database.
         AsyncAssetImport.PumpCompletion();
 
+        // Remote commands (agents/MCP) execute here — on the main thread, before the UI builds,
+        // so a remote edit and a human edit are indistinguishable to the rest of the frame.
+        RemoteCommandQueue.Pump();
+
         // Build the UI FIRST (the gizmo mutates transforms there), then render the scene with
         // this frame's values â€” otherwise the object trails the gizmo by one frame.
         using (Profiler.Zone("Editor.BuildUI")) {
             imgui.Update((float)delta);
             BuildUI();
             BusyOverlay.Draw(S);
+            BusyOverlay.DrawBakeBadge(S); // non-blocking GI-bake indicator (the bake no longer modal-blocks)
         }
 
         // Kick the startup asset import on the first painted frame (not in the constructor), so the
@@ -295,8 +395,7 @@ internal sealed class EditorApplication {
         // Skip the scene render while a deferred open is pending â€” the scene is about to be replaced.
         // A probe bake counts as "changing": its time-sliced job only advances inside the scene
         // render, so without this it crawls one slice per click instead of one per frame.
-        var probeBakePending = IrradianceVolume.IsBaking ||
-                               IrradianceVolume.Active is { IsActive: true, Bake: true };
+        var probeBakePending = ProbeRenderState.IsBaking;
         // A panel edit that changes the scene's appearance (light toggle, entity disable, component
         // value, add/remove component) flags the viewport dirty; pick that up here so the on-demand
         // renderer paints the change instead of leaving the previous frame frozen. IsAnyItemActive
@@ -313,9 +412,21 @@ internal sealed class EditorApplication {
             lastCameraMatrix = camMatrix;
             MarkSceneDirty();
         }
+        // Just-finished scene load: paint a burst of frames so AUTO-EXPOSURE can converge. Its meter
+        // is an async GPU readback (several frames latency) that snaps on the first target — without a
+        // burst the on-demand renderer would stop after a few frames and the scene stays at the stale
+        // EV (pitch black for a dim/interior/imported scene). Falling edge of IsLoading.
+        if (wasLoadingScene && !SceneCommands.IsLoading)
+            forceFrames = Math.Max(forceFrames, 45);
+        wasLoadingScene = SceneCommands.IsLoading;
+
+        // A live game UIDocument animates per frame (tweens, pulses, loading), so the Game view must
+        // keep repainting while one is active — otherwise on-demand rendering freezes the UI after the
+        // initial forceFrames run out (it builds in the controller's OnAttach but never draws again).
+        bool activeGameUI = !sceneTabActive && BallisticEngine.UI.UIDocument.Active.Count > 0;
         var renderScene = !SceneCommands.IsLoading &&
                           (alwaysRefresh || SceneManager.IsPlaying || editorInput.RightMouseDown ||
-                           gizmo.IsInteracting || forceFrames > 0 || probeBakePending);
+                           gizmo.IsInteracting || forceFrames > 0 || probeBakePending || activeGameUI);
         if (renderScene) {
             using var profileZone = Profiler.Zone("Editor.SceneRender");
             if (sceneTabActive)
@@ -331,10 +442,8 @@ internal sealed class EditorApplication {
         if (SceneManager.IsPlaying)
             Coroutine.EndOfFramePump();
 
-        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
-        GL.ClearColor(0.05f, 0.05f, 0.06f, 1f);
-        GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
-
+        // The DX12 host already cleared the swapchain backbuffer in Dx12BallisticEngineWindow.OnRenderFrame
+        // (before this callback), so there's nothing to clear here.
         using (Profiler.Zone("Editor.ImGuiRender"))
             imgui.Render();
 
@@ -349,6 +458,40 @@ internal sealed class EditorApplication {
 
         // Exponential moving average so the value is readable.
         editorCpuMs = editorCpuMs * 0.9f + (float)frameWatch.Elapsed.TotalMilliseconds * 0.1f;
+
+        // IDLE THROTTLE: when nothing is happening — not playing, no scene render, no mouse/keyboard
+        // activity, no open popup — there's no point spinning ImGui at hundreds of FPS (wasted CPU/GPU/
+        // battery for an identical frame). Drop to a low idle cap; snap back to full the instant the
+        // user does anything. Skipped when the user picked an explicit FPS cap below the idle rate.
+        UpdateIdleThrottle(renderScene, delta);
+    }
+
+    // ---- Idle frame throttle -------------------------------------------------
+    const int IdleFps = 30;          // frame cap while the editor is idle
+    double idleSeconds;              // time since the last activity (0 = active)
+
+    void UpdateIdleThrottle(bool renderedScene, double delta) {
+        ImGuiIOPtr io = ImGui.GetIO();
+        bool active = renderedScene || SceneManager.IsPlaying ||
+                      io.WantTextInput ||                         // typing in a field
+                      io.MouseDown[0] || io.MouseDown[1] || io.MouseDown[2] || // any mouse button held
+                      Math.Abs(io.MouseDelta.X) > 0.1f || Math.Abs(io.MouseDelta.Y) > 0.1f || // mouse moving
+                      io.MouseWheel != 0f ||                      // scrolling
+                      ImGui.IsAnyItemActive() ||                  // dragging a slider, etc.
+                      ImGui.IsPopupOpen("", ImGuiPopupFlags.AnyPopupId | ImGuiPopupFlags.AnyPopupLevel);
+
+        idleSeconds = active ? 0 : idleSeconds + delta;
+
+        // A short grace period after activity keeps interactions smooth (tooltips, hover fades) before
+        // dropping to the idle cap. The user's explicit cap still wins if it's already lower.
+        int userCap = EditorPrefs.Current.FrameRateLimit;
+        bool throttle = idleSeconds > 0.4 && (userCap <= 0 || userCap > IdleFps);
+        double targetFreq = throttle ? IdleFps : (userCap <= 0 ? 0 : userCap);
+        if (Math.Abs(window.UpdateFrequency - targetFreq) > 0.5) {
+            window.UpdateFrequency = targetFreq;
+            // The DX12 host has no GL context (window.VSync would NRE); it presents vsync'd and the
+            // UpdateFrequency cap paces it, so there's no VSync mode to toggle here.
+        }
     }
 
     void MarkSceneDirty() => forceFrames = 3;
@@ -358,11 +501,9 @@ internal sealed class EditorApplication {
     public void ApplyFrameRateLimit() {
         int limit = EditorPrefs.Current.FrameRateLimit;
         if (limit <= 0) {
-            window.VSync = OpenTK.Windowing.Common.VSyncMode.Adaptive;
-            window.UpdateFrequency = 0;   // uncapped; VSync paces it
+            window.UpdateFrequency = 0;   // uncapped; the DX12 swapchain presents vsync'd, which paces it
         }
         else {
-            window.VSync = OpenTK.Windowing.Common.VSyncMode.Off;
             window.UpdateFrequency = limit;
         }
     }
@@ -375,6 +516,10 @@ internal sealed class EditorApplication {
 
         Renderer.ActiveTarget = HDRenderer.RenderTarget.Scene;
         Renderer.BeginRender(new RendererArgs(editorCamera));
+        // Publish the coarse depth grid for gizmo depth-occlusion while the Scene depth is still intact
+        // (gizmos drawn later this frame dim when behind geometry). Cheap GPU-downscaled readback.
+        GizmoDepthOcclusion.Enabled = EditorPrefs.Current.ShowGizmos;
+        Renderer.ReadSceneDepthGrid();
         Renderer.PostRenderCleanUp();
     }
 
@@ -420,8 +565,14 @@ internal sealed class EditorApplication {
     void BuildUI() {
         ImGuiIOPtr io = ImGui.GetIO();
 
-        if (maximizedViewport && ImGui.IsKeyPressed(ImGuiKey.Escape))
-            maximizedViewport = false;
+        if (maximizedPanel is not null && ImGui.IsKeyPressed(ImGuiKey.Escape))
+            maximizedPanel = null;
+
+        // Drop a stale fullscreen target: if the maximized panel was closed (its Window-menu toggle
+        // turned off, or its duplicated instance closed), don't keep drawing it fullscreen forever —
+        // fall back to the normal docked layout this frame.
+        if (maximizedPanel is not null && !MaximizedPanelStillAvailable(maximizedPanel))
+            maximizedPanel = null;
 
         // Any interaction is a "scene might have changed" signal for the always-refresh-off mode.
         if (ImGui.IsMouseClicked(ImGuiMouseButton.Left) || ImGui.IsMouseClicked(ImGuiMouseButton.Right) ||
@@ -435,14 +586,35 @@ internal sealed class EditorApplication {
         SysVec2 workPos = vp.WorkPos;
         SysVec2 workSize = vp.WorkSize;
 
-        // Fullscreen view: only the toolbar (for Play/Stop) + the viewport, nothing else (no docking).
-        if (maximizedViewport) {
+        // Fullscreen: only the toolbar (for Play/Stop) + the maximized panel, nothing else (no docking).
+        if (maximizedPanel is not null) {
             Panel("##toolbar", workPos, new SysVec2(workSize.X, toolbarH),
                 PanelFlags | ImGuiWindowFlags.NoTitleBar, ToolbarUI);
-            DrawMaximizedViewport(workPos + new SysVec2(0, toolbarH), new SysVec2(workSize.X, workSize.Y - toolbarH));
+            SysVec2 maxPos = workPos + new SysVec2(0, toolbarH);
+            SysVec2 maxSize = new(workSize.X, workSize.Y - toolbarH);
+            // Keep the tab-strip band clamp valid while maximized too (this block returns before the
+            // normal-path assignment runs) — else the clamp used a stale value and a maximized panel's
+            // title double-click to restore stopped working.
+            contentAreaTop = maxPos.Y;
+            if (maximizedViewport)
+                DrawMaximizedViewport(maxPos, maxSize);
+            else
+                DrawMaximizedPanel(maximizedPanel, maxPos, maxSize);
+
+            // Exit-fullscreen button just under the toolbar (so it's not Esc-only). A small floating
+            // overlay window above everything; clicking restores the docked layout.
+            DrawExitFullscreenButton(workPos, workSize, toolbarH);
+
+            // Floating tool windows stay available while a panel is fullscreen — keep this list in sync
+            // with the normal-path block below (both must draw EVERY floating window or it vanishes in
+            // one mode). tagsLayers was previously missing here, so Tags & Layers disappeared in fullscreen.
             settings.Draw(S);
+            tagsLayers.Draw(S);
             profilerPanel.Draw(profiler, S);
             buildPanel.Draw(S);
+            CurveEditorWindow.Draw(S);
+            ComponentEditorWindow.Draw(S);
+            UnityImportWindow.Draw(S);
             DrawUnsavedPrompt();
             return;
         }
@@ -454,6 +626,7 @@ internal sealed class EditorApplication {
         // Full-window host window owning the central DockSpace. Transparent + chromeless so the docked
         // panels read as the whole editor; sits below the toolbar strip.
         SysVec2 hostPos = workPos + new SysVec2(0, toolbarH);
+        contentAreaTop = hostPos.Y;   // the tab-strip band must not reach above this (into the toolbar)
         SysVec2 hostSize = new(workSize.X, workSize.Y - toolbarH);
         ImGui.SetNextWindowPos(hostPos);
         ImGui.SetNextWindowSize(hostSize);
@@ -486,25 +659,19 @@ internal sealed class EditorApplication {
         // Dockable panels — normal windows ImGui places into the dock tree. The Window-menu bools
         // double as each window's close-button state (passed by ref to Begin). Entities and Scene-
         // components are now separate dockable windows (were inner Hierarchy tabs).
-        if (showHierarchy && ImGui.Begin(EditorLayout.Entities, ref showHierarchy))
-            hierarchy.DrawEntitiesContents();
-        if (showHierarchy) ImGui.End();
+        // IMPORTANT: once Begin() is called it MUST be paired with End(), even if Begin returns false
+        // (collapsed) OR the close button set show=false this frame. The old "if (show) End()" dropped
+        // the End() when the X was clicked (Begin already drew the content + opened a BeginChild that
+        // frame), leaving "Missing EndChild()" and corrupting all ImGui state. DrawDockPanel handles it.
+        if (showHierarchy) DrawDockPanel(EditorLayout.Entities, ref showHierarchy, hierarchy.DrawEntitiesContents);
+        if (showSceneComponents) DrawDockPanel(EditorLayout.SceneComponents, ref showSceneComponents, hierarchy.DrawSceneContents);
+        if (showInspector) DrawDockPanel(EditorLayout.Inspector, ref showInspector, inspector.DrawContents);
 
-        if (showSceneComponents && ImGui.Begin(EditorLayout.SceneComponents, ref showSceneComponents))
-            hierarchy.DrawSceneContents();
-        if (showSceneComponents) ImGui.End();
+        // Extra (duplicated) panel instances opened from the Add Tab menu.
+        extraPanels.DrawAll();
 
-        if (showInspector && ImGui.Begin(EditorLayout.Inspector, ref showInspector))
-            inspector.DrawContents();
-        if (showInspector) ImGui.End();
-
-        if (showBottom && ImGui.Begin(EditorLayout.Assets, ref showBottom))
-            assets.DrawContents();
-        if (showBottom) ImGui.End();
-
-        if (showConsole && ImGui.Begin(EditorLayout.Console, ref showConsole))
-            console.DrawContents();
-        if (showConsole) ImGui.End();
+        if (showBottom) DrawDockPanel(EditorLayout.Assets, ref showBottom, assets.DrawContents);
+        if (showConsole) DrawDockPanel(EditorLayout.Console, ref showConsole, console.DrawContents);
 
         // Scene + Game are separate dockable windows (were inner viewport tabs).
         DrawViewportWindows();
@@ -513,6 +680,9 @@ internal sealed class EditorApplication {
         tagsLayers.Draw(S);
         profilerPanel.Draw(profiler, S);
         buildPanel.Draw(S);
+        CurveEditorWindow.Draw(S);
+        ComponentEditorWindow.Draw(S);   // standalone component window — was only drawn while fullscreen
+        UnityImportWindow.Draw(S);
         DrawUnsavedPrompt();
 
         // Persist the layout whenever ImGui says it changed (drag/dock/resize/tab).
@@ -536,7 +706,7 @@ internal sealed class EditorApplication {
 
         if (ImGui.BeginMenu("File")) {
             if (ImGui.MenuItem($"{EditorIcons.Add}  New Scene", "Ctrl+N")) GuardUnsaved(SceneCommands.New);
-            if (ImGui.MenuItem($"{EditorIcons.Save}  Save", "Ctrl+S")) SaveScene();
+            if (ImGui.MenuItem($"{EditorIcons.Save}  Save", "Ctrl+S", false, !SceneManager.IsPlaying)) SaveScene();
             ImGui.Separator();
             if (ImGui.MenuItem($"{EditorIcons.Refresh}  Rebuild Scripts", "Ctrl+R")) RebuildScripts();
             ImGui.Separator();
@@ -557,12 +727,30 @@ internal sealed class EditorApplication {
             ImGui.EndMenu();
         }
 
+        if (ImGui.BeginMenu("Assets")) {
+            if (ImGui.MenuItem($"{EditorIcons.Refresh}  Refresh", "Ctrl+R")) RebuildScripts();
+            ImGui.Separator();
+            if (ImGui.MenuItem($"{EditorIcons.Package}  Import Unity Package...")) UnityImportWindow.Open();
+            ImGui.EndMenu();
+        }
+
         if (ImGui.BeginMenu("Window")) {
             ImGui.MenuItem("Entities", (string)null, ref showHierarchy);
             ImGui.MenuItem("Scene Components", (string)null, ref showSceneComponents);
             ImGui.MenuItem("Inspector", (string)null, ref showInspector);
             ImGui.MenuItem("Assets", (string)null, ref showBottom);
             ImGui.MenuItem("Console", (string)null, ref showConsole);
+
+            // Open ANOTHER instance of a panel (unlimited) — same as the tab's Add Tab menu.
+            if (ImGui.BeginMenu($"{EditorIcons.Add}  Add Panel")) {
+                AddTabItem(EditorLayout.Inspector, "Inspector", ref showInspector);
+                AddTabItem(EditorLayout.Entities, "Entities", ref showHierarchy);
+                AddTabItem(EditorLayout.SceneComponents, "Scene Components", ref showSceneComponents);
+                AddTabItem(EditorLayout.Assets, "Assets", ref showBottom);
+                AddTabItem(EditorLayout.Console, "Console", ref showConsole);
+                ImGui.EndMenu();
+            }
+            ImGui.Separator();
             ImGui.MenuItem("Statistics", (string)null, ref showStats);
             ImGui.MenuItem("Profiler", (string)null, ref profilerPanel.Open);
             ImGui.MenuItem("Build", (string)null, ref buildPanel.Open);
@@ -670,8 +858,10 @@ internal sealed class EditorApplication {
             ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(accent.X, accent.Y, accent.Z, 0.55f));
             ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(accent.X, accent.Y, accent.Z, 0.75f));
             if (ImGui.Button($"{EditorIcons.Save}  Save", new SysVec2(110 * S, 0))) {
-                SaveScene();
-                RunPending();
+                // Only proceed if the save actually succeeded — otherwise (e.g. blocked in play mode, or
+                // no scene path) we'd silently discard the unsaved changes the prompt is protecting.
+                if (SceneCommands.Save())
+                    RunPending();
             }
             ImGui.PopStyleColor(2);
             ImGui.SameLine();
@@ -812,8 +1002,13 @@ internal sealed class EditorApplication {
         ToggleIconButton("alwaysrefresh", EditorIcons.Refresh, ref alwaysRefresh,
             "Always refresh the viewport (off = re-render only on change)");
         ImGui.SameLine(0, 2);
-        if (EditorIcons.GhostButton("save", EditorIcons.Save, "Save scene (Ctrl+S)"))
+        // Save is disabled in play mode — the live scene is play-mutated and would clobber the edit
+        // scene on disk (SceneCommands.Save also guards this).
+        ImGui.BeginDisabled(SceneManager.IsPlaying);
+        if (EditorIcons.GhostButton("save", EditorIcons.Save,
+                SceneManager.IsPlaying ? "Stop play to save" : "Save scene (Ctrl+S)"))
             SaveScene();
+        ImGui.EndDisabled();
     }
 
     // FPS readout doubling as the frame-rate limiter: click to pick a preset (same options as
@@ -841,6 +1036,16 @@ internal sealed class EditorApplication {
                 ApplyFrameRateLimit();
                 EditorPrefs.Save();
             }
+        }
+        // Custom limit (item 13): type any value; 0 = unlimited. Enter applies.
+        ImGui.Separator();
+        ImGui.TextDisabled("Custom (0 = unlimited):");
+        ImGui.SetNextItemWidth(120);
+        int custom = limit;
+        if (ImGui.InputInt("##customfps", ref custom, 5, 30, ImGuiInputTextFlags.EnterReturnsTrue)) {
+            EditorPrefs.Current.FrameRateLimit = Math.Max(0, custom);
+            ApplyFrameRateLimit();
+            EditorPrefs.Save();
         }
         ImGui.EndPopup();
     }
@@ -874,6 +1079,16 @@ internal sealed class EditorApplication {
         GizmoModeButton("Rotate", GizmoMode.Rotate, bw, "Rotate (E)");
         ImGui.SameLine(0, 2);
         GizmoModeButton("Scale", GizmoMode.Scale, bw, "Scale (R)");
+
+        // Pivot / Center toggle as a plain labelled button on the LEFT (no icon), next to the gizmo
+        // mode buttons — the user wanted it here, not as a right-side icon in the viewport bar.
+        ImGui.SameLine(0, 10 * S);
+        bool isPivot = gizmo.Pivot == GizmoPivot.Pivot;
+        if (ImGui.Button(isPivot ? "Pivot" : "Center", new SysVec2(bw * 1.3f, h)))
+            gizmo.Pivot = isPivot ? GizmoPivot.Center : GizmoPivot.Pivot;
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(isPivot ? "Handle at the entity's pivot (click for Center)"
+                                     : "Handle at the selection's center (click for Pivot)");
     }
 
     // ---- Viewport (Scene / Game tabs) ----------------------------------------
@@ -887,6 +1102,34 @@ internal sealed class EditorApplication {
         ImGui.SetNextItemWidth(140 * S);
         ImGui.Combo($"##res{id}", ref res.PresetIndex,
             ViewportResolution.PresetLabels, ViewportResolution.PresetLabels.Length);
+
+        // Custom resolution: two editable int fields shown only when "Custom..." is selected.
+        if (res.IsCustom) {
+            ImGui.SameLine(0, 6 * S);
+            ImGui.SetNextItemWidth(60 * S);
+            ImGui.InputInt($"##cw{id}", ref res.CustomW, 0, 0);
+            ImGui.SameLine(0, 2);
+            ImGui.TextDisabled("x");
+            ImGui.SameLine(0, 2);
+            ImGui.SetNextItemWidth(60 * S);
+            ImGui.InputInt($"##ch{id}", ref res.CustomH, 0, 0);
+            res.CustomW = Math.Clamp(res.CustomW, 1, 16384);
+            res.CustomH = Math.Clamp(res.CustomH, 1, 16384);
+        }
+        else if (res.IsCustomAspect) {
+            // Custom aspect: two small int fields for the ratio (e.g. 21 : 9). Fills the panel,
+            // letterboxed to this ratio, no fixed pixel count.
+            ImGui.SameLine(0, 6 * S);
+            ImGui.SetNextItemWidth(46 * S);
+            ImGui.InputInt($"##aw{id}", ref res.AspectW, 0, 0);
+            ImGui.SameLine(0, 2);
+            ImGui.TextDisabled(":");
+            ImGui.SameLine(0, 2);
+            ImGui.SetNextItemWidth(46 * S);
+            ImGui.InputInt($"##ah{id}", ref res.AspectH, 0, 0);
+            res.AspectW = Math.Clamp(res.AspectW, 1, 256);
+            res.AspectH = Math.Clamp(res.AspectH, 1, 256);
+        }
 
         ImGui.SameLine(0, 16 * S);
         ImGui.TextDisabled($"{EditorIcons.Search}");
@@ -905,20 +1148,77 @@ internal sealed class EditorApplication {
         float right = ImGui.GetWindowWidth() - 14 * S;
         void RightAlign(float w) { right -= w; ImGui.SameLine(right); right -= 6 * S; }
 
+        // FIXED-WIDTH reservations for the resolution text and the FPS button: their digit counts
+        // change every frame (1920x1080 vs 800x600, 500 fps vs 60 fps), so measuring the live string
+        // made every control to their LEFT jump around. Reserve the widest case once.
         SysVec2 rs = id == "scene" ? sceneViewSize : gameViewSize;
         var resText = $"{(int)rs.X} x {(int)rs.Y}";
-        RightAlign(ImGui.CalcTextSize(resText).X);
+        float resW = ImGui.CalcTextSize("8888 x 8888").X;
+        RightAlign(resW);
         ImGui.AlignTextToFramePadding();
         ImGui.TextDisabled(resText);
 
         var fpsLabel = $"{runtime.Window.FrameRate:0} fps {EditorIcons.ChevronDown}";
-        RightAlign(ImGui.CalcTextSize(fpsLabel).X + pad2);
+        float fpsW = ImGui.CalcTextSize($"8888 fps {EditorIcons.ChevronDown}").X + pad2;
+        RightAlign(fpsW);
         DrawFpsButton(fpsLabel);
 
         // Stats overlay toggle, Unity's Game-view "Stats" button style (the overlay's X also closes it).
         var statsLabel = $"{EditorIcons.Info} Stats";
         RightAlign(ImGui.CalcTextSize(statsLabel).X + pad2);
         ToggleIconButton($"statsbar{id}", statsLabel, ref showStats, "Statistics overlay");
+
+        // (The maximize BUTTON was removed — double-click any panel's tab to fullscreen it, Esc to
+        // restore. Works for every panel now, so a dedicated viewport button is redundant.)
+
+        // Shading-mode dropdown: the engine's Shaded / Wireframe / Normals / Depth PLUS the editor-only
+        // extra views (AO / Lit / Luminance) that live in EditorDebugViews (never in a player build).
+        // In both the Scene and Game bars; per-view popup id so they don't collide.
+        {
+            var engineNames = new[] { "Shaded", "Wireframe", "Normals", "Depth" };
+            int extra = HDRenderer.EditorExtraDebugMode;
+            string current = extra != 0
+                ? Array.Find(EditorDebugViews.Modes, m => m.mode == extra).label
+                : engineNames[(int)Renderer.DebugViewMode];
+            var modeLabel = $"{current} {EditorIcons.ChevronDown}";
+            RightAlign(ImGui.CalcTextSize($"Ambient Occlusion {EditorIcons.ChevronDown}").X + pad2);
+            if (EditorIcons.GhostButton($"shadingmode{id}", modeLabel, "Shading / debug view mode"))
+                ImGui.OpenPopup($"##shadingmode{id}");
+            if (ImGui.BeginPopup($"##shadingmode{id}")) {
+                ImGui.TextDisabled("Shading Mode");
+                ImGui.Separator();
+                for (var i = 0; i < engineNames.Length; i++) {
+                    bool sel = extra == 0 && (int)Renderer.DebugViewMode == i;
+                    if (ImGui.MenuItem(engineNames[i], (string)null, sel)) {
+                        Renderer.DebugViewMode = (HDRenderer.DebugView)i;
+                        HDRenderer.EditorExtraDebugMode = EditorDebugViews.None;   // leave any extra view
+                        editorState.MarkViewportDirty();
+                    }
+                }
+                ImGui.Separator();
+                ImGui.TextDisabled("Buffers (editor only)");
+                foreach (var (mode, label) in EditorDebugViews.Modes) {
+                    if (ImGui.MenuItem(label, (string)null, extra == mode)) {
+                        HDRenderer.EditorExtraDebugMode = mode;
+                        Renderer.DebugViewMode = HDRenderer.DebugView.Shaded; // engine renders normally; we replace composite
+                        editorState.MarkViewportDirty();
+                    }
+                }
+
+                // GI ISOLATE: view ONE GI system's contribution at a time (forces the other two off),
+                // so you can see exactly how probes / reflections / Lumen each affect the scene.
+                ImGui.Separator();
+                ImGui.TextDisabled("GI Isolate");
+                var isolateNames = new[] { "All systems", "Only Light Probes", "Only Reflections", "Only Lumen" };
+                for (var i = 0; i < isolateNames.Length; i++) {
+                    if (ImGui.MenuItem(isolateNames[i], (string)null, (int)HDRenderer.EditorGiIsolate == i)) {
+                        HDRenderer.EditorGiIsolate = (HDRenderer.GiIsolate)i;
+                        editorState.MarkViewportDirty();
+                    }
+                }
+                ImGui.EndPopup();
+            }
+        }
 
         if (id == "scene") {
             EditorPrefs prefs = EditorPrefs.Current;
@@ -942,6 +1242,8 @@ internal sealed class EditorApplication {
                     world ? "Gizmo space: World (click for Local)" : "Gizmo space: Local (click for World)"))
                 gizmo.Space = world ? GizmoSpace.Local : GizmoSpace.World;
 
+            // (Pivot/Center moved to a labelled button in the main toolbar, next to Move/Rotate/Scale.)
+
             // Component gizmos toggle.
             RightAlign(ImGui.CalcTextSize(EditorIcons.Pin).X + pad2);
             var gizmosBefore = showGizmos;
@@ -953,24 +1255,170 @@ internal sealed class EditorApplication {
             var grid = prefs.ShowGrid;
             ToggleIconButton("gridtoggle", EditorIcons.Grid, ref grid, "Viewport grid");
             if (grid != prefs.ShowGrid) { prefs.ShowGrid = grid; EditorPrefs.Save(); }
+
+            // Light-probe debug toggle: green = occupied / near geometry, red = empty air, for the
+            // implicit auto-fit volume — without selecting anything. Diagnoses probe density/placement.
+            RightAlign(ImGui.CalcTextSize(EditorIcons.Pin).X + pad2);
+            var probes = ProbeRenderState.ProbeShowAll;
+            ToggleIconButton("probetoggle", EditorIcons.Pin, ref probes,
+                ProbeRenderState.ProbeShowAll
+                    ? $"Light probes ({ProbeRenderState.ProbeOccupiedCount} occupied / {ProbeRenderState.ProbeTotalCount} total)"
+                    : "Light probes (debug)");
+            ProbeRenderState.ProbeShowAll = probes;
+
+            // Reflection-probe debug toggle: cyan = local cubemap cell, dim blue = skybox-fallback cell.
+            RightAlign(ImGui.CalcTextSize(EditorIcons.Pin).X + pad2);
+            var refl = ProbeRenderState.ReflectionShowAll;
+            ToggleIconButton("refltoggle", EditorIcons.Pin, ref refl,
+                ProbeRenderState.ReflectionShowAll
+                    ? $"Reflection probes ({ProbeRenderState.ReflectionCapturedCount} local / {ProbeRenderState.ReflectionTotalCount} total)"
+                    : "Reflection probes (debug)");
+            ProbeRenderState.ReflectionShowAll = refl;
         }
 
         ImGui.Separator();
     }
 
-    // Double-clicking a viewport window's title/tab strip toggles fullscreen for that view. Call right
-    // after Begin so the title-bar rect is current. Restricted to the title-bar band so a double-click
-    // on the 3D image (which drives gizmo/selection) never accidentally maximizes.
-    void MaximizeOnTitleDoubleClick() {
-        if (!ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
-            return;
-        SysVec2 mn = ImGui.GetWindowPos();
-        float titleH = ImGui.GetFrameHeight();
+    // Double-clicking a viewport window's tab/title strip toggles fullscreen for that view. Call right
+    // after Begin. For a DOCKED window the tab bar sits ABOVE the content origin (GetWindowPos().Y), so
+    // the hit band extends upward by ~2 frame heights to cover the dock tab; for a floating window it
+    // covers the title bar. The horizontal span is the window width. Excludes the content area so a
+    // double-click on the 3D image (gizmo/selection) never maximizes.
+    // A small "exit fullscreen" button floated at the top-right while a panel is maximized, so leaving
+    // fullscreen isn't Esc-only (the user couldn't find a way out). Clicking it clears maximizedPanel.
+    void DrawExitFullscreenButton(SysVec2 workPos, SysVec2 workSize, float toolbarH) {
+        float margin = 8 * S;
+        // Centered at the TOP of the view (pivot 0.5,0), just under the toolbar — where the user
+        // expects it, out of the way of the left-side controls.
+        ImGui.SetNextWindowPos(new SysVec2(workPos.X + workSize.X * 0.5f, workPos.Y + toolbarH + margin),
+            ImGuiCond.Always, new SysVec2(0.5f, 0f));
+        ImGui.SetNextWindowBgAlpha(0.9f);
+        const ImGuiWindowFlags flags = ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.NoDocking |
+            ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoSavedSettings |
+            ImGuiWindowFlags.NoFocusOnAppearing | ImGuiWindowFlags.NoNav;
+        if (ImGui.Begin("##exitfullscreen", flags)) {
+            if (ImGui.Button($"{EditorIcons.Minimize}  Exit Fullscreen"))
+                maximizedPanel = null;
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Exit fullscreen (Esc)");
+        }
+        ImGui.End();
+    }
+
+    // Draws one dockable panel with a CORRECT Begin/End pairing: End() is always called once Begin()
+    // ran, even when Begin returns false or the close button just set `show` to false this frame. The
+    // content (+ the maximize/add-tab strip handler) only runs when Begin returned true.
+    void DrawDockPanel(string name, ref bool show, Action drawContents) {
+        bool visible = ImGui.Begin(name, ref show);
+        if (visible) {
+            MaximizePanelOnTitleDoubleClick(name);
+            drawContents();
+        }
+        ImGui.End();
+    }
+
+    // Double-clicking a window's tab/title strip toggles fullscreen for THAT panel (works for every
+    // dockable panel now, not just the viewports). Call right after the panel's Begin. For a DOCKED
+    // window the tab bar sits ABOVE the content origin, so the hit band extends upward by ~1.4 frame
+    // heights; for a floating window it covers the title bar. Excludes the content area.
+    void MaximizePanelOnTitleDoubleClick(string panelName) {
+        // Hit-test the title/tab strip purely geometrically — do NOT gate on IsWindowHovered, because a
+        // docked window's tab strip is owned by the dock-node parent, so this window is NOT "hovered"
+        // while the cursor is on its own tab (the old bug: the interaction was silently dropped).
+        // GetCursorStartPos is the content origin in window-local coords (just below the title/tab strip);
+        // window pos + that Y is where content rows begin. The strip is [windowTop .. contentTop].
         SysVec2 mouse = ImGui.GetIO().MousePos;
-        bool overTitle = mouse.Y >= mn.Y && mouse.Y <= mn.Y + titleH &&
-                         mouse.X >= mn.X && mouse.X <= mn.X + ImGui.GetWindowSize().X;
-        if (overTitle && ImGui.IsWindowHovered(ImGuiHoveredFlags.RootAndChildWindows | ImGuiHoveredFlags.AllowWhenBlockedByActiveItem))
-            maximizedViewport = !maximizedViewport;
+        SysVec2 winPos = ImGui.GetWindowPos();
+        float winW = ImGui.GetWindowSize().X;
+        float contentTop = winPos.Y + ImGui.GetCursorStartPos().Y;
+        float stripTop = winPos.Y - (ImGui.IsWindowDocked() ? ImGui.GetFrameHeight() : 0f);
+        // CLAMP the band so it can't reach up over the toolbar — a docked viewport sits right under it,
+        // and the band's upward extension used to overlap the toolbar's Save/undo buttons, so clicking
+        // those fullscreened the view. Keeping the band below the toolbar fixes that WITHOUT killing the
+        // tab double-click (the old IsAnyItemHovered guard also blocked the tab itself).
+        stripTop = Math.Max(stripTop, contentAreaTop);
+        bool onStrip = mouse.Y >= stripTop && mouse.Y < contentTop &&
+                       mouse.X >= winPos.X && mouse.X <= winPos.X + winW;
+
+        // Double-click the strip → toggle fullscreen for this panel.
+        if (onStrip && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
+            maximizedPanel = maximizedPanel == panelName ? null : panelName;
+
+        // Right-click the strip → "Add Tab" menu to open any closed panel (Unity/VS dock behaviour).
+        if (onStrip && ImGui.IsMouseClicked(ImGuiMouseButton.Right))
+            ImGui.OpenPopup($"##tabctx_{panelName}");
+        if (ImGui.BeginPopup($"##tabctx_{panelName}")) {
+            // Add Tab → click a kind to open ANOTHER instance of it (unlimited). Each entry shows how
+            // many are open. Singleton views (Scene/Game) aren't here — they're one-per-renderer-target.
+            if (ImGui.BeginMenu($"{EditorIcons.Add}  Add Tab")) {
+                AddTabItem(EditorLayout.Inspector, "Inspector", ref showInspector);
+                AddTabItem(EditorLayout.Entities, "Entities", ref showHierarchy);
+                AddTabItem(EditorLayout.SceneComponents, "Scene Components", ref showSceneComponents);
+                AddTabItem(EditorLayout.Assets, "Assets", ref showBottom);
+                AddTabItem(EditorLayout.Console, "Console", ref showConsole);
+                ImGui.EndMenu();
+            }
+            ImGui.Separator();
+            if (ImGui.MenuItem("Maximize / Restore", "Double-click"))
+                maximizedPanel = maximizedPanel == panelName ? null : panelName;
+            ImGui.EndPopup();
+        }
+    }
+
+    // One "Add Tab" entry: opens ANOTHER instance of the kind. If the primary (id-0) panel is closed,
+    // re-show it first; otherwise spawn an extra instance through the host. The count is shown as a hint.
+    void AddTabItem(string kindKey, string label, ref bool primaryShown) {
+        int total = (primaryShown ? 1 : 0) + extraPanels.CountOf(kindKey);
+        string hint = total > 0 ? $"{total} open" : null;
+        if (ImGui.MenuItem(label, hint)) {
+            if (!primaryShown) primaryShown = true;     // bring the main one back first
+            else extraPanels.Open(kindKey);             // already showing → add another
+        }
+    }
+
+    // Draws one panel filling the whole work area while maximized (anything except the viewports,
+    // which take DrawMaximizedViewport). Routes by the panel's layout name to its contents.
+    // Whether the currently-maximized panel is still a thing we can draw fullscreen. Viewports always
+    // are; a primary dock panel is only available while its Window-menu toggle is on; a duplicated
+    // (host) instance is available while the host still owns its label. Returns false once the panel
+    // has been closed, so BuildUI can drop the stale fullscreen target.
+    bool MaximizedPanelStillAvailable(string name) {
+        if (name == EditorLayout.SceneView || name == EditorLayout.GameView) return true;
+        if (name == EditorLayout.Entities) return showHierarchy;
+        if (name == EditorLayout.SceneComponents) return showSceneComponents;
+        if (name == EditorLayout.Inspector) return showInspector;
+        if (name == EditorLayout.Assets) return showBottom;
+        if (name == EditorLayout.Console) return showConsole;
+        return extraPanels.OwnsLabel(name);
+    }
+
+    void DrawMaximizedPanel(string name, SysVec2 pos, SysVec2 size) {
+        // A duplicated (Add Tab) panel's label is owned by the host, not one of the primary layout
+        // names below — route it to the host so double-clicking an extra tab can fullscreen it too
+        // (previously these hit the "can't be shown fullscreen" dead-end).
+        if (extraPanels.OwnsLabel(name)) {
+            extraPanels.DrawMaximizedInstance(name, pos, size, MaximizePanelOnTitleDoubleClick);
+            return;
+        }
+
+        ImGui.SetNextWindowPos(pos);
+        ImGui.SetNextWindowSize(size);
+        const ImGuiWindowFlags flags = ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove |
+            ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking;
+        if (ImGui.Begin(name, flags)) {
+            MaximizePanelOnTitleDoubleClick(name); // double-click its title again to restore
+            if (name == EditorLayout.Entities) hierarchy.DrawEntitiesContents();
+            else if (name == EditorLayout.SceneComponents) hierarchy.DrawSceneContents();
+            else if (name == EditorLayout.Inspector) inspector.DrawContents();
+            else if (name == EditorLayout.Assets) assets.DrawContents();
+            else if (name == EditorLayout.Console) console.DrawContents();
+            else {
+                // Unknown panel id maximized (shouldn't happen) — give a way out so it can't get stuck.
+                ImGui.TextDisabled("This panel can't be shown fullscreen.");
+                if (ImGui.Button("Exit Fullscreen")) maximizedPanel = null;
+            }
+        }
+        ImGui.End();
     }
 
     // Scene and Game are now SEPARATE dockable windows (default-tabbed together in the center dock
@@ -986,7 +1434,10 @@ internal sealed class EditorApplication {
         // Play/stop (and scene-open) request focusing one view so it surfaces above its dock tab group.
         if (pendingFocusWindow == EditorLayout.SceneView) ImGui.SetNextWindowFocus();
         if (ImGui.Begin(EditorLayout.SceneView)) {
-            MaximizeOnTitleDoubleClick();   // double-click the Scene dock tab to (un)fullscreen
+            // Maximize THIS view explicitly — never via the shared gameViewFocused flag, which is reset
+            // to false above and only set true inside GameTabContents (after this runs), so routing the
+            // Game tab's double-click through it maximized the Scene view by mistake.
+            MaximizePanelOnTitleDoubleClick(EditorLayout.SceneView);
             // The view whose window is focused drives offscreen render selection (OnRender).
             if (ImGui.IsWindowFocused()) sceneTabActive = true;
             SceneTabContents();
@@ -995,7 +1446,7 @@ internal sealed class EditorApplication {
 
         if (pendingFocusWindow == EditorLayout.GameView) ImGui.SetNextWindowFocus();
         if (ImGui.Begin(EditorLayout.GameView)) {
-            MaximizeOnTitleDoubleClick();   // double-click the Game dock tab to (un)fullscreen
+            MaximizePanelOnTitleDoubleClick(EditorLayout.GameView);   // (un)fullscreen the Game view
             if (ImGui.IsWindowFocused()) sceneTabActive = false;
             GameTabContents();
         }
@@ -1014,7 +1465,12 @@ internal sealed class EditorApplication {
         ImGui.SetNextWindowPos(pos, ImGuiCond.Always);
         ImGui.SetNextWindowSize(size, ImGuiCond.Always);
         if (ImGui.Begin("##viewportmax", PanelFlags | ImGuiWindowFlags.NoTitleBar)) {
-            if (sceneTabActive)
+            // Show whichever view was ACTUALLY maximized — drive off maximizedPanel, not sceneTabActive,
+            // which could be out of sync (the "maximize Scene, exit, switch to Game, things get weird"
+            // bug). Keep sceneTabActive in step so the on-demand render picks the right target.
+            bool sceneMax = maximizedPanel == EditorLayout.SceneView;
+            sceneTabActive = sceneMax;
+            if (sceneMax)
                 SceneTabContents();
             else
                 GameTabContents();
@@ -1034,10 +1490,19 @@ internal sealed class EditorApplication {
         if (dispOffset.X > 0 || dispOffset.Y > 0)
             ImGui.SetCursorPos(ImGui.GetCursorPos() + dispOffset);
 
-        (SysVec2 uv0, SysVec2 uv1) = sceneRes.ZoomUVs();
-        ImGui.Image(Tex(Renderer.SceneColorTextureId), dispSize, uv0, uv1);
+        (SysVec2 uv0, SysVec2 uv1) = sceneRes.ZoomUVs(!Renderer.DisplayTextureTopDown);
+        ImGui.Image(Tex(Renderer.SceneColorHandle), dispSize, uv0, uv1);
         SysVec2 imageMin = ImGui.GetItemRectMin();
         SysVec2 imageSize = dispSize;
+
+        // Drag assets from the browser straight onto the 3D view (Unity parity): model/prefab → spawn,
+        // script → entity-with-component, placed in front of the camera. Previously only the hierarchy
+        // and inspector accepted asset drops, so dropping onto the viewport did nothing.
+        if (ImGui.BeginDragDropTarget()) {
+            if (hierarchy.DropAssetsIntoScene())
+                MarkSceneDirty();
+            ImGui.EndDragDropTarget();
+        }
         // Hairline frame so the rendered image reads as a deliberate surface, not a raw blit.
         ImGui.GetWindowDrawList().AddRect(imageMin, imageMin + imageSize,
             ImGui.GetColorU32(new SysVec4(1, 1, 1, 0.06f)));
@@ -1092,6 +1557,14 @@ internal sealed class EditorApplication {
 
         if (showGizmos)
             DrawComponentGizmos(gizmoMin, gizmoSize);
+        else if (ProbeRenderState.AnyDebugActive) {
+            // The probe-debug overlays are their OWN tool, independent of the component-gizmo toggle —
+            // so they still draw when component gizmos are off. (When gizmos ARE on, DrawComponentGizmos
+            // already draws them.) Needs its own gizmoDrawer.Begin since DrawComponentGizmos was skipped.
+            gizmoDrawer.Begin(editorCamera, gizmoMin, gizmoSize, ImGui.GetWindowDrawList());
+            ProbeRenderState.DrawProbes(gizmoDrawer);
+            ProbeRenderState.DrawReflections(gizmoDrawer);
+        }
 
         // Arm vertex snapping while V is held over the viewport (raw key so it works regardless of which
         // panel has ImGui focus, suppressed while typing). On-demand rendering means we must keep
@@ -1100,9 +1573,14 @@ internal sealed class EditorApplication {
         if (VertexSnap.Held)
             MarkSceneDirty();
 
+        // The terrain brush ring follows the cursor, so keep the viewport repainting while it's armed
+        // and the mouse is over the Scene view (same idea as VertexSnap.Held above).
+        if (TerrainTool.Armed && sceneViewHovered)
+            MarkSceneDirty();
+
         if (editorState.Selected is not null)
             gizmo.Draw(editorCamera, editorState.Selected, gizmoMin, gizmoSize,
-                sceneViewHovered && !ColliderHandles.IsInteracting);
+                sceneViewHovered && !ColliderHandles.IsInteracting && !WheelHandles.IsInteracting && !TerrainTool.Armed);
 
         // Click-to-select (Unity-style): a clean left-click in the viewport (no drag) picks the mesh
         // under the cursor. Runs AFTER the gizmo draw so gizmo/collider hover this frame can veto the
@@ -1159,6 +1637,12 @@ internal sealed class EditorApplication {
             catch (Exception e) { ScriptGuard.ReportRepeating(sceneBehaviour, "OnDrawGizmos", e); }
         }
 
+        // DEBUG: probe-grid overlays (toolbar toggles / GI volume override). Always-on (not
+        // selection-gated) so the implicit auto-fit volumes show too — light probes green=occupied /
+        // red=air, reflection probes show occupied cubemap cells. The visual for the probe-density work.
+        ProbeRenderState.DrawProbes(gizmoDrawer);
+        ProbeRenderState.DrawReflections(gizmoDrawer);
+
         if (editorState.Selected is { IsActive: true } selected) {
             foreach (Behaviour behaviour in selected.Behaviours) {
                 try { behaviour.OnDrawGizmosSelected(gizmoDrawer); }
@@ -1172,17 +1656,35 @@ internal sealed class EditorApplication {
                     ColliderHandles.Draw(collider, editorCamera, imageMin, imageSize,
                         ImGui.GetWindowDrawList(), sceneViewHovered && !gizmo.IsInteracting))
                     MarkSceneDirty();
+
+            // WheelColliders get drag handles for radius + suspension travel (the wheel circle and
+            // travel line they draw are their own OnDrawGizmosSelected). Same hover suppression.
+            foreach (Behaviour behaviour in selected.Behaviours)
+                if (behaviour is WheelCollider wheel &&
+                    WheelHandles.Draw(wheel, editorCamera, imageMin, imageSize,
+                        ImGui.GetWindowDrawList(), sceneViewHovered && !gizmo.IsInteracting && !ColliderHandles.IsInteracting))
+                    MarkSceneDirty();
+
+            // Terrain gets a Scene-view sculpt brush, active only while the Inspector arms it. Hover is
+            // suppressed while the transform gizmo/collider handles interact so a click can't grab both.
+            // Disarm if the selection has no terrain, so a stale Armed flag can't block click-to-select.
+            Terrain selectedTerrain = selected.GetComponent<Terrain>();
+            if (selectedTerrain is null)
+                TerrainTool.Armed = false;
+            else if (TerrainTool.Draw(selectedTerrain, editorCamera, imageMin, imageSize,
+                         ImGui.GetWindowDrawList(),
+                         sceneViewHovered && !gizmo.IsInteracting && !ColliderHandles.IsInteracting))
+                MarkSceneDirty();
+        }
+        else {
+            TerrainTool.Armed = false; // nothing selected — never leave the brush armed
         }
 
         if (editorState.SelectedSceneBehaviour is { } selectedSceneBehaviour) {
             try { selectedSceneBehaviour.OnDrawGizmosSelected(gizmoDrawer); }
             catch (Exception e) { ScriptGuard.ReportRepeating(selectedSceneBehaviour, "OnDrawGizmosSelected", e); }
-
-            // Irradiance volumes get draggable face handles for resizing the box in-view.
-            if (selectedSceneBehaviour is IrradianceVolume irradianceVolume &&
-                VolumeBoundsHandles.Draw(irradianceVolume, editorCamera, imageMin, imageSize,
-                    ImGui.GetWindowDrawList(), sceneViewHovered))
-                MarkSceneDirty();
+            // (The IrradianceVolume box-resize handles were removed with the GL probe baker — P0.5. The
+            // unified GlobalIllumination volume is a global post-process override with no in-world bounds.)
         }
     }
 
@@ -1194,7 +1696,8 @@ internal sealed class EditorApplication {
         // Conditions under which a left-press can START a pick: over the viewport, not flying, and no
         // gizmo/handle interaction is claiming the click this frame.
         bool gizmoBusy = gizmo.IsInteracting || gizmo.IsHovered ||
-                         ColliderHandles.IsInteracting || VertexSnap.Held;
+                         ColliderHandles.IsInteracting || WheelHandles.IsInteracting || VertexSnap.Held ||
+                         TerrainTool.Armed || TerrainTool.IsInteracting;
         bool canStart = sceneViewHovered && !editorInput.RightMouseDown && !gizmoBusy &&
                         !imgui.WantTextInput;
 
@@ -1289,10 +1792,21 @@ internal sealed class EditorApplication {
             if (dispOffset.X > 0 || dispOffset.Y > 0)
                 ImGui.SetCursorPos(ImGui.GetCursorPos() + dispOffset);
 
-            (SysVec2 uv0, SysVec2 uv1) = gameRes.ZoomUVs();
-            ImGui.Image(Tex(Renderer.GameColorTextureId), dispSize, uv0, uv1);
+            (SysVec2 uv0, SysVec2 uv1) = gameRes.ZoomUVs(!Renderer.DisplayTextureTopDown);
+            ImGui.Image(Tex(Renderer.GameColorHandle), dispSize, uv0, uv1);
             gameViewFocused = ImGui.IsWindowFocused();
             gameViewHovered = ImGui.IsItemHovered(); // is the MOUSE over the game image specifically
+
+            // Route pointer input to active game UIs using the game IMAGE's on-screen rect (position +
+            // displayed size), so hit-testing maps window-space mouse coords into the UI's logical space
+            // correctly — independent of the panel's offset and display scale. Gated like engine input
+            // (Input.Enabled = play mode + game focused), so editing never leaks clicks into the UI.
+            if (Input.Enabled) {
+                SysVec2 imgMin = ImGui.GetItemRectMin();
+                var panelRect = new BallisticEngine.UI.Rect(imgMin.X, imgMin.Y, dispSize.X, dispSize.Y);
+                foreach (var doc in BallisticEngine.UI.UIDocument.Active)
+                    doc.ProcessInput(panelRect);
+            }
 
             // Stats pinned to the view's top-right (no orientation cube here, so right at the top).
             if (showStats && !stats.Draw(runtime.Window.FrameRate, editorCpuMs, gameViewSize, S,
@@ -1326,31 +1840,64 @@ internal sealed class EditorApplication {
     // Copies OS-dropped files into the browser's current folder and runs the import pipeline â€”
     // each file's dedicated importer (model/texture/Falcor/...) picks it up in the refresh.
     void ImportDroppedFiles(IReadOnlyList<string> files) {
+        if (files is null || files.Count == 0) {
+            Debugging.LogWarning("Drop import: the OS reported no files.");
+            return;
+        }
+
         var destFolder = Path.Combine(bootstrap.Project.RootPath,
             assets.CurrentFolder.Replace('/', Path.DirectorySeparatorChar));
         Directory.CreateDirectory(destFolder);
 
         var copied = 0;
         foreach (var source in files) {
-            if (!File.Exists(source)) {
-                Debugging.LogWarning($"Drop import: '{source}' is not a file (folders not supported yet).");
-                continue;
+            // Dropping a FOLDER copies its whole tree in (Unity parity); a file copies itself.
+            try {
+                if (Directory.Exists(source)) {
+                    CopyDirectoryInto(source, destFolder);
+                    copied++;
+                    continue;
+                }
+                if (!File.Exists(source)) {
+                    Debugging.LogWarning($"Drop import: '{source}' is neither a file nor a folder; skipped.");
+                    continue;
+                }
+                // Never silently skip a duplicate — land it under a unique name so a batch drop always
+                // imports SOMETHING (the old code skipped every name collision, which read as "nothing
+                // got added" when re-dropping the same files).
+                string destination = UniqueDropPath(Path.Combine(destFolder, Path.GetFileName(source)));
+                File.Copy(source, destination);
+                copied++;
             }
-
-            var destination = Path.Combine(destFolder, Path.GetFileName(source));
-            if (File.Exists(destination)) {
-                Debugging.LogWarning($"Drop import: '{Path.GetFileName(source)}' already exists in {assets.CurrentFolder}; skipped.");
-                continue;
+            catch (Exception e) {
+                Debugging.LogError($"Drop import failed for '{source}': {e.Message}");
             }
-
-            File.Copy(source, destination);
-            copied++;
         }
 
         if (copied > 0)
             AsyncAssetImport.Request(
-                copied == 1 ? $"Importing {Path.GetFileName(files[0])}..." : $"Importing {copied} files...",
+                copied == 1 ? $"Importing {Path.GetFileName(files[0])}..." : $"Importing {copied} items...",
                 onFinished: () => assets.InvalidateThumbnails());
+    }
+
+    // file.png -> file.png, file 1.png, file 2.png, ... (so a batch drop never collides itself away).
+    static string UniqueDropPath(string path) {
+        if (!File.Exists(path) && !Directory.Exists(path)) return path;
+        string dir = Path.GetDirectoryName(path)!, stem = Path.GetFileNameWithoutExtension(path),
+               ext = Path.GetExtension(path);
+        for (int i = 1; ; i++) {
+            string candidate = Path.Combine(dir, $"{stem} {i}{ext}");
+            if (!File.Exists(candidate) && !Directory.Exists(candidate)) return candidate;
+        }
+    }
+
+    static void CopyDirectoryInto(string sourceDir, string destParent) {
+        string dest = Path.Combine(destParent, Path.GetFileName(sourceDir.TrimEnd(Path.DirectorySeparatorChar)));
+        Directory.CreateDirectory(dest);
+        foreach (string file in Directory.GetFiles(sourceDir))
+            File.Copy(file, Path.Combine(dest, Path.GetFileName(file)), overwrite: false);
+        foreach (string sub in Directory.GetDirectories(sourceDir))
+            CopyDirectoryInto(sub, dest);
     }
 
 

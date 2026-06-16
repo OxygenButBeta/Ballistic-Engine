@@ -193,10 +193,6 @@ public static class GameScripts {
                   <HintPath>$(BallisticEngineDir)\BallisticEngine.dll</HintPath>
                   <Private>false</Private>
                 </Reference>
-                <Reference Include="OpenTK.Mathematics">
-                  <HintPath>$(BallisticEngineDir)\OpenTK.Mathematics.dll</HintPath>
-                  <Private>false</Private>
-                </Reference>
                 <Reference Include="OpenTK.Windowing.GraphicsLibraryFramework">
                   <HintPath>$(BallisticEngineDir)\OpenTK.Windowing.GraphicsLibraryFramework.dll</HintPath>
                   <Private>false</Private>

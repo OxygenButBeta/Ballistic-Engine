@@ -114,8 +114,8 @@ public static class StyleApplier
             case "text-shadow": ApplyTextShadow(style, value); break;
             // letter-spacing in px or em (em resolved against the current font size, like CSS).
             case "letter-spacing": style.LetterSpacing = ParseEmOrPx(value, style.FontSize); break;
-            // -unity-text-align / text-align keyword -> handled by the element's TextAlign at port time;
-            // accept the property so it doesn't warn, but alignment is set on the Label in v1.
+            case "text-align":
+            case "-unity-text-align": style.TextAlign = ParseTextAlign(value); break;
 
             default:
                 // Unmodeled property (e.g. box-shadow, transition) — skip without failing the load.
@@ -196,6 +196,22 @@ public static class StyleApplier
         if (nums.Length >= 3) blur = ParsePx(nums[2]);
         return true;
     }
+
+    // text-align: accepts CSS keywords (left/center/right -> middle-*) and Unity's compound names
+    // (upper-left, middle-center, lower-right, ...).
+    static TextAlign ParseTextAlign(string v) => v.Trim().ToLowerInvariant() switch
+    {
+        "left" or "middle-left" => TextAlign.MiddleLeft,
+        "center" or "middle-center" => TextAlign.MiddleCenter,
+        "right" or "middle-right" => TextAlign.MiddleRight,
+        "upper-left" or "top-left" => TextAlign.UpperLeft,
+        "upper-center" or "top-center" => TextAlign.UpperCenter,
+        "upper-right" or "top-right" => TextAlign.UpperRight,
+        "lower-left" or "bottom-left" => TextAlign.LowerLeft,
+        "lower-center" or "bottom-center" => TextAlign.LowerCenter,
+        "lower-right" or "bottom-right" => TextAlign.LowerRight,
+        _ => TextAlign.MiddleLeft,
+    };
 
     // font-family: takes the FIRST family in a comma list, stripped of quotes (CSS fallback lists like
     // "'Cinzel', serif" -> "Cinzel").

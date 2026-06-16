@@ -30,7 +30,7 @@ public sealed class Exposure : VolumeComponent {
     public readonly ClampedFloatParameter speedDarkToLight = new(3f, 0.1f, 20f);
 
     [Tooltip("Adaptation speed in stops/second when the scene gets darker (eyes adjust slowly).")]
-    public readonly ClampedFloatParameter speedLightToDark = new(1f, 0.1f, 20f);
+    public readonly ClampedFloatParameter speedLightToDark = new(2.5f, 0.1f, 20f);
 
     [Tooltip("Histogram mode: percentile below which dark pixels are ignored by the meter.")]
     public readonly ClampedFloatParameter histogramMin = new(40f, 0f, 100f);

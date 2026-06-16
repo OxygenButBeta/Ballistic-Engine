@@ -104,6 +104,9 @@ internal static class SceneCommands {
             SceneManager.StopPlay();
 
         SceneManager.GetCurrentScene().Clear();
+        // Defensively clear every render set too — scene.Clear()'s per-component OnDetach is best-effort,
+        // and a leaked renderer keeps DRAWING the old scene's meshes after the switch (the reported bug).
+        SceneManager.ClearAllRenderSets();
         SceneSerializer.Deserialize(yaml);
         CurrentScenePath = assetPath;
         EditorUndo.Clear();
@@ -116,6 +119,7 @@ internal static class SceneCommands {
             SceneManager.StopPlay();
 
         SceneManager.GetCurrentScene().Clear();
+        SceneManager.ClearAllRenderSets();
         CurrentScenePath = null;
         EditorUndo.Clear();
         RememberScene(null); // no file to reopen — next launch falls back to the StartupScene
@@ -125,6 +129,14 @@ internal static class SceneCommands {
     // session before a scene has been explicitly opened). No-op with a warning if there's nowhere to
     // write yet — the caller should offer Save As.
     public static bool Save() {
+        // Refuse to save while playing (Unity parity): the live scene holds play-mutated state (physics
+        // poses, spawned objects, script-changed values), so writing it would clobber the edit scene on
+        // disk — StopPlay restores the snapshot in memory but the FILE would already be corrupted.
+        if (SceneManager.IsPlaying) {
+            Debugging.LogWarning("Can't save while in play mode — stop play first (the edit scene would be overwritten with play state).");
+            return false;
+        }
+
         var path = CurrentScenePath ?? AssetDatabase.Project.Manifest.StartupScene;
         if (string.IsNullOrEmpty(path)) {
             Debugging.LogWarning("No scene file to save to. Use Save As or set a startup scene.");
@@ -136,6 +148,10 @@ internal static class SceneCommands {
     }
 
     public static void SaveAs(string assetPath) {
+        if (SceneManager.IsPlaying) {
+            Debugging.LogWarning("Can't save while in play mode — stop play first.");
+            return;
+        }
         SceneSerializer.Save(SceneManager.GetCurrentScene(), AssetDatabase.Project.ResolveAbsolute(assetPath));
         CurrentScenePath = assetPath;
         EditorUndo.MarkClean();

@@ -28,6 +28,9 @@ internal sealed class EditorPrefs {
     // --- Asset browser --- width of the folder tree pane (unscaled px; multiplied by DPI scale).
     public float AssetTreeWidth { get; set; } = 190f;
 
+    // Favourite folders (project-relative "Assets/..." paths) pinned above the folder tree, Unity-style.
+    public List<string> FavoriteFolders { get; set; } = new();
+
     // --- Grid + snapping ---
     public bool ShowGrid { get; set; } = true;
     public float GridSize { get; set; } = 1f;
@@ -40,6 +43,18 @@ internal sealed class EditorPrefs {
     // reopening the editor restores the scene you were last editing instead of always the StartupScene.
     // Keyed by project so switching between projects each remembers its own scene.
     public Dictionary<string, string> LastScenes { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    // Last Scene-view camera pose per project (root path -> "px,py,pz,pitch,yaw"), so reopening the
+    // editor restores where you were looking. Keyed per project like LastScenes.
+    public Dictionary<string, string> LastCameras { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public static string GetLastCamera(string projectRoot) =>
+        projectRoot is not null && Current.LastCameras.TryGetValue(projectRoot, out var v) ? v : null;
+
+    public static void SetLastCamera(string projectRoot, string pose) {
+        if (projectRoot is null) return;
+        Current.LastCameras[projectRoot] = pose;
+    }
 
     // Returns the last scene opened for this project root, or null if none has been recorded yet.
     public static string GetLastScene(string projectRoot) =>

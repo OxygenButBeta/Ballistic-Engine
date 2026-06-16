@@ -22,12 +22,27 @@ internal static class AsyncAssetImport {
     static volatile bool busy;
     static volatile string status = "Importing...";
     static volatile string currentFile;
+    static int completed, total;   // import-stage counts, for a determinate progress bar
+
+    // Fires on the MAIN thread after EVERY completed refresh (after the per-request onFinished), so
+    // global post-import work — prefab propagation to live instances — runs without each caller wiring
+    // it. Kept separate from onFinished, which is per-request.
+    public static event Action AfterRefresh;
 
     public static bool IsBusy => busy;
     public static string Status => status;
 
     // The asset currently being processed (null between assets / before the first), for the overlay.
     public static string CurrentFile => currentFile;
+
+    // 0..1 import progress, or -1 when the total isn't known yet (the scan stage before importing).
+    // The overlay draws a determinate bar when this is >= 0, an indeterminate sweep otherwise.
+    public static float Fraction {
+        get {
+            int t = Volatile.Read(ref total);
+            return t > 0 ? Math.Clamp((float)Volatile.Read(ref completed) / t, 0f, 1f) : -1f;
+        }
+    }
 
     // Kicks off (or queues) a background refresh. onFinished, if supplied, runs ON THE MAIN THREAD
     // after the refresh completes — use it for thumbnail invalidation, Invalidate(guid), etc.
@@ -54,10 +69,16 @@ internal static class AsyncAssetImport {
         busy = true;
         status = statusText;
         currentFile = null;
+        Volatile.Write(ref completed, 0);
+        Volatile.Write(ref total, 0); // unknown until the import stage reports its job count
         running = Task.Run(() => {
             var stopwatch = Stopwatch.StartNew();
             try {
                 AssetDatabase.ImportProgress = file => currentFile = file;
+                AssetDatabase.ImportProgressCount = (c, t) => {
+                    Volatile.Write(ref total, t);
+                    Volatile.Write(ref completed, c);
+                };
                 AssetDatabase.Refresh(forceAll);
             }
             catch (Exception exception) {
@@ -70,6 +91,7 @@ internal static class AsyncAssetImport {
                 // import generated don't look like outside edits on the next focus regain.
                 AssetChangeWatch.Snapshot();
                 AssetDatabase.ImportProgress = null;
+                AssetDatabase.ImportProgressCount = null;
                 currentFile = null;
                 OnRefreshComplete(onFinished, stopwatch.ElapsedMilliseconds);
             }
@@ -113,6 +135,15 @@ internal static class AsyncAssetImport {
         }
         catch (Exception exception) {
             Debugging.LogError($"Post-import refresh step failed: {exception.Message}");
+        }
+
+        // A refresh just completed and its per-request callback ran — fire the global AfterRefresh so
+        // prefab propagation (and any future global post-import work) runs once per refresh.
+        try {
+            AfterRefresh?.Invoke();
+        }
+        catch (Exception exception) {
+            Debugging.LogError($"Post-import AfterRefresh step failed: {exception.Message}");
         }
     }
 

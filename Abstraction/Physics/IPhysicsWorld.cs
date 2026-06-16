@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -36,6 +35,9 @@ public struct PhysicsContactEvent {
     public Vector3 Point;    // world-space representative contact point (last known, for Exit)
     public Vector3 Normal;   // unit normal pointing from B toward A
     public bool IsTrigger;   // at least one side is a trigger; the overlap was not solved
+    public int ChildA;       // compound child index on A that touched (0 for single-shape bodies)
+    public int ChildB;       // compound child index on B that touched — lets the engine resolve the
+                             // exact child collider that was struck, not just the body's first one
 }
 
 public struct PhysicsRayHit {
@@ -71,12 +73,36 @@ public interface IPhysicsWorld {
     // layerMask: only bodies whose Layer bit is set are tested (~0 = hit everything).
     bool Raycast(Vector3 origin, Vector3 direction, float maxDistance, int layerMask, out PhysicsRayHit hit);
 
+    // Shape-cast (sweep): slide a convex shape (sphere/box/capsule) from (position, rotation) along
+    // `direction` for up to maxDistance, returning the first body it touches. Unlike a ray, this has
+    // THICKNESS — it catches contacts a thin ray would miss (a wheel finding the ground, a character
+    // probing a step). hit.Distance is how far the shape traveled before contact; Point/Normal are at
+    // the touch. Mesh/concave shapes are not valid sweep shapes (convex only). layerMask as in Raycast.
+    bool ShapeCast(PhysicsShape shape, Vector3 position, Quaternion rotation, Vector3 direction,
+        float maxDistance, int layerMask, out PhysicsRayHit hit);
+
     // Overlap queries: collect every body whose shape intersects the volume and whose Layer is in
     // the mask. Results append to `results` (caller-cleared); returns the count. Used by
     // Physics.OverlapSphere/OverlapBox. Triggers are included (Unity parity).
+    //
+    // These are the CONSERVATIVE (broadphase-AABB) fast path: a body whose AABB overlaps the query
+    // but whose shape does not can be a false positive. Good for trigger/aggro/pickup volumes.
     int OverlapSphere(Vector3 center, float radius, int layerMask, List<IPhysicsBody> results);
     int OverlapBox(Vector3 center, Vector3 halfExtents, Quaternion orientation, int layerMask,
         List<IPhysicsBody> results);
+
+    // PRECISE overlap: returns only bodies whose SHAPE actually intersects the convex query shape
+    // (sphere/box/capsule), using Bepu's narrowphase, not just AABBs. No corner/rotation false
+    // positives. More expensive than the broadphase path above — use when correctness matters (a
+    // tight fit check, a melee hitbox). Mesh/concave query shapes are rejected (convex only).
+    int OverlapShape(PhysicsShape shape, Vector3 position, Quaternion rotation, int layerMask,
+        List<IPhysicsBody> results);
+
+    // Joints/constraints (P6). Binds two bodies (or one body to the world when BodyB is null) with a
+    // BallSocket/Hinge/Weld/Spring/Slider constraint. Returns null (after logging) if it can't be
+    // built — e.g. a missing body. Remove a constraint BEFORE removing either of its bodies.
+    IPhysicsConstraint AddConstraint(in PhysicsConstraintDescription description);
+    void RemoveConstraint(IPhysicsConstraint constraint);
 
     // Drops every body and shape (leaving/entering play mode). Outstanding IPhysicsBody
     // references become inert no-ops.

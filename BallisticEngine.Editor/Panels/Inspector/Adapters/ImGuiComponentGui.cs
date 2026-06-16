@@ -1,0 +1,62 @@
+using System;
+using System.Reflection;
+using Hexa.NET.ImGui;
+using SysVec2 = System.Numerics.Vector2;
+using SysVec3 = System.Numerics.Vector3;
+
+namespace BallisticEngine.Editor.Inspector;
+
+// INTEGRATION-TIME (compiled in the real editor against Hexa.NET.ImGui; NOT in the headless test).
+// Bridges InspectorPanel's existing helpers to the shared IInspectorGui so the component path drops its
+// hardcoded switch. Value widgets wrap InspectorUndo.Track exactly like the old DrawMember did -> undo +
+// dirty stay byte-identical. The host (InspectorPanel) implements IComponentInspectorHost by forwarding
+// to its own helpers (BeginGrid/RowWithTooltip/AxisVec3 are static; ApplyMember/DrawMixedMarker/
+// DrawAssetSlot/MarkViewportDirty are instance; TrackUndo => InspectorUndo.Track).
+public interface IComponentInspectorHost {
+    void RowWithTooltip(string label, string tooltip);
+    void DrawMixedMarker(MemberInfo member, object target, object value);
+    bool AxisVec3(string id, string label, ref SysVec3 v, float speed);
+    bool TrackUndo(string label, bool changed);
+    void MarkViewportDirty();
+}
+
+public sealed class ImGuiComponentGui : IInspectorGui {
+    readonly IComponentInspectorHost host;
+    string label;
+
+    public ImGuiComponentGui(IComponentInspectorHost host) => this.host = host;
+
+    // The component host (DrawMember) owns the row chrome (RowWithTooltip + mixed marker) and calls a
+    // drawer directly, so it sets the undo label here instead of through BeginRow.
+    public void SetUndoLabel(string fullLabel) => label = fullLabel;
+
+    public void PushId(string id) => ImGui.PushID(id);
+    public void PopId() => ImGui.PopID();
+    public void BeginDisabled() => ImGui.BeginDisabled();
+    public void EndDisabled() => ImGui.EndDisabled();
+
+    public void BeginRow(IProperty p) {
+        host.RowWithTooltip(p.Label, p.Tooltip);
+        if (p is MemberProperty mp) host.DrawMixedMarker(mp.Member, mp.Owner, mp.Get());
+        ImGui.SetNextItemWidth(-1);
+        label = $"Edit {p.Label}";
+    }
+    public void EndRow() { }
+
+    public void Header(string t) => ImGui.SeparatorText(t);
+    public void Space(float h) => ImGui.Dummy(new SysVec2(0, h));
+    public void HelpBox(string t) => ImGui.TextWrapped(t);
+
+    public bool Checkbox(ref bool v) => host.TrackUndo(label, ImGui.Checkbox("##v", ref v));
+    public bool SliderFloat(ref float v, float min, float max) => host.TrackUndo(label, ImGui.SliderFloat("##v", ref v, min, max));
+    public bool DragFloat(ref float v, float speed) => host.TrackUndo(label, ImGui.DragFloat("##v", ref v, speed));
+    public bool SliderInt(ref int v, int min, int max) => host.TrackUndo(label, ImGui.SliderInt("##v", ref v, min, max));
+    public bool DragInt(ref int v) => host.TrackUndo(label, ImGui.DragInt("##v", ref v));
+    public bool InputText(ref string v, int maxLength) => host.TrackUndo(label, ImGui.InputText("##v", ref v, (uint)maxLength));
+    public bool Combo(ref int index, string[] names) => host.TrackUndo(label, ImGui.Combo("##v", ref index, names, names.Length));
+    public bool ColorEdit3(ref SysVec3 v, bool hdr) =>
+        host.TrackUndo(label, ImGui.ColorEdit3("##v", ref v, hdr ? ImGuiColorEditFlags.Hdr | ImGuiColorEditFlags.Float : ImGuiColorEditFlags.None));
+    public bool DragFloat2(ref SysVec2 v, float speed) => host.TrackUndo(label, ImGui.DragFloat2("##v", ref v, speed));
+    public bool DragFloat3(ref SysVec3 v, float speed) => host.AxisVec3("v3", label, ref v, speed); // AxisVec3 owns its undo
+    public void Unsupported(Type t) => ImGui.TextDisabled($"({t.Name})");
+}

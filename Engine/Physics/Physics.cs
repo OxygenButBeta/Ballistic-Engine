@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -54,6 +53,37 @@ public static class Physics {
         float maxDistance = float.MaxValue, int layerMask = DefaultRaycastLayers) =>
         Raycast(origin, direction, out _, maxDistance, layerMask);
 
+    // ---- Shape casts (sweeps) ------------------------------------------------
+    // Like a ray, but with thickness: slides a convex shape and returns the first body it touches.
+    // Used for robust ground-finding (vehicle wheels), character step/ledge probing, and any "what's
+    // in front of this shape" query a zero-width ray would miss. Unity's SphereCast/BoxCast/CapsuleCast.
+
+    public static bool SphereCast(Vector3 origin, float radius, Vector3 direction, out RaycastHit hit,
+        float maxDistance = float.MaxValue, int layerMask = DefaultRaycastLayers) =>
+        ShapeCast(new SphereShape(radius), origin, Quaternion.Identity, direction, out hit, maxDistance, layerMask);
+
+    public static bool BoxCast(Vector3 center, Vector3 halfExtents, Vector3 direction, Quaternion orientation,
+        out RaycastHit hit, float maxDistance = float.MaxValue, int layerMask = DefaultRaycastLayers) =>
+        ShapeCast(new BoxShape(halfExtents * 2f), center, orientation, direction, out hit, maxDistance, layerMask);
+
+    public static bool CapsuleCast(Vector3 origin, float radius, float height, Vector3 direction,
+        Quaternion orientation, out RaycastHit hit, float maxDistance = float.MaxValue,
+        int layerMask = DefaultRaycastLayers) =>
+        ShapeCast(new CapsuleShape(radius, MathF.Max(0f, height - 2f * radius)), origin, orientation,
+            direction, out hit, maxDistance, layerMask);
+
+    static bool ShapeCast(PhysicsShape shape, Vector3 position, Quaternion rotation, Vector3 direction,
+        out RaycastHit hit, float maxDistance, int layerMask) {
+        hit = default;
+        if (World is null || direction == Vector3.Zero)
+            return false;
+        if (!World.ShapeCast(shape, position, rotation, direction.Normalized(), maxDistance, layerMask,
+                out PhysicsRayHit rawHit))
+            return false;
+        hit = MapHit(rawHit);
+        return true;
+    }
+
     // Every body intersecting a sphere, layer-filtered (Unity's OverlapSphere). Returns colliders.
     public static List<Collider> OverlapSphere(Vector3 center, float radius, int layerMask = ~0) {
         var bodies = new List<IPhysicsBody>();
@@ -66,6 +96,23 @@ public static class Physics {
         Quaternion orientation, int layerMask = ~0) {
         var bodies = new List<IPhysicsBody>();
         World?.OverlapBox(center, halfExtents, orientation, layerMask, bodies);
+        return ToColliders(bodies);
+    }
+
+    // PRECISE overlap: only colliders whose SHAPE truly intersects the convex query shape (Bepu's
+    // narrowphase, no AABB/rotation false positives). Costlier than OverlapSphere/OverlapBox above —
+    // reach for it when correctness matters (a tight fit test, a melee hitbox). Convex query only.
+    public static List<Collider> OverlapSpherePrecise(Vector3 center, float radius, int layerMask = ~0) =>
+        OverlapShape(new SphereShape(radius), center, Quaternion.Identity, layerMask);
+
+    public static List<Collider> OverlapBoxPrecise(Vector3 center, Vector3 halfExtents,
+        Quaternion orientation, int layerMask = ~0) =>
+        OverlapShape(new BoxShape(halfExtents * 2f), center, orientation, layerMask);
+
+    static List<Collider> OverlapShape(PhysicsShape shape, Vector3 position, Quaternion rotation,
+        int layerMask) {
+        var bodies = new List<IPhysicsBody>();
+        World?.OverlapShape(shape, position, rotation, layerMask, bodies);
         return ToColliders(bodies);
     }
 
@@ -133,6 +180,12 @@ public static class Physics {
             foreach (Rigidbody rigidbody in RuntimeSet<Rigidbody>.ReadOnlyCollection)
                 rigidbody.PrePhysicsStep(FixedTimestep);
 
+            // Standalone (Rigidbody-less) colliders teleport their static body to follow any runtime
+            // transform edit (gizmo/inspector/script) so moving level geometry at play time actually
+            // moves its collision. No-op for colliders that are part of a Rigidbody compound.
+            foreach (Collider collider in RuntimeSet<Collider>.ReadOnlyCollection)
+                collider.SyncStaticBodyToTransform();
+
             World.Step(FixedTimestep);
 
             foreach (Rigidbody rigidbody in RuntimeSet<Rigidbody>.ReadOnlyCollection)
@@ -158,18 +211,22 @@ public static class Physics {
             PhysicsContactEvent contactEvent = events[i];
             var ownerA = contactEvent.A?.UserData as Behaviour;
             var ownerB = contactEvent.B?.UserData as Behaviour;
-            DispatchToEntity(ownerA, ownerB, in contactEvent, contactEvent.Normal);
-            DispatchToEntity(ownerB, ownerA, in contactEvent, -contactEvent.Normal);
+            // The OTHER collider for A's callbacks is B's struck child (ChildB), and vice versa.
+            DispatchToEntity(ownerA, ownerB, in contactEvent, contactEvent.Normal, contactEvent.ChildB);
+            DispatchToEntity(ownerB, ownerA, in contactEvent, -contactEvent.Normal, contactEvent.ChildA);
         }
     }
 
     static void DispatchToEntity(Behaviour receiver, Behaviour other, in PhysicsContactEvent contactEvent,
-        Vector3 normalTowardReceiver) {
+        Vector3 normalTowardReceiver, int otherChildIndex) {
         Entity entity = receiver?.Entity;
         if (entity is null)
             return;
 
-        Collider otherCollider = other as Collider ?? (other as Rigidbody)?.PrimaryCollider;
+        // Resolve the exact child collider that was struck (P5) when the other side is a Rigidbody;
+        // a standalone Collider is itself the other collider.
+        Collider otherCollider = other as Collider
+            ?? (other as Rigidbody)?.ColliderForChild(otherChildIndex);
         var collision = new Collision(
             otherCollider,
             other as Rigidbody ?? otherCollider?.AttachedRigidbody,

@@ -2,8 +2,8 @@ using BepuPhysics;
 using BepuPhysics.Collidables;
 using static BallisticEngine.Bepu.BepuMath;
 using NumVector3 = System.Numerics.Vector3;
-using TkQuaternion = OpenTK.Mathematics.Quaternion;
-using TkVector3 = OpenTK.Mathematics.Vector3;
+using TkQuaternion = System.Numerics.Quaternion;   // engine math is System.Numerics now (was OpenTK)
+using TkVector3 = System.Numerics.Vector3;
 
 namespace BallisticEngine.Bepu;
 
@@ -146,5 +146,37 @@ sealed class BepuBody : IPhysicsBody {
         BodyReference body = Body;
         if (!body.Awake)
             body.Awake = true;
+    }
+
+    // ---- Restitution support (velocity-level bounce on contact Enter) --------
+    // Statics report inverse mass 0 (immovable) and zero velocity. These read straight from the
+    // live Bepu body, used by BepuContactTracker to apply a measured coefficient-of-restitution
+    // impulse the instant two bodies start touching.
+
+    internal float InverseMass => Valid && !IsStatic ? Body.LocalInertia.InverseMass : 0f;
+
+    internal NumVector3 CenterOfMass =>
+        !Valid ? default
+        : IsStatic ? world.Simulation.Statics[StaticHandle].Pose.Position
+        : Body.Pose.Position;
+
+    // Velocity of the body at a given world point (linear + angular contribution). Zero for statics.
+    internal NumVector3 VelocityAt(in NumVector3 worldPoint) {
+        if (!Valid || IsStatic)
+            return default;
+        BodyReference body = Body;
+        NumVector3 r = worldPoint - body.Pose.Position;
+        return body.Velocity.Linear + NumVector3.Cross(body.Velocity.Angular, r);
+    }
+
+    // Apply a world-space impulse at a world point straight to the live body (no wake gating change
+    // beyond the standard wake) — used for the restitution velocity flip.
+    internal void ApplyRestitutionImpulse(in NumVector3 impulse, in NumVector3 worldPoint) {
+        if (!Valid || IsStatic)
+            return;
+        BodyReference body = Body;
+        if (!body.Awake)
+            body.Awake = true;
+        body.ApplyImpulse(impulse, worldPoint - body.Pose.Position);
     }
 }

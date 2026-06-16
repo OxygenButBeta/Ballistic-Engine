@@ -29,6 +29,9 @@ public static class BuildPipeline {
         public string Configuration { get; init; } = "Release";
         public string RuntimeIdentifier { get; init; } = "win-x64";
         public bool SelfContained { get; init; } = true;       // bundle .NET so the target needs no runtime.
+
+        // Player identity baked into the published exe. Null → derived from the project manifest.
+        public PlayerSettings Player { get; init; }
     }
 
     public sealed record Result(bool Success, string OutputDir, string ExePath, long TotalBytes, string Error = null);
@@ -44,6 +47,8 @@ public static class BuildPipeline {
     public static Result Build(Options options, Action<string> log = null) {
         log ??= _ => { };
         var project = options.Project;
+        PlayerSettings player = options.Player ?? PlayerSettings.OrDefault(project.Manifest);
+        string productName = string.IsNullOrWhiteSpace(player.ProductName) ? project.Manifest.Name : player.ProductName;
 
         try {
             // 1. Game scripts: make sure GameScripts.dll is current (the player loads it without an SDK).
@@ -71,12 +76,12 @@ public static class BuildPipeline {
 
             Directory.CreateDirectory(options.OutputDir);
             log($"Publishing player ({options.Configuration}, {options.RuntimeIdentifier}, single-file)...");
-            if (!Publish(runtimeCsproj, options, log, out var publishError)) {
+            if (!Publish(runtimeCsproj, options, player, productName, project, log, out var publishError)) {
                 return Fail(options, publishError);
             }
 
-            // 5. Rename the published exe to the game name (root shows just <Game>.exe).
-            var exe = RenameExe(options.OutputDir, project.Manifest.Name, log);
+            // 5. Rename the published exe to the product name (root shows just <Product>.exe).
+            var exe = RenameExe(options.OutputDir, productName, log);
 
             // 6. Copy the trimmed, source-free content into <Game>\Data.
             log("Copying game data...");
@@ -106,7 +111,8 @@ public static class BuildPipeline {
 
     // ---- dotnet publish -----------------------------------------------------
 
-    static bool Publish(string runtimeCsproj, Options options, Action<string> log, out string error) {
+    static bool Publish(string runtimeCsproj, Options options, PlayerSettings player, string productName,
+        BallisticProject project, Action<string> log, out string error) {
         error = null;
 
         var startInfo = new ProcessStartInfo("dotnet") {
@@ -138,6 +144,25 @@ public static class BuildPipeline {
         // onto the engine library and break it — it has no Main). Dev `dotnet run` stays a console Exe.
         startInfo.ArgumentList.Add("-p:ShipBuild=true");
 
+        // --- player identity: baked into the exe's file metadata (Details tab) + AssemblyName so the
+        //     published exe is already named <Product>.exe before the rename step. ---
+        startInfo.ArgumentList.Add($"-p:AssemblyName={Sanitize(productName)}");
+        startInfo.ArgumentList.Add($"-p:Product={Escape(productName)}");
+        if (!string.IsNullOrWhiteSpace(player.CompanyName))
+            startInfo.ArgumentList.Add($"-p:Company={Escape(player.CompanyName)}");
+        if (TryNormalizeVersion(player.Version, out var version)) {
+            startInfo.ArgumentList.Add($"-p:Version={version}");
+            startInfo.ArgumentList.Add($"-p:FileVersion={version}");
+            startInfo.ArgumentList.Add($"-p:InformationalVersion={Escape(player.Version)}");
+        }
+
+        // --- icon: embed the .ico into the exe so it has a custom taskbar/file icon. The project-
+        //     relative path is resolved to absolute; a missing/invalid icon is skipped with a log
+        //     line rather than failing the whole build. ---
+        var iconAbsolute = ResolveIcon(project, player, log);
+        if (iconAbsolute is not null)
+            startInfo.ArgumentList.Add($"-p:ApplicationIcon={iconAbsolute}");
+
         string output;
         int exitCode;
         try {
@@ -164,21 +189,26 @@ public static class BuildPipeline {
         return true;
     }
 
-    // Renames BallisticEngine.Runtime.exe -> <Game>.exe so the root shows the game, not the engine.
-    // Returns the final exe path (unchanged on failure, e.g. name clash). Also drops any stray
-    // BallisticEngine.Runtime.pdb the publish left behind.
+    // Ensures the root shows <Product>.exe. With -p:AssemblyName set, publish already emits
+    // <Product>.exe, so this is usually a no-op; the BallisticEngine.Runtime.exe fallback covers a
+    // publish that ignored the rename (or an empty/invalid product name). Drops stray .pdb either way.
     static string RenameExe(string outputDir, string gameName, Action<string> log) {
-        var published = Path.Combine(outputDir, "BallisticEngine.Runtime.exe");
         var target = Path.Combine(outputDir, Sanitize(gameName) + ".exe");
 
-        var pdb = Path.Combine(outputDir, "BallisticEngine.Runtime.pdb");
-        if (File.Exists(pdb)) { try { File.Delete(pdb); } catch { /* harmless */ } }
+        foreach (var pdb in new[] { "BallisticEngine.Runtime.pdb", Sanitize(gameName) + ".pdb" }) {
+            var p = Path.Combine(outputDir, pdb);
+            if (File.Exists(p)) { try { File.Delete(p); } catch { /* harmless */ } }
+        }
 
-        if (!File.Exists(published) || string.Equals(published, target, StringComparison.OrdinalIgnoreCase))
-            return published;
+        // Already published under the product name (the AssemblyName path) — done.
+        if (File.Exists(target))
+            return target;
+
+        var published = Path.Combine(outputDir, "BallisticEngine.Runtime.exe");
+        if (!File.Exists(published))
+            return target; // nothing to rename; caller still reports the expected path
 
         try {
-            if (File.Exists(target)) File.Delete(target);
             File.Move(published, target);
             return target;
         }
@@ -186,6 +216,50 @@ public static class BuildPipeline {
             log($"  (kept default exe name — rename failed: {e.Message})");
             return published;
         }
+    }
+
+    // MSBuild Product/Company values are passed as one ArgumentList entry, so spaces are fine (no shell
+    // quoting); we only guard against a stray newline that would corrupt the arg.
+    static string Escape(string value) => (value ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
+
+    // dotnet's Version property wants a numeric "x.y.z[.w]". Accept the user's free-form string only if
+    // it normalizes to that; otherwise skip the version props (InformationalVersion still carries the raw
+    // string). "1.0" -> "1.0.0", "v1.2.3" -> "1.2.3", "beta" -> false.
+    static bool TryNormalizeVersion(string raw, out string normalized) {
+        normalized = null;
+        if (string.IsNullOrWhiteSpace(raw))
+            return false;
+        var trimmed = raw.Trim().TrimStart('v', 'V');
+        var parts = trimmed.Split('.');
+        if (parts.Length is < 1 or > 4)
+            return false;
+        var nums = new int[Math.Max(3, parts.Length)];
+        for (int i = 0; i < parts.Length; i++) {
+            if (!int.TryParse(parts[i], out nums[i]) || nums[i] < 0)
+                return false;
+        }
+        normalized = string.Join('.', nums);
+        return true;
+    }
+
+    // Resolves the player's icon to an absolute .ico path, or null (engine default) when unset/invalid.
+    static string ResolveIcon(BallisticProject project, PlayerSettings player, Action<string> log) {
+        if (string.IsNullOrWhiteSpace(player.IconPath))
+            return null;
+
+        var abs = Path.IsPathRooted(player.IconPath)
+            ? player.IconPath
+            : Path.Combine(project.RootPath, player.IconPath);
+
+        if (!File.Exists(abs)) {
+            log($"  (icon not found, using default: {player.IconPath})");
+            return null;
+        }
+        if (!abs.EndsWith(".ico", StringComparison.OrdinalIgnoreCase)) {
+            log($"  (icon must be a .ico, using default: {player.IconPath})");
+            return null;
+        }
+        return abs;
     }
 
     // The Runtime csproj lives in the engine SOURCE tree. The editor runs from <repo>\BallisticEngine.Editor\

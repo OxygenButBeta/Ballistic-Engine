@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.Editor;
 
@@ -35,7 +34,7 @@ internal sealed class EditorCamera : IViewProjectionProvider {
     // yaw/pitch as the inverse of the Update() convention (Forward = qYaw * qPitch * UnitZ, i.e.
     // Forward = (cosP*sinY, -sinP, cosP*cosY)).
     public void LookDirection(Vector3 direction) {
-        if (direction.LengthSquared < 1e-6f)
+        if (direction.LengthSquared() < 1e-6f)
             return;
         direction = direction.Normalized();
 
@@ -47,8 +46,8 @@ internal sealed class EditorCamera : IViewProjectionProvider {
         pitch = MathHelper.Clamp(pitch, -90f, 90f);
         yaw = MathHelper.RadiansToDegrees(MathF.Atan2(direction.X, direction.Z));
 
-        Quaternion qPitch = Quaternion.FromAxisAngle(Vector3.UnitX, MathHelper.DegreesToRadians(pitch));
-        Quaternion qYaw = Quaternion.FromAxisAngle(Vector3.UnitY, MathHelper.DegreesToRadians(yaw));
+        Quaternion qPitch = Quaternion.CreateFromAxisAngle(Vector3.UnitX, MathHelper.DegreesToRadians(pitch));
+        Quaternion qYaw = Quaternion.CreateFromAxisAngle(Vector3.UnitY, MathHelper.DegreesToRadians(yaw));
         transform.Rotation = qYaw * qPitch;
 
         transform.Position = focus - transform.Forward * orbitDistance;
@@ -60,10 +59,10 @@ internal sealed class EditorCamera : IViewProjectionProvider {
     }
 
     public Matrix4 GetViewMatrix() =>
-        Matrix4.LookAt(transform.Position, transform.Position + transform.Forward, transform.Up);
+        BMatrix.LookAt(transform.Position, transform.Position + transform.Forward, transform.Up);
 
     public Matrix4 GetProjectionMatrix() =>
-        Matrix4.CreatePerspectiveFieldOfView(MathHelper.DegreesToRadians(fovDegrees), aspect, nearPlane, farPlane);
+        BMatrix.CreatePerspectiveFieldOfView(MathHelper.DegreesToRadians(fovDegrees), aspect, nearPlane, farPlane);
 
     bool flying;
 
@@ -81,8 +80,8 @@ internal sealed class EditorCamera : IViewProjectionProvider {
         pitch += input.MouseDelta.Y * sensitivity;
         pitch = MathHelper.Clamp(pitch, -89f, 89f);
 
-        Quaternion qPitch = Quaternion.FromAxisAngle(Vector3.UnitX, MathHelper.DegreesToRadians(pitch));
-        Quaternion qYaw = Quaternion.FromAxisAngle(Vector3.UnitY, MathHelper.DegreesToRadians(yaw));
+        Quaternion qPitch = Quaternion.CreateFromAxisAngle(Vector3.UnitX, MathHelper.DegreesToRadians(pitch));
+        Quaternion qYaw = Quaternion.CreateFromAxisAngle(Vector3.UnitY, MathHelper.DegreesToRadians(yaw));
         transform.Rotation = qYaw * qPitch;
 
         Vector3 direction = Vector3.Zero;
@@ -96,5 +95,35 @@ internal sealed class EditorCamera : IViewProjectionProvider {
         float speed = moveSpeed * (input.Key(EditorKey.Shift) ? 2f : 1f);
         if (direction != Vector3.Zero)
             transform.Position += direction.Normalized() * speed * dt;
+    }
+
+    // "px,py,pz,pitch,yaw" — persisted per project so the Scene-view camera reopens where it was.
+    public string SerializePose() {
+        Vector3 p = transform.Position;
+        return string.Format(System.Globalization.CultureInfo.InvariantCulture,
+            "{0},{1},{2},{3},{4}", p.X, p.Y, p.Z, pitch, yaw);
+    }
+
+    // Applies a pose string produced by SerializePose. No-ops on malformed input.
+    public void RestorePose(string pose) {
+        if (string.IsNullOrEmpty(pose))
+            return;
+        var parts = pose.Split(',');
+        if (parts.Length != 5)
+            return;
+        var ci = System.Globalization.CultureInfo.InvariantCulture;
+        if (!float.TryParse(parts[0], System.Globalization.NumberStyles.Float, ci, out float px) ||
+            !float.TryParse(parts[1], System.Globalization.NumberStyles.Float, ci, out float py) ||
+            !float.TryParse(parts[2], System.Globalization.NumberStyles.Float, ci, out float pz) ||
+            !float.TryParse(parts[3], System.Globalization.NumberStyles.Float, ci, out float pi) ||
+            !float.TryParse(parts[4], System.Globalization.NumberStyles.Float, ci, out float yw))
+            return;
+
+        pitch = MathHelper.Clamp(pi, -89f, 89f);
+        yaw = yw;
+        Quaternion qPitch = Quaternion.CreateFromAxisAngle(Vector3.UnitX, MathHelper.DegreesToRadians(pitch));
+        Quaternion qYaw = Quaternion.CreateFromAxisAngle(Vector3.UnitY, MathHelper.DegreesToRadians(yaw));
+        transform.Rotation = qYaw * qPitch;
+        transform.Position = new Vector3(px, py, pz);
     }
 }

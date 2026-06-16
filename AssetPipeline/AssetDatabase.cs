@@ -25,9 +25,10 @@ public static class AssetDatabase {
         loadedAssets.Clear();
         assetToGuid.Clear();
 
-        // The engine layer can't know the project layout; hand it the probe-bake cache homes.
-        IrradianceVolume.CacheDirectory = Path.Combine(project.LibraryPath, "ProbeVolumes");
-        ReflectionVolume.CacheDirectory = Path.Combine(project.LibraryPath, "ReflectionProbes");
+        // The engine layer can't know the project layout; hand it the probe-bake cache homes. (Inert on
+        // DX12 — no baker writes them; kept for a future probe fallback, GI plan P7.)
+        ProbeRenderState.ProbeCacheDirectory = Path.Combine(project.LibraryPath, "ProbeVolumes");
+        ProbeRenderState.ReflectionCacheDirectory = Path.Combine(project.LibraryPath, "ReflectionProbes");
     }
 
     // forceAll = true rebuilds every Library artifact from source (Unity's "Reimport All").
@@ -67,6 +68,13 @@ public static class AssetDatabase {
     public static Action<string> ImportProgress {
         get => pipeline?.Progress;
         set { if (pipeline is not null) pipeline.Progress = value; }
+    }
+
+    // Numeric import progress (completed, total) for a determinate progress bar. Same threading as
+    // ImportProgress (fires on the Refresh thread).
+    public static Action<int, int> ImportProgressCount {
+        get => pipeline?.ProgressCount;
+        set { if (pipeline is not null) pipeline.ProgressCount = value; }
     }
 
     public static bool TryGetGuid(string assetPath, out Guid guid) =>
@@ -212,6 +220,8 @@ public static class AssetDatabase {
 
         return extension switch {
             ".fbx" or ".obj" or ".gltf" or ".glb" or ".dae" => MeshLoader.Load(pipeline, guid, assetPath),
+            ".wav" or ".wave" or ".ogg" => AudioClipLoader.Load(pipeline, guid, assetPath),
+            ".banim" => AnimationClipLoader.Load(Project, assetPath),
             _ when isImage => TextureLoader.Load(pipeline, guid, assetPath),
             ".shader" => ShaderProgramLoader.Load(Project, assetPath),
             ".mat" => MaterialLoader.Load(Project, assetPath),

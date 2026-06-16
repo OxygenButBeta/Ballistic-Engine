@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -15,12 +14,31 @@ public class Material : BObject
     public Vector3 EmissiveColor { get; set; } = Vector3.One;
     public float EmissiveIntensity { get; set; } = 1f;
 
+    // True when this material emits light — an emissive MAP, or an authored emissive COLOR (the
+    // loader sets it; EmissiveColor defaults to white so the color alone can't be the signal). The
+    // renderer's HasEmissive gates on this, so a COLOR-ONLY emissive (neon, screens, area lights,
+    // the Cornell light) emits, not just textured emissives. Default false (a plain material is
+    // not emissive even though EmissiveColor defaults to white).
+    public bool IsEmissive { get; set; }
+
     // Scalar PBR factors (glTF semantics): BaseColorFactor tints the albedo map, Metallic/
     // RoughnessFactor multiply their maps (or stand alone when the slot has no texture).
     // MetallicFactor defaults to 0 so an untextured material is a dielectric, not chrome.
     public Vector4 BaseColorFactor { get; set; } = Vector4.One;
     public float MetallicFactor { get; set; }
     public float RoughnessFactor { get; set; } = 1f;
+
+    // Dielectric specular reflectance (glTF KHR_materials_specular): the F0 of a non-metal at
+    // normal incidence is 0.08 * SpecularReflectance, so 0.5 = F0 0.04 = the default 4% dielectric
+    // (byte-identical to the old hardcoded 0.04). Raise for gems/water/varnish (higher IOR), lower
+    // for chalk/cloth. Metals ignore it (F0 = albedo). The renderer multiplies F0's dielectric base.
+    public float SpecularReflectance { get; set; } = 0.5f;
+
+    // CLEARCOAT (glTF KHR_materials_clearcoat): a thin transparent lacquer layer over the base —
+    // car paint, varnish, wet surfaces. A second GGX specular lobe (fixed F0 ~0.04) with its own
+    // low roughness, plus it attenuates the base layer by its Fresnel. 0 = no coat (default, off).
+    public float Clearcoat { get; set; }
+    public float ClearcoatRoughness { get; set; } = 0.1f;
 
     // Normal map controls. FlipY = DirectX-convention map (G down), the common game-content case.
     public float NormalStrength { get; set; } = 1f;
@@ -66,9 +84,13 @@ public class Material : BObject
             Name = Name + " (Instance)",
             EmissiveColor = EmissiveColor,
             EmissiveIntensity = EmissiveIntensity,
+            IsEmissive = IsEmissive,
             BaseColorFactor = BaseColorFactor,
             MetallicFactor = MetallicFactor,
             RoughnessFactor = RoughnessFactor,
+            SpecularReflectance = SpecularReflectance,
+            Clearcoat = Clearcoat,
+            ClearcoatRoughness = ClearcoatRoughness,
             NormalStrength = NormalStrength,
             NormalFlipY = NormalFlipY,
             Transparent = Transparent,

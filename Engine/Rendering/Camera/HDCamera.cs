@@ -1,4 +1,3 @@
-﻿using OpenTK.Mathematics;
 using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine;
@@ -34,9 +33,9 @@ public class HDCamera : Behaviour, IViewProjectionProvider
         // parent's origin. WorldRotation drives the basis so look direction follows the parent too.
         Vector3 eye = transform.WorldPosition;
         Quaternion worldRotation = transform.WorldRotation;
-        Vector3 forward = worldRotation * Vector3.UnitZ;
-        Vector3 up = worldRotation * Vector3.UnitY;
-        return Matrix4.LookAt(eye, eye + forward, up);
+        Vector3 forward = Vector3.Transform(Vector3.UnitZ, worldRotation);
+        Vector3 up = Vector3.Transform(Vector3.UnitY, worldRotation);
+        return BMatrix.LookAt(eye, eye + forward, up);
     }
 
     public Vector3 AmbientColor =>
@@ -63,7 +62,7 @@ public class HDCamera : Behaviour, IViewProjectionProvider
 
     public Matrix4 GetProjectionMatrix()
     {
-        return Matrix4.CreatePerspectiveFieldOfView(MathHelper.DegreesToRadians(45.0f),
+        return BMatrix.CreatePerspectiveFieldOfView(MathHelper.DegreesToRadians(45.0f),
             (float)window.Width / window.Height,
             nearPlane, farPlane);
     }

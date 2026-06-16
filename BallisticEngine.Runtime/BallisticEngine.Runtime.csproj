@@ -14,6 +14,10 @@
     <ItemGroup>
       <ProjectReference Include="..\BallisticEngine.csproj" />
       <ProjectReference Include="..\BallisticEngine.Profiling.Tracy\BallisticEngine.Profiling.Tracy.csproj" />
+      <!-- DX12 backend host (BALLISTIC_BACKEND=dx12). The Runtime is the host that chooses the backend;
+           it references the DX12 project so it can construct the DX12 runtime. (Vortice stays out of the
+           core engine library — only the host exe takes the dependency, like the Tracy backend.) -->
+      <ProjectReference Include="..\BallisticEngine.DX12\BallisticEngine.DX12.csproj" />
     </ItemGroup>
 
 </Project>

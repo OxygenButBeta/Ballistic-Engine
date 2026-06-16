@@ -37,30 +37,47 @@ public static class VolumePostProcessing {
             fx.MsaaSamples = aa.msaaSamples.Value;
         }
 
-        if (stack.GetComponent<ScreenSpaceReflections>() is { } ssr) {
-            fx.SsrEnabled = ssr.enabled.Value;
-            fx.SsrIntensity = ssr.intensity.Value;
+        if (stack.GetComponent<Upscaling>() is { } upscale) {
+            fx.UpscaleMode = upscale.mode.Value;
+            fx.UpscaleSharpness = upscale.sharpness.Value;
         }
 
-        if (stack.GetComponent<ScreenSpaceGlobalIllumination>() is { } ssgi) {
-            fx.SsgiEnabled = ssgi.enabled.Value;
-            fx.SsgiLook = ssgi.look.Value;
-            fx.SsgiDebugView = ssgi.debugView.Value;
-            fx.SsgiSkyFallback = ssgi.skyFallback.Value;
-            fx.SsgiRayCount = ssgi.rayCount.Value;
-            fx.SsgiMaxHistory = ssgi.maxHistory.Value;
-            fx.SsgiDenoise = ssgi.denoise.Value;
-            fx.SsgiRayLength = ssgi.rayLength.Value;
-            fx.SsgiFalloff = ssgi.falloff.Value;
-            fx.SsgiThickness = ssgi.thickness.Value;
-            fx.SsgiIntensity = ssgi.intensity.Value;
-            fx.SsgiTint = ssgi.tint.Value;
-            fx.SsgiSaturation = ssgi.saturation.Value;
-            fx.SsgiOcclusionPower = ssgi.occlusionPower.Value;
-            fx.SsgiMultiBounce = ssgi.multiBounce.Value;
-            // Retired dials (IBL carries the ambient base now); pinned to 0, no volume override.
-            fx.SsgiBounceBoost = 0f;
-            fx.SsgiAmbientFloor = 0f;
+        // THE unified Global Illumination volume — indirect light only (diffuse GI + reflections).
+        // Replaced the old ScreenSpaceGlobalIllumination + ScreenSpaceReflections + the dead GL
+        // probe/Lumen split overrides (P0.5 consolidation). The two Mode dropdowns each carry their own
+        // Off, so the enable bool is derived from the mode (no separate enable param to keep in sync).
+        if (stack.GetComponent<GlobalIllumination>() is { } gi) {
+            // MASTER SWITCH: enabled=false is a HARD STOP for the whole Lumen stack. We force every GI/
+            // reflection mode to Off here (overriding the dropdowns) so EVERY downstream reader — SSGI,
+            // RT-GI, SSR, RT-reflections, DDGI, screen probes, emissive-as-GI — sees "off" with no extra
+            // wiring. The renderer also hard-gates DDGI/screen-probe allocation on these same fields.
+            bool on = gi.enabled.Value;
+
+            // Diffuse GI.
+            fx.GiMode = on ? gi.giMode.Value : GiMode.Off;
+            fx.SsgiEnabled = on && gi.giMode.Value != GiMode.Off;
+            fx.SsgiIntensity = gi.intensity.Value;
+            fx.SsgiDebugView = on && gi.giIsolate.Value;
+            fx.GiEmissive = on && gi.emissiveAsGi.Value;   // emissive surfaces as area lights in the bounce
+            // Ray-Traced GI quality (DDGI world cache + screen probes). Part of the hard kill: off when the
+            // master switch is off, so the whole Lumen world/screen-probe machinery stops too.
+            fx.Ddgi = on && gi.worldRadianceCache.Value;
+            fx.ScreenProbes = on && gi.screenProbes.Value;
+            // Reflections (Off maps to SsrEnabled=false; the renderer's SSR-vs-RT gate keeps working).
+            fx.ReflectionMode = on ? gi.reflectionsMode.Value : ReflectionMode.Off;
+            fx.SsrEnabled = on && gi.reflectionsMode.Value != ReflectionMode.Off;
+            fx.SsrIntensity = gi.reflectionsIntensity.Value;
+            // Advanced bounce / temporal / look dials (every one is consumed by the DX12 SSGI/RT-GI path).
+            fx.SsgiRayLength = gi.rayLength.Value;
+            fx.SsgiFalloff = gi.falloff.Value;
+            fx.SsgiThickness = gi.thickness.Value;
+            fx.SsgiBounceBoost = gi.bounceBoost.Value;   // shader Params1.x (was hardcoded 0)
+            fx.SsgiOcclusionPower = gi.occlusionPower.Value;
+            fx.SsgiRayCount = gi.rayCount.Value;
+            fx.SsgiMaxHistory = gi.maxHistory.Value;
+            fx.SsgiLook = gi.look.Value;
+            fx.SsgiTint = gi.tint.Value;
+            fx.SsgiSaturation = gi.saturation.Value;
         }
 
         if (stack.GetComponent<Shadows>() is { } shadows) {
@@ -75,17 +92,20 @@ public static class VolumePostProcessing {
             fx.ContactShadowLength = shadows.contactLength.Value;
             fx.ContactShadowSteps = shadows.contactSteps.Value;
             fx.ContactShadowThickness = shadows.contactThickness.Value;
+            fx.RayTracedShadows = shadows.rayTracedShadows.Value;
         }
 
-        if (stack.GetComponent<VolumetricLight>() is { } volumetric) {
+        if (stack.GetComponent<VolumetricFog>() is { } volumetric) {
             fx.VolumetricEnabled = volumetric.enabled.Value;
             fx.VolumetricIntensity = volumetric.intensity.Value;
             fx.VolumetricDensity = volumetric.density.Value;
+            fx.VolumetricHeightFalloff = volumetric.heightFalloff.Value;
+            fx.VolumetricBaseHeight = volumetric.baseHeight.Value;
             fx.VolumetricScattering = volumetric.scattering.Value;
+            fx.VolumetricAmbientScatter = volumetric.ambientScatter.Value;
             fx.VolumetricAnisotropy = volumetric.anisotropy.Value;
             fx.VolumetricSunGlow = volumetric.sunGlow.Value;
             fx.VolumetricSunGlowSharpness = volumetric.sunGlowSharpness.Value;
-            fx.VolumetricAmbientFloor = volumetric.ambientFloor.Value;
             fx.VolumetricStepCount = volumetric.stepCount.Value;
             fx.VolumetricMaxDistance = volumetric.maxDistance.Value;
             fx.VolumetricFeedback = volumetric.feedback.Value;

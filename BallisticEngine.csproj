@@ -15,7 +15,11 @@
     <ItemGroup>
       <Compile Remove="BallisticEngine.Runtime\**\*.cs" />
       <Compile Remove="BallisticEngine.Editor\**\*.cs" />
+      <Compile Remove="BallisticEngine.Cli\**\*.cs" />
+      <Compile Remove="BallisticEngine.Mcp\**\*.cs" />
       <Compile Remove="BallisticEngine.Profiling.Tracy\**\*.cs" />
+      <Compile Remove="BallisticEngine.DX12\**\*.cs" />
+      <Compile Remove="BallisticEngine.SourceGen\**\*.cs" />
       <Compile Remove="Tools\**\*.cs" />
       <Compile Remove="SampleProject\**\*.cs" />
     </ItemGroup>
@@ -23,7 +27,13 @@
     <ItemGroup>
       <PackageReference Include="AssimpNet" Version="4.1.0" />
       <PackageReference Include="BepuPhysics" Version="2.4.0" />
+      <!-- The networking transport (plan §12.1). Pure-managed, MIT, no native build — quarantined to
+           Networking/LiteNetLib/ exactly like BepuPhysics is quarantined to Physics/Bepu (the ONLY
+           folder allowed to reference it; grep-auditable per CLAUDE.md layering). API pinned + proven
+           over a real localhost socket in %TEMP%\bal-litenetlib-test before integration. -->
+      <PackageReference Include="LiteNetLib" Version="2.1.4" />
       <PackageReference Include="Magick.NET-Q16-HDRI-AnyCPU" Version="14.14.0" />
+      <PackageReference Include="NVorbis" Version="0.10.5" />
       <PackageReference Include="OpenTK" Version="4.9.4" />
       <PackageReference Include="StbImageSharp" Version="2.30.15" />
       <PackageReference Include="StbTrueTypeSharp" Version="1.26.12" />
@@ -31,8 +41,29 @@
       <PackageReference Include="ZeroAllocJobScheduler" Version="1.1.2" />
     </ItemGroup>
 
+    <!-- The networking source generator (plan §11) — referenced as an ANALYZER (OutputItemType /
+         ReferenceOutputAssembly=false), never a runtime dependency. It emits SerializeState/DeserializeState
+         + the registration table for engine-defined NetworkBehaviour subtypes that carry [Networked]/[Rpc].
+         Game scripts get it transitively through GameScripts.csproj's ProjectReference to the engine. -->
     <ItemGroup>
-      <EmbeddedResource Include="OpenGL\Shader\Embedded\*.glsl" />
+      <ProjectReference Include="BallisticEngine.SourceGen\BallisticEngine.SourceGen.csproj"
+                        OutputItemType="Analyzer"
+                        ReferenceOutputAssembly="false" />
+    </ItemGroup>
+
+    <!-- Native OpenAL runtime (OpenAL-Soft). OpenTK ships only the MANAGED bindings, which
+         DllImport "OpenAL32.dll" — Windows has no system OpenAL, so without this the audio
+         backend gracefully disables itself and every sound is silent. Shipping the DLL next to
+         the exe makes audio work out of the box for the editor, the player, and any GAME built
+         on the engine (the file flows transitively through ProjectReference to every host, and
+         CopyToPublishDirectory carries it into `dotnet publish` ship builds). -->
+    <ItemGroup>
+      <None Include="Audio\Native\OpenAL32.dll" Condition="Exists('Audio\Native\OpenAL32.dll')">
+        <Link>OpenAL32.dll</Link>
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+        <Visible>false</Visible>
+      </None>
     </ItemGroup>
 
 </Project>

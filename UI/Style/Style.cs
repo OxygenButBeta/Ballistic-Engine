@@ -131,6 +131,10 @@ public sealed class Style
     public string FontFamily;
     public float LetterSpacing;
 
+    // Text alignment within the element's box (CSS text-align × vertical). Null = use the Label's own
+    // default (MiddleLeft). Set via USS `text-align` / `-unity-text-align`; the Label reads it.
+    public TextAlign? TextAlign;
+
     // CSS text-shadow: an offset + blur radius + color drawn behind the glyphs. Used both for
     // legibility (dark drop shadow) and glow (large blur, colored). HasTextShadow gates it.
     public bool HasTextShadow;

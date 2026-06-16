@@ -1,4 +1,4 @@
-#version 330 core
+#version 460 core
 layout(location = 0) in vec3 aPosition;
 layout(location = 1) in vec2 aTexCoord;
 layout(location = 2) in vec3 aNormal;
@@ -81,6 +81,8 @@ layout(std140) uniform PassData {
     bool ReflectionBlendWithSky;
     bool EnableAtmosphericScattering;
     float ReflectionIntensityLocal;
+    float ProbeIntensity;            // GlobalIllumination volume: diffuse-probe ambient strength (1 = unchanged)
+    float AmbientFloor;              // tiny shadow-fill so interiors never crush to pure black (default ~0.03)
 };
 
 void main()

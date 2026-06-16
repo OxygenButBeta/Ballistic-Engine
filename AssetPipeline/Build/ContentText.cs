@@ -18,6 +18,16 @@ public static class ContentText {
         return File.Exists(absolute) ? File.ReadAllText(absolute) : null;
     }
 
+    // Returns a BINARY asset's bytes (e.g. .banim animation clips), pack-aware. Null if missing.
+    public static byte[] ReadBytes(BallisticProject project, string assetPath) {
+        var logical = assetPath.Replace('\\', '/');
+        if (ContentMount.HasAny && ContentMount.TryReadBytes(logical, out var packed))
+            return packed;
+
+        var absolute = project.ResolveAbsolute(assetPath);
+        return File.Exists(absolute) ? File.ReadAllBytes(absolute) : null;
+    }
+
     // Deserializes a JSON text asset via PipelineJson, pack-aware. Returns default(T) when missing.
     public static T ReadJson<T>(BallisticProject project, string assetPath) {
         var text = Read(project, assetPath);

@@ -56,11 +56,6 @@ public sealed class ColorUsageAttribute : Attribute {
     public ColorUsageAttribute(bool hdr = false) => Hdr = hdr;
 }
 
-// Parity marker only. The engine already serializes public mutable fields; this attribute exists so
-// component code reads like Unity's. It has no behaviour of its own in v1.
-[AttributeUsage(AttributeTargets.Field, Inherited = false)]
-public sealed class SerializeFieldAttribute : Attribute { }
-
 // Excludes the member from BOTH scene serialization and the inspector: runtime-only state exposed
 // as a public read/write property (e.g. Rigidbody.Velocity) that must never be authored into
 // .scene files. The opposite trade-off from [HideInInspector], which keeps serialization.
@@ -74,6 +69,27 @@ public sealed class NotSerializedAttribute : Attribute { }
 public sealed class ButtonAttribute : Attribute {
     public string Label { get; }
     public ButtonAttribute(string label = null) => Label = label;
+}
+
+// Adds the decorated PARAMETERLESS method to the component's "..." / right-click context menu in the
+// inspector (Unity's [ContextMenu]). For one-shot actions you want tucked away rather than shown as a
+// full-width [Button]. Label defaults to the method name.
+[AttributeUsage(AttributeTargets.Method, AllowMultiple = false, Inherited = false)]
+public sealed class ContextMenuAttribute : Attribute {
+    public string Label { get; }
+    public ContextMenuAttribute(string label = null) => Label = label;
+}
+
+// Marks a PARAMETERLESS method as an "open editor window" trigger: the inspector shows a window-style
+// button for it, and clicking opens a dedicated EditorWindow showing this component in a large, focused
+// view (Unity's custom EditorWindow entry point, reduced to "give me a big window for this component").
+// Use it for components whose authoring is awkward in the narrow inspector column (curves, graphs,
+// large tables). Title defaults to "<Component>". The method itself still runs on click (so it can set
+// up state), then the window opens.
+[AttributeUsage(AttributeTargets.Method, AllowMultiple = false, Inherited = false)]
+public sealed class EditorWindowExecutionPointAttribute : Attribute {
+    public string Title { get; }
+    public EditorWindowExecutionPointAttribute(string title = null) => Title = title;
 }
 
 // Puts this member (and following members that share the same group name) inside a collapsible

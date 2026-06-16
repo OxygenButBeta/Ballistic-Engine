@@ -1,3 +1,4 @@
+
 namespace BallisticEngine.Editor;
 
 // Shared selection state across panels. Selecting an entity clears the asset selection and
@@ -6,6 +7,11 @@ namespace BallisticEngine.Editor;
 // selected asset, while SelectedAssetPath/Guid stay the "active" one (shown in the Inspector).
 internal sealed class EditorState {
     Entity selected;
+
+    // Where newly-created entities should spawn — a point a short distance in front of the scene-view
+    // camera (Unity's "create in front of the SceneView"), refreshed each frame by EditorApplication
+    // from the editor camera. Panels read this instead of dropping new objects at world origin.
+    public Vector3 SceneSpawnPoint { get; set; } = Vector3.Zero;
 
     // The "active" entity — shown in the Inspector. Setting it directly (used by a few legacy sites)
     // collapses the multi-selection to just this entity, matching Unity's "click selects one".
@@ -72,6 +78,19 @@ internal sealed class EditorState {
         return true;
     }
 
+    // An asset path the inspector asked the asset browser to REVEAL (navigate to its folder + select
+    // it), so clicking an asset reference jumps to it in the browser instead of swapping the inspector.
+    // Set by the inspector, consumed once per frame by the asset browser (same pattern as ViewportDirty).
+    public string RevealAssetRequest { get; private set; }
+
+    public void RequestRevealAsset(string path) => RevealAssetRequest = path;
+
+    public string ConsumeRevealAsset() {
+        string p = RevealAssetRequest;
+        RevealAssetRequest = null;
+        return p;
+    }
+
     // Every selected asset, in selection order. Non-empty iff an asset selection exists;
     // single-click selection is a one-element list.
     public List<(string Path, Guid Guid)> SelectedAssets { get; } = new();
@@ -120,6 +139,10 @@ internal sealed class EditorState {
     public void SelectAssets(IEnumerable<(string Path, Guid Guid)> items, (string Path, Guid Guid) active) {
         SelectedAssets.Clear();
         SelectedAssets.AddRange(items);
+        // Keep the active asset IN the selection set (mirrors SelectEntities) — otherwise the inspector's
+        // active asset wouldn't read as selected in the browser and batch ops would skip it.
+        if (!SelectedAssets.Any(a => a.Guid == active.Guid))
+            SelectedAssets.Add(active);
         SetActiveAsset(active.Path, active.Guid);
     }
 

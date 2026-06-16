@@ -15,11 +15,21 @@ public sealed class ModelImporter : IAssetImporter {
     static readonly string[] Extensions = [".fbx", ".obj", ".gltf", ".glb", ".dae"];
 
     public const string DefaultShaderRef = "Assets/Default/Shaders/Standard.shader";
+    // Skinned meshes need the GPU-skinning vertex stage; their generated materials use this shader.
+    public const string SkinnedShaderRef = "Assets/Default/Shaders/SkinnedStandard.shader";
 
     public string Name => "ModelImporter";
     // v3: vec4 tangents (handedness) + scalar PBR factors in .mat
     // v4: split-by-nodes submeshes + node hierarchy table (BMSH v5), default ON
-    public int Version => 4;
+    // v5: skinned-mesh import (bones/weights/skeleton in BMSH v6) + sibling .banim animation assets
+    // v6: glTF skinned materials carry PBR textures (extracted from embedded/external images) + factors
+    // v7: filename-convention texture auto-bind for materials the source binds nothing to
+    //     (Quixel Megascans / textures.com / Substance: empty FBX material + sibling "<stem>_4K_*.jpg")
+    // v8: FBX unit conversion — cm-authored models (UnitScaleFactor) no longer import 100x too big.
+    //     scaleFactor setting (0 = auto from file units).
+    // v9: FBX Z-up axis conversion (UpAxis=2 → -90°X bake, Unity-importer parity) — scan-pack
+    //     meshes no longer lie tipped 90° relative to converted Unity scene transforms.
+    public int Version => 9;
     public string ArtifactExtension => ".bmesh";
 
     // Generates a sibling "<Model>_Materials/" folder of .mat assets.
@@ -37,12 +47,17 @@ public sealed class ModelImporter : IAssetImporter {
         // set false per asset to merge submeshes by material instead (far fewer draw calls;
         // the right call for huge static set dressing).
         ["splitByNodes"] = true,
+        // Uniform scale baked into the mesh. 0 = AUTO: derive from the file's own units (FBX
+        // UnitScaleFactor — cm-authored content imports at the right metric size instead of 100x).
+        // Set a positive value to force a scale (Unity's "Scale Factor").
+        ["scaleFactor"] = 0.0,
     };
 
     public void Import(AssetImportContext context) {
         var flipUVs = context.Settings?["flipUVs"]?.GetValue<bool>() ?? true;
         var meshIndex = context.Settings?["meshIndex"]?.GetValue<int>() ?? -1;
         var splitByNodes = context.Settings?["splitByNodes"]?.GetValue<bool>() ?? true;
+        var scaleFactor = (float)(context.Settings?["scaleFactor"]?.GetValue<double>() ?? 0.0);
 
         if (meshIndex >= 0) {
             // Legacy single-mesh import: geometry only, mesh-local space, no materials.
@@ -51,19 +66,115 @@ public sealed class ModelImporter : IAssetImporter {
             return;
         }
 
-        DecodedModel model = AssimpMeshDecoder.DecodeScene(context.SourceAbsolutePath, flipUVs, splitByNodes);
-
+        var importSkin = context.Settings?["importSkin"]?.GetValue<bool>() ?? true;
         var generateMaterials = context.Settings?["generateMaterials"]?.GetValue<bool>() ?? true;
+
+        // Skinned models take the bind-space decode path (vertices NOT baked by node transform —
+        // the bones place them) and emit sibling .banim animation assets. Falls through to the
+        // static path when the model has no bones, so non-skinned imports are byte-identical to v4.
+        //
+        // glTF/glb skin goes through the NATIVE GltfSkinDecoder: AssimpNet 4.1.0's native build
+        // silently drops glTF2 skin data (every rigged glTF reads hasBones=false), so Assimp can't
+        // import it. FBX/other formats still use AssimpSkinDecoder, whose FBX skin support works.
+        if (importSkin) {
+            var ext = Path.GetExtension(context.SourceAbsolutePath).ToLowerInvariant();
+            if (GltfSkinDecoder.SupportsExtension(ext)) {
+                if (GltfSkinDecoder.HasSkin(context.SourceAbsolutePath)) {
+                    ImportSkinned(context, generateMaterials, GltfSkinDecoder.Decode(context.SourceAbsolutePath, flipUVs));
+                    return;
+                }
+            }
+            else if (AssimpSkinDecoder.SceneHasSkin(context.SourceAbsolutePath, flipUVs)) {
+                ImportSkinned(context, generateMaterials, AssimpSkinDecoder.Decode(context.SourceAbsolutePath, flipUVs));
+                return;
+            }
+        }
+
+        DecodedModel model = AssimpMeshDecoder.DecodeScene(
+            context.SourceAbsolutePath, flipUVs, splitByNodes, scaleFactor);
         MeshData data = generateMaterials ? GenerateMaterials(context, model) : model.Mesh;
+        MeshArtifact.Write(context.ArtifactAbsolutePath, in data);
+    }
+
+    // ---- Skinned import -----------------------------------------------------
+
+    // Shared by the glTF (native) and FBX (Assimp) skin decoders — both produce a
+    // DecodedSkinnedModel, so material generation + artifact + .banim writing is identical.
+    void ImportSkinned(AssetImportContext context, bool generateMaterials,
+        AssimpSkinDecoder.DecodedSkinnedModel model) {
+
+        // Wrap the skinned mesh in a DecodedModel so the existing material generator applies
+        // unchanged (it only reads SubMeshes + SubMeshMaterials and rewrites MaterialRefs). Skinned
+        // materials use the SkinnedStandard shader (GPU skinning vertex stage).
+        var wrapped = new DecodedModel { Mesh = model.Mesh, SubMeshMaterials = model.SubMeshMaterials };
+        MeshData data = generateMaterials ? GenerateMaterials(context, wrapped, SkinnedShaderRef) : model.Mesh;
+
+        // GenerateMaterials rebuilds MeshData from the static ctor (dropping skin) — re-attach the
+        // skin/skeleton that decode produced so the artifact carries them.
+        if (data.Skeleton.BoneCount == 0 && model.Mesh.IsSkinned)
+            data = new MeshData(data.Vertices, data.Indices, data.UVs, data.Normals, data.Tangents,
+                data.SubMeshes, data.Nodes, model.Mesh.BoneIndices, model.Mesh.BoneWeights, model.Mesh.Skeleton);
 
         MeshArtifact.Write(context.ArtifactAbsolutePath, in data);
+
+        WriteAnimationAssets(context, model.Animations);
+    }
+
+    // Writes one sibling "<Model>_Animations/<clip>.banim" per source animation, GUID-stamped via a
+    // .meta (NativeAssetImporter-style — the .banim IS the artifact, read straight back). Rewritten
+    // on every reimport, like the generated materials folder.
+    void WriteAnimationAssets(AssetImportContext context, AnimationClipData[] animations) {
+        if (animations is null || animations.Length == 0)
+            return;
+        if (!TryGetProjectRoot(context, out var projectRoot)) {
+            Debugging.LogWarning($"'{context.AssetPath}': cannot determine project root; animations skipped.");
+            return;
+        }
+
+        var modelDirAbsolute = Path.GetDirectoryName(context.SourceAbsolutePath)!;
+        var modelStem = Path.GetFileNameWithoutExtension(context.AssetPath);
+        var animationsDirAbsolute = Path.Combine(modelDirAbsolute, $"{modelStem}_Animations");
+
+        try {
+            Directory.CreateDirectory(animationsDirAbsolute);
+        }
+        catch (Exception exception) {
+            Debugging.LogWarning($"'{context.AssetPath}': cannot create animations folder: {exception.Message}");
+            return;
+        }
+
+        var usedNames = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (AnimationClipData clip in animations) {
+            var baseName = SanitizeFileName(clip.Name);
+            var fileName = baseName;
+            if (usedNames.TryGetValue(baseName, out int count)) {
+                fileName = $"{baseName}_{count + 1}";
+                usedNames[baseName] = count + 1;
+            }
+            else {
+                usedNames[baseName] = 1;
+            }
+
+            try {
+                var clipAbsolute = Path.Combine(animationsDirAbsolute, fileName + ".banim");
+                AnimationArtifact.Write(clipAbsolute, in clip);
+
+                // The .banim is read directly as its own artifact; ensure a stable GUID meta.
+                var metaPath = MetaFile.PathFor(clipAbsolute);
+                if (!File.Exists(metaPath))
+                    new MetaFile { Guid = Guid.NewGuid(), Importer = "AnimationImporter" }.Save(metaPath);
+            }
+            catch (Exception exception) {
+                Debugging.LogWarning($"'{context.AssetPath}': failed to write animation '{clip.Name}': {exception.Message}");
+            }
+        }
     }
 
     // ---- Material generation ------------------------------------------------
 
     // Writes one .mat per used source material and returns the mesh data with submesh
     // MaterialRefs pointing at them. Failures degrade per-material (ref stays null).
-    static MeshData GenerateMaterials(AssetImportContext context, DecodedModel model) {
+    static MeshData GenerateMaterials(AssetImportContext context, DecodedModel model, string shaderOverride = null) {
         SubMeshData[] subMeshes = (SubMeshData[])model.Mesh.SubMeshes.Clone();
         DecodedMaterial[] materials = model.SubMeshMaterials ?? [];
 
@@ -76,7 +187,10 @@ public sealed class ModelImporter : IAssetImporter {
         var modelStem = Path.GetFileNameWithoutExtension(context.AssetPath);
         var materialsDirAbsolute = Path.Combine(modelDirAbsolute, $"{modelStem}_Materials");
 
-        var shaderRef = context.Settings?["shader"]?.GetValue<string>();
+        // A skinned import forces the skinning shader; otherwise honor the per-asset setting.
+        var shaderRef = shaderOverride;
+        if (string.IsNullOrWhiteSpace(shaderRef))
+            shaderRef = context.Settings?["shader"]?.GetValue<string>();
         if (string.IsNullOrWhiteSpace(shaderRef))
             shaderRef = DefaultShaderRef;
 
@@ -91,7 +205,8 @@ public sealed class ModelImporter : IAssetImporter {
 
             if (!refByMaterial.TryGetValue(material, out var materialRef)) {
                 materialRef = WriteMaterialAsset(
-                    context, material, materialsDirAbsolute, projectRoot, shaderRef, resolver, fileNameOwners);
+                    context, material, materialsDirAbsolute, modelDirAbsolute, projectRoot,
+                    shaderRef, resolver, fileNameOwners);
                 refByMaterial[material] = materialRef;
             }
 
@@ -104,7 +219,7 @@ public sealed class ModelImporter : IAssetImporter {
     }
 
     static string WriteMaterialAsset(AssetImportContext context, DecodedMaterial material,
-        string materialsDirAbsolute, string projectRoot, string shaderRef,
+        string materialsDirAbsolute, string modelDirAbsolute, string projectRoot, string shaderRef,
         ModelTextureResolver resolver, Dictionary<string, DecodedMaterial> fileNameOwners) {
         var definition = new MaterialDefinition { Shader = shaderRef };
 
@@ -147,6 +262,12 @@ public sealed class ModelImporter : IAssetImporter {
             definition.Textures[slot.ToString()] = textureRef;
         }
 
+        // Fallback for source materials that reference NO textures of their own (Quixel Megascans
+        // and similar: empty FBX material, maps as sibling "<stem>_4K_Albedo.jpg" files). Match by
+        // filename convention. Never runs when the model bound something, so authored materials win.
+        if (definition.Textures.Count == 0)
+            BindByConvention(context, definition, modelDirAbsolute, projectRoot);
+
         try {
             Directory.CreateDirectory(materialsDirAbsolute);
 
@@ -161,6 +282,46 @@ public sealed class ModelImporter : IAssetImporter {
                 $"'{context.AssetPath}': failed to write material '{material.Name}': {exception.Message}");
             return null;
         }
+    }
+
+    // Binds PBR maps by filename convention into a material the source left textureless. Textures
+    // sit beside the model and share its stem ("<stem>_4K_Normal.jpg"). Mirrors WriteMaterialAsset's
+    // per-slot validation (project-relative ref, supported format, .meta type heal).
+    static void BindByConvention(AssetImportContext context, MaterialDefinition definition,
+        string modelDirAbsolute, string projectRoot) {
+        var modelStem = Path.GetFileNameWithoutExtension(context.AssetPath);
+
+        TextureConventionMatcher.Match match = TextureConventionMatcher.Find(
+            modelDirAbsolute, modelStem,
+            ext => TextureImporter.SupportsExtension(ext));
+
+        if (match.Textures.Count == 0)
+            return;
+
+        foreach ((TextureType slot, var absolute) in match.Textures) {
+            var textureRef = ToAssetRef(absolute, projectRoot);
+            if (textureRef is null) {
+                Debugging.LogWarning(
+                    $"'{context.AssetPath}': convention texture '{absolute}' is outside the project; skipped.");
+                continue;
+            }
+            EnsureTextureMeta(absolute, slot);
+            definition.Textures[slot.ToString()] = textureRef;
+        }
+
+        // Megascans ships separate roughness AND gloss; we bind roughness and ignore gloss (no
+        // invert path in the loader). Only warn when gloss is the ONLY shininess map present.
+        if (match.GlossOnly)
+            Debugging.LogWarning(
+                $"'{context.AssetPath}': only a gloss map was found (no roughness); roughness left unbound.");
+
+        // An opacity/mask sibling means the material is alpha-cutout (foliage cards, fences).
+        if (match.HasOpacity)
+            definition.Cutout = true;
+
+        Debugging.Log(
+            $"'{context.AssetPath}': source material had no textures; auto-bound {definition.Textures.Count} " +
+            "map(s) by filename convention.");
     }
 
     // Serializes texture-.meta writes: models import in parallel, and two models referencing the

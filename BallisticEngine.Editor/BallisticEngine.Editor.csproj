@@ -11,6 +11,10 @@
     <ItemGroup>
       <ProjectReference Include="..\BallisticEngine.csproj" />
       <ProjectReference Include="..\BallisticEngine.Profiling.Tracy\BallisticEngine.Profiling.Tracy.csproj" />
+      <!-- DX12 backend: the editor hosts a windowed DX12 swapchain + ImGui DX12 renderer when
+           BALLISTIC_BACKEND=dx12 (editor->DX12, the gateway to deleting GL). Vortice flows in transitively
+           like it does for the Runtime host. -->
+      <ProjectReference Include="..\BallisticEngine.DX12\BallisticEngine.DX12.csproj" />
     </ItemGroup>
 
     <ItemGroup>

@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The Roslyn SOURCE GENERATOR for the gameplay-framework networking layer (plan §11). Scans
+       NetworkBehaviour subtypes at COMPILE time and emits, per type with [Networked] fields, a partial
+       overriding SerializeState/DeserializeState (bit-packed delta) + NetworkTypeId/LayoutHash, plus the
+       (typeId, methodId) RPC dispatch table — so netcode pays ZERO per-tick reflection (the standing
+       rule). A source generator (not IL weaving like FishNet) → the generated C# is BROWSABLE and
+       DEBUGGABLE, and slots into the existing dotnet build → collectible-ALC script pipeline.
+
+       Quarantined like Networking/LiteNetLib (plan §12.2): this is the ONLY project allowed to reference
+       Microsoft.CodeAnalysis. It is referenced as an ANALYZER, never a runtime dependency. -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>   <!-- analyzers must target netstandard2.0 -->
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <EnforceExtendedAnalyzerRules>true</EnforceExtendedAnalyzerRules>
+    <IncludeBuildOutput>false</IncludeBuildOutput>       <!-- ship as analyzer, not a lib -->
+    <IsRoslynComponent>true</IsRoslynComponent>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.8.0" PrivateAssets="all" />
+  </ItemGroup>
+
+</Project>

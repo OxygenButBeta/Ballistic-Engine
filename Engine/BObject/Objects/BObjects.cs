@@ -80,8 +80,8 @@ public static class BObjects {
     // the new root entity. Forwards to the prefab system (PrefabAsset.Instantiate).
     public static Entity Instantiate(PrefabAsset prefab) => prefab?.Instantiate();
 
-    public static Entity Instantiate(PrefabAsset prefab, OpenTK.Mathematics.Vector3 position,
-        OpenTK.Mathematics.Quaternion rotation) => prefab?.Instantiate(position, rotation);
+    public static Entity Instantiate(PrefabAsset prefab, Vector3 position,
+        Quaternion rotation) => prefab?.Instantiate(position, rotation);
 
     // Destroys an entity and its descendants (Unity's Destroy(gameObject)). In edit mode this is
     // immediate; in play mode the entity is flagged and torn down by the scene.

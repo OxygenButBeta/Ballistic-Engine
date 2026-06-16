@@ -36,6 +36,11 @@ public sealed class EngineBootstrap {
 
         Project = BallisticProject.Open(projectPath);
 
+        // Structured log mirror for agents/tools: Library/Logs/engine.jsonl (editable projects
+        // only — a shipped player must not write into its install folder).
+        if (!playerMode)
+            JsonlLog.Start(Path.Combine(Project.LibraryPath, "Logs", "engine.jsonl"));
+
         // Load the project's C# game scripts. In the editor/dev runtime this compiles via `dotnet build`
         // first; in a shipped player the SDK may be absent, so load the pre-built GameScripts.dll as-is.
         // Null when the project has no scripts or they failed to compile (errors are in the log).
@@ -98,9 +103,20 @@ public sealed class EngineBootstrap {
         // file name (so `font-family: 'Cinzel'` resolves Cinzel.ttf), and sets a default.
         RegisterUIFonts();
 
+        // Audio backend (OpenAL), composition-root wiring like physics/renderer: components only
+        // ever see IAudioBackend. Initializes the output device now; degrades to silence (logged)
+        // if no device/driver is present (headless CI), never crashing.
+        Audio.Backend ??= new BallisticEngine.OpenALAudio.OpenALBackend();
+
         // Physics backend (Bepu), composition-root wiring like the renderer below: components
         // only ever see IPhysicsWorld. The simulation runs in play mode, driven by SceneManager.
         Physics.World ??= new BepuPhysicsWorld();
+
+        // Networking orchestrator (gameplay framework, plan §8.1) — a plain engine object, injected
+        // here like Physics.World. Starts Offline (no socket, byte-identical to today); the phase
+        // runner brings up a loopback host when a scene declares a GameMode. NetworkBehaviour/
+        // NetworkObject talk only through the Network facade, so the Engine layer stays transport-free.
+        Network.Manager ??= new NetworkManager();
 
         // Inject the layer collision matrix so the backend filters contacts by layer without
         // referencing the Engine layer's LayerManager directly (same delegate pattern as above).
@@ -157,9 +173,16 @@ public sealed class EngineBootstrap {
     }
 
     void BuildComponentRegistry(System.Reflection.Assembly gameScripts) {
-        ComponentRegistry.Build(gameScripts is null
+        System.Reflection.Assembly[] assemblies = gameScripts is null
             ? [typeof(SceneManager).Assembly, Runtime.GetType().Assembly]
-            : [typeof(SceneManager).Assembly, Runtime.GetType().Assembly, gameScripts]);
+            : [typeof(SceneManager).Assembly, Runtime.GetType().Assembly, gameScripts];
+        ComponentRegistry.Build(assemblies);
+
+        // Gameplay framework (plan §7.3.1): force every InputAction-container type's static fields to
+        // initialize so the full action list is populated up front (for a rebind screen / agent tooling)
+        // — `static readonly InputAction` fields are lazy otherwise. Run once here, like the registry
+        // build; never per-frame. The actions self-register into InputRegistry on first touch.
+        BallisticEngine.InputSystem.InputRegistry.ScanForActions(assemblies);
     }
 
     // Rebuilds the project's script assembly and reloads the current scene over the new types
@@ -204,6 +227,27 @@ public sealed class EngineBootstrap {
             DirectionalLight.Clear();
         }
         VolumeManager.ResetStack();
+
+        // Gameplay-framework reload safety (gate 0c / plan §8.6.2): the InputAction fusion registry is a
+        // host-side static root that holds script-ALC InputAction handles — it MUST be cleared before
+        // GameScripts.Unload or the collectible ALC leaks (a game-defined action pins the old assembly).
+        // It joins the existing "clear scene + registry + volume stack" list; the rebuilt registry's
+        // ScanForActions (in BuildComponentRegistry below) re-registers the NEW assembly's actions.
+        // Network is reset on StopPlay; a LIVE reload also drops the spawned-object table so no script
+        // pawn/controller type lingers (the scene.Clear above despawned them; this empties the registry).
+        BallisticEngine.InputSystem.InputRegistry.ClearForReload();
+        // The SECOND new host-side static root (gate 0c / §8.6.2): the network replication table holds a
+        // descriptor per game-defined NetworkBehaviour subtype (registered by the source generator's
+        // [ModuleInitializer]). It MUST also clear before Unload, or a script-ALC pawn/controller type's
+        // registration pins the old assembly — the same leak InputRegistry would cause. The new assembly's
+        // module initializers re-register on load. (Clearing the InputRegistry alone is necessary, not
+        // sufficient — §8.6.2's symmetry note.)
+        NetworkReplicationRegistry.ClearForReload();
+        // P7: the THIRD host-side static root (gate 0c / §8.6.2) — the ENTITY-LESS GameState replication
+        // table holds a descriptor per game-defined GameState subtype (registered by the generator's
+        // [ModuleInitializer], the IReplicated path). Same leak class as the two above if not cleared.
+        SceneReplicationRegistry.ClearForReload();
+        Network.Manager?.Stop();
         GameScripts.Unload();
 
         System.Reflection.Assembly gameScripts =
@@ -215,7 +259,14 @@ public sealed class EngineBootstrap {
             Physics.BeginPlay();
         SceneSerializer.Deserialize(snapshot);  // play lifecycle suppressed inside
         if (live) {
-            scene.FireBegin();
+            // Re-fire lifecycle on the new types. Mirror StartPlay: route through the gameplay phase
+            // runner when the scene declares a GameMode (so the player re-spawns/possesses), else the
+            // bare FireBegin (byte-identical to before the framework). Network.Stop above returned us to
+            // Offline, so the runner brings the loopback host back up.
+            if (GamePhaseRunner.HasGameMode(scene))
+                GamePhaseRunner.Run(scene);
+            else
+                scene.FireBegin();
             Debugging.Log("Game scripts: live-reloaded while playing (serializable state preserved).");
         }
         return true;
@@ -240,6 +291,10 @@ public sealed class EngineBootstrap {
     public void UpdateFrame(double delta) {
         Runtime.EngineTimer.Update(delta);
         SceneManager.Update((float)delta);
+        ParticleSystem.AdvanceAll((float)delta);   // once per frame, edit + play (editor preview)
+        TrailRenderer.AdvanceAll((float)delta);
+        Audio.Update();
+        InputActions.Update();   // snapshot action down-state for next frame's press/release edges
     }
 
     // Loads the project's startup scene (ScenesInBuild[0], or the legacy StartupScene field when the
@@ -263,6 +318,14 @@ public sealed class EngineBootstrap {
             Debugging.LogError($"Scene '{assetPath}' not found (no loose file or content-pack entry).");
             return;
         }
+        // Tear down the OUTGOING scene before loading the new one — Deserialize ADDS to the current
+        // scene, so without this the old entities' components stay registered (RuntimeSet renderers,
+        // lights, ...) and keep drawing/leaking even though they're gone from the hierarchy. The
+        // editor's scene-open path already does this (SceneCommands.ApplyNow); the runtime LoadScene
+        // path was missing it — the "old meshes still render after switching scenes" bug.
+        Scene current = SceneManager.GetCurrentScene();
+        current.Clear();
+        SceneManager.ClearAllRenderSets(); // defensive: scene.Clear()'s OnDetach is best-effort
         SceneSerializer.Deserialize(yaml);
     }
 

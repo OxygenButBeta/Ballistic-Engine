@@ -1,5 +1,4 @@
 using System.Collections.Generic;
-using OpenTK.Mathematics;
 
 namespace BallisticEngine.UI;
 

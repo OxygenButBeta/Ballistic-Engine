@@ -1,6 +1,5 @@
 ﻿using System.Runtime.CompilerServices;
 using BallisticEngine;
-using OpenTK.Mathematics;
 
 public static class GraphicAPI
 {
@@ -10,7 +9,9 @@ public static class GraphicAPI
                 out Shader cachedShader))
             return cachedShader as StandardShader;
 
-        return new GLStandardShader(vertexCode, fragmentCode);
+        // The active backend builds the concrete shader (GL -> GLSL program, DX12 -> HLSL) — no
+        // hardcoded GL type here, so GraphicAPI is backend-agnostic.
+        return RenderAsset.Current.CreateStandardShader(vertexCode, fragmentCode);
     }
     public static HDRenderer Renderer => RenderAsset.Current.Renderer;
 
@@ -43,6 +44,14 @@ public static class GraphicAPI
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static GPUBuffer<Vector4> CreateTangentBuffer(RenderContext renderContext) =>
         RenderAsset.Current.CreateTangentBuffer(renderContext);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static GPUBuffer<Vector4> CreateBoneIndexBuffer(RenderContext renderContext) =>
+        RenderAsset.Current.CreateBoneIndexBuffer(renderContext);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static GPUBuffer<Vector4> CreateBoneWeightBuffer(RenderContext renderContext) =>
+        RenderAsset.Current.CreateBoneWeightBuffer(renderContext);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static GPUBuffer<T> CreateBuffer<T>(RenderContext renderContext) where T : unmanaged =>

@@ -1,5 +1,4 @@
 ﻿using BallisticEngine;
-using OpenTK.Mathematics;
 
 public class Transform : Component {
     Vector3 position = Vector3.Zero;
@@ -35,12 +34,12 @@ public class Transform : Component {
         set { scale = value; localVersion++; }
     }
 
-    public Vector3 Forward => Rotation * Vector3.UnitZ;
-    public Vector3 Up => Rotation * Vector3.UnitY;
-    public Vector3 Right => Rotation * Vector3.UnitX;
+    public Vector3 Forward => Vector3.Transform(Vector3.UnitZ, Rotation);
+    public Vector3 Up => Vector3.Transform(Vector3.UnitY, Rotation);
+    public Vector3 Right => Vector3.Transform(Vector3.UnitX, Rotation);
     public Vector3 EulerAngles {
         get => RadiansToDegrees(Rotation.ToEulerAngles());
-        set => Rotation = Quaternion.FromEulerAngles(DegreesToRadians(value));
+        set => Rotation = BQuaternion.FromEulerAngles(DegreesToRadians(value));
     }
 
     // Row-vector (OpenTK) convention: points are transformed as v * M, so composition is
@@ -95,12 +94,12 @@ public class Transform : Component {
         get => WorldMatrix.ExtractTranslation();
         set => Position = Parent is null
             ? value
-            : Vector3.TransformPosition(value, Matrix4.Invert(Parent.WorldMatrix));
+            : Vector3.Transform(value, Parent.WorldMatrix.Inverted());
     }
 
     public Quaternion WorldRotation {
         get => Parent is null ? Rotation : Parent.WorldRotation * Rotation;
-        set => Rotation = Parent is null ? value : Quaternion.Invert(Parent.WorldRotation) * value;
+        set => Rotation = Parent is null ? value : Quaternion.Inverse(Parent.WorldRotation) * value;
     }
 
     public void SetParent(Transform? parent) {
@@ -118,7 +117,7 @@ public class Transform : Component {
         cachedWorldLocalVersion = -1;
         cachedParentWorldVersion = -1;
 
-        Matrix4 local = parent is null ? world : world * Matrix4.Invert(parent.WorldMatrix);
+        Matrix4 local = parent is null ? world : world * parent.WorldMatrix.Inverted();
         Scale = local.ExtractScale();
         Rotation = local.ExtractRotation();
         Position = local.ExtractTranslation();

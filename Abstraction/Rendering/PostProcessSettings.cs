@@ -14,6 +14,33 @@ public enum MeteringMode {
     Spot,           // only a small center circle meters
 }
 
+// Reflections technique (the unified GI volume's Reflections-Mode dropdown). Off mirrors GiMode.Off so
+// the two indirect dropdowns read alike. NOTE: ScreenSpace/RayTraced keep their original ordinals (0/1)
+// so existing .volume profiles that stored the enum BY VALUE still resolve; Off is appended last (=2).
+public enum ReflectionMode {
+    ScreenSpace,   // SSR — fast, screen-bounded
+    RayTraced,     // DXR — off-screen + sky reflect correctly (falls back to SSR without DXR)
+    Off,           // no reflections (IBL/skybox reflection only)
+}
+
+// Global-illumination technique (the GI volume's Off/SSGI/RT-GI dropdown).
+public enum GiMode {
+    Off,           // no GI bounce
+    ScreenSpace,   // SSGI (SSILVB screen-space gather)
+    RayTraced,     // DXR ray-traced GI (off-screen-aware; falls back to SSGI without DXR)
+}
+
+// Temporal upscaling quality (FSR). Each mode is a fixed per-dimension render-resolution ratio; the
+// upscaler reconstructs the display resolution. Higher ratio = lower internal res = faster, softer.
+public enum UpscaleMode {
+    Off,              // native-resolution render (no upscaler)
+    NativeAA,         // 1.0x — FSR temporal AA at native res (replaces TAA, no resolution gain)
+    Quality,          // 1.5x per dimension
+    Balanced,         // 1.7x
+    Performance,      // 2.0x
+    UltraPerformance, // 3.0x
+}
+
 // Tunables for the HDR -> display pipeline. Neutral by default: only exposure,
 // ACES tonemapping and gamma always run; everything stylistic is opt-in so the
 // calibrated PBR output isn't silently distorted.
@@ -37,7 +64,7 @@ public sealed class PostProcessSettings {
     public float AutoExposureLimitMin { get; set; } = 8f;           // EV floor the meter may reach
     public float AutoExposureLimitMax { get; set; } = 17f;          // EV ceiling the meter may reach
     public float AutoExposureSpeedDarkToLight { get; set; } = 3f;   // stops/sec when the scene brightens
-    public float AutoExposureSpeedLightToDark { get; set; } = 1f;   // stops/sec when the scene darkens
+    public float AutoExposureSpeedLightToDark { get; set; } = 2.5f; // stops/sec when the scene darkens (a day->night cut spans ~10 stops; 1.0 took 10+ s to settle)
     public float HistogramFilterMin { get; set; } = 40f;            // percentile below which pixels are rejected
     public float HistogramFilterMax { get; set; } = 95f;            // percentile above which pixels are rejected
 
@@ -68,22 +95,47 @@ public sealed class PostProcessSettings {
     public bool TaaEnabled { get; set; } = true;
     public float TaaFeedback { get; set; } = 0.9f; // history weight; higher = smoother, more ghosting
 
+    // Temporal upscaling (AMD FidelityFX FSR, DX12 only). Renders the scene at a lower internal
+    // resolution and reconstructs the display resolution from jittered frames + motion vectors. When
+    // active it REPLACES TAA (FSR does its own temporal AA). Off = native-res render (current behavior).
+    public UpscaleMode UpscaleMode { get; set; } = UpscaleMode.Off;
+    public float UpscaleSharpness { get; set; } = 0.5f;   // RCAS sharpening, 0 = none .. 1 = max
+
     // Screen-space reflections: smooth surfaces reflect the actual scene instead of only
     // the sky cubemap. Requires the normal attachment (unavailable in the MSAA path).
     public bool SsrEnabled { get; set; } = true;
     public float SsrIntensity { get; set; } = 1f;
+    public ReflectionMode ReflectionMode { get; set; } = ReflectionMode.ScreenSpace;  // SSR or DXR (Reflection volume)
 
     // Screen-space global illumination: a coarse one-bounce diffuse gather that adds
     // indirect fill light from sunlit on-screen surfaces into shadowed areas (the
     // directional bounce a flat ambient term can't provide). Like SSR it needs the normal
     // attachment, so it only runs while TAA is on / MSAA is off.
     public bool SsgiEnabled { get; set; } = true;
+    public GiMode GiMode { get; set; } = GiMode.ScreenSpace;   // GI volume dropdown: Off / SSGI / RT-GI (DXR)
+
+    // Emissive-as-GI source: emissive surfaces act as area lights in the indirect bounce (the DDGI/
+    // RTXGI/Lumen technique — at each GI ray hit the shader adds the hit's self-emission). DEFAULT true
+    // (a correctness fix: emissive lit the camera pixel via the G-buffer but cast no indirect light).
+    // The renderer reads this via GiEmissiveEnabled; BALLISTIC_DX12_GI_EMISSIVE=0/1 still force-overrides
+    // for the headless A/B harness. No double-count: directly-visible emissive is the G-buffer; this adds
+    // emission only at off-screen bounce hits on OTHER surfaces.
+    public bool GiEmissive { get; set; } = true;
+
+    // --- Ray-Traced GI quality (only consumed when GiMode == RayTraced) ---
+    // DDGI world-probe radiance cache: caches off-screen bounce so RT-GI gathers multi-bounce far-field
+    // light. DEFAULT false (matches the old BALLISTIC_DX12_DDGI == "1" gate — off unless asked). The
+    // BALLISTIC_DX12_DDGI env door still force-overrides for the A/B harness; unset = this drives.
+    public bool Ddgi { get; set; }
+
+    // Screen-space radiance probes: the near/mid-field final gather (DDGI-on only). DEFAULT true (matches
+    // the old BALLISTIC_DX12_SCREENPROBE != "0" gate). BALLISTIC_DX12_SCREENPROBE still force-overrides.
+    public bool ScreenProbes { get; set; } = true;
 
     // -- Quality / noise --
     // Rays per pixel: with temporal accumulation + the denoiser, even 2-4 stays clean.
     public int SsgiRayCount { get; set; } = 4;
     public float SsgiMaxHistory { get; set; } = 24f;  // temporal frames to accumulate (smoother/laggier)
-    public float SsgiDenoise { get; set; } = 2f;      // spatial denoiser tap spacing (wider = smoother)
 
     // -- Ray shape --
     public float SsgiRayLength { get; set; } = 12f;   // metres; near vs far bounce reach
@@ -101,43 +153,35 @@ public sealed class PostProcessSettings {
     // is actually contributing, and to tune ray length/intensity against real output.
     public bool SsgiDebugView { get; set; }
 
-    // Sky contribution for rays that miss every on-screen surface (0..1). DEFAULT 0: the
-    // forward shader's IBL irradiance already integrates the FULL sky, so adding sky again on
-    // every missed ray double-counts it — in open scenes most rays miss, and SSGI degenerated
-    // into a flat gray veil over the whole frame (washed contrast, milky shadows). The old
-    // non-zero default predates the IBL-as-ambient-base refactor, when a zero miss made GI
-    // collapse wherever the bright source left the screen; the IBL base killed that failure
-    // mode, leaving only the double-count. The dial remains for windowless interiors where a
-    // directional sky gather through openings can be worth it.
-    public float SsgiSkyFallback { get; set; }
-
-    // -- Bounce strength (advanced). SSGI is now a REFINEMENT on the physical IBL base, so it
-    // only adds the local one-bounce colour - intensity ~1 (not the old 1.5 that compensated
-    // for a missing ambient base). AmbientFloor/BounceBoost are retired: the IBL is the floor. --
+    // -- Bounce strength (advanced). SSGI is a REFINEMENT on the physical IBL base, so it only
+    // adds the local one-bounce colour - intensity ~1 (not the old 1.5 that compensated for a
+    // missing ambient base). --
     public float SsgiIntensity { get; set; } = 1f;                    // local-bounce strength
-    public OpenTK.Mathematics.Vector3 SsgiTint { get; set; } = OpenTK.Mathematics.Vector3.One; // bounce colour
+    public Vector3 SsgiTint { get; set; } = Vector3.One; // bounce colour
     public float SsgiSaturation { get; set; } = 1f;                   // bounce colour punch
     public float SsgiOcclusionPower { get; set; } = 0.6f;             // how hard AO bites the bounce
-    public float SsgiMultiBounce { get; set; } = 0.5f;                // re-bounce fraction (fake multi-bounce)
-    public float SsgiBounceBoost { get; set; }                        // retired (kept 0; IBL carries richness)
-    public float SsgiAmbientFloor { get; set; }                       // retired (kept 0; physical IBL is the base)
+    public float SsgiBounceBoost { get; set; }                        // super-linear gain on bright source pixels (volume: bounceBoost; shader Params1.x)
 
-    // Volumetric sun scattering (god-rays / light shafts): raymarches the directional
-    // shadow map and accumulates in-scatter where the air is lit. Half-res march + temporal
-    // denoise; like SSR/SSGI it reconstructs from the single-sample depth, so it only runs
-    // while TAA is on / MSAA is off. Off by default (it's an atmospheric, scene-dependent look).
+    // Volumetric height fog + sun scattering (god-rays): physical exponential height fog
+    // marched against the directional shadow map. In-scatters the atmosphere-attenuated sun
+    // and the baked sky's average radiance (skylight); its transmittance EXTINGUISHES the
+    // scene behind it (real fog hides things). Half-res march + temporal denoise; like
+    // SSR/SSGI it reconstructs from the single-sample depth, so it only runs while TAA is
+    // on / MSAA is off. Off by default (it's an atmospheric, scene-dependent look).
     public bool VolumetricEnabled { get; set; }
-    public float VolumetricIntensity { get; set; } = 1f;              // master grade; linear & gentle (scatter is bounded)
-    public float VolumetricDensity { get; set; } = 0.06f;             // depth-falloff SHAPE only (near air weighted vs far); not brightness
-    public float VolumetricScattering { get; set; } = 2.5f;           // shaft brightness; at 1.0 the brightest shaft ~= 1.0 (linear, no cliff)
-    public float VolumetricAnisotropy { get; set; } = 0.76f;          // phase shape g; higher = tighter forward shafts
-    public float VolumetricSunGlow { get; set; } = 0.3f;              // extra blaze around the sun disk (bounded 0..~1)
+    public float VolumetricIntensity { get; set; } = 1f;              // master strength: fades whole fog below 1, boosts only glow above
+    public float VolumetricDensity { get; set; } = 0.002f;            // extinction sigma_t at base height (1/m); 0.002 ~= 2km visibility (light haze)
+    public float VolumetricHeightFalloff { get; set; } = 0.04f;       // 1/m: fog thins with altitude (0 = uniform medium)
+    public float VolumetricBaseHeight { get; set; }                   // world Y below which the fog is at full density
+    public float VolumetricScattering { get; set; } = 1f;             // sun in-scatter multiplier (1 = physical balance)
+    public float VolumetricAmbientScatter { get; set; } = 1f;         // skylight in-scatter multiplier (1 = physical balance)
+    public float VolumetricAnisotropy { get; set; } = 0.7f;           // forward HG lobe g; higher = tighter/brighter toward the sun
+    public float VolumetricSunGlow { get; set; } = 0.3f;              // extra blaze around the sun disk seen through fog
     public float VolumetricSunGlowSharpness { get; set; } = 48f;      // how tight the sun-disk glow is (higher = smaller/hotter)
-    public float VolumetricAmbientFloor { get; set; } = 0.25f;        // min scatter when NOT looking at sun (0 = sun-facing only, 1 = uniform)
-    public int VolumetricStepCount { get; set; } = 48;                // raymarch samples (cost vs banding)
-    public float VolumetricMaxDistance { get; set; } = 120f;          // metres the march reaches (also sky slab)
+    public int VolumetricStepCount { get; set; } = 48;                // shadowed raymarch samples (cost vs banding)
+    public float VolumetricMaxDistance { get; set; } = 120f;          // metres of shadowed march; fog continues analytically beyond
     public float VolumetricFeedback { get; set; } = 0.9f;             // temporal history weight (smoother/laggier)
-    public OpenTK.Mathematics.Vector3 VolumetricTint { get; set; } = OpenTK.Mathematics.Vector3.One; // shaft colour grade
+    public Vector3 VolumetricTint { get; set; } = Vector3.One; // in-scatter colour grade
 
     // 1 = off. Offscreen targets are recreated when this changes. Ignored while TAA is on.
     public int MsaaSamples { get; set; } = 4;
@@ -160,12 +204,17 @@ public sealed class PostProcessSettings {
     public int ContactShadowSteps { get; set; } = 12;
     public float ContactShadowThickness { get; set; } = 0.5f;  // depth window counted as a hit
 
+    // Ray-traced sun shadows (DX12 + DXR only): trace a shadow ray per pixel against the scene BVH instead
+    // of the cascaded shadow maps. Off by default (opt-in via the Shadows volume; falls back to cascades
+    // on non-RT GPUs).
+    public bool RayTracedShadows { get; set; }
+
     // Stylistic extras, all neutral/off by default.
     public float Contrast { get; set; } = 1f;
     public float Saturation { get; set; } = 1f;
     public float VignetteStrength { get; set; }
     public float VignetteRoundness { get; set; } = 1f;  // 1 = circular, 0 = aspect-following oval
-    public OpenTK.Mathematics.Vector3 VignetteColor { get; set; } = OpenTK.Mathematics.Vector3.Zero; // darken toward black by default
+    public Vector3 VignetteColor { get; set; } = Vector3.Zero; // darken toward black by default
     public float FilmGrain { get; set; }
     public float Sharpen { get; set; }
 
@@ -182,4 +231,9 @@ public sealed class PostProcessSettings {
     public float DofFocalLength { get; set; } = 0.05f;  // 50mm-ish; larger = shallower DoF
     public float DofAperture { get; set; } = 2.8f;      // f-number; smaller = shallower DoF
     public float DofMaxCoc { get; set; } = 0.03f;       // blur-radius clamp (fraction of frame height)
+
+    // (The old GL realtime-GI stack fields — GiProbeIntensity / GiReflection* / GiSdf* / GiAmbientFloor /
+    // GiProbesEnabled / GiLumenEnabled / GiDebugShow* — were deleted in the P0.5 GI consolidation. They
+    // drove the GL probe/SDF baker, which is gone; DX12 GI is the unified GlobalIllumination volume
+    // (Ssgi* + GiMode + ReflectionMode above). No reader remained.)
 }

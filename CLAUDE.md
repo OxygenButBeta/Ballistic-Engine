@@ -2,7 +2,7 @@
 
 Custom C#/.NET 9 game engine — **NOT a Unity project** despite the folder location. Stack:
 OpenTK 4.9.4 (OpenGL **4.6 core** — bumped from 4.1 in the 2026-06 renderer overhaul; unlocks
-compute/SSBOs/MultiDrawIndirect/persistent mapping/DSA for future GPU-driven work. macOS was
+compute/SSBOs/MultiDrawIndirect/persistent mapping/DSA — now USED by the GPU-driven path. macOS was
 the old 4.1 ceiling and is out of scope for GL — a Mac path means another backend), AssimpNet +
 StbImageSharp + Magick.NET (import-time only), YamlDotNet (scenes), ImGui.NET (editor). Idioms
 deliberately mirror Unity (Entity/Behaviour, AssetDatabase, meta files, edit/play split).
@@ -10,7 +10,7 @@ deliberately mirror Unity (Entity/Behaviour, AssetDatabase, meta files, edit/pla
 ## Build & run
 
 ```
-dotnet build BallisticEngine.slnx          # 3 projects; the old .sln is gone
+dotnet build BallisticEngine.slnx          # 5 projects; the old .sln is gone
 dotnet run --project BallisticEngine.Runtime [projectPath]   # standalone player
 dotnet run --project BallisticEngine.Editor  [projectPath]   # ImGui editor
 ```
@@ -18,7 +18,37 @@ dotnet run --project BallisticEngine.Editor  [projectPath]   # ImGui editor
 Default project path: `<repo>\SampleProject`. Projects:
 - `BallisticEngine.csproj` (root) — engine **library**; globs all engine folders, `<Compile Remove>`s the exe subfolders.
 - `BallisticEngine.Runtime/` — thin player exe (Program + BEngineEntry over `EngineBootstrap`/`EngineLoop`).
-- `BallisticEngine.Editor/` — ImGui editor exe (ImGuiBackend/, EditorApp/, Panels/, EditorCamera/, Gizmo/).
+- `BallisticEngine.Editor/` — ImGui editor exe (ImGuiBackend/, EditorApp/, Panels/, EditorCamera/, Gizmo/, Remote/).
+- `BallisticEngine.Cli/` — `bal`, the headless agent CLI (see below).
+- `BallisticEngine.Mcp/` — stdio MCP server bridging to the editor's command port.
+
+## Agent surface (AI-operability layer, 2026-06)
+
+The engine is fully operable headlessly — **prefer these over hand-editing YAML or eyeballing
+screenshots** (each verb prints JSON, honest exit codes; `bal --help` lists all):
+
+- `bal map <project>` — orient first: scenes, script components, asset inventory.
+- `bal schema [--type X]` — component catalog from reflection (engine + game scripts); never guess members.
+- `bal scene get/set/add-entity/add-component/remove-*/find` — typed scene CRUD; one-member edit = one-line diff; ids tool-minted; refs path-form.
+- `bal validate` / `bal describe` / `bal import` / `bal assets resolve|refs|list` — checks, summaries, idempotent import, reverse-ref map.
+- `bal simulate <scene> --steps N --watch Entity[:Comp.Member] [--snapshot Entity] [--input script.json]` — REAL engine headless (HeadlessRuntime: scripts+physics play, no GL); numeric time series; `--snapshot` = full live component state at the final step (introspection); deterministic scripted input (two runs byte-identical).
+- `bal render <scene> [--orbit N] [--idmap]` + `bal imgdiff a b [--out heatmap]` — deterministic captures, multi-view, perceptual diff (mean + 32x32-hotspot budgets).
+- `bal query <op> <scene> --points/--pairs` — SPATIAL PERCEPTION (GpuSceneQuery: inline DXR RayQuery over the scene TLAS, headless, deterministic): `occupancy` (inside solid?), `classify` (open/enclosed/solid), `nudge` (occupied→free space), `rooms` (visibility clusters), `visibility` (clear line of sight per A>B pair). The agent asks the 3D world instead of guessing from pixels (`BallisticEngine.DX12/Query/`, proposal `Docs/Plans/gpu-scene-query-api-proposal.md`).
+- `bal gbuffer <scene> [--out dir]` — raw G-buffer dump (depth.bin R32F / normal.bin RGBA16F packed N*0.5+0.5 / albedo.bin RGBA8 + manifest.json) so the agent reads geometry directly, not the tonemapped pixel.
+- `bal perf <scene>` — render-perf stats JSON (draws/tris/cull/lights/cpuFrameMs; per-pass GPU ms is a DX12 follow-up).
+- `bal agents <project>` — regenerates the project's AGENTS.md (never stale: built from reflection + .meta).
+
+Env harness additions: `BALLISTIC_SCENE` (player loads any project-relative scene),
+`BALLISTIC_DETERMINISTIC=1` (TAA/SSGI/volumetric off + fixed exposure → frame 60 == frame 240
+byte-identical), `BALLISTIC_IDMAP=<path>` (entity-ID map: `<path>.json` per-entity/submesh
+screen bboxes + `<path>.bmp` segmentation — occlusion-aware "what is on screen where"),
+`BALLISTIC_SCREENSHOT_EXIT=0`. Every screenshot writes a `.stats.json` sidecar (draws/tris/
+cull/per-pass GPU ms). Logs mirror to `<project>/Library/Logs/engine.jsonl`.
+
+Live editor control: named pipe `\\.\pipe\BallisticEditor` (newline JSON `{id,method,params}` →
+`{id,result|error}`; methods in `BallisticEngine.Editor/Remote/RemoteHandlers.cs`) or the MCP
+server (16 tools). Remote mutations push EditorUndo first and mark the viewport dirty — they
+behave exactly like human edits. The pipe thread is engine-owned: survives script hot-reload.
 
 ## Layering rules (auditable by grep)
 
@@ -54,7 +84,25 @@ loop returns or the process never exits.
 - Loading any image asset AS `Texture3D` builds an equirect cubemap (skybox from .hdr/.exr).
 - `ModelImporter` (meshIndex -1) merges the whole model with one submesh per source material
   and generates a sibling `<Model>_Materials/` folder of `.mat` assets (rewritten on reimport).
+  - **Texture auto-bind by filename convention** (v7, `TextureConventionMatcher`): when a source
+    material references NO textures of its own (Quixel Megascans / textures.com / Substance ship an
+    empty FBX material + sibling `<stem>_4K_Albedo.jpg` etc.), maps are matched by suffix
+    (Albedo/Basecolor/Diffuse→Diffuse, Normal, Roughness [preferred over Gloss — no invert path],
+    Metalness→Metallic, AO, Emissive; Opacity/Mask→Cutout). Fallback ONLY — authored refs (glTF) win.
+  - **FBX unit conversion** (v8, `FbxUnitScaleFactor`): FBX's system unit is cm. cm-authored content
+    imported 100x too big; the importer reads `UnitScaleFactor` straight from the FBX (AssimpNet 4.1.0
+    has no scene metadata) and bakes a cm→m scale into the root node's local transform (vertices AND
+    the split-by-nodes hierarchy). `scaleFactor` setting: 0 = auto from file units, >0 = forced.
+    glTF/OBJ/DAE are metric → factor 1 (byte-identical to pre-v8).
 - `.pyscene` (Falcor) imports regex-parse camera/lights/models/envmap → sibling `.scene`.
+- **Unity package import** (editor: Assets > Import Unity Package): pick a `.unitypackage` (gzip tar:
+  `<guid>/{asset,asset.meta,pathname}`) or an unpacked Unity `Assets/` folder. `UnityPackageReader`
+  extracts the path tree; `UnityYamlParser` parses `.unity`/`.prefab` (the `--- !u!<classID> &<fileID>`
+  format — GameObject/Transform/MeshFilter/MeshRenderer); `UnitySceneConverter` emits a Ballistic
+  `.scene` (transform hierarchy + StaticMeshRenderers, **LH→RH coord fix: mirror X**), resolving Unity
+  `{guid}` refs via `UnityMetaGuidMap` (Unity .meta guid → on-disk file). This is the path to an
+  ASSEMBLED layout: bare prop-pack FBX has no scene data, but a Unity package carries the dressed
+  prefab/scene. (`AssetPipeline/Unity/`, `Engine/Serialization/Unity/`, editor `UnityImportWindow`.)
 
 ## Game scripting (C#)
 
@@ -132,6 +180,18 @@ loop returns or the process never exits.
   Volume component and in the `.volume` asset view (`VolumeProfileEditor`).
 - `Input.Enabled` is the master gate — the editor disables engine input outside
   play-with-Game-view-focused, so component debug keys don't leak into editing.
+- **Editor inspector = ONE attribute-driven drawer pipeline** (`BallisticEngine.Editor/Panels/Inspector/`):
+  component members AND volume parameters both render through a shared `DrawerRegistry` + `IInspectorGui` +
+  decorator chain (this replaced the two old hardcoded type-switches in `InspectorPanel.DrawMember` /
+  `VolumeProfileEditor.DrawParameter`, which used to drift). **When designing ANY inspector/editor window,
+  author with the attributes — do NOT hand-roll widgets or a new type-switch.** Layout/semantics:
+  `[Header]/[Space]/[Tooltip]/[FoldoutGroup]/[Range]/[ColorUsage]/[ReadOnly]/[LabelText]/[PropertyOrder]`;
+  conditionals `[ShowIf]/[HideIf]/[EnableIf]/[DisableIf]` (name a sibling member, optional `==` value;
+  VolumeParameter siblings auto-unwrap to `.Value`) — e.g. hide a dial unless a mode enum matches. A NEW
+  value type = register one `ITypeDrawer` (works in BOTH paths at once); a NEW cross-cutting behaviour = an
+  `IPropertyDecorator`. Attributes live in the engine assembly (`Engine/Attributes/`, plain
+  `System.Attribute`, zero ImGui); only the editor interprets them. Defaults are byte-identical, so adding
+  an attribute is always opt-in.
 
 ## Physics (BepuPhysics 2 behind `IPhysicsWorld`)
 
@@ -213,6 +273,45 @@ loop returns or the process never exits.
 
 ## Renderer pipeline (2026-06 overhaul — invariants that must not regress)
 
+- **GPU-driven path (MDI + compute cull + bindless, 2026-06, `OpenGL/Rendering/GpuDriven/`)**: the
+  WHOLE-MESH renderer (Bistro, ~1600 submeshes, `SubMeshIndex < 0`, non-skinned, single shader) is
+  drawn via `glMultiDrawElementsIndirectCount` after a GPU compute frustum cull, collapsing ~1600
+  `DrawElements` into a handful of MDI calls (CPU submit was THE bottleneck: 30ms CPU vs 12ms GPU,
+  6070 draws). Per-submesh/instanced/skinned/mixed-shader renderers keep the CPU path.
+  - `GpuDrivenRenderer` owns the buffers; `GpuCull_Comp.glsl` does the cull (positive-vertex AABB
+    test, world AABBs **pre-transformed on the CPU with the same 8-corner loop** as
+    `ComputeSubmeshVisibility` so it's bit-identical to `AabbInFrustum`). `GLPersistentBuffer` =
+    GL4.6 persistent-mapped triple-buffered fence-synced streaming. `GpuMaterialTable` = bindless
+    handles (`GL_ARB_bindless_texture`) so different materials batch into ONE draw; missing maps
+    use `DefaultTextures.Neutral` + the global metallic/roughness/normal multipliers, exactly
+    like CPU `SetMaterialUniforms`.
+  - `GpuDrivenShaderTransform` INJECTS the per-draw model (`PerDrawData[gl_DrawIDARB]`) + bindless
+    material reads into each material's OWN vert+frag GLSL by `#define` — shading is bit-identical
+    to the uniform path, so z-prepass invariance holds (prepass + opaque share the deterministic
+    cull). Bumps `#version` to 460. Prepass frag MUST reuse `SharedDecls` (cross-stage block names
+    must match). The transform must NOT touch shading math.
+  - **Two batches**: SOLID (backface cull on) + CUTOUT (cull off — single-sided foliage), separate
+    cmd/count/perdraw buffers to avoid the write-after-read hazard. The cull binds the COMPUTE
+    program, so re-activate the render program AFTER culls, before the MDI draws.
+  - `BALLISTIC_GPUDRIVEN=0` → CPU path (byte-identical fallback). Auto-disables without bindless/
+    draw-params. Verified byte-identical (meanError 0) deterministic full-FX, draws 420→3.
+  - GPU-driven shadows: DEFAULT ON (`BALLISTIC_GPUDRIVEN_SHADOWS=0` to disable). One MDI per cascade
+    after a light-space compute cull — collapses the ~2358 (move-time ~11000) CPU shadow depth draws
+    to ~10 when cascade caching invalidates on camera motion. Byte-identical to the CPU shadow path
+    (the bit-exact world-AABB cull + program state-leak fix). When the whole-mesh renderer is GPU-
+    driven for BOTH camera and shadows, the CPU per-submesh cull (`ComputeSubmeshVisibility`) is
+    skipped entirely — the GPU cull replaces it.
+  - Hi-Z OCCLUSION CULLING: DEFAULT ON (`BALLISTIC_GPUDRIVEN_HIZ=0` to disable). `GLHiZPass` builds
+    a MAX-depth mip pyramid (`HiZ_Down.glsl`) from the PREVIOUS frame's depth; the cull
+    (`occludedByHiZ`) drops submeshes whose whole AABB is behind a closer occluder, comparing in
+    LINEAR view distance (window depth bunches near the far plane — direct compare over-culls) with a
+    0.25 m bias. A camera-delta gate disables it one frame after a big jump (stale-depth hole safety);
+    shadows never use it. Byte-identical (0% pixel diff): Sun Temple 1000→473 draws, Bistro ~814→719.
+    GOTCHA: the pyramid build MUST detach its color attachment + restore unit-0 binding + re-enable
+    DepthTest/CullFace, or it corrupts the later passes (sky/SSGI/SSR) even when nothing is culled.
+  - Gotcha: route any NEW compute-shader compile through `GLSLShaderUtilities.ToAscii` (an em-dash
+    in a comment truncates the source → "unexpected end of file"). Whole-mesh model = plain
+    `WorldMatrix` for ALL submeshes (NOT inverse-node — that's per-submesh-renderer only).
 - **Frame shape (single path, no MSAA)**: cull → cascaded shadows (cached) → z-prepass →
   SSAO → opaque (LEqual, no depth writes) → sky → transparent → SSGI → SSR → volumetric →
   TAA → exposure meter → bloom → composite. TAA **is** the AA; the MSAA path was deleted
@@ -241,10 +340,15 @@ loop returns or the process never exits.
 - **Transient RT pool**: post passes `GLRenderTexturePool.Shared.Acquire()` per-frame scratch
   (released wholesale in `EndFrame`); ONLY cross-frame history (TAA/SSGI/volumetric
   accumulation) stays pass-owned. Never pool history.
-- **SSR marches at half-res**; SSR_Combine upsamples depth-aware. SSGI gather validates hits
-  (front-face check + tight thickness) — without it every ray "hits" behind a silhouette and
-  the frame gets a gray scene-average veil. `SsgiSkyFallback` defaults 0 (sky is already in
-  the IBL ambient; non-zero double-counts it).
+- **SSR marches at half-res**; SSR_Combine upsamples depth-aware. **SSGI gather = horizon
+  slices with sector visibility BITMASKS** (SSILVB-style, `SSGI_Frag.glsl`, `#version 460`):
+  per slice a 32-bit mask over the hemisphere arc gives ORDERED occlusion (near occluders
+  block far light — no scene-average veil by construction), `Thickness` = assumed occluder
+  thickness (thin geometry occludes thin sectors), and sky enters only through the visibly
+  OPEN sectors. `rayCount` now means slices (clamped to 8). (The GL-era `SsgiSkyFallback`/
+  `SsgiDenoise`/`SsgiMultiBounce` dials were dropped in the DX12 GI-volume consolidation — the
+  DX12 SSGI shader has no slot for them; OIDN replaced the a-trous denoise.) Temporal/combine
+  chain unchanged.
 - **Per-pass GPU timers** (`GLGpuTimers`, timestamp queries, non-blocking ring) publish into
   `RenderStats.Scene/Game` with real draw/triangle/cull counters — the editor Stats overlay
   shows them; `Transform` caches Local/World matrices with version stamps (don't bypass the
@@ -277,6 +381,12 @@ loop returns or the process never exits.
   (`EditorUndo.Push()`; `ImGui.IsItemActivated()` for widgets).
 - Rider locks folders on Windows — `git mv`/renames of open dirs fail; copy + `git rm --cached`.
 - FSQ/post/IBL shaders are **embedded resources** under `OpenGL/Shader/Embedded/`, not assets.
+- **GLSL NaN scrubs MUST be a component SELECT (ternary), never `mix(v, 0, flag)`** — float
+  `mix` is arithmetic (`v*(1-flag) + 0*flag`) and `NaN*0 == NaN`, `Inf*0 == NaN`: proven leak
+  on AMD RX 9070 XT (driver test in `%TEMP%\bal-nan-test`). The broken form turned one Inf
+  sun/specular pixel into NaN that the SSGI temporal EMA + multi-bounce + a-trous denoise grew
+  into a screen-eating black-noise field a STATIC camera could never flush (fast motion =
+  disocclusion reject = flush). Same rule applies in every temporal-feedback shader (SSGI x4, TAA).
 - **Bepu has no restitution — bounce = SOFT undamped contact springs** (low frequency,
   damping `1-bounciness`, uncapped recovery velocity). Stiffening the spring makes impacts
   MORE inelastic (speculative contacts absorb the approach velocity). Solver runs
@@ -287,7 +397,7 @@ loop returns or the process never exits.
 - `SampleProject/Assets/Default/Bistro_v5_2/` (1.6 GB test content) is **gitignored**
   pending a git-lfs decision; `Main.scene` references it, so it must exist locally.
 - Repo already tracks ~460 MB of binaries; git-lfs migration is an agreed follow-up.
-- Known half-finished: skybox shader as C# strings, editor shading-mode dropdown is UI-only
-  (renderer view modes not wired yet), synchronous asset refresh blocks the editor window on
-  big imports (no progress UI). SSGI's temporal pass still lacks depth-based disocclusion
-  rejection (history smears on fast motion until the color clamp catches up).
+- Known half-finished: skybox shader as C# strings. (RESOLVED since this note: the editor
+  shading-mode dropdown now drives real renderer debug views — Shaded/Wireframe/Normals/Depth;
+  asset refresh runs async off the render thread with a determinate progress overlay; SSGI's
+  temporal pass now has depth-based disocclusion rejection.)

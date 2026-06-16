@@ -1,9 +1,9 @@
 using System.Reflection;
 using BallisticEngine.AssetPipeline;
 using BallisticEngine.AssetPipeline.Loaders;
+using BallisticEngine.Editor.Inspector;
 using BallisticEngine.Serialization;
 using Hexa.NET.ImGui;
-using OpenTK.Mathematics;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec3 = System.Numerics.Vector3;
 using SysVec4 = System.Numerics.Vector4;
@@ -17,8 +17,15 @@ namespace BallisticEngine.Editor;
 //
 // Styling: an entity header card, component headers with type icon + tinted stripe + overlaid
 // enable checkbox + a "..." menu, and Unity-style colored X/Y/Z chips on vector rows.
-internal sealed class InspectorPanel {
+internal sealed class InspectorPanel : IComponentInspectorHost {
     readonly EditorState state;
+
+    // Shared inspector drawer pipeline (Odin-style): one registry of value drawers + the conditional/
+    // ordering attributes serve BOTH the component inspector (here) and the volume profile editor. The
+    // component path keeps its own row/foldout chrome and drives a drawer directly through componentGui;
+    // the volume path runs the full DrawerPipeline. See BallisticEngine.Editor.Inspector.
+    readonly DrawerRegistry memberRegistry = DrawerRegistry.CreatePrimitive();
+    readonly ImGuiComponentGui componentGui;
 
     // Pending asset-picker request (opened from an asset slot).
     MemberInfo pickerMember;
@@ -29,14 +36,49 @@ internal sealed class InspectorPanel {
 
     string addComponentSearch = "";
 
-    public InspectorPanel(EditorState state) => this.state = state;
+    // Inspector lock (Unity's padlock): when on, the inspector pins its current entity so selecting
+    // other objects in the hierarchy/viewport doesn't change what's shown. Lock only applies to an
+    // entity selection (the common case); asset/scene-behaviour selections always follow.
+    bool locked;
+    Entity lockedEntity;
+
+    // Distinguishes this inspector's ImGui ids from a second Inspector window's — without it both
+    // instances share ids like "inspectorlock", so toggling lock in one toggled the other (and the
+    // padlock looked dead). PushID(instanceId) at the top of DrawContents namespaces everything.
+    static int instanceCounter;
+    readonly int instanceId = instanceCounter++;
+
+    public InspectorPanel(EditorState state) {
+        this.state = state;
+        componentGui = new ImGuiComponentGui(this);
+        // The standalone component window reuses our reflection member renderer.
+        ComponentEditorWindow.Configure(DrawMemberList);
+    }
+
+    // IComponentInspectorHost: lets the shared ImGuiComponentGui adapter reuse this panel's existing
+    // helpers (row layout, mixed-value marker, the styled X/Y/Z vector widget, per-widget undo).
+    void IComponentInspectorHost.RowWithTooltip(string label, string tooltip) => RowWithTooltip(label, tooltip);
+    void IComponentInspectorHost.DrawMixedMarker(MemberInfo member, object target, object value) => DrawMixedMarker(member, target, value);
+    bool IComponentInspectorHost.AxisVec3(string id, string label, ref SysVec3 v, float speed) => AxisVec3(id, label, ref v, speed);
+    bool IComponentInspectorHost.TrackUndo(string label, bool changed) => InspectorUndo.Track(label, changed);
+    void IComponentInspectorHost.MarkViewportDirty() => state.MarkViewportDirty();
 
     public void DrawContents() {
+        ImGui.PushID(instanceId);   // namespace all ids so a 2nd Inspector window doesn't collide
         // Denser rows than the global style so more fits on screen.
         ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new SysVec2(8, 4));
         ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new SysVec2(8, 4));
 
-        if (state.SelectedAssets.Count > 1) {
+        DrawLockBar();
+
+        // While locked to a still-alive entity, show IT regardless of the live selection.
+        bool showLocked = locked && lockedEntity is not null &&
+                          SceneManager.GetCurrentScene().Entities.Contains(lockedEntity);
+
+        if (showLocked) {
+            DrawEntityInspector(lockedEntity);
+        }
+        else if (state.SelectedAssets.Count > 1) {
             DrawMultiAssetInspector();
         }
         else if (state.HasAssetSelection) {
@@ -50,11 +92,15 @@ internal sealed class InspectorPanel {
             // hierarchy actions (delete/duplicate/reparent) apply to all selected.
             if (state.SelectedEntities.Count > 1) {
                 ImGui.TextDisabled($"{EditorIcons.Package}  {state.SelectedEntities.Count} entities selected");
-                ImGui.TextDisabled("Editing the active one; hierarchy actions apply to all.");
+                ImGui.TextDisabled("Edits apply to ALL selected (matching components).");
                 ImGui.Separator();
                 ImGui.Spacing();
             }
+            // Scoped undo: ONLY for a single-entity selection (a multi-selection edit broadcasts to
+            // several entities, so it must take a full-scene snapshot to undo them all together).
+            InspectorUndo.ScopeEntity = state.SelectedEntities.Count == 1 ? state.Selected : null;
             DrawEntityInspector(state.Selected);
+            InspectorUndo.ScopeEntity = null;
         }
         else {
             DrawEmptyState();
@@ -68,6 +114,30 @@ internal sealed class InspectorPanel {
         DrawAssetPickerPopup();
 
         ImGui.PopStyleVar(2);
+        ImGui.PopID();
+    }
+
+    // A slim right-aligned lock toggle at the top of the inspector. Locking pins the current entity so
+    // selecting other objects doesn't change what's shown (Unity's padlock).
+    void DrawLockBar() {
+        float btn = ImGui.GetFrameHeight();
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - btn);
+        if (locked) {
+            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.CheckMark]);
+            if (EditorIcons.GhostButtonSmall("inspectorlock", EditorIcons.Lock, "Inspector locked - click to unlock")) {
+                locked = false;
+                lockedEntity = null;
+            }
+            ImGui.PopStyleColor();
+        }
+        else {
+            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+            if (EditorIcons.GhostButtonSmall("inspectorlock", EditorIcons.LockOpen, "Lock inspector to the current entity")) {
+                lockedEntity = state.Selected;
+                locked = lockedEntity is not null;
+            }
+            ImGui.PopStyleColor();
+        }
     }
 
     // Centered hint when nothing is selected, instead of a lone text line in the corner.
@@ -134,18 +204,65 @@ internal sealed class InspectorPanel {
         Behaviour[] behaviours = entity.Behaviours.ToArray();
         DrawEntityHeaderCard(entity, behaviours.Length);
 
+        // Prefab instance: recompute the override diff (cached per selection) and show the prefab bar
+        // with Open / Select / Apply All / Revert All (Unity's prefab instance header).
+        PrefabOverrides.Refresh(entity);
+        if (entity.IsPrefabInstance)
+            DrawPrefabInstanceBar(entity);
+
         DrawTagLayerRow(entity);
 
         ImGui.Spacing();
 
         DrawTransform(entity.transform);
 
-        foreach (Behaviour behaviour in behaviours)
-            DrawComponent(entity, behaviour);
+        var typeIndex = new Dictionary<Type, int>();
+        foreach (Behaviour behaviour in behaviours) {
+            Type bt = behaviour.GetType();
+            int idx = typeIndex.TryGetValue(bt, out int i) ? i : 0;
+            typeIndex[bt] = idx + 1;
+            DrawComponent(entity, behaviour, idx);
+        }
 
         ImGui.Spacing();
         ImGui.Spacing();
         DrawAddComponent(entity);
+        ImGui.Spacing();
+    }
+
+    // True if any member of this component differs from the prefab definition (drives the header dot).
+    static bool ComponentHasOverride(Behaviour behaviour, int typeIndex) =>
+        PrefabOverrides.ComponentHasOverride(ComponentRegistry.NameOf(behaviour), typeIndex);
+
+    // Prefab-instance header bar (Unity's blue prefab strip): the source name + Select (reveal the
+    // .prefab in the browser), Open (load it for editing), and Apply All / Revert All which push or
+    // discard this instance's overrides against the asset. Greyed when there are no overrides.
+    void DrawPrefabInstanceBar(Entity entity) {
+        string path = AssetDatabase.GuidToAssetPath(entity.PrefabSource);
+        string name = path is null ? "(missing prefab)" : Path.GetFileNameWithoutExtension(path);
+
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, new SysVec4(0.16f, 0.22f, 0.34f, 0.55f));
+        ImGui.BeginChild("##prefabbar", new SysVec2(0, ImGui.GetFrameHeight() + 10), ImGuiChildFlags.AutoResizeY);
+        ImGui.PushStyleColor(ImGuiCol.Text, new SysVec4(0.55f, 0.74f, 1f, 1f));
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextUnformatted($"{EditorIcons.Package}  Prefab: {name}");
+        ImGui.PopStyleColor();
+
+        if (path is not null) {
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Select")) state.RequestRevealAsset(path);
+        }
+
+        bool hasOverrides = PrefabOverrides.HasAnyOverride;
+        ImGui.BeginDisabled(!hasOverrides || path is null);
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Apply All")) PrefabInstanceOps.ApplyAll(entity);
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Revert All")) { PrefabInstanceOps.RevertAll(entity); state.MarkViewportDirty(); }
+        ImGui.EndDisabled();
+
+        ImGui.EndChild();
+        ImGui.PopStyleColor();
         ImGui.Spacing();
     }
 
@@ -197,9 +314,33 @@ internal sealed class InspectorPanel {
         ImGui.SetCursorScreenPos(new SysVec2(contentX, cardMin.Y + pad + frameH + 4));
         ImGui.TextDisabled(componentCount == 1 ? "1 component" : $"{componentCount} components");
 
-        // Reserve the card's space in the layout.
+        // Reserve the card's space in the layout — and make it a SCRIPT DROP TARGET: dragging a .cs
+        // tile from the asset browser onto the header adds that component to the entity (Unity parity;
+        // the hierarchy already accepts this, the inspector didn't).
         ImGui.SetCursorScreenPos(cardMin);
         ImGui.Dummy(new SysVec2(avail.X, cardH));
+        AcceptScriptDrop(entity);
+    }
+
+    // Drop target for .cs script tiles (asset-browser drag payload = ';'-separated GUIDs). Each that
+    // resolves to a compiled Behaviour type is added as a component (skipping dupes), one undo step.
+    unsafe void AcceptScriptDrop(Entity entity) {
+        if (!ImGui.BeginDragDropTarget())
+            return;
+        ImGuiPayloadPtr payload = ImGui.AcceptDragDropPayload(AssetBrowserPanel.DragType);
+        if (!payload.IsNull && payload.Data != null) {
+            string text = System.Runtime.InteropServices.Marshal.PtrToStringAnsi((IntPtr)payload.Data, payload.DataSize);
+            bool pushed = false;
+            foreach (string part in text?.Split(';', StringSplitOptions.RemoveEmptyEntries) ?? []) {
+                if (!Guid.TryParse(part, out Guid guid)) continue;
+                Type type = HierarchyPanel.ScriptComponentType(guid);
+                if (type is null || HasComponentOfType(entity, type)) continue;
+                if (!pushed) { EditorUndo.Push("Add Script Component"); pushed = true; }
+                entity.AddComponent(type);
+            }
+            if (pushed) state.MarkViewportDirty();
+        }
+        ImGui.EndDragDropTarget();
     }
 
     // Unity-style Tag + Layer row under the entity header. Both are entity state serialized in the
@@ -245,17 +386,34 @@ internal sealed class InspectorPanel {
     void DrawTransform(Transform transform) {
         bool open = PlainHeader("Transform");
 
-        // Right-click the header for Unity-style resets.
+        // Prefab override marker on the Transform header: a blue dot if any of pos/rot/scale differ
+        // from the prefab, with a right-click "Revert" per channel further down (the most common
+        // override). Drawn as a small badge after the header so it doesn't disturb layout.
+        bool posOv = PrefabOverrides.IsOverridden(PrefabOverrides.TransformPositionKey);
+        bool rotOv = PrefabOverrides.IsOverridden(PrefabOverrides.TransformRotationKey);
+        bool sclOv = PrefabOverrides.IsOverridden(PrefabOverrides.TransformScaleKey);
+        if (posOv || rotOv || sclOv) {
+            SysVec2 hp = ImGui.GetItemRectMax();
+            ImGui.GetWindowDrawList().AddCircleFilled(
+                new SysVec2(hp.X - 12, (ImGui.GetItemRectMin().Y + hp.Y) * 0.5f), 3.5f,
+                ImGui.GetColorU32(new SysVec4(0.45f, 0.66f, 1f, 1f)));
+        }
+
+        // The other selected entities' transforms, if this is a multi-selection — edits apply to all
+        // of them (Unity-style: a field change moves the whole group by the same DELTA, preserving
+        // relative offsets). Empty for a single selection.
+        var others = MultiTransforms(transform);
+
+        // Right-click the header for Unity-style resets (apply to the whole selection).
         if (ImGui.BeginPopupContextItem("##transformctx")) {
-            if (ImGui.MenuItem("Reset Position")) { EditorUndo.Push("Reset Position"); transform.Position = Vector3.Zero; }
-            if (ImGui.MenuItem("Reset Rotation")) { EditorUndo.Push("Reset Rotation"); transform.EulerAngles = Vector3.Zero; }
-            if (ImGui.MenuItem("Reset Scale")) { EditorUndo.Push("Reset Scale"); transform.Scale = Vector3.One; }
+            if (ImGui.MenuItem("Reset Position")) { EditorUndo.Push("Reset Position"); transform.Position = Vector3.Zero; foreach (Transform o in others) o.Position = Vector3.Zero; }
+            if (ImGui.MenuItem("Reset Rotation")) { EditorUndo.Push("Reset Rotation"); transform.EulerAngles = Vector3.Zero; foreach (Transform o in others) o.EulerAngles = Vector3.Zero; }
+            if (ImGui.MenuItem("Reset Scale")) { EditorUndo.Push("Reset Scale"); transform.Scale = Vector3.One; foreach (Transform o in others) o.Scale = Vector3.One; }
             ImGui.Separator();
             if (ImGui.MenuItem("Reset All")) {
                 EditorUndo.Push("Reset Transform");
-                transform.Position = Vector3.Zero;
-                transform.EulerAngles = Vector3.Zero;
-                transform.Scale = Vector3.One;
+                transform.Position = Vector3.Zero; transform.EulerAngles = Vector3.Zero; transform.Scale = Vector3.One;
+                foreach (Transform o in others) { o.Position = Vector3.Zero; o.EulerAngles = Vector3.Zero; o.Scale = Vector3.One; }
             }
             ImGui.EndPopup();
         }
@@ -264,13 +422,41 @@ internal sealed class InspectorPanel {
             return;
 
         if (BeginGrid("##transform")) {
-            SysVec3Row("Position", transform.Position, v => transform.Position = v, 0.05f);
-            SysVec3Row("Rotation", transform.EulerAngles, v => transform.EulerAngles = v, 0.5f);
-            SysVec3Row("Scale", transform.Scale, v => transform.Scale = v, 0.05f);
+            // The ACTIVE entity always takes the typed value verbatim (no representation drift). The
+            // OTHER selected entities receive the same DELTA, so the group moves rigidly and keeps its
+            // relative offsets. Rotation composes via QUATERNION (Euler add flips representations).
+            SysVec3Row("Position", transform.Position, v => {
+                Vector3 d = v - transform.Position; transform.Position = v;
+                foreach (Transform o in others) o.Position += d;
+            }, 0.05f);
+            SysVec3Row("Rotation", transform.EulerAngles, v => {
+                Quaternion oldQ = transform.Rotation;
+                transform.EulerAngles = v;
+                if (others.Count > 0) {
+                    Quaternion delta = transform.Rotation * Quaternion.Inverse(oldQ);
+                    foreach (Transform o in others) o.Rotation = delta * o.Rotation;
+                }
+            }, 0.5f);
+            SysVec3Row("Scale", transform.Scale, v => {
+                Vector3 d = v - transform.Scale; transform.Scale = v;
+                foreach (Transform o in others) o.Scale += d;
+            }, 0.05f, allowUniformLock: true);
             ImGui.EndTable();
         }
 
         ImGui.Spacing();
+    }
+
+    // The transforms of the OTHER selected entities (everything except `active`), when more than one
+    // entity is selected. Used to broadcast Transform edits across a multi-selection.
+    List<Transform> MultiTransforms(Transform active) {
+        var list = new List<Transform>();
+        if (state.SelectedEntities.Count <= 1)
+            return list;
+        foreach (Entity e in state.SelectedEntities)
+            if (e?.transform is { } t && !ReferenceEquals(t, active) && !e.IsDestroyed)
+                list.Add(t);
+        return list;
     }
 
     // Framed header with an accent stripe and a bold label, no enable checkbox (Transform).
@@ -292,13 +478,29 @@ internal sealed class InspectorPanel {
         return open;
     }
 
-    void DrawComponent(Entity entity, Behaviour behaviour) {
+    void DrawComponent(Entity entity, Behaviour behaviour, int typeIndex = 0) {
         Type type = behaviour.GetType();
         ImGui.PushID(behaviour.InstanceId.GetHashCode());
 
         bool enabled = behaviour.IsEnabled;
         bool open = ComponentHeader(Prettify(type.Name), type, ref enabled, out bool menuRequested);
-        if (enabled != behaviour.IsEnabled) { EditorUndo.Push($"Toggle {Prettify(type.Name)}"); behaviour.IsEnabled = enabled; state.MarkViewportDirty(); }
+
+        // Prefab override badge on the component header: a blue dot if ANY member of this component
+        // (matched by registry name + type-index) differs from the prefab definition.
+        if (entity.IsPrefabInstance && ComponentHasOverride(behaviour, typeIndex)) {
+            SysVec2 mx = ImGui.GetItemRectMax();
+            ImGui.GetWindowDrawList().AddCircleFilled(
+                new SysVec2(mx.X - 30, (ImGui.GetItemRectMin().Y + mx.Y) * 0.5f), 3.5f,
+                ImGui.GetColorU32(new SysVec4(0.45f, 0.66f, 1f, 1f)));
+        }
+        if (enabled != behaviour.IsEnabled) {
+            EditorUndo.Push($"Toggle {Prettify(type.Name)}");
+            behaviour.IsEnabled = enabled;
+            // Multi-selection: toggle the matching component on every selected entity too.
+            foreach (Behaviour sibling in MatchingComponents(behaviour))
+                sibling.IsEnabled = enabled;
+            state.MarkViewportDirty();
+        }
 
         if (menuRequested)
             ImGui.OpenPopup("##componentctx");
@@ -318,6 +520,29 @@ internal sealed class InspectorPanel {
             ImGui.BeginDisabled(!CanPasteInto(type));
             if (ImGui.MenuItem($"{EditorIcons.Add}  Paste Component Values")) PasteComponent(behaviour);
             ImGui.EndDisabled();
+
+            // [ContextMenu] methods (Unity's): each parameterless [ContextMenu]-marked method shows
+            // here and runs on click, ScriptGuard-protected so a throwing one can't take the editor down.
+            bool firstCtx = true;
+            foreach (MethodInfo ctxMethod in ComponentReflection.InspectorContextMenus(type)) {
+                if (firstCtx) { ImGui.Separator(); firstCtx = false; }
+                string ctxLabel = ctxMethod.GetCustomAttribute<ContextMenuAttribute>()?.Label ?? Prettify(ctxMethod.Name);
+                if (ImGui.MenuItem($"{EditorIcons.Wrench}  {ctxLabel}")) {
+                    EditorUndo.Push(ctxLabel);
+                    try { ctxMethod.Invoke(behaviour, null); }
+                    catch (Exception ex) { Debugging.LogError($"[ContextMenu] '{ctxLabel}' threw: {ex.InnerException?.Message ?? ex.Message}"); }
+                    state.MarkViewportDirty();
+                }
+            }
+
+            // Edit Script — for game-script components (compiled into GameScripts.dll), open the
+            // backing .cs in the OS's default C# editor (item 9). Engine components have no source file.
+            if (IsGameScript(type)) {
+                ImGui.Separator();
+                if (ImGui.MenuItem($"{EditorIcons.Code}  Edit Script"))
+                    OpenComponentScript(type);
+            }
+
             ImGui.Separator();
             if (ImGui.MenuItem($"{EditorIcons.Delete}  Remove Component")) removeClicked = true;
             ImGui.EndPopup();
@@ -325,6 +550,9 @@ internal sealed class InspectorPanel {
 
         if (removeClicked) {
             EditorUndo.Push("Remove Component");
+            // Multi-selection: remove the matching component from every selected entity too.
+            foreach (Behaviour sibling in MatchingComponents(behaviour))
+                sibling.Entity.RemoveComponent(sibling);
             entity.RemoveComponent(behaviour);
             state.MarkViewportDirty();
             ImGui.PopID();
@@ -344,6 +572,33 @@ internal sealed class InspectorPanel {
 
             if (behaviour is Terrain terrain)
                 DrawTerrainBrushSection(terrain);
+
+            if (behaviour is AudioSource audioSource)
+                DrawAudioSourceSection(audioSource);
+
+            if (behaviour is Animator animator)
+                DrawAnimatorSection(animator);
+
+            if (behaviour is AnimatorController controller)
+                DrawAnimatorControllerSection(controller);
+
+            if (behaviour is LightAnimator lightAnim)
+                DrawLightAnimatorSection(lightAnim);
+
+            if (behaviour is Spawner spawner)
+                DrawSpawnerSection(spawner);
+
+            if (behaviour is Health health)
+                DrawHealthSection(health);
+
+            if (behaviour is BallisticEngine.UI.UIDocument uiDoc)
+                DrawUIDocumentSection(uiDoc);
+
+            if (behaviour is ParticleSystem particles)
+                DrawParticleSystemSection(particles);
+
+            if (behaviour is TrailRenderer trail)
+                DrawTrailRendererSection(trail);
 
             ImGui.Spacing();
         }
@@ -427,13 +682,41 @@ internal sealed class InspectorPanel {
         }
 
         ImGui.SeparatorText("Overrides");
+        // UNDO for volume-profile edits (bug 2b): the profile is a .volume ASSET, outside scene-undo.
+        // Snapshot before drawing; if a parameter changed, push a callback undo step when the edit
+        // SETTLES (no item active) so a slider drag is one entry, not hundreds. The before-snapshot is
+        // captured at the start of a drag (the frame the change first appears) and held until release.
+        object beforeSnap = VolumeProfileEditor.Snapshot(volume.Profile);
         if (VolumeProfileEditor.Draw(volume.Profile)) {
             VolumeProfileEditor.SaveToAsset(volume.Profile);
-            // The viewport repaints on demand; without this a profile edit (toggle a component
-            // Active, drag contrast/saturation, ...) saves but never shows — looked "broken".
             state.MarkViewportDirty();
+
+            VolumeProfile prof = volume.Profile;
+            // Remember the state from BEFORE this drag started (first changed frame).
+            volumeUndoBefore ??= volumeUndoLastClean;
+            volumeUndoBefore ??= beforeSnap;
+
+            // Commit one undo step when the interaction ends (mouse released / instantaneous widget).
+            if (!ImGui.IsAnyItemActive()) {
+                object before = volumeUndoBefore;
+                object after = VolumeProfileEditor.Snapshot(prof);
+                EditorUndo.PushCallback("Edit Volume Override",
+                    () => { VolumeProfileEditor.Restore(prof, before); VolumeProfileEditor.SaveToAsset(prof); state.MarkViewportDirty(); },
+                    () => { VolumeProfileEditor.Restore(prof, after); VolumeProfileEditor.SaveToAsset(prof); state.MarkViewportDirty(); });
+                volumeUndoBefore = null;
+            }
+        }
+        else if (!ImGui.IsAnyItemActive()) {
+            // Idle: this clean snapshot is the "before" for the next edit.
+            volumeUndoLastClean = beforeSnap;
+            volumeUndoBefore = null;
         }
     }
+
+    // Volume-profile undo bookkeeping (see DrawVolumeSection): the snapshot from before the current
+    // drag began, and the last settled (clean) snapshot to use as its baseline.
+    static object volumeUndoBefore;
+    static object volumeUndoLastClean;
 
     // Terrain sculpting palette: a Sculpt toggle that arms the Scene-view brush, the brush mode, and
     // radius/strength (and a target height for Flatten/Set). Drives TerrainTool's static state; the
@@ -484,6 +767,375 @@ internal sealed class InspectorPanel {
         }
 
         ImGui.TextDisabled("Pick Lower to dig; Smooth/Flatten to level.");
+    }
+
+    // AudioSource preview: a Preview/Stop button so you can hear a clip without entering play mode.
+    // Uses the static Audio facade (play-mode-independent), so it works in edit mode; AudioSource.Play
+    // itself is gated to play mode. Graceful no-op when no audio device is present (headless CI).
+    static IAudioVoice audioPreviewVoice;
+    static float audioPreviewTime;   // scrub-slider position (seconds), persists between previews
+    void DrawAudioSourceSection(AudioSource source) {
+        ImGui.Spacing();
+        ImGui.SeparatorText("Preview");
+
+        if (source.Clip is null) {
+            ImGui.TextDisabled("Assign a Clip to preview.");
+            return;
+        }
+
+        bool playing = audioPreviewVoice is { IsPlaying: true };
+        if (ImGui.Button(playing ? $"{EditorIcons.Pause}  Stop" : $"{EditorIcons.Play}  Preview",
+                new SysVec2(120, 0))) {
+            audioPreviewVoice?.Stop();
+            audioPreviewVoice = playing
+                ? null
+                : Audio.Play(source.Clip, source.Volume, source.Pitch, loop: false);
+            playing = !playing;
+        }
+        ImGui.SameLine();
+        ImGui.TextDisabled($"{source.Clip.DurationSeconds:F1}s, {source.Clip.Channels}ch, {source.Clip.SampleRate}Hz");
+
+        DrawAudioScrubber(source.Clip, source.Volume, source.Pitch);
+
+        if (!Audio.IsAvailable)
+            ImGui.TextDisabled("(no audio device on this machine — preview is silent)");
+    }
+
+    // Time slider under the preview button: shows the play head while previewing and lets you scrub.
+    // Dragging seeks the live voice; releasing on a stopped voice restarts playback from that offset
+    // (so you can scrub a finished/idle clip to a spot and hear it from there).
+    void DrawAudioScrubber(AudioClip clip, float volume, float pitch) {
+        float duration = MathF.Max(clip.DurationSeconds, 0.001f);
+        bool live = audioPreviewVoice is { IsPlaying: true };
+
+        // While playing, the play head drives the slider; otherwise keep the last scrub position so the
+        // handle doesn't snap back to 0 between previews.
+        if (live)
+            audioPreviewTime = Math.Clamp(audioPreviewVoice.TimeSeconds, 0f, duration);
+
+        ImGui.SetNextItemWidth(-1);
+        float t = audioPreviewTime;
+        if (ImGui.SliderFloat("##audioScrub", ref t, 0f, duration, "%.2fs")) {
+            audioPreviewTime = Math.Clamp(t, 0f, duration);
+            if (audioPreviewVoice is { IsPlaying: true })
+                audioPreviewVoice.TimeSeconds = audioPreviewTime;   // seek the live voice
+            else {
+                // Scrubbing an idle clip: start a fresh voice and jump it to the scrub point.
+                audioPreviewVoice = Audio.Play(clip, volume, pitch, loop: false);
+                if (audioPreviewVoice is not null)
+                    audioPreviewVoice.TimeSeconds = audioPreviewTime;
+            }
+        }
+
+        // Keep the inspector repainting so the play head animates under on-demand rendering.
+        if (live)
+            state.MarkViewportDirty();
+    }
+
+    // Animator preview: a play/pause toggle + a scrub slider that evaluates the clip in edit mode, so
+    // you can pose the skinned character without entering play. Drives Animator.EvaluatePreview, which
+    // runs the same sample->skeleton->skinning pipeline as play-mode Tick.
+    void DrawAnimatorSection(Animator animator) {
+        ImGui.Spacing();
+        ImGui.SeparatorText("Preview");
+
+        if (animator.Clip is null) {
+            ImGui.TextDisabled("Assign a Clip to preview.");
+            return;
+        }
+
+        float duration = MathF.Max(animator.Clip.DurationSeconds, 0.001f);
+
+        if (ImGui.Button(animatorPreviewPlaying ? $"{EditorIcons.Pause}  Pause" : $"{EditorIcons.Play}  Play",
+                new SysVec2(100, 0)))
+            animatorPreviewPlaying = !animatorPreviewPlaying;
+        ImGui.SameLine();
+        if (ImGui.Button($"{EditorIcons.Refresh}  Reset", new SysVec2(100, 0))) {
+            animatorPreviewTime = 0f;
+            animatorPreviewPlaying = false;
+        }
+
+        if (animatorPreviewPlaying) {
+            animatorPreviewTime += (float)Time.DeltaTime;
+            if (animator.Loop && animatorPreviewTime > duration)
+                animatorPreviewTime %= duration;
+            state.MarkViewportDirty(); // keep the viewport repainting while previewing
+        }
+
+        float t = animatorPreviewTime;
+        if (ImGui.SliderFloat("##animScrub", ref t, 0f, duration, "%.2fs")) {
+            animatorPreviewTime = t;
+            animatorPreviewPlaying = false;
+        }
+
+        // Apply the previewed pose this frame (edit mode only — play mode drives it from Tick).
+        if (!SceneManager.IsPlaying) {
+            animator.EvaluatePreview(animatorPreviewTime);
+            state.MarkViewportDirty();
+        }
+
+        // Animation events (script-driven). Show the count + the last fired event so you can confirm
+        // they're wired and firing in play mode.
+        if (animator.EventCount > 0) {
+            ImGui.Spacing();
+            ImGui.SeparatorText("Events");
+            ImGui.TextDisabled($"{animator.EventCount} event(s) registered");
+            if (!string.IsNullOrEmpty(animator.LastFiredEvent))
+                ImGui.TextDisabled($"Last fired: {animator.LastFiredEvent}");
+        }
+    }
+
+    static bool animatorPreviewPlaying;
+    static float animatorPreviewTime;
+
+    // AnimatorController: a live view of the state machine. The graph is script-built (states +
+    // transitions are wired in OnBegin), so this is a runtime DEBUG/DRIVE surface — it lists the states
+    // with the current one highlighted, and renders a poker for each declared parameter (checkbox for
+    // bool, slider for float/int, a button for triggers) so you can drive the graph from the inspector
+    // in play mode without writing test code (very AI-managed-friendly: set "Speed" and watch it cross
+    // from idle->walk->run live).
+    void DrawAnimatorControllerSection(AnimatorController controller) {
+        ImGui.Spacing();
+        ImGui.SeparatorText("State Machine");
+
+        if (controller.StateCount == 0) {
+            ImGui.TextDisabled("No states. Build the graph in a script's OnBegin:");
+            ImGui.TextDisabled("  AddState(name, clip); state.To(target, param, Compare, ...)");
+            return;
+        }
+
+        if (!SceneManager.IsPlaying)
+            ImGui.TextDisabled("Enter play mode to drive the graph.");
+
+        // Current state banner.
+        string cur = controller.CurrentStateName ?? "(none)";
+        ImGui.Text("Current: ");
+        ImGui.SameLine();
+        ImGui.TextColored(new SysVec4(0.45f, 0.85f, 1f, 1f), cur);
+
+        // State list with the active one highlighted.
+        ImGui.Spacing();
+        ImGui.TextDisabled($"States ({controller.StateCount})");
+        foreach (AnimatorController.State s in controller.States) {
+            bool isCurrent = s.Name == controller.CurrentStateName;
+            string label = $"{(isCurrent ? EditorIcons.Play + " " : "   ")}{s.Name}";
+            string clipName = s.Clip is not null ? s.Clip.Name : "(no clip)";
+            if (isCurrent)
+                ImGui.TextColored(new SysVec4(0.45f, 0.85f, 1f, 1f), $"{label}  ->  {clipName}");
+            else
+                ImGui.TextDisabled($"{label}  ->  {clipName}");
+            // A click jumps to the state (play mode) — handy for testing.
+            if (SceneManager.IsPlaying && ImGui.IsItemClicked())
+                controller.Play(s.Name);
+        }
+
+        // Parameter pokers.
+        var prms = controller.Parameters;
+        if (prms.Count > 0) {
+            ImGui.Spacing();
+            ImGui.SeparatorText("Parameters");
+            foreach (var kv in prms) {
+                string name = kv.Key;
+                switch (kv.Value) {
+                    case AnimatorController.ParamKind.Bool: {
+                        bool b = controller.GetBool(name);
+                        if (ImGui.Checkbox(name, ref b)) controller.SetBool(name, b);
+                        break;
+                    }
+                    case AnimatorController.ParamKind.Trigger: {
+                        if (ImGui.Button($"{EditorIcons.Play} {name}", new SysVec2(140, 0)))
+                            controller.SetTrigger(name);
+                        ImGui.SameLine();
+                        ImGui.TextDisabled(controller.GetTrigger(name) ? "(set)" : "");
+                        break;
+                    }
+                    case AnimatorController.ParamKind.Int: {
+                        int iv = controller.GetInt(name);
+                        if (ImGui.DragInt(name, ref iv)) controller.SetInt(name, iv);
+                        break;
+                    }
+                    default: { // Float
+                        float fv = controller.GetFloat(name);
+                        if (ImGui.DragFloat(name, ref fv, 0.05f)) controller.SetFloat(name, fv);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (SceneManager.IsPlaying)
+            state.MarkViewportDirty(); // keep repainting so transitions show live
+    }
+
+    // LightAnimator: a live preview toggle that animates the light IN EDIT MODE (so you can dial in a
+    // flicker/pulse without entering play), plus a warning if there's no light on the entity to drive.
+    // The IntensityCurve / ColorOverTime members render their curve+gradient widgets automatically via
+    // the reflection DrawMember, so this only adds the preview control.
+    void DrawLightAnimatorSection(LightAnimator lightAnim) {
+        ImGui.Spacing();
+        ImGui.SeparatorText("Preview");
+
+        bool hasLight = lightAnim.GetComponent<PointLight>() is not null
+                     || lightAnim.GetComponent<SpotLight>() is not null;
+        if (!hasLight) {
+            ImGui.TextColored(new SysVec4(1f, 0.7f, 0.3f, 1f), "No PointLight or SpotLight on this entity.");
+            ImGui.TextDisabled("Add one — the animator drives its Intensity + Color.");
+            return;
+        }
+
+        if (ImGui.Button(lightAnimPreview ? $"{EditorIcons.Pause}  Stop Preview" : $"{EditorIcons.Play}  Preview",
+                new SysVec2(140, 0))) {
+            lightAnimPreview = !lightAnimPreview;
+            if (lightAnimPreview) lightAnimPreviewClock = 0f;
+            else { lightAnim.RestoreBase(); state.MarkViewportDirty(); } // un-dim the light when stopping
+        }
+        ImGui.SameLine();
+        ImGui.TextDisabled(lightAnim.Animation.ToString());
+
+        // Drive the light in edit mode along its own preview clock (play mode runs Tick itself).
+        if (lightAnimPreview && !SceneManager.IsPlaying) {
+            lightAnimPreviewClock += (float)Time.DeltaTime;
+            lightAnim.Apply(lightAnimPreviewClock);
+            state.MarkViewportDirty();
+        }
+    }
+
+    static bool lightAnimPreview;
+    static float lightAnimPreviewClock;
+
+    // Spawner: live alive/pooled counts + a manual Spawn One / Clear. Spawning only runs in play mode
+    // (Tick), so the manual button is most useful there; in edit mode it instantiates immediately so
+    // you can preview the prefab placement, and Clear cleans those up.
+    void DrawSpawnerSection(Spawner spawner) {
+        ImGui.Spacing();
+        ImGui.SeparatorText("Spawner");
+
+        if (spawner.Prefab is null) {
+            ImGui.TextColored(new SysVec4(1f, 0.7f, 0.3f, 1f), "Assign a Prefab to spawn.");
+            return;
+        }
+
+        ImGui.Text($"Alive: {spawner.AliveCount} / {spawner.MaxAlive}");
+        ImGui.SameLine();
+        ImGui.TextDisabled($"(pooled: {spawner.PooledCount})");
+
+        if (ImGui.Button($"{EditorIcons.Play}  Spawn One", new SysVec2(120, 0))) {
+            spawner.Spawn();
+            state.MarkViewportDirty();
+        }
+        ImGui.SameLine();
+        if (ImGui.Button($"{EditorIcons.Refresh}  Clear", new SysVec2(120, 0))) {
+            spawner.Clear();
+            state.MarkViewportDirty();
+        }
+
+        if (SceneManager.IsPlaying && spawner.AliveCount > 0)
+            state.MarkViewportDirty(); // keep repainting while instances live/expire
+    }
+
+    // Health: a current/max bar (green->red by fraction) + Damage/Heal/Kill/Revive test buttons so you
+    // can exercise the events without play-mode scripting. The OnDamaged/OnHealed/OnDied BEvents render
+    // their own listener editors automatically via the reflection DrawMember.
+    // UIDocument's Uxml/Uss are string PATHS; give them drag-drop target fields so you can drop a
+    // .uxml/.uss (or .uihtml/.uss) asset from the browser instead of typing the address (item 15).
+    void DrawUIDocumentSection(BallisticEngine.UI.UIDocument doc) {
+        ImGui.Spacing();
+        ImGui.SeparatorText("Markup & Style");
+        DrawPathDropField("UXML (markup)", doc.Uxml, [".uxml", ".uihtml", ".html"], p => doc.Uxml = p);
+        DrawPathDropField("USS (style)", doc.Uss, [".uss", ".uicss", ".css"], p => doc.Uss = p);
+        ImGui.TextDisabled("Drag a markup/style asset here, or type its Assets/... path.");
+    }
+
+    // A text field for an asset PATH that also accepts a drag-drop of a matching-extension asset (sets
+    // the field to the dropped asset's path). `exts` are the accepted extensions (lowercase, with dot).
+    void DrawPathDropField(string label, string current, string[] exts, Action<string> apply) {
+        ImGui.PushID(label);
+        ImGui.TextDisabled(label);
+        var s = current ?? "";
+        ImGui.SetNextItemWidth(-1);
+        if (ImGui.InputText("##path", ref s, 256)) {
+            EditorUndo.Push($"Edit {label}");
+            apply(s);
+            state.MarkViewportDirty();
+        }
+        // Drop target over the field: accept a single matching asset and write its path.
+        if (AcceptGuidDrop(out Guid guid)) {
+            string path = AssetDatabase.GuidToAssetPath(guid);
+            if (path is not null && exts.Any(e => path.EndsWith(e, StringComparison.OrdinalIgnoreCase))) {
+                EditorUndo.Push($"Assign {label}");
+                apply(path);
+                state.MarkViewportDirty();
+            }
+        }
+        ImGui.PopID();
+    }
+
+    void DrawHealthSection(Health health) {
+        ImGui.Spacing();
+        ImGui.SeparatorText("Health");
+
+        float frac = health.HealthFraction;
+        // Manual bar (green->red by remaining fraction), so it works without ProgressBar styling.
+        var draw = ImGui.GetWindowDrawList();
+        SysVec2 p = ImGui.GetCursorScreenPos();
+        float w = MathF.Max(ImGui.GetContentRegionAvail().X, 60f);
+        const float h = 18f;
+        draw.AddRectFilled(p, p + new SysVec2(w, h), 0xFF202428, 3f);
+        var barCol = ImGui.GetColorU32(new SysVec4(1f - frac, frac, 0.12f, 1f));
+        if (frac > 0f)
+            draw.AddRectFilled(p, p + new SysVec2(w * frac, h), barCol, 3f);
+        draw.AddRect(p, p + new SysVec2(w, h), 0xFF000000, 3f);
+        string label = health.IsDead ? "DEAD" : $"{health.CurrentHealth:0} / {health.MaxHealth:0}";
+        SysVec2 ts = ImGui.CalcTextSize(label);
+        draw.AddText(p + new SysVec2((w - ts.X) * 0.5f, (h - ts.Y) * 0.5f), 0xFFFFFFFF, label);
+        ImGui.Dummy(new SysVec2(w, h));
+
+        if (ImGui.Button("Damage 10", new SysVec2(90, 0))) { health.TakeDamage(10f); state.MarkViewportDirty(); }
+        ImGui.SameLine();
+        if (ImGui.Button("Heal 10", new SysVec2(90, 0))) { health.Heal(10f); state.MarkViewportDirty(); }
+        ImGui.SameLine();
+        if (ImGui.Button("Kill", new SysVec2(70, 0))) { health.Kill(); state.MarkViewportDirty(); }
+        ImGui.SameLine();
+        if (ImGui.Button("Revive", new SysVec2(70, 0))) { health.Revive(); state.MarkViewportDirty(); }
+
+        if (!SceneManager.IsPlaying)
+            ImGui.TextDisabled("Edit-mode tests don't fire DestroyOnDeath (play only).");
+    }
+
+    // ParticleSystem preview: it already animates live in the editor (AdvanceAll runs every editor
+    // frame), so this just adds a Restart (clear) + a one-shot Emit test + a live count, and keeps the
+    // viewport repainting while particles are alive so you see the motion.
+    void DrawParticleSystemSection(ParticleSystem particles) {
+        ImGui.Spacing();
+        ImGui.SeparatorText("Preview");
+
+        // Two equal half-width buttons that fill the row (auto-width 110px clipped the labels to
+        // "Resta.../Emit 5" in a narrow inspector); the live count goes on its own line so nothing
+        // gets squeezed off.
+        float spacing = ImGui.GetStyle().ItemSpacing.X;
+        float w = (ImGui.GetContentRegionAvail().X - spacing) * 0.5f;
+        if (ImGui.Button($"{EditorIcons.Refresh}  Restart", new SysVec2(w, 0)))
+            particles.Clear();
+        ImGui.SameLine();
+        if (ImGui.Button($"{EditorIcons.Play}  Emit 50", new SysVec2(w, 0)))
+            particles.Emit(50);
+        ImGui.TextDisabled($"{particles.LiveCount} live");
+
+        if (particles.LiveCount > 0)
+            state.MarkViewportDirty();
+    }
+
+    // TrailRenderer preview: also animates live in the editor; add a Clear + a live point count.
+    void DrawTrailRendererSection(TrailRenderer trail) {
+        ImGui.Spacing();
+        ImGui.SeparatorText("Preview");
+
+        if (ImGui.Button($"{EditorIcons.Refresh}  Clear", new SysVec2(-1, 0)))
+            trail.Clear();
+        ImGui.TextDisabled($"{trail.PointCount} points");
+
+        if (trail.PointCount > 0)
+            state.MarkViewportDirty();
     }
 
     static void CreateProfileAsset(Entity entity, Volume volume) {
@@ -591,8 +1243,16 @@ internal sealed class InspectorPanel {
             groupOpen = true;
         }
 
-        foreach (MemberInfo member in ComponentReflection.InspectorMembers(type)) {
+        // [PropertyOrder] reorders members (stable sort: default 0 keeps declaration order, so a
+        // component that doesn't use it renders exactly as before).
+        foreach (MemberInfo member in System.Linq.Enumerable.OrderBy(
+                     ComponentReflection.InspectorMembers(type), m => MemberAttributes.For(m).Order)) {
             MemberAttributes attrs = MemberAttributes.For(member);
+
+            // [ShowIf]/[HideIf]: skip a hidden member entirely, before any header/space/foldout chrome.
+            if (!Conditions.Visible(attrs.Conditionals, target))
+                continue;
+
             string group = attrs.Foldout?.Name;
 
             // Leaving the current foldout group (different/no group, or a new header) closes it.
@@ -629,21 +1289,91 @@ internal sealed class InspectorPanel {
             if (ImGui.Button($"{label}###btn_{type.Name}_{method.Name}", new SysVec2(-1, 0)))
                 method.Invoke(target, null);
         }
+
+        // [EditorWindowExecutionPoint] methods: a window-open button that runs the method (state setup)
+        // then opens a dedicated big window for this component.
+        foreach (MethodInfo method in ComponentReflection.InspectorWindowPoints(type)) {
+            var attr = method.GetCustomAttribute<EditorWindowExecutionPointAttribute>();
+            string label = attr?.Title ?? $"Open {Prettify(type.Name)} Window";
+            if (ImGui.Button($"{EditorIcons.Maximize}  {label}###win_{type.Name}_{method.Name}", new SysVec2(-1, 0))) {
+                try { method.Invoke(target, null); }
+                catch (Exception e) { Debugging.LogError($"Editor window method threw: {e.Message}"); }
+                ComponentEditorWindow.Open(target, attr?.Title ?? Prettify(type.Name));
+            }
+        }
+    }
+
+    // Sets a member on the active component AND, in a multi-selection, on the same-named member of the
+    // matching component (same type) of every OTHER selected entity — Unity's per-component multi-edit.
+    // Only broadcasts when `target` is a Behaviour on the active entity and >1 entity is selected; for
+    // anything else (assets, scene behaviours) it just sets the one target.
+    void ApplyMember(MemberInfo member, object target, object value) {
+        ComponentReflection.SetValue(member, target, value);
+
+        if (state.SelectedEntities.Count <= 1 || target is not Behaviour activeBehaviour)
+            return;
+        Entity activeEntity = activeBehaviour.Entity;
+        Type compType = activeBehaviour.GetType();
+        foreach (Entity e in state.SelectedEntities) {
+            if (e is null || e.IsDestroyed || ReferenceEquals(e, activeEntity))
+                continue;
+            foreach (Behaviour b in e.Behaviours) {
+                if (b.GetType() == compType) {
+                    try { ComponentReflection.SetValue(member, b, value); }
+                    catch { /* mismatched/read-only on a sibling — skip, don't break the edit */ }
+                    break; // first matching component only
+                }
+            }
+        }
+    }
+
+    // Draws a small amber "—" after the field label when the selected entities DISAGREE on this
+    // member's value (Unity's mixed-value dash). No-op for single selection or when all agree.
+    void DrawMixedMarker(MemberInfo member, object target, object activeValue) {
+        if (state.SelectedEntities.Count <= 1 || target is not Behaviour activeBehaviour)
+            return;
+        Type compType = activeBehaviour.GetType();
+        Entity activeEntity = activeBehaviour.Entity;
+        bool differs = false;
+        foreach (Entity e in state.SelectedEntities) {
+            if (e is null || e.IsDestroyed || ReferenceEquals(e, activeEntity))
+                continue;
+            foreach (Behaviour b in e.Behaviours) {
+                if (b.GetType() == compType) {
+                    object v = ComponentReflection.GetValue(member, b);
+                    if (!Equals(v, activeValue)) differs = true;
+                    break;
+                }
+            }
+            if (differs) break;
+        }
+        if (differs) {
+            ImGui.SameLine(0, 4);
+            ImGui.TextColored(new SysVec4(1f, 0.72f, 0.25f, 1f), "—");
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Values differ across the selection. Editing sets them all to this value.");
+        }
     }
 
     void DrawMember(MemberInfo member, object target, MemberAttributes attrs) {
         Type memberType = ComponentReflection.MemberType(member);
         object value = ComponentReflection.GetValue(member, target);
 
-        RowWithTooltip(Prettify(member.Name), attrs.Tooltip?.Text);
+        string display = attrs.LabelText?.Text ?? Prettify(member.Name);   // [LabelText] override
+        RowWithTooltip(display, attrs.Tooltip?.Text);
+        // Mixed-value marker: in a multi-selection, an amber dash when the selected entities DISAGREE
+        // on this member (the field shows the active entity's value; editing it sets them all alike).
+        DrawMixedMarker(member, target, value);
         ImGui.PushID(member.Name);
         ImGui.SetNextItemWidth(-1);
-        if (attrs.ReadOnly) ImGui.BeginDisabled();
+        // [ReadOnly] + [EnableIf]/[DisableIf] gate the value widget (the label stays enabled).
+        bool memberDisabled = attrs.ReadOnly || Conditions.Disabled(attrs.Conditionals, target);
+        if (memberDisabled) ImGui.BeginDisabled();
 
         // Every edit auto-registers ONE undo step via InspectorUndo.Track (snapshot on edit-begin,
         // commit on edit-end) — no per-widget EditorUndo.Push, so no case can forget it. Each change
         // also marks the viewport dirty (on-demand render) since a value edit can alter the picture.
-        string label = $"Edit {Prettify(member.Name)}";
+        string label = $"Edit {display}";
 
         if (typeof(BEvent).IsAssignableFrom(memberType)) {
             // Serialized event (UnityEvent-style): a multi-row listener editor. The component owns
@@ -653,79 +1383,31 @@ internal sealed class InspectorPanel {
         else if (typeof(BObject).IsAssignableFrom(memberType)) {
             DrawAssetSlot(member, target, value as BObject, memberType);
         }
+        else if (value is AnimationCurve curve) {
+            // Interactive curve widget — applies to ANY AnimationCurve member with no per-component
+            // wiring. Mutated in place (reference type); the "Edit" button opens the standalone window.
+            if (DrawCurveEditor(member.Name, curve, state.MarkViewportDirty))
+                state.MarkViewportDirty();
+        }
+        else if (value is ColorGradient gradient) {
+            // Interactive gradient bar — same auto-apply-to-any-member story as the curve.
+            if (DrawGradientEditor(member.Name, gradient))
+                state.MarkViewportDirty();
+        }
+        else if (memberRegistry.Resolve(memberType) is { } drawer) {
+            // Shared value drawers (float/int/bool/string/enum/Vector2/Vector3) — the SAME registry the
+            // volume profile editor uses, so the two paths can't drift. componentGui wraps each widget in
+            // InspectorUndo.Track; the MemberProperty setter is ApplyMember (multi-select) + dirty.
+            // Range/[ColorUsage] are carried on the IProperty, so slider-vs-drag and color-vs-axis match.
+            componentGui.SetUndoLabel(label);
+            drawer.Draw(new MemberProperty(member, target,
+                v => { ApplyMember(member, target, v); state.MarkViewportDirty(); }), componentGui);
+        }
         else {
-            switch (value) {
-                case float f: {
-                    bool changed = InspectorUndo.Track(label, attrs.Range is { } r
-                        ? ImGui.SliderFloat("##v", ref f, r.Min, r.Max)
-                        : ImGui.DragFloat("##v", ref f, 0.05f));
-                    if (changed) {
-                        if (attrs.Range is { } rc) f = Math.Clamp(f, rc.Min, rc.Max);
-                        ComponentReflection.SetValue(member, target, f);
-                        state.MarkViewportDirty();
-                    }
-                    break;
-                }
-                case int i: {
-                    bool changed = InspectorUndo.Track(label, attrs.Range is { } r
-                        ? ImGui.SliderInt("##v", ref i, (int)r.Min, (int)r.Max)
-                        : ImGui.DragInt("##v", ref i));
-                    if (changed) {
-                        if (attrs.Range is { } rc) i = Math.Clamp(i, (int)rc.Min, (int)rc.Max);
-                        ComponentReflection.SetValue(member, target, i);
-                        state.MarkViewportDirty();
-                    }
-                    break;
-                }
-                case bool b: {
-                    var changed = InspectorUndo.Track(label, ImGui.Checkbox("##v", ref b));
-                    if (changed) { ComponentReflection.SetValue(member, target, b); state.MarkViewportDirty(); }
-                    break;
-                }
-                case string s: {
-                    var str = s ?? "";
-                    var changed = InspectorUndo.Track(label, ImGui.InputText("##v", ref str, 256));
-                    if (changed) { ComponentReflection.SetValue(member, target, str); state.MarkViewportDirty(); }
-                    break;
-                }
-                case Vector3 v3: {
-                    var sv = new SysVec3(v3.X, v3.Y, v3.Z);
-                    // [ColorUsage] (or a "...Color" name) gets a color picker; HDR allows >1.
-                    var isColor = attrs.ColorUsage is not null ||
-                                  member.Name.EndsWith("Color", StringComparison.Ordinal);
-                    bool changed;
-                    if (isColor) {
-                        var flags = attrs.ColorUsage?.Hdr == true
-                            ? ImGuiColorEditFlags.Hdr | ImGuiColorEditFlags.Float
-                            : ImGuiColorEditFlags.None;
-                        changed = InspectorUndo.Track(label, ImGui.ColorEdit3("##v", ref sv, flags));
-                    }
-                    else {
-                        changed = AxisVec3("v3", label, ref sv, 0.05f);
-                    }
-                    if (changed) { ComponentReflection.SetValue(member, target, new Vector3(sv.X, sv.Y, sv.Z)); state.MarkViewportDirty(); }
-                    break;
-                }
-                case Vector2 v2: {
-                    var sv = new SysVec2(v2.X, v2.Y);
-                    var changed = InspectorUndo.Track(label, ImGui.DragFloat2("##v", ref sv, 0.05f));
-                    if (changed) { ComponentReflection.SetValue(member, target, new Vector2(sv.X, sv.Y)); state.MarkViewportDirty(); }
-                    break;
-                }
-                case Enum e: {
-                    string[] names = Enum.GetNames(memberType);
-                    int current = Array.IndexOf(names, e.ToString());
-                    var changed = InspectorUndo.Track(label, ImGui.Combo("##v", ref current, names, names.Length));
-                    if (changed) { ComponentReflection.SetValue(member, target, Enum.Parse(memberType, names[current])); state.MarkViewportDirty(); }
-                    break;
-                }
-                default:
-                    ImGui.TextDisabled($"({memberType.Name})");
-                    break;
-            }
+            ImGui.TextDisabled($"({memberType.Name})");
         }
 
-        if (attrs.ReadOnly) ImGui.EndDisabled();
+        if (memberDisabled) ImGui.EndDisabled();
         ImGui.PopID();
     }
 
@@ -765,6 +1447,295 @@ internal sealed class InspectorPanel {
         ImGui.SameLine(0, 0);
         ImGui.SetNextItemWidth(fieldW);
         return InspectorUndo.Track(label, ImGui.DragFloat(id, ref value, speed, 0, 0, "%.2f"));
+    }
+
+    // ---- AnimationCurve editor ---------------------------------------------------
+    // An interactive curve widget: a plot box that samples the curve into a polyline, draggable
+    // keyframe dots (drag to move time+value), double-click empty space to add a key, right-click a
+    // key to remove it, and preset buttons (Linear / Ease / Constant). Reusable for ANY AnimationCurve
+    // member. The curve is mutated in place; returns true when an edit happened (caller marks dirty).
+    // The plot auto-fits its value range to the keys (with a small pad) so any amplitude is visible.
+    static int curveDragKey = -1; // index of the key being dragged (-1 = none); single-widget assumption
+
+    static bool DrawCurveEditor(string id, AnimationCurve curve, Action onExternalEdit = null) {
+        bool edited = false;
+        ImGui.PushID(id);
+
+        float w = ImGui.GetContentRegionAvail().X;
+        const float height = 90f;
+        SysVec2 origin = ImGui.GetCursorScreenPos();
+        var size = new SysVec2(MathF.Max(w, 60f), height);
+        var draw = ImGui.GetWindowDrawList();
+
+        // Background + border.
+        draw.AddRectFilled(origin, origin + size, ImGui.GetColorU32(new SysVec4(0.10f, 0.11f, 0.13f, 1f)), 4f);
+        draw.AddRect(origin, origin + size, ImGui.GetColorU32(new SysVec4(0.30f, 0.32f, 0.36f, 1f)), 4f);
+
+        // Time range = [first key, last key] (default [0,1]); value range auto-fits the keys.
+        float t0 = 0f, t1 = 1f, vMin = 0f, vMax = 1f;
+        if (curve.Count > 0) {
+            t0 = curve.Keys[0].Time;
+            t1 = curve.Keys[curve.Count - 1].Time;
+            vMin = float.MaxValue; vMax = float.MinValue;
+            for (var i = 0; i < curve.Count; i++) {
+                vMin = MathF.Min(vMin, curve.Keys[i].Value);
+                vMax = MathF.Max(vMax, curve.Keys[i].Value);
+            }
+        }
+        if (t1 <= t0) t1 = t0 + 1f;
+        if (vMax <= vMin) { vMin -= 0.5f; vMax += 0.5f; }
+        float vPad = (vMax - vMin) * 0.12f;
+        vMin -= vPad; vMax += vPad;
+
+        SysVec2 ToScreen(float time, float value) {
+            float fx = (time - t0) / (t1 - t0);
+            float fy = (value - vMin) / (vMax - vMin);
+            return new SysVec2(origin.X + fx * size.X, origin.Y + (1f - fy) * size.Y);
+        }
+
+        // Zero line (if 0 is in the value range) for reference.
+        if (vMin < 0f && vMax > 0f) {
+            float zy = origin.Y + (1f - (0f - vMin) / (vMax - vMin)) * size.Y;
+            draw.AddLine(new SysVec2(origin.X, zy), new SysVec2(origin.X + size.X, zy),
+                ImGui.GetColorU32(new SysVec4(0.4f, 0.4f, 0.45f, 0.4f)));
+        }
+
+        // Sample the curve into a polyline across the box width.
+        const int Samples = 64;
+        uint curveColor = ImGui.GetColorU32(new SysVec4(0.45f, 0.85f, 1f, 1f));
+        SysVec2 prev = default;
+        for (var s = 0; s <= Samples; s++) {
+            float time = t0 + (t1 - t0) * s / Samples;
+            SysVec2 p = ToScreen(time, curve.Evaluate(time));
+            if (s > 0) draw.AddLine(prev, p, curveColor, 2f);
+            prev = p;
+        }
+
+        // An invisible button over the box captures interaction (hover/click/drag).
+        ImGui.InvisibleButton("##curvebox", size);
+        bool hovered = ImGui.IsItemHovered();
+        SysVec2 mouse = ImGui.GetMousePos();
+
+        float SnapTimeFromMouse() => t0 + (t1 - t0) * Math.Clamp((mouse.X - origin.X) / size.X, 0f, 1f);
+        float SnapValueFromMouse() => vMax - (vMax - vMin) * Math.Clamp((mouse.Y - origin.Y) / size.Y, 0f, 1f);
+
+        // Draw + hit-test keyframe dots.
+        const float dotR = 5f;
+        int hoverKey = -1;
+        for (var i = 0; i < curve.Count; i++) {
+            SysVec2 sp = ToScreen(curve.Keys[i].Time, curve.Keys[i].Value);
+            bool near = (mouse - sp).LengthSquared() <= (dotR + 3f) * (dotR + 3f);
+            if (near && hovered) hoverKey = i;
+            uint dc = (i == curveDragKey || near)
+                ? ImGui.GetColorU32(new SysVec4(1f, 0.85f, 0.3f, 1f))
+                : ImGui.GetColorU32(new SysVec4(1f, 1f, 1f, 1f));
+            draw.AddCircleFilled(sp, dotR, dc);
+        }
+
+        // Begin a drag on a key (snapshot for undo once).
+        if (hovered && hoverKey >= 0 && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
+            curveDragKey = hoverKey;
+            EditorUndo.Push($"Edit {id}");
+        }
+        // Drag the held key.
+        if (curveDragKey >= 0 && curveDragKey < curve.Count && ImGui.IsMouseDown(ImGuiMouseButton.Left)) {
+            curveDragKey = curve.MoveKey(curveDragKey, SnapTimeFromMouse(), SnapValueFromMouse());
+            edited = true;
+        }
+        if (ImGui.IsMouseReleased(ImGuiMouseButton.Left))
+            curveDragKey = -1;
+
+        // Double-click empty space adds a key on the curve at that time.
+        if (hovered && hoverKey < 0 && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) {
+            EditorUndo.Push($"Add key {id}");
+            curve.AddKey(SnapTimeFromMouse(), SnapValueFromMouse());
+            edited = true;
+        }
+        // Right-click a key removes it (keep at least one).
+        if (hovered && hoverKey >= 0 && curve.Count > 1 && ImGui.IsMouseClicked(ImGuiMouseButton.Right)) {
+            EditorUndo.Push($"Remove key {id}");
+            curve.RemoveKey(hoverKey);
+            edited = true;
+        }
+
+        // Preset buttons + "open full editor" + key count.
+        if (ImGui.SmallButton("Linear")) { EditorUndo.Push($"Preset {id}"); Replace(curve, AnimationCurve.Linear()); edited = true; }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Ease")) { EditorUndo.Push($"Preset {id}"); Replace(curve, AnimationCurve.EaseInOut()); edited = true; }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Const")) { EditorUndo.Push($"Preset {id}"); Replace(curve, AnimationCurve.Constant()); edited = true; }
+        ImGui.SameLine();
+        if (ImGui.SmallButton($"{EditorIcons.Maximize} Edit"))
+            CurveEditorWindow.Open(curve, id, onExternalEdit ?? (() => { }));
+        ImGui.SameLine();
+        ImGui.TextDisabled($"{curve.Count} keys");
+
+        ImGui.PopID();
+        return edited;
+    }
+
+    // Replaces a curve's keys with another curve's (in place — preserves the member's instance).
+    static void Replace(AnimationCurve target, AnimationCurve source) {
+        target.Clear();
+        for (var i = 0; i < source.Count; i++)
+            target.AddKey(source.Keys[i]);
+        target.PreWrap = source.PreWrap;
+        target.PostWrap = source.PostWrap;
+    }
+
+    // ---- Gradient editor ---------------------------------------------------------
+    // An interactive gradient bar (Unity's gradient editor, trimmed): the bar samples Evaluate across
+    // its width; COLOR stops sit as triangles BELOW the bar (drag horizontally to move, click to open a
+    // color picker, double-click empty to add, right-click to remove), ALPHA stops as triangles ABOVE
+    // (drag horizontally to move, vertical drag to change alpha). Reusable for ANY Gradient member;
+    // mutated in place; returns true on edit. The checkerboard behind the bar shows alpha.
+    static int gradColorDrag = -1, gradAlphaDrag = -1;
+    static int gradColorPick = -1; // color stop whose picker popup is open
+
+    static bool DrawGradientEditor(string id, ColorGradient g) {
+        bool edited = false;
+        ImGui.PushID(id);
+
+        float w = MathF.Max(ImGui.GetContentRegionAvail().X, 60f);
+        const float barH = 22f, stopH = 7f;
+        SysVec2 cursor = ImGui.GetCursorScreenPos();
+        SysVec2 barOrigin = cursor + new SysVec2(0f, stopH + 2f); // leave room for alpha stops above
+        var barSize = new SysVec2(w, barH);
+        var draw = ImGui.GetWindowDrawList();
+
+        // Checkerboard so alpha is visible.
+        const float check = 6f;
+        for (float x = 0; x < w; x += check)
+            for (float y = 0; y < barH; y += check) {
+                bool dark = (((int)(x / check) + (int)(y / check)) & 1) == 0;
+                uint cc = dark ? 0xFF606060 : 0xFF909090;
+                SysVec2 a = barOrigin + new SysVec2(x, y);
+                SysVec2 b = a + new SysVec2(MathF.Min(check, w - x), MathF.Min(check, barH - y));
+                draw.AddRectFilled(a, b, cc);
+            }
+
+        // Sample the gradient across the bar width into thin vertical slices.
+        const int slices = 96;
+        for (var s = 0; s < slices; s++) {
+            float t0 = (float)s / slices, t1 = (float)(s + 1) / slices;
+            Vector4 c0 = g.Evaluate(t0);
+            uint col = ImGui.GetColorU32(new SysVec4(c0.X, c0.Y, c0.Z, c0.W));
+            SysVec2 a = barOrigin + new SysVec2(t0 * w, 0f);
+            SysVec2 b = barOrigin + new SysVec2(t1 * w, barH);
+            draw.AddRectFilled(a, b, col);
+        }
+        draw.AddRect(barOrigin, barOrigin + barSize, 0xFF202224);
+
+        // Interaction surface covering the bar + both stop rows.
+        SysVec2 totalSize = new SysVec2(w, barH + stopH * 2f + 4f);
+        ImGui.SetCursorScreenPos(cursor);
+        ImGui.InvisibleButton("##gradbar", totalSize);
+        bool hovered = ImGui.IsItemHovered();
+        SysVec2 mouse = ImGui.GetMousePos();
+        float mt = Math.Clamp((mouse.X - barOrigin.X) / w, 0f, 1f);
+
+        float alphaRowY = cursor.Y;                       // alpha stops above the bar
+        float colorRowY = barOrigin.Y + barH + 2f;        // color stops below the bar
+
+        // ---- Color stops (below) ----
+        int hoverColor = -1;
+        for (var i = 0; i < g.ColorKeyCount; i++) {
+            float kx = barOrigin.X + g.ColorKeys[i].Time * w;
+            var tip = new SysVec2(kx, colorRowY);
+            var bl = new SysVec2(kx - stopH * 0.6f, colorRowY + stopH);
+            var br = new SysVec2(kx + stopH * 0.6f, colorRowY + stopH);
+            Vector3 kc = g.ColorKeys[i].Color;
+            uint fill = ImGui.GetColorU32(new SysVec4(kc.X, kc.Y, kc.Z, 1f));
+            draw.AddTriangleFilled(tip, bl, br, fill);
+            draw.AddTriangle(tip, bl, br, (i == gradColorDrag) ? 0xFF30D0FF : 0xFF202224);
+            if (hovered && MathF.Abs(mouse.X - kx) < stopH && mouse.Y >= colorRowY - 2f && mouse.Y <= colorRowY + stopH + 2f)
+                hoverColor = i;
+        }
+
+        // ---- Alpha stops (above) ----
+        int hoverAlpha = -1;
+        for (var i = 0; i < g.AlphaKeyCount; i++) {
+            float kx = barOrigin.X + g.AlphaKeys[i].Time * w;
+            var tip = new SysVec2(kx, alphaRowY + stopH);
+            var tl = new SysVec2(kx - stopH * 0.6f, alphaRowY);
+            var tr = new SysVec2(kx + stopH * 0.6f, alphaRowY);
+            float av = g.AlphaKeys[i].Alpha;
+            uint fill = ImGui.GetColorU32(new SysVec4(av, av, av, 1f));
+            draw.AddTriangleFilled(tip, tl, tr, fill);
+            draw.AddTriangle(tip, tl, tr, (i == gradAlphaDrag) ? 0xFF30D0FF : 0xFF202224);
+            if (hovered && MathF.Abs(mouse.X - kx) < stopH && mouse.Y >= alphaRowY - 2f && mouse.Y <= alphaRowY + stopH + 2f)
+                hoverAlpha = i;
+        }
+
+        // ---- Begin drags / picker / add / remove ----
+        if (hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
+            if (hoverColor >= 0) { gradColorDrag = hoverColor; EditorUndo.Push($"Edit {id}"); }
+            else if (hoverAlpha >= 0) { gradAlphaDrag = hoverAlpha; EditorUndo.Push($"Edit {id}"); }
+        }
+        // Open a color picker popup on a color-stop click-release (only if not dragged far).
+        if (hoverColor >= 0 && ImGui.IsMouseReleased(ImGuiMouseButton.Left) && gradColorDrag == hoverColor) {
+            gradColorPick = hoverColor;
+            ImGui.OpenPopup("##gradcolpick");
+        }
+
+        if (gradColorDrag >= 0 && gradColorDrag < g.ColorKeyCount && ImGui.IsMouseDown(ImGuiMouseButton.Left)) {
+            gradColorDrag = g.MoveColorKey(gradColorDrag, mt, g.ColorKeys[gradColorDrag].Color);
+            edited = true;
+        }
+        if (gradAlphaDrag >= 0 && gradAlphaDrag < g.AlphaKeyCount && ImGui.IsMouseDown(ImGuiMouseButton.Left)) {
+            gradAlphaDrag = g.MoveAlphaKey(gradAlphaDrag, mt, g.AlphaKeys[gradAlphaDrag].Alpha);
+            edited = true;
+        }
+        if (ImGui.IsMouseReleased(ImGuiMouseButton.Left)) { gradColorDrag = -1; gradAlphaDrag = -1; }
+
+        // Double-click empty space on the color row adds a color stop (sampled current color).
+        if (hovered && hoverColor < 0 && mouse.Y >= colorRowY - 2f && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) {
+            EditorUndo.Push($"Add color {id}");
+            g.AddColorKey(mt, g.EvaluateColor(mt));
+            edited = true;
+        }
+        // Double-click empty space on the alpha row adds an alpha stop.
+        if (hovered && hoverAlpha < 0 && mouse.Y <= alphaRowY + stopH + 2f && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) {
+            EditorUndo.Push($"Add alpha {id}");
+            g.AddAlphaKey(mt, g.EvaluateAlpha(mt));
+            edited = true;
+        }
+        // Right-click removes the hovered stop (keep at least one of each kind).
+        if (hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Right)) {
+            if (hoverColor >= 0 && g.ColorKeyCount > 1) { EditorUndo.Push($"Remove color {id}"); g.RemoveColorKey(hoverColor); edited = true; }
+            else if (hoverAlpha >= 0 && g.AlphaKeyCount > 1) { EditorUndo.Push($"Remove alpha {id}"); g.RemoveAlphaKey(hoverAlpha); edited = true; }
+        }
+
+        // Color picker popup for the selected color stop.
+        if (ImGui.BeginPopup("##gradcolpick")) {
+            if (gradColorPick >= 0 && gradColorPick < g.ColorKeyCount) {
+                Vector3 c = g.ColorKeys[gradColorPick].Color;
+                var sv = new SysVec3(c.X, c.Y, c.Z);
+                if (ImGui.ColorPicker3("##pick", ref sv)) {
+                    g.MoveColorKey(gradColorPick, g.ColorKeys[gradColorPick].Time, new Vector3(sv.X, sv.Y, sv.Z));
+                    edited = true;
+                }
+            }
+            ImGui.EndPopup();
+        }
+
+        // Preset buttons + counts.
+        if (ImGui.SmallButton("Fire")) { EditorUndo.Push($"Preset {id}"); ReplaceGradient(g, ColorGradient.Fire()); edited = true; }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Fade")) { EditorUndo.Push($"Preset {id}"); ReplaceGradient(g, ColorGradient.FadeOut(new Vector3(1f, 1f, 1f))); edited = true; }
+        ImGui.SameLine();
+        ImGui.TextDisabled($"{g.ColorKeyCount}c / {g.AlphaKeyCount}a");
+
+        ImGui.PopID();
+        return edited;
+    }
+
+    static void ReplaceGradient(ColorGradient target, ColorGradient source) {
+        target.Clear();
+        for (var i = 0; i < source.ColorKeyCount; i++)
+            target.AddColorKey(source.ColorKeys[i].Time, source.ColorKeys[i].Color);
+        for (var i = 0; i < source.AlphaKeyCount; i++)
+            target.AddAlphaKey(source.AlphaKeys[i].Time, source.AlphaKeys[i].Alpha);
     }
 
     // Multi-material meshes resolve their materials from refs baked into the mesh at import;
@@ -838,11 +1809,11 @@ internal sealed class InspectorPanel {
 
         float pickerW = ImGui.GetFrameHeight() + 6;
         if (ImGui.Button($"{icon}  {display}", new SysVec2(-pickerW - 4, 0)) && path is not null)
-            state.SelectAsset(path, guid); // pin the referenced asset in the Inspector
+            state.RequestRevealAsset(path); // jump to it in the asset browser, don't swap the inspector
         if (AcceptGuidDrop(out Guid d1))
             AssignAsset(member, target, assetType, d1);
         if (ImGui.IsItemHovered() && path is not null)
-            ImGui.SetTooltip(path);
+            ImGui.SetTooltip($"{path}\nClick to reveal in the asset browser.");
 
         ImGui.SameLine();
         if (ImGui.Button(EditorIcons.ChevronDown, new SysVec2(pickerW, 0)))
@@ -864,52 +1835,85 @@ internal sealed class InspectorPanel {
             .MakeGenericMethod(assetType);
         object loaded = load.Invoke(null, [guid]);
         if (loaded is not null)
-            ComponentReflection.SetValue(member, target, loaded);
+            ApplyMember(member, target, loaded); // broadcasts to the multi-selection like value edits
         state.MarkViewportDirty();
     }
 
     // Mini asset-picker window: search + every compatible asset; click to assign.
     void DrawAssetPickerPopup() {
-        ImGui.SetNextWindowSize(new SysVec2(380, 420), ImGuiCond.Appearing);
+        float u = ImGui.GetFontSize();
+        ImGui.SetNextWindowSize(new SysVec2(u * 28f, u * 30f), ImGuiCond.Appearing);
         if (!ImGui.BeginPopup("##assetpicker"))
             return;
 
-        ImGui.TextDisabled($"Select {pickerType?.Name ?? "asset"}");
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new SysVec2(8, 6));
+
+        // Header: "Select <Type>" in bold + a hint of which extensions qualify.
+        string typeName = pickerType is null ? "Asset" : Prettify(pickerType.Name);
+        ImGui.PushFont(ImGuiController.Bold);
+        ImGui.TextUnformatted($"Select {typeName}");
+        ImGui.PopFont();
+
+        string[] extensions = CompatibleExtensions(pickerType);
+        if (extensions.Length > 0) {
+            ImGui.SameLine();
+            ImGui.TextDisabled($"({string.Join(" ", extensions)})");
+        }
+        ImGui.Spacing();
+
         if (ImGui.IsWindowAppearing())
             ImGui.SetKeyboardFocusHere();
         ImGui.SetNextItemWidth(-1);
-        ImGui.InputTextWithHint("##search", $"{EditorIcons.Search} Search...", ref pickerSearch, 128);
+        ImGui.InputTextWithHint("##search", $"{EditorIcons.Search} Search {typeName.ToLowerInvariant()}s...",
+            ref pickerSearch, 128);
         ImGui.Separator();
 
         ImGui.BeginChild("##list");
 
-        if (ImGui.Selectable("(None)")) {
+        // (None) clears the slot.
+        ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+        if (ImGui.Selectable($"  (None)", false, ImGuiSelectableFlags.None, new SysVec2(0, ImGui.GetFrameHeight()))) {
             EditorUndo.Push($"Clear {Prettify(pickerMember.Name)}");
             ComponentReflection.SetValue(pickerMember, pickerTarget, null);
             state.MarkViewportDirty();
             ImGui.CloseCurrentPopup();
         }
+        ImGui.PopStyleColor();
 
-        string[] extensions = CompatibleExtensions(pickerType);
+        var any = false;
         foreach ((string path, Guid guid) in AssetDatabase.EnumerateAssets()
                      .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)) {
             var ext = Path.GetExtension(path).ToLowerInvariant();
-            if (extensions.Length > 0 && !extensions.Contains(ext))
+            // Type filter: only assets whose extension matches the slot's type. (Unknown type => nothing,
+            // so an unrecognized slot never floods the picker with every asset in the project.)
+            if (!extensions.Contains(ext))
                 continue;
-            if (pickerSearch.Length > 0 && !path.Contains(pickerSearch, StringComparison.OrdinalIgnoreCase))
+            if (pickerSearch.Length > 0 &&
+                !Path.GetFileName(path).Contains(pickerSearch, StringComparison.OrdinalIgnoreCase))
                 continue;
 
+            any = true;
             (string icon, SysVec4 tint) = EditorIcons.ForAssetExtension(ext);
-            if (ImGui.Selectable($"       {Path.GetFileName(path)}##{guid}")) {
+            bool clicked = ImGui.Selectable($"      {Path.GetFileName(path)}##{guid}", false,
+                ImGuiSelectableFlags.None, new SysVec2(0, ImGui.GetFrameHeight()));
+            SysVec2 rmin = ImGui.GetItemRectMin();
+            EditorIcons.DrawAt(new SysVec2(rmin.X + 6,
+                rmin.Y + (ImGui.GetFrameHeight() - ImGui.GetTextLineHeight()) * 0.5f), icon, tint);
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(path);
+            if (clicked) {
                 AssignAsset(pickerMember, pickerTarget, pickerType, guid);
                 ImGui.CloseCurrentPopup();
             }
-            EditorIcons.DrawAt(ImGui.GetItemRectMin() + new SysVec2(4, 0), icon, tint);
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip(path);
         }
 
+        if (!any)
+            ImGui.TextDisabled(pickerSearch.Length > 0
+                ? "No matching assets."
+                : $"No {typeName.ToLowerInvariant()} assets in the project.");
+
         ImGui.EndChild();
+        ImGui.PopStyleVar();
         ImGui.EndPopup();
     }
 
@@ -936,10 +1940,18 @@ internal sealed class InspectorPanel {
             return [".png", ".jpg", ".jpeg", ".tga", ".bmp", ".hdr", ".exr"];
         if (typeof(Mesh).IsAssignableFrom(assetType))
             return [".fbx", ".obj"];
+        if (typeof(AudioClip).IsAssignableFrom(assetType))
+            return [".wav", ".wave", ".ogg"];
         if (typeof(Material).IsAssignableFrom(assetType))
             return [".mat"];
         if (typeof(Shader).IsAssignableFrom(assetType))
             return [".shader"];
+        if (typeof(TerrainAsset).IsAssignableFrom(assetType))
+            return [".terrain"];
+        if (typeof(PrefabAsset).IsAssignableFrom(assetType))
+            return [".prefab"];
+        if (typeof(DataAsset).IsAssignableFrom(assetType))
+            return [".asset"];
         return [];
     }
 
@@ -999,7 +2011,16 @@ internal sealed class InspectorPanel {
 
         void Add(ComponentEntry e) {
             EditorUndo.Push($"Add {e.DisplayName}");
-            entity.AddComponent(e.Type);
+            // Multi-selection: add to EVERY selected entity that doesn't already have it (Unity-style),
+            // so you can equip a whole group at once. Single selection just adds to this entity.
+            if (state.SelectedEntities.Count > 1) {
+                foreach (Entity sel in state.SelectedEntities)
+                    if (sel is { IsDestroyed: false } && !HasComponentOfType(sel, e.Type))
+                        sel.AddComponent(e.Type);
+            }
+            else {
+                entity.AddComponent(e.Type);
+            }
             state.MarkViewportDirty();
             ImGui.CloseCurrentPopup();
         }
@@ -1077,18 +2098,28 @@ internal sealed class InspectorPanel {
         ImGui.Separator();
         ImGui.Spacing();
 
-        // The selection, capped so huge selections stay readable.
-        const int maxListed = 12;
-        for (var i = 0; i < assets.Count && i < maxListed; i++) {
-            (string path, _) = assets[i];
-            (string icon, SysVec4 tint) = EditorIcons.ForAssetExtension(Path.GetExtension(path).ToLowerInvariant());
-            ImGui.TextDisabled($"      {Path.GetFileName(path)}");
-            EditorIcons.DrawAt(ImGui.GetItemRectMin() + new SysVec2(4, 0), icon, tint);
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip(path);
+        // BY-TYPE breakdown instead of a flat file list: "3 Volume", "2 Terrain", ... — and clicking
+        // a type row narrows the selection to just that type (Unity-style "select all of a kind").
+        var byExt = assets
+            .GroupBy(a => Path.GetExtension(a.Path).ToLowerInvariant())
+            .OrderByDescending(g => g.Count())
+            .ToList();
+        ImGui.TextDisabled("By type (click to select just that kind):");
+        ImGui.Spacing();
+        foreach (var group in byExt) {
+            string ext = group.Key;
+            (string icon, SysVec4 tint) = EditorIcons.ForAssetExtension(ext);
+            string typeName = string.IsNullOrEmpty(ext) ? "File" : ext.TrimStart('.');
+            int n = group.Count();
+            ImGui.PushStyleColor(ImGuiCol.Text, tint);
+            ImGui.TextUnformatted(icon);
+            ImGui.PopStyleColor();
+            ImGui.SameLine(0, 6);
+            if (ImGui.Selectable($"{n}  {typeName}{(n == 1 ? "" : "s")}##type{ext}", false)) {
+                var ofType = group.ToList();
+                state.SelectAssets(ofType, ofType[^1]);
+            }
         }
-        if (assets.Count > maxListed)
-            ImGui.TextDisabled($"      ... and {assets.Count - maxListed} more");
 
         ImGui.Spacing();
 
@@ -1187,8 +2218,56 @@ internal sealed class InspectorPanel {
             case ".asset":
                 DrawDataAssetInspector(path);
                 break;
+            case ".wav" or ".wave" or ".ogg":
+                DrawAudioClipAsset(path);
+                break;
+            case ".banim":
+                DrawAnimationClipAsset(path);
+                break;
             // Everything else (models, etc.): just the file header above — no clutter.
         }
+    }
+
+    // Audio asset view: a Preview/Stop button + clip stats, so you can audition a .wav/.ogg straight
+    // from the asset browser without dropping it on an AudioSource. Same Audio facade as the component
+    // preview (play-mode-independent; silent no-op with no audio device).
+    void DrawAudioClipAsset(string path) {
+        AudioClip clip = AssetDatabase.Load<AudioClip>(path);
+        if (clip is null) {
+            ImGui.TextDisabled("Could not load audio clip.");
+            return;
+        }
+
+        ImGui.SeparatorText("Preview");
+        bool playing = audioPreviewVoice is { IsPlaying: true };
+        if (ImGui.Button(playing ? $"{EditorIcons.Pause}  Stop" : $"{EditorIcons.Play}  Play",
+                new SysVec2(120, 0))) {
+            audioPreviewVoice?.Stop();
+            audioPreviewVoice = playing ? null : Audio.Play(clip);
+        }
+        ImGui.SameLine();
+        ImGui.TextDisabled($"{clip.DurationSeconds:F1}s  -  {clip.Channels}ch  -  {clip.SampleRate} Hz");
+        if (!Audio.IsAvailable)
+            ImGui.TextDisabled("(no audio device on this machine - preview is silent)");
+    }
+
+    // Animation-clip asset view: clip stats. A skeletal pose preview needs a skinned mesh to drive,
+    // which an asset-only view doesn't have - assign the clip to an Animator on a skinned entity and
+    // use the Animator scrub. Here we just summarize the clip.
+    void DrawAnimationClipAsset(string path) {
+        AnimationClip clip = AssetDatabase.Load<AnimationClip>(path);
+        if (clip is null) {
+            ImGui.TextDisabled("Could not load animation clip.");
+            return;
+        }
+
+        ImGui.SeparatorText("Animation");
+        ImGui.TextDisabled($"Duration: {clip.DurationSeconds:F2}s");
+        ImGui.TextDisabled($"Channels (animated bones): {clip.Data.Channels.Length}");
+        ImGui.TextDisabled($"Ticks/sec: {clip.TicksPerSecond:F0}");
+        ImGui.Spacing();
+        ImGui.TextWrapped("Assign this clip to an Animator on a skinned mesh, then use the Animator's " +
+            "scrub slider to preview the pose.");
     }
 
     // Prefab inspector: its captured entity tree (read-only) + an Instantiate-into-scene action.
@@ -1313,6 +2392,46 @@ internal sealed class InspectorPanel {
         ImGui.TextDisabled("Changing the type reimports. Loaded materials keep the\nold instance until the scene reloads.");
     }
 
+    // Material preview thumbnail state. Re-rendered only when the material (guid) or its serialized
+    // content (hash) changes, so the GL pass runs once per edit, not per frame.
+    Guid materialPreviewGuid;
+    int materialPreviewHash;
+    nint materialPreviewTex;     // ImGui handle: GL texture name or DX12 UiHeap descriptor ptr
+    Dx12EditorPreview.Dx12EditorTexture materialPreviewDx12;   // DX12 backing (disposed on re-render)
+    const int MaterialPreviewSize = 128;
+    static bool IsDx12 => RenderBackendSelector.Selected == RenderBackend.Dx12;
+
+    void DrawMaterialPreview(Guid guid, MaterialDefinition definition) {
+        // DX12: the material-preview GPU render (Dx12EditorPreview) hangs the GPU under load — DISABLED until
+        // root-caused (the inspector just omits the sphere). Re-enable with the thumbnail path once verified.
+        if (IsDx12)
+            return;
+        // cheap content fingerprint: re-render only when the serialized material changes
+        int hash = System.Text.Json.JsonSerializer.Serialize(definition, PipelineJson.Options).GetHashCode();
+        if (guid != materialPreviewGuid || hash != materialPreviewHash || materialPreviewTex == 0) {
+            try {
+                byte[] pixels = MaterialPreviewRenderer.Render(definition, MaterialPreviewSize);
+                materialPreviewDx12?.Dispose();   // free the previous texture + its UiHeap slot
+                materialPreviewDx12 = Dx12EditorPreview.UploadTexture(pixels, MaterialPreviewSize);
+                materialPreviewTex = materialPreviewDx12.Handle;
+                materialPreviewGuid = guid;
+                materialPreviewHash = hash;
+            }
+            catch (Exception e) {
+                Debugging.LogError($"Material preview failed: {e.Message}");
+                materialPreviewTex = 0;
+            }
+        }
+
+        if (materialPreviewTex != 0) {
+            float size = 120f;
+            float pad = (ImGui.GetContentRegionAvail().X - size) * 0.5f;
+            if (pad > 0) ImGui.SetCursorPosX(ImGui.GetCursorPosX() + pad);
+            ImGui.Image(EditorApplication.Tex(materialPreviewTex), new SysVec2(size, size));
+            ImGui.Spacing();
+        }
+    }
+
     void DrawMaterialEditor(string path, Guid guid) {
         var absolute = AssetDatabase.Project.ResolveAbsolute(path);
         MaterialDefinition definition;
@@ -1323,6 +2442,10 @@ internal sealed class InspectorPanel {
             ImGui.TextDisabled($"Unreadable material: {exception.Message}");
             return;
         }
+
+        // Unity-style preview sphere: render the material to a thumbnail (re-rendered only when the
+        // material's serialized state changes), upload to a GL texture, show it centered.
+        DrawMaterialPreview(guid, definition);
 
         ImGui.TextDisabled($"Shader: {definition.Shader ?? "(none)"}");
         ImGui.Spacing();
@@ -1353,6 +2476,22 @@ internal sealed class InspectorPanel {
             }
 
             // Scalar material properties (stored in the .mat next to the texture refs).
+            // Base color: linear RGBA tint multiplying the albedo map (glTF baseColorFactor).
+            // White is the neutral "unstated" default, so it's stored as null and rendering
+            // is bit-identical to a .mat without the key.
+            Row("Base Color");
+            var baseColor = definition.BaseColor switch {
+                { Length: >= 4 } bc => new SysVec4(bc[0], bc[1], bc[2], bc[3]),
+                { Length: 3 } bc => new SysVec4(bc[0], bc[1], bc[2], 1f),
+                _ => SysVec4.One,
+            };
+            if (ImGui.ColorEdit4("##matbasecolor", ref baseColor)) {
+                definition.BaseColor = baseColor == SysVec4.One
+                    ? null
+                    : [baseColor.X, baseColor.Y, baseColor.Z, baseColor.W];
+                changed = true;
+            }
+
             // Packed ORM: metallic texture carries (occlusion, roughness, metallic) in RGB.
             // Auto-detected from "spec" file names when the .mat doesn't say explicitly.
             Row("Packed ORM");
@@ -1409,6 +2548,7 @@ internal sealed class InspectorPanel {
         if (changed) {
             PipelineJson.Write(absolute, definition);
             ApplyLiveMaterial(guid, definition);
+            state.MarkViewportDirty();
         }
 
         ImGui.Spacing();
@@ -1485,7 +2625,11 @@ internal sealed class InspectorPanel {
         ImGui.TableSetColumnIndex(0);
         ImGui.AlignTextToFramePadding();
         ImGui.TextDisabled(label);
+        // Tooltip on the LABEL itself (Unity-style: hover the field name), not just the "(?)" badge —
+        // this is what made [Tooltip] feel "broken" (you had to find the tiny marker).
         if (tooltip is not null) {
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(tooltip);
             ImGui.SameLine(0, 4);
             ImGui.TextDisabled("(?)");
             if (ImGui.IsItemHovered())
@@ -1495,13 +2639,120 @@ internal sealed class InspectorPanel {
         ImGui.SetNextItemWidth(-1);
     }
 
-    void SysVec3Row(string label, Vector3 value, Action<Vector3> apply, float speed) {
+    void SysVec3Row(string label, Vector3 value, Action<Vector3> apply, float speed) =>
+        SysVec3Row(label, value, apply, speed, allowUniformLock: false);
+
+    // Per-member "lock proportions" (Unity's chain link on Scale): the toggle state is keyed by the
+    // member label so each lockable Vector3 row remembers its own setting.
+    readonly Dictionary<string, bool> uniformLocks = new();
+
+    void SysVec3Row(string label, Vector3 value, Action<Vector3> apply, float speed, bool allowUniformLock) {
         Row(label);
+
+        // The chain-link toggle lives in the LABEL cell (column 0), right-aligned next to the fields —
+        // putting it in front of the X chip shifted Scale's fields right and broke alignment with
+        // Position/Rotation. Row() already moved us to column 1; hop back to 0, draw the lock, return.
+        bool locked = allowUniformLock && uniformLocks.GetValueOrDefault(label);
+        if (allowUniformLock) {
+            ImGui.TableSetColumnIndex(0);
+            string icon = locked ? EditorIcons.Lock : EditorIcons.LockOpen;
+            float btn = ImGui.GetFrameHeight();
+            ImGui.SameLine();
+            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - btn);
+            if (EditorIcons.GhostButtonSmall($"ulock_{label}", icon,
+                    locked ? "Proportions locked - editing one axis scales the others"
+                           : "Lock proportions (uniform scaling)")) {
+                uniformLocks[label] = !locked;
+                locked = !locked;
+            }
+            ImGui.TableSetColumnIndex(1);
+            ImGui.SetNextItemWidth(-1);
+        }
+
         var sv = new SysVec3(value.X, value.Y, value.Z);
+        var before = sv;
         if (AxisVec3(label, label, ref sv, speed)) {
+            if (locked)
+                sv = ApplyUniformLock(before, sv);
             apply(new Vector3(sv.X, sv.Y, sv.Z));
             state.MarkViewportDirty();
         }
+    }
+
+    // Given the value before/after an edit where exactly one axis was dragged, scale the OTHER two by
+    // the same ratio the edited axis changed by (so proportions hold). Falls back to an additive delta
+    // when the edited axis was zero (no ratio is defined). Picks the axis with the largest change.
+    static SysVec3 ApplyUniformLock(SysVec3 before, SysVec3 after) {
+        float dx = MathF.Abs(after.X - before.X), dy = MathF.Abs(after.Y - before.Y), dz = MathF.Abs(after.Z - before.Z);
+        int axis = dx >= dy && dx >= dz ? 0 : dy >= dz ? 1 : 2;   // the dragged axis
+        float oldA = axis == 0 ? before.X : axis == 1 ? before.Y : before.Z;
+        float newA = axis == 0 ? after.X : axis == 1 ? after.Y : after.Z;
+        if (MathF.Abs(newA - oldA) < 1e-9f) return after; // nothing actually changed
+
+        if (MathF.Abs(oldA) > 1e-6f) {
+            float ratio = newA / oldA;                      // proportional: multiply the others
+            return new SysVec3(before.X * ratio, before.Y * ratio, before.Z * ratio);
+        }
+        float delta = newA - oldA;                          // old axis was 0: shift the others equally
+        return new SysVec3(before.X + delta, before.Y + delta, before.Z + delta);
+    }
+
+    // True if a component type is a GAME script (compiled into GameScripts.dll), not an engine type.
+    static bool IsGameScript(Type type) =>
+        type.Assembly.GetName().Name == BallisticEngine.AssetPipeline.GameScripts.AssemblyName;
+
+    // Finds the component's backing .cs (Unity's rule: file name == class name) and opens it in the OS
+    // default C# editor. Also opens the generated Scripts.csproj first so the IDE has project context.
+    static void OpenComponentScript(Type type) {
+        // Locate <TypeName>.cs anywhere under Assets via the asset database.
+        string target = null;
+        foreach (var (path, _) in AssetDatabase.EnumerateAssets()) {
+            if (path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(Path.GetFileNameWithoutExtension(path), type.Name, StringComparison.Ordinal)) {
+                target = path;
+                break;
+            }
+        }
+        if (target is null) {
+            Debugging.LogWarning($"Edit Script: no '{type.Name}.cs' found under Assets.");
+            return;
+        }
+        try {
+            // Open the project file first (IDE context), then the source file.
+            var csproj = BallisticEngine.AssetPipeline.GameScripts.EnsureProjectFile(AssetDatabase.Project);
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(csproj) { UseShellExecute = true });
+            var abs = AssetDatabase.Project.ResolveAbsolute(target);
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(abs) { UseShellExecute = true });
+        }
+        catch (Exception ex) {
+            Debugging.LogWarning($"Edit Script: {ex.Message}");
+        }
+    }
+
+    // True if the entity already has a behaviour of (exactly) this type — for batch Add Component,
+    // so adding to a multi-selection skips entities that already have it (Unity-style).
+    static bool HasComponentOfType(Entity entity, Type type) {
+        foreach (Behaviour b in entity.Behaviours)
+            if (b.GetType() == type)
+                return true;
+        return false;
+    }
+
+    // The same-type component on every OTHER selected entity (for batch enable/disable/remove). Empty
+    // for a single selection. First matching component per entity; skips the active behaviour's entity.
+    List<Behaviour> MatchingComponents(Behaviour active) {
+        var list = new List<Behaviour>();
+        if (state.SelectedEntities.Count <= 1)
+            return list;
+        Type type = active.GetType();
+        Entity activeEntity = active.Entity;
+        foreach (Entity e in state.SelectedEntities) {
+            if (e is null || e.IsDestroyed || ReferenceEquals(e, activeEntity))
+                continue;
+            foreach (Behaviour b in e.Behaviours)
+                if (b.GetType() == type) { list.Add(b); break; }
+        }
+        return list;
     }
 
     // "RotationEuler" -> "Rotation Euler", "lightIntensity" -> "Light Intensity"

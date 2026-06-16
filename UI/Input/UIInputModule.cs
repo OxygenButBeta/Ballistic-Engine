@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine.UI;
@@ -30,17 +29,24 @@ public sealed class UIInputModule
     const string HoverClass = "hover";
     const string ActiveClass = "active";
 
-    // panelRect: where the panel sits in window pixels (usually the whole Game view). The pointer is
-    // translated into panel-local space before hit-testing. Returns the element under the pointer (or
-    // null), for callers that want it.
-    public VisualElement Update(VisualElement root, Rect panelRect)
+    // panelScreenRect: where the UI's render surface sits ON SCREEN, in the SAME space as
+    // Input.MousePosition (the whole window for the player; the Game-view image's screen rect for the
+    // editor). logicalSize: the UI's logical canvas (the space ResolvedRect lives in). The pointer is
+    // mapped from the panel rect into logical space — (mouse - origin) * (logical / panelSize) — so the
+    // hit-test matches the laid-out boxes regardless of the panel's on-screen offset OR display scale
+    // (this is what fixes "the button is at y:50 but I have to click y:90"). Returns the hovered
+    // element (or null).
+    public VisualElement Update(VisualElement root, Rect panelScreenRect, Vector2 logicalSize)
     {
         if (root == null) return null;
 
-        // Outside the panel (or input gated off) → treat as no pointer: clear hover, don't click.
         Vector2 mouse = Input.MousePosition;
-        bool inside = Input.Enabled && Input.PointerInGameView && panelRect.Contains(mouse);
-        Vector2 local = new(mouse.X - panelRect.X, mouse.Y - panelRect.Y);
+        bool inside = Input.Enabled && Input.PointerInGameView && panelScreenRect.Contains(mouse);
+
+        // Map window-space mouse -> logical UI space.
+        float sx = panelScreenRect.Width > 0 ? logicalSize.X / panelScreenRect.Width : 1f;
+        float sy = panelScreenRect.Height > 0 ? logicalSize.Y / panelScreenRect.Height : 1f;
+        Vector2 local = new((mouse.X - panelScreenRect.X) * sx, (mouse.Y - panelScreenRect.Y) * sy);
 
         VisualElement hit = inside ? LayoutPass.HitTest(root, local) : null;
 

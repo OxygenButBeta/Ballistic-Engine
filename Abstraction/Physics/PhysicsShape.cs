@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -19,15 +18,21 @@ public sealed record CapsuleShape(float Radius, float Length) : PhysicsShape;
 // static/kinematic bodies — never as part of a dynamic compound.
 public sealed record MeshShape(Vector3[] Vertices, uint[] Indices, Vector3 Scale) : PhysicsShape;
 
-// One shape of a body, posed relative to the body origin (the entity's world position).
+// One shape of a body, posed relative to the body origin (the entity's world position). IsTrigger
+// is PER-SHAPE: a single body can carry both solid and trigger parts (e.g. a character with a solid
+// capsule and a trigger pickup-range sphere). The backend filters each compound child accordingly —
+// solid children push, trigger children only report overlap (Unity's per-collider isTrigger).
 public readonly struct PhysicsShapePart {
     public readonly PhysicsShape Shape;
     public readonly Vector3 LocalPosition;
     public readonly Quaternion LocalRotation;
+    public readonly bool IsTrigger;
 
-    public PhysicsShapePart(PhysicsShape shape, Vector3 localPosition, Quaternion localRotation) {
+    public PhysicsShapePart(PhysicsShape shape, Vector3 localPosition, Quaternion localRotation,
+        bool isTrigger = false) {
         Shape = shape;
         LocalPosition = localPosition;
         LocalRotation = localRotation;
+        IsTrigger = isTrigger;
     }
 }

@@ -35,17 +35,25 @@ public static class MaterialLoader {
         material.Transparent = definition.Transparent;
         material.Opacity = Math.Clamp(definition.Opacity, 0f, 1f);
         material.EmissiveIntensity = MathF.Max(definition.EmissiveIntensity, 0f);
-        if (definition.EmissiveColor is { Length: >= 3 } emissive)
-            material.EmissiveColor = new OpenTK.Mathematics.Vector3(emissive[0], emissive[1], emissive[2]);
+        bool authoredEmissiveColor = false;
+        if (definition.EmissiveColor is { Length: >= 3 } emissive) {
+            var c = new Vector3(emissive[0], emissive[1], emissive[2]);
+            material.EmissiveColor = c;
+            authoredEmissiveColor = c.LengthSquared() > 1e-6f;
+        }
+        // Emissive when there's a map OR an authored non-black colour with positive intensity. The
+        // renderer's HasEmissive gates on this, so a COLOR-ONLY emissive emits (not just textured).
+        material.IsEmissive = material.Emissive is not null ||
+                              (authoredEmissiveColor && material.EmissiveIntensity > 0f);
         material.PackedOrm = ResolvePackedOrm(definition);
         material.Cutout = ResolveCutout(definition);
 
         // Scalar PBR factors (glTF semantics). Unstated metallic defaults to 1 with a metallic
         // map (the map drives it) and 0 without one (untextured = dielectric, not chrome).
         material.BaseColorFactor = definition.BaseColor switch {
-            { Length: >= 4 } c => new OpenTK.Mathematics.Vector4(c[0], c[1], c[2], c[3]),
-            { Length: 3 } c => new OpenTK.Mathematics.Vector4(c[0], c[1], c[2], 1f),
-            _ => OpenTK.Mathematics.Vector4.One,
+            { Length: >= 4 } c => new Vector4(c[0], c[1], c[2], c[3]),
+            { Length: 3 } c => new Vector4(c[0], c[1], c[2], 1f),
+            _ => Vector4.One,
         };
         material.MetallicFactor = Math.Clamp(
             definition.Metallic ?? (material.Metallic is not null ? 1f : 0f), 0f, 1f);

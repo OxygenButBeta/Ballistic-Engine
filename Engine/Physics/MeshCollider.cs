@@ -1,4 +1,3 @@
-using OpenTK.Mathematics;
 
 namespace BallisticEngine;
 
@@ -45,7 +44,7 @@ public class MeshCollider : Collider {
             if (!remap.TryGetValue(source, out uint mapped)) {
                 mapped = (uint)vertices.Count;
                 remap[source] = mapped;
-                vertices.Add(Vector3.TransformPosition(mesh.Vertices[source], inverseNode));
+                vertices.Add(Vector3.Transform(mesh.Vertices[source], inverseNode));
             }
             indices[i] = mapped;
         }
@@ -88,8 +87,8 @@ public class MeshCollider : Collider {
         gizmos.Color = new Vector3(0.35f, 1f, 0.4f);
         for (int i = 0; i < edgeCache.Length; i += 2) {
             gizmos.DrawLine(
-                position + rotation * (scale * (offset + edgeCache[i])),
-                position + rotation * (scale * (offset + edgeCache[i + 1])));
+                position + Vector3.Transform(scale * (offset + edgeCache[i]), rotation),
+                position + Vector3.Transform(scale * (offset + edgeCache[i + 1]), rotation));
         }
     }
 

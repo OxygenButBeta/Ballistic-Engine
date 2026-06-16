@@ -1,5 +1,4 @@
 using Hexa.NET.ImGui;
-using OpenTK.Mathematics;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec4 = System.Numerics.Vector4;
 
@@ -29,7 +28,7 @@ internal static class OrientationGizmo {
         // Rotation-only view matrix: world axes transformed by the camera's inverse rotation, then
         // drawn in the gizmo's local screen circle (X right, Y up).
         Quaternion inv = camera.Transform.Rotation;
-        inv.Invert();
+        inv = Quaternion.Inverse(inv);
 
         SysVec2 mouse = ImGui.GetMousePos();
         var hovered = viewHovered && (mouse - center).LengthSquared() < (radius + 8 * scale) * (radius + 8 * scale);
