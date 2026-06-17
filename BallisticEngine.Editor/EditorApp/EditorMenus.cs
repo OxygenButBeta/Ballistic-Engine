@@ -22,7 +22,7 @@ internal static class EditorMenus {
     public static readonly IReadOnlyDictionary<string, string> PathToWindowKey = new Dictionary<string, string> {
         ["Window/Entities"] = EditorLayout.Entities,
         ["Window/Scene Components"] = EditorLayout.SceneComponents,
-        ["Window/Inspector"] = EditorLayout.Inspector,
+        ["Window/Details"] = EditorLayout.Inspector,   // EF12: menu reads "Details"; KEY stays the Inspector dock id
         ["Window/Assets"] = EditorLayout.Assets,
         ["Window/Console"] = EditorLayout.Console,
         ["Window/Statistics"] = WindowKeys.Statistics,
@@ -46,7 +46,7 @@ internal static class EditorMenus {
     // ── Window menu — the five core dockable panels (Order groups them above the standalone tools) ──────
     [MenuItem("Window/Entities", 0)] static void Entities() => EditorWindows.Toggle(EditorLayout.Entities);
     [MenuItem("Window/Scene Components", 1)] static void SceneComponents() => EditorWindows.Toggle(EditorLayout.SceneComponents);
-    [MenuItem("Window/Inspector", 2)] static void Inspector() => EditorWindows.Toggle(EditorLayout.Inspector);
+    [MenuItem("Window/Details", 2)] static void Inspector() => EditorWindows.Toggle(EditorLayout.Inspector);   // EF12: shown as "Details"
     [MenuItem("Window/Assets", 3)] static void Assets() => EditorWindows.Toggle(EditorLayout.Assets);
     [MenuItem("Window/Console", 4)] static void Console() => EditorWindows.Toggle(EditorLayout.Console);
 

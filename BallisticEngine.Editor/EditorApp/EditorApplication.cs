@@ -153,7 +153,9 @@ internal sealed class EditorApplication {
         // Register the duplicable panel kinds. The factory makes a FRESH instance (own lock/folder
         // state); the draw delegate routes to its content method. The primary docked panels (the
         // fields above) are id-0; the Add Tab menu opens extras through the host.
-        extraPanels.Register(EditorLayout.Inspector, "Inspector", EditorIcons.Wrench,
+        // EF12: the Inspector panel is presented to the user as "Details" (Unity-style). The registry KEY
+        // stays EditorLayout.Inspector (= the dock-.ini / .panels-sidecar id); only the DISPLAY title changes.
+        extraPanels.Register(EditorLayout.Inspector, "Details", EditorIcons.Wrench,
             () => new InspectorPanel(editorState), p => ((InspectorPanel)p).DrawContents());
         extraPanels.Register(EditorLayout.Entities, "Entities", EditorIcons.Package,
             () => new HierarchyPanel(editorState), p => ((HierarchyPanel)p).DrawEntitiesContents());
@@ -176,7 +178,7 @@ internal sealed class EditorApplication {
         // generic body) and are always available; registration order == the old hardcoded draw order.
         panels.Register(EditorLayout.Entities, "Entities", EditorIcons.Package, hierarchy.DrawEntitiesContents);
         panels.Register(EditorLayout.SceneComponents, "Scene Components", EditorIcons.World, hierarchy.DrawSceneContents);
-        panels.Register(EditorLayout.Inspector, "Inspector", EditorIcons.Wrench, inspector.DrawContents);
+        panels.Register(EditorLayout.Inspector, "Details", EditorIcons.Wrench, inspector.DrawContents);  // EF12: KEY stays "Inspector", display = "Details"
         panels.Register(EditorLayout.Assets, "Assets", EditorIcons.Folder, assets.DrawContents);
         panels.Register(EditorLayout.Console, "Console", EditorIcons.Document, console.DrawContents);
         panels.Register(EditorLayout.SceneView, "Scene View", EditorIcons.Camera, null, isViewport: true);
@@ -906,7 +908,7 @@ internal sealed class EditorApplication {
             // and reset the dock arrangement.
             ImGui.Separator();
             if (ImGui.BeginMenu($"{EditorIcons.Add}  Add Panel")) {
-                AddTabItem(EditorLayout.Inspector, "Inspector");
+                AddTabItem(EditorLayout.Inspector, "Details");
                 AddTabItem(EditorLayout.Entities, "Entities");
                 AddTabItem(EditorLayout.SceneComponents, "Scene Components");
                 AddTabItem(EditorLayout.Assets, "Assets");
@@ -1490,7 +1492,15 @@ internal sealed class EditorApplication {
         // (SceneView/GameView) and never match a core-panel key, so there is no conflict. Same Unity-style
         // focus-on-open the viewports already get, now extended to the core dockable panels.
         if (pendingFocusWindow == name) ImGui.SetNextWindowFocus();
-        bool visible = ImGui.Begin(name, ref show);
+        // EF12: the docked tab/title is the descriptor's DISPLAY Title, with the panel KEY as the ImGui
+        // `###id`. ImHashStr resets at the last `###`, so the window id is still hash(name) — the dock-.ini
+        // `[Window][<key>]` entry, the dock-builder's DockBuilderDockWindow(key) target, and the `.panels`
+        // sidecar all match unchanged. This makes the docked title source agree with the maximized
+        // (DrawMaximizedPanel) and multi-instance (DockPanelHost) paths, which already show d.Title — and
+        // is what surfaces "Inspector"→"Details" (and "Scene"→"Scene Components") on the docked tab.
+        EditorPanelRegistry.Descriptor dd = panels.Get(name);
+        string label = dd is not null ? $"{dd.Title}###{name}" : name;
+        bool visible = ImGui.Begin(label, ref show);
         if (visible) {
             MaximizePanelOnTitleDoubleClick(name);
             drawContents();
@@ -1532,7 +1542,7 @@ internal sealed class EditorApplication {
             // Add Tab → click a kind to open ANOTHER instance of it (unlimited). Each entry shows how
             // many are open. Singleton views (Scene/Game) aren't here — they're one-per-renderer-target.
             if (ImGui.BeginMenu($"{EditorIcons.Add}  Add Tab")) {
-                AddTabItem(EditorLayout.Inspector, "Inspector");
+                AddTabItem(EditorLayout.Inspector, "Details");
                 AddTabItem(EditorLayout.Entities, "Entities");
                 AddTabItem(EditorLayout.SceneComponents, "Scene Components");
                 AddTabItem(EditorLayout.Assets, "Assets");

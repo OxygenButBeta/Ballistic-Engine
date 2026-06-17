@@ -19,8 +19,28 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF12** (rename Inspector → "Details")
-> Last committed chunk: **EF5d** · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **EF-LAYOUT** (inspector layout model — design + shared helper)
+> Last committed chunk: **EF12** · Branch: `dx12-renderer`
+>
+> **EF12 note (just landed):** Inspector panel renamed to "Details" everywhere user-facing, KEY unchanged.
+> Validated against ImGui source (`ImHashStr` resets the CRC at the last `###`; `CreateNewWindowSettings`
+> strips the `###`-prefix before keying the `.ini`), so the safe `Title###Key` pattern keeps the persistent
+> identity. Changes: (1) both `panels.Register`/`extraPanels.Register` titles "Inspector"→"Details"
+> (`EditorApplication.cs` :156/:181 — KEY stays `EditorLayout.Inspector`); (2) the two `AddTabItem(...,
+> "Inspector")` menu labels → "Details" (:911 Add Panel, :1537 Add Tab popup); (3) `DrawDockPanel` (:1495)
+> now `Begin($"{d.Title}###{name}")` instead of `Begin(name)` — the docked tab/title now reads the descriptor
+> Title (matching the maximized `DrawMaximizedPanel` + multi-instance `DockPanelHost` paths, which already
+> used `d.Title`), id still = the KEY so the dock-`.ini`/`.panels`-sidecar/dock-builder all match unchanged;
+> (4) Window menu: `[MenuItem("Window/Inspector")]`→`[MenuItem("Window/Details")]` + the `PathToWindowKey`
+> map key `"Window/Inspector"`→`"Window/Details"` (value `EditorLayout.Inspector` unchanged so the checkmark
+> still binds) in `EditorMenus.cs` :25/:49. **Approved scope decision (user):** the generic `DrawDockPanel`
+> change ALSO fixes a pre-existing inconsistency — the Scene Components docked tab now reads "Scene Components"
+> (was "Scene", its key) to match the Window menu/maximized view; id stays "Scene" so `.ini` preserved. The
+> `EditorLayout.Inspector`/`.SceneComponents` const KEYS are untouched. Touched 2 files: `EditorApplication.cs`
+> (mine: title/label/DrawDockPanel hunks — staged selectively with `git add -p` to leave the pre-existing
+> not-mine `RenderPassTogglesWindow.Draw(S)` lines unstaged) + `EditorMenus.cs`. Build 0-error (clean
+> `--no-incremental` scratch dir), oracle EXIT=0 (18 suites incl. Menu/Window registry A1 17/17). Visual-only
+> tab/title/menu change → batched into the editor-screenshot checkpoint (GPU-hang rule: no relaunch-loop).
 >
 > **EF5 identity decision RESOLVED → (i) faithful UE5** (cool graphite + blue-grey shell + a single
 > restrained azure highlight, NO warm accent). The azure accent `0x3D8BD4` (EditorPrefs default) is KEPT;
@@ -221,7 +241,7 @@ this same handoff for the chunk after it.
 - [x] EF5b — centralize bypass-color offenders — added a SEMANTIC tokens block to `EditorTheme.cs` (Error/Warning/Success, PrefabBlue/RowChild/IconMuted, PrimaryAction±, FolderTint/Dim, LogLevel[], Hairline/TreeGuide, PopupBg/InputBg) and routed the hand-typed `SysVec4` literals in ConsolePanel/HierarchyPanel/AssetBrowserPanel/StatsPanel/BuildPanel/VolumeProfileEditor through them. Deliberately harmonizes a few slightly-off literals into one family (NOT byte-identical — visual only, behaviour unchanged). Remaining literals in those files are justified (alpha-only overlays, alpha/scale derivations of a token, the no-icon fallback glyph, the `Style(ext)` file-type taxonomy data table — annotated in-file). Only the 6 panels + `EditorTheme.cs` touched. Build 0-error, oracle EXIT=0. Visual verify batched into the EF5a–d checkpoint.
 - [x] EF5c — panel chrome polish — routed inspector-cluster `SeparatorText` → `EditorDecoration.DrawSectionHeader` (incl. the shared `ImGuiComponentGui.Header` adapter, so all attribute `[Header]` sections at once) + toolbar `Separator()` → `DrawDivider()` in Console/Hierarchy/Assets. Gave `DrawSectionHeader` Caption-font + symmetric pad so titles recede; dropped now-redundant leading `Spacing()`. Visual-only (not byte-identical), behaviour unchanged; build 0-error, oracle EXIT=0. Out of scope: Stats/TagsLayers/Settings + modal-dialog separators (left stock). Visual verify batched into the EF5a–d checkpoint.
 - [x] EF5d — type/spacing tokens everywhere — routed `StatsPanel`'s 5 `SeparatorText` → `EditorDecoration.DrawSectionHeader` (Caption-font + palette hairline, the last stock section dividers); finished the inspector-cluster semantic literals: prefab dots/bar → `PrefabBlue`, multi-differ "—" + ComponentPreviews light/prefab warnings → `Warning`, "Missing (ref)" + ProfilerPanel over-budget → `Error`, animator current/active cyan → NEW `Info` token, destructive "Delete N Assets" button → NEW `Destructive`/`DestructiveHovered` tokens. Justified literals (accent derivations, alpha overlays, dark-on-chip glyph, parsed material base-color, prefab-bar navy surface backing) annotated + left. Type scale otherwise already applied (entity title=Header, meta=Caption, sections=Caption); interactive `CollapsingHeader`s in Tags/Settings left (collapsible, out of scope). Visual-only (not byte-identical), behaviour unchanged. Build 0-error, oracle EXIT=0. LAST EF5 sub-chunk → whole EF5 theme series ready for batched screenshot review.
-- [ ] EF12 — rename Inspector → "Details"
+- [x] EF12 — rename Inspector → "Details" — `panels.Register`/`extraPanels.Register` titles + both `AddTabItem` menu labels + the Window-menu `[MenuItem]` path & `PathToWindowKey` key all "Inspector"→"Details"; `DrawDockPanel` now `Begin($"{d.Title}###{name}")` so the docked tab reads the descriptor Title (validated vs ImGui source: `###` resets the id-hash + strips the `.ini` key prefix, so KEY/`.ini`/`.panels`/dock-builder identity all preserved). Generic change also fixes the pre-existing Scene-Components docked tab "Scene"→"Scene Components" (user-approved). `EditorLayout.*` KEY consts untouched. Build 0-error, oracle EXIT=0.
 - [ ] EF-LAYOUT — inspector layout model (design + shared helper)
 - [ ] EF16 — nested indent (fixed value-x)
 - [ ] EF11 — adaptive label column + slider value legibility
