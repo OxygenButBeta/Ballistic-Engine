@@ -12,6 +12,7 @@ namespace BallisticEngine.Cli;
 internal static class Program {
     static readonly IReadOnlyDictionary<string, ICommand> Commands = new ICommand[] {
         new SchemaCommand(),
+        new RemoteSchemaCommand(),
         new ValidateCommand(),
         new DescribeCommand(),
         new SceneCommand(),

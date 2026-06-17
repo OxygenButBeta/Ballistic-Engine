@@ -98,6 +98,24 @@ public static class RemoteSchema {
     // Every method's signature, in table (help-listing) order -- the canonical method catalog.
     public static string[] Signatures => Methods.Select(Signature).ToArray();
 
+    // A structured row in the agent-facing method catalog: the method name, its rendered signature, and
+    // the per-param contract (name + JSON kind + required flag). Required params come first, then optional,
+    // in declaration order -- the same ordering Signature() renders, so the structured and string catalogs
+    // agree by construction. This is the DATA shape the bal CLI (`bal remote-schema`) serializes to JSON so
+    // an agent can discover the command-port surface headlessly from the SAME table the editor dispatches
+    // and validates against (no fourth hand-maintained list).
+    public readonly record struct CatalogParam(string Name, string Kind, bool Required);
+    public readonly record struct CatalogEntry(string Method, string Signature, CatalogParam[] Params);
+
+    // The method catalog as structured rows, in table (help-listing) order. Generated from Methods, so it
+    // can never drift from the dispatch/validation/help surfaces -- they all read this one table.
+    public static CatalogEntry[] Catalog() => Methods.Select(m => new CatalogEntry(
+        m.Method,
+        Signature(m),
+        m.Required.Concat(m.Optional)
+            .Select(p => new CatalogParam(p.Name, p.Kind.ToString(), p.Required))
+            .ToArray())).ToArray();
+
     // D1 FULL (editor-rework Phase D, "command registry"): the dispatch coverage invariant. The editor's
     // RemoteHandlers builds a method->handler delegate MAP keyed by the same `registered` names; this asserts
     // that map covers EXACTLY this schema -- every schema method has a handler (no missing, would 404 at

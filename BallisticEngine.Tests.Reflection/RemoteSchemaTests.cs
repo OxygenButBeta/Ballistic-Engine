@@ -171,6 +171,48 @@ internal static class RemoteSchemaTests {
         h.Check("CoverageError(null) lists every schema method as missing (no NRE)",
             RemoteSchema.CoverageError(null!) is { } cn && allMethods.All(m => cn.Contains(m)));
 
+        // -- (8) D1 catalog: the structured method catalog is GENERATED from the table -------------------
+        // RemoteSchema.Catalog() is the structured (machine) form of the help/method surface -- the bal CLI
+        // (`bal remote-schema`) serializes it to JSON so an agent can discover the command-port surface
+        // headlessly from the SAME table the editor dispatches/validates/help against (no fourth hand-kept
+        // list). These prove the catalog faithfully mirrors Methods/Signatures: one row per method, the same
+        // order, the same signature, and per-param contract (required-first, kind names, required flags) that
+        // Validate()/Signature() agree with.
+        var catalog = RemoteSchema.Catalog();
+        h.Check("Catalog() has exactly one entry per method (catalog == table)",
+            catalog.Length == RemoteSchema.Methods.Count);
+        h.Check("Catalog() preserves the table (help-listing) order",
+            catalog.Select(c => c.Method).SequenceEqual(RemoteSchema.Methods.Select(m => m.Method)));
+        h.Check("each catalog entry's Signature matches RemoteSchema.Signature",
+            catalog.All(c => c.Signature == RemoteSchema.Signature(c.Method)));
+        h.Check("each catalog entry has one CatalogParam per schema Param",
+            catalog.All(c => c.Params.Length == RemoteSchema.For(c.Method)!.Params.Length));
+        h.Check("catalog params are required-first (no required after an optional)",
+            catalog.All(c => {
+                bool seenOptional = false;
+                foreach (RemoteSchema.CatalogParam p in c.Params) {
+                    if (!p.Required) seenOptional = true;
+                    else if (seenOptional) return false; // a required param after an optional -> wrong order
+                }
+                return true;
+            }));
+        h.Check("a paramless method has an empty catalog param list",
+            catalog.Single(c => c.Method == "editor.status").Params.Length == 0);
+        h.Check("component.set catalog: entity,target,value all required, value kind Any",
+            catalog.Single(c => c.Method == "component.set") is { } setEntry
+                && setEntry.Params.All(p => p.Required)
+                && setEntry.Params.Select(p => p.Name).SequenceEqual(new[] { "entity", "target", "value" })
+                && setEntry.Params.Single(p => p.Name == "value").Kind == "Any");
+        h.Check("entity.create catalog: name required (String), position/parent optional",
+            catalog.Single(c => c.Method == "entity.create") is { } createEntry
+                && createEntry.Params.Length == 3
+                && createEntry.Params[0] is { Name: "name", Required: true, Kind: "String" }
+                && createEntry.Params.Where(p => !p.Required).Select(p => p.Name)
+                    .OrderBy(n => n).SequenceEqual(new[] { "parent", "position" }));
+        h.Check("screenshot catalog: optional settleFrames carries kind Number",
+            catalog.Single(c => c.Method == "screenshot").Params
+                .Single(p => p.Name == "settleFrames") is { Required: false, Kind: "Number" });
+
         return h.Report("RemoteSchema (D2)");
     }
 
