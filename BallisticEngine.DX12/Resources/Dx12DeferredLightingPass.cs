@@ -38,6 +38,13 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         b.Read(b.Resource("ShadowMap"));
         b.Read(b.Resource("RtShadowMask"));
         b.Write(b.Resource("SceneColor"));
+        // PHASE-2 V3 (chunk 15): Deferred is the G-buffer-as-SRV CONSUMER — its ONE shared-resource head
+        // transition is `gbuffer.ToShaderResource()` (the combined PIXEL|NON_PIXEL SRV state on ALL colors AND
+        // depth). Derive it; the manual head in Record is gated off when the barriers door is on. The inline-core
+        // RT sun shadows (which also reads the G-buffer as SRV, chunk 9) keeps its OWN head transition — it runs
+        // outside the graph, so this migration doesn't affect it.
+        b.DeriveBarriers();
+        b.Use(Dx12ResourceUsage.GBufferShaderRead);
     }
 
     // Render-wide camera constants (the renderer's CameraNear/CameraFar, inlined — they're frame-invariant
@@ -120,7 +127,8 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
 
         // R2 / Decision 4: deferred is the CONSUMER of the G-buffer-as-SRV — head transition lives here.
         // === DEFERRED LIGHTING: read the G-buffer + depth → PBR sun + IBL + shadows + punctual → HDR. ===
-        gbuffer.ToShaderResource();
+        // PHASE-2 V3: skip the manual head when derived barriers are active (the graph emitted it before Record).
+        if (!ctx.BarriersDerived) gbuffer.ToShaderResource();
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Matrix4x4.Invert(ctx.ViewProj, out Matrix4x4 invVP);
