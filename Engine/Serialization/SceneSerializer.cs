@@ -144,9 +144,36 @@ public static class SceneSerializer {
             object serialized = SerializeValue(value);
             if (serialized is not null)
                 doc.Members[CamelCase(member.Name)] = serialized;
+            else if (value is not null)
+                // G0 (loud drops): the member HELD a value but serialized to null, so it silently
+                // vanishes on save/load. Make the data loss visible instead of dropping it quietly
+                // (the §3.45 silent-failure trap). Deduped per (type, member) so the per-frame undo
+                // snapshots don't spam — the FIRST drop is enough to flag the hole.
+                WarnDroppedMember(target.GetType(), member, value);
         }
 
         return doc;
+    }
+
+    // Members that held a non-null value but produced no serialized form are reported ONCE each, so a
+    // forgotten reference (entity/component ref without a guid, an unsupported member type) is loud,
+    // not a silent round-trip loss. The dedup key is the declaring type + member name.
+    static readonly HashSet<string> _reportedDrops = new(StringComparer.Ordinal);
+
+    static void WarnDroppedMember(Type ownerType, MemberInfo member, object value) {
+        string key = $"{ownerType.FullName}.{member.Name}";
+        lock (_reportedDrops) {
+            if (!_reportedDrops.Add(key))
+                return;
+        }
+
+        string reason = value is BObject
+            // Entity/Behaviour (and unsaved assets) are BObjects with no AssetDatabase guid, so there
+            // is no ref form to write yet — G1 (EntityRef) will close this for scene-object refs.
+            ? $"a reference of type '{value.GetType().Name}' has no asset guid (scene-object/unsaved refs do not round-trip yet)"
+            : $"its type '{value.GetType().Name}' has no serialized form";
+        Debugging.LogWarning(
+            $"Scene save dropped {ownerType.Name}.{member.Name}: {reason}. The value will be lost on reload.");
     }
 
     // BObject -> "guid:..."; BEvent -> a listener list; everything else passes through (converters

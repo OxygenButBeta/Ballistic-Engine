@@ -15,6 +15,7 @@ exit += InputActionChainTests.Run();
 exit += DrawerStackTests.Run();
 exit += ComponentPreviewTests.Run();
 exit += AssetInspectorTests.Run();
+exit += SerializerDropTests.Run();   // G0 — runs LAST (inserts a scene with no public unload)
 return exit;
 
 internal static class TypeCacheTests {
