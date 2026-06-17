@@ -399,36 +399,68 @@ internal sealed class EditorApplication {
         EditorPrefs.Save();
     }
 
+    // The editor frame loop, A2-decomposed into a declared ordered pass list (EditorFrameGraph). Built once
+    // (lazily, on first frame) so the pass objects + the frozen order are allocated only once, never per
+    // frame (perf constraint: zero per-frame alloc in the loop). The pass BODIES are the FramePass* methods
+    // below — verbatim slices of the old single OnRender, in the EXACT same order the events encode.
+    EditorFrameGraph frameGraph;
+    readonly EditorFrameContext frameContext = new();
+
+    EditorFrameGraph BuildFrameGraph() => new EditorFrameGraph()
+        .Add(new EditorDelegatePass(EditorFramePassEvent.ImportPump,     "ImportPump",     FramePassImportPump))
+        .Add(new EditorDelegatePass(EditorFramePassEvent.RemotePump,     "RemotePump",     FramePassRemotePump))
+        .Add(new EditorDelegatePass(EditorFramePassEvent.BuildUI,        "BuildUI",        FramePassBuildUI))
+        .Add(new EditorDelegatePass(EditorFramePassEvent.StartupImport,  "StartupImport",  FramePassStartupImport))
+        .Add(new EditorDelegatePass(EditorFramePassEvent.ResolveDirty,   "ResolveDirty",   FramePassResolveDirty))
+        .Add(new EditorDelegatePass(EditorFramePassEvent.ViewportRender, "ViewportRender", FramePassViewportRender))
+        .Add(new EditorDelegatePass(EditorFramePassEvent.ImGuiRender,    "ImGuiRender",    FramePassImGuiRender))
+        .Add(new EditorDelegatePass(EditorFramePassEvent.PostPresent,    "PostPresent",    FramePassPostPresent))
+        .Add(new EditorDelegatePass(EditorFramePassEvent.IdleThrottle,   "IdleThrottle",   FramePassIdleThrottle));
+
     void OnRender(double delta) {
         frameWatch.Restart();
 
-        // Run any main-thread completion work from a finished background import (thumbnail/asset
-        // cache invalidation) before building this frame's UI off the fresh asset database.
-        AsyncAssetImport.PumpCompletion();
+        frameGraph ??= BuildFrameGraph();
+        frameContext.Delta = delta;
+        frameContext.RenderScene = false;   // ResolveDirty sets it; ViewportRender + IdleThrottle read it
+        frameGraph.Execute(frameContext);
+    }
 
-        // Remote commands (agents/MCP) execute here — on the main thread, before the UI builds,
-        // so a remote edit and a human edit are indistinguishable to the rest of the frame.
-        RemoteCommandQueue.Pump();
+    // ---- Editor frame passes (verbatim OnRender slices, ordered by EditorFramePassEvent) -------------
 
-        // Build the UI FIRST (the gizmo mutates transforms there), then render the scene with
-        // this frame's values â€” otherwise the object trails the gizmo by one frame.
+    // Run any main-thread completion work from a finished background import (thumbnail/asset
+    // cache invalidation) before building this frame's UI off the fresh asset database.
+    void FramePassImportPump(EditorFrameContext ctx) => AsyncAssetImport.PumpCompletion();
+
+    // Remote commands (agents/MCP) execute here — on the main thread, before the UI builds,
+    // so a remote edit and a human edit are indistinguishable to the rest of the frame.
+    void FramePassRemotePump(EditorFrameContext ctx) => RemoteCommandQueue.Pump();
+
+    // Build the UI FIRST (the gizmo mutates transforms there), then render the scene with
+    // this frame's values â€” otherwise the object trails the gizmo by one frame.
+    void FramePassBuildUI(EditorFrameContext ctx) {
         using (Profiler.Zone("Editor.BuildUI")) {
-            imgui.Update((float)delta);
+            imgui.Update((float)ctx.Delta);
             BuildUI();
             BusyOverlay.Draw(S);
             BusyOverlay.DrawBakeBadge(S); // non-blocking GI-bake indicator (the bake no longer modal-blocks)
         }
+    }
 
-        // Kick the startup asset import on the first painted frame (not in the constructor), so the
-        // window and the busy overlay are already on screen instead of a black, frozen window. The
-        // startup scene loads on the render thread once the import finishes.
+    // Kick the startup asset import on the first painted frame (not in the constructor), so the
+    // window and the busy overlay are already on screen instead of a black, frozen window. The
+    // startup scene loads on the render thread once the import finishes.
+    void FramePassStartupImport(EditorFrameContext ctx) {
         if (!startupImportKicked) {
             startupImportKicked = true;
             AsyncAssetImport.Request("Importing project assets...", onFinished: LoadStartupScene);
         }
+    }
 
-        // "Always refresh" off: re-render the scene only while something is changing
-        // (playing, flying, gizmo drag, recent interaction). The last image stays on screen.
+    // Decide whether to re-render the scene this frame; result flows to ViewportRender + IdleThrottle via
+    // ctx.RenderScene. "Always refresh" off: re-render only while something is changing (playing, flying,
+    // gizmo drag, recent interaction). The last image stays on screen.
+    void FramePassResolveDirty(EditorFrameContext ctx) {
         // Skip the scene render while a deferred open is pending â€” the scene is about to be replaced.
         // A probe bake counts as "changing": its time-sliced job only advances inside the scene
         // render, so without this it crawls one slice per click instead of one per frame.
@@ -461,10 +493,14 @@ internal sealed class EditorApplication {
         // keep repainting while one is active — otherwise on-demand rendering freezes the UI after the
         // initial forceFrames run out (it builds in the controller's OnAttach but never draws again).
         bool activeGameUI = !sceneTabActive && BallisticEngine.UI.UIDocument.Active.Count > 0;
-        var renderScene = !SceneCommands.IsLoading &&
+        ctx.RenderScene = !SceneCommands.IsLoading &&
                           (alwaysRefresh || SceneManager.IsPlaying || editorInput.RightMouseDown ||
                            gizmo.IsInteracting || forceFrames > 0 || probeBakePending || activeGameUI);
-        if (renderScene) {
+    }
+
+    // Render the active Scene/Game view offscreen with this frame's (post-BuildUI) values.
+    void FramePassViewportRender(EditorFrameContext ctx) {
+        if (ctx.RenderScene) {
             using var profileZone = Profiler.Zone("Editor.SceneRender");
             if (sceneTabActive)
                 RenderSceneView();
@@ -478,15 +514,19 @@ internal sealed class EditorApplication {
         // does anything while playing; the runner is empty otherwise).
         if (SceneManager.IsPlaying)
             Coroutine.EndOfFramePump();
+    }
 
-        // The DX12 host already cleared the swapchain backbuffer in Dx12BallisticEngineWindow.OnRenderFrame
-        // (before this callback), so there's nothing to clear here.
+    // The DX12 host already cleared the swapchain backbuffer in Dx12BallisticEngineWindow.OnRenderFrame
+    // (before this callback), so there's nothing to clear here.
+    void FramePassImGuiRender(EditorFrameContext ctx) {
         using (Profiler.Zone("Editor.ImGuiRender"))
             imgui.Render();
+    }
 
-        // Pump the deferred scene open. NOTE: the buffer swap happens after OnRender returns, so a
-        // blocking apply here stalls BEFORE this frame presents â€” SceneCommands defers the apply two
-        // frames after prefetch so its final status is actually on screen. Refresh thumbnails after.
+    // Pump the deferred scene open + record this frame's CPU cost. NOTE: the buffer swap happens after
+    // OnRender returns, so a blocking apply here stalls BEFORE this frame presents â€” SceneCommands defers
+    // the apply two frames after prefetch so its final status is actually on screen. Refresh thumbnails after.
+    void FramePassPostPresent(EditorFrameContext ctx) {
         if (SceneCommands.PumpPendingOpen()) {
             assets.InvalidateThumbnails();
             pendingFocusWindow = EditorLayout.SceneView;
@@ -495,13 +535,13 @@ internal sealed class EditorApplication {
 
         // Exponential moving average so the value is readable.
         editorCpuMs = editorCpuMs * 0.9f + (float)frameWatch.Elapsed.TotalMilliseconds * 0.1f;
-
-        // IDLE THROTTLE: when nothing is happening — not playing, no scene render, no mouse/keyboard
-        // activity, no open popup — there's no point spinning ImGui at hundreds of FPS (wasted CPU/GPU/
-        // battery for an identical frame). Drop to a low idle cap; snap back to full the instant the
-        // user does anything. Skipped when the user picked an explicit FPS cap below the idle rate.
-        UpdateIdleThrottle(renderScene, delta);
     }
+
+    // IDLE THROTTLE: when nothing is happening — not playing, no scene render, no mouse/keyboard
+    // activity, no open popup — there's no point spinning ImGui at hundreds of FPS (wasted CPU/GPU/
+    // battery for an identical frame). Drop to a low idle cap; snap back to full the instant the
+    // user does anything. Skipped when the user picked an explicit FPS cap below the idle rate.
+    void FramePassIdleThrottle(EditorFrameContext ctx) => UpdateIdleThrottle(ctx.RenderScene, ctx.Delta);
 
     // ---- Idle frame throttle -------------------------------------------------
     const int IdleFps = 30;          // frame cap while the editor is idle

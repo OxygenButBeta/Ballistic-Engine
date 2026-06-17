@@ -10,6 +10,7 @@ exit += TypeCacheTests.Run();
 exit += PropertyModelTests.Run();
 exit += ReloadInvalidationTests.Run();
 exit += MenuRegistryTests.Run();
+exit += OrderedPassListTests.Run();
 return exit;
 
 internal static class TypeCacheTests {
