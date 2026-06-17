@@ -129,6 +129,14 @@ internal sealed class DockPanelHost {
     // `ref open` so the window's X button is drawn + HONORED while maximized — clicking it flips the
     // instance's Open flag (the next DrawAll removes the instance) and returns true so the caller can
     // exit fullscreen the same frame (no stuck-maximized panel). Returns false if not found / not closed.
+    //
+    // EF9b (doesn't-fight-docking): the maximized window uses its OWN dedicated `###maxinstance` id with
+    // NoSavedSettings instead of the instance's docked `label` (which carries `###KindKey`/`###KindKey_id`,
+    // the dock-tree identity). Reusing the docked id force-undocked the instance every maximize and saved
+    // its fullscreen geometry into the docked window's settings — the same layout-polluting fight EF9b
+    // removes for the primary panels. `runStrip` still gets the real `label` (the maximize KEY) so the
+    // title double-click restores the right instance. Content is the same kind.Draw, so docked and
+    // maximized views share one instance state.
     public bool DrawMaximizedInstance(string label, System.Numerics.Vector2 pos, System.Numerics.Vector2 size,
         Action<string> runStrip) {
         foreach (Instance inst in instances) {
@@ -137,9 +145,11 @@ internal sealed class DockPanelHost {
             ImGui.SetNextWindowPos(pos);
             ImGui.SetNextWindowSize(size);
             const ImGuiWindowFlags flags = ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove |
-                ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking;
+                ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking | ImGuiWindowFlags.NoSavedSettings;
+            // Dedicated fullscreen identity: visible title from the kind, fixed `###maxinstance` id.
+            string title = inst.Id == 0 ? $"{kind.Icon}  {kind.Title}" : $"{kind.Icon}  {kind.Title} {inst.Id}";
             bool open = inst.Open;
-            if (ImGui.Begin(label, ref open, flags)) {
+            if (ImGui.Begin($"{title}###maxinstance", ref open, flags)) {
                 runStrip?.Invoke(label);
                 kind.Draw(inst.Panel);
             }

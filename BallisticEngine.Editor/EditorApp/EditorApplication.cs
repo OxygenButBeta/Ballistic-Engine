@@ -1558,19 +1558,32 @@ internal sealed class EditorApplication {
         // A1b: single content path. The panel's body comes from its ONE registry descriptor — the same
         // DrawContents the normal docked path uses — so there is no parallel maximize-content chain to
         // drift, and no "can't be shown fullscreen" dead-end for a registered panel.
-        // EF9a: thread a `ref open` (the panel's single-owned Shown flag) so the window's X is drawn AND
-        // honored while maximized — the old `Begin(name, flags)` had no p_open ref, so the close was
-        // silently ignored ("opened a panel then can't close it, only Reset Layout"). On close, flip the
-        // registry Shown flag (so it STICKS — the panel stays closed next frame, no redraw loop) AND clear
-        // the maximize state this same frame so the docked layout returns immediately.
+        //
+        // EF9b (doesn't-fight-docking): the maximized window now has its OWN ImGui identity — a dedicated
+        // `###maxpanel` id with NoSavedSettings — instead of reusing the docked panel's bare `name`
+        // ("Inspector"/"Scene"/…) label. Sharing the docked identity made maximize FIGHT docking: ImGui
+        // can't have one window be both docked (a member of the dock tree, geometry saved to the .ini)
+        // and a NoDocking fixed-position fullscreen window at once, so each maximize force-undocked the
+        // panel and (without NoSavedSettings) wrote its fullscreen pos/size into that window's saved
+        // settings — polluting the layout EF9c will persist. The dedicated id leaves the docked window's
+        // identity, dock-node membership, and saved geometry completely untouched (same approach the
+        // viewport path already used via `##viewportmax`). The panel content is the SAME DrawContents
+        // delegate, so the maximized view and docked view still share one instance/state.
+        //
+        // EF9a contract PRESERVED: thread a `ref open` (the panel's single-owned Shown flag) so the X is
+        // drawn AND honored while maximized — NOT a `Begin(label, flags)` with no p_open. On close, flip
+        // the registry Shown flag (so it STICKS next frame, no redraw loop) AND clear the maximize state
+        // this same frame so the docked layout returns immediately. Restore-by-title-double-click keys off
+        // `name` (the maximize KEY), not the window label, so it stays a no-op-toggle that restores.
         ImGui.SetNextWindowPos(pos);
         ImGui.SetNextWindowSize(size);
         const ImGuiWindowFlags flags = ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove |
-            ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking;
+            ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking | ImGuiWindowFlags.NoSavedSettings;
+        EditorPanelRegistry.Descriptor d = panels.Get(name);
+        string title = d is not null ? $"{d.Icon}  {d.Title}" : name;
         bool open = panels.IsShown(name);
-        if (ImGui.Begin(name, ref open, flags)) {
-            MaximizePanelOnTitleDoubleClick(name); // double-click its title again to restore
-            EditorPanelRegistry.Descriptor d = panels.Get(name);
+        if (ImGui.Begin($"{title}###maxpanel", ref open, flags)) {
+            MaximizePanelOnTitleDoubleClick(name); // double-click its title again to restore (keys off the maximize key)
             if (d?.DrawContents is not null)
                 d.DrawContents();
             else {

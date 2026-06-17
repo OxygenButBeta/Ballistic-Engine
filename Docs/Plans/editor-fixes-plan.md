@@ -19,17 +19,24 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF9b** (maximize/fullscreen that doesn't fight docking; re-verify EF3 fullscreen)
-> Last committed chunk: **EF9a** · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **EF9c** (layout persist/restore + PassthruCentralNode review)
+> Last committed chunk: **EF9b** · Branch: `dx12-renderer`
 >
-> **EF9a note for EF9b:** the "can't close while maximized" bug is FIXED — both maximized paths now thread
-> a `ref open` so the window X works while fullscreen: `DrawMaximizedPanel` (registered core panels, via
-> `panels.IsShown`/new `EditorPanelRegistry.SetShown`) and `DockPanelHost.DrawMaximizedInstance` (extra
-> instances, returns `bool closed`). On close: the panel's `Shown`/`Open` flag flips false (close STICKS)
-> AND `maximize.Clear()` runs the SAME frame so the docked layout returns immediately (no stale/flicker
-> frame, no redraw loop). The existing `maximize.DropIfUnavailable(MaximizedPanelStillAvailable)` is the
-> backstop. EF9b should keep this `ref open` contract intact when it reworks the maximize MECHANISM — do
-> not regress to a `Begin(label, flags)` with no p_open ref.
+> **EF9b note for EF9c:** maximize no longer FIGHTS docking. The fullscreen windows now have their OWN
+> ImGui identities — `###maxpanel` (core panels, `DrawMaximizedPanel`) and `###maxinstance` (duplicated
+> tabs, `DockPanelHost.DrawMaximizedInstance`) — each with `NoSavedSettings`, instead of reusing the docked
+> window's bare label (`"Inspector"`/`"Scene"`/`###KindKey`). The old shared-identity path force-undocked
+> the panel on every maximize AND (lacking `NoSavedSettings`) wrote the fullscreen pos/size into that
+> window's saved settings — which would have polluted the layout EF9c persists. So **EF9c can now trust the
+> docked windows' saved geometry is clean** (maximize never touches it). The EF9a `ref open` close contract
+> is intact (close still flips `Shown`/`Open` + `maximize.Clear()` same frame; restore-double-click keys off
+> the maximize KEY `name`, not the window label). Editor "fullscreen" is purely an ImGui layout change — it
+> does NOT resize the swapchain (only `runtime.Window.OnResizeCallback` → `imgui.WindowResized` +
+> `viewport.InvalidateTargetSizes` does), so EF9b introduced NO second/undrained `ResizeBuffers` — the EF3
+> coupling DoD is met by construction (the resize harness `Docs/Validation/dx12-resize-harness/` is unchanged
+> and still the swapchain-resize guard). **For EF9c:** persisting the layout (`io.WantSaveIniSettings` →
+> `EditorLayout.Save()` at `EditorApplication.cs:828`) is already wired; EF9c's real work is restore-on-startup
+> + the `PassthruCentralNode` review (`EditorApplication.cs:784`).
 >
 > **EF3 note for later chunks (important):** the plan's original EF3 root cause ("`Dx12SwapChain.cs:165`
 > flushes the WRONG fence — legacy upload, not `frameFence`") was **STALE** — `Dx12Device.Flush()` was
@@ -81,7 +88,7 @@ this same handoff for the chunk after it.
 ### Progress checklist (each chat ticks its chunk)
 - [~] EF3 — swapchain drained resize + post-resize reset DONE (v1 @ d1799cb7) — but RESIZE STILL CRASHES LIVE (DXGI_ERROR_DEVICE_HUNG 0x887A0006 at **Present**, editor only). REOPENED. v2 follow-up: made DRED page-fault tracking ALWAYS-ON (next crash self-diagnoses the faulting VA) + hardened ImGui EnsureBuffers grow (drain before disposing an in-flight upload buffer). NOT yet the proven fix — needs ONE careful user repro to read the DRED page-fault. The hang is editor-specific (player `Dx12WindowedRuntime` resizes swapchain+offscreen in lockstep in OnResize and does NOT crash; editor has ImGui + a DECOUPLED panel-sized offscreen `ldr` resize via `InvalidateTargetSizes`). Swapchain `Resize` itself is proven clean (harness, both fence paths). See EF3 section + the [[gpu-hang]] memory.
 - [x] EF9a — honor close everywhere (incl. maximized) — `ref open` threaded through both maximized paths; close STICKS + exits fullscreen same frame
-- [ ] EF9b — maximize/fullscreen (re-verify EF3 fullscreen)
+- [x] EF9b — maximize/fullscreen (re-verify EF3 fullscreen) — dedicated `###maxpanel`/`###maxinstance` identities + `NoSavedSettings`; maximize no longer undocks/pollutes the docked window; no swapchain resize introduced
 - [ ] EF9c — layout persist + PassthruCentralNode review
 - [ ] EF9d — Window-menu open-state sync
 - [ ] EF5a — palette + geometry (BLOCKED on identity decision)
@@ -381,12 +388,28 @@ Layout). Validated causes: `PassthruCentralNode` + custom maximize state machine
   multi-instance + singleton semantics untouched. Verified: editor builds 0-error (bin-copy lock from a
   running editor ignored), reflection oracle EXIT=0 (18 suites green). Human screenshot of close-while-
   maximized batched into the EF9/windowing visual checkpoint.
-- **EF9b — Maximize/fullscreen that doesn't fight docking:** replace the custom maximize state machine
-  with a clean single-window fullscreen that honors `p_open` and exits cleanly, OR ImGui dock-node
-  maximize. Multi-instance maximized tabs (`DrawMaximizedInstance`) must keep working.
-  **DoD addition (EF3 coupling):** fullscreen enter/exit routes through the EF3 drained `Resize` — there
-  must be NO second, undrained `ResizeBuffers` introduced by the new fullscreen path. Re-run EF3's
-  fullscreen device-removal check after this chunk.
+- **EF9b — Maximize/fullscreen that doesn't fight docking — ✅ DONE:** the maximize STATE machine
+  (`MaximizeController`) was already clean + single-sourced (built in A1b, hardened EF9a). The remaining
+  EF9b defect was that the fullscreen WINDOWS reused the docked panels' ImGui identities — core panels via
+  `Begin(name, …)` (bare `"Inspector"`/`"Scene"` labels) and duplicated tabs via `Begin(label, …)`
+  (`###KindKey`). A single ImGui window can't be both docked (dock-tree member, geometry in the `.ini`) and
+  a `NoDocking` fixed-position fullscreen window, so each maximize FORCE-UNDOCKED the panel and — lacking
+  `NoSavedSettings` — wrote its fullscreen pos/size into the docked window's saved settings (the layout
+  EF9c persists). Fix: both maximize paths now `Begin` a DEDICATED identity (`###maxpanel` /
+  `###maxinstance`) carrying `NoSavedSettings`, exactly like the viewport path's pre-existing
+  `##viewportmax`. The docked window's identity, dock-node membership, and saved geometry are now NEVER
+  touched by maximize. The EF9a `ref open` close contract is preserved unchanged (close flips `Shown`/`Open`
+  + `maximize.Clear()` same frame; restore-double-click keys off the maximize KEY `name`, not the window
+  label). Multi-instance + singleton semantics untouched. Verified: editor csproj builds 0-error (to a
+  scratch output dir, around a running-editor bin-copy lock), reflection oracle EXIT=0 (all suites green).
+  **DoD addition (EF3 coupling) — MET BY CONSTRUCTION:** editor "fullscreen" is a pure ImGui maximized-panel
+  layout change; it does NOT call `Resize`/`ResizeBuffers` (the only swapchain resize is
+  `runtime.Window.OnResizeCallback` → `imgui.WindowResized` + `viewport.InvalidateTargetSizes`). EF9b's
+  changes are ImGui-window-identity only (grep of the two changed files for `Resize`/`swapChain` finds only
+  the unrelated ImGui `NoResize` window flag), so there is NO second/undrained `ResizeBuffers`. The EF3
+  resize harness (`Docs/Validation/dx12-resize-harness/`) is unchanged and remains the swapchain-resize
+  regression guard. Human screenshot of maximize+restore not regressing the docked layout is batched into
+  the EF9/windowing visual checkpoint.
 - **EF9c — Layout persist/restore + PassthruCentralNode review:** persist the dock layout (ImGui .ini or
   engine-side) so panels reopen where they were; "Reset Layout" rebuilds the default (the existing
   `EditorLayout.BuildDefault` dock builder targets windows by the `###KindKey` labels DockPanelHost mints
