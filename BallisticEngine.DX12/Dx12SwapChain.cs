@@ -158,14 +158,32 @@ public sealed class Dx12SwapChain : IDisposable {
         CheckPresent(swapChain.Present(vsync ? 1u : 0u, PresentFlags.None));
     }
 
-    // Flush the GPU, release backbuffer references (required by ResizeBuffers), resize, recreate RTVs.
+    // Resize the swapchain back buffers (EF3). ResizeBuffers requires (a) the GPU fully idle and (b)
+    // EVERY back-buffer reference released, or the in-flight frame that still binds a back-buffer RTV gets
+    // its resource ripped out from under it → device removal (the historical 4K→1080p hang + the dev-PC TDR).
+    // The drained-resize sequence, in order:
+    //  1. DRAIN every in-flight frame. dev.Flush() is a HARD barrier across ALL three queue fences — the
+    //     legacy render `fence`, the pipelined `frameFence` (a P0b-overlap frame is signalled ONLY there, so
+    //     waiting the render fence alone would let an overlapped frame still be reading a back buffer), AND
+    //     the worker-upload fence. After it returns no frame is in flight, whatever FramesInFlight is.
+    //  2. RELEASE every back-buffer reference so nothing is held when ResizeBuffers recycles the buffers.
+    //  3. ResizeBuffers (with the 0×0 clamp + same-size early-out below).
+    //  4. POST-RESIZE RESET: recreate the RTVs from the NEW back buffers AND drop the cached back-buffer
+    //     index — the next BeginFrame/PresentTexture re-reads swapChain.CurrentBackBufferIndex from scratch,
+    //     so a stale index can never index a disposed buffer. (frameSlot/frameFence ring state needs no reset:
+    //     step 1 fully drained it, so the next BeginFrame's per-slot WaitFrameFence sees an already-completed
+    //     — or zero — target and no-ops; it can never block on a value that will never be signalled.)
+    // This swapchain is the ONLY resize site (Dx12BallisticEngineWindow.OnResize routes here); the editor's
+    // in-window "fullscreen" is an ImGui maximized panel, NOT a DXGI mode change, so it does not resize here.
+    // ⚠ GPU-hang rule: verified by the bal-resize-test harness (in-flight Frame() before each Resize over a
+    // 0×0/shrink/grow/4K→1080p/same-size sequence, default AND BALLISTIC_DX12_OVERLAP=1) — no device removal.
     public void Resize(int width, int height) {
         width = Math.Max(1, width); height = Math.Max(1, height);
         if (width == Width && height == Height) return;
-        dev.Flush();   // drains render + worker uploads — ResizeBuffers needs the GPU fully idle
-        for (int i = 0; i < bufferCount; i++) { backBuffers[i]?.Dispose(); backBuffers[i] = null; }
+        dev.Flush();   // (1) hard barrier — render + pipelined-frame + worker-upload fences; GPU fully idle
+        for (int i = 0; i < bufferCount; i++) { backBuffers[i]?.Dispose(); backBuffers[i] = null; }  // (2)
         try {
-            swapChain.ResizeBuffers((uint)bufferCount, (uint)width, (uint)height, BackbufferFormat, SwapChainFlags.None);
+            swapChain.ResizeBuffers((uint)bufferCount, (uint)width, (uint)height, BackbufferFormat, SwapChainFlags.None);  // (3)
         }
         catch (Exception e) {
             Debugging.LogError($"[DX12] ResizeBuffers failed ({width}x{height}): {e.Message} " +
@@ -173,7 +191,8 @@ public sealed class Dx12SwapChain : IDisposable {
             throw;
         }
         Width = width; Height = height;
-        CreateBackBufferRtvs();
+        CreateBackBufferRtvs();              // (4) new RTVs
+        currentIndex = (int)swapChain.CurrentBackBufferIndex;   // (4) re-seed; never read a stale index post-resize
     }
 
     // Read the CURRENT backbuffer (must be in PRESENT state — call after EndFrame, before Present) back to

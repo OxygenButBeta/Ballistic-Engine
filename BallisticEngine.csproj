@@ -23,6 +23,7 @@
       <Compile Remove="BallisticEngine.Tests.Reflection\**\*.cs" />
       <Compile Remove="Tools\**\*.cs" />
       <Compile Remove="SampleProject\**\*.cs" />
+      <Compile Remove="Docs\**\*.cs" />   <!-- validation harnesses (e.g. dx12-resize-harness) are standalone exes, not engine sources -->
     </ItemGroup>
 
     <ItemGroup>

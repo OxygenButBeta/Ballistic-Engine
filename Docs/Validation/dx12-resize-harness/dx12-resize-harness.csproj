@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- EF3 swapchain-resize regression harness (editor-fixes-plan.md). Standalone exe — references the DX12
+       backend project so it builds the real Dx12Device + Dx12SwapChain, but is NOT part of the engine
+       library (the root BallisticEngine.csproj Compile-Removes Docs\**\*.cs) and NOT in the .slnx, so a
+       normal `dotnet build BallisticEngine.slnx` never pulls it in. Run it by hand to prove the resize path
+       does not remove the device — see README.md. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\BallisticEngine.DX12\BallisticEngine.DX12.csproj" />
+  </ItemGroup>
+</Project>
