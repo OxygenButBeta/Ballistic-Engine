@@ -19,8 +19,32 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF16** (nested drawing indents too far right — implement the EF-LAYOUT model's depth/value-x rule FIRST of the layout trio)
-> Last committed chunk: **EF-LAYOUT** · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **EF11** (adaptive label column + slider value legibility — implements the EF-LAYOUT model's label rule; pairs with EF16)
+> Last committed chunk: **EF16** · Branch: `dx12-renderer`
+>
+> **EF16 note (just landed):** nested member grids no longer march the value box off-screen. The two
+> recursion sites (`DrawNestedSlot`, `DrawPolymorphicSlot` in `InspectorPanel.cs`) now wrap their body in a
+> new `DrawNestedBody(Action)` that (1) CANCELS the `TreeNode`'s full per-level `IndentSpacing` for the body
+> grid (so the grid stops marching one big step right per level) and (2) bumps a static `nestDepth`; the body
+> grid is a new `BeginNestedGrid(...)` that uses a FIXED-width label column (`InspectorLayout.LabelColumnWidth`)
+> instead of the proportional 0.38/0.62 split, so the value column keeps a usable width at every depth. The
+> small per-depth label indent (`InspectorLayout.DepthIndentTotal`) is applied to the LABEL only, in `Row` /
+> `RowWithTooltip` (depth 0 → 0px → byte-identical for top-level + the ComponentPreviews/AssetInspectors shim
+> rows, which never nest). **Pragmatic deviation from the contract's "single panel-level value-x threaded
+> down":** structurally each nested foldout renders INSIDE its parent's value cell (column 1), so the child
+> grids do NOT share the panel content-left and a panel-global value-x physically cannot hold across value-cell
+> nesting. `BeginNestedGrid` therefore recomputes the anchor from THAT grid's current available width each time
+> — `ValueColumnLeft` clamps the label column to ≤62% of the current width, so the value box can never vanish
+> however deep (exactly the DoD). The top-level proportional `BeginGrid` (`:2459`) is UNTOUCHED. EF11 will be
+> the one to (optionally) unify the top-level grid onto the fixed-column model + route labels through
+> `DrawLabelCell` for the ellipsis/tooltip path — when it does, keep depth-0 rows visually equivalent
+> (`PreferredLabelWidth=132px` was tuned to the old 0.38 split). New supporting token:
+> `EditorTheme.UiScale` (effective DPI×UI scale, published by `ImGuiController.LoadFont`) so the static layout
+> helpers convert `InspectorLayout`'s pre-DPI metrics to screen px. Touched 3 files (`InspectorPanel.cs`,
+> `EditorTheme.cs`, `ImGuiController.cs` — all mine). Build 0-error (clean `--no-incremental` scratch dir,
+> around a running editor's bin lock), oracle EXIT=0 (18 suites). VISUAL chunk → human-screenshot checkpoint
+> (a 3-4-deep nested struct/list keeps readable value boxes; short/shallow components unchanged), batched into
+> the Inspector-layout screenshot set; NOT relaunch-looped (GPU-hang rule).
 >
 > **EF-LAYOUT note (just landed):** the ONE inspector column model + its shared helper landed as
 > `BallisticEngine.Editor/Panels/Inspector/InspectorLayout.cs` (design note also in the EF-LAYOUT section
@@ -259,7 +283,7 @@ this same handoff for the chunk after it.
 - [x] EF5d — type/spacing tokens everywhere — routed `StatsPanel`'s 5 `SeparatorText` → `EditorDecoration.DrawSectionHeader` (Caption-font + palette hairline, the last stock section dividers); finished the inspector-cluster semantic literals: prefab dots/bar → `PrefabBlue`, multi-differ "—" + ComponentPreviews light/prefab warnings → `Warning`, "Missing (ref)" + ProfilerPanel over-budget → `Error`, animator current/active cyan → NEW `Info` token, destructive "Delete N Assets" button → NEW `Destructive`/`DestructiveHovered` tokens. Justified literals (accent derivations, alpha overlays, dark-on-chip glyph, parsed material base-color, prefab-bar navy surface backing) annotated + left. Type scale otherwise already applied (entity title=Header, meta=Caption, sections=Caption); interactive `CollapsingHeader`s in Tags/Settings left (collapsible, out of scope). Visual-only (not byte-identical), behaviour unchanged. Build 0-error, oracle EXIT=0. LAST EF5 sub-chunk → whole EF5 theme series ready for batched screenshot review.
 - [x] EF12 — rename Inspector → "Details" — `panels.Register`/`extraPanels.Register` titles + both `AddTabItem` menu labels + the Window-menu `[MenuItem]` path & `PathToWindowKey` key all "Inspector"→"Details"; `DrawDockPanel` now `Begin($"{d.Title}###{name}")` so the docked tab reads the descriptor Title (validated vs ImGui source: `###` resets the id-hash + strips the `.ini` key prefix, so KEY/`.ini`/`.panels`/dock-builder identity all preserved). Generic change also fixes the pre-existing Scene-Components docked tab "Scene"→"Scene Components" (user-approved). `EditorLayout.*` KEY consts untouched. Build 0-error, oracle EXIT=0.
 - [x] EF-LAYOUT — inspector layout model (design + shared helper) — landed the column model + metrics + the shared label primitive as `InspectorLayout.cs` (`ValueColumnLeft`/`LabelColumnWidth`/`DepthIndent`/`DrawLabelCell`/`Ellipsize`/`MemberSearchThreshold`). NO call sites rewired (EF16→EF11→EF10 each opt in) → live inspector byte-identical, oracle 18/18 green. Design note in the EF-LAYOUT section + the file header.
-- [ ] EF16 — nested indent (fixed value-x)
+- [x] EF16 — nested indent (fixed value-x) — `DrawNestedSlot`/`DrawPolymorphicSlot` now wrap their body in `DrawNestedBody` (cancels the `TreeNode`'s full per-level `IndentSpacing`, bumps `nestDepth`) + a `BeginNestedGrid` with a FIXED-width label column (`InspectorLayout.LabelColumnWidth`) instead of the proportional 0.38/0.62 split, so the value box keeps a usable width at every nesting depth; the small per-depth label indent (`DepthIndentTotal`) applies to the LABEL only in `Row`/`RowWithTooltip` (depth 0 → 0px → top-level + shim rows byte-identical). Pragmatic deviation: the anchor is recomputed from each nested grid's current width (foldouts render inside the parent value cell, so a single panel-global value-x can't hold); `ValueColumnLeft` clamps label ≤62% so the value never vanishes. Added `EditorTheme.UiScale` token (published by `ImGuiController.LoadFont`). Top-level `BeginGrid` untouched. Build 0-error, oracle EXIT=0. Visual verify batched into the Inspector-layout screenshot set.
 - [ ] EF11 — adaptive label column + slider value legibility
 - [ ] EF10a — per-component member search (conditional)
 - [ ] EF10b — component-list search (conditional)
@@ -740,14 +764,30 @@ survive, (b) YAML is byte-stable across the two serializations (deterministic ke
 placement), (c) a non-polymorphic `List<float>`/`List<Material>` is byte-identical to pre-change output.
 DoD: the round-trip test passes (a/b/c); reorder/clear work in the editor.
 
-## EF16 — Nested drawing indents too far right (never fits)
-Implements the EF-LAYOUT model's depth/value-x rule (do FIRST of the layout trio). Root: `DrawNestedSlot
-:1973` uses `TreeNodeEx` → fixed ImGui indent per level; each level shrinks the value column until it clips.
-Fix: keep the value-field left edge at a FIXED x independent of nesting depth — depth indents only the
-label/foldout (small fixed indent), not the value column. So a `list → element → nested struct → field`
-chain keeps full-width value boxes at every depth.
+## EF16 — Nested drawing indents too far right (never fits) — ✅ DONE
+Implements the EF-LAYOUT model's depth/value-x rule (FIRST of the layout trio). Root: `DrawNestedSlot`/
+`DrawPolymorphicSlot` opened their body grid inside a `TreeNodeEx` whose full ImGui `IndentSpacing` marched
+BOTH columns right one step per level, AND the proportional 0.38/0.62 split re-shrank the value column each
+level → compounding "never fits".
+**✅ DONE.** Fix landed in `InspectorPanel.cs`: a new `DrawNestedBody(Action)` wraps each slot's body —
+(1) `Unindent(IndentSpacing)` cancels the TreeNode's full per-level indent for the body grid (so it no longer
+marches a big step right per level), (2) bumps a static `nestDepth` (restored in `finally`). The body grid is
+a new `BeginNestedGrid(id)` that uses a FIXED-width label column (`InspectorLayout.LabelColumnWidth(depth,
+valueLeft, s)`) instead of the proportional split, so the value column keeps a usable width at every depth;
+the SMALL per-depth label indent (`InspectorLayout.DepthIndentTotal`) is applied to the LABEL only, inside
+`Row`/`RowWithTooltip` (depth 0 → 0px → top-level + the ComponentPreviews/AssetInspectors shim rows, which
+never nest, stay byte-identical). **Pragmatic deviation from the EF-LAYOUT contract's "single panel-level
+value-x threaded down":** each nested foldout structurally renders INSIDE its parent's value cell (column 1),
+so the child grids don't share the panel content-left — a panel-global value-x physically can't hold across
+value-cell nesting. `BeginNestedGrid` recomputes the anchor from THAT grid's current available width each
+time; `ValueColumnLeft` clamps the label column to ≤62% of the current width, so the value box can never
+vanish however deep (the DoD). Added a supporting `EditorTheme.UiScale` token (effective DPI×UI scale,
+published by `ImGuiController.LoadFont`) so the static layout helpers convert pre-DPI metrics to px. The
+top-level proportional `BeginGrid` (`:2459`) is UNTOUCHED. Touched 3 files (`InspectorPanel.cs`,
+`EditorTheme.cs`, `ImGuiController.cs` — all mine). Build 0-error, oracle EXIT=0 (18 suites).
 DoD: a 4-deep nested structure still shows readable value boxes within the panel width; one extra level
-doesn't push values off-screen.
+doesn't push values off-screen. **Visual verify (human screenshot) batched into the Inspector-layout set —
+NOT relaunch-looped (GPU-hang rule).**
 
 ---
 

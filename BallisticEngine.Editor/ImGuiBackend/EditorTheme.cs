@@ -32,6 +32,12 @@ internal static class EditorTheme {
     // are multiples of it (see ImGuiController.LoadFont). 16.5 matches the historical single size.
     public static float BodySize { get; internal set; } = 16.5f;
 
+    // Effective UI scale (monitor DPI × the user's UI-scale pref), published by ImGuiController.LoadFont on
+    // every atlas (re)build so static layout helpers can convert their PRE-DPI design metrics to screen px
+    // without plumbing the ImGuiController instance through. EF16: InspectorLayout's column metrics
+    // (PreferredLabelWidth=132 etc.) are pre-DPI and multiply by this. 1.0 until the first LoadFont runs.
+    public static float UiScale { get; internal set; } = 1f;
+
     // Semantic size multipliers off BodySize (one place to retune the scale).
     // EF5i: the component/section headers read TOO BIG to the user. HeaderScale pulled back 1.20→1.05 — the
     // component header (Calibri BOLD) now sits just a hair above body size, distinguished mainly by WEIGHT +

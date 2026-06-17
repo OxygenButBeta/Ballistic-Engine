@@ -1064,6 +1064,11 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // internal (RW1.4): the relocated DataAssetInspector body (Inspector/AssetInspectors/) reflects a
     // DataAsset through this same member list via ctx.Panel.DrawMemberList — byte-identical to the inline call.
     internal void DrawMemberList(Type type, object target) {
+        // EF16: defensively re-seat the nesting depth to 0 at the top of each component's member list, in case
+        // a prior component's recursion was unwound by a caught draw exception (DrawNestedBody's finally
+        // restores it on the normal path; this is belt-and-braces against a throw escaping that).
+        nestDepth = 0;
+
         var gridOpen = false;
         var gridIndex = 0;       // each sub-table (split by Header/Space/foldout) needs a unique id
         string currentGroup = null;  // active [FoldoutGroup] name
@@ -1896,7 +1901,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         if (ImGui.TreeNodeEx($"{Prettify(actual.Name)}###polybody_{p.Name}",
                 ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.SpanAvailWidth)) {
             object boundInstance = instance; // capture for the per-member apply delegates
-            if (BeginGrid($"##polymembers_{p.Name}_{actual.Name}")) {
+            // EF16: draw the body grid one depth deeper with the TreeNode's full indent cancelled + a
+            // fixed-width label column, so the value boxes keep full width at every nesting level.
+            DrawNestedBody(() => {
+            if (BeginNestedGrid($"##polymembers_{p.Name}_{actual.Name}")) {
                 foreach (MemberInfo member in ComponentReflection.InspectorMembers(actual)) {
                     MemberAttributes attrs = MemberAttributes.For(member);
                     // [ShowIf]/[HideIf] at this level too (same skip DrawMemberList does for top-level members).
@@ -1917,6 +1925,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                 }
                 ImGui.EndTable();
             }
+            });
             ImGui.TreePop();
         }
     }
@@ -1978,7 +1987,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         if (ImGui.TreeNodeEx($"{Prettify(declaredType.Name)}###nestedbody_{p.Name}",
                 ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.SpanAvailWidth)) {
             object boundInstance = instance;    // capture for the per-member apply delegates (boxed for a struct)
-            if (BeginGrid($"##nestedmembers_{p.Name}_{actual.Name}")) {
+            // EF16: body grid drawn one depth deeper with the TreeNode's full indent cancelled + fixed-width
+            // label column, so the value boxes keep full width at every nesting level (see DrawNestedBody).
+            DrawNestedBody(() => {
+            if (BeginNestedGrid($"##nestedmembers_{p.Name}_{actual.Name}")) {
                 foreach (MemberInfo member in ComponentReflection.InspectorMembers(actual)) {
                     MemberAttributes attrs = MemberAttributes.For(member);
                     if (!Conditions.Visible(attrs.Conditionals, boundInstance))
@@ -1993,6 +2005,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                 }
                 ImGui.EndTable();
             }
+            });
             ImGui.TreePop();
         }
     }
@@ -2453,6 +2466,60 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         return true;
     }
 
+    // EF16 — nested-grid layout state. The inspector recurses through DrawNestedSlot / DrawPolymorphicSlot
+    // (a struct/class/[SerializeReference] member draws its own members in a child grid). The OLD behaviour
+    // put each child grid inside a TreeNode's full IndentSpacing (~21px) that marched the WHOLE table — BOTH
+    // columns — right one full step per level AND the proportional 0.38/0.62 split re-shrank the value column
+    // at every level, so a `list → element → struct → field` chain pushed the value box off the panel within
+    // a few levels (the "never fits" report). `nestDepth` carries the current nesting depth through the
+    // synchronous, single-threaded recursion (no reentrancy — drawing is one pass per frame); 0 == a
+    // top-level component member, bumped by DrawNestedBody around each slot's body.
+    static int nestDepth;
+
+    // EF16: a child grid for a nested member's body. The EF-LAYOUT fix has two halves:
+    //   (1) DrawNestedBody cancels the TreeNode's full per-level IndentSpacing so the grid does NOT march one
+    //       big step right per level (the value box stops being shoved off-screen);
+    //   (2) the grid uses a FIXED-width label column (NOT the proportional 0.38/0.62 split) computed from the
+    //       layout model so the value column keeps a usable width at every depth, with only a SMALL fixed
+    //       per-depth indent applied to the LABEL (in Row/RowWithTooltip), never the value column.
+    // The anchor is recomputed from THIS grid's available width each time rather than threaded from a single
+    // panel-level x: structurally each nested foldout renders INSIDE its parent's value cell (column 1), so
+    // the grids do not share the panel content-left and a panel-global value-x cannot hold across value-cell
+    // nesting. ValueColumnLeft clamps the label column to ≤62% of the current width, so the value box can
+    // never vanish however deep the nesting goes — which is exactly the DoD ("one extra level doesn't push
+    // values off-screen"). The top-level proportional BeginGrid (:2459) is untouched → depth-0 byte-identical.
+    static bool BeginNestedGrid(string id) {
+        float s = EditorTheme.UiScale;
+        float valueLeft = Inspector.InspectorLayout.ValueColumnLeft(ImGui.GetContentRegionAvail().X, s);
+
+        if (!ImGui.BeginTable(id, 2, ImGuiTableFlags.SizingFixedFit | ImGuiTableFlags.PadOuterX))
+            return false;
+        // LabelColumnWidth subtracts the small per-depth label indent so the value field's left edge resolves
+        // back to `valueLeft` even though Row/RowWithTooltip indent the label text by DepthIndentTotal.
+        float labelW = Inspector.InspectorLayout.LabelColumnWidth(nestDepth, valueLeft, s);
+        ImGui.TableSetupColumn("label", ImGuiTableColumnFlags.WidthFixed, labelW);
+        ImGui.TableSetupColumn("value", ImGuiTableColumnFlags.WidthStretch, 1f);
+        ResetRowZebra();
+        return true;
+    }
+
+    // EF16: run `body` as a nested member foldout one depth deeper, with the TreeNode's full IndentSpacing
+    // CANCELLED for the body (the model indents the label by a small fixed step inside the grid instead, so
+    // the value column never marches right). Keeps the foldout header at its natural position; only the body
+    // (the child grid) is pulled back to the panel content-left. Symmetric Unindent/Indent so a deep chain
+    // never leaves the cursor mis-indented. `nestDepth` is bumped for the duration so the child grid + its
+    // row labels resolve their column width / label indent at the correct depth.
+    static void DrawNestedBody(Action body) {
+        float indent = ImGui.GetStyle().IndentSpacing;
+        ImGui.Unindent(indent);              // cancel the TreeNode's full per-level indent for the body grid
+        nestDepth++;
+        try { body(); }
+        finally {
+            nestDepth--;
+            ImGui.Indent(indent);
+        }
+    }
+
     // Starts a new label/value row and leaves the cursor in the value column.
     // internal (RW1.1): the relocated RendererPreview body (Inspector/Preview/) calls this to draw its
     // submesh-material rows inside a BeginGrid table.
@@ -2465,12 +2532,24 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         RowChrome();
         ImGui.TableSetColumnIndex(0);
         ImGui.AlignTextToFramePadding();
+        // EF16: at a nested depth the TreeNode's full per-level indent was cancelled (DrawNestedBody) and the
+        // model re-applies a SMALL fixed indent on the LABEL only, so nesting still reads while the value
+        // column stays at the panel-level x. Depth 0 (top-level / shim rows) = no indent → byte-identical.
+        float labelIndent = LabelDepthIndent();
+        if (labelIndent > 0f) ImGui.Indent(labelIndent);
         ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.RowLabel);
         ImGui.TextUnformatted(label);
         ImGui.PopStyleColor();
+        if (labelIndent > 0f) ImGui.Unindent(labelIndent);
         ImGui.TableSetColumnIndex(1);
         ImGui.SetNextItemWidth(-1);
     }
+
+    // EF16: the small fixed label indent for the CURRENT nesting depth (0 at the top level → 0 px, so the
+    // top-level / shim rows are byte-identical). Reads InspectorLayout's DepthIndent so the indent step lives
+    // in the one layout model EF16/EF11/EF10 share.
+    static float LabelDepthIndent() =>
+        Inspector.InspectorLayout.DepthIndentTotal(nestDepth, EditorTheme.UiScale);
 
     // Like Row, but appends a "(?)" marker that shows the tooltip on hover (when one is supplied).
     static void RowWithTooltip(string label, string tooltip) {
@@ -2478,6 +2557,9 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         RowChrome();
         ImGui.TableSetColumnIndex(0);
         ImGui.AlignTextToFramePadding();
+        // EF16: small fixed label indent at nested depth (0 at top level → byte-identical). See Row().
+        float labelIndent = LabelDepthIndent();
+        if (labelIndent > 0f) ImGui.Indent(labelIndent);
         ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.RowLabel);
         ImGui.TextUnformatted(label);
         ImGui.PopStyleColor();
@@ -2493,6 +2575,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip(tooltip);
         }
+        if (labelIndent > 0f) ImGui.Unindent(labelIndent);
         ImGui.TableSetColumnIndex(1);
         ImGui.SetNextItemWidth(-1);
     }

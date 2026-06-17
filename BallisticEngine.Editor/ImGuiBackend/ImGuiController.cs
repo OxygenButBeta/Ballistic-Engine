@@ -112,6 +112,7 @@ internal sealed class ImGuiController : IDisposable {
         float baseSize = 15.5f;
         float size = MathF.Round(baseSize * scale);
         EditorTheme.BodySize = size;
+        EditorTheme.UiScale = scale;   // EF16: published so static layout helpers convert pre-DPI metrics to px
 
         // Resolve the regular/bold pair: prefer Calibri, fall back to Inter (Regular + SemiBold), then default.
         bool haveCalibri = File.Exists(calibri);
