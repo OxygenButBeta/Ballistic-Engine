@@ -19,6 +19,9 @@ public sealed class DirectXRenderAsset : RenderAsset {
         // concurrent resource creation the engine's worker-thread asset loading does (it spuriously
         // E_FAILs CreateCommittedResource). Opt in with BALLISTIC_DX12_DEBUG=1 for single-threaded debugging.
         bool debugLayer = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DEBUG") == "1";
+        // GPU-Based Validation REQUIRES the debug layer; requesting GBV without it would be a silent no-op.
+        // So BALLISTIC_DX12_GBV=1 implies the debug layer is on (the device reads BALLISTIC_DX12_GBV itself).
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_GBV") == "1") debugLayer = true;
         device = new Dx12Device(enableDebugLayer: debugLayer);
         Dx12Backend.Initialize(device);
 

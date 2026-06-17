@@ -98,11 +98,41 @@ public sealed class Dx12Device : IDisposable {
     readonly System.Threading.AutoResetEvent uploadEvent = new(false);
 
     public Dx12Device(bool enableDebugLayer = true) {
+        // GPU-Based Validation (GBV) — the deterministic gate for the BARRIER/STATE bug class the
+        // pass-graph migration relies on (W1 of the dx12-passgraph plan). GBV validates each resource's
+        // state AT EACH GPU-timeline USE, catching wrong/missing barriers that leave THIS frame visually
+        // clean (the silent class that ships). It REQUIRES the debug layer, is SLOW (10-100x), and can
+        // trip the TDR watchdog into a false device-removal — so it's strictly opt-in (BALLISTIC_DX12_GBV=1)
+        // and never default. (DirectXRenderAsset forces the debug layer on whenever GBV is requested so it
+        // isn't silently a no-op.) See [[gpu-hang-launch-safety]] re: GBV-induced false removals.
+        gbvEnabled = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GBV") == "1";
+
         // Debug layer first (must precede device creation) — catches the silent device-removals that
         // are the classic DX12 crash. On by default in Debug; harmless if the SDK layer is absent.
         if (enableDebugLayer && D3D12GetDebugInterface(out ID3D12Debug debug).Success) {
             debug.EnableDebugLayer();
+            // GBV is configured through the ID3D12Debug1 facet of the SAME debug interface (queried before
+            // it's disposed). Guarded — the facet/GBV may be absent on an old runtime; a failure must not
+            // block device creation (the debug layer is already enabled either way).
+            if (gbvEnabled) {
+                try {
+                    using var debug1 = debug.QueryInterfaceOrNull<ID3D12Debug1>();
+                    if (debug1 is not null) {
+                        debug1.SetEnableGPUBasedValidation(true);
+                        // Synchronized command-queue validation also catches cross-queue state hazards
+                        // (cheap relative to GBV itself; harmless on the single graphics queue we use today).
+                        debug1.SetEnableSynchronizedCommandQueueValidation(true);
+                        Console.WriteLine("[DX12] GPU-Based Validation: ENABLED (BALLISTIC_DX12_GBV=1) — slow; opt-in verification only.");
+                    } else {
+                        Console.WriteLine("[DX12] GPU-Based Validation requested but ID3D12Debug1 is unavailable on this runtime — skipped.");
+                    }
+                } catch (Exception e) {
+                    Console.WriteLine("[DX12] GPU-Based Validation setup failed (continuing without it): " + e.Message);
+                }
+            }
             debug.Dispose();
+        } else if (gbvEnabled) {
+            Console.WriteLine("[DX12] BALLISTIC_DX12_GBV=1 but the debug layer is not enabled/available — GBV is a no-op. Run with the debug layer (DirectXRenderAsset forces it when GBV is set).");
         }
         // (D3D12GetDebugInterface<T>(out T) is the Result overload — checked above.)
 
@@ -179,11 +209,27 @@ public sealed class Dx12Device : IDisposable {
         frameFenceTargets = new ulong[FramesInFlight];   // all 0 → the first N BeginFrames never wait (slots fresh)
 
         // Debug info queue (if the debug layer loaded): lets us print the REAL D3D12 message text on an
-        // E_FAIL instead of the opaque HRESULT. Stored-message log only; no break-on-error.
+        // E_FAIL instead of the opaque HRESULT. Stored-message log by default.
         if (enableDebugLayer)
             infoQueue = Device.QueryInterfaceOrNull<ID3D12InfoQueue>();
+
+        // W4 — FAIL LOUD: break into the debugger / throw at the offending call site on a NEW state error,
+        // so a barrier/state bug stops the run instead of scrolling past in the stored log. Opt-in
+        // (BALLISTIC_DX12_BREAK_ON_ERROR=1) and SEPARATE from GBV: chunk 0 only wires the mechanism. The
+        // baseline allowlist (W2 — "break only on messages NOT in the captured baseline") is a later chunk;
+        // until then break-on-error trips on pre-existing benign noise, so it stays OFF by default and the
+        // GBV verification run does NOT enable it (GBV stores+prints messages without breaking). When on,
+        // we break on Corruption + Error (the state class); Warnings stay non-breaking.
+        breakOnError = Environment.GetEnvironmentVariable("BALLISTIC_DX12_BREAK_ON_ERROR") == "1";
+        if (breakOnError && infoQueue is not null) {
+            infoQueue.SetBreakOnSeverity(MessageSeverity.Corruption, true);
+            infoQueue.SetBreakOnSeverity(MessageSeverity.Error, true);
+            Console.WriteLine("[DX12] Info-queue break-on-error: ENABLED (BALLISTIC_DX12_BREAK_ON_ERROR=1) — breaks on Corruption/Error. NOTE: no baseline allowlist yet, so pre-existing benign messages will also break.");
+        }
     }
 
+    readonly bool gbvEnabled;     // BALLISTIC_DX12_GBV=1 — GPU-Based Validation active (requires debug layer)
+    readonly bool breakOnError;   // BALLISTIC_DX12_BREAK_ON_ERROR=1 — info queue breaks on Corruption/Error
     readonly bool dredEnabled;
     // On a device-removal, report the GPU page-fault from DRED: a non-zero PageFaultVA means a GPU command
     // dereferenced freed/invalid memory (use-after-free / bad descriptor) — the decisive clue for a hang.
