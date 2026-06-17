@@ -420,6 +420,9 @@ public sealed class DX12HDRenderer : HDRenderer {
         // Fan the resize out to any pass that owns resolution-dependent targets. No-op while the graph is
         // empty (scaffold). Registration order matches the AllocXxx sequence above once passes populate it (R5).
         graph?.Resize(internalW, internalH);
+        // PHASE-3 (chunk 20): the feature blitter's scratch HDR copy follows the render res (it also self-sizes to
+        // the live SceneColor per-blit, so this is just to avoid a first-blit reallocation).
+        featureBlitter?.Resize(internalW, internalH);
     }
 
     void AllocFsrOutput() {
@@ -618,6 +621,11 @@ public sealed class DX12HDRenderer : HDRenderer {
         // → the compiler culls it every graph frame, exercising the culler. It NEVER records (culled on the graph
         // path; Enabled=false on the list path) → byte-neutral in both. Event=BeforeShadows(0) → ordering-inert.
         graph.Add(new Dx12CullProbePass());
+        // PHASE-3 (chunk 20): mark the BUILT-IN boundary — everything Add'd above is core. Authored render-feature
+        // adapters are appended AFTER this by the bridge (Dx12RenderFeatureBridge → graph.SetFeaturePasses) when a
+        // scene has a RenderFeatures SceneBehaviour. With no features the boundary == registered.Count, so the
+        // graph is exactly the built-in set → byte-identical to the feature-free golden path (pixel-neutral default).
+        graph.MarkCoreBoundary();
         graph.Build();
         // chunk 12: COMPILE the V1 dependency graph (DAG → cull → topo order). Pure CPU bookkeeping, no GPU work
         // — V1 maps handles 1:1 to existing concrete targets (no pooling). The compiled order is what
@@ -693,6 +701,15 @@ public sealed class DX12HDRenderer : HDRenderer {
             Console.Error.WriteLine("[DX12] Render graph (phase-2 V2): TRANSIENT ALIASING active (BALLISTIC_DX12_GRAPH_ALIAS=1).");
             Console.Error.WriteLine(rtPool.PlanReport);
         }
+
+        // PHASE-3 (chunk 20): the render-FEATURE bridge — the engine→backend seam for authored RenderFeatures (the
+        // mirror of the volume bridge). The blitter owns the proof feature's full-screen GPU work; the recorder is
+        // the backend-agnostic verb surface a feature.Record drives; the bridge gathers active features per frame
+        // and, only when the set changes, builds Dx12FeaturePassAdapters and graph.SetFeaturePasses them. Inert for
+        // feature-free scenes (Gather()==0 → SameAsLast → no-op), so the golden scenes are byte-identical.
+        featureBlitter = new Dx12FeatureBlitter(dev, targetW, targetH);
+        featureRecorder = new Dx12FeaturePassRecorder(featureBlitter);
+        featureBridge = new Dx12RenderFeatureBridge(graph, featureRecorder);
     }
 
     Dx12GpuDrivenRenderer gpuDriven;
@@ -711,6 +728,14 @@ public sealed class DX12HDRenderer : HDRenderer {
     // graph.Compile() can build a dependency DAG, cull, and derive a topo order; graph.ExecuteGraph(ctx) runs
     // THAT order. Built once (stable order, R1). Resize fans out to it (R5-ordered).
     Dx12RenderGraph graph;
+    // PHASE-3 (chunk 20): the authored-render-feature seam. featureBridge gathers the active RenderFeatures each
+    // frame (RenderFeatureManager) and, when the set changes, rebuilds the graph's feature-pass segment; featureBlitter
+    // owns the proof feature's GPU blit; featureRecorder is the backend-agnostic verb surface a feature.Record drives.
+    // All inert (no graph passes added) when no scene has a RenderFeatures SceneBehaviour → feature-free golden scenes
+    // are byte-identical.
+    Dx12FeatureBlitter featureBlitter;
+    Dx12FeaturePassRecorder featureRecorder;
+    Dx12RenderFeatureBridge featureBridge;
     // PHASE 2 V1 door: BALLISTIC_DX12_GRAPH=1 → run the COMPILED graph order (graph.ExecuteGraph) instead of the
     // phase-1 event-sort (graph.Execute). Default OFF → the proven phase-1 list runs unchanged (byte-identical to
     // the frozen golden set). The compiled order is provably == the event-sort order (PQ keyed (event,regIdx) +
@@ -1518,6 +1543,12 @@ public sealed class DX12HDRenderer : HDRenderer {
         // EACH TIME a different placed resource starts using shared memory, not once per frame. So nothing is
         // emitted here; the barrier lives WITH its consuming pass (the same Decision-4 principle as the head
         // transitions). Default off (aliasPath false) → PoolBarrier is a no-op (Active is null).
+
+        // PHASE-3 (chunk 20): the render-feature bridge — gather active authored RenderFeatures and, ONLY when the
+        // set changed, rebuild the graph's feature-pass segment (mirrors the volume bridge above). Must run BEFORE
+        // Execute/ExecuteGraph (it may re-Build/re-Compile the graph). A NO-OP for feature-free scenes (Gather()==0
+        // every frame → the graph stays the built-in set → byte-identical to golden), so it's unconditional here.
+        featureBridge.Apply();
 
         if (graphPath) graph.ExecuteGraph(ctx);
         else graph.Execute(ctx);

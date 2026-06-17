@@ -28,6 +28,11 @@ public sealed class Dx12RenderGraph {
     IRenderPass[] ordered = Array.Empty<IRenderPass>();
     bool built;
 
+    // PHASE-3 (chunk 20): the count of BUILT-IN passes registered before MarkCoreBoundary(). Authored render
+    // features (Dx12FeaturePassAdapter) are appended AFTER this boundary and can be swapped wholesale by
+    // SetFeaturePasses when the active-feature set changes — without disturbing the built-ins.
+    int coreCount = -1;
+
     // Phase-2 V1 compiler state (built by Compile(); used by ExecuteGraph). Null until first Compile().
     IRenderPass[] graphOrder;                         // the topo order ExecuteGraph runs
     Dx12GraphResources graphResources;
@@ -64,6 +69,28 @@ public sealed class Dx12RenderGraph {
     public void Build() {
         ordered = registered.OrderBy(p => (int)p.Event).ToArray();   // STABLE — R1
         built = true;
+    }
+
+    // PHASE-3 (chunk 20): snapshot the current registration count as the BUILT-IN boundary. Call once after all
+    // the built-in graph.Add()s (before Build/Compile). Everything registered up to here is core; SetFeaturePasses
+    // appends/replaces feature adapters after it.
+    public void MarkCoreBoundary() => coreCount = registered.Count;
+
+    // PHASE-3 (chunk 20): replace the authored-feature segment (everything after the core boundary) with `features`
+    // and re-Build + re-Compile. The bridge calls this ONLY when the active-feature set actually changes (the
+    // per-frame compare is in Dx12RenderFeatureBridge), so the recompile is rare CPU work. With an EMPTY feature
+    // list this restores the exact built-in graph → byte-identical to the no-feature golden path (the pixel-neutral
+    // default). Registration order is preserved (core first, then features in authored order) so the stable
+    // (event, registrationIndex) tiebreak is unchanged for the built-ins.
+    public void SetFeaturePasses(IReadOnlyList<IRenderPass> features) {
+        if (coreCount < 0) coreCount = registered.Count;   // no boundary marked → treat all-current as core (safety)
+        if (registered.Count > coreCount) registered.RemoveRange(coreCount, registered.Count - coreCount);
+        if (features != null)
+            for (int i = 0; i < features.Count; i++) registered.Add(features[i]);
+        built = false;
+        graphOrder = null;     // invalidate the compiled graph
+        Build();
+        Compile();
     }
 
     public IReadOnlyList<IRenderPass> Passes => ordered;
