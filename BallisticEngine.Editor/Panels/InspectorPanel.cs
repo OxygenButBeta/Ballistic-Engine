@@ -73,6 +73,12 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         // so the stack resolves them like any primitive and the if/else chain dissolves. They are ImGui-using
         // editor drawers (NOT in CreatePrimitive, which stays headless), registered AFTER the primitives so
         // last-wins resolution prefers them for their (disjoint) types.
+        // G4-editor (ch24): a plain nested struct/class member gets the recursive member foldout (was a dead
+        // (NestedFoo) Unsupported label). Registered FIRST among the editor drawers so the special CLASS
+        // widgets below (BEvent/AnimationCurve/ColorGradient are plain classes -> they too classify Nested)
+        // WIN by last-registered-wins -- this drawer is the true fallback for a class/struct with no dedicated
+        // drawer.
+        memberRegistry.Register(new NestedDrawer(this));
         memberRegistry.Register(new BEventDrawer());
         memberRegistry.Register(new AnimationCurveDrawer(this));
         memberRegistry.Register(new ColorGradientDrawer(this));
@@ -119,6 +125,9 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // G3-editor (ch23): the PolymorphicDrawer terminal drawer hands its IProperty + declared base type here;
     // render the implementor dropdown + recursive member foldout.
     void IComponentInspectorHost.DrawPolymorphicSlot(Inspector.IProperty property, Type declaredType) => DrawPolymorphicSlot(property, declaredType);
+    // G4-editor (ch24): the NestedDrawer terminal drawer hands its IProperty + declared type here; render the
+    // recursive member foldout (with struct write-back for value-type instances).
+    void IComponentInspectorHost.DrawNestedSlot(Inspector.IProperty property, Type declaredType) => DrawNestedSlot(property, declaredType);
 
     public void DrawContents() {
         ImGui.PushID(instanceId);   // namespace all ids so a 2nd Inspector window doesn't collide
@@ -2066,6 +2075,69 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         EditorUndo.Push($"Set {p.Label}");
         p.Set(instance);
         state.MarkViewportDirty();
+    }
+
+    // editor-rework G4-editor (ch24, Rule 2): the recursive nested struct/class editor (the parallel of
+    // DrawPolymorphicSlot, but the type is FIXED -- the declared type IS the concrete type, so there is no
+    // implementor dropdown, just the member foldout). Renders, inside the value column the BeginRow opened:
+    //   (1) for a CLASS member that is null, lazily Activator-creates + writes back the instance so it is
+    //       editable (a struct member is a value type -> never null, so this only fires for a reference type
+    //       with a public parameterless ctor; one without is left as the dead label, like the polymorphic
+    //       drawer's None). The lazy create is a one-time structural change -> return + redraw next frame.
+    //   (2) a foldout whose body draws the instance's members RECURSIVELY through the SAME component drawer
+    //       stack as a top-level member (componentStack.Draw(MemberProperty)) -- each child is a REAL reflected
+    //       member, so [Range]/[Tooltip]/[ShowIf]/[ReadOnly] work and a nested-in-nested member resolves THIS
+    //       drawer again (auto-recursion).
+    // ** STRUCT WRITE-BACK (the G4 fix ch20/21/23 deferred): the apply delegate writes the inner field on the
+    // instance, then writes the WHOLE instance back through the slot's property. For a CLASS the instance is a
+    // reference (the field write already landed; p.Set re-broadcasts + dirties). For a STRUCT the instance is a
+    // BOXED copy -- ComponentReflection.SetValue mutates the box, and p.Set(boxedInstance) unboxes it back into
+    // the parent member (the value-type write-back). The SAME code path serves both because p.Set always writes
+    // the boxed/referenced instance up the chain (-> ApplyMember broadcast + dirty), exactly like a primitive.
+    void DrawNestedSlot(Inspector.IProperty p, Type declaredType) {
+        object instance = p.Get();
+
+        // A null CLASS member: lazily build it so its members are editable (a struct value is never null). A
+        // type with no public parameterless ctor stays the dead label (Activator throws -> caught -> Unsupported).
+        if (instance is null) {
+            if (declaredType.IsValueType) {
+                // Defensive: a boxed value type read should never be null, but if a sibling target's value is
+                // null (multi-select) fall back to a fresh default so the foldout still draws.
+                instance = Activator.CreateInstance(declaredType);
+            } else {
+                object created;
+                try { created = Activator.CreateInstance(declaredType); }
+                catch { ImGui.TextDisabled($"({Prettify(declaredType.Name)})"); return; }
+                EditorUndo.Push($"Set {p.Label}");
+                p.Set(created);                 // structural change: the member is no longer null
+                state.MarkViewportDirty();
+                return;                         // redraw next frame against the new instance
+            }
+        }
+
+        Type actual = instance.GetType();
+        // Draw the instance's members in a collapsible foldout (the recursion). The members go in their own
+        // nested grid so the shared stack's BeginRow (TableNextRow) has an open table to write into.
+        if (ImGui.TreeNodeEx($"{Prettify(declaredType.Name)}###nestedbody_{p.Name}",
+                ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.SpanAvailWidth)) {
+            object boundInstance = instance;    // capture for the per-member apply delegates (boxed for a struct)
+            if (BeginGrid($"##nestedmembers_{p.Name}_{actual.Name}")) {
+                foreach (MemberInfo member in ComponentReflection.InspectorMembers(actual)) {
+                    MemberAttributes attrs = MemberAttributes.For(member);
+                    if (!Conditions.Visible(attrs.Conditionals, boundInstance))
+                        continue;
+                    MemberInfo capturedMember = member;
+                    componentStack.Draw(new Inspector.MemberProperty(capturedMember, boundInstance,
+                        v => {
+                            ComponentReflection.SetValue(capturedMember, boundInstance, v);
+                            p.Set(boundInstance);   // chain the WHOLE instance up (struct: unbox write-back; class: re-broadcast)
+                            state.MarkViewportDirty();
+                        }), componentGui);
+                }
+                ImGui.EndTable();
+            }
+            ImGui.TreePop();
+        }
     }
 
     // Accepts a Hierarchy entity-drag payload (int = entity InstanceId hash, set by HierarchyPanel's

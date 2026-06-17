@@ -274,3 +274,33 @@ public sealed class PolymorphicDrawer : ITypeDrawer {
         return false;
     }
 }
+
+// editor-rework G4-editor (ch24): the VISIBLE half of the nested struct/class round-trip (the engine half --
+// SerializeNestedInstance / TryDeserializeNestedInstance -- landed in ch24, so a plain nested member now
+// round-trips its members + STRUCT inner-field write-back instead of dropping to null). Terminal drawer for a
+// member whose declared type is a plain concrete class or a non-primitive struct (PropertyCategory.Nested).
+// Before this it matched no drawer (no primitive / enum / math / asset / collection / dict / polymorphic
+// drawer matches a plain class/struct) and fell to TypeDrawerTerminalStep -> gui.Unsupported -> a dead
+// `(NestedSettings)` / `(NestedConfig)` disabled label. Now it routes to the host's nested slot: a FOLDOUT
+// that draws the instance's members RECURSIVELY through the SAME member pipeline (so a nested-in-nested member
+// auto-recurses through this same drawer, and a nested [SerializeReference] / collection / ref member resolves
+// its own terminal drawer).
+//
+// CanDraw STRATEGY: delegate to PropertyCategories.Classify (the ENGINE classification the codec keys its
+// Nested branch off, so the drawer and serializer agree by construction). Classify == Nested is true for a
+// concrete class or non-primitive struct that is NOT a primitive / enum / math struct (Vector*/Quaternion/
+// Color) / BObject asset / EntityRef/ComponentRef / collection / dictionary / [SerializeReference]
+// abstract-or-interface -- every one of which already has its own terminal drawer. The remaining overlap is
+// the editor's special CLASS widgets BEvent / AnimationCurve / ColorGradient (plain classes -> they also
+// classify Nested): registering NestedDrawer BEFORE those three (see InspectorPanel ctor) lets their drawers
+// WIN by last-registered-wins, so this drawer only ever resolves a member with no dedicated drawer (the true
+// fallback). The host owns undo / dirty on an actual inner-field edit.
+public sealed class NestedDrawer : ITypeDrawer {
+    readonly IComponentInspectorHost host;
+    public NestedDrawer(IComponentInspectorHost host) => this.host = host;
+    public bool CanDraw(Type t) => PropertyCategories.Classify(t) == PropertyCategory.Nested;
+    public bool Draw(IProperty p, IInspectorGui gui) {
+        host.DrawNestedSlot(p, p.ValueType);
+        return false;
+    }
+}

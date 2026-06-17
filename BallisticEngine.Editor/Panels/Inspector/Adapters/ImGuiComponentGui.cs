@@ -62,6 +62,18 @@ public interface IComponentInspectorHost {
     // pushes one undo per type change. declaredType is passed explicitly (the IProperty's ValueType is the
     // abstract/interface base; the dropdown queries TypeCache against it).
     void DrawPolymorphicSlot(IProperty property, Type declaredType);
+
+    // editor-rework G4-editor (ch24, the visible half of the nested struct/class round-trip; engine codec done
+    // in ch24): the nested terminal drawer (NestedDrawer) routes a plain concrete-class / non-primitive-struct
+    // member here. The host renders a FOLDOUT that draws the instance's members RECURSIVELY through the SAME
+    // member pipeline (so range / conditional / tooltip attributes work and a nested-in-nested member auto-
+    // recurses) in place of the dead `(NestedSettings)` disabled label these members fell to via
+    // gui.Unsupported. Mirrors the DrawPolymorphicSlot host-method shape; the host unwraps the IProperty, reads
+    // the instance (Activator-creating a missing CLASS instance so an unset member is editable), draws each
+    // member, and -- the G4 difference -- for a STRUCT instance (value type) writes the BOXED instance back up
+    // through the slot's property after each inner-field edit (struct write-back), pushing one undo per edit.
+    // declaredType is the member's declared type (the concrete type to instantiate when the value is null).
+    void DrawNestedSlot(IProperty property, Type declaredType);
 }
 
 public sealed class ImGuiComponentGui : IInspectorGui {
