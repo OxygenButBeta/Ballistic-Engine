@@ -167,10 +167,15 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             // Multi-selection banner (Unity-style): edit the active entity, with a note that batch
             // hierarchy actions (delete/duplicate/reparent) apply to all selected.
             if (state.SelectedEntities.Count > 1) {
-                ImGui.TextDisabled($"{EditorIcons.Package}  {state.SelectedEntities.Count} entities selected");
+                // RW4: the selection count reads as a small accent chip (badge) instead of inline grey text,
+                // so the multi-edit state is glanceable; the explanatory line + divider stay below.
+                ImGui.AlignTextToFramePadding();
+                ImGui.TextDisabled($"{EditorIcons.Package}");
+                ImGui.SameLine(0, 6);
+                SysVec4 accent = EditorPrefs.Current.Accent;
+                EditorDecoration.DrawBadge($"{state.SelectedEntities.Count} entities", new SysVec4(accent.X, accent.Y, accent.Z, 0.30f));
                 ImGui.TextDisabled("Edits apply to ALL selected (matching components).");
-                ImGui.Separator();
-                ImGui.Spacing();
+                EditorDecoration.DrawDivider();
             }
             // Scoped undo: ONLY for a single-entity selection (a multi-selection edit broadcasts to
             // several entities, so it must take a full-scene snapshot to undo them all together).
@@ -223,10 +228,21 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         }
     }
 
-    // Centered hint when nothing is selected, instead of a lone text line in the corner.
+    // Centered hint when nothing is selected, instead of a lone text line in the corner. RW4 (Phase E): the
+    // prompt sits inside a faint empty-state card so the panel reads as a crafted surface, not a bare void.
     static void DrawEmptyState() {
         SysVec2 avail = ImGui.GetContentRegionAvail();
-        ImGui.Dummy(new SysVec2(0, avail.Y * 0.38f));
+        SysVec2 origin = ImGui.GetCursorScreenPos();
+        // Card spans the content width, centered vertically-ish around the prompt block.
+        float cardTop = avail.Y * 0.30f;
+        float cardH = MathF.Min(avail.Y * 0.42f, 150f);
+        float inset = 14f;
+        SysVec2 cardMin = new(origin.X + inset, origin.Y + cardTop);
+        SysVec2 cardMax = new(origin.X + avail.X - inset, origin.Y + cardTop + cardH);
+        if (cardMax.X > cardMin.X + 8 && cardMax.Y > cardMin.Y + 8)
+            EditorDecoration.DrawEmptyCard(cardMin, cardMax);
+
+        ImGui.Dummy(new SysVec2(0, cardTop + cardH * 0.5f - 34f));
         CenteredIcon(EditorIcons.Search, 34f, new SysVec4(1, 1, 1, 0.08f));
         ImGui.Spacing();
         CenteredDisabledText("Nothing selected");
@@ -549,8 +565,11 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         float cardH = pad + row1H + 4 + ImGui.GetTextLineHeight() + pad;
         SysVec2 cardMax = cardMin + new SysVec2(avail.X, cardH);
 
-        draw.AddRectFilled(cardMin, cardMax, ImGui.GetColorU32(new SysVec4(1, 1, 1, 0.035f)), 6f);
-        draw.AddRect(cardMin, cardMax, ImGui.GetColorU32(new SysVec4(0, 0, 0, 0.45f)), 6f);
+        // RW4 (Phase E decoration): the entity-header card surface now comes from the shared
+        // EditorDecoration primitive (palette-fed) instead of two inline hex AddRectFilled/AddRect — same
+        // rect + rounding, so layout is byte-unchanged; the only delta is the border hue now tracks the
+        // theme hairline rather than a hard inline black, matching the component-header chrome.
+        EditorDecoration.DrawCard(cardMin, cardMax, 6f);
 
         // Big type icon on the left.
         (string icon, SysVec4 tint) = EditorIcons.ForEntity(entity);
@@ -767,7 +786,9 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         SysVec2 min = ImGui.GetItemRectMin();
         SysVec2 max = ImGui.GetItemRectMax();
         var draw = ImGui.GetWindowDrawList();
-        draw.AddRectFilled(min, new SysVec2(min.X + 3, max.Y), ImGui.GetColorU32(ImGuiCol.CheckMark));
+        // RW4: the accent stripe goes through the shared decoration primitive (same 3px geometry), keeping
+        // the CheckMark accent color this header has always used.
+        EditorDecoration.DrawAccentStripe(min, max.Y - min.Y, ImGui.GetStyle().Colors[(int)ImGuiCol.CheckMark]);
         draw.AddText(ImGuiController.Bold, ImGui.GetFontSize(),
             new SysVec2(min.X + labelX, min.Y + (max.Y - min.Y - ImGui.GetFontSize()) * 0.5f),
             ImGui.GetColorU32(ImGuiCol.Text), label);
@@ -996,8 +1017,9 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         float headerH = max.Y - min.Y;
         var draw = ImGui.GetWindowDrawList();
 
-        // Category stripe down the left edge.
-        draw.AddRectFilled(min, new SysVec2(min.X + 3, max.Y), ImGui.GetColorU32(tint));
+        // Category stripe down the left edge. RW4: drawn via the shared EditorDecoration primitive (same
+        // 3px geometry as before) so the component-header stripe and any card-with-stripe use ONE source.
+        EditorDecoration.DrawAccentStripe(min, headerH, tint);
 
         SysVec2 cursor = ImGui.GetCursorScreenPos();
 
