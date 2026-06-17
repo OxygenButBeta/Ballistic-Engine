@@ -70,12 +70,16 @@ internal static class EditorIcons {
     public static readonly SysVec4 AxisZ = new(0.29f, 0.56f, 0.88f, 1f);
 
     // Soft category tints used for entity/component icons so the UI reads at a glance.
-    public static readonly SysVec4 TintLight = new(0.98f, 0.83f, 0.45f, 1f);
-    public static readonly SysVec4 TintCamera = new(0.55f, 0.78f, 0.98f, 1f);
-    public static readonly SysVec4 TintMesh = new(0.70f, 0.76f, 0.86f, 1f);
-    public static readonly SysVec4 TintVolume = new(0.78f, 0.60f, 0.93f, 1f);
-    public static readonly SysVec4 TintSky = new(0.56f, 0.82f, 0.90f, 1f);
-    public static readonly SysVec4 TintGeneric = new(0.58f, 0.63f, 0.72f, 1f);
+    // EF5i: DESATURATED + warm-shifted off the old saturated cyan/blue/purple — the user flagged the bright
+    // cyan icons as clashing with the neutral-graphite + amber identity. Category hue distinction is KEPT
+    // (light=warm gold, camera=muted steel, volume=muted mauve, sky=muted teal-grey) but pulled toward low
+    // saturation so the icons read as a cohesive quiet palette against the warm-neutral chrome, not neon.
+    public static readonly SysVec4 TintLight = new(0.95f, 0.82f, 0.50f, 1f);   // warm gold (sits in the amber family)
+    public static readonly SysVec4 TintCamera = new(0.66f, 0.74f, 0.84f, 1f);  // muted steel-grey (was bright blue)
+    public static readonly SysVec4 TintMesh = new(0.74f, 0.76f, 0.79f, 1f);    // near-neutral light grey
+    public static readonly SysVec4 TintVolume = new(0.80f, 0.68f, 0.86f, 1f);  // muted mauve (kept distinct, desaturated)
+    public static readonly SysVec4 TintSky = new(0.68f, 0.79f, 0.80f, 1f);     // muted teal-grey (was bright cyan)
+    public static readonly SysVec4 TintGeneric = new(0.64f, 0.65f, 0.67f, 1f); // neutral grey
 
     // Icon + tint describing an entity by its "most interesting" component (Unity-style).
     public static (string icon, SysVec4 tint) ForEntity(Entity entity) {

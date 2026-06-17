@@ -33,16 +33,22 @@ internal static class EditorTheme {
     public static float BodySize { get; internal set; } = 16.5f;
 
     // Semantic size multipliers off BodySize (one place to retune the scale).
-    public const float DisplayScale = 1.62f;
-    public const float HeaderScale  = 1.12f;
+    // EF5i: the component/section headers read TOO BIG to the user. HeaderScale pulled back 1.20→1.05 — the
+    // component header (Calibri BOLD) now sits just a hair above body size, distinguished mainly by WEIGHT +
+    // the accent stripe, not by a large size jump. Display (the entity-name title) also trimmed 1.62→1.40 so
+    // it stays a clear title without dominating.
+    public const float DisplayScale = 1.40f;
+    public const float HeaderScale  = 1.05f;
     public const float CaptionScale = 0.84f;
 
     // --- Drawer-row palette ---------------------------------------------------------------------------
     // The member LABEL was drawn with TextDisabled (the dead grey that made rows read as "off"). A real,
     // legible label color + a recessive caption color give the rows a proper hierarchy. Tuned to the
     // graphite palette in ImGuiController.ApplyColors.
-    public static readonly SysVec4 RowLabel   = new(0.82f, 0.85f, 0.90f, 1f);   // brighter than TextDisabled (>=10:1 on the deep base)
-    public static readonly SysVec4 RowCaption = new(0.57f, 0.61f, 0.69f, 1f);   // the "(?)" badge / hints
+    // EF5i: brightened — the user found the inspector text "too dim". RowLabel pushed up to near-primary so
+    // member labels read crisply; RowCaption lifted too so secondary hints/section labels aren't murky.
+    public static readonly SysVec4 RowLabel   = new(0.92f, 0.92f, 0.94f, 1f);   // neutral, near-primary (very legible on the deep base)
+    public static readonly SysVec4 RowCaption = new(0.70f, 0.70f, 0.73f, 1f);   // the "(?)" badge / hints / section labels — neutral grey, lifted
 
     // Hover-accent bar drawn at the LEFT edge of a hovered row (the affordance the flat rows lacked). Faint
     // fill across the row + a brighter accent sliver — one AddRectFilled each, hover-gated (cheap).
@@ -57,21 +63,22 @@ internal static class EditorTheme {
     // matches the panels WITHOUT re-typing hex constants in two places — the exact "koddan elle tanımlama"
     // duplication the rework fights. Values mirror ApplyColors' bg0..titleBg ramp byte-for-byte; if that ramp
     // is retuned, retune here too (a future E1 step folds ApplyColors onto these so they can't drift).
-    // EF5e — mirrors ImGuiController.ApplyColors' cool BLUE-slate ramp byte-for-byte (see note).
-    public static readonly SysVec4 Bg0         = Rgb(0x0C0E13);   // window background — deepest blue-charcoal
-    public static readonly SysVec4 Bg1         = Rgb(0x141822);   // child / popup / panel body — raised surface
-    public static readonly SysVec4 Bg2         = Rgb(0x1E2430);   // input frames (clearly lighter)
-    public static readonly SysVec4 Bg3         = Rgb(0x2B3340);   // hovered frames
-    public static readonly SysVec4 HeaderBg    = Rgb(0x222B3A);   // collapsing headers / selected tabs / title bands
-    public static readonly SysVec4 Text        = Rgb(0xEDEFF3);   // bright primary text
-    public static readonly SysVec4 TextDim     = Rgb(0x9098A6);   // disabled / secondary text
-    public static readonly SysVec4 Border      = Rgb(0x05070A);   // seam where one is still wanted
-    public static readonly SysVec4 BorderLight = Rgb(0x3A4150);   // subtle inner dividers
-    public static readonly SysVec4 TitleBg     = Rgb(0x0A0C0F);   // title bars
+    // EF5i — mirrors ImGuiController.ApplyColors' NEUTRAL graphite ramp byte-for-byte (see note). Pure neutral
+    // grey (R==G==B, zero blue bias) + a warm amber accent carry the identity — the blue-slate was rejected.
+    public static readonly SysVec4 Bg0         = Rgb(0x101012);   // window background / gutter — deep neutral charcoal
+    public static readonly SysVec4 Bg1         = Rgb(0x222226);   // child / popup / panel body — clearly raised surface
+    public static readonly SysVec4 Bg2         = Rgb(0x303035);   // input frames (clearly lighter)
+    public static readonly SysVec4 Bg3         = Rgb(0x42424A);   // hovered frames
+    public static readonly SysVec4 HeaderBg    = Rgb(0x36363B);   // collapsing headers / selected tabs / title bands
+    public static readonly SysVec4 Text        = Rgb(0xF2F3F4);   // bright primary text
+    public static readonly SysVec4 TextDim     = Rgb(0xA6A6AB);   // disabled / secondary text — lifted (was too dim)
+    public static readonly SysVec4 Border      = Rgb(0x060608);   // seam where one is still wanted
+    public static readonly SysVec4 BorderLight = Rgb(0x4E4E55);   // subtle inner dividers
+    public static readonly SysVec4 TitleBg     = Rgb(0x0A0A0C);   // title bars + top shell band
 
     // In-viewport toolbar chrome (RW3 E7). The overlay floats OVER the 3D image, so it needs its own
     // translucent surface + pill so the controls read against any scene. Tuned off the ramp above.
-    public static readonly SysVec4 OverlayBg   = new(0.055f, 0.063f, 0.078f, 0.86f);  // ~Bg0 @ 0.86 — pill backing
+    public static readonly SysVec4 OverlayBg   = new(0.063f, 0.063f, 0.071f, 0.88f);  // ~Bg0 @ 0.88 — pill backing
     public static readonly SysVec4 OverlayPill = new(0.0f, 0.0f, 0.0f, 0.30f);        // segmented-control backing
     public static readonly SysVec4 OverlayBorder = new(1f, 1f, 1f, 0.07f);            // hairline around the pill
     public const float OverlayRounding = 7f;   // pill corner radius (px, pre-scale)
@@ -85,7 +92,7 @@ internal static class EditorTheme {
     public static readonly SysVec4 Error     = Rgb(0xFF8066);   // invalid input / error text (amber-red)
     public static readonly SysVec4 Warning   = Rgb(0xFFB840);   // disabled-override / caution text (amber)
     public static readonly SysVec4 Success   = Rgb(0x80D980);   // build-succeeded / OK summary (green)
-    public static readonly SysVec4 Info      = Rgb(0x73D9FF);   // active/current highlight (cyan — animator state, transitions)
+    public static readonly SysVec4 Info      = Rgb(0xF0C060);   // active/current highlight (warm amber — animator state, transitions; EF5i: was cyan, clashed with the neutral+amber theme)
     public static readonly SysVec4 PrefabBlue = Rgb(0x73A8FF);  // prefab-instance accent (Unity's prefab blue)
     public static readonly SysVec4 RowChild  = Rgb(0xB8BDC7);   // hierarchy child label — dimmer than a root's white
     public static readonly SysVec4 IconMuted = new(0.45f, 0.47f, 0.52f, 0.6f);  // inactive ghost-icon (eye toggle)

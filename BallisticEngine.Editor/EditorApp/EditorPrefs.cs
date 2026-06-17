@@ -73,12 +73,16 @@ internal sealed class EditorPrefs {
         Save();
     }
 
-    // EF5e: the editor accent is STATIC — always the azure 0x3D8BD4, regardless of any saved/old value in
-    // editorprefs.json. (An old orange accent in the json was silently overriding the new UE5 theme.) The
-    // setter is intentionally a no-op so the Settings "Accent color" control can't drift the theme either.
+    // The editor accent is STATIC — fixed regardless of any saved/old value in editorprefs.json. (An old
+    // accent in the json used to silently override the theme.) The setter is intentionally a no-op so the
+    // Settings "Accent color" control can't drift the theme either.
+    // EF5i: pivoted OFF blue entirely (user rejected "genel mavilik"). The chrome is now NEUTRAL graphite +
+    // a warm AMBER/GOLD accent — Unity/Substance-style. Amber pops warmly against the cool-neutral grey ramp
+    // without re-introducing any blue cast. Tuned slightly MUTED (0xD49B45, was the more saturated 0xE0A23C)
+    // so the accent reads as a refined warm gold, not a gaudy neon orange on every selected control.
     [JsonIgnore]
     public SysVec4 Accent {
-        get => new(0.239f, 0.545f, 0.831f, 1f);
+        get => new(0.831f, 0.608f, 0.271f, 1f);   // 0xD49B45 muted amber/gold
         set { /* static theme: accent is fixed, ignore writes */ }
     }
 
