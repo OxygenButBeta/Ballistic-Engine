@@ -1049,17 +1049,15 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         var s = current ?? "";
         ImGui.SetNextItemWidth(-1);
         if (ImGui.InputText("##path", ref s, 256)) {
-            EditorUndo.Push($"Edit {label}");
-            apply(s);
-            state.MarkViewportDirty();
+            // `apply` is an opaque closure that may write any target (UIDocument paths etc.) and the
+            // entity is not reachable here, so this stays a whole-scene structural snapshot.
+            EditorCommands.Structural($"Edit {label}", () => { apply(s); state.MarkViewportDirty(); });
         }
         // Drop target over the field: accept a single matching asset and write its path.
         if (AcceptGuidDrop(out Guid guid)) {
             string path = AssetDatabase.GuidToAssetPath(guid);
             if (path is not null && exts.Any(e => path.EndsWith(e, StringComparison.OrdinalIgnoreCase))) {
-                EditorUndo.Push($"Assign {label}");
-                apply(path);
-                state.MarkViewportDirty();
+                EditorCommands.Structural($"Assign {label}", () => { apply(path); state.MarkViewportDirty(); });
             }
         }
         ImGui.PopID();
@@ -1149,9 +1147,12 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         VolumeProfileLoader.Save(new VolumeProfile(), AssetDatabase.Project.ResolveAbsolute(assetPath));
 
         // The new file needs a refresh pass to get its meta/GUID before it can be loaded + assigned.
+        // Single-entity edit (the Volume's own entity is reachable), so scope it to that entity --
+        // PushEntity restores just it in place (Push->PushEntity scoping aside, byte-identical). The
+        // snapshot still fires inside the deferred callback right before the mutate.
         AsyncAssetImport.Request("Importing profile...", onFinished: () => {
-            EditorUndo.Push("Assign Profile");
-            volume.Profile = AssetDatabase.Load<VolumeProfile>(assetPath);
+            EditorCommands.EditEntity(entity, "Assign Profile",
+                () => volume.Profile = AssetDatabase.Load<VolumeProfile>(assetPath));
         });
     }
 
@@ -1502,13 +1503,17 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     }
 
     void AssignAsset(MemberInfo member, object target, Type assetType, Guid guid) {
-        EditorUndo.Push($"Assign {Prettify(member.Name)}");
-        MethodInfo load = typeof(AssetDatabase).GetMethod(nameof(AssetDatabase.Load), [typeof(Guid)])!
-            .MakeGenericMethod(assetType);
-        object loaded = load.Invoke(null, [guid]);
-        if (loaded is not null)
-            ApplyMember(member, target, loaded); // broadcasts to the multi-selection like value edits
-        state.MarkViewportDirty();
+        // ApplyMember broadcasts to the whole multi-selection, so this stays a whole-scene structural
+        // snapshot (not a single-entity EditEntity). The asset load is a pure read -- keep it inside the
+        // command so the snapshot still fires exactly before the first write.
+        EditorCommands.Structural($"Assign {Prettify(member.Name)}", () => {
+            MethodInfo load = typeof(AssetDatabase).GetMethod(nameof(AssetDatabase.Load), [typeof(Guid)])!
+                .MakeGenericMethod(assetType);
+            object loaded = load.Invoke(null, [guid]);
+            if (loaded is not null)
+                ApplyMember(member, target, loaded); // broadcasts to the multi-selection like value edits
+            state.MarkViewportDirty();
+        });
     }
 
     // G2-editor: the IProperty-keyed asset slot (a collection element whose type is a BObject asset, e.g. a
@@ -1561,13 +1566,15 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     }
 
     void AssignAssetToProperty(Inspector.IProperty p, Type assetType, Guid guid) {
-        EditorUndo.Push($"Assign {p.Label}");
-        MethodInfo load = typeof(AssetDatabase).GetMethod(nameof(AssetDatabase.Load), [typeof(Guid)])!
-            .MakeGenericMethod(assetType);
-        object loaded = load.Invoke(null, [guid]);
-        if (loaded is not null)
-            p.Set(loaded);
-        state.MarkViewportDirty();
+        // IProperty.Set routes through ApplyMember (multi-select broadcast), so whole-scene Structural.
+        EditorCommands.Structural($"Assign {p.Label}", () => {
+            MethodInfo load = typeof(AssetDatabase).GetMethod(nameof(AssetDatabase.Load), [typeof(Guid)])!
+                .MakeGenericMethod(assetType);
+            object loaded = load.Invoke(null, [guid]);
+            if (loaded is not null)
+                p.Set(loaded);
+            state.MarkViewportDirty();
+        });
     }
 
     // Mini asset-picker window: search + every compatible asset; click to assign.
@@ -1605,13 +1612,15 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
         if (ImGui.Selectable($"  (None)", false, ImGuiSelectableFlags.None, new SysVec2(0, ImGui.GetFrameHeight()))) {
             if (pickerProperty is not null) {
-                // G2-editor: property-backed slot (collection element) -> clear via Set (collection write-back).
-                EditorUndo.Push($"Clear {pickerProperty.Label}");
-                pickerProperty.Set(null);
+                // G2-editor: property-backed slot (collection element) -> clear via Set (collection write-back,
+                // ApplyMember broadcast) -> whole-scene Structural.
+                EditorCommands.Structural($"Clear {pickerProperty.Label}", () => pickerProperty.Set(null));
             }
             else {
-                EditorUndo.Push($"Clear {Prettify(pickerMember.Name)}");
-                ComponentReflection.SetValue(pickerMember, pickerTarget, null);
+                // Direct member clear (single target, no broadcast) but the entity is not reachable from the
+                // picker context, so it stays whole-scene Structural -- byte-identical to the old Push.
+                EditorCommands.Structural($"Clear {Prettify(pickerMember.Name)}",
+                    () => ComponentReflection.SetValue(pickerMember, pickerTarget, null));
             }
             state.MarkViewportDirty();
             ImGui.CloseCurrentPopup();
@@ -1728,9 +1737,11 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // Writes a new EntityRef/ComponentRef (boxed) onto the slot's property. One undo per assignment; the
     // IProperty.Set routes through ApplyMember (multi-select broadcast) + MarkViewportDirty.
     void AssignSceneRef(Inspector.IProperty p, object refValue) {
-        EditorUndo.Push($"Assign {p.Label}");
-        p.Set(refValue);
-        state.MarkViewportDirty();
+        // IProperty.Set routes through ApplyMember (multi-select broadcast) -> whole-scene Structural.
+        EditorCommands.Structural($"Assign {p.Label}", () => {
+            p.Set(refValue);
+            state.MarkViewportDirty();
+        });
     }
 
     // G2-editor (Rule 2): the interactive collection editor for a List<T> / T[] member (the parallel of
@@ -1739,7 +1750,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // its own terminal drawer (a List<Vector3> draws Vector3 widgets, a List<Material> asset slots, a
     // List<EntityRef> scene-object slots), each with a Remove (X) button. Every structural change (Add /
     // Remove) copies-mutates-writes the WHOLE collection back through the property (-> ApplyMember broadcast +
-    // dirty) under one EditorUndo.Push; element edits push undo via the element's own terminal drawer
+    // dirty) under one EditorCommands.Structural; element edits push undo via the element's own terminal drawer
     // (primitives auto-Track; asset/scene-ref slots push their own). The element type's drawer must exist (a
     // struct element with no registered drawer shows Unsupported per-element, like a struct member -- the
     // ch20 scope: List/array of primitives / enums / math-structs / asset refs / scene refs / curves /
@@ -1806,40 +1817,44 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // broadcasts + dirties); an array is immutable-length so a new, one-longer array is built. One undo.
     void CollectionAdd(Inspector.IProperty p, Type collType, Type elemType,
         System.Collections.IList list, bool isArray) {
-        EditorUndo.Push($"Add to {p.Label}");
-        object def = DefaultElement(elemType);
-        if (isArray) {
-            int n = list?.Count ?? 0;
-            var grown = Array.CreateInstance(elemType, n + 1);
-            for (int i = 0; i < n; i++) grown.SetValue(list[i], i);
-            grown.SetValue(def, n);
-            p.Set(grown);
-        }
-        else {
-            System.Collections.IList target = list ?? (System.Collections.IList)Activator.CreateInstance(collType);
-            target.Add(def);
-            p.Set(target);
-        }
-        state.MarkViewportDirty();
+        // p.Set routes through ApplyMember (multi-select broadcast) -> whole-scene Structural.
+        EditorCommands.Structural($"Add to {p.Label}", () => {
+            object def = DefaultElement(elemType);
+            if (isArray) {
+                int n = list?.Count ?? 0;
+                var grown = Array.CreateInstance(elemType, n + 1);
+                for (int i = 0; i < n; i++) grown.SetValue(list[i], i);
+                grown.SetValue(def, n);
+                p.Set(grown);
+            }
+            else {
+                System.Collections.IList target = list ?? (System.Collections.IList)Activator.CreateInstance(collType);
+                target.Add(def);
+                p.Set(target);
+            }
+            state.MarkViewportDirty();
+        });
     }
 
     // Remove element at index. List<T> removes in place; an array rebuilds one shorter. One undo.
     void CollectionRemoveAt(Inspector.IProperty p, Type collType, Type elemType,
         System.Collections.IList list, bool isArray, int index) {
         if (list is null || index < 0 || index >= list.Count) return;
-        EditorUndo.Push($"Remove from {p.Label}");
-        if (isArray) {
-            int n = list.Count;
-            var shrunk = Array.CreateInstance(elemType, n - 1);
-            for (int i = 0, j = 0; i < n; i++)
-                if (i != index) shrunk.SetValue(list[i], j++);
-            p.Set(shrunk);
-        }
-        else {
-            list.RemoveAt(index);
-            p.Set(list);
-        }
-        state.MarkViewportDirty();
+        // p.Set routes through ApplyMember (multi-select broadcast) -> whole-scene Structural.
+        EditorCommands.Structural($"Remove from {p.Label}", () => {
+            if (isArray) {
+                int n = list.Count;
+                var shrunk = Array.CreateInstance(elemType, n - 1);
+                for (int i = 0, j = 0; i < n; i++)
+                    if (i != index) shrunk.SetValue(list[i], j++);
+                p.Set(shrunk);
+            }
+            else {
+                list.RemoveAt(index);
+                p.Set(list);
+            }
+            state.MarkViewportDirty();
+        });
     }
 
     // Write a single element back. Mutates the backing IList slot (works for both List<T> and T[], which both
@@ -1867,7 +1882,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // terminal drawer (a Dictionary<string,int> draws int widgets, a Dictionary<string,Material> asset slots, a
     // Dictionary<int,EntityRef> scene-object slots) + a Remove (X) button. Structural changes (Add / Remove)
     // mutate the backing dictionary and write it back through the property (-> ApplyMember broadcast + dirty)
-    // under one EditorUndo.Push; value edits push undo via the value's own terminal drawer. Keys are READ-ONLY
+    // under one EditorCommands.Structural; value edits push undo via the value's own terminal drawer. Keys are READ-ONLY
     // (Dictionary keys are immutable: in-place key edit = remove-old + add-new with a duplicate-key clash to
     // resolve -- deferred, ch21 scope). A value type with no registered drawer shows Unsupported per-cell, like
     // a struct member (G4). The key snapshot avoids a mid-iteration mutate.
@@ -1956,19 +1971,23 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         System.Collections.IDictionary target = dict ?? (System.Collections.IDictionary)Activator.CreateInstance(dictType);
         object key = UniqueDictKey(target, keyType);
         if (key is null) return; // can't synthesize a unique key for this key type -> Add is a no-op
-        EditorUndo.Push($"Add to {p.Label}");
-        target[key] = DefaultElement(valueType);
-        p.Set(target);
-        state.MarkViewportDirty();
+        // p.Set routes through ApplyMember (multi-select broadcast) -> whole-scene Structural.
+        EditorCommands.Structural($"Add to {p.Label}", () => {
+            target[key] = DefaultElement(valueType);
+            p.Set(target);
+            state.MarkViewportDirty();
+        });
     }
 
     // Remove the entry for the given key. One undo; mutate then write back through the property.
     void DictionaryRemove(Inspector.IProperty p, System.Collections.IDictionary dict, object key) {
         if (dict is null || key is null || !dict.Contains(key)) return;
-        EditorUndo.Push($"Remove from {p.Label}");
-        dict.Remove(key);
-        p.Set(dict);
-        state.MarkViewportDirty();
+        // p.Set routes through ApplyMember (multi-select broadcast) -> whole-scene Structural.
+        EditorCommands.Structural($"Remove from {p.Label}", () => {
+            dict.Remove(key);
+            p.Set(dict);
+            state.MarkViewportDirty();
+        });
     }
 
     // Write a single entry's value back. Sets dict[key] = value (key already present), then writes the WHOLE
@@ -2018,7 +2037,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     //   (1) a concrete-type DROPDOWN -- "None" + every instantiable type deriving from the declared base
     //       (TypeCache.GetTypesDerivedFrom, deterministically ordered, concrete + public-ctor only); the live
     //       value's actual type is preselected. Changing it Activator-creates the chosen type (None -> null),
-    //       writes it through the property (-> ApplyMember broadcast + dirty) under one EditorUndo.Push, then
+    //       writes it through the property (-> ApplyMember broadcast + dirty) under one EditorCommands.Structural, then
     //       returns so next frame redraws against the new instance.
     //   (2) when a value is set, a foldout whose body draws the instance's members RECURSIVELY through the SAME
     //       component drawer stack as a top-level member (componentStack.Draw(MemberProperty)). Because each
@@ -2099,9 +2118,11 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // IProperty.Set routes through ApplyMember (multi-select broadcast) + dirty. The instance is freshly
     // constructed (or null), so this is a structural change -> the caller returns and redraws next frame.
     void PolymorphicSet(Inspector.IProperty p, object instance) {
-        EditorUndo.Push($"Set {p.Label}");
-        p.Set(instance);
-        state.MarkViewportDirty();
+        // IProperty.Set routes through ApplyMember (multi-select broadcast) -> whole-scene Structural.
+        EditorCommands.Structural($"Set {p.Label}", () => {
+            p.Set(instance);
+            state.MarkViewportDirty();
+        });
     }
 
     // editor-rework G4-editor (ch24, Rule 2): the recursive nested struct/class editor (the parallel of
@@ -2135,9 +2156,11 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                 object created;
                 try { created = Activator.CreateInstance(declaredType); }
                 catch { ImGui.TextDisabled($"({Prettify(declaredType.Name)})"); return; }
-                EditorUndo.Push($"Set {p.Label}");
-                p.Set(created);                 // structural change: the member is no longer null
-                state.MarkViewportDirty();
+                // p.Set routes through ApplyMember (multi-select broadcast) -> whole-scene Structural.
+                EditorCommands.Structural($"Set {p.Label}", () => {
+                    p.Set(created);             // structural change: the member is no longer null
+                    state.MarkViewportDirty();
+                });
                 return;                         // redraw next frame against the new instance
             }
         }
@@ -2371,18 +2394,21 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             !searching || e.DisplayName.Contains(addComponentSearch, StringComparison.OrdinalIgnoreCase);
 
         void Add(ComponentEntry e) {
-            EditorUndo.Push($"Add {e.DisplayName}");
-            // Multi-selection: add to EVERY selected entity that doesn't already have it (Unity-style),
-            // so you can equip a whole group at once. Single selection just adds to this entity.
-            if (state.SelectedEntities.Count > 1) {
-                foreach (Entity sel in state.SelectedEntities)
-                    if (sel is { IsDestroyed: false } && !HasComponentOfType(sel, e.Type))
-                        sel.AddComponent(e.Type);
-            }
-            else {
-                entity.AddComponent(e.Type);
-            }
-            state.MarkViewportDirty();
+            // Adds a component to the scene graph (the multi-select branch touches N entities), so this is
+            // a whole-scene Structural snapshot. CloseCurrentPopup is a UI-state call -> outside the command.
+            EditorCommands.Structural($"Add {e.DisplayName}", () => {
+                // Multi-selection: add to EVERY selected entity that doesn't already have it (Unity-style),
+                // so you can equip a whole group at once. Single selection just adds to this entity.
+                if (state.SelectedEntities.Count > 1) {
+                    foreach (Entity sel in state.SelectedEntities)
+                        if (sel is { IsDestroyed: false } && !HasComponentOfType(sel, e.Type))
+                            sel.AddComponent(e.Type);
+                }
+                else {
+                    entity.AddComponent(e.Type);
+                }
+                state.MarkViewportDirty();
+            });
             ImGui.CloseCurrentPopup();
         }
 
@@ -2631,11 +2657,13 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         }
 
         if (ImGui.Button($"{EditorIcons.Add}  Instantiate into Scene", new SysVec2(-1, 0))) {
-            EditorUndo.Push("Instantiate Prefab");
-            Entity root = prefab.Instantiate();
-            if (root is not null)
-                state.Select(root);
-            state.MarkViewportDirty();
+            // Plants a new entity tree into the scene -> whole-scene Structural snapshot.
+            EditorCommands.Structural("Instantiate Prefab", () => {
+                Entity root = prefab.Instantiate();
+                if (root is not null)
+                    state.Select(root);
+                state.MarkViewportDirty();
+            });
         }
 
         ImGui.Spacing();
