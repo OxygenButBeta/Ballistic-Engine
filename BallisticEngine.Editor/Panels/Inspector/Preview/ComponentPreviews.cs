@@ -99,28 +99,174 @@ internal sealed class AudioSourcePreview : IComponentPreview {
         ctx.Panel.DrawAudioSourceSection((AudioSource)ctx.Behaviour);
 }
 
+// Animator preview: a play/pause toggle + a scrub slider that evaluates the clip in edit mode, so
+// you can pose the skinned character without entering play. Drives Animator.EvaluatePreview, which
+// runs the same sample->skeleton->skinning pipeline as play-mode Tick. Body moved here in RW1.2.
 [ComponentPreview(typeof(Animator))]
 internal sealed class AnimatorPreview : IComponentPreview {
+    static bool animatorPreviewPlaying;
+    static float animatorPreviewTime;
+
     public void Draw(in ComponentPreviewContext ctx) =>
-        ctx.Panel.DrawAnimatorSection((Animator)ctx.Behaviour);
+        EditorWidgets.AnimatorScrubber((Animator)ctx.Behaviour, ref animatorPreviewTime, ref animatorPreviewPlaying,
+            ctx.Panel.MarkViewportDirty);
 }
 
+// AnimatorController: a live view of the state machine. The graph is script-built (states +
+// transitions are wired in OnBegin), so this is a runtime DEBUG/DRIVE surface — it lists the states
+// with the current one highlighted, and renders a poker for each declared parameter (checkbox for
+// bool, slider for float/int, a button for triggers) so you can drive the graph from the inspector
+// in play mode without writing test code (very AI-managed-friendly: set "Speed" and watch it cross
+// from idle->walk->run live). Body moved here in RW1.2.
 [ComponentPreview(typeof(AnimatorController))]
 internal sealed class AnimatorControllerPreview : IComponentPreview {
-    public void Draw(in ComponentPreviewContext ctx) =>
-        ctx.Panel.DrawAnimatorControllerSection((AnimatorController)ctx.Behaviour);
+    public void Draw(in ComponentPreviewContext ctx) {
+        var controller = (AnimatorController)ctx.Behaviour;
+        ImGui.Spacing();
+        ImGui.SeparatorText("State Machine");
+
+        if (controller.StateCount == 0) {
+            ImGui.TextDisabled("No states. Build the graph in a script's OnBegin:");
+            ImGui.TextDisabled("  AddState(name, clip); state.To(target, param, Compare, ...)");
+            return;
+        }
+
+        if (!SceneManager.IsPlaying)
+            ImGui.TextDisabled("Enter play mode to drive the graph.");
+
+        // Current state banner.
+        string cur = controller.CurrentStateName ?? "(none)";
+        ImGui.Text("Current: ");
+        ImGui.SameLine();
+        ImGui.TextColored(new SysVec4(0.45f, 0.85f, 1f, 1f), cur);
+
+        // State list with the active one highlighted.
+        ImGui.Spacing();
+        ImGui.TextDisabled($"States ({controller.StateCount})");
+        foreach (AnimatorController.State s in controller.States) {
+            bool isCurrent = s.Name == controller.CurrentStateName;
+            string label = $"{(isCurrent ? EditorIcons.Play + " " : "   ")}{s.Name}";
+            string clipName = s.Clip is not null ? s.Clip.Name : "(no clip)";
+            if (isCurrent)
+                ImGui.TextColored(new SysVec4(0.45f, 0.85f, 1f, 1f), $"{label}  ->  {clipName}");
+            else
+                ImGui.TextDisabled($"{label}  ->  {clipName}");
+            // A click jumps to the state (play mode) — handy for testing.
+            if (SceneManager.IsPlaying && ImGui.IsItemClicked())
+                controller.Play(s.Name);
+        }
+
+        // Parameter pokers.
+        var prms = controller.Parameters;
+        if (prms.Count > 0) {
+            ImGui.Spacing();
+            ImGui.SeparatorText("Parameters");
+            foreach (var kv in prms) {
+                string name = kv.Key;
+                switch (kv.Value) {
+                    case AnimatorController.ParamKind.Bool: {
+                        bool b = controller.GetBool(name);
+                        if (ImGui.Checkbox(name, ref b)) controller.SetBool(name, b);
+                        break;
+                    }
+                    case AnimatorController.ParamKind.Trigger: {
+                        if (ImGui.Button($"{EditorIcons.Play} {name}", new SysVec2(140, 0)))
+                            controller.SetTrigger(name);
+                        ImGui.SameLine();
+                        ImGui.TextDisabled(controller.GetTrigger(name) ? "(set)" : "");
+                        break;
+                    }
+                    case AnimatorController.ParamKind.Int: {
+                        int iv = controller.GetInt(name);
+                        if (ImGui.DragInt(name, ref iv)) controller.SetInt(name, iv);
+                        break;
+                    }
+                    default: { // Float
+                        float fv = controller.GetFloat(name);
+                        if (ImGui.DragFloat(name, ref fv, 0.05f)) controller.SetFloat(name, fv);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (SceneManager.IsPlaying)
+            ctx.Panel.MarkViewportDirty(); // keep repainting so transitions show live
+    }
 }
 
+// LightAnimator: a live preview toggle that animates the light IN EDIT MODE (so you can dial in a
+// flicker/pulse without entering play), plus a warning if there's no light on the entity to drive.
+// The IntensityCurve / ColorOverTime members render their curve+gradient widgets automatically via
+// the reflection DrawMember, so this only adds the preview control. Body moved here in RW1.2.
 [ComponentPreview(typeof(LightAnimator))]
 internal sealed class LightAnimatorPreview : IComponentPreview {
-    public void Draw(in ComponentPreviewContext ctx) =>
-        ctx.Panel.DrawLightAnimatorSection((LightAnimator)ctx.Behaviour);
+    static bool lightAnimPreview;
+    static float lightAnimPreviewClock;
+
+    public void Draw(in ComponentPreviewContext ctx) {
+        var lightAnim = (LightAnimator)ctx.Behaviour;
+        ImGui.Spacing();
+        ImGui.SeparatorText("Preview");
+
+        bool hasLight = lightAnim.GetComponent<PointLight>() is not null
+                     || lightAnim.GetComponent<SpotLight>() is not null;
+        if (!hasLight) {
+            ImGui.TextColored(new SysVec4(1f, 0.7f, 0.3f, 1f), "No PointLight or SpotLight on this entity.");
+            ImGui.TextDisabled("Add one — the animator drives its Intensity + Color.");
+            return;
+        }
+
+        if (ImGui.Button(lightAnimPreview ? $"{EditorIcons.Pause}  Stop Preview" : $"{EditorIcons.Play}  Preview",
+                new SysVec2(140, 0))) {
+            lightAnimPreview = !lightAnimPreview;
+            if (lightAnimPreview) lightAnimPreviewClock = 0f;
+            else { lightAnim.RestoreBase(); ctx.Panel.MarkViewportDirty(); } // un-dim the light when stopping
+        }
+        ImGui.SameLine();
+        ImGui.TextDisabled(lightAnim.Animation.ToString());
+
+        // Drive the light in edit mode along its own preview clock (play mode runs Tick itself).
+        if (lightAnimPreview && !SceneManager.IsPlaying) {
+            lightAnimPreviewClock += (float)Time.DeltaTime;
+            lightAnim.Apply(lightAnimPreviewClock);
+            ctx.Panel.MarkViewportDirty();
+        }
+    }
 }
 
+// Spawner: live alive/pooled counts + a manual Spawn One / Clear. Spawning only runs in play mode
+// (Tick), so the manual button is most useful there; in edit mode it instantiates immediately so
+// you can preview the prefab placement, and Clear cleans those up. Body moved here in RW1.2.
 [ComponentPreview(typeof(Spawner))]
 internal sealed class SpawnerPreview : IComponentPreview {
-    public void Draw(in ComponentPreviewContext ctx) =>
-        ctx.Panel.DrawSpawnerSection((Spawner)ctx.Behaviour);
+    public void Draw(in ComponentPreviewContext ctx) {
+        var spawner = (Spawner)ctx.Behaviour;
+        ImGui.Spacing();
+        ImGui.SeparatorText("Spawner");
+
+        if (spawner.Prefab is null) {
+            ImGui.TextColored(new SysVec4(1f, 0.7f, 0.3f, 1f), "Assign a Prefab to spawn.");
+            return;
+        }
+
+        ImGui.Text($"Alive: {spawner.AliveCount} / {spawner.MaxAlive}");
+        ImGui.SameLine();
+        ImGui.TextDisabled($"(pooled: {spawner.PooledCount})");
+
+        if (ImGui.Button($"{EditorIcons.Play}  Spawn One", new SysVec2(120, 0))) {
+            spawner.Spawn();
+            ctx.Panel.MarkViewportDirty();
+        }
+        ImGui.SameLine();
+        if (ImGui.Button($"{EditorIcons.Refresh}  Clear", new SysVec2(120, 0))) {
+            spawner.Clear();
+            ctx.Panel.MarkViewportDirty();
+        }
+
+        if (SceneManager.IsPlaying && spawner.AliveCount > 0)
+            ctx.Panel.MarkViewportDirty(); // keep repainting while instances live/expire
+    }
 }
 
 // Health: a live HP bar + edit-mode damage/heal/kill/revive test buttons. Body moved here in RW1.1.
@@ -166,10 +312,31 @@ internal sealed class UIDocumentPreview : IComponentPreview {
         ctx.Panel.DrawUIDocumentSection((UIDocument)ctx.Behaviour);
 }
 
+// ParticleSystem preview: it already animates live in the editor (AdvanceAll runs every editor
+// frame), so this just adds a Restart (clear) + a one-shot Emit test + a live count, and keeps the
+// viewport repainting while particles are alive so you see the motion. Body moved here in RW1.2.
 [ComponentPreview(typeof(ParticleSystem))]
 internal sealed class ParticleSystemPreview : IComponentPreview {
-    public void Draw(in ComponentPreviewContext ctx) =>
-        ctx.Panel.DrawParticleSystemSection((ParticleSystem)ctx.Behaviour);
+    public void Draw(in ComponentPreviewContext ctx) {
+        var particles = (ParticleSystem)ctx.Behaviour;
+        ImGui.Spacing();
+        ImGui.SeparatorText("Preview");
+
+        // Two equal half-width buttons that fill the row (auto-width 110px clipped the labels to
+        // "Resta.../Emit 5" in a narrow inspector); the live count goes on its own line so nothing
+        // gets squeezed off.
+        float spacing = ImGui.GetStyle().ItemSpacing.X;
+        float w = (ImGui.GetContentRegionAvail().X - spacing) * 0.5f;
+        if (ImGui.Button($"{EditorIcons.Refresh}  Restart", new SysVec2(w, 0)))
+            particles.Clear();
+        ImGui.SameLine();
+        if (ImGui.Button($"{EditorIcons.Play}  Emit 50", new SysVec2(w, 0)))
+            particles.Emit(50);
+        ImGui.TextDisabled($"{particles.LiveCount} live");
+
+        if (particles.LiveCount > 0)
+            ctx.Panel.MarkViewportDirty();
+    }
 }
 
 // TrailRenderer: animates live in the editor; a Clear + a live point count. Body moved here in RW1.1.

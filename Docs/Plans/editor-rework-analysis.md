@@ -1,7 +1,7 @@
 # Editor Rework — Analysis & Plan Foundation (2026-06-17)
 
 **Worktree:** `e:/Unity Projects/Ballistic-Engine-editor`  **Branch:** `editor-rework-2026` (off `dx12-renderer` @ `c8380f2e`)
-**Status:** ★ SPINE DONE (chunks 1–42) + MERGED into `dx12-renderer` (merge `b7f474f1`). NOW running §9 REMAINING-WORK PLAN on `dx12-renderer` directly (main worktree `e:/Unity Projects/Ballistic-Engine`, NOT the worktree above — that is pre-merge, do not touch). Chunk 43 (RW1.1 + RW6) DONE. NEXT = chunk 44 (RW1.2). See §9.
+**Status:** ★ SPINE DONE (chunks 1–42) + MERGED into `dx12-renderer` (merge `b7f474f1`). NOW running §9 REMAINING-WORK PLAN on `dx12-renderer` directly (main worktree `e:/Unity Projects/Ballistic-Engine`, NOT the worktree above — that is pre-merge, do not touch). Chunk 43 (RW1.1 + RW6) + chunk 44 (RW1.2) DONE. NEXT = chunk 45 (RW1.3). See §9.
 **Method:** 5 parallel read-only探查 agents over the whole `BallisticEngine.Editor/` tree + key cross-checks (DockPanelHost, EditorDebugViews, ThumbnailCache), plus the strategic docs (`ai-native-engine-master-plan.md`, CLAUDE.md, DX12 endgame).
 
 ## LOCKED EXECUTION ORDER (read this first)
@@ -529,7 +529,7 @@ No code touched. New worktree `editor-rework-2026` created off `dx12-renderer @ 
 RW1  body migration (Rule 1.5 debt) — move Draw*Section + sub-editor bodies OUT of InspectorPanel into
      their registered IComponentPreview / IAssetInspector shims; pure structural, byte-identical render.
        RW1.1  Renderer (DrawSubMeshMaterials+Row) + 2 simplest (Health, TrailRenderer)        ← chunk 43 ✅
-       RW1.2  Animator / AnimatorController / LightAnimator / Spawner / Health-residue / ParticleSystem
+       RW1.2  Animator / AnimatorController / LightAnimator / Spawner / ParticleSystem      ← chunk 44 ✅
        RW1.3  Volume / Terrain / AudioSource / UIDocument / TrailRenderer-residue
        RW1.4  asset-inspector bodies (material editor, texture import, curve/gradient sub-editors)
        (RW1 DONE = InspectorPanel ~800–1000 lines; THEN update §0 + memory index.)
@@ -549,3 +549,7 @@ RW7  D2/D3 MCP schema completion + perception (rides C1)
 
 ### Chunk 43 (RW1.1 + RW6) — DONE
 Moved `DrawSubMeshMaterials`+`DrawSubMeshMaterialRow` → `RendererPreview` (now private statics inside it), `DrawHealthSection` → `HealthPreview`, `DrawTrailRendererSection` → `TrailRendererPreview`, all in `BallisticEngine.Editor/Panels/Inspector/Preview/ComponentPreviews.cs`. Enablers in `InspectorPanel.cs`: `Row(string)` widened `static`→`internal static` (relocated body calls it; `BeginGrid` was already internal static); added `internal void MarkViewportDirty()` so a moved body's `state.MarkViewportDirty()` becomes `ctx.Panel.MarkViewportDirty()` (private `state` reach). InspectorPanel dropped ~3357→~3300 lines. RW6: CLAUDE.md GL-drift banner (stack line, Renderer-pipeline section, embedded-shader gotcha) marked HISTORICAL/DX12. Build 0-err, harness ALL GREEN.
+
+### Chunk 44 (RW1.2) — DONE
+Moved the bodies of `DrawAnimatorSection` → `AnimatorPreview` (the 2 `animatorPreviewPlaying/Time` statics moved INTO the preview class; `EditorWidgets.AnimatorScrubber` reaches via parent-namespace nesting, `state.MarkViewportDirty` → `ctx.Panel.MarkViewportDirty`), `DrawAnimatorControllerSection` → `AnimatorControllerPreview`, `DrawLightAnimatorSection` → `LightAnimatorPreview` (the 2 `lightAnimPreview/Clock` statics moved in too), `DrawSpawnerSection` → `SpawnerPreview`, `DrawParticleSystemSection` → `ParticleSystemPreview` — all in `ComponentPreviews.cs`. No new InspectorPanel accessors needed beyond RW1.1's `MarkViewportDirty()` (no grid/Row use in these 5). Byte-exact check: the 3 em-dashes in the moved bodies (AnimatorController surface comment, click-jumps comment, LightAnimator `"Add one — …"` string) are clean U+2014 (`e2 80 94`) with NO trailing U+009D — preserved verbatim; the 2 pre-existing U+009D bytes in `ComponentPreviews.cs` are from RW1.1's `RendererPreview` (unchanged). InspectorPanel `3267→3096` lines. Build 0-err (Editor csproj alone), full reflection harness ALL GREEN (B1 16/16, B2 17/17, F3 22/22). HEADLESS — no editor launch.
+**RW1.2 of `Docs/Plans/editor-rework-analysis.md` §9 chunk list marked DONE.** NEXT = chunk 45 (RW1.3: Volume / Terrain / AudioSource / UIDocument bodies). InspectorPanel still ~3096 lines → RW1 not done yet (target ~800–1000; §0 status + memory index update happens at RW1.4 end, not now).
