@@ -248,7 +248,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
         bool enabled = behaviour.IsEnabled;
         bool open = ComponentHeader(Prettify(type.Name), type, ref enabled, out bool menuRequested);
-        if (enabled != behaviour.IsEnabled) { EditorUndo.Push($"Toggle {Prettify(type.Name)}"); behaviour.IsEnabled = enabled; state.MarkViewportDirty(); }
+        if (enabled != behaviour.IsEnabled) EditorCommands.EditScene($"Toggle {Prettify(type.Name)}", () => { behaviour.IsEnabled = enabled; state.MarkViewportDirty(); });
 
         if (menuRequested)
             ImGui.OpenPopup("##componentctx");
@@ -262,10 +262,11 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             DrawMemberList(type, behaviour);
 
         if (removeClicked) {
-            EditorUndo.Push("Remove Component");
-            SceneManager.GetCurrentScene().RemoveSceneBehaviour(behaviour);
-            state.SelectSceneBehaviour(null);
-            state.MarkViewportDirty();
+            EditorCommands.EditScene("Remove Component", () => {
+                SceneManager.GetCurrentScene().RemoveSceneBehaviour(behaviour);
+                state.SelectSceneBehaviour(null);
+                state.MarkViewportDirty();
+            });
         }
 
         ImGui.PopID();
@@ -369,7 +370,9 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         ImGui.SetCursorScreenPos(new SysVec2(contentX, cardMin.Y + pad));
         bool active = entity.IsActive;
         if (ImGui.Checkbox("##active", ref active)) { }
-        if (ImGui.IsItemActivated()) EditorUndo.Push("Toggle Active");
+        // Snapshot fires on activation; the SetActive mutate lands on a later branch/frame, so the
+        // grab-frame snapshot is preserved with a no-op mutate (Push->PushEntity scoping aside, byte-identical).
+        if (ImGui.IsItemActivated()) EditorCommands.EditEntity(entity, "Toggle Active", () => { });
         if (active != entity.IsActive) { entity.SetActive(active); state.MarkViewportDirty(); }
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("Active");
@@ -380,7 +383,9 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         var name = entity.Name ?? "";
         var renamed = ImGui.InputText("##name", ref name, 128);
         ImGui.PopStyleColor();
-        if (ImGui.IsItemActivated()) EditorUndo.Push("Rename");
+        // Snapshot on activation; the rename mutate (entity.Name) lands on a later edit frame, so the
+        // grab-frame snapshot is preserved with a no-op mutate.
+        if (ImGui.IsItemActivated()) EditorCommands.EditEntity(entity, "Rename", () => { });
         if (renamed) entity.Name = name;
 
         // Row 2: meta line.
@@ -403,15 +408,22 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         ImGuiPayloadPtr payload = ImGui.AcceptDragDropPayload(AssetBrowserPanel.DragType);
         if (!payload.IsNull && payload.Data != null) {
             string text = System.Runtime.InteropServices.Marshal.PtrToStringAnsi((IntPtr)payload.Data, payload.DataSize);
-            bool pushed = false;
+            // Resolve the addable script types FIRST (pure read), so the structural snapshot is taken
+            // exactly once before any AddComponent -- byte-identical to the old lazy `pushed` flag, but
+            // the snapshot+mutate stay atomic inside EditorCommands.Structural.
+            var toAdd = new List<Type>();
             foreach (string part in text?.Split(';', StringSplitOptions.RemoveEmptyEntries) ?? []) {
                 if (!Guid.TryParse(part, out Guid guid)) continue;
                 Type type = HierarchyPanel.ScriptComponentType(guid);
                 if (type is null || HasComponentOfType(entity, type)) continue;
-                if (!pushed) { EditorUndo.Push("Add Script Component"); pushed = true; }
-                entity.AddComponent(type);
+                toAdd.Add(type);
             }
-            if (pushed) state.MarkViewportDirty();
+            if (toAdd.Count > 0)
+                EditorCommands.Structural("Add Script Component", () => {
+                    foreach (Type type in toAdd)
+                        entity.AddComponent(type);
+                    state.MarkViewportDirty();
+                });
         }
         ImGui.EndDragDropTarget();
     }
@@ -429,9 +441,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         if (ImGui.BeginCombo("##tag", $"{EditorIcons.Pin} {currentTag}")) {
             foreach (string tag in TagManager.Tags) {
                 if (ImGui.Selectable(tag, tag == currentTag) && tag != entity.Tag) {
-                    EditorUndo.Push("Change Tag");
-                    entity.Tag = tag;
-                    state.MarkViewportDirty();
+                    EditorCommands.EditEntity(entity, "Change Tag", () => {
+                        entity.Tag = tag;
+                        state.MarkViewportDirty();
+                    });
                 }
             }
             ImGui.EndCombo();
@@ -446,9 +459,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         if (ImGui.BeginCombo("##layer", $"{EditorIcons.Grid} {currentLayerName}")) {
             foreach ((int index, string name) in LayerManager.DefinedLayers()) {
                 if (ImGui.Selectable($"{index}: {name}", index == entity.Layer) && index != entity.Layer) {
-                    EditorUndo.Push("Change Layer");
-                    entity.Layer = index;
-                    state.MarkViewportDirty();
+                    EditorCommands.EditEntity(entity, "Change Layer", () => {
+                        entity.Layer = index;
+                        state.MarkViewportDirty();
+                    });
                 }
             }
             ImGui.EndCombo();
@@ -479,14 +493,17 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
         // Right-click the header for Unity-style resets (apply to the whole selection).
         if (ImGui.BeginPopupContextItem("##transformctx")) {
-            if (ImGui.MenuItem("Reset Position")) { EditorUndo.Push("Reset Position"); transform.Position = Vector3.Zero; foreach (Transform o in others) o.Position = Vector3.Zero; }
-            if (ImGui.MenuItem("Reset Rotation")) { EditorUndo.Push("Reset Rotation"); transform.EulerAngles = Vector3.Zero; foreach (Transform o in others) o.EulerAngles = Vector3.Zero; }
-            if (ImGui.MenuItem("Reset Scale")) { EditorUndo.Push("Reset Scale"); transform.Scale = Vector3.One; foreach (Transform o in others) o.Scale = Vector3.One; }
+            // These reset the WHOLE multi-selection (transform + every `others`), so they stay a
+            // whole-scene structural snapshot (not a single-entity EditEntity).
+            if (ImGui.MenuItem("Reset Position")) EditorCommands.Structural("Reset Position", () => { transform.Position = Vector3.Zero; foreach (Transform o in others) o.Position = Vector3.Zero; });
+            if (ImGui.MenuItem("Reset Rotation")) EditorCommands.Structural("Reset Rotation", () => { transform.EulerAngles = Vector3.Zero; foreach (Transform o in others) o.EulerAngles = Vector3.Zero; });
+            if (ImGui.MenuItem("Reset Scale")) EditorCommands.Structural("Reset Scale", () => { transform.Scale = Vector3.One; foreach (Transform o in others) o.Scale = Vector3.One; });
             ImGui.Separator();
             if (ImGui.MenuItem("Reset All")) {
-                EditorUndo.Push("Reset Transform");
-                transform.Position = Vector3.Zero; transform.EulerAngles = Vector3.Zero; transform.Scale = Vector3.One;
-                foreach (Transform o in others) { o.Position = Vector3.Zero; o.EulerAngles = Vector3.Zero; o.Scale = Vector3.One; }
+                EditorCommands.Structural("Reset Transform", () => {
+                    transform.Position = Vector3.Zero; transform.EulerAngles = Vector3.Zero; transform.Scale = Vector3.One;
+                    foreach (Transform o in others) { o.Position = Vector3.Zero; o.EulerAngles = Vector3.Zero; o.Scale = Vector3.One; }
+                });
             }
             ImGui.EndPopup();
         }
@@ -567,12 +584,14 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                 ImGui.GetColorU32(new SysVec4(0.45f, 0.66f, 1f, 1f)));
         }
         if (enabled != behaviour.IsEnabled) {
-            EditorUndo.Push($"Toggle {Prettify(type.Name)}");
-            behaviour.IsEnabled = enabled;
-            // Multi-selection: toggle the matching component on every selected entity too.
-            foreach (Behaviour sibling in MatchingComponents(behaviour))
-                sibling.IsEnabled = enabled;
-            state.MarkViewportDirty();
+            // Toggle propagates to the matching component on every selected entity (multi-select), so
+            // it stays a whole-scene structural snapshot rather than a single-entity EditEntity.
+            EditorCommands.Structural($"Toggle {Prettify(type.Name)}", () => {
+                behaviour.IsEnabled = enabled;
+                foreach (Behaviour sibling in MatchingComponents(behaviour))
+                    sibling.IsEnabled = enabled;
+                state.MarkViewportDirty();
+            });
         }
 
         if (menuRequested)
@@ -601,10 +620,11 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                 if (firstCtx) { ImGui.Separator(); firstCtx = false; }
                 string ctxLabel = ctxMethod.GetCustomAttribute<ContextMenuAttribute>()?.Label ?? Prettify(ctxMethod.Name);
                 if (ImGui.MenuItem($"{EditorIcons.Wrench}  {ctxLabel}")) {
-                    EditorUndo.Push(ctxLabel);
-                    try { ctxMethod.Invoke(behaviour, null); }
-                    catch (Exception ex) { Debugging.LogError($"[ContextMenu] '{ctxLabel}' threw: {ex.InnerException?.Message ?? ex.Message}"); }
-                    state.MarkViewportDirty();
+                    EditorCommands.EditEntity(entity, ctxLabel, () => {
+                        try { ctxMethod.Invoke(behaviour, null); }
+                        catch (Exception ex) { Debugging.LogError($"[ContextMenu] '{ctxLabel}' threw: {ex.InnerException?.Message ?? ex.Message}"); }
+                        state.MarkViewportDirty();
+                    });
                 }
             }
 
@@ -622,12 +642,14 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         }
 
         if (removeClicked) {
-            EditorUndo.Push("Remove Component");
-            // Multi-selection: remove the matching component from every selected entity too.
-            foreach (Behaviour sibling in MatchingComponents(behaviour))
-                sibling.Entity.RemoveComponent(sibling);
-            entity.RemoveComponent(behaviour);
-            state.MarkViewportDirty();
+            // Removal propagates to the matching component on every selected entity (multi-select), so
+            // it stays a whole-scene structural snapshot.
+            EditorCommands.Structural("Remove Component", () => {
+                foreach (Behaviour sibling in MatchingComponents(behaviour))
+                    sibling.Entity.RemoveComponent(sibling);
+                entity.RemoveComponent(behaviour);
+                state.MarkViewportDirty();
+            });
             ImGui.PopID();
             return;
         }
@@ -665,9 +687,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         int j = i + dir;
         if (i < 0 || j < 0 || j >= list.Count)
             return;
-        EditorUndo.Push("Reorder Component");
-        (list[i], list[j]) = (list[j], list[i]);
-        state.MarkViewportDirty();
+        EditorCommands.Structural("Reorder Component", () => {
+            (list[i], list[j]) = (list[j], list[i]);
+            state.MarkViewportDirty();
+        });
     }
 
     // Resets every inspector member to a fresh instance's defaults (Unity's Reset). Lifecycle members
@@ -677,12 +700,14 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         Behaviour fresh;
         try { fresh = (Behaviour)Activator.CreateInstance(type); }
         catch { return; }
-        EditorUndo.Push($"Reset {Prettify(type.Name)}");
-        foreach (MemberInfo member in ComponentReflection.InspectorMembers(type)) {
-            try { ComponentReflection.SetValue(member, behaviour, ComponentReflection.GetValue(member, fresh)); }
-            catch { /* read-only / computed member — skip */ }
-        }
-        state.MarkViewportDirty();
+        // Reset rewrites just this one component's members on its own entity -> scoped EditEntity.
+        EditorCommands.EditEntity(behaviour.Entity, $"Reset {Prettify(type.Name)}", () => {
+            foreach (MemberInfo member in ComponentReflection.InspectorMembers(type)) {
+                try { ComponentReflection.SetValue(member, behaviour, ComponentReflection.GetValue(member, fresh)); }
+                catch { /* read-only / computed member -- skip */ }
+            }
+            state.MarkViewportDirty();
+        });
     }
 
     // Snapshots the component's inspector members into the clipboard.
@@ -702,14 +727,16 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     void PasteComponent(Behaviour behaviour) {
         if (!CanPasteInto(behaviour.GetType()))
             return;
-        EditorUndo.Push($"Paste {Prettify(behaviour.GetType().Name)}");
-        foreach (MemberInfo member in ComponentReflection.InspectorMembers(behaviour.GetType())) {
-            if (clipboardMembers.TryGetValue(member.Name, out object value)) {
-                try { ComponentReflection.SetValue(member, behaviour, value); }
-                catch { /* incompatible member — skip */ }
+        // Paste writes just this one component's members on its own entity -> scoped EditEntity.
+        EditorCommands.EditEntity(behaviour.Entity, $"Paste {Prettify(behaviour.GetType().Name)}", () => {
+            foreach (MemberInfo member in ComponentReflection.InspectorMembers(behaviour.GetType())) {
+                if (clipboardMembers.TryGetValue(member.Name, out object value)) {
+                    try { ComponentReflection.SetValue(member, behaviour, value); }
+                    catch { /* incompatible member -- skip */ }
+                }
             }
-        }
-        state.MarkViewportDirty();
+            state.MarkViewportDirty();
+        });
     }
 
     // Inline profile editing under a Volume component, Unity-style: the profile's overrides are
