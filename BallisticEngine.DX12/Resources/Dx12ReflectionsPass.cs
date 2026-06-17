@@ -41,6 +41,18 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     public void Declare(Dx12PassBuilder b) {
         b.Read(b.Resource("GBuffer"));
         b.ReadWrite(b.Resource("SceneColor"));
+        // PHASE-2 V3 (chunk 16): derive ONLY the SSR-path (DrawSsr) shared boundary head — the SSR march reads the
+        // lit HDR scene color + G-buffer depth as SRVs (target.ColorToShaderResource() +
+        // gbuffer.DepthToShaderResource(), DrawSsr head, where target == ctx.SceneColor). Derive both. LEFT INLINE:
+        //   - the RT branch's gbuffer.DepthToNonPixelShaderResource() (DXR raygen depth read, OUT of V3 scope),
+        //   - the RT branch's own target.ColorToShaderResource() + its combine-tail gbuffer.DepthToShaderResource(),
+        //   - the pass-private scratch transitions (ssrTarget/ssrScene) — mid-pass, not pass-boundary heads.
+        // DrawSsr is also the !sceneAS.Valid fallback from DrawRtReflections; the derived (or RT-branch) heads
+        // already ran by then, so the gated heads are idempotent no-ops. RT reflections excluded from the golden
+        // gate; the deterministic matrix exercises only the SSR (DrawSsr) path.
+        b.DeriveBarriers();
+        b.Use(Dx12ResourceUsage.SceneColorShaderRead);
+        b.Use(Dx12ResourceUsage.GBufferDepthShaderRead);
     }
 
     readonly Dx12Device dev;
@@ -121,8 +133,12 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
 
         // Both passes need the HDR color + G-buffer as SRVs. The G-buffer is already SRV; bring color to SRV.
         // R2 / Decision 4: reflections is a consumer of color + G-buffer-as-SRV — head transitions live here.
-        target.ColorToShaderResource();
-        gbuffer.DepthToShaderResource();
+        // PHASE-2 V3: skip the manual SceneColor + depth heads when derived barriers are active (the graph emitted
+        // ctx.SceneColor.ColorToShaderResource() + gbuffer.DepthToShaderResource() before Record). Idempotent.
+        if (!ctx.BarriersDerived) {
+            target.ColorToShaderResource();
+            gbuffer.DepthToShaderResource();
+        }
 
         // March (half-res) → ssrTarget. SRV slots: color t0, depth t1, normal t2, material t3, (ssr t4 unused).
         ssrSrvVisible.Reset();
