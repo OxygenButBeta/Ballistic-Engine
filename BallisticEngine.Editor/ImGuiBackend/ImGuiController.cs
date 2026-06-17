@@ -98,39 +98,45 @@ internal sealed class ImGuiController : IDisposable {
         var semibold = Path.Combine(fontsDir, "Inter-SemiBold.ttf");
         var icons = File.Exists(Path.Combine(fontsDir, "lucide.ttf"))
             ? Path.Combine(fontsDir, "lucide.ttf") : null;
-        float baseSize = 16.5f;                      // Inter reads a touch larger than Segoe at the same px
+        float baseSize = 17f;                        // EF5e: bumped — bigger UI text reads far less "çiğ"/cramped
         float size = MathF.Round(baseSize * scale);
         EditorTheme.BodySize = size;
 
-        ImFontPtr bodyFont, captionFont, headerFont, displayFont;
+        // EF5e — the BODY (default UI) font is now Inter SEMIBOLD, not Regular. Inter-Regular rendered thin /
+        // "çirkin" at UI sizes (the user's complaint); a medium weight is what AAA editors (UE5/Blender) use
+        // for body text — denser stems, far more legible, no longer spindly. Regular is kept only for the
+        // recessive Caption (secondary hints look right thin). SemiBold-or-fallback chosen FIRST so body can
+        // use it; if SemiBold is missing we fall back to Regular, then to the default font.
+        bool haveSemibold = File.Exists(semibold);
         bool haveRegular = File.Exists(regular);
-        if (haveRegular) {
-            bodyFont = io.Fonts.AddFontFromFileTTF(regular, size);
+        string bodyTtf = haveSemibold ? semibold : (haveRegular ? regular : null);
+
+        ImFontPtr bodyFont, captionFont, headerFont, displayFont;
+        if (bodyTtf is not null) {
+            bodyFont = AddTextFont(io, bodyTtf, size);
         }
         else {
             bodyFont = io.Fonts.AddFontDefault();
             io.FontGlobalScale = scale;
         }
         MergeIcons(io, icons, size);
+        Bold = bodyFont;   // body is already semibold; "Bold" call sites get the same weight (overridden below if a heavier exists)
 
         // Phase E (RW2) — a SEMANTIC TYPE SCALE so headers read as headers and captions recede (the #1
         // flatness fix). Real distinct pixel sizes baked into the atlas (NOT just bold weight). Each falls
         // back to the body font if the .ttf is missing, so EditorTheme handles are always valid.
-        // Caption: a smaller regular size for secondary hints / badges.
+        // Caption: a smaller REGULAR size for secondary hints / badges (thin is correct for recessive text).
         captionFont = haveRegular
             ? LoadSizedWithIcons(io, regular, icons, MathF.Round(baseSize * EditorTheme.CaptionScale * scale))
             : bodyFont;
 
-        // SemiBold for component headers / titles; falls back to the regular font seamlessly.
-        if (File.Exists(semibold)) {
-            Bold = io.Fonts.AddFontFromFileTTF(semibold, size);
-            MergeIcons(io, icons, size);
+        // Header / Display: SemiBold at larger sizes (real type-scale, not just weight).
+        if (haveSemibold) {
             headerFont  = LoadSizedWithIcons(io, semibold, icons, MathF.Round(baseSize * EditorTheme.HeaderScale * scale));
             displayFont = LoadSizedWithIcons(io, semibold, icons, MathF.Round(baseSize * EditorTheme.DisplayScale * scale));
         }
         else {
-            Bold = io.Fonts.Fonts[0];
-            headerFont = displayFont = Bold;
+            headerFont = displayFont = bodyFont;
         }
 
         EditorTheme.Body    = bodyFont;
@@ -154,8 +160,23 @@ internal sealed class ImGuiController : IDisposable {
     // Loads a TTF at a specific px size and merges the icon glyphs into it (so any semantic-scale font can
     // still render inline icons). Returns the font handle for EditorTheme.
     static unsafe ImFontPtr LoadSizedWithIcons(ImGuiIOPtr io, string ttf, string icons, float px) {
-        ImFontPtr f = io.Fonts.AddFontFromFileTTF(ttf, px);
+        ImFontPtr f = AddTextFont(io, ttf, px);
         MergeIcons(io, icons, px);
+        return f;
+    }
+
+    // Loads a TEXT font (Inter) with crisp rasterization. The default stb_truetype path under-samples thin UI
+    // fonts, which is why Inter read soft/"çirkin" before — EF5e: OversampleH=3 gives horizontal subpixel
+    // coverage (much sharper stems at UI sizes) and PixelSnapH snaps glyph origins to the pixel grid so text
+    // baselines don't blur. OversampleV stays 1 (vertical oversampling barely helps text, costs atlas space).
+    static unsafe ImFontPtr AddTextFont(ImGuiIOPtr io, string ttf, float px) {
+        ImFontConfigPtr cfg = ImGui.ImFontConfig();
+        cfg.OversampleH = 3;
+        cfg.OversampleV = 1;
+        cfg.PixelSnapH = true;
+        cfg.RasterizerMultiply = 1.15f;   // slightly thicken/contrast glyph coverage so text reads crisp, not washed
+        ImFontPtr f = io.Fonts.AddFontFromFileTTF(ttf, px, cfg);
+        cfg.Destroy();
         return f;
     }
 
@@ -232,120 +253,132 @@ internal sealed class ImGuiController : IDisposable {
     static void ApplyGeometry(float scale) {
         ImGuiStylePtr style = ImGui.GetStyle();
 
-        // EF5a — faithful-UE5 geometry: a tighter, flatter chrome than the prior "modern app" pass.
-        // Unreal's editor uses SMALL consistent rounding (~4-6px, not the soft 7-9px of consumer apps),
-        // near-zero borders (surfaces separated by background tint + spacing, not 1px seams — the main
-        // ImGui tell), and crisp rectangular tabs. The values below pull rounding down into the UE5 band
-        // and keep the roomy rows; behaviour is byte-unchanged (pure layout metrics).
-        style.WindowRounding = 5f;
-        style.ChildRounding = 5f;
-        style.FrameRounding = 4f;
-        style.PopupRounding = 5f;
-        style.GrabRounding = 4f;
-        style.TabRounding = 4f;
-        style.ScrollbarRounding = 5f;
+        // EF5e — REAL faithful-UE5 geometry (the EF5a pass was too timid to read). Unreal's editor chrome is
+        // nearly RECTANGULAR (2-3px rounding, not the soft 4-6px), uses thin 1px borders on input frames so
+        // each control reads as a distinct recessed slot (the UE5 "Details panel" tell), crisp tabs with NO
+        // rounding on the tab body, and a tighter vertical rhythm. These metrics are gravitating the look
+        // away from "default ImGui" decisively, not by a hair. Pure layout (behaviour unchanged).
+        style.WindowRounding = 3f;
+        style.ChildRounding = 3f;
+        style.FrameRounding = 3f;
+        style.PopupRounding = 3f;
+        style.GrabRounding = 3f;
+        style.TabRounding = 3f;
+        style.ScrollbarRounding = 3f;
         style.WindowBorderSize = 0f;        // panels read as surfaces, not framed boxes
-        style.FrameBorderSize = 0f;
+        style.FrameBorderSize = 1f;         // UE5: each input slot has a thin recessed border (the key tell)
         style.PopupBorderSize = 1f;         // keep a hairline on floating popups for separation
         style.ChildBorderSize = 0f;
-        style.WindowPadding = new SysVec2(12, 10);
-        style.FramePadding = new SysVec2(11, 7);
+        style.TabBorderSize = 0f;
+        style.WindowPadding = new SysVec2(10, 8);
+        style.FramePadding = new SysVec2(10, 7);    // taller input rows — more breathing room, less cramped
         style.CellPadding = new SysVec2(8, 6);
-        style.ItemSpacing = new SysVec2(9, 8);
-        style.ItemInnerSpacing = new SysVec2(8, 6);
-        style.IndentSpacing = 20f;
-        style.ScrollbarSize = 11f;          // slimmer modern scrollbar
-        style.GrabMinSize = 11f;
-        style.TabBarBorderSize = 0f;
+        style.ItemSpacing = new SysVec2(8, 7);      // a touch more vertical air between rows
+        style.ItemInnerSpacing = new SysVec2(7, 5);
+        style.IndentSpacing = 16f;          // shallower indent so nested rows keep their value column
+        style.ScrollbarSize = 12f;
+        style.GrabMinSize = 10f;
+        style.TabBarBorderSize = 1f;        // a thin rule under the tab bar (UE5 separates tabs from body)
         style.DockingSeparatorSize = 2f;    // thin dock split handles
         style.SeparatorTextBorderSize = 2f;
-        style.SeparatorTextPadding = new SysVec2(20, 6);
+        style.SeparatorTextPadding = new SysVec2(18, 5);
         style.WindowTitleAlign = new SysVec2(0.0f, 0.5f);
         style.WindowMenuButtonPosition = ImGuiDir.None;   // no collapse arrow clutter on dock tabs
         style.ScaleAllSizes(scale);
     }
 
-    // EF5a — faithful-UE5 "deep graphite" editor theme: a cool blue-grey (not flat neutral grey)
-    // elevation ramp pushed DARKER and flatter to match Unreal's editor chrome, with a single restrained
-    // azure highlight (no warm accent — identity decision (i)). Layered depth makes the azure pop; every
-    // interaction state derives from the accent + ramp. Safe to re-run any frame (colors only).
+    // EF5e — REAL faithful-UE5 "deep graphite" theme. The EF5a pass barely moved off the old palette
+    // (~4 hex tones, invisible to the eye); this is the actual overhaul. Unreal's Slate editor reads as:
+    // a VERY dark, slightly cool base; a HIGH-CONTRAST elevation ramp so panels / inputs / headers each
+    // sit on a visibly distinct surface; thin recessed borders on every input slot; and the azure accent
+    // used DECISIVELY (bright check/slider grabs, a fat accent overline on the selected tab, accent on the
+    // selected tree/table row) instead of the timid faint tints before. Every interaction state derives
+    // from accent + ramp. Safe to re-run any frame (colors only).
     // NOTE: the bg0..titleBg ramp below is mirrored byte-for-byte in EditorTheme (Bg0..TitleBg) for the
-    // in-viewport overlay chrome — if you retune here, retune EditorTheme too (the comment there says so).
+    // in-viewport overlay chrome — RETUNE EditorTheme TOO when this changes (its comment mandates the sync).
     static void ApplyColors(SysVec4 accent) {
         var c = ImGui.GetStyle().Colors;
 
-        // Deep, cool elevation ramp: surfaces read as stacked layers (deeper = further back), making the
-        // azure accent pop. Lifted just off pure black — a graphite charcoal easier on the eyes than
-        // near-black while reading distinctly darker/AAA than the prior pass. All contrasts verified:
-        // body text #ECEEF2 = 12-16:1 on every surface; textDim = >=4.7:1 even on input frames (bg2).
-        SysVec4 bg0 = Rgb(0x16181C);     // window background — base graphite (deeper than before)
-        SysVec4 bg1 = Rgb(0x1D2026);     // child / popup — raised surface
-        SysVec4 bg2 = Rgb(0x262A31);     // frames (inputs)
-        SysVec4 bg3 = Rgb(0x333842);     // hovered frames
-        SysVec4 header = Rgb(0x2B3038);  // collapsing headers / selected tabs
-        SysVec4 accentHi = Lighten(accent, 1.32f);
-        SysVec4 accentDim = Darken(accent, 0.5f);
-        SysVec4 accentFaint = WithAlpha(accent, 0.22f);
-        SysVec4 text = Rgb(0xECEEF2);    // bright primary text (>=12:1 on all surfaces)
-        SysVec4 textDim = Rgb(0x8C94A1); // secondary/disabled — nudged brighter to clear 4.5:1 on inputs
-        SysVec4 border = Rgb(0x0C0E11);  // used only where a seam is still wanted (popups/tables)
-        SysVec4 borderLight = Rgb(0x363C46);
-        SysVec4 titleBg = Rgb(0x121418);
+        // High-contrast cool-graphite elevation ramp. Base pushed much deeper (near Slate's #0E0F12), then
+        // each layer steps up CLEARLY (≈+8-10 luma per level, not +3) so depth is legible: window < child <
+        // header-bar < input-frame < hovered. The accent pops hard against this dark a base. Contrasts:
+        // body #EDEFF3 ≥ 13:1 on every surface; textDim ≥ 4.6:1 even on the lightest input frame.
+        // EF5e — cool BLUE-slate ramp (not neutral grey). A faint blue bias in every surface gives the
+        // chrome a deliberate, modern identity instead of the flat neutral-grey "default ImGui" feel; the
+        // azure accent then sits in the SAME hue family so it integrates rather than clashing.
+        SysVec4 bg0 = Rgb(0x0C0E13);     // window background — deepest blue-charcoal
+        SysVec4 bg1 = Rgb(0x141822);     // child / popup / panel body — raised surface
+        SysVec4 bg2 = Rgb(0x1E2430);     // input frames — clearly lighter so a slot reads as a slot
+        SysVec4 bg3 = Rgb(0x2B3340);     // hovered frames / scrollbar grab
+        SysVec4 header = Rgb(0x222B3A);  // collapsing headers / component-title bands / selected tabs (bluer)
+        SysVec4 headerHi = Rgb(0x2F3A4D);// header hovered — brighter blue-slate
+        SysVec4 accentHi = Lighten(accent, 1.30f);
+        SysVec4 accentDim = Darken(accent, 0.55f);
+        SysVec4 accentMid = WithAlpha(accent, 0.55f);
+        SysVec4 accentFaint = WithAlpha(accent, 0.20f);
+        SysVec4 accentRow = WithAlpha(accent, 0.32f);   // selected tree / table row — clearly readable
+        SysVec4 text = Rgb(0xEDEFF3);    // bright primary text (≥13:1 on all surfaces)
+        SysVec4 textDim = Rgb(0x9098A6); // secondary/disabled — clears 4.5:1 on the lightest input frame
+        SysVec4 border = Rgb(0x05070A);  // outer seam (popups/tables) — near-black, defines panel edges
+        SysVec4 frameBorder = Rgb(0x000000);            // 1px recessed border on input frames (the UE5 tell)
+        SysVec4 borderLight = Rgb(0x3A4150);
+        SysVec4 titleBg = Rgb(0x0A0C0F);
 
         c[(int)ImGuiCol.Text] = text;
         c[(int)ImGuiCol.TextDisabled] = textDim;
         c[(int)ImGuiCol.WindowBg] = bg0;
         c[(int)ImGuiCol.ChildBg] = new SysVec4(0, 0, 0, 0);
         c[(int)ImGuiCol.PopupBg] = bg1;
-        c[(int)ImGuiCol.Border] = border;
+        c[(int)ImGuiCol.Border] = frameBorder;          // FrameBorderSize=1 now draws this on every input slot
         c[(int)ImGuiCol.BorderShadow] = new SysVec4(0, 0, 0, 0);
         c[(int)ImGuiCol.FrameBg] = bg2;
-        c[(int)ImGuiCol.FrameBgHovered] = Mix(bg3, accent, 0.10f);
-        c[(int)ImGuiCol.FrameBgActive] = accentFaint;
+        c[(int)ImGuiCol.FrameBgHovered] = Mix(bg2, accent, 0.16f);
+        c[(int)ImGuiCol.FrameBgActive] = Mix(bg2, accent, 0.28f);
         c[(int)ImGuiCol.TitleBg] = titleBg;
-        c[(int)ImGuiCol.TitleBgActive] = titleBg;
+        c[(int)ImGuiCol.TitleBgActive] = header;            // focused panel's title bar reads as raised (blue-slate)
         c[(int)ImGuiCol.TitleBgCollapsed] = titleBg;
-        c[(int)ImGuiCol.MenuBarBg] = Rgb(0x101216);
+        c[(int)ImGuiCol.MenuBarBg] = Rgb(0x0A0C11);
         c[(int)ImGuiCol.ScrollbarBg] = new SysVec4(0, 0, 0, 0);
         c[(int)ImGuiCol.ScrollbarGrab] = bg3;
         c[(int)ImGuiCol.ScrollbarGrabHovered] = borderLight;
         c[(int)ImGuiCol.ScrollbarGrabActive] = accent;
-        c[(int)ImGuiCol.CheckMark] = accentHi;
+        c[(int)ImGuiCol.CheckMark] = accentHi;          // bright azure check — clearly the accent
         c[(int)ImGuiCol.SliderGrab] = accent;
         c[(int)ImGuiCol.SliderGrabActive] = accentHi;
         c[(int)ImGuiCol.Button] = bg2;
-        c[(int)ImGuiCol.ButtonHovered] = Mix(bg3, accent, 0.18f);
+        c[(int)ImGuiCol.ButtonHovered] = Mix(bg3, accent, 0.22f);
         c[(int)ImGuiCol.ButtonActive] = accentDim;
-        c[(int)ImGuiCol.Header] = header;
-        c[(int)ImGuiCol.HeaderHovered] = Mix(header, accent, 0.16f);
-        c[(int)ImGuiCol.HeaderActive] = accentFaint;
-        c[(int)ImGuiCol.Separator] = WithAlpha(Rgb(0xFFFFFF), 0.06f);   // faint light hairline reads on near-black
+        c[(int)ImGuiCol.Header] = header;               // selected tree row / collapsing header
+        c[(int)ImGuiCol.HeaderHovered] = headerHi;
+        c[(int)ImGuiCol.HeaderActive] = accentRow;
+        c[(int)ImGuiCol.Separator] = WithAlpha(Rgb(0xFFFFFF), 0.08f);   // light hairline reads on near-black
         c[(int)ImGuiCol.SeparatorHovered] = accent;
         c[(int)ImGuiCol.SeparatorActive] = accentHi;
         c[(int)ImGuiCol.ResizeGrip] = new SysVec4(0, 0, 0, 0);
         c[(int)ImGuiCol.ResizeGripHovered] = accentFaint;
         c[(int)ImGuiCol.ResizeGripActive] = accent;
-        // Tabs: selected tab carries an accent top-bar feel via a brighter fill; dimmed tabs recede.
-        c[(int)ImGuiCol.Tab] = Rgb(0x16191E);
-        c[(int)ImGuiCol.TabHovered] = bg3;
+        // Tabs (UE5 signature): selected tab sits on the header surface with a FAT bright-azure overline;
+        // unselected tabs recede into near-black so the active document reads instantly.
+        c[(int)ImGuiCol.Tab] = Rgb(0x101318);
+        c[(int)ImGuiCol.TabHovered] = headerHi;
         c[(int)ImGuiCol.TabSelected] = header;
-        c[(int)ImGuiCol.TabSelectedOverline] = accent;
-        c[(int)ImGuiCol.TabDimmed] = Rgb(0x131519);
+        c[(int)ImGuiCol.TabSelectedOverline] = accentHi;
+        c[(int)ImGuiCol.TabDimmed] = Rgb(0x0C0E12);
         c[(int)ImGuiCol.TabDimmedSelected] = bg2;
-        c[(int)ImGuiCol.TabDimmedSelectedOverline] = accentDim;
-        c[(int)ImGuiCol.TextSelectedBg] = accentFaint;
+        c[(int)ImGuiCol.TabDimmedSelectedOverline] = accentMid;
+        c[(int)ImGuiCol.TextSelectedBg] = accentRow;
         c[(int)ImGuiCol.DragDropTarget] = accentHi;
         c[(int)ImGuiCol.NavCursor] = accentHi;
-        c[(int)ImGuiCol.ModalWindowDimBg] = new SysVec4(0.02f, 0.02f, 0.03f, 0.6f);
-        c[(int)ImGuiCol.TableHeaderBg] = bg1;
-        c[(int)ImGuiCol.TableBorderStrong] = WithAlpha(Rgb(0xFFFFFF), 0.07f);
-        c[(int)ImGuiCol.TableBorderLight] = WithAlpha(Rgb(0xFFFFFF), 0.035f);
+        c[(int)ImGuiCol.ModalWindowDimBg] = new SysVec4(0.01f, 0.01f, 0.02f, 0.65f);
+        c[(int)ImGuiCol.TableHeaderBg] = header;
+        c[(int)ImGuiCol.TableBorderStrong] = WithAlpha(Rgb(0xFFFFFF), 0.09f);
+        c[(int)ImGuiCol.TableBorderLight] = WithAlpha(Rgb(0xFFFFFF), 0.04f);
         c[(int)ImGuiCol.TableRowBg] = new SysVec4(0, 0, 0, 0);
-        c[(int)ImGuiCol.TableRowBgAlt] = new SysVec4(1, 1, 1, 0.02f);
+        c[(int)ImGuiCol.TableRowBgAlt] = new SysVec4(1, 1, 1, 0.022f);
 
         // Docking: the empty central node + drag-preview overlay match the dark base / accent.
         c[(int)ImGuiCol.DockingEmptyBg] = bg0;
-        c[(int)ImGuiCol.DockingPreview] = accentFaint;
+        c[(int)ImGuiCol.DockingPreview] = accentMid;
     }
 
     static SysVec4 Lighten(SysVec4 c, float f) => new(

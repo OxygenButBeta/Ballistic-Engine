@@ -9,7 +9,10 @@ namespace BallisticEngine.Editor;
 // Load() runs once at startup BEFORE the theme is first applied; Save() runs whenever the Settings
 // panel changes something. All access is via the static Current snapshot.
 internal sealed class EditorPrefs {
-    // --- Theme --- refined azure accent that pairs with the cool-graphite panels (0x3D8BD4).
+    // --- Theme --- STATIC azure accent (0x3D8BD4) paired with the deep-graphite panels. EF5e: the accent
+    // is now a FIXED constant, NOT user-overridable — a saved editorprefs.json with an old (e.g. orange)
+    // accent used to override the theme so the UE5 palette never showed. These fields stay for json back-compat
+    // (deserialization won't choke) but the Accent property below ignores them and always returns azure.
     public float AccentR { get; set; } = 0.239f;
     public float AccentG { get; set; } = 0.545f;
     public float AccentB { get; set; } = 0.831f;
@@ -70,10 +73,13 @@ internal sealed class EditorPrefs {
         Save();
     }
 
+    // EF5e: the editor accent is STATIC — always the azure 0x3D8BD4, regardless of any saved/old value in
+    // editorprefs.json. (An old orange accent in the json was silently overriding the new UE5 theme.) The
+    // setter is intentionally a no-op so the Settings "Accent color" control can't drift the theme either.
     [JsonIgnore]
     public SysVec4 Accent {
-        get => new(AccentR, AccentG, AccentB, 1f);
-        set { AccentR = value.X; AccentG = value.Y; AccentB = value.Z; }
+        get => new(0.239f, 0.545f, 0.831f, 1f);
+        set { /* static theme: accent is fixed, ignore writes */ }
     }
 
     // ---- Storage ----

@@ -2211,23 +2211,32 @@ internal sealed class EditorApplication {
         ImGui.SetNextWindowBgAlpha(EditorTheme.OverlayBg.W);
         if (ImGui.Begin("##sceneToolsOverlay", flags)) {
             // Move/Rotate/Scale segmented control on its own dark pill, mirroring the old top-bar group.
-            float bw = 58 * S;
+            // EF1: size each mode button to fit its icon+label (the fixed 58*S clipped "Move"/"Rotate"/
+            // "Scale" to "Mov"/"Rot"/"Sca"). Measure all three labels, take the widest, add frame padding,
+            // floor at 58*S so they stay a visually equal segmented group. Same for the Pivot/Center button.
+            string lMove = EditorIcons.Add + " Move", lRot = EditorIcons.Refresh + " Rotate",
+                   lScale = EditorIcons.Maximize + " Scale";
+            float framePadX = ImGui.GetStyle().FramePadding.X * 2f;
+            float bw = MathF.Max(58 * S, MathF.Max(ImGui.CalcTextSize(lMove).X,
+                MathF.Max(ImGui.CalcTextSize(lRot).X, ImGui.CalcTextSize(lScale).X)) + framePadX);
             float h = ImGui.GetFrameHeight();
             SysVec2 pillStart = ImGui.GetCursorScreenPos();
             ImGui.GetWindowDrawList().AddRectFilled(
                 pillStart - new SysVec2(3 * S, 3 * S),
                 pillStart + new SysVec2(bw * 3 + 4 * S + 3 * S, h + 3 * S),
                 ImGui.GetColorU32(EditorTheme.OverlayPill), 6f * S);
-            GizmoModeButton(EditorIcons.Add + " Move", GizmoMode.Translate, bw, "Move (W)");
+            GizmoModeButton(lMove, GizmoMode.Translate, bw, "Move (W)");
             ImGui.SameLine(0, 2 * S);
-            GizmoModeButton(EditorIcons.Refresh + " Rotate", GizmoMode.Rotate, bw, "Rotate (E)");
+            GizmoModeButton(lRot, GizmoMode.Rotate, bw, "Rotate (E)");
             ImGui.SameLine(0, 2 * S);
-            GizmoModeButton(EditorIcons.Maximize + " Scale", GizmoMode.Scale, bw, "Scale (R)");
+            GizmoModeButton(lScale, GizmoMode.Scale, bw, "Scale (R)");
 
             // Pivot / Center.
             ImGui.SameLine(0, 10 * S);
             bool isPivot = gizmo.Pivot == GizmoPivot.Pivot;
-            if (ImGui.Button(isPivot ? "Pivot" : "Center", new SysVec2(58 * S, h)))
+            float pivotW = MathF.Max(58 * S,
+                MathF.Max(ImGui.CalcTextSize("Pivot").X, ImGui.CalcTextSize("Center").X) + framePadX);
+            if (ImGui.Button(isPivot ? "Pivot" : "Center", new SysVec2(pivotW, h)))
                 gizmo.Pivot = isPivot ? GizmoPivot.Center : GizmoPivot.Pivot;
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip(isPivot ? "Handle at the entity's pivot (click for Center)"

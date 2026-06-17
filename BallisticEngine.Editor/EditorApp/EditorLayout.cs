@@ -113,26 +113,40 @@ internal static class EditorLayout {
         return Array.Empty<string>();
     }
 
-    // Builds the default arrangement inside `dockId`: Hierarchy left, Inspector right, Assets+Console
-    // tabbed along the bottom, Viewport filling the center. Run inside the dock-host window for the
-    // frame the layout needs (re)building.
+    // Builds the default arrangement inside `dockId` (the user-approved layout, EF5e):
+    //   ┌──────────┬──────────┬───────────────────────────┐
+    //   │ Scene    │ Details  │  Scene View / Game View    │
+    //   │ Comps    │          │  (tabbed, fills the center) │
+    //   ├──────────┤          │                            │
+    //   │ Entities │          │                            │
+    //   ├──────────┴──────────┴───────────────────────────┤
+    //   │             Assets + Console (tabbed)            │
+    //   └──────────────────────────────────────────────────┘
+    // Far-left column is split HORIZONTALLY: Scene Components on top, Entities below. The Inspector
+    // ("Details") sits in a second column to the LEFT of the viewport (not on the right). Standalone tool
+    // windows (Tags & Layers, Profiler, Settings) are NOT placed here — they open floating from the Window
+    // menu and the user docks them where they like (they aren't core dockable panels).
+    // Run inside the dock-host window for the frame the layout needs (re)building.
     public static unsafe void BuildDefault(uint dockId, SysVec2 size) {
         ImGuiP.DockBuilderRemoveNode(dockId);
         ImGuiP.DockBuilderAddNode(dockId, ImGuiDockNodeFlags.None);
         ImGuiP.DockBuilderSetNodeSize(dockId, size);
 
-        uint center = dockId, left, right, bottom;
-        ImGuiP.DockBuilderSplitNode(center, ImGuiDir.Left, 0.16f, &left, &center);
-        ImGuiP.DockBuilderSplitNode(center, ImGuiDir.Right, 0.22f, &right, &center);
-        ImGuiP.DockBuilderSplitNode(center, ImGuiDir.Down, 0.28f, &bottom, &center);
+        uint center = dockId, leftOuter, details, bottom, leftTop, leftBottom;
+        // Bottom strip first (full width), then the two left columns, leaving the viewport in the center.
+        ImGuiP.DockBuilderSplitNode(center, ImGuiDir.Down, 0.26f, &bottom, &center);
+        ImGuiP.DockBuilderSplitNode(center, ImGuiDir.Left, 0.15f, &leftOuter, &center);   // far-left: hierarchy column
+        ImGuiP.DockBuilderSplitNode(center, ImGuiDir.Left, 0.26f, &details, &center);     // second column: Details
+        // Far-left column split horizontally: Scene Components (top) over Entities (bottom).
+        ImGuiP.DockBuilderSplitNode(leftOuter, ImGuiDir.Up, 0.42f, &leftTop, &leftBottom);
 
-        ImGuiP.DockBuilderDockWindow(Entities, left);
-        ImGuiP.DockBuilderDockWindow(SceneComponents, left);   // tabbed with Entities
-        ImGuiP.DockBuilderDockWindow(Inspector, right);
+        ImGuiP.DockBuilderDockWindow(SceneComponents, leftTop);
+        ImGuiP.DockBuilderDockWindow(Entities, leftBottom);
+        ImGuiP.DockBuilderDockWindow(Inspector, details);
         ImGuiP.DockBuilderDockWindow(Assets, bottom);
-        ImGuiP.DockBuilderDockWindow(Console, bottom);   // tabbed with Assets
+        ImGuiP.DockBuilderDockWindow(Console, bottom);       // tabbed with Assets
         ImGuiP.DockBuilderDockWindow(SceneView, center);
-        ImGuiP.DockBuilderDockWindow(GameView, center);  // tabbed with Scene View
+        ImGuiP.DockBuilderDockWindow(GameView, center);      // tabbed with Scene View
         ImGuiP.DockBuilderFinish(dockId);
     }
 }

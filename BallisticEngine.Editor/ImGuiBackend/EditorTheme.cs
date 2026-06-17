@@ -41,8 +41,8 @@ internal static class EditorTheme {
     // The member LABEL was drawn with TextDisabled (the dead grey that made rows read as "off"). A real,
     // legible label color + a recessive caption color give the rows a proper hierarchy. Tuned to the
     // graphite palette in ImGuiController.ApplyColors.
-    public static readonly SysVec4 RowLabel   = new(0.78f, 0.81f, 0.86f, 1f);   // brighter than TextDisabled (>=9:1 on inputs)
-    public static readonly SysVec4 RowCaption = new(0.55f, 0.58f, 0.65f, 1f);   // the "(?)" badge / hints
+    public static readonly SysVec4 RowLabel   = new(0.82f, 0.85f, 0.90f, 1f);   // brighter than TextDisabled (>=10:1 on the deep base)
+    public static readonly SysVec4 RowCaption = new(0.57f, 0.61f, 0.69f, 1f);   // the "(?)" badge / hints
 
     // Hover-accent bar drawn at the LEFT edge of a hovered row (the affordance the flat rows lacked). Faint
     // fill across the row + a brighter accent sliver — one AddRectFilled each, hover-gated (cheap).
@@ -57,21 +57,21 @@ internal static class EditorTheme {
     // matches the panels WITHOUT re-typing hex constants in two places — the exact "koddan elle tanımlama"
     // duplication the rework fights. Values mirror ApplyColors' bg0..titleBg ramp byte-for-byte; if that ramp
     // is retuned, retune here too (a future E1 step folds ApplyColors onto these so they can't drift).
-    // EF5a — mirrors ImGuiController.ApplyColors' deep-graphite UE5 ramp byte-for-byte (see note above).
-    public static readonly SysVec4 Bg0         = Rgb(0x16181C);   // window background — base graphite
-    public static readonly SysVec4 Bg1         = Rgb(0x1D2026);   // child / popup — raised surface
-    public static readonly SysVec4 Bg2         = Rgb(0x262A31);   // frames (inputs)
-    public static readonly SysVec4 Bg3         = Rgb(0x333842);   // hovered frames
-    public static readonly SysVec4 HeaderBg    = Rgb(0x2B3038);   // collapsing headers / selected tabs
-    public static readonly SysVec4 Text        = Rgb(0xECEEF2);   // bright primary text
-    public static readonly SysVec4 TextDim     = Rgb(0x8C94A1);   // disabled / secondary text
-    public static readonly SysVec4 Border      = Rgb(0x0C0E11);   // seam where one is still wanted
-    public static readonly SysVec4 BorderLight = Rgb(0x363C46);   // subtle inner dividers
-    public static readonly SysVec4 TitleBg     = Rgb(0x121418);   // title bars
+    // EF5e — mirrors ImGuiController.ApplyColors' cool BLUE-slate ramp byte-for-byte (see note).
+    public static readonly SysVec4 Bg0         = Rgb(0x0C0E13);   // window background — deepest blue-charcoal
+    public static readonly SysVec4 Bg1         = Rgb(0x141822);   // child / popup / panel body — raised surface
+    public static readonly SysVec4 Bg2         = Rgb(0x1E2430);   // input frames (clearly lighter)
+    public static readonly SysVec4 Bg3         = Rgb(0x2B3340);   // hovered frames
+    public static readonly SysVec4 HeaderBg    = Rgb(0x222B3A);   // collapsing headers / selected tabs / title bands
+    public static readonly SysVec4 Text        = Rgb(0xEDEFF3);   // bright primary text
+    public static readonly SysVec4 TextDim     = Rgb(0x9098A6);   // disabled / secondary text
+    public static readonly SysVec4 Border      = Rgb(0x05070A);   // seam where one is still wanted
+    public static readonly SysVec4 BorderLight = Rgb(0x3A4150);   // subtle inner dividers
+    public static readonly SysVec4 TitleBg     = Rgb(0x0A0C0F);   // title bars
 
     // In-viewport toolbar chrome (RW3 E7). The overlay floats OVER the 3D image, so it needs its own
     // translucent surface + pill so the controls read against any scene. Tuned off the ramp above.
-    public static readonly SysVec4 OverlayBg   = new(0.086f, 0.094f, 0.110f, 0.82f);  // ~Bg0 @ 0.82 — pill backing
+    public static readonly SysVec4 OverlayBg   = new(0.055f, 0.063f, 0.078f, 0.86f);  // ~Bg0 @ 0.86 — pill backing
     public static readonly SysVec4 OverlayPill = new(0.0f, 0.0f, 0.0f, 0.30f);        // segmented-control backing
     public static readonly SysVec4 OverlayBorder = new(1f, 1f, 1f, 0.07f);            // hairline around the pill
     public const float OverlayRounding = 7f;   // pill corner radius (px, pre-scale)
