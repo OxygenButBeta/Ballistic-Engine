@@ -462,17 +462,10 @@ public sealed class DX12HDRenderer : HDRenderer {
     bool bloomThisFrame;
 
     // SSAO: HBAO from depth → half-res AO target (+ separable blur), multiplied in the composite.
-    ID3D12RootSignature ssaoRootSig;    // SsaoConstants CBV (b0) + 1 SRV (t0: depth, then AO for blur) + sampler
-    ID3D12PipelineState ssaoPso, ssaoBlurHPso, ssaoBlurVPso;
-    Dx12OffscreenTarget ssaoA, ssaoB;   // half-res R8 ping-pong
-    ID3D12Resource ssaoCb;
-    unsafe byte* ssaoCbMapped;
-    Dx12DescriptorHeap ssaoSrvVisible;  // depth/AO source per sub-pass (3 slots)
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct SsaoConstants {
-        public Matrix4x4 Projection; public Matrix4x4 InvProjection; public Matrix4x4 View;
-        public float Radius; public float Intensity; public Vector2 TexelSize;
-    }
+    // CONVERTED to a pass-graph IRenderPass (chunk 4): Dx12SsaoPass owns the rootsig/PSOs/CB/heap/targets and
+    // runs at the PostProcess event via the graph. The still-inline composite reads its result via
+    // ssaoPass.ResultSrvCpu until composite itself converts (chunk 7).
+    Dx12SsaoPass ssaoPass;
 
     // Skybox pass (background): its own root sig (CBV b0 + cube SRV t0 + clamp sampler) + PSO (LEqual,
     // no depth write, cull none, SV_VertexID cube). Drawn after opaque in the same command list.
@@ -692,7 +685,9 @@ public sealed class DX12HDRenderer : HDRenderer {
         gbuffer = new Dx12GBuffer(dev, internalW, internalH);
         motionPrevValid = false;                                // prev view*proj is stale after a realloc
         if (bloomRootSig != null) AllocBloomTargets();          // half-res bloom ping-pong follows size
-        if (ssaoRootSig != null) AllocSsaoTargets();
+        // SSAO targets now reallocated via graph.Resize (Dx12SsaoPass.Resize) at the tail of this method — see
+        // the graph?.Resize call below. Its slot in the AllocXxx sequence (2nd, after bloom) is preserved by
+        // registration order (R5).
         if (ssrRootSig != null) AllocSsrTarget();
         if (ssgiRootSig != null) AllocSsgiTargets();
         if (taaRootSig != null) AllocTaaTargets();
@@ -823,10 +818,14 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         AllocFsrOutput();   // output-res UAV target for FSR (allocated even when off — cheap, simplifies resize)
 
-        // Phase-1 pass-graph scaffold: build the executor EMPTY (zero passes registered yet). Wired with
-        // the renderer's TimePass so converted passes get GPU timings; runs as a no-op until passes are
-        // moved onto IRenderPass in later chunks. Build() once for the stable order (R1).
+        // Phase-1 pass-graph: build the executor and register the converted passes. Wired with the renderer's
+        // TimePass so converted passes get GPU timings. Register in the original AllocateResolutionTargets
+        // AllocXxx order so graph.Resize fans out in that sequence (R5): bloom→ssao→ssr→ssgi→taa→rtShadowMask→
+        // fsr; bloom/ssr/ssgi/taa/rtShadowMask/fsr are still inline (alloc before graph.Resize), so SSAO — the
+        // first converted pass — registers first. Build() once for the stable order (R1).
         graph = new Dx12RenderGraph(TimePass);
+        ssaoPass = new Dx12SsaoPass(dev, targetW, targetH);   // chunk 4: first leaf-post pass (was BuildSsao)
+        graph.Add(ssaoPass);
         graph.Build();
     }
 
@@ -1242,55 +1241,11 @@ public sealed class DX12HDRenderer : HDRenderer {
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4, shaderVisible: true, framesInFlight: dev.FramesInFlight);
 
         BuildLumAverage();
-        BuildSsao();
     }
 
-    unsafe void BuildSsao() {
-        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-        // 2-SRV table: main pass = depth(t0) + G-buffer world normal(t1); blur passes = AO(t0).
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 0);
-        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
-        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
-            Filter = Filter.MinMagMipPoint, AddressU = TextureAddressMode.Clamp,
-            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
-            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
-        };
-        ssaoRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
-
-        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("Ssao.hlsl");
-        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "Ssao.hlsl");
-        ID3D12PipelineState MakePso(string entry) => dev.Device.CreateGraphicsPipelineState(
-            new GraphicsPipelineStateDescription {
-                RootSignature = ssaoRootSig, VertexShader = vs,
-                PixelShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, entry, "Ssao.hlsl"),
-                InputLayout = null, PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
-                RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
-                DepthStencilState = DepthStencilDescription.None,
-                RenderTargetFormats = new[] { Format.R8_UNorm }, DepthStencilFormat = Format.Unknown,
-                SampleDescription = new SampleDescription(1, 0),
-            });
-        ssaoPso = MakePso("PSMain");
-        ssaoBlurHPso = MakePso("PSBlurH");
-        ssaoBlurVPso = MakePso("PSBlurV");
-
-        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<SsaoConstants>() + 255) & ~255;
-        ssaoCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        ssaoCbMapped = ssaoCb.Map<byte>(0);
-        // Main pass binds a 2-SRV run (depth+normal); each blur binds a 2-SRV run (AO at t0, t1 unused).
-        // 3 runs × 2 = 6 contiguous slots.
-        ssaoSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 6, shaderVisible: true, framesInFlight: dev.FramesInFlight);
-        AllocSsaoTargets();
-    }
-
-    void AllocSsaoTargets() {
-        ssaoA?.Dispose(); ssaoB?.Dispose();
-        int w = System.Math.Max(1, targetW / 2), h = System.Math.Max(1, targetH / 2);
-        ssaoA = new Dx12OffscreenTarget(dev, w, h, withDepth: false, colorFormat: Format.R8_UNorm, colorReadable: true);
-        ssaoB = new Dx12OffscreenTarget(dev, w, h, withDepth: false, colorFormat: Format.R8_UNorm, colorReadable: true);
-    }
+    // BuildSsao / AllocSsaoTargets / DrawSsao moved VERBATIM to Resources/Dx12SsaoPass.cs (chunk 4 — first
+    // leaf-post conversion). The pass owns the rootsig/PSOs/CB/heap/targets, runs at the PostProcess event via
+    // the graph, and exposes its result via ssaoPass.ResultSrvCpu for the still-inline composite.
 
     unsafe void BuildLumAverage() {
         // LumConstants CBV (b0) + 2 SRVs (t0 HDR scene, t1 prev-EV history) + clamp sampler; outputs the 1×1
@@ -2190,27 +2145,15 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         bool ssaoOn = doors.Ssao;
 
-        if (fsrActive) {
-            // --- FSR upscale path (replaces TAA): SSAO (internal res) → FSR reconstruct internal→output
-            //     HDR → composite at output res. ---
-            if (ssaoOn) DrawSsao(view, proj);
-            RunFsr();
-            DrawComposite(ssaoOn, fsrOutput);
-        } else {
-            // --- Native path: TAA → SSAO → composite (all at the single shared resolution). ---
-            if (taaOn) DrawTaa();
-            else taaHistoryValid = false;   // keep history fresh for when TAA turns back on
-            if (ssaoOn) DrawSsao(view, proj);
-            DrawComposite(ssaoOn, target);
-        }
-
-        // === PHASE-1 PASS-GRAPH SCAFFOLD (chunk 3) ===
+        // === PHASE-1 PASS-GRAPH (chunk 4: SSAO is the first converted leaf-post pass) ===
         // Assemble the per-frame context from the locals computed above + the mid-frame-resolved flags, then
-        // run the graph. The graph is EMPTY this chunk, so Execute is a guaranteed no-op — every pass above
-        // still ran inline, so the image is byte-identical. This only proves Dx12FrameContext builds against
-        // the real locals and the executor runs without disturbing the frame. Passes migrate onto it in later
-        // chunks; once a pass moves here its inline call above is deleted. Built last so every mutated field
-        // (SceneColor after the FSR/native branch, IblActive/Shadows/RtShadows/giMode) holds its final value.
+        // run the graph. Placed HERE (before the TAA/FSR/composite block) because SSAO lives in the
+        // PostProcess group and the still-inline composite below READS the SSAO result (ssaoPass.ResultSrvCpu).
+        // SSAO reads only the G-buffer (depth + world normal) and writes its own half-res target — it is
+        // independent of TAA (which reads/writes `target`) and of the FSR/native branch, so running it here
+        // instead of interleaved with TAA is byte-neutral (verified: floor=0). Every mutated ctx field already
+        // holds its final value at this point (fsrActive/giMode/IblActive/Shadows resolved earlier in
+        // BeginRender). Passes still inline below run after the graph until they convert in later chunks.
         var ctx = new Dx12FrameContext {
             View = view, Proj = proj, ViewProj = viewProj,
             ProjUnjittered = projUnjittered, ViewProjUnjittered = viewProjUnjittered,
@@ -2229,7 +2172,19 @@ public sealed class DX12HDRenderer : HDRenderer {
             RtShadowsThisFrame = rtShadowsThisFrame,
             GiMode = giMode,
         };
-        graph.Execute(ctx);   // no-op: empty graph (scaffold). Byte-identical to before this chunk.
+        graph.Execute(ctx);   // runs SSAO (Enabled = doors.Ssao) at its PostProcess slot, before composite.
+
+        if (fsrActive) {
+            // --- FSR upscale path (replaces TAA): SSAO (ran in graph above) → FSR reconstruct
+            //     internal→output HDR → composite at output res. ---
+            RunFsr();
+            DrawComposite(ssaoOn, fsrOutput);
+        } else {
+            // --- Native path: TAA → composite (SSAO ran in graph above; all at the shared resolution). ---
+            if (taaOn) DrawTaa();
+            else taaHistoryValid = false;   // keep history fresh for when TAA turns back on
+            DrawComposite(ssaoOn, target);
+        }
 
         // Editor display path: leave the LDR composite in PixelShaderResource so the editor's ImGui pass can
         // sample it via SceneColorHandle/GameColorHandle THIS frame. The player (PresentToScreen) keeps it in
@@ -3610,49 +3565,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         }
     }
 
-    // HBAO from the G-buffer (scene depth for view-pos + world normal, both already SRVs from the deferred
-    // pass) → blurred half-res AO in ssaoA. No depth-reconstructed normal anymore — the real surface normal
-    // comes straight from the G-buffer (sharper, silhouette-correct). View transforms the world normal into
-    // view space for the horizon march.
-    unsafe void DrawSsao(Matrix4x4 view, Matrix4x4 proj) {
-        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        Matrix4x4.Invert(proj, out Matrix4x4 invProj);
-        gbuffer.DepthToShaderResource();   // no-op if fog already moved it
-        *(SsaoConstants*)ssaoCbMapped = new SsaoConstants {
-            Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProj),
-            View = Matrix4x4.Transpose(view),
-            Radius = 0.5f, Intensity = 1.0f, TexelSize = new Vector2(1f / ssaoA.Width, 1f / ssaoA.Height),
-        };
-        // Main AO pass: depth(t0) + G-buffer world normal(t1) → ssaoA. Uses slots 0,1.
-        dev.Device.CopyDescriptorsSimple(1, ssaoSrvVisible.Cpu(0), gbuffer.DepthSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssaoSrvVisible.Cpu(1), gbuffer.ColorSrvCpu(1), heapType);
-        ssaoA.RenderColorOnly(cl => {
-            cl.SetGraphicsRootSignature(ssaoRootSig); cl.SetPipelineState(ssaoPso);
-            cl.SetDescriptorHeaps(ssaoSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, ssaoCb.GPUVirtualAddress);
-            cl.SetGraphicsRootDescriptorTable(1, ssaoSrvVisible.Gpu(0));
-            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            cl.DrawInstanced(3, 1, 0, 0);
-        });
-        // Blur H (ssaoA→ssaoB), Blur V (ssaoB→ssaoA). Each binds a 2-slot run (AO at t0; t1 unused but
-        // copied so the descriptor is valid). Runs at slots 2 and 4.
-        void Blur(ID3D12PipelineState pso, Dx12OffscreenTarget src, Dx12OffscreenTarget dst, int srvSlot) {
-            src.ColorToShaderResource();
-            dev.Device.CopyDescriptorsSimple(1, ssaoSrvVisible.Cpu(srvSlot), src.ColorSrvCpu, heapType);
-            dev.Device.CopyDescriptorsSimple(1, ssaoSrvVisible.Cpu(srvSlot + 1), src.ColorSrvCpu, heapType);
-            dst.RenderColorOnly(cl => {
-                cl.SetGraphicsRootSignature(ssaoRootSig); cl.SetPipelineState(pso);
-                cl.SetDescriptorHeaps(ssaoSrvVisible.Heap);
-                cl.SetGraphicsRootConstantBufferView(0, ssaoCb.GPUVirtualAddress);
-                cl.SetGraphicsRootDescriptorTable(1, ssaoSrvVisible.Gpu(srvSlot));
-                cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-                cl.DrawInstanced(3, 1, 0, 0);
-            });
-        }
-        Blur(ssaoBlurHPso, ssaoA, ssaoB, 2);
-        Blur(ssaoBlurVPso, ssaoB, ssaoA, 4);
-        ssaoA.ColorToShaderResource();
-    }
+    // DrawSsao moved VERBATIM to Resources/Dx12SsaoPass.Record (chunk 4). It runs at the PostProcess event via
+    // graph.Execute; the still-inline composite reads its blurred half-res AO via ssaoPass.ResultSrvCpu.
 
     // Bloom: bright-pass the HDR `src` (already in SRV state) → bloomA; blur H (bloomA→bloomB);
     // blur V (bloomB→bloomA). Result lands in bloomA at half-res for the composite to add. `src` is the
@@ -3869,7 +3783,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(2),
             useMeter ? meteredEvTarget.ColorSrvCpu : hdr.ColorSrvCpu, heapType);   // adapted-EV slot (Automatic only)
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(3),
-            ssaoOn ? ssaoA.ColorSrvCpu : hdr.ColorSrvCpu, heapType);     // AO slot
+            ssaoOn ? ssaoPass.ResultSrvCpu : hdr.ColorSrvCpu, heapType);     // AO slot (pass-owned ssaoA)
 
         ldr.RenderColorOnly(cl => {
             cl.SetGraphicsRootSignature(compositeRootSig);
