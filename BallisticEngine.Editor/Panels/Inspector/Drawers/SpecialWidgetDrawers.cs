@@ -139,6 +139,71 @@ public sealed class CollectionDrawer : ITypeDrawer {
     }
 }
 
+// editor-rework G2-editor (ch21): the VISIBLE half of the Dictionary<K,V> round-trip (the engine half --
+// SerializeDictionary / DeserializeDictionary -- landed in ch19, so a Dictionary<K,V> member round-trips
+// instead of dropping to null). Terminal drawer for a closed-generic `Dictionary<K,V>` member. Before this
+// it matched no drawer and fell to TypeDrawerTerminalStep -> gui.Unsupported -> a dead `(Dictionary`2)`
+// disabled label. Now it routes to the host's interactive dictionary editor (per-entry rows, Add / Remove,
+// each VALUE drawn RECURSIVELY by its own terminal drawer -- a Dictionary<string,int> draws int widgets, a
+// Dictionary<string,Material> draws asset slots, a Dictionary<int,EntityRef> draws scene-object slots), the
+// parallel of CollectionDrawer.
+//
+// Registered AFTER CollectionDrawer (last-wins); no conflict -- a Dictionary<,> is neither List<> nor an
+// array, so CollectionDrawer.CanDraw returns false for it. Scope (ch21): leaf-key + leaf/asset/scene-ref
+// VALUE dictionaries (the common case). KEY is drawn READ-ONLY (Dictionary keys are immutable: editing a key
+// in place would have to remove-old + add-new, and a duplicate-key clash needs handling -- deferred). A
+// nested-struct key OR value with no registered terminal drawer falls to Unsupported per-cell exactly as a
+// struct member does today (G4). The drawer reports false (no auto-dirty): the host pushes undo + marks dirty
+// itself only on an actual add / remove / value edit, like CollectionDrawer.
+public sealed class DictionaryDrawer : ITypeDrawer {
+    readonly IComponentInspectorHost host;
+    public DictionaryDrawer(IComponentInspectorHost host) => this.host = host;
+    public bool CanDraw(Type t) =>
+        t.IsGenericType && t.GetGenericTypeDefinition() == typeof(Dictionary<,>);
+    public bool Draw(IProperty p, IInspectorGui gui) {
+        host.DrawDictionarySlot(p);
+        return false;
+    }
+}
+
+// editor-rework G2-editor (ch21): an IProperty over the VALUE slot of one dictionary entry (dict[key]). Lets
+// a dictionary value flow through the SAME terminal drawer resolution as a member / collection element -- an
+// int value resolves IntDrawer, a Material value resolves AssetSlotDrawer, an EntityRef value resolves
+// SceneObjectRefDrawer -- so the recursion is "draw-a-value", not a per-value type switch (Rule 2). Get reads
+// the boxed value for the captured key; Set writes it back through the supplied `assign` delegate (which sets
+// dict[key] = newValue and writes the WHOLE dictionary back to the owning member -> ApplyMember multi-select
+// broadcast + dirty), so a value edit behaves exactly like a member edit. Has no MemberInfo, so it carries NO
+// attributes/range/conditionals (a value cell is a bare value); ValueType is the value type. The sibling
+// CollectionElementProperty serves list/array elements; this one serves dictionary values (same shape).
+public sealed class DictionaryValueProperty : IProperty {
+    readonly Func<object> get;
+    readonly Action<object> assign;
+
+    public DictionaryValueProperty(string name, Type valueType, Func<object> get, Action<object> assign) {
+        Name = name;
+        ValueType = valueType;
+        this.get = get;
+        this.assign = assign;
+    }
+
+    public string Name { get; }
+    public string Label => Name;
+    public string Tooltip => null;
+    public Type ValueType { get; }
+    public object Owner => null;
+
+    public object Get() => get();
+    public void Set(object value) => assign(value);
+
+    public MemberAttributes Attributes => MemberAttributes.None;
+    public (float min, float max)? Range => null;
+    public bool IsColor => false;
+    public bool Hdr => false;
+    public bool HasOverrideToggle => false;
+    public bool Overridden { get => false; set { } }
+    public bool TryGetSiblingValue(string memberName, out object value) { value = null; return false; }
+}
+
 // editor-rework G2-editor: an IProperty over one ELEMENT slot of a collection (list[i] / array[i]). Lets a
 // collection element flow through the SAME terminal drawer resolution as a member -- a Vector3 element resolves
 // Vector3Drawer, a Material element resolves AssetSlotDrawer, an EntityRef element resolves SceneObjectRefDrawer

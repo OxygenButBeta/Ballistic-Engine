@@ -40,6 +40,15 @@ public interface IComponentInspectorHost {
     // host-method shape; the host unwraps the IProperty, mutates the backing collection, writes it back through
     // the property (-> ApplyMember multi-select broadcast + dirty), and pushes one undo per add / remove / edit.
     void DrawCollectionSlot(IProperty property);
+
+    // editor-rework G2-editor (ch21, the visible half of the Dictionary<K,V> round-trip; engine half done in
+    // ch19): the dictionary terminal drawer (DictionaryDrawer) routes a Dictionary<K,V> member here. The host
+    // renders an interactive dictionary editor (count + Add, per-entry row with a READ-ONLY key + a value drawn
+    // RECURSIVELY by its own terminal drawer + a Remove button) in place of the dead `(Dictionary`2)` disabled
+    // label these members fell to via gui.Unsupported. Mirrors the DrawCollectionSlot host-method shape; the
+    // host unwraps the IProperty, mutates the backing dictionary, writes it back through the property (->
+    // ApplyMember multi-select broadcast + dirty), and pushes one undo per add / remove / value edit.
+    void DrawDictionarySlot(IProperty property);
 }
 
 public sealed class ImGuiComponentGui : IInspectorGui {

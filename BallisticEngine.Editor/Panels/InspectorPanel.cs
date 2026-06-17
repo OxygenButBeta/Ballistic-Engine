@@ -81,6 +81,8 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         memberRegistry.Register(new SceneObjectRefDrawer(this));
         // G2-editor: List<T>/T[] get the interactive collection editor (was a dead (List`1) Unsupported label).
         memberRegistry.Register(new CollectionDrawer(this));
+        // G2-editor (ch21): Dictionary<K,V> gets the interactive entry editor (was a dead (Dictionary`2) label).
+        memberRegistry.Register(new DictionaryDrawer(this));
         // The standalone component window reuses our reflection member renderer.
         ComponentEditorWindow.Configure(DrawMemberList);
     }
@@ -108,6 +110,8 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     void IComponentInspectorHost.DrawSceneObjectSlot(Inspector.IProperty property) => DrawSceneObjectSlot(property);
     // G2-editor: the CollectionDrawer terminal drawer hands its IProperty here; render the per-element editor.
     void IComponentInspectorHost.DrawCollectionSlot(Inspector.IProperty property) => DrawCollectionSlot(property);
+    // G2-editor (ch21): the DictionaryDrawer terminal drawer hands its IProperty here; render the per-entry editor.
+    void IComponentInspectorHost.DrawDictionarySlot(Inspector.IProperty property) => DrawDictionarySlot(property);
 
     public void DrawContents() {
         ImGui.PushID(instanceId);   // namespace all ids so a 2nd Inspector window doesn't collide
@@ -1813,6 +1817,157 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         if (elemType.IsValueType) return Activator.CreateInstance(elemType);
         return null;
     }
+
+    // G2-editor (ch21, Rule 2): the interactive Dictionary<K,V> editor (the parallel of DrawCollectionSlot for
+    // the dictionary category). Renders, inside the value column the BeginRow opened: a "(N entries)" header +
+    // an "Add" button, then one row per entry -- a READ-ONLY key label + the VALUE drawn RECURSIVELY by its own
+    // terminal drawer (a Dictionary<string,int> draws int widgets, a Dictionary<string,Material> asset slots, a
+    // Dictionary<int,EntityRef> scene-object slots) + a Remove (X) button. Structural changes (Add / Remove)
+    // mutate the backing dictionary and write it back through the property (-> ApplyMember broadcast + dirty)
+    // under one EditorUndo.Push; value edits push undo via the value's own terminal drawer. Keys are READ-ONLY
+    // (Dictionary keys are immutable: in-place key edit = remove-old + add-new with a duplicate-key clash to
+    // resolve -- deferred, ch21 scope). A value type with no registered drawer shows Unsupported per-cell, like
+    // a struct member (G4). The key snapshot avoids a mid-iteration mutate.
+    void DrawDictionarySlot(Inspector.IProperty p) {
+        Type dictType = p.ValueType;
+        Type[] args = dictType.GetGenericArguments();
+        Type keyType = args[0];
+        Type valueType = args[1];
+        object boxed = p.Get();
+        System.Collections.IDictionary dict = boxed as System.Collections.IDictionary;
+
+        int count = dict?.Count ?? 0;
+
+        // Header row inside the value column: entry count + an Add button (full row width split).
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextDisabled($"{count} {(count == 1 ? "entry" : "entries")}");
+        ImGui.SameLine();
+        float addW = ImGui.GetFrameHeight() + 24;
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + Math.Max(0, ImGui.GetContentRegionAvail().X - addW));
+        if (ImGui.Button($"{EditorIcons.Add} Add##adddict_{p.Name}", new SysVec2(addW, 0))) {
+            DictionaryAdd(p, dictType, keyType, valueType, dict);
+            return; // structural change: redraw next frame against the new dictionary (avoids a stale row)
+        }
+
+        if (count == 0)
+            return;
+
+        // Snapshot the keys so removing/editing inside the loop never mutates the live key collection mid-iter.
+        var keys = new System.Collections.Generic.List<object>(count);
+        foreach (object k in dict.Keys) keys.Add(k);
+
+        // Per-entry rows: a READ-ONLY key label, then the value drawn by its own terminal drawer through a
+        // DictionaryValueProperty, followed by a Remove button. PushId per index so duplicate values keep
+        // distinct ImGui ids.
+        object removeKey = null;
+        bool hasRemove = false;
+        for (int i = 0; i < keys.Count; i++) {
+            ImGui.PushID(i);
+            object key = keys[i];
+            float removeW = ImGui.GetFrameHeight();
+            float avail = ImGui.GetContentRegionAvail().X;
+            float keyW = Math.Max(40f, avail * 0.4f);
+            float valW = Math.Max(40f, avail - keyW - removeW - 12);
+
+            // Key: read-only label (Dictionary keys are immutable in this version).
+            ImGui.AlignTextToFramePadding();
+            ImGui.SetNextItemWidth(keyW);
+            ImGui.Text(key?.ToString() ?? "(null)");
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Dictionary key (read-only)");
+            ImGui.SameLine(0, 6);
+
+            // Value: recursive terminal drawer (a value edit writes dict[key] = v then the whole dict back).
+            var valProp = new Inspector.DictionaryValueProperty(
+                $"Value {i}", valueType,
+                () => dict.Contains(key) ? dict[key] : null,
+                v => DictionarySetValue(p, dict, key, v));
+
+            ITypeDrawer drawer = memberRegistry.Resolve(valueType);
+            ImGui.SetNextItemWidth(valW);
+            if (drawer is not null) {
+                componentGui.SetUndoLabel($"Edit {p.Label} [{key}]");
+                drawer.Draw(valProp, componentGui);
+            }
+            else {
+                ImGui.TextDisabled($"({valueType.Name})"); // no drawer for this value type (e.g. nested struct)
+            }
+
+            ImGui.SameLine(0, 6);
+            if (ImGui.Button($"{EditorIcons.Delete}", new SysVec2(removeW, 0))) {
+                removeKey = key;
+                hasRemove = true;
+            }
+
+            ImGui.PopID();
+        }
+
+        if (hasRemove)
+            DictionaryRemove(p, dict, removeKey);
+    }
+
+    // Add a default entry with a freshly minted UNIQUE key (Dictionary keys must be distinct). The default
+    // value follows DefaultElement. One undo; mutate then write back through the property.
+    void DictionaryAdd(Inspector.IProperty p, Type dictType, Type keyType, Type valueType,
+        System.Collections.IDictionary dict) {
+        System.Collections.IDictionary target = dict ?? (System.Collections.IDictionary)Activator.CreateInstance(dictType);
+        object key = UniqueDictKey(target, keyType);
+        if (key is null) return; // can't synthesize a unique key for this key type -> Add is a no-op
+        EditorUndo.Push($"Add to {p.Label}");
+        target[key] = DefaultElement(valueType);
+        p.Set(target);
+        state.MarkViewportDirty();
+    }
+
+    // Remove the entry for the given key. One undo; mutate then write back through the property.
+    void DictionaryRemove(Inspector.IProperty p, System.Collections.IDictionary dict, object key) {
+        if (dict is null || key is null || !dict.Contains(key)) return;
+        EditorUndo.Push($"Remove from {p.Label}");
+        dict.Remove(key);
+        p.Set(dict);
+        state.MarkViewportDirty();
+    }
+
+    // Write a single entry's value back. Sets dict[key] = value (key already present), then writes the WHOLE
+    // dictionary through the property so ApplyMember broadcasts the edited dictionary to the multi-selection +
+    // marks dirty (the value terminal drawer already registered the per-drag undo, like a primitive edit).
+    void DictionarySetValue(Inspector.IProperty p, System.Collections.IDictionary dict, object key, object value) {
+        if (dict is null || key is null || !dict.Contains(key)) return;
+        dict[key] = value;
+        p.Set(dict);
+    }
+
+    // Mint a key not already present. string -> "" then "key", "key2", ...; integral types -> max existing + 1
+    // (or 0 when empty); other value-type keys -> their zero default IF unused else give up (returns null).
+    // Keeps Add simple: most dictionaries are keyed by string or int (the common, supported case).
+    static object UniqueDictKey(System.Collections.IDictionary dict, Type keyType) {
+        if (keyType == typeof(string)) {
+            if (!dict.Contains("")) return "";
+            for (int i = 1; i < 100000; i++) {
+                string cand = "key" + i;
+                if (!dict.Contains(cand)) return cand;
+            }
+            return null;
+        }
+        if (IsIntegralKey(keyType)) {
+            long max = -1;
+            foreach (object k in dict.Keys) {
+                long v = Convert.ToInt64(k);
+                if (v > max) max = v;
+            }
+            object next = Convert.ChangeType(max + 1, keyType);
+            return dict.Contains(next) ? null : next;
+        }
+        if (keyType.IsValueType) {
+            object def = Activator.CreateInstance(keyType);
+            return dict.Contains(def) ? null : def; // single zero-default slot; no synthesis for arbitrary structs
+        }
+        return null; // reference-type keys (rare) -> no synthesizable unique key
+    }
+
+    static bool IsIntegralKey(Type t) =>
+        t == typeof(int) || t == typeof(long) || t == typeof(short) || t == typeof(byte) ||
+        t == typeof(uint) || t == typeof(ulong) || t == typeof(ushort) || t == typeof(sbyte);
 
     // Accepts a Hierarchy entity-drag payload (int = entity InstanceId hash, set by HierarchyPanel's
     // EntityDragType source) onto the current item and resolves it back to the live entity. Mirrors
