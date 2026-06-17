@@ -32,7 +32,15 @@ public sealed class Dx12DescriptorHeap : IDisposable {
     // at 1: they're either process-lifetime, written under a synchronous flush, or off-limits (Lumen).
     readonly Dx12Device dev;
     readonly int framesInFlight;
-    int Base => dev.FrameSlot * capacity;   // slot offset in descriptors; 0 when framesInFlight==1 (FrameSlot stays 0)
+    // Slot offset in descriptors. MUST rebase by THIS heap's own framesInFlight, not the global FrameSlot:
+    // under BALLISTIC_DX12_OVERLAP=1 the device runs FramesInFlight=2, so dev.FrameSlot toggles 0/1 for EVERY
+    // heap — but a heap built with framesInFlight==1 only allocated `capacity*1` physical descriptors, so a raw
+    // `FrameSlot*capacity` would rebase past the end of its single slab (OOB descriptor → access violation /
+    // silent garbage; the SSGI/OIDN heaps are framesInFlight==1). `FrameSlot % framesInFlight` keeps a 1-slab
+    // heap pinned to slab 0 always (correct: its descriptors are created once + used under a synchronous flush)
+    // while an N-slab ring heap cycles 0..N-1 exactly as before. Byte-identical when FramesInFlight==1 (FrameSlot
+    // stays 0 → Base 0 for all heaps); fixes the OOB only-under-overlap.
+    int Base => (dev.FrameSlot % framesInFlight) * capacity;
 
     public Dx12DescriptorHeap(Dx12Device dev, DescriptorHeapType type, int capacity, bool shaderVisible,
                               int framesInFlight = 1) {
@@ -88,11 +96,27 @@ public sealed class Dx12DescriptorHeap : IDisposable {
 
     // Vortice handle-offset ctor: (baseHandle, int offsetInDescriptors, uint descriptorIncrementSize).
     // `index` is SLOT-LOCAL (0..capacity); Base rebases it into this frame's slot (0 when framesInFlight==1).
-    public CpuDescriptorHandle Cpu(int index) =>
-        new(cpuStart, Base + index, increment);
+    // The bounds assert turns a heap-misuse (slot offset past the physical heap — the class of bug that
+    // produced an intermittent 0xC0000005 in SetDescriptorHeaps/root-table binding) into a DETERMINISTIC,
+    // localized throw at the call site instead of a silent dangling GPU descriptor handle. Physical size is
+    // capacity*framesInFlight (ctor); the offset MUST land inside it.
+    public CpuDescriptorHandle Cpu(int index) {
+        CheckBounds(index);
+        return new(cpuStart, Base + index, increment);
+    }
 
-    public GpuDescriptorHandle Gpu(int index) =>
-        new(gpuStart, Base + index, increment);
+    public GpuDescriptorHandle Gpu(int index) {
+        CheckBounds(index);
+        return new(gpuStart, Base + index, increment);
+    }
+
+    void CheckBounds(int index) {
+        int offset = Base + index;
+        if ((uint)offset >= (uint)(capacity * framesInFlight))
+            throw new InvalidOperationException(
+                $"Descriptor heap access out of bounds: offset {offset} (FrameSlot {dev.FrameSlot}, slot-local {index}) " +
+                $">= physical size {capacity * framesInFlight} (capacity {capacity} x framesInFlight {framesInFlight}).");
+    }
 
     public void Dispose() => Heap.Dispose();
 }
