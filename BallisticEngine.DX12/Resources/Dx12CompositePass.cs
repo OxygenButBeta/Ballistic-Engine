@@ -39,6 +39,14 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         b.Read(b.Resource("FsrOutput"));
         b.Read(b.Resource("Ssao"));
         b.Write(b.Resource("Ldr"));
+        // PHASE-2 V3 (chunk 16): Composite's ONE shared-resource head transition is `hdr.ColorToShaderResource()`
+        // where hdr == ctx.SceneColor (captured in Record — the resolved scene color: native = target, FSR =
+        // fsrOutput, since FsrPass at event 650 already set ctx.SceneColor before Composite at 700). The deriver
+        // emits ctx.SceneColor.ColorToShaderResource() — the same concrete target. Derive it. The PRIVATE sub-step
+        // transitions (lum ping-pong, bloomA/B) and the frame-tail target.ColorToRenderTarget() are NOT pass-
+        // boundary heads → they stay inline (plan §V3: leave the frame-tail inline, derive only the head).
+        b.DeriveBarriers();
+        b.Use(Dx12ResourceUsage.SceneColorShaderRead);
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -344,7 +352,9 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         // Resolved CPU multiplier for the manual / Fixed paths (Automatic resolves it in the shader from the EV).
         float exposureMul = manual ? manualExp : pf.ExposureMultiplier;
 
-        hdr.ColorToShaderResource();   // HDR source → SRV (for both the lum pass and composite)
+        // PHASE-2 V3: skip the manual SceneColor head when derived barriers are active (the graph emitted
+        // ctx.SceneColor.ColorToShaderResource() before Record; hdr == ctx.SceneColor). Idempotent either way.
+        if (!ctx.BarriersDerived) hdr.ColorToShaderResource();   // HDR source → SRV (for both the lum pass and composite)
 
         // V1b: the physical 1×1 target holding THIS frame's adapted EV (captured pre-swap so the composite
         // SRV + the frame-end RT transition keep pointing at it after the ping-pong swaps the fields).
