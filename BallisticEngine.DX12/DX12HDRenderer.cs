@@ -415,51 +415,12 @@ public sealed class DX12HDRenderer : HDRenderer {
     // Camera projection near/far — shared by the projection build AND the froxel log-Z grid (must match).
     const float CameraNear = 0.1f, CameraFar = 1000f;
 
-    // Final composite (HDR scene → exposure → ACES → +bloom → sRGB → LDR).
-    ID3D12RootSignature compositeRootSig;   // CompositeConstants CBV (b0) + HDR+bloom SRV table + sampler
-    ID3D12PipelineState compositePso;
-    ID3D12Resource compositeCb;
-    unsafe byte* compositeCbMapped;
-    Dx12DescriptorHeap compositeSrvVisible;  // HDR color + bloom + avg-lum, copied per frame
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct CompositeConstants {
-        public float ExposureMul; public float BloomIntensity; public float AutoExposure; public float LegacyMul;   // row 0
-        public float Compensation; public float UseAo; public float Tonemap; public float Contrast;                 // row 1
-        public float Saturation; public float Sharpen; public float VignetteStrength; public float VignetteRoundness; // row 2
-        public float ChromaticAberration; public float LensDistortion; public float FilmGrain; public float GrainTime; // row 3
-        public Vector3 VignetteColor; public float Pad3;                                                            // row 4
-        public Vector2 ScreenSize; public Vector2 Pad4;                                                             // row 5
-    }
-
-    // Auto-exposure: a 1×1 R16F target holding the metered exposure EV100 (LumAverage.hlsl).
-    ID3D12RootSignature lumRootSig;     // LumConstants CBV (b0) + 2 SRVs (t0 HDR, t1 prev-EV) + sampler
-    ID3D12PipelineState lumPso;
-    // V1b: TWO 1×1 R16F targets, ping-ponged each frame — the meter reads last frame's adapted EV (history)
-    // and writes this frame's adapted EV. lumTarget = the one written THIS frame (composite reads it);
-    // lumHistory = last frame's. Swapped after the pass. Avoids a per-frame GPU→CPU readback stall.
-    Dx12OffscreenTarget lumTarget, lumHistory;
-    bool lumHistoryValid;               // V1b: false until the first metered frame populates history → snap (Reset)
-    bool exposureDebugDumped;           // V1: one-shot BALLISTIC_DX12_EXPOSURE_DEBUG avgLum readback latch
-    Dx12DescriptorHeap lumSrvVisible;   // [0]=HDR color SRV, [1]=prev-EV history SRV, copied per frame
-    ID3D12Resource lumCb;
-    unsafe byte* lumCbMapped;
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct LumConstants {
-        public float LimitMin; public float LimitMax; public float Calibrated; public float DeltaTime;
-        public float SpeedDarkToLight; public float SpeedLightToDark; public float Reset; public float Pad;
-    }
-
-    // Bloom: bright-pass + separable blur at half-res, fed into the composite (Bloom.hlsl).
-    ID3D12RootSignature bloomRootSig;   // BloomConstants CBV (b0) + 1 source SRV (t0) + sampler
-    ID3D12PipelineState bloomBrightPso, bloomBlurHPso, bloomBlurVPso;
-    Dx12OffscreenTarget bloomA, bloomB; // half-res R16F ping-pong
-    ID3D12Resource bloomCb;
-    unsafe byte* bloomCbMapped;
-    int bloomCbStride;                  // P0a: 256-aligned per-sub-pass slot stride (3 slots — see DrawBloom)
-    Dx12DescriptorHeap bloomSrvVisible; // source SRV per sub-pass (3 slots)
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct BloomConstants { public float Threshold; public Vector2 TexelSize; public float Pad; }
-    bool bloomThisFrame;
+    // Final composite (HDR scene → exposure → ACES → +bloom → sRGB → LDR) — CONVERTED to a pass-graph
+    // IRenderPass (chunk 7): Dx12CompositePass owns the composite rootsig/PSO/CB/heap AND its private sub-steps
+    // (auto-exposure metering + bloom: their rootsigs/PSOs/targets/CBs/heaps moved into the pass too — splitting
+    // them out would be a restructure, not a move; trap 3). Runs at the Composite event via the graph, after the
+    // (still-inline) TAA/FSR block, reading ctx.SceneColor.
+    Dx12CompositePass compositePass;
 
     // SSAO: HBAO from depth → half-res AO target (+ separable blur), multiplied in the composite.
     // CONVERTED to a pass-graph IRenderPass (chunk 4): Dx12SsaoPass owns the rootsig/PSOs/CB/heap/targets and
@@ -653,10 +614,9 @@ public sealed class DX12HDRenderer : HDRenderer {
         ldr.ColorToShaderResource();
         gbuffer = new Dx12GBuffer(dev, internalW, internalH);
         motionPrevValid = false;                                // prev view*proj is stale after a realloc
-        if (bloomRootSig != null) AllocBloomTargets();          // half-res bloom ping-pong follows size
-        // SSAO targets now reallocated via graph.Resize (Dx12SsaoPass.Resize) at the tail of this method — see
-        // the graph?.Resize call below. Its slot in the AllocXxx sequence (2nd, after bloom) is preserved by
-        // registration order (R5).
+        // SSAO (Dx12SsaoPass) + bloom (Dx12CompositePass's half-res ping-pong) now reallocate via graph.Resize at
+        // the tail of this method — see the graph?.Resize call below. SSAO's original slot (2nd) and bloom's (1st)
+        // in the AllocXxx sequence are byte-neutral because each allocator reads only the passed size (R5).
         if (ssrRootSig != null) AllocSsrTarget();
         if (ssgiRootSig != null) AllocSsgiTargets();
         if (taaRootSig != null) AllocTaaTargets();
@@ -767,7 +727,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         BuildSsr();
         BuildSsgi();
         BuildTaa();
-        BuildComposite();
+        // Composite (+ its private bloom + auto-exposure sub-steps) now built inside Dx12CompositePass's ctor
+        // (chunk 7), constructed below where the pass-graph is assembled. Was BuildComposite().
 
         // GPU-driven geometry path (compute cull + ExecuteIndirect + bindless) for whole-mesh renderers.
         // DEFAULT ON (byte-identical to the CPU path, verified on Bistro + SunTemple); BALLISTIC_DX12_GPUDRIVEN=0
@@ -803,6 +764,12 @@ public sealed class DX12HDRenderer : HDRenderer {
         fogPass = new Dx12FogPass(dev);
         graph.Add(apPass);
         graph.Add(fogPass);
+        // chunk 7: Composite (event 700, after SSAO/TAA/FSR at PostProcess=650). Owns bloomA/B (the half-res
+        // ping-pong); its Resize fans out LAST in registration order. The original AllocBloomTargets ran FIRST in
+        // AllocateResolutionTargets, but the bloom allocator reads only the passed size (no cross-pass dependency)
+        // so moving it to last is byte-neutral (R5). Was BuildComposite (→ BuildLumAverage → BuildBloom).
+        compositePass = new Dx12CompositePass(dev, targetW, targetH);
+        graph.Add(compositePass);
         graph.Build();
     }
 
@@ -1185,133 +1152,14 @@ public sealed class DX12HDRenderer : HDRenderer {
             7 + transparentCbSlotCount * MaterialSrvCount, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
-    unsafe void BuildComposite() {
-        // CompositeConstants CBV (b0) + 4-SRV table (HDR t0, bloom t1, avg-lum t2, AO t3) + clamp sampler s0.
-        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 4, baseShaderRegister: 0);
-        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
-        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
-            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
-            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
-            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
-        };
-        compositeRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
-
-        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("Composite.hlsl");
-        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "Composite.hlsl");
-        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "Composite.hlsl");
-        compositePso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
-            RootSignature = compositeRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
-            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
-            RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
-            DepthStencilState = DepthStencilDescription.None,
-            RenderTargetFormats = new[] { Dx12OffscreenTarget.ColorFormat },   // LDR output
-            DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
-        });
-
-        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<CompositeConstants>() + 255) & ~255;
-        compositeCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        compositeCbMapped = compositeCb.Map<byte>(0);
-        compositeSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4, shaderVisible: true, framesInFlight: dev.FramesInFlight);
-
-        BuildLumAverage();
-    }
+    // BuildComposite / BuildLumAverage / BuildBloom / AllocBloomTargets / DrawBloom / DumpMeteredLuminance /
+    // DumpAdaptedEv / DrawComposite moved VERBATIM into Resources/Dx12CompositePass.cs (chunk 7). The pass owns
+    // the composite rootsig/PSO/CB/heap AND its private sub-steps' resources (auto-exposure metering + bloom),
+    // runs at the Composite event via the graph (after the still-inline TAA/FSR block), reading ctx.SceneColor.
 
     // BuildSsao / AllocSsaoTargets / DrawSsao moved VERBATIM to Resources/Dx12SsaoPass.cs (chunk 4 — first
     // leaf-post conversion). The pass owns the rootsig/PSOs/CB/heap/targets, runs at the PostProcess event via
-    // the graph, and exposes its result via ssaoPass.ResultSrvCpu for the still-inline composite.
-
-    unsafe void BuildLumAverage() {
-        // LumConstants CBV (b0) + 2 SRVs (t0 HDR scene, t1 prev-EV history) + clamp sampler; outputs the 1×1
-        // adapted-EV100 target. The 2 SRVs are one contiguous table range (t0..t1) over the visible heap.
-        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Pixel);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 0);
-        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
-        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
-            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
-            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
-            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
-        };
-        lumRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
-
-        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumAverage.hlsl");
-        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "LumAverage.hlsl");
-        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "LumAverage.hlsl");
-        lumPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
-            RootSignature = lumRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
-            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
-            RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
-            DepthStencilState = DepthStencilDescription.None,
-            RenderTargetFormats = new[] { Format.R16_Float }, DepthStencilFormat = Format.Unknown,
-            SampleDescription = new SampleDescription(1, 0),
-        });
-
-        lumTarget = new Dx12OffscreenTarget(dev, 1, 1, withDepth: false,
-            colorFormat: Format.R16_Float, colorReadable: true);
-        lumHistory = new Dx12OffscreenTarget(dev, 1, 1, withDepth: false,  // V1b: ping-pong partner (prev adapted EV)
-            colorFormat: Format.R16_Float, colorReadable: true);
-        lumSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true, framesInFlight: dev.FramesInFlight);
-
-        int lumCbSize = (System.Runtime.InteropServices.Marshal.SizeOf<LumConstants>() + 255) & ~255;
-        lumCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)lumCbSize), ResourceStates.GenericRead);
-        lumCbMapped = lumCb.Map<byte>(0);
-
-        BuildBloom();
-    }
-
-    unsafe void BuildBloom() {
-        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
-        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
-        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
-            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
-            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
-            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
-        };
-        bloomRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
-
-        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("Bloom.hlsl");
-        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "Bloom.hlsl");
-        ID3D12PipelineState MakePso(string entry) => dev.Device.CreateGraphicsPipelineState(
-            new GraphicsPipelineStateDescription {
-                RootSignature = bloomRootSig, VertexShader = vs,
-                PixelShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, entry, "Bloom.hlsl"),
-                InputLayout = null, PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
-                RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
-                DepthStencilState = DepthStencilDescription.None,
-                RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat }, DepthStencilFormat = Format.Unknown,
-                SampleDescription = new SampleDescription(1, 0),
-            });
-        bloomBrightPso = MakePso("PSBrightPass");
-        bloomBlurHPso = MakePso("PSBlurH");
-        bloomBlurVPso = MakePso("PSBlurV");
-
-        // P0a: 3 sub-passes (bright/blurH/blurV) write DIFFERENT BloomConstants but all read one CB. With the
-        // pipelined frame they record into ONE list submitted together, so a single shared CB would let the
-        // CPU's 3rd write stomp the value the GPU's 1st draw still needs. Give each sub-pass its own 256-aligned
-        // slot. (Non-pipelined this was masked because each pass submitted+waited.)
-        bloomCbStride = (System.Runtime.InteropServices.Marshal.SizeOf<BloomConstants>() + 255) & ~255;
-        bloomCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)(bloomCbStride * 3)), ResourceStates.GenericRead);
-        bloomCbMapped = bloomCb.Map<byte>(0);
-        bloomSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true, framesInFlight: dev.FramesInFlight);
-        AllocBloomTargets();
-    }
-
-    void AllocBloomTargets() {
-        bloomA?.Dispose(); bloomB?.Dispose();
-        int w = System.Math.Max(1, targetW / 2), h = System.Math.Max(1, targetH / 2);
-        bloomA = new Dx12OffscreenTarget(dev, w, h, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
-        bloomB = new Dx12OffscreenTarget(dev, w, h, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
-    }
+    // the graph, and exposes its result via ssaoPass.ResultSrvCpu for the composite (now ctx.SsaoResult).
 
     // BuildFog / BuildAerialPerspective moved into the Dx12FogPass / Dx12AerialPerspectivePass ctors (chunk 5).
 
@@ -1995,6 +1843,11 @@ public sealed class DX12HDRenderer : HDRenderer {
             Ibl = ibl, SkyLuts = skyLuts, ClusteredLights = clusteredLights,
             ShadowMap = shadowMap, GpuDriven = gpuDriven,
             Doors = doors, PostFX = PostFX, Stats = RenderStats.Scene,
+            // chunk 7 (composite): deterministic flag (grain/exposure reset) + the SSAO pass output the composite
+            // samples for AO. SsaoResult is a stable descriptor handle (ssaoA.ColorSrvCpu) — only its contents
+            // change per frame, so binding it at ctx build is always correct.
+            DeterministicCapture = DeterministicCapture,
+            SsaoResult = ssaoPass.ResultSrvCpu,
             // mutated-mid-frame fields, set to their resolved final value:
             SceneColor = fsrActive ? fsrOutput : target,
             IblActiveThisFrame = iblActiveThisFrame,
@@ -2058,28 +1911,33 @@ public sealed class DX12HDRenderer : HDRenderer {
                 DrawSsr(view, proj);
         }
 
-        bool ssaoOn = doors.Ssao;
-
         // === PHASE-1 PASS-GRAPH — PostProcess window (chunk 4: SSAO). Runs at its canonical slot: after the
-        // Reflections/SSR block, before the TAA/FSR/composite block — the still-inline composite below READS
-        // SSAO's result (ssaoPass.ResultSrvCpu). SSAO reads only the G-buffer (depth + world normal) and writes
-        // its own half-res target — independent of TAA (reads/writes `target`) and the FSR/native branch, so
-        // running it here instead of interleaved with TAA is byte-neutral (verified: floor=0). The earlier
-        // windows already ran AP (after sky) + Fog (after GI) at their canonical positions; this window runs
-        // PostProcess (650)+ . The ctx was built once above (after the giMode resolve, before Sky). ===
-        graph.Execute(ctx, (int)Dx12RenderPassEvent.PostProcess, int.MaxValue);
+        // Reflections/SSR block, before the TAA/FSR block — the Composite pass (chunk 7) below READS SSAO's result
+        // (ctx.SsaoResult). SSAO reads only the G-buffer (depth + world normal) and writes its own half-res target —
+        // independent of TAA (reads/writes `target`) and the FSR/native branch, so running it here instead of
+        // interleaved with TAA is byte-neutral (verified: floor=0). The earlier windows already ran AP (after sky)
+        // + Fog (after GI) at their canonical positions; this window runs ONLY PostProcess (650) now (composite
+        // moved out to its own window after the TAA/FSR block — it must read the resolved ctx.SceneColor). The ctx
+        // was built once above (after the giMode resolve, before Sky). ===
+        graph.Execute(ctx, (int)Dx12RenderPassEvent.PostProcess, (int)Dx12RenderPassEvent.Composite);
 
         if (fsrActive) {
-            // --- FSR upscale path (replaces TAA): SSAO (ran in graph above) → FSR reconstruct
-            //     internal→output HDR → composite at output res. ---
+            // --- FSR upscale path (replaces TAA): SSAO (ran in graph above) → FSR reconstruct internal→output
+            //     HDR. The composite (Composite window below) reads ctx.SceneColor = fsrOutput at output res. ---
             RunFsr();
-            DrawComposite(ssaoOn, fsrOutput);
+            ctx.SceneColor = fsrOutput;   // the canonical composite-input branch (already set at ctx build; explicit here)
         } else {
-            // --- Native path: TAA → composite (SSAO ran in graph above; all at the shared resolution). ---
+            // --- Native path: TAA writes the AA'd color back into `target` (= ctx.SceneColor). ---
             if (taaOn) DrawTaa();
             else taaHistoryValid = false;   // keep history fresh for when TAA turns back on
-            DrawComposite(ssaoOn, target);
         }
+
+        // === PHASE-1 PASS-GRAPH — Composite window (chunk 7). DrawComposite became Dx12CompositePass.Record at the
+        // Composite event (700); it runs AFTER the TAA/FSR block so it reads the resolved ctx.SceneColor (fsrOutput
+        // when upscaling, target natively). GrainFrame is refreshed here from the LIVE ssgiFrame (SSGI incremented
+        // it after ctx was built) — the composite reads it for the non-deterministic film-grain phase only. ===
+        ctx.GrainFrame = ssgiFrame;
+        graph.Execute(ctx, (int)Dx12RenderPassEvent.Composite, int.MaxValue);
 
         // Editor display path: leave the LDR composite in PixelShaderResource so the editor's ImGui pass can
         // sample it via SceneColorHandle/GameColorHandle THIS frame. The player (PresentToScreen) keeps it in
@@ -3463,242 +3321,9 @@ public sealed class DX12HDRenderer : HDRenderer {
     // DrawSsao moved VERBATIM to Resources/Dx12SsaoPass.Record (chunk 4). It runs at the PostProcess event via
     // graph.Execute; the still-inline composite reads its blurred half-res AO via ssaoPass.ResultSrvCpu.
 
-    // Bloom: bright-pass the HDR `src` (already in SRV state) → bloomA; blur H (bloomA→bloomB);
-    // blur V (bloomB→bloomA). Result lands in bloomA at half-res for the composite to add. `src` is the
-    // scene HDR (native) or the FSR-upscaled HDR (so bloom is at output res when upscaling).
-    unsafe void DrawBloom(Dx12OffscreenTarget src) {
-        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        float texW = 1f / bloomA.Width, texH = 1f / bloomA.Height;
-
-        void Pass(ID3D12PipelineState pso, Dx12OffscreenTarget src, Dx12OffscreenTarget dst, int srvSlot,
-            Vector2 texel, float threshold) {
-            // P0a: write THIS sub-pass's constants to its own CB slot (srvSlot doubles as the CB slot) + bind
-            // that slot's GPU address, so the pipelined single-list submit doesn't let later writes stomp it.
-            *(BloomConstants*)(bloomCbMapped + srvSlot * bloomCbStride) =
-                new BloomConstants { Threshold = threshold, TexelSize = texel };
-            src.ColorToShaderResource();
-            dev.Device.CopyDescriptorsSimple(1, bloomSrvVisible.Cpu(srvSlot), src.ColorSrvCpu, heapType);
-            dst.RenderColorOnly(cl => {
-                cl.SetGraphicsRootSignature(bloomRootSig);
-                cl.SetPipelineState(pso);
-                cl.SetDescriptorHeaps(bloomSrvVisible.Heap);
-                cl.SetGraphicsRootConstantBufferView(0, bloomCb.GPUVirtualAddress + (ulong)(srvSlot * bloomCbStride));
-                cl.SetGraphicsRootDescriptorTable(1, bloomSrvVisible.Gpu(srvSlot));
-                cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-                cl.DrawInstanced(3, 1, 0, 0);
-            });
-        }
-
-        // Bright-pass reads the HDR scene (already in SRV state from DrawComposite).
-        Pass(bloomBrightPso, src, bloomA, 0, new Vector2(texW, texH), 1.0f);
-        Pass(bloomBlurHPso, bloomA, bloomB, 1, new Vector2(texW, texH), 0f);
-        Pass(bloomBlurVPso, bloomB, bloomA, 2, new Vector2(texW, texH), 0f);
-        bloomA.ColorToShaderResource();   // ready for the composite to sample
-    }
-
-    // Tonemap the HDR `hdr` source (the native scene target, or the FSR-upscaled output) into the LDR
-    // output at OUTPUT resolution. Auto-exposure drives the exposure; bloom (if on) runs first (inside
-    // this), reading the same HDR source. Sources at internal/half res are sampled by UV (resolution-safe).
-    // Exposure: the sky-atmosphere P1 path resolves PostFX.ExposureMultiplier (EV100) directly — no extra
-    // re-anchoring constant; the metering/clamp moved into LumAverage (LumConstants.LimitMin/Max).
-    // V1 one-shot calibration probe: read the 1×1 R16F meter target (currently holding raw geomean luminance,
-    // Calibrated=2) back to the CPU and print it + the EVs each anchor would produce. Lets us ground-truth the
-    // exposure constant against the actual lux-scaled radiance instead of guessing. BALLISTIC_DX12_EXPOSURE_DEBUG=1.
-    unsafe void DumpMeteredLuminance(PostProcessSettings pf) {
-        var footprints = new Vortice.Direct3D12.PlacedSubresourceFootPrint[1];
-        var rowCounts = new uint[1]; var rowSizes = new ulong[1];
-        dev.Device.GetCopyableFootprints(lumTarget.RenderTarget.Description, 0, 1, 0,
-            footprints, rowCounts, rowSizes, out ulong totalBytes);
-        Vortice.Direct3D12.PlacedSubresourceFootPrint fp = footprints[0];
-        using ID3D12Resource rb = dev.Device.CreateCommittedResource(
-            Vortice.Direct3D12.HeapProperties.ReadbackHeapProperties, Vortice.Direct3D12.HeapFlags.None,
-            Vortice.Direct3D12.ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
-        lumTarget.ColorToRenderTarget();   // SRV → RT so the next transition is from a known state
-        dev.ExecuteSyncImmediate(cl => {   // readback: flush an open pipelined frame so the copy sees this frame
-            cl.ResourceBarrierTransition(lumTarget.RenderTarget, ResourceStates.RenderTarget, ResourceStates.CopySource);
-            cl.CopyTextureRegion(new Vortice.Direct3D12.TextureCopyLocation(rb, fp), 0, 0, 0,
-                new Vortice.Direct3D12.TextureCopyLocation(lumTarget.RenderTarget, 0), null);
-            cl.ResourceBarrierTransition(lumTarget.RenderTarget, ResourceStates.CopySource, ResourceStates.RenderTarget);
-        });
-        Half* p = rb.Map<Half>(0);
-        float avgLum = (float)p[0];
-        rb.Unmap(0);
-        float greyEv = MathF.Log2(MathF.Max(avgLum, 1e-8f)) - MathF.Log2(0.18f * 1.2f);
-        float legacyEv = MathF.Log2(MathF.Max(avgLum, 1e-6f)) + 3f - 1f;
-        Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
-            $"[EXP-DBG] geomean avgLum={avgLum:0.000000}  greyAnchorEV={greyEv:0.00}  legacyEV={legacyEv:0.00}  " +
-            $"limits=[{pf.AutoExposureLimitMin},{pf.AutoExposureLimitMax}]  " +
-            $"M(greyClamped)={1f / (1.2f * MathF.Pow(2f, Math.Clamp(greyEv, pf.AutoExposureLimitMin, pf.AutoExposureLimitMax))):0.00000000}"));
-    }
-
-    // V1b eye-adaptation trace (BALLISTIC_DX12_EXPOSURE_EMA_DEBUG=1): read back the 1×1 adapted-EV target this
-    // frame and log it, so the per-frame easing curve is observable headlessly (it should ramp toward the
-    // metered EV at the configured stops/sec, not jump). DEBUG-ONLY — the readback stalls, so it's gated off
-    // by default and never runs on the production path. `t` is the just-written target (PixelShaderResource).
-    int emaDebugFrame;
-    unsafe void DumpAdaptedEv(Dx12OffscreenTarget t) {
-        var footprints = new Vortice.Direct3D12.PlacedSubresourceFootPrint[1];
-        var rowCounts = new uint[1]; var rowSizes = new ulong[1];
-        dev.Device.GetCopyableFootprints(t.RenderTarget.Description, 0, 1, 0,
-            footprints, rowCounts, rowSizes, out ulong totalBytes);
-        Vortice.Direct3D12.PlacedSubresourceFootPrint fp = footprints[0];
-        using ID3D12Resource rb = dev.Device.CreateCommittedResource(
-            Vortice.Direct3D12.HeapProperties.ReadbackHeapProperties, Vortice.Direct3D12.HeapFlags.None,
-            Vortice.Direct3D12.ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
-        t.ColorToRenderTarget();   // PixelShaderResource → RT so the copy transition starts from a known state
-        dev.ExecuteSyncImmediate(cl => {   // readback: flush an open pipelined frame so the copy sees this frame
-            cl.ResourceBarrierTransition(t.RenderTarget, ResourceStates.RenderTarget, ResourceStates.CopySource);
-            cl.CopyTextureRegion(new Vortice.Direct3D12.TextureCopyLocation(rb, fp), 0, 0, 0,
-                new Vortice.Direct3D12.TextureCopyLocation(t.RenderTarget, 0), null);
-            cl.ResourceBarrierTransition(t.RenderTarget, ResourceStates.CopySource, ResourceStates.PixelShaderResource);
-        });
-        Half* p = rb.Map<Half>(0);
-        float adaptedEv = (float)p[0];
-        rb.Unmap(0);
-        Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
-            $"[EMA-DBG] frame={++emaDebugFrame}  adaptedEV={adaptedEv:0.0000}  dt={(float)Time.DeltaTime:0.0000}  " +
-            $"speedUp={PostFX.AutoExposureSpeedDarkToLight}  speedDown={PostFX.AutoExposureSpeedLightToDark}"));
-    }
-
-    unsafe void DrawComposite(bool ssaoOn, Dx12OffscreenTarget hdr) {
-        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-
-        // Exposure (P1): physical EV100 from the Exposure volume. Three sources, in priority:
-        //   1. BALLISTIC_DX12_EXPOSURE env var — raw multiplier override (escape hatch / deterministic capture).
-        //   2. Exposure volume Fixed mode — resolve PostProcessSettings.ExposureMultiplier CPU-side (no meter).
-        //   3. Automatic / AutomaticHistogram — run the 1×1 metering pass (writes the metered EV100); the
-        //      composite shader turns that EV into the multiplier (same 1/(1.2*2^(EV-comp)) formula).
-        var pf = PostFX;
-        bool manual = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
-            System.Globalization.CultureInfo.InvariantCulture, out float manualExp);
-        // BALLISTIC_DX12_AUTOEXP=1 forces Automatic metering even with no Exposure volume (A/B test door).
-        bool forceAuto = Environment.GetEnvironmentVariable("BALLISTIC_DX12_AUTOEXP") == "1";
-        bool useMeter = !manual && (forceAuto || pf.ExposureMode != ExposureMode.Fixed);
-        // Resolved CPU multiplier for the manual / Fixed paths (Automatic resolves it in the shader from the EV).
-        float exposureMul = manual ? manualExp : pf.ExposureMultiplier;
-
-        hdr.ColorToShaderResource();   // HDR source → SRV (for both the lum pass and composite)
-
-        // V1b: the physical 1×1 target holding THIS frame's adapted EV (captured pre-swap so the composite
-        // SRV + the frame-end RT transition keep pointing at it after the ping-pong swaps the fields).
-        Dx12OffscreenTarget meteredEvTarget = lumTarget;
-        if (useMeter) {
-            // Auto-exposure metering: reduce the HDR source to a 1×1 adapted EV100 (LumAverage.hlsl).
-            // V1: the meter is grey-anchored (self-calibrating to the lux-scaled DX12 radiance) by default;
-            // BALLISTIC_DX12_EXPOSURE_CALIB=0 restores the legacy photometric anchor (the pre-V1 blow-out) for A/B.
-            bool calibrated = Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_CALIB") != "0";
-            // V1 diagnostic: BALLISTIC_DX12_EXPOSURE_DEBUG=1 makes the meter emit raw geomean luminance into the
-            // 1×1 target (Calibrated=2), read back once below to ground-truth the calibration constant.
-            bool expDebug = !exposureDebugDumped && Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_DEBUG") == "1";
-            // V1b eye-adaptation EMA. Reset (snap to metered EV, no ease) when: deterministic capture (keeps
-            // paused frames byte-identical to the pre-V1b instantaneous meter — the oracle), the FIRST metered
-            // frame (history uninitialized — easing up from EV 0 would flash dark→correct), or the debug probe
-            // (it emits raw avgLum, which must not be temporally eased). Eased frames need the real frame dt.
-            // BALLISTIC_DX12_EXPOSURE_EMA=0 forces instantaneous (the pre-V1b behaviour) for A/B.
-            bool emaOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_EMA") != "0";
-            // V1b debug: BALLISTIC_DX12_EXPOSURE_EMA_SEED=<ev> seeds the FIRST frame's history to a deliberately-
-            // off EV (instead of snapping to metered) so the easing curve toward the true metered EV is
-            // observable headlessly. Debug-only; never set on the production path.
-            if (!lumHistoryValid && !expDebug && emaOn
-                && float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_EMA_SEED"),
-                    System.Globalization.CultureInfo.InvariantCulture, out float seedEv)) {
-                lumHistory.Clear(seedEv, seedEv, seedEv);   // R16F: only R matters (the seeded prev EV)
-                lumHistoryValid = true;                     // skip the first-frame snap so the seeded value eases
-            }
-            bool reset = DeterministicCapture || !lumHistoryValid || expDebug || !emaOn;
-            *(LumConstants*)lumCbMapped = new LumConstants {
-                LimitMin = pf.AutoExposureLimitMin, LimitMax = pf.AutoExposureLimitMax,
-                Calibrated = expDebug ? 2f : (calibrated ? 1f : 0f),
-                DeltaTime = (float)Time.DeltaTime,
-                SpeedDarkToLight = pf.AutoExposureSpeedDarkToLight,
-                SpeedLightToDark = pf.AutoExposureSpeedLightToDark,
-                Reset = reset ? 1f : 0f,
-            };
-            // t0 = HDR scene; t1 = last frame's adapted EV (the ping-pong partner, already in PixelShaderResource).
-            dev.Device.CopyDescriptorsSimple(1, lumSrvVisible.Cpu(0), hdr.ColorSrvCpu, heapType);
-            dev.Device.CopyDescriptorsSimple(1, lumSrvVisible.Cpu(1), lumHistory.ColorSrvCpu, heapType);
-            lumHistory.ColorToShaderResource();   // ensure the history is sampleable as t1 (no-op after frame 1)
-            lumTarget.RenderColorOnly(cl => {
-                cl.SetGraphicsRootSignature(lumRootSig);
-                cl.SetPipelineState(lumPso);
-                cl.SetDescriptorHeaps(lumSrvVisible.Heap);
-                cl.SetGraphicsRootConstantBufferView(0, lumCb.GPUVirtualAddress);
-                cl.SetGraphicsRootDescriptorTable(1, lumSrvVisible.Gpu(0));
-                cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-                cl.DrawInstanced(3, 1, 0, 0);
-            });
-            lumTarget.ColorToShaderResource();    // composite reads it AND it becomes next frame's history t1
-            meteredEvTarget = lumTarget;          // the target holding THIS frame's adapted EV (pre-swap)
-            if (expDebug) { exposureDebugDumped = true; DumpMeteredLuminance(pf); }
-            // V1b ping-pong: this frame's written target becomes next frame's history; the old history (now in
-            // PixelShaderResource) becomes next frame's render target. The composite + the frame-end RT
-            // transition below reference `meteredEvTarget` (NOT lumTarget) so the swap doesn't misroute them.
-            else { (lumTarget, lumHistory) = (lumHistory, lumTarget); lumHistoryValid = true; }
-            // V1b debug trace (off by default; stalls — never on the production path): log the adapted EV.
-            if (!expDebug && Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_EMA_DEBUG") == "1")
-                DumpAdaptedEv(meteredEvTarget);
-        }
-
-        // Bloom: bright-pass + blur the HDR into bloomA (half-res). On by default; BALLISTIC_DX12_BLOOM=0 off.
-        bool bloomOn = doors.Bloom;
-        if (bloomOn) DrawBloom(hdr);
-
-        // Tonemap: AgX by default (graceful highlight desaturation, the "less çiğ" look); ACES via the door.
-        bool acesTonemap = Environment.GetEnvironmentVariable("BALLISTIC_DX12_TONEMAP") == "aces";
-        // Film grain is time-dependent → frozen (0) under deterministic capture so paused frames stay diffable.
-        float grainTime = DeterministicCapture ? 0f : (ssgiFrame & 1023);
-        // Stylistic grade comes from the volume stack (all neutral by default). BALLISTIC_DX12_GRADE_DEMO=1 is
-        // an A/B door that applies a mild cinematic film look (a sensible starting grade) when no ColorAdjustments
-        // volume is authored — proves the grade chain and shows what a light touch buys.
-        bool gradeDemo = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GRADE_DEMO") == "1";
-        float contrast = gradeDemo ? 1.12f : pf.Contrast;
-        float saturation = gradeDemo ? 1.15f : pf.Saturation;
-        float vignette = gradeDemo ? 0.25f : pf.VignetteStrength;
-        *(CompositeConstants*)compositeCbMapped = new CompositeConstants {
-            ExposureMul = exposureMul,
-            BloomIntensity = bloomOn ? 0.6f : 0f,
-            AutoExposure = useMeter ? 1f : 0f,
-            LegacyMul = pf.Exposure,
-            Compensation = pf.ExposureCompensation,
-            UseAo = ssaoOn ? 1f : 0f,
-            Tonemap = acesTonemap ? 1f : 0f,
-            // Stylistic grade (all neutral by default → byte-identical when untouched); ported from the GL composite.
-            Contrast = contrast, Saturation = saturation,
-            Sharpen = pf.Sharpen,
-            VignetteStrength = vignette, VignetteRoundness = pf.VignetteRoundness,
-            VignetteColor = ToNumerics(pf.VignetteColor),
-            ChromaticAberration = pf.ChromaticAberration, LensDistortion = pf.LensDistortion,
-            FilmGrain = DeterministicCapture ? 0f : pf.FilmGrain, GrainTime = grainTime,
-            ScreenSize = new Vector2(outputW, outputH),
-        };
-
-        dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(0), hdr.ColorSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(1),
-            bloomOn ? bloomA.ColorSrvCpu : hdr.ColorSrvCpu, heapType);   // bloom slot
-        dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(2),
-            useMeter ? meteredEvTarget.ColorSrvCpu : hdr.ColorSrvCpu, heapType);   // adapted-EV slot (Automatic only)
-        dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(3),
-            ssaoOn ? ssaoPass.ResultSrvCpu : hdr.ColorSrvCpu, heapType);     // AO slot (pass-owned ssaoA)
-
-        ldr.RenderColorOnly(cl => {
-            cl.SetGraphicsRootSignature(compositeRootSig);
-            cl.SetPipelineState(compositePso);
-            cl.SetDescriptorHeaps(compositeSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, compositeCb.GPUVirtualAddress);
-            cl.SetGraphicsRootDescriptorTable(1, compositeSrvVisible.Gpu(0));
-            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            cl.DrawInstanced(3, 1, 0, 0);
-        });
-        // Restore THIS frame's adapted-EV target (just consumed as the composite SRV) to RenderTarget — the
-        // legacy V1 frame-end tidy. With the V1b ping-pong it's now the `lumHistory` field; next frame the
-        // meter reads it as the t1 SRV (its own ColorToShaderResource handles that transition) and renders
-        // into the OTHER target. The state tracker makes either order valid; this keeps it consistent.
-        if (useMeter) meteredEvTarget.ColorToRenderTarget();
-        // Restore the INTERNAL scene target to RenderTarget for next frame's geometry/deferred pass (FSR
-        // left it in PixelShaderResource; in the native path hdr == target). fsrOutput stays in shader-read
-        // — RunFsr transitions it to UAV next frame from any state.
-        target.ColorToRenderTarget();
-    }
+    // DrawBloom / DumpMeteredLuminance / DumpAdaptedEv / DrawComposite moved VERBATIM into
+    // Resources/Dx12CompositePass.cs (chunk 7). DrawComposite became Dx12CompositePass.Record; bloom +
+    // auto-exposure metering are its private sub-steps. The pass runs at the Composite event via the graph.
 
     // DrawAerialPerspective + DrawFog moved into Dx12AerialPerspectivePass.Record / Dx12FogPass.Record
     // (chunk 5). The graph runs them at events 400 / 550 (before the SSAO PostProcess slot), the same

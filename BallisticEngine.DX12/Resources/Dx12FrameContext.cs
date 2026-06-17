@@ -1,5 +1,6 @@
 using System.Numerics;
 using System.Collections.Generic;
+using Vortice.Direct3D12;         // CpuDescriptorHandle
 using BallisticEngine;            // DX12HDRenderer, PostProcessSettings, RenderStats, GiMode, IStaticMeshRenderer
 
 namespace BallisticEngine.DX12;
@@ -43,6 +44,10 @@ public sealed class Dx12FrameContext {
     public int OutputW { get; init; }
     public int OutputH { get; init; }
 
+    // --- misc read-only frame state passes need (chunk 7: composite) ---
+    public bool DeterministicCapture { get; init; }   // BALLISTIC_DETERMINISTIC=1 (freezes grain + exposure reset)
+    public CpuDescriptorHandle SsaoResult { get; init; }   // Dx12SsaoPass.ResultSrvCpu (blurred half-res AO) — composite samples it when Doors.Ssao
+
     // --- shared backend resources (read-only references; the objects self-track their own state) ---
     public Dx12Device          Dev            { get; init; }
     public Dx12OffscreenTarget Target         { get; init; }   // HDR scene color (the canonical render target)
@@ -72,4 +77,9 @@ public sealed class Dx12FrameContext {
     public bool   ShadowsThisFrame   { get; set; }
     public bool   RtShadowsThisFrame { get; set; }
     public GiMode GiMode             { get; set; }
+
+    // The film-grain animation counter (DX12HDRenderer.ssgiFrame). SSGI increments it AFTER ctx is built, so
+    // the orchestrator refreshes it just before the PostProcess/Composite window — the composite reads it for
+    // the non-deterministic grain phase only (frozen under DeterministicCapture). Settable for that refresh.
+    public int GrainFrame { get; set; }
 }
