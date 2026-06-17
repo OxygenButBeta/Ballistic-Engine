@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using BallisticEngine.Serialization;
 
 namespace BallisticEngine;
@@ -38,8 +39,10 @@ public sealed class TypePlan {
         Members = members;
     }
 
-    // STATIC cache keyed by Type. Joins the P0.3 ClearForReload contract (Chunk 3) so a hot-reload drops
-    // stale plans built over the old game-script ALC — until then Clear() is exposed for the harness.
+    // STATIC cache keyed by Type. A compiled plan pins MemberInfo handles into the assembly the Type came
+    // from — including the collectible game-script ALC — so it MUST drop on hot-reload or a plan built for
+    // the old `Foo` is served for the new `Foo` (stale-after-reload, the worst bug class). P0.3 (Chunk 3)
+    // wires Clear() into the central ReloadCaches contract via the [ModuleInitializer] below.
     static readonly Dictionary<Type, TypePlan> cache = new();
 
     public static TypePlan For(Type type) {
@@ -50,8 +53,17 @@ public sealed class TypePlan {
         return plan;
     }
 
-    // Drops every compiled plan. Called by the P0.3 hot-reload invalidation (Chunk 3) and the harness.
+    // Drops every compiled plan. Called by the P0.3 hot-reload invalidation (via ReloadCaches) and the
+    // harness. After this, the next For(type) recompiles over the freshly-rebuilt TypeCache / new ALC types.
     public static void Clear() => cache.Clear();
+
+    // P0.3: TypePlan self-registers its invalidation into the central reload contract at assembly load — a
+    // [ModuleInitializer] (guaranteed before any reload, even if For() has never been called) so the cache
+    // can never be stranded holding stale game-script plans. This is THE one-line rule each new reflection
+    // cache obeys; the reload site (EngineBootstrap.ReloadGameScripts) calls ReloadCaches.InvalidateAll()
+    // once and never names TypePlan directly.
+    [ModuleInitializer]
+    internal static void RegisterReloadInvalidation() => ReloadCaches.Register(Clear);
 
     static TypePlan Build(Type type) {
         // The member set is the engine's single source of truth (ComponentReflection.InspectorMembers =

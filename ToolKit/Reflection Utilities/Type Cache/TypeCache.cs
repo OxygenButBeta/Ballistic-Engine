@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Runtime.CompilerServices;
 
 namespace BallisticEngine;
 
@@ -14,8 +15,14 @@ namespace BallisticEngine;
 // Lives in the ENGINE (not the editor): the serializer (Engine/Serialization) needs the derived-type
 // query to resolve [SerializeReference] $type tags HEADLESSLY (bal/runtime have no editor). Same
 // lifecycle as ComponentRegistry — ONE scan at bootstrap (EngineBootstrap.BuildComponentRegistry),
-// rebuilt from scratch on ALC hot-reload. (P0.3 formalizes the ClearForReload registration; for now
-// Build() fully replaces the cache, which the reload path already re-invokes — see EngineBootstrap.)
+// rebuilt from scratch on ALC hot-reload.
+//
+// HOT-RELOAD (P0.3, Chunk 3): TypeCache self-registers ClearForReload into the central ReloadCaches
+// contract via the [ModuleInitializer] below, so EngineBootstrap.ReloadGameScripts drops the stale type
+// snapshot at the reload boundary (before GameScripts.Unload), alongside the InputRegistry / Network
+// registries. Build() still fully replaces the snapshot on the rebuild that follows; the explicit clear
+// makes invalidation a FORMAL contract instead of relying on the reload path happening to re-invoke
+// Build() — and guarantees no stale game-script Type survives even momentarily between unload and rebuild.
 //
 // PERF (editor-rework §4): queries are computed ONCE per (T / attribute) at first ask and cached, so
 // per-frame UI code (the inspector redraws every frame in ImGui) pays zero reflection — [[pref-no-
@@ -50,6 +57,26 @@ public static class TypeCache {
         methodsWithAttrCache.Clear();
         IsBuilt = true;
     }
+
+    // P0.3 hot-reload invalidation: drop the type snapshot AND every memoized query so no Type from the
+    // unloaded game-script ALC survives. Self-registered into ReloadCaches (the [ModuleInitializer] below)
+    // and invoked by EngineBootstrap.ReloadGameScripts before GameScripts.Unload; Build() then re-scans the
+    // new assembly set. IsBuilt drops to false so a query in the brief unbuilt window returns empty (safe)
+    // rather than serving a stale list. The clear is idempotent.
+    public static void ClearForReload() {
+        allTypes = [];
+        derivedFromCache.Clear();
+        typesWithAttrCache.Clear();
+        methodsWithAttrCache.Clear();
+        IsBuilt = false;
+    }
+
+    // THE one-line rule (P0.3): TypeCache wires its own invalidation into the central reload contract at
+    // assembly load — a [ModuleInitializer] (not a lazy static ctor) so it is registered before any reload
+    // can occur, even if no code has touched TypeCache yet. Mirrors the source-gen [ModuleInitializer]
+    // registration the network registries use.
+    [ModuleInitializer]
+    internal static void RegisterReloadInvalidation() => ReloadCaches.Register(ClearForReload);
 
     // All CONCRETE, INSTANTIABLE types assignable to T (T may be an interface, an abstract class, or a
     // concrete base). "Instantiable" = the [SerializeReference]/Add-Component contract: a closed,

@@ -8,6 +8,7 @@ using BallisticEngine.Tests.Reflection;
 int exit = 0;
 exit += TypeCacheTests.Run();
 exit += PropertyModelTests.Run();
+exit += ReloadInvalidationTests.Run();
 return exit;
 
 internal static class TypeCacheTests {

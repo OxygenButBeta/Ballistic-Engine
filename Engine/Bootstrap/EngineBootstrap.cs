@@ -181,8 +181,9 @@ public sealed class EngineBootstrap {
         // The general reflection substrate (editor-rework P0.1) — built from the SAME assembly set,
         // alongside ComponentRegistry which it generalizes. Re-run on every reload (this method is
         // re-invoked from ReloadGameScripts) so its derived-type queries never serve stale game-script
-        // types. (P0.3 will formalize a ClearForReload registration; Build() already fully replaces the
-        // cache, so the reload path's re-invocation is sufficient today.)
+        // types. Its stale-cache invalidation is formalized in P0.3: TypeCache (and TypePlan) self-register
+        // into ReloadCaches, which ReloadGameScripts drains before GameScripts.Unload; this Build() then
+        // re-scans the new assembly set.
         TypeCache.Build(assemblies);
 
         // Gameplay framework (plan §7.3.1): force every InputAction-container type's static fields to
@@ -254,6 +255,15 @@ public sealed class EngineBootstrap {
         // table holds a descriptor per game-defined GameState subtype (registered by the generator's
         // [ModuleInitializer], the IReplicated path). Same leak class as the two above if not cleared.
         SceneReplicationRegistry.ClearForReload();
+        // P0.3 (editor-rework Chunk 3): drop every REFLECTION cache that pins old-ALC types/members
+        // (TypeCache type snapshot + query memo, TypePlan compiled member plans, and the future window /
+        // command / drawer-plan caches A1/B0/D1 will add). Unlike the three registries above — which drop
+        // ALC-PINNING handles so the ALC can unload — these drop STALE reflection so the rebuilt queries
+        // stay correct; both must clear at this same boundary. The central ReloadCaches list means each new
+        // cache self-registers once (a [ModuleInitializer] beside it) and the reload site is NEVER edited
+        // again — one call invalidates them all. BuildComponentRegistry below re-runs TypeCache.Build over
+        // the new assembly set; the per-Type plans lazily recompile on next ask.
+        ReloadCaches.InvalidateAll();
         Network.Manager?.Stop();
         GameScripts.Unload();
 
