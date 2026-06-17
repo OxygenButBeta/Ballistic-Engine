@@ -29,6 +29,18 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
     // Composite always runs (it IS the tonemap). The old inline call was unconditional in both branches.
     public bool Enabled(Dx12FrameContext ctx) => true;
 
+    // PHASE-2 V1: reads the resolved scene color (ctx.SceneColor — native = target, FSR = FsrOutput) and the
+    // SSAO result, tonemaps + composites + bloom + exposure-metering (private sub-steps) and WRITES the LDR
+    // output. Declares reads of BOTH "SceneColor" and "FsrOutput" so an edge forms from whichever upstream
+    // writer is active (TAA writes SceneColor in the native path; FSR writes FsrOutput) — both keep Composite
+    // last. Also reads the "Ssao" handle (so SSAO is never culled out from under it).
+    public void Declare(Dx12PassBuilder b) {
+        b.Read(b.Resource("SceneColor"));
+        b.Read(b.Resource("FsrOutput"));
+        b.Read(b.Resource("Ssao"));
+        b.Write(b.Resource("Ldr"));
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     struct CompositeConstants {
         public float ExposureMul; public float BloomIntensity; public float AutoExposure; public float LegacyMul;   // row 0

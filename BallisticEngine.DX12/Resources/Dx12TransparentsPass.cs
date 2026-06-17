@@ -33,6 +33,15 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
     // count==0 early-return inside Record). So the pass is always enabled.
     public bool Enabled(Dx12FrameContext ctx) => true;
 
+    // PHASE-2 V1: reads the G-buffer depth (DepthToReadOnly head) and the sun shadow map (forward-lit
+    // transparents sample the cascades), blends transparent geometry IN PLACE into the HDR scene color
+    // (ReadWrite — preserves the opaque-lit + sky pixels underneath).
+    public void Declare(Dx12PassBuilder b) {
+        b.Read(b.Resource("GBuffer"));
+        b.Read(b.Resource("ShadowMap"));
+        b.ReadWrite(b.Resource("SceneColor"));
+    }
+
     // The 6 material maps in HLSL register(t0..t5) order; camera near/far — mirror the orchestrator consts.
     const int MaterialSrvCount = 6;
     const float CameraNear = 0.1f, CameraFar = 1000f;

@@ -43,10 +43,3 @@ public interface IRenderPass {
     // phase-1 passes need not touch it.
     void Declare(Dx12PassBuilder builder) { }
 }
-
-// PHASE-2 placeholder — the builder a pass uses in Declare() to register reads/writes against virtual
-// resource handles. Empty in phase 1 (no pass calls it). Phase 2 (V1) fills it with Read/Write/Create
-// against a handle layer; defining the type NOW keeps IRenderPass.Declare's signature stable so phase 2
-// is purely additive. Do NOT add members until V1 — the empty type is intentional.
-public sealed class Dx12PassBuilder {
-}

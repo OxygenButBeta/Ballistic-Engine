@@ -36,6 +36,16 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable {
     // reproduces the MINIMAL "GI off" behaviour. The RT-vs-SSGI branch + the EnsureRtGi fallback live in Record.
     public bool Enabled(Dx12FrameContext ctx) => ctx.GiMode != GiMode.Off;
 
+    // PHASE-2 V1: reads the G-buffer (depth + normals for the SSGI/RT-GI gather) and read-modify-writes the HDR
+    // scene color (it gathers indirect from `target`, then CopyColorFrom(ssgiScene) back into `target` — the
+    // GI-enriched scene becomes the new SceneColor). The RT-GI branch additionally uses the DXR scene AS, but
+    // that's modeled as an immobile inline-core resource in V1 (the orchestrator owns ctx.Dxr); declaring the
+    // raster G-buffer + SceneColor is sufficient for the V1 order/cull (RT-GI is excluded from the golden gate).
+    public void Declare(Dx12PassBuilder b) {
+        b.Read(b.Resource("GBuffer"));
+        b.ReadWrite(b.Resource("SceneColor"));
+    }
+
     readonly Dx12Device dev;
 
     // === SSGI: SSILVB horizon-bitmask one-bounce gather (half-res) → composite into the lit HDR scene. ===

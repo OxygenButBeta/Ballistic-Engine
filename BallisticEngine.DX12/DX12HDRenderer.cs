@@ -612,7 +612,25 @@ public sealed class DX12HDRenderer : HDRenderer {
         // so moving it to last is byte-neutral (R5). Was BuildComposite (→ BuildLumAverage → BuildBloom).
         compositePass = new Dx12CompositePass(dev, targetW, targetH);
         graph.Add(compositePass);
+        // chunk 12 (phase 2 V1): a cull-path coverage pass. AllowCulling is default-OFF per pass, so without one
+        // pass that opts in, the culler (opaque-edge rule + iterate-to-fixpoint + non-imported-write decision)
+        // would ship UNTESTED (plan §V1, R-NEW-8). Dx12CullProbePass writes one non-imported scratch nobody reads
+        // → the compiler culls it every graph frame, exercising the culler. It NEVER records (culled on the graph
+        // path; Enabled=false on the list path) → byte-neutral in both. Event=BeforeShadows(0) → ordering-inert.
+        graph.Add(new Dx12CullProbePass());
         graph.Build();
+        // chunk 12: COMPILE the V1 dependency graph (DAG → cull → topo order). Pure CPU bookkeeping, no GPU work
+        // — V1 maps handles 1:1 to existing concrete targets (no pooling). The compiled order is what
+        // ExecuteGraph runs when graphPath is on. Compile here so any Declare/cycle error surfaces at init, not
+        // mid-frame; ExecuteGraph also lazily compiles if needed.
+        graph.Compile();
+        // Resolve the phase-2 V1 door once at init (kills per-frame env churn). When set, BeginRender calls
+        // graph.ExecuteGraph(ctx) (compiled order) instead of graph.Execute(ctx) (event sort).
+        graphPath = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GRAPH") == "1";
+        if (graphPath) {
+            Console.Error.WriteLine("[DX12] Render graph (phase-2 V1): COMPILED ORDER active (BALLISTIC_DX12_GRAPH=1).");
+            Console.Error.WriteLine(graph.LastCompileReport);
+        }
     }
 
     Dx12GpuDrivenRenderer gpuDriven;
@@ -625,11 +643,17 @@ public sealed class DX12HDRenderer : HDRenderer {
     bool hizPrimed;     // false until we have a valid previous-frame depth (first frame / after a big jump)
     readonly System.Collections.Generic.List<IStaticMeshRenderer> wholeMeshRenderers = new();
 
-    // The pluggable pass list (phase 1 scaffold → phase 2 true frame graph). Built EMPTY in Initialize and
-    // runs ZERO passes for now: BeginRender still records every pass INLINE; graph.Execute(ctx) is a proven
-    // no-op (byte-identical) until passes are converted to IRenderPass one chunk at a time. Built once
-    // (stable order, R1). Resize fans out to it (no-op while empty, R5-ordered once populated).
+    // The pluggable pass list (phase 1 — the URP pre-RenderGraph model: a stably-event-ordered IRenderPass
+    // list). PHASE 1 COMPLETE: every non-core pass is registered here and run by graph.Execute(ctx) (the event
+    // sort). PHASE 2 V1 (chunk 12): the same passes now also DECLARE reads/writes (IRenderPass.Declare), so
+    // graph.Compile() can build a dependency DAG, cull, and derive a topo order; graph.ExecuteGraph(ctx) runs
+    // THAT order. Built once (stable order, R1). Resize fans out to it (R5-ordered).
     Dx12RenderGraph graph;
+    // PHASE 2 V1 door: BALLISTIC_DX12_GRAPH=1 → run the COMPILED graph order (graph.ExecuteGraph) instead of the
+    // phase-1 event-sort (graph.Execute). Default OFF → the proven phase-1 list runs unchanged (byte-identical to
+    // the frozen golden set). The compiled order is provably == the event-sort order (PQ keyed (event,regIdx) +
+    // AllowCulling default-OFF), so GRAPH=1 must also be byte-identical to golden (the V1 pixel-neutral bar).
+    bool graphPath;
 
     // Cascade caching: skip re-rendering the sun cascades when the texel-snapped fit matrices AND the caster
     // geometry are unchanged (the depth-array layers are retained → byte-identical; big win for a static camera).
@@ -1407,7 +1431,15 @@ public sealed class DX12HDRenderer : HDRenderer {
         // giMode resolve / no-RT downgrade / WarnNoRtOnce stayed in the orchestrator above (they set ctx.GiMode,
         // which Dx12GiPass.Enabled reads). The Composite pass (event 700, last) reads the resolved ctx.SceneColor
         // after the TAA/FSR resolve (TaaPass/FsrPass at 650 set it). ===
-        graph.Execute(ctx);
+        //
+        // chunk 12 (phase 2 V1): when BALLISTIC_DX12_GRAPH=1, run the COMPILED DAG order (ExecuteGraph) instead of
+        // the event sort (Execute). The compiled order is provably identical to the event sort (topo-sort PQ keyed
+        // (event, registrationIndex) + AllowCulling default-OFF + edges that only run earlier-frame writers before
+        // later readers), so the image is byte-identical — the V1 pixel-neutral bar. Default OFF → Execute, the
+        // proven phase-1 list. Barriers are STILL the manual per-pass head transitions in both paths (V1 doesn't
+        // touch barriers — that's V3).
+        if (graphPath) graph.ExecuteGraph(ctx);
+        else graph.Execute(ctx);
 
         // P7.2a NO-RT RASTER PROBE measurement (BALLISTIC_DX12_NORT_PROBES=1): render ONE probe (6 cube faces) at
         // the camera + time it — the go/no-go gate before any grid wiring. Independent of giMode/RT (pure raster);

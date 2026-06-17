@@ -29,6 +29,14 @@ public sealed class Dx12SsaoPass : IRenderPass, IDisposable {
     // The VERBATIM outer-if predicate: `bool ssaoOn = doors.Ssao;` then `if (ssaoOn) DrawSsao(...)`.
     public bool Enabled(Dx12FrameContext ctx) => ctx.Doors.Ssao;
 
+    // PHASE-2 V1: reads the G-buffer (depth + world-normal) and WRITES its own half-res AO target (the "Ssao"
+    // handle, which the Composite pass reads via ctx.SsaoResult). Does NOT touch SceneColor — that's why SSAO
+    // can sit anywhere in PostProcess relative to TAA/FSR (disjoint resources, the chunk-4 reorder finding).
+    public void Declare(Dx12PassBuilder b) {
+        b.Read(b.Resource("GBuffer"));
+        b.Write(b.Resource("Ssao"));
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     struct SsaoConstants {
         public Matrix4x4 Projection; public Matrix4x4 InvProjection; public Matrix4x4 View;

@@ -35,6 +35,15 @@ public sealed class Dx12TaaPass : IRenderPass, IDisposable {
     // NOT TaaActive.
     public bool Enabled(Dx12FrameContext ctx) => !ctx.FsrActive;
 
+    // PHASE-2 V1: reads the G-buffer (motion vectors live in a G-buffer color RT) and read-modify-writes the HDR
+    // scene color (resolves current+history into the pass-owned ping-pong, then CopyColorFrom back into
+    // `target`). The pass-owned history targets are IMPORTED (never aliased) — V2 concern; not declared here in
+    // V1 (handles are 1:1 concrete; the history is pass-private and orchestrator-immobile).
+    public void Declare(Dx12PassBuilder b) {
+        b.Read(b.Resource("GBuffer"));
+        b.ReadWrite(b.Resource("SceneColor"));
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     struct TaaConstants { public float Feedback; public float ValidHistory; public Vector2 TexelSize; }
 

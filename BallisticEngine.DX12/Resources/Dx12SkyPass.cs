@@ -31,6 +31,14 @@ public sealed class Dx12SkyPass : IRenderPass, IDisposable {
     // The VERBATIM outer-if predicate: `if (doors.Sky)`.
     public bool Enabled(Dx12FrameContext ctx) => ctx.Doors.Sky;
 
+    // PHASE-2 V1: reads the G-buffer depth (DepthToReadOnly head) and WRITES the HDR scene color (draws sky into
+    // the un-lit background of `target` via RenderColorWithExternalDepth) — a ReadWrite since it preserves the
+    // already-lit pixels the Deferred pass wrote and only paints where depth is far.
+    public void Declare(Dx12PassBuilder b) {
+        b.Read(b.Resource("GBuffer"));
+        b.ReadWrite(b.Resource("SceneColor"));
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     struct SkyboxConstants {
         public Matrix4x4 ViewProjNoTranslate;

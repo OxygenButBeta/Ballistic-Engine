@@ -30,6 +30,14 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
     public bool Enabled(Dx12FrameContext ctx) =>
         (!ctx.Doors.Minimal && ctx.PostFX.VolumetricEnabled) || ctx.Doors.Fog;
 
+    // PHASE-2 V1: reads the G-buffer depth (and samples the sun cascades, which live in the imported ShadowMap)
+    // and blends fog IN PLACE into the HDR scene color (ReadWrite).
+    public void Declare(Dx12PassBuilder b) {
+        b.Read(b.Resource("GBuffer"));
+        b.Read(b.Resource("ShadowMap"));
+        b.ReadWrite(b.Resource("SceneColor"));
+    }
+
     // The sun shadow map is built at this fixed size in DX12HDRenderer (const ShadowMapSize). The fog samples
     // the cascade array — the texel size must match the map. Mirror the orchestrator's const verbatim.
     const int ShadowMapSize = 2048;

@@ -30,6 +30,13 @@ public sealed class Dx12AerialPerspectivePass : IRenderPass, IDisposable {
     // The VERBATIM outer-if predicate: `if (doors.AerialPersp && ProceduralSky.Active is not null)`.
     public bool Enabled(Dx12FrameContext ctx) => ctx.Doors.AerialPersp && ProceduralSky.Active is not null;
 
+    // PHASE-2 V1: reads the G-buffer depth and blends haze IN PLACE into the HDR scene color (ReadWrite — it
+    // reads `target` via the blend and writes it back).
+    public void Declare(Dx12PassBuilder b) {
+        b.Read(b.Resource("GBuffer"));
+        b.ReadWrite(b.Resource("SceneColor"));
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     struct ApConstants {
         public Matrix4x4 InvViewProj;

@@ -34,6 +34,15 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     public bool Enabled(Dx12FrameContext ctx) =>
         !ctx.Doors.Minimal && ctx.PostFX.SsrEnabled && ctx.PostFX.SsrIntensity > 0f;
 
+    // PHASE-2 V1: reads the G-buffer (depth + normal/roughness for the SSR march) and read-modify-writes the HDR
+    // scene color (marches reflections from `target`, then CopyColorFrom(ssrScene) back into `target`). RT
+    // reflections additionally use the DXR AS (inline-core in V1) — declaring G-buffer + SceneColor suffices for
+    // the V1 order/cull (RT reflections excluded from the golden gate).
+    public void Declare(Dx12PassBuilder b) {
+        b.Read(b.Resource("GBuffer"));
+        b.ReadWrite(b.Resource("SceneColor"));
+    }
+
     readonly Dx12Device dev;
 
     // === SSR: half-res view-space reflection march → combine (depth-aware upsample, lerp into HDR color). ===

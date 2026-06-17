@@ -24,6 +24,16 @@ public sealed class Dx12FsrPass : IRenderPass, IDisposable {
     // The VERBATIM outer-if predicate: `if (fsrActive) { RunFsr(); ... }`.
     public bool Enabled(Dx12FrameContext ctx) => ctx.FsrActive;
 
+    // PHASE-2 V1: reads the G-buffer (depth + motion for the upscaler) and the HDR scene color, then WRITES the
+    // FSR output target and sets ctx.SceneColor = FsrOutput (the canonical composite-input branch). Reads
+    // SceneColor (so it depends on the prior SceneColor writer — TAA in the native path, but FSR/TAA are
+    // mutually exclusive at runtime via Enabled; the edge just keeps the reg-order/event-order stable).
+    public void Declare(Dx12PassBuilder b) {
+        b.Read(b.Resource("GBuffer"));
+        b.Read(b.Resource("SceneColor"));
+        b.Write(b.Resource("FsrOutput"));
+    }
+
     // Render-wide camera constants (the renderer's CameraNear/CameraFar/FovYRadians, inlined — they're frame-
     // independent literals the FSR dispatch needs for its reprojection math).
     const float CameraNear = 0.1f, CameraFar = 1000f;

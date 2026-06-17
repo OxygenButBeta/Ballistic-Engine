@@ -30,6 +30,16 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
     // The inline call had NO outer-if (DrawDeferredLighting was always invoked). So the pass is always enabled.
     public bool Enabled(Dx12FrameContext ctx) => true;
 
+    // PHASE-2 V1: reads the G-buffer (as SRV), the sun shadow map, and the RT shadow mask; WRITES the HDR scene
+    // color (it shades every lit pixel into `target` via RenderColorOnlyCleared — a full overwrite, the first
+    // writer of SceneColor in the frame, so it's a pure Write not a ReadWrite).
+    public void Declare(Dx12PassBuilder b) {
+        b.Read(b.Resource("GBuffer"));
+        b.Read(b.Resource("ShadowMap"));
+        b.Read(b.Resource("RtShadowMask"));
+        b.Write(b.Resource("SceneColor"));
+    }
+
     // Render-wide camera constants (the renderer's CameraNear/CameraFar, inlined — they're frame-invariant
     // const float on the orchestrator; the deferred CB's ClusterNearFar uses them).
     const float CameraNear = 0.1f, CameraFar = 1000f;
