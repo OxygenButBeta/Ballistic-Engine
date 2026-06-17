@@ -37,6 +37,11 @@ public sealed class Dx12SkyPass : IRenderPass, IDisposable {
     public void Declare(Dx12PassBuilder b) {
         b.Read(b.Resource("GBuffer"));
         b.ReadWrite(b.Resource("SceneColor"));
+        // PHASE-2 V3 (chunk 15): Sky's ONE shared-resource head transition is `gbuffer.DepthToReadOnly()` — the
+        // depth becomes a read-only DSV for the LEqual-no-write sky draw. Derive it; the manual head in Record is
+        // gated off when the barriers door is on (so the graph emits the single transition, not manual+derived).
+        b.DeriveBarriers();
+        b.Use(Dx12ResourceUsage.GBufferDepthReadOnly);
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -181,7 +186,9 @@ public sealed class Dx12SkyPass : IRenderPass, IDisposable {
         Dx12GBuffer gbuffer = ctx.GBuffer;
         Dx12OffscreenTarget target = ctx.Target;
 
-        gbuffer.DepthToReadOnly();   // head transition (R2): emit our own (the inline block did this here)
+        // head transition (R2): emit our own (the inline block did this here). PHASE-2 V3: skip the manual head
+        // when derived barriers are active (the graph emitted it before Record).
+        if (!ctx.BarriersDerived) gbuffer.DepthToReadOnly();
         target.RenderColorWithExternalDepth(gbuffer.DsvHandle, cl => {
             if (ProceduralSky.Active is not null)
                 DrawProcSky(cl, ctx);

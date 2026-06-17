@@ -40,6 +40,14 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
         b.Read(b.Resource("GBuffer"));
         b.Read(b.Resource("ShadowMap"));
         b.ReadWrite(b.Resource("SceneColor"));
+        // PHASE-2 V3 (chunk 15): Transparents' ONE shared-resource head transition is `gbuffer.DepthToReadOnly()`
+        // (same usage class as Sky — the LEqual-no-write forward draw binds depth as a read-only DSV). Derive it;
+        // the manual head in Record is gated off when the barriers door is on. NOTE: the derived emit fires when
+        // the pass is Enabled (always true) EVEN when there are no transparent submeshes — but it's an idempotent
+        // state-tracked DepthToReadOnly with no draw, and every downstream consumer re-asserts its own depth state
+        // (R2), so the extra transition is a harmless no-op (verified SHA==golden + GBV 0-NEW, sky-off included).
+        b.DeriveBarriers();
+        b.Use(Dx12ResourceUsage.GBufferDepthReadOnly);
     }
 
     // The 6 material maps in HLSL register(t0..t5) order; camera near/far — mirror the orchestrator consts.
@@ -196,7 +204,8 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
         // 3) Draw back-to-front into the HDR color, depth-testing the G-buffer depth. Head transition (R2,
         // Decision 4): emit our OWN DepthToReadOnly (the inline sky block used to do this unconditionally;
         // now Sky is gated, so transparents re-asserts DepthRead). Idempotent no-op when upstream already set it.
-        gbuffer.DepthToReadOnly();
+        // PHASE-2 V3: skip the manual head when derived barriers are active (the graph emitted it before Record).
+        if (!ctx.BarriersDerived) gbuffer.DepthToReadOnly();
         target.RenderColorWithExternalDepth(gbuffer.DsvHandle, cl => {
             cl.SetGraphicsRootSignature(transparentRootSig);
             cl.SetPipelineState(transparentPso);
