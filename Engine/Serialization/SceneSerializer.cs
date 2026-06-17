@@ -155,6 +155,16 @@ public static class SceneSerializer {
         if (value is null)
             return null;
 
+        // Polymorphic render-feature list (phase-3 chunk 21 / design §5 D3): the RenderFeatures
+        // SceneBehaviour's `List<RenderFeature> Features` round-trips as an ORDERED YAML list of
+        // {type, active, members} entries — type-name via FeatureNameOf, members reflected exactly like
+        // a Behaviour's. The generic SerializeValue path can't do this (a List<abstractType> has no
+        // type discriminator), so it's handled here. Order is preserved (a List, not a set). The same
+        // {type, members} shape any other List<RenderFeature> member would use, so this is generic to
+        // the element TYPE, not the one member name.
+        if (value is System.Collections.IEnumerable features && IsRenderFeatureList(value.GetType()))
+            return SerializeFeatureList(features);
+
         if (value is BEvent evt)
             return BEventYaml.Serialize(evt);
 
@@ -348,6 +358,13 @@ public static class SceneSerializer {
         if (raw is null)
             return null;
 
+        // Polymorphic render-feature list (chunk 21 / design §5 D3) — inverse of SerializeFeatureList.
+        // Parses the ordered {type, active, members} list back into a List<RenderFeature>, resolving
+        // each type via ResolveFeature; an UNKNOWN type-name WARNS + SKIPS (Volume-loader parity: a
+        // scene authored with a since-deleted feature must still load), preserving the order of the rest.
+        if (IsRenderFeatureList(targetType))
+            return DeserializeFeatureList(raw);
+
         if (typeof(BObject).IsAssignableFrom(targetType))
             return raw is string reference ? LoadAsset(reference, targetType) : null;
 
@@ -398,6 +415,98 @@ public static class SceneSerializer {
             return null;
         }
     }
+
+    // ---- Render-feature list serialization (phase-3 chunk 21 / design §5 D3) -----------------------
+    // The authored render-feature list (RenderFeatures.Features) is a polymorphic ORDERED list of
+    // RenderFeature subtypes. ComponentReflection's generic path can't round-trip a List<abstractType>
+    // (no type discriminator), so it's handled inline by SerializeValue/DeserializeValue exactly like
+    // the BObject/BEvent/AnimationCurve special cases. Mirrors VolumeProfileLoader's type-name + member
+    // round-trip, but through the scene YAML (features are scene-local per design §5 D2, not a shared
+    // asset). Generic to the ELEMENT type (any List<RenderFeature> member), not the one member name.
+
+    // A `List<RenderFeature>` (or any list whose element type derives from RenderFeature).
+    static bool IsRenderFeatureList(Type type) =>
+        type.IsGenericType &&
+        type.GetGenericTypeDefinition() == typeof(List<>) &&
+        typeof(RenderFeature).IsAssignableFrom(type.GetGenericArguments()[0]);
+
+    // -> an ordered List<Dictionary<string,object>> of {type, active, members}. YamlDotNet serializes
+    // this nested map/list structure natively (the same shape ComponentDocument.Members already uses),
+    // so it lands as a clean YAML list under the member's key. Order preserved.
+    static object SerializeFeatureList(System.Collections.IEnumerable features) {
+        var list = new List<object>();
+        foreach (object item in features) {
+            if (item is not RenderFeature feature)
+                continue; // a null entry in the list (shouldn't happen) is dropped, not crash-on-write
+            var entry = new Dictionary<string, object> {
+                // type-name via FeatureNameOf (short name when unambiguous, else FullName) — the same
+                // discriminator ComponentDocument.Type uses for a Behaviour.
+                ["type"] = ComponentRegistry.FeatureNameOf(feature),
+                // Active is the per-feature master switch (mirrors ComponentDocument.Enabled): stored as
+                // a top-level key, NOT inside `members`, so it's not duplicated (it's excluded below).
+                ["active"] = feature.Active,
+            };
+            var members = new Dictionary<string, object>();
+            foreach (MemberInfo member in SerializableMembers(feature.GetType())) {
+                // `Active` is already captured top-level; skip it in the reflected member set so the two
+                // never diverge (and the YAML has one `active`, not an `active` AND a member `active`).
+                if (member.Name == nameof(RenderFeature.Active))
+                    continue;
+                object serialized = SerializeValue(GetMemberValue(member, feature));
+                if (serialized is not null)
+                    members[CamelCase(member.Name)] = serialized;
+            }
+            if (members.Count > 0)
+                entry["members"] = members;
+            list.Add(entry);
+        }
+        return list;
+    }
+
+    // Inverse: the YAML list (a List<object> of maps from YamlDotNet) -> List<RenderFeature>. Resolve
+    // each `type` via ResolveFeature; UNKNOWN -> warn + skip (Volume-loader parity), order of the rest
+    // preserved. `active` + nested `members` applied through the SAME reflection path Behaviour members
+    // use (ApplyMembers), so a feature's params deserialize identically to a component's.
+    static object DeserializeFeatureList(object raw) {
+        var result = new List<RenderFeature>();
+        if (raw is not System.Collections.IEnumerable entries)
+            return result;
+
+        foreach (object entryObj in entries) {
+            // YamlDotNet yields each mapping as IDictionary<object,object> (keys are strings).
+            if (entryObj is not IDictionary<object, object> entry)
+                continue;
+
+            string typeName = MapStr(entry, "type");
+            Type type = ComponentRegistry.ResolveFeature(typeName);
+            if (type is null) {
+                Debugging.LogWarning($"Unknown render feature '{typeName}'; skipped.");
+                continue;
+            }
+
+            var feature = (RenderFeature)Activator.CreateInstance(type);
+            if (entry.TryGetValue("active", out object activeRaw) && activeRaw is not null &&
+                bool.TryParse(activeRaw.ToString(), out bool active))
+                feature.Active = active;
+
+            if (entry.TryGetValue("members", out object membersRaw) &&
+                membersRaw is IDictionary<object, object> memberMap) {
+                // Normalize to the Dictionary<string,object> shape ApplyMembers expects (same as a
+                // ComponentDocument.Members), then reuse the exact Behaviour-member apply path.
+                var members = new Dictionary<string, object>(StringComparer.Ordinal);
+                foreach ((object k, object v) in memberMap)
+                    if (k is not null)
+                        members[k.ToString()] = v;
+                ApplyMembers(feature, type, members);
+            }
+
+            result.Add(feature);
+        }
+        return result;
+    }
+
+    static string MapStr(IDictionary<object, object> map, string key) =>
+        map.TryGetValue(key, out object v) && v is not null ? v.ToString() : null;
 
     // ---- Member reflection (shared with the editor inspector) --------------
 

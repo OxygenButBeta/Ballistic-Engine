@@ -172,6 +172,17 @@ RT_GI/RT_SHADOWS off — pre-existing device-removal, not phase-3's to fix). Bui
   is an ordered list of `{type-name (via `FeatureNameOf`), members}`. Do NOT invent a parallel JSON loader
   unless a feature needs the asset-sharing the `.volume` path gives (it doesn't — features are scene-local
   per D2). Legacy-rename map kept available for future renames (the Volume loader's pattern).
+  - **SHIPPED (chunk 21) — the polymorphic-list seam lives INLINE in `SceneSerializer`.** The
+    `List<RenderFeature>` member is special-cased in `SerializeValue`/`DeserializeValue` by ELEMENT TYPE
+    (`IsRenderFeatureList`), exactly alongside the existing `BObject`/`BEvent`/`AnimationCurve` cases — NOT a
+    new loader and NOT a member-name special-case. On-disk shape:
+    `{type: <FeatureNameOf>, active: <bool>, members: {<reflected>}}` per entry, ordered; `active` is a
+    top-level key (excluded from `members`), `members` omitted when empty; nested members reuse `ApplyMembers`
+    (asset refs as guids included); unknown type → warn+skip with order preserved. The generic
+    `ComponentReflection` member-writer CAN'T do this (a `List<abstractType>` has no type discriminator) — so
+    the scene serializer owns it, the same as every other non-primitive member type. (Full status: §6
+    chunk-21.) Caveat learned: a SceneBehaviour's own `id:` is not restored on load (pre-existing, all
+    SceneBehaviours); the feature LIST is byte-stable regardless.
 - **D4 — what the FIRST verb set is.** Minimal: `BlitFullscreen(sourceHandle, destHandle, materialOrShader)`
   + `SetRenderTarget(handle)` + read access to `SceneColor`. Just enough for the chunk-19 proof feature
   (tint/invert SceneColor). Every later verb is added on a concrete feature's demand, logged in this doc.
@@ -285,11 +296,48 @@ proven on a trivial feature BEFORE any real feature is built (the chunk-18 risk 
     magenta (per-channel R x1.0 / G x0.25 / B x0.6; meanAbsDiff 10.50/255); tint-door OFF byte-identical to golden
     (40a68b28de4aa294fb); GBV with the feature ACTIVE on BistroInterior+CornellBox = exit 0, 0 NEW.
 
-- **Chunk 21 — serialization round-trip (D3).** Make the `RenderFeatures` SceneBehaviour's feature list
-  serialize/deserialize through the scene YAML (reuse `ComponentReflection`): `FeatureNameOf` for the type,
-  members via reflection, ordered list preserved, unknown-type warn-skip (Volume-loader parity). Verify: a
-  scene with the proof feature saved→loaded reproduces it; a scene with NO features is byte-identical YAML
-  to today; golden 15/15 + GBV 0-NEW (no feature in golden scenes). Commit.
+- **Chunk 21 — serialization round-trip (D3). ✅ DONE.** The `RenderFeatures` SceneBehaviour's feature
+  list now serializes/deserializes through the scene YAML.
+  - **WHERE it lives (the decision):** INLINE in `SceneSerializer` (NOT a parallel JSON loader, NOT a per-
+    member special-case keyed by name). The polymorphic `List<RenderFeature>` is handled generically by the
+    ELEMENT TYPE in `SerializeValue`/`DeserializeValue` — exactly alongside the existing `BObject`/`BEvent`/
+    `AnimationCurve`/`ColorGradient` inline special cases. This fits the architecture: the generic
+    `ComponentReflection` member-writer can't round-trip a `List<abstractType>` (no type discriminator), so
+    the scene serializer special-cases it the same way it already special-cases every other non-trivial
+    member type. Any future `List<RenderFeature>` member round-trips for free (it's keyed on the type, not
+    the member name).
+  - **SHAPE (a NEW serialization fact for §5 D3):** the list serializes as an ORDERED YAML list of
+    `{type: <FeatureNameOf>, active: <bool>, members: {<reflected props/fields>}}`. `Active` is a TOP-LEVEL
+    key (mirrors `ComponentDocument.Enabled`) and is EXCLUDED from the reflected `members` set so it isn't
+    duplicated. `members` is omitted when empty. The nested map/list is the same `Dictionary<string,object>`
+    shape `ComponentDocument.Members` already uses, so YamlDotNet serializes it natively + the OpenTK/
+    System.Numerics converters fire for Vector3 members. Deserialize resolves each `type` via
+    `ResolveFeature`, `Activator.CreateInstance`s it, applies `active`, and runs the nested `members` through
+    the SAME `ApplyMembers` path a Behaviour uses (so a feature's params deserialize identically to a
+    component's, asset refs included). UNKNOWN type-name → `Debugging.LogWarning` + SKIP, order of the
+    survivors preserved (Volume-loader parity — a scene authored with a since-deleted feature still loads).
+  - **PRE-EXISTING (not chunk-21's): a SceneBehaviour's own `id:` is NOT restored on deserialize**
+    (`DeserializeCore`'s SceneComponents path never sets `behaviour.InstanceId`; only ENTITY components do,
+    via `ApplyComponent`). So a save→load→save churns the `RenderFeatures` host's `id:` line — but this is
+    orthogonal to the feature list and affects EVERY SceneBehaviour equally. The feature list itself
+    (type/active/members/order) is byte-stable across the round-trip. (Fixing the SceneBehaviour-id
+    restoration is out of scope here; flagged for a future chore if it ever matters.)
+  - **The proof door is RETAINED (the call documented):** `BALLISTIC_DX12_FEATURE_TINT_TEST` stays in
+    `RenderFeatureManager.Gather` (default-OFF, pixel-neutral). It's a useful no-scene seam smoke-test and
+    golden held 15/15 either way, so keeping it is the lower-risk choice. The serialized path is now the
+    PRIMARY proof (a real authored scene reproduces the feature without the door).
+  - **VERIFIED:** slnx 0-err (editor incl.); engine root + Runtime + Cli bins refreshed (no .hlsl touched).
+    (i) ROUND-TRIP — in-process harness `bal-feature-rt-test` 18/18 PASS: a 2-feature `RenderFeatures` host
+    saves as the `{type,active,members}` list; save→load→save reproduces the feature list byte-for-byte
+    (order + Vector3 + float + Active=false all preserved); an unknown type between two real ones warns+skips
+    without throwing (2 of 3 survive, order kept); a feature-free scene has NO `features:` key (golden
+    untouched). (ii) PIXEL-NEUTRAL DEFAULT — golden 15/15 SHA==golden under default AND `GRAPH=1`; golden
+    BistroInterior_Wine still `40a68b28de4aa294fb`. GBV CornellBox+BistroInterior alias off+on = exit 0, 0
+    NEW (0 error-class). (iii) POSITIVE (serialized, no door) — a throwaway `BistroInterior_FeatureTest`
+    scene authoring `RenderFeatures`→`SceneColorTintFeature` (tint 1/0.25/0.6, strength 0.6) rendered a
+    DIFFERENT SHA (`b21a042db0ed320164`) from golden with the expected magenta direction (R x1.006 / G x0.777
+    / B x0.888 post-tonemap, meanAbsDiff 5.22) — the seam now runs from a SERIALIZED feature, env door unused;
+    GBV on that scene = exit 0, 0 NEW. (Throwaway scene deleted after the proof — kept OUT of golden.) Commit.
 
 - **Chunk 22 — editor: the reorderable feature-list UI.** The feature PARAMS already draw via the existing
   `DrawerPipeline` (attributes free). Add the ONE new widget: a reorderable list on the `RenderFeatures`
