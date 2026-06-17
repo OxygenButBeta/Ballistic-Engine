@@ -34,7 +34,10 @@ public sealed class Dx12FrameContext {
     public float   Exposure    { get; init; }
 
     // --- scene inputs (read-only) ---
-    public IReadOnlyList<IStaticMeshRenderer> WholeMeshRenderers { get; init; }
+    // The whole-mesh renderer list (the renderer's `wholeMeshRenderers` field, a List). Concrete List type (not
+    // IReadOnlyList) because the GI + Reflections passes feed it to Dx12GpuDrivenRenderer.EnsureMaterialTable,
+    // which takes List<IStaticMeshRenderer>. Read-only USE (init-only); the orchestrator owns the list.
+    public List<IStaticMeshRenderer> WholeMeshRenderers { get; init; }
     public Vector4[] FrustumPlanes { get; init; }         // UNJITTERED-viewProj planes (shared array, read-only use)
     public Matrix4x4[] CascadeMatrices { get; init; }     // sun shadow cascade light-MVPs, filled by RenderShadows (shared array, read-only use)
 
@@ -79,6 +82,14 @@ public sealed class Dx12FrameContext {
     // per-frame resource, filled once before the graph runs — see "what STAYS inline"); the Transparents
     // pass (chunk 8) binds it to its b1 FrameConstants root CBV. Read-only (the address is stable per frame).
     public ulong FrameCbAddress { get; init; }
+
+    // Shared DXR substrate (chunk 10): the scene AS, the ID3D12Device5 facet, the one-time DXR-availability
+    // probe, the per-instance bindless geometry SRVs, and the DDGI world cache — all lazily created on first
+    // RT use. Shared by THREE consumers: RT sun shadows (still inline core in the orchestrator), the GI pass
+    // (RT-GI branch), and the Reflections pass (RT-reflections branch). The orchestrator owns the holder (one
+    // per renderer) and the same reference is threaded here every frame. Internally mutable (the holder does
+    // its own lazy-create); the ctx field is a stable reference (init-only). Null is never expected.
+    public Dx12DxrShared Dxr { get; init; }
 
     // --- engine-side config / output (read-only references) ---
     public Dx12RenderDoors      Doors    { get; init; }

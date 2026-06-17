@@ -100,72 +100,24 @@ public sealed class DX12HDRenderer : HDRenderer {
     int taaFrame;                       // jitter phase counter (shared by TAA + FSR; advanced in the frame tail)
     Vector2 currentJitter;              // this frame's sub-pixel jitter (pixels) — exposed for FSR reuse
 
-    // SSR: half-res view-space reflection march (reads HDR color + G-buffer) → combine (depth-aware
-    // upsample, lerp into the HDR color). Driven by the ScreenSpaceReflections VOLUME (PostFX.Ssr*).
-    ID3D12RootSignature ssrRootSig;     // SsrConstants CBV(b0) + 5-SRV table(color/depth/normal/material/ssr) + sampler
-    ID3D12PipelineState ssrMarchPso, ssrCombinePso;
-    ID3D12Resource ssrCb;
-    unsafe byte* ssrCbMapped;
-    Dx12OffscreenTarget ssrTarget;      // half-res RGBA16F reflection (rgb + strength)
-    Dx12OffscreenTarget ssrScene;       // full-res scratch: combine writes here, then copied back to `target`
-    Dx12DescriptorHeap ssrSrvVisible;   // 5 SRVs per pass
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct SsrConstants {
-        public Matrix4x4 Projection; public Matrix4x4 InvProjection; public Matrix4x4 ViewMatrix;
-        public float Intensity; public Vector3 Pad;
-        public Vector2 TexelSize; public Vector2 Pad2;
-    }
-
-    // SSGI: SSILVB horizon-bitmask one-bounce gather (half-res) → composite into the lit HDR scene. Ported
-    // from the GL SSGI_Frag/Combine. Temporal accumulation (via the motion buffer) + OIDN denoise wrap it
-    // (step C). Driven by the ScreenSpaceGlobalIllumination VOLUME (PostFX.Ssgi*).
-    ID3D12RootSignature ssgiRootSig;        // SsgiConstants CBV(b0) + 3-SRV table + clamp sampler
-    ID3D12PipelineState ssgiGatherPso, ssgiTemporalPso, ssgiCombinePso;
-    ID3D12Resource ssgiCb;
-    unsafe byte* ssgiCbMapped;
-    Dx12OffscreenTarget ssgiTarget;         // half-res RGBA16F raw GI (rgb + edge-fade)
-    Dx12OffscreenTarget ssgiHistoryA, ssgiHistoryB;  // half-res ping-pong accumulated GI (rgb + history len)
-    Dx12OffscreenTarget ssgiDenoised;       // half-res OIDN output (the GL a-trous replacement)
-    Dx12OffscreenTarget ssgiScene;          // full-res scratch: combine writes here, copied back to `target`
-    Dx12DescriptorHeap ssgiSrvVisible;      // 3 SRVs per pass
-    int ssgiFrame;                          // slice-set rotation counter
-    bool ssgiHistWriteB;                    // temporal ping-pong toggle
-    bool ssgiHistValid;                     // false on first frame / resize
-    // OIDN spatial denoise (replaces the GL a-trous). Two paths: a ZERO-COPY GPU path (OIDN's HIP device
-    // imports a D3D12 shared buffer; per frame = 2 GPU texture<->buffer copies + an in-place GPU denoise, no
-    // CPU readback) when SharedCapable, else the CPU readback round-trip (D3D12 -> host floats -> OIDN ->
-    // upload). Created lazily on first use; the shared path falls back to readback if the HIP import fails.
-    Dx12OidnDenoiser ssgiOidn;
-    bool ssgiOidnTried;
-    float[] ssgiCpuColor, ssgiCpuOut;       // host float3 buffers sized to the half-res GI (readback path)
-    Dx12OidnGpuPath ssgiOidnGpu;            // zero-copy GPU pack/unpack denoise (shared float buffer)
-    bool ssgiSharedFailed;                   // shared path failed once → stick to readback forever
-    bool ssgiOidnForceReadback;              // BALLISTIC_DX12_OIDN_READBACK=1 → force the CPU path (A/B door)
-    bool ssgiOidnTiming;                     // BALLISTIC_DX12_OIDN_TIMING=1 → log avg denoise ms (perf A/B)
-    bool ssgiOidnGuide;                      // P6.1 BALLISTIC_DX12_OIDN_GUIDE=1 → albedo+normal AOV guides
-    bool ssgiAuxFailed;                       // aux import failed once → denoise unguided forever (graceful)
-    bool ssgiOidnEnvRead;
-    readonly System.Diagnostics.Stopwatch ssgiOidnSw = new();
-    double ssgiOidnAccumMs; int ssgiOidnAccumFrames;
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct SsgiConstants {
-        public Matrix4x4 Projection; public Matrix4x4 InvProjection; public Matrix4x4 ViewMatrix;
-        public Vector4 Params0;   // RayLength, Falloff, Thickness, MultiBounce
-        public Vector4 Params1;   // BounceBoost, RayCount, FrameIndex, _
-        public Vector4 Params2;   // TexelSize.xy, preExposure, 1/preExposure
-        public Vector4 Combine0;  // Intensity, Look, Saturation, OcclusionPower
-        public Vector4 Tint;      // Tint.xyz, _
-        public Vector4 Params3;   // HasHistory, MaxHistory, _, _
-    }
+    // SSR moved VERBATIM to Resources/Dx12ReflectionsPass.cs (chunk 10 — Event=Reflections 600; the SSR
+    // rootsig/PSOs/CB/heap/targets + the SsrConstants struct + DrawSsr live there, alongside RT reflections as
+    // ONE mode-branch pass). SSGI moved VERBATIM to Resources/Dx12GiPass.cs (chunk 10 — Event=GlobalIllumination
+    // 500; the SSGI rootsig/PSOs/CB/heap/targets + history ping-pong + OIDN denoise + the SsgiConstants struct +
+    // DrawSsgi/FillSsgiConstants/SsgiResolveAndCombine live there, alongside RT-GI/DDGI/screen-probe as ONE
+    // mode-branch pass). Both were deferred to this single unified-pass chunk precisely because RT shares their
+    // resources (SSR ↔ DrawRtReflections; the SSGI resolve tail ↔ DrawRtGi).
 
     // --- DXR ray-traced sun shadows (volume-driven: Shadows.rayTracedShadows / PostFX.RayTracedShadows) ---
     // A scene BLAS/TLAS (Dx12SceneAS) + an RT pass (DxrShadows.hlsl) that traces one shadow ray per pixel
     // toward the sun → a full-res R8 mask the deferred lighting multiplies into the sun term (UseRtShadows).
     // Built lazily on first use; falls back to the cascaded CSM when DXR is unavailable. Hard shadows are
     // deterministic (no denoise); soft penumbra + OIDN is a follow-up.
-    Dx12SceneAS sceneAS;
-    ID3D12Device5 device5;
-    bool dxrChecked, dxrAvailable;
+    // Chunk 10: the scene AS + ID3D12Device5 facet + the DXR-availability probe + the per-instance bindless geo
+    // SRVs + the DDGI cache moved into the SHARED Dx12DxrShared holder (sceneAS/device5/dxrChecked/dxrAvailable/
+    // rtGeometry/ddgi were renderer fields). RT sun shadows (still inline core) + the GI pass + the Reflections
+    // pass all reference it (the GI/Reflections passes via ctx.Dxr). Created once in Initialize.
+    Dx12DxrShared dxr;
     bool noRtWarned;                            // P7.0: log the no-RT downgrade once, not every frame
     // P7.0: one-time log when RayTraced GI/reflections/shadows are auto-downgraded for lack of HW ray tracing.
     void WarnNoRtOnce() {
@@ -191,69 +143,14 @@ public sealed class DX12HDRenderer : HDRenderer {
     // mixes it into the scene. PHASE 8: DxrReflections.hlsl shades misses as the sky/IBL cube and HITS with
     // the REAL world-radiance estimator (sun + punctual + the DDGI world-cache irradiance field as ambient =
     // reflections see the same multi-bounce GI as the diffuse pass). Mirror rays are deterministic → no denoise.
-    ID3D12RootSignature rtReflRootSig;          // HeapDirectlyIndexed; CBV b0/b1/b2 + table{t0-t6,u0} + root SRV t7/t8/t9/t10 + s0/s1
-    ID3D12StateObject rtReflPso;
-    ID3D12Resource rtReflSbt, rtReflCb, rtReflSunCb, rtReflGridCb;
-    unsafe byte* rtReflCbMapped, rtReflSunCbMapped, rtReflGridCbMapped;
-    bool rtReflBuilt;
-    // Phase-8 reflection table reserves its OWN 8-slot tail of the bindless heap (so the table descriptors share
-    // the one bound CBV/SRV/UAV heap with the closest-hit's ResourceDescriptorHeap[] bindless reads), BELOW the
-    // ScreenProbe tail (16368) so the four reservations (RtRefl < ScreenProbe < DDGI < RtGi) never collide;
-    // materials bump from 0 and never reach here. Slots 16352..16359: t0 TLAS, t1 depth, t2 normal, t3 material,
-    // t4 irr cube, t5 prefilter cube, t6 DDGI irr atlas, u0 ssrTarget.
-    const int RtReflTableBase = 16384 - 32;
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct RtReflConstants {
-        public Matrix4x4 InvViewProj; public Vector3 CameraPos; public float Intensity;
-        public float PrefilterMaxMip; public float NormalBias; public float UseDdgi; public float Pad0;
-    }
-
-    // --- DXR ray-traced GI (GI volume Off/SSGI/RT-GI enum: PostFX.GiMode) ---
-    // DxrGi.hlsl cosine-samples one hemisphere ray per pixel → the raw one-bounce GI in ssgiTarget; then the
-    // SHARED SSGI pipeline (motion temporal + OIDN + combine) cleans + adds it. RT GI just replaces the
-    // SSILVB gather. Reuses device5 + sceneAS.
-    ID3D12RootSignature rtGiRootSig;            // CBV b0/b1 + table{t0-t4,u0} + SRV t5 materials + t6 instances + bindless
-    ID3D12StateObject rtGiPso;
-    ID3D12Resource rtGiSbt, rtGiCb, rtGiSunCb;
-    unsafe byte* rtGiCbMapped, rtGiSunCbMapped;
-    Dx12DescriptorHeap rtGiHeap;                // 6 descriptors (rebuilt per frame)
-    Dx12RtGeometry rtGeometry;                  // P1: per-instance index/normal/uv/tri-material SRVs (bindless)
-    Dx12Ddgi ddgi;                              // P2: DDGI world-probe radiance cache (BALLISTIC_DX12_DDGI=1)
-    bool ddgiLogged;
-    bool ddgiDebugDumped;                        // BALLISTIC_DX12_DDGI_DEBUG=1: one-shot atlas readback stats
-    // Volume drives it (PostFX.Ddgi, the GI volume's World Radiance Cache toggle); the BALLISTIC_DX12_DDGI
-    // env door still force-overrides for the A/B harness ("1" on, "0" off). Door read once; volume read live.
-    string ddgiEnvCached; bool ddgiEnvRead;
-    bool DdgiEnabled {
-        get {
-            if (!ddgiEnvRead) { ddgiEnvCached = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI"); ddgiEnvRead = true; }
-            return ddgiEnvCached is null ? PostFX.Ddgi : ddgiEnvCached == "1";
-        }
-    }
-
-    // Emissive-as-GI-source (GI track follow-up): emissive surfaces act as area lights in the indirect
-    // bounce. At each GI ray hit the shader adds the hit's self-emission L_e (emissiveMap*EmissiveFactor)
-    // on TOP of albedo*(sun+punctual+ambient) — the published DDGI/RTXGI/Lumen technique (no /PI, no albedo
-    // multiply: emission is already outgoing radiance). DEFAULT ON (it's a correctness fix — emissive lit
-    // the scene directly via the G-buffer but cast NO indirect light). The flag rides a spare CBV slot in
-    // each of the 4 GI hit shaders' b0 (no root-sig change), so BALLISTIC_DX12_GI_EMISSIVE=0 is a clean
-    // byte-identical-off A/B. NO double-count: the directly-visible emissive comes from the G-buffer Emissive
-    // MRT on the camera pixel; the GI term adds emission only at off-screen bounce hits on OTHER surfaces.
-    // Volume drives the default (PostFX.GiEmissive, from the GlobalIllumination volume's Emissive-as-GI
-    // toggle); the BALLISTIC_DX12_GI_EMISSIVE env door still force-overrides for the headless A/B harness
-    // (=0 off, anything else on). When the door is UNSET the volume value wins. The door string is read
-    // once (it can't change mid-process); the volume value is read live so editor edits take effect.
-    string giEmissiveEnvCached;
-    bool giEmissiveEnvRead;
-    bool GiEmissiveEnabled {
-        get {
-            if (!giEmissiveEnvRead) {
-                giEmissiveEnvCached = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_EMISSIVE");
-                giEmissiveEnvRead = true;
-            }
-            return giEmissiveEnvCached is null ? PostFX.GiEmissive : giEmissiveEnvCached != "0";
-        }
-    }
+    // RT reflections moved VERBATIM to Resources/Dx12ReflectionsPass.cs (chunk 10): the rtRefl rootsig/PSO/SBT/
+    // CBs + the RtReflTableBase bindless-tail constant + the RtReflConstants struct + EnsureRtReflections/
+    // DrawRtReflections, all alongside SSR as ONE RT-vs-SSR mode-branch pass. RT-GI + DDGI + the screen-probe
+    // final gather moved VERBATIM to Resources/Dx12GiPass.cs (chunk 10): the rtGi rootsig/PSO/SBT/CBs/heap + the
+    // RtGiConstants/RtGiSun structs + the RtGi/DDGI/ScreenProbe bindless-tail constants + EnsureRtGi/DrawRtGi/
+    // DrawScreenProbeGather, all alongside SSGI as ONE Off/SSGI/RT-GI mode-branch pass. The DdgiEnabled /
+    // GiEmissiveEnabled / ScreenProbeEnabled env-vs-volume gates moved into those passes too (read ctx.PostFX).
+    // The shared sceneAS/device5/rtGeometry/ddgi live in the Dx12DxrShared holder (`dxr`, threaded via ctx.Dxr).
 
     // P6.0 MOTION-stability harness (Phase 6): a DETERMINISTIC scripted camera orbit so the motion-dump
     // sequence has GENUINE camera movement — the only way reprojection + disocclusion (the real "boiling"
@@ -273,27 +170,9 @@ public sealed class DX12HDRenderer : HDRenderer {
         System.Globalization.CultureInfo.InvariantCulture, out float p) && p > 0f ? p : 6f;
     int giOrbitFrame;   // advances once per rendered frame while the orbit is active
 
-    // Phase 4: screen-space radiance probes (final gather). When DDGI is on, the screen-probe gather
-    // (Place→Trace→Blend→Integrate, bilateral-upsampled, miss → DDGI world cache) is the DEFAULT near/mid-field
-    // GI source — DDGI is the far-field cache. This is the published Lumen screen-trace → world-cache hierarchy.
-    // Phase 4 is hardened (bilateral + deterministic + budgeted + measured LESS noisy than the per-pixel DDGI
-    // gather), so it is now PRIMARY (2026-06-16 flip). THREE-STATE door: unset / "1" → screen probes (default);
-    // ONLY "0" → the per-pixel DDGI gather fallback. SCREENPROBE=0 reproduces the exact pre-flip DDGI-gather
-    // image (the byte-identical regression oracle). DDGI-on only — with DDGI off this path is untouched (the
-    // screen-probe trace needs the DDGI field for its far-field ray-miss handoff). P4.0: uniform rays + naive
-    // upsample; P4.1: bilateral integrate + E→L energy fix; P4.3: determinism + budget.
-    Dx12ScreenProbe screenProbe;
-    bool screenProbeLogged;
-    // Volume drives it (PostFX.ScreenProbes, the GI volume's Screen Probes toggle); the BALLISTIC_DX12_
-    // SCREENPROBE env door still force-overrides for the A/B harness ("0" off, anything else on). When the
-    // door is UNSET the volume value wins. Door read once; volume read live (editor edits take effect).
-    string screenProbeEnvCached; bool screenProbeEnvRead;
-    bool ScreenProbeEnabled {
-        get {
-            if (!screenProbeEnvRead) { screenProbeEnvCached = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SCREENPROBE"); screenProbeEnvRead = true; }
-            return screenProbeEnvCached is null ? PostFX.ScreenProbes : screenProbeEnvCached != "0";
-        }
-    }
+    // Phase 4 screen-space radiance probes moved into Resources/Dx12GiPass.cs (chunk 10) — the screenProbe
+    // instance + the ScreenProbeEnabled env-vs-volume gate live there (DrawScreenProbeGather is part of the
+    // RT-GI branch's Lumen screen-trace → world-cache hierarchy).
 
     // P7.2 NO-RT DDGI probe update (rasterized cube-relit far-field for GPUs without HW ray tracing).
     // P7.2a is MEASUREMENT-ONLY: BALLISTIC_DX12_NORT_PROBES=1 renders ONE probe (6 cube faces) at the camera +
@@ -305,15 +184,10 @@ public sealed class DX12HDRenderer : HDRenderer {
     bool NortProbesEnabled => nortProbesOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_NORT_PROBES") == "1";
     Dx12DescriptorHeap rasterProbeDbgHeap;   // 2 descriptors (cube SRV @0, ssgiTarget UAV @1), rebuilt per use
 
-    bool rtGiBuilt;
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct RtGiConstants { public Matrix4x4 InvViewProj; public Matrix4x4 ViewProj; public Vector4 Params; }  // preExp, rayLength, emissiveEnable, frameIdx
-    // P1 world-radiance hit shading: the sun + normal bias for the hit's direct-light term + shadow ray,
-    // plus the punctual-light count (the hit shader loops all gathered point/spot lights — scenes lit only
-    // by a point light, like the Bistro interior, get no bounce from sun/IBL alone).
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct RtGiSun { public Vector3 SunDir; public float NormalBias; public Vector3 SunColor; public float LightCount; }
-
+    // rtGiBuilt + the RtGiConstants/RtGiSun structs moved into Resources/Dx12GiPass.cs (chunk 10). SsgiPreExposure
+    // STAYS here: the still-inline NORT raster-probe DEBUG blit (DrawRasterProbeMeasure, off by default) pre-
+    // exposes the blitted albedo cube with it. Identical body to the GI pass's private copy (both read the
+    // BALLISTIC_DX12_EXPOSURE door).
     float SsgiPreExposure() => float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
         System.Globalization.CultureInfo.InvariantCulture, out float e) ? e : 1.0e-5f;
 
@@ -328,13 +202,7 @@ public sealed class DX12HDRenderer : HDRenderer {
     bool? deterministicOn;
     bool DeterministicCapture => deterministicOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DETERMINISTIC") == "1";
 
-    // GI-ISOLATE debug view (P0 measurement harness): when on, the SSGI/RT-GI combine outputs ONLY the
-    // indirect bounce it adds (not scene+bounce) so the indirect contribution is directly visible + diffable
-    // in enclosed interiors — the antidote the GI plan is built around (judge GI by the isolated bounce, never
-    // the composite mean). Env door BALLISTIC_DX12_GI_ISOLATE=1 (headless A/B); the editor can drive it later
-    // via PostFX. Falls back to the volume's SsgiDebugView so the existing inspector toggle works headless too.
-    bool GiIsolateOn() =>
-        Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_ISOLATE") == "1" || PostFX.SsgiDebugView;
+    // GiIsolateOn moved into Resources/Dx12GiPass.cs (chunk 10) — only the SSGI/RT-GI combine read it.
 
     // P6.0 motion harness: rotate the view by a cumulative scripted yaw around a pivot in front of the camera,
     // so the dumped sequence has GENUINE camera motion (reprojection + disocclusion = the real boiling test).
@@ -391,6 +259,15 @@ public sealed class DX12HDRenderer : HDRenderer {
     // (chunk 8 — Event=Sky 350; BuildSkybox/BuildProcSky/DrawSkybox/DrawProcSky + the SkyboxConstants/
     // ProcSkyConstants structs moved into it). The pass draws the sky into the HDR color at the far plane.
     Dx12SkyPass skyPass;
+
+    // chunk 10: GI (event 500 — the SINGLE Off/SSGI/RT-GI mode-branch pass; owns the SSGI rootsig/PSOs/targets +
+    // history + OIDN + the RT-GI/DDGI/screen-probe pipeline; reads the shared DXR substrate via ctx.Dxr) +
+    // Reflections (event 600 — the SINGLE RT-vs-SSR mode-branch pass; owns the SSR rootsig/PSOs/targets + the
+    // RT-reflection pipeline). The still-inline NORT raster-probe DEBUG blit reaches the GI pass's ssgiTarget via
+    // giPass.SsgiTarget; the composite reads the grain counter via giPass.SsgiFrame. Was the inline GI dispatch
+    // (DrawSsgi/DrawRtGi) + the inline reflections block (DrawSsr/DrawRtReflections).
+    Dx12GiPass giPass;
+    Dx12ReflectionsPass reflectionsPass;
 
     // Per-draw constant buffer ring: one upload heap sub-allocated in 256-byte slots, one slot per draw.
     ID3D12Resource cbRing;
@@ -533,11 +410,11 @@ public sealed class DX12HDRenderer : HDRenderer {
         ldr.ColorToShaderResource();
         gbuffer = new Dx12GBuffer(dev, internalW, internalH);
         motionPrevValid = false;                                // prev view*proj is stale after a realloc
-        // SSAO (Dx12SsaoPass) + bloom (Dx12CompositePass) + TAA (Dx12TaaPass) now reallocate via graph.Resize at
-        // the tail of this method — see the graph?.Resize call below. Their original AllocXxx slots (bloom 1st,
-        // ssao 2nd, taa 5th) are byte-neutral because each allocator reads only the passed size (R5).
-        if (ssrRootSig != null) AllocSsrTarget();
-        if (ssgiRootSig != null) AllocSsgiTargets();
+        // SSAO (Dx12SsaoPass) + bloom (Dx12CompositePass) + TAA (Dx12TaaPass) + SSR (Dx12ReflectionsPass, was
+        // AllocSsrTarget, slot 3) + SSGI (Dx12GiPass, was AllocSsgiTargets, slot 4) now reallocate via
+        // graph.Resize at the tail of this method — see the graph?.Resize call below. Their original AllocXxx
+        // slots (bloom 1st, ssao 2nd, ssr 3rd, ssgi 4th, taa 5th) are byte-neutral because each allocator reads
+        // only the passed size (R5).
         if (rtShadowMask != null) AllocRtShadowMask();
         AllocFsrOutput();
         // Fan the resize out to any pass that owns resolution-dependent targets. No-op while the graph is
@@ -645,8 +522,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         // Transparents now built inside Dx12TransparentsPass's ctor (chunk 8), constructed below at pass-graph
         // assembly. Was BuildTransparentPass(). Fog + AerialPerspective likewise inside their pass ctors
         // (Dx12FogPass / Dx12AerialPerspectivePass, chunk 5). Was BuildFog() + BuildAerialPerspective().
-        BuildSsr();
-        BuildSsgi();
+        // SSR now built inside Dx12ReflectionsPass's ctor + SSGI inside Dx12GiPass's ctor (chunk 10), both
+        // constructed below at pass-graph assembly. Was BuildSsr() + BuildSsgi().
         // TAA now built inside Dx12TaaPass's ctor (chunk 7); composite (+ its private bloom + auto-exposure
         // sub-steps) inside Dx12CompositePass's ctor — both constructed below at pass-graph assembly. Was
         // BuildTaa() + BuildComposite().
@@ -669,11 +546,15 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         AllocFsrOutput();   // output-res UAV target for FSR (allocated even when off — cheap, simplifies resize)
 
+        // chunk 10: the shared DXR substrate holder (sceneAS/device5/dxr-availability/rtGeometry/ddgi), lazily
+        // filled on first RT use. RT sun shadows (inline core) + the GI pass + the Reflections pass all reference
+        // it (the passes via ctx.Dxr). Created BEFORE the graph so EnsureRtShadows (inline) + the passes share it.
+        dxr = new Dx12DxrShared(dev);
+
         // Phase-1 pass-graph: build the executor and register the converted passes. Wired with the renderer's
         // TimePass so converted passes get GPU timings. Register in the original AllocateResolutionTargets
         // AllocXxx order so graph.Resize fans out in that sequence (R5): bloom→ssao→ssr→ssgi→taa→rtShadowMask→
-        // fsr; bloom/ssr/ssgi/taa/rtShadowMask/fsr are still inline (alloc before graph.Resize), so SSAO — the
-        // first converted pass — registers first. Build() once for the stable order (R1).
+        // fsr (ssr=Reflections pass, ssgi=GI pass as of chunk 10). Build() once for the stable order (R1).
         graph = new Dx12RenderGraph(TimePass);
         // chunk 9: Deferred lighting (event 300 — the OpaqueLighting slot, EARLIEST of all converted passes:
         // 300 < Sky 350 < AP 400 < Transparents 450 < Fog 550 < PostProcess 650 < Composite 700). Owns no
@@ -703,6 +584,18 @@ public sealed class DX12HDRenderer : HDRenderer {
         // BuildTransparentPass + the inline DrawTransparents call.
         transparentsPass = new Dx12TransparentsPass(dev);
         graph.Add(transparentsPass);
+        // chunk 10: GI (event 500 — GlobalIllumination, the SINGLE Off/SSGI/RT-GI mode-branch pass) + Reflections
+        // (event 600 — the SINGLE RT-vs-SSR mode-branch pass). The event sort places GI at 500 (after Transparents
+        // 450, before Fog 550) and Reflections at 600 (after Fog 550, before PostProcess 650) — the exact inline
+        // sequence. Both own resolution targets (GI: ssgi*; Reflections: ssr*); their Resize fans out in this
+        // registration order. The original AllocXxx order was ssr(3) before ssgi(4), but each allocator reads only
+        // the passed size (no cross-pass dependency) so registration order is byte-neutral (R5). Was BuildSsgi +
+        // the inline GI dispatch / BuildSsr + the inline reflections block. The shared sceneAS/device5/rtGeometry/
+        // ddgi come through ctx.Dxr (the dxr holder, created above).
+        giPass = new Dx12GiPass(dev, targetW, targetH);
+        graph.Add(giPass);
+        reflectionsPass = new Dx12ReflectionsPass(dev, targetW, targetH);
+        graph.Add(reflectionsPass);
         // chunk 7: TAA (event 650, registered AFTER SSAO so SSAO runs first within PostProcess — same-event ties
         // break on registration order, R1). Owns the ping-pong history; its Resize fans out after SSAO's (taa was
         // 5th in the old AllocXxx order — byte-neutral, the allocator reads only the size, R5). Was BuildTaa.
@@ -762,113 +655,10 @@ public sealed class DX12HDRenderer : HDRenderer {
         return r;
     }
 
-    unsafe void BuildSsr() {
-        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 5, baseShaderRegister: 0);
-        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
-        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
-            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
-            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
-            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
-        };
-        ssrRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
-
-        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("Ssr.hlsl");
-        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "Ssr.hlsl");
-        ID3D12PipelineState MakePso(string entry, Format rtFmt) => dev.Device.CreateGraphicsPipelineState(
-            new GraphicsPipelineStateDescription {
-                RootSignature = ssrRootSig, VertexShader = vs,
-                PixelShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, entry, "Ssr.hlsl"),
-                InputLayout = null, PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
-                RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
-                DepthStencilState = DepthStencilDescription.None,
-                RenderTargetFormats = new[] { rtFmt }, DepthStencilFormat = Format.Unknown,
-                SampleDescription = new SampleDescription(1, 0),
-            });
-        ssrMarchPso = MakePso("PSMarch", Dx12OffscreenTarget.HdrFormat);
-        ssrCombinePso = MakePso("PSCombine", Dx12OffscreenTarget.HdrFormat);
-
-        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<SsrConstants>() + 255) & ~255;
-        ssrCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        ssrCbMapped = ssrCb.Map<byte>(0);
-        ssrSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 10, shaderVisible: true, framesInFlight: dev.FramesInFlight);
-        AllocSsrTarget();
-    }
-
-    void AllocSsrTarget() {
-        ssrTarget?.Dispose(); ssrScene?.Dispose();
-        int w = System.Math.Max(1, targetW / 2), h = System.Math.Max(1, targetH / 2);
-        // allowUav so RT reflections can write it via a UAV (SSR still writes it via the RTV).
-        ssrTarget = new Dx12OffscreenTarget(dev, w, h, withDepth: false,
-            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
-        // Full-res scratch for the combine output (combine reads `target`, can't read+write it).
-        ssrScene = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false,
-            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
-    }
-
-    // SSGI PSOs: a half-res gather (PSGather, SSILVB horizon-bitmask) + a full-res combine (PSCombine,
-    // adds the bounce into the lit scene). One root sig: SsgiConstants CBV(b0) + a 3-SRV table + clamp.
-    unsafe void BuildSsgi() {
-        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 3, baseShaderRegister: 0);
-        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
-        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
-            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
-            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
-            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
-        };
-        ssgiRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
-
-        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("Ssgi.hlsl");
-        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "Ssgi.hlsl");
-        ID3D12PipelineState MakePso(string entry) => dev.Device.CreateGraphicsPipelineState(
-            new GraphicsPipelineStateDescription {
-                RootSignature = ssgiRootSig, VertexShader = vs,
-                PixelShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, entry, "Ssgi.hlsl"),
-                InputLayout = null, PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
-                RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
-                DepthStencilState = DepthStencilDescription.None,
-                RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat }, DepthStencilFormat = Format.Unknown,
-                SampleDescription = new SampleDescription(1, 0),
-            });
-        ssgiGatherPso = MakePso("PSGather");
-        ssgiTemporalPso = MakePso("PSTemporal");
-        ssgiCombinePso = MakePso("PSCombine");
-
-        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<SsgiConstants>() + 255) & ~255;
-        ssgiCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        ssgiCbMapped = ssgiCb.Map<byte>(0);
-        // 3 SRVs each for gather + temporal + combine = 9 contiguous slots per frame.
-        ssgiSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 9, shaderVisible: true, framesInFlight: dev.FramesInFlight);
-        AllocSsgiTargets();
-    }
-
-    void AllocSsgiTargets() {
-        ssgiTarget?.Dispose(); ssgiScene?.Dispose(); ssgiHistoryA?.Dispose(); ssgiHistoryB?.Dispose();
-        ssgiDenoised?.Dispose();
-        // The zero-copy OIDN GPU path's shared buffer + dst-UAV are sized to the half-res GI; its Ensure(w,h)
-        // detects the size change and rebuilds them on the next OIDN use (ssgiSharedFailed stays latched).
-        int w = System.Math.Max(1, targetW / 2), h = System.Math.Max(1, targetH / 2);
-        // allowUav so the RT-GI gather can write it via a UAV (the SSGI gather still uses the RTV).
-        ssgiTarget = new Dx12OffscreenTarget(dev, w, h, withDepth: false,
-            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
-        ssgiHistoryA = new Dx12OffscreenTarget(dev, w, h, withDepth: false,
-            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
-        ssgiHistoryB = new Dx12OffscreenTarget(dev, w, h, withDepth: false,
-            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
-        ssgiDenoised = new Dx12OffscreenTarget(dev, w, h, withDepth: false,
-            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);  // OIDN GPU unpack writes it
-        ssgiScene = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false,
-            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
-        ssgiHistValid = false;       // accumulated history is stale after a (re)allocation
-        ssgiCpuColor = ssgiCpuOut = null;   // host buffers re-size to the new half-res
-    }
+    // BuildSsr / AllocSsrTarget moved VERBATIM into Resources/Dx12ReflectionsPass.cs (chunk 10 — ctor + Resize).
+    // BuildSsgi / AllocSsgiTargets moved VERBATIM into Resources/Dx12GiPass.cs (chunk 10 — ctor + Resize). Both
+    // passes own their PSOs/CB/heap + targets; graph.Resize fans their Resize out (R5). The SSGI/SSR targets are
+    // no longer reallocated inline in AllocateResolutionTargets (the graph handles it).
 
     // Geometry pass PSO: same vertex layout + per-draw CBV(b0) + 6 material SRVs(t0..t5) as the forward
     // opaque path, but the pixel shader (GBuffer.hlsl) writes the 5-MRT fat G-buffer (+ motion) instead of
@@ -1584,6 +1374,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             Ibl = ibl, SkyLuts = skyLuts, ClusteredLights = clusteredLights,
             ShadowMap = shadowMap, GpuDriven = gpuDriven,
             RtShadowMask = rtShadowMask,   // chunk 9: deferred binds it to t12 when RtShadowsThisFrame (null → fallback)
+            Dxr = dxr,   // chunk 10: shared DXR substrate (sceneAS/device5/rtGeometry/ddgi) for the GI + Reflections passes
             FrameCbAddress = frameCb.GPUVirtualAddress,   // chunk 8: Transparents binds it; chunk 9: Deferred binds it too (b1 FrameConstants CBV)
             Doors = doors, PostFX = PostFX, Stats = RenderStats.Scene,
             // chunk 7 (composite): deterministic flag (grain/exposure reset) + the SSAO pass output the composite
@@ -1601,75 +1392,38 @@ public sealed class DX12HDRenderer : HDRenderer {
             GiMode = giMode,
         };
 
-        // === DEFERRED LIGHTING (Dx12DeferredLightingPass, event 300 — OpaqueLighting). chunk 9 NEW window
-        // [OpaqueLighting, Sky): the deferred pass shades the G-buffer (sun + IBL + cascade/RT shadows +
-        // clustered punctual) into the HDR color, exactly where the inline DrawDeferredLighting ran (after RT
-        // shadows, before Sky). The pass emits its OWN head gbuffer.ToShaderResource() (R2 — it's the consumer
-        // of the G-buffer-as-SRV; the inline head transition that used to sit here moved into the pass). The
-        // window stops short of Sky (350) so the still-separate Sky window runs next at its canonical slot. ===
-        graph.Execute(ctx, (int)Dx12RenderPassEvent.OpaqueLighting, (int)Dx12RenderPassEvent.Sky);
-
-        // === SKY (Dx12SkyPass, event 350) → AERIAL PERSPECTIVE (Dx12AerialPerspectivePass, event 400). The
-        // window WIDENED leftward this chunk to include Sky (was [AerialPerspective, Transparents); now [Sky,
-        // Transparents)) — Sky converted to a pass, so the inline sky block is gone. The graph runs Sky (head
-        // DepthToReadOnly + draws the procedural/skybox background into the HDR color at the far plane, gated by
-        // doors.Sky), then AP, then Transparents — all in event order, the exact relative position of the old
-        // inline frame. The window WIDENED rightward this chunk to include Transparents (450): was [Sky,
-        // Transparents); now [Sky, GlobalIllumination) — Transparents converted to a pass, so its inline call is
-        // gone. The window stops short of GlobalIllumination (500) because the GI/SSGI dispatch below is still
-        // inline at its canonical spot. Transparents emits its OWN head DepthToReadOnly (R2): when Sky is gated
-        // off, transparents still re-asserts DepthRead before drawing. ===
-        graph.Execute(ctx, (int)Dx12RenderPassEvent.Sky, (int)Dx12RenderPassEvent.GlobalIllumination);
-
-        // --- SSGI (volume-driven screen-space GI): local one-bounce light added to the lit scene, BEFORE
-        // fog/SSR so they apply over the GI-enriched colour (matches the GL order). Gather (SSILVB) +
-        // motion-buffer temporal accumulation + OIDN denoise. Driven by the ScreenSpaceGlobalIllumination
-        // VOLUME (PostFX.SsgiEnabled); BALLISTIC_DX12_SSGI=1/0 force-overrides for A/B + perf. NOTE: the OIDN
-        // denoise round-trip is currently a CPU readback (slow); the zero-copy D3D12<->HIP path is the perf
-        // follow-up (BALLISTIC_DX12_SSGI_OIDN=0 = fast temporal-only meanwhile). ---
-        // The giMode resolve moved up (before the ctx build); the DISPATCH stays here at its canonical spot.
-        if (giMode == GiMode.RayTraced) { if (EnsureRtGi()) TimePass("GI:RT", () => DrawRtGi(view, viewProj, proj, lightDir, lightColor, camPos)); else TimePass("GI:SSGI", () => DrawSsgi(view, proj)); }
-        else if (giMode == GiMode.ScreenSpace) TimePass("GI:SSGI", () => DrawSsgi(view, proj));
+        // === PHASE-1 PASS-GRAPH — the MAIN window (chunk 10 COLLAPSE). Every pre-composite pass is now an
+        // IRenderPass, so the five chunk-5..9 event windows merge into ONE Execute over [OpaqueLighting, Fog):
+        // Deferred (300) → Sky (350) → AP (400) → Transparents (450) → GI (500), in event order — the exact
+        // inline sequence. Each pass emits its OWN head transition (R2); the giMode resolve / no-RT downgrade /
+        // WarnNoRtOnce stayed in the orchestrator above (they set ctx.GiMode, which Dx12GiPass.Enabled reads).
+        // The GI pass internally does the Off/SSGI/RT-GI mode branch + the EnsureRtGi-fail → DrawSsgi fallback +
+        // the shared SsgiResolveAndCombine tail (folding in the chunk-6 deferred SSGI move). The window stops
+        // short of Fog (550) so the still-inline NORT raster-probe diagnostic runs at its canonical slot
+        // (after GI, before Fog) exactly as the old inline DrawRasterProbeMeasure call did. ===
+        graph.Execute(ctx, (int)Dx12RenderPassEvent.OpaqueLighting, (int)Dx12RenderPassEvent.Fog);
 
         // P7.2a NO-RT RASTER PROBE measurement (BALLISTIC_DX12_NORT_PROBES=1): render ONE probe (6 cube faces) at
-        // the camera + time it — the go/no-go gate before any grid wiring. Independent of giMode/RT (pure raster).
-        // _DEBUG=1 blits the albedo cube into ssgiTarget (so the GI-isolate capture shows it). Standalone; no grid.
+        // the camera + time it — the go/no-go gate before any grid wiring. Independent of giMode/RT (pure raster);
+        // off by default (never in the verification matrix). _DEBUG=1 blits the albedo cube into the GI pass's
+        // ssgiTarget (giPass.SsgiTarget) so the GI-isolate capture shows it. Standalone; no grid. Stays inline
+        // (it reaches deep into the orchestrator's geometry helpers — not a leaf-post pass).
         if (NortProbesEnabled) DrawRasterProbeMeasure(camPos);
 
-        // --- Volumetric fog (Dx12FogPass, event 550). Runs at its canonical inline slot: after GI/SSGI,
-        // before the Reflections/SSR block — the event window [Fog, Reflections) (chunk 5). Running it AFTER
-        // SSR instead would change the fog-active image (fog blends over SSR-modified pixels in the wrong
-        // order — measured: 1884px diff vs the inline order), so it must run HERE, not at the SSAO slot. The
-        // (!doors.Minimal && PostFX.VolumetricEnabled) || doors.Fog gate moved verbatim to Dx12FogPass.Enabled. ---
-        graph.Execute(ctx, (int)Dx12RenderPassEvent.Fog, (int)Dx12RenderPassEvent.Reflections);
+        // === PHASE-1 PASS-GRAPH — Fog → Composite window. Runs Fog (550) → Reflections (600) → SSAO/TAA/FSR
+        // (PostProcess 650) in event order. The Reflections pass internally does the RT-vs-SSR branch + the
+        // EnsureRtReflections-fail / !sceneAS.Valid → DrawSsr fallback (chunk 10 — it extracts the SSR resources
+        // chunk 5 deferred here). Fog runs at its canonical slot (after GI/SSGI, before Reflections/SSR — running
+        // it after SSR would change the fog-active image, measured 1884px in chunk 5). The window stops short of
+        // Composite (700) so the Composite pass reads the resolved ctx.SceneColor after the TAA/FSR resolve. ===
+        graph.Execute(ctx, (int)Dx12RenderPassEvent.Fog, (int)Dx12RenderPassEvent.Composite);
 
-        // --- Reflections (volume-driven, SSR vs RT). RT reflections trace the scene BVH (off-screen + sky
-        // correct), reusing the SSR reflection target + combine; SSR is the screen-space fallback. ---
-        // doors.Minimal forces SSR off (re-enabled at the SSR stage via the Ssr volume / a forced PostFX).
-        if (!doors.Minimal && PostFX.SsrEnabled && PostFX.SsrIntensity > 0f) {
-            string rtrEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RT_REFLECTIONS");
-            bool rtReflWanted = rtrEnv == "1" || (rtrEnv != "0" && PostFX.ReflectionMode == ReflectionMode.RayTraced);
-            if (rtReflWanted && EnsureRtReflections())
-                TimePass("Reflections:RT", () => DrawRtReflections(view, viewProj, proj, camPos, lightDir, lightColor));
-            else
-                DrawSsr(view, proj);
-        }
-
-        // === PHASE-1 PASS-GRAPH — PostProcess window (chunks 4+7: SSAO → TAA → FSR). Runs at its canonical slot:
-        // after the Reflections/SSR block, before composite. Within the window the event-650 passes run in
-        // registration order: SSAO (writes its half-res AO the composite samples via ctx.SsaoResult), then TaaPass
-        // (native path only — Enabled=!FsrActive; resolves AA into `target`), then FsrPass (FsrActive only —
-        // mutually exclusive with TAA; reconstructs fsrOutput + sets ctx.SceneColor=fsrOutput). Exactly one of
-        // TAA/FSR runs, same effective order as today's inline SSAO→(TAA|FSR). The earlier windows already ran AP
-        // (after sky) + Fog (after GI). The ctx was built once above (after the giMode resolve, before Sky). ===
-        graph.Execute(ctx, (int)Dx12RenderPassEvent.PostProcess, (int)Dx12RenderPassEvent.Composite);
-
-        // === PHASE-1 PASS-GRAPH — Composite window (chunk 7). DrawComposite became Dx12CompositePass.Record at the
+        // === PHASE-1 PASS-GRAPH — Composite window (chunk 7). DrawComposite is Dx12CompositePass.Record at the
         // Composite event (700); it runs AFTER the SSAO/TAA/FSR window so it reads the resolved ctx.SceneColor
         // (fsrOutput when upscaling — set by FsrPass; target natively — written by TaaPass). GrainFrame is
-        // refreshed here from the LIVE ssgiFrame (SSGI incremented it after ctx was built) — the composite reads
-        // it for the non-deterministic film-grain phase only. ===
-        ctx.GrainFrame = ssgiFrame;
+        // refreshed here from the LIVE GI-pass grain counter (the GI pass incremented ssgiFrame after ctx was
+        // built) — the composite reads it for the non-deterministic film-grain phase only. ===
+        ctx.GrainFrame = giPass.SsgiFrame;
         graph.Execute(ctx, (int)Dx12RenderPassEvent.Composite, int.MaxValue);
 
         // Editor display path: leave the LDR composite in PixelShaderResource so the editor's ImGui pass can
@@ -1754,255 +1508,23 @@ public sealed class DX12HDRenderer : HDRenderer {
     // vs-output resolution lifecycle — EnsureUpscaleTargets / native reset — is whole-frame management), passed
     // through ctx.Fsr / ctx.FsrOutput. The pass sets ctx.SceneColor = fsrOutput.
 
-    // Screen-space reflections (volume-driven): half-res view-space march reads the lit HDR color +
-    // G-buffer (depth/normal/material) → ssrTarget; combine depth-aware-upsamples + lerps into the scene
-    // color (via the ssrScene scratch, copied back to `target`). Runs after sky/fog so the color is complete.
-    unsafe void DrawSsr(Matrix4x4 view, Matrix4x4 proj) {
-        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        Matrix4x4.Invert(proj, out Matrix4x4 invProj);
-        *(SsrConstants*)ssrCbMapped = new SsrConstants {
-            Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProj),
-            ViewMatrix = Matrix4x4.Transpose(view),
-            Intensity = PostFX.SsrIntensity,
-            TexelSize = new Vector2(1f / ssrTarget.Width, 1f / ssrTarget.Height),
-        };
+    // DrawSsr moved VERBATIM into Resources/Dx12ReflectionsPass.cs (chunk 10). DrawSsgi / FillSsgiConstants /
+    // SsgiResolveAndCombine / EnsureRtGi / DrawRtGi / DrawScreenProbeGather moved VERBATIM into
+    // Resources/Dx12GiPass.cs (chunk 10). EnsureRtReflections / DrawRtReflections moved VERBATIM into
+    // Resources/Dx12ReflectionsPass.cs. The GI pass (Event=GlobalIllumination 500) does the Off/SSGI/RT-GI
+    // mode branch + the EnsureRtGi-fail -> DrawSsgi fallback + the shared SsgiResolveAndCombine tail, all
+    // internal; the Reflections pass (Event=Reflections 600) does the RT-vs-SSR branch + the EnsureRtReflections
+    // -> DrawSsr fallback. The shared sceneAS/device5/rtGeometry/ddgi come through ctx.Dxr (Dx12DxrShared).
 
-        // Both passes need the HDR color + G-buffer as SRVs. The G-buffer is already SRV; bring color to SRV.
-        target.ColorToShaderResource();
-        gbuffer.DepthToShaderResource();
-
-        // March (half-res) → ssrTarget. SRV slots: color t0, depth t1, normal t2, material t3, (ssr t4 unused).
-        ssrSrvVisible.Reset();
-        int mb = ssrSrvVisible.AllocateRange(5);
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(mb + 0), target.ColorSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(mb + 1), gbuffer.DepthSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(mb + 2), gbuffer.ColorSrvCpu(1), heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(mb + 3), gbuffer.ColorSrvCpu(2), heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(mb + 4), ssrTarget.ColorSrvCpu, heapType);
-        ssrTarget.RenderColorOnly(cl => {
-            cl.SetGraphicsRootSignature(ssrRootSig); cl.SetPipelineState(ssrMarchPso);
-            cl.SetDescriptorHeaps(ssrSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress);
-            cl.SetGraphicsRootDescriptorTable(1, ssrSrvVisible.Gpu(mb));
-            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            cl.DrawInstanced(3, 1, 0, 0);
-        });
-
-        // Combine (full-res) → ssrScene, reading scene color (t0), depth (t1), ssrTarget (t4).
-        ssrTarget.ColorToShaderResource();
-        int cb = ssrSrvVisible.AllocateRange(5);
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 0), target.ColorSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 1), gbuffer.DepthSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 2), gbuffer.ColorSrvCpu(1), heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 3), gbuffer.ColorSrvCpu(2), heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 4), ssrTarget.ColorSrvCpu, heapType);
-        ssrScene.RenderColorOnly(cl => {
-            cl.SetGraphicsRootSignature(ssrRootSig); cl.SetPipelineState(ssrCombinePso);
-            cl.SetDescriptorHeaps(ssrSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress);
-            cl.SetGraphicsRootDescriptorTable(1, ssrSrvVisible.Gpu(cb));
-            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            cl.DrawInstanced(3, 1, 0, 0);
-        });
-        ssrScene.ColorToShaderResource();
-        target.CopyColorFrom(ssrScene);   // the reflected scene becomes the new scene color
-    }
-
-    // Screen-space GI (SSILVB horizon-bitmask gather): half-res gather reads the lit HDR color + G-buffer
-    // depth/normal → ssgiTarget (raw one-bounce); combine adds it into the scene (via ssgiScene scratch,
-    // copied back to `target`). Step B is gather+combine (noisy); temporal accumulation (motion buffer) +
-    // OIDN denoise wrap it in step C. Profile dials are PostFX.Ssgi* (volume-driven).
-    unsafe void DrawSsgi(Matrix4x4 view, Matrix4x4 proj) {
-        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        FillSsgiConstants(view, proj);
-
-        target.ColorToShaderResource();
-        gbuffer.DepthToShaderResource();
-        // motion RT (gbuffer RT4) is already PixelShaderResource (ToShaderResource transitioned all colors).
-
-        // Gather (half-res) → ssgiTarget. SRVs: color t0, depth t1, normal t2.
-        ssgiSrvVisible.Reset();
-        int gb = ssgiSrvVisible.AllocateRange(3);
-        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(gb + 0), target.ColorSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(gb + 1), gbuffer.DepthSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(gb + 2), gbuffer.ColorSrvCpu(1), heapType);
-        ssgiTarget.RenderColorOnly(cl => {
-            cl.SetGraphicsRootSignature(ssgiRootSig); cl.SetPipelineState(ssgiGatherPso);
-            cl.SetDescriptorHeaps(ssgiSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, ssgiCb.GPUVirtualAddress);
-            cl.SetGraphicsRootDescriptorTable(1, ssgiSrvVisible.Gpu(gb));
-            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            cl.DrawInstanced(3, 1, 0, 0);
-        });
-
-        SsgiResolveAndCombine(resetRing: false);   // gather already Reset()+used slots 0-2; resolve continues 3-8
-    }
-
-    // Fill the shared SsgiConstants CBV (dials + matrices + pre-exposure + history flag). Used by the SSGI
-    // gather AND the RT-GI gather (temporal/combine read it). Returns this frame's rotation index.
-    unsafe int FillSsgiConstants(Matrix4x4 view, Matrix4x4 proj) {
-        Matrix4x4.Invert(proj, out Matrix4x4 invProj);
-        var pf = PostFX;
-        int fi = ssgiFrame++ & 1023;
-        float preExp = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
-            System.Globalization.CultureInfo.InvariantCulture, out float e) ? e : 1.0e-5f;
-        float invPreExp = preExp > 0f ? 1f / preExp : 0f;
-        *(SsgiConstants*)ssgiCbMapped = new SsgiConstants {
-            Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProj),
-            ViewMatrix = Matrix4x4.Transpose(view),
-            Params0 = new Vector4(pf.SsgiRayLength, pf.SsgiFalloff, pf.SsgiThickness, 0f),
-            Params1 = new Vector4(MathF.Max(pf.SsgiBounceBoost, 0f), Math.Clamp(pf.SsgiRayCount, 1, 8), fi, 0f),
-            Params2 = new Vector4(1f / ssgiTarget.Width, 1f / ssgiTarget.Height, preExp, invPreExp),
-            Combine0 = new Vector4(pf.SsgiIntensity, Math.Clamp(pf.SsgiLook, 0f, 1f),
-                                   MathF.Max(pf.SsgiSaturation, 0f), MathF.Max(pf.SsgiOcclusionPower, 0f)),
-            Tint = new Vector4(pf.SsgiTint.X, pf.SsgiTint.Y, pf.SsgiTint.Z, 0f),
-            // HasHistory=0 in deterministic capture → PSTemporal returns the current GI directly (the SSGI/DDGI
-            // temporal EMA is frame-count-dependent → would defeat byte-diffable captures). For DDGI the gather
-            // is already noise-free so skipping temporal costs nothing; for SSGI the OIDN spatial denoise still runs.
-            Params3 = new Vector4((ssgiHistValid && !DeterministicCapture) ? 1f : 0f, MathF.Max(pf.SsgiMaxHistory, 1f), GiIsolateOn() ? 1f : 0f, 0f),
-        };
-        return fi;
-    }
-
-    // Shared GI resolve tail: motion-buffer temporal accumulation + OIDN denoise + composite into the scene.
-    // ssgiTarget holds the raw (noisy) one-bounce GI (from either the SSILVB gather or the RT gather); the
-    // SsgiConstants CBV must already be filled. Used by both DrawSsgi and DrawRtGi.
-    // P0a: `resetRing` — reset the ssgiSrvVisible ring at the START of the resolve. DrawSsgi passes FALSE (its
-    // gather already Reset()+used slots 0-2; the resolve continues at 3-8 — the heap is sized 9 = one frame).
-    // DrawRtGi passes TRUE (it didn't touch the ring before the resolve, so the resolve owns it from slot 0).
-    // The hazard this fixes: under the pipelined single-list submit, recorded-but-not-yet-executed draws still
-    // reference their descriptor slots — a mid-resolve Reset() (the old code) let the temporal pass overwrite
-    // the gather's slots → the gather sampled the wrong SRVs. Now slots never alias within a frame.
-    unsafe void SsgiResolveAndCombine(bool resetRing = true) {
-        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        Dx12OffscreenTarget histRead = ssgiHistWriteB ? ssgiHistoryA : ssgiHistoryB;
-        Dx12OffscreenTarget histWrite = ssgiHistWriteB ? ssgiHistoryB : ssgiHistoryA;
-
-        // Temporal (half-res) → histWrite. SRVs: currentGI t0, historyGI t1, motion t2 (gbuffer RT4).
-        if (resetRing) ssgiSrvVisible.Reset();
-        ssgiTarget.ColorToShaderResource();
-        histRead.ColorToShaderResource();
-        int tb = ssgiSrvVisible.AllocateRange(3);
-        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(tb + 0), ssgiTarget.ColorSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(tb + 1), histRead.ColorSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(tb + 2), gbuffer.ColorSrvCpu(Dx12GBuffer.MotionRtIndex), heapType);
-        histWrite.RenderColorOnly(cl => {
-            cl.SetGraphicsRootSignature(ssgiRootSig); cl.SetPipelineState(ssgiTemporalPso);
-            cl.SetDescriptorHeaps(ssgiSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, ssgiCb.GPUVirtualAddress);
-            cl.SetGraphicsRootDescriptorTable(1, ssgiSrvVisible.Gpu(tb));
-            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            cl.DrawInstanced(3, 1, 0, 0);
-        });
-
-        // OIDN spatial denoise (replaces the GL a-trous). Preferred: the ZERO-COPY GPU path — OIDN's HIP
-        // device shares a D3D12 buffer, so we copy the GI texture into it on the GPU, denoise in place on the
-        // GPU, and copy back, with NO CPU readback (the readback/upload + Map was the cost). Fallback: the CPU
-        // readback round-trip (host floats -> OIDN -> upload). BALLISTIC_DX12_SSGI_OIDN=0 skips denoise (A/B);
-        // degrades gracefully if the OIDN DLLs aren't present.
-        Dx12OffscreenTarget giForCombine = histWrite;
-        bool oidnOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SSGI_OIDN") != "0";
-        if (oidnOn) {
-            if (!ssgiOidnEnvRead) {
-                ssgiOidnEnvRead = true;
-                ssgiOidnForceReadback = Environment.GetEnvironmentVariable("BALLISTIC_DX12_OIDN_READBACK") == "1";
-                ssgiOidnTiming = Environment.GetEnvironmentVariable("BALLISTIC_DX12_OIDN_TIMING") == "1";
-                // P6.1 GUIDED denoise: feed OIDN the G-buffer albedo+normal as AOV guides (edge-preserving). Door
-                // defaults OFF for this first cut (byte-identical-off = the proven baseline); flips to default-on
-                // after the A/B verifies it's strictly better. =1 → guided; unset/=0 → unguided (the old path).
-                ssgiOidnGuide = Environment.GetEnvironmentVariable("BALLISTIC_DX12_OIDN_GUIDE") == "1";
-            }
-            if (!ssgiOidnTried) { ssgiOidnTried = true; ssgiOidn = new Dx12OidnDenoiser(dev.AdapterLuidBytes); }
-            if (ssgiOidn != null && ssgiOidn.Valid) {
-                int w = ssgiTarget.Width, h = ssgiTarget.Height;
-                bool usedZeroCopy = false;
-                if (ssgiOidnTiming) ssgiOidnSw.Restart();
-                // Zero-copy GPU denoise (no CPU round-trip): pack the GI texture into a shared FLOAT buffer on
-                // the GPU, OIDN denoises it in place on the GPU, unpack back — float precision, ~12x faster.
-                if (ssgiOidn.SharedCapable && !ssgiSharedFailed && !ssgiOidnForceReadback) {
-                    if (ssgiOidnGpu == null) ssgiOidnGpu = new Dx12OidnGpuPath(dev);
-                    if (ssgiOidnGpu.Ensure(ssgiOidn, ssgiDenoised.RenderTarget, w, h)) {
-                        // P6.1: build + import the albedo/normal AOV guides ONCE (per size), then pack them from
-                        // the G-buffer each frame so OIDN denoises EDGE-AWARE. If aux setup fails, fall through to
-                        // the unguided filter (still valid). Gated on the door; off → byte-identical to pre-P6.1.
-                        if (ssgiOidnGuide && !ssgiAuxFailed) {
-                            // The G-buffer color RTs sit in the combined Pixel|NonPixel shader-read state from
-                            // the deferred pass (same state the DDGI/screen-probe gather reads them in), so the
-                            // PackAux compute SRV reads of RT0 albedo / RT1 normal are already valid — no barrier.
-                            if (ssgiOidnGpu.EnsureAux() && ssgiOidn.ImportAuxBuffers(ssgiOidnGpu.AlbedoHandle, ssgiOidnGpu.NormalHandle, ssgiOidnGpu.AuxByteSize)) {
-                                ssgiOidnGpu.PackAux(gbuffer.ColorSrvCpu(0), gbuffer.ColorSrvCpu(1), target.Width, target.Height);
-                            } else { ssgiOidnGpu.ReleaseAux(); ssgiAuxFailed = true; }   // import failed → free unused aux buffers + go unguided
-                        }
-                        histWrite.ColorToNonPixelShaderResource();   // GI texture as a compute SRV
-                        ssgiDenoised.ColorToUnorderedAccess();        // denoise target as a compute UAV
-                        ssgiOidnGpu.Pack(histWrite.ColorSrvCpu);      // GPU: texture -> shared float buf
-                        if (ssgiOidn.ExecuteShared()) {               // GPU: OIDN denoise in place
-                            ssgiOidnGpu.Unpack();                     // GPU: shared float buf -> texture
-                            ssgiDenoised.ColorToShaderResource();     // for the combine
-                            giForCombine = ssgiDenoised; usedZeroCopy = true;
-                        } else { ssgiSharedFailed = true; }           // HIP execute failed → readback from now on
-                    } else { ssgiSharedFailed = true; }               // import failed → readback from now on
-                }
-                // CPU readback fallback (shared path unavailable/failed/forced off this frame). NOTE: P6.1's
-                // guided AOVs ride the ZERO-COPY path (the one that runs on RT/HIP cards); the readback path is
-                // the rare non-HIP fallback and stays UNGUIDED (null albedo/normal) — guiding it would mean
-                // reading back + downsampling 2 full-res G-buffer textures on the CPU each frame, a large cost
-                // for a path that's already the slow fallback. DenoiseHdr already supports the guides if needed.
-                if (ReferenceEquals(giForCombine, histWrite)) {
-                    int n = w * h * 3;
-                    if (ssgiCpuColor == null || ssgiCpuColor.Length != n) { ssgiCpuColor = new float[n]; ssgiCpuOut = new float[n]; }
-                    histWrite.ReadColorRgb(ssgiCpuColor);
-                    if (ssgiOidn.DenoiseHdr(ssgiCpuColor, null, null, ssgiCpuOut, w, h)) {
-                        ssgiDenoised.WriteColorRgb(ssgiCpuOut);   // leaves ssgiDenoised in PixelShaderResource
-                        giForCombine = ssgiDenoised;
-                    }
-                }
-                if (ssgiOidnTiming && !ReferenceEquals(giForCombine, histWrite)) {
-                    ssgiOidnSw.Stop();
-                    ssgiOidnAccumMs += ssgiOidnSw.Elapsed.TotalMilliseconds; ssgiOidnAccumFrames++;
-                    if (ssgiOidnAccumFrames % 30 == 0)
-                        Console.WriteLine($"[OIDN] denoise avg {ssgiOidnAccumMs / ssgiOidnAccumFrames:F2}ms/frame over {ssgiOidnAccumFrames} ({(usedZeroCopy ? "ZERO-COPY" : "READBACK")})");
-                }
-            }
-        }
-        if (ReferenceEquals(giForCombine, histWrite)) histWrite.ColorToShaderResource();   // temporal-only path
-
-        // Combine (full-res) → ssgiScene, reading scene (t0) + (denoised) GI (t1; t2 unused, valid descriptor).
-        target.ColorToShaderResource();   // scene must be readable (no-op if the gather already set it)
-        int cbi = ssgiSrvVisible.AllocateRange(3);
-        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(cbi + 0), target.ColorSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(cbi + 1), giForCombine.ColorSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssgiSrvVisible.Cpu(cbi + 2), giForCombine.ColorSrvCpu, heapType);
-        ssgiScene.RenderColorOnly(cl => {
-            cl.SetGraphicsRootSignature(ssgiRootSig); cl.SetPipelineState(ssgiCombinePso);
-            cl.SetDescriptorHeaps(ssgiSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, ssgiCb.GPUVirtualAddress);
-            cl.SetGraphicsRootDescriptorTable(1, ssgiSrvVisible.Gpu(cbi));
-            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            cl.DrawInstanced(3, 1, 0, 0);
-        });
-        ssgiScene.ColorToShaderResource();
-        target.CopyColorFrom(ssgiScene);   // the GI-enriched scene becomes the new scene color
-
-        ssgiHistWriteB = !ssgiHistWriteB;   // ping-pong; this frame's accumulation is next frame's history
-        ssgiHistValid = true;
-    }
-
-    // Lazily build the DXR sun-shadow pipeline (scene AS owner, RT PSO, SBT, mask, heap) on first use.
-    // Returns false (→ cascade fallback) if DXR is unavailable on this GPU. Uses the source-verified Vortice
-    // 3.8.3 DXR API (same as Dx12DxrProbe).
+    // RT sun shadows STAY inline core (the plan converts them in a later chunk). chunk 10 rewired the lazy
+    // DXR-availability probe + the device5/sceneAS lazy-init onto the shared `dxr` holder (Dx12DxrShared) — the
+    // SAME shared substrate the GI + Reflections passes use — so all three reuse one scene AS / device5.
     unsafe bool EnsureRtShadows() {
-        if (!dxrChecked) {
-            dxrChecked = true;
-            dxrAvailable = dev.HasHardwareRayTracing;   // eager device-wide flag (FORCE_NORT-aware)
-            if (!dxrAvailable) Console.WriteLine("[RTShadows] DXR unavailable — using cascaded shadows.");
-        }
-        if (!dxrAvailable) return false;
+        if (!dxr.CheckAvailable("RTShadows")) return false;   // shared DXR-availability probe (chunk 10)
         if (rtShadowBuilt) return true;
         rtShadowBuilt = true;
 
-        if (device5 == null) device5 = dev.Device.QueryInterface<ID3D12Device5>();
-        if (sceneAS == null) sceneAS = new Dx12SceneAS(dev);
+        var device5 = dxr.Device5;   // shared ID3D12Device5 facet (chunk 10)
 
         // Global root sig: CBV(b0) + table {SRV t0 TLAS, t1 depth, t2 normal; UAV u0 mask}.
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
@@ -2052,8 +1574,9 @@ public sealed class DX12HDRenderer : HDRenderer {
 
     // RT sun shadows: ensure the scene AS, then DispatchRays one shadow ray per pixel → rtShadowMask. The
     // mask is left in PixelShaderResource for the deferred pass (UseRtShadows). viewProj is the JITTERED
-    // matrix the depth was rendered with (matches DrawDeferredLighting's world-pos reconstruction).
+    // matrix the depth was rendered with (matches the deferred pass's world-pos reconstruction).
     unsafe void DrawRtShadows(Matrix4x4 viewProj, Vector3 lightDir) {
+        var sceneAS = dxr.SceneAS;   // shared scene AS (chunk 10)
         sceneAS.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection);
         if (!sceneAS.Valid) return;
 
@@ -2096,563 +1619,6 @@ public sealed class DX12HDRenderer : HDRenderer {
         });
         rtShadowMask.ColorToShaderResource();
         rtShadowsThisFrame = true;
-    }
-
-    // Lazily build the DXR reflection pipeline. Reuses device5 + sceneAS (created by whichever RT effect ran
-    // first). Returns false (→ SSR fallback) when DXR is unavailable.
-    unsafe bool EnsureRtReflections() {
-        if (!dxrChecked) {
-            dxrChecked = true;
-            dxrAvailable = dev.HasHardwareRayTracing;   // eager device-wide flag (FORCE_NORT-aware)
-            if (!dxrAvailable) Console.WriteLine("[RTReflections] DXR unavailable — using SSR.");
-        }
-        if (!dxrAvailable) return false;
-        if (rtReflBuilt) return true;
-        rtReflBuilt = true;
-
-        if (device5 == null) device5 = dev.Device.QueryInterface<ID3D12Device5>();
-        if (sceneAS == null) sceneAS = new Dx12SceneAS(dev);
-
-        // PHASE 8 root sig (mirrors rtGiRootSig — the closest-hit decodes the hit bindlessly via
-        // ResourceDescriptorHeap[], so HeapDirectlyIndexed + the table descriptors live in the bindless tail):
-        //   CBV b0 ReflConstants | CBV b1 RtGiSun | CBV b2 DdgiGrid | table{SRV t0-t6, UAV u0} |
-        //   root SRV t7 GpuMaterials | t8 RtInstance[] | t9 Lights | t10 ProbeState + static clamp s0 + wrap s1.
-        var cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var cbv1 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.All);
-        var cbv2 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(2, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 7, baseShaderRegister: 0);  // t0-t6
-        var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);
-        var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange), ShaderVisibility.All);
-        var matSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All);
-        var instSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(8, 0), ShaderVisibility.All);
-        var lightSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(9, 0), ShaderVisibility.All);
-        var probeSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(10, 0), ShaderVisibility.All);
-        var clampSamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) {
-            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
-            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
-            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
-        };
-        var wrapSamp = new StaticSamplerDescription(ShaderVisibility.All, 1, 0) {   // albedo texture sampling at hits
-            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap,
-            AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 1,
-            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
-        };
-        rtReflRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(
-                RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { cbv0, cbv1, cbv2, table, matSrv, instSrv, lightSrv, probeSrv }, new[] { clampSamp, wrapSamp })));
-
-        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("DxrReflections.hlsl");
-        byte[] dxil = Dx12ShaderCompiler.Compile(DxcShaderStage.Library, hlsl, "", "DxrReflections.hlsl");
-        var subs = new[] {
-            new StateSubObject(new DxilLibraryDescription(dxil,
-                new ExportDescription("RayGen"), new ExportDescription("Miss"), new ExportDescription("ClosestHit"))),
-            new StateSubObject(new HitGroupDescription("HitGroup", HitGroupType.Triangles, "", "ClosestHit", "")),
-            new StateSubObject(new RaytracingShaderConfig(16, 8)),   // payload = float3 color + float roughness
-            new StateSubObject(new RaytracingPipelineConfig(1)),
-            new StateSubObject(new GlobalRootSignature(rtReflRootSig)),
-        };
-        rtReflPso = device5.CreateStateObject(new StateObjectDescription(StateObjectType.RaytracingPipeline, subs));
-
-        using ID3D12StateObjectProperties props = rtReflPso.QueryInterface<ID3D12StateObjectProperties>();
-        uint idSize = Vortice.Direct3D12.D3D12.ShaderIdentifierSizeInBytes;
-        rtReflSbt = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer(RtSbtSlot * 3), ResourceStates.GenericRead);
-        byte* sp = rtReflSbt.Map<byte>(0);
-        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 0 * RtSbtSlot, (void*)props.GetShaderIdentifier("RayGen"), idSize);
-        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 1 * RtSbtSlot, (void*)props.GetShaderIdentifier("Miss"), idSize);
-        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 2 * RtSbtSlot, (void*)props.GetShaderIdentifier("HitGroup"), idSize);
-        rtReflSbt.Unmap(0);
-
-        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<RtReflConstants>() + 255) & ~255;
-        rtReflCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        rtReflCbMapped = rtReflCb.Map<byte>(0);
-        int sunSize = (System.Runtime.InteropServices.Marshal.SizeOf<RtGiSun>() + 255) & ~255;
-        rtReflSunCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)sunSize), ResourceStates.GenericRead);
-        rtReflSunCbMapped = rtReflSunCb.Map<byte>(0);
-        int gridSize = (System.Runtime.InteropServices.Marshal.SizeOf<Dx12Ddgi.DdgiConstants>() + 255) & ~255;
-        rtReflGridCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)gridSize), ResourceStates.GenericRead);
-        rtReflGridCbMapped = rtReflGridCb.Map<byte>(0);
-        rtGeometry ??= new Dx12RtGeometry(dev);
-        return true;
-    }
-
-    // RT reflections: trace a reflection ray per pixel → ssrTarget (reflected color + strength), then reuse
-    // the SSR combine (depth-aware upsample + Fresnel lerp into the scene). Replaces the SSR march. PHASE 8:
-    // the hit is shaded with REAL world radiance (sun + punctual + the DDGI world-cache field as ambient =
-    // reflections see the same multi-bounce GI as the diffuse pass), so this needs the bindless geo/material
-    // table + the DDGI atlas/grid/ProbeState — bound EXACTLY like DrawRtGi (the renderer is fully synchronous,
-    // so the DDGI atlas this frame's GI pass wrote is fully drained before the reflection pass reads it).
-    unsafe void DrawRtReflections(Matrix4x4 view, Matrix4x4 viewProj, Matrix4x4 proj, Vector3 camPos,
-                                  Vector3 lightDir, Vector3 lightColor) {
-        sceneAS.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection);
-        if (!sceneAS.Valid) { DrawSsr(view, proj); return; }   // no geometry → fall back to SSR
-
-        // The world-radiance hit shading reads the bindless material table + per-instance geometry SRVs (same as
-        // RT-GI) — ensure they're fresh (stamp-cached no-ops if the geometry pass already built them).
-        gpuDriven.EnsureMaterialTable(wholeMeshRenderers);
-        rtGeometry.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection, gpuDriven);
-
-        // Sample the DDGI world cache at hits when it's allocated this frame (DDGI on). Without it, the hit
-        // ambient falls back to the flat IBL irradiance cube (UseDdgi=0) — a graceful no-DDGI path.
-        bool useDdgi = DdgiEnabled && ddgi != null && ddgi.Allocated;
-
-        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
-        *(RtReflConstants*)rtReflCbMapped = new RtReflConstants {
-            InvViewProj = Matrix4x4.Transpose(invVP), CameraPos = camPos, Intensity = PostFX.SsrIntensity,
-            PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f, NormalBias = 0.05f,
-            UseDdgi = useDdgi ? 1f : 0f,
-            // Pad0 = emissiveEnable — reflected emissive surfaces (neon in a mirror) light up when >0.5.
-            Pad0 = GiEmissiveEnabled ? 1f : 0f,
-        };
-        Vector3 sunDir = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
-        *(RtGiSun*)rtReflSunCbMapped = new RtGiSun {
-            SunDir = sunDir, NormalBias = 0.03f, SunColor = lightColor, LightCount = clusteredLights.LightCount,
-        };
-        // The DDGI grid description for SampleDdgiField at the hit (origin/spacing/dims + irrTexels/normalBias).
-        *(Dx12Ddgi.DdgiConstants*)rtReflGridCbMapped = useDdgi ? ddgi.GridConstants() : default;
-
-        // The G-buffer is in the combined shader-read state; color (target) bring to SRV for the combine.
-        target.ColorToShaderResource();
-        // The DXR raygen samples depth (t1) from the NON-PIXEL stage — promote it (fog/SSGI leave depth in
-        // PixelShaderResource only). Mirrors DrawRtGi's DepthToNonPixelShaderResource (audit C1). The combine's
-        // back-half re-transitions depth to the pixel-readable state it needs (DepthToShaderResource below).
-        gbuffer.DepthToNonPixelShaderResource();
-
-        // The table descriptors live in the bindless heap's reserved tail (so the one bound CBV/SRV/UAV heap
-        // serves BOTH the table AND the closest-hit's ResourceDescriptorHeap[] bindless geo/material reads).
-        Dx12DescriptorHeap bindless = Dx12Backend.BindlessHeap;
-        sceneAS.CreateTlasSrv(bindless.Cpu(RtReflTableBase + 0));                                            // t0 TLAS
-        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtReflTableBase + 1), gbuffer.DepthSrvCpu, heapType);     // t1 depth
-        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtReflTableBase + 2), gbuffer.ColorSrvCpu(1), heapType);  // t2 world normal
-        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtReflTableBase + 3), gbuffer.ColorSrvCpu(2), heapType);  // t3 material
-        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtReflTableBase + 4), ibl.IrradianceSrv, heapType);       // t4 irr cube
-        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtReflTableBase + 5), ibl.PrefilterSrv, heapType);        // t5 prefilter cube
-        // t6 DDGI irradiance atlas (the hit's ambient field). When DDGI is off there's no atlas — bind a
-        // Texture2D SRV (the G-buffer depth) as an inert stand-in so the descriptor TYPE matches the shader's
-        // Texture2D<float4> slot (audit C2 — keeps GPU-based validation silent; the shader never samples t6
-        // when UseDdgi=0, so the value is irrelevant — only the descriptor dimension matters).
-        if (useDdgi)
-            dev.Device.CreateShaderResourceView(ddgi.IrradianceTex, new ShaderResourceViewDescription {
-                Format = Format.R16G16B16A16_Float, ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
-                Shader4ComponentMapping = ShaderComponentMapping.Default,
-                Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
-            }, bindless.Cpu(RtReflTableBase + 6));
-        else
-            dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtReflTableBase + 6), gbuffer.DepthSrvCpu, heapType);
-        dev.Device.CreateUnorderedAccessView(ssrTarget.RenderTarget, null, new UnorderedAccessViewDescription {
-            Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
-        }, bindless.Cpu(RtReflTableBase + 7));                                                               // u0 ssrTarget
-
-        ssrTarget.ColorToUnorderedAccess();
-        // DDGI atlas (UnorderedAccess between passes) → NonPixelSRV for the closest-hit's field read; restore
-        // after. ProbeState (t10 root SRV) is read in its UAV state, same as the screen-probe trace does.
-        if (useDdgi)
-            dev.ExecuteSync(cl => cl.ResourceBarrierTransition(ddgi.IrradianceTex,
-                ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource));
-
-        uint idSize = Vortice.Direct3D12.D3D12.ShaderIdentifierSizeInBytes;
-        dev.ExecuteSync(cl => {
-            cl.SetDescriptorHeaps(bindless.Heap);   // bindless heap = the bound CBV/SRV/UAV heap (table + ResourceDescriptorHeap[])
-            cl.SetComputeRootSignature(rtReflRootSig);
-            cl.SetPipelineState1(rtReflPso);
-            cl.SetComputeRootConstantBufferView(0, rtReflCb.GPUVirtualAddress);
-            cl.SetComputeRootConstantBufferView(1, rtReflSunCb.GPUVirtualAddress);
-            cl.SetComputeRootConstantBufferView(2, rtReflGridCb.GPUVirtualAddress);
-            cl.SetComputeRootDescriptorTable(3, bindless.Gpu(RtReflTableBase));
-            cl.SetComputeRootShaderResourceView(4, gpuDriven.MaterialsGpuAddress);       // t7 GpuMaterials
-            cl.SetComputeRootShaderResourceView(5, rtGeometry.InstancesGpuAddress);      // t8 RtInstance[]
-            cl.SetComputeRootShaderResourceView(6, clusteredLights.LightBufGpuAddress);  // t9 punctual lights
-            cl.SetComputeRootShaderResourceView(7, useDdgi ? ddgi.ProbeStateGpuAddress   // t10 ProbeState (DDGI on)
-                                                           : clusteredLights.LightBufGpuAddress);  // inert when off (never read)
-            cl.DispatchRays(new DispatchRaysDescription {
-                Width = (uint)ssrTarget.Width, Height = (uint)ssrTarget.Height, Depth = 1,
-                RayGenerationShaderRecord = new GpuVirtualAddressRange { StartAddress = rtReflSbt.GPUVirtualAddress, SizeInBytes = idSize },
-                MissShaderTable = new GpuVirtualAddressRangeAndStride { StartAddress = rtReflSbt.GPUVirtualAddress + RtSbtSlot, SizeInBytes = idSize, StrideInBytes = idSize },
-                HitGroupTable = new GpuVirtualAddressRangeAndStride { StartAddress = rtReflSbt.GPUVirtualAddress + 2 * RtSbtSlot, SizeInBytes = idSize, StrideInBytes = idSize },
-            });
-        });
-        if (useDdgi)
-            dev.ExecuteSync(cl => cl.ResourceBarrierTransition(ddgi.IrradianceTex,
-                ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess));
-        ssrTarget.ColorToShaderResource();
-
-        // Reuse the SSR combine (depth-aware upsample + Fresnel lerp into the scene color).
-        Matrix4x4.Invert(proj, out Matrix4x4 invProj);
-        *(SsrConstants*)ssrCbMapped = new SsrConstants {
-            Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProj),
-            ViewMatrix = Matrix4x4.Transpose(view), Intensity = PostFX.SsrIntensity,
-            TexelSize = new Vector2(1f / ssrTarget.Width, 1f / ssrTarget.Height),
-        };
-        gbuffer.DepthToShaderResource();
-        ssrSrvVisible.Reset();
-        int cb = ssrSrvVisible.AllocateRange(5);
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 0), target.ColorSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 1), gbuffer.DepthSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 2), gbuffer.ColorSrvCpu(1), heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 3), gbuffer.ColorSrvCpu(2), heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 4), ssrTarget.ColorSrvCpu, heapType);
-        ssrScene.RenderColorOnly(cl => {
-            cl.SetGraphicsRootSignature(ssrRootSig); cl.SetPipelineState(ssrCombinePso);
-            cl.SetDescriptorHeaps(ssrSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress);
-            cl.SetGraphicsRootDescriptorTable(1, ssrSrvVisible.Gpu(cb));
-            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            cl.DrawInstanced(3, 1, 0, 0);
-        });
-        ssrScene.ColorToShaderResource();
-        target.CopyColorFrom(ssrScene);
-    }
-
-    // Lazily build the DXR GI pipeline. Reuses device5 + sceneAS. Returns false (→ SSGI fallback) without DXR.
-    unsafe bool EnsureRtGi() {
-        if (!dxrChecked) {
-            dxrChecked = true;
-            dxrAvailable = dev.HasHardwareRayTracing;   // eager device-wide flag (FORCE_NORT-aware)
-            if (!dxrAvailable) Console.WriteLine("[RTGI] DXR unavailable — using SSGI.");
-        }
-        if (!dxrAvailable) return false;
-        if (rtGiBuilt) return true;
-        rtGiBuilt = true;
-
-        if (device5 == null) device5 = dev.Device.QueryInterface<ID3D12Device5>();
-        if (sceneAS == null) sceneAS = new Dx12SceneAS(dev);
-
-        // P1 world-radiance hit shading: the closest-hit shader decodes the hit MATERIAL bindlessly (exactly
-        // like GBufferBindless), so the root sig must allow ResourceDescriptorHeap[] indexing
-        // (SamplerHeapDirectlyIndexed not needed — we use a static sampler). Layout:
-        //   CBV b0 RtGiConstants | CBV b1 RtGiSun (sun dir/color + frame) | table{SRV t0-t4, UAV u0} |
-        //   SRV t5 GpuMaterials (root) | SRV t6 RtInstance[] (root) + static clamp + wrap samplers.
-        var cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var cbv1 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 5, baseShaderRegister: 0);
-        var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);
-        var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange), ShaderVisibility.All);
-        var matSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(5, 0), ShaderVisibility.All);
-        var instSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(6, 0), ShaderVisibility.All);
-        var lightSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All);  // punctual lights
-        var clampSamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) {
-            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
-            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
-            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
-        };
-        var wrapSamp = new StaticSamplerDescription(ShaderVisibility.All, 1, 0) {   // albedo texture sampling
-            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap,
-            AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 1,
-            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
-        };
-        rtGiRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(
-                RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { cbv0, cbv1, table, matSrv, instSrv, lightSrv }, new[] { clampSamp, wrapSamp })));
-
-        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("DxrGi.hlsl");
-        byte[] dxil = Dx12ShaderCompiler.Compile(DxcShaderStage.Library, hlsl, "", "DxrGi.hlsl");
-        var subs = new[] {
-            new StateSubObject(new DxilLibraryDescription(dxil,
-                new ExportDescription("RayGen"), new ExportDescription("Miss"), new ExportDescription("ClosestHit"))),
-            new StateSubObject(new HitGroupDescription("HitGroup", HitGroupType.Triangles, "", "ClosestHit", "")),
-            new StateSubObject(new RaytracingShaderConfig(16, 8)),
-            new StateSubObject(new RaytracingPipelineConfig(1)),
-            new StateSubObject(new GlobalRootSignature(rtGiRootSig)),
-        };
-        rtGiPso = device5.CreateStateObject(new StateObjectDescription(StateObjectType.RaytracingPipeline, subs));
-
-        using ID3D12StateObjectProperties props = rtGiPso.QueryInterface<ID3D12StateObjectProperties>();
-        uint idSize = Vortice.Direct3D12.D3D12.ShaderIdentifierSizeInBytes;
-        rtGiSbt = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer(RtSbtSlot * 3), ResourceStates.GenericRead);
-        byte* sp = rtGiSbt.Map<byte>(0);
-        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 0 * RtSbtSlot, (void*)props.GetShaderIdentifier("RayGen"), idSize);
-        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 1 * RtSbtSlot, (void*)props.GetShaderIdentifier("Miss"), idSize);
-        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 2 * RtSbtSlot, (void*)props.GetShaderIdentifier("HitGroup"), idSize);
-        rtGiSbt.Unmap(0);
-
-        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<RtGiConstants>() + 255) & ~255;
-        rtGiCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        rtGiCbMapped = rtGiCb.Map<byte>(0);
-        int sunSize = (System.Runtime.InteropServices.Marshal.SizeOf<RtGiSun>() + 255) & ~255;
-        rtGiSunCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)sunSize), ResourceStates.GenericRead);
-        rtGiSunCbMapped = rtGiSunCb.Map<byte>(0);
-        rtGiHeap = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 6, shaderVisible: true);
-        rtGeometry = new Dx12RtGeometry(dev);
-        return true;
-    }
-
-    // The 6 RT-GI table descriptors (t0 TLAS, t1 depth, t2 normal, t3 irradiance, t4 scene color, u0 output)
-    // must live in the SAME heap as the bindless material/geometry SRVs (only one CBV/SRV/UAV heap binds at a
-    // time, and the hit shader's ResourceDescriptorHeap[] reads the bindless heap). So they get a RESERVED
-    // tail range of the BindlessHeap (16384 cap; materials bump from 0 and never reach here), written each
-    // frame. The table root param points at this base; bindless reads index the same heap by their slot.
-    const int RtGiTableBase = 16384 - 8;
-
-    // DDGI trace pass (P2.1) reserves its OWN 2-slot tail below RtGi's: [0] = TLAS SRV (t0), [1] = irradiance
-    // cube SRV (t3), so the trace root table's two ranges map to adjacent bindless-tail descriptors. Below
-    // RtGiTableBase (16376) so the two reservations never collide; materials bump from 0 and never reach here.
-    const int DdgiTableBase = 16384 - 12;   // slots 16372, 16373, 16374
-
-    // Phase 4 screen-probe TRACE reserves its OWN 3-slot tail below DDGI's: [0] = TLAS (t0), [1] = irr cube
-    // (t3), [2] = DDGI irradiance atlas (t4, the far-field handoff). Slots 16368/16369/16370 — below
-    // DdgiTableBase (16372) so the three reservations (ScreenProbe < DDGI < RtGi) never collide; materials bump
-    // from 0 and never reach here.
-    const int ScreenProbeTableBase = 16384 - 16;   // slots 16368, 16369, 16370
-
-    // RT global illumination: trace a cosine-hemisphere ray per pixel → raw one-bounce GI in ssgiTarget,
-    // then the SHARED SSGI resolve (temporal + OIDN + combine). viewProj is the JITTERED matrix (matches the
-    // depth); proj drives the SSGI dials/combine. lightDir/lightColor = the sun (raw HDR) for the world-space
-    // hit re-shading (P1). EnsureMaterialTable + rtGeometry.Ensure MUST run before this (bindless ids).
-    unsafe void DrawRtGi(Matrix4x4 view, Matrix4x4 viewProj, Matrix4x4 proj, Vector3 lightDir, Vector3 lightColor, Vector3 camPos) {
-        sceneAS.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection);
-        if (!sceneAS.Valid) { DrawSsgi(view, proj); return; }   // no geometry → fall back to SSGI
-
-        // --- DDGI world-probe radiance cache (BALLISTIC_DX12_DDGI=1). P2.0 allocates the probe atlases + snaps
-        // the camera-centered grid; P2.1 (below, after the bindless table is written) runs the trace+blend
-        // probe-update passes. The atlases are written but not yet read (the gather lands in P2.2), so this is
-        // still image-inert — verifying the update pipeline (non-zero, smooth probe tiles + no device-removal). ---
-        if (DdgiEnabled) {
-            if (ddgi == null) ddgi = new Dx12Ddgi(dev);
-            ddgi.Build();
-            ddgi.Update(camPos);
-            if (!ddgiLogged) {
-                ddgiLogged = true;
-                Vector3 o = ddgi.Origin;
-                Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
-                    $"[DDGI] grid {Dx12Ddgi.ProbesX}x{Dx12Ddgi.ProbesY}x{Dx12Ddgi.ProbesZ}={Dx12Ddgi.ProbeCount} probes; " +
-                    $"origin=({o.X:0.#},{o.Y:0.#},{o.Z:0.#}) spacing={ddgi.Spacing.X:0.#}m covers ~{ddgi.Spacing.X*(Dx12Ddgi.ProbesX-1):0}x{ddgi.Spacing.Y*(Dx12Ddgi.ProbesY-1):0}x{ddgi.Spacing.Z*(Dx12Ddgi.ProbesZ-1):0}m; " +
-                    $"irrAtlas={Dx12Ddgi.IrradianceAtlasW}x{Dx12Ddgi.IrradianceAtlasH} depthAtlas={Dx12Ddgi.DepthAtlasW}x{Dx12Ddgi.DepthAtlasH}; {Dx12Ddgi.RaysPerProbe} rays/probe"));
-                // P2.5 budget readout: round-robin fraction + per-frame probe/ray count + persistent grid VRAM
-                // (VRAM-budgeted FIRST per the plan — the GTX-1660's smaller VRAM must never be blown).
-                Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
-                    $"[DDGI] round-robin 1/{ddgi.CurrentUpdateFraction}: {ddgi.ProbesPerFrame} probes/frame x {Dx12Ddgi.RaysPerProbe} = {ddgi.ProbesPerFrame*Dx12Ddgi.RaysPerProbe} rays/frame; " +
-                    $"grid VRAM {ddgi.GridVramBytes/(1024.0*1024.0):0.0} MB"));
-            }
-        }
-        // The bindless material table (byte-identical to the raster G-buffer) feeds the world-space hit
-        // shading. The geometry pass builds it only when gpuDrivenOn — ensure it here too (stamp-cached no-op
-        // if already built) so RT-GI works with the CPU geometry path. Then the per-instance geometry SRVs.
-        gpuDriven.EnsureMaterialTable(wholeMeshRenderers);
-        rtGeometry.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection, gpuDriven);
-
-        int fi = FillSsgiConstants(view, proj);   // dials + matrices for the shared temporal/combine
-        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
-        *(RtGiConstants*)rtGiCbMapped = new RtGiConstants {
-            InvViewProj = Matrix4x4.Transpose(invVP), ViewProj = Matrix4x4.Transpose(viewProj),
-            // Params.z = emissiveEnable (was unused) — the GI hit adds emissive self-emission when >0.5.
-            Params = new Vector4(SsgiPreExposure(), MathF.Max(PostFX.SsgiRayLength, 0.1f), GiEmissiveEnabled ? 1f : 0f, fi),
-        };
-        Vector3 sunDir = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
-        *(RtGiSun*)rtGiSunCbMapped = new RtGiSun {
-            SunDir = sunDir, NormalBias = 0.03f, SunColor = lightColor, LightCount = clusteredLights.LightCount,
-        };
-
-        // --- P2.1 DDGI probe update (trace+blend). Reuses the SAME bindless heap + root-SRV addresses + the
-        // RtGiSun CBV as the RT-GI pass, so the probe hit-shading is byte-identical to DxrGi. Writes the trace
-        // table's 2 descriptors (TLAS@DdgiTableBase, irr cube@+1) into the bindless tail, then dispatches in
-        // its own ExecuteSync (each DX12 pass = its own submit; lets GI:DDGI be timed separately). Atlases are
-        // written but not yet read (gather = P2.2) → image still inert; this validates the update pipeline. ---
-        if (DdgiEnabled && ddgi != null && ddgi.Allocated) {
-            ddgi.EmissiveEnabled = GiEmissiveEnabled;
-            Dx12DescriptorHeap bh = Dx12Backend.BindlessHeap;
-            var ddgiHeapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-            sceneAS.CreateTlasSrv(bh.Cpu(DdgiTableBase + 0));                                              // t0 TLAS
-            dev.Device.CopyDescriptorsSimple(1, bh.Cpu(DdgiTableBase + 1), ibl.IrradianceSrv, ddgiHeapType); // t3 irr cube
-            // t4 = LAST frame's irradiance atlas (P2.3 multi-bounce feedback). The trace samples it as the hit
-            // ambient; DispatchDdgi transitions it UAV→SRV→UAV around the trace within its command list.
-            dev.Device.CreateShaderResourceView(ddgi.IrradianceTex, new ShaderResourceViewDescription {
-                Format = Format.R16G16B16A16_Float,
-                ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
-                Shader4ComponentMapping = ShaderComponentMapping.Default,
-                Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
-            }, bh.Cpu(DdgiTableBase + 2));
-            // One trace+blend+classify cycle (its own submit). `full` = warm-up / round-robin off (every probe).
-            // Reuses the descriptors written above (TLAS/cube/prev-irr stay valid across the warm-up replays).
-            // P0a: ExecuteSyncImmediate (NOT the frame-list append) — the DDGI multi-bounce feedback reads the
-            // PREVIOUS update's atlas, and the warm-up replays this MANY times each reading the last (line below:
-            // "each its own submit — never one giant command list"). Recording them all into the open pipelined
-            // frame list would defer every iteration to one submit, so each would read the STALE pre-frame atlas
-            // → the field never converges (a GI-internal read-after-write the algorithm depends on). Immediate
-            // flush keeps each iteration's completion exactly as the non-pipelined path had it. This is a submit/
-            // sync fix, NOT a change to the DDGI algorithm. Still cheap: 1 flush/frame for the round-robin.
-            void RunDdgiUpdate(bool full) => dev.ExecuteSyncImmediate(cl => {
-                cl.SetDescriptorHeaps(bh.Heap);
-                ddgi.DispatchDdgi(cl, bh, bh.Gpu(DdgiTableBase),
-                    rtGiSunCb.GPUVirtualAddress, gpuDriven.MaterialsGpuAddress,
-                    rtGeometry.InstancesGpuAddress, clusteredLights.LightBufGpuAddress,
-                    hysteresis: 0.97f, intensity: MathF.Max(PostFX.SsgiIntensity, 0f),
-                    feedback: true,         // P2.3 multi-bounce
-                    fullUpdate: full);
-            });
-
-            // --- P2.5 WARM-UP (capture-path determinism): on the FIRST DDGI frame, converge the field by
-            // replaying the update many times (each its own submit — never one giant command list) FULL-grid, so
-            // a paused screenshot is the STEADY STATE, byte-deterministic + independent of SCREENSHOT_FRAME. No-op
-            // in play (TryWarmUp returns false unless BALLISTIC_SCREENSHOT is set / _WARMUP overrides). ---
-            ddgi.TryWarmUp(() => RunDdgiUpdate(full: true));
-
-            // Own stopwatch (NOT TimePass — nesting it inside the outer GI:RT TimePass would clobber the shared
-            // passSw and corrupt GI:RT's reading). Each DX12 pass is its own ExecuteSync = its GPU wall-time.
-            // FREEZE on the PAUSED capture path: once warmed up, skip the per-frame round-robin update so every
-            // captured frame reads the SAME converged atlas (one more update would make the image frame-dependent).
-            // Gated on the paused capture (static camera → the frozen atlas is sampled at the correct, unchanged
-            // probe positions). A MOVING capture (or play) keeps updating live — freezing a moving camera would
-            // sample a stale-pose atlas as the grid re-snaps (audit Finding C).
-            // WarmupEnabled is now itself gated on the paused capture (Dx12Ddgi.WarmupIterations), so freeze ==
-            // WarmupEnabled: warm-up converged the field, then we hold it. Play/moving captures keep updating live.
-            if (!ddgi.WarmupEnabled) {
-                var ddgiSw = GiTimingEnabled ? System.Diagnostics.Stopwatch.StartNew() : null;
-                RunDdgiUpdate(full: false);   // the per-frame round-robin update (1/N probes)
-                if (ddgiSw != null) { ddgiSw.Stop(); RenderStats.Scene.GpuPasses.Add(("GI:DDGI", ddgiSw.Elapsed.TotalMilliseconds)); }
-            }
-            if (!ddgiDebugDumped && Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_DEBUG") == "1") {
-                ddgiDebugDumped = true; ddgi.DumpIrradianceStats();
-            }
-
-            // The compute gather/place reads depth as SRV t0 → NON_PIXEL state (shared by both GI sources below).
-            gbuffer.DepthToNonPixelShaderResource();
-
-            // --- PHASE 4: screen-space radiance probes (DEFAULT when DDGI is on; BALLISTIC_DX12_SCREENPROBE=0
-            // opts out to the per-pixel DDGI gather below). Runs a DOWNSAMPLED screen-probe final gather: Place
-            // (one probe per 16x16 tile, snapped to the G-buffer surface) → Trace (64 short hemisphere rays,
-            // miss → DDGI field) → Blend (rays → octahedral radiance tile) → Integrate (bilateral 2x2-probe
-            // upsample → ssgiTarget). The screen probes are the near/mid field; the DDGI cache we just updated is
-            // the far field (the trace's ray-miss handoff) — the published Lumen screen-trace → world-cache
-            // hierarchy. Same ssgiTarget contract → the shared resolve composites it (and GI-isolate shows it).
-            // The DDGI gather below is the SCREENPROBE=0 fallback (reproduces the pre-flip image byte-for-byte). ---
-            if (ScreenProbeEnabled) {
-                DrawScreenProbeGather(invVP);
-                SsgiResolveAndCombine();
-                return;
-            }
-
-            // --- P2.2 DDGI GATHER: per-pixel sample the probe field (8-probe trilinear + Chebyshev leak test)
-            // → albedo*E pre-exposed into ssgiTarget, REPLACING the RT per-pixel ray-march as the GI source
-            // (the plan: DDGI is the world cache; SSGI stays the near-field companion). Then the shared
-            // SsgiResolveAndCombine composites it (and GI-isolate shows it). G-buffer depth/normal/albedo are
-            // in the combined shader-read state from the deferred pass. ---
-            ssgiTarget.ColorToUnorderedAccess();
-            var gatherSw = GiTimingEnabled ? System.Diagnostics.Stopwatch.StartNew() : null;
-            dev.ExecuteSync(cl => {
-                ddgi.DispatchGather(cl, gbuffer.DepthSrvCpu, gbuffer.ColorSrvCpu(1), gbuffer.ColorSrvCpu(0),
-                    ssgiTarget.RenderTarget, ssgiTarget.Width, ssgiTarget.Height,
-                    Matrix4x4.Transpose(invVP), SsgiPreExposure());
-            });
-            if (gatherSw != null) { gatherSw.Stop(); RenderStats.Scene.GpuPasses.Add(("GI:DDGIGather", gatherSw.Elapsed.TotalMilliseconds)); }
-            ssgiTarget.ColorToShaderResource();
-            SsgiResolveAndCombine();   // shared: motion temporal + OIDN + composite
-            return;
-        }
-
-        // G-buffer is in the combined shader-read state (RT compute-stage can read depth+normal); the lit
-        // scene color is the bounce source (project the hit back to it), so bring it to SRV. The 6 table
-        // descriptors go into the BindlessHeap's reserved tail so the bindless hit shading shares the heap.
-        target.ColorToShaderResource();
-        Dx12DescriptorHeap bindless = Dx12Backend.BindlessHeap;
-        sceneAS.CreateTlasSrv(bindless.Cpu(RtGiTableBase + 0));
-        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtGiTableBase + 1), gbuffer.DepthSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtGiTableBase + 2), gbuffer.ColorSrvCpu(1), heapType);   // world normal
-        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtGiTableBase + 3), ibl.IrradianceSrv, heapType);        // off-screen fallback
-        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtGiTableBase + 4), target.ColorSrvCpu, heapType);       // lit scene color
-        dev.Device.CreateUnorderedAccessView(ssgiTarget.RenderTarget, null, new UnorderedAccessViewDescription {
-            Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
-        }, bindless.Cpu(RtGiTableBase + 5));
-
-        ssgiTarget.ColorToUnorderedAccess();
-        uint idSize = Vortice.Direct3D12.D3D12.ShaderIdentifierSizeInBytes;
-        dev.ExecuteSync(cl => {
-            cl.SetDescriptorHeaps(bindless.Heap);   // bindless heap = the bound CBV/SRV/UAV heap (table + ResourceDescriptorHeap[])
-            cl.SetComputeRootSignature(rtGiRootSig);
-            cl.SetPipelineState1(rtGiPso);
-            cl.SetComputeRootConstantBufferView(0, rtGiCb.GPUVirtualAddress);
-            cl.SetComputeRootConstantBufferView(1, rtGiSunCb.GPUVirtualAddress);
-            cl.SetComputeRootDescriptorTable(2, bindless.Gpu(RtGiTableBase));
-            cl.SetComputeRootShaderResourceView(3, gpuDriven.MaterialsGpuAddress);    // t5 GpuMaterials
-            cl.SetComputeRootShaderResourceView(4, rtGeometry.InstancesGpuAddress);   // t6 RtInstance[]
-            cl.SetComputeRootShaderResourceView(5, clusteredLights.LightBufGpuAddress);  // t7 punctual lights
-            cl.DispatchRays(new DispatchRaysDescription {
-                Width = (uint)ssgiTarget.Width, Height = (uint)ssgiTarget.Height, Depth = 1,
-                RayGenerationShaderRecord = new GpuVirtualAddressRange { StartAddress = rtGiSbt.GPUVirtualAddress, SizeInBytes = idSize },
-                MissShaderTable = new GpuVirtualAddressRangeAndStride { StartAddress = rtGiSbt.GPUVirtualAddress + RtSbtSlot, SizeInBytes = idSize, StrideInBytes = idSize },
-                HitGroupTable = new GpuVirtualAddressRangeAndStride { StartAddress = rtGiSbt.GPUVirtualAddress + 2 * RtSbtSlot, SizeInBytes = idSize, StrideInBytes = idSize },
-            });
-        });
-        ssgiTarget.ColorToShaderResource();
-
-        SsgiResolveAndCombine();   // shared: motion temporal + OIDN + composite
-    }
-
-    // PHASE 4 (P4.0): the screen-space radiance probe final gather. Runs the 4 sub-passes — Place, Trace,
-    // Blend, Integrate — leaving the (raw, pre-exposed) GI in ssgiTarget for the shared SsgiResolveAndCombine.
-    // Called from DrawRtGi only when ScreenProbeEnabled AND DDGI is on/allocated (the trace hands off to the
-    // DDGI world cache for its far field). The DDGI field was already updated this frame above, so the
-    // screen-probe rays sample a current cache. G-buffer depth is in NonPixelShaderResource on entry; albedo +
-    // normal are in the combined shader-read state from the deferred pass. invVP is the UN-transposed inverse
-    // view-projection (we transpose for the shaders, matching the DDGI gather convention).
-    unsafe void DrawScreenProbeGather(Matrix4x4 invVP) {
-        if (screenProbe == null) screenProbe = new Dx12ScreenProbe(dev);
-        screenProbe.EmissiveEnabled = GiEmissiveEnabled;
-        screenProbe.EnsureAllocated(ssgiTarget.Width, ssgiTarget.Height);
-        screenProbe.Build();
-
-        // Per-frame constants: the screen-probe grid + the DDGI grid description the trace samples on miss.
-        var ddgiGrid = ddgi.GridConstants();
-        screenProbe.PrepareConstants(Matrix4x4.Transpose(invVP),
-            maxRayDist: MathF.Max(PostFX.SsgiRayLength, 3f),   // SHORT near/mid-field ray (DDGI handles far)
-            preExposure: SsgiPreExposure(), intensity: MathF.Max(PostFX.SsgiIntensity, 0f),
-            deterministic: DeterministicCapture, ddgiGrid);
-
-        if (!screenProbeLogged) {
-            screenProbeLogged = true;
-            Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
-                $"[SCREENPROBE] grid {screenProbe.ProbesX}x{screenProbe.ProbesY}={screenProbe.ProbeCount} probes " +
-                $"(1 per {Dx12ScreenProbe.Downsample}x{Dx12ScreenProbe.Downsample} px); {Dx12ScreenProbe.OctTexels}x{Dx12ScreenProbe.OctTexels} octahedral, " +
-                $"{Dx12ScreenProbe.RaysPerProbe} rays/probe = {screenProbe.ProbeCount * Dx12ScreenProbe.RaysPerProbe} rays/frame; " +
-                $"VRAM {screenProbe.GridVramBytes / (1024.0 * 1024.0):0.0} MB"));
-        }
-
-        var sw = GiTimingEnabled ? System.Diagnostics.Stopwatch.StartNew() : null;
-
-        // PLACE: probePos/probeNormal from the G-buffer (depth NonPixelSRV, normal = G-buffer RT1).
-        screenProbe.DispatchPlace(gbuffer.DepthSrvCpu, gbuffer.ColorSrvCpu(1));
-
-        // TRACE: write the 3-descriptor bindless tail block ([0] TLAS, [1] irr cube, [2] DDGI atlas), then
-        // dispatch with the shared bindless geo/material addresses (same as the DDGI/RT-GI pass).
-        Dx12DescriptorHeap bh = Dx12Backend.BindlessHeap;
-        var ddgiHeapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        sceneAS.CreateTlasSrv(bh.Cpu(ScreenProbeTableBase + 0));                                               // t0 TLAS
-        dev.Device.CopyDescriptorsSimple(1, bh.Cpu(ScreenProbeTableBase + 1), ibl.IrradianceSrv, ddgiHeapType); // t3 irr cube
-        dev.Device.CreateShaderResourceView(ddgi.IrradianceTex, new ShaderResourceViewDescription {            // t4 DDGI atlas
-            Format = Format.R16G16B16A16_Float, ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
-            Shader4ComponentMapping = ShaderComponentMapping.Default,
-            Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
-        }, bh.Cpu(ScreenProbeTableBase + 2));
-        // The DDGI atlas is in UnorderedAccess (left so by DispatchDdgi) → the trace reads it as a NonPixelSRV.
-        dev.ExecuteSync(cl => cl.ResourceBarrierTransition(ddgi.IrradianceTex,
-            ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource));
-        screenProbe.DispatchTrace(bh, bh.Gpu(ScreenProbeTableBase),
-            rtGiSunCb.GPUVirtualAddress, gpuDriven.MaterialsGpuAddress, rtGeometry.InstancesGpuAddress,
-            clusteredLights.LightBufGpuAddress, ddgi.ProbeStateGpuAddress);
-        // DDGI atlas back to UnorderedAccess for next frame's DDGI blend.
-        dev.ExecuteSync(cl => cl.ResourceBarrierTransition(ddgi.IrradianceTex,
-            ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess));
-
-        // BLEND: rays → octahedral radiance tile (+ border).
-        screenProbe.DispatchBlend();
-
-        // INTEGRATE: full-res nearest-probe upsample → ssgiTarget (pre-exposed albedo*E).
-        ssgiTarget.ColorToUnorderedAccess();
-        screenProbe.DispatchIntegrate(gbuffer.DepthSrvCpu, gbuffer.ColorSrvCpu(1), gbuffer.ColorSrvCpu(0),
-            ssgiTarget.RenderTarget, ssgiTarget.Width, ssgiTarget.Height);
-        ssgiTarget.ColorToShaderResource();
-
-        if (sw != null) { sw.Stop(); RenderStats.Scene.GpuPasses.Add(("GI:ScreenProbe", sw.Elapsed.TotalMilliseconds)); }
     }
 
     // P7.2a MEASUREMENT: render ONE DDGI probe at the camera position (6 cube faces of a small G-buffer) and
@@ -2777,12 +1743,14 @@ public sealed class DX12HDRenderer : HDRenderer {
                     DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true);
             var ht = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
             dev.Device.CopyDescriptorsSimple(1, rasterProbeDbgHeap.Cpu(0), rasterProbe.AlbedoCubeSrv, ht);
-            dev.Device.CreateUnorderedAccessView(ssgiTarget.RenderTarget, null, new UnorderedAccessViewDescription {
+            // chunk 10: ssgiTarget now lives in the GI pass; the NORT debug blit reaches it via giPass.SsgiTarget.
+            var dbgGi = giPass.SsgiTarget;
+            dev.Device.CreateUnorderedAccessView(dbgGi.RenderTarget, null, new UnorderedAccessViewDescription {
                 Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
             }, rasterProbeDbgHeap.Cpu(1));
-            ssgiTarget.ColorToUnorderedAccess();
-            dev.ExecuteSync(cl => rasterProbe.DebugBlit(cl, rasterProbeDbgHeap, ssgiTarget.Width, ssgiTarget.Height, SsgiPreExposure()));
-            ssgiTarget.ColorToShaderResource();
+            dbgGi.ColorToUnorderedAccess();
+            dev.ExecuteSync(cl => rasterProbe.DebugBlit(cl, rasterProbeDbgHeap, dbgGi.Width, dbgGi.Height, SsgiPreExposure()));
+            dbgGi.ColorToShaderResource();
         }
     }
 
@@ -2825,12 +1793,14 @@ public sealed class DX12HDRenderer : HDRenderer {
                     DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true);
             var ht = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
             dev.Device.CopyDescriptorsSimple(1, rasterProbeDbgHeap.Cpu(0), rasterProbe.AlbedoCubeSrv, ht);
-            dev.Device.CreateUnorderedAccessView(ssgiTarget.RenderTarget, null, new UnorderedAccessViewDescription {
+            // chunk 10: ssgiTarget now lives in the GI pass; the NORT debug blit reaches it via giPass.SsgiTarget.
+            var dbgGi = giPass.SsgiTarget;
+            dev.Device.CreateUnorderedAccessView(dbgGi.RenderTarget, null, new UnorderedAccessViewDescription {
                 Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
             }, rasterProbeDbgHeap.Cpu(1));
-            ssgiTarget.ColorToUnorderedAccess();
-            dev.ExecuteSync(cl => rasterProbe.DebugBlit(cl, rasterProbeDbgHeap, ssgiTarget.Width, ssgiTarget.Height, SsgiPreExposure()));
-            ssgiTarget.ColorToShaderResource();
+            dbgGi.ColorToUnorderedAccess();
+            dev.ExecuteSync(cl => rasterProbe.DebugBlit(cl, rasterProbeDbgHeap, dbgGi.Width, dbgGi.Height, SsgiPreExposure()));
+            dbgGi.ColorToShaderResource();
         }
     }
 
