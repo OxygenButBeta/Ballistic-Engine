@@ -130,6 +130,27 @@ public sealed class MenuItemAttribute : Attribute {
     }
 }
 
+// Marks an editor IComponentPreview class as the custom inspector section for a component TYPE
+// (editor-rework Rule 1 / Phase B1). REPLACES the hand-written `if (behaviour is Renderer/Volume/
+// Terrain/...) DrawXxxSection(...)` god-chain in InspectorPanel: a preview self-registers by the
+// component type it draws, and the inspector resolves the applicable previews from a registry by type
+// — never an instanceof switch. Mirrors [MenuItem] (A1) / ComponentRegistry discovery exactly: the
+// attribute lives in the engine (zero ImGui/editor refs) so the host-assembly preview classes carry it
+// and the engine-side TypeCache scan discovers them headlessly; the editor's ComponentPreviewRegistry
+// is the only thing that interprets it. TargetType is the component base/interface the preview applies
+// to (assignable match, so a base-type preview covers subclasses). Priority breaks resolution order:
+// higher draws first; ties break on the preview type's full name (DeterministicResolver) so the order
+// is machine-independent. AllowMultiple = one preview can cover several component types.
+[AttributeUsage(AttributeTargets.Class, AllowMultiple = true, Inherited = false)]
+public sealed class ComponentPreviewAttribute : Attribute {
+    public Type TargetType { get; }
+    public int Priority { get; }
+    public ComponentPreviewAttribute(Type targetType, int priority = 0) {
+        TargetType = targetType;
+        Priority = priority;
+    }
+}
+
 // Marks a DataAsset subclass as creatable from the editor's asset browser (Unity's
 // [CreateAssetMenu]). The browser adds a "Create > {Menu} > {DisplayName}" entry that writes a new
 // .asset with this type's default values, named {FileName}. Discovered by ComponentRegistry.

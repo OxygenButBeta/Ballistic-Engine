@@ -195,6 +195,11 @@ internal sealed class EditorApplication {
         EditorWindows.Bind(ToggleWindow, OpenWindow, IsWindowOpen, IsWindowEnabled);
         EditorWindowRegistry.Rebuild();
 
+        // B1 (Rule 1): warm the component-preview registry the same way, so the first inspector draw doesn't
+        // pay the [ComponentPreview] reflection scan. The inspector resolves custom sections from this registry
+        // by type instead of the old `if (behaviour is Renderer/Volume/...)` instanceof chain.
+        ComponentPreviewRegistry.Rebuild();
+
         // Per-project dock layout: key by the project root, then apply the saved arrangement before the
         // first frame (BuildUI lays out the default if none exists).
         EditorLayout.SetProject(bootstrap.Project.RootPath);

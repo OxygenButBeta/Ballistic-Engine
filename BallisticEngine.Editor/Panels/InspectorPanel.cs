@@ -567,43 +567,14 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         if (open) {
             DrawMemberList(type, behaviour);
 
-            if (behaviour is Renderer renderer && BeginGrid("##submats")) {
-                DrawSubMeshMaterials(renderer);
-                ImGui.EndTable();
-            }
-
-            if (behaviour is Volume volume)
-                DrawVolumeProfileSection(entity, volume);
-
-            if (behaviour is Terrain terrain)
-                DrawTerrainBrushSection(terrain);
-
-            if (behaviour is AudioSource audioSource)
-                DrawAudioSourceSection(audioSource);
-
-            if (behaviour is Animator animator)
-                DrawAnimatorSection(animator);
-
-            if (behaviour is AnimatorController controller)
-                DrawAnimatorControllerSection(controller);
-
-            if (behaviour is LightAnimator lightAnim)
-                DrawLightAnimatorSection(lightAnim);
-
-            if (behaviour is Spawner spawner)
-                DrawSpawnerSection(spawner);
-
-            if (behaviour is Health health)
-                DrawHealthSection(health);
-
-            if (behaviour is BallisticEngine.UI.UIDocument uiDoc)
-                DrawUIDocumentSection(uiDoc);
-
-            if (behaviour is ParticleSystem particles)
-                DrawParticleSystemSection(particles);
-
-            if (behaviour is TrailRenderer trail)
-                DrawTrailRendererSection(trail);
+            // Custom per-component preview sections (B1, Rule 1): resolved from ComponentPreviewRegistry by
+            // type instead of the old `if (behaviour is Renderer/Volume/Terrain/...)` instanceof chain. Each
+            // applicable preview self-registered via [ComponentPreview(typeof(T))]; PreviewsFor caches the
+            // ordered list per component type (zero per-frame reflection). A plain component resolves to an
+            // empty list and just shows its members above.
+            var previewCtx = new Inspector.Preview.ComponentPreviewContext(this, entity, behaviour);
+            foreach (var preview in BallisticEngine.Editor.ComponentPreviewRegistry.PreviewsFor(type))
+                preview.Draw(in previewCtx);
 
             ImGui.Spacing();
         }
@@ -676,7 +647,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // Inline profile editing under a Volume component, Unity-style: the profile's overrides are
     // edited in place (and saved straight back to the .volume asset), or a fresh profile asset
     // can be created and assigned in one click.
-    void DrawVolumeProfileSection(Entity entity, Volume volume) {
+    internal void DrawVolumeProfileSection(Entity entity, Volume volume) {
         ImGui.Spacing();
 
         if (volume.Profile is null) {
@@ -727,7 +698,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // radius/strength (and a target height for Flatten/Set). Drives TerrainTool's static state; the
     // actual sculpting happens in the viewport. Not part of scene undo — brush settings are editor
     // tool state, and each stroke pushes its own undo + saves the .terrain asset.
-    static void DrawTerrainBrushSection(Terrain terrain) {
+    internal static void DrawTerrainBrushSection(Terrain terrain) {
         ImGui.Spacing();
 
         if (terrain.Terrain3D is null) {
@@ -779,7 +750,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // itself is gated to play mode. Graceful no-op when no audio device is present (headless CI).
     static IAudioVoice audioPreviewVoice;
     static float audioPreviewTime;   // scrub-slider position (seconds), persists between previews
-    void DrawAudioSourceSection(AudioSource source) {
+    internal void DrawAudioSourceSection(AudioSource source) {
         ImGui.Spacing();
         ImGui.SeparatorText("Preview");
 
@@ -840,7 +811,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // Animator preview: a play/pause toggle + a scrub slider that evaluates the clip in edit mode, so
     // you can pose the skinned character without entering play. Drives Animator.EvaluatePreview, which
     // runs the same sample->skeleton->skinning pipeline as play-mode Tick.
-    void DrawAnimatorSection(Animator animator) {
+    internal void DrawAnimatorSection(Animator animator) {
         ImGui.Spacing();
         ImGui.SeparatorText("Preview");
 
@@ -899,7 +870,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // bool, slider for float/int, a button for triggers) so you can drive the graph from the inspector
     // in play mode without writing test code (very AI-managed-friendly: set "Speed" and watch it cross
     // from idle->walk->run live).
-    void DrawAnimatorControllerSection(AnimatorController controller) {
+    internal void DrawAnimatorControllerSection(AnimatorController controller) {
         ImGui.Spacing();
         ImGui.SeparatorText("State Machine");
 
@@ -976,7 +947,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // flicker/pulse without entering play), plus a warning if there's no light on the entity to drive.
     // The IntensityCurve / ColorOverTime members render their curve+gradient widgets automatically via
     // the reflection DrawMember, so this only adds the preview control.
-    void DrawLightAnimatorSection(LightAnimator lightAnim) {
+    internal void DrawLightAnimatorSection(LightAnimator lightAnim) {
         ImGui.Spacing();
         ImGui.SeparatorText("Preview");
 
@@ -1011,7 +982,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // Spawner: live alive/pooled counts + a manual Spawn One / Clear. Spawning only runs in play mode
     // (Tick), so the manual button is most useful there; in edit mode it instantiates immediately so
     // you can preview the prefab placement, and Clear cleans those up.
-    void DrawSpawnerSection(Spawner spawner) {
+    internal void DrawSpawnerSection(Spawner spawner) {
         ImGui.Spacing();
         ImGui.SeparatorText("Spawner");
 
@@ -1043,7 +1014,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // their own listener editors automatically via the reflection DrawMember.
     // UIDocument's Uxml/Uss are string PATHS; give them drag-drop target fields so you can drop a
     // .uxml/.uss (or .uihtml/.uss) asset from the browser instead of typing the address (item 15).
-    void DrawUIDocumentSection(BallisticEngine.UI.UIDocument doc) {
+    internal void DrawUIDocumentSection(BallisticEngine.UI.UIDocument doc) {
         ImGui.Spacing();
         ImGui.SeparatorText("Markup & Style");
         DrawPathDropField("UXML (markup)", doc.Uxml, [".uxml", ".uihtml", ".html"], p => doc.Uxml = p);
@@ -1075,7 +1046,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         ImGui.PopID();
     }
 
-    void DrawHealthSection(Health health) {
+    internal void DrawHealthSection(Health health) {
         ImGui.Spacing();
         ImGui.SeparatorText("Health");
 
@@ -1110,7 +1081,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // ParticleSystem preview: it already animates live in the editor (AdvanceAll runs every editor
     // frame), so this just adds a Restart (clear) + a one-shot Emit test + a live count, and keeps the
     // viewport repainting while particles are alive so you see the motion.
-    void DrawParticleSystemSection(ParticleSystem particles) {
+    internal void DrawParticleSystemSection(ParticleSystem particles) {
         ImGui.Spacing();
         ImGui.SeparatorText("Preview");
 
@@ -1131,7 +1102,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     }
 
     // TrailRenderer preview: also animates live in the editor; add a Clear + a live point count.
-    void DrawTrailRendererSection(TrailRenderer trail) {
+    internal void DrawTrailRendererSection(TrailRenderer trail) {
         ImGui.Spacing();
         ImGui.SeparatorText("Preview");
 
@@ -1758,7 +1729,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // Multi-material meshes resolve their materials from refs baked into the mesh at import;
     // list them read-only so an empty SharedMaterial slot isn't mistaken for "no materials".
     // (SharedMaterial only overrides slots that have no baked ref.)
-    static void DrawSubMeshMaterials(Renderer renderer) {
+    internal static void DrawSubMeshMaterials(Renderer renderer) {
         Mesh mesh = renderer.SharedMesh;
         if (mesh?.SubMeshes is not { Length: > 1 } subMeshes)
             return;
@@ -2616,7 +2587,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
     // ---- Layout helpers --------------------------------------------------------
 
-    static bool BeginGrid(string id) {
+    internal static bool BeginGrid(string id) {
         // PadOuterX keeps the value column off the panel edge; the slight indent (via a leading
         // column) and inner spacing give the rows a calmer, more deliberate rhythm.
         if (!ImGui.BeginTable(id, 2, ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.PadOuterX))
