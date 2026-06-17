@@ -44,6 +44,11 @@ internal sealed class EditorApplication {
     // of the shell). The scattered inline ImGui.IsKeyPressed/editorInput.KeyPressed guards across OnUpdate +
     // BuildUI now route through this — each binding declares its context so a chord can't leak between scopes.
     readonly EditorInputRouter inputRouter;
+    // A5: the play/edit mode controller (the LAST Phase-A item). The editor-side wrapper around the
+    // engine's play lifecycle (SceneManager.StartPlay/StopPlay) — the mode-TRANSITION side-effects
+    // (save-guard before play, cursor reset + selection clear + window focus on stop) that were inline
+    // in the toolbar's Play/Stop button bodies now live in one explicit enter/exit-hook controller.
+    readonly EditorPlayModeController playMode;
     readonly ConsolePanel console = new();
     readonly StatsPanel stats = new();
     readonly SettingsPanel settings;
@@ -122,6 +127,23 @@ internal sealed class EditorApplication {
         imgui = new ImGuiController(window);
         editorInput = new EditorInput(window);
         inputRouter = BuildInputRouter();
+        // A5: the mode-transition side-effects, supplied as the controller's enter/exit handlers. The
+        // handlers capture `this`/`editorState` and only fire at transition time (well after ctor), so
+        // referencing fields here is safe. Behaviour is byte-identical to the old inline toolbar bodies.
+        playMode = new EditorPlayModeController(
+            saveBeforePlay: () => {
+                // Persist edits to disk before play (Unity-style): play mode only keeps an in-memory
+                // snapshot that Stop restores, so a close/crash mid-play would otherwise lose unsaved
+                // edits (collider sizes, etc.). Only when there's something to save and a file to save to.
+                if (EditorUndo.IsDirty && !string.IsNullOrEmpty(SceneCommands.CurrentScenePath))
+                    SceneCommands.Save();
+            },
+            onEntered: () => pendingFocusWindow = EditorLayout.GameView,
+            onExited: () => {
+                Cursor.Mode = CursorMode.Normal; // clear any leftover lock intent from the play session
+                editorState.Selected = null;
+                pendingFocusWindow = EditorLayout.SceneView;
+            });
         hierarchy = new HierarchyPanel(editorState);
         inspector = new InspectorPanel(editorState);
         assets = new AssetBrowserPanel(editorState, () => imgui.Scale);
@@ -1070,12 +1092,8 @@ internal sealed class EditorApplication {
             ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(0.66f, 0.26f, 0.20f, 1f));
             ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(0.78f, 0.33f, 0.24f, 1f));
             ImGui.PushStyleColor(ImGuiCol.ButtonActive, new SysVec4(0.85f, 0.38f, 0.27f, 1f));
-            if (ImGui.Button(EditorIcons.Stop, new SysVec2(buttonW, 0))) {
-                SceneManager.StopPlay();
-                Cursor.Mode = CursorMode.Normal; // clear any leftover lock intent from the play session
-                editorState.Selected = null;
-                pendingFocusWindow = EditorLayout.SceneView;
-            }
+            if (ImGui.Button(EditorIcons.Stop, new SysVec2(buttonW, 0)))
+                playMode.ExitPlay();   // A5: StopPlay -> cursor reset + selection clear + focus Scene view
             ImGui.PopStyleColor(3);
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip("Stop (exit play mode)");
@@ -1083,7 +1101,7 @@ internal sealed class EditorApplication {
         else {
             // Unity's compile-error lock: while the latest script compile failed, the Play
             // button is disabled with the reason in its tooltip (StartPlay also self-guards).
-            var playBlockedReason = SceneManager.PlayBlocked?.Invoke();
+            var playBlockedReason = playMode.BlockedReason;
 
             ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(0.16f, 0.42f, 0.24f, 1f));
             ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(0.20f, 0.53f, 0.30f, 1f));
@@ -1093,15 +1111,8 @@ internal sealed class EditorApplication {
             ImGui.EndDisabled();
             if (playBlockedReason is not null && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
                 ImGui.SetTooltip($"Play blocked: {playBlockedReason}");
-            if (playClicked) {
-                // Persist edits to disk before play (Unity-style): play mode only keeps an in-memory
-                // snapshot that Stop restores, so a close/crash mid-play would otherwise lose unsaved
-                // edits (collider sizes, etc.). Only when there's something to save and a file to save to.
-                if (EditorUndo.IsDirty && !string.IsNullOrEmpty(SceneCommands.CurrentScenePath))
-                    SceneCommands.Save();
-                SceneManager.StartPlay();
-                pendingFocusWindow = EditorLayout.GameView;
-            }
+            if (playClicked)
+                playMode.EnterPlay();   // A5: save-guard -> StartPlay -> focus Game view
             ImGui.PopStyleColor(3);
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip("Play");
