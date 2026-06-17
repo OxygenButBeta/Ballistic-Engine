@@ -19,7 +19,6 @@ public sealed class MemberAttributes {
 
     // --- drawer-pipeline additions ---
     public LabelTextAttribute LabelText { get; private init; }
-    public int Order { get; private init; }
     public IReadOnlyList<ConditionalAttribute> Conditionals { get; private init; }
 
     static readonly Dictionary<MemberInfo, MemberAttributes> cache = new();
@@ -48,7 +47,6 @@ public sealed class MemberAttributes {
             Foldout = member.GetCustomAttribute<FoldoutGroupAttribute>(),
             ReadOnly = member.GetCustomAttribute<ReadOnlyAttribute>() is not null,
             LabelText = member.GetCustomAttribute<LabelTextAttribute>(),
-            Order = member.GetCustomAttribute<PropertyOrderAttribute>()?.Order ?? 0,
             Conditionals = (IReadOnlyList<ConditionalAttribute>)conditionals ?? NoConditions,
         };
         cache[member] = resolved;
