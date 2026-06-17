@@ -76,6 +76,25 @@ public static class RemoteSchema {
     public static MethodSchema For(string method) =>
         method is not null && byName.TryGetValue(method, out MethodSchema s) ? s : null;
 
+    // D1 (editor-rework Phase D, "command registry"): the help/method listing is GENERATED from this same
+    // table, so it can never drift from the dispatch surface or the validation contract -- the editor's
+    // `help` command and any agent-facing method catalog read ONE source. Format: "method" when paramless,
+    // else "method {a, b?}" with a trailing '?' marking optional params (required first, then optional, in
+    // declaration order). A boundary guard and a self-describing catalog are the same table by construction.
+    public static string Signature(MethodSchema schema) {
+        if (schema is null || schema.Params.Length == 0)
+            return schema?.Method ?? "";
+        IEnumerable<string> parts = schema.Params
+            .Where(p => p.Required).Select(p => p.Name)
+            .Concat(schema.Params.Where(p => !p.Required).Select(p => p.Name + "?"));
+        return $"{schema.Method} {{{string.Join(", ", parts)}}}";
+    }
+
+    public static string Signature(string method) => Signature(For(method));
+
+    // Every method's signature, in table (help-listing) order -- the canonical method catalog.
+    public static string[] Signatures => Methods.Select(Signature).ToArray();
+
     // The boundary guard. Returns null when the request is well-formed, else a single clean error string
     // describing the FIRST problem (unknown method, then required params in declaration order). The caller
     // (RemoteHandlers.Dispatch / the MCP MapTool) surfaces this as the request error -- the handler never

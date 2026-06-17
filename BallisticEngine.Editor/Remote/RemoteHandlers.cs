@@ -70,9 +70,9 @@ internal static class RemoteHandlers {
         "scene.component.add" => SceneComponentAdd(p),
         "scene.component.set" => SceneComponentSet(p),
         "help" => Help(),
-        _ => throw new Exception($"unknown method '{method}' — methods: editor.status, scene.describe, " +
-                                 "scene.save, scene.open, entity.get/create/delete, component.add/remove/set, " +
-                                 "select, play.start/stop/pause/step, undo, redo, screenshot, console.tail, scripts.rebuild"),
+        // Defensive backstop -- D2 RemoteSchema.Validate already rejects unknown methods before DispatchValidated
+        // runs, so this is unreachable in practice; its message is generated from the schema so it can't go stale.
+        _ => throw new Exception($"unknown method '{method}' -- methods: {string.Join(", ", RemoteSchema.Methods.Select(s => s.Method))}"),
     };
 
     // ---- queries -------------------------------------------------------------
@@ -190,19 +190,9 @@ internal static class RemoteHandlers {
     }
 
     // Lists every remote method (self-describing API so an agent can discover the control surface).
-    static object Help() => new {
-        methods = new[] {
-            "editor.status", "scene.describe", "scene.save", "scene.open {path}",
-            "entity.get {entity}", "entity.create {name,...}", "entity.delete {entity}",
-            "component.add {entity,type}", "component.remove {entity,type}",
-            "component.set {entity,target,value}",
-            "scene.component.add {type}", "scene.component.set {type,member,value}",
-            "select {entity}", "play.start/stop/pause/step",
-            "undo", "redo", "screenshot {path,settle}", "console.tail {count}",
-            "scripts.rebuild", "unity.import {path,subfolder}",
-            "editor.frame {entity?,dir?,fit?}", "editor.refresh", "help",
-        },
-    };
+    // D1: the method catalog is GENERATED from RemoteSchema (the same engine-side table that the D2 boundary
+    // guard validates against), so help can never drift from the dispatch surface. One source of truth.
+    static object Help() => new { methods = RemoteSchema.Signatures };
 
     // Frames the Scene-view camera on an entity's geometry, or the WHOLE scene when no entity is
     // given (aggregates every renderable's world bounds). This is what makes a remote screenshot

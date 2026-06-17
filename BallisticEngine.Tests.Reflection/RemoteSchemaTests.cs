@@ -117,6 +117,31 @@ internal static class RemoteSchemaTests {
             && RemoteSchema.For("entity.create")!.Optional.Select(p => p.Name).OrderBy(n => n)
                 .SequenceEqual(new[] { "parent", "position" }));
 
+        // -- (6) D1: the help/method catalog is GENERATED from the table (single source of truth) -------
+        // RemoteHandlers.Help() and the dispatch backstop now read RemoteSchema.Signatures instead of a
+        // hand-listed array, so the agent-facing catalog can never drift from the dispatch/validation
+        // surface. These prove the signature renderer over the SAME table the boundary guard validates.
+        h.Check("Signatures has exactly one entry per method (catalog == table)",
+            RemoteSchema.Signatures.Length == RemoteSchema.Methods.Count);
+        h.Check("a paramless method renders as just its name",
+            RemoteSchema.Signature("editor.status") == "editor.status");
+        h.Check("a required-only method renders 'method {req}'",
+            RemoteSchema.Signature("scene.open") == "scene.open {path}");
+        h.Check("required params come BEFORE optionals, optionals marked with '?'",
+            RemoteSchema.Signature("entity.create") == "entity.create {name, position?, parent?}");
+        h.Check("a multi-required method lists all required, no '?'",
+            RemoteSchema.Signature("component.set") == "component.set {entity, target, value}");
+        h.Check("an all-optional method marks every param with '?'",
+            RemoteSchema.Signature("editor.frame") == "editor.frame {entity?, dir?, fit?}");
+        h.Check("Signature(string) agrees with Signature(MethodSchema)",
+            RemoteSchema.Signature("component.add") == RemoteSchema.Signature(RemoteSchema.For("component.add")));
+        h.Check("Signature of an unknown method is empty (safe, no throw)",
+            RemoteSchema.Signature("nope") == "");
+        h.Check("every signature starts with its own method name (catalog faithfully derived, no drift)",
+            RemoteSchema.Methods.All(m => RemoteSchema.Signature(m).StartsWith(m.Method, StringComparison.Ordinal)));
+        h.Check("the Signatures order matches the table (help-listing order preserved)",
+            RemoteSchema.Signatures.SequenceEqual(RemoteSchema.Methods.Select(RemoteSchema.Signature)));
+
         return h.Report("RemoteSchema (D2)");
     }
 
