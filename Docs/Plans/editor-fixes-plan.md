@@ -19,41 +19,33 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF6** (delete the dead Shading-Mode dropdown — full removal confirmed safe on DX12)
-> Last committed chunk: **EF4** (FPS/Timing block gated out of the Scene view) · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **NONE — EF1–EF16 CODE-COMPLETE.** EF6 was the last unchecked chunk (landed @ HEAD).
+> Last committed chunk: **EF6** (dead Shading-Mode dropdown deleted) · Branch: `dx12-renderer`
 >
-> **EF4 note (just landed):** the FPS/Timing block no longer shows in the Scene view. Root: a single global
-> `showStats` gated the same `stats.Draw` overlay in BOTH views with no view gate, so the Scene view (which
-> repaints ON DEMAND — idle until the user interacts) showed a meaningless "FPS" number. Fix (default
-> decision (a) — Game-view-only regardless of play state): `StatsPanel.Draw` gained a `bool showTiming`
-> param that wraps ONLY the "Timing" section (FPS / Frame / Editor CPU); the Scene-view call site passes
-> `showTiming: false`, the Game-view call site passes `showTiming: true`. The Rendering/GPU/GI/Scene
-> counters (draws/tris/renderers) STILL show in both views — the plan explicitly allows the Scene view to
-> keep a minimal draw/tri counter, just not the FPS number. Touched 2 files: `Panels/StatsPanel.cs` (new
-> param + gated block) + `EditorApp/EditorApplication.cs` (the two `stats.Draw` call sites — `showTiming:
-> false` Scene, `showTiming: true` Game). `EditorApplication.cs`'s ONLY diff is these two stats hunks (no
-> not-mine dirt), so it was stageable wholesale, but staged by exact path anyway (selective protocol). Build
-> 0-error (Editor csproj, clean `--no-incremental` scratch dir), oracle EXIT=0 (19 suites). DoD (Scene view
-> shows no FPS; Game view unchanged) rides the batched viewport-overlay human-screenshot checkpoint
-> (EF1/EF2/EF4/EF6); NOT relaunch-looped (GPU-hang rule).
+> **All implementation chunks are done** (every checklist item below is `[x]`). The only work that REMAINS
+> is non-code: the **batched human-screenshot reviews** the worker chunks deferred under the GPU-hang rule —
+> (1) viewport-overlay cluster **EF1/EF2/EF4/EF6**, (2) the **EF5a–d theme** series, (3) the **EF9 fullscreen**
+> + **Inspector-layout** sets. Each is a single editor launch where the user eyeballs several chunks at once
+> (see "Batch the human-screenshot checkpoints" below). There is no further code chunk to hand off — when the
+> screenshots pass, the plan is fully closed.
 >
-> **For EF6 (next):** delete the dead Shading-Mode dropdown. Root: `EditorDebugViews.Install()` is a no-op on
-> DX12 (`EditorDebugViews.cs:6-25`, `// No-op on DX12`); the dropdown (`EditorApplication.cs:1315-1357` per
-> the plan — RE-GREP, line numbers drift after EF2/EF4 insertions: search the shading-mode combo / `DebugViewMode`)
-> wires `Renderer.DebugViewMode`, `HDRenderer.EditorExtraDebugMode`, `HDRenderer.EditorGiIsolate` — props the
-> DX12 renderer NEVER reads. **Full removal CONFIRMED safe (validated):** grep of `BallisticEngine.DX12/` for
-> `DebugViewMode`/`Wireframe` = zero reads (only an unrelated GI-isolate hit) — Wireframe/Normals/Depth are ALL
-> dead on DX12, not just the buffer modes, so nothing functional is lost. Delete the whole dropdown + its dead
-> wiring; remove dangling `EditorDebugComposite`/`EditorExtraDebugMode` scaffolding IF no longer referenced
-> anywhere (grep first — the DX12 port TODO may keep the engine-side `DebugView` enum; leave that if still
-> referenced). **Do NOT break the GI-isolate path** (`EditorGiIsolate` — separate, still used). DoD: dropdown
-> gone, editor builds 0-error, no dangling `EditorDebugComposite`/`EditorExtraDebugMode` references, GI-isolate
-> untouched. Section `Docs/Plans/editor-fixes-plan.md` `:861`. EF6 touches `EditorApplication.cs` (shared) →
-> again do NOT run the selective-staging empty-set guard against `EditorApplication`; `git diff` it first, and
-> if its only diff is your dropdown-removal hunk(s) stage by exact path, else `git add -p` to stage ONLY your
-> hunk(s) (+ the plan doc), leaving the not-mine dirt unstaged — exactly as EF1/EF2/EF4/EF8/EF12 did. Verify
-> via build (Editor csproj, clean `--no-incremental` scratch dir) + reflection oracle (19 suites, EXIT=0);
-> human screenshot batched into the viewport-overlay set; NOT relaunch-looped (GPU-hang rule).
+> **EF6 note (just landed):** the Scene-view "Shading Mode" dropdown is gone. Root: the combo wired
+> `HDRenderer.DebugViewMode`/`EditorExtraDebugMode`/`EditorGiIsolate` and `EditorDebugViews.Install()` —
+> ALL inert on DX12 (the GL fullscreen-quad debug compositor died with the GL backend; `Install()` was a
+> `// No-op on DX12`). Re-grep of `BallisticEngine.DX12/` confirmed ZERO reads of any of those symbols / the
+> `DebugFrame` struct (the lone DX12 GI-isolate hit is `Dx12GiPass`, driven by `PostFX.SsgiDebugView` + an env
+> var, NOT `HDRenderer.EditorGiIsolate`) — so Shaded/Wireframe/Normals/Depth + the editor AO/Lit/SSGI views
+> were ALL dead, nothing functional lost. Removed the whole `if (id == "scene") { ... }` popup block + the
+> `EditorDebugViews.Install()` call; `EditorDebugViews.cs` (whose ONLY consumer was the dropdown) was
+> `git rm`'d after verifying zero remaining references. **Engine-side `HDRenderer` scaffolding left intact**
+> (the `DebugView` enum + `EditorDebugComposite`/`EditorExtraDebugMode`/`DebugFrame`/`GiIsolate`) — per the
+> plan's "leave the engine enum for the DX12 port TODO"; unused public members compile fine, and keeping the
+> engine abstraction file out of this editor-scoped commit keeps the blast radius tight. GI-isolate path
+> untouched. Touched 2 files: `EditorApp/EditorApplication.cs` (its only diff = the two EF6 hunks — no
+> not-mine dirt — staged by exact path) + `EditorApp/EditorDebugViews.cs` (deleted). Build 0-error (Editor
+> csproj, clean `--no-incremental` scratch dir), oracle EXIT=0 (19 suites). DoD met (dropdown gone, no
+> dangling editor-side `EditorExtraDebugMode`/`EditorDebugComposite` refs, GI-isolate untouched); human
+> screenshot batched into the viewport-overlay set; NOT relaunch-looped (GPU-hang rule).
 >
 > **EF2 note (just landed):** the orientation axis-ball (`OrientationGizmo.Draw`) and the visibility
 > eye-menu (`##sceneVisibilityOverlay` in `DrawSceneViewToolbar`) both anchored the viewport's top-right
@@ -621,7 +613,7 @@ this same handoff for the chunk after it.
 - [x] EF1 — gizmo-mode button auto-width — landed bundled with **EF5e** @ `f48a8447` (not a standalone commit): `DrawSceneViewToolbar` (`EditorApplication.cs:2214-2238`) sizes the Move/Rotate/Scale buttons to `bw = max(58*S, widest-of-three CalcTextSize + FramePadding.X*2)` and the Pivot/Center button likewise, with the pill background widened to match — labels no longer clip to "Mov"/"Rota"/"Sca". The checklist/pointer just weren't ticked when it rode in with EF5e; reconciled this chat (no new code), build 0-error + oracle 19/19. Human-screenshot DoD rides the batched viewport-overlay checkpoint (EF1/EF2/EF4/EF6).
 - [x] EF2 — gizmo ↔ eye-menu de-overlap — the visibility eye-menu (`##sceneVisibilityOverlay` in `DrawSceneViewToolbar`) was anchored top-right (`imageMin.X+imageSize.X−margin, imageMin.Y+margin`, pivot `(1,0)`) directly under the orientation axis-ball (`OrientationGizmo.Draw`, same top-right corner) → the eye button overlapped the gizmo's lower balls. Fix: push the eye-menu's `SetNextWindowPos` Y DOWN by the gizmo's footprint + gap — `eyeMenuY = imageMin.Y + (34+14 + 34+8)*S + margin = imageMin.Y + 90*S + margin` (90 px = gizmo center offset `radius+14` + hover-ring bottom `radius+8`, mirroring `OrientationGizmo.cs:24-25,34`), staying right-aligned so the axis balls are fully visible+clickable and the eye button sits just below them. Touched ONLY `EditorApplication.cs` (the eye-menu hunk in `DrawSceneViewToolbar`) — staged selectively with `git add -p` to leave the pre-existing not-mine dirt (`RenderPassTogglesWindow.Draw(S)` etc.) unstaged. Build 0-error (Editor csproj, clean `--no-incremental` scratch dir), oracle EXIT=0 (19 suites). Human-screenshot DoD (gizmo fully visible+clickable, eye-menu not overlapping) rides the batched viewport-overlay checkpoint (EF1/EF2/EF4/EF6); NOT relaunch-looped (GPU-hang rule).
 - [x] EF4 — FPS scene-view gate — `StatsPanel.Draw` gained `bool showTiming`; Scene-view call passes `false` (no FPS/Frame/Editor-CPU block), Game-view call passes `true` (unchanged). Draw/tri/renderer counters still show in both. Default decision (a): Game-view-only regardless of play state.
-- [ ] EF6 — delete dead shading-mode dropdown
+- [x] EF6 — delete dead shading-mode dropdown — removed the Scene-view "Shading Mode" combo from `DrawViewToolbar` (the `if (id == "scene") { ... }` popup: Shaded/Wireframe/Normals/Depth + the editor-only AO/Lit/SSGI buffer views) and its one-time `EditorDebugViews.Install()` wiring. **Full removal — every mode was inert on DX12:** grep of `BallisticEngine.DX12/` confirmed ZERO reads of `DebugViewMode`/`EditorExtraDebugMode`/`EditorDebugComposite`/`EditorGiIsolate`/the `DebugFrame` struct (the only DX12 GI-isolate hit is `Dx12GiPass`, driven by `PostFX.SsgiDebugView`+an env var, NOT `HDRenderer.EditorGiIsolate`). The GL fullscreen-quad debug compositor died with the GL backend; `EditorDebugViews.Install()` was already a `// No-op on DX12`. Since the dropdown was the ONLY consumer of `EditorDebugViews` (Modes/None), the now-dead `EditorDebugViews.cs` was deleted (`git rm`) — verified zero remaining references first. **Engine-side scaffolding kept** (`HDRenderer.DebugView` enum + `EditorDebugComposite`/`EditorExtraDebugMode`/`DebugFrame`/`GiIsolate`): per plan, left for the eventual DX12 debug-view port — unused public members compile fine and `HDRenderer.cs` (engine abstraction) stays out of this editor-scoped commit. GI-isolate path untouched. DoD met: dropdown gone, no dangling EDITOR-side `EditorExtraDebugMode`/`EditorDebugComposite` references, GI-isolate untouched. Touched 2 files: `EditorApp/EditorApplication.cs` (its only diff = the dropdown-removal + `Install()`-removal hunks, no not-mine dirt) staged by exact path; `EditorApp/EditorDebugViews.cs` deleted. Build 0-error (Editor csproj, clean `--no-incremental` scratch dir), oracle EXIT=0 (19 suites). Human-screenshot DoD rides the batched viewport-overlay checkpoint (EF1/EF2/EF4/EF6); NOT relaunch-looped (GPU-hang rule). **★ LAST unchecked chunk → the whole EF1–EF16 plan is now CODE-COMPLETE.**
 
 ---
 

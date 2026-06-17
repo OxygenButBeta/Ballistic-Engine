@@ -185,8 +185,8 @@ internal sealed class EditorApplication {
         panels.Register(EditorLayout.SceneView, "Scene View", EditorIcons.Camera, null, isViewport: true);
         panels.Register(EditorLayout.GameView, "Game View", EditorIcons.Play, null, isViewport: true);
 
-        // Wire the editor-only extra debug views (AO / Lit / Luminance) into the renderer's hook.
-        EditorDebugViews.Install();
+        // EF6: the editor-only debug-view compositor (EditorDebugViews) was deleted with the Shading-Mode
+        // dropdown — it was a no-op on DX12 (the GL fullscreen-quad compositor died with the GL backend).
         settings = new SettingsPanel(imgui.SetAccent, ApplyFrameRateLimit);
         buildPanel = new BuildPanel(bootstrap.Project);
 
@@ -1339,55 +1339,18 @@ internal sealed class EditorApplication {
         // (The maximize BUTTON was removed — double-click any panel's tab to fullscreen it, Esc to
         // restore. Works for every panel now, so a dedicated viewport button is redundant.)
 
-        // Shading-mode dropdown: the engine's Shaded / Wireframe / Normals / Depth PLUS the editor-only
-        // extra views (AO / Lit / Luminance) that live in EditorDebugViews (never in a player build).
-        // RW3 E8: SCENE VIEW ONLY now — the Game view is the player's-eye output, so the editor-only debug
-        // views (AO/Lit/Luminance + GI-isolate) belong on the Scene view, not the Game view (where they'd
-        // misrepresent what the shipped game shows). Per-view popup id kept for safety.
-        if (id == "scene") {
-            var engineNames = new[] { "Shaded", "Wireframe", "Normals", "Depth" };
-            int extra = HDRenderer.EditorExtraDebugMode;
-            string current = extra != 0
-                ? Array.Find(EditorDebugViews.Modes, m => m.mode == extra).label
-                : engineNames[(int)Renderer.DebugViewMode];
-            var modeLabel = $"{current} {EditorIcons.ChevronDown}";
-            RightAlign(ImGui.CalcTextSize($"Ambient Occlusion {EditorIcons.ChevronDown}").X + pad2);
-            if (EditorIcons.GhostButton($"shadingmode{id}", modeLabel, "Shading / debug view mode"))
-                ImGui.OpenPopup($"##shadingmode{id}");
-            if (ImGui.BeginPopup($"##shadingmode{id}")) {
-                ImGui.TextDisabled("Shading Mode");
-                ImGui.Separator();
-                for (var i = 0; i < engineNames.Length; i++) {
-                    bool sel = extra == 0 && (int)Renderer.DebugViewMode == i;
-                    if (ImGui.MenuItem(engineNames[i], (string)null, sel)) {
-                        Renderer.DebugViewMode = (HDRenderer.DebugView)i;
-                        HDRenderer.EditorExtraDebugMode = EditorDebugViews.None;   // leave any extra view
-                        editorState.MarkViewportDirty();
-                    }
-                }
-                ImGui.Separator();
-                ImGui.TextDisabled("Buffers (editor only)");
-                foreach (var (mode, label) in EditorDebugViews.Modes) {
-                    if (ImGui.MenuItem(label, (string)null, extra == mode)) {
-                        HDRenderer.EditorExtraDebugMode = mode;
-                        Renderer.DebugViewMode = HDRenderer.DebugView.Shaded; // engine renders normally; we replace composite
-                        editorState.MarkViewportDirty();
-                    }
-                }
-
-                // GI ISOLATE menu REMOVED (2026-06-17): the Lumen diffuse-GI stack is hard-disabled
-                // engine-wide, so isolating its contribution is meaningless. Force the (DX12-dead) isolate
-                // state back to None so nothing stale lingers.
-                HDRenderer.EditorGiIsolate = HDRenderer.GiIsolate.None;
-                ImGui.EndPopup();
-            }
-        }
+        // EF6 (2026-06-18): the Scene-view "Shading Mode" dropdown (Shaded/Wireframe/Normals/Depth +
+        // the editor-only AO/Lit/SSGI buffer views) was DELETED. It wired HDRenderer.DebugViewMode /
+        // EditorExtraDebugMode / EditorGiIsolate — props the DX12 renderer never reads (the GL fullscreen
+        // debug compositor died with the GL backend; EditorDebugViews.Install() was a no-op). Every mode
+        // was inert on DX12, so the dropdown only misled. Removed whole; the engine-side enum/hook stays
+        // in HDRenderer for the eventual DX12 debug-view port (see that TODO).
 
         // RW3 E7: the Scene-view-only controls (snap chip, World/Local space, component-gizmos, grid, and the
         // light/reflection probe GI-debug toggles) moved OUT of this thin resolution bar into the in-viewport
         // overlay (DrawSceneViewToolbar). They drove the same gizmo.Space / EditorPrefs / ProbeRenderState
-        // state — only their location changed. The resolution bar now carries only res / zoom / fps / stats /
-        // shading-mode, shared cleanly between the Scene and Game views.
+        // state — only their location changed. The resolution bar now carries only res / zoom / fps / stats,
+        // shared cleanly between the Scene and Game views.
 
         ImGui.Separator();
     }
