@@ -53,6 +53,13 @@ public sealed class Dx12FrameContext {
     public bool TaaActive { get; init; }
     public bool FsrActive { get; init; }
 
+    // FSR shared resources + state (FsrPass dispatches; the orchestrator still OWNS the upscaler + output target
+    // because the internal-vs-output render-resolution lifecycle — EnsureUpscaleTargets / native reset / mode
+    // change — is whole-frame resolution management, not a leaf-post concern). Fsr is null when FSR is off.
+    public Dx12FsrUpscaler      Fsr            { get; init; }
+    public Dx12OffscreenTarget  FsrOutput      { get; init; }
+    public bool                 MotionPrevValid{ get; init; }   // false on first frame after a (re)alloc → FSR resets its history
+
     // --- shared backend resources (read-only references; the objects self-track their own state) ---
     public Dx12Device          Dev            { get; init; }
     public Dx12OffscreenTarget Target         { get; init; }   // HDR scene color (the canonical render target)

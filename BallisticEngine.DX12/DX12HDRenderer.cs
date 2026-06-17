@@ -114,6 +114,7 @@ public sealed class DX12HDRenderer : HDRenderer {
     // ping-pong history targets + the taaWriteB/taaHistoryValid state. Runs at PostProcess (after SSAO, before
     // composite) in the native path only (FSR replaces it). Was BuildTaa/AllocTaaTargets/DrawTaa.
     Dx12TaaPass taaPass;
+    Dx12FsrPass fsrPass;                // chunk 7: FSR dispatch (Record only); fsr/fsrOutput stay orchestrator-owned
     int taaFrame;                       // jitter phase counter (shared by TAA + FSR; advanced in the frame tail)
     Vector2 currentJitter;              // this frame's sub-pixel jitter (pixels) — exposed for FSR reuse
 
@@ -759,6 +760,11 @@ public sealed class DX12HDRenderer : HDRenderer {
         // 5th in the old AllocXxx order — byte-neutral, the allocator reads only the size, R5). Was BuildTaa.
         taaPass = new Dx12TaaPass(dev, targetW, targetH);
         graph.Add(taaPass);
+        // chunk 7: FSR (event 650, registered after TAA — mutually exclusive: FsrPass.Enabled=FsrActive,
+        // TaaPass.Enabled=!FsrActive, so exactly one runs). Owns no resources (fsr/fsrOutput orchestrator-owned),
+        // so no Resize. Sets ctx.SceneColor = fsrOutput. Was RunFsr.
+        fsrPass = new Dx12FsrPass(dev);
+        graph.Add(fsrPass);
         // chunk 7: Composite (event 700, after SSAO/TAA at PostProcess=650). Owns bloomA/B (the half-res
         // ping-pong); its Resize fans out LAST in registration order. The original AllocBloomTargets ran FIRST in
         // AllocateResolutionTargets, but the bloom allocator reads only the passed size (no cross-pass dependency)
@@ -1809,6 +1815,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             DeterministicCapture = DeterministicCapture,
             SsaoResult = ssaoPass.ResultSrvCpu,
             TaaActive = taaOn, FsrActive = fsrActive,   // chunk 7: TaaPass runs in native path; FsrPass when FsrActive
+            Fsr = fsr, FsrOutput = fsrOutput, MotionPrevValid = motionPrevValid,   // chunk 7: FsrPass dispatch inputs
             // mutated-mid-frame fields, set to their resolved final value:
             SceneColor = fsrActive ? fsrOutput : target,
             IblActiveThisFrame = iblActiveThisFrame,
@@ -1872,28 +1879,20 @@ public sealed class DX12HDRenderer : HDRenderer {
                 DrawSsr(view, proj);
         }
 
-        // === PHASE-1 PASS-GRAPH — PostProcess window (chunks 4+7: SSAO then TAA). Runs at its canonical slot:
-        // after the Reflections/SSR block, before the FSR branch + composite. Within the window the event-650
-        // passes run in registration order: SSAO (writes its half-res AO the composite samples via ctx.SsaoResult),
-        // then TaaPass (native path only — Enabled=!FsrActive; writes the AA'd color back into `target`). Same
-        // order as today's inline SSAO→TAA. The earlier windows already ran AP (after sky) + Fog (after GI). The
-        // ctx was built once above (after the giMode resolve, before Sky). ===
+        // === PHASE-1 PASS-GRAPH — PostProcess window (chunks 4+7: SSAO → TAA → FSR). Runs at its canonical slot:
+        // after the Reflections/SSR block, before composite. Within the window the event-650 passes run in
+        // registration order: SSAO (writes its half-res AO the composite samples via ctx.SsaoResult), then TaaPass
+        // (native path only — Enabled=!FsrActive; resolves AA into `target`), then FsrPass (FsrActive only —
+        // mutually exclusive with TAA; reconstructs fsrOutput + sets ctx.SceneColor=fsrOutput). Exactly one of
+        // TAA/FSR runs, same effective order as today's inline SSAO→(TAA|FSR). The earlier windows already ran AP
+        // (after sky) + Fog (after GI). The ctx was built once above (after the giMode resolve, before Sky). ===
         graph.Execute(ctx, (int)Dx12RenderPassEvent.PostProcess, (int)Dx12RenderPassEvent.Composite);
 
-        if (fsrActive) {
-            // --- FSR upscale path (replaces TAA — TaaPass was skipped in the window above since Enabled=!FsrActive):
-            //     SSAO (ran in the window) → FSR reconstruct internal→output HDR. The composite (Composite window
-            //     below) reads ctx.SceneColor = fsrOutput at output res. ---
-            RunFsr();
-            ctx.SceneColor = fsrOutput;   // the canonical composite-input branch (already set at ctx build; explicit here)
-        }
-        // Native path: TaaPass (in the PostProcess window above) already resolved AA into `target` (= ctx.SceneColor)
-        // — or, when TAA is off, reset its own history-valid flag. Nothing to do inline here anymore.
-
         // === PHASE-1 PASS-GRAPH — Composite window (chunk 7). DrawComposite became Dx12CompositePass.Record at the
-        // Composite event (700); it runs AFTER the TAA/FSR block so it reads the resolved ctx.SceneColor (fsrOutput
-        // when upscaling, target natively). GrainFrame is refreshed here from the LIVE ssgiFrame (SSGI incremented
-        // it after ctx was built) — the composite reads it for the non-deterministic film-grain phase only. ===
+        // Composite event (700); it runs AFTER the SSAO/TAA/FSR window so it reads the resolved ctx.SceneColor
+        // (fsrOutput when upscaling — set by FsrPass; target natively — written by TaaPass). GrainFrame is
+        // refreshed here from the LIVE ssgiFrame (SSGI incremented it after ctx was built) — the composite reads
+        // it for the non-deterministic film-grain phase only. ===
         ctx.GrainFrame = ssgiFrame;
         graph.Execute(ctx, (int)Dx12RenderPassEvent.Composite, int.MaxValue);
 
@@ -2149,25 +2148,10 @@ public sealed class DX12HDRenderer : HDRenderer {
         };
     }
 
-    // FSR temporal upscale: reconstruct the output-resolution HDR from the internal-res HDR color + depth +
-    // motion + jitter. Replaces TAA. Inputs are transitioned to a shader-read state and the output to UAV;
-    // the FFX DX12 backend restores imported resources to those declared states at dispatch end, so the
-    // engine's per-resource state trackers stay consistent.
-    unsafe void RunFsr() {
-        target.ColorToShaderResource();      // internal HDR scene -> PixelShaderResource
-        gbuffer.DepthToShaderResource();      // depth -> PixelShaderResource
-        // motion RT is already PixelShaderResource (gbuffer.ToShaderResource transitioned all colors).
-        fsrOutput.ColorToUnorderedAccess();
-        bool reset = !motionPrevValid;        // first frame after a (re)allocation = reset the history
-        dev.ExecuteSync(cl => {
-            fsr.Dispatch(cl, target.RenderTarget, gbuffer.DepthResource,
-                gbuffer.MotionResource, fsrOutput.RenderTarget,
-                targetW, targetH, new Dx12FsrUpscaler.Vector2Jitter(currentJitter.X, currentJitter.Y),
-                16.6667f, reset, PostFX.UpscaleSharpness > 0f, PostFX.UpscaleSharpness,
-                CameraNear, CameraFar, FovYRadians);
-        });
-        fsrOutput.ColorToShaderResource();    // ready for the composite to sample
-    }
+    // RunFsr moved VERBATIM into Resources/Dx12FsrPass.Record (chunk 7). The pass runs at the PostProcess event
+    // (FsrActive only — mutually exclusive with TaaPass); fsr/fsrOutput stay orchestrator-owned (the internal-
+    // vs-output resolution lifecycle — EnsureUpscaleTargets / native reset — is whole-frame management), passed
+    // through ctx.Fsr / ctx.FsrOutput. The pass sets ctx.SceneColor = fsrOutput.
 
     // Screen-space reflections (volume-driven): half-res view-space march reads the lit HDR color +
     // G-buffer (depth/normal/material) → ssrTarget; combine depth-aware-upsamples + lerps into the scene
