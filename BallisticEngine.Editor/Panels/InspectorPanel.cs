@@ -710,6 +710,12 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                     });
                 }
             }
+            // EF7: "Add Tag…" at the bottom opens the Tags & Layers project window (where tags are
+            // defined). New tags persist in TagManager and appear in this dropdown next frame. Routed
+            // through the EditorWindows facade so the inspector needs no reference to the window/app.
+            ImGui.Separator();
+            if (ImGui.Selectable($"{EditorIcons.Add} Add Tag..."))
+                EditorWindows.Open(EditorMenus.WindowKeys.TagsLayers);
             ImGui.EndCombo();
         }
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Tag");
@@ -728,6 +734,11 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                     });
                 }
             }
+            // EF7: "Add Layer…" opens the same Tags & Layers window (layers are named there); a newly
+            // named layer shows up in this dropdown next frame via LayerManager.DefinedLayers().
+            ImGui.Separator();
+            if (ImGui.Selectable($"{EditorIcons.Add} Add Layer..."))
+                EditorWindows.Open(EditorMenus.WindowKeys.TagsLayers);
             ImGui.EndCombo();
         }
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Layer");

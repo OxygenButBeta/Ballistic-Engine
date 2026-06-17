@@ -19,8 +19,39 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF7** (Tag/Layer "Add…" → open Tags & Layers panel)
-> Last committed chunk: **EF15** · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **EF8** (split Layer Collision Matrix into its own panel)
+> Last committed chunk: **EF7** · Branch: `dx12-renderer`
+>
+> **EF7 note (just landed):** the inspector Tag/Layer dropdowns now link to the Tags & Layers project
+> window. `DrawTagLayerRow` (`InspectorPanel.cs`) appends, at the BOTTOM of each combo (after the
+> existing option loop), an `ImGui.Separator()` + an `ImGui.Selectable($"{EditorIcons.Add} Add Tag...")`
+> / `"... Add Layer..."` item; selecting it calls `EditorWindows.Open(EditorMenus.WindowKeys.TagsLayers)`.
+> **Decoupling:** the inspector holds NO reference to `TagsLayersPanel` or `EditorApplication` — it routes
+> through the static `EditorWindows` facade (the same surface the `[MenuItem("Window/Tags & Layers")]`
+> method uses; `EditorApplication.OpenWindow` already maps that key → `tagsLayers.Open = true`). Used
+> `Open` (never closes) rather than `Toggle`, so "Add…" reliably brings the panel up even if it's already
+> open. New tags/layers defined there persist via the existing `TagManager`/`LayerManager` store
+> (`LayerSettings.Save`) and reappear in the dropdown next frame (`TagManager.Tags` /
+> `LayerManager.DefinedLayers()` re-read each frame). `EditorIcons.Add` is the already-baked lucide plus
+> (same glyph TagsLayersPanel's own "Add Tag" button uses) — no new font codepoint. Touched ONLY
+> `InspectorPanel.cs` (mine). Build 0-error (Editor csproj, clean `--no-incremental` scratch dir), oracle
+> EXIT=0 (19 suites; `Menu/Window registry (A1)` 17/17 confirms the window-key wiring). Non-GPU
+> logic/wiring chunk → human screenshot (open a dropdown → "Add Tag…/Add Layer…" at the bottom opens the
+> Tags & Layers window; a tag added there appears in the dropdown) batched into the inspector/editor set;
+> NOT relaunch-looped (GPU-hang rule).
+>
+> **For EF8 (next):** `TagsLayersPanel.Draw` (`Panels/TagsLayersPanel.cs:35`) calls `DrawCollisionMatrix`
+> inline in the same window. EF8 = move that matrix UI into its OWN dedicated window (e.g. "Layer Collision
+> Matrix"), registered like the other tool windows. Pattern to mirror: add a `WindowKeys.LayerCollision`
+> const + a `[MenuItem("Window/Layer Collision Matrix", N)]` in `EditorMenus.cs` → `EditorWindows.Toggle`;
+> a new panel class with a `public bool Open` (copy the `TagsLayersPanel.Draw` guard + `Begin/End`
+> shell); own it as a field on `EditorApplication` and add it to the `ToggleWindow`/`OpenWindow`/
+> `IsWindowOpen` switches (the three sites at `EditorApplication.cs:1438/1456/1469` show the exact pattern
+> for `TagsLayers`) AND to the two `tagsLayers.Draw(S)` call sites (`:755` fullscreen + `:830` normal) so
+> the new window draws in both layout modes. Both panels read the same `LayerManager` store (matrix edits
+> still `LayerSettings.Save` / persist). `TagsLayersPanel` keeps only Tags + Layers. Verify the
+> `Menu/Window registry (A1)` oracle suite still passes (it enumerates the `[MenuItem]`s) + build 0-error;
+> human screenshot batched. NOT relaunch-looped.
 >
 > **EF15 note (just landed):** inspector collections gained reorder/clear UI AND polymorphic `List<IFoo>`
 > serialize now round-trips. THREE parts. (1) **Serialize fix (RW8) — `SceneSerializer.cs`:**
@@ -429,7 +460,7 @@ this same handoff for the chunk after it.
 - [x] EF10a — per-component member search (conditional) — `DrawMemberList` precomputes `visibleMembers` (post-`[ShowIf]`) once → drives both the threshold and the filter; a conditional search box (>`InspectorLayout.MemberSearchThreshold`=12 members) drawn above the grid via the NEW reusable `EditorWidgets.SearchField`; query state per-component-instance in a `ConditionalWeakTable<object,StrBox>` (GC-safe). Filter matches the DISPLAYED label (`MemberLabel` = `[LabelText] ?? Prettify(Name)`); precomputed `groupsWithMatch`/`headersWithMatch` hide `[FoldoutGroup]`/`[Header]` sections with no match. Draw-loop body reordered so chrome is decoupled from the member's own match (group-skip → space/header on section visibility → member's own `MemberVisible` last). No query → byte-identical. Validated on `VehicleController` ("steer" → only the 6 steer fields + their headers). Build 0-error, oracle EXIT=0.
 - [x] EF10b — component-list search (conditional) — `DrawEntityInspector` draws a conditional search box above the first component header (after Transform), shown only when the entity has >`InspectorLayout.ComponentSearchThreshold`(=6) components, via the EF10a `EditorWidgets.SearchField`; query is a single inspector-owned `componentListSearch` field (one list per shown entity → no per-instance keying needed). The `foreach (Behaviour ...)` loop gained a `ComponentMatch(b)` gate filtering on the DISPLAYED title (`Prettify(b.GetType().Name)`, the same string `ComponentHeader` shows, OrdinalIgnoreCase). The per-type `typeIndex` counter increments BEFORE the skip so hiding a filtered component never shifts a visible sibling's Nth-of-type index (prefab-override + multi-select keying). Transform is outside `behaviours` → never filtered/counted. No query → byte-identical. Touched `InspectorPanel.cs` + `InspectorLayout.cs` (added `ComponentSearchThreshold=6`). Build 0-error, oracle EXIT=0.
 - [x] EF15 — collection reorder/clear + polymorphic list serialize + round-trip test — TWO halves landed. (1) **Serialize fix (RW8):** `SerializeMemberValue` now routes a `[SerializeReference]` collection whose element type is a polymorphic BASE (abstract/interface or concrete-base, via new `IsPolymorphicElementMember`/`SequenceElementType`/`IsLeafElementType`) through a new `SerializeSequencePolymorphic` that emits a per-element `$type` (the scalar `SerializeReferenceInstance` path, per element); non-polymorphic lists (`List<int>`/`List<Material>`) stay on `SerializeValue` → byte-identical. (2) **Deserialize gate relaxed:** `TryDeserializeReferenceInstance` now also fires for a recursed element (`member==null`) when the raw carries a `$type` tag AND `targetType` is a polymorphic base (new `IsPolymorphicBaseTarget`) — the symmetric inverse of the serialize side (the handoff's "deserialize already ready" was wrong: the old `member==null` branch returned false at the `Classify==Polymorphic` gate). (3) **Editor UI:** `DrawCollectionSlot` gained per-element reorder up/down (`CollectionMove`, adjacent swap, disabled at ends), insert-above (`CollectionInsertAt`), and a header **Clear** (`CollectionClear`) beside Add; Remove/Add already existed. New `EditorIcons.ChevronUp` (lucide `U+E074`, inside the baked range — verified via the TTF cmap, zero tofu). All structural edits are one-undo `EditorCommands.Structural`, deferred past the row loop. (4) **Oracle = new suite #19** `Polymorphic collections (RW8/EF15)` (20 checks): interface `List<IDamageModifier>` + abstract `Shape[]` with ≥2 concrete types each + a nested polymorphic element; asserts (a) all concrete types + values + ORDER round-trip, (b) byte-stable across two serializations + a serialize/deserialize/serialize fixed point, (c) a non-polymorphic `List<int>` alongside is byte-identical (exactly 6 `$type` tags, zero from the plain list). Build 0-error (engine ROOT csproj + Editor, clean scratch dirs), oracle EXIT=0 (19 suites). Serialize half is CPU/headless/safe; the reorder UI is the only part needing a human screenshot → batch into the Inspector-layout set (GPU-hang rule: no relaunch-loop).
-- [ ] EF7 — Tag/Layer "Add…" → open Tags & Layers panel
+- [x] EF7 — Tag/Layer "Add…" → open Tags & Layers panel — `DrawTagLayerRow` appends a `Separator` + `Selectable("Add Tag.../Add Layer...")` at the bottom of each combo; selecting it calls `EditorWindows.Open(EditorMenus.WindowKeys.TagsLayers)` (static facade, no reference to the window/app — same surface the Window menu uses). `Open` not `Toggle` so "Add…" always surfaces the panel. New tags/layers persist via TagManager/LayerManager (`LayerSettings.Save`) + reappear next frame. `EditorIcons.Add` = already-baked lucide plus (no new codepoint). Touched only `InspectorPanel.cs`. Build 0-error, oracle EXIT=0 (19 suites, A1 17/17). Human screenshot batched.
 - [ ] EF8 — split Layer Collision Matrix into its own panel
 - [ ] EF13+EF14 — hierarchy collapse/expand + collapsed-by-default
 - [ ] EF1 — gizmo-mode button auto-width
