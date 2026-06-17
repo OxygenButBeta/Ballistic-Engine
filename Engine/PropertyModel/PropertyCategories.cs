@@ -43,6 +43,13 @@ public static class PropertyCategories {
         if (typeof(BObject).IsAssignableFrom(declaredType))
             return IsSceneObjectType(declaredType) ? PropertyCategory.SceneObjectRef : PropertyCategory.AssetRef;
 
+        // EntityRef/ComponentRef are the SERIALIZABLE value-type form of a scene-object reference
+        // (InstanceId-backed, resolved lazily). They are NOT BObjects, so they fall through the split
+        // above; classify them as SceneObjectRef too so the editor gives them the scene-object picker
+        // and the serializer/drawer agree on a leaf (the traversal does not recurse into the struct).
+        if (declaredType == typeof(EntityRef) || declaredType == typeof(ComponentRef))
+            return PropertyCategory.SceneObjectRef;
+
         if (IsCollection(declaredType))
             return PropertyCategory.Collection;
 

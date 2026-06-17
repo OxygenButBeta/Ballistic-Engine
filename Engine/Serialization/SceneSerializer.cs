@@ -144,7 +144,7 @@ public static class SceneSerializer {
             object serialized = SerializeValue(value);
             if (serialized is not null)
                 doc.Members[CamelCase(member.Name)] = serialized;
-            else if (value is not null)
+            else if (value is not null && !IsNoneSceneObjectRef(value))
                 // G0 (loud drops): the member HELD a value but serialized to null, so it silently
                 // vanishes on save/load. Make the data loss visible instead of dropping it quietly
                 // (the §3.45 silent-failure trap). Deduped per (type, member) so the per-frame undo
@@ -193,6 +193,17 @@ public static class SceneSerializer {
         // ColorGradient — same compact-string scalar approach as AnimationCurve.
         if (value is ColorGradient gradient)
             return gradient.ToCompactString();
+
+        // Scene-object references (EntityRef/ComponentRef) round-trip as the target InstanceId hex,
+        // NOT a guid: a scene object has no AssetDatabase guid (it is built at scene load), so it is
+        // identified by InstanceId the way BEvent stores its persistent-listener targets. Guid.Empty
+        // means "None" and serializes to null (skipped, like an unset asset ref). MUST come BEFORE the
+        // BObject case below; an EntityRef/ComponentRef is a value type so it never reaches that case,
+        // but the loud-drop path keys off SerializeValue returning null for a SET ref, so be explicit.
+        if (value is EntityRef entityRef)
+            return entityRef.InstanceId == Guid.Empty ? null : entityRef.InstanceId.ToString("N");
+        if (value is ComponentRef componentRef)
+            return componentRef.InstanceId == Guid.Empty ? null : componentRef.InstanceId.ToString("N");
 
         if (value is BObject asset) {
             return AssetDatabase.TryGetAssetGuid(asset, out Guid guid)
@@ -375,6 +386,15 @@ public static class SceneSerializer {
         if (raw is null)
             return null;
 
+        // Scene-object references parse the stored InstanceId hex back into the value-type ref.
+        // Resolution to the live object is LAZY (EntityRef.Value), so this never depends on entity
+        // creation order: a forward ref to an entity not yet built deserializes fine and binds on
+        // first access. A non-string / unparsable value yields None (Guid.Empty), like a missing ref.
+        if (targetType == typeof(EntityRef))
+            return new EntityRef(ParseInstanceId(raw));
+        if (targetType == typeof(ComponentRef))
+            return new ComponentRef(ParseInstanceId(raw));
+
         if (typeof(BObject).IsAssignableFrom(targetType))
             return raw is string reference ? LoadAsset(reference, targetType) : null;
 
@@ -413,6 +433,18 @@ public static class SceneSerializer {
             .MakeGenericMethod(targetType);
         return loadRef.Invoke(null, [reference]);
     }
+
+    // True when the value is an unset (None) scene-object ref. SerializeValue returns null for these,
+    // but a None ref is a legitimate "no target" value, NOT a dropped member, so the G0 loud-drop must
+    // skip it (only a SET ref that fails to serialize would be a real loss, and EntityRef/ComponentRef
+    // always serialize when set). Boxed value types, so a type check is enough.
+    static bool IsNoneSceneObjectRef(object value) =>
+        value is EntityRef { HasValue: false } or ComponentRef { HasValue: false };
+
+    // Parse a stored InstanceId hex ("N" form, 32 chars) back to a Guid; Guid.Empty (= None) for a
+    // non-string or unparsable value, so a corrupt/missing ref deserializes to "no target" not a throw.
+    static Guid ParseInstanceId(object raw) =>
+        raw is string s && Guid.TryParseExact(s, "N", out Guid id) ? id : Guid.Empty;
 
     static object Coerce(object raw, Type targetType) {
         try {

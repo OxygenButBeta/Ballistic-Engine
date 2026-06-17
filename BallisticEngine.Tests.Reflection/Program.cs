@@ -15,6 +15,7 @@ exit += InputActionChainTests.Run();
 exit += DrawerStackTests.Run();
 exit += ComponentPreviewTests.Run();
 exit += AssetInspectorTests.Run();
+exit += EntityRefTests.Run();        // G1 — inserts a scene (no public unload); runs before G0's own
 exit += SerializerDropTests.Run();   // G0 — runs LAST (inserts a scene with no public unload)
 return exit;
 
