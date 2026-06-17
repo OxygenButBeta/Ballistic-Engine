@@ -348,8 +348,8 @@ internal sealed class ImGuiController : IDisposable {
         c[(int)ImGuiCol.Button] = bg2;
         c[(int)ImGuiCol.ButtonHovered] = Mix(bg3, accent, 0.22f);
         c[(int)ImGuiCol.ButtonActive] = accentDim;
-        c[(int)ImGuiCol.Header] = header;               // selected tree row / collapsing header
-        c[(int)ImGuiCol.HeaderHovered] = headerHi;
+        c[(int)ImGuiCol.Header] = Mix(header, accent, 0.18f);   // selected tree row / collapsing header — azure-tinted
+        c[(int)ImGuiCol.HeaderHovered] = Mix(headerHi, accent, 0.10f);
         c[(int)ImGuiCol.HeaderActive] = accentRow;
         c[(int)ImGuiCol.Separator] = WithAlpha(Rgb(0xFFFFFF), 0.08f);   // light hairline reads on near-black
         c[(int)ImGuiCol.SeparatorHovered] = accent;
@@ -357,11 +357,11 @@ internal sealed class ImGuiController : IDisposable {
         c[(int)ImGuiCol.ResizeGrip] = new SysVec4(0, 0, 0, 0);
         c[(int)ImGuiCol.ResizeGripHovered] = accentFaint;
         c[(int)ImGuiCol.ResizeGripActive] = accent;
-        // Tabs (UE5 signature): selected tab sits on the header surface with a FAT bright-azure overline;
-        // unselected tabs recede into near-black so the active document reads instantly.
-        c[(int)ImGuiCol.Tab] = Rgb(0x101318);
+        // Tabs (UE5 signature): selected tab sits on the header surface with a FAT bright-azure overline +
+        // a faint accent tint so the active document reads instantly; unselected tabs recede into near-black.
+        c[(int)ImGuiCol.Tab] = Rgb(0x0E1119);
         c[(int)ImGuiCol.TabHovered] = headerHi;
-        c[(int)ImGuiCol.TabSelected] = header;
+        c[(int)ImGuiCol.TabSelected] = Mix(header, accent, 0.12f);   // selected tab carries a faint azure wash
         c[(int)ImGuiCol.TabSelectedOverline] = accentHi;
         c[(int)ImGuiCol.TabDimmed] = Rgb(0x0C0E12);
         c[(int)ImGuiCol.TabDimmedSelected] = bg2;

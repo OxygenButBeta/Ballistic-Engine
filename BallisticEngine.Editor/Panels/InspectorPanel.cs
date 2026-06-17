@@ -2446,6 +2446,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             return false;
         ImGui.TableSetupColumn("label", ImGuiTableColumnFlags.WidthStretch, 0.38f);
         ImGui.TableSetupColumn("value", ImGuiTableColumnFlags.WidthStretch, 0.62f);
+        ResetRowZebra();   // EF5e: each grid stripes from row 0 so zebra is stable + per-component
         return true;
     }
 
@@ -2498,6 +2499,12 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // rows had none). PERFORMANCE (plan §4): hover-gated — the fill is one TableSetBgColor + the sliver is
     // one AddRectFilled, ONLY when hovered; no per-row gradient/shadow, no allocation. Must be called right
     // after TableNextRow(), BEFORE TableSetColumnIndex(0), so the row's screen rect is the fresh row.
+    // EF5e: per-grid zebra row counter — alternate member rows get a faint wash so the Details panel reads
+    // as a structured grid (the UE5/Unity "Details" signature) instead of a flat wall of text. Reset at the
+    // start of each member grid (BeginGrid) so striping is stable frame-to-frame.
+    static int rowZebraIndex;
+    internal static void ResetRowZebra() => rowZebraIndex = 0;
+
     static void RowChrome() {
         // The row's vertical band: cursor Y at row start .. + a frame height (the row's content height).
         SysVec2 rowStart = ImGui.GetCursorScreenPos();
@@ -2506,6 +2513,13 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         // columns regardless of the table's internal split.
         float x0 = ImGui.GetWindowPos().X;
         float x1 = x0 + ImGui.GetWindowSize().X;
+
+        // Zebra: every other row gets a faint white wash (alternating bands). Cheap — one TableSetBgColor.
+        bool oddRow = (rowZebraIndex++ & 1) == 1;
+        if (oddRow)
+            ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0,
+                ImGui.GetColorU32(new SysVec4(1f, 1f, 1f, 0.022f)));
+
         bool hovered = ImGui.IsWindowHovered(ImGuiHoveredFlags.ChildWindows) &&
                        ImGui.IsMouseHoveringRect(new SysVec2(x0, rowStart.Y),
                                                  new SysVec2(x1, rowStart.Y + rowH), clip: false);
