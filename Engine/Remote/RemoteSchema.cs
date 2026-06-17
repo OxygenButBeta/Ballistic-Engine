@@ -36,9 +36,12 @@ public static class RemoteSchema {
     static Param Req(string name, Kind kind = Kind.String) => new(name, kind, true);
     static Param Opt(string name, Kind kind = Kind.String) => new(name, kind, false);
 
-    // The method table -- mirrors RemoteHandlers.Dispatch exactly (every case there has a row here). Order
-    // is the help-listing order. Keeping these in lockstep is the single maintenance rule: a new remote
-    // method adds one row; a new required param adds one Req(...). Validate() refuses any method NOT here.
+    // The method table -- the SINGLE source of truth for the remote method surface. RemoteHandlers builds a
+    // method->handler delegate map keyed by these names and asserts (CoverageError, at install) it covers
+    // this table EXACTLY, so the dispatch surface can't drift from the schema. Order is the help-listing
+    // order. The single maintenance rule: a new remote method adds one row here + one handler row there (the
+    // coverage assert fails fast if you forget either); a new required param adds one Req(...). Validate()
+    // refuses any method NOT here.
     public static readonly IReadOnlyList<MethodSchema> Methods = new[] {
         new MethodSchema("editor.status",       Array.Empty<Param>()),
         new MethodSchema("scene.describe",       Array.Empty<Param>()),
@@ -94,6 +97,25 @@ public static class RemoteSchema {
 
     // Every method's signature, in table (help-listing) order -- the canonical method catalog.
     public static string[] Signatures => Methods.Select(Signature).ToArray();
+
+    // D1 FULL (editor-rework Phase D, "command registry"): the dispatch coverage invariant. The editor's
+    // RemoteHandlers builds a method->handler delegate MAP keyed by the same `registered` names; this asserts
+    // that map covers EXACTLY this schema -- every schema method has a handler (no missing, would 404 at
+    // runtime) and every handler is a schema method (no extra, would bypass Validate()/help). It REPLACES the
+    // old hand-kept "switch case set == table" lockstep with a single source the editor enforces at install
+    // time (fail-fast on drift) and the headless harness tests directly with synthetic sets. Returns null when
+    // the sets match, else ONE clean error string naming the first missing then the first extra method.
+    public static string CoverageError(IEnumerable<string> registered) {
+        var have = new HashSet<string>(registered ?? Enumerable.Empty<string>(), StringComparer.Ordinal);
+        var want = new HashSet<string>(Methods.Select(m => m.Method), StringComparer.Ordinal);
+        var missing = want.Except(have).OrderBy(s => s, StringComparer.Ordinal).ToList();
+        var extra = have.Except(want).OrderBy(s => s, StringComparer.Ordinal).ToList();
+        if (missing.Count == 0 && extra.Count == 0)
+            return null;
+        return "remote dispatch table drifted from RemoteSchema -- "
+            + $"schema methods with NO handler: [{string.Join(", ", missing)}]; "
+            + $"handlers with NO schema row: [{string.Join(", ", extra)}]";
+    }
 
     // The boundary guard. Returns null when the request is well-formed, else a single clean error string
     // describing the FIRST problem (unknown method, then required params in declaration order). The caller

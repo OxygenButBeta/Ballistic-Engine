@@ -31,7 +31,50 @@ internal static class RemoteHandlers {
                     logTail.RemoveRange(0, 100);
             }
         };
+        // D1 FULL: assert the dispatch table covers EXACTLY the engine-side RemoteSchema -- fail-fast on
+        // drift at install (a schema method with no handler would 404 at runtime; a handler with no schema
+        // row would bypass Validate()/help). This REPLACES the old hand-kept "switch == table" lockstep
+        // with a machine-enforced single source of truth, checked once when the command port starts.
+        if (RemoteSchema.CoverageError(handlers.Keys) is { } drift)
+            throw new InvalidOperationException(drift);
     }
+
+    // D1 FULL (editor-rework Phase D, "command registry"): the dispatch surface is now a TABLE, not a
+    // 26-case string-switch hand-kept in lockstep with RemoteSchema + help. One method = ONE row here,
+    // keyed by the SAME name RemoteSchema declares; Install() asserts the keys match the schema exactly,
+    // so drift is a startup error instead of a silent 404 / un-validated handler. Each handler is a
+    // uniform Func<JsonElement,object> that reads what it needs from `p` (the request's "params"); the
+    // few that take a single required string just call RequireString(p, "...") inside the lambda (still a
+    // defensive inner guard, though RemoteSchema.Validate already screened it at the boundary).
+    static readonly IReadOnlyDictionary<string, Func<JsonElement, object>> handlers =
+        new Dictionary<string, Func<JsonElement, object>>(StringComparer.Ordinal) {
+            ["editor.status"]       = _ => Status(),
+            ["scene.describe"]      = _ => Describe(),
+            ["scene.save"]          = _ => SceneSave(),
+            ["scene.open"]          = p => SceneOpen(RequireString(p, "path")),
+            ["entity.get"]          = p => EntityJson(Resolve(RequireString(p, "entity"))),
+            ["entity.create"]       = p => EntityCreate(p),
+            ["entity.delete"]       = p => EntityDelete(RequireString(p, "entity")),
+            ["component.add"]       = p => ComponentAdd(p),
+            ["component.remove"]    = p => ComponentRemove(p),
+            ["component.set"]       = p => ComponentSet(p),
+            ["select"]              = p => Select(RequireString(p, "entity")),
+            ["play.start"]          = _ => PlayStart(),
+            ["play.stop"]           = _ => Run(() => SceneManager.StopPlay()),
+            ["play.pause"]          = p => PlayPause(p),
+            ["play.step"]           = _ => PlayStep(),
+            ["undo"]                = _ => Run(EditorUndo.Undo),
+            ["redo"]                = _ => Run(EditorUndo.Redo),
+            ["screenshot"]          = p => Screenshot(p),
+            ["console.tail"]        = p => ConsoleTail(p),
+            ["scripts.rebuild"]     = _ => new { ok = bootstrap.ReloadGameScripts() },
+            ["unity.import"]        = p => UnityImport(p),
+            ["editor.frame"]        = p => EditorFrame(p),
+            ["editor.refresh"]      = _ => EditorRefresh(),
+            ["scene.component.add"] = p => SceneComponentAdd(p),
+            ["scene.component.set"] = p => SceneComponentSet(p),
+            ["help"]                = _ => Help(),
+        };
 
     public static object Dispatch(string method, JsonElement p) {
         // D2 boundary guard: reject a malformed request (unknown method / missing or wrong-typed required
@@ -40,40 +83,13 @@ internal static class RemoteHandlers {
         // source of truth (RemoteSchema), shared with the MCP boundary and the headless harness.
         if (RemoteSchema.Validate(method, p) is { } error)
             throw new Exception(error);
-        return DispatchValidated(method, p);
+        // D1 FULL: table lookup. Validate() already proved the method is a schema method, and Install()
+        // proved every schema method has a handler, so the lookup cannot miss in practice; the backstop
+        // message is generated from the schema so it can't go stale if those invariants are ever bypassed.
+        if (!handlers.TryGetValue(method, out Func<JsonElement, object> handler))
+            throw new Exception($"unknown method '{method}' -- methods: {string.Join(", ", RemoteSchema.Methods.Select(s => s.Method))}");
+        return handler(p);
     }
-
-    static object DispatchValidated(string method, JsonElement p) => method switch {
-        "editor.status" => Status(),
-        "scene.describe" => Describe(),
-        "scene.save" => SceneSave(),
-        "scene.open" => SceneOpen(RequireString(p, "path")),
-        "entity.get" => EntityJson(Resolve(RequireString(p, "entity"))),
-        "entity.create" => EntityCreate(p),
-        "entity.delete" => EntityDelete(RequireString(p, "entity")),
-        "component.add" => ComponentAdd(p),
-        "component.remove" => ComponentRemove(p),
-        "component.set" => ComponentSet(p),
-        "select" => Select(RequireString(p, "entity")),
-        "play.start" => PlayStart(),
-        "play.stop" => Run(() => SceneManager.StopPlay()),
-        "play.pause" => PlayPause(p),
-        "play.step" => PlayStep(),
-        "undo" => Run(EditorUndo.Undo),
-        "redo" => Run(EditorUndo.Redo),
-        "screenshot" => Screenshot(p),
-        "console.tail" => ConsoleTail(p),
-        "scripts.rebuild" => new { ok = bootstrap.ReloadGameScripts() },
-        "unity.import" => UnityImport(p),
-        "editor.frame" => EditorFrame(p),
-        "editor.refresh" => EditorRefresh(),
-        "scene.component.add" => SceneComponentAdd(p),
-        "scene.component.set" => SceneComponentSet(p),
-        "help" => Help(),
-        // Defensive backstop -- D2 RemoteSchema.Validate already rejects unknown methods before DispatchValidated
-        // runs, so this is unreachable in practice; its message is generated from the schema so it can't go stale.
-        _ => throw new Exception($"unknown method '{method}' -- methods: {string.Join(", ", RemoteSchema.Methods.Select(s => s.Method))}"),
-    };
 
     // ---- queries -------------------------------------------------------------
 

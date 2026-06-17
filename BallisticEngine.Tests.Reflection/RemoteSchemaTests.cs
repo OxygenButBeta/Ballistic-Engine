@@ -83,8 +83,9 @@ internal static class RemoteSchemaTests {
 
         // -- (5) Table <-> Dispatch parity: the schema mirrors the real method surface ----------------
         // Every method the schema declares must be a known method (no typos / drift), and the set must be
-        // exactly the methods RemoteHandlers.Dispatch handles. This guards the single maintenance rule
-        // (add a method -> add a row). The expected set is the literal Dispatch case labels.
+        // exactly the methods RemoteHandlers dispatches (now a delegate table keyed by these names, asserted
+        // at install via CoverageError -- see section (7)). This guards the single maintenance rule (add a
+        // method -> add a row). The expected set is the literal dispatch-table keys.
         var expected = new HashSet<string>(StringComparer.Ordinal) {
             "editor.status", "scene.describe", "scene.save", "scene.open",
             "entity.get", "entity.create", "entity.delete",
@@ -141,6 +142,34 @@ internal static class RemoteSchemaTests {
             RemoteSchema.Methods.All(m => RemoteSchema.Signature(m).StartsWith(m.Method, StringComparison.Ordinal)));
         h.Check("the Signatures order matches the table (help-listing order preserved)",
             RemoteSchema.Signatures.SequenceEqual(RemoteSchema.Methods.Select(RemoteSchema.Signature)));
+
+        // -- (7) D1 FULL: the dispatch coverage invariant (table-driven dispatch) -----------------------
+        // RemoteHandlers replaced its 26-case string-switch with a method->handler delegate MAP keyed by the
+        // schema names, and asserts at install (RemoteSchema.CoverageError over the map keys) that the map
+        // covers this table EXACTLY. The editor wiring is tested by inspection; this suite proves the
+        // engine-side CoverageError LOGIC the editor relies on -- the same kind of single-source guard the
+        // D2 Validate() / D1 Signatures sections cover.
+        var allMethods = RemoteSchema.Methods.Select(m => m.Method).ToArray();
+        h.Check("CoverageError(the exact schema set) is null -- the real dispatch table covers the schema",
+            RemoteSchema.CoverageError(allMethods) is null);
+        h.Check("CoverageError tolerates the schema set in any order (set comparison, not sequence)",
+            RemoteSchema.CoverageError(allMethods.Reverse()) is null);
+        h.Check("CoverageError reports a schema method with NO handler (missing)",
+            RemoteSchema.CoverageError(allMethods.Where(m => m != "entity.create")) is { } cm
+                && cm.Contains("NO handler") && cm.Contains("entity.create"));
+        h.Check("CoverageError reports a handler with NO schema row (extra)",
+            RemoteSchema.CoverageError(allMethods.Append("entity.teleport")) is { } cx
+                && cx.Contains("NO schema row") && cx.Contains("entity.teleport"));
+        h.Check("CoverageError reports BOTH a missing and an extra at once",
+            RemoteSchema.CoverageError(allMethods.Where(m => m != "help").Append("bogus.cmd")) is { } cb
+                && cb.Contains("help") && cb.Contains("bogus.cmd"));
+        h.Check("CoverageError on an empty registration lists EVERY schema method as missing",
+            RemoteSchema.CoverageError(Array.Empty<string>()) is { } ce
+                && allMethods.All(m => ce.Contains(m)));
+        h.Check("CoverageError ignores a duplicate registration (set semantics, still covered)",
+            RemoteSchema.CoverageError(allMethods.Concat(allMethods)) is null);
+        h.Check("CoverageError(null) lists every schema method as missing (no NRE)",
+            RemoteSchema.CoverageError(null!) is { } cn && allMethods.All(m => cn.Contains(m)));
 
         return h.Report("RemoteSchema (D2)");
     }
