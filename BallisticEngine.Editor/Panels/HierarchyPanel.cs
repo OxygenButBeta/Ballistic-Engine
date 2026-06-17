@@ -296,8 +296,8 @@ internal sealed class HierarchyPanel {
         bool tinted = !entity.IsActive || entity.IsPrefabInstance || isChild;
         if (tinted) {
             SysVec4 col = !entity.IsActive ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
-                : entity.IsPrefabInstance ? new SysVec4(0.45f, 0.66f, 1f, 1f)
-                : new SysVec4(0.72f, 0.74f, 0.78f, 1f);   // child: dimmer than a root's white
+                : entity.IsPrefabInstance ? EditorTheme.PrefabBlue   // Unity's prefab-instance tint
+                : EditorTheme.RowChild;   // child: dimmer than a root's white
             ImGui.PushStyleColor(ImGuiCol.Text, col);
         }
 
@@ -349,7 +349,7 @@ internal sealed class HierarchyPanel {
             ImGui.SetCursorPosX(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - eyeW);
             ImGui.PushStyleColor(ImGuiCol.Text, entity.IsActive
                 ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
-                : new SysVec4(0.45f, 0.47f, 0.52f, 0.6f));
+                : EditorTheme.IconMuted);
             if (EditorIcons.GhostButtonSmall($"eye{id}", EditorIcons.Eye,
                     entity.IsActive ? "Hide (deactivate)" : "Show (activate)")) {
                 bool newActive = !entity.IsActive;
@@ -374,7 +374,7 @@ internal sealed class HierarchyPanel {
             // plus a short horizontal "elbow" into each child row. Drawn after the children so we know
             // their row Ys; the vertical stops at the LAST child's elbow (Unity convention).
             ImDrawListPtr dl = ImGui.GetWindowDrawList();
-            uint lineCol = ImGui.GetColorU32(new SysVec4(1f, 1f, 1f, 0.16f));
+            uint lineCol = ImGui.GetColorU32(EditorTheme.TreeGuide);
             float gutterX = rowMin.X + ImGui.GetTreeNodeToLabelSpacing() * 0.5f;
             float elbowW = ImGui.GetTreeNodeToLabelSpacing() * 0.42f;
             float halfRow = ImGui.GetFrameHeight() * 0.5f;

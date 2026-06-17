@@ -77,6 +77,46 @@ internal static class EditorTheme {
     public const float OverlayRounding = 7f;   // pill corner radius (px, pre-scale)
     public const float OverlayMargin   = 10f;  // gap from the viewport edges (px, pre-scale)
 
+    // --- SEMANTIC tokens (EF5b) -----------------------------------------------------------------------
+    // The single source for the meaning-carrying colors panels used to hand-type inline (the "bypass
+    // offenders" that gave the UI its raw feel). Each is named by ROLE, not by hue, so a panel reads
+    // `EditorTheme.Error` not `new SysVec4(1f, 0.5f, 0.4f, 1f)`. Tuned to the deep-graphite UE5 identity
+    // (EF5a): saturated enough to read as status against the dark ramp, never neon. Re-tune here once.
+    public static readonly SysVec4 Error     = Rgb(0xFF8066);   // invalid input / error text (amber-red)
+    public static readonly SysVec4 Warning   = Rgb(0xFFB840);   // disabled-override / caution text (amber)
+    public static readonly SysVec4 Success   = Rgb(0x80D980);   // build-succeeded / OK summary (green)
+    public static readonly SysVec4 PrefabBlue = Rgb(0x73A8FF);  // prefab-instance accent (Unity's prefab blue)
+    public static readonly SysVec4 RowChild  = Rgb(0xB8BDC7);   // hierarchy child label — dimmer than a root's white
+    public static readonly SysVec4 IconMuted = new(0.45f, 0.47f, 0.52f, 0.6f);  // inactive ghost-icon (eye toggle)
+
+    // Primary-action button (the green "Create" affordance) as a base color — call sites push the three
+    // hover/active variants off it (Btn/BtnHovered/BtnActive) so the whole button stays in one family.
+    public static readonly SysVec4 PrimaryAction        = Rgb(0x33A352);   // resting
+    public static readonly SysVec4 PrimaryActionHovered = Rgb(0x44C268);
+    public static readonly SysVec4 PrimaryActionActive  = Rgb(0x2A8C44);
+
+    // Folder gold — the asset browser's signature folder tint (icon + tree). The full/active variant and
+    // the dim/empty variant (lower alpha) used to be two hand-typed literals; derive the dim from this.
+    public static readonly SysVec4 FolderTint = Rgb(0xEBC25C);             // full / current / ancestor folder
+    public static SysVec4 FolderTintDim => new(0xDB / 255f, 0xB3 / 255f, 0x57 / 255f, 0.75f);  // empty / inactive
+
+    // Log severity ramp (Console). Index by level 0/1/2 — info recedes, warning amber, error red.
+    public static readonly SysVec4[] LogLevel = [
+        Rgb(0x8C949F),   // info — quiet
+        Rgb(0xF2CC4D),   // warning
+        Rgb(0xF26152),   // error
+    ];
+
+    // Faint hairline for the in-panel surfaces: tree-connector guides, overlay borders. White at low
+    // alpha so it reads on any surface in the ramp (a fixed grey would vanish on Bg0 and glare on Bg3).
+    public static readonly SysVec4 Hairline = new(1f, 1f, 1f, 0.07f);   // overlay / panel border hairline
+    public static readonly SysVec4 TreeGuide = new(1f, 1f, 1f, 0.16f);  // hierarchy tree-connector line
+
+    // Modal-prompt surfaces (the asset-browser "New …" dialogs). Slightly raised popup over a recessed
+    // input frame, pulled off the ramp so the prompts match the panels instead of re-typing hex.
+    public static readonly SysVec4 PopupBg = Rgb(0x1F2127);   // modal/popup background (~Bg1, a touch lighter)
+    public static readonly SysVec4 InputBg = Rgb(0x121419);   // recessed input frame inside a prompt
+
     // Convenience: PushFont(Header) for the duration of a using-less call site is awkward, so callers do
     // ImGui.PushFont(EditorTheme.Header); ...; ImGui.PopFont() directly. No wrapper needed.
 

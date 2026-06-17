@@ -19,12 +19,35 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF5b** (Theme: centralize bypass-color offenders)
-> Last committed chunk: **EF5a** · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **EF5c** (Theme: panel chrome polish)
+> Last committed chunk: **EF5b** · Branch: `dx12-renderer`
 >
 > **EF5 identity decision RESOLVED → (i) faithful UE5** (cool graphite + blue-grey shell + a single
 > restrained azure highlight, NO warm accent). The azure accent `0x3D8BD4` (EditorPrefs default) is KEPT;
-> the acceptance bar for the whole EF5 series is "looks like UE5". EF5b–d implement against this identity.
+> the acceptance bar for the whole EF5 series is "looks like UE5". EF5c–d implement against this identity.
+>
+> **EF5b note (just landed):** the panel "bypass offenders" (hand-typed `SysVec4` color literals that gave
+> the UI its raw feel) are now routed through `EditorTheme`. Added a **SEMANTIC tokens** block to
+> `EditorTheme.cs` (named by ROLE, not hue): `Error`/`Warning`/`Success`, `PrefabBlue`/`RowChild`/`IconMuted`,
+> `PrimaryAction`(+Hovered/Active), `FolderTint`/`FolderTintDim`, the `LogLevel[]` info/warn/error ramp,
+> `Hairline`/`TreeGuide`, and `PopupBg`/`InputBg` (modal-prompt surfaces, ramp-derived). Routed: `ConsolePanel`
+> (`LevelColors[]`→`EditorTheme.LogLevel`), `HierarchyPanel` (prefab-blue/child-dim/eye-off/tree-guide),
+> `AssetBrowserPanel` (prompt titles→`Text`, invalid-name→`Error`, popup/input bg, green Create→`PrimaryAction`,
+> favourite + folder-tree gold→`FolderTint`/`FolderTintDim`), `StatsPanel` (border→`Hairline`), `BuildPanel`
+> (success/fail summary→`Success`/`Error`), `VolumeProfileEditor` (disabled-override warn→`Warning`). **Tokens
+> chosen so this is NOT byte-identical** (it deliberately retunes a handful of slightly-off literals to one
+> coherent family — e.g. console warn `0.95,0.80,0.30`→`0xF2CC4D`, child-dim `0.72,0.74,0.78`→`0xB8BDC7`); the
+> diff is *visual harmonization*, behaviour unchanged. What stays as JUSTIFIED literals (per the DoD grep):
+> alpha-only overlays (`(0,0,0,0)`, `(1,1,1,0.0x)` ghost-button hovers, white-alpha watermark icons),
+> alpha/scale DERIVATIONS of an already-token color (`(tint.X,tint.Y,tint.Z,α)`, `(color.X*0.6,…)`,
+> `(accent.X,…,α)`), the no-icon-font FALLBACK folder glyph (degraded mode), and the **`Style(ext)` file-type
+> color TAXONOMY** (a self-contained data table keyed by extension — annotated in-file as deliberate, not
+> chrome). `PrefabBlue` is also used by InspectorPanel:711/811 — but those Inspector usages are OUT of EF5b
+> scope (inspector cluster / EF5c–d); the token now exists for them to adopt later. Touched only the six
+> panel files + `EditorTheme.cs` (all fully mine); `EditorApplication.cs`/`EditorMenus.cs` NOT touched.
+> Editor csproj builds 0-error (clean `--no-incremental` to a scratch dir, around a running-editor bin-copy
+> lock); reflection oracle EXIT=0 (all suites green). NOT visually verified yet — batched into the EF5a–d
+> human-screenshot checkpoint (GPU-hang rule: no relaunch-loop).
 >
 > **EF5a note (just landed):** palette + geometry reworked to a deeper-graphite UE5 identity — pure style,
 > behaviour byte-unchanged. (1) Geometry (`ImGuiController.ApplyGeometry`): rounding pulled into UE5's small
@@ -143,7 +166,7 @@ this same handoff for the chunk after it.
 - [x] EF9c — layout persist + PassthruCentralNode review — `Shown` open/closed state now round-trips via a `.panels` sidecar (`EditorLayout.Save/LoadPanelState` + `EditorPanelRegistry.HiddenKeys/ApplyHidden`); PassthruCentralNode dropped (central node always filled, removed the maximize/modal-capture hazard)
 - [x] EF9d — Window-menu open-state sync — checkmark already queried `panels.IsShown` each frame (EF9c made that the same persisted flag); the bind-gap was that a menu-reopened CORE panel flipped `Shown` but never surfaced (only the two viewports consumed `pendingFocusWindow`). Fix: `DrawDockPanel` now `SetNextWindowFocus()` when its panel == `pendingFocusWindow`, so re-open surfaces it — same Unity focus-on-open the viewports get. No state-vs-disk disagreement possible (EF9c gift).
 - [x] EF5a — palette + geometry — identity = (i) faithful UE5 (cool graphite + azure, no warm accent). Reworked `ImGuiController.ApplyGeometry` (rounding into UE5's 4-5px band) + `ApplyColors` (deeper-graphite bg0..titleBg ramp, brighter `textDim` for ≥4.5:1 on inputs) + mirrored the `EditorTheme` Bg0..TitleBg ramp / OverlayBg / RowLabel-RowCaption. Pure style, behaviour byte-unchanged; WCAG contrasts verified (body 12-16:1, accent 4.94:1). Only `ImGuiController.cs`+`EditorTheme.cs` touched. Visual verify batched into the EF5a–d checkpoint.
-- [ ] EF5b — centralize bypass-color offenders
+- [x] EF5b — centralize bypass-color offenders — added a SEMANTIC tokens block to `EditorTheme.cs` (Error/Warning/Success, PrefabBlue/RowChild/IconMuted, PrimaryAction±, FolderTint/Dim, LogLevel[], Hairline/TreeGuide, PopupBg/InputBg) and routed the hand-typed `SysVec4` literals in ConsolePanel/HierarchyPanel/AssetBrowserPanel/StatsPanel/BuildPanel/VolumeProfileEditor through them. Deliberately harmonizes a few slightly-off literals into one family (NOT byte-identical — visual only, behaviour unchanged). Remaining literals in those files are justified (alpha-only overlays, alpha/scale derivations of a token, the no-icon fallback glyph, the `Style(ext)` file-type taxonomy data table — annotated in-file). Only the 6 panels + `EditorTheme.cs` touched. Build 0-error, oracle EXIT=0. Visual verify batched into the EF5a–d checkpoint.
 - [ ] EF5c — panel chrome polish
 - [ ] EF5d — type/spacing tokens everywhere
 - [ ] EF12 — rename Inspector → "Details"
@@ -383,9 +406,20 @@ the acceptance bar for the whole EF5 series is "looks like UE5". EF5a–d all bu
   `#ECEEF2` = 12-16:1 on every surface; `textDim` ≥4.7:1 on inputs; azure accent 4.94:1 on bg0; RowLabel
   ~9-11:1, RowCaption ~4.7-5.8:1 — none muddy. Byte-of-behaviour unchanged; pure style. Only
   `ImGuiController.cs`+`EditorTheme.cs` touched. Visual verify batched into the EF5a–d screenshot checkpoint.
-- **EF5b — Centralize bypass offenders:** route `AssetBrowserPanel`/`ConsolePanel`/`HierarchyPanel`
-  hardcoded colors through `EditorTheme` (add semantic tokens where missing). No hand-typed `SysVec4`
-  colors left in panels.
+- **EF5b — Centralize bypass offenders — ✅ DONE:** added a SEMANTIC tokens block to `EditorTheme.cs`
+  (Error/Warning/Success, PrefabBlue/RowChild/IconMuted, PrimaryAction±, FolderTint/FolderTintDim, the
+  LogLevel[] ramp, Hairline/TreeGuide, PopupBg/InputBg) and routed the hand-typed `SysVec4` color literals
+  in `AssetBrowserPanel`/`ConsolePanel`/`HierarchyPanel` (+ secondary `StatsPanel`/`BuildPanel`/
+  `VolumeProfileEditor`) through them. Deliberately harmonizes a handful of slightly-off literals into one
+  coherent family (NOT byte-identical — pure visual, behaviour unchanged). The literals that REMAIN are
+  justified per the DoD grep: alpha-only overlays (`(0,0,0,0)`, `(1,1,1,0.0x)` ghost hovers, watermark
+  icons), alpha/scale DERIVATIONS of a token (`(tint/color/accent.X,…,α)`, `(color.X*0.6,…)`), the
+  no-icon-font fallback folder glyph (degraded mode), and the `Style(ext)` file-type color TAXONOMY (a
+  self-contained data table, annotated in-file as deliberate). Build 0-error, reflection oracle EXIT=0.
+  Visual verify batched into the EF5a–d checkpoint. **EF5c/EF5d note:** the Inspector/ComponentPreviews/
+  ProfilerPanel/AssetInspectors still hold semantic literals (e.g. InspectorPanel:711/811 prefab-blue,
+  :1192 warn, :1500 amber-red) — those are the inspector cluster's, addressed by EF5c/EF5d; the EF5b
+  tokens (`PrefabBlue`/`Warning`/`Error`) already exist for them to adopt.
 - **EF5c — Panel chrome polish:** rounded panel headers / section headers via `EditorDecoration`
   (cards, dividers, accent stripes) applied consistently across Inspector/Hierarchy/Assets/Console.
 - **EF5d — Type/spacing tokens:** verify type-scale (Display/Header/Body/Caption) + spacing are applied

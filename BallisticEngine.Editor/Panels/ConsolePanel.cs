@@ -21,11 +21,10 @@ internal sealed class ConsolePanel {
     bool collapse = true;
     string search = "";
 
-    static readonly SysVec4[] LevelColors = [
-        new(0.55f, 0.58f, 0.64f, 1f), // info icon — quiet
-        new(0.95f, 0.80f, 0.30f, 1f), // warning
-        new(0.95f, 0.38f, 0.32f, 1f), // error
-    ];
+    // Severity tints come from the central theme (EditorTheme.LogLevel: info/warning/error). EF5b — the
+    // per-level array used to be hand-typed here; routed through the theme so the console reads with the
+    // same status palette as the rest of the editor.
+    static SysVec4[] LevelColors => EditorTheme.LogLevel;
 
     static readonly string[] LevelIcons = [EditorIcons.Info, EditorIcons.Warning, EditorIcons.Error];
 

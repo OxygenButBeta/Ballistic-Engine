@@ -34,7 +34,7 @@ internal static class VolumeProfileEditor {
                 // even if its parameters are overridden — a common "I changed it and nothing happens"
                 // trap. Warn clearly, and offer a one-click Enable.
                 if (!component.Active && HasOverrides(component)) {
-                    ImGui.PushStyleColor(ImGuiCol.Text, new SysVec4(1f, 0.72f, 0.25f, 1f));
+                    ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.Warning);
                     ImGui.TextWrapped($"{EditorIcons.Warning} This override is DISABLED — its parameters have no effect. " +
                                       "Tick the checkbox by the name to enable it.");
                     ImGui.PopStyleColor();

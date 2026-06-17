@@ -221,7 +221,7 @@ internal sealed class AssetBrowserPanel {
         }
 
         // Bright title (the default text is dim/grey which read as "disabled").
-        ImGui.PushStyleColor(ImGuiCol.Text, new SysVec4(0.95f, 0.95f, 0.97f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.Text);
         ImGui.TextUnformatted($"New {newAssetKind}");
         ImGui.PopStyleColor();
         ImGui.Separator();
@@ -240,7 +240,7 @@ internal sealed class AssetBrowserPanel {
         string trimmed = newAssetName.Trim();
         bool valid = trimmed.Length > 0 && trimmed.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
         if (!valid && trimmed.Length > 0)
-            ImGui.TextColored(new SysVec4(1f, 0.5f, 0.4f, 1f), "Invalid file name.");
+            ImGui.TextColored(EditorTheme.Error, "Invalid file name.");
         else
             ImGui.TextDisabled($"Creates {trimmed}{newAssetExt}");
 
@@ -259,8 +259,8 @@ internal sealed class AssetBrowserPanel {
         ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new SysVec2(20, 18));
         ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 5f);
         ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new SysVec2(8, 8));
-        ImGui.PushStyleColor(ImGuiCol.PopupBg, new SysVec4(0.16f, 0.16f, 0.19f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.FrameBg, new SysVec4(0.10f, 0.10f, 0.12f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.PopupBg, EditorTheme.PopupBg);
+        ImGui.PushStyleColor(ImGuiCol.FrameBg, EditorTheme.InputBg);
     }
 
     static void PopPromptStyle() {
@@ -277,9 +277,9 @@ internal sealed class AssetBrowserPanel {
         ImGui.SameLine();
         // Coloured Create button (greyed when disabled) so it reads as the primary action.
         ImGui.BeginDisabled(!createEnabled);
-        ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(0.20f, 0.55f, 0.30f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(0.26f, 0.66f, 0.38f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new SysVec4(0.16f, 0.46f, 0.26f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Button, EditorTheme.PrimaryAction);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, EditorTheme.PrimaryActionHovered);
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive, EditorTheme.PrimaryActionActive);
         create = ImGui.Button("Create", new SysVec2(120, 0));
         ImGui.PopStyleColor(3);
         ImGui.EndDisabled();
@@ -327,7 +327,7 @@ internal sealed class AssetBrowserPanel {
             return;
         }
 
-        ImGui.PushStyleColor(ImGuiCol.Text, new SysVec4(0.95f, 0.95f, 0.97f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.Text);
         ImGui.TextUnformatted("New Script");
         ImGui.PopStyleColor();
         ImGui.Separator();
@@ -341,7 +341,7 @@ internal sealed class AssetBrowserPanel {
         string className = ScriptTemplates.ClassName(newScriptName.Trim());
         bool valid = IsValidIdentifier(className);
         if (!valid && newScriptName.Trim().Length > 0)
-            ImGui.TextColored(new SysVec4(1f, 0.5f, 0.4f, 1f), "Not a valid C# class name.");
+            ImGui.TextColored(EditorTheme.Error, "Not a valid C# class name.");
         else
             ImGui.TextDisabled($"Creates {className}.cs : Behaviour");
 
@@ -477,7 +477,7 @@ internal sealed class AssetBrowserPanel {
             string name = fav == "Assets" ? "Assets" : fav[(fav.LastIndexOf('/') + 1)..];
             ImGui.PushID($"fav{i}");
             bool current = string.Equals(fav, CurrentFolder, StringComparison.OrdinalIgnoreCase);
-            ImGui.PushStyleColor(ImGuiCol.Text, new SysVec4(0.95f, 0.82f, 0.45f, 1f));
+            ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.FolderTint);
             ImGui.TextUnformatted(EditorIcons.Folder);
             ImGui.PopStyleColor();
             ImGui.SameLine(0, 6);
@@ -558,8 +558,8 @@ internal sealed class AssetBrowserPanel {
 
         var expanded = open && subDirs.Length > 0;
         var tint = isCurrent || isAncestor
-            ? new SysVec4(0.92f, 0.76f, 0.38f, 1f)
-            : new SysVec4(0.86f, 0.70f, 0.34f, 0.75f);
+            ? EditorTheme.FolderTint
+            : EditorTheme.FolderTintDim;
         EditorIcons.DrawAt(new SysVec2(rowMin.X + ImGui.GetTreeNodeToLabelSpacing(), rowMin.Y),
             expanded ? EditorIcons.FolderOpen : EditorIcons.Folder, tint);
 
@@ -1527,6 +1527,9 @@ internal sealed class AssetBrowserPanel {
         draw.AddText(badgeMin + pad, ImGui.GetColorU32(new SysVec4(1, 1, 1, 0.92f)), tag);
     }
 
+    // Per-extension type taxonomy: the (tag, tint) for an asset's type tile/badge. This is a self-
+    // contained DATA TABLE (one deliberate hue per file category, not editor chrome) so it stays here
+    // rather than in EditorTheme — the EF5b "bypass offenders" were status/surface colors, not this map.
     static (string, SysVec4) Style(string ext) => ext switch {
         ".fbx" or ".obj" or ".gltf" or ".glb" => ("MESH", new SysVec4(0.20f, 0.30f, 0.42f, 1f)),
         ".png" or ".jpg" or ".jpeg" or ".tga" or ".bmp" => ("TEX", new SysVec4(0.18f, 0.34f, 0.25f, 1f)),

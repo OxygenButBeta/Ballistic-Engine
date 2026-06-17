@@ -24,7 +24,7 @@ internal sealed class StatsPanel {
         ImGui.SetNextWindowBgAlpha(0.88f);
         ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 8f);
         ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new SysVec2(12 * scale, 9 * scale));
-        ImGui.PushStyleColor(ImGuiCol.Border, new SysVec4(1, 1, 1, 0.07f));
+        ImGui.PushStyleColor(ImGuiCol.Border, EditorTheme.Hairline);
         const ImGuiWindowFlags flags = ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.NoMove |
             ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.AlwaysAutoResize |
             ImGuiWindowFlags.NoFocusOnAppearing | ImGuiWindowFlags.NoNav;

@@ -382,8 +382,8 @@ internal sealed class BuildPanel {
         }
 
         if (summary is not null) {
-            SysVec4 color = ok == true ? new SysVec4(0.5f, 0.85f, 0.5f, 1f)
-                          : ok == false ? new SysVec4(0.9f, 0.45f, 0.45f, 1f)
+            SysVec4 color = ok == true ? EditorTheme.Success
+                          : ok == false ? EditorTheme.Error
                           : EditorIcons.TintGeneric;
             ImGui.TextColored(color, summary);
         }
