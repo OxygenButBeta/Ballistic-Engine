@@ -1,11 +1,13 @@
 # Ballistic Engine
 
 Custom C#/.NET 9 game engine — **NOT a Unity project** despite the folder location. Stack:
-OpenTK 4.9.4 (OpenGL **4.6 core** — bumped from 4.1 in the 2026-06 renderer overhaul; unlocks
-compute/SSBOs/MultiDrawIndirect/persistent mapping/DSA — now USED by the GPU-driven path. macOS was
-the old 4.1 ceiling and is out of scope for GL — a Mac path means another backend), AssimpNet +
-StbImageSharp + Magick.NET (import-time only), YamlDotNet (scenes), ImGui.NET (editor). Idioms
-deliberately mirror Unity (Entity/Behaviour, AssetDatabase, meta files, edit/play split).
+**DX12 + DXR renderer** (Vortice bindings, `BallisticEngine.DX12/`; the live backend — Windows/PC
+only, hardware ray tracing). The OpenGL backend (`OpenGL/`) was **DELETED in the 2026-06 DX12
+migration** (C3) — it no longer exists; anything below that still says GL/GLSL is HISTORICAL (see the
+Renderer-pipeline section banner). OpenTK 4.9.4 is still referenced but now ONLY for `OpenTK.Mathematics`
+(incrementally being migrated to System.Numerics) + the OpenAL audio bindings — NOT for GL. AssimpNet +
+StbImageSharp + Magick.NET (import-time only), YamlDotNet (scenes), ImGui.NET (editor, on a DX12 backend).
+Idioms deliberately mirror Unity (Entity/Behaviour, AssetDatabase, meta files, edit/play split).
 
 ## Build & run
 
@@ -273,7 +275,16 @@ loop returns or the process never exits.
 
 ## Renderer pipeline (2026-06 overhaul — invariants that must not regress)
 
-- **GPU-driven path (MDI + compute cull + bindless, 2026-06, `OpenGL/Rendering/GpuDriven/`)**: the
+> ⚠ **HISTORICAL (GL-era) from here down.** The OpenGL backend (`OpenGL/`) described below was DELETED
+> in the DX12 migration (C3) — these `OpenGL/...` paths, GLSL files, `GL.*`/`glMultiDraw*` calls and OpenTK
+> GL types NO LONGER EXIST. The live renderer is **DX12/DXR** (`BallisticEngine.DX12/`, `.hlsl` shaders
+> embedded there); it deliberately MIRRORS the frame shape + invariants documented below (z-prepass
+> invariance, cull determinism, transient-RT pooling, TAA-is-the-AA, the post chain), so this section is
+> kept as the conceptual contract the DX12 passes must still honour — just read every GL/GLSL detail as
+> "the DX12 equivalent." DX12-specific notes (pass-graph, Lumen GI, exposure, P0a pipelined frame) live in
+> the `Docs/Plans/dx12-*` plans + the agent-memory topic files.
+
+- **GPU-driven path (MDI + compute cull + bindless, 2026-06, `OpenGL/Rendering/GpuDriven/` — GL-era, deleted; DX12 uses ExecuteIndirect)**: the
   WHOLE-MESH renderer (Bistro, ~1600 submeshes, `SubMeshIndex < 0`, non-skinned, single shader) is
   drawn via `glMultiDrawElementsIndirectCount` after a GPU compute frustum cull, collapsing ~1600
   `DrawElements` into a handful of MDI calls (CPU submit was THE bottleneck: 30ms CPU vs 12ms GPU,
@@ -380,7 +391,9 @@ loop returns or the process never exits.
 - Editor undo = whole-scene YAML snapshots pushed BEFORE each interaction
   (`EditorUndo.Push()`; `ImGui.IsItemActivated()` for widgets).
 - Rider locks folders on Windows — `git mv`/renames of open dirs fail; copy + `git rm --cached`.
-- FSQ/post/IBL shaders are **embedded resources** under `OpenGL/Shader/Embedded/`, not assets.
+- FSQ/post/IBL shaders are **embedded resources** (GL-era: `OpenGL/Shader/Embedded/`, deleted; DX12:
+  `.hlsl` embedded under `BallisticEngine.DX12/`), not assets. Incremental DX12 builds do NOT re-embed a
+  changed `.hlsl` — clean `obj/` + verify the embed (see memory `dx12-shader-edit-build-gotcha`).
 - **GLSL NaN scrubs MUST be a component SELECT (ternary), never `mix(v, 0, flag)`** — float
   `mix` is arithmetic (`v*(1-flag) + 0*flag`) and `NaN*0 == NaN`, `Inf*0 == NaN`: proven leak
   on AMD RX 9070 XT (driver test in `%TEMP%\bal-nan-test`). The broken form turned one Inf

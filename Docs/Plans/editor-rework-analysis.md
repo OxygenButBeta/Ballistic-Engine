@@ -1,7 +1,7 @@
 # Editor Rework — Analysis & Plan Foundation (2026-06-17)
 
 **Worktree:** `e:/Unity Projects/Ballistic-Engine-editor`  **Branch:** `editor-rework-2026` (off `dx12-renderer` @ `c8380f2e`)
-**Status:** ★ PLAN LOCKED (2026-06-17) — all decisions made (§6), execution order set, NO code written yet. Two external-review passes integrated + key claims code-verified. Ready to start Phase 0.
+**Status:** ★ SPINE DONE (chunks 1–42) + MERGED into `dx12-renderer` (merge `b7f474f1`). NOW running §9 REMAINING-WORK PLAN on `dx12-renderer` directly (main worktree `e:/Unity Projects/Ballistic-Engine`, NOT the worktree above — that is pre-merge, do not touch). Chunk 43 (RW1.1 + RW6) DONE. NEXT = chunk 44 (RW1.2). See §9.
 **Method:** 5 parallel read-only探查 agents over the whole `BallisticEngine.Editor/` tree + key cross-checks (DockPanelHost, EditorDebugViews, ThumbnailCache), plus the strategic docs (`ai-native-engine-master-plan.md`, CLAUDE.md, DX12 endgame).
 
 ## LOCKED EXECUTION ORDER (read this first)
@@ -511,3 +511,41 @@ END this chat by emitting the next handoff prompt for chunk <N+1>.
 ## 7. What was NOT changed
 
 No code touched. New worktree `editor-rework-2026` created off `dx12-renderer @ c8380f2e`; the active renderer work in the main worktree is untouched. This doc is the only artifact.
+
+---
+
+## 9. REMAINING-WORK PLAN (post-merge — the "last 20%")  ★ ACTIVE
+
+**Where we are:** the SPINE (chunks 1–42) landed and was MERGED into `dx12-renderer` (merge `b7f474f1`). That dissolved the god-object SHELL (Phase A window registry), unified the inspector DISPATCH (Phase B0/B1/B2: DrawerStack + ComponentPreviewRegistry + AssetInspectorRegistry — the `if (x is Foo)` chains are GONE), and built serialization/undo/AI-ops/registry substrate (G/F/D). But "spine done" hid two real gaps the SPINE explicitly punted:
+
+1. **Phase B left the bodies behind (the "later chunk" contract).** B moved *dispatch* to registries; the section *bodies* (`Draw*Section`, the curve/gradient/material editors) physically still live INSIDE `InspectorPanel.cs` (~3300 lines). Behaviour is byte-identical; this is pure structural debt — the panel is still a god-panel, just no longer a type-switch.
+2. **Phase E (visual + layout) was NEVER built.** `EditorTheme.cs` / `EditorDecoration.cs` do not exist; this is the real source of "çiğ/standart görünüyor" (clean arch, untouched visual layer).
+3. C1 thumbnail still GPU-gated (DXGI_DEVICE_HUNG); C2 debug-compositor no-op. (GPU-isolated, time-boxed, DRED-first, never relaunch-loop.)
+
+**Now run on `dx12-renderer` DIRECTLY** (main worktree `e:/Unity Projects/Ballistic-Engine`). The `editor-rework-2026` worktree/branch is PRE-merge — do NOT touch it. One chunk per chat; commit per chunk; `git add -A` FORBIDDEN (working tree is dirty — stage only your own files).
+
+### LOCKED EXECUTION ORDER (RW)
+```
+RW1  body migration (Rule 1.5 debt) — move Draw*Section + sub-editor bodies OUT of InspectorPanel into
+     their registered IComponentPreview / IAssetInspector shims; pure structural, byte-identical render.
+       RW1.1  Renderer (DrawSubMeshMaterials+Row) + 2 simplest (Health, TrailRenderer)        ← chunk 43 ✅
+       RW1.2  Animator / AnimatorController / LightAnimator / Spawner / Health-residue / ParticleSystem
+       RW1.3  Volume / Terrain / AudioSource / UIDocument / TrailRenderer-residue
+       RW1.4  asset-inspector bodies (material editor, texture import, curve/gradient sub-editors)
+       (RW1 DONE = InspectorPanel ~800–1000 lines; THEN update §0 + memory index.)
+RW2  type-scale + drawer-row redesign (Phase E core)                          ← GPU: editor LAUNCH, hang-safe
+RW3  in-viewport toolbar + theme (EditorTheme.cs)                             ← GPU: editor LAUNCH, hang-safe
+RW4  decoration polish (EditorDecoration.cs)                                  ← GPU: editor LAUNCH, hang-safe
+RW5  C1 thumbnail DRED root-cause (BILINEN ÇÖKERTEN — single seat, commit-safe-first, gate+defer if box fills)
+RW6  CLAUDE.md GL-drift doc cleanup (doc-only)                               ← chunk 43 ✅ (rode with RW1.1)
+RW7  D2/D3 MCP schema completion + perception (rides C1)
+```
+
+### ORACLE (every RW1 chunk)
+- (a) `dotnet run --project BallisticEngine.Tests.Reflection` → ALL suites GREEN (esp. `[ComponentPreview registry (B1)]`, `[AssetInspector registry (B2)]`, `[UndoCoverage (F3)]`).
+- (b) `dotnet build BallisticEngine.Editor/BallisticEngine.Editor.csproj` → 0 error (the full `.slnx` may fail ONLY on a `BallisticEngine.Mcp.exe` file-lock if an MCP server is running — that is environmental, not a compile error).
+- (c) RW1 = MOVE not FIX: render output byte-identical. Watch for **stray control bytes** baked into existing string literals (e.g. a U+009D `302 235` after the em-dash in `DrawSubMeshMaterials`' `"{label} — none"` and its `info —` comment) — preserve them byte-exact (splice via `python3` surrogateescape, do NOT retype) or the rendered text changes.
+- (d) GPU-hang safety: RW1 is HEADLESS (no editor launch). RW2–RW5 launch — DRED-first, never relaunch-loop.
+
+### Chunk 43 (RW1.1 + RW6) — DONE
+Moved `DrawSubMeshMaterials`+`DrawSubMeshMaterialRow` → `RendererPreview` (now private statics inside it), `DrawHealthSection` → `HealthPreview`, `DrawTrailRendererSection` → `TrailRendererPreview`, all in `BallisticEngine.Editor/Panels/Inspector/Preview/ComponentPreviews.cs`. Enablers in `InspectorPanel.cs`: `Row(string)` widened `static`→`internal static` (relocated body calls it; `BeginGrid` was already internal static); added `internal void MarkViewportDirty()` so a moved body's `state.MarkViewportDirty()` becomes `ctx.Panel.MarkViewportDirty()` (private `state` reach). InspectorPanel dropped ~3357→~3300 lines. RW6: CLAUDE.md GL-drift banner (stack line, Renderer-pipeline section, embedded-shader gotcha) marked HISTORICAL/DX12. Build 0-err, harness ALL GREEN.

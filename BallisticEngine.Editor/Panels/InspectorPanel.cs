@@ -104,6 +104,12 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     bool IComponentInspectorHost.AxisVec3(string id, string label, ref SysVec3 v, float speed) => AxisVec3(id, label, ref v, speed);
     bool IComponentInspectorHost.TrackUndo(string label, bool changed) => InspectorUndo.Track(label, changed);
     void IComponentInspectorHost.MarkViewportDirty() => state.MarkViewportDirty();
+
+    // RW1.1: the relocated component-preview bodies (Inspector/Preview/ComponentPreviews.cs) reach the
+    // private EditorState through this so a moved section's `state.MarkViewportDirty()` becomes
+    // `ctx.Panel.MarkViewportDirty()` — byte-identical, no behaviour change.
+    internal void MarkViewportDirty() => state.MarkViewportDirty();
+
     // B4: the AssetSlotDrawer terminal drawer hands its IProperty here; unwrap the reflected member/owner/type
     // and reuse the unchanged DrawAssetSlot rendering (byte-identical to the old IsSpecialWidgetType arm).
     void IComponentInspectorHost.DrawAssetSlot(Inspector.IProperty property) {
@@ -1253,37 +1259,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         ImGui.PopID();
     }
 
-    internal void DrawHealthSection(Health health) {
-        ImGui.Spacing();
-        ImGui.SeparatorText("Health");
-
-        float frac = health.HealthFraction;
-        // Manual bar (green->red by remaining fraction), so it works without ProgressBar styling.
-        var draw = ImGui.GetWindowDrawList();
-        SysVec2 p = ImGui.GetCursorScreenPos();
-        float w = MathF.Max(ImGui.GetContentRegionAvail().X, 60f);
-        const float h = 18f;
-        draw.AddRectFilled(p, p + new SysVec2(w, h), 0xFF202428, 3f);
-        var barCol = ImGui.GetColorU32(new SysVec4(1f - frac, frac, 0.12f, 1f));
-        if (frac > 0f)
-            draw.AddRectFilled(p, p + new SysVec2(w * frac, h), barCol, 3f);
-        draw.AddRect(p, p + new SysVec2(w, h), 0xFF000000, 3f);
-        string label = health.IsDead ? "DEAD" : $"{health.CurrentHealth:0} / {health.MaxHealth:0}";
-        SysVec2 ts = ImGui.CalcTextSize(label);
-        draw.AddText(p + new SysVec2((w - ts.X) * 0.5f, (h - ts.Y) * 0.5f), 0xFFFFFFFF, label);
-        ImGui.Dummy(new SysVec2(w, h));
-
-        if (ImGui.Button("Damage 10", new SysVec2(90, 0))) { health.TakeDamage(10f); state.MarkViewportDirty(); }
-        ImGui.SameLine();
-        if (ImGui.Button("Heal 10", new SysVec2(90, 0))) { health.Heal(10f); state.MarkViewportDirty(); }
-        ImGui.SameLine();
-        if (ImGui.Button("Kill", new SysVec2(70, 0))) { health.Kill(); state.MarkViewportDirty(); }
-        ImGui.SameLine();
-        if (ImGui.Button("Revive", new SysVec2(70, 0))) { health.Revive(); state.MarkViewportDirty(); }
-
-        if (!SceneManager.IsPlaying)
-            ImGui.TextDisabled("Edit-mode tests don't fire DestroyOnDeath (play only).");
-    }
+    // RW1.1: DrawHealthSection body MOVED into HealthPreview (Inspector/Preview/ComponentPreviews.cs).
 
     // ParticleSystem preview: it already animates live in the editor (AdvanceAll runs every editor
     // frame), so this just adds a Restart (clear) + a one-shot Emit test + a live count, and keeps the
@@ -1308,18 +1284,8 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             state.MarkViewportDirty();
     }
 
-    // TrailRenderer preview: also animates live in the editor; add a Clear + a live point count.
-    internal void DrawTrailRendererSection(TrailRenderer trail) {
-        ImGui.Spacing();
-        ImGui.SeparatorText("Preview");
-
-        if (ImGui.Button($"{EditorIcons.Refresh}  Clear", new SysVec2(-1, 0)))
-            trail.Clear();
-        ImGui.TextDisabled($"{trail.PointCount} points");
-
-        if (trail.PointCount > 0)
-            state.MarkViewportDirty();
-    }
+    // RW1.1: DrawTrailRendererSection body MOVED into TrailRendererPreview
+    // (Inspector/Preview/ComponentPreviews.cs).
 
     static void CreateProfileAsset(Entity entity, Volume volume) {
         var baseName = entity.Name is { Length: > 0 } entityName ? entityName : "Volume";
@@ -1601,52 +1567,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         return InspectorUndo.Track(label, ImGui.DragFloat(id, ref value, speed, 0, 0, "%.2f"));
     }
 
-    // Multi-material meshes resolve their materials from refs baked into the mesh at import;
-    // list them read-only so an empty SharedMaterial slot isn't mistaken for "no materials".
-    // (SharedMaterial only overrides slots that have no baked ref.)
-    internal static void DrawSubMeshMaterials(Renderer renderer) {
-        Mesh mesh = renderer.SharedMesh;
-        if (mesh?.SubMeshes is not { Length: > 1 } subMeshes)
-            return;
-
-        // A single-submesh renderer (one entity per source mesh) shows just its own slot.
-        var only = renderer.SubMeshIndex;
-        if (only >= 0 && only < subMeshes.Length) {
-            DrawSubMeshMaterialRow(renderer, subMeshes[only], only, "Material");
-            return;
-        }
-
-        // Whole-mesh renderers of split imports can have hundreds of submeshes; cap the list
-        // (it's read-only info — per-part slots live on the instantiated child entities).
-        const int MaxRows = 24;
-        var rows = Math.Min(subMeshes.Length, MaxRows);
-        for (var i = 0; i < rows; i++)
-            DrawSubMeshMaterialRow(renderer, subMeshes[i], i, i == 0 ? $"Materials ({subMeshes.Length})" : "");
-        if (subMeshes.Length > MaxRows) {
-            Row("");
-            ImGui.TextDisabled($"... and {subMeshes.Length - MaxRows} more");
-        }
-    }
-
-    static void DrawSubMeshMaterialRow(Renderer renderer, SubMeshData sub, int i, string rowLabel) {
-        Row(rowLabel);
-
-        var label = string.IsNullOrEmpty(sub.Name) ? $"Submesh {i}" : sub.Name;
-        Material material = renderer.MaterialFor(i);
-
-        if (material is null) {
-            ImGui.TextDisabled($"{label} — none");
-            return;
-        }
-
-        var reference = sub.MaterialRef;
-        if (reference is null && AssetDatabase.TryGetAssetGuid(material, out Guid guid))
-            reference = AssetDatabase.GuidToAssetPath(guid);
-
-        ImGui.TextUnformatted($"{EditorIcons.Color} {Path.GetFileNameWithoutExtension(reference ?? label)}");
-        if (reference is not null && ImGui.IsItemHovered())
-            ImGui.SetTooltip($"{label}\n{reference}");
-    }
+    // RW1.1: DrawSubMeshMaterials / DrawSubMeshMaterialRow were MOVED into RendererPreview
+    // (Inspector/Preview/ComponentPreviews.cs) so the per-submesh material body lives with the preview
+    // that owns it. Behaviour byte-identical; only the row helper (Row) + grid (BeginGrid) stay here,
+    // widened to internal static so the relocated body can still call them.
 
     // Asset slot. Assigned: clicking the name PINS the asset in the Inspector (shows its
     // asset view), the chevron button opens the picker. Unassigned: click opens the picker.
@@ -3179,7 +3103,9 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     }
 
     // Starts a new label/value row and leaves the cursor in the value column.
-    static void Row(string label) {
+    // internal (RW1.1): the relocated RendererPreview body (Inspector/Preview/) calls this to draw its
+    // submesh-material rows inside a BeginGrid table — byte-identical to the old inline DrawSubMeshMaterials.
+    internal static void Row(string label) {
         ImGui.TableNextRow();
         ImGui.TableSetColumnIndex(0);
         ImGui.AlignTextToFramePadding();
