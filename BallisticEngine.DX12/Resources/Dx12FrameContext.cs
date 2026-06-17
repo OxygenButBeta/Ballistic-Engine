@@ -44,9 +44,14 @@ public sealed class Dx12FrameContext {
     public int OutputW { get; init; }
     public int OutputH { get; init; }
 
-    // --- misc read-only frame state passes need (chunk 7: composite) ---
+    // --- misc read-only frame state passes need (chunk 7: composite/TAA/FSR) ---
     public bool DeterministicCapture { get; init; }   // BALLISTIC_DETERMINISTIC=1 (freezes grain + exposure reset)
     public CpuDescriptorHandle SsaoResult { get; init; }   // Dx12SsaoPass.ResultSrvCpu (blurred half-res AO) — composite samples it when Doors.Ssao
+    // The resolved upscale/AA branch. TaaActive == PostFX.TaaEnabled && !FsrActive && !DeterministicCapture &&
+    // !Minimal; FsrActive == the FSR mode is on. TAA + FSR are mutually exclusive. TaaPass runs in the native
+    // path (Enabled=!FsrActive); even when TaaActive is false it resets the (pass-owned) history-valid flag.
+    public bool TaaActive { get; init; }
+    public bool FsrActive { get; init; }
 
     // --- shared backend resources (read-only references; the objects self-track their own state) ---
     public Dx12Device          Dev            { get; init; }

@@ -110,21 +110,12 @@ public sealed class DX12HDRenderer : HDRenderer {
     // The jitter is applied to the camera projection (whole frame); reprojection uses UNJITTERED matrices.
     // Driven by the AntiAliasing VOLUME (PostFX.TaaEnabled / TaaFeedback). The jitter offset is reused by
     // the FSR upscaler later (plumbed once here).
-    ID3D12RootSignature taaRootSig;     // TaaConstants CBV(b0) + 3-SRV table(current/history/depth) + sampler
-    ID3D12PipelineState taaPso;
-    ID3D12Resource taaCb;
-    unsafe byte* taaCbMapped;
-    Dx12OffscreenTarget taaHistoryA, taaHistoryB;   // ping-pong accumulated HDR history
-    Dx12OffscreenTarget taaResolved;                // this frame's TAA output (→ history + copied to target)
-    Dx12DescriptorHeap taaSrvVisible;   // 3 SRVs per frame
-    bool taaWriteB;                     // ping-pong toggle
-    bool taaHistoryValid;
-    int taaFrame;                       // jitter phase counter
+    // TAA — CONVERTED to a pass-graph IRenderPass (chunk 7): Dx12TaaPass owns the rootsig/PSO/CB/heap +
+    // ping-pong history targets + the taaWriteB/taaHistoryValid state. Runs at PostProcess (after SSAO, before
+    // composite) in the native path only (FSR replaces it). Was BuildTaa/AllocTaaTargets/DrawTaa.
+    Dx12TaaPass taaPass;
+    int taaFrame;                       // jitter phase counter (shared by TAA + FSR; advanced in the frame tail)
     Vector2 currentJitter;              // this frame's sub-pixel jitter (pixels) — exposed for FSR reuse
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct TaaConstants {
-        public float Feedback; public float ValidHistory; public Vector2 TexelSize;
-    }
 
     // SSR: half-res view-space reflection march (reads HDR color + G-buffer) → combine (depth-aware
     // upsample, lerp into the HDR color). Driven by the ScreenSpaceReflections VOLUME (PostFX.Ssr*).
@@ -614,12 +605,11 @@ public sealed class DX12HDRenderer : HDRenderer {
         ldr.ColorToShaderResource();
         gbuffer = new Dx12GBuffer(dev, internalW, internalH);
         motionPrevValid = false;                                // prev view*proj is stale after a realloc
-        // SSAO (Dx12SsaoPass) + bloom (Dx12CompositePass's half-res ping-pong) now reallocate via graph.Resize at
-        // the tail of this method — see the graph?.Resize call below. SSAO's original slot (2nd) and bloom's (1st)
-        // in the AllocXxx sequence are byte-neutral because each allocator reads only the passed size (R5).
+        // SSAO (Dx12SsaoPass) + bloom (Dx12CompositePass) + TAA (Dx12TaaPass) now reallocate via graph.Resize at
+        // the tail of this method — see the graph?.Resize call below. Their original AllocXxx slots (bloom 1st,
+        // ssao 2nd, taa 5th) are byte-neutral because each allocator reads only the passed size (R5).
         if (ssrRootSig != null) AllocSsrTarget();
         if (ssgiRootSig != null) AllocSsgiTargets();
-        if (taaRootSig != null) AllocTaaTargets();
         if (rtShadowMask != null) AllocRtShadowMask();
         AllocFsrOutput();
         // Fan the resize out to any pass that owns resolution-dependent targets. No-op while the graph is
@@ -726,9 +716,9 @@ public sealed class DX12HDRenderer : HDRenderer {
         // constructed below where the pass-graph is assembled (chunk 5). Was BuildFog() + BuildAerialPerspective().
         BuildSsr();
         BuildSsgi();
-        BuildTaa();
-        // Composite (+ its private bloom + auto-exposure sub-steps) now built inside Dx12CompositePass's ctor
-        // (chunk 7), constructed below where the pass-graph is assembled. Was BuildComposite().
+        // TAA now built inside Dx12TaaPass's ctor (chunk 7); composite (+ its private bloom + auto-exposure
+        // sub-steps) inside Dx12CompositePass's ctor — both constructed below at pass-graph assembly. Was
+        // BuildTaa() + BuildComposite().
 
         // GPU-driven geometry path (compute cull + ExecuteIndirect + bindless) for whole-mesh renderers.
         // DEFAULT ON (byte-identical to the CPU path, verified on Bistro + SunTemple); BALLISTIC_DX12_GPUDRIVEN=0
@@ -764,7 +754,12 @@ public sealed class DX12HDRenderer : HDRenderer {
         fogPass = new Dx12FogPass(dev);
         graph.Add(apPass);
         graph.Add(fogPass);
-        // chunk 7: Composite (event 700, after SSAO/TAA/FSR at PostProcess=650). Owns bloomA/B (the half-res
+        // chunk 7: TAA (event 650, registered AFTER SSAO so SSAO runs first within PostProcess — same-event ties
+        // break on registration order, R1). Owns the ping-pong history; its Resize fans out after SSAO's (taa was
+        // 5th in the old AllocXxx order — byte-neutral, the allocator reads only the size, R5). Was BuildTaa.
+        taaPass = new Dx12TaaPass(dev, targetW, targetH);
+        graph.Add(taaPass);
+        // chunk 7: Composite (event 700, after SSAO/TAA at PostProcess=650). Owns bloomA/B (the half-res
         // ping-pong); its Resize fans out LAST in registration order. The original AllocBloomTargets ran FIRST in
         // AllocateResolutionTargets, but the bloom allocator reads only the passed size (no cross-pass dependency)
         // so moving it to last is byte-neutral (R5). Was BuildComposite (→ BuildLumAverage → BuildBloom).
@@ -796,48 +791,13 @@ public sealed class DX12HDRenderer : HDRenderer {
     int lastCasterStamp;
     bool shadowMapEverRendered;
 
-    unsafe void BuildTaa() {
-        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 3, baseShaderRegister: 0);
-        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
-        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
-            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
-            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
-            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
-        };
-        taaRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
+    // BuildTaa / AllocTaaTargets / DrawTaa moved VERBATIM into Resources/Dx12TaaPass.cs (chunk 7). The pass
+    // owns the rootsig/PSO/CB/heap + ping-pong history targets + taaWriteB/taaHistoryValid, runs at the
+    // PostProcess event (native path only — Enabled=!FsrActive; the TAA-skipped history reset moved into the
+    // pass too). Was BuildTaa (→ AllocTaaTargets).
 
-        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("Taa.hlsl");
-        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "Taa.hlsl");
-        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "Taa.hlsl");
-        taaPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
-            RootSignature = taaRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
-            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
-            RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
-            DepthStencilState = DepthStencilDescription.None,
-            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat }, DepthStencilFormat = Format.Unknown,
-            SampleDescription = new SampleDescription(1, 0),
-        });
-
-        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<TaaConstants>() + 255) & ~255;
-        taaCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        taaCbMapped = taaCb.Map<byte>(0);
-        taaSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true, framesInFlight: dev.FramesInFlight);
-        AllocTaaTargets();
-    }
-
-    void AllocTaaTargets() {
-        taaHistoryA?.Dispose(); taaHistoryB?.Dispose(); taaResolved?.Dispose();
-        taaHistoryA = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
-        taaHistoryB = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
-        taaResolved = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
-        taaHistoryValid = false;   // history is stale after a resize
-    }
-
-    // Standard 8-phase Halton(2,3) sub-pixel jitter in pixel units (-0.5..0.5). Reused by FSR later.
+    // Standard 8-phase Halton(2,3) sub-pixel jitter in pixel units (-0.5..0.5). Reused by FSR later. Stays in
+    // the orchestrator — it sets BeginRender's `currentJitter` (TAA + FSR jitter), not a TAA-pass-private thing.
     static Vector2 JitterOffset(int frameIndex) {
         int i = (frameIndex % 8) + 1;
         return new Vector2(Halton(i, 2) - 0.5f, Halton(i, 3) - 0.5f);
@@ -1848,6 +1808,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             // change per frame, so binding it at ctx build is always correct.
             DeterministicCapture = DeterministicCapture,
             SsaoResult = ssaoPass.ResultSrvCpu,
+            TaaActive = taaOn, FsrActive = fsrActive,   // chunk 7: TaaPass runs in native path; FsrPass when FsrActive
             // mutated-mid-frame fields, set to their resolved final value:
             SceneColor = fsrActive ? fsrOutput : target,
             IblActiveThisFrame = iblActiveThisFrame,
@@ -1911,26 +1872,23 @@ public sealed class DX12HDRenderer : HDRenderer {
                 DrawSsr(view, proj);
         }
 
-        // === PHASE-1 PASS-GRAPH — PostProcess window (chunk 4: SSAO). Runs at its canonical slot: after the
-        // Reflections/SSR block, before the TAA/FSR block — the Composite pass (chunk 7) below READS SSAO's result
-        // (ctx.SsaoResult). SSAO reads only the G-buffer (depth + world normal) and writes its own half-res target —
-        // independent of TAA (reads/writes `target`) and the FSR/native branch, so running it here instead of
-        // interleaved with TAA is byte-neutral (verified: floor=0). The earlier windows already ran AP (after sky)
-        // + Fog (after GI) at their canonical positions; this window runs ONLY PostProcess (650) now (composite
-        // moved out to its own window after the TAA/FSR block — it must read the resolved ctx.SceneColor). The ctx
-        // was built once above (after the giMode resolve, before Sky). ===
+        // === PHASE-1 PASS-GRAPH — PostProcess window (chunks 4+7: SSAO then TAA). Runs at its canonical slot:
+        // after the Reflections/SSR block, before the FSR branch + composite. Within the window the event-650
+        // passes run in registration order: SSAO (writes its half-res AO the composite samples via ctx.SsaoResult),
+        // then TaaPass (native path only — Enabled=!FsrActive; writes the AA'd color back into `target`). Same
+        // order as today's inline SSAO→TAA. The earlier windows already ran AP (after sky) + Fog (after GI). The
+        // ctx was built once above (after the giMode resolve, before Sky). ===
         graph.Execute(ctx, (int)Dx12RenderPassEvent.PostProcess, (int)Dx12RenderPassEvent.Composite);
 
         if (fsrActive) {
-            // --- FSR upscale path (replaces TAA): SSAO (ran in graph above) → FSR reconstruct internal→output
-            //     HDR. The composite (Composite window below) reads ctx.SceneColor = fsrOutput at output res. ---
+            // --- FSR upscale path (replaces TAA — TaaPass was skipped in the window above since Enabled=!FsrActive):
+            //     SSAO (ran in the window) → FSR reconstruct internal→output HDR. The composite (Composite window
+            //     below) reads ctx.SceneColor = fsrOutput at output res. ---
             RunFsr();
             ctx.SceneColor = fsrOutput;   // the canonical composite-input branch (already set at ctx build; explicit here)
-        } else {
-            // --- Native path: TAA writes the AA'd color back into `target` (= ctx.SceneColor). ---
-            if (taaOn) DrawTaa();
-            else taaHistoryValid = false;   // keep history fresh for when TAA turns back on
         }
+        // Native path: TaaPass (in the PostProcess window above) already resolved AA into `target` (= ctx.SceneColor)
+        // — or, when TAA is off, reset its own history-valid flag. Nothing to do inline here anymore.
 
         // === PHASE-1 PASS-GRAPH — Composite window (chunk 7). DrawComposite became Dx12CompositePass.Record at the
         // Composite event (700); it runs AFTER the TAA/FSR block so it reads the resolved ctx.SceneColor (fsrOutput
@@ -2172,43 +2130,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         });
     }
 
-    // TAA (volume-driven): resolve the jittered HDR scene against the motion-reprojected history. Reads the
-    // current HDR color (target) + history + G-buffer motion vectors, writes the resolved color into the new
-    // history buffer, then copies it back to `target` so the composite tonemaps the AA'd result. Reprojection
-    // is a per-pixel motion-vector add (jitter-free). History ping-pongs; invalidated on resize / first frame.
-    unsafe void DrawTaa() {
-        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        Dx12OffscreenTarget history = taaWriteB ? taaHistoryA : taaHistoryB;   // read from the OTHER buffer
-        Dx12OffscreenTarget writeHist = taaWriteB ? taaHistoryB : taaHistoryA;
-
-        *(TaaConstants*)taaCbMapped = new TaaConstants {
-            Feedback = PostFX.TaaFeedback, ValidHistory = taaHistoryValid ? 1f : 0f,
-            TexelSize = new Vector2(1f / targetW, 1f / targetH),
-        };
-
-        target.ColorToShaderResource();
-        history.ColorToShaderResource();
-        // Motion RT is already PixelShaderResource (gbuffer.ToShaderResource transitioned all colors).
-        taaSrvVisible.Reset();
-        int b = taaSrvVisible.AllocateRange(3);
-        dev.Device.CopyDescriptorsSimple(1, taaSrvVisible.Cpu(b + 0), target.ColorSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, taaSrvVisible.Cpu(b + 1), history.ColorSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, taaSrvVisible.Cpu(b + 2), gbuffer.ColorSrvCpu(Dx12GBuffer.MotionRtIndex), heapType);
-        writeHist.RenderColorOnly(cl => {
-            cl.SetGraphicsRootSignature(taaRootSig); cl.SetPipelineState(taaPso);
-            cl.SetDescriptorHeaps(taaSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, taaCb.GPUVirtualAddress);
-            cl.SetGraphicsRootDescriptorTable(1, taaSrvVisible.Gpu(b));
-            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            cl.DrawInstanced(3, 1, 0, 0);
-        });
-        writeHist.ColorToShaderResource();
-        target.CopyColorFrom(writeHist);   // the resolved AA'd color becomes the scene color
-
-        taaWriteB = !taaWriteB;
-        taaHistoryValid = true;
-        // taaFrame advances once per frame in BeginRender (shared by TAA + FSR jitter).
-    }
+    // DrawTaa moved VERBATIM into Resources/Dx12TaaPass.Record (chunk 7). It runs at the PostProcess
+    // event via the graph (native path only); the TAA-skipped history reset moved into the pass too.
 
     // The active upscale mode: the volume's PostFX.UpscaleMode, overridable by BALLISTIC_DX12_FSR for
     // headless A/B (off/nativeaa/quality/balanced/performance/ultra) — a kept test door.
