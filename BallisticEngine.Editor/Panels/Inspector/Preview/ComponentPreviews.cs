@@ -106,7 +106,7 @@ internal sealed class VolumePreview : IComponentPreview {
             return;
         }
 
-        ImGui.SeparatorText("Overrides");
+        EditorDecoration.DrawSectionHeader("Overrides");
         // UNDO for volume-profile edits (bug 2b): the profile is a .volume ASSET, outside scene-undo.
         // Snapshot before drawing; if a parameter changed, push a callback undo step when the edit
         // SETTLES (no item active) so a slider drag is one entry, not hundreds. The before-snapshot is
@@ -187,7 +187,7 @@ internal sealed class TerrainPreview : IComponentPreview {
             return;
         }
 
-        ImGui.SeparatorText("Sculpt");
+        EditorDecoration.DrawSectionHeader("Sculpt");
 
         bool armed = TerrainTool.Armed;
         if (ImGui.Checkbox("Enable Brush", ref armed))
@@ -235,8 +235,7 @@ internal sealed class TerrainPreview : IComponentPreview {
 internal sealed class AudioSourcePreview : IComponentPreview {
     public void Draw(in ComponentPreviewContext ctx) {
         var source = (AudioSource)ctx.Behaviour;
-        ImGui.Spacing();
-        ImGui.SeparatorText("Preview");
+        EditorDecoration.DrawSectionHeader("Preview");
 
         if (source.Clip is null) {
             ImGui.TextDisabled("Assign a Clip to preview.");
@@ -286,8 +285,7 @@ internal sealed class AnimatorPreview : IComponentPreview {
 internal sealed class AnimatorControllerPreview : IComponentPreview {
     public void Draw(in ComponentPreviewContext ctx) {
         var controller = (AnimatorController)ctx.Behaviour;
-        ImGui.Spacing();
-        ImGui.SeparatorText("State Machine");
+        EditorDecoration.DrawSectionHeader("State Machine");
 
         if (controller.StateCount == 0) {
             ImGui.TextDisabled("No states. Build the graph in a script's OnBegin:");
@@ -323,8 +321,7 @@ internal sealed class AnimatorControllerPreview : IComponentPreview {
         // Parameter pokers.
         var prms = controller.Parameters;
         if (prms.Count > 0) {
-            ImGui.Spacing();
-            ImGui.SeparatorText("Parameters");
+            EditorDecoration.DrawSectionHeader("Parameters");
             foreach (var kv in prms) {
                 string name = kv.Key;
                 switch (kv.Value) {
@@ -370,8 +367,7 @@ internal sealed class LightAnimatorPreview : IComponentPreview {
 
     public void Draw(in ComponentPreviewContext ctx) {
         var lightAnim = (LightAnimator)ctx.Behaviour;
-        ImGui.Spacing();
-        ImGui.SeparatorText("Preview");
+        EditorDecoration.DrawSectionHeader("Preview");
 
         bool hasLight = lightAnim.GetComponent<PointLight>() is not null
                      || lightAnim.GetComponent<SpotLight>() is not null;
@@ -406,8 +402,7 @@ internal sealed class LightAnimatorPreview : IComponentPreview {
 internal sealed class SpawnerPreview : IComponentPreview {
     public void Draw(in ComponentPreviewContext ctx) {
         var spawner = (Spawner)ctx.Behaviour;
-        ImGui.Spacing();
-        ImGui.SeparatorText("Spawner");
+        EditorDecoration.DrawSectionHeader("Spawner");
 
         if (spawner.Prefab is null) {
             ImGui.TextColored(new SysVec4(1f, 0.7f, 0.3f, 1f), "Assign a Prefab to spawn.");
@@ -438,8 +433,7 @@ internal sealed class SpawnerPreview : IComponentPreview {
 internal sealed class HealthPreview : IComponentPreview {
     public void Draw(in ComponentPreviewContext ctx) {
         var health = (Health)ctx.Behaviour;
-        ImGui.Spacing();
-        ImGui.SeparatorText("Health");
+        EditorDecoration.DrawSectionHeader("Health");
 
         float frac = health.HealthFraction;
         // Manual bar (green->red by remaining fraction), so it works without ProgressBar styling.
@@ -479,8 +473,7 @@ internal sealed class UIDocumentPreview : IComponentPreview {
     public void Draw(in ComponentPreviewContext ctx) {
         var doc = (UIDocument)ctx.Behaviour;
         InspectorPanel panel = ctx.Panel;
-        ImGui.Spacing();
-        ImGui.SeparatorText("Markup & Style");
+        EditorDecoration.DrawSectionHeader("Markup & Style");
         DrawPathDropField(panel, "UXML (markup)", doc.Uxml, [".uxml", ".uihtml", ".html"], p => doc.Uxml = p);
         DrawPathDropField(panel, "USS (style)", doc.Uss, [".uss", ".uicss", ".css"], p => doc.Uss = p);
         ImGui.TextDisabled("Drag a markup/style asset here, or type its Assets/... path.");
@@ -516,8 +509,7 @@ internal sealed class UIDocumentPreview : IComponentPreview {
 internal sealed class ParticleSystemPreview : IComponentPreview {
     public void Draw(in ComponentPreviewContext ctx) {
         var particles = (ParticleSystem)ctx.Behaviour;
-        ImGui.Spacing();
-        ImGui.SeparatorText("Preview");
+        EditorDecoration.DrawSectionHeader("Preview");
 
         // Two equal half-width buttons that fill the row (auto-width 110px clipped the labels to
         // "Resta.../Emit 5" in a narrow inspector); the live count goes on its own line so nothing
@@ -541,8 +533,7 @@ internal sealed class ParticleSystemPreview : IComponentPreview {
 internal sealed class TrailRendererPreview : IComponentPreview {
     public void Draw(in ComponentPreviewContext ctx) {
         var trail = (TrailRenderer)ctx.Behaviour;
-        ImGui.Spacing();
-        ImGui.SeparatorText("Preview");
+        EditorDecoration.DrawSectionHeader("Preview");
 
         if (ImGui.Button($"{EditorIcons.Refresh}  Clear", new SysVec2(-1, 0)))
             trail.Clear();

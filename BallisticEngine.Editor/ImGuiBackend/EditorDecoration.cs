@@ -51,15 +51,26 @@ internal static class EditorDecoration {
     // --- Section header -------------------------------------------------------------------------------
     // A lightweight section title with a divider rule trailing the label (depth via the palette's hairline,
     // not a heavy SeparatorText box). Draws the label in the Caption color + advances the cursor. Use for
-    // grouping sub-sections inside a panel where a full framed CollapsingHeader would be too loud.
+    // grouping sub-sections inside a panel where a full framed CollapsingHeader would be too loud — the
+    // palette-consistent replacement for stock ImGui.SeparatorText, which renders a stark default-ImGui
+    // frame+label that read flat against the deep-graphite UE5 theme (EF5c).
+    //
+    // The label uses the semantic Caption font (smaller, recessive) so a section title reads as a quiet
+    // group rule, not a loud header. Symmetric vertical padding mirrors SeparatorText's built-in spacing so
+    // converting a call site keeps the same rhythm; callers that already emit their own leading Spacing
+    // should drop it (the pad is now owned here — one place to tune).
+    public const float SectionPadY = 4f;
     public static void DrawSectionHeader(string label) {
+        ImGui.Dummy(new SysVec2(0, SectionPadY));
         // Right edge of the content region BEFORE the label is drawn (cursor X + remaining avail width) —
         // GetContentRegionAvail is the binding's portable way to find it (GetWindowContentRegionMax isn't
         // exposed in this Hexa.NET.ImGui build).
         float contentRight = ImGui.GetCursorScreenPos().X + ImGui.GetContentRegionAvail().X;
+        ImGui.PushFont(EditorTheme.Caption);
         ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.RowCaption);
         ImGui.TextUnformatted(label);
         ImGui.PopStyleColor();
+        ImGui.PopFont();
         // Trailing rule from just past the label to the content edge.
         SysVec2 rectMin = ImGui.GetItemRectMin();
         SysVec2 rectMax = ImGui.GetItemRectMax();
@@ -68,6 +79,7 @@ internal static class EditorDecoration {
         if (contentRight > x0 + 4f)
             ImGui.GetWindowDrawList().AddLine(
                 new SysVec2(x0, midY), new SysVec2(contentRight, midY), ImGui.GetColorU32(BorderColor(1f)));
+        ImGui.Dummy(new SysVec2(0, SectionPadY));
     }
 
     // --- Divider --------------------------------------------------------------------------------------

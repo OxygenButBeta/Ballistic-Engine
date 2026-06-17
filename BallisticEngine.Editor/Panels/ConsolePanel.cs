@@ -78,7 +78,7 @@ internal sealed class ConsolePanel {
         // ---- Toolbar row 2: search ----
         ImGui.SetNextItemWidth(-1);
         ImGui.InputTextWithHint("##consolesearch", $"{EditorIcons.Search} Filter log...", ref search, 128);
-        ImGui.Separator();
+        EditorDecoration.DrawDivider();
 
         ImGui.BeginChild("##log", default, ImGuiChildFlags.None, ImGuiWindowFlags.HorizontalScrollbar);
 

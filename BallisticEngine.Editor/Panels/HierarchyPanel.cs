@@ -50,7 +50,7 @@ internal sealed class HierarchyPanel {
         ImGui.SetNextItemWidth(-1);
         ImGui.InputTextWithHint("##hiersearch", $"{EditorIcons.Search} Search (t:Component)...", ref search, 128);
 
-        ImGui.Separator();
+        EditorDecoration.DrawDivider();
 
         // Snapshot so create/delete during iteration is safe; render the forest from the roots.
         var entities = scene.Entities.ToArray();

@@ -81,7 +81,7 @@ internal sealed class AssetBrowserPanel {
         float s = scale();
         thumbnails.Pump(); // at most one thumbnail decode per frame
         DrawNavigationBar(s);
-        ImGui.Separator();
+        EditorDecoration.DrawDivider();
 
         // Two panes, Unity-style: folder tree on the left, tile grid on the right,
         // separated by a draggable splitter (width persists in EditorPrefs).

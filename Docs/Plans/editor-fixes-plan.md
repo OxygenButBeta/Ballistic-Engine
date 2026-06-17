@@ -19,12 +19,35 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF5c** (Theme: panel chrome polish)
-> Last committed chunk: **EF5b** · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **EF5d** (Theme: type/spacing tokens everywhere)
+> Last committed chunk: **EF5c** · Branch: `dx12-renderer`
 >
 > **EF5 identity decision RESOLVED → (i) faithful UE5** (cool graphite + blue-grey shell + a single
 > restrained azure highlight, NO warm accent). The azure accent `0x3D8BD4` (EditorPrefs default) is KEPT;
-> the acceptance bar for the whole EF5 series is "looks like UE5". EF5c–d implement against this identity.
+> the acceptance bar for the whole EF5 series is "looks like UE5". EF5d implements against this identity.
+>
+> **EF5c note (just landed):** panel chrome polished by routing the stark stock section/divider widgets
+> through the existing `EditorDecoration` primitives (no hand-rolled DrawList chrome). (1) **Section headers:**
+> every `ImGui.SeparatorText(...)` in the inspector cluster — the shared `ImGuiComponentGui.Header` adapter
+> (so ALL attribute-driven `[Header]` sections at once), `InspectorPanel` (Render Features list + the
+> `[Header]` attribute path), `ComponentPreviews` (11 sections), `AssetInspectors` (2) — now calls
+> `EditorDecoration.DrawSectionHeader(...)`, which draws a Caption-font, RowCaption-colored label + a
+> palette hairline trailing rule instead of ImGui's framed default-look box. (2) **Structural dividers:** the
+> toolbar→content `ImGui.Separator()` in `ConsolePanel`, `HierarchyPanel`, and `AssetBrowserPanel`
+> (nav-bar→content) now use `EditorDecoration.DrawDivider()` (the quieter `BorderLight` hairline). (3)
+> `DrawSectionHeader` was given symmetric built-in vertical pad (`SectionPadY=4f`) + a `PushFont(Caption)`
+> so a section title reads as a quiet group rule, not a loud header; the immediately-preceding redundant
+> `ImGui.Spacing()` calls were dropped at the converted sites (the pad is now owned in one place). **NOT
+> byte-identical** (deliberate visual harmonization — section titles recede, rules are palette-consistent);
+> behaviour unchanged. Scope held to EF5c's Inspector/Hierarchy/Assets/Console panels — `StatsPanel`/
+> `TagsLayersPanel`/`SettingsPanel` `SeparatorText`/`CollapsingHeader` are OUT of scope and untouched; the
+> modal-dialog internal separators in `AssetBrowserPanel` (227/333) + inline favourites separator (498) were
+> left as stock (dialog internals, not panel chrome). Touched only the 6 panel files (`AssetBrowserPanel`,
+> `ConsolePanel`, `HierarchyPanel`, `InspectorPanel`, `Inspector/Adapters/ImGuiComponentGui`,
+> `Inspector/Preview/ComponentPreviews`, `Inspector/AssetInspectors/AssetInspectors` — 7 files) +
+> `EditorDecoration.cs` (all fully mine). Editor csproj builds 0-error (clean `--no-incremental` scratch
+> dir); reflection oracle EXIT=0 (all 18 suites green). NOT visually verified yet — batched into the EF5a–d
+> human-screenshot checkpoint (GPU-hang rule: no relaunch-loop).
 >
 > **EF5b note (just landed):** the panel "bypass offenders" (hand-typed `SysVec4` color literals that gave
 > the UI its raw feel) are now routed through `EditorTheme`. Added a **SEMANTIC tokens** block to
@@ -167,7 +190,7 @@ this same handoff for the chunk after it.
 - [x] EF9d — Window-menu open-state sync — checkmark already queried `panels.IsShown` each frame (EF9c made that the same persisted flag); the bind-gap was that a menu-reopened CORE panel flipped `Shown` but never surfaced (only the two viewports consumed `pendingFocusWindow`). Fix: `DrawDockPanel` now `SetNextWindowFocus()` when its panel == `pendingFocusWindow`, so re-open surfaces it — same Unity focus-on-open the viewports get. No state-vs-disk disagreement possible (EF9c gift).
 - [x] EF5a — palette + geometry — identity = (i) faithful UE5 (cool graphite + azure, no warm accent). Reworked `ImGuiController.ApplyGeometry` (rounding into UE5's 4-5px band) + `ApplyColors` (deeper-graphite bg0..titleBg ramp, brighter `textDim` for ≥4.5:1 on inputs) + mirrored the `EditorTheme` Bg0..TitleBg ramp / OverlayBg / RowLabel-RowCaption. Pure style, behaviour byte-unchanged; WCAG contrasts verified (body 12-16:1, accent 4.94:1). Only `ImGuiController.cs`+`EditorTheme.cs` touched. Visual verify batched into the EF5a–d checkpoint.
 - [x] EF5b — centralize bypass-color offenders — added a SEMANTIC tokens block to `EditorTheme.cs` (Error/Warning/Success, PrefabBlue/RowChild/IconMuted, PrimaryAction±, FolderTint/Dim, LogLevel[], Hairline/TreeGuide, PopupBg/InputBg) and routed the hand-typed `SysVec4` literals in ConsolePanel/HierarchyPanel/AssetBrowserPanel/StatsPanel/BuildPanel/VolumeProfileEditor through them. Deliberately harmonizes a few slightly-off literals into one family (NOT byte-identical — visual only, behaviour unchanged). Remaining literals in those files are justified (alpha-only overlays, alpha/scale derivations of a token, the no-icon fallback glyph, the `Style(ext)` file-type taxonomy data table — annotated in-file). Only the 6 panels + `EditorTheme.cs` touched. Build 0-error, oracle EXIT=0. Visual verify batched into the EF5a–d checkpoint.
-- [ ] EF5c — panel chrome polish
+- [x] EF5c — panel chrome polish — routed inspector-cluster `SeparatorText` → `EditorDecoration.DrawSectionHeader` (incl. the shared `ImGuiComponentGui.Header` adapter, so all attribute `[Header]` sections at once) + toolbar `Separator()` → `DrawDivider()` in Console/Hierarchy/Assets. Gave `DrawSectionHeader` Caption-font + symmetric pad so titles recede; dropped now-redundant leading `Spacing()`. Visual-only (not byte-identical), behaviour unchanged; build 0-error, oracle EXIT=0. Out of scope: Stats/TagsLayers/Settings + modal-dialog separators (left stock). Visual verify batched into the EF5a–d checkpoint.
 - [ ] EF5d — type/spacing tokens everywhere
 - [ ] EF12 — rename Inspector → "Details"
 - [ ] EF-LAYOUT — inspector layout model (design + shared helper)
@@ -420,8 +443,20 @@ the acceptance bar for the whole EF5 series is "looks like UE5". EF5a–d all bu
   ProfilerPanel/AssetInspectors still hold semantic literals (e.g. InspectorPanel:711/811 prefab-blue,
   :1192 warn, :1500 amber-red) — those are the inspector cluster's, addressed by EF5c/EF5d; the EF5b
   tokens (`PrefabBlue`/`Warning`/`Error`) already exist for them to adopt.
-- **EF5c — Panel chrome polish:** rounded panel headers / section headers via `EditorDecoration`
-  (cards, dividers, accent stripes) applied consistently across Inspector/Hierarchy/Assets/Console.
+- **EF5c — Panel chrome polish — ✅ DONE:** routed the stark stock section/divider widgets through the
+  existing `EditorDecoration` primitives (no hand-rolled DrawList chrome — the lib already had them). Every
+  inspector-cluster `ImGui.SeparatorText(...)` → `EditorDecoration.DrawSectionHeader(...)` (the shared
+  `ImGuiComponentGui.Header` adapter covers ALL attribute `[Header]` sections at once; plus `InspectorPanel`
+  Render-Features + the `[Header]` path, `ComponentPreviews` ×11, `AssetInspectors` ×2) — a Caption-font,
+  RowCaption-colored label + palette-hairline trailing rule instead of ImGui's framed default box. The
+  toolbar→content `ImGui.Separator()` in `ConsolePanel`/`HierarchyPanel`/`AssetBrowserPanel` (nav-bar) →
+  `EditorDecoration.DrawDivider()` (quieter `BorderLight` hairline). `DrawSectionHeader` gained a built-in
+  symmetric pad (`SectionPadY=4f`) + `PushFont(Caption)` so a title recedes as a quiet group rule; the
+  immediately-preceding redundant `ImGui.Spacing()` were dropped (pad now owned in one place). Visual-only
+  (deliberate harmonization, NOT byte-identical); behaviour unchanged. Out of scope (untouched): Stats/
+  TagsLayers/Settings `SeparatorText`/`CollapsingHeader`, and the modal-dialog internal separators in
+  `AssetBrowserPanel` (left stock — dialog internals, not panel chrome). Build 0-error, oracle EXIT=0.
+  Visual verify batched into the EF5a–d checkpoint.
 - **EF5d — Type/spacing tokens:** verify type-scale (Display/Header/Body/Caption) + spacing are applied
   everywhere (kills residual "flat" look); fix any panel still using raw `ImGui.Text`.
 DoD: human screenshots before/after each sub-chunk — clearly modern, not default-ImGui; no panel

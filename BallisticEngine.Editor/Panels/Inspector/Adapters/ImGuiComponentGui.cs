@@ -100,7 +100,7 @@ public sealed class ImGuiComponentGui : IInspectorGui {
     }
     public void EndRow() { }
 
-    public void Header(string t) => ImGui.SeparatorText(t);
+    public void Header(string t) => EditorDecoration.DrawSectionHeader(t);
     public void Space(float h) => ImGui.Dummy(new SysVec2(0, h));
     public void HelpBox(string t) => ImGui.TextWrapped(t);
 

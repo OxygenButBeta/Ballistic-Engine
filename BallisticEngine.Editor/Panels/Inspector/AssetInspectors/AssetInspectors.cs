@@ -403,7 +403,7 @@ internal sealed class AudioClipAssetInspector : IAssetInspector {
             return;
         }
 
-        ImGui.SeparatorText("Preview");
+        EditorDecoration.DrawSectionHeader("Preview");
         bool playing = InspectorPanel.audioPreviewVoice is { IsPlaying: true };
         if (ImGui.Button(playing ? $"{EditorIcons.Pause}  Stop" : $"{EditorIcons.Play}  Play",
                 new SysVec2(120, 0))) {
@@ -431,7 +431,7 @@ internal sealed class AnimationClipAssetInspector : IAssetInspector {
             return;
         }
 
-        ImGui.SeparatorText("Animation");
+        EditorDecoration.DrawSectionHeader("Animation");
         ImGui.TextDisabled($"Duration: {clip.DurationSeconds:F2}s");
         ImGui.TextDisabled($"Channels (animated bones): {clip.Data.Channels.Length}");
         ImGui.TextDisabled($"Ticks/sec: {clip.TicksPerSecond:F0}");

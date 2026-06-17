@@ -318,8 +318,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     void DrawRenderFeatureList(RenderFeatures host) {
         List<RenderFeature> list = host.Features ??= new();
 
-        ImGui.Spacing();
-        ImGui.SeparatorText("Render Features");
+        EditorDecoration.DrawSectionHeader("Render Features");
 
         if (list.Count == 0)
             ImGui.TextDisabled("No render features. Add one below.");
@@ -1100,7 +1099,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                 EndGroup();
 
             if (attrs.Space is not null) { CloseGrid(); ImGui.Dummy(new SysVec2(0, attrs.Space.Height)); }
-            if (attrs.Header is not null) { CloseGrid(); ImGui.SeparatorText(attrs.Header.Text); }
+            if (attrs.Header is not null) { CloseGrid(); EditorDecoration.DrawSectionHeader(attrs.Header.Text); }
 
             // Entering a new foldout group: draw its collapsible header once. When open, the matching
             // TreePop happens in EndGroup; when collapsed, TreeNodeEx requires no TreePop.
