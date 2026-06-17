@@ -2262,9 +2262,16 @@ internal sealed class EditorApplication {
         ImGui.End();
 
         // ── RIGHT: visibility menu (grid / gizmos / GI-debug probes) ─────────────────────────────────────
+        // EF2: the orientation axis-ball (OrientationGizmo.Draw, called from DrawSceneView) also anchors
+        // top-right of the viewport, so the eye-menu used to overlap its lower axis balls. Push the eye-menu
+        // DOWN below the gizmo's footprint (still right-aligned) so the balls stay fully visible+clickable.
+        // Footprint mirrors OrientationGizmo: center.Y = imageMin.Y + (radius=34 + 14)*S, bottom of the
+        // hover ring = center.Y + (radius=34 + 8)*S = imageMin.Y + 90*S; +a small gap for clearance.
+        const float gizmoBottom = (34f + 14f) + (34f + 8f);   // 90 px (pre-scale), see OrientationGizmo.cs:24-25,34
+        float eyeMenuY = imageMin.Y + gizmoBottom * S + margin;
         EditorPrefs prefs = EditorPrefs.Current;
-        ImGui.SetNextWindowPos(new SysVec2(imageMin.X + imageSize.X - margin, imageMin.Y + margin),
-            ImGuiCond.Always, new SysVec2(1f, 0f));   // pivot top-right
+        ImGui.SetNextWindowPos(new SysVec2(imageMin.X + imageSize.X - margin, eyeMenuY),
+            ImGuiCond.Always, new SysVec2(1f, 0f));   // pivot top-right, below the orientation gizmo
         ImGui.SetNextWindowBgAlpha(EditorTheme.OverlayBg.W);
         if (ImGui.Begin("##sceneVisibilityOverlay", flags)) {
             if (EditorIcons.GhostButton("ovvisibility", $"{EditorIcons.Eye} {EditorIcons.ChevronDown}",

@@ -19,8 +19,35 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF2** (orientation gizmo ↔ visibility eye-menu overlap, top-right)
-> Last committed chunk: **EF1** (rode in with **EF5e** @ `f48a8447`; see the EF1 reconciliation note below) · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **EF4** (FPS/stats overlay shows in Scene view in edit mode — gate it Game-view-only)
+> Last committed chunk: **EF2** (gizmo ↔ eye-menu de-overlap) · Branch: `dx12-renderer`
+>
+> **EF2 note (just landed):** the orientation axis-ball (`OrientationGizmo.Draw`) and the visibility
+> eye-menu (`##sceneVisibilityOverlay` in `DrawSceneViewToolbar`) both anchored the viewport's top-right
+> corner, so the eye button overlapped the gizmo's lower axis balls. Fix (one hunk in
+> `EditorApplication.cs`): the eye-menu's `SetNextWindowPos` Y is pushed DOWN by the gizmo's footprint —
+> `eyeMenuY = imageMin.Y + (34+14 + 34+8)*S + margin` (= `imageMin.Y + 90*S + margin`; 90 px = the gizmo
+> center offset `radius+14` plus the hover-ring bottom `radius+8`, mirroring `OrientationGizmo.cs:24-25,34`),
+> still right-aligned (pivot `(1,0)`), so the axis balls stay fully visible+clickable and the eye button
+> sits just below them. Touched ONLY `EditorApplication.cs` — staged selectively (`git add -p`) so the
+> pre-existing not-mine dirt (`RenderPassTogglesWindow.Draw(S)` etc.) stayed unstaged. Build 0-error
+> (Editor csproj, clean `--no-incremental` scratch dir), oracle EXIT=0 (19 suites). Human-screenshot DoD
+> (gizmo fully visible+clickable, eye-menu not overlapping) rides the batched viewport-overlay checkpoint
+> (EF1/EF2/EF4/EF6); NOT relaunch-looped (GPU-hang rule).
+>
+> **For EF4 (next):** the FPS/stats overlay appears in the Scene view in edit mode, which is misleading
+> (edit-mode frame timing is on-demand/inconsistent). Root: a single global `showStats` gates BOTH views
+> (the `stats.Draw` call sites at `EditorApplication.cs:1749/1974` — re-grep for `stats.Draw`, line numbers
+> drift). Fix: keep the Game-view `stats.Draw`; gate the Scene-view one so the FPS readout does NOT show in
+> the Scene view. **Open decision the plan pre-resolves → DEFAULT to (a): FPS Game-view-only regardless of
+> play state** (alt (b) = Game-view + `SceneManager.IsPlaying` only — do NOT pick (b) unless the user says
+> so). The plan allows the Scene view to keep a minimal draw/tri counter if desired, but NOT the FPS number.
+> DoD: Scene view shows no FPS; Game view unchanged. Section `Docs/Plans/editor-fixes-plan.md` `:763`. EF4
+> likely touches `EditorApplication.cs` (the `stats.Draw` call sites) → again do NOT run the
+> selective-staging empty-set guard against `EditorApplication`; `git add -p` and stage ONLY your stats-gate
+> hunk(s) (+ the plan doc), leaving the not-mine dirt unstaged — exactly as EF1/EF2/EF8/EF12 did. Verify via
+> build (Editor csproj, clean `--no-incremental` scratch dir) + reflection oracle (19 suites, EXIT=0); human
+> screenshot batched into the viewport-overlay set; NOT relaunch-looped (GPU-hang rule).
 >
 > **EF13+EF14 note (just landed):** the Hierarchy gained Collapse All / Expand All toolbar buttons and now
 > defaults a freshly-loaded scene to fully collapsed. ALL in `HierarchyPanel.cs` (Editor-only, one file).
@@ -59,8 +86,9 @@ This keeps each chat's context small and the history bisectable.
 > overlay checkpoint (EF1/EF2/EF4/EF6) — do NOT relaunch-loop the editor (GPU-hang rule); the user reviews
 > the batch.
 >
-> **For EF2 (next):** the orientation gizmo (axis balls) and the visibility eye-menu OVERLAP in the
-> viewport's top-right. Root (validated this chat): both anchor top-right within ~10-50px —
+> **EF2 note (SUPERSEDED — now landed; see the "EF2 note (just landed)" at the top of this pointer):** the
+> orientation gizmo (axis balls) and the visibility eye-menu OVERLAPPED in the
+> viewport's top-right. Root (validated): both anchor top-right within ~10-50px —
 > `OrientationGizmo.Draw` centers at `viewMin.X + viewSize.X - radius - 14*scale, viewMin.Y + radius +
 > 14*scale` with `radius = 34*scale` (footprint ≈ `82*scale` square top-right, `OrientationGizmo.cs:24-25`),
 > while the eye-menu overlay window `##sceneVisibilityOverlay` is pinned to `imageMin.X + imageSize.X -
@@ -558,7 +586,7 @@ this same handoff for the chunk after it.
 - [x] EF8 — split Layer Collision Matrix into its own panel — new `LayerCollisionMatrixPanel` (Window > Layer Collision Matrix) owns the matrix UI (the `DrawCollisionMatrix` body moved verbatim from `TagsLayersPanel`, dropped its `CollapsingHeader` wrapper since it's now the whole window, "above"→"in Tags & Layers" empty-state hint); `TagsLayersPanel` keeps only Tags + Layers. Wired exactly like `TagsLayers`: `WindowKeys.LayerCollision` const + `PathToWindowKey["Window/Layer Collision Matrix"]` + `[MenuItem("Window/Layer Collision Matrix", 25)]`→`EditorWindows.Toggle` in `EditorMenus.cs`; owned as a field on `EditorApplication` + the three switch arms (`ToggleWindow`/`OpenWindow`/`IsWindowOpen`) + both `Draw(S)` call sites (fullscreen `:756` + normal `:831`). Both panels read the same `LayerManager` store; matrix edits still `LayerSettings.Save`. Build 0-error (Editor csproj, clean `--no-incremental` scratch dir), oracle EXIT=0 (19 suites; A1 Menu/Window registry 17/17 confirms the new `[MenuItem]` compiles into the discovery). Touched 4 files (`LayerCollisionMatrixPanel.cs` new, `TagsLayersPanel.cs`, `EditorMenus.cs`, `EditorApplication.cs` — all mine). Human screenshot (two distinct windows; matrix edits persist; Tags & Layers no longer shows the matrix) batched into the editor set; NOT relaunch-looped.
 - [x] EF13+EF14 — hierarchy collapse/expand + collapsed-by-default — `HierarchyPanel` now OWNS the tree open-state (`Dictionary<int,bool> openState` keyed by `entity.InstanceId.GetHashCode()`). EF13 = two toolbar GhostButtons (ChevronRight=Collapse All, ChevronDown=Expand All) that arm a one-frame `ExpandForce`; EF14 = a node seen for the FIRST time (id not in tracker) defaults collapsed (covers first scene load + new entities, no scene-change detection). `SetNextItemOpen` is pushed ONLY on a forced/first-seen frame; otherwise ImGui's `TreeNodeEx` return is read back into the tracker so manual expansions persist. `DefaultOpen` flag dropped. Parent nodes only (leaves untracked); tracker pruned to live entities. Editor-only (1 file). Build 0-error, oracle EXIT=0 (19 suites).
 - [x] EF1 — gizmo-mode button auto-width — landed bundled with **EF5e** @ `f48a8447` (not a standalone commit): `DrawSceneViewToolbar` (`EditorApplication.cs:2214-2238`) sizes the Move/Rotate/Scale buttons to `bw = max(58*S, widest-of-three CalcTextSize + FramePadding.X*2)` and the Pivot/Center button likewise, with the pill background widened to match — labels no longer clip to "Mov"/"Rota"/"Sca". The checklist/pointer just weren't ticked when it rode in with EF5e; reconciled this chat (no new code), build 0-error + oracle 19/19. Human-screenshot DoD rides the batched viewport-overlay checkpoint (EF1/EF2/EF4/EF6).
-- [ ] EF2 — gizmo ↔ eye-menu de-overlap
+- [x] EF2 — gizmo ↔ eye-menu de-overlap — the visibility eye-menu (`##sceneVisibilityOverlay` in `DrawSceneViewToolbar`) was anchored top-right (`imageMin.X+imageSize.X−margin, imageMin.Y+margin`, pivot `(1,0)`) directly under the orientation axis-ball (`OrientationGizmo.Draw`, same top-right corner) → the eye button overlapped the gizmo's lower balls. Fix: push the eye-menu's `SetNextWindowPos` Y DOWN by the gizmo's footprint + gap — `eyeMenuY = imageMin.Y + (34+14 + 34+8)*S + margin = imageMin.Y + 90*S + margin` (90 px = gizmo center offset `radius+14` + hover-ring bottom `radius+8`, mirroring `OrientationGizmo.cs:24-25,34`), staying right-aligned so the axis balls are fully visible+clickable and the eye button sits just below them. Touched ONLY `EditorApplication.cs` (the eye-menu hunk in `DrawSceneViewToolbar`) — staged selectively with `git add -p` to leave the pre-existing not-mine dirt (`RenderPassTogglesWindow.Draw(S)` etc.) unstaged. Build 0-error (Editor csproj, clean `--no-incremental` scratch dir), oracle EXIT=0 (19 suites). Human-screenshot DoD (gizmo fully visible+clickable, eye-menu not overlapping) rides the batched viewport-overlay checkpoint (EF1/EF2/EF4/EF6); NOT relaunch-looped (GPU-hang rule).
 - [ ] EF4 — FPS scene-view gate
 - [ ] EF6 — delete dead shading-mode dropdown
 
