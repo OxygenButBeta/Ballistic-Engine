@@ -175,6 +175,130 @@ ele geçince yapılacak (plan R0.4 açık-uç maddesi).
 
 ---
 
+## R0.4 RE-WRITTEN — RTX 2060 class, RT modeled separately (2026-06-18, MODELED-ONLY)
+
+> ★ **This replaces the STALE GTX-1660 model above** (kept for the record, not deleted). Min target =
+> **RTX 2060 class** (rev3+, plan §5). **NO code, NO capture** — pure model/document chunk (PROVISIONAL
+> POLICY: every input re-grepped from the tree + the R0.3 RE-MEASURED table + the §0 GI-component ms from
+> memory `dx12-lumen-gi-p0-2026-06-16`). All RT-min numbers are a **MODEL** (no real 2060 on hand). Per the
+> user decision this run, the **two-stage closure picks (a) dev-enable** (model suffices to close R3) and
+> marks **(b) target-met PERMANENTLY MODELED** (no real 2060/3060 on hand → not ship-gating; see §closure).
+>
+> ‼ **PRE-R1.0.** Every GI-side input below is the R0.3 RE-MEASURED ms which is itself pre-R1.0. R1.0 lights
+> color-only/whole-mesh surfaces → more lit RT hits → GI cost rises → **RE-MEASURE this entire model after
+> R1.0** (the §4 gate + the dev-enable closure both re-validate at R2.5, plan ORDER FINDING line 44).
+
+### (A) The two compute-vs-RT classes are modeled SEPARATELY (the core R0.4 mandate)
+
+The GI stack splits into **two hardware classes** that scale to a 2060 by **different multipliers** —
+modeling them with one TFLOPS-divide (the GTX-1660 model's mistake) is WRONG:
+
+| Pass | HW class (re-grepped) | Why | Scaling basis to 2060 |
+|---|---|---|---|
+| **SSGI (SSILVB)** | **COMPUTE** (no RT cores) | screen-space horizon march, `Ssgi.hlsl`; reads depth/normal/color, no BVH | bandwidth+ALU only → R0.2's **5–8×** interval |
+| **Screen-space probes (gather)** | **COMPUTE** | `ScreenProbeTrace` + DDGI gather is screen-space sampling of the atlas | bandwidth+ALU → **5–8×** |
+| **DDGI trace/blend** | **RT-CORE** (DXR) | `DdgiTrace`/`DxrGi.ClosestHit` cast BVH rays per probe (inline/closest-hit) | **RT-core throughput, modeled separately+conservatively (below)** |
+| **RT-GI hit shading** | **RT-CORE** (DXR) | `DxrGi` 1-bounce world ray + inline shadow rays | **RT-core, separate** |
+| **RT reflections** | **RT-CORE** (DXR) | `DxrReflections` closest-hit off the world cache | **RT-core, separate** |
+
+**Why the RT ratio is NON-LINEAR (not a TFLOPS-divide).** The RX 9070 XT is RDNA4 — **2nd-gen+ ray
+accelerators** (RDNA4 ~doubled RT throughput vs RDNA3: denser BVH8 traversal, hardware instance/OBB
+transform, more box/tri tests per RA per clock). The RTX 2060 is Turing TU106 — **1st-gen RT cores**
+(no concurrent RT+shading on the same SM, no Shader Execution Reordering, no opacity micromaps,
+nominal ~5 GRays/s). The generational RT-feature gap means **RT-bound work scales WORSE than the
+ALU/bandwidth ratio** (a Turing 1st-gen RT core does materially less ray work per FLOP than an RDNA4 RA).
+So RT passes get a **separate, MORE PESSIMISTIC multiplier than the compute 5–8×.**
+
+### (B) Hardware specs (the divide bases — modeled, public figures, knowledge-cutoff)
+
+| GPU | FP32 TFLOPS | Bandwidth | RT generation | Role |
+|---|---|---|---|---|
+| RX 9070 XT (dev) | ~48.7 | ~640–672 GB/s (256-bit GDDR6) | RDNA4 2nd-gen+ RA | measurement substrate |
+| **RTX 2060 (min target)** | **~6.5** | **~336 GB/s** | **Turing 1st-gen RT** | **the budget gate** |
+| RTX 3060 (next-up ref) | ~12.7 | ~360 GB/s | Ampere 2nd-gen RT (~2× tri) | sanity upper-bound |
+
+- **Compute ratio (RX9070XT→2060):** FP32 ~48.7/6.5 ≈ **7.5×**; bandwidth ~660/336 ≈ **2.0×**. R0.2 already
+  fixed the compute interval at **5× (optimistic) … 8× (pessimistic)** for the bandwidth+ALU-bound mix —
+  R0.4 ADOPTS it unchanged for the COMPUTE passes (SSGI, screen-probe gather).
+- **RT ratio (separate + conservative):** the raw FP32 divide (7.5×) is the FLOOR for RT, not the ceiling.
+  Add the 1st-gen-RT penalty (no concurrent RT+shading serializes trace behind shading on Turing;
+  smaller ray-tri rate per RA). R0.4 models RT at **8× (optimistic) … 14× (pessimistic)** — strictly
+  worse than the compute interval, per the §2 R0.4 "RT ratio non-linear / model RT separately+conservatively"
+  mandate. (Sanity: the 3060 with 2nd-gen RT + ~2× FP32 would land ~½ the 2060's RT slowdown — consistent.)
+
+### (C) GI-on cost on the modeled 2060 (1080p NATIVE — the pessimistic gate)
+
+Inputs (RX 9070 XT, re-grepped, NOT stale): per-component **§0** — SSGI **~4.2ms** (memory line 27),
+screen-probe gather **~0.18ms** (line 158), DDGI trace+blend+gather **~0.41ms** (line 213), RT-GI hit
+**~4.0–4.79ms** (lines 28/P2.1), RT-refl **1.51–2.07ms** (line 398). R0.3 RE-MEASURED whole **GI-pass
+3.3–5.1ms** (this doc, table above — the SSGI ScreenSpace shipping path the baseline actually ran).
+
+Apply the SEPARATE multipliers (compute 5–8×, RT 8–14×):
+
+| Component | RX9070XT ms | class | 2060 optimistic | 2060 pessimistic |
+|---|---|---|---|---|
+| SSGI | 4.2 | compute ×5 / ×8 | 21.0 | 33.6 |
+| Screen-probe gather | 0.18 | compute ×5 / ×8 | 0.9 | 1.4 |
+| DDGI (trace+blend+gather) | 0.41 | RT ×8 / ×14 | 3.3 | 5.7 |
+| RT-GI hit (if RayTraced GI) | 4.0 | RT ×8 / ×14 | 32.0 | 56.0 |
+| RT reflections | 2.07 | RT ×8 / ×14 | 16.6 | 29.0 |
+
+- **The SHIPPING High path is NOT "all of the above".** R2.1 High = screen-probe + SSGI (on-screen) +
+  DDGI far-field + RT-refl (roughness-split) + emissive — it does **NOT** also run the full RT-GI hit
+  per-pixel march (DDGI gather REPLACES it as the GI source, memory line 152). So the gate stack is:
+  **SSGI + screen-probe gather + DDGI + RT-refl.**
+- **Modeled High GI-on cost @ 1080p native, 2060:** optimistic 21.0+0.9+3.3+16.6 ≈ **~42 ms**;
+  pessimistic 33.6+1.4+5.7+29.0 ≈ **~70 ms**. (Diffuse-only, refl-off: ~25–41 ms.)
+
+### (D) Total frame on the modeled 2060 + the FSR verdict
+
+R0.2 non-GI floor (RX 9070 XT) = **3.3–4.7 ms** cpuFrame (local floor scenes) → **2060 non-GI ~17–38 ms**
+(compute 5–8×, R0.2). Add GI-on (C):
+
+- **1080p NATIVE, High (SSGI+probe+DDGI+RT-refl):** non-GI 17–38 + GI 42–70 = **~59 .. 108 ms** →
+  **9–17 fps.** Blows 60fps (16.6ms) AND 30fps (33.3ms) by a wide margin. **60fps@1080p-native on a 2060
+  is NOT credible — confirmed, and now QUANTIFIED (R0.2 said it pre-GI; R0.4 confirms it with GI on top).**
+- **FSR is MANDATORY, not optional** (R0.2's crux, now reinforced). The COMPUTE + screen-space passes
+  (non-GI raster/post, SSGI, screen-probe gather, RT-refl's screen-space resolve) scale with internal
+  pixel count: **FSR-Quality = 720p internal ≈ 2.25× fewer pixels → those passes ÷~2.25.** The **RT-core
+  passes that are resolution-independent stay fixed:** DDGI is a fixed probe grid (res-independent), and
+  the RT trace itself (ray count) is per-probe / per-reflection-pixel — DDGI does NOT scale with screen
+  res; RT-refl's RAY cost scales with its (internal) pixel count but its BVH-traverse floor does not.
+- **Modeled FSR-Quality (720p internal), High, 2060:**
+  - non-GI: 17–38 ÷2.25 ≈ **8–17 ms**
+  - SSGI: 21.0–33.6 ÷2.25 ≈ **9–15 ms**
+  - screen-probe gather: 0.9–1.4 ÷2.25 ≈ **0.4–0.6 ms**
+  - DDGI: **3.3–5.7 ms** (res-independent, UNCHANGED)
+  - RT-refl: 16.6–29.0 ÷2.25 ≈ **7–13 ms** (screen-space-resolve part scales; BVH floor a touch higher)
+  - **Total: ~28 .. 51 ms → fits 30fps (33ms) at the OPTIMISTIC end, misses it at the pessimistic end;
+    misses 60fps (16.6ms) either way.**
+- **★ PRE-R1.0 GATE VERDICT (modeled, pessimistic, 2060):** **the credible ship target is 30fps@1080p via
+  FSR-Quality (720p internal), High-preset = screen-probe + SSGI + DDGI + RT-refl.** 60fps@1080p needs
+  EITHER a 3060-class GPU (2nd-gen RT + ~2× FP32 ≈ halves the RT terms → ~14–26ms FSR-Quality) OR a Low
+  preset (SSGI half-res + RT-refl off) — this is exactly the **R2.1 preset-math crux** to resolve with the
+  real per-preset FSR internal-res numbers. R0.4 supplies the PRE-MODEL; **R2.1 finalizes it.**
+
+### (E) Two-stage closure — DECIDED this run (user)
+
+- **(a) dev-enable — SELECTED.** The model above is sufficient to CLOSE the R3 work: it establishes the
+  target (30fps@1080p via FSR-Quality, High = probe+SSGI+DDGI+RT-refl on a 2060) and shows FSR is
+  mandatory and RT-GI-per-pixel must stay OFF in favor of DDGI gather. Development proceeds on the dev
+  card (RX 9070 XT) against this modeled budget; R2.1 tightens the preset math.
+- **(b) target-met — PERMANENTLY MODELED.** No real 2060/3060 on hand (user decision this run: do not
+  stop/ask for real hardware). The ship-gating measurement on a physical 2060 is **deferred indefinitely
+  and explicitly marked MODELED-ONLY** — not a silent default, a recorded decision (plan §4 "target-met
+  awaits real 2060/3060"; the closure options borrow/cloud/telemetry stay available if a card appears).
+  Any "fits on RT-min HW" headline remains a MODEL until a physical 2060/3060 is measured.
+
+**R0.4 DoD met:** RT vs compute classes modeled SEPARATELY (compute 5–8× adopted from R0.2; RT 8–14×
+strictly more pessimistic, non-linear, justified by RDNA4-2nd-gen-RA vs Turing-1st-gen-RT gap); inputs
+are the R0.3 RE-MEASURED 3.3–5.1ms GI-pass + §0 re-grepped component ms (NOT the stale 3.2–4.2); FSR
+mandatory + 30fps@1080p-FSR-Quality target derived; two-stage closure WRITTEN, **dev-enable SELECTED**,
+**target-met marked PERMANENTLY MODELED**; STALE GTX-1660 section PRESERVED above under its banner, new
+2060 section added below it; everything flagged PRE-R1.0 → re-measure post-R1.0. **No code, no capture.**
+
+---
+
 ## R0 DoD durumu (mandated order: R0.0 → R0.1 → R0.2 → R0.3 → R0.4 → R1 …)
 
 - [x] **R0.0a** Re-ground (PROVISIONAL POLICY) — committed `ef7f28c1`.
@@ -185,12 +309,17 @@ ele geçince yapılacak (plan R0.4 açık-uç maddesi).
       present locally) + determinism CHARACTERIZED (paused & play byte-identical run-to-run; f60≠f240 expected)
       + per-pass perceptual NOISE-FLOOR measured (resting GI-isolate boiling 0.027–0.084 → §4 gate ≤0.3) →
       `Docs/Validation/gi-noise-floor.json`. ‼ X AND noise-floor are PRE-R1.0 → re-measure post-R1.0.
-- [ ] **R0.4** Extrapolation — RTX 2060 (NOT GTX-1660) RT budget modeled separately+conservatively;
-      two-stage closure (dev-enable / target-met). ⚠ **The R0.4 section above is STALE** — it is the
-      prior out-of-order worker's GTX-1660 model, which contradicts the rev3+ min-target (RTX 2060). The
-      R0.4 worker must re-write it against the 2060 class and feed it the RE-MEASURED R0.3 GI-pass ms
-      (3.3–5.1ms, above), NOT the stale 3.2–4.2 numbers in the old R0.4 table.
+- [x] **R0.4** Extrapolation (this chunk) — STALE GTX-1660 section PRESERVED under its banner; new
+      **"R0.4 RE-WRITTEN — RTX 2060 class"** section added below it. RT vs compute modeled SEPARATELY
+      (compute 5–8× from R0.2; RT 8–14× strictly more pessimistic — RDNA4 2nd-gen+ RA vs Turing 1st-gen
+      RT, non-linear, NOT a TFLOPS-divide). Inputs = R0.3 RE-MEASURED 3.3–5.1ms + §0 re-grepped component
+      ms (SSGI 4.2 / probe-gather 0.18 / DDGI 0.41 / RT-GI 4.0 / RT-refl 1.5–2.07). **Verdict: 60fps@1080p
+      -native NOT credible on a 2060; FSR mandatory; target = 30fps@1080p via FSR-Quality (720p internal),
+      High = screen-probe+SSGI+DDGI+RT-refl.** Two-stage closure: **(a) dev-enable SELECTED**; **(b)
+      target-met PERMANENTLY MODELED** (no real 2060/3060, user decision). ‼ PRE-R1.0 → re-measure post-R1.0.
 - [~] R0.0b özel fixture'lar — built (`GiFixtures/`), ColorOnly bug confirmed visible (isolate 2.30) → R1.0.
 
-**Sıradaki:** **R0.4** (extrapolation/model chunk, no code). THEN R1.x (already committed `e1ccbbf6`/`fa3d6bb6`/
-`6b7e9565` OUT-OF-ORDER) is re-validated against this now-existing R0 baseline at R2.5.
+**★ FAZ R0 TAMAMLANDI (R0.0a→R0.4).** Sıradaki = **R1.0 (MaterialId)** — R1's biggest item, ALREADY
+committed OUT-OF-ORDER (`e1ccbbf6`/`fa3d6bb6`/`6b7e9565`) WITHOUT an R0 baseline. Per ORDER FINDING
+(plan line 44) + §2 R2.5, R1.0's "explain any nonzero diff" + re-measured X/noise-floor were done on a
+MISSING denominator → R1.0 is re-validated against THIS now-existing R0 baseline (re-confirm at R2.5).
