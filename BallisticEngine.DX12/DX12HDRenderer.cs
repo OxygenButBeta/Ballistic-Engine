@@ -698,6 +698,9 @@ public sealed class DX12HDRenderer : HDRenderer {
         if (taaRootSig != null) AllocTaaTargets();
         if (rtShadowMask != null) AllocRtShadowMask();
         AllocFsrOutput();
+        // Fan the resize out to any pass that owns resolution-dependent targets. No-op while the graph is
+        // empty (scaffold). Registration order matches the AllocXxx sequence above once passes populate it (R5).
+        graph?.Resize(internalW, internalH);
     }
 
     void AllocFsrOutput() {
@@ -819,6 +822,12 @@ public sealed class DX12HDRenderer : HDRenderer {
         gpuDriven = new Dx12GpuDrivenRenderer(dev);
 
         AllocFsrOutput();   // output-res UAV target for FSR (allocated even when off — cheap, simplifies resize)
+
+        // Phase-1 pass-graph scaffold: build the executor EMPTY (zero passes registered yet). Wired with
+        // the renderer's TimePass so converted passes get GPU timings; runs as a no-op until passes are
+        // moved onto IRenderPass in later chunks. Build() once for the stable order (R1).
+        graph = new Dx12RenderGraph(TimePass);
+        graph.Build();
     }
 
     Dx12GpuDrivenRenderer gpuDriven;
@@ -830,6 +839,12 @@ public sealed class DX12HDRenderer : HDRenderer {
     Vector3 hizLastCamPos;
     bool hizPrimed;     // false until we have a valid previous-frame depth (first frame / after a big jump)
     readonly System.Collections.Generic.List<IStaticMeshRenderer> wholeMeshRenderers = new();
+
+    // The pluggable pass list (phase 1 scaffold → phase 2 true frame graph). Built EMPTY in Initialize and
+    // runs ZERO passes for now: BeginRender still records every pass INLINE; graph.Execute(ctx) is a proven
+    // no-op (byte-identical) until passes are converted to IRenderPass one chunk at a time. Built once
+    // (stable order, R1). Resize fans out to it (no-op while empty, R5-ordered once populated).
+    Dx12RenderGraph graph;
 
     // Cascade caching: skip re-rendering the sun cascades when the texel-snapped fit matrices AND the caster
     // geometry are unchanged (the depth-array layers are retained → byte-identical; big win for a static camera).
@@ -2188,6 +2203,33 @@ public sealed class DX12HDRenderer : HDRenderer {
             if (ssaoOn) DrawSsao(view, proj);
             DrawComposite(ssaoOn, target);
         }
+
+        // === PHASE-1 PASS-GRAPH SCAFFOLD (chunk 3) ===
+        // Assemble the per-frame context from the locals computed above + the mid-frame-resolved flags, then
+        // run the graph. The graph is EMPTY this chunk, so Execute is a guaranteed no-op — every pass above
+        // still ran inline, so the image is byte-identical. This only proves Dx12FrameContext builds against
+        // the real locals and the executor runs without disturbing the frame. Passes migrate onto it in later
+        // chunks; once a pass moves here its inline call above is deleted. Built last so every mutated field
+        // (SceneColor after the FSR/native branch, IblActive/Shadows/RtShadows/giMode) holds its final value.
+        var ctx = new Dx12FrameContext {
+            View = view, Proj = proj, ViewProj = viewProj,
+            ProjUnjittered = projUnjittered, ViewProjUnjittered = viewProjUnjittered,
+            CurrentJitter = currentJitter, CamPos = camPos,
+            LightDir = lightDir, LightColor = lightColor, Ambient = ambient, Exposure = exposure,
+            WholeMeshRenderers = wholeMeshRenderers, FrustumPlanes = frustumPlanes,
+            TargetW = targetW, TargetH = targetH, OutputW = outputW, OutputH = outputH,
+            Dev = dev, Target = target, Ldr = ldr, GBuffer = gbuffer,
+            Ibl = ibl, SkyLuts = skyLuts, ClusteredLights = clusteredLights,
+            ShadowMap = shadowMap, GpuDriven = gpuDriven,
+            Doors = doors, PostFX = PostFX, Stats = RenderStats.Scene,
+            // mutated-mid-frame fields, set to their resolved final value:
+            SceneColor = fsrActive ? fsrOutput : target,
+            IblActiveThisFrame = iblActiveThisFrame,
+            ShadowsThisFrame = shadowsThisFrame,
+            RtShadowsThisFrame = rtShadowsThisFrame,
+            GiMode = giMode,
+        };
+        graph.Execute(ctx);   // no-op: empty graph (scaffold). Byte-identical to before this chunk.
 
         // Editor display path: leave the LDR composite in PixelShaderResource so the editor's ImGui pass can
         // sample it via SceneColorHandle/GameColorHandle THIS frame. The player (PresentToScreen) keeps it in
