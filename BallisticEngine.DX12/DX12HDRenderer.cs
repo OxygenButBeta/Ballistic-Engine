@@ -1458,10 +1458,16 @@ public sealed class DX12HDRenderer : HDRenderer {
         // canonical spot below (after transparents); GI converts to a pass in chunk 10. ===
         // GI: Off / SSGI / RT-GI (the GI volume dropdown; env doors override). RT-GI traces the scene BVH;
         // both SSGI and RT-GI share the temporal + OIDN + combine resolve. RT-GI falls back to SSGI w/o DXR.
+        // === GI PRAGMATIC REVIVAL R0.1 (2026-06-18) — diffuse-GI re-enabled at this single choke point. ===
+        // The 2026-06-17 hard-disable (`giMode = GiMode.Off`) is reverted to the env/PostFX resolve below, so
+        // Dx12GiPass.Enabled() can return true again and the diffuse-GI pass (SSGI / RT-GI / DDGI / screen
+        // probes / emissive-as-GI) records once more. Env doors take precedence over PostFX.GiMode so the
+        // headless A/B harness can drive GI deterministically (BALLISTIC_DX12_SSGI=1 → ScreenSpace, =0 → Off).
+        // NOTE: this is the DIFFUSE-GI choke point ONLY — SPECULAR reflections (SSR / RT-reflections) stay
+        // disabled by the user's separate WIP (PostProcessSettings.SsrEnabled=false + the VolumePostProcessing
+        // reflections bridge forcing Off); reflections are reopened later per the R2 quality preset, not here.
         string ssgiEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SSGI");
         string rtgiEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RT_GI");
-        // doors.Minimal forces GI Off (the stage harness re-enables with BALLISTIC_DX12_SSGI=1 / _RT_GI=1,
-        // which set giMode below exactly as before since they take precedence over the Minimal default).
         GiMode giMode = rtgiEnv == "1" ? GiMode.RayTraced
                       : ssgiEnv == "1" ? GiMode.ScreenSpace
                       : ssgiEnv == "0" ? GiMode.Off
