@@ -25,6 +25,10 @@ internal static class TerrainTool {
     static bool hadHit;
     static Vector3 lastHitLocal;
 
+    // Heightfield snapshot from BEFORE the active stroke began (a clone of asset.Heights). Captured on
+    // stroke-start so the F2 asset undo can revert the whole stroke as ONE entry; cleared on stroke-end.
+    static float[] strokeBeforeHeights;
+
     // True while a sculpt stroke is in progress — joins the editor's gizmoBusy check so a stroke
     // never also fires click-to-select or starts the transform gizmo.
     public static bool IsInteracting => sculpting;
@@ -74,7 +78,12 @@ internal static class TerrainTool {
         // Begin a stroke on left-press over a hit (and not while flying / over a popup).
         if (!sculpting && hadHit && viewHovered &&
             ImGui.IsMouseClicked(ImGuiMouseButton.Left) && !ImGui.GetIO().WantTextInput) {
-            EditorUndo.Push($"Sculpt Terrain ({Brush})");
+            // F2 asset undo: the heightfield is a .terrain ASSET (saved on stroke end via SaveTerrain),
+            // NOT scene data, so a whole-scene Push could never revert it. Capture the BEFORE heights
+            // here (one clone) and record the EditAsset before/after revert pair on stroke end, when the
+            // AFTER state is known -- exactly the InspectorPanel volume-profile deferred pattern. This
+            // also FIXES undo for sculpting (the prior whole-scene snapshot left the heightfield edited).
+            strokeBeforeHeights = (float[])asset.Heights.Clone();
             sculpting = true;
             activeTerrain = terrain;
         }
@@ -99,10 +108,47 @@ internal static class TerrainTool {
     }
 
     static void EndStroke() {
-        if (activeTerrain?.Terrain3D is { } asset)
+        Terrain terrain = activeTerrain;
+        if (terrain?.Terrain3D is { } asset) {
             AssetDatabase.SaveTerrain(asset);
+
+            // F2: record ONE asset-scoped undo entry for the whole stroke. Undo restores the BEFORE
+            // heights, redo restores the AFTER heights -- both write back into the live asset, rebuild
+            // the mesh, and re-persist the .terrain asset so disk + the loaded instance stay in sync.
+            // The stroke already mutated the heights frame-by-frame, so EditAsset's mutate is a no-op
+            // (it only records the revert pair) -- same shape as the volume-profile / curve F2 sites.
+            float[] before = strokeBeforeHeights;
+            if (before is not null && before.Length == asset.Heights.Length &&
+                !HeightsEqual(before, asset.Heights)) {
+                float[] after = (float[])asset.Heights.Clone();
+                EditorCommands.EditAsset($"Sculpt Terrain ({Brush})",
+                    applyOld: () => RestoreHeights(terrain, asset, before),
+                    applyNew: () => RestoreHeights(terrain, asset, after),
+                    mutate: () => { });
+            }
+        }
+        strokeBeforeHeights = null;
         sculpting = false;
         activeTerrain = null;
+    }
+
+    // Writes a captured heightfield back into the live asset, rebuilds the mesh, and re-persists the
+    // .terrain asset (keeping disk + the loaded instance in lock-step, like SaveTerrain on stroke end).
+    static void RestoreHeights(Terrain terrain, TerrainAsset asset, float[] heights) {
+        Array.Copy(heights, asset.Heights, asset.Heights.Length);
+        asset.BumpRevision();
+        terrain?.Rebuild();
+        AssetDatabase.SaveTerrain(asset);
+    }
+
+    static bool HeightsEqual(float[] a, float[] b) {
+        if (a.Length != b.Length)
+            return false;
+        for (int i = 0; i < a.Length; i++) {
+            if (a[i] != b[i])
+                return false;
+        }
+        return true;
     }
 
     static void EndStrokeIfActive() {

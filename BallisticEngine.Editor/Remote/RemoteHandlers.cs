@@ -31,39 +31,65 @@ internal static class RemoteHandlers {
                     logTail.RemoveRange(0, 100);
             }
         };
+        // D1 FULL: assert the dispatch table covers EXACTLY the engine-side RemoteSchema -- fail-fast on
+        // drift at install (a schema method with no handler would 404 at runtime; a handler with no schema
+        // row would bypass Validate()/help). This REPLACES the old hand-kept "switch == table" lockstep
+        // with a machine-enforced single source of truth, checked once when the command port starts.
+        if (RemoteSchema.CoverageError(handlers.Keys) is { } drift)
+            throw new InvalidOperationException(drift);
     }
 
-    public static object Dispatch(string method, JsonElement p) => method switch {
-        "editor.status" => Status(),
-        "scene.describe" => Describe(),
-        "scene.save" => SceneSave(),
-        "scene.open" => SceneOpen(RequireString(p, "path")),
-        "entity.get" => EntityJson(Resolve(RequireString(p, "entity"))),
-        "entity.create" => EntityCreate(p),
-        "entity.delete" => EntityDelete(RequireString(p, "entity")),
-        "component.add" => ComponentAdd(p),
-        "component.remove" => ComponentRemove(p),
-        "component.set" => ComponentSet(p),
-        "select" => Select(RequireString(p, "entity")),
-        "play.start" => PlayStart(),
-        "play.stop" => Run(() => SceneManager.StopPlay()),
-        "play.pause" => PlayPause(p),
-        "play.step" => PlayStep(),
-        "undo" => Run(EditorUndo.Undo),
-        "redo" => Run(EditorUndo.Redo),
-        "screenshot" => Screenshot(p),
-        "console.tail" => ConsoleTail(p),
-        "scripts.rebuild" => new { ok = bootstrap.ReloadGameScripts() },
-        "unity.import" => UnityImport(p),
-        "editor.frame" => EditorFrame(p),
-        "editor.refresh" => EditorRefresh(),
-        "scene.component.add" => SceneComponentAdd(p),
-        "scene.component.set" => SceneComponentSet(p),
-        "help" => Help(),
-        _ => throw new Exception($"unknown method '{method}' — methods: editor.status, scene.describe, " +
-                                 "scene.save, scene.open, entity.get/create/delete, component.add/remove/set, " +
-                                 "select, play.start/stop/pause/step, undo, redo, screenshot, console.tail, scripts.rebuild"),
-    };
+    // D1 FULL (editor-rework Phase D, "command registry"): the dispatch surface is now a TABLE, not a
+    // 26-case string-switch hand-kept in lockstep with RemoteSchema + help. One method = ONE row here,
+    // keyed by the SAME name RemoteSchema declares; Install() asserts the keys match the schema exactly,
+    // so drift is a startup error instead of a silent 404 / un-validated handler. Each handler is a
+    // uniform Func<JsonElement,object> that reads what it needs from `p` (the request's "params"); the
+    // few that take a single required string just call RequireString(p, "...") inside the lambda (still a
+    // defensive inner guard, though RemoteSchema.Validate already screened it at the boundary).
+    static readonly IReadOnlyDictionary<string, Func<JsonElement, object>> handlers =
+        new Dictionary<string, Func<JsonElement, object>>(StringComparer.Ordinal) {
+            ["editor.status"]       = _ => Status(),
+            ["scene.describe"]      = _ => Describe(),
+            ["scene.save"]          = _ => SceneSave(),
+            ["scene.open"]          = p => SceneOpen(RequireString(p, "path")),
+            ["entity.get"]          = p => EntityJson(Resolve(RequireString(p, "entity"))),
+            ["entity.create"]       = p => EntityCreate(p),
+            ["entity.delete"]       = p => EntityDelete(RequireString(p, "entity")),
+            ["component.add"]       = p => ComponentAdd(p),
+            ["component.remove"]    = p => ComponentRemove(p),
+            ["component.set"]       = p => ComponentSet(p),
+            ["select"]              = p => Select(RequireString(p, "entity")),
+            ["play.start"]          = _ => PlayStart(),
+            ["play.stop"]           = _ => Run(() => SceneManager.StopPlay()),
+            ["play.pause"]          = p => PlayPause(p),
+            ["play.step"]           = _ => PlayStep(),
+            ["undo"]                = _ => Run(EditorUndo.Undo),
+            ["redo"]                = _ => Run(EditorUndo.Redo),
+            ["screenshot"]          = p => Screenshot(p),
+            ["console.tail"]        = p => ConsoleTail(p),
+            ["scripts.rebuild"]     = _ => new { ok = bootstrap.ReloadGameScripts() },
+            ["unity.import"]        = p => UnityImport(p),
+            ["editor.frame"]        = p => EditorFrame(p),
+            ["editor.refresh"]      = _ => EditorRefresh(),
+            ["scene.component.add"] = p => SceneComponentAdd(p),
+            ["scene.component.set"] = p => SceneComponentSet(p),
+            ["help"]                = _ => Help(),
+        };
+
+    public static object Dispatch(string method, JsonElement p) {
+        // D2 boundary guard: reject a malformed request (unknown method / missing or wrong-typed required
+        // param) with ONE clean error BEFORE any handler runs, so a bad JSON shape can't NRE the editor or
+        // throw a cryptic JsonElement exception deep in a handler. The schema is the engine-side single
+        // source of truth (RemoteSchema), shared with the MCP boundary and the headless harness.
+        if (RemoteSchema.Validate(method, p) is { } error)
+            throw new Exception(error);
+        // D1 FULL: table lookup. Validate() already proved the method is a schema method, and Install()
+        // proved every schema method has a handler, so the lookup cannot miss in practice; the backstop
+        // message is generated from the schema so it can't go stale if those invariants are ever bypassed.
+        if (!handlers.TryGetValue(method, out Func<JsonElement, object> handler))
+            throw new Exception($"unknown method '{method}' -- methods: {string.Join(", ", RemoteSchema.Methods.Select(s => s.Method))}");
+        return handler(p);
+    }
 
     // ---- queries -------------------------------------------------------------
 
@@ -147,9 +173,14 @@ internal static class RemoteHandlers {
         Type type = ComponentRegistry.ResolveScene(typeName)
             ?? throw new Exception($"unknown scene component '{typeName}'" + Hint(typeName,
                 ComponentRegistry.SceneMenu.Select(e => e.Type.Name)));
-        EditorUndo.Push($"Add scene {type.Name} (remote)");
-        SceneBehaviour added = SceneManager.GetCurrentScene().AddSceneBehaviour(type);
-        Mutated();
+        // F1==D1: the remote/MCP scene-component add routes through the SAME EditorCommands choke point
+        // the human menu uses. Scene-wide -> EditScene (whole-scene snapshot, byte-identical to the old
+        // "Push(); AddSceneBehaviour();"). The agent edit is now an EditorCommands command BY CONSTRUCTION.
+        SceneBehaviour added = null!;
+        EditorCommands.EditScene($"Add scene {type.Name} (remote)", () => {
+            added = SceneManager.GetCurrentScene().AddSceneBehaviour(type);
+            Mutated();
+        });
         return new { sceneComponent = added.GetType().Name };
     }
 
@@ -165,26 +196,19 @@ internal static class RemoteHandlers {
             .FirstOrDefault(b => b.GetType().Name.Equals(typeName, StringComparison.OrdinalIgnoreCase))
             ?? throw new Exception($"scene has no '{typeName}' component (add it with scene.component.add)");
 
-        EditorUndo.Push($"Set scene {typeName}.{memberName} (remote)");
-        object written = SetBehaviourMember(behaviour, memberName, value);
-        Mutated();
+        // F1==D1: remote scene-member tuning (sky/fog/lighting) shares the EditScene command path.
+        object written = null!;
+        EditorCommands.EditScene($"Set scene {typeName}.{memberName} (remote)", () => {
+            written = SetBehaviourMember(behaviour, memberName, value);
+            Mutated();
+        });
         return new { sceneComponent = typeName, member = memberName, value = written };
     }
 
     // Lists every remote method (self-describing API so an agent can discover the control surface).
-    static object Help() => new {
-        methods = new[] {
-            "editor.status", "scene.describe", "scene.save", "scene.open {path}",
-            "entity.get {entity}", "entity.create {name,...}", "entity.delete {entity}",
-            "component.add {entity,type}", "component.remove {entity,type}",
-            "component.set {entity,target,value}",
-            "scene.component.add {type}", "scene.component.set {type,member,value}",
-            "select {entity}", "play.start/stop/pause/step",
-            "undo", "redo", "screenshot {path,settle}", "console.tail {count}",
-            "scripts.rebuild", "unity.import {path,subfolder}",
-            "editor.frame {entity?,dir?,fit?}", "editor.refresh", "help",
-        },
-    };
+    // D1: the method catalog is GENERATED from RemoteSchema (the same engine-side table that the D2 boundary
+    // guard validates against), so help can never drift from the dispatch surface. One source of truth.
+    static object Help() => new { methods = RemoteSchema.Signatures };
 
     // Frames the Scene-view camera on an entity's geometry, or the WHOLE scene when no entity is
     // given (aggregates every renderable's world bounds). This is what makes a remote screenshot
@@ -324,22 +348,29 @@ internal static class RemoteHandlers {
 
     static object EntityCreate(JsonElement p) {
         string name = RequireString(p, "name");
-        EditorUndo.Push($"Create {name} (remote)");
-        Scene scene = SceneManager.GetCurrentScene();
-        Entity entity = scene.CreateEntity(name);
-        if (p.TryGetProperty("position", out JsonElement pos) && pos.ValueKind != JsonValueKind.Null)
-            entity.transform.Position = (Vector3)ConvertValue(typeof(Vector3), pos);
-        if (p.TryGetProperty("parent", out JsonElement parent) && parent.ValueKind == JsonValueKind.String)
-            entity.transform.SetParent(Resolve(parent.GetString()!).transform);
-        Mutated();
+        // F1==D1: remote entity creation is a Structural command (whole-scene snapshot), the same
+        // choke point the human "Create Entity" menu uses. Byte-identical to "Push(); CreateEntity();".
+        Entity entity = null!;
+        EditorCommands.Structural($"Create {name} (remote)", () => {
+            Scene scene = SceneManager.GetCurrentScene();
+            entity = scene.CreateEntity(name);
+            if (p.TryGetProperty("position", out JsonElement pos) && pos.ValueKind != JsonValueKind.Null)
+                entity.transform.Position = (Vector3)ConvertValue(typeof(Vector3), pos);
+            if (p.TryGetProperty("parent", out JsonElement parent) && parent.ValueKind == JsonValueKind.String)
+                entity.transform.SetParent(Resolve(parent.GetString()!).transform);
+            Mutated();
+        });
         return new { id = entity.InstanceId.ToString("N"), name = entity.Name };
     }
 
     static object EntityDelete(string query) {
         Entity entity = Resolve(query);
-        EditorUndo.Push($"Delete {entity.Name} (remote)");
-        SceneManager.GetCurrentScene().DestroyEntity(entity);
-        Mutated();
+        // F1==D1: remote delete -> Structural (whole-scene snapshot). Resolve + the label string read
+        // the entity BEFORE the snapshot, exactly as the old "Push($..); DestroyEntity();" did.
+        EditorCommands.Structural($"Delete {entity.Name} (remote)", () => {
+            SceneManager.GetCurrentScene().DestroyEntity(entity);
+            Mutated();
+        });
         return new { deleted = entity.Name };
     }
 
@@ -349,18 +380,25 @@ internal static class RemoteHandlers {
         Type type = ComponentRegistry.Resolve(typeName)
             ?? throw new Exception($"unknown component type '{typeName}'" + Hint(typeName,
                 ComponentRegistry.Menu.Select(e => e.Type.Name)));
-        EditorUndo.Push($"Add {type.Name} (remote)");
-        Behaviour behaviour = entity.AddComponent(type);
-        Mutated();
+        // F1==D1: remote add-component -> Structural, matching the human inspector "Add Component"
+        // path (HierarchyPanel/InspectorPanel component add is Structural). Byte-identical snapshot.
+        Behaviour behaviour = null!;
+        EditorCommands.Structural($"Add {type.Name} (remote)", () => {
+            behaviour = entity.AddComponent(type);
+            Mutated();
+        });
         return new { entity = entity.Name, component = behaviour.GetType().Name };
     }
 
     static object ComponentRemove(JsonElement p) {
         Entity entity = Resolve(RequireString(p, "entity"));
         Behaviour behaviour = FindComponent(entity, RequireString(p, "type"));
-        EditorUndo.Push($"Remove {behaviour.GetType().Name} (remote)");
-        entity.RemoveComponent(behaviour);
-        Mutated();
+        // F1==D1: remote remove-component -> Structural. FindComponent + the label read the behaviour
+        // BEFORE the snapshot, exactly as the old "Push($..); RemoveComponent();" did.
+        EditorCommands.Structural($"Remove {behaviour.GetType().Name} (remote)", () => {
+            entity.RemoveComponent(behaviour);
+            Mutated();
+        });
         return new { entity = entity.Name, removed = behaviour.GetType().Name };
     }
 
@@ -373,32 +411,36 @@ internal static class RemoteHandlers {
         JsonElement value = p.TryGetProperty("value", out JsonElement v)
             ? v : throw new Exception("missing 'value'");
 
-        EditorUndo.Push($"Set {target} (remote)");
-        object? written;
-        switch (target.ToLowerInvariant()) {
-            case "name": entity.Name = value.GetString() ?? ""; written = entity.Name; break;
-            case "active": entity.SetActive(value.GetBoolean()); written = entity.IsActive; break;
-            case "tag": entity.Tag = value.GetString(); written = entity.Tag; break;
-            case "layer": entity.Layer = value.GetInt32(); written = entity.Layer; break;
-            case "transform.position":
-                entity.transform.Position = (Vector3)ConvertValue(typeof(Vector3), value);
-                written = LiveJson(entity.transform.Position); break;
-            case "transform.rotation":
-                entity.transform.EulerAngles = (Vector3)ConvertValue(typeof(Vector3), value);
-                written = LiveJson(entity.transform.EulerAngles); break;
-            case "transform.scale":
-                entity.transform.Scale = (Vector3)ConvertValue(typeof(Vector3), value);
-                written = LiveJson(entity.transform.Scale); break;
-            default: {
-                int dot = target.IndexOf('.');
-                if (dot <= 0 || dot == target.Length - 1)
-                    throw new Exception($"unknown target '{target}' — name|active|tag|layer|transform.*|<Component>.<Member>");
-                Behaviour behaviour = FindComponent(entity, target[..dot]);
-                written = SetBehaviourMember(behaviour, target[(dot + 1)..], value);
-                break;
+        // F1==D1: a remote single-entity value/transform/member edit -> EditEntity (scoped PushEntity:
+        // selection survives, no whole-scene re-bake), the SAME path a human inspector value edit takes.
+        // The target-parse switch IS the mutation; it runs inside the command after the scoped snapshot.
+        object? written = null;
+        EditorCommands.EditEntity(entity, $"Set {target} (remote)", () => {
+            switch (target.ToLowerInvariant()) {
+                case "name": entity.Name = value.GetString() ?? ""; written = entity.Name; break;
+                case "active": entity.SetActive(value.GetBoolean()); written = entity.IsActive; break;
+                case "tag": entity.Tag = value.GetString(); written = entity.Tag; break;
+                case "layer": entity.Layer = value.GetInt32(); written = entity.Layer; break;
+                case "transform.position":
+                    entity.transform.Position = (Vector3)ConvertValue(typeof(Vector3), value);
+                    written = LiveJson(entity.transform.Position); break;
+                case "transform.rotation":
+                    entity.transform.EulerAngles = (Vector3)ConvertValue(typeof(Vector3), value);
+                    written = LiveJson(entity.transform.EulerAngles); break;
+                case "transform.scale":
+                    entity.transform.Scale = (Vector3)ConvertValue(typeof(Vector3), value);
+                    written = LiveJson(entity.transform.Scale); break;
+                default: {
+                    int dot = target.IndexOf('.');
+                    if (dot <= 0 || dot == target.Length - 1)
+                        throw new Exception($"unknown target '{target}' — name|active|tag|layer|transform.*|<Component>.<Member>");
+                    Behaviour behaviour = FindComponent(entity, target[..dot]);
+                    written = SetBehaviourMember(behaviour, target[(dot + 1)..], value);
+                    break;
+                }
             }
-        }
-        Mutated();
+            Mutated();
+        });
         return new { entity = entity.Name, target, value = written };
     }
 

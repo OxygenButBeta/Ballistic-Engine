@@ -162,7 +162,11 @@ internal static class ColliderHandles {
             grabDir = worldDir;
             GizmoMath.MouseRay(vp, viewMin, viewSize, mouse, out Vector3 rayO, out Vector3 rayD);
             grabParam = ClosestParamOnAxis(worldPos, worldDir, rayO, rayD);
-            EditorUndo.Push("Resize Collider");
+            // Drag-start snapshot of this ONE collider's entity -> scoped through EditorCommands.EditEntity
+            // (PushEntity: selection survives, no whole-scene IrradianceVolume re-bake). The drag mutates
+            // box.Size/Center on later frames, so the snapshot point (the grab frame) is preserved with a
+            // no-op mutate -- byte-identical to the old "Push(); ..." beyond the Push->PushEntity scoping.
+            EditorCommands.EditEntity(collider.Entity, "Resize Collider", () => { });
             grabbed = true;
         }
 

@@ -1,0 +1,101 @@
+namespace BallisticEngine.Editor;
+
+// A1b (single-sourced maximize) → A1b-deeper (single-OWNED core panels). The ONE place each core
+// dockable panel is declared AND the single owner of its show-state. Before A1b a core panel was spread
+// across non-contiguous sites that had to agree by hand:
+//   (1) the normal draw call          (BuildUI: `if (showInspector) DrawDockPanel(Inspector, ...)`)
+//   (2) the maximize CONTENT re-route (DrawMaximizedPanel's `if (name == Inspector) inspector.Draw...`)
+//   (3) the still-available hand-list (MaximizedPanelStillAvailable's `if (name == Inspector) return showInspector`)
+// A1b collapsed (1)/(2)/(3) into a descriptor; A1b-deeper goes further and makes the registry OWN the
+// `bool Shown` visibility too (was the five `showXxx` fields on EditorApplication, each switched-by-name
+// in five more sites: Toggle / Open / IsWindowOpen / Add-Tab / Reset). Now there is NO core panel named
+// by EditorApplication: the menu toggles by KEY, the draw loop walks the descriptors, and the maximize
+// paths read the same entry. Adding a core panel = ONE Register() call (the Phase-A end-state).
+//
+// It is a thin data table (key -> descriptor) — NOT a duplicate-instance host (that's DockPanelHost,
+// for the "Add Tab" extras). The descriptors hold delegates so the registry itself takes no ImGui
+// dependency; EditorApplication owns the ImGui Begin/End and the geometric tab hit-test (it draws each
+// core panel via DrawCore's callback, which writes the close-button result back into Shown).
+internal sealed class EditorPanelRegistry {
+    internal sealed class Descriptor {
+        public string Key;                  // the EditorLayout.* dock name (also the ImGui ### id + maximize key)
+        public string Title;
+        public string Icon;
+        public System.Action DrawContents;  // draws the panel body (null for viewports — they use the compositing path)
+        public bool IsViewport;             // Scene/Game views: special render-target compositing, not a generic body
+        public bool Shown = true;           // current open state (owned here — replaces the showXxx fields). Viewports ignore it.
+    }
+
+    readonly Dictionary<string, Descriptor> byKey = new();
+    readonly List<Descriptor> ordered = new();   // declaration order (stable; mirrors the old hardcoded draw order)
+
+    public IReadOnlyList<Descriptor> All => ordered;
+
+    public void Register(string key, string title, string icon, System.Action drawContents,
+        bool isViewport = false) {
+        var d = new Descriptor {
+            Key = key, Title = title, Icon = icon,
+            DrawContents = drawContents, IsViewport = isViewport,
+        };
+        byKey[key] = d;
+        ordered.Add(d);
+    }
+
+    public Descriptor Get(string key) => byKey.TryGetValue(key, out Descriptor d) ? d : null;
+
+    public bool Contains(string key) => byKey.ContainsKey(key);
+
+    // Is this a NON-viewport core panel (has a generic body the docked + maximize paths draw)?
+    public bool IsCorePanel(string key) => Get(key) is { IsViewport: false };
+
+    // Current open state of a registered panel (false for an unknown key). Viewports are always shown.
+    public bool IsShown(string key) {
+        Descriptor d = Get(key);
+        if (d is null) return false;
+        return d.IsViewport || d.Shown;
+    }
+
+    // Window-menu checkbox behaviour: flip a core panel's show-state and return the NEW state (so the
+    // caller can request focus when it just opened, exactly as the old per-name switch did). No-op +
+    // false for a viewport / unknown key.
+    public bool Toggle(string key) {
+        if (Get(key) is not { IsViewport: false } d) return false;
+        d.Shown = !d.Shown;
+        return d.Shown;
+    }
+
+    // Re-show a hidden core panel. Returns true if it was hidden and is now shown — the caller
+    // (OpenWindow / Add-Tab) opens an EXTRA host instance instead when the primary was already visible.
+    public bool Show(string key) {
+        if (Get(key) is not { IsViewport: false } d) return false;
+        if (d.Shown) return false;
+        d.Shown = true;
+        return true;
+    }
+
+    // Reset all core panels to visible (the Reset-Layout default). Viewports are untouched (always shown).
+    public void ResetVisibility() {
+        foreach (Descriptor d in ordered)
+            if (!d.IsViewport) d.Shown = true;
+    }
+
+    // Whether `key` is a registered panel that is currently shown (so it can be drawn fullscreen).
+    // Viewports are always available (one renderer target, never "closed"). Unregistered key -> false.
+    public bool IsAvailable(string key) => IsShown(key);
+
+    // Draw every shown, non-viewport core panel in declaration order. `drawOne(key, ref shown, contents)`
+    // does the ImGui Begin/End with the close button bound to `shown`; the registry writes the result
+    // back into the descriptor so the close button updates the single-owned state. The viewports are
+    // excluded (their compositing path is DrawViewportWindows). Returns nothing — pure iteration.
+    public void DrawCore(CoreDrawer drawOne) {
+        foreach (Descriptor d in ordered) {
+            if (d.IsViewport || !d.Shown) continue;
+            bool shown = d.Shown;
+            drawOne(d.Key, ref shown, d.DrawContents);
+            d.Shown = shown;   // honour a close-button X that flipped it this frame
+        }
+    }
+
+    // The per-panel draw callback (a delegate so we can take `shown` by ref — lambdas can't capture ref).
+    public delegate void CoreDrawer(string key, ref bool shown, System.Action drawContents);
+}

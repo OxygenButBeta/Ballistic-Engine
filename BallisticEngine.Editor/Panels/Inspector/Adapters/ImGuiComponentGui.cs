@@ -18,6 +18,62 @@ public interface IComponentInspectorHost {
     bool AxisVec3(string id, string label, ref SysVec3 v, float speed);
     bool TrackUndo(string label, bool changed);
     void MarkViewportDirty();
+
+    // editor-rework B4: the BObject asset-slot terminal drawer (AssetSlotDrawer) routes its IProperty here so
+    // the slot's existing drag-drop + picker rendering (InspectorPanel.DrawAssetSlot) is reused unchanged --
+    // the host unwraps the property's member/owner/type and forwards to its private DrawAssetSlot.
+    void DrawAssetSlot(IProperty property);
+
+    // editor-rework G1-editor (Rule 1, the visible half of the EntityRef/ComponentRef work; engine half done
+    // in ch17): the scene-object-ref terminal drawer (SceneObjectRefDrawer) routes an EntityRef / ComponentRef
+    // member here. The host renders an interactive scene-object SLOT (current target name + drag-onto-slot from
+    // a Hierarchy row + a searchable picker of live scene entities / behaviours) in place of the dead
+    // `(EntityRef)` / `(ComponentRef)` disabled label these members fell to via gui.Unsupported. Mirrors the
+    // DrawAssetSlot host-method shape exactly; the host unwraps the IProperty and renders + sets the ref.
+    void DrawSceneObjectSlot(IProperty property);
+
+    // editor-rework G2-editor (Rule 2, the visible half of the List<T>/T[] round-trip; engine half done in
+    // ch19): the collection terminal drawer (CollectionDrawer) routes a List<T> / T[] member here. The host
+    // renders an interactive collection editor (count + Add, per-element row with a Remove button, each
+    // element drawn RECURSIVELY by its own terminal drawer) in place of the dead `(List`1)` / `(...)`
+    // disabled label these members fell to via gui.Unsupported. Mirrors the DrawAssetSlot / DrawSceneObjectSlot
+    // host-method shape; the host unwraps the IProperty, mutates the backing collection, writes it back through
+    // the property (-> ApplyMember multi-select broadcast + dirty), and pushes one undo per add / remove / edit.
+    void DrawCollectionSlot(IProperty property);
+
+    // editor-rework G2-editor (ch21, the visible half of the Dictionary<K,V> round-trip; engine half done in
+    // ch19): the dictionary terminal drawer (DictionaryDrawer) routes a Dictionary<K,V> member here. The host
+    // renders an interactive dictionary editor (count + Add, per-entry row with a READ-ONLY key + a value drawn
+    // RECURSIVELY by its own terminal drawer + a Remove button) in place of the dead `(Dictionary`2)` disabled
+    // label these members fell to via gui.Unsupported. Mirrors the DrawCollectionSlot host-method shape; the
+    // host unwraps the IProperty, mutates the backing dictionary, writes it back through the property (->
+    // ApplyMember multi-select broadcast + dirty), and pushes one undo per add / remove / value edit.
+    void DrawDictionarySlot(IProperty property);
+
+    // editor-rework G3-editor (ch23, the visible half of the [SerializeReference] polymorphism round-trip;
+    // engine $type codec done in ch22): the polymorphic terminal drawer (PolymorphicDrawer) routes an
+    // interface / abstract [SerializeReference] member here. The host renders a concrete-type DROPDOWN
+    // (TypeCache.GetTypesDerivedFrom(declaredType) + "None"; the live value's actual type is preselected) +,
+    // when a value is set, a foldout that draws the instance's members RECURSIVELY through the SAME member
+    // pipeline (so range / conditional / tooltip attributes work and a nested polymorphic member auto-recurses)
+    // in place of the dead `(IFoo)` disabled label these members fell to via gui.Unsupported. Mirrors the
+    // DrawCollectionSlot / DrawDictionarySlot host-method shape; the host unwraps the IProperty, Activator-
+    // creates / nulls the instance on a dropdown change (-> property.Set -> ApplyMember broadcast + dirty), and
+    // pushes one undo per type change. declaredType is passed explicitly (the IProperty's ValueType is the
+    // abstract/interface base; the dropdown queries TypeCache against it).
+    void DrawPolymorphicSlot(IProperty property, Type declaredType);
+
+    // editor-rework G4-editor (ch24, the visible half of the nested struct/class round-trip; engine codec done
+    // in ch24): the nested terminal drawer (NestedDrawer) routes a plain concrete-class / non-primitive-struct
+    // member here. The host renders a FOLDOUT that draws the instance's members RECURSIVELY through the SAME
+    // member pipeline (so range / conditional / tooltip attributes work and a nested-in-nested member auto-
+    // recurses) in place of the dead `(NestedSettings)` disabled label these members fell to via
+    // gui.Unsupported. Mirrors the DrawPolymorphicSlot host-method shape; the host unwraps the IProperty, reads
+    // the instance (Activator-creating a missing CLASS instance so an unset member is editable), draws each
+    // member, and -- the G4 difference -- for a STRUCT instance (value type) writes the BOXED instance back up
+    // through the slot's property after each inner-field edit (struct write-back), pushing one undo per edit.
+    // declaredType is the member's declared type (the concrete type to instantiate when the value is null).
+    void DrawNestedSlot(IProperty property, Type declaredType);
 }
 
 public sealed class ImGuiComponentGui : IInspectorGui {
@@ -26,8 +82,9 @@ public sealed class ImGuiComponentGui : IInspectorGui {
 
     public ImGuiComponentGui(IComponentInspectorHost host) => this.host = host;
 
-    // The component host (DrawMember) owns the row chrome (RowWithTooltip + mixed marker) and calls a
-    // drawer directly, so it sets the undo label here instead of through BeginRow.
+    // Since B0 the component value rows route through the shared DrawerStack, so BeginRow (below) sets the
+    // undo label ("Edit {label}") just like the volume path — DrawMember no longer calls this. Kept for any
+    // host that wants to override the label before a manual drawer call (none today; harmless to retain).
     public void SetUndoLabel(string fullLabel) => label = fullLabel;
 
     public void PushId(string id) => ImGui.PushID(id);

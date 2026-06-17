@@ -83,8 +83,7 @@ internal sealed class HierarchyPanel {
         // create a fresh entity carrying that component (Unity behavior).
         if (ImGui.BeginDragDropTarget()) {
             if (AcceptEntityDrop(entities, out Entity dropped) && dropped.transform.Parent is not null) {
-                EditorUndo.Push("Unparent");
-                dropped.transform.SetParentKeepingWorld(null);
+                EditorCommands.Structural("Unparent", () => dropped.transform.SetParentKeepingWorld(null));
             }
             if (AcceptAssetDrop(out List<Guid> droppedAssets)) {
                 InstantiateModels(scene, droppedAssets);
@@ -120,24 +119,26 @@ internal sealed class HierarchyPanel {
     void DeleteSelected(Scene scene) {
         var targets = state.SelectedEntities.ToArray();
         if (targets.Length == 0) return;
-        EditorUndo.Push(targets.Length == 1 ? "Delete Entity" : $"Delete {targets.Length} Entities");
-        foreach (Entity e in targets)
-            scene.DestroyEntity(e);
-        state.Selected = null;
-        state.MarkViewportDirty();
+        EditorCommands.Structural(targets.Length == 1 ? "Delete Entity" : $"Delete {targets.Length} Entities", () => {
+            foreach (Entity e in targets)
+                scene.DestroyEntity(e);
+            state.Selected = null;
+            state.MarkViewportDirty();
+        });
     }
 
     // Duplicates every selected entity; the clones become the new selection (active = last clone).
     void DuplicateSelected(Scene scene) {
         var targets = state.SelectedEntities.ToArray();
         if (targets.Length == 0) return;
-        EditorUndo.Push(targets.Length == 1 ? "Duplicate" : $"Duplicate {targets.Length} Entities");
-        var clones = new List<Entity>(targets.Length);
-        foreach (Entity e in targets)
-            clones.Add(EntityClone.Duplicate(scene, e));
-        if (clones.Count > 0)
-            state.SelectEntities(clones, clones[^1]);
-        state.MarkViewportDirty();
+        EditorCommands.Structural(targets.Length == 1 ? "Duplicate" : $"Duplicate {targets.Length} Entities", () => {
+            var clones = new List<Entity>(targets.Length);
+            foreach (Entity e in targets)
+                clones.Add(EntityClone.Duplicate(scene, e));
+            if (clones.Count > 0)
+                state.SelectEntities(clones, clones[^1]);
+            state.MarkViewportDirty();
+        });
     }
 
     // Ctrl+Shift+G (Unity's Group): create a new empty "Group" entity at the centre of the selection
@@ -158,29 +159,29 @@ internal sealed class HierarchyPanel {
         }
         if (roots.Count == 0) return;
 
-        EditorUndo.Push(roots.Count == 1 ? "Group" : $"Group {roots.Count} Entities");
+        EditorCommands.Structural(roots.Count == 1 ? "Group" : $"Group {roots.Count} Entities", () => {
+            // Group pivot at the centre of the roots' world positions (Unity-style).
+            Vector3 centre = Vector3.Zero;
+            foreach (Entity e in roots) centre += e.transform.WorldPosition;
+            centre /= roots.Count;
 
-        // Group pivot at the centre of the roots' world positions (Unity-style).
-        Vector3 centre = Vector3.Zero;
-        foreach (Entity e in roots) centre += e.transform.WorldPosition;
-        centre /= roots.Count;
+            Entity group = scene.CreateEntity("Group");
+            group.transform.WorldPosition = centre;
 
-        Entity group = scene.CreateEntity("Group");
-        group.transform.WorldPosition = centre;
+            // Reparent under the common parent of the roots if they share one, so the group sits where the
+            // objects were in the hierarchy; otherwise it's a scene root.
+            Transform commonParent = roots[0].transform.Parent;
+            foreach (Entity e in roots)
+                if (!ReferenceEquals(e.transform.Parent, commonParent)) { commonParent = null; break; }
+            if (commonParent is not null)
+                group.transform.SetParentKeepingWorld(commonParent);
 
-        // Reparent under the common parent of the roots if they share one, so the group sits where the
-        // objects were in the hierarchy; otherwise it's a scene root.
-        Transform commonParent = roots[0].transform.Parent;
-        foreach (Entity e in roots)
-            if (!ReferenceEquals(e.transform.Parent, commonParent)) { commonParent = null; break; }
-        if (commonParent is not null)
-            group.transform.SetParentKeepingWorld(commonParent);
+            foreach (Entity e in roots)
+                e.transform.SetParentKeepingWorld(group.transform);
 
-        foreach (Entity e in roots)
-            e.transform.SetParentKeepingWorld(group.transform);
-
-        state.Select(group);
-        state.MarkViewportDirty();
+            state.Select(group);
+            state.MarkViewportDirty();
+        });
     }
 
     // Captures the entity subtree as a .prefab asset next to the asset browser's current folder, then
@@ -206,12 +207,13 @@ internal sealed class HierarchyPanel {
 
         try {
             File.WriteAllText(abs, PrefabAsset.FromEntity(entity).ToYaml());
-            EditorUndo.Push("Create Prefab");
-            AsyncAssetImport.Request("Creating prefab...", onFinished: () => {
-                if (AssetDatabase.TryGetGuid(relPath, out Guid guid)) {
-                    entity.PrefabSource = guid;
-                    state.MarkViewportDirty();
-                }
+            EditorCommands.Structural("Create Prefab", () => {
+                AsyncAssetImport.Request("Creating prefab...", onFinished: () => {
+                    if (AssetDatabase.TryGetGuid(relPath, out Guid guid)) {
+                        entity.PrefabSource = guid;
+                        state.MarkViewportDirty();
+                    }
+                });
             });
         }
         catch (Exception e) {
@@ -270,8 +272,9 @@ internal sealed class HierarchyPanel {
             var commit = ImGui.IsItemDeactivatedAfterEdit() || ImGui.IsKeyPressed(ImGuiKey.Enter);
             if (commit || ImGui.IsItemDeactivated()) {
                 if (commit && !string.IsNullOrWhiteSpace(renameBuffer)) {
-                    EditorUndo.Push("Rename");
-                    entity.Name = renameBuffer;
+                    // Single-entity value edit -> scoped through EditorCommands.EditEntity (PushEntity:
+                    // selection survives, no whole-scene re-bake), the preferred path for one-entity edits.
+                    EditorCommands.EditEntity(entity, "Rename", () => entity.Name = renameBuffer);
                 }
                 renamingId = -1;
             }
@@ -355,9 +358,12 @@ internal sealed class HierarchyPanel {
                 var batch = selected && state.SelectedEntities.Count > 1
                     ? state.SelectedEntities.ToArray()
                     : new[] { entity };
-                EditorUndo.Push(batch.Length > 1 ? $"Toggle Active ({batch.Length})" : "Toggle Active");
-                foreach (Entity e in batch)
-                    if (!e.IsDestroyed) e.SetActive(newActive);
+                // F1 pilot: a multi-entity toggle is structural (whole-scene snapshot), routed through
+                // the choke point. Byte-identical to the old manual Push(); the batch read stays outside.
+                EditorCommands.Structural(batch.Length > 1 ? $"Toggle Active ({batch.Length})" : "Toggle Active", () => {
+                    foreach (Entity e in batch)
+                        if (!e.IsDestroyed) e.SetActive(newActive);
+                });
                 state.MarkViewportDirty();
             }
             ImGui.PopStyleColor();
@@ -429,16 +435,19 @@ internal sealed class HierarchyPanel {
             if (ImGui.MenuItem("Apply Overrides")) PrefabInstanceOps.ApplyAll(entity);
             if (ImGui.MenuItem("Revert Overrides")) { PrefabInstanceOps.RevertAll(entity); state.MarkViewportDirty(); }
             ImGui.Separator();
-            if (ImGui.MenuItem("Unpack")) { EditorUndo.PushEntity("Unpack Prefab", entity); entity.PrefabSource = Guid.Empty; }
+            // F1 pilot: a single-entity edit -- scoped through EditorCommands.EditEntity (maps to
+            // PushEntity, byte-identical: selection survives, no whole-scene rebuild).
+            if (ImGui.MenuItem("Unpack")) EditorCommands.EditEntity(entity, "Unpack Prefab", () => entity.PrefabSource = Guid.Empty);
             ImGui.EndMenu();
         }
         if (ImGui.MenuItem($"Duplicate{suffix}", "Ctrl+D")) DuplicateSelected(scene);
         if (ImGui.MenuItem($"Group{suffix}", "Ctrl+Shift+G")) GroupSelected(scene);
         if (entity.transform.Parent is not null && ImGui.MenuItem($"Unparent{suffix}")) {
-            EditorUndo.Push("Unparent");
-            foreach (Entity e in state.SelectedEntities.ToArray())
-                e.transform.SetParentKeepingWorld(null);
-            state.MarkViewportDirty();
+            EditorCommands.Structural("Unparent", () => {
+                foreach (Entity e in state.SelectedEntities.ToArray())
+                    e.transform.SetParentKeepingWorld(null);
+                state.MarkViewportDirty();
+            });
         }
         ImGui.Separator();
         DrawCreateMenu(scene);   // create children/objects from a node too
@@ -459,8 +468,7 @@ internal sealed class HierarchyPanel {
             if (AcceptEntityDrop(allEntities, out Entity dragged) &&
                 !ReferenceEquals(dragged, entity) &&
                 !entity.transform.IsDescendantOf(dragged.transform)) {   // no cycles
-                EditorUndo.Push("Reparent");
-                dragged.transform.SetParentKeepingWorld(entity.transform);
+                EditorCommands.Structural("Reparent", () => dragged.transform.SetParentKeepingWorld(entity.transform));
             }
             // Script asset dropped onto an entity row â†’ add its component (Unity behavior).
             if (AcceptAssetDrop(out List<Guid> droppedAssets))
@@ -470,19 +478,22 @@ internal sealed class HierarchyPanel {
     }
 
     void AddScriptComponents(Entity entity, List<Guid> guids) {
-        var added = false;
+        // Resolve the addable component types first (pure reads) so the undo snapshot is taken only
+        // when at least one will actually be added -- byte-identical to the old lazy "Push on first add".
+        var types = new List<Type>();
         foreach (Guid guid in guids) {
             Type type = ScriptComponentType(guid);
-            if (type is null)
-                continue;
-            if (!added)
-                EditorUndo.Push("Add Script Component");
-            added = true;
-            entity.AddComponent(type);
+            if (type is not null)
+                types.Add(type);
         }
+        if (types.Count == 0)
+            return;
 
-        if (added)
+        EditorCommands.Structural("Add Script Component", () => {
+            foreach (Type type in types)
+                entity.AddComponent(type);
             state.Select(entity);
+        });
     }
 
     // Drop target for the SCENE VIEW: call inside a BeginDragDropTarget/EndDragDropTarget block over
@@ -500,20 +511,27 @@ internal sealed class HierarchyPanel {
     }
 
     void CreateEntitiesFromScripts(Scene scene, List<Guid> guids) {
-        Entity last = null;
+        // Resolve the spawnable component types first (pure reads) so the undo snapshot is taken only
+        // when at least one entity will actually be created -- byte-identical to the old lazy Push.
+        var types = new List<Type>();
         foreach (Guid guid in guids) {
             Type type = ScriptComponentType(guid);
-            if (type is null)
-                continue;
-            if (last is null)
-                EditorUndo.Push("Add Script Entity");
-            Entity entity = Spawn(scene, type.Name);
-            entity.AddComponent(type);
-            last = entity;
+            if (type is not null)
+                types.Add(type);
         }
+        if (types.Count == 0)
+            return;
 
-        if (last is not null)
-            state.Select(last);
+        EditorCommands.Structural("Add Script Entity", () => {
+            Entity last = null;
+            foreach (Type type in types) {
+                Entity entity = Spawn(scene, type.Name);
+                entity.AddComponent(type);
+                last = entity;
+            }
+            if (last is not null)
+                state.Select(last);
+        });
     }
 
     // Maps a dropped .cs asset to its compiled component by Unity's file-name == class-name rule
@@ -554,12 +572,13 @@ internal sealed class HierarchyPanel {
         if (models.Count == 0)
             return;
 
-        EditorUndo.Push("Add Model");
-        Entity last = null;
-        foreach (Guid guid in models)
-            last = ModelInstantiation.Instantiate(scene, guid) ?? last;
-        if (last is not null)
-            state.Select(last);
+        EditorCommands.Structural("Add Model", () => {
+            Entity last = null;
+            foreach (Guid guid in models)
+                last = ModelInstantiation.Instantiate(scene, guid) ?? last;
+            if (last is not null)
+                state.Select(last);
+        });
     }
 
     // Instantiates any dropped .prefab assets into the scene (Unity's drag-prefab-to-hierarchy). The
@@ -571,17 +590,18 @@ internal sealed class HierarchyPanel {
         if (prefabs.Count == 0)
             return;
 
-        EditorUndo.Push(prefabs.Count == 1 ? "Instantiate Prefab" : $"Instantiate {prefabs.Count} Prefabs");
-        var roots = new List<Entity>();
-        foreach (Guid guid in prefabs) {
-            PrefabAsset prefab = AssetDatabase.Load<PrefabAsset>(AssetDatabase.GuidToAssetPath(guid));
-            Entity root = prefab?.Instantiate();
-            if (root is not null)
-                roots.Add(root);
-        }
-        if (roots.Count > 0)
-            state.SelectEntities(roots, roots[^1]);
-        state.MarkViewportDirty();
+        EditorCommands.Structural(prefabs.Count == 1 ? "Instantiate Prefab" : $"Instantiate {prefabs.Count} Prefabs", () => {
+            var roots = new List<Entity>();
+            foreach (Guid guid in prefabs) {
+                PrefabAsset prefab = AssetDatabase.Load<PrefabAsset>(AssetDatabase.GuidToAssetPath(guid));
+                Entity root = prefab?.Instantiate();
+                if (root is not null)
+                    roots.Add(root);
+            }
+            if (roots.Count > 0)
+                state.SelectEntities(roots, roots[^1]);
+            state.MarkViewportDirty();
+        });
     }
 
     static unsafe bool AcceptEntityDrop(Entity[] entities, out Entity entity) {
@@ -642,8 +662,9 @@ internal sealed class HierarchyPanel {
     // Shared "create" submenu used by the empty-space context menu and the toolbar + button.
     void DrawCreateMenu(Scene scene) {
         if (ImGui.MenuItem("Create Empty")) {
-            EditorUndo.Push("Create Empty");
-            state.Select(Spawn(scene, "Entity"));
+            // F1 pilot: structural create routed through the EditorCommands choke point (byte-identical
+            // to the old "Push(); mutate();" -- the snapshot scope is now chosen by EditorCommands, not here).
+            EditorCommands.Structural("Create Empty", () => state.Select(Spawn(scene, "Entity")));
         }
         if (ImGui.BeginMenu($"{EditorIcons.Package} 3D Object")) {
             if (ImGui.MenuItem("Cube")) CreatePrimitive(scene, PrimitiveKind.Cube);
@@ -692,10 +713,11 @@ internal sealed class HierarchyPanel {
             if (ImGui.BeginMenu(group.Key)) {
                 foreach (ComponentEntry entry in group.OrderBy(e => e.DisplayName, StringComparer.OrdinalIgnoreCase)) {
                     if (ImGui.MenuItem(entry.DisplayName)) {
-                        EditorUndo.Push($"Create {entry.DisplayName}");
-                        Entity e = Spawn(scene, entry.DisplayName);
-                        e.AddComponent(entry.Type);
-                        state.Select(e);
+                        EditorCommands.Structural($"Create {entry.DisplayName}", () => {
+                            Entity e = Spawn(scene, entry.DisplayName);
+                            e.AddComponent(entry.Type);
+                            state.Select(e);
+                        });
                     }
                 }
                 ImGui.EndMenu();
@@ -708,24 +730,27 @@ internal sealed class HierarchyPanel {
     void CreateWithComponentNamed(Scene scene, string name, string registryName) {
         Type type = ComponentRegistry.Resolve(registryName);
         if (type is null) return;
-        EditorUndo.Push($"Create {name}");
-        Entity entity = Spawn(scene, name);
-        entity.AddComponent(type);
-        state.Select(entity);
+        EditorCommands.Structural($"Create {name}", () => {
+            Entity entity = Spawn(scene, name);
+            entity.AddComponent(type);
+            state.Select(entity);
+        });
     }
 
     void CreateWithComponent<T>(Scene scene, string name) where T : Behaviour {
-        EditorUndo.Push($"Create {name}");
-        Entity entity = Spawn(scene, name);
-        entity.AddComponent(typeof(T));
-        state.Select(entity);
+        EditorCommands.Structural($"Create {name}", () => {
+            Entity entity = Spawn(scene, name);
+            entity.AddComponent(typeof(T));
+            state.Select(entity);
+        });
     }
 
     void CreatePrimitive(Scene scene, PrimitiveKind kind) {
-        EditorUndo.Push($"Create {kind}");
-        Entity e = Primitives.Create(scene, kind);
-        if (e is not null) e.transform.Position = state.SceneSpawnPoint;
-        state.Select(e);
+        EditorCommands.Structural($"Create {kind}", () => {
+            Entity e = Primitives.Create(scene, kind);
+            if (e is not null) e.transform.Position = state.SceneSpawnPoint;
+            state.Select(e);
+        });
     }
 
     // Creates a Terrain entity AND its backing assets: a fresh .terrain heightfield next to the asset
@@ -733,29 +758,30 @@ internal sealed class HierarchyPanel {
     // assets import asynchronously, then bind onto the component so the terrain shows the checker
     // immediately. The checker tiles across the terrain so the grid reads at any size.
     void CreateTerrain(Scene scene) {
-        EditorUndo.Push("Create Terrain");
-        Entity entity = Spawn(scene, "Terrain");
-        var terrain = (Terrain)entity.AddComponent(typeof(Terrain));
-        state.Select(entity);
+        EditorCommands.Structural("Create Terrain", () => {
+            Entity entity = Spawn(scene, "Terrain");
+            var terrain = (Terrain)entity.AddComponent(typeof(Terrain));
+            state.Select(entity);
 
-        string folder = CurrentAssetFolder?.Invoke() ?? "Assets";
-        string dir = AssetDatabase.Project.ResolveAbsolute(folder);
-        Directory.CreateDirectory(dir);
-        string terrainAbs = UniqueAssetPath(Path.Combine(dir, "Terrain.terrain"));
-        File.WriteAllText(terrainAbs,
-            "{\n  \"version\": 1,\n  \"resolution\": 256,\n  \"sizeX\": 100,\n  \"sizeZ\": 100,\n  \"heightScale\": 20\n}\n");
-        string terrainRel = ToProjectRelative(terrainAbs);
+            string folder = CurrentAssetFolder?.Invoke() ?? "Assets";
+            string dir = AssetDatabase.Project.ResolveAbsolute(folder);
+            Directory.CreateDirectory(dir);
+            string terrainAbs = UniqueAssetPath(Path.Combine(dir, "Terrain.terrain"));
+            File.WriteAllText(terrainAbs,
+                "{\n  \"version\": 1,\n  \"resolution\": 256,\n  \"sizeX\": 100,\n  \"sizeZ\": 100,\n  \"heightScale\": 20\n}\n");
+            string terrainRel = ToProjectRelative(terrainAbs);
 
-        string materialRel = TerrainAssets.EnsureCheckerMaterial();
+            string materialRel = TerrainAssets.EnsureCheckerMaterial();
 
-        AsyncAssetImport.Request("Creating terrain...", onFinished: () => {
-            var asset = AssetDatabase.Load<TerrainAsset>(terrainRel);
-            if (asset is not null) terrain.Terrain3D = asset;
-            if (materialRel is not null) {
-                var mat = AssetDatabase.Load<Material>(materialRel);
-                if (mat is not null) terrain.Material = mat;
-            }
-            state.MarkViewportDirty();
+            AsyncAssetImport.Request("Creating terrain...", onFinished: () => {
+                var asset = AssetDatabase.Load<TerrainAsset>(terrainRel);
+                if (asset is not null) terrain.Terrain3D = asset;
+                if (materialRel is not null) {
+                    var mat = AssetDatabase.Load<Material>(materialRel);
+                    if (mat is not null) terrain.Material = mat;
+                }
+                state.MarkViewportDirty();
+            });
         });
     }
 
@@ -792,8 +818,9 @@ internal sealed class HierarchyPanel {
             foreach (ComponentEntry entry in ComponentRegistry.SceneMenu) {
                 (string entryIcon, _) = EditorIcons.ForComponentType(entry.Type);
                 if (ImGui.MenuItem($"{entryIcon}  {entry.DisplayName}")) {
-                    EditorUndo.Push($"Add {entry.DisplayName}");
-                    state.SelectSceneBehaviour(scene.AddSceneBehaviour(entry.Type));
+                    // Scene-wide edit (a SceneBehaviour lives on the Scene, not an entity) -> EditScene.
+                    EditorCommands.EditScene($"Add {entry.DisplayName}",
+                        () => state.SelectSceneBehaviour(scene.AddSceneBehaviour(entry.Type)));
                 }
             }
             ImGui.EndPopup();
@@ -827,10 +854,11 @@ internal sealed class HierarchyPanel {
 
             if (ImGui.BeginPopupContextItem($"##sbctx{behaviour.InstanceId}")) {
                 if (ImGui.MenuItem("Remove")) {
-                    EditorUndo.Push($"Remove {behaviour.GetType().Name}");
-                    scene.RemoveSceneBehaviour(behaviour);
-                    if (ReferenceEquals(state.SelectedSceneBehaviour, behaviour))
-                        state.SelectSceneBehaviour(null);
+                    EditorCommands.EditScene($"Remove {behaviour.GetType().Name}", () => {
+                        scene.RemoveSceneBehaviour(behaviour);
+                        if (ReferenceEquals(state.SelectedSceneBehaviour, behaviour))
+                            state.SelectSceneBehaviour(null);
+                    });
                 }
                 ImGui.EndPopup();
             }

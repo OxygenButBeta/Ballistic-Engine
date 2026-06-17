@@ -141,12 +141,39 @@ public static class SceneSerializer {
 
         foreach (MemberInfo member in SerializableMembers(target.GetType())) {
             object value = GetMemberValue(member, target);
-            object serialized = SerializeValue(value);
+            object serialized = SerializeMemberValue(value, MemberType(member), member, visited: null);
             if (serialized is not null)
                 doc.Members[CamelCase(member.Name)] = serialized;
+            else if (value is not null && !IsNoneSceneObjectRef(value))
+                // G0 (loud drops): the member HELD a value but serialized to null, so it silently
+                // vanishes on save/load. Make the data loss visible instead of dropping it quietly
+                // (the §3.45 silent-failure trap). Deduped per (type, member) so the per-frame undo
+                // snapshots don't spam — the FIRST drop is enough to flag the hole.
+                WarnDroppedMember(target.GetType(), member, value);
         }
 
         return doc;
+    }
+
+    // Members that held a non-null value but produced no serialized form are reported ONCE each, so a
+    // forgotten reference (entity/component ref without a guid, an unsupported member type) is loud,
+    // not a silent round-trip loss. The dedup key is the declaring type + member name.
+    static readonly HashSet<string> _reportedDrops = new(StringComparer.Ordinal);
+
+    static void WarnDroppedMember(Type ownerType, MemberInfo member, object value) {
+        string key = $"{ownerType.FullName}.{member.Name}";
+        lock (_reportedDrops) {
+            if (!_reportedDrops.Add(key))
+                return;
+        }
+
+        string reason = value is BObject
+            // Entity/Behaviour (and unsaved assets) are BObjects with no AssetDatabase guid, so there
+            // is no ref form to write yet — G1 (EntityRef) will close this for scene-object refs.
+            ? $"a reference of type '{value.GetType().Name}' has no asset guid (scene-object/unsaved refs do not round-trip yet)"
+            : $"its type '{value.GetType().Name}' has no serialized form";
+        Debugging.LogWarning(
+            $"Scene save dropped {ownerType.Name}.{member.Name}: {reason}. The value will be lost on reload.");
     }
 
     // BObject -> "guid:..."; BEvent -> a listener list; everything else passes through (converters
@@ -177,13 +204,164 @@ public static class SceneSerializer {
         if (value is ColorGradient gradient)
             return gradient.ToCompactString();
 
+        // Scene-object references (EntityRef/ComponentRef) round-trip as the target InstanceId hex,
+        // NOT a guid: a scene object has no AssetDatabase guid (it is built at scene load), so it is
+        // identified by InstanceId the way BEvent stores its persistent-listener targets. Guid.Empty
+        // means "None" and serializes to null (skipped, like an unset asset ref). MUST come BEFORE the
+        // BObject case below; an EntityRef/ComponentRef is a value type so it never reaches that case,
+        // but the loud-drop path keys off SerializeValue returning null for a SET ref, so be explicit.
+        if (value is EntityRef entityRef)
+            return entityRef.InstanceId == Guid.Empty ? null : entityRef.InstanceId.ToString("N");
+        if (value is ComponentRef componentRef)
+            return componentRef.InstanceId == Guid.Empty ? null : componentRef.InstanceId.ToString("N");
+
         if (value is BObject asset) {
             return AssetDatabase.TryGetAssetGuid(asset, out Guid guid)
                 ? AssetRef.FromGuid(guid)
-                : null; // unsaved/asset-less object reference — skip
+                : null; // unsaved/asset-less object reference -- skip
         }
 
+        // Collections (G2): List<T> / arrays / Dictionary<K,V> round-trip as a YAML sequence (or mapping
+        // for a dict) by recursing EACH element through SerializeValue -- so an element can itself be a
+        // primitive, a math struct (the converters fire on the boxed runtime type), an asset/scene ref, or
+        // a nested struct/class. An EMPTY collection still serializes (an empty sequence) so an authored
+        // empty list round-trips as empty, not null. A null collection is the leaf-null case the caller
+        // already handles (skipped from the doc). MUST come AFTER BObject so a BObject-derived value never
+        // reaches here, and is guarded to collection types so every existing non-collection member is
+        // byte-identical (the only behaviour change is that a List<T>/array/dict member -- e.g.
+        // LineRenderer.Points -- now ROUND-TRIPS instead of deserializing to null).
+        if (value is System.Collections.IDictionary dict)
+            return SerializeDictionary(dict);
+        if (value is not string && value is System.Collections.IEnumerable seq)
+            return SerializeSequence(seq);
+
         return value;
+    }
+
+    // ---- [SerializeReference] polymorphism (G3 engine-half) -----------------
+    // A member whose DECLARED type is abstract/interface (or a base marked [SerializeReference]) stores its
+    // live CONCRETE type so a derived implementation round-trips (Unity's [SerializeReference]). Only such a
+    // member emits a $type tag; every existing non-polymorphic member (primitive/struct/asset/scene-ref/
+    // collection/dict/nested) goes straight to SerializeValue UNCHANGED, so all existing scenes are
+    // byte-identical (no shipped component carries [SerializeReference], and a concrete-typed member never
+    // classifies Polymorphic). The trigger is exactly PropertyCategories.Classify == Polymorphic, so the
+    // serializer and the property model agree on what is polymorphic by construction.
+    static object SerializeMemberValue(object value, Type declaredType, MemberInfo member, HashSet<object> visited) {
+        if (value is null)
+            return null;
+
+        PropertyCategory category = PropertyCategories.Classify(declaredType, member);
+        if (category == PropertyCategory.Polymorphic)
+            return SerializeReferenceInstance(value, visited);
+        // Nested struct/class (G4): a plain (non-[SerializeReference]) member whose declared type is a
+        // concrete class or non-primitive struct round-trips its serializable members as a YAML mapping --
+        // NO $type tag (the declared type IS the concrete type, picked on load via Activator). The trigger is
+        // exactly Classify == Nested, so the model and codec agree. Before G4 this rode the SerializeValue
+        // pass-through (YamlDotNet reflected the object's PUBLIC members), which serialized but deserialized
+        // to null (the round-trip was lost); now the member-map below pairs with TryDeserializeNestedInstance
+        // so a nested member ROUND-TRIPS. Recurses through SerializeMemberValue so a nested-in-nested member
+        // (or a nested member that is itself polymorphic/a collection/a ref) is handled by the same path.
+        if (category == PropertyCategory.Nested)
+            return SerializeNestedInstance(value, visited);
+        return SerializeValue(value);
+    }
+
+    // The $type discriminator key. A leading '$' can't collide with a CamelCase member name (members never
+    // start with '$'), and it sorts/reads as a clear out-of-band tag in the YAML mapping.
+    const string TypeTag = "$type";
+
+    // Serialize a polymorphic instance as a YAML mapping: a $type tag (the concrete type's namespace-
+    // qualified FullName -- NOT the AssemblyQualifiedName, so it survives an assembly rename and stays
+    // diff-clean) plus each serializable member recursed through SerializeMemberValue (so a nested member
+    // can itself be polymorphic, a collection, a ref, or a leaf). TREE-ONLY with a cycle-guard (Trap 3 /
+    // Unity parity): a back-reference to an already-serialized instance stops at the guard and serializes as
+    // null (a real object graph would hurt YAML diff-cleanliness and the drawer -- rejected by the plan).
+    static Dictionary<object, object> SerializeReferenceInstance(object instance, HashSet<object> visited) {
+        visited ??= new HashSet<object>(ReferenceEqualityComparer.Instance);
+        if (!visited.Add(instance))
+            return null; // cycle / shared ref already emitted -> null (Unity duplicates/nulls back-refs)
+
+        try {
+            Type concrete = instance.GetType();
+            var map = new Dictionary<object, object> {
+                // FullName resolves back via TypeCache.GetTypesDerivedFrom(declaredType) on load -- scoped to
+                // the declared base's implementors, deterministic, and assembly-agnostic.
+                [TypeTag] = concrete.FullName,
+            };
+
+            foreach (MemberInfo member in SerializableMembers(concrete)) {
+                object value = GetMemberValue(member, instance);
+                object serialized = SerializeMemberValue(value, MemberType(member), member, visited);
+                if (serialized is not null)
+                    map[CamelCase(member.Name)] = serialized;
+            }
+            return map;
+        }
+        finally {
+            // Pop so a sibling that legitimately reuses the same instance type (different instance) is not
+            // mistaken for a cycle -- only an ANCESTOR back-reference is a cycle.
+            visited.Remove(instance);
+        }
+    }
+
+    // ---- Nested struct/class members (G4 engine-half) -----------------------
+    // Serialize a plain nested instance (a concrete class or non-primitive struct, NOT [SerializeReference])
+    // as a YAML mapping of its serializable members -- WITHOUT a $type tag, because the declared member type
+    // is the concrete type (no subclass is stored, so load re-instantiates the declared type directly). The
+    // sibling of SerializeReferenceInstance: same member recursion, same cycle guard, but $type-free. A class
+    // member can form a reference cycle (A.Child -> B.Parent -> A), so the SAME visited-set guard applies and
+    // an ancestor back-reference serializes as null (tree-only + cycle-guard, Trap 3 / Unity parity). A struct
+    // is a value type -> never reference-cyclic, and HashSet adds the boxed copy harmlessly. An empty member
+    // map is still returned (an all-default nested value round-trips as an empty mapping, not null).
+    static Dictionary<object, object> SerializeNestedInstance(object instance, HashSet<object> visited) {
+        // Structs are value types: each access boxes a fresh copy, so a HashSet identity-add would never
+        // collide and the guard is moot -- only reference types can form a real cycle. Guard classes only.
+        bool guard = !instance.GetType().IsValueType;
+        if (guard) {
+            visited ??= new HashSet<object>(ReferenceEqualityComparer.Instance);
+            if (!visited.Add(instance))
+                return null; // ancestor back-reference -> null (Unity duplicates/nulls back-refs)
+        }
+
+        try {
+            var map = new Dictionary<object, object>();
+            foreach (MemberInfo member in SerializableMembers(instance.GetType())) {
+                object value = GetMemberValue(member, instance);
+                object serialized = SerializeMemberValue(value, MemberType(member), member, visited);
+                if (serialized is not null)
+                    map[CamelCase(member.Name)] = serialized;
+            }
+            return map;
+        }
+        finally {
+            if (guard)
+                visited.Remove(instance);
+        }
+    }
+
+    // A list/array member -> a YAML sequence (List<object>); each element recurses through SerializeValue.
+    // A null element survives as a null entry (index preserved) so a `List<Material>` with a gap round-trips
+    // its shape; the deserialize side reads the null back. Built as List<object> so YamlDotNet emits a
+    // block/flow sequence and each boxed element uses its own runtime-type converter (math structs) or scalar.
+    static List<object> SerializeSequence(System.Collections.IEnumerable seq) {
+        var items = new List<object>();
+        foreach (object element in seq)
+            items.Add(SerializeValue(element));
+        return items;
+    }
+
+    // A Dictionary<K,V> member -> a YAML mapping (Dictionary<object,object>); both key and value recurse
+    // through SerializeValue. Keys are typically primitives/enums (scalar); a complex key still serializes
+    // via the same recursion. A null serialized key is skipped (a YAML mapping has no null key).
+    static Dictionary<object, object> SerializeDictionary(System.Collections.IDictionary dict) {
+        var map = new Dictionary<object, object>();
+        foreach (System.Collections.DictionaryEntry e in dict) {
+            object key = SerializeValue(e.Key);
+            if (key is null)
+                continue;
+            map[key] = SerializeValue(e.Value);
+        }
+        return map;
     }
 
     // ---- Deserialize -------------------------------------------------------
@@ -347,14 +525,16 @@ public static class SceneSerializer {
                 continue;
             }
 
-            object value = DeserializeValue(raw, memberType);
+            object value = DeserializeValue(raw, memberType, member);
             if (value is not null)
                 SetMemberValue(member, target, value);
         }
     }
 
-    // Inverse of SerializeValue. Asset refs (string -> BObject) load via AssetDatabase.
-    static object DeserializeValue(object raw, Type targetType) {
+    // Inverse of SerializeValue. Asset refs (string -> BObject) load via AssetDatabase. The optional member
+    // carries [SerializeReference] context for the G3 polymorphic branch (a $type-tagged map). It is null for
+    // recursed collection elements -- their polymorphism is detected by the $type tag + abstract element type.
+    static object DeserializeValue(object raw, Type targetType, MemberInfo member = null) {
         if (raw is null)
             return null;
 
@@ -362,8 +542,27 @@ public static class SceneSerializer {
         // Parses the ordered {type, active, members} list back into a List<RenderFeature>, resolving
         // each type via ResolveFeature; an UNKNOWN type-name WARNS + SKIPS (Volume-loader parity: a
         // scene authored with a since-deleted feature must still load), preserving the order of the rest.
+        // Checked before the [SerializeReference] / collection branches: a List<RenderFeature> is its own
+        // ordered {type, active, members} shape, not a $type-tagged single instance nor a generic list.
         if (IsRenderFeatureList(targetType))
             return DeserializeFeatureList(raw);
+
+        // [SerializeReference] polymorphism (G3): a $type-tagged mapping is an out-of-band signal ONLY the
+        // polymorphic serializer emits (a Vector*/Dictionary map never carries $type), so its presence on a
+        // polymorphic-eligible target means "instantiate the named concrete type + fill its members." Checked
+        // FIRST so a polymorphic member never falls through to the collection/math-map branches below. A
+        // non-polymorphic target (the common case) skips this entirely -> byte-identical.
+        if (TryDeserializeReferenceInstance(raw, targetType, member, out object polymorphic))
+            return polymorphic;
+
+        // Scene-object references parse the stored InstanceId hex back into the value-type ref.
+        // Resolution to the live object is LAZY (EntityRef.Value), so this never depends on entity
+        // creation order: a forward ref to an entity not yet built deserializes fine and binds on
+        // first access. A non-string / unparsable value yields None (Guid.Empty), like a missing ref.
+        if (targetType == typeof(EntityRef))
+            return new EntityRef(ParseInstanceId(raw));
+        if (targetType == typeof(ComponentRef))
+            return new ComponentRef(ParseInstanceId(raw));
 
         if (typeof(BObject).IsAssignableFrom(targetType))
             return raw is string reference ? LoadAsset(reference, targetType) : null;
@@ -374,6 +573,33 @@ public static class SceneSerializer {
 
         if (targetType == typeof(ColorGradient))
             return raw is string gradientStr ? ColorGradient.Parse(gradientStr) : null;
+
+        // Collections (G2): rebuild a List<T> / T[] from a YAML sequence and a Dictionary<K,V> from a YAML
+        // mapping, recursing EACH element back through DeserializeValue at the element type -- so an element
+        // that is itself a math struct (arrives as a {x,y,z} map), an asset/scene ref (a string), or a
+        // nested type rehydrates correctly. This is checked BEFORE the math-struct map conversion below: a
+        // Dictionary<K,V> member arrives as the SAME IDictionary<object,object> a Vector3 does, so the
+        // targetType (collection vs Vector*) is what disambiguates -- the collection branch must win for a
+        // dictionary-typed member. Guarded to actual collection target types, so a Vector*/Quaternion member
+        // (not a collection) still falls through to the map-to-vector conversion unchanged.
+        if (targetType.IsArray)
+            return DeserializeArray(raw, targetType.GetElementType());
+        if (TryGetListElementType(targetType, out Type listElem))
+            return DeserializeList(raw, targetType, listElem);
+        if (TryGetDictionaryTypes(targetType, out Type keyType, out Type valType))
+            return DeserializeDictionary(raw, targetType, keyType, valType);
+
+        // Nested struct/class (G4): a plain (non-[SerializeReference]) member whose declared type is a
+        // concrete class or non-primitive struct arrives as a member mapping (written by SerializeNestedInstance).
+        // Reconstruct by instantiating the DECLARED type (no $type lookup -- the declared type is the concrete
+        // type) and refilling its members through ApplyMembers (the SAME recursion a component uses, so a
+        // nested-in-nested member rehydrates too). Checked AFTER the collection/asset/ref branches (a Nested
+        // member is none of those) and BEFORE the math-struct map conversion below (a Vector*/Quaternion is
+        // classified MathStruct, never Nested, so they don't overlap -- but order makes the precedence explicit).
+        // A STRUCT comes back as a BOXED instance; ApplyMembers mutates the box, the caller's SetMemberValue
+        // unboxes it into the field, so struct write-back round-trips through the codec.
+        if (TryDeserializeNestedInstance(raw, targetType, member, out object nested))
+            return nested;
 
         // OpenTK types arrive already converted; otherwise coerce the scalar to the member type.
         if (targetType.IsInstanceOfType(raw))
@@ -393,16 +619,204 @@ public static class SceneSerializer {
         return Coerce(raw, targetType);
     }
 
+    // ---- [SerializeReference] deserialize (G3 engine-half) ------------------
+    // Reconstruct a polymorphic instance from a $type-tagged mapping: resolve the concrete type, instantiate
+    // it, and fill its members through ApplyMembers (the SAME recursion as a top-level component, so a nested
+    // member can itself be polymorphic/a collection/a ref). Returns false (leaving the existing pipeline to
+    // run) UNLESS the target is polymorphic-eligible AND the raw map actually carries a $type tag -- so a
+    // non-polymorphic member is byte-identical. A $type that fails to resolve (renamed/removed type) logs and
+    // yields null rather than throwing, matching the "missing ref -> null" leniency of the rest of the codec.
+    static bool TryDeserializeReferenceInstance(object raw, Type targetType, MemberInfo member, out object result) {
+        result = null;
+
+        // Only a [SerializeReference] member opts in (the exact trigger the serializer used). A polymorphic
+        // COLLECTION element (a `[SerializeReference] List<IFoo>`) is out of scope for this chunk -- the
+        // collection serializer does not write $type per element yet -- so a recursed element (member == null)
+        // is never treated as polymorphic here, keeping serialize/deserialize symmetric (no new silent loss).
+        if (PropertyCategories.Classify(targetType, member) != PropertyCategory.Polymorphic)
+            return false;
+
+        if (raw is not IDictionary<object, object> map ||
+            !map.TryGetValue(TypeTag, out object tagObj) || tagObj is not string typeName)
+            return false; // eligible target but no $type tag -> not a polymorphic payload (let the caller decide)
+
+        Type concrete = ResolvePolymorphicType(typeName, targetType);
+        if (concrete is null) {
+            Debugging.LogWarning(
+                $"[SerializeReference] could not resolve concrete type '{typeName}' for '{targetType.Name}'; " +
+                "the value is dropped (the type was renamed or removed).");
+            result = null;
+            return true; // handled (consumed the $type payload) -- don't fall through to the math/collection branches
+        }
+
+        object instance = Activator.CreateInstance(concrete);
+        // Reuse the component member-application path: build the string-keyed member dict (skip the $type tag)
+        // and apply through the same recursion, so nested polymorphic/collection/ref members rehydrate.
+        var members = new Dictionary<string, object>(StringComparer.Ordinal);
+        foreach ((object k, object v) in map)
+            if (k is string key && key != TypeTag)
+                members[key] = v;
+
+        ApplyMembers(instance, concrete, members);
+        result = instance;
+        return true;
+    }
+
+    // Resolve a $type FullName to a concrete instantiable type ASSIGNABLE to the declared base. Scoped to the
+    // declared base's implementors via TypeCache so resolution is deterministic, assembly-agnostic, and can
+    // never bind an unrelated type that merely shares a FullName. TypeCache is built at bootstrap over the
+    // engine + game-script assemblies (the headless serializer has it too -- it is an ENGINE cache).
+    static Type ResolvePolymorphicType(string fullName, Type declaredType) {
+        foreach (Type t in TypeCache.GetTypesDerivedFrom(declaredType))
+            if (string.Equals(t.FullName, fullName, StringComparison.Ordinal))
+                return t;
+        return null;
+    }
+
+    // ---- Nested struct/class deserialize (G4 engine-half) -------------------
+    // Reconstruct a plain nested instance from a member mapping: instantiate the DECLARED type (no $type --
+    // unlike the polymorphic path, the declared type IS the concrete type) and fill its members through the
+    // same ApplyMembers recursion a top-level component uses, so a nested-in-nested member rehydrates too.
+    // Returns false (leaving the existing pipeline to run) UNLESS the target classifies Nested AND the raw is
+    // a member mapping -- so a non-nested member is byte-identical. A type with no public parameterless ctor
+    // (Activator throws) logs and yields null rather than throwing, matching the codec's "missing -> null"
+    // leniency. A STRUCT instantiates to a boxed default; ApplyMembers mutates the box; the caller's
+    // SetMemberValue unboxes it back into the field (struct write-back).
+    static bool TryDeserializeNestedInstance(object raw, Type targetType, MemberInfo member, out object result) {
+        result = null;
+
+        if (PropertyCategories.Classify(targetType, member) != PropertyCategory.Nested)
+            return false;
+
+        // A nested value is written as a YAML mapping of its members. Anything else (a scalar from a legacy
+        // scene, or a corrupt value) is not a nested payload -> leave it for the caller's coerce/fallthrough.
+        if (raw is not IDictionary<object, object> rawMap)
+            return false;
+
+        object instance;
+        try {
+            instance = Activator.CreateInstance(targetType);
+        }
+        catch (Exception ex) {
+            Debugging.LogWarning(
+                $"Nested member type '{targetType.Name}' could not be instantiated ({ex.GetType().Name}); " +
+                "the value is dropped (it needs a public parameterless constructor).");
+            result = null;
+            return true; // handled -- don't fall through to the math/coerce branches
+        }
+
+        // Build a string-keyed member dict (YamlDotNet keys arrive as object strings) and apply through the
+        // shared recursion, so nested polymorphic/collection/ref/struct members rehydrate the same way.
+        var members = new Dictionary<string, object>(StringComparer.Ordinal);
+        foreach ((object k, object v) in rawMap)
+            if (k is string key)
+                members[key] = v;
+
+        ApplyMembers(instance, targetType, members);
+        result = instance;
+        return true;
+    }
+
     // Read a float component from a YAML mapping (values arrive as strings from YamlDotNet).
     static float MapF(IDictionary<object, object> map, string key) =>
         map.TryGetValue(key, out object v) && v is not null &&
         float.TryParse(v.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out float f) ? f : 0f;
+
+    // ---- Collection deserialize (G2) ---------------------------------------
+    // A YAML sequence arrives from YamlDotNet as a List<object> (or any IEnumerable when typed loosely);
+    // a YAML mapping as an IDictionary<object,object>. Each helper recurses every element back through
+    // DeserializeValue at the element/key/value type, so a list of math structs / refs / nested types
+    // rehydrates the same way a top-level member would. A raw that is not a sequence (corrupt/legacy)
+    // yields an empty collection rather than throwing, matching the "missing ref -> None" leniency.
+
+    // T[] from a sequence raw.
+    static object DeserializeArray(object raw, Type elementType) {
+        List<object> items = RawItems(raw);
+        Array array = Array.CreateInstance(elementType, items.Count);
+        for (int i = 0; i < items.Count; i++)
+            array.SetValue(DeserializeValue(items[i], elementType), i);
+        return array;
+    }
+
+    // List<T> (or anything assignable from List<T> via IList) from a sequence raw.
+    static object DeserializeList(object raw, Type targetType, Type elementType) {
+        List<object> items = RawItems(raw);
+        var list = (System.Collections.IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(elementType))!;
+        foreach (object item in items)
+            list.Add(DeserializeValue(item, elementType));
+        // The member is exactly List<T> in the common case; if it is a wider IList target the List<T> is
+        // assignable. SetMemberValue would throw on a true mismatch -- ApplyMembers swallows nothing, but a
+        // List<T> assigned to a List<T> member is the only shape this branch is reached for (TryGetListElementType).
+        return list;
+    }
+
+    // Dictionary<K,V> from a mapping raw. Keys/values both recurse at their declared types.
+    static object DeserializeDictionary(object raw, Type targetType, Type keyType, Type valType) {
+        var dict = (System.Collections.IDictionary)Activator.CreateInstance(
+            typeof(Dictionary<,>).MakeGenericType(keyType, valType))!;
+        if (raw is IDictionary<object, object> map) {
+            foreach ((object k, object v) in map) {
+                object key = DeserializeValue(k, keyType);
+                if (key is null)
+                    continue;
+                dict[key] = DeserializeValue(v, valType);
+            }
+        }
+        return dict;
+    }
+
+    // Normalize a sequence raw to a List<object>. YamlDotNet yields List<object> for a block/flow sequence;
+    // be tolerant of any non-string IEnumerable. Non-sequence (a scalar/map) -> empty (no throw).
+    static List<object> RawItems(object raw) {
+        if (raw is List<object> direct)
+            return direct;
+        var items = new List<object>();
+        if (raw is not string && raw is System.Collections.IEnumerable e && raw is not IDictionary<object, object>)
+            foreach (object item in e)
+                items.Add(item);
+        return items;
+    }
+
+    // True for a List<T> member (the exact closed-generic List<>). Out the element type. Excludes arrays
+    // (handled separately) and other IEnumerables we do not reconstruct (e.g. read-only sequences).
+    static bool TryGetListElementType(Type t, out Type elementType) {
+        elementType = null;
+        if (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(List<>)) {
+            elementType = t.GetGenericArguments()[0];
+            return true;
+        }
+        return false;
+    }
+
+    // True for a Dictionary<K,V> member (the exact closed-generic Dictionary<,>). Out key + value types.
+    static bool TryGetDictionaryTypes(Type t, out Type keyType, out Type valueType) {
+        keyType = valueType = null;
+        if (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(Dictionary<,>)) {
+            Type[] args = t.GetGenericArguments();
+            keyType = args[0];
+            valueType = args[1];
+            return true;
+        }
+        return false;
+    }
 
     static object LoadAsset(string reference, Type targetType) {
         MethodInfo loadRef = typeof(AssetDatabase).GetMethod(nameof(AssetDatabase.LoadRef))!
             .MakeGenericMethod(targetType);
         return loadRef.Invoke(null, [reference]);
     }
+
+    // True when the value is an unset (None) scene-object ref. SerializeValue returns null for these,
+    // but a None ref is a legitimate "no target" value, NOT a dropped member, so the G0 loud-drop must
+    // skip it (only a SET ref that fails to serialize would be a real loss, and EntityRef/ComponentRef
+    // always serialize when set). Boxed value types, so a type check is enough.
+    static bool IsNoneSceneObjectRef(object value) =>
+        value is EntityRef { HasValue: false } or ComponentRef { HasValue: false };
+
+    // Parse a stored InstanceId hex ("N" form, 32 chars) back to a Guid; Guid.Empty (= None) for a
+    // non-string or unparsable value, so a corrupt/missing ref deserializes to "no target" not a throw.
+    static Guid ParseInstanceId(object raw) =>
+        raw is string s && Guid.TryParseExact(s, "N", out Guid id) ? id : Guid.Empty;
 
     static object Coerce(object raw, Type targetType) {
         try {

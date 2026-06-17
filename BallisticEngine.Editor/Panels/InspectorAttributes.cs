@@ -19,11 +19,16 @@ public sealed class MemberAttributes {
 
     // --- drawer-pipeline additions ---
     public LabelTextAttribute LabelText { get; private init; }
-    public int Order { get; private init; }
     public IReadOnlyList<ConditionalAttribute> Conditionals { get; private init; }
 
     static readonly Dictionary<MemberInfo, MemberAttributes> cache = new();
     static readonly ConditionalAttribute[] NoConditions = System.Array.Empty<ConditionalAttribute>();
+
+    // The attribute-less default for an IProperty with no backing MemberInfo (a collection element slot,
+    // editor-rework G2-editor). All attributes null / empty so the drawer stack's Visibility (no
+    // conditionals -> always visible) and Enable (no ReadOnly -> always enabled) steps are no-ops and the
+    // element draws as a bare value. Shared singleton so a per-element property allocates no attribute set.
+    public static readonly MemberAttributes None = new() { Conditionals = NoConditions };
 
     public static MemberAttributes For(MemberInfo member) {
         if (cache.TryGetValue(member, out MemberAttributes cached))
@@ -42,7 +47,6 @@ public sealed class MemberAttributes {
             Foldout = member.GetCustomAttribute<FoldoutGroupAttribute>(),
             ReadOnly = member.GetCustomAttribute<ReadOnlyAttribute>() is not null,
             LabelText = member.GetCustomAttribute<LabelTextAttribute>(),
-            Order = member.GetCustomAttribute<PropertyOrderAttribute>()?.Order ?? 0,
             Conditionals = (IReadOnlyList<ConditionalAttribute>)conditionals ?? NoConditions,
         };
         cache[member] = resolved;

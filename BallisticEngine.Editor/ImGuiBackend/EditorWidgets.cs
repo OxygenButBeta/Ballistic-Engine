@@ -7,7 +7,7 @@ namespace BallisticEngine.Editor;
 // Custom draw-list widgets that give the editor a purpose-built, modern feel beyond stock ImGui:
 // an iOS/Material-style toggle switch and a soft drop-shadow helper for floating cards. All are
 // theme-aware (read the accent from the current style) and DPI-aware (pass the UI scale).
-internal static class EditorWidgets {
+internal static partial class EditorWidgets {
     // A sliding on/off switch. Returns true the frame it changes. Reads better than a checkbox for
     // standalone booleans (panel headers, settings, the live-refresh toggle).
     public static bool ToggleSwitch(string id, ref bool value, float scale) {

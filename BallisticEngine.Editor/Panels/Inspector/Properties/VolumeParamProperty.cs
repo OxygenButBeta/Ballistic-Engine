@@ -22,6 +22,11 @@ public sealed class VolumeParamProperty : IProperty {
         ValueType = valueProp.PropertyType;
     }
 
+    // The parameter's backing FIELD (slot.Field) — the MemberInfo carrying the cross-cutting attributes the
+    // drawer stack keys its resolved order off (B0). Exposed so the stack treats the volume path identically
+    // to the component path (MemberProperty.Member), keeping the two on ONE shared resolution.
+    public MemberInfo Field => slot.Field;
+
     public string Name => slot.Name;
     public string Label => Attributes.LabelText?.Text ?? InspectorReflection.Prettify(slot.Name);
     public string Tooltip => Attributes.Tooltip?.Text;

@@ -66,3 +66,13 @@ public sealed class PropertyOrderAttribute : Attribute {
     public int Order { get; }
     public PropertyOrderAttribute(int order) => Order = order;
 }
+
+// Marks a member whose DECLARED type is abstract/interface (or any base) as polymorphically serialized
+// by CONCRETE TYPE (Unity's [SerializeReference]): the live concrete type is recorded as a $type tag and
+// instantiated on load, and the inspector offers a TypeCache dropdown of implementors (editor-rework
+// Rule 1.75 / §3.45 gap 2 / Trap 3). MARKER ONLY in P0.2 — the property model uses it to classify the
+// member as PropertyCategory.Polymorphic so the traversal contract is complete; the $type codec + dropdown
+// wiring land in Phase G3. Without this marker an abstract/interface member is left Unsupported (it can't
+// be `new`'d, so the model won't silently recurse a base it can't instantiate).
+[AttributeUsage(AttributeTargets.Field | AttributeTargets.Property, Inherited = false)]
+public sealed class SerializeReferenceAttribute : Attribute { }

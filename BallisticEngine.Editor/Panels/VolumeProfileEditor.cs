@@ -160,7 +160,7 @@ internal static class VolumeProfileEditor {
     // attributes the component inspector uses, so the two paths can't drift. ImGuiVolumeGui draws the
     // per-parameter override checkbox + label and disables the value cell when not overridden;
     // [ShowIf]/[HideIf] on a parameter field hide its row.
-    static readonly DrawerPipeline pipeline = DrawerPipeline.CreateDefault();
+    static readonly DrawerStack pipeline = DrawerStack.CreateDefault();
     static readonly ImGuiVolumeGui volumeGui = new();
 
     static bool DrawParameters(VolumeComponent component) {
@@ -170,9 +170,11 @@ internal static class VolumeProfileEditor {
         ImGui.TableSetupColumn("value", ImGuiTableColumnFlags.WidthStretch, 0.55f);
 
         var changed = false;
-        // [PropertyOrder] sorts (stable: default 0 keeps declaration order).
-        foreach (VolumeComponent.ParameterSlot slot in System.Linq.Enumerable.OrderBy(
-                     component.Parameters, s => MemberAttributes.For(s.Field).Order)) {
+        // [PropertyOrder] sorts via the single-sourced engine rule (stable: default 0 keeps slot order) --
+        // same ordering the component inspector uses, keyed on the parameter's backing field, so the two
+        // inspector paths can't drift on member order.
+        foreach (VolumeComponent.ParameterSlot slot in
+                     PropertyOrdering.Sort(component.Parameters, s => PropertyOrdering.OrderOf(s.Field))) {
             changed |= pipeline.Draw(new VolumeParamProperty(slot, component), volumeGui);
             changed |= volumeGui.TakeOverrideChanged();   // toggling the override checkbox is also a change
         }
@@ -197,8 +199,8 @@ internal static class VolumeProfileEditor {
             exposure.limitMax.Value = exposure.limitMin.Value;
     }
 
-    // (The per-parameter value switch is gone — DrawParameters now runs every slot through the shared
-    // DrawerPipeline + ImGuiVolumeGui, the same value drawers the component inspector uses.)
+    // (The per-parameter value switch is gone -- DrawParameters now runs every slot through the shared
+    // composable DrawerStack + ImGuiVolumeGui (B0), the same value drawers the component inspector uses.)
 
     // Compact framed header with an Active checkbox overlaid after the arrow (the inline version
     // of InspectorPanel's component header) and a "..." menu button on the right edge. Remove

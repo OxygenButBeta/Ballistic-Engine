@@ -167,11 +167,16 @@ internal sealed class TransformGizmo {
         Matrix4 vp, SysVec2 viewMin, SysVec2 viewSize, SysVec2 mouse) {
         if (!dragging) {
             if (activeAxis >= 0 && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
-                EditorUndo.Push(Mode switch {   // snapshot before the gizmo mutates the transform
+                // Drag-start snapshot of the ONE selected entity's transform -> scoped through
+                // EditorCommands.EditEntity (PushEntity: selection survives, no whole-scene re-bake).
+                // The gizmo mutates entity.transform on later drag frames, so the grab-frame snapshot
+                // is preserved with a no-op mutate -- byte-identical beyond the Push->PushEntity scoping.
+                string label = Mode switch {
                     GizmoMode.Translate => "Move",
                     GizmoMode.Rotate => "Rotate",
                     _ => "Scale",
-                });
+                };
+                EditorCommands.EditEntity(entity, label, () => { });
                 dragging = true;
                 // Work in WORLD space so the gizmo is correct for parented objects (their local
                 // Position/Rotation are relative to the parent; the handles live in world space).
@@ -297,7 +302,10 @@ internal sealed class TransformGizmo {
         if (!vertexDragging) {
             // Arm a drag: V is held, the view is hovered, a source vertex exists, and LMB just went down.
             if (viewHovered && VertexSnap.Found && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
-                EditorUndo.Push("Vertex Snap");
+                // Drag-start snapshot of the ONE selected entity's transform -> scoped EditEntity
+                // (PushEntity); the snap moves entity.transform.WorldPosition on later frames, so the
+                // grab-frame snapshot is preserved with a no-op mutate -- byte-identical scoping swap.
+                EditorCommands.EditEntity(entity, "Vertex Snap", () => { });
                 vertexDragging = true;
                 // Freeze the pivot->source vertex offset; pure translation keeps it constant.
                 vertexOffset = VertexSnap.SourceWorld - entity.transform.WorldPosition;
