@@ -200,6 +200,11 @@ internal sealed class EditorApplication {
         // by type instead of the old `if (behaviour is Renderer/Volume/...)` instanceof chain.
         ComponentPreviewRegistry.Rebuild();
 
+        // B2 (Rule 1): warm the asset-inspector registry the same way, so the first asset selection doesn't
+        // pay the [AssetInspector] reflection scan. DrawAssetInspector resolves the per-extension body from
+        // this registry instead of the old `switch (ext) { case ".mat": ... }` god-switch.
+        AssetInspectorRegistry.Rebuild();
+
         // Per-project dock layout: key by the project root, then apply the saved arrangement before the
         // first frame (BuildUI lays out the default if none exists).
         EditorLayout.SetProject(bootstrap.Project.RootPath);

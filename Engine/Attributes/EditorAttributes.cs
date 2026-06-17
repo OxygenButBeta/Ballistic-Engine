@@ -151,6 +151,39 @@ public sealed class ComponentPreviewAttribute : Attribute {
     }
 }
 
+// Marks an editor IAssetInspector class as the custom inspector body for an asset FILE EXTENSION
+// (editor-rework Rule 1 / Phase B2). REPLACES the `switch (ext) { case ".mat": DrawMaterialEditor(...);
+// case ".png" or ...: DrawTextureImportSettings(...); ... }` god-switch in InspectorPanel.DrawAssetInspector
+// — the asset-side mirror of B1's `if (behaviour is Renderer/Volume/...)` chain that Rule 1 deletes.
+//
+// Asset selection in this editor is PATH+EXTENSION+GUID-based (there is no single loaded "asset object"
+// to switch on — `.scene`/`.shader`/`.glsl` aren't even backed by an instance), so B2 keys on the file
+// EXTENSION rather than a Type — the exact analog of B1's TargetType. An inspector self-registers by the
+// extension(s) it draws; the panel resolves the applicable inspector from a registry by extension, never a
+// switch. Adding a custom asset body = adding one [AssetInspector] class; InspectorPanel is never edited.
+//
+// Mirrors [ComponentPreview] (B1) / [MenuItem] (A1) limb-for-limb: the attribute lives in the engine (zero
+// ImGui/editor refs) so the host-assembly inspector classes carry it and the engine-side TypeCache scan
+// discovers them headlessly; the editor's AssetInspectorRegistry is the only thing that interprets it.
+// Extension is normalised to lower-case WITH the leading dot (".mat") on construction so a query matches the
+// `Path.GetExtension(path).ToLowerInvariant()` the panel produces. AllowMultiple = one inspector class can
+// cover several extensions (e.g. the texture body covers .png/.jpg/.tga/.hdr/...). Priority breaks resolution
+// order when two inspectors claim the SAME extension: higher wins; ties break on the inspector type's full
+// name (DeterministicResolver) so the winner is machine-independent.
+[AttributeUsage(AttributeTargets.Class, AllowMultiple = true, Inherited = false)]
+public sealed class AssetInspectorAttribute : Attribute {
+    public string Extension { get; }
+    public int Priority { get; }
+    public AssetInspectorAttribute(string extension, int priority = 0) {
+        // Normalise to ".ext" lower-case so it matches Path.GetExtension(...).ToLowerInvariant().
+        extension = (extension ?? string.Empty).Trim().ToLowerInvariant();
+        if (extension.Length > 0 && extension[0] != '.')
+            extension = "." + extension;
+        Extension = extension;
+        Priority = priority;
+    }
+}
+
 // Marks a DataAsset subclass as creatable from the editor's asset browser (Unity's
 // [CreateAssetMenu]). The browser adds a "Create > {Menu} > {DisplayName}" entry that writes a new
 // .asset with this type's default values, named {FileName}. Discovered by ComponentRegistry.

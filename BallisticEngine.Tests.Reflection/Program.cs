@@ -14,6 +14,7 @@ exit += OrderedPassListTests.Run();
 exit += InputActionChainTests.Run();
 exit += DrawerStackTests.Run();
 exit += ComponentPreviewTests.Run();
+exit += AssetInspectorTests.Run();
 return exit;
 
 internal static class TypeCacheTests {

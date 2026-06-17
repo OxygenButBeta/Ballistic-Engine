@@ -2,6 +2,7 @@ using System.Reflection;
 using BallisticEngine.AssetPipeline;
 using BallisticEngine.AssetPipeline.Loaders;
 using BallisticEngine.Editor.Inspector;
+using BallisticEngine.Editor.Inspector.AssetInspectors;
 using BallisticEngine.Serialization;
 using Hexa.NET.ImGui;
 using SysVec2 = System.Numerics.Vector2;
@@ -1907,7 +1908,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
     // Selected .volume asset: edit the live profile instance directly (every Volume referencing
     // it sees the change immediately) and persist on change.
-    static void DrawVolumeProfileAsset(Guid guid) {
+    internal static void DrawVolumeProfileAsset(Guid guid) {
         var profile = AssetDatabase.Load<VolumeProfile>(guid);
         if (profile is null) {
             ImGui.TextDisabled("Unreadable volume profile.");
@@ -2167,6 +2168,12 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
     // ---- Asset inspector -----------------------------------------------------
 
+    // B2 (Rule 1): the asset inspector resolves the custom body for the selected asset's extension from
+    // AssetInspectorRegistry instead of the old `switch (ext)` god-switch. Each former case is now a
+    // self-registering [AssetInspector(".ext")] class whose Draw delegates back into the section methods below
+    // (still here, now internal) so the rendering is byte-identical, only the DISPATCH moved. An extension with
+    // NO registered inspector draws only the file header above (R1.9's never-blank fallback, byte-identical to
+    // the old "just the file header, no clutter" default for models etc.).
     void DrawAssetInspector() {
         var path = state.SelectedAssetPath;
         Guid guid = state.SelectedAssetGuid;
@@ -2176,50 +2183,33 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         DrawAssetHeader(path, ext, meta);
         ImGui.Spacing();
 
-        switch (ext) {
-            case ".png" or ".jpg" or ".jpeg" or ".tga" or ".bmp" or ".hdr" or ".exr":
-                DrawTextureImportSettings(path, guid, meta);
-                break;
-            case ".mat":
-                DrawMaterialEditor(path, guid);
-                break;
-            case ".volume":
-                DrawVolumeProfileAsset(guid);
-                break;
-            case ".scene":
-                if (ImGui.Button($"{EditorIcons.Play}  Open Scene", new SysVec2(-1, 0)))
-                    OpenScene(path);
-                break;
-            case ".pyscene":
-                ImGui.TextWrapped("Falcor scene. On import it generates a sibling .scene you can open.");
-                break;
-            case ".shader" or ".glsl" or ".cubemap":
-                // Native text assets — show a hint but no noisy "unsupported" line.
-                ImGui.TextDisabled("Edit this file in a text editor.");
-                if (ImGui.Button($"{EditorIcons.FolderOpen}  Show in Explorer", new SysVec2(-1, 0)))
-                    System.Diagnostics.Process.Start("explorer.exe",
-                        $"/select,\"{AssetDatabase.Project.ResolveAbsolute(path)}\"");
-                break;
-            case ".prefab":
-                DrawPrefabInspector(path);
-                break;
-            case ".asset":
-                DrawDataAssetInspector(path);
-                break;
-            case ".wav" or ".wave" or ".ogg":
-                DrawAudioClipAsset(path);
-                break;
-            case ".banim":
-                DrawAnimationClipAsset(path);
-                break;
-            // Everything else (models, etc.): just the file header above — no clutter.
-        }
+        IAssetInspector inspector = AssetInspectorRegistry.InspectorFor(ext);
+        inspector?.Draw(new AssetInspectorContext(this, path, guid, ext, meta));
+    }
+
+    // The three former inline switch cases extracted as section methods (a structural MOVE, byte-identical to
+    // the inline bodies) so their [AssetInspector] shims can delegate to them like the rest. Internal so the
+    // host-assembly inspector classes reach them.
+    internal static void DrawSceneAssetActions(string path) {
+        if (ImGui.Button($"{EditorIcons.Play}  Open Scene", new SysVec2(-1, 0)))
+            OpenScene(path);
+    }
+
+    internal static void DrawPysceneHint() =>
+        ImGui.TextWrapped("Falcor scene. On import it generates a sibling .scene you can open.");
+
+    // Native text assets: show a hint but no noisy "unsupported" line.
+    internal static void DrawTextAssetHint(string path) {
+        ImGui.TextDisabled("Edit this file in a text editor.");
+        if (ImGui.Button($"{EditorIcons.FolderOpen}  Show in Explorer", new SysVec2(-1, 0)))
+            System.Diagnostics.Process.Start("explorer.exe",
+                $"/select,\"{AssetDatabase.Project.ResolveAbsolute(path)}\"");
     }
 
     // Audio asset view: a Preview/Stop button + clip stats, so you can audition a .wav/.ogg straight
     // from the asset browser without dropping it on an AudioSource. Same Audio facade as the component
     // preview (play-mode-independent; silent no-op with no audio device).
-    void DrawAudioClipAsset(string path) {
+    internal void DrawAudioClipAsset(string path) {
         AudioClip clip = AssetDatabase.Load<AudioClip>(path);
         if (clip is null) {
             ImGui.TextDisabled("Could not load audio clip.");
@@ -2242,7 +2232,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // Animation-clip asset view: clip stats. A skeletal pose preview needs a skinned mesh to drive,
     // which an asset-only view doesn't have - assign the clip to an Animator on a skinned entity and
     // use the Animator scrub. Here we just summarize the clip.
-    void DrawAnimationClipAsset(string path) {
+    internal void DrawAnimationClipAsset(string path) {
         AnimationClip clip = AssetDatabase.Load<AnimationClip>(path);
         if (clip is null) {
             ImGui.TextDisabled("Could not load animation clip.");
@@ -2261,7 +2251,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // Prefab inspector: its captured entity tree (read-only) + an Instantiate-into-scene action.
     // The backend is capture/instantiate (no live instance overrides), so this views the asset and
     // plants copies; editing happens by instantiating, changing in the scene, and re-creating.
-    void DrawPrefabInspector(string path) {
+    internal void DrawPrefabInspector(string path) {
         PrefabAsset prefab = AssetDatabase.Load<PrefabAsset>(path);
         if (prefab is null) {
             ImGui.TextDisabled("Could not load prefab.");
@@ -2296,7 +2286,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // inspector uses (honors [Range]/[Header]/[Tooltip]/[FoldoutGroup]/asset pickers). Edits write
     // straight back to the .asset file via DataAssetSerializer: an asset edit, not scene state, so NO
     // scene undo (the .volume edit-write-back pattern). Change is detected by a serialized-text diff.
-    void DrawDataAssetInspector(string path) {
+    internal void DrawDataAssetInspector(string path) {
         if (dataAssetPath != path || dataAssetInstance is null) {
             dataAssetPath = path;
             dataAssetInstance = LoadDataAsset(path);
@@ -2354,7 +2344,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         ImGui.Separator();
     }
 
-    static void DrawTextureImportSettings(string path, Guid guid, MetaFile meta) {
+    internal static void DrawTextureImportSettings(string path, Guid guid, MetaFile meta) {
         if (meta is null) {
             ImGui.TextDisabled("No import settings.");
             return;
@@ -2420,7 +2410,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         }
     }
 
-    void DrawMaterialEditor(string path, Guid guid) {
+    internal void DrawMaterialEditor(string path, Guid guid) {
         var absolute = AssetDatabase.Project.ResolveAbsolute(path);
         MaterialDefinition definition;
         try {
