@@ -105,6 +105,31 @@ public sealed class FoldoutGroupAttribute : Attribute {
     }
 }
 
+// Marks a static, PARAMETERLESS method as a menu-bar command (Unity's [MenuItem]). The editor
+// discovers every such method by reflection at bootstrap (TypeCache.GetMethodsWithAttribute<MenuItem>),
+// builds the top menu bar from the slash-separated Path, and invokes the method when the entry is
+// clicked. This is the self-registration primitive for the editor's window/command registry (editor
+// rework Rule 3): a window opens itself by carrying a [MenuItem("Window/Xxx")] method that calls into
+// the editor's window facade — EditorApplication never lists a window by name.
+//
+//   [MenuItem("Window/Inspector")] static void OpenInspector() => EditorWindows.Open("Inspector");
+//
+// Path = "TopMenu/Sub/.../Leaf"; the last segment is the clickable label, the rest are sub-menus.
+// Order sorts siblings sharing the same parent path (ascending; ties break on the leaf label, then on
+// the declaring method's full name — a stable total order independent of assembly-load order, so the
+// menu is deterministic across machines/builds). The attribute lives in the engine assembly (zero
+// ImGui/editor refs) so editor windows in the host assembly can carry it and the headless TypeCache
+// scan in EngineBootstrap discovers them. AllowMultiple so one method can sit under several paths.
+[AttributeUsage(AttributeTargets.Method, AllowMultiple = true, Inherited = false)]
+public sealed class MenuItemAttribute : Attribute {
+    public string Path { get; }
+    public int Order { get; }
+    public MenuItemAttribute(string path, int order = 0) {
+        Path = path;
+        Order = order;
+    }
+}
+
 // Marks a DataAsset subclass as creatable from the editor's asset browser (Unity's
 // [CreateAssetMenu]). The browser adds a "Create > {Menu} > {DisplayName}" entry that writes a new
 // .asset with this type's default values, named {FileName}. Discovered by ComponentRegistry.

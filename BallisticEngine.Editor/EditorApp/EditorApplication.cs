@@ -138,6 +138,14 @@ internal sealed class EditorApplication {
         settings = new SettingsPanel(imgui.SetAccent, ApplyFrameRateLimit);
         buildPanel = new BuildPanel(bootstrap.Project);
 
+        // A1 (Rule 3): bind the static EditorWindows facade to this instance so the self-registered
+        // [MenuItem] window commands (discovered by EditorWindowRegistry) act on the live editor. The menu
+        // bar is built from the registry — EditorApplication no longer names windows when drawing the menu.
+        // Build the registry once now so the first menu draw doesn't pay the reflection scan (TypeCache is
+        // already built by EngineBootstrap above).
+        EditorWindows.Bind(ToggleWindow, OpenWindow, IsWindowOpen, IsWindowEnabled);
+        EditorWindowRegistry.Rebuild();
+
         // Per-project dock layout: key by the project root, then apply the saved arrangement before the
         // first frame (BuildUI lays out the default if none exists).
         EditorLayout.SetProject(bootstrap.Project.RootPath);
@@ -730,18 +738,21 @@ internal sealed class EditorApplication {
         if (ImGui.BeginMenu("Assets")) {
             if (ImGui.MenuItem($"{EditorIcons.Refresh}  Refresh", "Ctrl+R")) RebuildScripts();
             ImGui.Separator();
-            if (ImGui.MenuItem($"{EditorIcons.Package}  Import Unity Package...")) UnityImportWindow.Open();
+            // Discovered [MenuItem("Assets/...")] commands (the Unity-package importer self-registers here).
+            DrawRegistryMenu("Assets");
             ImGui.EndMenu();
         }
 
         if (ImGui.BeginMenu("Window")) {
-            ImGui.MenuItem("Entities", (string)null, ref showHierarchy);
-            ImGui.MenuItem("Scene Components", (string)null, ref showSceneComponents);
-            ImGui.MenuItem("Inspector", (string)null, ref showInspector);
-            ImGui.MenuItem("Assets", (string)null, ref showBottom);
-            ImGui.MenuItem("Console", (string)null, ref showConsole);
+            // The window list is BUILT from the self-registered [MenuItem("Window/...")] commands
+            // (EditorWindowRegistry), not hand-listed — Rule 3: EditorApplication names no window here.
+            // The core panels (Order 0-4) and the standalone tools (Order 20+) render with a checkmark
+            // mirroring their open state; the registry separates the two groups by Order with a divider.
+            DrawRegistryMenu("Window");
 
-            // Open ANOTHER instance of a panel (unlimited) — same as the tab's Add Tab menu.
+            // Layout operations (not windows, so not registry-discovered): open another panel instance,
+            // and reset the dock arrangement.
+            ImGui.Separator();
             if (ImGui.BeginMenu($"{EditorIcons.Add}  Add Panel")) {
                 AddTabItem(EditorLayout.Inspector, "Inspector", ref showInspector);
                 AddTabItem(EditorLayout.Entities, "Entities", ref showHierarchy);
@@ -750,12 +761,6 @@ internal sealed class EditorApplication {
                 AddTabItem(EditorLayout.Console, "Console", ref showConsole);
                 ImGui.EndMenu();
             }
-            ImGui.Separator();
-            ImGui.MenuItem("Statistics", (string)null, ref showStats);
-            ImGui.MenuItem("Profiler", (string)null, ref profilerPanel.Open);
-            ImGui.MenuItem("Build", (string)null, ref buildPanel.Open);
-            ImGui.MenuItem("Tags & Layers", (string)null, ref tagsLayers.Open);
-            ImGui.MenuItem("Settings", (string)null, ref settings.Open);
             ImGui.Separator();
             if (ImGui.MenuItem("Reset Layout")) {
                 EditorLayout.DeleteSaved();
@@ -781,6 +786,42 @@ internal sealed class EditorApplication {
 
         ImGui.EndMainMenuBar();
         return height;
+    }
+
+    // Renders every self-registered [MenuItem("<topMenu>/...")] command under the open menu (Rule 3 / A1).
+    // Nested paths become sub-menus; a 2-segment path ("Window/Inspector") is a leaf directly under the
+    // top menu. A leaf whose path maps to a window key shows a Unity-style checkmark mirroring that
+    // window's open state (and is disabled when EditorWindows.IsEnabled is false). Entries come pre-sorted
+    // deterministically from the registry; a big jump in Order between consecutive leaves inserts a divider
+    // (so the core panels and the standalone tools stay visually grouped, as the old hand-list did).
+    void DrawRegistryMenu(string topMenu) {
+        int? prevOrder = null;
+        foreach (EditorWindowRegistry.Entry entry in EditorWindowRegistry.Items) {
+            if (entry.TopMenu != topMenu) continue;
+
+            // Group divider: a >10 Order gap from the previous leaf in this menu separates groups.
+            if (prevOrder is { } po && entry.Order - po > 10)
+                ImGui.Separator();
+            prevOrder = entry.Order;
+
+            // Open the sub-menus this entry nests under, in order, then close them after the leaf.
+            IReadOnlyList<string> subs = entry.SubMenus;
+            var opened = 0;
+            var skip = false;
+            foreach (string sub in subs) {
+                if (!ImGui.BeginMenu(sub)) { skip = true; break; }
+                opened++;
+            }
+            if (!skip) {
+                bool isToggle = EditorMenus.PathToWindowKey.TryGetValue(entry.Path, out string key);
+                bool selected = isToggle && EditorWindows.IsOpen(key);
+                bool enabled = !isToggle || EditorWindows.IsEnabled(key);
+                if (ImGui.MenuItem(entry.Leaf, (string)null, selected, enabled))
+                    entry.Invoke();
+            }
+            for (int i = 0; i < opened; i++)
+                ImGui.EndMenu();
+        }
     }
 
     void DrawGameObjectMenu() {
@@ -1304,6 +1345,74 @@ internal sealed class EditorApplication {
         }
         ImGui.End();
     }
+
+    // ── EditorWindows facade handlers (A1 / Rule 3) ─────────────────────────────────────────────────
+    // The static EditorWindows facade (called by the self-registered [MenuItem] window commands) routes
+    // here so the menu's open/toggle acts on this live instance. Keys are the EditorLayout.* dock names for
+    // the core panels and EditorMenus.WindowKeys.* for the standalone tool windows. These three handlers
+    // REPLACE the per-window `ref showXxx` / `ref panel.Open` arguments that DrawMainMenuBar used to pass by
+    // name — the menu no longer references a window field directly; it toggles through the key.
+
+    // Toggle a window's visibility (the Window-menu checkbox behaviour). Closed → (re)open + focus it.
+    void ToggleWindow(string key) {
+        switch (key) {
+            case EditorLayout.Entities: showHierarchy = !showHierarchy; if (showHierarchy) pendingFocusWindow = key; break;
+            case EditorLayout.SceneComponents: showSceneComponents = !showSceneComponents; if (showSceneComponents) pendingFocusWindow = key; break;
+            case EditorLayout.Inspector: showInspector = !showInspector; if (showInspector) pendingFocusWindow = key; break;
+            case EditorLayout.Assets: showBottom = !showBottom; if (showBottom) pendingFocusWindow = key; break;
+            case EditorLayout.Console: showConsole = !showConsole; if (showConsole) pendingFocusWindow = key; break;
+            case EditorMenus.WindowKeys.Statistics: showStats = !showStats; break;
+            case EditorMenus.WindowKeys.Profiler: profilerPanel.Open = !profilerPanel.Open; break;
+            case EditorMenus.WindowKeys.Build: buildPanel.Open = !buildPanel.Open; break;
+            case EditorMenus.WindowKeys.TagsLayers: tagsLayers.Open = !tagsLayers.Open; break;
+            case EditorMenus.WindowKeys.Settings: settings.Open = !settings.Open; break;
+        }
+    }
+
+    // Open a window (never closes). For a dockable kind whose primary is hidden, bring the primary back;
+    // otherwise spawn ANOTHER instance through the host (the "Add Panel" behaviour). For a standalone
+    // window, just open it.
+    void OpenWindow(string key) {
+        switch (key) {
+            case EditorLayout.Entities: OpenDockable(key, ref showHierarchy); break;
+            case EditorLayout.SceneComponents: OpenDockable(key, ref showSceneComponents); break;
+            case EditorLayout.Inspector: OpenDockable(key, ref showInspector); break;
+            case EditorLayout.Assets: OpenDockable(key, ref showBottom); break;
+            case EditorLayout.Console: OpenDockable(key, ref showConsole); break;
+            case EditorMenus.WindowKeys.Statistics: showStats = true; break;
+            case EditorMenus.WindowKeys.Profiler: profilerPanel.Open = true; break;
+            case EditorMenus.WindowKeys.Build: buildPanel.Open = true; break;
+            case EditorMenus.WindowKeys.TagsLayers: tagsLayers.Open = true; break;
+            case EditorMenus.WindowKeys.Settings: settings.Open = true; break;
+            case EditorMenus.WindowKeys.UnityImport: UnityImportWindow.Open(); break;
+        }
+    }
+
+    // Open a dockable kind: re-show the hidden primary first, else add another instance via the host
+    // (mirrors the old AddTabItem behaviour, now keyed instead of named).
+    void OpenDockable(string key, ref bool primaryShown) {
+        if (!primaryShown) primaryShown = true;
+        else extraPanels.Open(key);
+    }
+
+    // Whether a window is currently shown (drives the Window-menu checkmark via EditorWindows.IsOpen).
+    bool IsWindowOpen(string key) => key switch {
+        EditorLayout.Entities => showHierarchy,
+        EditorLayout.SceneComponents => showSceneComponents,
+        EditorLayout.Inspector => showInspector,
+        EditorLayout.Assets => showBottom,
+        EditorLayout.Console => showConsole,
+        EditorMenus.WindowKeys.Statistics => showStats,
+        EditorMenus.WindowKeys.Profiler => profilerPanel.Open,
+        EditorMenus.WindowKeys.Build => buildPanel.Open,
+        EditorMenus.WindowKeys.TagsLayers => tagsLayers.Open,
+        EditorMenus.WindowKeys.Settings => settings.Open,
+        EditorMenus.WindowKeys.UnityImport => UnityImportWindow.IsOpen,
+        _ => false,
+    };
+
+    // Per-window menu-enable gate (reserved for future "disabled while playing" cases; all enabled today).
+    bool IsWindowEnabled(string key) => true;
 
     // Draws one dockable panel with a CORRECT Begin/End pairing: End() is always called once Begin()
     // ran, even when Begin returns false or the close button just set `show` to false this frame. The
