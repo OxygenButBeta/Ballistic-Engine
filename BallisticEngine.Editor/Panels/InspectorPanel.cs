@@ -50,6 +50,14 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
     string addComponentSearch = "";
 
+    // EF10a — per-component member-search buffers. The search box (shown only on components with enough
+    // members — InspectorLayout.MemberSearchThreshold) filters which member rows draw. Keyed by the live
+    // component INSTANCE so each visible component keeps its own query independently and the query survives
+    // across frames; a ConditionalWeakTable so a removed/destroyed component's entry is collected with it
+    // (no manual eviction, no leak). The boxed string holder lets us mutate the value in place by reference.
+    readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, StrBox> memberSearch = new();
+    sealed class StrBox { public string Value = ""; }
+
     // Inspector lock (Unity's padlock): when on, the inspector pins its current entity so selecting
     // other objects in the hierarchy/viewport doesn't change what's shown. Lock only applies to an
     // entity selection (the common case); asset/scene-behaviour selections always follow.
@@ -1069,6 +1077,78 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         // restores it on the normal path; this is belt-and-braces against a throw escaping that).
         nestDepth = 0;
 
+        // EF10a — the per-component member SET that survives [ShowIf]/[HideIf] (what the user actually sees).
+        // Computed ONCE here so it drives BOTH the search-box visibility threshold AND the filter, and so the
+        // forward-scan that hides empty [Header]/[FoldoutGroup] sections under a query has a concrete list to
+        // walk. This is the only added per-frame allocation and only over the (already small) member list.
+        var visibleMembers = new List<(MemberInfo Info, MemberAttributes Attrs)>();
+        foreach (TypePlan.Member planned in TypePlan.For(type).Members) {
+            MemberAttributes a = MemberAttributes.For(planned.Info);
+            if (Conditions.Visible(a.Conditionals, target))
+                visibleMembers.Add((planned.Info, a));
+        }
+
+        // EF10a — conditional per-component member search. Shown only when the component has enough members
+        // to be worth filtering (don't clutter a 3-field component — InspectorLayout.MemberSearchThreshold).
+        // The box sits ABOVE the grid and only decides ROW VISIBILITY; it is NOT part of the column model
+        // (EF11/EF16 own that), so it can't collide with the label/value layout.
+        string query = "";
+        if (visibleMembers.Count > Inspector.InspectorLayout.MemberSearchThreshold) {
+            StrBox box = memberSearch.GetValue(target, static _ => new StrBox());
+            if (EditorWidgets.SearchField($"##membersearch_{type.Name}", "Search properties...", ref box.Value))
+                state.MarkViewportDirty();
+            query = box.Value;
+            ImGui.Spacing();
+        }
+
+        // EF10a — when a query is active, `matches` is the set of members whose DISPLAYED label (the same
+        // [LabelText] ?? Prettify(Name) the row shows) contains the query; a [Header] section or [FoldoutGroup]
+        // with no matching member is hidden so only the relevant fields + their group remain. With no query
+        // `matches` is null → the predicates below pass everyone → the draw is byte-identical to pre-EF10a.
+        HashSet<MemberInfo> matches = null;
+        if (query.Length > 0) {
+            matches = new HashSet<MemberInfo>();
+            foreach ((MemberInfo info, MemberAttributes a) in visibleMembers)
+                if (MemberLabel(info, a).Contains(query, StringComparison.OrdinalIgnoreCase))
+                    matches.Add(info);
+        }
+
+        bool MemberVisible(MemberInfo m) => matches is null || matches.Contains(m);
+
+        // A [FoldoutGroup] is drawn only if it holds a matching member (else the whole collapsible group is
+        // hidden under the filter). Precomputed so the draw loop's group-header decision is O(1).
+        HashSet<string> groupsWithMatch = null;
+        if (matches is not null) {
+            groupsWithMatch = new HashSet<string>();
+            foreach ((MemberInfo info, MemberAttributes a) in visibleMembers)
+                if (a.Foldout?.Name is { } g && matches.Contains(info))
+                    groupsWithMatch.Add(g);
+        }
+
+        bool GroupVisible(string g) => g is null || groupsWithMatch is null || groupsWithMatch.Contains(g);
+
+        // A [Header] divider is drawn only if at least one member in ITS section (from the header up to the
+        // next header) survives the filter — otherwise the divider would orphan above hidden fields. Maps the
+        // header-bearing MemberInfo → whether its section has a match.
+        HashSet<MemberInfo> headersWithMatch = null;
+        if (matches is not null) {
+            headersWithMatch = new HashSet<MemberInfo>();
+            MemberInfo currentHeader = null;
+            bool sectionHasMatch = false;
+            foreach ((MemberInfo info, MemberAttributes a) in visibleMembers) {
+                if (a.Header is not null) {
+                    if (currentHeader is not null && sectionHasMatch) headersWithMatch.Add(currentHeader);
+                    currentHeader = info;
+                    sectionHasMatch = false;
+                }
+                if (currentHeader is not null && matches.Contains(info) && GroupVisible(a.Foldout?.Name))
+                    sectionHasMatch = true;
+            }
+            if (currentHeader is not null && sectionHasMatch) headersWithMatch.Add(currentHeader);
+        }
+
+        bool HeaderVisible(MemberInfo m) => headersWithMatch is null || headersWithMatch.Contains(m);
+
         var gridOpen = false;
         var gridIndex = 0;       // each sub-table (split by Header/Space/foldout) needs a unique id
         string currentGroup = null;  // active [FoldoutGroup] name
@@ -1095,25 +1175,31 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         // Member order is single-sourced engine-side: TypePlan.For(type).Members is already ordered by
         // [PropertyOrder] then declaration order (the same rule this site used to compute inline), so the
         // inspector consumes ONE ordered member list instead of re-sorting -- byte-identical, no drift.
-        foreach (TypePlan.Member planned in TypePlan.For(type).Members) {
-            MemberInfo member = planned.Info;
-            MemberAttributes attrs = MemberAttributes.For(member);
-
-            // [ShowIf]/[HideIf]: skip a hidden member entirely, before any header/space/foldout chrome.
-            if (!Conditions.Visible(attrs.Conditionals, target))
-                continue;
-
+        foreach ((MemberInfo member, MemberAttributes attrs) in visibleMembers) {
             string group = attrs.Foldout?.Name;
+
+            // EF10a: under a filter, a whole [FoldoutGroup] with no matching member is hidden — skip every
+            // member in it WITHOUT touching the chrome state (no EndGroup for a group that was never opened).
+            // No query → GroupVisible always true → byte-identical to pre-EF10a.
+            if (!GroupVisible(group))
+                continue;
 
             // Leaving the current foldout group (different/no group, or a new header) closes it.
             if (group != currentGroup || attrs.Header is not null)
                 EndGroup();
 
-            if (attrs.Space is not null) { CloseGrid(); ImGui.Dummy(new SysVec2(0, attrs.Space.Height)); }
-            if (attrs.Header is not null) { CloseGrid(); EditorDecoration.DrawSectionHeader(attrs.Header.Text); }
+            // EF10a: [Header]/[Space] chrome is decoupled from the member's own filter match — the header
+            // divider draws when ITS SECTION has a match (HeaderVisible), even if the header-bearing member's
+            // label itself doesn't match, so a matched field lower in the section keeps its section title.
+            // No query → HeaderVisible always true → byte-identical.
+            // A [Space] shows when the member it decorates (or that member's section header) is going to draw,
+            // so the gap never orphans above a filtered-out field.
+            if (attrs.Space is not null && (MemberVisible(member) || HeaderVisible(member))) { CloseGrid(); ImGui.Dummy(new SysVec2(0, attrs.Space.Height)); }
+            if (attrs.Header is not null && HeaderVisible(member)) { CloseGrid(); EditorDecoration.DrawSectionHeader(attrs.Header.Text); }
 
             // Entering a new foldout group: draw its collapsible header once. When open, the matching
-            // TreePop happens in EndGroup; when collapsed, TreeNodeEx requires no TreePop.
+            // TreePop happens in EndGroup; when collapsed, TreeNodeEx requires no TreePop. (Only reached when
+            // the group is visible under the filter — GroupVisible gated above.)
             if (group is not null && group != currentGroup) {
                 CloseGrid();
                 var flags = attrs.Foldout.DefaultOpen ? ImGuiTreeNodeFlags.DefaultOpen : ImGuiTreeNodeFlags.None;
@@ -1124,6 +1210,11 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
             if (currentGroup is not null && !groupOpen)
                 continue;                       // member hidden inside a collapsed foldout
+
+            // EF10a: the member's OWN label-match gate is the last step — its header/group chrome has already
+            // been emitted above, so a non-matching member is dropped without orphaning its section title.
+            if (!MemberVisible(member))
+                continue;
 
             EnsureGrid();
             DrawMember(member, target, attrs);
@@ -1152,6 +1243,12 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             }
         }
     }
+
+    // EF10a — the label the search filter matches on: the SAME text the row shows ([LabelText] override,
+    // else the prettified member name), so typing "steer" finds "High Speed Steer Scale" exactly as the user
+    // reads it. Mirrors MemberProperty.Label / VolumeParamProperty.Label (single source of the display label).
+    static string MemberLabel(MemberInfo member, MemberAttributes attrs) =>
+        attrs.LabelText?.Text ?? Inspector.InspectorReflection.Prettify(member.Name);
 
     // Sets a member on the active component AND, in a multi-selection, on the same-named member of the
     // matching component (same type) of every OTHER selected entity — Unity's per-component multi-edit.

@@ -19,8 +19,41 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF10a** (per-component member search bar — conditional, sits above the member grid)
-> Last committed chunk: **EF11** · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **EF10b** (component-list search — a top-of-inspector box filtering which COMPONENTS show, conditional)
+> Last committed chunk: **EF10a** · Branch: `dx12-renderer`
+>
+> **EF10a note (just landed):** the per-component member search bar is in. `DrawMemberList` now precomputes
+> the `visibleMembers` set (members surviving `[ShowIf]/[HideIf]`) ONCE — it drives both the search-box
+> threshold AND the filter. When `visibleMembers.Count > InspectorLayout.MemberSearchThreshold` (=12) a
+> search box draws ABOVE the grid via the NEW reusable `EditorWidgets.SearchField(id, hint, ref buffer,
+> width, maxLen)` helper (factored out of the inlined `InputTextWithHint` pattern so Hierarchy/Assets/
+> Add-Component can adopt it later — adoption NOT done here, optional). The query state is per-component-
+> INSTANCE in a `ConditionalWeakTable<object, StrBox>` (`memberSearch`) so each visible component keeps its
+> own query and a removed component's entry is GC'd with it (no leak, no eviction). Filtering: `matches` =
+> members whose DISPLAYED label (`MemberLabel` = `[LabelText] ?? Prettify(Name)`, mirroring
+> `MemberProperty.Label`) contains the query (OrdinalIgnoreCase). Group/header hiding: precomputed
+> `groupsWithMatch` (a `[FoldoutGroup]` shows iff it holds a match) + `headersWithMatch` (a `[Header]`
+> divider shows iff its SECTION — header up to the next header — has a match). The draw-loop body was
+> reordered so chrome is DECOUPLED from the member's own match: `GroupVisible` skips a whole hidden group
+> first, then `[Space]`/`[Header]` draw on section/decoration visibility (so a matched field keeps its
+> section title even if the header-bearing member's own label doesn't match), and the member's OWN
+> `MemberVisible` gate is the LAST step (drops a non-matching row without orphaning its header). No query →
+> all predicates pass → byte-identical to pre-EF10a (the changed `foreach` now walks `visibleMembers`, which
+> is the same set, in the same order). Validated against `VehicleController` (>12 members, `[Header]`
+> sections): typing "steer" leaves only the 6 steer fields under their Steering/Grip headers. Touched 2
+> files (`InspectorPanel.cs`, `EditorWidgets.cs` — both mine). Editor builds 0-error (clean `--no-incremental`
+> scratch dir; DX12 now compiles too — the `AoResult`→`SsaoResult` gap was resolved by the user's R0 GI
+> commit `cb3e9d73` + the GTAO WIP), oracle EXIT=0 (18 suites). VISUAL chunk → human-screenshot checkpoint
+> (heavy component shows the box + filters to matching fields/groups; small component shows no box;
+> unfiltered byte-identical), batched into the Inspector-layout set; NOT relaunch-looped (GPU-hang rule).
+>
+> **For EF10b (next):** the component-LIST search is a top-of-inspector box filtering which COMPONENTS draw
+> (for many-component entities), same conditional-visibility rule (only show it when the entity has enough
+> components). It reuses `EditorWidgets.SearchField`. The component-draw loop is in `DrawContents`/the
+> entity branch — find where components iterate (search `foreach (Behaviour` / `DrawComponentHeader`); the
+> box sits above the first component header. Conditional threshold: pick a sensible component-count gate
+> (the plan leaves it open — a small count like >6 components is reasonable; tune as you see fit). Filter on
+> the component's DISPLAY name. EF10a left `EditorWidgets.SearchField` ready; no new widget needed.
 >
 > **EF11 note (just landed):** the inspector member labels now ellipsize + tooltip instead of silently
 > clipping, and slider value text is legible over the amber grab. Both halves of the EF-LAYOUT label rule:
@@ -320,7 +353,7 @@ this same handoff for the chunk after it.
 - [x] EF-LAYOUT — inspector layout model (design + shared helper) — landed the column model + metrics + the shared label primitive as `InspectorLayout.cs` (`ValueColumnLeft`/`LabelColumnWidth`/`DepthIndent`/`DrawLabelCell`/`Ellipsize`/`MemberSearchThreshold`). NO call sites rewired (EF16→EF11→EF10 each opt in) → live inspector byte-identical, oracle 18/18 green. Design note in the EF-LAYOUT section + the file header.
 - [x] EF16 — nested indent (fixed value-x) — `DrawNestedSlot`/`DrawPolymorphicSlot` now wrap their body in `DrawNestedBody` (cancels the `TreeNode`'s full per-level `IndentSpacing`, bumps `nestDepth`) + a `BeginNestedGrid` with a FIXED-width label column (`InspectorLayout.LabelColumnWidth`) instead of the proportional 0.38/0.62 split, so the value box keeps a usable width at every nesting depth; the small per-depth label indent (`DepthIndentTotal`) applies to the LABEL only in `Row`/`RowWithTooltip` (depth 0 → 0px → top-level + shim rows byte-identical). Pragmatic deviation: the anchor is recomputed from each nested grid's current width (foldouts render inside the parent value cell, so a single panel-global value-x can't hold); `ValueColumnLeft` clamps label ≤62% so the value never vanishes. Added `EditorTheme.UiScale` token (published by `ImGuiController.LoadFont`). Top-level `BeginGrid` untouched. Build 0-error, oracle EXIT=0. Visual verify batched into the Inspector-layout screenshot set.
 - [x] EF11 — adaptive label column + slider value legibility — `Row`/`RowWithTooltip` route their label through `DrawRowLabel` → `InspectorLayout.DrawLabelCell` (ellipsis + full-text/`[Tooltip]` hover), column width = `GetContentRegionAvail().X` at the label cell (works for both the proportional top-level grid AND the fixed nested grid → top-level `BeginGrid` untouched, depth-0 short labels visually equivalent). Resolved the EF16 double-indent trap (removed the manual `Indent`, `DrawLabelCell` owns it; deleted `LabelDepthIndent`) + tightened the ellipsize budget to `columnWidth − indent − gap`. Slider value legibility: new `EditorTheme.SliderGrabRest` (darkened amber) pushed as `SliderGrab` around the `##v` slider in both adapters (`ImGuiComponentGui`/`ImGuiVolumeGui`), scoped → global EF5 accent untouched. Build 0-error (Editor clean; the only failure is the user's in-progress DX12 `AoResult`→`SsaoResult` rename — not mine), oracle EXIT=0. Visual verify batched into the Inspector-layout set.
-- [ ] EF10a — per-component member search (conditional)
+- [x] EF10a — per-component member search (conditional) — `DrawMemberList` precomputes `visibleMembers` (post-`[ShowIf]`) once → drives both the threshold and the filter; a conditional search box (>`InspectorLayout.MemberSearchThreshold`=12 members) drawn above the grid via the NEW reusable `EditorWidgets.SearchField`; query state per-component-instance in a `ConditionalWeakTable<object,StrBox>` (GC-safe). Filter matches the DISPLAYED label (`MemberLabel` = `[LabelText] ?? Prettify(Name)`); precomputed `groupsWithMatch`/`headersWithMatch` hide `[FoldoutGroup]`/`[Header]` sections with no match. Draw-loop body reordered so chrome is decoupled from the member's own match (group-skip → space/header on section visibility → member's own `MemberVisible` last). No query → byte-identical. Validated on `VehicleController` ("steer" → only the 6 steer fields + their headers). Build 0-error, oracle EXIT=0.
 - [ ] EF10b — component-list search (conditional)
 - [ ] EF15 — collection reorder/clear + polymorphic list serialize + round-trip test
 - [ ] EF7 — Tag/Layer "Add…" → open Tags & Layers panel
@@ -742,11 +775,21 @@ the reflection oracle stayed 18/18 green because nothing in the live draw flow c
 
 ## EF10 — Per-component (and component-list) conditional search bar
 Root: no inspector member/component filter exists (`InspectorPanel.cs:51` only Add-Component search).
-- **EF10a — Component-internal member search (PRIORITY):** under a component's header, a search box that
-  filters that component's exposed fields (and hides foldout groups with no match). **Conditional
-  visibility:** only shown when the component's field/member count exceeds a threshold OR the content
-  doesn't fit the panel (don't show it on a 3-field component). Filter applies to the `DrawMemberList`
-  flow; group headers (Drive/Gearbox/Steering...) hide when empty under the filter.
+- **EF10a — Component-internal member search (PRIORITY) — ✅ DONE:** under a component's header, a search box
+  that filters that component's exposed fields and hides `[FoldoutGroup]`/`[Header]` sections with no match.
+  **Conditional visibility:** shown only when the component's visible-member count exceeds
+  `InspectorLayout.MemberSearchThreshold` (=12) — don't clutter a small component. Implemented in
+  `DrawMemberList`: precompute `visibleMembers` (post-`[ShowIf]/[HideIf]`) ONCE → drives both the threshold
+  and the filter; the box draws above the grid via the NEW reusable `EditorWidgets.SearchField`; the query is
+  per-component-INSTANCE in a `ConditionalWeakTable<object,StrBox>` (GC-safe, no eviction). Filter matches the
+  DISPLAYED label (`MemberLabel` = `[LabelText] ?? Prettify(Name)`, mirroring `MemberProperty.Label`);
+  precomputed `groupsWithMatch` / `headersWithMatch` (a header's SECTION = header→next header) drive the
+  group/divider hiding. The draw-loop body was reordered so the `[Header]`/`[Space]` chrome is DECOUPLED from
+  the member's own match (a matched field keeps its section title even when the header-bearing member's own
+  label doesn't match), and the member's own `MemberVisible` gate is the LAST step. No query → byte-identical
+  to pre-EF10a. Validated on `VehicleController` (>12 members, `[Header]` sections — "steer" leaves only the
+  6 steer fields under Steering/Grip). Touched `InspectorPanel.cs` + `EditorWidgets.cs`. Build 0-error,
+  oracle EXIT=0.
 - **EF10b — Component-list search (secondary):** a top-of-inspector box filtering which components show,
   for many-component objects; same conditional-visibility rule.
 - Factor a small reusable `EditorWidgets` search-field helper so later panels (Hierarchy/Assets/Add-
