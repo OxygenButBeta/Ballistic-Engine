@@ -44,6 +44,19 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable {
     public void Declare(Dx12PassBuilder b) {
         b.Read(b.Resource("GBuffer"));
         b.ReadWrite(b.Resource("SceneColor"));
+        // PHASE-2 V3 (chunk 16): derive ONLY the SCREEN-PATH (DrawSsgi) shared boundary head — the SSGI gather
+        // reads the lit HDR scene color + G-buffer depth as SRVs (target.ColorToShaderResource() +
+        // gbuffer.DepthToShaderResource(), DrawSsgi head). Derive both. EVERYTHING ELSE stays inline:
+        //   - the RT branch's gbuffer.DepthToNonPixelShaderResource() (RT raygen, OUT of V3 scope),
+        //   - the RT branch's own target.ColorToShaderResource() (DrawRtGi — idempotent after the derived emit),
+        //   - the pass-private scratch transitions in SsgiResolveAndCombine (ssgiTarget/ssgiDenoised/ssgiScene/
+        //     history) — they are mid-pass, not pass-boundary heads.
+        // The derived emit fires before Record for EVERY GI mode (incl. RT): a redundant SceneColor->PSR +
+        // depth->PSR before the RT branch re-transitions depth->NonPixel — idempotent, harmless. RT GI is excluded
+        // from the golden gate; the deterministic matrix exercises only the ScreenSpace (DrawSsgi) path.
+        b.DeriveBarriers();
+        b.Use(Dx12ResourceUsage.SceneColorShaderRead);
+        b.Use(Dx12ResourceUsage.GBufferDepthShaderRead);
     }
 
     readonly Dx12Device dev;
@@ -164,8 +177,14 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         FillSsgiConstants(ctx);
 
-        target.ColorToShaderResource();
-        gbuffer.DepthToShaderResource();
+        // PHASE-2 V3: skip the manual SceneColor + depth heads when derived barriers are active (the graph emitted
+        // ctx.SceneColor.ColorToShaderResource() + gbuffer.DepthToShaderResource() before Record). DrawSsgi is also
+        // the EnsureRtGi-fails / !sceneAS.Valid fallback called from DrawRtGi — by then the derived (or RT-branch)
+        // transitions already ran, so these are idempotent no-ops either way.
+        if (!ctx.BarriersDerived) {
+            target.ColorToShaderResource();
+            gbuffer.DepthToShaderResource();
+        }
         // motion RT (gbuffer RT4) is already PixelShaderResource (ToShaderResource transitioned all colors).
 
         // Gather (half-res) → ssgiTarget. SRVs: color t0, depth t1, normal t2.
