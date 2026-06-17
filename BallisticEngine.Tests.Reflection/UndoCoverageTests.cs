@@ -23,9 +23,10 @@ namespace BallisticEngine.Tests.Reflection;
 //
 // SCOPE -- engine-expressible mutations (the pure-engine half of the action surface):
 //   create entity, delete entity, reparent, rename, add component, remove component, edit member,
-//   toggle active, AND (F2) an asset edit via the EditAsset callback path. OUT OF SCOPE (documented below,
-//   needs ImGui/EditorWidgets -> migrate + test in F1): gizmo drags, widget activation-state
-//   deferred-commit, terrain brush.
+//   toggle active, AND (F2) an asset edit via the EditAsset callback path -- the .volume profile, curve,
+//   AND terrain-heightfield (.terrain) edits all now route through that one before/after callback shape.
+//   OUT OF SCOPE (documented below, needs ImGui/EditorWidgets -> migrate + test in F1): gizmo drags, widget
+//   activation-state deferred-commit, and the ImGui stroke wiring that drives those asset edits.
 //
 // F2 (asset-edit hole CLOSED): an asset edit routed through EditorCommands.EditAsset (-> PushCallback,
 // the .volume profile / curve callback path) now leaves exactly one recoverable entry -- modeled here as
@@ -173,10 +174,11 @@ internal static class UndoCoverageTests {
                           : (c.EntriesPushed == 1 && c.Restored) ? "covered" : "UNCOVERED";
             Console.WriteLine($"    - {c.Name}: entries={c.EntriesPushed} restored={c.Restored} [{status}]");
         }
-        // F2 closed the asset-edit hole for the EditAsset callback path (volume-profile group). The
-        // ImGui-coupled drag/activation wiring around it (and gizmo/terrain) still migrate+test in F1.
+        // F2 closed the asset-edit hole for the EditAsset callback path (volume-profile, curve, AND the
+        // terrain heightfield all route through it now). Only the ImGui-coupled drag/activation/stroke
+        // wiring around those edits still migrates + tests in F1.
         Console.WriteLine("    out-of-scope (need ImGui/EditorWidgets, migrate+test in F1): " +
-                          "gizmo drag, widget deferred-commit, terrain brush.");
+                          "gizmo drag, widget deferred-commit, stroke wiring.");
 
         return h.Report("UndoCoverage (F3)");
     }
