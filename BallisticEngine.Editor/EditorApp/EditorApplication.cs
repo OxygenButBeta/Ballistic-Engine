@@ -33,6 +33,12 @@ internal sealed class EditorApplication {
     // Entities / Assets / Console / Scene-component tabs as they want (Add Tab menu). The primary
     // panels above stay as fields (lots of code references them); the host owns the duplicates.
     readonly DockPanelHost extraPanels = new();
+    // A1b: the single descriptor table for the CORE dockable panels (one declaration per panel that the
+    // normal draw, the maximize content path, and the maximize-availability check all read).
+    readonly EditorPanelRegistry panels = new();
+    // A1b: the maximize state machine (which panel fills the window) — replaces the bare `maximizedPanel`
+    // string + its three hand-synced clear sites with one can't-get-stuck controller.
+    readonly MaximizeController maximize = new();
     readonly ConsolePanel console = new();
     readonly StatsPanel stats = new();
     readonly SettingsPanel settings;
@@ -53,8 +59,10 @@ internal sealed class EditorApplication {
     bool showBottom = true;     // the Assets window
     bool showConsole = true;    // the Console window
     // Double-click ANY panel's tab to fill the window with it; Esc restores. null = no panel
-    // maximized. (Was viewport-only; now works for every dockable panel.)
-    string maximizedPanel;
+    // maximized. (Was viewport-only; now works for every dockable panel.) A1b: the backing state now
+    // lives in `maximize` (MaximizeController) — the maximized key is single-sourced there. Reads route
+    // through this convenience accessor; mutations go through maximize.Toggle/Clear (the can't-forget API).
+    string maximizedPanel => maximize.Maximized;
     float contentAreaTop;   // Y of the dock area's top (just under the toolbar); clamps the tab-strip band
     bool maximizedViewport => maximizedPanel == EditorLayout.SceneView || maximizedPanel == EditorLayout.GameView;
 
@@ -132,6 +140,27 @@ internal sealed class EditorApplication {
         extraPanels.Register(EditorLayout.Console, "Console", EditorIcons.Document,
             () => new ConsolePanel(), p => ((ConsolePanel)p).DrawContents());
         extraPanels.OnTitleStrip = MaximizePanelOnTitleDoubleClick;
+
+        // A1b: declare the CORE dockable panels ONCE in the registry. The maximize content path and the
+        // maximize-availability check both read these descriptors — no more hand-synced if/else chain +
+        // still-available switch + showXxx triple. DrawContents routes to the same primary panel field
+        // the normal docked path uses (the maximized view and the docked view share one instance/state).
+        // The two viewports are flagged IsViewport (their fullscreen draw is the render-target compositing
+        // path in DrawMaximizedViewport, not a generic body) and are always available.
+        panels.Register(EditorLayout.Entities, "Entities", EditorIcons.Package,
+            hierarchy.DrawEntitiesContents, () => showHierarchy);
+        panels.Register(EditorLayout.SceneComponents, "Scene Components", EditorIcons.World,
+            hierarchy.DrawSceneContents, () => showSceneComponents);
+        panels.Register(EditorLayout.Inspector, "Inspector", EditorIcons.Wrench,
+            inspector.DrawContents, () => showInspector);
+        panels.Register(EditorLayout.Assets, "Assets", EditorIcons.Folder,
+            assets.DrawContents, () => showBottom);
+        panels.Register(EditorLayout.Console, "Console", EditorIcons.Document,
+            console.DrawContents, () => showConsole);
+        panels.Register(EditorLayout.SceneView, "Scene View", EditorIcons.Camera,
+            null, () => true, isViewport: true);
+        panels.Register(EditorLayout.GameView, "Game View", EditorIcons.Play,
+            null, () => true, isViewport: true);
 
         // Wire the editor-only extra debug views (AO / Lit / Luminance) into the renderer's hook.
         EditorDebugViews.Install();
@@ -573,14 +602,14 @@ internal sealed class EditorApplication {
     void BuildUI() {
         ImGuiIOPtr io = ImGui.GetIO();
 
-        if (maximizedPanel is not null && ImGui.IsKeyPressed(ImGuiKey.Escape))
-            maximizedPanel = null;
+        if (maximize.IsMaximized && ImGui.IsKeyPressed(ImGuiKey.Escape))
+            maximize.Clear();
 
         // Drop a stale fullscreen target: if the maximized panel was closed (its Window-menu toggle
         // turned off, or its duplicated instance closed), don't keep drawing it fullscreen forever —
-        // fall back to the normal docked layout this frame.
-        if (maximizedPanel is not null && !MaximizedPanelStillAvailable(maximizedPanel))
-            maximizedPanel = null;
+        // fall back to the normal docked layout this frame. One can't-forget call: there is no state
+        // path that stays maximized on a panel that's no longer drawable (the old "stuck maximized" bug).
+        maximize.DropIfUnavailable(MaximizedPanelStillAvailable);
 
         // Any interaction is a "scene might have changed" signal for the always-refresh-off mode.
         if (ImGui.IsMouseClicked(ImGuiMouseButton.Left) || ImGui.IsMouseClicked(ImGuiMouseButton.Right) ||
@@ -1339,7 +1368,7 @@ internal sealed class EditorApplication {
             ImGuiWindowFlags.NoFocusOnAppearing | ImGuiWindowFlags.NoNav;
         if (ImGui.Begin("##exitfullscreen", flags)) {
             if (ImGui.Button($"{EditorIcons.Minimize}  Exit Fullscreen"))
-                maximizedPanel = null;
+                maximize.Clear();
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip("Exit fullscreen (Esc)");
         }
@@ -1451,7 +1480,7 @@ internal sealed class EditorApplication {
 
         // Double-click the strip → toggle fullscreen for this panel.
         if (onStrip && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
-            maximizedPanel = maximizedPanel == panelName ? null : panelName;
+            maximize.Toggle(panelName);
 
         // Right-click the strip → "Add Tab" menu to open any closed panel (Unity/VS dock behaviour).
         if (onStrip && ImGui.IsMouseClicked(ImGuiMouseButton.Right))
@@ -1469,7 +1498,7 @@ internal sealed class EditorApplication {
             }
             ImGui.Separator();
             if (ImGui.MenuItem("Maximize / Restore", "Double-click"))
-                maximizedPanel = maximizedPanel == panelName ? null : panelName;
+                maximize.Toggle(panelName);
             ImGui.EndPopup();
         }
     }
@@ -1492,12 +1521,10 @@ internal sealed class EditorApplication {
     // (host) instance is available while the host still owns its label. Returns false once the panel
     // has been closed, so BuildUI can drop the stale fullscreen target.
     bool MaximizedPanelStillAvailable(string name) {
-        if (name == EditorLayout.SceneView || name == EditorLayout.GameView) return true;
-        if (name == EditorLayout.Entities) return showHierarchy;
-        if (name == EditorLayout.SceneComponents) return showSceneComponents;
-        if (name == EditorLayout.Inspector) return showInspector;
-        if (name == EditorLayout.Assets) return showBottom;
-        if (name == EditorLayout.Console) return showConsole;
+        // A1b: single-sourced. A core panel (or viewport) is "available" per its ONE registry descriptor
+        // (viewports always; a normal panel while its show-toggle is on). A duplicated (Add Tab) instance
+        // is available while the host still owns its label. No more per-panel switch to keep in sync.
+        if (panels.Contains(name)) return panels.IsAvailable(name);
         return extraPanels.OwnsLabel(name);
     }
 
@@ -1510,21 +1537,23 @@ internal sealed class EditorApplication {
             return;
         }
 
+        // A1b: single content path. The panel's body comes from its ONE registry descriptor — the same
+        // DrawContents the normal docked path uses — so there is no parallel maximize-content chain to
+        // drift, and no "can't be shown fullscreen" dead-end for a registered panel.
         ImGui.SetNextWindowPos(pos);
         ImGui.SetNextWindowSize(size);
         const ImGuiWindowFlags flags = ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove |
             ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking;
         if (ImGui.Begin(name, flags)) {
             MaximizePanelOnTitleDoubleClick(name); // double-click its title again to restore
-            if (name == EditorLayout.Entities) hierarchy.DrawEntitiesContents();
-            else if (name == EditorLayout.SceneComponents) hierarchy.DrawSceneContents();
-            else if (name == EditorLayout.Inspector) inspector.DrawContents();
-            else if (name == EditorLayout.Assets) assets.DrawContents();
-            else if (name == EditorLayout.Console) console.DrawContents();
+            EditorPanelRegistry.Descriptor d = panels.Get(name);
+            if (d?.DrawContents is not null)
+                d.DrawContents();
             else {
-                // Unknown panel id maximized (shouldn't happen) — give a way out so it can't get stuck.
+                // Not a registered, body-drawable panel (shouldn't reach here — the stale-drop clears an
+                // unknown target). Give a way out so it can never get stuck maximized.
                 ImGui.TextDisabled("This panel can't be shown fullscreen.");
-                if (ImGui.Button("Exit Fullscreen")) maximizedPanel = null;
+                if (ImGui.Button("Exit Fullscreen")) maximize.Clear();
             }
         }
         ImGui.End();
