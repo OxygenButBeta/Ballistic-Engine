@@ -31,6 +31,15 @@ public interface IComponentInspectorHost {
     // `(EntityRef)` / `(ComponentRef)` disabled label these members fell to via gui.Unsupported. Mirrors the
     // DrawAssetSlot host-method shape exactly; the host unwraps the IProperty and renders + sets the ref.
     void DrawSceneObjectSlot(IProperty property);
+
+    // editor-rework G2-editor (Rule 2, the visible half of the List<T>/T[] round-trip; engine half done in
+    // ch19): the collection terminal drawer (CollectionDrawer) routes a List<T> / T[] member here. The host
+    // renders an interactive collection editor (count + Add, per-element row with a Remove button, each
+    // element drawn RECURSIVELY by its own terminal drawer) in place of the dead `(List`1)` / `(...)`
+    // disabled label these members fell to via gui.Unsupported. Mirrors the DrawAssetSlot / DrawSceneObjectSlot
+    // host-method shape; the host unwraps the IProperty, mutates the backing collection, writes it back through
+    // the property (-> ApplyMember multi-select broadcast + dirty), and pushes one undo per add / remove / edit.
+    void DrawCollectionSlot(IProperty property);
 }
 
 public sealed class ImGuiComponentGui : IInspectorGui {

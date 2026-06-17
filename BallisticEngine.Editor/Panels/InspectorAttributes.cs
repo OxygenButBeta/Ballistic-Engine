@@ -25,6 +25,12 @@ public sealed class MemberAttributes {
     static readonly Dictionary<MemberInfo, MemberAttributes> cache = new();
     static readonly ConditionalAttribute[] NoConditions = System.Array.Empty<ConditionalAttribute>();
 
+    // The attribute-less default for an IProperty with no backing MemberInfo (a collection element slot,
+    // editor-rework G2-editor). All attributes null / empty so the drawer stack's Visibility (no
+    // conditionals -> always visible) and Enable (no ReadOnly -> always enabled) steps are no-ops and the
+    // element draws as a bare value. Shared singleton so a per-element property allocates no attribute set.
+    public static readonly MemberAttributes None = new() { Conditionals = NoConditions };
+
     public static MemberAttributes For(MemberInfo member) {
         if (cache.TryGetValue(member, out MemberAttributes cached))
             return cached;

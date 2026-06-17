@@ -36,6 +36,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     Type pickerType;
     string pickerSearch = "";
     bool openPicker;
+    // G2-editor: when the picker was opened for an IProperty WITHOUT a backing MemberInfo (a collection
+    // element asset slot), writes route through this property's Set (-> the collection write-back) instead of
+    // the member path. Null for the common member-backed asset slot (which keeps its exact existing path).
+    Inspector.IProperty pickerProperty;
 
     // G1-editor: pending scene-object-picker request (opened from an EntityRef/ComponentRef slot). The slot
     // sets the ref through the IProperty so the picker keeps the property (not the raw member) to write back
@@ -75,6 +79,8 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         memberRegistry.Register(new AssetSlotDrawer(this));
         // G1-editor: EntityRef/ComponentRef get the interactive scene-object slot (was a dead Unsupported label).
         memberRegistry.Register(new SceneObjectRefDrawer(this));
+        // G2-editor: List<T>/T[] get the interactive collection editor (was a dead (List`1) Unsupported label).
+        memberRegistry.Register(new CollectionDrawer(this));
         // The standalone component window reuses our reflection member renderer.
         ComponentEditorWindow.Configure(DrawMemberList);
     }
@@ -91,11 +97,17 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     void IComponentInspectorHost.DrawAssetSlot(Inspector.IProperty property) {
         if (property is Inspector.MemberProperty mp)
             DrawAssetSlot(mp.Member, mp.Owner, mp.Get() as BObject, mp.ValueType);
+        else
+            // G2-editor: a collection element asset slot (no backing MemberInfo) routes through the IProperty,
+            // writing the picked/cleared asset via property.Set -> the collection write-back.
+            DrawAssetSlotForProperty(property);
     }
     // G1-editor: the SceneObjectRefDrawer terminal drawer hands its IProperty here; the slot reads/writes the
     // EntityRef/ComponentRef value through the IProperty (Get/Set route to ApplyMember + MarkViewportDirty),
     // so a pick/drag broadcasts to the multi-selection exactly like a primitive edit.
     void IComponentInspectorHost.DrawSceneObjectSlot(Inspector.IProperty property) => DrawSceneObjectSlot(property);
+    // G2-editor: the CollectionDrawer terminal drawer hands its IProperty here; render the per-element editor.
+    void IComponentInspectorHost.DrawCollectionSlot(Inspector.IProperty property) => DrawCollectionSlot(property);
 
     public void DrawContents() {
         ImGui.PushID(instanceId);   // namespace all ids so a 2nd Inspector window doesn't collide
@@ -1438,6 +1450,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         pickerMember = member;
         pickerTarget = target;
         pickerType = assetType;
+        pickerProperty = null;   // G2-editor: member-backed slot -> clear any prior property-backed request
         openPicker = true;
     }
 
@@ -1448,6 +1461,65 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         object loaded = load.Invoke(null, [guid]);
         if (loaded is not null)
             ApplyMember(member, target, loaded); // broadcasts to the multi-selection like value edits
+        state.MarkViewportDirty();
+    }
+
+    // G2-editor: the IProperty-keyed asset slot (a collection element whose type is a BObject asset, e.g. a
+    // List<Material> element). The parallel of DrawAssetSlot(member,...) but every write routes through
+    // IProperty.Set (-> the collection write-back) instead of a MemberInfo, and the picker remembers the
+    // property (pickerProperty) so its click-to-assign / (None) write through the same path. Mirrors
+    // DrawSceneObjectSlot's IProperty approach.
+    void DrawAssetSlotForProperty(Inspector.IProperty p) {
+        Type assetType = p.ValueType;
+        var asset = p.Get() as BObject;
+        Guid guid = default;
+        bool hasGuid = asset is not null && AssetDatabase.TryGetAssetGuid(asset, out guid);
+
+        if (asset is null) {
+            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+            if (ImGui.Button($"None  {EditorIcons.ChevronDown}", new SysVec2(-1, 0)))
+                OpenPickerForProperty(p);
+            ImGui.PopStyleColor();
+            if (AcceptGuidDrop(out Guid d0))
+                AssignAssetToProperty(p, assetType, d0);
+            return;
+        }
+
+        var path = hasGuid ? AssetDatabase.GuidToAssetPath(guid) : null;
+        var display = path is not null ? Path.GetFileName(path) : asset.GetType().Name;
+        (string icon, _) = EditorIcons.ForAssetExtension(
+            path is not null ? Path.GetExtension(path).ToLowerInvariant() : "");
+
+        float pickerW = ImGui.GetFrameHeight() + 6;
+        if (ImGui.Button($"{icon}  {display}", new SysVec2(-pickerW - 4, 0)) && path is not null)
+            state.RequestRevealAsset(path);
+        if (AcceptGuidDrop(out Guid d1))
+            AssignAssetToProperty(p, assetType, d1);
+        if (ImGui.IsItemHovered() && path is not null)
+            ImGui.SetTooltip($"{path}\nClick to reveal in the asset browser.");
+
+        ImGui.SameLine();
+        if (ImGui.Button(EditorIcons.ChevronDown, new SysVec2(pickerW, 0)))
+            OpenPickerForProperty(p);
+        if (AcceptGuidDrop(out Guid d2))
+            AssignAssetToProperty(p, assetType, d2);
+    }
+
+    void OpenPickerForProperty(Inspector.IProperty p) {
+        pickerProperty = p;
+        pickerMember = null;
+        pickerTarget = null;
+        pickerType = p.ValueType;
+        openPicker = true;
+    }
+
+    void AssignAssetToProperty(Inspector.IProperty p, Type assetType, Guid guid) {
+        EditorUndo.Push($"Assign {p.Label}");
+        MethodInfo load = typeof(AssetDatabase).GetMethod(nameof(AssetDatabase.Load), [typeof(Guid)])!
+            .MakeGenericMethod(assetType);
+        object loaded = load.Invoke(null, [guid]);
+        if (loaded is not null)
+            p.Set(loaded);
         state.MarkViewportDirty();
     }
 
@@ -1485,8 +1557,15 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         // (None) clears the slot.
         ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
         if (ImGui.Selectable($"  (None)", false, ImGuiSelectableFlags.None, new SysVec2(0, ImGui.GetFrameHeight()))) {
-            EditorUndo.Push($"Clear {Prettify(pickerMember.Name)}");
-            ComponentReflection.SetValue(pickerMember, pickerTarget, null);
+            if (pickerProperty is not null) {
+                // G2-editor: property-backed slot (collection element) -> clear via Set (collection write-back).
+                EditorUndo.Push($"Clear {pickerProperty.Label}");
+                pickerProperty.Set(null);
+            }
+            else {
+                EditorUndo.Push($"Clear {Prettify(pickerMember.Name)}");
+                ComponentReflection.SetValue(pickerMember, pickerTarget, null);
+            }
             state.MarkViewportDirty();
             ImGui.CloseCurrentPopup();
         }
@@ -1514,7 +1593,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip(path);
             if (clicked) {
-                AssignAsset(pickerMember, pickerTarget, pickerType, guid);
+                if (pickerProperty is not null)
+                    AssignAssetToProperty(pickerProperty, pickerType, guid);  // G2-editor: collection element
+                else
+                    AssignAsset(pickerMember, pickerTarget, pickerType, guid);
                 ImGui.CloseCurrentPopup();
             }
         }
@@ -1602,6 +1684,134 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         EditorUndo.Push($"Assign {p.Label}");
         p.Set(refValue);
         state.MarkViewportDirty();
+    }
+
+    // G2-editor (Rule 2): the interactive collection editor for a List<T> / T[] member (the parallel of
+    // DrawAssetSlot / DrawSceneObjectSlot for the collection category). Renders, inside the value column the
+    // BeginRow opened: a "(N items)" header + an "Add" button, then one row per element drawn RECURSIVELY by
+    // its own terminal drawer (a List<Vector3> draws Vector3 widgets, a List<Material> asset slots, a
+    // List<EntityRef> scene-object slots), each with a Remove (X) button. Every structural change (Add /
+    // Remove) copies-mutates-writes the WHOLE collection back through the property (-> ApplyMember broadcast +
+    // dirty) under one EditorUndo.Push; element edits push undo via the element's own terminal drawer
+    // (primitives auto-Track; asset/scene-ref slots push their own). The element type's drawer must exist (a
+    // struct element with no registered drawer shows Unsupported per-element, like a struct member -- the
+    // ch20 scope: List/array of primitives / enums / math-structs / asset refs / scene refs / curves /
+    // gradients; Dictionary is ch21, deep nested-struct element write-back is G4).
+    void DrawCollectionSlot(Inspector.IProperty p) {
+        Type collType = p.ValueType;
+        bool isArray = collType.IsArray;
+        Type elemType = isArray ? collType.GetElementType() : collType.GetGenericArguments()[0];
+        object boxed = p.Get();
+        System.Collections.IList list = boxed as System.Collections.IList; // List<T> and T[] both implement IList
+
+        int count = list?.Count ?? 0;
+
+        // Header row inside the value column: item count + an Add button (full row width split).
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextDisabled($"{count} item{(count == 1 ? "" : "s")}");
+        ImGui.SameLine();
+        float addW = ImGui.GetFrameHeight() + 24;
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + Math.Max(0, ImGui.GetContentRegionAvail().X - addW));
+        if (ImGui.Button($"{EditorIcons.Add} Add##addcol_{p.Name}", new SysVec2(addW, 0))) {
+            CollectionAdd(p, collType, elemType, list, isArray);
+            return; // structural change: redraw next frame against the new collection (avoids a stale row)
+        }
+
+        if (count == 0)
+            return;
+
+        // Per-element rows: each element drawn by its own terminal drawer through a CollectionElementProperty,
+        // followed by a Remove button. PushId per index so duplicate element values keep distinct ImGui ids.
+        int removeIndex = -1;
+        for (int i = 0; i < count; i++) {
+            ImGui.PushID(i);
+            int captured = i;
+            float removeW = ImGui.GetFrameHeight();
+            float elemW = Math.Max(40f, ImGui.GetContentRegionAvail().X - removeW - 6);
+
+            var elemProp = new Inspector.CollectionElementProperty(
+                $"Element {i}", elemType,
+                () => captured < (list?.Count ?? 0) ? list[captured] : null,
+                v => CollectionSetElement(p, list, captured, v));
+
+            ITypeDrawer drawer = memberRegistry.Resolve(elemType);
+            ImGui.SetNextItemWidth(elemW);
+            if (drawer is not null) {
+                componentGui.SetUndoLabel($"Edit {p.Label} [{i}]");
+                drawer.Draw(elemProp, componentGui);
+            }
+            else {
+                ImGui.TextDisabled($"({elemType.Name})"); // no drawer for this element type (e.g. nested struct)
+            }
+
+            ImGui.SameLine(0, 6);
+            if (ImGui.Button($"{EditorIcons.Delete}", new SysVec2(removeW, 0)))
+                removeIndex = captured;
+
+            ImGui.PopID();
+        }
+
+        if (removeIndex >= 0)
+            CollectionRemoveAt(p, collType, elemType, list, isArray, removeIndex);
+    }
+
+    // Add a default element. List<T> grows in place then writes back (the same instance, but Set still
+    // broadcasts + dirties); an array is immutable-length so a new, one-longer array is built. One undo.
+    void CollectionAdd(Inspector.IProperty p, Type collType, Type elemType,
+        System.Collections.IList list, bool isArray) {
+        EditorUndo.Push($"Add to {p.Label}");
+        object def = DefaultElement(elemType);
+        if (isArray) {
+            int n = list?.Count ?? 0;
+            var grown = Array.CreateInstance(elemType, n + 1);
+            for (int i = 0; i < n; i++) grown.SetValue(list[i], i);
+            grown.SetValue(def, n);
+            p.Set(grown);
+        }
+        else {
+            System.Collections.IList target = list ?? (System.Collections.IList)Activator.CreateInstance(collType);
+            target.Add(def);
+            p.Set(target);
+        }
+        state.MarkViewportDirty();
+    }
+
+    // Remove element at index. List<T> removes in place; an array rebuilds one shorter. One undo.
+    void CollectionRemoveAt(Inspector.IProperty p, Type collType, Type elemType,
+        System.Collections.IList list, bool isArray, int index) {
+        if (list is null || index < 0 || index >= list.Count) return;
+        EditorUndo.Push($"Remove from {p.Label}");
+        if (isArray) {
+            int n = list.Count;
+            var shrunk = Array.CreateInstance(elemType, n - 1);
+            for (int i = 0, j = 0; i < n; i++)
+                if (i != index) shrunk.SetValue(list[i], j++);
+            p.Set(shrunk);
+        }
+        else {
+            list.RemoveAt(index);
+            p.Set(list);
+        }
+        state.MarkViewportDirty();
+    }
+
+    // Write a single element back. Mutates the backing IList slot (works for both List<T> and T[], which both
+    // implement IList) then writes the WHOLE collection through the property so ApplyMember broadcasts the
+    // edited collection to the multi-selection + marks dirty (the element terminal drawer already registered
+    // the per-drag undo, like a primitive member edit).
+    void CollectionSetElement(Inspector.IProperty p, System.Collections.IList list, int index, object value) {
+        if (list is null || index < 0 || index >= list.Count) return;
+        list[index] = value;
+        p.Set(list);
+    }
+
+    // A sensible default for a new element: value types get their zero (Activator), reference/string types
+    // get null (an empty asset/scene-object slot the user then fills via its picker -- matches Unity adding a
+    // null Object slot). EntityRef/ComponentRef are structs -> their None default. Strings start empty.
+    static object DefaultElement(Type elemType) {
+        if (elemType == typeof(string)) return "";
+        if (elemType.IsValueType) return Activator.CreateInstance(elemType);
+        return null;
     }
 
     // Accepts a Hierarchy entity-drag payload (int = entity InstanceId hash, set by HierarchyPanel's

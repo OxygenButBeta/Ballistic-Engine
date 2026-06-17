@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace BallisticEngine.Editor.Inspector;
 
@@ -102,4 +103,75 @@ public sealed class SceneObjectRefDrawer : ITypeDrawer {
         host.DrawSceneObjectSlot(p);
         return false;
     }
+}
+
+// editor-rework G2-editor (Rule 2, the VISIBLE half of the collection round-trip; the engine half --
+// SerializeSequence / DeserializeList / DeserializeArray -- landed in ch19, so a List<T>/T[] member now
+// round-trips instead of dropping to null). Terminal drawer for a `List<T>` or `T[]` member. Before this it
+// matched no drawer and fell to TypeDrawerTerminalStep -> gui.Unsupported -> a dead `(List`1)` / `(...)`
+// disabled label (the visible half of the user's "serialize backendi cok sinirli" complaint). Now it routes
+// to the host's interactive collection editor (per-element rows, add / remove, each element drawn RECURSIVELY
+// by its own terminal drawer -- a List<Vector3> draws Vector3 widgets, a List<Material> draws asset slots, a
+// List<EntityRef> draws scene-object slots), the parallel of AssetSlotDrawer/SceneObjectRefDrawer.
+//
+// Scope (ch20): List<T> + single-dimension arrays. Dictionary<K,V> (ch21) and a DEEP nested-struct element's
+// inner-field write-back (G4) are NOT covered here -- a struct element with no registered terminal drawer
+// falls to Unsupported per-element exactly as a struct member does today. An element whose type HAS a drawer
+// (primitive / enum / math-struct / asset ref / scene-object ref / curve / gradient) edits in full, because a
+// list slot is reassigned as a WHOLE element (list[i] = newValue) so even a boxed value-type element writes
+// back -- the limitation is only EDITING a struct element's inner fields, not the element itself.
+//
+// CanDraw keys on the DECLARED value type (List<> closed generic OR array); a string is IEnumerable<char> but
+// is never reached (StringDrawer wins by type-equality, and CanDraw excludes it). The drawer reports false (no
+// auto-dirty): the host pushes undo + marks dirty itself only on an actual add / remove / element edit, like
+// the asset and scene-object slots.
+public sealed class CollectionDrawer : ITypeDrawer {
+    readonly IComponentInspectorHost host;
+    public CollectionDrawer(IComponentInspectorHost host) => this.host = host;
+    public bool CanDraw(Type t) {
+        if (t == typeof(string)) return false;                          // IEnumerable<char> -- StringDrawer's
+        if (t.IsArray && t.GetArrayRank() == 1) return true;            // T[]
+        return t.IsGenericType && t.GetGenericTypeDefinition() == typeof(List<>);  // List<T>
+    }
+    public bool Draw(IProperty p, IInspectorGui gui) {
+        host.DrawCollectionSlot(p);
+        return false;
+    }
+}
+
+// editor-rework G2-editor: an IProperty over one ELEMENT slot of a collection (list[i] / array[i]). Lets a
+// collection element flow through the SAME terminal drawer resolution as a member -- a Vector3 element resolves
+// Vector3Drawer, a Material element resolves AssetSlotDrawer, an EntityRef element resolves SceneObjectRefDrawer
+// -- so the recursion is "draw-a-value", not a per-element type switch (Rule 2). Get reads the boxed element;
+// Set writes it back through the supplied `assign` delegate (which mutates the backing list/array and writes
+// the WHOLE collection back to the owning member -> ApplyMember multi-select broadcast + dirty), so an element
+// edit behaves exactly like a member edit. Has no MemberInfo, so it carries NO attributes/range/conditionals
+// (an element is a bare value); ValueType is the element type.
+public sealed class CollectionElementProperty : IProperty {
+    readonly Func<object> get;
+    readonly Action<object> assign;
+
+    public CollectionElementProperty(string name, Type elementType, Func<object> get, Action<object> assign) {
+        Name = name;
+        ValueType = elementType;
+        this.get = get;
+        this.assign = assign;
+    }
+
+    public string Name { get; }
+    public string Label => Name;
+    public string Tooltip => null;
+    public Type ValueType { get; }
+    public object Owner => null;
+
+    public object Get() => get();
+    public void Set(object value) => assign(value);
+
+    public MemberAttributes Attributes => MemberAttributes.None;
+    public (float min, float max)? Range => null;
+    public bool IsColor => false;
+    public bool Hdr => false;
+    public bool HasOverrideToggle => false;
+    public bool Overridden { get => false; set { } }
+    public bool TryGetSiblingValue(string memberName, out object value) { value = null; return false; }
 }
