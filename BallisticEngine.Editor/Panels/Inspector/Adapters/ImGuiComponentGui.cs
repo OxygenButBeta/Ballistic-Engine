@@ -23,6 +23,14 @@ public interface IComponentInspectorHost {
     // the slot's existing drag-drop + picker rendering (InspectorPanel.DrawAssetSlot) is reused unchanged --
     // the host unwraps the property's member/owner/type and forwards to its private DrawAssetSlot.
     void DrawAssetSlot(IProperty property);
+
+    // editor-rework G1-editor (Rule 1, the visible half of the EntityRef/ComponentRef work; engine half done
+    // in ch17): the scene-object-ref terminal drawer (SceneObjectRefDrawer) routes an EntityRef / ComponentRef
+    // member here. The host renders an interactive scene-object SLOT (current target name + drag-onto-slot from
+    // a Hierarchy row + a searchable picker of live scene entities / behaviours) in place of the dead
+    // `(EntityRef)` / `(ComponentRef)` disabled label these members fell to via gui.Unsupported. Mirrors the
+    // DrawAssetSlot host-method shape exactly; the host unwraps the IProperty and renders + sets the ref.
+    void DrawSceneObjectSlot(IProperty property);
 }
 
 public sealed class ImGuiComponentGui : IInspectorGui {

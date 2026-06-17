@@ -37,6 +37,13 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     string pickerSearch = "";
     bool openPicker;
 
+    // G1-editor: pending scene-object-picker request (opened from an EntityRef/ComponentRef slot). The slot
+    // sets the ref through the IProperty so the picker keeps the property (not the raw member) to write back
+    // the chosen EntityRef/ComponentRef value (which routes to ApplyMember + multi-select + dirty).
+    Inspector.IProperty sceneRefPickerProperty;
+    string sceneRefSearch = "";
+    bool openSceneRefPicker;
+
     string addComponentSearch = "";
 
     // Inspector lock (Unity's padlock): when on, the inspector pins its current entity so selecting
@@ -66,6 +73,8 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         memberRegistry.Register(new AnimationCurveDrawer(this));
         memberRegistry.Register(new ColorGradientDrawer(this));
         memberRegistry.Register(new AssetSlotDrawer(this));
+        // G1-editor: EntityRef/ComponentRef get the interactive scene-object slot (was a dead Unsupported label).
+        memberRegistry.Register(new SceneObjectRefDrawer(this));
         // The standalone component window reuses our reflection member renderer.
         ComponentEditorWindow.Configure(DrawMemberList);
     }
@@ -83,6 +92,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         if (property is Inspector.MemberProperty mp)
             DrawAssetSlot(mp.Member, mp.Owner, mp.Get() as BObject, mp.ValueType);
     }
+    // G1-editor: the SceneObjectRefDrawer terminal drawer hands its IProperty here; the slot reads/writes the
+    // EntityRef/ComponentRef value through the IProperty (Get/Set route to ApplyMember + MarkViewportDirty),
+    // so a pick/drag broadcasts to the multi-selection exactly like a primitive edit.
+    void IComponentInspectorHost.DrawSceneObjectSlot(Inspector.IProperty property) => DrawSceneObjectSlot(property);
 
     public void DrawContents() {
         ImGui.PushID(instanceId);   // namespace all ids so a 2nd Inspector window doesn't collide
@@ -133,6 +146,13 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             ImGui.OpenPopup("##assetpicker");
         }
         DrawAssetPickerPopup();
+
+        if (openSceneRefPicker) {
+            openSceneRefPicker = false;
+            sceneRefSearch = "";
+            ImGui.OpenPopup("##scenerefpicker");
+        }
+        DrawSceneObjectPickerPopup();
 
         ImGui.PopStyleVar(2);
         ImGui.PopID();
@@ -1507,6 +1527,192 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         ImGui.EndChild();
         ImGui.PopStyleVar();
         ImGui.EndPopup();
+    }
+
+    // G1-editor: the interactive scene-object SLOT for an EntityRef / ComponentRef member (the parallel of
+    // DrawAssetSlot for BObject asset members). Reads the current ref's InstanceId off the boxed value, shows
+    // the live target's name (or "None" / a missing-reference marker), accepts a Hierarchy entity-drag, and
+    // opens a searchable picker on click. All writes go through the IProperty (Set -> ApplyMember + dirty +
+    // multi-select broadcast) so the ref behaves exactly like a primitive edit; each write pushes one undo.
+    void DrawSceneObjectSlot(Inspector.IProperty p) {
+        bool isComponentRef = p.ValueType == typeof(ComponentRef);
+        object boxed = p.Get();
+        Guid instanceId = boxed switch {
+            EntityRef e => e.InstanceId,
+            ComponentRef c => c.InstanceId,
+            _ => Guid.Empty,
+        };
+
+        // Resolve the live target for display (lazy, like EntityRef.Value): a set-but-deleted ref shows the
+        // Unity "Missing" marker, an unset ref shows "None".
+        BObject resolved = instanceId == Guid.Empty ? null : SceneManager.FindByInstanceId(instanceId);
+        string label;
+        SysVec4 textCol;
+        string icon;
+        SysVec4 iconTint = EditorIcons.TintGeneric;
+        if (instanceId == Guid.Empty) {
+            label = "None";
+            textCol = ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled];
+            icon = isComponentRef ? EditorIcons.Wrench : EditorIcons.Package;
+        }
+        else if (resolved is null) {
+            label = $"Missing ({(isComponentRef ? "Component" : "Entity")})";
+            textCol = new SysVec4(1f, 0.55f, 0.35f, 1f); // amber-red, like a missing reference
+            icon = EditorIcons.Warning;
+        }
+        else if (resolved is Behaviour b) {
+            (icon, iconTint) = EditorIcons.ForComponentType(b.GetType());
+            label = $"{b.Entity?.Name} ({Prettify(b.GetType().Name)})";
+            textCol = ImGui.GetStyle().Colors[(int)ImGuiCol.Text];
+        }
+        else {
+            (icon, iconTint) = resolved is Entity ent ? EditorIcons.ForEntity(ent) : (EditorIcons.Package, EditorIcons.TintGeneric);
+            label = resolved.Name;
+            textCol = ImGui.GetStyle().Colors[(int)ImGuiCol.Text];
+        }
+
+        float pickerW = ImGui.GetFrameHeight() + 6;
+        ImGui.PushStyleColor(ImGuiCol.Text, textCol);
+        bool clicked = ImGui.Button($"{icon}  {label}", new SysVec2(-pickerW - 4, 0));
+        ImGui.PopStyleColor();
+        // The main button opens the picker too (no "reveal" action for scene objects -- selecting one would
+        // swap the inspector away from the edited entity, which is surprising; click = pick, like None).
+        if (clicked)
+            OpenSceneRefPickerFor(p);
+        if (AcceptEntityDrop(out Entity dropped) && !isComponentRef)
+            AssignSceneRef(p, new EntityRef(dropped));
+        else if (resolved is not null && ImGui.IsItemHovered())
+            ImGui.SetTooltip(isComponentRef ? "Click to pick a component." : "Click to pick an entity, or drag a Hierarchy row here.");
+
+        ImGui.SameLine();
+        if (ImGui.Button(EditorIcons.ChevronDown, new SysVec2(pickerW, 0)))
+            OpenSceneRefPickerFor(p);
+        if (AcceptEntityDrop(out Entity dropped2) && !isComponentRef)
+            AssignSceneRef(p, new EntityRef(dropped2));
+    }
+
+    void OpenSceneRefPickerFor(Inspector.IProperty p) {
+        sceneRefPickerProperty = p;
+        openSceneRefPicker = true;
+    }
+
+    // Writes a new EntityRef/ComponentRef (boxed) onto the slot's property. One undo per assignment; the
+    // IProperty.Set routes through ApplyMember (multi-select broadcast) + MarkViewportDirty.
+    void AssignSceneRef(Inspector.IProperty p, object refValue) {
+        EditorUndo.Push($"Assign {p.Label}");
+        p.Set(refValue);
+        state.MarkViewportDirty();
+    }
+
+    // Accepts a Hierarchy entity-drag payload (int = entity InstanceId hash, set by HierarchyPanel's
+    // EntityDragType source) onto the current item and resolves it back to the live entity. Mirrors
+    // BEventEditor.AcceptEntityDrop exactly so the drag-onto-slot UX matches the event editor.
+    static unsafe bool AcceptEntityDrop(out Entity entity) {
+        entity = null;
+        if (!ImGui.BeginDragDropTarget())
+            return false;
+        ImGuiPayloadPtr payload = ImGui.AcceptDragDropPayload("BALLISTIC_ENTITY");
+        if (!payload.IsNull && payload.Data != null) {
+            int hash = *(int*)payload.Data;
+            foreach (Entity e in SceneManager.GetCurrentScene().Entities)
+                if (e.InstanceId.GetHashCode() == hash) { entity = e; break; }
+        }
+        ImGui.EndDragDropTarget();
+        return entity is not null;
+    }
+
+    // Scene-object picker popup: search + every live scene entity (EntityRef) or every behaviour under each
+    // entity (ComponentRef); click to assign, (None) clears. The parallel of DrawAssetPickerPopup, but over
+    // the live scene (SceneManager.GetCurrentScene().Entities) instead of the AssetDatabase.
+    void DrawSceneObjectPickerPopup() {
+        float u = ImGui.GetFontSize();
+        ImGui.SetNextWindowSize(new SysVec2(u * 28f, u * 30f), ImGuiCond.Appearing);
+        if (!ImGui.BeginPopup("##scenerefpicker"))
+            return;
+
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new SysVec2(8, 6));
+
+        Inspector.IProperty p = sceneRefPickerProperty;
+        bool isComponentRef = p is not null && p.ValueType == typeof(ComponentRef);
+        string typeName = isComponentRef ? "Component" : "Entity";
+
+        ImGui.PushFont(ImGuiController.Bold);
+        ImGui.TextUnformatted($"Select {typeName}");
+        ImGui.PopFont();
+        ImGui.Spacing();
+
+        if (ImGui.IsWindowAppearing())
+            ImGui.SetKeyboardFocusHere();
+        ImGui.SetNextItemWidth(-1);
+        ImGui.InputTextWithHint("##search", $"{EditorIcons.Search} Search {typeName.ToLowerInvariant()}s...",
+            ref sceneRefSearch, 128);
+        ImGui.Separator();
+
+        ImGui.BeginChild("##list");
+
+        // (None) clears the slot to the default (Guid.Empty) ref.
+        ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+        if (ImGui.Selectable("  (None)", false, ImGuiSelectableFlags.None, new SysVec2(0, ImGui.GetFrameHeight()))) {
+            if (p is not null)
+                AssignSceneRef(p, isComponentRef ? (object)ComponentRef.None : EntityRef.None);
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.PopStyleColor();
+
+        var any = false;
+        if (p is not null) {
+            foreach (Entity e in SceneManager.GetCurrentScene().Entities) {
+                if (e is null || e.IsDestroyed)
+                    continue;
+                if (!isComponentRef) {
+                    if (!MatchesSearch(e.Name))
+                        continue;
+                    any = true;
+                    (string icon, SysVec4 tint) = EditorIcons.ForEntity(e);
+                    if (SceneRefRow(icon, tint, e.Name, e.InstanceId)) {
+                        AssignSceneRef(p, new EntityRef(e));
+                        ImGui.CloseCurrentPopup();
+                    }
+                }
+                else {
+                    foreach (Behaviour b in e.Behaviours) {
+                        if (b is null)
+                            continue;
+                        string rowName = $"{e.Name} : {Prettify(b.GetType().Name)}";
+                        if (!MatchesSearch(rowName))
+                            continue;
+                        any = true;
+                        (string icon, SysVec4 tint) = EditorIcons.ForComponentType(b.GetType());
+                        if (SceneRefRow(icon, tint, rowName, b.InstanceId)) {
+                            AssignSceneRef(p, new ComponentRef(b));
+                            ImGui.CloseCurrentPopup();
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!any)
+            ImGui.TextDisabled(sceneRefSearch.Length > 0
+                ? "No matching scene objects."
+                : $"No {typeName.ToLowerInvariant()}s in the scene.");
+
+        ImGui.EndChild();
+        ImGui.PopStyleVar();
+        ImGui.EndPopup();
+    }
+
+    bool MatchesSearch(string name) =>
+        sceneRefSearch.Length == 0 || name.Contains(sceneRefSearch, StringComparison.OrdinalIgnoreCase);
+
+    // One picker row (icon + name), keyed by the target InstanceId so duplicate names stay distinct ids.
+    static bool SceneRefRow(string icon, SysVec4 tint, string name, Guid instanceId) {
+        bool clicked = ImGui.Selectable($"      {name}##{instanceId:N}", false,
+            ImGuiSelectableFlags.None, new SysVec2(0, ImGui.GetFrameHeight()));
+        SysVec2 rmin = ImGui.GetItemRectMin();
+        EditorIcons.DrawAt(new SysVec2(rmin.X + 6,
+            rmin.Y + (ImGui.GetFrameHeight() - ImGui.GetTextLineHeight()) * 0.5f), icon, tint);
+        return clicked;
     }
 
     // Selected .volume asset: edit the live profile instance directly (every Volume referencing

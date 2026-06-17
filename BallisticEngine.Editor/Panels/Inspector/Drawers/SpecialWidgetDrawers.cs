@@ -81,3 +81,25 @@ public sealed class AssetSlotDrawer : ITypeDrawer {
         return false;
     }
 }
+
+// editor-rework G1-editor (Rule 1, gap 1 -- the VISIBLE half; the EntityRef/ComponentRef value types +
+// serializer round-trip + PropertyCategories.SceneObjectRef classify landed engine-side in ch17). Terminal
+// drawer for the serializable scene-object reference value types. Before this, an EntityRef/ComponentRef
+// member matched no drawer and fell to TypeDrawerTerminalStep -> gui.Unsupported -> a dead `(EntityRef)` /
+// `(ComponentRef)` disabled label (the visible half of the user's "Unity SerializeField object assignment"
+// complaint). Now it routes to the host's interactive scene-object slot (current target + drag-onto-slot +
+// searchable picker of live scene entities / behaviours), the parallel of AssetSlotDrawer/DrawAssetSlot.
+//
+// CanDraw keys on the DECLARED value type (the B4 null-safe rule: a struct value type is never null, but the
+// terminal resolves by ValueType regardless of the live value, so the slot draws even for a None ref). The
+// drawer reports false (no auto-dirty): the host pushes undo + marks dirty itself only on an actual user
+// pick / drag / clear, exactly like the asset slot.
+public sealed class SceneObjectRefDrawer : ITypeDrawer {
+    readonly IComponentInspectorHost host;
+    public SceneObjectRefDrawer(IComponentInspectorHost host) => this.host = host;
+    public bool CanDraw(Type t) => t == typeof(EntityRef) || t == typeof(ComponentRef);
+    public bool Draw(IProperty p, IInspectorGui gui) {
+        host.DrawSceneObjectSlot(p);
+        return false;
+    }
+}
