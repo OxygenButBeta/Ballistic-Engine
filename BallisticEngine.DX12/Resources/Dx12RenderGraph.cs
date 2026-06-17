@@ -47,11 +47,23 @@ public sealed class Dx12RenderGraph {
     // Run every enabled pass in the frozen order. An EMPTY graph (no passes registered — the chunk-3
     // scaffold state) is a guaranteed no-op, so wiring this into BeginRender leaves the image byte-identical
     // while all the inline pass calls still run. Passes are converted one at a time in later chunks.
-    public void Execute(Dx12FrameContext ctx) {
+    public void Execute(Dx12FrameContext ctx) =>
+        Execute(ctx, int.MinValue, int.MaxValue);
+
+    // Run only the enabled passes whose Event is in [minEventInclusive, maxEventExclusive). During the
+    // incremental migration the inline frame still INTERLEAVES un-converted passes between graph events
+    // (e.g. the inline SSR block sits between Fog=550 and SSAO=650 today). A single Execute() can't reproduce
+    // that interleave until every intervening pass is also in the graph — so the orchestrator runs the graph
+    // in EVENT WINDOWS around the still-inline passes, calling Execute(ctx, lo, hi) at each gap. As passes
+    // convert, the windows merge; at step G the whole frame is one Execute(ctx). The frozen event order (R1)
+    // is unchanged — this only bounds WHICH slice of it runs at each call site.
+    public void Execute(Dx12FrameContext ctx, int minEventInclusive, int maxEventExclusive) {
         if (!built) Build();
         var list = ordered;
         for (int i = 0; i < list.Length; i++) {
             IRenderPass pass = list[i];
+            int ev = (int)pass.Event;
+            if (ev < minEventInclusive || ev >= maxEventExclusive) continue;
             if (!pass.Enabled(ctx)) continue;
             if (timePass != null) timePass(pass.Name, () => pass.Record(ctx));
             else pass.Record(ctx);

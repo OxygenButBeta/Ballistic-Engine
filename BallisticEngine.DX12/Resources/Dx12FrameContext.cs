@@ -35,6 +35,7 @@ public sealed class Dx12FrameContext {
     // --- scene inputs (read-only) ---
     public IReadOnlyList<IStaticMeshRenderer> WholeMeshRenderers { get; init; }
     public Vector4[] FrustumPlanes { get; init; }         // UNJITTERED-viewProj planes (shared array, read-only use)
+    public Matrix4x4[] CascadeMatrices { get; init; }     // sun shadow cascade light-MVPs, filled by RenderShadows (shared array, read-only use)
 
     // --- render resolution (read-only) ---
     public int TargetW { get; init; }

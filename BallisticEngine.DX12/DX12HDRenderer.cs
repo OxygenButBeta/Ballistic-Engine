@@ -466,6 +466,10 @@ public sealed class DX12HDRenderer : HDRenderer {
     // runs at the PostProcess event via the graph. The still-inline composite reads its result via
     // ssaoPass.ResultSrvCpu until composite itself converts (chunk 7).
     Dx12SsaoPass ssaoPass;
+    // chunk 5: AerialPerspective (event 400) + Fog (event 550), converted leaf-post passes (was the inline
+    // DrawAerialPerspective / DrawFog). Both blend in place into `target` — no cross-pass output getter.
+    Dx12AerialPerspectivePass apPass;
+    Dx12FogPass fogPass;
 
     // Skybox pass (background): its own root sig (CBV b0 + cube SRV t0 + clamp sampler) + PSO (LEqual,
     // no depth write, cull none, SV_VertexID cube). Drawn after opaque in the same command list.
@@ -560,43 +564,8 @@ public sealed class DX12HDRenderer : HDRenderer {
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct ShadowConstants { public Matrix4x4 LightMvp; }
 
-    // Volumetric fog (full-screen post pass, blended over scene color).
-    ID3D12RootSignature fogRootSig;     // FogConstants CBV (b0) + depth+shadow SRV table (t0,t1) + sampler
-    ID3D12PipelineState fogPso;
-    ID3D12Resource fogCb;
-    unsafe byte* fogCbMapped;
-    Dx12DescriptorHeap fogSrvVisible;   // depth + shadow array, copied per frame
-
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct FogConstants {
-        public Matrix4x4 InvViewProj;
-        public Matrix4x4 Cascade0, Cascade1, Cascade2, Cascade3;
-        public Vector4 CascadeBias;
-        public Vector3 CameraPos; public float CascadeCountF;
-        public Vector3 SunDirection; public float Density;
-        public Vector3 SunColor; public float HeightFalloff;
-        public Vector3 SkyAmbient; public float BaseHeight;
-        public Vector3 Tint; public float Anisotropy;
-        public float Scattering, AmbientScatter, SunGlow, SunGlowSharpness;
-        public float StepCount, MaxDistance, ShadowMapTexel, Exposure;
-    }
-
-    // Aerial perspective (full-screen post pass; atmospheric haze on distant opaque geometry). SEPARATE pass —
-    // does NOT touch the deferred lighting shader. Blended over scene color like fog (dst*transmittance + src).
-    ID3D12RootSignature apRootSig;      // ApConstants CBV (b0) + depth SRV (t0) + sampler
-    ID3D12PipelineState apPso;
-    ID3D12Resource apCb;
-    unsafe byte* apCbMapped;
-    Dx12DescriptorHeap apSrvVisible;    // scene depth, copied per frame
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct ApConstants {
-        public Matrix4x4 InvViewProj;
-        public Vector3 CameraPos; public float Strength;
-        public Vector3 SunDirection; public float Distance;
-        public Vector3 SunRadiance; public float HazeAniso;
-        public Vector3 SkyTint; public float AirDensity;
-        public float Haze, MaxDistance, NearFade, Pad;   // NearFade: haze fades in over [NearFade, 2*NearFade] m (V3)
-    }
+    // Volumetric fog + aerial perspective moved to Dx12FogPass / Dx12AerialPerspectivePass (chunk 5). Their
+    // root sigs / PSOs / CBs / heaps + the FogConstants/ApConstants structs now live inside those pass classes.
 
     // Per-frame constants (b1) shared by every opaque draw: the cascade matrices + shadow params.
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
@@ -793,8 +762,8 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         BuildDeferredLighting();
         BuildTransparentPass();
-        BuildFog();
-        BuildAerialPerspective();
+        // Fog + AerialPerspective now built inside their pass ctors (Dx12FogPass / Dx12AerialPerspectivePass),
+        // constructed below where the pass-graph is assembled (chunk 5). Was BuildFog() + BuildAerialPerspective().
         BuildSsr();
         BuildSsgi();
         BuildTaa();
@@ -826,6 +795,14 @@ public sealed class DX12HDRenderer : HDRenderer {
         graph = new Dx12RenderGraph(TimePass);
         ssaoPass = new Dx12SsaoPass(dev, targetW, targetH);   // chunk 4: first leaf-post pass (was BuildSsao)
         graph.Add(ssaoPass);
+        // chunk 5: AerialPerspective (event 400) + Fog (event 550). Both resolution-independent (no Resize
+        // body) so registration order doesn't touch R5; the event sort places them before SSAO (650) — the
+        // same relative order as today's inline frame (AP before transparents/SSGI, fog before SSR; both
+        // before SSAO). Was BuildAerialPerspective / BuildFog.
+        apPass = new Dx12AerialPerspectivePass(dev);
+        fogPass = new Dx12FogPass(dev);
+        graph.Add(apPass);
+        graph.Add(fogPass);
         graph.Build();
     }
 
@@ -1336,97 +1313,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         bloomB = new Dx12OffscreenTarget(dev, w, h, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
     }
 
-    unsafe void BuildFog() {
-        // FogConstants CBV (b0) + a 2-SRV table (depth t0, shadow array t1) + clamp sampler s0.
-        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 0);
-        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
-        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
-            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
-            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
-            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
-        };
-        fogRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
-
-        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("VolumetricFog.hlsl");
-        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "VolumetricFog.hlsl");
-        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "VolumetricFog.hlsl");
-
-        // Blend: dest = dest * srcAlpha(transmittance) + src(scatter). Classic over-fog composite.
-        var blend = BlendDescription.Opaque;
-        var rt0 = blend.RenderTarget[0];
-        rt0.BlendEnable = true;
-        rt0.SourceBlend = Blend.One;
-        rt0.DestinationBlend = Blend.SourceAlpha;
-        rt0.BlendOperation = BlendOperation.Add;
-        rt0.SourceBlendAlpha = Blend.Zero;
-        rt0.DestinationBlendAlpha = Blend.Zero;
-        rt0.BlendOperationAlpha = BlendOperation.Add;
-        blend.RenderTarget[0] = rt0;
-
-        fogPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
-            RootSignature = fogRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
-            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
-            RasterizerState = RasterizerDescription.CullNone, BlendState = blend,
-            DepthStencilState = DepthStencilDescription.None,
-            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
-            DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
-        });
-
-        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<FogConstants>() + 255) & ~255;
-        fogCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        fogCbMapped = fogCb.Map<byte>(0);
-        fogSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true, framesInFlight: dev.FramesInFlight);
-    }
-
-    unsafe void BuildAerialPerspective() {
-        // ApConstants CBV (b0) + a 1-SRV table (depth t0) + clamp sampler s0.
-        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
-        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
-        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
-            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
-            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
-            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
-        };
-        apRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
-
-        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("AerialPerspective.hlsl");
-        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "AerialPerspective.hlsl");
-        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "AerialPerspective.hlsl");
-
-        // Same composite as fog: dest = dest*srcAlpha(transmittance) + src(inscatter).
-        var blend = BlendDescription.Opaque;
-        var rt0 = blend.RenderTarget[0];
-        rt0.BlendEnable = true;
-        rt0.SourceBlend = Blend.One;
-        rt0.DestinationBlend = Blend.SourceAlpha;
-        rt0.BlendOperation = BlendOperation.Add;
-        rt0.SourceBlendAlpha = Blend.Zero;
-        rt0.DestinationBlendAlpha = Blend.Zero;
-        rt0.BlendOperationAlpha = BlendOperation.Add;
-        blend.RenderTarget[0] = rt0;
-
-        apPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
-            RootSignature = apRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
-            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
-            RasterizerState = RasterizerDescription.CullNone, BlendState = blend,
-            DepthStencilState = DepthStencilDescription.None,
-            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
-            DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
-        });
-
-        int apCbSize = (System.Runtime.InteropServices.Marshal.SizeOf<ApConstants>() + 255) & ~255;
-        apCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)apCbSize), ResourceStates.GenericRead);
-        apCbMapped = apCb.Map<byte>(0);
-        apSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true, framesInFlight: dev.FramesInFlight);
-    }
+    // BuildFog / BuildAerialPerspective moved into the Dx12FogPass / Dx12AerialPerspectivePass ctors (chunk 5).
 
     unsafe void BuildShadows() {
         shadowMap = new Dx12ShadowMap(dev, ShadowMapSize, CascadeCount);
@@ -2064,37 +1951,10 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         DrawDeferredLighting(view, viewProj, camPos, lightDir, lightColor, ambient);
 
-        // === SKY: draw into the HDR color at the far plane, depth-testing the G-buffer depth (LEqual,
-        // no write). ProceduralSky takes precedence over an asset cubemap Skybox (matches GL). ===
-        // doors.Sky = off under BARE-MINIMUM → the background keeps the HDR clear color (a solid backdrop;
-        // lit geometry still composites correctly — this just removes the sky pass to isolate it).
-        gbuffer.DepthToReadOnly();
-        if (doors.Sky)
-            target.RenderColorWithExternalDepth(gbuffer.DsvHandle, cl => {
-                if (ProceduralSky.Active is not null)
-                    DrawProcSky(cl, view, proj, light);
-                else
-                    DrawSkybox(cl, view, proj);
-            });
-
-        // === AERIAL PERSPECTIVE: atmospheric haze on distant opaque geometry (#1 scale cue), blended over the
-        // sky+opaque HDR before transparents/fog. Separate pass — never touches deferred lighting. Only when a
-        // ProceduralSky drives the atmosphere; BALLISTIC_DX12_AP=0 disables it. ===
-        if (doors.AerialPersp && ProceduralSky.Active is not null) {
-            Vector3 apSunDir = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
-            DrawAerialPerspective(viewProj, camPos, apSunDir, lightColor);
-        }
-
-        // === TRANSPARENTS: forward, back-to-front, alpha-blended over the HDR scene + sky, depth-testing
-        // the G-buffer depth (LEqual, no write). Runs before fog/SSR/TAA so they apply over the glass. ===
-        DrawTransparents(view, viewProj, camPos, lightDir, lightColor, ambient);
-
-        // --- SSGI (volume-driven screen-space GI): local one-bounce light added to the lit scene, BEFORE
-        // fog/SSR so they apply over the GI-enriched colour (matches the GL order). Gather (SSILVB) +
-        // motion-buffer temporal accumulation + OIDN denoise. Driven by the ScreenSpaceGlobalIllumination
-        // VOLUME (PostFX.SsgiEnabled); BALLISTIC_DX12_SSGI=1/0 force-overrides for A/B + perf. NOTE: the OIDN
-        // denoise round-trip is currently a CPU readback (slow); the zero-copy D3D12<->HIP path is the perf
-        // follow-up (BALLISTIC_DX12_SSGI_OIDN=0 = fast temporal-only meanwhile). ---
+        // === GI MODE RESOLVE (moved UP from its old spot below the GI dispatch — chunk 5). It has no
+        // dependency on sky/transparents and the pass-graph ctx (built right after) needs giMode at its final
+        // value. The GI DISPATCH itself stays inline at its canonical spot below (after transparents); GI
+        // converts to a pass in chunk 10. ===
         // GI: Off / SSGI / RT-GI (the GI volume dropdown; env doors override). RT-GI traces the scene BVH;
         // both SSGI and RT-GI share the temporal + OIDN + combine resolve. RT-GI falls back to SSGI w/o DXR.
         string ssgiEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SSGI");
@@ -2115,6 +1975,62 @@ public sealed class DX12HDRenderer : HDRenderer {
             if (giMode == GiMode.RayTraced) giMode = GiMode.ScreenSpace;
             WarnNoRtOnce();
         }
+
+        // === PHASE-1 PASS-GRAPH CONTEXT (chunks 4–5). Built ONCE here — after DrawDeferredLighting + the
+        // giMode resolve, before the Sky pass — so every mutated ctx field holds its FINAL value (fsrActive
+        // resolved pre-body; iblActiveThisFrame/shadowsThisFrame/rtShadowsThisFrame set above; giMode just
+        // resolved). The graph then runs in EVENT WINDOWS at the gaps between the still-inline passes, so each
+        // converted pass executes at its canonical inline position (AP after sky/before transparents; Fog after
+        // GI/before SSR; SSAO after SSR/before composite). As more passes convert, the windows merge into one
+        // Execute (step G). ===
+        var ctx = new Dx12FrameContext {
+            View = view, Proj = proj, ViewProj = viewProj,
+            ProjUnjittered = projUnjittered, ViewProjUnjittered = viewProjUnjittered,
+            CurrentJitter = currentJitter, CamPos = camPos,
+            LightDir = lightDir, LightColor = lightColor, Ambient = ambient, Exposure = exposure,
+            WholeMeshRenderers = wholeMeshRenderers, FrustumPlanes = frustumPlanes,
+            CascadeMatrices = cascadeMatrices,   // shared per-frame array, filled by RenderShadows; Fog reads it
+            TargetW = targetW, TargetH = targetH, OutputW = outputW, OutputH = outputH,
+            Dev = dev, Target = target, Ldr = ldr, GBuffer = gbuffer,
+            Ibl = ibl, SkyLuts = skyLuts, ClusteredLights = clusteredLights,
+            ShadowMap = shadowMap, GpuDriven = gpuDriven,
+            Doors = doors, PostFX = PostFX, Stats = RenderStats.Scene,
+            // mutated-mid-frame fields, set to their resolved final value:
+            SceneColor = fsrActive ? fsrOutput : target,
+            IblActiveThisFrame = iblActiveThisFrame,
+            ShadowsThisFrame = shadowsThisFrame,
+            RtShadowsThisFrame = rtShadowsThisFrame,
+            GiMode = giMode,
+        };
+
+        // === SKY: draw into the HDR color at the far plane, depth-testing the G-buffer depth (LEqual,
+        // no write). ProceduralSky takes precedence over an asset cubemap Skybox (matches GL). ===
+        // doors.Sky = off under BARE-MINIMUM → the background keeps the HDR clear color (a solid backdrop;
+        // lit geometry still composites correctly — this just removes the sky pass to isolate it).
+        gbuffer.DepthToReadOnly();
+        if (doors.Sky)
+            target.RenderColorWithExternalDepth(gbuffer.DsvHandle, cl => {
+                if (ProceduralSky.Active is not null)
+                    DrawProcSky(cl, view, proj, light);
+                else
+                    DrawSkybox(cl, view, proj);
+            });
+
+        // === AERIAL PERSPECTIVE (Dx12AerialPerspectivePass, event 400). Runs at its canonical inline slot:
+        // after Sky, before Transparents — the event window [AerialPerspective, Transparents) (chunk 5). ===
+        graph.Execute(ctx, (int)Dx12RenderPassEvent.AerialPerspective, (int)Dx12RenderPassEvent.Transparents);
+
+        // === TRANSPARENTS: forward, back-to-front, alpha-blended over the HDR scene + sky, depth-testing
+        // the G-buffer depth (LEqual, no write). Runs before fog/SSR/TAA so they apply over the glass. ===
+        DrawTransparents(view, viewProj, camPos, lightDir, lightColor, ambient);
+
+        // --- SSGI (volume-driven screen-space GI): local one-bounce light added to the lit scene, BEFORE
+        // fog/SSR so they apply over the GI-enriched colour (matches the GL order). Gather (SSILVB) +
+        // motion-buffer temporal accumulation + OIDN denoise. Driven by the ScreenSpaceGlobalIllumination
+        // VOLUME (PostFX.SsgiEnabled); BALLISTIC_DX12_SSGI=1/0 force-overrides for A/B + perf. NOTE: the OIDN
+        // denoise round-trip is currently a CPU readback (slow); the zero-copy D3D12<->HIP path is the perf
+        // follow-up (BALLISTIC_DX12_SSGI_OIDN=0 = fast temporal-only meanwhile). ---
+        // The giMode resolve moved up (before the ctx build); the DISPATCH stays here at its canonical spot.
         if (giMode == GiMode.RayTraced) { if (EnsureRtGi()) TimePass("GI:RT", () => DrawRtGi(view, viewProj, proj, lightDir, lightColor, camPos)); else TimePass("GI:SSGI", () => DrawSsgi(view, proj)); }
         else if (giMode == GiMode.ScreenSpace) TimePass("GI:SSGI", () => DrawSsgi(view, proj));
 
@@ -2123,13 +2039,12 @@ public sealed class DX12HDRenderer : HDRenderer {
         // _DEBUG=1 blits the albedo cube into ssgiTarget (so the GI-isolate capture shows it). Standalone; no grid.
         if (NortProbesEnabled) DrawRasterProbeMeasure(camPos);
 
-        // --- Volumetric fog (post pass, reads depth+shadows, blends over HDR scene color) ---
-        // BALLISTIC_FX_VOLUMETRIC=1 forces it on (same harness contract as the GL backend).
-        // doors.Fog already folds in BALLISTIC_FX_VOLUMETRIC==1; under MINIMAL PostFX.VolumetricEnabled is
-        // also gated off (the volume bridge doesn't run), so fog is off unless BALLISTIC_FX_VOLUMETRIC=1.
-        bool fogOn = (!doors.Minimal && PostFX.VolumetricEnabled) || doors.Fog;
-        if (fogOn)
-            DrawFog(view, viewProj, camPos, light);
+        // --- Volumetric fog (Dx12FogPass, event 550). Runs at its canonical inline slot: after GI/SSGI,
+        // before the Reflections/SSR block — the event window [Fog, Reflections) (chunk 5). Running it AFTER
+        // SSR instead would change the fog-active image (fog blends over SSR-modified pixels in the wrong
+        // order — measured: 1884px diff vs the inline order), so it must run HERE, not at the SSAO slot. The
+        // (!doors.Minimal && PostFX.VolumetricEnabled) || doors.Fog gate moved verbatim to Dx12FogPass.Enabled. ---
+        graph.Execute(ctx, (int)Dx12RenderPassEvent.Fog, (int)Dx12RenderPassEvent.Reflections);
 
         // --- Reflections (volume-driven, SSR vs RT). RT reflections trace the scene BVH (off-screen + sky
         // correct), reusing the SSR reflection target + combine; SSR is the screen-space fallback. ---
@@ -2145,34 +2060,14 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         bool ssaoOn = doors.Ssao;
 
-        // === PHASE-1 PASS-GRAPH (chunk 4: SSAO is the first converted leaf-post pass) ===
-        // Assemble the per-frame context from the locals computed above + the mid-frame-resolved flags, then
-        // run the graph. Placed HERE (before the TAA/FSR/composite block) because SSAO lives in the
-        // PostProcess group and the still-inline composite below READS the SSAO result (ssaoPass.ResultSrvCpu).
-        // SSAO reads only the G-buffer (depth + world normal) and writes its own half-res target — it is
-        // independent of TAA (which reads/writes `target`) and of the FSR/native branch, so running it here
-        // instead of interleaved with TAA is byte-neutral (verified: floor=0). Every mutated ctx field already
-        // holds its final value at this point (fsrActive/giMode/IblActive/Shadows resolved earlier in
-        // BeginRender). Passes still inline below run after the graph until they convert in later chunks.
-        var ctx = new Dx12FrameContext {
-            View = view, Proj = proj, ViewProj = viewProj,
-            ProjUnjittered = projUnjittered, ViewProjUnjittered = viewProjUnjittered,
-            CurrentJitter = currentJitter, CamPos = camPos,
-            LightDir = lightDir, LightColor = lightColor, Ambient = ambient, Exposure = exposure,
-            WholeMeshRenderers = wholeMeshRenderers, FrustumPlanes = frustumPlanes,
-            TargetW = targetW, TargetH = targetH, OutputW = outputW, OutputH = outputH,
-            Dev = dev, Target = target, Ldr = ldr, GBuffer = gbuffer,
-            Ibl = ibl, SkyLuts = skyLuts, ClusteredLights = clusteredLights,
-            ShadowMap = shadowMap, GpuDriven = gpuDriven,
-            Doors = doors, PostFX = PostFX, Stats = RenderStats.Scene,
-            // mutated-mid-frame fields, set to their resolved final value:
-            SceneColor = fsrActive ? fsrOutput : target,
-            IblActiveThisFrame = iblActiveThisFrame,
-            ShadowsThisFrame = shadowsThisFrame,
-            RtShadowsThisFrame = rtShadowsThisFrame,
-            GiMode = giMode,
-        };
-        graph.Execute(ctx);   // runs SSAO (Enabled = doors.Ssao) at its PostProcess slot, before composite.
+        // === PHASE-1 PASS-GRAPH — PostProcess window (chunk 4: SSAO). Runs at its canonical slot: after the
+        // Reflections/SSR block, before the TAA/FSR/composite block — the still-inline composite below READS
+        // SSAO's result (ssaoPass.ResultSrvCpu). SSAO reads only the G-buffer (depth + world normal) and writes
+        // its own half-res target — independent of TAA (reads/writes `target`) and the FSR/native branch, so
+        // running it here instead of interleaved with TAA is byte-neutral (verified: floor=0). The earlier
+        // windows already ran AP (after sky) + Fog (after GI) at their canonical positions; this window runs
+        // PostProcess (650)+ . The ctx was built once above (after the giMode resolve, before Sky). ===
+        graph.Execute(ctx, (int)Dx12RenderPassEvent.PostProcess, int.MaxValue);
 
         if (fsrActive) {
             // --- FSR upscale path (replaces TAA): SSAO (ran in graph above) → FSR reconstruct
@@ -3805,97 +3700,9 @@ public sealed class DX12HDRenderer : HDRenderer {
         target.ColorToRenderTarget();
     }
 
-    // Aerial perspective: blend the atmosphere's distance haze over opaque geometry (the #1 scale/realism cue).
-    // A full-screen analytic single-scattering pass — a SEPARATE pass that does NOT touch deferred lighting.
-    // Runs after the sky, before transparents/fog. In RAW HDR radiance (composites before the tonemap). The
-    // Strength/Distance dials are env-tunable; BALLISTIC_DX12_AP=0 disables it (byte-identical off).
-    unsafe void DrawAerialPerspective(Matrix4x4 viewProj, Vector3 camPos, Vector3 sunDir, Vector3 sunRadiance) {
-        Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
-        var pSky = ProceduralSky.Active;
-        // Sky-colour ambient tint for haze in shadow (Rayleigh-blue, engine-radiance scale).
-        Vector3 skyTint = sunRadiance * new Vector3(0.10f, 0.16f, 0.32f);
-
-        float strength = 1f;
-        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_AP_STRENGTH"),
-            System.Globalization.CultureInfo.InvariantCulture, out float s)) strength = s;
-
-        float distance = 1200f;  // haze half-distance in metres (scene-scale; env-tunable below)
-        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_AP_DISTANCE"),
-            System.Globalization.CultureInfo.InvariantCulture, out float dd)) distance = dd;
-        // V3 (fixes D2): fade the haze in over [NearFade, 2*NearFade] m so interiors / short views get ~no aerial
-        // perspective (the lux-scaled SkyTint painted a blue veil on every opaque pixel even at ~10 m). 25 m fades
-        // it in across 25–50 m: enclosed rooms stay clean, distant vistas keep the cue. =0 restores pre-V3 (door).
-        float nearFade = 25f;
-        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_AP_NEARFADE"),
-            System.Globalization.CultureInfo.InvariantCulture, out float nf)) nearFade = nf;
-        *(ApConstants*)apCbMapped = new ApConstants {
-            InvViewProj = Matrix4x4.Transpose(invVP),
-            CameraPos = camPos, Strength = strength,
-            SunDirection = sunDir, Distance = distance,
-            SunRadiance = sunRadiance, HazeAniso = pSky is not null ? Math.Clamp(pSky.HazeAnisotropy, 0f, 0.95f) : 0.8f,
-            SkyTint = skyTint, AirDensity = pSky is not null ? MathF.Max(pSky.AirDensity, 0f) : 1f,
-            Haze = pSky is not null ? MathF.Max(pSky.Haze, 0f) : 1f,
-            MaxDistance = 60000f, NearFade = nearFade,
-        };
-
-        gbuffer.DepthToShaderResource();
-        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        dev.Device.CopyDescriptorsSimple(1, apSrvVisible.Cpu(0), gbuffer.DepthSrvCpu, heapType);
-
-        target.RenderColorOnly(cl => {
-            cl.SetGraphicsRootSignature(apRootSig);
-            cl.SetPipelineState(apPso);
-            cl.SetDescriptorHeaps(apSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, apCb.GPUVirtualAddress);
-            cl.SetGraphicsRootDescriptorTable(1, apSrvVisible.Gpu(0));
-            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            cl.DrawInstanced(3, 1, 0, 0);
-        });
-    }
-
-    // Full-screen volumetric fog: march the air toward the camera (shadowed sun + sky in-scatter),
-    // blend (scatter, transmittance) over the scene color. Reads scene depth + shadow cascades as SRVs.
-    unsafe void DrawFog(Matrix4x4 view, Matrix4x4 viewProj, Vector3 camPos, LightUniforms light) {
-        Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
-        // Crude sky-ambient for fog in-scatter (engine-radiance scale; the fog Exposure constant matches
-        // the opaque pre-exposure). A proper average-irradiance readback is a follow-up.
-        Vector3 skyAmbient = new Vector3(2000f, 2200f, 2600f);
-        var pf = PostFX;
-        var fc = new FogConstants {
-            InvViewProj = Matrix4x4.Transpose(invVP),
-            Cascade0 = Matrix4x4.Transpose(cascadeMatrices[0]), Cascade1 = Matrix4x4.Transpose(cascadeMatrices[1]),
-            Cascade2 = Matrix4x4.Transpose(cascadeMatrices[2]), Cascade3 = Matrix4x4.Transpose(cascadeMatrices[3]),
-            CascadeBias = new Vector4(0.0015f, 0.0020f, 0.0030f, 0.0050f),
-            CameraPos = camPos, CascadeCountF = CascadeCount,
-            SunDirection = ToNumerics(light.Direction), Density = pf.VolumetricDensity,
-            SunColor = ToNumerics(light.Color), HeightFalloff = pf.VolumetricHeightFalloff,
-            SkyAmbient = skyAmbient, BaseHeight = pf.VolumetricBaseHeight,
-            Tint = ToNumerics(pf.VolumetricTint), Anisotropy = pf.VolumetricAnisotropy,
-            Scattering = pf.VolumetricScattering * pf.VolumetricIntensity,
-            AmbientScatter = pf.VolumetricAmbientScatter * pf.VolumetricIntensity,
-            SunGlow = pf.VolumetricSunGlow, SunGlowSharpness = pf.VolumetricSunGlowSharpness,
-            StepCount = pf.VolumetricStepCount, MaxDistance = pf.VolumetricMaxDistance,
-            ShadowMapTexel = 1f / ShadowMapSize, Exposure = 1.0e-5f,   // match the opaque pre-exposure
-        };
-        *(FogConstants*)fogCbMapped = fc;
-
-        // depth → SRV (G-buffer owns it), shadow array already SRV from RenderShadows. Copy both into the
-        // fog heap. After the sky pass the G-buffer depth is in DepthRead; bring it to PixelShaderResource.
-        gbuffer.DepthToShaderResource();
-        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(0), gbuffer.DepthSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(1), shadowMap.SrvCpu, heapType);
-
-        target.RenderColorOnly(cl => {
-            cl.SetGraphicsRootSignature(fogRootSig);
-            cl.SetPipelineState(fogPso);
-            cl.SetDescriptorHeaps(fogSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, fogCb.GPUVirtualAddress);
-            cl.SetGraphicsRootDescriptorTable(1, fogSrvVisible.Gpu(0));
-            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            cl.DrawInstanced(3, 1, 0, 0);
-        });
-    }
+    // DrawAerialPerspective + DrawFog moved into Dx12AerialPerspectivePass.Record / Dx12FogPass.Record
+    // (chunk 5). The graph runs them at events 400 / 550 (before the SSAO PostProcess slot), the same
+    // relative position as today's inline frame.
 
     // Draw the environment cubemap as the far-plane background (LEqual, no depth write) where opaque
     // geometry didn't cover. No-op if the scene has no Skybox or its cubemap isn't a DX12 cube yet.
