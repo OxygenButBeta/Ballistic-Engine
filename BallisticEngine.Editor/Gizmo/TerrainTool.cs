@@ -74,7 +74,11 @@ internal static class TerrainTool {
         // Begin a stroke on left-press over a hit (and not while flying / over a popup).
         if (!sculpting && hadHit && viewHovered &&
             ImGui.IsMouseClicked(ImGuiMouseButton.Left) && !ImGui.GetIO().WantTextInput) {
-            EditorUndo.Push($"Sculpt Terrain ({Brush})");
+            // Stroke-start snapshot -> EditorCommands.Structural (byte-identical whole-scene Push). The
+            // heightfield itself is a .terrain ASSET saved on stroke end (SaveTerrain), so the true
+            // asset-scoped undo is an F2 EditAsset/PushCallback conversion, not this F1 call-site swap;
+            // here we only relocate the existing whole-scene Push onto the command choke point.
+            EditorCommands.Structural($"Sculpt Terrain ({Brush})", () => { });
             sculpting = true;
             activeTerrain = terrain;
         }

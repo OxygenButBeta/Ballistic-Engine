@@ -93,7 +93,11 @@ internal static class WheelHandles {
             grabDir = worldDir;
             GizmoMath.MouseRay(vp, viewMin, viewSize, mouse, out Vector3 rayO, out Vector3 rayD);
             grabParam = ClosestParamOnAxis(worldPos, worldDir, rayO, rayD);
-            EditorUndo.Push("Edit Wheel");
+            // Drag-start snapshot of this ONE wheel's entity -> scoped through EditorCommands.EditEntity
+            // (PushEntity: selection survives, no whole-scene re-bake). The drag mutates wheel.Radius/
+            // SuspensionTravel on later frames, so the grab-frame snapshot is preserved with a no-op
+            // mutate -- byte-identical beyond the Push->PushEntity scoping.
+            EditorCommands.EditEntity(wheel.Entity, "Edit Wheel", () => { });
             grabbed = true;
         }
 
