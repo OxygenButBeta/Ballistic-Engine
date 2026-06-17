@@ -21,6 +21,12 @@ public static class ComponentRegistry {
     static readonly Dictionary<string, Type> volumeByName = new(StringComparer.Ordinal);
     static readonly List<ComponentEntry> volumeMenu = new();
 
+    // RenderFeatures (authored custom render passes — phase 3) — resolved by name when loading a scene's
+    // RenderFeatures list and listed in the editor's Add Render Feature menu. Exact mirror of the volume
+    // branch: a game authors a RenderFeature subclass and it appears here with zero wiring.
+    static readonly Dictionary<string, Type> featureByName = new(StringComparer.Ordinal);
+    static readonly List<ComponentEntry> featureMenu = new();
+
     // DataAssets (.asset files) — resolved by name when loading a .asset and listed in the asset
     // browser's "Create" menu (only types carrying [CreateDataAsset] appear in the menu; ALL
     // concrete DataAsset types are resolvable by name for loading).
@@ -31,6 +37,7 @@ public static class ComponentRegistry {
     public static IReadOnlyList<ComponentEntry> Menu => menu;
     public static IReadOnlyList<ComponentEntry> SceneMenu => sceneMenu;
     public static IReadOnlyList<ComponentEntry> VolumeMenu => volumeMenu;
+    public static IReadOnlyList<ComponentEntry> RenderFeatureMenu => featureMenu;
     public static IReadOnlyList<ComponentEntry> DataAssetMenu => dataMenu;
 
     public static void Build(params Assembly[] assemblies) {
@@ -40,6 +47,8 @@ public static class ComponentRegistry {
         sceneMenu.Clear();
         volumeByName.Clear();
         volumeMenu.Clear();
+        featureByName.Clear();
+        featureMenu.Clear();
         dataByName.Clear();
         dataMenu.Clear();
 
@@ -56,6 +65,8 @@ public static class ComponentRegistry {
                     Register(type, sceneByName, sceneMenu);
                 else if (typeof(VolumeComponent).IsAssignableFrom(type))
                     Register(type, volumeByName, volumeMenu);
+                else if (typeof(RenderFeature).IsAssignableFrom(type))
+                    RegisterFeature(type);
                 else if (typeof(DataAsset).IsAssignableFrom(type))
                     RegisterDataAsset(type);
             }
@@ -64,7 +75,25 @@ public static class ComponentRegistry {
         menu.Sort((a, b) => string.CompareOrdinal(a.DisplayName, b.DisplayName));
         sceneMenu.Sort((a, b) => string.CompareOrdinal(a.DisplayName, b.DisplayName));
         volumeMenu.Sort((a, b) => string.CompareOrdinal(a.DisplayName, b.DisplayName));
+        featureMenu.Sort((a, b) => string.CompareOrdinal(a.DisplayName, b.DisplayName));
         dataMenu.Sort((a, b) => string.CompareOrdinal(a.DisplayName, b.DisplayName));
+    }
+
+    // RenderFeatures (phase 3) are discovered by base-type like the others, but carry their OWN
+    // [RenderFeature] attribute (not [Component]) — so they need a parallel register that reads it and
+    // honors HideFromAddMenu. Always resolvable by name (for scene loading); the menu entry is gated by
+    // the attribute exactly as Register gates on ComponentAttribute.
+    static void RegisterFeature(Type type) {
+        var key = featureByName.ContainsKey(type.Name) ? type.FullName : type.Name;
+        featureByName[key] = type;
+
+        RenderFeatureAttribute attr = type.GetCustomAttribute<RenderFeatureAttribute>();
+        if (attr is { HideFromAddMenu: true })
+            return;
+        featureMenu.Add(new ComponentEntry(
+            attr?.DisplayName ?? type.Name,
+            attr?.Menu ?? string.Empty,
+            type));
     }
 
     // DataAssets are always resolvable by name (for loading), but only those carrying
@@ -110,6 +139,9 @@ public static class ComponentRegistry {
     public static Type ResolveVolume(string typeName) =>
         typeName is null ? null : volumeByName.GetValueOrDefault(typeName);
 
+    public static Type ResolveFeature(string typeName) =>
+        typeName is null ? null : featureByName.GetValueOrDefault(typeName);
+
     // Returns the registry key (the name used in scene files) for a component instance.
     public static string NameOf(Behaviour behaviour) {
         Type type = behaviour.GetType();
@@ -124,5 +156,11 @@ public static class ComponentRegistry {
     public static string VolumeNameOf(VolumeComponent component) {
         Type type = component.GetType();
         return volumeByName.ContainsKey(type.Name) && volumeByName[type.Name] == type ? type.Name : type.FullName;
+    }
+
+    // The registry key (the name stored in a scene's RenderFeatures list) for a feature instance.
+    public static string FeatureNameOf(RenderFeature feature) {
+        Type type = feature.GetType();
+        return featureByName.ContainsKey(type.Name) && featureByName[type.Name] == type ? type.Name : type.FullName;
     }
 }

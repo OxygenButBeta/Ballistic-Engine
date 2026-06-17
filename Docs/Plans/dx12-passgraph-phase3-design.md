@@ -175,6 +175,15 @@ RT_GI/RT_SHADOWS off — pre-existing device-removal, not phase-3's to fix). Bui
 - **D4 — what the FIRST verb set is.** Minimal: `BlitFullscreen(sourceHandle, destHandle, materialOrShader)`
   + `SetRenderTarget(handle)` + read access to `SceneColor`. Just enough for the chunk-19 proof feature
   (tint/invert SceneColor). Every later verb is added on a concrete feature's demand, logged in this doc.
+  - **SHIPPED (chunk 19) — split into TWO backend-agnostic surfaces** (the declare side is NOT the same as
+    the record side): `IFeaturePassRecorder` = { `string SceneColor {get;}`, `SetRenderTarget(string)`,
+    `BlitFullscreen(string src, string dst, string shaderOrMaterial=null)` } (the RECORD-time verbs); and a
+    NEW `IFeatureIOBuilder` = { `Read(string)`, `Write(string)`, `ReadWrite(string)`,
+    `RequestScratch(string roleName)→string`, `AllowCulling(bool)` } (the DECLARE-time verbs `RenderFeature.Declare`
+    uses). Reason for the split: the design (§3) said `Declare` must be engine-agnostic too (string handle
+    names, NOT `Dx12PassBuilder`) — so it needs its own backend-neutral builder interface, parallel to the
+    recorder. Both are string-handle-keyed; the chunk-20 DX12 adapter implements both and maps names→graph
+    handles / `Dx12PassBuilder` reads-writes.
 - **D5 — default `Active`/removability.** A feature defaults `Active=true` when added (URP parity), but the
   WHOLE layer is inert until a `RenderFeatures` SceneBehaviour with ≥1 feature exists in the scene — so the
   golden scenes (which have none) are untouched. The manager early-outs on empty exactly like
@@ -193,8 +202,8 @@ RT_GI/RT_SHADOWS off — pre-existing device-removal, not phase-3's to fix). Bui
 Each sub-chunk = ONE intent, ends with a handoff prompt, gated by §4. Ordered safest→riskiest; the seam is
 proven on a trivial feature BEFORE any real feature is built (the chunk-18 risk call).
 
-- **Chunk 19 — engine-side scaffold (PIXEL-NEUTRAL, no backend wiring yet).** Add the engine-side authoring
-  surface ONLY: `[RenderFeature]` attribute (`Engine/Attributes/`), `RenderFeature` abstract base +
+- **Chunk 19 — engine-side scaffold (PIXEL-NEUTRAL, no backend wiring yet). ✅ DONE.** Add the engine-side
+  authoring surface ONLY: `[RenderFeature]` attribute (`Engine/Attributes/`), `RenderFeature` abstract base +
   `RenderPassEvent` enum + `RenderFeatureManager` + `IFeaturePassRecorder` (`Engine/Rendering/RenderFeatures/`),
   the `RenderFeatures` SceneBehaviour (D2), and the `ComponentRegistry` branch (`RenderFeatureMenu`/
   `ResolveFeature`/`FeatureNameOf`). NOTHING calls into the backend yet; no `IRenderPass` is built. Gate:
@@ -202,6 +211,35 @@ proven on a trivial feature BEFORE any real feature is built (the chunk-18 risk 
   editor 0-err, and **golden 15/15 + GBV 0-NEW are untouched** (no renderer code changed → trivially holds,
   but RUN it to prove the new types didn't perturb bootstrap). Commit. (Pure additive engine scaffold — the
   Volume-framework analogue of "the classes exist, nothing renders yet".)
+  - **WHAT SHIPPED (8 new files + 2 edits):** `Engine/Attributes/RenderFeatureAttribute.cs`
+    (`[RenderFeature("Name", "Menu")]`, `HideFromAddMenu`; mirrors `ComponentAttribute` — `Menu` is a ctor
+    POSITIONAL arg, NOT a named arg: getter-only props can't be named attr args → CS0617, the design's
+    `Menu=…` shorthand was illustrative). `Engine/Rendering/RenderFeatures/`: `RenderPassEvent.cs`
+    (16 members, 0..750, **textually identical** to `Dx12RenderPassEvent` — verified by diff; INVARIANT to
+    keep in lock-step), `RenderFeature.cs` (abstract: `Active` def-true, `virtual Event`=PostProcess,
+    `virtual Declare(IFeatureIOBuilder)` default-empty=opaque escape hatch, abstract `Record(IFeaturePassRecorder)`;
+    params are PLAIN decorated members — NO VolumeParameter, the §2a divergence), `IFeaturePassRecorder.cs`
+    (D4 minimal verbs: `string SceneColor {get;}` + `SetRenderTarget(name)` + `BlitFullscreen(src,dst,shaderOrMaterial?)`),
+    `IFeatureIOBuilder.cs` (engine-agnostic declare surface — `Read/Write/ReadWrite/RequestScratch/AllowCulling`,
+    string handle names, NOT `Dx12PassBuilder`; the backend adapter translates these → `Dx12PassBuilder` in
+    chunk 20), `RenderFeatureManager.cs` (static; `Gather()` returns the active-in-order count, early-outs on
+    no/empty/inactive `RenderFeatures.Active`; `Reset()` ALC-reload hook), `RenderFeatures.cs` (SceneBehaviour,
+    `static Active`, `List<RenderFeature> Features`), `Builtin/SceneColorTintFeature.cs` (the discoverable sample
+    — Tint/Strength plain members, NOT placed in any scene). **Edits:** `ComponentRegistry.cs` (parallel
+    `featureByName`/`featureMenu` + `RenderFeatureMenu`/`ResolveFeature`/`FeatureNameOf` + `RegisterFeature`
+    reading `[RenderFeature]`/`HideFromAddMenu`), `EngineBootstrap.ReloadGameScripts` (`RenderFeatureManager.Reset()`
+    next to `VolumeManager.ResetStack()`).
+  - **D4 verb set as of chunk 19** (grow per concrete feature, log here): RECORDER = { `SceneColor` (read
+    accessor), `SetRenderTarget(handleName)`, `BlitFullscreen(src,dst,shaderOrMaterial?)` }; IO-DECLARE =
+    { `Read`, `Write`, `ReadWrite`, `RequestScratch(roleName)→name`, `AllowCulling(bool)` }. (NEW DESIGN FACT:
+    the engine-agnostic DECLARE surface is split into its own `IFeatureIOBuilder` so `RenderFeature.Declare`
+    never names `Dx12PassBuilder` — the §3 seam needs a backend-neutral declare verb just as it needs a
+    backend-neutral record verb.)
+  - **VERIFIED:** slnx 0-err (editor incl.); scratch harness `bal-feature-test` 16/16 PASS (menu entry +
+    DisplayName/Menu, `ResolveFeature` round-trip + unknown/null→null, `FeatureNameOf` round-trip, abstract base
+    excluded, `Active` def-true, `Event`=PostProcess, enum 16@0..750, `Gather()`==0 with no host); enum diff
+    vs `Dx12RenderPassEvent` empty; golden 15/15 × {default, GRAPH=1, GRAPH+BARRIERS}; GBV CornellBox
+    `8 known, 0 NEW (0 error-class)`.
 
 - **Chunk 20 — the backend BRIDGE + adapter + the PROOF feature (the seam test).** Add
   `Dx12RenderFeatureBridge` + `Dx12FeaturePassAdapter` + a DX12 `IFeaturePassRecorder` impl (the minimal D4

@@ -227,6 +227,9 @@ public sealed class EngineBootstrap {
             DirectionalLight.Clear();
         }
         VolumeManager.ResetStack();
+        // Phase-3 render-feature layer (mirrors VolumeManager.ResetStack): drop the gathered active set so
+        // a collectible-ALC RenderFeature instance can't pin the unloaded assembly across a script reload.
+        RenderFeatureManager.Reset();
 
         // Gameplay-framework reload safety (gate 0c / plan §8.6.2): the InputAction fusion registry is a
         // host-side static root that holds script-ALC InputAction handles — it MUST be cleared before
