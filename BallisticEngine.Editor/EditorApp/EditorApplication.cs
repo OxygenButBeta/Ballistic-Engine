@@ -957,8 +957,9 @@ internal sealed class EditorApplication {
         Scene scene = SceneManager.GetCurrentScene();
 
         if (ImGui.MenuItem("Create Empty")) {
-            EditorUndo.Push("Create Empty");
-            editorState.Select(scene.CreateEntity("Entity"));
+            // F1: structural create routed through the EditorCommands choke point (byte-identical to the
+            // old "Push(); mutate();" -- the snapshot scope is now chosen by EditorCommands, not here).
+            EditorCommands.Structural("Create Empty", () => editorState.Select(scene.CreateEntity("Entity")));
         }
 
         ImGui.Separator();
@@ -980,19 +981,21 @@ internal sealed class EditorApplication {
     }
 
     void CreateWithComponent<T>(string name) where T : Behaviour {
-        EditorUndo.Push($"Create {name}");
-        Entity entity = SceneManager.GetCurrentScene().CreateEntity(name);
-        entity.AddComponent(typeof(T));
-        PlaceInFrontOfCamera(entity);
-        editorState.Select(entity);
+        EditorCommands.Structural($"Create {name}", () => {
+            Entity entity = SceneManager.GetCurrentScene().CreateEntity(name);
+            entity.AddComponent(typeof(T));
+            PlaceInFrontOfCamera(entity);
+            editorState.Select(entity);
+        });
     }
 
     void CreatePrimitive(PrimitiveKind kind) {
-        EditorUndo.Push($"Create {kind}");
-        Entity entity = Primitives.Create(SceneManager.GetCurrentScene(), kind);
-        PlaceInFrontOfCamera(entity);
-        editorState.Select(entity);
-        MarkSceneDirty();
+        EditorCommands.Structural($"Create {kind}", () => {
+            Entity entity = Primitives.Create(SceneManager.GetCurrentScene(), kind);
+            PlaceInFrontOfCamera(entity);
+            editorState.Select(entity);
+            MarkSceneDirty();
+        });
     }
 
     void PlaceInFrontOfCamera(Entity entity) {
@@ -1966,11 +1969,14 @@ internal sealed class EditorApplication {
         if (selected is null)
             return;
 
-        EditorUndo.Push("Align To View");
+        // Single-entity transform edit -> scoped through EditorCommands.EditEntity (PushEntity: the
+        // selection survives and no scene-wide IrradianceVolume re-bake fires). Byte-identical mutate.
         Transform cam = editorCamera.Transform;
-        selected.transform.Position = cam.Position;
-        selected.transform.Rotation = cam.Rotation;
-        MarkSceneDirty();
+        EditorCommands.EditEntity(selected, "Align To View", () => {
+            selected.transform.Position = cam.Position;
+            selected.transform.Rotation = cam.Rotation;
+            MarkSceneDirty();
+        });
     }
 
     // Ctrl+C: remember the selected entity for a later paste (clone-on-paste, Unity-style).
@@ -1985,11 +1991,14 @@ internal sealed class EditorApplication {
         if (!EditorClipboard.HasCopy)
             return;
 
-        EditorUndo.Push("Paste");
-        if (EditorClipboard.Paste(SceneManager.GetCurrentScene()) is { } copy) {
-            editorState.Select(copy);
-            MarkSceneDirty();
-        }
+        // Structural create (the pasted clone is a new entity). The snapshot fires at the same point as
+        // before -- after the HasCopy guard, before Paste runs -- so undo is byte-identical.
+        EditorCommands.Structural("Paste", () => {
+            if (EditorClipboard.Paste(SceneManager.GetCurrentScene()) is { } copy) {
+                editorState.Select(copy);
+                MarkSceneDirty();
+            }
+        });
     }
 
     unsafe void GameTabContents() {
