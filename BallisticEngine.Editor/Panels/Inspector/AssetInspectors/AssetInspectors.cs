@@ -34,8 +34,33 @@ namespace BallisticEngine.Editor.Inspector.AssetInspectors;
 [AssetInspector(".hdr")]
 [AssetInspector(".exr")]
 internal sealed class TextureAssetInspector : IAssetInspector {
-    public void Draw(in AssetInspectorContext ctx) =>
-        InspectorPanel.DrawTextureImportSettings(ctx.Path, ctx.Guid, ctx.Meta);
+    public void Draw(in AssetInspectorContext ctx) => DrawTextureImportSettings(ctx.Path, ctx.Guid, ctx.Meta);
+
+    static void DrawTextureImportSettings(string path, Guid guid, MetaFile meta) {
+        if (meta is null) {
+            ImGui.TextDisabled("No import settings.");
+            return;
+        }
+
+        if (InspectorPanel.BeginGrid("##texsettings")) {
+            InspectorPanel.Row("Texture Type");
+            TextureType current = TextureImporter.TypeFromSettings(meta.Settings);
+            string[] names = Enum.GetNames<TextureType>();
+            int index = Array.IndexOf(names, current.ToString());
+            ImGui.SetNextItemWidth(-1);
+            if (ImGui.Combo("##textype", ref index, names, names.Length)) {
+                meta.Settings["textureType"] = names[index];
+                meta.Save(MetaFile.PathFor(AssetDatabase.Project.ResolveAbsolute(path)));
+                Guid reimported = guid;
+                AsyncAssetImport.Request("Reimporting texture...",
+                    onFinished: () => AssetDatabase.Invalidate(reimported));
+            }
+            ImGui.EndTable();
+        }
+
+        ImGui.Spacing();
+        ImGui.TextDisabled("Changing the type reimports. Loaded materials keep the\nold instance until the scene reloads.");
+    }
 }
 
 [AssetInspector(".mat")]
@@ -232,20 +257,34 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
 
 [AssetInspector(".volume")]
 internal sealed class VolumeProfileAssetInspector : IAssetInspector {
-    public void Draw(in AssetInspectorContext ctx) =>
-        InspectorPanel.DrawVolumeProfileAsset(ctx.Guid);
+    public void Draw(in AssetInspectorContext ctx) => DrawVolumeProfileAsset(ctx.Guid);
+
+    static void DrawVolumeProfileAsset(Guid guid) {
+        var profile = AssetDatabase.Load<VolumeProfile>(guid);
+        if (profile is null) {
+            ImGui.TextDisabled("Unreadable volume profile.");
+            return;
+        }
+
+        if (VolumeProfileEditor.Draw(profile))
+            VolumeProfileEditor.SaveToAsset(profile);
+    }
 }
 
 [AssetInspector(".scene")]
 internal sealed class SceneAssetInspector : IAssetInspector {
-    public void Draw(in AssetInspectorContext ctx) =>
-        InspectorPanel.DrawSceneAssetActions(ctx.Path);
+    public void Draw(in AssetInspectorContext ctx) => DrawSceneAssetActions(ctx.Path);
+
+    static void DrawSceneAssetActions(string path) {
+        if (ImGui.Button($"{EditorIcons.Play}  Open Scene", new SysVec2(-1, 0)))
+            SceneCommands.Open(path);
+    }
 }
 
 [AssetInspector(".pyscene")]
 internal sealed class PysceneAssetInspector : IAssetInspector {
     public void Draw(in AssetInspectorContext ctx) =>
-        InspectorPanel.DrawPysceneHint();
+        ImGui.TextWrapped("Falcor scene. On import it generates a sibling .scene you can open.");
 }
 
 // Native text assets — a hint + Show-in-Explorer. Covers the .shader/.glsl/.cubemap group.
@@ -253,32 +292,151 @@ internal sealed class PysceneAssetInspector : IAssetInspector {
 [AssetInspector(".glsl")]
 [AssetInspector(".cubemap")]
 internal sealed class TextAssetInspector : IAssetInspector {
-    public void Draw(in AssetInspectorContext ctx) =>
-        InspectorPanel.DrawTextAssetHint(ctx.Path);
+    public void Draw(in AssetInspectorContext ctx) => DrawTextAssetHint(ctx.Path);
+
+    // Native text assets: show a hint but no noisy "unsupported" line.
+    static void DrawTextAssetHint(string path) {
+        ImGui.TextDisabled("Edit this file in a text editor.");
+        if (ImGui.Button($"{EditorIcons.FolderOpen}  Show in Explorer", new SysVec2(-1, 0)))
+            System.Diagnostics.Process.Start("explorer.exe",
+                $"/select,\"{AssetDatabase.Project.ResolveAbsolute(path)}\"");
+    }
 }
 
+// Prefab inspector: its captured entity tree (read-only) + an Instantiate-into-scene action.
+// The backend is capture/instantiate (no live instance overrides), so this views the asset and
+// plants copies; editing happens by instantiating, changing in the scene, and re-creating.
 [AssetInspector(".prefab")]
 internal sealed class PrefabAssetInspector : IAssetInspector {
-    public void Draw(in AssetInspectorContext ctx) =>
-        ctx.Panel.DrawPrefabInspector(ctx.Path);
+    public void Draw(in AssetInspectorContext ctx) => DrawPrefabInspector(ctx.Panel, ctx.Path);
+
+    static void DrawPrefabInspector(InspectorPanel panel, string path) {
+        PrefabAsset prefab = AssetDatabase.Load<PrefabAsset>(path);
+        if (prefab is null) {
+            ImGui.TextDisabled("Could not load prefab.");
+            return;
+        }
+
+        if (ImGui.Button($"{EditorIcons.Add}  Instantiate into Scene", new SysVec2(-1, 0))) {
+            // Plants a new entity tree into the scene -> whole-scene Structural snapshot.
+            EditorCommands.Structural("Instantiate Prefab", () => {
+                Entity root = prefab.Instantiate();
+                if (root is not null)
+                    panel.Select(root);
+                panel.MarkViewportDirty();
+            });
+        }
+
+        ImGui.Spacing();
+        ImGui.TextDisabled($"Contents ({prefab.Entities.Count} entit{(prefab.Entities.Count == 1 ? "y" : "ies")})");
+        ImGui.Separator();
+        foreach (var doc in prefab.Entities) {
+            float indent = doc.Transform?.Parent is null ? 0 : 16f;
+            if (indent > 0) ImGui.Indent(indent);
+            ImGui.TextUnformatted($"{EditorIcons.Package}  {doc.Name}");
+            if (indent > 0) ImGui.Unindent(indent);
+        }
+    }
 }
 
+// DataAsset inspector: reflect the loaded instance through the SAME member list the component
+// inspector uses (honors [Range]/[Header]/[Tooltip]/[FoldoutGroup]/asset pickers). Edits write
+// straight back to the .asset file via DataAssetSerializer: an asset edit, not scene state, so NO
+// scene undo (the .volume edit-write-back pattern). Change is detected by a serialized-text diff.
 [AssetInspector(".asset")]
 internal sealed class DataAssetInspector : IAssetInspector {
-    public void Draw(in AssetInspectorContext ctx) =>
-        ctx.Panel.DrawDataAssetInspector(ctx.Path);
+    public void Draw(in AssetInspectorContext ctx) => DrawDataAssetInspector(ctx.Panel, ctx.Path);
+
+    // The DataAsset (ScriptableObject-equivalent) currently being edited, cached so edits accumulate
+    // on one instance; reloaded when the selected .asset path changes. Was instance state on InspectorPanel;
+    // the registry's single shared inspector instance owns the same single cache (RW1.4).
+    string dataAssetPath;
+    object dataAssetInstance;
+
+    void DrawDataAssetInspector(InspectorPanel panel, string path) {
+        if (dataAssetPath != path || dataAssetInstance is null) {
+            dataAssetPath = path;
+            dataAssetInstance = LoadDataAsset(path);
+        }
+        if (dataAssetInstance is not DataAsset asset) {
+            ImGui.TextDisabled("Could not load data asset (unknown or renamed type?).");
+            return;
+        }
+
+        string before = DataAssetSerializer.Serialize(asset);
+        panel.DrawMemberList(asset.GetType(), asset);
+        string after = DataAssetSerializer.Serialize(asset);
+        if (before != after)
+            SaveDataAsset(path, asset);
+    }
+
+    static object LoadDataAsset(string path) {
+        try { return AssetDatabase.Load<DataAsset>(path); }
+        catch { return null; }
+    }
+
+    static void SaveDataAsset(string path, DataAsset instance) {
+        try {
+            File.WriteAllText(AssetDatabase.Project.ResolveAbsolute(path),
+                DataAssetSerializer.Serialize(instance));
+        }
+        catch (Exception e) {
+            Debugging.LogError($"Could not save data asset: {e.Message}");
+        }
+    }
 }
 
+// Audio asset view: a Preview/Stop button + clip stats, so you can audition a .wav/.ogg straight
+// from the asset browser without dropping it on an AudioSource. Same Audio facade as the component
+// preview (play-mode-independent; silent no-op with no audio device). Shares the audioPreviewVoice
+// static on InspectorPanel with the AudioSource component preview (RW1.3).
 [AssetInspector(".wav")]
 [AssetInspector(".wave")]
 [AssetInspector(".ogg")]
 internal sealed class AudioClipAssetInspector : IAssetInspector {
-    public void Draw(in AssetInspectorContext ctx) =>
-        ctx.Panel.DrawAudioClipAsset(ctx.Path);
+    public void Draw(in AssetInspectorContext ctx) => DrawAudioClipAsset(ctx.Path);
+
+    static void DrawAudioClipAsset(string path) {
+        AudioClip clip = AssetDatabase.Load<AudioClip>(path);
+        if (clip is null) {
+            ImGui.TextDisabled("Could not load audio clip.");
+            return;
+        }
+
+        ImGui.SeparatorText("Preview");
+        bool playing = InspectorPanel.audioPreviewVoice is { IsPlaying: true };
+        if (ImGui.Button(playing ? $"{EditorIcons.Pause}  Stop" : $"{EditorIcons.Play}  Play",
+                new SysVec2(120, 0))) {
+            InspectorPanel.audioPreviewVoice?.Stop();
+            InspectorPanel.audioPreviewVoice = playing ? null : Audio.Play(clip);
+        }
+        ImGui.SameLine();
+        ImGui.TextDisabled($"{clip.DurationSeconds:F1}s  -  {clip.Channels}ch  -  {clip.SampleRate} Hz");
+        if (!Audio.IsAvailable)
+            ImGui.TextDisabled("(no audio device on this machine - preview is silent)");
+    }
 }
 
+// Animation-clip asset view: clip stats. A skeletal pose preview needs a skinned mesh to drive,
+// which an asset-only view doesn't have - assign the clip to an Animator on a skinned entity and
+// use the Animator scrub. Here we just summarize the clip.
 [AssetInspector(".banim")]
 internal sealed class AnimationClipAssetInspector : IAssetInspector {
-    public void Draw(in AssetInspectorContext ctx) =>
-        ctx.Panel.DrawAnimationClipAsset(ctx.Path);
+    public void Draw(in AssetInspectorContext ctx) => DrawAnimationClipAsset(ctx.Path);
+
+    static void DrawAnimationClipAsset(string path) {
+        AnimationClip clip = AssetDatabase.Load<AnimationClip>(path);
+        if (clip is null) {
+            ImGui.TextDisabled("Could not load animation clip.");
+            return;
+        }
+
+        ImGui.SeparatorText("Animation");
+        ImGui.TextDisabled($"Duration: {clip.DurationSeconds:F2}s");
+        ImGui.TextDisabled($"Channels (animated bones): {clip.Data.Channels.Length}");
+        ImGui.TextDisabled($"Ticks/sec: {clip.TicksPerSecond:F0}");
+        ImGui.Spacing();
+        ImGui.TextWrapped("Assign this clip to an Animator on a skinned mesh, then use the Animator's " +
+            "scrub slider to preview the pose.");
+    }
 }

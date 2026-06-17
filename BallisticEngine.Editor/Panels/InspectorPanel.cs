@@ -110,6 +110,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // `ctx.Panel.MarkViewportDirty()` — byte-identical, no behaviour change.
     internal void MarkViewportDirty() => state.MarkViewportDirty();
 
+    // RW1.4: the relocated PrefabAssetInspector body (Inspector/AssetInspectors/) selects the instantiated
+    // root through this passthrough (was `state.Select(root)`), same private-EditorState reach as above.
+    internal void Select(Entity entity) => state.Select(entity);
+
     // B4: the AssetSlotDrawer terminal drawer hands its IProperty here; unwrap the reflected member/owner/type
     // and reuse the unchanged DrawAssetSlot rendering (byte-identical to the old IsSpecialWidgetType arm).
     void IComponentInspectorHost.DrawAssetSlot(Inspector.IProperty property) {
@@ -935,9 +939,9 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // RW1.3: DrawTerrainBrushSection body MOVED into TerrainPreview
     // (Inspector/Preview/ComponentPreviews.cs).
 
-    // AudioSource/clip preview voice + scrub state. The component preview (AudioSourcePreview, RW1.3)
-    // AND the .wav asset-clip preview (DrawAudioClipAsset, an RW1.4 body still inline here) share these,
-    // so they stay on InspectorPanel as internal statics and are reached from the moved preview.
+    // AudioSource/clip preview voice + scrub state. The component preview (AudioSourcePreview, RW1.3) AND
+    // the .wav asset-clip preview (AudioClipAssetInspector, RW1.4) share these, so they stay on InspectorPanel
+    // as internal statics and are reached as InspectorPanel.audioPreviewVoice from both relocated bodies.
     internal static IAudioVoice audioPreviewVoice;
     internal static float audioPreviewTime;   // scrub-slider position (seconds), persists between previews
 
@@ -2065,18 +2069,8 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         return clicked;
     }
 
-    // Selected .volume asset: edit the live profile instance directly (every Volume referencing
-    // it sees the change immediately) and persist on change.
-    internal static void DrawVolumeProfileAsset(Guid guid) {
-        var profile = AssetDatabase.Load<VolumeProfile>(guid);
-        if (profile is null) {
-            ImGui.TextDisabled("Unreadable volume profile.");
-            return;
-        }
-
-        if (VolumeProfileEditor.Draw(profile))
-            VolumeProfileEditor.SaveToAsset(profile);
-    }
+    // RW1.4: DrawVolumeProfileAsset body MOVED into VolumeProfileAssetInspector
+    // (Inspector/AssetInspectors/AssetInspectors.cs).
 
     static string[] CompatibleExtensions(Type assetType) {
         if (assetType is null) return [];
@@ -2331,11 +2325,11 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // ---- Asset inspector -----------------------------------------------------
 
     // B2 (Rule 1): the asset inspector resolves the custom body for the selected asset's extension from
-    // AssetInspectorRegistry instead of the old `switch (ext)` god-switch. Each former case is now a
-    // self-registering [AssetInspector(".ext")] class whose Draw delegates back into the section methods below
-    // (still here, now internal) so the rendering is byte-identical, only the DISPATCH moved. An extension with
-    // NO registered inspector draws only the file header above (R1.9's never-blank fallback, byte-identical to
-    // the old "just the file header, no clutter" default for models etc.).
+    // AssetInspectorRegistry instead of the old `switch (ext)` god-switch. Each former case is a
+    // self-registering [AssetInspector(".ext")] class that OWNS its section body (RW1.4 moved every body out of
+    // this panel into the shims; render byte-identical). An extension with NO registered inspector draws only
+    // the file header above (R1.9's never-blank fallback, byte-identical to the old "just the file header, no
+    // clutter" default for models etc.).
     void DrawAssetInspector() {
         var path = state.SelectedAssetPath;
         Guid guid = state.SelectedAssetGuid;
@@ -2349,138 +2343,11 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         inspector?.Draw(new AssetInspectorContext(this, path, guid, ext, meta));
     }
 
-    // The three former inline switch cases extracted as section methods (a structural MOVE, byte-identical to
-    // the inline bodies) so their [AssetInspector] shims can delegate to them like the rest. Internal so the
-    // host-assembly inspector classes reach them.
-    internal static void DrawSceneAssetActions(string path) {
-        if (ImGui.Button($"{EditorIcons.Play}  Open Scene", new SysVec2(-1, 0)))
-            OpenScene(path);
-    }
-
-    internal static void DrawPysceneHint() =>
-        ImGui.TextWrapped("Falcor scene. On import it generates a sibling .scene you can open.");
-
-    // Native text assets: show a hint but no noisy "unsupported" line.
-    internal static void DrawTextAssetHint(string path) {
-        ImGui.TextDisabled("Edit this file in a text editor.");
-        if (ImGui.Button($"{EditorIcons.FolderOpen}  Show in Explorer", new SysVec2(-1, 0)))
-            System.Diagnostics.Process.Start("explorer.exe",
-                $"/select,\"{AssetDatabase.Project.ResolveAbsolute(path)}\"");
-    }
-
-    // Audio asset view: a Preview/Stop button + clip stats, so you can audition a .wav/.ogg straight
-    // from the asset browser without dropping it on an AudioSource. Same Audio facade as the component
-    // preview (play-mode-independent; silent no-op with no audio device).
-    internal void DrawAudioClipAsset(string path) {
-        AudioClip clip = AssetDatabase.Load<AudioClip>(path);
-        if (clip is null) {
-            ImGui.TextDisabled("Could not load audio clip.");
-            return;
-        }
-
-        ImGui.SeparatorText("Preview");
-        bool playing = audioPreviewVoice is { IsPlaying: true };
-        if (ImGui.Button(playing ? $"{EditorIcons.Pause}  Stop" : $"{EditorIcons.Play}  Play",
-                new SysVec2(120, 0))) {
-            audioPreviewVoice?.Stop();
-            audioPreviewVoice = playing ? null : Audio.Play(clip);
-        }
-        ImGui.SameLine();
-        ImGui.TextDisabled($"{clip.DurationSeconds:F1}s  -  {clip.Channels}ch  -  {clip.SampleRate} Hz");
-        if (!Audio.IsAvailable)
-            ImGui.TextDisabled("(no audio device on this machine - preview is silent)");
-    }
-
-    // Animation-clip asset view: clip stats. A skeletal pose preview needs a skinned mesh to drive,
-    // which an asset-only view doesn't have - assign the clip to an Animator on a skinned entity and
-    // use the Animator scrub. Here we just summarize the clip.
-    internal void DrawAnimationClipAsset(string path) {
-        AnimationClip clip = AssetDatabase.Load<AnimationClip>(path);
-        if (clip is null) {
-            ImGui.TextDisabled("Could not load animation clip.");
-            return;
-        }
-
-        ImGui.SeparatorText("Animation");
-        ImGui.TextDisabled($"Duration: {clip.DurationSeconds:F2}s");
-        ImGui.TextDisabled($"Channels (animated bones): {clip.Data.Channels.Length}");
-        ImGui.TextDisabled($"Ticks/sec: {clip.TicksPerSecond:F0}");
-        ImGui.Spacing();
-        ImGui.TextWrapped("Assign this clip to an Animator on a skinned mesh, then use the Animator's " +
-            "scrub slider to preview the pose.");
-    }
-
-    // Prefab inspector: its captured entity tree (read-only) + an Instantiate-into-scene action.
-    // The backend is capture/instantiate (no live instance overrides), so this views the asset and
-    // plants copies; editing happens by instantiating, changing in the scene, and re-creating.
-    internal void DrawPrefabInspector(string path) {
-        PrefabAsset prefab = AssetDatabase.Load<PrefabAsset>(path);
-        if (prefab is null) {
-            ImGui.TextDisabled("Could not load prefab.");
-            return;
-        }
-
-        if (ImGui.Button($"{EditorIcons.Add}  Instantiate into Scene", new SysVec2(-1, 0))) {
-            // Plants a new entity tree into the scene -> whole-scene Structural snapshot.
-            EditorCommands.Structural("Instantiate Prefab", () => {
-                Entity root = prefab.Instantiate();
-                if (root is not null)
-                    state.Select(root);
-                state.MarkViewportDirty();
-            });
-        }
-
-        ImGui.Spacing();
-        ImGui.TextDisabled($"Contents ({prefab.Entities.Count} entit{(prefab.Entities.Count == 1 ? "y" : "ies")})");
-        ImGui.Separator();
-        foreach (var doc in prefab.Entities) {
-            float indent = doc.Transform?.Parent is null ? 0 : 16f;
-            if (indent > 0) ImGui.Indent(indent);
-            ImGui.TextUnformatted($"{EditorIcons.Package}  {doc.Name}");
-            if (indent > 0) ImGui.Unindent(indent);
-        }
-    }
-
-    // The DataAsset (ScriptableObject-equivalent) currently being edited, cached so edits accumulate
-    // on one instance; reloaded when the selected .asset path changes.
-    string dataAssetPath;
-    object dataAssetInstance;
-
-    // DataAsset inspector: reflect the loaded instance through the SAME member list the component
-    // inspector uses (honors [Range]/[Header]/[Tooltip]/[FoldoutGroup]/asset pickers). Edits write
-    // straight back to the .asset file via DataAssetSerializer: an asset edit, not scene state, so NO
-    // scene undo (the .volume edit-write-back pattern). Change is detected by a serialized-text diff.
-    internal void DrawDataAssetInspector(string path) {
-        if (dataAssetPath != path || dataAssetInstance is null) {
-            dataAssetPath = path;
-            dataAssetInstance = LoadDataAsset(path);
-        }
-        if (dataAssetInstance is not DataAsset asset) {
-            ImGui.TextDisabled("Could not load data asset (unknown or renamed type?).");
-            return;
-        }
-
-        string before = DataAssetSerializer.Serialize(asset);
-        DrawMemberList(asset.GetType(), asset);
-        string after = DataAssetSerializer.Serialize(asset);
-        if (before != after)
-            SaveDataAsset(path, asset);
-    }
-
-    static object LoadDataAsset(string path) {
-        try { return AssetDatabase.Load<DataAsset>(path); }
-        catch { return null; }
-    }
-
-    static void SaveDataAsset(string path, DataAsset instance) {
-        try {
-            File.WriteAllText(AssetDatabase.Project.ResolveAbsolute(path),
-                DataAssetSerializer.Serialize(instance));
-        }
-        catch (Exception e) {
-            Debugging.LogError($"Could not save data asset: {e.Message}");
-        }
-    }
+    // RW1.4: every former asset-inspector section body (scene/pyscene/text-hint, audio/animation clip,
+    // prefab, data-asset + its cache fields & Load/SaveDataAsset helpers) MOVED into its
+    // [AssetInspector(".ext")] shim in Inspector/AssetInspectors/AssetInspectors.cs — byte-identical render,
+    // only the home changed. The shims reach the panel through ctx.Panel (DrawMemberList / MarkViewportDirty /
+    // Select) and the audioPreviewVoice static; the DataAsset cache now lives on the shim's single instance.
 
     // Big type icon + bold file name + dim path/importer lines, divided from the body.
     static unsafe void DrawAssetHeader(string path, string ext, MetaFile meta) {
@@ -2508,31 +2375,8 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         ImGui.Separator();
     }
 
-    internal static void DrawTextureImportSettings(string path, Guid guid, MetaFile meta) {
-        if (meta is null) {
-            ImGui.TextDisabled("No import settings.");
-            return;
-        }
-
-        if (BeginGrid("##texsettings")) {
-            Row("Texture Type");
-            TextureType current = TextureImporter.TypeFromSettings(meta.Settings);
-            string[] names = Enum.GetNames<TextureType>();
-            int index = Array.IndexOf(names, current.ToString());
-            ImGui.SetNextItemWidth(-1);
-            if (ImGui.Combo("##textype", ref index, names, names.Length)) {
-                meta.Settings["textureType"] = names[index];
-                meta.Save(MetaFile.PathFor(AssetDatabase.Project.ResolveAbsolute(path)));
-                Guid reimported = guid;
-                AsyncAssetImport.Request("Reimporting texture...",
-                    onFinished: () => AssetDatabase.Invalidate(reimported));
-            }
-            ImGui.EndTable();
-        }
-
-        ImGui.Spacing();
-        ImGui.TextDisabled("Changing the type reimports. Loaded materials keep the\nold instance until the scene reloads.");
-    }
+    // RW1.4: DrawTextureImportSettings body MOVED into TextureAssetInspector
+    // (Inspector/AssetInspectors/AssetInspectors.cs).
 
     // DrawMaterialEditor + DrawMaterialPreview + the material-preview cache fields + ReferenceToPath /
     // ApplyLiveMaterial / LoadSlot moved to MaterialAssetInspector (Inspector/AssetInspectors/) in RW1.4 — the
@@ -2556,8 +2400,6 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         ImGui.EndDragDropTarget();
         return accepted;
     }
-
-    static void OpenScene(string assetPath) => SceneCommands.Open(assetPath);
 
     // ---- Layout helpers --------------------------------------------------------
 
