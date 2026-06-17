@@ -375,13 +375,26 @@ proven on a trivial feature BEFORE any real feature is built (the chunk-18 risk 
     launched in a loop; the widget compiles clean and follows the proven `DrawAddComponentPopup` idiom
     verbatim. Commit.
 
-- **Chunk 23 — phase-3 DoD + acceptance doc + (optionally) one REAL example feature.** Write
+- **Chunk 23 — phase-3 DoD + acceptance doc + (optionally) one REAL example feature. ✅ DONE.** Wrote
   `dx12-passgraph-phase3-done.md`: the seam is proven, a feature is authorable without referencing DX12,
   discovered/serialized/editor-reorderable, participates in the graph (declare→cull/alias/barriers), and the
-  no-feature default is byte-identical to golden under all gates. OPTIONALLY ship one genuinely useful
-  example feature (e.g. a custom outline or a screen-space tint volume-driven) to validate the verb set on
-  real work — its own move/fix-split commits, golden-neutral when absent. Then phase 3 (and the whole
-  pass-graph migration) is DONE.
+  no-feature default is byte-identical to golden under all gates.
+  - **ACCEPTANCE (the doc, §1):** all FIVE §7 DoD items met with delivering commits + oracle —
+    1 discovered (chunk 19 `6c25ce6e`), 2 authored (chunk 19 + 22 `fc4be698`), 3 serialized (chunk 21
+    `0c30b259`), 4 scheduled (chunk 20 `c58ef059`/`f4c8474f`), 5 pixel-neutral-default (all chunks; the
+    proof feature supplies the positive+removability test the golden set can't).
+  - **OPTIONAL example feature — CONSCIOUSLY DECLINED (doc §2):** the §6 example's only job ("validate the
+    verb set on real work, golden-neutral when absent") is ALREADY met by the shipped `SceneColorTintFeature`
+    (a real `RenderFeature` driving a real DX12 PSO, proven env-door + serialized, inert/golden-neutral when
+    absent). A NEW always-on example would be either pixel-changing (breaks this chunk's golden gate) or inert
+    (redundant with the proof feature) → adds maintained surface for zero proven need (subtract-complexity
+    doctrine). Declined; golden preserved. The authoring path is open + proven for a real game's first custom
+    pass (that feature's verification is its own concern).
+  - **VERIFIED (chunk 23, fresh on the pinned substrate):** build DX12→Runtime (0-err) + DLL→Cli+Runtime bins;
+    `bal render` CornellBox + BistroInterior_Wine under default AND `GRAPH=1` = **4/4 SHA==golden**
+    (`6e3ee554…` / `40a68b28…`); GBV CornellBox (Runtime.exe, `DEBUG=1 GBV=1 BREAK_ON_ERROR=1`) = exit 0,
+    **`8 known, 0 NEW (0 error-class)`**, no device-removal. Doc-only chunk → golden byte-identical by
+    construction. **Phase 3 — and the whole pass-graph migration (phases 1+2+3) — is DONE + ACCEPTED.** Commit.
 
 A sub-chunk that runs long stops, commits what's clean, and the handoff carries the partial state — the
 chat boundary is the rollback boundary. Verb-set growth (D4) and any new design fact are recorded in THIS
