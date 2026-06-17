@@ -41,6 +41,17 @@ public sealed class Harness {
         failures.Add($"{name} — got [{string.Join(", ", a.Select(t => t.Name))}] expected [{string.Join(", ", expected.Select(t => t.Name))}]");
     }
 
+    // Assert a string sequence equals the expected order exactly (the property model's ordering checks
+    // produce string keys, not Types — CheckSequence is Type-only).
+    public void CheckStrings(string name, IEnumerable<string> actual, params string[] expected) {
+        var a = actual.ToArray();
+        if (a.SequenceEqual(expected)) {
+            passed++;
+            return;
+        }
+        failures.Add($"{name} — got [{string.Join(", ", a)}] expected [{string.Join(", ", expected)}]");
+    }
+
     // Print the summary and return the process exit code (0 = all passed, else the failure count).
     public int Report(string suite) {
         int total = passed + failures.Count;
