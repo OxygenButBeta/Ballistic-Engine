@@ -36,11 +36,19 @@ Bu fixture'lar R1.0 (MaterialId bug repro) için ayrıca üretilecek (plan R0.0b
 
 ## R0.2 — Payda (frame budget denominator)
 
-- **Render çözünürlüğü:** 1920×1080 native (headless `Dx12HeadlessRuntime` default). Hedef model: 1080p iç-render
-  → (ileride) TSR/FSR 4K, Lumen modeli.
+> ⚠ **SUPERSEDED (2026-06-18).** Bu R0.2 bölümü SIRA-DIŞI koşan önceki worker'ın notuydu (gerçek R0
+> baseline'ından ÖNCE). Doğru/güncel R0.2 ölçümü artık **`gi-pragmatic-revival-plan.md` → "R0.2 measured"
+> bloğunda**: (a) "TSR/FSR 4K Lumen model" satırı GEVŞEKTİ — motor SADECE **FSR** taşıyor (TSR YOK; `UpscaleMode`
+> enum + `Upscaling` volume + `Dx12FsrPass`), (b) bu doc'un GTX-1660 ekstrapolasyonu rev3+ min-hedefiyle ÇELİŞİR
+> (hedef **RTX 2060**, 1660 değil). Aşağıdaki orijinal satırlar kayıt için bırakıldı; KARAR plan'daki blok.
+
+- **Render çözünürlüğü:** 1920×1080 native (headless `Dx12HeadlessRuntime` default). ~~Hedef model: 1080p iç-render
+  → (ileride) TSR/FSR 4K, Lumen modeli.~~ → **FSR (TSR değil)**; bkz plan R0.2 measured (1).
 - **Frame bütçesi:** 60fps = **16.6 ms** / 30fps = **33 ms**.
-- **GI'ya kalan = 16.6 − (direkt ışık + gölge + post).** RX 9070 XT'de bu pay BÜYÜK (toplam non-GI pass ~0.05–0.3ms,
-  cpuFrame ~2.4–4ms GI-off) — dev kartta sığma sorunu yok. **Asıl payda kısıtı hedef-GPU'da** (R0.4).
+- **GI'ya kalan = 16.6 − (direkt ışık + gölge + post).** RX 9070 XT'de bu pay BÜYÜK (non-GI cpuFrame ~3.3–4.7ms GI-off,
+  yeniden ölçüldü 2026-06-18 CornellBox/LightTest/SunTemple) — dev kartta sığma sorunu yok. **Asıl payda kısıtı
+  hedef-GPU'da (RTX 2060, GTX-1660 DEĞİL)** — plan R0.2 measured (4): modeled 2060'ta ağır yol için **FSR ZORUNLU**,
+  60fps@1080p-native CREDIBLE DEĞİL; hedef 30fps@native veya 60fps@FSR.
 
 ## R0.3 — 4(+1)-senaryo baseline (GI-isolate A/B, RX 9070 XT, frame 60, paused+deterministic)
 

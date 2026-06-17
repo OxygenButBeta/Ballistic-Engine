@@ -45,6 +45,33 @@
 
 **DoD met:** No load-bearing claim consumed without a same-session re-grep. **Bridge target confirmed `Off`** (HEAD==tree, lines 66-76). No code changed in this chunk.
 
+### R0.2 measured (the denominator — 2026-06-18, same-session `git`/`grep`/`read` + headless GI-OFF perf)
+> PROVISIONAL POLICY applied: re-measured every load-bearing claim against the tree. **NO code change** — measurement chunk. The pre-existing `gi-revival-R0-baseline.md` §R0.2 was written by the OUT-OF-ORDER prior worker (before this R0 run) and is **superseded here**: its "TSR/FSR 4K, Lumen model" line was loose, and its GTX-1660 extrapolation contradicts the rev3+ min target (RTX **2060**, not 1660). The numbers below replace it.
+
+**(1) Upscaler is FSR, NOT TSR — confirmed in tree.** `Abstraction/Rendering/PostProcessSettings.cs:52-59` `enum UpscaleMode { Off, NativeAA(1.0x), Quality(1.5x), Balanced(1.7x), Performance(2.0x), UltraPerformance(3.0x) }` (per-dimension ratios), default `UpscaleMode.Off` (`:133`). Wired via the `Upscaling` volume component (`Engine/Rendering/Volumes/Components/Upscaling.cs` — "AMD FidelityFX FSR") → `Dx12FsrPass` / `Dx12FsrUpscaler` / `native/fsr/`. **No TSR anywhere.** FSR temporal pass REPLACES TAA when mode≠Off.
+
+**(2) Target res + frame budget.** Render substrate = **1920×1080** (headless `Dx12HeadlessRuntime` default; same res the noise-floor json pins). With FSR the 1080p can be EITHER the display target reconstructed from a lower internal res (e.g. Quality → 720p internal → 1080p), OR the internal res reconstructed to 4K — both supported; the budget here is pinned to the **measured 1920×1080 native render** (`UpscaleMode.Off`, what headless actually does). Frame budget: **60fps = 16.6 ms / 30fps = 33.3 ms.**
+
+**(3) Non-GI cost measured (GI-OFF, RX 9070 XT, headless paused frame 60, `BALLISTIC_DX12_SSGI=0 BALLISTIC_FX_SSGI=0`).** ⚠ **HONEST TOOLING CAVEAT:** the only headless GPU signal is `bal perf`/`BALLISTIC_STATS_OUT`: `cpuFrameMs` (full-frame CPU submit wall-time) + `gpuPasses[]` (per-pass **CPU stopwatch** around submit+fence-wait, NOT GPU timestamp queries — `gpuFrameMs` is always 0; "per-pass GPU ms is a DX12 follow-up", CLAUDE.md). Under the pipelined frame (P0a) the per-pass wall-times are ~0.02ms each (fence-wait ≈ 0), so they UNDER-report true GPU exec — use `cpuFrameMs` as the frame proxy, not the pass sum.
+
+| Scene (available locally) | tris | draws | non-GI cpuFrameMs | graph post-pass sum (excl GI[absent]+Refl) | Refl pass ms |
+|---|---|---|---|---|---|
+| CornellBox | 86 | 1 | 4.74 | ~0.10 | 0.046 |
+| LightTest | 1.5k | 2 | 4.62 | ~0.09 | 0.018 |
+| SunTemple | 606k | 1 | 3.25 | ~0.08 | 0.015 |
+
+⚠ **Bistro (Interior_Wine / Exterior) = the heavy real-content scenes — gitignored 1.6GB, NOT present locally** (CLAUDE.md repo-facts). The prior baseline doc's Bistro numbers (cpuFrame 7.0–7.4ms GI-on / ~4.0ms GI-off) were measured by a worker who had Bistro; **here they are an OPEN ITEM** — whoever has Bistro re-measures non-GI there (it dominates the real-content denominator). The 3 local scenes are CPU-submit-bound (trivial geometry) so their non-GI cpuFrameMs ≈ **3.3–4.7 ms** is a FLOOR, not the heavy-scene cost.
+
+**(4) GI budget X (PRELIMINARY, pre-R1.0 — WILL TIGHTEN after R1.0; pessimistic X is the gate).**
+- **GI-side cost (RX 9070 XT, from §0 + prior baseline, re-grepped):** §0 table SSGI ~4 ms · DDGI ~0.41 · screen-probe ~0.63 · RT-refl ~1.5–2. Prior baseline measured GI-pass cpuFrame ~3.2–4.2 ms (SSGI path only; **stale-but-cited**, re-measured at R0.3 GI-ON + post-R1.0).
+- **X on the dev card (RX 9070 XT)** = 16.6 − non-GI. Non-GI ≈ 3.3–4.7 ms (local floor) → **X ≈ 12–13 ms** on the dev card. **The dev card is NOT the constraint** (SSGI ~4 + DDGI ~0.41 + probe ~0.63 + RT-refl ~2 ≈ 7 ms ≪ 12 ms). The real denominator constraint is the **target GPU (RTX 2060)** — see R0.4.
+- **Target-GPU (RTX 2060) modeled interval (MODELED-ONLY — no real 2060 on hand; closure path = R0.4 'dev-enable', per user decision this run):** RX 9070 XT (~48 TFLOPS FP32, ~1557 GB/s) → RTX 2060 (~6.5 TFLOPS FP32, ~336 GB/s) for a bandwidth+ALU-bound compute+RT stack: **optimistic ~5×, pessimistic ~8×** slowdown (RT-core path is non-linear — model RT separately + conservatively per R0.4).
+  - Non-GI on 2060 (model): 3.3–4.7 ms × 5–8 = **~17–38 ms** for the LOCAL floor scenes ALONE → **already over 16.6 ms at the pessimistic end even before GI.** This mirrors the prior baseline's GTX-1660 finding (SSGI alone 20–37 ms) but at the corrected 2060 class.
+  - **★ PRELIMINARY GATE (pessimistic, 2060, 1080p native, will tighten post-R1.0):** at 8× the non-GI floor alone (~26–38 ms) blows the 60fps budget → **a 60fps@1080p-native target on 2060 is NOT credible for the heavy path; the realistic target is 30fps@1080p (33 ms) OR 60fps via FSR (internal res < 1080p).** GI budget X under 30fps@1080p-native-on-2060: 33 − (17–38)non-GI = **X ∈ [−5 .. +16] ms (pessimistic .. optimistic)** — i.e. at the pessimistic model GI does NOT fit even at 30fps@native, and **FSR (lower internal res) is REQUIRED**, not optional. Under FSR-Quality (720p internal, ~2.25× fewer pixels) the per-pixel passes scale down ~2.25× → non-GI ~7.5–17 ms on 2060 → **X ∈ [16 .. 25] ms @ 30fps**, comfortably fitting SSGI+DDGI+probe+RT-refl (~7 ms dev → modeled ~35–56 ms?? — NO: GI passes are also FSR-internal-res for screen-space parts; DDGI/RT are res-independent). **This is the crux R2.1 must resolve with the real preset math; flagged PRELIMINARY.**
+- **R2.1 High-fit, modeled on current P8.0 refl cost (~1.5–2 ms RX9070XT, §0):** flagged for **RE-RUN if R2.3 changes the reflection path** (cache vs re-shade roughness-split shifts the refl cost).
+
+**R0.2 DoD met:** target res (1080p) + FSR-not-TSR confirmed + frame budget (16.6/33.3 ms) WRITTEN; non-GI measured (GI-OFF, 3 local scenes, GPU-safe, zero device-removal) + RX9070XT→2060 extrapolation method (5–8×, RT separate) WRITTEN; GI budget X computed as a PESSIMISTIC/OPTIMISTIC interval, marked **PRELIMINARY / will-tighten-post-R1.0**, pessimistic X is the gate. Key finding the gate hangs on: **on the modeled 2060, FSR (internal res < 1080p) is REQUIRED for the heavy path; 60fps@1080p-native is not credible — target is 30fps@native or 60fps@FSR.** No code changed.
+
 ## §0. Keep / drop
 **KEEP (committed; "VERIFIED-under-WHICH-content", re-verified in R0.3):**
 | Piece | ms (RX 9070 XT) | Role / asterisk |
