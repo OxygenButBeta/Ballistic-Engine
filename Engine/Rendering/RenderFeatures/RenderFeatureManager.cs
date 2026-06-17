@@ -17,6 +17,23 @@ public static class RenderFeatureManager {
     // no RenderFeatures behaviour exists or all its features are inactive. The backend reads this.
     public static IReadOnlyList<RenderFeature> Active => active;
 
+    // CHUNK-20 PROOF DOOR (BALLISTIC_DX12_FEATURE_TINT_TEST): inject ONE SceneColorTintFeature when no scene
+    // authors a RenderFeatures host yet (serialization is chunk 21). Default OFF → completely inert, so the
+    // golden scenes are byte-identical; set to render the seam's positive test (the feature visibly tints the
+    // frame) WITHOUT depending on YAML round-trip. Env read is cached (cheap; never on the production path).
+    // The Tint is a strong magenta so the change is unmistakable in the positive capture.
+    static RenderFeature testFeature;
+    static int testDoor = -1;   // -1 unread, 0 off, 1 on
+    static RenderFeature TestFeatureOrNull() {
+        if (testDoor < 0)
+            testDoor = System.Environment.GetEnvironmentVariable("BALLISTIC_DX12_FEATURE_TINT_TEST") == "1" ? 1 : 0;
+        if (testDoor == 0) return null;
+        return testFeature ??= new SceneColorTintFeature {
+            Tint = new System.Numerics.Vector3(1f, 0.25f, 0.6f),   // strong magenta — unmistakable in the capture
+            Strength = 1f,
+        };
+    }
+
     // Collect the active features in authored order for this frame. Returns the count (0 = the layer is
     // inert this frame — the backend skips the bridge entirely). Mirrors VolumeManager.Update's shape:
     // reset the working set, early-out on empty, then fill in order.
@@ -24,8 +41,12 @@ public static class RenderFeatureManager {
         active.Clear();
 
         RenderFeatures host = RenderFeatures.Active;
-        if (host is null || !host.IsActive || host.Features is null || host.Features.Count == 0)
+        if (host is null || !host.IsActive || host.Features is null || host.Features.Count == 0) {
+            // No authored host — the chunk-20 proof door can still inject one tint feature (default off → 0).
+            RenderFeature test = TestFeatureOrNull();
+            if (test is { Active: true }) { active.Add(test); return active.Count; }
             return 0;
+        }
 
         foreach (RenderFeature feature in host.Features) {
             if (feature is { Active: true })
