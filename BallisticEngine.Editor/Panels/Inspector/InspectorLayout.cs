@@ -148,4 +148,11 @@ internal static class InspectorLayout {
     // members to be worth filtering (don't clutter a 3-field component). EF10a reads this threshold so the
     // "show the search box?" rule lives with the rest of the layout model. Tunable in EF10a.
     public const int MemberSearchThreshold = 12;
+
+    // --- Component-list search-bar gate (EF10b metric) ------------------------------------------------
+    // The top-of-inspector component-LIST search (EF10b) is also CONDITIONAL — it only shows once an entity
+    // carries enough components to be worth filtering (a 2-3 component entity doesn't need a box above the
+    // first header). Coarser than the per-component member threshold because the unit (a whole component)
+    // is bigger. Tunable in EF10b.
+    public const int ComponentSearchThreshold = 6;
 }

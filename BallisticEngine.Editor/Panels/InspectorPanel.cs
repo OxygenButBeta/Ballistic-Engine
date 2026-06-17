@@ -58,6 +58,12 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, StrBox> memberSearch = new();
     sealed class StrBox { public string Value = ""; }
 
+    // EF10b — top-of-inspector component-LIST search. Filters which COMPONENTS draw (by display name) on
+    // many-component entities. Unlike the per-component member search there is only ONE component list per
+    // shown entity, so a single inspector-owned buffer suffices (no per-instance keying); it carries across
+    // selections, which is fine — it's a transient view filter, not persisted state.
+    string componentListSearch = "";
+
     // Inspector lock (Unity's padlock): when on, the inspector pins its current entity so selecting
     // other objects in the hierarchy/viewport doesn't change what's shown. Lock only applies to an
     // entity selection (the common case); asset/scene-behaviour selections always follow.
@@ -507,11 +513,33 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
         DrawTransform(entity.transform);
 
+        // EF10b — conditional component-LIST search. Shown only when the entity carries enough components to
+        // be worth filtering (don't clutter a 2-3 component entity — InspectorLayout.ComponentSearchThreshold).
+        // The box sits ABOVE the first component header and only decides which whole components draw; it does
+        // NOT touch the per-component member search (EF10a) or the column model (EF11/EF16). The filter matches
+        // the component's DISPLAYED title (Prettify(type.Name) — the same string ComponentHeader shows). No
+        // query → componentMatch passes everyone → byte-identical to pre-EF10b.
+        string componentQuery = "";
+        if (behaviours.Length > Inspector.InspectorLayout.ComponentSearchThreshold) {
+            if (EditorWidgets.SearchField("##componentsearch", "Search components...", ref componentListSearch))
+                state.MarkViewportDirty();
+            componentQuery = componentListSearch;
+            ImGui.Spacing();
+        }
+
+        bool ComponentMatch(Behaviour b) =>
+            componentQuery.Length == 0 ||
+            Prettify(b.GetType().Name).Contains(componentQuery, StringComparison.OrdinalIgnoreCase);
+
         var typeIndex = new Dictionary<Type, int>();
         foreach (Behaviour behaviour in behaviours) {
             Type bt = behaviour.GetType();
             int idx = typeIndex.TryGetValue(bt, out int i) ? i : 0;
             typeIndex[bt] = idx + 1;
+            // EF10b — keep the type-index counter accurate (prefab-override/multi-select keying uses the
+            // Nth-of-type index) even for components the filter hides, so hiding a component never shifts a
+            // visible sibling's index. Increment FIRST (above), then skip the draw.
+            if (!ComponentMatch(behaviour)) continue;
             DrawComponent(entity, behaviour, idx);
         }
 

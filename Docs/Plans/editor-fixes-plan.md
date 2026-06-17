@@ -19,10 +19,41 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF10b** (component-list search — a top-of-inspector box filtering which COMPONENTS show, conditional)
-> Last committed chunk: **EF10a** · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **EF15** (collection reorder/clear + polymorphic list serialize + round-trip test)
+> Last committed chunk: **EF10b** · Branch: `dx12-renderer`
 >
-> **EF10a note (just landed):** the per-component member search bar is in. `DrawMemberList` now precomputes
+> **EF10b note (just landed):** the top-of-inspector component-LIST search is in. `DrawEntityInspector` now
+> draws a conditional search box ABOVE the first component header (after Transform): shown only when the
+> entity carries more than `InspectorLayout.ComponentSearchThreshold` (=6) components, via the SAME reusable
+> `EditorWidgets.SearchField` EF10a landed (no new widget). The query is a single inspector-owned
+> `componentListSearch` field (NOT per-instance — there's one component list per shown entity, unlike the
+> per-component member search which needed per-component keys; it carries across selections, fine for a
+> transient view filter). The `foreach (Behaviour ...)` draw loop gained a `ComponentMatch(b)` gate that
+> filters on the component's DISPLAYED title (`Prettify(b.GetType().Name)` — the exact string
+> `ComponentHeader` shows at `:813`, so the filter matches what the user reads), OrdinalIgnoreCase. **Key
+> correctness point:** the per-type `typeIndex[bt]` counter is incremented BEFORE the match-skip, so hiding a
+> filtered component does NOT shift a visible sibling's Nth-of-type index (which keys prefab-override badges +
+> multi-select propagation). Transform is drawn by `DrawTransform` outside `behaviours`, so it's never
+> filtered and not counted toward the threshold. No query → `ComponentMatch` passes everyone → byte-identical
+> to pre-EF10b. Touched 2 files (`InspectorPanel.cs` + `InspectorLayout.cs` — both mine; added the
+> `ComponentSearchThreshold=6` constant alongside `MemberSearchThreshold`). Editor builds 0-error (clean
+> `--no-incremental` scratch dir; DX12 compiles standalone since the R0 GI commit), oracle EXIT=0 (18 suites).
+> VISUAL chunk → human-screenshot checkpoint (a many-component entity shows the box + filters to matching
+> components; a 2-3 component entity shows no box; unfiltered byte-identical), batched into the
+> Inspector-layout set; NOT relaunch-looped (GPU-hang rule).
+>
+> **For EF15 (next):** inspector collections need (1) per-element reorder (up/down) + clear/insert on the list
+> drawer (per-element Remove + Add already exist — `InspectorPanel.cs:1608`/`:1575`), and (2) the
+> serialize-side polymorphic fix: `SceneSerializer.cs:349 SerializeSequence` calls `SerializeValue(element)`
+> NOT `SerializeMemberValue(...)`, so `[SerializeReference] List<IFoo>`/`IFoo[]` elements lose their `$type`
+> discriminator. The DESERIALIZE side is CONFIRMED READY (`SceneSerializer.cs:550,634,641` detect a
+> `$type`-tagged recursed element even when `member==null`) — fix is serialize-side only, and must keep
+> non-polymorphic lists (`List<float>`/`List<Material>`) byte-identical. ORACLE (review catch — reflection
+> suite does NOT cover this): add a concrete save→reload→re-save round-trip test over a `List<IFoo>` with ≥2
+> distinct concrete element types asserting (a) all concrete types survive, (b) byte-stable across the two
+> serializations, (c) a non-polymorphic list is byte-identical to pre-change. See the EF15 section.
+>
+> **EF10a note (kept for reference):** the per-component member search bar is in. `DrawMemberList` now precomputes
 > the `visibleMembers` set (members surviving `[ShowIf]/[HideIf]`) ONCE — it drives both the search-box
 > threshold AND the filter. When `visibleMembers.Count > InspectorLayout.MemberSearchThreshold` (=12) a
 > search box draws ABOVE the grid via the NEW reusable `EditorWidgets.SearchField(id, hint, ref buffer,
@@ -354,7 +385,7 @@ this same handoff for the chunk after it.
 - [x] EF16 — nested indent (fixed value-x) — `DrawNestedSlot`/`DrawPolymorphicSlot` now wrap their body in `DrawNestedBody` (cancels the `TreeNode`'s full per-level `IndentSpacing`, bumps `nestDepth`) + a `BeginNestedGrid` with a FIXED-width label column (`InspectorLayout.LabelColumnWidth`) instead of the proportional 0.38/0.62 split, so the value box keeps a usable width at every nesting depth; the small per-depth label indent (`DepthIndentTotal`) applies to the LABEL only in `Row`/`RowWithTooltip` (depth 0 → 0px → top-level + shim rows byte-identical). Pragmatic deviation: the anchor is recomputed from each nested grid's current width (foldouts render inside the parent value cell, so a single panel-global value-x can't hold); `ValueColumnLeft` clamps label ≤62% so the value never vanishes. Added `EditorTheme.UiScale` token (published by `ImGuiController.LoadFont`). Top-level `BeginGrid` untouched. Build 0-error, oracle EXIT=0. Visual verify batched into the Inspector-layout screenshot set.
 - [x] EF11 — adaptive label column + slider value legibility — `Row`/`RowWithTooltip` route their label through `DrawRowLabel` → `InspectorLayout.DrawLabelCell` (ellipsis + full-text/`[Tooltip]` hover), column width = `GetContentRegionAvail().X` at the label cell (works for both the proportional top-level grid AND the fixed nested grid → top-level `BeginGrid` untouched, depth-0 short labels visually equivalent). Resolved the EF16 double-indent trap (removed the manual `Indent`, `DrawLabelCell` owns it; deleted `LabelDepthIndent`) + tightened the ellipsize budget to `columnWidth − indent − gap`. Slider value legibility: new `EditorTheme.SliderGrabRest` (darkened amber) pushed as `SliderGrab` around the `##v` slider in both adapters (`ImGuiComponentGui`/`ImGuiVolumeGui`), scoped → global EF5 accent untouched. Build 0-error (Editor clean; the only failure is the user's in-progress DX12 `AoResult`→`SsaoResult` rename — not mine), oracle EXIT=0. Visual verify batched into the Inspector-layout set.
 - [x] EF10a — per-component member search (conditional) — `DrawMemberList` precomputes `visibleMembers` (post-`[ShowIf]`) once → drives both the threshold and the filter; a conditional search box (>`InspectorLayout.MemberSearchThreshold`=12 members) drawn above the grid via the NEW reusable `EditorWidgets.SearchField`; query state per-component-instance in a `ConditionalWeakTable<object,StrBox>` (GC-safe). Filter matches the DISPLAYED label (`MemberLabel` = `[LabelText] ?? Prettify(Name)`); precomputed `groupsWithMatch`/`headersWithMatch` hide `[FoldoutGroup]`/`[Header]` sections with no match. Draw-loop body reordered so chrome is decoupled from the member's own match (group-skip → space/header on section visibility → member's own `MemberVisible` last). No query → byte-identical. Validated on `VehicleController` ("steer" → only the 6 steer fields + their headers). Build 0-error, oracle EXIT=0.
-- [ ] EF10b — component-list search (conditional)
+- [x] EF10b — component-list search (conditional) — `DrawEntityInspector` draws a conditional search box above the first component header (after Transform), shown only when the entity has >`InspectorLayout.ComponentSearchThreshold`(=6) components, via the EF10a `EditorWidgets.SearchField`; query is a single inspector-owned `componentListSearch` field (one list per shown entity → no per-instance keying needed). The `foreach (Behaviour ...)` loop gained a `ComponentMatch(b)` gate filtering on the DISPLAYED title (`Prettify(b.GetType().Name)`, the same string `ComponentHeader` shows, OrdinalIgnoreCase). The per-type `typeIndex` counter increments BEFORE the skip so hiding a filtered component never shifts a visible sibling's Nth-of-type index (prefab-override + multi-select keying). Transform is outside `behaviours` → never filtered/counted. No query → byte-identical. Touched `InspectorPanel.cs` + `InspectorLayout.cs` (added `ComponentSearchThreshold=6`). Build 0-error, oracle EXIT=0.
 - [ ] EF15 — collection reorder/clear + polymorphic list serialize + round-trip test
 - [ ] EF7 — Tag/Layer "Add…" → open Tags & Layers panel
 - [ ] EF8 — split Layer Collision Matrix into its own panel
@@ -790,8 +821,15 @@ Root: no inspector member/component filter exists (`InspectorPanel.cs:51` only A
   to pre-EF10a. Validated on `VehicleController` (>12 members, `[Header]` sections — "steer" leaves only the
   6 steer fields under Steering/Grip). Touched `InspectorPanel.cs` + `EditorWidgets.cs`. Build 0-error,
   oracle EXIT=0.
-- **EF10b — Component-list search (secondary):** a top-of-inspector box filtering which components show,
-  for many-component objects; same conditional-visibility rule.
+- **EF10b — Component-list search (secondary) — ✅ DONE:** a top-of-inspector box filtering which components
+  show, for many-component objects; same conditional-visibility rule. Implemented in `DrawEntityInspector`:
+  shown only when `behaviours.Length > InspectorLayout.ComponentSearchThreshold` (=6), via the EF10a
+  `EditorWidgets.SearchField`; query in a single inspector-owned `componentListSearch` field (one component
+  list per shown entity → no per-instance keying); the draw loop gained a `ComponentMatch(b)` gate filtering
+  on the DISPLAYED title `Prettify(b.GetType().Name)` (the string `ComponentHeader` shows, OrdinalIgnoreCase).
+  The per-type `typeIndex` counter increments BEFORE the match-skip so a hidden component never shifts a
+  visible sibling's Nth-of-type index (prefab-override badge + multi-select keying). Transform is drawn
+  outside `behaviours` → never filtered/counted. No query → byte-identical. Build 0-error, oracle EXIT=0.
 - Factor a small reusable `EditorWidgets` search-field helper so later panels (Hierarchy/Assets/Add-
   Component) can reuse it (those panels are an optional later round, not required here).
 DoD: on a heavy component (e.g. Vehicle Controller) typing "steer" leaves only steer fields + their
