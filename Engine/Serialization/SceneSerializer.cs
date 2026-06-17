@@ -237,9 +237,22 @@ public static class SceneSerializer {
     // classifies Polymorphic). The trigger is exactly PropertyCategories.Classify == Polymorphic, so the
     // serializer and the property model agree on what is polymorphic by construction.
     static object SerializeMemberValue(object value, Type declaredType, MemberInfo member, HashSet<object> visited) {
-        if (value is not null &&
-            PropertyCategories.Classify(declaredType, member) == PropertyCategory.Polymorphic)
+        if (value is null)
+            return null;
+
+        PropertyCategory category = PropertyCategories.Classify(declaredType, member);
+        if (category == PropertyCategory.Polymorphic)
             return SerializeReferenceInstance(value, visited);
+        // Nested struct/class (G4): a plain (non-[SerializeReference]) member whose declared type is a
+        // concrete class or non-primitive struct round-trips its serializable members as a YAML mapping --
+        // NO $type tag (the declared type IS the concrete type, picked on load via Activator). The trigger is
+        // exactly Classify == Nested, so the model and codec agree. Before G4 this rode the SerializeValue
+        // pass-through (YamlDotNet reflected the object's PUBLIC members), which serialized but deserialized
+        // to null (the round-trip was lost); now the member-map below pairs with TryDeserializeNestedInstance
+        // so a nested member ROUND-TRIPS. Recurses through SerializeMemberValue so a nested-in-nested member
+        // (or a nested member that is itself polymorphic/a collection/a ref) is handled by the same path.
+        if (category == PropertyCategory.Nested)
+            return SerializeNestedInstance(value, visited);
         return SerializeValue(value);
     }
 
@@ -278,6 +291,41 @@ public static class SceneSerializer {
             // Pop so a sibling that legitimately reuses the same instance type (different instance) is not
             // mistaken for a cycle -- only an ANCESTOR back-reference is a cycle.
             visited.Remove(instance);
+        }
+    }
+
+    // ---- Nested struct/class members (G4 engine-half) -----------------------
+    // Serialize a plain nested instance (a concrete class or non-primitive struct, NOT [SerializeReference])
+    // as a YAML mapping of its serializable members -- WITHOUT a $type tag, because the declared member type
+    // is the concrete type (no subclass is stored, so load re-instantiates the declared type directly). The
+    // sibling of SerializeReferenceInstance: same member recursion, same cycle guard, but $type-free. A class
+    // member can form a reference cycle (A.Child -> B.Parent -> A), so the SAME visited-set guard applies and
+    // an ancestor back-reference serializes as null (tree-only + cycle-guard, Trap 3 / Unity parity). A struct
+    // is a value type -> never reference-cyclic, and HashSet adds the boxed copy harmlessly. An empty member
+    // map is still returned (an all-default nested value round-trips as an empty mapping, not null).
+    static Dictionary<object, object> SerializeNestedInstance(object instance, HashSet<object> visited) {
+        // Structs are value types: each access boxes a fresh copy, so a HashSet identity-add would never
+        // collide and the guard is moot -- only reference types can form a real cycle. Guard classes only.
+        bool guard = !instance.GetType().IsValueType;
+        if (guard) {
+            visited ??= new HashSet<object>(ReferenceEqualityComparer.Instance);
+            if (!visited.Add(instance))
+                return null; // ancestor back-reference -> null (Unity duplicates/nulls back-refs)
+        }
+
+        try {
+            var map = new Dictionary<object, object>();
+            foreach (MemberInfo member in SerializableMembers(instance.GetType())) {
+                object value = GetMemberValue(member, instance);
+                object serialized = SerializeMemberValue(value, MemberType(member), member, visited);
+                if (serialized is not null)
+                    map[CamelCase(member.Name)] = serialized;
+            }
+            return map;
+        }
+        finally {
+            if (guard)
+                visited.Remove(instance);
         }
     }
 
@@ -522,6 +570,18 @@ public static class SceneSerializer {
         if (TryGetDictionaryTypes(targetType, out Type keyType, out Type valType))
             return DeserializeDictionary(raw, targetType, keyType, valType);
 
+        // Nested struct/class (G4): a plain (non-[SerializeReference]) member whose declared type is a
+        // concrete class or non-primitive struct arrives as a member mapping (written by SerializeNestedInstance).
+        // Reconstruct by instantiating the DECLARED type (no $type lookup -- the declared type is the concrete
+        // type) and refilling its members through ApplyMembers (the SAME recursion a component uses, so a
+        // nested-in-nested member rehydrates too). Checked AFTER the collection/asset/ref branches (a Nested
+        // member is none of those) and BEFORE the math-struct map conversion below (a Vector*/Quaternion is
+        // classified MathStruct, never Nested, so they don't overlap -- but order makes the precedence explicit).
+        // A STRUCT comes back as a BOXED instance; ApplyMembers mutates the box, the caller's SetMemberValue
+        // unboxes it into the field, so struct write-back round-trips through the codec.
+        if (TryDeserializeNestedInstance(raw, targetType, member, out object nested))
+            return nested;
+
         // OpenTK types arrive already converted; otherwise coerce the scalar to the member type.
         if (targetType.IsInstanceOfType(raw))
             return raw;
@@ -592,6 +652,50 @@ public static class SceneSerializer {
             if (string.Equals(t.FullName, fullName, StringComparison.Ordinal))
                 return t;
         return null;
+    }
+
+    // ---- Nested struct/class deserialize (G4 engine-half) -------------------
+    // Reconstruct a plain nested instance from a member mapping: instantiate the DECLARED type (no $type --
+    // unlike the polymorphic path, the declared type IS the concrete type) and fill its members through the
+    // same ApplyMembers recursion a top-level component uses, so a nested-in-nested member rehydrates too.
+    // Returns false (leaving the existing pipeline to run) UNLESS the target classifies Nested AND the raw is
+    // a member mapping -- so a non-nested member is byte-identical. A type with no public parameterless ctor
+    // (Activator throws) logs and yields null rather than throwing, matching the codec's "missing -> null"
+    // leniency. A STRUCT instantiates to a boxed default; ApplyMembers mutates the box; the caller's
+    // SetMemberValue unboxes it back into the field (struct write-back).
+    static bool TryDeserializeNestedInstance(object raw, Type targetType, MemberInfo member, out object result) {
+        result = null;
+
+        if (PropertyCategories.Classify(targetType, member) != PropertyCategory.Nested)
+            return false;
+
+        // A nested value is written as a YAML mapping of its members. Anything else (a scalar from a legacy
+        // scene, or a corrupt value) is not a nested payload -> leave it for the caller's coerce/fallthrough.
+        if (raw is not IDictionary<object, object> rawMap)
+            return false;
+
+        object instance;
+        try {
+            instance = Activator.CreateInstance(targetType);
+        }
+        catch (Exception ex) {
+            Debugging.LogWarning(
+                $"Nested member type '{targetType.Name}' could not be instantiated ({ex.GetType().Name}); " +
+                "the value is dropped (it needs a public parameterless constructor).");
+            result = null;
+            return true; // handled -- don't fall through to the math/coerce branches
+        }
+
+        // Build a string-keyed member dict (YamlDotNet keys arrive as object strings) and apply through the
+        // shared recursion, so nested polymorphic/collection/ref/struct members rehydrate the same way.
+        var members = new Dictionary<string, object>(StringComparer.Ordinal);
+        foreach ((object k, object v) in rawMap)
+            if (k is string key)
+                members[key] = v;
+
+        ApplyMembers(instance, targetType, members);
+        result = instance;
+        return true;
     }
 
     // Read a float component from a YAML mapping (values arrive as strings from YamlDotNet).
