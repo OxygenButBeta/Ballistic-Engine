@@ -1018,7 +1018,9 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // Draws all inspector members of a component, honouring [Header]/[Space] (which break the
     // two-column grid into stacked sub-tables) and the per-member attributes. The caller has
     // already drawn the Enabled row in its own grid and closed it.
-    void DrawMemberList(Type type, object target) {
+    // internal (RW1.4): the relocated DataAssetInspector body (Inspector/AssetInspectors/) reflects a
+    // DataAsset through this same member list via ctx.Panel.DrawMemberList — byte-identical to the inline call.
+    internal void DrawMemberList(Type type, object target) {
         var gridOpen = false;
         var gridIndex = 0;       // each sub-table (split by Header/Space/foldout) needs a unique id
         string currentGroup = null;  // active [FoldoutGroup] name
@@ -2532,190 +2534,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         ImGui.TextDisabled("Changing the type reimports. Loaded materials keep the\nold instance until the scene reloads.");
     }
 
-    // Material preview thumbnail state. Re-rendered only when the material (guid) or its serialized
-    // content (hash) changes, so the GL pass runs once per edit, not per frame.
-    Guid materialPreviewGuid;
-    int materialPreviewHash;
-    nint materialPreviewTex;     // ImGui handle: GL texture name or DX12 UiHeap descriptor ptr
-    Dx12EditorPreview.Dx12EditorTexture materialPreviewDx12;   // DX12 backing (disposed on re-render)
-    const int MaterialPreviewSize = 128;
-    static bool IsDx12 => RenderBackendSelector.Selected == RenderBackend.Dx12;
-
-    void DrawMaterialPreview(Guid guid, MaterialDefinition definition) {
-        // DX12: the material-preview GPU render (Dx12EditorPreview) hangs the GPU under load — DISABLED until
-        // root-caused (the inspector just omits the sphere). Re-enable with the thumbnail path once verified.
-        if (IsDx12)
-            return;
-        // cheap content fingerprint: re-render only when the serialized material changes
-        int hash = System.Text.Json.JsonSerializer.Serialize(definition, PipelineJson.Options).GetHashCode();
-        if (guid != materialPreviewGuid || hash != materialPreviewHash || materialPreviewTex == 0) {
-            try {
-                byte[] pixels = MaterialPreviewRenderer.Render(definition, MaterialPreviewSize);
-                materialPreviewDx12?.Dispose();   // free the previous texture + its UiHeap slot
-                materialPreviewDx12 = Dx12EditorPreview.UploadTexture(pixels, MaterialPreviewSize);
-                materialPreviewTex = materialPreviewDx12.Handle;
-                materialPreviewGuid = guid;
-                materialPreviewHash = hash;
-            }
-            catch (Exception e) {
-                Debugging.LogError($"Material preview failed: {e.Message}");
-                materialPreviewTex = 0;
-            }
-        }
-
-        if (materialPreviewTex != 0) {
-            float size = 120f;
-            float pad = (ImGui.GetContentRegionAvail().X - size) * 0.5f;
-            if (pad > 0) ImGui.SetCursorPosX(ImGui.GetCursorPosX() + pad);
-            ImGui.Image(EditorApplication.Tex(materialPreviewTex), new SysVec2(size, size));
-            ImGui.Spacing();
-        }
-    }
-
-    internal void DrawMaterialEditor(string path, Guid guid) {
-        var absolute = AssetDatabase.Project.ResolveAbsolute(path);
-        MaterialDefinition definition;
-        try {
-            definition = PipelineJson.Read<MaterialDefinition>(absolute);
-        }
-        catch (Exception exception) {
-            ImGui.TextDisabled($"Unreadable material: {exception.Message}");
-            return;
-        }
-
-        // Unity-style preview sphere: render the material to a thumbnail (re-rendered only when the
-        // material's serialized state changes), upload to a GL texture, show it centered.
-        DrawMaterialPreview(guid, definition);
-
-        ImGui.TextDisabled($"Shader: {definition.Shader ?? "(none)"}");
-        ImGui.Spacing();
-
-        var changed = false;
-        if (BeginGrid("##matslots")) {
-            foreach (TextureType slot in new[] {
-                         TextureType.Diffuse, TextureType.Normal, TextureType.Metallic,
-                         TextureType.Roughness, TextureType.AO, TextureType.Emissive,
-                     }) {
-                definition.Textures.TryGetValue(slot.ToString(), out var reference);
-                var display = reference is null
-                    ? "None"
-                    : Path.GetFileName(ReferenceToPath(reference) ?? reference);
-
-                Row(slot.ToString());
-                ImGui.PushID((int)slot);
-                if (reference is null)
-                    ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
-                ImGui.Button(display, new SysVec2(-1, 0));
-                if (reference is null)
-                    ImGui.PopStyleColor();
-                if (AcceptGuidDrop(out Guid dropped)) {
-                    definition.Textures[slot.ToString()] = AssetRef.FromGuid(dropped);
-                    changed = true;
-                }
-                ImGui.PopID();
-            }
-
-            // Scalar material properties (stored in the .mat next to the texture refs).
-            // Base color: linear RGBA tint multiplying the albedo map (glTF baseColorFactor).
-            // White is the neutral "unstated" default, so it's stored as null and rendering
-            // is bit-identical to a .mat without the key.
-            Row("Base Color");
-            var baseColor = definition.BaseColor switch {
-                { Length: >= 4 } bc => new SysVec4(bc[0], bc[1], bc[2], bc[3]),
-                { Length: 3 } bc => new SysVec4(bc[0], bc[1], bc[2], 1f),
-                _ => SysVec4.One,
-            };
-            if (ImGui.ColorEdit4("##matbasecolor", ref baseColor)) {
-                definition.BaseColor = baseColor == SysVec4.One
-                    ? null
-                    : [baseColor.X, baseColor.Y, baseColor.Z, baseColor.W];
-                changed = true;
-            }
-
-            // Packed ORM: metallic texture carries (occlusion, roughness, metallic) in RGB.
-            // Auto-detected from "spec" file names when the .mat doesn't say explicitly.
-            Row("Packed ORM");
-            var packedOrm = MaterialLoader.ResolvePackedOrm(definition);
-            if (ImGui.Checkbox("##matpackedorm", ref packedOrm)) {
-                definition.PackedOrm = packedOrm;
-                changed = true;
-            }
-
-            // Alpha cutout: discard below 0.5 diffuse alpha + double-sided (foliage cards).
-            // Auto-detected from foliage-style texture names when not set explicitly.
-            Row("Alpha Cutout");
-            var cutout = MaterialLoader.ResolveCutout(definition);
-            if (ImGui.Checkbox("##matcutout", ref cutout)) {
-                definition.Cutout = cutout;
-                changed = true;
-            }
-
-            Row("Transparent");
-            var transparent = definition.Transparent;
-            if (ImGui.Checkbox("##mattransparent", ref transparent)) {
-                definition.Transparent = transparent;
-                changed = true;
-            }
-
-            if (definition.Transparent) {
-                Row("Opacity");
-                var opacity = definition.Opacity;
-                if (ImGui.SliderFloat("##matopacity", ref opacity, 0f, 1f)) {
-                    definition.Opacity = opacity;
-                    changed = true;
-                }
-            }
-
-            Row("Emissive Color");
-            var emissive = definition.EmissiveColor is { Length: >= 3 } c
-                ? new SysVec3(c[0], c[1], c[2])
-                : SysVec3.One;
-            if (ImGui.ColorEdit3("##matemissivecolor", ref emissive)) {
-                definition.EmissiveColor = [emissive.X, emissive.Y, emissive.Z];
-                changed = true;
-            }
-
-            Row("Emissive Intensity");
-            var emissivemntensity = definition.EmissiveIntensity;
-            if (ImGui.DragFloat("##matemissiveintensity", ref emissivemntensity, 0.05f, 0f, 100f)) {
-                definition.EmissiveIntensity = emissivemntensity;
-                changed = true;
-            }
-
-            ImGui.EndTable();
-        }
-
-        if (changed) {
-            PipelineJson.Write(absolute, definition);
-            ApplyLiveMaterial(guid, definition);
-            state.MarkViewportDirty();
-        }
-
-        ImGui.Spacing();
-        ImGui.TextDisabled("Drag textures from the Assets panel onto the slots.");
-    }
-
-    static string ReferenceToPath(string reference) =>
-        AssetRef.IsGuidRef(reference, out Guid g) ? AssetDatabase.GuidToAssetPath(g) : reference;
-
-    static void ApplyLiveMaterial(Guid materialGuid, MaterialDefinition definition) {
-        var material = AssetDatabase.Load<Material>(materialGuid);
-        if (material is null)
-            return;
-
-        material.Diffuse = LoadSlot(definition, TextureType.Diffuse) ?? material.Diffuse;
-        material.Normal = LoadSlot(definition, TextureType.Normal);
-        material.Metallic = LoadSlot(definition, TextureType.Metallic);
-        material.Roughness = LoadSlot(definition, TextureType.Roughness);
-        material.AO = LoadSlot(definition, TextureType.AO);
-        material.Emissive = LoadSlot(definition, TextureType.Emissive);
-        MaterialLoader.ApplyScalars(material, definition);
-    }
-
-    static Texture2D LoadSlot(MaterialDefinition definition, TextureType slot) =>
-        definition.Textures.TryGetValue(slot.ToString(), out var reference) && reference is not null
-            ? AssetDatabase.LoadRef<Texture2D>(reference)
-            : null;
+    // DrawMaterialEditor + DrawMaterialPreview + the material-preview cache fields + ReferenceToPath /
+    // ApplyLiveMaterial / LoadSlot moved to MaterialAssetInspector (Inspector/AssetInspectors/) in RW1.4 — the
+    // body is byte-identical to the old inline material editor; only its home changed (the [AssetInspector(".mat")]
+    // shim now owns the single preview cache the panel field used to).
 
     internal static unsafe bool AcceptGuidDrop(out Guid guid) {
         guid = Guid.Empty;
