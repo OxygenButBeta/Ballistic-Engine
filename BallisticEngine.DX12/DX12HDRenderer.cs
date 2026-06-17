@@ -79,31 +79,13 @@ public sealed class DX12HDRenderer : HDRenderer {
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct MotionConstants { public Matrix4x4 ViewProjCur; public Matrix4x4 ViewProjPrev; public float NormalLodBias; public Vector3 PadMotion; }
 
-    // Deferred lighting pass: fullscreen, reads the G-buffer + depth → PBR sun + IBL + shadows → HDR target
-    // (DeferredLighting.hlsl). The lighting math moved here out of the material shader.
-    ID3D12RootSignature deferredRootSig;   // LightConstants CBV(b0) + FrameConstants CBV(b1) + 9-SRV table(t0..t8) + sampler
-    ID3D12PipelineState deferredPso;
-    ID3D12Resource deferredCb;
-    unsafe byte* deferredCbMapped;
-    Dx12DescriptorHeap deferredSrvVisible;  // 9 SRVs copied per frame: G0..G3, depth, irradiance, prefilter, BRDF, shadow
+    // Deferred lighting: deferredRootSig/Pso/Cb/SrvVisible + the LightConstants struct moved VERBATIM into
+    // Resources/Dx12DeferredLightingPass.cs (chunk 9). The pass owns them; it runs at the OpaqueLighting event
+    // (300) via the graph, reading ctx light/IBL/cluster/rtShadow state. Was BuildDeferredLighting /
+    // DrawDeferredLighting.
 
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct LightConstants {
-        public Matrix4x4 InvViewProj;
-        public Matrix4x4 View;
-        public Vector3 LightDir; public float Pad0;
-        public Vector3 LightColor; public float Pad1;
-        public Vector3 Ambient; public float Pad2;
-        public Vector3 CameraPos; public float UseIBL;
-        public float PrefilterMaxMip;
-        public float PunctualCount;
-        public Vector2 ScreenSize;
-        public Vector2 ClusterNearFar;
-        public float UseRtShadows; public float SpecClamp;   // SpecClamp: max per-light specular luma (V2 firefly cap; 0 = off)
-        public float SpecAaStrength; public float Pad4, Pad5, Pad6;   // V2: geometric specular AA strength (0 = off)
-    }
-
-    // Clustered punctual lights (point/spot) shaded in the deferred pass.
+    // Clustered punctual lights (point/spot) shaded in the deferred pass — orchestrator-owned (the CPU froxel
+    // gather runs inline before deferred), built in Initialize; the deferred pass reads it via ctx.
     Dx12ClusteredLights clusteredLights;
 
     // TAA: jittered rendering + reprojected history accumulation (the AA; also smooths SSR/SSAO noise).
@@ -396,6 +378,10 @@ public sealed class DX12HDRenderer : HDRenderer {
     // runs at the PostProcess event via the graph. The still-inline composite reads its result via
     // ssaoPass.ResultSrvCpu until composite itself converts (chunk 7).
     Dx12SsaoPass ssaoPass;
+    // chunk 9: Deferred lighting (event 300 — OpaqueLighting). Owns the deferred rootsig/PSO/CB/13-SRV heap;
+    // reads ctx light/IBL/cluster/rtShadow state + draws the full-screen lit HDR into `target` (head transition
+    // gbuffer.ToShaderResource — R2). Was BuildDeferredLighting / DrawDeferredLighting (+ the LightConstants struct).
+    Dx12DeferredLightingPass deferredPass;
     // chunk 5: AerialPerspective (event 400) + Fog (event 550), converted leaf-post passes (was the inline
     // DrawAerialPerspective / DrawFog). Both blend in place into `target` — no cross-pass output getter.
     Dx12AerialPerspectivePass apPass;
@@ -652,7 +638,10 @@ public sealed class DX12HDRenderer : HDRenderer {
             ResourceDescription.Buffer((ulong)frameCbSize), ResourceStates.GenericRead);
         frameCbMapped = frameCb.Map<byte>(0);
 
-        BuildDeferredLighting();
+        // Deferred lighting now built inside Dx12DeferredLightingPass's ctor (chunk 9), constructed below at
+        // pass-graph assembly. Was BuildDeferredLighting(). clusteredLights (the CPU froxel gather feeds it)
+        // stays orchestrator-owned — built here, the deferred pass reads it via ctx.
+        clusteredLights = new Dx12ClusteredLights(dev);
         // Transparents now built inside Dx12TransparentsPass's ctor (chunk 8), constructed below at pass-graph
         // assembly. Was BuildTransparentPass(). Fog + AerialPerspective likewise inside their pass ctors
         // (Dx12FogPass / Dx12AerialPerspectivePass, chunk 5). Was BuildFog() + BuildAerialPerspective().
@@ -686,6 +675,13 @@ public sealed class DX12HDRenderer : HDRenderer {
         // fsr; bloom/ssr/ssgi/taa/rtShadowMask/fsr are still inline (alloc before graph.Resize), so SSAO — the
         // first converted pass — registers first. Build() once for the stable order (R1).
         graph = new Dx12RenderGraph(TimePass);
+        // chunk 9: Deferred lighting (event 300 — the OpaqueLighting slot, EARLIEST of all converted passes:
+        // 300 < Sky 350 < AP 400 < Transparents 450 < Fog 550 < PostProcess 650 < Composite 700). Owns no
+        // resolution targets (full-screen draw into `target`), so its Resize is a no-op → registration order is
+        // R5-neutral; registered first for hygiene (matches its earliest event). Was BuildDeferredLighting +
+        // the inline gbuffer.ToShaderResource() + DrawDeferredLighting call.
+        deferredPass = new Dx12DeferredLightingPass(dev);
+        graph.Add(deferredPass);
         ssaoPass = new Dx12SsaoPass(dev, targetW, targetH);   // chunk 4: first leaf-post pass (was BuildSsao)
         graph.Add(ssaoPass);
         // chunk 8: Sky (event 350 — skybox + procedural atmosphere). Resolution-independent (no Resize body)
@@ -970,45 +966,10 @@ public sealed class DX12HDRenderer : HDRenderer {
         boneMatrixMapped = boneMatrixRing.Map<byte>(0);
     }
 
-    // Deferred lighting PSO: fullscreen triangle, LightConstants CBV(b0) + FrameConstants CBV(b1) +
-    // 9-SRV table(t0..t8: G0..G3, depth, irradiance, prefilter, BRDF, shadow) + clamp sampler.
-    unsafe void BuildDeferredLighting() {
-        var lightCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Pixel);
-        var frameCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.Pixel);
-        // 13 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster lights/grid/index
-        // (t9..t11), RT shadow mask (t12).
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 13, baseShaderRegister: 0);
-        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
-        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
-            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
-            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
-            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
-        };
-        deferredRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None,
-                new[] { lightCbv, frameCbv, srvTable }, new[] { samp })));
-
-        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("DeferredLighting.hlsl");
-        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "DeferredLighting.hlsl");
-        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "DeferredLighting.hlsl");
-        deferredPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
-            RootSignature = deferredRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
-            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
-            RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
-            DepthStencilState = DepthStencilDescription.None,
-            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
-            DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
-        });
-
-        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<LightConstants>() + 255) & ~255;
-        deferredCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        deferredCbMapped = deferredCb.Map<byte>(0);
-        deferredSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 13, shaderVisible: true, framesInFlight: dev.FramesInFlight);
-
-        clusteredLights = new Dx12ClusteredLights(dev);
-    }
+    // BuildDeferredLighting moved VERBATIM into the Dx12DeferredLightingPass ctor (chunk 9): the deferred
+    // rootsig/PSO/CB/13-SRV heap (LightConstants CBV b0 + FrameConstants CBV b1 + 13-SRV table + clamp sampler).
+    // The pass runs at the OpaqueLighting event (300) via the graph. clusteredLights (which BuildDeferredLighting
+    // used to also construct) is now built in Initialize, orchestrator-owned.
 
     // BuildTransparentPass / DrawTransparents moved VERBATIM into Resources/Dx12TransparentsPass.cs (chunk 8):
     // the forward transparent pass (back-to-front alpha-blended Material.Transparent submeshes, full forward PBR
@@ -1564,25 +1525,24 @@ public sealed class DX12HDRenderer : HDRenderer {
         // same as the sun). ===
         GatherPunctualLights(view, proj);
 
-        // === DEFERRED LIGHTING: read the G-buffer + depth → PBR sun + IBL + shadows + punctual → HDR. ===
-        gbuffer.ToShaderResource();
-
         // === RT SUN SHADOWS (volume-driven; DXR): trace one shadow ray per pixel against the scene BVH into
         // a mask the deferred sun term reads (replaces the cascade PCF). Opt-in via the Shadows volume's RT
         // checkbox or BALLISTIC_DX12_RT_SHADOWS=1; falls back to cascades if DXR is unavailable. Runs after
-        // the G-buffer is readable, before deferred lighting. ===
+        // the G-buffer is readable, before deferred lighting. The unconditional gbuffer.ToShaderResource() that
+        // used to sit here (before BOTH RT shadows and deferred) moved to the deferred pass head (chunk 9, R2);
+        // since RT shadows ALSO consumes the G-buffer as an SRV (depth + world normal) and runs BEFORE deferred,
+        // DrawRtShadows emits its OWN head gbuffer.ToShaderResource() (idempotent, the safety net). rtShadowsThis
+        // Frame must resolve HERE — the deferred pass reads it via ctx, which is built right after. ===
         rtShadowsThisFrame = false;
         string rtsEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RT_SHADOWS");
         bool rtShadowsWanted = rtsEnv == "1" || (rtsEnv != "0" && PostFX.RayTracedShadows);
         if (rtShadowsWanted && EnsureRtShadows())
             DrawRtShadows(viewProj, lightDir);
 
-        DrawDeferredLighting(view, viewProj, camPos, lightDir, lightColor, ambient);
-
-        // === GI MODE RESOLVE (moved UP from its old spot below the GI dispatch — chunk 5). It has no
-        // dependency on sky/transparents and the pass-graph ctx (built right after) needs giMode at its final
-        // value. The GI DISPATCH itself stays inline at its canonical spot below (after transparents); GI
-        // converts to a pass in chunk 10. ===
+        // === GI MODE RESOLVE (moved UP from its old spot below the GI dispatch — chunk 5; now ALSO above the
+        // deferred pass — chunk 9). It has no dependency on deferred/sky/transparents and the pass-graph ctx
+        // (built right after) needs giMode at its final value. The GI DISPATCH itself stays inline at its
+        // canonical spot below (after transparents); GI converts to a pass in chunk 10. ===
         // GI: Off / SSGI / RT-GI (the GI volume dropdown; env doors override). RT-GI traces the scene BVH;
         // both SSGI and RT-GI share the temporal + OIDN + combine resolve. RT-GI falls back to SSGI w/o DXR.
         string ssgiEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SSGI");
@@ -1604,13 +1564,14 @@ public sealed class DX12HDRenderer : HDRenderer {
             WarnNoRtOnce();
         }
 
-        // === PHASE-1 PASS-GRAPH CONTEXT (chunks 4–5). Built ONCE here — after DrawDeferredLighting + the
-        // giMode resolve, before the Sky pass — so every mutated ctx field holds its FINAL value (fsrActive
-        // resolved pre-body; iblActiveThisFrame/shadowsThisFrame/rtShadowsThisFrame set above; giMode just
-        // resolved). The graph then runs in EVENT WINDOWS at the gaps between the still-inline passes, so each
-        // converted pass executes at its canonical inline position (AP after sky/before transparents; Fog after
-        // GI/before SSR; SSAO after SSR/before composite). As more passes convert, the windows merge into one
-        // Execute (step G). ===
+        // === PHASE-1 PASS-GRAPH CONTEXT (chunks 4–9). Built ONCE here — after RT shadows + the giMode resolve,
+        // and now ALSO BEFORE the deferred pass (chunk 9 moved the ctx build UP above deferred so the deferred
+        // window can run from ctx) — so every mutated ctx field holds its FINAL value (fsrActive resolved
+        // pre-body; iblActiveThisFrame/shadowsThisFrame/rtShadowsThisFrame set above — RT shadows just ran;
+        // giMode just resolved). The graph then runs in EVENT WINDOWS at the gaps between the still-inline passes,
+        // so each converted pass executes at its canonical inline position (Deferred at OpaqueLighting; Sky/AP/
+        // Transparents next; Fog after GI; SSAO/TAA/FSR after SSR; Composite last). As more passes convert, the
+        // windows merge into one Execute (step G). ===
         var ctx = new Dx12FrameContext {
             View = view, Proj = proj, ViewProj = viewProj,
             ProjUnjittered = projUnjittered, ViewProjUnjittered = viewProjUnjittered,
@@ -1622,7 +1583,8 @@ public sealed class DX12HDRenderer : HDRenderer {
             Dev = dev, Target = target, Ldr = ldr, GBuffer = gbuffer,
             Ibl = ibl, SkyLuts = skyLuts, ClusteredLights = clusteredLights,
             ShadowMap = shadowMap, GpuDriven = gpuDriven,
-            FrameCbAddress = frameCb.GPUVirtualAddress,   // chunk 8: Transparents binds it to its b1 FrameConstants CBV
+            RtShadowMask = rtShadowMask,   // chunk 9: deferred binds it to t12 when RtShadowsThisFrame (null → fallback)
+            FrameCbAddress = frameCb.GPUVirtualAddress,   // chunk 8: Transparents binds it; chunk 9: Deferred binds it too (b1 FrameConstants CBV)
             Doors = doors, PostFX = PostFX, Stats = RenderStats.Scene,
             // chunk 7 (composite): deterministic flag (grain/exposure reset) + the SSAO pass output the composite
             // samples for AO. SsaoResult is a stable descriptor handle (ssaoA.ColorSrvCpu) — only its contents
@@ -1638,6 +1600,14 @@ public sealed class DX12HDRenderer : HDRenderer {
             RtShadowsThisFrame = rtShadowsThisFrame,
             GiMode = giMode,
         };
+
+        // === DEFERRED LIGHTING (Dx12DeferredLightingPass, event 300 — OpaqueLighting). chunk 9 NEW window
+        // [OpaqueLighting, Sky): the deferred pass shades the G-buffer (sun + IBL + cascade/RT shadows +
+        // clustered punctual) into the HDR color, exactly where the inline DrawDeferredLighting ran (after RT
+        // shadows, before Sky). The pass emits its OWN head gbuffer.ToShaderResource() (R2 — it's the consumer
+        // of the G-buffer-as-SRV; the inline head transition that used to sit here moved into the pass). The
+        // window stops short of Sky (350) so the still-separate Sky window runs next at its canonical slot. ===
+        graph.Execute(ctx, (int)Dx12RenderPassEvent.OpaqueLighting, (int)Dx12RenderPassEvent.Sky);
 
         // === SKY (Dx12SkyPass, event 350) → AERIAL PERSPECTIVE (Dx12AerialPerspectivePass, event 400). The
         // window WIDENED leftward this chunk to include Sky (was [AerialPerspective, Transparents); now [Sky,
@@ -1751,66 +1721,11 @@ public sealed class DX12HDRenderer : HDRenderer {
     // Fullscreen deferred lighting: read the G-buffer (G0..G3 + depth, already in SRV state) + IBL +
     // shadow cascades, shade Cook-Torrance sun + split-sum IBL + clustered punctual lights, write RAW HDR
     // into `target`. Mirrors the forward StandardOpaque shading — only the inputs come from the G-buffer.
-    unsafe void DrawDeferredLighting(Matrix4x4 view, Matrix4x4 viewProj, Vector3 camPos, Vector3 lightDir, Vector3 lightColor, Vector3 ambient) {
-        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
-        // V2 specular firefly cap (per-light specular luma clamp). Default on; BALLISTIC_DX12_SPEC_CLAMP tunes it
-        // (0 = off, byte-identical to pre-V2). Lux-ish radiance scale → a high cap that only bites texel spikes.
-        float specClampValue = 8000f;
-        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_SPEC_CLAMP"),
-            System.Globalization.CultureInfo.InvariantCulture, out float sc)) specClampValue = sc;
-        // V2 geometric specular AA: roughen noisy normals to kill normal-map sparkle. Default on; tune/disable
-        // via BALLISTIC_DX12_SPEC_AA (0 = off, byte-identical). Strength scales the normal-derivative variance.
-        float specAaValue = 2f;
-        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_SPEC_AA"),
-            System.Globalization.CultureInfo.InvariantCulture, out float sa)) specAaValue = sa;
-        *(LightConstants*)deferredCbMapped = new LightConstants {
-            InvViewProj = Matrix4x4.Transpose(invVP),
-            View = Matrix4x4.Transpose(view),
-            LightDir = lightDir, LightColor = lightColor, Ambient = ambient, CameraPos = camPos,
-            UseIBL = iblActiveThisFrame ? 1f : 0f,
-            PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f,
-            PunctualCount = clusteredLights.LightCount,
-            ScreenSize = new Vector2(targetW, targetH),
-            ClusterNearFar = new Vector2(CameraNear, CameraFar),
-            UseRtShadows = rtShadowsThisFrame ? 1f : 0f,
-            // V2: per-light specular luma cap (firefly bound). The radiance scale is lux-ish (sun ~80000), so the
-            // cap is high — it only bites single-texel NDF spikes, not broad highlights. BALLISTIC_DX12_SPEC_CLAMP
-            // tunes it; =0 disables (byte-identical). Default 8000 (≈ a tenth of the sun radiance — outliers only).
-            SpecClamp = specClampValue,
-            SpecAaStrength = specAaValue,
-        };
-
-        // Copy the 13 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster
-        // lights/grid/index (t9..t11), RT shadow mask (t12).
-        deferredSrvVisible.Reset();
-        int b = deferredSrvVisible.AllocateRange(13);
-        // Only the 4 SHADED G-buffer RTs feed lighting (G0..G3 → t0..t3); the motion RT (RT4) is for TAA/FSR.
-        for (int i = 0; i < Dx12GBuffer.ShadedRtCount; i++)
-            dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + i), gbuffer.ColorSrvCpu(i), heapType);
-        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 4), gbuffer.DepthSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 5), ibl.IrradianceSrv, heapType);
-        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 6), ibl.PrefilterSrv, heapType);
-        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 7), ibl.BrdfSrv, heapType);
-        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 8), shadowMap.SrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 9), clusteredLights.LightSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 10), clusteredLights.GridSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 11), clusteredLights.IndexSrvCpu, heapType);
-        // RT shadow mask (t12) — the real mask when RT shadows ran this frame, else a valid unused fallback.
-        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 12),
-            rtShadowMask != null ? rtShadowMask.ColorSrvCpu : gbuffer.DepthSrvCpu, heapType);
-
-        target.RenderColorOnlyCleared(cl => {
-            cl.SetGraphicsRootSignature(deferredRootSig);
-            cl.SetPipelineState(deferredPso);
-            cl.SetDescriptorHeaps(deferredSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, deferredCb.GPUVirtualAddress);
-            cl.SetGraphicsRootConstantBufferView(1, frameCb.GPUVirtualAddress);
-            cl.SetGraphicsRootDescriptorTable(2, deferredSrvVisible.Gpu(b));
-            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            cl.DrawInstanced(3, 1, 0, 0);
-        });
-    }
+    // DrawDeferredLighting moved VERBATIM into Resources/Dx12DeferredLightingPass.Record (chunk 9). It runs at
+    // the OpaqueLighting event (300) via the graph, emitting its own head gbuffer.ToShaderResource() (R2 — the
+    // deferred pass is the consumer of the G-buffer-as-SRV). The LightConstants struct + the deferred rootsig/
+    // PSO/CB/heap moved with it; the RT shadow mask + FrameConstants CBV come through ctx (RtShadowMask /
+    // FrameCbAddress).
 
     // DrawTransparents moved VERBATIM into Resources/Dx12TransparentsPass.Record (chunk 8). It runs at
     // the Transparents event (450) via the graph, emitting its own head DepthToReadOnly (R2).
@@ -2141,6 +2056,14 @@ public sealed class DX12HDRenderer : HDRenderer {
     unsafe void DrawRtShadows(Matrix4x4 viewProj, Vector3 lightDir) {
         sceneAS.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection);
         if (!sceneAS.Valid) return;
+
+        // R2 / Decision 4: RT shadows is ALSO a consumer of the G-buffer-as-SRV — it reads gbuffer depth +
+        // world-normal (RT1) below via its own descriptor table. Chunk 9 moved the gbuffer.ToShaderResource()
+        // head transition OUT of the orchestrator and INTO the deferred pass (which runs AFTER this), so RT
+        // shadows must emit its OWN head transition or it would dispatch while the G-buffer is still in
+        // RenderTarget/DepthWrite state. Idempotent (no-op when an upstream already set it; the deferred pass
+        // re-asserts it too). Only fires under BALLISTIC_DX12_RT_SHADOWS / the Shadows-volume RT checkbox.
+        gbuffer.ToShaderResource();
 
         Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
         Vector3 sun = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);

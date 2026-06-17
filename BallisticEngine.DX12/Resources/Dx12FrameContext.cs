@@ -70,6 +70,10 @@ public sealed class Dx12FrameContext {
     public Dx12ClusteredLights ClusteredLights{ get; init; }
     public Dx12ShadowMap       ShadowMap      { get; init; }
     public Dx12GpuDrivenRenderer GpuDriven    { get; init; }
+    // Full-res R8 RT sun-shadow mask (1 lit / 0 shadowed) — null until RT shadows first run; the orchestrator
+    // owns it (allocated/dispatched inline before deferred). The deferred pass (chunk 9) binds it to t12 when
+    // RtShadowsThisFrame, else a valid unused fallback (gbuffer depth). Reference is stable per frame.
+    public Dx12OffscreenTarget RtShadowMask   { get; init; }
 
     // The per-frame FrameConstants CB's GPU virtual address. The orchestrator owns `frameCb` (a shared
     // per-frame resource, filled once before the graph runs — see "what STAYS inline"); the Transparents

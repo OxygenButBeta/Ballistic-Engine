@@ -1,0 +1,181 @@
+using System;
+using System.Numerics;
+using System.Runtime.InteropServices;
+using Vortice.Direct3D;        // PrimitiveTopology
+using Vortice.Direct3D12;
+using Vortice.Dxc;             // DxcShaderStage
+using Vortice.DXGI;            // Format, SampleDescription
+
+namespace BallisticEngine.DX12;
+
+// Deferred lighting: read the fat G-buffer + depth → PBR sun + IBL + shadows (cascade or RT mask) +
+// clustered punctual → the HDR scene color (`target`). One full-screen draw; the pass is the CONSUMER of
+// the G-buffer-as-SRV, so its head transition is `gbuffer.ToShaderResource()` (Decision 4 / R2 — every
+// consumer emits its own head transition; idempotent no-op if an upstream already did it).
+//
+// VERBATIM MOVE (chunk 9 of the pass-graph migration): the bodies of BuildDeferredLighting/
+// DrawDeferredLighting are copied unchanged, only re-rooted onto `ctx`/this pass's own fields. No logic
+// change → SHA==golden (deferred shades every lit pixel, so the deterministic gate is the real move oracle
+// here — a wrong move fails immediately, unlike a temporal pass). Copies the Dx12TransparentsPass template
+// (draws into `target`, owns NO resolution targets → Resize is a no-op, R5-neutral).
+//
+// Event = OpaqueLighting (300) — the deferred-shading slot, after the G-buffer is filled (geometry + Hi-Z +
+// punctual gather stay inline core) and after RT sun shadows ran (the orchestrator sets ctx.RtShadowsThisFrame
+// before building ctx), before Sky (350). CORE-adjacent but the plan lists it as a pass (step E); it reads
+// ctx light/IBL/cluster/rtShadow state and is always invoked (no outer-if → always enabled).
+public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
+    public Dx12RenderPassEvent Event => Dx12RenderPassEvent.OpaqueLighting;
+    public string Name => "Deferred";
+
+    // The inline call had NO outer-if (DrawDeferredLighting was always invoked). So the pass is always enabled.
+    public bool Enabled(Dx12FrameContext ctx) => true;
+
+    // Render-wide camera constants (the renderer's CameraNear/CameraFar, inlined — they're frame-invariant
+    // const float on the orchestrator; the deferred CB's ClusterNearFar uses them).
+    const float CameraNear = 0.1f, CameraFar = 1000f;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct LightConstants {
+        public Matrix4x4 InvViewProj;
+        public Matrix4x4 View;
+        public Vector3 LightDir; public float Pad0;
+        public Vector3 LightColor; public float Pad1;
+        public Vector3 Ambient; public float Pad2;
+        public Vector3 CameraPos; public float UseIBL;
+        public float PrefilterMaxMip;
+        public float PunctualCount;
+        public Vector2 ScreenSize;
+        public Vector2 ClusterNearFar;
+        public float UseRtShadows; public float SpecClamp;   // SpecClamp: max per-light specular luma (V2 firefly cap; 0 = off)
+        public float SpecAaStrength; public float Pad4, Pad5, Pad6;   // V2: geometric specular AA strength (0 = off)
+    }
+
+    readonly Dx12Device dev;
+    ID3D12RootSignature deferredRootSig;   // LightConstants CBV(b0) + FrameConstants CBV(b1) + 13-SRV table + sampler
+    ID3D12PipelineState deferredPso;
+    ID3D12Resource deferredCb;
+    unsafe byte* deferredCbMapped;
+    Dx12DescriptorHeap deferredSrvVisible;  // 13 SRVs copied per frame: G0..G3, depth, irradiance, prefilter, BRDF, shadow, cluster lights/grid/index, RT shadow mask
+
+    // BuildDeferredLighting moved VERBATIM into the ctor (re-rooted onto `dev`). clusteredLights stays
+    // orchestrator-owned (the CPU froxel gather runs inline before deferred); the pass reads it via ctx.
+    public unsafe Dx12DeferredLightingPass(Dx12Device device) {
+        dev = device;
+        var lightCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Pixel);
+        var frameCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.Pixel);
+        // 13 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster lights/grid/index
+        // (t9..t11), RT shadow mask (t12).
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 13, baseShaderRegister: 0);
+        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
+        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        deferredRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None,
+                new[] { lightCbv, frameCbv, srvTable }, new[] { samp })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("DeferredLighting.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "DeferredLighting.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "DeferredLighting.hlsl");
+        deferredPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+            RootSignature = deferredRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
+            DepthStencilState = DepthStencilDescription.None,
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
+            DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
+        });
+
+        int cbSize = (Marshal.SizeOf<LightConstants>() + 255) & ~255;
+        deferredCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+        deferredCbMapped = deferredCb.Map<byte>(0);
+        deferredSrvVisible = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 13, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+    }
+
+    // DrawDeferredLighting moved VERBATIM. Re-rooted onto ctx: view/viewProj/camPos/light from ctx; IBL/
+    // shadow/cluster resources from ctx; iblActiveThisFrame/rtShadowsThisFrame from ctx; the RT shadow mask
+    // (orchestrator-owned, null when RT shadows never ran) and the FrameConstants CBV address from ctx.
+    public unsafe void Record(Dx12FrameContext ctx) {
+        var gbuffer = ctx.GBuffer;
+        var ibl = ctx.Ibl;
+        var shadowMap = ctx.ShadowMap;
+        var clusteredLights = ctx.ClusteredLights;
+        var rtShadowMask = ctx.RtShadowMask;
+        var target = ctx.Target;
+        int targetW = ctx.TargetW, targetH = ctx.TargetH;
+
+        // R2 / Decision 4: deferred is the CONSUMER of the G-buffer-as-SRV — head transition lives here.
+        // === DEFERRED LIGHTING: read the G-buffer + depth → PBR sun + IBL + shadows + punctual → HDR. ===
+        gbuffer.ToShaderResource();
+
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        Matrix4x4.Invert(ctx.ViewProj, out Matrix4x4 invVP);
+        // V2 specular firefly cap (per-light specular luma clamp). Default on; BALLISTIC_DX12_SPEC_CLAMP tunes it
+        // (0 = off, byte-identical to pre-V2). Lux-ish radiance scale → a high cap that only bites texel spikes.
+        float specClampValue = 8000f;
+        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_SPEC_CLAMP"),
+            System.Globalization.CultureInfo.InvariantCulture, out float sc)) specClampValue = sc;
+        // V2 geometric specular AA: roughen noisy normals to kill normal-map sparkle. Default on; tune/disable
+        // via BALLISTIC_DX12_SPEC_AA (0 = off, byte-identical). Strength scales the normal-derivative variance.
+        float specAaValue = 2f;
+        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_SPEC_AA"),
+            System.Globalization.CultureInfo.InvariantCulture, out float sa)) specAaValue = sa;
+        *(LightConstants*)deferredCbMapped = new LightConstants {
+            InvViewProj = Matrix4x4.Transpose(invVP),
+            View = Matrix4x4.Transpose(ctx.View),
+            LightDir = ctx.LightDir, LightColor = ctx.LightColor, Ambient = ctx.Ambient, CameraPos = ctx.CamPos,
+            UseIBL = ctx.IblActiveThisFrame ? 1f : 0f,
+            PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f,
+            PunctualCount = clusteredLights.LightCount,
+            ScreenSize = new Vector2(targetW, targetH),
+            ClusterNearFar = new Vector2(CameraNear, CameraFar),
+            UseRtShadows = ctx.RtShadowsThisFrame ? 1f : 0f,
+            // V2: per-light specular luma cap (firefly bound). The radiance scale is lux-ish (sun ~80000), so the
+            // cap is high — it only bites single-texel NDF spikes, not broad highlights. BALLISTIC_DX12_SPEC_CLAMP
+            // tunes it; =0 disables (byte-identical). Default 8000 (≈ a tenth of the sun radiance — outliers only).
+            SpecClamp = specClampValue,
+            SpecAaStrength = specAaValue,
+        };
+
+        // Copy the 13 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster
+        // lights/grid/index (t9..t11), RT shadow mask (t12).
+        deferredSrvVisible.Reset();
+        int b = deferredSrvVisible.AllocateRange(13);
+        // Only the 4 SHADED G-buffer RTs feed lighting (G0..G3 → t0..t3); the motion RT (RT4) is for TAA/FSR.
+        for (int i = 0; i < Dx12GBuffer.ShadedRtCount; i++)
+            dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + i), gbuffer.ColorSrvCpu(i), heapType);
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 4), gbuffer.DepthSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 5), ibl.IrradianceSrv, heapType);
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 6), ibl.PrefilterSrv, heapType);
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 7), ibl.BrdfSrv, heapType);
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 8), shadowMap.SrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 9), clusteredLights.LightSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 10), clusteredLights.GridSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 11), clusteredLights.IndexSrvCpu, heapType);
+        // RT shadow mask (t12) — the real mask when RT shadows ran this frame, else a valid unused fallback.
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 12),
+            rtShadowMask != null ? rtShadowMask.ColorSrvCpu : gbuffer.DepthSrvCpu, heapType);
+
+        target.RenderColorOnlyCleared(cl => {
+            cl.SetGraphicsRootSignature(deferredRootSig);
+            cl.SetPipelineState(deferredPso);
+            cl.SetDescriptorHeaps(deferredSrvVisible.Heap);
+            cl.SetGraphicsRootConstantBufferView(0, deferredCb.GPUVirtualAddress);
+            cl.SetGraphicsRootConstantBufferView(1, ctx.FrameCbAddress);
+            cl.SetGraphicsRootDescriptorTable(2, deferredSrvVisible.Gpu(b));
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
+    }
+
+    public void Dispose() {
+        deferredPso?.Dispose();
+        deferredRootSig?.Dispose();
+        deferredCb?.Dispose();
+        deferredSrvVisible?.Dispose();
+    }
+}
