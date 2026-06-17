@@ -1,3 +1,6 @@
+using BallisticEngine.Serialization;
+using Hexa.NET.ImGui;
+
 namespace BallisticEngine.Editor;
 
 // ONE choke point for every editor mutation (Phase F / F1 == Phase D / D1). The goal is to turn
@@ -28,6 +31,15 @@ namespace BallisticEngine.Editor;
 //
 // All methods no-op the snapshot while playing (EditorUndo itself guards SceneManager.IsPlaying) and
 // still run the mutation, exactly like the manual pattern.
+//
+// DEFERRED-COMMIT (the inspector-widget path, F1 chunk 33): the four methods above snapshot the
+// instant they are called -- right for discrete actions, but a slider/drag/typing session emits its
+// `changed` result EVERY frame, so a naive Push() per frame would spam the undo stack. TrackEdit owns
+// the activation-state machine that collapses one drag into exactly one entry, and it routes through
+// the SAME Structural/EditEntity scope choice (scopeEntity null -> whole-scene snapshot; non-null ->
+// scoped entity snapshot), so the inspector's per-widget undo and the discrete-action undo are now ONE
+// choke point. (Was InspectorUndo.Track -- relocated here so EditorCommands is the only undo entry
+// point; InspectorUndo now forwards to keep its call sites byte-identical.)
 internal static class EditorCommands {
     // A discrete structural change to the scene graph (add/remove/reparent/delete/create/group). Takes
     // a whole-scene snapshot first, then applies. Equivalent to "EditorUndo.Push(label); mutate();".
@@ -69,5 +81,60 @@ internal static class EditorCommands {
             return;
         EditorUndo.PushCallback(label, applyOld, applyNew);
         mutate();
+    }
+
+    // ---- Deferred-commit (inspector widgets) ----------------------------------------------------
+    //
+    // A single static pending slot is enough because ImGui edits one item at a time, so the per-axis
+    // TrackEdit calls in a Vector3 row don't race (only one is active at a time).
+    static string pendingYaml;
+    static string pendingLabel;
+    static Entity pendingEntity;
+    static bool pendingScoped;
+    static EntityDocument pendingDoc;
+
+    // Per-WIDGET edit with deferred commit. Call immediately AFTER the widget and BEFORE applying its new
+    // value, every frame; returns `changed` unchanged so call sites read naturally. Maps onto ImGui's
+    // per-item activation state to emit exactly one undo entry per drag / typing session, none for
+    // aborted no-change edits:
+    //   IsItemActivated()            -> the edit BEGAN this frame: snapshot NOW (still the OLD value,
+    //                                   since TrackEdit runs before the value is applied) into the slot.
+    //   IsItemDeactivatedAfterEdit() -> the edit FINISHED with a real change: commit the snapshot.
+    //   IsItemDeactivated()          -> the edit finished with NO change (hover/abort): drop it.
+    // Instantaneous widgets (checkbox/combo/color swatch) fire activate + deactivated-after-edit on the
+    // same frame, so they get exactly one entry too. `scopeEntity` picks the scope EXACTLY like the
+    // synchronous methods: non-null -> scoped entity snapshot (EditEntity-equivalent: undo restores just
+    // that entity, selection survives, no IrradianceVolume re-bake); null -> whole-scene snapshot
+    // (Structural-equivalent, for multi-selection broadcasts / scene-behaviour / asset edits).
+    public static bool TrackEdit(string label, Entity scopeEntity, bool changed) {
+        if (ImGui.IsItemActivated()) {
+            pendingLabel = label;
+            pendingEntity = scopeEntity;
+            pendingScoped = scopeEntity is not null;
+            // Scoped: capture just the entity (cheap, side-effect-free undo). Otherwise the whole scene.
+            pendingYaml = pendingScoped ? null : SceneSerializer.Serialize(SceneManager.GetCurrentScene());
+            if (pendingScoped)
+                pendingDoc = SceneSerializer.CaptureEntity(scopeEntity);
+        }
+
+        if (ImGui.IsItemDeactivatedAfterEdit()) {
+            if (pendingScoped && pendingDoc is not null)
+                EditorUndo.PushEntitySnapshot(pendingLabel, pendingEntity, pendingDoc);
+            else if (pendingYaml is not null)
+                EditorUndo.PushSnapshot(pendingLabel, pendingYaml);
+            ClearPending();
+        }
+        else if (ImGui.IsItemDeactivated()) {
+            ClearPending(); // aborted / no net change
+        }
+
+        return changed;
+    }
+
+    static void ClearPending() {
+        pendingYaml = null;
+        pendingDoc = null;
+        pendingEntity = null;
+        pendingScoped = false;
     }
 }
