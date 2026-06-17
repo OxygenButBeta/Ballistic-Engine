@@ -184,6 +184,12 @@ RT_GI/RT_SHADOWS off — pre-existing device-removal, not phase-3's to fix). Bui
     names, NOT `Dx12PassBuilder`) — so it needs its own backend-neutral builder interface, parallel to the
     recorder. Both are string-handle-keyed; the chunk-20 DX12 adapter implements both and maps names→graph
     handles / `Dx12PassBuilder` reads-writes.
+  - **CHUNK 20 — NO verb growth needed.** The chunk-19 D4 verb set drove the full SceneColorTint proof
+    end-to-end with NOTHING added. The DX12 backend handle map currently resolves ONLY `"SceneColor"`
+    (unknown→throw) and the only `BlitFullscreen` shader implemented is `"SceneColorTint"` (in-place RMW; a
+    plain copy when shader==null) — both grow on a concrete feature's demand, logged here. The recorder
+    ping-pongs through a private HDR scratch (Dx12FeatureBlitter) so src==dst==SceneColor is legal without the
+    feature minting scratch.
 - **D5 — default `Active`/removability.** A feature defaults `Active=true` when added (URP parity), but the
   WHOLE layer is inert until a `RenderFeatures` SceneBehaviour with ≥1 feature exists in the scene — so the
   golden scenes (which have none) are untouched. The manager early-outs on empty exactly like
@@ -241,15 +247,43 @@ proven on a trivial feature BEFORE any real feature is built (the chunk-18 risk 
     vs `Dx12RenderPassEvent` empty; golden 15/15 × {default, GRAPH=1, GRAPH+BARRIERS}; GBV CornellBox
     `8 known, 0 NEW (0 error-class)`.
 
-- **Chunk 20 — the backend BRIDGE + adapter + the PROOF feature (the seam test).** Add
-  `Dx12RenderFeatureBridge` + `Dx12FeaturePassAdapter` + a DX12 `IFeaturePassRecorder` impl (the minimal D4
-  verb set). Wire the bridge into `DX12HDRenderer` (one call after the built-in `graph.Add`s, BEFORE
-  `graph.Build()` — gated so it's a no-op when no `RenderFeatures` SceneBehaviour exists). Add ONE trivial
-  built-in proof feature (a "SceneColor tint/invert at PostProcess-1"). Verify: (i) with NO feature in the
-  scene → golden 15/15 + GBV 0-NEW (the pixel-neutral default); (ii) with the proof feature added → the
-  frame visibly tints in the expected region AND removing it returns byte-identical to golden (the positive
-  + removability oracle, §4). This is THE risky chunk (engine↔backend seam); it's the first that runs the
-  graph with a feature. If the verb surface proves too thin for even the tint, GROW it minimally + log here.
+- **Chunk 20 — the backend BRIDGE + adapter + the PROOF feature (the seam test). ✅ DONE (commits c58ef059
+  backend + f4c8474f proof door).** Shipped (5 new DX12 files + 1 shader + 2 edits, all in BallisticEngine.DX12,
+  + 1 engine test-door):
+  - `Resources/Dx12FeaturePassAdapter.cs` — `IRenderPass` wrapping ONE `RenderFeature`:
+    `Event=(Dx12RenderPassEvent)(int)feature.Event`, `Name=GetType().Name`, `Enabled=feature.Active`,
+    `Declare`→runs `feature.Declare` through `Dx12FeatureIOBuilder`, `Record`→binds the shared recorder to
+    `ctx`+feature then drives `feature.Record`. A feature that declares nothing = opaque node.
+  - `Resources/Dx12FeatureIOBuilder.cs` — `IFeatureIOBuilder` impl: string handle names →
+    `Dx12PassBuilder.Read/Write/ReadWrite` against the canonical graph handle of the same name (so
+    `"SceneColor"` shares identity with the built-ins → a real DAG edge). `RequestScratch` namespaced
+    `Feature.<type>#<idx>.<role>.<n>` (imported:false); `AllowCulling`→builder opt-in.
+  - `Resources/Dx12FeaturePassRecorder.cs` — `IFeaturePassRecorder` impl: `SceneColor` name accessor;
+    `Resolve(name)` maps `"SceneColor"`→`ctx.SceneColor` (only handle mapped today, D4 — unknown→throw);
+    `BlitFullscreen(src,dst,"SceneColorTint")`→routes to the blitter; `SetRenderTarget`→validate-only.
+  - `Resources/Dx12FeatureBlitter.cs` — the proof feature's GPU work: rootsig/PSO/CB/heap + an HDR scratch.
+    Tints SceneColor IN PLACE by `CopyColorFrom(SceneColor)→scratch` then a full-screen tint pass samples the
+    scratch and writes back (a RT can't be sampled+rendered at once). `Strength=0`→passthrough.
+  - `Resources/Dx12RenderFeatureBridge.cs` — the ONE bridge (mirrors `VolumePostProcessing.Apply`):
+    `RenderFeatureManager.Gather()`; rebuild the graph's feature segment ONLY when the active set changes
+    (`graph.SetFeaturePasses`→re-Build+Compile); no-op for feature-free scenes. Called once in `BeginRender`
+    after the volume bridge, BEFORE `graph.Execute`.
+  - `Shaders/SceneColorTint.hlsl` — `lerp(c, c*Tint, Strength)` in HDR-linear before composite.
+  - **Edits:** `Dx12RenderGraph` (`MarkCoreBoundary()` snapshots the built-in count; `SetFeaturePasses(features)`
+    truncates to the boundary, appends adapters, re-Build+Compile — empty list = exact built-in graph);
+    `DX12HDRenderer` (MarkCoreBoundary after the built-in Add's; create blitter/recorder/bridge at Initialize;
+    `featureBridge.Apply()` per frame before Execute; `featureBlitter.Resize` fan-out).
+  - **Proof door (engine-side, default OFF):** `RenderFeatureManager.Gather` injects ONE `SceneColorTintFeature`
+    (magenta 1.0/0.25/0.6) when `BALLISTIC_DX12_FEATURE_TINT_TEST=1` and no host exists — so the seam is
+    exercised end-to-end WITHOUT chunk-21 YAML round-trip. Inert when unset.
+  - **WHERE the bridge mounts (the chunk-20 decision):** built-ins are added + `graph.MarkCoreBoundary()` + Build
+    + Compile ONCE at Initialize; the bridge re-`SetFeaturePasses` (re-Build+Compile) ONLY when the active-feature
+    SET changes (compare by instance ref + order — a param-only edit does NOT rebuild). Cheap CPU recompile, rare.
+  - **VERIFIED:** slnx 0-err (editor incl.); SceneColorTint.hlsl embedded in DX12+Runtime+Cli bins. (i) PIXEL-NEUTRAL
+    DEFAULT — golden 15/15 SHA==golden under default / GRAPH=1 / GRAPH+GRAPH_BARRIERS; GBV CornellBox+BistroInterior
+    alias off+on = exit 0, 0 NEW (0 error-class). (ii) POSITIVE+REMOVABILITY — BistroInterior tint-door ON tints
+    magenta (per-channel R x1.0 / G x0.25 / B x0.6; meanAbsDiff 10.50/255); tint-door OFF byte-identical to golden
+    (40a68b28de4aa294fb); GBV with the feature ACTIVE on BistroInterior+CornellBox = exit 0, 0 NEW.
 
 - **Chunk 21 — serialization round-trip (D3).** Make the `RenderFeatures` SceneBehaviour's feature list
   serialize/deserialize through the scene YAML (reuse `ComponentReflection`): `FeatureNameOf` for the type,
