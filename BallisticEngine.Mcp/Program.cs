@@ -75,6 +75,18 @@ internal static class Program {
         if (method.Length == 0)
             return Result(id, ToolText($"unknown tool '{tool}'", isError: true));
 
+        // D2: defence-in-depth -- the method MapTool produced must be one the tool's declared ToolBinding
+        // allows. This makes the ToolBindings table load-bearing (the boundary contract, not dead data): a
+        // mapping regression that produced a method outside the declared set is caught HERE with a clean
+        // error instead of sending a surprise method down the pipe. The reflection harness (McpBoundaryTests)
+        // proves those declared methods are all real RemoteSchema methods, so this guard + that test together
+        // mean the MCP boundary can only ever send a real, schema-known method.
+        ToolBinding binding = Array.Find(ToolBindings, b => b.Tool == tool);
+        if (binding.Tool is not null && Array.IndexOf(binding.Methods, method) < 0)
+            return Result(id, ToolText(
+                $"internal: tool '{tool}' produced method '{method}' not in its declared binding "
+                + $"[{string.Join(", ", binding.Methods)}]", isError: true));
+
         try {
             JsonElement reply = CallPipe(method, pipeParams);
             return Result(id, reply.TryGetProperty("error", out JsonElement err)
@@ -152,7 +164,64 @@ internal static class Program {
         throw new Exception("bal.exe not found (build BallisticEngine.Cli or set BALLISTIC_ENGINE_ROOT)");
     }
 
-    // Tool name + MCP arguments -> command-port method + params (mostly pass-through).
+    // D2 (editor-rework Phase D, "MCP boundary schema validation"): the DECLARATIVE binding of each
+    // pipe-backed MCP tool to its command-port method(s) + the args the boundary requires PRESENT before
+    // it ever reaches the editor. This is the MCP layer's slice of the SAME single-source-of-truth the
+    // editor enforces with RemoteSchema -- the MCP tool surface used to be a THIRD hand-kept list (the
+    // tool switch in MapTool + the inputSchema.required arrays in ToolDefinitions) that could silently
+    // drift from the engine's RemoteSchema (e.g. the engine adds a required param to component.set; the MCP
+    // boundary keeps packaging the old shape and a malformed call slips through). This table is the boundary
+    // contract made DATA: ToolCall asserts at runtime that MapTool only ever produces a method declared here
+    // (so a mapping regression can't send a surprise method down the pipe), and -- because the MCP process
+    // stays ZERO-DEPENDENCY (it does NOT reference the engine, see the .csproj note) -- the parity with the
+    // engine schema is enforced HEADLESSLY by the reflection harness, which MIRRORS this table (the same
+    // mirror pattern MenuRegistryTests/ComponentPreviewTests use for unreferenceable editor types) and
+    // asserts every method here is a real RemoteSchema method and the RequiredArgs cover that method's
+    // required STRING params. ★ The harness mirror (BallisticEngine.Tests.Reflection/McpBoundaryTests.cs)
+    // MUST be kept in lockstep with this table -- a divergence makes the parity test RED. (CLI-backed tools
+    // scene_query/scene_gbuffer are NOT here: they shell out to `bal` and have no command-port method.)
+    //
+    // Methods can be a SET (play_control fans action->start/stop/pause/step; editor_undo->undo|redo). Two arg
+    // sets, both contributing to the GUARANTEE the MCP gives the editor (every schema-required string is in
+    // the pipe call):
+    //   - RequiredArgs: the agent MUST supply these -- Str() throws a clean message if absent, BEFORE the
+    //     pipe call, so a missing one is rejected here, not deep in a handler.
+    //   - DefaultedArgs: the MCP FILLS these if the agent omits them (e.g. editor_screenshot defaults `path`
+    //     to a temp file), so they are always present in the pipe call without burdening the agent.
+    // So the boundary guarantee = RequiredArgs UNION DefaultedArgs >= the method's required STRING params
+    // (asserted headlessly by the harness). Optional-only args (position/parent/fit/count/...) appear in
+    // NEITHER set -- the boundary tolerates them missing. The required Kind.Any "value" of component.set /
+    // scene.component.set is intentionally in NEITHER: the MCP reads it with TryGetProperty (an agent may
+    // pass a number/array), and the editor's RemoteSchema.Validate enforces its presence -- that division of
+    // labour is asserted by the harness too.
+    internal readonly record struct ToolBinding(string Tool, string[] Methods, string[] RequiredArgs, string[] DefaultedArgs);
+    internal static readonly ToolBinding[] ToolBindings = [
+        new("editor_status",       ["editor.status"],        [],                  []),
+        new("scene_describe",      ["scene.describe"],       [],                  []),
+        new("entity_get",          ["entity.get"],           ["entity"],          []),
+        new("entity_create",       ["entity.create"],        ["name"],            []),
+        new("entity_delete",       ["entity.delete"],        ["entity"],          []),
+        new("component_add",       ["component.add"],         ["entity", "type"], []),
+        new("component_remove",    ["component.remove"],      ["entity", "type"], []),
+        new("component_set",       ["component.set"],         ["entity", "target"], []),
+        new("editor_select",       ["select"],               ["entity"],          []),
+        new("play_control",        ["play.start", "play.stop", "play.pause", "play.step"], ["action"], []),
+        new("scene_save",          ["scene.save"],           [],                  []),
+        new("scene_open",          ["scene.open"],           ["path"],            []),
+        new("editor_undo",         ["undo", "redo"],         [],                  []),
+        new("editor_screenshot",   ["screenshot"],           [],                  ["path"]), // path defaults to a temp file
+        new("console_tail",        ["console.tail"],         [],                  []),
+        new("scripts_rebuild",     ["scripts.rebuild"],      [],                  []),
+        new("editor_frame",        ["editor.frame"],         [],                  []),
+        new("editor_refresh",      ["editor.refresh"],       [],                  []),
+        new("scene_component_set", ["scene.component.set"],  ["type", "member"],  []),
+    ];
+
+    // Tool name + MCP arguments -> command-port method + params (mostly pass-through). The method NAMES this
+    // switch produces are exactly the ToolBindings[*].Methods above (the harness asserts that parity), and
+    // each Str() call below is exactly a ToolBindings[*].RequiredArgs entry -- the boundary rejects a missing
+    // required arg here (clean Str() error) before the pipe call, so a malformed request never reaches the
+    // editor (the engine-side RemoteSchema.Validate is the second, defence-in-depth check on the editor).
     static (string method, object? p) MapTool(string tool, JsonElement a) => tool switch {
         "editor_status" => ("editor.status", null),
         "scene_describe" => ("scene.describe", null),

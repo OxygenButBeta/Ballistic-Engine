@@ -22,6 +22,7 @@ exit += SerializeReferenceTests.Run(); // G3 -- inserts a scene (no public unloa
 exit += NestedTests.Run();             // G4 -- inserts a scene (no public unload); runs before G0's own
 exit += UndoCoverageTests.Run();       // F3 -- undo coverage harness (inserts a scene; engine-only)
 exit += RemoteSchemaTests.Run();       // D2 -- command-port boundary schema validation (no scene; pure)
+exit += McpBoundaryTests.Run();        // D2 -- MCP tool surface <-> RemoteSchema parity (no scene; pure)
 exit += SerializerDropTests.Run();   // G0 — runs LAST (inserts a scene with no public unload)
 return exit;
 
