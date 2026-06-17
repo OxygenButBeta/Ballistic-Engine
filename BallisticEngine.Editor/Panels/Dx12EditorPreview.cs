@@ -180,6 +180,13 @@ internal static class Dx12EditorPreview {
         *(MatConstants*)matCbMapped = cb;
 
         // 2 contiguous SRV slots (albedo, normal) in the ring heap; missing maps fall back to 1x1 white.
+        // Reset the ring to slot 0 FIRST: this heap's AllocateRange contract (Dx12DescriptorHeap) is a per-use
+        // rewind — without it the 64-slot ring bump-grows across previews and silently wraps at draw #32,
+        // overwriting a slot a later CopyDescriptorsSimple still indexes (a named DEVICE_HUNG suspect: a
+        // shader-visible SRV ring overwritten under load). Each preview drains the GPU before returning
+        // (RenderIntoCleared + ReadColorRgba8 both submit+wait), so only 2 live slots are ever needed — rewind
+        // to 0 keeps the bound table descriptors fixed + valid. Harmless for the gated path; the fix-enabler.
+        matSrvHeap.Reset();
         int slot = matSrvHeap.AllocateRange(2);
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Dev.Device.CopyDescriptorsSimple(1, matSrvHeap.Cpu(slot),

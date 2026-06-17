@@ -27,6 +27,12 @@ internal sealed class ThumbnailCache {
         // DX12: the thumbnail/material-preview GPU path (Dx12EditorPreview) hangs the GPU (DXGI_ERROR_DEVICE_HUNG)
         // under load — DISABLED until root-caused (icon-tile fallback, the committed-safe behavior). The preview/
         // upload code below stays in the tree for the fix. Re-enable by removing this guard once verified safe.
+        // RW5 (editor-rework §9, chunk 50): static root-cause analysis done + a defensive ring-reset fix applied to
+        // Dx12EditorPreview.RenderMaterial (matSrvHeap.Reset()). The DEFINITIVE root cause + the un-gate still need
+        // ONE clean-seat DRED launch (BALLISTIC_DX12_DRED=1, no other editor on the GPU) to verify — see
+        // Docs/Plans/editor-rework-analysis.md §9 "Chunk 50 (RW5)" for the full findings + launch recipe. Kept
+        // GATED here (the box filled: a live debugged editor held the GPU, so launching the known PC-crasher path
+        // was unsafe; never relaunch-loop). Do NOT remove this guard without that DRED verification.
         if (IsDx12)
             return 0;
 
