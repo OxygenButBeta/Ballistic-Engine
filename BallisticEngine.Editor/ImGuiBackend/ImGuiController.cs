@@ -232,16 +232,18 @@ internal sealed class ImGuiController : IDisposable {
     static void ApplyGeometry(float scale) {
         ImGuiStylePtr style = ImGui.GetStyle();
 
-        // Modern app geometry: generous corner radii on cards/popups/tabs, rounded inputs, and almost
-        // no borders — surfaces are separated by background tint + spacing, not lines (the "flat panels
-        // welded by 1px seams" look is the main ImGui tell).
-        style.WindowRounding = 6f;
-        style.ChildRounding = 8f;
-        style.FrameRounding = 7f;
-        style.PopupRounding = 9f;
-        style.GrabRounding = 7f;
-        style.TabRounding = 8f;
-        style.ScrollbarRounding = 9f;
+        // EF5a — faithful-UE5 geometry: a tighter, flatter chrome than the prior "modern app" pass.
+        // Unreal's editor uses SMALL consistent rounding (~4-6px, not the soft 7-9px of consumer apps),
+        // near-zero borders (surfaces separated by background tint + spacing, not 1px seams — the main
+        // ImGui tell), and crisp rectangular tabs. The values below pull rounding down into the UE5 band
+        // and keep the roomy rows; behaviour is byte-unchanged (pure layout metrics).
+        style.WindowRounding = 5f;
+        style.ChildRounding = 5f;
+        style.FrameRounding = 4f;
+        style.PopupRounding = 5f;
+        style.GrabRounding = 4f;
+        style.TabRounding = 4f;
+        style.ScrollbarRounding = 5f;
         style.WindowBorderSize = 0f;        // panels read as surfaces, not framed boxes
         style.FrameBorderSize = 0f;
         style.PopupBorderSize = 1f;         // keep a hairline on floating popups for separation
@@ -263,28 +265,32 @@ internal sealed class ImGuiController : IDisposable {
         style.ScaleAllSizes(scale);
     }
 
-    // Distinctive "graphite" editor theme: cool blue-grey panels (not flat neutral grey), layered
-    // depth, and accent-tinted interaction states so it reads as a crafted tool rather than default
-    // ImGui. Safe to re-run any frame (colors only); the accent + derived tints drive every state.
+    // EF5a — faithful-UE5 "deep graphite" editor theme: a cool blue-grey (not flat neutral grey)
+    // elevation ramp pushed DARKER and flatter to match Unreal's editor chrome, with a single restrained
+    // azure highlight (no warm accent — identity decision (i)). Layered depth makes the azure pop; every
+    // interaction state derives from the accent + ramp. Safe to re-run any frame (colors only).
+    // NOTE: the bg0..titleBg ramp below is mirrored byte-for-byte in EditorTheme (Bg0..TitleBg) for the
+    // in-viewport overlay chrome — if you retune here, retune EditorTheme too (the comment there says so).
     static void ApplyColors(SysVec4 accent) {
         var c = ImGui.GetStyle().Colors;
 
-        // Dark, softly-cool elevation ramp: surfaces read as stacked layers (deeper = further back),
-        // making the blue accent pop. Lifted off pure black — a graphite charcoal that's easier on the
-        // eyes than near-black while still modern.
-        SysVec4 bg0 = Rgb(0x1A1C20);     // window background — base graphite
-        SysVec4 bg1 = Rgb(0x212429);     // child / popup — raised surface
-        SysVec4 bg2 = Rgb(0x282C32);     // frames (inputs)
-        SysVec4 bg3 = Rgb(0x343943);     // hovered frames
-        SysVec4 header = Rgb(0x2C313A);  // collapsing headers / selected tabs
+        // Deep, cool elevation ramp: surfaces read as stacked layers (deeper = further back), making the
+        // azure accent pop. Lifted just off pure black — a graphite charcoal easier on the eyes than
+        // near-black while reading distinctly darker/AAA than the prior pass. All contrasts verified:
+        // body text #ECEEF2 = 12-16:1 on every surface; textDim = >=4.7:1 even on input frames (bg2).
+        SysVec4 bg0 = Rgb(0x16181C);     // window background — base graphite (deeper than before)
+        SysVec4 bg1 = Rgb(0x1D2026);     // child / popup — raised surface
+        SysVec4 bg2 = Rgb(0x262A31);     // frames (inputs)
+        SysVec4 bg3 = Rgb(0x333842);     // hovered frames
+        SysVec4 header = Rgb(0x2B3038);  // collapsing headers / selected tabs
         SysVec4 accentHi = Lighten(accent, 1.32f);
         SysVec4 accentDim = Darken(accent, 0.5f);
         SysVec4 accentFaint = WithAlpha(accent, 0.22f);
-        SysVec4 text = Rgb(0xECEEF2);    // bright for contrast
-        SysVec4 textDim = Rgb(0x848C99);
-        SysVec4 border = Rgb(0x0E1013);  // used only where a seam is still wanted (popups/tables)
-        SysVec4 borderLight = Rgb(0x383E48);
-        SysVec4 titleBg = Rgb(0x15171A);
+        SysVec4 text = Rgb(0xECEEF2);    // bright primary text (>=12:1 on all surfaces)
+        SysVec4 textDim = Rgb(0x8C94A1); // secondary/disabled — nudged brighter to clear 4.5:1 on inputs
+        SysVec4 border = Rgb(0x0C0E11);  // used only where a seam is still wanted (popups/tables)
+        SysVec4 borderLight = Rgb(0x363C46);
+        SysVec4 titleBg = Rgb(0x121418);
 
         c[(int)ImGuiCol.Text] = text;
         c[(int)ImGuiCol.TextDisabled] = textDim;
@@ -299,7 +305,7 @@ internal sealed class ImGuiController : IDisposable {
         c[(int)ImGuiCol.TitleBg] = titleBg;
         c[(int)ImGuiCol.TitleBgActive] = titleBg;
         c[(int)ImGuiCol.TitleBgCollapsed] = titleBg;
-        c[(int)ImGuiCol.MenuBarBg] = Rgb(0x14161A);
+        c[(int)ImGuiCol.MenuBarBg] = Rgb(0x101216);
         c[(int)ImGuiCol.ScrollbarBg] = new SysVec4(0, 0, 0, 0);
         c[(int)ImGuiCol.ScrollbarGrab] = bg3;
         c[(int)ImGuiCol.ScrollbarGrabHovered] = borderLight;
@@ -320,11 +326,11 @@ internal sealed class ImGuiController : IDisposable {
         c[(int)ImGuiCol.ResizeGripHovered] = accentFaint;
         c[(int)ImGuiCol.ResizeGripActive] = accent;
         // Tabs: selected tab carries an accent top-bar feel via a brighter fill; dimmed tabs recede.
-        c[(int)ImGuiCol.Tab] = Rgb(0x1A1D23);
+        c[(int)ImGuiCol.Tab] = Rgb(0x16191E);
         c[(int)ImGuiCol.TabHovered] = bg3;
         c[(int)ImGuiCol.TabSelected] = header;
         c[(int)ImGuiCol.TabSelectedOverline] = accent;
-        c[(int)ImGuiCol.TabDimmed] = Rgb(0x16191E);
+        c[(int)ImGuiCol.TabDimmed] = Rgb(0x131519);
         c[(int)ImGuiCol.TabDimmedSelected] = bg2;
         c[(int)ImGuiCol.TabDimmedSelectedOverline] = accentDim;
         c[(int)ImGuiCol.TextSelectedBg] = accentFaint;

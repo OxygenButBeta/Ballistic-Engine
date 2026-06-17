@@ -19,14 +19,28 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF5a** (Theme: palette + geometry) — ⛔ BLOCKED on the EF5 identity decision
-> Last committed chunk: **EF9d** · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **EF5b** (Theme: centralize bypass-color offenders)
+> Last committed chunk: **EF5a** · Branch: `dx12-renderer`
 >
-> **STOP before implementing EF5a:** EF5a is BLOCKED on the **EF5 theme-identity decision** (see Open
-> Decisions + the EF5 section). The next chat must ASK the user to pick (i) faithful-UE5 (cool graphite +
-> blue-grey shell + a single restrained azure highlight, NO warm accent) OR (ii) UE5-inspired with our OWN
-> warm signature accent — and NOT start EF5a until that is answered. This choice fixes BOTH the accent AND
-> the "looks like UE5" acceptance bar. (EF5 is the headline ask + a GPU-touching style area, so do not guess.)
+> **EF5 identity decision RESOLVED → (i) faithful UE5** (cool graphite + blue-grey shell + a single
+> restrained azure highlight, NO warm accent). The azure accent `0x3D8BD4` (EditorPrefs default) is KEPT;
+> the acceptance bar for the whole EF5 series is "looks like UE5". EF5b–d implement against this identity.
+>
+> **EF5a note (just landed):** palette + geometry reworked to a deeper-graphite UE5 identity — pure style,
+> behaviour byte-unchanged. (1) Geometry (`ImGuiController.ApplyGeometry`): rounding pulled into UE5's small
+> band (Window/Child/Popup 5px, Frame/Grab/Tab 4px, Scrollbar 5px — was the soft 6-9px "consumer app" pass);
+> spacing/padding/borders unchanged. (2) Palette (`ImGuiController.ApplyColors`): the bg0..titleBg elevation
+> ramp pushed darker/cooler — bg0 `#1A1C20`→`#16181C`, bg1 `#212429`→`#1D2026`, bg2 `#282C32`→`#262A31`,
+> bg3→`#333842`, header→`#2B3038`, titleBg `#15171A`→`#121418`, menuBar→`#101216`, Tab/TabDimmed darkened to
+> match; `textDim` nudged `#848C99`→`#8C94A1` so secondary text clears 4.5:1 even on input frames; border/
+> borderLight retuned. (3) `EditorTheme` Bg0..TitleBg ramp mirrored byte-for-byte (the overlay-chrome mirror;
+> its comment mandates the sync) + `OverlayBg` (~Bg0@0.82) + RowLabel/RowCaption re-tuned to the new ramp.
+> **Contrast VERIFIED (WCAG):** body text `#ECEEF2` = 12-16:1 on every surface; `textDim` ≥4.7:1 on inputs;
+> azure accent 4.94:1 on bg0 (>3:1 UI-element min); RowLabel ~9-11:1, RowCaption ~4.7-5.8:1 — none muddy.
+> Touched ONLY `ImGuiController.cs` + `EditorTheme.cs` (both fully mine); `EditorApplication.cs` NOT touched
+> (its 2 pre-existing not-mine `RenderPassTogglesWindow.Draw(S)` lines are still the only diff there).
+> Editor csproj builds 0-error (scratch dir, around running-editor bin-copy lock). NOT visually verified yet
+> — batched into the EF5a–d human-screenshot checkpoint (GPU-hang rule: no relaunch-loop).
 >
 > **EF9d note (just landed):** the Window-menu open-state sync is COMPLETE. The checkmark was already correct
 > (`DrawRegistryMenu("Window")` → `EditorWindows.IsOpen(key)` → `IsWindowOpen` → `panels.IsShown(key)`, queried
@@ -128,7 +142,7 @@ this same handoff for the chunk after it.
 - [x] EF9b — maximize/fullscreen (re-verify EF3 fullscreen) — dedicated `###maxpanel`/`###maxinstance` identities + `NoSavedSettings`; maximize no longer undocks/pollutes the docked window; no swapchain resize introduced
 - [x] EF9c — layout persist + PassthruCentralNode review — `Shown` open/closed state now round-trips via a `.panels` sidecar (`EditorLayout.Save/LoadPanelState` + `EditorPanelRegistry.HiddenKeys/ApplyHidden`); PassthruCentralNode dropped (central node always filled, removed the maximize/modal-capture hazard)
 - [x] EF9d — Window-menu open-state sync — checkmark already queried `panels.IsShown` each frame (EF9c made that the same persisted flag); the bind-gap was that a menu-reopened CORE panel flipped `Shown` but never surfaced (only the two viewports consumed `pendingFocusWindow`). Fix: `DrawDockPanel` now `SetNextWindowFocus()` when its panel == `pendingFocusWindow`, so re-open surfaces it — same Unity focus-on-open the viewports get. No state-vs-disk disagreement possible (EF9c gift).
-- [ ] EF5a — palette + geometry (BLOCKED on identity decision)
+- [x] EF5a — palette + geometry — identity = (i) faithful UE5 (cool graphite + azure, no warm accent). Reworked `ImGuiController.ApplyGeometry` (rounding into UE5's 4-5px band) + `ApplyColors` (deeper-graphite bg0..titleBg ramp, brighter `textDim` for ≥4.5:1 on inputs) + mirrored the `EditorTheme` Bg0..TitleBg ramp / OverlayBg / RowLabel-RowCaption. Pure style, behaviour byte-unchanged; WCAG contrasts verified (body 12-16:1, accent 4.94:1). Only `ImGuiController.cs`+`EditorTheme.cs` touched. Visual verify batched into the EF5a–d checkpoint.
 - [ ] EF5b — centralize bypass-color offenders
 - [ ] EF5c — panel chrome polish
 - [ ] EF5d — type/spacing tokens everywhere
@@ -186,11 +200,9 @@ this same handoff for the chunk after it.
 - **EF6 Wireframe — CONFIRMED DEAD on DX12 (full removal safe).** Grep of `BallisticEngine.DX12/` for
   `DebugViewMode`/`Wireframe`: zero reads (only an unrelated GI-isolate hit). Wireframe/Normals/Depth
   are ALL non-functional on DX12, not just the buffer modes. Full dropdown removal loses nothing.
-- **EF5 identity decision — STILL OPEN, blocks EF5a.** The review is right that "UE5 look" (cool,
-  monochrome graphite + restrained blue-grey, NO warm accent) conflicts with "add a warmer signature
-  accent". Pick ONE before EF5a: (i) faithful UE5 (cool, azure/blue-grey highlight only), or
-  (ii) "UE5-inspired with our own warm signature accent". This choice drives BOTH the accent and the
-  "does it look like UE5" oracle. Flagged in Open Decisions; do not start EF5a until resolved.
+- **EF5 identity decision — RESOLVED 2026-06-17 → (i) faithful UE5** (cool, monochrome graphite +
+  restrained blue-grey shell + a single azure highlight `0x3D8BD4`, NO warm accent). This drives BOTH the
+  accent and the "does it look like UE5" oracle for the whole EF5 series. EF5a landed against it.
 
 ---
 
@@ -360,16 +372,17 @@ NOT greenfield: `EditorTheme.cs`/`EditorDecoration.cs`/`ImGuiController` exist. 
 (a) palette+geometry not yet pushed to a deep UE5-dark identity, (b) panels bypassing the theme with
 hardcoded colors. Target: deep dark graphite base, rounded panel headers, **one strong accent**,
 AAA-tool feel — "doesn't look like default ImGui."
-⛔ **BLOCKED on the identity decision (review catch).** "Faithful UE5" is cool/monochrome (graphite +
-blue-grey shell + a single restrained azure highlight, NO warm accent), which conflicts with adding a
-warm signature accent. Do NOT start EF5a until the user picks (i) faithful-UE5 or (ii) UE5-inspired-
-with-our-own-accent (see Open Decisions). This choice fixes BOTH the accent AND the "looks like UE5"
-acceptance bar. No accent recommendation is baked into the plan until then.
-- **EF5a — Palette + geometry pass:** rework `ImGuiController.ApplyColors/ApplyGeometry` + `EditorTheme`
-  surface ramp to a deep-graphite identity per the chosen direction (darker Bg0/Bg1, elevated TitleBg,
-  subtle 1px borders, consistent rounding 4-6px), set the accent. **Check text/background contrast
-  ratios (≥4.5:1 for body text) — deep-graphite themes easily go too low-contrast and read as muddy,
-  the opposite of the AAA feel.** Byte-of-behavior unchanged; pure style.
+✅ **IDENTITY DECISION RESOLVED → (i) faithful UE5** (cool graphite + blue-grey shell + a single
+restrained azure highlight, NO warm accent). The azure accent `0x3D8BD4` (EditorPrefs default) is KEPT;
+the acceptance bar for the whole EF5 series is "looks like UE5". EF5a–d all build against this identity.
+- **EF5a — Palette + geometry pass — ✅ DONE:** reworked `ImGuiController.ApplyGeometry` (rounding pulled
+  into UE5's small 4-5px band) + `ApplyColors` (deeper/cooler bg0..titleBg ramp: bg0 `#16181C`, bg1
+  `#1D2026`, bg2 `#262A31`, bg3 `#333842`, header `#2B3038`, titleBg `#121418`, menuBar `#101216`; `textDim`
+  brightened `#848C99`→`#8C94A1` for ≥4.5:1 on input frames) + mirrored the `EditorTheme` Bg0..TitleBg ramp
+  (overlay-chrome mirror) / OverlayBg / RowLabel-RowCaption to match. **Contrasts verified (WCAG):** body
+  `#ECEEF2` = 12-16:1 on every surface; `textDim` ≥4.7:1 on inputs; azure accent 4.94:1 on bg0; RowLabel
+  ~9-11:1, RowCaption ~4.7-5.8:1 — none muddy. Byte-of-behaviour unchanged; pure style. Only
+  `ImGuiController.cs`+`EditorTheme.cs` touched. Visual verify batched into the EF5a–d screenshot checkpoint.
 - **EF5b — Centralize bypass offenders:** route `AssetBrowserPanel`/`ConsolePanel`/`HierarchyPanel`
   hardcoded colors through `EditorTheme` (add semantic tokens where missing). No hand-typed `SysVec4`
   colors left in panels.
@@ -572,9 +585,9 @@ Theme (EF5) and windowing (EF9) are the user's emphasized asks — give them the
 human-screenshot verification. One commit per chunk (bisect discipline).
 
 ## Open decisions to confirm before implementing
-- **EF5 (BLOCKS EF5a): theme identity** — (i) faithful UE5 (cool graphite + blue-grey shell + restrained
-  azure highlight, NO warm accent) OR (ii) UE5-inspired with our OWN signature (warmer) accent. This
-  picks the accent AND the "looks like UE5" acceptance bar. Resolve before starting EF5a.
+- ~~**EF5 (BLOCKS EF5a): theme identity**~~ — **RESOLVED 2026-06-17 → (i) faithful UE5** (cool graphite +
+  blue-grey shell + a single restrained azure highlight `0x3D8BD4`, NO warm accent). Acceptance bar for
+  EF5a–d = "looks like UE5".
 - EF4: FPS Game-view-only (a) vs Game-view-and-playing-only (b). Default (a).
 - EF10: member-count threshold for showing the per-component search box (e.g. >12 fields) — tune in EF10a.
 - (Resolved by validation, no longer open: EF6 full removal is safe; EF9 keeps DockPanelHost; EF15
