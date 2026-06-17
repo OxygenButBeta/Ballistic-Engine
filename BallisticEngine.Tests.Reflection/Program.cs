@@ -12,6 +12,7 @@ exit += ReloadInvalidationTests.Run();
 exit += MenuRegistryTests.Run();
 exit += OrderedPassListTests.Run();
 exit += InputActionChainTests.Run();
+exit += DrawerStackTests.Run();
 return exit;
 
 internal static class TypeCacheTests {

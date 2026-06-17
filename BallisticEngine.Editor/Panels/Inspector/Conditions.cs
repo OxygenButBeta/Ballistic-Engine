@@ -3,12 +3,14 @@ using System.Collections.Generic;
 
 namespace BallisticEngine.Editor.Inspector;
 
-// Shared evaluation of [ShowIf]/[HideIf]/[EnableIf]/[DisableIf]. Used by BOTH the volume pipeline (via
-// ConditionalDecorator) and the component host loop (InspectorPanel.DrawMemberList/DrawMember call these
-// directly, since that loop owns its own foldout/grid chrome). A sibling that resolves to a
-// VolumeParameter is unwrapped to its .Value, so the same attribute works on plain components and volume
-// overrides. A missing sibling fails OPEN (never hides / never disables) so a typo'd condition can't
-// blank the inspector.
+// Shared evaluation of [ShowIf]/[HideIf]/[EnableIf]/[DisableIf]. The single source of truth both inspector
+// paths run through (B0): the composable drawer stack's VisibilityStep/EnableStep call these for every value
+// row (component AND volume), and the component LAYOUT driver (InspectorPanel.DrawMemberList) calls
+// Conditions.Visible for its skip + foldout chrome — but it now shares this same evaluator with the stack,
+// so the old component-vs-volume drift (each side reimplementing the condition logic) is gone. A sibling that
+// resolves to a VolumeParameter is unwrapped to its .Value, so the same attribute works on plain components
+// and volume overrides. A missing sibling fails OPEN (never hides / never disables) so a typo'd condition
+// can't blank the inspector.
 public static class Conditions {
     public static bool Visible(IReadOnlyList<ConditionalAttribute> conditionals, object owner) {
         if (conditionals is null) return true;

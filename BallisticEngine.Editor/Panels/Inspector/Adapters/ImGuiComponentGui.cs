@@ -26,8 +26,9 @@ public sealed class ImGuiComponentGui : IInspectorGui {
 
     public ImGuiComponentGui(IComponentInspectorHost host) => this.host = host;
 
-    // The component host (DrawMember) owns the row chrome (RowWithTooltip + mixed marker) and calls a
-    // drawer directly, so it sets the undo label here instead of through BeginRow.
+    // Since B0 the component value rows route through the shared DrawerStack, so BeginRow (below) sets the
+    // undo label ("Edit {label}") just like the volume path — DrawMember no longer calls this. Kept for any
+    // host that wants to override the label before a manual drawer call (none today; harmless to retain).
     public void SetUndoLabel(string fullLabel) => label = fullLabel;
 
     public void PushId(string id) => ImGui.PushID(id);

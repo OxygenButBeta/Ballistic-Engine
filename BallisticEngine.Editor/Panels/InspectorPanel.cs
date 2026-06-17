@@ -20,11 +20,13 @@ namespace BallisticEngine.Editor;
 internal sealed class InspectorPanel : IComponentInspectorHost {
     readonly EditorState state;
 
-    // Shared inspector drawer pipeline (Odin-style): one registry of value drawers + the conditional/
-    // ordering attributes serve BOTH the component inspector (here) and the volume profile editor. The
-    // component path keeps its own row/foldout chrome and drives a drawer directly through componentGui;
-    // the volume path runs the full DrawerPipeline. See BallisticEngine.Editor.Inspector.
+    // Shared inspector drawer STACK (Odin-style, B0): one registry of value drawers + a composable, recursive,
+    // deterministic drawer stack serve BOTH the component inspector (here) and the volume profile editor, so
+    // the two can't drift. The component path keeps its own foldout/grid LAYOUT + [ShowIf]/[Header]/[Space]
+    // skip in DrawMemberList (the layout driver); each value ROW runs through componentStack (Enable+terminal,
+    // sharing memberRegistry). See BallisticEngine.Editor.Inspector.DrawerStack.
     readonly DrawerRegistry memberRegistry = DrawerRegistry.CreatePrimitive();
+    readonly DrawerStack componentStack;
     readonly ImGuiComponentGui componentGui;
 
     // Pending asset-picker request (opened from an asset slot).
@@ -51,6 +53,9 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     public InspectorPanel(EditorState state) {
         this.state = state;
         componentGui = new ImGuiComponentGui(this);
+        // The component-path drawer stack shares memberRegistry as its terminal type-drawer source, so the
+        // component inspector and volume profile editor resolve the SAME value drawers (B0).
+        componentStack = DrawerStack.CreateComponent(memberRegistry);
         // The standalone component window reuses our reflection member renderer.
         ComponentEditorWindow.Configure(DrawMemberList);
     }
@@ -1359,6 +1364,20 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         Type memberType = ComponentReflection.MemberType(member);
         object value = ComponentReflection.GetValue(member, target);
 
+        // Registry-drawable value types (float/int/bool/string/enum/Vector2/Vector3) -- and ONLY these, not
+        // the special-widget types below -- now flow through the SAME composable drawer STACK as the volume
+        // profile editor (B0). The component stack owns its own row (PushId/BeginRow=label+mixed-marker+width)
+        // and the [ReadOnly]/[EnableIf] disable wrap (EnableStep) -- byte-identical to the old inline scaffold,
+        // but single-sourced through the stack instead of this method re-implementing Conditions.Disabled +
+        // calling the drawer directly (the component-vs-volume drift Conditions.cs warned about). The
+        // [ShowIf]/[HideIf] skip + the out-of-grid [Header]/[Space] separators stay in DrawMemberList (the
+        // layout driver), so the component stack registers only Enable+terminal -- see DrawerStack.CreateComponent.
+        if (!IsSpecialWidgetType(memberType, value) && memberRegistry.Resolve(memberType) is not null) {
+            componentStack.Draw(new MemberProperty(member, target,
+                v => { ApplyMember(member, target, v); state.MarkViewportDirty(); }), componentGui);
+            return;
+        }
+
         string display = attrs.LabelText?.Text ?? Prettify(member.Name);   // [LabelText] override
         RowWithTooltip(display, attrs.Tooltip?.Text);
         // Mixed-value marker: in a multi-selection, an amber dash when the selected entities DISAGREE
@@ -1373,8 +1392,6 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         // Every edit auto-registers ONE undo step via InspectorUndo.Track (snapshot on edit-begin,
         // commit on edit-end) — no per-widget EditorUndo.Push, so no case can forget it. Each change
         // also marks the viewport dirty (on-demand render) since a value edit can alter the picture.
-        string label = $"Edit {display}";
-
         if (typeof(BEvent).IsAssignableFrom(memberType)) {
             // Serialized event (UnityEvent-style): a multi-row listener editor. The component owns
             // the instance (a `public BEvent X = new();` field) so we edit it in place, never reassign.
@@ -1394,15 +1411,6 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             if (DrawGradientEditor(member.Name, gradient))
                 state.MarkViewportDirty();
         }
-        else if (memberRegistry.Resolve(memberType) is { } drawer) {
-            // Shared value drawers (float/int/bool/string/enum/Vector2/Vector3) — the SAME registry the
-            // volume profile editor uses, so the two paths can't drift. componentGui wraps each widget in
-            // InspectorUndo.Track; the MemberProperty setter is ApplyMember (multi-select) + dirty.
-            // Range/[ColorUsage] are carried on the IProperty, so slider-vs-drag and color-vs-axis match.
-            componentGui.SetUndoLabel(label);
-            drawer.Draw(new MemberProperty(member, target,
-                v => { ApplyMember(member, target, v); state.MarkViewportDirty(); }), componentGui);
-        }
         else {
             ImGui.TextDisabled($"({memberType.Name})");
         }
@@ -1410,6 +1418,15 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         if (memberDisabled) ImGui.EndDisabled();
         ImGui.PopID();
     }
+
+    // The special-widget member types with their own hand-rolled editors (BEvent listener list, asset slot,
+    // curve, gradient) that must NOT route through the value-drawer stack -- they keep the manual path until
+    // B4 converges them as terminal drawers. Matches the old if/else precedence exactly.
+    static bool IsSpecialWidgetType(Type memberType, object value) =>
+        typeof(BEvent).IsAssignableFrom(memberType)
+        || typeof(BObject).IsAssignableFrom(memberType)
+        || value is AnimationCurve
+        || value is ColorGradient;
 
     // ---- Vector widgets ---------------------------------------------------------
 

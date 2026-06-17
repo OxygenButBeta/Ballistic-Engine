@@ -160,7 +160,7 @@ internal static class VolumeProfileEditor {
     // attributes the component inspector uses, so the two paths can't drift. ImGuiVolumeGui draws the
     // per-parameter override checkbox + label and disables the value cell when not overridden;
     // [ShowIf]/[HideIf] on a parameter field hide its row.
-    static readonly DrawerPipeline pipeline = DrawerPipeline.CreateDefault();
+    static readonly DrawerStack pipeline = DrawerStack.CreateDefault();
     static readonly ImGuiVolumeGui volumeGui = new();
 
     static bool DrawParameters(VolumeComponent component) {
@@ -197,8 +197,8 @@ internal static class VolumeProfileEditor {
             exposure.limitMax.Value = exposure.limitMin.Value;
     }
 
-    // (The per-parameter value switch is gone — DrawParameters now runs every slot through the shared
-    // DrawerPipeline + ImGuiVolumeGui, the same value drawers the component inspector uses.)
+    // (The per-parameter value switch is gone -- DrawParameters now runs every slot through the shared
+    // composable DrawerStack + ImGuiVolumeGui (B0), the same value drawers the component inspector uses.)
 
     // Compact framed header with an Active checkbox overlaid after the arrow (the inline version
     // of InspectorPanel's component header) and a "..." menu button on the right edge. Remove
