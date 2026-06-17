@@ -64,8 +64,10 @@ public static class Dx12Backend {
         // have a few hundred unique maps). Grow if a scene ever needs more.
         SrvStore = new Dx12DescriptorHeap(device, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4096, shaderVisible: false);
         // Shader-visible bindless table: a few thousand texture descriptors (whole-mesh scenes use a few
-        // hundred unique maps × 6 slots). Bump-allocated; Reset() + re-register on a material-set change.
-        BindlessHeap = new Dx12DescriptorHeap(device, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 16384, shaderVisible: true);
+        // hundred unique maps × 6 slots). Bump-allocated; Reset() + re-register on a material-set change. The
+        // capacity is the single source of truth in Dx12BindlessTail (its RT/GI reserved-tail bases are derived
+        // from it), so the heap size and the tail can never drift apart.
+        BindlessHeap = new Dx12DescriptorHeap(device, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, Dx12BindlessTail.HeapCapacity, shaderVisible: true);
         // Editor ImGui present heap (scene/game color + font atlas + thumbnails). Generous so a busy asset
         // browser's thumbnails all fit; only the editor swapchain host populates it (null cost headless).
         UiHeap = new Dx12DescriptorHeap(device, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 16384, shaderVisible: true);

@@ -145,15 +145,16 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
     Dx12ScreenProbe screenProbe; // P4: screen-space radiance probes (final gather)
     bool screenProbeLogged;
 
-    // The 6 RT-GI table descriptors live in the SAME bindless heap as the material/geometry SRVs (one
-    // CBV/SRV/UAV heap binds at a time). RESERVED tail of the BindlessHeap (16384 cap; materials bump from 0).
-    const int RtGiTableBase = 16384 - 8;
-
-    // DDGI trace reserves its OWN 2-slot tail below RtGi's (TLAS @ +0, irr cube @ +1, prev-irr @ +2).
-    const int DdgiTableBase = 16384 - 12; // slots 16372, 16373, 16374
-
-    // Screen-probe TRACE reserves its OWN 3-slot tail below DDGI's (TLAS @ +0, irr cube @ +1, DDGI atlas @ +2).
-    const int ScreenProbeTableBase = 16384 - 16; // slots 16368, 16369, 16370
+    // The RT-GI / DDGI / screen-probe table descriptors live in the SAME bindless heap as the material/geometry
+    // SRVs (one CBV/SRV/UAV heap binds at a time), in the heap's RESERVED TAIL. R1.1: the bases are no longer
+    // hand-written `16384 - N` magic numbers — they come from the single Dx12BindlessTail allocator, which
+    // compile-time-asserts the layout (byte-identical to the old constants; see Dx12BindlessTail.cs).
+    //   RtGi: 6 used (TLAS @ +0, depth +1, normal +2, irr cube +3, lit scene +4, ssgiTarget UAV +5).
+    //   DDGI: 3 used (TLAS @ +0, irr cube +1, prev-irr atlas +2).
+    //   ScreenProbe: 3 used (TLAS @ +0, irr cube +1, DDGI atlas +2).
+    const int RtGiTableBase = Dx12BindlessTail.RtGiTableBase;
+    const int DdgiTableBase = Dx12BindlessTail.DdgiTableBase;
+    const int ScreenProbeTableBase = Dx12BindlessTail.ScreenProbeTableBase;
 
     // BuildSsgi + the SSGI/RT-GI rootsig/PSO/CB/heap construction moved VERBATIM into the ctor (re-rooted onto
     // dev). The SSGI PSOs/targets are built here; the RT-GI pipeline (rtGi*) stays LAZY (EnsureRtGi on first

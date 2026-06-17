@@ -79,10 +79,12 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     unsafe byte* rtReflCbMapped, rtReflSunCbMapped, rtReflGridCbMapped;
     bool rtReflBuilt;
     const int RtSbtSlot = 64;                   // shader-table record alignment
-    // Phase-8 reflection table reserves its OWN 8-slot tail of the bindless heap, BELOW the ScreenProbe tail
-    // (16368) so the four reservations (RtRefl < ScreenProbe < DDGI < RtGi) never collide. Slots 16352..16359:
-    // t0 TLAS, t1 depth, t2 normal, t3 material, t4 irr cube, t5 prefilter cube, t6 DDGI irr atlas, u0 ssrTarget.
-    const int RtReflTableBase = 16384 - 32;
+    // Phase-8 reflection table reserves its OWN 8-slot tail of the bindless heap, BELOW the ScreenProbe tail so
+    // the four reservations (RtRefl < ScreenProbe < DDGI < RtGi) never collide. Slots used (8): t0 TLAS, t1 depth,
+    // t2 normal, t3 material, t4 irr cube, t5 prefilter cube, t6 DDGI irr atlas, u0 ssrTarget. R1.1: the base is
+    // no longer a hand-written `16384 - 32` magic number — it comes from the single Dx12BindlessTail allocator
+    // (compile-time-asserted, byte-identical to the old constant; see Dx12BindlessTail.cs).
+    const int RtReflTableBase = Dx12BindlessTail.RtReflTableBase;
     [StructLayout(LayoutKind.Sequential)]
     struct RtReflConstants {
         public Matrix4x4 InvViewProj; public Vector3 CameraPos; public float Intensity;
