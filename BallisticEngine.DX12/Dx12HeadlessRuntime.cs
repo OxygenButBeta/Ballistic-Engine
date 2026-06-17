@@ -130,9 +130,29 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
             Console.WriteLine($"[Screenshot] saved {r.Width}x{r.Height} to {ScreenshotPath} (DX12)");
             PrintPerfStats();
             GBufferDump(r);
+            DrainValidation(r);
         }
         else {
             Console.Error.WriteLine("[Screenshot] DX12 renderer not active; nothing saved.");
+        }
+    }
+
+    // W2/W4 — drain the debug/GBV info queue at end-of-headless-render, normalize each message to a
+    // signature, partition against the captured baseline, print the report to STDERR (so `bal render`
+    // surfaces it — the CLI forwards the player's stderr, discards stdout), and FAIL LOUD on NEW
+    // error-class messages when BALLISTIC_DX12_BREAK_ON_ERROR=1. This is the headless render path's drain
+    // — before this, only the probe self-tests + the editor crash handler drained the queue, so a
+    // `bal render` GBV run stored validation messages but never printed them. GATED on HasInfoQueue
+    // inside DrainReportAndGate: a normal `bal render` (no debug layer / no GBV) is a silent no-op, so the
+    // non-debug render stays byte-identical and unchanged.
+    static void DrainValidation(DX12HDRenderer r) {
+        int newErrors = DX12.Dx12ValidationBaseline.DrainReportAndGate(r.Device);
+        // A nonzero count only ever returns when break-on-error is set AND there were NEW (non-baseline)
+        // error-class messages. Exit code 2 so the CLI (`bal render`) reports the validation failure; this
+        // runs AFTER the screenshot+stats are written, so artifacts still exist for inspection.
+        if (newErrors > 0) {
+            Console.Error.WriteLine($"[DX12-Validation] exiting non-zero ({newErrors} NEW error-class message(s)).");
+            Environment.Exit(2);
         }
     }
 

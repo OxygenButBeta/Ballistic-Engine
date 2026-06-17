@@ -22,6 +22,13 @@ public sealed class Dx12Device : IDisposable {
     // Lets OIDN create a HIP device on the SAME physical GPU (oidnNewDeviceByLUID) for zero-copy buffer sharing.
     public byte[] AdapterLuidBytes { get; }
 
+    // The adapter's human description (e.g. "AMD Radeon RX 9070 XT") and driver version, captured at
+    // device creation for the validation-baseline substrate pin (W2: a baseline is only valid against the
+    // GPU+driver that produced it). Best-effort: empty if the query failed. Driver version comes from the
+    // adapter's UMD version (CheckInterfaceSupport on IDXGIDevice), formatted as the familiar a.b.c.d.
+    public string AdapterDescription { get; }
+    public string AdapterDriverVersion { get; }
+
     // Hardware ray-tracing (DXR Tier 1.0+) support, queried ONCE at device creation. The renderer reads this
     // eagerly to AUTO-DOWNGRADE RayTraced GI/reflections/shadows to their screen-space fallbacks on a no-RT GPU
     // (the audience floor — GTX-1660-class cards often lack RT). A FORCED RT path on a non-DXR device is exactly
@@ -151,6 +158,19 @@ public sealed class Dx12Device : IDisposable {
         using IDXGIFactory4 factory = CreateDXGIFactory1<IDXGIFactory4>();
         IDXGIAdapter1 adapter = PickHardwareAdapter(factory);
         Device = D3D12CreateDevice<ID3D12Device2>(adapter, FeatureLevel.Level_12_0);
+        // Capture the adapter description + UMD (driver) version for the validation-baseline substrate pin
+        // (W2). Driver version is the packed LARGE_INTEGER UMD version: 4×16-bit fields → "a.b.c.d", the
+        // familiar AMD/NVIDIA driver-version form. Best-effort; both stay "" on failure (never blocks the
+        // device). Done while the adapter is still live (it's disposed immediately after).
+        try { AdapterDescription = adapter.Description1.Description?.Trim() ?? ""; } catch { AdapterDescription = ""; }
+        try {
+            // UMD version is queried against the IDXGIDevice interface GUID (the canonical "driver version"
+            // probe). The generic CheckInterfaceSupport<T> overload infers the interface from T.
+            if (adapter.CheckInterfaceSupport<IDXGIDevice>(out long umd)) {
+                AdapterDriverVersion = string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                    $"{(umd >> 48) & 0xFFFF}.{(umd >> 32) & 0xFFFF}.{(umd >> 16) & 0xFFFF}.{umd & 0xFFFF}");
+            } else AdapterDriverVersion = "";
+        } catch { AdapterDriverVersion = ""; }
         adapter.Dispose();
         // The adapter LUID as raw 8 bytes (little-endian) for OIDN HIP device matching (oidnNewDeviceByLUID).
         // ID3D12Device.AdapterLuid is the 64-bit LUID; its byte layout IS the native LUID struct.
@@ -213,19 +233,19 @@ public sealed class Dx12Device : IDisposable {
         if (enableDebugLayer)
             infoQueue = Device.QueryInterfaceOrNull<ID3D12InfoQueue>();
 
-        // W4 — FAIL LOUD: break into the debugger / throw at the offending call site on a NEW state error,
-        // so a barrier/state bug stops the run instead of scrolling past in the stored log. Opt-in
-        // (BALLISTIC_DX12_BREAK_ON_ERROR=1) and SEPARATE from GBV: chunk 0 only wires the mechanism. The
-        // baseline allowlist (W2 — "break only on messages NOT in the captured baseline") is a later chunk;
-        // until then break-on-error trips on pre-existing benign noise, so it stays OFF by default and the
-        // GBV verification run does NOT enable it (GBV stores+prints messages without breaking). When on,
-        // we break on Corruption + Error (the state class); Warnings stay non-breaking.
+        // W4 — FAIL LOUD on a NEW state error, BASELINE-AWARE (chunk 1). Chunk 0 wired a BLUNT
+        // SetBreakOnSeverity(Corruption/Error) that fired on EVERY error including pre-existing benign
+        // noise — incompatible with the "zero NEW errors vs baseline" gate (severity alone can't tell a
+        // baseline message from a new one). That is now REPLACED by a drain-time gate: at end-of-headless-
+        // render, Dx12ValidationBaseline.DrainReportAndGate() drains the info queue, normalizes each
+        // message to a signature, partitions against the captured baseline, and (when
+        // BALLISTIC_DX12_BREAK_ON_ERROR=1) fails the run loud on NEW error-class messages only. So the
+        // device ctor no longer sets break-on-severity; the gate is the allowlist-filtered drain. The flag
+        // is recorded here only for the banner; the drain gate re-reads the env var itself. (GBV stores +
+        // prints messages without breaking regardless — break-on-error is the optional hard-fail on top.)
         breakOnError = Environment.GetEnvironmentVariable("BALLISTIC_DX12_BREAK_ON_ERROR") == "1";
-        if (breakOnError && infoQueue is not null) {
-            infoQueue.SetBreakOnSeverity(MessageSeverity.Corruption, true);
-            infoQueue.SetBreakOnSeverity(MessageSeverity.Error, true);
-            Console.WriteLine("[DX12] Info-queue break-on-error: ENABLED (BALLISTIC_DX12_BREAK_ON_ERROR=1) — breaks on Corruption/Error. NOTE: no baseline allowlist yet, so pre-existing benign messages will also break.");
-        }
+        if (breakOnError && infoQueue is not null)
+            Console.WriteLine("[DX12] Info-queue break-on-error: ENABLED (BALLISTIC_DX12_BREAK_ON_ERROR=1) — baseline-aware: the end-of-frame drain fails loud on NEW (non-baseline) Corruption/Error messages only.");
     }
 
     readonly bool gbvEnabled;     // BALLISTIC_DX12_GBV=1 — GPU-Based Validation active (requires debug layer)
@@ -260,6 +280,28 @@ public sealed class Dx12Device : IDisposable {
         }
         infoQueue.ClearStoredMessages();
         return sb.ToString();
+    }
+
+    // True iff a debug info queue exists (debug layer / GBV is engaged). Lets the headless render path
+    // gate its drain-and-print so the normal (no-debug) `bal render` is byte-identical and unchanged.
+    public bool HasInfoQueue => infoQueue is not null;
+    public bool GbvEnabled => gbvEnabled;
+
+    // W2 drain: return the stored messages as durable DebugMessage records (Category/Severity/Id/
+    // Description) so the validation-baseline logic can NORMALIZE each to a signature. Clears the queue,
+    // exactly like DrainDebugMessages(). Empty list when the info queue is off. This is the structured
+    // counterpart of DrainDebugMessages() — the string form stays for the existing probe/editor callers.
+    public System.Collections.Generic.IReadOnlyList<DebugMessage> DrainDebugMessagesStructured() {
+        if (infoQueue is null) return System.Array.Empty<DebugMessage>();
+        ulong n = infoQueue.NumStoredMessages;
+        if (n == 0) return System.Array.Empty<DebugMessage>();
+        var list = new System.Collections.Generic.List<DebugMessage>((int)n);
+        for (ulong i = 0; i < n; i++) {
+            Message m = infoQueue.GetMessage(i);
+            list.Add(new DebugMessage(m.Category, m.Severity, m.Id, m.Description));
+        }
+        infoQueue.ClearStoredMessages();
+        return list;
     }
 
     static IDXGIAdapter1 PickHardwareAdapter(IDXGIFactory4 factory) {

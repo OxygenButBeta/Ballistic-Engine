@@ -22,6 +22,9 @@ namespace BallisticEngine;
 // typed properties only.
 public sealed class DX12HDRenderer : HDRenderer {
     readonly Dx12Device dev;
+    // The backing device — exposed so the headless render path can drain the debug/GBV info queue at
+    // end-of-frame (W2 validation baseline). Read-only; the renderer still owns the device's lifetime.
+    public Dx12Device Device => dev;
     Dx12OffscreenTarget target;       // HDR scene color (R16F) + depth — opaque/sky/fog render here
     Dx12OffscreenTarget ldr;          // LDR composite output (R8) — readback/display reads this
     // targetW/targetH = the INTERNAL (render) resolution: the scene + all post passes render here. When FSR
