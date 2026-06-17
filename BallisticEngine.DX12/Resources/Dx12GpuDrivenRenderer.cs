@@ -309,11 +309,18 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     public void BuildHiZ(CpuDescriptorHandle depthSrvCpu, int w, int h, bool enabled) {
         hizOnThisFrame = enabled;
         if (!enabled) return;
-        hiz.Ensure(w, h);
-        if (hizBindlessIndex < 0) {
+        // EF3 RESIZE HANG FIX: Ensure() returns true when it RECREATED the pyramid (resize → new dimensions →
+        // new resource + new mip count). The cull shader reads the pyramid through the BINDLESS heap slot
+        // hizBindlessIndex (ResourceDescriptorHeap[index]); that descriptor must be re-pointed at the NEW
+        // resource, or the cull samples the DISPOSED old pyramid → GPU device-removal/hang (DXGI_DEVICE_HUNG,
+        // PageFaultVA=0). Previously CreateAllMipsSrv ran ONLY on first build (hizBindlessIndex < 0), so after
+        // any resize the bindless descriptor was stale — the editor's resize crash. Re-register whenever the
+        // pyramid was (re)created OR the slot is unallocated.
+        bool recreated = hiz.Ensure(w, h);   // true on FIRST build (pyramid was null) AND on every resize
+        if (hizBindlessIndex < 0)
             hizBindlessIndex = Dx12Backend.BindlessHeap.Allocate();
+        if (recreated)   // re-point the bindless descriptor at the (new) pyramid — covers first build + resizes
             hiz.CreateAllMipsSrv(Dx12Backend.BindlessHeap.Cpu(hizBindlessIndex));
-        }
         dev.ExecuteSync(cl => hiz.Build(cl, depthSrvCpu));
     }
 

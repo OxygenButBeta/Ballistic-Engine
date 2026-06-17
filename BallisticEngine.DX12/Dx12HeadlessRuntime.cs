@@ -52,6 +52,18 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
         OnWindowShow?.Invoke();
         const double dt = 1.0 / 60.0;   // fixed step — deterministic frames for verification
 
+        // EF3 resize-stress diagnostic (BALLISTIC_DX12_RESIZE_STRESS=1): reproduce the editor's drag-resize
+        // GPU HANG headlessly. DRED reported PageFaultVA=0x0 on the live crash → NOT a use-after-free but a
+        // runaway/degenerate-extent shader. The editor renders the scene at the PANEL pixel size, which
+        // during a drag changes every frame (and can go tiny/odd). This drives ResizeSceneTarget over such a
+        // sequence with a real render between each, on the fully-bootstrapped renderer (DefaultTextures etc.
+        // all live), so a bad-extent dispatch hangs HERE — letting the pass be bisected without ever
+        // relaunching the live editor (GPU-hang rule). Runs with DRED always-on; prints OK per step.
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_RESIZE_STRESS") == "1") {
+            ResizeStress(dt);
+            return;
+        }
+
         // Run until the screenshot frame, render it, save, exit. With no screenshot requested, run a few
         // frames then stop (nothing to present without a swapchain). Query mode also needs a frame or two so
         // the AS-feeding RuntimeSet<IStaticMeshRenderer> is populated before the query runs.
@@ -90,6 +102,45 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
         // GpuSceneQuery over the REAL scene TLAS and print occupancy + classify for each given world point.
         // Validates the production AS-from-renderers path that the self-test door (synthetic box) can't.
         SceneQuerySmoke();
+    }
+
+    // EF3 resize-stress: render the scene across a sequence of sizes (the editor's drag-resize pattern) on
+    // the real renderer, checking DeviceRemovedReason after each. A single optional env BALLISTIC_DX12_
+    // RESIZE_STRESS_ONLYPASS=<n> isn't needed — bisection is done by reading which size logs the removal.
+    void ResizeStress(double dt) {
+        if (RenderAsset.Current.Renderer is not DX12HDRenderer r) {
+            Console.Error.WriteLine("[ResizeStress] DX12 renderer not active."); return;
+        }
+        // Warm up a few frames at the default size so the scene + AS + shadows are built before we resize.
+        for (int i = 0; i < 3; i++) { WindowUpdateCallback?.Invoke(dt); WindowRenderCallback?.Invoke(dt); }
+
+        // Sizes that mimic a drag-resize: shrink, grow, tiny, odd/non-aligned, 4K, back. The editor clamps
+        // the panel size to >=1 (ViewportRenderer), so we never pass 0 — but we DO pass small/odd extents that
+        // a group-count or mip computation might mishandle.
+        (int w, int h)[] sizes = {
+            (1920,1080),(1600,900),(800,600),(1,1),(2,2),(7,3),(64,64),(1280,720),(3840,2160),
+            (1920,1080),(1281,721),(33,1080),(1920,17),(640,360),(2560,1440),(1200,800),(1920,1080),
+        };
+        foreach (var (w, h) in sizes) {
+            r.ResizeSceneTarget(w, h);
+            r.Device.Flush();
+            var afterResize = r.Device.Device.DeviceRemovedReason;
+            if (!afterResize.Success) {
+                Console.Error.WriteLine($"[ResizeStress] DEVICE REMOVED by REALLOC at {w}x{h}: reason={afterResize} DRED={r.Device.DrainDredReport()}");
+                Environment.Exit(3);
+            }
+            WindowUpdateCallback?.Invoke(dt);
+            WindowRenderCallback?.Invoke(dt);
+            var reason = r.Device.Device.DeviceRemovedReason;
+            if (!reason.Success) {
+                Console.Error.WriteLine($"[ResizeStress] DEVICE REMOVED by RENDER at {w}x{h}: reason={reason} DRED={r.Device.DrainDredReport()}");
+                // Debug/GBV messages (only present under BALLISTIC_DX12_DEBUG/GBV) name a bad bind/barrier.
+                if (r.Device.HasInfoQueue) Console.Error.WriteLine($"[ResizeStress] debug-msgs:\n{r.Device.DrainDebugMessages()}");
+                Environment.Exit(3);   // stop on first removal — do not keep hammering the GPU
+            }
+            Console.WriteLine($"[ResizeStress] ok {w}x{h}");
+        }
+        Console.WriteLine("[ResizeStress] PASS (no device removal across the size sequence)");
     }
 
     static void SceneQuerySmoke() {

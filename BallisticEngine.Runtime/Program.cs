@@ -42,7 +42,8 @@ internal class Program {
         // crashed the swapchain). A normal launch uses the windowed DX12 host.
         bool headlessMode = Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT") is not null
                             || Environment.GetEnvironmentVariable("BALLISTIC_QUERY") is not null
-                            || Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_MOTION_DUMP") is not null;
+                            || Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_MOTION_DUMP") is not null
+                            || Environment.GetEnvironmentVariable("BALLISTIC_DX12_RESIZE_STRESS") == "1";
         IBallisticEngineRuntime runtime;
         if (headlessMode) {
             Console.WriteLine("[Backend] DX12 host (headless — screenshot/query path).");
