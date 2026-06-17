@@ -36,6 +36,11 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
         b.Read(b.Resource("GBuffer"));
         b.Read(b.Resource("ShadowMap"));
         b.ReadWrite(b.Resource("SceneColor"));
+        // PHASE-2 V3 (chunk 14): Fog's ONE shared-resource head transition is `gbuffer.DepthToShaderResource()` —
+        // same usage class as SSAO/AP. The ShadowMap SRV is set up by RenderShadows (not a per-pass boundary
+        // transition the pass owns), so only the depth usage is derived here.
+        b.DeriveBarriers();
+        b.Use(Dx12ResourceUsage.GBufferDepthShaderRead);
     }
 
     // The sun shadow map is built at this fixed size in DX12HDRenderer (const ShadowMapSize). The fog samples
@@ -150,7 +155,8 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
 
         // depth → SRV (G-buffer owns it), shadow array already SRV from RenderShadows. Copy both into the
         // fog heap. After the sky pass the G-buffer depth is in DepthRead; bring it to PixelShaderResource.
-        gbuffer.DepthToShaderResource();   // head transition (R2): emit our own
+        // PHASE-2 V3: skip the manual head transition when derived barriers are active (the graph emitted it).
+        if (!ctx.BarriersDerived) gbuffer.DepthToShaderResource();   // head transition (R2): emit our own
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(0), gbuffer.DepthSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(1), shadowMap.SrvCpu, heapType);

@@ -35,6 +35,10 @@ public sealed class Dx12AerialPerspectivePass : IRenderPass, IDisposable {
     public void Declare(Dx12PassBuilder b) {
         b.Read(b.Resource("GBuffer"));
         b.ReadWrite(b.Resource("SceneColor"));
+        // PHASE-2 V3 (chunk 14): AP's ONE shared-resource head transition is `gbuffer.DepthToShaderResource()` —
+        // same usage class as SSAO/Fog. Declare it so the graph derives + emits it (BALLISTIC_DX12_GRAPH_BARRIERS=1).
+        b.DeriveBarriers();
+        b.Use(Dx12ResourceUsage.GBufferDepthShaderRead);
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -142,7 +146,9 @@ public sealed class Dx12AerialPerspectivePass : IRenderPass, IDisposable {
             MaxDistance = 60000f, NearFade = nearFade,
         };
 
-        gbuffer.DepthToShaderResource();   // head transition (R2): emit our own
+        // Head transition (R2): emit our own. PHASE-2 V3: skip when derived barriers are active (the graph
+        // already emitted it before Record — emit the derived set ONLY, plan §V3).
+        if (!ctx.BarriersDerived) gbuffer.DepthToShaderResource();
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         dev.Device.CopyDescriptorsSimple(1, apSrvVisible.Cpu(0), gbuffer.DepthSrvCpu, heapType);
 

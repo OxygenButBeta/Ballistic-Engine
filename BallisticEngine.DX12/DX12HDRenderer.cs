@@ -631,6 +631,18 @@ public sealed class DX12HDRenderer : HDRenderer {
             Console.Error.WriteLine("[DX12] Render graph (phase-2 V1): COMPILED ORDER active (BALLISTIC_DX12_GRAPH=1).");
             Console.Error.WriteLine(graph.LastCompileReport);
         }
+        // PHASE 2 V3 (chunk 14): auto-derived boundary barriers. Gated behind BALLISTIC_DX12_GRAPH_BARRIERS=1
+        // (requires GRAPH=1 — it runs in ExecuteGraph). When set, the graph DERIVES each migrated pass's head
+        // transition from its declared Usages and emits it before Record; the migrated pass skips its manual head
+        // transition (ctx.BarriersDerived). Default off → migrated passes emit their manual head transitions,
+        // byte-identical to V1/V2. Compile already built + plan-level-validated the deriver (CompareToManual);
+        // print the comparison so the manual-vs-derived sets are auditable.
+        barriersPath = graphPath && Environment.GetEnvironmentVariable("BALLISTIC_DX12_GRAPH_BARRIERS") == "1";
+        graph.SetBarriersDerived(barriersPath);
+        if (barriersPath) {
+            Console.Error.WriteLine("[DX12] Render graph (phase-2 V3): AUTO-DERIVED BARRIERS active (BALLISTIC_DX12_GRAPH_BARRIERS=1).");
+            Console.Error.WriteLine(graph.LastDeriverReport);
+        }
 
         // === PHASE 2 V2 (chunk 13): the TRANSIENT RENDER-TARGET POOL + lifetime ALIASING. Gated behind
         // BALLISTIC_DX12_GRAPH_ALIAS=1 (requires GRAPH=1 — it reads the COMPILED order for lifetimes). Default off →
@@ -711,6 +723,11 @@ public sealed class DX12HDRenderer : HDRenderer {
     // rtPool null, Active null → committed targets, byte-identical to V1.
     Dx12RenderTargetPool rtPool;
     bool aliasPath;
+    // PHASE 2 V3 (chunk 14): the auto-derived-barriers door. barriersPath = graphPath && BALLISTIC_DX12_GRAPH_BARRIERS=1.
+    // When set, the graph emits each migrated pass's derived head transition (deriver.Emit) before its Record, and
+    // ctx.BarriersDerived tells the migrated pass to skip its own manual head transition (emit derived ONLY).
+    // Default off → migrated passes emit their manual head transitions, byte-identical to V1/V2.
+    bool barriersPath;
 
     // Cascade caching: skip re-rendering the sun cascades when the texel-snapped fit matrices AND the caster
     // geometry are unchanged (the depth-array layers are retained → byte-identical; big win for a static camera).
@@ -1458,6 +1475,7 @@ public sealed class DX12HDRenderer : HDRenderer {
             Dxr = dxr,   // chunk 10: shared DXR substrate (sceneAS/device5/rtGeometry/ddgi) for the GI + Reflections passes
             FrameCbAddress = frameCb.GPUVirtualAddress,   // chunk 8: Transparents binds it; chunk 9: Deferred binds it too (b1 FrameConstants CBV)
             Doors = doors, PostFX = PostFX, Stats = RenderStats.Scene,
+            BarriersDerived = barriersPath,   // chunk 14 (V3): migrated passes skip their manual head transition when on
             // chunk 7 (composite): deterministic flag (grain/exposure reset) + the SSAO pass output the composite
             // samples for AO. SsaoResult is a stable descriptor handle (ssaoA.ColorSrvCpu) — only its contents
             // change per frame, so binding it at ctx build is always correct.

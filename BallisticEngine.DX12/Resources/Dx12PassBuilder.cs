@@ -2,6 +2,20 @@ using System.Collections.Generic;
 
 namespace BallisticEngine.DX12;
 
+// PHASE-2 (V3) — the USAGE of a declared read/write, the input to the auto-barrier derivation. A pass that has
+// opted into derived barriers (builder.DeriveBarriers()) declares its SHARED/imported-resource reads with one
+// of these instead of the bare Read(handle); the graph maps usage → the idempotent target-state transition the
+// pass used to emit as its manual head transition (the usage→state map, plan §V3). Only the boundary transitions
+// on SHARED resources (GBuffer depth/color, the canonical SceneColor target) are derived — pass-PRIVATE scratch
+// ping-pong transitions (ssaoA, ssrTarget, ssgiTarget) stay inline (they are not pass-boundary head transitions).
+public enum Dx12ResourceUsage {
+    None = 0,
+    GBufferShaderRead,          // gbuffer.ToShaderResource()            — combined PIXEL|NON_PIXEL on ALL colors+depth (Deferred)
+    GBufferDepthShaderRead,     // gbuffer.DepthToShaderResource()       — depth → PixelShaderResource (SSAO/AP/Fog/Refl-SSR/FSR)
+    GBufferDepthReadOnly,       // gbuffer.DepthToReadOnly()             — depth → DepthRead (Sky/Transparents DSV bind)
+    SceneColorShaderRead,       // ctx.SceneColor.ColorToShaderResource()— canonical HDR scene color → PixelShaderResource (GI/Refl/TAA/FSR/Composite)
+}
+
 // PHASE-2 (V1) — the builder a pass uses in IRenderPass.Declare() to register its resource reads/writes and
 // its scheduling hints against the frame graph. Filled by Dx12RenderGraph.Compile() (one builder per pass,
 // once at build), then frozen into a Dx12PassDeclaration the compiler reads to build the dependency DAG.
@@ -63,6 +77,21 @@ public sealed class Dx12PassBuilder {
     // imported write, or any consumer, keeps it. Default-OFF means the cull path is exercised only by passes that
     // set this — the matrix MUST include ≥1 cull-enabled pass or the culler footgun ships untested.
     public void AllowCulling() => Current.AllowCulling = true;
+
+    // --- PHASE-2 V3: auto-derived boundary barriers (BALLISTIC_DX12_GRAPH_BARRIERS=1) ---
+
+    // Opt this pass into DERIVED boundary barriers. A pass that calls this declares its SHARED-resource reads via
+    // Use(usage) (below); the graph derives the equivalent idempotent head transition and emits it before Record,
+    // and the pass REMOVES its own manual head transition. Default OFF (per pass) → the pass keeps its manual head
+    // transitions, byte-identical to V1/V2. Migrate ONE pass at a time (plan §V3). DeriveBarriers without any
+    // Use() means "this pass needs no boundary transition" (e.g. it only writes pass-private scratch).
+    public void DeriveBarriers() => Current.BarriersDerived = true;
+
+    // Declare ONE boundary usage of a SHARED resource. The graph maps usage → the idempotent transition method on
+    // the concrete ctx resource and emits it at the pass boundary (replacing the manual head transition). Order
+    // matters: usages are emitted in declaration order, BATCHED conceptually at the boundary (the resource objects
+    // self-track + early-return, so a redundant one is a free no-op — the manual set's idempotency is preserved).
+    public void Use(Dx12ResourceUsage usage) => Current.Usages.Add(usage);
 }
 
 // The frozen per-pass declaration the compiler reads. One per registered pass; an opaque (Declare-not-overridden)
@@ -73,6 +102,12 @@ public sealed class Dx12PassDeclaration {
     public readonly HashSet<string> SharedState = new();
     public bool AllowCulling;        // false unless the pass opts in via builder.AllowCulling()
     public bool Declared;            // true once the pass overrode Declare() and recorded ≥1 read/write/touch
+
+    // PHASE-2 V3: the ORDERED list of shared-resource boundary usages this pass declared (via builder.Use). The
+    // barrier deriver maps each to an idempotent transition on the concrete ctx resource and emits it before
+    // Record — replacing the pass's manual head transition. Empty unless the pass opted into BarriersDerived.
+    public readonly List<Dx12ResourceUsage> Usages = new();
+    public bool BarriersDerived;     // true once the pass called builder.DeriveBarriers() — derive its head transitions
 
     public bool IsOpaque => !Declared;   // never culled, imports everything (see compiler opaque-edge rule)
 }

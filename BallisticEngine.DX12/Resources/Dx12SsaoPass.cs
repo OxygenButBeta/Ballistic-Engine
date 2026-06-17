@@ -35,6 +35,12 @@ public sealed class Dx12SsaoPass : IRenderPass, IDisposable {
     public void Declare(Dx12PassBuilder b) {
         b.Read(b.Resource("GBuffer"));
         b.Write(b.Resource("Ssao"));
+        // PHASE-2 V3 (chunk 14): opt into DERIVED boundary barriers. SSAO's ONE shared-resource head transition is
+        // `gbuffer.DepthToShaderResource()` — declare it as a usage so the graph derives + emits it before Record
+        // (under BALLISTIC_DX12_GRAPH_BARRIERS=1). The pass-private ssaoA/ssaoB ping-pong transitions are NOT
+        // boundary transitions → they stay inline in Record. SSAO is the first migrated pass (the template).
+        b.DeriveBarriers();
+        b.Use(Dx12ResourceUsage.GBufferDepthShaderRead);
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -125,7 +131,10 @@ public sealed class Dx12SsaoPass : IRenderPass, IDisposable {
         Matrix4x4 view = ctx.View, proj = ctx.Proj;
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Matrix4x4.Invert(proj, out Matrix4x4 invProj);
-        gbuffer.DepthToShaderResource();   // head transition (R2): emit our own; no-op if fog already moved it
+        // Head transition (R2): emit our own; no-op if fog already moved it. PHASE-2 V3 (chunk 14): when derived
+        // barriers are active the GRAPH already emitted this (deriver.Emit before Record), so SKIP the manual one
+        // — emit the derived set ONLY (plan §V3: not manual+derived stacked, which would muddy the GBV sequence).
+        if (!ctx.BarriersDerived) gbuffer.DepthToShaderResource();
         *(SsaoConstants*)ssaoCbMapped = new SsaoConstants {
             Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProj),
             View = Matrix4x4.Transpose(view),

@@ -91,6 +91,14 @@ public sealed class Dx12FrameContext {
     // its own lazy-create); the ctx field is a stable reference (init-only). Null is never expected.
     public Dx12DxrShared Dxr { get; init; }
 
+    // PHASE-2 V3 (chunk 14): true when BALLISTIC_DX12_GRAPH_BARRIERS=1 (requires GRAPH=1). A MIGRATED pass reads
+    // this at the head of Record: when true, the graph ALREADY emitted the pass's boundary head transition (the
+    // derived set), so the pass SKIPS its own manual head transition (emit the derived set ONLY — plan §V3); when
+    // false, the graph emitted nothing, so the pass emits its manual head transition as before. The two are
+    // mutually exclusive → GBV sees exactly one transition sequence (not manual+derived stacked). init-only,
+    // stable per frame. Un-migrated passes ignore it (they always emit their manual head transitions).
+    public bool BarriersDerived { get; init; }
+
     // --- engine-side config / output (read-only references) ---
     public Dx12RenderDoors      Doors    { get; init; }
     public PostProcessSettings  PostFX   { get; init; }

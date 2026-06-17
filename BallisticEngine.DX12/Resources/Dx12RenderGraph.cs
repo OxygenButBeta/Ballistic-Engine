@@ -34,6 +34,14 @@ public sealed class Dx12RenderGraph {
     Dx12PassDeclaration[] declarations;               // per-registered-pass, index-aligned with `registered`
     string lastCompileReport;                         // dump of the compiled DAG/cull/order (diagnostics)
 
+    // Phase-2 V3 (chunk 14): the auto-derived boundary-barrier engine, built by Compile() from each migrated
+    // pass's declared Usages. When BarriersDerived is on (BALLISTIC_DX12_GRAPH_BARRIERS=1) ExecuteGraph emits the
+    // DERIVED head transition before a migrated pass's Record — replacing the manual head transition the pass
+    // removed. Default OFF (BarriersDerived false) → the manual head transitions inside each Record run, unchanged.
+    Dx12BarrierDeriver deriver;
+    bool barriersDerived;                             // the BALLISTIC_DX12_GRAPH_BARRIERS door (set by SetBarriersDerived)
+    string lastDeriverReport;                         // the plan-level manual-vs-derived comparison dump
+
     // Optional per-pass timing wrapper supplied by the renderer (its TimePass: records GPU wall-time into
     // RenderStats.GpuPasses only when GI timing is on, else just runs the body). Kept as a delegate so the
     // graph doesn't reach into the renderer's RenderStats/GiTimingEnabled internals. Null → run directly.
@@ -222,7 +230,32 @@ public sealed class Dx12RenderGraph {
 
         graphOrder = order.ToArray();
         lastCompileReport = BuildReport(orderIdx, culled);
+
+        // --- 6. PHASE-2 V3 (chunk 14): build the auto-derived boundary-barrier engine. For each pass that opted
+        // into BarriersDerived (builder.DeriveBarriers), register its ordered Usages → the deriver computes the
+        // (role → final-state) map and the runtime emit path. Then run the PLAN-LEVEL defense: compare the derived
+        // set to the static manual reference (CompareToManual: derived ⊇ manual + same final state) and THROW at
+        // init on any mismatch — a derivation bug surfaces here, not as mid-frame corruption. Pure CPU; the engine
+        // only EMITS at runtime when the door is on AND the pass is migrated (ExecuteGraph). ---
+        deriver = new Dx12BarrierDeriver();
+        for (int i = 0; i < n; i++)
+            if (declarations[i].BarriersDerived)
+                deriver.Register(registered[i].Name, declarations[i].Usages);
+        lastDeriverReport = deriver.CompareToManual(Dx12BarrierDeriver.ManualReference(), out bool unsound);
+        if (unsound)
+            throw new InvalidOperationException(
+                "[Dx12RenderGraph] V3 barrier derivation UNSOUND — derived set does not cover the manual reference " +
+                "(same final state per role required). See report:\n" + lastDeriverReport);
     }
+
+    // The BALLISTIC_DX12_GRAPH_BARRIERS door (resolved once by the renderer; requires the GRAPH path). When ON,
+    // ExecuteGraph emits each migrated pass's DERIVED head transition before its Record (the pass removed its
+    // manual head transition). OFF → migrated passes have NO head transition AT ALL (it was removed) UNLESS this
+    // is on — so a migrated pass under GRAPH=1 without BARRIERS=1 would be wrong. Guarded: the migration removes a
+    // pass's manual head transition ONLY in tandem with this; default off keeps the comparison/dump but does not
+    // emit (the door gates EMIT, not the build). The renderer keeps GRAPH_BARRIERS requiring GRAPH=1.
+    public void SetBarriersDerived(bool on) => barriersDerived = on;
+    public string LastDeriverReport => lastDeriverReport;
 
     // Run the COMPILED topo order (the BALLISTIC_DX12_GRAPH=1 path). Compiles lazily on first call. Same
     // Enabled→Record contract as Execute; barriers are still the manual phase-1 head transitions in V1.
@@ -232,6 +265,11 @@ public sealed class Dx12RenderGraph {
         for (int i = 0; i < list.Length; i++) {
             IRenderPass pass = list[i];
             if (!pass.Enabled(ctx)) continue;
+            // PHASE-2 V3 (chunk 14): when the barriers door is on, EMIT the migrated pass's DERIVED boundary head
+            // transition before Record (the pass removed its manual head transition; ctx.BarriersDerived tells it
+            // to skip the manual one). A no-op for un-migrated passes (deriver.Emit returns silently) and when the
+            // door is off (the pass emits its own manual head transition inside Record, as in V1/V2).
+            if (barriersDerived) deriver.Emit(pass.Name, ctx);
             if (timePass != null) timePass(pass.Name, () => pass.Record(ctx));
             else pass.Record(ctx);
         }
