@@ -214,10 +214,15 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
     public void Resize(int width, int height) => AllocBloomTargets(width, height);
 
     void AllocBloomTargets(int width, int height) {
-        bloomA?.Dispose(); bloomB?.Dispose();
+        // V2: bloomA/bloomB are audit-passed transients (bright-pass fully overwrites bloomA before blurH reads it;
+        // each blur DST is a full-screen draw). lumTarget/lumHistory are NOT pooled (cross-frame ping-pong history
+        // → imported). AllocOrPool = committed (byte-identical) when no pool, placed-aliased when the pool is active.
+        // Dispose the current field unless it's pool-placed (the pool's re-acquire disposes its own Live).
+        if (bloomA is { IsPlaced: false }) bloomA.Dispose();
+        if (bloomB is { IsPlaced: false }) bloomB.Dispose();
         int w = System.Math.Max(1, width / 2), h = System.Math.Max(1, height / 2);
-        bloomA = new Dx12OffscreenTarget(dev, w, h, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
-        bloomB = new Dx12OffscreenTarget(dev, w, h, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
+        bloomA = Dx12RenderTargetPool.AllocOrPool(dev, "bloomA", w, h, Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: false);
+        bloomB = Dx12RenderTargetPool.AllocOrPool(dev, "bloomB", w, h, Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: false);
     }
 
     // VERBATIM DrawBloom. Bright-pass the HDR `src` (already in SRV state) → bloomA; blur H (bloomA→bloomB);
@@ -313,6 +318,9 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
     // (private sub-steps). The old (bool ssaoOn, Dx12OffscreenTarget hdr) params are now ctx.Doors.Ssao +
     // ctx.SceneColor; the AO SRV is ctx.SsaoResult.
     public unsafe void Record(Dx12FrameContext ctx) {
+        // V2: aliasing barrier + discard bloomA/B (the targets Composite PRODUCES). NOT ssaoA — Composite only
+        // READS ssaoA (the AO slot); discarding it would erase SSAO's output right before the composite samples it.
+        Dx12RenderTargetPool.PoolBarrier(ctx.Dev, "bloomA", "bloomB");   // no-op when pool off
         Dx12OffscreenTarget hdr = ctx.SceneColor;
         bool ssaoOn = ctx.Doors.Ssao;
         Dx12OffscreenTarget ldr = ctx.Ldr;

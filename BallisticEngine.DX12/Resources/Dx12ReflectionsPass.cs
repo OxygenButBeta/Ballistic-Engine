@@ -94,6 +94,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     // rtReflWanted && EnsureRtReflections() ? DrawRtReflections : DrawSsr. The inline TimePass("Reflections:RT")
     // tag is dropped — the GRAPH already times the pass under Name ("Reflections").
     public unsafe void Record(Dx12FrameContext ctx) {
+        Dx12RenderTargetPool.PoolBarrier(ctx.Dev, "ssrTarget", "ssrScene");   // V2: aliasing barrier + discard the produced placed targets (no-op when pool off)
         string rtrEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RT_REFLECTIONS");
         bool rtReflWanted = rtrEnv == "1" || (rtrEnv != "0" && ctx.PostFX.ReflectionMode == ReflectionMode.RayTraced);
         if (rtReflWanted && EnsureRtReflections(ctx))
@@ -374,7 +375,16 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     // full-res combine scratch allocate in Resize.
     unsafe void BuildSsr() {
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 5, baseShaderRegister: 0);
+        // V2 NOTE: DataVolatile (not the default DataStaticWhileSetAtExecute) on the SRV range. The SSR combine
+        // samples ssrTarget, which under BALLISTIC_DX12_GRAPH_ALIAS=1 is a PLACED resource whose backing memory is
+        // later aliased to another target — that breaks the DATA_STATIC "this resource's state won't change after
+        // SetDescriptorTable" promise the default flag makes (GBV flagged it: InvalidSubresourceState "(assumed at
+        // first use)" on the aliased ssrTarget). DataVolatile is the spec-correct flag for a descriptor whose
+        // resource may be aliased; it only RELAXES a driver caching assumption → pixel-neutral on BOTH paths
+        // (default/V1 still SHA==golden, verified). Applies to all 5 SRVs in the range (uniform; only ssrTarget is
+        // aliased, the G-buffer SRVs are committed, but DataVolatile is harmless for them too).
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 5, baseShaderRegister: 0,
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 0, flags: DescriptorRangeFlags.DataVolatile);
         var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
         var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
@@ -409,14 +419,16 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
 
     // AllocSsrTarget moved VERBATIM into Resize (graph.Resize fans this out in registration order, R5).
     public void Resize(int w, int h) {
-        ssrTarget?.Dispose(); ssrScene?.Dispose();
+        // V2: ssrTarget/ssrScene are audit-passed transients (the SSR march/RT dispatch fully writes ssrTarget
+        // before the combine reads it; the combine fully overwrites ssrScene). AllocOrPool = committed when no pool
+        // (byte-identical), placed-aliased when the pool is active. ssrTarget allowUav (RT reflections write it via
+        // a UAV; SSR via the RTV) — the placed heap is RT/DS-flagged + AllowUnorderedAccess on the resource desc.
+        // Dispose the current field unless it's pool-placed (the pool's re-acquire disposes its own Live).
+        if (ssrTarget is { IsPlaced: false }) ssrTarget.Dispose();
+        if (ssrScene is { IsPlaced: false }) ssrScene.Dispose();
         int hw = Math.Max(1, w / 2), hh = Math.Max(1, h / 2);
-        // allowUav so RT reflections can write it via a UAV (SSR still writes it via the RTV).
-        ssrTarget = new Dx12OffscreenTarget(dev, hw, hh, withDepth: false,
-            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
-        // Full-res scratch for the combine output (combine reads `target`, can't read+write it).
-        ssrScene = new Dx12OffscreenTarget(dev, w, h, withDepth: false,
-            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
+        ssrTarget = Dx12RenderTargetPool.AllocOrPool(dev, "ssrTarget", hw, hh, Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
+        ssrScene = Dx12RenderTargetPool.AllocOrPool(dev, "ssrScene", w, h, Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: false);
     }
 
     // --- helpers replicated from the orchestrator (read env / ctx.PostFX; identical semantics) ---

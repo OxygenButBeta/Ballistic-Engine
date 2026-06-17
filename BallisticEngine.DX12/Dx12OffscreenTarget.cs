@@ -41,8 +41,19 @@ public sealed class Dx12OffscreenTarget : IDisposable {
     // Current resource state of the RT, tracked so transitions are correct.
     ResourceStates state = ResourceStates.RenderTarget;
 
+    // PHASE-2 V2: when this target's color RT is a PLACED resource (aliased onto a pool heap), keep a handle to
+    // its heap + byte offset so the pool can identify the previous tenant for an aliasing barrier. Null/0 for the
+    // default committed path (no aliasing) — byte-identical to pre-V2. Set only when constructed via the pool.
+    public ID3D12Heap PlacedHeap { get; }
+    public ulong PlacedOffset { get; }
+    public bool IsPlaced => PlacedHeap != null;
+    // The CPU descriptor for a UAV view of the color RT, when the pool created one (RT-GI/OIDN write the GI scratch
+    // via a UAV). The committed path lazily creates UAVs per-pass; placed targets don't need this today (passes
+    // still build their own UAVs), so it stays informational. Reserved for V3/V4.
+
     public Dx12OffscreenTarget(Dx12Device device, int width, int height, bool withDepth = false,
-        Format? colorFormat = null, bool colorReadable = false, bool allowUav = false) {
+        Format? colorFormat = null, bool colorReadable = false, bool allowUav = false,
+        ID3D12Heap placedHeap = null, ulong placedOffset = 0) {
         dev = device;
         Width = width;
         Height = height;
@@ -53,9 +64,25 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         // AllowUnorderedAccess for targets a compute pass (e.g. the FSR upscaler) writes via UAV.
         rtDesc.Flags = ResourceFlags.AllowRenderTarget | (allowUav ? ResourceFlags.AllowUnorderedAccess : ResourceFlags.None);
         var clearVal = new ClearValue(Format, new Vortice.Mathematics.Color4(0, 0, 0, 1));
-        RenderTarget = dev.Device.CreateCommittedResource(
-            HeapProperties.DefaultHeapProperties, HeapFlags.None, rtDesc,
-            ResourceStates.RenderTarget, clearVal);
+        // PHASE-2 V2 PLACED PATH: when the render-target pool supplies a heap + offset, the color RT is a PLACED
+        // resource on shared (aliasable) memory instead of a committed resource with its own implicit heap. This is
+        // the ONLY change for aliasing — every other code path (RTV/SRV/transitions/readback) is byte-identical
+        // because they operate on the ID3D12Resource handle, which is the same shape either way. The pool guarantees
+        // no two PLACED resources whose lifetimes OVERLAP share an offset (so committed-vs-placed is a memory-
+        // location change only). The initial state is RenderTarget exactly as the committed path (placed resources
+        // start UNINITIALIZED, but every pooled target is FULLY OVERWRITTEN before it is read — the V2 read-before-
+        // write audit, the load-bearing safety net — so the leftover tenant garbage is never observed).
+        if (placedHeap != null) {
+            PlacedHeap = placedHeap;
+            PlacedOffset = placedOffset;
+            ClearValue? cv = clearVal;   // bind the Nullable<ClearValue> CreatePlacedResource<T> overload (returns T)
+            RenderTarget = dev.Device.CreatePlacedResource<ID3D12Resource>(
+                placedHeap, placedOffset, rtDesc, ResourceStates.RenderTarget, cv);
+        } else {
+            RenderTarget = dev.Device.CreateCommittedResource(
+                HeapProperties.DefaultHeapProperties, HeapFlags.None, rtDesc,
+                ResourceStates.RenderTarget, clearVal);
+        }
 
         rtvHeap = dev.Device.CreateDescriptorHeap(new DescriptorHeapDescription(
             DescriptorHeapType.RenderTargetView, 1));
@@ -219,6 +246,23 @@ public sealed class Dx12OffscreenTarget : IDisposable {
                 cl.ClearDepthStencilView(dsvHandle, ClearFlags.Depth, 1.0f, 0);
             record(cl);
         });
+    }
+
+    // PHASE-2 V2: when this is a PLACED (aliased) target, the pool calls this right after the aliasing barrier
+    // (same recorded list, the pool's ExecuteSync) to satisfy the D3D12 placed-RT INITIALIZATION requirement: a
+    // freshly-(re)activated placed render target is uninitialized; the debug layer requires a Discard/Clear/Copy
+    // before the first draw that uses it (RenderTargetOrDepthStencilResouceNotInitialized otherwise). Discard =
+    // "prior contents are undefined" — exactly correct here because the consuming pass FULLY OVERWRITES this RT
+    // before reading it (the V2 read-before-write audit). Transitions to RenderTarget first (idempotent — discard
+    // requires the RT/DEPTH_WRITE state) so it is valid regardless of the state the previous tenant left it in.
+    // No-op for a committed target (only the pool calls this, only on placed targets).
+    public void DiscardForAlias(ID3D12GraphicsCommandList4 cl) {
+        // DiscardResource requires the resource be in RENDER_TARGET (or DEPTH_WRITE). Transition from the C#-tracked
+        // state (which matches the GPU reality — the producing pass left it where it ended last frame, OR
+        // MarkAliasedOut reset it to RenderTarget when a later pass decayed it), then discard (the placed-RT
+        // initialization hint that satisfies RenderTargetOrDepthStencilResouceNotInitialized).
+        TransitionTo(cl, ResourceStates.RenderTarget);
+        cl.DiscardResource(RenderTarget);
     }
 
     void BindTargets(ID3D12GraphicsCommandList4 cl) {

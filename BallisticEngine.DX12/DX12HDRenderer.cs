@@ -631,6 +631,56 @@ public sealed class DX12HDRenderer : HDRenderer {
             Console.Error.WriteLine("[DX12] Render graph (phase-2 V1): COMPILED ORDER active (BALLISTIC_DX12_GRAPH=1).");
             Console.Error.WriteLine(graph.LastCompileReport);
         }
+
+        // === PHASE 2 V2 (chunk 13): the TRANSIENT RENDER-TARGET POOL + lifetime ALIASING. Gated behind
+        // BALLISTIC_DX12_GRAPH_ALIAS=1 (requires GRAPH=1 — it reads the COMPILED order for lifetimes). Default off →
+        // every pooled pass's AllocOrPool falls through to a committed target, byte-identical to V1/phase-1. ===
+        // Lifetime model (the key V2 insight): every pooled scratch target is PASS-PRIVATE — born and consumed
+        // ENTIRELY within ONE pass's Record (ssgiTarget→…→ssgiScene inside the GI Record; bloomA/B inside Composite;
+        // etc.), never crossing a pass boundary. So a target's lifetime is exactly its OWNING PASS's compiled-order
+        // position. Targets in the SAME pass coexist (must NOT alias → distinct regions); targets in DIFFERENT
+        // passes have disjoint lifetimes (CAN alias). Registering each with first==last==passOrder makes the greedy
+        // interval-coloring produce exactly that (same-pass overlap → separate region; cross-pass disjoint → share).
+        aliasPath = graphPath && Environment.GetEnvironmentVariable("BALLISTIC_DX12_GRAPH_ALIAS") == "1";
+        if (aliasPath) {
+            rtPool = new Dx12RenderTargetPool(dev);
+            int hw = Math.Max(1, targetW / 2), hh = Math.Max(1, targetH / 2);
+            var Hdr = Dx12OffscreenTarget.HdrFormat;
+            int ssao = graph.OrderIndexOf("SSAO"), refl = graph.OrderIndexOf("Reflections");
+            int gi = graph.OrderIndexOf("GI"), comp = graph.OrderIndexOf("Composite");
+            // POOLED (audit-passed full-overwrite-before-read transients). Format/size/uav MUST match the pass's
+            // actual AllocOrPool call (the pool asserts this on Acquire). History (ssgiHistory/taaHistory/lumTarget)
+            // is NOT registered → those passes' AllocOrPool calls fall through to committed (imported, never aliased).
+            //
+            // LIFETIME = [firstWritePass, lastReadPass] in compiled-graph order. MOST pooled scratch is PASS-PRIVATE
+            // (born + consumed inside ONE pass's Record → first==last==that pass). The ONE CROSS-PASS exception:
+            // ★ ssaoA is written by SSAO (order `ssao`) but READ by Composite (order `comp`) as the AO slot
+            // (ctx.SsaoResult = ssaoPass.ResultSrvCpu). So ssaoA's lifetime is [ssao .. comp], NOT [ssao .. ssao].
+            // Registering it [ssao..ssao] would (wrongly) let bloomA[comp..comp] alias ssaoA's memory — and the
+            // Composite reads ssaoA WHILE writing bloomA → memory collision → wrong pixels (the V2 lifetime trap
+            // that the CornellBox SHA mismatch caught). lastRead=comp keeps ssaoA out of bloom's region.
+            rtPool.Register("ssaoA", hw, hh, Format.R8_UNorm, false, ssao, comp);   // CROSS-PASS: read by Composite
+            rtPool.Register("ssaoB", hw, hh, Format.R8_UNorm, false, ssao, ssao);   // SSAO-internal blur scratch
+            rtPool.Register("ssrTarget", hw, hh, Hdr, true, refl, refl);
+            rtPool.Register("ssrScene", targetW, targetH, Hdr, false, refl, refl);
+            rtPool.Register("ssgiTarget", hw, hh, Hdr, true, gi, gi);
+            rtPool.Register("ssgiDenoised", hw, hh, Hdr, true, gi, gi);
+            rtPool.Register("ssgiScene", targetW, targetH, Hdr, false, gi, gi);
+            rtPool.Register("bloomA", hw, hh, Hdr, false, comp, comp);
+            rtPool.Register("bloomB", hw, hh, Hdr, false, comp, comp);
+            rtPool.BuildPlan();
+            // V2 SOUNDNESS GATE: assert no two aliased logicals have overlapping lifetimes (the invariant the whole
+            // pixel-neutral guarantee rests on). A violation throws at init rather than corrupting memory mid-frame.
+            string overlap = rtPool.AuditNoOverlap();
+            if (overlap != null) throw new InvalidOperationException("[DX12 V2] alias plan UNSOUND — " + overlap);
+            Dx12RenderTargetPool.Active = rtPool;
+            // Re-Resize so every pooled pass RE-ACQUIRES its target as a PLACED resource (its ctor allocated
+            // committed targets before the pool existed; AllocOrPool now hands back placed ones, disposing the
+            // committed pre-pool allocation). Same registration-order fan-out as the normal resize path (R5).
+            graph.Resize(targetW, targetH);
+            Console.Error.WriteLine("[DX12] Render graph (phase-2 V2): TRANSIENT ALIASING active (BALLISTIC_DX12_GRAPH_ALIAS=1).");
+            Console.Error.WriteLine(rtPool.PlanReport);
+        }
     }
 
     Dx12GpuDrivenRenderer gpuDriven;
@@ -654,6 +704,13 @@ public sealed class DX12HDRenderer : HDRenderer {
     // the frozen golden set). The compiled order is provably == the event-sort order (PQ keyed (event,regIdx) +
     // AllowCulling default-OFF), so GRAPH=1 must also be byte-identical to golden (the V1 pixel-neutral bar).
     bool graphPath;
+    // PHASE 2 V2 (chunk 13): the transient render-target pool + the alias-active door. aliasPath = graphPath &&
+    // BALLISTIC_DX12_GRAPH_ALIAS=1. When set, rtPool owns the shared placed-resource heap + the alias plan, and is
+    // published as Dx12RenderTargetPool.Active so each pooled pass's AllocOrPool hands back placed (aliased)
+    // targets. BeginRender emits the per-frame whole-heap aliasing barrier before the graph runs. Default off →
+    // rtPool null, Active null → committed targets, byte-identical to V1.
+    Dx12RenderTargetPool rtPool;
+    bool aliasPath;
 
     // Cascade caching: skip re-rendering the sun cascades when the texel-snapped fit matrices AND the caster
     // geometry are unchanged (the depth-array layers are retained → byte-identical; big win for a static camera).
@@ -1438,6 +1495,12 @@ public sealed class DX12HDRenderer : HDRenderer {
         // later readers), so the image is byte-identical — the V1 pixel-neutral bar. Default OFF → Execute, the
         // proven phase-1 list. Barriers are STILL the manual per-pass head transitions in both paths (V1 doesn't
         // touch barriers — that's V3).
+        // PHASE 2 V2 (chunk 13): the per-PASS aliasing barriers (Dx12RenderTargetPool.PoolBarrier at the head of
+        // each pooled pass's Record) handle the placed-resource tenant changes — an aliasing barrier is required
+        // EACH TIME a different placed resource starts using shared memory, not once per frame. So nothing is
+        // emitted here; the barrier lives WITH its consuming pass (the same Decision-4 principle as the head
+        // transitions). Default off (aliasPath false) → PoolBarrier is a no-op (Active is null).
+
         if (graphPath) graph.ExecuteGraph(ctx);
         else graph.Execute(ctx);
 

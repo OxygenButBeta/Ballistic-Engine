@@ -135,6 +135,7 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable {
     // inline code used (GI:RT / GI:SSGI) is dropped — the GRAPH already times the pass under Name ("GI"); the
     // inner DDGI/Gather/ScreenProbe sub-stopwatches inside DrawRtGi keep adding their own GpuPasses entries.
     public unsafe void Record(Dx12FrameContext ctx) {
+        Dx12RenderTargetPool.PoolBarrier(ctx.Dev, "ssgiTarget", "ssgiDenoised", "ssgiScene");   // V2: aliasing barrier + discard the produced placed targets (no-op when pool off)
         if (ctx.GiMode == GiMode.RayTraced) {
             if (EnsureRtGi(ctx)) DrawRtGi(ctx);
             else DrawSsgi(ctx);
@@ -680,20 +681,25 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable {
     // res GI + history ping-pong + denoise scratch (allowUav — the RT-GI gather + OIDN unpack write via UAV);
     // full-res scene scratch. The OIDN GPU shared buffer re-sizes on the next OIDN use (size-change detected).
     public void Resize(int w, int h) {
-        ssgiTarget?.Dispose(); ssgiScene?.Dispose(); ssgiHistoryA?.Dispose(); ssgiHistoryB?.Dispose();
-        ssgiDenoised?.Dispose();
+        // V2: ssgiTarget/ssgiDenoised/ssgiScene are audit-passed transients (the gather/RT-dispatch fully writes
+        // ssgiTarget before the resolve reads it; OIDN unpack fully overwrites ssgiDenoised; the combine fully
+        // overwrites ssgiScene). ssgiHistoryA/B are CROSS-FRAME TEMPORAL history (the resolve reads histRead before
+        // writing histWrite) → IMPORTED, NEVER pooled/aliased (aliasing history = temporal corruption). AllocOrPool
+        // = committed when no pool (byte-identical), placed-aliased when active.
+        // Dispose pooled fields unless pool-placed (the pool re-acquire disposes its own Live); history is always committed.
+        if (ssgiTarget is { IsPlaced: false }) ssgiTarget.Dispose();
+        if (ssgiScene is { IsPlaced: false }) ssgiScene.Dispose();
+        if (ssgiDenoised is { IsPlaced: false }) ssgiDenoised.Dispose();
+        ssgiHistoryA?.Dispose(); ssgiHistoryB?.Dispose();   // history: always committed, dispose unconditionally
         int hw = Math.Max(1, w / 2), hh = Math.Max(1, h / 2);
         // allowUav so the RT-GI gather can write it via a UAV (the SSGI gather still uses the RTV).
-        ssgiTarget = new Dx12OffscreenTarget(dev, hw, hh, withDepth: false,
-            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
-        ssgiHistoryA = new Dx12OffscreenTarget(dev, hw, hh, withDepth: false,
+        ssgiTarget = Dx12RenderTargetPool.AllocOrPool(dev, "ssgiTarget", hw, hh, Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
+        ssgiHistoryA = new Dx12OffscreenTarget(dev, hw, hh, withDepth: false,   // IMPORTED history — never pooled
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
-        ssgiHistoryB = new Dx12OffscreenTarget(dev, hw, hh, withDepth: false,
+        ssgiHistoryB = new Dx12OffscreenTarget(dev, hw, hh, withDepth: false,   // IMPORTED history — never pooled
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
-        ssgiDenoised = new Dx12OffscreenTarget(dev, hw, hh, withDepth: false,
-            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);  // OIDN GPU unpack writes it
-        ssgiScene = new Dx12OffscreenTarget(dev, w, h, withDepth: false,
-            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
+        ssgiDenoised = Dx12RenderTargetPool.AllocOrPool(dev, "ssgiDenoised", hw, hh, Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);  // OIDN GPU unpack writes it
+        ssgiScene = Dx12RenderTargetPool.AllocOrPool(dev, "ssgiScene", w, h, Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: false);
         ssgiHistValid = false;       // accumulated history is stale after a (re)allocation
         ssgiCpuColor = ssgiCpuOut = null;   // host buffers re-size to the new half-res
     }

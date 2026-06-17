@@ -104,16 +104,23 @@ public sealed class Dx12SsaoPass : IRenderPass, IDisposable {
     public void Resize(int width, int height) => AllocTargets(width, height);
 
     void AllocTargets(int width, int height) {
-        ssaoA?.Dispose(); ssaoB?.Dispose();
+        // V2: AllocOrPool returns a COMMITTED target (byte-identical) when no pool is active, else a PLACED target
+        // aliased onto the pool heap. ssaoA/ssaoB are audit-passed transients (each is the full-overwrite DST of a
+        // full-screen draw before it is read) — safe to alias. Dispose the current field UNLESS it's a pool-placed
+        // target (the pool re-acquire disposes its own Live; double-disposing it is the bug). A committed field
+        // (no pool, or the pre-pool ctor allocation about to be replaced by a placed one) is disposed here.
+        if (ssaoA is { IsPlaced: false }) ssaoA.Dispose();
+        if (ssaoB is { IsPlaced: false }) ssaoB.Dispose();
         int w = System.Math.Max(1, width / 2), h = System.Math.Max(1, height / 2);
-        ssaoA = new Dx12OffscreenTarget(dev, w, h, withDepth: false, colorFormat: Format.R8_UNorm, colorReadable: true);
-        ssaoB = new Dx12OffscreenTarget(dev, w, h, withDepth: false, colorFormat: Format.R8_UNorm, colorReadable: true);
+        ssaoA = Dx12RenderTargetPool.AllocOrPool(dev, "ssaoA", w, h, Format.R8_UNorm, colorReadable: true, allowUav: false);
+        ssaoB = Dx12RenderTargetPool.AllocOrPool(dev, "ssaoB", w, h, Format.R8_UNorm, colorReadable: true, allowUav: false);
     }
 
     // VERBATIM DrawSsao. HBAO from the G-buffer (scene depth for view-pos + world normal, both already SRVs
     // from the deferred pass) → blurred half-res AO in ssaoA. The real surface normal comes straight from the
     // G-buffer (sharper, silhouette-correct); View transforms the world normal into view space for the march.
     public unsafe void Record(Dx12FrameContext ctx) {
+        Dx12RenderTargetPool.PoolBarrier(ctx.Dev, "ssaoA", "ssaoB");   // V2: aliasing barrier + discard the produced placed targets (no-op when pool off)
         Dx12GBuffer gbuffer = ctx.GBuffer;
         Matrix4x4 view = ctx.View, proj = ctx.Proj;
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;

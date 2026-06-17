@@ -237,6 +237,20 @@ public sealed class Dx12RenderGraph {
         }
     }
 
+    // PHASE-2 V2: the compiled topo order (the same order ExecuteGraph runs). Null until Compile(). The
+    // transient-RT pool reads pass ORDER positions off this to compute each pooled target's lifetime (a pass-
+    // private scratch target's lifetime is exactly its owning pass's order position — see Dx12RenderTargetPool).
+    public IReadOnlyList<IRenderPass> GraphOrder => graphOrder;
+
+    // The compiled-order position of the pass named `name` (case-sensitive, matches IRenderPass.Name), or -1.
+    // Used by the V2 alias planner to stamp each pooled target's owning-pass order index as its lifetime point.
+    public int OrderIndexOf(string name) {
+        var list = graphOrder;
+        if (list == null) return -1;
+        for (int i = 0; i < list.Length; i++) if (list[i].Name == name) return i;
+        return -1;
+    }
+
     string BuildReport(List<int> orderIdx, bool[] culled) {
         var sb = new StringBuilder();
         sb.AppendLine($"[Dx12RenderGraph] V1 compile: {registered.Count} passes, {graphResources.Count} resources.");
