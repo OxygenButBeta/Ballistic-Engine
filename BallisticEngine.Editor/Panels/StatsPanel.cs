@@ -10,9 +10,12 @@ namespace BallisticEngine.Editor;
 internal sealed class StatsPanel {
     // anchorMin/anchorSize = the view image's screen rect; topOffset leaves room for anything
     // already living in that corner (the Scene view's orientation cube).
+    // showTiming gates the FPS/Frame/Editor-CPU readout: the Game view passes true; the Scene view
+    // passes false (EF4 — edit-mode frame timing is on-demand/inconsistent, so the FPS number is
+    // misleading there). The draw/triangle/renderer counters stay in BOTH views.
     // Returns false when the user clicked the overlay's close button (the caller untoggles).
     public unsafe bool Draw(float fps, float editorCpuMs, SysVec2 viewSize, float scale,
-        SysVec2 anchorMin, SysVec2 anchorSize, float topOffset, RenderStats rs) {
+        SysVec2 anchorMin, SysVec2 anchorSize, float topOffset, RenderStats rs, bool showTiming) {
         ImGui.SetNextWindowPos(
             new SysVec2(anchorMin.X + anchorSize.X - 10 * scale, anchorMin.Y + topOffset),
             ImGuiCond.Always, new SysVec2(1, 0));   // pivot top-right: grows leftward/downward
@@ -63,10 +66,15 @@ internal sealed class StatsPanel {
         ImGui.BeginChild("##statsbody", new SysVec2(300 * scale, bodyH), ImGuiChildFlags.None,
             ImGuiWindowFlags.NoBackground);
 
-        EditorDecoration.DrawSectionHeader("Timing");
-        Line("FPS", $"{fps:0}", scale);
-        Line("Frame", $"{(fps > 0 ? 1000f / fps : 0):0.00} ms", scale);
-        Line("Editor CPU", $"{editorCpuMs:0.00} ms", scale);
+        // EF4: the Timing block (FPS/Frame/Editor CPU) only makes sense for the Game view, which paints
+        // every frame. The Scene view repaints on demand (idle until the user interacts), so its FPS is
+        // not a meaningful frame rate — suppress the whole block there.
+        if (showTiming) {
+            EditorDecoration.DrawSectionHeader("Timing");
+            Line("FPS", $"{fps:0}", scale);
+            Line("Frame", $"{(fps > 0 ? 1000f / fps : 0):0.00} ms", scale);
+            Line("Editor CPU", $"{editorCpuMs:0.00} ms", scale);
+        }
         EditorDecoration.DrawSectionHeader("Rendering");
         Line("Draw calls", rs.DrawCalls.ToString(), scale);
         Line("Depth draws", rs.DepthOnlyDrawCalls.ToString(), scale);

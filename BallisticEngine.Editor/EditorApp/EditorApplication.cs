@@ -1809,9 +1809,11 @@ internal sealed class EditorApplication {
 
         DrawOrientationGizmo(imageMin, imageSize);   // orientation cube stays panel-anchored, not zoomed
 
-        // Stats pinned to the view's top-right, below the orientation cube.
+        // Stats pinned to the view's top-right, below the orientation cube. EF4: no FPS/Timing block in
+        // the Scene view (it repaints on demand, so its frame rate is misleading) — only the Game view
+        // shows timing. The draw/triangle/renderer counters still show in both.
         if (showStats && !stats.Draw(runtime.Window.FrameRate, editorCpuMs, sceneViewSize, S,
-                imageMin, imageSize, 105 * S, RenderStats.Scene))
+                imageMin, imageSize, 105 * S, RenderStats.Scene, showTiming: false))
             showStats = false;
     }
 
@@ -2035,8 +2037,9 @@ internal sealed class EditorApplication {
             }
 
             // Stats pinned to the view's top-right (no orientation cube here, so right at the top).
+            // EF4: the Game view paints every frame, so it keeps the FPS/Timing block.
             if (showStats && !stats.Draw(runtime.Window.FrameRate, editorCpuMs, gameViewSize, S,
-                    ImGui.GetItemRectMin(), dispSize, 10 * S, RenderStats.Game))
+                    ImGui.GetItemRectMin(), dispSize, 10 * S, RenderStats.Game, showTiming: true))
                 showStats = false;
         }
         else {
