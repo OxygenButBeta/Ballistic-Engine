@@ -19,10 +19,26 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF-LAYOUT** (inspector layout model — design + shared helper)
-> Last committed chunk: **EF12** · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **EF16** (nested drawing indents too far right — implement the EF-LAYOUT model's depth/value-x rule FIRST of the layout trio)
+> Last committed chunk: **EF-LAYOUT** · Branch: `dx12-renderer`
 >
-> **EF12 note (just landed):** Inspector panel renamed to "Details" everywhere user-facing, KEY unchanged.
+> **EF-LAYOUT note (just landed):** the ONE inspector column model + its shared helper landed as
+> `BallisticEngine.Editor/Panels/Inspector/InspectorLayout.cs` (design note also in the EF-LAYOUT section
+> below — read the file header for the authoritative contract). It owns: `ValueColumnLeft` (fixed panel-level
+> value-x), `LabelColumnWidth(depth, panelValueLeft, s)` (recovers that x at any depth by narrowing the label
+> column), `DepthIndent=12px` / `DepthIndentTotal`, `DrawLabelCell` (per-depth label indent + ellipsis +
+> full-text/`[Tooltip]` hover), `Ellipsize`, and the EF10a `MemberSearchThreshold=12`. **NO call sites were
+> rewired** — by design the model ships first and EF16→EF11→EF10 each opt their slice in — so the live
+> inspector draw is byte-identical to before (oracle stayed 18/18 green; only a NEW file + this plan edit).
+> **EF16 is now unblocked and is the FIRST implementer:** make the nested grids (`DrawNestedSlot :1952`,
+> `DrawPolymorphicSlot :1896`) stop applying ImGui's full `TreeNode` IndentSpacing to the value column —
+> pass `depth` + the panel-level `panelValueLeft` down and give the nested `BeginGrid` a FIXED-width label
+> column (`InspectorLayout.LabelColumnWidth(depth, panelValueLeft, s)`) so the value box keeps full width at
+> every depth. Keep top-level (depth 0) rows visually equivalent (`PreferredLabelWidth=132px` was tuned to
+> the old 0.38 split). DoD: a 4-deep nested struct still shows readable value boxes; short/shallow components
+> unchanged. Visual chunk → build clean + hand off a human-screenshot checkpoint (GPU-hang rule: no relaunch-loop).
+>
+> **EF12 note (kept for reference):** Inspector panel renamed to "Details" everywhere user-facing, KEY unchanged.
 > Validated against ImGui source (`ImHashStr` resets the CRC at the last `###`; `CreateNewWindowSettings`
 > strips the `###`-prefix before keying the `.ini`), so the safe `Title###Key` pattern keeps the persistent
 > identity. Changes: (1) both `panels.Register`/`extraPanels.Register` titles "Inspector"→"Details"
@@ -242,7 +258,7 @@ this same handoff for the chunk after it.
 - [x] EF5c — panel chrome polish — routed inspector-cluster `SeparatorText` → `EditorDecoration.DrawSectionHeader` (incl. the shared `ImGuiComponentGui.Header` adapter, so all attribute `[Header]` sections at once) + toolbar `Separator()` → `DrawDivider()` in Console/Hierarchy/Assets. Gave `DrawSectionHeader` Caption-font + symmetric pad so titles recede; dropped now-redundant leading `Spacing()`. Visual-only (not byte-identical), behaviour unchanged; build 0-error, oracle EXIT=0. Out of scope: Stats/TagsLayers/Settings + modal-dialog separators (left stock). Visual verify batched into the EF5a–d checkpoint.
 - [x] EF5d — type/spacing tokens everywhere — routed `StatsPanel`'s 5 `SeparatorText` → `EditorDecoration.DrawSectionHeader` (Caption-font + palette hairline, the last stock section dividers); finished the inspector-cluster semantic literals: prefab dots/bar → `PrefabBlue`, multi-differ "—" + ComponentPreviews light/prefab warnings → `Warning`, "Missing (ref)" + ProfilerPanel over-budget → `Error`, animator current/active cyan → NEW `Info` token, destructive "Delete N Assets" button → NEW `Destructive`/`DestructiveHovered` tokens. Justified literals (accent derivations, alpha overlays, dark-on-chip glyph, parsed material base-color, prefab-bar navy surface backing) annotated + left. Type scale otherwise already applied (entity title=Header, meta=Caption, sections=Caption); interactive `CollapsingHeader`s in Tags/Settings left (collapsible, out of scope). Visual-only (not byte-identical), behaviour unchanged. Build 0-error, oracle EXIT=0. LAST EF5 sub-chunk → whole EF5 theme series ready for batched screenshot review.
 - [x] EF12 — rename Inspector → "Details" — `panels.Register`/`extraPanels.Register` titles + both `AddTabItem` menu labels + the Window-menu `[MenuItem]` path & `PathToWindowKey` key all "Inspector"→"Details"; `DrawDockPanel` now `Begin($"{d.Title}###{name}")` so the docked tab reads the descriptor Title (validated vs ImGui source: `###` resets the id-hash + strips the `.ini` key prefix, so KEY/`.ini`/`.panels`/dock-builder identity all preserved). Generic change also fixes the pre-existing Scene-Components docked tab "Scene"→"Scene Components" (user-approved). `EditorLayout.*` KEY consts untouched. Build 0-error, oracle EXIT=0.
-- [ ] EF-LAYOUT — inspector layout model (design + shared helper)
+- [x] EF-LAYOUT — inspector layout model (design + shared helper) — landed the column model + metrics + the shared label primitive as `InspectorLayout.cs` (`ValueColumnLeft`/`LabelColumnWidth`/`DepthIndent`/`DrawLabelCell`/`Ellipsize`/`MemberSearchThreshold`). NO call sites rewired (EF16→EF11→EF10 each opt in) → live inspector byte-identical, oracle 18/18 green. Design note in the EF-LAYOUT section + the file header.
 - [ ] EF16 — nested indent (fixed value-x)
 - [ ] EF11 — adaptive label column + slider value legibility
 - [ ] EF10a — per-component member search (conditional)
@@ -619,11 +635,11 @@ DoD: open/close any panel — close STICKS even when maximized, no Reset Layout 
 still work; fullscreen works and routes through EF3's drained resize; layout persists across restart;
 Window menu reflects state.
 
-## EF-LAYOUT — Inspector layout model (design FIRST, then EF11/EF16/EF10/EF15 implement it)
+## EF-LAYOUT — Inspector layout model (design FIRST, then EF11/EF16/EF10/EF15 implement it) — ✅ DONE
 Review catch: EF11 (adaptive label column), EF16 (nesting indent), and EF10 (per-component search) all
 touch the SAME draw flow (`DrawMemberList`/`BeginGrid :2445`/`DrawNestedSlot :1973`) and can contradict
 each other (EF16 wants the value column at a fixed x independent of depth; EF11 wants an adaptive label
-column). Resolve them as ONE layout model BEFORE implementing any of the three:
+column). Resolved them as ONE layout model BEFORE implementing any of the three:
 - A single column model: value-field left edge anchored at a fixed x (does NOT shift with nesting depth);
   depth indents the LABEL/foldout only; label column adaptive within `[min, fixed-x − gap]` with ellipsis
   + hover-tooltip for overflow.
@@ -631,6 +647,39 @@ column). Resolve them as ONE layout model BEFORE implementing any of the three:
 This is a small design note + a shared helper, not a separate deliverable; EF11/EF16/EF10 then each
 implement their slice against it. Sequence: write the model → EF16 → EF11 → EF10. Existing short-label,
 shallow components must stay byte-identical.
+
+**✅ DONE — shared helper landed: `BallisticEngine.Editor/Panels/Inspector/InspectorLayout.cs`.** It is the
+single home for the column model + its metrics + the shared label primitive that EF16/EF11/EF10 route
+through, so the three rules live in one place and can't drift. **Deliberately NO call sites rewired this
+chunk** (EF16 first, then EF11, then EF10 each opt their slice in) → the inspector draws EXACTLY as before
+this commit (byte-identical for the existing short-label / shallow components — the hard constraint), and
+the reflection oracle stayed 18/18 green because nothing in the live draw flow changed yet.
+- **The contract (read the file header for the full version):**
+  - Two columns: LABEL/foldout (left) + VALUE field (right). The value column's LEFT EDGE is anchored at a
+    FIXED panel-level x (`InspectorLayout.ValueColumnLeft(panelAvailWidth, s)`) and does NOT move with depth.
+  - DEPTH indents the LABEL/foldout ONLY, by a SMALL fixed step (`DepthIndent = 12px`), never the value
+    column — the opposite of today, where a nested grid sits inside a `TreeNode`'s full `IndentSpacing`
+    (~21px) and marches the WHOLE table (both columns) right per level. A nested grid recovers the same
+    value-x by narrowing its own label column: `LabelColumnWidth(depth, panelValueLeft, s) = panelValueLeft
+    − depth*DepthIndent`. **Caller threads `panelValueLeft` (computed once per component) down through the
+    recursion** so every depth aligns to the same x.
+  - The label column is ADAPTIVE within `[MinLabelWidth=96px*S, valueLeft − LabelValueGap=10px*S]`:
+    `DrawLabelCell(label, depth, columnWidth, s, tooltip)` draws it with the per-depth indent, ELLIPSIZES
+    (`Ellipsize`, O(log n) binary search) when the text exceeds its column, and shows a FULL-TEXT hover
+    tooltip when clipped (a real `[Tooltip]` wins). EF11 = adaptive label + legible labels uses this; EF16
+    = depth/value-x uses `ValueColumnLeft`/`LabelColumnWidth`/`DepthIndentTotal`.
+  - EF10a's per-component search bar sits ABOVE the grid and only filters rows (not part of the column
+    model). Its conditional-visibility threshold lives here too: `MemberSearchThreshold = 12` (tune in EF10a).
+- **How EF16/EF11 will plug in (the implementer's note):** today the nested grids (`DrawNestedSlot :1952`,
+  `DrawPolymorphicSlot :1896`) open their own `BeginGrid` table INSIDE a `TreeNodeEx` that applies ImGui's
+  full IndentSpacing. The model's fix is: drop the TreeNode's full indent for the body's GRID (keep the
+  foldout header), pass a `depth` + the panel-level `panelValueLeft` into the nested grid, and have the
+  nested `BeginGrid` use a FIXED-width label column (`LabelColumnWidth(depth, …)`) instead of today's
+  proportional `SizingStretchProp` 0.38/0.62 split. The top-level `BeginGrid` (`:2445`) is depth 0 — when
+  EF16/EF11 switch it to the fixed-column model, the existing rows must stay visually equivalent (the
+  `PreferredLabelWidth=132px` anchor was picked to match the old 0.38 split's label weight at a typical
+  ~340px panel). `InspectorPanel.Row`/`RowWithTooltip` + the two `IInspectorGui.BeginRow` adapters
+  (`ImGuiComponentGui`/`ImGuiVolumeGui`) are the label-drawing sites that route through `DrawLabelCell`.
 
 ## EF10 — Per-component (and component-list) conditional search bar
 Root: no inspector member/component filter exists (`InspectorPanel.cs:51` only Add-Component search).
