@@ -29,6 +29,7 @@ internal static class EditorMenus {
         ["Window/Profiler"] = WindowKeys.Profiler,
         ["Window/Build"] = WindowKeys.Build,
         ["Window/Tags & Layers"] = WindowKeys.TagsLayers,
+        ["Window/Layer Collision Matrix"] = WindowKeys.LayerCollision,   // EF8: split out of Tags & Layers
         ["Window/Settings"] = WindowKeys.Settings,
     };
 
@@ -39,6 +40,7 @@ internal static class EditorMenus {
         public const string Profiler = "##win.profiler";
         public const string Build = "##win.build";
         public const string TagsLayers = "##win.tagslayers";
+        public const string LayerCollision = "##win.layercollision";   // EF8
         public const string Settings = "##win.settings";
         public const string UnityImport = "##win.unityimport";
     }
@@ -55,6 +57,7 @@ internal static class EditorMenus {
     [MenuItem("Window/Profiler", 21)] static void Profiler() => EditorWindows.Toggle(WindowKeys.Profiler);
     [MenuItem("Window/Build", 22)] static void Build() => EditorWindows.Toggle(WindowKeys.Build);
     [MenuItem("Window/Tags & Layers", 23)] static void TagsLayers() => EditorWindows.Toggle(WindowKeys.TagsLayers);
+    [MenuItem("Window/Layer Collision Matrix", 25)] static void LayerCollision() => EditorWindows.Toggle(WindowKeys.LayerCollision);   // EF8
     [MenuItem("Window/Settings", 24)] static void Settings() => EditorWindows.Toggle(WindowKeys.Settings);
     // Standalone, self-managed window (no facade key needed) — toggles its own static open flag.
     [MenuItem("Window/Render Pass Toggles", 26)] static void RenderPassToggles() => RenderPassTogglesWindow.Toggle();

@@ -8,6 +8,8 @@ namespace BallisticEngine.Editor;
 // Project Tags & Layers editor (Window > Tags & Layers). Edits the engine's TagManager / LayerManager
 // directly and persists to ProjectSettings/TagsAndLayers.json via LayerSettings.Save on every change
 // (project-level config, not scene state — no scene undo, same as other project settings).
+// EF8: the Layer Collision Matrix was SPLIT out into LayerCollisionMatrixPanel (Window > Layer Collision
+// Matrix); this panel now owns only tag + layer definitions. Both read the same LayerManager store.
 internal sealed class TagsLayersPanel {
     public bool Open;
 
@@ -31,8 +33,6 @@ internal sealed class TagsLayersPanel {
         DrawTags();
         ImGui.Spacing();
         DrawLayers(scale);
-        ImGui.Spacing();
-        DrawCollisionMatrix(scale);
 
         ImGui.End();
     }
@@ -90,61 +90,5 @@ internal sealed class TagsLayersPanel {
                 Persist();
             ImGui.PopID();
         }
-    }
-
-    void DrawCollisionMatrix(float scale) {
-        if (!ImGui.CollapsingHeader("Layer Collision Matrix", ImGuiTreeNodeFlags.DefaultOpen))
-            return;
-
-        // Only named layers participate (an unnamed layer has nothing to collide as). The matrix is
-        // symmetric: a checkbox at (row, col) drives SetCollision(row, col) and mirrors automatically.
-        var layers = LayerManager.DefinedLayers().ToList();
-        if (layers.Count == 0) {
-            ImGui.TextDisabled("Name some layers above to edit their collision matrix.");
-            return;
-        }
-
-        ImGui.TextDisabled("Checked = the two layers' physics bodies collide.");
-        ImGui.Spacing();
-
-        float cell = ImGui.GetFrameHeight();
-        float labelW = 0;
-        foreach ((_, string name) in layers)
-            labelW = MathF.Max(labelW, ImGui.CalcTextSize(name).X);
-        labelW += 12 * scale;
-
-        var draw = ImGui.GetWindowDrawList();
-        SysVec2 origin = ImGui.GetCursorScreenPos();
-
-        // Column headers: layer names rotated would be ideal, but horizontal indices keep it readable.
-        // We draw a triangular grid (upper triangle) — row labels on the left, a small index on top.
-        for (var r = 0; r < layers.Count; r++) {
-            (int rowIndex, string rowName) = layers[r];
-            ImGui.PushID(rowIndex);
-
-            ImGui.AlignTextToFramePadding();
-            ImGui.SetCursorPosX(ImGui.GetCursorPosX());
-            ImGui.TextUnformatted(rowName);
-            ImGui.SameLine(labelW);
-
-            // Each checkbox pairs this row layer with every OTHER named layer at-or-after it (so each
-            // unordered pair shows once). Includes the self-pair (a layer colliding with itself).
-            for (var col = r; col < layers.Count; col++) {
-                (int colIndex, string colName) = layers[col];
-                ImGui.PushID(colIndex);
-                bool collide = LayerManager.GetCollision(rowIndex, colIndex);
-                if (ImGui.Checkbox("##c", ref collide)) {
-                    LayerManager.SetCollision(rowIndex, colIndex, collide);
-                    Persist();
-                }
-                if (ImGui.IsItemHovered())
-                    ImGui.SetTooltip($"{rowName}  ↔  {colName}");
-                ImGui.SameLine(0, 4 * scale);
-                ImGui.PopID();
-            }
-            ImGui.NewLine();
-            ImGui.PopID();
-        }
-        _ = (draw, origin); // (reserved for a future rotated-header pass)
     }
 }

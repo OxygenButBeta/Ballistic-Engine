@@ -53,6 +53,7 @@ internal sealed class EditorApplication {
     readonly StatsPanel stats = new();
     readonly SettingsPanel settings;
     readonly TagsLayersPanel tagsLayers = new();
+    readonly LayerCollisionMatrixPanel layerCollision = new();   // EF8: matrix split into its own window
     readonly ProfilerPanel profilerPanel = new();
     readonly BuildPanel buildPanel;
     readonly EditorProfilerBackend profiler;
@@ -753,6 +754,7 @@ internal sealed class EditorApplication {
             // one mode). tagsLayers was previously missing here, so Tags & Layers disappeared in fullscreen.
             settings.Draw(S);
             tagsLayers.Draw(S);
+            layerCollision.Draw(S);
             profilerPanel.Draw(profiler, S);
             buildPanel.Draw(S);
             CurveEditorWindow.Draw(S);
@@ -1436,6 +1438,7 @@ internal sealed class EditorApplication {
             case EditorMenus.WindowKeys.Profiler: profilerPanel.Open = !profilerPanel.Open; break;
             case EditorMenus.WindowKeys.Build: buildPanel.Open = !buildPanel.Open; break;
             case EditorMenus.WindowKeys.TagsLayers: tagsLayers.Open = !tagsLayers.Open; break;
+            case EditorMenus.WindowKeys.LayerCollision: layerCollision.Open = !layerCollision.Open; break;
             case EditorMenus.WindowKeys.Settings: settings.Open = !settings.Open; break;
         }
     }
@@ -1454,6 +1457,7 @@ internal sealed class EditorApplication {
             case EditorMenus.WindowKeys.Profiler: profilerPanel.Open = true; break;
             case EditorMenus.WindowKeys.Build: buildPanel.Open = true; break;
             case EditorMenus.WindowKeys.TagsLayers: tagsLayers.Open = true; break;
+            case EditorMenus.WindowKeys.LayerCollision: layerCollision.Open = true; break;
             case EditorMenus.WindowKeys.Settings: settings.Open = true; break;
             case EditorMenus.WindowKeys.UnityImport: UnityImportWindow.Open(); break;
         }
@@ -1467,6 +1471,7 @@ internal sealed class EditorApplication {
             EditorMenus.WindowKeys.Profiler => profilerPanel.Open,
             EditorMenus.WindowKeys.Build => buildPanel.Open,
             EditorMenus.WindowKeys.TagsLayers => tagsLayers.Open,
+            EditorMenus.WindowKeys.LayerCollision => layerCollision.Open,
             EditorMenus.WindowKeys.Settings => settings.Open,
             EditorMenus.WindowKeys.UnityImport => UnityImportWindow.IsOpen,
             _ => false,
