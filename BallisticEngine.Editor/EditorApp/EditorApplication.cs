@@ -1483,6 +1483,13 @@ internal sealed class EditorApplication {
     // ran, even when Begin returns false or the close button just set `show` to false this frame. The
     // content (+ the maximize/add-tab strip handler) only runs when Begin returned true.
     void DrawDockPanel(string name, ref bool show, Action drawContents) {
+        // EF9d: a core panel re-opened from the Window menu (ToggleWindow flipped Shown false->true and
+        // set pendingFocusWindow = key) must SURFACE — otherwise it re-appears behind whatever tab shares
+        // its dock node and the toggle reads as a no-op. DrawCore runs before DrawViewportWindows (which
+        // clears pendingFocusWindow), so the flag is still live here; the viewports consume their own keys
+        // (SceneView/GameView) and never match a core-panel key, so there is no conflict. Same Unity-style
+        // focus-on-open the viewports already get, now extended to the core dockable panels.
+        if (pendingFocusWindow == name) ImGui.SetNextWindowFocus();
         bool visible = ImGui.Begin(name, ref show);
         if (visible) {
             MaximizePanelOnTitleDoubleClick(name);

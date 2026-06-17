@@ -19,10 +19,29 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF9d** (Window-menu open-state sync)
-> Last committed chunk: **EF9c** · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **EF5a** (Theme: palette + geometry) — ⛔ BLOCKED on the EF5 identity decision
+> Last committed chunk: **EF9d** · Branch: `dx12-renderer`
 >
-> **EF9c note for EF9d:** layout persist/restore is DONE and the `Shown` open/closed state now ROUND-TRIPS
+> **STOP before implementing EF5a:** EF5a is BLOCKED on the **EF5 theme-identity decision** (see Open
+> Decisions + the EF5 section). The next chat must ASK the user to pick (i) faithful-UE5 (cool graphite +
+> blue-grey shell + a single restrained azure highlight, NO warm accent) OR (ii) UE5-inspired with our OWN
+> warm signature accent — and NOT start EF5a until that is answered. This choice fixes BOTH the accent AND
+> the "looks like UE5" acceptance bar. (EF5 is the headline ask + a GPU-touching style area, so do not guess.)
+>
+> **EF9d note (just landed):** the Window-menu open-state sync is COMPLETE. The checkmark was already correct
+> (`DrawRegistryMenu("Window")` → `EditorWindows.IsOpen(key)` → `IsWindowOpen` → `panels.IsShown(key)`, queried
+> every frame; EF9c made that the SAME `Shown` flag it persists, so menu-state and disk-state can't disagree).
+> The only real gap was that re-opening a CORE panel from the menu flipped `Shown` false→true and set
+> `pendingFocusWindow = key` but NOTHING consumed it for core panels — only the two viewports
+> (`SceneView`/`GameView`) called `SetNextWindowFocus` — so a re-opened Inspector re-appeared BEHIND its
+> dock-tab neighbour and read as a no-op. EF9d's one-line fix: `DrawDockPanel` now calls
+> `ImGui.SetNextWindowFocus()` when its panel == `pendingFocusWindow`, surfacing the re-opened panel (the
+> same Unity focus-on-open the viewports already get). Ordering is safe: `panels.DrawCore(DrawDockPanel)`
+> runs BEFORE `DrawViewportWindows()` (which clears `pendingFocusWindow` at the end of the frame), and the
+> viewport keys never collide with a core-panel key. Human-screenshot verify (re-open Inspector from the
+> Window menu → it surfaces; close → checkmark clears) batched into the EF9/windowing visual checkpoint.
+>
+> **EF9c note (kept for reference):** layout persist/restore is DONE and the `Shown` open/closed state now ROUND-TRIPS
 > across restart. EF9c added: (1) `EditorPanelRegistry.HiddenKeys()` / `ApplyHidden(...)` (the closed core
 > panels are the persisted unit — viewports are never "closed"); (2) `EditorLayout.SavePanelState/LoadPanelState`
 > writing a `<projectStem>.v2.panels` sidecar next to the dock `.ini` (the `.ini` persists window geometry/dock
@@ -108,7 +127,7 @@ this same handoff for the chunk after it.
 - [x] EF9a — honor close everywhere (incl. maximized) — `ref open` threaded through both maximized paths; close STICKS + exits fullscreen same frame
 - [x] EF9b — maximize/fullscreen (re-verify EF3 fullscreen) — dedicated `###maxpanel`/`###maxinstance` identities + `NoSavedSettings`; maximize no longer undocks/pollutes the docked window; no swapchain resize introduced
 - [x] EF9c — layout persist + PassthruCentralNode review — `Shown` open/closed state now round-trips via a `.panels` sidecar (`EditorLayout.Save/LoadPanelState` + `EditorPanelRegistry.HiddenKeys/ApplyHidden`); PassthruCentralNode dropped (central node always filled, removed the maximize/modal-capture hazard)
-- [ ] EF9d — Window-menu open-state sync
+- [x] EF9d — Window-menu open-state sync — checkmark already queried `panels.IsShown` each frame (EF9c made that the same persisted flag); the bind-gap was that a menu-reopened CORE panel flipped `Shown` but never surfaced (only the two viewports consumed `pendingFocusWindow`). Fix: `DrawDockPanel` now `SetNextWindowFocus()` when its panel == `pendingFocusWindow`, so re-open surfaces it — same Unity focus-on-open the viewports get. No state-vs-disk disagreement possible (EF9c gift).
 - [ ] EF5a — palette + geometry (BLOCKED on identity decision)
 - [ ] EF5b — centralize bypass-color offenders
 - [ ] EF5c — panel chrome polish
