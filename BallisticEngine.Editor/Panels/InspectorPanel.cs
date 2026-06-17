@@ -929,217 +929,35 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         });
     }
 
-    // Inline profile editing under a Volume component, Unity-style: the profile's overrides are
-    // edited in place (and saved straight back to the .volume asset), or a fresh profile asset
-    // can be created and assigned in one click.
-    internal void DrawVolumeProfileSection(Entity entity, Volume volume) {
-        ImGui.Spacing();
+    // RW1.3: DrawVolumeProfileSection body (+ the volumeUndoBefore/volumeUndoLastClean statics and the
+    // CreateProfileAsset helper) MOVED into VolumePreview (Inspector/Preview/ComponentPreviews.cs).
 
-        if (volume.Profile is null) {
-            if (ImGui.Button($"{EditorIcons.Add}  New Profile", new SysVec2(-1, 0)))
-                CreateProfileAsset(entity, volume);
-            ImGui.TextDisabled("Creates a .volume asset and assigns it.");
-            return;
-        }
+    // RW1.3: DrawTerrainBrushSection body MOVED into TerrainPreview
+    // (Inspector/Preview/ComponentPreviews.cs).
 
-        ImGui.SeparatorText("Overrides");
-        // UNDO for volume-profile edits (bug 2b): the profile is a .volume ASSET, outside scene-undo.
-        // Snapshot before drawing; if a parameter changed, push a callback undo step when the edit
-        // SETTLES (no item active) so a slider drag is one entry, not hundreds. The before-snapshot is
-        // captured at the start of a drag (the frame the change first appears) and held until release.
-        object beforeSnap = VolumeProfileEditor.Snapshot(volume.Profile);
-        if (VolumeProfileEditor.Draw(volume.Profile)) {
-            VolumeProfileEditor.SaveToAsset(volume.Profile);
-            state.MarkViewportDirty();
+    // AudioSource/clip preview voice + scrub state. The component preview (AudioSourcePreview, RW1.3)
+    // AND the .wav asset-clip preview (DrawAudioClipAsset, an RW1.4 body still inline here) share these,
+    // so they stay on InspectorPanel as internal statics and are reached from the moved preview.
+    internal static IAudioVoice audioPreviewVoice;
+    internal static float audioPreviewTime;   // scrub-slider position (seconds), persists between previews
 
-            VolumeProfile prof = volume.Profile;
-            // Remember the state from BEFORE this drag started (first changed frame).
-            volumeUndoBefore ??= volumeUndoLastClean;
-            volumeUndoBefore ??= beforeSnap;
-
-            // Commit one undo step when the interaction ends (mouse released / instantaneous widget).
-            // F2: route the .volume ASSET edit through the EditorCommands.EditAsset choke point (which is
-            // EditorUndo.PushCallback under the hood) so every asset edit shares one undo entry point. The
-            // edit already happened during VolumeProfileEditor.Draw above, so the mutate step is a no-op --
-            // EditAsset only records the before/after revert pair here. Byte-identical to the prior
-            // PushCallback (same label, same applyOld/applyNew closures).
-            if (!ImGui.IsAnyItemActive()) {
-                object before = volumeUndoBefore;
-                object after = VolumeProfileEditor.Snapshot(prof);
-                EditorCommands.EditAsset("Edit Volume Override",
-                    applyOld: () => { VolumeProfileEditor.Restore(prof, before); VolumeProfileEditor.SaveToAsset(prof); state.MarkViewportDirty(); },
-                    applyNew: () => { VolumeProfileEditor.Restore(prof, after); VolumeProfileEditor.SaveToAsset(prof); state.MarkViewportDirty(); },
-                    mutate: () => { });
-                volumeUndoBefore = null;
-            }
-        }
-        else if (!ImGui.IsAnyItemActive()) {
-            // Idle: this clean snapshot is the "before" for the next edit.
-            volumeUndoLastClean = beforeSnap;
-            volumeUndoBefore = null;
-        }
-    }
-
-    // Volume-profile undo bookkeeping (see DrawVolumeSection): the snapshot from before the current
-    // drag began, and the last settled (clean) snapshot to use as its baseline.
-    static object volumeUndoBefore;
-    static object volumeUndoLastClean;
-
-    // Terrain sculpting palette: a Sculpt toggle that arms the Scene-view brush, the brush mode, and
-    // radius/strength (and a target height for Flatten/Set). Drives TerrainTool's static state; the
-    // actual sculpting happens in the viewport. Not part of scene undo — brush settings are editor
-    // tool state, and each stroke pushes its own undo + saves the .terrain asset.
-    internal static void DrawTerrainBrushSection(Terrain terrain) {
-        ImGui.Spacing();
-
-        if (terrain.Terrain3D is null) {
-            ImGui.TextDisabled("Assign a Terrain asset to sculpt (or create one: Assets > New Terrain).");
-            TerrainTool.Armed = false;
-            return;
-        }
-
-        ImGui.SeparatorText("Sculpt");
-
-        bool armed = TerrainTool.Armed;
-        if (ImGui.Checkbox("Enable Brush", ref armed))
-            TerrainTool.Armed = armed;
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Left-drag in the Scene view to sculpt. While on, clicks paint instead of selecting.");
-
-        if (!armed)
-            return;
-
-        // Brush mode.
-        string[] modes = ["Raise", "Lower", "Smooth", "Flatten", "Set"];
-        int mode = (int)TerrainTool.Brush;
-        ImGui.SetNextItemWidth(-1);
-        if (ImGui.Combo("##terrainbrush", ref mode, modes, modes.Length))
-            TerrainTool.Brush = (TerrainSculpt.Brush)mode;
-
-        float radius = TerrainTool.Radius;
-        if (ImGui.SliderFloat("Radius", ref radius, 0.5f, 60f, "%.1f"))
-            TerrainTool.Radius = radius;
-
-        float strength = TerrainTool.Strength;
-        if (ImGui.SliderFloat("Strength", ref strength, 0.01f, 2f, "%.2f"))
-            TerrainTool.Strength = strength;
-
-        // Flatten/Set converge toward a target height (0..1 of the terrain's HeightScale).
-        if (TerrainTool.Brush is TerrainSculpt.Brush.Flatten or TerrainSculpt.Brush.Set) {
-            float target = TerrainTool.TargetHeight;
-            if (ImGui.SliderFloat("Target Height", ref target, 0f, 1f, "%.2f"))
-                TerrainTool.TargetHeight = target;
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("Normalized height (x HeightScale) the brush levels toward.");
-        }
-
-        ImGui.TextDisabled("Pick Lower to dig; Smooth/Flatten to level.");
-    }
-
-    // AudioSource preview: a Preview/Stop button so you can hear a clip without entering play mode.
-    // Uses the static Audio facade (play-mode-independent), so it works in edit mode; AudioSource.Play
-    // itself is gated to play mode. Graceful no-op when no audio device is present (headless CI).
-    static IAudioVoice audioPreviewVoice;
-    static float audioPreviewTime;   // scrub-slider position (seconds), persists between previews
-    internal void DrawAudioSourceSection(AudioSource source) {
-        ImGui.Spacing();
-        ImGui.SeparatorText("Preview");
-
-        if (source.Clip is null) {
-            ImGui.TextDisabled("Assign a Clip to preview.");
-            return;
-        }
-
-        bool playing = audioPreviewVoice is { IsPlaying: true };
-        if (ImGui.Button(playing ? $"{EditorIcons.Pause}  Stop" : $"{EditorIcons.Play}  Preview",
-                new SysVec2(120, 0))) {
-            audioPreviewVoice?.Stop();
-            audioPreviewVoice = playing
-                ? null
-                : Audio.Play(source.Clip, source.Volume, source.Pitch, loop: false);
-            playing = !playing;
-        }
-        ImGui.SameLine();
-        ImGui.TextDisabled($"{source.Clip.DurationSeconds:F1}s, {source.Clip.Channels}ch, {source.Clip.SampleRate}Hz");
-
-        EditorWidgets.AudioScrubber(source.Clip, source.Volume, source.Pitch,
-            ref audioPreviewVoice, ref audioPreviewTime, state.MarkViewportDirty);
-
-        if (!Audio.IsAvailable)
-            ImGui.TextDisabled("(no audio device on this machine — preview is silent)");
-    }
+    // RW1.3: DrawAudioSourceSection body MOVED into AudioSourcePreview
+    // (Inspector/Preview/ComponentPreviews.cs).
 
     // RW1.2: DrawAnimatorSection / DrawAnimatorControllerSection / DrawLightAnimatorSection /
     // DrawSpawnerSection bodies MOVED into Animator/AnimatorController/LightAnimator/Spawner Preview
     // (Inspector/Preview/ComponentPreviews.cs).
 
-    // Health: a current/max bar (green->red by fraction) + Damage/Heal/Kill/Revive test buttons so you
-    // can exercise the events without play-mode scripting. The OnDamaged/OnHealed/OnDied BEvents render
-    // their own listener editors automatically via the reflection DrawMember.
-    // UIDocument's Uxml/Uss are string PATHS; give them drag-drop target fields so you can drop a
-    // .uxml/.uss (or .uihtml/.uss) asset from the browser instead of typing the address (item 15).
-    internal void DrawUIDocumentSection(BallisticEngine.UI.UIDocument doc) {
-        ImGui.Spacing();
-        ImGui.SeparatorText("Markup & Style");
-        DrawPathDropField("UXML (markup)", doc.Uxml, [".uxml", ".uihtml", ".html"], p => doc.Uxml = p);
-        DrawPathDropField("USS (style)", doc.Uss, [".uss", ".uicss", ".css"], p => doc.Uss = p);
-        ImGui.TextDisabled("Drag a markup/style asset here, or type its Assets/... path.");
-    }
-
-    // A text field for an asset PATH that also accepts a drag-drop of a matching-extension asset (sets
-    // the field to the dropped asset's path). `exts` are the accepted extensions (lowercase, with dot).
-    void DrawPathDropField(string label, string current, string[] exts, Action<string> apply) {
-        ImGui.PushID(label);
-        ImGui.TextDisabled(label);
-        var s = current ?? "";
-        ImGui.SetNextItemWidth(-1);
-        if (ImGui.InputText("##path", ref s, 256)) {
-            // `apply` is an opaque closure that may write any target (UIDocument paths etc.) and the
-            // entity is not reachable here, so this stays a whole-scene structural snapshot.
-            EditorCommands.Structural($"Edit {label}", () => { apply(s); state.MarkViewportDirty(); });
-        }
-        // Drop target over the field: accept a single matching asset and write its path.
-        if (AcceptGuidDrop(out Guid guid)) {
-            string path = AssetDatabase.GuidToAssetPath(guid);
-            if (path is not null && exts.Any(e => path.EndsWith(e, StringComparison.OrdinalIgnoreCase))) {
-                EditorCommands.Structural($"Assign {label}", () => { apply(path); state.MarkViewportDirty(); });
-            }
-        }
-        ImGui.PopID();
-    }
-
     // RW1.1: DrawHealthSection body MOVED into HealthPreview (Inspector/Preview/ComponentPreviews.cs).
+
+    // RW1.3: DrawUIDocumentSection body (+ the DrawPathDropField helper) MOVED into UIDocumentPreview
+    // (Inspector/Preview/ComponentPreviews.cs); the shared AcceptGuidDrop stays here (internal static).
 
     // RW1.2: DrawParticleSystemSection body MOVED into ParticleSystemPreview
     // (Inspector/Preview/ComponentPreviews.cs).
 
     // RW1.1: DrawTrailRendererSection body MOVED into TrailRendererPreview
     // (Inspector/Preview/ComponentPreviews.cs).
-
-    static void CreateProfileAsset(Entity entity, Volume volume) {
-        var baseName = entity.Name is { Length: > 0 } entityName ? entityName : "Volume";
-        string assetPath = null;
-        for (var i = 0; i < 100; i++) {
-            var candidate = $"Assets/{baseName} Profile{(i == 0 ? "" : $" {i}")}.volume";
-            if (!File.Exists(AssetDatabase.Project.ResolveAbsolute(candidate))) {
-                assetPath = candidate;
-                break;
-            }
-        }
-        if (assetPath is null)
-            return;
-
-        VolumeProfileLoader.Save(new VolumeProfile(), AssetDatabase.Project.ResolveAbsolute(assetPath));
-
-        // The new file needs a refresh pass to get its meta/GUID before it can be loaded + assigned.
-        // Single-entity edit (the Volume's own entity is reachable), so scope it to that entity --
-        // PushEntity restores just it in place (Push->PushEntity scoping aside, byte-identical). The
-        // snapshot still fires inside the deferred callback right before the mutate.
-        AsyncAssetImport.Request("Importing profile...", onFinished: () => {
-            EditorCommands.EditEntity(entity, "Assign Profile",
-                () => volume.Profile = AssetDatabase.Load<VolumeProfile>(assetPath));
-        });
-    }
 
     // Collapsible component header: framed bar with a category-tinted stripe + type icon, a bold
     // label, an enable checkbox after the arrow, and a "..." menu on the right edge. Right-click
@@ -2899,7 +2717,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             ? AssetDatabase.LoadRef<Texture2D>(reference)
             : null;
 
-    static unsafe bool AcceptGuidDrop(out Guid guid) {
+    internal static unsafe bool AcceptGuidDrop(out Guid guid) {
         guid = Guid.Empty;
         if (!ImGui.BeginDragDropTarget())
             return false;
