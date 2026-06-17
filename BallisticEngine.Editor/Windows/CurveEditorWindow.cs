@@ -494,6 +494,11 @@ internal static class CurveEditorWindow {
     // Whole-curve snapshot undo: capture the compact string before/after via a callback entry, so the
     // edit is reversible no matter which component (or .volume) owns the curve. Pushed once per gesture.
     // Undo restores `before`; redo restores `after[0]`, which Changed() keeps current through the drag.
+    // F2: route the curve ASSET edit through the EditorCommands.EditAsset choke point (which is
+    // EditorUndo.PushCallback under the hood) so every asset edit shares one undo entry point. The curve
+    // mutation happens during the live gesture (and Changed() keeps after[0] current), so the mutate step
+    // is a no-op here -- EditAsset only records the before/after revert pair. Byte-identical to the prior
+    // PushCallback (same label, same applyOld/applyNew closures, one entry per gesture).
     static void PushUndo() {
         if (snapshotPushed) return;
         snapshotPushed = true;
@@ -502,9 +507,10 @@ internal static class CurveEditorWindow {
         string before = curve.ToCompactString();
         string[] after = [before];              // filled in by Changed() as the gesture proceeds
         pendingAfter = after;
-        EditorUndo.PushCallback($"Curve {title}",
+        EditorCommands.EditAsset($"Curve {title}",
             applyOld: () => { ApplyString(curve, before); changed?.Invoke(); },
-            applyNew: () => { ApplyString(curve, after[0]); changed?.Invoke(); });
+            applyNew: () => { ApplyString(curve, after[0]); changed?.Invoke(); },
+            mutate: () => { });
     }
 
     static void ApplyString(AnimationCurve curve, string compact) {
