@@ -83,6 +83,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         memberRegistry.Register(new CollectionDrawer(this));
         // G2-editor (ch21): Dictionary<K,V> gets the interactive entry editor (was a dead (Dictionary`2) label).
         memberRegistry.Register(new DictionaryDrawer(this));
+        // G3-editor (ch23): an interface/abstract [SerializeReference] member gets the implementor dropdown +
+        // recursive member foldout (was a dead (IFoo) Unsupported label). Last-wins; no other drawer matches an
+        // interface/abstract type, so order vs the primitives is irrelevant.
+        memberRegistry.Register(new PolymorphicDrawer(this));
         // The standalone component window reuses our reflection member renderer.
         ComponentEditorWindow.Configure(DrawMemberList);
     }
@@ -112,6 +116,9 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     void IComponentInspectorHost.DrawCollectionSlot(Inspector.IProperty property) => DrawCollectionSlot(property);
     // G2-editor (ch21): the DictionaryDrawer terminal drawer hands its IProperty here; render the per-entry editor.
     void IComponentInspectorHost.DrawDictionarySlot(Inspector.IProperty property) => DrawDictionarySlot(property);
+    // G3-editor (ch23): the PolymorphicDrawer terminal drawer hands its IProperty + declared base type here;
+    // render the implementor dropdown + recursive member foldout.
+    void IComponentInspectorHost.DrawPolymorphicSlot(Inspector.IProperty property, Type declaredType) => DrawPolymorphicSlot(property, declaredType);
 
     public void DrawContents() {
         ImGui.PushID(instanceId);   // namespace all ids so a 2nd Inspector window doesn't collide
@@ -1968,6 +1975,98 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     static bool IsIntegralKey(Type t) =>
         t == typeof(int) || t == typeof(long) || t == typeof(short) || t == typeof(byte) ||
         t == typeof(uint) || t == typeof(ulong) || t == typeof(ushort) || t == typeof(sbyte);
+
+    // G3-editor (ch23, Rule 2): the interactive [SerializeReference] polymorphism editor for an interface /
+    // abstract member (the parallel of DrawCollectionSlot / DrawDictionarySlot for the Polymorphic category).
+    // Renders, inside the value column the BeginRow opened:
+    //   (1) a concrete-type DROPDOWN -- "None" + every instantiable type deriving from the declared base
+    //       (TypeCache.GetTypesDerivedFrom, deterministically ordered, concrete + public-ctor only); the live
+    //       value's actual type is preselected. Changing it Activator-creates the chosen type (None -> null),
+    //       writes it through the property (-> ApplyMember broadcast + dirty) under one EditorUndo.Push, then
+    //       returns so next frame redraws against the new instance.
+    //   (2) when a value is set, a foldout whose body draws the instance's members RECURSIVELY through the SAME
+    //       component drawer stack as a top-level member (componentStack.Draw(MemberProperty)). Because each
+    //       child is a REAL reflected member (a MemberInfo, unlike a collection element / dictionary value), its
+    //       [Range]/[Tooltip]/[ShowIf]/[ReadOnly] attributes work, and a nested [SerializeReference] member
+    //       resolves THIS drawer again -> nested polymorphism auto-recurses (CompositeModifier.Inner).
+    // The instance is a reference type (an interface / abstract base is implemented by a class), so a child
+    // member write mutates the instance in place; the apply delegate also writes the WHOLE instance back through
+    // the slot's property so the multi-selection broadcast + dirty fire exactly like a primitive member edit.
+    void DrawPolymorphicSlot(Inspector.IProperty p, Type declaredType) {
+        object instance = p.Get();
+        Type actual = instance?.GetType();
+
+        // The implementor options: "None" plus every instantiable concrete derived type (deterministically
+        // ordered by TypeCache). The combo shows the current selection by name; per-item equality (`t == actual`)
+        // drives the checkmark + suppresses a redundant rebuild when the same type is re-picked.
+        System.Collections.Generic.IReadOnlyList<Type> derived = TypeCache.GetTypesDerivedFrom(declaredType);
+
+        string current = actual is null ? "None" : Prettify(actual.Name);
+        bool typeChanged = false;
+        ImGui.SetNextItemWidth(-1);
+        if (ImGui.BeginCombo($"##poly_{p.Name}", current)) {
+            // None
+            if (ImGui.Selectable("None", actual is null) && actual is not null) {
+                PolymorphicSet(p, null);
+                typeChanged = true;
+            }
+            // Each derived concrete type: short Name (more readable), FullName tooltip (disambiguates collisions).
+            for (int i = 0; i < derived.Count; i++) {
+                Type t = derived[i];
+                bool isSel = t == actual;
+                if (ImGui.Selectable($"{Prettify(t.Name)}##{i}", isSel) && !isSel) {
+                    PolymorphicSet(p, Activator.CreateInstance(t));
+                    typeChanged = true;
+                }
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip(t.FullName);
+            }
+            ImGui.EndCombo();
+        }
+
+        // Structural change this frame: the slot's value is a new instance / null now -- redraw next frame
+        // against it (the local `instance`/`actual` are stale), exactly like DrawCollectionSlot's Add/Remove.
+        if (typeChanged || instance is null)
+            return; // None or just-changed: nothing to expand this frame
+
+        // A value is set: draw its members in a collapsible foldout (the recursion). The members go in their own
+        // nested grid (BeginGrid) so the shared stack's BeginRow (TableNextRow) has an open table to write into.
+        if (ImGui.TreeNodeEx($"{Prettify(actual.Name)}###polybody_{p.Name}",
+                ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.SpanAvailWidth)) {
+            object boundInstance = instance; // capture for the per-member apply delegates
+            if (BeginGrid($"##polymembers_{p.Name}_{actual.Name}")) {
+                foreach (MemberInfo member in ComponentReflection.InspectorMembers(actual)) {
+                    MemberAttributes attrs = MemberAttributes.For(member);
+                    // [ShowIf]/[HideIf] at this level too (same skip DrawMemberList does for top-level members).
+                    if (!Conditions.Visible(attrs.Conditionals, boundInstance))
+                        continue;
+                    // Each child member flows through the SAME component stack as a top-level member: a real
+                    // MemberProperty (MemberInfo present -> attributes honored). The apply delegate writes the
+                    // member on the instance, then writes the WHOLE instance back up through the slot's property
+                    // so the edit broadcasts to the multi-selection + marks dirty (the terminal drawer already
+                    // registered the per-edit undo, like any primitive member edit).
+                    MemberInfo capturedMember = member;
+                    componentStack.Draw(new Inspector.MemberProperty(capturedMember, boundInstance,
+                        v => {
+                            ComponentReflection.SetValue(capturedMember, boundInstance, v);
+                            p.Set(boundInstance);            // chain the whole instance up (-> ApplyMember + dirty)
+                            state.MarkViewportDirty();
+                        }), componentGui);
+                }
+                ImGui.EndTable();
+            }
+            ImGui.TreePop();
+        }
+    }
+
+    // Assign a new polymorphic instance (or null for None) onto the slot's property. One undo per type change;
+    // IProperty.Set routes through ApplyMember (multi-select broadcast) + dirty. The instance is freshly
+    // constructed (or null), so this is a structural change -> the caller returns and redraws next frame.
+    void PolymorphicSet(Inspector.IProperty p, object instance) {
+        EditorUndo.Push($"Set {p.Label}");
+        p.Set(instance);
+        state.MarkViewportDirty();
+    }
 
     // Accepts a Hierarchy entity-drag payload (int = entity InstanceId hash, set by HierarchyPanel's
     // EntityDragType source) onto the current item and resolves it back to the live entity. Mirrors

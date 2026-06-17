@@ -222,6 +222,7 @@ public sealed class CollectionElementProperty : IProperty {
         this.get = get;
         this.assign = assign;
     }
+    // (G3-editor PolymorphicDrawer follows this class at file end -- see its banner.)
 
     public string Name { get; }
     public string Label => Name;
@@ -239,4 +240,37 @@ public sealed class CollectionElementProperty : IProperty {
     public bool HasOverrideToggle => false;
     public bool Overridden { get => false; set { } }
     public bool TryGetSiblingValue(string memberName, out object value) { value = null; return false; }
+}
+
+// editor-rework G3-editor (ch23): the VISIBLE half of the [SerializeReference] polymorphism round-trip (the
+// engine half -- the $type codec SerializeReferenceInstance / TryDeserializeReferenceInstance -- landed in
+// ch22, so a [SerializeReference] abstract/interface member now round-trips its live concrete type). Terminal
+// drawer for a member whose DECLARED type is an interface or abstract class (the [SerializeReference] case).
+// Before this it matched no drawer (no primitive / enum / math / asset / collection / dict drawer matches an
+// interface or abstract type) and fell to TypeDrawerTerminalStep -> gui.Unsupported -> a dead `(IDamageModifier)`
+// / `(StatusEffect)` disabled label. Now it routes to the host's polymorphic slot: a concrete-type DROPDOWN
+// (TypeCache.GetTypesDerivedFrom(declaredType) + "None"); picking one Activator.CreateInstance's it (None ->
+// null); a set value's members are then drawn RECURSIVELY in a foldout, each through its OWN member pipeline (so
+// a nested [SerializeReference] member auto-recurses through this same drawer).
+//
+// CanDraw STRATEGY (declared-TYPE based, the same purely-type contract every sibling drawer uses): an interface
+// or abstract declared type. ITypeDrawer.CanDraw receives only the Type (no member / attribute context -- the
+// DrawerRegistry resolves by type), so [SerializeReference] cannot be tested here. That is FINE: an interface /
+// abstract member WITHOUT [SerializeReference] classifies Unsupported engine-side (PropertyCategories) and
+// serializes to null, so it would otherwise show a dead label -- giving it the implementor dropdown is strictly
+// additive (the dropdown lists derived concrete types; with none it shows just "None"). A concrete base WITH
+// [SerializeReference] (the rarer Polymorphic case) is NOT matched here -- a concrete type already has its own
+// drawer (Nested member-recursion / math-struct / asset / ...), which keeps its existing in-place editing; the
+// type-swap dropdown for a concrete base is deferred (G4). The host owns undo / dirty on an actual pick.
+public sealed class PolymorphicDrawer : ITypeDrawer {
+    readonly IComponentInspectorHost host;
+    public PolymorphicDrawer(IComponentInspectorHost host) => this.host = host;
+    // Interface or abstract class declared type: the [SerializeReference] implementor-dropdown case. No other
+    // drawer matches such a type (primitives / enums / math / asset / collection / dict all key on concrete
+    // types), so last-wins registration order versus them is irrelevant; registered last to be safe.
+    public bool CanDraw(Type t) => t is { IsInterface: true } or { IsAbstract: true };
+    public bool Draw(IProperty p, IInspectorGui gui) {
+        host.DrawPolymorphicSlot(p, p.ValueType);
+        return false;
+    }
 }

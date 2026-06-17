@@ -49,6 +49,19 @@ public interface IComponentInspectorHost {
     // host unwraps the IProperty, mutates the backing dictionary, writes it back through the property (->
     // ApplyMember multi-select broadcast + dirty), and pushes one undo per add / remove / value edit.
     void DrawDictionarySlot(IProperty property);
+
+    // editor-rework G3-editor (ch23, the visible half of the [SerializeReference] polymorphism round-trip;
+    // engine $type codec done in ch22): the polymorphic terminal drawer (PolymorphicDrawer) routes an
+    // interface / abstract [SerializeReference] member here. The host renders a concrete-type DROPDOWN
+    // (TypeCache.GetTypesDerivedFrom(declaredType) + "None"; the live value's actual type is preselected) +,
+    // when a value is set, a foldout that draws the instance's members RECURSIVELY through the SAME member
+    // pipeline (so range / conditional / tooltip attributes work and a nested polymorphic member auto-recurses)
+    // in place of the dead `(IFoo)` disabled label these members fell to via gui.Unsupported. Mirrors the
+    // DrawCollectionSlot / DrawDictionarySlot host-method shape; the host unwraps the IProperty, Activator-
+    // creates / nulls the instance on a dropdown change (-> property.Set -> ApplyMember broadcast + dirty), and
+    // pushes one undo per type change. declaredType is passed explicitly (the IProperty's ValueType is the
+    // abstract/interface base; the dropdown queries TypeCache against it).
+    void DrawPolymorphicSlot(IProperty property, Type declaredType);
 }
 
 public sealed class ImGuiComponentGui : IInspectorGui {
