@@ -339,11 +339,41 @@ proven on a trivial feature BEFORE any real feature is built (the chunk-18 risk 
     / B x0.888 post-tonemap, meanAbsDiff 5.22) — the seam now runs from a SERIALIZED feature, env door unused;
     GBV on that scene = exit 0, 0 NEW. (Throwaway scene deleted after the proof — kept OUT of golden.) Commit.
 
-- **Chunk 22 — editor: the reorderable feature-list UI.** The feature PARAMS already draw via the existing
-  `DrawerPipeline` (attributes free). Add the ONE new widget: a reorderable list on the `RenderFeatures`
-  SceneBehaviour's inspector (add/remove/reorder/enable-toggle features), pushing `EditorUndo` like every
-  other editor mutation, marking the viewport dirty. Reorder changes registration order → re-`Build`/`Compile`
-  the graph. Verify in-editor (per gpu-hang safety: GBV-off, no RT) + golden unaffected (editor-only). Commit.
+- **Chunk 22 — editor: the reorderable feature-list UI. ✅ DONE.** The ONE new editor widget on the
+  `RenderFeatures` SceneBehaviour inspector (add/remove/reorder/enable-toggle), all mutations through the
+  existing `EditorUndo` + `MarkViewportDirty` path. The feature params draw through the SAME
+  attribute-driven `DrawMemberList`/`DrawerPipeline` a component uses (attributes free — no per-feature
+  widget code).
+  - **WHERE it lives (2 edits, NO new files):**
+    - `Engine/Rendering/RenderFeatures/RenderFeatures.cs` — `Features` gains `[HideInInspector]` so the
+      GENERIC reflected member list skips it (a `List<abstractType>` has no sensible default drawer); the
+      dedicated widget renders it instead. **Serialization is UNAFFECTED** — the scene serializer drives off
+      `SerializableMembers` (which IGNORES `[HideInInspector]`) + the chunk-21 `IsRenderFeatureList`
+      element-type path, NOT `InspectorMembers`. (Re-ran the chunk-21 round-trip harness `bal-feature-rt-test`
+      18/18 PASS to prove it: the `features:` list still byte-stable, feature-free scene still has no
+      `features:` key.)
+    - `BallisticEngine.Editor/Panels/InspectorPanel.cs` — `DrawSceneBehaviourInspector` calls the new
+      `DrawRenderFeatureList(RenderFeatures)` when the selected SceneBehaviour is a `RenderFeatures`, after
+      the generic member list. The widget: a `SeparatorText("Render Features")` then one collapsible card
+      per feature (Active checkbox → `feature.Active`/Enabled→graph rebuild via the chunk-20 bridge; display
+      name from `RenderFeatureMenu`; ^/v reorder small-buttons bounds-disabled at the edges; a red trash
+      remove). Structural changes (remove/reorder) are DEFERRED to after the per-feature loop (no
+      mid-iteration list mutation) and tuple-swap/RemoveAt with `EditorUndo`. The open card draws the
+      feature's params via `DrawMemberList(feature.GetType(), feature)` (shared DrawerPipeline). Below: an
+      "Add Feature" button → a search popup mirroring `DrawAddComponentPopup` over
+      `ComponentRegistry.RenderFeatureMenu`, `Activator.CreateInstance`→`RenderFeature`, appended (DUPLICATES
+      ALLOWED — URP parity, §5 D1, no "already present" filter). `PushID(i)` per feature namespaces ids so
+      two same-type features don't collide.
+  - **GOTCHA (Hexa.NET.ImGui binding):** `ImGui.GetWindowContentRegionMax()` does NOT exist in this binding —
+    right-align via `SetCursorPosX(GetCursorPosX() + GetContentRegionAvail().X - btnW*3 - 8)` after a
+    `SameLine` (the same idiom `DrawLockBar` uses), not the content-region-max API.
+  - **VERIFIED (editor-only → golden unaffected):** slnx 0-err (editor included). The ONLY engine-side change
+    is the inert `[HideInInspector]` attribute, which the renderer never reads → the deterministic frame is
+    untouched. Golden **30/30** SHA==golden (the full 15-row matrix under BOTH `default` AND `GRAPH=1` doors).
+    Serialization round-trip 18/18 (above). No `.hlsl`/DX12-backend touched, so GBV is unchanged by
+    construction (no renderer/barrier code in this chunk). Per gpu-hang-safety the live editor was NOT
+    launched in a loop; the widget compiles clean and follows the proven `DrawAddComponentPopup` idiom
+    verbatim. Commit.
 
 - **Chunk 23 — phase-3 DoD + acceptance doc + (optionally) one REAL example feature.** Write
   `dx12-passgraph-phase3-done.md`: the seam is proven, a feature is authorable without referencing DX12,

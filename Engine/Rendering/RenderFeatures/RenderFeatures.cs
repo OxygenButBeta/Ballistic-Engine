@@ -20,6 +20,12 @@ public class RenderFeatures : SceneBehaviour {
     // The authored features, in injection/registration order. Plain RenderFeature instances — they
     // serialize through ComponentReflection / the scene YAML by type-name + members (chunk 21), the same
     // path a Behaviour list uses. Public for the editor list widget (chunk 22); never null.
+    //
+    // [HideInInspector] hides it from the GENERIC reflected member list (a List<abstractType> has no
+    // sensible default drawer) — the editor renders it with the dedicated reorderable feature-list widget
+    // (chunk 22) instead. Serialization is UNAFFECTED: the scene serializer drives off SerializableMembers
+    // (which ignores [HideInInspector]) + the IsRenderFeatureList element-type path (chunk 21).
+    [HideInInspector]
     public List<RenderFeature> Features { get; set; } = new();
 
     protected internal override void OnAttach() {

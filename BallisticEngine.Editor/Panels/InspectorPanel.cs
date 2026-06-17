@@ -185,8 +185,14 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             ImGui.EndPopup();
         }
 
-        if (open)
+        if (open) {
             DrawMemberList(type, behaviour);
+            // Phase-3 chunk 22: the RenderFeatures scene behaviour gets the dedicated reorderable
+            // feature-list widget (its Features member is [HideInInspector], so the generic list above
+            // skips it). All other scene behaviours show only their reflected members.
+            if (behaviour is RenderFeatures features)
+                DrawRenderFeatureList(features);
+        }
 
         if (removeClicked) {
             EditorUndo.Push("Remove Component");
@@ -196,6 +202,184 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         }
 
         ImGui.PopID();
+    }
+
+    // ---- Render-feature list (phase-3 chunk 22) -------------------------------
+
+    // Search buffer for the Add Feature popup (mirrors addComponentSearch).
+    string addFeatureSearch = "";
+
+    // The reorderable feature list on the RenderFeatures scene behaviour — the editor face of the
+    // authored render-feature layer (URP's ScriptableRendererFeature list). Each feature draws as a
+    // collapsible sub-card with an Active toggle, up/down/remove controls, and its reflected params via
+    // the SAME attribute-driven DrawerPipeline a component uses. Add/remove/reorder/toggle each push
+    // EditorUndo and dirty the viewport, exactly like every other editor mutation; the backend bridge
+    // rebuilds the graph's feature segment when the active set or order changes (chunk 20).
+    void DrawRenderFeatureList(RenderFeatures host) {
+        List<RenderFeature> list = host.Features ??= new();
+
+        ImGui.Spacing();
+        ImGui.SeparatorText("Render Features");
+
+        if (list.Count == 0)
+            ImGui.TextDisabled("No render features. Add one below.");
+
+        int moveFrom = -1, moveTo = -1, removeAt = -1;
+
+        for (var i = 0; i < list.Count; i++) {
+            RenderFeature feature = list[i];
+            if (feature is null) continue;
+            Type ft = feature.GetType();
+            ImGui.PushID(i);
+
+            // Active toggle (left of the header).
+            bool active = feature.Active;
+            if (ImGui.Checkbox("##featactive", ref active)) {
+                EditorUndo.Push(active ? "Enable Render Feature" : "Disable Render Feature");
+                feature.Active = active;
+                state.MarkViewportDirty();
+            }
+            ImGui.SameLine();
+
+            // Collapsible feature header carrying the (display) type name.
+            string display = ComponentRegistry.RenderFeatureMenu
+                .FirstOrDefault(e => e.Type == ft).DisplayName ?? Prettify(ft.Name);
+            ImGui.PushStyleColor(ImGuiCol.Text,
+                ImGui.GetStyle().Colors[(int)(active ? ImGuiCol.Text : ImGuiCol.TextDisabled)]);
+            bool open = ImGui.CollapsingHeader($"{display}###feathdr{i}", ImGuiTreeNodeFlags.DefaultOpen);
+            ImGui.PopStyleColor();
+
+            // Reorder + remove controls (right-aligned on the header row). After SameLine,
+            // GetContentRegionAvail().X is the width remaining to the right edge — reserve three
+            // small buttons' worth and push the cursor there (same idiom as DrawLockBar).
+            float btnW = ImGui.GetFrameHeight();
+            ImGui.SameLine();
+            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - btnW * 3 - 8);
+            ImGui.BeginDisabled(i == 0);
+            if (ImGui.SmallButton("^##fup")) { moveFrom = i; moveTo = i - 1; }
+            ImGui.EndDisabled();
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Move up");
+            ImGui.SameLine();
+            ImGui.BeginDisabled(i == list.Count - 1);
+            if (ImGui.SmallButton("v##fdn")) { moveFrom = i; moveTo = i + 1; }
+            ImGui.EndDisabled();
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Move down");
+            ImGui.SameLine();
+            ImGui.PushStyleColor(ImGuiCol.Text, EditorIcons.AxisX);
+            if (ImGui.SmallButton($"{EditorIcons.Delete}##frm")) removeAt = i;
+            ImGui.PopStyleColor();
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Remove feature");
+
+            // The feature's reflected params (Event/Tint/Strength/…) via the shared drawer pipeline.
+            // Undo for a param edit is taken per-widget by the same InspectorUndo path components use.
+            if (open) {
+                ImGui.Indent();
+                DrawMemberList(ft, feature);
+                ImGui.Unindent();
+            }
+
+            ImGui.PopID();
+        }
+
+        // Apply structural changes AFTER the loop (mutating the list mid-iteration is unsafe).
+        if (removeAt >= 0) {
+            EditorUndo.Push("Remove Render Feature");
+            list.RemoveAt(removeAt);
+            state.MarkViewportDirty();
+        }
+        else if (moveFrom >= 0 && moveTo >= 0 && moveTo < list.Count) {
+            EditorUndo.Push("Reorder Render Feature");
+            (list[moveFrom], list[moveTo]) = (list[moveTo], list[moveFrom]);
+            state.MarkViewportDirty();
+        }
+
+        ImGui.Spacing();
+        DrawAddFeatureButton(host);
+    }
+
+    void DrawAddFeatureButton(RenderFeatures host) {
+        float avail = ImGui.GetContentRegionAvail().X;
+        float w = Math.Clamp(avail * 0.72f, 180f, 320f);
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (avail - w) * 0.5f);
+
+        SysVec4 accent = ImGui.GetStyle().Colors[(int)ImGuiCol.CheckMark];
+        ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(accent.X, accent.Y, accent.Z, 0.16f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(accent.X, accent.Y, accent.Z, 0.30f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new SysVec4(accent.X, accent.Y, accent.Z, 0.42f));
+        var clicked = ImGui.Button($"{EditorIcons.Add}  Add Feature", new SysVec2(w, 0));
+        ImGui.PopStyleColor(3);
+
+        if (clicked) {
+            addFeatureSearch = "";
+            ImGui.OpenPopup("##addfeature");
+        }
+
+        DrawAddFeaturePopup(host);
+    }
+
+    // Mirrors DrawAddComponentPopup, but lists ComponentRegistry.RenderFeatureMenu and appends a fresh
+    // instance to the host's feature list (URP lets the same feature type be added multiple times, so no
+    // "already present" filtering — duplicates are allowed by design, §5 D1).
+    void DrawAddFeaturePopup(RenderFeatures host) {
+        float u = ImGui.GetFontSize();
+        ImGui.SetNextWindowSize(new SysVec2(u * 26f, u * 24f), ImGuiCond.Appearing);
+        if (!ImGui.BeginPopup("##addfeature"))
+            return;
+
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new SysVec2(8, 6));
+
+        ImGui.PushFont(ImGuiController.Bold);
+        ImGui.TextUnformatted("Add Render Feature");
+        ImGui.PopFont();
+        ImGui.Spacing();
+
+        if (ImGui.IsWindowAppearing())
+            ImGui.SetKeyboardFocusHere();
+        ImGui.SetNextItemWidth(-1);
+        ImGui.InputTextWithHint("##addfeatsearch", $"{EditorIcons.Search} Search features...",
+            ref addFeatureSearch, 128);
+        bool enter = ImGui.IsItemFocused() && ImGui.IsKeyPressed(ImGuiKey.Enter);
+        ImGui.Separator();
+
+        bool searching = addFeatureSearch.Length > 0;
+        bool Matches(ComponentEntry e) =>
+            !searching || e.DisplayName.Contains(addFeatureSearch, StringComparison.OrdinalIgnoreCase);
+
+        void Add(ComponentEntry e) {
+            if (Activator.CreateInstance(e.Type) is not RenderFeature feature)
+                return;
+            EditorUndo.Push($"Add {e.DisplayName}");
+            (host.Features ??= new()).Add(feature);
+            state.MarkViewportDirty();
+            ImGui.CloseCurrentPopup();
+        }
+
+        ImGui.BeginChild("##addfeatlist");
+
+        IReadOnlyList<ComponentEntry> entries = ComponentRegistry.RenderFeatureMenu;
+        if (entries.Count == 0) {
+            ImGui.TextDisabled("No render features are defined.");
+            ImGui.TextDisabled("Author a RenderFeature subclass in your project scripts.");
+        }
+        else {
+            ComponentEntry? first = null;
+            var any = false;
+            foreach (ComponentEntry entry in entries) {
+                if (!Matches(entry)) continue;
+                any = true;
+                first ??= entry;
+                if (AddComponentRow(entry))
+                    Add(entry);
+            }
+            if (!any)
+                ImGui.TextDisabled("No features match.");
+            if (enter && first is { } f)
+                Add(f);
+        }
+
+        ImGui.EndChild();
+        ImGui.PopStyleVar();
+        ImGui.EndPopup();
     }
 
     // ---- Entity inspector ----------------------------------------------------
