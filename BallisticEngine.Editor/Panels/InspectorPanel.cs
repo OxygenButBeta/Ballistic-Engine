@@ -2532,24 +2532,25 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         RowChrome();
         ImGui.TableSetColumnIndex(0);
         ImGui.AlignTextToFramePadding();
-        // EF16: at a nested depth the TreeNode's full per-level indent was cancelled (DrawNestedBody) and the
-        // model re-applies a SMALL fixed indent on the LABEL only, so nesting still reads while the value
-        // column stays at the panel-level x. Depth 0 (top-level / shim rows) = no indent → byte-identical.
-        float labelIndent = LabelDepthIndent();
-        if (labelIndent > 0f) ImGui.Indent(labelIndent);
-        ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.RowLabel);
-        ImGui.TextUnformatted(label);
-        ImGui.PopStyleColor();
-        if (labelIndent > 0f) ImGui.Unindent(labelIndent);
+        DrawRowLabel(label, null);
         ImGui.TableSetColumnIndex(1);
         ImGui.SetNextItemWidth(-1);
     }
 
-    // EF16: the small fixed label indent for the CURRENT nesting depth (0 at the top level → 0 px, so the
-    // top-level / shim rows are byte-identical). Reads InspectorLayout's DepthIndent so the indent step lives
-    // in the one layout model EF16/EF11/EF10 share.
-    static float LabelDepthIndent() =>
-        Inspector.InspectorLayout.DepthIndentTotal(nestDepth, EditorTheme.UiScale);
+    // EF11: the ONE label-drawing primitive both Row and RowWithTooltip route through. Replaces the old
+    // plain TextUnformatted + manual EF16 Indent with InspectorLayout.DrawLabelCell, which (1) applies the
+    // small per-depth label indent ITSELF (so the EF16 manual Indent is gone — applying it here too would
+    // DOUBLE-indent), (2) ellipsizes a label that overruns its column and shows the full text on hover, so
+    // a long member name like "High Speed Steer Scale" is never silently truncated, and (3) shows the
+    // [Tooltip] on label hover when one is supplied. `columnWidth` is the label cell's ACTUAL remaining width
+    // (`GetContentRegionAvail().X` measured at the cell, before any indent) — it works for BOTH the top-level
+    // proportional grid (column 0 ≈ 38%) and the fixed-width nested grid, with no panel-level x threaded down.
+    // Depth 0 (top-level + the ComponentPreviews/AssetInspectors shim rows, which never nest) → 0px indent +
+    // a label that fits → DrawLabelCell returns the label unchanged → visually equivalent to the old path.
+    static void DrawRowLabel(string label, string tooltip) {
+        float columnWidth = ImGui.GetContentRegionAvail().X;
+        Inspector.InspectorLayout.DrawLabelCell(label, nestDepth, columnWidth, EditorTheme.UiScale, tooltip);
+    }
 
     // Like Row, but appends a "(?)" marker that shows the tooltip on hover (when one is supplied).
     static void RowWithTooltip(string label, string tooltip) {
@@ -2557,17 +2558,11 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         RowChrome();
         ImGui.TableSetColumnIndex(0);
         ImGui.AlignTextToFramePadding();
-        // EF16: small fixed label indent at nested depth (0 at top level → byte-identical). See Row().
-        float labelIndent = LabelDepthIndent();
-        if (labelIndent > 0f) ImGui.Indent(labelIndent);
-        ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.RowLabel);
-        ImGui.TextUnformatted(label);
-        ImGui.PopStyleColor();
-        // Tooltip on the LABEL itself (Unity-style: hover the field name), not just the "(?)" badge —
-        // this is what made [Tooltip] feel "broken" (you had to find the tiny marker).
+        // EF11: the label (with per-depth indent + ellipsis + full-text/[Tooltip] hover) is drawn by the shared
+        // DrawLabelCell — including the Unity-style tooltip ON THE LABEL ITSELF (what made [Tooltip] feel
+        // "broken" was having to find the tiny "(?)" marker). The "(?)" badge is kept as a redundant affordance.
+        DrawRowLabel(label, tooltip);
         if (tooltip is not null) {
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip(tooltip);
             ImGui.SameLine(0, 4);
             ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.RowCaption);
             ImGui.TextUnformatted("(?)");
@@ -2575,7 +2570,6 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip(tooltip);
         }
-        if (labelIndent > 0f) ImGui.Unindent(labelIndent);
         ImGui.TableSetColumnIndex(1);
         ImGui.SetNextItemWidth(-1);
     }

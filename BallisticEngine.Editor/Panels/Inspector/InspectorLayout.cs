@@ -98,7 +98,10 @@ internal static class InspectorLayout {
         if (indent > 0f)
             ImGui.Indent(indent);
 
-        float avail = System.Math.Max(0f, columnWidth - LabelValueGap * s);
+        // The text occupies [indent .. columnWidth − gap]; subtract BOTH so a deeply-indented label still
+        // ellipsizes before it touches the value field (EF11 — `columnWidth` is the cell's full width measured
+        // before the indent, so the budget must drop the indent the cursor just consumed).
+        float avail = System.Math.Max(0f, columnWidth - indent - LabelValueGap * s);
         string shown = Ellipsize(label, avail);
         bool clipped = !ReferenceEquals(shown, label);
 

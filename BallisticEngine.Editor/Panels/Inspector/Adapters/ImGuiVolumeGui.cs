@@ -50,9 +50,19 @@ public sealed class ImGuiVolumeGui : IInspectorGui {
     public void HelpBox(string t) { ImGui.TextDisabled(t); }
 
     public bool Checkbox(ref bool v) => ImGui.Checkbox("##v", ref v);
-    public bool SliderFloat(ref float v, float min, float max) => ImGui.SliderFloat("##v", ref v, min, max);
+    public bool SliderFloat(ref float v, float min, float max) {
+        ImGui.PushStyleColor(ImGuiCol.SliderGrab, EditorTheme.SliderGrabRest);   // EF11: legible value over the grab
+        bool changed = ImGui.SliderFloat("##v", ref v, min, max);
+        ImGui.PopStyleColor();
+        return changed;
+    }
     public bool DragFloat(ref float v, float speed) => ImGui.DragFloat("##v", ref v, speed);
-    public bool SliderInt(ref int v, int min, int max) => ImGui.SliderInt("##v", ref v, min, max);
+    public bool SliderInt(ref int v, int min, int max) {
+        ImGui.PushStyleColor(ImGuiCol.SliderGrab, EditorTheme.SliderGrabRest);   // EF11: legible value over the grab
+        bool changed = ImGui.SliderInt("##v", ref v, min, max);
+        ImGui.PopStyleColor();
+        return changed;
+    }
     public bool DragInt(ref int v) => ImGui.DragInt("##v", ref v);
     public bool InputText(ref string v, int maxLength) => ImGui.InputText("##v", ref v, (uint)maxLength);
     public bool Combo(ref int index, string[] names) => ImGui.Combo("##v", ref index, names, names.Length);

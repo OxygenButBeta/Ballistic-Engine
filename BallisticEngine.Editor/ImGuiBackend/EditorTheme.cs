@@ -56,6 +56,16 @@ internal static class EditorTheme {
     public static readonly SysVec4 RowLabel   = new(0.92f, 0.92f, 0.94f, 1f);   // neutral, near-primary (very legible on the deep base)
     public static readonly SysVec4 RowCaption = new(0.70f, 0.70f, 0.73f, 1f);   // the "(?)" badge / hints / section labels — neutral grey, lifted
 
+    // EF11 — slider-value legibility. A slider draws its value string CENTERED over the whole frame; the bright
+    // amber SliderGrab (the resting accent, ~0xD49B45, luma ~0.42) slides under that text, so the white value
+    // (ImGuiCol.Text, ~0xF2F3F4) washes out to ~1.8:1 whenever the grab sits behind the digits. This is a
+    // darkened amber for the RESTING grab only — keeps the amber identity but drops the grab's luma far enough
+    // that the white value reads ~6.5:1 over it (still > the dark FrameBg part too). The ACTIVE/dragging grab
+    // stays bright (SliderGrabActive in ImGuiController) — that's a transient, focused state. Applied by the
+    // inspector slider adapters (ImGuiComponentGui / ImGuiVolumeGui), scoped to the slider draw, so the global
+    // EF5 accent is untouched everywhere else.
+    public static readonly SysVec4 SliderGrabRest = Rgb(0x8A6A30);   // darkened amber — white value text reads on it
+
     // Hover-accent bar drawn at the LEFT edge of a hovered row (the affordance the flat rows lacked). Faint
     // fill across the row + a brighter accent sliver — one AddRectFilled each, hover-gated (cheap).
     public static SysVec4 RowHoverFill(SysVec4 accent) => new(accent.X, accent.Y, accent.Z, 0.055f);

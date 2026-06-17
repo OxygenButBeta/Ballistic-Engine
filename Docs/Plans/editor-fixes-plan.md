@@ -19,8 +19,43 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF11** (adaptive label column + slider value legibility — implements the EF-LAYOUT model's label rule; pairs with EF16)
-> Last committed chunk: **EF16** · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **EF10a** (per-component member search bar — conditional, sits above the member grid)
+> Last committed chunk: **EF11** · Branch: `dx12-renderer`
+>
+> **EF11 note (just landed):** the inspector member labels now ellipsize + tooltip instead of silently
+> clipping, and slider value text is legible over the amber grab. Both halves of the EF-LAYOUT label rule:
+> (1) **Adaptive label / no silent truncation:** `InspectorPanel.Row` + `RowWithTooltip` route their label
+> through a new `DrawRowLabel(label, tooltip)` shim → `InspectorLayout.DrawLabelCell(...)`, which ellipsizes
+> a label wider than its column and shows the full text on hover (a real `[Tooltip]` wins). The column width
+> passed is `ImGui.GetContentRegionAvail().X` measured AT the label cell (column 0) — this is the actual
+> remaining label-column width and works for BOTH the top-level proportional `BeginGrid` (≈38% label col)
+> AND the fixed-width nested `BeginNestedGrid`, so **no panel-level value-x had to be threaded down** and
+> the **top-level `BeginGrid` (:2459) is UNTOUCHED** (depth-0 short labels are visually equivalent — a label
+> that fits returns unchanged from `Ellipsize`; only an over-long label now ellipsizes+tooltips instead of
+> clipping). **Resolved the EF16↔EF11 double-indent trap:** `DrawLabelCell` applies `DepthIndentTotal`
+> ITSELF, so the EF16 manual `ImGui.Indent(LabelDepthIndent())` in Row/RowWithTooltip was REMOVED (and the
+> now-unused `LabelDepthIndent()` helper deleted) — the indent is applied exactly once. Also tightened
+> `DrawLabelCell`'s ellipsize budget to `columnWidth − indent − gap` (was `− gap`) so a deeply-indented label
+> still ellipsizes before touching the value field. (2) **Slider value legibility:** the slider draws its
+> value string centered over the frame and the bright amber `SliderGrab` slid under it (white-on-amber
+> ~1.8:1). New `EditorTheme.SliderGrabRest` (a darkened amber `0x8A6A30`, white value ~6.5:1) is pushed as
+> `ImGuiCol.SliderGrab` around the `##v` slider draw in BOTH inspector adapters (`ImGuiComponentGui` +
+> `ImGuiVolumeGui`), scoped to the slider only so the **global EF5 amber accent is untouched**; the
+> active/dragging grab stays bright (`SliderGrabActive`, transient). Touched 5 files
+> (`InspectorPanel.cs`, `InspectorLayout.cs`, `EditorTheme.cs`, `ImGuiComponentGui.cs`, `ImGuiVolumeGui.cs`
+> — all mine). Build 0-error (the Editor compiles clean; the only build failure is the user's IN-PROGRESS
+> DX12 `AoResult`→`SsaoResult` rename in `Dx12FrameContext`/`Dx12DeferredLightingPass`/`Dx12CompositePass`
+> — NOT mine, NOT staged), oracle EXIT=0 (18 suites). VISUAL chunk → human-screenshot checkpoint (a wide-named
+> member like "High Speed Steer Scale" ellipsizes with a hover tooltip; a ranged float slider's value reads
+> against the amber grab; short/shallow components unchanged), batched into the Inspector-layout set; NOT
+> relaunch-looped (GPU-hang rule).
+>
+> **For EF10a (next):** the per-component member search bar sits ABOVE the member grid and filters which rows
+> draw — it is NOT part of the column model. `InspectorLayout.MemberSearchThreshold = 12` is the conditional-
+> visibility gate (only show the box when the component's member count exceeds it). The member-draw loop is
+> `DrawMemberList` (the grid opens at `BeginGrid("##members{type.Name}{gridIndex++}")` ~:1079). Factor a small
+> reusable `EditorWidgets` search-field helper (Hierarchy/Assets/Add-Component can reuse it later — optional).
+> Filter must hide `[Header]`/`[FoldoutGroup]` groups that have no matching child under the filter.
 >
 > **EF16 note (just landed):** nested member grids no longer march the value box off-screen. The two
 > recursion sites (`DrawNestedSlot`, `DrawPolymorphicSlot` in `InspectorPanel.cs`) now wrap their body in a
@@ -284,7 +319,7 @@ this same handoff for the chunk after it.
 - [x] EF12 — rename Inspector → "Details" — `panels.Register`/`extraPanels.Register` titles + both `AddTabItem` menu labels + the Window-menu `[MenuItem]` path & `PathToWindowKey` key all "Inspector"→"Details"; `DrawDockPanel` now `Begin($"{d.Title}###{name}")` so the docked tab reads the descriptor Title (validated vs ImGui source: `###` resets the id-hash + strips the `.ini` key prefix, so KEY/`.ini`/`.panels`/dock-builder identity all preserved). Generic change also fixes the pre-existing Scene-Components docked tab "Scene"→"Scene Components" (user-approved). `EditorLayout.*` KEY consts untouched. Build 0-error, oracle EXIT=0.
 - [x] EF-LAYOUT — inspector layout model (design + shared helper) — landed the column model + metrics + the shared label primitive as `InspectorLayout.cs` (`ValueColumnLeft`/`LabelColumnWidth`/`DepthIndent`/`DrawLabelCell`/`Ellipsize`/`MemberSearchThreshold`). NO call sites rewired (EF16→EF11→EF10 each opt in) → live inspector byte-identical, oracle 18/18 green. Design note in the EF-LAYOUT section + the file header.
 - [x] EF16 — nested indent (fixed value-x) — `DrawNestedSlot`/`DrawPolymorphicSlot` now wrap their body in `DrawNestedBody` (cancels the `TreeNode`'s full per-level `IndentSpacing`, bumps `nestDepth`) + a `BeginNestedGrid` with a FIXED-width label column (`InspectorLayout.LabelColumnWidth`) instead of the proportional 0.38/0.62 split, so the value box keeps a usable width at every nesting depth; the small per-depth label indent (`DepthIndentTotal`) applies to the LABEL only in `Row`/`RowWithTooltip` (depth 0 → 0px → top-level + shim rows byte-identical). Pragmatic deviation: the anchor is recomputed from each nested grid's current width (foldouts render inside the parent value cell, so a single panel-global value-x can't hold); `ValueColumnLeft` clamps label ≤62% so the value never vanishes. Added `EditorTheme.UiScale` token (published by `ImGuiController.LoadFont`). Top-level `BeginGrid` untouched. Build 0-error, oracle EXIT=0. Visual verify batched into the Inspector-layout screenshot set.
-- [ ] EF11 — adaptive label column + slider value legibility
+- [x] EF11 — adaptive label column + slider value legibility — `Row`/`RowWithTooltip` route their label through `DrawRowLabel` → `InspectorLayout.DrawLabelCell` (ellipsis + full-text/`[Tooltip]` hover), column width = `GetContentRegionAvail().X` at the label cell (works for both the proportional top-level grid AND the fixed nested grid → top-level `BeginGrid` untouched, depth-0 short labels visually equivalent). Resolved the EF16 double-indent trap (removed the manual `Indent`, `DrawLabelCell` owns it; deleted `LabelDepthIndent`) + tightened the ellipsize budget to `columnWidth − indent − gap`. Slider value legibility: new `EditorTheme.SliderGrabRest` (darkened amber) pushed as `SliderGrab` around the `##v` slider in both adapters (`ImGuiComponentGui`/`ImGuiVolumeGui`), scoped → global EF5 accent untouched. Build 0-error (Editor clean; the only failure is the user's in-progress DX12 `AoResult`→`SsaoResult` rename — not mine), oracle EXIT=0. Visual verify batched into the Inspector-layout set.
 - [ ] EF10a — per-component member search (conditional)
 - [ ] EF10b — component-list search (conditional)
 - [ ] EF15 — collection reorder/clear + polymorphic list serialize + round-trip test
@@ -719,13 +754,29 @@ Root: no inspector member/component filter exists (`InspectorPanel.cs:51` only A
 DoD: on a heavy component (e.g. Vehicle Controller) typing "steer" leaves only steer fields + their
 group; a small component shows no search box; behavior on unfiltered components byte-identical.
 
-## EF11 — Inspector drawer-row readability (label clip + slider value overlay)
+## EF11 — Inspector drawer-row readability (label clip + slider value overlay) — ✅ DONE
 Implements the EF-LAYOUT model's label rule. Root: fixed 38% label column (`BeginGrid :2445`) clips long
 labels; slider value text overlaps fill.
-Fix: adaptive label column (min/auto width with ellipsis + full-text tooltip on hover) so labels like
-"High Speed Steer Scale" aren't silently truncated; ensure slider value text is legible against the fill
-(offset/contrast). Depends on EF-LAYOUT (shared column model) and pairs with EF16. Keep short labels neutral.
+**✅ DONE.** Two halves: (1) **Adaptive label / no silent truncation** — `InspectorPanel.Row` +
+`RowWithTooltip` route their label through a new `DrawRowLabel(label, tooltip)` shim →
+`InspectorLayout.DrawLabelCell(...)`, which ellipsizes a label wider than its column and shows the full text
+on hover (a real `[Tooltip]` wins). The `columnWidth` passed is `ImGui.GetContentRegionAvail().X` measured AT
+the label cell (column 0) — the actual remaining label-column width, so it works for BOTH the top-level
+proportional `BeginGrid` (≈38% label col) AND the fixed-width nested `BeginNestedGrid` with NO panel-level
+value-x threaded down, and the **top-level `BeginGrid` (:2459) stays UNTOUCHED** (depth-0 labels that fit
+return unchanged from `Ellipsize` → visually equivalent; only over-long labels now ellipsize+tooltip instead
+of clip). Resolved the EF16↔EF11 **double-indent trap**: `DrawLabelCell` applies `DepthIndentTotal` itself,
+so the EF16 manual `ImGui.Indent` in Row/RowWithTooltip was removed (and the now-dead `LabelDepthIndent`
+helper deleted) — indent applied exactly once. Tightened `DrawLabelCell`'s ellipsize budget to
+`columnWidth − indent − gap`. (2) **Slider value legibility** — new `EditorTheme.SliderGrabRest` (darkened
+amber `0x8A6A30`, white value ~6.5:1) pushed as `ImGuiCol.SliderGrab` around the `##v` slider draw in both
+inspector adapters (`ImGuiComponentGui`/`ImGuiVolumeGui`), scoped to the slider so the **global EF5 amber
+accent is untouched**; the active/dragging grab stays bright. Touched 5 files (`InspectorPanel.cs`,
+`InspectorLayout.cs`, `EditorTheme.cs`, `ImGuiComponentGui.cs`, `ImGuiVolumeGui.cs` — all mine). Build
+0-error (Editor clean; the only build failure is the user's in-progress DX12 `AoResult`→`SsaoResult` rename
+— not mine, not staged), oracle EXIT=0 (18 suites).
 DoD: long labels readable (full via tooltip/ellipsis), slider values legible; short-label rows unchanged.
+**Visual verify (human screenshot) batched into the Inspector-layout set — NOT relaunch-looped (GPU-hang rule).**
 
 ## EF12 — Rename Inspector → "Details"
 Root: hardcoded `"Inspector"` (`EditorApplication.cs:179`, also `:156`).

@@ -105,9 +105,19 @@ public sealed class ImGuiComponentGui : IInspectorGui {
     public void HelpBox(string t) => ImGui.TextWrapped(t);
 
     public bool Checkbox(ref bool v) => host.TrackUndo(label, ImGui.Checkbox("##v", ref v));
-    public bool SliderFloat(ref float v, float min, float max) => host.TrackUndo(label, ImGui.SliderFloat("##v", ref v, min, max));
+    public bool SliderFloat(ref float v, float min, float max) {
+        ImGui.PushStyleColor(ImGuiCol.SliderGrab, EditorTheme.SliderGrabRest);   // EF11: legible value over the grab
+        bool changed = host.TrackUndo(label, ImGui.SliderFloat("##v", ref v, min, max));
+        ImGui.PopStyleColor();
+        return changed;
+    }
     public bool DragFloat(ref float v, float speed) => host.TrackUndo(label, ImGui.DragFloat("##v", ref v, speed));
-    public bool SliderInt(ref int v, int min, int max) => host.TrackUndo(label, ImGui.SliderInt("##v", ref v, min, max));
+    public bool SliderInt(ref int v, int min, int max) {
+        ImGui.PushStyleColor(ImGuiCol.SliderGrab, EditorTheme.SliderGrabRest);   // EF11: legible value over the grab
+        bool changed = host.TrackUndo(label, ImGui.SliderInt("##v", ref v, min, max));
+        ImGui.PopStyleColor();
+        return changed;
+    }
     public bool DragInt(ref int v) => host.TrackUndo(label, ImGui.DragInt("##v", ref v));
     public bool InputText(ref string v, int maxLength) => host.TrackUndo(label, ImGui.InputText("##v", ref v, (uint)maxLength));
     public bool Combo(ref int index, string[] names) => host.TrackUndo(label, ImGui.Combo("##v", ref index, names, names.Length));
