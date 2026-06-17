@@ -19,10 +19,28 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF9c** (layout persist/restore + PassthruCentralNode review)
-> Last committed chunk: **EF9b** · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **EF9d** (Window-menu open-state sync)
+> Last committed chunk: **EF9c** · Branch: `dx12-renderer`
 >
-> **EF9b note for EF9c:** maximize no longer FIGHTS docking. The fullscreen windows now have their OWN
+> **EF9c note for EF9d:** layout persist/restore is DONE and the `Shown` open/closed state now ROUND-TRIPS
+> across restart. EF9c added: (1) `EditorPanelRegistry.HiddenKeys()` / `ApplyHidden(...)` (the closed core
+> panels are the persisted unit — viewports are never "closed"); (2) `EditorLayout.SavePanelState/LoadPanelState`
+> writing a `<projectStem>.v2.panels` sidecar next to the dock `.ini` (the `.ini` persists window geometry/dock
+> node but NOT whether the editor submits the window, so a closed panel would otherwise re-open on next launch);
+> (3) wiring — `panels.ApplyHidden(EditorLayout.LoadPanelState())` after `EditorLayout.Load()` on startup, and a
+> per-frame change-gated `SavePanelState` at the end of `BuildUI` (closing a panel only flips `Shown`, which does
+> NOT dirty ImGui's dock settings, so the existing `WantSaveIniSettings` save can't catch it). `DeleteSaved` now
+> also clears the sidecar so "Reset Layout" re-shows every panel (it already called `panels.ResetVisibility()`).
+> **PassthruCentralNode REMOVED** (`DockSpace` now uses `ImGuiDockNodeFlags.None`): the central node is ALWAYS
+> filled by the Scene/Game view windows so passthrough never engaged visibly, and the review flagged it as a
+> maximize/modal-capture breaker — dropping it is byte-identical to the eye and removes the hazard. **For EF9d:**
+> the Window menu is registry-driven (`DrawRegistryMenu("Window")` at `EditorApplication.cs:882`); the
+> per-panel checkmark/open state reads `EditorWindows.IsOpen` → `IsWindowOpen` → `panels.IsShown(key)`, which is
+> now the SAME `Shown` flag EF9c persists. So a closed panel is genuinely "closed" in the registry AND on disk —
+> EF9d's job is to confirm the menu checkmarks reflect it and re-opening from the menu works (the wiring at
+> `EditorWindowRegistry.cs:72-105` is already correct per the plan; bind/verify, don't rebuild).
+>
+> **EF9b note (kept for reference):** maximize no longer FIGHTS docking. The fullscreen windows now have their OWN
 > ImGui identities — `###maxpanel` (core panels, `DrawMaximizedPanel`) and `###maxinstance` (duplicated
 > tabs, `DockPanelHost.DrawMaximizedInstance`) — each with `NoSavedSettings`, instead of reusing the docked
 > window's bare label (`"Inspector"`/`"Scene"`/`###KindKey`). The old shared-identity path force-undocked
@@ -89,7 +107,7 @@ this same handoff for the chunk after it.
 - [~] EF3 — swapchain drained resize + post-resize reset DONE (v1 @ d1799cb7) — but RESIZE STILL CRASHES LIVE (DXGI_ERROR_DEVICE_HUNG 0x887A0006 at **Present**, editor only). REOPENED. v2 follow-up: made DRED page-fault tracking ALWAYS-ON (next crash self-diagnoses the faulting VA) + hardened ImGui EnsureBuffers grow (drain before disposing an in-flight upload buffer). NOT yet the proven fix — needs ONE careful user repro to read the DRED page-fault. The hang is editor-specific (player `Dx12WindowedRuntime` resizes swapchain+offscreen in lockstep in OnResize and does NOT crash; editor has ImGui + a DECOUPLED panel-sized offscreen `ldr` resize via `InvalidateTargetSizes`). Swapchain `Resize` itself is proven clean (harness, both fence paths). See EF3 section + the [[gpu-hang]] memory.
 - [x] EF9a — honor close everywhere (incl. maximized) — `ref open` threaded through both maximized paths; close STICKS + exits fullscreen same frame
 - [x] EF9b — maximize/fullscreen (re-verify EF3 fullscreen) — dedicated `###maxpanel`/`###maxinstance` identities + `NoSavedSettings`; maximize no longer undocks/pollutes the docked window; no swapchain resize introduced
-- [ ] EF9c — layout persist + PassthruCentralNode review
+- [x] EF9c — layout persist + PassthruCentralNode review — `Shown` open/closed state now round-trips via a `.panels` sidecar (`EditorLayout.Save/LoadPanelState` + `EditorPanelRegistry.HiddenKeys/ApplyHidden`); PassthruCentralNode dropped (central node always filled, removed the maximize/modal-capture hazard)
 - [ ] EF9d — Window-menu open-state sync
 - [ ] EF5a — palette + geometry (BLOCKED on identity decision)
 - [ ] EF5b — centralize bypass-color offenders
@@ -410,12 +428,26 @@ Layout). Validated causes: `PassthruCentralNode` + custom maximize state machine
   resize harness (`Docs/Validation/dx12-resize-harness/`) is unchanged and remains the swapchain-resize
   regression guard. Human screenshot of maximize+restore not regressing the docked layout is batched into
   the EF9/windowing visual checkpoint.
-- **EF9c — Layout persist/restore + PassthruCentralNode review:** persist the dock layout (ImGui .ini or
-  engine-side) so panels reopen where they were; "Reset Layout" rebuilds the default (the existing
-  `EditorLayout.BuildDefault` dock builder targets windows by the `###KindKey` labels DockPanelHost mints
-  — keep that contract). Re-evaluate `PassthruCentralNode` (`EditorApplication.cs:783`): keep only if the
-  central viewport genuinely needs click-through; the review flags it as a maximize/modal-capture
-  breaker, so drop it if the viewport doesn't require it.
+- **EF9c — Layout persist/restore + PassthruCentralNode review — ✅ DONE:** the dock layout `.ini`
+  (`EditorLayout.Save/Load`) already persisted window geometry/dock node, but NOT whether a panel is open —
+  a closed core panel re-opened on next launch because `EditorPanelRegistry.Descriptor.Shown` defaults true
+  and `DrawCore` simply skips a closed panel's `Begin` (so ImGui never learns it was closed). EF9c closes
+  that gap: (1) `EditorPanelRegistry.HiddenKeys()` enumerates the closed core panels + `ApplyHidden(set)`
+  re-applies them (viewports excluded — one renderer target, never "closed"); (2) `EditorLayout.SavePanelState/
+  LoadPanelState` persist that set to a `<projectStem>.v{LayoutVersion}.panels` sidecar next to the `.ini`
+  (versioned together; `DeleteSaved` clears both so Reset Layout re-shows everything, matching the existing
+  `panels.ResetVisibility()`); (3) wiring — `panels.ApplyHidden(EditorLayout.LoadPanelState())` right after
+  `EditorLayout.Load()` on startup (before the first frame submits panels), and a per-frame, change-gated
+  `SavePanelState` at the end of `BuildUI` (closing a panel only flips `Shown`, which does NOT dirty ImGui's
+  dock settings, so the existing `WantSaveIniSettings` save could not catch it; gated on a cheap joined-string
+  compare so there's no per-frame file I/O). The `EditorLayout.BuildDefault` `###KindKey`/bare-name dock
+  contract is untouched. **PassthruCentralNode REMOVED** — `DockSpace(..., ImGuiDockNodeFlags.None)`: the
+  central node is ALWAYS filled by the Scene/Game view windows so passthrough never engaged visibly (the host
+  window already carries `NoBackground`), and the review flagged the flag as a maximize/modal-capture breaker;
+  dropping it is byte-identical to the eye and removes the hazard. Verified: editor csproj builds 0-error (to
+  a scratch output dir, around a running-editor bin-copy lock), reflection oracle EXIT=0 (all suites green).
+  Human verification (closed panel stays closed across restart; Reset Layout re-shows all; no visual change
+  from the PassthruCentralNode drop) batched into the EF9/windowing visual checkpoint.
 - **EF9d — Window-menu sync:** Window menu checkmarks reflect each panel's open state (closed panel
   visibly closed + re-openable). `EditorWindowRegistry` wiring already correct (`:72-105`) — bind to it.
 ⚠️ Same GPU area as EF3 (fullscreen). EF3 lands first; EF9b re-verifies EF3's fullscreen path. GPU-hang rule.

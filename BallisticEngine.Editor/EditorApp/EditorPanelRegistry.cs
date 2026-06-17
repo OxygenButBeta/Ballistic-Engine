@@ -85,6 +85,23 @@ internal sealed class EditorPanelRegistry {
             if (!d.IsViewport) d.Shown = true;
     }
 
+    // EF9c (layout restore): the keys of core panels the user has CLOSED. The dock-layout .ini persists
+    // each window's geometry/dock node but NOT whether the editor is currently submitting it, so a closed
+    // panel would re-open on the next launch (Shown defaults true) unless we persist this set separately.
+    // Viewports are never "closed" (one renderer target) so they're excluded.
+    public IEnumerable<string> HiddenKeys() {
+        foreach (Descriptor d in ordered)
+            if (!d.IsViewport && !d.Shown) yield return d.Key;
+    }
+
+    // EF9c (layout restore): re-apply a persisted closed-panel set on startup — every non-viewport core
+    // panel is shown unless its key is in `hidden`. Called once after the dock layout loads, before the
+    // first frame submits the panels, so a panel the user closed last session stays closed.
+    public void ApplyHidden(IReadOnlyCollection<string> hidden) {
+        foreach (Descriptor d in ordered)
+            if (!d.IsViewport) d.Shown = !hidden.Contains(d.Key);
+    }
+
     // Whether `key` is a registered panel that is currently shown (so it can be drawn fullscreen).
     // Viewports are always available (one renderer target, never "closed"). Unregistered key -> false.
     public bool IsAvailable(string key) => IsShown(key);

@@ -33,16 +33,25 @@ internal static class EditorLayout {
     // references windows that no longer exist, so we version the file to fall back to BuildDefault).
     const int LayoutVersion = 2;
 
-    static string LayoutFile {
+    static string LayoutDir {
         get {
             var dir = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                 "BallisticEngine", "Layouts");
             Directory.CreateDirectory(dir);
-            byte[] hash = MD5.HashData(Encoding.UTF8.GetBytes(projectKey.ToLowerInvariant()));
-            return Path.Combine(dir, $"{Convert.ToHexString(hash)[..16]}.v{LayoutVersion}.ini");
+            return dir;
         }
     }
+
+    static string ProjectStem =>
+        Convert.ToHexString(MD5.HashData(Encoding.UTF8.GetBytes(projectKey.ToLowerInvariant())))[..16];
+
+    static string LayoutFile => Path.Combine(LayoutDir, $"{ProjectStem}.v{LayoutVersion}.ini");
+
+    // Sidecar to the .ini: the set of CLOSED core panels (one key per line). The dock-layout .ini
+    // persists each window's geometry/dock node but not whether the editor is currently submitting it,
+    // so without this a panel the user closed would re-open on the next launch. Versioned with the .ini.
+    static string PanelStateFile => Path.Combine(LayoutDir, $"{ProjectStem}.v{LayoutVersion}.panels");
 
     // True when a saved layout exists for this project (so the dock host skips BuildDefault).
     public static bool HasSaved => File.Exists(LayoutFile);
@@ -73,10 +82,35 @@ internal static class EditorLayout {
     }
 
     // Forget the saved layout so the next BuildDefault (driven by EditorApplication's reset flag) lays
-    // the panels out fresh.
+    // the panels out fresh. Also clears the panel-visibility sidecar (Reset Layout re-shows every panel).
     public static void DeleteSaved() {
-        try { if (File.Exists(LayoutFile)) File.Delete(LayoutFile); }
+        try {
+            if (File.Exists(LayoutFile)) File.Delete(LayoutFile);
+            if (File.Exists(PanelStateFile)) File.Delete(PanelStateFile);
+        }
         catch (Exception e) { Debugging.LogWarning($"Could not reset editor layout: {e.Message}"); }
+    }
+
+    // Persist which core panels are currently CLOSED (one key per line). Called alongside Save() whenever
+    // the layout changes and on exit. An empty set writes an empty file (so a previously-closed panel that
+    // the user re-opened is remembered as open).
+    public static void SavePanelState(IEnumerable<string> hiddenKeys) {
+        try { File.WriteAllLines(PanelStateFile, hiddenKeys); }
+        catch (Exception e) { Debugging.LogWarning($"Could not save panel state: {e.Message}"); }
+    }
+
+    // Read the persisted closed-panel set (empty if none / unreadable). Apply once on startup, before the
+    // first frame submits the panels, so a panel the user closed last session stays closed.
+    public static IReadOnlyCollection<string> LoadPanelState() {
+        try {
+            if (File.Exists(PanelStateFile))
+                return File.ReadAllLines(PanelStateFile)
+                    .Select(l => l.Trim())
+                    .Where(l => l.Length > 0)
+                    .ToHashSet();
+        }
+        catch (Exception e) { Debugging.LogWarning($"Could not load panel state: {e.Message}"); }
+        return Array.Empty<string>();
     }
 
     // Builds the default arrangement inside `dockId`: Hierarchy left, Inspector right, Assets+Console

@@ -209,6 +209,9 @@ internal sealed class EditorApplication {
         // first frame (BuildUI lays out the default if none exists).
         EditorLayout.SetProject(bootstrap.Project.RootPath);
         EditorLayout.Load();
+        // EF9c: the .ini restores each panel's geometry/dock node but not whether it's open. Re-apply the
+        // persisted closed-panel set so a panel the user closed last session stays closed across restart.
+        panels.ApplyHidden(EditorLayout.LoadPanelState());
 
         // Restore the Scene-view camera to wherever it was last left in this project.
         editorCamera.RestorePose(EditorPrefs.GetLastCamera(bootstrap.Project.RootPath));
@@ -780,7 +783,14 @@ internal sealed class EditorApplication {
         ImGui.PopStyleVar(3);
 
         uint dockId = ImGui.GetID("##MainDockSpace");
-        ImGui.DockSpace(dockId, SysVec2.Zero, ImGuiDockNodeFlags.PassthruCentralNode);
+        // EF9c: NO PassthruCentralNode. It only matters when the central node is EMPTY (it makes the empty
+        // node transparent + click-through to whatever is behind the host window). Here the central node is
+        // ALWAYS filled by the Scene/Game view windows, so passthrough never engaged visibly — but the flag
+        // still suppresses the central node's own background/hit-target, which the review flagged as a
+        // maximize/modal-capture breaker (a fullscreen/modal over an empty-feeling central node could leak
+        // input through). Dropping it is byte-identical to the eye (central node always has a window) and
+        // removes the hazard. The host window already has NoBackground, so nothing relied on passthrough.
+        ImGui.DockSpace(dockId, SysVec2.Zero, ImGuiDockNodeFlags.None);
 
         // First run for this project with no saved layout (or an explicit Reset) builds the default.
         if (!layoutInitialized) {
@@ -827,7 +837,20 @@ internal sealed class EditorApplication {
             EditorLayout.Save();
             io.WantSaveIniSettings = false;
         }
+
+        // EF9c: persist the open/closed panel set separately from the .ini — closing a panel (the X) only
+        // flips our Shown flag, which doesn't dirty ImGui's dock settings, so WantSaveIniSettings above can
+        // stay false. Save only when the set actually changed (cheap string compare, no per-frame file I/O).
+        string hidden = string.Join('\n', panels.HiddenKeys());
+        if (hidden != lastSavedPanelState) {
+            EditorLayout.SavePanelState(panels.HiddenKeys());
+            lastSavedPanelState = hidden;
+        }
     }
+
+    // The last panel-visibility set persisted to disk (EF9c) — guards against re-writing the sidecar every
+    // frame. null until the first save so the initial state is always written once.
+    string lastSavedPanelState;
 
     // ---- Menu bar -----------------------------------------------------------
 
