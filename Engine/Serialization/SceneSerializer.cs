@@ -208,10 +208,49 @@ public static class SceneSerializer {
         if (value is BObject asset) {
             return AssetDatabase.TryGetAssetGuid(asset, out Guid guid)
                 ? AssetRef.FromGuid(guid)
-                : null; // unsaved/asset-less object reference — skip
+                : null; // unsaved/asset-less object reference -- skip
         }
 
+        // Collections (G2): List<T> / arrays / Dictionary<K,V> round-trip as a YAML sequence (or mapping
+        // for a dict) by recursing EACH element through SerializeValue -- so an element can itself be a
+        // primitive, a math struct (the converters fire on the boxed runtime type), an asset/scene ref, or
+        // a nested struct/class. An EMPTY collection still serializes (an empty sequence) so an authored
+        // empty list round-trips as empty, not null. A null collection is the leaf-null case the caller
+        // already handles (skipped from the doc). MUST come AFTER BObject so a BObject-derived value never
+        // reaches here, and is guarded to collection types so every existing non-collection member is
+        // byte-identical (the only behaviour change is that a List<T>/array/dict member -- e.g.
+        // LineRenderer.Points -- now ROUND-TRIPS instead of deserializing to null).
+        if (value is System.Collections.IDictionary dict)
+            return SerializeDictionary(dict);
+        if (value is not string && value is System.Collections.IEnumerable seq)
+            return SerializeSequence(seq);
+
         return value;
+    }
+
+    // A list/array member -> a YAML sequence (List<object>); each element recurses through SerializeValue.
+    // A null element survives as a null entry (index preserved) so a `List<Material>` with a gap round-trips
+    // its shape; the deserialize side reads the null back. Built as List<object> so YamlDotNet emits a
+    // block/flow sequence and each boxed element uses its own runtime-type converter (math structs) or scalar.
+    static List<object> SerializeSequence(System.Collections.IEnumerable seq) {
+        var items = new List<object>();
+        foreach (object element in seq)
+            items.Add(SerializeValue(element));
+        return items;
+    }
+
+    // A Dictionary<K,V> member -> a YAML mapping (Dictionary<object,object>); both key and value recurse
+    // through SerializeValue. Keys are typically primitives/enums (scalar); a complex key still serializes
+    // via the same recursion. A null serialized key is skipped (a YAML mapping has no null key).
+    static Dictionary<object, object> SerializeDictionary(System.Collections.IDictionary dict) {
+        var map = new Dictionary<object, object>();
+        foreach (System.Collections.DictionaryEntry e in dict) {
+            object key = SerializeValue(e.Key);
+            if (key is null)
+                continue;
+            map[key] = SerializeValue(e.Value);
+        }
+        return map;
     }
 
     // ---- Deserialize -------------------------------------------------------
@@ -405,6 +444,21 @@ public static class SceneSerializer {
         if (targetType == typeof(ColorGradient))
             return raw is string gradientStr ? ColorGradient.Parse(gradientStr) : null;
 
+        // Collections (G2): rebuild a List<T> / T[] from a YAML sequence and a Dictionary<K,V> from a YAML
+        // mapping, recursing EACH element back through DeserializeValue at the element type -- so an element
+        // that is itself a math struct (arrives as a {x,y,z} map), an asset/scene ref (a string), or a
+        // nested type rehydrates correctly. This is checked BEFORE the math-struct map conversion below: a
+        // Dictionary<K,V> member arrives as the SAME IDictionary<object,object> a Vector3 does, so the
+        // targetType (collection vs Vector*) is what disambiguates -- the collection branch must win for a
+        // dictionary-typed member. Guarded to actual collection target types, so a Vector*/Quaternion member
+        // (not a collection) still falls through to the map-to-vector conversion unchanged.
+        if (targetType.IsArray)
+            return DeserializeArray(raw, targetType.GetElementType());
+        if (TryGetListElementType(targetType, out Type listElem))
+            return DeserializeList(raw, targetType, listElem);
+        if (TryGetDictionaryTypes(targetType, out Type keyType, out Type valType))
+            return DeserializeDictionary(raw, targetType, keyType, valType);
+
         // OpenTK types arrive already converted; otherwise coerce the scalar to the member type.
         if (targetType.IsInstanceOfType(raw))
             return raw;
@@ -427,6 +481,84 @@ public static class SceneSerializer {
     static float MapF(IDictionary<object, object> map, string key) =>
         map.TryGetValue(key, out object v) && v is not null &&
         float.TryParse(v.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out float f) ? f : 0f;
+
+    // ---- Collection deserialize (G2) ---------------------------------------
+    // A YAML sequence arrives from YamlDotNet as a List<object> (or any IEnumerable when typed loosely);
+    // a YAML mapping as an IDictionary<object,object>. Each helper recurses every element back through
+    // DeserializeValue at the element/key/value type, so a list of math structs / refs / nested types
+    // rehydrates the same way a top-level member would. A raw that is not a sequence (corrupt/legacy)
+    // yields an empty collection rather than throwing, matching the "missing ref -> None" leniency.
+
+    // T[] from a sequence raw.
+    static object DeserializeArray(object raw, Type elementType) {
+        List<object> items = RawItems(raw);
+        Array array = Array.CreateInstance(elementType, items.Count);
+        for (int i = 0; i < items.Count; i++)
+            array.SetValue(DeserializeValue(items[i], elementType), i);
+        return array;
+    }
+
+    // List<T> (or anything assignable from List<T> via IList) from a sequence raw.
+    static object DeserializeList(object raw, Type targetType, Type elementType) {
+        List<object> items = RawItems(raw);
+        var list = (System.Collections.IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(elementType))!;
+        foreach (object item in items)
+            list.Add(DeserializeValue(item, elementType));
+        // The member is exactly List<T> in the common case; if it is a wider IList target the List<T> is
+        // assignable. SetMemberValue would throw on a true mismatch -- ApplyMembers swallows nothing, but a
+        // List<T> assigned to a List<T> member is the only shape this branch is reached for (TryGetListElementType).
+        return list;
+    }
+
+    // Dictionary<K,V> from a mapping raw. Keys/values both recurse at their declared types.
+    static object DeserializeDictionary(object raw, Type targetType, Type keyType, Type valType) {
+        var dict = (System.Collections.IDictionary)Activator.CreateInstance(
+            typeof(Dictionary<,>).MakeGenericType(keyType, valType))!;
+        if (raw is IDictionary<object, object> map) {
+            foreach ((object k, object v) in map) {
+                object key = DeserializeValue(k, keyType);
+                if (key is null)
+                    continue;
+                dict[key] = DeserializeValue(v, valType);
+            }
+        }
+        return dict;
+    }
+
+    // Normalize a sequence raw to a List<object>. YamlDotNet yields List<object> for a block/flow sequence;
+    // be tolerant of any non-string IEnumerable. Non-sequence (a scalar/map) -> empty (no throw).
+    static List<object> RawItems(object raw) {
+        if (raw is List<object> direct)
+            return direct;
+        var items = new List<object>();
+        if (raw is not string && raw is System.Collections.IEnumerable e && raw is not IDictionary<object, object>)
+            foreach (object item in e)
+                items.Add(item);
+        return items;
+    }
+
+    // True for a List<T> member (the exact closed-generic List<>). Out the element type. Excludes arrays
+    // (handled separately) and other IEnumerables we do not reconstruct (e.g. read-only sequences).
+    static bool TryGetListElementType(Type t, out Type elementType) {
+        elementType = null;
+        if (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(List<>)) {
+            elementType = t.GetGenericArguments()[0];
+            return true;
+        }
+        return false;
+    }
+
+    // True for a Dictionary<K,V> member (the exact closed-generic Dictionary<,>). Out key + value types.
+    static bool TryGetDictionaryTypes(Type t, out Type keyType, out Type valueType) {
+        keyType = valueType = null;
+        if (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(Dictionary<,>)) {
+            Type[] args = t.GetGenericArguments();
+            keyType = args[0];
+            valueType = args[1];
+            return true;
+        }
+        return false;
+    }
 
     static object LoadAsset(string reference, Type targetType) {
         MethodInfo loadRef = typeof(AssetDatabase).GetMethod(nameof(AssetDatabase.LoadRef))!
