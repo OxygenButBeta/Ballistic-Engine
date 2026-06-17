@@ -19,6 +19,7 @@ exit += EntityRefTests.Run();        // G1 — inserts a scene (no public unload
 exit += CollectionTests.Run();       // G2 — inserts a scene (no public unload); runs before G0's own
 exit += SerializeReferenceTests.Run(); // G3 -- inserts a scene (no public unload); runs before G0's own
 exit += NestedTests.Run();             // G4 -- inserts a scene (no public unload); runs before G0's own
+exit += UndoCoverageTests.Run();       // F3 -- undo coverage harness (inserts a scene; engine-only)
 exit += SerializerDropTests.Run();   // G0 — runs LAST (inserts a scene with no public unload)
 return exit;
 
