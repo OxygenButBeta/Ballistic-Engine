@@ -19,12 +19,41 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF5d** (Theme: type/spacing tokens everywhere)
-> Last committed chunk: **EF5c** · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **EF12** (rename Inspector → "Details")
+> Last committed chunk: **EF5d** · Branch: `dx12-renderer`
 >
 > **EF5 identity decision RESOLVED → (i) faithful UE5** (cool graphite + blue-grey shell + a single
 > restrained azure highlight, NO warm accent). The azure accent `0x3D8BD4` (EditorPrefs default) is KEPT;
-> the acceptance bar for the whole EF5 series is "looks like UE5". EF5d implements against this identity.
+> the acceptance bar for the whole EF5 series is "looks like UE5". The whole EF5 theme series (EF5a–d) is
+> now landed and ready for the user's batched human-screenshot review (GPU-hang rule: no relaunch-loop).
+>
+> **EF5d note (just landed — LAST EF5 sub-chunk):** the type/spacing + remaining inspector-cluster semantic
+> literals are done. (1) **Type/spacing:** routed `StatsPanel`'s 5 stock `ImGui.SeparatorText(...)` section
+> dividers (Timing/Rendering/GPU/Global Illumination/Scene) → `EditorDecoration.DrawSectionHeader(...)`, the
+> same Caption-font + palette-hairline treatment EF5c gave the inspector cluster (these were the last
+> default-look section dividers feeding the residual "flat" feel). The `Display`/`Header`/`Caption` type
+> scale is otherwise already applied where warranted (entity-name title = Header @ InspectorPanel:601, meta
+> line = Caption @ :613, all section headers = Caption via DrawSectionHeader). LEFT alone deliberately: the
+> `CollapsingHeader`s in `TagsLayersPanel`/`SettingsPanel` are INTERACTIVE/collapsible (framed, already read
+> as headers) — converting them to non-collapsible section rules would remove function, out of scope. (2)
+> **Inspector-cluster semantic literals → EditorTheme tokens** (formal owner per the EF5b handoff):
+> `InspectorPanel` prefab-override dots (×2) + prefab-bar text → `EditorTheme.PrefabBlue`; multi-differ "—"
+> marker → `Warning`; "Missing (ref)" → `Error`. `ComponentPreviews` animator current/active cyan (×2) →
+> NEW `EditorTheme.Info` token (cyan active-highlight — added this chunk); "No PointLight…"/"Assign a
+> Prefab…" amber warnings (×2) → `Warning`. `ProfilerPanel` over-budget-zone (≥50% frame) red → `Error`. The
+> destructive "Delete N Assets" button red (`InspectorPanel:2314-2315`) → NEW `EditorTheme.Destructive` +
+> `DestructiveHovered` tokens (deep desaturated red, base+hovered family mirroring `PrimaryAction`; only
+> colored destructive button in Panels/). NOT byte-identical (the cyan/amber/red literals snap to the one
+> token family — visual harmonization; behaviour unchanged). What stays as JUSTIFIED literals (annotated):
+> the prefab-bar dark-navy SURFACE backing (`:527` — a dark low-alpha bar, NOT an alpha of bright PrefabBlue;
+> in-file comment added), accent alpha/scale derivations (`(accent.X,…,α)`), alpha-only overlays/watermarks,
+> the dark-on-chip glyph color (`:1248`), the neutral batch-Document icon tint (`:2266`), and the
+> `AssetInspectors` material base-color PARSED from the .mat (user data, not chrome). Touched only 5 files:
+> `EditorTheme.cs` (+Info/+Destructive tokens), `InspectorPanel.cs`, `ComponentPreviews.cs`, `ProfilerPanel.cs`,
+> `StatsPanel.cs` (all fully mine). `EditorApplication.cs`/`EditorMenus.cs`/`TypeCache.cs`/`RenderPassTogglesWindow.cs`
+> NOT touched (their pre-existing not-mine dirt is unchanged). Build 0-error (clean `--no-incremental`
+> scratch dir), reflection oracle EXIT=0 (all 18 suites green). NOT visually verified — batched into the
+> EF5a–d human-screenshot checkpoint (GPU-hang rule).
 >
 > **EF5c note (just landed):** panel chrome polished by routing the stark stock section/divider widgets
 > through the existing `EditorDecoration` primitives (no hand-rolled DrawList chrome). (1) **Section headers:**
@@ -191,7 +220,7 @@ this same handoff for the chunk after it.
 - [x] EF5a — palette + geometry — identity = (i) faithful UE5 (cool graphite + azure, no warm accent). Reworked `ImGuiController.ApplyGeometry` (rounding into UE5's 4-5px band) + `ApplyColors` (deeper-graphite bg0..titleBg ramp, brighter `textDim` for ≥4.5:1 on inputs) + mirrored the `EditorTheme` Bg0..TitleBg ramp / OverlayBg / RowLabel-RowCaption. Pure style, behaviour byte-unchanged; WCAG contrasts verified (body 12-16:1, accent 4.94:1). Only `ImGuiController.cs`+`EditorTheme.cs` touched. Visual verify batched into the EF5a–d checkpoint.
 - [x] EF5b — centralize bypass-color offenders — added a SEMANTIC tokens block to `EditorTheme.cs` (Error/Warning/Success, PrefabBlue/RowChild/IconMuted, PrimaryAction±, FolderTint/Dim, LogLevel[], Hairline/TreeGuide, PopupBg/InputBg) and routed the hand-typed `SysVec4` literals in ConsolePanel/HierarchyPanel/AssetBrowserPanel/StatsPanel/BuildPanel/VolumeProfileEditor through them. Deliberately harmonizes a few slightly-off literals into one family (NOT byte-identical — visual only, behaviour unchanged). Remaining literals in those files are justified (alpha-only overlays, alpha/scale derivations of a token, the no-icon fallback glyph, the `Style(ext)` file-type taxonomy data table — annotated in-file). Only the 6 panels + `EditorTheme.cs` touched. Build 0-error, oracle EXIT=0. Visual verify batched into the EF5a–d checkpoint.
 - [x] EF5c — panel chrome polish — routed inspector-cluster `SeparatorText` → `EditorDecoration.DrawSectionHeader` (incl. the shared `ImGuiComponentGui.Header` adapter, so all attribute `[Header]` sections at once) + toolbar `Separator()` → `DrawDivider()` in Console/Hierarchy/Assets. Gave `DrawSectionHeader` Caption-font + symmetric pad so titles recede; dropped now-redundant leading `Spacing()`. Visual-only (not byte-identical), behaviour unchanged; build 0-error, oracle EXIT=0. Out of scope: Stats/TagsLayers/Settings + modal-dialog separators (left stock). Visual verify batched into the EF5a–d checkpoint.
-- [ ] EF5d — type/spacing tokens everywhere
+- [x] EF5d — type/spacing tokens everywhere — routed `StatsPanel`'s 5 `SeparatorText` → `EditorDecoration.DrawSectionHeader` (Caption-font + palette hairline, the last stock section dividers); finished the inspector-cluster semantic literals: prefab dots/bar → `PrefabBlue`, multi-differ "—" + ComponentPreviews light/prefab warnings → `Warning`, "Missing (ref)" + ProfilerPanel over-budget → `Error`, animator current/active cyan → NEW `Info` token, destructive "Delete N Assets" button → NEW `Destructive`/`DestructiveHovered` tokens. Justified literals (accent derivations, alpha overlays, dark-on-chip glyph, parsed material base-color, prefab-bar navy surface backing) annotated + left. Type scale otherwise already applied (entity title=Header, meta=Caption, sections=Caption); interactive `CollapsingHeader`s in Tags/Settings left (collapsible, out of scope). Visual-only (not byte-identical), behaviour unchanged. Build 0-error, oracle EXIT=0. LAST EF5 sub-chunk → whole EF5 theme series ready for batched screenshot review.
 - [ ] EF12 — rename Inspector → "Details"
 - [ ] EF-LAYOUT — inspector layout model (design + shared helper)
 - [ ] EF16 — nested indent (fixed value-x)
@@ -457,8 +486,21 @@ the acceptance bar for the whole EF5 series is "looks like UE5". EF5a–d all bu
   TagsLayers/Settings `SeparatorText`/`CollapsingHeader`, and the modal-dialog internal separators in
   `AssetBrowserPanel` (left stock — dialog internals, not panel chrome). Build 0-error, oracle EXIT=0.
   Visual verify batched into the EF5a–d checkpoint.
-- **EF5d — Type/spacing tokens:** verify type-scale (Display/Header/Body/Caption) + spacing are applied
-  everywhere (kills residual "flat" look); fix any panel still using raw `ImGui.Text`.
+- **EF5d — Type/spacing tokens — ✅ DONE:** the type-scale (Display/Header/Body/Caption) is verified applied
+  where warranted (entity-name title = Header, meta line = Caption, every section header = Caption via
+  `EditorDecoration.DrawSectionHeader`); the LAST stock section dividers — `StatsPanel`'s 5
+  `ImGui.SeparatorText(...)` (Timing/Rendering/GPU/Global Illumination/Scene) — were routed through
+  `DrawSectionHeader` to match (the residual default-look "flat" spots). Also FINISHED the inspector-cluster
+  semantic literals (formal owner per EF5b): `InspectorPanel` prefab dots×2 + prefab-bar text → `PrefabBlue`,
+  multi-differ "—" → `Warning`, "Missing (ref)" → `Error`; `ComponentPreviews` animator current/active cyan×2
+  → NEW `Info` token, light/prefab warnings×2 → `Warning`; `ProfilerPanel` over-budget zone → `Error`; the
+  destructive "Delete N Assets" button → NEW `Destructive`/`DestructiveHovered` tokens. Justified literals
+  left + annotated (accent alpha/scale derivations, alpha-only overlays/watermarks, dark-on-chip glyph, the
+  neutral batch-Document icon tint, the prefab-bar navy SURFACE backing, the `AssetInspectors` material
+  base-color parsed from .mat). Interactive `CollapsingHeader`s in `TagsLayersPanel`/`SettingsPanel` left
+  (collapsible — converting would remove function). Touched only `EditorTheme.cs` + the 4 panel files (all
+  mine). Visual-only (not byte-identical), behaviour unchanged; build 0-error, oracle EXIT=0. Visual verify
+  batched into the EF5a–d checkpoint. **LAST EF5 sub-chunk — the whole theme series is now ready for review.**
 DoD: human screenshots before/after each sub-chunk — clearly modern, not default-ImGui; no panel
 bypasses the theme (grep for `new SysVec4(` color literals in Panels/ → only justified ones remain).
 

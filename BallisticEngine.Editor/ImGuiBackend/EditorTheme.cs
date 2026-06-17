@@ -85,6 +85,7 @@ internal static class EditorTheme {
     public static readonly SysVec4 Error     = Rgb(0xFF8066);   // invalid input / error text (amber-red)
     public static readonly SysVec4 Warning   = Rgb(0xFFB840);   // disabled-override / caution text (amber)
     public static readonly SysVec4 Success   = Rgb(0x80D980);   // build-succeeded / OK summary (green)
+    public static readonly SysVec4 Info      = Rgb(0x73D9FF);   // active/current highlight (cyan — animator state, transitions)
     public static readonly SysVec4 PrefabBlue = Rgb(0x73A8FF);  // prefab-instance accent (Unity's prefab blue)
     public static readonly SysVec4 RowChild  = Rgb(0xB8BDC7);   // hierarchy child label — dimmer than a root's white
     public static readonly SysVec4 IconMuted = new(0.45f, 0.47f, 0.52f, 0.6f);  // inactive ghost-icon (eye toggle)
@@ -94,6 +95,11 @@ internal static class EditorTheme {
     public static readonly SysVec4 PrimaryAction        = Rgb(0x33A352);   // resting
     public static readonly SysVec4 PrimaryActionHovered = Rgb(0x44C268);
     public static readonly SysVec4 PrimaryActionActive  = Rgb(0x2A8C44);
+
+    // Destructive-action button (the dark-red "Delete N Assets" affordance) — a deep desaturated red so
+    // it reads as danger without the neon of the Error TEXT color. Resting + hovered, same family pattern.
+    public static readonly SysVec4 Destructive        = Rgb(0x8C3329);   // resting
+    public static readonly SysVec4 DestructiveHovered = Rgb(0xAD4233);
 
     // Folder gold — the asset browser's signature folder tint (icon + tree). The full/active variant and
     // the dim/empty variant (lower alpha) used to be two hand-typed literals; derive the dim from this.

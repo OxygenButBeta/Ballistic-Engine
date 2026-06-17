@@ -524,9 +524,12 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         string path = AssetDatabase.GuidToAssetPath(entity.PrefabSource);
         string name = path is null ? "(missing prefab)" : Path.GetFileNameWithoutExtension(path);
 
+        // Justified literal (EF5d): a deep, desaturated navy SURFACE backing for Unity's prefab strip — a
+        // dark low-alpha bar, NOT an alpha of the bright PrefabBlue foreground; the blue TEXT/dot above use
+        // the EditorTheme.PrefabBlue token. (A direct alpha of PrefabBlue would read far too bright here.)
         ImGui.PushStyleColor(ImGuiCol.ChildBg, new SysVec4(0.16f, 0.22f, 0.34f, 0.55f));
         ImGui.BeginChild("##prefabbar", new SysVec2(0, ImGui.GetFrameHeight() + 10), ImGuiChildFlags.AutoResizeY);
-        ImGui.PushStyleColor(ImGuiCol.Text, new SysVec4(0.55f, 0.74f, 1f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.PrefabBlue);
         ImGui.AlignTextToFramePadding();
         ImGui.TextUnformatted($"{EditorIcons.Package}  Prefab: {name}");
         ImGui.PopStyleColor();
@@ -707,7 +710,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             SysVec2 hp = ImGui.GetItemRectMax();
             ImGui.GetWindowDrawList().AddCircleFilled(
                 new SysVec2(hp.X - 12, (ImGui.GetItemRectMin().Y + hp.Y) * 0.5f), 3.5f,
-                ImGui.GetColorU32(new SysVec4(0.45f, 0.66f, 1f, 1f)));
+                ImGui.GetColorU32(EditorTheme.PrefabBlue));
         }
 
         // The other selected entities' transforms, if this is a multi-selection — edits apply to all
@@ -807,7 +810,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             SysVec2 mx = ImGui.GetItemRectMax();
             ImGui.GetWindowDrawList().AddCircleFilled(
                 new SysVec2(mx.X - 30, (ImGui.GetItemRectMin().Y + mx.Y) * 0.5f), 3.5f,
-                ImGui.GetColorU32(new SysVec4(0.45f, 0.66f, 1f, 1f)));
+                ImGui.GetColorU32(EditorTheme.PrefabBlue));
         }
         if (enabled != behaviour.IsEnabled) {
             // Toggle propagates to the matching component on every selected entity (multi-select), so
@@ -1188,7 +1191,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         }
         if (differs) {
             ImGui.SameLine(0, 4);
-            ImGui.TextColored(new SysVec4(1f, 0.72f, 0.25f, 1f), "—");
+            ImGui.TextColored(EditorTheme.Warning, "—");
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip("Values differ across the selection. Editing sets them all to this value.");
         }
@@ -1496,7 +1499,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         }
         else if (resolved is null) {
             label = $"Missing ({(isComponentRef ? "Component" : "Entity")})";
-            textCol = new SysVec4(1f, 0.55f, 0.35f, 1f); // amber-red, like a missing reference
+            textCol = EditorTheme.Error; // amber-red, like a missing reference
             icon = EditorIcons.Warning;
         }
         else if (resolved is Behaviour b) {
@@ -2311,8 +2314,8 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         ImGui.Separator();
         ImGui.Spacing();
 
-        ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(0.55f, 0.20f, 0.16f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(0.68f, 0.26f, 0.20f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Button, EditorTheme.Destructive);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, EditorTheme.DestructiveHovered);
         if (ImGui.Button($"{EditorIcons.Delete}  Delete {assets.Count} Assets", new SysVec2(-1, 0)))
             AssetOps.DeleteAssets(state, assets);
         ImGui.PopStyleColor(2);

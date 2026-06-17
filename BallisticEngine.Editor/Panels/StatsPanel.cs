@@ -63,11 +63,11 @@ internal sealed class StatsPanel {
         ImGui.BeginChild("##statsbody", new SysVec2(300 * scale, bodyH), ImGuiChildFlags.None,
             ImGuiWindowFlags.NoBackground);
 
-        ImGui.SeparatorText("Timing");
+        EditorDecoration.DrawSectionHeader("Timing");
         Line("FPS", $"{fps:0}", scale);
         Line("Frame", $"{(fps > 0 ? 1000f / fps : 0):0.00} ms", scale);
         Line("Editor CPU", $"{editorCpuMs:0.00} ms", scale);
-        ImGui.SeparatorText("Rendering");
+        EditorDecoration.DrawSectionHeader("Rendering");
         Line("Draw calls", rs.DrawCalls.ToString(), scale);
         Line("Depth draws", rs.DepthOnlyDrawCalls.ToString(), scale);
         if (rs.DrawsSavedByInstancing > 0)
@@ -78,7 +78,7 @@ internal sealed class StatsPanel {
             Line("Submeshes culled", rs.SubMeshesCulled.ToString(), scale);
         Line("View", $"{(int)viewSize.X} x {(int)viewSize.Y}", scale);
         if (rs.GpuPasses.Count > 0) {
-            ImGui.SeparatorText("GPU");
+            EditorDecoration.DrawSectionHeader("GPU");
             Line("GPU frame", $"{rs.GpuFrameMs:0.00} ms", scale);
             foreach ((string name, double ms) in rs.GpuPasses)
                 if (ms >= 0.005)
@@ -87,7 +87,7 @@ internal sealed class StatsPanel {
 
         // Global Illumination readout — "what is the data / how is it affecting the scene": which GI
         // systems are live, their strengths, the probe grid + occupancy, and bake progress.
-        ImGui.SeparatorText("Global Illumination");
+        EditorDecoration.DrawSectionHeader("Global Illumination");
         int pGx = ProbeRenderState.ProbeGridX, pGy = ProbeRenderState.ProbeGridY, pGz = ProbeRenderState.ProbeGridZ;
         int pOcc = ProbeRenderState.ProbeOccupiedCount, pTot = ProbeRenderState.ProbeTotalCount;
         Line("Light probes",
@@ -105,7 +105,7 @@ internal sealed class StatsPanel {
         Line("Lumen (SDF-GI)",
             ProbeRenderState.LumenEnabled ? $"on  x{ProbeRenderState.LumenIntensity:0.0#}" : "OFF", scale);
 
-        ImGui.SeparatorText("Scene");
+        EditorDecoration.DrawSectionHeader("Scene");
         Line("Entities", scene.Entities.Count.ToString(), scale);
         Line("Scene components", scene.SceneBehaviours.Count.ToString(), scale);
         Line("Managed mem", $"{GC.GetTotalMemory(false) / (1024.0 * 1024.0):0.0} MB", scale);

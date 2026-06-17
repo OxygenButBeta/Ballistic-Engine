@@ -300,7 +300,7 @@ internal sealed class AnimatorControllerPreview : IComponentPreview {
         string cur = controller.CurrentStateName ?? "(none)";
         ImGui.Text("Current: ");
         ImGui.SameLine();
-        ImGui.TextColored(new SysVec4(0.45f, 0.85f, 1f, 1f), cur);
+        ImGui.TextColored(EditorTheme.Info, cur);
 
         // State list with the active one highlighted.
         ImGui.Spacing();
@@ -310,7 +310,7 @@ internal sealed class AnimatorControllerPreview : IComponentPreview {
             string label = $"{(isCurrent ? EditorIcons.Play + " " : "   ")}{s.Name}";
             string clipName = s.Clip is not null ? s.Clip.Name : "(no clip)";
             if (isCurrent)
-                ImGui.TextColored(new SysVec4(0.45f, 0.85f, 1f, 1f), $"{label}  ->  {clipName}");
+                ImGui.TextColored(EditorTheme.Info, $"{label}  ->  {clipName}");
             else
                 ImGui.TextDisabled($"{label}  ->  {clipName}");
             // A click jumps to the state (play mode) — handy for testing.
@@ -372,7 +372,7 @@ internal sealed class LightAnimatorPreview : IComponentPreview {
         bool hasLight = lightAnim.GetComponent<PointLight>() is not null
                      || lightAnim.GetComponent<SpotLight>() is not null;
         if (!hasLight) {
-            ImGui.TextColored(new SysVec4(1f, 0.7f, 0.3f, 1f), "No PointLight or SpotLight on this entity.");
+            ImGui.TextColored(EditorTheme.Warning, "No PointLight or SpotLight on this entity.");
             ImGui.TextDisabled("Add one — the animator drives its Intensity + Color.");
             return;
         }
@@ -405,7 +405,7 @@ internal sealed class SpawnerPreview : IComponentPreview {
         EditorDecoration.DrawSectionHeader("Spawner");
 
         if (spawner.Prefab is null) {
-            ImGui.TextColored(new SysVec4(1f, 0.7f, 0.3f, 1f), "Assign a Prefab to spawn.");
+            ImGui.TextColored(EditorTheme.Warning, "Assign a Prefab to spawn.");
             return;
         }
 

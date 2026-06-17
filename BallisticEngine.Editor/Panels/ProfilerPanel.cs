@@ -99,7 +99,7 @@ internal sealed class ProfilerPanel {
                 ImGui.TableNextColumn();
                 var percent = frame.TotalMs > 0 ? zone.DurationMs / frame.TotalMs * 100.0 : 0;
                 if (percent >= 50)
-                    ImGui.TextColored(new SysVec4(1f, 0.55f, 0.35f, 1f), $"{percent:0.0}");
+                    ImGui.TextColored(EditorTheme.Error, $"{percent:0.0}");
                 else
                     ImGui.Text($"{percent:0.0}");
             }
