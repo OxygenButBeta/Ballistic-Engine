@@ -1,0 +1,76 @@
+{
+  "Note": "DX12 pass-graph PHASE-1 GOLDEN SET (chunk 11, step G). This is PHASE 2's ground truth: the frozen output of the phase-1 pass-list across the full coverage matrix. Phase 2 (V1 DAG/cull -> V2 aliasing -> V3 auto-barriers -> V4 async) is PURE ARCHITECTURE over an unchanged image, so its only contract is 'output unchanged vs THIS frozen set'. The deterministic gate is LITERAL SHA-256 byte-identity (the determinism noise-floor is EXACTLY 0 on this substrate -- see dx12-noise-floor.json, chunk 2; NO tolerance epsilon). Plus the metric fingerprint (imgstat: meanLuma / blackCrush / highlightClip / 16-bin histogram) -- a phase-2 change that matches SHA but shifts a metric is impossible (SHA match => byte-identical => metric-identical), but the fingerprint is recorded so a perceptual shift is human-auditable if the substrate pin ever changes and SHAs are regenerated. A metric shift in phase 2 is a HARD-FAIL, not an R-NEW-2 soft-gate (phase 2 is pixel-preserving). PIN to substrate (R-NEW-6): a driver/GPU bump shifts HDR float output and invalidates these SHAs -- regenerate the whole set on the new substrate before trusting any phase-2 imgdiff. See plan C:\\Users\\suley\\.claude\\plans\\silly-leaping-fog.md 'GOLDEN FREEZE' + memory dx12-passgraph-plan-2026-06-17.",
+
+  "Substrate": {
+    "Commit": "65ee31cf",
+    "CommitSubject": "[dx12-passgraph] chunk11 step-G: collapse orchestrator to ONE graph.Execute(ctx)",
+    "Branch": "dx12-renderer",
+    "PhaseMilestone": "PHASE 1 COMPLETE -- DX12HDRenderer god-object converted to a stably-ordered IRenderPass list (every non-core pass is a Dx12<Pass>Pass : IRenderPass in a Dx12RenderGraph, ordered by Dx12RenderPassEvent; the orchestrator is a single graph.Execute(ctx)). NOT yet a graph (no Declare/DAG/cull/alias) -- that is phase 2.",
+    "Gpu": "AMD Radeon RX 9070 XT",
+    "DriverVersion": "32.0.31019.2002",
+    "GraphicsToolsInstalled": true,
+    "D3D12SDKLayersVersion": "10.0.26100.8521 (WinBuild.160101.0800)",
+    "OsVersion": "10.0.26200.0",
+    "Resolution": "1920x1080",
+    "DeterminismFloor": "EXACTLY 0 (SHA-256 byte-identical run-to-run, LDR + HDR). See dx12-noise-floor.json. The phase-2 deterministic gate is literal SHA-256 equality, no epsilon.",
+    "CapturedUtc": "2026-06-17T05:30:00Z"
+  },
+
+  "Oracle": {
+    "DeterministicHalf": "bal render <scene> --out <dir> forces BALLISTIC_DETERMINISTIC=1 (TAA/FSR/temporal pass-through, fixed exposure, DDGI converged, grain frozen to 0) and captures frame 180. The .bmp's SHA-256 is the gate. This set = the deterministic half ONLY.",
+    "TemporalHalf": "NOT in this set. TAA/FSR/cross-frame-history are inert under DETERMINISTIC, so any phase-2 V-layer touching history (V2 aliasing especially) MUST ALSO pass regime (b): the motion-dump boiling band in dx12-noise-floor.json (RegimeB_BoilingBand). The golden SHA gate is structurally blind to the temporal subsystem.",
+    "StateHalf": "GBV (BALLISTIC_DX12_DEBUG=1 BALLISTIC_DX12_GBV=1 BALLISTIC_DX12_BREAK_ON_ERROR=1, run Runtime.exe DIRECTLY -- bal render captures stderr) must stay zero-NEW-error vs dx12-gbv-baseline.json through phase 2. Pixel-neutral is necessary but NOT sufficient for barrier correctness (a wrong-timing barrier can be pixel-clean and GBV-dirty)."
+  },
+
+  "Excluded": {
+    "RtPaths": "BALLISTIC_DX12_RT_GI=1 and BALLISTIC_DX12_RT_SHADOWS=1 are EXCLUDED from the golden set. They device-remove (0x887A0005 DXGI_ERROR_DEVICE_REMOVED) headless at end-of-frame SaveBmp readback (with OIDN on, crash earlier in oidnExecuteFilter). PROVEN PRE-EXISTING (reproduced identically on baselines 5c564a2d / a73a7698 with the chunk-10/9 code absent) -- an orthogonal RT-readback fault, NOT a pass-graph bug. Per gpu-hang-launch-safety they are NOT launched in verification. Fixing that fault is a separate follow-up; once fixed, ADD rt-gi/rt-shadows rows to this golden set on the same substrate.",
+    "SunTemple": "Renders BLACK headless (pre-existing, trivial floor/zero signal) -- excluded from the test scene set, as in chunks 1-10.",
+    "FsrUnderGbv": "GBV x FidelityFX (FSR) is pathologically slow (does not complete in a bounded window, 18GB working set) -- the FSR-path GBV check is deferred/unverified (chunk 7). The FSR move is byte-identical-by-construction (verbatim RunFsr); FSR's deterministic output is still captured here via the default path (FSR off by default)."
+  },
+
+  "Matrix": {
+    "_comment": "config -> per-scene { ldrSha256 (the gate), metric fingerprint }. 'default' SHAs MUST match dx12-noise-floor.json RegimeA (chunk 2) -- they do, confirming the chunk-3..11 pass-graph migration is byte-neutral on the default path end to end. PNG visual references live in golden/<config>__<scene>.png (lossless re-encode of the same BMP; the SHA gate is on the original .bmp).",
+
+    "default": {
+      "_doors": "everything on (no env doors) -- the primary gate, all 4 scenes.",
+      "SkyTest":             { "ldrSha256": "fb51654739802db307403d842bbdb4785e730357f8b6d32ebc2945c94d1a83ba", "meanLuma": 173.1, "blackCrush": 0.00,  "highlightClip": 0.00, "hist16": [0,0,0,0,0,0,0,0,0,8,64,27,0,0,0,0] },
+      "CornellBox":          { "ldrSha256": "6e3ee554009ce9f0520a8c6a124fb6dff3cb03fc2b92bd5e8b3650c1eb4d7fa1", "meanLuma": 73.2,  "blackCrush": 47.46, "highlightClip": 0.00, "hist16": [48,3,3,1,1,1,3,4,4,4,4,3,2,11,0,0] },
+      "BistroInterior_Wine": { "ldrSha256": "40a68b28de4aa294fb61712c7c4307231db58770d8cb7b63fed9763ddb50ccfe", "meanLuma": 49.2,  "blackCrush": 15.71, "highlightClip": 0.00, "hist16": [17,15,28,13,7,4,2,1,3,4,0,0,0,0,0,0] },
+      "BistroExterior":      { "ldrSha256": "02d61b2b140758828841a51c4c4932941f0b3bdc1c39419ad890382720d3b853", "meanLuma": 34.1,  "blackCrush": 37.69, "highlightClip": 0.00, "hist16": [41,14,18,7,4,3,2,2,2,1,0,0,0,0,0,0] }
+    },
+
+    "minimal": {
+      "_doors": "BALLISTIC_DX12_MINIMAL=1 -- the 'every non-core pass gated off' floor (G-buffer + deferred + composite only). All 4 scenes. SkyTest minimal == black (no sky, no opaque geometry).",
+      "SkyTest":             { "ldrSha256": "8b5d941948e88f0bff54107aecc9eff30b50159d192a1c920fdb90049fda43af", "meanLuma": 0.0,   "blackCrush": 100.00, "highlightClip": 0.00, "hist16": [100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0] },
+      "CornellBox":          { "ldrSha256": "f01e572f686617c2aa7c53f26471ab9695db24f71dc5e01df89d7cd76857b651", "meanLuma": 37.8,  "blackCrush": 73.08, "highlightClip": 0.00, "hist16": [73,1,2,3,1,1,0,0,0,0,0,2,3,8,0,0] },
+      "BistroInterior_Wine": { "ldrSha256": "1264765cc83b514c20e45ac5ce29584441e3b6630cdf3e490d74914b618a61d2", "meanLuma": 25.8,  "blackCrush": 60.26, "highlightClip": 0.00, "hist16": [63,12,6,2,1,1,1,3,6,1,0,0,0,0,0,0] },
+      "BistroExterior":      { "ldrSha256": "20d0a8a21c08c33d9c5204fe1ea72edc72102c594d80b97c906e3f36ffd931cc", "meanLuma": 30.4,  "blackCrush": 69.35, "highlightClip": 0.00, "hist16": [69,3,2,1,1,1,3,4,7,0,0,1,0,0,0,0] }
+    },
+
+    "perDoorOff": {
+      "_doors": "single-door-OFF (rest on) on BistroInterior_Wine -- the config that surfaces an R2 transition-inheritance bug (disabled-pass head transition). Each is its pass's DISABLED branch. SkyTest sky-off is the ProceduralSky scene's sky-disabled branch (R2 for AP/Transparents head transitions). Pruned per R3: one scene per door, not all 4.",
+      "ssgi-off__BistroInterior_Wine":    { "door": "BALLISTIC_DX12_SSGI=0",       "ldrSha256": "0d603760829277abf4437bb436e7c0de5274a20b8d014066c13641bacde28e23", "meanLuma": 25.1, "blackCrush": 59.46, "highlightClip": 0.00, "hist16": [61,11,10,3,1,1,1,1,3,3,0,0,0,0,0,0] },
+      "ssao-off__BistroInterior_Wine":    { "door": "BALLISTIC_DX12_SSAO=0",       "ldrSha256": "142b4f1fd431f8ac42b517536daee39329f63bec37fd4257ef55738db8f1a45b", "meanLuma": 50.1, "blackCrush": 15.42, "highlightClip": 0.00, "hist16": [17,14,29,13,7,4,3,1,2,4,0,0,0,0,0,0] },
+      "shadows-off__BistroInterior_Wine": { "door": "BALLISTIC_DX12_SHADOWS=0",    "ldrSha256": "34180fd1de181d5da68b70ffa0d8996f3bd8c88b2000fcf62f308d11ab0fc465", "meanLuma": 60.5, "blackCrush": 8.29,  "highlightClip": 0.00, "hist16": [9,12,26,15,11,6,4,2,5,5,0,0,0,0,0,0] },
+      "bloom-off__BistroInterior_Wine":   { "door": "BALLISTIC_DX12_BLOOM=0",      "ldrSha256": "4ceb31da493f65d062d932bf4600604c350f48ee674648c03a77cd826e837616", "meanLuma": 39.2, "blackCrush": 20.15, "highlightClip": 0.00, "hist16": [24,25,23,9,4,2,2,3,3,0,0,0,0,0,0,0] },
+      "sky-off__BistroInterior_Wine":     { "door": "BALLISTIC_DX12_SKY=0",        "ldrSha256": "40a68b28de4aa294fb61712c7c4307231db58770d8cb7b63fed9763ddb50ccfe", "meanLuma": 49.2, "blackCrush": 15.71, "highlightClip": 0.00, "hist16": [17,15,28,13,7,4,2,1,3,4,0,0,0,0,0,0], "_note": "byte-identical to default -- BistroInterior is an interior, no sky pixels in frame; the R2 Transparents/AP head-transition path runs but is byte-neutral here." },
+      "sky-off__SkyTest":                 { "door": "BALLISTIC_DX12_SKY=0",        "ldrSha256": "8b5d941948e88f0bff54107aecc9eff30b50159d192a1c920fdb90049fda43af", "meanLuma": 0.0,  "blackCrush": 100.00,"highlightClip": 0.00, "hist16": [100,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], "_note": "== minimal SkyTest -- the only ProceduralSky scene goes black with Sky off (no opaque geometry). The sky-disabled branch for the scene that actually paints sky." }
+    },
+
+    "fogOn": {
+      "_doors": "BALLISTIC_FX_VOLUMETRIC=1 on BistroInterior_Wine -- the volumetric-fog pass's ENABLED branch (fog is OFF by default, so this is the only golden config that exercises Fog drawing). Distinct SHA from default (322f != 40a6) -- fog visibly paints. The door is BALLISTIC_FX_VOLUMETRIC (legacy name), NOT BALLISTIC_DX12_FOG.",
+      "fog-on__BistroInterior_Wine":      { "door": "BALLISTIC_FX_VOLUMETRIC=1",   "ldrSha256": "322fe42cf932737bc64695c9837dbba7503350602276a030b57e1b41408ce4ab", "meanLuma": 54.7, "blackCrush": 6.17,  "highlightClip": 0.00, "hist16": [9,13,33,16,8,4,3,2,3,4,0,0,0,0,0,0] }
+    }
+  },
+
+  "Regenerate": {
+    "How": "From the chunk-11 (or later phase-2) tree on this substrate: build DX12 -> Runtime -> cp -f the fresh BallisticEngine.DX12.dll into BallisticEngine.Cli/bin/Debug/net9.0 (bal render uses the Cli-bin DLL). Then `bal render <ABS scene path> --out <dir>` for each config with the env doors above set in the parent shell (bal render inherits parent env). sha256sum the output .bmp.",
+    "Scenes": {
+      "SkyTest": "SampleProject/Assets/SkyTest/SkyTest.scene",
+      "CornellBox": "SampleProject/Assets/CornellBox/CornellBox.scene",
+      "BistroInterior_Wine": "SampleProject/Assets/Bistro_v5_2/BistroInterior_Wine.scene",
+      "BistroExterior": "SampleProject/Assets/Bistro_v5_2/BistroExterior.scene"
+    },
+    "Fingerprint": "python e:/tmp/imgstat.py hist <bmp> -> meanLuma / blackCrush / highlightClip / 16-bin histogram."
+  }
+}

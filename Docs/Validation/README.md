@@ -9,6 +9,26 @@ those are captured here and the gate fails only on signatures NOT in this set.
 See `C:\Users\suley\.claude\plans\silly-leaping-fog.md` § "Validation oracle" (W1–W4) and the memory
 `dx12-passgraph-plan-2026-06-17`.
 
+## The validation set in this folder
+
+| file | what it is |
+|---|---|
+| `dx12-gbv-baseline.json` | the GBV/debug-layer message allowlist (W2) — the **state** oracle |
+| `dx12-noise-floor.json` | determinism floor (regime a = SHA-256, EXACTLY 0) + boiling band (regime b) (W3) |
+| `dx12-boiling-metric.py` | the regime-(b) boiling-metric helper |
+| `dx12-golden-set.json` | **PHASE-1 GOLDEN SET (chunk 11)** — the frozen full-matrix SHA-256s + metric fingerprints + substrate pin; phase 2's ground truth |
+| `golden/*.png` | lossless visual references for each golden config (`<config>__<scene>.png`) — the SHA gate is on the original `.bmp` |
+
+**`dx12-golden-set.json` is phase 2's ground truth.** Phase 1 freely changed the look (it was being
+fixed); phase 2 (V1 DAG/cull → V2 aliasing → V3 auto-barriers → V4 async) is pure architecture over an
+unchanged image, so its only contract is "output unchanged vs the FROZEN golden set." The deterministic
+gate is **literal SHA-256** byte-identity (the noise-floor is exactly 0 — no epsilon). RT paths (RT_GI /
+RT_SHADOWS) are EXCLUDED — they device-remove headless (pre-existing, orthogonal). The temporal half
+(TAA/FSR/history) is NOT in the golden set (inert under `BALLISTIC_DETERMINISTIC`) — phase-2 V-layers
+that touch history must also pass the regime-(b) boiling band. PINNED to commit `65ee31cf` / RX 9070 XT
+/ driver 32.0.31019.2002; a driver/GPU bump invalidates the SHAs → regenerate the whole set first
+(R-NEW-6). See the `Regenerate` block in the JSON.
+
 ## How it works
 
 - Each D3D12 message is normalized to a **signature** = `Category|Id|normalized-text`, with addresses,
