@@ -135,22 +135,24 @@ public sealed class PostProcessSettings {
 
     // Screen-space reflections: smooth surfaces reflect the actual scene instead of only
     // the sky cubemap. Requires the normal attachment (unavailable in the MSAA path).
-    // REFLECTIONS HARD-DISABLED (2026-06-18): SSR + RT-reflections are taken out of the system (same kill as
-    // the GI stack). These defaults are flipped to Off so any consumer / a scene with no GI volume also
-    // reflects "reflections off"; the renderer's reflections pass is gated on SsrEnabled so it never runs.
-    public bool SsrEnabled { get; set; } = false;
+    // REFLECTIONS RE-ENABLED (GI PRAGMATIC REVIVAL R0.1, 2026-06-18): the 2026-06-18 hard-disable default-Off is
+    // reverted. These defaults are the no-volume baseline (a scene with no GlobalIllumination volume) and the
+    // volume bridge (VolumePostProcessing.Apply) overwrites them from the volume's Reflections-Mode dropdown.
+    // Default ScreenSpace = SSR on; the renderer's reflections pass is gated on SsrEnabled.
+    public bool SsrEnabled { get; set; } = true;
     public float SsrIntensity { get; set; } = 1f;
-    public ReflectionMode ReflectionMode { get; set; } = ReflectionMode.Off;  // SSR or DXR (Reflection volume) — forced Off, system disabled
+    public ReflectionMode ReflectionMode { get; set; } = ReflectionMode.ScreenSpace;  // SSR or DXR (Reflection volume) — re-enabled R0.1
 
     // Screen-space global illumination: a coarse one-bounce diffuse gather that adds
     // indirect fill light from sunlit on-screen surfaces into shadowed areas (the
     // directional bounce a flat ambient term can't provide). Like SSR it needs the normal
     // attachment, so it only runs while TAA is on / MSAA is off.
-    // LUMEN GI HARD-DISABLED (2026-06-17): the whole indirect-GI stack is taken out of the system at the
-    // DX12HDRenderer giMode choke point. These defaults are flipped to Off so any other consumer (or a
-    // scene with no GI volume) also reflects "GI off" rather than the old live default.
-    public bool SsgiEnabled { get; set; } = false;
-    public GiMode GiMode { get; set; } = GiMode.Off;   // GI volume dropdown: Off / SSGI / RT-GI (DXR) — forced Off, system disabled
+    // LUMEN GI RE-ENABLED (GI PRAGMATIC REVIVAL R0.1, 2026-06-18): the 2026-06-17 hard-disable default-Off is
+    // reverted. These defaults are the no-volume baseline (a scene with no GlobalIllumination volume); the volume
+    // bridge (VolumePostProcessing.Apply) overwrites them from the volume's GI-Mode dropdown. Default ScreenSpace
+    // = SSGI on. The DX12HDRenderer giMode choke point still lets BALLISTIC_DX12_SSGI/RT_GI env doors override.
+    public bool SsgiEnabled { get; set; } = true;
+    public GiMode GiMode { get; set; } = GiMode.ScreenSpace;   // GI volume dropdown: Off / SSGI / RT-GI (DXR) — re-enabled R0.1
 
     // Emissive-as-GI source: emissive surfaces act as area lights in the indirect bounce (the DDGI/
     // RTXGI/Lumen technique — at each GI ray hit the shader adds the hit's self-emission). DEFAULT true

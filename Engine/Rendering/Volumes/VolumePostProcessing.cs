@@ -53,29 +53,39 @@ public static class VolumePostProcessing {
         // probe/Lumen split overrides (P0.5 consolidation). The two Mode dropdowns each carry their own
         // Off, so the enable bool is derived from the mode (no separate enable param to keep in sync).
         if (stack.GetComponent<GlobalIllumination>() is { } gi) {
-            // LUMEN GI + REFLECTIONS HARD-DISABLED (2026-06-17/18): the whole indirect-lighting stack hosted by
-            // this volume is taken out of the system. The DIFFUSE side (SSGI, RT-GI, the DDGI world cache, the
-            // screen probes, emissive-as-GI) was disabled 2026-06-17; the SPECULAR side (SSR + RT-reflections)
-            // was disabled 2026-06-18. This bridge no longer maps the volume's GI/Reflections dropdowns onto
-            // PostFX — it writes the OFF state unconditionally, so a scene whose GlobalIllumination volume has
-            // GI or reflections turned on can no longer bring the dead passes back to life. The volume UI stays
-            // (no code deleted) but is inert. To restore, map the dials back to the fx fields below.
-
-            // Diffuse GI — forced off (system disabled). The advanced bounce/temporal/look dials are still
-            // copied so the inert values stay coherent, but nothing consumes them while GiMode == Off.
-            fx.GiMode = GiMode.Off;
-            fx.SsgiEnabled = false;
+            // === GI PRAGMATIC REVIVAL R0.1 (2026-06-18) — bridge FLIPPED to volume-driven. ===
+            // This bridge is the shipping front door: the blended GlobalIllumination volume drives PostFX, which
+            // the renderer reads each frame. The 2026-06-17/18 hard-disable (this block unconditionally writing
+            // GiMode.Off / SsgiEnabled=false / ReflectionMode.Off / SsrEnabled=false) is REVERTED — the volume's
+            // GI/Reflections dropdowns now map onto PostFX so a scene whose GlobalIllumination volume turns GI or
+            // reflections on actually gets them. (The volume `enabled` master switch hard-stops the whole stack:
+            // enabled=false forces both modes Off regardless of the dropdowns — matches the component tooltip.)
+            //
+            // PRECEDENCE (defined here, R0.1 — not deferred to R3): the VOLUME is AUTHORITATIVE; it drives PostFX
+            // unconditionally below. The BALLISTIC_DX12_* env doors are a DEBUG OVERRIDE only — they win over
+            // PostFX at the renderer choke point (DX12HDRenderer GI-mode resolve: BALLISTIC_DX12_SSGI/RT_GI for
+            // diffuse, BALLISTIC_DX12_RT_REFLECTIONS for the SSR-vs-RT reflection branch), NOT here in the bridge.
+            // So the volume is the user/shipping path; an env door is the A/B-harness / bisect override layered on
+            // top. The no-RT auto-downgrade (RayTraced→ScreenSpace without HW RT) also lives at that choke point.
+            //
+            // ⚠ DEV-ONLY, R1.0-INCOMPLETE: GI is back on the shipping path but RT-GI / emissive-as-GI bounce is
+            // still gated on per-triangle MaterialId only present on submesh-range meshes (R1.0 moves it into the
+            // RT geometry build). Until R1.0 lands, color-only / whole-mesh content gets NO RT bounce/bleed.
+            bool giOn = gi.enabled.Value;
+            fx.GiMode = giOn ? gi.giMode.Value : GiMode.Off;
+            fx.SsgiEnabled = giOn && gi.giMode.Value != GiMode.Off;
             fx.SsgiIntensity = gi.intensity.Value;
-            fx.SsgiDebugView = false;
-            fx.GiEmissive = false;
-            fx.Ddgi = false;
-            fx.ScreenProbes = false;
-            // Reflections (SSR + RT) — forced off (system disabled). SsrEnabled=false makes Dx12ReflectionsPass
-            // .Enabled() return false, so neither the SSR march nor the RT-reflections branch ever runs.
-            fx.ReflectionMode = ReflectionMode.Off;
-            fx.SsrEnabled = false;
+            fx.SsgiDebugView = giOn && gi.giIsolate.Value;
+            fx.GiEmissive = giOn && gi.emissiveAsGi.Value;
+            fx.Ddgi = giOn && gi.worldRadianceCache.Value;
+            fx.ScreenProbes = giOn && gi.screenProbes.Value;
+            // Reflections (SSR + RT) — driven by the volume's Reflections-Mode dropdown. SsrEnabled gates
+            // Dx12ReflectionsPass.Enabled(); ReflectionMode selects the SSR vs RT branch inside Record.
+            fx.ReflectionMode = giOn ? gi.reflectionsMode.Value : ReflectionMode.Off;
+            fx.SsrEnabled = giOn && gi.reflectionsMode.Value != ReflectionMode.Off;
             fx.SsrIntensity = gi.reflectionsIntensity.Value;
-            // Advanced bounce / temporal / look dials (inert while GI is disabled; copied for coherence).
+            // Advanced bounce / temporal / look dials (consumed by the SSGI/GI combine when GI is on; copied
+            // always so the values stay coherent when GI is toggled mid-session).
             fx.SsgiRayLength = gi.rayLength.Value;
             fx.SsgiFalloff = gi.falloff.Value;
             fx.SsgiThickness = gi.thickness.Value;

@@ -55,16 +55,24 @@ internal static class RenderPassTogglesWindow {
         var pfx = r.PostFX;
         bool fog = pfx.VolumetricEnabled;
         if (ImGui.Checkbox("Volumetric Fog", ref fog)) pfx.VolumetricEnabled = fog;
-        // SSR / RT-reflections AND GI (SSGI / RT-GI / DDGI / screen probes) are both HARD-DISABLED engine-wide
-        // (reflections 2026-06-18, GI 2026-06-17): the whole indirect-lighting stack is taken out of the system
-        // at the renderer's gates (Dx12ReflectionsPass.Enabled via SsrEnabled / Dx12GiPass.Enabled via giMode),
-        // so neither can be re-enabled at runtime. Shown read-only/disabled to make that explicit.
-        ImGui.BeginDisabled();
-        bool ssr = false;
-        ImGui.Checkbox("SSR / Reflections — disabled", ref ssr);
-        bool giOn = false;
-        ImGui.Checkbox("GI (SSGI / RT) — disabled", ref giOn);
-        ImGui.EndDisabled();
+        // SSR / RT-reflections AND GI (SSGI / RT-GI / DDGI / screen probes) are RE-ENABLED engine-wide as of the
+        // GI PRAGMATIC REVIVAL R0.1 (2026-06-18): the volume bridge (VolumePostProcessing.Apply) now drives PostFX
+        // from the GlobalIllumination volume's GI/Reflections dropdowns. These checkboxes flip the live PostFX
+        // flags the same volume framework writes each frame — a live diagnostic on top of the volume. NOTE: the
+        // GI mode (SSGI vs RT-GI) is the volume's GI-Mode dropdown; this is just the on/off gate.
+        // ⚠ DEV-ONLY, R1.0-INCOMPLETE: RT-GI / emissive-as-GI bounce still requires per-triangle MaterialId only
+        // present on submesh-range meshes — color-only / whole-mesh content gets no RT bounce until R1.0.
+        bool ssr = pfx.SsrEnabled;
+        if (ImGui.Checkbox("SSR / Reflections", ref ssr)) {
+            pfx.SsrEnabled = ssr;
+            pfx.ReflectionMode = ssr && pfx.ReflectionMode == ReflectionMode.Off ? ReflectionMode.ScreenSpace
+                               : ssr ? pfx.ReflectionMode : ReflectionMode.Off;
+        }
+        bool giOn = pfx.GiMode != GiMode.Off;
+        if (ImGui.Checkbox("GI (SSGI / RT)  — dev-only, R1.0-incomplete", ref giOn)) {
+            pfx.GiMode = giOn && pfx.GiMode == GiMode.Off ? GiMode.ScreenSpace : giOn ? pfx.GiMode : GiMode.Off;
+            pfx.SsgiEnabled = giOn;
+        }
 
         if (d.Minimal) {
             ImGui.Spacing();
