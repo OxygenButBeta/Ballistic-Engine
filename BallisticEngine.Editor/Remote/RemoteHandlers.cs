@@ -33,7 +33,17 @@ internal static class RemoteHandlers {
         };
     }
 
-    public static object Dispatch(string method, JsonElement p) => method switch {
+    public static object Dispatch(string method, JsonElement p) {
+        // D2 boundary guard: reject a malformed request (unknown method / missing or wrong-typed required
+        // param) with ONE clean error BEFORE any handler runs, so a bad JSON shape can't NRE the editor or
+        // throw a cryptic JsonElement exception deep in a handler. The schema is the engine-side single
+        // source of truth (RemoteSchema), shared with the MCP boundary and the headless harness.
+        if (RemoteSchema.Validate(method, p) is { } error)
+            throw new Exception(error);
+        return DispatchValidated(method, p);
+    }
+
+    static object DispatchValidated(string method, JsonElement p) => method switch {
         "editor.status" => Status(),
         "scene.describe" => Describe(),
         "scene.save" => SceneSave(),
