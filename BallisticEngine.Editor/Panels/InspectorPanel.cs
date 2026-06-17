@@ -1701,28 +1701,46 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
         int count = list?.Count ?? 0;
 
-        // Header row inside the value column: item count + an Add button (full row width split).
+        // Header row inside the value column: item count + a Clear button + an Add button (full row width).
+        // Add is right-aligned; Clear sits just left of it (only when the list is non-empty, so an empty list
+        // never shows a no-op Clear). Both are structural single-undo edits like Add.
         ImGui.AlignTextToFramePadding();
         ImGui.TextDisabled($"{count} item{(count == 1 ? "" : "s")}");
-        ImGui.SameLine();
         float addW = ImGui.GetFrameHeight() + 24;
-        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + Math.Max(0, ImGui.GetContentRegionAvail().X - addW));
+        float clearW = count > 0 ? ImGui.GetFrameHeight() + 32 : 0f;
+        float gap = count > 0 ? 6f : 0f;
+        ImGui.SameLine();
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + Math.Max(0, ImGui.GetContentRegionAvail().X - addW - clearW - gap));
+        bool clearClicked = false;
+        if (count > 0) {
+            if (ImGui.Button($"{EditorIcons.Delete} Clear##clearcol_{p.Name}", new SysVec2(clearW, 0)))
+                clearClicked = true;
+            ImGui.SameLine(0, gap);
+        }
         if (ImGui.Button($"{EditorIcons.Add} Add##addcol_{p.Name}", new SysVec2(addW, 0))) {
             CollectionAdd(p, collType, elemType, list, isArray);
             return; // structural change: redraw next frame against the new collection (avoids a stale row)
+        }
+        if (clearClicked) {
+            CollectionClear(p, collType, elemType, isArray);
+            return; // structural change: redraw next frame against the now-empty collection
         }
 
         if (count == 0)
             return;
 
         // Per-element rows: each element drawn by its own terminal drawer through a CollectionElementProperty,
-        // followed by a Remove button. PushId per index so duplicate element values keep distinct ImGui ids.
-        int removeIndex = -1;
+        // followed by reorder (up/down), insert, and remove buttons. PushId per index so duplicate element
+        // values keep distinct ImGui ids. Structural edits (move/insert/remove) are DEFERRED past the loop so
+        // the collection is not mutated mid-iteration (a stale row + redraw next frame, like Add).
+        int removeIndex = -1, insertIndex = -1, moveFrom = -1, moveTo = -1;
+        float btnW = ImGui.GetFrameHeight();
+        // 4 trailing buttons (up, down, insert, remove) each btnW wide, with 4px gaps.
+        float controlsW = btnW * 4 + 4 * 3 + 6;
         for (int i = 0; i < count; i++) {
             ImGui.PushID(i);
             int captured = i;
-            float removeW = ImGui.GetFrameHeight();
-            float elemW = Math.Max(40f, ImGui.GetContentRegionAvail().X - removeW - 6);
+            float elemW = Math.Max(40f, ImGui.GetContentRegionAvail().X - controlsW);
 
             var elemProp = new Inspector.CollectionElementProperty(
                 $"Element {i}", elemType,
@@ -1739,14 +1757,40 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                 ImGui.TextDisabled($"({elemType.Name})"); // no drawer for this element type (e.g. nested struct)
             }
 
+            // Move up (disabled on the first row): swap with the previous element.
             ImGui.SameLine(0, 6);
-            if (ImGui.Button($"{EditorIcons.Delete}", new SysVec2(removeW, 0)))
-                removeIndex = captured;
+            ImGui.BeginDisabled(captured == 0);
+            if (ImGui.Button($"{EditorIcons.ChevronUp}##up", new SysVec2(btnW, 0))) { moveFrom = captured; moveTo = captured - 1; }
+            ImGui.EndDisabled();
+            if (ImGui.IsItemHovered() && captured > 0) ImGui.SetTooltip("Move up");
+
+            // Move down (disabled on the last row): swap with the next element.
+            ImGui.SameLine(0, 4);
+            ImGui.BeginDisabled(captured == count - 1);
+            if (ImGui.Button($"{EditorIcons.ChevronDown}##down", new SysVec2(btnW, 0))) { moveFrom = captured; moveTo = captured + 1; }
+            ImGui.EndDisabled();
+            if (ImGui.IsItemHovered() && captured < count - 1) ImGui.SetTooltip("Move down");
+
+            // Insert a default element BEFORE this row.
+            ImGui.SameLine(0, 4);
+            if (ImGui.Button($"{EditorIcons.Add}##ins", new SysVec2(btnW, 0))) insertIndex = captured;
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Insert above");
+
+            // Remove this row.
+            ImGui.SameLine(0, 4);
+            if (ImGui.Button($"{EditorIcons.Delete}##rm", new SysVec2(btnW, 0))) removeIndex = captured;
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Remove");
 
             ImGui.PopID();
         }
 
-        if (removeIndex >= 0)
+        // Apply at most ONE structural change per frame (the buttons are mutually exclusive in practice — a
+        // single click — but order the checks so a deferred change is unambiguous). Each is a single undo.
+        if (moveFrom >= 0 && moveTo >= 0)
+            CollectionMove(p, collType, elemType, list, isArray, moveFrom, moveTo);
+        else if (insertIndex >= 0)
+            CollectionInsertAt(p, collType, elemType, list, isArray, insertIndex);
+        else if (removeIndex >= 0)
             CollectionRemoveAt(p, collType, elemType, list, isArray, removeIndex);
     }
 
@@ -1790,6 +1834,73 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                 list.RemoveAt(index);
                 p.Set(list);
             }
+            state.MarkViewportDirty();
+        });
+    }
+
+    // Move the element at `from` to `to` (reorder). Used for the up/down buttons (adjacent swap), but written
+    // generally so a future drag-reorder can reuse it. List<T> moves in place; an array rebuilds (immutable
+    // length, but a move is a permutation so the length is unchanged). One undo. The WHOLE collection is
+    // written back through the property so ApplyMember broadcasts + dirties, exactly like Add/Remove.
+    void CollectionMove(Inspector.IProperty p, Type collType, Type elemType,
+        System.Collections.IList list, bool isArray, int from, int to) {
+        if (list is null) return;
+        int n = list.Count;
+        if (from < 0 || from >= n || to < 0 || to >= n || from == to) return;
+        EditorCommands.Structural($"Reorder {p.Label}", () => {
+            if (isArray) {
+                var moved = Array.CreateInstance(elemType, n);
+                for (int i = 0; i < n; i++) moved.SetValue(list[i], i);
+                object tmp = moved.GetValue(from);
+                // Shift the gap between from..to, then drop the moved value at `to` (stable for an adjacent swap).
+                if (from < to)
+                    for (int i = from; i < to; i++) moved.SetValue(moved.GetValue(i + 1), i);
+                else
+                    for (int i = from; i > to; i--) moved.SetValue(moved.GetValue(i - 1), i);
+                moved.SetValue(tmp, to);
+                p.Set(moved);
+            }
+            else {
+                object tmp = list[from];
+                list.RemoveAt(from);
+                list.Insert(to, tmp);
+                p.Set(list);
+            }
+            state.MarkViewportDirty();
+        });
+    }
+
+    // Insert a default element BEFORE index. List<T> inserts in place; an array rebuilds one longer. One undo.
+    void CollectionInsertAt(Inspector.IProperty p, Type collType, Type elemType,
+        System.Collections.IList list, bool isArray, int index) {
+        EditorCommands.Structural($"Insert into {p.Label}", () => {
+            object def = DefaultElement(elemType);
+            if (isArray) {
+                int n = list?.Count ?? 0;
+                int at = Math.Clamp(index, 0, n);
+                var grown = Array.CreateInstance(elemType, n + 1);
+                for (int i = 0, j = 0; i < n + 1; i++)
+                    grown.SetValue(i == at ? def : list[j++], i);
+                p.Set(grown);
+            }
+            else {
+                System.Collections.IList target = list ?? (System.Collections.IList)Activator.CreateInstance(collType);
+                target.Insert(Math.Clamp(index, 0, target.Count), def);
+                p.Set(target);
+            }
+            state.MarkViewportDirty();
+        });
+    }
+
+    // Clear the whole collection. List<T> -> an empty List<T>; an array -> a zero-length array (both keep the
+    // member a non-null EMPTY collection, never null, so the editor + serializer treat it as "authored empty").
+    // One undo.
+    void CollectionClear(Inspector.IProperty p, Type collType, Type elemType, bool isArray) {
+        EditorCommands.Structural($"Clear {p.Label}", () => {
+            if (isArray)
+                p.Set(Array.CreateInstance(elemType, 0));
+            else
+                p.Set((System.Collections.IList)Activator.CreateInstance(collType));
             state.MarkViewportDirty();
         });
     }

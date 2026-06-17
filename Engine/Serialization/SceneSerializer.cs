@@ -253,6 +253,18 @@ public static class SceneSerializer {
         PropertyCategory category = PropertyCategories.Classify(declaredType, member);
         if (category == PropertyCategory.Polymorphic)
             return SerializeReferenceInstance(value, visited);
+        // Polymorphic COLLECTION (RW8 / EF15): a `[SerializeReference] List<IFoo>` or `IFoo[]` is classified
+        // Collection (IsCollection wins before the polymorphic branch), so its elements would ride the plain
+        // SerializeValue path and lose their per-element $type. When the member carries [SerializeReference]
+        // AND its element type is a polymorphic base (abstract/interface, or a concrete base that may hold a
+        // subclass), each element is serialized as a $type-tagged mapping instead -- the SAME shape a scalar
+        // [SerializeReference] member uses, just per element. A null element survives as a null entry (index
+        // preserved), exactly like the non-polymorphic sequence path. A non-[SerializeReference] collection
+        // (the overwhelming common case) is byte-identical (this branch is not taken).
+        if (category == PropertyCategory.Collection &&
+            value is System.Collections.IEnumerable polySeq &&
+            IsPolymorphicElementMember(declaredType, member))
+            return SerializeSequencePolymorphic(polySeq, visited);
         // Nested struct/class (G4): a plain (non-[SerializeReference]) member whose declared type is a
         // concrete class or non-primitive struct round-trips its serializable members as a YAML mapping --
         // NO $type tag (the declared type IS the concrete type, picked on load via Activator). The trigger is
@@ -348,6 +360,62 @@ public static class SceneSerializer {
         foreach (object element in seq)
             items.Add(SerializeValue(element));
         return items;
+    }
+
+    // RW8/EF15: a polymorphic sequence -> each NON-null element serialized as a $type-tagged mapping
+    // (SerializeReferenceInstance), so a `[SerializeReference] List<IFoo>` round-trips the live concrete type
+    // of EVERY element (the scalar polymorphic path, applied per element). A null element survives as a null
+    // entry so the list's shape (and any intentional gaps) round-trips, matching SerializeSequence. The shared
+    // `visited` cycle-guard is threaded so an element that back-references an ancestor stops at the guard
+    // (tree-only + null, Unity parity) -- same contract as a scalar [SerializeReference] member.
+    static List<object> SerializeSequencePolymorphic(System.Collections.IEnumerable seq, HashSet<object> visited) {
+        var items = new List<object>();
+        foreach (object element in seq)
+            items.Add(element is null ? null : SerializeReferenceInstance(element, visited));
+        return items;
+    }
+
+    // True when `member` is a collection (List<T>/T[]) marked [SerializeReference] whose ELEMENT type T is a
+    // polymorphic base -- the trigger for per-element $type. Mirrors PropertyCategories' polymorphism rule but
+    // applied to the element type: an abstract/interface T (the usual case) OR a concrete base T (a subclass
+    // may be stored) qualifies, exactly as a SCALAR [SerializeReference] member of type T would classify
+    // Polymorphic. Without the attribute, or for a non-collection / a primitive element type, returns false
+    // (the byte-identical non-polymorphic path). The element type is read from the DECLARED member type (not a
+    // live element) so an all-null or empty list still serializes its elements with the right shape on the
+    // (non-null) ones.
+    static bool IsPolymorphicElementMember(Type declaredType, MemberInfo member) {
+        if (member is null ||
+            member.GetCustomAttribute<SerializeReferenceAttribute>() is null)
+            return false;
+        Type element = SequenceElementType(declaredType);
+        if (element is null)
+            return false;
+        // Abstract/interface element OR a concrete base element both store a $type (a subclass may be assigned),
+        // matching PropertyCategories.Classify's Polymorphic rule for a [SerializeReference] scalar of that type.
+        // A primitive/leaf element type (List<int>, List<string>) is never polymorphic -> false (byte-identical).
+        return !IsLeafElementType(element);
+    }
+
+    // The element type of a List<T> or T[] member, else null (the member is not a single-arg sequence we can
+    // tag per element -- e.g. a Dictionary, a non-generic IEnumerable, or a leaf). Polymorphic dictionaries are
+    // out of scope (no shipped content uses one); only List<T>/T[] get per-element $type.
+    static Type SequenceElementType(Type t) {
+        if (t is null) return null;
+        if (t.IsArray) return t.GetElementType();
+        if (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(List<>))
+            return t.GetGenericArguments()[0];
+        return null;
+    }
+
+    // A leaf element type that must NEVER carry $type (it round-trips as a scalar/struct, not a polymorphic
+    // mapping): a primitive leaf, an enum, a math struct, or an asset/scene-object ref. Anything else (an
+    // abstract/interface base, or a concrete class base) is a candidate for per-element $type when the member
+    // is [SerializeReference]. Keeps List<int>/List<string>/List<Vector3>/List<Material>/List<EntityRef>
+    // byte-identical even if (unusually) marked [SerializeReference].
+    static bool IsLeafElementType(Type element) {
+        PropertyCategory c = PropertyCategories.Classify(element);
+        return c is PropertyCategory.Primitive or PropertyCategory.Enum or PropertyCategory.MathStruct
+            or PropertyCategory.AssetRef or PropertyCategory.SceneObjectRef;
     }
 
     // A Dictionary<K,V> member -> a YAML mapping (Dictionary<object,object>); both key and value recurse
@@ -629,11 +697,22 @@ public static class SceneSerializer {
     static bool TryDeserializeReferenceInstance(object raw, Type targetType, MemberInfo member, out object result) {
         result = null;
 
-        // Only a [SerializeReference] member opts in (the exact trigger the serializer used). A polymorphic
-        // COLLECTION element (a `[SerializeReference] List<IFoo>`) is out of scope for this chunk -- the
-        // collection serializer does not write $type per element yet -- so a recursed element (member == null)
-        // is never treated as polymorphic here, keeping serialize/deserialize symmetric (no new silent loss).
-        if (PropertyCategories.Classify(targetType, member) != PropertyCategory.Polymorphic)
+        // Two ways a value is polymorphic here:
+        //  (1) a SCALAR [SerializeReference] member -- the original G3 trigger (member carries the attribute, so
+        //      Classify(targetType, member) == Polymorphic), and
+        //  (2) RW8/EF15 a recursed COLLECTION element of a `[SerializeReference] List<IFoo>` -- it arrives with
+        //      member == null (DeserializeList/Array pass no member) and targetType == the element type IFoo, so
+        //      Classify can't see the attribute. The serializer now emits a per-element $type for these, and the
+        //      $type tag is out-of-band (a Vector*/Dictionary/nested map NEVER carries $type), so its presence on
+        //      a polymorphic-ELIGIBLE BASE target (abstract/interface, or a concrete base a subclass derives from)
+        //      is an unambiguous "this element is polymorphic" signal -- the symmetric inverse of (1).
+        // A non-polymorphic member (no attribute) with a non-base targetType still returns false below -> the
+        // common path is byte-identical (a plain map without $type, or a concrete leaf target, never qualifies).
+        bool scalarPolymorphic = PropertyCategories.Classify(targetType, member) == PropertyCategory.Polymorphic;
+        bool tagged = raw is IDictionary<object, object> probe &&
+                      probe.TryGetValue(TypeTag, out object t) && t is string;
+        bool elementPolymorphic = member is null && tagged && IsPolymorphicBaseTarget(targetType);
+        if (!scalarPolymorphic && !elementPolymorphic)
             return false;
 
         if (raw is not IDictionary<object, object> map ||
@@ -660,6 +739,19 @@ public static class SceneSerializer {
         ApplyMembers(instance, concrete, members);
         result = instance;
         return true;
+    }
+
+    // True when `targetType` is a base that a $type-tagged element can polymorphically rehydrate into: an
+    // abstract class / interface (the usual `[SerializeReference] List<IFoo>` element), OR a concrete class
+    // that may have subclasses. Excludes the LEAF shapes that round-trip as a scalar/struct/ref and so never
+    // carry $type (primitive/enum/math-struct/asset/scene-ref) -- a belt-and-braces guard so an (impossible)
+    // $type on a leaf target is ignored rather than mis-resolved. Used only for the member==null recursed
+    // collection-element path; the scalar [SerializeReference] path keys off the attribute as before.
+    static bool IsPolymorphicBaseTarget(Type targetType) {
+        if (targetType is null) return false;
+        if (targetType.IsAbstract || targetType.IsInterface) return true;
+        // A concrete class base can still hold a subclass; allow it. But never a struct/leaf/sealed-leaf shape.
+        return targetType.IsClass && !IsLeafElementType(targetType);
     }
 
     // Resolve a $type FullName to a concrete instantiable type ASSIGNABLE to the declared base. Scoped to the

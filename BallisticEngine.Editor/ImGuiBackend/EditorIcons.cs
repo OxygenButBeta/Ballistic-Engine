@@ -25,6 +25,7 @@ internal static class EditorIcons {
     public const string Stop = "";         // lucide square
     public const string ChevronDown = "";  // lucide chevron-down
     public const string ChevronRight = ""; // lucide chevron-right
+    public const string ChevronUp = "";   // lucide chevron-up (U+E074, in baked range; reorder-up)
     public const string Undo = "";         // lucide undo-2
     public const string Redo = "";         // lucide redo-2
     public const string Eye = "";          // lucide eye (visibility toggle)

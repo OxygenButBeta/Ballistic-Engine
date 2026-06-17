@@ -19,6 +19,7 @@ exit += AssetInspectorTests.Run();
 exit += EntityRefTests.Run();        // G1 — inserts a scene (no public unload); runs before G0's own
 exit += CollectionTests.Run();       // G2 — inserts a scene (no public unload); runs before G0's own
 exit += SerializeReferenceTests.Run(); // G3 -- inserts a scene (no public unload); runs before G0's own
+exit += PolymorphicCollectionTests.Run(); // RW8/EF15 -- polymorphic List<IFoo>/IFoo[] round-trip (scene; before G0)
 exit += NestedTests.Run();             // G4 -- inserts a scene (no public unload); runs before G0's own
 exit += UndoCoverageTests.Run();       // F3 -- undo coverage harness (inserts a scene; engine-only)
 exit += RemoteSchemaTests.Run();       // D2 -- command-port boundary schema validation (no scene; pure)

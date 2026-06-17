@@ -19,10 +19,52 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF15** (collection reorder/clear + polymorphic list serialize + round-trip test)
-> Last committed chunk: **EF10b** · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **EF7** (Tag/Layer "Add…" → open Tags & Layers panel)
+> Last committed chunk: **EF15** · Branch: `dx12-renderer`
 >
-> **EF10b note (just landed):** the top-of-inspector component-LIST search is in. `DrawEntityInspector` now
+> **EF15 note (just landed):** inspector collections gained reorder/clear UI AND polymorphic `List<IFoo>`
+> serialize now round-trips. THREE parts. (1) **Serialize fix (RW8) — `SceneSerializer.cs`:**
+> `SerializeMemberValue` now detects a `[SerializeReference]` collection whose ELEMENT type is a polymorphic
+> base (abstract/interface, or a concrete base a subclass derives from) via new helpers
+> `IsPolymorphicElementMember`/`SequenceElementType`/`IsLeafElementType`, and routes it through a new
+> `SerializeSequencePolymorphic` that emits a per-element `$type` (the scalar `SerializeReferenceInstance`
+> path, applied per element, sharing the cycle-guard `visited` set). A non-`[SerializeReference]` collection
+> or a leaf-element list (`List<int>`/`List<Material>`/`List<Vector3>`/`List<EntityRef>`) stays on the
+> existing `SerializeValue` → **byte-identical**. (2) **Deserialize gate relaxed — `TryDeserializeReferenceInstance`:**
+> the handoff's claim that deserialize was "confirmed ready" was WRONG — the old gate
+> `Classify(targetType, member) != Polymorphic` returned false for a recursed element (`member==null`,
+> `targetType==IFoo`) because `Classify(IFoo, null)` is `Unsupported` (no attribute visible). Fixed: the gate
+> now ALSO fires when `member==null` AND the raw carries a `$type` tag AND `targetType` is a polymorphic base
+> (new `IsPolymorphicBaseTarget`) — the `$type` tag is out-of-band (a Vector*/dict/nested map never carries
+> it), so its presence on a base target is unambiguous. Symmetric with the serialize side. (3) **Editor UI —
+> `DrawCollectionSlot` (`InspectorPanel.cs`):** added per-element reorder up/down (`CollectionMove`, adjacent
+> swap, `BeginDisabled` at the ends), insert-above (`CollectionInsertAt`), and a header **Clear**
+> (`CollectionClear`, beside Add, shown only when non-empty). Per-element Remove + header Add already existed.
+> Row layout is now `[element][↑][↓][+][🗑]`; structural edits are deferred past the row loop (one applied per
+> frame) and each is a single-undo `EditorCommands.Structural`. New `EditorIcons.ChevronUp` = lucide `U+E074`
+> (chevron-up) — verified via the `lucide.ttf` cmap to be inside the baked range `0xE04C–0xE2A1`, so zero
+> tofu risk (no new font codepoint to bake). (4) **Oracle = NEW suite #19** `PolymorphicCollectionTests`
+> (`Polymorphic collections (RW8/EF15)`, 20 checks) + `PolymorphicCollectionFixtures`: an interface
+> `List<IDamageModifier>` (Crit/Poison/Composite, the last with a nested `[SerializeReference]` Inner) + an
+> abstract `Shape[]` (Circle/Square) + a non-polymorphic `List<int>` control + a leaf `Marker`. Asserts
+> (a) every concrete element type + member values + ORDER round-trip (incl. the nested polymorphic element),
+> (b) byte-stable across two serializations AND a serialize/deserialize/serialize fixed point, (c) the plain
+> `List<int>` is byte-identical — exactly **6** `$type` tags total (3 list + 2 array + 1 nested), zero from
+> the int list. Touched 6 files (`SceneSerializer.cs`, `InspectorPanel.cs`, `EditorIcons.cs`,
+> `Tests.Reflection/Program.cs` + 2 new test files — all mine). Build 0-error (ROOT engine csproj for the
+> serialize change + Editor csproj, both clean `--no-incremental` scratch dirs), oracle EXIT=0 (now 19 suites).
+> The serialize/deserialize half is CPU/headless/safe; the reorder/insert/clear UI is the only part needing a
+> human screenshot → batch into the Inspector-layout set (GPU-hang rule: no relaunch-loop).
+>
+> **For EF7 (next):** the Tag/Layer dropdowns in the inspector (`InspectorPanel.cs:666-696`, iterating
+> `TagManager.Tags` / `LayerManager.DefinedLayers()`) have NO "Add Tag…/Add Layer…" entry. A real management
+> window EXISTS (`Panels/TagsLayersPanel.cs:26`, Window > Tags & Layers) but is not linked from the dropdowns.
+> EF7 = add an "Add Tag…"/"Add Layer…" item at the bottom of each dropdown that opens the Tags & Layers panel
+> (find how other code opens a registered window — likely `EditorWindows`/`panels.Show(key)` or a Window-menu
+> path; mirror EF12's `EditorLayout` key usage). EF8 (after) then splits the Layer Collision Matrix out of
+> that panel. Non-GPU/logic chunk; verify via build + a human screenshot in the batched set.
+>
+> **EF10b note (kept for reference):** the top-of-inspector component-LIST search is in. `DrawEntityInspector` now
 > draws a conditional search box ABOVE the first component header (after Transform): shown only when the
 > entity carries more than `InspectorLayout.ComponentSearchThreshold` (=6) components, via the SAME reusable
 > `EditorWidgets.SearchField` EF10a landed (no new widget). The query is a single inspector-owned
@@ -386,7 +428,7 @@ this same handoff for the chunk after it.
 - [x] EF11 — adaptive label column + slider value legibility — `Row`/`RowWithTooltip` route their label through `DrawRowLabel` → `InspectorLayout.DrawLabelCell` (ellipsis + full-text/`[Tooltip]` hover), column width = `GetContentRegionAvail().X` at the label cell (works for both the proportional top-level grid AND the fixed nested grid → top-level `BeginGrid` untouched, depth-0 short labels visually equivalent). Resolved the EF16 double-indent trap (removed the manual `Indent`, `DrawLabelCell` owns it; deleted `LabelDepthIndent`) + tightened the ellipsize budget to `columnWidth − indent − gap`. Slider value legibility: new `EditorTheme.SliderGrabRest` (darkened amber) pushed as `SliderGrab` around the `##v` slider in both adapters (`ImGuiComponentGui`/`ImGuiVolumeGui`), scoped → global EF5 accent untouched. Build 0-error (Editor clean; the only failure is the user's in-progress DX12 `AoResult`→`SsaoResult` rename — not mine), oracle EXIT=0. Visual verify batched into the Inspector-layout set.
 - [x] EF10a — per-component member search (conditional) — `DrawMemberList` precomputes `visibleMembers` (post-`[ShowIf]`) once → drives both the threshold and the filter; a conditional search box (>`InspectorLayout.MemberSearchThreshold`=12 members) drawn above the grid via the NEW reusable `EditorWidgets.SearchField`; query state per-component-instance in a `ConditionalWeakTable<object,StrBox>` (GC-safe). Filter matches the DISPLAYED label (`MemberLabel` = `[LabelText] ?? Prettify(Name)`); precomputed `groupsWithMatch`/`headersWithMatch` hide `[FoldoutGroup]`/`[Header]` sections with no match. Draw-loop body reordered so chrome is decoupled from the member's own match (group-skip → space/header on section visibility → member's own `MemberVisible` last). No query → byte-identical. Validated on `VehicleController` ("steer" → only the 6 steer fields + their headers). Build 0-error, oracle EXIT=0.
 - [x] EF10b — component-list search (conditional) — `DrawEntityInspector` draws a conditional search box above the first component header (after Transform), shown only when the entity has >`InspectorLayout.ComponentSearchThreshold`(=6) components, via the EF10a `EditorWidgets.SearchField`; query is a single inspector-owned `componentListSearch` field (one list per shown entity → no per-instance keying needed). The `foreach (Behaviour ...)` loop gained a `ComponentMatch(b)` gate filtering on the DISPLAYED title (`Prettify(b.GetType().Name)`, the same string `ComponentHeader` shows, OrdinalIgnoreCase). The per-type `typeIndex` counter increments BEFORE the skip so hiding a filtered component never shifts a visible sibling's Nth-of-type index (prefab-override + multi-select keying). Transform is outside `behaviours` → never filtered/counted. No query → byte-identical. Touched `InspectorPanel.cs` + `InspectorLayout.cs` (added `ComponentSearchThreshold=6`). Build 0-error, oracle EXIT=0.
-- [ ] EF15 — collection reorder/clear + polymorphic list serialize + round-trip test
+- [x] EF15 — collection reorder/clear + polymorphic list serialize + round-trip test — TWO halves landed. (1) **Serialize fix (RW8):** `SerializeMemberValue` now routes a `[SerializeReference]` collection whose element type is a polymorphic BASE (abstract/interface or concrete-base, via new `IsPolymorphicElementMember`/`SequenceElementType`/`IsLeafElementType`) through a new `SerializeSequencePolymorphic` that emits a per-element `$type` (the scalar `SerializeReferenceInstance` path, per element); non-polymorphic lists (`List<int>`/`List<Material>`) stay on `SerializeValue` → byte-identical. (2) **Deserialize gate relaxed:** `TryDeserializeReferenceInstance` now also fires for a recursed element (`member==null`) when the raw carries a `$type` tag AND `targetType` is a polymorphic base (new `IsPolymorphicBaseTarget`) — the symmetric inverse of the serialize side (the handoff's "deserialize already ready" was wrong: the old `member==null` branch returned false at the `Classify==Polymorphic` gate). (3) **Editor UI:** `DrawCollectionSlot` gained per-element reorder up/down (`CollectionMove`, adjacent swap, disabled at ends), insert-above (`CollectionInsertAt`), and a header **Clear** (`CollectionClear`) beside Add; Remove/Add already existed. New `EditorIcons.ChevronUp` (lucide `U+E074`, inside the baked range — verified via the TTF cmap, zero tofu). All structural edits are one-undo `EditorCommands.Structural`, deferred past the row loop. (4) **Oracle = new suite #19** `Polymorphic collections (RW8/EF15)` (20 checks): interface `List<IDamageModifier>` + abstract `Shape[]` with ≥2 concrete types each + a nested polymorphic element; asserts (a) all concrete types + values + ORDER round-trip, (b) byte-stable across two serializations + a serialize/deserialize/serialize fixed point, (c) a non-polymorphic `List<int>` alongside is byte-identical (exactly 6 `$type` tags, zero from the plain list). Build 0-error (engine ROOT csproj + Editor, clean scratch dirs), oracle EXIT=0 (19 suites). Serialize half is CPU/headless/safe; the reorder UI is the only part needing a human screenshot → batch into the Inspector-layout set (GPU-hang rule: no relaunch-loop).
 - [ ] EF7 — Tag/Layer "Add…" → open Tags & Layers panel
 - [ ] EF8 — split Layer Collision Matrix into its own panel
 - [ ] EF13+EF14 — hierarchy collapse/expand + collapsed-by-default
