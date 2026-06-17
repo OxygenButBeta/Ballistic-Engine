@@ -182,6 +182,13 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable {
         Matrix4x4.Invert(proj, out Matrix4x4 invProj);
         var pf = ctx.PostFX;
         int fi = ssgiFrame++ & 1023;
+        // chunk 11 (step-G collapse): publish the POST-increment grain counter into ctx so the composite reads
+        // the freshly-produced value within the SINGLE graph.Execute (GI event 500 runs before Composite 700).
+        // Was the orchestrator's `ctx.GrainFrame = giPass.SsgiFrame` line between the old GI/Composite windows;
+        // when GI is Off the pass doesn't run, so the orchestrator still seeds ctx.GrainFrame = giPass.SsgiFrame
+        // (un-incremented) before Execute. Deterministic capture freezes grain to 0 regardless, so this is
+        // live-path-only — but kept exact to avoid a silent off-by-one in the grain animation phase.
+        ctx.GrainFrame = ssgiFrame;
         float preExp = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
             System.Globalization.CultureInfo.InvariantCulture, out float e) ? e : 1.0e-5f;
         float invPreExp = preExp > 0f ? 1f / preExp : 0f;

@@ -1392,39 +1392,35 @@ public sealed class DX12HDRenderer : HDRenderer {
             GiMode = giMode,
         };
 
-        // === PHASE-1 PASS-GRAPH — the MAIN window (chunk 10 COLLAPSE). Every pre-composite pass is now an
-        // IRenderPass, so the five chunk-5..9 event windows merge into ONE Execute over [OpaqueLighting, Fog):
-        // Deferred (300) → Sky (350) → AP (400) → Transparents (450) → GI (500), in event order — the exact
-        // inline sequence. Each pass emits its OWN head transition (R2); the giMode resolve / no-RT downgrade /
-        // WarnNoRtOnce stayed in the orchestrator above (they set ctx.GiMode, which Dx12GiPass.Enabled reads).
-        // The GI pass internally does the Off/SSGI/RT-GI mode branch + the EnsureRtGi-fail → DrawSsgi fallback +
-        // the shared SsgiResolveAndCombine tail (folding in the chunk-6 deferred SSGI move). The window stops
-        // short of Fog (550) so the still-inline NORT raster-probe diagnostic runs at its canonical slot
-        // (after GI, before Fog) exactly as the old inline DrawRasterProbeMeasure call did. ===
-        graph.Execute(ctx, (int)Dx12RenderPassEvent.OpaqueLighting, (int)Dx12RenderPassEvent.Fog);
+        // Seed the film-grain counter with the un-incremented GI-pass value (covers the GI-Off case, where the
+        // GI pass doesn't run to overwrite it). When GI runs, FillSsgiConstants overwrites ctx.GrainFrame with
+        // the POST-increment value during the GI pass's Record (GI event 500 < Composite 700, so the composite
+        // sees the fresh value within the single Execute below). Grain is frozen to 0 under deterministic
+        // capture regardless — this is the live-path counter only.
+        ctx.GrainFrame = giPass.SsgiFrame;
+
+        // === PHASE-1 PASS-GRAPH — STEP G COLLAPSE (chunk 11): the THREE chunk-5..10 event windows merge into ONE
+        // full-range graph.Execute(ctx). Every non-core pass is an IRenderPass, so the graph runs the entire
+        // event-ordered list in a single call: Deferred (300) → Sky (350) → AP (400) → Transparents (450) →
+        // GI (500) → Fog (550) → Reflections (600) → SSAO/TAA/FSR (PostProcess 650) → Composite (700) — the exact
+        // inline frame sequence the event sort reproduces. Each pass emits its OWN head transition (R2); the
+        // giMode resolve / no-RT downgrade / WarnNoRtOnce stayed in the orchestrator above (they set ctx.GiMode,
+        // which Dx12GiPass.Enabled reads). The Composite pass (event 700, last) reads the resolved ctx.SceneColor
+        // after the TAA/FSR resolve (TaaPass/FsrPass at 650 set it). ===
+        graph.Execute(ctx);
 
         // P7.2a NO-RT RASTER PROBE measurement (BALLISTIC_DX12_NORT_PROBES=1): render ONE probe (6 cube faces) at
         // the camera + time it — the go/no-go gate before any grid wiring. Independent of giMode/RT (pure raster);
         // off by default (never in the verification matrix). _DEBUG=1 blits the albedo cube into the GI pass's
-        // ssgiTarget (giPass.SsgiTarget) so the GI-isolate capture shows it. Standalone; no grid. Stays inline
-        // (it reaches deep into the orchestrator's geometry helpers — not a leaf-post pass).
+        // ssgiTarget (giPass.SsgiTarget) so the GI-isolate capture shows it. STEP G: moved here AFTER the full
+        // graph (was in the old gap between the GI and Fog windows). It's a STANDALONE measurement — it leaves
+        // ssgiTarget untouched unless _DEBUG, and ssgiTarget is GI-pass-private scratch nothing downstream reads
+        // (the GI pass already composited it into SceneColor during its Record), so its position relative to
+        // Fog/Reflections/Composite is irrelevant. It reuses srvVisible (Reset) + the CBV ring — both
+        // orchestrator-owned, touched by no graph pass — so no ordering hazard with the collapsed graph. Stays
+        // inline (it reaches deep into the orchestrator's geometry helpers — not a leaf-post pass). Default path
+        // (NORT off) is byte-identical: the diagnostic isn't even called.
         if (NortProbesEnabled) DrawRasterProbeMeasure(camPos);
-
-        // === PHASE-1 PASS-GRAPH — Fog → Composite window. Runs Fog (550) → Reflections (600) → SSAO/TAA/FSR
-        // (PostProcess 650) in event order. The Reflections pass internally does the RT-vs-SSR branch + the
-        // EnsureRtReflections-fail / !sceneAS.Valid → DrawSsr fallback (chunk 10 — it extracts the SSR resources
-        // chunk 5 deferred here). Fog runs at its canonical slot (after GI/SSGI, before Reflections/SSR — running
-        // it after SSR would change the fog-active image, measured 1884px in chunk 5). The window stops short of
-        // Composite (700) so the Composite pass reads the resolved ctx.SceneColor after the TAA/FSR resolve. ===
-        graph.Execute(ctx, (int)Dx12RenderPassEvent.Fog, (int)Dx12RenderPassEvent.Composite);
-
-        // === PHASE-1 PASS-GRAPH — Composite window (chunk 7). DrawComposite is Dx12CompositePass.Record at the
-        // Composite event (700); it runs AFTER the SSAO/TAA/FSR window so it reads the resolved ctx.SceneColor
-        // (fsrOutput when upscaling — set by FsrPass; target natively — written by TaaPass). GrainFrame is
-        // refreshed here from the LIVE GI-pass grain counter (the GI pass incremented ssgiFrame after ctx was
-        // built) — the composite reads it for the non-deterministic film-grain phase only. ===
-        ctx.GrainFrame = giPass.SsgiFrame;
-        graph.Execute(ctx, (int)Dx12RenderPassEvent.Composite, int.MaxValue);
 
         // Editor display path: leave the LDR composite in PixelShaderResource so the editor's ImGui pass can
         // sample it via SceneColorHandle/GameColorHandle THIS frame. The player (PresentToScreen) keeps it in

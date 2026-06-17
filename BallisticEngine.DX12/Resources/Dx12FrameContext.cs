@@ -110,8 +110,10 @@ public sealed class Dx12FrameContext {
     public bool   RtShadowsThisFrame { get; set; }
     public GiMode GiMode             { get; set; }
 
-    // The film-grain animation counter (DX12HDRenderer.ssgiFrame). SSGI increments it AFTER ctx is built, so
-    // the orchestrator refreshes it just before the PostProcess/Composite window — the composite reads it for
-    // the non-deterministic grain phase only (frozen under DeterministicCapture). Settable for that refresh.
+    // The film-grain animation counter (DX12HDRenderer.ssgiFrame). The orchestrator SEEDS it with the
+    // un-incremented giPass.SsgiFrame just before the single graph.Execute (covers the GI-Off case); when GI
+    // runs, FillSsgiConstants overwrites it with the POST-increment value during the GI pass's Record (GI event
+    // 500 < Composite 700, so the composite sees the fresh value within one Execute — chunk 11 step-G collapse).
+    // The composite reads it for the non-deterministic grain phase only (frozen to 0 under DeterministicCapture).
     public int GrainFrame { get; set; }
 }
