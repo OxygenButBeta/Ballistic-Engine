@@ -51,6 +51,35 @@ internal static class EditorTheme {
 
     public const float RowAccentBarWidth = 2.5f;   // left sliver width (px, pre-scale — small on purpose)
 
+    // --- Surface PALETTE (RW3) -------------------------------------------------------------------------
+    // Single source for the graphite elevation ramp that ImGuiController.ApplyColors hand-derives as LOCALS.
+    // RW3's in-viewport toolbar overlay (and the eventual E1 centralized theme) read these so the chrome
+    // matches the panels WITHOUT re-typing hex constants in two places — the exact "koddan elle tanımlama"
+    // duplication the rework fights. Values mirror ApplyColors' bg0..titleBg ramp byte-for-byte; if that ramp
+    // is retuned, retune here too (a future E1 step folds ApplyColors onto these so they can't drift).
+    public static readonly SysVec4 Bg0         = Rgb(0x1A1C20);   // window background — base graphite
+    public static readonly SysVec4 Bg1         = Rgb(0x212429);   // child / popup — raised surface
+    public static readonly SysVec4 Bg2         = Rgb(0x282C32);   // frames (inputs)
+    public static readonly SysVec4 Bg3         = Rgb(0x343943);   // hovered frames
+    public static readonly SysVec4 HeaderBg    = Rgb(0x2C313A);   // collapsing headers / selected tabs
+    public static readonly SysVec4 Text        = Rgb(0xECEEF2);   // bright primary text
+    public static readonly SysVec4 TextDim     = Rgb(0x848C99);   // disabled / secondary text
+    public static readonly SysVec4 Border      = Rgb(0x0E1013);   // seam where one is still wanted
+    public static readonly SysVec4 BorderLight = Rgb(0x383E48);   // subtle inner dividers
+    public static readonly SysVec4 TitleBg     = Rgb(0x15171A);   // title bars
+
+    // In-viewport toolbar chrome (RW3 E7). The overlay floats OVER the 3D image, so it needs its own
+    // translucent surface + pill so the controls read against any scene. Tuned off the ramp above.
+    public static readonly SysVec4 OverlayBg   = new(0.102f, 0.110f, 0.125f, 0.82f);  // ~Bg0 @ 0.82 — pill backing
+    public static readonly SysVec4 OverlayPill = new(0.0f, 0.0f, 0.0f, 0.30f);        // segmented-control backing
+    public static readonly SysVec4 OverlayBorder = new(1f, 1f, 1f, 0.07f);            // hairline around the pill
+    public const float OverlayRounding = 7f;   // pill corner radius (px, pre-scale)
+    public const float OverlayMargin   = 10f;  // gap from the viewport edges (px, pre-scale)
+
     // Convenience: PushFont(Header) for the duration of a using-less call site is awkward, so callers do
     // ImGui.PushFont(EditorTheme.Header); ...; ImGui.PopFont() directly. No wrapper needed.
+
+    // Local hex helper so the palette can be authored as 0xRRGGBB without depending on ImGuiController.
+    static SysVec4 Rgb(int hex) => new(
+        ((hex >> 16) & 0xFF) / 255f, ((hex >> 8) & 0xFF) / 255f, (hex & 0xFF) / 255f, 1f);
 }

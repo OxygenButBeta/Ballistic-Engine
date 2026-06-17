@@ -51,6 +51,14 @@ internal static class EditorIcons {
     public const string Maximize = "";  // lucide maximize (U+E116)
     public const string Minimize = "";  // lucide minimize (U+E11E)
 
+    // RW3 E9 — the three Scene-view debug toggles used to share the SAME map-pin glyph (Pin), so the
+    // component-gizmos / light-probe / reflection-probe buttons were visually indistinguishable. Give the
+    // two probe toggles their own meaning by reusing ALREADY-BAKED glyphs (Lightbulb = light probes, Cloud
+    // = reflection/environment probes); component gizmos keep Pin. No new codepoints (zero tofu risk —
+    // every glyph here is one ImGuiController already merges from lucide.ttf).
+    public const string ProbeLight = Lightbulb;   // light-probe debug toggle
+    public const string ProbeReflection = Cloud;  // reflection-probe debug toggle
+
     // The contiguous glyph range to bake (smallest..largest of the codepoints above), used by
     // ImGuiController when merging lucide.ttf. Keep in sync if icons outside this range are added.
     public const int RangeLow = 0xE04C;

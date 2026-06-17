@@ -1089,9 +1089,9 @@ internal sealed class EditorApplication {
             ImGui.Dummy(new SysVec2(1, 0));
         }
 
-        ImGui.SameLine(0, 24 * S);
-        GizmoModeToolbar();
-
+        // RW3 E7: the gizmo Move/Rotate/Scale + Pivot/Center group moved OUT of this cramped top app bar
+        // into the in-viewport overlay (DrawSceneViewToolbar). The top bar now carries only the app-level
+        // controls (scene name, undo/redo, transport, save) — scene-manipulation tools live on the 3D view.
         ImGui.SameLine(0, 24 * S);
         UndoRedoToolbar();
 
@@ -1226,32 +1226,9 @@ internal sealed class EditorApplication {
             ImGui.PopStyleColor();
     }
 
-    // Move/Rotate/Scale as a segmented control: one dark backing pill, accent on the active mode.
-    void GizmoModeToolbar() {
-        float h = ImGui.GetFrameHeight();
-        float bw = 62 * S;
-        SysVec2 start = ImGui.GetCursorScreenPos();
-        ImGui.GetWindowDrawList().AddRectFilled(
-            start - new SysVec2(3 * S, 3 * S),
-            start + new SysVec2(bw * 3 + 4 + 3 * S, h + 3 * S),
-            ImGui.GetColorU32(new SysVec4(0, 0, 0, 0.30f)), 6f);
-
-        GizmoModeButton("Move", GizmoMode.Translate, bw, "Move (W)");
-        ImGui.SameLine(0, 2);
-        GizmoModeButton("Rotate", GizmoMode.Rotate, bw, "Rotate (E)");
-        ImGui.SameLine(0, 2);
-        GizmoModeButton("Scale", GizmoMode.Scale, bw, "Scale (R)");
-
-        // Pivot / Center toggle as a plain labelled button on the LEFT (no icon), next to the gizmo
-        // mode buttons — the user wanted it here, not as a right-side icon in the viewport bar.
-        ImGui.SameLine(0, 10 * S);
-        bool isPivot = gizmo.Pivot == GizmoPivot.Pivot;
-        if (ImGui.Button(isPivot ? "Pivot" : "Center", new SysVec2(bw * 1.3f, h)))
-            gizmo.Pivot = isPivot ? GizmoPivot.Center : GizmoPivot.Pivot;
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip(isPivot ? "Handle at the entity's pivot (click for Center)"
-                                     : "Handle at the selection's center (click for Pivot)");
-    }
+    // (RW3 E7: the Move/Rotate/Scale + Pivot/Center group moved to the in-viewport overlay —
+    // DrawSceneViewToolbar. GizmoModeButton (below) is still the segmented-control button, now called
+    // from the overlay instead of a top-bar GizmoModeToolbar.)
 
     // ---- Viewport (Scene / Game tabs) ----------------------------------------
 
@@ -1335,8 +1312,10 @@ internal sealed class EditorApplication {
 
         // Shading-mode dropdown: the engine's Shaded / Wireframe / Normals / Depth PLUS the editor-only
         // extra views (AO / Lit / Luminance) that live in EditorDebugViews (never in a player build).
-        // In both the Scene and Game bars; per-view popup id so they don't collide.
-        {
+        // RW3 E8: SCENE VIEW ONLY now — the Game view is the player's-eye output, so the editor-only debug
+        // views (AO/Lit/Luminance + GI-isolate) belong on the Scene view, not the Game view (where they'd
+        // misrepresent what the shipped game shows). Per-view popup id kept for safety.
+        if (id == "scene") {
             var engineNames = new[] { "Shaded", "Wireframe", "Normals", "Depth" };
             int extra = HDRenderer.EditorExtraDebugMode;
             string current = extra != 0
@@ -1382,61 +1361,11 @@ internal sealed class EditorApplication {
             }
         }
 
-        if (id == "scene") {
-            EditorPrefs prefs = EditorPrefs.Current;
-
-            // Snap indicator chip.
-            var snapOn = ImGui.GetIO().KeyCtrl;
-            RightAlign(ImGui.CalcTextSize("Snap").X);
-            ImGui.AlignTextToFramePadding();
-            if (snapOn)
-                ImGui.TextColored(ImGui.GetStyle().Colors[(int)ImGuiCol.CheckMark], "Snap");
-            else
-                ImGui.TextDisabled("Snap");
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("Hold Ctrl while dragging a gizmo to snap.");
-
-            // Gizmo space toggle: globe = world axes, cube = the object's local axes.
-            var world = gizmo.Space == GizmoSpace.World;
-            var spaceIcon = world ? EditorIcons.World : EditorIcons.Package;
-            RightAlign(ImGui.CalcTextSize(spaceIcon).X + pad2);
-            if (EditorIcons.GhostButton("gizmospace", spaceIcon,
-                    world ? "Gizmo space: World (click for Local)" : "Gizmo space: Local (click for World)"))
-                gizmo.Space = world ? GizmoSpace.Local : GizmoSpace.World;
-
-            // (Pivot/Center moved to a labelled button in the main toolbar, next to Move/Rotate/Scale.)
-
-            // Component gizmos toggle.
-            RightAlign(ImGui.CalcTextSize(EditorIcons.Pin).X + pad2);
-            var gizmosBefore = showGizmos;
-            ToggleIconButton("gizmostoggle", EditorIcons.Pin, ref showGizmos, "Component gizmos");
-            if (gizmosBefore != showGizmos) { prefs.ShowGizmos = showGizmos; EditorPrefs.Save(); }
-
-            // Grid toggle.
-            RightAlign(ImGui.CalcTextSize(EditorIcons.Grid).X + pad2);
-            var grid = prefs.ShowGrid;
-            ToggleIconButton("gridtoggle", EditorIcons.Grid, ref grid, "Viewport grid");
-            if (grid != prefs.ShowGrid) { prefs.ShowGrid = grid; EditorPrefs.Save(); }
-
-            // Light-probe debug toggle: green = occupied / near geometry, red = empty air, for the
-            // implicit auto-fit volume — without selecting anything. Diagnoses probe density/placement.
-            RightAlign(ImGui.CalcTextSize(EditorIcons.Pin).X + pad2);
-            var probes = ProbeRenderState.ProbeShowAll;
-            ToggleIconButton("probetoggle", EditorIcons.Pin, ref probes,
-                ProbeRenderState.ProbeShowAll
-                    ? $"Light probes ({ProbeRenderState.ProbeOccupiedCount} occupied / {ProbeRenderState.ProbeTotalCount} total)"
-                    : "Light probes (debug)");
-            ProbeRenderState.ProbeShowAll = probes;
-
-            // Reflection-probe debug toggle: cyan = local cubemap cell, dim blue = skybox-fallback cell.
-            RightAlign(ImGui.CalcTextSize(EditorIcons.Pin).X + pad2);
-            var refl = ProbeRenderState.ReflectionShowAll;
-            ToggleIconButton("refltoggle", EditorIcons.Pin, ref refl,
-                ProbeRenderState.ReflectionShowAll
-                    ? $"Reflection probes ({ProbeRenderState.ReflectionCapturedCount} local / {ProbeRenderState.ReflectionTotalCount} total)"
-                    : "Reflection probes (debug)");
-            ProbeRenderState.ReflectionShowAll = refl;
-        }
+        // RW3 E7: the Scene-view-only controls (snap chip, World/Local space, component-gizmos, grid, and the
+        // light/reflection probe GI-debug toggles) moved OUT of this thin resolution bar into the in-viewport
+        // overlay (DrawSceneViewToolbar). They drove the same gizmo.Space / EditorPrefs / ProbeRenderState
+        // state — only their location changed. The resolution bar now carries only res / zoom / fps / stats /
+        // shading-mode, shared cleanly between the Scene and Game views.
 
         ImGui.Separator();
     }
@@ -1733,6 +1662,14 @@ internal sealed class EditorApplication {
         sceneViewHovered = ImGui.IsItemHovered();
         gameViewFocused = false;
         gameViewHovered = false;
+
+        // RW3 E7 — Unity-style IN-VIEWPORT toolbar: scene-manipulation tools (gizmo mode/pivot/space/snap)
+        // float as an overlay on the top-left of the 3D image; the visibility menu (grid/gizmos/probes) sits
+        // top-right. This declutters the cramped top app bar. Drawn AFTER the image so the overlay's child
+        // windows sit ON TOP (clicks land on the buttons, and a button row is never "image-hovered" → bare
+        // W/E/R don't fire under it). It does NOT change behaviour — same gizmo.Mode/Pivot/Space, same
+        // EditorPrefs.ShowGrid/ShowGizmos, same ProbeRenderState toggles — only their LOCATION moved.
+        DrawSceneViewToolbar(imageMin, imageSize);
 
         // A4: the scene-view hotkeys (gizmo mode W/E/R + Unity focus/clipboard F, Ctrl+Shift+F, Ctrl+C/V) now
         // route through the input router instead of two inline guard blocks. The two original blocks had DIFFERENT
@@ -2182,6 +2119,114 @@ internal sealed class EditorApplication {
         ImGui.PopStyleColor(active ? 2 : 3);
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip(tooltip);
+    }
+
+    // RW3 E7 — the in-viewport toolbar overlay. Two floating, auto-sized child windows pinned to the Scene
+    // image's top-left (tools) and top-right (visibility), drawn over the 3D view. Flags: no decoration / no
+    // docking / no nav / no saved-settings / no focus-on-appearing so the overlay never steals focus from the
+    // viewport or persists into the .ini layout. The styling reads from EditorTheme.Overlay* so the chrome
+    // matches the panels. Behaviour is the SAME state these controls always drove (gizmo / EditorPrefs /
+    // ProbeRenderState) — RW3 only relocates them out of the cramped top bar.
+    void DrawSceneViewToolbar(SysVec2 imageMin, SysVec2 imageSize) {
+        float margin = EditorTheme.OverlayMargin * S;
+        const ImGuiWindowFlags flags = ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.NoDocking |
+            ImGuiWindowFlags.NoNav | ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.NoFocusOnAppearing |
+            ImGuiWindowFlags.AlwaysAutoResize;
+
+        ImGui.PushStyleColor(ImGuiCol.WindowBg, EditorTheme.OverlayBg);
+        ImGui.PushStyleColor(ImGuiCol.Border, EditorTheme.OverlayBorder);
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, EditorTheme.OverlayRounding * S);
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 1f);
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new SysVec2(8 * S, 6 * S));
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new SysVec2(6 * S, 6 * S));
+
+        // ── LEFT: gizmo tools (Move/Rotate/Scale + Pivot/Center + World/Local + snap chip) ──────────────
+        ImGui.SetNextWindowPos(new SysVec2(imageMin.X + margin, imageMin.Y + margin), ImGuiCond.Always);
+        ImGui.SetNextWindowBgAlpha(EditorTheme.OverlayBg.W);
+        if (ImGui.Begin("##sceneToolsOverlay", flags)) {
+            // Move/Rotate/Scale segmented control on its own dark pill, mirroring the old top-bar group.
+            float bw = 58 * S;
+            float h = ImGui.GetFrameHeight();
+            SysVec2 pillStart = ImGui.GetCursorScreenPos();
+            ImGui.GetWindowDrawList().AddRectFilled(
+                pillStart - new SysVec2(3 * S, 3 * S),
+                pillStart + new SysVec2(bw * 3 + 4 * S + 3 * S, h + 3 * S),
+                ImGui.GetColorU32(EditorTheme.OverlayPill), 6f * S);
+            GizmoModeButton(EditorIcons.Add + " Move", GizmoMode.Translate, bw, "Move (W)");
+            ImGui.SameLine(0, 2 * S);
+            GizmoModeButton(EditorIcons.Refresh + " Rotate", GizmoMode.Rotate, bw, "Rotate (E)");
+            ImGui.SameLine(0, 2 * S);
+            GizmoModeButton(EditorIcons.Maximize + " Scale", GizmoMode.Scale, bw, "Scale (R)");
+
+            // Pivot / Center.
+            ImGui.SameLine(0, 10 * S);
+            bool isPivot = gizmo.Pivot == GizmoPivot.Pivot;
+            if (ImGui.Button(isPivot ? "Pivot" : "Center", new SysVec2(58 * S, h)))
+                gizmo.Pivot = isPivot ? GizmoPivot.Center : GizmoPivot.Pivot;
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(isPivot ? "Handle at the entity's pivot (click for Center)"
+                                         : "Handle at the selection's center (click for Pivot)");
+
+            // World / Local gizmo space.
+            ImGui.SameLine(0, 6 * S);
+            bool world = gizmo.Space == GizmoSpace.World;
+            string spaceIcon = world ? EditorIcons.World : EditorIcons.Package;
+            if (EditorIcons.GhostButton("ovgizmospace", spaceIcon,
+                    world ? "Gizmo space: World (click for Local)" : "Gizmo space: Local (click for World)"))
+                gizmo.Space = world ? GizmoSpace.Local : GizmoSpace.World;
+
+            // Snap indicator chip (lit while Ctrl is held — hold Ctrl to snap a drag).
+            ImGui.SameLine(0, 8 * S);
+            ImGui.AlignTextToFramePadding();
+            bool snapOn = ImGui.GetIO().KeyCtrl;
+            if (snapOn) ImGui.TextColored(EditorPrefs.Current.Accent, $"{EditorIcons.Grid} Snap");
+            else { ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.TextDim); ImGui.Text($"{EditorIcons.Grid} Snap"); ImGui.PopStyleColor(); }
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Hold Ctrl while dragging a gizmo to snap.");
+        }
+        ImGui.End();
+
+        // ── RIGHT: visibility menu (grid / gizmos / GI-debug probes) ─────────────────────────────────────
+        EditorPrefs prefs = EditorPrefs.Current;
+        ImGui.SetNextWindowPos(new SysVec2(imageMin.X + imageSize.X - margin, imageMin.Y + margin),
+            ImGuiCond.Always, new SysVec2(1f, 0f));   // pivot top-right
+        ImGui.SetNextWindowBgAlpha(EditorTheme.OverlayBg.W);
+        if (ImGui.Begin("##sceneVisibilityOverlay", flags)) {
+            if (EditorIcons.GhostButton("ovvisibility", $"{EditorIcons.Eye} {EditorIcons.ChevronDown}",
+                    "Visibility: grid, gizmos, GI-debug overlays"))
+                ImGui.OpenPopup("##visibilitymenu");
+            if (ImGui.BeginPopup("##visibilitymenu")) {
+                ImGui.TextDisabled("Show in Scene");
+                ImGui.Separator();
+
+                bool grid = prefs.ShowGrid;
+                if (ImGui.MenuItem($"{EditorIcons.Grid}  Grid", (string)null, grid)) {
+                    prefs.ShowGrid = !grid; EditorPrefs.Save();
+                }
+                bool giz = showGizmos;
+                if (ImGui.MenuItem($"{EditorIcons.Pin}  Component Gizmos", (string)null, giz)) {
+                    showGizmos = !giz; prefs.ShowGizmos = showGizmos; EditorPrefs.Save();
+                }
+
+                ImGui.Separator();
+                ImGui.TextDisabled("GI Debug");
+                bool probes = ProbeRenderState.ProbeShowAll;
+                string probeHint = probes
+                    ? $" ({ProbeRenderState.ProbeOccupiedCount} occupied / {ProbeRenderState.ProbeTotalCount} total)" : "";
+                if (ImGui.MenuItem($"{EditorIcons.ProbeLight}  Light Probes{probeHint}", (string)null, probes))
+                    ProbeRenderState.ProbeShowAll = !probes;
+                bool refl = ProbeRenderState.ReflectionShowAll;
+                string reflHint = refl
+                    ? $" ({ProbeRenderState.ReflectionCapturedCount} local / {ProbeRenderState.ReflectionTotalCount} total)" : "";
+                if (ImGui.MenuItem($"{EditorIcons.ProbeReflection}  Reflection Probes{reflHint}", (string)null, refl))
+                    ProbeRenderState.ReflectionShowAll = !refl;
+                ImGui.EndPopup();
+            }
+        }
+        ImGui.End();
+
+        ImGui.PopStyleVar(4);
+        ImGui.PopStyleColor(2);
     }
 
     // Runs on the render thread once the startup asset import completes. Routes the startup scene
