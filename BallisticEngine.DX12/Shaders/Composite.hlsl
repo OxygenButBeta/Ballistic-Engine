@@ -16,7 +16,7 @@ cbuffer CompositeConstants : register(b0) {
     float LegacyMul;      // PostProcessSettings.Exposure (raw manual multiplier on top of EV; 1 = untouched)
     // row 1
     float Compensation;   // exposure compensation in stops (Automatic mode applies it on top of the metered EV)
-    float UseAo;          // > 0.5 = multiply by the SSAO texture
+    float _padAo;         // (was UseAo) AO now multiplies the IBL ambient in deferred lighting, not the final HDR
     float Tonemap;        // 0 = AgX (default), 1 = ACES (BALLISTIC_DX12_TONEMAP=aces A/B door)
     float Contrast;       // 1 = neutral; midtone contrast around 0.5
     // row 2
@@ -40,7 +40,6 @@ cbuffer CompositeConstants : register(b0) {
 Texture2D HdrColor : register(t0);
 Texture2D BloomTex : register(t1);
 Texture2D MeteredEv : register(t2);  // 1×1 metered EV100 (auto-exposure); Automatic mode only
-Texture2D AoTex    : register(t3);   // screen-space AO (1 = unoccluded); UseAo gates it
 SamplerState LinearClamp : register(s0);
 
 struct VSOut { float4 Position : SV_Position; float2 Uv : TEXCOORD0; };
@@ -120,8 +119,8 @@ float ResolveExposure() {
 // NEIGHBOUR pixels so every grade sample is post-tonemap — never mix raw HDR with tonemapped (NaN gotcha).
 float3 ToneMapAt(float2 uv, float exposure) {
     float3 hdr = HdrColor.SampleLevel(LinearClamp, uv, 0).rgb;
-    if (UseAo > 0.5)
-        hdr *= AoTex.SampleLevel(LinearClamp, uv, 0).r;   // forward AO approximation (before bloom glow)
+    // AO is no longer applied here — GTAO multiplies into the IBL ambient term in deferred lighting (the
+    // physically-correct, ambient-only layer), not into the final HDR colour (which darkened direct light too).
     if (BloomIntensity > 0.0)
         hdr += BloomTex.SampleLevel(LinearClamp, uv, 0).rgb * BloomIntensity;
     float3 exposed = max(hdr * exposure, 0.0);            // tonemappers want non-negative input

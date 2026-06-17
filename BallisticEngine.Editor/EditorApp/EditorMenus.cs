@@ -56,6 +56,8 @@ internal static class EditorMenus {
     [MenuItem("Window/Build", 22)] static void Build() => EditorWindows.Toggle(WindowKeys.Build);
     [MenuItem("Window/Tags & Layers", 23)] static void TagsLayers() => EditorWindows.Toggle(WindowKeys.TagsLayers);
     [MenuItem("Window/Settings", 24)] static void Settings() => EditorWindows.Toggle(WindowKeys.Settings);
+    // Standalone, self-managed window (no facade key needed) — toggles its own static open flag.
+    [MenuItem("Window/Render Pass Toggles", 26)] static void RenderPassToggles() => RenderPassTogglesWindow.Toggle();
 
     // ── Assets menu — the Unity-package importer self-registers here (was hand-listed in the Assets menu) ─
     [MenuItem("Assets/Import Unity Package...", 10)] static void ImportUnityPackage() =>

@@ -8,4 +8,8 @@ public sealed class Bloom : VolumeComponent {
 
     [Tooltip("HDR luminance above which pixels start to bloom (soft knee).")]
     public readonly ClampedFloatParameter threshold = new(1f, 0f, 8f);
+
+    [Tooltip("Soft-knee width below the threshold. Lower = harder cutoff (only bright spots bloom, " +
+             "no scene-wide glow); higher = softer ramp-in.")]
+    public readonly ClampedFloatParameter knee = new(0.5f, 0f, 2f);
 }

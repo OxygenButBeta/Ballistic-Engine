@@ -141,7 +141,11 @@ public static class TypeCache {
             // returned MethodInfos are always directly invokable.
             if (type.ContainsGenericParameters)
                 continue;
-            MethodInfo[] methods = type.GetMethods(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly);
+            // Include NonPublic: Unity-style [MenuItem] handler methods are conventionally `private static`
+            // (written without an access modifier, e.g. `[MenuItem("Window/Profiler")] static void Profiler()`).
+            // Without NonPublic the whole Window menu came up EMPTY — the discovery scan matched zero methods.
+            MethodInfo[] methods = type.GetMethods(
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.DeclaredOnly);
             foreach (MethodInfo method in methods)
                 if (method.IsDefined(attributeType, inherit: true))
                     result.Add(method);

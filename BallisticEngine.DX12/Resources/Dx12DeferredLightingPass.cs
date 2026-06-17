@@ -64,7 +64,8 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         public Vector2 ScreenSize;
         public Vector2 ClusterNearFar;
         public float UseRtShadows; public float SpecClamp;   // SpecClamp: max per-light specular luma (V2 firefly cap; 0 = off)
-        public float SpecAaStrength; public float Pad4, Pad5, Pad6;   // V2: geometric specular AA strength (0 = off)
+        public float SpecAaStrength; public float UseSsao;   // V2: geometric specular AA strength (0 = off); UseSsao: GTAO into ambient
+        public float Pad5, Pad6;
     }
 
     readonly Dx12Device dev;
@@ -72,7 +73,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
     ID3D12PipelineState deferredPso;
     ID3D12Resource deferredCb;
     unsafe byte* deferredCbMapped;
-    Dx12DescriptorHeap deferredSrvVisible;  // 13 SRVs copied per frame: G0..G3, depth, irradiance, prefilter, BRDF, shadow, cluster lights/grid/index, RT shadow mask
+    Dx12DescriptorHeap deferredSrvVisible;  // 14 SRVs copied per frame: G0..G3, depth, irradiance, prefilter, BRDF, shadow, cluster lights/grid/index, RT shadow mask, GTAO
 
     // BuildDeferredLighting moved VERBATIM into the ctor (re-rooted onto `dev`). clusteredLights stays
     // orchestrator-owned (the CPU froxel gather runs inline before deferred); the pass reads it via ctx.
@@ -80,9 +81,9 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         dev = device;
         var lightCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Pixel);
         var frameCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.Pixel);
-        // 13 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster lights/grid/index
-        // (t9..t11), RT shadow mask (t12).
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 13, baseShaderRegister: 0);
+        // 14 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster lights/grid/index
+        // (t9..t11), RT shadow mask (t12), GTAO (t13).
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 14, baseShaderRegister: 0);
         var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
         var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
@@ -110,7 +111,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         deferredCbMapped = deferredCb.Map<byte>(0);
         deferredSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 13, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 14, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
     // DrawDeferredLighting moved VERBATIM. Re-rooted onto ctx: view/viewProj/camPos/light from ctx; IBL/
@@ -157,12 +158,16 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
             // tunes it; =0 disables (byte-identical). Default 8000 (≈ a tenth of the sun radiance — outliers only).
             SpecClamp = specClampValue,
             SpecAaStrength = specAaValue,
+            // GTAO into the ambient term — on only when AO is actually rendered this frame (door + volume enable).
+            // Matches Dx12GtaoPass.Enabled so the t13 bind below holds the real AO target when this is 1.
+            UseSsao = ctx.Doors.Ssao && ctx.PostFX.SSAOEnabled ? 1f : 0f,
+            Pad6 = Environment.GetEnvironmentVariable("BALLISTIC_DX12_AO_DEBUG") == "1" ? 1f : 0f,  // TEMP-AO-DEBUG
         };
 
-        // Copy the 13 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster
-        // lights/grid/index (t9..t11), RT shadow mask (t12).
+        // Copy the 14 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster
+        // lights/grid/index (t9..t11), RT shadow mask (t12), GTAO (t13).
         deferredSrvVisible.Reset();
-        int b = deferredSrvVisible.AllocateRange(13);
+        int b = deferredSrvVisible.AllocateRange(14);
         // Only the 4 SHADED G-buffer RTs feed lighting (G0..G3 → t0..t3); the motion RT (RT4) is for TAA/FSR.
         for (int i = 0; i < Dx12GBuffer.ShadedRtCount; i++)
             dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + i), gbuffer.ColorSrvCpu(i), heapType);
@@ -177,6 +182,10 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         // RT shadow mask (t12) — the real mask when RT shadows ran this frame, else a valid unused fallback.
         dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 12),
             rtShadowMask != null ? rtShadowMask.ColorSrvCpu : gbuffer.DepthSrvCpu, heapType);
+        // GTAO (t13) — the blurred AO from Dx12GtaoPass (event 200, runs before this) when AO is on, else a
+        // valid unused fallback. UseSsao gates the sample, so the fallback's contents never affect the output.
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 13),
+            (ctx.Doors.Ssao && ctx.PostFX.SSAOEnabled) ? ctx.AoResult : gbuffer.DepthSrvCpu, heapType);
 
         target.RenderColorOnlyCleared(cl => {
             cl.SetGraphicsRootSignature(deferredRootSig);

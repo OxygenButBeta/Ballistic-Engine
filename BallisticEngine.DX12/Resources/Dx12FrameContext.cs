@@ -49,7 +49,11 @@ public sealed class Dx12FrameContext {
 
     // --- misc read-only frame state passes need (chunk 7: composite/TAA/FSR) ---
     public bool DeterministicCapture { get; init; }   // BALLISTIC_DETERMINISTIC=1 (freezes grain + exposure reset)
-    public CpuDescriptorHandle SsaoResult { get; init; }   // Dx12SsaoPass.ResultSrvCpu (blurred half-res AO) — composite samples it when Doors.Ssao
+    public CpuDescriptorHandle SsaoResult { get; init; }   // (legacy; unused since the GTAO rework) was Dx12SsaoPass output
+    // Dx12GtaoPass.ResultSrvCpu (blurred GTAO at the chosen AO resolution). The DEFERRED LIGHTING pass samples
+    // it and multiplies it into the IBL ambient term only (the physically-correct layer). A stable descriptor
+    // handle (gtaoA.ColorSrvCpu) — only its contents change per frame, so binding it at ctx build is correct.
+    public CpuDescriptorHandle AoResult { get; init; }
     // The resolved upscale/AA branch. TaaActive == PostFX.TaaEnabled && !FsrActive && !DeterministicCapture &&
     // !Minimal; FsrActive == the FSR mode is on. TAA + FSR are mutually exclusive. TaaPass runs in the native
     // path (Enabled=!FsrActive); even when TaaActive is false it resets the (pass-owned) history-valid flag.

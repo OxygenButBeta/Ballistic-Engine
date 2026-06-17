@@ -233,7 +233,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         cullParamMapped = cullParamUpload.Map<byte>(0);
 
         materials = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)(materialStride * 4096)), ResourceStates.GenericRead);
+            ResourceDescription.Buffer((ulong)((long)materialStride * MaxMaterials)), ResourceStates.GenericRead);
         materialsMapped = materials.Map<byte>(0);
     }
 
@@ -254,30 +254,57 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
 
         foreach (var r in wholeMesh) {
             Mesh mesh = r.SharedMesh; if (mesh is null) continue;
-            for (int s = 0; s < mesh.SubMeshes.Length; s++) {
-                Material mat = r.MaterialFor(s);
-                if (mat is null || mat.Transparent || materialIds.ContainsKey(mat)) continue;
-                int id = materialCount++;
-                materialIds[mat] = id;
-                bool hasMetal = mat.Metallic is not null, hasRough = mat.Roughness is not null;
-                var gm = new GpuMaterial {
-                    DiffuseIdx = (uint)Bindless(mat.Diffuse, TextureType.Diffuse),
-                    NormalIdx = (uint)Bindless(mat.Normal, TextureType.Normal),
-                    MetallicIdx = (uint)Bindless(mat.Metallic, TextureType.Metallic),
-                    RoughnessIdx = (uint)Bindless(mat.Roughness, TextureType.Roughness),
-                    AoIdx = (uint)Bindless(mat.AO, TextureType.AO),
-                    EmissiveIdx = (uint)Bindless(mat.Emissive, TextureType.Emissive),
-                    BaseColorFactor = ToNum(mat.BaseColorFactor),
-                    EmissiveFactor = new Vector4(mat.EmissiveColor.X, mat.EmissiveColor.Y, mat.EmissiveColor.Z, 0) * mat.EmissiveIntensity,
-                    Metallic = mat.MetallicFactor, Roughness = mat.RoughnessFactor,
-                    SpecularReflectance = mat.SpecularReflectance, NormalStrength = mat.NormalStrength,
-                    NormalFlipY = mat.NormalFlipY ? 1f : 0f, HasMetallicMap = hasMetal ? 1f : 0f,
-                    HasRoughnessMap = hasRough ? 1f : 0f, PackedOrm = mat.PackedOrm ? 1f : 0f,
-                    Cutout = mat.Cutout ? 1f : 0f, HasEmissive = mat.IsEmissive ? 1f : 0f,
-                };
-                *(GpuMaterial*)(materialsMapped + (long)id * materialStride) = gm;
-            }
+            for (int s = 0; s < mesh.SubMeshes.Length; s++)
+                RegisterMaterial(r.MaterialFor(s));
         }
+    }
+
+    // The bindless material table is sized for `MaxMaterials` GpuMaterial entries (AllocateBuffers).
+    const int MaxMaterials = 4096;
+
+    // Register one opaque material into the bindless table if it isn't there yet, writing its GpuMaterial
+    // (byte-identical decode to GBufferBindless.hlsl). No-op for null / transparent / already-present / table-
+    // full. Factored out of EnsureMaterialTable so the RT geometry build (Dx12RtGeometry) can resolve-or-
+    // register the SAME ids — see ResolveOrRegisterMaterialId.
+    unsafe void RegisterMaterial(Material mat) {
+        if (mat is null || mat.Transparent || materialIds.ContainsKey(mat) || materialCount >= MaxMaterials) return;
+        int id = materialCount++;
+        materialIds[mat] = id;
+        bool hasMetal = mat.Metallic is not null, hasRough = mat.Roughness is not null;
+        var gm = new GpuMaterial {
+            DiffuseIdx = (uint)Bindless(mat.Diffuse, TextureType.Diffuse),
+            NormalIdx = (uint)Bindless(mat.Normal, TextureType.Normal),
+            MetallicIdx = (uint)Bindless(mat.Metallic, TextureType.Metallic),
+            RoughnessIdx = (uint)Bindless(mat.Roughness, TextureType.Roughness),
+            AoIdx = (uint)Bindless(mat.AO, TextureType.AO),
+            EmissiveIdx = (uint)Bindless(mat.Emissive, TextureType.Emissive),
+            BaseColorFactor = ToNum(mat.BaseColorFactor),
+            EmissiveFactor = new Vector4(mat.EmissiveColor.X, mat.EmissiveColor.Y, mat.EmissiveColor.Z, 0) * mat.EmissiveIntensity,
+            Metallic = mat.MetallicFactor, Roughness = mat.RoughnessFactor,
+            SpecularReflectance = mat.SpecularReflectance, NormalStrength = mat.NormalStrength,
+            NormalFlipY = mat.NormalFlipY ? 1f : 0f, HasMetallicMap = hasMetal ? 1f : 0f,
+            HasRoughnessMap = hasRough ? 1f : 0f, PackedOrm = mat.PackedOrm ? 1f : 0f,
+            Cutout = mat.Cutout ? 1f : 0f, HasEmissive = mat.IsEmissive ? 1f : 0f,
+        };
+        *(GpuMaterial*)(materialsMapped + (long)id * materialStride) = gm;
+    }
+
+    // R1.0 (GI Pragmatic Revival) — robust per-submesh MaterialId for the RT geometry build. Dx12RtGeometry
+    // bakes one MaterialId per triangle so the DXR hit shaders decode the SAME material the raster G-buffer
+    // does. EnsureMaterialTable only registers WHOLE-MESH (SubMeshIndex<0) renderers, but the TLAS/rtGeometry
+    // trace EVERY active renderer (incl. SubMeshIndex>=0 split-import children). Those renderers' materials
+    // were absent from the table, so the old `TryMaterialId-or-0` fallback silently shaded their triangles
+    // with material 0 (the first whole-mesh material) — RT-GI/emissive/reflection bounce came out wrong/empty
+    // off color-only & split content while the raster G-buffer looked correct. This resolve-or-register makes
+    // every RT-traced submesh's material present (extending the live table; the next EnsureMaterialTable reset
+    // re-registers whole-mesh first, then rtGeometry's stamp-tracked rebuild re-adds these — ids stay
+    // consistent). Returns -1 for null/transparent (the caller leaves such triangles at id 0; transparent
+    // surfaces bounce negligibly and are skipped by the raster path too).
+    public int ResolveOrRegisterMaterialId(Material mat) {
+        if (mat is null || mat.Transparent) return -1;
+        if (materialIds.TryGetValue(mat, out int id)) return id;
+        RegisterMaterial(mat);
+        return materialIds.TryGetValue(mat, out id) ? id : -1;   // -1 only if the table was full
     }
 
     // RT exposure: the DXR GI/reflection hit shaders decode the hit material BYTE-IDENTICALLY to the raster
@@ -496,9 +523,11 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     // per-cascade depth draws. Mirrors the CPU shadow caster set EXACTLY (every submesh with IndexCount > 0,
     // no material filter — depth-only) so the shadow maps are byte-identical. Stores the slices for
     // DrawShadowCascade. cascadeMatrices = the 4 light-space view*proj matrices.
+    // activeCascades = how many cascades the volume selected (1..ShadowCascades); culls/draws only those.
     public unsafe void BuildShadowCull(ID3D12GraphicsCommandList4 cl, List<IStaticMeshRenderer> wholeMesh,
-                                       Matrix4x4[] cascadeMatrices) {
+                                       Matrix4x4[] cascadeMatrices, int activeCascades = ShadowCascades) {
         shadowSlices.Clear();
+        int cascades = Math.Clamp(activeCascades, 1, ShadowCascades);
         var byMesh = new Dictionary<Mesh, List<IStaticMeshRenderer>>();
         foreach (var r in wholeMesh) {
             Mesh m = r.SharedMesh; if (m is null) continue;
@@ -508,7 +537,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
 
         int total = 0, sliceCount = 0;
         var planes = new Vector4[6];
-        for (int c = 0; c < ShadowCascades; c++) {
+        for (int c = 0; c < cascades; c++) {
             ExtractPlanes(cascadeMatrices[c], planes);
             foreach (var kv in byMesh) {
                 if (sliceCount >= ShadowCascades * MaxGroups) break;

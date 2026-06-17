@@ -110,8 +110,14 @@ public sealed class Dx12RtGeometry : IDisposable {
     }
 
     // Per-triangle MaterialId: for each submesh, every triangle in [IndexStart/3, +IndexCount/3) gets the
-    // submesh material's GBuffer id (gpu.TryMaterialId). Triangles of transparent/unmapped submeshes get 0
-    // (they shade with material 0 — rare, and the bounce off a transparent surface is negligible).
+    // submesh material's GBuffer id, resolved the SAME way the raster G-buffer does — gpu.ResolveOrRegister-
+    // MaterialId (R1.0). EnsureMaterialTable registers only WHOLE-MESH (SubMeshIndex<0) renderers, but this
+    // build runs for EVERY active renderer the TLAS traces (incl. SubMeshIndex>=0 split-import children).
+    // Resolve-or-register makes each RT-traced submesh's material present in the table instead of the old
+    // silent `matId=0` fallback, which shaded those triangles with the FIRST whole-mesh material — the cause
+    // of wrong/empty RT-GI/emissive/reflection bounce off color-only & split content (the raster G-buffer was
+    // correct, the RT trace was not). Transparent/null materials resolve to -1 → triangle stays id 0 (the
+    // bounce off a transparent surface is negligible, and the raster path skips it too).
     unsafe void BuildTriMaterials(Mesh mesh, IStaticMeshRenderer r, Dx12GpuDrivenRenderer gpu,
                                   out ID3D12Resource buf, out int bindlessIdx) {
         int triCount = mesh.IndexBuffer.ElementCount / 3;
@@ -119,7 +125,8 @@ public sealed class Dx12RtGeometry : IDisposable {
         for (int sm = 0; sm < mesh.SubMeshes.Length; sm++) {
             SubMeshData sub = mesh.SubMeshes[sm];
             if (sub.IndexCount <= 0) continue;
-            if (!gpu.TryMaterialId(r.MaterialFor(sm), out int matId)) matId = 0;
+            int matId = gpu.ResolveOrRegisterMaterialId(r.MaterialFor(sm));
+            if (matId < 0) matId = 0;   // null/transparent/table-full → material 0 (negligible bounce)
             int triStart = sub.IndexStart / 3;
             int triEnd = Math.Min((sub.IndexStart + sub.IndexCount) / 3, triCount);
             for (int t = triStart; t < triEnd; t++) triMat[t] = (uint)matId;

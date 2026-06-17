@@ -758,6 +758,7 @@ internal sealed class EditorApplication {
             CurveEditorWindow.Draw(S);
             ComponentEditorWindow.Draw(S);
             UnityImportWindow.Draw(S);
+            RenderPassTogglesWindow.Draw(S);
             DrawUnsavedPrompt();
             return;
         }
@@ -832,6 +833,7 @@ internal sealed class EditorApplication {
         CurveEditorWindow.Draw(S);
         ComponentEditorWindow.Draw(S);   // standalone component window — was only drawn while fullscreen
         UnityImportWindow.Draw(S);
+        RenderPassTogglesWindow.Draw(S);
         DrawUnsavedPrompt();
 
         // Persist the layout whenever ImGui says it changed (drag/dock/resize/tab).
@@ -1371,17 +1373,10 @@ internal sealed class EditorApplication {
                     }
                 }
 
-                // GI ISOLATE: view ONE GI system's contribution at a time (forces the other two off),
-                // so you can see exactly how probes / reflections / Lumen each affect the scene.
-                ImGui.Separator();
-                ImGui.TextDisabled("GI Isolate");
-                var isolateNames = new[] { "All systems", "Only Light Probes", "Only Reflections", "Only Lumen" };
-                for (var i = 0; i < isolateNames.Length; i++) {
-                    if (ImGui.MenuItem(isolateNames[i], (string)null, (int)HDRenderer.EditorGiIsolate == i)) {
-                        HDRenderer.EditorGiIsolate = (HDRenderer.GiIsolate)i;
-                        editorState.MarkViewportDirty();
-                    }
-                }
+                // GI ISOLATE menu REMOVED (2026-06-17): the Lumen diffuse-GI stack is hard-disabled
+                // engine-wide, so isolating its contribution is meaningless. Force the (DX12-dead) isolate
+                // state back to None so nothing stale lingers.
+                HDRenderer.EditorGiIsolate = HDRenderer.GiIsolate.None;
                 ImGui.EndPopup();
             }
         }

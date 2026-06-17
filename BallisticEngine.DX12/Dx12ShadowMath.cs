@@ -10,9 +10,12 @@ public static class Dx12ShadowMath {
     // camView/camProj are the System.Numerics camera matrices (DX z[0,1]); lightTravelDir = the sun's
     // travel direction (from the light toward the scene = -toLight). Fills `matrices` (count = cascades)
     // + `depthRanges` (world depth extent per cascade, for bias scaling).
+    // cascadeCount = how many cascades to fit (1..matrices.Length); the volume's cascadeCount drives it. The
+    // extra array slots beyond cascadeCount are left as-is (the shader samples only CascadeCountF of them).
     public static void ComputeCascades(Matrix4x4 camView, Matrix4x4 camProj, Vector3 lightTravelDir,
-        float shadowDistance, int shadowMapSize, Matrix4x4[] matrices, float[] depthRanges, float lambda = 0.7f) {
-        int count = matrices.Length;
+        float shadowDistance, int shadowMapSize, Matrix4x4[] matrices, float[] depthRanges,
+        float lambda = 0.7f, int cascadeCount = 0) {
+        int count = cascadeCount > 0 ? Math.Min(cascadeCount, matrices.Length) : matrices.Length;
         float near = MathF.Max(shadowDistance * 0.02f, 0.3f);
         lambda = Math.Clamp(lambda, 0f, 1f);
 

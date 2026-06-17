@@ -1,11 +1,11 @@
 using System.Numerics;
 using BallisticEngine.DX12;
-using BallisticEngine.Rendering;   // BatchGroup<T>
+using BallisticEngine.Rendering; // BatchGroup<T>
 using Vortice.Direct3D;
 using Vortice.Direct3D12;
 using Vortice.Dxc;
 using Vortice.DXGI;
-using GLMatrix4 = System.Numerics.Matrix4x4;   // engine math is System.Numerics now; ToNumerics(...) is an identity copy
+using GLMatrix4 = System.Numerics.Matrix4x4; // engine math is System.Numerics now; ToNumerics(...) is an identity copy
 using GLVector3 = System.Numerics.Vector3;
 
 namespace BallisticEngine;
@@ -20,13 +20,17 @@ namespace BallisticEngine;
 // Drives shading via constant buffers + descriptor tables directly (NOT the GL per-name uniform API),
 // and uses NO reflection on the per-frame path (standing rule): it iterates a typed RuntimeSet and reads
 // typed properties only.
-public sealed class DX12HDRenderer : HDRenderer {
+public sealed class DX12HDRenderer : HDRenderer
+{
     readonly Dx12Device dev;
+
     // The backing device — exposed so the headless render path can drain the debug/GBV info queue at
     // end-of-frame (W2 validation baseline). Read-only; the renderer still owns the device's lifetime.
     public Dx12Device Device => dev;
-    Dx12OffscreenTarget target;       // HDR scene color (R16F) + depth — opaque/sky/fog render here
-    Dx12OffscreenTarget ldr;          // LDR composite output (R8) — readback/display reads this
+    Dx12OffscreenTarget target; // HDR scene color (R16F) + depth — opaque/sky/fog render here
+
+    Dx12OffscreenTarget ldr; // LDR composite output (R8) — readback/display reads this
+
     // targetW/targetH = the INTERNAL (render) resolution: the scene + all post passes render here. When FSR
     // is off this equals the output resolution. When FSR is on it's the (smaller) FSR render resolution and
     // the upscaler reconstructs outputW/outputH. ldr is always at output resolution.
@@ -36,11 +40,11 @@ public sealed class DX12HDRenderer : HDRenderer {
     // FSR temporal upscaling: render at targetW/H (internal) -> fsrOutput (output res). Replaces TAA when
     // active. fsrUnavailable latches if the native DLLs fail to load (clean checkout) so we stop retrying.
     Dx12FsrUpscaler fsr;
-    Dx12OffscreenTarget fsrOutput;    // HDR (R16F), output res, UAV-writable — FSR's reconstructed color
+    Dx12OffscreenTarget fsrOutput; // HDR (R16F), output res, UAV-writable — FSR's reconstructed color
     bool fsrActive;
     bool fsrUnavailable;
     UpscaleMode currentUpscaleMode = UpscaleMode.Off;
-    const float FovYRadians = 45f * (MathF.PI / 180f);   // matches the projection's vertical FOV
+    const float FovYRadians = 45f * (MathF.PI / 180f); // matches the projection's vertical FOV
 
     ID3D12RootSignature rootSig;
     ID3D12PipelineState pso;
@@ -60,11 +64,11 @@ public sealed class DX12HDRenderer : HDRenderer {
     // static mesh exactly. The bone matrices ride in a per-frame upload ring bound as a root SRV (t6).
     ID3D12RootSignature skinnedGbufferRootSig;
     ID3D12PipelineState skinnedGbufferPso;
-    ID3D12Resource boneMatrixRing;          // upload heap: transposed float4x4[] per skinned draw
+    ID3D12Resource boneMatrixRing; // upload heap: transposed float4x4[] per skinned draw
     unsafe byte* boneMatrixMapped;
-    int boneMatrixSlotSize;                  // bytes per skinned draw (maxBones * 64, 256-aligned)
-    int boneMatrixSlotCount;                 // skinned draws per frame ceiling
-    const int MaxBonesPerDraw = 256;         // skeleton bone ceiling for one skinned mesh
+    int boneMatrixSlotSize; // bytes per skinned draw (maxBones * 64, 256-aligned)
+    int boneMatrixSlotCount; // skinned draws per frame ceiling
+    const int MaxBonesPerDraw = 256; // skeleton bone ceiling for one skinned mesh
 
     // Motion vectors: a per-pass CBV (b1) shared by BOTH geometry passes (CPU GBuffer.hlsl + GPU-driven
     // GBufferBindless.hlsl) holding the UNJITTERED current + previous frame view*proj. The geometry PS
@@ -74,10 +78,17 @@ public sealed class DX12HDRenderer : HDRenderer {
     // per-object motion for animated/physics renderers is a follow-up (would bake a prev model per draw).
     ID3D12Resource motionCb;
     unsafe byte* motionCbMapped;
-    Matrix4x4 motionPrevViewProj;   // previous frame's UNJITTERED view*proj
+    Matrix4x4 motionPrevViewProj; // previous frame's UNJITTERED view*proj
     bool motionPrevValid;
+
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct MotionConstants { public Matrix4x4 ViewProjCur; public Matrix4x4 ViewProjPrev; public float NormalLodBias; public Vector3 PadMotion; }
+    struct MotionConstants
+    {
+        public Matrix4x4 ViewProjCur;
+        public Matrix4x4 ViewProjPrev;
+        public float NormalLodBias;
+        public Vector3 PadMotion;
+    }
 
     // Deferred lighting: deferredRootSig/Pso/Cb/SrvVisible + the LightConstants struct moved VERBATIM into
     // Resources/Dx12DeferredLightingPass.cs (chunk 9). The pass owns them; it runs at the OpaqueLighting event
@@ -96,9 +107,9 @@ public sealed class DX12HDRenderer : HDRenderer {
     // ping-pong history targets + the taaWriteB/taaHistoryValid state. Runs at PostProcess (after SSAO, before
     // composite) in the native path only (FSR replaces it). Was BuildTaa/AllocTaaTargets/DrawTaa.
     Dx12TaaPass taaPass;
-    Dx12FsrPass fsrPass;                // chunk 7: FSR dispatch (Record only); fsr/fsrOutput stay orchestrator-owned
-    int taaFrame;                       // jitter phase counter (shared by TAA + FSR; advanced in the frame tail)
-    Vector2 currentJitter;              // this frame's sub-pixel jitter (pixels) — exposed for FSR reuse
+    Dx12FsrPass fsrPass; // chunk 7: FSR dispatch (Record only); fsr/fsrOutput stay orchestrator-owned
+    int taaFrame; // jitter phase counter (shared by TAA + FSR; advanced in the frame tail)
+    Vector2 currentJitter; // this frame's sub-pixel jitter (pixels) — exposed for FSR reuse
 
     // SSR moved VERBATIM to Resources/Dx12ReflectionsPass.cs (chunk 10 — Event=Reflections 600; the SSR
     // rootsig/PSOs/CB/heap/targets + the SsrConstants struct + DrawSsr live there, alongside RT reflections as
@@ -118,24 +129,35 @@ public sealed class DX12HDRenderer : HDRenderer {
     // rtGeometry/ddgi were renderer fields). RT sun shadows (still inline core) + the GI pass + the Reflections
     // pass all reference it (the GI/Reflections passes via ctx.Dxr). Created once in Initialize.
     Dx12DxrShared dxr;
-    bool noRtWarned;                            // P7.0: log the no-RT downgrade once, not every frame
+
+    bool noRtWarned; // P7.0: log the no-RT downgrade once, not every frame
+
     // P7.0: one-time log when RayTraced GI/reflections/shadows are auto-downgraded for lack of HW ray tracing.
-    void WarnNoRtOnce() {
+    void WarnNoRtOnce()
+    {
         if (noRtWarned) return;
         noRtWarned = true;
-        Console.WriteLine("[DX12] No hardware ray tracing — RayTraced GI/reflections/shadows downgraded to screen-space fallbacks (SSGI/SSR/cascades).");
+        Console.WriteLine(
+            "[DX12] No hardware ray tracing — RayTraced GI/reflections/shadows downgraded to screen-space fallbacks (SSGI/SSR/cascades).");
     }
-    ID3D12RootSignature rtShadowRootSig;        // CBV(b0) + table{SRV t0 TLAS, t1 depth, t2 normal; UAV u0 mask}
+
+    ID3D12RootSignature rtShadowRootSig; // CBV(b0) + table{SRV t0 TLAS, t1 depth, t2 normal; UAV u0 mask}
     ID3D12StateObject rtShadowPso;
     ID3D12Resource rtShadowSbt, rtShadowCb;
     unsafe byte* rtShadowCbMapped;
-    Dx12OffscreenTarget rtShadowMask;           // full-res R8 (1 lit / 0 shadowed), UAV + SRV
-    Dx12DescriptorHeap rtShadowHeap;            // 4 descriptors (rebuilt per frame)
+    Dx12OffscreenTarget rtShadowMask; // full-res R8 (1 lit / 0 shadowed), UAV + SRV
+    Dx12DescriptorHeap rtShadowHeap; // 4 descriptors (rebuilt per frame)
     bool rtShadowBuilt;
     bool rtShadowsThisFrame;
-    const int RtSbtSlot = 64;                   // shader-table record alignment
+    const int RtSbtSlot = 64; // shader-table record alignment
+
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct RtShadowConstants { public Matrix4x4 InvViewProj; public Vector3 SunDir; public float NormalBias; }
+    struct RtShadowConstants
+    {
+        public Matrix4x4 InvViewProj;
+        public Vector3 SunDir;
+        public float NormalBias;
+    }
 
     // --- DXR ray-traced reflections (Reflection volume SSR-vs-RT dropdown: PostFX.ReflectionMode) ---
     // Reuses Dx12SceneAS + the SSR reflection target (ssrTarget) + the SSR combine (ssrCombinePso): the RT
@@ -161,14 +183,22 @@ public sealed class DX12HDRenderer : HDRenderer {
     // mode. Off by default → zero effect on every existing capture. The orbit frame index = the SSGI frame
     // counter (advances once per render), so two runs are byte-identical. Pivot distance is tunable too.
     float? giOrbitDeg;
+
     float GiOrbitDegPerFrame => giOrbitDeg ??= float.TryParse(
         Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_ORBIT"),
-        System.Globalization.CultureInfo.InvariantCulture, out float d) ? d : 0f;
+        System.Globalization.CultureInfo.InvariantCulture, out float d)
+        ? d
+        : 0f;
+
     float? giOrbitPivot;
+
     float GiOrbitPivotDist => giOrbitPivot ??= float.TryParse(
         Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_ORBIT_PIVOT"),
-        System.Globalization.CultureInfo.InvariantCulture, out float p) && p > 0f ? p : 6f;
-    int giOrbitFrame;   // advances once per rendered frame while the orbit is active
+        System.Globalization.CultureInfo.InvariantCulture, out float p) && p > 0f
+        ? p
+        : 6f;
+
+    int giOrbitFrame; // advances once per rendered frame while the orbit is active
 
     // Phase 4 screen-space radiance probes moved into Resources/Dx12GiPass.cs (chunk 10) — the screenProbe
     // instance + the ScreenProbeEnabled env-vs-volume gate live there (DrawScreenProbeGather is part of the
@@ -182,14 +212,16 @@ public sealed class DX12HDRenderer : HDRenderer {
     bool rasterProbeLogged;
     bool? nortProbesOn;
     bool NortProbesEnabled => nortProbesOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_NORT_PROBES") == "1";
-    Dx12DescriptorHeap rasterProbeDbgHeap;   // 2 descriptors (cube SRV @0, ssgiTarget UAV @1), rebuilt per use
+    Dx12DescriptorHeap rasterProbeDbgHeap; // 2 descriptors (cube SRV @0, ssgiTarget UAV @1), rebuilt per use
 
     // rtGiBuilt + the RtGiConstants/RtGiSun structs moved into Resources/Dx12GiPass.cs (chunk 10). SsgiPreExposure
     // STAYS here: the still-inline NORT raster-probe DEBUG blit (DrawRasterProbeMeasure, off by default) pre-
     // exposes the blitted albedo cube with it. Identical body to the GI pass's private copy (both read the
     // BALLISTIC_DX12_EXPOSURE door).
     float SsgiPreExposure() => float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
-        System.Globalization.CultureInfo.InvariantCulture, out float e) ? e : 1.0e-5f;
+        System.Globalization.CultureInfo.InvariantCulture, out float e)
+        ? e
+        : 1.0e-5f;
 
     // BALLISTIC_DETERMINISTIC=1 — byte-deterministic, frame-INDEPENDENT captures (the documented "frame 60 ==
     // frame 240" contract; `bal render`/`bal gbuffer` set it). On DX12 this had NO consumer (it was a GL-only
@@ -200,7 +232,9 @@ public sealed class DX12HDRenderer : HDRenderer {
     // Exposure is already pinned by BALLISTIC_DX12_EXPOSURE. Result: every captured frame is identical regardless
     // of SCREENSHOT_FRAME, so DDGI (and any GI) captures are truly diffable across builds.
     bool? deterministicOn;
-    bool DeterministicCapture => deterministicOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DETERMINISTIC") == "1";
+
+    bool DeterministicCapture =>
+        deterministicOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DETERMINISTIC") == "1";
 
     // GiIsolateOn moved into Resources/Dx12GiPass.cs (chunk 10) — only the SSGI/RT-GI combine read it.
 
@@ -210,7 +244,8 @@ public sealed class DX12HDRenderer : HDRenderer {
     // is byte-identical). Deterministic: the yaw = giOrbitFrame * degPerFrame, frame index advances once per
     // call, so two runs match. Rebuilds via BMatrix.LookAt (the exact convention the renderer's view expects),
     // so motion vectors / camPos / lighting all derive from one coherent orbited camera.
-    Matrix4x4 ApplyGiOrbit(Matrix4x4 view) {
+    Matrix4x4 ApplyGiOrbit(Matrix4x4 view)
+    {
         float degPerFrame = GiOrbitDegPerFrame;
         if (degPerFrame == 0f) return view;
         if (!Matrix4x4.Invert(view, out Matrix4x4 invView)) return view;
@@ -218,11 +253,11 @@ public sealed class DX12HDRenderer : HDRenderer {
         // LookAt basis lives in invView rows: forward = -Z basis.
         Vector3 fwd = -Vector3.Normalize(new Vector3(invView.M31, invView.M32, invView.M33));
         Vector3 pivot = eye + fwd * GiOrbitPivotDist;
-        float yaw = (giOrbitFrame++) * degPerFrame * (MathF.PI / 180f);   // cumulative; advances per frame
+        float yaw = (giOrbitFrame++) * degPerFrame * (MathF.PI / 180f); // cumulative; advances per frame
         // Rotate the eye around the pivot's WORLD-up axis (Y) so the orbit reads like a natural camera pan/arc.
         Matrix4x4 rot = Matrix4x4.CreateFromAxisAngle(Vector3.UnitY, yaw);
         Vector3 newEye = pivot + Vector3.Transform(eye - pivot, rot);
-        Vector3 newTarget = pivot;   // keep looking at the pivot → the scene stays framed as it orbits
+        Vector3 newTarget = pivot; // keep looking at the pivot → the scene stays framed as it orbits
         return BMatrix.LookAt(newEye, newTarget, Vector3.UnitY);
     }
 
@@ -241,15 +276,17 @@ public sealed class DX12HDRenderer : HDRenderer {
     // (still-inline) TAA/FSR block, reading ctx.SceneColor.
     Dx12CompositePass compositePass;
 
-    // SSAO: HBAO from depth → half-res AO target (+ separable blur), multiplied in the composite.
-    // CONVERTED to a pass-graph IRenderPass (chunk 4): Dx12SsaoPass owns the rootsig/PSOs/CB/heap/targets and
-    // runs at the PostProcess event via the graph. The still-inline composite reads its result via
-    // ssaoPass.ResultSrvCpu until composite itself converts (chunk 7).
-    Dx12SsaoPass ssaoPass;
+    // GTAO (ground-truth AO, Jimenez 2016): from the G-buffer (depth + normal + albedo) → blurred AO target.
+    // Runs at AfterGBuffer (event 200), BEFORE deferred lighting, which samples it (ctx.AoResult) and multiplies
+    // it into the IBL ambient term only — the physically-correct, ambient-only layer (the old HBAO/Dx12SsaoPass
+    // ran post-deferred and post-multiplied the whole HDR colour). All params come from the AmbientOcclusion volume.
+    Dx12GtaoPass gtaoPass;
+
     // chunk 9: Deferred lighting (event 300 — OpaqueLighting). Owns the deferred rootsig/PSO/CB/13-SRV heap;
     // reads ctx light/IBL/cluster/rtShadow state + draws the full-screen lit HDR into `target` (head transition
     // gbuffer.ToShaderResource — R2). Was BuildDeferredLighting / DrawDeferredLighting (+ the LightConstants struct).
     Dx12DeferredLightingPass deferredPass;
+
     // chunk 5: AerialPerspective (event 400) + Fog (event 550), converted leaf-post passes (was the inline
     // DrawAerialPerspective / DrawFog). Both blend in place into `target` — no cross-pass output getter.
     Dx12AerialPerspectivePass apPass;
@@ -281,15 +318,21 @@ public sealed class DX12HDRenderer : HDRenderer {
 
     // Matches StandardOpaque.hlsl's cbuffer DrawConstants byte-for-byte (16-byte-aligned rows).
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct DrawConstants {
+    struct DrawConstants
+    {
         public Matrix4x4 Mvp;
         public Matrix4x4 Model;
-        public Vector3 LightDir; public float Exposure;
-        public Vector3 LightColor; public float Metallic;
-        public Vector3 Ambient; public float Roughness;
-        public Vector3 CameraPos; public float SpecularReflectance;
+        public Vector3 LightDir;
+        public float Exposure;
+        public Vector3 LightColor;
+        public float Metallic;
+        public Vector3 Ambient;
+        public float Roughness;
+        public Vector3 CameraPos;
+        public float SpecularReflectance;
         public Vector4 BaseColorFactor;
-        public Vector3 EmissiveFactor; public float HasEmissive;
+        public Vector3 EmissiveFactor;
+        public float HasEmissive;
         public float NormalStrength, NormalFlipY, HasMetallicMap, HasRoughnessMap;
         public float PackedOrm, Cutout, UseIBL, PrefilterMaxMip;
     }
@@ -299,42 +342,67 @@ public sealed class DX12HDRenderer : HDRenderer {
 
     // IBL: baker (env→irradiance/prefilter/BRDF) + a per-frame 3-SRV shader-visible table (t6..t8).
     Dx12IblBaker ibl;
-    Dx12DescriptorHeap iblSrvVisible;   // 3 contiguous SRVs copied per frame
+    Dx12DescriptorHeap iblSrvVisible; // 3 contiguous SRVs copied per frame
     bool iblActiveThisFrame;
 
     // Sky-atmosphere LUTs (Hillaire 2020), SEPARATE from the IBL baker: v1 = Transmittance LUT.
     Dx12SkyLuts skyLuts;
 
-    // Sun cascaded shadows.
-    const int CascadeCount = 4;
-    const int ShadowMapSize = 2048;
+    // Sun cascaded shadows. MaxCascades is the allocated array depth (the shadow-map texture array + the CB
+    // slot budget + the FrameConstants cascade slots are all sized for this); the Shadows volume's cascadeCount
+    // selects how many of these are actually fit/rendered/sampled (1..MaxCascades) without reallocation. The
+    // shadow-map RESOLUTION is volume-driven too, but a resolution change recreates the texture (BuildShadows
+    // sizes the array), so it's applied lazily in RenderShadows when PostFX.ShadowResolution differs.
+    const int MaxCascades = 4;
+    int shadowMapSize = 2048;     // current allocated per-cascade resolution (PostFX.ShadowResolution)
+    int activeCascadeCount = 4;   // cascades fit/rendered this frame (PostFX.ShadowCascadeCount, clamped)
     Dx12ShadowMap shadowMap;
-    ID3D12RootSignature shadowRootSig;     // ShadowConstants CBV (b0)
+    ID3D12RootSignature shadowRootSig; // ShadowConstants CBV (b0)
     ID3D12PipelineState shadowPso;
-    ID3D12Resource shadowCb;               // per (cascade,submesh) LightMvp slots, upload heap
+    ID3D12Resource shadowCb; // per (cascade,submesh) LightMvp slots, upload heap
     unsafe byte* shadowCbMapped;
     int shadowCbSlotSize, shadowCbSlotCount;
-    readonly Matrix4x4[] cascadeMatrices = new Matrix4x4[CascadeCount];
-    readonly float[] cascadeDepthRanges = new float[CascadeCount];
+    readonly Matrix4x4[] cascadeMatrices = new Matrix4x4[MaxCascades];
+    readonly float[] cascadeDepthRanges = new float[MaxCascades];
     bool shadowsThisFrame;
 
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct ShadowConstants { public Matrix4x4 LightMvp; }
+    struct ShadowConstants
+    {
+        public Matrix4x4 LightMvp;
+    }
 
     // Volumetric fog + aerial perspective moved to Dx12FogPass / Dx12AerialPerspectivePass (chunk 5). Their
     // root sigs / PSOs / CBs / heaps + the FogConstants/ApConstants structs now live inside those pass classes.
 
-    // Per-frame constants (b1) shared by every opaque draw: the cascade matrices + shadow params.
+    // Per-frame constants (b1) shared by every opaque draw: the cascade matrices + shadow params. The tail
+    // block (Filtering..ContactThickness) is volume-driven by the Shadows VolumeComponent → PostFX → here →
+    // DeferredLighting.hlsl (must stay 16-byte aligned; kept in two float4 rows). HLSL layout must match.
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    unsafe struct FrameConstants {
+    unsafe struct FrameConstants
+    {
         public Matrix4x4 Cascade0, Cascade1, Cascade2, Cascade3;
-        public Vector4 CascadeBias;        // per-cascade depth-compare bias
-        public float CascadeCountF; public float ShadowsEnabled; public float ShadowMapTexel; public float CascadeBlend;
+        public Vector4 CascadeBias; // per-cascade depth-compare bias
+        public float CascadeCountF;
+        public float ShadowsEnabled;
+        public float ShadowMapTexel;
+        public float CascadeBlend;
+        // Shadows volume tail (b1): row 1 = filtering mode / PCSS softness / contact toggle+length.
+        public float ShadowFiltering;     // 0 = hard, 1 = soft PCF, 2 = PCSS
+        public float ShadowSoftness;      // PCSS penumbra scale
+        public float ContactShadowsOn;    // >0.5 = march screen-space contact shadow
+        public float ContactShadowLength; // world metres marched
+        // row 2 = contact march tuning + pad.
+        public float ContactShadowSteps;
+        public float ContactShadowThickness;
+        public float FramePad0, FramePad1;
     }
+
     ID3D12Resource frameCb;
     unsafe byte* frameCbMapped;
 
-    public DX12HDRenderer(Dx12Device device) {
+    public DX12HDRenderer(Dx12Device device)
+    {
         dev = device;
     }
 
@@ -358,13 +426,15 @@ public sealed class DX12HDRenderer : HDRenderer {
     // demand (not per-frame) — the headless `bal query` path + the editor live-query surface use it. Owns
     // its OWN Dx12SceneAS so queries work with RT render effects off. See GpuSceneQuery / the proposal doc.
     public GpuSceneQuery CreateSceneQuery() => new GpuSceneQuery(dev);
+
     // DX12 textures are top-down → the editor must NOT flip V (unlike GL's bottom-up textures).
     public override bool DisplayTextureTopDown => true;
 
     // Mirror the LDR composite's SRV into the shared UI heap at a STABLE slot (re-pointed on resize so the
     // ImGui handle stays constant). Headless registers too — harmless; the handle is just never sampled
     // without an editor present. Requires `ldr` to have been created colorReadable (so it owns an SRV).
-    void RegisterLdrUi() {
+    void RegisterLdrUi()
+    {
         if (Dx12Backend.UiHeap == null) return;
         if (ldrUiSlot < 0) ldrUiSlot = Dx12Backend.UiHeap.Allocate();
         Dx12Backend.RegisterUiAt(ldrUiSlot, ldr.ColorSrvCpu);
@@ -374,32 +444,39 @@ public sealed class DX12HDRenderer : HDRenderer {
     public override void ResizeSceneTarget(int width, int height) => Resize(width, height);
     public override void ResizeGameTarget(int width, int height) => Resize(width, height);
 
-    void Resize(int width, int height) {
+    void Resize(int width, int height)
+    {
         if (width <= 0 || height <= 0) return;
         if (target != null && width == outputW && height == outputH) return;
-        outputW = width; outputH = height;
+        outputW = width;
+        outputH = height;
         // Reset to native (internal == output); BeginRender's EnsureUpscaleTargets re-derives the internal
         // render resolution from the volume's UpscaleMode and reallocates if FSR wants a smaller render res.
         fsrActive = false;
         currentUpscaleMode = UpscaleMode.Off;
-        fsr?.Dispose(); fsr = null;
+        fsr?.Dispose();
+        fsr = null;
         AllocateResolutionTargets(width, height);
     }
 
     // (Re)allocate every resolution-dependent target. internalW/H = the render resolution (scene + all post
     // passes); ldr + fsrOutput are at the output resolution. Called on resize and on an FSR mode change.
-    void AllocateResolutionTargets(int internalW, int internalH) {
+    void AllocateResolutionTargets(int internalW, int internalH)
+    {
         // GPU MUST be idle before freeing the old targets: a resize (e.g. dragging the editor from the 4K
         // to the 1080p monitor) reallocates these while the previous frame's commands may still read them.
         // Disposing under an active GPU read is a use-after-free → TDR → DXGI_ERROR_DEVICE_REMOVED. Flush
         // also drains in-flight worker uploads (see Dx12Device.Flush). Realloc is rare (resize / FSR mode).
         dev.Flush();
-        targetW = internalW; targetH = internalH;
-        target?.Dispose(); ldr?.Dispose(); gbuffer?.Dispose();
+        targetW = internalW;
+        targetH = internalH;
+        target?.Dispose();
+        ldr?.Dispose();
+        gbuffer?.Dispose();
         // The HDR scene target no longer owns depth — the G-buffer owns the scene depth (deferred path).
         target = new Dx12OffscreenTarget(dev, internalW, internalH, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
-        ldr = new Dx12OffscreenTarget(dev, outputW, outputH, colorReadable: true);   // LDR composite output (display res)
+        ldr = new Dx12OffscreenTarget(dev, outputW, outputH, colorReadable: true); // LDR composite output (display res)
         RegisterLdrUi();
         // Editor display: the editor's ImGui pass samples ldr (SceneColorHandle) EVERY frame, including
         // before the scene first composites (long async import). Leave it sample-ready (PixelShaderResource)
@@ -409,7 +486,7 @@ public sealed class DX12HDRenderer : HDRenderer {
         // and it's harmless headless (SaveBmp transitions from any state).
         ldr.ColorToShaderResource();
         gbuffer = new Dx12GBuffer(dev, internalW, internalH);
-        motionPrevValid = false;                                // prev view*proj is stale after a realloc
+        motionPrevValid = false; // prev view*proj is stale after a realloc
         // SSAO (Dx12SsaoPass) + bloom (Dx12CompositePass) + TAA (Dx12TaaPass) + SSR (Dx12ReflectionsPass, was
         // AllocSsrTarget, slot 3) + SSGI (Dx12GiPass, was AllocSsgiTargets, slot 4) now reallocate via
         // graph.Resize at the tail of this method — see the graph?.Resize call below. Their original AllocXxx
@@ -425,7 +502,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         featureBlitter?.Resize(internalW, internalH);
     }
 
-    void AllocFsrOutput() {
+    void AllocFsrOutput()
+    {
         fsrOutput?.Dispose();
         // Output-resolution HDR target FSR writes via UAV and the composite reads via SRV.
         fsrOutput = new Dx12OffscreenTarget(dev, outputW, outputH, withDepth: false,
@@ -433,7 +511,8 @@ public sealed class DX12HDRenderer : HDRenderer {
     }
 
     // Map the volume UpscaleMode to an FSR quality id.
-    static uint FsrQuality(UpscaleMode m) => m switch {
+    static uint FsrQuality(UpscaleMode m) => m switch
+    {
         UpscaleMode.NativeAA => FfxApi.QualityNativeAA,
         UpscaleMode.Quality => FfxApi.QualityQuality,
         UpscaleMode.Balanced => FfxApi.QualityBalanced,
@@ -445,51 +524,71 @@ public sealed class DX12HDRenderer : HDRenderer {
     // Ensure the internal render resolution + FSR context match the requested upscale mode. Reallocates the
     // internal-res targets (and recreates the FSR context) only when the mode actually changes. If the FSR
     // DLLs can't load it latches off and renders native (graceful degrade on a clean checkout).
-    void EnsureUpscaleTargets(UpscaleMode mode) {
+    void EnsureUpscaleTargets(UpscaleMode mode)
+    {
         bool wantFsr = mode != UpscaleMode.Off && !fsrUnavailable;
         int wantIW = outputW, wantIH = outputH;
-        if (wantFsr) {
-            try { (wantIW, wantIH) = Dx12FsrUpscaler.RenderResolutionFor(outputW, outputH, FsrQuality(mode)); }
-            catch (Exception e) {
+        if (wantFsr)
+        {
+            try
+            {
+                (wantIW, wantIH) = Dx12FsrUpscaler.RenderResolutionFor(outputW, outputH, FsrQuality(mode));
+            }
+            catch (Exception e)
+            {
                 Console.WriteLine($"[FSR] unavailable, rendering native: {e.Message}");
-                fsrUnavailable = true; wantFsr = false; wantIW = outputW; wantIH = outputH;
+                fsrUnavailable = true;
+                wantFsr = false;
+                wantIW = outputW;
+                wantIH = outputH;
             }
         }
-        if (target != null && wantIW == targetW && wantIH == targetH && fsrActive == wantFsr) {
+
+        if (target != null && wantIW == targetW && wantIH == targetH && fsrActive == wantFsr)
+        {
             currentUpscaleMode = mode;
-            return;   // nothing to reallocate
+            return; // nothing to reallocate
         }
+
         AllocateResolutionTargets(wantIW, wantIH);
-        if (wantFsr) {
-            try {
+        if (wantFsr)
+        {
+            try
+            {
                 fsr?.Dispose();
                 fsr = new Dx12FsrUpscaler(dev, wantIW, wantIH, outputW, outputH);
-            } catch (Exception e) {
+            }
+            catch (Exception e)
+            {
                 Console.WriteLine($"[FSR] context create failed, rendering native: {e.Message}");
-                fsrUnavailable = true; wantFsr = false;
+                fsrUnavailable = true;
+                wantFsr = false;
             }
         }
+
         fsrActive = wantFsr;
         currentUpscaleMode = mode;
     }
 
-    public override unsafe void Initialize() {
+    public override unsafe void Initialize()
+    {
         // Clustered-deferred: geometry → G-buffer (owns scene depth) → deferred lighting → HDR `target`
         // (color only) → sky/fog/post → composite into `ldr` (R8). `target` no longer owns depth.
         // At init internal == output (FSR off); EnsureUpscaleTargets adjusts once a volume requests FSR.
-        outputW = targetW; outputH = targetH;
+        outputW = targetW;
+        outputH = targetH;
         target = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         ldr = new Dx12OffscreenTarget(dev, targetW, targetH, colorReadable: true);
         RegisterLdrUi();
-        ldr.ColorToShaderResource();   // sample-safe before first composite (see AllocateResolutionTargets)
+        ldr.ColorToShaderResource(); // sample-safe before first composite (see AllocateResolutionTargets)
         gbuffer = new Dx12GBuffer(dev, targetW, targetH);
         BuildRootSignature();
         BuildPipeline();
         BuildGeometryPass();
 
         cbSlotSize = (System.Runtime.InteropServices.Marshal.SizeOf<DrawConstants>() + 255) & ~255;
-        cbSlotCount = 8192;   // submesh draws per frame ceiling (SunTemple ~hundreds)
+        cbSlotCount = 8192; // submesh draws per frame ceiling (SunTemple ~hundreds)
         cbRing = dev.Device.CreateCommittedResource(
             HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)(cbSlotSize * cbSlotCount)), ResourceStates.GenericRead);
@@ -509,7 +608,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         skyLuts = new Dx12SkyLuts(dev);
         // 3 IBL SRVs (irradiance/prefilter/BRDF) copied contiguously per frame into a shader-visible heap.
         iblSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true,
+            framesInFlight: dev.FramesInFlight);
 
         BuildShadows();
 
@@ -547,7 +647,7 @@ public sealed class DX12HDRenderer : HDRenderer {
                               "Re-enable per pass with BALLISTIC_DX12_{SHADOWS,SKY,IBL,SSAO,BLOOM,AP,VOLUMES}=1 / BALLISTIC_FX_VOLUMETRIC=1.");
         gpuDriven = new Dx12GpuDrivenRenderer(dev);
 
-        AllocFsrOutput();   // output-res UAV target for FSR (allocated even when off — cheap, simplifies resize)
+        AllocFsrOutput(); // output-res UAV target for FSR (allocated even when off — cheap, simplifies resize)
 
         // chunk 10: the shared DXR substrate holder (sceneAS/device5/dxr-availability/rtGeometry/ddgi), lazily
         // filled on first RT use. RT sun shadows (inline core) + the GI pass + the Reflections pass all reference
@@ -566,8 +666,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         // the inline gbuffer.ToShaderResource() + DrawDeferredLighting call.
         deferredPass = new Dx12DeferredLightingPass(dev);
         graph.Add(deferredPass);
-        ssaoPass = new Dx12SsaoPass(dev, targetW, targetH);   // chunk 4: first leaf-post pass (was BuildSsao)
-        graph.Add(ssaoPass);
+        gtaoPass = new Dx12GtaoPass(dev, targetW, targetH); // GTAO at AfterGBuffer (200), feeds the deferred ambient (was Dx12SsaoPass)
+        graph.Add(gtaoPass);
         // chunk 8: Sky (event 350 — skybox + procedural atmosphere). Resolution-independent (no Resize body)
         // so registration order doesn't touch R5; the event sort places it FIRST of the converted passes (350
         // < AP 400 < Fog 550 < PostProcess 650). Registered before apPass for same-event-tiebreak hygiene (R1),
@@ -635,10 +735,13 @@ public sealed class DX12HDRenderer : HDRenderer {
         // Resolve the phase-2 V1 door once at init (kills per-frame env churn). When set, BeginRender calls
         // graph.ExecuteGraph(ctx) (compiled order) instead of graph.Execute(ctx) (event sort).
         graphPath = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GRAPH") == "1";
-        if (graphPath) {
-            Console.Error.WriteLine("[DX12] Render graph (phase-2 V1): COMPILED ORDER active (BALLISTIC_DX12_GRAPH=1).");
+        if (graphPath)
+        {
+            Console.Error.WriteLine(
+                "[DX12] Render graph (phase-2 V1): COMPILED ORDER active (BALLISTIC_DX12_GRAPH=1).");
             Console.Error.WriteLine(graph.LastCompileReport);
         }
+
         // PHASE 2 V3 (chunk 14): auto-derived boundary barriers. Gated behind BALLISTIC_DX12_GRAPH_BARRIERS=1
         // (requires GRAPH=1 — it runs in ExecuteGraph). When set, the graph DERIVES each migrated pass's head
         // transition from its declared Usages and emits it before Record; the migrated pass skips its manual head
@@ -647,8 +750,10 @@ public sealed class DX12HDRenderer : HDRenderer {
         // print the comparison so the manual-vs-derived sets are auditable.
         barriersPath = graphPath && Environment.GetEnvironmentVariable("BALLISTIC_DX12_GRAPH_BARRIERS") == "1";
         graph.SetBarriersDerived(barriersPath);
-        if (barriersPath) {
-            Console.Error.WriteLine("[DX12] Render graph (phase-2 V3): AUTO-DERIVED BARRIERS active (BALLISTIC_DX12_GRAPH_BARRIERS=1).");
+        if (barriersPath)
+        {
+            Console.Error.WriteLine(
+                "[DX12] Render graph (phase-2 V3): AUTO-DERIVED BARRIERS active (BALLISTIC_DX12_GRAPH_BARRIERS=1).");
             Console.Error.WriteLine(graph.LastDeriverReport);
         }
 
@@ -662,25 +767,24 @@ public sealed class DX12HDRenderer : HDRenderer {
         // passes have disjoint lifetimes (CAN alias). Registering each with first==last==passOrder makes the greedy
         // interval-coloring produce exactly that (same-pass overlap → separate region; cross-pass disjoint → share).
         aliasPath = graphPath && Environment.GetEnvironmentVariable("BALLISTIC_DX12_GRAPH_ALIAS") == "1";
-        if (aliasPath) {
+        if (aliasPath)
+        {
             rtPool = new Dx12RenderTargetPool(dev);
             int hw = Math.Max(1, targetW / 2), hh = Math.Max(1, targetH / 2);
             var Hdr = Dx12OffscreenTarget.HdrFormat;
-            int ssao = graph.OrderIndexOf("SSAO"), refl = graph.OrderIndexOf("Reflections");
+            int refl = graph.OrderIndexOf("Reflections");
             int gi = graph.OrderIndexOf("GI"), comp = graph.OrderIndexOf("Composite");
             // POOLED (audit-passed full-overwrite-before-read transients). Format/size/uav MUST match the pass's
             // actual AllocOrPool call (the pool asserts this on Acquire). History (ssgiHistory/taaHistory/lumTarget)
             // is NOT registered → those passes' AllocOrPool calls fall through to committed (imported, never aliased).
             //
-            // LIFETIME = [firstWritePass, lastReadPass] in compiled-graph order. MOST pooled scratch is PASS-PRIVATE
-            // (born + consumed inside ONE pass's Record → first==last==that pass). The ONE CROSS-PASS exception:
-            // ★ ssaoA is written by SSAO (order `ssao`) but READ by Composite (order `comp`) as the AO slot
-            // (ctx.SsaoResult = ssaoPass.ResultSrvCpu). So ssaoA's lifetime is [ssao .. comp], NOT [ssao .. ssao].
-            // Registering it [ssao..ssao] would (wrongly) let bloomA[comp..comp] alias ssaoA's memory — and the
-            // Composite reads ssaoA WHILE writing bloomA → memory collision → wrong pixels (the V2 lifetime trap
-            // that the CornellBox SHA mismatch caught). lastRead=comp keeps ssaoA out of bloom's region.
-            rtPool.Register("ssaoA", hw, hh, Format.R8_UNorm, false, ssao, comp);   // CROSS-PASS: read by Composite
-            rtPool.Register("ssaoB", hw, hh, Format.R8_UNorm, false, ssao, ssao);   // SSAO-internal blur scratch
+            // NOTE: GTAO's gtaoA/gtaoB are deliberately NOT pooled — their size depends on the AmbientOcclusion
+            // volume's Resolution dropdown (Full/Half/Quarter), which can change at runtime, so a fixed-size pool
+            // registration would break the pool's size-match assert. They fall through to committed targets (the
+            // pool is a perf optimisation, not a correctness requirement; committed is always valid).
+            //
+            // LIFETIME = [firstWritePass, lastReadPass] in compiled-graph order. The remaining pooled scratch is all
+            // PASS-PRIVATE (born + consumed inside ONE pass's Record → first==last==that pass).
             rtPool.Register("ssrTarget", hw, hh, Hdr, true, refl, refl);
             rtPool.Register("ssrScene", targetW, targetH, Hdr, false, refl, refl);
             rtPool.Register("ssgiTarget", hw, hh, Hdr, true, gi, gi);
@@ -698,7 +802,8 @@ public sealed class DX12HDRenderer : HDRenderer {
             // committed targets before the pool existed; AllocOrPool now hands back placed ones, disposing the
             // committed pre-pool allocation). Same registration-order fan-out as the normal resize path (R5).
             graph.Resize(targetW, targetH);
-            Console.Error.WriteLine("[DX12] Render graph (phase-2 V2): TRANSIENT ALIASING active (BALLISTIC_DX12_GRAPH_ALIAS=1).");
+            Console.Error.WriteLine(
+                "[DX12] Render graph (phase-2 V2): TRANSIENT ALIASING active (BALLISTIC_DX12_GRAPH_ALIAS=1).");
             Console.Error.WriteLine(rtPool.PlanReport);
         }
 
@@ -714,12 +819,24 @@ public sealed class DX12HDRenderer : HDRenderer {
 
     Dx12GpuDrivenRenderer gpuDriven;
     bool gpuDrivenOn;
+
     bool hizWanted;
+
     // Cached per-feature on/off doors (resolved once at init from the BALLISTIC_DX12_*/_FX_* env vars).
     // Implements the BALLISTIC_DX12_MINIMAL "bare minimum" diagnostic switch + kills the per-frame env churn.
     Dx12RenderDoors doors;
+
+    // Live editor control of the door-gated passes (the "Render Pass Toggles" window). Reading is free; a
+    // write reassigns the whole struct, which BeginRender copies into the next frame's ctx → the toggle takes
+    // effect next frame with zero per-frame cost (mirrors how PostFX is a renderer-owned live object). The
+    // PostFX-gated passes (Fog/SSR/GI) already toggle live via the Volume framework — these are the rest.
+    public Dx12RenderDoors Doors {
+        get => doors;
+        set => doors = value;
+    }
+    public void SetDoor(string door, bool value) => doors = doors.With(door, value);
     Vector3 hizLastCamPos;
-    bool hizPrimed;     // false until we have a valid previous-frame depth (first frame / after a big jump)
+    bool hizPrimed; // false until we have a valid previous-frame depth (first frame / after a big jump)
     readonly System.Collections.Generic.List<IStaticMeshRenderer> wholeMeshRenderers = new();
 
     // The pluggable pass list (phase 1 — the URP pre-RenderGraph model: a stably-event-ordered IRenderPass
@@ -728,6 +845,7 @@ public sealed class DX12HDRenderer : HDRenderer {
     // graph.Compile() can build a dependency DAG, cull, and derive a topo order; graph.ExecuteGraph(ctx) runs
     // THAT order. Built once (stable order, R1). Resize fans out to it (R5-ordered).
     Dx12RenderGraph graph;
+
     // PHASE-3 (chunk 20): the authored-render-feature seam. featureBridge gathers the active RenderFeatures each
     // frame (RenderFeatureManager) and, when the set changes, rebuilds the graph's feature-pass segment; featureBlitter
     // owns the proof feature's GPU blit; featureRecorder is the backend-agnostic verb surface a feature.Record drives.
@@ -735,19 +853,24 @@ public sealed class DX12HDRenderer : HDRenderer {
     // are byte-identical.
     Dx12FeatureBlitter featureBlitter;
     Dx12FeaturePassRecorder featureRecorder;
+
     Dx12RenderFeatureBridge featureBridge;
+
     // PHASE 2 V1 door: BALLISTIC_DX12_GRAPH=1 → run the COMPILED graph order (graph.ExecuteGraph) instead of the
     // phase-1 event-sort (graph.Execute). Default OFF → the proven phase-1 list runs unchanged (byte-identical to
     // the frozen golden set). The compiled order is provably == the event-sort order (PQ keyed (event,regIdx) +
     // AllowCulling default-OFF), so GRAPH=1 must also be byte-identical to golden (the V1 pixel-neutral bar).
     bool graphPath;
+
     // PHASE 2 V2 (chunk 13): the transient render-target pool + the alias-active door. aliasPath = graphPath &&
     // BALLISTIC_DX12_GRAPH_ALIAS=1. When set, rtPool owns the shared placed-resource heap + the alias plan, and is
     // published as Dx12RenderTargetPool.Active so each pooled pass's AllocOrPool hands back placed (aliased)
     // targets. BeginRender emits the per-frame whole-heap aliasing barrier before the graph runs. Default off →
     // rtPool null, Active null → committed targets, byte-identical to V1.
     Dx12RenderTargetPool rtPool;
+
     bool aliasPath;
+
     // PHASE 2 V3 (chunk 14): the auto-derived-barriers door. barriersPath = graphPath && BALLISTIC_DX12_GRAPH_BARRIERS=1.
     // When set, the graph emits each migrated pass's derived head transition (deriver.Emit) before its Record, and
     // ctx.BarriersDerived tells the migrated pass to skip its own manual head transition (emit derived ONLY).
@@ -757,8 +880,9 @@ public sealed class DX12HDRenderer : HDRenderer {
     // Cascade caching: skip re-rendering the sun cascades when the texel-snapped fit matrices AND the caster
     // geometry are unchanged (the depth-array layers are retained → byte-identical; big win for a static camera).
     bool shadowCacheOn;
-    readonly Matrix4x4[] lastCascadeMatrices = new Matrix4x4[CascadeCount];
+    readonly Matrix4x4[] lastCascadeMatrices = new Matrix4x4[MaxCascades];
     int lastCasterStamp;
+    int lastActiveCascadeCount = -1; // invalidate the cache when the volume changes cascadeCount
     bool shadowMapEverRendered;
 
     // BuildTaa / AllocTaaTargets / DrawTaa moved VERBATIM into Resources/Dx12TaaPass.cs (chunk 7). The pass
@@ -768,13 +892,22 @@ public sealed class DX12HDRenderer : HDRenderer {
 
     // Standard 8-phase Halton(2,3) sub-pixel jitter in pixel units (-0.5..0.5). Reused by FSR later. Stays in
     // the orchestrator — it sets BeginRender's `currentJitter` (TAA + FSR jitter), not a TAA-pass-private thing.
-    static Vector2 JitterOffset(int frameIndex) {
+    static Vector2 JitterOffset(int frameIndex)
+    {
         int i = (frameIndex % 8) + 1;
         return new Vector2(Halton(i, 2) - 0.5f, Halton(i, 3) - 0.5f);
     }
-    static float Halton(int index, int b) {
+
+    static float Halton(int index, int b)
+    {
         float r = 0f, f = 1f;
-        while (index > 0) { f /= b; r += f * (index % b); index /= b; }
+        while (index > 0)
+        {
+            f /= b;
+            r += f * (index % b);
+            index /= b;
+        }
+
         return r;
     }
 
@@ -786,16 +919,19 @@ public sealed class DX12HDRenderer : HDRenderer {
     // Geometry pass PSO: same vertex layout + per-draw CBV(b0) + 6 material SRVs(t0..t5) as the forward
     // opaque path, but the pixel shader (GBuffer.hlsl) writes the 5-MRT fat G-buffer (+ motion) instead of
     // shading. Adds a per-pass MotionConstants CBV(b1) for the motion-vector reprojection.
-    unsafe void BuildGeometryPass() {
+    unsafe void BuildGeometryPass()
+    {
         // b0 = per-draw DrawConstants (root CBV); table0 = 6 material SRVs t0..t5; b1 = MotionConstants
         // (per pass); s0 wrap sampler.
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView,
             new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var matRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, MaterialSrvCount, baseShaderRegister: 0);
+        var matRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, MaterialSrvCount,
+            baseShaderRegister: 0);
         var matTable = new RootParameter1(new RootDescriptorTable1(matRange), ShaderVisibility.Pixel);
         var motionCbv = new RootParameter1(RootParameterType.ConstantBufferView,
             new RootDescriptor1(1, 0), ShaderVisibility.Pixel);
-        var wrap = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+        var wrap = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0)
+        {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap,
             AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 16,
             ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
@@ -817,10 +953,11 @@ public sealed class DX12HDRenderer : HDRenderer {
             new InputElementDescription("NORMAL", 0, Format.R32G32B32_Float, 0, 1),
             new InputElementDescription("TEXCOORD", 0, Format.R32G32_Float, 0, 2),
             new InputElementDescription("TANGENT", 0, Format.R32G32B32A32_Float, 0, 3));
-        gbufferPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+        gbufferPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription
+        {
             RootSignature = gbufferRootSig, VertexShader = vs, PixelShader = ps, InputLayout = layout,
             PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
-            RasterizerState = RasterizerDescription.CullClockwise,   // back-face cull, CCW-from-front (forward parity)
+            RasterizerState = RasterizerDescription.CullClockwise, // back-face cull, CCW-from-front (forward parity)
             BlendState = BlendDescription.Opaque, DepthStencilState = DepthStencilDescription.Default,
             RenderTargetFormats = Dx12GBuffer.ColorFormats,
             DepthStencilFormat = Dx12GBuffer.DepthFormat, SampleDescription = new SampleDescription(1, 0),
@@ -831,17 +968,20 @@ public sealed class DX12HDRenderer : HDRenderer {
     // per-bone matrices (GBufferSkinned.hlsl). Root sig adds a bone-matrix SRV (t6, root SRV) on top of the
     // static layout (b0 DrawConstants, table0 = 6 material SRVs, b1 MotionConstants). Input layout adds two
     // streams: BLENDINDICES (slot 4) + BLENDWEIGHT (slot 5), each a float4 buffer the mesh already uploads.
-    unsafe void BuildSkinnedGeometryPass() {
+    unsafe void BuildSkinnedGeometryPass()
+    {
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView,
             new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var matRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, MaterialSrvCount, baseShaderRegister: 0);
+        var matRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, MaterialSrvCount,
+            baseShaderRegister: 0);
         var matTable = new RootParameter1(new RootDescriptorTable1(matRange), ShaderVisibility.Pixel);
         var motionCbv = new RootParameter1(RootParameterType.ConstantBufferView,
             new RootDescriptor1(1, 0), ShaderVisibility.Pixel);
         // Bone matrices as a root SRV at t6 (vertex-visible) — a raw GPU address, no descriptor-heap slot.
         var boneSrv = new RootParameter1(RootParameterType.ShaderResourceView,
             new RootDescriptor1(6, 0), ShaderVisibility.Vertex);
-        var wrap = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+        var wrap = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0)
+        {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap,
             AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 16,
             ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
@@ -860,7 +1000,8 @@ public sealed class DX12HDRenderer : HDRenderer {
             new InputElementDescription("TANGENT", 0, Format.R32G32B32A32_Float, 0, 3),
             new InputElementDescription("BLENDINDICES", 0, Format.R32G32B32A32_Float, 0, 4),
             new InputElementDescription("BLENDWEIGHT", 0, Format.R32G32B32A32_Float, 0, 5));
-        skinnedGbufferPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+        skinnedGbufferPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription
+        {
             RootSignature = skinnedGbufferRootSig, VertexShader = vs, PixelShader = ps, InputLayout = layout,
             PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
             RasterizerState = RasterizerDescription.CullClockwise,
@@ -870,8 +1011,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         });
 
         // Per-frame bone-matrix upload ring: one MaxBonesPerDraw-matrix slot per skinned draw.
-        boneMatrixSlotSize = (MaxBonesPerDraw * 64 + 255) & ~255;   // 64 bytes per float4x4
-        boneMatrixSlotCount = 64;                                    // skinned characters per frame ceiling
+        boneMatrixSlotSize = (MaxBonesPerDraw * 64 + 255) & ~255; // 64 bytes per float4x4
+        boneMatrixSlotCount = 64; // skinned characters per frame ceiling
         boneMatrixRing = dev.Device.CreateCommittedResource(
             HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)((long)boneMatrixSlotSize * boneMatrixSlotCount)),
@@ -894,51 +1035,58 @@ public sealed class DX12HDRenderer : HDRenderer {
     // the composite rootsig/PSO/CB/heap AND its private sub-steps' resources (auto-exposure metering + bloom),
     // runs at the Composite event via the graph (after the still-inline TAA/FSR block), reading ctx.SceneColor.
 
-    // BuildSsao / AllocSsaoTargets / DrawSsao moved VERBATIM to Resources/Dx12SsaoPass.cs (chunk 4 — first
-    // leaf-post conversion). The pass owns the rootsig/PSOs/CB/heap/targets, runs at the PostProcess event via
-    // the graph, and exposes its result via ssaoPass.ResultSrvCpu for the composite (now ctx.SsaoResult).
+    // GTAO lives in Resources/Dx12GtaoPass.cs (replaced the old HBAO Dx12SsaoPass). The pass owns the
+    // rootsig/PSOs/CB/heap/targets, runs at the AfterGBuffer event (200, BEFORE deferred lighting) via the
+    // graph, and exposes its blurred AO via gtaoPass.ResultSrvCpu → ctx.AoResult for the deferred ambient term.
 
     // BuildFog / BuildAerialPerspective moved into the Dx12FogPass / Dx12AerialPerspectivePass ctors (chunk 5).
 
-    unsafe void BuildShadows() {
-        shadowMap = new Dx12ShadowMap(dev, ShadowMapSize, CascadeCount);
+    unsafe void BuildShadows()
+    {
+        shadowMap = new Dx12ShadowMap(dev, shadowMapSize, MaxCascades);
 
         // Depth-only PSO: ShadowConstants CBV (b0), POSITION-only input, depth bias to cut acne.
         shadowRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.AllowInputAssemblerInputLayout, new[] {
-                new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Vertex) })));
+            new RootSignatureDescription1(RootSignatureFlags.AllowInputAssemblerInputLayout, new[]
+            {
+                new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0),
+                    ShaderVisibility.Vertex)
+            })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("ShadowDepth.hlsl");
         byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "ShadowDepth.hlsl");
         var layout = new InputLayoutDescription(
             new InputElementDescription("POSITION", 0, Format.R32G32B32_Float, 0, 0));
-        var raster = RasterizerDescription.CullClockwise;   // cull back faces (same winding as opaque)
-        raster.DepthBias = 2000;            // constant slope-scaled bias to fight shadow acne
+        var raster = RasterizerDescription.CullClockwise; // cull back faces (same winding as opaque)
+        raster.DepthBias = 2000; // constant slope-scaled bias to fight shadow acne
         raster.SlopeScaledDepthBias = 2.5f;
         raster.DepthBiasClamp = 0f;
-        var psoDesc = new GraphicsPipelineStateDescription {
-            RootSignature = shadowRootSig, VertexShader = vs, PixelShader = default,   // depth-only, no PS
+        var psoDesc = new GraphicsPipelineStateDescription
+        {
+            RootSignature = shadowRootSig, VertexShader = vs, PixelShader = default, // depth-only, no PS
             InputLayout = layout, PrimitiveTopologyType = PrimitiveTopologyType.Triangle,
             SampleMask = uint.MaxValue, RasterizerState = raster, BlendState = BlendDescription.Opaque,
             DepthStencilState = DepthStencilDescription.Default,
-            RenderTargetFormats = System.Array.Empty<Format>(),     // no color targets
+            RenderTargetFormats = System.Array.Empty<Format>(), // no color targets
             DepthStencilFormat = Dx12ShadowMap.DepthFormat,
             SampleDescription = new SampleDescription(1, 0),
         };
         shadowPso = dev.Device.CreateGraphicsPipelineState(psoDesc);
 
         shadowCbSlotSize = (System.Runtime.InteropServices.Marshal.SizeOf<ShadowConstants>() + 255) & ~255;
-        // CascadeCount × submesh draws per frame.
-        shadowCbSlotCount = CascadeCount * 4096;
+        // MaxCascades × submesh draws per frame (sized for the full cascade budget).
+        shadowCbSlotCount = MaxCascades * 4096;
         shadowCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)((long)shadowCbSlotSize * shadowCbSlotCount)), ResourceStates.GenericRead);
+            ResourceDescription.Buffer((ulong)((long)shadowCbSlotSize * shadowCbSlotCount)),
+            ResourceStates.GenericRead);
         shadowCbMapped = shadowCb.Map<byte>(0);
     }
 
     // BuildProcSky / BuildSkybox moved VERBATIM into Resources/Dx12SkyPass.cs's ctor (chunk 8). The pass owns
     // both rootsigs/PSOs/CBs/heaps (skybox + procedural), runs at the Sky event via the graph.
 
-    void BuildRootSignature() {
+    void BuildRootSignature()
+    {
         // b0 = per-draw constants (root CBV);
         // table0 (param 1) = 6 material SRVs t0..t5 (per draw);
         // table1 (param 2) = 4 SRVs t6..t9: irradiance cube / prefilter cube / BRDF LUT / shadow array (frame);
@@ -946,19 +1094,22 @@ public sealed class DX12HDRenderer : HDRenderer {
         // static samplers: s0 wrap (material), s1 clamp (IBL/sky).
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView,
             new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var matRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, MaterialSrvCount, baseShaderRegister: 0);
+        var matRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, MaterialSrvCount,
+            baseShaderRegister: 0);
         var matTable = new RootParameter1(new RootDescriptorTable1(matRange), ShaderVisibility.Pixel);
         var iblRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 4, baseShaderRegister: 6);
         var iblTable = new RootParameter1(new RootDescriptorTable1(iblRange), ShaderVisibility.Pixel);
         var frameCbv = new RootParameter1(RootParameterType.ConstantBufferView,
             new RootDescriptor1(1, 0), ShaderVisibility.Pixel);
 
-        var wrap = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+        var wrap = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0)
+        {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap,
             AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 16,
             ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
         };
-        var clamp = new StaticSamplerDescription(ShaderVisibility.Pixel, 1, 0) {
+        var clamp = new StaticSamplerDescription(ShaderVisibility.Pixel, 1, 0)
+        {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
             AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
             ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
@@ -970,7 +1121,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         rootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(desc));
     }
 
-    void BuildPipeline() {
+    void BuildPipeline()
+    {
         // Fully-qualified: the GL backend also has a BallisticEngine.EmbeddedShaderSource (ReadGlsl), and
         // this file is in namespace BallisticEngine, so the unqualified name would resolve to the GL one.
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("StandardOpaque.hlsl");
@@ -985,7 +1137,8 @@ public sealed class DX12HDRenderer : HDRenderer {
             new InputElementDescription("TEXCOORD", 0, Format.R32G32_Float, 0, 2),
             new InputElementDescription("TANGENT", 0, Format.R32G32B32A32_Float, 0, 3));
 
-        var psoDesc = new GraphicsPipelineStateDescription {
+        var psoDesc = new GraphicsPipelineStateDescription
+        {
             RootSignature = rootSig,
             VertexShader = vs,
             PixelShader = ps,
@@ -1015,24 +1168,33 @@ public sealed class DX12HDRenderer : HDRenderer {
     // the .stats.json / `bal perf` sidecar already serializes.
     readonly System.Diagnostics.Stopwatch passSw = new();
     bool? giTimingOn;
+
     bool GiTimingEnabled => giTimingOn ??= (Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_TIMING") == "1"
-        || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("BALLISTIC_STATS_OUT")));
+                                            || !string.IsNullOrWhiteSpace(
+                                                Environment.GetEnvironmentVariable("BALLISTIC_STATS_OUT")));
 
     // Run `body`, and if GI timing is on, record its GPU wall-time under `name` in RenderStats.GpuPasses.
-    void TimePass(string name, Action body) {
-        if (!GiTimingEnabled) { body(); return; }
+    void TimePass(string name, Action body)
+    {
+        if (!GiTimingEnabled)
+        {
+            body();
+            return;
+        }
+
         passSw.Restart();
         body();
         passSw.Stop();
         RenderStats.Scene.GpuPasses.Add((name, passSw.Elapsed.TotalMilliseconds));
     }
 
-    public override unsafe RenderMetrics BeginRender(RendererArgs args) {
+    public override unsafe RenderMetrics BeginRender(RendererArgs args)
+    {
         IViewProjectionProvider vp = args.viewProjectionProvider;
         if (vp is null || target is null)
             return default;
-        cpuFrameSw.Restart();   // CPU render-submission cost (the AI-measurable frame budget)
-        if (GiTimingEnabled) RenderStats.Scene.GpuPasses.Clear();   // fresh per-pass GPU timings each frame
+        cpuFrameSw.Restart(); // CPU render-submission cost (the AI-measurable frame budget)
+        if (GiTimingEnabled) RenderStats.Scene.GpuPasses.Clear(); // fresh per-pass GPU timings each frame
 
         // Resolve the upscale mode (volume, or a BALLISTIC_DX12_FSR env override for headless A/B) and make
         // the internal render resolution + FSR context match it (reallocates targets only on a mode change).
@@ -1041,12 +1203,12 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         // Camera. The provider's view (LookAt) is convention-agnostic — convert 1:1. Rebuild the
         // projection DX-style (RH, z in [0,1]) since the provider's is OpenTK GL-convention (z in [-1,1]).
-        Matrix4x4 view = ToNumerics(vp.GetViewMatrix());
-        view = ApplyGiOrbit(view);   // P6.0 motion harness: deterministic scripted orbit (no-op unless GI_ORBIT set)
+        Matrix4x4 view = vp.GetViewMatrix();
+        view = ApplyGiOrbit(view); // P6.0 motion harness: deterministic scripted orbit (no-op unless GI_ORBIT set)
         Matrix4x4 proj = Matrix4x4.CreatePerspectiveFieldOfView(
             FovYRadians, (float)targetW / targetH, CameraNear, CameraFar);
-        Matrix4x4 projUnjittered = proj;   // before the jitter — the shadow cascade fit uses this (stable
-                                           // across frames so cascade caching works; shadows shouldn't jitter)
+        Matrix4x4 projUnjittered = proj; // before the jitter — the shadow cascade fit uses this (stable
+        // across frames so cascade caching works; shadows shouldn't jitter)
         // UNJITTERED view*proj — used for motion vectors + the froxel/SSR/post math.
         Matrix4x4 viewProjUnjittered = view * proj;
 
@@ -1060,12 +1222,14 @@ public sealed class DX12HDRenderer : HDRenderer {
         bool taaOn = PostFX.TaaEnabled && !fsrActive && !DeterministicCapture && !doors.Minimal;
         bool jitterOn = taaOn || fsrActive;
         currentJitter = jitterOn ? JitterOffset(taaFrame) : Vector2.Zero;
-        if (jitterOn) {
+        if (jitterOn)
+        {
             // NDC offset = 2 * pixelJitter / screen. DX clip y is up, so subtract for the +y pixel dir.
             proj.M31 += 2f * currentJitter.X / targetW;
             proj.M32 -= 2f * currentJitter.Y / targetH;
         }
-        Matrix4x4 viewProj = view * proj;   // JITTERED — geometry/SSR/etc. render with this
+
+        Matrix4x4 viewProj = view * proj; // JITTERED — geometry/SSR/etc. render with this
 
         // Motion-vector constants (b1): UNJITTERED current + previous view*proj. First frame (or after a
         // resize) has no valid previous frame → use the current matrix so motion = 0 everywhere.
@@ -1075,8 +1239,9 @@ public sealed class DX12HDRenderer : HDRenderer {
         // the mip chain does the heavy lifting; preserves detail). BALLISTIC_DX12_NORMAL_LOD_BIAS tunes it.
         float normalLodBias = 0.5f;
         if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_NORMAL_LOD_BIAS"),
-            System.Globalization.CultureInfo.InvariantCulture, out float nlb)) normalLodBias = nlb;
-        *(MotionConstants*)motionCbMapped = new MotionConstants {
+                System.Globalization.CultureInfo.InvariantCulture, out float nlb)) normalLodBias = nlb;
+        *(MotionConstants*)motionCbMapped = new MotionConstants
+        {
             ViewProjCur = Matrix4x4.Transpose(viewProjUnjittered),
             ViewProjPrev = Matrix4x4.Transpose(viewProjPrevForMotion),
             NormalLodBias = normalLodBias,
@@ -1086,47 +1251,53 @@ public sealed class DX12HDRenderer : HDRenderer {
         // the un-orbited serialized transform. For an un-orbited frame this equals vp.Transform.WorldPosition.
         Vector3 camPos = GiOrbitDegPerFrame != 0f && Matrix4x4.Invert(view, out Matrix4x4 invViewForPos)
             ? invViewForPos.Translation
-            : ToNumerics(vp.Transform.WorldPosition);
+            : vp.Transform.WorldPosition;
 
         // Blend the scene's active Volumes into PostFX once per frame (exposure/bloom/SSGI/etc.). This is the
         // ONLY bridge from the volume framework to the live render settings — it was never wired on DX12, so
         // EDITING the Exposure (or any) volume did NOTHING and PostFX sat at its constructor defaults (EV15).
         // The composite, fog, SSGI, etc. read PostFX, so this must run before them. BALLISTIC_DX12_VOLUMES=0
         // restores the old unwired behaviour (PostFX = defaults) for A/B.
-        if (doors.Volumes) {
+        if (doors.Volumes)
+        {
             VolumeManager.Update(camPos);
             VolumePostProcessing.Apply(VolumeManager.Stack, PostFX);
         }
 
         LightUniforms light = LightUniforms.Resolve();
-        Vector3 lightDir = ToNumerics(light.Direction);
-        Vector3 lightColor = ToNumerics(light.Color);
+        Vector3 lightDir = light.Direction;
+        Vector3 lightColor = light.Color;
         // Golden hour (P4): a ProceduralSky reddens/dims the directional sun by the SAME atmosphere it shows.
         // ProceduralSky.SunTransmittance was never called on DX12 — the sun was the raw white-balanced colour
         // at every elevation. Multiply it in here so geometry, the IBL bake and the sun disk all warm + fade
         // at low sun. BALLISTIC_DX12_SKY_TLUT=0 keeps the old (un-reddened) sun for A/B.
         bool tlutOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SKY_TLUT") != "0";
-        if (tlutOn && ProceduralSky.Active is { } skyForSun && lightDir.LengthSquared() > 1e-8f) {
+        if (tlutOn && ProceduralSky.Active is { } skyForSun && lightDir.LengthSquared() > 1e-8f)
+        {
             var st = skyForSun.SunTransmittance(new System.Numerics.Vector3(lightDir.X, lightDir.Y, lightDir.Z));
             lightColor *= new Vector3(st.X, st.Y, st.Z);
         }
+
         // Honor the AUTHORED ambient. The old MathF.Max(0.05f, …) floor OVERRODE a scene's explicit choice:
         // CornellBox authors ambientIntensity 0 (a pure direct/GI test) and LightTest 0.01 (a dark point-light
         // stage), but the floor forced both to 5%, washing CornellBox milky-grey and lifting LightTest's black.
         // SceneLighting defaults AmbientIntensity to 1.0, so scenes that want ambient already have plenty; a
         // scene that sets it low/zero means it. (IBL/GI add the real bounce ambient at their own stages.)
-        Vector3 ambient = ToNumerics(vp.AmbientColor) * light.AmbientIntensity;
+        Vector3 ambient = vp.AmbientColor * light.AmbientIntensity;
         // The sun radiance is HDR (lux-scaled, ~80000); a fixed pre-exposure brings it into a viewable
         // range before the ACES tonemap (the GL path auto-meters EV100; this is a constant stand-in for
         // first light). Tunable via BALLISTIC_DX12_EXPOSURE while dialing against the frozen baseline.
         // 1e-5 lands the PBR path (energy-conserving ÷π diffuse) near the GL baseline brightness; the DX12
         // image is intentionally a touch dimmer (no IBL ambient / shadows yet — those are next milestones).
         float exposure = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
-            System.Globalization.CultureInfo.InvariantCulture, out float e) ? e : 1.0e-5f;
+            System.Globalization.CultureInfo.InvariantCulture, out float e)
+            ? e
+            : 1.0e-5f;
 
         // GPU-driven: collect whole-mesh renderers once (used by BOTH the shadow pass and the geometry pass).
         wholeMeshRenderers.Clear();
-        if (gpuDrivenOn) {
+        if (gpuDrivenOn)
+        {
             foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
                 if (r is { IsActive: true, IsRenderable: true } && r.SubMeshIndex < 0 && r.SharedMesh != null)
                     wholeMeshRenderers.Add(r);
@@ -1144,7 +1315,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         // change). Own upload command list, before the render list. Only when a ProceduralSky is active.
         // doors.Ibl = off under BARE-MINIMUM → UseIBL=0 → deferred uses the flat-fill ambient branch.
         iblActiveThisFrame = false;
-        if (doors.Ibl && ProceduralSky.Active is { } pSky) {
+        if (doors.Ibl && ProceduralSky.Active is { } pSky)
+        {
             Vector3 sunDir = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
             float sunAngR = (DirectionalLight.Instance?.AngularDiameter ?? 0.53f) * 0.5f * (MathF.PI / 180f);
             // Transmittance LUT (re-bakes only on atmosphere-param change). Drives P5/P6 + the future shader
@@ -1162,15 +1334,25 @@ public sealed class DX12HDRenderer : HDRenderer {
         // BALLISTIC_DX12_PIPELINED=0 (then every pass submits+waits as before — the byte-identical fallback).
         dev.BeginFrame();
 
-        // Per-frame constants (b1): cascade matrices + shadow params.
-        var fc = new FrameConstants {
+        // Per-frame constants (b1): cascade matrices + shadow params. The cascade layout (count, blend) and the
+        // filtering/contact-shadow tail are volume-driven via PostFX (the Shadows VolumeComponent → bridge).
+        // activeCascadeCount + shadowMapSize were resolved in RenderShadows (it owns the fit + any reallocation).
+        var fc = new FrameConstants
+        {
             Cascade0 = Matrix4x4.Transpose(cascadeMatrices[0]),
             Cascade1 = Matrix4x4.Transpose(cascadeMatrices[1]),
             Cascade2 = Matrix4x4.Transpose(cascadeMatrices[2]),
             Cascade3 = Matrix4x4.Transpose(cascadeMatrices[3]),
             CascadeBias = new Vector4(0.0015f, 0.0020f, 0.0030f, 0.0050f),
-            CascadeCountF = CascadeCount, ShadowsEnabled = shadowsThisFrame ? 1f : 0f,
-            ShadowMapTexel = 1f / ShadowMapSize, CascadeBlend = 0.1f,
+            CascadeCountF = activeCascadeCount, ShadowsEnabled = shadowsThisFrame ? 1f : 0f,
+            ShadowMapTexel = 1f / shadowMapSize,
+            CascadeBlend = Math.Clamp(PostFX.ShadowCascadeBlend, 0f, 0.5f),
+            ShadowFiltering = PostFX.ShadowFiltering,
+            ShadowSoftness = PostFX.ShadowSoftness,
+            ContactShadowsOn = PostFX.ContactShadowsEnabled ? 1f : 0f,
+            ContactShadowLength = PostFX.ContactShadowLength,
+            ContactShadowSteps = PostFX.ContactShadowSteps,
+            ContactShadowThickness = PostFX.ContactShadowThickness,
         };
         *(FrameConstants*)frameCbMapped = fc;
 
@@ -1190,7 +1372,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         // Hi-Z: build the occlusion pyramid from the PREVIOUS frame's depth (before the geometry pass clears
         // it). Camera-delta gate: disable for one frame after a big jump (stale depth) + the first frame.
         bool hizEnabled = false;
-        if (hizWanted && wholeMeshRenderers.Count > 0) {
+        if (hizWanted && wholeMeshRenderers.Count > 0)
+        {
             float camDelta = (camPos - hizLastCamPos).Length();
             hizEnabled = hizPrimed && camDelta < 2.0f;
             hizLastCamPos = camPos;
@@ -1203,14 +1386,16 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         // === GEOMETRY PASS: fill the fat G-buffer (no lighting — GBuffer.hlsl writes albedo/normal/ORM/
         // emissive + depth). Same vertex transform + material sampling as the old forward opaque. ===
-        gbuffer.RenderGeometry(cl => {
+        gbuffer.RenderGeometry(cl =>
+        {
             cl.SetGraphicsRootSignature(gbufferRootSig);
             cl.SetPipelineState(gbufferPso);
             cl.SetDescriptorHeaps(srvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(2, motionCb.GPUVirtualAddress);   // b1 motion (per pass)
+            cl.SetGraphicsRootConstantBufferView(2, motionCb.GPUVirtualAddress); // b1 motion (per pass)
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
 
-            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
+            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
+            {
                 if (r is null || !r.IsActive || !r.IsRenderable) continue;
                 // Whole-mesh renderers are GPU-driven (compute cull + ExecuteIndirect) — skip them here.
                 if (gpuDrivenOn && r.SubMeshIndex < 0) continue;
@@ -1227,7 +1412,7 @@ public sealed class DX12HDRenderer : HDRenderer {
                 if (vb?.Resource is null || ib?.Resource is null ||
                     nb?.Resource is null || ub?.Resource is null || tb?.Resource is null) continue;
 
-                Matrix4x4 model = ToNumerics(r.Transform.WorldMatrix);
+                Matrix4x4 model = r.Transform.WorldMatrix;
                 Matrix4x4 mvp = model * viewProj;
 
                 Span<VertexBufferView> vbViews = stackalloc VertexBufferView[4];
@@ -1242,13 +1427,19 @@ public sealed class DX12HDRenderer : HDRenderer {
                 int first = only >= 0 ? only : 0;
                 int last = only >= 0 ? only : mesh.SubMeshes.Length - 1;
 
-                for (int s = first; s <= last; s++) {
+                for (int s = first; s <= last; s++)
+                {
                     if ((uint)s >= (uint)mesh.SubMeshes.Length) break;
                     SubMeshData sub = mesh.SubMeshes[s];
                     if (sub.IndexCount <= 0) continue;
                     // Per-submesh frustum cull (camera frustum from the UNJITTERED viewProj).
                     mesh.GetSubMeshBounds(s, out GLVector3 lmin, out GLVector3 lmax);
-                    if (!AabbInFrustum(lmin, lmax, model)) { culled++; continue; }
+                    if (!AabbInFrustum(lmin, lmax, model))
+                    {
+                        culled++;
+                        continue;
+                    }
+
                     Material mat = r.MaterialFor(s);
                     if (mat is null) continue;
                     // Transparent submeshes can't be deferred-shaded (no blending in a G-buffer) — they're
@@ -1262,15 +1453,16 @@ public sealed class DX12HDRenderer : HDRenderer {
                     // The G-buffer geometry shader reads the material-shaping fields (factors, maps, flags);
                     // the per-light fields (LightDir/LightColor/Ambient/Exposure) are unused here (they live
                     // in the deferred pass now) but the struct is shared, so they're filled harmlessly.
-                    var c = new DrawConstants {
+                    var c = new DrawConstants
+                    {
                         Mvp = Matrix4x4.Transpose(mvp),
                         Model = Matrix4x4.Transpose(model),
                         LightDir = lightDir, Exposure = exposure,
                         LightColor = lightColor, Metallic = mat.MetallicFactor,
                         Ambient = ambient, Roughness = mat.RoughnessFactor,
                         CameraPos = camPos, SpecularReflectance = mat.SpecularReflectance,
-                        BaseColorFactor = ToNumerics(mat.BaseColorFactor),
-                        EmissiveFactor = ToNumerics(mat.EmissiveColor) * mat.EmissiveIntensity,
+                        BaseColorFactor = mat.BaseColorFactor,
+                        EmissiveFactor = mat.EmissiveColor * mat.EmissiveIntensity,
                         HasEmissive = emissive ? 1f : 0f,
                         NormalStrength = mat.NormalStrength, NormalFlipY = mat.NormalFlipY ? 1f : 0f,
                         HasMetallicMap = hasMetal ? 1f : 0f, HasRoughnessMap = hasRough ? 1f : 0f,
@@ -1304,7 +1496,8 @@ public sealed class DX12HDRenderer : HDRenderer {
             // root sig + PSO once, then draw every skinned renderer with the 6-stream layout + a bone SRV. ===
             int boneSlot = 0;
             bool skinnedStateSet = false;
-            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
+            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
+            {
                 if (r is null || !r.IsActive || !r.IsRenderable || !r.IsSkinned) continue;
                 Mesh mesh = r.SharedMesh;
                 if (mesh is null || !mesh.IsSkinned) continue;
@@ -1328,21 +1521,23 @@ public sealed class DX12HDRenderer : HDRenderer {
                 byte* dst = boneMatrixMapped + (long)boneSlot * boneMatrixSlotSize;
                 var mptr = (Matrix4x4*)dst;
                 for (int b = 0; b < boneCount; b++)
-                    mptr[b] = Matrix4x4.Transpose(ToNumerics(skin[b]));
+                    mptr[b] = Matrix4x4.Transpose(skin[b]);
                 // Any unset slot stays whatever was there; only indices < boneCount are referenced by weights.
                 ulong boneGpuAddr = boneMatrixRing.GPUVirtualAddress + (ulong)((long)boneSlot * boneMatrixSlotSize);
 
-                if (!skinnedStateSet) {
+                if (!skinnedStateSet)
+                {
                     cl.SetGraphicsRootSignature(skinnedGbufferRootSig);
                     cl.SetPipelineState(skinnedGbufferPso);
                     cl.SetDescriptorHeaps(srvVisible.Heap);
-                    cl.SetGraphicsRootConstantBufferView(2, motionCb.GPUVirtualAddress);   // b1 motion
+                    cl.SetGraphicsRootConstantBufferView(2, motionCb.GPUVirtualAddress); // b1 motion
                     cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
                     skinnedStateSet = true;
                 }
-                cl.SetGraphicsRootShaderResourceView(3, boneGpuAddr);   // t6 bone matrices (root SRV)
 
-                Matrix4x4 model = ToNumerics(r.Transform.WorldMatrix);
+                cl.SetGraphicsRootShaderResourceView(3, boneGpuAddr); // t6 bone matrices (root SRV)
+
+                Matrix4x4 model = r.Transform.WorldMatrix;
                 Matrix4x4 mvp = model * viewProj;
 
                 Span<VertexBufferView> sViews = stackalloc VertexBufferView[6];
@@ -1358,7 +1553,8 @@ public sealed class DX12HDRenderer : HDRenderer {
                 int sOnly = r.SubMeshIndex;
                 int sFirst = sOnly >= 0 ? sOnly : 0;
                 int sLast = sOnly >= 0 ? sOnly : mesh.SubMeshes.Length - 1;
-                for (int s = sFirst; s <= sLast; s++) {
+                for (int s = sFirst; s <= sLast; s++)
+                {
                     if ((uint)s >= (uint)mesh.SubMeshes.Length) break;
                     SubMeshData sub = mesh.SubMeshes[s];
                     if (sub.IndexCount <= 0) continue;
@@ -1372,15 +1568,16 @@ public sealed class DX12HDRenderer : HDRenderer {
                     bool hasMetal = mat.Metallic is not null;
                     bool hasRough = mat.Roughness is not null;
                     bool emissive = mat.IsEmissive;
-                    var c = new DrawConstants {
+                    var c = new DrawConstants
+                    {
                         Mvp = Matrix4x4.Transpose(mvp),
                         Model = Matrix4x4.Transpose(model),
                         LightDir = lightDir, Exposure = exposure,
                         LightColor = lightColor, Metallic = mat.MetallicFactor,
                         Ambient = ambient, Roughness = mat.RoughnessFactor,
                         CameraPos = camPos, SpecularReflectance = mat.SpecularReflectance,
-                        BaseColorFactor = ToNumerics(mat.BaseColorFactor),
-                        EmissiveFactor = ToNumerics(mat.EmissiveColor) * mat.EmissiveIntensity,
+                        BaseColorFactor = mat.BaseColorFactor,
+                        EmissiveFactor = mat.EmissiveColor * mat.EmissiveIntensity,
                         HasEmissive = emissive ? 1f : 0f,
                         NormalStrength = mat.NormalStrength, NormalFlipY = mat.NormalFlipY ? 1f : 0f,
                         HasMetallicMap = hasMetal ? 1f : 0f, HasRoughnessMap = hasRough ? 1f : 0f,
@@ -1406,11 +1603,13 @@ public sealed class DX12HDRenderer : HDRenderer {
                     tris += sub.IndexCount / 3;
                     slot++;
                 }
+
                 boneSlot++;
             }
 
             // Restore the static G-buffer state for any passes after this callback that assume it.
-            if (skinnedStateSet) {
+            if (skinnedStateSet)
+            {
                 cl.SetGraphicsRootSignature(gbufferRootSig);
                 cl.SetPipelineState(gbufferPso);
                 cl.SetGraphicsRootConstantBufferView(2, motionCb.GPUVirtualAddress);
@@ -1419,7 +1618,8 @@ public sealed class DX12HDRenderer : HDRenderer {
             // GPU-driven whole-mesh geometry: compute cull + ExecuteIndirect + bindless materials, into the
             // same G-buffer. Uses the JITTERED viewProj for the per-draw Mvp (matches the CPU path) and the
             // UNJITTERED frustum planes for culling (byte-identical visible set).
-            if (gpuDrivenOn && wholeMeshRenderers.Count > 0) {
+            if (gpuDrivenOn && wholeMeshRenderers.Count > 0)
+            {
                 draws += gpuDriven.RenderInto(cl, wholeMeshRenderers, viewProj, frustumPlanes,
                     viewProjUnjittered, view, CameraNear, CameraFar, motionCb.GPUVirtualAddress);
                 tris += gpuDriven.LastTris;
@@ -1428,7 +1628,8 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         // Hi-Z debug door: how many whole-mesh submeshes survived the GPU cull (frustum + Hi-Z occlusion).
         if (gpuDrivenOn && wholeMeshRenderers.Count > 0
-            && Environment.GetEnvironmentVariable("BALLISTIC_DX12_HIZ_DEBUG") == "1") {
+                        && Environment.GetEnvironmentVariable("BALLISTIC_DX12_HIZ_DEBUG") == "1")
+        {
             var (vis, tot) = gpuDriven.DebugVisibleCount();
             Console.WriteLine($"[HiZDebug] visible submeshes {vis}/{tot} (hizEnabled={(hizEnabled ? 1 : 0)})");
         }
@@ -1478,7 +1679,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         // This is ABSOLUTE — even the BALLISTIC_DX12_RT_GI=1 force door loses to it, because a forced RT path on a
         // non-DXR device is the device-removal/PC-crash hazard ([[gpu-hang-launch-safety]]). EnsureRtGi already
         // returns false without RT, so GI was guarded; this makes the intent explicit + logs once for all 3 effects.
-        if (!dev.HasHardwareRayTracing) {
+        if (!dev.HasHardwareRayTracing)
+        {
             if (giMode == GiMode.RayTraced) giMode = GiMode.ScreenSpace;
             WarnNoRtOnce();
         }
@@ -1491,29 +1693,31 @@ public sealed class DX12HDRenderer : HDRenderer {
         // so each converted pass executes at its canonical inline position (Deferred at OpaqueLighting; Sky/AP/
         // Transparents next; Fog after GI; SSAO/TAA/FSR after SSR; Composite last). As more passes convert, the
         // windows merge into one Execute (step G). ===
-        var ctx = new Dx12FrameContext {
+        var ctx = new Dx12FrameContext
+        {
             View = view, Proj = proj, ViewProj = viewProj,
             ProjUnjittered = projUnjittered, ViewProjUnjittered = viewProjUnjittered,
             CurrentJitter = currentJitter, CamPos = camPos,
             LightDir = lightDir, LightColor = lightColor, Ambient = ambient, Exposure = exposure,
             WholeMeshRenderers = wholeMeshRenderers, FrustumPlanes = frustumPlanes,
-            CascadeMatrices = cascadeMatrices,   // shared per-frame array, filled by RenderShadows; Fog reads it
+            CascadeMatrices = cascadeMatrices, // shared per-frame array, filled by RenderShadows; Fog reads it
             TargetW = targetW, TargetH = targetH, OutputW = outputW, OutputH = outputH,
             Dev = dev, Target = target, Ldr = ldr, GBuffer = gbuffer,
             Ibl = ibl, SkyLuts = skyLuts, ClusteredLights = clusteredLights,
             ShadowMap = shadowMap, GpuDriven = gpuDriven,
-            RtShadowMask = rtShadowMask,   // chunk 9: deferred binds it to t12 when RtShadowsThisFrame (null → fallback)
-            Dxr = dxr,   // chunk 10: shared DXR substrate (sceneAS/device5/rtGeometry/ddgi) for the GI + Reflections passes
-            FrameCbAddress = frameCb.GPUVirtualAddress,   // chunk 8: Transparents binds it; chunk 9: Deferred binds it too (b1 FrameConstants CBV)
+            RtShadowMask = rtShadowMask, // chunk 9: deferred binds it to t12 when RtShadowsThisFrame (null → fallback)
+            Dxr = dxr, // chunk 10: shared DXR substrate (sceneAS/device5/rtGeometry/ddgi) for the GI + Reflections passes
+            FrameCbAddress =
+                frameCb.GPUVirtualAddress, // chunk 8: Transparents binds it; chunk 9: Deferred binds it too (b1 FrameConstants CBV)
             Doors = doors, PostFX = PostFX, Stats = RenderStats.Scene,
-            BarriersDerived = barriersPath,   // chunk 14 (V3): migrated passes skip their manual head transition when on
-            // chunk 7 (composite): deterministic flag (grain/exposure reset) + the SSAO pass output the composite
-            // samples for AO. SsaoResult is a stable descriptor handle (ssaoA.ColorSrvCpu) — only its contents
-            // change per frame, so binding it at ctx build is always correct.
+            BarriersDerived = barriersPath, // chunk 14 (V3): migrated passes skip their manual head transition when on
+            // deterministic flag (grain/exposure reset) + the GTAO pass output the DEFERRED LIGHTING pass samples
+            // for the ambient AO term. AoResult is a stable descriptor handle (gtaoA.ColorSrvCpu) — only its
+            // contents change per frame, so binding it at ctx build is always correct.
             DeterministicCapture = DeterministicCapture,
-            SsaoResult = ssaoPass.ResultSrvCpu,
-            TaaActive = taaOn, FsrActive = fsrActive,   // chunk 7: TaaPass runs in native path; FsrPass when FsrActive
-            Fsr = fsr, FsrOutput = fsrOutput, MotionPrevValid = motionPrevValid,   // chunk 7: FsrPass dispatch inputs
+            AoResult = gtaoPass.ResultSrvCpu,
+            TaaActive = taaOn, FsrActive = fsrActive, // chunk 7: TaaPass runs in native path; FsrPass when FsrActive
+            Fsr = fsr, FsrOutput = fsrOutput, MotionPrevValid = motionPrevValid, // chunk 7: FsrPass dispatch inputs
             // mutated-mid-frame fields, set to their resolved final value:
             SceneColor = fsrActive ? fsrOutput : target,
             IblActiveThisFrame = iblActiveThisFrame,
@@ -1600,21 +1804,26 @@ public sealed class DX12HDRenderer : HDRenderer {
     // Gather the scene's active point/spot lights into the clustered light buffer + CPU froxel-cull. Reads
     // typed properties only (no reflection). Radiance is RAW HDR PhysicalColor (NOT pre-exposed — the DX12
     // composite auto-meters it, exactly like the sun), unlike the GL path which pre-exposes at upload.
-    void GatherPunctualLights(Matrix4x4 view, Matrix4x4 proj) {
+    void GatherPunctualLights(Matrix4x4 view, Matrix4x4 proj)
+    {
         clusteredLights.BeginGather();
-        foreach (PointLight p in RuntimeSet<PointLight>.ReadOnlyCollection) {
+        foreach (PointLight p in RuntimeSet<PointLight>.ReadOnlyCollection)
+        {
             if (p is null || !p.IsActive) continue;
-            clusteredLights.AddPoint(ToNumerics(p.transform.WorldPosition), p.Range,
-                ToNumerics(p.PhysicalColor), p.SourceRadius);
+            clusteredLights.AddPoint(p.transform.WorldPosition, p.Range,
+                p.PhysicalColor, p.SourceRadius);
         }
-        foreach (SpotLight s in RuntimeSet<SpotLight>.ReadOnlyCollection) {
+
+        foreach (SpotLight s in RuntimeSet<SpotLight>.ReadOnlyCollection)
+        {
             if (s is null || !s.IsActive) continue;
             Vector3 dir = Vector3.Transform(Vector3.UnitZ, s.transform.WorldRotation);
             float inner = Math.Clamp(s.InnerAngle, 0f, 89f) * (MathF.PI / 180f);
             float outer = Math.Clamp(MathF.Max(s.OuterAngle, s.InnerAngle), 0f, 89.9f) * (MathF.PI / 180f);
-            clusteredLights.AddSpot(ToNumerics(s.transform.WorldPosition), dir, s.Range,
-                ToNumerics(s.PhysicalColor), MathF.Cos(inner), MathF.Cos(outer), s.SourceRadius);
+            clusteredLights.AddSpot(s.transform.WorldPosition, dir, s.Range,
+                s.PhysicalColor, MathF.Cos(inner), MathF.Cos(outer), s.SourceRadius);
         }
+
         clusteredLights.Cull(view, proj, targetW, targetH, CameraNear, CameraFar);
     }
 
@@ -1635,10 +1844,12 @@ public sealed class DX12HDRenderer : HDRenderer {
 
     // The active upscale mode: the volume's PostFX.UpscaleMode, overridable by BALLISTIC_DX12_FSR for
     // headless A/B (off/nativeaa/quality/balanced/performance/ultra) — a kept test door.
-    UpscaleMode ResolveUpscaleMode() {
+    UpscaleMode ResolveUpscaleMode()
+    {
         string env = Environment.GetEnvironmentVariable("BALLISTIC_DX12_FSR");
         if (string.IsNullOrEmpty(env)) return PostFX.UpscaleMode;
-        return env.Trim().ToLowerInvariant() switch {
+        return env.Trim().ToLowerInvariant() switch
+        {
             "0" or "off" => UpscaleMode.Off,
             "1" or "native" or "nativeaa" => UpscaleMode.NativeAA,
             "quality" or "q" => UpscaleMode.Quality,
@@ -1665,15 +1876,17 @@ public sealed class DX12HDRenderer : HDRenderer {
     // RT sun shadows STAY inline core (the plan converts them in a later chunk). chunk 10 rewired the lazy
     // DXR-availability probe + the device5/sceneAS lazy-init onto the shared `dxr` holder (Dx12DxrShared) — the
     // SAME shared substrate the GI + Reflections passes use — so all three reuse one scene AS / device5.
-    unsafe bool EnsureRtShadows() {
-        if (!dxr.CheckAvailable("RTShadows")) return false;   // shared DXR-availability probe (chunk 10)
+    unsafe bool EnsureRtShadows()
+    {
+        if (!dxr.CheckAvailable("RTShadows")) return false; // shared DXR-availability probe (chunk 10)
         if (rtShadowBuilt) return true;
         rtShadowBuilt = true;
 
-        var device5 = dxr.Device5;   // shared ID3D12Device5 facet (chunk 10)
+        var device5 = dxr.Device5; // shared ID3D12Device5 facet (chunk 10)
 
         // Global root sig: CBV(b0) + table {SRV t0 TLAS, t1 depth, t2 normal; UAV u0 mask}.
-        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0),
+            ShaderVisibility.All);
         var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 3, baseShaderRegister: 0);
         var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);
         var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange), ShaderVisibility.All);
@@ -1682,11 +1895,12 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("DxrShadows.hlsl");
         byte[] dxil = Dx12ShaderCompiler.Compile(DxcShaderStage.Library, hlsl, "", "DxrShadows.hlsl");
-        var subs = new[] {
+        var subs = new[]
+        {
             new StateSubObject(new DxilLibraryDescription(dxil,
                 new ExportDescription("RayGen"), new ExportDescription("Miss"), new ExportDescription("ClosestHit"))),
             new StateSubObject(new HitGroupDescription("HitGroup", HitGroupType.Triangles, "", "ClosestHit", "")),
-            new StateSubObject(new RaytracingShaderConfig(4, 8)),   // payload = uint Occluded
+            new StateSubObject(new RaytracingShaderConfig(4, 8)), // payload = uint Occluded
             new StateSubObject(new RaytracingPipelineConfig(1)),
             new StateSubObject(new GlobalRootSignature(rtShadowRootSig)),
         };
@@ -1697,9 +1911,12 @@ public sealed class DX12HDRenderer : HDRenderer {
         rtShadowSbt = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer(RtSbtSlot * 3), ResourceStates.GenericRead);
         byte* sp = rtShadowSbt.Map<byte>(0);
-        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 0 * RtSbtSlot, (void*)props.GetShaderIdentifier("RayGen"), idSize);
-        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 1 * RtSbtSlot, (void*)props.GetShaderIdentifier("Miss"), idSize);
-        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 2 * RtSbtSlot, (void*)props.GetShaderIdentifier("HitGroup"), idSize);
+        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 0 * RtSbtSlot, (void*)props.GetShaderIdentifier("RayGen"),
+            idSize);
+        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 1 * RtSbtSlot, (void*)props.GetShaderIdentifier("Miss"),
+            idSize);
+        System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 2 * RtSbtSlot,
+            (void*)props.GetShaderIdentifier("HitGroup"), idSize);
         rtShadowSbt.Unmap(0);
 
         int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<RtShadowConstants>() + 255) & ~255;
@@ -1712,7 +1929,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         return true;
     }
 
-    void AllocRtShadowMask() {
+    void AllocRtShadowMask()
+    {
         rtShadowMask?.Dispose();
         rtShadowMask = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false,
             colorFormat: Format.R8_UNorm, colorReadable: true, allowUav: true);
@@ -1721,8 +1939,9 @@ public sealed class DX12HDRenderer : HDRenderer {
     // RT sun shadows: ensure the scene AS, then DispatchRays one shadow ray per pixel → rtShadowMask. The
     // mask is left in PixelShaderResource for the deferred pass (UseRtShadows). viewProj is the JITTERED
     // matrix the depth was rendered with (matches the deferred pass's world-pos reconstruction).
-    unsafe void DrawRtShadows(Matrix4x4 viewProj, Vector3 lightDir) {
-        var sceneAS = dxr.SceneAS;   // shared scene AS (chunk 10)
+    unsafe void DrawRtShadows(Matrix4x4 viewProj, Vector3 lightDir)
+    {
+        var sceneAS = dxr.SceneAS; // shared scene AS (chunk 10)
         sceneAS.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection);
         if (!sceneAS.Valid) return;
 
@@ -1736,31 +1955,44 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
         Vector3 sun = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
-        *(RtShadowConstants*)rtShadowCbMapped = new RtShadowConstants {
+        *(RtShadowConstants*)rtShadowCbMapped = new RtShadowConstants
+        {
             InvViewProj = Matrix4x4.Transpose(invVP), SunDir = sun, NormalBias = 0.05f,
         };
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         sceneAS.CreateTlasSrv(rtShadowHeap.Cpu(0));
         dev.Device.CopyDescriptorsSimple(1, rtShadowHeap.Cpu(1), gbuffer.DepthSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, rtShadowHeap.Cpu(2), gbuffer.ColorSrvCpu(1), heapType);  // world normal
-        dev.Device.CreateUnorderedAccessView(rtShadowMask.RenderTarget, null, new UnorderedAccessViewDescription {
+        dev.Device.CopyDescriptorsSimple(1, rtShadowHeap.Cpu(2), gbuffer.ColorSrvCpu(1), heapType); // world normal
+        dev.Device.CreateUnorderedAccessView(rtShadowMask.RenderTarget, null, new UnorderedAccessViewDescription
+        {
             Format = Format.R8_UNorm, ViewDimension = UnorderedAccessViewDimension.Texture2D,
         }, rtShadowHeap.Cpu(3));
 
         rtShadowMask.ColorToUnorderedAccess();
         uint idSize = Vortice.Direct3D12.D3D12.ShaderIdentifierSizeInBytes;
-        dev.ExecuteSync(cl => {
+        dev.ExecuteSync(cl =>
+        {
             cl.SetDescriptorHeaps(rtShadowHeap.Heap);
             cl.SetComputeRootSignature(rtShadowRootSig);
             cl.SetPipelineState1(rtShadowPso);
             cl.SetComputeRootConstantBufferView(0, rtShadowCb.GPUVirtualAddress);
             cl.SetComputeRootDescriptorTable(1, rtShadowHeap.Gpu(0));
-            cl.DispatchRays(new DispatchRaysDescription {
+            cl.DispatchRays(new DispatchRaysDescription
+            {
                 Width = (uint)targetW, Height = (uint)targetH, Depth = 1,
-                RayGenerationShaderRecord = new GpuVirtualAddressRange { StartAddress = rtShadowSbt.GPUVirtualAddress, SizeInBytes = idSize },
-                MissShaderTable = new GpuVirtualAddressRangeAndStride { StartAddress = rtShadowSbt.GPUVirtualAddress + RtSbtSlot, SizeInBytes = idSize, StrideInBytes = idSize },
-                HitGroupTable = new GpuVirtualAddressRangeAndStride { StartAddress = rtShadowSbt.GPUVirtualAddress + 2 * RtSbtSlot, SizeInBytes = idSize, StrideInBytes = idSize },
+                RayGenerationShaderRecord = new GpuVirtualAddressRange
+                    { StartAddress = rtShadowSbt.GPUVirtualAddress, SizeInBytes = idSize },
+                MissShaderTable = new GpuVirtualAddressRangeAndStride
+                {
+                    StartAddress = rtShadowSbt.GPUVirtualAddress + RtSbtSlot, SizeInBytes = idSize,
+                    StrideInBytes = idSize
+                },
+                HitGroupTable = new GpuVirtualAddressRangeAndStride
+                {
+                    StartAddress = rtShadowSbt.GPUVirtualAddress + 2 * RtSbtSlot, SizeInBytes = idSize,
+                    StrideInBytes = idSize
+                },
             });
         });
         rtShadowMask.ColorToShaderResource();
@@ -1774,7 +2006,8 @@ public sealed class DX12HDRenderer : HDRenderer {
     // probe is correct geometry. The per-face geometry is the SAME per-submesh loop as the camera G-buffer (lean
     // variant: probe PSO writes albedo+normal+depth only, no lighting fields, no GPU-driven whole-mesh path —
     // that's a P7.2c add). One ExecuteSync (all 6 faces batched). Returns leaving ssgiTarget untouched unless debug.
-    unsafe void DrawRasterProbeMeasure(Vector3 camPos) {
+    unsafe void DrawRasterProbeMeasure(Vector3 camPos)
+    {
         if (rasterProbe == null) rasterProbe = new Dx12RasterProbe(dev);
         rasterProbe.Build();
 
@@ -1783,7 +2016,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         // per-submesh draws/face. A/B the two cost numbers against the same probe. Only the WHOLE-MESH renderers
         // feed the proxy (SubMeshIndex<0 — the ~1600-submesh Bistro mass = 100% of the P7.2a cost); non-whole-mesh
         // renderers are rare and deferred (P7.2c can add them back via the per-submesh loop if a fixture needs it).
-        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_NORT_PROBES_PROXY") == "1") {
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_NORT_PROBES_PROXY") == "1")
+        {
             DrawRasterProbeMeasureProxy(camPos);
             return;
         }
@@ -1796,15 +2030,18 @@ public sealed class DX12HDRenderer : HDRenderer {
         // probeDrawSlot indexes a SEPARATE region of the CBV ring (starting high) so it can't collide with the
         // camera geometry pass's slots this frame.
         int probeDraws = 0;
-        int probeDrawSlot = cbSlotCount / 2;   // upper half of the CBV ring — disjoint from camera-pass slots
-        void DrawFace(ID3D12GraphicsCommandList4 cl, Matrix4x4 faceVP) {
+        int probeDrawSlot = cbSlotCount / 2; // upper half of the CBV ring — disjoint from camera-pass slots
+
+        void DrawFace(ID3D12GraphicsCommandList4 cl, Matrix4x4 faceVP)
+        {
             cl.SetGraphicsRootSignature(rasterProbe.GeoRootSig);
             cl.SetPipelineState(rasterProbe.GeoPso);
             cl.SetDescriptorHeaps(srvVisible.Heap);
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            ExtractFrustumPlanes(faceVP);   // sets frustumPlanes used by AabbInFrustum (camera frustum already consumed)
+            ExtractFrustumPlanes(faceVP); // sets frustumPlanes used by AabbInFrustum (camera frustum already consumed)
 
-            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
+            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
+            {
                 if (r is null || !r.IsActive || !r.IsRenderable) continue;
                 Mesh mesh = r.SharedMesh;
                 if (mesh is null) continue;
@@ -1816,7 +2053,7 @@ public sealed class DX12HDRenderer : HDRenderer {
                 if (vb?.Resource is null || ib?.Resource is null || nb?.Resource is null ||
                     ub?.Resource is null || tb?.Resource is null) continue;
 
-                Matrix4x4 model = ToNumerics(r.Transform.WorldMatrix);
+                Matrix4x4 model = r.Transform.WorldMatrix;
                 Matrix4x4 mvp = model * faceVP;
                 Span<VertexBufferView> vbViews = stackalloc VertexBufferView[4];
                 vbViews[0] = new VertexBufferView(vb.GpuAddress, (uint)vb.ByteSize, (uint)vb.Stride);
@@ -1829,7 +2066,8 @@ public sealed class DX12HDRenderer : HDRenderer {
                 int only = r.SubMeshIndex;
                 int first = only >= 0 ? only : 0;
                 int last = only >= 0 ? only : mesh.SubMeshes.Length - 1;
-                for (int s = first; s <= last; s++) {
+                for (int s = first; s <= last; s++)
+                {
                     if ((uint)s >= (uint)mesh.SubMeshes.Length) break;
                     SubMeshData sub = mesh.SubMeshes[s];
                     if (sub.IndexCount <= 0) continue;
@@ -1839,13 +2077,15 @@ public sealed class DX12HDRenderer : HDRenderer {
                     if (mat is null || mat.Transparent) continue;
                     if (probeDrawSlot >= cbSlotCount) break;
 
-                    var c = new DrawConstants {
+                    var c = new DrawConstants
+                    {
                         Mvp = Matrix4x4.Transpose(mvp), Model = Matrix4x4.Transpose(model),
-                        BaseColorFactor = ToNumerics(mat.BaseColorFactor),
+                        BaseColorFactor = mat.BaseColorFactor,
                         Cutout = mat.Cutout ? 1f : 0f, HasEmissive = mat.IsEmissive ? 1f : 0f,
                     };
                     *(DrawConstants*)(cbMapped + (long)probeDrawSlot * cbSlotSize) = c;
-                    cl.SetGraphicsRootConstantBufferView(0, cbRing.GPUVirtualAddress + (ulong)((long)probeDrawSlot * cbSlotSize));
+                    cl.SetGraphicsRootConstantBufferView(0,
+                        cbRing.GPUVirtualAddress + (ulong)((long)probeDrawSlot * cbSlotSize));
 
                     int tableStart = srvVisible.AllocateRange(Dx12RasterProbe.MaterialSrvCount);
                     BindSrv(tableStart + 0, mat.Diffuse, TextureType.Diffuse, fallbackDiffuse);
@@ -1857,7 +2097,8 @@ public sealed class DX12HDRenderer : HDRenderer {
                     cl.SetGraphicsRootDescriptorTable(1, srvVisible.Gpu(tableStart));
 
                     cl.DrawIndexedInstanced((uint)sub.IndexCount, 1, (uint)sub.IndexStart, 0, 0);
-                    probeDrawSlot++; probeDraws++;
+                    probeDrawSlot++;
+                    probeDraws++;
                 }
             }
         }
@@ -1873,17 +2114,19 @@ public sealed class DX12HDRenderer : HDRenderer {
         sw.Stop();
         RenderStats.Scene.GpuPasses.Add(("GI:RasterProbe1", sw.Elapsed.TotalMilliseconds));
 
-        if (!rasterProbeLogged) {
+        if (!rasterProbeLogged)
+        {
             rasterProbeLogged = true;
             int perFace = probeDraws / 6;
             Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
                 $"[RASTERPROBE] P7.2a measure: 1 probe x 6 faces @ {Dx12RasterProbe.FaceRes}px = {probeDraws} draws " +
-                $"(~{perFace}/face) in {sw.Elapsed.TotalMilliseconds:0.000}ms (dev card). VRAM {rasterProbe.VramBytes/1024.0:0.0}KB. " +
-                $"Extrapolate: 128 probes/frame ~= {sw.Elapsed.TotalMilliseconds*128:0.0}ms naive (before proxy/cull tuning)."));
+                $"(~{perFace}/face) in {sw.Elapsed.TotalMilliseconds:0.000}ms (dev card). VRAM {rasterProbe.VramBytes / 1024.0:0.0}KB. " +
+                $"Extrapolate: 128 probes/frame ~= {sw.Elapsed.TotalMilliseconds * 128:0.0}ms naive (before proxy/cull tuning)."));
         }
 
         // Debug: equirect-blit the albedo cube into ssgiTarget so the GI-isolate capture shows the probe geometry.
-        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_NORT_PROBES_DEBUG") == "1") {
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_NORT_PROBES_DEBUG") == "1")
+        {
             if (rasterProbeDbgHeap == null)
                 rasterProbeDbgHeap = new Dx12DescriptorHeap(dev,
                     DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true);
@@ -1891,11 +2134,13 @@ public sealed class DX12HDRenderer : HDRenderer {
             dev.Device.CopyDescriptorsSimple(1, rasterProbeDbgHeap.Cpu(0), rasterProbe.AlbedoCubeSrv, ht);
             // chunk 10: ssgiTarget now lives in the GI pass; the NORT debug blit reaches it via giPass.SsgiTarget.
             var dbgGi = giPass.SsgiTarget;
-            dev.Device.CreateUnorderedAccessView(dbgGi.RenderTarget, null, new UnorderedAccessViewDescription {
+            dev.Device.CreateUnorderedAccessView(dbgGi.RenderTarget, null, new UnorderedAccessViewDescription
+            {
                 Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
             }, rasterProbeDbgHeap.Cpu(1));
             dbgGi.ColorToUnorderedAccess();
-            dev.ExecuteSync(cl => rasterProbe.DebugBlit(cl, rasterProbeDbgHeap, dbgGi.Width, dbgGi.Height, SsgiPreExposure()));
+            dev.ExecuteSync(cl =>
+                rasterProbe.DebugBlit(cl, rasterProbeDbgHeap, dbgGi.Width, dbgGi.Height, SsgiPreExposure()));
             dbgGi.ColorToShaderResource();
         }
     }
@@ -1904,7 +2149,8 @@ public sealed class DX12HDRenderer : HDRenderer {
     // ~1 ExecuteIndirect/mesh-group/face) and time it — the go/no-go cost vs P7.2a's 7.483ms/probe per-submesh
     // floor. Build the bindless material table (stamp-cached; the lean shader reads GpuMaterials[matId] + bindless
     // diffuse) + the probe pipeline + the per-face meta ONCE, then RenderOneProbeGpuDriven batches all 6 faces.
-    unsafe void DrawRasterProbeMeasureProxy(Vector3 camPos) {
+    unsafe void DrawRasterProbeMeasureProxy(Vector3 camPos)
+    {
         gpuDriven.EnsureMaterialTable(wholeMeshRenderers);
         gpuDriven.BuildProbePipeline(Dx12RasterProbe.ProbeAlbedoFormat,
             Dx12RasterProbe.ProbeNormalFormat, Dx12RasterProbe.ProbeDepthFormat);
@@ -1914,7 +2160,9 @@ public sealed class DX12HDRenderer : HDRenderer {
         gpuDriven.ProbeBuildFaceMeta(wholeMeshRenderers, faceVPs);
 
         int probeExecs = 0;
-        void DrawFace(ID3D12GraphicsCommandList4 cl, int face) {
+
+        void DrawFace(ID3D12GraphicsCommandList4 cl, int face)
+        {
             probeExecs += gpuDriven.RenderIntoProbeFace(cl, face);
         }
 
@@ -1923,17 +2171,19 @@ public sealed class DX12HDRenderer : HDRenderer {
         sw.Stop();
         RenderStats.Scene.GpuPasses.Add(("GI:RasterProbeProxy", sw.Elapsed.TotalMilliseconds));
 
-        if (!rasterProbeLogged) {
+        if (!rasterProbeLogged)
+        {
             rasterProbeLogged = true;
             Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
                 $"[RASTERPROBE] P7.2b PROXY measure: 1 probe x 6 faces @ {Dx12RasterProbe.FaceRes}px = {probeExecs} " +
                 $"ExecuteIndirect (~{probeExecs / 6.0:0.0}/face), {gpuDriven.ProbeLastTris} tris fed in " +
                 $"{sw.Elapsed.TotalMilliseconds:0.000}ms (dev card) vs P7.2a 7.483ms/probe per-submesh. " +
-                $"Extrapolate: 128 probes/frame ~= {sw.Elapsed.TotalMilliseconds*128:0.0}ms naive (round-robin cuts this)."));
+                $"Extrapolate: 128 probes/frame ~= {sw.Elapsed.TotalMilliseconds * 128:0.0}ms naive (round-robin cuts this)."));
         }
 
         // Debug blit (same as P7.2a) — show the proxy-rasterized albedo cube so the geometry is visibly correct.
-        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_NORT_PROBES_DEBUG") == "1") {
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_NORT_PROBES_DEBUG") == "1")
+        {
             if (rasterProbeDbgHeap == null)
                 rasterProbeDbgHeap = new Dx12DescriptorHeap(dev,
                     DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true);
@@ -1941,17 +2191,19 @@ public sealed class DX12HDRenderer : HDRenderer {
             dev.Device.CopyDescriptorsSimple(1, rasterProbeDbgHeap.Cpu(0), rasterProbe.AlbedoCubeSrv, ht);
             // chunk 10: ssgiTarget now lives in the GI pass; the NORT debug blit reaches it via giPass.SsgiTarget.
             var dbgGi = giPass.SsgiTarget;
-            dev.Device.CreateUnorderedAccessView(dbgGi.RenderTarget, null, new UnorderedAccessViewDescription {
+            dev.Device.CreateUnorderedAccessView(dbgGi.RenderTarget, null, new UnorderedAccessViewDescription
+            {
                 Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
             }, rasterProbeDbgHeap.Cpu(1));
             dbgGi.ColorToUnorderedAccess();
-            dev.ExecuteSync(cl => rasterProbe.DebugBlit(cl, rasterProbeDbgHeap, dbgGi.Width, dbgGi.Height, SsgiPreExposure()));
+            dev.ExecuteSync(cl =>
+                rasterProbe.DebugBlit(cl, rasterProbeDbgHeap, dbgGi.Width, dbgGi.Height, SsgiPreExposure()));
             dbgGi.ColorToShaderResource();
         }
     }
 
-    // DrawSsao moved VERBATIM to Resources/Dx12SsaoPass.Record (chunk 4). It runs at the PostProcess event via
-    // graph.Execute; the still-inline composite reads its blurred half-res AO via ssaoPass.ResultSrvCpu.
+    // GTAO is Dx12GtaoPass.Record. It runs at the AfterGBuffer event (200) via graph.Execute; the deferred
+    // lighting pass reads its blurred AO via gtaoPass.ResultSrvCpu (ctx.AoResult) and applies it to ambient only.
 
     // DrawBloom / DumpMeteredLuminance / DumpAdaptedEv / DrawComposite moved VERBATIM into
     // Resources/Dx12CompositePass.cs (chunk 7). DrawComposite became Dx12CompositePass.Record; bloom +
@@ -1966,75 +2218,133 @@ public sealed class DX12HDRenderer : HDRenderer {
 
     // Hash of all active shadow-caster transforms — changes when geometry moves/appears (so cascade caching
     // re-renders). Camera/sun motion is caught separately by the cascade fit matrices. No reflection (typed).
-    int ComputeShadowCasterStamp() {
+    int ComputeShadowCasterStamp()
+    {
         var h = new System.HashCode();
-        foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
+        foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
+        {
             if (r is null || !r.IsActive || !r.IsRenderable) continue;
             GLMatrix4 m = r.Transform.WorldMatrix;
-            h.Add(m.M11); h.Add(m.M12); h.Add(m.M13); h.Add(m.M14);
-            h.Add(m.M21); h.Add(m.M22); h.Add(m.M23); h.Add(m.M24);
-            h.Add(m.M31); h.Add(m.M32); h.Add(m.M33); h.Add(m.M34);
-            h.Add(m.M41); h.Add(m.M42); h.Add(m.M43); h.Add(m.M44);
+            h.Add(m.M11);
+            h.Add(m.M12);
+            h.Add(m.M13);
+            h.Add(m.M14);
+            h.Add(m.M21);
+            h.Add(m.M22);
+            h.Add(m.M23);
+            h.Add(m.M24);
+            h.Add(m.M31);
+            h.Add(m.M32);
+            h.Add(m.M33);
+            h.Add(m.M34);
+            h.Add(m.M41);
+            h.Add(m.M42);
+            h.Add(m.M43);
+            h.Add(m.M44);
             h.Add(r.SubMeshIndex);
         }
+
         return h.ToHashCode();
+    }
+
+    // Round a requested shadow-map resolution to the nearest power of two (the shadow array is square POT).
+    static int SnapPow2(int v)
+    {
+        if (v <= 1) return 1;
+        int p = 1;
+        while (p < v) p <<= 1;
+        // pick the closer of p and p/2 (round to nearest, not always up).
+        return (p - v) < (v - (p >> 1)) ? p : (p >> 1);
     }
 
     // Render the sun cascades' depth (one depth-array layer per cascade) before the opaque pass. Uses the
     // dedicated upload command list (separate from the render list), then leaves the array as an SRV the
     // opaque shader samples. Cascade caching skips the pass when nothing the shadows depend on changed.
-    unsafe void RenderShadows(Matrix4x4 camView, Matrix4x4 camProj, LightUniforms light) {
+    unsafe void RenderShadows(Matrix4x4 camView, Matrix4x4 camProj, LightUniforms light)
+    {
         shadowsThisFrame = false;
-        if (DirectionalLight.Instance is null) return;   // no sun → no shadows
+        if (DirectionalLight.Instance is null) return; // no sun → no shadows
 
-        Vector3 sunTravel = -ToNumerics(light.Direction);   // light.Direction is TOWARD the light
+        Vector3 sunTravel = -light.Direction; // light.Direction is TOWARD the light
         if (sunTravel.LengthSquared() < 1e-8f) return;
-        float shadowDistance = DirectionalLight.Instance.ShadowDistance;
-        Dx12ShadowMath.ComputeCascades(camView, camProj, sunTravel, shadowDistance, ShadowMapSize,
-            cascadeMatrices, cascadeDepthRanges);
+
+        // === Volume-driven cascade layout (Shadows VolumeComponent → PostFX). The number of cascades, the
+        // shadow distance, the split shape and the per-cascade resolution are all overrides now. cascadeCount
+        // selects how many of the MaxCascades-deep array we fit/render/sample (no reallocation); resolution
+        // reallocates the texture lazily (rare authoring edit, not a hot path). The Shadows volume's maxDistance
+        // overrides DirectionalLight.ShadowDistance so an interior volume can pull the budget close. ===
+        activeCascadeCount = Math.Clamp(PostFX.ShadowCascadeCount, 1, MaxCascades);
+        float shadowDistance = PostFX.ShadowMaxDistance > 0f
+            ? PostFX.ShadowMaxDistance : DirectionalLight.Instance.ShadowDistance;
+        float splitLambda = Math.Clamp(PostFX.ShadowSplitDistribution, 0f, 1f);
+
+        // Resolution change → recreate the cascade texture (powers-of-two, clamped to the volume's range). Done
+        // here (before any fit/render) so the new array is valid for this frame; invalidates the cache so the
+        // first frame at the new size re-renders. Cheap no-op when unchanged.
+        int wantSize = Math.Clamp(SnapPow2(PostFX.ShadowResolution), 512, 4096);
+        if (wantSize != shadowMapSize)
+        {
+            shadowMapSize = wantSize;
+            shadowMap.Dispose();
+            shadowMap = new Dx12ShadowMap(dev, shadowMapSize, MaxCascades);
+            shadowMapEverRendered = false; // force a re-render at the new resolution
+        }
+
+        Dx12ShadowMath.ComputeCascades(camView, camProj, sunTravel, shadowDistance, shadowMapSize,
+            cascadeMatrices, cascadeDepthRanges, splitLambda, activeCascadeCount);
 
         // Cascade caching: if every cascade's fit matrix AND the caster geometry are unchanged since the last
         // render, the shadow-map layers still hold valid depth — skip the whole pass (byte-identical). The
         // big static-camera win. Camera/sun motion changes the fit matrices; geometry motion changes the stamp.
         int casterStamp = ComputeShadowCasterStamp();
-        bool cascadesUnchanged = shadowMapEverRendered && casterStamp == lastCasterStamp;
-        for (int c = 0; cascadesUnchanged && c < CascadeCount; c++)
+        bool cascadesUnchanged = shadowMapEverRendered && casterStamp == lastCasterStamp
+            && activeCascadeCount == lastActiveCascadeCount;
+        for (int c = 0; cascadesUnchanged && c < activeCascadeCount; c++)
             cascadesUnchanged &= cascadeMatrices[c].Equals(lastCascadeMatrices[c]);
-        if (shadowCacheOn && cascadesUnchanged) {
-            shadowsThisFrame = true;   // the cached shadow map is still valid
+        if (shadowCacheOn && cascadesUnchanged)
+        {
+            shadowsThisFrame = true; // the cached shadow map is still valid
             if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_SHADOW_CACHE_DEBUG") == "1")
                 Console.WriteLine("[ShadowCache] cascades unchanged — skipped re-render.");
             return;
         }
+
         lastCasterStamp = casterStamp;
-        for (int c = 0; c < CascadeCount; c++) lastCascadeMatrices[c] = cascadeMatrices[c];
+        lastActiveCascadeCount = activeCascadeCount;
+        for (int c = 0; c < activeCascadeCount; c++) lastCascadeMatrices[c] = cascadeMatrices[c];
         shadowMapEverRendered = true;
 
         // Fill per (cascade, submesh) LightMvp constants, mirroring the opaque iteration.
         int slot = 0;
-        var fills = new System.Collections.Generic.List<(int cascade, Dx12Buffer<GLVector3> vb, Dx12IndexBuffer ib, int start, int count, int cbSlot)>();
-        for (int c = 0; c < CascadeCount; c++) {
+        var fills =
+            new System.Collections.Generic.List<(int cascade, Dx12Buffer<GLVector3> vb, Dx12IndexBuffer ib, int start,
+                int count, int cbSlot)>();
+        for (int c = 0; c < activeCascadeCount; c++)
+        {
             // Cull shadow casters against THIS cascade's light frustum (a caster off-screen for the camera
             // but inside this cascade still casts — that's why we cull per the LIGHT frustum, not the camera).
             ExtractFrustumPlanes(cascadeMatrices[c]);
-            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
+            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
+            {
                 if (r is null || !r.IsActive || !r.IsRenderable) continue;
                 // Whole-mesh casters are GPU-driven (per-cascade compute cull + ExecuteIndirect) — skip here.
                 if (gpuDrivenOn && r.SubMeshIndex < 0) continue;
-                Mesh mesh = r.SharedMesh; if (mesh is null) continue;
+                Mesh mesh = r.SharedMesh;
+                if (mesh is null) continue;
                 if (mesh.VertexBuffer is not Dx12Buffer<GLVector3> vb || vb.Resource is null) continue;
                 if (mesh.IndexBuffer is not Dx12IndexBuffer ib || ib.Resource is null) continue;
-                Matrix4x4 model = ToNumerics(r.Transform.WorldMatrix);
+                Matrix4x4 model = r.Transform.WorldMatrix;
                 Matrix4x4 lightMvp = model * cascadeMatrices[c];
                 int only = r.SubMeshIndex;
                 int first = only >= 0 ? only : 0;
                 int last = only >= 0 ? only : mesh.SubMeshes.Length - 1;
-                for (int s = first; s <= last; s++) {
+                for (int s = first; s <= last; s++)
+                {
                     if ((uint)s >= (uint)mesh.SubMeshes.Length) break;
                     SubMeshData sub = mesh.SubMeshes[s];
                     if (sub.IndexCount <= 0) continue;
                     mesh.GetSubMeshBounds(s, out GLVector3 lmin, out GLVector3 lmax);
-                    if (!AabbInFrustum(lmin, lmax, model)) continue;   // outside this cascade
+                    if (!AabbInFrustum(lmin, lmax, model)) continue; // outside this cascade
                     if (slot >= shadowCbSlotCount) break;
                     *(ShadowConstants*)(shadowCbMapped + (long)slot * shadowCbSlotSize) =
                         new ShadowConstants { LightMvp = Matrix4x4.Transpose(lightMvp) };
@@ -2043,31 +2353,39 @@ public sealed class DX12HDRenderer : HDRenderer {
                 }
             }
         }
+
         bool gpuShadows = gpuDrivenOn && wholeMeshRenderers.Count > 0;
         if (fills.Count == 0 && !gpuShadows) return;
 
-        dev.ExecuteUpload(cl => {
+        dev.ExecuteUpload(cl =>
+        {
             // GPU-driven whole-mesh casters: per-cascade compute cull (must precede the depth draws).
-            if (gpuShadows) gpuDriven.BuildShadowCull(cl, wholeMeshRenderers, cascadeMatrices);
+            if (gpuShadows) gpuDriven.BuildShadowCull(cl, wholeMeshRenderers, cascadeMatrices, activeCascadeCount);
             shadowMap.ToDepthWrite(cl);
-            for (int c = 0; c < CascadeCount; c++) {
-                shadowMap.RenderCascade(cl, c, cc => {
+            for (int c = 0; c < activeCascadeCount; c++)
+            {
+                shadowMap.RenderCascade(cl, c, cc =>
+                {
                     // CPU per-submesh casters for this cascade.
                     cc.SetGraphicsRootSignature(shadowRootSig);
                     cc.SetPipelineState(shadowPso);
                     cc.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-                    foreach (var f in fills) {
+                    foreach (var f in fills)
+                    {
                         if (f.cascade != c) continue;
                         cc.SetGraphicsRootConstantBufferView(0,
                             shadowCb.GPUVirtualAddress + (ulong)((long)f.cbSlot * shadowCbSlotSize));
-                        cc.IASetVertexBuffers(0, new VertexBufferView(f.vb.GpuAddress, (uint)f.vb.ByteSize, (uint)f.vb.Stride));
+                        cc.IASetVertexBuffers(0,
+                            new VertexBufferView(f.vb.GpuAddress, (uint)f.vb.ByteSize, (uint)f.vb.Stride));
                         cc.IASetIndexBuffer(new IndexBufferView(f.ib.GpuAddress, (uint)f.ib.ByteSize, Format.R32_UInt));
                         cc.DrawIndexedInstanced((uint)f.count, 1, (uint)f.start, 0, 0);
                     }
+
                     // GPU-driven whole-mesh casters for this cascade (ExecuteIndirect into the same layer).
                     if (gpuShadows) gpuDriven.DrawShadowCascade(cc, c);
                 });
             }
+
             shadowMap.ToShaderResource(cl);
         });
         shadowsThisFrame = true;
@@ -2081,7 +2399,8 @@ public sealed class DX12HDRenderer : HDRenderer {
     void BindSrv(int visibleSlot, Texture2D tex, TextureType type, Dx12Texture2D explicitFallback)
         => BindSrvInto(srvVisible, visibleSlot, tex, type, explicitFallback);
 
-    void BindSrvInto(Dx12DescriptorHeap heap, int slot, Texture2D tex, TextureType type, Dx12Texture2D explicitFallback) {
+    void BindSrvInto(Dx12DescriptorHeap heap, int slot, Texture2D tex, TextureType type, Dx12Texture2D explicitFallback)
+    {
         var dx = (tex as Dx12Texture2D)
                  ?? explicitFallback
                  ?? (DefaultTextures.Neutral(type) as Dx12Texture2D);
@@ -2089,9 +2408,11 @@ public sealed class DX12HDRenderer : HDRenderer {
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
     }
 
-    public override void PostRenderCleanUp() {
+    public override void PostRenderCleanUp()
+    {
         foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
-            if (r != null) r.RenderedThisFrame = false;
+            if (r != null)
+                r.RenderedThisFrame = false;
     }
 
     // Readback comes from the LDR composite (R8) — the HDR scene target isn't a valid BMP source.
@@ -2101,28 +2422,40 @@ public sealed class DX12HDRenderer : HDRenderer {
     // depth, R32F), world normal (RGBA16F, packed N*0.5+0.5), and albedo (RGBA8 sRGB) as raw little-endian
     // .bin files + a manifest.json describing dims/format/encoding so the agent can decode them. Reads the
     // G-buffer AFTER a frame (resources are in ShaderRead state). Returns the manifest object (for the CLI).
-    public object DumpGBuffer(string dir) {
+    public object DumpGBuffer(string dir)
+    {
         if (gbuffer == null) return new { ok = false, error = "no g-buffer (renderer not initialized)" };
         System.IO.Directory.CreateDirectory(dir);
         int w = gbuffer.Width, h = gbuffer.Height;
 
-        byte[] depth  = gbuffer.ReadbackRaw(-1, out int depthBpp);                 // R32_Float, 4 B/px
-        byte[] normal = gbuffer.ReadbackRaw(1, out int normalBpp);                 // RGBA16F, 8 B/px (packed)
-        byte[] albedo = gbuffer.ReadbackRaw(0, out int albedoBpp);                 // RGBA8 sRGB, 4 B/px
+        byte[] depth = gbuffer.ReadbackRaw(-1, out int depthBpp); // R32_Float, 4 B/px
+        byte[] normal = gbuffer.ReadbackRaw(1, out int normalBpp); // RGBA16F, 8 B/px (packed)
+        byte[] albedo = gbuffer.ReadbackRaw(0, out int albedoBpp); // RGBA8 sRGB, 4 B/px
 
         System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "depth.bin"), depth);
         System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "normal.bin"), normal);
         System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, "albedo.bin"), albedo);
 
-        return new {
+        return new
+        {
             ok = true, width = w, height = h,
-            buffers = new object[] {
-                new { name = "depth",  file = "depth.bin",  format = "R32_Float", bytesPerPixel = depthBpp,
-                      encoding = "window depth [0,1]; world pos = unproject(uv, depth) via InvViewProj" },
-                new { name = "normal", file = "normal.bin", format = "R16G16B16A16_Float", bytesPerPixel = normalBpp,
-                      encoding = "world normal PACKED as N*0.5+0.5 in RGB (half floats); unpack N = rgb*2-1" },
-                new { name = "albedo", file = "albedo.bin", format = "R8G8B8A8_UNorm_sRGB", bytesPerPixel = albedoBpp,
-                      encoding = "albedo.rgb sRGB; a = specular F0" },
+            buffers = new object[]
+            {
+                new
+                {
+                    name = "depth", file = "depth.bin", format = "R32_Float", bytesPerPixel = depthBpp,
+                    encoding = "window depth [0,1]; world pos = unproject(uv, depth) via InvViewProj"
+                },
+                new
+                {
+                    name = "normal", file = "normal.bin", format = "R16G16B16A16_Float", bytesPerPixel = normalBpp,
+                    encoding = "world normal PACKED as N*0.5+0.5 in RGB (half floats); unpack N = rgb*2-1"
+                },
+                new
+                {
+                    name = "albedo", file = "albedo.bin", format = "R8G8B8A8_UNorm_sRGB", bytesPerPixel = albedoBpp,
+                    encoding = "albedo.rgb sRGB; a = specular F0"
+                },
             },
         };
     }
@@ -2135,15 +2468,17 @@ public sealed class DX12HDRenderer : HDRenderer {
     // readback at end-of-frame behind an env door, exactly like DumpGBuffer; the render path is unchanged.
     // SceneColor is the FSR/native canonical target; this reads `target` (the pre-FSR HDR composite input),
     // which is what the deterministic (FSR-off) gate exercises.
-    public object DumpHdrColor(string file) {
+    public object DumpHdrColor(string file)
+    {
         if (target == null) return new { ok = false, error = "no HDR target (renderer not initialized)" };
         int w = target.Width, h = target.Height;
         var rgb = new float[w * h * 3];
-        target.ReadColorRgb(rgb);   // half->float, raw HDR (no tonemap), top-down rows
+        target.ReadColorRgb(rgb); // half->float, raw HDR (no tonemap), top-down rows
         var bytes = new byte[rgb.Length * 4];
         Buffer.BlockCopy(rgb, 0, bytes, 0, bytes.Length);
         System.IO.File.WriteAllBytes(file, bytes);
-        return new {
+        return new
+        {
             ok = true, width = w, height = h, channels = 3,
             format = "R32_Float (little-endian), 3 floats/pixel (RGB), top-down rows",
             file,
@@ -2156,10 +2491,21 @@ public sealed class DX12HDRenderer : HDRenderer {
 
     // Internal pipeline steps — no engine/editor caller (BeginRender draws opaques itself).
     public override void RenderOpaque(IReadOnlyCollection<IStaticMeshRenderer> renderTargets,
-        RendererArgs args, bool isShadowPass) { }
-    public override void RenderSkybox(IReadOnlyCollection<ISkyboxDrawable> renderTargets, RendererArgs args) { }
-    public override void RenderInstancing(BatchGroup<IStaticMeshRenderer> batchGroup, RendererArgs args) { }
-    public override void RenderInstancing(Mesh mesh, Material material, GLMatrix4[] transforms, RendererArgs args) { }
+        RendererArgs args, bool isShadowPass)
+    {
+    }
+
+    public override void RenderSkybox(IReadOnlyCollection<ISkyboxDrawable> renderTargets, RendererArgs args)
+    {
+    }
+
+    public override void RenderInstancing(BatchGroup<IStaticMeshRenderer> batchGroup, RendererArgs args)
+    {
+    }
+
+    public override void RenderInstancing(Mesh mesh, Material material, GLMatrix4[] transforms, RendererArgs args)
+    {
+    }
 
     // --- Frustum culling (CPU, per submesh) ------------------------------------------------------------
     // 6 frustum planes (xyz = normal, w = d) extracted from a row-major view*proj (Gribb-Hartmann). Tested
@@ -2167,7 +2513,8 @@ public sealed class DX12HDRenderer : HDRenderer {
     // and shadow pass only draw what the (camera or light) frustum can see.
     readonly Vector4[] frustumPlanes = new Vector4[6];
 
-    void ExtractFrustumPlanes(Matrix4x4 m) {
+    void ExtractFrustumPlanes(Matrix4x4 m)
+    {
         // Row-major System.Numerics: rows are (M11..M14), (M21..M24), ... Gribb-Hartmann combines rows.
         // left = row4 + row1, right = row4 - row1, bottom = row4 + row2, top = row4 - row2,
         // near = row3 (DX z[0,1]: near = row3, not row4+row3), far = row4 - row3.
@@ -2175,13 +2522,14 @@ public sealed class DX12HDRenderer : HDRenderer {
         Vector4 r2 = new(m.M12, m.M22, m.M32, m.M42);
         Vector4 r3 = new(m.M13, m.M23, m.M33, m.M43);
         Vector4 r4 = new(m.M14, m.M24, m.M34, m.M44);
-        frustumPlanes[0] = r4 + r1;   // left
-        frustumPlanes[1] = r4 - r1;   // right
-        frustumPlanes[2] = r4 + r2;   // bottom
-        frustumPlanes[3] = r4 - r2;   // top
-        frustumPlanes[4] = r3;        // near (DX: z >= 0)
-        frustumPlanes[5] = r4 - r3;   // far
-        for (int i = 0; i < 6; i++) {
+        frustumPlanes[0] = r4 + r1; // left
+        frustumPlanes[1] = r4 - r1; // right
+        frustumPlanes[2] = r4 + r2; // bottom
+        frustumPlanes[3] = r4 - r2; // top
+        frustumPlanes[4] = r3; // near (DX: z >= 0)
+        frustumPlanes[5] = r4 - r3; // far
+        for (int i = 0; i < 6; i++)
+        {
             Vector3 n = new(frustumPlanes[i].X, frustumPlanes[i].Y, frustumPlanes[i].Z);
             float len = n.Length();
             if (len > 1e-6f) frustumPlanes[i] /= len;
@@ -2191,30 +2539,28 @@ public sealed class DX12HDRenderer : HDRenderer {
     // True if the world-space AABB (8 corners of the local box transformed by `model`) is at least partly
     // inside the frustum. Positive-vertex test: for each plane, if the farthest-along-the-normal corner is
     // behind the plane, the whole box is outside.
-    bool AabbInFrustum(GLVector3 localMin, GLVector3 localMax, Matrix4x4 model) {
+    bool AabbInFrustum(GLVector3 localMin, GLVector3 localMax, Matrix4x4 model)
+    {
         // Transform the 8 corners to world, take their AABB (cheap + matches the GL whole-corner loop).
         Vector3 wlo = new(float.MaxValue), whi = new(float.MinValue);
-        for (int c = 0; c < 8; c++) {
+        for (int c = 0; c < 8; c++)
+        {
             var lc = new Vector3((c & 1) == 0 ? localMin.X : localMax.X,
-                                 (c & 2) == 0 ? localMin.Y : localMax.Y,
-                                 (c & 4) == 0 ? localMin.Z : localMax.Z);
+                (c & 2) == 0 ? localMin.Y : localMax.Y,
+                (c & 4) == 0 ? localMin.Z : localMax.Z);
             Vector3 w = Vector3.Transform(lc, model);
-            wlo = Vector3.Min(wlo, w); whi = Vector3.Max(whi, w);
+            wlo = Vector3.Min(wlo, w);
+            whi = Vector3.Max(whi, w);
         }
-        for (int i = 0; i < 6; i++) {
+
+        for (int i = 0; i < 6; i++)
+        {
             Vector4 p = frustumPlanes[i];
             // Positive vertex (farthest along the plane normal).
             Vector3 pv = new(p.X >= 0 ? whi.X : wlo.X, p.Y >= 0 ? whi.Y : wlo.Y, p.Z >= 0 ? whi.Z : wlo.Z);
-            if (p.X * pv.X + p.Y * pv.Y + p.Z * pv.Z + p.W < 0f) return false;   // fully outside this plane
+            if (p.X * pv.X + p.Y * pv.Y + p.Z * pv.Z + p.W < 0f) return false; // fully outside this plane
         }
+
         return true;
     }
-
-    static Matrix4x4 ToNumerics(GLMatrix4 m) => new(
-        m.M11, m.M12, m.M13, m.M14,
-        m.M21, m.M22, m.M23, m.M24,
-        m.M31, m.M32, m.M33, m.M34,
-        m.M41, m.M42, m.M43, m.M44);
-    static Vector3 ToNumerics(GLVector3 v) => new(v.X, v.Y, v.Z);
-    static Vector4 ToNumerics(Vector4 v) => v;
 }

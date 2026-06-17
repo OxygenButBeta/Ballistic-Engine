@@ -5,6 +5,16 @@ public class Transform : Component {
     Quaternion rotation = Quaternion.Identity;
     Vector3 scale = Vector3.One;
 
+    // Authored Euler angles (degrees), stored ALONGSIDE the quaternion so EulerAngles is a stable
+    // edit field (Unity's eulerAngles). The quaternion→euler conversion is multi-valued: reading
+    // EulerAngles straight off `rotation` and writing it back (e.g. a per-frame `t.EulerAngles =
+    // t.EulerAngles`) is NOT idempotent — the result drifts every frame and gimbal-flips near ±90°.
+    // So we keep the last authored euler and only re-derive it from the quaternion when something
+    // ELSE set the rotation (eulerDirty). EulerAngles round-trips exactly; render math still reads
+    // the quaternion, so behaviour is unchanged for everything but the euler edit path.
+    Vector3 eulerAngles = Vector3.Zero;
+    bool eulerDirty;
+
     // Matrix caching: the renderer reads WorldMatrix several times per frame per renderer
     // (cull AABB, prepass, shadow casters, main pass) — recomputing 3 matrix products plus the
     // whole parent chain each read was pure waste for static entities. `localVersion` bumps on
@@ -26,7 +36,10 @@ public class Transform : Component {
 
     public Quaternion Rotation {
         get => rotation;
-        set { rotation = value; localVersion++; }
+        // A quaternion write from anywhere but the euler setter invalidates the cached euler, so the
+        // next EulerAngles read re-derives it from the new rotation (the only place the multi-valued
+        // conversion is allowed to happen — once, on demand, not every frame).
+        set { rotation = value; eulerDirty = true; localVersion++; }
     }
 
     public Vector3 Scale {
@@ -38,8 +51,23 @@ public class Transform : Component {
     public Vector3 Up => Vector3.Transform(Vector3.UnitY, Rotation);
     public Vector3 Right => Vector3.Transform(Vector3.UnitX, Rotation);
     public Vector3 EulerAngles {
-        get => RadiansToDegrees(Rotation.ToEulerAngles());
-        set => Rotation = BQuaternion.FromEulerAngles(DegreesToRadians(value));
+        // Return the authored euler verbatim (idempotent round-trip); only re-derive from the
+        // quaternion when something else set the rotation since the last euler write.
+        get {
+            if (eulerDirty) {
+                eulerAngles = RadiansToDegrees(rotation.ToEulerAngles());
+                eulerDirty = false;
+            }
+            return eulerAngles;
+        }
+        // Store the authored angles AND the equivalent quaternion. Bypass the Rotation setter so it
+        // doesn't flag eulerDirty — we want this exact euler preserved, not re-derived back out.
+        set {
+            eulerAngles = value;
+            eulerDirty = false;
+            rotation = BQuaternion.FromEulerAngles(DegreesToRadians(value));
+            localVersion++;
+        }
     }
 
     // Row-vector (OpenTK) convention: points are transformed as v * M, so composition is

@@ -40,6 +40,23 @@ public readonly struct Dx12RenderDoors {
         AerialPersp = aerialPersp; Fog = fog; Volumes = volumes;
     }
 
+    // Return a copy with ONE door flipped (the struct is readonly → rebuild by value). Used by the editor's
+    // live "Render Pass Toggles" window to flip a door-gated pass at runtime: the renderer's `Doors` field is
+    // reassigned to the returned value and copied into the next frame's Dx12FrameContext — no env round-trip,
+    // no per-frame cost. `door` is the case-insensitive field name (Shadows/Ibl/Sky/Ssao/Bloom/AerialPersp/
+    // Fog/Volumes); Minimal is intentionally not flippable here (it's a launch-time diagnostic switch).
+    public Dx12RenderDoors With(string door, bool value) => door.ToLowerInvariant() switch {
+        "shadows"     => new(Minimal, value, Ibl, Sky, Ssao, Bloom, AerialPersp, Fog, Volumes),
+        "ibl"         => new(Minimal, Shadows, value, Sky, Ssao, Bloom, AerialPersp, Fog, Volumes),
+        "sky"         => new(Minimal, Shadows, Ibl, value, Ssao, Bloom, AerialPersp, Fog, Volumes),
+        "ssao"        => new(Minimal, Shadows, Ibl, Sky, value, Bloom, AerialPersp, Fog, Volumes),
+        "bloom"       => new(Minimal, Shadows, Ibl, Sky, Ssao, value, AerialPersp, Fog, Volumes),
+        "aerialpersp" => new(Minimal, Shadows, Ibl, Sky, Ssao, Bloom, value, Fog, Volumes),
+        "fog"         => new(Minimal, Shadows, Ibl, Sky, Ssao, Bloom, AerialPersp, value, Volumes),
+        "volumes"     => new(Minimal, Shadows, Ibl, Sky, Ssao, Bloom, AerialPersp, Fog, value),
+        _ => this,
+    };
+
     static string? Env(string name) => Environment.GetEnvironmentVariable(name);
 
     // Resolve a feature that is "ON unless ENV==0" in normal mode, and "OFF unless ENV==1" under MINIMAL.

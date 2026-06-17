@@ -30,6 +30,23 @@ public enum GiMode {
     RayTraced,     // DXR ray-traced GI (off-screen-aware; falls back to SSGI without DXR)
 }
 
+// Ambient-occlusion quality (the AmbientOcclusion volume's Quality dropdown). Drives the GTAO slice +
+// step counts (more = smoother, fewer artefacts, costlier). Ordinals are stable for .volume by-value.
+public enum AoQuality {
+    Low,    // 2 slices × 4 steps  — cheapest, more noise (the denoiser/TAA leans on it)
+    Medium, // 3 slices × 6 steps  — the default balance
+    High,   // 4 slices × 8 steps  — clean on most content
+    Ultra,  // 6 slices × 12 steps — reference quality
+}
+
+// Ambient-occlusion render resolution (the AmbientOcclusion volume's Resolution dropdown). The GTAO pass
+// runs at this fraction of the render resolution and is bilinear-upsampled when the deferred pass samples it.
+public enum AoResolution {
+    Full,    // 1:1 — sharpest, costliest
+    Half,    // 1/2 per axis (1/4 the pixels) — the default
+    Quarter, // 1/4 per axis (1/16 the pixels) — cheapest
+}
+
 // Temporal upscaling quality (FSR). Each mode is a fixed per-dimension render-resolution ratio; the
 // upscaler reconstructs the display resolution. Higher ratio = lower internal res = faster, softer.
 public enum UpscaleMode {
@@ -87,12 +104,23 @@ public sealed class PostProcessSettings {
     public float BloomIntensity { get; set; } = 0.04f;
     // HDR threshold with a soft knee; values below it leak progressively less into bloom.
     public float BloomThreshold { get; set; } = 1f;
+    // Half-width (in luminance) of the soft-knee transition band under the threshold. Smaller = harder
+    // cutoff (only genuinely-bright pixels bloom, no scene-wide glow); larger = softer ramp-in.
+    public float BloomKnee { get; set; } = 0.5f;
 
+    // Ambient occlusion. The DX12 backend runs GTAO (ground-truth AO, Jimenez 2016) and applies it to the
+    // INDIRECT (IBL ambient) term only — direct sun/punctual light is untouched, which is the physically
+    // correct layer (the old HBAO post-multiplied the whole HDR colour, darkening direct light too).
     public bool SSAOEnabled { get; set; } = true;
-    // 0.5 was tuned for tabletop props; at that radius architectural crevices (window
-    // recesses, cornices, arches) get no contact darkening and large surfaces read flat.
+    // World-space sampling radius. Larger reads architectural crevices (window recesses, cornices, arches);
+    // 0.5 (the old default) was tuned for tabletop props and left large surfaces flat.
     public float SSAORadius { get; set; } = 1.75f; // world units
-    public float SSAOIntensity { get; set; } = 1.3f;
+    public float SSAOIntensity { get; set; } = 1.0f;  // GTAO is physically normalized — 1 is the neutral strength
+    public float SSAOPower { get; set; } = 1.0f;      // contrast/falloff exponent on the occlusion (1 = linear)
+    public float SSAOThickness { get; set; } = 0.25f; // assumed occluder thickness (m): thin lets light past railings/foliage
+    public bool SSAOMultiBounce { get; set; } = true; // Jimenez albedo-aware multi-bounce (avoids over-darkening dark crevices)
+    public AoQuality SSAOQuality { get; set; } = AoQuality.Medium;   // slice/step count preset
+    public AoResolution SSAOResolution { get; set; } = AoResolution.Half; // render fraction (Full/Half/Quarter)
 
     // Temporal anti-aliasing: jittered rendering + history accumulation. Replaces MSAA
     // (MSAA is forced off while TAA runs) and also smooths specular/SSAO/SSR noise.
@@ -107,16 +135,22 @@ public sealed class PostProcessSettings {
 
     // Screen-space reflections: smooth surfaces reflect the actual scene instead of only
     // the sky cubemap. Requires the normal attachment (unavailable in the MSAA path).
-    public bool SsrEnabled { get; set; } = true;
+    // REFLECTIONS HARD-DISABLED (2026-06-18): SSR + RT-reflections are taken out of the system (same kill as
+    // the GI stack). These defaults are flipped to Off so any consumer / a scene with no GI volume also
+    // reflects "reflections off"; the renderer's reflections pass is gated on SsrEnabled so it never runs.
+    public bool SsrEnabled { get; set; } = false;
     public float SsrIntensity { get; set; } = 1f;
-    public ReflectionMode ReflectionMode { get; set; } = ReflectionMode.ScreenSpace;  // SSR or DXR (Reflection volume)
+    public ReflectionMode ReflectionMode { get; set; } = ReflectionMode.Off;  // SSR or DXR (Reflection volume) — forced Off, system disabled
 
     // Screen-space global illumination: a coarse one-bounce diffuse gather that adds
     // indirect fill light from sunlit on-screen surfaces into shadowed areas (the
     // directional bounce a flat ambient term can't provide). Like SSR it needs the normal
     // attachment, so it only runs while TAA is on / MSAA is off.
-    public bool SsgiEnabled { get; set; } = true;
-    public GiMode GiMode { get; set; } = GiMode.ScreenSpace;   // GI volume dropdown: Off / SSGI / RT-GI (DXR)
+    // LUMEN GI HARD-DISABLED (2026-06-17): the whole indirect-GI stack is taken out of the system at the
+    // DX12HDRenderer giMode choke point. These defaults are flipped to Off so any other consumer (or a
+    // scene with no GI volume) also reflects "GI off" rather than the old live default.
+    public bool SsgiEnabled { get; set; } = false;
+    public GiMode GiMode { get; set; } = GiMode.Off;   // GI volume dropdown: Off / SSGI / RT-GI (DXR) — forced Off, system disabled
 
     // Emissive-as-GI source: emissive surfaces act as area lights in the indirect bounce (the DDGI/
     // RTXGI/Lumen technique — at each GI ray hit the shader adds the hit's self-emission). DEFAULT true

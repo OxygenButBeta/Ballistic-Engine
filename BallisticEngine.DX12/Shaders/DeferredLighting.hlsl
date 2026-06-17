@@ -22,7 +22,8 @@ cbuffer LightConstants : register(b0) {
     float    UseRtShadows;                        // >0.5 = sample the RT shadow mask instead of cascade PCF
     float    SpecClamp;                            // V2: max per-light specular LUMA (0 = off); caps NDF fireflies
     float    SpecAaStrength;                       // V2: geometric specular AA strength (0 = off); roughens noisy normals
-    float    Pad4, Pad5, Pad6;
+    float    UseSsao;                              // >0.5 = multiply the GTAO term into the IBL ambient (ambient-only)
+    float    Pad5, Pad6;
 };
 
 // V2 specular firefly clamp (fixes D3): a normal-mapped surface lit by a sharp light produces single-pixel
@@ -42,10 +43,18 @@ static const int ClusterDimY = 9;
 static const int ClusterDimZ = 24;
 
 // Per-frame cascade matrices + shadow params (shared layout with the forward FrameConstants, b1).
+// The Shadows-volume tail (Filtering..ContactThickness) must match DX12HDRenderer.FrameConstants exactly.
 cbuffer FrameConstants : register(b1) {
     float4x4 Cascade0, Cascade1, Cascade2, Cascade3;
     float4   CascadeBias;
     float    CascadeCountF; float ShadowsEnabled; float ShadowMapTexel; float CascadeBlend;
+    float    ShadowFiltering;     // 0 = hard, 1 = soft PCF, 2 = PCSS
+    float    ShadowSoftness;      // PCSS penumbra scale
+    float    ContactShadowsOn;    // >0.5 = march a screen-space contact shadow
+    float    ContactShadowLength; // world metres marched
+    float    ContactShadowSteps;
+    float    ContactShadowThickness;
+    float    FramePad0, FramePad1;
 };
 
 Texture2D GAlbedo   : register(t0);   // rgb albedo, a = specularReflectance
@@ -69,6 +78,7 @@ StructuredBuffer<GpuLight> ClusterLights : register(t9);
 Buffer<int2>               ClusterGrid   : register(t10);  // per-cluster {offset, count}
 Buffer<uint>               ClusterIndex  : register(t11);  // flat light-index list
 Texture2D RtShadowMask     : register(t12);                // ray-traced sun shadow (1 lit / 0 shadowed)
+Texture2D SsaoTex          : register(t13);                // GTAO (1 = unoccluded); multiplied into ambient only
 SamplerState LinearClamp : register(s0);
 
 static const float PI = 3.14159265359;
@@ -216,7 +226,11 @@ float4 PSMain(VSOut i) : SV_Target {
     float3 N = normalize(g1.rgb * 2.0 - 1.0);
     float metallic = g2.r;
     float roughness = clamp(g2.g, 0.045, 1.0);
+    // Material AO (baked into the texture) times the screen-space GTAO. AO modulates the AMBIENT/indirect term
+    // ONLY (used in the IBL + fallback ambient below) — direct sun/punctual light is left untouched, which is
+    // the physically-correct layer. GTAO is rendered at the AO resolution; LinearClamp upsamples it here.
     float ao = g2.b;
+    if (UseSsao > 0.5) ao *= SsaoTex.SampleLevel(LinearClamp, i.Uv, 0).r;
 
     // GEOMETRIC SPECULAR ANTI-ALIASING (V2, fixes D3 — the crawling sparkle on normal-mapped surfaces). The
     // high-frequency tiled normal maps (Bistro brick/stone) alias under-sampled: adjacent screen pixels get
@@ -288,5 +302,7 @@ float4 PSMain(VSOut i) : SV_Target {
     }
 
     float3 litHdr = diffuse + specular + punctual + ambient + emissive;
+    // TEMP-AO-DEBUG: visualise the raw GTAO term (remove before commit). Pad6 carries the debug flag.
+    if (Pad6 > 0.5) { float a = SsaoTex.SampleLevel(LinearClamp, i.Uv, 0).r; return float4(a, a, a, 1.0); }
     return float4(litHdr, 1.0);
 }

@@ -20,7 +20,7 @@ namespace BallisticEngine.DX12;
 // commit). Copies the Dx12SsaoPass template (the canonical leaf-post pass).
 //
 // Event = Composite (700). Reads ctx.SceneColor (the FSR/native HDR source the orchestrator + FsrPass resolve)
-// in place of the old `hdr` param; reads ctx.SsaoResult (Dx12SsaoPass output) for the AO slot and ctx.GrainFrame
+// in place of the old `hdr` param. (AO is no longer composited here — GTAO multiplies into the deferred ambient.) ctx.GrainFrame
 // for the grain phase. Writes the LDR `ldr` target, then restores ctx.Target to RenderTarget (frame-end tidy).
 public sealed class Dx12CompositePass : IRenderPass, IDisposable {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.Composite;
@@ -43,7 +43,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         // where hdr == ctx.SceneColor (captured in Record — the resolved scene color: native = target, FSR =
         // fsrOutput, since FsrPass at event 650 already set ctx.SceneColor before Composite at 700). The deriver
         // emits ctx.SceneColor.ColorToShaderResource() — the same concrete target. Derive it. The PRIVATE sub-step
-        // transitions (lum ping-pong, bloomA/B) and the frame-tail target.ColorToRenderTarget() are NOT pass-
+        // transitions (lum ping-pong, bloom mip chain) and the frame-tail target.ColorToRenderTarget() are NOT pass-
         // boundary heads → they stay inline (plan §V3: leave the frame-tail inline, derive only the head).
         b.DeriveBarriers();
         b.Use(Dx12ResourceUsage.SceneColorShaderRead);
@@ -52,7 +52,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
     [StructLayout(LayoutKind.Sequential)]
     struct CompositeConstants {
         public float ExposureMul; public float BloomIntensity; public float AutoExposure; public float LegacyMul;   // row 0
-        public float Compensation; public float UseAo; public float Tonemap; public float Contrast;                 // row 1
+        public float Compensation; public float PadAo; public float Tonemap; public float Contrast;                 // row 1 (PadAo: was UseAo; AO moved to deferred ambient)
         public float Saturation; public float Sharpen; public float VignetteStrength; public float VignetteRoundness; // row 2
         public float ChromaticAberration; public float LensDistortion; public float FilmGrain; public float GrainTime; // row 3
         public Vector3 VignetteColor; public float Pad3;                                                            // row 4
@@ -64,7 +64,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         public float SpeedDarkToLight; public float SpeedLightToDark; public float Reset; public float Pad;
     }
     [StructLayout(LayoutKind.Sequential)]
-    struct BloomConstants { public float Threshold; public Vector2 TexelSize; public float Pad; }
+    struct BloomConstants { public Vector2 TexelSize; public float Threshold; public float Knee; }
 
     readonly Dx12Device dev;
 
@@ -88,21 +88,27 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
     unsafe byte* lumCbMapped;
     int emaDebugFrame;
 
-    // Bloom: bright-pass + separable blur at half-res, fed into the composite (Bloom.hlsl).
+    // Bloom: progressive dual-filter mip pyramid (Jimenez/COD), fed into the composite (Bloom.hlsl).
+    // A chain of half-res→quarter→… HDR targets: downsample (level 0 thresholds + Karis), then tent-upsample
+    // each smaller level ADDITIVELY onto the next larger one. The half-res level-0 result is what composite adds.
+    const int BloomMaxLevels = 6;
     ID3D12RootSignature bloomRootSig;   // BloomConstants CBV (b0) + 1 source SRV (t0) + sampler
-    ID3D12PipelineState bloomBrightPso, bloomBlurHPso, bloomBlurVPso;
-    Dx12OffscreenTarget bloomA, bloomB; // half-res R16F ping-pong
+    ID3D12PipelineState bloomDownThresholdPso, bloomDownPso, bloomUpPso;  // up PSO uses additive (One/One) blend
+    readonly Dx12OffscreenTarget[] bloomLevels = new Dx12OffscreenTarget[BloomMaxLevels];
+    int bloomLevelCount;
     ID3D12Resource bloomCb;
     unsafe byte* bloomCbMapped;
-    int bloomCbStride;                  // P0a: 256-aligned per-sub-pass slot stride (3 slots — see DrawBloom)
-    Dx12DescriptorHeap bloomSrvVisible; // source SRV per sub-pass (3 slots)
+    int bloomCbStride;                  // 256-aligned per-pass slot stride; one slot per down + up draw
+    int bloomCbSlots;                   // total CB/SRV slots provisioned (down chain + up chain)
+    Dx12DescriptorHeap bloomSrvVisible; // source SRV per pass (one per down + up draw)
 
     // VERBATIM BuildComposite (which chained BuildLumAverage → BuildBloom). Allocates everything once.
     public unsafe Dx12CompositePass(Dx12Device device, int width, int height) {
         dev = device;
-        // CompositeConstants CBV (b0) + 4-SRV table (HDR t0, bloom t1, avg-lum t2, AO t3) + clamp sampler s0.
+        // CompositeConstants CBV (b0) + 3-SRV table (HDR t0, bloom t1, avg-lum t2) + clamp sampler s0.
+        // (The old AO t3 slot is gone — GTAO now multiplies into ambient in deferred lighting, not here.)
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 4, baseShaderRegister: 0);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 3, baseShaderRegister: 0);
         var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
         var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
@@ -129,7 +135,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         compositeCbMapped = compositeCb.Map<byte>(0);
         compositeSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true, framesInFlight: dev.FramesInFlight);
 
         BuildLumAverage();
         BuildBloom(width, height);
@@ -186,32 +192,40 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         bloomRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
 
+        // Additive (One/One) blend for the upsample pass — each smaller level is ADDED onto the larger one,
+        // exactly the GL fixed-function additive upsample. The down passes overwrite (opaque).
+        // NB: build it from the ctor, NOT `var b = BlendDescription.Opaque; b.RenderTarget[0] = …` — Vortice's
+        // BlendDescription.RenderTarget is a fixed-buffer whose backing is SHARED across copies, so mutating a
+        // copy permanently corrupts BlendDescription.Opaque process-wide (proven by reflection). The ctor is safe.
+        var additive = new BlendDescription(Blend.One, Blend.One);   // src=One dest=One op=Add, all channels
+
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("Bloom.hlsl");
         byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "Bloom.hlsl");
-        ID3D12PipelineState MakePso(string entry) => dev.Device.CreateGraphicsPipelineState(
+        ID3D12PipelineState MakePso(string entry, BlendDescription blend) => dev.Device.CreateGraphicsPipelineState(
             new GraphicsPipelineStateDescription {
                 RootSignature = bloomRootSig, VertexShader = vs,
                 PixelShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, entry, "Bloom.hlsl"),
                 InputLayout = null, PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
-                RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
+                RasterizerState = RasterizerDescription.CullNone, BlendState = blend,
                 DepthStencilState = DepthStencilDescription.None,
                 RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat }, DepthStencilFormat = Format.Unknown,
                 SampleDescription = new SampleDescription(1, 0),
             });
-        bloomBrightPso = MakePso("PSBrightPass");
-        bloomBlurHPso = MakePso("PSBlurH");
-        bloomBlurVPso = MakePso("PSBlurV");
+        bloomDownThresholdPso = MakePso("PSDownThreshold", BlendDescription.Opaque);
+        bloomDownPso = MakePso("PSDown", BlendDescription.Opaque);
+        bloomUpPso = MakePso("PSUp", additive);
 
-        // P0a: 3 sub-passes (bright/blurH/blurV) write DIFFERENT BloomConstants but all read one CB. With the
-        // pipelined frame they record into ONE list submitted together, so a single shared CB would let the
-        // CPU's 3rd write stomp the value the GPU's 1st draw still needs. Give each sub-pass its own 256-aligned
-        // slot. (Non-pipelined this was masked because each pass submitted+waited.)
+        // Each down + up draw writes DIFFERENT BloomConstants (its own source texel size) but all read one CB.
+        // With the pipelined frame they record into ONE list submitted together, so a single shared CB would let
+        // a later CPU write stomp a value an earlier draw still needs. Give each draw its own 256-aligned slot.
+        // Max draws/frame = down chain (≤ BloomMaxLevels) + up chain (≤ BloomMaxLevels-1) ≤ 2*BloomMaxLevels.
+        bloomCbSlots = BloomMaxLevels * 2;
         bloomCbStride = (Marshal.SizeOf<BloomConstants>() + 255) & ~255;
         bloomCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)(bloomCbStride * 3)), ResourceStates.GenericRead);
+            ResourceDescription.Buffer((ulong)(bloomCbStride * bloomCbSlots)), ResourceStates.GenericRead);
         bloomCbMapped = bloomCb.Map<byte>(0);
         bloomSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, bloomCbSlots, shaderVisible: true, framesInFlight: dev.FramesInFlight);
         AllocBloomTargets(width, height);
     }
 
@@ -222,47 +236,64 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
     public void Resize(int width, int height) => AllocBloomTargets(width, height);
 
     void AllocBloomTargets(int width, int height) {
-        // V2: bloomA/bloomB are audit-passed transients (bright-pass fully overwrites bloomA before blurH reads it;
-        // each blur DST is a full-screen draw). lumTarget/lumHistory are NOT pooled (cross-frame ping-pong history
-        // → imported). AllocOrPool = committed (byte-identical) when no pool, placed-aliased when the pool is active.
-        // Dispose the current field unless it's pool-placed (the pool's re-acquire disposes its own Live).
-        if (bloomA is { IsPlaced: false }) bloomA.Dispose();
-        if (bloomB is { IsPlaced: false }) bloomB.Dispose();
+        // Bloom mip chain: half, quarter, … down to BloomMaxLevels or until a level would drop below 8px (the
+        // GL EnsureChain rule). Each level is an HDR transient (every draw fully writes its DST; level 0 is the
+        // composite's sampled result + the up chain's final additive target). AllocOrPool = committed when no pool
+        // is active (byte-identical), placed-aliased otherwise. Dispose current fields unless pool-placed.
+        for (int i = 0; i < BloomMaxLevels; i++) {
+            if (bloomLevels[i] is { IsPlaced: false }) bloomLevels[i].Dispose();
+            bloomLevels[i] = null;
+        }
         int w = System.Math.Max(1, width / 2), h = System.Math.Max(1, height / 2);
-        bloomA = Dx12RenderTargetPool.AllocOrPool(dev, "bloomA", w, h, Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: false);
-        bloomB = Dx12RenderTargetPool.AllocOrPool(dev, "bloomB", w, h, Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: false);
+        bloomLevelCount = 0;
+        for (int i = 0; i < BloomMaxLevels && w >= 8 && h >= 8; i++) {
+            bloomLevels[i] = Dx12RenderTargetPool.AllocOrPool(dev, $"bloomL{i}", w, h,
+                Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: false);
+            bloomLevelCount++;
+            w = System.Math.Max(1, w / 2);
+            h = System.Math.Max(1, h / 2);
+        }
     }
 
-    // VERBATIM DrawBloom. Bright-pass the HDR `src` (already in SRV state) → bloomA; blur H (bloomA→bloomB);
-    // blur V (bloomB→bloomA). Result lands in bloomA at half-res for the composite to add.
-    unsafe void DrawBloom(Dx12OffscreenTarget src) {
+    // Progressive dual-filter bloom (Jimenez/COD). Downsample chain: HDR scene → level 0 (Karis + threshold) →
+    // level 1 → … . Upsample chain: tent-filter each smaller level ADDITIVELY (One/One blend PSO) onto the next
+    // larger one, level N-1 down to 0. Level 0 (half-res) holds the final bloom the composite adds. `src` (the
+    // HDR scene) is already in SRV state from DrawComposite. Each draw owns a distinct CB/SRV slot (pipelined-safe).
+    unsafe void DrawBloom(Dx12OffscreenTarget src, float threshold, float knee) {
+        if (bloomLevelCount == 0) return;   // viewport too small for even one mip level
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        float texW = 1f / bloomA.Width, texH = 1f / bloomA.Height;
+        int slot = 0;
 
-        void Pass(ID3D12PipelineState pso, Dx12OffscreenTarget src, Dx12OffscreenTarget dst, int srvSlot,
-            Vector2 texel, float threshold) {
-            // P0a: write THIS sub-pass's constants to its own CB slot (srvSlot doubles as the CB slot) + bind
-            // that slot's GPU address, so the pipelined single-list submit doesn't let later writes stomp it.
-            *(BloomConstants*)(bloomCbMapped + srvSlot * bloomCbStride) =
-                new BloomConstants { Threshold = threshold, TexelSize = texel };
-            src.ColorToShaderResource();
-            dev.Device.CopyDescriptorsSimple(1, bloomSrvVisible.Cpu(srvSlot), src.ColorSrvCpu, heapType);
+        void Pass(ID3D12PipelineState pso, Dx12OffscreenTarget passSrc, Dx12OffscreenTarget dst, float threshold, float knee) {
+            int s = slot++;
+            // Source texel size = 1 / the SOURCE level being read (tap spacing is in the source's pixels).
+            *(BloomConstants*)(bloomCbMapped + s * bloomCbStride) = new BloomConstants {
+                TexelSize = new Vector2(1f / passSrc.Width, 1f / passSrc.Height), Threshold = threshold, Knee = knee,
+            };
+            passSrc.ColorToShaderResource();
+            dev.Device.CopyDescriptorsSimple(1, bloomSrvVisible.Cpu(s), passSrc.ColorSrvCpu, heapType);
             dst.RenderColorOnly(cl => {
                 cl.SetGraphicsRootSignature(bloomRootSig);
                 cl.SetPipelineState(pso);
                 cl.SetDescriptorHeaps(bloomSrvVisible.Heap);
-                cl.SetGraphicsRootConstantBufferView(0, bloomCb.GPUVirtualAddress + (ulong)(srvSlot * bloomCbStride));
-                cl.SetGraphicsRootDescriptorTable(1, bloomSrvVisible.Gpu(srvSlot));
+                cl.SetGraphicsRootConstantBufferView(0, bloomCb.GPUVirtualAddress + (ulong)(s * bloomCbStride));
+                cl.SetGraphicsRootDescriptorTable(1, bloomSrvVisible.Gpu(s));
                 cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
                 cl.DrawInstanced(3, 1, 0, 0);
             });
         }
 
-        // Bright-pass reads the HDR scene (already in SRV state from DrawComposite).
-        Pass(bloomBrightPso, src, bloomA, 0, new Vector2(texW, texH), 1.0f);
-        Pass(bloomBlurHPso, bloomA, bloomB, 1, new Vector2(texW, texH), 0f);
-        Pass(bloomBlurVPso, bloomB, bloomA, 2, new Vector2(texW, texH), 0f);
-        bloomA.ColorToShaderResource();   // ready for the composite to sample
+        // Downsample: HDR scene → level 0 (threshold + Karis from the volume's threshold/knee), then each level
+        // from its predecessor (plain energy-preserving 13-tap, no threshold). Threshold/knee only matter on L0.
+        Pass(bloomDownThresholdPso, src, bloomLevels[0], threshold, knee);
+        for (int i = 1; i < bloomLevelCount; i++)
+            Pass(bloomDownPso, bloomLevels[i - 1], bloomLevels[i], 0f, 0f);
+
+        // Upsample: tent-filter level i+1 additively onto level i, from the smallest up to level 0.
+        for (int i = bloomLevelCount - 2; i >= 0; i--)
+            Pass(bloomUpPso, bloomLevels[i + 1], bloomLevels[i], 0f, 0f);
+
+        bloomLevels[0].ColorToShaderResource();   // half-res result, ready for the composite to sample
     }
 
     // VERBATIM DumpMeteredLuminance. V1 one-shot calibration probe: read the 1×1 R16F meter target back to the
@@ -323,14 +354,13 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
 
     // VERBATIM DrawComposite (re-rooted onto ctx). Tonemap the HDR `hdr` (= ctx.SceneColor — native scene
     // target or FSR output) into the LDR `ldr` at OUTPUT resolution. Auto-exposure metering + bloom run first
-    // (private sub-steps). The old (bool ssaoOn, Dx12OffscreenTarget hdr) params are now ctx.Doors.Ssao +
-    // ctx.SceneColor; the AO SRV is ctx.SsaoResult.
+    // (private sub-steps). The old (bool ssaoOn, Dx12OffscreenTarget hdr) params are now ctx.SceneColor only —
+    // AO is no longer composited here (GTAO multiplies into the deferred ambient term).
     public unsafe void Record(Dx12FrameContext ctx) {
-        // V2: aliasing barrier + discard bloomA/B (the targets Composite PRODUCES). NOT ssaoA — Composite only
-        // READS ssaoA (the AO slot); discarding it would erase SSAO's output right before the composite samples it.
-        Dx12RenderTargetPool.PoolBarrier(ctx.Dev, "bloomA", "bloomB");   // no-op when pool off
+        // V2: aliasing barrier + discard the bloom mip levels (the targets Composite PRODUCES). (AO is no longer
+        // sampled here — GTAO multiplies into the deferred ambient term, so there is no AO slot to preserve.)
+        Dx12RenderTargetPool.PoolBarrier(ctx.Dev, "bloomL0", "bloomL1", "bloomL2", "bloomL3", "bloomL4", "bloomL5");   // no-op when pool off
         Dx12OffscreenTarget hdr = ctx.SceneColor;
-        bool ssaoOn = ctx.Doors.Ssao;
         Dx12OffscreenTarget ldr = ctx.Ldr;
         Dx12OffscreenTarget target = ctx.Target;
         int outputW = ctx.OutputW, outputH = ctx.OutputH;
@@ -416,9 +446,11 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
                 DumpAdaptedEv(meteredEvTarget, pf);
         }
 
-        // Bloom: bright-pass + blur the HDR into bloomA (half-res). On by default; BALLISTIC_DX12_BLOOM=0 off.
-        bool bloomOn = doors.Bloom;
-        if (bloomOn) DrawBloom(hdr);
+        // Bloom: progressive mip-pyramid bright-pass + blur of the HDR into the half-res level 0. The env door
+        // is the hard master switch (BALLISTIC_DX12_BLOOM=0); within that, the Bloom VOLUME drives it (enable +
+        // threshold + knee + intensity), so editing the override in the inspector actually changes the render.
+        bool bloomOn = doors.Bloom && pf.BloomEnabled;
+        if (bloomOn) DrawBloom(hdr, pf.BloomThreshold, pf.BloomKnee);
 
         // Tonemap: AgX by default (graceful highlight desaturation, the "less çiğ" look); ACES via the door.
         bool acesTonemap = Environment.GetEnvironmentVariable("BALLISTIC_DX12_TONEMAP") == "aces";
@@ -433,11 +465,11 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         float vignette = gradeDemo ? 0.25f : pf.VignetteStrength;
         *(CompositeConstants*)compositeCbMapped = new CompositeConstants {
             ExposureMul = exposureMul,
-            BloomIntensity = bloomOn ? 0.6f : 0f,
+            BloomIntensity = bloomOn ? pf.BloomIntensity : 0f,
             AutoExposure = useMeter ? 1f : 0f,
             LegacyMul = pf.Exposure,
             Compensation = pf.ExposureCompensation,
-            UseAo = ssaoOn ? 1f : 0f,
+            PadAo = 0f,   // (was UseAo) AO is applied in deferred lighting now
             Tonemap = acesTonemap ? 1f : 0f,
             // Stylistic grade (all neutral by default → byte-identical when untouched); ported from the GL composite.
             Contrast = contrast, Saturation = saturation,
@@ -453,11 +485,9 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
 
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(0), hdr.ColorSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(1),
-            bloomOn ? bloomA.ColorSrvCpu : hdr.ColorSrvCpu, heapType);   // bloom slot
+            bloomOn && bloomLevelCount > 0 ? bloomLevels[0].ColorSrvCpu : hdr.ColorSrvCpu, heapType);   // bloom slot (half-res level 0)
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(2),
             useMeter ? meteredEvTarget.ColorSrvCpu : hdr.ColorSrvCpu, heapType);   // adapted-EV slot (Automatic only)
-        dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(3),
-            ssaoOn ? ctx.SsaoResult : hdr.ColorSrvCpu, heapType);     // AO slot (Dx12SsaoPass output)
 
         ldr.RenderColorOnly(cl => {
             cl.SetGraphicsRootSignature(compositeRootSig);
@@ -480,9 +510,10 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
     }
 
     public void Dispose() {
-        bloomA?.Dispose(); bloomB?.Dispose();
+        foreach (Dx12OffscreenTarget level in bloomLevels)
+            if (level is { IsPlaced: false }) level.Dispose();
         bloomSrvVisible?.Dispose(); bloomCb?.Dispose();
-        bloomBrightPso?.Dispose(); bloomBlurHPso?.Dispose(); bloomBlurVPso?.Dispose();
+        bloomDownThresholdPso?.Dispose(); bloomDownPso?.Dispose(); bloomUpPso?.Dispose();
         bloomRootSig?.Dispose();
         lumTarget?.Dispose(); lumHistory?.Dispose();
         lumSrvVisible?.Dispose(); lumCb?.Dispose();

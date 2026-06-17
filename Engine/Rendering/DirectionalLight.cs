@@ -1,5 +1,3 @@
-using OpenTK.Windowing.GraphicsLibraryFramework;
-
 namespace BallisticEngine;
 
 // CPU-side lighting values the renderer pushes as uniforms. Built from the active
@@ -99,43 +97,6 @@ public class DirectionalLight : Behaviour
     protected internal override void OnBegin()
     {
         registered = this;
-    }
-
-    protected internal override void Tick(in float delta)
-    {
-        if (Input.IsKeyDown(Keys.U))
-        {
-            Illuminance += 2000f;
-        }
-        else if (Input.IsKeyDown(Keys.L))
-        {
-            Illuminance = System.Math.Max(0f, Illuminance - 2000f);
-        }
-
-        if (Input.IsKeyDown(Keys.Q))
-        {
-            ambientIntensity += 0.02f;
-        }
-        else if (Input.IsKeyDown(Keys.E))
-        {
-            ambientIntensity -= 0.02f;
-        }
-
-
-        Vector3 angles = transform.EulerAngles; // degrees
-
-        float speed = 45f * delta;
-
-        if (Input.IsKeyDown(Keys.Right))
-            angles.Y -= speed;
-        if (Input.IsKeyDown(Keys.Left))
-            angles.Y += speed;
-        if (Input.IsKeyDown(Keys.Up))
-            angles.X -= speed;
-        if (Input.IsKeyDown(Keys.Down))
-            angles.X += speed;
-
-        transform.EulerAngles = angles;
     }
 
     public override void OnDrawGizmos(IGizmos gizmos) {
