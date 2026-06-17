@@ -19,10 +19,44 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF13+EF14** (hierarchy collapse/expand + collapsed-by-default)
-> Last committed chunk: **EF8** · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **EF1** (viewport gizmo-mode buttons clip — "Mov"/"Rota"/"Sca")
+> Last committed chunk: **EF13+EF14** · Branch: `dx12-renderer`
 >
-> **EF8 note (just landed):** the Layer Collision Matrix is now its OWN window (Window > Layer Collision
+> **EF13+EF14 note (just landed):** the Hierarchy gained Collapse All / Expand All toolbar buttons and now
+> defaults a freshly-loaded scene to fully collapsed. ALL in `HierarchyPanel.cs` (Editor-only, one file).
+> The hierarchy OWNS the tree open-state in a `Dictionary<int,bool> openState` keyed by
+> `entity.InstanceId.GetHashCode()` (the id used everywhere else in the panel) — ImGui's implicit per-node
+> open-state can't honour an on-demand all-fold OR a collapsed-on-load default without re-fighting the
+> user's own arrow toggles every frame, so the tracker is the source of truth. **EF13:** two `EditorIcons.
+> GhostButton`s after Delete — `ChevronRight`="Collapse All", `ChevronDown`="Expand All" (both glyphs already
+> baked + used elsewhere — no new font codepoint) — set a one-frame `ExpandForce` (`None`/`CollapseAll`/
+> `ExpandAll`) that's consumed by the node draw and cleared right after `EndChild`. **EF14:** the
+> `ImGuiTreeNodeFlags.DefaultOpen` was DROPPED; instead a node whose id is NOT yet in the tracker is "first
+> seen" → defaults **collapsed** (this single rule covers first scene load AND any freshly-created entity,
+> with no scene-change detection). **The core invariant (DoD point c):** `SetNextItemOpen` is pushed ONLY on
+> a frame where a force is armed OR the node is first-seen; on every other frame ImGui keeps its own state
+> and the panel reads `TreeNodeEx`'s return value back into the tracker — so a node the user manually
+> expands STAYS expanded across subsequent frames. Only parent nodes (`children.Count > 0`) are tracked
+> (leaves have no fold); a `PruneOpenState` drops entries for entities no longer in the scene (delete /
+> scene swap), keeping the dict ≤ live-entity size. While the search filter is active the flat list draws no
+> tree nodes, so an armed force is simply cleared at frame end (no-op) — correct. Build 0-error (Editor
+> csproj, clean `--no-incremental` scratch dir), oracle EXIT=0 (19 suites — the change is pure editor UI, no
+> reflection/serializer surface). VISUAL chunk → human-screenshot checkpoint (Collapse All folds the whole
+> tree; Expand All unfolds it; a fresh scene loads fully collapsed; a node the user expands stays expanded
+> next frame) batched into the editor set; NOT relaunch-looped (GPU-hang rule).
+>
+> **For EF1 (next):** the viewport gizmo-mode toolbar buttons clip their labels ("Mov"/"Rota"/"Sca"). Root:
+> a fixed button width `bw = 58*S` at `EditorApplication.cs:~2150` ignores the icon+label width. Fix: size
+> each mode button to `max(58*S, CalcTextSize(label).X + framePadding.X*2 + iconPad)` (compute the max label
+> width ONCE across Move/Rotate/Scale and apply it to all three so they stay visually equal), and check the
+> Pivot/Snap buttons in the same cluster read in full too. Keep the min width. **This chunk touches
+> `EditorApplication.cs`** — so the selective-staging guard's "must be empty" set CANNOT include
+> `EditorApplication`; instead diff-review each staged hunk (`git add -p`) to leave the pre-existing not-mine
+> dirt (`RenderPassTogglesWindow.Draw(S)` lines etc.) unstaged, exactly as EF8/EF12 did. DoD: human
+> screenshot shows full labels with no overlap; build 0-error. Section: `Docs/Plans/editor-fixes-plan.md`
+> ~`:627`. NOT relaunch-looped (GPU-hang rule).
+>
+> **EF8 note (kept for reference):** the Layer Collision Matrix is now its OWN window (Window > Layer Collision
 > Matrix), split out of Tags & Layers. New panel `Panels/LayerCollisionMatrixPanel.cs` (`public bool Open`,
 > mirrors `TagsLayersPanel`'s `Persist()` + `Begin/End` shell) owns the matrix: the `DrawCollisionMatrix`
 > body moved VERBATIM from `TagsLayersPanel` except (a) its `CollapsingHeader("Layer Collision Matrix")`
@@ -502,7 +536,7 @@ this same handoff for the chunk after it.
 - [x] EF15 — collection reorder/clear + polymorphic list serialize + round-trip test — TWO halves landed. (1) **Serialize fix (RW8):** `SerializeMemberValue` now routes a `[SerializeReference]` collection whose element type is a polymorphic BASE (abstract/interface or concrete-base, via new `IsPolymorphicElementMember`/`SequenceElementType`/`IsLeafElementType`) through a new `SerializeSequencePolymorphic` that emits a per-element `$type` (the scalar `SerializeReferenceInstance` path, per element); non-polymorphic lists (`List<int>`/`List<Material>`) stay on `SerializeValue` → byte-identical. (2) **Deserialize gate relaxed:** `TryDeserializeReferenceInstance` now also fires for a recursed element (`member==null`) when the raw carries a `$type` tag AND `targetType` is a polymorphic base (new `IsPolymorphicBaseTarget`) — the symmetric inverse of the serialize side (the handoff's "deserialize already ready" was wrong: the old `member==null` branch returned false at the `Classify==Polymorphic` gate). (3) **Editor UI:** `DrawCollectionSlot` gained per-element reorder up/down (`CollectionMove`, adjacent swap, disabled at ends), insert-above (`CollectionInsertAt`), and a header **Clear** (`CollectionClear`) beside Add; Remove/Add already existed. New `EditorIcons.ChevronUp` (lucide `U+E074`, inside the baked range — verified via the TTF cmap, zero tofu). All structural edits are one-undo `EditorCommands.Structural`, deferred past the row loop. (4) **Oracle = new suite #19** `Polymorphic collections (RW8/EF15)` (20 checks): interface `List<IDamageModifier>` + abstract `Shape[]` with ≥2 concrete types each + a nested polymorphic element; asserts (a) all concrete types + values + ORDER round-trip, (b) byte-stable across two serializations + a serialize/deserialize/serialize fixed point, (c) a non-polymorphic `List<int>` alongside is byte-identical (exactly 6 `$type` tags, zero from the plain list). Build 0-error (engine ROOT csproj + Editor, clean scratch dirs), oracle EXIT=0 (19 suites). Serialize half is CPU/headless/safe; the reorder UI is the only part needing a human screenshot → batch into the Inspector-layout set (GPU-hang rule: no relaunch-loop).
 - [x] EF7 — Tag/Layer "Add…" → open Tags & Layers panel — `DrawTagLayerRow` appends a `Separator` + `Selectable("Add Tag.../Add Layer...")` at the bottom of each combo; selecting it calls `EditorWindows.Open(EditorMenus.WindowKeys.TagsLayers)` (static facade, no reference to the window/app — same surface the Window menu uses). `Open` not `Toggle` so "Add…" always surfaces the panel. New tags/layers persist via TagManager/LayerManager (`LayerSettings.Save`) + reappear next frame. `EditorIcons.Add` = already-baked lucide plus (no new codepoint). Touched only `InspectorPanel.cs`. Build 0-error, oracle EXIT=0 (19 suites, A1 17/17). Human screenshot batched.
 - [x] EF8 — split Layer Collision Matrix into its own panel — new `LayerCollisionMatrixPanel` (Window > Layer Collision Matrix) owns the matrix UI (the `DrawCollisionMatrix` body moved verbatim from `TagsLayersPanel`, dropped its `CollapsingHeader` wrapper since it's now the whole window, "above"→"in Tags & Layers" empty-state hint); `TagsLayersPanel` keeps only Tags + Layers. Wired exactly like `TagsLayers`: `WindowKeys.LayerCollision` const + `PathToWindowKey["Window/Layer Collision Matrix"]` + `[MenuItem("Window/Layer Collision Matrix", 25)]`→`EditorWindows.Toggle` in `EditorMenus.cs`; owned as a field on `EditorApplication` + the three switch arms (`ToggleWindow`/`OpenWindow`/`IsWindowOpen`) + both `Draw(S)` call sites (fullscreen `:756` + normal `:831`). Both panels read the same `LayerManager` store; matrix edits still `LayerSettings.Save`. Build 0-error (Editor csproj, clean `--no-incremental` scratch dir), oracle EXIT=0 (19 suites; A1 Menu/Window registry 17/17 confirms the new `[MenuItem]` compiles into the discovery). Touched 4 files (`LayerCollisionMatrixPanel.cs` new, `TagsLayersPanel.cs`, `EditorMenus.cs`, `EditorApplication.cs` — all mine). Human screenshot (two distinct windows; matrix edits persist; Tags & Layers no longer shows the matrix) batched into the editor set; NOT relaunch-looped.
-- [ ] EF13+EF14 — hierarchy collapse/expand + collapsed-by-default
+- [x] EF13+EF14 — hierarchy collapse/expand + collapsed-by-default — `HierarchyPanel` now OWNS the tree open-state (`Dictionary<int,bool> openState` keyed by `entity.InstanceId.GetHashCode()`). EF13 = two toolbar GhostButtons (ChevronRight=Collapse All, ChevronDown=Expand All) that arm a one-frame `ExpandForce`; EF14 = a node seen for the FIRST time (id not in tracker) defaults collapsed (covers first scene load + new entities, no scene-change detection). `SetNextItemOpen` is pushed ONLY on a forced/first-seen frame; otherwise ImGui's `TreeNodeEx` return is read back into the tracker so manual expansions persist. `DefaultOpen` flag dropped. Parent nodes only (leaves untracked); tracker pruned to live entities. Editor-only (1 file). Build 0-error, oracle EXIT=0 (19 suites).
 - [ ] EF1 — gizmo-mode button auto-width
 - [ ] EF2 — gizmo ↔ eye-menu de-overlap
 - [ ] EF4 — FPS scene-view gate

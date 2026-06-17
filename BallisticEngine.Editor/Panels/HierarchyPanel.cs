@@ -18,6 +18,21 @@ internal sealed class HierarchyPanel {
 
     string search = "";
 
+    // ---- Tree expand/collapse state (EF13+EF14) ------------------------------
+    // ImGui keeps tree open-state implicitly per-node in its storage, which can't honour either an
+    // on-demand Collapse/Expand-All OR a "collapsed on first load" default without fighting the user's
+    // own per-node toggles every frame. So the hierarchy OWNS the open-state, keyed by entity id (the
+    // same GetHashCode() used everywhere else): the tracker is the source of truth, pushed into ImGui
+    // via SetNextItemOpen ONLY on the frames a force applies (a button click, or a node seen for the
+    // first time — which is collapsed-by-default), and read back from ImGui otherwise so manual
+    // expansions persist.
+    readonly Dictionary<int, bool> openState = new();
+
+    enum ExpandForce { None, CollapseAll, ExpandAll }
+    // Set by the toolbar buttons; consumed for exactly ONE frame (all nodes get SetNextItemOpen that
+    // frame), then cleared. Outside that frame ImGui keeps the user's per-node state.
+    ExpandForce pendingForce = ExpandForce.None;
+
     // Set by EditorApplication: the asset browser's current folder (project-relative), so "Create
     // Prefab" writes the .prefab next to whatever the user is browsing. Falls back to "Assets".
     public Func<string> CurrentAssetFolder;
@@ -46,6 +61,14 @@ internal sealed class HierarchyPanel {
             DeleteSelected(scene);
         ImGui.EndDisabled();
 
+        // Collapse-all / expand-all: arm a one-frame force the tree applies via SetNextItemOpen (EF13).
+        ImGui.SameLine(0, 2);
+        if (EditorIcons.GhostButton("hiercollapse", EditorIcons.ChevronRight, "Collapse All"))
+            pendingForce = ExpandForce.CollapseAll;
+        ImGui.SameLine(0, 2);
+        if (EditorIcons.GhostButton("hierexpand", EditorIcons.ChevronDown, "Expand All"))
+            pendingForce = ExpandForce.ExpandAll;
+
         ImGui.SameLine(0, 6);
         ImGui.SetNextItemWidth(-1);
         ImGui.InputTextWithHint("##hiersearch", $"{EditorIcons.Search} Search (t:Component)...", ref search, 128);
@@ -54,6 +77,12 @@ internal sealed class HierarchyPanel {
 
         // Snapshot so create/delete during iteration is safe; render the forest from the roots.
         var entities = scene.Entities.ToArray();
+
+        // Keep the open-state tracker bounded: drop entries for entities that no longer exist (deleted,
+        // or a scene swap), so a destroyed id can't shadow a future reuse and the dict stays the size of
+        // the live scene. Cheap — only runs when the tracker holds more than the live entity count.
+        if (openState.Count > entities.Length)
+            PruneOpenState(entities);
 
         // A full-height child as the drop area (minus a slim count footer), so dragging an
         // entity onto empty space unparents it.
@@ -77,6 +106,10 @@ internal sealed class HierarchyPanel {
         }
 
         ImGui.EndChild();
+
+        // The collapse/expand-all force is consumed for exactly this one frame — every node has now
+        // read it (or, while filtering, none did). Clear it so the user's subsequent toggles stick.
+        pendingForce = ExpandForce.None;
 
         // Drop on the empty child area â†’ unparent to world; model assets from the browser
         // instantiate as entities (one per source mesh for splitByNodes imports); script assets
@@ -284,8 +317,26 @@ internal sealed class HierarchyPanel {
         var children = Children(entity, allEntities);
         bool selected = state.IsEntitySelected(entity);
 
+        // EF13+EF14 open-state: the tracker is the source of truth, and ONLY parent nodes (leaves have no
+        // fold) are tracked. Force ImGui's open state when a Collapse/Expand-All is armed this frame, OR
+        // when the node is seen for the FIRST time (default collapsed — covers first scene load and any
+        // freshly-created entity without scene-change detection). Otherwise leave ImGui alone so the
+        // user's own arrow toggles persist.
+        if (children.Count > 0) {
+            bool firstSeen = !openState.ContainsKey(id);
+            if (pendingForce != ExpandForce.None || firstSeen) {
+                bool wantOpen = pendingForce switch {
+                    ExpandForce.ExpandAll => true,
+                    ExpandForce.CollapseAll => false,
+                    _ => false,   // first-seen default = collapsed (EF14)
+                };
+                ImGui.SetNextItemOpen(wantOpen);
+                openState[id] = wantOpen;
+            }
+        }
+
         var flags = ImGuiTreeNodeFlags.OpenOnArrow | ImGuiTreeNodeFlags.SpanAvailWidth |
-                    ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.AllowOverlap;
+                    ImGuiTreeNodeFlags.AllowOverlap;
         if (selected) flags |= ImGuiTreeNodeFlags.Selected;
         if (children.Count == 0) flags |= ImGuiTreeNodeFlags.Leaf | ImGuiTreeNodeFlags.NoTreePushOnOpen;
 
@@ -303,6 +354,11 @@ internal sealed class HierarchyPanel {
 
         // Leading spaces leave room for the type icon overlaid after the arrow.
         bool open = ImGui.TreeNodeEx($"     {entity.Name}##{id}", flags);
+
+        // Remember ImGui's actual open state so a manual arrow toggle persists across frames (and so the
+        // next Collapse/Expand-All starts from the truth). A leaf reports closed but has nothing to track.
+        if (children.Count > 0)
+            openState[id] = open;
 
         if (tinted)
             ImGui.PopStyleColor();
@@ -614,6 +670,22 @@ internal sealed class HierarchyPanel {
         foreach (Entity e in entities)
             if (e.InstanceId.GetHashCode() == id) { entity = e; return true; }
         return false;
+    }
+
+    // Removes open-state entries whose entity is gone (delete / scene swap). Builds the live-id set from
+    // the same id space the tree keys on (InstanceId.GetHashCode()).
+    void PruneOpenState(Entity[] entities) {
+        var live = new HashSet<int>(entities.Length);
+        foreach (Entity e in entities)
+            live.Add(e.InstanceId.GetHashCode());
+        // Materialize the keys to remove first — can't mutate the dict while enumerating it.
+        List<int> stale = null;
+        foreach (int key in openState.Keys)
+            if (!live.Contains(key))
+                (stale ??= new List<int>()).Add(key);
+        if (stale is not null)
+            foreach (int key in stale)
+                openState.Remove(key);
     }
 
     static List<Entity> Children(Entity parent, Entity[] all) {
