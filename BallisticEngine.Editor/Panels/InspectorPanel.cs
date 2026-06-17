@@ -768,12 +768,18 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             volumeUndoBefore ??= beforeSnap;
 
             // Commit one undo step when the interaction ends (mouse released / instantaneous widget).
+            // F2: route the .volume ASSET edit through the EditorCommands.EditAsset choke point (which is
+            // EditorUndo.PushCallback under the hood) so every asset edit shares one undo entry point. The
+            // edit already happened during VolumeProfileEditor.Draw above, so the mutate step is a no-op --
+            // EditAsset only records the before/after revert pair here. Byte-identical to the prior
+            // PushCallback (same label, same applyOld/applyNew closures).
             if (!ImGui.IsAnyItemActive()) {
                 object before = volumeUndoBefore;
                 object after = VolumeProfileEditor.Snapshot(prof);
-                EditorUndo.PushCallback("Edit Volume Override",
-                    () => { VolumeProfileEditor.Restore(prof, before); VolumeProfileEditor.SaveToAsset(prof); state.MarkViewportDirty(); },
-                    () => { VolumeProfileEditor.Restore(prof, after); VolumeProfileEditor.SaveToAsset(prof); state.MarkViewportDirty(); });
+                EditorCommands.EditAsset("Edit Volume Override",
+                    applyOld: () => { VolumeProfileEditor.Restore(prof, before); VolumeProfileEditor.SaveToAsset(prof); state.MarkViewportDirty(); },
+                    applyNew: () => { VolumeProfileEditor.Restore(prof, after); VolumeProfileEditor.SaveToAsset(prof); state.MarkViewportDirty(); },
+                    mutate: () => { });
                 volumeUndoBefore = null;
             }
         }

@@ -23,21 +23,28 @@ namespace BallisticEngine.Tests.Reflection;
 //
 // SCOPE -- engine-expressible mutations (the pure-engine half of the action surface):
 //   create entity, delete entity, reparent, rename, add component, remove component, edit member,
-//   toggle active. OUT OF SCOPE (documented below, needs ImGui/EditorWidgets -> migrate + test in F1):
-//   gizmo drags, widget activation-state deferred-commit, terrain brush, curve/volume callback edits.
+//   toggle active, AND (F2) an asset edit via the EditAsset callback path. OUT OF SCOPE (documented below,
+//   needs ImGui/EditorWidgets -> migrate + test in F1): gizmo drags, widget activation-state
+//   deferred-commit, terrain brush.
 //
-// KNOWN HOLE (the RED case that proves the harness can tell covered from uncovered): an asset-edit-style
-// mutation that bypasses snapshotting leaves ZERO entries. The harness ASSERTS that bypass == 0 coverage
-// (a positive assertion of a documented hole), and reports it -- exit stays 0; F2 will flip it to covered.
+// F2 (asset-edit hole CLOSED): an asset edit routed through EditorCommands.EditAsset (-> PushCallback,
+// the .volume profile / curve callback path) now leaves exactly one recoverable entry -- modeled here as
+// the "asset edit (EditAsset callback)" action (capture before/after, push the revert pair, Undo runs
+// applyOld). This was the KNOWN HOLE the harness flagged for F2; it is now an IN-SCOPE covered action.
+//
+// BYPASS CONTROL (the case that proves the harness can tell covered from uncovered): a mutation that
+// bypasses snapshotting entirely (no Push) leaves ZERO entries. The harness ASSERTS bypass == 0 coverage
+// so a dropped Push can never silently pass as covered. (Distinct from the EditAsset path, now covered.)
 //
 // Runs alongside the other G-suites that insert into the global SceneManager (no public unload); the
 // leftover scene is harmless (process exits next).
 internal static class UndoCoverageTests {
-    // A faithful stand-in for EditorUndo: the same two entry shapes (whole-scene YAML / scoped entity
-    // doc), one entry per Push, Undo restores the captured state. No redo/labels/capacity here -- the
-    // coverage contract is "did the action leave a recoverable entry", which these two paths express.
+    // A faithful stand-in for EditorUndo: the same three entry shapes (whole-scene YAML / scoped entity
+    // doc / callback revert pair), one entry per Push, Undo restores the captured state. No redo/labels/
+    // capacity here -- the coverage contract is "did the action leave a recoverable entry", which these
+    // paths express (the callback shape mirrors EditorUndo.PushCallback reached via EditorCommands.EditAsset).
     sealed class UndoModel {
-        readonly record struct Entry(string Yaml, Guid EntityId, EntityDocument Doc) {
+        readonly record struct Entry(string Yaml, Guid EntityId, EntityDocument Doc, Action ApplyOld, Action ApplyNew) {
             public bool IsScoped => Doc is not null;
         }
 
@@ -45,20 +52,34 @@ internal static class UndoCoverageTests {
         public int Count => stack.Count;
 
         // Whole-scene snapshot BEFORE a structural change (EditorUndo.Push).
-        public void Push() => stack.Add(new Entry(SceneSerializer.Serialize(SceneManager.GetCurrentScene()), Guid.Empty, null));
+        public void Push() => stack.Add(new Entry(SceneSerializer.Serialize(SceneManager.GetCurrentScene()), Guid.Empty, null, null, null));
 
         // Scoped single-entity snapshot BEFORE a value edit (EditorUndo.PushEntity).
         public void PushEntity(Entity e) {
             if (e is null) { Push(); return; }
-            stack.Add(new Entry(null, e.InstanceId, SceneSerializer.CaptureEntity(e)));
+            stack.Add(new Entry(null, e.InstanceId, SceneSerializer.CaptureEntity(e), null, null));
+        }
+
+        // Callback entry for a non-scene ASSET edit (EditorUndo.PushCallback, reached via
+        // EditorCommands.EditAsset). The caller captures the asset state BEFORE and AFTER the edit and
+        // supplies the revert (applyOld) + re-apply (applyNew) pair; Undo runs applyOld. This is the F2
+        // path the editor's .volume / curve asset edits now route through, modeled here so the harness
+        // proves the EditAsset callback actually leaves one recoverable entry (was the KNOWN HOLE).
+        public void PushCallback(Action applyOld, Action applyNew) {
+            if (applyOld is null || applyNew is null) return;
+            stack.Add(new Entry(null, Guid.Empty, null, applyOld, applyNew));
         }
 
         // Restore the top entry (EditorUndo.Undo -> Apply): scoped restores just its entity in place,
-        // full rebuilds the scene. Pops the entry.
+        // callback runs applyOld, full rebuilds the scene. Pops the entry.
         public void Undo() {
             if (stack.Count == 0) return;
             Entry top = stack[^1];
             stack.RemoveAt(stack.Count - 1);
+            if (top.ApplyOld is not null) {
+                top.ApplyOld();
+                return;
+            }
             if (top.IsScoped) {
                 if (FindEntity(top.EntityId) is { } target)
                     SceneSerializer.RestoreEntityInPlace(target, top.Doc);
@@ -108,10 +129,16 @@ internal static class UndoCoverageTests {
         foreach (var (name, setup, mutate) in actions)
             coverage.Add(Measure(name, setup, mutate, knownHole: false));
 
-        // The documented KNOWN HOLE: an asset-edit-style mutation that bypasses snapshotting -- mutates a
-        // member WITHOUT any Push first. EditorUndo never sees it, so it leaves ZERO entries (today, edit
-        // a .mat -> Ctrl+Z does nothing). We assert that the bypass path is RECOGNIZED as zero-coverage.
-        coverage.Add(Measure("asset edit (bypass undo)", SetupSubject, AssetEditBypass, knownHole: true));
+        // F2 CLOSED the asset-edit hole: an asset edit routed through EditorCommands.EditAsset (the .volume
+        // profile / curve callback path) now leaves exactly one recoverable entry. This action models that
+        // path -- capture the asset state before/after, push the callback pair, Undo runs applyOld. It is
+        // IN-SCOPE and covered (was the KNOWN HOLE the F3 harness flagged for F2 to close).
+        coverage.Add(Measure("asset edit (EditAsset callback)", SetupSubject, AssetEditCallback, knownHole: false));
+
+        // The bypass-recognition control STAYS: a mutation with NO Push still leaves ZERO entries. This is
+        // the harness's proof it can tell covered from uncovered (a regression that drops a Push must read
+        // as 0 coverage, not silently pass). Distinct from the EditAsset path above, which IS covered now.
+        coverage.Add(Measure("edit without undo (bypass control)", SetupSubject, AssetEditBypass, knownHole: true));
 
         // ---- Assertions: every in-scope action == exactly one recoverable undo entry ----------------
         foreach (ActionCoverage c in coverage.Where(c => !c.KnownHole)) {
@@ -121,12 +148,20 @@ internal static class UndoCoverageTests {
                 "Undo did not return the scene to its pre-action snapshot (wrong scope or no entry)");
         }
 
-        // ---- The harness PROVES it can tell covered from uncovered: the bypass path == 0 coverage ----
+        // ---- F2: the EditAsset callback path is now COVERED (was the KNOWN HOLE) ---------------------
+        ActionCoverage assetEdit = coverage.First(c => c.Name == "asset edit (EditAsset callback)");
+        h.Check("EditAsset callback leaves exactly one undo entry (F2 closed the asset-edit hole)",
+            assetEdit.EntriesPushed == 1,
+            $"expected 1 entry from the EditAsset callback path, got {assetEdit.EntriesPushed}");
+        h.Check("EditAsset callback undo restored the prior asset state", assetEdit.Restored,
+            "applyOld did not revert the asset edit -- the callback before/after capture is wrong");
+
+        // ---- The harness PROVES it can tell covered from uncovered: the bypass control == 0 coverage --
         ActionCoverage hole = coverage.First(c => c.KnownHole);
-        h.Check("known-hole bypass pushes ZERO undo entries (harness distinguishes covered vs not)",
+        h.Check("bypass control pushes ZERO undo entries (harness distinguishes covered vs not)",
             hole.EntriesPushed == 0,
-            $"the asset-edit bypass should leave 0 entries (documented hole), got {hole.EntriesPushed}");
-        h.Check("known-hole bypass is NOT recoverable (Ctrl+Z is a no-op today)", !hole.Restored,
+            $"a no-Push edit should leave 0 entries (the dropped-Push bug class), got {hole.EntriesPushed}");
+        h.Check("bypass control is NOT recoverable (a dropped Push is a no-op Ctrl+Z)", !hole.Restored,
             "a bypassing edit must NOT round-trip -- if it did, it wasn't really a bypass");
 
         // ---- Coverage summary report (the green-gate baseline F1/F2 migrate against) -----------------
@@ -134,12 +169,14 @@ internal static class UndoCoverageTests {
         int inScope = coverage.Count(c => !c.KnownHole);
         Console.WriteLine($"[UndoCoverage] in-scope actions covered: {covered}/{inScope}");
         foreach (ActionCoverage c in coverage) {
-            string status = c.KnownHole ? "KNOWN HOLE (F2 will close)"
+            string status = c.KnownHole ? "bypass control (must read 0 coverage)"
                           : (c.EntriesPushed == 1 && c.Restored) ? "covered" : "UNCOVERED";
             Console.WriteLine($"    - {c.Name}: entries={c.EntriesPushed} restored={c.Restored} [{status}]");
         }
+        // F2 closed the asset-edit hole for the EditAsset callback path (volume-profile group). The
+        // ImGui-coupled drag/activation wiring around it (and gizmo/terrain) still migrate+test in F1.
         Console.WriteLine("    out-of-scope (need ImGui/EditorWidgets, migrate+test in F1): " +
-                          "gizmo drag, widget deferred-commit, terrain brush, curve/volume callback edit.");
+                          "gizmo drag, widget deferred-commit, terrain brush.");
 
         return h.Report("UndoCoverage (F3)");
     }
@@ -247,11 +284,27 @@ internal static class UndoCoverageTests {
         subject.SetActive(false);
     }
 
-    // The KNOWN HOLE: mutate WITHOUT pushing undo first (the asset-edit / forgotten-Push shape). Leaves
-    // zero entries -> Ctrl+Z is a no-op. The harness asserts this is recognized as zero coverage.
+    // F2: the asset edit routed through EditorCommands.EditAsset (-> EditorUndo.PushCallback). The caller
+    // captures the asset state BEFORE and AFTER the edit (here the subject component's member, standing in
+    // for a .volume profile / curve snapshot -- VolumeProfileEditor.Snapshot/Restore have exactly this
+    // value-capture/value-restore shape) and supplies the revert/re-apply pair. One entry, Undo runs
+    // applyOld and round-trips -- the formerly-bypassed asset edit is now undoable.
+    static void AssetEditCallback(UndoModel u) {
+        UndoSubjectBehaviour s = subject.GetComponent<UndoSubjectBehaviour>();
+        int before = s.Hp;                          // capture asset state BEFORE the edit
+        s.Hp = 7;                                    // the edit itself (already applied, as in the editor)
+        int after = s.Hp;                            // capture asset state AFTER the edit
+        // Push the callback pair AFTER the edit (matches the editor: the .volume Draw mutates, then
+        // EditAsset records the revert pair). applyOld reverts to `before`, applyNew re-applies `after`.
+        u.PushCallback(() => s.Hp = before, () => s.Hp = after);
+    }
+
+    // The BYPASS CONTROL (kept as the covered-vs-uncovered proof): mutate WITHOUT any Push (the
+    // forgotten-Push bug class). Leaves zero entries -> Ctrl+Z is a no-op. The harness asserts this reads
+    // as zero coverage, so a dropped Push can never silently pass as covered.
     static void AssetEditBypass(UndoModel u) {
         UndoSubjectBehaviour s = subject.GetComponent<UndoSubjectBehaviour>();
-        // No u.Push() / u.PushEntity() -- this is exactly the bug class: mutate, no snapshot.
+        // No u.Push() / u.PushEntity() / u.PushCallback() -- this is exactly the bug class: mutate, no snapshot.
         s.Hp = 7;
     }
 }
