@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The editor-rework Phase-0 headless harness (P0.1+). A GL-FREE console runner that exercises the
+       engine's reflection substrate (TypeCache now; P0.2's resolve-plan-for-type, P0.4 determinism, and
+       the drawer-tree resolution next) with NO ImGui / NO GPU — the contract + oracle the rest of Phase 0
+       hangs on. References the engine LIBRARY only, exactly like the `bal` CLI. Exit code 0 = all checks
+       pass; non-zero = the failing check count (honest exit codes, agent-runnable). NOT in the slnx by
+       default (it's a test runner, not a shipped host); run it with `dotnet run` against this project. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>baltest-reflection</AssemblyName>
+    <RootNamespace>BallisticEngine.Tests.Reflection</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BallisticEngine.csproj" />
+  </ItemGroup>
+
+</Project>

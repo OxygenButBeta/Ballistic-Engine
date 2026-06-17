@@ -20,6 +20,7 @@
       <Compile Remove="BallisticEngine.Profiling.Tracy\**\*.cs" />
       <Compile Remove="BallisticEngine.DX12\**\*.cs" />
       <Compile Remove="BallisticEngine.SourceGen\**\*.cs" />
+      <Compile Remove="BallisticEngine.Tests.Reflection\**\*.cs" />
       <Compile Remove="Tools\**\*.cs" />
       <Compile Remove="SampleProject\**\*.cs" />
     </ItemGroup>

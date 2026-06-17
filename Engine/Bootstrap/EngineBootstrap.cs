@@ -178,6 +178,13 @@ public sealed class EngineBootstrap {
             : [typeof(SceneManager).Assembly, Runtime.GetType().Assembly, gameScripts];
         ComponentRegistry.Build(assemblies);
 
+        // The general reflection substrate (editor-rework P0.1) — built from the SAME assembly set,
+        // alongside ComponentRegistry which it generalizes. Re-run on every reload (this method is
+        // re-invoked from ReloadGameScripts) so its derived-type queries never serve stale game-script
+        // types. (P0.3 will formalize a ClearForReload registration; Build() already fully replaces the
+        // cache, so the reload path's re-invocation is sufficient today.)
+        TypeCache.Build(assemblies);
+
         // Gameplay framework (plan §7.3.1): force every InputAction-container type's static fields to
         // initialize so the full action list is populated up front (for a rebind screen / agent tooling)
         // — `static readonly InputAction` fields are lazy otherwise. Run once here, like the registry
