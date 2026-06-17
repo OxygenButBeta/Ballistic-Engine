@@ -1031,15 +1031,18 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         ImGui.SetCursorScreenPos(new SysVec2(chkX, min.Y + (headerH - frameH) * 0.5f));
         ImGui.Checkbox($"##en_{label}", ref enabled);
 
-        // Type icon + bold label after the checkbox.
-        float fontSize = ImGui.GetFontSize();
-        float textY = min.Y + (headerH - fontSize) * 0.5f;
+        // Type icon + label after the checkbox. EF5e: the component title uses the larger semantic HEADER
+        // font (not body-size Bold) so a component header reads as a real header — the type-scale hierarchy
+        // that breaks the "flat wall of same-size text" feel. (Header has icon glyphs merged in, so the icon
+        // renders from the same font at the same size and stays baseline-aligned with the label.)
+        float headerFontSize = EditorTheme.Header.FontSize;
+        float textY = min.Y + (headerH - headerFontSize) * 0.5f;
         float iconX = chkX + frameH + 6;
         var dimmed = enabled ? 1f : 0.45f;
-        draw.AddText(new SysVec2(iconX, textY),
+        draw.AddText(EditorTheme.Header, headerFontSize, new SysVec2(iconX, textY),
             ImGui.GetColorU32(new SysVec4(tint.X, tint.Y, tint.Z, dimmed)), icon);
-        draw.AddText(ImGuiController.Bold, fontSize,
-            new SysVec2(iconX + fontSize + 6, textY),
+        draw.AddText(EditorTheme.Header, headerFontSize,
+            new SysVec2(iconX + headerFontSize + 8, textY),
             ImGui.GetColorU32(enabled ? ImGuiCol.Text : ImGuiCol.TextDisabled), label);
 
         // "..." menu pinned to the right edge.
