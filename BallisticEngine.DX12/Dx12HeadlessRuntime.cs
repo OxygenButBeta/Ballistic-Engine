@@ -130,6 +130,7 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
             Console.WriteLine($"[Screenshot] saved {r.Width}x{r.Height} to {ScreenshotPath} (DX12)");
             PrintPerfStats();
             GBufferDump(r);
+            HdrDump(r);
             DrainValidation(r);
         }
         else {
@@ -166,6 +167,21 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
         string path = System.IO.Path.Combine(MotionDumpDir,
             string.Create(System.Globalization.CultureInfo.InvariantCulture, $"frame_{index:00}.bmp"));
         r.SaveFrame(path);
+    }
+
+    // W3 noise-floor HDR dump (BALLISTIC_DX12_HDR_DUMP=<file>): after the frame, write the HDR scene-color
+    // target back as raw R32F-triple .bin so the determinism floor can be measured in LINEAR/HDR space (the
+    // tonemapped LDR PNG can round away a sub-floor HDR diff). Measurement-only; same end-of-frame readback
+    // pattern as GBufferDump.
+    static void HdrDump(DX12HDRenderer r) {
+        string file = Environment.GetEnvironmentVariable("BALLISTIC_DX12_HDR_DUMP");
+        if (string.IsNullOrWhiteSpace(file)) return;
+        string? d = System.IO.Path.GetDirectoryName(file);
+        if (!string.IsNullOrEmpty(d)) System.IO.Directory.CreateDirectory(d);
+        object manifest = r.DumpHdrColor(file);
+        System.IO.File.WriteAllText(file + ".manifest.json",
+            System.Text.Json.JsonSerializer.Serialize(manifest));
+        Console.WriteLine($"[HdrDump] wrote HDR scene color to {file} (DX12)");
     }
 
     // Raw G-buffer dump for `bal gbuffer` (BALLISTIC_GBUFFER_DUMP=<dir>): after the frame, write depth/normal/

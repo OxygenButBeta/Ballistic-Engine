@@ -32,6 +32,22 @@ See `C:\Users\suley\.claude\plans\silly-leaping-fog.md` § "Validation oracle" (
 | `BALLISTIC_DX12_GBV_BASELINE=<path>` | override the baseline path (default: this file, resolved via `BALLISTIC_ENGINE_ROOT` or the `BallisticEngine.slnx` walk-up) |
 | `BALLISTIC_DX12_GBV_CAPTURE_BASELINE=<path>` | capture mode: **merge** the run's messages into the baseline at `<path>` (re-run across scenes to accumulate) |
 | `BALLISTIC_DX12_GBV_BASELINE_COMMIT=<hash>` | stamp the `Substrate.Commit` field when capturing (the running build can't read its own git hash) |
+| `BALLISTIC_DX12_HDR_DUMP=<file>` | (W3 noise-floor) write the HDR scene-color target back as raw R32F-triple `.bin` (+ `.manifest.json`) so the determinism floor can be measured in LINEAR/HDR space, not just the tonemapped LDR PNG. Measurement-only; render path unchanged. |
+
+## Noise floor (W3) — `dx12-noise-floor.json`
+
+`dx12-noise-floor.json` records the phase-2 `imgdiff` tolerances measured in chunk 2. **Headline result:
+the deterministic floor is EXACTLY ZERO** — all 4 coverage scenes (SkyTest, CornellBox,
+BistroInterior_Wine, BistroExterior) render byte-identical (SHA-256) across repeated deterministic
+renders in BOTH LDR (the composite BMP) and HDR/linear (the `BALLISTIC_DX12_HDR_DUMP` R32F readback). So
+the phase-2 deterministic gate is literal byte-identity vs the frozen golden set — no tolerance epsilon
+needed on this substrate.
+
+The **regime-(b) boiling band** (temporal-active motion-dump, the second oracle the deterministic gate
+can't exercise) is near-deterministic too: BistroInterior is bit-exact run-to-run (σ=0), BistroExterior
+has σ≈3e-6. Recommended operational regime-(b) gate = boiling within 0.5% (or mean+3σ, whichever looser)
+of the frozen phase-1 value. Pinned to the same substrate as the GBV baseline; regenerate on a driver/GPU
+bump. Boiling helper: `e:/tmp/chunk2/boil.py <runDir>...`.
 
 ## Substrate pin (R-NEW-6)
 

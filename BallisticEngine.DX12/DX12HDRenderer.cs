@@ -4194,6 +4194,30 @@ public sealed class DX12HDRenderer : HDRenderer {
             },
         };
     }
+
+    // HDR scene-color dump for the W3 noise-floor measurement (`BALLISTIC_DX12_HDR_DUMP=<file>`): read the
+    // canonical HDR scene-color target (`target`, the R16F surface opaque/sky/fog render into, the same one
+    // ReadColorRgb feeds OIDN) back to float RGB and write it as a raw little-endian R32F-triple .bin so the
+    // floor can be measured in LINEAR/HDR space, not just the tonemapped LDR PNG (tonemap compresses sub-
+    // floor HDR diffs — a barrier-induced HDR diff can round to the same 8-bit value). Measurement-only: a
+    // readback at end-of-frame behind an env door, exactly like DumpGBuffer; the render path is unchanged.
+    // SceneColor is the FSR/native canonical target; this reads `target` (the pre-FSR HDR composite input),
+    // which is what the deterministic (FSR-off) gate exercises.
+    public object DumpHdrColor(string file) {
+        if (target == null) return new { ok = false, error = "no HDR target (renderer not initialized)" };
+        int w = target.Width, h = target.Height;
+        var rgb = new float[w * h * 3];
+        target.ReadColorRgb(rgb);   // half->float, raw HDR (no tonemap), top-down rows
+        var bytes = new byte[rgb.Length * 4];
+        Buffer.BlockCopy(rgb, 0, bytes, 0, bytes.Length);
+        System.IO.File.WriteAllBytes(file, bytes);
+        return new {
+            ok = true, width = w, height = h, channels = 3,
+            format = "R32_Float (little-endian), 3 floats/pixel (RGB), top-down rows",
+            file,
+        };
+    }
+
     // Output (display/readback) resolution — equals the internal render res unless FSR is upscaling.
     public int Width => outputW;
     public int Height => outputH;
