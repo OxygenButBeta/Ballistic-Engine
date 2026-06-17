@@ -18,6 +18,11 @@ public interface IComponentInspectorHost {
     bool AxisVec3(string id, string label, ref SysVec3 v, float speed);
     bool TrackUndo(string label, bool changed);
     void MarkViewportDirty();
+
+    // editor-rework B4: the BObject asset-slot terminal drawer (AssetSlotDrawer) routes its IProperty here so
+    // the slot's existing drag-drop + picker rendering (InspectorPanel.DrawAssetSlot) is reused unchanged --
+    // the host unwraps the property's member/owner/type and forwards to its private DrawAssetSlot.
+    void DrawAssetSlot(IProperty property);
 }
 
 public sealed class ImGuiComponentGui : IInspectorGui {

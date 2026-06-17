@@ -57,6 +57,15 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         // The component-path drawer stack shares memberRegistry as its terminal type-drawer source, so the
         // component inspector and volume profile editor resolve the SAME value drawers (B0).
         componentStack = DrawerStack.CreateComponent(memberRegistry);
+        // B4 (Rule 2): the four widget types that used to BYPASS the stack via IsSpecialWidgetType (BEvent /
+        // BObject asset-slot / AnimationCurve / ColorGradient) are now TERMINAL drawers on the SAME registry,
+        // so the stack resolves them like any primitive and the if/else chain dissolves. They are ImGui-using
+        // editor drawers (NOT in CreatePrimitive, which stays headless), registered AFTER the primitives so
+        // last-wins resolution prefers them for their (disjoint) types.
+        memberRegistry.Register(new BEventDrawer());
+        memberRegistry.Register(new AnimationCurveDrawer(this));
+        memberRegistry.Register(new ColorGradientDrawer(this));
+        memberRegistry.Register(new AssetSlotDrawer(this));
         // The standalone component window reuses our reflection member renderer.
         ComponentEditorWindow.Configure(DrawMemberList);
     }
@@ -68,6 +77,12 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     bool IComponentInspectorHost.AxisVec3(string id, string label, ref SysVec3 v, float speed) => AxisVec3(id, label, ref v, speed);
     bool IComponentInspectorHost.TrackUndo(string label, bool changed) => InspectorUndo.Track(label, changed);
     void IComponentInspectorHost.MarkViewportDirty() => state.MarkViewportDirty();
+    // B4: the AssetSlotDrawer terminal drawer hands its IProperty here; unwrap the reflected member/owner/type
+    // and reuse the unchanged DrawAssetSlot rendering (byte-identical to the old IsSpecialWidgetType arm).
+    void IComponentInspectorHost.DrawAssetSlot(Inspector.IProperty property) {
+        if (property is Inspector.MemberProperty mp)
+            DrawAssetSlot(mp.Member, mp.Owner, mp.Get() as BObject, mp.ValueType);
+    }
 
     public void DrawContents() {
         ImGui.PushID(instanceId);   // namespace all ids so a 2nd Inspector window doesn't collide
@@ -1257,72 +1272,25 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     }
 
     void DrawMember(MemberInfo member, object target, MemberAttributes attrs) {
-        Type memberType = ComponentReflection.MemberType(member);
-        object value = ComponentReflection.GetValue(member, target);
-
-        // Registry-drawable value types (float/int/bool/string/enum/Vector2/Vector3) -- and ONLY these, not
-        // the special-widget types below -- now flow through the SAME composable drawer STACK as the volume
-        // profile editor (B0). The component stack owns its own row (PushId/BeginRow=label+mixed-marker+width)
-        // and the [ReadOnly]/[EnableIf] disable wrap (EnableStep) -- byte-identical to the old inline scaffold,
-        // but single-sourced through the stack instead of this method re-implementing Conditions.Disabled +
-        // calling the drawer directly (the component-vs-volume drift Conditions.cs warned about). The
-        // [ShowIf]/[HideIf] skip + the out-of-grid [Header]/[Space] separators stay in DrawMemberList (the
-        // layout driver), so the component stack registers only Enable+terminal -- see DrawerStack.CreateComponent.
-        if (!IsSpecialWidgetType(memberType, value) && memberRegistry.Resolve(memberType) is not null) {
-            componentStack.Draw(new MemberProperty(member, target,
-                v => { ApplyMember(member, target, v); state.MarkViewportDirty(); }), componentGui);
-            return;
-        }
-
-        string display = attrs.LabelText?.Text ?? Prettify(member.Name);   // [LabelText] override
-        RowWithTooltip(display, attrs.Tooltip?.Text);
-        // Mixed-value marker: in a multi-selection, an amber dash when the selected entities DISAGREE
-        // on this member (the field shows the active entity's value; editing it sets them all alike).
-        DrawMixedMarker(member, target, value);
-        ImGui.PushID(member.Name);
-        ImGui.SetNextItemWidth(-1);
-        // [ReadOnly] + [EnableIf]/[DisableIf] gate the value widget (the label stays enabled).
-        bool memberDisabled = attrs.ReadOnly || Conditions.Disabled(attrs.Conditionals, target);
-        if (memberDisabled) ImGui.BeginDisabled();
-
-        // Every edit auto-registers ONE undo step via InspectorUndo.Track (snapshot on edit-begin,
-        // commit on edit-end) — no per-widget EditorUndo.Push, so no case can forget it. Each change
-        // also marks the viewport dirty (on-demand render) since a value edit can alter the picture.
-        if (typeof(BEvent).IsAssignableFrom(memberType)) {
-            // Serialized event (UnityEvent-style): a multi-row listener editor. The component owns
-            // the instance (a `public BEvent X = new();` field) so we edit it in place, never reassign.
-            BEventEditor.Draw(member.Name, value as BEvent);
-        }
-        else if (typeof(BObject).IsAssignableFrom(memberType)) {
-            DrawAssetSlot(member, target, value as BObject, memberType);
-        }
-        else if (value is AnimationCurve curve) {
-            // Interactive curve widget — applies to ANY AnimationCurve member with no per-component
-            // wiring. Mutated in place (reference type); the "Edit" button opens the standalone window.
-            if (EditorWidgets.CurveEditor(member.Name, curve, state.MarkViewportDirty))
-                state.MarkViewportDirty();
-        }
-        else if (value is ColorGradient gradient) {
-            // Interactive gradient bar — same auto-apply-to-any-member story as the curve.
-            if (EditorWidgets.GradientEditor(member.Name, gradient))
-                state.MarkViewportDirty();
-        }
-        else {
-            ImGui.TextDisabled($"({memberType.Name})");
-        }
-
-        if (memberDisabled) ImGui.EndDisabled();
-        ImGui.PopID();
+        // B4 (Rule 2 -- "serialize-a-value == draw-a-value, ONE recursion"): EVERY drawable member now
+        // flows through the SAME composable drawer STACK as the volume profile editor (B0). Since chunk15
+        // the four ex-special widget types (BEvent / BObject asset-slot / AnimationCurve / ColorGradient)
+        // are TERMINAL drawers registered on memberRegistry, so the IsSpecialWidgetType bypass + its
+        // if/else chain are GONE -- the stack's TypeDrawerTerminalStep resolves them (and the primitives)
+        // uniformly, and an unresolved type falls to gui.Unsupported() == the old ({Type}) TextDisabled
+        // row. The component stack owns its own row (PushId/BeginRow = label + mixed-marker + width) and
+        // the [ReadOnly]/[EnableIf] disable wrap (EnableStep) -- byte-identical to the old inline scaffold.
+        // The [ShowIf]/[HideIf] skip + the out-of-grid [Header]/[Space] separators stay in DrawMemberList
+        // (the layout driver), so the component stack registers only Enable+terminal -- see
+        // DrawerStack.CreateComponent.
+        //
+        // Per-edit undo + dirty are unchanged: primitive edits auto-register one InspectorUndo.Track step
+        // and mark the viewport dirty via the apply delegate below; the curve/gradient/asset terminal
+        // drawers mark dirty through the host exactly as their old arms did (BEvent ignored its result, so
+        // it still marks nothing).
+        componentStack.Draw(new MemberProperty(member, target,
+            v => { ApplyMember(member, target, v); state.MarkViewportDirty(); }), componentGui);
     }
-
-    // The special-widget member types with their own hand-rolled editors (BEvent listener list, asset slot,
-    // curve, gradient) that must NOT route through the value-drawer stack -- they keep the manual path until
-    // B4 converges them as terminal drawers. Matches the old if/else precedence exactly.
-    static bool IsSpecialWidgetType(Type memberType, object value) =>
-        typeof(BEvent).IsAssignableFrom(memberType)
-        || typeof(BObject).IsAssignableFrom(memberType)
-        || value is AnimationCurve
-        || value is ColorGradient;
 
     // ---- Vector widgets ---------------------------------------------------------
 
