@@ -42,6 +42,15 @@ public sealed class Dx12TaaPass : IRenderPass, IDisposable {
     public void Declare(Dx12PassBuilder b) {
         b.Read(b.Resource("GBuffer"));
         b.ReadWrite(b.Resource("SceneColor"));
+        // PHASE-2 V3 (chunk 16): TAA's ONE shared-resource head transition is `target.ColorToShaderResource()`
+        // where target == ctx.SceneColor (the native-path scene color it reads; FSR hasn't run, TAA is the
+        // native path) — derive it as SceneColorShaderRead. The pass-private history.ColorToShaderResource() and
+        // the motion RT (already PSR from gbuffer.ToShaderResource upstream) are NOT pass-boundary heads → stay
+        // inline. The derived emit fires before Record whenever the pass is enabled (!FsrActive), even when
+        // TaaActive is false (Record early-returns after resetting the history flag) — a redundant idempotent
+        // SceneColor→PSR transition, harmless (the ch15 Transparents idempotent-emit gotcha).
+        b.DeriveBarriers();
+        b.Use(Dx12ResourceUsage.SceneColorShaderRead);
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -124,7 +133,9 @@ public sealed class Dx12TaaPass : IRenderPass, IDisposable {
             TexelSize = new Vector2(1f / targetW, 1f / targetH),
         };
 
-        target.ColorToShaderResource();
+        // PHASE-2 V3: skip the manual SceneColor head when derived barriers are active (the graph emitted
+        // ctx.SceneColor.ColorToShaderResource() before Record). history is pass-private → always inline.
+        if (!ctx.BarriersDerived) target.ColorToShaderResource();
         history.ColorToShaderResource();
         // Motion RT is already PixelShaderResource (gbuffer.ToShaderResource transitioned all colors).
         taaSrvVisible.Reset();

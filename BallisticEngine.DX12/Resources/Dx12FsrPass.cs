@@ -32,6 +32,15 @@ public sealed class Dx12FsrPass : IRenderPass, IDisposable {
         b.Read(b.Resource("GBuffer"));
         b.Read(b.Resource("SceneColor"));
         b.Write(b.Resource("FsrOutput"));
+        // PHASE-2 V3 (chunk 16): FSR's two shared-resource head transitions are `target.ColorToShaderResource()`
+        // (target == ctx.SceneColor — the internal HDR scene; TAA didn't run in the FSR path so SceneColor is
+        // still `target`) and `gbuffer.DepthToShaderResource()`. Derive both. The pass-private
+        // fsrOutput.ColorToUnorderedAccess() is the OUTPUT (a Write), not a boundary head → stays inline.
+        // NOTE: GBV+FSR is forbidden (18GB hang, ch7) — this derived path is verified by the SHA matrix + the
+        // verbatim-move argument, not GBV (FSR-path GBV is DEFERRED/UNVERIFIED).
+        b.DeriveBarriers();
+        b.Use(Dx12ResourceUsage.SceneColorShaderRead);
+        b.Use(Dx12ResourceUsage.GBufferDepthShaderRead);
     }
 
     // Render-wide camera constants (the renderer's CameraNear/CameraFar/FovYRadians, inlined — they're frame-
@@ -51,8 +60,12 @@ public sealed class Dx12FsrPass : IRenderPass, IDisposable {
         Dx12FsrUpscaler fsr = ctx.Fsr;
         int targetW = ctx.TargetW, targetH = ctx.TargetH;
 
-        target.ColorToShaderResource();      // internal HDR scene -> PixelShaderResource
-        gbuffer.DepthToShaderResource();      // depth -> PixelShaderResource
+        // PHASE-2 V3: skip the manual SceneColor + depth heads when derived barriers are active (the graph
+        // emitted ctx.SceneColor.ColorToShaderResource() + gbuffer.DepthToShaderResource() before Record).
+        if (!ctx.BarriersDerived) {
+            target.ColorToShaderResource();  // internal HDR scene -> PixelShaderResource
+            gbuffer.DepthToShaderResource(); // depth -> PixelShaderResource
+        }
         // motion RT is already PixelShaderResource (gbuffer.ToShaderResource transitioned all colors).
         fsrOutput.ColorToUnorderedAccess();
         bool reset = !ctx.MotionPrevValid;    // first frame after a (re)allocation = reset the history

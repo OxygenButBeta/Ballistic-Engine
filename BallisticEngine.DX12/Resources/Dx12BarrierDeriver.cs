@@ -149,6 +149,23 @@ public sealed class Dx12BarrierDeriver {
             ["Sky"]               = new() { [Role.GBufferDepth] = ResourceStates.DepthRead },
             ["Transparents"]      = new() { [Role.GBufferDepth] = ResourceStates.DepthRead },
             ["Deferred"]          = new() { [Role.GBufferColor] = GbCombined },
+            // chunk 16 (SceneColor group): TAA reads SceneColor as SRV (native path). FSR additionally reads the
+            // G-buffer depth as SRV for the upscaler reprojection. Composite reads the resolved SceneColor as SRV.
+            ["TAA"]               = new() { [Role.SceneColor] = ResourceStates.PixelShaderResource },
+            ["FSR"]               = new() {
+                [Role.SceneColor] = ResourceStates.PixelShaderResource,
+                [Role.GBufferDepth] = ResourceStates.PixelShaderResource,
+            },
+            ["Composite"]         = new() { [Role.SceneColor] = ResourceStates.PixelShaderResource },
+            // GI (screen path) + Reflections (SSR path): each reads SceneColor + G-buffer depth as SRV.
+            ["GI"]                = new() {
+                [Role.SceneColor] = ResourceStates.PixelShaderResource,
+                [Role.GBufferDepth] = ResourceStates.PixelShaderResource,
+            },
+            ["Reflections"]       = new() {
+                [Role.SceneColor] = ResourceStates.PixelShaderResource,
+                [Role.GBufferDepth] = ResourceStates.PixelShaderResource,
+            },
         };
     }
 }
