@@ -112,6 +112,15 @@ public static class VolumePostProcessing {
             fx.VolumetricTint = volumetric.tint.Value;
         }
 
+        if (stack.GetComponent<AerialPerspective>() is { } aerial) {
+            fx.AerialPerspectiveEnabled = aerial.enabled.Value;
+            fx.AerialPerspectiveIntensity = aerial.intensity.Value;
+            fx.AerialPerspectiveStartDistance = aerial.startDistance.Value;
+            fx.AerialPerspectiveMaxDistance = aerial.maxDistance.Value;
+            fx.AerialPerspectiveDensityScale = aerial.densityScale.Value;
+            fx.AerialPerspectiveTint = aerial.tint.Value;
+        }
+
         if (stack.GetComponent<ColorAdjustments>() is { } grade) {
             fx.Contrast = grade.contrast.Value;
             fx.Saturation = grade.saturation.Value;

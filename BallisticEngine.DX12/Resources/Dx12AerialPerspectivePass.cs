@@ -12,31 +12,30 @@ namespace BallisticEngine.DX12;
 // sky+opaque HDR before transparents/fog. SEPARATE pass — never touches deferred lighting. Only when a
 // ProceduralSky drives the atmosphere; BALLISTIC_DX12_AP=0 disables it.
 //
-// VERBATIM MOVE (chunk 5 of the pass-graph migration): the body of BuildAerialPerspective/DrawAerialPerspective
-// is copied unchanged, only re-rooted onto `ctx`/this pass's own fields. No logic change → eyeball-unchanged +
-// zero NEW GBV (a MOVE-only commit). Copies the Dx12SsaoPass template (the canonical leaf-post pass).
+// REWRITE (dx12-aerial-perspective-rework): the old pass marched a fake analytic haze with a hardcoded
+// lux-scaled blue tint (the flat blue-white veil). It now bakes a Hillaire FROXEL VOLUME each frame (the
+// SAME atmosphere the sky shows) and just SAMPLES it by (screenUV, viewDistance) — physically correct,
+// sky-matched colour, real exp(-beta*d) optical depth. All look tuning lives in the AerialPerspective
+// Volume component (PostFX bridge); see Docs/Plans/dx12-aerial-perspective-rework.md.
 //
-// Decision 4 / R2: the head resource transition (gbuffer.DepthToShaderResource) lives at the TOP of Record —
-// the pass emits its OWN idempotent head transition, never relying on an upstream pass.
-//
-// Event = AerialPerspective (400). Today inline AP runs after Sky and before Transparents; under the graph it
-// runs at its event slot (AerialPerspective=400 < Fog=550 < SSR/Reflections=600 < PostProcess/SSAO=650), which
-// the graph.Execute() call (placed before composite) reproduces in the same relative order. It writes IN PLACE
-// to `target` (the HDR scene color) via RenderColorOnly — no cross-pass output getter needed.
+// Event = AerialPerspective (400). Runs after Sky, before Transparents. Writes IN PLACE to the HDR scene
+// color via RenderColorOnly (fixed-function blend: dest = dest*srcAlpha(T) + src(inscatter)).
 public sealed class Dx12AerialPerspectivePass : IRenderPass, IDisposable {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.AerialPerspective;
     public string Name => "AerialPerspective";
 
-    // The VERBATIM outer-if predicate: `if (doors.AerialPersp && ProceduralSky.Active is not null)`.
+    // The pass runs whenever the AP door is on AND a ProceduralSky drives the atmosphere. The per-frame
+    // AerialPerspective volume toggle is honoured via the shader's `Enabled` constant (a clean no-op discard)
+    // so the pass overhead is a single cheap bake + a discarded fullscreen draw when the volume turns it off.
     public bool Enabled(Dx12FrameContext ctx) => ctx.Doors.AerialPersp && ProceduralSky.Active is not null;
 
-    // PHASE-2 V1: reads the G-buffer depth and blends haze IN PLACE into the HDR scene color (ReadWrite — it
-    // reads `target` via the blend and writes it back).
+    // PHASE-2 V1: reads the G-buffer depth + the baked froxel volume and blends haze IN PLACE into the HDR
+    // scene color (ReadWrite — it reads `target` via the blend and writes it back).
     public void Declare(Dx12PassBuilder b) {
         b.Read(b.Resource("GBuffer"));
         b.ReadWrite(b.Resource("SceneColor"));
-        // PHASE-2 V3 (chunk 14): AP's ONE shared-resource head transition is `gbuffer.DepthToShaderResource()` —
-        // same usage class as SSAO/Fog. Declare it so the graph derives + emits it (BALLISTIC_DX12_GRAPH_BARRIERS=1).
+        // AP's ONE shared-resource head transition is `gbuffer.DepthToShaderResource()` — same usage class as
+        // SSAO/Fog. The froxel volume is pass-owned (the bake transitions it to PixelShaderResource itself).
         b.DeriveBarriers();
         b.Use(Dx12ResourceUsage.GBufferDepthShaderRead);
     }
@@ -44,34 +43,38 @@ public sealed class Dx12AerialPerspectivePass : IRenderPass, IDisposable {
     [StructLayout(LayoutKind.Sequential)]
     struct ApConstants {
         public Matrix4x4 InvViewProj;
-        public Vector3 CameraPos; public float Strength;
-        public Vector3 SunDirection; public float Distance;
-        public Vector3 SunRadiance; public float HazeAniso;
-        public Vector3 SkyTint; public float AirDensity;
-        public float Haze, MaxDistance, NearFade, Pad;   // NearFade: haze fades in over [NearFade, 2*NearFade] m (V3)
+        public Vector3 CameraPos; public float MaxDistance;   // froxel-volume far depth (m) — MUST match the bake
+        public float Enabled; public Vector3 PadAp;           // 0 = pass is a clean no-op (shader discards)
     }
 
     readonly Dx12Device dev;
-    ID3D12RootSignature apRootSig;      // ApConstants CBV (b0) + depth SRV (t0) + sampler
+    readonly Dx12AerialPerspectiveLut lut;   // the froxel volume + its bake, baked at the head of Record
+    ID3D12RootSignature apRootSig;           // ApConstants CBV (b0) + depth+volume SRV table (t0,t1) + 2 samplers
     ID3D12PipelineState apPso;
     ID3D12Resource apCb;
     unsafe byte* apCbMapped;
-    Dx12DescriptorHeap apSrvVisible;    // scene depth, copied per frame
+    Dx12DescriptorHeap apSrvVisible;         // depth + froxel volume, copied per frame (2 descriptors)
 
-    // VERBATIM BuildAerialPerspective. Owns rootsig/PSO/CB/heap (resolution-independent — no Resize body).
     public unsafe Dx12AerialPerspectivePass(Dx12Device device) {
         dev = device;
-        // ApConstants CBV (b0) + a 1-SRV table (depth t0) + clamp sampler s0.
+        lut = new Dx12AerialPerspectiveLut(device);
+
+        // ApConstants CBV (b0) + a 2-SRV table (depth t0, froxel volume t1) + point sampler s0 + linear s1.
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 0);
         var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
-        var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+        var pointSamp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipPoint, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        var linearSamp = new StaticSamplerDescription(ShaderVisibility.Pixel, 1, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
             AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
             ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
         };
         apRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { samp })));
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { pointSamp, linearSamp })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("AerialPerspective.hlsl");
         byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "AerialPerspective.hlsl");
@@ -103,12 +106,9 @@ public sealed class Dx12AerialPerspectivePass : IRenderPass, IDisposable {
             ResourceDescription.Buffer((ulong)apCbSize), ResourceStates.GenericRead);
         apCbMapped = apCb.Map<byte>(0);
         apSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
-    // VERBATIM DrawAerialPerspective. The call-site args (viewProj, camPos, apSunDir, lightColor=sunRadiance)
-    // are re-derived from ctx: apSunDir = the normalized sun dir (UnitY fallback for a zero dir), exactly as the
-    // inline call site computed it.
     public unsafe void Record(Dx12FrameContext ctx) {
         Matrix4x4 viewProj = ctx.ViewProj;
         Vector3 camPos = ctx.CamPos;
@@ -117,40 +117,40 @@ public sealed class Dx12AerialPerspectivePass : IRenderPass, IDisposable {
         Vector3 sunRadiance = ctx.LightColor;
         Dx12GBuffer gbuffer = ctx.GBuffer;
         Dx12OffscreenTarget target = ctx.Target;
+        var pf = ctx.PostFX;
 
         Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
         var pSky = ProceduralSky.Active;
-        // Sky-colour ambient tint for haze in shadow (Rayleigh-blue, engine-radiance scale).
+        // Sky-colour ambient tint for haze in shadow (Rayleigh-blue, engine-radiance scale) — the same anchor
+        // the old pass used for SkyTint, now feeding the froxel volume's ambient in-scatter term.
         Vector3 skyTint = sunRadiance * new Vector3(0.10f, 0.16f, 0.32f);
 
-        float strength = 1f;
+        // BALLISTIC_DX12_AP_* env overrides (dev knobs) sit ON TOP of the PostFX/volume values so a paused A/B
+        // capture can sweep without editing a scene. Default = the volume-driven PostFX value.
+        float intensity = pf.AerialPerspectiveIntensity;
         if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_AP_STRENGTH"),
-            System.Globalization.CultureInfo.InvariantCulture, out float s)) strength = s;
+            System.Globalization.CultureInfo.InvariantCulture, out float s)) intensity = s;
+        bool apEnabled = pf.AerialPerspectiveEnabled && intensity > 0f;
 
-        float distance = 1200f;  // haze half-distance in metres (scene-scale; env-tunable below)
-        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_AP_DISTANCE"),
-            System.Globalization.CultureInfo.InvariantCulture, out float dd)) distance = dd;
-        // V3 (fixes D2): fade the haze in over [NearFade, 2*NearFade] m so interiors / short views get ~no aerial
-        // perspective (the lux-scaled SkyTint painted a blue veil on every opaque pixel even at ~10 m). 25 m fades
-        // it in across 25–50 m: enclosed rooms stay clean, distant vistas keep the cue. =0 restores pre-V3 (door).
-        float nearFade = 25f;
-        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_AP_NEARFADE"),
-            System.Globalization.CultureInfo.InvariantCulture, out float nf)) nearFade = nf;
+        // 1) Bake the froxel volume for this frame (compute dispatch on the frame list; leaves it as SRV). Bake
+        // UNCONDITIONALLY so the volume is always left in PixelShaderResource — binding its SRV (t1, below)
+        // while it sat in its initial UnorderedAccess state would be a resource-state / GBV error. When the
+        // volume is disabled we bake at intensity 0 (≈ a clean, cheap empty volume) and the shader discards via
+        // the Enabled constant anyway. 32^3 is cheap, so the always-on bake is the safe + simple choice.
+        lut.Bake(invVP, camPos, sunDir, sunRadiance, skyTint, pSky, pf, apEnabled ? intensity : 0f);
+
+        // 2) Fill the AP pass constants. MaxDistance MUST equal the bake's so the depth->slice map inverts it.
         *(ApConstants*)apCbMapped = new ApConstants {
             InvViewProj = Matrix4x4.Transpose(invVP),
-            CameraPos = camPos, Strength = strength,
-            SunDirection = sunDir, Distance = distance,
-            SunRadiance = sunRadiance, HazeAniso = pSky is not null ? Math.Clamp(pSky.HazeAnisotropy, 0f, 0.95f) : 0.8f,
-            SkyTint = skyTint, AirDensity = pSky is not null ? MathF.Max(pSky.AirDensity, 0f) : 1f,
-            Haze = pSky is not null ? MathF.Max(pSky.Haze, 0f) : 1f,
-            MaxDistance = 60000f, NearFade = nearFade,
+            CameraPos = camPos, MaxDistance = MathF.Max(pf.AerialPerspectiveMaxDistance, 1f),
+            Enabled = apEnabled ? 1f : 0f,
         };
 
-        // Head transition (R2): emit our own. PHASE-2 V3: skip when derived barriers are active (the graph
-        // already emitted it before Record — emit the derived set ONLY, plan §V3).
+        // Head transition (R2): emit our own unless the graph already derived barriers.
         if (!ctx.BarriersDerived) gbuffer.DepthToShaderResource();
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        dev.Device.CopyDescriptorsSimple(1, apSrvVisible.Cpu(0), gbuffer.DepthSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, apSrvVisible.Cpu(0), gbuffer.DepthSrvCpu, heapType);   // t0 depth
+        dev.Device.CopyDescriptorsSimple(1, apSrvVisible.Cpu(1), lut.SrvCpu, heapType);            // t1 froxel volume
 
         target.RenderColorOnly(cl => {
             cl.SetGraphicsRootSignature(apRootSig);
@@ -164,6 +164,7 @@ public sealed class Dx12AerialPerspectivePass : IRenderPass, IDisposable {
     }
 
     public void Dispose() {
+        lut?.Dispose();
         apSrvVisible?.Dispose();
         apCb?.Dispose();
         apPso?.Dispose();

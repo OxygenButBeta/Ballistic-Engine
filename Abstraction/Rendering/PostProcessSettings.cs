@@ -187,6 +187,17 @@ public sealed class PostProcessSettings {
     public float VolumetricFeedback { get; set; } = 0.9f;             // temporal history weight (smoother/laggier)
     public Vector3 VolumetricTint { get; set; } = Vector3.One; // in-scatter colour grade
 
+    // Aerial perspective: atmospheric distance haze on opaque geometry, baked from a Hillaire froxel
+    // volume that shares the ProceduralSky atmosphere (so geometry fades into the same colour as the
+    // sky behind it). ON by default at a calibrated strength; only applies while a ProceduralSky is
+    // active. Replaced the old ad-hoc analytic AP (the blue-white veil) — see dx12-aerial-perspective-rework.
+    public bool AerialPerspectiveEnabled { get; set; } = true;
+    public float AerialPerspectiveIntensity { get; set; } = 1f;        // master strength (1 = physical against the sky)
+    public float AerialPerspectiveStartDistance { get; set; } = 30f;   // m: haze starts building beyond this (foreground/interiors stay crisp)
+    public float AerialPerspectiveMaxDistance { get; set; } = 2000f;   // m: froxel volume far depth; haze ~half strength near 40% of this
+    public float AerialPerspectiveDensityScale { get; set; } = 1f;     // apparent atmosphere density for the in-scene march (1 = physical)
+    public Vector3 AerialPerspectiveTint { get; set; } = Vector3.One;  // in-scatter colour grade (extinction stays neutral)
+
     // 1 = off. Offscreen targets are recreated when this changes. Ignored while TAA is on.
     public int MsaaSamples { get; set; } = 4;
 
