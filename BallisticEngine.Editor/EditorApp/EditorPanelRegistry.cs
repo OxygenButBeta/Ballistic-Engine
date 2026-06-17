@@ -73,6 +73,12 @@ internal sealed class EditorPanelRegistry {
         return true;
     }
 
+    // Directly set a core panel's show-state (EF9a: the maximized draw path writes back the close-button
+    // result here, exactly as DrawCore does for the docked path). No-op for a viewport / unknown key.
+    public void SetShown(string key, bool shown) {
+        if (Get(key) is { IsViewport: false } d) d.Shown = shown;
+    }
+
     // Reset all core panels to visible (the Reset-Layout default). Viewports are untouched (always shown).
     public void ResetVisibility() {
         foreach (Descriptor d in ordered)

@@ -19,8 +19,17 @@ This keeps each chat's context small and the history bisectable.
 
 **The chunk pointer lives in this section.** Always trust git + this line over any chat's memory:
 
-> ### ▶ NEXT CHUNK: **EF9a** (honor close everywhere, incl. maximized)
-> Last committed chunk: **EF3** · Branch: `dx12-renderer`
+> ### ▶ NEXT CHUNK: **EF9b** (maximize/fullscreen that doesn't fight docking; re-verify EF3 fullscreen)
+> Last committed chunk: **EF9a** · Branch: `dx12-renderer`
+>
+> **EF9a note for EF9b:** the "can't close while maximized" bug is FIXED — both maximized paths now thread
+> a `ref open` so the window X works while fullscreen: `DrawMaximizedPanel` (registered core panels, via
+> `panels.IsShown`/new `EditorPanelRegistry.SetShown`) and `DockPanelHost.DrawMaximizedInstance` (extra
+> instances, returns `bool closed`). On close: the panel's `Shown`/`Open` flag flips false (close STICKS)
+> AND `maximize.Clear()` runs the SAME frame so the docked layout returns immediately (no stale/flicker
+> frame, no redraw loop). The existing `maximize.DropIfUnavailable(MaximizedPanelStillAvailable)` is the
+> backstop. EF9b should keep this `ref open` contract intact when it reworks the maximize MECHANISM — do
+> not regress to a `Begin(label, flags)` with no p_open ref.
 >
 > **EF3 note for later chunks (important):** the plan's original EF3 root cause ("`Dx12SwapChain.cs:165`
 > flushes the WRONG fence — legacy upload, not `frameFence`") was **STALE** — `Dx12Device.Flush()` was
@@ -71,7 +80,7 @@ this same handoff for the chunk after it.
 
 ### Progress checklist (each chat ticks its chunk)
 - [x] EF3 — swapchain drained resize + post-resize reset (root cause was stale/already-fixed; hardened + harness regression guard added)
-- [ ] EF9a — honor close everywhere (incl. maximized)
+- [x] EF9a — honor close everywhere (incl. maximized) — `ref open` threaded through both maximized paths; close STICKS + exits fullscreen same frame
 - [ ] EF9b — maximize/fullscreen (re-verify EF3 fullscreen)
 - [ ] EF9c — layout persist + PassthruCentralNode review
 - [ ] EF9d — Window-menu open-state sync
@@ -339,11 +348,15 @@ Symptoms: fullscreen broken; panels can't be maximized; opening a panel then can
 Layout). Validated causes: `PassthruCentralNode` + custom maximize state machine fighting docking +
 `DrawMaximizedPanel`/`DrawMaximizedInstance` using `ImGui.Begin(label, flags)` with NO `p_open` ref
 (`EditorApplication.cs:1548-1575`, `DockPanelHost.cs:138`) → the X is ignored while maximized.
-- **EF9a — Honor close everywhere (the real "can't close" fix):** thread a `ref open` through BOTH the
-  normal path (`DrawDockPanel`/`EditorPanelRegistry.DrawCore` already do) AND the maximized path
-  (`DrawMaximizedPanel` + `DockPanelHost.DrawMaximizedInstance` currently do NOT). Closing a panel while
-  maximized must flip its `Shown`/`Open` flag and exit fullscreen the same frame. Verify the close STICKS
-  (panel stays closed next frame; no redraw loop). Keep DockPanelHost's instance list semantics.
+- **EF9a — Honor close everywhere (the real "can't close" fix) — ✅ DONE:** threaded a `ref open` through
+  BOTH maximized paths (`DrawMaximizedPanel` for registered core panels via `panels.IsShown` + new
+  `EditorPanelRegistry.SetShown`; `DockPanelHost.DrawMaximizedInstance` now `Begin(label, ref open, flags)`
+  and returns `bool closed`). On X-while-maximized: the panel's `Shown`/`Open` flag flips false (close
+  STICKS, no redraw loop) AND `maximize.Clear()` runs the SAME frame so the docked layout returns
+  immediately. The normal docked path already honored close (`DrawDockPanel`/`DrawCore`). DockPanelHost
+  multi-instance + singleton semantics untouched. Verified: editor builds 0-error (bin-copy lock from a
+  running editor ignored), reflection oracle EXIT=0 (18 suites green). Human screenshot of close-while-
+  maximized batched into the EF9/windowing visual checkpoint.
 - **EF9b — Maximize/fullscreen that doesn't fight docking:** replace the custom maximize state machine
   with a clean single-window fullscreen that honors `p_open` and exits cleanly, OR ImGui dock-node
   maximize. Multi-instance maximized tabs (`DrawMaximizedInstance`) must keep working.

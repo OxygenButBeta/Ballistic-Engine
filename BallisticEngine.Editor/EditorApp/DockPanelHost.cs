@@ -125,8 +125,11 @@ internal sealed class DockPanelHost {
 
     // Draws the host instance identified by `label` as a single fixed window filling pos/size, so a
     // duplicated panel can be shown fullscreen exactly like a primary one. `runStrip` runs the title
-    // double-click/right-click handler (so the maximized window can be restored). No-op if not found.
-    public void DrawMaximizedInstance(string label, System.Numerics.Vector2 pos, System.Numerics.Vector2 size,
+    // double-click/right-click handler (so the maximized window can be restored). EF9a: threads a
+    // `ref open` so the window's X button is drawn + HONORED while maximized — clicking it flips the
+    // instance's Open flag (the next DrawAll removes the instance) and returns true so the caller can
+    // exit fullscreen the same frame (no stuck-maximized panel). Returns false if not found / not closed.
+    public bool DrawMaximizedInstance(string label, System.Numerics.Vector2 pos, System.Numerics.Vector2 size,
         Action<string> runStrip) {
         foreach (Instance inst in instances) {
             if (!kinds.TryGetValue(inst.KindKey, out Kind kind) || Label(kind, inst) != label)
@@ -135,12 +138,15 @@ internal sealed class DockPanelHost {
             ImGui.SetNextWindowSize(size);
             const ImGuiWindowFlags flags = ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove |
                 ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking;
-            if (ImGui.Begin(label, flags)) {
+            bool open = inst.Open;
+            if (ImGui.Begin(label, ref open, flags)) {
                 runStrip?.Invoke(label);
                 kind.Draw(inst.Panel);
             }
             ImGui.End();
-            return;
+            inst.Open = open;
+            return !open;   // closed this frame → caller exits fullscreen
         }
+        return false;
     }
 }

@@ -1546,20 +1546,29 @@ internal sealed class EditorApplication {
     void DrawMaximizedPanel(string name, SysVec2 pos, SysVec2 size) {
         // A duplicated (Add Tab) panel's label is owned by the host, not one of the primary layout
         // names below — route it to the host so double-clicking an extra tab can fullscreen it too
-        // (previously these hit the "can't be shown fullscreen" dead-end).
+        // (previously these hit the "can't be shown fullscreen" dead-end). EF9a: the host now threads a
+        // `ref open` so the X works while maximized; if it closed this frame, exit fullscreen NOW (the
+        // instance is gone, so leaving it maximized would draw a stale target one frame / re-show it).
         if (extraPanels.OwnsLabel(name)) {
-            extraPanels.DrawMaximizedInstance(name, pos, size, MaximizePanelOnTitleDoubleClick);
+            if (extraPanels.DrawMaximizedInstance(name, pos, size, MaximizePanelOnTitleDoubleClick))
+                maximize.Clear();
             return;
         }
 
         // A1b: single content path. The panel's body comes from its ONE registry descriptor — the same
         // DrawContents the normal docked path uses — so there is no parallel maximize-content chain to
         // drift, and no "can't be shown fullscreen" dead-end for a registered panel.
+        // EF9a: thread a `ref open` (the panel's single-owned Shown flag) so the window's X is drawn AND
+        // honored while maximized — the old `Begin(name, flags)` had no p_open ref, so the close was
+        // silently ignored ("opened a panel then can't close it, only Reset Layout"). On close, flip the
+        // registry Shown flag (so it STICKS — the panel stays closed next frame, no redraw loop) AND clear
+        // the maximize state this same frame so the docked layout returns immediately.
         ImGui.SetNextWindowPos(pos);
         ImGui.SetNextWindowSize(size);
         const ImGuiWindowFlags flags = ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove |
             ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking;
-        if (ImGui.Begin(name, flags)) {
+        bool open = panels.IsShown(name);
+        if (ImGui.Begin(name, ref open, flags)) {
             MaximizePanelOnTitleDoubleClick(name); // double-click its title again to restore
             EditorPanelRegistry.Descriptor d = panels.Get(name);
             if (d?.DrawContents is not null)
@@ -1572,6 +1581,10 @@ internal sealed class EditorApplication {
             }
         }
         ImGui.End();
+        if (!open) {                  // X clicked while maximized: honor the close everywhere
+            panels.SetShown(name, false);
+            maximize.Clear();
+        }
     }
 
     // Scene and Game are now SEPARATE dockable windows (default-tabbed together in the center dock
