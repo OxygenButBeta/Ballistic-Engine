@@ -424,46 +424,10 @@ public sealed class DX12HDRenderer : HDRenderer {
     Dx12AerialPerspectivePass apPass;
     Dx12FogPass fogPass;
 
-    // Skybox pass (background): its own root sig (CBV b0 + cube SRV t0 + clamp sampler) + PSO (LEqual,
-    // no depth write, cull none, SV_VertexID cube). Drawn after opaque in the same command list.
-    ID3D12RootSignature skyRootSig;
-    ID3D12PipelineState skyPso;
-    ID3D12Resource skyCb;          // upload heap, one SkyboxConstants, rewritten per frame
-    unsafe byte* skyCbMapped;
-    Dx12DescriptorHeap skySrvVisible;   // one cube SRV copied per frame
-
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct SkyboxConstants {
-        public Matrix4x4 ViewProjNoTranslate;
-        public Matrix4x4 SkyRotation;
-        public float Exposure; public Vector3 Pad;
-    }
-
-    // Procedural sky pass. The FAST background path samples the baked env cube (procSkyBgPso, one cube fetch
-    // per pixel); procSkyPso is the per-pixel atmosphere/cloud march, kept only as the fallback for the frame
-    // before any env cube has been baked. Both share procSkyRootSig (CBV b0 + cube SRV table t0 + sampler s0).
-    ID3D12RootSignature procSkyRootSig;
-    ID3D12PipelineState procSkyPso;      // fallback: full SkyRadiance() march
-    ID3D12PipelineState procSkyBgPso;    // primary: sample the baked env cube
-    ID3D12Resource procSkyCb;
-    unsafe byte* procSkyCbMapped;
-    Dx12DescriptorHeap procSkyEnvSrvVisible;   // env cube SRV copied per frame for the background sample
-
-    // MUST match ProceduralSky.hlsl's cbuffer AND Dx12IblBaker.ProcSkyConstants byte-for-byte.
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct ProcSkyConstants {
-        public Matrix4x4 ViewProjNoTranslate;
-        public Vector3 SunDirection; public float SunAngularRadius;
-        public Vector3 SunRadiance; public float SunDiskIntensity;
-        public Vector3 GroundAlbedo; public float AirDensity;
-        public float Haze, HazeAnisotropy, OzoneDensity, MultiScatter;
-        public float Exposure, BakeFace; public Vector2 Pad0;
-        // Volumetric clouds + cirrus + stars (GL Sky_Procedural.glsl parity).
-        public float CloudsEnabled, CloudCoverage, CloudDensity, CloudAltitude;
-        public float CloudThickness, CloudScale, CloudDetail, CloudAmbient;
-        public Vector3 CloudWindOffset; public float CloudWindAngle;
-        public float CirrusCoverage, StarIntensity; public Vector2 Pad1;
-    }
+    // Sky (background): the asset cubemap Skybox + the procedural atmosphere are both owned by Dx12SkyPass
+    // (chunk 8 — Event=Sky 350; BuildSkybox/BuildProcSky/DrawSkybox/DrawProcSky + the SkyboxConstants/
+    // ProcSkyConstants structs moved into it). The pass draws the sky into the HDR color at the far plane.
+    Dx12SkyPass skyPass;
 
     // Per-draw constant buffer ring: one upload heap sub-allocated in 256-byte slots, one slot per draw.
     ID3D12Resource cbRing;
@@ -695,8 +659,8 @@ public sealed class DX12HDRenderer : HDRenderer {
 
         BuildSkinnedGeometryPass();
 
-        BuildSkybox();
-        BuildProcSky();
+        // Sky (skybox + procedural atmosphere) now built inside Dx12SkyPass's ctor (chunk 8), constructed
+        // below at pass-graph assembly. Was BuildSkybox() + BuildProcSky().
 
         ibl = new Dx12IblBaker(dev);
         skyLuts = new Dx12SkyLuts(dev);
@@ -747,6 +711,12 @@ public sealed class DX12HDRenderer : HDRenderer {
         graph = new Dx12RenderGraph(TimePass);
         ssaoPass = new Dx12SsaoPass(dev, targetW, targetH);   // chunk 4: first leaf-post pass (was BuildSsao)
         graph.Add(ssaoPass);
+        // chunk 8: Sky (event 350 — skybox + procedural atmosphere). Resolution-independent (no Resize body)
+        // so registration order doesn't touch R5; the event sort places it FIRST of the converted passes (350
+        // < AP 400 < Fog 550 < PostProcess 650). Registered before apPass for same-event-tiebreak hygiene (R1),
+        // though Sky 350 != AP 400 so it's not load-bearing. Was BuildSkybox + BuildProcSky.
+        skyPass = new Dx12SkyPass(dev);
+        graph.Add(skyPass);
         // chunk 5: AerialPerspective (event 400) + Fog (event 550). Both resolution-independent (no Resize
         // body) so registration order doesn't touch R5; the event sort places them before SSAO (650) — the
         // same relative order as today's inline frame (AP before transparents/SSGI, fog before SSR; both
@@ -1164,91 +1134,8 @@ public sealed class DX12HDRenderer : HDRenderer {
         shadowCbMapped = shadowCb.Map<byte>(0);
     }
 
-    unsafe void BuildProcSky() {
-        // Root sig: ProcSky CBV (b0) + env cube SRV table (t0) + a linear-clamp sampler (s0). The CBV still
-        // drives the march fallback; the SRV/sampler feed the fast env-cube background sample.
-        var cbv = new RootParameter1(RootParameterType.ConstantBufferView,
-            new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
-        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
-        var sampler = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
-            Filter = Filter.MinMagMipLinear,
-            AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
-            AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
-            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
-        };
-        procSkyRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { sampler })));
-
-        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("ProceduralSky.hlsl");
-        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "ProceduralSky.hlsl");
-        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "ProceduralSky.hlsl");
-        byte[] psBg = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSBackground", "ProceduralSky.hlsl");
-        var ds = DepthStencilDescription.Default;
-        ds.DepthWriteMask = DepthWriteMask.Zero;
-        ds.DepthFunc = ComparisonFunction.LessEqual;
-        var psoDesc = new GraphicsPipelineStateDescription {
-            RootSignature = procSkyRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
-            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
-            RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
-            DepthStencilState = ds,
-            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
-            DepthStencilFormat = Dx12OffscreenTarget.DepthFormat,
-            SampleDescription = new SampleDescription(1, 0),
-        };
-        procSkyPso = dev.Device.CreateGraphicsPipelineState(psoDesc);
-        psoDesc.PixelShader = psBg;
-        procSkyBgPso = dev.Device.CreateGraphicsPipelineState(psoDesc);
-
-        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<ProcSkyConstants>() + 255) & ~255;
-        procSkyCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        procSkyCbMapped = procSkyCb.Map<byte>(0);
-        procSkyEnvSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true, framesInFlight: dev.FramesInFlight);
-    }
-
-    unsafe void BuildSkybox() {
-        // Root sig: CBV b0 + 1 cube SRV table (t0) + static clamp sampler.
-        var cbv = new RootParameter1(RootParameterType.ConstantBufferView,
-            new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
-        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
-        var sampler = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
-            Filter = Filter.MinMagMipLinear,
-            AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
-            AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
-            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
-        };
-        skyRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { sampler })));
-
-        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("Skybox.hlsl");
-        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "Skybox.hlsl");
-        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "Skybox.hlsl");
-        // Depth: test LEqual, NO write — fills only far-plane (uncovered) pixels behind opaque geometry.
-        var ds = DepthStencilDescription.Default;
-        ds.DepthWriteMask = DepthWriteMask.Zero;
-        ds.DepthFunc = ComparisonFunction.LessEqual;
-        var psoDesc = new GraphicsPipelineStateDescription {
-            RootSignature = skyRootSig, VertexShader = vs, PixelShader = ps,
-            InputLayout = null,   // SV_VertexID cube, no vertex buffer
-            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
-            RasterizerState = RasterizerDescription.CullNone,
-            BlendState = BlendDescription.Opaque, DepthStencilState = ds,
-            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
-            DepthStencilFormat = Dx12OffscreenTarget.DepthFormat,
-            SampleDescription = new SampleDescription(1, 0),
-        };
-        skyPso = dev.Device.CreateGraphicsPipelineState(psoDesc);
-
-        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<SkyboxConstants>() + 255) & ~255;
-        skyCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        skyCbMapped = skyCb.Map<byte>(0);
-        skySrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true, framesInFlight: dev.FramesInFlight);
-    }
+    // BuildProcSky / BuildSkybox moved VERBATIM into Resources/Dx12SkyPass.cs's ctor (chunk 8). The pass owns
+    // both rootsigs/PSOs/CBs/heaps (skybox + procedural), runs at the Sky event via the graph.
 
     void BuildRootSignature() {
         // b0 = per-draw constants (root CBV);
@@ -1824,22 +1711,13 @@ public sealed class DX12HDRenderer : HDRenderer {
             GiMode = giMode,
         };
 
-        // === SKY: draw into the HDR color at the far plane, depth-testing the G-buffer depth (LEqual,
-        // no write). ProceduralSky takes precedence over an asset cubemap Skybox (matches GL). ===
-        // doors.Sky = off under BARE-MINIMUM → the background keeps the HDR clear color (a solid backdrop;
-        // lit geometry still composites correctly — this just removes the sky pass to isolate it).
-        gbuffer.DepthToReadOnly();
-        if (doors.Sky)
-            target.RenderColorWithExternalDepth(gbuffer.DsvHandle, cl => {
-                if (ProceduralSky.Active is not null)
-                    DrawProcSky(cl, view, proj, light);
-                else
-                    DrawSkybox(cl, view, proj);
-            });
-
-        // === AERIAL PERSPECTIVE (Dx12AerialPerspectivePass, event 400). Runs at its canonical inline slot:
-        // after Sky, before Transparents — the event window [AerialPerspective, Transparents) (chunk 5). ===
-        graph.Execute(ctx, (int)Dx12RenderPassEvent.AerialPerspective, (int)Dx12RenderPassEvent.Transparents);
+        // === SKY (Dx12SkyPass, event 350) → AERIAL PERSPECTIVE (Dx12AerialPerspectivePass, event 400). The
+        // window WIDENED leftward this chunk to include Sky (was [AerialPerspective, Transparents); now [Sky,
+        // Transparents)) — Sky converted to a pass, so the inline sky block is gone. The graph runs Sky (head
+        // DepthToReadOnly + draws the procedural/skybox background into the HDR color at the far plane, gated by
+        // doors.Sky), then AP, in event order — the exact relative position of the old inline frame. Transparents
+        // (450) is still inline below (converts next chunk), so the window stops short of it. ===
+        graph.Execute(ctx, (int)Dx12RenderPassEvent.Sky, (int)Dx12RenderPassEvent.Transparents);
 
         // === TRANSPARENTS: forward, back-to-front, alpha-blended over the HDR scene + sky, depth-testing
         // the G-buffer depth (LEqual, no write). Runs before fog/SSR/TAA so they apply over the glass. ===
@@ -2059,7 +1937,12 @@ public sealed class DX12HDRenderer : HDRenderer {
         float punctualCount = clusteredLights.LightCount;
         int tslot = 0;
 
-        // 3) Draw back-to-front into the HDR color, depth-testing the G-buffer depth (already DepthRead).
+        // 3) Draw back-to-front into the HDR color, depth-testing the G-buffer depth. Head transition (R2,
+        // Decision 4): emit our OWN DepthToReadOnly — the inline sky block used to do this unconditionally,
+        // but chunk 8 made Sky a graph pass gated by doors.Sky, so when Sky is off (BALLISTIC_DX12_SKY=0) or
+        // AP left depth in PixelShaderResource, transparents must re-assert DepthRead itself. Idempotent: a
+        // free no-op when an upstream pass already set it. (The transparents pass keeps this head next chunk.)
+        gbuffer.DepthToReadOnly();
         target.RenderColorWithExternalDepth(gbuffer.DsvHandle, cl => {
             cl.SetGraphicsRootSignature(transparentRootSig);
             cl.SetPipelineState(transparentPso);
@@ -3236,43 +3119,8 @@ public sealed class DX12HDRenderer : HDRenderer {
     // (chunk 5). The graph runs them at events 400 / 550 (before the SSAO PostProcess slot), the same
     // relative position as today's inline frame.
 
-    // Draw the environment cubemap as the far-plane background (LEqual, no depth write) where opaque
-    // geometry didn't cover. No-op if the scene has no Skybox or its cubemap isn't a DX12 cube yet.
-    unsafe void DrawSkybox(ID3D12GraphicsCommandList4 cl, Matrix4x4 view, Matrix4x4 proj) {
-        if (Skybox.Active?.Cubemap is not Dx12Texture3D cube || cube.Resource is null)
-            return;
-
-        // View with translation stripped (the sky cube is centred on the camera).
-        Matrix4x4 viewNoT = view; viewNoT.M41 = 0; viewNoT.M42 = 0; viewNoT.M43 = 0;
-        Vector3 euler = Skybox.Active.RotationEuler;
-        Matrix4x4 rot = Matrix4x4.CreateRotationX(euler.X * (MathF.PI / 180f))
-                      * Matrix4x4.CreateRotationY(euler.Y * (MathF.PI / 180f))
-                      * Matrix4x4.CreateRotationZ(euler.Z * (MathF.PI / 180f));
-        // The skybox texels are HDR scaled by sky.Exposure into RAW radiance, exactly like ProceduralSky
-        // (DrawProcSky writes raw SunRadiance ~80000 and the composite auto-meters it). The old `* 1.0e-5f`
-        // pre-divided the cube sky 100000x BELOW the composite's lux-scaled metering range → the sky crushed
-        // to black (the exterior's "black sky"). Skybox.Exposure (~5000) alone lands an HDRI peak (~1) in the
-        // same raw-radiance band as the procedural sky, so the metered exposure resolves it correctly.
-        float skyExposure = Skybox.Active.Exposure;
-
-        var sc = new SkyboxConstants {
-            ViewProjNoTranslate = Matrix4x4.Transpose(viewNoT * proj),
-            SkyRotation = Matrix4x4.Transpose(rot),
-            Exposure = skyExposure,
-        };
-        *(SkyboxConstants*)skyCbMapped = sc;
-
-        dev.Device.CopyDescriptorsSimple(1, skySrvVisible.Cpu(0), cube.SrvCpu,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
-
-        cl.SetGraphicsRootSignature(skyRootSig);
-        cl.SetPipelineState(skyPso);
-        cl.SetDescriptorHeaps(skySrvVisible.Heap);
-        cl.SetGraphicsRootConstantBufferView(0, skyCb.GPUVirtualAddress);
-        cl.SetGraphicsRootDescriptorTable(1, skySrvVisible.Gpu(0));
-        cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-        cl.DrawInstanced(36, 1, 0, 0);
-    }
+    // DrawSkybox / DrawProcSky moved VERBATIM into Resources/Dx12SkyPass.cs (chunk 8) as the two branches
+    // of Dx12SkyPass.Record (ProceduralSky.Active ? DrawProcSky : DrawSkybox), behind the head DepthToReadOnly.
 
     // Hash of all active shadow-caster transforms — changes when geometry moves/appears (so cascade caching
     // re-renders). Camera/sun motion is caught separately by the cascade fit matrices. No reflection (typed).
@@ -3383,59 +3231,6 @@ public sealed class DX12HDRenderer : HDRenderer {
         shadowsThisFrame = true;
     }
 
-    // Draw the procedural atmosphere as the far-plane background (pure-ALU march by view direction).
-    unsafe void DrawProcSky(ID3D12GraphicsCommandList4 cl, Matrix4x4 view, Matrix4x4 proj, LightUniforms light) {
-        ProceduralSky sky = ProceduralSky.Active;
-        if (sky is null) return;
-
-        Matrix4x4 viewNoT = view; viewNoT.M41 = 0; viewNoT.M42 = 0; viewNoT.M43 = 0;
-        // Sun: DirectionalLight drives it (LightUniforms.Direction is TOWARD the light = toward the sun).
-        Vector3 sunDir = ToNumerics(light.Direction);
-        if (sunDir.LengthSquared() < 1e-8f) sunDir = Vector3.UnitY;
-        sunDir = Vector3.Normalize(sunDir);
-        float sunAngularRadius = (DirectionalLight.Instance?.AngularDiameter ?? 0.53f) * 0.5f * (MathF.PI / 180f);
-
-        float cloudTime = Dx12SkyCloudParams.CloudTime(sky);
-        var sc = new ProcSkyConstants {
-            ViewProjNoTranslate = Matrix4x4.Transpose(viewNoT * proj),
-            SunDirection = sunDir, SunAngularRadius = MathF.Max(sunAngularRadius, 1e-4f),
-            SunRadiance = ToNumerics(light.Color), SunDiskIntensity = MathF.Max(sky.SunDiskIntensity, 0f),
-            GroundAlbedo = ToNumerics(sky.GroundColor), AirDensity = MathF.Max(sky.AirDensity, 0f),
-            Haze = MathF.Max(sky.Haze, 0f), HazeAnisotropy = Math.Clamp(sky.HazeAnisotropy, 0f, 0.99f),
-            OzoneDensity = MathF.Max(sky.OzoneDensity, 0f), MultiScatter = MathF.Max(sky.MultipleScattering, 1f),
-            Exposure = MathF.Max(sky.Exposure, 0f),
-            // Volumetric clouds + cirrus + stars (clamps mirror GLProceduralSkyPass).
-            CloudsEnabled = sky.CloudsEnabled ? 1f : 0f, CloudCoverage = Math.Clamp(sky.CloudCoverage, 0f, 1f),
-            CloudDensity = MathF.Max(sky.CloudDensity, 0f), CloudAltitude = Math.Clamp(sky.CloudAltitude, 600f, 20000f),
-            CloudThickness = Math.Clamp(sky.CloudThickness, 100f, 20000f), CloudScale = MathF.Max(sky.CloudScale, 0.05f),
-            CloudDetail = Math.Clamp(sky.CloudDetail, 0f, 1f), CloudAmbient = MathF.Max(sky.CloudAmbient, 0f),
-            CloudWindOffset = Dx12SkyCloudParams.WindOffset(sky, cloudTime),
-            CloudWindAngle = Dx12SkyCloudParams.WindRadians(sky),
-            CirrusCoverage = Math.Clamp(sky.CirrusCoverage, 0f, 1f), StarIntensity = MathF.Max(sky.StarIntensity, 0f),
-        };
-        *(ProcSkyConstants*)procSkyCbMapped = sc;
-
-        cl.SetGraphicsRootSignature(procSkyRootSig);
-        cl.SetGraphicsRootConstantBufferView(0, procSkyCb.GPUVirtualAddress);
-        cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-
-        // FAST PATH: the IBL baker already rendered the full SkyRadiance() kernel (atmosphere + clouds +
-        // cirrus + stars + sun disk) into the env cube this frame — sample it instead of marching the whole
-        // atmosphere again for every screen pixel. One cube fetch/pixel vs thousands of ALU/pixel; this was
-        // the FPS sink. Only the first frame (before any bake) falls back to the per-pixel PSMain march.
-        // BALLISTIC_DX12_SKY_MARCH=1 forces the old per-pixel march (A/B + escape hatch).
-        bool forceMarch = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SKY_MARCH") == "1";
-        if (!forceMarch && iblActiveThisFrame && ibl is { HasBaked: true }) {
-            dev.Device.CopyDescriptorsSimple(1, procSkyEnvSrvVisible.Cpu(0), ibl.EnvSrv,
-                DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
-            cl.SetPipelineState(procSkyBgPso);
-            cl.SetDescriptorHeaps(procSkyEnvSrvVisible.Heap);
-            cl.SetGraphicsRootDescriptorTable(1, procSkyEnvSrvVisible.Gpu(0));
-        } else {
-            cl.SetPipelineState(procSkyPso);
-        }
-        cl.DrawInstanced(36, 1, 0, 0);
-    }
 
     // Copy one material texture's persistent SRV into the shader-visible table at `visibleSlot`. A null
     // texture resolves to that slot's neutral default (DefaultTextures.Neutral) so the descriptor is
