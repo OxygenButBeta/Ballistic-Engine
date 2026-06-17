@@ -355,9 +355,12 @@ internal sealed class HierarchyPanel {
                 var batch = selected && state.SelectedEntities.Count > 1
                     ? state.SelectedEntities.ToArray()
                     : new[] { entity };
-                EditorUndo.Push(batch.Length > 1 ? $"Toggle Active ({batch.Length})" : "Toggle Active");
-                foreach (Entity e in batch)
-                    if (!e.IsDestroyed) e.SetActive(newActive);
+                // F1 pilot: a multi-entity toggle is structural (whole-scene snapshot), routed through
+                // the choke point. Byte-identical to the old manual Push(); the batch read stays outside.
+                EditorCommands.Structural(batch.Length > 1 ? $"Toggle Active ({batch.Length})" : "Toggle Active", () => {
+                    foreach (Entity e in batch)
+                        if (!e.IsDestroyed) e.SetActive(newActive);
+                });
                 state.MarkViewportDirty();
             }
             ImGui.PopStyleColor();
@@ -429,7 +432,9 @@ internal sealed class HierarchyPanel {
             if (ImGui.MenuItem("Apply Overrides")) PrefabInstanceOps.ApplyAll(entity);
             if (ImGui.MenuItem("Revert Overrides")) { PrefabInstanceOps.RevertAll(entity); state.MarkViewportDirty(); }
             ImGui.Separator();
-            if (ImGui.MenuItem("Unpack")) { EditorUndo.PushEntity("Unpack Prefab", entity); entity.PrefabSource = Guid.Empty; }
+            // F1 pilot: a single-entity edit -- scoped through EditorCommands.EditEntity (maps to
+            // PushEntity, byte-identical: selection survives, no whole-scene rebuild).
+            if (ImGui.MenuItem("Unpack")) EditorCommands.EditEntity(entity, "Unpack Prefab", () => entity.PrefabSource = Guid.Empty);
             ImGui.EndMenu();
         }
         if (ImGui.MenuItem($"Duplicate{suffix}", "Ctrl+D")) DuplicateSelected(scene);
@@ -642,8 +647,9 @@ internal sealed class HierarchyPanel {
     // Shared "create" submenu used by the empty-space context menu and the toolbar + button.
     void DrawCreateMenu(Scene scene) {
         if (ImGui.MenuItem("Create Empty")) {
-            EditorUndo.Push("Create Empty");
-            state.Select(Spawn(scene, "Entity"));
+            // F1 pilot: structural create routed through the EditorCommands choke point (byte-identical
+            // to the old "Push(); mutate();" -- the snapshot scope is now chosen by EditorCommands, not here).
+            EditorCommands.Structural("Create Empty", () => state.Select(Spawn(scene, "Entity")));
         }
         if (ImGui.BeginMenu($"{EditorIcons.Package} 3D Object")) {
             if (ImGui.MenuItem("Cube")) CreatePrimitive(scene, PrimitiveKind.Cube);
