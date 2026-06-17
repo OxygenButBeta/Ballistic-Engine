@@ -71,6 +71,11 @@ public sealed class Dx12FrameContext {
     public Dx12ShadowMap       ShadowMap      { get; init; }
     public Dx12GpuDrivenRenderer GpuDriven    { get; init; }
 
+    // The per-frame FrameConstants CB's GPU virtual address. The orchestrator owns `frameCb` (a shared
+    // per-frame resource, filled once before the graph runs — see "what STAYS inline"); the Transparents
+    // pass (chunk 8) binds it to its b1 FrameConstants root CBV. Read-only (the address is stable per frame).
+    public ulong FrameCbAddress { get; init; }
+
     // --- engine-side config / output (read-only references) ---
     public Dx12RenderDoors      Doors    { get; init; }
     public PostProcessSettings  PostFX   { get; init; }
