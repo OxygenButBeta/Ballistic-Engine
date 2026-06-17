@@ -52,13 +52,10 @@ internal sealed class EditorApplication {
 
     bool showGizmos = EditorPrefs.Current.ShowGizmos;  // component gizmos in the Scene view
 
-    // Panel visibility (toggled from the Window menu / each window's close button). Scene/Game and
-    // Entities/Scene-components are independent dockable windows (default-tabbed together).
-    bool showHierarchy = true;        // the Entities window
-    bool showSceneComponents = true;  // the Scene-components window
-    bool showInspector = true;
-    bool showBottom = true;     // the Assets window
-    bool showConsole = true;    // the Console window
+    // A1b-deeper: the five core panels' visibility (Entities / Scene-components / Inspector / Assets /
+    // Console) lives in the `panels` registry now (one Shown per descriptor) — the old showHierarchy/
+    // showSceneComponents/showInspector/showBottom/showConsole fields are gone. EditorApplication names
+    // no core panel: it toggles/opens/queries them BY KEY through the registry.
     // Double-click ANY panel's tab to fill the window with it; Esc restores. null = no panel
     // maximized. (Was viewport-only; now works for every dockable panel.) A1b: the backing state now
     // lives in `maximize` (MaximizeController) — the maximized key is single-sourced there. Reads route
@@ -141,26 +138,22 @@ internal sealed class EditorApplication {
             () => new ConsolePanel(), p => ((ConsolePanel)p).DrawContents());
         extraPanels.OnTitleStrip = MaximizePanelOnTitleDoubleClick;
 
-        // A1b: declare the CORE dockable panels ONCE in the registry. The maximize content path and the
-        // maximize-availability check both read these descriptors — no more hand-synced if/else chain +
-        // still-available switch + showXxx triple. DrawContents routes to the same primary panel field
-        // the normal docked path uses (the maximized view and the docked view share one instance/state).
-        // The two viewports are flagged IsViewport (their fullscreen draw is the render-target compositing
-        // path in DrawMaximizedViewport, not a generic body) and are always available.
-        panels.Register(EditorLayout.Entities, "Entities", EditorIcons.Package,
-            hierarchy.DrawEntitiesContents, () => showHierarchy);
-        panels.Register(EditorLayout.SceneComponents, "Scene Components", EditorIcons.World,
-            hierarchy.DrawSceneContents, () => showSceneComponents);
-        panels.Register(EditorLayout.Inspector, "Inspector", EditorIcons.Wrench,
-            inspector.DrawContents, () => showInspector);
-        panels.Register(EditorLayout.Assets, "Assets", EditorIcons.Folder,
-            assets.DrawContents, () => showBottom);
-        panels.Register(EditorLayout.Console, "Console", EditorIcons.Document,
-            console.DrawContents, () => showConsole);
-        panels.Register(EditorLayout.SceneView, "Scene View", EditorIcons.Camera,
-            null, () => true, isViewport: true);
-        panels.Register(EditorLayout.GameView, "Game View", EditorIcons.Play,
-            null, () => true, isViewport: true);
+        // A1b-deeper: declare the CORE dockable panels ONCE in the registry, which now OWNS their show
+        // state (the five showXxx bools are gone — the registry's per-descriptor Shown is the single
+        // source). The normal docked draw (DrawCore), the maximize content path, the maximize-availability
+        // check, and the Window-menu toggle/open/checkmark all read these descriptors — no hand-synced
+        // if/else chain + still-available switch + showXxx triple + the five per-name menu switches.
+        // DrawContents routes to the same primary panel field the normal docked path uses (the maximized
+        // view and the docked view share one instance/state). The two viewports are flagged IsViewport
+        // (their fullscreen draw is the render-target compositing path in DrawMaximizedViewport, not a
+        // generic body) and are always available; registration order == the old hardcoded draw order.
+        panels.Register(EditorLayout.Entities, "Entities", EditorIcons.Package, hierarchy.DrawEntitiesContents);
+        panels.Register(EditorLayout.SceneComponents, "Scene Components", EditorIcons.World, hierarchy.DrawSceneContents);
+        panels.Register(EditorLayout.Inspector, "Inspector", EditorIcons.Wrench, inspector.DrawContents);
+        panels.Register(EditorLayout.Assets, "Assets", EditorIcons.Folder, assets.DrawContents);
+        panels.Register(EditorLayout.Console, "Console", EditorIcons.Document, console.DrawContents);
+        panels.Register(EditorLayout.SceneView, "Scene View", EditorIcons.Camera, null, isViewport: true);
+        panels.Register(EditorLayout.GameView, "Game View", EditorIcons.Play, null, isViewport: true);
 
         // Wire the editor-only extra debug views (AO / Lit / Luminance) into the renderer's hook.
         EditorDebugViews.Install();
@@ -721,22 +714,21 @@ internal sealed class EditorApplication {
         }
         ImGui.End();
 
-        // Dockable panels — normal windows ImGui places into the dock tree. The Window-menu bools
-        // double as each window's close-button state (passed by ref to Begin). Entities and Scene-
-        // components are now separate dockable windows (were inner Hierarchy tabs).
+        // Dockable core panels — normal windows ImGui places into the dock tree. A1b-deeper: walk the
+        // registry instead of five named DrawDockPanel calls; the registry owns each panel's Shown state
+        // and writes the close-button result back through DrawDockPanel's `ref show`. EditorApplication
+        // names no core panel here. The declaration order (Entities, Scene-components, Inspector, Assets,
+        // Console) reproduces the old draw order.
         // IMPORTANT: once Begin() is called it MUST be paired with End(), even if Begin returns false
         // (collapsed) OR the close button set show=false this frame. The old "if (show) End()" dropped
         // the End() when the X was clicked (Begin already drew the content + opened a BeginChild that
         // frame), leaving "Missing EndChild()" and corrupting all ImGui state. DrawDockPanel handles it.
-        if (showHierarchy) DrawDockPanel(EditorLayout.Entities, ref showHierarchy, hierarchy.DrawEntitiesContents);
-        if (showSceneComponents) DrawDockPanel(EditorLayout.SceneComponents, ref showSceneComponents, hierarchy.DrawSceneContents);
-        if (showInspector) DrawDockPanel(EditorLayout.Inspector, ref showInspector, inspector.DrawContents);
+        panels.DrawCore(DrawDockPanel);
 
-        // Extra (duplicated) panel instances opened from the Add Tab menu.
+        // Extra (duplicated) panel instances opened from the Add Tab menu. (Drawn after the core panels
+        // now that the latter are one registry loop; these are floating-centered windows ImGui places by
+        // ###id, so the Begin order relative to Assets/Console is immaterial.)
         extraPanels.DrawAll();
-
-        if (showBottom) DrawDockPanel(EditorLayout.Assets, ref showBottom, assets.DrawContents);
-        if (showConsole) DrawDockPanel(EditorLayout.Console, ref showConsole, console.DrawContents);
 
         // Scene + Game are separate dockable windows (were inner viewport tabs).
         DrawViewportWindows();
@@ -811,18 +803,18 @@ internal sealed class EditorApplication {
             // and reset the dock arrangement.
             ImGui.Separator();
             if (ImGui.BeginMenu($"{EditorIcons.Add}  Add Panel")) {
-                AddTabItem(EditorLayout.Inspector, "Inspector", ref showInspector);
-                AddTabItem(EditorLayout.Entities, "Entities", ref showHierarchy);
-                AddTabItem(EditorLayout.SceneComponents, "Scene Components", ref showSceneComponents);
-                AddTabItem(EditorLayout.Assets, "Assets", ref showBottom);
-                AddTabItem(EditorLayout.Console, "Console", ref showConsole);
+                AddTabItem(EditorLayout.Inspector, "Inspector");
+                AddTabItem(EditorLayout.Entities, "Entities");
+                AddTabItem(EditorLayout.SceneComponents, "Scene Components");
+                AddTabItem(EditorLayout.Assets, "Assets");
+                AddTabItem(EditorLayout.Console, "Console");
                 ImGui.EndMenu();
             }
             ImGui.Separator();
             if (ImGui.MenuItem("Reset Layout")) {
                 EditorLayout.DeleteSaved();
                 resetLayoutRequested = true;
-                showHierarchy = showSceneComponents = showInspector = showBottom = showConsole = true;
+                panels.ResetVisibility();
             }
             ImGui.EndMenu();
         }
@@ -1411,13 +1403,14 @@ internal sealed class EditorApplication {
     // name — the menu no longer references a window field directly; it toggles through the key.
 
     // Toggle a window's visibility (the Window-menu checkbox behaviour). Closed → (re)open + focus it.
+    // A1b-deeper: the five core panels collapse to one registry call (it owns their Shown state); only the
+    // standalone tool windows keep their own field-backed open flags.
     void ToggleWindow(string key) {
+        if (panels.IsCorePanel(key)) {
+            if (panels.Toggle(key)) pendingFocusWindow = key;   // focus when it just (re)opened
+            return;
+        }
         switch (key) {
-            case EditorLayout.Entities: showHierarchy = !showHierarchy; if (showHierarchy) pendingFocusWindow = key; break;
-            case EditorLayout.SceneComponents: showSceneComponents = !showSceneComponents; if (showSceneComponents) pendingFocusWindow = key; break;
-            case EditorLayout.Inspector: showInspector = !showInspector; if (showInspector) pendingFocusWindow = key; break;
-            case EditorLayout.Assets: showBottom = !showBottom; if (showBottom) pendingFocusWindow = key; break;
-            case EditorLayout.Console: showConsole = !showConsole; if (showConsole) pendingFocusWindow = key; break;
             case EditorMenus.WindowKeys.Statistics: showStats = !showStats; break;
             case EditorMenus.WindowKeys.Profiler: profilerPanel.Open = !profilerPanel.Open; break;
             case EditorMenus.WindowKeys.Build: buildPanel.Open = !buildPanel.Open; break;
@@ -1426,16 +1419,16 @@ internal sealed class EditorApplication {
         }
     }
 
-    // Open a window (never closes). For a dockable kind whose primary is hidden, bring the primary back;
+    // Open a window (never closes). For a core panel whose primary is hidden, bring the primary back;
     // otherwise spawn ANOTHER instance through the host (the "Add Panel" behaviour). For a standalone
     // window, just open it.
     void OpenWindow(string key) {
+        if (panels.IsCorePanel(key)) {
+            if (!panels.Show(key))          // re-show a hidden primary; if already shown,
+                extraPanels.Open(key);      // add another instance via the host
+            return;
+        }
         switch (key) {
-            case EditorLayout.Entities: OpenDockable(key, ref showHierarchy); break;
-            case EditorLayout.SceneComponents: OpenDockable(key, ref showSceneComponents); break;
-            case EditorLayout.Inspector: OpenDockable(key, ref showInspector); break;
-            case EditorLayout.Assets: OpenDockable(key, ref showBottom); break;
-            case EditorLayout.Console: OpenDockable(key, ref showConsole); break;
             case EditorMenus.WindowKeys.Statistics: showStats = true; break;
             case EditorMenus.WindowKeys.Profiler: profilerPanel.Open = true; break;
             case EditorMenus.WindowKeys.Build: buildPanel.Open = true; break;
@@ -1445,28 +1438,19 @@ internal sealed class EditorApplication {
         }
     }
 
-    // Open a dockable kind: re-show the hidden primary first, else add another instance via the host
-    // (mirrors the old AddTabItem behaviour, now keyed instead of named).
-    void OpenDockable(string key, ref bool primaryShown) {
-        if (!primaryShown) primaryShown = true;
-        else extraPanels.Open(key);
-    }
-
     // Whether a window is currently shown (drives the Window-menu checkmark via EditorWindows.IsOpen).
-    bool IsWindowOpen(string key) => key switch {
-        EditorLayout.Entities => showHierarchy,
-        EditorLayout.SceneComponents => showSceneComponents,
-        EditorLayout.Inspector => showInspector,
-        EditorLayout.Assets => showBottom,
-        EditorLayout.Console => showConsole,
-        EditorMenus.WindowKeys.Statistics => showStats,
-        EditorMenus.WindowKeys.Profiler => profilerPanel.Open,
-        EditorMenus.WindowKeys.Build => buildPanel.Open,
-        EditorMenus.WindowKeys.TagsLayers => tagsLayers.Open,
-        EditorMenus.WindowKeys.Settings => settings.Open,
-        EditorMenus.WindowKeys.UnityImport => UnityImportWindow.IsOpen,
-        _ => false,
-    };
+    bool IsWindowOpen(string key) {
+        if (panels.IsCorePanel(key)) return panels.IsShown(key);
+        return key switch {
+            EditorMenus.WindowKeys.Statistics => showStats,
+            EditorMenus.WindowKeys.Profiler => profilerPanel.Open,
+            EditorMenus.WindowKeys.Build => buildPanel.Open,
+            EditorMenus.WindowKeys.TagsLayers => tagsLayers.Open,
+            EditorMenus.WindowKeys.Settings => settings.Open,
+            EditorMenus.WindowKeys.UnityImport => UnityImportWindow.IsOpen,
+            _ => false,
+        };
+    }
 
     // Per-window menu-enable gate (reserved for future "disabled while playing" cases; all enabled today).
     bool IsWindowEnabled(string key) => true;
@@ -1517,11 +1501,11 @@ internal sealed class EditorApplication {
             // Add Tab → click a kind to open ANOTHER instance of it (unlimited). Each entry shows how
             // many are open. Singleton views (Scene/Game) aren't here — they're one-per-renderer-target.
             if (ImGui.BeginMenu($"{EditorIcons.Add}  Add Tab")) {
-                AddTabItem(EditorLayout.Inspector, "Inspector", ref showInspector);
-                AddTabItem(EditorLayout.Entities, "Entities", ref showHierarchy);
-                AddTabItem(EditorLayout.SceneComponents, "Scene Components", ref showSceneComponents);
-                AddTabItem(EditorLayout.Assets, "Assets", ref showBottom);
-                AddTabItem(EditorLayout.Console, "Console", ref showConsole);
+                AddTabItem(EditorLayout.Inspector, "Inspector");
+                AddTabItem(EditorLayout.Entities, "Entities");
+                AddTabItem(EditorLayout.SceneComponents, "Scene Components");
+                AddTabItem(EditorLayout.Assets, "Assets");
+                AddTabItem(EditorLayout.Console, "Console");
                 ImGui.EndMenu();
             }
             ImGui.Separator();
@@ -1533,12 +1517,14 @@ internal sealed class EditorApplication {
 
     // One "Add Tab" entry: opens ANOTHER instance of the kind. If the primary (id-0) panel is closed,
     // re-show it first; otherwise spawn an extra instance through the host. The count is shown as a hint.
-    void AddTabItem(string kindKey, string label, ref bool primaryShown) {
-        int total = (primaryShown ? 1 : 0) + extraPanels.CountOf(kindKey);
+    // A1b-deeper: the primary show-state is the registry's, not a ref bool — Show() re-opens a hidden
+    // primary (returns true), else we add an extra host instance, exactly as before.
+    void AddTabItem(string kindKey, string label) {
+        int total = (panels.IsShown(kindKey) ? 1 : 0) + extraPanels.CountOf(kindKey);
         string hint = total > 0 ? $"{total} open" : null;
         if (ImGui.MenuItem(label, hint)) {
-            if (!primaryShown) primaryShown = true;     // bring the main one back first
-            else extraPanels.Open(kindKey);             // already showing → add another
+            if (!panels.Show(kindKey))                  // bring the main one back first; if already shown,
+                extraPanels.Open(kindKey);              // add another
         }
     }
 
