@@ -24,6 +24,7 @@ internal sealed class EditorApplication {
     readonly EditorCamera editorCamera = new();
     readonly EditorInput editorInput;
     readonly EditorState editorState = new();
+    readonly ViewportRenderer viewport;   // single source for the Scene/Game offscreen render sequence
 
     readonly HierarchyPanel hierarchy;
     readonly InspectorPanel inspector;
@@ -92,7 +93,6 @@ internal sealed class EditorApplication {
     SysVec2 gamePanelSize = new(1280, 720);
     readonly ViewportResolution sceneRes = new();
     readonly ViewportResolution gameRes = new();
-    int sceneW, sceneH, gameW, gameH;
     bool sceneViewHovered;
     bool gameViewFocused;
     bool gameViewHovered;   // mouse is over the Game view image (used to gate click-to-recapture)
@@ -220,11 +220,12 @@ internal sealed class EditorApplication {
         window.WindowState = WindowState.Maximized;
         runtime.Window.OnResizeCallback += (w, h) => {
             imgui.WindowResized(w, h);
-            sceneW = sceneH = gameW = gameH = 0; // re-sync offscreen targets next frame
+            viewport.InvalidateTargetSizes(); // re-sync offscreen targets next frame
         };
         imgui.WindowResized(runtime.Window.Width, runtime.Window.Height);
 
         this.window = window;
+        viewport = new ViewportRenderer(() => Renderer);
         ApplyFrameRateLimit();
 
         // Keep the selection alive across undo/redo: the scene is rebuilt from YAML on Restore, so
@@ -586,18 +587,11 @@ internal sealed class EditorApplication {
     }
 
     void RenderSceneView() {
-        var w = Math.Max(1, (int)sceneViewSize.X);
-        var h = Math.Max(1, (int)sceneViewSize.Y);
-        if (w != sceneW || h != sceneH) { Renderer.ResizeSceneTarget(w, h); sceneW = w; sceneH = h; }
-        editorCamera.SetAspect((float)w / h);
-
-        Renderer.ActiveTarget = HDRenderer.RenderTarget.Scene;
-        Renderer.BeginRender(new RendererArgs(editorCamera));
-        // Publish the coarse depth grid for gizmo depth-occlusion while the Scene depth is still intact
-        // (gizmos drawn later this frame dim when behind geometry). Cheap GPU-downscaled readback.
+        editorCamera.SetAspect((float)Math.Max(1, (int)sceneViewSize.X) / Math.Max(1, (int)sceneViewSize.Y));
+        // Gate the gizmo depth-occlusion grid the ViewportRenderer publishes (gizmos drawn later this
+        // frame dim when behind geometry). Editor policy lives here; the read happens inside the render.
         GizmoDepthOcclusion.Enabled = EditorPrefs.Current.ShowGizmos;
-        Renderer.ReadSceneDepthGrid();
-        Renderer.PostRenderCleanUp();
+        viewport.RenderSceneView(editorCamera, sceneViewSize);
     }
 
     // The Game view works in edit mode too: it renders from the first active HDCamera in the
@@ -624,14 +618,8 @@ internal sealed class EditorApplication {
         if (camera is null)
             return;
 
-        var w = Math.Max(1, (int)gameViewSize.X);
-        var h = Math.Max(1, (int)gameViewSize.Y);
-        if (w != gameW || h != gameH) { Renderer.ResizeGameTarget(w, h); gameW = w; gameH = h; }
-
-        gameCameraView.Bind(camera, (float)w / h);
-        Renderer.ActiveTarget = HDRenderer.RenderTarget.Game;
-        Renderer.BeginRender(new RendererArgs(gameCameraView));
-        Renderer.PostRenderCleanUp();
+        gameCameraView.Bind(camera, (float)Math.Max(1, (int)gameViewSize.X) / Math.Max(1, (int)gameViewSize.Y));
+        viewport.RenderGameView(gameCameraView, gameViewSize);
     }
 
     // ---- Layout -------------------------------------------------------------
