@@ -80,7 +80,7 @@ public sealed class TypePlan {
                 Name = info.Name,
                 ValueType = valueType,
                 Category = PropertyCategories.Classify(valueType, info),
-                Order = info.GetCustomAttribute<PropertyOrderAttribute>()?.Order ?? 0,
+                Order = PropertyOrdering.OrderOf(info),   // single-sourced [PropertyOrder]; 0 = declaration order
                 Declaration = declaration++,
             });
         }

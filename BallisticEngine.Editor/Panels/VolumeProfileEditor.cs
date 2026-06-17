@@ -170,9 +170,11 @@ internal static class VolumeProfileEditor {
         ImGui.TableSetupColumn("value", ImGuiTableColumnFlags.WidthStretch, 0.55f);
 
         var changed = false;
-        // [PropertyOrder] sorts (stable: default 0 keeps declaration order).
-        foreach (VolumeComponent.ParameterSlot slot in System.Linq.Enumerable.OrderBy(
-                     component.Parameters, s => MemberAttributes.For(s.Field).Order)) {
+        // [PropertyOrder] sorts via the single-sourced engine rule (stable: default 0 keeps slot order) --
+        // same ordering the component inspector uses, keyed on the parameter's backing field, so the two
+        // inspector paths can't drift on member order.
+        foreach (VolumeComponent.ParameterSlot slot in
+                     PropertyOrdering.Sort(component.Parameters, s => PropertyOrdering.OrderOf(s.Field))) {
             changed |= pipeline.Draw(new VolumeParamProperty(slot, component), volumeGui);
             changed |= volumeGui.TakeOverrideChanged();   // toggling the override checkbox is also a change
         }

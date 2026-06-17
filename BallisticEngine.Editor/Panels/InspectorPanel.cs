@@ -1245,10 +1245,11 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             groupOpen = true;
         }
 
-        // [PropertyOrder] reorders members (stable sort: default 0 keeps declaration order, so a
-        // component that doesn't use it renders exactly as before).
-        foreach (MemberInfo member in System.Linq.Enumerable.OrderBy(
-                     ComponentReflection.InspectorMembers(type), m => MemberAttributes.For(m).Order)) {
+        // Member order is single-sourced engine-side: TypePlan.For(type).Members is already ordered by
+        // [PropertyOrder] then declaration order (the same rule this site used to compute inline), so the
+        // inspector consumes ONE ordered member list instead of re-sorting -- byte-identical, no drift.
+        foreach (TypePlan.Member planned in TypePlan.For(type).Members) {
+            MemberInfo member = planned.Info;
             MemberAttributes attrs = MemberAttributes.For(member);
 
             // [ShowIf]/[HideIf]: skip a hidden member entirely, before any header/space/foldout chrome.
