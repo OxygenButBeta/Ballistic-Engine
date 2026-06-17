@@ -145,14 +145,21 @@ public sealed class Dx12Device : IDisposable {
 
         // DRED (Device Removed Extended Data) — diagnoses GPU HANGS/device-removals WITHOUT the debug-layer
         // SDK (which isn't installed here): on a removal, DrainDredReport() reports the GPU PAGE-FAULT VA
-        // (non-zero = the GPU accessed freed/invalid memory — use-after-free or a bad descriptor). Auto-
-        // breadcrumbs have a per-command GPU cost, so it's OFF unless BALLISTIC_DX12_DRED=1. Must precede
-        // device creation. See [[gpu-hang-launch-safety]] (the DX12 thumbnail hang this is for).
-        dredEnabled = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DRED") == "1";
-        if (dredEnabled && D3D12GetDebugInterface(out ID3D12DeviceRemovedExtendedDataSettings dred).Success) {
-            dred.SetAutoBreadcrumbsEnablement(DredEnablement.ForcedOn);
+        // (non-zero = the GPU accessed freed/invalid memory — use-after-free or a bad descriptor).
+        //
+        // Split by cost (EF3): PAGE-FAULT tracking is ~free (the runtime just records the last fault VA on a
+        // removal — no per-command overhead), so it is ALWAYS ON now: a device-removal (e.g. the editor
+        // resize hang) should ALWAYS leave a usable page-fault VA in the log without a special relaunch — the
+        // GPU-hang rule wants the FIRST crash to be self-diagnosing. AUTO-BREADCRUMBS (per-command markers that
+        // pinpoint WHICH op faulted) DO have a per-command GPU cost, so they stay opt-in (BALLISTIC_DX12_DRED=1).
+        // DrainDredReport works as long as EITHER is on. Must precede device creation.
+        // See [[gpu-hang-launch-safety]] (the DX12 thumbnail + editor-resize hangs this is for).
+        bool breadcrumbs = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DRED") == "1";
+        if (D3D12GetDebugInterface(out ID3D12DeviceRemovedExtendedDataSettings dred).Success) {
             dred.SetPageFaultEnablement(DredEnablement.ForcedOn);
+            if (breadcrumbs) dred.SetAutoBreadcrumbsEnablement(DredEnablement.ForcedOn);
             dred.Dispose();
+            dredEnabled = true;   // DrainDredReport now has at least page-fault data on a removal
         }
 
         using IDXGIFactory4 factory = CreateDXGIFactory1<IDXGIFactory4>();

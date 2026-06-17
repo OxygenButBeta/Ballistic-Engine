@@ -191,6 +191,15 @@ internal sealed unsafe class ImGuiDx12Renderer : IImGuiRenderer {
     }
 
     void EnsureBuffers(int vtxCount, int idxCount) {
+        // GROW HAZARD (EF3): these are single upload buffers the GPU reads while a prior frame is still in
+        // flight. A window resize/maximize can sharply increase the ImGui vertex count (more/larger panels) and
+        // trip a grow MID-STREAM — disposing the old buffer while the previous frame's draw still references it
+        // is a use-after-free → DXGI_ERROR_DEVICE_HUNG. Drain the GPU BEFORE disposing so no in-flight frame
+        // holds the buffer being freed. The grow is rare (only on a capacity increase), so the Flush is cheap;
+        // the steady-state (no grow) path is untouched. The default editor frame is already synchronous
+        // (FramesInFlight==1, EndFrame waits), but the drain makes correctness independent of that.
+        bool grow = (vtxBuffer == null || vtxCount > vtxCapacity) || (idxBuffer == null || idxCount > idxCapacity);
+        if (grow && (vtxBuffer != null || idxBuffer != null)) Dev.Flush();
         if (vtxBuffer == null || vtxCount > vtxCapacity) {
             if (vtxBuffer != null) { vtxBuffer.Unmap(0); vtxBuffer.Dispose(); }
             vtxCapacity = Math.Max(vtxCount + 5000, vtxCapacity * 2);

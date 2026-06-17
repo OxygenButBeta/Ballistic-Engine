@@ -79,7 +79,7 @@ this same handoff for the chunk after it.
 ```
 
 ### Progress checklist (each chat ticks its chunk)
-- [x] EF3 — swapchain drained resize + post-resize reset (root cause was stale/already-fixed; hardened + harness regression guard added)
+- [~] EF3 — swapchain drained resize + post-resize reset DONE (v1 @ d1799cb7) — but RESIZE STILL CRASHES LIVE (DXGI_ERROR_DEVICE_HUNG 0x887A0006 at **Present**, editor only). REOPENED. v2 follow-up: made DRED page-fault tracking ALWAYS-ON (next crash self-diagnoses the faulting VA) + hardened ImGui EnsureBuffers grow (drain before disposing an in-flight upload buffer). NOT yet the proven fix — needs ONE careful user repro to read the DRED page-fault. The hang is editor-specific (player `Dx12WindowedRuntime` resizes swapchain+offscreen in lockstep in OnResize and does NOT crash; editor has ImGui + a DECOUPLED panel-sized offscreen `ldr` resize via `InvalidateTargetSizes`). Swapchain `Resize` itself is proven clean (harness, both fence paths). See EF3 section + the [[gpu-hang]] memory.
 - [x] EF9a — honor close everywhere (incl. maximized) — `ref open` threaded through both maximized paths; close STICKS + exits fullscreen same frame
 - [ ] EF9b — maximize/fullscreen (re-verify EF3 fullscreen)
 - [ ] EF9c — layout persist + PassthruCentralNode review
@@ -235,8 +235,32 @@ its `SetNextWindowPos` Y down by gizmo height + gap), OR move the eye-menu to th
 the toolbar. Prefer: eye-menu below the gizmo, right-aligned, so the axis balls stay fully clickable.
 DoD: human screenshot — gizmo fully visible+clickable, eye-menu not overlapping.
 
-## EF3 — Window resize / fullscreen → DX12 device removal ⚠️ CRASH (high priority) — ✅ DONE
-**VALIDATED RESOLUTION (the stated root cause was STALE):** the plan claimed `Dx12SwapChain.cs:165`
+## EF3 — Window resize / fullscreen → DX12 device removal ⚠️ CRASH (high priority) — ⚠️ REOPENED (still crashes)
+**STATUS 2026-06-17 (after v1 @ d1799cb7): RESIZE STILL CRASHES THE LIVE EDITOR.** A user drag-resize
+device-removed with `DXGI_ERROR_DEVICE_HUNG` (0x887A0006) at **`Dx12SwapChain` Present** (not at
+`ResizeBuffers`). So the swapchain `Resize` itself is NOT the culprit — a GPU command EARLIER in the frame
+hung; Present is just where it surfaced. v1's swapchain hardening + the resize-harness are CORRECT but
+INSUFFICIENT (the harness exercises only swapchain clear+present, not the editor's real render path).
+**Asymmetry that localizes it:** the PLAYER (`Dx12WindowedRuntime.OnResize`) resizes the swapchain AND the
+renderer offscreen target SYNCHRONOUSLY in lockstep and does NOT crash; the EDITOR (`PresentToScreen=false`)
+has (a) the ImGui present pass sampling the offscreen `ldr` via the shared `UiHeap`, and (b) a DECOUPLED,
+panel-sized offscreen `ldr` resize deferred to a later frame via `viewport.InvalidateTargetSizes()`
+(`EditorApplication.cs:251-253`) — `ldr` is disposed+recreated in `AllocateResolutionTargets`
+(`DX12HDRenderer.cs:448`, which itself `dev.Flush()`es). The exact faulting op is NOT yet proven (candidates:
+mismatched-dimension bind during the drag storm; an ImGui upload-buffer grow disposing an in-flight buffer;
+a UiHeap descriptor overwrite). A scratch real-renderer repro is blocked (needs full engine bootstrap —
+`DefaultTextures` NRE). **v2 follow-up shipped = MAKE-SAFE + DIAGNOSTICS, not the proven fix:**
+(1) DRED **page-fault tracking is now ALWAYS-ON** (`Dx12Device` ctor — negligible cost; auto-breadcrumbs
+still opt-in via `BALLISTIC_DX12_DRED=1`) so the NEXT crash logs the faulting VA without a special relaunch;
+(2) hardened `ImGuiDx12Renderer.EnsureBuffers` to `dev.Flush()` before disposing an in-flight upload buffer
+on a grow (a real latent UAF, defensive). **NEXT (needs the user, ONE careful repro — GPU-hang rule, no
+relaunch-loop):** rebuild the editor, reproduce the resize crash ONCE, read `engine.jsonl` for the
+`[DX12] Present device-removed` line — it will now carry `DRED=PageFaultVA=0x… reads/writes=…` naming the
+freed allocation. That VA → the faulting resource → the real fix (likely: resize the editor offscreen target
+in lockstep, or guard the present's sampled `ldr`/descriptor across the resize). Swapchain-side facts below
+remain valid.
+
+**(v1, still valid) VALIDATED RESOLUTION of the swapchain-side claim (it was STALE):** the plan claimed `Dx12SwapChain.cs:165`
 "flushes the wrong fence" — but `Dx12Device.Flush()` was already hardened in commit `49623af8` (P0b step1)
 to drain ALL THREE queue fences (render `fence` via `WaitForGpu`, pipelined `frameFence` via
 `WaitFrameFence(frameFenceValue)`, AND `uploadFence`) before returning, so the drained-resize was already
