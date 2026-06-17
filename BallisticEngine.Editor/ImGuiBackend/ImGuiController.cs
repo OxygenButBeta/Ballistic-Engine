@@ -98,25 +98,45 @@ internal sealed class ImGuiController : IDisposable {
         var semibold = Path.Combine(fontsDir, "Inter-SemiBold.ttf");
         var icons = File.Exists(Path.Combine(fontsDir, "lucide.ttf"))
             ? Path.Combine(fontsDir, "lucide.ttf") : null;
-        float size = MathF.Round(16.5f * scale);   // Inter reads a touch larger than Segoe at the same px
+        float baseSize = 16.5f;                      // Inter reads a touch larger than Segoe at the same px
+        float size = MathF.Round(baseSize * scale);
+        EditorTheme.BodySize = size;
 
-        if (File.Exists(regular)) {
-            io.Fonts.AddFontFromFileTTF(regular, size);
+        ImFontPtr bodyFont, captionFont, headerFont, displayFont;
+        bool haveRegular = File.Exists(regular);
+        if (haveRegular) {
+            bodyFont = io.Fonts.AddFontFromFileTTF(regular, size);
         }
         else {
-            io.Fonts.AddFontDefault();
+            bodyFont = io.Fonts.AddFontDefault();
             io.FontGlobalScale = scale;
         }
         MergeIcons(io, icons, size);
+
+        // Phase E (RW2) — a SEMANTIC TYPE SCALE so headers read as headers and captions recede (the #1
+        // flatness fix). Real distinct pixel sizes baked into the atlas (NOT just bold weight). Each falls
+        // back to the body font if the .ttf is missing, so EditorTheme handles are always valid.
+        // Caption: a smaller regular size for secondary hints / badges.
+        captionFont = haveRegular
+            ? LoadSizedWithIcons(io, regular, icons, MathF.Round(baseSize * EditorTheme.CaptionScale * scale))
+            : bodyFont;
 
         // SemiBold for component headers / titles; falls back to the regular font seamlessly.
         if (File.Exists(semibold)) {
             Bold = io.Fonts.AddFontFromFileTTF(semibold, size);
             MergeIcons(io, icons, size);
+            headerFont  = LoadSizedWithIcons(io, semibold, icons, MathF.Round(baseSize * EditorTheme.HeaderScale * scale));
+            displayFont = LoadSizedWithIcons(io, semibold, icons, MathF.Round(baseSize * EditorTheme.DisplayScale * scale));
         }
         else {
             Bold = io.Fonts.Fonts[0];
+            headerFont = displayFont = Bold;
         }
+
+        EditorTheme.Body    = bodyFont;
+        EditorTheme.Caption = captionFont;
+        EditorTheme.Header  = headerFont;
+        EditorTheme.Display = displayFont;
 
         // Icon-only display font for asset tiles and empty states (baked big = crisp).
         HasIcons = icons is not null;
@@ -129,6 +149,14 @@ internal sealed class ImGuiController : IDisposable {
         else {
             LargeIcons = io.Fonts.Fonts[0];
         }
+    }
+
+    // Loads a TTF at a specific px size and merges the icon glyphs into it (so any semantic-scale font can
+    // still render inline icons). Returns the font handle for EditorTheme.
+    static unsafe ImFontPtr LoadSizedWithIcons(ImGuiIOPtr io, string ttf, string icons, float px) {
+        ImFontPtr f = io.Fonts.AddFontFromFileTTF(ttf, px);
+        MergeIcons(io, icons, px);
+        return f;
     }
 
     // Merges icon glyphs into the last-added font so labels can mix text and icons freely.

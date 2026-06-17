@@ -542,7 +542,11 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
         float pad = 10f;
         float frameH = ImGui.GetFrameHeight();
-        float cardH = pad + frameH + 4 + ImGui.GetTextLineHeight() + pad;
+        // RW2: row 1 hosts the name field in the larger Header font, so its frame is taller than the
+        // default frameH — size the card from the header frame height so the bigger title never clips.
+        float headerFrameH = EditorTheme.Header.FontSize + ImGui.GetStyle().FramePadding.Y * 2;
+        float row1H = MathF.Max(frameH, headerFrameH);
+        float cardH = pad + row1H + 4 + ImGui.GetTextLineHeight() + pad;
         SysVec2 cardMax = cardMin + new SysVec2(avail.X, cardH);
 
         draw.AddRectFilled(cardMin, cardMax, ImGui.GetColorU32(new SysVec4(1, 1, 1, 0.035f)), 6f);
@@ -574,17 +578,25 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         ImGui.SameLine();
         ImGui.SetNextItemWidth(cardMax.X - pad - ImGui.GetCursorScreenPos().X);
         ImGui.PushStyleColor(ImGuiCol.FrameBg, new SysVec4(0, 0, 0, 0.30f));
+        // RW2: the entity NAME is the top of the inspector's type hierarchy — draw it in the Header
+        // (semibold, larger) font so it reads as the title, not just another body-size field.
+        ImGui.PushFont(EditorTheme.Header);
         var name = entity.Name ?? "";
         var renamed = ImGui.InputText("##name", ref name, 128);
+        ImGui.PopFont();
         ImGui.PopStyleColor();
         // Snapshot on activation; the rename mutate (entity.Name) lands on a later edit frame, so the
         // grab-frame snapshot is preserved with a no-op mutate.
         if (ImGui.IsItemActivated()) EditorCommands.EditEntity(entity, "Rename", () => { });
         if (renamed) entity.Name = name;
 
-        // Row 2: meta line.
-        ImGui.SetCursorScreenPos(new SysVec2(contentX, cardMin.Y + pad + frameH + 4));
-        ImGui.TextDisabled(componentCount == 1 ? "1 component" : $"{componentCount} components");
+        // Row 2: meta line. RW2: caption font + recessive caption color so it reads as secondary metadata.
+        ImGui.SetCursorScreenPos(new SysVec2(contentX, cardMin.Y + pad + row1H + 4));
+        ImGui.PushFont(EditorTheme.Caption);
+        ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.RowCaption);
+        ImGui.TextUnformatted(componentCount == 1 ? "1 component" : $"{componentCount} components");
+        ImGui.PopStyleColor();
+        ImGui.PopFont();
 
         // Reserve the card's space in the layout — and make it a SCRIPT DROP TARGET: dragging a .cs
         // tile from the asset browser onto the header adds that component to the entity (Unity parity;
@@ -2415,12 +2427,19 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
     // Starts a new label/value row and leaves the cursor in the value column.
     // internal (RW1.1): the relocated RendererPreview body (Inspector/Preview/) calls this to draw its
-    // submesh-material rows inside a BeginGrid table — byte-identical to the old inline DrawSubMeshMaterials.
+    // submesh-material rows inside a BeginGrid table.
+    // RW2 (Phase E): the label now uses EditorTheme.RowLabel (a legible label color, not the dead
+    // TextDisabled grey) and the row gets a hover-accent affordance (faint fill + a left sliver) via
+    // RowChrome. ALL member rows route through here (component members via ImGuiComponentGui.BeginRow ->
+    // RowWithTooltip, plus every shim Row), so the whole inspector picks up the look in one place.
     internal static void Row(string label) {
         ImGui.TableNextRow();
+        RowChrome();
         ImGui.TableSetColumnIndex(0);
         ImGui.AlignTextToFramePadding();
-        ImGui.TextDisabled(label);
+        ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.RowLabel);
+        ImGui.TextUnformatted(label);
+        ImGui.PopStyleColor();
         ImGui.TableSetColumnIndex(1);
         ImGui.SetNextItemWidth(-1);
     }
@@ -2428,21 +2447,55 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // Like Row, but appends a "(?)" marker that shows the tooltip on hover (when one is supplied).
     static void RowWithTooltip(string label, string tooltip) {
         ImGui.TableNextRow();
+        RowChrome();
         ImGui.TableSetColumnIndex(0);
         ImGui.AlignTextToFramePadding();
-        ImGui.TextDisabled(label);
+        ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.RowLabel);
+        ImGui.TextUnformatted(label);
+        ImGui.PopStyleColor();
         // Tooltip on the LABEL itself (Unity-style: hover the field name), not just the "(?)" badge —
         // this is what made [Tooltip] feel "broken" (you had to find the tiny marker).
         if (tooltip is not null) {
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip(tooltip);
             ImGui.SameLine(0, 4);
-            ImGui.TextDisabled("(?)");
+            ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.RowCaption);
+            ImGui.TextUnformatted("(?)");
+            ImGui.PopStyleColor();
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip(tooltip);
         }
         ImGui.TableSetColumnIndex(1);
         ImGui.SetNextItemWidth(-1);
+    }
+
+    // RW2 (Phase E, drawer-row affordance): on the CURRENT table row, if the mouse hovers it, paint a faint
+    // accent row-bg + a left accent sliver so rows have rhythm + a hover affordance (the flat label|widget
+    // rows had none). PERFORMANCE (plan §4): hover-gated — the fill is one TableSetBgColor + the sliver is
+    // one AddRectFilled, ONLY when hovered; no per-row gradient/shadow, no allocation. Must be called right
+    // after TableNextRow(), BEFORE TableSetColumnIndex(0), so the row's screen rect is the fresh row.
+    static void RowChrome() {
+        // The row's vertical band: cursor Y at row start .. + a frame height (the row's content height).
+        SysVec2 rowStart = ImGui.GetCursorScreenPos();
+        float rowH = ImGui.GetFrameHeightWithSpacing();
+        // Full panel content width (the table spans it); use the window inner rect so the band covers both
+        // columns regardless of the table's internal split.
+        float x0 = ImGui.GetWindowPos().X;
+        float x1 = x0 + ImGui.GetWindowSize().X;
+        bool hovered = ImGui.IsWindowHovered(ImGuiHoveredFlags.ChildWindows) &&
+                       ImGui.IsMouseHoveringRect(new SysVec2(x0, rowStart.Y),
+                                                 new SysVec2(x1, rowStart.Y + rowH), clip: false);
+        if (!hovered)
+            return;
+
+        SysVec4 accent = EditorPrefs.Current.Accent;
+        ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0,
+            ImGui.GetColorU32(EditorTheme.RowHoverFill(accent)));
+        var draw = ImGui.GetWindowDrawList();
+        float w = EditorTheme.RowAccentBarWidth;
+        draw.AddRectFilled(new SysVec2(x0, rowStart.Y),
+                           new SysVec2(x0 + w, rowStart.Y + rowH),
+                           ImGui.GetColorU32(EditorTheme.RowHoverBar(accent)));
     }
 
     void SysVec3Row(string label, Vector3 value, Action<Vector3> apply, float speed) =>
