@@ -141,7 +141,7 @@ public static class SceneSerializer {
 
         foreach (MemberInfo member in SerializableMembers(target.GetType())) {
             object value = GetMemberValue(member, target);
-            object serialized = SerializeValue(value);
+            object serialized = SerializeMemberValue(value, MemberType(member), member, visited: null);
             if (serialized is not null)
                 doc.Members[CamelCase(member.Name)] = serialized;
             else if (value is not null && !IsNoneSceneObjectRef(value))
@@ -226,6 +226,59 @@ public static class SceneSerializer {
             return SerializeSequence(seq);
 
         return value;
+    }
+
+    // ---- [SerializeReference] polymorphism (G3 engine-half) -----------------
+    // A member whose DECLARED type is abstract/interface (or a base marked [SerializeReference]) stores its
+    // live CONCRETE type so a derived implementation round-trips (Unity's [SerializeReference]). Only such a
+    // member emits a $type tag; every existing non-polymorphic member (primitive/struct/asset/scene-ref/
+    // collection/dict/nested) goes straight to SerializeValue UNCHANGED, so all existing scenes are
+    // byte-identical (no shipped component carries [SerializeReference], and a concrete-typed member never
+    // classifies Polymorphic). The trigger is exactly PropertyCategories.Classify == Polymorphic, so the
+    // serializer and the property model agree on what is polymorphic by construction.
+    static object SerializeMemberValue(object value, Type declaredType, MemberInfo member, HashSet<object> visited) {
+        if (value is not null &&
+            PropertyCategories.Classify(declaredType, member) == PropertyCategory.Polymorphic)
+            return SerializeReferenceInstance(value, visited);
+        return SerializeValue(value);
+    }
+
+    // The $type discriminator key. A leading '$' can't collide with a CamelCase member name (members never
+    // start with '$'), and it sorts/reads as a clear out-of-band tag in the YAML mapping.
+    const string TypeTag = "$type";
+
+    // Serialize a polymorphic instance as a YAML mapping: a $type tag (the concrete type's namespace-
+    // qualified FullName -- NOT the AssemblyQualifiedName, so it survives an assembly rename and stays
+    // diff-clean) plus each serializable member recursed through SerializeMemberValue (so a nested member
+    // can itself be polymorphic, a collection, a ref, or a leaf). TREE-ONLY with a cycle-guard (Trap 3 /
+    // Unity parity): a back-reference to an already-serialized instance stops at the guard and serializes as
+    // null (a real object graph would hurt YAML diff-cleanliness and the drawer -- rejected by the plan).
+    static Dictionary<object, object> SerializeReferenceInstance(object instance, HashSet<object> visited) {
+        visited ??= new HashSet<object>(ReferenceEqualityComparer.Instance);
+        if (!visited.Add(instance))
+            return null; // cycle / shared ref already emitted -> null (Unity duplicates/nulls back-refs)
+
+        try {
+            Type concrete = instance.GetType();
+            var map = new Dictionary<object, object> {
+                // FullName resolves back via TypeCache.GetTypesDerivedFrom(declaredType) on load -- scoped to
+                // the declared base's implementors, deterministic, and assembly-agnostic.
+                [TypeTag] = concrete.FullName,
+            };
+
+            foreach (MemberInfo member in SerializableMembers(concrete)) {
+                object value = GetMemberValue(member, instance);
+                object serialized = SerializeMemberValue(value, MemberType(member), member, visited);
+                if (serialized is not null)
+                    map[CamelCase(member.Name)] = serialized;
+            }
+            return map;
+        }
+        finally {
+            // Pop so a sibling that legitimately reuses the same instance type (different instance) is not
+            // mistaken for a cycle -- only an ANCESTOR back-reference is a cycle.
+            visited.Remove(instance);
+        }
     }
 
     // A list/array member -> a YAML sequence (List<object>); each element recurses through SerializeValue.
@@ -414,16 +467,26 @@ public static class SceneSerializer {
                 continue;
             }
 
-            object value = DeserializeValue(raw, memberType);
+            object value = DeserializeValue(raw, memberType, member);
             if (value is not null)
                 SetMemberValue(member, target, value);
         }
     }
 
-    // Inverse of SerializeValue. Asset refs (string -> BObject) load via AssetDatabase.
-    static object DeserializeValue(object raw, Type targetType) {
+    // Inverse of SerializeValue. Asset refs (string -> BObject) load via AssetDatabase. The optional member
+    // carries [SerializeReference] context for the G3 polymorphic branch (a $type-tagged map). It is null for
+    // recursed collection elements -- their polymorphism is detected by the $type tag + abstract element type.
+    static object DeserializeValue(object raw, Type targetType, MemberInfo member = null) {
         if (raw is null)
             return null;
+
+        // [SerializeReference] polymorphism (G3): a $type-tagged mapping is an out-of-band signal ONLY the
+        // polymorphic serializer emits (a Vector*/Dictionary map never carries $type), so its presence on a
+        // polymorphic-eligible target means "instantiate the named concrete type + fill its members." Checked
+        // FIRST so a polymorphic member never falls through to the collection/math-map branches below. A
+        // non-polymorphic target (the common case) skips this entirely -> byte-identical.
+        if (TryDeserializeReferenceInstance(raw, targetType, member, out object polymorphic))
+            return polymorphic;
 
         // Scene-object references parse the stored InstanceId hex back into the value-type ref.
         // Resolution to the live object is LAZY (EntityRef.Value), so this never depends on entity
@@ -475,6 +538,60 @@ public static class SceneSerializer {
         }
 
         return Coerce(raw, targetType);
+    }
+
+    // ---- [SerializeReference] deserialize (G3 engine-half) ------------------
+    // Reconstruct a polymorphic instance from a $type-tagged mapping: resolve the concrete type, instantiate
+    // it, and fill its members through ApplyMembers (the SAME recursion as a top-level component, so a nested
+    // member can itself be polymorphic/a collection/a ref). Returns false (leaving the existing pipeline to
+    // run) UNLESS the target is polymorphic-eligible AND the raw map actually carries a $type tag -- so a
+    // non-polymorphic member is byte-identical. A $type that fails to resolve (renamed/removed type) logs and
+    // yields null rather than throwing, matching the "missing ref -> null" leniency of the rest of the codec.
+    static bool TryDeserializeReferenceInstance(object raw, Type targetType, MemberInfo member, out object result) {
+        result = null;
+
+        // Only a [SerializeReference] member opts in (the exact trigger the serializer used). A polymorphic
+        // COLLECTION element (a `[SerializeReference] List<IFoo>`) is out of scope for this chunk -- the
+        // collection serializer does not write $type per element yet -- so a recursed element (member == null)
+        // is never treated as polymorphic here, keeping serialize/deserialize symmetric (no new silent loss).
+        if (PropertyCategories.Classify(targetType, member) != PropertyCategory.Polymorphic)
+            return false;
+
+        if (raw is not IDictionary<object, object> map ||
+            !map.TryGetValue(TypeTag, out object tagObj) || tagObj is not string typeName)
+            return false; // eligible target but no $type tag -> not a polymorphic payload (let the caller decide)
+
+        Type concrete = ResolvePolymorphicType(typeName, targetType);
+        if (concrete is null) {
+            Debugging.LogWarning(
+                $"[SerializeReference] could not resolve concrete type '{typeName}' for '{targetType.Name}'; " +
+                "the value is dropped (the type was renamed or removed).");
+            result = null;
+            return true; // handled (consumed the $type payload) -- don't fall through to the math/collection branches
+        }
+
+        object instance = Activator.CreateInstance(concrete);
+        // Reuse the component member-application path: build the string-keyed member dict (skip the $type tag)
+        // and apply through the same recursion, so nested polymorphic/collection/ref members rehydrate.
+        var members = new Dictionary<string, object>(StringComparer.Ordinal);
+        foreach ((object k, object v) in map)
+            if (k is string key && key != TypeTag)
+                members[key] = v;
+
+        ApplyMembers(instance, concrete, members);
+        result = instance;
+        return true;
+    }
+
+    // Resolve a $type FullName to a concrete instantiable type ASSIGNABLE to the declared base. Scoped to the
+    // declared base's implementors via TypeCache so resolution is deterministic, assembly-agnostic, and can
+    // never bind an unrelated type that merely shares a FullName. TypeCache is built at bootstrap over the
+    // engine + game-script assemblies (the headless serializer has it too -- it is an ENGINE cache).
+    static Type ResolvePolymorphicType(string fullName, Type declaredType) {
+        foreach (Type t in TypeCache.GetTypesDerivedFrom(declaredType))
+            if (string.Equals(t.FullName, fullName, StringComparison.Ordinal))
+                return t;
+        return null;
     }
 
     // Read a float component from a YAML mapping (values arrive as strings from YamlDotNet).
