@@ -40,6 +40,10 @@ internal sealed class EditorApplication {
     // A1b: the maximize state machine (which panel fills the window) — replaces the bare `maximizedPanel`
     // string + its three hand-synced clear sites with one can't-get-stuck controller.
     readonly MaximizeController maximize = new();
+    // A4: the editor's hotkeys as one declarative, priority-resolved, conflict-checkable table (the input half
+    // of the shell). The scattered inline ImGui.IsKeyPressed/editorInput.KeyPressed guards across OnUpdate +
+    // BuildUI now route through this — each binding declares its context so a chord can't leak between scopes.
+    readonly EditorInputRouter inputRouter;
     readonly ConsolePanel console = new();
     readonly StatsPanel stats = new();
     readonly SettingsPanel settings;
@@ -117,6 +121,7 @@ internal sealed class EditorApplication {
 
         imgui = new ImGuiController(window);
         editorInput = new EditorInput(window);
+        inputRouter = BuildInputRouter();
         hierarchy = new HierarchyPanel(editorState);
         inspector = new InspectorPanel(editorState);
         assets = new AssetBrowserPanel(editorState, () => imgui.Scale);
@@ -356,19 +361,58 @@ internal sealed class EditorApplication {
     void HandleGlobalShortcuts() {
         if (!editorInput.CtrlDown || imgui.WantTextInput)
             return;
+        inputRouter.Dispatch(EditorInputContext.Global);
+    }
 
-        if (editorInput.KeyPressed(OpenTK.Windowing.GraphicsLibraryFramework.Keys.Z)) {
-            EditorUndo.Undo();
-            MarkSceneDirty();
-        }
-        if (editorInput.KeyPressed(OpenTK.Windowing.GraphicsLibraryFramework.Keys.Y)) {
-            EditorUndo.Redo();
-            MarkSceneDirty();
-        }
-        if (editorInput.KeyPressed(OpenTK.Windowing.GraphicsLibraryFramework.Keys.S))
-            SaveScene();
-        if (editorInput.KeyPressed(OpenTK.Windowing.GraphicsLibraryFramework.Keys.R))
-            RebuildScripts();
+    // A4: build the declarative hotkey table ONCE. Every shell hotkey that used to be an inline guard in
+    // OnUpdate/BuildUI is a binding here, tagged with the context it belongs to (Global fires from any panel;
+    // SceneView fires only while the Scene viewport is the active surface). The router resolves a chord to at
+    // most one action per dispatch, by priority then Id -- so e.g. the bare-R gizmo binding (SceneView) and
+    // Ctrl+R rebuild (Global) never collide: different chord, different context, and the conflict check
+    // (asserted in the harness) verifies no two bindings share chord+context+priority. Bodies stay co-located
+    // here with the methods/state they touch (same minimal-diff approach A2 used for the frame passes).
+    EditorInputRouter BuildInputRouter() {
+        var r = new EditorInputRouter(editorInput);
+
+        // Global Ctrl chords -- fire regardless of focused panel (suppression while typing is the context gate,
+        // applied by the caller). Same effect as the old HandleGlobalShortcuts block, in the same set.
+        r.Bind(EditorActions.Undo, new KeyChord<Keys>(Keys.Z, ctrl: true), EditorInputContext.Global,
+               () => { EditorUndo.Undo(); MarkSceneDirty(); });
+        r.Bind(EditorActions.Redo, new KeyChord<Keys>(Keys.Y, ctrl: true), EditorInputContext.Global,
+               () => { EditorUndo.Redo(); MarkSceneDirty(); });
+        r.Bind(EditorActions.Save, new KeyChord<Keys>(Keys.S, ctrl: true), EditorInputContext.Global,
+               SaveScene);
+        r.Bind(EditorActions.RebuildScripts, new KeyChord<Keys>(Keys.R, ctrl: true), EditorInputContext.Global,
+               RebuildScripts);
+
+        // Scene-view gizmo mode (bare W/E/R, no modifiers -- the exact-modifier chord means Ctrl+R never selects
+        // gizmo-scale, replacing the old `!KeyCtrl` guard). SceneViewHovered = the mouse must be over the Scene
+        // image, matching the old `sceneViewHovered` guard (stricter than the focus/clipboard keys below).
+        r.Bind(EditorActions.GizmoTranslate, new KeyChord<Keys>(Keys.W), EditorInputContext.SceneViewHovered,
+               () => gizmo.Mode = GizmoMode.Translate);
+        r.Bind(EditorActions.GizmoRotate, new KeyChord<Keys>(Keys.E), EditorInputContext.SceneViewHovered,
+               () => gizmo.Mode = GizmoMode.Rotate);
+        r.Bind(EditorActions.GizmoScale, new KeyChord<Keys>(Keys.R), EditorInputContext.SceneViewHovered,
+               () => gizmo.Mode = GizmoMode.Scale);
+
+        // Scene-view focus/clipboard (Unity mapping). F frames the selection; Ctrl+Shift+F aligns it to the
+        // view; Ctrl+C / Ctrl+V copy / paste the selected entity. The exact-modifier match keeps Ctrl+Shift+F
+        // from also firing plain Frame (the old fall-through bug), and Ctrl+C/V from triggering the gizmo keys.
+        r.Bind(EditorActions.FrameSelected, new KeyChord<Keys>(Keys.F), EditorInputContext.SceneView,
+               FocusSelected);
+        r.Bind(EditorActions.AlignToView, new KeyChord<Keys>(Keys.F, ctrl: true, shift: true),
+               EditorInputContext.SceneView, AlignSelectedToView);
+        r.Bind(EditorActions.CopyEntity, new KeyChord<Keys>(Keys.C, ctrl: true), EditorInputContext.SceneView,
+               CopySelected);
+        r.Bind(EditorActions.PasteEntity, new KeyChord<Keys>(Keys.V, ctrl: true), EditorInputContext.SceneView,
+               PasteClipboard);
+
+        r.Build();
+        // No per-action enabled-gate: SaveScene already handles the play-mode case itself (it logs the "can't
+        // save while playing" warning and no-ops), so gating the dispatch here would SWALLOW that feedback --
+        // behaviour-identical only if the action always runs, as before. The ActionEnabled hook exists for a
+        // future binding that genuinely needs silent suppression.
+        return r;
     }
 
     bool startupImportKicked;
@@ -623,6 +667,10 @@ internal sealed class EditorApplication {
     void BuildUI() {
         ImGuiIOPtr io = ImGui.GetIO();
 
+        // Esc to exit maximize stays an ImGui key (NOT routed through the A4 raw-OpenTK router): ImGui's Escape
+        // is modal/popup-aware (a popup eats it first), which is the wanted behaviour here, whereas the router's
+        // raw probe would ignore that capture. The router owns the raw keyboard-shortcut surface; this one
+        // UI-modal key intentionally stays with ImGui.
         if (maximize.IsMaximized && ImGui.IsKeyPressed(ImGuiKey.Escape))
             maximize.Clear();
 
@@ -1662,38 +1710,31 @@ internal sealed class EditorApplication {
         gameViewFocused = false;
         gameViewHovered = false;
 
-        // Scene-view shortcuts (not while flying â€” the camera uses WASD too).
-        if (sceneViewHovered && !editorInput.RightMouseDown && !ImGui.GetIO().KeyCtrl) {
-            if (ImGui.IsKeyPressed(ImGuiKey.W)) gizmo.Mode = GizmoMode.Translate;
-            if (ImGui.IsKeyPressed(ImGuiKey.E)) gizmo.Mode = GizmoMode.Rotate;
-            if (ImGui.IsKeyPressed(ImGuiKey.R)) gizmo.Mode = GizmoMode.Scale;
-        }
-
-        // Focus/clipboard keys work from ANY panel while the Scene tab is showing (Unity-style), so
-        // selecting in the Hierarchy and pressing F flies the camera there without needing to hover the
-        // viewport first. Suppressed while typing or flying. Mapping matches Unity exactly:
-        //   F             -> fly the camera to frame the selection,
-        //   Ctrl+Shift+F  -> move the selection to the camera (Align With View),
-        //   Ctrl+C/V      -> copy / paste the selected entity.
-        // Modifiers AND the key edges are read from RAW OpenTK (editorInput, the same source the global
-        // Ctrl+Z/S use), not ImGui's io â€” so Ctrl/Shift can never read a frame stale relative to the F
-        // edge, which was making Ctrl+Shift+F fall through to the plain-F (frame) path.
-        if (!editorInput.RightMouseDown && !imgui.WantTextInput) {
-            bool ctrl = editorInput.CtrlDown;
-            bool shift = editorInput.ShiftDown;
-
-            if (editorInput.KeyPressed(Keys.F)) {
-                if (ctrl && shift)
-                    AlignSelectedToView();
-                else if (!ctrl && !shift)
-                    FocusSelected();
-            }
-
-            if (ctrl && !shift && editorInput.KeyPressed(Keys.C))
-                CopySelected();
-            if (ctrl && !shift && editorInput.KeyPressed(Keys.V))
-                PasteClipboard();
-        }
+        // A4: the scene-view hotkeys (gizmo mode W/E/R + Unity focus/clipboard F, Ctrl+Shift+F, Ctrl+C/V) now
+        // route through the input router instead of two inline guard blocks. The two original blocks had DIFFERENT
+        // guards, so they stay TWO dispatch calls, each reproducing its old gate EXACTLY (move != fit -- I keep
+        // the precise guard split rather than merge into one stronger gate):
+        //
+        //   Gizmo W/E/R (SceneViewHovered): old guard `sceneViewHovered && !RightMouseDown && !KeyCtrl`. The
+        //   `!KeyCtrl` is now the exact-modifier chord match (bare W/E/R never fire while Ctrl is held), so the
+        //   live guard is just hover + not-flying. NOTE: the old gizmo block did NOT suppress on WantTextInput,
+        //   so this one doesn't either (faithful). ONE intentional tightening: exact-modifier match also means
+        //   bare W/E/R no longer fire while SHIFT is held (the old `!KeyCtrl`-only guard let Shift+W change the
+        //   gizmo mode -- an undocumented accident, not intended). This is A4's defining contract ("a bare-key
+        //   binding means exactly that key, no modifiers") and the only deliberate behaviour delta in the move.
+        //
+        //   Focus/clipboard F, Ctrl+Shift+F, Ctrl+C/V (SceneView): old guard `!RightMouseDown && !WantTextInput`
+        //   -- worked from ANY panel while the Scene tab is showing (select in the Hierarchy, press F to fly the
+        //   camera there). The exact-modifier match replaces the hand-written `if (ctrl && shift) align else if
+        //   (!ctrl && !shift) frame` fall-through, so Ctrl+Shift+F no longer falls through to plain Frame.
+        //
+        // Both read modifiers + key edges from RAW OpenTK (EditorInput) -- the focus/clipboard keys already did;
+        // routing the gizmo keys through the same probe makes that uniform (and is behaviour-equivalent under the
+        // preserved hover/Ctrl gating).
+        if (sceneViewHovered && !editorInput.RightMouseDown)
+            inputRouter.Dispatch(EditorInputContext.SceneViewHovered);
+        if (!editorInput.RightMouseDown && !imgui.WantTextInput)
+            inputRouter.Dispatch(EditorInputContext.SceneView);
 
         // Gizmo/grid project into the on-screen image rect. When the view is magnified (zoom > 1),
         // the image shows a centered 1/zoom crop, so the projection rect is enlarged by zoom around
