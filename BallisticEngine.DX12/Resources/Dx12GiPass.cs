@@ -151,7 +151,8 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
     // inline constants exactly (the Reflections pass keeps its own RtRefl tail below).
     bool ddgiLogged;
     bool ddgiDebugDumped;
-    int probeColorThrottle;   // throttles the editor probe-colour readback (every ~12th GI frame when requested)
+    int probeColorThrottle;
+    bool probeReadbackLogged;   // throttles the editor probe-colour readback (every ~12th GI frame when requested)
     Dx12ScreenProbe screenProbe; // P4: screen-space radiance probes (final gather)
     bool screenProbeLogged;
 
@@ -739,7 +740,10 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
             if (GiDebugGrid.ProbeColorsRequested ||
                 Environment.GetEnvironmentVariable("BALLISTIC_DX12_PROBE_COLORS") == "1")
             {
-                if ((probeColorThrottle++ % 12) == 0) ddgi.ReadbackProbeColors();
+                if ((probeColorThrottle++ % 12) == 0) {
+                    ddgi.ReadbackProbeColors();
+                    if (!probeReadbackLogged) { probeReadbackLogged = true; Console.Error.WriteLine("[PROBE-DBG] ReadbackProbeColors CALLED"); }
+                }
                 GiDebugGrid.ProbeColorsRequested = false;
             }
 

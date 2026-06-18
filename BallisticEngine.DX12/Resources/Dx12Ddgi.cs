@@ -150,15 +150,14 @@ public sealed class Dx12Ddgi : IDisposable {
             if (warmupEnv == null) {
                 string raw = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_WARMUP");
                 if (int.TryParse(raw, out int n)) warmupEnv = Math.Max(0, n);
-                // BAKED mode: converge DEEPER than the capture default (128 vs 64). The whole point of baking is we
-                // pay this once and then run free — so we spend the converge budget on QUALITY. With hysteresis
-                // 0.97 the field needs ~33 samples to settle; 128 over-converges so even slow-fading bounce + the
-                // multi-bounce feedback (each iteration reads the last field) fully resolves → a cleaner, deeper
-                // indirect than the live round-robin ever reaches. (This is the "sample quality must go up" ask.)
-                else if (BakedMode) warmupEnv = 128;
-                // Default ON only for a PAUSED capture (the deterministic-diff use case — static camera, so the
-                // converged-then-frozen field is sampled at the right probe positions). A moving/play screenshot
-                // gets live round-robin updates instead (no point converging a field the camera will leave).
+                // WARM-UP IS CAPTURE-ONLY (2026-06-18 GPU-HANG FIX). The blocking warm-up replays the FULL-grid
+                // DXR update N times in ONE frame — at the baked grid (256 rays, +cascade) that is a HUGE single-
+                // frame GPU workload that TRIPS THE TDR WATCHDOG (>2s → GPU reset → PC crash). That is the crash
+                // the user hit when baked became the always-on default (every editor/play scene-open ran 128
+                // blocking iterations). In PLAY/EDITOR we now do NOT warm up — the PROGRESSIVE bake (CHUNK1, one
+                // distance band per few frames, amortized across frames) converges the field safely without ever
+                // blocking the GPU. Warm-up stays ONLY for a PAUSED screenshot (deterministic capture, no live
+                // camera, TDR not a concern for a one-shot offline render). 64 iters (capture deterministic).
                 else warmupEnv = (Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT") != null
                     && Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT_PAUSED") == "1") ? 64 : 0;
             }

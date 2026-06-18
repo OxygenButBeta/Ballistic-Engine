@@ -87,7 +87,7 @@ public sealed class GlobalIllumination : VolumeComponent {
              "cascade (wide coverage, no GI falloff at the grid edge). Baked GI only — the frozen field pays the " +
              "cost once, so the extra cascade is free at runtime. Ray-Traced GI only.")]
     [ShowIf("bakedGi", true)]
-    public readonly ClampedIntParameter cascades = new(2, 1, 2);
+    public readonly ClampedIntParameter cascades = new(1, 1, 2);   // default 1: far cascade off until re-validated (GPU-hang suspect)
 
     // ---- Debug ----
     [Tooltip("GI-isolate view: show ONLY the indirect bounce this GI pass adds (not the lit scene). " +

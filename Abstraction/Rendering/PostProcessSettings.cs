@@ -164,12 +164,13 @@ public sealed class PostProcessSettings {
     // reverted. These defaults are the no-volume baseline (a scene with no GlobalIllumination volume); the volume
     // bridge (VolumePostProcessing.Apply) overwrites them from the volume's GI-Mode dropdown. Default ScreenSpace
     // = SSGI on. The DX12HDRenderer giMode choke point still lets BALLISTIC_DX12_SSGI/RT_GI env doors override.
-    // BAKED-ONLY DEFAULT (2026-06-18): GI = the baked-freeze DDGI path (RayTraced mode, baked once then frozen →
-    // 0 rays/frame, no realtime update). NOT ScreenSpace (that's a realtime per-frame gather). SsgiEnabled stays
-    // true only because the RayTraced path reuses the SSGI resolve/combine tail; the actual GI source is the
-    // frozen DDGI field, not a realtime SSGI march.
-    public bool SsgiEnabled { get; set; } = true;
-    public GiMode GiMode { get; set; } = GiMode.RayTraced;   // baked DDGI runs on the RayTraced path; frozen, not realtime
+    // SAFETY DEFAULT-OFF (2026-06-18): the baked DXR path crashed the dev PC on EVERY scene open (GPU hang / TDR /
+    // reset — even a headless `bal render` subprocess took the GPU down). Until the crash root cause is found
+    // OFFLINE, GI defaults to Off so opening the editor NEVER touches the DXR bake. The baked system is intact,
+    // just opt-in: BALLISTIC_DX12_RT_GI=1 (+ the GI volume) re-enables it for a deliberate, supervised test. This
+    // is NOT abandoning baked — it's making the editor safe to open while the hang is diagnosed without the GPU.
+    public bool SsgiEnabled { get; set; } = false;
+    public GiMode GiMode { get; set; } = GiMode.Off;   // crash safety — baked is opt-in until the TDR is fixed
 
     // Emissive-as-GI source: emissive surfaces act as area lights in the indirect bounce (the DDGI/
     // RTXGI/Lumen technique — at each GI ray hit the shader adds the hit's self-emission). DEFAULT true
@@ -192,7 +193,11 @@ public sealed class PostProcessSettings {
 
     // Probe cascade count for baked GI: 1 = single dense grid, 2 = near dense + far sparse. BAKED-ONLY DEFAULT
     // (2026-06-18): 2 (best look, free at runtime once frozen). BALLISTIC_DX12_DDGI_CASCADES force-overrides.
-    public int DdgiCascades { get; set; } = 2;
+    // CASCADE DEFAULT 1 (2026-06-18): the 2-cascade far grid (its own bindless-tail block + separate per-frame
+    // trace) is the prime suspect for the GPU hang / TDR seen when baked became the always-on default — it is the
+    // newest, least-tested DXR path and runs every scene open at cascade=2. Dropped to 1 (single dense grid,
+    // headless-GBV-proven) until the far cascade is re-validated. BALLISTIC_DX12_DDGI_CASCADES=2 re-enables it.
+    public int DdgiCascades { get; set; } = 1;
 
     // Screen-space radiance probes: the near/mid-field final gather. This is a REALTIME per-frame screen trace —
     // BAKED-ONLY DEFAULT (2026-06-18): FALSE, so the baked path uses the pure frozen-field gather (no realtime
@@ -270,8 +275,8 @@ public sealed class PostProcessSettings {
     // so paused captures stay byte-identical).
     public bool DustEnabled { get; set; }                             // master toggle for floating dust motes
     public float DustIntensity { get; set; } = 0.5f;                  // overall dust glow multiplier
-    public float DustSize { get; set; } = 0.5f;                       // noise frequency: lower = larger/sparser motes, higher = fine/dense
-    public Vector3 DustDrift { get; set; } = new(0.05f, 0.02f, 0f);   // world-space drift velocity (m/s) of the dust field
+    public float DustSize { get; set; } = 0.5f;                       // noise frequency scale: lower = larger/sparser motes, higher = fine/dense
+    public Vector3 DustDrift { get; set; } = new(0.15f, 0.08f, 0.05f);// world-space drift velocity (m/s) of the dust field (gentle air current)
     public float DustSparkle { get; set; } = 1f;                      // how strongly motes catch the sun (twinkle gain)
 
     // Aerial perspective: atmospheric distance haze on opaque geometry, baked from a Hillaire froxel

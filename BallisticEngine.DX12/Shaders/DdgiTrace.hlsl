@@ -296,7 +296,9 @@ float3 ShadeHit(RayQuery<RAY_FLAG_FORCE_OPAQUE> q, float3 rayDir, out bool backf
     // frame, but the per-channel min avoids even a one-frame blotch on an extreme single-channel bounce.
     float luma = dot(radiance, float3(0.2126, 0.7152, 0.0722));
     if (luma > 1.0e5) radiance *= 1.0e5 / max(luma, 1e-4);
-    return Sanitize(min(radiance, 60000.0.xxx));
+    // CLAMP NEGATIVE: radiance is physically >= 0. A negative store (seen as atlas min=-20.9) feeds the
+    // multi-bounce feedback loop and the gather as garbage. max(...,0) before the fp16 cap kills it at the source.
+    return max(Sanitize(min(radiance, 60000.0.xxx)), 0.0.xxx);
 }
 
 [numthreads(64, 1, 1)]
