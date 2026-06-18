@@ -61,7 +61,16 @@ public sealed class Dx12Ddgi : IDisposable {
     // is camera-centered: re-snapped each frame to the camera so coverage follows the view (a single clipmap
     // cascade for now). ProbeSpacing sets the covered volume = spacing * (probes-1) per axis.
     public Vector3 Origin { get; private set; }
-    public Vector3 Spacing { get; private set; } = new(2.0f, 2.0f, 2.0f);   // 2m → ~30x14x30m covered volume
+    // Live spacing default = 2m → ~30x14x30m covered volume. In BAKED mode we tighten to 1.2m: with no per-frame
+    // ray budget to respect, denser probes (the most visible quality lever — finer indirect detail, less trilinear
+    // blur between probes) are free at runtime. Covered volume shrinks to ~18x8x18m, which is fine for an interior;
+    // a future cascade extends the far field. BALLISTIC_DX12_DDGI_SPACING overrides (metres).
+    public Vector3 Spacing { get; private set; } = new(2.0f, 2.0f, 2.0f);
+    float BakedSpacing {
+        get => float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_SPACING"),
+            System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float s) && s > 0.1f
+            ? s : 1.2f;
+    }
 
     public bool Allocated => irradianceTex != null;
 
@@ -112,6 +121,12 @@ public sealed class Dx12Ddgi : IDisposable {
             if (warmupEnv == null) {
                 string raw = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_WARMUP");
                 if (int.TryParse(raw, out int n)) warmupEnv = Math.Max(0, n);
+                // BAKED mode: converge DEEPER than the capture default (128 vs 64). The whole point of baking is we
+                // pay this once and then run free — so we spend the converge budget on QUALITY. With hysteresis
+                // 0.97 the field needs ~33 samples to settle; 128 over-converges so even slow-fading bounce + the
+                // multi-bounce feedback (each iteration reads the last field) fully resolves → a cleaner, deeper
+                // indirect than the live round-robin ever reaches. (This is the "sample quality must go up" ask.)
+                else if (BakedMode) warmupEnv = 128;
                 // Default ON only for a PAUSED capture (the deterministic-diff use case — static camera, so the
                 // converged-then-frozen field is sampled at the right probe positions). A moving/play screenshot
                 // gets live round-robin updates instead (no point converging a field the camera will leave).
@@ -122,6 +137,31 @@ public sealed class Dx12Ddgi : IDisposable {
         }
     }
     bool warmedUp;   // the one-shot warm-up has run (guards the first DispatchDdgi only)
+
+    // --- BAKED (frozen) MODE: the user-facing "compute GI once on scene open, then freeze" mode. This is the
+    // SAME machinery as the capture-path warm-up (TryWarmUp → converge full-grid → then skip the per-frame
+    // update), but driven explicitly in PLAY/EDITOR instead of being locked to a paused screenshot. Why this is
+    // the right answer to "performanssız + ghosting": once frozen the per-frame ray + EMA temporal cost is ZERO
+    // (the field is a static SRV the gather samples), so ghosting is structurally impossible and the GI is ~free.
+    // The trade: a frozen field doesn't follow moving lights / a sun cycle — Rebake() re-converges on demand
+    // (scene load, light change, or a manual editor button). BALLISTIC_DX12_DDGI_BAKED=1 forces it on headless.
+    bool bakeModeEnv, bakeModeEnvRead;
+    public bool BakedMode {
+        get {
+            if (!bakeModeEnvRead) {
+                bakeModeEnvRead = true;
+                bakeModeEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_BAKED") == "1";
+            }
+            return bakeModeEnv || bakedModeRequested;
+        }
+    }
+    bool bakedModeRequested;            // set by the volume/editor bridge (BakedMode on without the env door)
+    public void SetBakedMode(bool on) { if (on != bakedModeRequested) { bakedModeRequested = on; if (on) Rebake(); } }
+
+    // Force a fresh converge: clears the warmed-up latch so the NEXT DispatchDdgi re-runs the full-grid warm-up
+    // (TryWarmUp). Call on scene open, a light/sun change, or the editor "Rebake GI" button. Cheap to call — the
+    // actual cost is the one-shot converge on the next frame, not here.
+    public void Rebake() { warmedUp = false; }
 
     // Emissive-as-GI-source: when set, the trace's ShadeHit adds the hit surface's self-emission L_e so
     // emissive surfaces act as area lights in the probe field (rides Params2.w → DdgiTrace emissiveEnable).
@@ -192,7 +232,16 @@ public sealed class Dx12Ddgi : IDisposable {
 
     // Camera-centered snap: place the grid so the camera sits near its centre, snapped to whole probe
     // spacings (so probes don't swim under sub-cell camera motion → temporal stability). Call per frame.
+    bool bakedSpacingApplied;
     public void Update(Vector3 cameraPos) {
+        // BAKED mode (CHUNK 0 stopgap, single dense grid — superseded by the cascade in ch3): tighten the probe
+        // spacing ONCE so denser probes give finer indirect. Applied once (a one-shot, not per-frame) so it never
+        // thrashes the snap, and only in BakedMode so the live path is byte-identical.
+        if (BakedMode && !bakedSpacingApplied) {
+            bakedSpacingApplied = true;
+            float s = BakedSpacing;
+            Spacing = new Vector3(s, s, s);
+        }
         Vector3 half = new(
             Spacing.X * (ProbesX - 1) * 0.5f,
             Spacing.Y * (ProbesY - 1) * 0.5f,
