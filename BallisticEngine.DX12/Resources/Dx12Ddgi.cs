@@ -197,6 +197,23 @@ public sealed class Dx12Ddgi : IDisposable {
     }
     bool bakeProbeStateCleared;          // the GPU ProbeBakeState counters have been zeroed for this bake run
 
+    // CHUNK5 AUTO RE-BAKE on a LIGHT change: the frozen field is lit for ONE sun/light state — when the sun moves
+    // (day cycle) or its colour/intensity changes beyond a small threshold, the baked GI is wrong, so re-converge.
+    // Called per frame by the renderer with the sun direction + colour; cheap CPU compare, no per-draw reflection.
+    // Only re-bakes after a freeze (mid-bake light changes are absorbed by the ongoing converge). User choice.
+    Vector3 lastSunDir, lastSunColor; bool haveSun;
+    public void NotifyLight(Vector3 sunDir, Vector3 sunColor) {
+        if (!BakedMode) return;
+        if (haveSun && bakeFrozen) {
+            // Direction: re-bake past ~3° of sun rotation; colour/intensity: past ~5% relative change.
+            bool dirChanged = Vector3.Dot(Vector3.Normalize(sunDir + new Vector3(1e-6f)),
+                                          Vector3.Normalize(lastSunDir + new Vector3(1e-6f))) < 0.9986f;   // cos 3°
+            bool colChanged = (sunColor - lastSunColor).Length() > 0.05f * (lastSunColor.Length() + 1e-3f);
+            if (dirChanged || colChanged) Rebake();
+        }
+        lastSunDir = sunDir; lastSunColor = sunColor; haveSun = true;
+    }
+
     // Emissive-as-GI-source: when set, the trace's ShadeHit adds the hit surface's self-emission L_e so
     // emissive surfaces act as area lights in the probe field (rides Params2.w → DdgiTrace emissiveEnable).
     // Set by the renderer from BALLISTIC_DX12_GI_EMISSIVE (default ON). Default true so a missing setter
@@ -328,6 +345,16 @@ public sealed class Dx12Ddgi : IDisposable {
         if (moved < 0.02f) staticFrames++;
         else { staticFrames = 0; jitterSeed = frameCounter; }   // moving → keep advancing the seed with the frame
 
+        // CHUNK5 AUTO RE-BAKE on a LARGE camera move: once frozen, the field follows the camera (Origin snaps) but
+        // its CONTENT is stale — walk far enough that the camera leaves the volume the bake converged for and the GI
+        // is wrong. When the camera moves more than ~40% of the grid half-extent from where the bake last froze,
+        // restart the progressive bake (near-first again). Only fires after a freeze + past the move threshold, so a
+        // slow pan inside the volume never trips it (no thrash). User choice: auto on large move / light change.
+        if (BakedMode && bakeFrozen) {
+            float halfExtent = Spacing.X * (ProbesX - 1) * 0.5f;
+            if ((cameraPos - bakeFrozenCamPos).Length() > halfExtent * 0.4f) Rebake();
+        }
+
         // CHUNK 1 progressive bake wave: capture the camera for the GPU band test, and ripple the open-band
         // frontier outward (one band every BandFrames frames) until the whole grid is reachable. When the bake
         // has run long enough for the furthest band to converge, latch bakeFrozen → the renderer stops tracing.
@@ -335,9 +362,10 @@ public sealed class Dx12Ddgi : IDisposable {
             bakeCamPos = cameraPos;
             bakeFrameCounter++;
             if (++bakeWaveFrames >= BandFrames) { bakeWaveFrames = 0; if (bakeWave < MaxBand) bakeWave++; }
-            if (bakeFrameCounter >= BakeCompleteFrameEstimate) bakeFrozen = true;
+            if (bakeFrameCounter >= BakeCompleteFrameEstimate) { bakeFrozen = true; bakeFrozenCamPos = cameraPos; }
         }
     }
+    Vector3 bakeFrozenCamPos;   // CHUNK5: camera pos when the bake last froze — re-bake when the camera leaves it
 
     // Params1 = (maxRayDist, normalBias, feedbackEnable, intensity). feedbackEnable>0.5 → the trace reads
     // last frame's irradiance FIELD at each hit (P2.3 multi-bounce); 0 → flat IBL-cube ambient (1-bounce).

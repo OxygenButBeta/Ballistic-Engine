@@ -62,6 +62,12 @@ public static class GiDebugGrid {
     public static bool ProbeColorsRequested;
     public static void RequestProbeColors() => ProbeColorsRequested = true;
 
+    // CHUNK5 manual "Rebake GI" button: the editor/remote sets this; the DX12 DDGI pass consumes it once per
+    // frame and calls Rebake() on both cascades (re-runs the progressive bake near-first). A one-shot flag — the
+    // renderer clears it after acting. Cross-thread plain bool is fine (set rarely, read once/frame).
+    public static bool RebakeRequested;
+    public static void RequestRebake() => RebakeRequested = true;
+
     // Called by the DX12 DDGI readback. `colors` is indexed by the SAME probe flattening as ProbePosition's
     // (pz*ProbesY + py)*ProbesX + px order Dx12Ddgi uses. Copies in (the gizmo reads on the main thread).
     public static void PublishProbeColors(System.ReadOnlySpan<Vector3> colors) {

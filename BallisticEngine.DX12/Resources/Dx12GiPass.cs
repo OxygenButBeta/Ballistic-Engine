@@ -583,7 +583,11 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
             if (ctx.Dxr.Ddgi == null) ctx.Dxr.Ddgi = new Dx12Ddgi(dev);
             var ddgi = ctx.Dxr.Ddgi;
             ddgi.Build();
+            // CHUNK5 manual "Rebake GI" button (editor/remote): consume the one-shot request before Update so the
+            // wave restarts this frame. Applies to both cascades.
+            if (GiDebugGrid.RebakeRequested) { ddgi.Rebake(); ddgiFar?.Rebake(); GiDebugGrid.RebakeRequested = false; }
             ddgi.Update(camPos);
+            ddgi.NotifyLight(lightDir, lightColor);   // CHUNK5 auto re-bake on sun move / colour change
             // CHUNK3: bring up the FAR cascade when cascade=2. Wider spacing (3x near) so it covers a far larger
             // volume at lower density; the near cascade keeps the detail. Only meaningful in BAKED mode (the
             // cascade is a coverage tool for the frozen field); the live path runs near only.
@@ -593,6 +597,7 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
                 ddgiFar.SetBakedMode(true);
                 ddgiFar.Build();
                 ddgiFar.Update(camPos);
+                ddgiFar.NotifyLight(lightDir, lightColor);   // CHUNK5 far cascade re-bakes on the same light change
             }
             if (!ddgiLogged)
             {
