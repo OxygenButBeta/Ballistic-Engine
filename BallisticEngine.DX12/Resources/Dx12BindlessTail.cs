@@ -44,6 +44,10 @@ internal static class Dx12BindlessTail
     const int ScreenProbeReserved = 4;
     const int DdgiReserved = 4;
     const int RtGiReserved = 8;
+    // CHUNK3: the FAR DDGI cascade needs its OWN trace descriptor block (it can't share the near DDGI slots —
+    // both trace in the same frame). 4 slots like near DDGI (t0 TLAS, t1 irr cube, t2 prev-irr, t3 prev-depth).
+    // Placed BELOW RtRefl so the four historical bases above stay byte-identical (the asserts below still hold).
+    const int DdgiFarReserved = 4;
 
     // Per-block USED slot counts (descriptors each pass actually writes; asserted <= reserved).
     //   RtRefl   : t0 TLAS, t1 depth, t2 normal, t3 material, t4 irr cube, t5 prefilter, t6 DDGI atlas, u0 ssr (8)
@@ -56,7 +60,7 @@ internal static class Dx12BindlessTail
     public const int RtGiUsed = 6;
 
     // Total tail size (sum of reserved blocks) — derived, never hand-written.
-    const int TailReserved = RtReflReserved + ScreenProbeReserved + DdgiReserved + RtGiReserved;
+    const int TailReserved = RtReflReserved + ScreenProbeReserved + DdgiReserved + RtGiReserved + DdgiFarReserved;
 
     // Bases derived by cumulative reservation from the TOP of the heap. RtGi sits highest (its reserved block
     // ends exactly at the cap); each lower block subtracts the blocks above it. Pure arithmetic → no overlap is
@@ -65,12 +69,14 @@ internal static class Dx12BindlessTail
     public const int DdgiTableBase = RtGiTableBase - DdgiReserved;                                   // 16372
     public const int ScreenProbeTableBase = DdgiTableBase - ScreenProbeReserved;                     // 16368
     public const int RtReflTableBase = ScreenProbeTableBase - RtReflReserved;                        // 16352
+    // CHUNK3 FAR DDGI cascade trace block — below RtRefl (keeps the four historical bases above unchanged).
+    public const int DdgiFarTableBase = RtReflTableBase - DdgiFarReserved;                            // 16348
 
     // The lowest tail index — the material/geometry head allocator must never bump up to here. The bindless heap
     // throws (DETERMINISTIC, see Dx12DescriptorHeap.Allocate) if materials exhaust capacity, so a head/tail
     // collision surfaces as a localized throw, not a silent GPU descriptor aliasing hang. MaxMaterials*6 + the
     // Dx12RtGeometry per-mesh SRVs stay far below this in practice.
-    public const int TailStart = RtReflTableBase;                                                    // 16352
+    public const int TailStart = DdgiFarTableBase;                                                    // 16348
 
     // === COMPILE-TIME asserts (C# has no static_assert; this is the closest equivalent — a `const` boolean fed
     // into a fixed-size buffer whose size is 0 when the assert holds and -1 when it fails, which is a HARD

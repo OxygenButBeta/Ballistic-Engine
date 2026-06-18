@@ -155,7 +155,22 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
     //   ScreenProbe: 3 used (TLAS @ +0, irr cube +1, DDGI atlas +2).
     const int RtGiTableBase = Dx12BindlessTail.RtGiTableBase;
     const int DdgiTableBase = Dx12BindlessTail.DdgiTableBase;
+    const int DdgiFarTableBase = Dx12BindlessTail.DdgiFarTableBase;   // CHUNK3 far cascade trace block
     const int ScreenProbeTableBase = Dx12BindlessTail.ScreenProbeTableBase;
+
+    // CHUNK3: the FAR (sparse, wide) cascade — its own Dx12Ddgi, traced + blended like near each frame, sampled by
+    // the gather as the fallback where near has no coverage. Created only when cascade=2 (BALLISTIC_DX12_DDGI_CASCADES
+    // >= 2). Reflections keep reading the NEAR cascade (ctx.Dxr.Ddgi); far augments diffuse coverage only.
+    Dx12Ddgi ddgiFar;
+    int? cascadeCountEnv;
+    int CascadeCount {
+        get {
+            if (cascadeCountEnv == null)
+                cascadeCountEnv = int.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_CASCADES"),
+                    out int n) && n >= 1 ? Math.Min(n, 2) : 1;
+            return cascadeCountEnv.Value;
+        }
+    }
 
     // BuildSsgi + the SSGI/RT-GI rootsig/PSO/CB/heap construction moved VERBATIM into the ctor (re-rooted onto
     // dev). The SSGI PSOs/targets are built here; the RT-GI pipeline (rtGi*) stays LAZY (EnsureRtGi on first
@@ -569,6 +584,16 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
             var ddgi = ctx.Dxr.Ddgi;
             ddgi.Build();
             ddgi.Update(camPos);
+            // CHUNK3: bring up the FAR cascade when cascade=2. Wider spacing (3x near) so it covers a far larger
+            // volume at lower density; the near cascade keeps the detail. Only meaningful in BAKED mode (the
+            // cascade is a coverage tool for the frozen field); the live path runs near only.
+            if (CascadeCount >= 2 && ddgi.BakedMode)
+            {
+                if (ddgiFar == null) { ddgiFar = new Dx12Ddgi(dev); ddgiFar.CascadeSpacingMultiplier = 3f; }
+                ddgiFar.SetBakedMode(true);
+                ddgiFar.Build();
+                ddgiFar.Update(camPos);
+            }
             if (!ddgiLogged)
             {
                 ddgiLogged = true;
@@ -695,6 +720,44 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
                 GiDebugGrid.ProbeColorsRequested = false;
             }
 
+            // --- CHUNK3 FAR CASCADE trace+blend: same pattern as near, into its OWN bindless-tail block
+            // (DdgiFarTableBase) so the two cascades don't clobber each other's trace descriptors. Wider grid,
+            // progressively baked then frozen exactly like near. Only when cascade=2 + baked. ---
+            if (ddgiFar != null && ddgiFar.Allocated)
+            {
+                sceneAS.CreateTlasSrv(bh.Cpu(DdgiFarTableBase + 0));   // t0 TLAS
+                dev.Device.CopyDescriptorsSimple(1, bh.Cpu(DdgiFarTableBase + 1), ibl.IrradianceSrv, ddgiHeapType); // t3 irr cube
+                dev.Device.CreateShaderResourceView(ddgiFar.IrradianceTex, new ShaderResourceViewDescription
+                {
+                    Format = Format.R16G16B16A16_Float,
+                    ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
+                    Shader4ComponentMapping = ShaderComponentMapping.Default,
+                    Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
+                }, bh.Cpu(DdgiFarTableBase + 2));   // t4 prev irr atlas (far)
+                dev.Device.CreateShaderResourceView(ddgiFar.DepthTex, new ShaderResourceViewDescription
+                {
+                    Format = Format.R16G16_Float,
+                    ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
+                    Shader4ComponentMapping = ShaderComponentMapping.Default,
+                    Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
+                }, bh.Cpu(DdgiFarTableBase + 3));   // t11 prev depth atlas (far leak gate)
+
+                ddgiFar.EmissiveEnabled = GiEmissiveEnabled(ctx);
+                float farHyst = ddgiFar.IsStatic ? 0.985f : 0.97f;
+                void RunFarUpdate(bool full) => dev.ExecuteSyncImmediate(cl =>
+                {
+                    cl.SetDescriptorHeaps(bh.Heap);
+                    ddgiFar.DispatchDdgi(cl, bh, bh.Gpu(DdgiFarTableBase),
+                        rtGiSunCb.GPUVirtualAddress, gpuDriven.MaterialsGpuAddress,
+                        rtGeometry.InstancesGpuAddress, clusteredLights.LightBufGpuAddress,
+                        hysteresis: farHyst, intensity: MathF.Max(ctx.PostFX.SsgiIntensity, 0f),
+                        feedback: true, fullUpdate: full);
+                });
+                ddgiFar.TryWarmUp(() => RunFarUpdate(full: true));
+                bool farFrozen = ddgiFar.WarmupEnabled || (ddgiFar.BakedMode && ddgiFar.IsBakeComplete);
+                if (!farFrozen) RunFarUpdate(full: false);
+            }
+
             // The compute gather/place reads depth as SRV t0 → NON_PIXEL state (shared by both GI sources below).
             gbuffer.DepthToNonPixelShaderResource();
 
@@ -716,7 +779,7 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
             {
                 ddgi.DispatchGather(cl, gbuffer.DepthSrvCpu, gbuffer.ColorSrvCpu(1), gbuffer.ColorSrvCpu(0),
                     ssgiTarget.RenderTarget, ssgiTarget.Width, ssgiTarget.Height,
-                    Matrix4x4.Transpose(invVP), SsgiPreExposure());
+                    Matrix4x4.Transpose(invVP), SsgiPreExposure(), ddgiFar);   // CHUNK3 far cascade fallback
             });
             if (gatherSw != null)
             {
@@ -1044,5 +1107,6 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
         rtGiSunCb?.Dispose();
         rtGiHeap?.Dispose();
         screenProbe?.Dispose(); // ddgi lives in the shared holder (ctx.Dxr) — disposed there.
+        ddgiFar?.Dispose(); ddgiFar = null;   // CHUNK3 far cascade is owned here (not in ctx.Dxr)
     }
 }
