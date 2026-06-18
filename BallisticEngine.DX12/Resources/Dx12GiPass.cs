@@ -268,7 +268,8 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
             Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProj),
             ViewMatrix = Matrix4x4.Transpose(view),
             Params0 = new Vector4(pf.SsgiRayLength, pf.SsgiFalloff, pf.SsgiThickness, 0f),
-            Params1 = new Vector4(MathF.Max(pf.SsgiBounceBoost, 0f), Math.Clamp(pf.SsgiRayCount, 1, 8), fi, 0f),
+            Params1 = new Vector4(MathF.Max(pf.SsgiBounceBoost, 0f), Math.Clamp(pf.SsgiRayCount, 1, 8), fi,
+                Math.Clamp(pf.SsgiTemporalClamp, 1f, 4f)),   // w = temporal neighbourhood-clamp inflation (live dial)
             Params2 = new Vector4(1f / ssgiTarget.Width, 1f / ssgiTarget.Height, preExp, invPreExp),
             Combine0 = new Vector4(pf.SsgiIntensity, Math.Clamp(pf.SsgiLook, 0f, 1f),
                 MathF.Max(pf.SsgiSaturation, 0f), MathF.Max(pf.SsgiOcclusionPower, 0f)),
@@ -276,7 +277,8 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
             // HasHistory=0 in deterministic capture → PSTemporal returns the current GI directly (the SSGI/DDGI
             // temporal EMA is frame-count-dependent → would defeat byte-diffable captures).
             Params3 = new Vector4((ssgiHistValid && !ctx.DeterministicCapture) ? 1f : 0f,
-                MathF.Max(pf.SsgiMaxHistory, 1f), GiIsolateOn(ctx) ? 1f : 0f, 0f),
+                MathF.Max(pf.SsgiMaxHistory, 1f), GiIsolateOn(ctx) ? 1f : 0f,
+                MathF.Max(pf.SsgiGhostingReject, 0f)),   // w = ghosting-reject motion slope (live dial)
         };
         return fi;
     }

@@ -114,6 +114,19 @@ public sealed class GlobalIllumination : VolumeComponent {
     [Tooltip("Temporal frames to accumulate. Higher = smoother but laggier.")]
     public readonly ClampedFloatParameter maxHistory = new(24f, 1f, 64f);
 
+    [FoldoutGroup("Advanced")]
+    [Tooltip("Ghosting reject: how aggressively a moving camera flushes the temporal trail. 0 = never flush " +
+             "(maximum smoothing, but a fast pan smears/ghosts); higher = a pan collapses the accumulation faster " +
+             "(kills ghosting, but more per-frame grain shows while moving). Tune live against your scene: raise " +
+             "it until ghosting is gone, then back off until grain-while-moving is acceptable.")]
+    public readonly ClampedFloatParameter ghostingReject = new(0.06f, 0f, 0.5f);
+
+    [FoldoutGroup("Advanced")]
+    [Tooltip("Temporal clamp tightness: how far accumulated history may stray from the current local bounce " +
+             "before it's clamped. Low = tight (less ghosting, slightly more noise); high = loose (smoother, but " +
+             "stale light lingers as ghosting). The companion to Ghosting Reject for the static/slow case.")]
+    public readonly ClampedFloatParameter temporalClamp = new(1.6f, 1f, 4f);
+
     [Header("Advanced — Look")]
     [FoldoutGroup("Advanced")]
     [Tooltip("Cinematic look strength on the local bounce (saturation + warmth).")]

@@ -187,6 +187,8 @@ public sealed class PostProcessSettings {
     // Rays per pixel: with temporal accumulation + the denoiser, even 2-4 stays clean.
     public int SsgiRayCount { get; set; } = 4;
     public float SsgiMaxHistory { get; set; } = 24f;  // temporal frames to accumulate (smoother/laggier)
+    public float SsgiGhostingReject { get; set; } = 0.06f;  // how fast camera motion flushes the temporal trail (0=never, higher=aggressive)
+    public float SsgiTemporalClamp { get; set; } = 1.6f;    // neighbourhood clamp box inflation (low=tight/less-ghost, high=loose/smoother)
 
     // -- Ray shape --
     public float SsgiRayLength { get; set; } = 12f;   // metres; near vs far bounce reach

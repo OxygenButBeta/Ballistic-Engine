@@ -269,7 +269,7 @@ public sealed class Dx12Device : IDisposable {
             dred.GetPageFaultAllocationOutput(out DredPageFaultOutput pf);
             return $"PageFaultVA=0x{pf.PageFaultVA:X} " +
                    "(VA!=0 => GPU touched freed/invalid memory: use-after-free or bad descriptor; " +
-                   "auto-breadcrumbs are in the Watson dump / debugger)";
+                   "VA==0 => bad bind / GPU HANG, not a memory fault)";
         }
         catch (Exception e) { return "DRED read failed: " + e.Message; }
     }
@@ -394,6 +394,14 @@ public sealed class Dx12Device : IDisposable {
         if (target == 0 || frameFence.CompletedValue >= target) return;
         frameFence.SetEventOnCompletion(target, frameFenceEvent.SafeWaitHandle.DangerousGetHandle());
         frameFenceEvent.WaitOne();
+        if (dredTrap) {
+            var rr = Device.DeviceRemovedReason;
+            if (!rr.Success) {
+                Console.Error.WriteLine($"[DRED-TRAP] DEVICE REMOVED after frame submit (WaitFrameFence): reason={rr} DRED={DrainDredReport()}");
+                if (HasInfoQueue) Console.Error.WriteLine($"[DRED-TRAP] debug-msgs:\n{DrainDebugMessages()}");
+                Environment.Exit(7);
+            }
+        }
     }
 
     // The latest submitted frame's completion target — Flush()/swapchain present wait on this so an overlapped
@@ -507,7 +515,19 @@ public sealed class Dx12Device : IDisposable {
             fence.SetEventOnCompletion(target, fenceEvent.SafeWaitHandle.DangerousGetHandle());
             fenceEvent.WaitOne();
         }
+        // TEMP DIAG (BALLISTIC_DX12_DRED_TRAP=1): catch a device-removal at the EXACT submit that caused it —
+        // check the removed reason right after every GPU wait and dump DRED breadcrumbs immediately, before the
+        // next unrelated D3D12 call surfaces it as E_INVALIDARG/DEVICE_REMOVED far from the real failing op.
+        if (dredTrap) {
+            var rr = Device.DeviceRemovedReason;
+            if (!rr.Success) {
+                Console.Error.WriteLine($"[DRED-TRAP] DEVICE REMOVED right after a GPU submit: reason={rr} DRED={DrainDredReport()}");
+                if (HasInfoQueue) Console.Error.WriteLine($"[DRED-TRAP] debug-msgs:\n{DrainDebugMessages()}");
+                Environment.Exit(7);
+            }
+        }
     }
+    readonly bool dredTrap = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DRED_TRAP") == "1";
 
     // Create a DEFAULT-heap buffer of `byteSize` seeded with `data`, via a temporary upload heap +
     // CopyBufferRegion (the GPU-local path the real renderer wants — vs the cube test's upload-heap

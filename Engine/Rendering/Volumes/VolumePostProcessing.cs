@@ -93,6 +93,8 @@ public static class VolumePostProcessing {
             fx.SsgiOcclusionPower = gi.occlusionPower.Value;
             fx.SsgiRayCount = gi.rayCount.Value;
             fx.SsgiMaxHistory = gi.maxHistory.Value;
+            fx.SsgiGhostingReject = gi.ghostingReject.Value;
+            fx.SsgiTemporalClamp = gi.temporalClamp.Value;
             fx.SsgiLook = gi.look.Value;
             fx.SsgiTint = gi.tint.Value;
             fx.SsgiSaturation = gi.saturation.Value;

@@ -156,7 +156,15 @@ void RayGen() {
 }
 
 [shader("miss")]
-void Miss(inout GiPayload p) { p.Color = 0.0.xxx; }   // sky = no bounce (IBL ambient already counts it)
+void Miss(inout GiPayload p) {
+    // A ray that hits nothing escaped to the SKY — it must carry the sky/IBL radiance in that direction, NOT
+    // zero. Returning 0 here (the old "IBL ambient already counts it" assumption) is why open/sky-lit areas got
+    // NO indirect bounce: with the deferred IBL diffuse now dropped when GI runs (GiDiffuseActive), the sky's
+    // contribution to indirect diffuse comes SOLELY through these missed rays. Sample the irradiance cube along
+    // the ray direction (pre-exposed later by the caller, like the hit path). This is what SSGI already does via
+    // its open-sector sky term — it's the main reason SSGI looked lit and RT-GI looked black.
+    p.Color = Irradiance.SampleLevel(LinearClamp, WorldRayDirection(), 0).rgb;
+}
 
 [shader("closesthit")]
 void ClosestHit(inout GiPayload p, in BuiltInTriangleIntersectionAttributes attr) {

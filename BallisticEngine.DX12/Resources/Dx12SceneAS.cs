@@ -110,7 +110,14 @@ public sealed class Dx12SceneAS : IDisposable {
         ID3D12Resource tlasScratch = AsBuffer(tlasPre.ScratchDataSizeInBytes, ResourceStates.UnorderedAccess);
 
         // 3. Record all builds (BLAS first, UAV barriers, then TLAS) in one submission.
-        dev.ExecuteSync(cl => {
+        // MUST be ExecuteSyncImmediate (submit + WaitForGpu NOW), NOT ExecuteSync: under the pipelined frame
+        // (P0a, default) ExecuteSync only RECORDS into the open frame list and returns without submitting — the
+        // build runs at EndFrame. But the scratch + instance buffers are disposed IMMEDIATELY below, so the
+        // deferred GPU build would read/write FREED memory → invalid AS → GPU HANG (DEVICE_HUNG, PageFaultVA=0,
+        // reproduced on the RX 9070 XT for RT-GI / RT-shadows). Immediate completes the build before we free its
+        // transient inputs. This is a once-per-stamp cost (static scene = first frame only), so the synchronous
+        // flush is fine — the AS must exist before any RT dispatch this frame anyway.
+        dev.ExecuteSyncImmediate(cl => {
             foreach (var b in toBuild) {
                 cl.BuildRaytracingAccelerationStructure(new BuildRaytracingAccelerationStructureDescription {
                     Inputs = b.inputs, DestinationAccelerationStructureData = b.result.GPUVirtualAddress,
