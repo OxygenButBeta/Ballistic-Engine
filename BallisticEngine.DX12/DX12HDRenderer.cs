@@ -109,6 +109,7 @@ public sealed class DX12HDRenderer : HDRenderer
     Dx12TaaPass taaPass;
     Dx12FsrPass fsrPass; // chunk 7: FSR dispatch (Record only); fsr/fsrOutput stay orchestrator-owned
     int taaFrame; // jitter phase counter (shared by TAA + FSR; advanced in the frame tail)
+    int frameCounter; // monotonic frame index, advanced EVERY BeginRender (drives time-animated FX like dust drift)
     Vector2 currentJitter; // this frame's sub-pixel jitter (pixels) — exposed for FSR reuse
 
     // SSR moved VERBATIM to Resources/Dx12ReflectionsPass.cs (chunk 10 — Event=Reflections 600; the SSR
@@ -1692,6 +1693,14 @@ public sealed class DX12HDRenderer : HDRenderer
                       : ssgiEnv == "0" ? GiMode.Off
                       : doors.Minimal ? GiMode.Off
                       : PostFX.GiMode;
+        // ===== MASTER GI KILL SWITCH (2026-06-18, user: "baştan kapat şunu, volume override'ını da disable et,
+        // devre dışı bırak — RT GI hala aktif ve çalışıyor"). The RT-GI/DXR bake path crashed the PC and the user
+        // wants it HARD OFF — not via a default that an env door or a volume can re-enable. Unless EXPLICITLY
+        // opted-in with BALLISTIC_DX12_GI_FORCE=1 (a deliberate, supervised override), GI is forced Off here AFTER
+        // every other resolve, so NOTHING — not PostFX.GiMode, not a GlobalIllumination volume, not
+        // BALLISTIC_DX12_RT_GI=1 — can turn the DXR GI on. This is the off-switch the user asked for. =====
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_FORCE") != "1")
+            giMode = GiMode.Off;
         // REALTIME GI REMOVED (2026-06-18, user: "varolan realtime gi'i kapatalım sadece bu konuştuğumuz [baked]
         // sistem olsun; her frame update vs o sistemi komple kaldır"). The ONLY GI now is the baked-freeze DDGI on
         // the RayTraced path (computed once, frozen, 0 rays/frame). Realtime ScreenSpace SSGI is no longer a GI
@@ -1733,6 +1742,7 @@ public sealed class DX12HDRenderer : HDRenderer
             FrameCbAddress =
                 frameCb.GPUVirtualAddress, // chunk 8: Transparents binds it; chunk 9: Deferred binds it too (b1 FrameConstants CBV)
             Doors = doors, PostFX = PostFX, Stats = RenderStats.Scene,
+            FrameCounter = DeterministicCapture ? 0 : frameCounter, // monotonic; 0 when capturing → byte-identical
             BarriersDerived = barriersPath, // chunk 14 (V3): migrated passes skip their manual head transition when on
             // deterministic flag (grain/exposure reset) + the GTAO pass output the DEFERRED LIGHTING pass samples
             // for the ambient AO term. AoResult is a stable descriptor handle (gtaoA.ColorSrvCpu) — only its
@@ -1814,6 +1824,8 @@ public sealed class DX12HDRenderer : HDRenderer
         // Advance the jitter phase (used by both TAA and FSR) and remember this frame's UNJITTERED view*proj
         // for next frame's motion vectors (independent of TAA, since FSR replaces TAA but still needs motion).
         if (jitterOn) taaFrame++;
+        frameCounter++; // monotonic, every frame — drives dust drift even with TAA/SSGI off
+        if (frameCounter >= 1 << 24) frameCounter = 0; // wrap before float precision degrades (~16.7M frames)
         motionPrevViewProj = viewProjUnjittered;
         motionPrevValid = true;
 

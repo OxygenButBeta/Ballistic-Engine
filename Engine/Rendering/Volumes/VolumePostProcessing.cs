@@ -71,7 +71,13 @@ public static class VolumePostProcessing {
             // ⚠ DEV-ONLY, R1.0-INCOMPLETE: GI is back on the shipping path but RT-GI / emissive-as-GI bounce is
             // still gated on per-triangle MaterialId only present on submesh-range meshes (R1.0 moves it into the
             // RT geometry build). Until R1.0 lands, color-only / whole-mesh content gets NO RT bounce/bleed.
-            bool giOn = gi.enabled.Value;
+            // ===== MASTER GI KILL (2026-06-18, user: "volume override'ını da disable et"). The DXR GI path is
+            // hard-off (it crashed the PC). The volume's GI dropdown must NOT re-enable it: unless explicitly
+            // opted-in (BALLISTIC_DX12_GI_FORCE=1), the volume drives GI Off regardless of its giMode/bakedGi. The
+            // renderer's giMode resolve also force-Offs (belt + suspenders), but killing it here means the volume
+            // override genuinely does nothing — the off-switch the user asked for. =====
+            bool giForce = System.Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_FORCE") == "1";
+            bool giOn = giForce && gi.enabled.Value;
             fx.GiMode = giOn ? gi.giMode.Value : GiMode.Off;
             fx.SsgiEnabled = giOn && gi.giMode.Value != GiMode.Off;
             fx.SsgiIntensity = gi.intensity.Value;
