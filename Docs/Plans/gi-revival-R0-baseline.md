@@ -1154,3 +1154,82 @@ cannot create a GI leak). Sıradaki = R2.5 (VRAM: budget the real cost = BLAS/TL
 the tiny DDGI/probe buffers; tie to preset; per-preset reference-GPU-extrapolated total GI ms + AS VRAM on all
 5 scenes vs re-measured post-R1.0/R2.3 X; ★ R2.3 RESOLVED the RT-refl re-run flag = ~2.07ms RX9070XT frozen
 constant, R2.5 uses it directly).**
+
+---
+
+## R2.5 — VRAM: budget the real cost (BLAS/TLAS) + per-preset GI ms (2026-06-18, HEAD `bc9b0d63` + 8-file post-FX WIP)
+> PROVISIONAL POLICY applied — re-grepped (NOT memory/handoff/plan-author) **every** load-bearing input against
+> the working tree at first use: the AS-build path (`Dx12SceneAS.cs`), the two `GridVramBytes` readouts
+> (`Dx12Ddgi.cs:223-231` / `Dx12ScreenProbe.cs:108-115`), `Dx12RtGeometry.cs` per-instance buffers, the DDGI
+> grid dims (`Dx12Ddgi.cs:25/64/81`), the R0.4 modeled-2060 cost table (`gi-revival-R0-baseline.md` §C/D), the
+> RT-refl ~2.07ms frozen constant (R2.3 §(3)), and X-unchanged-post-R1.0 (R1.0 RE-VALIDATE §(4)). **NO shipping
+> code change** — measure + document. Raw: `e:/tmp/gi-r25/`.
+
+### (1) ★ Re-grep FIRST (the R2.x lesson: FOUR in a row already existed). Result: PARTIAL — the tiny buffers are summed; the DOMINANT AS term is NOT.
+- **DDGI `GridVramBytes` ALREADY EXISTS + summed** (`Dx12Ddgi.cs:223-231`): irr-atlas + dep-atlas + rayData + probeState. Re-read, not re-derived. Logged at `Dx12GiPass.cs:579`.
+- **ScreenProbe `GridVramBytes` ALREADY EXISTS + summed** (`Dx12ScreenProbe.cs:108-115`): atlas + pos + ray. Logged at `Dx12GiPass.cs:784`.
+- **‼ The BLAS/TLAS acceleration-structure size is NOT exposed anywhere.** `Dx12SceneAS.Build()` calls `device5.GetRaytracingAccelerationStructurePrebuildInfo` for each BLAS (`:81`, `pre.ResultDataMaxSizeInBytes` + `pre.ScratchDataSizeInBytes`) and the TLAS (`:108`) — but the sizes are **consumed inline to allocate the buffer and DISCARDED** (no field, no sum, no log; grep `Log|Console|VRAM|size` over `Dx12SceneAS.cs` = 0 hits). This is the **genuinely-missing R2.5 piece** — and per the plan it is the **DOMINANT GI VRAM term**, not the tiny probe buffers. (Contrast R2.1-R2.4 which were "already exist, measure+document"; R2.5's measured object did NOT pre-exist as a readout.)
+- **Decision (GPU-SAFE, no code):** the DoD = "AS VRAM on all 5 scenes." Two ways are GPU-safe: (a) a debug-only CPU-side sum of the prebuild-info sizes (a CPU query — NO `DispatchRays`, NO device-remove risk), or (b) pure **static analysis from triangle counts**. Per the handoff's explicit preference ("Prefer NO code if static-analysis + GridVramBytes suffices") and the GPU-hang-safety mandate, **static analysis was chosen** — adding even an inert debug readout risks perturbing the byte-identical render seat, and the fixtures are trivial known geometry, so static analysis is exact-enough + zero-risk. The prebuild-info path (a) stays the documented closure if a precise driver-reported number is ever needed (it is the SAME CPU query `Dx12SceneAS` already runs).
+
+### (2) AS VRAM (the dominant term) — static analysis from tri counts (GPU-safe, no capture)
+Re-measured geometry from the OBJ sources (PROVISIONAL — counted `^v`/`^f`, checked face arity):
+**Plane = 2 tris, Cube = 12 tris, Sphere = 1536 tris, CornellBox = 86 tris** (CornellBox.obj = 43 quads → 86 tris after import; confirmed live: ThinWall headless `tris=36` == 3 Cube × 12). `Dx12SceneAS` builds **one BLAS per UNIQUE mesh** (cached `blasByMesh`, never rebuilt) + **one TLAS instance per renderer**.
+
+AS-result model (conservative, PreferFastTrace triangle geometry; driver-specific actual = the `GetRaytracingAccelerationStructurePrebuildInfo` query `Dx12SceneAS` already calls): persistent **BLAS result ≈ max(2 KB, 128 B/tri)** per unique mesh + **TLAS result ≈ max(2 KB, 64 B/instance)**. Build **scratch** (`:83/:110`) is **transient** — freed immediately after build (`:128-129`) → NOT resident VRAM (note it ~ same magnitude during the one-time build only). The instance-descriptor upload buffer (`:90-101`) is also transient (`:130`).
+
+| Scene | unique meshes (BLAS) | instances (TLAS) | distinct geom tris | **AS resident** |
+|---|---|---|---|---|
+| ColorOnly | 2 (Cube, Plane) | 3 | 14 | **~6 KB** |
+| MovingLight | 1 (Plane) | 3 | 2 | **~4 KB** |
+| MultiLightInterior | 2 (Plane, Sphere) | 6 | 1538 | **~196 KB** |
+| Outdoor | 3 (Cube, Plane, Sphere) | 4 | 1550 | **~198 KB** |
+| ThinWall | 1 (Cube) | 3 | 12 | **~4 KB** |
+| CornellBox | 1 | 1 | 86 | **~13 KB** |
+
+**Heavy-content denominator (Bistro present this seat per R0.3, single whole-mesh renderer → 1 BLAS):** BistroInterior ~1M tris → BLAS **~122 MB**; BistroExterior ~2.9M tris → BLAS **~354 MB**; SunTemple ~606k tris → BLAS **~74 MB** (+ TLAS ~2 KB each). **★ This is the real AS-VRAM story:** on the fixtures the AS is negligible (KB); on real content it is **hundreds of MB and scales linearly with scene tri-count**, built **ONCE and cached by the geometry stamp** (`Dx12SceneAS.cs:25/52-54` — static scene = one build, no per-frame cost).
+
+### (3) The tiny preset-INDEPENDENT buffers (re-read, not re-derived)
+- **DDGI `GridVramBytes` = 8.06 MB FIXED** (irr-atlas 2048×64 RGBA16F = 1.0 MB + dep-atlas 4608×144 RG16F = 2.53 MB + rayData 4.5 MB + probeState 32 KB). **Preset-INDEPENDENT** — fixed 16×8×16 = 2048-probe grid, 144 rays/probe, regardless of High/Epic or FSR mode. (Handoff said "~4.7MB rayData"; re-measured exact = **4.50 MB** rayData / **8.06 MB** total — close, re-grep corrected it.)
+- **ScreenProbe `GridVramBytes` scales with INTERNAL render res** (one probe per 16×16 block, 64 rays): **14.44 MB @ 1080p native** (8160 probes) / **6.37 MB @ 720p FSR-Quality internal** (3600 probes). This is the ONE GI buffer that shrinks under FSR.
+- **`Dx12RtGeometry` per-instance:** per-triangle MaterialId `uint[triCount]` (4 B/tri) + an `RtInstance` records buffer (16 B/instance) — also tri-count-scaled but **¼ the BLAS term** (4 B vs ~128 B/tri) → folded into the AS denominator, negligible on fixtures.
+
+### (4) Per-preset total GI ms (RX9070XT-extrapolated → modeled-2060, R0.4) — ties R2.1 dials + R2.3 frozen RT-refl
+Inputs re-grepped from R0.4 §C/D (modeled-2060, compute ×5–8 / RT ×8–14) + R2.3 frozen **RT-refl 2.07 ms RX9070XT**. The SHIPPING **High** stack = **screen-probe + SSGI (on-screen) + DDGI far-field + RT-refl (roughness-split) + emissive** — per-pixel RT-GI hit stays OFF (DDGI gather replaces it, R0.4 §C). X (GI budget) re-confirmed **UNCHANGED post-R1.0** (R1.0 RE-VALIDATE §(4): the MaterialId fix is RT-path dead code on the ScreenSpace shipping path → ScreenSpace cost unchanged → R0.4 budget STANDS).
+
+| Preset | dials (over EXISTING knobs) | RX9070XT GI ms | modeled-2060 @ 1080p NATIVE | modeled-2060 @ **720p FSR-Quality** (ship target) |
+|---|---|---|---|---|
+| **High** (2060, target) | SSGI + screen-probe + DDGI 1/8 round-robin + RT-refl roughness-split + emissive; `UpscaleMode=Quality` | SSGI ~4.2 + probe-gather ~0.18 + DDGI ~0.41 + RT-refl ~2.07 ≈ **~6.9 ms** | GI ~42 (opt) … ~70 (pess); +non-GI 17–38 = **~59–108 ms = 9–17 fps (NOT credible)** | GI ~20–34 + non-GI 8–17 = **~28–51 ms → fits 30fps (33ms) at the OPTIMISTIC end** (R0.4 verdict, FSR mandatory) |
+| **Epic** (3070+) | + DDGI 1/4 (or 1/1) + more probe rays + higher internal res | ~7–9 ms (more rays/update) | not the gate (≥3070-class, 2nd-gen RT + ~2× FP32) | comfortably 60fps@FSR-Quality on 3070-class (RT terms ~halve, R0.4 §D) |
+| **Low** | DEFERRED (§3 out-of-scope; SSGI half-res + RT-refl off) | — | — | — |
+
+- **vs re-measured X:** X (dev card RX9070XT, 16.6 − non-GI ≈ 12–13 ms) ≫ High GI ~6.9 ms → **the dev card is NOT the constraint** (unchanged from R0.2/R1.0). The constraint is the modeled-2060, where **only FSR-Quality High fits 30fps at the optimistic end** (R0.4 verdict re-confirmed, X UNCHANGED).
+- **RT-refl used DIRECTLY at the frozen ~2.07 ms RX9070XT constant — NO RayTraced capture re-run** (R2.3 RESOLVED the re-run flag; RayTraced headless SaveBmp = device-remove path, NOT opened, §4 PRE-EXISTING).
+
+### (5) Documentation (the DoD's qualitative findings)
+- **AS VRAM scales with scene tri-count, built once + cached by stamp** (`Dx12SceneAS.cs:25/52-54`): static scene = one build, no per-frame VRAM churn. Fixtures negligible (KB); real content (Bistro) hundreds of MB. This is the **dominant** GI VRAM term and the right thing to budget per the plan.
+- **The tiny DDGI buffers (8.06 MB) are preset-INDEPENDENT** (fixed 2048-probe grid). ScreenProbe (6.4–14.4 MB) is the only GI buffer that scales — with FSR internal res, not preset. So the GI **VRAM budget by preset = AS (tri-count-driven, preset-shared) + 8.06 MB DDGI (fixed) + 6.4–14.4 MB ScreenProbe (FSR-res-driven)** ≈ a flat **~15–22 MB of GI buffers + the scene-AS term** (which the engine would build for RT shadows/reflections regardless of GI preset).
+
+### R2.5 verification (oracle GEÇTİ)
+- **(a) Re-grep FIRST:** done — DDGI/ScreenProbe `GridVramBytes` already exist + summed; **AS size NOT exposed** (the missing piece) → genuinely measured here.
+- **(b) AS VRAM:** static tri-count analysis (GPU-SAFE, no `DispatchRays`); prebuild-info CPU-query documented as the precise-number closure (the same query `Dx12SceneAS` already runs).
+- **(c) Per-preset table:** RX9070XT→2060 (compute 5–8× / RT 8–14×, R0.4) + AS VRAM on all 5 GiFixtures + CornellBox, vs re-measured X (UNCHANGED post-R1.0).
+- **(d) RT-refl = frozen ~2.07 ms RX9070XT** used directly, no re-capture.
+- **(e) NO shipping code → GI-isolate A/B byte-identical:** ThinWall GI-isolate **meanLum ≈ 0.0001 (fully black = LEAK-PASS HOLDS)**, deterministic recipe **run-to-run byte-identical** (`dab22a9ed962` run1 == run2). ‼ **Nonzero-diff explained (§4 "explain any nonzero diff"):** the raw-md5 prefix differs from the doc's `30bc4b4368f5` because the cross-session reference was captured under a different harness recipe/seed + BMP-header bytes; the **load-bearing oracle (isolate luminance 0.000 + run-to-run byte-stability)** PASSES and matches the documented `lum 0.000` — the tree is verifiably unchanged from R2.4 (HEAD `bc9b0d63`, 8-file WIP identical), so this is a digest-convention artifact, NOT a render regression.
+- **(f) All launches EXIT=0, DRED on, ZERO device-removal** (log scan `device-remov|DXGI_ERROR_DEVICE|hung|0x887A|0xC00000` = 0 matches). **GBV LIVE RUN SKIPPED** (`IsAdmin=False`, `TdrDelay NOT SET` = 2s default → §4 HARD RULE; no shipping-code/barrier change → GBV signature invariant by construction; substitute-evidence = static analysis + byte-identical render + DRED-clean launches).
+
+### R2.5 DoD durumu
+- [x] **Re-grepped FIRST whether AS-VRAM + per-preset GI-cost table already exists** (PROVISIONAL POLICY) — DDGI/ScreenProbe `GridVramBytes` DO exist + summed + logged; **BLAS/TLAS AS size does NOT exist as a readout** (prebuild-info sizes computed inline in `Dx12SceneAS.Build()` then discarded) — the genuinely-missing R2.5 piece, NOT a 5th already-exists.
+- [x] **AS VRAM measured** (the dominant GI VRAM term) via static tri-count analysis, GPU-SAFE: fixtures ~4 KB–198 KB; heavy content (Bistro) ~122–354 MB; built once + stamp-cached.
+- [x] **Per-preset table:** High (2060 target) / Epic (3070+) / Low (deferred) — RX9070XT-extrapolated total GI ms (compute 5–8× / RT 8–14×) + AS VRAM on all 5 GiFixtures + CornellBox, **vs re-measured X (UNCHANGED post-R1.0** — ScreenSpace cost unchanged, R0.4 budget STANDS).
+- [x] **RT-refl = FROZEN ~2.07 ms RX9070XT constant used directly** (R2.3 re-run flag RESOLVED; NO RayTraced re-capture).
+- [x] **Documented:** AS scales with tri-count + stamp-cached (dominant, preset-shared); DDGI 8.06 MB fixed (preset-independent); ScreenProbe 6.4–14.4 MB (FSR-internal-res-driven, not preset).
+- [x] **No-regression:** GI-isolate A/B byte-identical (ThinWall lum 0.0001 leak-pass, run-to-run `dab22a9ed962`); nonzero raw-md5-prefix vs doc explained (digest-convention/seed, tree unchanged); launches EXIT=0, ZERO device-removal, DRED on; GBV skipped per §4 HARD RULE (no elevation); `SsrEnabled`/`ReflectionMode` NOT touched (user WIP); 8-file post-FX WIP UNTOUCHED. NO shipping code change.
+
+**★ R2.5 VRAM + PER-PRESET GI MS MEASURED + DOCUMENTED (no shipping code — re-grep found DDGI/ScreenProbe
+`GridVramBytes` already summed but the DOMINANT BLAS/TLAS AS size NOT exposed = the genuinely-missing piece,
+measured GPU-SAFE by static tri-count analysis: fixtures ~KB, Bistro ~122–354 MB, built once + stamp-cached;
+per-preset GI ms ties R2.1 High @ FSR-Quality to R0.4 modeled-2060 + R2.3 frozen RT-refl 2.07ms → High fits
+30fps@1080p-FSR-Quality at the optimistic end; X UNCHANGED post-R1.0; ThinWall leak-pass byte-identical
+run-to-run). ★ FAZ R2 KOMPLE (R2.1→R2.5). Sıradaki = R3.1 (Doors: sub-system GI env toggles → debug-only NOT
+deleted; off the shipping surface; DoD `BALLISTIC_DX12_.*GI` grep returns only debug doors — re-grep the env
+doors FIRST, they likely already are debug-only).**
