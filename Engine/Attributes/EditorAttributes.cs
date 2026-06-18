@@ -62,6 +62,15 @@ public sealed class ColorUsageAttribute : Attribute {
 [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property, Inherited = false)]
 public sealed class NotSerializedAttribute : Attribute { }
 
+// Unity parity: opts a NON-PUBLIC field (private / protected / internal) into scene serialization AND
+// the inspector, so encapsulated state can be authored without a public field. By default only PUBLIC
+// fields/properties are serializable state (ComponentReflection); a private field is invisible. Marking
+// it [SerializeField] includes it — exactly like Unity's [SerializeField]. A PUBLIC member doesn't need
+// it (it's already serialized); applying it there is harmless. Pair with [HideInInspector] to serialize a
+// private field without showing it, or [NotSerialized] which wins (excludes from both even if marked).
+[AttributeUsage(AttributeTargets.Field, Inherited = false)]
+public sealed class SerializeFieldAttribute : Attribute { }
+
 // Renders a full-width button in the inspector that invokes the decorated PARAMETERLESS method
 // when clicked (bake triggers, one-shot actions). Clearer than a self-resetting bool checkbox.
 // Label defaults to the method name.

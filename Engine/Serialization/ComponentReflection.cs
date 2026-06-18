@@ -7,6 +7,9 @@ namespace BallisticEngine.Serialization;
 // classes. Used by both the scene serializer and the editor inspector so they agree.
 public static class ComponentReflection {
     const BindingFlags Flags = BindingFlags.Public | BindingFlags.Instance;
+    // Field scan also pulls NON-public fields so a private/protected field marked [SerializeField] (Unity
+    // parity) can opt into serialization; unmarked non-public fields are filtered out in SerializableMembers.
+    const BindingFlags FieldFlags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
 
     static bool IsFrameworkType(Type declaringType) =>
         declaringType == typeof(BObject) ||
@@ -23,9 +26,16 @@ public static class ComponentReflection {
                 prop.GetCustomAttribute<NotSerializedAttribute>() is null)
                 yield return prop;
         }
-        foreach (FieldInfo field in type.GetFields(Flags)) {
+        foreach (FieldInfo field in type.GetFields(FieldFlags)) {
             if (field.IsLiteral || IsFrameworkType(field.DeclaringType) ||
                 field.GetCustomAttribute<NotSerializedAttribute>() is not null)
+                continue;
+            // A NON-PUBLIC field is serializable state ONLY when it opts in with [SerializeField] (Unity
+            // parity). This also filters out compiler-generated members the NonPublic scan now sees —
+            // auto-property backing fields (`<Prop>k__BackingField`), captured locals, etc. — none of which
+            // carry [SerializeField], so they're skipped without an explicit name check. Public fields are
+            // unchanged (no marker needed), so every existing scene/component is byte-identical.
+            if (!field.IsPublic && field.GetCustomAttribute<SerializeFieldAttribute>() is null)
                 continue;
             // `readonly` fields are normally skipped (their value can't change), EXCEPT BEvents: they're
             // declared `public readonly BEvent OnX = new();` and populated IN PLACE (listeners added to

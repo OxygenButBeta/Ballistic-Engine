@@ -14,6 +14,7 @@ exit += OrderedPassListTests.Run();
 exit += InputActionChainTests.Run();
 exit += DrawerStackTests.Run();
 exit += PropertyOrderingTests.Run();   // Phase B residue -- single-sourced [PropertyOrder] member ordering (pure)
+exit += SerializeFieldTests.Run();     // [SerializeField] non-public opt-in (pure; ComponentReflection)
 exit += ComponentPreviewTests.Run();
 exit += AssetInspectorTests.Run();
 exit += EntityRefTests.Run();        // G1 — inserts a scene (no public unload); runs before G0's own
