@@ -197,6 +197,33 @@ byte-identical. Final `bal render` golden frozen + committed.
 
 ---
 
-## Running notes / handoff log (each worker appends)
+## Running notes / handoff log
 
-- (ch0) …
+ALL 7 CHUNKS DONE on dx12-renderer (single session, not plan-runner — user took full control).
+Commits: ch0 b2d187ae · ch1 02f0cb96 · ch2 8b7de516 · ch3 fed987a5 + a6b234ea · ch4 a13bbddf ·
+ch5 ff321131 · ch6 8b657f13.
+
+- (ch0) Baked freeze plumbing (BakedMode/Rebake/SetBakedMode) reusing the capture-path warm-up;
+  dense spacing. Default-OFF byte-identical (meanError 0).
+- (ch1) GPU distance-priority progressive bake queue: ProbeBakeState counter (trace u1 / blend t1),
+  band test in ProbeActiveThisFrame (3 shaders), CPU only advances bakeWave. Non-baked byte-identical,
+  GBV-clean, progressive wave proven (warmup0 frame-30 != converged).
+- (ch2) Max fidelity: dynamic rays 144 live / 256 baked (Params4.w), oct 6->8 (Params0.x/y dynamic in
+  blend, atlas auto-resizes). Live byte-identical, baked GBV-clean.
+- (ch3) 2-cascade: gather SampleCascade over near(t3-5)+far(t6-8)+b2 grid; far = own Dx12Ddgi with its
+  own bindless-tail block (DdgiFarTableBase=16348, below RtRefl so historical bases unchanged → asserts
+  hold). cascade=1 byte-identical, cascade=2 baked GBV-clean.
+- (ch4) Reflections already read the DDGI field (GridConstants+atlas) → frozen-fed for free. Added
+  BALLISTIC_DX12_REFLECTIONS=1 to test headlessly. RT-refl + baked cascade GBV-clean.
+- (ch5) Auto re-bake: large camera move (>40% half-extent from freeze) + light change (NotifyLight,
+  ~3° sun / 5% colour) + manual GiDebugGrid.RequestRebake(). Non-baked inert, baked GBV-clean.
+- (ch6) Volume front-door GlobalIllumination.bakedGi + cascades; PostFX.DdgiBaked/DdgiCascades bridge;
+  env doors still override. Hid the 3 temporal dials when baked ([HideIf]). All test suites green.
+
+GOTCHAS recorded: shader edits need clean obj/ (memory dx12-shader-edit-build-gotcha — done each ch);
+bal render is always capture-path (warmup masks live progressive — verify progressive with WARMUP=0);
+RT-GI forced via BALLISTIC_DX12_RT_GI=1 (DDGI only runs in GiMode.RayTraced); test scene =
+GiFixtures/MultiLightInterior (Bistro gitignored). NOT YET DONE (deferred, not in user's asks): a
+dedicated reflection cubemap cache on the bake queue (field-fed reflection shipped instead); cascade
+boundary soft-blend (coverage test is seam-free enough for now); editor "Rebake GI" button UI (the
+RequestRebake() bridge exists, no widget wired). Bistro/large-scene visual A/B not run (content absent).
