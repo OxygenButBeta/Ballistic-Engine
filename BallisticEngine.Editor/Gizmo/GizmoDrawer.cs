@@ -15,9 +15,11 @@ internal sealed class GizmoDrawer : IGizmos {
     ImDrawListPtr draw;
 
     public Vector3 Color { get; set; } = Vector3.One;
+    public Vector3 CameraPosition { get; private set; }
 
     public void Begin(IViewProjectionProvider camera, SysVec2 min, SysVec2 size, ImDrawListPtr drawList) {
         vp = camera.GetViewMatrix() * camera.GetProjectionMatrix();
+        CameraPosition = camera.Transform.Position;
         viewMin = min;
         viewSize = size;
         draw = drawList;

@@ -8,6 +8,11 @@ namespace BallisticEngine;
 public interface IGizmos {
     Vector3 Color { get; set; }
 
+    // World position of the camera the gizmos are being drawn through (editor camera in the editor).
+    // Lets a gizmo place camera-relative geometry — e.g. the camera-centered DDGI probe grid the GI
+    // Debug visualiser re-derives on the CPU (GiDebugGrid.Snap). Editor fills it in Begin().
+    Vector3 CameraPosition { get; }
+
     void DrawLine(Vector3 from, Vector3 to);
 
     // A line from origin along direction (length = direction's magnitude).
