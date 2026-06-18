@@ -71,9 +71,12 @@ public sealed class Dx12Ddgi : IDisposable {
     // a future cascade extends the far field. BALLISTIC_DX12_DDGI_SPACING overrides (metres).
     public Vector3 Spacing { get; private set; } = new(2.0f, 2.0f, 2.0f);
     float BakedSpacing {
-        get => float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_SPACING"),
-            System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float s) && s > 0.1f
-            ? s : 1.2f;
+        get {
+            if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_SPACING"),
+                System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float s) && s > 0.1f)
+                return s;                              // env wins
+            return VolumeSpacing > 0.1f ? VolumeSpacing : 1.2f;   // then volume, then default
+        }
     }
     // CHUNK3: a cascade can be configured as the FAR (sparse, wide) one — its spacing is the near baked spacing
     // times this multiplier, so it covers a much larger volume at lower density. Set on the far instance before
@@ -104,17 +107,21 @@ public sealed class Dx12Ddgi : IDisposable {
     // 144 live (byte-identical) or higher in BAKED mode where the deep one-shot converge can afford more rays for
     // a cleaner integral (CHUNK2 fidelity). The active count rides DdgiConstants so the trace/blend read it.
     public const int RaysPerProbe = 256;   // MAX rays/probe — RayData buffer + DdgiBlend RAYS_PER_PROBE cap
+    // VOLUME OVERRIDE (the BakedGlobalIllumination volume sets these via the GI pass each frame; <=0 = unset →
+    // env/default drive). Precedence: env door > volume > default.
+    public int VolumeRays, VolumeConverge;
+    public float VolumeSpacing;
     int? raysEnv;
     public int ActiveRays {
         get {
             if (raysEnv == null) {
                 bool parsed = int.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_RAYS"), out int n);
-                // Baked mode: 256 rays (max fidelity — frozen field pays it once). Live: 144 (byte-identical to the
-                // pre-CHUNK2 round-robin). Env override clamps to [16, RaysPerProbe].
                 int def = BakedMode ? RaysPerProbe : 144;
-                raysEnv = parsed ? Math.Clamp(n, 16, RaysPerProbe) : def;
+                raysEnv = parsed ? Math.Clamp(n, 16, RaysPerProbe) : -1;   // -1 = no env → fall to volume/default
             }
-            return raysEnv.Value;
+            if (raysEnv.Value > 0) return raysEnv.Value;                    // env wins
+            if (VolumeRays > 0) return Math.Clamp(VolumeRays, 16, RaysPerProbe);  // then the volume
+            return BakedMode ? RaysPerProbe : 144;                          // then the default
         }
     }
 
@@ -285,8 +292,9 @@ public sealed class Dx12Ddgi : IDisposable {
         get {
             if (convergeTargetEnv == null)
                 convergeTargetEnv = int.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_CONVERGE"),
-                    out int n) && n >= 1 ? n : 48;
-            return convergeTargetEnv.Value;
+                    out int n) && n >= 1 ? n : -1;   // -1 = no env → volume/default
+            if (convergeTargetEnv.Value > 0) return convergeTargetEnv.Value;
+            return VolumeConverge > 0 ? VolumeConverge : 48;
         }
     }
     // Distance band width (metres). A new band opens every BandFrames frames, so the bake ripples outward from the

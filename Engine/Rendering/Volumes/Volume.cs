@@ -135,7 +135,10 @@ public class Volume : Behaviour {
         if (!HasGi)
             return;
 
-        if (ShowCascadeBounds || ShowProbeGrid)
+        // The dedicated BakedGlobalIllumination volume drives the probe gizmo via GiDebugGrid.ShowProbeGrid — OR
+        // it in so ticking "Show Probe Grid" on the baked volume draws the probes even though that's a separate
+        // component (this Volume just hosts the gizmo surface). The per-Volume ShowProbeGrid still works too.
+        if (ShowCascadeBounds || ShowProbeGrid || GiDebugGrid.ShowProbeGrid)
             DrawDdgiGrid(gizmos);
 
         if (ShowReflectionRays)
@@ -159,14 +162,16 @@ public class Volume : Behaviour {
             gizmos.DrawWireCube(center, covered * 0.85f, Quaternion.Identity);
         }
 
-        if (!ShowProbeGrid)
+        // ShowProbeGrid: this Volume's own toggle OR the dedicated baked-GI volume's (via GiDebugGrid).
+        bool showGrid = ShowProbeGrid || GiDebugGrid.ShowProbeGrid;
+        if (!showGrid)
             return;
 
         // Distance-limited + per-axis ranged so we never iterate all 2048 probes / flood the view with
         // 245k line calls: only probes within ProbeDrawDistance of the camera are marked. We clamp the
         // per-axis probe index range to the cells around the camera before the triple loop.
         Vector3 cam = gizmos.CameraPosition;
-        float d = ProbeDrawDistance;
+        float d = MathF.Max(ProbeDrawDistance, GiDebugGrid.ProbeDrawDistance);
         float d2 = d * d;
 
         int x0 = ProbeRangeMin(cam.X, origin.X, spacing.X, d, GiDebugGrid.ProbesX);
@@ -202,7 +207,7 @@ public class Volume : Behaviour {
             // SOLID coloured sphere (user: wire sphere "hiçbir şey belli değil" — a filled, bold, opaque blob
             // makes each probe's cached colour obvious at a glance). Cross marker stays the cheap fallback when
             // sphere-mode is off.
-            if (ShowProbeSpheres)
+            if (ShowProbeSpheres || GiDebugGrid.ShowProbeSpheres)
                 gizmos.DrawSolidSphere(p, markerR);   // small world radius; the drawer clamps the pixel size
             else
                 DrawCrossMarker(gizmos, p, markerR);

@@ -597,8 +597,11 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
             // REALTIME GI REMOVED (2026-06-18): DDGI is ALWAYS baked now — there is no per-frame live-DDGI path
             // anymore (the round-robin update only runs to BAKE, then freezes). Force baked on regardless of the
             // volume flag (PostFX.DdgiBaked is kept for the inspector label / future, but the live path is gone).
-            // SetBakedMode is a no-op when unchanged; it triggers a Rebake on the first enable.
             ddgi.SetBakedMode(true);
+            // Dedicated BakedGlobalIllumination volume dials → the DDGI instance (env doors still override these).
+            ddgi.VolumeRays = ctx.PostFX.BakedGiRaysPerProbe;
+            ddgi.VolumeSpacing = ctx.PostFX.BakedGiProbeSpacing;
+            ddgi.VolumeConverge = ctx.PostFX.BakedGiConvergeTarget;
             // CHUNK5 manual "Rebake GI" button (editor/remote): consume the one-shot request before Update so the
             // wave restarts this frame. Applies to both cascades.
             if (GiDebugGrid.RebakeRequested) { ddgi.Rebake(); ddgiFar?.Rebake(); GiDebugGrid.RebakeRequested = false; }

@@ -199,6 +199,19 @@ public sealed class PostProcessSettings {
     // headless-GBV-proven) until the far cascade is re-validated. BALLISTIC_DX12_DDGI_CASCADES=2 re-enables it.
     public int DdgiCascades { get; set; } = 1;
 
+    // ===== Dedicated BakedGlobalIllumination volume dials (2026-06-18, the separate debuggable baked-GI front
+    // door). The renderer reads these when the baked path runs (GI_FORCE opt-in). Each env door still overrides
+    // the matching field for the A/B harness; unset = these drive. Defaults = the safe baked config. =====
+    public bool BakedGiEnabled { get; set; }                 // the dedicated volume's master on/off (debug toggle)
+    public float BakedGiIntensity { get; set; } = 1f;
+    public bool BakedGiEmissive { get; set; } = true;
+    public bool BakedGiIsolate { get; set; }                 // GI-isolate debug view (only the baked bounce)
+    public int BakedGiRaysPerProbe { get; set; } = 256;      // bake rays/probe (16..256)
+    public float BakedGiProbeSpacing { get; set; } = 1.2f;   // near-cascade probe spacing (m)
+    public int BakedGiConvergeTarget { get; set; } = 48;     // frames a probe traces before it freezes
+    public int BakedGiBandFrames { get; set; } = 2;          // progressive: frames before the next band opens
+    public bool BakedGiRebakeRequest { get; set; }           // one-shot "rebake now" from the volume tick box
+
     // Screen-space radiance probes: the near/mid-field final gather. This is a REALTIME per-frame screen trace —
     // BAKED-ONLY DEFAULT (2026-06-18): FALSE, so the baked path uses the pure frozen-field gather (no realtime
     // screen probes). BALLISTIC_DX12_SCREENPROBE still force-overrides.

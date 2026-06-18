@@ -89,6 +89,13 @@ public static class GiDebugGrid {
     // reads it per frame; the editor/remote flips it. BALLISTIC_DX12_GI_OFF=1 forces it off headlessly.
     public static bool GiEnabled = true;
 
+    // Probe-grid gizmo toggles, driven by the BakedGlobalIllumination volume (the dedicated debug front door).
+    // The Volume component's OnDrawGizmos reads these so the probe visualiser follows the baked-GI volume, not a
+    // separate per-Volume toggle. Default off (gizmo costs nothing until shown).
+    public static bool ShowProbeGrid;
+    public static bool ShowProbeSpheres = true;
+    public static float ProbeDrawDistance = 12f;
+
     // Called by the DX12 DDGI readback. `colors` is indexed by the SAME probe flattening as ProbePosition's
     // (pz*ProbesY + py)*ProbesX + px order Dx12Ddgi uses. Copies in (the gizmo reads on the main thread).
     public static void PublishProbeColors(System.ReadOnlySpan<Vector3> colors) {

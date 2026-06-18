@@ -136,6 +136,39 @@ public static class VolumePostProcessing {
             }
         }
 
+        // ===== BAKED GLOBAL ILLUMINATION — the dedicated, debuggable baked-GI volume (2026-06-18). Everything
+        // about the bake in one place: enable/intensity/emissive, quality (cascades/rays/spacing/converge/bands),
+        // and the debug surface (GI-isolate + the probe-grid gizmo). The DXR bake still only RUNS when the
+        // renderer's master GI gate is opted-in (BALLISTIC_DX12_GI_FORCE=1) — this volume configures it, the gate
+        // arms it. The debug toggles drive GiDebugGrid (the editor gizmo) directly. =====
+        if (stack.GetComponent<BakedGlobalIllumination>() is { } baked) {
+            bool on = baked.enabled.Value;
+            fx.BakedGiEnabled = on;
+            // Drive the SHARED GI fields the baked renderer path reads (so GI_FORCE + this volume = baked GI).
+            if (on) {
+                fx.GiMode = GiMode.RayTraced;   // the baked path lives on the RT-GI branch (gated by GI_FORCE)
+                fx.Ddgi = true; fx.DdgiBaked = true;
+            }
+            fx.BakedGiIntensity = baked.intensity.Value;
+            fx.SsgiIntensity = baked.intensity.Value;          // the GI combine reads SsgiIntensity
+            fx.BakedGiEmissive = baked.emissiveAsGi.Value;
+            fx.GiEmissive = on && baked.emissiveAsGi.Value;
+            fx.BakedGiIsolate = baked.giIsolate.Value;
+            fx.SsgiDebugView = on && baked.giIsolate.Value;
+            fx.DdgiCascades = baked.cascades.Value;
+            fx.BakedGiRaysPerProbe = baked.raysPerProbe.Value;
+            fx.BakedGiProbeSpacing = baked.probeSpacing.Value;
+            fx.BakedGiConvergeTarget = baked.convergeTarget.Value;
+            fx.BakedGiBandFrames = baked.bandFrames.Value;
+            fx.BakedGiRebakeRequest = baked.rebakeNow.Value;
+            // Debug gizmo toggles → the editor probe-grid visualiser (GiDebugGrid is the render↔editor bridge).
+            GiDebugGrid.GiEnabled = on;                          // also the GI on/off debug (skip the pass when off)
+            GiDebugGrid.ShowProbeGrid = baked.showProbeGrid.Value;
+            GiDebugGrid.ShowProbeSpheres = baked.showProbeSpheres.Value;
+            GiDebugGrid.ProbeDrawDistance = baked.probeDrawDistance.Value;
+            if (baked.rebakeNow.Value) GiDebugGrid.RequestRebake();
+        }
+
         if (stack.GetComponent<Shadows>() is { } shadows) {
             fx.ShadowMaxDistance = shadows.maxDistance.Value;
             fx.ShadowCascadeCount = shadows.cascadeCount.Value;
