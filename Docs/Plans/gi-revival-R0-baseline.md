@@ -1032,3 +1032,125 @@ branch would regress the /PI double-count the code deliberately avoids). RT-refl
 R2.5 re-run flag RESOLVED (no path change). Sıradaki = R2.4 (Cascaded + cull: finite ~30m near + clipmap fade,
 distant horizon → IBL/sky intentional+documented, culling = perf lever only; ★ GUARD: never cull geometry a
 probe's visibility depends on — leak-test ThinWall must PASS with culling ON).**
+
+---
+
+## R2.4 — Cascaded + cull (2026-06-18, MEASURE+DOCUMENT, no code — finite volume + leak-safe-culling ALREADY EXIST by construction)
+
+> PROVISIONAL POLICY applied: re-grepped/re-read EVERY R2.4 load-bearing claim against the working tree —
+> the DDGI grid extent/origin/spacing, the gather out-of-bounds → IBL/sky fallback, the DxrGi/DxrReflections
+> miss path, and WHICH renderer set feeds the GI/probe-visibility TLAS vs the raster camera-cull path. **NO
+> code change** — measure+document, the THIRD R2.x chunk in a row where the plan-author's "build X" turned out
+> to already exist (R2.2 round-robin, R2.3 roughness-split, now R2.4 finite-volume + leak-safe-culling). Raw
+> captures: `e:/tmp/gi-r2.4/`.
+
+### (1) The DDGI volume is FINITE — re-measured from the tree (NOT memory)
+- **`Dx12Ddgi.cs:25`** `ProbesX=16, ProbesY=8, ProbesZ=16` → **2048 probes** (`ProbeCount`, :26).
+- **`Dx12Ddgi.cs:64`** `Spacing = (2.0, 2.0, 2.0)` metres → covered volume = `spacing * (probes-1)` per axis =
+  **30 × 14 × 30 m** (the in-file comment on :64 confirms "~30x14x30m covered volume"; :217 budget-readout
+  comment likewise). This IS the plan's "finite volume (~30m near)".
+- **Camera-centered, snapped (`Dx12Ddgi.cs:180-192`):** `Update(cameraPos)` places the grid so the camera
+  sits near its centre, snapped to whole probe spacings each frame so probes don't swim under sub-cell motion
+  (temporal stability). The file calls this **"a single clipmap cascade for now"** (:61). → The "clipmap
+  fade"/multi-cascade is NOT implemented; a SINGLE camera-following cascade is the chosen architecture (a true
+  clipmap/infinite cascade is **out of scope §3** — "SWRT SDF/GDF · raster-proxy · No-RT Low (deferred)"; the
+  finite single-cascade + IBL-far is deliberate, see (2)).
+
+### (2) Distant horizon → IBL/sky is INTENTIONAL (re-read from the gather + miss paths)
+- **Gather out-of-bounds (`DdgiGather.hlsl:88/119/162`):** default `Output[px] = float4(0,0,0,1)` ("no GI"); a
+  probe cell corner outside the grid dims is SKIPPED (`if (any(c < 0) || any(c >= dims)) continue;`); if ALL 8
+  enclosing probes are out-of-bounds (a shading point beyond the finite volume) then `sumW → 0` →
+  `E = sumW > 1e-5 ? sumIrr/sumW : 0` = **0 DDGI contribution** → the pixel keeps only the deferred-lighting
+  IBL/sky ambient. So **beyond ~30m the surface falls to IBL/sky by construction** — exactly the plan's
+  "distant horizon → IBL/sky (intentional, document it)".
+- **DxrGi miss (`DxrGi.hlsl:158-159`):** a probe-update ray that escapes the BVH returns `Color = 0` with the
+  comment "sky = no bounce (IBL ambient already counts it)" → far-field open-sky radiance enters the field via
+  the IBL irradiance cube the hit shading samples, not a fabricated bounce.
+- **DxrReflections miss (`DxrReflections.hlsl:222-226`):** a reflection ray that escapes the BVH returns the
+  roughness-mipped **prefilter sky/IBL cube** — the documented far-field reflection fallback (R2.3 already
+  recorded: IBL fallback ONLY on the reflection-ray MISS; near/mid traced geometry never falls to IBL).
+- **WHY this is correct, not a bug:** DDGI is a finite probe grid by design (the chosen "not Lumen, shippable"
+  architecture — Part A §0 stack: screen-probe + SSGI on-screen → DDGI far-field → cascaded boundary → IBL/sky).
+  An infinite/clipmap cascade is out of scope (§3). The honest quality-ceiling (plan Part B) already states
+  off-screen far-field is DDGI low-freq and beyond-volume is IBL — R2.4 confirms the code matches that contract.
+
+### (3) ★ THE LEAK-vs-CULL GUARD (the load-bearing R2.4 DoD) — leak-safe BY CONSTRUCTION
+- **The GI/probe-visibility TLAS is fed the FULL static-mesh set, NOT a frustum-culled subset.** EVERY
+  TLAS/RT-geometry call-site re-grepped from the tree uses `RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection`:
+  - `Dx12GiPass.cs:554` (DDGI/screen-probe `sceneAS.Ensure`) + `:586` (`rtGeometry.Ensure`)
+  - `Dx12ReflectionsPass.cs:273` (`sceneAS.Ensure`) + `:279` (`rtGeometry.Ensure`)
+  - `DX12HDRenderer.cs:1945` (the shared RT-shadow `sceneAS.Ensure`) + `GpuSceneQuery.cs:103`
+  - **`Dx12SceneAS.cs` has ZERO frustum/cull references** (grep `frustum|cull|InFrustum|IsVisible` = 0 matches)
+    — it builds the TLAS from whatever renderers it's handed; `Dx12RtGeometry.Ensure` filters ONLY by
+    `IsActive`/`IsRenderable` (`Dx12RtGeometry.cs:52`), never by frustum. → The BVH ALWAYS contains all active
+    static geometry, so an OFF-CAMERA occluder still blocks probe rays. **No cull-induced leak is possible.**
+- **The leak gate itself (the Chebyshev visibility test, `DdgiGather.hlsl:124/139-151`):** a probe on the far
+  side of a thin wall is statistically occluded (depth-moments variance) and dropped — this gate only WORKS
+  because the depth atlas was built from probe rays traced against the full TLAS (the off-screen wall is in the
+  BVH). Aggressive culling that dropped that wall from the trace set would defeat the gate → the plan's exact
+  warning ("aggressive culling creates leaks"). Confirmed: the trace set is the full set, so the gate is fed
+  the geometry it needs.
+- **LEAK-TEST PASSES with culling ON (the shipping default):** ThinWall GI-isolate captured GPU-safe (paused
+  f60, DRED on, `BALLISTIC_DX12_GI_ISOLATE=1 BALLISTIC_DX12_SSGI=1`) = **isolate 0.000, SHA `30bc4b4368f5`
+  byte-identical** to the R2.3/R1.1/R1.0 reference — fully black, NO bleed-through the thin wall. Culling is ON
+  (raster default), the leak-test still passes → DoD met.
+
+### (4) Culling = perf lever ONLY — the separation, documented
+- The **raster** camera frustum cull (`AabbInFrustum`, `DX12HDRenderer.cs:1437/1623`, light-frustum cascades
+  `:2350`, punctual faces `:2075`) culls **draw submission** for the geometry/z-prepass/shadow RASTER passes.
+  It NEVER feeds the TLAS. (CLAUDE.md invariant: "The FULL opaque list still feeds shadows and bakes — an
+  off-screen mesh still casts shadows.")
+- The **GI/probe-visibility** path (DDGI trace, screen-probe trace, RT reflections, RT shadows) uses the FULL
+  `RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection` → the TLAS. These two sets are ARCHITECTURALLY SEPARATE:
+  frustum culling is a raster-only perf lever and cannot create a GI leak by construction.
+
+### (5) Re-grep verdict: R2.4's finite-volume + leak-safe-culling ALREADY EXISTS → measure+document (no code)
+Exactly as R2.2 (round-robin) and R2.3 (roughness-split) already existed: the finite DDGI volume, the IBL/sky
+far-field fallback, and the full-set-fed-TLAS (= leak-safe culling) are all PRESENT in the tree. There is no
+clipmap to build (single cascade is the chosen scope) and no cull-guard to add (the TLAS is the full set by
+construction). **NO code change.**
+
+### R2.4 verification (oracle GEÇTİ)
+| Capture (GI-ON, isolate, paused f60, DRED) | SHA | Reference | Verdict |
+|---|---|---|---|
+| ThinWall (leak-test, the critical one) | `30bc4b4368f5` | `30bc4b4368f5` | ✓ byte-identical, isolate 0.000 = LEAK-PASS HOLDS with culling ON |
+| CornellBox | `81dbf7a5667f` | `81dbf7a5667f` | ✓ byte-identical (strong color-bleed, no regress) |
+| ColorOnly | `55ec21c5cffb` | `55ec21c5cffb` | ✓ byte-identical |
+
+All 3 launches EXIT=0, ZERO device-removal (log scan `device-remov|DXGI_ERROR_DEVICE|hung|0x887A|0xC00000|DRED`
+= 0 matches), DRED on. RayTraced GI/reflections NOT opened headless (device-remove safety §4 PRE-EXISTING) —
+the leak-safe TLAS-full-set claim is proven by STATIC ANALYSIS of the call-sites + the byte-identical ScreenSpace
+shipping-path render, the §4-sanctioned substitute-evidence path for a no-code chunk. **GBV LIVE RUN SKIPPED**
+(TdrDelay NOT SET = 2s default, no elevation → §4 HARD RULE; no barrier/code change → GBV signature invariant by
+construction). Build 0-err (DX12 `-t:Rebuild` compile-asserts pass; only pre-existing CA2014 warnings).
+
+### R2.4 DoD durumu
+
+- [x] **MEASURED the existing GI cascaded/finite-volume + culling against the tree FIRST** (PROVISIONAL POLICY):
+      DDGI grid = finite 16×8×16 @ 2m = ~30×14×30m, camera-centered single clipmap cascade (`Dx12Ddgi.cs:25/64/
+      180-192`); far-edge fade to IBL/sky via gather out-of-bounds `continue`→`sumW=0`→`E=0` (`DdgiGather.hlsl:
+      119/162`) + DxrGi miss = 0-bounce (`:158-159`) + DxrReflections miss = prefilter cube (`:222-226`); the
+      TLAS is fed the FULL `RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection` at every GI call-site, NOT a
+      culled subset.
+- [x] **DOCUMENTED distant horizon → IBL/sky is INTENTIONAL** (finite DDGI by design; clipmap/infinite out of
+      scope §3; matches the Part B honest quality-ceiling — beyond-volume = IBL).
+- [x] **★ THE GUARD verified:** GI/probe-visibility (TLAS) is fed the full static-mesh set (static analysis of
+      6 call-sites + `Dx12SceneAS.cs` has zero cull refs + `Dx12RtGeometry.Ensure` filters only IsActive/
+      IsRenderable) → off-screen occluders still block probe rays → no cull-induced leak by construction. The
+      Chebyshev depth-moments gate (`DdgiGather.hlsl:124/139-151`) is fed the geometry it needs. **Leak-test
+      ThinWall PASSES with culling ON: isolate 0.000, SHA `30bc4b4368f5` byte-identical.**
+- [x] **Culling = perf lever ONLY:** raster frustum cull (`AabbInFrustum`) gates draw submission for the raster
+      passes; the TLAS/probe-visibility uses the full set — the two are architecturally separate, frustum
+      culling cannot create a GI leak.
+- [x] **No-regression:** shipping-path GI-isolate A/B byte-identical 3-for-3 (CornellBox/ThinWall/ColorOnly ==
+      references); build 0-err; 3 launches EXIT=0, ZERO device-removal, DRED on. `SsrEnabled`/`ReflectionMode`
+      NOT touched (user's WIP); 8-file post-FX WIP diff UNTOUCHED. NO code change.
+
+**★ R2.4 CASCADED + CULL MEASURED + DOCUMENTED (no code change — the finite ~30m single-cascade DDGI volume,
+the beyond-volume → IBL/sky fallback, and the leak-safe full-set-fed-TLAS ALL ALREADY EXIST by construction;
+the leak-test ThinWall PASSES with culling ON, byte-identical `30bc4b4368f5`, because the TLAS is the FULL
+static-mesh set so off-screen occluders still block probe rays and frustum culling — a raster-only perf lever —
+cannot create a GI leak). Sıradaki = R2.5 (VRAM: budget the real cost = BLAS/TLAS acceleration structures, not
+the tiny DDGI/probe buffers; tie to preset; per-preset reference-GPU-extrapolated total GI ms + AS VRAM on all
+5 scenes vs re-measured post-R1.0/R2.3 X; ★ R2.3 RESOLVED the RT-refl re-run flag = ~2.07ms RX9070XT frozen
+constant, R2.5 uses it directly).**
