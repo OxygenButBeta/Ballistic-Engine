@@ -31,8 +31,17 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
 
     // The verbatim outer-if from the inline reflections block (DX12HDRenderer ~1649). When false the pass is
     // skipped entirely (no SSR, no RT reflections) — exactly as the inline `if(...)` did.
-    public bool Enabled(Dx12FrameContext ctx) =>
-        !ctx.Doors.Minimal && ctx.PostFX.SsrEnabled && ctx.PostFX.SsrIntensity > 0f;
+    // CHUNK4: BALLISTIC_DX12_REFLECTIONS=1 force-enables the pass headlessly (SsrEnabled is default-off in the
+    // user's reflections-WIP, so the A/B harness has no other way to exercise the frozen-cascade-fed reflection).
+    // =0 force-off. Default (unset) = the verbatim PostFX gate (byte-identical).
+    public bool Enabled(Dx12FrameContext ctx) {
+        if (reflForceEnvUnread) { reflForceEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_REFLECTIONS"); reflForceEnvUnread = false; }
+        if (ctx.Doors.Minimal) return false;
+        if (reflForceEnv == "1") return ctx.PostFX.SsrIntensity > 0f;
+        if (reflForceEnv == "0") return false;
+        return ctx.PostFX.SsrEnabled && ctx.PostFX.SsrIntensity > 0f;
+    }
+    string reflForceEnv; bool reflForceEnvUnread = true;
 
     // PHASE-2 V1: reads the G-buffer (depth + normal/roughness for the SSR march) and read-modify-writes the HDR
     // scene color (marches reflections from `target`, then CopyColorFrom(ssrScene) back into `target`). RT
