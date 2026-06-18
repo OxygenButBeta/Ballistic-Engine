@@ -52,6 +52,19 @@ internal static class PropertyModelTests {
             PropertyCategories.Classify(typeof(ISampleModifier), poly) == PropertyCategory.Polymorphic);
         h.Check("unmarked interface → Unsupported",
             PropertyCategories.Classify(typeof(ISampleModifier), unmarked) == PropertyCategory.Unsupported);
+
+        // An ABSTRACT-BObject asset (Texture3D etc.) classifies AssetRef, NEVER Polymorphic — even with
+        // [SerializeReference] (an asset is guid-referenced, never type-swapped + instantiated). This is the
+        // engine contract the editor's PolymorphicDrawer leans on: it must not mistake an abstract asset base
+        // for a polymorphic slot and expand the backend object (the user-reported "Cubemap opens UID/Type/..").
+        var cubemap = typeof(SamplePolyHost).GetProperty(nameof(SamplePolyHost.Cubemap));
+        var markedCubemap = typeof(SamplePolyHost).GetProperty(nameof(SamplePolyHost.MarkedCubemap));
+        h.Check("abstract Texture3D (no marker) → AssetRef (not Nested/Polymorphic)",
+            PropertyCategories.Classify(typeof(Texture3D), cubemap) == PropertyCategory.AssetRef);
+        h.Check("abstract Texture3D + [SerializeReference] → AssetRef (asset wins, never Polymorphic)",
+            PropertyCategories.Classify(typeof(Texture3D), markedCubemap) == PropertyCategory.AssetRef);
+        h.Check("abstract Texture3D by type alone → AssetRef",
+            PropertyCategories.Classify(typeof(Texture3D)) == PropertyCategory.AssetRef);
     }
 
     // ── ARTIFACT 1 — the static TypePlan: members, ordering, [HideInInspector] exclusion ─────────────

@@ -67,6 +67,15 @@ public sealed class SampleCritModifier : ISampleModifier {
 public sealed class SamplePolyHost {
     [SerializeReference] public ISampleModifier Modifier { get; set; }
     public ISampleModifier Unmarked { get; set; }          // no marker → Unsupported (can't instantiate)
+
+    // Abstract-BObject ASSET members (bug 2026-06-18): the engine's asset base types are ABSTRACT
+    // (Texture3D / Texture2D / Mesh / ...; concrete bodies live in the backend, e.g. Dx12Texture3D). An
+    // asset member must classify AssetRef — NEVER Polymorphic — even WITH [SerializeReference], because an
+    // asset is referenced by guid, never type-swapped + instantiated. This is the engine contract the
+    // editor's PolymorphicDrawer relies on (it must NOT steal an abstract-asset member from the asset slot
+    // and expand the backend object's internal fields — the user-reported "Cubemap opens UID/Type/Sky").
+    public Texture3D Cubemap { get; set; }
+    [SerializeReference] public Texture3D MarkedCubemap { get; set; }
 }
 
 // Collection fixture: a List member classifies as Collection (recursion is Phase G2; the model only needs

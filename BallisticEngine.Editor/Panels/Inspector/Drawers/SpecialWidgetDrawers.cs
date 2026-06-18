@@ -254,21 +254,34 @@ public sealed class CollectionElementProperty : IProperty {
 // a nested [SerializeReference] member auto-recurses through this same drawer).
 //
 // CanDraw STRATEGY (declared-TYPE based, the same purely-type contract every sibling drawer uses): an interface
-// or abstract declared type. ITypeDrawer.CanDraw receives only the Type (no member / attribute context -- the
-// DrawerRegistry resolves by type), so [SerializeReference] cannot be tested here. That is FINE: an interface /
-// abstract member WITHOUT [SerializeReference] classifies Unsupported engine-side (PropertyCategories) and
-// serializes to null, so it would otherwise show a dead label -- giving it the implementor dropdown is strictly
-// additive (the dropdown lists derived concrete types; with none it shows just "None"). A concrete base WITH
-// [SerializeReference] (the rarer Polymorphic case) is NOT matched here -- a concrete type already has its own
-// drawer (Nested member-recursion / math-struct / asset / ...), which keeps its existing in-place editing; the
-// type-swap dropdown for a concrete base is deferred (G4). The host owns undo / dirty on an actual pick.
+// or abstract declared type -- EXCEPT a BObject-derived ASSET type. ITypeDrawer.CanDraw receives only the Type
+// (no member / attribute context -- the DrawerRegistry resolves by type), so [SerializeReference] cannot be
+// tested here. That is FINE for the plain-abstract case: an interface / abstract member WITHOUT
+// [SerializeReference] classifies Unsupported engine-side (PropertyCategories) and serializes to null, so it
+// would otherwise show a dead label -- giving it the implementor dropdown is strictly additive (the dropdown
+// lists derived concrete types; with none it shows just "None").
+//
+// BObject EXCLUSION (bug fix 2026-06-18): the engine's asset base types are ABSTRACT (Texture / Texture2D /
+// Texture3D / Mesh / ...; the concrete bodies are backend types like Dx12Texture3D). Those are ASSETS --
+// PropertyCategories.Classify maps any BObject to AssetRef, NEVER Polymorphic, regardless of [SerializeReference]
+// -- so an abstract-asset member like `Skybox.Cubemap` (Texture3D) must resolve AssetSlotDrawer, not this one.
+// But AssetSlotDrawer keys on `IsAssignableFrom(BObject)` (not a concrete-type test), and this drawer was matching
+// EVERY abstract type via last-wins, stealing those members and expanding the backend object's internal fields
+// (the user-reported "Cubemap opens UID/Type/Sky Ambient/..."). Excluding BObject here lets the asset slot win
+// and keeps polymorphism to the genuine [SerializeReference] interface/abstract-NON-asset case. (The comment's
+// old claim that "asset drawers key on concrete types" was wrong -- they key on the BObject base.)
+//
+// A concrete base WITH [SerializeReference] (the rarer Polymorphic case) is NOT matched here -- a concrete type
+// already has its own drawer (Nested member-recursion / math-struct / asset / ...), which keeps its existing
+// in-place editing; the type-swap dropdown for a concrete base is deferred (G4). The host owns undo / dirty.
 public sealed class PolymorphicDrawer : ITypeDrawer {
     readonly IComponentInspectorHost host;
     public PolymorphicDrawer(IComponentInspectorHost host) => this.host = host;
-    // Interface or abstract class declared type: the [SerializeReference] implementor-dropdown case. No other
-    // drawer matches such a type (primitives / enums / math / asset / collection / dict all key on concrete
-    // types), so last-wins registration order versus them is irrelevant; registered last to be safe.
-    public bool CanDraw(Type t) => t is { IsInterface: true } or { IsAbstract: true };
+    // Interface or abstract class declared type, but never a BObject asset (those are AssetSlotDrawer's; an
+    // abstract BObject base must not be mistaken for a [SerializeReference] polymorphic slot). Registered last,
+    // so this exclusion is what stops it from stealing abstract-asset members from the asset slot via last-wins.
+    public bool CanDraw(Type t) =>
+        t is { IsInterface: true } or { IsAbstract: true } && !typeof(BObject).IsAssignableFrom(t);
     public bool Draw(IProperty p, IInspectorGui gui) {
         host.DrawPolymorphicSlot(p, p.ValueType);
         return false;
