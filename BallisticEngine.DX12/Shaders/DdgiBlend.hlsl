@@ -48,9 +48,13 @@ RWTexture2D<float2> DepthAtlas      : register(u1);   // CSDepth target (distinc
 RWStructuredBuffer<float4> ProbeState : register(u2); // CSClassify target: xyz = relocation offset (world), w = active(1/0)
 
 static const float PI = 3.14159265359;
-static const uint RAYS_PER_PROBE = 144u;
-static const uint IRR_TEXELS = 6u;
-static const uint DEPTH_TEXELS = 16u;
+// CHUNK2: active ray count rides Params4.w (144 live / 256 baked) — MUST match DdgiTrace.RaysPerProbe(). The
+// blend loops + RayData indexing use this so the integral matches the rays the trace actually wrote.
+uint RaysPerProbe() { return clamp((uint)Params4.w, 16u, 256u); }
+// CHUNK2: oct texel counts ride DdgiConstants (Params0.x irr / Params0.y depth) so the C# atlas size + the
+// gather UV math + this blend stay in lockstep when fidelity is raised (no static-const drift).
+uint IrrTexels()   { return (uint)Params0.x; }
+uint DepthTexels() { return (uint)Params0.y; }
 static const uint BORDER = 1u;
 
 // Ternary component-select NaN/Inf scrub (NEVER mix(v,0,flag) — NaN*0==NaN, the proven AMD black-hole bug).
@@ -111,7 +115,7 @@ TexelInfo Locate(uint2 px, uint texels) {
 [numthreads(8, 8, 1)]
 void CSIrradiance(uint3 dtid : SV_DispatchThreadID) {
     uint2 px = dtid.xy;
-    TexelInfo info = Locate(px, IRR_TEXELS);
+    TexelInfo info = Locate(px, IrrTexels());
     if (!info.valid) return;
     if (!ProbeActiveThisFrame(info.probe)) return;   // P2.5 round-robin: keep stale tile, don't EMA stale rays
 
@@ -119,11 +123,11 @@ void CSIrradiance(uint3 dtid : SV_DispatchThreadID) {
     float jitter = Hash1(info.probe * 31u + (uint)Params0.w * 2654435761u);
 
     float3 sum = 0.0.xxx; float wsum = 0.0;
-    [loop] for (uint r = 0; r < RAYS_PER_PROBE; r++) {
-        float3 rayDir = SphericalFibonacci(r, RAYS_PER_PROBE, jitter);
+    [loop] for (uint r = 0; r < RaysPerProbe(); r++) {
+        float3 rayDir = SphericalFibonacci(r, RaysPerProbe(), jitter);
         float w = max(dot(texelDir, rayDir), 0.0);       // cosine: gather the hemisphere about texelDir
         if (w <= 0.0) continue;
-        sum += RayData[info.probe * RAYS_PER_PROBE + r].rgb * w;
+        sum += RayData[info.probe * RaysPerProbe() + r].rgb * w;
         wsum += w;
     }
     float3 result = SanitizeIrr(sum / max(wsum, 1e-4));
@@ -144,7 +148,7 @@ void CSIrradiance(uint3 dtid : SV_DispatchThreadID) {
 [numthreads(8, 8, 1)]
 void CSDepth(uint3 dtid : SV_DispatchThreadID) {
     uint2 px = dtid.xy;
-    TexelInfo info = Locate(px, DEPTH_TEXELS);
+    TexelInfo info = Locate(px, DepthTexels());
     if (!info.valid) return;
     if (!ProbeActiveThisFrame(info.probe)) return;   // P2.5 round-robin (must match CSIrradiance)
 
@@ -152,13 +156,13 @@ void CSDepth(uint3 dtid : SV_DispatchThreadID) {
     float jitter = Hash1(info.probe * 31u + (uint)Params0.w * 2654435761u);
 
     float2 sum = 0.0.xx; float wsum = 0.0;
-    [loop] for (uint r = 0; r < RAYS_PER_PROBE; r++) {
-        float3 rayDir = SphericalFibonacci(r, RAYS_PER_PROBE, jitter);
+    [loop] for (uint r = 0; r < RaysPerProbe(); r++) {
+        float3 rayDir = SphericalFibonacci(r, RaysPerProbe(), jitter);
         float w = pow(max(dot(texelDir, rayDir), 0.0), 50.0);   // sharpened: depth wants the near-axis rays
         if (w <= 0.0) continue;
         // abs(): P2.4 encodes backface hits as a NEGATIVE distance for classification; the depth MOMENTS need
         // the geometric (unsigned) distance.
-        float dist = min(abs(RayData[info.probe * RAYS_PER_PROBE + r].a), Params1.x);
+        float dist = min(abs(RayData[info.probe * RaysPerProbe() + r].a), Params1.x);
         sum += float2(dist, dist * dist) * w;
         wsum += w;
     }
@@ -217,10 +221,10 @@ void BorderCopy(uint2 px, uint texels, bool isDepth) {
 }
 
 [numthreads(8, 8, 1)]
-void CSBorderIrr(uint3 dtid : SV_DispatchThreadID) { BorderCopy(dtid.xy, IRR_TEXELS, false); }
+void CSBorderIrr(uint3 dtid : SV_DispatchThreadID) { BorderCopy(dtid.xy, IrrTexels(), false); }
 
 [numthreads(8, 8, 1)]
-void CSBorderDepth(uint3 dtid : SV_DispatchThreadID) { BorderCopy(dtid.xy, DEPTH_TEXELS, true); }
+void CSBorderDepth(uint3 dtid : SV_DispatchThreadID) { BorderCopy(dtid.xy, DepthTexels(), true); }
 
 // --- P2.4 CLASSIFICATION + RELOCATION (1 thread per probe). Reduce over the probe's rays:
 //   * BACKFACE ratio (rays that hit the solid side, encoded as negative distance by the trace): a probe with
@@ -246,9 +250,9 @@ void CSClassify(uint3 dtid : SV_DispatchThreadID) {
 
     uint backfaces = 0, hits = 0;
     float3 push = 0.0.xxx;
-    [loop] for (uint r = 0; r < RAYS_PER_PROBE; r++) {
-        float3 dir = SphericalFibonacci(r, RAYS_PER_PROBE, jitter);
-        float d = RayData[probe * RAYS_PER_PROBE + r].a;
+    [loop] for (uint r = 0; r < RaysPerProbe(); r++) {
+        float3 dir = SphericalFibonacci(r, RaysPerProbe(), jitter);
+        float d = RayData[probe * RaysPerProbe() + r].a;
         if (abs(d) >= Params1.x) continue;   // sky / far miss = open, no contribution to classification
         hits++;
         if (d < 0.0) {                        // backface hit → push strongly toward where the geometry ISN'T

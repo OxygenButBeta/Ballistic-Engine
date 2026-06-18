@@ -26,7 +26,10 @@ public sealed class Dx12Ddgi : IDisposable {
     public const int ProbeCount = ProbesX * ProbesY * ProbesZ;
 
     // --- Octahedral tile sizes (interior texels; a 1px border is added for correct bilinear wrap at edges).
-    public const int IrradianceTexels = 6;    // 6x6 octahedral irradiance per probe (RGBA16F)
+    // CHUNK2 fidelity: 8x8 irradiance (was 6) — sharper indirect, less trilinear smear between texels. The
+    // blend (IrrTexels()) + gather + field-sample all read this from DdgiConstants (Params0.x/y), so the atlas
+    // size, blend, and sample stay in lockstep. Atlas grows 2048x64 -> 2560x80 (still tiny).
+    public const int IrradianceTexels = 8;    // 8x8 octahedral irradiance per probe (RGBA16F)
     public const int DepthTexels = 16;         // 16x16 octahedral depth moments per probe (RG16F)
     const int Border = 1;
     const int IrrTile = IrradianceTexels + 2 * Border;   // 8
@@ -92,7 +95,23 @@ public sealed class Dx12Ddgi : IDisposable {
     }
 
     // --- P2.1 probe-update plumbing ---
-    public const int RaysPerProbe = 144;   // MUST match DdgiTrace/DdgiBlend HLSL (SphericalFibonacci ray count)
+    // RayData + the blend loops are SIZED for MaxRaysPerProbe; the ACTIVE ray count is dynamic (ActiveRays):
+    // 144 live (byte-identical) or higher in BAKED mode where the deep one-shot converge can afford more rays for
+    // a cleaner integral (CHUNK2 fidelity). The active count rides DdgiConstants so the trace/blend read it.
+    public const int RaysPerProbe = 256;   // MAX rays/probe — RayData buffer + DdgiBlend RAYS_PER_PROBE cap
+    int? raysEnv;
+    public int ActiveRays {
+        get {
+            if (raysEnv == null) {
+                bool parsed = int.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_RAYS"), out int n);
+                // Baked mode: 256 rays (max fidelity — frozen field pays it once). Live: 144 (byte-identical to the
+                // pre-CHUNK2 round-robin). Env override clamps to [16, RaysPerProbe].
+                int def = BakedMode ? RaysPerProbe : 144;
+                raysEnv = parsed ? Math.Clamp(n, 16, RaysPerProbe) : def;
+            }
+            return raysEnv.Value;
+        }
+    }
 
     // --- P2.5 GTX-1660 budget lock: ROUND-ROBIN probe update. Trace/blend/classify only the probes whose phase
     // matches this frame (probe % UpdateFraction == phase); the rest keep last frame's atlas (DDGI is built for
@@ -343,7 +362,9 @@ public sealed class Dx12Ddgi : IDisposable {
             // are eligible THIS frame. bakeEnable is 0 in the live path → the band test is bypassed (Params2 round-
             // robin governs), so the non-baked render is byte-identical.
             Params3 = new Vector4(bakeCamPos, BandWidth),
-            Params4 = new Vector4(BakedMode ? 1f : 0f, bakeWave, ConvergeTarget, 0f),
+            // Params4.w = ActiveRays (CHUNK2 dynamic ray count: 144 live / 256 baked). The trace/blend read it
+            // instead of the old hard-coded 144 so fidelity scales with mode without resizing RayData.
+            Params4 = new Vector4(BakedMode ? 1f : 0f, bakeWave, ConvergeTarget, ActiveRays),
         };
     }
 

@@ -89,7 +89,8 @@ float3 Sanitize(float3 v) {
                   isnan(v.z) || isinf(v.z) ? 0.0 : v.z);
 }
 
-uint RaysPerProbe() { return 144u; }   // spherical-Fibonacci ray count per probe (tune in P2.5)
+// CHUNK2: active ray count rides Params4.w (144 live / 256 baked). Clamp to [16, 256] (RayData is sized for 256).
+uint RaysPerProbe() { return clamp((uint)Params4.w, 16u, 256u); }
 
 // Spherical Fibonacci direction i of n, rotated by a per-frame random basis so the probe samples the whole
 // sphere over frames (the temporal accumulation in the blend pass converges it).
