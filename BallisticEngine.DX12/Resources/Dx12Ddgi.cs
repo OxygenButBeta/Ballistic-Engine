@@ -169,6 +169,19 @@ public sealed class Dx12Ddgi : IDisposable {
     bool built;
     int frameCounter;   // drives ray-rotation jitter + the first-frame hard-set in the blend EMA
 
+    // --- STABILITY: stop the field from "boiling" (visibly changing every frame) while the camera/scene is
+    // static. The boiling was three compounding causes: (1) a NEW per-frame jitter seed → different ray dirs →
+    // a different probe estimate every update; (2) the 1/8 round-robin → a different probe SUBSET each frame, so
+    // even with a frozen field the visible set keeps shifting; (3) a slow EMA that never settles. The fix: track
+    // camera motion; when static, FREEZE the jitter seed (rays stop rotating → each probe converges to one
+    // estimate) and let the EMA finish settling. A real move resumes rotation immediately (disocclusion needs
+    // fresh samples). `Origin` snapping already filters sub-cell motion; this filters sub-frame jitter churn.
+    Vector3 lastCamPos;
+    bool haveLastCam;
+    int staticFrames;        // consecutive frames the camera barely moved
+    int jitterSeed;          // the seed actually fed to the ray jitter — frozen while static
+    public bool IsStatic => staticFrames >= 8;
+
     public Dx12Ddgi(Dx12Device device) { dev = device; }
 
     public void EnsureAllocated() {
@@ -189,6 +202,13 @@ public sealed class Dx12Ddgi : IDisposable {
             MathF.Round(cameraPos.Y / Spacing.Y) * Spacing.Y,
             MathF.Round(cameraPos.Z / Spacing.Z) * Spacing.Z);
         Origin = snapped - half;
+
+        // STABILITY: detect a (near-)static camera. Threshold ~2cm/frame — below it the field should converge and
+        // hold, not boil. A move resets the static counter, so jitter rotation resumes the instant the camera moves.
+        float moved = haveLastCam ? (cameraPos - lastCamPos).Length() : 1e9f;
+        lastCamPos = cameraPos; haveLastCam = true;
+        if (moved < 0.02f) staticFrames++;
+        else { staticFrames = 0; jitterSeed = frameCounter; }   // moving → keep advancing the seed with the frame
     }
 
     // Params1 = (maxRayDist, normalBias, feedbackEnable, intensity). feedbackEnable>0.5 → the trace reads
@@ -197,13 +217,20 @@ public sealed class Dx12Ddgi : IDisposable {
     // probe traces/blends this dispatch (warm-up + UpdateFraction==1); else only probes with probe%N==phase.
     public DdgiConstants Constants(int frameIndex, float hysteresis, float intensity, bool feedback, bool fullUpdate) {
         int n = UpdateFraction;
-        bool full = fullUpdate || n <= 1;
+        // STABILITY: while the camera is static, FULL-update every frame with a FROZEN jitter seed. Full-update
+        // kills the round-robin's per-frame subset churn; the frozen seed (jitterSeed stops advancing in Update)
+        // stops the ray dirs rotating, so each probe converges to ONE estimate and the EMA settles to a steady
+        // value instead of boiling. Combined with a higher static hysteresis (set by the caller), the field
+        // visibly STOPS changing a fraction of a second after the camera stops — the Lumen "converge then hold".
+        bool staticNow = IsStatic;
+        bool full = fullUpdate || n <= 1 || staticNow;
         int phase = full ? 0 : ((frameIndex % n) + n) % n;
+        int jit = staticNow ? jitterSeed : frameIndex;   // frozen seed while static → no ray-rotation churn
         return new() {
             OriginSpacingX = new Vector4(Origin, Spacing.X),
             SpacingYZ = new Vector4(Spacing.Y, Spacing.Z, 0, 0),
             ProbeDims = new Vector4(ProbesX, ProbesY, ProbesZ, ProbeCount),
-            Params0 = new Vector4(IrradianceTexels, DepthTexels, hysteresis, frameIndex),
+            Params0 = new Vector4(IrradianceTexels, DepthTexels, hysteresis, jit),
             Params1 = new Vector4(40f, 0.25f, feedback ? 1f : 0f, intensity),
             // Params2.w = emissiveEnable (was pad) — the trace adds emissive self-emission at hits when >0.5.
             Params2 = new Vector4(full ? 1 : n, phase, full ? 1f : 0f, EmissiveEnabled ? 1f : 0f),
@@ -271,7 +298,9 @@ public sealed class Dx12Ddgi : IDisposable {
             registerSpace: 0, offsetInDescriptorsFromTableStart: 1);
         var prevIrrRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 4,  // t4
             registerSpace: 0, offsetInDescriptorsFromTableStart: 2);
-        var t_table = new RootParameter1(new RootDescriptorTable1(tlasRange, cubeRange, prevIrrRange), ShaderVisibility.All);
+        var prevDepthRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 11,  // t11 prev-depth (Chebyshev leak gate)
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 3);
+        var t_table = new RootParameter1(new RootDescriptorTable1(tlasRange, cubeRange, prevIrrRange, prevDepthRange), ShaderVisibility.All);
         var t_mat = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(5, 0), ShaderVisibility.All);
         var t_inst = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(6, 0), ShaderVisibility.All);
         var t_light = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All);
@@ -398,8 +427,12 @@ public sealed class Dx12Ddgi : IDisposable {
         frameCounter++;
 
         // P2.3 multi-bounce: the trace reads the irradiance atlas (t4) → SRV state for the trace dispatch.
+        // The leak gate also reads the DEPTH-moments atlas (t11) → same SRV transition (both feed the field read).
         if (fb)
+        {
             cl.ResourceBarrierTransition(irradianceTex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            cl.ResourceBarrierTransition(depthTex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+        }
         // P2.4: the trace reads ProbeState (t8, last frame's classification) as a root SRV → NonPixelSRV state;
         // the classify pass writes it back as a UAV at the end of this command list.
         cl.ResourceBarrierTransition(probeState, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
@@ -418,9 +451,12 @@ public sealed class Dx12Ddgi : IDisposable {
         int totalThreads = ProbeCount * RaysPerProbe;
         cl.Dispatch((uint)((totalThreads + 63) / 64), 1, 1);
 
-        // Trace done reading the irradiance atlas → back to UnorderedAccess for the blend write below.
+        // Trace done reading the irradiance + depth atlases → back to UnorderedAccess for the blend write below.
         if (fb)
+        {
             cl.ResourceBarrierTransition(irradianceTex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+            cl.ResourceBarrierTransition(depthTex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+        }
         // Trace done reading ProbeState → back to UnorderedAccess for the classify write at the end.
         cl.ResourceBarrierTransition(probeState, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
 
@@ -530,6 +566,57 @@ public sealed class Dx12Ddgi : IDisposable {
     // non-zero fraction, so we can confirm the probe-update pipeline produced sensible, non-zero, smooth data
     // (the P2.1 success gate) WITHOUT a gather pass yet. CPU-side readback, called once after Dispatch; not in
     // the hot path. The atlas is left in UnorderedAccess by DispatchDdgi → transition to CopySource here + back.
+    // PROBE-COLOUR READBACK for the editor gizmo (ShowProbeSpheres). Copies the irradiance atlas to the CPU,
+    // averages each probe's 6x6 interior octahedral tile to ONE mean RGB, and publishes it to GiDebugGrid so the
+    // gizmo can tint each probe sphere with the real bounce colour it caches. Called at a THROTTLED cadence (a
+    // few Hz — see the renderer gate) because a texture readback is a full GPU sync; not per-frame. The atlas is
+    // in UnorderedAccess (left by DispatchDdgi); transitioned to CopySource and back. No-op until the grid is
+    // allocated. Probe flat index = (pz*ProbesY+py)*ProbesX+px (the trace/blend flattening); the atlas tile for a
+    // probe is at (col,row) = (pz*ProbesX+px, py), interior origin (col*IrrTile+Border, row*IrrTile+Border).
+    public unsafe void ReadbackProbeColors() {
+        if (!built || irradianceTex == null) return;
+        int w = IrradianceAtlasW, h = IrradianceAtlasH;
+        const int bpp = 8;   // RGBA16F
+        var footprints = new PlacedSubresourceFootPrint[1];
+        var rowCounts = new uint[1]; var rowSizes = new ulong[1];
+        dev.Device.GetCopyableFootprints(irradianceTex.Description, 0, 1, 0,
+            footprints, rowCounts, rowSizes, out ulong totalBytes);
+        PlacedSubresourceFootPrint fp = footprints[0];
+        int rowPitch = (int)fp.Footprint.RowPitch;
+        var rb = dev.Device.CreateCommittedResource(HeapProperties.ReadbackHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
+        // ExecuteSyncImmediate: the readback must observe the blend writes finished THIS frame (a recorded-only
+        // copy under the pipelined frame would read the atlas mid-frame / before the blend). Throttled, so the
+        // sync cost is paid only a few times a second.
+        dev.ExecuteSyncImmediate(cl => {
+            cl.ResourceBarrierTransition(irradianceTex, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+            cl.CopyTextureRegion(new TextureCopyLocation(rb, fp), 0, 0, 0,
+                new TextureCopyLocation(irradianceTex, 0), null);
+            cl.ResourceBarrierTransition(irradianceTex, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
+        });
+        byte* p = rb.Map<byte>(0);
+        var colors = new Vector3[ProbeCount];
+        for (int pz = 0; pz < ProbesZ; pz++)
+        for (int py = 0; py < ProbesY; py++)
+        for (int px = 0; px < ProbesX; px++) {
+            int col = pz * ProbesX + px, row = py;
+            int ox = col * IrrTile + Border, oy = row * IrrTile + Border;   // interior origin (skip border)
+            float r = 0, g = 0, b = 0; int n = 0;
+            for (int ty = 0; ty < IrradianceTexels; ty++) {
+                byte* line = p + (long)(oy + ty) * rowPitch + (long)ox * bpp;
+                for (int tx = 0; tx < IrradianceTexels; tx++) {
+                    Half* texel = (Half*)(line + tx * bpp);
+                    float vr = (float)texel[0], vg = (float)texel[1], vb = (float)texel[2];
+                    if (float.IsNaN(vr) || float.IsInfinity(vr)) continue;
+                    r += vr; g += vg; b += vb; n++;
+                }
+            }
+            if (n > 0) { float inv = 1f / n; colors[(pz * ProbesY + py) * ProbesX + px] = new Vector3(r * inv, g * inv, b * inv); }
+        }
+        rb.Unmap(0); rb.Dispose();
+        GiDebugGrid.PublishProbeColors(colors);
+    }
+
     public unsafe void DumpIrradianceStats() {
         if (!built || irradianceTex == null) { Console.WriteLine("[DDGI-DBG] not built"); return; }
         int w = IrradianceAtlasW, h = IrradianceAtlasH;

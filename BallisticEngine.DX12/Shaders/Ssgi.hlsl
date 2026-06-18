@@ -194,35 +194,46 @@ float4 PSTemporal(VSOut input) : SV_Target {
     // signal across a camera move). 1.6x is the middle ground: tight enough that a real disocclusion clamps the
     // trail away, loose enough that the per-frame gather noise still averages into history (so a static camera
     // stays smooth and OIDN isn't asked to remove all of it alone).
-    float3 lo = current, hi = current;
+    // VARIANCE neighbourhood clamp (YCoCg-free, but mean±N·sigma instead of raw min/max). A raw min/max box over
+    // a NOISY half-res gather is huge → it clamps almost nothing, so stale GI from before a camera move rides
+    // straight through = the severe ghosting (worst against the bright sky backdrop, where the trail is most
+    // visible). The mean±sigma AABB tracks the SIGNAL, not the noise outliers, so history that disagrees with the
+    // true local bounce is rejected hard even while per-pixel noise is high. clampScale = the live dial (N sigmas).
+    float3 m1 = 0.0.xxx, m2 = 0.0.xxx;
     [unroll] for (int x = -1; x <= 1; x++)
     [unroll] for (int y = -1; y <= 1; y++) {
         float3 c = Sanitize(ColorTex.SampleLevel(LinearClamp, uv + float2(x, y) * texel, 0).rgb);
-        lo = min(lo, c); hi = max(hi, c);
+        m1 += c; m2 += c * c;
     }
-    float clampScale = max(Params1.w, 1.0);   // live "Temporal Clamp" dial (volume Advanced)
-    float3 boxCenter = (lo + hi) * 0.5;
-    float3 boxExtent = (hi - lo) * 0.5 * clampScale + 0.025.xxx;
-    lo = max(boxCenter - boxExtent, 0.0.xxx);
-    hi = boxCenter + boxExtent;
+    m1 /= 9.0; m2 /= 9.0;
+    float3 sigma = sqrt(max(m2 - m1 * m1, 0.0.xxx));
+    float clampScale = max(Params1.w, 1.0);   // live "Temporal Clamp" dial = N sigmas (volume Advanced)
+    float3 lo = max(m1 - sigma * clampScale - 0.01.xxx, 0.0.xxx);
+    float3 hi = m1 + sigma * clampScale + 0.01.xxx;
     float3 clampedHistory = clamp(history.rgb, lo, hi);
 
+    // DISOCCLUSION reject: how far the raw history had to be clamped, relative to the signal range. A big clamp
+    // distance means history disagreed with the current surface (a camera move uncovered new geometry, or we
+    // reprojected onto the sky) → snap toward `current` by collapsing the accumulated history length.
     float boxSize = max(length(hi - lo), 0.04);
     float drift = length(history.rgb - clampedHistory) / boxSize;
-    float reset = smoothstep(1.5, 4.0, drift);
+    // AGGRESSIVE disocclusion: history that strayed even modestly outside the signal band is stale (an edge was
+    // uncovered, or we reprojected onto a different surface / the sky). Flush it HARD — reset toward a 1-frame
+    // history so the trail vanishes instead of lingering. Range 0.3..1.5 (was 0.75..2.5) catches the ghosting
+    // the looser band let through; the variance clamp keeps real noise from tripping it.
+    float reset = smoothstep(0.3, 1.5, drift);
     float histLen = (isnan(history.a) || isinf(history.a)) ? 1.0 : history.a;
     histLen = lerp(histLen, 1.0, reset);
     histLen = min(histLen + 1.0, maxHistory);
 
-    // MOTION-AWARE history shortening: only a FAST pan should collapse the EMA (that's the ghosting case). A
-    // slow look-around or a static camera must keep the full accumulation so noise stays suppressed — otherwise
-    // killing the trail just trades ghosting for grain (the over-aggressive 0.25 slope did exactly that). The
-    // dead-zone (subtract ~1 texel) ignores sub-pixel jitter; the gentle slope only bites real motion, and the
-    // floor keeps a few frames of smoothing even mid-pan so a moving camera isn't pure single-frame noise.
-    float rejectSlope = Params3.w;   // live "Ghosting Reject" dial (volume Advanced); 0 = never flush
+    // MOTION-AWARE history shortening: a moving camera is THE ghosting case (the trail is the old GI smearing
+    // across the pan). Collapse the EMA toward the current frame as screen motion rises. More aggressive than
+    // before: a smaller dead-zone (0.5 texel) + a steeper floor so even a slow look-around flushes the trail,
+    // while a truly static camera (motionPx≈0) keeps the full accumulation for noise suppression.
+    float rejectSlope = max(Params3.w, 0.06) * 2.5;   // live "Ghosting Reject" dial, scaled up for a firmer flush
     float motionPx = length(motion / max(texel, 1e-6));
-    float motionTrust = saturate(1.0 - max(motionPx - 1.0, 0.0) * rejectSlope);   // static/slow → 1; a fast pan drops it
-    histLen = lerp(max(histLen * 0.35, 4.0), histLen, motionTrust);
+    float motionTrust = saturate(1.0 - max(motionPx - 0.5, 0.0) * rejectSlope);   // static → 1; any real motion drops it fast
+    histLen = lerp(2.0, histLen, motionTrust);   // mid-motion floors at ~2 frames (less smear than the old 0.35*hist)
 
     float alpha = 1.0 / histLen;
     float3 accumulated = lerp(clampedHistory, current, alpha);

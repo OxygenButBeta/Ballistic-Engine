@@ -44,4 +44,33 @@ public static class GiDebugGrid {
         spacing.X * (ProbesX - 1),
         spacing.Y * (ProbesY - 1),
         spacing.Z * (ProbesZ - 1));
+
+    // ── Probe irradiance COLOUR bridge (DX12 → Editor gizmo). The DX12 backend periodically reads the DDGI
+    // irradiance atlas back to the CPU, averages each probe's tile to one mean colour, and publishes it here;
+    // the Volume gizmo (ShowProbeSpheres) reads it to tint each sphere with the real bounce colour it caches —
+    // the "I can't see the colour data in the spheres" view. This is plain CPU data (no DX12 types), so the
+    // Engine/Editor layers can read it without breaking the layering rule. RAW HDR linear (the gizmo tonemaps).
+    // ProbeColorFrame increments on every publish so the gizmo knows the data is live (and how stale).
+    public static readonly Vector3[] ProbeColors = new Vector3[ProbeCount];
+    public static bool HasProbeColors;     // set true after the first publish (else the gizmo uses a placeholder)
+    public static int ProbeColorFrame;     // bumped each publish; lets the gizmo show "no live data" if frozen
+
+    // The gizmo SETS this each frame it wants live probe colours (ShowProbeSpheres on). The DX12 DDGI pass reads
+    // it and does a THROTTLED atlas readback only while it's requested — so the GPU readback cost is paid only
+    // when the debug view is actually open, never in normal rendering. Stored as a frame stamp: the gizmo writes
+    // the current frame; the renderer compares against its own counter to decide "requested recently".
+    public static bool ProbeColorsRequested;
+    public static void RequestProbeColors() => ProbeColorsRequested = true;
+
+    // Called by the DX12 DDGI readback. `colors` is indexed by the SAME probe flattening as ProbePosition's
+    // (pz*ProbesY + py)*ProbesX + px order Dx12Ddgi uses. Copies in (the gizmo reads on the main thread).
+    public static void PublishProbeColors(System.ReadOnlySpan<Vector3> colors) {
+        int n = System.Math.Min(colors.Length, ProbeColors.Length);
+        for (int i = 0; i < n; i++) ProbeColors[i] = colors[i];
+        HasProbeColors = true;
+        ProbeColorFrame++;
+    }
+
+    // Probe flat index in the DDGI/atlas order — the gizmo maps its (px,py,pz) loop to a ProbeColors index.
+    public static int ProbeIndex(int px, int py, int pz) => (pz * ProbesY + py) * ProbesX + px;
 }

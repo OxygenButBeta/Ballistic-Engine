@@ -18,6 +18,7 @@ TextureCube Irradiance : register(t3);              // sky/IBL cube (bound for p
                                                     // P4.0 takes the far field purely from the DDGI cache —
                                                     // a grid-boundary sky term using this is a P4.1 option)
 Texture2D<float4> DdgiIrradiance : register(t4);    // the DDGI world-cache irradiance atlas (far-field handoff)
+Texture2D<float2> DdgiDepth      : register(t11);   // DDGI depth-moments atlas — the Chebyshev LEAK GATE
 RWStructuredBuffer<float4> RayData : register(u0);   // [probe * RaysPerProbe + ray] = (radiance.rgb, dist)
 
 cbuffer ScreenProbeConstants : register(b0) {
@@ -152,6 +153,11 @@ float3 SampleDdgiField(float3 worldPos, float3 N) {
     float2 atlasSize = float2((uint)DdgiProbeDims.x * (uint)DdgiProbeDims.z, (uint)DdgiProbeDims.y) * float(tile);
     float2 octI = DdgiOctEncode(N);
 
+    // Depth-moments atlas layout for the Chebyshev LEAK GATE (16x16 tiles + 2 border).
+    uint depTexels = 16u;
+    uint depTile = depTexels + 2u;
+    float2 depAtlasSize = float2((uint)DdgiProbeDims.x * (uint)DdgiProbeDims.z, (uint)DdgiProbeDims.y) * float(depTile);
+
     float3 sum = 0.0.xxx; float wsum = 0.0;
     [unroll] for (int i = 0; i < 8; i++) {
         int3 off = int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
@@ -160,11 +166,29 @@ float3 SampleDdgiField(float3 worldPos, float3 N) {
         uint probe = ((uint)c.z * (uint)DdgiProbeDims.y + (uint)c.y) * (uint)DdgiProbeDims.x + (uint)c.x;
         if (DdgiProbeState[probe].w < 0.5) continue;   // skip inactive (buried) DDGI probes
         float3 toProbe = DdgiProbePos((uint)c.x, (uint)c.y, (uint)c.z) - biasPos;
-        float3 dirToProbe = dot(toProbe, toProbe) > 1e-10 ? normalize(toProbe) : N;
+        float distToProbe = length(toProbe);
+        float3 dirToProbe = distToProbe > 1e-5 ? toProbe / distToProbe : N;
         float3 triv = lerp(1.0 - f, f, (float3)off);
         float trilinear = triv.x * triv.y * triv.z;
         float wrap = saturate(dot(dirToProbe, N) * 0.5 + 0.5); wrap = wrap * wrap + 0.2;
-        float wgt = trilinear * wrap;
+
+        // CHEBYSHEV VARIANCE VISIBILITY — THE LEAK GATE. The screen-probe far-field handoff read the world cache
+        // with NO occlusion test, so a sealed interior pulled sky-lit probes sitting OUTSIDE the wall as if it
+        // weren't there → "lit room with no light". Reject a probe the receiver can't actually see (it's behind
+        // a wall): compare the probe's stored mean visible distance (toward the receiver) to the real distance.
+        uint dcol = (uint)c.z * (uint)DdgiProbeDims.x + (uint)c.x, drow = (uint)c.y;
+        float2 depOct = DdgiOctEncode(-dirToProbe);
+        float2 depUv = (float2(dcol * depTile, drow * depTile) + 1.0 + depOct * float(depTexels)) / depAtlasSize;
+        float2 mom = DdgiDepth.SampleLevel(LinearClamp, depUv, 0).rg;
+        float vis = 1.0;
+        if (distToProbe > mom.x) {
+            float variance = abs(mom.x * mom.x - mom.y);
+            float diff = distToProbe - mom.x;
+            vis = variance / (variance + diff * diff);
+            vis = max(vis * vis * vis, 0.0);
+        }
+
+        float wgt = trilinear * wrap * vis;
         if (wgt < 1e-6) continue;
         uint col = (uint)c.z * (uint)DdgiProbeDims.x + (uint)c.x, row = (uint)c.y;
         float2 texelXY = float2(col * tile, row * tile) + 1.0 + octI * float(irrTexels);

@@ -105,30 +105,35 @@ void CSIntegrate(uint3 dtid : SV_DispatchThreadID) {
     uint texels = (uint)SpParams2.x;
     float2 atlasSize = float2(probesX, probesY) * float(texels + 2u * BORDER);
 
-    // --- BILATERAL 4-PROBE GATHER. The pixel sits at fractional grid coords (px+0.5)/ds - 0.5 (probes are at
-    // tile centres). The 2x2 enclosing probes are (gx,gy)+{0,1}^2; bilinear weight by the fractional position,
-    // x depth/plane similarity x normal similarity x validity. ---
+    // --- BILATERAL 4x4-PROBE GATHER (Lumen-style spatial filter in radiance-cache space). The pixel sits at
+    // fractional grid coords (px+0.5)/ds - 0.5. The old gather used only the 2x2 enclosing probes — too few to
+    // smooth the per-probe Monte-Carlo noise (each probe is one frame of 64 jittered rays). Widening to the 4x4
+    // neighbourhood SHARES radiance across ~16 probes, which is exactly how Lumen kills noise: average the
+    // precious traces over a probe neighbourhood, weighted so edges/silhouettes don't bleed:
+    //   - a smooth GAUSSIAN spatial falloff (replaces bilinear; the 2 inner probes dominate, outer ones feather),
+    //   - the SAME depth/plane test (a probe off the pixel's tangent plane drops out → no halo across edges),
+    //   - the SAME normal test (a probe facing away drops out).
+    // Renormalised by the surviving weight; nearest-probe fallback when all are rejected (a thin silhouette).
     float2 g = (float2(px) + 0.5) / float(ds) - 0.5;   // probe-grid coords (probe centre = integer)
-    int2 g0 = (int2)floor(g);
-    float2 f = g - (float2)g0;
+    int2 gc = (int2)round(g);                          // nearest probe cell (centre of the 4x4 window)
 
     // A plane-distance scale: how far off the pixel's tangent plane a probe may be before it's rejected. Tie it
     // to the world spacing between probes (≈ depth*tile/focal — approximate with a fraction of the view depth).
-    float planeScale = max(abs(worldPos.z - 0.0) * 0.0 + length(worldPos) * 0.05, 0.05);
+    float planeScale = max(length(worldPos) * 0.05, 0.05);
 
     float3 sumE = 0.0.xxx; float sumW = 0.0;
     uint nearestProbe = 0; float nearestW = -1.0;
-    [unroll] for (int i = 0; i < 4; i++) {
-        int2 off = int2(i & 1, (i >> 1) & 1);
-        int2 c = g0 + off;
+    [unroll] for (int dy = -1; dy <= 2; dy++)
+    [unroll] for (int dx = -1; dx <= 2; dx++) {
+        int2 c = gc + int2(dx, dy);
         if (c.x < 0 || c.y < 0 || c.x >= (int)probesX || c.y >= (int)probesY) continue;
         uint probe = (uint)c.y * probesX + (uint)c.x;
         float4 pp = ProbePos[probe];
         if (pp.w < 0.5) continue;   // probe landed on sky
 
-        // Bilinear weight.
-        float2 bw2 = lerp(1.0 - f, f, (float2)off);
-        float bilinear = bw2.x * bw2.y;
+        // Smooth spatial falloff: Gaussian in probe-grid distance from the pixel's fractional position.
+        float2 d2 = (float2)c - g;
+        float spatial = exp(-dot(d2, d2) * 0.5);
 
         // Plane/depth test: distance of the probe's world position from the pixel's tangent plane.
         float planeDist = abs(dot(pp.xyz - worldPos, N));
@@ -139,7 +144,7 @@ void CSIntegrate(uint3 dtid : SV_DispatchThreadID) {
         float wNormal = saturate(dot(pN, N));
         wNormal = wNormal * wNormal;
 
-        float weight = bilinear * wPlane * wNormal;
+        float weight = spatial * wPlane * wNormal;
         if (weight > nearestW) { nearestW = weight; nearestProbe = probe; }   // best for the fallback
         if (weight < 1e-5) continue;
 
@@ -150,10 +155,19 @@ void CSIntegrate(uint3 dtid : SV_DispatchThreadID) {
     float3 E;
     if (sumW > 1e-4) E = sumE / sumW;
     else if (nearestW >= 0.0) E = SampleProbe(nearestProbe, N, texels, atlasSize);   // all rejected → nearest
-    else return;   // no valid probe at all (all sky) → no GI
+    else { Output[px] = float4(0, 0, 0, 1); return; }   // no valid probe → WRITE BLACK (was `return`, leaving the
+                                                        // UAV's stale value = the torn/garbage speckle on edges)
+
+    // Firefly clamp on the irradiance BEFORE the albedo product: a single probe texel near the fp16 ceiling (a
+    // bright bounce hit) upsampled to full-res shows as the white speckle dotting the walls/statue. Cap E to a
+    // soft multiple of its own luma's neighbourhood — here a hard but high ceiling kills the Inf-class spikes
+    // while leaving legitimate bright bounce intact (the shared OIDN + temporal pass smooth the rest).
+    E = Sanitize(E);
+    float eLuma = dot(E, float3(0.2126, 0.7152, 0.0722));
+    if (eLuma > 8000.0) E *= 8000.0 / max(eLuma, 1e-4);   // clamp raw-HDR irradiance fireflies
 
     // Indirect diffuse exitance = albedo * E, pre-exposed to the ssgiTarget contract (PSCombine multiplies by
     // 1/preExp + Intensity). NOT *intensity here — PSCombine applies SsgiIntensity.
-    float3 outRgb = Sanitize(albedo * Sanitize(E)) * SpParams1.w;
+    float3 outRgb = Sanitize(albedo * E) * SpParams1.w;
     Output[px] = float4(outRgb, 1.0);
 }

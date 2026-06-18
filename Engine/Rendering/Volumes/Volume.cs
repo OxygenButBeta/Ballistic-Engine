@@ -173,8 +173,12 @@ public class Volume : Behaviour {
         int z0 = ProbeRangeMin(cam.Z, origin.Z, spacing.Z, d, GiDebugGrid.ProbesZ);
         int z1 = ProbeRangeMax(cam.Z, origin.Z, spacing.Z, d, GiDebugGrid.ProbesZ);
 
-        // Placeholder colour (stage 2 = real irradiance from the GPU atlas readback). Yellow-green probes.
-        gizmos.Color = new Vector3(0.7f, 0.9f, 0.4f);
+        // Ask the renderer to publish live probe irradiance (throttled GPU readback) — only while this gizmo is
+        // drawn, so closed = no readback cost. The colours arrive a frame or two later in GiDebugGrid.ProbeColors.
+        GiDebugGrid.RequestProbeColors();
+        bool liveColors = GiDebugGrid.HasProbeColors;
+        Vector3 placeholder = new(0.7f, 0.9f, 0.4f);   // yellow-green, used until the first readback lands
+        gizmos.Color = placeholder;
         float markerR = MathF.Min(spacing.X, MathF.Min(spacing.Y, spacing.Z)) * 0.12f;
 
         for (int px = x0; px <= x1; px++)
@@ -183,11 +187,35 @@ public class Volume : Behaviour {
             Vector3 p = GiDebugGrid.ProbePosition(origin, spacing, px, py, pz);
             if ((p - cam).LengthSquared() > d2)
                 continue;
+            // Tint the sphere with the probe's REAL cached irradiance. The readback is RAW HDR linear, so
+            // tonemap it for the gizmo (Reinhard + sqrt gamma) — a bright cache shows bright, a dark one dark,
+            // and the hue reveals what colour each probe bounces (the "see the colour data" view).
+            if (liveColors && ShowProbeSpheres) {
+                Vector3 c = GiDebugGrid.ProbeColors[GiDebugGrid.ProbeIndex(px, py, pz)];
+                gizmos.Color = TonemapProbe(c);
+            }
             if (ShowProbeSpheres)
                 gizmos.DrawWireSphere(p, markerR);
             else
                 DrawCrossMarker(gizmos, p, markerR);
         }
+    }
+
+    // Raw HDR linear probe irradiance → a viewable gizmo colour. The field is RAW radiance (~1e3–5e3), so a
+    // naive exposure saturated every probe to white (the "spheres are all white" bug). Normalise by the probe's
+    // own luminance to keep the HUE (what colour it bounces) and use the brightness only for a gentle value, so
+    // a red-bounce probe reads red and a sky-blue one reads blue regardless of absolute intensity. Reinhard on a
+    // SMALL exposure gives the value; sqrt gamma lifts mid-tones for the thin wire lines.
+    static Vector3 TonemapProbe(Vector3 c) {
+        c = new Vector3(MathF.Max(c.X, 0f), MathF.Max(c.Y, 0f), MathF.Max(c.Z, 0f));
+        float luma = c.X * 0.2126f + c.Y * 0.7152f + c.Z * 0.0722f;
+        // Hue = colour normalised by its own luminance (keeps the chroma, drops the absolute scale).
+        Vector3 hue = luma > 1e-4f ? c * (1f / luma) : Vector3.One;
+        // Value = a soft tonemap of the luminance so a dim probe is darker, a bright one lighter, neither white.
+        float v = luma / (luma + 800f);          // 800 ≈ a typical mid probe irradiance → ~0.5 value
+        v = MathF.Sqrt(MathF.Min(v, 1f)) * 0.9f + 0.1f;   // lift + floor so even a dark probe's wire is visible
+        Vector3 col = hue * v;
+        return new Vector3(MathF.Min(col.X, 1f), MathF.Min(col.Y, 1f), MathF.Min(col.Z, 1f));
     }
 
     // A cheap 3-line "+" cross marker (6 DrawLine calls' worth via 3 axes), far cheaper than a 120-line

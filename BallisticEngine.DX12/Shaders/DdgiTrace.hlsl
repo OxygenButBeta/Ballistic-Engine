@@ -15,6 +15,7 @@
 RaytracingAccelerationStructure Scene : register(t0);
 TextureCube Irradiance : register(t3);              // sky/IBL irradiance (the sky term feeding open-sky probes)
 Texture2D<float4> PrevIrradiance : register(t4);    // P2.3: LAST frame's DDGI irradiance atlas (multi-bounce)
+Texture2D<float2> PrevDepth : register(t11);        // LAST frame's DDGI depth-moments atlas — Chebyshev leak gate
 RWStructuredBuffer<float4> RayData : register(u0);   // [probe * RaysPerProbe + ray] = (radiance.rgb, dist)
 
 cbuffer DdgiConstants : register(b0) {
@@ -153,17 +154,43 @@ float3 SampleIrradianceField(float3 worldPos, float3 N) {
     float2 atlasSize = float2((uint)ProbeDims.x * (uint)ProbeDims.z, (uint)ProbeDims.y) * float(tile);
     float2 octI = TraceOctEncode(N);     // sample along the surface normal (diffuse receiver)
 
+    // Depth-moments atlas layout (16x16 tiles, +2 border) — for the Chebyshev LEAK GATE below.
+    uint depTexels = (uint)Params0.y;
+    uint depTile = depTexels + 2u;
+    float2 depAtlasSize = float2((uint)ProbeDims.x * (uint)ProbeDims.z, (uint)ProbeDims.y) * float(depTile);
+
     float3 sum = 0.0.xxx; float wsum = 0.0;
     [unroll] for (int i = 0; i < 8; i++) {
         int3 off = int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
         int3 c = baseC + off;
         if (any(c < 0) || any(c >= dims)) continue;
-        float3 toProbe = ProbePos((uint)c.x, (uint)c.y, (uint)c.z) - biasPos;
-        float3 dirToProbe = dot(toProbe, toProbe) > 1e-10 ? normalize(toProbe) : N;
+        float3 probeP = ProbePos((uint)c.x, (uint)c.y, (uint)c.z);
+        float3 toProbe = probeP - biasPos;
+        float distToProbe = length(toProbe);
+        float3 dirToProbe = distToProbe > 1e-5 ? toProbe / distToProbe : N;
         float3 triv = lerp(1.0 - f, f, (float3)off);
         float trilinear = triv.x * triv.y * triv.z;
         float wrap = saturate(dot(dirToProbe, N) * 0.5 + 0.5); wrap = wrap * wrap + 0.2;
-        float w = trilinear * wrap;
+
+        // CHEBYSHEV VARIANCE VISIBILITY — THE LEAK GATE. Was missing here (this field read fed the screen-probe
+        // far-field + multi-bounce ambient), so a closed interior receiver could read a probe SITTING OUTSIDE the
+        // wall (it sees the sky) as if the wall weren't there → sky/IBL light leaking into a sealed room with no
+        // light. Sample the probe's depth moments toward the receiver; if the receiver is statistically FARTHER
+        // than the probe can "see" in that direction, it's occluded (behind a wall) → drop the probe. Same math
+        // as DdgiGather (the camera-visible gather already had this; the field read did not).
+        uint dcol = (uint)c.z * (uint)ProbeDims.x + (uint)c.x, drow = (uint)c.y;
+        float2 depOct = TraceOctEncode(-dirToProbe);   // from the probe toward the receiver
+        float2 depUv = (float2(dcol * depTile, drow * depTile) + 1.0 + depOct * float(depTexels)) / depAtlasSize;
+        float2 mom = PrevDepth.SampleLevel(LinearClamp, depUv, 0).rg;
+        float vis = 1.0;
+        if (distToProbe > mom.x) {
+            float variance = abs(mom.x * mom.x - mom.y);
+            float diff = distToProbe - mom.x;
+            vis = variance / (variance + diff * diff);
+            vis = max(vis * vis * vis, 0.0);   // sharpen (RTXGI) — kill faint leaks
+        }
+
+        float w = trilinear * wrap * vis;
         if (w < 1e-6) continue;
         uint col = (uint)c.z * (uint)ProbeDims.x + (uint)c.x, row = (uint)c.y;
         float2 texelXY = float2(col * tile, row * tile) + 1.0 + octI * float(irrTexels);

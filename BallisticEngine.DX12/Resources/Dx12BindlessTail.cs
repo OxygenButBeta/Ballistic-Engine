@@ -47,12 +47,12 @@ internal static class Dx12BindlessTail
 
     // Per-block USED slot counts (descriptors each pass actually writes; asserted <= reserved).
     //   RtRefl   : t0 TLAS, t1 depth, t2 normal, t3 material, t4 irr cube, t5 prefilter, t6 DDGI atlas, u0 ssr (8)
-    //   ScreenPb : t0 TLAS, t1 irr cube, t2 DDGI atlas                                                       (3)
-    //   DDGI     : t0 TLAS, t1 irr cube, t2 prev-irr atlas                                                   (3)
+    //   ScreenPb : t0 TLAS, t1 irr cube, t2 DDGI atlas, t3 DDGI depth (leak gate)                            (4)
+    //   DDGI     : t0 TLAS, t1 irr cube, t2 prev-irr atlas, t3 prev-DEPTH atlas (Chebyshev leak gate)         (4)
     //   RtGi     : t0 TLAS, t1 depth, t2 normal, t3 irr cube, t4 lit scene, u0 ssgiTarget                    (6)
     public const int RtReflUsed = 8;
-    public const int ScreenProbeUsed = 3;
-    public const int DdgiUsed = 3;
+    public const int ScreenProbeUsed = 4;   // +1: DDGI depth atlas (leak gate) fills the 4th reserved slot
+    public const int DdgiUsed = 4;   // +1: the prev-depth atlas for the leak gate fills the 4th reserved slot
     public const int RtGiUsed = 6;
 
     // Total tail size (sum of reserved blocks) — derived, never hand-written.

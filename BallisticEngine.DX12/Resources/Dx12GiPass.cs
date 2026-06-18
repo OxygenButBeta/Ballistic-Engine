@@ -142,6 +142,7 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
     // inline constants exactly (the Reflections pass keeps its own RtRefl tail below).
     bool ddgiLogged;
     bool ddgiDebugDumped;
+    int probeColorThrottle;   // throttles the editor probe-colour readback (every ~12th GI frame when requested)
     Dx12ScreenProbe screenProbe; // P4: screen-space radiance probes (final gather)
     bool screenProbeLogged;
 
@@ -624,18 +625,33 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
                 Shader4ComponentMapping = ShaderComponentMapping.Default,
                 Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
             }, bh.Cpu(DdgiTableBase + 2));
+            // t11 (table offset +3) = LAST frame's DEPTH-moments atlas — the Chebyshev LEAK GATE for the field
+            // read (SampleIrradianceField). Without it a sealed-interior receiver pulled sky-lit probes sitting
+            // OUTSIDE the wall → light leaking into a dark room. RG16F (mean, mean²).
+            dev.Device.CreateShaderResourceView(ddgi.DepthTex, new ShaderResourceViewDescription
+            {
+                Format = Format.R16G16_Float,
+                ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
+            }, bh.Cpu(DdgiTableBase + 3));
 
             // One trace+blend+classify cycle (its own submit). `full` = warm-up / round-robin off (every probe).
             // P0a: ExecuteSyncImmediate (NOT the frame-list append) — the DDGI multi-bounce feedback reads the
             // PREVIOUS update's atlas, so each iteration must complete before the next. Submit/sync fix, NOT an
             // algorithm change.
+            // STABILITY: a HIGHER hysteresis while the camera is static (0.97 → 0.985) lets the now-frozen-jitter
+            // field settle to a steady value without boiling; a moving camera keeps the responsive 0.97 so new
+            // light still appears quickly. The frozen jitter (Constants) is what actually stops the churn; this
+            // just smooths the last bit of settle.
+            float ddgiHyst = ddgi.IsStatic ? 0.985f : 0.97f;
             void RunDdgiUpdate(bool full) => dev.ExecuteSyncImmediate(cl =>
             {
                 cl.SetDescriptorHeaps(bh.Heap);
                 ddgi.DispatchDdgi(cl, bh, bh.Gpu(DdgiTableBase),
                     rtGiSunCb.GPUVirtualAddress, gpuDriven.MaterialsGpuAddress,
                     rtGeometry.InstancesGpuAddress, clusteredLights.LightBufGpuAddress,
-                    hysteresis: 0.97f, intensity: MathF.Max(ctx.PostFX.SsgiIntensity, 0f),
+                    hysteresis: ddgiHyst, intensity: MathF.Max(ctx.PostFX.SsgiIntensity, 0f),
                     feedback: true, // P2.3 multi-bounce
                     fullUpdate: full);
             });
@@ -660,6 +676,17 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
             {
                 ddgiDebugDumped = true;
                 ddgi.DumpIrradianceStats();
+            }
+
+            // PROBE-COLOUR readback for the editor gizmo (ShowProbeSpheres). Only while the gizmo requests it,
+            // and THROTTLED to every ~12th GI frame (a texture readback is a full GPU sync — a few Hz is plenty
+            // for a debug tint). The request flag is cleared so a closed gizmo stops the readback next frame.
+            // The gizmo requests live probe colours; BALLISTIC_DX12_PROBE_COLORS=1 forces it headless (test door).
+            if (GiDebugGrid.ProbeColorsRequested ||
+                Environment.GetEnvironmentVariable("BALLISTIC_DX12_PROBE_COLORS") == "1")
+            {
+                if ((probeColorThrottle++ % 12) == 0) ddgi.ReadbackProbeColors();
+                GiDebugGrid.ProbeColorsRequested = false;
             }
 
             // The compute gather/place reads depth as SRV t0 → NON_PIXEL state (shared by both GI sources below).
@@ -806,15 +833,31 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
             Shader4ComponentMapping = ShaderComponentMapping.Default,
             Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
         }, bh.Cpu(ScreenProbeTableBase + 2));
-        // The DDGI atlas is in UnorderedAccess (left so by DispatchDdgi) → the trace reads it as a NonPixelSRV.
-        dev.ExecuteSync(cl => cl.ResourceBarrierTransition(ddgi.IrradianceTex,
-            ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource));
+        // t11 (table offset +3) = DDGI DEPTH-moments atlas — the Chebyshev LEAK GATE for the far-field read
+        // (SampleDdgiField). Without it the sealed-interior screen probes pulled sky-lit probes from OUTSIDE the
+        // wall → a dark room lit by leaked sky. RG16F (mean, mean²).
+        dev.Device.CreateShaderResourceView(ddgi.DepthTex, new ShaderResourceViewDescription
+        {
+            Format = Format.R16G16_Float,
+            ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
+            Shader4ComponentMapping = ShaderComponentMapping.Default,
+            Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
+        }, bh.Cpu(ScreenProbeTableBase + 3));
+        // Both DDGI atlases are in UnorderedAccess (left so by DispatchDdgi) → the trace reads them as NonPixelSRV.
+        dev.ExecuteSync(cl =>
+        {
+            cl.ResourceBarrierTransition(ddgi.IrradianceTex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            cl.ResourceBarrierTransition(ddgi.DepthTex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+        });
         screenProbe.DispatchTrace(bh, bh.Gpu(ScreenProbeTableBase),
             rtGiSunCb.GPUVirtualAddress, gpuDriven.MaterialsGpuAddress, rtGeometry.InstancesGpuAddress,
             clusteredLights.LightBufGpuAddress, ddgi.ProbeStateGpuAddress);
-        // DDGI atlas back to UnorderedAccess for next frame's DDGI blend.
-        dev.ExecuteSync(cl => cl.ResourceBarrierTransition(ddgi.IrradianceTex,
-            ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess));
+        // Both DDGI atlases back to UnorderedAccess for next frame's DDGI blend.
+        dev.ExecuteSync(cl =>
+        {
+            cl.ResourceBarrierTransition(ddgi.IrradianceTex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+            cl.ResourceBarrierTransition(ddgi.DepthTex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+        });
 
         // BLEND: rays → octahedral radiance tile (+ border).
         screenProbe.DispatchBlend();

@@ -329,7 +329,8 @@ public sealed class Dx12ScreenProbe : IDisposable {
         var tlas = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, 0, 0, 0);   // t0
         var cube = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, 3, 0, 1);   // t3
         var ddgiAtlas = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, 4, 0, 2);   // t4
-        var table = new RootParameter1(new RootDescriptorTable1(tlas, cube, ddgiAtlas), ShaderVisibility.All);
+        var ddgiDepth = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, 11, 0, 3);  // t11 DDGI depth (leak gate)
+        var table = new RootParameter1(new RootDescriptorTable1(tlas, cube, ddgiAtlas, ddgiDepth), ShaderVisibility.All);
         var mat = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(5, 0), ShaderVisibility.All);
         var inst = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(6, 0), ShaderVisibility.All);
         var light = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All);
