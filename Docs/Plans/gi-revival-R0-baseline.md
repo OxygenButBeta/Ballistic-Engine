@@ -727,3 +727,148 @@ SSGI + screen-probe gather + DDGI + RT-refl; **NO per-pixel RT-GI hit** — DDGI
 **★ R2.1 PRESETS WRITTEN + CALIBRATED (no code change — DATA + calibration chunk; the GiQuality enum + dial
 derivation is R3.2, the gather-only branch + two-rate is R2.2). Sıradaki = R2.2 (two rates: on-screen fast
 SSGI+screen-probe + off-screen loose DDGI round-robin; budget the two latencies separately).**
+
+---
+
+## R2.2 — Two update rates: measure + budget + document (2026-06-18, HEAD `b64df298` + 8-file post-FX WIP)
+
+> PROVISIONAL POLICY applied: re-grepped EVERY load-bearing claim against the working tree at first use —
+> "does the round-robin already exist?", the gather-only-branch wiring claim from R2.1 §(B), the DDGI/SSGI/
+> screen-probe convergence constants, the reference GI-isolate SHAs — all from fresh `git`/`grep`/`read`/build/
+> headless-capture, NOT memory or the R2.1 doc text. **NO code change** — R2.2 turned out to be a measure+
+> budget+document chunk (like R1.x): both rates ALREADY EXIST in the tree, fully wired. Raw: `e:/tmp/gi-r22/`.
+
+### (0) ‼ THE LOAD-BEARING PROVISIONAL-POLICY CATCH — the gather-only branch ALREADY EXISTS
+
+R2.1 §(B) (and the R2.2 handoff) claimed the "DDGI gather + screen-probe WITHOUT the per-pixel RT-GI march"
+(R0.4 High) "**needs a new code branch in `Dx12GiPass`**, deferred to R2.2." **Re-grepping the tree REFUTES
+this.** The branch already exists as the DEFAULT `GiMode==RayTraced` configuration:
+
+- `Dx12GiPass.DrawRtGi` (`Dx12GiPass.cs:541`) runs the DDGI round-robin update (`:563-655`), then hits a
+  **three-way GI-source fork**:
+  1. **`ScreenProbeEnabled` (DEFAULT ON when DDGI on, `:669-674`):** `DrawScreenProbeGather` → screen-probe
+     trace (short near/mid rays, DDGI far-field handoff on miss) → `SsgiResolveAndCombine` → **`return` at
+     `:673`.** The per-pixel cosine RT-GI `DispatchRays` (`:729-743`) is **NEVER REACHED** on this path.
+  2. **DDGI per-pixel gather (`BALLISTIC_DX12_SCREENPROBE=0`, `:676-694`):** `ddgi.DispatchGather` replaces
+     the per-pixel march → `return at :694`. Per-pixel `DispatchRays` again NOT reached.
+  3. **Per-pixel cosine RT-GI `DispatchRays` (`:715-744`):** reached ONLY when `DdgiEnabled(ctx)` is FALSE
+     (the whole `if (DdgiEnabled)` block, `:563-695`, returns). i.e. the brute per-pixel RT-GI march is the
+     **no-DDGI** fallback, not the default High path.
+- Defaults (`Dx12GiPass.cs:933-957`): `DdgiEnabled` ← `ctx.PostFX.Ddgi` (volume `worldRadianceCache`),
+  `ScreenProbeEnabled` ← `ctx.PostFX.ScreenProbes` — both **true in the R2.1 High preset**. So **R0.4 High
+  ("screen-probe + SSGI + DDGI + RT-refl, per-pixel RT-GI OFF") IS the default `GiMode==RayTraced` path** —
+  no new branch needed. The R2.1 §(B) "needs a new code branch" claim is a STALE read of the code (it
+  over-read `:538-541` "DrawRtGi hosts the hierarchy AND is the per-pixel trace" as "they're one indivisible
+  pass"; in fact the per-pixel `DispatchRays` is the THIRD fork the DDGI+screen-probe early-returns skip).
+
+**★ R2.2 WIRING DECISION (recorded, supersedes R2.1 §(B)'s deferred wiring gap):** the gather-only High
+configuration needs **NO new code** — it is `GiMode=RayTraced` + `Ddgi=true` + `ScreenProbes=true` (the R2.1
+High dials), which already skips the per-pixel march. The **R3.2 `GiQuality=High` enum** therefore just sets
+those three existing dials; it does NOT need a "gather-only sub-flag" on `DrawRtGi`. **HOWEVER**, the runtime
+High preset STILL degrades to `GiMode=ScreenSpace` (R2.1's option 2) for the SHIPPING surface **for the
+GPU-SAFETY reason, not a wiring gap**: `GiMode=RayTraced` headless SaveBmp is the documented device-remove
+risk (§4 PRE-EXISTING) that R0.3/R1.x/R2.1 deliberately never opened, so RayTraced is validated only by static
+analysis + CPU-harness, never a headless capture on this seat. R3.2 may flip the default to RayTraced once a
+GPU-safe RayTraced capture path exists (privileged TdrDelay seat or real-HW). Until then: **High = ScreenSpace
+on the shipping surface (validated, byte-identical), RayTraced-gather-only is the documented end-state the
+code ALREADY SUPPORTS.**
+
+### (A) The two rates — both ALREADY WIRED in the tree (re-grepped, the constants)
+
+| Rate | Pass / code | Cadence | Constants (from tree) |
+|---|---|---|---|
+| **OFF-SCREEN loose** | DDGI world-cache round-robin (`Dx12Ddgi.cs:83-100`, P2.5) | `1/UpdateFraction` probes/frame | `UpdateFraction` default **8** (env `BALLISTIC_DX12_DDGI_UPDATE_FRACTION`, clamp ≥1); `ProbeCount` = 16×8×16 = **2048**; `RaysPerProbe` = **144**; blend hysteresis **0.97** (`Dx12GiPass.cs:636`); per-probe FIRST-TOUCH hard-set (`DdgiBlend.hlsl:123/156`) |
+| **ON-SCREEN fast** | SSGI temporal EMA (`Ssgi.hlsl PSTemporal:159-220`) + screen-probe gather (`Dx12ScreenProbe.cs`, recomputed from scratch each frame) | **every frame** | SSGI `maxHistory` default **24** (`PostProcessSettings.cs:178`, volume `maxHistory` 1..64); EMA `histLen=min(histLen+1,maxHistory)`, `alpha=1/histLen`, `lerp(history,current,alpha)`. Screen-probe: grid 1 per 16×16px, 64 rays/probe, **NO own EMA** — rides the SSGI temporal tail (`ScreenProbeBlend.hlsl:6`, `Dx12ScreenProbe.cs:168`) |
+
+### (B) ON-SCREEN latency budget (the FAST path — SSGI EMA + screen-probe, every frame)
+
+Screen-probe RAW gather is recomputed from scratch every frame (instant). The on-screen latency is ENTIRELY
+the **SSGI temporal EMA tail** (OIDN is a spatial denoise → adds NO frames). After a STEP lighting change
+(moving light), the stale-value residual weight `∏(1−alpha_k)` decays (analytic, `maxHistory=24`):
+
+| Stale residual ≤ | SSGI frames | @60fps | @30fps |
+|---|---|---|---|
+| 0.50 (half-converged) | 1 | ~17 ms | ~33 ms |
+| 0.20 | 4 | ~67 ms | ~133 ms |
+| 0.10 (visually converged) | 10 | ~167 ms | ~333 ms |
+| 0.05 | 20 | ~333 ms | ~667 ms |
+
+**★ ON-SCREEN BUDGET (WRITTEN, the plan DoD): ≤ ~10 frames to visual convergence (residual ≤0.10) = ~167 ms
+@60fps / ~333 ms @30fps.** This MEETS the plan's "≤ N frames / ~100ms" intent at 60fps for the half-to-quarter
+residual (1–4 frames = ~17–67 ms) and reaches FULL visual convergence in ~167 ms — "few frames, NOT instant"
+exactly as rev7 crack-3 corrected. To TIGHTEN to ≤100 ms full-converge a preset could lower `maxHistory`
+(e.g. 12 → residual≤0.10 in ~6 frames = ~100 ms@60), at the cost of more temporal noise — left as an R3.2
+preset dial, NOT changed here (no code).
+
+### (C) OFF-SCREEN latency budget (the LOOSE path — DDGI round-robin) + DERIVED rate
+
+Two convergence regimes (the per-probe first-touch hard-set, `DdgiBlend.hlsl:123`, makes them distinct):
+- **INITIAL FILL** (camera enters new area / cold field): each probe SNAPS to a usable value on its FIRST
+  touch (alpha=1.0), so the whole grid is usably filled in **UpdateFraction frames** = the full-grid TOUCH
+  time. This is the "well under 0.5s" the code comments — at 1/8 = **8 frames = ~133 ms@60 / ~267 ms@30.**
+- **STEP RESPONSE** (light moved, field already initialized): a probe updates once per N frames and EMA-blends
+  at hysteresis 0.97 → ~`1/(1−0.97)`≈33 of its OWN updates to fully settle → worst-case full converge =
+  N×33 frames. This is the "few seconds, ACCEPTED" off-screen latency.
+
+| Rate | probes/frame | rays/frame | full-grid TOUCH (initial fill) | STEP full-converge (worst case) |
+|---|---|---|---|---|
+| **1/8 (default)** | 256 | 36,864 | 8 fr (~133 ms@60 / ~267 ms@30) | ~267 fr (~4.4 s@60 / ~8.9 s@30) |
+| 1/16 (tighter budget) | 128 | 18,432 | 16 fr (~267 ms@60 / ~533 ms@30) | ~533 fr (~8.9 s@60 / ~17.8 s@30) |
+| 1/4 (faster) | 512 | 73,728 | 4 fr (~67 ms@60 / ~133 ms@30) | ~133 fr (~2.2 s@60 / ~4.4 s@30) |
+
+**★ OFF-SCREEN BUDGET (WRITTEN, the plan DoD): full-grid INITIAL FILL ≤ ~270 ms (1/8, the usable-field metric
+that matters for a camera turning to reveal off-screen geometry); STEP full-converge ≤ ~4.4 s@60fps (1/8) =
+"few seconds, ACCEPTED" per plan.** ★ **RATE DERIVED FROM THE BUDGET:** the plan asks "derive the round-robin
+rate from the latency budget." Taking the OFF-SCREEN budget = the plan's "1/8→1/16, few-s" envelope: at 1/8
+the STEP converge = 4.4 s@60, at 1/16 = 8.9 s@60 — both "few seconds," so **1/8 is the default (best
+responsiveness within the ray-budget), 1/16 the tighter-budget fallback** if the per-frame ray cost (36,864 →
+18,432 rays/frame) must halve on a weaker card (the original P2.5 "1660 budget lock" rationale, `Dx12Ddgi.cs:
+83-90`). The rate is ALREADY env-tunable (`BALLISTIC_DX12_DDGI_UPDATE_FRACTION`) + ProbesPerFrame readout is
+ALREADY logged (`Dx12GiPass.cs:578`) — no code needed; R3.2 maps `GiQuality` → UpdateFraction (High=8,
+Epic=4 denser). The two rates are SEPARATE by construction (different passes, different cadences) — measured
+separately exactly as §4 demands.
+
+### (D) No-regression A/B (no code → shipping path byte-identical, GPU-safe, this run)
+
+Re-captured the SHIPPING-path GI-isolate A/B (ScreenSpace, paused f60, DRED on, GPU-safe recipe) — **byte-
+identical to the R2.1/R1.x references:**
+
+| Scene | This run SHA | Reference SHA | Verdict |
+|---|---|---|---|
+| CornellBox GI-ON | `81dbf7a5667f` | `81dbf7a5667f` | ✓ byte-identical (strong color-bleed, isolate 43.154) |
+| ThinWall GI-ON | `30bc4b4368f5` | `30bc4b4368f5` | ✓ byte-identical (leak-pass HOLDS, isolate 0.000) |
+| ColorOnly GI-ON | `55ec21c5cffb` | `55ec21c5cffb` | ✓ byte-identical (SSGI bounce, isolate 2.288) |
+
+All 3 launches EXIT=0, ZERO device-removal, DRED on. **MovingLight two-rate measure done by static analysis
+of the rate constants (above), NOT a GiMode=RayTraced headless capture** — RayTraced headless SaveBmp is the
+documented device-remove risk (§4 PRE-EXISTING) that this seat never opens; the two rates are deterministic
+functions of the tree constants (UpdateFraction / ProbeCount / RaysPerProbe / maxHistory / hysteresis), so
+static derivation IS the measurement for a no-code chunk (the R1.2-sanctioned substitute-evidence path:
+static analysis + byte-identical render + DRED-clean launches; GBV LIVE skipped — `IsAdmin=False`,
+`TdrDelay NOT SET`=2s default, raising it needs elevation; GBV at 2s TDR = false-device-removal/freeze).
+
+### R2.2 DoD durumu
+
+- [x] **Two rates exist + identified** (off-screen DDGI round-robin `UpdateFraction`; on-screen SSGI EMA +
+      screen-probe every frame) — re-grepped from the tree, both ALREADY WIRED, no new technique/code.
+- [x] **ON-SCREEN latency budgeted** (SSGI EMA, maxHistory=24): ≤10 frames to visual convergence (~167 ms@60
+      / ~333 ms@30); 1–4 frames to half/quarter residual (~17–67 ms@60). "Few frames, NOT instant" per rev7.
+- [x] **OFF-SCREEN latency budgeted SEPARATELY** (DDGI round-robin, 1/8): initial fill 8 frames (~133 ms@60);
+      step full-converge ~4.4 s@60 = "few seconds, accepted." Two regimes distinguished (per-probe first-touch
+      hard-set vs EMA step-response).
+- [x] **Round-robin RATE DERIVED from the budget**: 1/8 default (best responsiveness in ray-budget, 4.4 s@60
+      step-converge), 1/16 tighter-budget fallback (8.9 s@60, still "few-s") — both inside the plan's "1/8→1/16,
+      few-s" envelope; env-tunable + ProbesPerFrame already logged. R3.2 maps GiQuality→UpdateFraction.
+- [x] **R2.1 §(B) wiring gap RESOLVED via PROVISIONAL POLICY catch**: the gather-only branch ALREADY EXISTS
+      (the default `GiMode=RayTraced`+DDGI+ScreenProbe path skips the per-pixel `DispatchRays`); NO new code.
+      Runtime High stays `GiMode=ScreenSpace` on the shipping surface for GPU-SAFETY (RayTraced headless
+      device-remove risk), NOT a wiring gap — recorded as a R3.2 default-flip-when-GPU-safe item.
+- [x] **No-regression**: shipping-path GI-isolate A/B byte-identical (CornellBox/ThinWall/ColorOnly 3-for-3);
+      build 0-err (DX12 -t:Rebuild compile-asserts pass + Runtime); 3 launches EXIT=0, ZERO device-removal,
+      DRED on. NO code change.
+
+**★ R2.2 TWO RATES MEASURED + BUDGETED + DOCUMENTED (no code change — both rates already wired; the
+gather-only branch already exists, R2.1's "needs new code" was a stale read corrected by re-grep). Sıradaki =
+R2.3 (Reflections: measure P8.0 cache-vs-re-shade on a modeled 2060; roughness-split rough→cache / sharp→
+re-shade-at-hit clamp rays; glossy sharp reflection from re-shade; IBL fallback only OUTSIDE cascaded
+far-field — AND R2.1's RT-refl PROVISIONAL term gets re-measured here, flagged for R2.5 re-run).**
