@@ -426,3 +426,99 @@ Re-grepped from the tree (the load-bearing structural fact the handoff/R0.3-doc 
 from the post-R1.0 tree, R1.2 GBV+DRED clean launches). **KEY HANDOFF NOTE:** the R0.3 "PRE-R1.0 → re-
 measure" flag is now DISCHARGED — the re-measure showed NO change because the R1.0 fix is RT-path-only +
 dead on the shipping ScreenSpace path; the §4 gate (≤0.3) + R0.4 budget are confirmed valid post-R1.0.
+
+---
+
+## R1.1 + R1.2 RE-VALIDATED against the now-existing R0 baseline (2026-06-18, HEAD `96c41d4d` + 8-file post-FX WIP)
+
+> PROVISIONAL POLICY applied: every load-bearing claim (fa3d6bb6 content, the bindless-tail code, the offset
+> enumeration, 6b7e9565 = no-code, the §4 gate) re-measured against the WORKING TREE by fresh
+> `git show`/`grep`/`read`/build/headless-capture — NOT from memory or the handoff. **NO code change** — both
+> chunks are already committed + correct (R1.1 byte-identical pure refactor; R1.2 doc-only); this is pure
+> re-validate. Raw outputs: `e:/tmp/gi-r1revalidate/` (cornell/coloronly/thinwall/multilight GI-isolate bmp +
+> .stats.json + .log). Both `fa3d6bb6` and `6b7e9565` confirmed ANCESTORS of HEAD `96c41d4d` (`git merge-base
+> --is-ancestor` = YES, ×2) → the rebuilt binary contains both.
+
+### R1.1 (bindless tail `fa3d6bb6`) — DoD verified FROM CODE + byte-identical smoke
+
+- **(a) `git show fa3d6bb6 --stat`** = 4 files: `Dx12BindlessTail.cs` (NEW, +105), `Dx12Backend.cs` (6),
+  `Dx12GiPass.cs` (19), `Dx12ReflectionsPass.cs` (10). Matches the DoD (centralize the 4 RT/GI tail bases).
+- **(b) Code re-read from tree (not the commit):** `Dx12BindlessTail.cs` is the single source —
+  `HeapCapacity=16384` (the ONLY place the cap is named), four RESERVED counts (`RtRefl 16 / ScreenProbe 4 /
+  DDGI 4 / RtGi 8`) + the cap are the ONLY layout inputs; **all four bases are DERIVED by cumulative
+  subtraction from the cap** (`RtGiTableBase = HeapCapacity - RtGiReserved` → 16376; each lower base subtracts
+  the blocks above → DDGI 16372 / ScreenProbe 16368 / RtRefl 16352). Eight **COMPILE-TIME asserts**
+  (`1 / (cond ? 1 : 0)` CS0020 div-by-zero guards) verify: derived bases == historical 16352/16368/16372/16376,
+  each block's USED ≤ RESERVED, the tail is < cap and > 0. The static-ctor `_ = A_… + …` touches all guards so
+  the compiler must evaluate them.
+- **(c) ★ Offsets ENUMERATED FROM THE TREE (never hand-listed) — "zero hand-listed magic number" PROVEN:**
+  - `grep "16384"` over all `BallisticEngine.DX12/` → ONLY: `Dx12BindlessTail.cs:39` (the `HeapCapacity` def),
+    the historical comments in that file + `Dx12GiPass.cs:150` / `Dx12ReflectionsPass.cs:85`, the **unrelated**
+    `Dx12Backend.cs:73` `UiHeap` (a SEPARATE ImGui present heap, NOT the bindless tail — correctly out of the
+    allocator's scope), and `IblBake.hlsl:112` (an unrelated radiance clamp `min(...,16384.0)`). **No
+    `16384 - N` computation literal in ANY active code.**
+  - `grep "Dx12BindlessTail|HeapCapacity"` → `Dx12GiPass.cs:155-157` reads `Dx12BindlessTail.{RtGi,Ddgi,
+    ScreenProbe}TableBase`; `Dx12ReflectionsPass.cs:87` reads `Dx12BindlessTail.RtReflTableBase`;
+    `Dx12Backend.cs:70` creates `BindlessHeap` with `Dx12BindlessTail.HeapCapacity`. All consumers read the
+    single source.
+  - `grep "16376|16372|16368|16352"` → the four base values appear ONLY in `Dx12BindlessTail.cs` (historical
+    comments + the compile-time assert *equality checks*, which is the intended verification — the RUNTIME
+    bases are the derived `HeapCapacity - …` expressions, not the literals). No consumer hand-lists a base.
+- **(d) Build 0-err (compile-time asserts PASSED):** `dotnet build BallisticEngine.DX12 -t:Rebuild` (full
+  rebuild → the static asserts are actually evaluated) → **0 Error(s)** (22 pre-existing warnings, not mine);
+  Cli 0-err. The CS0020 guards hold → the derived layout matches the historical bases.
+- **(e) GPU-safe byte-identical smoke (ScreenSpace shipping path, paused f60, DETERMINISTIC, GI_ISOLATE=1,
+  SSGI=1, DRED on):** every value matches the R1.0 re-validate reference EXACTLY:
+  - CornellBox GI-ON: lum **43.154**, sha **81dbf7a5667f** (== R0.3/R1.0 ref, byte-identical)
+  - CornellBox GI-OFF: lum 37.676, sha 4a50b5b7c70f (A/B differs → GI active)
+  - ColorOnly GI-ON: lum **2.288**, sha **55ec21c5cffb** (== ref); GI-OFF lum 102.172 sha e42fe2013a73 (== ref)
+  - ThinWall GI-ON: lum **0.000**, sha **30bc4b4368f5** (leak-pass holds; run2 == run1 byte-identical)
+  - MultiLightInterior GI-ON: lum 115.544 (== R0.3 isolate 115.3)
+  - CornellBox GI-ON run2 sha == run1 → determinism holds run-to-run.
+  - ★ EXPECTED: R1.1 only re-points the **RT-path** SRV table indices (RtGi/RtRefl/DDGI/ScreenProbe tail), which
+    are inert on the ScreenSpace SSGI shipping path → byte-identical is correct, NOT a missed regression. (RT_GI
+    visual A/B not run — device-unsafe headless SaveBmp path, §4 PRE-EXISTING; the compile-asserted equality to
+    the historical bases is the RT-path correctness oracle.)
+
+### R1.2 (barrier audit `6b7e9565`) — no-code-change verified + GBV/DRED clean launches
+
+- **(d) `git show 6b7e9565 --stat`** = 1 file (`Docs/Plans/gi-revival-R1.2-barrier-audit.md`, +110), **NO code
+  change CONFIRMED** (audit-only verify record). The audit doc maps 5 DDGI `irradianceTex` raw-barrier paths
+  (DispatchDdgi/DispatchGather/screen-probe trace/RT-refl/DumpIrradianceStats) + the state-tracked
+  idempotent helpers (Dx12OffscreenTarget/Dx12ScreenProbe) — ALL SYMMETRIC (UAV-on-entry → UAV-on-exit), no
+  asymmetry/missing-restore found.
+- **(e) GBV + DRED clean launches — UAV↔SRV asymmetry: NONE (by construction):**
+  - **8 DRED-on headless launches** this re-validate (5 R1.1 smoke + ColorOnly-off + MultiLight + ThinWall-run2),
+    ALL EXIT=0, **ZERO device-removal, ZERO DRED/fault/0xC0000005/TDR markers** in any log.
+  - Since R1.1 (pure const centralization, byte-identical) + R1.2 (doc-only) changed **NO barrier code**, the
+    GBV signature set is **invariant by construction** — no new ResourceBarrier, no new resource-state
+    transition was introduced. The substrate-matched GBV baseline `Docs/Validation/dx12-gbv-baseline.json`
+    (RX 9070 XT / driver 32.0.31019.2002, commit 9912b749) holds unchanged.
+  - **‼ GBV LIVE RUN: SKIPPED per plan §4 HARD RULE (re-confirmed this session).** Raising `TdrDelay` to ~60s
+    needs HKLM write = elevation; this session is **NOT admin** (`IsAdmin=False`; `TdrDelay NOT SET` = default
+    2s). Running GBV (10-100× slower) at the default 2s TDR would trip a FALSE device-removal — the documented
+    PC-freeze path (standing GPU-hang GOTCHA: never relaunch-loop, PC crashed once). This is a GPU-SAFETY
+    constraint, not a solvable build/oracle issue. The substitute-evidence path (static audit + baseline
+    invariance + DRED clean launches + byte-identical render) is plan-§4-SANCTIONED for an audit-only no-code
+    chunk. **GBV-with-raised-TdrDelay stays OPEN for a privileged/real-HW closure** — unchanged from the prior
+    R1.2 record (it was skipped for the SAME elevation reason then).
+
+### R1.1 + R1.2 RE-VALIDATE DoD durumu
+
+- [x] R1.1 (a) `fa3d6bb6 --stat` = 4 files (Dx12BindlessTail.cs NEW + 3 consumers); (b) code re-read = single
+      source, derived bases, 8 compile-time asserts; (c) offsets ENUMERATED from tree — no `16384 - N` literal
+      in active code, all consumers read `Dx12BindlessTail.*`, bases appear only in the allocator (comments +
+      assert equalities); (d) build 0-err = asserts passed; (e) byte-identical ScreenSpace smoke (43.154 /
+      2.288 / 0.000 == R1.0 ref) + determinism + 5 clean launches.
+- [x] R1.2 (d) `6b7e9565 --stat` = 1 doc file, NO code change; (e) 8 DRED-on clean launches no-removal, UAV↔SRV
+      asymmetry NONE (no barrier code changed → GBV signature set invariant; substrate-matched baseline holds).
+- [~] R1.2 GBV LIVE: §4 HARD RULE (no elevation to raise TdrDelay) → SKIPPED, GPU-safe; substitute-evidence
+      path used. GBV-with-raised-TdrDelay open for a privileged/real-HW closure.
+
+**★ R1.1 + R1.2 RE-VALIDATED (no code change — both already correct + committed). FAZ R1 (R1.0/R1.1/R1.2)
+all re-validated against the now-existing R0 baseline. Sıradaki = R1.3 (OIDN 2nd-run crash repro-first) →
+R2.1 (presets).** Per the handoff, R1.3 may be re-ordered (the PID-handle fix is ALREADY in the tree per
+R0.0a re-ground — `Dx12OidnGpuPath.cs:31` shareSeq + per-process unique names; R1.3 should re-verify the fix
+HOLDS via two back-to-back zero-copy captures, NOT repro-from-scratch). The plan §2 next listed phase after
+R1 is **R2.1 (presets: High = screen-probe+SSGI+DDGI+RT-refl roughness-split @ modeled 2060, calibrated to
+the R0.4 budget — the preset-math crux with real FSR-Quality internal-res numbers).**

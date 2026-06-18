@@ -145,6 +145,42 @@ ThinWall 0.000 leak-pass, CornellBox 43.154 no-regress; the "ColorOnly=MaterialI
 noise-floor re-measured (both unchanged), §4 gate ≤0.3 RE-FROZEN, R0.4 budget stands; determinism + 8 clean
 launches no-removal + build 0-err. **NO code change** (fix already correct). ★ **R1.0 RE-VALIDATED.**
 
+### R1.1 + R1.2 RE-VALIDATED (2026-06-18, HEAD `96c41d4d` + 8-file post-FX WIP — GPU-safe ScreenSpace path)
+> PROVISIONAL POLICY applied: re-measured `fa3d6bb6`'s `--stat`, the `Dx12BindlessTail.cs` code, the offset
+> enumeration (grep, NEVER hand-listed), `6b7e9565`'s no-code claim, and the §4 GBV gate by fresh
+> `git`/`grep`/`read`/build/headless-capture (NOT memory/handoff). **NO code change** — both already committed
+> + correct (R1.1 byte-identical pure const refactor; R1.2 doc-only). Both confirmed ANCESTORS of HEAD
+> (`git merge-base --is-ancestor` ×2 = YES) → the rebuilt binary contains both. Full record:
+> [gi-revival-R0-baseline.md §"R1.1 + R1.2 RE-VALIDATED"](gi-revival-R0-baseline.md). Raw: `e:/tmp/gi-r1revalidate/`.
+
+- **R1.1 (bindless tail `fa3d6bb6`) GEÇTİ:** `--stat` = 4 files (Dx12BindlessTail.cs NEW +105, +3 consumers).
+  Code re-read: `HeapCapacity=16384` named ONCE; 4 reserved counts + cap = the ONLY layout inputs; all 4 bases
+  DERIVED by cumulative subtraction (RtGi 16376 / DDGI 16372 / ScreenProbe 16368 / RtRefl 16352); 8
+  COMPILE-TIME asserts (CS0020 div-guards) verify derived==historical + used≤reserved + tail-sane. **Offsets
+  ENUMERATED FROM THE TREE (never hand-listed):** grep `16384` over DX12/ → only the `HeapCapacity` def +
+  historical comments + the UNRELATED `Dx12Backend.cs:73` UiHeap (separate ImGui heap) + `IblBake.hlsl:112`
+  (unrelated radiance clamp); **NO `16384 - N` computation literal in any active code**; `Dx12GiPass.cs:155-157`
+  + `Dx12ReflectionsPass.cs:87` read `Dx12BindlessTail.*`; the base values 16352/16368/16372/16376 appear ONLY
+  in the allocator (comments + assert equalities, runtime bases are the derived expressions). **Build 0-err
+  on a full DX12 rebuild = compile-time asserts PASSED.** GPU-safe byte-identical smoke (ScreenSpace, paused
+  f60): CornellBox GI-ON 43.154/`81dbf7a5667f`, GI-OFF 37.676/`4a50b5b7c70f`, ColorOnly GI-ON 2.288/
+  `55ec21c5cffb`, GI-OFF 102.172/`e42fe2013a73`, ThinWall 0.000/`30bc4b4368f5` — ALL == R1.0 re-validate ref,
+  determinism run2==run1. R1.1 only re-points RT-path SRV table indices (inert on the ScreenSpace shipping
+  path) → byte-identical is CORRECT, not a missed regression; the compile-asserted equality is the RT-path
+  correctness oracle (RT_GI device-unsafe headless SaveBmp NOT opened, §4 PRE-EXISTING).
+- **R1.2 (barrier audit `6b7e9565`) GEÇTİ:** `--stat` = 1 doc file (`gi-revival-R1.2-barrier-audit.md` +110),
+  **NO code change CONFIRMED.** Audit (5 DDGI irradianceTex raw-barrier paths + idempotent state-tracked
+  helpers) is CLEAN — all UAV-on-entry → UAV-on-exit symmetric. **8 DRED-on headless launches** this
+  re-validate (5 R1.1 smoke + ColorOnly-off + MultiLight + ThinWall-run2), ALL EXIT=0, ZERO device-removal,
+  ZERO faults. Since R1.1+R1.2 changed NO barrier code, the **GBV signature set is invariant by construction**
+  (substrate-matched baseline `dx12-gbv-baseline.json` RX9070XT/driver32.0.31019.2002 holds). **‼ GBV LIVE
+  RUN SKIPPED per §4 HARD RULE** — raising TdrDelay needs elevation (`IsAdmin=False`, `TdrDelay NOT SET`=2s
+  default); GBV at 2s TDR = false-device-removal/PC-freeze (the documented crash path). GPU-SAFETY constraint,
+  not a solvable issue; substitute-evidence path (static audit + baseline invariance + DRED clean launches +
+  byte-identical render) is §4-sanctioned for an audit-only no-code chunk. GBV-with-raised-TdrDelay stays OPEN
+  for a privileged/real-HW closure (same elevation reason it was skipped before). ★ **FAZ R1 (R1.0/R1.1/R1.2)
+  ALL RE-VALIDATED. Sıradaki = R1.3 (OIDN — fix already in tree per R0.0a, re-verify it HOLDS) → R2.1 presets.**
+
 ## §0. Keep / drop
 **KEEP (committed; "VERIFIED-under-WHICH-content", re-verified in R0.3):**
 | Piece | ms (RX 9070 XT) | Role / asterisk |
