@@ -27,28 +27,28 @@ public class Volume : Behaviour {
     [Tooltip("The shared .volume asset holding this volume's overrides.")]
     public VolumeProfile Profile { get; set; }
 
-    // ================= GI DEBUG (editor gizmos; runtime-only, never serialised) =================
+    // ================= GI DEBUG (editor gizmos) =================
     // Tick these to visualise the GI system in the Scene view. They only do anything when this volume's
-    // profile carries a GlobalIllumination override (the source of the GI dials). All [NotSerialized] so
-    // they're inspector-only debug switches, not scene state, and [ShowIf("HasGi")] so they hide on a
-    // volume with no GI override. The gizmos re-derive the camera-centered DDGI grid on the CPU
-    // (GiDebugGrid) — placement-only; real probe irradiance colour is a deferred GPU-readback stage.
+    // profile carries a GlobalIllumination override (the source of the GI dials), and [ShowIf("HasGi")]
+    // hides the whole group on a volume with no GI override. NOT [NotSerialized]: that attribute drops a
+    // member from BOTH save AND the inspector (ComponentReflection.InspectorMembers derives from the
+    // serializable set), so the toggles would never appear — they are plain serialised members that
+    // default off (writing false/12 to YAML is harmless; they're switches, not runtime-only state). The
+    // gizmos re-derive the camera-centered DDGI grid on the CPU (GiDebugGrid) — placement-only; real probe
+    // irradiance colour is a deferred GPU-readback stage.
 
-    [NotSerialized]
     [FoldoutGroup("GI Debug", defaultOpen: false)]
     [Tooltip("Draw the cascaded GI volume bound — the finite ~30m world-radiance grid box + its clipmap " +
              "fade band. Outside it, GI falls to IBL/sky (intentional). Camera-centered, so it follows the view.")]
     [ShowIf("HasGi")]
     public bool ShowCascadeBounds { get; set; }
 
-    [NotSerialized]
     [FoldoutGroup("GI Debug", defaultOpen: false)]
     [Tooltip("Draw the DDGI world-probe grid (off-screen far-field cache). Frustum-culled + distance-limited " +
              "so 2048 probes don't flood the view — only probes near the camera/in front are marked.")]
     [ShowIf("HasGi")]
     public bool ShowProbeGrid { get; set; }
 
-    [NotSerialized]
     [FoldoutGroup("GI Debug", defaultOpen: false)]
     [Tooltip("Draw each visible DDGI probe as a small wire sphere (instead of a cross marker). Heavier — " +
              "kept tightly distance-limited. Sphere colour is a placeholder until the GPU irradiance " +
@@ -56,7 +56,6 @@ public class Volume : Behaviour {
     [ShowIf("ShowProbeGrid")]
     public bool ShowProbeSpheres { get; set; }
 
-    [NotSerialized]
     [FoldoutGroup("GI Debug", defaultOpen: false)]
     [Range(2f, 30f)]
     [Tooltip("How far from the camera (metres) to draw probe markers. Keeps the probe-grid gizmo cheap and " +
@@ -64,7 +63,6 @@ public class Volume : Behaviour {
     [ShowIf("ShowProbeGrid")]
     public float ProbeDrawDistance { get; set; } = 12f;
 
-    [NotSerialized]
     [FoldoutGroup("GI Debug", defaultOpen: false)]
     [Tooltip("Draw sample reflection rays off this volume's origin — green where the surface would take a " +
              "SHARP re-shade-at-hit reflection (roughness below the split threshold), amber where it falls " +
