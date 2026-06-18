@@ -157,3 +157,42 @@ float4 PSCombine(VSOut i) : SV_Target {
     // Lerp (not add) — the SSR hit replaces the sky-IBL reflection baked into the scene color.
     return float4(lerp(scene, ssr.rgb, ssr.a), 1.0);
 }
+
+// --- TEMPORAL pass (RT reflections only): motion-reprojected EMA over the half-res reflection target. RT
+// reflections are mirror rays (no jitter), but the HIT reads the DDGI world cache, which churns frame to frame
+// — and reflections have NO other denoiser — so that churn is raw jitter in the mirror. Reproject last frame's
+// reflection via the motion buffer and EMA-blend with this frame's, with a neighbourhood clamp + a disocclusion
+// reset so a moving mirror / uncovered surface doesn't smear. The .a channel is the reflection STRENGTH (carried
+// straight through, not accumulated). For this pass: ColorTex(t0)=current reflection, DepthTex(t1)=history,
+// NormalTex(t2)=motion (G-buffer RG). Params: Intensity.x reused as hasHistory (0 on first frame / resize).
+float4 PSTemporal(VSOut i) : SV_Target {
+    float2 uv = i.Uv;
+    float4 current = SanitizeSsr(ColorTex.SampleLevel(LinearClamp, uv, 0));
+
+    float hasHistory = Intensity;   // SsrConstants.Intensity is repurposed as the hasHistory flag for this pass
+    float2 motion = NormalTex.SampleLevel(LinearClamp, uv, 0).rg;   // prevUV - currUV (G-buffer motion)
+    float2 prevUV = uv + motion;
+    bool valid = hasHistory > 0.5 && all(prevUV >= 0.0) && all(prevUV <= 1.0);
+    if (!valid) return current;
+
+    float4 history = SanitizeSsr(DepthTex.SampleLevel(LinearClamp, prevUV, 0));
+
+    // Neighbourhood clamp (variance) on the RGB so a disoccluded mirror flushes instead of smearing.
+    float3 m1 = 0.0.xxx, m2 = 0.0.xxx;
+    [unroll] for (int x = -1; x <= 1; x++)
+    [unroll] for (int y = -1; y <= 1; y++) {
+        float3 c = SanitizeSsr(ColorTex.SampleLevel(LinearClamp, uv + float2(x, y) * TexelSize, 0)).rgb;
+        m1 += c; m2 += c * c;
+    }
+    m1 /= 9.0; m2 /= 9.0;
+    float3 sigma = sqrt(max(m2 - m1 * m1, 0.0.xxx));
+    float3 lo = m1 - sigma * 2.0 - 0.02.xxx;
+    float3 hi = m1 + sigma * 2.0 + 0.02.xxx;
+    float3 clamped = clamp(history.rgb, lo, hi);
+
+    // EMA toward the (clamped) history. ~0.85 = a steady mirror over ~7 frames; the motion-buffer reprojection
+    // tracks moving surfaces so a static scene converges and holds (no jitter) while a pan still updates.
+    float alpha = 0.15;
+    float3 outRgb = lerp(clamped, current.rgb, alpha);
+    return float4(outRgb, current.a);   // strength = current (not accumulated)
+}

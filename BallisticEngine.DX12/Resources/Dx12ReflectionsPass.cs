@@ -65,6 +65,14 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     Dx12OffscreenTarget ssrTarget;      // half-res RGBA16F reflection (rgb + strength); also RT reflections' UAV output
     Dx12OffscreenTarget ssrScene;       // full-res scratch: combine writes here, then copied back to `target`
     Dx12DescriptorHeap ssrSrvVisible;   // 5 SRVs per pass (10-slot ring)
+    // RT-reflection TEMPORAL denoise: RT reflections are mirror rays (no jitter) but the HIT samples the DDGI
+    // world cache, which changes frame-to-frame — and reflections have NO denoiser (unlike diffuse GI's OIDN +
+    // temporal), so that churn shows as raw JITTER in the mirror (the user: "disabling reflections killed the
+    // jitter"). A light motion-reprojected EMA over the half-res reflection target smooths it. SSR (screen march)
+    // is stable and skips this. Ping-pong; history is cross-frame so NEVER pooled.
+    Dx12OffscreenTarget ssrHistoryA, ssrHistoryB;
+    ID3D12PipelineState ssrTemporalPso;
+    bool ssrHistWriteB, ssrHistValid;
     [StructLayout(LayoutKind.Sequential)]
     struct SsrConstants {
         public Matrix4x4 Projection; public Matrix4x4 InvProjection; public Matrix4x4 ViewMatrix;
@@ -360,6 +368,35 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
                 ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess));
         ssrTarget.ColorToShaderResource();
 
+        // RT-REFLECTION TEMPORAL DENOISE: motion-reproject + EMA the half-res reflection (kills the DDGI-cache
+        // churn that shows as mirror jitter). Reads ssrTarget(t0)=current, history(t1), G-buffer motion(t2);
+        // writes the smoothed reflection into the OTHER history buffer, which becomes this frame's combine input.
+        Dx12OffscreenTarget histRead = ssrHistWriteB ? ssrHistoryA : ssrHistoryB;
+        Dx12OffscreenTarget histWrite = ssrHistWriteB ? ssrHistoryB : ssrHistoryA;
+        histRead.ColorToShaderResource();
+        *(SsrConstants*)ssrCbMapped = new SsrConstants {
+            Intensity = ssrHistValid ? 1f : 0f,   // repurposed as the hasHistory flag for PSTemporal
+            TexelSize = new Vector2(1f / ssrTarget.Width, 1f / ssrTarget.Height),
+        };
+        ssrSrvVisible.Reset();
+        int tb = ssrSrvVisible.AllocateRange(5);
+        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(tb + 0), ssrTarget.ColorSrvCpu, heapType);          // t0 current
+        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(tb + 1), histRead.ColorSrvCpu, heapType);           // t1 history
+        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(tb + 2), gbuffer.ColorSrvCpu(Dx12GBuffer.MotionRtIndex), heapType); // t2 motion
+        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(tb + 3), ssrTarget.ColorSrvCpu, heapType);          // t3 (unused, valid)
+        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(tb + 4), ssrTarget.ColorSrvCpu, heapType);          // t4 (unused, valid)
+        histWrite.RenderColorOnly(cl => {
+            cl.SetGraphicsRootSignature(ssrRootSig); cl.SetPipelineState(ssrTemporalPso);
+            cl.SetDescriptorHeaps(ssrSrvVisible.Heap);
+            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress);
+            cl.SetGraphicsRootDescriptorTable(1, ssrSrvVisible.Gpu(tb));
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
+        histWrite.ColorToShaderResource();
+        ssrHistWriteB = !ssrHistWriteB; ssrHistValid = true;
+        Dx12OffscreenTarget reflForCombine = histWrite;   // the combine reads the denoised reflection
+
         // Reuse the SSR combine (depth-aware upsample + Fresnel lerp into the scene color).
         Matrix4x4.Invert(proj, out Matrix4x4 invProj);
         *(SsrConstants*)ssrCbMapped = new SsrConstants {
@@ -374,7 +411,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 1), gbuffer.DepthSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 2), gbuffer.ColorSrvCpu(1), heapType);
         dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 3), gbuffer.ColorSrvCpu(2), heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 4), ssrTarget.ColorSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 4), reflForCombine.ColorSrvCpu, heapType);   // DENOISED reflection
         ssrScene.RenderColorOnly(cl => {
             cl.SetGraphicsRootSignature(ssrRootSig); cl.SetPipelineState(ssrCombinePso);
             cl.SetDescriptorHeaps(ssrSrvVisible.Heap);
@@ -426,6 +463,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
             });
         ssrMarchPso = MakePso("PSMarch", Dx12OffscreenTarget.HdrFormat);
         ssrCombinePso = MakePso("PSCombine", Dx12OffscreenTarget.HdrFormat);
+        ssrTemporalPso = MakePso("PSTemporal", Dx12OffscreenTarget.HdrFormat);   // RT-reflection temporal denoise
 
         int cbSize = (Marshal.SizeOf<SsrConstants>() + 255) & ~255;
         ssrCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
@@ -444,9 +482,14 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         // Dispose the current field unless it's pool-placed (the pool's re-acquire disposes its own Live).
         if (ssrTarget is { IsPlaced: false }) ssrTarget.Dispose();
         if (ssrScene is { IsPlaced: false }) ssrScene.Dispose();
+        ssrHistoryA?.Dispose(); ssrHistoryB?.Dispose();
         int hw = Math.Max(1, w / 2), hh = Math.Max(1, h / 2);
         ssrTarget = Dx12RenderTargetPool.AllocOrPool(dev, "ssrTarget", hw, hh, Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
         ssrScene = Dx12RenderTargetPool.AllocOrPool(dev, "ssrScene", w, h, Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: false);
+        // RT-reflection temporal history (half-res, committed — cross-frame, never pooled/aliased).
+        ssrHistoryA = new Dx12OffscreenTarget(dev, hw, hh, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
+        ssrHistoryB = new Dx12OffscreenTarget(dev, hw, hh, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
+        ssrHistValid = false;
     }
 
     // --- helpers replicated from the orchestrator (read env / ctx.PostFX; identical semantics) ---
@@ -466,9 +509,10 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     }
 
     public void Dispose() {
-        ssrMarchPso?.Dispose(); ssrCombinePso?.Dispose();
+        ssrMarchPso?.Dispose(); ssrCombinePso?.Dispose(); ssrTemporalPso?.Dispose();
         ssrRootSig?.Dispose(); ssrCb?.Dispose(); ssrSrvVisible?.Dispose();
         ssrTarget?.Dispose(); ssrScene?.Dispose();
+        ssrHistoryA?.Dispose(); ssrHistoryB?.Dispose();
         rtReflPso?.Dispose(); rtReflRootSig?.Dispose();
         rtReflSbt?.Dispose(); rtReflCb?.Dispose(); rtReflSunCb?.Dispose(); rtReflGridCb?.Dispose();
     }
