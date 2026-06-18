@@ -1233,3 +1233,100 @@ per-preset GI ms ties R2.1 High @ FSR-Quality to R0.4 modeled-2060 + R2.3 frozen
 run-to-run). ★ FAZ R2 KOMPLE (R2.1→R2.5). Sıradaki = R3.1 (Doors: sub-system GI env toggles → debug-only NOT
 deleted; off the shipping surface; DoD `BALLISTIC_DX12_.*GI` grep returns only debug doors — re-grep the env
 doors FIRST, they likely already are debug-only).**
+
+---
+
+## R3.1 — Doors (sub-system GI toggles → debug-only) — RE-GREP + DOCUMENT (no shipping code)
+> PROVISIONAL POLICY applied: re-grepped `BALLISTIC_DX12_.*GI` + the broader GI/SSGI/DDGI/SCREENPROBE env-door
+> set over `BallisticEngine.DX12/`, re-read each door's resolve site + the `Dx12RenderDoors` central struct +
+> the R0.1 precedence in `VolumePostProcessing.cs`/`PostProcessSettings.cs`, all against the working tree (NOT
+> memory/handoff). **NO code change** — this is the 6th measure+document chunk in a row; the DoD ("grep returns
+> only debug doors") **already holds by construction**, exactly as the plan's R3.1 wording ("re-grep FIRST, they
+> likely already are debug-only") signaled. Raw grep + build log: this session.
+
+### (0) The R3.1 question (what "off the shipping surface, not the code path" means)
+Per R0.1 (`VolumePostProcessing.cs:64-69`, commit `d8ee45a7`), the precedence is **DEFINED + COMMITTED**: the
+**`GlobalIllumination` volume is AUTHORITATIVE** (its `giMode`/`reflectionsMode`/`emissiveAsGi`/`worldRadianceCache`/
+`screenProbes`/`giIsolate`/`enabled` dials drive `PostFX`, which the renderer reads each frame). The
+`BALLISTIC_DX12_*` env doors are a **DEBUG OVERRIDE only** — they win over `PostFX` *at the renderer choke point*,
+never on the shipping/volume surface. R3.1 just **verifies** that every GI sub-system env door is such an
+override (a bisect tool), not a shipping control that changes the *default* GI behavior.
+
+### (1) Re-grep result (the DoD oracle)
+`BALLISTIC_DX12_.*GI` over `BallisticEngine.DX12/` returns ONLY env-var-read doors — NONE of them is exposed on a
+shipping/volume surface. Cross-checked the broader GI/SSGI/DDGI/SCREENPROBE/RT set. **`BALLISTIC_FX_SSGI` is GONE
+from DX12** (0 matches in `BallisticEngine.DX12/`; it survives only in docs/CLI help + `Dx12RenderDoors`' comment
+banner — a GL-era door). The central per-pass door struct **`Dx12RenderDoors` has NO GI/SSGI/DDGI/screen-probe
+field at all** (its `With()`/`Resolve()` cover only Shadows/Ibl/Sky/Ssao/Bloom/AerialPersp/Fog/Volumes) → GI is
+**not** part of the shipping door surface; it is gated purely by the volume (`PostFX.GiMode`) at the choke point.
+
+### (2) Door inventory — each door, default, role (ALL debug bisect tools, NOT shipping controls)
+The decisive structural proof is the **resolve form**: every GI sub-system door reads
+`envCached is null ? ctx.PostFX.X : (env compares)` — i.e. the volume value is the DEFAULT, the env var is
+consulted ONLY when explicitly set (`is null` → volume). That is the textbook debug-override (volume authoritative).
+
+| Env door | Default (env unset) | Resolve site | Role |
+|---|---|---|---|
+| `BALLISTIC_DX12_SSGI` | **volume `PostFX.GiMode`** (`=1`→ScreenSpace / `=0`→Off override) | `DX12HDRenderer.cs:1670-1676` (giMode ternary) | The GI-on/off **A/B harness master** — only consulted if set; unset → `PostFX.GiMode`. Debug. |
+| `BALLISTIC_DX12_RT_GI` | **volume `PostFX.GiMode`** (`=1`→RayTraced override, then no-RT auto-downgrade) | `DX12HDRenderer.cs:1671-1684` | Force the RT-GI path for A/B; loses to the no-RT auto-downgrade. Debug (RayTraced headless = device-unsafe, §4). |
+| `BALLISTIC_DX12_DDGI` | **volume `PostFX.Ddgi`** | `Dx12GiPass.cs:933-942` + `Dx12ReflectionsPass.cs:455` | Force DDGI world-cache on/off. `is null ? PostFX.Ddgi : env=="1"`. Debug. |
+| `BALLISTIC_DX12_SCREENPROBE` | **volume `PostFX.ScreenProbes`** | `Dx12GiPass.cs:948-957` | Force screen-probes (`!=0` on). `is null ? PostFX.ScreenProbes : env!="0"`. Debug. |
+| `BALLISTIC_DX12_GI_EMISSIVE` | **volume `PostFX.GiEmissive`** | `Dx12GiPass.cs:963-972` + `Dx12ReflectionsPass.cs:462` + `Dx12ScreenProbe.cs:103` | Force emissive-as-GI. `is null ? PostFX.GiEmissive : env!="0"`. Debug. |
+| `BALLISTIC_DX12_GI_ISOLATE` | **volume `PostFX.SsgiDebugView`** | `Dx12GiPass.cs:926-927` | GI-isolate debug view (`==1` OR the volume's giIsolate). The §4 GI-isolate A/B oracle. Debug. |
+| `BALLISTIC_DX12_DDGI_UPDATE_FRACTION` | `8` (round-robin rate; R2.2) | `Dx12Ddgi.cs:95` | Tune off-screen update rate; default inside the plan's 1/8→1/16 envelope. Debug tunable. |
+| `BALLISTIC_DX12_DDGI_WARMUP` | warmup-count default | `Dx12Ddgi.cs:108-113` | One-shot warmup-iteration override. Debug tunable. |
+| `BALLISTIC_DX12_DDGI_DEBUG` | off | `Dx12GiPass.cs:657` + `Dx12Ddgi.cs:529` | Read the irradiance atlas back + report min/max/mean. Pure diagnostic. |
+| `BALLISTIC_DX12_GI_TIMING` | off (or any `BALLISTIC_STATS_OUT` run) | `DX12HDRenderer.cs:1172` + `Dx12GiPass.cs:921` | Per-pass GI ms into `RenderStats`. Pure diagnostic. |
+| `BALLISTIC_DX12_GI_MOTION_DUMP` / `_GI_MOTION_FRAMES` | unset (no dump) / `8` | `Dx12HeadlessRuntime.cs:40-42` | Phase-6 motion-stability multi-frame dump harness. Pure diagnostic. |
+| `BALLISTIC_DX12_GI_ORBIT` / `_GI_ORBIT_PIVOT` | unset / `0` (no orbit) | `DX12HDRenderer.cs:188-243` | Orbit-camera A/B harness (tests under camera motion). Debug; no-op when unset. |
+| `BALLISTIC_DX12_SSGI_OIDN` | on (`!=0` denoise) | `Dx12GiPass.cs:319-321` | Skip the OIDN denoise for A/B; degrades gracefully w/o DLLs. Debug. |
+| `BALLISTIC_DX12_RT_REFLECTIONS` | **volume `PostFX.ReflectionMode==RayTraced`** | `Dx12ReflectionsPass.cs:112-113` | Force the RT-vs-SSR reflection branch. `=="1"` OR `(!="0" && volume)`. Debug (separate from the SSGI GI door; user's SsrEnabled WIP owns the volume side). |
+
+**Adjacent (NOT a GI door, listed for completeness):** `BALLISTIC_DX12_GBV_BASELINE` (`Dx12ValidationBaseline.cs:118`)
+matched the `.*GI` regex by the substring "GBV*GI*" boundary but is the **GPU-Based-Validation baseline path** —
+unrelated to GI; not a GI control.
+
+### (3) Verdict — DoD already met (no code)
+- **Every GI env door is a DEBUG bisect/diagnostic tool, NOT a shipping control.** Each diffuse-GI behavior door
+  (`SSGI`/`RT_GI`/`DDGI`/`SCREENPROBE`/`GI_EMISSIVE`/`GI_ISOLATE`/`RT_REFLECTIONS`) resolves to the volume value
+  when unset (`is null ? PostFX.X`); the rest are pure diagnostics (timing/dump/orbit/oidn-skip/warmup/debug-readback).
+- **The shipping surface is the `GlobalIllumination` volume**, period — `Dx12RenderDoors` carries no GI field, and
+  `VolumePostProcessing.cs:74-86` maps the volume dials onto `PostFX` unconditionally (R0.1, `d8ee45a7`).
+- **GI behavior changes via the volume's `GiMode`** (+ R3.2's upcoming `GiQuality`), never via an env door's
+  default. The doors only LET A/B/bisect override the volume — "off the shipping surface, not the code path"
+  (the code path stays for bisecting; the default is governed by the volume). **The DoD `BALLISTIC_DX12_.*GI`
+  grep returns only debug doors is SATISFIED BY CONSTRUCTION** — no door is load-bearing on the shipping default.
+
+### R3.1 verification (oracle GEÇTİ)
+- **(a) Re-grep FIRST (PROVISIONAL POLICY):** done — `BALLISTIC_DX12_.*GI` + the broader GI/SSGI/DDGI/SCREENPROBE/RT
+  set grepped over `BallisticEngine.DX12/`; **all matches are env-var-read doors, none on a shipping surface**; the
+  central `Dx12RenderDoors` struct has NO GI field; `BALLISTIC_FX_SSGI` is gone from DX12. **DoD already holds.**
+- **(b) Classify each door:** done — table in §(2): every GI behavior door resolves `is null ? volume : env`
+  (volume authoritative per R0.1 `d8ee45a7`), the rest are pure diagnostics. ZERO doors are a shipping control.
+- **(c) NO code (confirmed) → GI-isolate A/B byte-identical by construction:** no door changed, no default changed,
+  no GI code touched → the ThinWall GI-isolate leak-pass (meanLum ≈ 0.0001, run-to-run byte-stable, recipe
+  `BALLISTIC_DETERMINISTIC=1 BALLISTIC_SCREENSHOT_PAUSED=1 SCREENSHOT_FRAME=60 GI_ISOLATE=1 SSGI=1`) + the
+  CornellBox/ColorOnly references are unchanged from R2.5 (HEAD/tree identical, the 8-file post-FX WIP untouched).
+- **(d) Build 0-err:** `dotnet build BallisticEngine.DX12.csproj` → **0 Errors** (22 pre-existing warnings, none GI).
+  No launch needed (no code, no shader change) → trivially EXIT=0, DRED-safe, ZERO device-removal risk.
+
+### R3.1 DoD durumu
+- [x] **Re-grepped `BALLISTIC_DX12_.*GI` + broader GI/SSGI/DDGI/SCREENPROBE/RT door set FIRST** (PROVISIONAL POLICY)
+  — all matches are env-var-read doors; `Dx12RenderDoors` central struct has NO GI field; `BALLISTIC_FX_SSGI` gone from DX12.
+- [x] **Classified every door** as a DEBUG bisect/diagnostic tool, NOT a shipping control (table §(2); volume
+  authoritative per R0.1 `d8ee45a7`, env doors = `is null ? volume : env` override-when-set, or pure diagnostics).
+- [x] **DoD met:** `BALLISTIC_DX12_.*GI` grep returns only debug doors — no shipping-path env-gating of GI behavior;
+  GI behavior changes via the volume's `GiMode` (+ R3.2 `GiQuality`), never an env door default. Satisfied by construction.
+- [x] **Door inventory documented** (§(2)): each door, its default (= volume value when unset, else the diagnostic
+  default), its resolve site, and its role as a debug tool.
+- [x] **No-regression / no shipping code:** GI-isolate A/B byte-identical by construction (no code/default changed,
+  tree unchanged from R2.5); build 0-err; `SsrEnabled`/`ReflectionMode` NOT touched (user WIP); 8-file post-FX WIP UNTOUCHED.
+
+**★ R3.1 DOORS RE-GREPPED + DOCUMENTED (no shipping code — 6th measure+document in a row, the DoD held by
+construction exactly as the plan signaled). Every `BALLISTIC_DX12_*GI*`/SSGI/DDGI/SCREENPROBE/RT_REFLECTIONS env
+door is a DEBUG bisect/diagnostic tool, NOT a shipping control: the `GlobalIllumination` volume is authoritative
+(R0.1 `d8ee45a7`), the env doors override-when-set (`is null ? volume : env`) or are pure diagnostics, and the
+central `Dx12RenderDoors` struct has NO GI field. DoD `BALLISTIC_DX12_.*GI` grep returns only debug doors =
+SATISFIED. Sıradaki = R3.2 (Volume: add `GiQuality (High/Epic)` enum to the unified `GlobalIllumination` volume,
+re-verify P0.5-unified FIRST, advanced knobs derive from preset via the inspector attribute pipeline — R3.2
+LIKELY adds real code, the first shipping-code chunk since R0.1, so rebuild + byte-identical A/B is MANDATORY).**
