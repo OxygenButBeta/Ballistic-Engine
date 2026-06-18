@@ -646,6 +646,12 @@ public sealed class DX12HDRenderer : HDRenderer
             Console.WriteLine("[DX12] BARE-MINIMUM render: G-buffer + deferred (sun/punctual) + composite only. " +
                               "Re-enable per pass with BALLISTIC_DX12_{SHADOWS,SKY,IBL,SSAO,BLOOM,AP,VOLUMES}=1 / BALLISTIC_FX_VOLUMETRIC=1.");
         gpuDriven = new Dx12GpuDrivenRenderer(dev);
+        // Drop every per-scene CACHED cull/draw state on a scene swap. These caches are keyed by cheap change
+        // stamps (not scene identity): the GPU-driven material table (renderer+submesh count), the Hi-Z prime,
+        // the shadow-cascade cache. Two scenes with matching stamps would keep the first scene's table/cull
+        // state — the second scene then renders wrong / culls everything. SceneManager raises this AFTER it
+        // empties the render sets (StopPlay / LoadScenePath / editor ApplyNow all route through it).
+        SceneManager.RenderSetsCleared += OnRenderSetsCleared;
 
         AllocFsrOutput(); // output-res UAV target for FSR (allocated even when off — cheap, simplifies resize)
 
@@ -819,6 +825,18 @@ public sealed class DX12HDRenderer : HDRenderer
 
     Dx12GpuDrivenRenderer gpuDriven;
     bool gpuDrivenOn;
+
+    // Scene-swap cache reset (subscribed to SceneManager.RenderSetsCleared in the ctor). Forces the GPU-driven
+    // material table to rebuild for the new scene (its count-stamp could coincide with the old scene's), drops
+    // the Hi-Z prime (the pyramid holds the OLD scene's depth — a near-identical new camera would otherwise cull
+    // the whole new scene behind stale occluders), and invalidates the shadow-cascade cache (a matching caster
+    // stamp would reuse the old scene's shadow map). hizLastCamPos/lastCasterStamp are stamps, not state — they
+    // get overwritten before they're read again, so they need no reset here.
+    void OnRenderSetsCleared() {
+        gpuDriven.Invalidate();
+        hizPrimed = false;
+        shadowMapEverRendered = false;
+    }
 
     bool hizWanted;
 
@@ -1674,14 +1692,19 @@ public sealed class DX12HDRenderer : HDRenderer
                       : ssgiEnv == "0" ? GiMode.Off
                       : doors.Minimal ? GiMode.Off
                       : PostFX.GiMode;
-        // P7.0 NO-RT AUTO-DOWNGRADE: on a GPU without hardware ray tracing (the audience floor; or BALLISTIC_DX12_
-        // FORCE_NORT=1 on the dev card), RayTraced GI → ScreenSpace BEFORE EnsureRtGi/DrawRtGi touch the DXR path.
-        // This is ABSOLUTE — even the BALLISTIC_DX12_RT_GI=1 force door loses to it, because a forced RT path on a
-        // non-DXR device is the device-removal/PC-crash hazard ([[gpu-hang-launch-safety]]). EnsureRtGi already
-        // returns false without RT, so GI was guarded; this makes the intent explicit + logs once for all 3 effects.
+        // REALTIME GI REMOVED (2026-06-18, user: "varolan realtime gi'i kapatalım sadece bu konuştuğumuz [baked]
+        // sistem olsun; her frame update vs o sistemi komple kaldır"). The ONLY GI now is the baked-freeze DDGI on
+        // the RayTraced path (computed once, frozen, 0 rays/frame). Realtime ScreenSpace SSGI is no longer a GI
+        // mode — it collapses to Off. The omurga (DXR trace+blend) stays, used solely to BAKE. The BALLISTIC_DX12_
+        // SSGI=1 env door can still force the legacy realtime SSGI for an A/B comparison, but it is never the
+        // default. (RayTraced here means "baked DDGI" — PostFX.DdgiBaked is default true; the GI pass freezes it.)
+        if (giMode == GiMode.ScreenSpace && ssgiEnv != "1") giMode = GiMode.Off;
+        // NO-RT (no hardware ray tracing): the baked path can't trace, so GI is OFF (no fallback to realtime SSGI —
+        // that's the system we removed). The audience floor is RT-capable per the standing directive; a non-RT GPU
+        // simply gets IBL ambient. (Forcing a DXR path on a non-DXR device is the device-removal hazard.)
         if (!dev.HasHardwareRayTracing)
         {
-            if (giMode == GiMode.RayTraced) giMode = GiMode.ScreenSpace;
+            if (giMode != GiMode.Off) giMode = GiMode.Off;
             WarnNoRtOnce();
         }
 
@@ -2272,16 +2295,19 @@ public sealed class DX12HDRenderer : HDRenderer
         // shadow distance, the split shape and the per-cascade resolution are all overrides now. cascadeCount
         // selects how many of the MaxCascades-deep array we fit/render/sample (no reallocation); resolution
         // reallocates the texture lazily (rare authoring edit, not a hot path). The Shadows volume's maxDistance
-        // overrides DirectionalLight.ShadowDistance so an interior volume can pull the budget close. ===
-        activeCascadeCount = Math.Clamp(PostFX.ShadowCascadeCount, 1, MaxCascades);
-        float shadowDistance = PostFX.ShadowMaxDistance > 0f
+        // overrides DirectionalLight.ShadowDistance so an interior volume can pull the budget close. When the
+        // volume bridge is OFF (BALLISTIC_DX12_VOLUMES=0, the A/B path), PostFX sits at its constructor defaults
+        // and DirectionalLight.ShadowDistance stays authoritative — preserving the pre-wiring behaviour. ===
+        bool volumesDriving = doors.Volumes;
+        activeCascadeCount = volumesDriving ? Math.Clamp(PostFX.ShadowCascadeCount, 1, MaxCascades) : MaxCascades;
+        float shadowDistance = volumesDriving && PostFX.ShadowMaxDistance > 0f
             ? PostFX.ShadowMaxDistance : DirectionalLight.Instance.ShadowDistance;
-        float splitLambda = Math.Clamp(PostFX.ShadowSplitDistribution, 0f, 1f);
+        float splitLambda = volumesDriving ? Math.Clamp(PostFX.ShadowSplitDistribution, 0f, 1f) : 0.7f;
 
         // Resolution change → recreate the cascade texture (powers-of-two, clamped to the volume's range). Done
         // here (before any fit/render) so the new array is valid for this frame; invalidates the cache so the
-        // first frame at the new size re-renders. Cheap no-op when unchanged.
-        int wantSize = Math.Clamp(SnapPow2(PostFX.ShadowResolution), 512, 4096);
+        // first frame at the new size re-renders. Cheap no-op when unchanged. Volumes-off → keep the 2048 default.
+        int wantSize = volumesDriving ? Math.Clamp(SnapPow2(PostFX.ShadowResolution), 512, 4096) : 2048;
         if (wantSize != shadowMapSize)
         {
             shadowMapSize = wantSize;

@@ -302,6 +302,8 @@ public sealed class Dx12Ddgi : IDisposable {
     // Max band = furthest probe corner / band width (so the wave eventually covers every probe).
     int MaxBand => (int)MathF.Ceiling(new Vector3(Spacing.X * ProbesX, Spacing.Y * ProbesY, Spacing.Z * ProbesZ).Length() * 0.5f / BandWidth) + 1;
     public bool IsBakeComplete => bakeFrozen;
+    public int BakeWave => bakeWave;            // editor gizmo: progressive bake frontier (current open band)
+    public int MaxBandPublic => MaxBand;        // editor gizmo: total bands (for a "baking X%" readout)
     // CPU-only completion estimate (no GPU readback needed for correctness): the bake is done once every band has
     // been open long enough for its probes to hit ConvergeTarget. Conservative upper bound = all bands opened
     // (MaxBand*BandFrames) + the convergence tail (ConvergeTarget frames for the last-opened band). A throttled GPU

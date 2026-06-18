@@ -35,7 +35,16 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
     // The inline dispatch ran only when giMode != Off (RayTraced → EnsureRtGi?DrawRtGi:DrawSsgi; ScreenSpace →
     // DrawSsgi). doors.Minimal already forces giMode = Off in the orchestrator's resolve, so this gate also
     // reproduces the MINIMAL "GI off" behaviour. The RT-vs-SSGI branch + the EnsureRtGi fallback live in Record.
-    public bool Enabled(Dx12FrameContext ctx) => ctx.GiMode != GiMode.Off;
+    public bool Enabled(Dx12FrameContext ctx) {
+        // DEBUG GI ON/OFF (user: see the GI's effect by toggling it). GiDebugGrid.GiEnabled = false → skip the
+        // whole GI pass → IBL ambient only, so flipping it shows exactly what the baked GI adds. Env door
+        // BALLISTIC_DX12_GI_OFF=1 forces off headlessly (A/B); =0 forces on.
+        if (!giOffEnvRead) { giOffEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_OFF"); giOffEnvRead = true; }
+        if (giOffEnv == "1") return false;
+        if (giOffEnv != "0" && !GiDebugGrid.GiEnabled) return false;
+        return ctx.GiMode != GiMode.Off;
+    }
+    string giOffEnv; bool giOffEnvRead;
 
     // PHASE-2 V1: reads the G-buffer (depth + normals for the SSGI/RT-GI gather) and read-modify-writes the HDR
     // scene color (it gathers indirect from `target`, then CopyColorFrom(ssgiScene) back into `target` — the
@@ -584,14 +593,19 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
             if (ctx.Dxr.Ddgi == null) ctx.Dxr.Ddgi = new Dx12Ddgi(dev);
             var ddgi = ctx.Dxr.Ddgi;
             ddgi.Build();
-            // CHUNK6 front door: the volume's bakedGi drives baked mode (the env door still force-overrides via
-            // Dx12Ddgi.BakedMode). SetBakedMode is a no-op when unchanged; it triggers a Rebake on the off->on edge.
-            ddgi.SetBakedMode(ctx.PostFX.DdgiBaked);
+            // REALTIME GI REMOVED (2026-06-18): DDGI is ALWAYS baked now — there is no per-frame live-DDGI path
+            // anymore (the round-robin update only runs to BAKE, then freezes). Force baked on regardless of the
+            // volume flag (PostFX.DdgiBaked is kept for the inspector label / future, but the live path is gone).
+            // SetBakedMode is a no-op when unchanged; it triggers a Rebake on the first enable.
+            ddgi.SetBakedMode(true);
             // CHUNK5 manual "Rebake GI" button (editor/remote): consume the one-shot request before Update so the
             // wave restarts this frame. Applies to both cascades.
             if (GiDebugGrid.RebakeRequested) { ddgi.Rebake(); ddgiFar?.Rebake(); GiDebugGrid.RebakeRequested = false; }
             ddgi.Update(camPos);
             ddgi.NotifyLight(lightDir, lightColor);   // CHUNK5 auto re-bake on sun move / colour change
+            // Publish the REAL grid to the editor gizmo so it marks the actual probe positions (baked spacing,
+            // not the CPU-guessed 2m default) + shows the bake progress. Fixes "nerede ne probe var göremiyorum".
+            GiDebugGrid.PublishLiveGrid(ddgi.Origin, ddgi.Spacing, ddgi.IsBakeComplete, ddgi.BakeWave, ddgi.MaxBandPublic);
             // CHUNK3: bring up the FAR cascade when cascade=2. Wider spacing (3x near) so it covers a far larger
             // volume at lower density; the near cascade keeps the detail. Only meaningful in BAKED mode (the
             // cascade is a coverage tool for the frozen field); the live path runs near only.

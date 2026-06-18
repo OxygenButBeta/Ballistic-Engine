@@ -116,6 +116,33 @@ internal sealed class GizmoDrawer : IGizmos {
         DrawCircle(center, Vector3.UnitZ, radius);
     }
 
+    // A SOLID (filled) sphere drawn as a camera-facing shaded disc — bold + opaque so the colour reads at a
+    // glance (the DDGI probe blobs: a wire sphere showed "hiçbir şey belli değil"). Projects the centre + a
+    // world-radius offset to get the on-screen pixel radius, then fills a disc in the current Color with a
+    // small darker rim for roundness. Behind-geometry probes draw dimmer (occlusion) like the lines do.
+    public void DrawSolidSphere(Vector3 center, float radius) {
+        Vector4 cc = Vector4.Transform(new Vector4(center, 1f), vp);
+        if (cc.W <= 1e-4f) return;                       // behind the camera
+        if (!ProjOcc(cc, out SysVec2 c, out bool occ)) return;
+        // Pixel radius: project a point one world-radius off the centre, PERPENDICULAR to the view direction
+        // (centre→camera × world-up), so the offset is always across the screen regardless of view angle.
+        Vector3 toCam = CameraPosition - center;
+        float tl = toCam.Length(); Vector3 viewDir = tl > 1e-5f ? toCam / tl : Vector3.UnitZ;
+        Vector3 side = Vector3.Cross(viewDir, Vector3.UnitY);
+        if (side.LengthSquared() < 1e-6f) side = Vector3.UnitX;
+        side = Vector3.Normalize(side);
+        float pr = 4f;
+        if (P(center + side * radius, out SysVec2 e))
+            pr = MathF.Max(2.5f, (e - c).Length());
+        // Cull if off the Scene rect (cheap bounds check on the centre + radius).
+        if (c.X + pr < viewMin.X || c.X - pr > viewMin.X + viewSize.X ||
+            c.Y + pr < viewMin.Y || c.Y - pr > viewMin.Y + viewSize.Y) return;
+        float alpha = occ ? 0.45f : 1.0f;
+        draw.AddCircleFilled(c, pr, Col(alpha), 20);
+        // A dark rim so adjacent same-colour probes still read as separate blobs + a touch of roundness.
+        draw.AddCircle(c, pr, Col(occ ? 0.4f : 0.7f) & 0xA0000000u | 0x00202020u, 20, 1.3f);
+    }
+
     void DrawCircle(Vector3 center, Vector3 axis, float radius) {
         const int segments = 40;
         SysVec2 prev = default;

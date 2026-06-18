@@ -21,6 +21,21 @@ public static class GiDebugGrid {
     // Mirror of Dx12Ddgi.Spacing default (2 m → ~30 x 14 x 30 m covered volume).
     public static readonly Vector3 DefaultSpacing = new(2f, 2f, 2f);
 
+    // LIVE grid state published by the renderer each GI frame (the REAL Dx12Ddgi grid — baked spacing differs
+    // from DefaultSpacing, and the cascade has a far grid). Without this the gizmo drew probes at the wrong
+    // positions (CPU-guessed 2m spacing vs the real 1.2m baked) → "nerede ne probe var göremiyorum". The gizmo
+    // prefers LiveOrigin/LiveSpacing when HasLiveGrid; falls back to the CPU snap otherwise.
+    public static bool HasLiveGrid;
+    public static Vector3 LiveOrigin, LiveSpacing = new(2f, 2f, 2f);
+    public static Vector3 LiveFarOrigin, LiveFarSpacing;   // cascade 2 (far) — zero spacing = no far cascade
+    public static bool LiveFrozen;                          // the baked field has frozen (bake complete)
+    public static int LiveBakeWave, LiveMaxBand;            // progressive bake frontier (for a "baking X%" readout)
+    public static void PublishLiveGrid(Vector3 origin, Vector3 spacing, bool frozen, int bakeWave, int maxBand) {
+        LiveOrigin = origin; LiveSpacing = spacing; LiveFrozen = frozen;
+        LiveBakeWave = bakeWave; LiveMaxBand = maxBand; HasLiveGrid = true;
+    }
+    public static void PublishFarGrid(Vector3 origin, Vector3 spacing) { LiveFarOrigin = origin; LiveFarSpacing = spacing; }
+
     // Camera-centered snap — identical to Dx12Ddgi.Update(): place the corner probe so the camera sits
     // near the grid centre, snapped to whole probe spacings (probes don't swim under sub-cell motion).
     public static Vector3 Snap(Vector3 cameraPos, Vector3 spacing) {
@@ -67,6 +82,12 @@ public static class GiDebugGrid {
     // renderer clears it after acting. Cross-thread plain bool is fine (set rarely, read once/frame).
     public static bool RebakeRequested;
     public static void RequestRebake() => RebakeRequested = true;
+
+    // DEBUG GI ON/OFF toggle (user: "kapatıp açabileyim bir de etkisi görmek için debug"): a live switch to see
+    // the baked GI's contribution. FALSE = the GI pass is skipped entirely → the scene falls back to IBL ambient
+    // only (no indirect bounce), so flipping it shows EXACTLY what the GI adds. Default true (GI on). The renderer
+    // reads it per frame; the editor/remote flips it. BALLISTIC_DX12_GI_OFF=1 forces it off headlessly.
+    public static bool GiEnabled = true;
 
     // Called by the DX12 DDGI readback. `colors` is indexed by the SAME probe flattening as ProbePosition's
     // (pz*ProbesY + py)*ProbesX + px order Dx12Ddgi uses. Copies in (the gizmo reads on the main thread).

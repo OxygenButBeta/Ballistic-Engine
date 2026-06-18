@@ -37,10 +37,13 @@ public sealed class GlobalIllumination : VolumeComponent {
     public readonly EnumParameter<GiQuality> giQuality = new(GiQuality.High);
 
     // ---- Diffuse GI (the indirect one-bounce light) ----
-    [Tooltip("Diffuse global illumination technique. Off = IBL ambient only; Screen-Space = SSGI " +
-             "(fast, screen-bounded one-bounce); Ray-Traced = DXR off-screen-aware one-bounce (Lumen), " +
-             "falls back to Screen-Space on GPUs without ray tracing. All denoised with OIDN.")]
-    public readonly EnumParameter<GiMode> giMode = new(GiMode.ScreenSpace);
+    // REALTIME GI REMOVED (2026-06-18): the ONLY GI is now BAKED (computed once on the DXR path, then frozen).
+    // Off = IBL ambient only; Ray-Traced = the baked-freeze DDGI (NOT realtime — no per-frame update). Screen-Space
+    // (realtime SSGI) is legacy/inert: selecting it now renders as Off (the renderer collapses it). Default
+    // Ray-Traced so a fresh GI volume bakes out of the box.
+    [Tooltip("Global illumination. Off = IBL ambient only; Ray-Traced = the BAKED world-probe GI (computed once, " +
+             "then frozen — no realtime per-frame update, no ghosting). Screen-Space is legacy and renders as Off.")]
+    public readonly EnumParameter<GiMode> giMode = new(GiMode.RayTraced);
 
     [Tooltip("Strength of the indirect diffuse bounce added over the IBL ambient base.")]
     public readonly ClampedFloatParameter intensity = new(1f, 0f, 4f);
@@ -60,30 +63,25 @@ public sealed class GlobalIllumination : VolumeComponent {
     [Tooltip("Strength of reflections on smooth surfaces.")]
     public readonly ClampedFloatParameter reflectionsIntensity = new(1f, 0f, 2f);
 
-    // ---- Ray-Traced quality (only relevant when GI Mode = Ray-Traced) ----
-    [Tooltip("DDGI world-probe radiance cache: a grid of probes that caches off-screen bounce light so " +
-             "the Ray-Traced GI gathers MULTI-bounce far-field light (light from rooms/geometry the camera " +
-             "can't see). Off = single-bounce screen-aware RT-GI only. Lumen's world radiance cache. " +
-             "Ray-Traced GI only.")]
-    [ShowIf("giMode", GiMode.RayTraced)]
-    public readonly BoolParameter worldRadianceCache = new(false);
+    // The DDGI world-probe grid IS the baked GI's storage — it's now always on (the baked field lives in it), so
+    // it's no longer a user knob. Kept (default true) + hidden so old assets deserialize and the bridge still reads it.
+    [HideInInspector]
+    public readonly BoolParameter worldRadianceCache = new(true);
 
-    [Tooltip("Screen-space radiance probes: the near/mid-field final-gather (Place->Trace->Blend->Integrate) " +
-             "that hands far-field ray-misses to the DDGI world cache — Lumen's screen-trace -> world-cache " +
-             "hierarchy. Off = the per-pixel DDGI gather fallback. Needs the World Radiance Cache on. " +
-             "Ray-Traced GI only.")]
-    [ShowIf("giMode", GiMode.RayTraced)]
-    public readonly BoolParameter screenProbes = new(true);
+    // Screen-space radiance probes were a REALTIME final-gather — removed with the rest of realtime GI. Kept as a
+    // hidden inert field (default off) so old .volume assets that set it still deserialize; the renderer ignores it.
+    [HideInInspector]
+    public readonly BoolParameter screenProbes = new(false);
 
-    // ---- Baked (frozen) GI ----
+    // ---- Baked (frozen) GI — THE GI now ----
     [Tooltip("BAKE the world-probe GI ONCE then FREEZE it: compute the indirect light progressively over the " +
              "first frames (the region around the camera first, the rest filling in over time — playable " +
              "immediately) and then stop updating it. Frozen = 0 rays/frame at runtime (near-free) and NO temporal " +
              "feedback, so GHOSTING is structurally impossible — the fix for 'performanssız + ghosting'. The " +
              "trade: a frozen field doesn't follow a moving sun (it auto re-bakes when the sun or the camera " +
-             "moves far enough). Needs the World Radiance Cache. Ray-Traced GI only.")]
+             "moves far enough). Default ON — this is THE GI (realtime GI was removed). Ray-Traced GI only.")]
     [ShowIf("giMode", GiMode.RayTraced)]
-    public readonly BoolParameter bakedGi = new(false);
+    public readonly BoolParameter bakedGi = new(true);
 
     [Tooltip("Probe cascades: 1 = a single dense grid; 2 = a NEAR dense cascade (high detail) plus a FAR sparse " +
              "cascade (wide coverage, no GI falloff at the grid edge). Baked GI only — the frozen field pays the " +

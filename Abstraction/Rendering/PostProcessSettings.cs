@@ -149,10 +149,12 @@ public sealed class PostProcessSettings {
     // REFLECTIONS RE-ENABLED (GI PRAGMATIC REVIVAL R0.1, 2026-06-18): the 2026-06-18 hard-disable default-Off is
     // reverted. These defaults are the no-volume baseline (a scene with no GlobalIllumination volume) and the
     // volume bridge (VolumePostProcessing.Apply) overwrites them from the volume's Reflections-Mode dropdown.
-    // Default ScreenSpace = SSR on; the renderer's reflections pass is gated on SsrEnabled.
-    public bool SsrEnabled { get; set; } = true;
+    // BAKED-ONLY DEFAULT (2026-06-18, user: "rt çözümünü tamamen devre dışı bırak, realtime bir şey istemiyorum"):
+    // NO realtime per-frame GI/reflection. Reflections off by default — specular comes from the IBL/skybox cube,
+    // not a realtime SSR/RT march. A scene that WANTS reflections turns them on via the volume's Reflections-Mode.
+    public bool SsrEnabled { get; set; } = false;
     public float SsrIntensity { get; set; } = 1f;
-    public ReflectionMode ReflectionMode { get; set; } = ReflectionMode.ScreenSpace;  // SSR or DXR (Reflection volume) — re-enabled R0.1
+    public ReflectionMode ReflectionMode { get; set; } = ReflectionMode.Off;  // realtime SSR/RT reflections off by default
 
     // Screen-space global illumination: a coarse one-bounce diffuse gather that adds
     // indirect fill light from sunlit on-screen surfaces into shadowed areas (the
@@ -162,8 +164,12 @@ public sealed class PostProcessSettings {
     // reverted. These defaults are the no-volume baseline (a scene with no GlobalIllumination volume); the volume
     // bridge (VolumePostProcessing.Apply) overwrites them from the volume's GI-Mode dropdown. Default ScreenSpace
     // = SSGI on. The DX12HDRenderer giMode choke point still lets BALLISTIC_DX12_SSGI/RT_GI env doors override.
+    // BAKED-ONLY DEFAULT (2026-06-18): GI = the baked-freeze DDGI path (RayTraced mode, baked once then frozen →
+    // 0 rays/frame, no realtime update). NOT ScreenSpace (that's a realtime per-frame gather). SsgiEnabled stays
+    // true only because the RayTraced path reuses the SSGI resolve/combine tail; the actual GI source is the
+    // frozen DDGI field, not a realtime SSGI march.
     public bool SsgiEnabled { get; set; } = true;
-    public GiMode GiMode { get; set; } = GiMode.ScreenSpace;   // GI volume dropdown: Off / SSGI / RT-GI (DXR) — re-enabled R0.1
+    public GiMode GiMode { get; set; } = GiMode.RayTraced;   // baked DDGI runs on the RayTraced path; frozen, not realtime
 
     // Emissive-as-GI source: emissive surfaces act as area lights in the indirect bounce (the DDGI/
     // RTXGI/Lumen technique — at each GI ray hit the shader adds the hit's self-emission). DEFAULT true
@@ -174,22 +180,24 @@ public sealed class PostProcessSettings {
     public bool GiEmissive { get; set; } = true;
 
     // --- Ray-Traced GI quality (only consumed when GiMode == RayTraced) ---
-    // DDGI world-probe radiance cache: caches off-screen bounce so RT-GI gathers multi-bounce far-field
-    // light. DEFAULT false (matches the old BALLISTIC_DX12_DDGI == "1" gate — off unless asked). The
-    // BALLISTIC_DX12_DDGI env door still force-overrides for the A/B harness; unset = this drives.
-    public bool Ddgi { get; set; }
+    // DDGI world-probe radiance cache: the probe grid the baked GI lives in. BAKED-ONLY DEFAULT (2026-06-18):
+    // TRUE (the baked path needs the grid). BALLISTIC_DX12_DDGI env door still force-overrides.
+    public bool Ddgi { get; set; } = true;
 
-    // Bake the DDGI field once then freeze it (progressive near-first bake → 0 rays/frame, no ghosting). DEFAULT
-    // false (live DDGI). BALLISTIC_DX12_DDGI_BAKED force-overrides for the A/B harness; unset = this drives.
-    public bool DdgiBaked { get; set; }
+    // Bake the DDGI field once then freeze it (progressive near-first → 0 rays/frame, no realtime update, no
+    // ghosting). BAKED-ONLY DEFAULT (2026-06-18): TRUE — this is THE GI now (user: no realtime). The
+    // BALLISTIC_DX12_DDGI_BAKED env door force-overrides; setting GI Mode to ScreenSpace in a volume opts back
+    // into realtime SSGI for that scene.
+    public bool DdgiBaked { get; set; } = true;
 
-    // Probe cascade count for baked GI: 1 = single dense grid, 2 = near dense + far sparse. DEFAULT 1 (single).
-    // BALLISTIC_DX12_DDGI_CASCADES force-overrides; unset = this drives. Only meaningful with DdgiBaked.
-    public int DdgiCascades { get; set; } = 1;
+    // Probe cascade count for baked GI: 1 = single dense grid, 2 = near dense + far sparse. BAKED-ONLY DEFAULT
+    // (2026-06-18): 2 (best look, free at runtime once frozen). BALLISTIC_DX12_DDGI_CASCADES force-overrides.
+    public int DdgiCascades { get; set; } = 2;
 
-    // Screen-space radiance probes: the near/mid-field final gather (DDGI-on only). DEFAULT true (matches
-    // the old BALLISTIC_DX12_SCREENPROBE != "0" gate). BALLISTIC_DX12_SCREENPROBE still force-overrides.
-    public bool ScreenProbes { get; set; } = true;
+    // Screen-space radiance probes: the near/mid-field final gather. This is a REALTIME per-frame screen trace —
+    // BAKED-ONLY DEFAULT (2026-06-18): FALSE, so the baked path uses the pure frozen-field gather (no realtime
+    // screen probes). BALLISTIC_DX12_SCREENPROBE still force-overrides.
+    public bool ScreenProbes { get; set; } = false;
 
     // -- Quality / noise --
     // Rays per pixel: with temporal accumulation + the denoiser, even 2-4 stays clean.

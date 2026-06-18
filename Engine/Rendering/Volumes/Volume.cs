@@ -143,8 +143,11 @@ public class Volume : Behaviour {
     }
 
     void DrawDdgiGrid(IGizmos gizmos) {
-        Vector3 spacing = GiDebugGrid.DefaultSpacing;
-        Vector3 origin = GiDebugGrid.Snap(gizmos.CameraPosition, spacing);
+        // Prefer the REAL grid the renderer published this frame (baked spacing != the 2m default; the cascade
+        // has its own far spacing). Falls back to the CPU snap only before the first publish. This is the fix for
+        // "nerede ne probe var göremiyorum" — the gizmo now marks the actual probe positions, not guessed ones.
+        Vector3 spacing = GiDebugGrid.HasLiveGrid ? GiDebugGrid.LiveSpacing : GiDebugGrid.DefaultSpacing;
+        Vector3 origin = GiDebugGrid.HasLiveGrid ? GiDebugGrid.LiveOrigin : GiDebugGrid.Snap(gizmos.CameraPosition, spacing);
         Vector3 covered = GiDebugGrid.CoveredSize(spacing);
         Vector3 center = origin + covered * 0.5f;
 
@@ -187,15 +190,20 @@ public class Volume : Behaviour {
             Vector3 p = GiDebugGrid.ProbePosition(origin, spacing, px, py, pz);
             if ((p - cam).LengthSquared() > d2)
                 continue;
-            // Tint the sphere with the probe's REAL cached irradiance. The readback is RAW HDR linear, so
-            // tonemap it for the gizmo (Reinhard + sqrt gamma) — a bright cache shows bright, a dark one dark,
-            // and the hue reveals what colour each probe bounces (the "see the colour data" view).
-            if (liveColors && ShowProbeSpheres) {
-                Vector3 c = GiDebugGrid.ProbeColors[GiDebugGrid.ProbeIndex(px, py, pz)];
-                gizmos.Color = TonemapProbe(c);
-            }
+            // Tint the marker with the probe's REAL cached irradiance. The readback is RAW HDR linear, so
+            // tonemap it for the gizmo — a bright cache shows bright, a dark one dark, and the hue reveals what
+            // colour each probe bounces (the "see the colour data" view). No live data yet → bright placeholder.
+            bool haveColor = liveColors;
+            if (haveColor)
+                gizmos.Color = TonemapProbe(GiDebugGrid.ProbeColors[GiDebugGrid.ProbeIndex(px, py, pz)]);
+            else
+                gizmos.Color = placeholder;
+
+            // SOLID coloured sphere (user: wire sphere "hiçbir şey belli değil" — a filled, bold, opaque blob
+            // makes each probe's cached colour obvious at a glance). Cross marker stays the cheap fallback when
+            // sphere-mode is off.
             if (ShowProbeSpheres)
-                gizmos.DrawWireSphere(p, markerR);
+                gizmos.DrawSolidSphere(p, markerR * 2.2f);
             else
                 DrawCrossMarker(gizmos, p, markerR);
         }

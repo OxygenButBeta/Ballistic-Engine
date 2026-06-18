@@ -20,6 +20,12 @@ public interface IGizmos {
 
     void DrawWireSphere(Vector3 center, float radius);
 
+    // A SOLID (filled, shaded) sphere — for data points that need a bold readable blob, not a faint wire
+    // outline (the DDGI probe visualiser: a full coloured sphere per probe so its cached colour is obvious,
+    // unlike a wire sphere where "hiçbir şey belli değil"). Implementations may approximate with a camera-facing
+    // shaded disc/impostor if true filled geometry is expensive; the point is a solid, opaque, coloured marker.
+    void DrawSolidSphere(Vector3 center, float radius);
+
     // Cone with its apex at `apex` opening along `direction` (length = height), with the given
     // half-angle in degrees at the base. Used by spot lights.
     void DrawWireCone(Vector3 apex, Vector3 direction, float halfAngleDegrees);
