@@ -788,6 +788,27 @@ internal sealed class EditorApplication {
         ImGui.PopStyleVar(3);
 
         uint dockId = ImGui.GetID("##MainDockSpace");
+
+        // (Re)build the default arrangement BEFORE DockSpace() submits the node for this frame. ImGui's
+        // DockBuilder rule: a DockBuilderRemoveNode + re-split must run BEFORE the matching DockSpace() call,
+        // so the DockSpace() below adopts the freshly-built tree the SAME frame. Reset Layout used to call
+        // BuildDefault AFTER DockSpace() (below the call) — DockSpace had already laid the windows into the
+        // OLD node geometry, then the rebuild's splits landed on top of a node DockSpace already sized, so the
+        // panels reattached but at the wrong proportions ("Reset Layout gives a wrong/garbled default"). The
+        // first-run path worked only by luck (the node was brand-new + empty that frame). Building first fixes
+        // both: the node is rebuilt, then DockSpace submits windows straight into the correct split tree.
+        bool buildDefault = false;
+        if (!layoutInitialized) {
+            layoutInitialized = true;
+            buildDefault = !EditorLayout.HasSaved;   // first run with no saved layout
+        }
+        if (resetLayoutRequested) {
+            resetLayoutRequested = false;
+            buildDefault = true;
+        }
+        if (buildDefault)
+            EditorLayout.BuildDefault(dockId, hostSize);
+
         // EF9c: NO PassthruCentralNode. It only matters when the central node is EMPTY (it makes the empty
         // node transparent + click-through to whatever is behind the host window). Here the central node is
         // ALWAYS filled by the Scene/Game view windows, so passthrough never engaged visibly — but the flag
@@ -796,17 +817,6 @@ internal sealed class EditorApplication {
         // input through). Dropping it is byte-identical to the eye (central node always has a window) and
         // removes the hazard. The host window already has NoBackground, so nothing relied on passthrough.
         ImGui.DockSpace(dockId, SysVec2.Zero, ImGuiDockNodeFlags.None);
-
-        // First run for this project with no saved layout (or an explicit Reset) builds the default.
-        if (!layoutInitialized) {
-            layoutInitialized = true;
-            if (!EditorLayout.HasSaved)
-                EditorLayout.BuildDefault(dockId, hostSize);
-        }
-        if (resetLayoutRequested) {
-            resetLayoutRequested = false;
-            EditorLayout.BuildDefault(dockId, hostSize);
-        }
         ImGui.End();
 
         // Dockable core panels — normal windows ImGui places into the dock tree. A1b-deeper: walk the
