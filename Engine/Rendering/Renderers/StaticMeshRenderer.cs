@@ -13,6 +13,12 @@ public class StaticMeshRenderer : Renderer {
     [HideInInspector]
     public override int SubMeshIndex { get; set; } = -1;
 
+    // Per-submesh material overrides (Unity's sharedMaterials). Serialized here (a base-declared member
+    // is excluded from serialization, like SubMeshIndex). Hidden from the attribute inspector because the
+    // RendererPreview draws the per-slot list itself; an all-null/absent array is byte-identical to before.
+    [HideInInspector]
+    public Material[] SharedMaterials { get => MaterialOverrides; set => MaterialOverrides = value; }
+
     // Register for drawing as soon as we're attached (edit mode too), so the editor viewport
     // shows the mesh without entering play.
     protected internal override void OnAttach() {

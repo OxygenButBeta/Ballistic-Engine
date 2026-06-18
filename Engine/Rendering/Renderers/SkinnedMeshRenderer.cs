@@ -13,6 +13,12 @@ public class SkinnedMeshRenderer : Renderer {
     [HideInInspector]
     public override int SubMeshIndex { get; set; } = -1;
 
+    // Per-submesh material overrides (Unity's sharedMaterials). Serialized here (a base-declared member is
+    // excluded from serialization, like SubMeshIndex). Hidden from the attribute inspector because the
+    // RendererPreview draws the per-slot list; an all-null/absent array is byte-identical to before.
+    [HideInInspector]
+    public Material[] SharedMaterials { get => MaterialOverrides; set => MaterialOverrides = value; }
+
     // Per-bone skinning matrices for this frame (mesh-bind -> animated, mesh-local space). Identity
     // until an Animator drives them; size tracks the mesh's bone count. Runtime-only.
     Matrix4[] skinningMatrices;

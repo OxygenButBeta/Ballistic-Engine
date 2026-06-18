@@ -1505,6 +1505,38 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             AssignAssetToProperty(p, assetType, d2);
     }
 
+    // Per-submesh MATERIAL OVERRIDE slot for the RendererPreview's material list (the editable replacement
+    // for the old read-only label list). Draws a real asset slot (drag-drop + picker + reveal) bound to the
+    // renderer's per-submesh override (Renderer.Get/SetMaterialOverride = Unity's sharedMaterials[i]); a null
+    // override shows the BAKED material as a dimmed placeholder so the slot reads "inheriting from the mesh"
+    // rather than empty, and assigning one overrides just that submesh. Each write is one undo step
+    // (EditorCommands.Structural -> the override array is a serialized member). Reuses the IProperty asset
+    // slot so the slot behaves byte-identically to every other Material slot. Internal: the RendererPreview
+    // (Inspector.Preview) calls it, the rest of the asset-slot machinery stays private.
+    internal void DrawSubMeshMaterialSlot(Renderer renderer, int submeshIndex, Material baked) {
+        var slot = new Inspector.CollectionElementProperty(
+            $"Submesh {submeshIndex} Material", typeof(Material),
+            () => renderer.GetMaterialOverride(submeshIndex),
+            v => EditorCommands.Structural($"Assign Submesh {submeshIndex} Material", () => {
+                renderer.SetMaterialOverride(submeshIndex, v as Material);
+                state.MarkViewportDirty();
+            }));
+
+        // When there is no override, hint the inherited (baked) material behind the slot — the asset slot
+        // shows "None" for a null value, so a dimmed "(from mesh: X)" caption keeps the slot informative.
+        DrawAssetSlotForProperty(slot);
+        if (renderer.GetMaterialOverride(submeshIndex) is null && baked is not null) {
+            string bakedName = AssetDatabase.TryGetAssetGuid(baked, out Guid g)
+                ? Path.GetFileNameWithoutExtension(AssetDatabase.GuidToAssetPath(g))
+                : baked.GetType().Name;
+            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+            ImGui.TextUnformatted($"{EditorIcons.Color} from mesh: {bakedName}");
+            ImGui.PopStyleColor();
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Inheriting the material baked into the mesh for this submesh.\nAssign one above to override just this slot.");
+        }
+    }
+
     void OpenPickerForProperty(Inspector.IProperty p) {
         pickerProperty = p;
         pickerMember = null;

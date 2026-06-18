@@ -23,63 +23,61 @@ namespace BallisticEngine.Editor.Inspector.Preview;
 // The remaining shims (Volume/Terrain/AudioSource/Animator/...) still delegate back into InspectorPanel
 // section methods via the context — RW1.2+ migrate those bodies the same way.
 
-// Renderer: per-submesh material slots. Wraps its section in a BeginGrid/EndTable table (the others draw
-// raw) — exactly the inline shape it replaces. Body moved here in RW1.1.
+// Renderer: per-submesh material slots (Unity's Materials list). Each submesh of a multi-material mesh
+// gets a real EDITABLE asset slot (drag-drop + picker) bound to a per-submesh override; long lists go in a
+// scrolling box. (Replaced the old read-only label list, capped at 24, in 2026-06-18.)
 [ComponentPreview(typeof(Renderer))]
 internal sealed class RendererPreview : IComponentPreview {
     public void Draw(in ComponentPreviewContext ctx) {
         var renderer = (Renderer)ctx.Behaviour;
-        if (InspectorPanel.BeginGrid("##submats")) {
-            DrawSubMeshMaterials(renderer);
-            ImGui.EndTable();
-        }
+        DrawSubMeshMaterials(renderer, ctx.Panel);
     }
 
-    // Multi-material meshes resolve their materials from refs baked into the mesh at import;
-    // list them read-only so an empty SharedMaterial slot isn't mistaken for "no materials".
-    // (SharedMaterial only overrides slots that have no baked ref.)
-    static void DrawSubMeshMaterials(Renderer renderer) {
+    // Multi-material meshes carry a baked material ref per submesh (the .mat the importer generated). Each
+    // submesh gets an EDITABLE slot bound to a per-submesh override (Renderer.sharedMaterials); a null
+    // override inherits the baked material, assigning one overrides just that submesh.
+    static void DrawSubMeshMaterials(Renderer renderer, InspectorPanel panel) {
         Mesh mesh = renderer.SharedMesh;
         if (mesh?.SubMeshes is not { Length: > 1 } subMeshes)
             return;
 
-        // A single-submesh renderer (one entity per source mesh) shows just its own slot.
-        var only = renderer.SubMeshIndex;
+        // A single-submesh renderer (one entity per source part) shows just its own slot.
+        int only = renderer.SubMeshIndex;
         if (only >= 0 && only < subMeshes.Length) {
-            DrawSubMeshMaterialRow(renderer, subMeshes[only], only, "Material");
+            EditorDecoration.DrawSectionHeader("Material");
+            DrawSlotRow(renderer, panel, subMeshes[only], only);
             return;
         }
 
-        // Whole-mesh renderers of split imports can have hundreds of submeshes; cap the list
-        // (it's read-only info — per-part slots live on the instantiated child entities).
-        const int MaxRows = 24;
-        var rows = Math.Min(subMeshes.Length, MaxRows);
-        for (var i = 0; i < rows; i++)
-            DrawSubMeshMaterialRow(renderer, subMeshes[i], i, i == 0 ? $"Materials ({subMeshes.Length})" : "");
-        if (subMeshes.Length > MaxRows) {
-            InspectorPanel.Row("");
-            ImGui.TextDisabled($"... and {subMeshes.Length - MaxRows} more");
+        // Whole-mesh renderers of split imports can have hundreds of submeshes; keep the rows in a scrolling
+        // box (every slot reachable, no silent truncation) rather than capping the visible count.
+        EditorDecoration.DrawSectionHeader($"Materials ({subMeshes.Length})");
+        const int ScrollThreshold = 8;
+        bool scroll = subMeshes.Length > ScrollThreshold;
+        if (scroll) {
+            float rowH = ImGui.GetFrameHeightWithSpacing() + ImGui.GetTextLineHeightWithSpacing();
+            ImGui.BeginChild("##submatscroll", new SysVec2(0, Math.Min(10, subMeshes.Length) * rowH),
+                ImGuiChildFlags.Borders);
         }
+        for (var i = 0; i < subMeshes.Length; i++)
+            DrawSlotRow(renderer, panel, subMeshes[i], i);
+        if (scroll)
+            ImGui.EndChild();
     }
 
-    static void DrawSubMeshMaterialRow(Renderer renderer, SubMeshData sub, int i, string rowLabel) {
-        InspectorPanel.Row(rowLabel);
+    // One submesh row: the submesh name as a label, then its editable material-override slot below it. A null
+    // override inherits the material baked into the mesh; assigning one overrides just that submesh.
+    static void DrawSlotRow(Renderer renderer, InspectorPanel panel, SubMeshData sub, int i) {
+        ImGui.PushID(i);
+        string label = string.IsNullOrEmpty(sub.Name) ? $"Submesh {i}" : sub.Name;
+        ImGui.TextUnformatted(label);
+        if (ImGui.IsItemHovered() && !string.IsNullOrEmpty(sub.MaterialRef))
+            ImGui.SetTooltip($"{label}\nBaked: {sub.MaterialRef}");
 
-        var label = string.IsNullOrEmpty(sub.Name) ? $"Submesh {i}" : sub.Name;
-        Material material = renderer.MaterialFor(i);
-
-        if (material is null) {
-            ImGui.TextDisabled($"{label} — none");
-            return;
-        }
-
-        var reference = sub.MaterialRef;
-        if (reference is null && AssetDatabase.TryGetAssetGuid(material, out Guid guid))
-            reference = AssetDatabase.GuidToAssetPath(guid);
-
-        ImGui.TextUnformatted($"{EditorIcons.Color} {Path.GetFileNameWithoutExtension(reference ?? label)}");
-        if (reference is not null && ImGui.IsItemHovered())
-            ImGui.SetTooltip($"{label}\n{reference}");
+        Material baked = string.IsNullOrEmpty(sub.MaterialRef) ? null
+            : AssetDatabase.LoadRef<Material>(sub.MaterialRef);
+        panel.DrawSubMeshMaterialSlot(renderer, i, baked);
+        ImGui.PopID();
     }
 }
 
