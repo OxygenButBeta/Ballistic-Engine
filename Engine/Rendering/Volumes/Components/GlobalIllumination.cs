@@ -27,6 +27,15 @@ public sealed class GlobalIllumination : VolumeComponent {
              "scene with no override). This is THE way to fully turn Lumen off from the volume.")]
     public readonly BoolParameter enabled = new(true);
 
+    // ---- Quality preset ----
+    [Tooltip("GI quality preset. Together with GI Mode this is THE control for GI — High (RTX 2060 ship " +
+             "target) and Epic (RTX 3070+, more slices / longer temporal history / denser probes) are the " +
+             "two front-door knobs; everything else has a good default under Advanced. High is byte-identical " +
+             "to the engine defaults. The preset DRIVES the Advanced dials' effective values (slices/history); " +
+             "Low (a No-RT survival floor) is deferred — the min target is RT-capable.")]
+    [HideIf("enabled", false)]
+    public readonly EnumParameter<GiQuality> giQuality = new(GiQuality.High);
+
     // ---- Diffuse GI (the indirect one-bounce light) ----
     [Tooltip("Diffuse global illumination technique. Off = IBL ambient only; Screen-Space = SSGI " +
              "(fast, screen-bounded one-bounce); Ray-Traced = DXR off-screen-aware one-bounce (Lumen), " +

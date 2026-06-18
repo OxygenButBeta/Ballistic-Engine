@@ -96,6 +96,33 @@ public static class VolumePostProcessing {
             fx.SsgiLook = gi.look.Value;
             fx.SsgiTint = gi.tint.Value;
             fx.SsgiSaturation = gi.saturation.Value;
+            // === GI PRAGMATIC REVIVAL R3.2 (2026-06-18) — GiQuality preset DRIVES the effective dials. ===
+            // GiMode + GiQuality are THE two control surfaces for GI (plan §2 R3.2 DoD: "GI behavior changes
+            // ONLY via GiMode + GiQuality"). The preset is a fixed assignment over the EXISTING dials — no new
+            // technique, no PostFX.GiQuality field (the renderer reads the resolved dials, not the preset). It
+            // is applied AFTER the per-dial copies above, so the preset is the authoritative effective value;
+            // the user-overridable Advanced foldout that lets a dial escape the preset is the POST-PLAN
+            // follow-up (NOT this chunk). Preset values are the R2.1 tables (gi-revival-R0-baseline.md §R2.1(C)):
+            //   High (RTX 2060 ship target) = 4 slices / 24 history — IDENTICAL to the engine defaults, so a
+            //     scene at the default High renders byte-identically to HEAD (the volume-framework contract).
+            //   Epic (RTX 3070+)            = 8 slices / 32 history — more slices + longer temporal accumulation.
+            // The GiMode=RayTraced+gather-only / denser DDGI round-robin / RT-refl lower-roughness-cutoff parts
+            // of the Epic-vs-High end-state are the R2.2/R2.3 wiring deps (the gather-only RT-GI branch); until
+            // those land the runtime preset rides the validated GPU-safe ScreenSpace path the GiMode dropdown
+            // already selects, so the preset only drives the slice/history dials here.
+            if (giOn) {
+                switch (gi.giQuality.Value) {
+                    case GiQuality.Epic:
+                        fx.SsgiRayCount = 8;     // more horizon slices (clamped ≤8 in the SSGI gather)
+                        fx.SsgiMaxHistory = 32f; // longer temporal accumulation (smoother, laggier — OK on Epic HW)
+                        break;
+                    case GiQuality.High:
+                    default:
+                        fx.SsgiRayCount = 4;     // == engine default → byte-identical to HEAD at default High
+                        fx.SsgiMaxHistory = 24f; // == engine default
+                        break;
+                }
+            }
         }
 
         if (stack.GetComponent<Shadows>() is { } shadows) {

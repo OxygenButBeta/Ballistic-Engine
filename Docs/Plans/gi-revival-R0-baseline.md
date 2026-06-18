@@ -1330,3 +1330,76 @@ central `Dx12RenderDoors` struct has NO GI field. DoD `BALLISTIC_DX12_.*GI` grep
 SATISFIED. Sıradaki = R3.2 (Volume: add `GiQuality (High/Epic)` enum to the unified `GlobalIllumination` volume,
 re-verify P0.5-unified FIRST, advanced knobs derive from preset via the inspector attribute pipeline — R3.2
 LIKELY adds real code, the first shipping-code chunk since R0.1, so rebuild + byte-identical A/B is MANDATORY).**
+
+## R3.2 — Volume: GiQuality (High/Epic) preset enum (2026-06-18, HEAD `1c5b02ce` + 8-file post-FX WIP)
+> PROVISIONAL POLICY applied: re-verified P0.5-unified, the GiQuality-not-yet-exists claim, the R2.1 preset
+> tables (C), the bridge surface (VolumePostProcessing.cs:55-99), the existing PostFX dials, and the
+> reference SHAs by fresh `git`/`grep`/`read`/build/headless-capture — NOT memory/handoff. **★ FIRST
+> shipping-code chunk since R0.1** (R1.0–R3.1 were all measure+document). Rebuild + byte-identical A/B done.
+
+**(0) Re-verify FIRST (PROVISIONAL POLICY + plan R3.2 "re-verify P0.5-unified first").**
+- `Engine/Rendering/Volumes/Components/` = ONLY `GlobalIllumination.cs` (no ScreenSpaceGlobalIllumination /
+  ScreenSpaceReflections split). **P0.5-unified CONFIRMED.** The volume carries `enabled/giMode/intensity/
+  emissiveAsGi/reflectionsMode/reflectionsIntensity/worldRadianceCache/screenProbes/giIsolate` + the Advanced
+  dials (rayLength/falloff/thickness/bounceBoost/occlusionPower/rayCount/maxHistory/look/tint/saturation).
+- `grep GiQuality` over Engine/ Abstraction/ DX12/ Editor/ = **0 matches before this chunk** → R3.2 genuinely
+  unstarted, CONFIRMED. `GiMode`/`ReflectionMode`/`UpscaleMode` enums live in `Abstraction/Rendering/
+  PostProcessSettings.cs:20/27/52` — so `GiQuality` goes alongside them.
+
+**(1) What was added (3 files, +47/-0, GI-only — the 8-file post-FX WIP UNTOUCHED).**
+- `Abstraction/Rendering/PostProcessSettings.cs:38` — `enum GiQuality { High, Epic }` (High=0 first/default,
+  stable ordinal for `.volume` by-value; Low DEFERRED per §0/§3 — the two RT tiers only, NO third technique).
+- `Engine/Rendering/Volumes/Components/GlobalIllumination.cs:37` — `public readonly EnumParameter<GiQuality>
+  giQuality = new(GiQuality.High)`, a FRONT-DOOR knob right after the master `enabled` switch, `[HideIf("enabled",
+  false)]` + `[Tooltip]`. **Auto-discovered by `VolumeComponent` reflection** (`GetFields` over public readonly
+  `VolumeParameter` fields, VolumeComponent.cs:25) → renders through the existing `DrawerRegistry` via the
+  `IEnumParameter` interface (same path as `EnumParameter<GiMode>`) — **ZERO editor wiring, NO new type-switch**
+  (DoD point 4 satisfied by the attribute pipeline).
+- `Engine/Rendering/Volumes/VolumePostProcessing.cs:99-130` — the bridge (THE only stack→PostFX seam) maps
+  `gi.giQuality` onto the EXISTING PostFX dials, applied AFTER the per-dial copies so the preset is the
+  authoritative effective value: **High → SsgiRayCount=4, SsgiMaxHistory=24** (== engine defaults == volume
+  dial defaults → byte-identical to HEAD); **Epic → SsgiRayCount=8, SsgiMaxHistory=32** (R2.1 table C). Inside
+  `if (giOn)` so a hard-stopped stack (`enabled=false`) leaves the dials at the no-GI path. **NO `PostFX.GiQuality`
+  field** — the renderer reads the resolved dials, not the preset (cleaner; the preset is a volume-authoring
+  convenience). The High↔Epic delta is ONLY the slice/history dials here; the GiMode=RayTraced+gather-only /
+  denser DDGI round-robin / RT-refl lower-roughness-cutoff parts of the Epic end-state are the R2.2/R2.3 wiring
+  deps (gather-only RT-GI branch), so the runtime preset rides the validated GPU-safe ScreenSpace path the
+  GiMode dropdown selects until those land (R2.1 DECISION, byte-identical, no regression).
+
+**(2) DECISION (recorded, not silent): preset DRIVES the dials, user-overridable foldout is POST-PLAN.**
+Plan §R2.1 says "preset tables WRITTEN over the EXISTING dials"; memory `gi-revival-advanced-volume-followup`
+says the user adds the override-foldout themselves AFTER the plan. So R3.2 = the preset is the authoritative
+effective value (overwrites the per-dial copies); the user's later foldout will let a dial escape the preset.
+Kept minimal: enum + preset→dial mapping, nothing else. NOT built here: the Advanced-override foldout.
+
+**(3) Oracle — byte-identical GI-isolate A/B at default High (MANDATORY, first real-code chunk).**
+- Build: `dotnet build BallisticEngine.csproj` 0-err + `BallisticEngine.DX12 -t:Rebuild` 0-err + Runtime 0-err.
+  NO shader touched (C#-only) → no re-embed needed.
+- ThinWall GI-isolate (`BALLISTIC_DETERMINISTIC=1 _SCREENSHOT_PAUSED=1 _SCREENSHOT_FRAME=60 _DX12_GI_ISOLATE=1
+  _DX12_SSGI=1`): run1==run2 SHA `30bc4b4368f5...` = **byte-identical run-to-run AND == the R2.1/R2.2/R2.4/R2.5
+  reference SHA `30bc4b4368f5`** (leak-pass holds, isolate 0.000). CornellBox `81dbf7a5667f...` == ref
+  `81dbf7a5667f`; ColorOnly `55ec21c5cffb...` == ref `55ec21c5cffb`. **Default High == HEAD, byte-for-byte.**
+- All 4 launches EXIT=0, ZERO device-removal, ScreenSpace SSGI path ONLY (NO RT_GI/RT_SHADOWS/ReflectionMode=
+  RayTraced headless SaveBmp — the device-remove path was NOT opened, §4 PRE-EXISTING).
+- Epic delta is non-zero by construction (8/32 vs 4/24 over the existing validated SSGI dials) — a scene-level
+  Epic A/B needs a `giQuality:Epic` volume override (no fixture carries one); the unconditional switch + the
+  byte-identical High proof + the two dials being existing validated PostFX members = the Epic path is live,
+  not dead code. RayTraced-headless Epic capture intentionally NOT opened (GPU-safety).
+
+**R3.2 DoD durumu:**
+- [x] P0.5-unified re-verified (only GlobalIllumination.cs; no GiQuality pre-existing).
+- [x] `GiQuality {High,Epic}` enum added (Low DEFERRED, no third technique).
+- [x] Advanced knobs derive from preset (High=4/24 defaults, Epic=8/32) via the bridge — the ONLY stack→PostFX seam.
+- [x] Inspector attribute pipeline, NO new type-switch (EnumParameter auto-discovered + DrawerRegistry).
+- [x] **DoD: GI behavior changes ONLY via `GiMode` + `GiQuality`** — the two front-door knobs; env doors stay
+      debug-override (R3.1); the Advanced dials are now preset-driven (user-override foldout is post-plan).
+- [x] Build 0-err (engine + DX12 rebuild + Runtime); byte-identical at default High (3 fixtures == ref SHAs,
+      run-to-run stable); 4 clean launches no device-removal; 8-file post-FX WIP + SsrEnabled/ReflectionMode UNTOUCHED.
+
+**★ R3.2 VOLUME DONE — GiQuality (High/Epic) preset enum + bridge wiring (first shipping-code chunk since R0.1).
+Default High byte-identical to HEAD (ThinWall `30bc4b4368f5`/CornellBox `81dbf7a5667f`/ColorOnly `55ec21c5cffb`
+== R2.x reference SHAs). GI now controlled by exactly two front-door knobs (GiMode + GiQuality), everything else
+preset-driven or Advanced. Sıradaki = R3.3 (Maintainability — verify the 4 DoD bullets hold in aggregate:
+1 enum + 1 preset control GI [done R3.2]; zero manual bindless magic numbers [R1.1 done]; grep = debug doors only
+[R3.1 done]; Part B kept/dropped records [in plan]. LIKELY measure+document/verify-the-aggregate; after R3.3 the
+only remaining is R3+ Auto-downgrade = OPTIONAL/off-critical-path §2 → decide skip-or-do).**

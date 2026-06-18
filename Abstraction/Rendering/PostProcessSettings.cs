@@ -30,6 +30,17 @@ public enum GiMode {
     RayTraced,     // DXR ray-traced GI (off-screen-aware; falls back to SSGI without DXR)
 }
 
+// GI quality preset (the GI volume's Quality dropdown). A preset is a fixed assignment over the EXISTING
+// GI dials (SSGI slices / temporal history; the GiMode/Ddgi/ReflectionMode end-state is governed by the
+// per-preset wiring in the volume bridge) — NO new technique (GI Pragmatic Revival R3.2). Together with
+// GiMode this is THE control surface for GI: behaviour changes ONLY via GiMode + GiQuality. The fiddly
+// per-dial overrides stay under the volume's Advanced foldout. Low (No-RT survival floor) is DEFERRED
+// (plan §0/§3 — the min target is RT-capable), so the enum is the two RT tiers only.
+public enum GiQuality {
+    High,   // RTX 2060 ship target — screen-probe + SSGI + DDGI far-field + RT-refl roughness-split (4 slices, 24 history)
+    Epic,   // RTX 3070+ — more slices / longer temporal history / denser probe round-robin (8 slices, 32 history)
+}
+
 // Ambient-occlusion quality (the AmbientOcclusion volume's Quality dropdown). Drives the GTAO slice +
 // step counts (more = smoother, fewer artefacts, costlier). Ordinals are stable for .volume by-value.
 public enum AoQuality {
