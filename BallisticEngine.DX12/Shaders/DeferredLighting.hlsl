@@ -373,7 +373,13 @@ float4 PSMain(VSOut i) : SV_Target {
         float mip = clamp(roughness * PrefilterMaxMip, 0.0, PrefilterMaxMip);
         float3 prefiltered = PrefilterMap.SampleLevel(LinearClamp, R, mip).rgb;
         float2 brdf = BrdfLut.SampleLevel(LinearClamp, float2(NdotVamb, roughness), 0).rg;
-        float3 ambientSpecular = prefiltered * (Famb * brdf.x + brdf.y) * ao;
+        // SPECULAR OCCLUSION (Lagarde "GetSpecularOcclusion"): a rough/occluded surface's ambient-specular lobe
+        // integrates the average prefiltered sky, so against a bright sky it can wash into a broad untextured veil.
+        // Derive a specular AO from AO, NdotV and roughness so occluded / grazing / rough surfaces drop the excess
+        // sky reflection (restoring material contrast) while smooth, open, face-on surfaces (water, glass, metal,
+        // polished floor) keep their full, sharp reflection. A no-op (≈1) for the common smooth-and-open case.
+        float specOcc = saturate(pow(max(NdotVamb + ao, 0.0), exp2(-16.0 * roughness - 1.0)) - 1.0 + ao);
+        float3 ambientSpecular = prefiltered * (Famb * brdf.x + brdf.y) * specOcc;
         ambient = ambientDiffuse + ambientSpecular;
     }
     else {
