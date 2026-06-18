@@ -1403,3 +1403,114 @@ preset-driven or Advanced. Sıradaki = R3.3 (Maintainability — verify the 4 Do
 1 enum + 1 preset control GI [done R3.2]; zero manual bindless magic numbers [R1.1 done]; grep = debug doors only
 [R3.1 done]; Part B kept/dropped records [in plan]. LIKELY measure+document/verify-the-aggregate; after R3.3 the
 only remaining is R3+ Auto-downgrade = OPTIONAL/off-critical-path §2 → decide skip-or-do).**
+
+## R3.3 — Maintainability: verify the 4 DoD bullets hold IN AGGREGATE (2026-06-18, HEAD `b9f01a68` + post-FX/editor WIP)
+> PROVISIONAL POLICY applied: every one of the 4 DoD bullets was RE-MEASURED against the working tree by fresh
+> `grep`/`read`/build (NOT "done in R1.1/R3.1/R3.2 so it holds" — each claim re-verified at this load-bearing
+> use, headline included). **NO shipping code change** — this is the verify-the-aggregate / measure+document
+> chunk the plan's R3.3 row signals (the 4 bullets were landed across R1.1/R3.1/R3.2; R3.3 confirms they hold
+> together as the maintainability invariant). Raw capture: `e:/tmp/gi-r33/`.
+
+### (i) DoD bullet 1 — "1 enum + 1 preset control GI" → **GI changes ONLY via `GiMode` + `GiQuality` (two front-door knobs)**
+Re-grepped `GiQuality` over the tree + re-read the three GI control sites:
+- `Abstraction/Rendering/PostProcessSettings.cs` — `enum GiMode {Off,ScreenSpace,RayTraced}` (`:27`) + `enum GiQuality
+  {High,Epic}` (`:39`). The `:33-38` doc comment states it verbatim: *"Together with GiMode this is THE control
+  surface for GI: behaviour changes ONLY via GiMode + GiQuality. The fiddly per-dial overrides stay under the
+  volume's Advanced foldout."* Low DEFERRED (§0/§3 — two RT tiers only).
+- `Engine/Rendering/Volumes/Components/GlobalIllumination.cs` — `giQuality` (`:37`, FRONT-DOOR right after the master
+  `enabled`, `[HideIf("enabled",false)]`) + `giMode` (`:43`); the Advanced dials (`rayCount :110`, `maxHistory :115`,
+  rayLength/falloff/thickness/bounceBoost/occlusionPower/look/tint/saturation) all live under `[FoldoutGroup("Advanced")]`.
+  Auto-discovered by `VolumeComponent` reflection → renders through the existing `DrawerRegistry` (no type-switch).
+- `Engine/Rendering/Volumes/VolumePostProcessing.cs:113-125` — the preset DRIVES `SsgiRayCount`/`SsgiMaxHistory`
+  (High=4/24 == engine defaults → byte-identical; Epic=8/32), applied AFTER the per-dial copies (`:94-95`), inside
+  `if (giOn)`. **No `PostFX.GiQuality` field** (the renderer reads the resolved dials, the preset is a volume-authoring
+  convenience). **VERDICT: bullet (i) HOLDS** — exactly two front-door knobs; the Advanced dials are preset-driven.
+
+### (ii) DoD bullet 2 — "zero manual bindless magic numbers" (offsets ENUMERATED FROM THE TREE, never hand-listed)
+- `grep "16384 - "` / `"16384-"` over `BallisticEngine.DX12/` → matches are ALL in **comments** (historical references
+  in `Dx12BindlessTail.cs:9/12/27-30/82` + `Dx12GiPass.cs:150` + `Dx12ReflectionsPass.cs:85`). **NO `16384 - N`
+  computation literal in any active code.**
+- `grep "16384"` (bare) → the only non-comment occurrences are `Dx12BindlessTail.cs:39` `public const int
+  HeapCapacity = 16384;` (the single source, named ONCE), `Dx12Backend.cs:73` `UiHeap` (a SEPARATE ImGui present
+  heap, correctly outside the bindless-tail allocator), and `IblBake.hlsl:112` (an unrelated radiance clamp).
+- `Dx12BindlessTail.cs` re-read: the four tail bases are **DERIVED by cumulative subtraction from `HeapCapacity`**,
+  NOT hand-listed: `RtGiTableBase = HeapCapacity - RtGiReserved`; `DdgiTableBase = RtGiTableBase - DdgiReserved`;
+  `ScreenProbeTableBase = DdgiTableBase - ScreenProbeReserved`; `RtReflTableBase = ScreenProbeTableBase - RtReflReserved`
+  (`:64-67`). The only layout inputs are `HeapCapacity` + the 4 reserved counts (`:43-46`). Eight COMPILE-TIME asserts
+  (`:83-98`, `1/(cond?1:0)` CS0020 guards) verify derived==historical + used≤reserved + tail-sane, touched in the
+  static ctor (`:102-104`).
+- All consumers read the single source: `grep "Dx12BindlessTail\."` → `Dx12Backend.cs:70` (`HeapCapacity`),
+  `Dx12GiPass.cs:155-157` (RtGi/Ddgi/ScreenProbe bases), `Dx12ReflectionsPass.cs:87` (RtRefl base). No consumer
+  hand-lists a base address.
+- **Build proof:** `dotnet build BallisticEngine.DX12 -t:Rebuild` → **0 Errors** (22 pre-existing warnings, none GI) →
+  the 8 compile-time asserts ACTUALLY evaluated and PASSED (a failing CS0020 div-by-zero guard would be a hard error).
+  **VERDICT: bullet (ii) HOLDS** — single source, derived+compile-asserted, zero hand-listed magic numbers.
+
+### (iii) DoD bullet 3 — "grep = debug doors only" (GI env doors are bisect/diagnostic, not shipping controls)
+- `grep "BALLISTIC_DX12.*(GI|SSGI|DDGI|SCREENPROBE|RT_REFLECT|RT_GI)"` over `BallisticEngine.DX12/` → every match is an
+  env-var **READ** door whose resolve form is `envCached is null ? PostFX.X : (env compares)` (volume AUTHORITATIVE,
+  env override-when-set) — `BALLISTIC_DX12_SSGI`/`RT_GI` (`DX12HDRenderer.cs:1670-1684`), `DDGI`/`SCREENPROBE`/
+  `GI_EMISSIVE`/`GI_ISOLATE` (`Dx12GiPass.cs:927-972`), `RT_REFLECTIONS` (`Dx12ReflectionsPass.cs:112`) — or pure
+  diagnostics (`GI_TIMING`/`GI_MOTION_DUMP`/`GI_ORBIT`/`SSGI_OIDN`/`DDGI_WARMUP`/`DDGI_UPDATE_FRACTION`/`DDGI_DEBUG`).
+  `BALLISTIC_DX12_GBV_BASELINE` matched by substring but is the GPU-Validation-baseline path, not a GI control.
+- The central per-pass door struct `Dx12RenderDoors` (`Dx12RenderDoors.cs:24-41`) carries **NO GI/SSGI/DDGI/screen-probe
+  field** — only `Minimal/Shadows/Ibl/Sky/Ssao/Bloom/AerialPersp/Fog/Volumes`; its `With()`/`Resolve()` cover the same
+  set. GI is gated purely by the volume (`PostFX.GiMode`) at the renderer choke point; under MINIMAL, SSGI/GI/DDGI are
+  forced off via the volume bridge (`:11` comment), NOT a door field. `BALLISTIC_FX_SSGI` is GONE from DX12 (0 matches).
+  **VERDICT: bullet (iii) HOLDS** — every GI env door is a debug bisect/diagnostic; the shipping surface is the volume.
+
+### (iv) DoD bullet 4 — "Part B records kept/dropped + why"
+Re-read `gi-pragmatic-revival-plan.md`:
+- **§0 Keep/drop** (plan `:184-198`): a KEEP table with the per-piece ms + role/asterisk (SSGI ~4 / DDGI ~0.41 /
+  screen-probe ~0.63 / RT-GI hit / OIDN+temporal / RT-refl ~1.5–2 / emissive-as-GI) AND a DROP list (Surface Cache
+  mesh-cards · Software RT SDF/GDF · No-RT raster-proxy 225ms · No-RT Low floor deferred · Surfels).
+- **Part B "What was eliminated by measurement"** (plan `:262-265`): the WHY for each drop — raster-proxy measured
+  128 probes ≈ 225ms (non-viable); No-RT Low deferred (min floor is RT-capable, premature opt, P7.1 code stays);
+  Surfels marginal + highest device-removal risk. Plus "Why not Lumen" + "Honest quality ceiling" (DDGI ≠ Surface
+  Cache's off-screen near-field, ACCEPTED LOSS) + the rev1→rev7 correction trail.
+  **VERDICT: bullet (iv) HOLDS** — kept/dropped + why are recorded in Part B + §0.
+
+### R3.3 verification (oracle GEÇTİ)
+- **(a) All 4 DoD bullets re-grep/re-read aggregate → HOLD** (sections (i)–(iv) above; each re-measured at first
+  load-bearing use per PROVISIONAL POLICY, NOT assumed-from-prior-chunk). Maintainability invariant intact:
+  **GI behavior changes ONLY via `GiMode` + `GiQuality`; zero hand-listed bindless magic numbers; env doors are
+  debug-only (no GI field in `Dx12RenderDoors`); Part B records kept/dropped+why.**
+- **(b) Build 0-err:** `dotnet build BallisticEngine.csproj` 0-err + `BallisticEngine.DX12 -t:Rebuild` 0-err
+  (asserts evaluated+passed) + Runtime 0-err.
+- **(c) No-code → GI-isolate A/B byte-identical by construction + smoke-confirmed:** no GI code/default changed since
+  R3.2 (`b9f01a68`); ThinWall GI-isolate smoke (`BALLISTIC_DETERMINISTIC=1 _SCREENSHOT_PAUSED=1 _SCREENSHOT_FRAME=60
+  _DX12_GI_ISOLATE=1 _DX12_SSGI=1`, ScreenSpace path) → SHA **`30bc4b4368f5`** = the R2.1/R2.2/R2.4/R2.5/R3.2 reference
+  SHA, byte-for-byte (leak-pass holds, isolate 0.000, draws=1/tris=36). EXIT=0, ZERO device-removal, DRED on.
+- **(d) GPU-safety:** RT_GI/RT_SHADOWS/ReflectionMode=RayTraced headless SaveBmp **NOT opened** (the §4 PRE-EXISTING
+  device-remove path); only the ScreenSpace SSGI shipping path exercised. The post-FX/editor WIP (3 `.hlsl` +
+  `Dx12DeferredLightingPass.cs`/`Dx12GtaoPass.cs`/`DX12HDRenderer.cs` + `ComponentPreviews.cs`/`InspectorPanel.cs`/
+  `Renderer.cs`/`SkinnedMeshRenderer.cs`/`StaticMeshRenderer.cs` + `.idea`/`.sln.DotSettings.user`) UNTOUCHED + UNSTAGED.
+
+### R3.3 DoD durumu
+- [x] **(i) 1 enum + 1 preset control GI** — `GiMode` + `GiQuality` are the two front-door knobs; preset DRIVES the
+  Advanced dials (VolumePostProcessing.cs:113-125 after the per-dial copies); re-grepped + re-read, HOLDS.
+- [x] **(ii) zero manual bindless magic numbers** — `Dx12BindlessTail.cs` single source, 4 bases DERIVED by cumulative
+  subtraction, 8 compile-time asserts PASS (DX12 -t:Rebuild 0-err), consumers read it, no `16384 - N` in active code.
+- [x] **(iii) grep = debug doors only** — every GI env door is `is null ? volume : env` override or pure diagnostic;
+  `Dx12RenderDoors` struct has NO GI field; `BALLISTIC_FX_SSGI` gone from DX12.
+- [x] **(iv) Part B records kept/dropped + why** — §0 Keep/drop table + Part B "What was eliminated by measurement"
+  (+ "Why not Lumen" + honest quality ceiling + rev1→rev7 trail) all present.
+- [x] **No shipping code / no-regression:** build 0-err; ThinWall GI-isolate smoke `30bc4b4368f5` == ref byte-identical;
+  EXIT=0, zero device-removal; post-FX/editor WIP + SsrEnabled/ReflectionMode UNTOUCHED.
+
+**★ R3.3 MAINTAINABILITY DONE — all 4 DoD bullets re-measured against the tree and HOLD in aggregate (no shipping
+code; PROVISIONAL POLICY: each bullet re-grep/re-read at first use, not assumed-from-prior-chunk). GI is a clean,
+maintainable front door: behaviour changes ONLY via `GiMode` + `GiQuality`; bindless offsets are derived +
+compile-asserted from one source; env doors are debug-only (no GI field in the central door struct); kept/dropped
+decisions + rationale are recorded in Part B + §0.**
+
+**★★ R3+ Auto-downgrade = SKIPPED (DECISION, this run).** Plan §2 marks it **OPTIONAL, off the critical path** and
+states the "fits" proof does NOT depend on it. R0.4 closed the budget gate as **PERMANENTLY MODELED** (no real
+2060/3060 on hand; (a) dev-enable SELECTED, (b) target-met permanently-modeled). Auto-downgrade is a wall-clock-ms
+preset-drop — it needs **real-HW frame-time telemetry** to be meaningful (drop a preset when the measured ms exceeds
+budget); on a modeled-only seat there is no live ms to gate on, so building it now is premature + would need a
+determinism-gate + forced-transition test + hysteresis with no real signal to validate against. P7.0 no-RT
+auto-downgrade (RayTraced→ScreenSpace without HW RT) stays present + untouched. R3+ reopens if a physical
+2060/3060 appears. **★★★ FAZ R3 COMPLETE (R3.1/R3.2/R3.3) → GI PRAGMATIC REVIVAL PLAN COMPLETE through R3.3,
+R3+ optional-skipped. The plan's goal — a fully dynamic, bake-free, no-manual-probe, leak-free, minimized-cost,
+maintainable GI front door — is met (target-met headline stays a MODEL per R0.4, recorded not silent).**
