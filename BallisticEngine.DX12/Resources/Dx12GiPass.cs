@@ -266,6 +266,7 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
         var target = ctx.SceneColor;
         var gbuffer = ctx.GBuffer;
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        ddgiPathActive = false;   // SSGI source is sun-scale → use the aggressive SSGI pre-exposure, not the DDGI one
         FillSsgiConstants(ctx);
 
         // PHASE-2 V3: skip the manual SceneColor + depth heads when derived barriers are active (the graph emitted
@@ -610,9 +611,16 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
         Matrix4x4 view = ctx.View, viewProj = ctx.ViewProj, proj = ctx.Proj;
         Vector3 lightDir = ctx.LightDir, lightColor = ctx.LightColor, camPos = ctx.CamPos;
 
+        // The DDGI gather samples the probe IRRADIANCE atlas (~200 scale), not the SSGI sun-scale source, so the
+        // pre-exposure chain must use the DDGI-scale value (see SsgiPreExposure). Set BEFORE FillSsgiConstants (it
+        // reads SsgiPreExposure for the combine's inverse-pre-exposure) and the gather. Cleared on the SSGI/RT
+        // fallbacks below so those keep the SSGI-scale pre-exposure.
+        ddgiPathActive = DdgiEnabled(ctx);
+
         sceneAS.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection);
         if (!sceneAS.Valid)
         {
+            ddgiPathActive = false;
             DrawSsgi(ctx);
             return;
         } // no geometry → fall back to SSGI
@@ -768,7 +776,8 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
             if (!ddgiDebugDumped && Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_DEBUG") == "1")
             {
                 ddgiDebugDumped = true;
-                ddgi.DumpIrradianceStats();
+                ddgi.DumpRayDataStats();        // trace output (isolates trace-writes vs blend-integrates)
+                ddgi.DumpIrradianceStats();     // blend output (the field the gather samples)
             }
 
             // PROBE-COLOUR readback for the editor gizmo (ShowProbeSpheres). Only while the gizmo requests it,
@@ -1090,10 +1099,18 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
     }
 
     // --- helpers replicated from the orchestrator (read env / ctx.PostFX; identical semantics) ---
-    static float SsgiPreExposure() => float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
+    // Pre-exposure for the GI pre-expose→temporal/OIDN→combine chain. The SSILVB SSGI source is RAW HDR at the
+    // SUN scale (~1e4-1e5 radiance), so it needs an aggressive 1e-5 to land in the ~1.0 range OIDN/temporal can
+    // denoise without crushing. The DDGI gather is a DIFFERENT scale: it reads the probe IRRADIANCE atlas (mean
+    // ~200, not ~1e5), so the same 1e-5 drives the gathered GI to ~0.002 — small enough that OIDN/temporal treat
+    // it as noise and zero it (the "DDGI renders black" bug, even though the atlas is 92% populated). DDGI needs a
+    // pre-exposure ~100x larger so its irradiance lands in the same OIDN-friendly ~1.0 range. `ddgiPathActive`
+    // (set by DrawRtGi before FillSsgiConstants/the gather) selects it; BALLISTIC_DX12_EXPOSURE overrides both.
+    bool ddgiPathActive;
+    float SsgiPreExposure() => float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
         System.Globalization.CultureInfo.InvariantCulture, out float e)
         ? e
-        : 1.0e-5f;
+        : (ddgiPathActive ? 3.0e-4f : 1.0e-5f);
 
     bool? giTimingOn;
 

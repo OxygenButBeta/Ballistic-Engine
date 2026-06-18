@@ -903,7 +903,7 @@ public sealed class Dx12Ddgi : IDisposable {
         int rowPitch = (int)fp.Footprint.RowPitch;
         var rb = dev.Device.CreateCommittedResource(HeapProperties.ReadbackHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
-        dev.ExecuteSync(cl => {
+        dev.ExecuteSyncImmediate(cl => {
             cl.ResourceBarrierTransition(irradianceTex, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
             cl.CopyTextureRegion(new TextureCopyLocation(rb, fp), 0, 0, 0,
                 new TextureCopyLocation(irradianceTex, 0), null);
@@ -925,6 +925,36 @@ public sealed class Dx12Ddgi : IDisposable {
         rb.Unmap(0); rb.Dispose();
         Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
             $"[DDGI-DBG] irradiance atlas {w}x{h}: mean={sum / Math.Max(total, 1):0.000000} min={mn:0.000000} max={mx:0.000000} nonzero={100.0 * nonzero / Math.Max(total, 1):0.0}% ({nonzero}/{total} RGB samples)"));
+    }
+
+    // DIAG: read the RayData buffer (trace output) directly — isolates "does the TRACE write radiance" from
+    // "does the BLEND integrate it into the atlas". RayData[probe*RaysPerProbe+ray] = (radiance.rgb, dist).
+    public unsafe void DumpRayDataStats() {
+        if (!built || rayData == null) { Console.WriteLine("[RAYDATA-DBG] not built"); return; }
+        long count = (long)ProbeCount * RaysPerProbe;          // float4 each
+        long bytes = count * 16;
+        var rb = dev.Device.CreateCommittedResource(HeapProperties.ReadbackHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)bytes), ResourceStates.CopyDest);
+        dev.ExecuteSyncImmediate(cl => {
+            cl.ResourceBarrierTransition(rayData, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+            cl.CopyBufferRegion(rb, 0, rayData, 0, (ulong)bytes);
+            cl.ResourceBarrierTransition(rayData, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
+        });
+        byte* pb = rb.Map<byte>(0);
+        float* p = (float*)pb;
+        double sum = 0; float mn = float.MaxValue, mx = float.MinValue; long nz = 0, tot = 0; long distNz = 0;
+        for (long i = 0; i < count; i++) {
+            float d = p[i * 4 + 3];
+            for (int c = 0; c < 3; c++) {
+                float v = p[i * 4 + c];
+                if (float.IsNaN(v) || float.IsInfinity(v)) continue;
+                sum += v; if (v < mn) mn = v; if (v > mx) mx = v; if (v > 1e-6f) nz++; tot++;
+            }
+            if (MathF.Abs(d) > 1e-6f) distNz++;
+        }
+        rb.Unmap(0); rb.Dispose();
+        Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+            $"[RAYDATA-DBG] {count} rays: radiance mean={sum / Math.Max(tot, 1):0.0000} min={mn:0.0000} max={mx:0.0000} nonzero={100.0 * nz / Math.Max(tot, 1):0.0}%; rays-with-hit-dist={100.0 * distNz / Math.Max(count, 1):0.0}%"));
     }
 
     ID3D12Resource CreateAtlas(int w, int h, Format fmt) {
