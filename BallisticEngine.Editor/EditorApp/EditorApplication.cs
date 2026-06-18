@@ -1228,12 +1228,17 @@ internal sealed class EditorApplication {
                 EditorPrefs.Save();
             }
         }
-        // Custom limit (item 13): type any value; 0 = unlimited. Enter applies.
+        // Custom limit (item 13): type any value; 0 = unlimited. Applies on edit.
+        // NOTE: InputInt/InputScalar do NOT support ImGuiInputTextFlags.EnterReturnsTrue — passing it
+        // trips an ImGui assert (imgui_widgets.cpp: `(flags & EnterReturnsTrue) == 0`) and crashes the
+        // app the moment this popup opens. InputInt already returns true whenever the value changes, so
+        // commit on IsItemDeactivatedAfterEdit() to apply once the field loses focus / Enter is pressed.
         ImGui.Separator();
         ImGui.TextDisabled("Custom (0 = unlimited):");
         ImGui.SetNextItemWidth(120);
         int custom = limit;
-        if (ImGui.InputInt("##customfps", ref custom, 5, 30, ImGuiInputTextFlags.EnterReturnsTrue)) {
+        ImGui.InputInt("##customfps", ref custom, 5, 30);
+        if (ImGui.IsItemDeactivatedAfterEdit()) {
             EditorPrefs.Current.FrameRateLimit = Math.Max(0, custom);
             ApplyFrameRateLimit();
             EditorPrefs.Save();
@@ -1326,10 +1331,16 @@ internal sealed class EditorApplication {
         ImGui.AlignTextToFramePadding();
         ImGui.TextDisabled(resText);
 
-        var fpsLabel = $"{runtime.Window.FrameRate:0} fps {EditorIcons.ChevronDown}";
-        float fpsW = ImGui.CalcTextSize($"8888 fps {EditorIcons.ChevronDown}").X + pad2;
-        RightAlign(fpsW);
-        DrawFpsButton(fpsLabel);
+        // EF4/EF6 (2026-06-18): the live-FPS + frame-rate-limit button is GAME-VIEW ONLY. The Scene view
+        // repaints ON DEMAND (idle until the user interacts), so its "fps" reading is meaningless — the
+        // same reason EF4 gated the Timing block out of the Scene stats overlay. Show resolution in both
+        // views (Unity does), but the fps button only on the Game view.
+        if (id == "game") {
+            var fpsLabel = $"{runtime.Window.FrameRate:0} fps {EditorIcons.ChevronDown}";
+            float fpsW = ImGui.CalcTextSize($"8888 fps {EditorIcons.ChevronDown}").X + pad2;
+            RightAlign(fpsW);
+            DrawFpsButton(fpsLabel);
+        }
 
         // Stats overlay toggle, Unity's Game-view "Stats" button style (the overlay's X also closes it).
         var statsLabel = $"{EditorIcons.Info} Stats";
