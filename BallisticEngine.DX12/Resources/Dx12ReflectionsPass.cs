@@ -39,7 +39,14 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         if (ctx.Doors.Minimal) return false;
         if (reflForceEnv == "1") return ctx.PostFX.SsrIntensity > 0f;
         if (reflForceEnv == "0") return false;
-        return ctx.PostFX.SsrEnabled && ctx.PostFX.SsrIntensity > 0f;
+        // REFLECTIONS DEFAULT-ON (2026-06-18 GI/reflections overhaul): screen-space reflections were hard-off
+        // (PostFX.SsrEnabled default false + a volume bridge that only set it from a GlobalIllumination volume
+        // which most scenes lack). SSR is a big, safe visual win (wet/glossy floors, metal, water), so run it by
+        // default whenever GI is on and intensity allows. A scene can still force it off via BALLISTIC_DX12_
+        // REFLECTIONS=0 or a Reflections-Mode=Off volume (which sets SsrEnabled=false explicitly — but only a
+        // present-and-disabled volume does that; absent = default-on here).
+        if (ctx.PostFX.SsrIntensity <= 0f) return false;
+        return ctx.PostFX.SsrEnabled || ctx.GiMode != GiMode.Off;
     }
     string reflForceEnv; bool reflForceEnvUnread = true;
 
