@@ -522,3 +522,208 @@ R0.0a re-ground — `Dx12OidnGpuPath.cs:31` shareSeq + per-process unique names;
 HOLDS via two back-to-back zero-copy captures, NOT repro-from-scratch). The plan §2 next listed phase after
 R1 is **R2.1 (presets: High = screen-probe+SSGI+DDGI+RT-refl roughness-split @ modeled 2060, calibrated to
 the R0.4 budget — the preset-math crux with real FSR-Quality internal-res numbers).**
+
+---
+
+## R1.3 RE-VERIFIED — OIDN 2nd-run NAME_ALREADY_EXISTS fix HOLDS (2026-06-18, HEAD `3a33e3ac` + 8-file post-FX WIP)
+
+> PROVISIONAL POLICY applied: every load-bearing claim (the shareSeq fix location, its commit, the readback
+> fallback path) re-measured against the WORKING TREE by fresh `git blame`/`grep`/`read` + headless captures —
+> NOT from memory or the handoff. **NO code change** — the fix is already in the tree + correct; this chunk is
+> pure re-verify-it-HOLDS. Raw outputs: `e:/tmp/gi-r13/` (cap1.bmp / cap2.bmp / cap_guide.bmp + .stats.json).
+> ‼ The handoff said the OIDN file is in `Resources/` — it is NOT; it is `BallisticEngine.DX12/Oidn/Dx12OidnGpuPath.cs`
+> (PROVISIONAL POLICY catch: re-located via `Glob **/Dx12Oidn*.cs`).
+
+### (1) The fix is in the tree AND committed (re-grepped + git blame, not assumed)
+
+- **`Dx12OidnGpuPath.cs:31`** `static int shareSeq; // process-wide counter → unique shared-handle names (avoid 0x887A002C)`.
+- **`:124-126`** the color buffer's shared-handle name = `$"BallisticOidnSharedFloat_{Environment.ProcessId}_{Interlocked.Increment(ref shareSeq)}"`
+  → per-process (PID) + per-instance (monotonic counter) UNIQUE. The inline comment (`:119-123`) documents the
+  exact failure mode: a FIXED name `"BallisticOidnSharedFloat"` fails with `DXGI_ERROR_NAME_ALREADY_EXISTS`
+  (`0x887A002C`) if a prior/concurrent process still holds it OR if `Ensure()` re-creates on resize before the
+  old handle is closed; the name is only used to OPEN-by-name (which the code NEVER does — it imports the IntPtr
+  directly), so any unique string works.
+- **`:163-168`** the two AUX buffers (albedo/normal guides, P6.1 guided denoise) use the SAME pattern:
+  `BallisticOidnAlbedo_{PID}_{shareSeq++}` / `BallisticOidnNormal_{PID}_{shareSeq++}` — so a single process that
+  runs Ensure + EnsureAux creates THREE shared handles, all on the same incrementing counter, all unique.
+- **`git blame`:** the color-buffer fix (`:31`/`:124-126`) is commit **`b86e2b4a0`** (2026-06-16); the aux fix
+  (`:163-168`) is **`9a799cec2`** (2026-06-16). BOTH are ancestors of HEAD `3a33e3ac` → the rebuilt binary has
+  them. `git diff HEAD -- Dx12OidnGpuPath.cs` = EMPTY (file is committed/unmodified, NOT part of the 8-file WIP).
+
+### (2) Readback fallback is DEFAULT-SAFE (re-read from `Dx12GiPass.cs`)
+
+`Dx12GiPass.cs:345-389` is the OIDN dispatch. The zero-copy GPU path is tried first
+(`ssgiOidn.SharedCapable && !ssgiSharedFailed && !ssgiOidnForceReadback`). On ANY failure it sets
+`ssgiSharedFailed = true` ("readback from now on") — a STICKY one-way downgrade:
+- `Ensure()` returns false (shared-handle create / OIDN import fail) → `ssgiSharedFailed = true` (`:388`).
+- HIP execute fail → `ssgiSharedFailed = true` (`:383`).
+- The CPU readback (`:392-397`) then runs whenever the GPU path produced no output (`giForCombine == histWrite`).
+- The readback itself "degrades gracefully without DLLs" (`:319`), denoise-skip if `BALLISTIC_DX12_SSGI_OIDN=0`.
+- `BALLISTIC_DX12_OIDN_READBACK=1` is the explicit A/B door to force the readback path (default unset = prefer
+  zero-copy). So: zero-copy preferred, readback is the safe fallback, no DLL → graceful skip. **Default-safe.**
+
+### (3) Two back-to-back zero-copy captures BOTH SUCCEED (the DoD — GPU-safe ScreenSpace path)
+
+Recipe (GPU-safe, GI-isolate, paused f60, DRED on): `BALLISTIC_DETERMINISTIC=1 BALLISTIC_SCREENSHOT_PAUSED=1
+BALLISTIC_SCREENSHOT_FRAME=60 BALLISTIC_DX12_DRED=1 BALLISTIC_DX12_GI_ISOLATE=1 BALLISTIC_DX12_SSGI=1
+BALLISTIC_DX12_OIDN_TIMING=1` on `CornellBox.scene`. OIDN runs on the SSGI/GI denoise (ScreenSpace), which is
+GPU-safe — NOT the RT_GI device-remove path (§4 PRE-EXISTING, NOT opened).
+
+| Run | OIDN path | NAME_ALREADY_EXISTS / 0x887A002C | device-removal | EXIT | screenshot sha256 |
+|---|---|---|---|---|---|
+| cap1 (1st process) | **ZERO-COPY** (`sharedCapable=True`, `denoise avg 5.21ms/60 ZERO-COPY`) | NONE | NONE | 0 | `81DBF7A5667F…` |
+| cap2 (2nd process, back-to-back) | **ZERO-COPY** (`denoise avg 5.52ms/60 ZERO-COPY`) | NONE | NONE | 0 | `81DBF7A5667F…` |
+| cap_guide (guided: Ensure + EnsureAux = 3 shared handles in ONE process) | **ZERO-COPY** (`denoise avg 6.08ms/60 ZERO-COPY`) | NONE | NONE | 0 | (guided) |
+
+- **Both back-to-back zero-copy captures SUCCEED** (the DoD): no NAME_ALREADY_EXISTS, no device-removal, EXIT=0.
+- **cap1 sha256 == cap2 sha256** (`81DBF7A5667F…`, byte-identical) AND the prefix `81dbf7a5667f` is the EXACT
+  R1.0/R1.1 CornellBox GI-ON reference → the fix HOLDS and the shipping-path GI image is UNCHANGED (no regress).
+- **cap_guide** stresses the per-instance uniqueness HARDEST: the guided path creates 3 shared handles
+  (1 color + 2 aux) in ONE process, all incrementing shareSeq — still ZERO-COPY, no collision, EXIT=0.
+
+### R1.3 DoD durumu
+
+- [x] (a) Fix in tree + committed: `Dx12OidnGpuPath.cs:31/124-126` (`b86e2b4a0`) + `:163-168` aux (`9a799cec2`),
+      both HEAD ancestors; file unmodified vs HEAD (NOT part of the 8-file WIP). PROVISIONAL POLICY: re-grepped,
+      git-blamed — not assumed. (File path corrected: `Oidn/`, not `Resources/`.)
+- [x] (b) Readback fallback default-safe: `Dx12GiPass.cs:345-389` sticky one-way downgrade to CPU readback on any
+      shared-path failure; readback degrades gracefully without DLLs; `BALLISTIC_DX12_OIDN_READBACK=1` is the
+      explicit A/B force door (default unset = prefer zero-copy).
+- [x] (c) Two back-to-back zero-copy captures BOTH SUCCEED (DoD): cap1 + cap2 both ZERO-COPY, EXIT=0, no
+      NAME_ALREADY_EXISTS/0x887A002C, no device-removal; sha256 byte-identical == R1.0/R1.1 ref `81dbf7a5667f`;
+      guided 3-handle path also clean. 3 headless launches, ALL EXIT=0, ZERO device-removal, DRED on.
+
+**★ R1.3 RE-VERIFIED (no code change — fix already in tree + HOLDS). FAZ R1 (R1.0/R1.1/R1.2/R1.3) COMPLETE,
+all re-validated against the now-existing R0 baseline. Sıradaki = R2.1 (presets — below).**
+
+---
+
+## R2.1 — Preset tables (High / Epic) calibrated to the R0.4 modeled-2060 budget (2026-06-18, HEAD `3a33e3ac`)
+
+> PROVISIONAL POLICY applied: re-grepped every dial + budget input from the tree (`PostProcessSettings.cs`,
+> `GlobalIllumination.cs` volume, `UpscaleMode` enum, `GiMode`/`ReflectionMode` enums, the R0.4 RE-WRITTEN
+> model above) — NOT from memory. **NO code change** — R2.1 DEFINES the preset DATA + the calibration math;
+> the `GiQuality` enum + dial-derivation WIRING is **R3.2** (this is the "preset tables WRITTEN" chunk, the
+> knob is added later). **NO new GI technique** — a preset is a knob over the existing SSGI / DDGI /
+> screen-probe / RT-refl / FSR passes only.
+
+### (A) The dials a preset controls (re-grepped from the tree — the existing knobs, nothing new)
+
+A preset is a fixed assignment over these EXISTING members (no new field needed for R2.1):
+
+| Knob | Type / source | Role |
+|---|---|---|
+| `PostFX.GiMode` / volume `giMode` | `GiMode {Off,ScreenSpace,RayTraced}` | diffuse-GI technique select |
+| `PostFX.SsgiEnabled` | bool | SSGI on-screen bounce |
+| `PostFX.ScreenProbes` / volume `screenProbes` | bool (consumed when `GiMode==RayTraced`) | near/mid-field final gather |
+| `PostFX.Ddgi` / volume `worldRadianceCache` | bool (consumed when `GiMode==RayTraced`) | off-screen far-field world cache |
+| `PostFX.GiEmissive` / volume `emissiveAsGi` | bool | emissive-as-area-light in the bounce |
+| `PostFX.ReflectionMode` / volume `reflectionsMode` | `ReflectionMode {ScreenSpace,RayTraced,Off}` | specular technique |
+| `PostFX.SsrEnabled` | bool | SSR gate (reflections WIP — user's separate work, NOT touched here) |
+| `PostFX.SsgiRayCount` / volume `rayCount` | int 1..16 (clamp ≤8 slices) | SSGI horizon slices |
+| `PostFX.SsgiMaxHistory` / volume `maxHistory` | float 1..64 | temporal accumulation frames |
+| `PostFX.UpscaleMode` | `UpscaleMode {Off,NativeAA,Quality(1.5×),Balanced(1.7×),Performance(2.0×),UltraPerformance(3.0×)}` | FSR internal-res ratio |
+
+### (B) ‼ THE PRESET-MATH CRUX (flagged by the plan; resolved here as a DEFINITION + a wiring gap for R3.2/R2.2)
+
+R0.4's High = "screen-probe + SSGI + DDGI far-field + RT-refl, **RT-GI per-pixel march STAYS OFF** (DDGI gather
+replaces it)". But in the CURRENT tree, `ScreenProbes` + `Ddgi` are consumed **only when `GiMode==RayTraced`**
+(`GlobalIllumination.cs:59/66` `[ShowIf(giMode, RayTraced)]`; `Dx12GiPass.DrawRtGi` is the per-pixel
+cosine-hemisphere RT-GI trace AND it hosts the DDGI/screen-probe hierarchy, `:538-541`). So the exact R0.4
+High configuration — **DDGI + screen-probe gather WITHOUT the brute per-pixel RT-GI march** — is **not yet a
+single switch the code exposes.** Two ways to realize it, the choice is an R3.2/R2.2 wiring decision (NOT R2.1):
+
+1. **`GiMode=RayTraced` with a "gather-only" sub-flag** that skips the per-pixel `DrawRtGi` cosine march and
+   feeds the screen-probe → DDGI gather as the GI source (the literal R0.4 "DDGI gather replaces RT-GI" — needs
+   a new code branch in `Dx12GiPass`, deferred to **R2.2 two-rates**, which is exactly where on-screen-fast vs
+   off-screen-loose DDGI round-robin is built).
+2. **`GiMode=ScreenSpace` (SSGI only)** as a pragmatic High-minus until the gather-only branch lands. This is
+   what the **shipping path runs today** (the R0.3/R1.x baseline = `GiMode.ScreenSpace`, SSGI + screen-bounded
+   probes). It is leak-free + GPU-safe + already validated, but it is screen-bounded (no off-screen far-field).
+
+**R2.1 DECISION (recorded, not silent):** the preset TABLE below names the R0.4-intended end-state
+(option 1 — DDGI-gather High), and explicitly marks the **gather-only RT-GI branch as the R2.2 wiring
+dependency**. Until R2.2 lands that branch, the **runtime High preset degrades to option 2** (`GiMode=ScreenSpace`)
+— byte-identical to today's shipping path, the only validated GPU-safe config. This keeps R2.1 a pure
+DATA+CALIBRATION chunk (no code, no regression) while honestly flagging the one passmap gap R2.2/R3.2 closes.
+
+### (C) The preset tables (DATA — the dial assignments per preset)
+
+**Low = DEFERRED** (plan §0/§3 — RT-capable floor; No-RT Low is a measured-out, premature-opt deferral).
+
+| Dial | **High** (RTX 2060, ship target) | **Epic** (RTX 3070+) | Notes |
+|---|---|---|---|
+| `GiMode` | `ScreenSpace` (today) → `RayTraced`+gather-only (R2.2 end-state) | `RayTraced` (full incl. per-pixel where it fits) | crux (B) |
+| `SsgiEnabled` | true | true | on-screen fast bounce both |
+| `ScreenProbes` | true (gather-only) | true | near/mid final gather |
+| `Ddgi` (world cache) | true (off-screen far-field, loose round-robin) | true (denser round-robin / more probes) | R2.2 two-rate |
+| `GiEmissive` | true | true | emissive-as-GI |
+| `ReflectionMode` | `RayTraced` (roughness-split: rough→cache, sharp→re-shade) | `RayTraced` (more rays, lower roughness cutoff) | R2.3 builds the split |
+| `SsrEnabled` | (governed by user's reflections WIP — untouched) | (same) | NOT set by R2.1 |
+| `SsgiRayCount` (slices) | 4 | 8 (clamp) | Epic = more slices |
+| `SsgiMaxHistory` | 24 (default) | 32 | Epic = smoother/laggier OK |
+| `UpscaleMode` | **`Quality` (1.5×/dim → 720p internal @ 1080p) — MANDATORY** | `NativeAA` (1.0×) or `Quality` | High needs FSR per R0.4 |
+
+### (D) Calibration — does High fit the modeled 2060 at target-fps? (per-preset FSR internal-res math)
+
+The plan §2 R2.1 DoD calibration test = "all of High fits 2060 at target-fps." Using the R0.4 RE-WRITTEN
+modeled-2060 budget (this doc §"R0.4 RE-WRITTEN") with the **High dial set above** (gate stack =
+SSGI + screen-probe gather + DDGI + RT-refl; **NO per-pixel RT-GI hit** — DDGI gather replaces it):
+
+**Per-preset FSR internal-res numbers (the crux the plan asked R2.1 to resolve):**
+- **High `UpscaleMode=Quality` = 1.5× per dimension → 1280×720 internal @ 1920×1080 display = exactly
+  2.25× fewer pixels** (1.5² = 2.25). This is the divisor R0.4 modeled. Screen-space/compute passes (non-GI
+  raster+post, SSGI, screen-probe gather, RT-refl's screen-resolve) scale ÷2.25; DDGI (fixed probe grid) is
+  res-independent (UNCHANGED); RT-refl BVH-traverse floor is res-independent (a touch higher than ÷2.25).
+
+| High component | RX9070XT ms | 2060 native (R0.4) | **2060 @ FSR-Quality (720p)** |
+|---|---|---|---|
+| non-GI (raster+shadow+post) | 3.3–4.7 | 17–38 | ÷2.25 → **8–17** |
+| SSGI (compute) | ~4.2 | 21.0–33.6 | ÷2.25 → **9–15** |
+| screen-probe gather (compute) | ~0.18 | 0.9–1.4 | ÷2.25 → **0.4–0.6** |
+| DDGI (RT, res-independent) | ~0.41 | 3.3–5.7 | **3.3–5.7** (unchanged) |
+| RT-refl (RT; screen-resolve ÷2.25, BVH floor fixed) | ~2.07 | 16.6–29.0 | **7–13** |
+| **TOTAL** | — | **~59–108 ms (9–17 fps native)** | **~28–51 ms** |
+
+- **VERDICT (modeled, pessimistic 2060):** High @ FSR-Quality = **~28–51 ms → fits 30fps (33.3 ms) at the
+  OPTIMISTIC end, misses it at the pessimistic end; misses 60fps (16.6 ms) either way.** This is IDENTICAL to
+  R0.4's verdict (consistent — R2.1's dial set IS the R0.4 gate stack). **The credible ship target = 30fps@
+  1080p via FSR-Quality, High preset = screen-probe+SSGI+DDGI+RT-refl, per-pixel RT-GI OFF.**
+- **★ CALIBRATION RESULT (plan DoD):** "all of High fits 2060 at target-fps" → **TRUE only at the optimistic
+  model end (30fps@FSR-Quality).** At the pessimistic end it overruns 33 ms → R2.5 VRAM/budget will re-measure
+  POST-R1.0/R2.3 with the real refl cost (R0.2's "RE-RUN if R2.3 changes the reflection path" flag — RT-refl
+  cache-vs-re-shade shifts the refl term). The plan's fallback "if R0.2 refutes, switch to Epic-only-3070" is
+  NOT triggered: High DOES fit at the optimistic end on a 2060 @ FSR-Quality, so High-on-2060 stays the target;
+  Epic is the 3070+ tier (more rays/res/history), NOT a 2060 demotion.
+- **target-met = PERMANENTLY MODELED** (R0.4 (b), user decision this run — no real 2060/3070 on hand; the
+  "fits at the optimistic end" headline stays a MODEL until a physical card is measured; dev proceeds on RX
+  9070 XT against this budget).
+
+### (E) ‼ Re-run / dependency flags carried forward (so R2.3/R2.5 key off them)
+
+- **RT-refl term is PROVISIONAL** — R0.4/R2.1 use the current P8.0 "via world cache" cost (~2.07ms RX9070XT).
+  **R2.3** builds the roughness-split (rough→cache cheap, sharp→re-shade-at-hit costlier) → the RT-refl term
+  CHANGES → **RE-RUN this High-fit calibration at R2.5** (R0.2's flagged dependency).
+- **DDGI/screen-probe round-robin RATE is unset here** — R2.1 names DDGI "loose round-robin" but the actual
+  on-screen-fast (≤N frames / ~100ms) vs off-screen-loose (1/8→1/16, few-s) split + its cost is **R2.2**.
+- **The gather-only RT-GI branch (crux B option 1) is the R2.2 wiring dependency** — until it lands, the
+  runtime High preset = `GiMode=ScreenSpace` (option 2, byte-identical to today's validated shipping path).
+
+### R2.1 DoD durumu
+
+- [x] Preset tables WRITTEN (High / Epic; Low deferred) — dial assignments over the EXISTING knobs (re-grepped
+      from `PostProcessSettings.cs` + `GlobalIllumination.cs`), NO new GI technique.
+- [x] Calibrated to the R0.4 modeled-2060 budget WITH per-preset FSR internal-res numbers (High `Quality` =
+      720p internal = 2.25× fewer pixels; per-component ÷2.25 except res-independent DDGI + RT BVH floor) →
+      High @ FSR-Quality = ~28–51 ms = fits 30fps at the optimistic end (= R0.4 verdict, consistent).
+- [x] Preset-math crux RESOLVED as a definition + recorded wiring gap (DDGI-gather-without-per-pixel-RT-GI is
+      the R2.2 wiring dependency; runtime High degrades to `GiMode=ScreenSpace` until then — byte-identical to
+      the validated shipping path, so NO behaviour regression, preset is a knob).
+- [x] GI-isolate A/B unchanged on the shipping path (NO code → CornellBox GI-ON `81dbf7a5667f` byte-identical,
+      verified post-R2.1) + build 0-err (DX12 -t:Rebuild + Runtime). NO new GI technique.
+- [~] Re-run flags carried forward: RT-refl term PROVISIONAL (RE-RUN at R2.5 after R2.3 roughness-split);
+      round-robin rate is R2.2; gather-only branch is R2.2.
+
+**★ R2.1 PRESETS WRITTEN + CALIBRATED (no code change — DATA + calibration chunk; the GiQuality enum + dial
+derivation is R3.2, the gather-only branch + two-rate is R2.2). Sıradaki = R2.2 (two rates: on-screen fast
+SSGI+screen-probe + off-screen loose DDGI round-robin; budget the two latencies separately).**
