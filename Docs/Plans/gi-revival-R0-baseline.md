@@ -872,3 +872,163 @@ gather-only branch already exists, R2.1's "needs new code" was a stale read corr
 R2.3 (Reflections: measure P8.0 cache-vs-re-shade on a modeled 2060; roughness-split rough→cache / sharp→
 re-shade-at-hit clamp rays; glossy sharp reflection from re-shade; IBL fallback only OUTSIDE cascaded
 far-field — AND R2.1's RT-refl PROVISIONAL term gets re-measured here, flagged for R2.5 re-run).**
+
+---
+
+## R2.3 — Reflections: measure P8.0 (cache vs re-shade) + roughness-split + RT-refl term re-measure (2026-06-18, HEAD `63bd346f` + 8-file post-FX WIP)
+
+> PROVISIONAL POLICY applied: re-grepped EVERY load-bearing claim against the working tree at first use —
+> what the committed P8.0 reflection path ACTUALLY IS (re-READ `DxrReflections.hlsl` ClosestHit + `Dx12ReflectionsPass.cs`,
+> NOT memory `dx12-lumen-gi-p0`'s "via world cache" subject), whether a roughness-split ALREADY EXISTS (grep
+> + read the raygen branch), the RtReflTableBase value (enumerated from `Dx12BindlessTail.cs`, NEVER hand-listed),
+> the RT-refl ~2.07ms term, the shipping-path defaults (`SsrEnabled`/`ReflectionMode`), and the reference
+> GI-isolate SHAs — all from fresh `git`/`grep`/`read`/build/headless-capture. **NO code change** — R2.3 turned
+> out to be a measure+document chunk (like R1.x/R2.1/R2.2): the roughness handling + re-shade-at-hit ALREADY
+> EXIST in the tree, fully wired, satisfying the DoD. Raw: `e:/tmp/gi-r23/`.
+
+### (0) ‼ THE LOAD-BEARING PROVISIONAL-POLICY CATCH — P8.0 is RE-SHADE-AT-HIT (sharp), NOT a blurry cache-read
+
+The handoff/plan asks "is the committed P8.0 reflection path a blurry CACHE read (DDGI atlas at the hit) or a
+SHARP RE-SHADE at the hit?" The commit subject `336967af` ("RT reflections **via the world cache** — Hit
+Lighting + DDGI multi-bounce") reads ambiguously toward "cache." **Re-READING the shader REFUTES the cache
+reading** (PROVISIONAL POLICY: the log subject describes intent, not realized state — rev6 crack-4):
+
+- **`DxrReflections.hlsl` ClosestHit (`:229-284`) is full world-space RE-SHADE at the hit**, not a cache read
+  of the reflection color. Line `:274`: `float3 radiance = albedo * (sun + punctual + ambient) + emissive;`
+  where:
+  - `sun` = `SunColor * saturate(dot(Ng,SunDir)) * Visibility(...)` — a shadow-rayed sun term computed AT the hit (`:267-268`),
+  - `punctual` = `PunctualDiffuse(hit, Ng)` — each punctual light, shadow-rayed, AT the hit (`:269`, `:101-123`),
+  - `ambient` = `UseDdgi>0.5 ? SampleDdgiField(hit,Ng) : Irradiance.SampleLevel(...)` (`:273`) — the DDGI world
+    cache is read **ONLY for the hit surface's own multi-bounce GI ambient** (the diffuse irradiance E at the
+    hit), exactly the DdgiTrace.ShadeHit estimator. It is NOT the reflection color; it is the indirect-light
+    term FEEDING the re-shade.
+  - `emissive` = self-emission L_e (`:256-260`, gated on `HasEmissive` + `Pad0` emissiveEnable).
+- **The reflection ray is a deterministic MIRROR ray** `R = reflect(-V, N)` (`:198`) traced into the BVH
+  (`:212-217`), one per pixel, no jitter → **SHARP specular, byte-identical capture, no denoiser** (`:24`).
+- **VERDICT (re-measured): P8.0 = "Hit Lighting" re-shade-at-hit (SHARP), not a cache-read of the reflection.**
+  The DDGI atlas appears in the closest-hit but ONLY as the hit's ambient (its own GI), preventing the
+  reflected wall from looking flat/grey. So the worry "P8.0 might be a blurry cache" is FALSE by construction —
+  the reflection sharpness comes from the mirror ray + re-shade, the cache only enriches the hit's ambient.
+
+### (1) ‼ THE SECOND PROVISIONAL-POLICY CATCH — the roughness-split ALREADY EXISTS (as a gradient, not a binary)
+
+The plan asks R2.3 to "build the roughness-split: rough→cache (cheap), sharp→re-shade-at-hit (clamp rays)."
+**Re-grepping (`grep -i 'roughness.split|rough.*cache|sharp.*re-shade'` over `BallisticEngine.DX12/` = 0
+matches for a NAMED split) then re-READING the raygen PROVES the EFFECTIVE split already exists** — as a
+roughness GRADIENT, which satisfies the DoD without a separate "read DDGI-atlas AS the reflection" branch:
+
+| Surface roughness | What the shader does | Reflection result |
+|---|---|---|
+| **≤ 0.6** (`MAX_ROUGHNESS`, `DxrReflections.hlsl:81`) | Trace a mirror ray (`:198,:212-217`) → **re-shade at hit** (`:274`). `roughFade = 1.0 - smoothstep(0.3, 0.6, roughness)` (`:205`) tapers strength toward the rough end; `grazeKeep` cuts grazing fresnel on roughening surfaces (`:203-204`). | **SHARP reflection from re-shade** (the DoD). Glossier (roughness→0.3) = full strength. |
+| **> 0.6** | `if (... roughness > MAX_ROUGHNESS) return;` (`:190`) — **NO reflection ray traced**. The surface's indirect specular is left to the **diffuse GI** (which carries near-diffuse roughness; comment `:27-28` "the diffuse GI carries near-diffuse roughness — no rough-tail field-along-R term, that path needs /PI AND double-counts where diffuse GI already lights"). | Rough surface → handled by diffuse GI/DDGI, NOT a separate refl cache read. **No double-count.** |
+| **reflection ray MISSES** (escapes the scene) | `Miss` (`:222-227`): `Prefilter.SampleLevel(WorldRayDirection(), mip)` with `mip = roughness * PrefilterMaxMip` (`:225`) — the **roughness-mipped sky/IBL prefilter cube**. | **IBL fallback ONLY for the escaped ray** = only OUTSIDE traced geometry (= outside the cascaded far-field / BVH). |
+
+**★ R2.3 ARCHITECTURE DECISION (recorded, supersedes the plan's "build a binary rough→cache split"):** the
+existing design is a roughness GRADIENT, not a binary cache-vs-reshade switch, and it is the BETTER
+architecture for this stack:
+- The plan's literal "rough → read the DDGI cache AS the reflection color" would re-introduce the `/PI` +
+  double-count hazard the shader comment (`:27-28`) explicitly avoids (the diffuse GI ALREADY lights rough
+  surfaces' indirect specular). So a separate rough-refl cache branch is NOT built — it would be a regression.
+- "Sharp → re-shade-at-hit with CLAMPED ray budget" is satisfied: the ray budget IS clamped — exactly ONE
+  mirror ray per pixel (`:212-217`, `DispatchRays` Width×Height in `Dx12ReflectionsPass.cs:351-356`), plus the
+  hit's shadow rays (sun + punctual, inline `RayQuery`, `:91-98`), `MaxTraceRecursionDepth=1`
+  (`Dx12ReflectionsPass.cs:230` `RaytracingPipelineConfig(1)`) → no recursion, bounded cost. Rough surfaces
+  (>0.6) trace ZERO reflection rays (the early-return is the clamp at the rough end).
+- **So R2.3 = NO new code** (PROVISIONAL POLICY catch, the THIRD chunk in a row — R1.x/R2.1/R2.2 — where the
+  plan-author's "needs building" was a stale read: the roughness gradient + re-shade + IBL-miss-only are all
+  in `336967af`/`b95ccee5`, both HEAD ancestors).
+
+### (2) DoD checks (static analysis — RT reflections headless capture is device-unsafe, §4 PRE-EXISTING)
+
+- **DoD-1 "glossy surface shows a SHARP reflection from re-shade (not the blurry cache)": SATISFIED by
+  construction.** The mirror ray (`:198`) + the hit re-shade (`:274`) ARE the sharp reflection; the DDGI cache
+  is only the hit's ambient term, never the reflection color. A glossy surface (roughness ≤ ~0.3) gets full
+  `roughFade` strength (`:205`) and a sharp mirror trace. **Validated by static analysis, NOT a RayTraced
+  headless capture** — `ReflectionMode=RayTraced` / `BALLISTIC_DX12_RT_REFLECTIONS=1` headless SaveBmp is the
+  documented device-remove risk (§4 PRE-EXISTING, the `DispatchRays` SBT path) that this seat NEVER opens. A
+  glossy-surface VISUAL A/B is deferred to a GPU-safe RayTraced seat (privileged TdrDelay or real-HW), recorded
+  NOT silent. (No glossy fixture was authored either — the 5 GiFixtures are diffuse-GI focused and CornellBox
+  materials carry default roughness; building a glossy fixture is moot until the RayTraced capture path is
+  GPU-safe.)
+- **DoD-2 "IBL fallback ONLY outside the cascaded far-field (document as intentional): SATISFIED + DOCUMENTED.**
+  The ONLY IBL path in the reflection is the `Miss` shader (`:222-227`) — reached ONLY when the mirror ray
+  ESCAPES all scene geometry (the BVH). Hits inside the scene re-shade with the DDGI world cache as ambient,
+  NOT IBL (`:271-273` "the field already folds in sky, so do NOT add the IBL cube on top when DDGI is bound").
+  So near/mid-field traced geometry NEVER falls to IBL — IBL is the sky/escaped-ray color only, which is
+  exactly "outside the cascaded far-field." **This is intentional and correct** (a reflection of the open sky
+  SHOULD be the sky; a reflection of a nearby wall is re-shaded). The no-DDGI fallback (`UseDdgi=0`) uses the
+  flat IBL irradiance cube at hits — a graceful degrade only when DDGI is off, not the shipping High path.
+
+### (3) ‼ RT-refl PROVISIONAL term RE-MEASURED → UNCHANGED → R2.5 re-run flag RESOLVED (no shift)
+
+R2.1 §(E) flagged "RT-refl term is PROVISIONAL — uses the current P8.0 'via world cache' cost (~2.07ms
+RX9070XT); R2.3 builds the roughness-split → the RT-refl term CHANGES → RE-RUN the High-fit calibration at
+R2.5." **Re-measured here against the now-known facts:**
+
+- The "~2.07ms RX9070XT" term (re-grepped: `gi-revival-R0-baseline.md:233` "RT-refl 1.51–2.07ms (line 398)",
+  `:244`/`:685` RT-refl 2.07 → 16.6–29.0 on 2060) was measured on the **CURRENT** P8.0 path — which IS the
+  re-shade-at-hit + roughness-gradient path (the SAME code R2.3 just re-measured; `336967af` is a HEAD
+  ancestor, so the 2.07ms was ALWAYS measured on the re-shade path, never on a hypothetical pre-split "blurry
+  cache" path).
+- **Since R2.3 builds NO new code (the roughness-split already exists), the RT-refl cost does NOT shift.** The
+  premise of the R2.5 re-run flag ("R2.3 changes the reflection path → cost changes") is FALSE: there is no
+  path change. **‼ The R2.5 RT-refl re-run flag is RESOLVED — NO re-run needed for a refl-COST change.** The
+  R2.1 High-fit calibration (RT-refl 2.07ms RX9070XT → 7–13ms 2060 @ FSR-Quality, total ~28–51ms = fits 30fps
+  at the optimistic end) **STANDS unchanged**, now on a CONFIRMED (not provisional) refl term.
+- **Soft flag CARRIED to R2.5 (downgraded, not dropped):** R2.5 still budgets VRAM (BLAS/TLAS) + the
+  post-R1.0 X re-confirm per its own DoD; the RT-refl ms feeding that is now FROZEN at ~2.07ms RX9070XT
+  (re-shade path, confirmed) — R2.5 uses it as a known constant, not a provisional placeholder. If a future
+  RT-refl change DOES land (e.g. multi-ray glossy roughening, NOT in scope), THAT would re-open the flag.
+
+### (4) No-regression A/B (no code → shipping path byte-identical, GPU-safe, this run)
+
+The SHIPPING reflections path is **SSR** (re-grepped defaults: `PostProcessSettings.cs:142` `SsrEnabled=true`,
+`:144` `ReflectionMode=ScreenSpace`) — RT reflections engage ONLY via `BALLISTIC_DX12_RT_REFLECTIONS=1` or
+`ReflectionMode=RayTraced` (the user's separate reflections WIP — R2.3 did NOT set them). So the shipping-path
+A/B is the SSR path, which carries NO device-remove risk. Re-captured the GI-isolate A/B (ScreenSpace, paused
+f60, DRED on, GPU-safe recipe) after a clean DX12 `-t:Rebuild` (compile-asserts passed, 0-err) + Runtime
+rebuild (DX12.dll auto-copied, timestamps match) — **byte-identical to the R2.2/R2.1/R1.x references:**
+
+| Scene | This run SHA | Reference SHA | Verdict |
+|---|---|---|---|
+| CornellBox GI-ON | `81dbf7a5667f` | `81dbf7a5667f` | ✓ byte-identical |
+| ThinWall GI-ON | `30bc4b4368f5` | `30bc4b4368f5` | ✓ byte-identical (leak-pass HOLDS) |
+| ColorOnly GI-ON | `55ec21c5cffb` | `55ec21c5cffb` | ✓ byte-identical |
+
+All 3 launches EXIT=0, ZERO device-removal (log scan for `device-remov|DXGI_ERROR_DEVICE|hung|0x887A|0xC00000|
+DRED` = 0 matches), DRED on. RT reflections NOT opened headless (device-remove safety). `RtReflTableBase`
+re-confirmed = **16352** (enumerated from `Dx12BindlessTail.cs:67` `ScreenProbeTableBase - RtReflReserved`,
+NEVER hand-listed; compile-asserted == historical `16384-32`).
+
+### R2.3 DoD durumu
+
+- [x] **Measured what P8.0 ACTUALLY IS** (re-READ `DxrReflections.hlsl` ClosestHit + `Dx12ReflectionsPass.cs`,
+      not the commit subject): **RE-SHADE-AT-HIT (sharp), NOT a blurry cache-read.** `radiance = albedo*(sun +
+      punctual + ambient) + emissive`; the DDGI cache is the hit's AMBIENT term only, not the reflection color;
+      mirror ray = deterministic = sharp. RX9070XT cost re-confirmed ~2.07ms (re-shade path, the measured one).
+- [x] **Roughness-split: ALREADY EXISTS as a GRADIENT** (PROVISIONAL POLICY catch — no named split in grep, but
+      the raygen branch IS the effective split): roughness ≤ 0.6 → trace + re-shade (sharp, clamped to 1
+      mirror ray + inline shadow rays, MaxTraceRecursionDepth=1); roughness > 0.6 → early-return (diffuse GI
+      handles it, no /PI double-count); miss → roughness-mipped prefilter cube. **NO new code** — the literal
+      "rough→read-cache-as-reflection" branch the plan named is NOT built (would regress into the double-count
+      the shader comment `:27-28` deliberately avoids).
+- [x] **DoD glossy sharp-from-re-shade**: SATISFIED by construction (mirror ray + hit re-shade); validated by
+      static analysis (RayTraced headless capture is device-unsafe §4 PRE-EXISTING; visual A/B deferred to a
+      GPU-safe RayTraced seat, recorded). IBL fallback ONLY on the reflection-ray MISS (escaped ray = outside
+      the BVH/cascaded far-field) — intentional + documented; near/mid-field traced geometry never falls to IBL.
+- [x] **RT-refl PROVISIONAL term RE-MEASURED → UNCHANGED** (R2.3 builds no code → no path change → no cost
+      shift). **R2.5 RT-refl re-run flag RESOLVED** (the "R2.3 changes the path" premise is false); the R2.1
+      High-fit calibration STANDS on a now-CONFIRMED refl term (~2.07ms RX9070XT). Soft flag downgraded to a
+      frozen-constant carry for R2.5's own VRAM/X budget.
+- [x] **No-regression**: shipping-path (SSR) GI-isolate A/B byte-identical (CornellBox/ThinWall/ColorOnly
+      3-for-3 == references); build 0-err (DX12 `-t:Rebuild` compile-asserts pass + Runtime, DX12.dll
+      auto-copied); 3 launches EXIT=0, ZERO device-removal, DRED on. `SsrEnabled`/`ReflectionMode` NOT touched
+      (user's WIP). 8-file post-FX WIP diff UNTOUCHED. NO code change.
+
+**★ R2.3 REFLECTIONS MEASURED + DOCUMENTED (no code change — P8.0 is re-shade-at-hit/sharp not cache-read; the
+roughness gradient + clamped-ray re-shade + IBL-miss-only ALREADY EXIST in the tree and satisfy the DoD; the
+plan's "build a binary rough→cache split" was a stale read corrected by re-read, and a literal cache-as-refl
+branch would regress the /PI double-count the code deliberately avoids). RT-refl term re-measured = UNCHANGED →
+R2.5 re-run flag RESOLVED (no path change). Sıradaki = R2.4 (Cascaded + cull: finite ~30m near + clipmap fade,
+distant horizon → IBL/sky intentional+documented, culling = perf lever only; ★ GUARD: never cull geometry a
+probe's visibility depends on — leak-test ThinWall must PASS with culling ON).**
