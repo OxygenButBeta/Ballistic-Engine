@@ -75,6 +75,22 @@ public sealed class GlobalIllumination : VolumeComponent {
     [ShowIf("giMode", GiMode.RayTraced)]
     public readonly BoolParameter screenProbes = new(true);
 
+    // ---- Baked (frozen) GI ----
+    [Tooltip("BAKE the world-probe GI ONCE then FREEZE it: compute the indirect light progressively over the " +
+             "first frames (the region around the camera first, the rest filling in over time — playable " +
+             "immediately) and then stop updating it. Frozen = 0 rays/frame at runtime (near-free) and NO temporal " +
+             "feedback, so GHOSTING is structurally impossible — the fix for 'performanssız + ghosting'. The " +
+             "trade: a frozen field doesn't follow a moving sun (it auto re-bakes when the sun or the camera " +
+             "moves far enough). Needs the World Radiance Cache. Ray-Traced GI only.")]
+    [ShowIf("giMode", GiMode.RayTraced)]
+    public readonly BoolParameter bakedGi = new(false);
+
+    [Tooltip("Probe cascades: 1 = a single dense grid; 2 = a NEAR dense cascade (high detail) plus a FAR sparse " +
+             "cascade (wide coverage, no GI falloff at the grid edge). Baked GI only — the frozen field pays the " +
+             "cost once, so the extra cascade is free at runtime. Ray-Traced GI only.")]
+    [ShowIf("bakedGi", true)]
+    public readonly ClampedIntParameter cascades = new(2, 1, 2);
+
     // ---- Debug ----
     [Tooltip("GI-isolate view: show ONLY the indirect bounce this GI pass adds (not the lit scene). " +
              "Black = no bounce here. The way to verify + tune GI — judge it by the isolated bounce.")]
@@ -109,22 +125,28 @@ public sealed class GlobalIllumination : VolumeComponent {
              ">8 is clamped. (Screen-Space mode only.)")]
     public readonly ClampedIntParameter rayCount = new(4, 1, 16);
 
+    // CHUNK6: the three temporal dials are MEANINGLESS once GI is BAKED (a frozen field has no per-frame temporal
+    // accumulation — that's the whole point: 0 ghosting by construction). Hidden when bakedGi is on so the
+    // inspector doesn't show inert knobs ("kullanılamayan şeyler çöpe"). They stay live (and visible) for the
+    // non-baked DDGI/SSGI path. Hidden, not deleted — toggling bakedGi off restores them with their values.
     [Header("Advanced — Temporal")]
     [FoldoutGroup("Advanced")]
-    [Tooltip("Temporal frames to accumulate. Higher = smoother but laggier.")]
+    [HideIf("bakedGi", true)]
+    [Tooltip("Temporal frames to accumulate. Higher = smoother but laggier. (Live GI only — baked GI is frozen.)")]
     public readonly ClampedFloatParameter maxHistory = new(24f, 1f, 64f);
 
     [FoldoutGroup("Advanced")]
+    [HideIf("bakedGi", true)]
     [Tooltip("Ghosting reject: how aggressively a moving camera flushes the temporal trail. 0 = never flush " +
              "(maximum smoothing, but a fast pan smears/ghosts); higher = a pan collapses the accumulation faster " +
-             "(kills ghosting, but more per-frame grain shows while moving). Tune live against your scene: raise " +
-             "it until ghosting is gone, then back off until grain-while-moving is acceptable.")]
+             "(kills ghosting, but more per-frame grain shows while moving). (Live GI only — baked GI has no " +
+             "temporal trail, so ghosting is impossible by construction.)")]
     public readonly ClampedFloatParameter ghostingReject = new(0.06f, 0f, 0.5f);
 
     [FoldoutGroup("Advanced")]
+    [HideIf("bakedGi", true)]
     [Tooltip("Temporal clamp tightness: how far accumulated history may stray from the current local bounce " +
-             "before it's clamped. Low = tight (less ghosting, slightly more noise); high = loose (smoother, but " +
-             "stale light lingers as ghosting). The companion to Ghosting Reject for the static/slow case.")]
+             "before it's clamped. (Live GI only — baked GI is frozen, no history to clamp.)")]
     public readonly ClampedFloatParameter temporalClamp = new(1.6f, 1f, 4f);
 
     [Header("Advanced — Look")]

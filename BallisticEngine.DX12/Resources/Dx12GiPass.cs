@@ -162,14 +162,15 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
     // the gather as the fallback where near has no coverage. Created only when cascade=2 (BALLISTIC_DX12_DDGI_CASCADES
     // >= 2). Reflections keep reading the NEAR cascade (ctx.Dxr.Ddgi); far augments diffuse coverage only.
     Dx12Ddgi ddgiFar;
-    int? cascadeCountEnv;
-    int CascadeCount {
-        get {
-            if (cascadeCountEnv == null)
-                cascadeCountEnv = int.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_CASCADES"),
-                    out int n) && n >= 1 ? Math.Min(n, 2) : 1;
-            return cascadeCountEnv.Value;
+    int? cascadeCountEnv; bool cascadeEnvRead;
+    int CascadeCount(Dx12FrameContext ctx) {
+        if (!cascadeEnvRead) {
+            cascadeEnvRead = true;
+            cascadeCountEnv = int.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_CASCADES"),
+                out int n) && n >= 1 ? Math.Min(n, 2) : (int?)null;
         }
+        // Env door wins (A/B harness); else the volume's cascade count (CHUNK6 front door), clamped to [1,2].
+        return cascadeCountEnv ?? Math.Clamp(ctx.PostFX.DdgiCascades, 1, 2);
     }
 
     // BuildSsgi + the SSGI/RT-GI rootsig/PSO/CB/heap construction moved VERBATIM into the ctor (re-rooted onto
@@ -583,6 +584,9 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
             if (ctx.Dxr.Ddgi == null) ctx.Dxr.Ddgi = new Dx12Ddgi(dev);
             var ddgi = ctx.Dxr.Ddgi;
             ddgi.Build();
+            // CHUNK6 front door: the volume's bakedGi drives baked mode (the env door still force-overrides via
+            // Dx12Ddgi.BakedMode). SetBakedMode is a no-op when unchanged; it triggers a Rebake on the off->on edge.
+            ddgi.SetBakedMode(ctx.PostFX.DdgiBaked);
             // CHUNK5 manual "Rebake GI" button (editor/remote): consume the one-shot request before Update so the
             // wave restarts this frame. Applies to both cascades.
             if (GiDebugGrid.RebakeRequested) { ddgi.Rebake(); ddgiFar?.Rebake(); GiDebugGrid.RebakeRequested = false; }
@@ -591,7 +595,7 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
             // CHUNK3: bring up the FAR cascade when cascade=2. Wider spacing (3x near) so it covers a far larger
             // volume at lower density; the near cascade keeps the detail. Only meaningful in BAKED mode (the
             // cascade is a coverage tool for the frozen field); the live path runs near only.
-            if (CascadeCount >= 2 && ddgi.BakedMode)
+            if (CascadeCount(ctx) >= 2 && ddgi.BakedMode)
             {
                 if (ddgiFar == null) { ddgiFar = new Dx12Ddgi(dev); ddgiFar.CascadeSpacingMultiplier = 3f; }
                 ddgiFar.SetBakedMode(true);

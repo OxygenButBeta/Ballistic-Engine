@@ -79,6 +79,9 @@ public static class VolumePostProcessing {
             fx.GiEmissive = giOn && gi.emissiveAsGi.Value;
             fx.Ddgi = giOn && gi.worldRadianceCache.Value;
             fx.ScreenProbes = giOn && gi.screenProbes.Value;
+            // Baked (frozen) GI + cascade count — the progressive-bake front door (CHUNK6).
+            fx.DdgiBaked = giOn && gi.bakedGi.Value;
+            fx.DdgiCascades = gi.cascades.Value;
             // Reflections (SSR + RT) — driven by the volume's Reflections-Mode dropdown. SsrEnabled gates
             // Dx12ReflectionsPass.Enabled(); ReflectionMode selects the SSR vs RT branch inside Record.
             fx.ReflectionMode = giOn ? gi.reflectionsMode.Value : ReflectionMode.Off;

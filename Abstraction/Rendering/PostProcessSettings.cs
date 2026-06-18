@@ -179,6 +179,14 @@ public sealed class PostProcessSettings {
     // BALLISTIC_DX12_DDGI env door still force-overrides for the A/B harness; unset = this drives.
     public bool Ddgi { get; set; }
 
+    // Bake the DDGI field once then freeze it (progressive near-first bake → 0 rays/frame, no ghosting). DEFAULT
+    // false (live DDGI). BALLISTIC_DX12_DDGI_BAKED force-overrides for the A/B harness; unset = this drives.
+    public bool DdgiBaked { get; set; }
+
+    // Probe cascade count for baked GI: 1 = single dense grid, 2 = near dense + far sparse. DEFAULT 1 (single).
+    // BALLISTIC_DX12_DDGI_CASCADES force-overrides; unset = this drives. Only meaningful with DdgiBaked.
+    public int DdgiCascades { get; set; } = 1;
+
     // Screen-space radiance probes: the near/mid-field final gather (DDGI-on only). DEFAULT true (matches
     // the old BALLISTIC_DX12_SCREENPROBE != "0" gate). BALLISTIC_DX12_SCREENPROBE still force-overrides.
     public bool ScreenProbes { get; set; } = true;
