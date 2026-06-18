@@ -49,6 +49,7 @@ public sealed class Dx12Ddgi : IDisposable {
     // NOT registered in Dx12Backend.BindlessHeap, which the material table Resets (would clobber them).
     public ID3D12Resource IrradianceTex => irradianceTex;
     public ID3D12Resource DepthTex => depthTex;
+    public ID3D12Resource ProbeStateTex => probeState;   // CHUNK3: far cascade exposes its state for the near gather
     ID3D12Resource irradianceTex, depthTex;
 
     // GPU address of the per-probe ProbeState buffer (relocation offset + active flag), for OTHER passes that
@@ -74,6 +75,10 @@ public sealed class Dx12Ddgi : IDisposable {
             System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float s) && s > 0.1f
             ? s : 1.2f;
     }
+    // CHUNK3: a cascade can be configured as the FAR (sparse, wide) one — its spacing is the near baked spacing
+    // times this multiplier, so it covers a much larger volume at lower density. Set on the far instance before
+    // its first Update. 1 = same as near (a plain cascade); the renderer uses ~3-4x for the far cascade.
+    public float CascadeSpacingMultiplier { get; set; } = 1f;
 
     public bool Allocated => irradianceTex != null;
 
@@ -303,7 +308,7 @@ public sealed class Dx12Ddgi : IDisposable {
         // thrashes the snap, and only in BakedMode so the live path is byte-identical.
         if (BakedMode && !bakedSpacingApplied) {
             bakedSpacingApplied = true;
-            float s = BakedSpacing;
+            float s = BakedSpacing * CascadeSpacingMultiplier;   // CHUNK3: far cascade widens via the multiplier
             Spacing = new Vector3(s, s, s);
         }
         Vector3 half = new(
@@ -524,11 +529,12 @@ public sealed class Dx12Ddgi : IDisposable {
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         constCbMapped = constCb.Map<byte>(0);
 
-        // --- P2.2/P2.4 GATHER root sig: CBV b0 (grid) + CBV b1 (extra) + table {t0..t5 SRV, u0 UAV} +
-        // linear-clamp. t5 = ProbeState (P2.4 relocation offset + active flag). ---
+        // --- P2.2/P2.4 GATHER root sig: CBV b0 (near grid) + CBV b1 (extra) + CBV b2 (CHUNK3 FAR grid) + table
+        // {t0..t8 SRV, u0 UAV} + linear-clamp. t0-t2 G-buffer; t3-t5 NEAR atlas/depth/state; t6-t8 FAR (CHUNK3). ---
         var g_cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
         var g_cbv1 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.All);
-        var g_srv = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 6, baseShaderRegister: 0);   // t0..t5
+        var g_cbv2 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(2, 0), ShaderVisibility.All);  // b2 far grid
+        var g_srv = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 9, baseShaderRegister: 0);   // t0..t8 (CHUNK3: +3 far)
         var g_uav = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);
         var g_table = new RootParameter1(new RootDescriptorTable1(g_srv, g_uav), ShaderVisibility.All);
         var g_samp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) {
@@ -537,18 +543,24 @@ public sealed class Dx12Ddgi : IDisposable {
             ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
         };
         gatherRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { g_cbv0, g_cbv1, g_table }, new[] { g_samp })));
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { g_cbv0, g_cbv1, g_cbv2, g_table }, new[] { g_samp })));
         string gatherHlsl = EmbeddedShaderSource.ReadHlsl("DdgiGather.hlsl");
         byte[] gatherCs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, gatherHlsl, "CSGather", "DdgiGather.hlsl");
         gatherPso = dev.Device.CreateComputePipelineState(
             new ComputePipelineStateDescription { RootSignature = gatherRootSig, ComputeShader = gatherCs });
         gatherHeap = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 7, shaderVisible: true);  // 6 SRV + 1 UAV
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 10, shaderVisible: true);  // 9 SRV + 1 UAV
         int gcbSize = (System.Runtime.InteropServices.Marshal.SizeOf<DdgiGatherExtra>() + 255) & ~255;
         gatherCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)gcbSize), ResourceStates.GenericRead);
         gatherCbMapped = gatherCb.Map<byte>(0);
+        // CHUNK3: far-grid CBV (b2). Filled with the far cascade's DdgiConstants when cascade=2, else a copy of
+        // near (harmless — the shader ignores far when cascadeCount<1.5).
+        farGridCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+        farGridCbMapped = farGridCb.Map<byte>(0);
     }
+    ID3D12Resource farGridCb; unsafe byte* farGridCbMapped;   // CHUNK3 far cascade grid CBV (b2)
 
     // Run the probe update: TRACE (rays/probe → RayData) then BLEND (RayData → irradiance + depth atlases).
     // Must be called from inside DrawRtGi AFTER EnsureMaterialTable + rtGeometry.Ensure (bindless ids fresh)
@@ -671,53 +683,81 @@ public sealed class Dx12Ddgi : IDisposable {
     // (the caller then runs SsgiResolveAndCombine). The atlases are in UnorderedAccess on entry (left so by
     // DispatchDdgi) → transitioned to NonPixelShaderResource for the SRV read here, then back to UnorderedAccess
     // for next frame's blend. ssgiTarget must be in UnorderedAccess on entry (caller's ColorToUnorderedAccess).
+    // CHUNK3: `far` is the optional second (sparse, wide) cascade. When non-null the gather samples NEAR first and
+    // falls back to FAR where near has no coverage; when null it's the original single-cascade gather (cascadeCount
+    // 1 → the shader's far branch is inert, byte-identical). The far atlases must already be in the SAME state the
+    // near ones expect (UnorderedAccess on entry) — they're transitioned in lockstep with near.
+    static void IrrSrv(Dx12Device d, ID3D12Resource tex, CpuDescriptorHandle h) =>
+        d.Device.CreateShaderResourceView(tex, new ShaderResourceViewDescription {
+            Format = Format.R16G16B16A16_Float, ViewDimension = ShaderResourceViewDimension.Texture2D,
+            Shader4ComponentMapping = ShaderComponentMapping.Default, Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
+        }, h);
+    static void DepSrv(Dx12Device d, ID3D12Resource tex, CpuDescriptorHandle h) =>
+        d.Device.CreateShaderResourceView(tex, new ShaderResourceViewDescription {
+            Format = Format.R16G16_Float, ViewDimension = ShaderResourceViewDimension.Texture2D,
+            Shader4ComponentMapping = ShaderComponentMapping.Default, Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
+        }, h);
+    static void StateSrv(Dx12Device d, ID3D12Resource buf, int count, CpuDescriptorHandle h) =>
+        d.Device.CreateShaderResourceView(buf, new ShaderResourceViewDescription {
+            Format = Format.Unknown, ViewDimension = ShaderResourceViewDimension.Buffer,
+            Shader4ComponentMapping = ShaderComponentMapping.Default,
+            Buffer = new BufferShaderResourceView { FirstElement = 0, NumElements = (uint)count, StructureByteStride = 16 },
+        }, h);
+
     public unsafe void DispatchGather(ID3D12GraphicsCommandList4 cl,
         CpuDescriptorHandle depthSrv, CpuDescriptorHandle normalSrv, CpuDescriptorHandle albedoSrv,
         ID3D12Resource ssgiTargetRes, int screenW, int screenH,
-        Matrix4x4 invViewProjTransposed, float preExposure) {
+        Matrix4x4 invViewProjTransposed, float preExposure, Dx12Ddgi far = null) {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        bool hasFar = far != null && far.Allocated && far != this;
         *(DdgiGatherExtra*)gatherCbMapped = new DdgiGatherExtra {
             InvViewProj = invViewProjTransposed,
-            GParams = new Vector4(preExposure, screenW, screenH, 0f),
+            GParams = new Vector4(preExposure, screenW, screenH, hasFar ? 2f : 1f),   // w = cascadeCount
         };
-        // Build the gather heap: t0 depth, t1 normal, t2 albedo, t3 irrAtlas, t4 depthAtlas, t5 ProbeState,
-        // u0 ssgiTarget (slot 6).
+        // CHUNK3 far grid CBV (b2): the far cascade's grid constants, or a copy of near when single-cascade.
+        *(DdgiConstants*)farGridCbMapped = hasFar ? far.GridConstants() : Constants(frameCounter, 0.97f, 1f, false, true);
+
+        // Build the gather heap: t0 depth, t1 normal, t2 albedo, t3-t5 NEAR irr/depth/state, t6-t8 FAR irr/depth/
+        // state (CHUNK3 — far when present, else a harmless copy of near; the shader ignores far at cascadeCount 1),
+        // u0 ssgiTarget (slot 9).
         gatherHeap.Reset();
         dev.Device.CopyDescriptorsSimple(1, gatherHeap.Cpu(0), depthSrv, heapType);
         dev.Device.CopyDescriptorsSimple(1, gatherHeap.Cpu(1), normalSrv, heapType);
         dev.Device.CopyDescriptorsSimple(1, gatherHeap.Cpu(2), albedoSrv, heapType);
-        dev.Device.CreateShaderResourceView(irradianceTex, new ShaderResourceViewDescription {
-            Format = Format.R16G16B16A16_Float, ViewDimension = ShaderResourceViewDimension.Texture2D,
-            Shader4ComponentMapping = ShaderComponentMapping.Default,
-            Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
-        }, gatherHeap.Cpu(3));
-        dev.Device.CreateShaderResourceView(depthTex, new ShaderResourceViewDescription {
-            Format = Format.R16G16_Float, ViewDimension = ShaderResourceViewDimension.Texture2D,
-            Shader4ComponentMapping = ShaderComponentMapping.Default,
-            Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
-        }, gatherHeap.Cpu(4));
-        dev.Device.CreateShaderResourceView(probeState, new ShaderResourceViewDescription {   // t5 ProbeState
-            Format = Format.Unknown, ViewDimension = ShaderResourceViewDimension.Buffer,
-            Shader4ComponentMapping = ShaderComponentMapping.Default,
-            Buffer = new BufferShaderResourceView { FirstElement = 0, NumElements = ProbeCount, StructureByteStride = 16 },
-        }, gatherHeap.Cpu(5));
+        IrrSrv(dev, irradianceTex, gatherHeap.Cpu(3));
+        DepSrv(dev, depthTex, gatherHeap.Cpu(4));
+        StateSrv(dev, probeState, ProbeCount, gatherHeap.Cpu(5));
+        IrrSrv(dev, hasFar ? far.IrradianceTex : irradianceTex, gatherHeap.Cpu(6));
+        DepSrv(dev, hasFar ? far.DepthTex : depthTex, gatherHeap.Cpu(7));
+        StateSrv(dev, hasFar ? far.ProbeStateTex : probeState, ProbeCount, gatherHeap.Cpu(8));
         dev.Device.CreateUnorderedAccessView(ssgiTargetRes, null, new UnorderedAccessViewDescription {
             Format = Format.R16G16B16A16_Float, ViewDimension = UnorderedAccessViewDimension.Texture2D,
-        }, gatherHeap.Cpu(6));
+        }, gatherHeap.Cpu(9));
 
         cl.ResourceBarrierTransition(irradianceTex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
         cl.ResourceBarrierTransition(depthTex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
         cl.ResourceBarrierTransition(probeState, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+        if (hasFar) {
+            cl.ResourceBarrierTransition(far.IrradianceTex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            cl.ResourceBarrierTransition(far.DepthTex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            cl.ResourceBarrierTransition(far.ProbeStateTex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+        }
         cl.SetDescriptorHeaps(gatherHeap.Heap);
         cl.SetComputeRootSignature(gatherRootSig);
         cl.SetPipelineState(gatherPso);
-        cl.SetComputeRootConstantBufferView(0, constCb.GPUVirtualAddress);    // b0 grid (filled by DispatchDdgi this frame)
+        cl.SetComputeRootConstantBufferView(0, constCb.GPUVirtualAddress);    // b0 near grid (filled by DispatchDdgi)
         cl.SetComputeRootConstantBufferView(1, gatherCb.GPUVirtualAddress);   // b1 extra
-        cl.SetComputeRootDescriptorTable(2, gatherHeap.Gpu(0));
+        cl.SetComputeRootConstantBufferView(2, farGridCb.GPUVirtualAddress);  // b2 far grid (CHUNK3)
+        cl.SetComputeRootDescriptorTable(3, gatherHeap.Gpu(0));
         cl.Dispatch((uint)((screenW + 7) / 8), (uint)((screenH + 7) / 8), 1);
         cl.ResourceBarrierTransition(irradianceTex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
         cl.ResourceBarrierTransition(depthTex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
         cl.ResourceBarrierTransition(probeState, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+        if (hasFar) {
+            cl.ResourceBarrierTransition(far.IrradianceTex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+            cl.ResourceBarrierTransition(far.DepthTex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+            cl.ResourceBarrierTransition(far.ProbeStateTex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+        }
     }
 
     // DEBUG (BALLISTIC_DX12_DDGI_DEBUG=1): read the irradiance atlas back to the CPU and report min/max/mean +
@@ -839,6 +879,7 @@ public sealed class Dx12Ddgi : IDisposable {
         gatherRootSig?.Dispose(); gatherRootSig = null;
         gatherHeap?.Dispose(); gatherHeap = null;
         if (gatherCb != null) { gatherCb.Unmap(0); gatherCb.Dispose(); gatherCb = null; }
+        if (farGridCb != null) { farGridCb.Unmap(0); farGridCb.Dispose(); farGridCb = null; }
         if (constCb != null) { constCb.Unmap(0); constCb.Dispose(); constCb = null; }
         built = false;
     }
