@@ -171,6 +171,36 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
     // CHUNK3: the FAR (sparse, wide) cascade — its own Dx12Ddgi, traced + blended like near each frame, sampled by
     // the gather as the fallback where near has no coverage. Created only when cascade=2 (BALLISTIC_DX12_DDGI_CASCADES
     // >= 2). Reflections keep reading the NEAR cascade (ctx.Dxr.Ddgi); far augments diffuse coverage only.
+    // SCENE-FIXED GRID: the scene's world AABB, computed once from the static-mesh renderers (cached). The DDGI
+    // grid is fitted to this so the bake spans the whole scene and never slides with the camera.
+    bool sceneBoundsValid; Vector3 cachedSceneMin, cachedSceneMax;
+    bool TryComputeSceneBounds(out Vector3 min, out Vector3 max) {
+        if (sceneBoundsValid) { min = cachedSceneMin; max = cachedSceneMax; return true; }
+        min = new Vector3(float.MaxValue); max = new Vector3(float.MinValue);
+        bool any = false;
+        foreach (var r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
+            var mesh = r.SharedMesh;
+            if (mesh?.SubMeshes == null || mesh.SubMeshes.Length == 0) continue;
+            Matrix4x4 model = r.Transform.WorldMatrix;   // already System.Numerics.Matrix4x4
+            for (int s = 0; s < mesh.SubMeshes.Length; s++) {
+                mesh.GetSubMeshBounds(s, out Vector3 lmin, out Vector3 lmax);   // Vector3 = System.Numerics here
+                // 8-corner world transform (matches the cull's WorldAabb so the grid lines up with the geometry).
+                for (int c = 0; c < 8; c++) {
+                    var corner = new Vector3(
+                        (c & 1) == 0 ? lmin.X : lmax.X,
+                        (c & 2) == 0 ? lmin.Y : lmax.Y,
+                        (c & 4) == 0 ? lmin.Z : lmax.Z);
+                    Vector3 w = Vector3.Transform(corner, model);
+                    min = Vector3.Min(min, w); max = Vector3.Max(max, w);
+                    any = true;
+                }
+            }
+        }
+        if (!any) return false;
+        cachedSceneMin = min; cachedSceneMax = max; sceneBoundsValid = true;
+        return true;
+    }
+
     Dx12Ddgi ddgiFar;
     int? cascadeCountEnv; bool cascadeEnvRead;
     int CascadeCount(Dx12FrameContext ctx) {
@@ -602,6 +632,11 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
             ddgi.VolumeRays = ctx.PostFX.BakedGiRaysPerProbe;
             ddgi.VolumeSpacing = ctx.PostFX.BakedGiProbeSpacing;
             ddgi.VolumeConverge = ctx.PostFX.BakedGiConvergeTarget;
+            // SCENE-FIXED GRID: fit the probe grid to the whole scene's world AABB ONCE, so the bake covers the
+            // entire scene and never slides with the camera (the fix for "gittiğim yeri siliyor + uzak siyah").
+            // Computed from the static-mesh renderers' world bounds; cached + only re-sent when it changes.
+            if (TryComputeSceneBounds(out Vector3 sbMin, out Vector3 sbMax))
+                ddgi.SetSceneBounds(sbMin, sbMax);
             // CHUNK5 manual "Rebake GI" button (editor/remote): consume the one-shot request before Update so the
             // wave restarts this frame. Applies to both cascades.
             if (GiDebugGrid.RebakeRequested) { ddgi.Rebake(); ddgiFar?.Rebake(); GiDebugGrid.RebakeRequested = false; }

@@ -314,33 +314,61 @@ public sealed class Dx12Ddgi : IDisposable {
 
     public Dx12Ddgi(Dx12Device device) { dev = device; }
 
+    // ===== SCENE-FIXED GRID (2026-06-18, user: "sahne-sabit grid: bir kez sahnenin tamamını kapla, kamerayla
+    // KAYMA"). The camera-centered snap made the grid SLIDE under the camera, so walking away "deleted" the bake
+    // there and far geometry (outside the small grid) was black. Instead the grid is fitted ONCE to the scene's
+    // world bounding box: it covers the WHOLE scene, never moves, bakes once, and stays everywhere the camera goes.
+    // Spacing is derived so the fixed probe count spans the bounds; auto-rebake on camera move is disabled (the
+    // grid is static — only a light change rebakes). SetSceneBounds is called by the renderer with the scene AABB. =====
+    bool sceneFixed;                  // true once SetSceneBounds has fitted the grid (then Update doesn't camera-snap)
+    Vector3 sceneMin, sceneMax;
+    public void SetSceneBounds(Vector3 min, Vector3 max) {
+        // Pad the box a little so probes sit just outside the surfaces (not embedded in walls) + guard a degenerate
+        // (empty/point) bounds. Fit the FIXED probe grid to the padded box: spacing = extent / (probes-1) per axis.
+        Vector3 size = max - min;
+        if (size.X < 0.5f || size.Y < 0.5f || size.Z < 0.5f) return;   // not a real bounds yet — keep waiting
+        Vector3 pad = size * 0.05f + new Vector3(0.5f);
+        sceneMin = min - pad; sceneMax = max + pad;
+        Vector3 ext = sceneMax - sceneMin;
+        Spacing = new Vector3(
+            ext.X / MathF.Max(ProbesX - 1, 1),
+            ext.Y / MathF.Max(ProbesY - 1, 1),
+            ext.Z / MathF.Max(ProbesZ - 1, 1));
+        Origin = sceneMin;            // corner probe at the box corner; the grid exactly spans the scene
+        if (!sceneFixed) { sceneFixed = true; Rebake(); }   // first fit → bake the whole scene once
+    }
+
     public void EnsureAllocated() {
         if (Allocated) return;
         irradianceTex = CreateAtlas(IrradianceAtlasW, IrradianceAtlasH, Format.R16G16B16A16_Float);
         depthTex = CreateAtlas(DepthAtlasW, DepthAtlasH, Format.R16G16_Float);
     }
 
-    // Camera-centered snap: place the grid so the camera sits near its centre, snapped to whole probe
-    // spacings (so probes don't swim under sub-cell camera motion → temporal stability). Call per frame.
+    // Grid placement, called per frame. SCENE-FIXED (the default baked behaviour): once SetSceneBounds has fitted
+    // the grid to the scene AABB, the grid is STATIC — it does NOT follow the camera, so the bake covers the whole
+    // scene and never "slides away". Only the legacy (no-bounds) path camera-snaps. The bake camera (for the
+    // progressive band order) still tracks the real camera so the region around the viewer converges first.
     bool bakedSpacingApplied;
     public void Update(Vector3 cameraPos) {
-        // BAKED mode (CHUNK 0 stopgap, single dense grid — superseded by the cascade in ch3): tighten the probe
-        // spacing ONCE so denser probes give finer indirect. Applied once (a one-shot, not per-frame) so it never
-        // thrashes the snap, and only in BakedMode so the live path is byte-identical.
-        if (BakedMode && !bakedSpacingApplied) {
-            bakedSpacingApplied = true;
-            float s = BakedSpacing * CascadeSpacingMultiplier;   // CHUNK3: far cascade widens via the multiplier
-            Spacing = new Vector3(s, s, s);
+        if (!sceneFixed) {
+            // LEGACY camera-centered snap (only until SetSceneBounds fits the scene grid — e.g. headless with no
+            // bounds supplied). Kept so a caller that never sets bounds still gets a usable camera-local grid.
+            if (BakedMode && !bakedSpacingApplied) {
+                bakedSpacingApplied = true;
+                float s = BakedSpacing * CascadeSpacingMultiplier;
+                Spacing = new Vector3(s, s, s);
+            }
+            Vector3 half = new(
+                Spacing.X * (ProbesX - 1) * 0.5f,
+                Spacing.Y * (ProbesY - 1) * 0.5f,
+                Spacing.Z * (ProbesZ - 1) * 0.5f);
+            Vector3 snapped = new(
+                MathF.Round(cameraPos.X / Spacing.X) * Spacing.X,
+                MathF.Round(cameraPos.Y / Spacing.Y) * Spacing.Y,
+                MathF.Round(cameraPos.Z / Spacing.Z) * Spacing.Z);
+            Origin = snapped - half;
         }
-        Vector3 half = new(
-            Spacing.X * (ProbesX - 1) * 0.5f,
-            Spacing.Y * (ProbesY - 1) * 0.5f,
-            Spacing.Z * (ProbesZ - 1) * 0.5f);
-        Vector3 snapped = new(
-            MathF.Round(cameraPos.X / Spacing.X) * Spacing.X,
-            MathF.Round(cameraPos.Y / Spacing.Y) * Spacing.Y,
-            MathF.Round(cameraPos.Z / Spacing.Z) * Spacing.Z);
-        Origin = snapped - half;
+        // (scene-fixed: Origin + Spacing are locked by SetSceneBounds; the grid never moves with the camera.)
 
         // STABILITY: detect a (near-)static camera. Threshold ~2cm/frame — below it the field should converge and
         // hold, not boil. A move resets the static counter, so jitter rotation resumes the instant the camera moves.
@@ -349,12 +377,11 @@ public sealed class Dx12Ddgi : IDisposable {
         if (moved < 0.02f) staticFrames++;
         else { staticFrames = 0; jitterSeed = frameCounter; }   // moving → keep advancing the seed with the frame
 
-        // CHUNK5 AUTO RE-BAKE on a LARGE camera move: once frozen, the field follows the camera (Origin snaps) but
-        // its CONTENT is stale — walk far enough that the camera leaves the volume the bake converged for and the GI
-        // is wrong. When the camera moves more than ~40% of the grid half-extent from where the bake last froze,
-        // restart the progressive bake (near-first again). Only fires after a freeze + past the move threshold, so a
-        // slow pan inside the volume never trips it (no thrash). User choice: auto on large move / light change.
-        if (BakedMode && bakeFrozen) {
+        // AUTO RE-BAKE on a large camera move is DISABLED for the scene-fixed grid: the grid covers the whole
+        // scene and never moves, so walking around never invalidates the bake (that was the camera-centered grid's
+        // problem — "gittiğim yeri siliyor"). Only the legacy camera-snap path re-bakes on a big move. A light/sun
+        // change still rebakes in both modes (NotifyLight). User choice: scene-fixed = bake once, stays everywhere.
+        if (BakedMode && bakeFrozen && !sceneFixed) {
             float halfExtent = Spacing.X * (ProbesX - 1) * 0.5f;
             if ((cameraPos - bakeFrozenCamPos).Length() > halfExtent * 0.4f) Rebake();
         }
