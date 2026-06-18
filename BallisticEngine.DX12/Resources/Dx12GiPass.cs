@@ -328,7 +328,7 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
             Params1 = new Vector4(MathF.Max(pf.SsgiBounceBoost, 0f), Math.Clamp(pf.SsgiRayCount, 1, 8), fi,
                 Math.Clamp(pf.SsgiTemporalClamp, 1f, 4f)),   // w = temporal neighbourhood-clamp inflation (live dial)
             Params2 = new Vector4(1f / ssgiTarget.Width, 1f / ssgiTarget.Height, preExp, invPreExp),
-            Combine0 = new Vector4(pf.SsgiIntensity, Math.Clamp(pf.SsgiLook, 0f, 1f),
+            Combine0 = new Vector4(pf.SsgiIntensity * GiIntensityScale(), Math.Clamp(pf.SsgiLook, 0f, 1f),
                 MathF.Max(pf.SsgiSaturation, 0f), MathF.Max(pf.SsgiOcclusionPower, 0f)),
             Tint = new Vector4(pf.SsgiTint.X, pf.SsgiTint.Y, pf.SsgiTint.Z, 0f),
             // HasHistory=0 in deterministic capture → PSTemporal returns the current GI directly (the SSGI/DDGI
@@ -1104,6 +1104,19 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
     // GI-ISOLATE debug view: the combine outputs ONLY the indirect bounce. Env door OR the volume's SsgiDebugView.
     static bool GiIsolateOn(Dx12FrameContext ctx) =>
         Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_ISOLATE") == "1" || ctx.PostFX.SsgiDebugView;
+
+    // GI intensity scale (tuning A/B): a global multiplier on the SSGI/GI combine strength. Default 1.4 — a touch
+    // richer than physical so interiors read with the soft, filled "Unreal" indirect look the user wants, without
+    // washing out. BALLISTIC_DX12_GI_INTENSITY overrides for A/B; read once.
+    static float? giIntensityScale;
+    static float GiIntensityScale() {
+        if (giIntensityScale is null) {
+            giIntensityScale =
+                float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_INTENSITY"),
+                    System.Globalization.CultureInfo.InvariantCulture, out float v) ? Math.Clamp(v, 0f, 8f) : 1.4f;
+        }
+        return giIntensityScale.Value;
+    }
 
     // DDGI world cache: volume PostFX.Ddgi, force-overridden by the BALLISTIC_DX12_DDGI env door. Door read once.
     string ddgiEnvCached;
