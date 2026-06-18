@@ -65,7 +65,9 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         public Vector2 ClusterNearFar;
         public float UseRtShadows; public float SpecClamp;   // SpecClamp: max per-light specular luma (V2 firefly cap; 0 = off)
         public float SpecAaStrength; public float UseSsao;   // V2: geometric specular AA strength (0 = off); UseSsao: GTAO into ambient
-        public float Pad5, Pad6;
+        public float GiDiffuseActive;                        // >0.5 = a GI pass (SSGI/RT-GI) supplies indirect DIFFUSE this frame → fade IBL diffuse ambient toward the floor. IBL specular/reflection stays.
+        public float GiAmbientFloor;                         // [0..1] fraction of IBL diffuse kept under active GI — the skylight floor that stops sparse/unconverged GI rendering pure black.
+        public Matrix4x4 ViewProjFwd;                        // world → clip (transposed); contact-shadow march reprojection
     }
 
     readonly Dx12Device dev;
@@ -143,6 +145,13 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         float specAaValue = 2f;
         if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_SPEC_AA"),
             System.Globalization.CultureInfo.InvariantCulture, out float sa)) specAaValue = sa;
+        // GI skylight floor: fraction of IBL diffuse kept even when GI is active, so the (often sparse/
+        // unconverged) DDGI field never leaves a surface pure black. 0.6 = mostly GI-driven with a sky safety
+        // floor; 0 reproduces the old all-or-nothing zeroing. BALLISTIC_DX12_GI_FLOOR overrides. GI off → unused
+        // (the shader takes the full-IBL branch regardless of this value).
+        float giAmbientFloorValue = 0.6f;
+        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_FLOOR"),
+            System.Globalization.CultureInfo.InvariantCulture, out float gf)) giAmbientFloorValue = Math.Clamp(gf, 0f, 1f);
         *(LightConstants*)deferredCbMapped = new LightConstants {
             InvViewProj = Matrix4x4.Transpose(invVP),
             View = Matrix4x4.Transpose(ctx.View),
@@ -161,7 +170,18 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
             // GTAO into the ambient term — on only when AO is actually rendered this frame (door + volume enable).
             // Matches Dx12GtaoPass.Enabled so the t13 bind below holds the real AO target when this is 1.
             UseSsao = ctx.Doors.Ssao && ctx.PostFX.SSAOEnabled ? 1f : 0f,
-            Pad6 = Environment.GetEnvironmentVariable("BALLISTIC_DX12_AO_DEBUG") == "1" ? 1f : 0f,  // TEMP-AO-DEBUG
+            // When a GI pass runs this frame it computes the indirect DIFFUSE bounce (incl. the sky/IBL
+            // irradiance term, in the GI hit shader). So the deferred IBL DIFFUSE ambient would DOUBLE-COUNT it
+            // and (being full-strength) bury the bounce — the "IBL too dominant, GI does nothing" symptom. Tell
+            // the shader to drop IBL diffuse when GI is active; IBL SPECULAR/reflection ambient is kept (GI here
+            // is diffuse-only). GI off → 0 → full IBL ambient (fallback, byte-identical to before).
+            GiDiffuseActive = ctx.GiMode != GiMode.Off ? 1f : 0f,
+            // Skylight floor under GI: keep this fraction of IBL diffuse so surfaces the (sparse/unconverged) GI
+            // field doesn't reach still get soft sky ambient instead of pure black. 0.6 default = mostly-GI with a
+            // safety floor; BALLISTIC_DX12_GI_FLOOR overrides. Once the DDGI field converges densely this can drop.
+            GiAmbientFloor = giAmbientFloorValue,
+            // Forward world→clip for the contact-shadow screen-space march (HLSL muls row-vector × matrix).
+            ViewProjFwd = Matrix4x4.Transpose(ctx.ViewProj),
         };
 
         // Copy the 14 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster

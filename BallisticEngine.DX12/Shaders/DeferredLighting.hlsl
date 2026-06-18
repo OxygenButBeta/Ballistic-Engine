@@ -23,7 +23,9 @@ cbuffer LightConstants : register(b0) {
     float    SpecClamp;                            // V2: max per-light specular LUMA (0 = off); caps NDF fireflies
     float    SpecAaStrength;                       // V2: geometric specular AA strength (0 = off); roughens noisy normals
     float    UseSsao;                              // >0.5 = multiply the GTAO term into the IBL ambient (ambient-only)
-    float    Pad5, Pad6;
+    float    GiDiffuseActive;                      // >0.5 = a GI pass supplies indirect DIFFUSE this frame → fade IBL diffuse ambient toward the floor (no full double-count); IBL specular kept
+    float    GiAmbientFloor;                        // [0..1] fraction of IBL diffuse KEPT even when GI is active (skylight floor — prevents pure-black where GI is sparse/unconverged; UE keeps a skylight floor under Lumen)
+    float4x4 ViewProjFwd;                          // world → clip (transposed on upload); contact-shadow march reprojection
 };
 
 // V2 specular firefly clamp (fixes D3): a normal-mapped surface lit by a sharp light produces single-pixel
@@ -123,23 +125,59 @@ float CascadeMatrixApply(int c, float3 worldPos, out float3 proj) {
     return max(abs(clip.x), abs(clip.y));
 }
 
+// One hard depth-compare tap (Filtering == 0): razor-sharp, aliased.
+float ShadowTapHard(int c, float2 uv, float z, float bias) {
+    float d = ShadowCascades.SampleLevel(LinearClamp, float3(uv, (float)c), 0).r;
+    return (z - bias) <= d ? 1.0 : 0.0;
+}
+
+// Fixed 5x5 PCF (Filtering == 1): the default soft edge. radiusTexels widens with ShadowSoftness.
+float ShadowPcf(int c, float2 base, float z, float bias, float radiusTexels) {
+    float lit = 0.0;
+    [unroll] for (int dy = -2; dy <= 2; dy++)
+    [unroll] for (int dx = -2; dx <= 2; dx++) {
+        float2 uv = base + float2(dx, dy) * ShadowMapTexel * radiusTexels;
+        lit += ShadowTapHard(c, uv, z, bias);
+    }
+    return lit / 25.0;
+}
+
+// PCSS (Filtering == 2): contact-hardening. A blocker search estimates the average occluder depth; the
+// penumbra grows with the receiver↔blocker gap × ShadowSoftness, then a variable-radius PCF fills it.
+float ShadowPcss(int c, float2 base, float z, float bias) {
+    // 1) Blocker search over a softness-scaled kernel.
+    float searchTexels = 2.0 + ShadowSoftness * 2.0;
+    float blockerSum = 0.0; float blockerCount = 0.0;
+    [unroll] for (int sy = -2; sy <= 2; sy++)
+    [unroll] for (int sx = -2; sx <= 2; sx++) {
+        float2 uv = base + float2(sx, sy) * ShadowMapTexel * searchTexels;
+        float d = ShadowCascades.SampleLevel(LinearClamp, float3(uv, (float)c), 0).r;
+        if (d < z - bias) { blockerSum += d; blockerCount += 1.0; }
+    }
+    if (blockerCount < 0.5) return 1.0;                  // fully lit — no blockers
+    float avgBlocker = blockerSum / blockerCount;
+    // 2) Penumbra ∝ (receiver - blocker) / blocker, scaled by the artist softness (1 = physical-ish sharp).
+    float penumbra = max(z - avgBlocker, 0.0) / max(avgBlocker, 1e-4);
+    float radiusTexels = clamp(penumbra * ShadowSoftness * 64.0, 0.75, 12.0);
+    // 3) Variable-radius PCF (reuse the 5x5 kernel at the computed radius).
+    return ShadowPcf(c, base, z, bias, radiusTexels);
+}
+
 float SunShadow(float3 N, float3 L, float3 worldPos) {
     if (ShadowsEnabled < 0.5) return 1.0;
     float ndl = saturate(dot(N, L));
     int count = (int)CascadeCountF;
+    int mode = (int)(ShadowFiltering + 0.5);
     for (int c = 0; c < count; c++) {
         float3 proj;
         float edge = CascadeMatrixApply(c, worldPos, proj);
         if (edge > 1.0 || proj.z > 1.0 || proj.z < 0.0) continue;
         float bias = max(CascadeBias[c] * (1.0 - ndl), CascadeBias[c] * 0.1);
-        float lit = 0.0;
-        [unroll] for (int dy = -1; dy <= 1; dy++)
-        [unroll] for (int dx = -1; dx <= 1; dx++) {
-            float2 uv = proj.xy + float2(dx, dy) * ShadowMapTexel;
-            float d = ShadowCascades.SampleLevel(LinearClamp, float3(uv, (float)c), 0).r;
-            lit += (proj.z - bias) <= d ? 1.0 : 0.0;
-        }
-        return lit / 9.0;
+        if (mode == 0) return ShadowTapHard(c, proj.xy, proj.z, bias);
+        if (mode == 2) return ShadowPcss(c, proj.xy, proj.z, bias);
+        // mode 1 (default soft PCF): radius scales gently with softness, matching the old GL path.
+        float radiusTexels = clamp(ShadowSoftness * 0.75, 0.5, 4.0);
+        return ShadowPcf(c, proj.xy, proj.z, bias, radiusTexels);
     }
     return 1.0;
 }
@@ -149,6 +187,38 @@ float3 WorldPosFromDepth(float2 uv, float depth) {
     float4 ndc = float4(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, depth, 1.0);
     float4 w = mul(ndc, InvViewProj);
     return w.xyz / w.w;
+}
+
+// Screen-space contact shadows (Shadows volume): a short ray-march toward the sun in screen space that
+// grounds small props + fine geometry the cascades miss. It only DARKENS (never lifts) — a multiplier on the
+// cascade/RT shadow. Marches ContactShadowLength world-metres in ContactShadowSteps samples; a hit is when
+// the scene depth at a sample sits in front of the ray by more than the threshold but within ContactShadow
+// Thickness (a thin-occluder window, so a far background doesn't spuriously occlude). Returns 1 = unshadowed.
+float ContactShadow(float3 worldPos, float3 L) {
+    if (ContactShadowsOn < 0.5 || ContactShadowLength <= 0.0) return 1.0;
+    int steps = max((int)(ContactShadowSteps + 0.5), 1);
+    float stepLen = ContactShadowLength / (float)steps;
+    float3 p = worldPos;
+    [loop] for (int i = 1; i <= steps; i++) {
+        p += L * stepLen;
+        // Reproject the marched world point to this frame's screen UV + clip depth.
+        float4 clip = mul(float4(p, 1.0), ViewProjFwd);
+        if (clip.w <= 0.0) continue;
+        float3 ndc = clip.xyz / clip.w;
+        float2 uv = ndc.xy * float2(0.5, -0.5) + 0.5;
+        if (any(uv < 0.0) || any(uv > 1.0)) continue;          // marched off-screen — no info
+        float sceneDepth = DepthTex.SampleLevel(LinearClamp, uv, 0).r;
+        // Both depths are DX clip-z [0,1]; reconstruct each sample's VIEW-space z so the thickness window is
+        // in metres, not nonlinear depth. We only need the delta, so compare reconstructed view positions.
+        float3 rayWorld = WorldPosFromDepth(uv, ndc.z);
+        float3 sceneWorld = WorldPosFromDepth(uv, sceneDepth);
+        float rayVz   = -mul(float4(rayWorld, 1.0), View).z;   // positive view distance
+        float sceneVz = -mul(float4(sceneWorld, 1.0), View).z;
+        float diff = rayVz - sceneVz;                          // >0 = scene surface is in front of the ray
+        if (diff > 0.01 && diff < ContactShadowThickness)
+            return 0.0;                                        // occluded by a thin foreground surface
+    }
+    return 1.0;
 }
 
 // Inverse-square distance attenuation with a smooth range cutoff (windowing). range = light.w.
@@ -259,6 +329,8 @@ float4 PSMain(VSOut i) : SV_Target {
     if (NdotL > 0.0) {
         float shadow = (UseRtShadows > 0.5) ? RtShadowMask.SampleLevel(LinearClamp, i.Uv, 0).r
                                             : SunShadow(N, D, worldPos);
+        // Contact shadows refine the cascade path (RT shadows already capture contact). Only darkens.
+        if (UseRtShadows <= 0.5) shadow *= ContactShadow(worldPos, D);
         float3 radiance = LightColor * shadow;
         float3 H = normalize(V + D);
         float NDF = DistributionGGX(N, H, roughness);
@@ -290,6 +362,13 @@ float4 PSMain(VSOut i) : SV_Target {
         float3 kD = (1.0 - Famb) * (1.0 - metallic);
         float3 irradiance = IrradianceMap.SampleLevel(LinearClamp, N, 0).rgb;
         float3 ambientDiffuse = kD * irradiance * albedo * ao;
+        // When a GI pass is active it adds the indirect DIFFUSE bounce later (its hit shader already folds in the
+        // sky/IBL irradiance term). Adding the FULL IBL diffuse here too would DOUBLE-COUNT and drown the bounce
+        // — the "IBL too dominant, GI invisible" symptom. But fully ZEROING it makes every pixel the (sparse,
+        // possibly-unconverged) GI field fails to reach render pure BLACK (the DDGI grid is often <1% populated).
+        // So keep a SKYLIGHT FLOOR fraction of IBL diffuse even under GI — exactly like UE keeps a skylight under
+        // Lumen — so unlit/un-GI'd surfaces get soft sky ambient instead of black, and GI adds richness on top.
+        if (GiDiffuseActive > 0.5) ambientDiffuse *= GiAmbientFloor;
         float3 R = reflect(-V, N);
         float mip = clamp(roughness * PrefilterMaxMip, 0.0, PrefilterMaxMip);
         float3 prefiltered = PrefilterMap.SampleLevel(LinearClamp, R, mip).rgb;
@@ -302,7 +381,5 @@ float4 PSMain(VSOut i) : SV_Target {
     }
 
     float3 litHdr = diffuse + specular + punctual + ambient + emissive;
-    // TEMP-AO-DEBUG: visualise the raw GTAO term (remove before commit). Pad6 carries the debug flag.
-    if (Pad6 > 0.5) { float a = SsaoTex.SampleLevel(LinearClamp, i.Uv, 0).r; return float4(a, a, a, 1.0); }
     return float4(litHdr, 1.0);
 }

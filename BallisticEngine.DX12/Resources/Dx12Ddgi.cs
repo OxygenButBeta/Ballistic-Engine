@@ -410,7 +410,9 @@ public sealed class Dx12Ddgi : IDisposable {
         // value instead of boiling. Combined with a higher static hysteresis (set by the caller), the field
         // visibly STOPS changing a fraction of a second after the camera stops — the Lumen "converge then hold".
         bool staticNow = IsStatic;
-        bool full = fullUpdate || n <= 1 || staticNow;
+        // CLEAN warm-up converge: force a full, non-baked update — every probe eligible every iteration.
+        bool cleanWarmup = warmupCleanConverge;
+        bool full = fullUpdate || cleanWarmup || n <= 1 || staticNow;
         int phase = full ? 0 : ((frameIndex % n) + n) % n;
         int jit = staticNow ? jitterSeed : frameIndex;   // frozen seed while static → no ray-rotation churn
         return new() {
@@ -428,7 +430,13 @@ public sealed class Dx12Ddgi : IDisposable {
             Params3 = new Vector4(bakeCamPos, BandWidth),
             // Params4.w = ActiveRays (CHUNK2 dynamic ray count: 144 live / 256 baked). The trace/blend read it
             // instead of the old hard-coded 144 so fidelity scales with mode without resizing RayData.
-            Params4 = new Vector4(BakedMode ? 1f : 0f, bakeWave, ConvergeTarget, ActiveRays),
+            // CONVERGENCE FIX (2026-06-18): during the clean warm-up, DISABLE the bake gate entirely (bakeEnable=0)
+            // so ProbeActiveThisFrame falls through to the round-robin branch, which — with full=1 → Params2.z=1 —
+            // returns TRUE for every probe. The band-ripple + per-probe freeze counter is for the amortized LIVE
+            // bake; in a one-shot offline warm-up it starved the field to band-0 only (the 99.4%-empty root cause).
+            // Otherwise (live/baked) keep the band frontier; a normal full update still opens all bands (MaxBand).
+            Params4 = new Vector4(cleanWarmup ? 0f : (BakedMode ? 1f : 0f),
+                                  full ? MaxBand : bakeWave, ConvergeTarget, ActiveRays),
         };
     }
 
@@ -466,9 +474,17 @@ public sealed class Dx12Ddgi : IDisposable {
         warmedUp = true;
         int iters = WarmupIterations;
         if (iters <= 0) return false;
+        // CLEAN converge: disable the bake band/freeze gate for the whole warm-up so EVERY probe traces+blends on
+        // EVERY iteration (the band-ripple + per-probe freeze counter is for the amortized LIVE bake; in a one-shot
+        // offline warm-up it just starves the field — the 99.4%-empty root cause). The EMA + multi-bounce feedback
+        // then converge the FULL grid over `iters`. Restored after.
+        bool savedWarmupClean = warmupCleanConverge;
+        warmupCleanConverge = true;
         for (int i = 0; i < iters; i++) runOneFullUpdate();
+        warmupCleanConverge = savedWarmupClean;
         return true;
     }
+    bool warmupCleanConverge;   // while true, Constants() emits a NON-baked full-update (no band gate, no freeze)
 
     // Build the trace + blend compute PSOs and the RayData buffer (once). The atlas UAVs are registered into
     // blendHeap here too (persistent atlases → persistent descriptors). Idempotent.

@@ -343,5 +343,10 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
         radiance = Irradiance.SampleLevel(LinearClamp, dir, 0).rgb;   // sky
         dist = Params1.x;                                              // far (open)
     }
+    // Radiance is physically >= 0 and finite. The sky-cube path is NOT routed through ShadeHit's clamp, so a bad
+    // cubemap texel (the observed atlas min=-20.9) would store a NEGATIVE that poisons the multi-bounce feedback
+    // and the gather. Sanitize + clamp BOTH paths at the single write site so nothing negative/NaN ever enters
+    // the field (ternary scrub, not *0 — the AMD NaN*0 black-hole class).
+    radiance = max(Sanitize(radiance), 0.0.xxx);
     RayData[id] = float4(radiance, dist);
 }

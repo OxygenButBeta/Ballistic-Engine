@@ -134,6 +134,7 @@ public sealed class DX12HDRenderer : HDRenderer
     bool noRtWarned; // P7.0: log the no-RT downgrade once, not every frame
 
     // P7.0: one-time log when RayTraced GI/reflections/shadows are auto-downgraded for lack of HW ray tracing.
+    bool giModeLogged;
     void WarnNoRtOnce()
     {
         if (noRtWarned) return;
@@ -1688,34 +1689,40 @@ public sealed class DX12HDRenderer : HDRenderer
         // reflections bridge forcing Off); reflections are reopened later per the R2 quality preset, not here.
         string ssgiEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SSGI");
         string rtgiEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RT_GI");
-        GiMode giMode = rtgiEnv == "1" ? GiMode.RayTraced
-                      : ssgiEnv == "1" ? GiMode.ScreenSpace
-                      : ssgiEnv == "0" ? GiMode.Off
-                      : doors.Minimal ? GiMode.Off
-                      : PostFX.GiMode;
-        // ===== MASTER GI KILL SWITCH (2026-06-18, user: "baştan kapat şunu, volume override'ını da disable et,
-        // devre dışı bırak — RT GI hala aktif ve çalışıyor"). The RT-GI/DXR bake path crashed the PC and the user
-        // wants it HARD OFF — not via a default that an env door or a volume can re-enable. Unless EXPLICITLY
-        // opted-in with BALLISTIC_DX12_GI_FORCE=1 (a deliberate, supervised override), GI is forced Off here AFTER
-        // every other resolve, so NOTHING — not PostFX.GiMode, not a GlobalIllumination volume, not
-        // BALLISTIC_DX12_RT_GI=1 — can turn the DXR GI on. This is the off-switch the user asked for. =====
-        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_FORCE") != "1")
+        // ===== GI QUALITY OVERHAUL (2026-06-18, user /loop "MAKE IT BETTER / Unreal quality"): the prior default
+        // was the baked-freeze DDGI on the RayTraced path, whose probe field never converges in practice (proven:
+        // 99.4% empty atlas, DispatchDdgi runs but the blend doesn't fill it) → a dead, flat, near-black image. The
+        // working, good-looking GI is **screen-space SSGI** (SSILVB horizon-bitmask one-bounce → temporal → OIDN):
+        // it converges instantly, fills shadows with warm bounce, and looks far closer to UE. So SSGI is now THE
+        // DEFAULT GI. RayTraced (per-pixel DXR trace, for true off-screen bounce) stays available via the volume
+        // GiMode dropdown / BALLISTIC_DX12_RT_GI=1. Env doors still win for the A/B harness. =====
+        GiMode giMode =
+              rtgiEnv == "1" ? GiMode.RayTraced
+            : ssgiEnv == "1" ? GiMode.ScreenSpace
+            : ssgiEnv == "0" ? GiMode.Off
+            : doors.Minimal ? GiMode.Off
+            // Volume override: a scene's GlobalIllumination volume can pick the mode explicitly. PostFX.GiMode
+            // defaults to Off (the crash-era default), so treat Off-from-default as "use the new SSGI default";
+            // a volume that explicitly sets RayTraced/ScreenSpace is honoured.
+            : PostFX.GiMode != GiMode.Off ? PostFX.GiMode
+            : GiMode.ScreenSpace;
+        // GI TECHNIQUE OVERRIDE (2026-06-18): scenes ship a BakedGlobalIllumination volume that maps to
+        // GiMode.RayTraced, but the baked-DDGI probe field is the broken/dead path. Until a scene OPTS IN to true
+        // ray-traced GI (BALLISTIC_DX12_RT_GI=1), rewrite RayTraced → ScreenSpace so every GI-on scene uses the
+        // good-looking SSGI by default. RT-GI stays one env-door away for the off-screen-coverage case.
+        if (giMode == GiMode.RayTraced && rtgiEnv != "1")
+            giMode = GiMode.ScreenSpace;
+        // MASTER GI KILL SWITCH: BALLISTIC_DX12_GI_FORCE=0 forces GI Off (emergency off if a path ever hangs).
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_FORCE") == "0")
             giMode = GiMode.Off;
-        // REALTIME GI REMOVED (2026-06-18, user: "varolan realtime gi'i kapatalım sadece bu konuştuğumuz [baked]
-        // sistem olsun; her frame update vs o sistemi komple kaldır"). The ONLY GI now is the baked-freeze DDGI on
-        // the RayTraced path (computed once, frozen, 0 rays/frame). Realtime ScreenSpace SSGI is no longer a GI
-        // mode — it collapses to Off. The omurga (DXR trace+blend) stays, used solely to BAKE. The BALLISTIC_DX12_
-        // SSGI=1 env door can still force the legacy realtime SSGI for an A/B comparison, but it is never the
-        // default. (RayTraced here means "baked DDGI" — PostFX.DdgiBaked is default true; the GI pass freezes it.)
-        if (giMode == GiMode.ScreenSpace && ssgiEnv != "1") giMode = GiMode.Off;
-        // NO-RT (no hardware ray tracing): the baked path can't trace, so GI is OFF (no fallback to realtime SSGI —
-        // that's the system we removed). The audience floor is RT-capable per the standing directive; a non-RT GPU
-        // simply gets IBL ambient. (Forcing a DXR path on a non-DXR device is the device-removal hazard.)
+        // NO-RT (no hardware ray tracing): SSGI is pure screen-space (no DXR), so it runs fine without RT — keep
+        // it. Only the RayTraced (DXR per-pixel / DDGI) mode needs hardware RT, so downgrade THAT to SSGI on a
+        // non-RT GPU instead of killing GI outright (the old code turned GI fully Off — that's why non-RT was flat).
         if (!dev.HasHardwareRayTracing)
         {
-            if (giMode != GiMode.Off) giMode = GiMode.Off;
-            WarnNoRtOnce();
+            if (giMode == GiMode.RayTraced) { giMode = GiMode.ScreenSpace; WarnNoRtOnce(); }
         }
+        if (!giModeLogged) { giModeLogged = true; Console.WriteLine($"[GI] mode={giMode} (PostFX={PostFX.GiMode}, hasRT={dev.HasHardwareRayTracing})"); }
 
         // === PHASE-1 PASS-GRAPH CONTEXT (chunks 4–9). Built ONCE here — after RT shadows + the giMode resolve,
         // and now ALSO BEFORE the deferred pass (chunk 9 moved the ctx build UP above deferred so the deferred
