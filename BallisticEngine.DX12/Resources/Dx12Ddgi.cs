@@ -84,6 +84,11 @@ public sealed class Dx12Ddgi : IDisposable {
         public Vector4 Params0;          // x=irrTexels y=depthTexels z=hysteresis w=frameIndex
         public Vector4 Params1;          // x=maxRayDist y=normalBias z=feedbackEnable w=intensity
         public Vector4 Params2;          // P2.5 round-robin: x=updateFraction(N) y=phase(0..N-1) z=fullUpdate(1/0) w=emissiveEnable
+        // CHUNK 1 GPU progressive bake. The probe-SELECTION decision lives entirely on the GPU (per-probe
+        // camera-distance band + a converged-frame counter in ProbeBakeState) — the CPU only advances bakeWave by
+        // frame, so there is NO per-probe CPU work / readback to pick probes (user: "işin ne kadarı gpu da olursa").
+        public Vector4 Params3;          // xyz = camera world pos, w = band width (metres per distance band)
+        public Vector4 Params4;          // x=bakeEnable(1/0) y=bakeWave(max open band this frame) z=convergeTarget w=pad
     }
 
     // --- P2.1 probe-update plumbing ---
@@ -161,7 +166,12 @@ public sealed class Dx12Ddgi : IDisposable {
     // Force a fresh converge: clears the warmed-up latch so the NEXT DispatchDdgi re-runs the full-grid warm-up
     // (TryWarmUp). Call on scene open, a light/sun change, or the editor "Rebake GI" button. Cheap to call — the
     // actual cost is the one-shot converge on the next frame, not here.
-    public void Rebake() { warmedUp = false; }
+    public void Rebake() {
+        warmedUp = false;
+        bakeFrozen = false; bakeWave = 0; bakeWaveFrames = 0; bakeFrameCounter = 0;
+        bakeProbeStateCleared = false;   // ch1: re-clear the GPU converged-counters on the next dispatch
+    }
+    bool bakeProbeStateCleared;          // the GPU ProbeBakeState counters have been zeroed for this bake run
 
     // Emissive-as-GI-source: when set, the trace's ShadeHit adds the hit surface's self-emission L_e so
     // emissive surfaces act as area lights in the probe field (rides Params2.w → DdgiTrace emissiveEnable).
@@ -172,6 +182,11 @@ public sealed class Dx12Ddgi : IDisposable {
     // RayData[probe*RaysPerProbe + ray] = (radiance.rgb, hitDistance), written by the trace pass, read by the
     // blend pass. ProbeCount*144*16B = ~4.7 MB — sized once for the static grid; persistent UAV.
     ID3D12Resource rayData;
+
+    // CHUNK1 GPU progressive bake: per-probe converged-frame counter (uint). Trace bumps it (u1); blend/classify
+    // read it (t1) to mirror the eligibility test. ProbeCount*4B = ~8KB. Persistent; zeroed on each (re)bake.
+    ID3D12Resource probeBakeState;
+    ID3D12Resource bakeZeroUpload;   // persistent zero upload, copied over probeBakeState on Rebake
 
     // Trace pass (DdgiTrace.hlsl): inline RayQuery in a COMPUTE PSO (not an RT PSO — RayQuery needs no SBT).
     // Root sig mirrors DxrGi exactly so the bindless hit-shading is byte-identical: CBV b0/b1, a table for
@@ -222,6 +237,36 @@ public sealed class Dx12Ddgi : IDisposable {
     int jitterSeed;          // the seed actually fed to the ray jitter — frozen while static
     public bool IsStatic => staticFrames >= 8;
 
+    // --- CHUNK 1 GPU progressive bake state (CPU side is just scalars; the per-probe decision is on the GPU). ---
+    Vector3 bakeCamPos;          // camera pos captured in Update(), fed to the GPU band test via Params3
+    int bakeWave;                // highest distance band opened so far — advances one band every few frames
+    int bakeWaveFrames;          // frames spent on the current wave (paces how fast bands open)
+    bool bakeFrozen;             // all probes converged → CPU stops dispatching trace/blend (the freeze)
+    int bakeFrameCounter;        // frames since the bake (re)started — used by the CPU-only completion fallback
+    // ConvergeTarget = how many times a probe must trace before it freezes. Deep (the field is one-shot in baked
+    // mode, so we over-converge for quality). Env BALLISTIC_DX12_DDGI_CONVERGE overrides (ch2 raises it).
+    int? convergeTargetEnv;
+    public int ConvergeTarget {
+        get {
+            if (convergeTargetEnv == null)
+                convergeTargetEnv = int.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_CONVERGE"),
+                    out int n) && n >= 1 ? n : 48;
+            return convergeTargetEnv.Value;
+        }
+    }
+    // Distance band width (metres). A new band opens every BandFrames frames, so the bake ripples outward from the
+    // camera. Total bands ≈ grid half-extent / bandWidth → the whole grid is opened in (bands * BandFrames) frames.
+    float BandWidth => MathF.Max(Spacing.X * 1.5f, 1.0f);
+    const int BandFrames = 2;    // frames before opening the next outward band (paces the ripple — not too eager)
+    // Max band = furthest probe corner / band width (so the wave eventually covers every probe).
+    int MaxBand => (int)MathF.Ceiling(new Vector3(Spacing.X * ProbesX, Spacing.Y * ProbesY, Spacing.Z * ProbesZ).Length() * 0.5f / BandWidth) + 1;
+    public bool IsBakeComplete => bakeFrozen;
+    // CPU-only completion estimate (no GPU readback needed for correctness): the bake is done once every band has
+    // been open long enough for its probes to hit ConvergeTarget. Conservative upper bound = all bands opened
+    // (MaxBand*BandFrames) + the convergence tail (ConvergeTarget frames for the last-opened band). A throttled GPU
+    // readback (ch1 success log / editor progress) can confirm earlier, but this guarantees the freeze happens.
+    int BakeCompleteFrameEstimate => MaxBand * BandFrames + ConvergeTarget + 4;
+
     public Dx12Ddgi(Dx12Device device) { dev = device; }
 
     public void EnsureAllocated() {
@@ -258,6 +303,16 @@ public sealed class Dx12Ddgi : IDisposable {
         lastCamPos = cameraPos; haveLastCam = true;
         if (moved < 0.02f) staticFrames++;
         else { staticFrames = 0; jitterSeed = frameCounter; }   // moving → keep advancing the seed with the frame
+
+        // CHUNK 1 progressive bake wave: capture the camera for the GPU band test, and ripple the open-band
+        // frontier outward (one band every BandFrames frames) until the whole grid is reachable. When the bake
+        // has run long enough for the furthest band to converge, latch bakeFrozen → the renderer stops tracing.
+        if (BakedMode && !bakeFrozen) {
+            bakeCamPos = cameraPos;
+            bakeFrameCounter++;
+            if (++bakeWaveFrames >= BandFrames) { bakeWaveFrames = 0; if (bakeWave < MaxBand) bakeWave++; }
+            if (bakeFrameCounter >= BakeCompleteFrameEstimate) bakeFrozen = true;
+        }
     }
 
     // Params1 = (maxRayDist, normalBias, feedbackEnable, intensity). feedbackEnable>0.5 → the trace reads
@@ -283,6 +338,12 @@ public sealed class Dx12Ddgi : IDisposable {
             Params1 = new Vector4(40f, 0.25f, feedback ? 1f : 0f, intensity),
             // Params2.w = emissiveEnable (was pad) — the trace adds emissive self-emission at hits when >0.5.
             Params2 = new Vector4(full ? 1 : n, phase, full ? 1f : 0f, EmissiveEnabled ? 1f : 0f),
+            // CHUNK 1 progressive bake: camera pos + band width feed the GPU's per-probe distance-band test; the
+            // bake params (enable, open-band frontier, converge target) tell the trace/blend/classify which probes
+            // are eligible THIS frame. bakeEnable is 0 in the live path → the band test is bypassed (Params2 round-
+            // robin governs), so the non-baked render is byte-identical.
+            Params3 = new Vector4(bakeCamPos, BandWidth),
+            Params4 = new Vector4(BakedMode ? 1f : 0f, bakeWave, ConvergeTarget, 0f),
         };
     }
 
@@ -335,6 +396,16 @@ public sealed class Dx12Ddgi : IDisposable {
         var zero = new Vector4[ProbeCount * RaysPerProbe];
         rayData = dev.CreateUavBuffer<Vector4>(zero, ResourceStates.UnorderedAccess);
 
+        // CHUNK1 ProbeBakeState: per-probe converged-frame counter (uint), zero-seeded. Trace bumps (u1), blend
+        // reads (t1). Re-zeroed on Rebake via a CopyBufferRegion from the persistent zero upload below.
+        var bakeZero = new uint[ProbeCount];
+        probeBakeState = dev.CreateUavBuffer<uint>(bakeZero, ResourceStates.UnorderedAccess);
+        // Persistent zero-filled upload buffer (~8KB) so Rebake() can reset the counters with one copy (no per-
+        // rebake allocation). Upload heap, mapped once + zeroed.
+        bakeZeroUpload = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)ProbeCount * sizeof(uint)), ResourceStates.GenericRead);
+        unsafe { byte* zp = bakeZeroUpload.Map<byte>(0); for (int i = 0; i < ProbeCount * sizeof(uint); i++) zp[i] = 0; bakeZeroUpload.Unmap(0); }
+
         // --- TRACE root sig (mirrors DxrGi). The TLAS + irr cube + prev-irradiance-atlas are NON-CONTIGUOUS
         // registers (t0,t3,t4) so the table holds THREE ranges, written to ADJACENT bindless-tail slots so one
         // GPU base handle covers all (range 0→slot+0=t0 TLAS, 1→slot+1=t3 cube, 2→slot+2=t4 prev irr atlas).
@@ -355,6 +426,7 @@ public sealed class Dx12Ddgi : IDisposable {
         var t_light = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All);
         var t_probe = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(8, 0), ShaderVisibility.All);  // t8 ProbeState (P2.4)
         var t_uav = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(0, 0), ShaderVisibility.All);  // u0 RayData
+        var t_bake = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(1, 0), ShaderVisibility.All);  // u1 ProbeBakeState (CHUNK1)
         var clampSamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
             AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
@@ -368,7 +440,7 @@ public sealed class Dx12Ddgi : IDisposable {
         traceRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { t_cbv0, t_cbv1, t_table, t_mat, t_inst, t_light, t_probe, t_uav },
+                new[] { t_cbv0, t_cbv1, t_table, t_mat, t_inst, t_light, t_probe, t_uav, t_bake },
                 new[] { clampSamp, wrapSamp })));
 
         string traceHlsl = EmbeddedShaderSource.ReadHlsl("DdgiTrace.hlsl");
@@ -382,10 +454,11 @@ public sealed class Dx12Ddgi : IDisposable {
         // (CSIrradiance u0, CSDepth u1, CSClassify u2; CSBorder* read+write u0/u1). ---
         var b_cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
         var b_srv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.All);  // t0 RayData
+        var b_bake = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(1, 0), ShaderVisibility.All); // t1 ProbeBakeState (CHUNK1)
         var b_uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 3, baseShaderRegister: 0);  // u0 irr + u1 depth + u2 ProbeState
         var b_table = new RootParameter1(new RootDescriptorTable1(b_uavRange), ShaderVisibility.All);
         blendRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { b_cbv, b_srv, b_table })));
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { b_cbv, b_srv, b_bake, b_table })));
 
         string blendHlsl = EmbeddedShaderSource.ReadHlsl("DdgiBlend.hlsl");
         byte[] irrCs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, blendHlsl, "CSIrradiance", "DdgiBlend.hlsl");
@@ -475,6 +548,15 @@ public sealed class Dx12Ddgi : IDisposable {
         *(DdgiConstants*)constCbMapped = Constants(frameCounter, hysteresis, intensity, fb, fullUpdate);
         frameCounter++;
 
+        // CHUNK1: zero the per-probe converged counters at the START of a (re)bake run, so the wave restarts from
+        // band 0 with every probe un-converged. One small CopyBufferRegion from the persistent zero upload.
+        if (BakedMode && !bakeProbeStateCleared) {
+            bakeProbeStateCleared = true;
+            cl.ResourceBarrierTransition(probeBakeState, ResourceStates.UnorderedAccess, ResourceStates.CopyDest);
+            cl.CopyBufferRegion(probeBakeState, 0, bakeZeroUpload, 0, (ulong)ProbeCount * sizeof(uint));
+            cl.ResourceBarrierTransition(probeBakeState, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+        }
+
         // P2.3 multi-bounce: the trace reads the irradiance atlas (t4) → SRV state for the trace dispatch.
         // The leak gate also reads the DEPTH-moments atlas (t11) → same SRV transition (both feed the field read).
         if (fb)
@@ -497,6 +579,7 @@ public sealed class Dx12Ddgi : IDisposable {
         cl.SetComputeRootShaderResourceView(5, lightsAddr);             // t7 Lights
         cl.SetComputeRootShaderResourceView(6, probeState.GPUVirtualAddress);  // t8 ProbeState (P2.4)
         cl.SetComputeRootUnorderedAccessView(7, rayData.GPUVirtualAddress);  // u0 RayData
+        cl.SetComputeRootUnorderedAccessView(8, probeBakeState.GPUVirtualAddress);  // u1 ProbeBakeState (CHUNK1)
         int totalThreads = ProbeCount * RaysPerProbe;
         cl.Dispatch((uint)((totalThreads + 63) / 64), 1, 1);
 
@@ -511,19 +594,23 @@ public sealed class Dx12Ddgi : IDisposable {
 
         // RayData write → read barrier before blend.
         cl.ResourceBarrierUnorderedAccessView(rayData);
+        // CHUNK1: the trace bumped ProbeBakeState (u1); the blend reads it (t1) → UAV write must complete first.
+        cl.ResourceBarrierUnorderedAccessView(probeBakeState);
 
         // --- BLEND: switch heaps to blendHeap (its own shader-visible heap). RayData must be readable as a
         // root SRV (t0): it was created in UnorderedAccess — a root SRV reads it fine in any GenericRead-
         // compatible state, but to be correct transition it to NonPixelShaderResource for the read, then back.
         cl.ResourceBarrierTransition(rayData, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+        cl.ResourceBarrierTransition(probeBakeState, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
         cl.SetDescriptorHeaps(blendHeap.Heap);
         cl.SetComputeRootSignature(blendRootSig);
         cl.SetComputeRootConstantBufferView(0, constCb.GPUVirtualAddress);   // b0
         cl.SetComputeRootShaderResourceView(1, rayData.GPUVirtualAddress);   // t0 RayData
+        cl.SetComputeRootShaderResourceView(2, probeBakeState.GPUVirtualAddress);  // t1 ProbeBakeState (CHUNK1)
 
-        // Both passes bind the SAME 2-descriptor table base (slot 0): u0→irr, u1→depth. Each shader writes
-        // only its own register.
-        cl.SetComputeRootDescriptorTable(2, blendHeap.Gpu(0));
+        // The 3-UAV table base (slot 0): u0→irr, u1→depth, u2→ProbeState. Each shader writes only its own
+        // register. (Param index 3 now — t1 ProbeBake was inserted as param 2.)
+        cl.SetComputeRootDescriptorTable(3, blendHeap.Gpu(0));
 
         cl.SetPipelineState(blendIrrPso);
         cl.Dispatch((uint)((IrradianceAtlasW + 7) / 8), (uint)((IrradianceAtlasH + 7) / 8), 1);
@@ -555,6 +642,7 @@ public sealed class Dx12Ddgi : IDisposable {
         // Restore the bindless heap for whatever the caller does next (it bound bindless before us).
         cl.SetDescriptorHeaps(bindless.Heap);
         cl.ResourceBarrierTransition(rayData, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+        cl.ResourceBarrierTransition(probeBakeState, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
     }
 
     // P2.2 GATHER (own ExecuteSync, called by DrawRtGi when DDGI is on). Reads the G-buffer (depth/normal/
@@ -714,6 +802,8 @@ public sealed class Dx12Ddgi : IDisposable {
         irradianceTex?.Dispose(); irradianceTex = null;
         depthTex?.Dispose(); depthTex = null;
         rayData?.Dispose(); rayData = null;
+        probeBakeState?.Dispose(); probeBakeState = null;
+        if (bakeZeroUpload != null) { bakeZeroUpload.Dispose(); bakeZeroUpload = null; }
         tracePso?.Dispose(); tracePso = null;
         traceRootSig?.Dispose(); traceRootSig = null;
         blendIrrPso?.Dispose(); blendIrrPso = null;

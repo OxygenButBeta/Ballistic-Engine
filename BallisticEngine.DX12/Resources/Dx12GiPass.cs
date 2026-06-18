@@ -660,11 +660,17 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
             // replaying the update many times FULL-grid, so a paused screenshot is the STEADY STATE. No-op in play. ---
             ddgi.TryWarmUp(() => RunDdgiUpdate(full: true));
 
-            // FREEZE on the PAUSED capture path: once warmed up, skip the per-frame round-robin update.
-            if (!ddgi.WarmupEnabled)
+            // FREEZE conditions: (1) the PAUSED capture path (warm-up converged it once); (2) CHUNK1 BAKED mode
+            // once the progressive bake has converged the whole grid (IsBakeComplete). In both cases the per-frame
+            // trace/blend is skipped → 0 rays/frame, only the gather samples the frozen field (the "performanssız +
+            // ghosting" fix: no temporal feedback once frozen). While the bake is still rippling outward, we DO run
+            // the per-frame update (full:false → the GPU band test picks the eligible wave), so the scene is
+            // playable immediately and the far field fills in over frames.
+            bool frozen = ddgi.WarmupEnabled || (ddgi.BakedMode && ddgi.IsBakeComplete);
+            if (!frozen)
             {
                 var ddgiSw = GiTimingEnabled ? System.Diagnostics.Stopwatch.StartNew() : null;
-                RunDdgiUpdate(full: false); // the per-frame round-robin update (1/N probes)
+                RunDdgiUpdate(full: false); // live round-robin OR (baked) the GPU distance-band progressive wave
                 if (ddgiSw != null)
                 {
                     ddgiSw.Stop();

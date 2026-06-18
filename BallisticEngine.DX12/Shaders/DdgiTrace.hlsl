@@ -25,12 +25,36 @@ cbuffer DdgiConstants : register(b0) {
     float4 Params0;          // x irrTexels, y depthTexels, z hysteresis, w frameIndex
     float4 Params1;          // x maxRayDist, y normalBias, z feedbackEnable w intensity
     float4 Params2;          // P2.5 round-robin: x updateFraction(N), y phase, z fullUpdate(1/0), w pad
+    float4 Params3;          // CHUNK1 bake: xyz camera world pos, w band width (m)
+    float4 Params4;          // CHUNK1 bake: x bakeEnable, y bakeWave (open band), z convergeTarget, w pad
 };
 
-// P2.5 ROUND-ROBIN: a probe is updated this frame only if its phase matches (probe % N == phase), unless the
-// dispatch is a full update (warm-up / N==1). Inactive probes early-out before tracing → the cost cut. The
-// blend + classify passes apply the SAME test so stale RayData is never re-integrated into the EMA field.
+// CHUNK 1 GPU progressive bake: per-probe converged-frame counter. Trace increments it (once per probe, the
+// ray-0 thread); a probe whose counter >= convergeTarget is FROZEN (skipped). Blend/classify read the same
+// counter so they don't re-integrate a frozen probe. This is the whole bake QUEUE living on the GPU.
+RWStructuredBuffer<uint> ProbeBakeState : register(u1);
+
+// Distance band of a probe from the bake camera (0 = nearest). Used to ripple the bake outward from the camera.
+uint ProbeBakeBand(float3 probePos) {
+    float d = length(probePos - Params3.xyz);
+    return (uint)floor(d / max(Params3.w, 0.5));
+}
+
+// P2.5 ROUND-ROBIN (live path) OR CHUNK1 PROGRESSIVE BAKE (bakeEnable>0.5): in bake mode a probe is eligible
+// this frame iff its distance band has been opened (band <= bakeWave) AND it hasn't converged yet
+// (counter < convergeTarget). So the bake ripples out from the camera and each probe stops once converged →
+// the field freezes. Outside bake mode the original round-robin governs (byte-identical). Same test mirrored in
+// DdgiBlend (CSIrradiance/CSDepth) + classify so a skipped probe's atlas tile is never touched.
 bool ProbeActiveThisFrame(uint probe) {
+    if (Params4.x > 0.5) {                                 // CHUNK1 progressive bake
+        if (ProbeBakeState[probe] >= (uint)Params4.z) return false;   // already converged → frozen
+        // band test uses the BASE probe pos (relocation offset is small; band granularity is coarse)
+        uint px = probe % (uint)ProbeDims.x;
+        uint py = (probe / (uint)ProbeDims.x) % (uint)ProbeDims.y;
+        uint pz = probe / ((uint)ProbeDims.x * (uint)ProbeDims.y);
+        float3 basePos = OriginSpacingX.xyz + float3(px * OriginSpacingX.w, py * SpacingYZ.x, pz * SpacingYZ.y);
+        return ProbeBakeBand(basePos) <= (uint)Params4.y;
+    }
     if (Params2.z > 0.5) return true;                     // fullUpdate
     uint n = max((uint)Params2.x, 1u);
     return (probe % n) == (uint)Params2.y;
@@ -283,9 +307,14 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
     uint probe = id / rays;
     uint ray = id % rays;
 
-    // P2.5 round-robin: skip probes not in this frame's phase (they keep last frame's RayData, which the blend
-    // also skips — so the atlas tile is untouched). The expensive RayQuery below never runs for them.
+    // P2.5 round-robin / CHUNK1 bake: skip probes not eligible this frame (they keep last frame's RayData, which
+    // the blend also skips — so the atlas tile is untouched). The expensive RayQuery below never runs for them.
     if (!ProbeActiveThisFrame(probe)) return;
+
+    // CHUNK1 progressive bake: count this probe's converged frames (once per probe — the ray-0 thread). When the
+    // counter reaches convergeTarget the probe freezes (ProbeActiveThisFrame returns false above). GPU-owned, no
+    // CPU readback. Only in bake mode so the live path's RayData is byte-identical.
+    if (Params4.x > 0.5 && ray == 0u) ProbeBakeState[probe] = ProbeBakeState[probe] + 1u;
 
     float3 probePos = ProbeWorldPos(probe);
     float jitter = Hash1(probe * 31u + (uint)Params0.w * 2654435761u);

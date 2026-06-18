@@ -16,17 +16,33 @@ cbuffer DdgiConstants : register(b0) {
     float4 Params0;          // x irrTexels, y depthTexels, z hysteresis, w frameIndex
     float4 Params1;          // x maxRayDist, y normalBias, z feedbackEnable, w intensity
     float4 Params2;          // P2.5 round-robin: x updateFraction(N), y phase, z fullUpdate(1/0), w pad
+    float4 Params3;          // CHUNK1 bake: xyz camera world pos, w band width (m)
+    float4 Params4;          // CHUNK1 bake: x bakeEnable, y bakeWave (open band), z convergeTarget, w pad
 };
 
-// P2.5 ROUND-ROBIN: blend/classify only the probes traced this frame (probe % N == phase), unless a full
-// update (warm-up / N==1). MUST match DdgiTrace.ProbeActiveThisFrame exactly — blending a probe whose RayData
-// is stale would EMA garbage into its tile. Inactive tiles keep last frame's atlas value untouched.
+StructuredBuffer<float4> RayData     : register(t0);   // [probe * RaysPerProbe + ray] = (radiance, dist)
+StructuredBuffer<uint>   ProbeBake   : register(t1);   // CHUNK1: per-probe converged-frame counter (read-only here)
+
+// P2.5 ROUND-ROBIN / CHUNK1 PROGRESSIVE BAKE: blend/classify only the probes traced this frame. MUST match
+// DdgiTrace.ProbeActiveThisFrame exactly — blending a probe whose RayData is stale would EMA garbage into its
+// tile. In bake mode the SAME band + converged test (the converged counter the trace already bumped this frame
+// is one step ahead, so use > target-1, i.e. >= target means it was JUST frozen this frame — still blend that
+// last result; only skip once it was frozen on a PRIOR frame). Simpler + exact: eligible iff band opened AND
+// counter <= target (the trace bumped it to <=target for the frame it last traced).
 bool ProbeActiveThisFrame(uint probe) {
+    if (Params4.x > 0.5) {                                 // CHUNK1 progressive bake
+        if (ProbeBake[probe] > (uint)Params4.z) return false;   // frozen on a prior frame → tile already final
+        uint px = probe % (uint)ProbeDims.x;
+        uint py = (probe / (uint)ProbeDims.x) % (uint)ProbeDims.y;
+        uint pz = probe / ((uint)ProbeDims.x * (uint)ProbeDims.y);
+        float3 basePos = OriginSpacingX.xyz + float3(px * OriginSpacingX.w, py * SpacingYZ.x, pz * SpacingYZ.y);
+        uint band = (uint)floor(length(basePos - Params3.xyz) / max(Params3.w, 0.5));
+        return band <= (uint)Params4.y;
+    }
     if (Params2.z > 0.5) return true;
     uint n = max((uint)Params2.x, 1u);
     return (probe % n) == (uint)Params2.y;
 }
-StructuredBuffer<float4> RayData : register(t0);   // [probe * RaysPerProbe + ray] = (radiance, dist)
 RWTexture2D<float4> IrradianceAtlas : register(u0);   // CSIrradiance target
 RWTexture2D<float2> DepthAtlas      : register(u1);   // CSDepth target (distinct register; one bound per pass)
 RWStructuredBuffer<float4> ProbeState : register(u2); // CSClassify target: xyz = relocation offset (world), w = active(1/0)
