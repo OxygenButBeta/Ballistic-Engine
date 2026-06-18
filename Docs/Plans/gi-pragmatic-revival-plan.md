@@ -99,6 +99,52 @@
 
 **R0.4 DoD met:** RT vs compute modeled separately (compute 5–8× adopted; RT 8–14× strictly more pessimistic + non-linear, RDNA4-vs-Turing justified); inputs from R0.3 RE-MEASURED (3.3–5.1ms) + §0 re-grepped, not stale; FSR-mandatory + 30fps@1080p-FSR-Quality target derived; two-stage closure written, dev-enable SELECTED + target-met PERMANENTLY MODELED; STALE GTX-1660 section preserved, new 2060 section added below it; flagged PRE-R1.0. No code, no capture. **★ FAZ R0 COMPLETE (R0.0a→R0.4).**
 
+### R1.0 RE-VALIDATED (2026-06-18, against the now-existing R0 baseline — GPU-safe ScreenSpace path)
+> PROVISIONAL POLICY applied: re-measured e1ccbbf6's content, the R1.0 fix code, the R0.3 ColorOnly=2.30,
+> the noise-floor, AND the ancestry of the R0.3 substrate by fresh git/grep/read/headless-capture (NOT the
+> handoff/memory). **NO code change** — the fix is correct + committed; this is re-validate + re-measure.
+> Full record: [gi-revival-R0-baseline.md §"R1.0 RE-VALIDATED"](gi-revival-R0-baseline.md). Raw:
+> `e:/tmp/gi-r1validate/`.
+
+- **★ ORDER-FINDING CORRECTED (the load-bearing discovery).** `git merge-base --is-ancestor 3f3406e9
+  928d3fe2` = **YES** → the R1.0 **code fix** (`3f3406e9`, the user's post-FX commit) is an ANCESTOR of the
+  R0.2/R0.3 baseline substrate. **The R0 baseline was NEVER a pre-R1.0 denominator on the code level** —
+  `3f3406e9` predates every R0.x commit. `e1ccbbf6` itself touches ONLY `gi-revival-R1.0-materialid.md`
+  (the repro+verify RECORD). So "PRE-R1.0" on R0.3/R0.4/noise-floor was a *plan-phase ordering* label, not
+  a code state — the ORDER FINDING (line 44) over-read it as "ran on a missing denominator."
+- **★ The R1.0 fix is RAYTRACED-PATH ONLY → DEAD CODE on the ScreenSpace SSGI shipping path.**
+  `ResolveOrRegisterMaterialId` (`Dx12GpuDrivenRenderer.cs:303`) has exactly one caller —
+  `Dx12RtGeometry.BuildTriMaterials` (`Dx12RtGeometry.cs:128`) — which feeds the **DXR closest-hit** shaders
+  (RT-GI hit + RT reflections). The R0.3 baseline + this re-capture run the ScreenSpace SSGI path, which
+  never reads the RT MaterialId buffer. ‼ **The R0.3 doc's "ColorOnly isolate=2.30 = the R1.0 MaterialId
+  bug signature" is a MISLABEL** — it is the ScreenSpace SSGI bounce off a small/oblique color-only emitter
+  (screen-space-coverage limited), NOT the RT MaterialId degenerate buffer. The MaterialId bug only
+  manifests on the RayTraced path (NOT opened headless — device-remove safety, §4 PRE-EXISTING). So
+  "ColorOnly isolate should RISE post-R1.0 on the ScreenSpace path" is **false by construction.**
+- **Re-captured GI-isolate A/B (ScreenSpace, paused f60, 8 launches, all EXIT=0, ZERO device-removal):**
+  CornellBox isolate **43.154** (== R0.3 43.1, strong color-bleed); ColorOnly isolate **2.288** (== R0.3
+  2.30, UNCHANGED — fix dead on this path, correct); ThinWall isolate **0.000** (== R0.3 0.00, LEAK-PASS
+  HOLDS). Determinism: CornellBox GI-ON `81dbf7a5667f` byte-identical run-to-run.
+- **Soft-gate (R1.0(c)) re-confirmed:** ScreenSpace shipping path = **byte-zero diff** vs R0.3 (no
+  unexplained regression). The fix is a strict superset on the RT path + dead code on SSGI. The RT-path
+  "color-only now bounces" claim is proven by the commit-time **CPU harness CASE 2** (old buffer `[0,…,0]`
+  degenerate → fix resolves the real id) — the proper oracle since RT_GI=1 headless SaveBmp is device-unsafe.
+- **Re-measured X + noise-floor → §4 gate RE-FROZEN (both UNCHANGED).** Noise-floor (CornellBox static
+  motion-dump, temporal active, f180): mean boiling **0.0270** = R0.3's 0.027 byte-for-byte → **§4 gate
+  stays ≤0.3** (the floor cannot shift — the fix is dead on the SSGI temporal chain it measures). Budget X:
+  the High shipping preset uses DDGI gather (NOT per-pixel RT-GI, R0.4), so the GI-pass input to the X model
+  is the ScreenSpace cost, **unchanged post-R1.0** → R0.4's 2060 verdict (FSR mandatory, 30fps@1080p-FSR-
+  Quality, dev-enable, target-met permanently-modeled) **stands.** `gi-noise-floor.json` `PreR1_0` → false,
+  `R1_0_ReFreeze` recorded.
+
+**R1.0 RE-VALIDATE DoD met:** (a) e1ccbbf6 DoD verified from code (fix present + correct; e1ccbbf6 = doc
+record, fix in parent `3f3406e9`); (b) ORDER-FINDING corrected (R0.3 substrate already had the fix → no
+missing denominator on the code side); (c) GI-isolate A/B re-captured (ColorOnly 2.288 UNCHANGED+EXPLAINED,
+ThinWall 0.000 leak-pass, CornellBox 43.154 no-regress; the "ColorOnly=MaterialId-bug" mislabel corrected);
+(d) soft-gate ScreenSpace byte-zero, RT-path correctness via CPU harness CASE 2, RT_GI NOT opened; (e) X +
+noise-floor re-measured (both unchanged), §4 gate ≤0.3 RE-FROZEN, R0.4 budget stands; determinism + 8 clean
+launches no-removal + build 0-err. **NO code change** (fix already correct). ★ **R1.0 RE-VALIDATED.**
+
 ## §0. Keep / drop
 **KEEP (committed; "VERIFIED-under-WHICH-content", re-verified in R0.3):**
 | Piece | ms (RX 9070 XT) | Role / asterisk |
@@ -125,7 +171,7 @@
 | **R0.2** Denominator | Write target res (1080p→FSR; confirm engine has FSR not TSR) + frame budget (60fps=16.6ms/30fps=33ms). Measure non-GI (direct+shadow+post) extrapolated → **GI budget X (pessimistic/optimistic interval).** | X is **PRELIMINARY (pre-R1.0)** — marked "will tighten". Pessimistic X is the gate. R2.1 High-fit modeled on current P8.0 refl cost, flagged for re-run if R2.3 changes it. |
 | **R0.3** Baseline | Capture 5 scenarios on the **SHIPPING path (volume-on), not env-door.** GI-isolate + composite + per-pass ms + two-rate latency (scene-5). | **Characterize determinism** (which passes deterministic vs not → byte-identical BLIND-marked on the rest). **Measure per-pass perceptual noise-floor** → imgdiff gate = noise-floor+margin. ⚠ both X AND noise-floor are pre-R1.0 → **re-measured after R1.0**. |
 | **R0.4** Extrapolation | All RT-min numbers are MODEL (no 2060 on hand). RT budget modeled **separately + conservatively** (RX9070XT→2060 RT ratio non-linear). | Two-stage closure: **(a) dev-enable** (model suffices, closes R3) / **(b) target-met** (real 2060/3060, ship-gating). Closure path = **explicit user decision before R2 sign-off** (borrow/cloud/telemetry/accept-modeled), never a silent default. |
-| **★ R1.0** MaterialId | Move per-triangle MaterialId from raster G-buffer path (submesh-range→triangle) into RT geometry-build. R1's BIGGEST item; **changes BVH/geometry-build → R1.1 + MegaLights depend on it → FIRST.** | (a) repro scene-3 "no bounce"; (b) move it; (c) **soft-gate**: color-only now bounces+bleeds; imported mesh NOT hard byte-identical — **explain any nonzero diff** (unexplained = regression). **Then re-measure X + noise-floor.** |
+| **★ R1.0** MaterialId ✅ | Move per-triangle MaterialId from raster G-buffer path (submesh-range→triangle) into RT geometry-build. R1's BIGGEST item; **changes BVH/geometry-build → R1.1 + MegaLights depend on it → FIRST.** | **DONE + RE-VALIDATED** (`e1ccbbf6` doc; fix in `3f3406e9`). (a) repro+CPU-harness CASE 2 (degenerate buffer); (b) moved (`ResolveOrRegisterMaterialId`→`BuildTriMaterials`); (c) soft-gate: RT path = color-only bounces (CPU CASE 2), SSGI shipping path = byte-zero diff (fix is RT-only dead code there). **Re-measured X + noise-floor = UNCHANGED** (0.0270; §4 gate ≤0.3 RE-FROZEN). ‼ R0.3 "ColorOnly=2.30=MaterialId-bug" MISLABEL corrected (it's the SSGI bounce, not the RT path). |
 | **R1.1** Bindless tail | Replace manual `16384-N` bases with one `BindlessTailAllocator` (compile-time asserted). | Enumerate offsets **from the tree at R1.1 time** (R1.0 shifted them); zero hand-listed integers. Zero manual magic numbers after. |
 | **R1.2** Barrier audit | Adversarial barrier-audit workflow (4–6 reviewers) + GBV oracle for UAV↔SRV asymmetries. | DRED+GBV (TdrDelay-raised, §4) + 5+ clean launches no-removal. |
 | **R1.3** OIDN crash | PID-handle fix NOT in tree → does 2nd-run `NAME_ALREADY_EXISTS` still repro? If yes fix; if no, find what fixed it + readback fallback default-safe. | Two back-to-back zero-copy captures both succeed. |
