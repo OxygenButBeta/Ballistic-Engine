@@ -83,7 +83,10 @@ uint ProbeIndex(uint px, uint py, uint pz, float3 dims) {
 // CHUNK3: gather one cascade. `far` selects the FAR atlas set (the two cascades have identical math, only the
 // grid + atlas SRVs differ). Returns the trilinear-accumulated irradiance E and the total weight (sumW) — the
 // caller uses sumW to decide whether near had coverage (sumW>0) before falling back to far. Out-of-grid → sumW 0.
-float3 SampleCascade(DdgiGrid g, bool far, float3 worldPos, float3 N, out float sumW) {
+// bypassVis: skip the Chebyshev leak gate (a COVERAGE FALLBACK for receivers the gate rejects entirely — small/
+// thin geometry like the Cornell boxes the sparse probe grid "can't see", which would otherwise render pure
+// black). Used only when the normal (gated) sample returned ~no weight, so it can't leak into well-covered areas.
+float3 SampleCascade(DdgiGrid g, bool far, float3 worldPos, float3 N, bool bypassVis, out float sumW) {
     sumW = 0.0;
     float3 spacing = float3(g.OriginSpacingX.w, g.SpacingYZ.x, g.SpacingYZ.y);
     float3 biasPos = worldPos + N * g.Params1.y;
@@ -120,7 +123,7 @@ float3 SampleCascade(DdgiGrid g, bool far, float3 worldPos, float3 N, out float 
         float2 mom = far ? DepthAtlasFar.SampleLevel(LinearClamp, duv, 0).rg
                          : DepthAtlas.SampleLevel(LinearClamp, duv, 0).rg;
         float vis = 1.0;
-        if (distToProbe > mom.x) {
+        if (!bypassVis && distToProbe > mom.x) {
             float variance = abs(mom.x * mom.x - mom.y);
             float diff = distToProbe - mom.x;
             vis = variance / (variance + diff * diff);
@@ -137,6 +140,11 @@ float3 SampleCascade(DdgiGrid g, bool far, float3 worldPos, float3 N, out float 
         sumW += weight;
     }
     return sumW > 1e-5 ? sumIrr / sumW : 0.0.xxx;
+}
+// Default (leak-gated) sample — the common path. Defined AFTER the 6-arg overload so DXC has it in scope (HLSL
+// has no forward declarations).
+float3 SampleCascade(DdgiGrid g, bool far, float3 worldPos, float3 N, out float sumW) {
+    return SampleCascade(g, far, worldPos, N, false, sumW);
 }
 
 [numthreads(8, 8, 1)]
@@ -165,9 +173,20 @@ void CSGather(uint3 dtid : SV_DispatchThreadID) {
     // until the cell genuinely leaves the grid. cascadeCount (GParams.w) < 1.5 → near only (byte-identical 1-cascade).
     float sumWNear = 0.0;
     float3 E = SampleCascade(GNear, false, worldPos, N, sumWNear);
+    float coverage = sumWNear;
     if (GParams.w >= 1.5 && sumWNear <= 1e-4) {
         float sumWFar = 0.0;
         E = SampleCascade(GFar, true, worldPos, N, sumWFar);
+        coverage = max(coverage, sumWFar);
+    }
+    // COVERAGE FALLBACK: a receiver the leak gate rejects entirely (small/thin geometry the sparse probe grid
+    // "can't see" — e.g. the Cornell boxes) returns ~0 weight → pure black. Re-sample NEAR with the gate bypassed
+    // and blend it in, weighted DOWN (0.5) so any leak it admits is soft, not a bright wall-punch-through. Only
+    // kicks in where the gated sample failed (coverage ~0), so well-covered surfaces are byte-identical.
+    if (coverage <= 1e-3) {
+        float sumWBp = 0.0;
+        float3 Ebp = SampleCascade(GNear, false, worldPos, N, true, sumWBp);
+        if (sumWBp > 1e-4) E = lerp(E, Ebp, saturate(1.0 - coverage * 1000.0) * 0.5);
     }
 
     float3 outRgb = Sanitize(albedo * E) * GParams.x;

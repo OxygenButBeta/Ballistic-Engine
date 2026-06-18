@@ -1696,22 +1696,19 @@ public sealed class DX12HDRenderer : HDRenderer
         // it converges instantly, fills shadows with warm bounce, and looks far closer to UE. So SSGI is now THE
         // DEFAULT GI. RayTraced (per-pixel DXR trace, for true off-screen bounce) stays available via the volume
         // GiMode dropdown / BALLISTIC_DX12_RT_GI=1. Env doors still win for the A/B harness. =====
+        // GI DEFAULT = DDGI (RayTraced). Once the DDGI gather pre-exposure was fixed (commit da593c99) the
+        // world-probe radiance cache renders properly — warmer, fuller, and with REAL off-screen colour bleed that
+        // screen-space SSGI structurally can't have. So DDGI is the default; SSGI stays available via
+        // BALLISTIC_DX12_SSGI=1 (it still wins on tiny near-field geometry the probe grid is too sparse to catch).
         GiMode giMode =
               rtgiEnv == "1" ? GiMode.RayTraced
             : ssgiEnv == "1" ? GiMode.ScreenSpace
             : ssgiEnv == "0" ? GiMode.Off
             : doors.Minimal ? GiMode.Off
-            // Volume override: a scene's GlobalIllumination volume can pick the mode explicitly. PostFX.GiMode
-            // defaults to Off (the crash-era default), so treat Off-from-default as "use the new SSGI default";
-            // a volume that explicitly sets RayTraced/ScreenSpace is honoured.
+            // Volume override honoured when explicitly set; PostFX.GiMode defaults to Off (crash-era), so an
+            // unset/Off resolves to the DDGI (RayTraced) default.
             : PostFX.GiMode != GiMode.Off ? PostFX.GiMode
-            : GiMode.ScreenSpace;
-        // GI TECHNIQUE OVERRIDE (2026-06-18): scenes ship a BakedGlobalIllumination volume that maps to
-        // GiMode.RayTraced, but the baked-DDGI probe field is the broken/dead path. Until a scene OPTS IN to true
-        // ray-traced GI (BALLISTIC_DX12_RT_GI=1), rewrite RayTraced → ScreenSpace so every GI-on scene uses the
-        // good-looking SSGI by default. RT-GI stays one env-door away for the off-screen-coverage case.
-        if (giMode == GiMode.RayTraced && rtgiEnv != "1")
-            giMode = GiMode.ScreenSpace;
+            : GiMode.RayTraced;
         // MASTER GI KILL SWITCH: BALLISTIC_DX12_GI_FORCE=0 forces GI Off (emergency off if a path ever hangs).
         if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_FORCE") == "0")
             giMode = GiMode.Off;
