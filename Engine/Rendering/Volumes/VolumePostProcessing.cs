@@ -162,6 +162,38 @@ public static class VolumePostProcessing {
             fx.VolumetricTint = volumetric.tint.Value;
         }
 
+        // VolumetricLighting supersedes VolumetricFog: same physical fog (reuses the fx.Volumetric* fields the
+        // fog pass already consumes) PLUS the independent god-ray and dust layers. Applied AFTER the legacy
+        // VolumetricFog block so when both somehow coexist in a profile, the unified override wins.
+        if (stack.GetComponent<VolumetricLighting>() is { } vlit) {
+            fx.VolumetricEnabled = vlit.enabled.Value;
+            fx.VolumetricIntensity = vlit.intensity.Value;
+            fx.VolumetricDensity = vlit.density.Value;
+            fx.VolumetricHeightFalloff = vlit.heightFalloff.Value;
+            fx.VolumetricBaseHeight = vlit.baseHeight.Value;
+            fx.VolumetricScattering = vlit.scattering.Value;
+            fx.VolumetricAmbientScatter = vlit.ambientScatter.Value;
+            fx.VolumetricAnisotropy = vlit.anisotropy.Value;
+            fx.VolumetricSunGlow = vlit.sunGlow.Value;
+            fx.VolumetricSunGlowSharpness = vlit.sunGlowSharpness.Value;
+            fx.VolumetricStepCount = vlit.stepCount.Value;
+            fx.VolumetricMaxDistance = vlit.maxDistance.Value;
+            fx.VolumetricTint = vlit.tint.Value;
+
+            fx.ShaftsEnabled = vlit.shaftsEnabled.Value;
+            fx.ShaftIntensity = vlit.shaftIntensity.Value;
+            fx.ShaftDensity = vlit.shaftDensity.Value;
+            fx.ShaftDecay = vlit.shaftDecay.Value;
+            fx.ShaftSharpness = vlit.shaftSharpness.Value;
+            fx.ShaftTint = vlit.shaftTint.Value;
+
+            fx.DustEnabled = vlit.dustEnabled.Value;
+            fx.DustIntensity = vlit.dustIntensity.Value;
+            fx.DustSize = vlit.dustSize.Value;
+            fx.DustDrift = vlit.dustDrift.Value;
+            fx.DustSparkle = vlit.dustSparkle.Value;
+        }
+
         if (stack.GetComponent<AerialPerspective>() is { } aerial) {
             fx.AerialPerspectiveEnabled = aerial.enabled.Value;
             fx.AerialPerspectiveIntensity = aerial.intensity.Value;

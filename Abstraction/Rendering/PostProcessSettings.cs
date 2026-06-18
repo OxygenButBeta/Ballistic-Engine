@@ -252,6 +252,28 @@ public sealed class PostProcessSettings {
     public float VolumetricFeedback { get; set; } = 0.9f;             // temporal history weight (smoother/laggier)
     public Vector3 VolumetricTint { get; set; } = Vector3.One; // in-scatter colour grade
 
+    // God rays / light shafts: an AESTHETIC layer on top of the fog raymarch. The fog stays physical;
+    // the shafts get their OWN visibility density (ShaftDensity) decoupled from the fog extinction, so
+    // you get crisp sun shafts WITHOUT having to crank the fog to non-physical values. Shadow-gated sun
+    // in-scatter, scaled by an independent decay-with-distance and a tighter phase. OFF by default → no
+    // contribution unless a VolumetricLighting override turns them on (byte-identical otherwise).
+    public bool ShaftsEnabled { get; set; }                           // master toggle for the aesthetic shaft layer
+    public float ShaftIntensity { get; set; } = 1f;                   // overall shaft brightness multiplier
+    public float ShaftDensity { get; set; } = 0.05f;                  // shaft visibility weight (1/m), INDEPENDENT of the fog density
+    public float ShaftDecay { get; set; }                             // 1/m fade with march distance (0 = no fade; higher = near shafts only)
+    public float ShaftSharpness { get; set; } = 0.85f;                // shaft phase anisotropy g (tighter/brighter toward the sun)
+    public Vector3 ShaftTint { get; set; } = Vector3.One;             // colour grade on the shafts only
+
+    // Volumetric dust: procedural sun-lit motes floating in the air around the camera (no scene objects;
+    // a 3D noise field sampled along the same raymarch). Shadow-gated so dust only sparkles where the sun
+    // reaches, drifts over time. OFF by default; animated by Time (frozen to 0 under deterministic capture
+    // so paused captures stay byte-identical).
+    public bool DustEnabled { get; set; }                             // master toggle for floating dust motes
+    public float DustIntensity { get; set; } = 0.5f;                  // overall dust glow multiplier
+    public float DustSize { get; set; } = 0.5f;                       // noise frequency: lower = larger/sparser motes, higher = fine/dense
+    public Vector3 DustDrift { get; set; } = new(0.05f, 0.02f, 0f);   // world-space drift velocity (m/s) of the dust field
+    public float DustSparkle { get; set; } = 1f;                      // how strongly motes catch the sun (twinkle gain)
+
     // Aerial perspective: atmospheric distance haze on opaque geometry, baked from a Hillaire froxel
     // volume that shares the ProceduralSky atmosphere (so geometry fades into the same colour as the
     // sky behind it). ON by default at a calibrated strength; only applies while a ProceduralSky is

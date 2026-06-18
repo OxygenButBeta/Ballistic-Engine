@@ -174,18 +174,13 @@ public sealed class Dx12Ddgi : IDisposable {
     // (the field is a static SRV the gather samples), so ghosting is structurally impossible and the GI is ~free.
     // The trade: a frozen field doesn't follow moving lights / a sun cycle — Rebake() re-converges on demand
     // (scene load, light change, or a manual editor button). BALLISTIC_DX12_DDGI_BAKED=1 forces it on headless.
-    bool bakeModeEnv, bakeModeEnvRead;
-    public bool BakedMode {
-        get {
-            if (!bakeModeEnvRead) {
-                bakeModeEnvRead = true;
-                bakeModeEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_BAKED") == "1";
-            }
-            return bakeModeEnv || bakedModeRequested;
-        }
-    }
-    bool bakedModeRequested;            // set by the volume/editor bridge (BakedMode on without the env door)
-    public void SetBakedMode(bool on) { if (on != bakedModeRequested) { bakedModeRequested = on; if (on) Rebake(); } }
+    // REALTIME GI REMOVED (2026-06-18): DDGI is ALWAYS baked — there is no live per-frame DDGI path anymore.
+    // BakedMode is hard-true so the round-robin update runs ONLY to bake (then freezes); it can never become the
+    // forever-updating realtime field the user removed. (The env door / SetBakedMode are kept as no-ops for call
+    // sites + the editor bridge, but they cannot turn baking OFF.)
+    public bool BakedMode => true;
+    bool bakedModeRequested = true;
+    public void SetBakedMode(bool on) { /* always baked now — see BakedMode. Kept so callers compile. */ }
 
     // Force a fresh converge: clears the warmed-up latch so the NEXT DispatchDdgi re-runs the full-grid warm-up
     // (TryWarmUp). Call on scene open, a light/sun change, or the editor "Rebake GI" button. Cheap to call — the

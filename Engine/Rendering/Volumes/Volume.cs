@@ -203,7 +203,7 @@ public class Volume : Behaviour {
             // makes each probe's cached colour obvious at a glance). Cross marker stays the cheap fallback when
             // sphere-mode is off.
             if (ShowProbeSpheres)
-                gizmos.DrawSolidSphere(p, markerR * 2.2f);
+                gizmos.DrawSolidSphere(p, markerR);   // small world radius; the drawer clamps the pixel size
             else
                 DrawCrossMarker(gizmos, p, markerR);
         }
