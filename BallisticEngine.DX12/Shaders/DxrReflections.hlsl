@@ -46,12 +46,13 @@ struct GpuMaterial {
     float Cutout, HasEmissive, Pad2, Pad3;
 };
 struct GpuLight { float4 PosRange; float4 Color; float4 DirCosOuter; float4 Extra; };
-struct LumenInstanceMeta { uint TriOffset, TriCount, Pad0, Pad1; float4x4 World; };
+struct LumenInstanceMeta { uint TriOffset, TriCount, ClusterOffset, ClusterCount; float4x4 World; };
 StructuredBuffer<GpuMaterial>       GpuMaterials : register(t7);
 StructuredBuffer<RtInstance>        RtInstances  : register(t8);
 StructuredBuffer<GpuLight>          Lights       : register(t9);
-StructuredBuffer<float4>            CardRadiance : register(t11);   // P5: Lumen per-triangle lit+multibounce radiance
-StructuredBuffer<LumenInstanceMeta> InstanceMeta : register(t12);   // per-instance {triOffset, world}
+StructuredBuffer<float4>            CardRadiance : register(t11);   // #2A: Lumen per-CLUSTER lit+multibounce radiance
+StructuredBuffer<LumenInstanceMeta> InstanceMeta : register(t12);   // per-instance {triOffset, clusterOffset, world}
+StructuredBuffer<uint>              TriToCluster : register(t13);   // #2A: global tri index → LOCAL cluster index
 
 static const float MAX_ROUGHNESS = 0.6;
 struct ReflPayload { float3 Color; float Roughness; };
@@ -156,8 +157,8 @@ void ClosestHit(inout ReflPayload p, in BuiltInTriangleIntersectionAttributes at
     // path; the mirror ray (sharp) lands on one triangle whose card is its outgoing radiance — correct for both.
     if (UseCards > 0.5) {
         LumenInstanceMeta meta = InstanceMeta[InstanceID()];
-        uint gtri = meta.TriOffset + PrimitiveIndex();
-        p.Color = Sanitize(min(CardRadiance[gtri].rgb, 60000.0.xxx));
+        uint record = meta.ClusterOffset + TriToCluster[meta.TriOffset + PrimitiveIndex()];   // #2A cluster record
+        p.Color = Sanitize(min(CardRadiance[record].rgb, 60000.0.xxx));
         return;
     }
 

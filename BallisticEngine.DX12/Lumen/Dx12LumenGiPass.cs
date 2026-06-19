@@ -226,6 +226,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.SetComputeRootShaderResourceView(6, clusteredLights.LightBufGpuAddress);   // t9 punctual lights
             cl.SetComputeRootShaderResourceView(7, scene.CardRadianceWriteGpu);           // t10 CardRadiance (this frame's stable cache)
             cl.SetComputeRootShaderResourceView(8, scene.InstanceMetaGpuAddress);         // t11 InstanceMeta
+            cl.SetComputeRootShaderResourceView(9, scene.TriToClusterGpuAddress);         // t12 TriToCluster (#2A)
             cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
         });
         indirect.ColorToShaderResource();
@@ -336,7 +337,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // (tris ≤ budget) get stride 1 automatically (no change). Determinism: a deterministic capture forces
         // stride 1 (a strided cache depends on frame count → not byte-reproducible).
         int budget = (int)EnvF("BALLISTIC_DX12_LUMEN_BUDGET", 200000f);
-        int tris = scene.TotalTriangles;
+        int tris = scene.RecordCount;   // budget now counts RECORDS (clusters), the card-light dispatch unit
         uint stride = 1u;
         // A deterministic capture renders a FIXED frame, so the round-robin phase (FrameIndex % stride) is itself
         // deterministic → byte-identical across runs. Hence budget is safe under DeterministicCapture (it does NOT
@@ -357,7 +358,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         *(LumenCardConstants*)cardCbMapped = new LumenCardConstants
         {
             SunDir = sunDir, SunBias = 0.03f, SunColor = ctx.LightColor, LightCount = clusteredLights.LightCount,
-            InstanceCount = (uint)scene.InstanceCount, TotalTris = (uint)scene.TotalTriangles,
+            InstanceCount = (uint)scene.InstanceCount, TotalTris = (uint)scene.RecordCount,   // #2A: dispatch bound = record count
             SkyIntensity = skyIntensity, UseSky = useSky ? 1f : 0f, SkyVisRays = 4f,
             EmaAlpha = emaAlpha, BounceRays = bounce ? 4f : 0f,
             HistoryValid = (scene.HistoryValid && !ctx.DeterministicCapture) ? 1f : 0f,
@@ -395,7 +396,9 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.SetComputeRootShaderResourceView(7, clusteredLights.LightBufGpuAddress);  // t5 Lights
             cl.SetComputeRootShaderResourceView(8, scene.CardRadianceReadGpu);           // t6 PrevCard (read)
             cl.SetComputeRootUnorderedAccessView(9, scene.LastUpdatedGpu);               // u1 LastUpdated (age)
-            cl.Dispatch((uint)((scene.TotalTriangles + 63) / 64), 1, 1);
+            cl.SetComputeRootShaderResourceView(10, scene.TriToClusterGpuAddress);       // t7 TriToCluster
+            cl.SetComputeRootShaderResourceView(11, scene.ClusterToTriGpuAddress);       // t8 ClusterToTri
+            cl.Dispatch((uint)((scene.RecordCount + 63) / 64), 1, 1);                     // #2A: one thread per record
             cl.ResourceBarrierTransition(cardW, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
         });
         scene.SetState(cardW, ResourceStates.NonPixelShaderResource);
@@ -426,6 +429,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         var lightSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(9, 0), ShaderVisibility.All);
         var cardSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(10, 0), ShaderVisibility.All);  // t10 CardRadiance
         var metaSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(11, 0), ShaderVisibility.All);  // t11 InstanceMeta
+        var triClusterSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(12, 0), ShaderVisibility.All);  // t12 TriToCluster (#2A)
         var clampSamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
         {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
@@ -441,7 +445,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         traceRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { cbv0, cbv1, tlasSrv, table, matSrv, instSrv, lightSrv, cardSrv, metaSrv }, new[] { clampSamp, wrapSamp })));
+                new[] { cbv0, cbv1, tlasSrv, table, matSrv, instSrv, lightSrv, cardSrv, metaSrv, triClusterSrv }, new[] { clampSamp, wrapSamp })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumenGi.hlsl");
         byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSTrace", "LumenGi.hlsl");
@@ -516,6 +520,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         var lights = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(5, 0), ShaderVisibility.All);    // t5
         var prevCard = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(6, 0), ShaderVisibility.All);  // t6 PrevCard
         var ageUav = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(1, 0), ShaderVisibility.All);  // u1 LastUpdated
+        var triClus = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All);  // t7 TriToCluster
+        var clusTri = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(8, 0), ShaderVisibility.All);  // t8 ClusterToTri
         var clamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
         {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
@@ -529,7 +535,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         cardRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { cbv0, tlasSrv, uavRoot, skyTable, instMeta, rtInst, mats, lights, prevCard, ageUav }, new[] { clamp, wrap })));
+                new[] { cbv0, tlasSrv, uavRoot, skyTable, instMeta, rtInst, mats, lights, prevCard, ageUav, triClus, clusTri }, new[] { clamp, wrap })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumenCardLight.hlsl");
         byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSMain", "LumenCardLight.hlsl");

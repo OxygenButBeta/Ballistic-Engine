@@ -33,6 +33,9 @@ public sealed class Dx12SceneAS : IDisposable {
     public int InstanceCount => instances.Count;
     public Matrix4x4 InstanceWorld(int i) => instances[i].world;
     public int InstanceTriangleCount(int i) => instances[i].mesh.IndexBuffer.ElementCount / 3;
+    // The CPU mesh behind an instance — Lumen V2 #2A reads its object-space positions/normals/indices to build a
+    // per-mesh triangle clustering (the cluster radiance cache). Same instance order as the accessors above.
+    public Mesh InstanceMesh(int i) => instances[i].mesh;
 
     public Dx12SceneAS(Dx12Device device) {
         dev = device;

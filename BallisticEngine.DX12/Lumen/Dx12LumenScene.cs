@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Vortice.Direct3D12;
@@ -37,9 +38,12 @@ public sealed class Dx12LumenScene : IDisposable
     [StructLayout(LayoutKind.Sequential)]
     struct LumenInstanceMeta
     {
-        public uint TriOffset; public uint TriCount; public uint Pad0; public uint Pad1;
+        public uint TriOffset; public uint TriCount; public uint ClusterOffset; public uint ClusterCount;
         public Matrix4x4 World;   // object→world, transposed on upload (HLSL column-major)
     }
+    // #2A: TriOffset/ClusterOffset are this instance's bases into the GLOBAL triangle / cluster (record) spaces.
+    // A triangle's record = ClusterOffset + TriToCluster[TriOffset + localTri]; the card-light writes / the trace
+    // samples RecordRadiance[record]. (TriOffset still indexes the global TriToCluster map below.)
 
     ID3D12Resource instanceMeta;        // LumenInstanceMeta[] — root SRV, indexed by instance
     public ulong InstanceMetaGpuAddress => instanceMeta?.GPUVirtualAddress ?? 0;
@@ -60,6 +64,20 @@ public sealed class Dx12LumenScene : IDisposable
     public ulong CardRadianceReadGpu  => (CardRadianceRead)?.GPUVirtualAddress ?? 0;
     public bool HistoryValid { get; private set; }
     public int TotalTriangles { get; private set; }
+
+    // ---- #2A RadianceCache interface ----
+    // A cache RECORD is the unit the radiance cache stores (today = one CLUSTER; the card-light dispatch still
+    // walks triangles but writes per-cluster). RecordCount sizes CardRadiance + LastUpdated (the cache shrinks
+    // 30-50× vs per-triangle). TriToCluster is the GLOBAL triangle→local-cluster map the card-light + trace read
+    // (record = instance.ClusterOffset + TriToCluster[instance.TriOffset + localTri]).
+    public int RecordCount { get; private set; }
+    ID3D12Resource triToCluster;        // uint[] global tri index → LOCAL cluster index (root SRV)
+    public ulong TriToClusterGpuAddress => triToCluster?.GPUVirtualAddress ?? 0;
+    // #2A: record (global cluster) index → the cluster's REPRESENTATIVE global triangle index. The card-light
+    // pass dispatches ONE thread per record, reads its representative triangle here, and lights+writes that
+    // record (no per-triangle race, and the dispatch is RecordCount-wide → cheaper than per-triangle).
+    ID3D12Resource clusterToTri;
+    public ulong ClusterToTriGpuAddress => clusterToTri?.GPUVirtualAddress ?? 0;
 
     // ---- P7 #1: per-record "last updated frame" (the update-budget priority input). One uint per triangle
     // (the cache record unit; #2A makes this per-cluster behind the RadianceCache interface). The card-light
@@ -129,8 +147,9 @@ public sealed class Dx12LumenScene : IDisposable
         if (!loggedThisStamp)
         {
             loggedThisStamp = true;
-            string line = $"[Lumen] scene: objects={InstanceCount} cards(tris)={TotalTriangles} " +
-                          $"cacheMB={(TotalTriangles * 16L) / (1024 * 1024.0):0.00} dirtyUpdates={DirtyUpdateCount}";
+            string line = $"[Lumen] scene: objects={InstanceCount} tris={TotalTriangles} records(clusters)={RecordCount} " +
+                          $"({(TotalTriangles > 0 ? (float)TotalTriangles / Math.Max(RecordCount, 1) : 0):0.0} tri/cluster) " +
+                          $"cacheMB={(RecordCount * 16L) / (1024 * 1024.0):0.00} dirtyUpdates={DirtyUpdateCount}";
             Console.WriteLine(line);
             Debugging.Log(line);
         }
@@ -146,15 +165,24 @@ public sealed class Dx12LumenScene : IDisposable
         int n = sceneAS.InstanceCount;
         InstanceCount = n;
 
-        LumenInstanceMeta[] meta = BuildMetaArray(sceneAS, out int total);
+        // #2A: build the per-instance meta AND the global triangle→cluster map + record (cluster) count in one
+        // pass. The cache is sized by RecordCount (clusters), not TotalTriangles — the 30-50× shrink.
+        LumenInstanceMeta[] meta = BuildMetaArray(sceneAS, out int total, out int records, out uint[] triCluster, out uint[] clusTri);
         TotalTriangles = total;
+        RecordCount = records;
 
         instanceMeta?.Dispose();
         instanceMeta = n > 0 ? dev.CreateUavBuffer<LumenInstanceMeta>(meta, ResourceStates.GenericRead) : null;
 
+        triToCluster?.Dispose();
+        triToCluster = total > 0 ? dev.CreateUavBuffer<uint>(triCluster, ResourceStates.GenericRead) : null;
+
+        clusterToTri?.Dispose();
+        clusterToTri = records > 0 ? dev.CreateUavBuffer<uint>(clusTri, ResourceStates.GenericRead) : null;
+
         cardRadianceA?.Dispose(); cardRadianceB?.Dispose();
-        // float4 per triangle; UAV (card-light writes) readable as a StructuredBuffer SRV by the hit trace.
-        int count = Math.Max(TotalTriangles, 1);
+        // float4 per RECORD (cluster); UAV (card-light writes) readable as a StructuredBuffer SRV by the hit trace.
+        int count = Math.Max(RecordCount, 1);
         var zero = new Vector4[count];   // start cleared (no stale radiance on a fresh build)
         cardRadianceA = dev.CreateUavBuffer<Vector4>(zero, ResourceStates.UnorderedAccess);
         cardRadianceB = dev.CreateUavBuffer<Vector4>(zero, ResourceStates.UnorderedAccess);
@@ -195,35 +223,57 @@ public sealed class Dx12LumenScene : IDisposable
     unsafe void RefreshTransforms(Dx12SceneAS sceneAS)
     {
         if (sceneAS.InstanceCount == 0) return;
-        LumenInstanceMeta[] meta = BuildMetaArray(sceneAS, out _);
+        // Re-cluster is a cached per-mesh no-op (topology unchanged), so this just rebuilds the meta with the same
+        // cluster offsets + re-uploads world matrices. The triToCluster map is unchanged → not re-uploaded.
+        LumenInstanceMeta[] meta = BuildMetaArray(sceneAS, out _, out _, out _, out _);
         instanceMeta?.Dispose();
         instanceMeta = dev.CreateUavBuffer<LumenInstanceMeta>(meta, ResourceStates.GenericRead);
     }
 
-    // Per-instance {triOffset (prefix sum), triCount, world} — the meta the card-light + trace + reflections
-    // read. Shared by Rebuild (topology change) and RefreshTransforms (motion only).
-    LumenInstanceMeta[] BuildMetaArray(Dx12SceneAS sceneAS, out int total)
+    // Per-instance {triOffset, triCount, clusterOffset, clusterCount, world} + the GLOBAL triangle→local-cluster
+    // map + the record→global-representative-tri map + the total record (cluster) count. Shared by Rebuild
+    // (topology change) and RefreshTransforms (motion only — clustering is mesh-cached so re-calling is cheap).
+    LumenInstanceMeta[] BuildMetaArray(Dx12SceneAS sceneAS, out int total, out int records, out uint[] triCluster, out uint[] clusterTri)
     {
         int n = sceneAS.InstanceCount;
         var meta = new LumenInstanceMeta[Math.Max(n, 1)];
-        int offset = 0;
+        int totalTris = 0;
+        for (int i = 0; i < n; i++) totalTris += sceneAS.InstanceTriangleCount(i);
+        triCluster = new uint[Math.Max(totalTris, 1)];
+        var clusterTriList = new List<uint>(Math.Max(totalTris / 64, 16));   // record → global representative tri
+
+        int offset = 0, clusterOffset = 0;
         for (int i = 0; i < n; i++)
         {
             int tris = sceneAS.InstanceTriangleCount(i);
+            var mc = Dx12LumenCluster.Cluster(sceneAS.InstanceMesh(i));
+            int copyN = Math.Min(tris, mc.TriToCluster.Length);
+            for (int t = 0; t < copyN; t++) triCluster[offset + t] = (uint)mc.TriToCluster[t];
+            // Append this instance's cluster representatives in LOCAL-cluster order — that matches the global
+            // record index (clusterOffset + localCluster), so clusterTriList[record] is the representative.
+            for (int c = 0; c < mc.ClusterFirstTri.Length; c++)
+                clusterTriList.Add((uint)(offset + mc.ClusterFirstTri[c]));   // global representative tri index
+
             meta[i] = new LumenInstanceMeta
             {
                 TriOffset = (uint)offset, TriCount = (uint)tris,
+                ClusterOffset = (uint)clusterOffset, ClusterCount = (uint)mc.ClusterCount,
                 World = Matrix4x4.Transpose(sceneAS.InstanceWorld(i)),
             };
             offset += tris;
+            clusterOffset += mc.ClusterCount;
         }
         total = offset;
+        records = clusterOffset;
+        clusterTri = clusterTriList.Count > 0 ? clusterTriList.ToArray() : new uint[1];
         return meta;
     }
 
     public void Dispose()
     {
         instanceMeta?.Dispose(); instanceMeta = null;
+        triToCluster?.Dispose(); triToCluster = null;
+        clusterToTri?.Dispose(); clusterToTri = null;
         cardRadianceA?.Dispose(); cardRadianceA = null;
         cardRadianceB?.Dispose(); cardRadianceB = null;
         lastUpdated?.Dispose(); lastUpdated = null;

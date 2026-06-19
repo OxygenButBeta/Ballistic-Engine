@@ -274,6 +274,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         var probeSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(10, 0), ShaderVisibility.All);
         var cardSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(11, 0), ShaderVisibility.All);  // P5 t11 CardRadiance
         var metaSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(12, 0), ShaderVisibility.All);  // P5 t12 LumenInstanceMeta
+        var triClusterSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(13, 0), ShaderVisibility.All);  // #2A t13 TriToCluster
         var clampSamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
             AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
@@ -287,7 +288,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         rtReflRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { cbv0, cbv1, cbv2, table, matSrv, instSrv, lightSrv, probeSrv, cardSrv, metaSrv }, new[] { clampSamp, wrapSamp })));
+                new[] { cbv0, cbv1, cbv2, table, matSrv, instSrv, lightSrv, probeSrv, cardSrv, metaSrv, triClusterSrv }, new[] { clampSamp, wrapSamp })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("DxrReflections.hlsl");
         byte[] dxil = Dx12ShaderCompiler.Compile(DxcShaderStage.Library, hlsl, "", "DxrReflections.hlsl");
@@ -403,8 +404,10 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
             // When Lumen is off, bind valid filler (the light buffer) — UseCards=0 gates the shader read anyway.
             ulong cardAddr = useCards ? ctx.LumenScene.CardRadianceReadGpu : clusteredLights.LightBufGpuAddress;
             ulong metaAddr = useCards ? ctx.LumenScene.InstanceMetaGpuAddress : clusteredLights.LightBufGpuAddress;
+            ulong triClusAddr = useCards && ctx.LumenScene.TriToClusterGpuAddress != 0 ? ctx.LumenScene.TriToClusterGpuAddress : clusteredLights.LightBufGpuAddress;
             cl.SetComputeRootShaderResourceView(8, cardAddr);                            // t11 CardRadiance
             cl.SetComputeRootShaderResourceView(9, metaAddr);                            // t12 LumenInstanceMeta
+            cl.SetComputeRootShaderResourceView(10, triClusAddr);                         // t13 TriToCluster (#2A)
             cl.DispatchRays(new DispatchRaysDescription {
                 Width = (uint)ssrTarget.Width, Height = (uint)ssrTarget.Height, Depth = 1,
                 RayGenerationShaderRecord = new GpuVirtualAddressRange { StartAddress = rtReflSbt.GPUVirtualAddress, SizeInBytes = idSize },

@@ -61,12 +61,13 @@ struct GpuMaterial {
     float Cutout, HasEmissive, Pad2, Pad3;
 };
 struct GpuLight { float4 PosRange; float4 Color; float4 DirCosOuter; float4 Extra; };
-struct LumenInstanceMeta { uint TriOffset, TriCount, Pad0, Pad1; float4x4 World; };
+struct LumenInstanceMeta { uint TriOffset, TriCount, ClusterOffset, ClusterCount; float4x4 World; };
 StructuredBuffer<GpuMaterial>       GpuMaterials : register(t7);
 StructuredBuffer<RtInstance>        RtInstances  : register(t8);
 StructuredBuffer<GpuLight>          Lights       : register(t9);
-StructuredBuffer<float4>            CardRadiance : register(t10);   // P3: per-triangle lit radiance (the cards)
-StructuredBuffer<LumenInstanceMeta> InstanceMeta : register(t11);   // per-instance {triOffset, world}
+StructuredBuffer<float4>            CardRadiance : register(t10);   // #2A: per-CLUSTER lit radiance (the records)
+StructuredBuffer<LumenInstanceMeta> InstanceMeta : register(t11);   // per-instance {triOffset, clusterOffset, world}
+StructuredBuffer<uint>              TriToCluster : register(t12);   // #2A: global tri index → LOCAL cluster index
 
 static const float PI = 3.14159265359;
 
@@ -256,13 +257,14 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
         q.Proceed();
         if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
             if (UseCards > 0.5) {
-                // P3: SAMPLE the surface card (lit first-bounce radiance the card-light pass wrote) — no per-hit
-                // relighting. Back-face hits (ray hit the far side of a one-sided card) get 0 (a card is lit on
-                // its front; a back hit contributes no radiance), matching the raster one-sided convention.
+                // #2A: SAMPLE the surface card at the hit triangle's CLUSTER RECORD (the lit radiance the card-
+                // light pass wrote per cluster) — no per-hit relighting. record = instance.ClusterOffset + the
+                // local cluster of the hit triangle. Diffuse GI is low-frequency, so the cluster's single radiance
+                // reads identically to per-triangle on the receiver.
                 uint inst = q.CommittedInstanceID();
                 LumenInstanceMeta meta = InstanceMeta[inst];
-                uint gtri = meta.TriOffset + q.CommittedPrimitiveIndex();
-                sum += CardRadiance[gtri].rgb;
+                uint record = meta.ClusterOffset + TriToCluster[meta.TriOffset + q.CommittedPrimitiveIndex()];
+                sum += CardRadiance[record].rgb;
             } else {
                 // A/B fallback (BALLISTIC_DX12_LUMEN_NOCARDS=1): re-shade the hit directly (the P2 path).
                 float3 hitPos = origin + dir * q.CommittedRayT();

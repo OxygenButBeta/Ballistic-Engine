@@ -22,7 +22,7 @@ RWStructuredBuffer<float4> CardRadiance : register(u0);
 TextureCube SkyIrradiance : register(t1);
 RWStructuredBuffer<uint> LastUpdated : register(u1);   // P7 #1: per-record age (frame index of last relight)
 
-struct LumenInstanceMeta { uint TriOffset, TriCount, Pad0, Pad1; float4x4 World; };
+struct LumenInstanceMeta { uint TriOffset, TriCount, ClusterOffset, ClusterCount; float4x4 World; };
 struct RtInstance { uint NormalIdx, UvIdx, IndexIdx, TriMatIdx; uint PositionIdx, TriCount, Pad0, Pad1; };
 struct GpuMaterial {
     uint DiffuseIdx, NormalIdx, MetallicIdx, RoughnessIdx;
@@ -38,6 +38,8 @@ StructuredBuffer<RtInstance>        RtInstances : register(t3);
 StructuredBuffer<GpuMaterial>       GpuMaterials: register(t4);
 StructuredBuffer<GpuLight>          Lights      : register(t5);
 StructuredBuffer<float4>            PrevCard    : register(t6);   // P4: PREVIOUS frame's cache (multi-bounce + EMA)
+StructuredBuffer<uint>              TriToCluster : register(t7);   // #2A: global tri index → LOCAL cluster index (2nd-bounce hit→record)
+StructuredBuffer<uint>              ClusterToTri : register(t8);   // #2A: record (global cluster) → global representative tri
 
 cbuffer LumenCardConstants : register(b0) {
     float3 SunDir;   float SunBias;      // TO the sun (normalized), world; shadow-ray origin offset
@@ -94,27 +96,27 @@ uint InstanceForTri(uint tri) {
 
 [numthreads(64, 1, 1)]
 void CSMain(uint3 dtid : SV_DispatchThreadID) {
-    uint gtri = dtid.x;
-    if (gtri >= TotalTris) return;
+    // #2A: ONE thread per RECORD (cluster). The dispatch is RecordCount-wide (30-50× fewer threads than per-
+    // triangle) and there is NO write race — each record is owned by exactly one thread. The record lights its
+    // cluster's REPRESENTATIVE triangle (ClusterToTri[record]) and writes that radiance into the cache.
+    uint record = dtid.x;
+    if (record >= TotalTris) return;   // TotalTris is repurposed as RecordCount for the dispatch bound (see C#)
 
-    // P7 #1 — UPDATE BUDGET. Only a round-robin slice of records relight each frame; the rest carry their
-    // previous cache radiance forward unchanged. The cache is view-independent + EMA-stable, so a record that
-    // is re-lit every `UpdateStride` frames looks identical to one re-lit every frame (just slower to react to
-    // a light change). `ForceFull` (set on a sun/light/transform dirty frame) overrides → full relight that
-    // frame, so light changes have no perceptible latency. A never-updated record (age 0 right after a build)
-    // is always due, so the first frames sweep the whole scene to fill the cache.
-    bool everUpdated = LastUpdated[gtri] != 0u;
-    bool due = (ForceFull != 0u) || !everUpdated || ((gtri % UpdateStride) == (FrameIndex % UpdateStride));
-    if (!due) {
-        // Carry forward: the read buffer holds last frame's radiance for this record; copy it into the write
-        // buffer so the trace (which reads the write buffer) sees a complete, stable cache.
-        CardRadiance[gtri] = float4(PrevCard[gtri].rgb, 1.0);
-        return;
-    }
-
+    uint gtri = ClusterToTri[record];
     uint inst = InstanceForTri(gtri);
     LumenInstanceMeta meta = Instances[inst];
     uint localTri = gtri - meta.TriOffset;
+
+    // P7 #1 — UPDATE BUDGET, per-RECORD. Only a round-robin slice of records relight each frame; the rest carry
+    // their previous radiance forward. The view-independent + EMA-stable cache makes a record re-lit every
+    // `UpdateStride` frames look identical to per-frame for a static light. `ForceFull` (sun/light/topology dirty)
+    // overrides → full relight that frame (no latency). A never-updated record (age 0 after a build) is always due.
+    bool everUpdated = LastUpdated[record] != 0u;
+    bool due = (ForceFull != 0u) || !everUpdated || ((record % UpdateStride) == (FrameIndex % UpdateStride));
+    if (!due) {
+        CardRadiance[record] = float4(PrevCard[record].rgb, 1.0);   // carry forward
+        return;
+    }
 
     RtInstance geo = RtInstances[inst];
     Buffer<uint>             indices = ResourceDescriptorHeap[geo.IndexIdx];
@@ -182,7 +184,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
     // averaged; * albedo gives this surface's indirect response.
     float3 indirect = 0.0.xxx;
     uint sr = (uint)clamp(max(SkyVisRays, BounceRays), 1.0, 8.0);
-    float jit = Hash(gtri * 2654435761u);
+    float jit = Hash(record * 2654435761u);
     float3x3 basis = BuildBasis(N);
     [loop] for (uint k = 0; k < sr; k++) {
         float3 d = normalize(mul(CosineHemisphere(k, sr, jit), basis));
@@ -190,11 +192,12 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
         RayQuery<RAY_FLAG_FORCE_OPAQUE> q; q.TraceRayInline(Scene, 0, 0xFF, rd); q.Proceed();
         if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
             // Second bounce from the previous cache (only when HistoryValid + bounce enabled; else 0 = direct-only).
+            // #2A: map the hit triangle to its cluster RECORD (ClusterOffset + local cluster of the hit triangle).
             if (HistoryValid > 0.5 && BounceRays > 0.5) {
                 uint hi = q.CommittedInstanceID();
                 LumenInstanceMeta hm = Instances[hi];
-                uint hg = hm.TriOffset + q.CommittedPrimitiveIndex();
-                indirect += PrevCard[hg].rgb;
+                uint hrec = hm.ClusterOffset + TriToCluster[hm.TriOffset + q.CommittedPrimitiveIndex()];
+                indirect += PrevCard[hrec].rgb;
             }
         } else if (UseSky > 0.5) {
             indirect += SkyIrradiance.SampleLevel(LinearClamp, d, 0).rgb * SkyIntensity;
@@ -207,13 +210,13 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
     // receiver integrates.)
     float3 lit = albedo * (sun + punctual + indirect) + emissive;
 
-    // P4 conservative TEMPORAL update: EMA-blend over the previous cache (per-triangle, view-independent → no
+    // P4 conservative TEMPORAL update: EMA-blend over the previous cache (per-RECORD, view-independent → no
     // reprojection). First frame after a (re)build (HistoryValid=0) takes the lit value straight (alpha=1).
     float alpha = HistoryValid > 0.5 ? saturate(EmaAlpha) : 1.0;
-    float3 prev = PrevCard[gtri].rgb;
+    float3 prev = PrevCard[record].rgb;
     float3 radiance = lerp(prev, lit, alpha);
-    CardRadiance[gtri] = float4(Sanitize(radiance), 1.0);
+    CardRadiance[record] = float4(Sanitize(radiance), 1.0);
 
     // P7 #1: stamp this record as updated this frame (FrameIndex+1 so it's never 0 — 0 means "never updated").
-    LastUpdated[gtri] = FrameIndex + 1u;
+    LastUpdated[record] = FrameIndex + 1u;
 }
