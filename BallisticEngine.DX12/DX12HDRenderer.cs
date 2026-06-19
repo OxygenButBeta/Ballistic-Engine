@@ -1229,10 +1229,15 @@ public sealed class DX12HDRenderer : HDRenderer
         // Shadows first: render the sun cascades' depth (own upload command list) before opaque. Fit with the
         // UNJITTERED proj so the cascades are stable frame-to-frame (cascade caching + no TAA shadow jitter).
         // doors.Shadows = off under BARE-MINIMUM (the deferred shadow term hard-1.0s via fc.ShadowsEnabled below).
+        bool fprof = Environment.GetEnvironmentVariable("BALLISTIC_DX12_FRAME_PROFILE") == "1";
+        var fpsw = fprof ? System.Diagnostics.Stopwatch.StartNew() : null;
+        void FP(string t) { if (fprof) { fpsw.Stop(); Console.WriteLine($"[FrameProf] {t} {fpsw.Elapsed.TotalMilliseconds:0.00}ms"); fpsw.Restart(); } }
+
         if (doors.Shadows)
             RenderShadows(view, projUnjittered, light);
         else
             shadowsThisFrame = false;
+        FP("RenderShadows");
 
         // IBL: bake the env→irradiance/prefilter/BRDF from the procedural sky (re-bakes only on param
         // change). Own upload command list, before the render list. Only when a ProceduralSky is active.
@@ -1248,6 +1253,7 @@ public sealed class DX12HDRenderer : HDRenderer
             ibl.EnsureBaked(pSky, sunDir, lightColor, sunAngR);
             iblActiveThisFrame = ibl.HasBaked;
         }
+        FP("IBL bake");
 
         // P0a — OPEN the pipelined frame command list. Everything from here (Hi-Z, geometry, deferred, sky,
         // transparents, GI, post, composite) records into ONE list submitted once at EndFrame, replacing the
@@ -1651,9 +1657,11 @@ public sealed class DX12HDRenderer : HDRenderer
         // Execute/ExecuteGraph (it may re-Build/re-Compile the graph). A NO-OP for feature-free scenes (Gather()==0
         // every frame → the graph stays the built-in set → byte-identical to golden), so it's unconditional here.
         featureBridge.Apply();
+        FP("geometry+deferred+setup");
 
         if (graphPath) graph.ExecuteGraph(ctx);
         else graph.Execute(ctx);
+        FP("graph.Execute(all passes)");
 
         // Editor display path: leave the LDR composite in PixelShaderResource so the editor's ImGui pass can
         // sample it via SceneColorHandle/GameColorHandle THIS frame. The player (PresentToScreen) keeps it in
