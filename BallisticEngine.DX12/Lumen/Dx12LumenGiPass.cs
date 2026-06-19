@@ -171,6 +171,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     int probeStride = 16, octSize = 8;
     int probesX, probesY, probeHeaderCount;
     const int SpTableBase = Dx12BindlessTail.LumenScreenProbeTableBase;
+    // PERF: the screen-probe table descriptors (t1-t6 SRV + u1/u2/u3 UAV) are re-written into the bindless tail
+    // EVERY frame even though the source resources don't change between resizes — CreateUnorderedAccessView +
+    // CopyDescriptorsSimple are CPU driver calls and were ~half the per-frame Lumen CPU cost. Cache them: only
+    // re-write when a source resource HANDLE changes (resize / scene swap), detected by this stamp. Visual output
+    // is byte-identical (the descriptors point at the same views).
+    long spDescStamp = -1;
 
     [StructLayout(LayoutKind.Sequential)]
     struct ProbeConstants
@@ -216,11 +222,17 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     Vector3 prevSunColor;
     float prevLightCount = -1f;
 
+    static readonly bool LumenProfile = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_PROFILE") == "1";
+    System.Diagnostics.Stopwatch profSw = new();
+    void Prof(string tag) { if (LumenProfile) { profSw.Stop(); Console.WriteLine($"[LumenProf] {tag} {profSw.Elapsed.TotalMilliseconds:0.00}ms"); profSw.Restart(); } }
+
     public unsafe void Record(Dx12FrameContext ctx)
     {
+        if (LumenProfile) profSw.Restart();
         // Build/refresh the substrate (shared TLAS + bindless geo + card table + atlases) and log its counts.
         if (!scene.Ensure(ctx))
             return;   // no valid scene AS → nothing to trace (Lumen is HW-RT only; no SSGI fallback)
+        Prof("scene.Ensure");
 
         var sceneAS = ctx.Dxr.SceneAS;
         var rtGeo = ctx.Dxr.RtGeometry;
@@ -249,6 +261,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // 1D dispatch over all scene triangles. Skipped when cards are off (A/B re-shade path). ===
         if (useCards && scene.TotalTriangles > 0)
             LightCards(ctx, sunDirN, clusteredLights, ibl, skyIntensity, useSky);
+        Prof("LightCards");
 
         *(LumenConstants*)traceCbMapped = new LumenConstants
         {
@@ -321,6 +334,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         probeHistory.ColorToShaderResource();   // #3: the trace reads last frame's accumulated probes (table t14)
         indirect.ColorToUnorderedAccess();
 
+        Prof("pre-trace setup");
         if (WantScreenProbe(ctx))
         {
             // Sıra 1: SCREEN-PROBE front end fills `indirect` (place → trace → integrate). Same E contract.
@@ -348,6 +362,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             });
         }
         indirect.ColorToShaderResource();
+        Prof("TRACE/gather");
 
         // === COMMON MOTION-VECTOR TEMPORAL RESOLVE (LumenTemporal) ===
         // Reproject the resolved history with the REAL G-buffer motion vector (RT4) + neighbourhood AABB clamp +
@@ -404,6 +419,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             probeHistory.ColorToShaderResource();
             probeHistoryValid = true;
         }
+        Prof("temporal");
 
         // === SPATIAL DENOISE: edge-aware à-trous blur of the raw indirect E (diffuse GI is low-frequency, so a
         // wide bilateral blur removes the per-pixel hemisphere-ray grain without a screen-space temporal
@@ -457,6 +473,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // PSO — no scratch target needed. The deferred pass already suppressed its IBL diffuse ambient
         // (ctx.LumenActiveThisFrame → UseIBLDiffuse=0), so this adds Lumen's diffuse indirect without double-count.
         // BALLISTIC_DX12_LUMEN_DEBUG=1 swaps to an OPAQUE-replace PSO that shows the raw irradiance E instead. ===
+        Prof("denoise");
         gbuffer.ToShaderResource();
         // GTAO into the GI combine at the AmbientOcclusion volume's strength (env override _LUMEN_AO). The GTAO
         // buffer is ctx.AoResult when AO is actually rendered this frame; else a valid fallback + AoStrength 0
@@ -495,6 +512,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.DrawInstanced(3, 1, 0, 0);
         });
 
+        Prof("combine");
         // Swap the cache ping-pong: this frame's written cache becomes next frame's "previous" (EMA + bounce
         // source). Only when cards actually ran this frame (else the read/write buffers didn't advance).
         if (useCards && scene.TotalTriangles > 0)
@@ -633,28 +651,36 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Dx12DescriptorHeap bindless = Dx12Backend.BindlessHeap;
-        // Table t1-t6 SRV + u1 atlas UAV in the screen-probe reserved tail.
-        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 0), gbuffer.DepthSrvCpu, heapType);     // t1 depth
-        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 1), gbuffer.ColorSrvCpu(1), heapType);  // t2 normal
-        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 2), gbuffer.ColorSrvCpu(2), heapType);  // t3 material
-        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 3), target.ColorSrvCpu, heapType);      // t4 lit scene color
-        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 4), ibl.IrradianceSrv, heapType);       // t5 sky irradiance
-        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 5), ibl.PrefilterSrv, heapType);        // t6 sky prefilter
-        dev.Device.CreateUnorderedAccessView(probeAtlas.RenderTarget, null, new UnorderedAccessViewDescription
+        // PERF: write the screen-probe table descriptors ONLY when a source resource handle changed (resize / scene
+        // swap), not every frame. Stamp = the source CPU-descriptor pointers. The bindless tail slots persist, so a
+        // cached frame reuses last write — byte-identical output, ~9 driver calls/frame eliminated.
+        long descStamp = (long)gbuffer.DepthSrvCpu.Ptr ^ ((long)gbuffer.ColorSrvCpu(1).Ptr << 1)
+            ^ ((long)target.ColorSrvCpu.Ptr << 2) ^ ((long)ibl.IrradianceSrv.Ptr << 3)
+            ^ ((long)probeAtlas.ColorSrvCpu.Ptr << 4) ^ ((long)indirect.ColorSrvCpu.Ptr << 5)
+            ^ ((long)probeAtlasFiltered.ColorSrvCpu.Ptr << 6) ^ ((long)probeAtlasHistory.ColorSrvCpu.Ptr << 7);
+        if (descStamp != spDescStamp)
         {
-            Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
-        }, bindless.Cpu(SpTableBase + 6));                                                                      // u1 probe atlas
-        // u2 indirect (SpTableBase+7) + t13 atlas history (SpTableBase+8) — ALL in the ONE bindless heap so a single
-        // SetDescriptorHeaps(bindless) covers every table (a separate heap for these caused SetDescriptorTableInvalid).
-        dev.Device.CreateUnorderedAccessView(indirect.RenderTarget, null, new UnorderedAccessViewDescription
-        {
-            Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
-        }, bindless.Cpu(SpTableBase + 7));                                                                      // u2 indirect
-        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 8), probeAtlasHistory.ColorSrvCpu, heapType); // t13 atlas history
-        dev.Device.CreateUnorderedAccessView(probeAtlasFiltered.RenderTarget, null, new UnorderedAccessViewDescription
-        {
-            Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
-        }, bindless.Cpu(SpTableBase + 9));                                                                      // u3 probe atlas FILTERED (blob fix)
+            spDescStamp = descStamp;
+            dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 0), gbuffer.DepthSrvCpu, heapType);     // t1 depth
+            dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 1), gbuffer.ColorSrvCpu(1), heapType);  // t2 normal
+            dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 2), gbuffer.ColorSrvCpu(2), heapType);  // t3 material
+            dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 3), target.ColorSrvCpu, heapType);      // t4 lit scene color
+            dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 4), ibl.IrradianceSrv, heapType);       // t5 sky irradiance
+            dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 5), ibl.PrefilterSrv, heapType);        // t6 sky prefilter
+            dev.Device.CreateUnorderedAccessView(probeAtlas.RenderTarget, null, new UnorderedAccessViewDescription
+            {
+                Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+            }, bindless.Cpu(SpTableBase + 6));                                                                      // u1 probe atlas
+            dev.Device.CreateUnorderedAccessView(indirect.RenderTarget, null, new UnorderedAccessViewDescription
+            {
+                Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+            }, bindless.Cpu(SpTableBase + 7));                                                                      // u2 indirect
+            dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 8), probeAtlasHistory.ColorSrvCpu, heapType); // t13 atlas history
+            dev.Device.CreateUnorderedAccessView(probeAtlasFiltered.RenderTarget, null, new UnorderedAccessViewDescription
+            {
+                Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+            }, bindless.Cpu(SpTableBase + 9));                                                                      // u3 probe atlas FILTERED (blob fix)
+        }
 
         probeAtlas.ColorToUnorderedAccess();
         probeAtlasFiltered.ColorToUnorderedAccess();

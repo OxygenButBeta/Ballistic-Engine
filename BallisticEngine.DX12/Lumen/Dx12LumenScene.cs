@@ -135,14 +135,21 @@ public sealed class Dx12LumenScene : IDisposable
         if (!ctx.Dxr.CheckAvailable("Lumen"))
             return false;
 
+        bool prof = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_PROFILE") == "1";
+        var sw = prof ? System.Diagnostics.Stopwatch.StartNew() : null;
+        void P(string t) { if (prof) { sw.Stop(); Console.WriteLine($"[SceneProf] {t} {sw.Elapsed.TotalMilliseconds:0.00}ms"); sw.Restart(); } }
+
         Dx12SceneAS sceneAS = ctx.Dxr.SceneAS;
         sceneAS.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection);
         if (!sceneAS.Valid)
             return false;
+        P("sceneAS.Ensure");
 
         ctx.GpuDriven.EnsureMaterialTable(ctx.WholeMeshRenderers);
+        P("EnsureMaterialTable");
         Dx12RtGeometry rtGeo = ctx.Dxr.RtGeometry;
         rtGeo.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection, ctx.GpuDriven);
+        P("rtGeo.Ensure");
 
         int objects = rtGeo.InstanceCount;
         // TOPOLOGY stamp (object count + per-instance tri counts only) — a change means the cache layout is stale
@@ -160,9 +167,18 @@ public sealed class Dx12LumenScene : IDisposable
         }
         else
         {
-            // Same topology — just refresh per-instance world matrices in place (cheap; keeps cache + history).
-            RefreshTransforms(sceneAS);
+            // Same topology — refresh per-instance world matrices ONLY if a transform actually changed. PERF: this
+            // was the entire Lumen CPU cost (~17ms on Bistro exterior) — it ran EVERY frame, rebuilding the
+            // instance-meta + world-space card buffers and re-uploading them even on a totally STATIC scene. A
+            // transform stamp skips it when nothing moved → 0ms on a static scene, byte-identical output.
+            int ts = ComputeTransformStamp(sceneAS);
+            if (ts != transformStamp)
+            {
+                transformStamp = ts;
+                RefreshTransforms(sceneAS);
+            }
         }
+        P(s != stamp ? "Rebuild" : "RefreshTransforms");
 
         if (!loggedThisStamp)
         {
@@ -248,6 +264,21 @@ public sealed class Dx12LumenScene : IDisposable
         h.Add(objects);
         for (int i = 0; i < sceneAS.InstanceCount; i++)
             h.Add(sceneAS.InstanceTriangleCount(i));
+        return h.ToHashCode();
+    }
+
+    // PERF: a cheap stamp of all instance WORLD matrices — RefreshTransforms (the ~17ms/frame cost) runs only when
+    // this changes (an instance actually moved). On a static scene it never changes → RefreshTransforms is skipped
+    // entirely. Cheap: a handful of instances on the whole-mesh path (Bistro = 1 instance).
+    int transformStamp = -1;
+    int ComputeTransformStamp(Dx12SceneAS sceneAS)
+    {
+        var h = new HashCode();
+        for (int i = 0; i < sceneAS.InstanceCount; i++)
+        {
+            Matrix4x4 w = sceneAS.InstanceWorld(i);
+            h.Add(w.M11); h.Add(w.M22); h.Add(w.M33); h.Add(w.M41); h.Add(w.M42); h.Add(w.M43);   // scale + translation (enough to catch any move)
+        }
         return h.ToHashCode();
     }
 
