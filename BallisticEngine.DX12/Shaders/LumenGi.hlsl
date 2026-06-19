@@ -313,22 +313,30 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
         //   • depth agreement: RELATIVE tolerance (abs(dz)/depth) so far surfaces aren't falsely rejected on a
         //     zoom-out (the old absolute 0.0015 rejected everything when the camera pulled back → whole-scene dark).
         //   • motion: ease trust down as the surface moves on screen, don't slam it to 0.
+        // TRUST factors — kept DELIBERATELY soft. The earlier per-frame pulse ("parlayıp sönme") came from a
+        // depth-agreement term that wobbled as the camera moved: hist.a is LAST frame's depth, `depth` is this
+        // frame's, so on any camera move the same surface's depth shifts and a tight band made `trust` (hence the
+        // blend weight, hence the brightness) oscillate frame to frame. So:
+        //   • depth band is now WIDE — it only catches a real disocclusion (a totally different surface), ~25%.
+        //   • motion barely lowers trust (the reprojection already handles motion; we don't want a brightness ramp).
+        //   • the PULSE is bounded by the LUMINANCE CLAMP instead (a tight ±band keeps each frame's result close to
+        //     the stable history, so a noisy fresh E can't flash brighter/darker than the converged value).
         float onScreen = (wValid && all(prevUv >= 0.0) && all(prevUv <= 1.0)) ? 1.0 : 0.0;
-        float depthAgree = saturate(1.0 - abs(hist.a - depth) / max(depth * 0.05, 1e-4));   // relative, ~5% band
-        float motionTrust = saturate(1.0 - motionTexels * 0.15);                            // gentle, not a cliff
+        float depthAgree = saturate(1.0 - abs(hist.a - depth) / max(depth * 0.25, 1e-4));   // wide → disocclusion only
+        float motionTrust = saturate(1.0 - motionTexels * 0.04);                            // very gentle
         float trust = onScreen * depthAgree * motionTrust;
 
-        // Luminance clamp the history toward this frame's E (bounds a lighting change so it can't trail).
+        // Luminance clamp: bound the history's brightness to a TIGHT band around this frame's E so neither a noisy
+        // fresh frame nor a stale history can pulse. This is the primary anti-flicker now (not the depth reject).
         float lh = max(dot(hist.rgb, float3(0.2126, 0.7152, 0.0722)), 1e-4);
         float le = dot(E, float3(0.2126, 0.7152, 0.0722));
-        float lClamped = clamp(lh, le * 0.4, le * 2.5 + 1e-3);
+        float lClamped = clamp(lh, le * 0.7, le * 1.5 + 1e-3);
         float3 clampedHist = hist.rgb * (lClamped / lh);
 
-        // Effective this-frame weight: ProbeAlpha when fully trusted, rising to 1 as trust falls (so a real
-        // disocclusion converges fast WITHOUT a hard cut). blendHist = clampedHist scaled by trust so a low-trust
-        // history still contributes a little (keeps the result from collapsing to one dark frame).
+        // Weight: ProbeAlpha when trusted (slow, stable accumulation), easing to 1 only on a real disocclusion.
+        // Low trust falls toward fresh E (not black) so nothing collapses.
         float alpha = lerp(1.0, saturate(ProbeAlpha), trust);
-        float3 histContribution = lerp(E, clampedHist, trust);   // low trust → fall back toward fresh E, not black
+        float3 histContribution = lerp(E, clampedHist, trust);
         outE = lerp(histContribution, E, alpha);
     }
     Indirect[px] = float4(Sanitize(outE), depth);             // store depth in .a for next frame's reject + history copy
