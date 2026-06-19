@@ -55,6 +55,23 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
         // Run until the screenshot frame, render it, save, exit. With no screenshot requested, run a few
         // frames then stop (nothing to present without a swapchain). Query mode also needs a frame or two so
         // the AS-feeding RuntimeSet<IStaticMeshRenderer> is populated before the query runs.
+        // FPS BENCHMARK (BALLISTIC_DX12_FPSBENCH=<frames>): render N frames back-to-back with NO screenshot /
+        // readback (which would force a per-frame GPU drain and hide CPU↔GPU overlap), and print the average
+        // wall-clock frame time + FPS. This is the metric that actually moves with frame overlap
+        // (BALLISTIC_DX12_OVERLAP=1) — a single paused capture can't show it (it must complete one frame). A
+        // warm-up prefix is excluded so first-frame allocation/PSO-warm doesn't skew the average.
+        string fpsBenchEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_FPSBENCH");
+        if (int.TryParse(fpsBenchEnv, out int benchFrames) && benchFrames > 0) {
+            int warm = Math.Min(30, benchFrames / 4);
+            for (int f = 0; f < warm; f++) { WindowUpdateCallback?.Invoke(dt); WindowRenderCallback?.Invoke(dt); }
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int f = 0; f < benchFrames; f++) { WindowUpdateCallback?.Invoke(dt); WindowRenderCallback?.Invoke(dt); }
+            sw.Stop();
+            double msPerFrame = sw.Elapsed.TotalMilliseconds / benchFrames;
+            Console.WriteLine($"[FpsBench] frames={benchFrames} warmup={warm} avgFrameMs={msPerFrame:0.000} fps={1000.0 / msPerFrame:0.0} overlap={(Environment.GetEnvironmentVariable("BALLISTIC_DX12_OVERLAP") == "1" ? "ON" : "off")}");
+            return;
+        }
+
         bool queryMode = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("BALLISTIC_QUERY"));
         int lastFrame = ScreenshotPath is not null ? ScreenshotFrame
             : queryMode ? 3 : 5;
