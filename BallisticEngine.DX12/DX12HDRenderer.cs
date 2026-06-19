@@ -1696,19 +1696,23 @@ public sealed class DX12HDRenderer : HDRenderer
         // it converges instantly, fills shadows with warm bounce, and looks far closer to UE. So SSGI is now THE
         // DEFAULT GI. RayTraced (per-pixel DXR trace, for true off-screen bounce) stays available via the volume
         // GiMode dropdown / BALLISTIC_DX12_RT_GI=1. Env doors still win for the A/B harness. =====
-        // GI DEFAULT = DDGI (RayTraced). Once the DDGI gather pre-exposure was fixed (commit da593c99) the
-        // world-probe radiance cache renders properly — warmer, fuller, and with REAL off-screen colour bleed that
-        // screen-space SSGI structurally can't have. So DDGI is the default; SSGI stays available via
-        // BALLISTIC_DX12_SSGI=1 (it still wins on tiny near-field geometry the probe grid is too sparse to catch).
+        // GI DEFAULT = SSGI (ScreenSpace). DDGI (RayTraced) renders, but on a large CLOSED interior the coarse
+        // probe grid (e.g. SunTemple: ~20 m spacing) places probes OUTSIDE the walls where their trace rays see the
+        // sky → the field carries ~360 raw-HDR units of leaked skylight even with NO light reaching the room, which
+        // the gather's inverse-pre-exposure then blows out to pure white (the "lightless room goes white" bug).
+        // SSGI is screen-space — it bounces only what's actually lit, so it can't invent light. DDGI stays opt-in
+        // (BALLISTIC_DX12_RT_GI=1) until the closed-interior probe leak is fixed.
         GiMode giMode =
               rtgiEnv == "1" ? GiMode.RayTraced
             : ssgiEnv == "1" ? GiMode.ScreenSpace
             : ssgiEnv == "0" ? GiMode.Off
             : doors.Minimal ? GiMode.Off
-            // Volume override honoured when explicitly set; PostFX.GiMode defaults to Off (crash-era), so an
-            // unset/Off resolves to the DDGI (RayTraced) default.
             : PostFX.GiMode != GiMode.Off ? PostFX.GiMode
-            : GiMode.RayTraced;
+            : GiMode.ScreenSpace;
+        // Scenes ship a BakedGlobalIllumination volume that maps to GiMode.RayTraced; rewrite that to ScreenSpace
+        // unless the scene OPTS IN to DDGI via BALLISTIC_DX12_RT_GI=1 (the closed-interior leak above).
+        if (giMode == GiMode.RayTraced && rtgiEnv != "1")
+            giMode = GiMode.ScreenSpace;
         // MASTER GI KILL SWITCH: BALLISTIC_DX12_GI_FORCE=0 forces GI Off (emergency off if a path ever hangs).
         if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_FORCE") == "0")
             giMode = GiMode.Off;
