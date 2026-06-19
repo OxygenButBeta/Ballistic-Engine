@@ -87,8 +87,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     // ---- spatial denoise (edge-aware blur of the per-pixel indirect E) ----
     ID3D12RootSignature denoiseRootSig; // CBV b0 + table{t0-t2 SRV, u0 UAV}
     ID3D12PipelineState denoisePso;
-    ID3D12Resource denoiseCb;
-    unsafe byte* denoiseCbMapped;
+    // (per-pass denoise CBs live in denoiseCbs[]/denoiseCbMappedArr[] — see BuildDenoisePipeline)
     Dx12DescriptorHeap denoiseSrv;      // 4 descriptors (E/depth/normal SRV + filtered UAV)
     Dx12OffscreenTarget indirectFiltered; // full-res filtered E the combine reads
 
@@ -265,16 +264,19 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // effective ~33px footprint. The LAST written buffer is indirectFiltered (the combine reads it).
         // BALLISTIC_DX12_LUMEN_NODENOISE=1 passes through (raw E). ===
         bool denoise = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NODENOISE") != "1" && fx.LumenDenoisePasses > 0;
-        int dnPasses = denoise ? Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_DENOISE_PASSES", fx.LumenDenoisePasses), 1, 5) : 1;
+        int dnPasses = denoise ? Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_DENOISE_PASSES", fx.LumenDenoisePasses), 1, MaxDenoisePasses) : 1;
         Dx12OffscreenTarget src = indirect, dst = indirectFiltered;
+        denoiseSrv.Reset();   // ONCE per frame — each pass takes a DISTINCT 4-descriptor range (no cross-pass alias)
         for (int pass = 0; pass < dnPasses; pass++)
         {
-            *(DenoiseConstants*)denoiseCbMapped = new DenoiseConstants
+            unsafe
             {
-                Texel = new Vector2(1f / indirect.Width, 1f / indirect.Height),
-                Step = denoise ? (1 << pass) : 1f, Enabled = denoise ? 1f : 0f,
-            };
-            denoiseSrv.Reset();
+                *(DenoiseConstants*)denoiseCbMappedArr[pass] = new DenoiseConstants
+                {
+                    Texel = new Vector2(1f / indirect.Width, 1f / indirect.Height),
+                    Step = denoise ? (1 << pass) : 1f, Enabled = denoise ? 1f : 0f,
+                };
+            }
             int db = denoiseSrv.AllocateRange(4);
             dev.Device.CopyDescriptorsSimple(1, denoiseSrv.Cpu(db + 0), src.ColorSrvCpu, heapType);           // t0 E in
             dev.Device.CopyDescriptorsSimple(1, denoiseSrv.Cpu(db + 1), gbuffer.DepthSrvCpu, heapType);       // t1 depth
@@ -284,12 +286,13 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                 Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
             }, denoiseSrv.Cpu(db + 3));                                                                        // u0 E out
             dst.ColorToUnorderedAccess();
+            ulong passCbAddr = denoiseCbs[pass].GPUVirtualAddress;
             dev.ExecuteSync(cl =>
             {
                 cl.SetDescriptorHeaps(denoiseSrv.Heap);
                 cl.SetComputeRootSignature(denoiseRootSig);
                 cl.SetPipelineState(denoisePso);
-                cl.SetComputeRootConstantBufferView(0, denoiseCb.GPUVirtualAddress);
+                cl.SetComputeRootConstantBufferView(0, passCbAddr);
                 cl.SetComputeRootDescriptorTable(1, denoiseSrv.Gpu(db));
                 cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
             });
@@ -602,13 +605,26 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSDenoise", "LumenGi.hlsl");
         denoisePso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription { RootSignature = denoiseRootSig, ComputeShader = cs });
 
+        // PER-PASS CBs (not one shared CB): the denoise runs up to MaxDenoisePasses iterations recorded into ONE
+        // pipelined-frame command list, so a single CB would have every pass read the LAST pass's stride (and a
+        // single 4-descriptor heap Reset per pass would alias every pass's descriptors → only the last survived,
+        // the rest read garbage → the GI went BLACK at passes >= 4). One CB + one 4-descriptor range PER PASS.
         int cbSize = (Marshal.SizeOf<DenoiseConstants>() + 255) & ~255;
-        denoiseCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        denoiseCbMapped = denoiseCb.Map<byte>(0);
+        denoiseCbs = new ID3D12Resource[MaxDenoisePasses];
+        denoiseCbMappedArr = new System.IntPtr[MaxDenoisePasses];
+        for (int i = 0; i < MaxDenoisePasses; i++)
+        {
+            denoiseCbs[i] = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+                ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+            unsafe { denoiseCbMappedArr[i] = (System.IntPtr)denoiseCbs[i].Map<byte>(0); }
+        }
         denoiseSrv = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, MaxDenoisePasses * 4,
+            shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
+    const int MaxDenoisePasses = 5;
+    ID3D12Resource[] denoiseCbs;
+    System.IntPtr[] denoiseCbMappedArr;
 
     // P7 #1b — the indirect E (trace) + the denoise scratch run at HALF render resolution (the dominant cost in
     // the baseline was this geometry-independent full-res trace+denoise floor, ~1.2ms; diffuse indirect is
@@ -648,7 +664,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         scene.Dispose();
         tracePso?.Dispose(); traceRootSig?.Dispose(); traceCb?.Dispose(); sunCb?.Dispose();
         cardPso?.Dispose(); cardRootSig?.Dispose(); cardCb?.Dispose();
-        denoisePso?.Dispose(); denoiseRootSig?.Dispose(); denoiseCb?.Dispose(); denoiseSrv?.Dispose();
+        denoisePso?.Dispose(); denoiseRootSig?.Dispose(); denoiseSrv?.Dispose();
+        if (denoiseCbs != null) foreach (var cb in denoiseCbs) cb?.Dispose();
         combinePso?.Dispose(); combineDebugPso?.Dispose(); combineRootSig?.Dispose(); combineSrv?.Dispose(); combineCb?.Dispose();
         indirect?.Dispose(); indirectFiltered?.Dispose(); probeHistory?.Dispose();
     }
