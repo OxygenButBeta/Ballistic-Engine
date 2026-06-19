@@ -110,6 +110,17 @@ public sealed class Dx12DescriptorHeap : IDisposable {
         return new(gpuStart, Base + index, increment);
     }
 
+    // P0b: a CPU handle at an ABSOLUTE physical descriptor index (NOT slot-local, NOT FrameSlot-rebased).
+    // For one-time setup that must populate EVERY frame slab's copy of a fixed descriptor (e.g. Hi-Z's pyramid
+    // SRV/UAVs, written once at init but read from whichever slab the current FrameSlot selects). Bounds-checked
+    // against the physical heap size. Normal per-frame access uses Cpu()/Gpu() (FrameSlot-rebased).
+    public CpuDescriptorHandle CpuPhysical(int physicalIndex) {
+        if ((uint)physicalIndex >= (uint)(capacity * framesInFlight))
+            throw new InvalidOperationException(
+                $"CpuPhysical out of bounds: {physicalIndex} >= physical size {capacity * framesInFlight}.");
+        return new(cpuStart, physicalIndex, increment);
+    }
+
     void CheckBounds(int index) {
         int offset = Base + index;
         if ((uint)offset >= (uint)(capacity * framesInFlight))

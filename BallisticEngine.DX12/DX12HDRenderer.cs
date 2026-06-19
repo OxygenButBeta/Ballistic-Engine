@@ -127,8 +127,8 @@ public sealed class DX12HDRenderer : HDRenderer
 
     ID3D12RootSignature rtShadowRootSig; // CBV(b0) + table{SRV t0 TLAS, t1 depth, t2 normal; UAV u0 mask}
     ID3D12StateObject rtShadowPso;
-    ID3D12Resource rtShadowSbt, rtShadowCb;
-    unsafe byte* rtShadowCbMapped;
+    ID3D12Resource rtShadowSbt;
+    Dx12FrameCb<RtShadowConstants> rtShadowCb;   // P0b N-buffered
     Dx12OffscreenTarget rtShadowMask; // full-res R8 (1 lit / 0 shadowed), UAV + SRV
     Dx12DescriptorHeap rtShadowHeap; // 4 descriptors (rebuilt per frame)
     bool rtShadowBuilt;
@@ -1830,12 +1830,11 @@ public sealed class DX12HDRenderer : HDRenderer
             (void*)props.GetShaderIdentifier("HitGroup"), idSize);
         rtShadowSbt.Unmap(0);
 
-        int cbSize = (System.Runtime.InteropServices.Marshal.SizeOf<RtShadowConstants>() + 255) & ~255;
-        rtShadowCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        rtShadowCbMapped = rtShadowCb.Map<byte>(0);
+        rtShadowCb = new Dx12FrameCb<RtShadowConstants>(dev);
+        // P0b: per-frame descriptor heap → framesInFlight so Cpu()/Gpu() auto-offset by FrameSlot under overlap.
         rtShadowHeap = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4, shaderVisible: true);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4, shaderVisible: true,
+            framesInFlight: dev.FramesInFlight);
         AllocRtShadowMask();
         return true;
     }
@@ -1866,10 +1865,10 @@ public sealed class DX12HDRenderer : HDRenderer
 
         Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
         Vector3 sun = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
-        *(RtShadowConstants*)rtShadowCbMapped = new RtShadowConstants
+        rtShadowCb.Write(new RtShadowConstants
         {
             InvViewProj = Matrix4x4.Transpose(invVP), SunDir = sun, NormalBias = 0.05f,
-        };
+        });
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         sceneAS.CreateTlasSrv(rtShadowHeap.Cpu(0));
@@ -1887,7 +1886,7 @@ public sealed class DX12HDRenderer : HDRenderer
             cl.SetDescriptorHeaps(rtShadowHeap.Heap);
             cl.SetComputeRootSignature(rtShadowRootSig);
             cl.SetPipelineState1(rtShadowPso);
-            cl.SetComputeRootConstantBufferView(0, rtShadowCb.GPUVirtualAddress);
+            cl.SetComputeRootConstantBufferView(0, rtShadowCb.Gpu);
             cl.SetComputeRootDescriptorTable(1, rtShadowHeap.Gpu(0));
             cl.DispatchRays(new DispatchRaysDescription
             {

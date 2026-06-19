@@ -103,21 +103,28 @@ public sealed class Dx12HiZ : IDisposable {
         pyramid.Name = "HiZPyramid";
         state = ResourceStates.NonPixelShaderResource;
 
+        // P0b: N-buffer the heap so the per-build SrvDepth descriptor copy (Build, every frame) can't be stomped
+        // under frame overlap. The fixed pyramid SRV/UAV descriptors are written into ALL FramesInFlight slabs
+        // (the pyramid resource is one cross-frame buffer; only the slab the descriptors live in differs per
+        // frame). framesInFlight==1 → one slab → byte-identical.
         heap = new Dx12DescriptorHeap(dev, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
-            UavBase + mipCount, shaderVisible: true);
-        // slot 0: all-mips SRV (cull samples this).
-        dev.Device.CreateShaderResourceView(pyramid, new ShaderResourceViewDescription {
-            Format = Format.R32_Float, ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
-            Shader4ComponentMapping = ShaderComponentMapping.Default,
-            Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = (uint)mipCount },
-        }, heap.Cpu(SrvAllMips));
-        // slot 1: depth SRV (filled per build from the G-buffer depth descriptor).
-        // slots 2..: one UAV per mip.
-        for (int mip = 0; mip < mipCount; mip++) {
-            dev.Device.CreateUnorderedAccessView(pyramid, null, new UnorderedAccessViewDescription {
-                Format = Format.R32_Float, ViewDimension = UnorderedAccessViewDimension.Texture2D,
-                Texture2D = new Texture2DUnorderedAccessView { MipSlice = (uint)mip },
-            }, heap.Cpu(UavBase + mip));
+            UavBase + mipCount, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+        for (int slab = 0; slab < dev.FramesInFlight; slab++) {
+            int b = slab * (UavBase + mipCount);   // physical base of this slab (matches Dx12DescriptorHeap.Base)
+            // slot 0: all-mips SRV (cull samples this).
+            dev.Device.CreateShaderResourceView(pyramid, new ShaderResourceViewDescription {
+                Format = Format.R32_Float, ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Texture2D = new Texture2DShaderResourceView { MostDetailedMip = 0, MipLevels = (uint)mipCount },
+            }, heap.CpuPhysical(b + SrvAllMips));
+            // slot 1: depth SRV (filled per build from the G-buffer depth descriptor).
+            // slots 2..: one UAV per mip.
+            for (int mip = 0; mip < mipCount; mip++) {
+                dev.Device.CreateUnorderedAccessView(pyramid, null, new UnorderedAccessViewDescription {
+                    Format = Format.R32_Float, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+                    Texture2D = new Texture2DUnorderedAccessView { MipSlice = (uint)mip },
+                }, heap.CpuPhysical(b + UavBase + mip));
+            }
         }
         return true;
     }
