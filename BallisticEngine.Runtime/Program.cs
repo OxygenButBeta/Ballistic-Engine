@@ -43,6 +43,7 @@ internal class Program {
         bool headlessMode = Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT") is not null
                             || Environment.GetEnvironmentVariable("BALLISTIC_QUERY") is not null
                             || Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_MOTION_DUMP") is not null
+                            || Environment.GetEnvironmentVariable("BALLISTIC_DX12_FPSBENCH") is not null
                             || Environment.GetEnvironmentVariable("BALLISTIC_DX12_RESIZE_STRESS") == "1";
         IBallisticEngineRuntime runtime;
         if (headlessMode) {
