@@ -43,6 +43,7 @@ cbuffer LumenConstants : register(b0) {
     float NormalBias;   float MaxRayDist; float UseCards;   float ScreenSteps;   // bias; world ray length; >0.5 = sample cards on RT hit; screen march
     float SkyIntensity; float UseSky;    float UseScreenTrace; float ScreenRange;   // sky-miss scale; >0.5 sky; >0.5 screen-trace; contact range (m)
     float HistoryValid; float ProbeAlpha; float Pad0; float Pad1;   // #3 probe temporal: history usable?; this-frame EMA weight
+    float4x4 PrevViewProj;   // #3: previous-frame UNJITTERED view*proj (world→prev clip) for camera-robust reprojection
 };
 cbuffer LumenSun : register(b1) {
     float3 SunDir;   float SunBias;       // TO the sun (normalized), world; shadow-ray origin offset
@@ -296,10 +297,15 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
     //      instead of leaving the old bright/dark value to fade out slowly. This is the AABB-clamp TAA uses.
     float3 outE = E;
     [branch] if (HistoryValid > 0.5) {
-        float2 motion = Motion.SampleLevel(LinearClamp, uv, 0).rg;   // prevUV - currUV (UNJITTERED screen delta)
-        float2 prevUv = uv + motion;
+        // REPROJECT this surface to its previous-frame screen position. Compute it DIRECTLY from the world
+        // position via the previous view*proj — this catches a moving SCENE/editor camera even when the motion
+        // vector buffer is zero (the motion buffer only reliably fills for play-mode object motion). prevUv is the
+        // previous-frame UV; the screen delta drives the motion-scaled reject below.
+        float4 prevClip = mul(float4(worldPos, 1.0), PrevViewProj);
+        float2 prevUv = (prevClip.w > 1e-6) ? (prevClip.xy / prevClip.w) * float2(0.5, -0.5) + 0.5 : uv;
+        float2 motion = prevUv - uv;
         float motionTexels = length(motion / max(TexelSize, 1e-6));
-        bool onScreen = all(prevUv >= 0.0) && all(prevUv <= 1.0);
+        bool onScreen = (prevClip.w > 1e-6) && all(prevUv >= 0.0) && all(prevUv <= 1.0);
         // Reprojected history (rgb=accumulated E, a=depth at capture).
         float4 hist = ProbeHistory.SampleLevel(LinearClamp, prevUv, 0);
         bool sameSurface = abs(hist.a - depth) < 0.0015;

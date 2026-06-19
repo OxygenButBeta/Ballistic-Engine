@@ -24,6 +24,7 @@ public sealed class Dx12FrameContext {
     public Matrix4x4 ViewProj            { get; init; }   // JITTERED view*proj
     public Matrix4x4 ProjUnjittered      { get; init; }   // pre-jitter proj (shadow cascade fit is stable)
     public Matrix4x4 ViewProjUnjittered  { get; init; }   // UNJITTERED view*proj (motion vectors / post math)
+    public Matrix4x4 PrevViewProjUnjittered { get; init; } // PREVIOUS frame's UNJITTERED view*proj (Lumen probe reprojection — robust to a moving SCENE camera even when the motion buffer is zero)
     public Vector2   CurrentJitter       { get; init; }   // this frame's sub-pixel jitter (pixels)
     public Vector3   CamPos              { get; init; }
 

@@ -1570,6 +1570,7 @@ public sealed class DX12HDRenderer : HDRenderer
         {
             View = view, Proj = proj, ViewProj = viewProj,
             ProjUnjittered = projUnjittered, ViewProjUnjittered = viewProjUnjittered,
+            PrevViewProjUnjittered = viewProjPrevForMotion,   // #3 Lumen probe reprojection (camera-motion-robust)
             CurrentJitter = currentJitter, CamPos = camPos,
             LightDir = lightDir, LightColor = lightColor, Ambient = ambient, Exposure = exposure,
             WholeMeshRenderers = wholeMeshRenderers, FrustumPlanes = frustumPlanes,

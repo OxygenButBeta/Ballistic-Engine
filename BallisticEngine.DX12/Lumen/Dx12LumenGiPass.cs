@@ -116,6 +116,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public float NormalBias; public float MaxRayDist; public float UseCards; public float ScreenSteps;
         public float SkyIntensity; public float UseSky; public float UseScreenTrace; public float ScreenRange;
         public float HistoryValid; public float ProbeAlpha; public float Pad0; public float Pad1;   // #3 probe temporal
+        public Matrix4x4 PrevViewProj;   // #3: previous-frame UNJITTERED view*proj — camera-motion-robust probe reprojection
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -200,6 +201,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             // accumulated result is the CLEAN one we want to measure, not a single noisy frame).
             HistoryValid = probeHistoryValid ? 1f : 0f,
             ProbeAlpha = EnvF("BALLISTIC_DX12_LUMEN_PROBE_ALPHA", 0.1f),
+            PrevViewProj = Matrix4x4.Transpose(ctx.PrevViewProjUnjittered),   // world → prev clip (HLSL column-major)
         };
         *(LumenSun*)sunCbMapped = new LumenSun
         {
