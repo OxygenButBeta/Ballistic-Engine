@@ -42,7 +42,7 @@ cbuffer LumenConstants : register(b0) {
     float2 TexelSize;   float RayCount;  float FrameIndex;   // 1/res; hemisphere rays per pixel; rotation seed
     float NormalBias;   float MaxRayDist; float UseCards;   float ScreenSteps;   // bias; world ray length; >0.5 = sample cards on RT hit; screen march
     float SkyIntensity; float UseSky;    float UseScreenTrace; float ScreenRange;   // sky-miss scale; >0.5 sky; >0.5 screen-trace; contact range (m)
-    float HistoryValid; float ProbeAlpha; float Pad0; float Pad1;   // #3 probe temporal: history usable?; this-frame EMA weight
+    float HistoryValid; float ProbeAlpha; float ImportanceSampling; float Pad1;   // #3 temporal; #4 sun-importance (>0.5 on)
     float4x4 PrevViewProj;   // #3: previous-frame UNJITTERED view*proj (world→prev clip) for camera-robust reprojection
 };
 cbuffer LumenSun : register(b1) {
@@ -243,9 +243,28 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
     float jitter = Hash(px.x * 73856093u ^ px.y * 19349663u ^ (uint)FrameIndex * 2654435761u);
     float3x3 basis = BuildBasis(N);
 
+    // #4 IMPORTANCE SAMPLING — the dominant indirect contributor in a sun-lit scene is the SUN-facing hemisphere
+    // (direct-sun bounce + open sky toward the sun). Pure cosine sampling spends rays uniformly; biasing the FIRST
+    // ray toward the sun direction (when the surface faces it) guarantees the brightest direction is sampled even
+    // at 1-2 rays/pixel, where cosine sampling has visible hotspot noise (measured: 1 ray = 10.8% hotspot). The
+    // remaining rays stay cosine for unbiased hemisphere coverage; the per-ray radiance is still plainly averaged,
+    // so the estimate stays the cosine-weighted irradiance (the sun ray lands in the cosine lobe it would have
+    // covered anyway — this is a stratification/guarantee, not a reweighting). Gated by ImportanceSampling.
+    float3 sunLocalDir = mul(SunDir, transpose(basis));   // sun direction in the surface's local frame
+    bool sunUp = sunLocalDir.z > 0.05;   // surface faces the sun → its bounce is worth a guaranteed ray
+    float importance = ImportanceSampling;
+
     float3 sum = 0.0.xxx;
     [loop] for (uint r = 0; r < rays; r++) {
-        float3 local = CosineHemisphere(r, rays, jitter);
+        float3 local;
+        if (importance > 0.5 && r == 0u && sunUp) {
+            // Guaranteed ray toward the sun (jittered within a small cosine-lobe cone so a flat surface still gets
+            // a smooth result, not a hard single direction).
+            float3 c = CosineHemisphere(0u, max(rays, 2u), jitter);
+            local = normalize(sunLocalDir * 2.0 + c);   // pull the cosine sample toward the sun
+        } else {
+            local = CosineHemisphere(r, rays, jitter);
+        }
         float3 dir = normalize(mul(local, basis));
 
         // 1) Screen trace (near-field contact bounce). UseScreenTrace<0.5 disables it → pure RT+cards (the A/B

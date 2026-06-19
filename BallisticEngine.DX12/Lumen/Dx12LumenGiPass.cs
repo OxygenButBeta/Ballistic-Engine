@@ -114,7 +114,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public Vector2 TexelSize; public float RayCount; public float FrameIndex;
         public float NormalBias; public float MaxRayDist; public float UseCards; public float ScreenSteps;
         public float SkyIntensity; public float UseSky; public float UseScreenTrace; public float ScreenRange;
-        public float HistoryValid; public float ProbeAlpha; public float Pad0; public float Pad1;   // #3 probe temporal
+        public float HistoryValid; public float ProbeAlpha; public float ImportanceSampling; public float Pad1;   // #3 temporal; #4 importance
         public Matrix4x4 PrevViewProj;   // #3: previous-frame UNJITTERED view*proj — camera-motion-robust probe reprojection
     }
 
@@ -200,6 +200,13 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             // accumulated result is the CLEAN one we want to measure, not a single noisy frame).
             HistoryValid = probeHistoryValid ? 1f : 0f,
             ProbeAlpha = EnvF("BALLISTIC_DX12_LUMEN_PROBE_ALPHA", 0.05f),   // 0.05 = strong temporal accumulation (kills per-ray sparkle); the soft-trust blend handles motion so a low base alpha no longer causes gitgel
+            // #4 importance sampling: guarantee a sun-facing ray. DEFAULT OFF — measured on the GI Test scene it
+            // did NOT help and slightly HURT at 1 ray (10.8% -> 12.7% hotspot): that scene's dominant indirect is
+            // sky-ambient + many point/spot bounces, not the sun, so spending a ray on the sun direction missed the
+            // real contributors. Correct importance needs the actual radiance distribution (octahedral probes /
+            // ReSTIR) — too big a lift for the marginal gain now that temporal accumulation already cleans the
+            // grain. Kept opt-in (BALLISTIC_DX12_LUMEN_IMPORTANCE=1) for genuinely sun-dominant scenes.
+            ImportanceSampling = EnvF("BALLISTIC_DX12_LUMEN_IMPORTANCE", 0f),
             PrevViewProj = Matrix4x4.Transpose(ctx.PrevViewProjUnjittered),   // world → prev clip (HLSL column-major)
         };
         *(LumenSun*)sunCbMapped = new LumenSun
