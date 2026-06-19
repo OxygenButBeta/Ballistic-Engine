@@ -266,6 +266,9 @@ public sealed class DX12HDRenderer : HDRenderer
     unsafe byte* shadowCbMapped;
     int shadowCbSlotSize, shadowCbSlotCount;
     readonly Matrix4x4[] cascadeMatrices = new Matrix4x4[MaxCascades];
+    // P4: reused across shadow re-renders (was a per-call `new List` → GC churn). Cleared at the top of RenderShadows.
+    readonly System.Collections.Generic.List<(int cascade, Dx12Buffer<GLVector3> vb, Dx12IndexBuffer ib, int start,
+        int count, int cbSlot)> shadowFills = new(256);
     readonly float[] cascadeDepthRanges = new float[MaxCascades];
     bool shadowsThisFrame;
 
@@ -2024,11 +2027,11 @@ public sealed class DX12HDRenderer : HDRenderer
         for (int c = 0; c < activeCascadeCount; c++) lastCascadeMatrices[c] = cascadeMatrices[c];
         shadowMapEverRendered = true;
 
-        // Fill per (cascade, submesh) LightMvp constants, mirroring the opaque iteration.
+        // Fill per (cascade, submesh) LightMvp constants, mirroring the opaque iteration. P4: reuse a
+        // pre-allocated list across frames (the old per-call `new List` churned the GC every shadow re-render).
         int slot = 0;
-        var fills =
-            new System.Collections.Generic.List<(int cascade, Dx12Buffer<GLVector3> vb, Dx12IndexBuffer ib, int start,
-                int count, int cbSlot)>();
+        var fills = shadowFills;
+        fills.Clear();
         for (int c = 0; c < activeCascadeCount; c++)
         {
             // Cull shadow casters against THIS cascade's light frustum (a caster off-screen for the camera
