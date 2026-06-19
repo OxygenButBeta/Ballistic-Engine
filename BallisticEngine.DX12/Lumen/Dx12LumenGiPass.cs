@@ -138,6 +138,49 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public uint FrameIndex; public uint UpdateStride; public uint ForceFull; public uint Pad0;   // P7 #1
     }
 
+    // ---- Sıra 1: SCREEN-SPACE RADIANCE PROBES (LumenScreenProbe.hlsl) ----
+    // A sparse grid of radiance probes (one per ProbeStride×ProbeStride screen tile) replaces the per-pixel trace
+    // as the GI front end: far fewer trace points + more rays each → lower variance AND lower cost (the published
+    // Lumen final-gather). Three compute passes (place → trace → integrate) write the SAME full-res `indirect`
+    // irradiance E buffer the per-pixel CSTrace did, so the downstream probe-temporal + denoise + combine chain is
+    // untouched. Gated behind BALLISTIC_DX12_LUMEN_SCREENPROBE ("1" force on, "0" force off, unset → default).
+    ID3D12RootSignature spRootSig;       // HeapDirectlyIndexed; CBV b0/b1 + root SRV t0 TLAS + table{t1-t6, u1 atlas} + root SRV t7-t12 + root UAV u0 headers / u2 indirect + s0/s1
+    ID3D12PipelineState spPlacePso, spTracePso, spIntegratePso;
+    ID3D12Resource spProbeCb, spSunCb;
+    unsafe byte* spProbeCbMapped, spSunCbMapped;
+    ID3D12Resource probeHeaders;         // StructuredBuffer<ProbeHeader> (root UAV u0) — sized ProbesX*ProbesY
+    Dx12OffscreenTarget probeAtlas;      // octahedral radiance atlas, (ProbesX*OctSize) × (ProbesY*OctSize), RGBA16F UAV
+    Dx12DescriptorHeap spSrv;            // per-frame: 6 SRV (t1-t6) + 1 UAV (u1 atlas)
+    int probeStride = 16, octSize = 8;
+    int probesX, probesY, probeHeaderCount;
+    const int SpTableBase = Dx12BindlessTail.LumenScreenProbeTableBase;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct ProbeConstants
+    {
+        public Matrix4x4 InvViewProj;
+        public Matrix4x4 ViewProj;
+        public Vector3 CameraPos; public float Intensity;
+        public Vector2 FullTexel; public float RayCount; public float FrameIndex;
+        public float NormalBias; public float MaxRayDist; public float UseCards; public float ScreenSteps;
+        public float SkyIntensity; public float UseSky; public float UseScreenTrace; public float ScreenRange;
+        public float FalloffDist; public float ProbeTile; public float ProbeStride; public float OctSize;
+        public uint ProbesX; public uint ProbesY; public uint FullW; public uint FullH;
+    }
+
+    static int spEnvDoor = -2;   // -2 unread, -1 unset(default), 0 force-off, 1 force-on
+    bool WantScreenProbe()
+    {
+        if (spEnvDoor == -2)
+        {
+            string v = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_SCREENPROBE");
+            spEnvDoor = v == "1" ? 1 : v == "0" ? 0 : -1;
+        }
+        return spEnvDoor == 1 || (spEnvDoor == -1 && ScreenProbeDefaultOn);
+    }
+    // Flip to true once the A/B proves screen probes are >= the per-pixel trace (per the work plan).
+    const bool ScreenProbeDefaultOn = false;
+
     int frameCounter;
 
     // P7 #1 update-budget dirty tracking: the sun dir/color + light count the cache was last FULLY relit with.
@@ -246,23 +289,31 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         probeHistory.ColorToShaderResource();   // #3: the trace reads last frame's accumulated probes (table t14)
         indirect.ColorToUnorderedAccess();
 
-        dev.ExecuteSync(cl =>
+        if (WantScreenProbe())
         {
-            cl.SetDescriptorHeaps(bindless.Heap);
-            cl.SetComputeRootSignature(traceRootSig);
-            cl.SetPipelineState(tracePso);
-            cl.SetComputeRootConstantBufferView(0, traceCb.GPUVirtualAddress);
-            cl.SetComputeRootConstantBufferView(1, sunCb.GPUVirtualAddress);
-            cl.SetComputeRootShaderResourceView(2, sceneAS.TlasAddress);                  // t0 TLAS (root SRV)
-            cl.SetComputeRootDescriptorTable(3, bindless.Gpu(LumenTableBase));            // t1-t6 + u0
-            cl.SetComputeRootShaderResourceView(4, ctx.GpuDriven.MaterialsGpuAddress);    // t7 GpuMaterials
-            cl.SetComputeRootShaderResourceView(5, rtGeo.InstancesGpuAddress);            // t8 RtInstance[]
-            cl.SetComputeRootShaderResourceView(6, clusteredLights.LightBufGpuAddress);   // t9 punctual lights
-            cl.SetComputeRootShaderResourceView(7, scene.CardRadianceWriteGpu);           // t10 CardRadiance (this frame's stable cache)
-            cl.SetComputeRootShaderResourceView(8, scene.InstanceMetaGpuAddress);         // t11 InstanceMeta
-            cl.SetComputeRootShaderResourceView(9, scene.TriToClusterGpuAddress);         // t12 TriToCluster (#2A)
-            cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
-        });
+            // Sıra 1: SCREEN-PROBE front end fills `indirect` (place → trace → integrate). Same E contract.
+            TraceScreenProbe(ctx, sceneAS, rtGeo, clusteredLights, intensity, maxDist, skyIntensity, useSky, useCards);
+        }
+        else
+        {
+            dev.ExecuteSync(cl =>
+            {
+                cl.SetDescriptorHeaps(bindless.Heap);
+                cl.SetComputeRootSignature(traceRootSig);
+                cl.SetPipelineState(tracePso);
+                cl.SetComputeRootConstantBufferView(0, traceCb.GPUVirtualAddress);
+                cl.SetComputeRootConstantBufferView(1, sunCb.GPUVirtualAddress);
+                cl.SetComputeRootShaderResourceView(2, sceneAS.TlasAddress);                  // t0 TLAS (root SRV)
+                cl.SetComputeRootDescriptorTable(3, bindless.Gpu(LumenTableBase));            // t1-t6 + u0
+                cl.SetComputeRootShaderResourceView(4, ctx.GpuDriven.MaterialsGpuAddress);    // t7 GpuMaterials
+                cl.SetComputeRootShaderResourceView(5, rtGeo.InstancesGpuAddress);            // t8 RtInstance[]
+                cl.SetComputeRootShaderResourceView(6, clusteredLights.LightBufGpuAddress);   // t9 punctual lights
+                cl.SetComputeRootShaderResourceView(7, scene.CardRadianceWriteGpu);           // t10 CardRadiance (this frame's stable cache)
+                cl.SetComputeRootShaderResourceView(8, scene.InstanceMetaGpuAddress);         // t11 InstanceMeta
+                cl.SetComputeRootShaderResourceView(9, scene.TriToClusterGpuAddress);         // t12 TriToCluster (#2A)
+                cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
+            });
+        }
         indirect.ColorToShaderResource();
 
         // #3: snapshot this frame's accumulated probes (indirect, with depth in .a) into the history for next
@@ -456,6 +507,114 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         scene.SetState(cardR, ResourceStates.NonPixelShaderResource);
     }
 
+    // Sıra 1 — SCREEN-PROBE front end. Fills `indirect` (full-res E) via place → trace → integrate, replacing the
+    // per-pixel CSTrace. Reuses the trace CB's already-set dials (intensity/dist/sky/cards passed in). The G-buffer
+    // + scene color + probeHistory are already promoted to SRV by the caller; `indirect` is already UAV.
+    unsafe void TraceScreenProbe(Dx12FrameContext ctx, Dx12SceneAS sceneAS, Dx12RtGeometry rtGeo,
+                                 Dx12ClusteredLights clusteredLights, float intensity, float maxDist,
+                                 float skyIntensity, bool useSky, bool useCards)
+    {
+        var gbuffer = ctx.GBuffer;
+        var ibl = ctx.Ibl;
+        var target = ctx.SceneColor;
+        Matrix4x4.Invert(ctx.ViewProj, out Matrix4x4 invVP);
+        Vector3 sunDirN = ctx.LightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(ctx.LightDir);
+
+        *(ProbeConstants*)spProbeCbMapped = new ProbeConstants
+        {
+            InvViewProj = Matrix4x4.Transpose(invVP),
+            ViewProj = Matrix4x4.Transpose(ctx.ViewProj),
+            CameraPos = ctx.CamPos, Intensity = intensity,
+            FullTexel = new Vector2(1f / indirect.Width, 1f / indirect.Height),
+            RayCount = octSize * octSize, FrameIndex = ctx.DeterministicCapture ? 0f : frameCounter,
+            NormalBias = 0.03f, MaxRayDist = maxDist, UseCards = useCards ? 1f : 0f, ScreenSteps = 16f,
+            SkyIntensity = skyIntensity, UseSky = useSky ? 1f : 0f,
+            UseScreenTrace = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOSCREEN") == "1" ? 0f : 1f,
+            ScreenRange = EnvF("BALLISTIC_DX12_LUMEN_SCREEN_RANGE", 1.5f),
+            FalloffDist = EnvF("BALLISTIC_DX12_LUMEN_FALLOFF", 12f),
+            ProbeTile = 0f, ProbeStride = probeStride, OctSize = octSize,
+            ProbesX = (uint)probesX, ProbesY = (uint)probesY,
+            FullW = (uint)indirect.Width, FullH = (uint)indirect.Height,
+        };
+        *(LumenSun*)spSunCbMapped = new LumenSun
+        {
+            SunDir = sunDirN, SunBias = 0.03f, SunColor = ctx.LightColor, LightCount = clusteredLights.LightCount,
+        };
+
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        Dx12DescriptorHeap bindless = Dx12Backend.BindlessHeap;
+        // Table t1-t6 SRV + u1 atlas UAV in the screen-probe reserved tail.
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 0), gbuffer.DepthSrvCpu, heapType);     // t1 depth
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 1), gbuffer.ColorSrvCpu(1), heapType);  // t2 normal
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 2), gbuffer.ColorSrvCpu(2), heapType);  // t3 material
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 3), target.ColorSrvCpu, heapType);      // t4 lit scene color
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 4), ibl.IrradianceSrv, heapType);       // t5 sky irradiance
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 5), ibl.PrefilterSrv, heapType);        // t6 sky prefilter
+        dev.Device.CreateUnorderedAccessView(probeAtlas.RenderTarget, null, new UnorderedAccessViewDescription
+        {
+            Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+        }, bindless.Cpu(SpTableBase + 6));                                                                      // u1 probe atlas
+
+        probeAtlas.ColorToUnorderedAccess();
+
+        void SetCommonRoots(ID3D12GraphicsCommandList cl)
+        {
+            cl.SetComputeRootConstantBufferView(0, spProbeCb.GPUVirtualAddress);
+            cl.SetComputeRootConstantBufferView(1, spSunCb.GPUVirtualAddress);
+            cl.SetComputeRootShaderResourceView(2, sceneAS.TlasAddress);                  // t0 TLAS (root SRV)
+            cl.SetComputeRootDescriptorTable(3, bindless.Gpu(SpTableBase));               // t1-t6 + u1 atlas
+            cl.SetComputeRootShaderResourceView(4, ctx.GpuDriven.MaterialsGpuAddress);    // t7 GpuMaterials
+            cl.SetComputeRootShaderResourceView(5, rtGeo.InstancesGpuAddress);            // t8 RtInstance[]
+            cl.SetComputeRootShaderResourceView(6, clusteredLights.LightBufGpuAddress);   // t9 lights
+            cl.SetComputeRootShaderResourceView(7, scene.CardRadianceWriteGpu);           // t10 CardRadiance
+            cl.SetComputeRootShaderResourceView(8, scene.InstanceMetaGpuAddress);         // t11 InstanceMeta
+            cl.SetComputeRootShaderResourceView(9, scene.TriToClusterGpuAddress);         // t12 TriToCluster
+            cl.SetComputeRootUnorderedAccessView(10, probeHeaders.GPUVirtualAddress);     // u0 ProbeHeaders (root UAV — buffer)
+        }
+
+        // u2 Indirect: a Texture2D UAV can't be a root UAV (root UAVs are buffers only). Bind it via a small
+        // per-frame descriptor in the screen-probe SRV heap instead, as a table at root slot 11.
+        spSrv.Reset();
+        int sb = spSrv.AllocateRange(1);
+        dev.Device.CreateUnorderedAccessView(indirect.RenderTarget, null, new UnorderedAccessViewDescription
+        {
+            Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+        }, spSrv.Cpu(sb));
+
+        dev.ExecuteSync(cl =>
+        {
+            cl.SetDescriptorHeaps(bindless.Heap);
+            cl.SetComputeRootSignature(spRootSig);
+            // PLACE
+            cl.SetPipelineState(spPlacePso);
+            SetCommonRoots(cl);
+            cl.SetComputeRootDescriptorTable(11, spSrv.Gpu(sb));                          // u2 indirect (table slot 11)                          // u2 indirect (table)
+            cl.Dispatch((uint)((probesX + 7) / 8), (uint)((probesY + 7) / 8), 1);
+        });
+        // PLACE writes probeHeaders (root UAV) — a UAV barrier suffices before the trace reads it. The next
+        // ExecuteSync's submit/WaitForGpu already serialises GPU work, so no explicit barrier needed.
+        dev.ExecuteSync(cl =>
+        {
+            cl.SetDescriptorHeaps(bindless.Heap);
+            cl.SetComputeRootSignature(spRootSig);
+            cl.SetPipelineState(spTracePso);
+            SetCommonRoots(cl);
+            cl.SetComputeRootDescriptorTable(11, spSrv.Gpu(sb));                          // u2 indirect (table slot 11)
+            cl.Dispatch((uint)((probesX * octSize + 7) / 8), (uint)((probesY * octSize + 7) / 8), 1);
+        });
+        probeAtlas.ColorToShaderResource();   // integrate reads the atlas as a UAV — keep UAV; transition not needed (still UAV)
+        probeAtlas.ColorToUnorderedAccess();
+        dev.ExecuteSync(cl =>
+        {
+            cl.SetDescriptorHeaps(bindless.Heap);
+            cl.SetComputeRootSignature(spRootSig);
+            cl.SetPipelineState(spIntegratePso);
+            SetCommonRoots(cl);
+            cl.SetComputeRootDescriptorTable(11, spSrv.Gpu(sb));                          // u2 indirect (table slot 11)
+            cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
+        });
+    }
+
     static float EnvF(string name, float fallback) =>
         float.TryParse(Environment.GetEnvironmentVariable(name), System.Globalization.CultureInfo.InvariantCulture,
             out float v) ? v : fallback;
@@ -640,7 +799,80 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         denoiseSrv = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, MaxDenoisePasses * 4,
             shaderVisible: true, framesInFlight: dev.FramesInFlight);
+
+        BuildScreenProbePipeline();
     }
+
+    // Sıra 1 — screen-probe root sig (mirrors the GI trace) + 3 PSOs (place/trace/integrate) + CBs + a 1-descriptor
+    // per-frame heap for the u2 indirect Texture2D UAV (root UAVs are buffers only, so the texture UAV is a table).
+    unsafe void BuildScreenProbePipeline()
+    {
+        var cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var cbv1 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.All);
+        var tlasSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.All);   // t0 TLAS
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 6, baseShaderRegister: 1);   // t1-t6
+        var atlasUav = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 1,
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 6);   // u1 atlas (after the 6 SRVs)
+        var table = new RootParameter1(new RootDescriptorTable1(srvRange, atlasUav), ShaderVisibility.All);
+        var matSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All);
+        var instSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(8, 0), ShaderVisibility.All);
+        var lightSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(9, 0), ShaderVisibility.All);
+        var cardSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(10, 0), ShaderVisibility.All);
+        var metaSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(11, 0), ShaderVisibility.All);
+        var triClusterSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(12, 0), ShaderVisibility.All);
+        var headerUav = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(0, 0), ShaderVisibility.All);   // u0 ProbeHeaders (root UAV, buffer)
+        var indirectUavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 2);   // u2 indirect (table)
+        var indirectTable = new RootParameter1(new RootDescriptorTable1(indirectUavRange), ShaderVisibility.All);
+        var clampSamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
+        {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        var wrapSamp = new StaticSamplerDescription(ShaderVisibility.All, 1, 0)
+        {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap,
+            AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        // Roots: 0 cbv0, 1 cbv1, 2 t0 TLAS, 3 table{t1-t6,u1}, 4-9 t7-t12, 10 u0 headers, 11 table{u2 indirect}.
+        spRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(
+                RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
+                new[] { cbv0, cbv1, tlasSrv, table, matSrv, instSrv, lightSrv, cardSrv, metaSrv, triClusterSrv, headerUav, indirectTable },
+                new[] { clampSamp, wrapSamp })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumenScreenProbe.hlsl");
+        spPlacePso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription
+        {
+            RootSignature = spRootSig,
+            ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSPlace", "LumenScreenProbe.hlsl"),
+        });
+        spTracePso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription
+        {
+            RootSignature = spRootSig,
+            ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSProbeTrace", "LumenScreenProbe.hlsl"),
+        });
+        spIntegratePso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription
+        {
+            RootSignature = spRootSig,
+            ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSIntegrate", "LumenScreenProbe.hlsl"),
+        });
+
+        int pcSize = (Marshal.SizeOf<ProbeConstants>() + 255) & ~255;
+        spProbeCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)pcSize), ResourceStates.GenericRead);
+        spProbeCbMapped = spProbeCb.Map<byte>(0);
+        int snSize = (Marshal.SizeOf<LumenSun>() + 255) & ~255;
+        spSunCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)snSize), ResourceStates.GenericRead);
+        spSunCbMapped = spSunCb.Map<byte>(0);
+
+        spSrv = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4,
+            shaderVisible: true, framesInFlight: dev.FramesInFlight);
+    }
+
     const int MaxDenoisePasses = 5;
     ID3D12Resource[] denoiseCbs;
     System.IntPtr[] denoiseCbMappedArr;
@@ -676,6 +908,22 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         probeHistory = new Dx12OffscreenTarget(dev, lw, lh, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
         probeHistoryValid = false;   // a resized history is stale → first frame takes the raw E (alpha=1)
+
+        // Sıra 1 — screen-probe grid + octahedral atlas, sized off the `indirect` resolution (the GI front-end
+        // resolution). One probe per probeStride×probeStride tile; each probe holds an octSize×octSize oct tile.
+        probeStride = Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_PROBE_STRIDE", 16f), 4, 64);
+        octSize = Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_PROBE_OCT", 8f), 4, 16);
+        probesX = (lw + probeStride - 1) / probeStride;
+        probesY = (lh + probeStride - 1) / probeStride;
+        probeHeaderCount = Math.Max(probesX * probesY, 1);
+        probeHeaders?.Dispose();
+        // ProbeHeader = 2× float4 = 32 bytes. UAV structured buffer (root UAV).
+        probeHeaders = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)(probeHeaderCount * 32), ResourceFlags.AllowUnorderedAccess),
+            ResourceStates.UnorderedAccess);
+        probeAtlas?.Dispose();
+        probeAtlas = new Dx12OffscreenTarget(dev, Math.Max(probesX * octSize, 1), Math.Max(probesY * octSize, 1),
+            withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
     }
 
     public void Dispose()
@@ -687,5 +935,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         if (denoiseCbs != null) foreach (var cb in denoiseCbs) cb?.Dispose();
         combinePso?.Dispose(); combineDebugPso?.Dispose(); combineRootSig?.Dispose(); combineSrv?.Dispose(); combineCb?.Dispose();
         indirect?.Dispose(); indirectFiltered?.Dispose(); probeHistory?.Dispose();
+        spPlacePso?.Dispose(); spTracePso?.Dispose(); spIntegratePso?.Dispose(); spRootSig?.Dispose();
+        spProbeCb?.Dispose(); spSunCb?.Dispose(); spSrv?.Dispose();
+        probeHeaders?.Dispose(); probeAtlas?.Dispose();
     }
 }

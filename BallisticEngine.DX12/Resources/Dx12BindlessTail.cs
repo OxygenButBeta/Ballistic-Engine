@@ -23,12 +23,20 @@ internal static class Dx12BindlessTail
     public const int LumenCardUsed = 1;
     public const int LumenCardTableBase = LumenTableBase - LumenCardReserved;
 
-    public const int TailStart = LumenCardTableBase;
+    // Lumen V2 Sıra 1 — SCREEN-PROBE trace table (its own tail below the card tail). The probe trace mirrors the
+    // GI trace's binding shape: t1 depth, t2 normal, t3 material, t4 lit scene color, t5 sky irradiance, t6 sky
+    // prefilter (6 SRV) + u1 probe atlas UAV (u0 ProbeHeaders + u2 Indirect are ROOT UAVs). 9 reserved for slack.
+    const int LumenScreenProbeReserved = 12;
+    public const int LumenScreenProbeUsed = 7;   // t1-t6 SRV + u1 atlas UAV
+    public const int LumenScreenProbeTableBase = LumenCardTableBase - LumenScreenProbeReserved;
+
+    public const int TailStart = LumenScreenProbeTableBase;
 
     const int A_RtReflFits = 1 / (RtReflUsed <= RtReflReserved ? 1 : 0);
     const int A_LumenFits = 1 / (LumenUsed <= LumenReserved ? 1 : 0);
     const int A_LumenCardFits = 1 / (LumenCardUsed <= LumenCardReserved ? 1 : 0);
+    const int A_LumenScreenProbeFits = 1 / (LumenScreenProbeUsed <= LumenScreenProbeReserved ? 1 : 0);
     const int A_TailStartPositive = 1 / (TailStart > 0 ? 1 : 0);
 
-    static Dx12BindlessTail() => _ = A_RtReflFits + A_LumenFits + A_LumenCardFits + A_TailStartPositive;
+    static Dx12BindlessTail() => _ = A_RtReflFits + A_LumenFits + A_LumenCardFits + A_LumenScreenProbeFits + A_TailStartPositive;
 }
