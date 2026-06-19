@@ -278,7 +278,7 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
                 cpuFrameMs = rs.CpuFrameMs,
                 gpuFrameMs = rs.GpuFrameMs,
                 gpuPasses = rs.GpuPasses.Select(p => new { name = p.Name, ms = p.Ms }).ToArray(),
-                note = rs.GpuPasses.Count == 0 ? "per-pass GPU timestamp queries not yet wired on DX12 (renderer follow-up); cpuFrameMs + counters are live" : null,
+                note = rs.GpuPasses.Count == 0 ? "per-pass GPU timing off (set BALLISTIC_DX12_PASS_TIMING=1); cpuFrameMs + counters are live" : null,
             };
             System.IO.File.WriteAllText(statsOut,
                 System.Text.Json.JsonSerializer.Serialize(payload,

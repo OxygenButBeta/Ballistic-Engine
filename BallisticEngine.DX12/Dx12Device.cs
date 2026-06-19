@@ -364,6 +364,60 @@ public sealed class Dx12Device : IDisposable {
         }
     }
 
+    // ---- REAL GPU TIMESTAMP TIMING (opt-in, BALLISTIC_DX12_PASS_TIMING) ----
+    // The CPU-Stopwatch pass timer measures submit + fence-wait + GPU; this gives the GPU's OWN execution time by
+    // writing a timestamp into the queue before and after a pass's submits and resolving the tick delta. A pass is
+    // bracketed by GpuTimerBegin()/GpuTimerEnd(): each issues a tiny timestamp-only submit, so the markers sit in
+    // queue order around all of the pass's ExecuteSync submits (the queue is serial). Used only in timing mode
+    // (where the pipelined frame is already disabled — every pass is its own submit), so the extra marker submits
+    // never perturb the shipping frame path. Falls back (returns -1) if the queue doesn't support timestamps.
+    ID3D12QueryHeap tsHeap;
+    ID3D12Resource tsReadback;
+    ulong tsFrequency;
+    bool tsInit, tsAvail;
+    const int TsSlots = 2;   // [0]=begin, [1]=end
+    void EnsureTimestampHeap() {
+        if (tsInit) return;
+        tsInit = true;
+        try {
+            Queue.GetTimestampFrequency(out tsFrequency);   // ticks per second on this queue
+            tsHeap = Device.CreateQueryHeap<ID3D12QueryHeap>(new QueryHeapDescription(QueryHeapType.Timestamp, TsSlots));
+            tsReadback = Device.CreateCommittedResource(HeapProperties.ReadbackHeapProperties, HeapFlags.None,
+                ResourceDescription.Buffer((ulong)(TsSlots * sizeof(ulong))), ResourceStates.CopyDest);
+            tsAvail = tsFrequency > 0;
+        } catch { tsAvail = false; }   // timestamps unsupported on this queue → caller keeps the CPU stopwatch
+    }
+    void WriteTimestampMarker(int slot) {
+        lock (submitGate) {
+            allocator.Reset();
+            commandList.Reset(allocator, null);
+            commandList.EndQuery(tsHeap, QueryType.Timestamp, (uint)slot);   // EndQuery writes a timestamp query
+            commandList.Close();
+            Queue.ExecuteCommandList(commandList);
+            WaitForGpu();   // timing mode is synchronous anyway; this keeps the marker ordered before/after the pass
+        }
+    }
+    // True iff GPU timestamps are usable; gates the renderer's GPU-timed path.
+    public bool GpuTimerAvailable { get { EnsureTimestampHeap(); return tsAvail; } }
+    public void GpuTimerBegin() { if (GpuTimerAvailable) WriteTimestampMarker(0); }
+    // End the span and return its GPU-side duration in ms (-1 if unavailable).
+    public unsafe double GpuTimerEnd() {
+        if (!tsAvail) return -1.0;
+        WriteTimestampMarker(1);
+        lock (submitGate) {
+            allocator.Reset();
+            commandList.Reset(allocator, null);
+            commandList.ResolveQueryData(tsHeap, QueryType.Timestamp, 0, (uint)TsSlots, tsReadback, 0);
+            commandList.Close();
+            Queue.ExecuteCommandList(commandList);
+            WaitForGpu();
+            ulong* t = tsReadback.Map<ulong>(0);
+            ulong begin = t[0], end = t[1];
+            tsReadback.Unmap(0);
+            return end > begin ? (end - begin) * 1000.0 / tsFrequency : 0.0;
+        }
+    }
+
     // P0a/P0b — open the per-frame command list on the next round-robin slot. Subsequent ExecuteSync calls on
     // THIS thread record into it instead of submitting. No-op (legacy per-pass submit) when
     // BALLISTIC_DX12_PIPELINED=0. P0b: advance `frameSlot`, then WAIT for the frame that last used this slot

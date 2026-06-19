@@ -296,8 +296,17 @@ public sealed class Dx12LumenScene : IDisposable
         var h = new HashCode();
         for (int i = 0; i < sceneAS.InstanceCount; i++)
         {
+            // FULL 3×3 rotation/scale block + translation. The old stamp hashed only the diagonal (M11/M22/M33) +
+            // translation, so a PURE ROTATION — which lives entirely in the off-diagonal terms (M12/M13/M21/…) —
+            // left the stamp unchanged: RefreshTransforms was skipped and the world-space card frames (ClusterCards)
+            // kept the stale orientation, so the GI cache lit a rotated instance as if it never turned. Hashing the
+            // whole upper-left 3×3 catches rotation, shear, and non-uniform scale. Cost is negligible (a handful of
+            // instances on the whole-mesh path; Bistro = 1).
             Matrix4x4 w = sceneAS.InstanceWorld(i);
-            h.Add(w.M11); h.Add(w.M22); h.Add(w.M33); h.Add(w.M41); h.Add(w.M42); h.Add(w.M43);   // scale + translation (enough to catch any move)
+            h.Add(w.M11); h.Add(w.M12); h.Add(w.M13);
+            h.Add(w.M21); h.Add(w.M22); h.Add(w.M23);
+            h.Add(w.M31); h.Add(w.M32); h.Add(w.M33);
+            h.Add(w.M41); h.Add(w.M42); h.Add(w.M43);   // translation
         }
         return h.ToHashCode();
     }

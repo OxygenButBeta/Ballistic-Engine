@@ -32,8 +32,22 @@ public sealed class Dx12SwapChain : IDisposable {
 
     // The UI present command list (clear -> ImGui draws -> backbuffer transitions). Open between
     // BeginFrame and Present; the ImGui DX12 backend records its draws into it.
-    readonly ID3D12CommandAllocator uiAllocator;
-    readonly ID3D12GraphicsCommandList4 uiList;
+    // P0c: N-BUFFERED so the PLAYER present (PresentTexture) no longer blocks on dev.Flush() every frame —
+    // each present uses a distinct allocator+list, and the recycle gate waits only for the present that used
+    // THIS slot last (presentFenceTargets), letting the CPU run ahead of the GPU through the present (the
+    // same ring the device's frameFence uses for the render frame). The EDITOR path (BeginFrame/EndFrame)
+    // keeps using slot 0 synchronously — it still flushes (ImGui's per-frame upload isn't N-buffered here),
+    // so the ring only accelerates the player. The fence/ring is sized to the swapchain buffer count.
+    readonly ID3D12CommandAllocator[] uiAllocators;
+    readonly ID3D12GraphicsCommandList4[] uiLists;
+    readonly ID3D12Fence presentFence;
+    readonly System.Threading.AutoResetEvent presentFenceEvent = new(false);
+    ulong presentFenceValue;
+    readonly ulong[] presentFenceTargets;   // [bufferCount] the presentFence value the GPU reaches when that slot's present is done
+    int uiSlot;                              // round-robin present slot (0..bufferCount-1)
+    // Slot 0's allocator+list is the EDITOR's BeginFrame/EndFrame surface (synchronous, unchanged).
+    ID3D12CommandAllocator uiAllocator => uiAllocators[0];
+    ID3D12GraphicsCommandList4 uiList => uiLists[0];
 
     public int Width { get; private set; }
     public int Height { get; private set; }
@@ -75,10 +89,16 @@ public sealed class Dx12SwapChain : IDisposable {
         rtvIncrement = dev.Device.GetDescriptorHandleIncrementSize(DescriptorHeapType.RenderTargetView);
         CreateBackBufferRtvs();
 
-        uiAllocator = dev.Device.CreateCommandAllocator(CommandListType.Direct);
-        uiList = dev.Device.CreateCommandList<ID3D12GraphicsCommandList4>(
-            CommandListType.Direct, uiAllocator, null);
-        uiList.Close();   // created open; close so the first Reset is uniform (matches Dx12Device).
+        uiAllocators = new ID3D12CommandAllocator[bufferCount];
+        uiLists = new ID3D12GraphicsCommandList4[bufferCount];
+        for (int i = 0; i < bufferCount; i++) {
+            uiAllocators[i] = dev.Device.CreateCommandAllocator(CommandListType.Direct);
+            uiLists[i] = dev.Device.CreateCommandList<ID3D12GraphicsCommandList4>(
+                CommandListType.Direct, uiAllocators[i], null);
+            uiLists[i].Close();   // created open; close so the first Reset is uniform (matches Dx12Device).
+        }
+        presentFence = dev.Device.CreateFence(0, FenceFlags.None);
+        presentFenceTargets = new ulong[bufferCount];   // all 0 → the first N presents never wait (slots fresh)
     }
 
     void CreateBackBufferRtvs() {
@@ -143,19 +163,43 @@ public sealed class Dx12SwapChain : IDisposable {
     // to RenderTarget after, keeping the Dx12OffscreenTarget's own state tracking consistent. One command
     // list + GPU flush (the synchronous model), then Present.
     public void PresentTexture(ID3D12Resource source, bool vsync) {
+        // P0c — PIPELINED present (no per-frame dev.Flush). Round-robin over N present slots; the recycle gate
+        // waits ONLY for the present that last used THIS slot (presentFenceTargets[uiSlot]) before reusing its
+        // allocator, so the CPU runs ahead of the GPU by up to bufferCount presents. Ordering vs the render
+        // frame is implicit: the blit and the renderer's writes share dev.Queue (FIFO), so the next frame's
+        // render into `source` cannot start on the GPU until this slot's CopyResource(bb, source) has executed
+        // — no flush needed to protect `source`. The flip-model swapchain provides its own backpressure
+        // (BufferCount images), so an uncapped Present never outruns the display by more than the buffer count.
+        int slot = uiSlot;
+        uiSlot = (uiSlot + 1) % bufferCount;
+        WaitPresentSlot(slot);   // gate: the GPU finished the present that used this allocator last time
         currentIndex = (int)swapChain.CurrentBackBufferIndex;
-        uiAllocator.Reset();
-        uiList.Reset(uiAllocator, null);
+        ID3D12CommandAllocator alloc = uiAllocators[slot];
+        ID3D12GraphicsCommandList4 list = uiLists[slot];
+        alloc.Reset();
+        list.Reset(alloc, null);
         ID3D12Resource bb = backBuffers[currentIndex];
-        uiList.ResourceBarrierTransition(bb, ResourceStates.Present, ResourceStates.CopyDest);
-        uiList.ResourceBarrierTransition(source, ResourceStates.RenderTarget, ResourceStates.CopySource);
-        uiList.CopyResource(bb, source);
-        uiList.ResourceBarrierTransition(source, ResourceStates.CopySource, ResourceStates.RenderTarget);
-        uiList.ResourceBarrierTransition(bb, ResourceStates.CopyDest, ResourceStates.Present);
-        uiList.Close();
-        dev.Queue.ExecuteCommandList(uiList);
-        dev.Flush();
+        list.ResourceBarrierTransition(bb, ResourceStates.Present, ResourceStates.CopyDest);
+        list.ResourceBarrierTransition(source, ResourceStates.RenderTarget, ResourceStates.CopySource);
+        list.CopyResource(bb, source);
+        list.ResourceBarrierTransition(source, ResourceStates.CopySource, ResourceStates.RenderTarget);
+        list.ResourceBarrierTransition(bb, ResourceStates.CopyDest, ResourceStates.Present);
+        list.Close();
+        dev.Queue.ExecuteCommandList(list);
+        ulong target = ++presentFenceValue;
+        dev.Queue.Signal(presentFence, target);
+        presentFenceTargets[slot] = target;
         CheckPresent(swapChain.Present(vsync ? 1u : 0u, PresentFlags.None));
+    }
+
+    // Recycle gate for a present slot: block until the GPU has finished the present that last used this slot's
+    // allocator (so Reset() can't recycle commands still in flight). No-op the first bufferCount presents
+    // (targets are 0) and whenever the GPU already passed the target.
+    void WaitPresentSlot(int slot) {
+        ulong target = presentFenceTargets[slot];
+        if (target == 0 || presentFence.CompletedValue >= target) return;
+        presentFence.SetEventOnCompletion(target, presentFenceEvent.SafeWaitHandle.DangerousGetHandle());
+        presentFenceEvent.WaitOne();
     }
 
     // Resize the swapchain back buffers (EF3). ResizeBuffers requires (a) the GPU fully idle and (b)
@@ -181,6 +225,10 @@ public sealed class Dx12SwapChain : IDisposable {
         width = Math.Max(1, width); height = Math.Max(1, height);
         if (width == Width && height == Height) return;
         dev.Flush();   // (1) hard barrier — render + pipelined-frame + worker-upload fences; GPU fully idle
+        // (1b) P0c — dev.Flush drains the device's queues but NOT this swapchain's present fence: a pipelined
+        // PresentTexture (CopyResource into a backbuffer) is signalled only on presentFence. Releasing the
+        // backbuffers below while that copy is still reading one → device removal. Drain the latest present too.
+        WaitPresentSlot((uiSlot + bufferCount - 1) % bufferCount);   // the most-recently submitted present slot
         for (int i = 0; i < bufferCount; i++) { backBuffers[i]?.Dispose(); backBuffers[i] = null; }  // (2)
         try {
             swapChain.ResizeBuffers((uint)bufferCount, (uint)width, (uint)height, BackbufferFormat, SwapChainFlags.None);  // (3)
@@ -254,8 +302,11 @@ public sealed class Dx12SwapChain : IDisposable {
 
     public void Dispose() {
         dev.Flush();
-        uiList.Dispose();
-        uiAllocator.Dispose();
+        WaitPresentSlot((uiSlot + bufferCount - 1) % bufferCount);   // drain any pipelined present before freeing lists
+        presentFence?.Dispose();
+        presentFenceEvent.Dispose();
+        if (uiLists != null) foreach (var l in uiLists) l?.Dispose();
+        if (uiAllocators != null) foreach (var a in uiAllocators) a?.Dispose();
         if (backBuffers != null)
             foreach (ID3D12Resource b in backBuffers) b?.Dispose();
         rtvHeap?.Dispose();

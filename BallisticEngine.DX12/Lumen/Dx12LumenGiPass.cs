@@ -150,6 +150,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public uint InstanceCount; public uint TotalTris; public float SkyIntensity; public float UseSky;
         public float SkyVisRays; public float EmaAlpha; public float BounceRays; public float HistoryValid;
         public uint FrameIndex; public uint UpdateStride; public uint ForceFull; public uint TexelDim;   // P7 #1; Sıra 5 mesh-card grid edge
+        public Vector3 CameraPos; public float PriorityScale;   // P7 #1b priority budget
+        public float PriorityNearDist; public float UsePriority; public float Pad7a; public float Pad7b;
     }
 
     // ---- Sıra 1: SCREEN-SPACE RADIANCE PROBES (LumenScreenProbe.hlsl) ----
@@ -159,7 +161,9 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     // irradiance E buffer the per-pixel CSTrace did, so the downstream probe-temporal + denoise + combine chain is
     // untouched. Gated behind BALLISTIC_DX12_LUMEN_SCREENPROBE ("1" force on, "0" force off, unset → default).
     ID3D12RootSignature spRootSig;       // HeapDirectlyIndexed; CBV b0/b1 + root SRV t0 TLAS + table{t1-t6, u1 atlas} + root SRV t7-t12 + root UAV u0 headers / u2 indirect + s0/s1
-    ID3D12PipelineState spPlacePso, spTracePso, spIntegratePso, spFilterPso;
+    ID3D12PipelineState spPlacePso, spTracePso, spIntegratePso, spFilterPso, spShPso;
+    ID3D12Resource probeSH;   // SH irradiance cache: 7 float4 / probe (9 RGB cosine-convolved coeffs), root UAV u4
+    int probeShCapacity;      // current probe count the buffer is sized for
     Dx12FrameCb<ProbeConstants> spProbeCb;   // P0b N-buffered
     Dx12FrameCb<LumenSun> spSunCb;           // P0b N-buffered
     ID3D12Resource probeHeaders;         // StructuredBuffer<ProbeHeader> (root UAV u0) — sized ProbesX*ProbesY
@@ -187,7 +191,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public Vector2 FullTexel; public float RayCount; public float FrameIndex;
         public float NormalBias; public float MaxRayDist; public float UseCards; public float ScreenSteps;
         public float SkyIntensity; public float UseSky; public float UseScreenTrace; public float ScreenRange;
-        public float FalloffDist; public float ProbeTile; public float ProbeStride; public float OctSize;
+        public float FalloffDist; public float UseSH; public float ProbeStride; public float OctSize;
         public uint ProbesX; public uint ProbesY; public uint FullW; public uint FullH;
         public float HistoryValid; public float ProbeEma; public float TexelDim; public float SpPad1;
     }
@@ -254,6 +258,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         float skyIntensity = EnvF("BALLISTIC_DX12_LUMEN_SKY", fx.LumenSkyIntensity);
         bool useSky = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOSKY") != "1";
         bool useCards = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOCARDS") != "1";
+
+        // QUALITY TIER: probe oct resolution comes from the volume (fx.LumenProbeOct), env door overrides. If the
+        // tier changed octSize since last frame, re-size the octahedral atlas trio (cheap — 3 small textures).
+        int wantOct = Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_PROBE_OCT", fx.LumenProbeOct), 4, 16);
+        if (wantOct != octSize) { octSize = wantOct; ReallocProbeAtlas(); }
 
         Vector3 sunDirN = ctx.LightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(ctx.LightDir);
 
@@ -372,6 +381,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // camera-only and screen-probe had none). BALLISTIC_DX12_LUMEN_NOTEMPORAL=1 bypasses it (raw E).
         bool temporalOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOTEMPORAL") != "1"
                           && !ctx.DeterministicCapture;   // deterministic capture: skip (single frame, fresh) for golden stability
+        // ADAPTIVE DENOISE signal: capture whether THIS frame had a valid temporal history BEFORE the temporal
+        // pass overwrites it. A history miss (first frame / resize / a big disocclusion that rejected most of the
+        // reprojected E) means the indirect is still single-frame-noisy → the denoise temporarily widens to clean
+        // it; in steady state (history valid) the temporal accumulation already did the heavy lifting so 1 pass is
+        // enough. This is what lets the Balanced/Performance tiers run denoise=1 without grain on camera cuts.
+        bool historyMissThisFrame = !probeHistoryValid;
         if (temporalOn)
         {
             tempCb.Write(new TemporalConstants
@@ -428,6 +443,15 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // BALLISTIC_DX12_LUMEN_NODENOISE=1 passes through (raw E). ===
         bool denoise = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NODENOISE") != "1" && fx.LumenDenoisePasses > 0;
         int dnPasses = denoise ? Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_DENOISE_PASSES", fx.LumenDenoisePasses), 1, MaxDenoisePasses) : 1;
+        // ADAPTIVE: on a history miss (camera cut / resize / heavy disocclusion) the indirect is still raw-noisy,
+        // so widen the à-trous to at least 3 passes THIS frame to kill the grain before it's visible; steady-state
+        // frames keep the tier's count (1 for Balanced/Performance). The temporal accumulation re-converges within
+        // a few frames, so this transient cost is paid only on the cut, not continuously. Env door fixes the count
+        // (DENOISE_PASSES set) → no adaptivity, for deterministic A/B. Determinism keeps a fixed count too.
+        bool adaptiveDenoise = denoise && Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_DENOISE_PASSES") == null
+                               && !ctx.DeterministicCapture;
+        if (adaptiveDenoise && historyMissThisFrame)
+            dnPasses = Math.Clamp(Math.Max(dnPasses, 3), 1, MaxDenoisePasses);
         Dx12OffscreenTarget src = indirect, dst = indirectFiltered;
         denoiseSrv.Reset();   // ONCE per frame — each pass takes a DISTINCT 4-descriptor range (no cross-pass alias)
         for (int pass = 0; pass < dnPasses; pass++)
@@ -537,7 +561,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // makes a strided update visually identical to a per-frame one for a STATIC light. Small scenes
         // (tris ≤ budget) get stride 1 automatically (no change). Determinism: a deterministic capture forces
         // stride 1 (a strided cache depends on frame count → not byte-reproducible).
-        int budget = (int)EnvF("BALLISTIC_DX12_LUMEN_BUDGET", 200000f);
+        int budget = (int)EnvF("BALLISTIC_DX12_LUMEN_BUDGET", ctx.PostFX.LumenCardBudget);
         int tris = scene.RecordCount;   // budget now counts RECORDS (clusters), the card-light dispatch unit
         uint stride = 1u;
         // A deterministic capture renders a FIXED frame, so the round-robin phase (FrameIndex % stride) is itself
@@ -556,6 +580,17 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         uint forceFull = lightChanged ? 1u : 0u;
         if (lightChanged) { prevSunDir = sunDir; prevSunColor = ctx.LightColor; prevLightCount = clusteredLights.LightCount; }
 
+        // P7 #1b PRIORITY budget: spend the same average records/frame as the stride, but weighted by staleness ×
+        // camera proximity so near cards react fast and far ones update lazily. OFF under a deterministic capture
+        // (its hash×frame gate is not byte-reproducible — same reason the EMA is disabled there) and when the
+        // budget is unlimited (stride 1 already updates everything). Env door BALLISTIC_DX12_LUMEN_PRIORITY=0 forces
+        // the legacy flat round-robin. PriorityScale sets the mean due-rate to ≈ budget/recordCount: at steady
+        // state a record's staleness averages recordCount/budget, and (0.25+nearW) averages ~0.6, so scaling by
+        // (recordCount/budget)·0.6 lands the mean probability near budget/recordCount.
+        bool priorityOn = budget > 0 && tris > budget && !ctx.DeterministicCapture
+                          && Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_PRIORITY") != "0";
+        float priorityScale = priorityOn ? Math.Max(1f, (float)tris / budget * 0.85f) : 1f;
+
         cardCb.Write(new LumenCardConstants
         {
             SunDir = sunDir, SunBias = 0.03f, SunColor = ctx.LightColor, LightCount = clusteredLights.LightCount,
@@ -565,6 +600,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             HistoryValid = (scene.HistoryValid && !ctx.DeterministicCapture) ? 1f : 0f,
             FrameIndex = (uint)frameCounter, UpdateStride = stride, ForceFull = forceFull,
             TexelDim = (uint)scene.TexelDim,
+            CameraPos = ctx.CamPos, PriorityScale = priorityScale,
+            PriorityNearDist = EnvF("BALLISTIC_DX12_LUMEN_PRIORITY_NEAR", 12f), UsePriority = priorityOn ? 1f : 0f,
         });
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
@@ -634,7 +671,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             UseScreenTrace = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOSCREEN") == "1" ? 0f : 1f,
             ScreenRange = EnvF("BALLISTIC_DX12_LUMEN_SCREEN_RANGE", 1.5f),
             FalloffDist = EnvF("BALLISTIC_DX12_LUMEN_FALLOFF", 12f),
-            ProbeTile = 0f, ProbeStride = probeStride, OctSize = octSize,
+            UseSH = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_PROBE_NOSH") != "1" ? 1f : 0f,
+            ProbeStride = probeStride, OctSize = octSize,
             ProbesX = (uint)probesX, ProbesY = (uint)probesY,
             FullW = (uint)indirect.Width, FullH = (uint)indirect.Height,
             // Sıra 3 temporal accumulation. A deterministic capture KEEPS accumulation (fixed frame → fixed,
@@ -700,6 +738,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.SetComputeRootUnorderedAccessView(10, probeHeaders.GPUVirtualAddress);     // u0 ProbeHeaders (root UAV — buffer)
             cl.SetComputeRootShaderResourceView(12, probeHeadersPrev.GPUVirtualAddress);  // t16 prev headers (root SRV — buffer)
             cl.SetComputeRootShaderResourceView(13, scene.ClusterCardsGpuAddress);        // t17 ClusterCards (Sıra 5)
+            cl.SetComputeRootUnorderedAccessView(14, probeSH.GPUVirtualAddress);          // u4 ProbeSH (root UAV — buffer, SH cache)
         }
 
         // Root slot 11 table = u2 indirect (SpTableBase+7) + t13 atlas history (SpTableBase+8), bound from the
@@ -772,7 +811,26 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             probeAtlasFiltered.ColorToUnorderedAccess();
         }
 
-        // INTEGRATE — reads ProbeAtlasFiltered (u3) + the history SRV. The atlas/filtered are UAV.
+        // PROBE-SH PROJECTION — the integrate-cost fix. Project each probe's filtered oct tile into 9 RGB
+        // cosine-convolved SH coeffs ONCE (1 thread/probe), so CSIntegrate evaluates an O(1) SH per neighbour
+        // probe instead of scanning the oct² tile ×16 per full-res pixel. ProbeAtlasFiltered is the input (UAV),
+        // probeSH the output (root UAV). BALLISTIC_DX12_LUMEN_PROBE_NOSH=1 falls back to the per-pixel oct integral.
+        bool probeSHOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_PROBE_NOSH") != "1";
+        if (probeSHOn)
+        {
+            dev.ExecuteSync(cl =>
+            {
+                cl.SetDescriptorHeaps(bindless.Heap);
+                cl.SetComputeRootSignature(spRootSig);
+                cl.SetPipelineState(spShPso);
+                SetCommonRoots(cl);
+                cl.SetComputeRootDescriptorTable(11, slot11);
+                cl.Dispatch((uint)((probesX * probesY + 63) / 64), 1, 1);
+            });
+        }
+
+        // INTEGRATE — reads ProbeAtlasFiltered (u3) + the history SRV. The atlas/filtered are UAV. With SH on it
+        // reads probeSH (u4) and ignores the oct tile; the spIntegratePso shader picks the path by a CB flag.
         dev.ExecuteSync(cl =>
         {
             cl.SetDescriptorHeaps(bindless.Heap);
@@ -1027,6 +1085,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         var indirectTable = new RootParameter1(new RootDescriptorTable1(indirectUavRange, atlasHistRange, filteredUavRange), ShaderVisibility.All);
         var prevHeaderSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(16, 0), ShaderVisibility.All);  // t16 prev headers (root SRV, buffer)
         var spCardsSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(17, 0), ShaderVisibility.All);  // t17 ClusterCards (Sıra 5)
+        var probeShUav = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(4, 0), ShaderVisibility.All);  // u4 ProbeSH (root UAV, buffer — SH irradiance cache)
         var clampSamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
         {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
@@ -1039,11 +1098,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 1,
             ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
         };
-        // Roots: 0 cbv0,1 cbv1,2 t0 TLAS,3 table{t1-t6,u1},4-9 t7-t12,10 u0 headers,11 table{u2,t13 hist},12 t16 prev,13 t17 cards.
+        // Roots: 0 cbv0,1 cbv1,2 t0 TLAS,3 table{t1-t6,u1},4-9 t7-t12,10 u0 headers,11 table{u2,t13 hist,u3 filtered},12 t16 prev,13 t17 cards,14 u4 ProbeSH.
         spRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { cbv0, cbv1, tlasSrv, table, matSrv, instSrv, lightSrv, cardSrv, metaSrv, triClusterSrv, headerUav, indirectTable, prevHeaderSrv, spCardsSrv },
+                new[] { cbv0, cbv1, tlasSrv, table, matSrv, instSrv, lightSrv, cardSrv, metaSrv, triClusterSrv, headerUav, indirectTable, prevHeaderSrv, spCardsSrv, probeShUav },
                 new[] { clampSamp, wrapSamp })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumenScreenProbe.hlsl");
@@ -1066,6 +1125,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         {
             RootSignature = spRootSig,
             ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSProbeFilter", "LumenScreenProbe.hlsl"),
+        });
+        spShPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription
+        {
+            RootSignature = spRootSig,
+            ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSProbeSH", "LumenScreenProbe.hlsl"),
         });
 
         spProbeCb = new Dx12FrameCb<ProbeConstants>(dev);
@@ -1122,7 +1186,9 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // 0.251), with identical mean/coverage. Larger strides start to blob on dense thin geometry; 24 is the
         // measured sweet spot. BALLISTIC_DX12_LUMEN_PROBE_STRIDE overrides.
         probeStride = Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_PROBE_STRIDE", 24f), 4, 64);
-        octSize = Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_PROBE_OCT", 8f), 4, 16);
+        // octSize: the env door wins (A/B); otherwise keep the field the quality tier set this frame (default 6,
+        // Balanced). Record() reallocates the atlases when the tier changes octSize between frames (EnsureProbeAtlas).
+        octSize = Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_PROBE_OCT", octSize), 4, 16);
         probesX = (lw + probeStride - 1) / probeStride;
         probesY = (lh + probeStride - 1) / probeStride;
         probeHeaderCount = Math.Max(probesX * probesY, 1);
@@ -1134,6 +1200,21 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         probeHeadersPrev?.Dispose();   // Sıra 3: previous-frame headers (reproject reject) — copy dest / root SRV
         probeHeadersPrev = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)(probeHeaderCount * 32)), ResourceStates.GenericRead);
+        // SH irradiance cache: 7 float4 (112 bytes) per probe. Sized off probe COUNT (oct-independent), so it
+        // survives a tier octSize change (only the atlas trio re-sizes there). CSProbeSH writes it; CSIntegrate reads.
+        probeSH?.Dispose();
+        probeShCapacity = probeHeaderCount;
+        probeSH = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)(probeShCapacity * 7 * 16), ResourceFlags.AllowUnorderedAccess),
+            ResourceStates.UnorderedAccess);
+        ReallocProbeAtlas();
+    }
+
+    // (Re)allocate the octahedral atlas trio — the ONLY resources sized off octSize. Called by Initialize AND by
+    // Record when the quality tier changes octSize between frames (so a runtime tier swap re-sizes the atlas
+    // without a full GI Initialize). Resets spHistoryValid: a re-sized atlas history is stale (first frame raw).
+    void ReallocProbeAtlas()
+    {
         probeAtlas?.Dispose();
         probeAtlas = new Dx12OffscreenTarget(dev, Math.Max(probesX * octSize, 1), Math.Max(probesY * octSize, 1),
             withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
@@ -1160,5 +1241,6 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         probeAtlasFiltered?.Dispose();
         spProbeCb?.Dispose(); spSunCb?.Dispose();
         probeHeaders?.Dispose(); probeHeadersPrev?.Dispose(); probeAtlas?.Dispose(); probeAtlasHistory?.Dispose();
+        probeSH?.Dispose(); spShPso?.Dispose();
     }
 }

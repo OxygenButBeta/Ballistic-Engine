@@ -246,8 +246,15 @@ public sealed class PostProcessSettings {
     public float LumenIntensity { get; set; } = 2f;          // master GI strength (tuned: visible indirect without washing out)
     public float LumenSkyIntensity { get; set; } = 1.5f;     // skylight let in through open sky-visibility
     public int LumenRayCount { get; set; } = 16;             // hemisphere rays per pixel (temporal accumulation cleans the rest)
-    public int LumenDenoisePasses { get; set; } = 3;         // à-trous spatial denoise iterations (0 = raw)
+    public int LumenDenoisePasses { get; set; } = 1;         // à-trous spatial denoise iterations (0 = raw); Balanced default (adaptive bumps it on disocclusion)
     public bool LumenMultiBounce { get; set; } = true;       // accumulate multi-bounce in the radiance cache
+    // --- Lumen QUALITY TIER (perf preset). The GlobalIllumination volume's `quality` enum sets these; a tier is
+    // just (probeOct, cardBudget, denoisePasses) chosen for a frame-time target. The integrate cost is ~oct² per
+    // probe per pixel, so dropping oct is the strongest knob (measured: oct8→6→4 = 130→161→211 FPS Bistro ext).
+    // Default = Balanced (oct 6, budget 50k, denoise 1): Lumen on at ~+1.9ms instead of High's ~+5.9ms. The
+    // BALLISTIC_DX12_LUMEN_PROBE_OCT / _BUDGET / _DENOISE_PASSES env doors still override for A/B. ---
+    public int LumenProbeOct { get; set; } = 6;              // octahedral tile resolution per probe (oct × oct cells); Balanced default
+    public int LumenCardBudget { get; set; } = 50000;        // card-light records relit per frame (round-robin; 0 = unlimited)
     public bool LumenReflections { get; set; } = true;       // feed RT reflections from the radiance cache
     // How much the screen-space GTAO bites the GI's contact shading. DEFAULT 0: screen-space GTAO dragged a dark
     // "ghost of nearby geometry" smudge under camera motion, and the RT trace already carries macro occlusion, so

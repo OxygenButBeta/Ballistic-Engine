@@ -39,7 +39,7 @@ cbuffer ProbeConstants : register(b0) {
     float2 FullTexel;   float RayCount;   float FrameIndex;     // FullTexel = 1/full-res
     float NormalBias;   float MaxRayDist; float UseCards;       float ScreenSteps;
     float SkyIntensity; float UseSky;     float UseScreenTrace; float ScreenRange;
-    float FalloffDist;  float ProbeTile;  float ProbeStride;    float OctSize;       // ProbeStride=16; OctSize=8 (8x8 tile)
+    float FalloffDist;  float UseSH;      float ProbeStride;    float OctSize;       // UseSH=1 → CSIntegrate evaluates the SH cache (was ProbeTile, unused)
     uint  ProbesX;      uint ProbesY;     uint FullW;           uint FullH;
     float HistoryValid; float ProbeEma;   float TexelDim;       float SpPad1;        // Sıra 3 EMA; Sıra 5 mesh-card grid edge (1=legacy)
 };
@@ -53,6 +53,13 @@ struct ProbeHeader { float4 PosValid; float4 NormalDepth; };
 RWStructuredBuffer<ProbeHeader> ProbeHeaders : register(u0);   // CSPlace writes, CSTrace/CSIntegrate read
 RWTexture2D<float4> ProbeAtlas : register(u1);                 // octahedral radiance atlas (ProbesX*OctSize wide)
 RWTexture2D<float4> Indirect   : register(u2);                 // OUT (CSIntegrate): incoming irradiance E
+// SH IRRADIANCE CACHE (the integrate-cost fix): CSProbeSH projects each probe's filtered oct tile into 9 RGB
+// SH coefficients ONCE per probe (oct² taps amortised over the probe, not per pixel). CSIntegrate then only
+// EVALUATES the SH in the pixel normal direction for its 4..16 neighbour probes — O(probes·9) instead of the
+// old O(pixels·16·oct²). 9 coeffs × RGB = 27 floats → 7 float4 per probe (last .yzw padding). Index: probe p
+// occupies [p*7 .. p*7+6]. The SH already bakes the cosine (Lambert) convolution, so the evaluate is a plain
+// dot — no per-pixel hemisphere integral.
+RWStructuredBuffer<float4> ProbeSH : register(u4);             // 7 float4 / probe (9 RGB irradiance-SH coeffs)
 Texture2D<float4>   ProbeAtlasHistory : register(t13);        // Sıra 3: previous frame's accumulated atlas (EMA)
 StructuredBuffer<ProbeHeader> ProbeHeadersPrev : register(t16);// Sıra 3: previous frame's probe headers (reproject reject)
 
@@ -121,6 +128,55 @@ float3 OctDecode(float2 f) {
     float t = saturate(-n.z);
     n.xy += float2(n.x >= 0.0 ? -t : t, n.y >= 0.0 ? -t : t);
     return normalize(n);
+}
+
+// --- Order-2 (9-coefficient) real spherical harmonics, evaluated for a direction. Standard basis. ---
+void ShBasis(float3 d, out float sh[9]) {
+    sh[0] = 0.282095;                       // Y00
+    sh[1] = 0.488603 * d.y;                 // Y1-1
+    sh[2] = 0.488603 * d.z;                 // Y10
+    sh[3] = 0.488603 * d.x;                 // Y11
+    sh[4] = 1.092548 * d.x * d.y;           // Y2-2
+    sh[5] = 1.092548 * d.y * d.z;           // Y2-1
+    sh[6] = 0.315392 * (3.0 * d.z * d.z - 1.0); // Y20
+    sh[7] = 1.092548 * d.x * d.z;           // Y21
+    sh[8] = 0.546274 * (d.x * d.x - d.y * d.y); // Y22
+}
+
+// Cosine-lobe (Lambert) convolution weights per band — bakes the clamped-cosine hemisphere integral into the
+// coefficients so the evaluate is a plain SH dot (Ramamoorthi & Hanrahan 2001). A_l: l=0 π, l=1 2π/3, l=2 π/4.
+static const float ShCosA0 = 3.141593;
+static const float ShCosA1 = 2.094395;
+static const float ShCosA2 = 0.785398;
+
+// Pack/unpack the 9 RGB coeffs to/from the 7-float4 ProbeSH slab (last float4 holds coeff 8 in .xyz).
+void StoreProbeSH(uint p, float3 c[9]) {
+    uint b = p * 7u;
+    ProbeSH[b + 0] = float4(c[0], c[1].x);
+    ProbeSH[b + 1] = float4(c[1].yz, c[2].xy);
+    ProbeSH[b + 2] = float4(c[2].z, c[3]);
+    ProbeSH[b + 3] = float4(c[4], c[5].x);
+    ProbeSH[b + 4] = float4(c[5].yz, c[6].xy);
+    ProbeSH[b + 5] = float4(c[6].z, c[7]);
+    ProbeSH[b + 6] = float4(c[8], 0.0);
+}
+void LoadProbeSH(uint p, out float3 c[9]) {
+    uint b = p * 7u;
+    float4 a0 = ProbeSH[b + 0], a1 = ProbeSH[b + 1], a2 = ProbeSH[b + 2], a3 = ProbeSH[b + 3];
+    float4 a4 = ProbeSH[b + 4], a5 = ProbeSH[b + 5], a6 = ProbeSH[b + 6];
+    c[0] = a0.xyz; c[1] = float3(a0.w, a1.xy); c[2] = float3(a1.zw, a2.x);
+    c[3] = a2.yzw; c[4] = a3.xyz; c[5] = float3(a3.w, a4.xy);
+    c[6] = float3(a4.zw, a5.x); c[7] = a5.yzw; c[8] = a6.xyz;
+}
+
+// Evaluate the cosine-convolved irradiance SH in direction N → irradiance E (already /π-normalised so the
+// downstream combine multiplies albedo/π exactly as before — same E units the oct-integral produced).
+float3 EvalProbeSH(float3 c[9], float3 N) {
+    float sh[9]; ShBasis(N, sh);
+    float3 E = c[0] * (ShCosA0 * sh[0]);
+    E += (c[1] * sh[1] + c[2] * sh[2] + c[3] * sh[3]) * ShCosA1;
+    E += (c[4] * sh[4] + c[5] * sh[5] + c[6] * sh[6] + c[7] * sh[7] + c[8] * sh[8]) * ShCosA2;
+    return max(E / PI, 0.0.xxx);   // /π: convolved SH gives radiance·π integral; divide back to match oct-path E
 }
 
 float Visibility(float3 origin, float3 N, float3 dir, float maxDist) {
@@ -360,6 +416,45 @@ void CSProbeFilter(uint3 dtid : SV_DispatchThreadID) {
     ProbeAtlasFiltered[atlasPx] = float4(wsum > 1e-4 ? acc / wsum : ProbeAtlas[atlasPx].rgb, 1.0);
 }
 
+// ===== CSProbeSH: project each probe's FILTERED octahedral tile into 9 RGB SH coefficients (1 thread / probe) =====
+// This is the integrate-cost fix: the oct² tile scan happens ONCE per probe here (a few thousand probes) instead
+// of per full-res pixel ×16 in CSIntegrate. The result is the directional radiance distribution as SH; the pixel
+// pass then evaluates it in the surface-normal direction (cosine-convolved) for a Lambertian irradiance with no
+// per-pixel hemisphere loop. The octahedral map is equal-area-ISH, so we weight each cell by its solid angle via
+// the standard 1/(|x|+|y|+|z|)³ octahedral Jacobian to keep the projection unbiased.
+[numthreads(64, 1, 1)]
+void CSProbeSH(uint3 dtid : SV_DispatchThreadID) {
+    uint pidx = dtid.x;
+    if (pidx >= ProbesX * ProbesY) return;
+    uint2 probe = uint2(pidx % ProbesX, pidx / ProbesX);
+    uint oct = (uint)OctSize;
+
+    float3 c[9];
+    [unroll] for (uint k = 0; k < 9; k++) c[k] = 0.0.xxx;
+    ProbeHeader h = ProbeHeaders[pidx];
+    if (h.PosValid.w < 0.5) { StoreProbeSH(pidx, c); return; }
+
+    float wsum = 0.0;
+    [loop] for (uint cy = 0; cy < oct; cy++)
+    [loop] for (uint cx = 0; cx < oct; cx++) {
+        float2 octUv = (float2(cx, cy) + 0.5) / float(oct);
+        float3 dir = OctDecode(octUv);
+        float3 rad = ProbeAtlasFiltered[uint2(probe.x * oct + cx, probe.y * oct + cy)].rgb;
+        // Octahedral solid-angle weight (Jacobian of the equal-area-ish unwrap). Constant cell area in oct space
+        // maps to a varying sphere solid angle ~ 1/(|x|+|y|+|z|)³ in the pre-normalised direction.
+        float3 un = float3(octUv.x * 2.0 - 1.0, octUv.y * 2.0 - 1.0, 0.0);
+        float l1 = abs(un.x) + abs(un.y); un.z = 1.0 - l1;
+        float dw = 1.0 / pow(max(abs(un.x) + abs(un.y) + abs(un.z), 1e-3), 3.0);
+        float sh[9]; ShBasis(dir, sh);
+        [unroll] for (uint k = 0; k < 9; k++) c[k] += rad * (sh[k] * dw);
+        wsum += dw;
+    }
+    // Normalise to the unit sphere integral (4π) so the convolved evaluate yields physical irradiance.
+    float norm = wsum > 1e-4 ? (4.0 * PI) / wsum : 0.0;
+    [unroll] for (uint k = 0; k < 9; k++) c[k] = Sanitize(c[k] * norm);
+    StoreProbeSH(pidx, c);
+}
+
 // ===== CSIntegrate: per full-res pixel, gather 4 nearest probes' octahedral radiance, cosine-weighted =====
 // Sample a probe's octahedral tile for the irradiance arriving at a pixel with normal Npix: integrate the tile's
 // full sphere weighted by cos(theta) over the pixel hemisphere. We approximate with the cosine-importance the
@@ -424,7 +519,13 @@ void CSIntegrate(uint3 dtid : SV_DispatchThreadID) {
         float wDepth = 1.0 / (1.0 + abs(h.NormalDepth.w - depth) * 1500.0);
         float wNormal = pow(saturate(dot(h.NormalDepth.xyz, Npix) * 0.5 + 0.5), 2.0);
         float w = wSpatial * wDepth * wNormal + 1e-5;
-        float3 rad = SampleProbeTile((uint2)pc, Npix);
+        // SH evaluate (integrate-cost fix): the per-probe directional radiance is precomputed as cosine-convolved
+        // irradiance SH by CSProbeSH, so this is a plain 9-term evaluate in the pixel normal direction — no oct²
+        // tile scan per probe. Identical irradiance to the old SampleProbeTile cosine integral, O(1) per probe.
+        // UseSH=0 (env BALLISTIC_DX12_LUMEN_PROBE_NOSH=1) falls back to the per-pixel oct integral for A/B.
+        float3 rad;
+        if (UseSH > 0.5) { float3 prc[9]; LoadProbeSH(pidx, prc); rad = EvalProbeSH(prc, Npix); }
+        else             { rad = SampleProbeTile((uint2)pc, Npix); }
         acc += rad * w; wsum += w;
         float fw = wSpatial * wDepth * (saturate(dot(h.NormalDepth.xyz, Npix)) + 0.1);
         if (fw > bestW) { bestW = fw; bestRad = rad; }

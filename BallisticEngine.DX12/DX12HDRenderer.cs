@@ -1122,12 +1122,23 @@ public sealed class DX12HDRenderer : HDRenderer
                                                 || !string.IsNullOrWhiteSpace(
                                                     Environment.GetEnvironmentVariable("BALLISTIC_STATS_OUT")));
 
-    // Run `body`, and if pass timing is on, record its GPU wall-time under `name` in RenderStats.GpuPasses.
+    // Run `body`, and if pass timing is on, record its GPU time under `name` in RenderStats.GpuPasses. Prefers a
+    // REAL GPU timestamp span (dev.GpuTimer*, excludes CPU submit/fence overhead); falls back to the CPU stopwatch
+    // when the queue doesn't support timestamps. Both paths run only in timing mode (pipelined frame off).
     void TimePass(string name, Action body)
     {
         if (!PassTimingEnabled)
         {
             body();
+            return;
+        }
+
+        if (dev.GpuTimerAvailable)
+        {
+            dev.GpuTimerBegin();
+            body();
+            double gpuMs = dev.GpuTimerEnd();
+            RenderStats.Scene.GpuPasses.Add((name, gpuMs));
             return;
         }
 
@@ -1716,6 +1727,15 @@ public sealed class DX12HDRenderer : HDRenderer
         RenderStats.Scene.Triangles = tris;
         RenderStats.Scene.SubMeshesCulled = culled;
         RenderStats.Scene.CpuFrameMs = cpuFrameSw.Elapsed.TotalMilliseconds;
+        // GpuFrameMs = sum of the real per-pass GPU timestamps (timing mode runs every pass as its own serial
+        // submit, so the queue is idle between passes → the sum is the GPU's total scene-pass time). 0 when timing
+        // is off (no queries issued) or unsupported.
+        if (PassTimingEnabled)
+        {
+            double sum = 0;
+            foreach (var p in RenderStats.Scene.GpuPasses) sum += p.Ms;
+            RenderStats.Scene.GpuFrameMs = sum;
+        }
         return new RenderMetrics(draws, 0, (int)tris, 0, 0f);
     }
 

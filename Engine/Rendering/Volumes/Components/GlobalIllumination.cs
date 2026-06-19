@@ -10,10 +10,21 @@ namespace BallisticEngine;
 // defaults — VolumeManager seeds the stack from those defaults). Drives the DX12 Lumen GI pass via
 // VolumePostProcessing.Apply → PostProcessSettings; the BALLISTIC_DX12_LUMEN_* env doors still override for
 // A/B diagnostics.
+// Lumen performance preset. A tier is a (probeOct, cardBudget, denoisePasses) bundle picked for a frame-time
+// target — integrate cost is ~oct² per probe per pixel, so the octahedral tile size is the dominant knob.
+// Measured (Bistro exterior, RX 9070 XT): High ~130 FPS, Balanced ~174, Performance ~234. Custom = author each
+// dial by hand (the tier no longer overrides probeOct/budget/denoisePasses).
+public enum GiQuality { High, Balanced, Performance, Custom }
+
 public sealed class GlobalIllumination : VolumeComponent {
     [Tooltip("Master switch for Lumen global illumination. Off → direct lighting + IBL + AO + shadows only. " +
              "Requires hardware ray tracing; without it GI is unavailable regardless of this toggle.")]
     public readonly BoolParameter enabled = new(true);
+
+    [Tooltip("Performance preset. Sets probe octahedral resolution, card-relight budget, and denoise passes for a " +
+             "frame-time target. High = max fidelity (oct 8). Balanced = the default (oct 6, ~3× cheaper than High " +
+             "for near-identical quality). Performance = fastest (oct 4). Custom = honour the individual dials below.")]
+    public readonly EnumParameter<GiQuality> quality = new(GiQuality.Balanced);
 
     [Tooltip("Overall strength of the indirect (diffuse GI) contribution. 1 = physical.")]
     public readonly ClampedFloatParameter intensity = new(2f, 0f, 4f);
@@ -24,8 +35,19 @@ public sealed class GlobalIllumination : VolumeComponent {
     [Tooltip("Hemisphere rays traced per pixel. Higher = less noise before denoise/temporal, more cost.")]
     public readonly ClampedIntParameter rayCount = new(16, 1, 16);
 
-    [Tooltip("Edge-aware spatial denoise iterations on the indirect (à-trous). 0 = raw (noisy).")]
-    public readonly ClampedIntParameter denoisePasses = new(3, 0, 5);
+    [Tooltip("Octahedral tile resolution per probe (oct × oct cells). Dominant cost knob (~oct²). Only honoured " +
+             "when Quality = Custom; the presets set it.")]
+    [ShowIf(nameof(quality), GiQuality.Custom)]
+    public readonly ClampedIntParameter probeOct = new(6, 4, 16);
+
+    [Tooltip("Card-light records relit per frame (round-robin; 0 = unlimited). Only honoured when Quality = Custom.")]
+    [ShowIf(nameof(quality), GiQuality.Custom)]
+    public readonly ClampedIntParameter cardBudget = new(50000, 0, 400000);
+
+    [Tooltip("Edge-aware spatial denoise iterations on the indirect (à-trous). Adaptive: this is the steady-state " +
+             "count; the pass temporarily raises it on disocclusion (history miss). Only honoured when Quality = Custom.")]
+    [ShowIf(nameof(quality), GiQuality.Custom)]
+    public readonly ClampedIntParameter denoisePasses = new(1, 0, 5);
 
     [Tooltip("Accumulate multi-bounce in the surface-card radiance cache (light bounces more than once).")]
     public readonly BoolParameter multiBounce = new(true);

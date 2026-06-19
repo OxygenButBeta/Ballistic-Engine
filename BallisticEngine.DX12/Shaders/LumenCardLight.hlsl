@@ -51,6 +51,8 @@ cbuffer LumenCardConstants : register(b0) {
     uint InstanceCount; uint TotalTris; float SkyIntensity; float UseSky;
     float SkyVisRays; float EmaAlpha; float BounceRays; float HistoryValid;   // P4: temporal blend + 2nd-bounce gather
     uint FrameIndex; uint UpdateStride; uint ForceFull; uint TexelDim;   // P7 #1 round-robin; Sıra 5 TexelDim (1=legacy)
+    float3 CameraPos; float PriorityScale;   // P7 #1b PRIORITY budget: per-record due prob = saturate(priority/scale)
+    float PriorityNearDist; float UsePriority; float Pad7a; float Pad7b;   // near falloff (m); UsePriority 1=priority,0=legacy stride
 };
 SamplerState LinearClamp : register(s0);
 SamplerState LinearWrap  : register(s1);
@@ -111,12 +113,35 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
     LumenInstanceMeta meta = Instances[inst];
     uint localTri = gtri - meta.TriOffset;
 
-    // P7 #1 — UPDATE BUDGET, per-RECORD. Only a round-robin slice of records relight each frame; the rest carry
-    // their previous radiance forward. The view-independent + EMA-stable cache makes a record re-lit every
-    // `UpdateStride` frames look identical to per-frame for a static light. `ForceFull` (sun/light/topology dirty)
-    // overrides → full relight that frame (no latency). A never-updated record (age 0 after a build) is always due.
+    // P7 #1 — UPDATE BUDGET, per-RECORD. Only a SLICE of records relight each frame; the rest carry their previous
+    // radiance forward. The view-independent + EMA-stable cache makes a strided/budgeted update look identical to
+    // per-frame for a static light. `ForceFull` (sun/light/topology dirty) overrides → full relight (no latency).
+    // A never-updated record (age 0 after a build) is always due.
+    //
+    // P7 #1b — PRIORITY budget (UsePriority=1): instead of a flat record%stride round-robin, weight each record's
+    // due-probability by (a) STALENESS — frames since its last relight (so nothing starves) and (b) camera
+    // PROXIMITY — near cards refresh faster (they fill more screen, so their GI error is more visible). The result
+    // is the same average records/frame as the stride budget, but the spend is concentrated where it matters: a
+    // near card reacts in a frame or two while a distant one updates lazily. Stochastic (hash threshold) so no sort
+    // is needed; staleness in the priority guarantees even a low-priority card eventually updates (no permanent
+    // starvation). The flat round-robin (UsePriority=0) stays available for A/B + determinism.
     bool everUpdated = LastUpdated[record] != 0u;
-    bool due = (ForceFull != 0u) || !everUpdated || ((record % UpdateStride) == (FrameIndex % UpdateStride));
+    bool due;
+    if (ForceFull != 0u || !everUpdated) {
+        due = true;
+    } else if (UsePriority > 0.5) {
+        uint lastFrame = LastUpdated[record] - 1u;                       // stamped FrameIndex+1
+        float staleness = float(FrameIndex - lastFrame);                // ≥1 (frames since relight)
+        float dist = length(ClusterCards[record].Origin - CameraPos);
+        float nearW = PriorityNearDist / (PriorityNearDist + dist);     // 1 at camera → 0 far (smooth, no cliff)
+        // Priority grows with staleness AND proximity. Divide by PriorityScale (C# sets it so the mean due-rate
+        // matches the budget) → a probability; a fixed per-record/per-frame hash gates it. saturate keeps very
+        // stale/near cards at prob 1 (always due) so they never lag.
+        float prob = saturate((staleness * (0.25 + nearW)) / max(PriorityScale, 1e-3));
+        due = Hash(record * 2654435761u ^ (FrameIndex * 40503u)) < prob;
+    } else {
+        due = (record % UpdateStride) == (FrameIndex % UpdateStride);   // legacy flat round-robin
+    }
     if (!due) {
         CardRadiance[record] = float4(PrevCard[record].rgb, 1.0);   // carry forward
         return;

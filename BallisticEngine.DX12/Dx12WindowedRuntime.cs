@@ -35,6 +35,11 @@ public sealed class Dx12WindowedRuntime : GameWindow, IBallisticEngineRuntime, I
 
     Dx12SwapChain swapChain;
 
+    // Present sync. DEFAULT OFF (uncapped) — vsync caps the player to the refresh rate (60 Hz), which hides the
+    // CPU↔GPU frame overlap (P0b/P0c) and the Lumen tier savings behind the flip wait. BALLISTIC_DX12_VSYNC=1
+    // turns it back on (no tearing, refresh-locked). Read once: it's a launch-time choice, not a per-frame toggle.
+    static readonly bool VSync = Environment.GetEnvironmentVariable("BALLISTIC_DX12_VSYNC") == "1";
+
     public void SetFrequency(int frequency) => UpdateFrequency = frequency;
     public void SwapFrameBuffers() { }   // present is driven by OnRenderFrame
 
@@ -112,7 +117,7 @@ public sealed class Dx12WindowedRuntime : GameWindow, IBallisticEngineRuntime, I
             WindowRenderCallback?.Invoke(args.Time);   // engine renders the scene into the renderer's LDR target
         var r = RenderAsset.Current.Renderer as DX12HDRenderer;
         if (r?.DisplayResource != null)
-            swapChain.PresentTexture(r.DisplayResource, vsync: true);
+            swapChain.PresentTexture(r.DisplayResource, vsync: VSync);
         base.OnRenderFrame(args);
         Profiler.FrameMark();
     }

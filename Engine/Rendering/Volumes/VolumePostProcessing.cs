@@ -117,9 +117,19 @@ public static class VolumePostProcessing {
             fx.LumenIntensity = gi.intensity.Value;
             fx.LumenSkyIntensity = gi.skyIntensity.Value;
             fx.LumenRayCount = gi.rayCount.Value;
-            fx.LumenDenoisePasses = gi.denoisePasses.Value;
             fx.LumenMultiBounce = gi.multiBounce.Value;
             fx.LumenAoStrength = gi.aoStrength.Value;
+            // Quality tier → (probeOct, cardBudget, denoisePasses). Custom honours the per-dial overrides.
+            switch (gi.quality.Value) {
+                case GiQuality.High:        fx.LumenProbeOct = 8; fx.LumenCardBudget = 200000; fx.LumenDenoisePasses = 3; break;
+                case GiQuality.Balanced:    fx.LumenProbeOct = 6; fx.LumenCardBudget = 50000;  fx.LumenDenoisePasses = 1; break;
+                case GiQuality.Performance: fx.LumenProbeOct = 4; fx.LumenCardBudget = 25000;  fx.LumenDenoisePasses = 1; break;
+                default: // Custom
+                    fx.LumenProbeOct = gi.probeOct.Value;
+                    fx.LumenCardBudget = gi.cardBudget.Value;
+                    fx.LumenDenoisePasses = gi.denoisePasses.Value;
+                    break;
+            }
         }
 
         if (stack.GetComponent<Reflections>() is { } refl) {
