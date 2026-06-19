@@ -157,6 +157,15 @@ public sealed class Dx12LumenScene : IDisposable
         // must NOT realloc the 100k-triangle cache or reset the temporal EMA every frame; it only needs its
         // world matrix re-uploaded. (Pre-fix the stamp folded translation → CarDemo rebuilt every frame.)
         int s = ComputeTopologyStamp(sceneAS, objects);
+        bool willRecreate = s != stamp || cardRadianceA == null
+                            || (transformStamp != ComputeTransformStamp(sceneAS));
+        // P0b: a Rebuild/RefreshTransforms below recreates GPU buffers MID-FRAME (CreateUavBuffer → its own
+        // upload submit) that the PREVIOUS frame, still in flight under overlap, may be reading. Drain that
+        // frame FIRST so the realloc can't race it (the realloc'd buffers are then read by nobody). Only on a
+        // recreate frame (topology change / instance motion) — steady-state frames skip it and overlap fully.
+        // No-op when overlap is off (LastFrameFenceTarget already reached). RequestFrameSync (below) then keeps
+        // the NEXT frame from overlapping into this recreate too.
+        if (willRecreate) dev.WaitForFrame(dev.LastFrameFenceTarget);
         if (s != stamp || cardRadianceA == null)
         {
             stamp = s;
@@ -164,6 +173,10 @@ public sealed class Dx12LumenScene : IDisposable
             DirtyThisFrame = true;
             DirtyUpdateCount++;
             loggedThisStamp = false;
+            // P0b: Rebuild recreated GPU buffers that aren't N-buffered (the cache layout is topology-keyed, not
+            // frame-keyed). Force this frame to drain before the next records, so frame N+1 can't read/recycle
+            // across the realloc under overlap. Steady-state (no rebuild) frames overlap fully. No-op overlap-off.
+            dev.RequestFrameSync();
         }
         else
         {
@@ -176,6 +189,7 @@ public sealed class Dx12LumenScene : IDisposable
             {
                 transformStamp = ts;
                 RefreshTransforms(sceneAS);
+                dev.RequestFrameSync();   // P0b: same as Rebuild — recreated non-N-buffered buffers this frame.
             }
         }
         P(s != stamp ? "Rebuild" : "RefreshTransforms");

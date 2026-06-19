@@ -409,9 +409,22 @@ public sealed class Dx12Device : IDisposable {
         ulong target = ++frameFenceValue;
         Queue.Signal(frameFence, target);
         frameFenceTargets[frameSlot] = target;
-        if (FramesInFlight == 1) WaitFrameFence(target);   // P0a fallback: no overlap, drain before returning
+        // P0b: drain when overlap is off (FramesInFlight==1, the P0a fallback) OR when a pass requested a sync
+        // this frame. RequestFrameSync lets a pass that recreated/realloc'd a GPU resource MID-FRAME (e.g. the
+        // Lumen scene's TLAS-driven buffer rebuild, whose lifecycle isn't N-buffered) force this one frame to
+        // complete on the GPU before the CPU records the next — so the next frame can't recycle/read across the
+        // realloc. Steady-state (no rebuild) frames still overlap fully. Cleared each frame.
+        if (FramesInFlight == 1 || syncThisFrame) WaitFrameFence(target);
+        syncThisFrame = false;
         return true;
     }
+
+    // P0b — a pass calls this to force THIS frame to drain on the GPU at EndFrame (no overlap into the next
+    // frame), for the one frame where it recreated/realloc'd a GPU resource that isn't N-buffered (the Lumen
+    // scene's TLAS-driven buffer rebuild). Steady-state frames don't call it → they overlap fully. No-op when
+    // overlap is already off. Cleared in EndFrame.
+    bool syncThisFrame;
+    public void RequestFrameSync() => syncThisFrame = true;
 
     // Block until the GPU has signalled frameFence to at least `target`. Used by BeginFrame (per-slot recycle
     // gate), the FramesInFlight==1 EndFrame, and Flush (so a swapchain resize/present sees the frame drained).
