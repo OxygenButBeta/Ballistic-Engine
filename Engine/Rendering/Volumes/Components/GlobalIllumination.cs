@@ -30,7 +30,9 @@ public sealed class GlobalIllumination : VolumeComponent {
     [Tooltip("Accumulate multi-bounce in the surface-card radiance cache (light bounces more than once).")]
     public readonly BoolParameter multiBounce = new(true);
 
-    [Tooltip("How much the AmbientOcclusion volume's GTAO darkens the GI's contact shading. The ray trace " +
-             "already has macro occlusion, so this is a partial contact-detail term (0 = none, 1 = full GTAO).")]
-    public readonly ClampedFloatParameter aoStrength = new(0.5f, 0f, 1f);
+    [Tooltip("How much the AmbientOcclusion volume's GTAO darkens the GI's contact shading. DEFAULT 0: GTAO is " +
+             "screen-space and dragged a dark 'ghost of nearby geometry' smudge under camera motion, and the RT " +
+             "trace already carries macro occlusion (so it double-darkened). Raise only if a scene specifically " +
+             "wants the extra contact term and tolerates the screen-space artifact (0 = none, 1 = full GTAO).")]
+    public readonly ClampedFloatParameter aoStrength = new(0f, 0f, 1f);
 }

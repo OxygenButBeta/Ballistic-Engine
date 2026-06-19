@@ -188,9 +188,16 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             CameraPos = ctx.CamPos, Intensity = intensity,
             TexelSize = new Vector2(1f / indirect.Width, 1f / indirect.Height),
             RayCount = rayCount, FrameIndex = ctx.DeterministicCapture ? 0f : frameCounter,
-            NormalBias = 0.03f, MaxRayDist = maxDist, UseCards = useCards ? 1f : 0f, ScreenSteps = 16f,
+            NormalBias = EnvF("BALLISTIC_DX12_LUMEN_NORMALBIAS", 0.03f), MaxRayDist = maxDist, UseCards = useCards ? 1f : 0f, ScreenSteps = 16f,
             SkyIntensity = skyIntensity, UseSky = useSky ? 1f : 0f,
-            UseScreenTrace = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOSCREEN") == "1" ? 0f : 1f,
+            // Screen-trace DEFAULT OFF. It contributed a "ghost of another geometry" smudge that's static (not
+            // temporal) and GI-only: a screen-trace hit returns the hit pixel's full LIT SceneColor (albedo
+            // INCLUDED), so (a) it double-counts albedo vs the RT cards path (which returns albedo-free irradiance
+            // the combine multiplies), and (b) on a thin silhouette its thickness window mis-hits the FOREGROUND
+            // geometry behind/beside it, painting that surface's colour/shadow onto the edge. The RT trace already
+            // owns near+mid+far GI correctly and view-independently, so screen-trace's only role (a cheap contact
+            // bounce) isn't worth the artifact. Re-enable with BALLISTIC_DX12_LUMEN_SCREEN=1.
+            UseScreenTrace = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_SCREEN") == "1" ? 1f : 0f,
             // Short confident-contact range for the screen trace; mid/far GI is RT (view-independent). The old
             // behaviour let ANY on-screen hit veto RT → view-dependent darkening when the light source panned off.
             ScreenRange = EnvF("BALLISTIC_DX12_LUMEN_SCREEN_RANGE", 1.5f),
@@ -323,8 +330,13 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // (so the fallback's contents never affect the output). This is what makes the AmbientOcclusion override
         // drive contact detail in the GI; the RT trace already has macro occlusion so the default strength is
         // partial (no double-darkening of corners).
+        // GTAO is NOT mixed into the GI by default. It's a SCREEN-SPACE term, so under camera motion it dragged a
+        // dark "ghost of nearby geometry" smudge onto every surface (static per view, GI-only — the reported bug),
+        // and the Lumen RT trace ALREADY carries macro occlusion (rays that don't escape find less light), so GTAO
+        // on top double-darkened corners anyway. Default strength 0 (the volume's LumenAoStrength / env can opt it
+        // back in for a scene that specifically wants the extra contact term and tolerates the screen-space cost).
         bool aoOn = ctx.Doors.Ssao && fx.SSAOEnabled;
-        float aoStrength = aoOn ? EnvF("BALLISTIC_DX12_LUMEN_AO", fx.LumenAoStrength) : 0f;
+        float aoStrength = aoOn ? EnvF("BALLISTIC_DX12_LUMEN_AO", 0f) : 0f;
         *(CombineConstants*)combineCbMapped = new CombineConstants
         {
             AoStrength = aoStrength,

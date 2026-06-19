@@ -338,16 +338,22 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
         //   • motion barely lowers trust (the reprojection already handles motion; we don't want a brightness ramp).
         //   • the PULSE is bounded by the LUMINANCE CLAMP instead (a tight ±band keeps each frame's result close to
         //     the stable history, so a noisy fresh E can't flash brighter/darker than the converged value).
+        // The depth band catches DISOCCLUSION (the reprojected texel now sees a DIFFERENT surface). It must be
+        // tight enough to reject a thin silhouette's far/near neighbour — a window ledge whose front and the wall
+        // behind it differ by only a few %; a wide (25%) band let the wall's history bleed onto the ledge as a
+        // moving "smudge/leak" when the camera turned (the reported bug, GI-only). 8% catches it. The per-frame
+        // PULSE that a tight band used to cause is now held by the luminance clamp below (the right division of
+        // labour: depth = disocclusion, clamp = flicker), so we can keep depth tight without bringing pulse back.
         float onScreen = (wValid && all(prevUv >= 0.0) && all(prevUv <= 1.0)) ? 1.0 : 0.0;
-        float depthAgree = saturate(1.0 - abs(hist.a - depth) / max(depth * 0.25, 1e-4));   // wide → disocclusion only
+        float depthAgree = saturate(1.0 - abs(hist.a - depth) / max(depth * 0.08, 1e-4));   // tight → thin-edge disocclusion
         float motionTrust = saturate(1.0 - motionTexels * 0.04);                            // very gentle
         float trust = onScreen * depthAgree * motionTrust;
 
-        // Luminance clamp: bound the history's brightness to a TIGHT band around this frame's E so neither a noisy
-        // fresh frame nor a stale history can pulse. This is the primary anti-flicker now (not the depth reject).
+        // Luminance clamp: bound the history's brightness to a TIGHT band around this frame's E — the PRIMARY
+        // anti-flicker (so the tight depth band above doesn't reintroduce the per-frame pulse). ±~25%.
         float lh = max(dot(hist.rgb, float3(0.2126, 0.7152, 0.0722)), 1e-4);
         float le = dot(E, float3(0.2126, 0.7152, 0.0722));
-        float lClamped = clamp(lh, le * 0.7, le * 1.5 + 1e-3);
+        float lClamped = clamp(lh, le * 0.75, le * 1.3 + 1e-3);
         float3 clampedHist = hist.rgb * (lClamped / lh);
 
         // Weight: ProbeAlpha when trusted (slow, stable accumulation), easing to 1 only on a real disocclusion.
