@@ -109,6 +109,8 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
     unsafe byte* bloomCbMapped;
     int bloomCbStride;                  // 256-aligned per-pass slot stride; one slot per down + up draw
     int bloomCbSlots;                   // total CB/SRV slots provisioned (down chain + up chain)
+    long bloomCbFrameStride;            // P0b: bytes per frame slab (stride*slots); buffer ×FramesInFlight
+    long BloomCbFrameOffset => (long)dev.FrameSlot * bloomCbFrameStride;   // 0 when overlap off
     Dx12DescriptorHeap bloomSrvVisible; // source SRV per pass (one per down + up draw)
 
     // VERBATIM BuildComposite (which chained BuildLumAverage → BuildBloom). Allocates everything once.
@@ -232,8 +234,11 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         // Max draws/frame = down chain (≤ BloomMaxLevels) + up chain (≤ BloomMaxLevels-1) ≤ 2*BloomMaxLevels.
         bloomCbSlots = BloomMaxLevels * 2;
         bloomCbStride = (Marshal.SizeOf<BloomConstants>() + 255) & ~255;
+        // P0b: the bloom CB ring is CPU-written every frame → N-buffer (FramesInFlight slabs) + FrameSlot offset
+        // so overlap can't stomp it. The bloomSrvVisible heap is already framesInFlight-aware (auto offset).
+        bloomCbFrameStride = (long)bloomCbStride * bloomCbSlots;
         bloomCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)(bloomCbStride * bloomCbSlots)), ResourceStates.GenericRead);
+            ResourceDescription.Buffer((ulong)(bloomCbFrameStride * dev.FramesInFlight)), ResourceStates.GenericRead);
         bloomCbMapped = bloomCb.Map<byte>(0);
         bloomSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, bloomCbSlots, shaderVisible: true, framesInFlight: dev.FramesInFlight);
@@ -278,7 +283,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         void Pass(ID3D12PipelineState pso, Dx12OffscreenTarget passSrc, Dx12OffscreenTarget dst, float threshold, float knee) {
             int s = slot++;
             // Source texel size = 1 / the SOURCE level being read (tap spacing is in the source's pixels).
-            *(BloomConstants*)(bloomCbMapped + s * bloomCbStride) = new BloomConstants {
+            *(BloomConstants*)(bloomCbMapped + BloomCbFrameOffset + s * bloomCbStride) = new BloomConstants {
                 TexelSize = new Vector2(1f / passSrc.Width, 1f / passSrc.Height), Threshold = threshold, Knee = knee,
             };
             passSrc.ColorToShaderResource();
@@ -287,7 +292,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
                 cl.SetGraphicsRootSignature(bloomRootSig);
                 cl.SetPipelineState(pso);
                 cl.SetDescriptorHeaps(bloomSrvVisible.Heap);
-                cl.SetGraphicsRootConstantBufferView(0, bloomCb.GPUVirtualAddress + (ulong)(s * bloomCbStride));
+                cl.SetGraphicsRootConstantBufferView(0, bloomCb.GPUVirtualAddress + (ulong)(BloomCbFrameOffset + s * bloomCbStride));
                 cl.SetGraphicsRootDescriptorTable(1, bloomSrvVisible.Gpu(s));
                 cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
                 cl.DrawInstanced(3, 1, 0, 0);

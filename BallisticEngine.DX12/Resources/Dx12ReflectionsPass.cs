@@ -93,6 +93,9 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     ID3D12PipelineState ssrMarchPso, ssrCombinePso;
     ID3D12Resource ssrCb;
     unsafe byte* ssrCbMapped;
+    int ssrCbStride;                    // P0b: 256-aligned per-frame slab stride (×FramesInFlight buffer)
+    // P0b: byte offset of THIS frame's ssrCb slab (0 when overlap off). Applied to every ssrCb write+bind.
+    long SsrCbOffset => (long)dev.FrameSlot * ssrCbStride;
     Dx12OffscreenTarget ssrTarget;      // half-res RGBA16F reflection (rgb + strength); also RT reflections' UAV output
     Dx12OffscreenTarget ssrScene;       // full-res scratch: combine writes here, then copied back to `target`
     Dx12DescriptorHeap ssrSrvVisible;   // 5 SRVs per pass (10-slot ring)
@@ -176,7 +179,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Matrix4x4 view = ctx.View, proj = ctx.Proj;
         Matrix4x4.Invert(proj, out Matrix4x4 invProj);
-        *(SsrConstants*)ssrCbMapped = new SsrConstants {
+        *(SsrConstants*)(ssrCbMapped + SsrCbOffset) = new SsrConstants {
             Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProj),
             ViewMatrix = Matrix4x4.Transpose(view),
             Intensity = ForcedIntensity(ctx),
@@ -203,7 +206,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         ssrTarget.RenderColorOnly(cl => {
             cl.SetGraphicsRootSignature(ssrRootSig); cl.SetPipelineState(ssrMarchPso);
             cl.SetDescriptorHeaps(ssrSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress);
+            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress + (ulong)SsrCbOffset);
             cl.SetGraphicsRootDescriptorTable(1, ssrSrvVisible.Gpu(mb));
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
@@ -222,7 +225,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         // Combine (full-res) → ssrScene, reading scene color (t0), depth (t1), denoised reflection (t4). The
         // temporal pass overwrote ssrCb (Intensity = hasHistory) — restore the full combine SsrConstants.
         Matrix4x4.Invert(proj, out Matrix4x4 invProjC);
-        *(SsrConstants*)ssrCbMapped = new SsrConstants {
+        *(SsrConstants*)(ssrCbMapped + SsrCbOffset) = new SsrConstants {
             Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProjC),
             ViewMatrix = Matrix4x4.Transpose(view), Intensity = ForcedIntensity(ctx),
             TexelSize = new Vector2(1f / ssrTarget.Width, 1f / ssrTarget.Height),
@@ -237,7 +240,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         ssrScene.RenderColorOnly(cl => {
             cl.SetGraphicsRootSignature(ssrRootSig); cl.SetPipelineState(ssrCombinePso);
             cl.SetDescriptorHeaps(ssrSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress);
+            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress + (ulong)SsrCbOffset);
             cl.SetGraphicsRootDescriptorTable(1, ssrSrvVisible.Gpu(cb));
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
@@ -258,7 +261,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         Dx12OffscreenTarget histRead = ssrHistWriteB ? ssrHistoryA : ssrHistoryB;
         Dx12OffscreenTarget histWrite = ssrHistWriteB ? ssrHistoryB : ssrHistoryA;
         histRead.ColorToShaderResource();
-        *(SsrConstants*)ssrCbMapped = new SsrConstants {
+        *(SsrConstants*)(ssrCbMapped + SsrCbOffset) = new SsrConstants {
             Intensity = ssrHistValid ? 1f : 0f,   // repurposed as the hasHistory flag for PSTemporal
             TexelSize = new Vector2(1f / ssrTarget.Width, 1f / ssrTarget.Height),
         };
@@ -272,7 +275,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         histWrite.RenderColorOnly(cl => {
             cl.SetGraphicsRootSignature(ssrRootSig); cl.SetPipelineState(ssrTemporalPso);
             cl.SetDescriptorHeaps(ssrSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress);
+            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress + (ulong)SsrCbOffset);
             cl.SetGraphicsRootDescriptorTable(1, ssrSrvVisible.Gpu(tb));
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
@@ -452,7 +455,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
 
         // Reuse the SSR combine (depth-aware upsample + Fresnel lerp into the scene color).
         Matrix4x4.Invert(proj, out Matrix4x4 invProj);
-        *(SsrConstants*)ssrCbMapped = new SsrConstants {
+        *(SsrConstants*)(ssrCbMapped + SsrCbOffset) = new SsrConstants {
             Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProj),
             ViewMatrix = Matrix4x4.Transpose(view), Intensity = ForcedIntensity(ctx),
             TexelSize = new Vector2(1f / ssrTarget.Width, 1f / ssrTarget.Height),
@@ -468,7 +471,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         ssrScene.RenderColorOnly(cl => {
             cl.SetGraphicsRootSignature(ssrRootSig); cl.SetPipelineState(ssrCombinePso);
             cl.SetDescriptorHeaps(ssrSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress);
+            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress + (ulong)SsrCbOffset);
             cl.SetGraphicsRootDescriptorTable(1, ssrSrvVisible.Gpu(cb));
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
@@ -518,9 +521,13 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         ssrCombinePso = MakePso("PSCombine", Dx12OffscreenTarget.HdrFormat);
         ssrTemporalPso = MakePso("PSTemporal", Dx12OffscreenTarget.HdrFormat);   // RT-reflection temporal denoise
 
-        int cbSize = (Marshal.SizeOf<SsrConstants>() + 255) & ~255;
+        // P0b: ssrCb is written 4× per frame (march/combine/temporal/RT) at the SAME address — under frame
+        // overlap the next frame's march would stomp the constants while the GPU still reads this frame's
+        // combine. N-buffer the buffer (FramesInFlight slabs) and offset every write+bind by FrameSlot.
+        // FramesInFlight==1 (overlap off) → stride*0 = base, byte-identical to the old single slot.
+        ssrCbStride = (Marshal.SizeOf<SsrConstants>() + 255) & ~255;
         ssrCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+            ResourceDescription.Buffer((ulong)(ssrCbStride * dev.FramesInFlight)), ResourceStates.GenericRead);
         ssrCbMapped = ssrCb.Map<byte>(0);
         ssrSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 10, shaderVisible: true, framesInFlight: dev.FramesInFlight);

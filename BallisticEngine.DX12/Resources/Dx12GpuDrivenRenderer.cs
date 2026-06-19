@@ -44,6 +44,13 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     int cullParamSlotSize;       // shadow CullParams slot
     int geoCullParamSlotSize;    // geometry GeoCullParams slot (bigger — has the Hi-Z fields)
     int metaStride, perDrawStride, materialStride;
+    // P0b frame-overlap: every per-frame CPU-mapped UPLOAD buffer is N-buffered (×dev.FramesInFlight) so the CPU
+    // writing frame F+1's slab can't stomp data the GPU is still reading from frame F. Each *FrameStride is the
+    // byte span of ONE frame's region; the live slot is dev.FrameSlot*stride. At FramesInFlight==1 every stride
+    // multiplies a single-frame alloc and FrameSlot is always 0 → offsets are 0 → byte-identical to pre-P0b.
+    long metaFrameStride;          // metaUpload: metaStride*Capacity bytes per frame
+    long cullParamFrameStride;     // cullParamUpload: geoCullParamSlotSize*MaxGroups bytes per frame
+    long materialsFrameStride;     // materials: materialStride*MaxMaterials bytes per frame
     public long LastTris;        // triangles fed to the GPU cull this frame (pre-cull upper bound, for stats)
     public int LastSubmeshes;    // submeshes fed to the GPU cull this frame
 
@@ -95,6 +102,8 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     ID3D12Resource shadowCommands;     // DEFAULT UAV
     ID3D12Resource shadowPerDraws;     // DEFAULT UAV
     int shadowMetaStride;
+    long shadowMetaFrameStride;        // P0b: shadowMetaUpload bytes per frame (shadowMetaStride*ShadowCapacity)
+    long shadowCullParamFrameStride;   // P0b: shadowCullParamUpload bytes per frame
     readonly List<(int cascade, Dx12Buffer<GLVector3> vb, Dx12IndexBuffer ib, int baseIdx, int count)> shadowSlices = new();
 
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
@@ -197,18 +206,21 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         commands = dev.CreateUavBuffer<byte>(zeroCmds, ResourceStates.IndirectArgument);
         perDraws = dev.CreateUavBuffer<PerDraw>(zeroPerDraw, ResourceStates.NonPixelShaderResource);
 
+        metaFrameStride = (long)metaStride * Capacity;
         metaUpload = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)(metaStride * Capacity)), ResourceStates.GenericRead);
+            ResourceDescription.Buffer((ulong)(metaFrameStride * dev.FramesInFlight)), ResourceStates.GenericRead);
         metaMapped = metaUpload.Map<byte>(0);
 
         cullParamSlotSize = (System.Runtime.InteropServices.Marshal.SizeOf<CullParams>() + 255) & ~255;
         geoCullParamSlotSize = (System.Runtime.InteropServices.Marshal.SizeOf<GeoCullParams>() + 255) & ~255;
+        cullParamFrameStride = (long)geoCullParamSlotSize * MaxGroups;
         cullParamUpload = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)(geoCullParamSlotSize * MaxGroups)), ResourceStates.GenericRead);
+            ResourceDescription.Buffer((ulong)(cullParamFrameStride * dev.FramesInFlight)), ResourceStates.GenericRead);
         cullParamMapped = cullParamUpload.Map<byte>(0);
 
+        materialsFrameStride = (long)materialStride * MaxMaterials;
         materials = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)((long)materialStride * MaxMaterials)), ResourceStates.GenericRead);
+            ResourceDescription.Buffer((ulong)(materialsFrameStride * dev.FramesInFlight)), ResourceStates.GenericRead);
         materialsMapped = materials.Map<byte>(0);
     }
 
@@ -279,7 +291,13 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             HasRoughnessMap = hasRough ? 1f : 0f, PackedOrm = mat.PackedOrm ? 1f : 0f,
             Cutout = mat.Cutout ? 1f : 0f, HasEmissive = mat.IsEmissive ? 1f : 0f,
         };
-        *(GpuMaterial*)(materialsMapped + (long)id * materialStride) = gm;
+        // materials is stamp-gated (rebuilt only on a material-set change, not per frame), but N-buffered for
+        // overlap safety: when a rebuild lands on frame F, an in-flight earlier frame may still be reading its
+        // own slab, and a later frame will read a DIFFERENT slot. The data is frame-invariant (same stamp = same
+        // bytes), so write the entry into ALL N slabs (like ClusteredLights' clusterMin/Max) — every slot holds
+        // correct material data regardless of which FrameSlot the next draw reads from.
+        for (int f = 0; f < dev.FramesInFlight; f++)
+            *(GpuMaterial*)(materialsMapped + f * materialsFrameStride + (long)id * materialStride) = gm;
     }
 
     // R1.0 (GI Pragmatic Revival) — robust per-submesh MaterialId for the RT geometry build. Dx12RtGeometry
@@ -304,7 +322,10 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     // G-buffer, so they reuse THIS exact bindless material table (no parallel build → no drift). The table is
     // a root SRV in the raster draw; here we hand the RT pass its GPU address + the Material→id map so it can
     // build a per-triangle MaterialId buffer (Dx12RtGeometry) that resolves the same ids GBufferBindless uses.
-    public ulong MaterialsGpuAddress => materials?.GPUVirtualAddress ?? 0;
+    // Live FrameSlot's material slab (all N slabs hold identical, frame-invariant data — see RegisterMaterial —
+    // so the RT/Lumen/reflection passes that read this within the same frame decode the same bytes the raster
+    // draw does). FramesInFlight==1 → FrameSlot 0 → offset 0 → byte-identical to pre-P0b.
+    public ulong MaterialsGpuAddress => materials is null ? 0 : materials.GPUVirtualAddress + (ulong)(dev.FrameSlot * materialsFrameStride);
     public int MaterialCount => materialCount;
     public bool TryMaterialId(Material mat, out int id) {
         if (mat is not null) return materialIds.TryGetValue(mat, out id);
@@ -373,6 +394,10 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             list.Add(r);
         }
 
+        // P0b: write into THIS frame's slab of the N-buffered uploads (offset 0 at FramesInFlight==1).
+        long metaSlot = (long)dev.FrameSlot * metaFrameStride;
+        long cullParamSlot = (long)dev.FrameSlot * cullParamFrameStride;
+
         int total = 0, groupCount = 0;
         long triAccum = 0;
         foreach (var kv in byMesh) {
@@ -398,7 +423,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
                     if (!materialIds.TryGetValue(mat, out int matId)) continue;
                     mesh.GetSubMeshBounds(s, out GLVector3 lmin, out GLVector3 lmax);
                     WorldAabb(lmin, lmax, model, out Vector3 wlo, out Vector3 whi);
-                    *(SubmeshMeta*)(metaMapped + (long)total * metaStride) = new SubmeshMeta {
+                    *(SubmeshMeta*)(metaMapped + metaSlot + (long)total * metaStride) = new SubmeshMeta {
                         Mvp = Matrix4x4.Transpose(mvp), Model = Matrix4x4.Transpose(model),
                         AabbMin = new Vector4(wlo, 0), AabbMax = new Vector4(whi, 0),
                         FirstIndex = (uint)sub.IndexStart, IndexCount = (uint)sub.IndexCount,
@@ -419,7 +444,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
                 ViewProj = Matrix4x4.Transpose(viewProjUnjittered), View = Matrix4x4.Transpose(view),
                 HizParams = new Vector4(hiz.Width, hiz.Height, hiz.MipCount, near), HizFar = new Vector4(far, 0, 0, 0),
             };
-            *(GeoCullParams*)(cullParamMapped + (long)groupCount * geoCullParamSlotSize) = cp;
+            *(GeoCullParams*)(cullParamMapped + cullParamSlot + (long)groupCount * geoCullParamSlotSize) = cp;
             groups.Add((vb, nb, ub, tb, ib, groupBase, groupTotal));
             groupCount++;
         }
@@ -435,11 +460,11 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);
         cl.SetComputeRootSignature(geoCullRootSig);
         cl.SetPipelineState(cullPso);
-        cl.SetComputeRootShaderResourceView(1, metaUpload.GPUVirtualAddress);
+        cl.SetComputeRootShaderResourceView(1, metaUpload.GPUVirtualAddress + (ulong)metaSlot);
         cl.SetComputeRootUnorderedAccessView(2, commands.GPUVirtualAddress);
         cl.SetComputeRootUnorderedAccessView(3, perDraws.GPUVirtualAddress);
         for (int g = 0; g < groups.Count; g++) {
-            cl.SetComputeRootConstantBufferView(0, cullParamUpload.GPUVirtualAddress + (ulong)((long)g * geoCullParamSlotSize));
+            cl.SetComputeRootConstantBufferView(0, cullParamUpload.GPUVirtualAddress + (ulong)(cullParamSlot + (long)g * geoCullParamSlotSize));
             cl.Dispatch((uint)((groups[g].count + 63) / 64), 1, 1);
         }
 
@@ -452,7 +477,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         cl.SetGraphicsRootSignature(drawRootSig);
         cl.SetPipelineState(drawPso);
         cl.SetGraphicsRootShaderResourceView(1, perDraws.GPUVirtualAddress);
-        cl.SetGraphicsRootShaderResourceView(2, materials.GPUVirtualAddress);
+        cl.SetGraphicsRootShaderResourceView(2, materials.GPUVirtualAddress + (ulong)(dev.FrameSlot * materialsFrameStride));
         cl.SetGraphicsRootConstantBufferView(3, motionCbAddress);   // b1 motion (per pass)
         cl.IASetPrimitiveTopology(Vortice.Direct3D.PrimitiveTopology.TriangleList);
         for (int g = 0; g < groups.Count; g++) {
@@ -514,11 +539,13 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     unsafe void AllocateShadowBuffers() {
         shadowCommands = dev.CreateUavBuffer<byte>(new byte[ShadowCapacity * DrawCmdStride], ResourceStates.IndirectArgument);
         shadowPerDraws = dev.CreateUavBuffer<ShadowPerDraw>(new ShadowPerDraw[ShadowCapacity], ResourceStates.NonPixelShaderResource);
+        shadowMetaFrameStride = (long)shadowMetaStride * ShadowCapacity;
         shadowMetaUpload = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)((long)shadowMetaStride * ShadowCapacity)), ResourceStates.GenericRead);
+            ResourceDescription.Buffer((ulong)(shadowMetaFrameStride * dev.FramesInFlight)), ResourceStates.GenericRead);
         shadowMetaMapped = shadowMetaUpload.Map<byte>(0);
+        shadowCullParamFrameStride = (long)cullParamSlotSize * ShadowCascades * MaxGroups;
         shadowCullParamUpload = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)((long)cullParamSlotSize * ShadowCascades * MaxGroups)), ResourceStates.GenericRead);
+            ResourceDescription.Buffer((ulong)(shadowCullParamFrameStride * dev.FramesInFlight)), ResourceStates.GenericRead);
         shadowCullParamMapped = shadowCullParamUpload.Map<byte>(0);
     }
 
@@ -537,6 +564,10 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             if (!byMesh.TryGetValue(m, out var list)) { list = new(); byMesh[m] = list; }
             list.Add(r);
         }
+
+        // P0b: write into THIS frame's slab (offset 0 at FramesInFlight==1).
+        long shadowMetaSlot = (long)dev.FrameSlot * shadowMetaFrameStride;
+        long shadowCullParamSlot = (long)dev.FrameSlot * shadowCullParamFrameStride;
 
         int total = 0, sliceCount = 0;
         var planes = new Vector4[6];
@@ -557,7 +588,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
                         if (sub.IndexCount <= 0) continue;
                         mesh.GetSubMeshBounds(s, out GLVector3 lmin, out GLVector3 lmax);
                         WorldAabb(lmin, lmax, model, out Vector3 wlo, out Vector3 whi);
-                        *(ShadowMeta*)(shadowMetaMapped + (long)total * shadowMetaStride) = new ShadowMeta {
+                        *(ShadowMeta*)(shadowMetaMapped + shadowMetaSlot + (long)total * shadowMetaStride) = new ShadowMeta {
                             LightMvp = lightMvp, AabbMin = new Vector4(wlo, 0), AabbMax = new Vector4(whi, 0),
                             FirstIndex = (uint)sub.IndexStart, IndexCount = (uint)sub.IndexCount,
                         };
@@ -570,7 +601,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
                     P0 = planes[0], P1 = planes[1], P2 = planes[2], P3 = planes[3], P4 = planes[4], P5 = planes[5],
                     SubmeshCount = (uint)count, OutBase = (uint)sliceBase,
                 };
-                *(CullParams*)(shadowCullParamMapped + (long)sliceCount * cullParamSlotSize) = cp;
+                *(CullParams*)(shadowCullParamMapped + shadowCullParamSlot + (long)sliceCount * cullParamSlotSize) = cp;
                 shadowSlices.Add((c, vb, ib, sliceBase, count));
                 sliceCount++;
             }
@@ -581,11 +612,11 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         cl.ResourceBarrierTransition(shadowPerDraws, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
         cl.SetComputeRootSignature(cullRootSig);
         cl.SetPipelineState(shadowCullPso);
-        cl.SetComputeRootShaderResourceView(1, shadowMetaUpload.GPUVirtualAddress);
+        cl.SetComputeRootShaderResourceView(1, shadowMetaUpload.GPUVirtualAddress + (ulong)shadowMetaSlot);
         cl.SetComputeRootUnorderedAccessView(2, shadowCommands.GPUVirtualAddress);
         cl.SetComputeRootUnorderedAccessView(3, shadowPerDraws.GPUVirtualAddress);
         for (int i = 0; i < shadowSlices.Count; i++) {
-            cl.SetComputeRootConstantBufferView(0, shadowCullParamUpload.GPUVirtualAddress + (ulong)((long)i * cullParamSlotSize));
+            cl.SetComputeRootConstantBufferView(0, shadowCullParamUpload.GPUVirtualAddress + (ulong)(shadowCullParamSlot + (long)i * cullParamSlotSize));
             cl.Dispatch((uint)((shadowSlices[i].count + 63) / 64), 1, 1);
         }
         cl.ResourceBarrierTransition(shadowCommands, ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument);

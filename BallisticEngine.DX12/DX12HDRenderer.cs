@@ -66,6 +66,8 @@ public sealed class DX12HDRenderer : HDRenderer
     ID3D12PipelineState skinnedGbufferPso;
     ID3D12Resource boneMatrixRing; // upload heap: transposed float4x4[] per skinned draw
     unsafe byte* boneMatrixMapped;
+    long boneFrameStride;       // P0b: bytes per frame slab; buffer ×FramesInFlight, offset by FrameSlot
+    long BoneFrameOffset => (long)dev.FrameSlot * boneFrameStride;
     int boneMatrixSlotSize; // bytes per skinned draw (maxBones * 64, 256-aligned)
     int boneMatrixSlotCount; // skinned draws per frame ceiling
     const int MaxBonesPerDraw = 256; // skeleton bone ceiling for one skinned mesh
@@ -208,6 +210,9 @@ public sealed class DX12HDRenderer : HDRenderer
     ID3D12Resource cbRing;
     int cbSlotSize;
     int cbSlotCount;
+    long cbFrameStride;         // P0b: bytes per frame slab (cbSlotSize*cbSlotCount); buffer is ×FramesInFlight
+    // P0b: byte offset of THIS frame's per-draw CB slab (0 when overlap off). Added to every cbRing write+bind.
+    long CbFrameOffset => (long)dev.FrameSlot * cbFrameStride;
     unsafe byte* cbMapped;
 
     // Shader-visible SRV heap: per draw we copy the material's diffuse SRV into the next slot and point
@@ -484,9 +489,13 @@ public sealed class DX12HDRenderer : HDRenderer
 
         cbSlotSize = (System.Runtime.InteropServices.Marshal.SizeOf<DrawConstants>() + 255) & ~255;
         cbSlotCount = 8192; // submesh draws per frame ceiling (SunTemple ~hundreds)
+        // P0b: the per-draw CB ring is CPU-written every frame, so under overlap frame N+1's draws would stomp
+        // slots the GPU still reads for frame N. N-buffer it (FramesInFlight slabs) + offset every write/bind by
+        // FrameSlot. FramesInFlight==1 (overlap off) → cbFrameStride*0 = base → byte-identical to the old ring.
+        cbFrameStride = (long)cbSlotSize * cbSlotCount;
         cbRing = dev.Device.CreateCommittedResource(
             HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)(cbSlotSize * cbSlotCount)), ResourceStates.GenericRead);
+            ResourceDescription.Buffer((ulong)(cbFrameStride * dev.FramesInFlight)), ResourceStates.GenericRead);
         cbMapped = cbRing.Map<byte>(0);
 
         // 6 SRVs per draw (the material table) — size the ring for the worst-case draw count.
@@ -941,9 +950,11 @@ public sealed class DX12HDRenderer : HDRenderer
         // Per-frame bone-matrix upload ring: one MaxBonesPerDraw-matrix slot per skinned draw.
         boneMatrixSlotSize = (MaxBonesPerDraw * 64 + 255) & ~255; // 64 bytes per float4x4
         boneMatrixSlotCount = 64; // skinned characters per frame ceiling
+        // P0b: CPU-written every frame → N-buffer + FrameSlot-offset (same as cbRing). Overlap off → base 0.
+        boneFrameStride = (long)boneMatrixSlotSize * boneMatrixSlotCount;
         boneMatrixRing = dev.Device.CreateCommittedResource(
             HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)((long)boneMatrixSlotSize * boneMatrixSlotCount)),
+            ResourceDescription.Buffer((ulong)(boneFrameStride * dev.FramesInFlight)),
             ResourceStates.GenericRead);
         boneMatrixMapped = boneMatrixRing.Map<byte>(0);
     }
@@ -1415,9 +1426,9 @@ public sealed class DX12HDRenderer : HDRenderer
                         UseIBL = iblActiveThisFrame ? 1f : 0f,
                         PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f,
                     };
-                    *(DrawConstants*)(cbMapped + (long)slot * cbSlotSize) = c;
+                    *(DrawConstants*)(cbMapped + CbFrameOffset + (long)slot * cbSlotSize) = c;
                     cl.SetGraphicsRootConstantBufferView(0,
-                        cbRing.GPUVirtualAddress + (ulong)((long)slot * cbSlotSize));
+                        cbRing.GPUVirtualAddress + (ulong)(CbFrameOffset + (long)slot * cbSlotSize));
 
                     // 6 material SRVs (t0..t5); null slots resolve to neutral defaults.
                     int tableStart = srvVisible.AllocateRange(MaterialSrvCount);
@@ -1463,12 +1474,12 @@ public sealed class DX12HDRenderer : HDRenderer
                 // hands us mesh-local skinning matrices (inverseBind * worldBone); identity == bind pose.
                 Matrix4[] skin = r.SkinningMatrices;
                 int boneCount = skin is null ? 0 : System.Math.Min(skin.Length, MaxBonesPerDraw);
-                byte* dst = boneMatrixMapped + (long)boneSlot * boneMatrixSlotSize;
+                byte* dst = boneMatrixMapped + BoneFrameOffset + (long)boneSlot * boneMatrixSlotSize;
                 var mptr = (Matrix4x4*)dst;
                 for (int b = 0; b < boneCount; b++)
                     mptr[b] = Matrix4x4.Transpose(skin[b]);
                 // Any unset slot stays whatever was there; only indices < boneCount are referenced by weights.
-                ulong boneGpuAddr = boneMatrixRing.GPUVirtualAddress + (ulong)((long)boneSlot * boneMatrixSlotSize);
+                ulong boneGpuAddr = boneMatrixRing.GPUVirtualAddress + (ulong)(BoneFrameOffset + (long)boneSlot * boneMatrixSlotSize);
 
                 if (!skinnedStateSet)
                 {
@@ -1530,9 +1541,9 @@ public sealed class DX12HDRenderer : HDRenderer
                         UseIBL = iblActiveThisFrame ? 1f : 0f,
                         PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f,
                     };
-                    *(DrawConstants*)(cbMapped + (long)slot * cbSlotSize) = c;
+                    *(DrawConstants*)(cbMapped + CbFrameOffset + (long)slot * cbSlotSize) = c;
                     cl.SetGraphicsRootConstantBufferView(0,
-                        cbRing.GPUVirtualAddress + (ulong)((long)slot * cbSlotSize));
+                        cbRing.GPUVirtualAddress + (ulong)(CbFrameOffset + (long)slot * cbSlotSize));
 
                     int tableStart = srvVisible.AllocateRange(MaterialSrvCount);
                     BindSrv(tableStart + 0, mat.Diffuse, TextureType.Diffuse, fallbackDiffuse);
