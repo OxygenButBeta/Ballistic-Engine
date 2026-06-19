@@ -37,11 +37,19 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     public bool Enabled(Dx12FrameContext ctx) {
         if (reflForceEnvUnread) { reflForceEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_REFLECTIONS"); reflForceEnvUnread = false; }
         if (ctx.Doors.Minimal) return false;
-        if (reflForceEnv == "1") return ctx.PostFX.SsrIntensity > 0f;
+        // Force-enable door (A/B harness): run regardless of SsrIntensity — test scenes carry no Reflection volume
+        // so SsrIntensity is 0; the old `SsrIntensity>0` gate made RT reflections un-testable headlessly. Record
+        // substitutes a default intensity when the door forces it on with intensity 0 (ForcedIntensity below).
+        if (reflForceEnv == "1") return true;
         if (reflForceEnv == "0") return false;
         if (ctx.PostFX.SsrIntensity <= 0f) return false;
         return ctx.PostFX.SsrEnabled;
     }
+    // The intensity the A/B door uses when forcing the pass on against a scene with no Reflection volume (SsrIntensity 0).
+    float ForcedIntensity(Dx12FrameContext ctx) =>
+        reflForceEnv == "1" && ctx.PostFX.SsrIntensity <= 0f ? EnvF("BALLISTIC_DX12_REFLECTIONS_INTENSITY", 1f) : ctx.PostFX.SsrIntensity;
+    static float EnvF(string n, float f) => float.TryParse(Environment.GetEnvironmentVariable(n),
+        System.Globalization.CultureInfo.InvariantCulture, out float v) ? v : f;
     string reflForceEnv; bool reflForceEnvUnread = true;
 
     // Temporal reflection denoise master switch. Default ON (kills static-view jitter); BALLISTIC_DX12_REFL_
@@ -154,7 +162,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         *(SsrConstants*)ssrCbMapped = new SsrConstants {
             Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProj),
             ViewMatrix = Matrix4x4.Transpose(view),
-            Intensity = ctx.PostFX.SsrIntensity,
+            Intensity = ForcedIntensity(ctx),
             TexelSize = new Vector2(1f / ssrTarget.Width, 1f / ssrTarget.Height),
         };
 
@@ -199,7 +207,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         Matrix4x4.Invert(proj, out Matrix4x4 invProjC);
         *(SsrConstants*)ssrCbMapped = new SsrConstants {
             Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProjC),
-            ViewMatrix = Matrix4x4.Transpose(view), Intensity = ctx.PostFX.SsrIntensity,
+            ViewMatrix = Matrix4x4.Transpose(view), Intensity = ForcedIntensity(ctx),
             TexelSize = new Vector2(1f / ssrTarget.Width, 1f / ssrTarget.Height),
         };
         ssrSrvVisible.Reset();
@@ -366,7 +374,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         bool useCards = ctx.LumenActiveThisFrame && ctx.LumenScene is { Valid: true } && ctx.PostFX.LumenReflections
                         && Environment.GetEnvironmentVariable("BALLISTIC_DX12_REFL_NOCARDS") != "1";
         *(RtReflConstants*)rtReflCbMapped = new RtReflConstants {
-            InvViewProj = Matrix4x4.Transpose(invVP), CameraPos = camPos, Intensity = ctx.PostFX.SsrIntensity,
+            InvViewProj = Matrix4x4.Transpose(invVP), CameraPos = camPos, Intensity = ForcedIntensity(ctx),
             PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f, NormalBias = 0.05f,
             UseCards = useCards ? 1f : 0f,
             Unused1 = 0f,
@@ -438,7 +446,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         Matrix4x4.Invert(proj, out Matrix4x4 invProj);
         *(SsrConstants*)ssrCbMapped = new SsrConstants {
             Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProj),
-            ViewMatrix = Matrix4x4.Transpose(view), Intensity = ctx.PostFX.SsrIntensity,
+            ViewMatrix = Matrix4x4.Transpose(view), Intensity = ForcedIntensity(ctx),
             TexelSize = new Vector2(1f / ssrTarget.Width, 1f / ssrTarget.Height),
         };
         gbuffer.DepthToShaderResource();
