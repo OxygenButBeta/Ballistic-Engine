@@ -125,9 +125,17 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public Vector3 SunColor; public float LightCount;
         public uint InstanceCount; public uint TotalTris; public float SkyIntensity; public float UseSky;
         public float SkyVisRays; public float EmaAlpha; public float BounceRays; public float HistoryValid;
+        public uint FrameIndex; public uint UpdateStride; public uint ForceFull; public uint Pad0;   // P7 #1
     }
 
     int frameCounter;
+
+    // P7 #1 update-budget dirty tracking: the sun dir/color + light count the cache was last FULLY relit with.
+    // A change (or a topology rebuild) → ForceFull this frame so the round-robin budget never starves a light
+    // change of latency. NaN sentinel forces a full relight on the first frame.
+    Vector3 prevSunDir = new(float.NaN, 0, 0);
+    Vector3 prevSunColor;
+    float prevLightCount = -1f;
 
     public unsafe void Record(Dx12FrameContext ctx)
     {
@@ -315,6 +323,33 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         var sceneAS = ctx.Dxr.SceneAS;
         float emaAlpha = EnvF("BALLISTIC_DX12_LUMEN_EMA", 0.1f);          // conservative temporal blend (0.1 = slow, stable)
         bool bounce = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOBOUNCE") != "1" && ctx.PostFX.LumenMultiBounce;
+
+        // === P7 #1 UPDATE BUDGET ===
+        // Re-light only a round-robin slice of records each frame instead of the whole scene. stride = how many
+        // frames a full sweep takes; a record relights every `stride`-th frame. budget = target records/frame
+        // (the door BALLISTIC_DX12_LUMEN_BUDGET overrides; 0 = unlimited → stride 1 = old behaviour). The EMA
+        // makes a strided update visually identical to a per-frame one for a STATIC light. Small scenes
+        // (tris ≤ budget) get stride 1 automatically (no change). Determinism: a deterministic capture forces
+        // stride 1 (a strided cache depends on frame count → not byte-reproducible).
+        int budget = (int)EnvF("BALLISTIC_DX12_LUMEN_BUDGET", 200000f);
+        int tris = scene.TotalTriangles;
+        uint stride = 1u;
+        // A deterministic capture renders a FIXED frame, so the round-robin phase (FrameIndex % stride) is itself
+        // deterministic → byte-identical across runs. Hence budget is safe under DeterministicCapture (it does NOT
+        // disable it like the EMA does), so `bal perf` measures the real budgeted cost.
+        if (budget > 0 && tris > budget)
+            stride = (uint)Math.Min(8, (tris + budget - 1) / budget);   // cap at 8 → at most ~8-frame react latency
+
+        // ForceFull this frame when the light state changed (or topology rebuilt) so the budget never delays a
+        // light change. Compared against the values the cache was last fully relit with.
+        bool lightChanged = float.IsNaN(prevSunDir.X)
+            || Vector3.DistanceSquared(prevSunDir, sunDir) > 1e-8f
+            || Vector3.DistanceSquared(prevSunColor, ctx.LightColor) > 1e-6f
+            || prevLightCount != clusteredLights.LightCount
+            || scene.DirtyThisFrame;
+        uint forceFull = lightChanged ? 1u : 0u;
+        if (lightChanged) { prevSunDir = sunDir; prevSunColor = ctx.LightColor; prevLightCount = clusteredLights.LightCount; }
+
         *(LumenCardConstants*)cardCbMapped = new LumenCardConstants
         {
             SunDir = sunDir, SunBias = 0.03f, SunColor = ctx.LightColor, LightCount = clusteredLights.LightCount,
@@ -322,6 +357,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             SkyIntensity = skyIntensity, UseSky = useSky ? 1f : 0f, SkyVisRays = 4f,
             EmaAlpha = emaAlpha, BounceRays = bounce ? 4f : 0f,
             HistoryValid = (scene.HistoryValid && !ctx.DeterministicCapture) ? 1f : 0f,
+            FrameIndex = (uint)frameCounter, UpdateStride = stride, ForceFull = forceFull,
         };
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
@@ -333,12 +369,15 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // pixel SRV too (the trace reads it as a root SRV). The read buffer stays SRV for next frame's swap.
         ID3D12Resource cardW = scene.CardRadianceWrite;
         ID3D12Resource cardR = scene.CardRadianceRead;
+        ID3D12Resource ageBuf = scene.LastUpdated;   // P7 #1 per-record age (read+write UAV)
         dev.ExecuteSync(cl =>
         {
             if (scene.StateOf(cardW) != ResourceStates.UnorderedAccess)
                 cl.ResourceBarrierTransition(cardW, scene.StateOf(cardW), ResourceStates.UnorderedAccess);
             if (scene.StateOf(cardR) != ResourceStates.NonPixelShaderResource)
                 cl.ResourceBarrierTransition(cardR, scene.StateOf(cardR), ResourceStates.NonPixelShaderResource);
+            if (ageBuf != null && scene.LastUpdatedState != ResourceStates.UnorderedAccess)
+                cl.ResourceBarrierTransition(ageBuf, scene.LastUpdatedState, ResourceStates.UnorderedAccess);
             cl.SetDescriptorHeaps(bindless.Heap);
             cl.SetComputeRootSignature(cardRootSig);
             cl.SetPipelineState(cardPso);
@@ -351,10 +390,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.SetComputeRootShaderResourceView(6, ctx.GpuDriven.MaterialsGpuAddress);   // t4 GpuMaterials
             cl.SetComputeRootShaderResourceView(7, clusteredLights.LightBufGpuAddress);  // t5 Lights
             cl.SetComputeRootShaderResourceView(8, scene.CardRadianceReadGpu);           // t6 PrevCard (read)
+            cl.SetComputeRootUnorderedAccessView(9, scene.LastUpdatedGpu);               // u1 LastUpdated (age)
             cl.Dispatch((uint)((scene.TotalTriangles + 63) / 64), 1, 1);
             cl.ResourceBarrierTransition(cardW, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
         });
         scene.SetState(cardW, ResourceStates.NonPixelShaderResource);
+        if (ageBuf != null) scene.SetLastUpdatedState(ResourceStates.UnorderedAccess);   // stays UAV (read+write each frame)
         scene.SetState(cardR, ResourceStates.NonPixelShaderResource);
     }
 
@@ -470,6 +511,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         var mats = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(4, 0), ShaderVisibility.All);      // t4
         var lights = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(5, 0), ShaderVisibility.All);    // t5
         var prevCard = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(6, 0), ShaderVisibility.All);  // t6 PrevCard
+        var ageUav = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(1, 0), ShaderVisibility.All);  // u1 LastUpdated
         var clamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
         {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
@@ -483,7 +525,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         cardRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { cbv0, tlasSrv, uavRoot, skyTable, instMeta, rtInst, mats, lights, prevCard }, new[] { clamp, wrap })));
+                new[] { cbv0, tlasSrv, uavRoot, skyTable, instMeta, rtInst, mats, lights, prevCard, ageUav }, new[] { clamp, wrap })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumenCardLight.hlsl");
         byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSMain", "LumenCardLight.hlsl");

@@ -20,6 +20,7 @@
 RaytracingAccelerationStructure Scene : register(t0);
 RWStructuredBuffer<float4> CardRadiance : register(u0);
 TextureCube SkyIrradiance : register(t1);
+RWStructuredBuffer<uint> LastUpdated : register(u1);   // P7 #1: per-record age (frame index of last relight)
 
 struct LumenInstanceMeta { uint TriOffset, TriCount, Pad0, Pad1; float4x4 World; };
 struct RtInstance { uint NormalIdx, UvIdx, IndexIdx, TriMatIdx; uint PositionIdx, TriCount, Pad0, Pad1; };
@@ -43,6 +44,7 @@ cbuffer LumenCardConstants : register(b0) {
     float3 SunColor; float LightCount;   // sun radiance (RAW HDR); # punctual lights
     uint InstanceCount; uint TotalTris; float SkyIntensity; float UseSky;
     float SkyVisRays; float EmaAlpha; float BounceRays; float HistoryValid;   // P4: temporal blend + 2nd-bounce gather
+    uint FrameIndex; uint UpdateStride; uint ForceFull; uint Pad0;   // P7 #1: update-budget round-robin
 };
 SamplerState LinearClamp : register(s0);
 SamplerState LinearWrap  : register(s1);
@@ -94,6 +96,21 @@ uint InstanceForTri(uint tri) {
 void CSMain(uint3 dtid : SV_DispatchThreadID) {
     uint gtri = dtid.x;
     if (gtri >= TotalTris) return;
+
+    // P7 #1 — UPDATE BUDGET. Only a round-robin slice of records relight each frame; the rest carry their
+    // previous cache radiance forward unchanged. The cache is view-independent + EMA-stable, so a record that
+    // is re-lit every `UpdateStride` frames looks identical to one re-lit every frame (just slower to react to
+    // a light change). `ForceFull` (set on a sun/light/transform dirty frame) overrides → full relight that
+    // frame, so light changes have no perceptible latency. A never-updated record (age 0 right after a build)
+    // is always due, so the first frames sweep the whole scene to fill the cache.
+    bool everUpdated = LastUpdated[gtri] != 0u;
+    bool due = (ForceFull != 0u) || !everUpdated || ((gtri % UpdateStride) == (FrameIndex % UpdateStride));
+    if (!due) {
+        // Carry forward: the read buffer holds last frame's radiance for this record; copy it into the write
+        // buffer so the trace (which reads the write buffer) sees a complete, stable cache.
+        CardRadiance[gtri] = float4(PrevCard[gtri].rgb, 1.0);
+        return;
+    }
 
     uint inst = InstanceForTri(gtri);
     LumenInstanceMeta meta = Instances[inst];
@@ -196,4 +213,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
     float3 prev = PrevCard[gtri].rgb;
     float3 radiance = lerp(prev, lit, alpha);
     CardRadiance[gtri] = float4(Sanitize(radiance), 1.0);
+
+    // P7 #1: stamp this record as updated this frame (FrameIndex+1 so it's never 0 — 0 means "never updated").
+    LastUpdated[gtri] = FrameIndex + 1u;
 }

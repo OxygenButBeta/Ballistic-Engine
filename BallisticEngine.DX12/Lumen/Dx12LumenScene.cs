@@ -61,6 +61,18 @@ public sealed class Dx12LumenScene : IDisposable
     public bool HistoryValid { get; private set; }
     public int TotalTriangles { get; private set; }
 
+    // ---- P7 #1: per-record "last updated frame" (the update-budget priority input). One uint per triangle
+    // (the cache record unit; #2A makes this per-cluster behind the RadianceCache interface). The card-light
+    // pass reads it to decide whether a record is "due" this frame and writes the current frame index back when
+    // it relights. Persistent + lives as long as the cache (rebuilt/zeroed only on a topology change → a fresh
+    // build looks "never updated", so the first budgeted frames sweep the whole scene to fill it). ----
+    ID3D12Resource lastUpdated;   // uint[] per record; UAV (card-light writes) + SRV (card-light reads its own age)
+    public ulong LastUpdatedGpu => lastUpdated?.GPUVirtualAddress ?? 0;
+    ResourceStates lastUpdatedState = ResourceStates.UnorderedAccess;
+    public ResourceStates LastUpdatedState => lastUpdatedState;
+    public void SetLastUpdatedState(ResourceStates s) => lastUpdatedState = s;
+    public ID3D12Resource LastUpdated => lastUpdated;
+
     // Swap the ping-pong AFTER the card-light pass + trace have consumed this frame's buffers. Called by the
     // pass at the end of Record. The just-written buffer becomes next frame's "previous"/read.
     public void SwapCache() { writeB = !writeB; HistoryValid = true; }
@@ -147,6 +159,15 @@ public sealed class Dx12LumenScene : IDisposable
         cardRadianceA = dev.CreateUavBuffer<Vector4>(zero, ResourceStates.UnorderedAccess);
         cardRadianceB = dev.CreateUavBuffer<Vector4>(zero, ResourceStates.UnorderedAccess);
         cardStateA = cardStateB = ResourceStates.UnorderedAccess;
+
+        // P7 #1: per-record age, zeroed on (re)build. 0 reads as "never updated" → the budgeted card-light pass
+        // prioritizes the whole scene over the first frames after a build (full warm-up), then steady-state
+        // round-robins. uint.MaxValue would also work as "stale"; 0 keeps the warm-up sweep simplest.
+        lastUpdated?.Dispose();
+        var zeroAge = new uint[count];
+        lastUpdated = dev.CreateUavBuffer<uint>(zeroAge, ResourceStates.UnorderedAccess);
+        lastUpdatedState = ResourceStates.UnorderedAccess;
+
         writeB = false;
         HistoryValid = false;   // a rebuilt cache has no valid history → the EMA starts fresh (alpha=1 first frame)
     }
@@ -205,5 +226,6 @@ public sealed class Dx12LumenScene : IDisposable
         instanceMeta?.Dispose(); instanceMeta = null;
         cardRadianceA?.Dispose(); cardRadianceA = null;
         cardRadianceB?.Dispose(); cardRadianceB = null;
+        lastUpdated?.Dispose(); lastUpdated = null;
     }
 }

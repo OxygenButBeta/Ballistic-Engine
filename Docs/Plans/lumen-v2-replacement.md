@@ -115,3 +115,57 @@ Lumen V2 owns their debug seams.
 - Color-only/material-id content must contribute correctly.
 - Moving light latency is measured separately for on-screen and off-screen paths.
 - Hardware RT unavailable means `Lumen` is unavailable or reduced explicitly; no hidden fallback to SSGI.
+
+## Performance Overhaul (P7 — Unreal-Lumen-aligned, no quality loss)
+
+The P2–P6 stack is conceptually Lumen but the *naïve* variant: the cache scales with triangle count, every
+triangle is re-lit every frame, and the final gather is a flat full-res per-pixel hemisphere trace + à-trous
+blur. Unreal Lumen's real cost wins are amortized/budgeted updates, a bounded surface cache, and a
+screen-probe final gather with importance/temporal reuse. P7 closes those gaps while keeping the two correctness
+properties (no thin-wall leak, sealed interiors stay dark).
+
+### Baseline (measured `bal perf`, 2026-06-19, RX 9070 XT, Lumen ON, default dials)
+
+| Scene | Triangles | Lumen GI ms | Next-biggest pass |
+|---|---|---|---|
+| CornellBox | 86 | **1.24** | Deferred 0.008 |
+| MultiLightInterior | 1,546 | **1.69** | Deferred 0.009 |
+| BistroInterior_Wine | 797,113 | **2.00** | Reflections 0.021 |
+| BistroExterior | millions | **2.07** | Transparents 0.036 |
+
+**Key finding that reorders the plan:** Lumen is by far the most expensive render pass (10–100× the next
+pass), AND ~1.2 ms of it is a geometry-INDEPENDENT floor (full-res per-pixel trace + denoise) — an 86-tri Cornell
+box already costs 1.24 ms; 797 k tris adds only ~0.8 ms. So the constant floor (trace+denoise) is the bigger
+prize than card lighting; card lighting is the geometry-scaling ~0.8 ms term.
+
+### P7 milestones (order = risk-ascending, each measured before/after with `bal perf`)
+
+- **#1 Cache update budget** (~2-3 d, low risk, fixes the geometry-scaling term). Persistent per-record
+  `lastUpdatedFrame`; light a fixed budget of highest-priority records/frame (round-robin stride + priority);
+  EMA absorbs the staleness. Light/sun/transform dirty → force a full relight that frame (latency guard).
+  Stays unit-agnostic so #2A inherits it.
+- **#1b Half-res trace + denoise** (cheap follow-on, fixes most of the constant floor). Diffuse indirect is
+  low-frequency; trace/denoise at half-res, depth-aware upsample in combine (reuse the SSR upsample pattern).
+- **#2A Cluster radiance cache** (~4-6 d). Per-triangle → per-meshlet (cluster by normal+material). FIRST DAY:
+  put cache access behind a unit-agnostic `RadianceCache` interface (Sample/Write over a "surface record") so a
+  later upgrade to real mesh cards (#2B) is ~2-2.5 weeks, not a rewrite. 30-50× smaller cache; scalable.
+- **#3 Screen radiance probes** (~1-2 wk). Per-pixel flat gather → quarter/eighth-res probe trace + depth/
+  normal-weighted interpolation; à-trous denoise largely retired. Lower variance AND lower cost.
+- **#4 Importance + spatial/temporal reuse** (~3-5 d, on top of #3). Importance-sample toward carrying
+  directions; reuse neighbour probes; disocclusion rejection (anti-ghosting).
+
+### Deferred (consciously last)
+
+- **#2B Real mesh-card + atlas** (~3-4 wk; ~2-2.5 wk if #2A used the interface). Only if `imgdiff` proves
+  "patchy" indirect on large flat surfaces. Gives card-interior gradient + true surface-area scaling.
+- **#5 SDF / software trace** — last. For HWRT-PC target this is portability, not quality (HWRT TLAS already
+  covers far-field). Do distant-merged-cards before a full SDF stack.
+
+### Expected cumulative result
+
+~−65-70% Lumen GI cost with equal-or-better quality (#3/#4 reduce variance). Only #2A carries a small,
+controllable quality trade (cluster-interior averaging — mitigated by normal+material-aware clustering).
+
+### Restore point
+
+`30fc5071` "[gi] Safe point before Lumen perf overhaul".
