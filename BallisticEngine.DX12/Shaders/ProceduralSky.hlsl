@@ -415,8 +415,14 @@ float3 SkyRadiance(float3 dir) {
         if (hasClouds) {
             // Split the air at the cumulus mean depth: front scatter untouched, the cloud dimmed by that
             // air (aerial perspective), everything behind shown through the cloud transmittance.
-            float3 skyFront = (frontR * BetaR * AirDensity * phaseR + frontM * BetaM * Haze * phaseM)
-                            * SunRadiance * max(MultiScatter, 1.0);
+            // MS must be the SAME split-out isotropic glow used for the clear sky above — the old flat
+            // `* max(MultiScatter,1)` on combined Rayleigh+Mie bleached the achromatic Mie haze along with
+            // the molecular blue and washed the whole hemisphere milky-white (regressed the 6d08c792 fix).
+            float3 frontSingle = (frontR * BetaR * AirDensity * phaseR + frontM * BetaM * Haze * phaseM)
+                               * SunRadiance;
+            float3 frontMs = (frontR * BetaR * AirDensity + frontM * BetaM * Haze * 0.25)
+                           * (1.0 / (4.0 * PI)) * max(MultiScatter - 1.0, 0.0) * SunRadiance;
+            float3 skyFront = frontSingle + frontMs;
             sky = skyFront + exp(-Extinction(frontDepths)) * clouds.rgb
                 + clouds.a * max(skyBack - skyFront, (float3)0.0);
         } else {

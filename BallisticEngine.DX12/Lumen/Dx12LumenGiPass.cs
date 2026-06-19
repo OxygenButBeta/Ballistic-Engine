@@ -105,7 +105,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public Vector3 CameraPos; public float Intensity;
         public Vector2 TexelSize; public float RayCount; public float FrameIndex;
         public float NormalBias; public float MaxRayDist; public float UseCards; public float ScreenSteps;
-        public float SkyIntensity; public float UseSky; public float Pad0; public float Pad1;
+        public float SkyIntensity; public float UseSky; public float UseScreenTrace; public float ScreenRange;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -172,6 +172,10 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             RayCount = rayCount, FrameIndex = ctx.DeterministicCapture ? 0f : frameCounter,
             NormalBias = 0.03f, MaxRayDist = maxDist, UseCards = useCards ? 1f : 0f, ScreenSteps = 16f,
             SkyIntensity = skyIntensity, UseSky = useSky ? 1f : 0f,
+            UseScreenTrace = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOSCREEN") == "1" ? 0f : 1f,
+            // Short confident-contact range for the screen trace; mid/far GI is RT (view-independent). The old
+            // behaviour let ANY on-screen hit veto RT → view-dependent darkening when the light source panned off.
+            ScreenRange = EnvF("BALLISTIC_DX12_LUMEN_SCREEN_RANGE", 1.5f),
         };
         *(LumenSun*)sunCbMapped = new LumenSun
         {

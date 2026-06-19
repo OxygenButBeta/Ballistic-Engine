@@ -177,14 +177,27 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
             cl.DrawInstanced(3, 1, 0, 0);
         });
 
-        // Combine (full-res) → ssrScene, reading scene color (t0), depth (t1), ssrTarget (t4).
+        // TEMPORAL DENOISE the half-res reflection (same pass RT uses) — kills the static-view march/Fresnel jitter
+        // before the combine. The motion gate passes the live reflection through under any real camera motion, so
+        // moving views stay sharp. The combine then reads the DENOISED target instead of the raw ssrTarget.
         ssrTarget.ColorToShaderResource();
+        Dx12OffscreenTarget reflForCombine = DenoiseReflectionTemporal(ctx, gbuffer);
+
+        // Combine (full-res) → ssrScene, reading scene color (t0), depth (t1), denoised reflection (t4). The
+        // temporal pass overwrote ssrCb (Intensity = hasHistory) — restore the full combine SsrConstants.
+        Matrix4x4.Invert(proj, out Matrix4x4 invProjC);
+        *(SsrConstants*)ssrCbMapped = new SsrConstants {
+            Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProjC),
+            ViewMatrix = Matrix4x4.Transpose(view), Intensity = ctx.PostFX.SsrIntensity,
+            TexelSize = new Vector2(1f / ssrTarget.Width, 1f / ssrTarget.Height),
+        };
+        ssrSrvVisible.Reset();
         int cb = ssrSrvVisible.AllocateRange(5);
         dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 0), target.ColorSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 1), gbuffer.DepthSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 2), gbuffer.ColorSrvCpu(1), heapType);
         dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 3), gbuffer.ColorSrvCpu(2), heapType);
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 4), ssrTarget.ColorSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 4), reflForCombine.ColorSrvCpu, heapType);
         ssrScene.RenderColorOnly(cl => {
             cl.SetGraphicsRootSignature(ssrRootSig); cl.SetPipelineState(ssrCombinePso);
             cl.SetDescriptorHeaps(ssrSrvVisible.Heap);
@@ -195,6 +208,42 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         });
         ssrScene.ColorToShaderResource();
         target.CopyColorFrom(ssrScene);   // the reflected scene becomes the new scene color
+    }
+
+    // TEMPORAL DENOISE (shared by SSR + RT): motion-reproject + EMA the half-res `ssrTarget` reflection into the
+    // ping-pong history, returning the smoothed target the combine should read. PSTemporal hard-gates on screen
+    // motion (~static → heavy EMA = kills the frame-to-frame churn that shows as jitter; any real motion → passes
+    // the live reflection straight through, so a moving view/mirror never smears). SSR's half-res march + Fresnel
+    // edges flicker on a static view exactly like RT's cache-fed mirror does, so both feed the SAME denoiser.
+    // Pre: ssrTarget is in ColorToShaderResource. Post: the returned target is in ColorToShaderResource.
+    unsafe Dx12OffscreenTarget DenoiseReflectionTemporal(Dx12FrameContext ctx, Dx12GBuffer gbuffer) {
+        var dev = ctx.Dev;
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        Dx12OffscreenTarget histRead = ssrHistWriteB ? ssrHistoryA : ssrHistoryB;
+        Dx12OffscreenTarget histWrite = ssrHistWriteB ? ssrHistoryB : ssrHistoryA;
+        histRead.ColorToShaderResource();
+        *(SsrConstants*)ssrCbMapped = new SsrConstants {
+            Intensity = ssrHistValid ? 1f : 0f,   // repurposed as the hasHistory flag for PSTemporal
+            TexelSize = new Vector2(1f / ssrTarget.Width, 1f / ssrTarget.Height),
+        };
+        ssrSrvVisible.Reset();
+        int tb = ssrSrvVisible.AllocateRange(5);
+        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(tb + 0), ssrTarget.ColorSrvCpu, heapType);          // t0 current
+        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(tb + 1), histRead.ColorSrvCpu, heapType);           // t1 history
+        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(tb + 2), gbuffer.ColorSrvCpu(Dx12GBuffer.MotionRtIndex), heapType); // t2 motion
+        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(tb + 3), ssrTarget.ColorSrvCpu, heapType);          // t3 (unused, valid)
+        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(tb + 4), ssrTarget.ColorSrvCpu, heapType);          // t4 (unused, valid)
+        histWrite.RenderColorOnly(cl => {
+            cl.SetGraphicsRootSignature(ssrRootSig); cl.SetPipelineState(ssrTemporalPso);
+            cl.SetDescriptorHeaps(ssrSrvVisible.Heap);
+            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress);
+            cl.SetGraphicsRootDescriptorTable(1, ssrSrvVisible.Gpu(tb));
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
+        histWrite.ColorToShaderResource();
+        ssrHistWriteB = !ssrHistWriteB; ssrHistValid = true;
+        return histWrite;
     }
 
     // ============================== RT reflections ==============================
@@ -365,34 +414,8 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         });
         ssrTarget.ColorToShaderResource();
 
-        // RT-REFLECTION TEMPORAL DENOISE: motion-reproject + EMA the half-res reflection (kills the DDGI-cache
-        // churn that shows as mirror jitter). Reads ssrTarget(t0)=current, history(t1), G-buffer motion(t2);
-        // writes the smoothed reflection into the OTHER history buffer, which becomes this frame's combine input.
-        Dx12OffscreenTarget histRead = ssrHistWriteB ? ssrHistoryA : ssrHistoryB;
-        Dx12OffscreenTarget histWrite = ssrHistWriteB ? ssrHistoryB : ssrHistoryA;
-        histRead.ColorToShaderResource();
-        *(SsrConstants*)ssrCbMapped = new SsrConstants {
-            Intensity = ssrHistValid ? 1f : 0f,   // repurposed as the hasHistory flag for PSTemporal
-            TexelSize = new Vector2(1f / ssrTarget.Width, 1f / ssrTarget.Height),
-        };
-        ssrSrvVisible.Reset();
-        int tb = ssrSrvVisible.AllocateRange(5);
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(tb + 0), ssrTarget.ColorSrvCpu, heapType);          // t0 current
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(tb + 1), histRead.ColorSrvCpu, heapType);           // t1 history
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(tb + 2), gbuffer.ColorSrvCpu(Dx12GBuffer.MotionRtIndex), heapType); // t2 motion
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(tb + 3), ssrTarget.ColorSrvCpu, heapType);          // t3 (unused, valid)
-        dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(tb + 4), ssrTarget.ColorSrvCpu, heapType);          // t4 (unused, valid)
-        histWrite.RenderColorOnly(cl => {
-            cl.SetGraphicsRootSignature(ssrRootSig); cl.SetPipelineState(ssrTemporalPso);
-            cl.SetDescriptorHeaps(ssrSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress);
-            cl.SetGraphicsRootDescriptorTable(1, ssrSrvVisible.Gpu(tb));
-            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            cl.DrawInstanced(3, 1, 0, 0);
-        });
-        histWrite.ColorToShaderResource();
-        ssrHistWriteB = !ssrHistWriteB; ssrHistValid = true;
-        Dx12OffscreenTarget reflForCombine = histWrite;   // the combine reads the denoised reflection
+        // Temporal-denoise the half-res RT reflection (kills the cache-churn mirror jitter) — shared with SSR.
+        Dx12OffscreenTarget reflForCombine = DenoiseReflectionTemporal(ctx, gbuffer);   // the combine reads the denoised reflection
 
         // Reuse the SSR combine (depth-aware upsample + Fresnel lerp into the scene color).
         Matrix4x4.Invert(proj, out Matrix4x4 invProj);

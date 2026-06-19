@@ -71,6 +71,7 @@ internal static class RemoteHandlers {
             ["unity.import"]        = p => UnityImport(p),
             ["editor.frame"]        = p => EditorFrame(p),
             ["editor.refresh"]      = _ => EditorRefresh(),
+            ["editor.reimport"]     = _ => EditorReimport(),
             ["scene.component.add"] = p => SceneComponentAdd(p),
             ["scene.component.set"] = p => SceneComponentSet(p),
             ["help"]                = _ => Help(),
@@ -158,13 +159,25 @@ internal static class RemoteHandlers {
         }
     }
 
-    // Force a full asset reimport (registers newly-written assets like converted .scene/.volume).
+    // Incremental refresh: scans Assets/ and imports only changed/new files (up-to-date checks honored,
+    // like Unity's Refresh). Registers newly-written assets (converted .scene/.volume) WITHOUT
+    // re-importing everything. For a full force reimport use editor.reimport.
     public static Action RequestRefresh;
     static object EditorRefresh() {
         if (RequestRefresh is null)
             throw new Exception("refresh not wired");
         RequestRefresh();
-        return new { refreshing = true, note = "poll editor.status; assets reimport on a worker" };
+        return new { refreshing = true, note = "incremental — poll editor.status; only changed assets import on a worker" };
+    }
+
+    // Full force reimport: ignores up-to-date checks and re-imports every asset (slow). Use when an
+    // importer changed or an artifact is suspected stale; plain editing/syncing should use editor.refresh.
+    public static Action RequestReimport;
+    static object EditorReimport() {
+        if (RequestReimport is null)
+            throw new Exception("reimport not wired");
+        RequestReimport();
+        return new { reimporting = true, note = "FULL reimport — poll editor.status; all assets reimport on a worker" };
     }
 
     // Add a scene-wide component (SceneBehaviour: Skybox, ProceduralSky, SceneLighting, IrradianceVolume...).

@@ -28,7 +28,24 @@ public static class VolumeProfileLoader {
         }
         var profile = new VolumeProfile { Name = Path.GetFileNameWithoutExtension(assetPath) };
 
+        // MIGRATION (legacy GI stack → Lumen V2): reflections used to live INSIDE the GlobalIllumination
+        // component as `reflectionsMode`/`reflectionsIntensity`; they were split into the standalone
+        // `Reflections` component. A profile saved under the old shape has NO Reflections block, so its
+        // reflections override silently did nothing (the bridge gates `SsrEnabled` on the missing component).
+        // Carry the old fields out into a synthesized Reflections component below.
+        ReflectionMode? legacyReflMode = null;
+        float? legacyReflIntensity = null;
+
         foreach (VolumeComponentDefinition componentDef in definition.Components ?? []) {
+            if (componentDef.Type == "GlobalIllumination" && componentDef.Parameters is { } giParams) {
+                if (giParams.TryGetValue("reflectionsMode", out VolumeParameterDefinition rm)
+                    && rm.Value.ValueKind is JsonValueKind.String
+                    && Enum.TryParse(rm.Value.GetString(), out ReflectionMode parsedMode))
+                    legacyReflMode = parsedMode;
+                if (giParams.TryGetValue("reflectionsIntensity", out VolumeParameterDefinition ri)
+                    && ri.Value.ValueKind is JsonValueKind.Number)
+                    legacyReflIntensity = ri.Value.GetSingle();
+            }
             var typeName = LegacyTypeNames.GetValueOrDefault(componentDef.Type, componentDef.Type);
             Type type = ComponentRegistry.ResolveVolume(typeName);
             if (type is null) {
@@ -62,6 +79,16 @@ public static class VolumeProfileLoader {
                 slot.Parameter.Overridden = parameterDef.Overridden;
                 ApplyValue(slot.Parameter, parameterDef.Value, assetPath, slot.Name);
             }
+        }
+
+        // Finish the legacy-reflections migration: synthesize a Reflections component from the old
+        // GlobalIllumination.reflections* fields when the profile didn't already carry its own. Only when the
+        // old fields were actually present (so untouched/new profiles are byte-identical). The next editor Save
+        // persists the new shape and drops the stale GI fields.
+        if ((legacyReflMode is not null || legacyReflIntensity is not null) && !profile.Has(typeof(Reflections))) {
+            var refl = (Reflections)profile.Add(typeof(Reflections));
+            if (legacyReflMode is { } m) { refl.mode.Value = m; refl.mode.Overridden = true; }
+            if (legacyReflIntensity is { } i) { refl.intensity.Value = i; refl.intensity.Overridden = true; }
         }
 
         return profile;

@@ -24,7 +24,7 @@ cbuffer LightConstants : register(b0) {
     float    SpecAaStrength;                       // V2: geometric specular AA strength (0 = off); roughens noisy normals
     float    UseSsao;                              // >0.5 = multiply the GTAO term into the IBL ambient (ambient-only)
     float    UseIBLDiffuse;                         // >0.5 = add the IBL diffuse-irradiance ambient; 0 when Lumen owns diffuse GI
-    float    Pad4;
+    float    UseIBLSpecular;                        // >0.5 = add the IBL prefiltered-specular ambient; 0 when RT/SSR own reflections
     float4x4 ViewProjFwd;                          // world → clip (transposed on upload); contact-shadow march reprojection
 };
 
@@ -375,7 +375,13 @@ float4 PSMain(VSOut i) : SV_Target {
         // sky reflection (restoring material contrast) while smooth, open, face-on surfaces (water, glass, metal,
         // polished floor) keep their full, sharp reflection. A no-op (≈1) for the common smooth-and-open case.
         float specOcc = saturate(pow(max(NdotVamb + ao, 0.0), exp2(-16.0 * roughness - 1.0)) - 1.0 + ao);
-        float3 ambientSpecular = prefiltered * (Famb * brdf.x + brdf.y) * specOcc;
+        // Sky-IBL specular is gated the SAME way as the diffuse above. The prefiltered cube is the procedural
+        // sky's average radiance with NO sky-visibility term (only short-range GTAO), so a CLOSED interior whose
+        // walls never see the sky still ate the sky's bright, sun-tinted average as a broad untextured veil — the
+        // exact diffuse leak fixed earlier, just on the specular lobe (user: orange tent on a roofed Bistro hall).
+        // Reflections come from Lumen RT reflections / SSR (both sky-visibility-aware); IBL is the miss fallback.
+        float3 ambientSpecular = (UseIBLSpecular > 0.5)
+            ? prefiltered * (Famb * brdf.x + brdf.y) * specOcc : 0.0.xxx;
         ambient = ambientDiffuse + ambientSpecular;
     }
     else {

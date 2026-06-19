@@ -41,7 +41,7 @@ cbuffer LumenConstants : register(b0) {
     float3 CameraPos;   float Intensity;         // GI intensity multiplier
     float2 TexelSize;   float RayCount;  float FrameIndex;   // 1/res; hemisphere rays per pixel; rotation seed
     float NormalBias;   float MaxRayDist; float UseCards;   float ScreenSteps;   // bias; world ray length; >0.5 = sample cards on RT hit; screen march
-    float SkyIntensity; float UseSky;    float Pad0; float Pad1;   // sky-miss scale; >0.5 = sky enters on miss
+    float SkyIntensity; float UseSky;    float UseScreenTrace; float ScreenRange;   // sky-miss scale; >0.5 sky; >0.5 screen-trace; contact range (m)
 };
 cbuffer LumenSun : register(b1) {
     float3 SunDir;   float SunBias;       // TO the sun (normalized), world; shadow-ray origin offset
@@ -172,13 +172,18 @@ float3 ShadeHit(uint instId, uint prim, float2 bary2, float3x4 o2w, float3 rayDi
     return albedo * (sun + punctual) + emissive;
 }
 
-// March the depth buffer along a world-space ray. Returns true + the lit color at the hit pixel when the ray
-// passes BEHIND an on-screen surface within a thin thickness window (a real near-field hit). Cheap contact
-// bounce that avoids an RT dispatch when the answer is already on screen.
+// March the depth buffer along a world-space ray for a CONFIDENT, CLOSE near-field contact only (cheap contact
+// bounce that avoids an RT dispatch when the answer is unambiguously on screen). Returns true ONLY for a hit
+// inside ScreenRange metres — anything beyond that, off-screen, or behind a thick/uncertain occluder returns
+// false so the RT ray (view-INDEPENDENT) owns the mid/far light. This is the fix for the SSGI view-dependent
+// darkening: previously ANY on-screen hit (even a dark wall) vetoed RT, so turning the camera so the lit
+// corridor left the screen made walls go dark; now only short-range contacts win, RT handles the rest.
 bool ScreenTrace(float3 origin, float3 dir, out float3 radiance) {
     radiance = 0.0.xxx;
+    // Confident screen contact distance — short (contact bounce only). The dominant mid/far GI comes from RT.
+    float range = min(ScreenRange, MaxRayDist);
     int steps = max((int)ScreenSteps, 1);
-    float stepLen = MaxRayDist / (float)steps;
+    float stepLen = range / (float)steps;
     // Start a little along the ray so we don't self-intersect the origin pixel.
     float3 p = origin + dir * stepLen;
     [loop] for (int i = 0; i < steps; i++, p += dir * stepLen) {
@@ -195,12 +200,15 @@ bool ScreenTrace(float3 origin, float3 dir, out float3 radiance) {
         float rayZ = length(rayWorld - CameraPos);
         float sceneZ = length(sceneWorld - CameraPos);
         float diff = rayZ - sceneZ;                            // >0 = scene surface is in front of the ray
+        // Thin-window contact: the scene surface sits just in front of the ray (a real touch), AND the contact
+        // is CLOSE to the origin (within range). A thick gap (diff large) means the ray passed well behind the
+        // on-screen surface — NOT a contact; bail to RT instead of returning that surface's (maybe dark) color.
         if (diff > 0.01 * rayZ && diff < stepLen * 2.0) {
-            // Hit an on-screen surface: incoming radiance = its lit HDR color. Front-facing check via depth
-            // gradient is skipped in P2 (noisy-but-truthful); a back-face would over-count slightly.
+            if (length(sceneWorld - origin) > range) return false;   // too far to be a confident contact → RT
             radiance = SceneColor.SampleLevel(LinearClamp, uv, 0).rgb;
             return true;
         }
+        if (diff >= stepLen * 2.0) return false;              // ray went behind a thick occluder → not a contact, use RT
     }
     return false;
 }
@@ -231,9 +239,10 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
         float3 local = CosineHemisphere(r, rays, jitter);
         float3 dir = normalize(mul(local, basis));
 
-        // 1) Screen trace.
+        // 1) Screen trace (near-field contact bounce). UseScreenTrace<0.5 disables it → pure RT+cards (the A/B
+        // door to prove the view-dependent darkening is screen-trace's fault, not the RT path).
         float3 rad;
-        if (ScreenTrace(origin, dir, rad)) { sum += rad; continue; }
+        if (UseScreenTrace > 0.5 && ScreenTrace(origin, dir, rad)) { sum += rad; continue; }
 
         // 2) Hardware RT on screen miss.
         RayDesc ray;

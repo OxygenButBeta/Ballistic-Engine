@@ -30,10 +30,6 @@ public sealed class GlobalIllumination : VolumeComponent {
     [Tooltip("Accumulate multi-bounce in the surface-card radiance cache (light bounces more than once).")]
     public readonly BoolParameter multiBounce = new(true);
 
-    [Tooltip("Feed hardware ray-traced reflections from the same radiance cache (reflections see GI). " +
-             "The Reflection volume's RayTraced mode must also be on for RT reflections to run.")]
-    public readonly BoolParameter reflections = new(true);
-
     [Tooltip("How much the AmbientOcclusion volume's GTAO darkens the GI's contact shading. The ray trace " +
              "already has macro occlusion, so this is a partial contact-detail term (0 = none, 1 = full GTAO).")]
     public readonly ClampedFloatParameter aoStrength = new(0.5f, 0f, 1f);

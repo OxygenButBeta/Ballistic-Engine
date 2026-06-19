@@ -92,7 +92,7 @@ internal static class RemoteSchemaTests {
             "component.add", "component.remove", "component.set", "select",
             "play.start", "play.stop", "play.pause", "play.step",
             "undo", "redo", "screenshot", "console.tail", "scripts.rebuild",
-            "unity.import", "editor.frame", "editor.refresh",
+            "unity.import", "editor.frame", "editor.refresh", "editor.reimport",
             "scene.component.add", "scene.component.set", "help",
         };
         var actual = RemoteSchema.Methods.Select(m => m.Method).ToHashSet(StringComparer.Ordinal);

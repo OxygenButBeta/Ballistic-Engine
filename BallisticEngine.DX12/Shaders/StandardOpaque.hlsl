@@ -220,8 +220,10 @@ float4 PSMain(VSOutput i) : SV_Target {
         // so multiply by albedo*kD directly (no /PI here).
         float3 Famb = FresnelSchlickRoughness(NdotVamb, F0, roughness);
         float3 kD = (1.0 - Famb) * (1.0 - metallic);
-        float3 irradiance = IrradianceMap.SampleLevel(LinearClamp, N, 0).rgb;
-        float3 ambientDiffuse = kD * irradiance * albedo * ao;
+        // Diffuse sky-IBL DISABLED (parity with the deferred path): the env-irradiance cube has no sky-visibility
+        // term, so a closed interior wrongly ate the procedural sky's full ambient — and the Skybox path never
+        // baked IBL at all. Diffuse indirect now comes from Lumen GI alone (TLAS-occluded). Specular IBL stays.
+        float3 ambientDiffuse = 0.0.xxx;
         // Specular: prefiltered env (roughness→mip) × split-sum BRDF (scale,bias) on F0.
         float3 R = reflect(-V, N);
         float mip = clamp(roughness * PrefilterMaxMip, 0.0, PrefilterMaxMip);

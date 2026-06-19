@@ -65,7 +65,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         public Vector2 ClusterNearFar;
         public float UseRtShadows; public float SpecClamp;   // SpecClamp: max per-light specular luma (V2 firefly cap; 0 = off)
         public float SpecAaStrength; public float UseSsao;   // V2: geometric specular AA strength (0 = off); UseSsao: GTAO into ambient
-        public float UseIBLDiffuse; public float Pad4;        // UseIBLDiffuse: 0 when Lumen V2 owns diffuse GI (no double-count)
+        public float UseIBLDiffuse; public float UseIBLSpecular; // 0 when Lumen V2 owns diffuse GI / RT+SSR own reflections
         public Matrix4x4 ViewProjFwd;                        // world → clip (transposed); contact-shadow march reprojection
     }
 
@@ -162,10 +162,19 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
             // GTAO into the ambient term — on only when AO is actually rendered this frame (door + volume enable).
             // Matches Dx12GtaoPass.Enabled so the t13 bind below holds the real AO target when this is 1.
             UseSsao = ctx.Doors.Ssao && ctx.PostFX.SSAOEnabled ? 1f : 0f,
-            // Lumen V2 owns diffuse GI when active → suppress the IBL diffuse ambient here so the Lumen combine
-            // (event 500) doesn't double-count it. Specular IBL stays (Lumen P2 is diffuse-only).
-            UseIBLDiffuse = ctx.LumenActiveThisFrame ? 0f : 1f,
-            Pad4 = 0f,
+            // Diffuse sky-IBL is DISABLED on the deferred path. It samples the env-irradiance cube by surface
+            // normal with NO sky-visibility term (only short-range GTAO), so a CLOSED interior — whose walls never
+            // see the sky — still ate the procedural sky's full (bright, sun-tinted) ambient and washed flat. The
+            // Skybox path never baked IBL at all (UseIBL=0), so the two skies behaved completely differently
+            // (user: "skybox ne yapıyorsa procedural de aynısını yapmalı"). Parity fix: NEITHER sky adds diffuse
+            // sky-ambient here — diffuse indirect comes from Lumen GI alone (which DOES occlude via the TLAS).
+            // Specular IBL stays (reflections; occluded separately). When Lumen is active it owned this anyway.
+            UseIBLDiffuse = 0f,
+            // Sky-IBL specular ALSO disabled on the deferred path (parity with the diffuse above). The prefiltered
+            // cube has no sky-visibility, so a closed interior ate the procedural sky's bright sun-tinted average as
+            // a broad untextured veil (the orange "tent" on a roofed Bistro hall). Reflections come from Lumen RT /
+            // SSR (sky-visibility-aware); the Skybox path never baked IBL (UseIBL=0) so both skies now match.
+            UseIBLSpecular = 0f,
             // Forward world→clip for the contact-shadow screen-space march (HLSL muls row-vector × matrix).
             ViewProjFwd = Matrix4x4.Transpose(ctx.ViewProj),
         };

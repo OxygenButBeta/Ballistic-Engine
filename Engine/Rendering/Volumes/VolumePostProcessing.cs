@@ -119,8 +119,16 @@ public static class VolumePostProcessing {
             fx.LumenRayCount = gi.rayCount.Value;
             fx.LumenDenoisePasses = gi.denoisePasses.Value;
             fx.LumenMultiBounce = gi.multiBounce.Value;
-            fx.LumenReflections = gi.reflections.Value;
             fx.LumenAoStrength = gi.aoStrength.Value;
+        }
+
+        if (stack.GetComponent<Reflections>() is { } refl) {
+            // The mode dropdown IS the master gate: Off → SsrEnabled false (pass skipped); otherwise the
+            // technique enum picks SSR vs RT inside the pass. sampleRadianceCache only matters in RayTraced mode.
+            fx.ReflectionMode = refl.mode.Value;
+            fx.SsrEnabled = refl.mode.Value != ReflectionMode.Off;
+            fx.SsrIntensity = refl.intensity.Value;
+            fx.LumenReflections = refl.sampleRadianceCache.Value;
         }
 
         if (stack.GetComponent<AerialPerspective>() is { } aerial) {

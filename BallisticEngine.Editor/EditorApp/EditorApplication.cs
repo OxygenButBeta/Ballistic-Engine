@@ -286,7 +286,8 @@ internal sealed class EditorApplication {
             editorCamera.Focus(center, radius);
             forceFrames = Math.Max(forceFrames, 45);  // burst so auto-exposure re-meters for the new view
         };
-        RemoteHandlers.RequestRefresh = () => AsyncAssetImport.Request("Refreshing assets...", forceAll: true);
+        RemoteHandlers.RequestRefresh  = () => AsyncAssetImport.Request("Refreshing assets...", forceAll: false);
+        RemoteHandlers.RequestReimport = () => AsyncAssetImport.Request("Reimporting all assets...", forceAll: true);
     }
 
     // A selection that can survive a scene rebuild: an entity by its (round-tripped) InstanceId, or a

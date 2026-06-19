@@ -214,6 +214,7 @@ internal static class Program {
         new("scripts_rebuild",     ["scripts.rebuild"],      [],                  []),
         new("editor_frame",        ["editor.frame"],         [],                  []),
         new("editor_refresh",      ["editor.refresh"],       [],                  []),
+        new("editor_reimport",     ["editor.reimport"],      [],                  []),
         new("scene_component_set", ["scene.component.set"],  ["type", "member"],  []),
     ];
 
@@ -262,6 +263,7 @@ internal static class Program {
             fit = a.ValueKind == JsonValueKind.Object && a.TryGetProperty("fit", out JsonElement f) ? (object)f.GetDouble() : 1.0,
         }),
         "editor_refresh" => ("editor.refresh", null),
+        "editor_reimport" => ("editor.reimport", null),
         "scene_component_set" => ("scene.component.set", new {
             type = Str(a, "type"),
             member = Str(a, "member"),
@@ -369,7 +371,8 @@ internal static class Program {
             ("entity", "string", "Entity to frame; omit to frame the whole scene", false),
             ("dir", "string", "Look direction 'x,y,z' e.g. '0.3,-0.5,1' for a 3/4 top view; omit to keep current", false),
             ("fit", "number", "Zoom multiplier on the framed radius (1=default, <1 closer, >1 wider)", false)) },
-        new { name = "editor_refresh", description = "Force a full asset reimport (registers newly written .scene/.volume/.mat assets).", inputSchema = Schema() },
+        new { name = "editor_refresh", description = "Incremental asset refresh: scans Assets/ and imports only changed/new files (registers newly written .scene/.volume/.mat). Does NOT reimport everything.", inputSchema = Schema() },
+        new { name = "editor_reimport", description = "FULL force reimport: re-imports every asset ignoring up-to-date checks (slow). Use only when an importer changed or an artifact is stale.", inputSchema = Schema() },
         new { name = "scene_component_set", description = "Set a member on a scene-wide component (Skybox/ProceduralSky/SceneLighting), e.g. tune sky exposure. Undoable.", inputSchema = Schema(
             ("type", "string", "Scene component type, e.g. ProceduralSky", true),
             ("member", "string", "Member name, e.g. exposure", true),

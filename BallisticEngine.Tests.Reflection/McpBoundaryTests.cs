@@ -55,6 +55,7 @@ internal static class McpBoundaryTests {
         new("scripts_rebuild",     ["scripts.rebuild"],      [],                  []),
         new("editor_frame",        ["editor.frame"],         [],                  []),
         new("editor_refresh",      ["editor.refresh"],       [],                  []),
+        new("editor_reimport",     ["editor.reimport"],      [],                  []),
         new("scene_component_set", ["scene.component.set"],  ["type", "member"],  []),
     ];
 

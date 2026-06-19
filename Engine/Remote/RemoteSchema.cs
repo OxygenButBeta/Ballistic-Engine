@@ -66,6 +66,7 @@ public static class RemoteSchema {
         new MethodSchema("unity.import",         new[] { Req("path"), Opt("subfolder") }),
         new MethodSchema("editor.frame",         new[] { Opt("entity"), Opt("dir"), Opt("fit", Kind.Number) }),
         new MethodSchema("editor.refresh",       Array.Empty<Param>()),
+        new MethodSchema("editor.reimport",      Array.Empty<Param>()),
         new MethodSchema("scene.component.add",  new[] { Req("type") }),
         new MethodSchema("scene.component.set",  new[] { Req("type"), Req("member"), Req("value", Kind.Any) }),
         new MethodSchema("help",                 Array.Empty<Param>()),

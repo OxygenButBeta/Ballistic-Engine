@@ -158,9 +158,10 @@ float4 PSCombine(VSOut i) : SV_Target {
     return float4(lerp(scene, ssr.rgb, ssr.a), 1.0);
 }
 
-// --- TEMPORAL pass (RT reflections only): motion-reprojected EMA over the half-res reflection target. RT
-// reflections are mirror rays (no jitter), but the HIT reads the DDGI world cache, which churns frame to frame
-// — and reflections have NO other denoiser — so that churn is raw jitter in the mirror. Reproject last frame's
+// --- TEMPORAL pass (SSR + RT): motion-reprojected EMA over the half-res reflection target. RT mirror rays read
+// the Lumen card cache, which churns frame to frame; SSR's half-res march + Fresnel edges flicker on a static
+// view the same way — and reflections run BEFORE TAA with no other denoiser — so both feed this pass. Reproject
+// last frame's
 // reflection via the motion buffer and EMA-blend with this frame's, with a neighbourhood clamp + a disocclusion
 // reset so a moving mirror / uncovered surface doesn't smear. The .a channel is the reflection STRENGTH (carried
 // straight through, not accumulated). For this pass: ColorTex(t0)=current reflection, DepthTex(t1)=history,
