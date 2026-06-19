@@ -73,6 +73,12 @@ float4 PSMarch(VSOut i) : SV_Target {
     float hit = 0.0;
     float2 hitUV = 0.0.xx;
 
+    // STABILITY: scale the depth-compare bias by the surface view depth. A fixed +0.01 is too tight for
+    // distant/thin geometry (the refine bisection lands on a different sub-texel each frame → the hit UV
+    // jitters); a depth-proportional bias keeps the comparison consistent across distance, so the resolved
+    // hit point is stable frame to frame on thin/grazing surfaces.
+    float zBias = max(0.01, abs(P.z) * 0.0025);
+
     [loop] for (int s = 0; s < MARCH_STEPS; s++) {
         prevPos = rayPos;
         rayPos += R * stepLength;
@@ -82,12 +88,12 @@ float4 PSMarch(VSOut i) : SV_Target {
         float sceneZ = ViewPos(uv).z;
         float thickness = stepLength * 2.0 + 0.3;
         // View Z is negative ahead; a hit is where the scene surface is in front of the ray within thickness.
-        if (sceneZ > rayPos.z + 0.01 && sceneZ - rayPos.z < thickness) {
+        if (sceneZ > rayPos.z + zBias && sceneZ - rayPos.z < thickness) {
             float3 lo = prevPos, hi = rayPos;
             [loop] for (int r = 0; r < REFINE_STEPS; r++) {
                 float3 mid = (lo + hi) * 0.5;
                 float wm; float2 midUV = ToUV(mid, wm);
-                if (ViewPos(midUV).z > mid.z + 0.01) hi = mid; else lo = mid;
+                if (ViewPos(midUV).z > mid.z + zBias) hi = mid; else lo = mid;
             }
             float wd; hitUV = ToUV(hi, wd);
             hit = 1.0; break;
@@ -95,8 +101,10 @@ float4 PSMarch(VSOut i) : SV_Target {
     }
     if (hit < 0.5) return 0.0.xxxx;
 
+    // Wider screen-edge fade (0.12 vs 0.08): thin surfaces whose reflection ray exits the screen pop in/out
+    // binarily right at the border, reading as edge jitter. A softer ramp dissolves that flicker.
     float2 edge = min(hitUV, 1.0 - hitUV);
-    float edgeFade = smoothstep(0.0, 0.08, min(edge.x, edge.y));
+    float edgeFade = smoothstep(0.0, 0.12, min(edge.x, edge.y));
     float roughFade = 1.0 - smoothstep(0.3, MAX_ROUGHNESS, roughness);
 
     bool isMetal = metallic >= 0.5;
@@ -108,11 +116,27 @@ float4 PSMarch(VSOut i) : SV_Target {
     float grazeKeep = 1.0 - smoothstep(0.05, 0.45, roughness);
     fresnel = F0 + grazing * grazeKeep;
 
-    float3 reflected = ColorTex.SampleLevel(LinearClamp, hitUV, 0).rgb;
+    // GRAZING STABILITY: at extreme grazing angles (NdotV→0) the Fresnel term explodes and a sub-pixel normal
+    // wobble on a thin/edge-on surface swings the reflection violently — the dominant SSR shimmer on thin
+    // geometry. Fade strength out below ~25° grazing so the most unstable angles contribute softly, not as a
+    // razor-sharp mirror. The mid-range and head-on reflections (where SSR is stable) are untouched.
+    float grazeStable = smoothstep(0.05, 0.35, NdotV);
+
+    // The scene-color texture has no mip chain, so a single point tap on thin/high-contrast reflected geometry
+    // aliases (the dominant SSR shimmer source besides grazing). A small fixed 4-tap box around the hit UV,
+    // widened with roughness, pre-filters that aliasing in-shader — a cheap stand-in for a roughness mip
+    // (physically correct too: rougher = blurrier reflection). Head-on sharp metals (roughness≈0) get a tight
+    // 1-texel kernel; rougher surfaces blur more.
+    float blurR = (0.75 + roughness * 3.0);
+    float2 t = TexelSize * blurR;
+    float3 reflected = (ColorTex.SampleLevel(LinearClamp, hitUV + float2( t.x,  t.y), 0).rgb
+                      + ColorTex.SampleLevel(LinearClamp, hitUV + float2(-t.x,  t.y), 0).rgb
+                      + ColorTex.SampleLevel(LinearClamp, hitUV + float2( t.x, -t.y), 0).rgb
+                      + ColorTex.SampleLevel(LinearClamp, hitUV + float2(-t.x, -t.y), 0).rgb) * 0.25;
     float surfaceLum = dot(ColorTex.SampleLevel(LinearClamp, i.Uv, 0).rgb, float3(0.2126, 0.7152, 0.0722));
     float lowLightDamp = smoothstep(0.0, 0.08, surfaceLum);
 
-    float strength = saturate(fresnel * Intensity) * edgeFade * roughFade * lowLightDamp;
+    float strength = saturate(fresnel * Intensity) * edgeFade * roughFade * lowLightDamp * grazeStable;
     return float4(reflected, strength);
 }
 

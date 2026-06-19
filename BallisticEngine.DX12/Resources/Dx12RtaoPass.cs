@@ -22,7 +22,10 @@ namespace BallisticEngine.DX12;
 // GTAO wrote as an RTV and we then read as an SRV is fine; writing it via a separate-pass UAV was not (the
 // AoTex[px]-reads-0 bug). The copy-back keeps ctx.AoResult (= gtaoPass.ResultSrvCpu) valid with no plumbing.
 //
-// Opt-in: BALLISTIC_DX12_RTAO=1 (default off → Enabled false → byte-identical). Needs a valid scene TLAS (DXR).
+// DEFAULT ON when HW-RT + a valid scene TLAS are present (gates IBL ambient by real sky-visibility so closed
+// interiors don't glow from skylight). BALLISTIC_DX12_RTAO=0 force-disables for A/B. Still requires the AO door
+// + AmbientOcclusion volume enabled (it read-modify-writes GTAO's AO target — that GTAO coupling is the next
+// follow-up; for now AO is default-on in the shipped scenes so this runs).
 public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.BeforeOpaqueLighting;
     public string Name => "RTAO";
@@ -34,7 +37,10 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
     int? envCached;
     public bool Enabled(Dx12FrameContext ctx) {
         if (!ctx.Doors.Ssao || !ctx.PostFX.SSAOEnabled) return false;
-        envCached ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_RTAO") == "1" ? 1 : 0;
+        // DEFAULT ON (HW-RT gated). Sky-occlusion is the only term that gates the IBL ambient by REAL openness
+        // (a sealed interior must not glow from skylight); leaving it opt-in meant every HW-RT scene leaked sky
+        // ambient into closed rooms. BALLISTIC_DX12_RTAO=0 force-disables for A/B (byte-identical to pre-default).
+        envCached ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_RTAO") == "0" ? 0 : 1;
         if (envCached == 0) return false;
         return ctx.Dxr?.SceneAS != null && ctx.Dev.HasHardwareRayTracing;
     }

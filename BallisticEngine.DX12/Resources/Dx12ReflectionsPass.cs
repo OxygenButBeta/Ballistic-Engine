@@ -44,6 +44,13 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     }
     string reflForceEnv; bool reflForceEnvUnread = true;
 
+    // Temporal reflection denoise master switch. Default ON (kills static-view jitter); BALLISTIC_DX12_REFL_
+    // NOTEMPORAL=1 turns it OFF — the surface-motion reprojection can ERASE reflections while the camera moves
+    // (the "reflections vanished when I move" bug), so this is the escape hatch / A-B door.
+    static bool? reflTemporalEnabled;
+    static bool ReflTemporalEnabled =>
+        reflTemporalEnabled ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_REFL_NOTEMPORAL") != "1";
+
     // PHASE-2 V1: reads the G-buffer (depth + normal/roughness for the SSR march) and read-modify-writes the HDR
     // scene color (marches reflections from `target`, then CopyColorFrom(ssrScene) back into `target`). RT
     // reflections additionally use the DXR AS (inline-core in V1) — declaring G-buffer + SceneColor suffices for
@@ -181,7 +188,11 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         // before the combine. The motion gate passes the live reflection through under any real camera motion, so
         // moving views stay sharp. The combine then reads the DENOISED target instead of the raw ssrTarget.
         ssrTarget.ColorToShaderResource();
-        Dx12OffscreenTarget reflForCombine = DenoiseReflectionTemporal(ctx, gbuffer);
+        // BALLISTIC_DX12_REFL_NOTEMPORAL=1 bypasses the temporal denoise (the motion-reprojected EMA that can
+        // ERASE reflections while the camera moves — surface-motion reprojection pulls the wrong reflected texel).
+        Dx12OffscreenTarget reflForCombine = ReflTemporalEnabled
+            ? DenoiseReflectionTemporal(ctx, gbuffer)
+            : ssrTarget;
 
         // Combine (full-res) → ssrScene, reading scene color (t0), depth (t1), denoised reflection (t4). The
         // temporal pass overwrote ssrCb (Intensity = hasHistory) — restore the full combine SsrConstants.
@@ -418,7 +429,10 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         ssrTarget.ColorToShaderResource();
 
         // Temporal-denoise the half-res RT reflection (kills the cache-churn mirror jitter) — shared with SSR.
-        Dx12OffscreenTarget reflForCombine = DenoiseReflectionTemporal(ctx, gbuffer);   // the combine reads the denoised reflection
+        // BALLISTIC_DX12_REFL_NOTEMPORAL=1 bypasses it (see DrawSsr) when the denoise erases moving reflections.
+        Dx12OffscreenTarget reflForCombine = ReflTemporalEnabled
+            ? DenoiseReflectionTemporal(ctx, gbuffer)
+            : ssrTarget;
 
         // Reuse the SSR combine (depth-aware upsample + Fresnel lerp into the scene color).
         Matrix4x4.Invert(proj, out Matrix4x4 invProj);
