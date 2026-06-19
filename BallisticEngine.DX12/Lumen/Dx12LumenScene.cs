@@ -214,19 +214,20 @@ public sealed class Dx12LumenScene : IDisposable
         bool meshCards = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_MESHCARDS") == "1";
         TexelDim = meshCards ? Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_MESHCARD_DIM", 4f), 1, 8) : 1;
 
-        instanceMeta?.Dispose();
+        // P0b: defer release of the OLD buffers (the GPU may still read them for the in-flight frame under overlap).
+        dev.DeferredRelease(instanceMeta);
         instanceMeta = n > 0 ? dev.CreateUavBuffer<LumenInstanceMeta>(meta, ResourceStates.GenericRead) : null;
 
-        triToCluster?.Dispose();
+        dev.DeferredRelease(triToCluster);
         triToCluster = total > 0 ? dev.CreateUavBuffer<uint>(triCluster, ResourceStates.GenericRead) : null;
 
-        clusterToTri?.Dispose();
+        dev.DeferredRelease(clusterToTri);
         clusterToTri = records > 0 ? dev.CreateUavBuffer<uint>(clusTri, ResourceStates.GenericRead) : null;
 
-        clusterCards?.Dispose();
+        dev.DeferredRelease(clusterCards);
         clusterCards = records > 0 ? dev.CreateUavBuffer<GpuClusterCard>(cards, ResourceStates.GenericRead) : null;
 
-        cardRadianceA?.Dispose(); cardRadianceB?.Dispose();
+        dev.DeferredRelease(cardRadianceA); dev.DeferredRelease(cardRadianceB);
         // float4 per TEXEL (TexelsPerRecord per record); UAV (card-light writes) readable as a StructuredBuffer SRV
         // by the hit trace. count = RecordCount × TexelsPerRecord (== RecordCount when TexelDim 1, byte-identical).
         int count = Math.Max(RecordCount * TexelsPerRecord, 1);
@@ -240,13 +241,18 @@ public sealed class Dx12LumenScene : IDisposable
         // round-robins. uint.MaxValue would also work as "stale"; 0 keeps the warm-up sweep simplest.
         // P7 #1 age stays PER-RECORD (one update decision per cluster, not per texel — the whole card relights as a
         // unit), so it is sized RecordCount, NOT count.
-        lastUpdated?.Dispose();
+        dev.DeferredRelease(lastUpdated);
         var zeroAge = new uint[Math.Max(RecordCount, 1)];
         lastUpdated = dev.CreateUavBuffer<uint>(zeroAge, ResourceStates.UnorderedAccess);
         lastUpdatedState = ResourceStates.UnorderedAccess;
 
         writeB = false;
         HistoryValid = false;   // a rebuilt cache has no valid history → the EMA starts fresh (alpha=1 first frame)
+        // Rebuild already uploaded THIS frame's instance transforms (BuildMetaArray) — record their stamp so the
+        // NEXT frame doesn't fire a redundant RefreshTransforms (which re-uploads the identical matrices). Pre-fix
+        // transformStamp stayed -1 after a rebuild → the following frame always ran RefreshTransforms once, an
+        // unnecessary per-buffer realloc (and, under frame overlap, a mid-frame GPU-resource recreate hazard).
+        transformStamp = ComputeTransformStamp(sceneAS);
     }
 
     // Resource-state tracking per buffer (the pass transitions UAV↔non-pixel-SRV around the card-light dispatch
@@ -291,11 +297,13 @@ public sealed class Dx12LumenScene : IDisposable
         // cluster offsets + re-uploads world matrices. The triToCluster map is unchanged → not re-uploaded. Sıra 5:
         // the card frames ARE world-space, so a moved instance needs them re-uploaded too (rebuilt by BuildMetaArray).
         LumenInstanceMeta[] meta = BuildMetaArray(sceneAS, out _, out _, out _, out _, out GpuClusterCard[] cards);
-        instanceMeta?.Dispose();
+        // P0b: DEFER the old buffers' release — the GPU may still read them for the frame in flight under overlap
+        // (immediate Dispose = use-after-free → device removal). Freed once the GPU passes the in-flight frame.
+        dev.DeferredRelease(instanceMeta);
         instanceMeta = dev.CreateUavBuffer<LumenInstanceMeta>(meta, ResourceStates.GenericRead);
         if (clusterCards != null)
         {
-            clusterCards.Dispose();
+            dev.DeferredRelease(clusterCards);
             clusterCards = dev.CreateUavBuffer<GpuClusterCard>(cards, ResourceStates.GenericRead);
         }
     }

@@ -364,11 +364,36 @@ public sealed class Dx12Device : IDisposable {
         if (!pipelinedFrames || frameOpen) return;
         frameSlot = (frameSlot + 1) % FramesInFlight;
         WaitFrameFence(frameFenceTargets[frameSlot]);   // the GPU finished the frame that last used this slot's allocator+list
+        // P0b: the slot's previous frame is now GPU-complete (the wait above) — so any GPU resource queued for
+        // release DURING that frame is safe to free now. Drains the deferred-release queue for resources whose
+        // owning frame the GPU has finished. (Overlap-only hazard: with overlap off, EndFrame waits so the old
+        // single-Dispose path was already safe; that path is preserved when FramesInFlight==1 — see DeferredRelease.)
+        DrainDeferredReleases();
         frameList = frameLists[frameSlot];
         frameAllocators[frameSlot].Reset();
         frameList.Reset(frameAllocators[frameSlot], null);
         frameThreadId = Environment.CurrentManagedThreadId;
         frameOpen = true;
+    }
+
+    // P0b — DEFERRED GPU-RESOURCE RELEASE. A per-frame pass that recreates a GPU resource (e.g. Lumen's
+    // RefreshTransforms reallocating instanceMeta/clusterCards on instance motion) must NOT Dispose the old one
+    // immediately under frame overlap: the GPU may still be reading it for the frame already in flight → a
+    // use-after-free that removes the device. Queue the old resource here with the CURRENT frame's fence target;
+    // it's freed in a later BeginFrame once the GPU passes that target. When overlap is OFF (FramesInFlight==1)
+    // EndFrame waits every frame, so immediate Dispose was already safe — DeferredRelease then disposes inline
+    // (byte-identical timing; no queue growth). Single-threaded with the render frame (the frame-owning thread).
+    readonly System.Collections.Generic.Queue<(ulong target, IDisposable res)> deferredReleases = new();
+    public void DeferredRelease(IDisposable resource) {
+        if (resource is null) return;
+        if (FramesInFlight == 1) { resource.Dispose(); return; }   // no overlap → EndFrame drained it; free now
+        deferredReleases.Enqueue((frameFenceValue + 1, resource));   // freed once the GPU passes the in-flight frame
+    }
+    void DrainDeferredReleases() {
+        ulong done = frameFence.CompletedValue;
+        while (deferredReleases.Count > 0 && deferredReleases.Peek().target <= done) {
+            deferredReleases.Dequeue().res.Dispose();
+        }
     }
 
     // P0a/P0b — close + submit the recorded frame ONCE. P0b: SIGNAL the dedicated frameFence (record the value
@@ -603,6 +628,7 @@ public sealed class Dx12Device : IDisposable {
     public void Dispose() {
         WaitForGpu();
         WaitFrameFence(frameFenceValue);   // P0b: drain any overlapped frame (signalled only on frameFence)
+        while (deferredReleases.Count > 0) deferredReleases.Dequeue().res.Dispose();   // free any pending GPU resources
         fenceEvent.Dispose();
         fence.Dispose();
         frameFenceEvent.Dispose();
