@@ -61,6 +61,17 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     const int LumenTableBase = Dx12BindlessTail.LumenTableBase;
     Dx12OffscreenTarget indirect;       // full-res RGBA16F incoming irradiance E (cross-pass scratch; rebuilt on resize)
 
+    // ---- spatial denoise (edge-aware blur of the per-pixel indirect E) ----
+    ID3D12RootSignature denoiseRootSig; // CBV b0 + table{t0-t2 SRV, u0 UAV}
+    ID3D12PipelineState denoisePso;
+    ID3D12Resource denoiseCb;
+    unsafe byte* denoiseCbMapped;
+    Dx12DescriptorHeap denoiseSrv;      // 4 descriptors (E/depth/normal SRV + filtered UAV)
+    Dx12OffscreenTarget indirectFiltered; // full-res filtered E the combine reads
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct DenoiseConstants { public Vector2 Texel; public float Step; public float Enabled; }
+
     // ---- combine (additive fullscreen) ----
     ID3D12RootSignature combineRootSig; // 4-SRV table + sampler
     ID3D12PipelineState combinePso;
@@ -94,7 +105,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public Vector3 SunDir; public float SunBias;
         public Vector3 SunColor; public float LightCount;
         public uint InstanceCount; public uint TotalTris; public float SkyIntensity; public float UseSky;
-        public float SkyVisRays; public float Pad0; public float Pad1; public float Pad2;
+        public float SkyVisRays; public float EmaAlpha; public float BounceRays; public float HistoryValid;
     }
 
     int frameCounter;
@@ -117,7 +128,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         Matrix4x4.Invert(ctx.ViewProj, out Matrix4x4 invVP);
 
         float intensity = EnvF("BALLISTIC_DX12_LUMEN_INTENSITY", 1f);
-        float rayCount = MathF.Round(EnvF("BALLISTIC_DX12_LUMEN_RAYS", 4f));
+        float rayCount = MathF.Round(EnvF("BALLISTIC_DX12_LUMEN_RAYS", 6f));   // 6 hemisphere rays/px (denoise + cache clean the rest)
         float maxDist = EnvF("BALLISTIC_DX12_LUMEN_DIST", 40f);
         float skyIntensity = EnvF("BALLISTIC_DX12_LUMEN_SKY", 1f);
         bool useSky = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOSKY") != "1";
@@ -179,11 +190,55 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.SetComputeRootShaderResourceView(4, ctx.GpuDriven.MaterialsGpuAddress);    // t7 GpuMaterials
             cl.SetComputeRootShaderResourceView(5, rtGeo.InstancesGpuAddress);            // t8 RtInstance[]
             cl.SetComputeRootShaderResourceView(6, clusteredLights.LightBufGpuAddress);   // t9 punctual lights
-            cl.SetComputeRootShaderResourceView(7, scene.CardRadianceGpuAddress);         // t10 CardRadiance (cards)
+            cl.SetComputeRootShaderResourceView(7, scene.CardRadianceWriteGpu);           // t10 CardRadiance (this frame's stable cache)
             cl.SetComputeRootShaderResourceView(8, scene.InstanceMetaGpuAddress);         // t11 InstanceMeta
             cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
         });
         indirect.ColorToShaderResource();
+
+        // === SPATIAL DENOISE: edge-aware à-trous blur of the raw indirect E (diffuse GI is low-frequency, so a
+        // wide bilateral blur removes the per-pixel hemisphere-ray grain without a screen-space temporal
+        // history). 3 iterations at increasing stride (1,2,4) ping-ponging indirect↔indirectFiltered → an
+        // effective ~33px footprint. The LAST written buffer is indirectFiltered (the combine reads it).
+        // BALLISTIC_DX12_LUMEN_NODENOISE=1 passes through (raw E). ===
+        bool denoise = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NODENOISE") != "1";
+        int dnPasses = denoise ? Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_DENOISE_PASSES", 3f), 1, 5) : 1;
+        Dx12OffscreenTarget src = indirect, dst = indirectFiltered;
+        for (int pass = 0; pass < dnPasses; pass++)
+        {
+            *(DenoiseConstants*)denoiseCbMapped = new DenoiseConstants
+            {
+                Texel = new Vector2(1f / indirect.Width, 1f / indirect.Height),
+                Step = denoise ? (1 << pass) : 1f, Enabled = denoise ? 1f : 0f,
+            };
+            denoiseSrv.Reset();
+            int db = denoiseSrv.AllocateRange(4);
+            dev.Device.CopyDescriptorsSimple(1, denoiseSrv.Cpu(db + 0), src.ColorSrvCpu, heapType);           // t0 E in
+            dev.Device.CopyDescriptorsSimple(1, denoiseSrv.Cpu(db + 1), gbuffer.DepthSrvCpu, heapType);       // t1 depth
+            dev.Device.CopyDescriptorsSimple(1, denoiseSrv.Cpu(db + 2), gbuffer.ColorSrvCpu(1), heapType);    // t2 normal
+            dev.Device.CreateUnorderedAccessView(dst.RenderTarget, null, new UnorderedAccessViewDescription
+            {
+                Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+            }, denoiseSrv.Cpu(db + 3));                                                                        // u0 E out
+            dst.ColorToUnorderedAccess();
+            dev.ExecuteSync(cl =>
+            {
+                cl.SetDescriptorHeaps(denoiseSrv.Heap);
+                cl.SetComputeRootSignature(denoiseRootSig);
+                cl.SetPipelineState(denoisePso);
+                cl.SetComputeRootConstantBufferView(0, denoiseCb.GPUVirtualAddress);
+                cl.SetComputeRootDescriptorTable(1, denoiseSrv.Gpu(db));
+                cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
+            });
+            dst.ColorToShaderResource();
+            // Ping-pong for the next iteration; ensure the FINAL result lands in indirectFiltered.
+            (src, dst) = (dst, src);
+        }
+        // After the loop `src` holds the last-written result. If that isn't indirectFiltered, the combine must
+        // read `src` — but to keep the combine bind stable, copy the result into indirectFiltered when needed.
+        if (!ReferenceEquals(src, indirectFiltered))
+            indirectFiltered.CopyColorFrom(src);
+        indirectFiltered.ColorToShaderResource();
 
         // === COMBINE: add E*albedo*ao/PI directly into the HDR scene color via an additive (One/One) fullscreen
         // PSO — no scratch target needed. The deferred pass already suppressed its IBL diffuse ambient
@@ -192,7 +247,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         gbuffer.ToShaderResource();
         combineSrv.Reset();
         int cb = combineSrv.AllocateRange(4);
-        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 0), indirect.ColorSrvCpu, heapType);          // t0 E
+        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 0), indirectFiltered.ColorSrvCpu, heapType);  // t0 E (denoised)
         dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 1), gbuffer.ColorSrvCpu(0), heapType);        // t1 albedo
         dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 2), gbuffer.ColorSrvCpu(2), heapType);        // t2 material (ao)
         dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 3), gbuffer.DepthSrvCpu, heapType);           // t3 depth
@@ -208,6 +263,10 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.DrawInstanced(3, 1, 0, 0);
         });
 
+        // Swap the cache ping-pong: this frame's written cache becomes next frame's "previous" (EMA + bounce
+        // source). Only when cards actually ran this frame (else the read/write buffers didn't advance).
+        if (useCards && scene.TotalTriangles > 0)
+            scene.SwapCache();
         frameCounter++;
     }
 
@@ -218,40 +277,49 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                            Dx12IblBaker ibl, float skyIntensity, bool useSky)
     {
         var sceneAS = ctx.Dxr.SceneAS;
+        float emaAlpha = EnvF("BALLISTIC_DX12_LUMEN_EMA", 0.1f);          // conservative temporal blend (0.1 = slow, stable)
+        bool bounce = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOBOUNCE") != "1";
         *(LumenCardConstants*)cardCbMapped = new LumenCardConstants
         {
             SunDir = sunDir, SunBias = 0.03f, SunColor = ctx.LightColor, LightCount = clusteredLights.LightCount,
             InstanceCount = (uint)scene.InstanceCount, TotalTris = (uint)scene.TotalTriangles,
             SkyIntensity = skyIntensity, UseSky = useSky ? 1f : 0f, SkyVisRays = 4f,
+            EmaAlpha = emaAlpha, BounceRays = bounce ? 4f : 0f,
+            HistoryValid = (scene.HistoryValid && !ctx.DeterministicCapture) ? 1f : 0f,
         };
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Dx12DescriptorHeap bindless = Dx12Backend.BindlessHeap;
         dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(CardSkyTableBase + 0), ibl.IrradianceSrv, heapType);   // t1 sky cube
 
-        // CardRadiance is the card-light UAV target this dispatch; it was left in UnorderedAccess by Rebuild (or
-        // CopySource/Pixel by a prior frame). Bring it to UAV, dispatch, then to NonPixelShaderResource for the
-        // trace's root-SRV read (a root SRV still needs the resource in a readable state for the compute stage).
-        ID3D12Resource card = scene.CardRadiance;
+        // Ping-pong: write THIS frame's buffer (UAV), read the PREVIOUS frame's (non-pixel SRV) for the EMA +
+        // 2nd bounce. Transition each to the needed state; after the dispatch bring the WRITE buffer to non-
+        // pixel SRV too (the trace reads it as a root SRV). The read buffer stays SRV for next frame's swap.
+        ID3D12Resource cardW = scene.CardRadianceWrite;
+        ID3D12Resource cardR = scene.CardRadianceRead;
         dev.ExecuteSync(cl =>
         {
-            if (scene.cardRadianceState != ResourceStates.UnorderedAccess)
-                cl.ResourceBarrierTransition(card, scene.cardRadianceState, ResourceStates.UnorderedAccess);
+            if (scene.StateOf(cardW) != ResourceStates.UnorderedAccess)
+                cl.ResourceBarrierTransition(cardW, scene.StateOf(cardW), ResourceStates.UnorderedAccess);
+            if (scene.StateOf(cardR) != ResourceStates.NonPixelShaderResource)
+                cl.ResourceBarrierTransition(cardR, scene.StateOf(cardR), ResourceStates.NonPixelShaderResource);
             cl.SetDescriptorHeaps(bindless.Heap);
             cl.SetComputeRootSignature(cardRootSig);
             cl.SetPipelineState(cardPso);
             cl.SetComputeRootConstantBufferView(0, cardCb.GPUVirtualAddress);
             cl.SetComputeRootShaderResourceView(1, sceneAS.TlasAddress);                 // t0 TLAS
-            cl.SetComputeRootUnorderedAccessView(2, scene.CardRadianceGpuAddress);       // u0 CardRadiance
+            cl.SetComputeRootUnorderedAccessView(2, scene.CardRadianceWriteGpu);         // u0 CardRadiance (write)
             cl.SetComputeRootDescriptorTable(3, bindless.Gpu(CardSkyTableBase));         // t1 sky cube
             cl.SetComputeRootShaderResourceView(4, scene.InstanceMetaGpuAddress);        // t2 LumenInstanceMeta
             cl.SetComputeRootShaderResourceView(5, ctx.Dxr.RtGeometry.InstancesGpuAddress); // t3 RtInstance[]
             cl.SetComputeRootShaderResourceView(6, ctx.GpuDriven.MaterialsGpuAddress);   // t4 GpuMaterials
             cl.SetComputeRootShaderResourceView(7, clusteredLights.LightBufGpuAddress);  // t5 Lights
+            cl.SetComputeRootShaderResourceView(8, scene.CardRadianceReadGpu);           // t6 PrevCard (read)
             cl.Dispatch((uint)((scene.TotalTriangles + 63) / 64), 1, 1);
-            cl.ResourceBarrierTransition(card, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            cl.ResourceBarrierTransition(cardW, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
         });
-        scene.cardRadianceState = ResourceStates.NonPixelShaderResource;
+        scene.SetState(cardW, ResourceStates.NonPixelShaderResource);
+        scene.SetState(cardR, ResourceStates.NonPixelShaderResource);
     }
 
     static float EnvF(string name, float fallback) =>
@@ -359,6 +427,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         var rtInst = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(3, 0), ShaderVisibility.All);    // t3
         var mats = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(4, 0), ShaderVisibility.All);      // t4
         var lights = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(5, 0), ShaderVisibility.All);    // t5
+        var prevCard = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(6, 0), ShaderVisibility.All);  // t6 PrevCard
         var clamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
         {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
@@ -372,7 +441,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         cardRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { cbv0, tlasSrv, uavRoot, skyTable, instMeta, rtInst, mats, lights }, new[] { clamp, wrap })));
+                new[] { cbv0, tlasSrv, uavRoot, skyTable, instMeta, rtInst, mats, lights, prevCard }, new[] { clamp, wrap })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumenCardLight.hlsl");
         byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSMain", "LumenCardLight.hlsl");
@@ -382,6 +451,30 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         cardCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         cardCbMapped = cardCb.Map<byte>(0);
+
+        BuildDenoisePipeline();
+    }
+
+    // Spatial-denoise compute (LumenGi.hlsl CSDenoise): CBV b0 + table{E t0 / depth t1 / normal t2 SRV, u0 UAV}.
+    unsafe void BuildDenoisePipeline()
+    {
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var srv = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 3, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 0);
+        var uav = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 3);
+        var table = new RootParameter1(new RootDescriptorTable1(srv, uav), ShaderVisibility.All);
+        denoiseRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, table })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumenGi.hlsl");
+        byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSDenoise", "LumenGi.hlsl");
+        denoisePso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription { RootSignature = denoiseRootSig, ComputeShader = cs });
+
+        int cbSize = (Marshal.SizeOf<DenoiseConstants>() + 255) & ~255;
+        denoiseCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+        denoiseCbMapped = denoiseCb.Map<byte>(0);
+        denoiseSrv = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
     // The indirect buffer + the (unused-in-P2) scratch reallocate with the render resolution. Full-res for now
@@ -389,7 +482,10 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     public void Resize(int w, int h)
     {
         indirect?.Dispose();
+        indirectFiltered?.Dispose();
         indirect = new Dx12OffscreenTarget(dev, Math.Max(1, w), Math.Max(1, h), withDepth: false,
+            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
+        indirectFiltered = new Dx12OffscreenTarget(dev, Math.Max(1, w), Math.Max(1, h), withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
     }
 
@@ -398,7 +494,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         scene.Dispose();
         tracePso?.Dispose(); traceRootSig?.Dispose(); traceCb?.Dispose(); sunCb?.Dispose();
         cardPso?.Dispose(); cardRootSig?.Dispose(); cardCb?.Dispose();
+        denoisePso?.Dispose(); denoiseRootSig?.Dispose(); denoiseCb?.Dispose(); denoiseSrv?.Dispose();
         combinePso?.Dispose(); combineDebugPso?.Dispose(); combineRootSig?.Dispose(); combineSrv?.Dispose();
-        indirect?.Dispose();
+        indirect?.Dispose(); indirectFiltered?.Dispose();
     }
 }

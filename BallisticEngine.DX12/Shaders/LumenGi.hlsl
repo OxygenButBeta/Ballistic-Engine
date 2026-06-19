@@ -268,6 +268,53 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
     Indirect[px] = float4(Sanitize(E), 1.0);
 }
 
+// ===== Spatial denoise (P4): edge-aware blur of the per-pixel indirect E =====
+// The cache (cards) is temporally STABLE, but the per-pixel screen gather still Monte-Carlo-samples only a few
+// hemisphere rays → spatial variance (the visible "grain"). Diffuse GI is LOW-FREQUENCY, so a depth+normal-
+// guided blur removes that variance without a screen-space temporal history (plan: "final screen pixels do not
+// carry the history burden"). One wide à-trous-style pass, separable-ish 5x5 with bilateral weights. Reads the
+// raw E (t0), depth (t1), normal (t2); writes the filtered E to a scratch the combine then reads.
+Texture2D<float4> DnIn     : register(t0);
+Texture2D<float>  DnDepth  : register(t1);
+Texture2D<float4> DnNormal : register(t2);
+RWTexture2D<float4> DnOut  : register(u0);
+
+cbuffer DenoiseConstants : register(b0) {
+    float2 DnTexel; float DnStep; float DnEnabled;   // 1/res; tap stride (px); >0.5 = blur (else passthrough)
+};
+
+[numthreads(8, 8, 1)]
+void CSDenoise(uint3 dtid : SV_DispatchThreadID) {
+    uint2 px = dtid.xy;
+    uint W = (uint)round(1.0 / DnTexel.x), H = (uint)round(1.0 / DnTexel.y);
+    if (px.x >= W || px.y >= H) return;
+
+    float3 c = DnIn[px].rgb;
+    if (DnEnabled < 0.5) { DnOut[px] = float4(c, 1); return; }
+
+    float dC = DnDepth[px];
+    if (dC >= 1.0) { DnOut[px] = float4(c, 1); return; }   // sky — nothing to filter
+    float3 nC = DnNormal[px].rgb * 2.0 - 1.0;
+
+    float3 sum = 0.0.xxx; float wsum = 0.0;
+    int r = 2; float stride = max(DnStep, 1.0);
+    [unroll] for (int dy = -2; dy <= 2; dy++)
+    [unroll] for (int dx = -2; dx <= 2; dx++) {
+        int2 q = int2(px) + int2(dx, dy) * (int)stride;
+        if (q.x < 0 || q.y < 0 || q.x >= (int)W || q.y >= (int)H) continue;
+        float dq = DnDepth[q];
+        if (dq >= 1.0) continue;
+        float3 nq = DnNormal[q].rgb * 2.0 - 1.0;
+        // Bilateral weights: gaussian spatial * normal similarity * depth similarity (linear-ish window depth).
+        float wSpatial = exp(-float(dx * dx + dy * dy) / 4.0);
+        float wNormal = pow(saturate(dot(nC, nq)), 32.0);
+        float wDepth = exp(-abs(dq - dC) * 600.0);
+        float w = wSpatial * wNormal * wDepth;
+        sum += DnIn[q].rgb * w; wsum += w;
+    }
+    DnOut[px] = float4(wsum > 1e-4 ? sum / wsum : c, 1);
+}
+
 // ===== Combine: add the diffuse indirect into the HDR scene color =====
 // Indirect holds incoming irradiance E. The diffuse response is E * albedo * ao (Lambertian, the same albedo
 // the deferred pass used). The deferred pass SUPPRESSED its IBL diffuse ambient when Lumen is active (UseIBL

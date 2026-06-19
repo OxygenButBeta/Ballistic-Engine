@@ -36,12 +36,13 @@ StructuredBuffer<LumenInstanceMeta> Instances   : register(t2);
 StructuredBuffer<RtInstance>        RtInstances : register(t3);
 StructuredBuffer<GpuMaterial>       GpuMaterials: register(t4);
 StructuredBuffer<GpuLight>          Lights      : register(t5);
+StructuredBuffer<float4>            PrevCard    : register(t6);   // P4: PREVIOUS frame's cache (multi-bounce + EMA)
 
 cbuffer LumenCardConstants : register(b0) {
     float3 SunDir;   float SunBias;      // TO the sun (normalized), world; shadow-ray origin offset
     float3 SunColor; float LightCount;   // sun radiance (RAW HDR); # punctual lights
     uint InstanceCount; uint TotalTris; float SkyIntensity; float UseSky;
-    float SkyVisRays; float Pad0; float Pad1; float Pad2;
+    float SkyVisRays; float EmaAlpha; float BounceRays; float HistoryValid;   // P4: temporal blend + 2nd-bounce gather
 };
 SamplerState LinearClamp : register(s0);
 SamplerState LinearWrap  : register(s1);
@@ -157,25 +158,42 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
         punctual += rad * nd * Visibility(triCenter, N, Ld, dist);
     }
 
-    // Sky-visibility ambient: a few cosine-hemisphere rays; the fraction that ESCAPE see the sky irradiance.
-    // Cheap openness term so an open surface picks up skylight while a sealed one does not (occlusion-correct).
-    float3 sky = 0.0.xxx;
-    if (UseSky > 0.5) {
-        uint sr = (uint)clamp(SkyVisRays, 1.0, 8.0);
-        float jit = Hash(gtri * 2654435761u);
-        float3x3 basis = BuildBasis(N);
-        float3 acc = 0.0.xxx;
-        [loop] for (uint k = 0; k < sr; k++) {
-            float3 d = normalize(mul(CosineHemisphere(k, sr, jit), basis));
-            if (Visibility(triCenter, N, d, 1e4) > 0.5)
-                acc += SkyIrradiance.SampleLevel(LinearClamp, d, 0).rgb;
+    // Hemisphere gather: ONE cosine-hemisphere ray set serves BOTH the sky-visibility ambient AND the P4
+    // second bounce. Each ray: if it escapes → sky irradiance (occlusion-correct: a sealed surface sees no
+    // sky); if it HITS a triangle → that triangle's PREVIOUS-frame cache radiance (multi-bounce — over frames
+    // the cache converges to full multi-bounce GI, the Lumen radiance-cache trick). The incoming irradiance is
+    // averaged; * albedo gives this surface's indirect response.
+    float3 indirect = 0.0.xxx;
+    uint sr = (uint)clamp(max(SkyVisRays, BounceRays), 1.0, 8.0);
+    float jit = Hash(gtri * 2654435761u);
+    float3x3 basis = BuildBasis(N);
+    [loop] for (uint k = 0; k < sr; k++) {
+        float3 d = normalize(mul(CosineHemisphere(k, sr, jit), basis));
+        RayDesc rd; rd.Origin = triCenter + N * max(SunBias, 0.004); rd.Direction = d; rd.TMin = 0.02; rd.TMax = 1e4;
+        RayQuery<RAY_FLAG_FORCE_OPAQUE> q; q.TraceRayInline(Scene, 0, 0xFF, rd); q.Proceed();
+        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+            // Second bounce from the previous cache (only when HistoryValid + bounce enabled; else 0 = direct-only).
+            if (HistoryValid > 0.5 && BounceRays > 0.5) {
+                uint hi = q.CommittedInstanceID();
+                LumenInstanceMeta hm = Instances[hi];
+                uint hg = hm.TriOffset + q.CommittedPrimitiveIndex();
+                indirect += PrevCard[hg].rgb;
+            }
+        } else if (UseSky > 0.5) {
+            indirect += SkyIrradiance.SampleLevel(LinearClamp, d, 0).rgb * SkyIntensity;
         }
-        sky = acc / float(sr) * SkyIntensity;
     }
+    indirect /= float(sr);
 
-    // Outgoing radiance leaving the surface = albedo * (incident direct + sky) + emissive. (Lambertian: the
-    // /PI is folded at the RECEIVER's gather in LumenGi; here we store irradiance*albedo + emissive so the
-    // hit-sample is the leaving radiance the receiver integrates.)
-    float3 radiance = albedo * (sun + punctual + sky) + emissive;
+    // Outgoing radiance leaving the surface = albedo * (direct + indirect) + emissive. (Lambertian: the /PI is
+    // folded at the RECEIVER's gather in LumenGi; here we store leaving radiance so the hit-sample is what the
+    // receiver integrates.)
+    float3 lit = albedo * (sun + punctual + indirect) + emissive;
+
+    // P4 conservative TEMPORAL update: EMA-blend over the previous cache (per-triangle, view-independent → no
+    // reprojection). First frame after a (re)build (HistoryValid=0) takes the lit value straight (alpha=1).
+    float alpha = HistoryValid > 0.5 ? saturate(EmaAlpha) : 1.0;
+    float3 prev = PrevCard[gtri].rgb;
+    float3 radiance = lerp(prev, lit, alpha);
     CardRadiance[gtri] = float4(Sanitize(radiance), 1.0);
 }

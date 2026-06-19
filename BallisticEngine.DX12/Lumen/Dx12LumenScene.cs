@@ -45,11 +45,25 @@ public sealed class Dx12LumenScene : IDisposable
     public ulong InstanceMetaGpuAddress => instanceMeta?.GPUVirtualAddress ?? 0;
     public int InstanceCount { get; private set; }
 
-    // ---- per-triangle radiance cache (the "cards") ----
-    ID3D12Resource cardRadiance;        // float4[totalTris]  (rgb radiance, a unused) — UAV (card-light writes) / SRV (hit reads)
-    public ID3D12Resource CardRadiance => cardRadiance;
-    public ulong CardRadianceGpuAddress => cardRadiance?.GPUVirtualAddress ?? 0;
+    // ---- per-triangle radiance cache (the "cards") — DOUBLE-BUFFERED for P4 temporal accumulation + multi-
+    // bounce. Each frame the card-light pass WRITES the "current" buffer while READING the "previous": it EMA-
+    // blends the new lit radiance over the previous (conservative temporal stabilization → kills the P2 noise
+    // WITHOUT any screen-space history) and gathers a second bounce by sampling the previous cache at its rays'
+    // hits (so the cache converges to full multi-bounce GI over a few frames — the Lumen radiance-cache trick).
+    // The screen trace reads the "current" (stable) cache. Cards are per-triangle + view-independent, so the
+    // temporal EMA needs NO reprojection (a static scene's triangle radiance is stationary). ----
+    ID3D12Resource cardRadianceA, cardRadianceB;
+    bool writeB;   // which buffer the card-light pass writes THIS frame (ping-pong)
+    public ID3D12Resource CardRadianceWrite => writeB ? cardRadianceB : cardRadianceA;
+    public ID3D12Resource CardRadianceRead  => writeB ? cardRadianceA : cardRadianceB;   // previous frame's cache
+    public ulong CardRadianceWriteGpu => (CardRadianceWrite)?.GPUVirtualAddress ?? 0;
+    public ulong CardRadianceReadGpu  => (CardRadianceRead)?.GPUVirtualAddress ?? 0;
+    public bool HistoryValid { get; private set; }
     public int TotalTriangles { get; private set; }
+
+    // Swap the ping-pong AFTER the card-light pass + trace have consumed this frame's buffers. Called by the
+    // pass at the end of Record. The just-written buffer becomes next frame's "previous"/read.
+    public void SwapCache() { writeB = !writeB; HistoryValid = true; }
 
     // ---- dirty tracking ----
     int stamp = -1;
@@ -60,7 +74,7 @@ public sealed class Dx12LumenScene : IDisposable
 
     public Dx12LumenScene(Dx12Device device) { dev = device; }
 
-    public bool Valid => TotalTriangles > 0 && cardRadiance != null;
+    public bool Valid => TotalTriangles > 0 && cardRadianceA != null;
 
     // Refresh the substrate for this frame: ensure the shared TLAS + bindless geometry, rebuild the per-instance
     // triangle-range table + the CardRadiance cache on a stamp change, and log the counts. Returns usability.
@@ -82,7 +96,7 @@ public sealed class Dx12LumenScene : IDisposable
 
         int objects = rtGeo.InstanceCount;
         int s = ComputeStamp(sceneAS, objects);
-        if (s != stamp || cardRadiance == null)
+        if (s != stamp || cardRadianceA == null)
         {
             stamp = s;
             Rebuild(sceneAS, rtGeo);
@@ -128,15 +142,22 @@ public sealed class Dx12LumenScene : IDisposable
         instanceMeta?.Dispose();
         instanceMeta = n > 0 ? dev.CreateUavBuffer<LumenInstanceMeta>(meta, ResourceStates.GenericRead) : null;
 
-        cardRadiance?.Dispose();
+        cardRadianceA?.Dispose(); cardRadianceB?.Dispose();
         // float4 per triangle; UAV (card-light writes) readable as a StructuredBuffer SRV by the hit trace.
         int count = Math.Max(TotalTriangles, 1);
         var zero = new Vector4[count];   // start cleared (no stale radiance on a fresh build)
-        cardRadiance = dev.CreateUavBuffer<Vector4>(zero, ResourceStates.UnorderedAccess);
-        cardRadianceState = ResourceStates.UnorderedAccess;
+        cardRadianceA = dev.CreateUavBuffer<Vector4>(zero, ResourceStates.UnorderedAccess);
+        cardRadianceB = dev.CreateUavBuffer<Vector4>(zero, ResourceStates.UnorderedAccess);
+        cardStateA = cardStateB = ResourceStates.UnorderedAccess;
+        writeB = false;
+        HistoryValid = false;   // a rebuilt cache has no valid history → the EMA starts fresh (alpha=1 first frame)
     }
 
-    public ResourceStates cardRadianceState = ResourceStates.UnorderedAccess;
+    // Resource-state tracking per buffer (the pass transitions UAV↔non-pixel-SRV around the card-light dispatch
+    // + trace read). Exposed so the pass can manage barriers on whichever buffer is read/written this frame.
+    public ResourceStates cardStateA = ResourceStates.UnorderedAccess, cardStateB = ResourceStates.UnorderedAccess;
+    public ResourceStates StateOf(ID3D12Resource r) => r == cardRadianceB ? cardStateB : cardStateA;
+    public void SetState(ID3D12Resource r, ResourceStates s) { if (r == cardRadianceB) cardStateB = s; else cardStateA = s; }
 
     int ComputeStamp(Dx12SceneAS sceneAS, int objects)
     {
@@ -154,6 +175,7 @@ public sealed class Dx12LumenScene : IDisposable
     public void Dispose()
     {
         instanceMeta?.Dispose(); instanceMeta = null;
-        cardRadiance?.Dispose(); cardRadiance = null;
+        cardRadianceA?.Dispose(); cardRadianceA = null;
+        cardRadianceB?.Dispose(); cardRadianceB = null;
     }
 }
