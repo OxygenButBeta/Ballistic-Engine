@@ -70,6 +70,7 @@ StructuredBuffer<float4>            CardRadiance : register(t10);   // #2A: per-
 StructuredBuffer<LumenInstanceMeta> InstanceMeta : register(t11);   // per-instance {triOffset, clusterOffset, world}
 StructuredBuffer<uint>              TriToCluster : register(t12);   // #2A: global tri index → LOCAL cluster index
 Texture2D<float4>                   ProbeHistory : register(t14);   // #3: last frame's accumulated E (rgb) + depth (a)
+Texture2D<float2>                   Motion       : register(t15);   // #3: screen motion (prevUV-currUV) for ghosting reject
 
 static const float PI = 3.14159265359;
 
@@ -283,19 +284,39 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
     // combine applies the receiver albedo. Intensity is the artist GI dial.
     float3 E = Sanitize(sum / float(rays) * Intensity);
 
-    // #3 PROBE TEMPORAL ACCUMULATION — EMA this frame's noisy few-ray E over the accumulated history at the SAME
-    // probe texel (probes are view-locked to the screen, so no reprojection needed for a static camera; a moving
-    // camera is rejected by the depth guard below). Over frames this converges to a many-ray, low-variance probe
-    // radiance — the screen-probe quality win. The history carries its depth in .a so a disocclusion (this probe
-    // now sees a different surface) FLUSHES instead of smearing. ProbeAlpha = this-frame weight.
+    // #3 PROBE TEMPORAL ACCUMULATION — EMA this frame's noisy few-ray E over the REPROJECTED accumulated history.
+    // Over frames this converges to a many-ray, low-variance probe radiance (the screen-probe quality win) while
+    // three guards kill GHOSTING (the temporal trail under motion):
+    //   1) REPROJECT: sample history at the surface's PREVIOUS screen position (px + motion), not px — so a moving
+    //      surface accumulates correctly instead of dragging a trail.
+    //   2) MOTION + DEPTH reject: if the reprojected texel left the screen, or its depth disagrees (disocclusion),
+    //      or screen motion is large, take the FRESH E (no blend) so a fast move shows the current frame, sharp.
+    //   3) NEIGHBOURHOOD CLAMP: clamp the history to this frame's local 3x3 E min/max. A lighting change (a shadow
+    //      sweeps across a surface whose DEPTH is unchanged — depth-reject can't catch it) is bounded immediately
+    //      instead of leaving the old bright/dark value to fade out slowly. This is the AABB-clamp TAA uses.
     float3 outE = E;
-    if (HistoryValid > 0.5) {
-        float4 hist = ProbeHistory[px];                       // rgb = accumulated E, a = depth it was captured at
-        float histDepth = hist.a;
-        bool sameSurface = abs(histDepth - depth) < 0.001;    // non-linear depth → tight tol = disocclusion reject
-        if (sameSurface)
-            outE = lerp(hist.rgb, E, saturate(ProbeAlpha));   // accumulate
-        // else: disocclusion → take the fresh E (outE already = E)
+    [branch] if (HistoryValid > 0.5) {
+        float2 motion = Motion.SampleLevel(LinearClamp, uv, 0).rg;   // prevUV - currUV (UNJITTERED screen delta)
+        float2 prevUv = uv + motion;
+        float motionTexels = length(motion / max(TexelSize, 1e-6));
+        bool onScreen = all(prevUv >= 0.0) && all(prevUv <= 1.0);
+        // Reprojected history (rgb=accumulated E, a=depth at capture).
+        float4 hist = ProbeHistory.SampleLevel(LinearClamp, prevUv, 0);
+        bool sameSurface = abs(hist.a - depth) < 0.0015;
+        if (onScreen && sameSurface) {
+            // CLAMP history toward this frame's E so a lighting change (shadow sweep at constant depth) is bounded
+            // instead of trailing. No cross-thread neighbour read (that races the in-flight UAV writes): bound the
+            // history's LUMINANCE to within a band around E's luminance and rescale — cheap, race-free, and enough
+            // to stop a stale bright/dark value from lingering once the lighting moves.
+            float lh = max(dot(hist.rgb, float3(0.2126, 0.7152, 0.0722)), 1e-4);
+            float le = dot(E, float3(0.2126, 0.7152, 0.0722));
+            float lClamped = clamp(lh, le * 0.5, le * 2.0 + 1e-3);
+            float3 clampedHist = hist.rgb * (lClamped / lh);
+            // More motion → trust history less (faster convergence to the fresh frame under movement).
+            float alpha = saturate(max(ProbeAlpha, motionTexels * 0.5));
+            outE = lerp(clampedHist, E, alpha);
+        }
+        // else (off-screen / disocclusion) → fresh E (outE already = E), no ghost.
     }
     Indirect[px] = float4(Sanitize(outE), depth);             // store depth in .a for next frame's reject + history copy
 }

@@ -221,6 +221,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
         }, bindless.Cpu(LumenTableBase + 6));                                                                      // u0 indirect
         dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(LumenTableBase + 7), probeHistory.ColorSrvCpu, heapType);  // t14 ProbeHistory (#3)
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(LumenTableBase + 8), gbuffer.ColorSrvCpu(4), heapType);    // t15 motion (ghosting reject)
 
         // The trace reads depth/normal/material/scene-color as SRVs from the COMPUTE (non-pixel) stage, and the
         // scene color must be readable too. Promote: G-buffer to the combined read; scene color to SRV. ALL in
@@ -448,10 +449,13 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         var tlasSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.All);   // t0 TLAS (root)
         var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 6, baseShaderRegister: 1);   // t1-t6
         var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);  // u0
-        // #3: probe history texture (t14) lives in the SAME table tail (slot LumenTableBase+7), after u0 (+6).
+        // #3: probe history texture (t14, slot +7) + motion vectors (t15, slot +8, ghosting reject) in the table
+        // tail, after u0 (+6).
         var probeRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 14,
             registerSpace: 0, offsetInDescriptorsFromTableStart: 7);
-        var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange, probeRange), ShaderVisibility.All);
+        var motionRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 15,
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 8);
+        var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange, probeRange, motionRange), ShaderVisibility.All);
         var matSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All);
         var instSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(8, 0), ShaderVisibility.All);
         var lightSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(9, 0), ShaderVisibility.All);
