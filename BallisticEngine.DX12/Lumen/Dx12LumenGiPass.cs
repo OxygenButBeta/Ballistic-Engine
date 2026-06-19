@@ -153,7 +153,6 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     Dx12OffscreenTarget probeAtlas;      // octahedral radiance atlas, (ProbesX*OctSize) × (ProbesY*OctSize), RGBA16F UAV
     Dx12OffscreenTarget probeAtlasHistory; // Sıra 3: previous frame's accumulated atlas (EMA source) — table t13
     bool spHistoryValid;
-    Dx12DescriptorHeap spSrv;            // per-frame: u2 indirect UAV + t13 atlas-history SRV
     int probeStride = 16, octSize = 8;
     int probesX, probesY, probeHeaderCount;
     const int SpTableBase = Dx12BindlessTail.LumenScreenProbeTableBase;
@@ -562,6 +561,13 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         {
             Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
         }, bindless.Cpu(SpTableBase + 6));                                                                      // u1 probe atlas
+        // u2 indirect (SpTableBase+7) + t13 atlas history (SpTableBase+8) — ALL in the ONE bindless heap so a single
+        // SetDescriptorHeaps(bindless) covers every table (a separate heap for these caused SetDescriptorTableInvalid).
+        dev.Device.CreateUnorderedAccessView(indirect.RenderTarget, null, new UnorderedAccessViewDescription
+        {
+            Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+        }, bindless.Cpu(SpTableBase + 7));                                                                      // u2 indirect
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 8), probeAtlasHistory.ColorSrvCpu, heapType); // t13 atlas history
 
         probeAtlas.ColorToUnorderedAccess();
 
@@ -581,43 +587,39 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.SetComputeRootShaderResourceView(12, probeHeadersPrev.GPUVirtualAddress);  // t16 prev headers (root SRV — buffer)
         }
 
-        // Per-frame table (root slot 11): u2 Indirect (texture UAV, offset 0) + t13 atlas history (texture SRV,
-        // offset 1). Texture UAV/SRV can't be root descriptors, so they live in this small per-frame heap.
-        spSrv.Reset();
-        int sb = spSrv.AllocateRange(2);
-        dev.Device.CreateUnorderedAccessView(indirect.RenderTarget, null, new UnorderedAccessViewDescription
-        {
-            Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
-        }, spSrv.Cpu(sb + 0));
-        dev.Device.CopyDescriptorsSimple(1, spSrv.Cpu(sb + 1), probeAtlasHistory.ColorSrvCpu, heapType);   // t13 atlas history
+        // Root slot 11 table = u2 indirect (SpTableBase+7) + t13 atlas history (SpTableBase+8), bound from the
+        // SAME bindless heap as slot 3. The descriptors are written ONCE above (not per-dispatch) → no
+        // StaticDescriptorInvalidDescriptorChange; one SetDescriptorHeaps(bindless) serves all tables → no
+        // SetDescriptorTableInvalid. The 3 dispatches are separate ExecuteSync; GPU work is serialised by each
+        // submit's WaitForGpu so no inter-dispatch UAV barrier is needed.
+        var slot11 = bindless.Gpu(SpTableBase + 7);
 
+        // PLACE — writes probeHeaders (root UAV). indirect + atlas already UAV.
         dev.ExecuteSync(cl =>
         {
             cl.SetDescriptorHeaps(bindless.Heap);
             cl.SetComputeRootSignature(spRootSig);
-            // PLACE
             cl.SetPipelineState(spPlacePso);
             SetCommonRoots(cl);
-            cl.SetComputeRootDescriptorTable(11, spSrv.Gpu(sb));                          // u2 indirect (table slot 11)                          // u2 indirect (table)
+            cl.SetComputeRootDescriptorTable(11, slot11);
             cl.Dispatch((uint)((probesX + 7) / 8), (uint)((probesY + 7) / 8), 1);
         });
-        // PLACE writes probeHeaders (root UAV) — a UAV barrier suffices before the trace reads it. The next
-        // ExecuteSync's submit/WaitForGpu already serialises GPU work, so no explicit barrier needed.
-        // The trace reads the previous accumulated atlas (t13) as an SRV — promote it before the trace.
-        probeAtlasHistory.ColorToShaderResource();
+
+        // TRACE — reads the previous accumulated atlas (t13) from a COMPUTE shader → NON_PIXEL state (not the
+        // default PIXEL from ColorToShaderResource; that PIXEL/NON_PIXEL mismatch was a GBV InvalidSubresourceState).
+        probeAtlasHistory.ColorToNonPixelShaderResource();
         dev.ExecuteSync(cl =>
         {
             cl.SetDescriptorHeaps(bindless.Heap);
             cl.SetComputeRootSignature(spRootSig);
             cl.SetPipelineState(spTracePso);
             SetCommonRoots(cl);
-            cl.SetComputeRootDescriptorTable(11, spSrv.Gpu(sb));                          // u2 indirect + t13 hist (table slot 11)
+            cl.SetComputeRootDescriptorTable(11, slot11);
             cl.Dispatch((uint)((probesX * octSize + 7) / 8), (uint)((probesY * octSize + 7) / 8), 1);
         });
+
         // Snapshot this frame's accumulated atlas + headers into the history for next frame's EMA + reproject test.
-        probeAtlas.ColorToShaderResource();
         probeAtlasHistory.CopyColorFrom(probeAtlas);
-        probeAtlasHistory.ColorToShaderResource();
         // headers → prev (a plain buffer copy; both are committed UAV/SRV-readable structured buffers).
         dev.ExecuteSync(cl =>
         {
@@ -628,7 +630,9 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.ResourceBarrierTransition(probeHeadersPrev, ResourceStates.CopyDest, ResourceStates.GenericRead);
         });
         spHistoryValid = true;
-        // INTEGRATE reads the atlas as a UAV (RWTexture2D) — bring it back to UAV.
+
+        // INTEGRATE — reads the atlas as a UAV (RWTexture2D) + the history SRV (NON_PIXEL). Bring the atlas back to
+        // UAV (CopyColorFrom left it COPY_SOURCE). The t13 history descriptor was written once → still valid.
         probeAtlas.ColorToUnorderedAccess();
         dev.ExecuteSync(cl =>
         {
@@ -636,7 +640,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.SetComputeRootSignature(spRootSig);
             cl.SetPipelineState(spIntegratePso);
             SetCommonRoots(cl);
-            cl.SetComputeRootDescriptorTable(11, spSrv.Gpu(sb));                          // u2 indirect + t13 hist (table slot 11)
+            cl.SetComputeRootDescriptorTable(11, slot11);
             cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
         });
     }
@@ -836,9 +840,15 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         var cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
         var cbv1 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.All);
         var tlasSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.All);   // t0 TLAS
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 6, baseShaderRegister: 1);   // t1-t6
+        // DataVolatile (mirrors Dx12ReflectionsPass): the descriptor DATA may change between submits, so D3D must
+        // NOT assume DATA_STATIC_WHILE_SET_AT_EXECUTE — that assumption caused the GBV StaticDescriptorInvalid
+        // DescriptorChange + InvalidSubresourceState ("enforced because the descriptor is DATA_STATIC") storm when
+        // the same bindless tail slots are re-written each frame across 3 separate ExecuteSync submits.
+        const DescriptorRangeFlags Vol = DescriptorRangeFlags.DataVolatile;
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 6, baseShaderRegister: 1,
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 0, flags: Vol);   // t1-t6
         var atlasUav = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 1,
-            registerSpace: 0, offsetInDescriptorsFromTableStart: 6);   // u1 atlas (after the 6 SRVs)
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 6, flags: Vol);   // u1 atlas (after the 6 SRVs)
         var table = new RootParameter1(new RootDescriptorTable1(srvRange, atlasUav), ShaderVisibility.All);
         var matSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All);
         var instSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(8, 0), ShaderVisibility.All);
@@ -849,9 +859,9 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         var headerUav = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(0, 0), ShaderVisibility.All);   // u0 ProbeHeaders (root UAV, buffer)
         // Per-frame table: u2 indirect (texture UAV) at offset 0, t13 atlas-history (texture SRV) at offset 1.
         var indirectUavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 2,
-            registerSpace: 0, offsetInDescriptorsFromTableStart: 0);   // u2 indirect
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 0, flags: Vol);   // u2 indirect
         var atlasHistRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 13,
-            registerSpace: 0, offsetInDescriptorsFromTableStart: 1);   // t13 atlas history
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 1, flags: Vol);   // t13 atlas history
         var indirectTable = new RootParameter1(new RootDescriptorTable1(indirectUavRange, atlasHistRange), ShaderVisibility.All);
         var prevHeaderSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(16, 0), ShaderVisibility.All);  // t16 prev headers (root SRV, buffer)
         var clampSamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
@@ -898,10 +908,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         spSunCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)snSize), ResourceStates.GenericRead);
         spSunCbMapped = spSunCb.Map<byte>(0);
-
-        spSrv = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 8,
-            shaderVisible: true, framesInFlight: dev.FramesInFlight);
+        // (No separate descriptor heap: u2 indirect + t13 atlas history live in the ONE bindless heap at the
+        // screen-probe tail — a second shader-visible heap can't be bound simultaneously.)
     }
 
     const int MaxDenoisePasses = 5;
@@ -974,7 +982,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         combinePso?.Dispose(); combineDebugPso?.Dispose(); combineRootSig?.Dispose(); combineSrv?.Dispose(); combineCb?.Dispose();
         indirect?.Dispose(); indirectFiltered?.Dispose(); probeHistory?.Dispose();
         spPlacePso?.Dispose(); spTracePso?.Dispose(); spIntegratePso?.Dispose(); spRootSig?.Dispose();
-        spProbeCb?.Dispose(); spSunCb?.Dispose(); spSrv?.Dispose();
+        spProbeCb?.Dispose(); spSunCb?.Dispose();
         probeHeaders?.Dispose(); probeHeadersPrev?.Dispose(); probeAtlas?.Dispose(); probeAtlasHistory?.Dispose();
     }
 }

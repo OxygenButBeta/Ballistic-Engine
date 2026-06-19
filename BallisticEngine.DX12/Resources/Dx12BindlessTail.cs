@@ -26,8 +26,11 @@ internal static class Dx12BindlessTail
     // Lumen V2 Sıra 1 — SCREEN-PROBE trace table (its own tail below the card tail). The probe trace mirrors the
     // GI trace's binding shape: t1 depth, t2 normal, t3 material, t4 lit scene color, t5 sky irradiance, t6 sky
     // prefilter (6 SRV) + u1 probe atlas UAV (u0 ProbeHeaders + u2 Indirect are ROOT UAVs). 9 reserved for slack.
-    const int LumenScreenProbeReserved = 12;
-    public const int LumenScreenProbeUsed = 7;   // t1-t6 SRV + u1 atlas UAV
+    // 9 used: t1-t6 SRV (6) + u1 atlas UAV + u2 indirect UAV + t13 atlas-history SRV. ALL in the ONE bindless heap
+    // (a single shader-visible CBV/SRV/UAV heap can be set at a time — a separate per-frame heap for u2/t13 caused
+    // SetDescriptorTableInvalid). 16 reserved for slack.
+    const int LumenScreenProbeReserved = 16;
+    public const int LumenScreenProbeUsed = 9;
     public const int LumenScreenProbeTableBase = LumenCardTableBase - LumenScreenProbeReserved;
 
     public const int TailStart = LumenScreenProbeTableBase;
