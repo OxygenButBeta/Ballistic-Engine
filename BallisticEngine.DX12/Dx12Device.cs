@@ -221,8 +221,18 @@ public sealed class Dx12Device : IDisposable {
         // submit). One command LIST + allocator per slot → resetting an in-flight list is impossible (each
         // slot's reuse is fence-gated in BeginFrame). EndFrame submits on the dedicated `frameFence`.
         pipelinedFrames = Environment.GetEnvironmentVariable("BALLISTIC_DX12_PIPELINED") != "0";
-        bool overlap = pipelinedFrames && Environment.GetEnvironmentVariable("BALLISTIC_DX12_OVERLAP") == "1";
-        FramesInFlight = overlap ? 2 : 1;   // P0b overlap N=2 (opt-in); 1 = no overlap (EndFrame waits). Raise to 3 (≤ MaxFramesInFlight) post-P0c.
+        // P0b CPU↔GPU OVERLAP is now DEFAULT ON (was opt-in during bring-up). Every per-frame CPU-written
+        // resource is N-buffered (CBs via Dx12FrameCb, the ring CBs + ClusteredLights/GpuDriven uploads + the
+        // Lumen CBs by FrameSlot stride, the shader-visible heaps by framesInFlight) and the Lumen scene's
+        // mid-frame buffer realloc drains-around + RequestFrameSync's the rebuild frame — so the CPU running a
+        // frame ahead can no longer stomp data the GPU still reads (the TDR/PC-crash class is closed). Verified
+        // byte-identical (all 4 test scenes, GI on, deterministic paused) AND device-stable over a 300-frame
+        // play run; measured +11-18% fps headless. Windowed is safe regardless: the swapchain present still
+        // dev.Flush()es (which now drains the overlapped frame too), so the windowed path stays correct even
+        // before P0c removes that flush. BALLISTIC_DX12_OVERLAP=0 is the kill-switch back to the single-wait
+        // (P0a) frame; BALLISTIC_DX12_PIPELINED=0 disables even P0a.
+        bool overlap = pipelinedFrames && Environment.GetEnvironmentVariable("BALLISTIC_DX12_OVERLAP") != "0";
+        FramesInFlight = overlap ? 2 : 1;   // N=2 (default); 1 = no overlap (EndFrame waits). Raise to 3 (≤ MaxFramesInFlight) post-P0c.
         frameAllocators = new ID3D12CommandAllocator[FramesInFlight];
         frameLists = new ID3D12GraphicsCommandList4[FramesInFlight];
         for (int i = 0; i < FramesInFlight; i++) {
