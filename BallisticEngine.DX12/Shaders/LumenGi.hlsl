@@ -297,32 +297,39 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
     //      instead of leaving the old bright/dark value to fade out slowly. This is the AABB-clamp TAA uses.
     float3 outE = E;
     [branch] if (HistoryValid > 0.5) {
-        // REPROJECT this surface to its previous-frame screen position. Compute it DIRECTLY from the world
-        // position via the previous view*proj — this catches a moving SCENE/editor camera even when the motion
-        // vector buffer is zero (the motion buffer only reliably fills for play-mode object motion). prevUv is the
-        // previous-frame UV; the screen delta drives the motion-scaled reject below.
+        // REPROJECT this surface to its previous-frame screen position via worldPos * PrevViewProj (catches a
+        // moving SCENE camera even with a zero motion buffer). prevUv = previous-frame UV.
         float4 prevClip = mul(float4(worldPos, 1.0), PrevViewProj);
-        float2 prevUv = (prevClip.w > 1e-6) ? (prevClip.xy / prevClip.w) * float2(0.5, -0.5) + 0.5 : uv;
+        bool wValid = prevClip.w > 1e-6;
+        float2 prevUv = wValid ? (prevClip.xy / prevClip.w) * float2(0.5, -0.5) + 0.5 : uv;
         float2 motion = prevUv - uv;
         float motionTexels = length(motion / max(TexelSize, 1e-6));
-        bool onScreen = (prevClip.w > 1e-6) && all(prevUv >= 0.0) && all(prevUv <= 1.0);
-        // Reprojected history (rgb=accumulated E, a=depth at capture).
-        float4 hist = ProbeHistory.SampleLevel(LinearClamp, prevUv, 0);
-        bool sameSurface = abs(hist.a - depth) < 0.0015;
-        if (onScreen && sameSurface) {
-            // CLAMP history toward this frame's E so a lighting change (shadow sweep at constant depth) is bounded
-            // instead of trailing. No cross-thread neighbour read (that races the in-flight UAV writes): bound the
-            // history's LUMINANCE to within a band around E's luminance and rescale — cheap, race-free, and enough
-            // to stop a stale bright/dark value from lingering once the lighting moves.
-            float lh = max(dot(hist.rgb, float3(0.2126, 0.7152, 0.0722)), 1e-4);
-            float le = dot(E, float3(0.2126, 0.7152, 0.0722));
-            float lClamped = clamp(lh, le * 0.5, le * 2.0 + 1e-3);
-            float3 clampedHist = hist.rgb * (lClamped / lh);
-            // More motion → trust history less (faster convergence to the fresh frame under movement).
-            float alpha = saturate(max(ProbeAlpha, motionTexels * 0.5));
-            outE = lerp(clampedHist, E, alpha);
-        }
-        // else (off-screen / disocclusion) → fresh E (outE already = E), no ghost.
+        float4 hist = ProbeHistory.SampleLevel(LinearClamp, prevUv, 0);   // rgb=accumulated E, a=depth at capture
+
+        // SOFT history weight in [0,1] — NEVER a binary all-or-nothing reject (that caused the "GI flicks off then
+        // back on" gitgel AND the go-dark-on-zoom-out: a hard reject drops to a single noisy/dark frame). Three
+        // smooth factors multiply down the trust instead:
+        //   • on-screen: 0 only when the reprojection truly left the screen.
+        //   • depth agreement: RELATIVE tolerance (abs(dz)/depth) so far surfaces aren't falsely rejected on a
+        //     zoom-out (the old absolute 0.0015 rejected everything when the camera pulled back → whole-scene dark).
+        //   • motion: ease trust down as the surface moves on screen, don't slam it to 0.
+        float onScreen = (wValid && all(prevUv >= 0.0) && all(prevUv <= 1.0)) ? 1.0 : 0.0;
+        float depthAgree = saturate(1.0 - abs(hist.a - depth) / max(depth * 0.05, 1e-4));   // relative, ~5% band
+        float motionTrust = saturate(1.0 - motionTexels * 0.15);                            // gentle, not a cliff
+        float trust = onScreen * depthAgree * motionTrust;
+
+        // Luminance clamp the history toward this frame's E (bounds a lighting change so it can't trail).
+        float lh = max(dot(hist.rgb, float3(0.2126, 0.7152, 0.0722)), 1e-4);
+        float le = dot(E, float3(0.2126, 0.7152, 0.0722));
+        float lClamped = clamp(lh, le * 0.4, le * 2.5 + 1e-3);
+        float3 clampedHist = hist.rgb * (lClamped / lh);
+
+        // Effective this-frame weight: ProbeAlpha when fully trusted, rising to 1 as trust falls (so a real
+        // disocclusion converges fast WITHOUT a hard cut). blendHist = clampedHist scaled by trust so a low-trust
+        // history still contributes a little (keeps the result from collapsing to one dark frame).
+        float alpha = lerp(1.0, saturate(ProbeAlpha), trust);
+        float3 histContribution = lerp(E, clampedHist, trust);   // low trust → fall back toward fresh E, not black
+        outE = lerp(histContribution, E, alpha);
     }
     Indirect[px] = float4(Sanitize(outE), depth);             // store depth in .a for next frame's reject + history copy
 }

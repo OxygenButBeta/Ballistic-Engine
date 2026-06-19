@@ -200,7 +200,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             // accumulation (a fixed frame means a fixed, reproducible accumulation over the static camera — and the
             // accumulated result is the CLEAN one we want to measure, not a single noisy frame).
             HistoryValid = probeHistoryValid ? 1f : 0f,
-            ProbeAlpha = EnvF("BALLISTIC_DX12_LUMEN_PROBE_ALPHA", 0.1f),
+            ProbeAlpha = EnvF("BALLISTIC_DX12_LUMEN_PROBE_ALPHA", 0.2f),   // 0.2 = smoother recovery after motion (0.1 was too slow → gitgel)
             PrevViewProj = Matrix4x4.Transpose(ctx.PrevViewProjUnjittered),   // world → prev clip (HLSL column-major)
         };
         *(LumenSun*)sunCbMapped = new LumenSun
