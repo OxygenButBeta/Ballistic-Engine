@@ -68,7 +68,10 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
             for (int f = 0; f < benchFrames; f++) { WindowUpdateCallback?.Invoke(dt); WindowRenderCallback?.Invoke(dt); }
             sw.Stop();
             double msPerFrame = sw.Elapsed.TotalMilliseconds / benchFrames;
-            Console.WriteLine($"[FpsBench] frames={benchFrames} warmup={warm} avgFrameMs={msPerFrame:0.000} fps={1000.0 / msPerFrame:0.0} overlap={(Environment.GetEnvironmentVariable("BALLISTIC_DX12_OVERLAP") == "1" ? "ON" : "off")}");
+            // Report the ACTUAL frames-in-flight from the device, not a stale env check — overlap is now default-ON
+            // (gated on OVERLAP!="0"), so the old `=="1"` label misreported the default run as "off".
+            int fif = RenderAsset.Current.Renderer is DX12HDRenderer rb ? rb.Device.FramesInFlight : 1;
+            Console.WriteLine($"[FpsBench] frames={benchFrames} warmup={warm} avgFrameMs={msPerFrame:0.000} fps={1000.0 / msPerFrame:0.0} framesInFlight={fif} overlap={(fif > 1 ? "ON" : "off")}");
             return;
         }
 
