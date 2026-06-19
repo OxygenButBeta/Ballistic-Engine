@@ -26,7 +26,7 @@ RWTexture2D<float4> Output  : register(u0);
 cbuffer ReflConstants : register(b0) {
     float4x4 InvViewProj;    // screen+depth → world (JITTERED, transposed)
     float3 CameraPos; float Intensity;
-    float PrefilterMaxMip; float NormalBias; float Unused0; float Unused1;
+    float PrefilterMaxMip; float NormalBias; float UseCards; float Unused1;   // UseCards: P5 — sample the Lumen card cache at hits
 };
 cbuffer RtReflectionLights : register(b1) {
     float3 SunDir;     float SunNormalBias;   // TO the sun (normalized), world; bias = shadow-ray origin offset
@@ -46,9 +46,12 @@ struct GpuMaterial {
     float Cutout, HasEmissive, Pad2, Pad3;
 };
 struct GpuLight { float4 PosRange; float4 Color; float4 DirCosOuter; float4 Extra; };
-StructuredBuffer<GpuMaterial> GpuMaterials : register(t7);
-StructuredBuffer<RtInstance>  RtInstances  : register(t8);
-StructuredBuffer<GpuLight>    Lights       : register(t9);
+struct LumenInstanceMeta { uint TriOffset, TriCount, Pad0, Pad1; float4x4 World; };
+StructuredBuffer<GpuMaterial>       GpuMaterials : register(t7);
+StructuredBuffer<RtInstance>        RtInstances  : register(t8);
+StructuredBuffer<GpuLight>          Lights       : register(t9);
+StructuredBuffer<float4>            CardRadiance : register(t11);   // P5: Lumen per-triangle lit+multibounce radiance
+StructuredBuffer<LumenInstanceMeta> InstanceMeta : register(t12);   // per-instance {triOffset, world}
 
 static const float MAX_ROUGHNESS = 0.6;
 struct ReflPayload { float3 Color; float Roughness; };
@@ -147,6 +150,17 @@ void Miss(inout ReflPayload p) {
 
 [shader("closesthit")]
 void ClosestHit(inout ReflPayload p, in BuiltInTriangleIntersectionAttributes attr) {
+    // P5: when the Lumen card cache is live, the reflection hit SAMPLES the card (the lit + multi-bounce
+    // radiance leaving that surface — albedo*(direct+indirect)+emissive) instead of re-shading direct+IBL, so
+    // a reflection sees the SAME GI the diffuse does. This is the "rough reflections sample the radiance cache"
+    // path; the mirror ray (sharp) lands on one triangle whose card is its outgoing radiance — correct for both.
+    if (UseCards > 0.5) {
+        LumenInstanceMeta meta = InstanceMeta[InstanceID()];
+        uint gtri = meta.TriOffset + PrimitiveIndex();
+        p.Color = Sanitize(min(CardRadiance[gtri].rgb, 60000.0.xxx));
+        return;
+    }
+
     // Full world-space radiance at the reflection hit. Fetch the hit triangle's interpolated normal + UV from
     // the bindless per-instance geometry buffers.
     RtInstance inst = RtInstances[InstanceID()];

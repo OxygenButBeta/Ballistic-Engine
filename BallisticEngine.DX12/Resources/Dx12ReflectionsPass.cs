@@ -106,7 +106,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     [StructLayout(LayoutKind.Sequential)]
     struct RtReflConstants {
         public Matrix4x4 InvViewProj; public Vector3 CameraPos; public float Intensity;
-        public float PrefilterMaxMip; public float NormalBias; public float Unused0; public float Unused1;
+        public float PrefilterMaxMip; public float NormalBias; public float UseCards; public float Unused1;  // UseCards: P5 — sample the Lumen card cache at hits
     }
     [StructLayout(LayoutKind.Sequential)]
     struct RtGiSun { public Vector3 SunDir; public float NormalBias; public Vector3 SunColor; public float LightCount; }
@@ -223,6 +223,8 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         var instSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(8, 0), ShaderVisibility.All);
         var lightSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(9, 0), ShaderVisibility.All);
         var probeSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(10, 0), ShaderVisibility.All);
+        var cardSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(11, 0), ShaderVisibility.All);  // P5 t11 CardRadiance
+        var metaSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(12, 0), ShaderVisibility.All);  // P5 t12 LumenInstanceMeta
         var clampSamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
             AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
@@ -236,7 +238,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         rtReflRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { cbv0, cbv1, cbv2, table, matSrv, instSrv, lightSrv, probeSrv }, new[] { clampSamp, wrapSamp })));
+                new[] { cbv0, cbv1, cbv2, table, matSrv, instSrv, lightSrv, probeSrv, cardSrv, metaSrv }, new[] { clampSamp, wrapSamp })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("DxrReflections.hlsl");
         byte[] dxil = Dx12ShaderCompiler.Compile(DxcShaderStage.Library, hlsl, "", "DxrReflections.hlsl");
@@ -298,10 +300,14 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
+        // P5: sample the Lumen card cache at reflection hits when Lumen is active this frame + has a valid cache
+        // (so reflections see the same multi-bounce GI the diffuse does). Off → the hit re-shades direct+IBL.
+        bool useCards = ctx.LumenActiveThisFrame && ctx.LumenScene is { Valid: true }
+                        && Environment.GetEnvironmentVariable("BALLISTIC_DX12_REFL_NOCARDS") != "1";
         *(RtReflConstants*)rtReflCbMapped = new RtReflConstants {
             InvViewProj = Matrix4x4.Transpose(invVP), CameraPos = camPos, Intensity = ctx.PostFX.SsrIntensity,
             PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f, NormalBias = 0.05f,
-            Unused0 = 0f,
+            UseCards = useCards ? 1f : 0f,
             Unused1 = 0f,
         };
         Vector3 sunDir = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
@@ -343,7 +349,13 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
             cl.SetComputeRootShaderResourceView(4, gpuDriven.MaterialsGpuAddress);       // t7 GpuMaterials
             cl.SetComputeRootShaderResourceView(5, rtGeometry.InstancesGpuAddress);      // t8 RtInstance[]
             cl.SetComputeRootShaderResourceView(6, clusteredLights.LightBufGpuAddress);  // t9 punctual lights
-            cl.SetComputeRootShaderResourceView(7, clusteredLights.LightBufGpuAddress);
+            cl.SetComputeRootShaderResourceView(7, clusteredLights.LightBufGpuAddress);  // t10 (probe, unused → filler)
+            // P5: the Lumen card cache (this frame's lit + multi-bounce radiance, post-swap) + per-instance meta.
+            // When Lumen is off, bind valid filler (the light buffer) — UseCards=0 gates the shader read anyway.
+            ulong cardAddr = useCards ? ctx.LumenScene.CardRadianceReadGpu : clusteredLights.LightBufGpuAddress;
+            ulong metaAddr = useCards ? ctx.LumenScene.InstanceMetaGpuAddress : clusteredLights.LightBufGpuAddress;
+            cl.SetComputeRootShaderResourceView(8, cardAddr);                            // t11 CardRadiance
+            cl.SetComputeRootShaderResourceView(9, metaAddr);                            // t12 LumenInstanceMeta
             cl.DispatchRays(new DispatchRaysDescription {
                 Width = (uint)ssrTarget.Width, Height = (uint)ssrTarget.Height, Depth = 1,
                 RayGenerationShaderRecord = new GpuVirtualAddressRange { StartAddress = rtReflSbt.GPUVirtualAddress, SizeInBytes = idSize },

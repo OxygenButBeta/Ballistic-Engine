@@ -1580,6 +1580,7 @@ public sealed class DX12HDRenderer : HDRenderer
             ShadowMap = shadowMap, GpuDriven = gpuDriven,
             RtShadowMask = rtShadowMask, // chunk 9: deferred binds it to t12 when RtShadowsThisFrame (null → fallback)
             Dxr = dxr, // chunk 10: shared DXR substrate (sceneAS/device5/rtGeometry/ddgi) for the GI + Reflections passes
+            LumenScene = lumenGiPass.Scene, // Lumen V2 P5: the radiance cache the Reflections pass samples for rough reflections
             FrameCbAddress =
                 frameCb.GPUVirtualAddress, // chunk 8: Transparents binds it; chunk 9: Deferred binds it too (b1 FrameConstants CBV)
             Doors = doors, PostFX = PostFX, Stats = RenderStats.Scene,

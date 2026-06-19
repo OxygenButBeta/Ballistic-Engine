@@ -95,6 +95,11 @@ public sealed class Dx12FrameContext {
     // its own lazy-create); the ctx field is a stable reference (init-only). Null is never expected.
     public Dx12DxrShared Dxr { get; init; }
 
+    // Lumen V2 scene substrate (the per-triangle radiance cache + per-instance meta). The Reflections pass
+    // (event 600, after the Lumen GI pass at 500) reads it so rough reflections sample the SAME multi-bounce
+    // GI the diffuse uses (plan P5). Null when Lumen is off; reflections gates on LumenActiveThisFrame too.
+    public Dx12LumenScene LumenScene { get; init; }
+
     // PHASE-2 V3 (chunk 14): true when BALLISTIC_DX12_GRAPH_BARRIERS=1 (requires GRAPH=1). A MIGRATED pass reads
     // this at the head of Record: when true, the graph ALREADY emitted the pass's boundary head transition (the
     // derived set), so the pass SKIPS its own manual head transition (emit the derived set ONLY — plan §V3); when

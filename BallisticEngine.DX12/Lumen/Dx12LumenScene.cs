@@ -95,7 +95,11 @@ public sealed class Dx12LumenScene : IDisposable
         rtGeo.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection, ctx.GpuDriven);
 
         int objects = rtGeo.InstanceCount;
-        int s = ComputeStamp(sceneAS, objects);
+        // TOPOLOGY stamp (object count + per-instance tri counts only) — a change means the cache layout is stale
+        // → full rebuild + history reset. TRANSFORMS are NOT in this stamp: a moving instance (play-mode physics)
+        // must NOT realloc the 100k-triangle cache or reset the temporal EMA every frame; it only needs its
+        // world matrix re-uploaded. (Pre-fix the stamp folded translation → CarDemo rebuilt every frame.)
+        int s = ComputeTopologyStamp(sceneAS, objects);
         if (s != stamp || cardRadianceA == null)
         {
             stamp = s;
@@ -103,6 +107,11 @@ public sealed class Dx12LumenScene : IDisposable
             DirtyThisFrame = true;
             DirtyUpdateCount++;
             loggedThisStamp = false;
+        }
+        else
+        {
+            // Same topology — just refresh per-instance world matrices in place (cheap; keeps cache + history).
+            RefreshTransforms(sceneAS);
         }
 
         if (!loggedThisStamp)
@@ -125,19 +134,8 @@ public sealed class Dx12LumenScene : IDisposable
         int n = sceneAS.InstanceCount;
         InstanceCount = n;
 
-        var meta = new LumenInstanceMeta[Math.Max(n, 1)];
-        int offset = 0;
-        for (int i = 0; i < n; i++)
-        {
-            int tris = sceneAS.InstanceTriangleCount(i);
-            meta[i] = new LumenInstanceMeta
-            {
-                TriOffset = (uint)offset, TriCount = (uint)tris,
-                World = Matrix4x4.Transpose(sceneAS.InstanceWorld(i)),
-            };
-            offset += tris;
-        }
-        TotalTriangles = offset;
+        LumenInstanceMeta[] meta = BuildMetaArray(sceneAS, out int total);
+        TotalTriangles = total;
 
         instanceMeta?.Dispose();
         instanceMeta = n > 0 ? dev.CreateUavBuffer<LumenInstanceMeta>(meta, ResourceStates.GenericRead) : null;
@@ -159,17 +157,47 @@ public sealed class Dx12LumenScene : IDisposable
     public ResourceStates StateOf(ID3D12Resource r) => r == cardRadianceB ? cardStateB : cardStateA;
     public void SetState(ID3D12Resource r, ResourceStates s) { if (r == cardRadianceB) cardStateB = s; else cardStateA = s; }
 
-    int ComputeStamp(Dx12SceneAS sceneAS, int objects)
+    // TOPOLOGY-only stamp: object count + per-instance triangle counts. Deliberately EXCLUDES transforms (a
+    // moving instance keeps the same layout → no rebuild, just RefreshTransforms). A mesh/instance add/remove
+    // changes the counts → rebuild + history reset.
+    int ComputeTopologyStamp(Dx12SceneAS sceneAS, int objects)
     {
         var h = new HashCode();
         h.Add(objects);
         for (int i = 0; i < sceneAS.InstanceCount; i++)
-        {
             h.Add(sceneAS.InstanceTriangleCount(i));
-            Matrix4x4 w = sceneAS.InstanceWorld(i);
-            h.Add(w.M41); h.Add(w.M42); h.Add(w.M43);   // translation is enough to detect a moved instance
-        }
         return h.ToHashCode();
+    }
+
+    // Re-upload only the per-instance world matrices (topology unchanged). Cheap (a handful of instances) and
+    // keeps the big CardRadiance cache + its temporal history intact across instance motion.
+    unsafe void RefreshTransforms(Dx12SceneAS sceneAS)
+    {
+        if (sceneAS.InstanceCount == 0) return;
+        LumenInstanceMeta[] meta = BuildMetaArray(sceneAS, out _);
+        instanceMeta?.Dispose();
+        instanceMeta = dev.CreateUavBuffer<LumenInstanceMeta>(meta, ResourceStates.GenericRead);
+    }
+
+    // Per-instance {triOffset (prefix sum), triCount, world} — the meta the card-light + trace + reflections
+    // read. Shared by Rebuild (topology change) and RefreshTransforms (motion only).
+    LumenInstanceMeta[] BuildMetaArray(Dx12SceneAS sceneAS, out int total)
+    {
+        int n = sceneAS.InstanceCount;
+        var meta = new LumenInstanceMeta[Math.Max(n, 1)];
+        int offset = 0;
+        for (int i = 0; i < n; i++)
+        {
+            int tris = sceneAS.InstanceTriangleCount(i);
+            meta[i] = new LumenInstanceMeta
+            {
+                TriOffset = (uint)offset, TriCount = (uint)tris,
+                World = Matrix4x4.Transpose(sceneAS.InstanceWorld(i)),
+            };
+            offset += tris;
+        }
+        total = offset;
+        return meta;
     }
 
     public void Dispose()

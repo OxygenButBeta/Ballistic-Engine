@@ -33,6 +33,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     readonly Dx12Device dev;
     readonly Dx12LumenScene scene;
 
+    // The card radiance cache (+ per-instance meta) the Reflections pass (event 600, after this) samples so
+    // rough reflections read the SAME multi-bounce GI the diffuse sees (plan P5). Exposed read-only; valid only
+    // after a successful Ensure this frame (the reflections pass also gates on ctx.LumenActiveThisFrame).
+    public Dx12LumenScene Scene => scene;
+
     public Dx12LumenGiPass(Dx12Device device, int width, int height)
     {
         dev = device;
