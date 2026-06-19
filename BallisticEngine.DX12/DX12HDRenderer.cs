@@ -1079,6 +1079,13 @@ public sealed class DX12HDRenderer : HDRenderer
     readonly System.Diagnostics.Stopwatch passSw = new();
     bool? passTimingOn;
 
+    // GI motion harness: per-frame camera yaw (deg) injected in BeginRender so a headless sequence has real motion.
+    int motionYawFrame;
+    float? motionYawCached;
+    float MotionYawPerFrame => motionYawCached ??= (float.TryParse(
+        Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_MOTION_YAW"),
+        System.Globalization.CultureInfo.InvariantCulture, out float v) ? v : 0f);
+
     bool PassTimingEnabled => passTimingOn ??= (Environment.GetEnvironmentVariable("BALLISTIC_DX12_PASS_TIMING") == "1"
                                                 || !string.IsNullOrWhiteSpace(
                                                     Environment.GetEnvironmentVariable("BALLISTIC_STATS_OUT")));
@@ -1114,6 +1121,17 @@ public sealed class DX12HDRenderer : HDRenderer
         // Camera. The provider's view (LookAt) is convention-agnostic — convert 1:1. Rebuild the
         // projection DX-style (RH, z in [0,1]) since the provider's is OpenTK GL-convention (z in [-1,1]).
         Matrix4x4 view = vp.GetViewMatrix();
+        // GI MOTION HARNESS (BALLISTIC_DX12_GI_MOTION_YAW=<deg/frame>): inject a per-frame camera yaw so a headless
+        // capture sequence has GENUINE motion (real motion vectors + temporal reprojection follow) — the only way
+        // to measure GI temporal stability / boiling under motion, which a static capture cannot. Applied as a
+        // post-rotation in VIEW space about the camera's local up (a clean yaw of the look direction).
+        float motionYaw = MotionYawPerFrame;
+        if (motionYaw != 0f)
+        {
+            float ang = motionYaw * (3.14159265f / 180f) * motionYawFrame;
+            view = view * Matrix4x4.CreateRotationY(ang);   // view-space yaw: spins the look direction each frame
+            motionYawFrame++;
+        }
         Matrix4x4 proj = Matrix4x4.CreatePerspectiveFieldOfView(
             FovYRadians, (float)targetW / targetH, CameraNear, CameraFar);
         Matrix4x4 projUnjittered = proj; // before the jitter — the shadow cascade fit uses this (stable

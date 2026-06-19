@@ -169,7 +169,8 @@ public sealed class Dx12LumenScene : IDisposable
             loggedThisStamp = true;
             string line = $"[Lumen] scene: objects={InstanceCount} tris={TotalTriangles} records(clusters)={RecordCount} " +
                           $"({(TotalTriangles > 0 ? (float)TotalTriangles / Math.Max(RecordCount, 1) : 0):0.0} tri/cluster) " +
-                          $"cacheMB={(RecordCount * 16L) / (1024 * 1024.0):0.00} dirtyUpdates={DirtyUpdateCount}";
+                          $"meshCards={(TexelDim > 1 ? $"ON({TexelDim}x{TexelDim}={TexelsPerRecord} texels/rec)" : "off")} " +
+                          $"cacheMB={(RecordCount * (long)TexelsPerRecord * 16L) / (1024 * 1024.0):0.00} dirtyUpdates={DirtyUpdateCount}";
             Console.WriteLine(line);
             Debugging.Log(line);
         }

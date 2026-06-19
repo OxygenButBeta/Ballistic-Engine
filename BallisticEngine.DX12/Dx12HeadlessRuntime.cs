@@ -58,6 +58,23 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
         bool queryMode = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("BALLISTIC_QUERY"));
         int lastFrame = ScreenshotPath is not null ? ScreenshotFrame
             : queryMode ? 3 : 5;
+        // GI MOTION DUMP (BALLISTIC_DX12_GI_MOTION_DUMP=<dir>): render a sequence with per-frame camera yaw
+        // (BALLISTIC_DX12_GI_MOTION_YAW) and save the LAST K frames as frameNNN.bmp so a script can measure
+        // frame-to-frame GI noise/boiling under REAL motion (a static capture can't). K = SCREENSHOT_FRAME's tail.
+        string motionDir = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_MOTION_DUMP");
+        if (!string.IsNullOrWhiteSpace(motionDir)) {
+            System.IO.Directory.CreateDirectory(motionDir);
+            int total = ScreenshotFrame > 0 ? ScreenshotFrame : 60;
+            int dumpTail = 8;   // save the last 8 frames (warmed-up, in motion)
+            for (int frame = 1; frame <= total; frame++) {
+                WindowUpdateCallback?.Invoke(dt);
+                WindowRenderCallback?.Invoke(dt);
+                if (frame > total - dumpTail)
+                    SaveScreenshotTo(System.IO.Path.Combine(motionDir, $"frame{frame:D3}.bmp"));
+            }
+            return;
+        }
+
         for (int frame = 1; frame <= lastFrame; frame++) {
             WindowUpdateCallback?.Invoke(dt);
             WindowRenderCallback?.Invoke(dt);
@@ -165,6 +182,12 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
         else {
             Console.Error.WriteLine("[Screenshot] DX12 renderer not active; nothing saved.");
         }
+    }
+
+    // Plain frame save to an explicit path (the GI motion-dump sequence). No perf/gbuffer/validation side effects.
+    void SaveScreenshotTo(string path) {
+        if (RenderAsset.Current.Renderer is DX12HDRenderer r)
+            r.SaveFrame(path);
     }
 
     // W2/W4 — drain the debug/GBV info queue at end-of-headless-render, normalize each message to a
