@@ -317,6 +317,49 @@ void CSProbeTrace(uint3 dtid : SV_DispatchThreadID) {
     ProbeAtlas[atlasPx] = float4(rad, 1.0);
 }
 
+// ===== CSProbeFilter: SPATIAL filter of the probe atlas in PROBE space (the proper blob fix) =====
+// The few-ray probes vary probe-to-probe on a flat wall → ~tile-size BLOBS. Filtering in probe space (each
+// atlas cell blended with the SAME oct cell of NEIGHBOURING probes, depth+normal weighted) removes that variance
+// at its SOURCE — cheap (only ~ProbesX*ProbesY*oct² texels, far fewer than full-res), and far more effective than
+// a wide gather at integrate time. Joint-bilateral: wide on a flat surface, sharp across a silhouette/plane edge.
+// Reads ProbeAtlas (t-bound as a UAV is fine to read), writes ProbeAtlasFiltered (u2 reused — see C# binding).
+RWTexture2D<float4> ProbeAtlasFiltered : register(u3);   // Sıra: filtered atlas the integrate reads
+
+[numthreads(8, 8, 1)]
+void CSProbeFilter(uint3 dtid : SV_DispatchThreadID) {
+    uint oct = (uint)OctSize;
+    uint2 atlasPx = dtid.xy;
+    uint2 probe = atlasPx / oct;
+    uint2 lcell = atlasPx % oct;
+    if (probe.x >= ProbesX || probe.y >= ProbesY) return;
+    uint pidx = probe.y * ProbesX + probe.x;
+    ProbeHeader hc = ProbeHeaders[pidx];
+    if (hc.PosValid.w < 0.5) { ProbeAtlasFiltered[atlasPx] = ProbeAtlas[atlasPx]; return; }
+    float3 Pc = hc.PosValid.xyz; float3 Nc = hc.NormalDepth.xyz; float dc = hc.NormalDepth.w;
+
+    // Blend the SAME oct cell across a neighbourhood of probes (radius from the CB, default 2 → 5x5 probes).
+    int r = (int)clamp(SpPad1, 1.0, 3.0);   // SpPad1 repurposed as the probe-filter radius
+    float3 acc = 0.0.xxx; float wsum = 0.0;
+    [loop] for (int dy = -r; dy <= r; dy++)
+    [loop] for (int dx = -r; dx <= r; dx++) {
+        int2 np = int2(probe) + int2(dx, dy);
+        if (np.x < 0 || np.y < 0 || np.x >= (int)ProbesX || np.y >= (int)ProbesY) continue;
+        uint nidx = np.y * ProbesX + np.x;
+        ProbeHeader hn = ProbeHeaders[nidx];
+        if (hn.PosValid.w < 0.5) continue;
+        // Joint-bilateral: gaussian on probe distance × world-position proximity × normal similarity. The world +
+        // normal terms keep the filter from blending probes across a wall corner / onto a different plane.
+        float wS = exp(-float(dx*dx + dy*dy) * 0.4);
+        float posD = distance(hn.PosValid.xyz, Pc);
+        float wP = exp(-posD * posD * 0.5);   // ~1.4m falloff — same flat surface only
+        float wN = pow(saturate(dot(hn.NormalDepth.xyz, Nc)), 8.0);
+        float w = wS * wP * wN + 1e-5;
+        acc += ProbeAtlas[uint2(np.x * oct + lcell.x, np.y * oct + lcell.y)].rgb * w;
+        wsum += w;
+    }
+    ProbeAtlasFiltered[atlasPx] = float4(wsum > 1e-4 ? acc / wsum : ProbeAtlas[atlasPx].rgb, 1.0);
+}
+
 // ===== CSIntegrate: per full-res pixel, gather 4 nearest probes' octahedral radiance, cosine-weighted =====
 // Sample a probe's octahedral tile for the irradiance arriving at a pixel with normal Npix: integrate the tile's
 // full sphere weighted by cos(theta) over the pixel hemisphere. We approximate with the cosine-importance the
@@ -332,7 +375,7 @@ float3 SampleProbeTile(uint2 probe, float3 Npix) {
         float3 dir = OctDecode(octUv);
         float w = max(dot(dir, Npix), 0.0);
         if (w <= 0.0) continue;
-        float4 t = ProbeAtlas[uint2(probe.x * oct + cx, probe.y * oct + cy)];
+        float4 t = ProbeAtlasFiltered[uint2(probe.x * oct + cx, probe.y * oct + cy)];   // filtered (blob removed at source)
         acc += t.rgb * w; wsum += w;
     }
     return wsum > 1e-4 ? acc / wsum : 0.0.xxx;
@@ -365,9 +408,9 @@ void CSIntegrate(uint3 dtid : SV_DispatchThreadID) {
     // resolves to the best nearby probe (no black hole — the measured failure).
     float3 bestRad = 0.0.xxx; float bestW = -1.0; bool anyValid = false;
     int2 ibase = int2(base);
-    // 4x4 neighbourhood (the 2x2 enclosing + a 1-probe skirt) so a pixel near a tile whose nearest probes all
-    // reject (silhouette / sparse placement) still finds a coherent probe — kills the 16px blob holes that a
-    // strict 2x2 left on ceilings and large flat regions.
+    // 4x4 neighbourhood — the blob is now removed at its SOURCE by the probe-space CSProbeFilter pass, so the
+    // integrate only needs a modest bilinear-ish gather (cheaper than the 6x6 it briefly used → FPS back). The
+    // depth/normal bilateral still keeps edges sharp.
     [unroll] for (int dy = -1; dy <= 2; dy++)
     [unroll] for (int dx = -1; dx <= 2; dx++) {
         int2 pc = ibase + int2(dx, dy);
@@ -376,10 +419,8 @@ void CSIntegrate(uint3 dtid : SV_DispatchThreadID) {
         ProbeHeader h = ProbeHeaders[pidx];
         if (h.PosValid.w < 0.5) continue;
         anyValid = true;
-        // Spatial: gaussian on the probe-space distance from the pixel (probeF). Wider than bilinear so the skirt
-        // probes blend smoothly instead of a hard 2x2 cutoff.
         float2 d2 = (float2(pc) - probeF);
-        float wSpatial = exp(-dot(d2, d2) * 0.7);
+        float wSpatial = exp(-dot(d2, d2) * 0.5);
         float wDepth = 1.0 / (1.0 + abs(h.NormalDepth.w - depth) * 1500.0);
         float wNormal = pow(saturate(dot(h.NormalDepth.xyz, Npix) * 0.5 + 0.5), 2.0);
         float w = wSpatial * wDepth * wNormal + 1e-5;

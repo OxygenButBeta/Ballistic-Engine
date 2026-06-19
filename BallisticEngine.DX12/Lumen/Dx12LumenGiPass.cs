@@ -84,6 +84,20 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     Dx12OffscreenTarget probeHistory;
     bool probeHistoryValid;
 
+    // ---- COMMON motion-vector temporal resolve (LumenTemporal.hlsl) — the proper motion-stability fix ----
+    // Runs on `indirect` after the trace/gather, reprojecting the resolved history with the REAL G-buffer motion
+    // vector (RT4) + neighbourhood AABB clamp + disocclusion reject. Replaces both the per-pixel inline temporal
+    // (camera-only) and gives the screen-probe path a temporal it never had. `probeHistory` is the resolved history.
+    ID3D12RootSignature tempRootSig;   // CBV b0 + table{t0 InE, t1 History, t2 Depth, t3 Motion, u0 OutE} + sampler
+    ID3D12PipelineState tempPso;
+    ID3D12Resource tempCb;
+    unsafe byte* tempCbMapped;
+    Dx12DescriptorHeap tempSrv;        // 5 descriptors/frame
+    Dx12OffscreenTarget indirectResolved; // temporal output (ping target so we don't read+write `indirect` in place)
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct TemporalConstants { public Vector2 Texel; public float HistoryValid; public float Alpha; public uint W, H; public float Pad0, Pad1; }
+
     // ---- spatial denoise (edge-aware blur of the per-pixel indirect E) ----
     ID3D12RootSignature denoiseRootSig; // CBV b0 + table{t0-t2 SRV, u0 UAV}
     ID3D12PipelineState denoisePso;
@@ -145,12 +159,13 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     // irradiance E buffer the per-pixel CSTrace did, so the downstream probe-temporal + denoise + combine chain is
     // untouched. Gated behind BALLISTIC_DX12_LUMEN_SCREENPROBE ("1" force on, "0" force off, unset → default).
     ID3D12RootSignature spRootSig;       // HeapDirectlyIndexed; CBV b0/b1 + root SRV t0 TLAS + table{t1-t6, u1 atlas} + root SRV t7-t12 + root UAV u0 headers / u2 indirect + s0/s1
-    ID3D12PipelineState spPlacePso, spTracePso, spIntegratePso;
+    ID3D12PipelineState spPlacePso, spTracePso, spIntegratePso, spFilterPso;
     ID3D12Resource spProbeCb, spSunCb;
     unsafe byte* spProbeCbMapped, spSunCbMapped;
     ID3D12Resource probeHeaders;         // StructuredBuffer<ProbeHeader> (root UAV u0) — sized ProbesX*ProbesY
     ID3D12Resource probeHeadersPrev;     // Sıra 3: previous frame's headers (reproject reject) — root SRV t16
     Dx12OffscreenTarget probeAtlas;      // octahedral radiance atlas, (ProbesX*OctSize) × (ProbesY*OctSize), RGBA16F UAV
+    Dx12OffscreenTarget probeAtlasFiltered; // probe-space spatial-filtered atlas (blob fix) — the integrate reads this
     Dx12OffscreenTarget probeAtlasHistory; // Sıra 3: previous frame's accumulated atlas (EMA source) — table t13
     bool spHistoryValid;
     int probeStride = 16, octSize = 8;
@@ -181,16 +196,15 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         }
         if (spEnvDoor == 1) return true;    // explicit force-on (overrides the deterministic guard, for A/B)
         if (spEnvDoor == 0) return false;
-        // DEFAULT path. Screen probes are the GI front end in PLAY — they accumulate over real frames into a clean,
-        // low-variance gather (measured: on par with / smoother than the per-pixel trace; SunTemple grain 0.262 vs
-        // 0.304, Bistro 0.504 vs 0.562). BUT a DETERMINISTIC CAPTURE forces the card cache's temporal EMA + multi-
-        // bounce OFF (for byte-reproducibility), which starves the sparse screen-probe gather (the per-pixel trace,
-        // shooting a ray from EVERY pixel, tolerates the weaker cache far better). So under a deterministic capture
-        // we fall back to the per-pixel trace → golden/diffable captures stay stable, play uses the better gather.
+        // DEFAULT path. Screen probes are the GI front end — they are PERF-CRITICAL (far fewer trace points than
+        // per-pixel, the user needs this for FPS). The user's live test found per-pixel cleaner in MOTION but
+        // explicitly does NOT accept its perf cost → the right answer is to KEEP screen probes and FIX their motion
+        // boiling (sliding blobs under camera motion — the sparse probe grid's per-frame placement + few-ray gather
+        // don't accumulate under motion). Deterministic capture still falls back to per-pixel (golden stability).
         return ScreenProbeDefaultOn && !ctx.DeterministicCapture;
     }
-    // Screen probes are the default GI gather in play (proven on par / smoother). The deterministic-capture guard in
-    // WantScreenProbe keeps golden captures on the per-pixel path.
+    // Screen probes are the default — they're perf-critical (the user's requirement). Motion boiling is being
+    // fixed (motion-vector reprojected history + lean on the view-independent card cache).
     const bool ScreenProbeDefaultOn = true;
 
     int frameCounter;
@@ -260,7 +274,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             // ProbeAlpha = this-frame weight in the EMA (lower = smoother + more lag). A deterministic capture KEEPS
             // accumulation (a fixed frame means a fixed, reproducible accumulation over the static camera — and the
             // accumulated result is the CLEAN one we want to measure, not a single noisy frame).
-            HistoryValid = probeHistoryValid ? 1f : 0f,
+            // CSTrace's INLINE temporal: in PLAY the new common LumenTemporal pass owns the temporal resolve (real
+            // motion vector), so the inline path is OFF to avoid double temporal. But a DETERMINISTIC CAPTURE skips
+            // the common pass (golden stability) → keep the inline temporal there so the golden is UNCHANGED (the
+            // inline accumulation was what produced the golden SHA). BALLISTIC_DX12_LUMEN_INLINE_TEMPORAL=1 forces it on.
+            HistoryValid = (probeHistoryValid && (ctx.DeterministicCapture
+                            || Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_INLINE_TEMPORAL") == "1")) ? 1f : 0f,
             ProbeAlpha = EnvF("BALLISTIC_DX12_LUMEN_PROBE_ALPHA", 0.05f),   // 0.05 = strong temporal accumulation (kills per-ray sparkle); the soft-trust blend handles motion so a low base alpha no longer causes gitgel
             // #4 importance sampling: guarantee a sun-facing ray. DEFAULT OFF — measured on the GI Test scene it
             // did NOT help and slightly HURT at 1 ray (10.8% -> 12.7% hotspot): that scene's dominant indirect is
@@ -330,12 +349,61 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         }
         indirect.ColorToShaderResource();
 
-        // #3: snapshot this frame's accumulated probes (indirect, with depth in .a) into the history for next
-        // frame's EMA. Must happen BEFORE the denoise overwrites indirect's .a. After this, indirect's rgb feeds
-        // the denoise/combine as before (the .a depth is ignored downstream).
-        probeHistory.CopyColorFrom(indirect);
-        probeHistory.ColorToShaderResource();
-        probeHistoryValid = true;
+        // === COMMON MOTION-VECTOR TEMPORAL RESOLVE (LumenTemporal) ===
+        // Reproject the resolved history with the REAL G-buffer motion vector (RT4) + neighbourhood AABB clamp +
+        // disocclusion reject, EMA-blend the fresh E → writes the resolved E to `indirectResolved`, which then
+        // feeds the denoise/combine, and snapshots into `probeHistory` for next frame. This is the proper
+        // motion-stability fix (covers BOTH the per-pixel and screen-probe paths; the old inline temporal was
+        // camera-only and screen-probe had none). BALLISTIC_DX12_LUMEN_NOTEMPORAL=1 bypasses it (raw E).
+        bool temporalOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOTEMPORAL") != "1"
+                          && !ctx.DeterministicCapture;   // deterministic capture: skip (single frame, fresh) for golden stability
+        if (temporalOn)
+        {
+            *(TemporalConstants*)tempCbMapped = new TemporalConstants
+            {
+                Texel = new Vector2(1f / indirect.Width, 1f / indirect.Height),
+                HistoryValid = probeHistoryValid ? 1f : 0f,
+                Alpha = EnvF("BALLISTIC_DX12_LUMEN_TEMPORAL_ALPHA", 0.1f),
+                W = (uint)indirect.Width, H = (uint)indirect.Height,
+                Pad0 = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_TEMPORAL_NOMOTION") == "1" ? 1f : 0f,
+            };
+            probeHistory.ColorToShaderResource();
+            indirectResolved.ColorToUnorderedAccess();
+            tempSrv.Reset();
+            int tb = tempSrv.AllocateRange(5);
+            dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 0), indirect.ColorSrvCpu, heapType);          // t0 fresh E
+            dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 1), probeHistory.ColorSrvCpu, heapType);      // t1 history
+            dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 2), gbuffer.DepthSrvCpu, heapType);           // t2 depth
+            dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 3), gbuffer.ColorSrvCpu(4), heapType);        // t3 motion (RT4)
+            dev.Device.CreateUnorderedAccessView(indirectResolved.RenderTarget, null, new UnorderedAccessViewDescription
+            {
+                Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+            }, tempSrv.Cpu(tb + 4));                                                                            // u0 resolved
+            ulong tcb = tempCb.GPUVirtualAddress;
+            dev.ExecuteSync(cl =>
+            {
+                cl.SetDescriptorHeaps(tempSrv.Heap);
+                cl.SetComputeRootSignature(tempRootSig);
+                cl.SetPipelineState(tempPso);
+                cl.SetComputeRootConstantBufferView(0, tcb);
+                cl.SetComputeRootDescriptorTable(1, tempSrv.Gpu(tb));
+                cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
+            });
+            indirectResolved.ColorToShaderResource();
+            // The resolved E becomes `indirect` for the denoise/combine, and the history for next frame.
+            indirect.CopyColorFrom(indirectResolved);
+            indirect.ColorToShaderResource();
+            probeHistory.CopyColorFrom(indirectResolved);
+            probeHistory.ColorToShaderResource();
+            probeHistoryValid = true;
+        }
+        else
+        {
+            // No temporal (deterministic/off): snapshot raw E so the inline-temporal A/B door still has a history.
+            probeHistory.CopyColorFrom(indirect);
+            probeHistory.ColorToShaderResource();
+            probeHistoryValid = true;
+        }
 
         // === SPATIAL DENOISE: edge-aware à-trous blur of the raw indirect E (diffuse GI is low-frequency, so a
         // wide bilateral blur removes the per-pixel hemisphere-ray grain without a screen-space temporal
@@ -556,6 +624,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             HistoryValid = spHistoryValid ? 1f : 0f,
             ProbeEma = EnvF("BALLISTIC_DX12_LUMEN_PROBE_EMA", 0.1f),   // this-frame weight; low = strong accumulation
             TexelDim = scene.TexelDim,
+            SpPad1 = EnvF("BALLISTIC_DX12_LUMEN_PROBE_FILTER_RADIUS", 2f),   // probe-space spatial filter radius (blob fix)
         };
         *(LumenSun*)spSunCbMapped = new LumenSun
         {
@@ -582,8 +651,13 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
         }, bindless.Cpu(SpTableBase + 7));                                                                      // u2 indirect
         dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(SpTableBase + 8), probeAtlasHistory.ColorSrvCpu, heapType); // t13 atlas history
+        dev.Device.CreateUnorderedAccessView(probeAtlasFiltered.RenderTarget, null, new UnorderedAccessViewDescription
+        {
+            Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+        }, bindless.Cpu(SpTableBase + 9));                                                                      // u3 probe atlas FILTERED (blob fix)
 
         probeAtlas.ColorToUnorderedAccess();
+        probeAtlasFiltered.ColorToUnorderedAccess();
 
         void SetCommonRoots(ID3D12GraphicsCommandList cl)
         {
@@ -646,9 +720,33 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         });
         spHistoryValid = true;
 
-        // INTEGRATE — reads the atlas as a UAV (RWTexture2D) + the history SRV (NON_PIXEL). Bring the atlas back to
-        // UAV (CopyColorFrom left it COPY_SOURCE). The t13 history descriptor was written once → still valid.
+        // PROBE-SPACE SPATIAL FILTER (the proper blob fix) — blend each probe's atlas cell with the same oct cell
+        // of neighbouring probes (depth/normal/world bilateral) → removes the probe-to-probe variance (blob) at its
+        // SOURCE, cheaply (probe-res, not full-res). Reads ProbeAtlas (u1), writes ProbeAtlasFiltered (u3); the
+        // integrate then reads ProbeAtlasFiltered. BALLISTIC_DX12_LUMEN_PROBE_NOFILTER=1 bypasses (copy raw → filtered).
         probeAtlas.ColorToUnorderedAccess();
+        bool probeFilter = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_PROBE_NOFILTER") != "1";
+        if (probeFilter)
+        {
+            probeAtlasFiltered.ColorToUnorderedAccess();
+            dev.ExecuteSync(cl =>
+            {
+                cl.SetDescriptorHeaps(bindless.Heap);
+                cl.SetComputeRootSignature(spRootSig);
+                cl.SetPipelineState(spFilterPso);
+                SetCommonRoots(cl);
+                cl.SetComputeRootDescriptorTable(11, slot11);
+                cl.Dispatch((uint)((probesX * octSize + 7) / 8), (uint)((probesY * octSize + 7) / 8), 1);
+            });
+        }
+        else
+        {
+            probeAtlasFiltered.CopyColorFrom(probeAtlas);
+            probeAtlas.ColorToUnorderedAccess();
+            probeAtlasFiltered.ColorToUnorderedAccess();
+        }
+
+        // INTEGRATE — reads ProbeAtlasFiltered (u3) + the history SRV. The atlas/filtered are UAV.
         dev.ExecuteSync(cl =>
         {
             cl.SetDescriptorHeaps(bindless.Heap);
@@ -848,6 +946,38 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             shaderVisible: true, framesInFlight: dev.FramesInFlight);
 
         BuildScreenProbePipeline();
+        BuildTemporalPipeline();
+    }
+
+    // Common motion-vector temporal resolve pipeline (LumenTemporal.hlsl): CBV b0 + table{t0 InE, t1 History,
+    // t2 Depth, t3 Motion (SRV) + u0 OutE (UAV)} + linear-clamp sampler.
+    unsafe void BuildTemporalPipeline()
+    {
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var srv = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 4, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 0);
+        var uav = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 4);
+        var table = new RootParameter1(new RootDescriptorTable1(srv, uav), ShaderVisibility.All);
+        var samp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
+        {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
+            AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1, ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        tempRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, table }, new[] { samp })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumenTemporal.hlsl");
+        tempPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription
+        {
+            RootSignature = tempRootSig,
+            ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSTemporal", "LumenTemporal.hlsl"),
+        });
+        int cbSize = (Marshal.SizeOf<TemporalConstants>() + 255) & ~255;
+        tempCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+        tempCbMapped = tempCb.Map<byte>(0);
+        tempSrv = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 8,
+            shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
     // Sıra 1 — screen-probe root sig (mirrors the GI trace) + 3 PSOs (place/trace/integrate) + CBs + a 1-descriptor
@@ -879,7 +1009,9 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             registerSpace: 0, offsetInDescriptorsFromTableStart: 0, flags: Vol);   // u2 indirect
         var atlasHistRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 13,
             registerSpace: 0, offsetInDescriptorsFromTableStart: 1, flags: Vol);   // t13 atlas history
-        var indirectTable = new RootParameter1(new RootDescriptorTable1(indirectUavRange, atlasHistRange), ShaderVisibility.All);
+        var filteredUavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 3,
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 2, flags: Vol);   // u3 ProbeAtlasFiltered (blob-fix filter out / integrate in)
+        var indirectTable = new RootParameter1(new RootDescriptorTable1(indirectUavRange, atlasHistRange, filteredUavRange), ShaderVisibility.All);
         var prevHeaderSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(16, 0), ShaderVisibility.All);  // t16 prev headers (root SRV, buffer)
         var spCardsSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(17, 0), ShaderVisibility.All);  // t17 ClusterCards (Sıra 5)
         var clampSamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
@@ -916,6 +1048,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         {
             RootSignature = spRootSig,
             ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSIntegrate", "LumenScreenProbe.hlsl"),
+        });
+        spFilterPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription
+        {
+            RootSignature = spRootSig,
+            ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSProbeFilter", "LumenScreenProbe.hlsl"),
         });
 
         int pcSize = (Marshal.SizeOf<ProbeConstants>() + 255) & ~255;
@@ -965,6 +1102,9 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         probeHistory = new Dx12OffscreenTarget(dev, lw, lh, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
         probeHistoryValid = false;   // a resized history is stale → first frame takes the raw E (alpha=1)
+        indirectResolved?.Dispose();   // common motion-vector temporal output (ping target)
+        indirectResolved = new Dx12OffscreenTarget(dev, lw, lh, withDepth: false,
+            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
 
         // Sıra 1 — screen-probe grid + octahedral atlas, sized off the `indirect` resolution (the GI front-end
         // resolution). One probe per probeStride×probeStride tile; each probe holds an octSize×octSize oct tile.
@@ -988,6 +1128,9 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         probeAtlas?.Dispose();
         probeAtlas = new Dx12OffscreenTarget(dev, Math.Max(probesX * octSize, 1), Math.Max(probesY * octSize, 1),
             withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
+        probeAtlasFiltered?.Dispose();   // probe-space spatial-filtered atlas (blob fix)
+        probeAtlasFiltered = new Dx12OffscreenTarget(dev, Math.Max(probesX * octSize, 1), Math.Max(probesY * octSize, 1),
+            withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
         probeAtlasHistory?.Dispose();   // Sıra 3: previous-frame accumulated atlas (EMA source)
         probeAtlasHistory = new Dx12OffscreenTarget(dev, Math.Max(probesX * octSize, 1), Math.Max(probesY * octSize, 1),
             withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
@@ -1003,7 +1146,9 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         if (denoiseCbs != null) foreach (var cb in denoiseCbs) cb?.Dispose();
         combinePso?.Dispose(); combineDebugPso?.Dispose(); combineRootSig?.Dispose(); combineSrv?.Dispose(); combineCb?.Dispose();
         indirect?.Dispose(); indirectFiltered?.Dispose(); probeHistory?.Dispose();
-        spPlacePso?.Dispose(); spTracePso?.Dispose(); spIntegratePso?.Dispose(); spRootSig?.Dispose();
+        tempPso?.Dispose(); tempRootSig?.Dispose(); tempCb?.Dispose(); tempSrv?.Dispose(); indirectResolved?.Dispose();
+        spPlacePso?.Dispose(); spTracePso?.Dispose(); spIntegratePso?.Dispose(); spFilterPso?.Dispose(); spRootSig?.Dispose();
+        probeAtlasFiltered?.Dispose();
         spProbeCb?.Dispose(); spSunCb?.Dispose();
         probeHeaders?.Dispose(); probeHeadersPrev?.Dispose(); probeAtlas?.Dispose(); probeAtlasHistory?.Dispose();
     }
