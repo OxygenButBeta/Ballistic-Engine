@@ -46,17 +46,26 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         Resize(width, height);
     }
 
-    // The product door. BALLISTIC_DX12_LUMEN=1 arms Lumen; unset/0 = off (no substrate alloc, no-op Record).
-    int? armed;
-    public bool Armed => (armed ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN") == "1" ? 1 : 0) == 1;
+    // The product door. Lumen is driven by the GlobalIllumination VOLUME (ctx.PostFX.LumenEnabled, default ON —
+    // plan §Target Shape: one product-facing mode). The BALLISTIC_DX12_LUMEN env door overrides for A/B:
+    // "1" forces on, "0" forces off, unset → follow the volume. Always hard-gated by hardware ray tracing in
+    // WouldRun (no HW RT → Lumen unavailable, plan gate #6: NO hidden screen-space fallback).
+    static int envDoor = -2;   // -2 unread, -1 unset(follow volume), 0 force-off, 1 force-on
+    static bool Armed(Dx12FrameContext ctx) {
+        if (envDoor == -2) {
+            string v = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN");
+            envDoor = v == "1" ? 1 : v == "0" ? 0 : -1;
+        }
+        return envDoor == 1 || (envDoor == -1 && ctx.PostFX.LumenEnabled);
+    }
 
     // The frame-level "Lumen runs" predicate, shared with the orchestrator (which mirrors it into
     // ctx.LumenActiveThisFrame so the deferred pass suppresses its IBL diffuse ambient before this pass adds
     // its own diffuse indirect). Lumen is HW-RT only — no hidden SSGI fallback (plan gate #6).
-    public static bool WouldRun(Dx12FrameContext ctx, bool armed) =>
-        !ctx.Doors.Minimal && armed && ctx.Dev.HasHardwareRayTracing && ctx.Dxr?.SceneAS != null;
+    public static bool WouldRun(Dx12FrameContext ctx) =>
+        !ctx.Doors.Minimal && Armed(ctx) && ctx.Dev.HasHardwareRayTracing && ctx.Dxr?.SceneAS != null;
 
-    public bool Enabled(Dx12FrameContext ctx) => WouldRun(ctx, Armed);
+    public bool Enabled(Dx12FrameContext ctx) => WouldRun(ctx);
 
     // ---- trace (inline RayQuery compute) ----
     ID3D12RootSignature traceRootSig;   // HeapDirectlyIndexed; CBV b0/b1 + table{t0-t6, u0} + root SRV t7/t8/t9 + s0/s1
@@ -132,10 +141,13 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
 
         Matrix4x4.Invert(ctx.ViewProj, out Matrix4x4 invVP);
 
-        float intensity = EnvF("BALLISTIC_DX12_LUMEN_INTENSITY", 1f);
-        float rayCount = MathF.Round(EnvF("BALLISTIC_DX12_LUMEN_RAYS", 6f));   // 6 hemisphere rays/px (denoise + cache clean the rest)
+        // Dials: the GlobalIllumination VOLUME (ctx.PostFX) drives them; the BALLISTIC_DX12_LUMEN_* env doors
+        // override for A/B (EnvF returns the env value when set, else the volume-supplied fallback).
+        var fx = ctx.PostFX;
+        float intensity = EnvF("BALLISTIC_DX12_LUMEN_INTENSITY", fx.LumenIntensity);
+        float rayCount = MathF.Round(EnvF("BALLISTIC_DX12_LUMEN_RAYS", fx.LumenRayCount));
         float maxDist = EnvF("BALLISTIC_DX12_LUMEN_DIST", 40f);
-        float skyIntensity = EnvF("BALLISTIC_DX12_LUMEN_SKY", 1f);
+        float skyIntensity = EnvF("BALLISTIC_DX12_LUMEN_SKY", fx.LumenSkyIntensity);
         bool useSky = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOSKY") != "1";
         bool useCards = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOCARDS") != "1";
 
@@ -206,8 +218,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // history). 3 iterations at increasing stride (1,2,4) ping-ponging indirect↔indirectFiltered → an
         // effective ~33px footprint. The LAST written buffer is indirectFiltered (the combine reads it).
         // BALLISTIC_DX12_LUMEN_NODENOISE=1 passes through (raw E). ===
-        bool denoise = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NODENOISE") != "1";
-        int dnPasses = denoise ? Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_DENOISE_PASSES", 3f), 1, 5) : 1;
+        bool denoise = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NODENOISE") != "1" && fx.LumenDenoisePasses > 0;
+        int dnPasses = denoise ? Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_DENOISE_PASSES", fx.LumenDenoisePasses), 1, 5) : 1;
         Dx12OffscreenTarget src = indirect, dst = indirectFiltered;
         for (int pass = 0; pass < dnPasses; pass++)
         {
@@ -283,7 +295,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     {
         var sceneAS = ctx.Dxr.SceneAS;
         float emaAlpha = EnvF("BALLISTIC_DX12_LUMEN_EMA", 0.1f);          // conservative temporal blend (0.1 = slow, stable)
-        bool bounce = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOBOUNCE") != "1";
+        bool bounce = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOBOUNCE") != "1" && ctx.PostFX.LumenMultiBounce;
         *(LumenCardConstants*)cardCbMapped = new LumenCardConstants
         {
             SunDir = sunDir, SunBias = 0.03f, SunColor = ctx.LightColor, LightCount = clusteredLights.LightCount,

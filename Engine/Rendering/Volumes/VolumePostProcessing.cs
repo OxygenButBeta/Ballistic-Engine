@@ -112,6 +112,16 @@ public static class VolumePostProcessing {
             fx.DustSparkle = vlit.dustSparkle.Value;
         }
 
+        if (stack.GetComponent<GlobalIllumination>() is { } gi) {
+            fx.LumenEnabled = gi.enabled.Value;
+            fx.LumenIntensity = gi.intensity.Value;
+            fx.LumenSkyIntensity = gi.skyIntensity.Value;
+            fx.LumenRayCount = gi.rayCount.Value;
+            fx.LumenDenoisePasses = gi.denoisePasses.Value;
+            fx.LumenMultiBounce = gi.multiBounce.Value;
+            fx.LumenReflections = gi.reflections.Value;
+        }
+
         if (stack.GetComponent<AerialPerspective>() is { } aerial) {
             fx.AerialPerspectiveEnabled = aerial.enabled.Value;
             fx.AerialPerspectiveIntensity = aerial.intensity.Value;

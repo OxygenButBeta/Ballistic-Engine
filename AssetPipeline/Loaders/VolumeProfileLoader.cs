@@ -11,30 +11,14 @@ public static class VolumeProfileLoader {
     // back the new name on the next editor save).
     static readonly Dictionary<string, string> LegacyTypeNames = new() {
         ["VolumetricLight"] = "VolumetricFog",
-        // P0.5 GI consolidation: the old ScreenSpaceGlobalIllumination + ScreenSpaceReflections folded
-        // into ONE unified GlobalIllumination volume. Both old type names remap to it; if a profile has
-        // BOTH, they merge into the one instance (profile.Add returns the existing instance). The dead
-        // GL probe overrides (the old monolithic GlobalIllumination's probe/SDF params, LightProbes,
-        // ReflectionProbes, Lumen) are NOT remapped — they warn-and-skip (those settings were GL-only).
-        ["ScreenSpaceGlobalIllumination"] = "GlobalIllumination",
-        ["ScreenSpaceReflections"] = "GlobalIllumination",
+        // The old screen-space-GI / reflection volume components were REMOVED with the legacy GI stack
+        // (Lumen V2). Their on-disk type names are no longer remapped to anything — a profile that still
+        // names them warn-and-skips in Load (ResolveVolume → null), exactly like any unknown component.
     };
 
-    // Per-old-type parameter renames for the GI consolidation: a parameter stored under its old name in
-    // an old-typed component binds to the new field name on the unified GlobalIllumination. Keyed by the
-    // ORIGINAL on-disk type name (before the LegacyTypeNames remap) so the two sources stay disambiguated.
-    // Names not listed bind unchanged (most carried over with identical names); names with no new field
-    // are dropped (e.g. the old `enabled` — the new volume derives enable from the Mode dropdowns).
-    static readonly Dictionary<string, Dictionary<string, string>> LegacyParameterNames = new() {
-        ["ScreenSpaceGlobalIllumination"] = new() {
-            ["mode"] = "giMode",
-            ["debugView"] = "giIsolate",
-        },
-        ["ScreenSpaceReflections"] = new() {
-            ["mode"] = "reflectionsMode",
-            ["intensity"] = "reflectionsIntensity",
-        },
-    };
+    // Per-old-type parameter renames (none currently — the GI-consolidation renames were dropped with the
+    // legacy GI volumes). Kept as the extension point for future component renames.
+    static readonly Dictionary<string, Dictionary<string, string>> LegacyParameterNames = new();
 
     public static VolumeProfile Load(BallisticProject project, string assetPath) {
         var definition = ContentText.ReadJson<VolumeProfileDefinition>(project, assetPath);

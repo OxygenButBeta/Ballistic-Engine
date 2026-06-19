@@ -302,7 +302,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
         // P5: sample the Lumen card cache at reflection hits when Lumen is active this frame + has a valid cache
         // (so reflections see the same multi-bounce GI the diffuse does). Off → the hit re-shades direct+IBL.
-        bool useCards = ctx.LumenActiveThisFrame && ctx.LumenScene is { Valid: true }
+        bool useCards = ctx.LumenActiveThisFrame && ctx.LumenScene is { Valid: true } && ctx.PostFX.LumenReflections
                         && Environment.GetEnvironmentVariable("BALLISTIC_DX12_REFL_NOCARDS") != "1";
         *(RtReflConstants*)rtReflCbMapped = new RtReflConstants {
             InvViewProj = Matrix4x4.Transpose(invVP), CameraPos = camPos, Intensity = ctx.PostFX.SsrIntensity,

@@ -1603,7 +1603,7 @@ public sealed class DX12HDRenderer : HDRenderer
         // Lumen V2 GI active this frame — resolved from the SAME predicate the Lumen pass's Enabled() uses, so
         // the deferred pass (event 300) suppresses its IBL diffuse ambient iff the Lumen pass (event 500) will
         // add its own diffuse indirect. Set after ctx build (Doors/Dev/Dxr are populated in the initializer).
-        ctx.LumenActiveThisFrame = Dx12LumenGiPass.WouldRun(ctx, lumenGiPass.Armed);
+        ctx.LumenActiveThisFrame = Dx12LumenGiPass.WouldRun(ctx);
 
         // Seed the film-grain counter. Grain is frozen to 0 under deterministic capture.
         ctx.GrainFrame = DeterministicCapture ? 0 : frameCounter;

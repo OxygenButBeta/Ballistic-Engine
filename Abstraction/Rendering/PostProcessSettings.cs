@@ -236,4 +236,17 @@ public sealed class PostProcessSettings {
     public float DofMaxCoc { get; set; } = 0.03f;       // blur-radius clamp (fraction of frame height)
 
     // The old realtime-GI and baked-GI settings were removed with the GI renderer.
+
+    // --- Lumen V2 global illumination (the GlobalIllumination volume → these fields → the DX12 Lumen GI pass).
+    // Lumen is the product GI path (HW-RT diffuse one-/multi-bounce + surface-card radiance cache). LumenEnabled
+    // is the master on/off; default ON (the pass also hard-gates on hardware ray tracing — no HW RT = no GI,
+    // no hidden screen-space fallback). The dials below were env-only during the Lumen build; the volume now
+    // drives them, with the BALLISTIC_DX12_LUMEN_* env doors still overriding for A/B. ---
+    public bool LumenEnabled { get; set; } = true;
+    public float LumenIntensity { get; set; } = 1f;          // master GI strength
+    public float LumenSkyIntensity { get; set; } = 1f;       // skylight let in through open sky-visibility
+    public int LumenRayCount { get; set; } = 6;              // hemisphere rays per pixel (variance vs cost)
+    public int LumenDenoisePasses { get; set; } = 3;         // à-trous spatial denoise iterations (0 = raw)
+    public bool LumenMultiBounce { get; set; } = true;       // accumulate multi-bounce in the radiance cache
+    public bool LumenReflections { get; set; } = true;       // feed RT reflections from the radiance cache
 }

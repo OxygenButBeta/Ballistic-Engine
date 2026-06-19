@@ -284,9 +284,9 @@ loop returns or the process never exits.
 Invariants the DX12 passes still honour (the conceptual contract — names below are the DX12 equivalents):
 
 - **Frame shape (single path, no MSAA, TAA is the AA)**: cull → cascaded shadows (cached) → z-prepass →
-  AO (GTAO) → opaque (LEqual, no depth writes) → sky → transparent → SSGI → SSR → GI → volumetric/fog →
-  TAA → exposure meter → bloom → composite. Event-sorted pass list (see pass-graph plan); the MSAA path
-  was deleted (the AntiAliasing volume's MSAA setting is inert).
+  AO (GTAO) → opaque (LEqual, no depth writes) → sky → transparent → **Lumen GI (event 500)** → SSR/RT
+  reflections → volumetric/fog → TAA → exposure meter → bloom → composite. Event-sorted pass list (see
+  pass-graph plan); the MSAA path was deleted (the AntiAliasing volume's MSAA setting is inert).
 - **GPU-driven (ExecuteIndirect)**: the whole-mesh renderer (Bistro, ~1600 submeshes, `SubMeshIndex < 0`,
   non-skinned) is drawn indirect after a GPU compute frustum cull + bindless material table — CPU submit
   was the bottleneck. CPU world-AABBs are bit-identical to the GPU cull (same 8-corner loop). GPU-driven
@@ -301,11 +301,18 @@ Invariants the DX12 passes still honour (the conceptual contract — names below
 - **Cascade caching**: sun cascades re-render only when the texel-snapped fit matrix OR the caster-AABB
   geometry stamp changes. Static camera = all four free.
 - **Transient RT pool**: post passes acquire per-frame scratch (released wholesale at EndFrame); ONLY
-  cross-frame history (TAA/SSGI/volumetric/GI accumulation) is pass-owned. NEVER pool history.
-- **SSR half-res** (depth-aware upsample). **SSGI = horizon slices with 32-bit sector visibility bitmasks**
-  (SSILVB-style): ordered occlusion (near occluders block far light — no scene-average veil), `Thickness` =
-  assumed occluder thickness, sky enters only through OPEN sectors, `rayCount` = slices (≤8). OIDN replaced
-  the a-trous denoise; the GL-era `SsgiSkyFallback`/`SsgiDenoise`/`SsgiMultiBounce` dials are gone.
+  cross-frame history (TAA/volumetric, the Lumen radiance cache) is pass-owned. NEVER pool history.
+- **GI = Lumen V2** (`BallisticEngine.DX12/Lumen/`, the legacy SSGI/DDGI/screen-probe/OIDN stack was DELETED).
+  HW-RT diffuse GI: per-pixel screen trace → inline-RayQuery TLAS on a screen miss → sky on an RT miss; RT
+  hits SAMPLE a per-triangle surface-card radiance cache (`Dx12LumenScene`) that a card-light compute fills
+  with lit first-bounce + multi-bounce radiance (the cache is double-buffered for a cache-space temporal EMA —
+  no screen-space history). An à-trous spatial denoise cleans the per-pixel indirect. The diffuse indirect is
+  added into the HDR color (deferred suppresses its IBL diffuse ambient when Lumen is active → no double-
+  count). HW-RT ONLY — no hidden screen-space fallback (no HW RT = GI off). Driven by the `GlobalIllumination`
+  VOLUME (default ON); the `BALLISTIC_DX12_LUMEN[...]` env doors override for A/B. Plan: `Docs/Plans/
+  lumen-v2-replacement.md`; memory `lumen-v2-replacement-progress`.
+- **SSR half-res** (depth-aware upsample); **RT reflections** re-shade hits — when Lumen is on they sample the
+  SAME radiance cache the diffuse uses (rough + sharp), IBL only the miss/far fallback.
 - **Per-pass GPU timers** publish into `RenderStats.Scene/Game` (real draw/triangle/cull counters; editor
   Stats overlay). `Transform` caches Local/World with version stamps — don't bypass the setters.
 
@@ -316,8 +323,11 @@ Invariants the DX12 passes still honour (the conceptual contract — names below
 - `BALLISTIC_SCREENSHOT_PAUSED=1` — load the scene but never StartPlay: no scripts/physics,
   serialized camera → **bit-exact deterministic frames**, diffable across builds. Play-mode
   frames are NOT diffable (sim time at a fixed frame varies run to run).
-- `BALLISTIC_FX_SSGI/SSR/VOLUMETRIC/SSAO/SSGI_DEBUG=0|1` — force post-FX toggles after the
-  volume stack applies, for A/B screenshot runs.
+- `BALLISTIC_FX_SSR/VOLUMETRIC/SSAO=0|1` — force post-FX toggles after the volume stack applies, for A/B runs.
+- **Lumen GI** (default ON, HW-RT-gated): `BALLISTIC_DX12_LUMEN=0` off / `=1` force-on; `_LUMEN_DEBUG=1` shows
+  the raw indirect irradiance E; `_LUMEN_RAYS` / `_LUMEN_DENOISE_PASSES` / `_LUMEN_INTENSITY` / `_LUMEN_SKY` /
+  `_LUMEN_EMA` tune; `_LUMEN_NOCARDS` / `_LUMEN_NOBOUNCE` / `_LUMEN_NODENOISE` / `_REFL_NOCARDS` A/B isolate.
+  The env doors OVERRIDE the `GlobalIllumination` volume.
 
 ## Hard-won gotchas (do not relearn these)
 
