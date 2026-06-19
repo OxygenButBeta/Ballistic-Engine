@@ -73,7 +73,16 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     ID3D12Resource traceCb, sunCb;
     unsafe byte* traceCbMapped, sunCbMapped;
     const int LumenTableBase = Dx12BindlessTail.LumenTableBase;
-    Dx12OffscreenTarget indirect;       // full-res RGBA16F incoming irradiance E (cross-pass scratch; rebuilt on resize)
+    Dx12OffscreenTarget indirect;       // probe-res RGBA16F incoming irradiance E (cross-pass scratch; rebuilt on resize)
+
+    // ---- #3 PROBE TEMPORAL ACCUMULATION ----
+    // The trace is a low-res PROBE gather (1 trace point per probe-grid cell). A few rays/probe/frame is noisy, so
+    // the probe radiance is ACCUMULATED across frames (cache-space-like temporal EMA) → many effective rays at low
+    // cost, the low-variance final gather Lumen's screen probes give. History is probe-res, depth-guarded against a
+    // disocclusion (camera move / geometry change flushes a probe instead of smearing). `probeHistory` holds last
+    // frame's accumulated E + its depth in .a; cross-frame so it is pass-owned (NEVER pooled). RGBA16F: rgb=E, a=depth.
+    Dx12OffscreenTarget probeHistory;
+    bool probeHistoryValid;
 
     // ---- spatial denoise (edge-aware blur of the per-pixel indirect E) ----
     ID3D12RootSignature denoiseRootSig; // CBV b0 + table{t0-t2 SRV, u0 UAV}
@@ -106,6 +115,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public Vector2 TexelSize; public float RayCount; public float FrameIndex;
         public float NormalBias; public float MaxRayDist; public float UseCards; public float ScreenSteps;
         public float SkyIntensity; public float UseSky; public float UseScreenTrace; public float ScreenRange;
+        public float HistoryValid; public float ProbeAlpha; public float Pad0; public float Pad1;   // #3 probe temporal
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -184,6 +194,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             // Short confident-contact range for the screen trace; mid/far GI is RT (view-independent). The old
             // behaviour let ANY on-screen hit veto RT → view-dependent darkening when the light source panned off.
             ScreenRange = EnvF("BALLISTIC_DX12_LUMEN_SCREEN_RANGE", 1.5f),
+            // #3 probe temporal accumulation. HistoryValid 0 on the first frame / after a resize → take raw E.
+            // ProbeAlpha = this-frame weight in the EMA (lower = smoother + more lag). A deterministic capture KEEPS
+            // accumulation (a fixed frame means a fixed, reproducible accumulation over the static camera — and the
+            // accumulated result is the CLEAN one we want to measure, not a single noisy frame).
+            HistoryValid = probeHistoryValid ? 1f : 0f,
+            ProbeAlpha = EnvF("BALLISTIC_DX12_LUMEN_PROBE_ALPHA", 0.1f),
         };
         *(LumenSun*)sunCbMapped = new LumenSun
         {
@@ -204,12 +220,14 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         {
             Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
         }, bindless.Cpu(LumenTableBase + 6));                                                                      // u0 indirect
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(LumenTableBase + 7), probeHistory.ColorSrvCpu, heapType);  // t14 ProbeHistory (#3)
 
         // The trace reads depth/normal/material/scene-color as SRVs from the COMPUTE (non-pixel) stage, and the
         // scene color must be readable too. Promote: G-buffer to the combined read; scene color to SRV. ALL in
         // one list so state tracking is exact (the RTAO-pass pattern that avoided the split-submit barrier bugs).
         gbuffer.ToShaderResource();
         target.ColorToShaderResource();
+        probeHistory.ColorToShaderResource();   // #3: the trace reads last frame's accumulated probes (table t14)
         indirect.ColorToUnorderedAccess();
 
         dev.ExecuteSync(cl =>
@@ -230,6 +248,13 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
         });
         indirect.ColorToShaderResource();
+
+        // #3: snapshot this frame's accumulated probes (indirect, with depth in .a) into the history for next
+        // frame's EMA. Must happen BEFORE the denoise overwrites indirect's .a. After this, indirect's rgb feeds
+        // the denoise/combine as before (the .a depth is ignored downstream).
+        probeHistory.CopyColorFrom(indirect);
+        probeHistory.ColorToShaderResource();
+        probeHistoryValid = true;
 
         // === SPATIAL DENOISE: edge-aware à-trous blur of the raw indirect E (diffuse GI is low-frequency, so a
         // wide bilateral blur removes the per-pixel hemisphere-ray grain without a screen-space temporal
@@ -423,7 +448,10 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         var tlasSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.All);   // t0 TLAS (root)
         var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 6, baseShaderRegister: 1);   // t1-t6
         var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);  // u0
-        var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange), ShaderVisibility.All);
+        // #3: probe history texture (t14) lives in the SAME table tail (slot LumenTableBase+7), after u0 (+6).
+        var probeRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 14,
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 7);
+        var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange, probeRange), ShaderVisibility.All);
         var matSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All);
         var instSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(8, 0), ShaderVisibility.All);
         var lightSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(9, 0), ShaderVisibility.All);
@@ -590,14 +618,22 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // traversal/dispatch-bound, not pixel-bound) but DID cost quality (Cornell/Bistro hotspot ~5-8%). So the
         // scale stays opt-in (BALLISTIC_DX12_LUMEN_RESSCALE=2/4) for 4K / weak-GPU cases where pixel count bites;
         // the depth-aware upsample + UV-sampled trace/denoise are kept so it's correct when enabled.
-        int scale = Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_RESSCALE", 1f), 1, 4);
+        // #3 PROBE: the trace runs at probe resolution (low-res = 1 probe per scale×scale block) and accumulates
+        // temporally. Default scale = 2 (probe mode ON) — the temporal accumulation makes the low-res probe gather
+        // LOWER variance than the old full-res single-frame gather, not just cheaper. RESSCALE overrides (1 =
+        // full-res, no probe downsample; 2 = default; 4 = aggressive). The depth-aware combine upsamples probes.
+        int scale = Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_RESSCALE", 2f), 1, 4);
         int lw = Math.Max(1, fullW / scale), lh = Math.Max(1, fullH / scale);
         indirect?.Dispose();
         indirectFiltered?.Dispose();
+        probeHistory?.Dispose();
         indirect = new Dx12OffscreenTarget(dev, lw, lh, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
         indirectFiltered = new Dx12OffscreenTarget(dev, lw, lh, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
+        probeHistory = new Dx12OffscreenTarget(dev, lw, lh, withDepth: false,
+            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
+        probeHistoryValid = false;   // a resized history is stale → first frame takes the raw E (alpha=1)
     }
 
     public void Dispose()
@@ -607,6 +643,6 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         cardPso?.Dispose(); cardRootSig?.Dispose(); cardCb?.Dispose();
         denoisePso?.Dispose(); denoiseRootSig?.Dispose(); denoiseCb?.Dispose(); denoiseSrv?.Dispose();
         combinePso?.Dispose(); combineDebugPso?.Dispose(); combineRootSig?.Dispose(); combineSrv?.Dispose(); combineCb?.Dispose();
-        indirect?.Dispose(); indirectFiltered?.Dispose();
+        indirect?.Dispose(); indirectFiltered?.Dispose(); probeHistory?.Dispose();
     }
 }

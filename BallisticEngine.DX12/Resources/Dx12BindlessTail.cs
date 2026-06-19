@@ -15,7 +15,7 @@ internal static class Dx12BindlessTail
     // prefilter cube, u0 indirect UAV. (TLAS t0 + CardRadiance/InstanceMeta/materials/lights are ROOT SRVs,
     // not table slots.)
     const int LumenReserved = 16;
-    public const int LumenUsed = 7;
+    public const int LumenUsed = 8;   // #3: slot +7 = probe history SRV (t14)
     public const int LumenTableBase = RtReflTableBase - LumenReserved;
 
     // Lumen V2 card-LIGHTING pass table — one slot (the sky irradiance cube). Below the GI tail.

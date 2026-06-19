@@ -42,6 +42,7 @@ cbuffer LumenConstants : register(b0) {
     float2 TexelSize;   float RayCount;  float FrameIndex;   // 1/res; hemisphere rays per pixel; rotation seed
     float NormalBias;   float MaxRayDist; float UseCards;   float ScreenSteps;   // bias; world ray length; >0.5 = sample cards on RT hit; screen march
     float SkyIntensity; float UseSky;    float UseScreenTrace; float ScreenRange;   // sky-miss scale; >0.5 sky; >0.5 screen-trace; contact range (m)
+    float HistoryValid; float ProbeAlpha; float Pad0; float Pad1;   // #3 probe temporal: history usable?; this-frame EMA weight
 };
 cbuffer LumenSun : register(b1) {
     float3 SunDir;   float SunBias;       // TO the sun (normalized), world; shadow-ray origin offset
@@ -68,6 +69,7 @@ StructuredBuffer<GpuLight>          Lights       : register(t9);
 StructuredBuffer<float4>            CardRadiance : register(t10);   // #2A: per-CLUSTER lit radiance (the records)
 StructuredBuffer<LumenInstanceMeta> InstanceMeta : register(t11);   // per-instance {triOffset, clusterOffset, world}
 StructuredBuffer<uint>              TriToCluster : register(t12);   // #2A: global tri index → LOCAL cluster index
+Texture2D<float4>                   ProbeHistory : register(t14);   // #3: last frame's accumulated E (rgb) + depth (a)
 
 static const float PI = 3.14159265359;
 
@@ -279,8 +281,23 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
 
     // Mean over the cosine-sampled rays ≈ cosine-weighted incoming irradiance E. Store E (not E*albedo); the
     // combine applies the receiver albedo. Intensity is the artist GI dial.
-    float3 E = sum / float(rays) * Intensity;
-    Indirect[px] = float4(Sanitize(E), 1.0);
+    float3 E = Sanitize(sum / float(rays) * Intensity);
+
+    // #3 PROBE TEMPORAL ACCUMULATION — EMA this frame's noisy few-ray E over the accumulated history at the SAME
+    // probe texel (probes are view-locked to the screen, so no reprojection needed for a static camera; a moving
+    // camera is rejected by the depth guard below). Over frames this converges to a many-ray, low-variance probe
+    // radiance — the screen-probe quality win. The history carries its depth in .a so a disocclusion (this probe
+    // now sees a different surface) FLUSHES instead of smearing. ProbeAlpha = this-frame weight.
+    float3 outE = E;
+    if (HistoryValid > 0.5) {
+        float4 hist = ProbeHistory[px];                       // rgb = accumulated E, a = depth it was captured at
+        float histDepth = hist.a;
+        bool sameSurface = abs(histDepth - depth) < 0.001;    // non-linear depth → tight tol = disocclusion reject
+        if (sameSurface)
+            outE = lerp(hist.rgb, E, saturate(ProbeAlpha));   // accumulate
+        // else: disocclusion → take the fresh E (outE already = E)
+    }
+    Indirect[px] = float4(Sanitize(outE), depth);             // store depth in .a for next frame's reject + history copy
 }
 
 // ===== Spatial denoise (P4): edge-aware blur of the per-pixel indirect E =====
