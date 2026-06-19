@@ -253,7 +253,4 @@ public sealed class PostProcessSettings {
     // already has MACRO occlusion, so this is a partial contact-detail term, not a second full AO. 0 = GI sees
     // only its own RT occlusion (+ baked material AO); 1 = full GTAO. Default 0.5.
     public float LumenAoStrength { get; set; } = 0.5f;
-    // Indirect half-distance (m): a bounce from a hit D away is scaled by 2^(-D/this). Damps long interior rays
-    // reaching distant exterior light (the "outside leaks in" glow). 0 = off. Default 16 (gentle in open scenes).
-    public float LumenFalloffDistance { get; set; } = 16f;
 }

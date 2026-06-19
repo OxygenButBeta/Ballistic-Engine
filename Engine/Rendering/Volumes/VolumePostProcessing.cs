@@ -120,7 +120,6 @@ public static class VolumePostProcessing {
             fx.LumenDenoisePasses = gi.denoisePasses.Value;
             fx.LumenMultiBounce = gi.multiBounce.Value;
             fx.LumenAoStrength = gi.aoStrength.Value;
-            fx.LumenFalloffDistance = gi.falloffDistance.Value;
         }
 
         if (stack.GetComponent<Reflections>() is { } refl) {

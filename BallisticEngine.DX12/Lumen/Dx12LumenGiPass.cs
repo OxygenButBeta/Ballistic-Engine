@@ -114,7 +114,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public Vector2 TexelSize; public float RayCount; public float FrameIndex;
         public float NormalBias; public float MaxRayDist; public float UseCards; public float ScreenSteps;
         public float SkyIntensity; public float UseSky; public float UseScreenTrace; public float ScreenRange;
-        public float HistoryValid; public float ProbeAlpha; public float ImportanceSampling; public float FalloffDist;   // falloff half-distance (m)
+        public float HistoryValid; public float ProbeAlpha; public float ImportanceSampling; public float Pad1;   // #3 temporal; #4 importance
         public Matrix4x4 PrevViewProj;   // #3: previous-frame UNJITTERED view*proj — camera-motion-robust probe reprojection
     }
 
@@ -136,7 +136,6 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public uint InstanceCount; public uint TotalTris; public float SkyIntensity; public float UseSky;
         public float SkyVisRays; public float EmaAlpha; public float BounceRays; public float HistoryValid;
         public uint FrameIndex; public uint UpdateStride; public uint ForceFull; public uint Pad0;   // P7 #1
-        public float BounceEnergy; public float FalloffDist; public float Pad1; public float Pad2;   // leak fix
     }
 
     int frameCounter;
@@ -208,11 +207,6 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             // ReSTIR) — too big a lift for the marginal gain now that temporal accumulation already cleans the
             // grain. Kept opt-in (BALLISTIC_DX12_LUMEN_IMPORTANCE=1) for genuinely sun-dominant scenes.
             ImportanceSampling = EnvF("BALLISTIC_DX12_LUMEN_IMPORTANCE", 0f),
-            // Distance falloff half-distance (the GlobalIllumination volume's falloffDistance; env overrides for
-            // A/B): indirect from a hit `d` m away is scaled by 2^(-d/FalloffDist). Stops long interior rays from
-            // dragging in distant exterior (sun-lit) light — the "outside light leaks in" glow — while leaving
-            // near-field bounce/color-bleed intact. 0 = off.
-            FalloffDist = EnvF("BALLISTIC_DX12_LUMEN_FALLOFF", fx.LumenFalloffDistance),
             PrevViewProj = Matrix4x4.Transpose(ctx.PrevViewProjUnjittered),   // world → prev clip (HLSL column-major)
         };
         *(LumenSun*)sunCbMapped = new LumenSun
@@ -407,10 +401,6 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             EmaAlpha = emaAlpha, BounceRays = bounce ? 4f : 0f,
             HistoryValid = (scene.HistoryValid && !ctx.DeterministicCapture) ? 1f : 0f,
             FrameIndex = (uint)frameCounter, UpdateStride = stride, ForceFull = forceFull,
-            // Leak fix: per-bounce energy loss (default 0.6 — physical + stops multi-bounce pumping exterior light
-            // into interiors) + the same distance falloff applied to the bounce ray (far card → less pump).
-            BounceEnergy = EnvF("BALLISTIC_DX12_LUMEN_BOUNCE_ENERGY", 0.6f),
-            FalloffDist = EnvF("BALLISTIC_DX12_LUMEN_FALLOFF", ctx.PostFX.LumenFalloffDistance),
         };
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
