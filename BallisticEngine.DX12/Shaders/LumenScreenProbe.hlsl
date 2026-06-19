@@ -41,6 +41,7 @@ cbuffer ProbeConstants : register(b0) {
     float SkyIntensity; float UseSky;     float UseScreenTrace; float ScreenRange;
     float FalloffDist;  float ProbeTile;  float ProbeStride;    float OctSize;       // ProbeStride=16; OctSize=8 (8x8 tile)
     uint  ProbesX;      uint ProbesY;     uint FullW;           uint FullH;
+    float HistoryValid; float ProbeEma;   float SpPad0;         float SpPad1;        // Sıra 3: prev-atlas EMA accumulation
 };
 cbuffer ProbeSun : register(b1) {
     float3 SunDir;   float SunBias;
@@ -52,6 +53,8 @@ struct ProbeHeader { float4 PosValid; float4 NormalDepth; };
 RWStructuredBuffer<ProbeHeader> ProbeHeaders : register(u0);   // CSPlace writes, CSTrace/CSIntegrate read
 RWTexture2D<float4> ProbeAtlas : register(u1);                 // octahedral radiance atlas (ProbesX*OctSize wide)
 RWTexture2D<float4> Indirect   : register(u2);                 // OUT (CSIntegrate): incoming irradiance E
+Texture2D<float4>   ProbeAtlasHistory : register(t13);        // Sıra 3: previous frame's accumulated atlas (EMA)
+StructuredBuffer<ProbeHeader> ProbeHeadersPrev : register(t16);// Sıra 3: previous frame's probe headers (reproject reject)
 
 SamplerState LinearClamp : register(s0);
 SamplerState LinearWrap  : register(s1);
@@ -279,7 +282,24 @@ void CSProbeTrace(uint3 dtid : SV_DispatchThreadID) {
 
     float3 origin = P + N * NormalBias;
     float3 rad = TraceRay(origin, dir);
-    ProbeAtlas[atlasPx] = float4(Sanitize(rad), 1.0);
+    rad = Sanitize(rad);
+
+    // Sıra 3 — TEMPORAL ACCUMULATION. The single-frame few-ray probe is noisy/blobby; EMA it over the previous
+    // frame's atlas → many effective rays per probe at no extra trace cost (the published Lumen screen-probe
+    // temporal filter). Cells are screen-tile-anchored; on a static camera the same probe maps to the same atlas
+    // cell across frames, so a straight EMA per cell is correct. On a moving camera the probe at this grid cell may
+    // now cover DIFFERENT geometry — reject (take fresh) when the previous probe at the same cell sat on a surface
+    // far from this one (disocclusion), so we accumulate instead of smearing a trail.
+    [branch] if (HistoryValid > 0.5) {
+        ProbeHeader hp = ProbeHeadersPrev[pidx];
+        float posDiff = distance(hp.PosValid.xyz, P);
+        bool sameSurface = hp.PosValid.w > 0.5 && posDiff < max(0.5, length(P - CameraPos) * 0.03);
+        if (sameSurface) {
+            float3 prev = Sanitize(ProbeAtlasHistory[atlasPx].rgb);
+            rad = lerp(prev, rad, saturate(ProbeEma));   // low alpha → strong accumulation, kills grain/blob flicker
+        }
+    }
+    ProbeAtlas[atlasPx] = float4(rad, 1.0);
 }
 
 // ===== CSIntegrate: per full-res pixel, gather 4 nearest probes' octahedral radiance, cosine-weighted =====

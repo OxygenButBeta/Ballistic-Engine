@@ -149,8 +149,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     ID3D12Resource spProbeCb, spSunCb;
     unsafe byte* spProbeCbMapped, spSunCbMapped;
     ID3D12Resource probeHeaders;         // StructuredBuffer<ProbeHeader> (root UAV u0) — sized ProbesX*ProbesY
+    ID3D12Resource probeHeadersPrev;     // Sıra 3: previous frame's headers (reproject reject) — root SRV t16
     Dx12OffscreenTarget probeAtlas;      // octahedral radiance atlas, (ProbesX*OctSize) × (ProbesY*OctSize), RGBA16F UAV
-    Dx12DescriptorHeap spSrv;            // per-frame: 6 SRV (t1-t6) + 1 UAV (u1 atlas)
+    Dx12OffscreenTarget probeAtlasHistory; // Sıra 3: previous frame's accumulated atlas (EMA source) — table t13
+    bool spHistoryValid;
+    Dx12DescriptorHeap spSrv;            // per-frame: u2 indirect UAV + t13 atlas-history SRV
     int probeStride = 16, octSize = 8;
     int probesX, probesY, probeHeaderCount;
     const int SpTableBase = Dx12BindlessTail.LumenScreenProbeTableBase;
@@ -166,6 +169,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public float SkyIntensity; public float UseSky; public float UseScreenTrace; public float ScreenRange;
         public float FalloffDist; public float ProbeTile; public float ProbeStride; public float OctSize;
         public uint ProbesX; public uint ProbesY; public uint FullW; public uint FullH;
+        public float HistoryValid; public float ProbeEma; public float SpPad0; public float SpPad1;
     }
 
     static int spEnvDoor = -2;   // -2 unread, -1 unset(default), 0 force-off, 1 force-on
@@ -535,6 +539,10 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             ProbeTile = 0f, ProbeStride = probeStride, OctSize = octSize,
             ProbesX = (uint)probesX, ProbesY = (uint)probesY,
             FullW = (uint)indirect.Width, FullH = (uint)indirect.Height,
+            // Sıra 3 temporal accumulation. A deterministic capture KEEPS accumulation (fixed frame → fixed,
+            // reproducible accumulation over the static camera — the converged result is what we measure).
+            HistoryValid = spHistoryValid ? 1f : 0f,
+            ProbeEma = EnvF("BALLISTIC_DX12_LUMEN_PROBE_EMA", 0.1f),   // this-frame weight; low = strong accumulation
         };
         *(LumenSun*)spSunCbMapped = new LumenSun
         {
@@ -570,16 +578,18 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.SetComputeRootShaderResourceView(8, scene.InstanceMetaGpuAddress);         // t11 InstanceMeta
             cl.SetComputeRootShaderResourceView(9, scene.TriToClusterGpuAddress);         // t12 TriToCluster
             cl.SetComputeRootUnorderedAccessView(10, probeHeaders.GPUVirtualAddress);     // u0 ProbeHeaders (root UAV — buffer)
+            cl.SetComputeRootShaderResourceView(12, probeHeadersPrev.GPUVirtualAddress);  // t16 prev headers (root SRV — buffer)
         }
 
-        // u2 Indirect: a Texture2D UAV can't be a root UAV (root UAVs are buffers only). Bind it via a small
-        // per-frame descriptor in the screen-probe SRV heap instead, as a table at root slot 11.
+        // Per-frame table (root slot 11): u2 Indirect (texture UAV, offset 0) + t13 atlas history (texture SRV,
+        // offset 1). Texture UAV/SRV can't be root descriptors, so they live in this small per-frame heap.
         spSrv.Reset();
-        int sb = spSrv.AllocateRange(1);
+        int sb = spSrv.AllocateRange(2);
         dev.Device.CreateUnorderedAccessView(indirect.RenderTarget, null, new UnorderedAccessViewDescription
         {
             Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
-        }, spSrv.Cpu(sb));
+        }, spSrv.Cpu(sb + 0));
+        dev.Device.CopyDescriptorsSimple(1, spSrv.Cpu(sb + 1), probeAtlasHistory.ColorSrvCpu, heapType);   // t13 atlas history
 
         dev.ExecuteSync(cl =>
         {
@@ -593,16 +603,32 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         });
         // PLACE writes probeHeaders (root UAV) — a UAV barrier suffices before the trace reads it. The next
         // ExecuteSync's submit/WaitForGpu already serialises GPU work, so no explicit barrier needed.
+        // The trace reads the previous accumulated atlas (t13) as an SRV — promote it before the trace.
+        probeAtlasHistory.ColorToShaderResource();
         dev.ExecuteSync(cl =>
         {
             cl.SetDescriptorHeaps(bindless.Heap);
             cl.SetComputeRootSignature(spRootSig);
             cl.SetPipelineState(spTracePso);
             SetCommonRoots(cl);
-            cl.SetComputeRootDescriptorTable(11, spSrv.Gpu(sb));                          // u2 indirect (table slot 11)
+            cl.SetComputeRootDescriptorTable(11, spSrv.Gpu(sb));                          // u2 indirect + t13 hist (table slot 11)
             cl.Dispatch((uint)((probesX * octSize + 7) / 8), (uint)((probesY * octSize + 7) / 8), 1);
         });
-        probeAtlas.ColorToShaderResource();   // integrate reads the atlas as a UAV — keep UAV; transition not needed (still UAV)
+        // Snapshot this frame's accumulated atlas + headers into the history for next frame's EMA + reproject test.
+        probeAtlas.ColorToShaderResource();
+        probeAtlasHistory.CopyColorFrom(probeAtlas);
+        probeAtlasHistory.ColorToShaderResource();
+        // headers → prev (a plain buffer copy; both are committed UAV/SRV-readable structured buffers).
+        dev.ExecuteSync(cl =>
+        {
+            cl.ResourceBarrierTransition(probeHeaders, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+            cl.ResourceBarrierTransition(probeHeadersPrev, ResourceStates.GenericRead, ResourceStates.CopyDest);
+            cl.CopyResource(probeHeadersPrev, probeHeaders);
+            cl.ResourceBarrierTransition(probeHeaders, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
+            cl.ResourceBarrierTransition(probeHeadersPrev, ResourceStates.CopyDest, ResourceStates.GenericRead);
+        });
+        spHistoryValid = true;
+        // INTEGRATE reads the atlas as a UAV (RWTexture2D) — bring it back to UAV.
         probeAtlas.ColorToUnorderedAccess();
         dev.ExecuteSync(cl =>
         {
@@ -610,7 +636,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.SetComputeRootSignature(spRootSig);
             cl.SetPipelineState(spIntegratePso);
             SetCommonRoots(cl);
-            cl.SetComputeRootDescriptorTable(11, spSrv.Gpu(sb));                          // u2 indirect (table slot 11)
+            cl.SetComputeRootDescriptorTable(11, spSrv.Gpu(sb));                          // u2 indirect + t13 hist (table slot 11)
             cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
         });
     }
@@ -821,8 +847,13 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         var metaSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(11, 0), ShaderVisibility.All);
         var triClusterSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(12, 0), ShaderVisibility.All);
         var headerUav = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(0, 0), ShaderVisibility.All);   // u0 ProbeHeaders (root UAV, buffer)
-        var indirectUavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 2);   // u2 indirect (table)
-        var indirectTable = new RootParameter1(new RootDescriptorTable1(indirectUavRange), ShaderVisibility.All);
+        // Per-frame table: u2 indirect (texture UAV) at offset 0, t13 atlas-history (texture SRV) at offset 1.
+        var indirectUavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 2,
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 0);   // u2 indirect
+        var atlasHistRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 13,
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 1);   // t13 atlas history
+        var indirectTable = new RootParameter1(new RootDescriptorTable1(indirectUavRange, atlasHistRange), ShaderVisibility.All);
+        var prevHeaderSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(16, 0), ShaderVisibility.All);  // t16 prev headers (root SRV, buffer)
         var clampSamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
         {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
@@ -835,11 +866,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 1,
             ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
         };
-        // Roots: 0 cbv0, 1 cbv1, 2 t0 TLAS, 3 table{t1-t6,u1}, 4-9 t7-t12, 10 u0 headers, 11 table{u2 indirect}.
+        // Roots: 0 cbv0, 1 cbv1, 2 t0 TLAS, 3 table{t1-t6,u1}, 4-9 t7-t12, 10 u0 headers, 11 table{u2 indirect,t13 hist}, 12 t16 prev headers.
         spRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { cbv0, cbv1, tlasSrv, table, matSrv, instSrv, lightSrv, cardSrv, metaSrv, triClusterSrv, headerUav, indirectTable },
+                new[] { cbv0, cbv1, tlasSrv, table, matSrv, instSrv, lightSrv, cardSrv, metaSrv, triClusterSrv, headerUav, indirectTable, prevHeaderSrv },
                 new[] { clampSamp, wrapSamp })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumenScreenProbe.hlsl");
@@ -869,7 +900,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         spSunCbMapped = spSunCb.Map<byte>(0);
 
         spSrv = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 8,
             shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
@@ -921,9 +952,16 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         probeHeaders = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)(probeHeaderCount * 32), ResourceFlags.AllowUnorderedAccess),
             ResourceStates.UnorderedAccess);
+        probeHeadersPrev?.Dispose();   // Sıra 3: previous-frame headers (reproject reject) — copy dest / root SRV
+        probeHeadersPrev = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)(probeHeaderCount * 32)), ResourceStates.GenericRead);
         probeAtlas?.Dispose();
         probeAtlas = new Dx12OffscreenTarget(dev, Math.Max(probesX * octSize, 1), Math.Max(probesY * octSize, 1),
             withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
+        probeAtlasHistory?.Dispose();   // Sıra 3: previous-frame accumulated atlas (EMA source)
+        probeAtlasHistory = new Dx12OffscreenTarget(dev, Math.Max(probesX * octSize, 1), Math.Max(probesY * octSize, 1),
+            withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
+        spHistoryValid = false;   // a resized atlas history is stale → first frame takes the raw trace (alpha=1)
     }
 
     public void Dispose()
@@ -937,6 +975,6 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         indirect?.Dispose(); indirectFiltered?.Dispose(); probeHistory?.Dispose();
         spPlacePso?.Dispose(); spTracePso?.Dispose(); spIntegratePso?.Dispose(); spRootSig?.Dispose();
         spProbeCb?.Dispose(); spSunCb?.Dispose(); spSrv?.Dispose();
-        probeHeaders?.Dispose(); probeAtlas?.Dispose();
+        probeHeaders?.Dispose(); probeHeadersPrev?.Dispose(); probeAtlas?.Dispose(); probeAtlasHistory?.Dispose();
     }
 }
