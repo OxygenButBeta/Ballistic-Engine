@@ -79,6 +79,26 @@ public sealed class Dx12LumenScene : IDisposable
     ID3D12Resource clusterToTri;
     public ulong ClusterToTriGpuAddress => clusterToTri?.GPUVirtualAddress ?? 0;
 
+    // ---- Sıra 5: MESH-CARD planar frames (WORLD-space, record-indexed) + texel-grid radiance cache ----
+    // Each record (cluster) carries a world-space card plane (Dx12LumenCluster.ClusterCard transformed per
+    // instance). A hit at world point P maps to card UV → a TEXEL within the record's TexelDim×TexelDim tile, so
+    // the cache stores per-texel radiance (cluster-interior detail) instead of one value per record. Gated behind
+    // BALLISTIC_DX12_LUMEN_MESHCARDS; when off, only the legacy 1-value-per-record path allocates (byte-identical).
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GpuClusterCard   // 4× float4 = 64 B; matches HLSL ClusterCard
+    {
+        public Vector3 Origin; public float InvExtentU;
+        public Vector3 U;      public float InvExtentV;
+        public Vector3 V;      public float Pad0;
+        public Vector3 Normal; public float Pad1;
+    }
+    ID3D12Resource clusterCards;   // GpuClusterCard[] per record (root SRV); built only when mesh-cards armed
+    public ulong ClusterCardsGpuAddress => clusterCards?.GPUVirtualAddress ?? 0;
+    // Texel grid edge per card (TexelDim²  texels/record). Default 1 = legacy single-value record (byte-identical
+    // off). Mesh-cards arm it to e.g. 4 → 16 texels/record. Env BALLISTIC_DX12_LUMEN_MESHCARD_DIM overrides.
+    public int TexelDim { get; private set; } = 1;
+    public int TexelsPerRecord => TexelDim * TexelDim;
+
     // ---- P7 #1: per-record "last updated frame" (the update-budget priority input). One uint per triangle
     // (the cache record unit; #2A makes this per-cluster behind the RadianceCache interface). The card-light
     // pass reads it to decide whether a record is "due" this frame and writes the current frame index back when
@@ -167,9 +187,15 @@ public sealed class Dx12LumenScene : IDisposable
 
         // #2A: build the per-instance meta AND the global triangle→cluster map + record (cluster) count in one
         // pass. The cache is sized by RecordCount (clusters), not TotalTriangles — the 30-50× shrink.
-        LumenInstanceMeta[] meta = BuildMetaArray(sceneAS, out int total, out int records, out uint[] triCluster, out uint[] clusTri);
+        LumenInstanceMeta[] meta = BuildMetaArray(sceneAS, out int total, out int records, out uint[] triCluster, out uint[] clusTri, out GpuClusterCard[] cards);
         TotalTriangles = total;
         RecordCount = records;
+
+        // Sıra 5: mesh-card texel grid. Armed by BALLISTIC_DX12_LUMEN_MESHCARDS=1 → TexelDim N (default 4, 16
+        // texels/record); off → TexelDim 1 (legacy single-value record, cache byte-identical to pre-Sıra-5). The
+        // cache + age buffers are sized RecordCount × TexelsPerRecord.
+        bool meshCards = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_MESHCARDS") == "1";
+        TexelDim = meshCards ? Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_MESHCARD_DIM", 4f), 1, 8) : 1;
 
         instanceMeta?.Dispose();
         instanceMeta = n > 0 ? dev.CreateUavBuffer<LumenInstanceMeta>(meta, ResourceStates.GenericRead) : null;
@@ -180,9 +206,13 @@ public sealed class Dx12LumenScene : IDisposable
         clusterToTri?.Dispose();
         clusterToTri = records > 0 ? dev.CreateUavBuffer<uint>(clusTri, ResourceStates.GenericRead) : null;
 
+        clusterCards?.Dispose();
+        clusterCards = records > 0 ? dev.CreateUavBuffer<GpuClusterCard>(cards, ResourceStates.GenericRead) : null;
+
         cardRadianceA?.Dispose(); cardRadianceB?.Dispose();
-        // float4 per RECORD (cluster); UAV (card-light writes) readable as a StructuredBuffer SRV by the hit trace.
-        int count = Math.Max(RecordCount, 1);
+        // float4 per TEXEL (TexelsPerRecord per record); UAV (card-light writes) readable as a StructuredBuffer SRV
+        // by the hit trace. count = RecordCount × TexelsPerRecord (== RecordCount when TexelDim 1, byte-identical).
+        int count = Math.Max(RecordCount * TexelsPerRecord, 1);
         var zero = new Vector4[count];   // start cleared (no stale radiance on a fresh build)
         cardRadianceA = dev.CreateUavBuffer<Vector4>(zero, ResourceStates.UnorderedAccess);
         cardRadianceB = dev.CreateUavBuffer<Vector4>(zero, ResourceStates.UnorderedAccess);
@@ -191,8 +221,10 @@ public sealed class Dx12LumenScene : IDisposable
         // P7 #1: per-record age, zeroed on (re)build. 0 reads as "never updated" → the budgeted card-light pass
         // prioritizes the whole scene over the first frames after a build (full warm-up), then steady-state
         // round-robins. uint.MaxValue would also work as "stale"; 0 keeps the warm-up sweep simplest.
+        // P7 #1 age stays PER-RECORD (one update decision per cluster, not per texel — the whole card relights as a
+        // unit), so it is sized RecordCount, NOT count.
         lastUpdated?.Dispose();
-        var zeroAge = new uint[count];
+        var zeroAge = new uint[Math.Max(RecordCount, 1)];
         lastUpdated = dev.CreateUavBuffer<uint>(zeroAge, ResourceStates.UnorderedAccess);
         lastUpdatedState = ResourceStates.UnorderedAccess;
 
@@ -224,16 +256,27 @@ public sealed class Dx12LumenScene : IDisposable
     {
         if (sceneAS.InstanceCount == 0) return;
         // Re-cluster is a cached per-mesh no-op (topology unchanged), so this just rebuilds the meta with the same
-        // cluster offsets + re-uploads world matrices. The triToCluster map is unchanged → not re-uploaded.
-        LumenInstanceMeta[] meta = BuildMetaArray(sceneAS, out _, out _, out _, out _);
+        // cluster offsets + re-uploads world matrices. The triToCluster map is unchanged → not re-uploaded. Sıra 5:
+        // the card frames ARE world-space, so a moved instance needs them re-uploaded too (rebuilt by BuildMetaArray).
+        LumenInstanceMeta[] meta = BuildMetaArray(sceneAS, out _, out _, out _, out _, out GpuClusterCard[] cards);
         instanceMeta?.Dispose();
         instanceMeta = dev.CreateUavBuffer<LumenInstanceMeta>(meta, ResourceStates.GenericRead);
+        if (clusterCards != null)
+        {
+            clusterCards.Dispose();
+            clusterCards = dev.CreateUavBuffer<GpuClusterCard>(cards, ResourceStates.GenericRead);
+        }
     }
+
+    static float EnvF(string name, float fallback) =>
+        float.TryParse(Environment.GetEnvironmentVariable(name), System.Globalization.CultureInfo.InvariantCulture,
+            out float v) ? v : fallback;
 
     // Per-instance {triOffset, triCount, clusterOffset, clusterCount, world} + the GLOBAL triangle→local-cluster
     // map + the record→global-representative-tri map + the total record (cluster) count. Shared by Rebuild
     // (topology change) and RefreshTransforms (motion only — clustering is mesh-cached so re-calling is cheap).
-    LumenInstanceMeta[] BuildMetaArray(Dx12SceneAS sceneAS, out int total, out int records, out uint[] triCluster, out uint[] clusterTri)
+    LumenInstanceMeta[] BuildMetaArray(Dx12SceneAS sceneAS, out int total, out int records, out uint[] triCluster,
+                                       out uint[] clusterTri, out GpuClusterCard[] cards)
     {
         int n = sceneAS.InstanceCount;
         var meta = new LumenInstanceMeta[Math.Max(n, 1)];
@@ -241,6 +284,7 @@ public sealed class Dx12LumenScene : IDisposable
         for (int i = 0; i < n; i++) totalTris += sceneAS.InstanceTriangleCount(i);
         triCluster = new uint[Math.Max(totalTris, 1)];
         var clusterTriList = new List<uint>(Math.Max(totalTris / 64, 16));   // record → global representative tri
+        var cardList = new List<GpuClusterCard>(Math.Max(totalTris / 64, 16));   // record → WORLD-space card frame
 
         int offset = 0, clusterOffset = 0;
         for (int i = 0; i < n; i++)
@@ -254,6 +298,27 @@ public sealed class Dx12LumenScene : IDisposable
             for (int c = 0; c < mc.ClusterFirstTri.Length; c++)
                 clusterTriList.Add((uint)(offset + mc.ClusterFirstTri[c]));   // global representative tri index
 
+            // Sıra 5: transform each cluster's OBJECT-space card frame into WORLD space for THIS instance, in the
+            // SAME local-cluster order → record-indexed. Origin = point (w=1); U/V/Normal = directions (w=0). The
+            // span scales with the world matrix, so InvExtent is divided by the axis' world length.
+            Matrix4x4 w = sceneAS.InstanceWorld(i);
+            for (int c = 0; c < mc.Cards.Length; c++)
+            {
+                var card = mc.Cards[c];
+                Vector3 wo = Vector3.Transform(card.Origin, w);
+                Vector3 wu = Vector3.TransformNormal(card.U, w);
+                Vector3 wv = Vector3.TransformNormal(card.V, w);
+                Vector3 wn = Vector3.TransformNormal(card.Normal, w);
+                float ulen = wu.Length(); float vlen = wv.Length();
+                cardList.Add(new GpuClusterCard
+                {
+                    Origin = wo, InvExtentU = card.InvExtentU / MathF.Max(ulen, 1e-6f),
+                    U = ulen > 1e-6f ? wu / ulen : Vector3.UnitX, InvExtentV = card.InvExtentV / MathF.Max(vlen, 1e-6f),
+                    V = vlen > 1e-6f ? wv / vlen : Vector3.UnitZ, Pad0 = 0,
+                    Normal = wn.LengthSquared() > 1e-12f ? Vector3.Normalize(wn) : Vector3.UnitY, Pad1 = 0,
+                });
+            }
+
             meta[i] = new LumenInstanceMeta
             {
                 TriOffset = (uint)offset, TriCount = (uint)tris,
@@ -266,6 +331,7 @@ public sealed class Dx12LumenScene : IDisposable
         total = offset;
         records = clusterOffset;
         clusterTri = clusterTriList.Count > 0 ? clusterTriList.ToArray() : new uint[1];
+        cards = cardList.Count > 0 ? cardList.ToArray() : new GpuClusterCard[1];
         return meta;
     }
 
@@ -274,6 +340,7 @@ public sealed class Dx12LumenScene : IDisposable
         instanceMeta?.Dispose(); instanceMeta = null;
         triToCluster?.Dispose(); triToCluster = null;
         clusterToTri?.Dispose(); clusterToTri = null;
+        clusterCards?.Dispose(); clusterCards = null;
         cardRadianceA?.Dispose(); cardRadianceA = null;
         cardRadianceB?.Dispose(); cardRadianceB = null;
         lastUpdated?.Dispose(); lastUpdated = null;
