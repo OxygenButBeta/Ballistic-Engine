@@ -959,7 +959,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
 
         // Sıra 1 — screen-probe grid + octahedral atlas, sized off the `indirect` resolution (the GI front-end
         // resolution). One probe per probeStride×probeStride tile; each probe holds an octSize×octSize oct tile.
-        probeStride = Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_PROBE_STRIDE", 16f), 4, 64);
+        // Default stride 24 (tuned): vs 16 it is CHEAPER (Bistro GI 3.72→3.31ms, ~11%) AND slightly SMOOTHER
+        // (more full-res pixels averaged per probe → lower variance: Bistro grain 0.504→0.478, SunTemple 0.262→
+        // 0.251), with identical mean/coverage. Larger strides start to blob on dense thin geometry; 24 is the
+        // measured sweet spot. BALLISTIC_DX12_LUMEN_PROBE_STRIDE overrides.
+        probeStride = Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_PROBE_STRIDE", 24f), 4, 64);
         octSize = Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_PROBE_OCT", 8f), 4, 16);
         probesX = (lw + probeStride - 1) / probeStride;
         probesY = (lh + probeStride - 1) / probeStride;
