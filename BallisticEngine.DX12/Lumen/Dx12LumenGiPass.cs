@@ -70,8 +70,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     // ---- trace (inline RayQuery compute) ----
     ID3D12RootSignature traceRootSig;   // HeapDirectlyIndexed; CBV b0/b1 + table{t0-t6, u0} + root SRV t7/t8/t9 + s0/s1
     ID3D12PipelineState tracePso;
-    ID3D12Resource traceCb, sunCb;
-    unsafe byte* traceCbMapped, sunCbMapped;
+    // P0b: N-buffered (FrameSlot-offset) so frame overlap can't stomp the GI constants the GPU still reads.
+    // Pure upload-slab N-buffering — the Lumen ALGORITHM (trace/blend/gather/shading) is untouched; only WHICH
+    // copy of the per-frame constants the CPU writes + the GPU binds changes. FramesInFlight==1 → byte-identical.
+    Dx12FrameCb<LumenConstants> traceCb;
+    Dx12FrameCb<LumenSun> sunCb;
     const int LumenTableBase = Dx12BindlessTail.LumenTableBase;
     Dx12OffscreenTarget indirect;       // probe-res RGBA16F incoming irradiance E (cross-pass scratch; rebuilt on resize)
 
@@ -90,8 +93,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     // (camera-only) and gives the screen-probe path a temporal it never had. `probeHistory` is the resolved history.
     ID3D12RootSignature tempRootSig;   // CBV b0 + table{t0 InE, t1 History, t2 Depth, t3 Motion, u0 OutE} + sampler
     ID3D12PipelineState tempPso;
-    ID3D12Resource tempCb;
-    unsafe byte* tempCbMapped;
+    Dx12FrameCb<TemporalConstants> tempCb;   // P0b N-buffered
     Dx12DescriptorHeap tempSrv;        // 5 descriptors/frame
     Dx12OffscreenTarget indirectResolved; // temporal output (ping target so we don't read+write `indirect` in place)
 
@@ -112,8 +114,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     ID3D12RootSignature combineRootSig; // 4-SRV table + sampler
     ID3D12PipelineState combinePso;
     ID3D12PipelineState combineDebugPso; // OPAQUE replace — BALLISTIC_DX12_LUMEN_DEBUG=1 shows raw E (no add)
-    ID3D12Resource combineCb;
-    unsafe byte* combineCbMapped;
+    Dx12FrameCb<CombineConstants> combineCb;   // P0b N-buffered
     Dx12DescriptorHeap combineSrv;      // 5 SRVs per pass (E/albedo/material/depth/GTAO)
 
     [StructLayout(LayoutKind.Sequential)]
@@ -138,8 +139,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     // Card-lighting pass (LumenCardLight.hlsl): lights every triangle "card" before the trace samples them.
     ID3D12RootSignature cardRootSig;
     ID3D12PipelineState cardPso;
-    ID3D12Resource cardCb;
-    unsafe byte* cardCbMapped;
+    Dx12FrameCb<LumenCardConstants> cardCb;   // P0b N-buffered
     const int CardSkyTableBase = Dx12BindlessTail.LumenCardTableBase;
 
     [StructLayout(LayoutKind.Sequential)]
@@ -160,8 +160,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     // untouched. Gated behind BALLISTIC_DX12_LUMEN_SCREENPROBE ("1" force on, "0" force off, unset → default).
     ID3D12RootSignature spRootSig;       // HeapDirectlyIndexed; CBV b0/b1 + root SRV t0 TLAS + table{t1-t6, u1 atlas} + root SRV t7-t12 + root UAV u0 headers / u2 indirect + s0/s1
     ID3D12PipelineState spPlacePso, spTracePso, spIntegratePso, spFilterPso;
-    ID3D12Resource spProbeCb, spSunCb;
-    unsafe byte* spProbeCbMapped, spSunCbMapped;
+    Dx12FrameCb<ProbeConstants> spProbeCb;   // P0b N-buffered
+    Dx12FrameCb<LumenSun> spSunCb;           // P0b N-buffered
     ID3D12Resource probeHeaders;         // StructuredBuffer<ProbeHeader> (root UAV u0) — sized ProbesX*ProbesY
     ID3D12Resource probeHeadersPrev;     // Sıra 3: previous frame's headers (reproject reject) — root SRV t16
     Dx12OffscreenTarget probeAtlas;      // octahedral radiance atlas, (ProbesX*OctSize) × (ProbesY*OctSize), RGBA16F UAV
@@ -263,7 +263,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             LightCards(ctx, sunDirN, clusteredLights, ibl, skyIntensity, useSky);
         Prof("LightCards");
 
-        *(LumenConstants*)traceCbMapped = new LumenConstants
+        traceCb.Write(new LumenConstants
         {
             InvViewProj = Matrix4x4.Transpose(invVP),
             ViewProj = Matrix4x4.Transpose(ctx.ViewProj),
@@ -303,11 +303,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             ImportanceSampling = EnvF("BALLISTIC_DX12_LUMEN_IMPORTANCE", 0f),
             TexelDim = scene.TexelDim,
             PrevViewProj = Matrix4x4.Transpose(ctx.PrevViewProjUnjittered),   // world → prev clip (HLSL column-major)
-        };
-        *(LumenSun*)sunCbMapped = new LumenSun
+        });
+        sunCb.Write(new LumenSun
         {
             SunDir = sunDirN, SunBias = 0.03f, SunColor = ctx.LightColor, LightCount = clusteredLights.LightCount,
-        };
+        });
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Dx12DescriptorHeap bindless = Dx12Backend.BindlessHeap;
@@ -347,8 +347,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                 cl.SetDescriptorHeaps(bindless.Heap);
                 cl.SetComputeRootSignature(traceRootSig);
                 cl.SetPipelineState(tracePso);
-                cl.SetComputeRootConstantBufferView(0, traceCb.GPUVirtualAddress);
-                cl.SetComputeRootConstantBufferView(1, sunCb.GPUVirtualAddress);
+                cl.SetComputeRootConstantBufferView(0, traceCb.Gpu);
+                cl.SetComputeRootConstantBufferView(1, sunCb.Gpu);
                 cl.SetComputeRootShaderResourceView(2, sceneAS.TlasAddress);                  // t0 TLAS (root SRV)
                 cl.SetComputeRootDescriptorTable(3, bindless.Gpu(LumenTableBase));            // t1-t6 + u0
                 cl.SetComputeRootShaderResourceView(4, ctx.GpuDriven.MaterialsGpuAddress);    // t7 GpuMaterials
@@ -374,14 +374,14 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                           && !ctx.DeterministicCapture;   // deterministic capture: skip (single frame, fresh) for golden stability
         if (temporalOn)
         {
-            *(TemporalConstants*)tempCbMapped = new TemporalConstants
+            tempCb.Write(new TemporalConstants
             {
                 Texel = new Vector2(1f / indirect.Width, 1f / indirect.Height),
                 HistoryValid = probeHistoryValid ? 1f : 0f,
                 Alpha = EnvF("BALLISTIC_DX12_LUMEN_TEMPORAL_ALPHA", 0.1f),
                 W = (uint)indirect.Width, H = (uint)indirect.Height,
                 Pad0 = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_TEMPORAL_NOMOTION") == "1" ? 1f : 0f,
-            };
+            });
             probeHistory.ColorToShaderResource();
             indirectResolved.ColorToUnorderedAccess();
             tempSrv.Reset();
@@ -394,7 +394,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             {
                 Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
             }, tempSrv.Cpu(tb + 4));                                                                            // u0 resolved
-            ulong tcb = tempCb.GPUVirtualAddress;
+            ulong tcb = tempCb.Gpu;
             dev.ExecuteSync(cl =>
             {
                 cl.SetDescriptorHeaps(tempSrv.Heap);
@@ -449,7 +449,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                 Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
             }, denoiseSrv.Cpu(db + 3));                                                                        // u0 E out
             dst.ColorToUnorderedAccess();
-            ulong passCbAddr = denoiseCbs[pass].GPUVirtualAddress;
+            ulong passCbAddr = denoiseCbs[pass].GPUVirtualAddress + (ulong)DenoiseCbOffset;
             dev.ExecuteSync(cl =>
             {
                 cl.SetDescriptorHeaps(denoiseSrv.Heap);
@@ -487,11 +487,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // back in for a scene that specifically wants the extra contact term and tolerates the screen-space cost).
         bool aoOn = ctx.Doors.Ssao && fx.SSAOEnabled;
         float aoStrength = aoOn ? EnvF("BALLISTIC_DX12_LUMEN_AO", 0f) : 0f;
-        *(CombineConstants*)combineCbMapped = new CombineConstants
+        combineCb.Write(new CombineConstants
         {
             AoStrength = aoStrength,
             IndirectTexel = new Vector2(1f / indirect.Width, 1f / indirect.Height),   // half-res texel for the upsample
-        };
+        });
         combineSrv.Reset();
         int cb = combineSrv.AllocateRange(5);
         dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 0), indirectFiltered.ColorSrvCpu, heapType);  // t0 E (denoised)
@@ -506,7 +506,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.SetGraphicsRootSignature(combineRootSig);
             cl.SetPipelineState(pso);                  // additive One/One blend (or opaque replace when debugE)
             cl.SetDescriptorHeaps(combineSrv.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, combineCb.GPUVirtualAddress);
+            cl.SetGraphicsRootConstantBufferView(0, combineCb.Gpu);
             cl.SetGraphicsRootDescriptorTable(1, combineSrv.Gpu(cb));
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
@@ -556,7 +556,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         uint forceFull = lightChanged ? 1u : 0u;
         if (lightChanged) { prevSunDir = sunDir; prevSunColor = ctx.LightColor; prevLightCount = clusteredLights.LightCount; }
 
-        *(LumenCardConstants*)cardCbMapped = new LumenCardConstants
+        cardCb.Write(new LumenCardConstants
         {
             SunDir = sunDir, SunBias = 0.03f, SunColor = ctx.LightColor, LightCount = clusteredLights.LightCount,
             InstanceCount = (uint)scene.InstanceCount, TotalTris = (uint)scene.RecordCount,   // #2A: dispatch bound = record count
@@ -565,7 +565,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             HistoryValid = (scene.HistoryValid && !ctx.DeterministicCapture) ? 1f : 0f,
             FrameIndex = (uint)frameCounter, UpdateStride = stride, ForceFull = forceFull,
             TexelDim = (uint)scene.TexelDim,
-        };
+        });
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Dx12DescriptorHeap bindless = Dx12Backend.BindlessHeap;
@@ -588,7 +588,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.SetDescriptorHeaps(bindless.Heap);
             cl.SetComputeRootSignature(cardRootSig);
             cl.SetPipelineState(cardPso);
-            cl.SetComputeRootConstantBufferView(0, cardCb.GPUVirtualAddress);
+            cl.SetComputeRootConstantBufferView(0, cardCb.Gpu);
             cl.SetComputeRootShaderResourceView(1, sceneAS.TlasAddress);                 // t0 TLAS
             cl.SetComputeRootUnorderedAccessView(2, scene.CardRadianceWriteGpu);         // u0 CardRadiance (write)
             cl.SetComputeRootDescriptorTable(3, bindless.Gpu(CardSkyTableBase));         // t1 sky cube
@@ -622,7 +622,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         Matrix4x4.Invert(ctx.ViewProj, out Matrix4x4 invVP);
         Vector3 sunDirN = ctx.LightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(ctx.LightDir);
 
-        *(ProbeConstants*)spProbeCbMapped = new ProbeConstants
+        spProbeCb.Write(new ProbeConstants
         {
             InvViewProj = Matrix4x4.Transpose(invVP),
             ViewProj = Matrix4x4.Transpose(ctx.ViewProj),
@@ -643,11 +643,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             ProbeEma = EnvF("BALLISTIC_DX12_LUMEN_PROBE_EMA", 0.1f),   // this-frame weight; low = strong accumulation
             TexelDim = scene.TexelDim,
             SpPad1 = EnvF("BALLISTIC_DX12_LUMEN_PROBE_FILTER_RADIUS", 2f),   // probe-space spatial filter radius (blob fix)
-        };
-        *(LumenSun*)spSunCbMapped = new LumenSun
+        });
+        spSunCb.Write(new LumenSun
         {
             SunDir = sunDirN, SunBias = 0.03f, SunColor = ctx.LightColor, LightCount = clusteredLights.LightCount,
-        };
+        });
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Dx12DescriptorHeap bindless = Dx12Backend.BindlessHeap;
@@ -687,8 +687,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
 
         void SetCommonRoots(ID3D12GraphicsCommandList cl)
         {
-            cl.SetComputeRootConstantBufferView(0, spProbeCb.GPUVirtualAddress);
-            cl.SetComputeRootConstantBufferView(1, spSunCb.GPUVirtualAddress);
+            cl.SetComputeRootConstantBufferView(0, spProbeCb.Gpu);
+            cl.SetComputeRootConstantBufferView(1, spSunCb.Gpu);
             cl.SetComputeRootShaderResourceView(2, sceneAS.TlasAddress);                  // t0 TLAS (root SRV)
             cl.SetComputeRootDescriptorTable(3, bindless.Gpu(SpTableBase));               // t1-t6 + u1 atlas
             cl.SetComputeRootShaderResourceView(4, ctx.GpuDriven.MaterialsGpuAddress);    // t7 GpuMaterials
@@ -839,14 +839,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             RootSignature = traceRootSig, ComputeShader = cs,
         });
 
-        int cbSize = (Marshal.SizeOf<LumenConstants>() + 255) & ~255;
-        traceCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        traceCbMapped = traceCb.Map<byte>(0);
-        int sunSize = (Marshal.SizeOf<LumenSun>() + 255) & ~255;
-        sunCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)sunSize), ResourceStates.GenericRead);
-        sunCbMapped = sunCb.Map<byte>(0);
+        traceCb = new Dx12FrameCb<LumenConstants>(dev);
+        sunCb = new Dx12FrameCb<LumenSun>(dev);
 
         // --- combine root sig: CBV b0 (AoStrength) + 5-SRV table (E / albedo / material / depth / GTAO) + clamp
         // sampler. Additive PSO. ---
@@ -881,10 +875,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
 
         combineSrv = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 10, shaderVisible: true, framesInFlight: dev.FramesInFlight);
-        int combCbSize = (Marshal.SizeOf<CombineConstants>() + 255) & ~255;
-        combineCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)combCbSize), ResourceStates.GenericRead);
-        combineCbMapped = combineCb.Map<byte>(0);
+        combineCb = new Dx12FrameCb<CombineConstants>(dev);
 
         BuildCardPipeline();
     }
@@ -927,10 +918,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSMain", "LumenCardLight.hlsl");
         cardPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription { RootSignature = cardRootSig, ComputeShader = cs });
 
-        int cbSize = (Marshal.SizeOf<LumenCardConstants>() + 255) & ~255;
-        cardCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        cardCbMapped = cardCb.Map<byte>(0);
+        cardCb = new Dx12FrameCb<LumenCardConstants>(dev);
 
         BuildDenoisePipeline();
     }
@@ -958,13 +946,15 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // pipelined-frame command list, so a single CB would have every pass read the LAST pass's stride (and a
         // single 4-descriptor heap Reset per pass would alias every pass's descriptors → only the last survived,
         // the rest read garbage → the GI went BLACK at passes >= 4). One CB + one 4-descriptor range PER PASS.
-        int cbSize = (Marshal.SizeOf<DenoiseConstants>() + 255) & ~255;
+        // P0b: each per-pass denoise CB is N-buffered (×FramesInFlight) so overlap can't stomp it; write+bind
+        // offset by FrameSlot. FramesInFlight==1 → offset 0 → byte-identical.
+        denoiseCbStride = (Marshal.SizeOf<DenoiseConstants>() + 255) & ~255;
         denoiseCbs = new ID3D12Resource[MaxDenoisePasses];
         denoiseCbMappedArr = new System.IntPtr[MaxDenoisePasses];
         for (int i = 0; i < MaxDenoisePasses; i++)
         {
             denoiseCbs[i] = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-                ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+                ResourceDescription.Buffer((ulong)(denoiseCbStride * dev.FramesInFlight)), ResourceStates.GenericRead);
             unsafe { denoiseCbMappedArr[i] = (System.IntPtr)denoiseCbs[i].Map<byte>(0); }
         }
         denoiseSrv = new Dx12DescriptorHeap(dev,
@@ -997,10 +987,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             RootSignature = tempRootSig,
             ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSTemporal", "LumenTemporal.hlsl"),
         });
-        int cbSize = (Marshal.SizeOf<TemporalConstants>() + 255) & ~255;
-        tempCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        tempCbMapped = tempCb.Map<byte>(0);
+        tempCb = new Dx12FrameCb<TemporalConstants>(dev);
         tempSrv = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 8,
             shaderVisible: true, framesInFlight: dev.FramesInFlight);
@@ -1081,14 +1068,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSProbeFilter", "LumenScreenProbe.hlsl"),
         });
 
-        int pcSize = (Marshal.SizeOf<ProbeConstants>() + 255) & ~255;
-        spProbeCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)pcSize), ResourceStates.GenericRead);
-        spProbeCbMapped = spProbeCb.Map<byte>(0);
-        int snSize = (Marshal.SizeOf<LumenSun>() + 255) & ~255;
-        spSunCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)snSize), ResourceStates.GenericRead);
-        spSunCbMapped = spSunCb.Map<byte>(0);
+        spProbeCb = new Dx12FrameCb<ProbeConstants>(dev);
+        spSunCb = new Dx12FrameCb<LumenSun>(dev);
         // (No separate descriptor heap: u2 indirect + t13 atlas history live in the ONE bindless heap at the
         // screen-probe tail — a second shader-visible heap can't be bound simultaneously.)
     }
@@ -1096,6 +1077,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     const int MaxDenoisePasses = 5;
     ID3D12Resource[] denoiseCbs;
     System.IntPtr[] denoiseCbMappedArr;
+    int denoiseCbStride;        // P0b: 256-aligned per-frame slab stride (each denoiseCb is ×FramesInFlight)
+    long DenoiseCbOffset => (long)dev.FrameSlot * denoiseCbStride;   // 0 when overlap off
 
     // P7 #1b — the indirect E (trace) + the denoise scratch run at HALF render resolution (the dominant cost in
     // the baseline was this geometry-independent full-res trace+denoise floor, ~1.2ms; diffuse indirect is
