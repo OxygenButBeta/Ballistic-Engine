@@ -42,7 +42,7 @@ cbuffer LumenConstants : register(b0) {
     float2 TexelSize;   float RayCount;  float FrameIndex;   // 1/res; hemisphere rays per pixel; rotation seed
     float NormalBias;   float MaxRayDist; float UseCards;   float ScreenSteps;   // bias; world ray length; >0.5 = sample cards on RT hit; screen march
     float SkyIntensity; float UseSky;    float UseScreenTrace; float ScreenRange;   // sky-miss scale; >0.5 sky; >0.5 screen-trace; contact range (m)
-    float HistoryValid; float ProbeAlpha; float ImportanceSampling; float Pad1;   // #3 temporal; #4 sun-importance (>0.5 on)
+    float HistoryValid; float ProbeAlpha; float ImportanceSampling; float FalloffDist;   // #3 temporal; #4 importance; falloff half-distance (m)
     float4x4 PrevViewProj;   // #3: previous-frame UNJITTERED view*proj (world→prev clip) for camera-robust reprojection
 };
 cbuffer LumenSun : register(b1) {
@@ -279,20 +279,25 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
         q.TraceRayInline(Scene, 0, 0xFF, ray);
         q.Proceed();
         if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+            // DISTANCE FALLOFF — indirect from a FAR hit contributes less. Physically the angular coverage of a
+            // distant surface shrinks, and without it an interior surface's long rays reach the sun-lit OUTSIDE and
+            // wash the interior with exterior light (the Bistro "outside light leaking in" glow). exp falloff:
+            // full at the surface, halving every FalloffDist metres. Near bounce / color-bleed is untouched; only
+            // the long-range over-contribution is damped. FalloffDist<=0 disables (uniform, the old behaviour).
+            float hitT = q.CommittedRayT();
+            float falloff = (FalloffDist > 0.01) ? exp2(-hitT / FalloffDist) : 1.0;
             if (UseCards > 0.5) {
                 // #2A: SAMPLE the surface card at the hit triangle's CLUSTER RECORD (the lit radiance the card-
-                // light pass wrote per cluster) — no per-hit relighting. record = instance.ClusterOffset + the
-                // local cluster of the hit triangle. Diffuse GI is low-frequency, so the cluster's single radiance
-                // reads identically to per-triangle on the receiver.
+                // light pass wrote per cluster) — no per-hit relighting.
                 uint inst = q.CommittedInstanceID();
                 LumenInstanceMeta meta = InstanceMeta[inst];
                 uint record = meta.ClusterOffset + TriToCluster[meta.TriOffset + q.CommittedPrimitiveIndex()];
-                sum += CardRadiance[record].rgb;
+                sum += CardRadiance[record].rgb * falloff;
             } else {
                 // A/B fallback (BALLISTIC_DX12_LUMEN_NOCARDS=1): re-shade the hit directly (the P2 path).
-                float3 hitPos = origin + dir * q.CommittedRayT();
+                float3 hitPos = origin + dir * hitT;
                 sum += ShadeHit(q.CommittedInstanceID(), q.CommittedPrimitiveIndex(),
-                                q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), dir, hitPos);
+                                q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), dir, hitPos) * falloff;
             }
         } else if (UseSky > 0.5) {
             // 3) Ray escaped → sky/IBL irradiance in that direction.

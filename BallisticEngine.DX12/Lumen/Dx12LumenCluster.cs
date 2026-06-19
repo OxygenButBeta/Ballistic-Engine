@@ -85,6 +85,16 @@ internal static class Dx12LumenCluster
         var subEndTri = BuildSubmeshTriEnds(mesh, triCount);
         int subCursor = 0;
 
+        // Spatial-split state: a cluster must not span a large distance, else it groups triangles on OPPOSITE
+        // sides of a thin wall (or two parallel walls) that share a normal — its single radiance then LEAKS
+        // through the wall (measured: cluster leak was the dominant GI hotspot, ~6%). Split when a triangle's
+        // centroid is farther from the cluster's first-triangle centroid than `spatialSplit`. The threshold is
+        // sized from the mesh extent so it adapts to scene scale (big level vs a prop).
+        float meshExtent = MeshExtent(verts);
+        float spatialSplit = meshExtent * SpatialSplitFraction;   // a cluster spans at most this world distance
+        float spatialSplitSq = spatialSplit * spatialSplit;
+        Vector3 clusterSeedCentroid = Vector3.Zero;
+
         for (int t = 0; t < triCount; t++)
         {
             // Advance the submesh cursor; a boundary forces a fresh cluster (never mix materials in one record).
@@ -92,6 +102,7 @@ internal static class Dx12LumenCluster
             while (subCursor < subEndTri.Count && t >= subEndTri[subCursor]) { subCursor++; submeshBoundary = true; }
 
             Vector3 n = TriNormal(verts, indices, t);
+            Vector3 c = TriCentroid(verts, indices, t);
 
             bool startNew = cluster < 0 || inCluster >= target || submeshBoundary;
             if (!startNew && inCluster > 0)
@@ -101,6 +112,9 @@ internal static class Dx12LumenCluster
                 float la = avg.Length();
                 if (la > 1e-6f && Vector3.Dot(avg / la, n) < creaseCos)
                     startNew = true;
+                // Spatial check: too far from where the cluster started → it would span a wall → split.
+                else if (Vector3.DistanceSquared(c, clusterSeedCentroid) > spatialSplitSq)
+                    startNew = true;
             }
 
             if (startNew)
@@ -108,6 +122,7 @@ internal static class Dx12LumenCluster
                 cluster++;
                 inCluster = 0;
                 clusterNormalSum = Vector3.Zero;
+                clusterSeedCentroid = c;   // the new cluster's spatial anchor
                 firstTri.Add(t);   // this triangle is the new cluster's representative
             }
             triToCluster[t] = cluster;
@@ -137,5 +152,25 @@ internal static class Dx12LumenCluster
         Vector3 n = Vector3.Cross(p1 - p0, p2 - p0);
         float l = n.Length();
         return l > 1e-12f ? n / l : Vector3.UnitY;
+    }
+
+    static Vector3 TriCentroid(Vector3[] verts, uint[] indices, int tri) =>
+        (verts[indices[tri * 3 + 0]] + verts[indices[tri * 3 + 1]] + verts[indices[tri * 3 + 2]]) * (1f / 3f);
+
+    // A cluster spans at most this fraction of the mesh's bounding-box diagonal — caps how far apart triangles in
+    // one record may be, so a record never bridges a thin wall (front+back) or two parallel walls. Small enough to
+    // stop leaks, large enough to keep clusters near the tri-count target on big flat surfaces. Env-tunable.
+    static float SpatialSplitFraction =>
+        float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_CLUSTER_SPAN"), out float v) && v > 0
+            ? v : 0.03f;
+
+    // Bounding-box diagonal of the mesh in object space (the scale the spatial split is relative to).
+    static float MeshExtent(Vector3[] verts)
+    {
+        if (verts.Length == 0) return 1f;
+        Vector3 lo = verts[0], hi = verts[0];
+        for (int i = 1; i < verts.Length; i++) { lo = Vector3.Min(lo, verts[i]); hi = Vector3.Max(hi, verts[i]); }
+        float d = (hi - lo).Length();
+        return d > 1e-4f ? d : 1f;
     }
 }

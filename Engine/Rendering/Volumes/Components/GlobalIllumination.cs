@@ -30,6 +30,12 @@ public sealed class GlobalIllumination : VolumeComponent {
     [Tooltip("Accumulate multi-bounce in the surface-card radiance cache (light bounces more than once).")]
     public readonly BoolParameter multiBounce = new(true);
 
+    [Tooltip("Indirect-light half-distance in metres: a bounce from a hit D metres away is scaled by 2^(-D/this). " +
+             "Lower it in semi-open interiors (e.g. Bistro) so long rays don't drag distant EXTERIOR light inside " +
+             "(the 'outside light leaking in' glow); raise it for large open scenes that want long-range bounce. " +
+             "0 = no falloff (uniform, can over-light interiors).")]
+    public readonly ClampedFloatParameter falloffDistance = new(16f, 0f, 64f);
+
     [Tooltip("How much the AmbientOcclusion volume's GTAO darkens the GI's contact shading. The ray trace " +
              "already has macro occlusion, so this is a partial contact-detail term (0 = none, 1 = full GTAO).")]
     public readonly ClampedFloatParameter aoStrength = new(0.5f, 0f, 1f);

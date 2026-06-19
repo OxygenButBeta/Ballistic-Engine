@@ -114,7 +114,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public Vector2 TexelSize; public float RayCount; public float FrameIndex;
         public float NormalBias; public float MaxRayDist; public float UseCards; public float ScreenSteps;
         public float SkyIntensity; public float UseSky; public float UseScreenTrace; public float ScreenRange;
-        public float HistoryValid; public float ProbeAlpha; public float ImportanceSampling; public float Pad1;   // #3 temporal; #4 importance
+        public float HistoryValid; public float ProbeAlpha; public float ImportanceSampling; public float FalloffDist;   // falloff half-distance (m)
         public Matrix4x4 PrevViewProj;   // #3: previous-frame UNJITTERED view*proj — camera-motion-robust probe reprojection
     }
 
@@ -207,6 +207,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             // ReSTIR) — too big a lift for the marginal gain now that temporal accumulation already cleans the
             // grain. Kept opt-in (BALLISTIC_DX12_LUMEN_IMPORTANCE=1) for genuinely sun-dominant scenes.
             ImportanceSampling = EnvF("BALLISTIC_DX12_LUMEN_IMPORTANCE", 0f),
+            // Distance falloff half-distance (the GlobalIllumination volume's falloffDistance; env overrides for
+            // A/B): indirect from a hit `d` m away is scaled by 2^(-d/FalloffDist). Stops long interior rays from
+            // dragging in distant exterior (sun-lit) light — the "outside light leaks in" glow — while leaving
+            // near-field bounce/color-bleed intact. 0 = off.
+            FalloffDist = EnvF("BALLISTIC_DX12_LUMEN_FALLOFF", fx.LumenFalloffDistance),
             PrevViewProj = Matrix4x4.Transpose(ctx.PrevViewProjUnjittered),   // world → prev clip (HLSL column-major)
         };
         *(LumenSun*)sunCbMapped = new LumenSun
