@@ -95,7 +95,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     Dx12DescriptorHeap combineSrv;      // 5 SRVs per pass (E/albedo/material/depth/GTAO)
 
     [StructLayout(LayoutKind.Sequential)]
-    struct CombineConstants { public float AoStrength; public float Pad0, Pad1, Pad2; }
+    struct CombineConstants { public float AoStrength; public Vector2 IndirectTexel; public float Pad0; }   // IndirectTexel = 1/half-res for the depth-aware upsample
 
     [StructLayout(LayoutKind.Sequential)]
     struct LumenConstants
@@ -286,7 +286,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // partial (no double-darkening of corners).
         bool aoOn = ctx.Doors.Ssao && fx.SSAOEnabled;
         float aoStrength = aoOn ? EnvF("BALLISTIC_DX12_LUMEN_AO", fx.LumenAoStrength) : 0f;
-        *(CombineConstants*)combineCbMapped = new CombineConstants { AoStrength = aoStrength };
+        *(CombineConstants*)combineCbMapped = new CombineConstants
+        {
+            AoStrength = aoStrength,
+            IndirectTexel = new Vector2(1f / indirect.Width, 1f / indirect.Height),   // half-res texel for the upsample
+        };
         combineSrv.Reset();
         int cb = combineSrv.AllocateRange(5);
         dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 0), indirectFiltered.ColorSrvCpu, heapType);  // t0 E (denoised)
@@ -546,8 +550,13 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         var srv = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 3, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 0);
         var uav = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 3);
         var table = new RootParameter1(new RootDescriptorTable1(srv, uav), ShaderVisibility.All);
+        var dnSamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
+        {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
+            AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1, ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
         denoiseRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, table })));
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, table }, new[] { dnSamp })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumenGi.hlsl");
         byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSDenoise", "LumenGi.hlsl");
@@ -561,15 +570,27 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
-    // The indirect buffer + the (unused-in-P2) scratch reallocate with the render resolution. Full-res for now
-    // (half-res + depth-aware upsample is a P4 perf follow-up). Committed (cross-pass scratch; never pooled).
+    // P7 #1b — the indirect E (trace) + the denoise scratch run at HALF render resolution (the dominant cost in
+    // the baseline was this geometry-independent full-res trace+denoise floor, ~1.2ms; diffuse indirect is
+    // low-frequency so half-res is visually free with a depth-aware upsample in the combine). The combine still
+    // reads the FULL-res G-buffer (albedo/depth/AO) and depth-aware-upsamples the half-res E. fullW/fullH are
+    // kept so the combine knows the upsample ratio. BALLISTIC_DX12_LUMEN_RESSCALE overrides (1 = full-res A/B,
+    // 2 = half (default), 4 = quarter). Committed (cross-pass scratch; never pooled).
+    int fullW, fullH;
     public void Resize(int w, int h)
     {
+        fullW = Math.Max(1, w); fullH = Math.Max(1, h);
+        // Default FULL-res. Measured on RX 9070 XT: half/quarter-res gave NO perf win (Lumen cost here is RT-
+        // traversal/dispatch-bound, not pixel-bound) but DID cost quality (Cornell/Bistro hotspot ~5-8%). So the
+        // scale stays opt-in (BALLISTIC_DX12_LUMEN_RESSCALE=2/4) for 4K / weak-GPU cases where pixel count bites;
+        // the depth-aware upsample + UV-sampled trace/denoise are kept so it's correct when enabled.
+        int scale = Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_RESSCALE", 1f), 1, 4);
+        int lw = Math.Max(1, fullW / scale), lh = Math.Max(1, fullH / scale);
         indirect?.Dispose();
         indirectFiltered?.Dispose();
-        indirect = new Dx12OffscreenTarget(dev, Math.Max(1, w), Math.Max(1, h), withDepth: false,
+        indirect = new Dx12OffscreenTarget(dev, lw, lh, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
-        indirectFiltered = new Dx12OffscreenTarget(dev, Math.Max(1, w), Math.Max(1, h), withDepth: false,
+        indirectFiltered = new Dx12OffscreenTarget(dev, lw, lh, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
     }
 

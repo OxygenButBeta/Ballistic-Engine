@@ -219,14 +219,18 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
     uint W = (uint)round(1.0 / TexelSize.x), H = (uint)round(1.0 / TexelSize.y);
     if (px.x >= W || px.y >= H) return;
 
-    float depth = Depth[px];
+    // P7 #1b — the trace runs at (possibly) HALF the G-buffer resolution. `px` indexes the LOW-res indirect
+    // buffer; `uv` (half-res texel center) maps to the full UV, so depth/normal must be UV-SAMPLED, not integer-
+    // loaded (an integer load would read full-res texel `px`, i.e. the wrong place). A half-res pixel legitimately
+    // represents its 2x2 full-res block; the combine's depth-aware upsample restores the full-res silhouette.
+    float2 uv = (float2(px) + 0.5) * TexelSize;
+    float depth = Depth.SampleLevel(LinearClamp, uv, 0).r;
     if (depth >= 1.0) { Indirect[px] = float4(0, 0, 0, 1); return; }   // sky: no indirect receiver
 
-    float3 nWorld = Normal[px].rgb * 2.0 - 1.0;
+    float3 nWorld = Normal.SampleLevel(LinearClamp, uv, 0).rgb * 2.0 - 1.0;
     if (dot(nWorld, nWorld) < 0.1) { Indirect[px] = float4(0, 0, 0, 1); return; }
     float3 N = normalize(nWorld);
 
-    float2 uv = (float2(px) + 0.5) * TexelSize;
     float3 worldPos = WorldFromUvDepth(uv, depth);
     float3 origin = worldPos + N * NormalBias;
 
@@ -287,9 +291,10 @@ Texture2D<float4> DnIn     : register(t0);
 Texture2D<float>  DnDepth  : register(t1);
 Texture2D<float4> DnNormal : register(t2);
 RWTexture2D<float4> DnOut  : register(u0);
+SamplerState DnLinearClamp : register(s0);   // P7 #1b: G-buffer is full-res, the E buffer is half-res → UV-sample
 
 cbuffer DenoiseConstants : register(b0) {
-    float2 DnTexel; float DnStep; float DnEnabled;   // 1/res; tap stride (px); >0.5 = blur (else passthrough)
+    float2 DnTexel; float DnStep; float DnEnabled;   // 1/res (of the HALF-res E buffer); tap stride (px); >0.5 = blur
 };
 
 [numthreads(8, 8, 1)]
@@ -298,12 +303,15 @@ void CSDenoise(uint3 dtid : SV_DispatchThreadID) {
     uint W = (uint)round(1.0 / DnTexel.x), H = (uint)round(1.0 / DnTexel.y);
     if (px.x >= W || px.y >= H) return;
 
+    // P7 #1b — px indexes the HALF-res E buffer (integer load OK for DnIn). depth/normal are FULL-res, so they
+    // are UV-sampled at the half-res texel center (uvC) and per-tap (uvQ).
+    float2 uvC = (float2(px) + 0.5) * DnTexel;
     float3 c = DnIn[px].rgb;
     if (DnEnabled < 0.5) { DnOut[px] = float4(c, 1); return; }
 
-    float dC = DnDepth[px];
+    float dC = DnDepth.SampleLevel(DnLinearClamp, uvC, 0).r;
     if (dC >= 1.0) { DnOut[px] = float4(c, 1); return; }   // sky — nothing to filter
-    float3 nC = DnNormal[px].rgb * 2.0 - 1.0;
+    float3 nC = DnNormal.SampleLevel(DnLinearClamp, uvC, 0).rgb * 2.0 - 1.0;
 
     float3 sum = 0.0.xxx; float wsum = 0.0;
     int r = 2; float stride = max(DnStep, 1.0);
@@ -311,9 +319,10 @@ void CSDenoise(uint3 dtid : SV_DispatchThreadID) {
     [unroll] for (int dx = -2; dx <= 2; dx++) {
         int2 q = int2(px) + int2(dx, dy) * (int)stride;
         if (q.x < 0 || q.y < 0 || q.x >= (int)W || q.y >= (int)H) continue;
-        float dq = DnDepth[q];
+        float2 uvQ = (float2(q) + 0.5) * DnTexel;
+        float dq = DnDepth.SampleLevel(DnLinearClamp, uvQ, 0).r;
         if (dq >= 1.0) continue;
-        float3 nq = DnNormal[q].rgb * 2.0 - 1.0;
+        float3 nq = DnNormal.SampleLevel(DnLinearClamp, uvQ, 0).rgb * 2.0 - 1.0;
         // Bilateral weights: gaussian spatial * normal similarity * depth similarity (linear-ish window depth).
         float wSpatial = exp(-float(dx * dx + dy * dy) / 4.0);
         float wNormal = pow(saturate(dot(nC, nq)), 32.0);
@@ -344,8 +353,32 @@ Texture2D<float>  CombineDepth : register(t3);
 Texture2D<float>  GtaoTex    : register(t4);   // screen-space GTAO (1 = unoccluded); AmbientOcclusion volume
 
 cbuffer CombineConstants : register(b0) {
-    float AoStrength; float CombinePad0, CombinePad1, CombinePad2;   // how much GTAO bites the GI (0..1)
+    float AoStrength; float2 IndirectTexel; float CombinePad0;   // GTAO bite (0..1); 1/half-res for the upsample
 };
+
+// P7 #1b — DEPTH-AWARE UPSAMPLE of the half-res indirect E (the SSR-combine pattern). The E buffer is rendered
+// at a fraction of the G-buffer resolution; a plain bilinear sample bleeds indirect across silhouettes (a wall's
+// GI leaks onto the floor in front of it). Weight each of the 4 nearest half-res taps by bilinear × depth
+// similarity to the FULL-res center depth, so a tap on the wrong surface is rejected → crisp edges from a coarse
+// buffer. When IndirectTexel matches full-res (RESSCALE=1) this degrades to a plain bilinear fetch (taps coincide).
+float3 UpsampleIndirect(float2 uv, float centerDepth) {
+    float2 lowSize = 1.0 / IndirectTexel;
+    float2 pos = uv * lowSize - 0.5;
+    float2 baseUV = (floor(pos) + 0.5) * IndirectTexel;
+    float2 f = frac(pos);
+    float3 acc = 0.0.xxx; float wSum = 0.0;
+    [unroll] for (int k = 0; k < 4; k++) {
+        float2 corner = float2(k & 1, k >> 1);
+        float2 tuv = baseUV + corner * IndirectTexel;
+        float wBilinear = (corner.x > 0.5 ? f.x : 1.0 - f.x) * (corner.y > 0.5 ? f.y : 1.0 - f.y);
+        float tapDepth = CombineDepth.SampleLevel(LinearClamp, tuv, 0).r;
+        float wDepth = 1.0 / (1.0 + abs(tapDepth - centerDepth) * 4000.0);   // depth is non-linear [0,1] → tight tol
+        float w = wBilinear * wDepth + 1e-5;
+        acc += Sanitize(IndirectIn.SampleLevel(LinearClamp, tuv, 0).rgb) * w;
+        wSum += w;
+    }
+    return acc / wSum;
+}
 
 struct VSOut { float4 Position : SV_Position; float2 Uv : TEXCOORD0; };
 VSOut VSCombine(uint vid : SV_VertexID) {
@@ -359,7 +392,7 @@ VSOut VSCombine(uint vid : SV_VertexID) {
 float4 PSCombine(VSOut i) : SV_Target {
     float depth = CombineDepth.SampleLevel(LinearClamp, i.Uv, 0).r;
     if (depth >= 1.0) discard;                       // sky: leave the scene color untouched
-    float3 E = IndirectIn.SampleLevel(LinearClamp, i.Uv, 0).rgb;
+    float3 E = UpsampleIndirect(i.Uv, depth);
     float3 albedo = GAlbedo.SampleLevel(LinearClamp, i.Uv, 0).rgb;
     float matAo = GMaterial.SampleLevel(LinearClamp, i.Uv, 0).b;
     // GTAO eased by AoStrength (1 = no GTAO darkening; lerp toward the raw GTAO at full strength).
@@ -373,6 +406,6 @@ float4 PSCombine(VSOut i) : SV_Target {
 float4 PSDebugE(VSOut i) : SV_Target {
     float depth = CombineDepth.SampleLevel(LinearClamp, i.Uv, 0).r;
     if (depth >= 1.0) return float4(0, 0, 0, 1);
-    float3 E = IndirectIn.SampleLevel(LinearClamp, i.Uv, 0).rgb;
+    float3 E = UpsampleIndirect(i.Uv, depth);
     return float4(Sanitize(E), 1.0);
 }
