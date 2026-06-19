@@ -39,8 +39,7 @@ public abstract class VolumeComponent {
                 parameters[i].Parameter.Interp(source, interpFactor);
                 // Propagate the Overridden flag to the stack parameter so consumers can tell a value
                 // came from a PROFILE vs the default. Without this the stack value was correct but
-                // Overridden stayed false, so a bridge that gates on .Overridden (e.g. the GI bridge,
-                // to stop a default Lumen component clobbering GlobalIllumination) saw nothing as set.
+                // Overridden stayed false, so bridges that gate on .Overridden saw nothing as set.
                 parameters[i].Parameter.Overridden = true;
             }
         }

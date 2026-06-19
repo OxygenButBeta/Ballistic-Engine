@@ -216,6 +216,10 @@ public sealed class Dx12OffscreenTarget : IDisposable {
     public void ColorToUnorderedAccess() {
         dev.ExecuteSync(cl => TransitionTo(cl, ResourceStates.UnorderedAccess));
     }
+    // Transition the color INSIDE a caller-supplied command list (state-tracked, idempotent), so a pass can do a
+    // multi-step sequence (e.g. SRV-read → CopyDest → SRV) atomically in ONE list — separate ColorToX ExecuteSync
+    // calls split the barriers across submits. Used by the RTAO copy-back (Dx12RtaoPass).
+    public void ColorTransitionInList(ID3D12GraphicsCommandList4 cl, ResourceStates target) => TransitionTo(cl, target);
 
     // Depth state transitions for post passes that read scene depth as an SRV.
     public void DepthToShaderResource() {

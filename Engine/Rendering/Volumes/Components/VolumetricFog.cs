@@ -6,6 +6,12 @@ namespace BallisticEngine;
 // hides the scene behind it, in-scattering the atmosphere-attenuated sun (golden at dusk,
 // gone at night when a ProceduralSky drives the scene) and the baked sky's average
 // radiance as skylight — so the fog always matches the sky and clouds above it.
+//
+// SUPERSEDED by [[VolumetricLighting]] (fog + independent god rays + dust). This type is kept and stays
+// fully functional (the VolumePostProcessing bridge still reads it, so existing scenes/profiles using it
+// render unchanged), but it is HIDDEN from the editor's Add Override menu so new content uses the unified
+// override and the two can't both be added by hand.
+[Component(HideFromAddMenu = true)]
 public sealed class VolumetricFog : VolumeComponent {
     public readonly BoolParameter enabled = new(false);
 

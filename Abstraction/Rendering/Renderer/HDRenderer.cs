@@ -19,7 +19,7 @@ public abstract class HDRenderer {
     public enum DebugView { Shaded, Wireframe, Normals, Depth }
     public DebugView DebugViewMode { get; set; } = DebugView.Shaded;
 
-    // EDITOR-ONLY extra debug visualisations (AO / lit-no-tonemap / SSGI / ... ) live in the EDITOR
+    // EDITOR-ONLY extra debug visualisations (AO / lit-no-tonemap / ... ) live in the EDITOR
     // project, not here, so they never ship in a player build. The renderer exposes this frame's
     // buffers through DebugFrame and asks EditorDebugComposite to draw — if it returns true it took
     // over the composite, otherwise the normal composite runs. The hook is null in the player (nothing
@@ -30,7 +30,7 @@ public abstract class HDRenderer {
     // editor debug composite is a Phase 7 concern (editor → DX12). Not part of the runtime display
     // contract (that's SceneColorHandle/GameColorHandle, now backend-agnostic).
     public struct DebugFrame {
-        public int NormalTexture, DepthTexture, AoTexture, LitColor, SsgiTexture;   // GL texture ids (editor-debug, Phase 7)
+        public int NormalTexture, DepthTexture, AoTexture, LitColor;   // GL texture ids (editor-debug, Phase 7)
         public int DestWidth, DestHeight;
         public bool PresentToScreen;     // true = draw into FB 0 (player); false = the editor display FBO
         public Matrix4 InvProjection;
@@ -45,13 +45,6 @@ public abstract class HDRenderer {
     // can read it without an editor reference; it's never set in the player. (DX12 extra-view compositing
     // is not yet ported — see EditorDebugViews; the built-in DebugViewMode path works.)
     public static int EditorExtraDebugMode;
-
-    // GI per-system ISOLATE for editor A/B debugging: 0 = normal (all systems per their overrides),
-    // 1 = ONLY light probes, 2 = ONLY reflection probes, 3 = ONLY Lumen. The renderer forces the other
-    // two systems off when non-zero (applied AFTER the volume stack, like the env overrides) so you can
-    // see exactly what each GI system contributes. Editor-set; never touched in the player.
-    public enum GiIsolate { None, Probes, Reflections, Lumen }
-    public static GiIsolate EditorGiIsolate;
 
     // HDR -> display tunables (tonemap, bloom, SSAO, MSAA, grading). Shared by all targets.
     public PostProcessSettings PostFX { get; } = new();

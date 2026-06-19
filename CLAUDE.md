@@ -59,9 +59,9 @@ behave exactly like human edits. The pipe thread is engine-owned: survives scrip
 | `Shared/`, `ToolKit/` | BCL only | everything else |
 | `Abstraction/` | Shared, OpenTK.Mathematics | GL calls, file formats |
 | `Engine/` | Abstraction, Shared | Assimp/Stb/Magick, asset file I/O |
-| `OpenGL/` | Abstraction, Engine types, GL | Assimp/Stb/Magick |
-| `Physics/` | Abstraction, BepuPhysics | GL, Assimp/Stb/Magick, Engine internals |
-| `AssetPipeline/` | everything + Assimp/Stb/Magick/STJ | GL calls (GPU upload goes through `RenderAsset`) |
+| `BallisticEngine.DX12/` | Abstraction, Engine types, Vortice/DX12 | Assimp/Stb/Magick |
+| `Physics/` | Abstraction, BepuPhysics | Assimp/Stb/Magick, Engine internals |
+| `AssetPipeline/` | everything + Assimp/Stb/Magick/STJ | GPU upload goes through `RenderAsset` |
 
 `AssetPipeline/` is the ONLY place allowed to reference AssimpNet/StbImageSharp/Magick.NET;
 `Physics/` is the ONLY place allowed to reference BepuPhysics (engine components talk through
@@ -273,97 +273,41 @@ loop returns or the process never exits.
 - No-code-change fallback: `dotnet-trace collect --process-id <pid> -f speedscope` (sampling,
   no frame markers) — view at speedscope.app.
 
-## Renderer pipeline (2026-06 overhaul — invariants that must not regress)
+## Renderer pipeline (DX12/DXR — invariants that must not regress)
 
-> ⚠ **HISTORICAL (GL-era) from here down.** The OpenGL backend (`OpenGL/`) described below was DELETED
-> in the DX12 migration (C3) — these `OpenGL/...` paths, GLSL files, `GL.*`/`glMultiDraw*` calls and OpenTK
-> GL types NO LONGER EXIST. The live renderer is **DX12/DXR** (`BallisticEngine.DX12/`, `.hlsl` shaders
-> embedded there); it deliberately MIRRORS the frame shape + invariants documented below (z-prepass
-> invariance, cull determinism, transient-RT pooling, TAA-is-the-AA, the post chain), so this section is
-> kept as the conceptual contract the DX12 passes must still honour — just read every GL/GLSL detail as
-> "the DX12 equivalent." DX12-specific notes (pass-graph, Lumen GI, exposure, P0a pipelined frame) live in
-> the `Docs/Plans/dx12-*` plans + the agent-memory topic files.
+> Live backend = **DX12/DXR** (`BallisticEngine.DX12/`, `.hlsl` embedded there). The GL backend is gone;
+> the OLD GL-era detail (GLSL paths, `GL.*`/MDI, GLHiZPass, GLSLShaderUtilities) was removed from this
+> doc — it no longer existed. DX12 mirrors the SAME frame shape + invariants below. Deep DX12-specific
+> notes (pass-graph, Lumen GI, exposure, P0a pipelined frame, GPU-driven ExecuteIndirect) live in the
+> `Docs/Plans/dx12-*` plans + the agent-memory topic files — read those before touching a DX12 pass.
 
-- **GPU-driven path (MDI + compute cull + bindless, 2026-06, `OpenGL/Rendering/GpuDriven/` — GL-era, deleted; DX12 uses ExecuteIndirect)**: the
-  WHOLE-MESH renderer (Bistro, ~1600 submeshes, `SubMeshIndex < 0`, non-skinned, single shader) is
-  drawn via `glMultiDrawElementsIndirectCount` after a GPU compute frustum cull, collapsing ~1600
-  `DrawElements` into a handful of MDI calls (CPU submit was THE bottleneck: 30ms CPU vs 12ms GPU,
-  6070 draws). Per-submesh/instanced/skinned/mixed-shader renderers keep the CPU path.
-  - `GpuDrivenRenderer` owns the buffers; `GpuCull_Comp.glsl` does the cull (positive-vertex AABB
-    test, world AABBs **pre-transformed on the CPU with the same 8-corner loop** as
-    `ComputeSubmeshVisibility` so it's bit-identical to `AabbInFrustum`). `GLPersistentBuffer` =
-    GL4.6 persistent-mapped triple-buffered fence-synced streaming. `GpuMaterialTable` = bindless
-    handles (`GL_ARB_bindless_texture`) so different materials batch into ONE draw; missing maps
-    use `DefaultTextures.Neutral` + the global metallic/roughness/normal multipliers, exactly
-    like CPU `SetMaterialUniforms`.
-  - `GpuDrivenShaderTransform` INJECTS the per-draw model (`PerDrawData[gl_DrawIDARB]`) + bindless
-    material reads into each material's OWN vert+frag GLSL by `#define` — shading is bit-identical
-    to the uniform path, so z-prepass invariance holds (prepass + opaque share the deterministic
-    cull). Bumps `#version` to 460. Prepass frag MUST reuse `SharedDecls` (cross-stage block names
-    must match). The transform must NOT touch shading math.
-  - **Two batches**: SOLID (backface cull on) + CUTOUT (cull off — single-sided foliage), separate
-    cmd/count/perdraw buffers to avoid the write-after-read hazard. The cull binds the COMPUTE
-    program, so re-activate the render program AFTER culls, before the MDI draws.
-  - `BALLISTIC_GPUDRIVEN=0` → CPU path (byte-identical fallback). Auto-disables without bindless/
-    draw-params. Verified byte-identical (meanError 0) deterministic full-FX, draws 420→3.
-  - GPU-driven shadows: DEFAULT ON (`BALLISTIC_GPUDRIVEN_SHADOWS=0` to disable). One MDI per cascade
-    after a light-space compute cull — collapses the ~2358 (move-time ~11000) CPU shadow depth draws
-    to ~10 when cascade caching invalidates on camera motion. Byte-identical to the CPU shadow path
-    (the bit-exact world-AABB cull + program state-leak fix). When the whole-mesh renderer is GPU-
-    driven for BOTH camera and shadows, the CPU per-submesh cull (`ComputeSubmeshVisibility`) is
-    skipped entirely — the GPU cull replaces it.
-  - Hi-Z OCCLUSION CULLING: DEFAULT ON (`BALLISTIC_GPUDRIVEN_HIZ=0` to disable). `GLHiZPass` builds
-    a MAX-depth mip pyramid (`HiZ_Down.glsl`) from the PREVIOUS frame's depth; the cull
-    (`occludedByHiZ`) drops submeshes whose whole AABB is behind a closer occluder, comparing in
-    LINEAR view distance (window depth bunches near the far plane — direct compare over-culls) with a
-    0.25 m bias. A camera-delta gate disables it one frame after a big jump (stale-depth hole safety);
-    shadows never use it. Byte-identical (0% pixel diff): Sun Temple 1000→473 draws, Bistro ~814→719.
-    GOTCHA: the pyramid build MUST detach its color attachment + restore unit-0 binding + re-enable
-    DepthTest/CullFace, or it corrupts the later passes (sky/SSGI/SSR) even when nothing is culled.
-  - Gotcha: route any NEW compute-shader compile through `GLSLShaderUtilities.ToAscii` (an em-dash
-    in a comment truncates the source → "unexpected end of file"). Whole-mesh model = plain
-    `WorldMatrix` for ALL submeshes (NOT inverse-node — that's per-submesh-renderer only).
-- **Frame shape (single path, no MSAA)**: cull → cascaded shadows (cached) → z-prepass →
-  SSAO → opaque (LEqual, no depth writes) → sky → transparent → SSGI → SSR → volumetric →
-  TAA → exposure meter → bloom → composite. TAA **is** the AA; the MSAA path was deleted
-  (the AntiAliasing volume's MSAA setting is inert).
-- **Z-prepass contract**: `GLSLShaderUtilities` injects `invariant gl_Position;` into EVERY
-  vertex shader; the prepass re-renders visible opaques with each material's OWN vertex
-  source (depth-only companion programs, `PrepassShaderFor`) so prepass depth is bit-identical
-  and the main pass shades each pixel exactly once (DepthFunc LEqual + DepthMask false).
-  Breaking invariance = checkerboard holes. Instanced runs MUST draw instanced in BOTH passes.
-- **Culling**: `SplitRenderables` computes per-renderer world AABBs (per-SUBMESH local bounds —
-  whole-mesh bounds would make split-by-nodes culling useless) and frustum-culls the main view;
-  shadow casters cull per cascade / per punctual face against the light frustums. The FULL
-  opaque list still feeds shadows and bakes — an off-screen mesh still casts shadows.
-- **Cascade caching**: sun cascades re-render only when the texel-snapped fit matrix OR the
-  scene-geometry stamp (hash of all caster AABBs) changes. Static camera = all four free.
-  Punctual tiles were already stamp-cached.
-- **PassData UBO**: ALL pass constants live in one std140 block (`PassData`, binding 0),
-  declared TEXTUALLY IDENTICALLY in Vert.glsl + Frag.glsl, filled once per pass by
-  `GLUniformBlock` (offsets are QUERIED from the program, never hand-computed). Member names
-  match the old uniforms. Samplers can't live in UBOs — units are assigned once per program.
-  Shaders without the block fall back to the legacy per-uniform path (`SetPassUniformsLegacy`).
-- **Instancing is ON**: the opaque sort (material → mesh → submesh) makes identical
-  (mesh, submesh, material) runs adjacent; runs ≥ 2 stream model matrices into the mesh's
-  instance buffer (attribs 4-7) and draw `DrawElementsInstanced`. The instanced matrix is
-  built WITHOUT transpose in Vert.glsl — it must equal the uniform-path matrix exactly.
-- **Transient RT pool**: post passes `GLRenderTexturePool.Shared.Acquire()` per-frame scratch
-  (released wholesale in `EndFrame`); ONLY cross-frame history (TAA/SSGI/volumetric
-  accumulation) stays pass-owned. Never pool history.
-- **SSR marches at half-res**; SSR_Combine upsamples depth-aware. **SSGI gather = horizon
-  slices with sector visibility BITMASKS** (SSILVB-style, `SSGI_Frag.glsl`, `#version 460`):
-  per slice a 32-bit mask over the hemisphere arc gives ORDERED occlusion (near occluders
-  block far light — no scene-average veil by construction), `Thickness` = assumed occluder
-  thickness (thin geometry occludes thin sectors), and sky enters only through the visibly
-  OPEN sectors. `rayCount` now means slices (clamped to 8). (The GL-era `SsgiSkyFallback`/
-  `SsgiDenoise`/`SsgiMultiBounce` dials were dropped in the DX12 GI-volume consolidation — the
-  DX12 SSGI shader has no slot for them; OIDN replaced the a-trous denoise.) Temporal/combine
-  chain unchanged.
-- **Per-pass GPU timers** (`GLGpuTimers`, timestamp queries, non-blocking ring) publish into
-  `RenderStats.Scene/Game` with real draw/triangle/cull counters — the editor Stats overlay
-  shows them; `Transform` caches Local/World matrices with version stamps (don't bypass the
-  setters).
+Invariants the DX12 passes still honour (the conceptual contract — names below are the DX12 equivalents):
+
+- **Frame shape (single path, no MSAA, TAA is the AA)**: cull → cascaded shadows (cached) → z-prepass →
+  AO (GTAO) → opaque (LEqual, no depth writes) → sky → transparent → SSGI → SSR → GI → volumetric/fog →
+  TAA → exposure meter → bloom → composite. Event-sorted pass list (see pass-graph plan); the MSAA path
+  was deleted (the AntiAliasing volume's MSAA setting is inert).
+- **GPU-driven (ExecuteIndirect)**: the whole-mesh renderer (Bistro, ~1600 submeshes, `SubMeshIndex < 0`,
+  non-skinned) is drawn indirect after a GPU compute frustum cull + bindless material table — CPU submit
+  was the bottleneck. CPU world-AABBs are bit-identical to the GPU cull (same 8-corner loop). GPU-driven
+  shadows + Hi-Z occlusion cull DEFAULT ON. Per-submesh/instanced/skinned/mixed-shader keep the CPU path.
+  Material table is stamped by renderer+submesh count → scene swaps must clear it (`RenderSetsCleared`).
+- **Z-prepass contract**: every vertex shader is position-invariant so the prepass depth is bit-identical;
+  the main opaque pass shades each pixel once (LEqual + depth-write off). Breaking invariance = checkerboard
+  holes. Instanced runs MUST draw instanced in BOTH passes.
+- **Culling**: per-SUBMESH world AABBs (whole-mesh bounds would kill split-by-nodes culling); frustum-cull
+  the main view, cull shadow casters per cascade / punctual face. The FULL opaque list still feeds shadows
+  + bakes — an off-screen mesh still casts shadows.
+- **Cascade caching**: sun cascades re-render only when the texel-snapped fit matrix OR the caster-AABB
+  geometry stamp changes. Static camera = all four free.
+- **Transient RT pool**: post passes acquire per-frame scratch (released wholesale at EndFrame); ONLY
+  cross-frame history (TAA/SSGI/volumetric/GI accumulation) is pass-owned. NEVER pool history.
+- **SSR half-res** (depth-aware upsample). **SSGI = horizon slices with 32-bit sector visibility bitmasks**
+  (SSILVB-style): ordered occlusion (near occluders block far light — no scene-average veil), `Thickness` =
+  assumed occluder thickness, sky enters only through OPEN sectors, `rayCount` = slices (≤8). OIDN replaced
+  the a-trous denoise; the GL-era `SsgiSkyFallback`/`SsgiDenoise`/`SsgiMultiBounce` dials are gone.
+- **Per-pass GPU timers** publish into `RenderStats.Scene/Game` (real draw/triangle/cull counters; editor
+  Stats overlay). `Transform` caches Local/World with version stamps — don't bypass the setters.
 
 ## Headless verification (agents: use this)
 
@@ -377,29 +321,23 @@ loop returns or the process never exits.
 
 ## Hard-won gotchas (do not relearn these)
 
-- **ImGui backend MUST `GL.ActiveTexture(Texture0)` before binding** — the engine leaves
-  high texture units active; otherwise the entire UI samples a scene texture.
 - **Never mix raw-HDR and tonemapped samples in post shaders** (e.g. sharpen blur):
   extrapolation around the EXR sun goes negative → `pow` → NaN black holes. Tonemap first.
 - Clamp float cubemap texels below fp16 max (~65504) before RGBA16F upload (sun = Inf → NaN).
-- `GL.ShaderSource` truncates multibyte UTF-8 (Turkish comments broke shaders) —
-  `GLSLShaderUtilities.ToAscii` sanitizes; keep it in the compile path.
-- `GLFrameBuffer.Resize` deletes/recreates the texture — only resize when the size actually
-  changed or the viewport flickers.
 - Editor frame order is UI build → scene render → present, so gizmo drags don't lag a frame.
 - Asset tiles select on click RELEASE (drag must not steal the Inspector selection).
 - Editor undo = whole-scene YAML snapshots pushed BEFORE each interaction
   (`EditorUndo.Push()`; `ImGui.IsItemActivated()` for widgets).
 - Rider locks folders on Windows — `git mv`/renames of open dirs fail; copy + `git rm --cached`.
-- FSQ/post/IBL shaders are **embedded resources** (GL-era: `OpenGL/Shader/Embedded/`, deleted; DX12:
-  `.hlsl` embedded under `BallisticEngine.DX12/`), not assets. Incremental DX12 builds do NOT re-embed a
-  changed `.hlsl` — clean `obj/` + verify the embed (see memory `dx12-shader-edit-build-gotcha`).
-- **GLSL NaN scrubs MUST be a component SELECT (ternary), never `mix(v, 0, flag)`** — float
-  `mix` is arithmetic (`v*(1-flag) + 0*flag`) and `NaN*0 == NaN`, `Inf*0 == NaN`: proven leak
+- FSQ/post/IBL shaders are **embedded resources** (`.hlsl` embedded under `BallisticEngine.DX12/`),
+  not assets. Incremental DX12 builds do NOT re-embed a changed `.hlsl` — clean `obj/` + verify the
+  embed (see memory `dx12-shader-edit-build-gotcha`).
+- **HLSL NaN scrubs MUST be a component SELECT (ternary), never `lerp(v, 0, flag)`** — float
+  `lerp`/`mix` is arithmetic (`v*(1-flag) + 0*flag`) and `NaN*0 == NaN`, `Inf*0 == NaN`: proven leak
   on AMD RX 9070 XT (driver test in `%TEMP%\bal-nan-test`). The broken form turned one Inf
-  sun/specular pixel into NaN that the SSGI temporal EMA + multi-bounce + a-trous denoise grew
-  into a screen-eating black-noise field a STATIC camera could never flush (fast motion =
-  disocclusion reject = flush). Same rule applies in every temporal-feedback shader (SSGI x4, TAA).
+  sun/specular pixel into NaN that the SSGI temporal EMA + multi-bounce + OIDN grew into a
+  screen-eating black-noise field a STATIC camera could never flush (fast motion = disocclusion
+  reject = flush). Same rule applies in every temporal-feedback shader (SSGI, TAA).
 - **Bepu has no restitution — bounce = SOFT undamped contact springs** (low frequency,
   damping `1-bounciness`, uncapped recovery velocity). Stiffening the spring makes impacts
   MORE inelastic (speculative contacts absorb the approach velocity). Solver runs

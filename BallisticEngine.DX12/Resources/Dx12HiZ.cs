@@ -79,6 +79,16 @@ public sealed class Dx12HiZ : IDisposable {
         }, dst);
     }
 
+    // Drop the pyramid so the next Ensure() rebuilds it (returns true → caller re-points its bindless SRV) and
+    // its first Build() refills it from the NEW depth. Called on a scene swap: a same-resolution swap leaves
+    // Ensure() a no-op, so without this the pyramid keeps the OLD scene's depth and the occlusion cull rejects
+    // the new scene's geometry behind stale occluders (the "culling breaks after switching scenes" bug).
+    public void Invalidate() {
+        pyramid?.Dispose(); heap?.Dispose();
+        pyramid = null; heap = null;
+        width = height = mipCount = 0;
+    }
+
     // Returns true if the pyramid was (re)created (the caller must re-register any external SRV).
     public bool Ensure(int w, int h) {
         if (pyramid != null && w == width && h == height) return false;

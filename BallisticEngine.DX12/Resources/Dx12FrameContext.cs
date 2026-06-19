@@ -1,7 +1,7 @@
 using System.Numerics;
 using System.Collections.Generic;
 using Vortice.Direct3D12;         // CpuDescriptorHandle
-using BallisticEngine;            // DX12HDRenderer, PostProcessSettings, RenderStats, GiMode, IStaticMeshRenderer
+using BallisticEngine;            // DX12HDRenderer, PostProcessSettings, RenderStats, IStaticMeshRenderer
 
 namespace BallisticEngine.DX12;
 
@@ -10,13 +10,13 @@ namespace BallisticEngine.DX12;
 //
 // MUST be a MUTABLE CLASS, not an `in` readonly struct (design decision 2, correctness trap 5): a few
 // fields are MUTATED mid-frame by the orchestrator AND by passes (SceneColor follows the FSR/native +
-// back-copy branch; IblActive/Shadows/RtShadows/GiMode are resolved once mid-frame). An `in` struct
+// back-copy branch; IblActive/Shadows/RtShadows are resolved once mid-frame). An `in` struct
 // can't carry those.
 //
 // R8: genuinely read-only fields are `init`-only properties (set once at construction, never after) so a
 // phase-2 authored pass can't accidentally reassign ctx.View. Only the five fields the orchestrator
 // mutates mid-frame have public setters: SceneColor, IblActiveThisFrame, RtShadowsThisFrame,
-// ShadowsThisFrame, GiMode.
+// ShadowsThisFrame.
 public sealed class Dx12FrameContext {
     // --- camera / projection (read-only) ---
     public Matrix4x4 View                { get; init; }
@@ -115,17 +115,18 @@ public sealed class Dx12FrameContext {
     // composite-input branch + every back-copy pass uniformly.
     public Dx12OffscreenTarget SceneColor { get; set; }
 
-    // Resolved once mid-frame by the orchestrator (IBL bake succeeded / shadows ran / RT shadows ran / the
-    // GI mode after the no-RT downgrade). Passes read these instead of recomputing them.
+    // Resolved once mid-frame by the orchestrator. Passes read these instead of recomputing them.
     public bool   IblActiveThisFrame { get; set; }
     public bool   ShadowsThisFrame   { get; set; }
     public bool   RtShadowsThisFrame { get; set; }
-    public GiMode GiMode             { get; set; }
 
-    // The film-grain animation counter (DX12HDRenderer.ssgiFrame). The orchestrator SEEDS it with the
-    // un-incremented giPass.SsgiFrame just before the single graph.Execute (covers the GI-Off case); when GI
-    // runs, FillSsgiConstants overwrites it with the POST-increment value during the GI pass's Record (GI event
-    // 500 < Composite 700, so the composite sees the fresh value within one Execute — chunk 11 step-G collapse).
+    // The film-grain animation counter. The orchestrator seeds it just before the single graph.Execute.
     // The composite reads it for the non-deterministic grain phase only (frozen to 0 under DeterministicCapture).
     public int GrainFrame { get; set; }
+
+    // Monotonic per-frame counter (DX12HDRenderer.frameCounter), advanced every BeginRender regardless of
+    // which passes run — UNLIKE GrainFrame/taaFrame which only tick when SSGI/jitter are active. Drives
+    // animated effects that must move even with TAA off (the volumetric dust drift). Frozen to 0 under
+    // DeterministicCapture so paused/bal-render frames stay byte-identical.
+    public int FrameCounter { get; set; }
 }

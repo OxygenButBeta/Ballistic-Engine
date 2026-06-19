@@ -14,31 +14,12 @@ public enum MeteringMode {
     Spot,           // only a small center circle meters
 }
 
-// Reflections technique (the unified GI volume's Reflections-Mode dropdown). Off mirrors GiMode.Off so
-// the two indirect dropdowns read alike. NOTE: ScreenSpace/RayTraced keep their original ordinals (0/1)
+// Reflections technique. NOTE: ScreenSpace/RayTraced keep their original ordinals (0/1)
 // so existing .volume profiles that stored the enum BY VALUE still resolve; Off is appended last (=2).
 public enum ReflectionMode {
     ScreenSpace,   // SSR — fast, screen-bounded
     RayTraced,     // DXR — off-screen + sky reflect correctly (falls back to SSR without DXR)
     Off,           // no reflections (IBL/skybox reflection only)
-}
-
-// Global-illumination technique (the GI volume's Off/SSGI/RT-GI dropdown).
-public enum GiMode {
-    Off,           // no GI bounce
-    ScreenSpace,   // SSGI (SSILVB screen-space gather)
-    RayTraced,     // DXR ray-traced GI (off-screen-aware; falls back to SSGI without DXR)
-}
-
-// GI quality preset (the GI volume's Quality dropdown). A preset is a fixed assignment over the EXISTING
-// GI dials (SSGI slices / temporal history; the GiMode/Ddgi/ReflectionMode end-state is governed by the
-// per-preset wiring in the volume bridge) — NO new technique (GI Pragmatic Revival R3.2). Together with
-// GiMode this is THE control surface for GI: behaviour changes ONLY via GiMode + GiQuality. The fiddly
-// per-dial overrides stay under the volume's Advanced foldout. Low (No-RT survival floor) is DEFERRED
-// (plan §0/§3 — the min target is RT-capable), so the enum is the two RT tiers only.
-public enum GiQuality {
-    High,   // RTX 2060 ship target — screen-probe + SSGI + DDGI far-field + RT-refl roughness-split (4 slices, 24 history)
-    Epic,   // RTX 3070+ — more slices / longer temporal history / denser probe round-robin (8 slices, 32 history)
 }
 
 // Ambient-occlusion quality (the AmbientOcclusion volume's Quality dropdown). Drives the GTAO slice +
@@ -146,114 +127,16 @@ public sealed class PostProcessSettings {
 
     // Screen-space reflections: smooth surfaces reflect the actual scene instead of only
     // the sky cubemap. Requires the normal attachment (unavailable in the MSAA path).
-    // REFLECTIONS RE-ENABLED (GI PRAGMATIC REVIVAL R0.1, 2026-06-18): the 2026-06-18 hard-disable default-Off is
-    // reverted. These defaults are the no-volume baseline (a scene with no GlobalIllumination volume) and the
-    // volume bridge (VolumePostProcessing.Apply) overwrites them from the volume's Reflections-Mode dropdown.
-    // BAKED-ONLY DEFAULT (2026-06-18, user: "rt çözümünü tamamen devre dışı bırak, realtime bir şey istemiyorum"):
-    // NO realtime per-frame GI/reflection. Reflections off by default — specular comes from the IBL/skybox cube,
-    // not a realtime SSR/RT march. A scene that WANTS reflections turns them on via the volume's Reflections-Mode.
+    // Off by default: specular comes from the IBL/skybox cube unless a scene explicitly enables SSR/RT reflections.
     public bool SsrEnabled { get; set; } = false;
     public float SsrIntensity { get; set; } = 1f;
     public ReflectionMode ReflectionMode { get; set; } = ReflectionMode.Off;  // realtime SSR/RT reflections off by default
-
-    // Screen-space global illumination: a coarse one-bounce diffuse gather that adds
-    // indirect fill light from sunlit on-screen surfaces into shadowed areas (the
-    // directional bounce a flat ambient term can't provide). Like SSR it needs the normal
-    // attachment, so it only runs while TAA is on / MSAA is off.
-    // LUMEN GI RE-ENABLED (GI PRAGMATIC REVIVAL R0.1, 2026-06-18): the 2026-06-17 hard-disable default-Off is
-    // reverted. These defaults are the no-volume baseline (a scene with no GlobalIllumination volume); the volume
-    // bridge (VolumePostProcessing.Apply) overwrites them from the volume's GI-Mode dropdown. Default ScreenSpace
-    // = SSGI on. The DX12HDRenderer giMode choke point still lets BALLISTIC_DX12_SSGI/RT_GI env doors override.
-    // SAFETY DEFAULT-OFF (2026-06-18): the baked DXR path crashed the dev PC on EVERY scene open (GPU hang / TDR /
-    // reset — even a headless `bal render` subprocess took the GPU down). Until the crash root cause is found
-    // OFFLINE, GI defaults to Off so opening the editor NEVER touches the DXR bake. The baked system is intact,
-    // just opt-in: BALLISTIC_DX12_RT_GI=1 (+ the GI volume) re-enables it for a deliberate, supervised test. This
-    // is NOT abandoning baked — it's making the editor safe to open while the hang is diagnosed without the GPU.
-    public bool SsgiEnabled { get; set; } = false;
-    public GiMode GiMode { get; set; } = GiMode.Off;   // crash safety — baked is opt-in until the TDR is fixed
-
-    // Emissive-as-GI source: emissive surfaces act as area lights in the indirect bounce (the DDGI/
-    // RTXGI/Lumen technique — at each GI ray hit the shader adds the hit's self-emission). DEFAULT true
-    // (a correctness fix: emissive lit the camera pixel via the G-buffer but cast no indirect light).
-    // The renderer reads this via GiEmissiveEnabled; BALLISTIC_DX12_GI_EMISSIVE=0/1 still force-overrides
-    // for the headless A/B harness. No double-count: directly-visible emissive is the G-buffer; this adds
-    // emission only at off-screen bounce hits on OTHER surfaces.
-    public bool GiEmissive { get; set; } = true;
-
-    // --- Ray-Traced GI quality (only consumed when GiMode == RayTraced) ---
-    // DDGI world-probe radiance cache: the probe grid the baked GI lives in. BAKED-ONLY DEFAULT (2026-06-18):
-    // TRUE (the baked path needs the grid). BALLISTIC_DX12_DDGI env door still force-overrides.
-    public bool Ddgi { get; set; } = true;
-
-    // Bake the DDGI field once then freeze it (progressive near-first → 0 rays/frame, no realtime update, no
-    // ghosting). BAKED-ONLY DEFAULT (2026-06-18): TRUE — this is THE GI now (user: no realtime). The
-    // BALLISTIC_DX12_DDGI_BAKED env door force-overrides; setting GI Mode to ScreenSpace in a volume opts back
-    // into realtime SSGI for that scene.
-    public bool DdgiBaked { get; set; } = true;
-
-    // Probe cascade count for baked GI: 1 = single dense grid, 2 = near dense + far sparse. BAKED-ONLY DEFAULT
-    // (2026-06-18): 2 (best look, free at runtime once frozen). BALLISTIC_DX12_DDGI_CASCADES force-overrides.
-    // CASCADE DEFAULT 1 (2026-06-18): the 2-cascade far grid (its own bindless-tail block + separate per-frame
-    // trace) is the prime suspect for the GPU hang / TDR seen when baked became the always-on default — it is the
-    // newest, least-tested DXR path and runs every scene open at cascade=2. Dropped to 1 (single dense grid,
-    // headless-GBV-proven) until the far cascade is re-validated. BALLISTIC_DX12_DDGI_CASCADES=2 re-enables it.
-    public int DdgiCascades { get; set; } = 1;
-
-    // ===== Dedicated BakedGlobalIllumination volume dials (2026-06-18, the separate debuggable baked-GI front
-    // door). The renderer reads these when the baked path runs (GI_FORCE opt-in). Each env door still overrides
-    // the matching field for the A/B harness; unset = these drive. Defaults = the safe baked config. =====
-    public bool BakedGiEnabled { get; set; }                 // the dedicated volume's master on/off (debug toggle)
-    public float BakedGiIntensity { get; set; } = 1f;
-    public bool BakedGiEmissive { get; set; } = true;
-    public bool BakedGiIsolate { get; set; }                 // GI-isolate debug view (only the baked bounce)
-    public int BakedGiRaysPerProbe { get; set; } = 256;      // bake rays/probe (16..256)
-    public float BakedGiProbeSpacing { get; set; } = 1.2f;   // near-cascade probe spacing (m)
-    public int BakedGiConvergeTarget { get; set; } = 48;     // frames a probe traces before it freezes
-    public int BakedGiBandFrames { get; set; } = 2;          // progressive: frames before the next band opens
-    public bool BakedGiRebakeRequest { get; set; }           // one-shot "rebake now" from the volume tick box
-
-    // Screen-space radiance probes: the near/mid-field final gather. This is a REALTIME per-frame screen trace —
-    // BAKED-ONLY DEFAULT (2026-06-18): FALSE, so the baked path uses the pure frozen-field gather (no realtime
-    // screen probes). BALLISTIC_DX12_SCREENPROBE still force-overrides.
-    public bool ScreenProbes { get; set; } = false;
-
-    // -- Quality / noise --
-    // Rays per pixel: with temporal accumulation + the denoiser, even 2-4 stays clean.
-    public int SsgiRayCount { get; set; } = 4;
-    public float SsgiMaxHistory { get; set; } = 24f;  // temporal frames to accumulate (smoother/laggier)
-    public float SsgiGhostingReject { get; set; } = 0.06f;  // how fast camera motion flushes the temporal trail (0=never, higher=aggressive)
-    public float SsgiTemporalClamp { get; set; } = 1.6f;    // neighbourhood clamp box inflation (low=tight/less-ghost, high=loose/smoother)
-
-    // -- Ray shape --
-    public float SsgiRayLength { get; set; } = 12f;   // metres; near vs far bounce reach
-    public float SsgiFalloff { get; set; } = 0.5f;    // distance falloff exponent (0 = none); gentle so far walls still bounce
-    public float SsgiThickness { get; set; } = 0.5f;  // depth-test tolerance during the march
-
-    // -- THE dial: one cinematic look slider (0 = off-ish/neutral, ~0.6 = filmic default,
-    // 1 = strong hero grade). It internally drives warmth, shadow lift, colour-bleed punch,
-    // filmic contrast and stability inside the SSGI combine, so a good look needs nothing more
-    // than this. The physical/artistic knobs below remain as advanced overrides. --
-    public float SsgiLook { get; set; } = 0.6f;
-
-    // Debug: show ONLY the bounce SSGI would add (brightened 10x so faint GI reads), instead of
-    // scene+bounce. Black = no gather at that pixel. The fastest way to see whether/where SSGI
-    // is actually contributing, and to tune ray length/intensity against real output.
-    public bool SsgiDebugView { get; set; }
-
-    // -- Bounce strength (advanced). SSGI is a REFINEMENT on the physical IBL base, so it only
-    // adds the local one-bounce colour - intensity ~1 (not the old 1.5 that compensated for a
-    // missing ambient base). --
-    public float SsgiIntensity { get; set; } = 1f;                    // local-bounce strength
-    public Vector3 SsgiTint { get; set; } = Vector3.One; // bounce colour
-    public float SsgiSaturation { get; set; } = 1f;                   // bounce colour punch
-    public float SsgiOcclusionPower { get; set; } = 0.6f;             // how hard AO bites the bounce
-    public float SsgiBounceBoost { get; set; }                        // super-linear gain on bright source pixels (volume: bounceBoost; shader Params1.x)
 
     // Volumetric height fog + sun scattering (god-rays): physical exponential height fog
     // marched against the directional shadow map. In-scatters the atmosphere-attenuated sun
     // and the baked sky's average radiance (skylight); its transmittance EXTINGUISHES the
     // scene behind it (real fog hides things). Half-res march + temporal denoise; like
-    // SSR/SSGI it reconstructs from the single-sample depth, so it only runs while TAA is
+    // SSR it reconstructs from the single-sample depth, so it only runs while TAA is
     // on / MSAA is off. Off by default (it's an atmospheric, scene-dependent look).
     public bool VolumetricEnabled { get; set; }
     public float VolumetricIntensity { get; set; } = 1f;              // master strength: fades whole fog below 1, boosts only glow above
@@ -352,8 +235,5 @@ public sealed class PostProcessSettings {
     public float DofAperture { get; set; } = 2.8f;      // f-number; smaller = shallower DoF
     public float DofMaxCoc { get; set; } = 0.03f;       // blur-radius clamp (fraction of frame height)
 
-    // (The old GL realtime-GI stack fields — GiProbeIntensity / GiReflection* / GiSdf* / GiAmbientFloor /
-    // GiProbesEnabled / GiLumenEnabled / GiDebugShow* — were deleted in the P0.5 GI consolidation. They
-    // drove the GL probe/SDF baker, which is gone; DX12 GI is the unified GlobalIllumination volume
-    // (Ssgi* + GiMode + ReflectionMode above). No reader remained.)
+    // The old realtime-GI and baked-GI settings were removed with the GI renderer.
 }

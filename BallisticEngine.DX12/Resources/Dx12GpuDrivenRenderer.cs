@@ -102,31 +102,6 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct ShadowPerDraw { public Matrix4x4 LightMvp; }
 
-    // --- P7.2b NO-RT raster-probe proxy (the reduced-geometry far-field for GPUs without HW ray tracing) ---
-    // Reuses the camera GPU-driven cull + cmdSig + bindless material table to draw the whole-mesh mass into a
-    // probe cube's lean 2-MRT G-buffer (Dx12RasterProbe) with ~1 ExecuteIndirect/mesh-group/face instead of the
-    // 158 per-submesh draws/face of P7.2a (7.483ms/probe — non-viable). probeDrawPso is built against the EXISTING
-    // drawRootSig (so cmdSig stays valid; root param 3 b1 motion is left unbound — the lean shader never reads it)
-    // but with the probe cube's 2 RT formats. Own buffer set sized ProbeFaces*Capacity so all 6 faces hold disjoint
-    // slices and batch into ONE command list with no upload-heap aliasing (mirrors ShadowCapacity's per-cascade
-    // slicing). Lazily built on first RenderIntoProbe. ProbeBuildFaceMeta computes the face-independent fields +
-    // world AABBs ONCE per probe; per face only the Mvp + cull planes are re-stamped (the 8-corner WorldAabb is
-    // camera-independent — recomputing it 6x would be the new bottleneck).
-    const int ProbeFaces = 6;
-    const int ProbeCapacity = ProbeFaces * Capacity;
-    bool probeBuilt;
-    ID3D12PipelineState probeDrawPso;          // lean 2-MRT GBufferProbeBindless, built against drawRootSig + cmdSig
-    ID3D12Resource probeMetaUpload;   unsafe byte* probeMetaMapped;   // SubmeshMeta[ProbeCapacity] (per-face slices)
-    ID3D12Resource probeCullParamUpload; unsafe byte* probeCullParamMapped;  // GeoCullParams[ProbeFaces*MaxGroups]
-    ID3D12Resource probeCommands;     // DEFAULT UAV (per-face slices)
-    ID3D12Resource probePerDraws;     // DEFAULT UAV
-    // Per-face draw slices recorded by ProbeBuildFaceMeta, consumed by RenderIntoProbeFace.
-    readonly List<(int face, Dx12Buffer<GLVector3> vb, Dx12Buffer<GLVector3> nb, Dx12Buffer<Vector2> ub,
-        Dx12Buffer<Vector4> tb, Dx12IndexBuffer ib, int baseIdx, int count, int cullSlot)> probeSlices = new();
-    int probeCullSlotCount;
-    long probeLastTris;
-    public long ProbeLastTris => probeLastTris;
-
     public Dx12GpuDrivenRenderer(Dx12Device device) {
         dev = device;
         metaStride = System.Runtime.InteropServices.Marshal.SizeOf<SubmeshMeta>();
@@ -237,6 +212,24 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         materialsMapped = materials.Map<byte>(0);
     }
 
+    // Drop the cached material table so the NEXT EnsureMaterialTable rebuilds from scratch. Called on a scene
+    // swap: the table is cached by a cheap count stamp (renderer + submesh count), so a new scene with the SAME
+    // counts as the old one would keep the old scene's Material->id map and bindless texture binds — then
+    // RenderInto's `materialIds.TryGetValue(mat)` misses every new-scene material and skips its submeshes (the
+    // "second scene culls/renders wrong" bug). The dictionaries hold dead Material/Texture refs across the swap
+    // anyway, so clear them too. -1 stamp forces a rebuild even if the new counts coincide.
+    public void Invalidate() {
+        tableStamp = -1;
+        materialIds.Clear();
+        bindlessIds.Clear();
+        materialCount = 0;
+        hizBindlessIndex = -1;
+        // Drop the Hi-Z pyramid too: a same-resolution scene swap leaves it holding the OLD scene's depth, so
+        // the occlusion cull would reject the new scene behind stale occluders. Next BuildHiZ re-creates it
+        // (recreated=true → bindless SRV re-pointed) and refills from the new depth.
+        hiz?.Invalidate();
+    }
+
     // Build / rebuild the bindless material table from the whole-mesh renderers' opaque submeshes. Cached
     // by a stamp (material-set size); rebuild resets the shared bindless heap + caches.
     public unsafe void EnsureMaterialTable(List<IStaticMeshRenderer> wholeMesh) {
@@ -344,9 +337,19 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         // any resize the bindless descriptor was stale — the editor's resize crash. Re-register whenever the
         // pyramid was (re)created OR the slot is unallocated.
         bool recreated = hiz.Ensure(w, h);   // true on FIRST build (pyramid was null) AND on every resize
-        if (hizBindlessIndex < 0)
+        // The bindless slot must be (re-)written when it was freshly allocated, NOT only when the pyramid was
+        // recreated. EnsureMaterialTable calls BindlessHeap.Reset() on a material-table rebuild and sets
+        // hizBindlessIndex = -1 (the old slot is gone). On a SCENE SWAP the resolution is unchanged, so
+        // hiz.Ensure() returns false (no recreation) — but the slot below is freshly Allocate()d into a heap
+        // whose descriptor was never written. Re-pointing only on `recreated` left that new slot pointing at
+        // garbage → the cull sampled junk Hi-Z depth → whole new scene wrongly occlusion-culled (the "culling
+        // breaks after switching scenes" bug). Re-write whenever the slot was just allocated OR the pyramid was
+        // recreated. (Same class of bug as the EF3 resize hang: a cached bindless descriptor not re-pointed
+        // after its backing heap/resource changed.)
+        bool slotReallocated = hizBindlessIndex < 0;
+        if (slotReallocated)
             hizBindlessIndex = Dx12Backend.BindlessHeap.Allocate();
-        if (recreated)   // re-point the bindless descriptor at the (new) pyramid — covers first build + resizes
+        if (recreated || slotReallocated)
             hiz.CreateAllMipsSrv(Dx12Backend.BindlessHeap.Cpu(hizBindlessIndex));
         dev.ExecuteSync(cl => hiz.Build(cl, depthSrvCpu));
     }
@@ -640,179 +643,6 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         return (visible, total);
     }
 
-    // ============================ P7.2b NO-RT raster-probe proxy ============================
-    // Lazily build the lean 2-MRT probe PSO (against the EXISTING drawRootSig so cmdSig is reused) + the per-face
-    // buffer set. albedoFmt/normalFmt MUST match Dx12RasterProbe's cube formats (the OM format-match gate).
-    public unsafe void BuildProbePipeline(Vortice.DXGI.Format albedoFmt, Vortice.DXGI.Format normalFmt,
-                                          Vortice.DXGI.Format depthFmt) {
-        if (probeBuilt) return;
-        probeBuilt = true;
-
-        string hlsl = EmbeddedShaderSource.ReadHlsl("GBufferProbeBindless.hlsl");
-        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "GBufferProbeBindless.hlsl");
-        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "GBufferProbeBindless.hlsl");
-        var layout = new InputLayoutDescription(
-            new InputElementDescription("POSITION", 0, Vortice.DXGI.Format.R32G32B32_Float, 0, 0),
-            new InputElementDescription("NORMAL", 0, Vortice.DXGI.Format.R32G32B32_Float, 0, 1),
-            new InputElementDescription("TEXCOORD", 0, Vortice.DXGI.Format.R32G32_Float, 0, 2),
-            new InputElementDescription("TANGENT", 0, Vortice.DXGI.Format.R32G32B32A32_Float, 0, 3));
-        probeDrawPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
-            RootSignature = drawRootSig,                  // REUSE: cmdSig targets drawRootSig's root const (param 0)
-            VertexShader = vs, PixelShader = ps, InputLayout = layout,
-            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
-            RasterizerState = RasterizerDescription.CullClockwise,   // back-face cull (geometry parity)
-            BlendState = BlendDescription.Opaque, DepthStencilState = DepthStencilDescription.Default,
-            RenderTargetFormats = new[] { albedoFmt, normalFmt },     // 2 MRT — matches the probe cube bind exactly
-            DepthStencilFormat = depthFmt, SampleDescription = new Vortice.DXGI.SampleDescription(1, 0),
-        });
-
-        probeCommands = dev.CreateUavBuffer<byte>(new byte[ProbeCapacity * DrawCmdStride], ResourceStates.IndirectArgument);
-        probePerDraws = dev.CreateUavBuffer<PerDraw>(new PerDraw[ProbeCapacity], ResourceStates.NonPixelShaderResource);
-        probeMetaUpload = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)((long)metaStride * ProbeCapacity)), ResourceStates.GenericRead);
-        probeMetaMapped = probeMetaUpload.Map<byte>(0);
-        probeCullParamUpload = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)((long)geoCullParamSlotSize * ProbeFaces * MaxGroups)), ResourceStates.GenericRead);
-        probeCullParamMapped = probeCullParamUpload.Map<byte>(0);
-    }
-
-    // CPU-build the per-face SubmeshMeta + GeoCullParams for ALL 6 probe faces in ONE pass (call BEFORE recording
-    // any face's GPU work — the single un-drained command list reads these uploads at execution time, so every CPU
-    // write must precede the ExecuteSync). The world AABB (8-corner WorldAabb) is computed ONCE per submesh and
-    // reused across the 6 faces (it depends only on `model`, not the face viewProj); only Mvp + the cull planes
-    // differ per face. Hi-Z is DISABLED (HizEnabled=0): the probe sits at a different position than the camera
-    // whose previous-frame depth built the pyramid, so the pyramid is meaningless here — frustum-only cull.
-    // `faceVPs`[6] are the cube-face view*proj; the per-face frustum planes are derived here. Mirrors RenderInto's
-    // grouping (one ExecuteIndirect per unique Mesh) but writes into the disjoint per-face probe buffer slices
-    // (face f occupies [f*Capacity, f*Capacity + groupTotals)). Must run after EnsureMaterialTable.
-    public unsafe void ProbeBuildFaceMeta(List<IStaticMeshRenderer> wholeMesh, ReadOnlySpan<Matrix4x4> faceVPs) {
-        probeSlices.Clear();
-        probeCullSlotCount = 0;
-        probeLastTris = 0;
-
-        var byMesh = new Dictionary<Mesh, List<IStaticMeshRenderer>>();
-        foreach (var r in wholeMesh) {
-            Mesh m = r.SharedMesh; if (m is null) continue;
-            if (!byMesh.TryGetValue(m, out var list)) { list = new(); byMesh[m] = list; }
-            list.Add(r);
-        }
-
-        var planes = new Vector4[6];
-        for (int f = 0; f < ProbeFaces; f++) {
-            ExtractPlanes(faceVPs[f], planes);
-            int faceBase = f * Capacity;     // disjoint per-face region (no aliasing across faces in one list)
-            int total = faceBase;
-            foreach (var kv in byMesh) {
-                if (probeCullSlotCount >= ProbeFaces * MaxGroups) break;
-                Mesh mesh = kv.Key;
-                var vb = mesh.VertexBuffer as Dx12Buffer<GLVector3>;
-                var ib = mesh.IndexBuffer as Dx12IndexBuffer;
-                var nb = mesh.NormalBuffer as Dx12Buffer<GLVector3>;
-                var ub = mesh.UvBuffer as Dx12Buffer<Vector2>;
-                var tb = mesh.TangentBuffer as Dx12Buffer<Vector4>;
-                if (vb?.Resource is null || ib?.Resource is null || nb?.Resource is null ||
-                    ub?.Resource is null || tb?.Resource is null) continue;
-
-                int groupBase = total;
-                foreach (var r in kv.Value) {
-                    Matrix4x4 model = ToNum(r.Transform.WorldMatrix);
-                    Matrix4x4 mvp = model * faceVPs[f];
-                    for (int s = 0; s < mesh.SubMeshes.Length && total < faceBase + Capacity; s++) {
-                        SubMeshData sub = mesh.SubMeshes[s];
-                        if (sub.IndexCount <= 0) continue;
-                        Material mat = r.MaterialFor(s);
-                        if (mat is null || mat.Transparent) continue;
-                        if (!materialIds.TryGetValue(mat, out int matId)) continue;
-                        mesh.GetSubMeshBounds(s, out GLVector3 lmin, out GLVector3 lmax);
-                        WorldAabb(lmin, lmax, model, out Vector3 wlo, out Vector3 whi);
-                        *(SubmeshMeta*)(probeMetaMapped + (long)total * metaStride) = new SubmeshMeta {
-                            Mvp = Matrix4x4.Transpose(mvp), Model = Matrix4x4.Transpose(model),
-                            AabbMin = new Vector4(wlo, 0), AabbMax = new Vector4(whi, 0),
-                            FirstIndex = (uint)sub.IndexStart, IndexCount = (uint)sub.IndexCount,
-                            MaterialId = (uint)matId, Flags = 0,
-                        };
-                        if (f == 0) probeLastTris += sub.IndexCount / 3;   // count once (pre-cull upper bound)
-                        total++;
-                    }
-                }
-                int groupTotal = total - groupBase;
-                if (groupTotal == 0) continue;
-                // GeoCullParams: frustum planes + Hi-Z DISABLED. ViewProj/View/HizParams are unused when
-                // HizEnabled=0 (occludedByHiZ early-outs) but filled benignly to keep the std140 layout valid.
-                var cp = new GeoCullParams {
-                    P0 = planes[0], P1 = planes[1], P2 = planes[2],
-                    P3 = planes[3], P4 = planes[4], P5 = planes[5],
-                    SubmeshCount = (uint)groupTotal, OutBase = (uint)groupBase,
-                    HizEnabled = 0u, HizIndex = 0u,
-                    ViewProj = Matrix4x4.Transpose(faceVPs[f]), View = Matrix4x4.Identity,
-                    HizParams = new Vector4(1, 1, 1, 0.05f), HizFar = new Vector4(60f, 0, 0, 0),
-                };
-                *(GeoCullParams*)(probeCullParamMapped + (long)probeCullSlotCount * geoCullParamSlotSize) = cp;
-                probeSlices.Add((f, vb, nb, ub, tb, ib, groupBase, groupTotal, probeCullSlotCount));
-                probeCullSlotCount++;
-            }
-        }
-    }
-
-    // Record this probe FACE's cull + ExecuteIndirect into the currently-bound face RTV/DSV (the caller —
-    // Dx12RasterProbe — set the 2 RTVs + DSV + 24px viewport + cleared them). Runs the SAME geometry compute cull
-    // (geoCullRootSig/cullPso) writing the per-face probe buffer slice, then ExecuteIndirect per mesh group with
-    // the lean probeDrawPso. The bindless heap must already be bound by the caller (the cull samples nothing for
-    // Hi-Z here, but GBufferProbeBindless reads ResourceDescriptorHeap for the diffuse texture). Disjoint per-face
-    // slices mean no cross-face barrier interleaving is needed. Returns ExecuteIndirect count for this face.
-    public unsafe int RenderIntoProbeFace(ID3D12GraphicsCommandList4 cl, int face) {
-        bool any = false;
-        for (int i = 0; i < probeSlices.Count; i++) if (probeSlices[i].face == face) { any = true; break; }
-        if (!any) return 0;
-
-        // 1) Outputs UAV for the cull writes (idempotent — they start in these post-draw states).
-        cl.ResourceBarrierTransition(probeCommands, ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess);
-        cl.ResourceBarrierTransition(probePerDraws, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
-
-        // 2) Cull dispatch per group (HizEnabled=0 so no pyramid read; bind bindless heap before the root sig).
-        cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);
-        cl.SetComputeRootSignature(geoCullRootSig);
-        cl.SetPipelineState(cullPso);
-        cl.SetComputeRootShaderResourceView(1, probeMetaUpload.GPUVirtualAddress);
-        cl.SetComputeRootUnorderedAccessView(2, probeCommands.GPUVirtualAddress);
-        cl.SetComputeRootUnorderedAccessView(3, probePerDraws.GPUVirtualAddress);
-        for (int i = 0; i < probeSlices.Count; i++) {
-            if (probeSlices[i].face != face) continue;
-            cl.SetComputeRootConstantBufferView(0,
-                probeCullParamUpload.GPUVirtualAddress + (ulong)((long)probeSlices[i].cullSlot * geoCullParamSlotSize));
-            cl.Dispatch((uint)((probeSlices[i].count + 63) / 64), 1, 1);
-        }
-
-        // 3) Flush the cull's UAV writes for the indirect draw.
-        cl.ResourceBarrierTransition(probeCommands, ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument);
-        cl.ResourceBarrierTransition(probePerDraws, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
-
-        // 4) Lean bindless GPU-driven draw into the bound face RTV/DSV — one ExecuteIndirect per mesh group.
-        // Re-activate the GRAPHICS root sig + PSO after the compute cull (gotcha: SetDescriptorHeaps before the
-        // root sig). Root params: t0 PerDraws (b1 motion at param 3 left UNBOUND — the lean shader never reads it).
-        cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);
-        cl.SetGraphicsRootSignature(drawRootSig);
-        cl.SetPipelineState(probeDrawPso);
-        cl.SetGraphicsRootShaderResourceView(1, probePerDraws.GPUVirtualAddress);
-        cl.SetGraphicsRootShaderResourceView(2, materials.GPUVirtualAddress);
-        cl.IASetPrimitiveTopology(Vortice.Direct3D.PrimitiveTopology.TriangleList);
-        int execs = 0;
-        for (int i = 0; i < probeSlices.Count; i++) {
-            var sl = probeSlices[i];
-            if (sl.face != face) continue;
-            Span<VertexBufferView> vbViews = stackalloc VertexBufferView[4];
-            vbViews[0] = new VertexBufferView(sl.vb.GpuAddress, (uint)sl.vb.ByteSize, (uint)sl.vb.Stride);
-            vbViews[1] = new VertexBufferView(sl.nb.GpuAddress, (uint)sl.nb.ByteSize, (uint)sl.nb.Stride);
-            vbViews[2] = new VertexBufferView(sl.ub.GpuAddress, (uint)sl.ub.ByteSize, (uint)sl.ub.Stride);
-            vbViews[3] = new VertexBufferView(sl.tb.GpuAddress, (uint)sl.tb.ByteSize, (uint)sl.tb.Stride);
-            cl.IASetVertexBuffers(0, vbViews);
-            cl.IASetIndexBuffer(new IndexBufferView(sl.ib.GpuAddress, (uint)sl.ib.ByteSize, Vortice.DXGI.Format.R32_UInt));
-            cl.ExecuteIndirect(cmdSig, (uint)sl.count, probeCommands, (ulong)((long)sl.baseIdx * DrawCmdStride), null, 0);
-            execs++;
-        }
-        return execs;
-    }
-
     static void WorldAabb(GLVector3 localMin, GLVector3 localMax, Matrix4x4 model, out Vector3 lo, out Vector3 hi) {
         lo = new Vector3(float.MaxValue); hi = new Vector3(float.MinValue);
         for (int c = 0; c < 8; c++) {
@@ -836,7 +666,5 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         hiz?.Dispose();
         shadowCullPso?.Dispose(); shadowDrawRootSig?.Dispose(); shadowDrawPso?.Dispose(); shadowCmdSig?.Dispose();
         shadowCommands?.Dispose(); shadowPerDraws?.Dispose(); shadowMetaUpload?.Dispose(); shadowCullParamUpload?.Dispose();
-        probeDrawPso?.Dispose(); probeCommands?.Dispose(); probePerDraws?.Dispose();
-        probeMetaUpload?.Dispose(); probeCullParamUpload?.Dispose();
     }
 }

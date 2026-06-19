@@ -126,6 +126,14 @@ public class SceneManager {
     // stay on screen after a scene switch" bug). Every scene-teardown path (StopPlay, LoadScenePath,
     // and the editor's ApplyNow) calls this so the asymmetry can't reappear. Must list ALL RuntimeSets
     // the renderer iterates; add new ones here when a new renderable type is introduced.
+    // Fired AFTER every render set is emptied on a scene teardown (StopPlay / LoadScenePath / editor ApplyNow).
+    // The active backend subscribes to drop any per-scene CACHED GPU state that survives a swap because it is
+    // keyed by a cheap change-stamp, not by scene identity — e.g. the DX12 GPU-driven material table (stamped by
+    // renderer+submesh count), the Hi-Z prime, the shadow-cascade cache. Two scenes with matching counts would
+    // otherwise keep the first scene's table/cull state and the second scene renders wrong / culls everything.
+    // Engine layer raises it; the renderer layer (DX12) listens — no upward dependency.
+    public static event Action RenderSetsCleared;
+
     public static void ClearAllRenderSets() {
         RuntimeSet<IStaticMeshRenderer>.Clear();
         RuntimeSet<PointLight>.Clear();
@@ -134,6 +142,7 @@ public class SceneManager {
         RuntimeSet<IRibbonSource>.Clear();
         RuntimeSet<ParticleSystem>.Clear();
         DirectionalLight.Clear();
+        RenderSetsCleared?.Invoke();
     }
 
     public static Scene GetCurrentScene() {

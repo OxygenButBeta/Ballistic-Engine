@@ -33,11 +33,13 @@ public readonly struct Dx12RenderDoors {
     public readonly bool AerialPersp;   // aerial-perspective haze
     public readonly bool Fog;           // volumetric fog
     public readonly bool Volumes;       // the Volume framework → PostFX bridge (VolumeManager.Update + Apply)
+    public readonly bool Shafts;        // god-ray / light-shaft layer (forces PostFX.ShaftsEnabled for A/B)
+    public readonly bool Dust;          // volumetric dust motes layer (forces PostFX.DustEnabled for A/B)
 
     public Dx12RenderDoors(bool minimal, bool shadows, bool ibl, bool sky, bool ssao, bool bloom,
-                           bool aerialPersp, bool fog, bool volumes) {
+                           bool aerialPersp, bool fog, bool volumes, bool shafts, bool dust) {
         Minimal = minimal; Shadows = shadows; Ibl = ibl; Sky = sky; Ssao = ssao; Bloom = bloom;
-        AerialPersp = aerialPersp; Fog = fog; Volumes = volumes;
+        AerialPersp = aerialPersp; Fog = fog; Volumes = volumes; Shafts = shafts; Dust = dust;
     }
 
     // Return a copy with ONE door flipped (the struct is readonly → rebuild by value). Used by the editor's
@@ -46,14 +48,16 @@ public readonly struct Dx12RenderDoors {
     // no per-frame cost. `door` is the case-insensitive field name (Shadows/Ibl/Sky/Ssao/Bloom/AerialPersp/
     // Fog/Volumes); Minimal is intentionally not flippable here (it's a launch-time diagnostic switch).
     public Dx12RenderDoors With(string door, bool value) => door.ToLowerInvariant() switch {
-        "shadows"     => new(Minimal, value, Ibl, Sky, Ssao, Bloom, AerialPersp, Fog, Volumes),
-        "ibl"         => new(Minimal, Shadows, value, Sky, Ssao, Bloom, AerialPersp, Fog, Volumes),
-        "sky"         => new(Minimal, Shadows, Ibl, value, Ssao, Bloom, AerialPersp, Fog, Volumes),
-        "ssao"        => new(Minimal, Shadows, Ibl, Sky, value, Bloom, AerialPersp, Fog, Volumes),
-        "bloom"       => new(Minimal, Shadows, Ibl, Sky, Ssao, value, AerialPersp, Fog, Volumes),
-        "aerialpersp" => new(Minimal, Shadows, Ibl, Sky, Ssao, Bloom, value, Fog, Volumes),
-        "fog"         => new(Minimal, Shadows, Ibl, Sky, Ssao, Bloom, AerialPersp, value, Volumes),
-        "volumes"     => new(Minimal, Shadows, Ibl, Sky, Ssao, Bloom, AerialPersp, Fog, value),
+        "shadows"     => new(Minimal, value, Ibl, Sky, Ssao, Bloom, AerialPersp, Fog, Volumes, Shafts, Dust),
+        "ibl"         => new(Minimal, Shadows, value, Sky, Ssao, Bloom, AerialPersp, Fog, Volumes, Shafts, Dust),
+        "sky"         => new(Minimal, Shadows, Ibl, value, Ssao, Bloom, AerialPersp, Fog, Volumes, Shafts, Dust),
+        "ssao"        => new(Minimal, Shadows, Ibl, Sky, value, Bloom, AerialPersp, Fog, Volumes, Shafts, Dust),
+        "bloom"       => new(Minimal, Shadows, Ibl, Sky, Ssao, value, AerialPersp, Fog, Volumes, Shafts, Dust),
+        "aerialpersp" => new(Minimal, Shadows, Ibl, Sky, Ssao, Bloom, value, Fog, Volumes, Shafts, Dust),
+        "fog"         => new(Minimal, Shadows, Ibl, Sky, Ssao, Bloom, AerialPersp, value, Volumes, Shafts, Dust),
+        "volumes"     => new(Minimal, Shadows, Ibl, Sky, Ssao, Bloom, AerialPersp, Fog, value, Shafts, Dust),
+        "shafts"      => new(Minimal, Shadows, Ibl, Sky, Ssao, Bloom, AerialPersp, Fog, Volumes, value, Dust),
+        "dust"        => new(Minimal, Shadows, Ibl, Sky, Ssao, Bloom, AerialPersp, Fog, Volumes, Shafts, value),
         _ => this,
     };
 
@@ -84,6 +88,11 @@ public readonly struct Dx12RenderDoors {
             // Fog historically was OFF unless BALLISTIC_FX_VOLUMETRIC==1 (or a volume enabled it). Keep that
             // exactly: the door only carries the env-force; the PostFX.VolumetricEnabled check stays at the site.
             fog:         Env("BALLISTIC_FX_VOLUMETRIC") == "1",
-            volumes:     DoorDefaultOn(minimal, "BALLISTIC_DX12_VOLUMES"));
+            volumes:     DoorDefaultOn(minimal, "BALLISTIC_DX12_VOLUMES"),
+            // God rays + dust: pure A/B test doors (default OFF). When set they force the corresponding
+            // PostFX flag on at the fog pass so the aesthetic layers can be exercised without authoring a
+            // volume profile. Absent, the layers are driven solely by the VolumetricLighting override.
+            shafts:      Env("BALLISTIC_DX12_SHAFTS") == "1",
+            dust:        Env("BALLISTIC_DX12_DUST") == "1");
     }
 }

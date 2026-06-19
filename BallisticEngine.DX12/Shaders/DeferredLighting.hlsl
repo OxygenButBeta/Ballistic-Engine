@@ -23,8 +23,8 @@ cbuffer LightConstants : register(b0) {
     float    SpecClamp;                            // V2: max per-light specular LUMA (0 = off); caps NDF fireflies
     float    SpecAaStrength;                       // V2: geometric specular AA strength (0 = off); roughens noisy normals
     float    UseSsao;                              // >0.5 = multiply the GTAO term into the IBL ambient (ambient-only)
-    float    GiDiffuseActive;                      // >0.5 = a GI pass supplies indirect DIFFUSE this frame → fade IBL diffuse ambient toward the floor (no full double-count); IBL specular kept
-    float    GiAmbientFloor;                        // [0..1] fraction of IBL diffuse KEPT even when GI is active (skylight floor — prevents pure-black where GI is sparse/unconverged; UE keeps a skylight floor under Lumen)
+    float    Pad3;
+    float    Pad4;
     float4x4 ViewProjFwd;                          // world → clip (transposed on upload); contact-shadow march reprojection
 };
 
@@ -362,13 +362,6 @@ float4 PSMain(VSOut i) : SV_Target {
         float3 kD = (1.0 - Famb) * (1.0 - metallic);
         float3 irradiance = IrradianceMap.SampleLevel(LinearClamp, N, 0).rgb;
         float3 ambientDiffuse = kD * irradiance * albedo * ao;
-        // When a GI pass is active it adds the indirect DIFFUSE bounce later (its hit shader already folds in the
-        // sky/IBL irradiance term). Adding the FULL IBL diffuse here too would DOUBLE-COUNT and drown the bounce
-        // — the "IBL too dominant, GI invisible" symptom. But fully ZEROING it makes every pixel the (sparse,
-        // possibly-unconverged) GI field fails to reach render pure BLACK (the DDGI grid is often <1% populated).
-        // So keep a SKYLIGHT FLOOR fraction of IBL diffuse even under GI — exactly like UE keeps a skylight under
-        // Lumen — so unlit/un-GI'd surfaces get soft sky ambient instead of black, and GI adds richness on top.
-        if (GiDiffuseActive > 0.5) ambientDiffuse *= GiAmbientFloor;
         float3 R = reflect(-V, N);
         float mip = clamp(roughness * PrefilterMaxMip, 0.0, PrefilterMaxMip);
         float3 prefiltered = PrefilterMap.SampleLevel(LinearClamp, R, mip).rgb;

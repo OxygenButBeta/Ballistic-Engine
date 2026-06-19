@@ -39,14 +39,8 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         if (ctx.Doors.Minimal) return false;
         if (reflForceEnv == "1") return ctx.PostFX.SsrIntensity > 0f;
         if (reflForceEnv == "0") return false;
-        // REFLECTIONS DEFAULT-ON (2026-06-18 GI/reflections overhaul): screen-space reflections were hard-off
-        // (PostFX.SsrEnabled default false + a volume bridge that only set it from a GlobalIllumination volume
-        // which most scenes lack). SSR is a big, safe visual win (wet/glossy floors, metal, water), so run it by
-        // default whenever GI is on and intensity allows. A scene can still force it off via BALLISTIC_DX12_
-        // REFLECTIONS=0 or a Reflections-Mode=Off volume (which sets SsrEnabled=false explicitly — but only a
-        // present-and-disabled volume does that; absent = default-on here).
         if (ctx.PostFX.SsrIntensity <= 0f) return false;
-        return ctx.PostFX.SsrEnabled || ctx.GiMode != GiMode.Off;
+        return ctx.PostFX.SsrEnabled;
     }
     string reflForceEnv; bool reflForceEnvUnread = true;
 
@@ -112,7 +106,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     [StructLayout(LayoutKind.Sequential)]
     struct RtReflConstants {
         public Matrix4x4 InvViewProj; public Vector3 CameraPos; public float Intensity;
-        public float PrefilterMaxMip; public float NormalBias; public float UseDdgi; public float Pad0;
+        public float PrefilterMaxMip; public float NormalBias; public float Unused0; public float Unused1;
     }
     [StructLayout(LayoutKind.Sequential)]
     struct RtGiSun { public Vector3 SunDir; public float NormalBias; public Vector3 SunColor; public float LightCount; }
@@ -274,7 +268,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         rtReflSunCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)sunSize), ResourceStates.GenericRead);
         rtReflSunCbMapped = rtReflSunCb.Map<byte>(0);
-        int gridSize = (Marshal.SizeOf<Dx12Ddgi.DdgiConstants>() + 255) & ~255;
+        int gridSize = 256;
         rtReflGridCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)gridSize), ResourceStates.GenericRead);
         rtReflGridCbMapped = rtReflGridCb.Map<byte>(0);
@@ -290,7 +284,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     unsafe void DrawRtReflections(Dx12FrameContext ctx) {
         var dev = ctx.Dev; var target = ctx.SceneColor; var gbuffer = ctx.GBuffer; var ibl = ctx.Ibl;
         var gpuDriven = ctx.GpuDriven; var clusteredLights = ctx.ClusteredLights;
-        var sceneAS = ctx.Dxr.SceneAS; var rtGeometry = ctx.Dxr.RtGeometry; var ddgi = ctx.Dxr.Ddgi;
+        var sceneAS = ctx.Dxr.SceneAS; var rtGeometry = ctx.Dxr.RtGeometry;
         Matrix4x4 view = ctx.View, viewProj = ctx.ViewProj, proj = ctx.Proj;
         Vector3 camPos = ctx.CamPos, lightDir = ctx.LightDir, lightColor = ctx.LightColor;
 
@@ -302,25 +296,19 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         gpuDriven.EnsureMaterialTable(ctx.WholeMeshRenderers);
         rtGeometry.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection, gpuDriven);
 
-        // Sample the DDGI world cache at hits when it's allocated this frame (DDGI on). Without it, the hit
-        // ambient falls back to the flat IBL irradiance cube (UseDdgi=0) — a graceful no-DDGI path.
-        bool useDdgi = DdgiEnabled(ctx) && ddgi != null && ddgi.Allocated;
-
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
         *(RtReflConstants*)rtReflCbMapped = new RtReflConstants {
             InvViewProj = Matrix4x4.Transpose(invVP), CameraPos = camPos, Intensity = ctx.PostFX.SsrIntensity,
             PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f, NormalBias = 0.05f,
-            UseDdgi = useDdgi ? 1f : 0f,
-            // Pad0 = emissiveEnable — reflected emissive surfaces (neon in a mirror) light up when >0.5.
-            Pad0 = GiEmissiveEnabled(ctx) ? 1f : 0f,
+            Unused0 = 0f,
+            Unused1 = 0f,
         };
         Vector3 sunDir = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
         *(RtGiSun*)rtReflSunCbMapped = new RtGiSun {
             SunDir = sunDir, NormalBias = 0.03f, SunColor = lightColor, LightCount = clusteredLights.LightCount,
         };
-        // The DDGI grid description for SampleDdgiField at the hit (origin/spacing/dims + irrTexels/normalBias).
-        *(Dx12Ddgi.DdgiConstants*)rtReflGridCbMapped = useDdgi ? ddgi.GridConstants() : default;
+        new Span<byte>(rtReflGridCbMapped, 256).Clear();
 
         // The G-buffer is in the combined shader-read state; color (target) bring to SRV for the combine.
         target.ColorToShaderResource();
@@ -337,27 +325,12 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtReflTableBase + 3), gbuffer.ColorSrvCpu(2), heapType);  // t3 material
         dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtReflTableBase + 4), ibl.IrradianceSrv, heapType);       // t4 irr cube
         dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtReflTableBase + 5), ibl.PrefilterSrv, heapType);        // t5 prefilter cube
-        // t6 DDGI irradiance atlas (the hit's ambient field). When DDGI is off bind a Texture2D SRV (the
-        // G-buffer depth) as an inert stand-in so the descriptor TYPE matches the shader's Texture2D<float4> slot.
-        if (useDdgi)
-            dev.Device.CreateShaderResourceView(ddgi.IrradianceTex, new ShaderResourceViewDescription {
-                Format = Format.R16G16B16A16_Float, ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
-                Shader4ComponentMapping = ShaderComponentMapping.Default,
-                Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
-            }, bindless.Cpu(RtReflTableBase + 6));
-        else
-            dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtReflTableBase + 6), gbuffer.DepthSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RtReflTableBase + 6), gbuffer.DepthSrvCpu, heapType);
         dev.Device.CreateUnorderedAccessView(ssrTarget.RenderTarget, null, new UnorderedAccessViewDescription {
             Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
         }, bindless.Cpu(RtReflTableBase + 7));                                                               // u0 ssrTarget
 
         ssrTarget.ColorToUnorderedAccess();
-        // DDGI atlas (UnorderedAccess between passes) → NonPixelSRV for the closest-hit's field read; restore
-        // after. ProbeState (t10 root SRV) is read in its UAV state, same as the screen-probe trace does.
-        if (useDdgi)
-            dev.ExecuteSync(cl => cl.ResourceBarrierTransition(ddgi.IrradianceTex,
-                ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource));
-
         uint idSize = Vortice.Direct3D12.D3D12.ShaderIdentifierSizeInBytes;
         dev.ExecuteSync(cl => {
             cl.SetDescriptorHeaps(bindless.Heap);   // bindless heap = the bound CBV/SRV/UAV heap (table + ResourceDescriptorHeap[])
@@ -370,8 +343,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
             cl.SetComputeRootShaderResourceView(4, gpuDriven.MaterialsGpuAddress);       // t7 GpuMaterials
             cl.SetComputeRootShaderResourceView(5, rtGeometry.InstancesGpuAddress);      // t8 RtInstance[]
             cl.SetComputeRootShaderResourceView(6, clusteredLights.LightBufGpuAddress);  // t9 punctual lights
-            cl.SetComputeRootShaderResourceView(7, useDdgi ? ddgi.ProbeStateGpuAddress   // t10 ProbeState (DDGI on)
-                                                           : clusteredLights.LightBufGpuAddress);  // inert when off (never read)
+            cl.SetComputeRootShaderResourceView(7, clusteredLights.LightBufGpuAddress);
             cl.DispatchRays(new DispatchRaysDescription {
                 Width = (uint)ssrTarget.Width, Height = (uint)ssrTarget.Height, Depth = 1,
                 RayGenerationShaderRecord = new GpuVirtualAddressRange { StartAddress = rtReflSbt.GPUVirtualAddress, SizeInBytes = idSize },
@@ -379,9 +351,6 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
                 HitGroupTable = new GpuVirtualAddressRangeAndStride { StartAddress = rtReflSbt.GPUVirtualAddress + 2 * RtSbtSlot, SizeInBytes = idSize, StrideInBytes = idSize },
             });
         });
-        if (useDdgi)
-            dev.ExecuteSync(cl => cl.ResourceBarrierTransition(ddgi.IrradianceTex,
-                ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess));
         ssrTarget.ColorToShaderResource();
 
         // RT-REFLECTION TEMPORAL DENOISE: motion-reproject + EMA the half-res reflection (kills the DDGI-cache
@@ -506,22 +475,6 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         ssrHistoryA = new Dx12OffscreenTarget(dev, hw, hh, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         ssrHistoryB = new Dx12OffscreenTarget(dev, hw, hh, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         ssrHistValid = false;
-    }
-
-    // --- helpers replicated from the orchestrator (read env / ctx.PostFX; identical semantics) ---
-    string ddgiEnvCached; bool ddgiEnvRead;
-    bool DdgiEnabled(Dx12FrameContext ctx) {
-        if (!ddgiEnvRead) { ddgiEnvCached = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI"); ddgiEnvRead = true; }
-        return ddgiEnvCached is null ? ctx.PostFX.Ddgi : ddgiEnvCached == "1";
-    }
-
-    string giEmissiveEnvCached; bool giEmissiveEnvRead;
-    bool GiEmissiveEnabled(Dx12FrameContext ctx) {
-        if (!giEmissiveEnvRead) {
-            giEmissiveEnvCached = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_EMISSIVE");
-            giEmissiveEnvRead = true;
-        }
-        return giEmissiveEnvCached is null ? ctx.PostFX.GiEmissive : giEmissiveEnvCached != "0";
     }
 
     public void Dispose() {

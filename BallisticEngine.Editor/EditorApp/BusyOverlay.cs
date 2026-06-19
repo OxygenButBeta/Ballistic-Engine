@@ -125,32 +125,10 @@ internal static class BusyOverlay {
         }
     }
 
-    // Non-blocking bake indicator: a small pill in the bottom-right corner with a thin progress bar,
-    // shown WHILE the light-probe bake runs (which no longer blocks the UI). The user keeps editing;
-    // this just tells them GI is refining in the background. Drawn on the foreground list, no input eat.
-    public static void DrawBakeBadge(float s) {
-        if (!ProbeRenderState.IsBaking)
-            return;
-        var draw = ImGui.GetForegroundDrawList();
-        SysVec2 display = ImGui.GetIO().DisplaySize;
-        float w = 190 * s, h = 30 * s, margin = 14 * s;
-        SysVec2 pos = new(display.X - w - margin, display.Y - h - margin);
-        draw.AddRectFilled(pos, pos + new SysVec2(w, h),
-            ImGui.GetColorU32(new SysVec4(0.10f, 0.10f, 0.12f, 0.92f)), 6 * s);
-        draw.AddRect(pos, pos + new SysVec2(w, h),
-            ImGui.GetColorU32(new SysVec4(1f, 1f, 1f, 0.08f)), 6 * s);
-        float prog = Math.Clamp(ProbeRenderState.BakeProgress, 0f, 1f);
-        var label = $"Baking GI  {(int)(prog * 100)}%";
-        draw.AddText(pos + new SysVec2(10 * s, 5 * s),
-            ImGui.GetColorU32(new SysVec4(0.85f, 0.88f, 0.95f, 1f)), label);
-        // Thin progress bar along the bottom edge of the pill.
-        SysVec2 bMin = pos + new SysVec2(10 * s, h - 7 * s);
-        float bW = w - 20 * s;
-        draw.AddRectFilled(bMin, bMin + new SysVec2(bW, 3 * s),
-            ImGui.GetColorU32(new SysVec4(0.07f, 0.07f, 0.08f, 1f)), 1.5f * s);
-        draw.AddRectFilled(bMin, bMin + new SysVec2(bW * prog, 3 * s),
-            ImGui.GetColorU32(new SysVec4(0.26f, 0.55f, 0.95f, 1f)), 1.5f * s);
-    }
+    // Non-blocking bake indicator (GL-era light-probe bake). The legacy probe baker was removed with the
+    // GI stack (Lumen V2 has no offline bake), so there is nothing to indicate — kept as a no-op so the
+    // call site stays put for any future background-GI badge.
+    public static void DrawBakeBadge(float s) { }
 
     // Shortens text to fit maxWidth, appending an ellipsis. A long path is trimmed from the FRONT
     // (the file name at the end is the useful part); plain status text from the back.

@@ -538,9 +538,6 @@ internal sealed class EditorApplication {
     // gizmo drag, recent interaction). The last image stays on screen.
     void FramePassResolveDirty(EditorFrameContext ctx) {
         // Skip the scene render while a deferred open is pending â€” the scene is about to be replaced.
-        // A probe bake counts as "changing": its time-sliced job only advances inside the scene
-        // render, so without this it crawls one slice per click instead of one per frame.
-        var probeBakePending = ProbeRenderState.IsBaking;
         // A panel edit that changes the scene's appearance (light toggle, entity disable, component
         // value, add/remove component) flags the viewport dirty; pick that up here so the on-demand
         // renderer paints the change instead of leaving the previous frame frozen. IsAnyItemActive
@@ -571,7 +568,7 @@ internal sealed class EditorApplication {
         bool activeGameUI = !sceneTabActive && BallisticEngine.UI.UIDocument.Active.Count > 0;
         ctx.RenderScene = !SceneCommands.IsLoading &&
                           (alwaysRefresh || SceneManager.IsPlaying || editorInput.RightMouseDown ||
-                           gizmo.IsInteracting || forceFrames > 0 || probeBakePending || activeGameUI);
+                           gizmo.IsInteracting || forceFrames > 0 || activeGameUI);
     }
 
     // Render the active Scene/Game view offscreen with this frame's (post-BuildUI) values.
@@ -1360,12 +1357,8 @@ internal sealed class EditorApplication {
         // (The maximize BUTTON was removed — double-click any panel's tab to fullscreen it, Esc to
         // restore. Works for every panel now, so a dedicated viewport button is redundant.)
 
-        // EF6 (2026-06-18): the Scene-view "Shading Mode" dropdown (Shaded/Wireframe/Normals/Depth +
-        // the editor-only AO/Lit/SSGI buffer views) was DELETED. It wired HDRenderer.DebugViewMode /
-        // EditorExtraDebugMode / EditorGiIsolate — props the DX12 renderer never reads (the GL fullscreen
-        // debug compositor died with the GL backend; EditorDebugViews.Install() was a no-op). Every mode
-        // was inert on DX12, so the dropdown only misled. Removed whole; the engine-side enum/hook stays
-        // in HDRenderer for the eventual DX12 debug-view port (see that TODO).
+        // EF6 (2026-06-18): the Scene-view "Shading Mode" dropdown was removed. It wired editor-only
+        // debug compositor hooks that were inert on DX12, so the dropdown only misled.
 
         // RW3 E7: the Scene-view-only controls (snap chip, World/Local space, component-gizmos, grid, and the
         // light/reflection probe GI-debug toggles) moved OUT of this thin resolution bar into the in-viewport
@@ -1761,14 +1754,6 @@ internal sealed class EditorApplication {
 
         if (showGizmos)
             DrawComponentGizmos(gizmoMin, gizmoSize);
-        else if (ProbeRenderState.AnyDebugActive) {
-            // The probe-debug overlays are their OWN tool, independent of the component-gizmo toggle —
-            // so they still draw when component gizmos are off. (When gizmos ARE on, DrawComponentGizmos
-            // already draws them.) Needs its own gizmoDrawer.Begin since DrawComponentGizmos was skipped.
-            gizmoDrawer.Begin(editorCamera, gizmoMin, gizmoSize, ImGui.GetWindowDrawList());
-            ProbeRenderState.DrawProbes(gizmoDrawer);
-            ProbeRenderState.DrawReflections(gizmoDrawer);
-        }
 
         // Arm vertex snapping while V is held over the viewport (raw key so it works regardless of which
         // panel has ImGui focus, suppressed while typing). On-demand rendering means we must keep
@@ -1843,12 +1828,6 @@ internal sealed class EditorApplication {
             catch (Exception e) { ScriptGuard.ReportRepeating(sceneBehaviour, "OnDrawGizmos", e); }
         }
 
-        // DEBUG: probe-grid overlays (toolbar toggles / GI volume override). Always-on (not
-        // selection-gated) so the implicit auto-fit volumes show too — light probes green=occupied /
-        // red=air, reflection probes show occupied cubemap cells. The visual for the probe-density work.
-        ProbeRenderState.DrawProbes(gizmoDrawer);
-        ProbeRenderState.DrawReflections(gizmoDrawer);
-
         if (editorState.Selected is { IsActive: true } selected) {
             foreach (Behaviour behaviour in selected.Behaviours) {
                 try { behaviour.OnDrawGizmosSelected(gizmoDrawer); }
@@ -1889,8 +1868,6 @@ internal sealed class EditorApplication {
         if (editorState.SelectedSceneBehaviour is { } selectedSceneBehaviour) {
             try { selectedSceneBehaviour.OnDrawGizmosSelected(gizmoDrawer); }
             catch (Exception e) { ScriptGuard.ReportRepeating(selectedSceneBehaviour, "OnDrawGizmosSelected", e); }
-            // (The IrradianceVolume box-resize handles were removed with the GL probe baker — P0.5. The
-            // unified GlobalIllumination volume is a global post-process override with no in-world bounds.)
         }
     }
 
@@ -2276,19 +2253,8 @@ internal sealed class EditorApplication {
                 if (ImGui.MenuItem($"{EditorIcons.Pin}  Component Gizmos", (string)null, giz)) {
                     showGizmos = !giz; prefs.ShowGizmos = showGizmos; EditorPrefs.Save();
                 }
-
-                ImGui.Separator();
-                ImGui.TextDisabled("GI Debug");
-                bool probes = ProbeRenderState.ProbeShowAll;
-                string probeHint = probes
-                    ? $" ({ProbeRenderState.ProbeOccupiedCount} occupied / {ProbeRenderState.ProbeTotalCount} total)" : "";
-                if (ImGui.MenuItem($"{EditorIcons.ProbeLight}  Light Probes{probeHint}", (string)null, probes))
-                    ProbeRenderState.ProbeShowAll = !probes;
-                bool refl = ProbeRenderState.ReflectionShowAll;
-                string reflHint = refl
-                    ? $" ({ProbeRenderState.ReflectionCapturedCount} local / {ProbeRenderState.ReflectionTotalCount} total)" : "";
-                if (ImGui.MenuItem($"{EditorIcons.ProbeReflection}  Reflection Probes{reflHint}", (string)null, refl))
-                    ProbeRenderState.ReflectionShowAll = !refl;
+                // The GL-era probe/reflection GI-debug toggles lived here; removed with the legacy GI
+                // stack (Lumen V2). Lumen's own debug views will repopulate this menu when they land.
                 ImGui.EndPopup();
             }
         }

@@ -18,6 +18,14 @@ cbuffer FogConstants : register(b0) {
     float3   Tint;               float Anisotropy;
     float    Scattering; float AmbientScatter; float SunGlow; float SunGlowSharpness;
     float    StepCount; float MaxDistance; float ShadowMapTexel; float Exposure;
+
+    // --- God rays (aesthetic shafts, density decoupled from the fog) ---
+    float3   ShaftTint;          float ShaftIntensity;  // ShaftIntensity==0 ⇒ shaft layer off (CPU gate)
+    float    ShaftDensity; float ShaftDecay; float ShaftSharpness; float ShaftPad;
+
+    // --- Volumetric dust (procedural sun-lit motes) ---
+    float3   DustDrift;          float DustIntensity;   // DustIntensity==0 ⇒ dust layer off (CPU gate)
+    float    DustSize; float DustSparkle; float Time; float DustPad;
 };
 
 Texture2D      DepthTex      : register(t0);
@@ -79,6 +87,53 @@ float SunVisibility(float3 wp) {
 }
 float IGN(float2 pix) { return frac(52.9829189 * frac(dot(pix, float2(0.06711056, 0.00583715)))); }
 
+// --- Procedural dust noise (cheap 3D value noise) ---
+float3 Hash33(float3 p) {
+    p = float3(dot(p, float3(127.1, 311.7, 74.7)),
+               dot(p, float3(269.5, 183.3, 246.1)),
+               dot(p, float3(113.5, 271.9, 124.6)));
+    return frac(sin(p) * 43758.5453);
+}
+float ValueNoise3(float3 p) {
+    float3 i = floor(p), f = frac(p);
+    float3 u = f * f * (3.0 - 2.0 * f);
+    float n000 = Hash33(i + float3(0, 0, 0)).x;
+    float n100 = Hash33(i + float3(1, 0, 0)).x;
+    float n010 = Hash33(i + float3(0, 1, 0)).x;
+    float n110 = Hash33(i + float3(1, 1, 0)).x;
+    float n001 = Hash33(i + float3(0, 0, 1)).x;
+    float n101 = Hash33(i + float3(1, 0, 1)).x;
+    float n011 = Hash33(i + float3(0, 1, 1)).x;
+    float n111 = Hash33(i + float3(1, 1, 1)).x;
+    float nx00 = lerp(n000, n100, u.x), nx10 = lerp(n010, n110, u.x);
+    float nx01 = lerp(n001, n101, u.x), nx11 = lerp(n011, n111, u.x);
+    return lerp(lerp(nx00, nx10, u.y), lerp(nx01, nx11, u.y), u.z);
+}
+// DISCRETE dust motes via a cellular (Worley) field: each grid cell holds ONE jittered point; the mote is a
+// sharp radial falloff around it — distinct sparkling specks in empty air, NOT the soft cloudy blobs that
+// value noise produces. Only a random subset of cells actually carry a mote (presence hash), so the volume
+// stays sparse. DustSize scales the cell frequency (higher ⇒ smaller, denser motes).
+float DustMotes(float3 worldPos) {
+    float3 p = (worldPos + DustDrift * Time) * (DustSize * 1.5);
+    float3 cell = floor(p), f = p - cell;
+    float acc = 0.0;
+    // Search the 3x3x3 neighbourhood so a mote near a cell edge still lights this sample.
+    [unroll] for (int dz = -1; dz <= 1; dz++)
+    [unroll] for (int dy = -1; dy <= 1; dy++)
+    [unroll] for (int dx = -1; dx <= 1; dx++) {
+        float3 o = float3(dx, dy, dz);
+        float3 h = Hash33(cell + o);           // h.xyz = jittered point in the cell; reuse .x as presence
+        if (h.x > 0.82) {                      // ~18% of cells carry a mote → sparse
+            float3 pt = o + h;                 // point position relative to our cell origin
+            float d = length(f - pt);
+            acc += saturate(1.0 - d / 0.35);   // sharp radial mote (radius 0.35 of a cell)
+        }
+    }
+    float m = saturate(acc);
+    return m * m;                              // tighten the core → punctate sparkle
+}
+float DustField(float3 worldPos) { return DustMotes(worldPos); }
+
 float4 PSMain(VSOut i) : SV_Target {
     float depth = DepthTex.SampleLevel(LinearClamp, i.Uv, 0).r;
     float3 rayStart = CameraPos;
@@ -102,19 +157,51 @@ float4 PSMain(VSOut i) : SV_Target {
     float3 sunSource = SunColor * (phaseSun * Scattering);
     float3 ambSource = SkyAmbient * AmbientScatter;
 
+    // God-ray shaft layer: shadow-gated sun in-scatter with its OWN phase (ShaftSharpness) and an
+    // accumulation weight (ShaftDensity) decoupled from the fog's SigmaT — so shafts are visible even
+    // when the fog density is at a physical (low) value. ShaftIntensity==0 ⇒ CPU left it off, skip.
+    bool shaftOn = ShaftIntensity > 1e-6;
+    float shaftPhase = HG(mu, clamp(ShaftSharpness, 0.0, 0.97));
+    float3 shaftAccum = 0;
+
+    // Dust layer: procedural motes lit by the (shadow-gated) sun, forward-scattered. Pure additive glow —
+    // does NOT contribute to extinction (transmittance), so it never thickens the air. DustIntensity==0 ⇒ off.
+    bool dustOn = DustIntensity > 1e-6;
+    float dustPhase = HG(mu, 0.55);
+    float3 dustAccum = 0;
+
     float3 scatter = 0; float transmittance = 1.0;
     [loop] for (int s = 0; s < steps; s++) {
         float t = (s + jitter) * stepLen;
         float3 p = rayStart + rayDir * t;
+        float vis = -1.0;   // lazily evaluated shadow visibility (shared by fog/shaft/dust)
         float sigma = SigmaT(p.y);
         if (sigma > 1e-6) {
             float stepT = exp(-sigma * stepLen);
-            float vis = SunVisibility(p);
+            vis = SunVisibility(p);
             float3 src = ALBEDO * (sunSource * vis + ambSource);
             scatter += src * (transmittance * (1.0 - stepT));
             transmittance *= stepT;
-            if (transmittance < 0.002) break;
         }
+        if (shaftOn) {
+            if (vis < 0.0) vis = SunVisibility(p);
+            float decay = exp(-ShaftDecay * t);
+            shaftAccum += (vis * shaftPhase * ShaftDensity * decay * stepLen) * transmittance;
+        }
+        if (dustOn) {
+            // Floating dust reads as a NEAR-camera effect — fade it out past ~12 m so it never becomes a
+            // sky-wide texture on distant geometry (which looked like fog, not motes).
+            float distFade = saturate(1.0 - t / 12.0);
+            float mote = DustField(p) * distFade;
+            if (mote > 1e-3) {
+                if (vis < 0.0) vis = SunVisibility(p);
+                // Motes catch the sun (shadow-gated, forward-scattered) AND pick up a little skylight, so
+                // they stay faintly visible in shade / sunless scenes instead of vanishing.
+                float3 lit = SunColor * (vis * dustPhase) + SkyAmbient * 0.15;
+                dustAccum += (mote * stepLen) * transmittance * lit;
+            }
+        }
+        if (transmittance < 0.002) break;
     }
     if (transmittance > 0.002 && surfaceDist > marchDist) {
         float tau = OpticalDepth(rayStart, rayDir, marchDist, surfaceDist);
@@ -127,6 +214,16 @@ float4 PSMain(VSOut i) : SV_Target {
     scatter += SunColor * (glow * (1.0 - transmittance));
 
     scatter *= Tint;
+
+    // Aesthetic layers, added AFTER the fog tint so they grade independently. Shaft uses the shadowed sun
+    // colour with its own tint; dust already carries its sun+sky lighting from the march (just scale here).
+    if (shaftOn)
+        scatter += shaftAccum * SunColor * ShaftTint * ShaftIntensity;
+    if (dustOn)
+        scatter += dustAccum * (DustIntensity * DustSparkle);
+
+    // NaN/Inf scrub: component SELECT, never mix(v,0,flag) (float mix is arithmetic and NaN*0==NaN —
+    // proven leak in temporal-feedback shaders; see the project gotchas).
     if (any(isnan(scatter)) || any(isinf(scatter))) scatter = 0;
 
     // Fog now composites in HDR (the scene target is R16F; the final composite tonemaps). Output RAW HDR

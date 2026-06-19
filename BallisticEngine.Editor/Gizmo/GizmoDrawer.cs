@@ -117,9 +117,8 @@ internal sealed class GizmoDrawer : IGizmos {
     }
 
     // A SOLID (filled) sphere drawn as a camera-facing shaded disc — bold + opaque so the colour reads at a
-    // glance (the DDGI probe blobs: a wire sphere showed "hiçbir şey belli değil"). Projects the centre + a
-    // world-radius offset to get the on-screen pixel radius, then fills a disc in the current Color with a
-    // small darker rim for roundness. Behind-geometry probes draw dimmer (occlusion) like the lines do.
+    // glance. Projects the centre + a world-radius offset to get the on-screen pixel radius, then fills a disc
+    // in the current Color with a small darker rim for roundness. Behind-geometry markers draw dimmer.
     public void DrawSolidSphere(Vector3 center, float radius) {
         Vector4 cc = Vector4.Transform(new Vector4(center, 1f), vp);
         if (cc.W <= 1e-4f) return;                       // behind the camera

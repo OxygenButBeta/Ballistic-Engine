@@ -62,6 +62,11 @@ public sealed class Dx12GtaoPass : IRenderPass, IDisposable {
     // The blurred AO the deferred lighting pass samples (gtaoA after the V blur). Exposed via ctx.AoResult.
     public CpuDescriptorHandle ResultSrvCpu => gtaoA.ColorSrvCpu;
 
+    // The AO target itself — the optional RT sky-occlusion pass (Dx12RtaoPass, event 250) reads it as an SRV,
+    // multiplies by sky-visibility into its OWN target, then copies the result back here (CopyDest). gtaoA does
+    // not need UAV for that, so it stays a plain RTV+SRV target.
+    public Dx12OffscreenTarget AoTarget => gtaoA;
+
     public unsafe Dx12GtaoPass(Dx12Device device, int width, int height) {
         dev = device;
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);

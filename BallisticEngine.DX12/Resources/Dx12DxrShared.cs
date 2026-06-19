@@ -3,14 +3,13 @@ using Vortice.Direct3D12;
 
 namespace BallisticEngine.DX12;
 
-// Shared DXR substrate used by THREE consumers — RT sun shadows (still inline core in the orchestrator),
-// the GI pass (Dx12GiPass, RT-GI branch), and the Reflections pass (Dx12ReflectionsPass, RT-reflections
-// branch). Before chunk 10 these lived as four scattered DX12HDRenderer fields (sceneAS / device5 /
+// Shared DXR substrate used by RT sun shadows and RT reflections. Before chunk 10 these lived as
+// scattered DX12HDRenderer fields (sceneAS / device5 /
 // dxrChecked+dxrAvailable / rtGeometry) that EnsureRtShadows / EnsureRtGi / EnsureRtReflections each lazily
 // created on a first-come basis. When GI + Reflections move into passes, that shared state can no longer be
-// a renderer field reachable by all three — so it's collected into THIS holder, which the orchestrator
-// creates once and threads through Dx12FrameContext (Dxr). RT shadows still references it inline; the two
-// passes reference it via ctx. The lazy-create-on-first-use semantics are PRESERVED verbatim: whichever
+// a renderer field reachable by both — so it's collected into THIS holder, which the orchestrator
+// creates once and threads through Dx12FrameContext (Dxr). RT shadows still references it inline; the
+// reflections pass references it via ctx. The lazy-create-on-first-use semantics are PRESERVED verbatim: whichever
 // effect runs first builds sceneAS/device5/rtGeometry, the rest reuse them (a static scene builds the AS
 // once). This is an ORCHESTRATION holder only — no Lumen/DXR algorithm lives here (hard constraint).
 public sealed class Dx12DxrShared : IDisposable {
@@ -29,13 +28,6 @@ public sealed class Dx12DxrShared : IDisposable {
     Dx12SceneAS sceneAS;
     ID3D12Device5 device5;
     Dx12RtGeometry rtGeometry;
-
-    // The DDGI world-probe radiance cache (BALLISTIC_DX12_DDGI=1). Inline it was a DX12HDRenderer field shared
-    // between DrawRtGi (which CREATES + updates it) and DrawRtReflections (which READS its atlas/grid/ProbeState
-    // as the hit ambient). With GI + Reflections in separate passes that shared field moves HERE: the GI pass
-    // creates it lazily in DrawRtGi (Ddgi = new Dx12Ddgi(dev) the first DDGI frame) and the Reflections pass
-    // reads it via ctx.Dxr.Ddgi. Settable so the GI pass can assign the instance it creates; null until then.
-    public Dx12Ddgi Ddgi { get; set; }
 
     public Dx12DxrShared(Dx12Device device) { dev = device; }
 
@@ -66,7 +58,6 @@ public sealed class Dx12DxrShared : IDisposable {
     public Dx12RtGeometry RtGeometry => rtGeometry ??= new Dx12RtGeometry(dev);
 
     public void Dispose() {
-        Ddgi?.Dispose();
         rtGeometry?.Dispose();
         sceneAS?.Dispose();
         device5?.Dispose();

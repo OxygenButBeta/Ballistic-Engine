@@ -10,7 +10,7 @@ public enum ConditionKind { Show, Hide, Enable, Disable }
 
 // Base for [ShowIf]/[HideIf]/[EnableIf]/[DisableIf]. Two forms:
 //   [ShowIf("enabled")]                  -> truthiness of the sibling (bool true / non-zero / non-null)
-//   [ShowIf("mode", GiMode.RayTraced)]   -> equality against the given value (enums, ints, bools, ...)
+//   [ShowIf("mode", SomeMode.Advanced)]  -> equality against the given value (enums, ints, bools, ...)
 // Multiple are allowed and AND-combined (every Show/Enable condition must pass; any Hide/Disable that
 // matches hides/disables). A VolumeComponent sibling that is a VolumeParameter is unwrapped to its
 // .Value before comparison, so the same attribute works on plain components and volume overrides.

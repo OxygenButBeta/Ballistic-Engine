@@ -9,8 +9,7 @@ public interface IGizmos {
     Vector3 Color { get; set; }
 
     // World position of the camera the gizmos are being drawn through (editor camera in the editor).
-    // Lets a gizmo place camera-relative geometry — e.g. the camera-centered DDGI probe grid the GI
-    // Debug visualiser re-derives on the CPU (GiDebugGrid.Snap). Editor fills it in Begin().
+    // Lets a gizmo place camera-relative geometry. Editor fills it in Begin().
     Vector3 CameraPosition { get; }
 
     void DrawLine(Vector3 from, Vector3 to);
@@ -21,9 +20,8 @@ public interface IGizmos {
     void DrawWireSphere(Vector3 center, float radius);
 
     // A SOLID (filled, shaded) sphere — for data points that need a bold readable blob, not a faint wire
-    // outline (the DDGI probe visualiser: a full coloured sphere per probe so its cached colour is obvious,
-    // unlike a wire sphere where "hiçbir şey belli değil"). Implementations may approximate with a camera-facing
-    // shaded disc/impostor if true filled geometry is expensive; the point is a solid, opaque, coloured marker.
+    // outline. Implementations may approximate with a camera-facing shaded disc/impostor if true filled
+    // geometry is expensive; the point is a solid, opaque, coloured marker.
     void DrawSolidSphere(Vector3 center, float radius);
 
     // Cone with its apex at `apex` opening along `direction` (length = height), with the given

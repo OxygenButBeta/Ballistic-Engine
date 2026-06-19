@@ -175,6 +175,16 @@ float4 PSTemporal(VSOut i) : SV_Target {
     bool valid = hasHistory > 0.5 && all(prevUV >= 0.0) && all(prevUV <= 1.0);
     if (!valid) return current;
 
+    // CRITICAL for mirrors: the G-buffer motion buffer tracks the REFLECTIVE SURFACE, NOT the reflected image
+    // (the mirrored content moves at a DIFFERENT screen velocity than the surface). So surface-motion
+    // reprojection is only valid when the surface is (nearly) STATIC on screen — under any real motion it pulls
+    // the wrong reflected pixel and the temporal blend smears/erases the reflection (the "reflections vanished"
+    // bug). Gate the temporal HARD on screen motion: ~0 motion → full denoise (kills the static-camera DDGI
+    // churn, the actual goal); any real motion → pass the current reflection straight through (sharp, no erase).
+    float motionPx = length(motion / max(TexelSize, 1e-6.xx));
+    float motionTrust = saturate(1.0 - motionPx * 0.5);   // >~2 texels of motion → 0 (pure current frame)
+    if (motionTrust < 0.01) return current;
+
     float4 history = SanitizeSsr(DepthTex.SampleLevel(LinearClamp, prevUV, 0));
 
     // Neighbourhood clamp (variance) on the RGB so a disoccluded mirror flushes instead of smearing.
@@ -190,9 +200,9 @@ float4 PSTemporal(VSOut i) : SV_Target {
     float3 hi = m1 + sigma * 2.0 + 0.02.xxx;
     float3 clamped = clamp(history.rgb, lo, hi);
 
-    // EMA toward the (clamped) history. ~0.85 = a steady mirror over ~7 frames; the motion-buffer reprojection
-    // tracks moving surfaces so a static scene converges and holds (no jitter) while a pan still updates.
-    float alpha = 0.15;
+    // EMA toward the (clamped) history, faded out by motionTrust so a static mirror converges (smooth) while any
+    // motion keeps the live reflection. alpha is the blend toward CURRENT, so low alpha = more history = smoother.
+    float alpha = lerp(1.0, 0.15, motionTrust);   // static → 0.15 (heavy smoothing); moving → 1.0 (current only)
     float3 outRgb = lerp(clamped, current.rgb, alpha);
     return float4(outRgb, current.a);   // strength = current (not accumulated)
 }

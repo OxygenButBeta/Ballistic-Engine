@@ -18,7 +18,6 @@ namespace BallisticEngine.DX12;
 //   Sky .............................. DrawProcSky / DrawSkybox
 //   AerialPerspective ................ DrawAerialPerspective
 //   Transparents ..................... DrawTransparents
-//   GlobalIllumination ............... DrawSsgi / DrawRtGi
 //   Fog .............................. DrawFog
 //   Reflections ...................... DrawSsr / DrawRtReflections
 //   PostProcess ...................... SSAO / TAA / FSR
@@ -35,7 +34,6 @@ public enum Dx12RenderPassEvent {
     Sky                   = 350,
     AerialPerspective     = 400,
     Transparents          = 450,
-    GlobalIllumination    = 500,
     Fog                   = 550,
     Reflections           = 600,
     PostProcess           = 650,

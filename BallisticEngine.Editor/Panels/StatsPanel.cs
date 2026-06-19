@@ -93,25 +93,9 @@ internal sealed class StatsPanel {
                     Line(name, $"{ms:0.00} ms", scale);
         }
 
-        // Global Illumination readout — "what is the data / how is it affecting the scene": which GI
-        // systems are live, their strengths, the probe grid + occupancy, and bake progress.
-        EditorDecoration.DrawSectionHeader("Global Illumination");
-        int pGx = ProbeRenderState.ProbeGridX, pGy = ProbeRenderState.ProbeGridY, pGz = ProbeRenderState.ProbeGridZ;
-        int pOcc = ProbeRenderState.ProbeOccupiedCount, pTot = ProbeRenderState.ProbeTotalCount;
-        Line("Light probes",
-            ProbeRenderState.ProbesEnabled ? $"on  x{ProbeRenderState.ProbeIntensity:0.0#}" : "OFF", scale);
-        if (pGx > 0)
-            Line("  probe grid", $"{pGx}x{pGy}x{pGz} = {pGx * pGy * pGz}", scale);
-        if (pTot > 0)
-            Line("  occupied / air", $"{pOcc} / {pTot - pOcc}", scale);
-        if (ProbeRenderState.IsBaking)
-            Line("  baking", $"{ProbeRenderState.BakeProgress * 100:0}%", scale);
-        Line("Reflection probes",
-            ProbeRenderState.ReflectionsEnabled ? $"on  x{ProbeRenderState.ReflectionIntensity:0.0#}" : "OFF", scale);
-        if (ProbeRenderState.ReflectionTotalCount > 0)
-            Line("  local / total", $"{ProbeRenderState.ReflectionCapturedCount} / {ProbeRenderState.ReflectionTotalCount}", scale);
-        Line("Lumen (SDF-GI)",
-            ProbeRenderState.LumenEnabled ? $"on  x{ProbeRenderState.LumenIntensity:0.0#}" : "OFF", scale);
+        // Global Illumination readout — the GL-era probe/SDF-GI summary lived here; it was removed with
+        // the legacy GI stack (Lumen V2). Lumen's own scene/card/atlas stats will repopulate this section
+        // (plan P1 reports object/card/atlas/dirty counts).
 
         EditorDecoration.DrawSectionHeader("Scene");
         Line("Entities", scene.Entities.Count.ToString(), scale);

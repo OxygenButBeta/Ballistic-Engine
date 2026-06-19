@@ -37,14 +37,4 @@
       </None>
     </ItemGroup>
 
-    <!-- OIDN (Intel Open Image Denoise) runtime DLLs: the API DLL loads core (weights) + a device DLL
-         (CPU fallback + HIP for AMD) + TBB. All must sit next to the exe. Condition'd + flowed transitively
-         like the FSR DLLs. The .exe tools (oidnDenoise/Benchmark/Test) are skipped. -->
-    <ItemGroup Condition="Exists('..\native\oidn\bin\OpenImageDenoise.dll')">
-      <None Include="..\native\oidn\bin\*.dll">
-        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-        <Link>%(Filename)%(Extension)</Link>
-      </None>
-    </ItemGroup>
-
 </Project>

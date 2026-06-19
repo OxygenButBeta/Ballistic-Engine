@@ -60,6 +60,12 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
         public Vector3 Tint; public float Anisotropy;
         public float Scattering, AmbientScatter, SunGlow, SunGlowSharpness;
         public float StepCount, MaxDistance, ShadowMapTexel, Exposure;
+        // God rays (must mirror the HLSL cbuffer order/padding exactly).
+        public Vector3 ShaftTint; public float ShaftIntensity;
+        public float ShaftDensity, ShaftDecay, ShaftSharpness, ShaftPad;
+        // Volumetric dust.
+        public Vector3 DustDrift; public float DustIntensity;
+        public float DustSize, DustSparkle, Time, DustPad;
     }
 
     readonly Dx12Device dev;
@@ -150,6 +156,23 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
             SunGlow = pf.VolumetricSunGlow, SunGlowSharpness = pf.VolumetricSunGlowSharpness,
             StepCount = pf.VolumetricStepCount, MaxDistance = pf.VolumetricMaxDistance,
             ShadowMapTexel = 1f / ShadowMapSize, Exposure = 1.0e-5f,   // match the opaque pre-exposure
+            // God rays: ShaftIntensity==0 ⇒ shader skips the layer (CPU master gate). Fold the master
+            // intensity into the per-shaft strength here so the shader has a single multiplier. The
+            // BALLISTIC_DX12_SHAFTS door force-enables the layer for A/B without authoring a volume.
+            ShaftTint = pf.ShaftTint,
+            ShaftIntensity = (pf.ShaftsEnabled || ctx.Doors.Shafts) ? pf.ShaftIntensity : 0f,
+            ShaftDensity = pf.ShaftDensity, ShaftDecay = pf.ShaftDecay,
+            ShaftSharpness = pf.ShaftSharpness, ShaftPad = 0f,
+            // Dust: DustIntensity==0 ⇒ shader skips the layer. Time drives the drift; frozen to 0 under
+            // deterministic capture so paused/bal-render frames stay byte-identical. BALLISTIC_DX12_DUST
+            // door force-enables for A/B.
+            DustDrift = pf.DustDrift,
+            DustIntensity = (pf.DustEnabled || ctx.Doors.Dust) ? pf.DustIntensity : 0f,
+            DustSize = pf.DustSize, DustSparkle = pf.DustSparkle,
+            // FrameCounter advances every frame (unlike GrainFrame, which only ticks with SSGI on) and is
+            // already 0 under deterministic capture, so dust drifts in the editor/player but freezes for
+            // byte-identical captures. ~60 fps assumed for the seconds conversion.
+            Time = ctx.FrameCounter * (1f / 60f), DustPad = 0f,
         };
         *(FogConstants*)fogCbMapped = fc;
 
