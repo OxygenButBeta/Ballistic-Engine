@@ -231,8 +231,11 @@ public sealed class Dx12Device : IDisposable {
         // dev.Flush()es (which now drains the overlapped frame too), so the windowed path stays correct even
         // before P0c removes that flush. BALLISTIC_DX12_OVERLAP=0 is the kill-switch back to the single-wait
         // (P0a) frame; BALLISTIC_DX12_PIPELINED=0 disables even P0a.
-        bool overlap = pipelinedFrames && Environment.GetEnvironmentVariable("BALLISTIC_DX12_OVERLAP") != "0";
-        FramesInFlight = overlap ? 2 : 1;   // N=2 (default); 1 = no overlap (EndFrame waits). Raise to 3 (≤ MaxFramesInFlight) post-P0c.
+        string overlapEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_OVERLAP");
+        bool overlap = pipelinedFrames && overlapEnv != "0";
+        // N=2 default; OVERLAP=3 lets the CPU run TWO frames ahead (only helps when the present-flush is gone —
+        // P0c — or under a deep GPU-bound frame). Clamped to MaxFramesInFlight. 1 = no overlap (EndFrame waits).
+        FramesInFlight = !overlap ? 1 : (overlapEnv == "3" ? Math.Min(3, MaxFramesInFlight) : 2);
         frameAllocators = new ID3D12CommandAllocator[FramesInFlight];
         frameLists = new ID3D12GraphicsCommandList4[FramesInFlight];
         for (int i = 0; i < FramesInFlight; i++) {
