@@ -156,9 +156,13 @@ float4 PSMain(VSOut i) : SV_Target {
     // under-counts (each |projN| <= 1) and systematically washes the occlusion out toward 1.
     visibility = saturate(visibility / max(weightSum, 1e-4));
 
-    // Power shapes contrast; Intensity scales toward full occlusion (lerp from 1 = unoccluded).
+    // Power shapes contrast; Intensity scales toward full occlusion. Intensity in [0,1] lerps from unoccluded
+    // (1) toward the AO; ABOVE 1 it keeps deepening via an exponent (the AmbientOcclusion volume's slider goes
+    // past 1, so `saturate(Intensity)` silently capped it — a darker setting did nothing). The exponent form
+    // stays in [0,1] (no negative-AO from a lerp overshoot).
     float ao = pow(saturate(visibility), Power);
-    ao = lerp(1.0, ao, saturate(Intensity));
+    ao = Intensity <= 1.0 ? lerp(1.0, ao, max(Intensity, 0.0))
+                          : pow(ao, Intensity);   // >1 = stronger occlusion, clamped to [0,1] by pow of a [0,1] base
 
     if (MultiBounce > 0.5) {
         float3 albedo = AlbedoTex.SampleLevel(PointClamp, i.Uv, 0).rgb;

@@ -120,6 +120,7 @@ public static class VolumePostProcessing {
             fx.LumenDenoisePasses = gi.denoisePasses.Value;
             fx.LumenMultiBounce = gi.multiBounce.Value;
             fx.LumenReflections = gi.reflections.Value;
+            fx.LumenAoStrength = gi.aoStrength.Value;
         }
 
         if (stack.GetComponent<AerialPerspective>() is { } aerial) {

@@ -316,15 +316,27 @@ void CSDenoise(uint3 dtid : SV_DispatchThreadID) {
 }
 
 // ===== Combine: add the diffuse indirect into the HDR scene color =====
-// Indirect holds incoming irradiance E. The diffuse response is E * albedo * ao (Lambertian, the same albedo
-// the deferred pass used). The deferred pass SUPPRESSED its IBL diffuse ambient when Lumen is active (UseIBL
-// Diffuse=0), so this is not double-counting — Lumen OWNS the diffuse indirect. Specular IBL + direct light +
-// emissive are already in the scene color. Additive blend into the existing HDR target.
+// Indirect holds incoming irradiance E. The diffuse response is E * albedo * occlusion (Lambertian, the same
+// albedo the deferred pass used). The deferred pass SUPPRESSED its IBL diffuse ambient when Lumen is active
+// (UseIBLDiffuse=0), so this is not double-counting — Lumen OWNS the diffuse indirect. Specular IBL + direct
+// light + emissive are already in the scene color. Additive blend into the existing HDR target.
+//
+// OCCLUSION: the material's baked AO (GMaterial.b) ALWAYS applies (it's authored detail). The screen-space
+// GTAO (t4, the AmbientOcclusion volume's output) applies at AoStrength — the Lumen RT trace already carries
+// MACRO occlusion (rays that don't escape find less light), so full GTAO on top double-darkens corners. At
+// AoStrength 0 the GI sees only its own RT occlusion + material AO; at 1 the GTAO bites fully. This is how the
+// AmbientOcclusion override drives CONTACT detail in the GI (the high-frequency darkening the coarse cache /
+// few-ray gather miss). GTAO is at AO resolution → LinearClamp upsamples it.
 
 Texture2D<float4> IndirectIn : register(t0);   // E from CSTrace
 Texture2D<float4> GAlbedo    : register(t1);   // rgb albedo
-Texture2D<float4> GMaterial  : register(t2);   // b = AO
+Texture2D<float4> GMaterial  : register(t2);   // b = baked material AO
 Texture2D<float>  CombineDepth : register(t3);
+Texture2D<float>  GtaoTex    : register(t4);   // screen-space GTAO (1 = unoccluded); AmbientOcclusion volume
+
+cbuffer CombineConstants : register(b0) {
+    float AoStrength; float CombinePad0, CombinePad1, CombinePad2;   // how much GTAO bites the GI (0..1)
+};
 
 struct VSOut { float4 Position : SV_Position; float2 Uv : TEXCOORD0; };
 VSOut VSCombine(uint vid : SV_VertexID) {
@@ -340,8 +352,10 @@ float4 PSCombine(VSOut i) : SV_Target {
     if (depth >= 1.0) discard;                       // sky: leave the scene color untouched
     float3 E = IndirectIn.SampleLevel(LinearClamp, i.Uv, 0).rgb;
     float3 albedo = GAlbedo.SampleLevel(LinearClamp, i.Uv, 0).rgb;
-    float ao = GMaterial.SampleLevel(LinearClamp, i.Uv, 0).b;
-    float3 diffuseIndirect = E * albedo * ao / PI;   // Lambertian: outgoing = E*albedo/PI
+    float matAo = GMaterial.SampleLevel(LinearClamp, i.Uv, 0).b;
+    // GTAO eased by AoStrength (1 = no GTAO darkening; lerp toward the raw GTAO at full strength).
+    float gtao = lerp(1.0, GtaoTex.SampleLevel(LinearClamp, i.Uv, 0).r, saturate(AoStrength));
+    float3 diffuseIndirect = E * albedo * matAo * gtao / PI;   // Lambertian: outgoing = E*albedo/PI
     return float4(Sanitize(diffuseIndirect), 1.0);   // additive blend (One/One) adds onto the HDR scene color
 }
 

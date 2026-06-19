@@ -249,4 +249,8 @@ public sealed class PostProcessSettings {
     public int LumenDenoisePasses { get; set; } = 3;         // à-trous spatial denoise iterations (0 = raw)
     public bool LumenMultiBounce { get; set; } = true;       // accumulate multi-bounce in the radiance cache
     public bool LumenReflections { get; set; } = true;       // feed RT reflections from the radiance cache
+    // How much the screen-space GTAO (AmbientOcclusion volume) bites the GI's contact shading. The RT trace
+    // already has MACRO occlusion, so this is a partial contact-detail term, not a second full AO. 0 = GI sees
+    // only its own RT occlusion (+ baked material AO); 1 = full GTAO. Default 0.5.
+    public float LumenAoStrength { get; set; } = 0.5f;
 }

@@ -90,7 +90,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     ID3D12RootSignature combineRootSig; // 4-SRV table + sampler
     ID3D12PipelineState combinePso;
     ID3D12PipelineState combineDebugPso; // OPAQUE replace — BALLISTIC_DX12_LUMEN_DEBUG=1 shows raw E (no add)
-    Dx12DescriptorHeap combineSrv;      // 4 SRVs per pass
+    ID3D12Resource combineCb;
+    unsafe byte* combineCbMapped;
+    Dx12DescriptorHeap combineSrv;      // 5 SRVs per pass (E/albedo/material/depth/GTAO)
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct CombineConstants { public float AoStrength; public float Pad0, Pad1, Pad2; }
 
     [StructLayout(LayoutKind.Sequential)]
     struct LumenConstants
@@ -262,12 +267,21 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // (ctx.LumenActiveThisFrame → UseIBLDiffuse=0), so this adds Lumen's diffuse indirect without double-count.
         // BALLISTIC_DX12_LUMEN_DEBUG=1 swaps to an OPAQUE-replace PSO that shows the raw irradiance E instead. ===
         gbuffer.ToShaderResource();
+        // GTAO into the GI combine at the AmbientOcclusion volume's strength (env override _LUMEN_AO). The GTAO
+        // buffer is ctx.AoResult when AO is actually rendered this frame; else a valid fallback + AoStrength 0
+        // (so the fallback's contents never affect the output). This is what makes the AmbientOcclusion override
+        // drive contact detail in the GI; the RT trace already has macro occlusion so the default strength is
+        // partial (no double-darkening of corners).
+        bool aoOn = ctx.Doors.Ssao && fx.SSAOEnabled;
+        float aoStrength = aoOn ? EnvF("BALLISTIC_DX12_LUMEN_AO", fx.LumenAoStrength) : 0f;
+        *(CombineConstants*)combineCbMapped = new CombineConstants { AoStrength = aoStrength };
         combineSrv.Reset();
-        int cb = combineSrv.AllocateRange(4);
+        int cb = combineSrv.AllocateRange(5);
         dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 0), indirectFiltered.ColorSrvCpu, heapType);  // t0 E (denoised)
         dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 1), gbuffer.ColorSrvCpu(0), heapType);        // t1 albedo
-        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 2), gbuffer.ColorSrvCpu(2), heapType);        // t2 material (ao)
+        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 2), gbuffer.ColorSrvCpu(2), heapType);        // t2 material (baked ao)
         dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 3), gbuffer.DepthSrvCpu, heapType);           // t3 depth
+        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 4), aoOn ? ctx.AoResult : gbuffer.DepthSrvCpu, heapType); // t4 GTAO
         bool debugE = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_DEBUG") == "1";
         ID3D12PipelineState pso = debugE ? combineDebugPso : combinePso;
         target.RenderColorOnly(cl =>
@@ -275,7 +289,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.SetGraphicsRootSignature(combineRootSig);
             cl.SetPipelineState(pso);                  // additive One/One blend (or opaque replace when debugE)
             cl.SetDescriptorHeaps(combineSrv.Heap);
-            cl.SetGraphicsRootDescriptorTable(0, combineSrv.Gpu(cb));
+            cl.SetGraphicsRootConstantBufferView(0, combineCb.GPUVirtualAddress);
+            cl.SetGraphicsRootDescriptorTable(1, combineSrv.Gpu(cb));
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
         });
@@ -395,8 +410,10 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             ResourceDescription.Buffer((ulong)sunSize), ResourceStates.GenericRead);
         sunCbMapped = sunCb.Map<byte>(0);
 
-        // --- combine root sig: 4-SRV table (E / albedo / material / depth) + clamp sampler. Additive PSO. ---
-        var combRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 4, baseShaderRegister: 0);
+        // --- combine root sig: CBV b0 (AoStrength) + 5-SRV table (E / albedo / material / depth / GTAO) + clamp
+        // sampler. Additive PSO. ---
+        var combCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Pixel);
+        var combRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 5, baseShaderRegister: 0);
         var combTable = new RootParameter1(new RootDescriptorTable1(combRange), ShaderVisibility.Pixel);
         var combSamp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0)
         {
@@ -405,7 +422,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
         };
         combineRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { combTable }, new[] { combSamp })));
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { combCbv, combTable }, new[] { combSamp })));
 
         byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSCombine", "LumenGi.hlsl");
         byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSCombine", "LumenGi.hlsl");
@@ -425,7 +442,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         combineDebugPso = dev.Device.CreateGraphicsPipelineState(MakeCombine(psDebug, BlendDescription.Opaque));
 
         combineSrv = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 8, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 10, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+        int combCbSize = (Marshal.SizeOf<CombineConstants>() + 255) & ~255;
+        combineCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)combCbSize), ResourceStates.GenericRead);
+        combineCbMapped = combineCb.Map<byte>(0);
 
         BuildCardPipeline();
     }
@@ -512,7 +533,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         tracePso?.Dispose(); traceRootSig?.Dispose(); traceCb?.Dispose(); sunCb?.Dispose();
         cardPso?.Dispose(); cardRootSig?.Dispose(); cardCb?.Dispose();
         denoisePso?.Dispose(); denoiseRootSig?.Dispose(); denoiseCb?.Dispose(); denoiseSrv?.Dispose();
-        combinePso?.Dispose(); combineDebugPso?.Dispose(); combineRootSig?.Dispose(); combineSrv?.Dispose();
+        combinePso?.Dispose(); combineDebugPso?.Dispose(); combineRootSig?.Dispose(); combineSrv?.Dispose(); combineCb?.Dispose();
         indirect?.Dispose(); indirectFiltered?.Dispose();
     }
 }
