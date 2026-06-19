@@ -76,9 +76,9 @@ public sealed class DX12HDRenderer : HDRenderer
     // vector (prevUV - currUV) into the G-buffer's RG16F motion target — consumed by TAA and the FSR
     // upscaler. Camera reprojection (correct for static geometry, which is all of the heavy test content);
     // per-object motion for animated/physics renderers is a follow-up (would bake a prev model per draw).
-    ID3D12Resource motionCb;
-    unsafe byte* motionCbMapped;
+    Dx12FrameCb<MotionConstants> motionCb;   // P0b: N-buffered (FrameSlot-offset) so overlap can't stomp it
     Matrix4x4 motionPrevViewProj; // previous frame's UNJITTERED view*proj
+    float normalLodBiasCached;     // P2: BALLISTIC_DX12_NORMAL_LOD_BIAS cached once (was parsed every frame)
     bool motionPrevValid;
 
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
@@ -296,8 +296,7 @@ public sealed class DX12HDRenderer : HDRenderer
         public float FramePad0, FramePad1;
     }
 
-    ID3D12Resource frameCb;
-    unsafe byte* frameCbMapped;
+    Dx12FrameCb<FrameConstants> frameCb;   // P0b: N-buffered (FrameSlot-offset)
 
     public DX12HDRenderer(Dx12Device device)
     {
@@ -509,10 +508,7 @@ public sealed class DX12HDRenderer : HDRenderer
 
         BuildShadows();
 
-        int frameCbSize = (System.Runtime.InteropServices.Marshal.SizeOf<FrameConstants>() + 255) & ~255;
-        frameCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)frameCbSize), ResourceStates.GenericRead);
-        frameCbMapped = frameCb.Map<byte>(0);
+        frameCb = new Dx12FrameCb<FrameConstants>(dev);
 
         // Deferred lighting now built inside Dx12DeferredLightingPass's ctor (chunk 9), constructed below at
         // pass-graph assembly. Was BuildDeferredLighting(). clusteredLights (the CPU froxel gather feeds it)
@@ -872,10 +868,10 @@ public sealed class DX12HDRenderer : HDRenderer
             new RootSignatureDescription1(RootSignatureFlags.AllowInputAssemblerInputLayout,
                 new[] { cbv, matTable, motionCbv }, new[] { wrap })));
 
-        int motionCbSize = (System.Runtime.InteropServices.Marshal.SizeOf<MotionConstants>() + 255) & ~255;
-        motionCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)motionCbSize), ResourceStates.GenericRead);
-        motionCbMapped = motionCb.Map<byte>(0);
+        motionCb = new Dx12FrameCb<MotionConstants>(dev);
+        // P2 — cache the normal-map LOD bias env door once (was parsed every BeginRender).
+        normalLodBiasCached = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_NORMAL_LOD_BIAS"),
+            System.Globalization.CultureInfo.InvariantCulture, out float nlbInit) ? nlbInit : 0.5f;
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("GBuffer.hlsl");
         byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "GBuffer.hlsl");
@@ -1186,14 +1182,13 @@ public sealed class DX12HDRenderer : HDRenderer
         // V2 (fixes D3): normal-map LOD bias — sample normal maps slightly coarser to clean up the residual
         // aliasing the new upload-time mip chain (Dx12Texture2D) doesn't fully catch. Default +0.5 (gentle —
         // the mip chain does the heavy lifting; preserves detail). BALLISTIC_DX12_NORMAL_LOD_BIAS tunes it.
-        float normalLodBias = 0.5f;
-        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_NORMAL_LOD_BIAS"),
-                System.Globalization.CultureInfo.InvariantCulture, out float nlb)) normalLodBias = nlb;
-        *(MotionConstants*)motionCbMapped = new MotionConstants
+        // P0b: the motion CB VALUE is built here, but WRITTEN after BeginFrame (below) so it lands in this
+        // frame's N-buffer slot — writing before BeginFrame would target the previous slot under overlap.
+        var motionConstants = new MotionConstants
         {
             ViewProjCur = Matrix4x4.Transpose(viewProjUnjittered),
             ViewProjPrev = Matrix4x4.Transpose(viewProjPrevForMotion),
-            NormalLodBias = normalLodBias,
+            NormalLodBias = normalLodBiasCached,
         };
 
         Vector3 camPos = vp.Transform.WorldPosition;
@@ -1281,6 +1276,9 @@ public sealed class DX12HDRenderer : HDRenderer
         // BALLISTIC_DX12_PIPELINED=0 (then every pass submits+waits as before — the byte-identical fallback).
         dev.BeginFrame();
 
+        // P0b: write the motion CB into THIS frame's N-buffer slot (FrameSlot is now set by BeginFrame).
+        motionCb.Write(motionConstants);
+
         // Per-frame constants (b1): cascade matrices + shadow params. The cascade layout (count, blend) and the
         // filtering/contact-shadow tail are volume-driven via PostFX (the Shadows VolumeComponent → bridge).
         // activeCascadeCount + shadowMapSize were resolved in RenderShadows (it owns the fit + any reallocation).
@@ -1301,7 +1299,7 @@ public sealed class DX12HDRenderer : HDRenderer
             ContactShadowSteps = PostFX.ContactShadowSteps,
             ContactShadowThickness = PostFX.ContactShadowThickness,
         };
-        *(FrameConstants*)frameCbMapped = fc;
+        frameCb.Write(fc);
 
         int draws = 0;
         int culled = 0;
@@ -1338,7 +1336,7 @@ public sealed class DX12HDRenderer : HDRenderer
             cl.SetGraphicsRootSignature(gbufferRootSig);
             cl.SetPipelineState(gbufferPso);
             cl.SetDescriptorHeaps(srvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(2, motionCb.GPUVirtualAddress); // b1 motion (per pass)
+            cl.SetGraphicsRootConstantBufferView(2, motionCb.Gpu); // b1 motion (per pass)
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
 
             foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
@@ -1477,7 +1475,7 @@ public sealed class DX12HDRenderer : HDRenderer
                     cl.SetGraphicsRootSignature(skinnedGbufferRootSig);
                     cl.SetPipelineState(skinnedGbufferPso);
                     cl.SetDescriptorHeaps(srvVisible.Heap);
-                    cl.SetGraphicsRootConstantBufferView(2, motionCb.GPUVirtualAddress); // b1 motion
+                    cl.SetGraphicsRootConstantBufferView(2, motionCb.Gpu); // b1 motion
                     cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
                     skinnedStateSet = true;
                 }
@@ -1559,7 +1557,7 @@ public sealed class DX12HDRenderer : HDRenderer
             {
                 cl.SetGraphicsRootSignature(gbufferRootSig);
                 cl.SetPipelineState(gbufferPso);
-                cl.SetGraphicsRootConstantBufferView(2, motionCb.GPUVirtualAddress);
+                cl.SetGraphicsRootConstantBufferView(2, motionCb.Gpu);
             }
 
             // GPU-driven whole-mesh geometry: compute cull + ExecuteIndirect + bindless materials, into the
@@ -1568,7 +1566,7 @@ public sealed class DX12HDRenderer : HDRenderer
             if (gpuDrivenOn && wholeMeshRenderers.Count > 0)
             {
                 draws += gpuDriven.RenderInto(cl, wholeMeshRenderers, viewProj, frustumPlanes,
-                    viewProjUnjittered, view, CameraNear, CameraFar, motionCb.GPUVirtualAddress);
+                    viewProjUnjittered, view, CameraNear, CameraFar, motionCb.Gpu);
                 tris += gpuDriven.LastTris;
             }
         });
@@ -1624,7 +1622,7 @@ public sealed class DX12HDRenderer : HDRenderer
             Dxr = dxr, // chunk 10: shared DXR substrate (sceneAS/device5/rtGeometry/ddgi) for the GI + Reflections passes
             LumenScene = lumenGiPass.Scene, // Lumen V2 P5: the radiance cache the Reflections pass samples for rough reflections
             FrameCbAddress =
-                frameCb.GPUVirtualAddress, // chunk 8: Transparents binds it; chunk 9: Deferred binds it too (b1 FrameConstants CBV)
+                frameCb.Gpu, // chunk 8: Transparents binds it; chunk 9: Deferred binds it too (b1 FrameConstants CBV)
             Doors = doors, PostFX = PostFX, Stats = RenderStats.Scene,
             FrameCounter = DeterministicCapture ? 0 : frameCounter, // monotonic; 0 when capturing → byte-identical
             BarriersDerived = barriersPath, // chunk 14 (V3): migrated passes skip their manual head transition when on
