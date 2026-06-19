@@ -16,13 +16,13 @@ public sealed class GlobalIllumination : VolumeComponent {
     public readonly BoolParameter enabled = new(true);
 
     [Tooltip("Overall strength of the indirect (diffuse GI) contribution. 1 = physical.")]
-    public readonly ClampedFloatParameter intensity = new(1f, 0f, 4f);
+    public readonly ClampedFloatParameter intensity = new(2f, 0f, 4f);
 
     [Tooltip("How much skylight enters through open sky-visibility (a sealed interior stays dark regardless).")]
-    public readonly ClampedFloatParameter skyIntensity = new(1f, 0f, 4f);
+    public readonly ClampedFloatParameter skyIntensity = new(1.5f, 0f, 4f);
 
-    [Tooltip("Hemisphere rays traced per pixel. Higher = less noise before denoise, more cost.")]
-    public readonly ClampedIntParameter rayCount = new(6, 1, 16);
+    [Tooltip("Hemisphere rays traced per pixel. Higher = less noise before denoise/temporal, more cost.")]
+    public readonly ClampedIntParameter rayCount = new(16, 1, 16);
 
     [Tooltip("Edge-aware spatial denoise iterations on the indirect (à-trous). 0 = raw (noisy).")]
     public readonly ClampedIntParameter denoisePasses = new(3, 0, 5);

@@ -200,7 +200,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             // accumulation (a fixed frame means a fixed, reproducible accumulation over the static camera — and the
             // accumulated result is the CLEAN one we want to measure, not a single noisy frame).
             HistoryValid = probeHistoryValid ? 1f : 0f,
-            ProbeAlpha = EnvF("BALLISTIC_DX12_LUMEN_PROBE_ALPHA", 0.2f),   // 0.2 = smoother recovery after motion (0.1 was too slow → gitgel)
+            ProbeAlpha = EnvF("BALLISTIC_DX12_LUMEN_PROBE_ALPHA", 0.05f),   // 0.05 = strong temporal accumulation (kills per-ray sparkle); the soft-trust blend handles motion so a low base alpha no longer causes gitgel
             PrevViewProj = Matrix4x4.Transpose(ctx.PrevViewProjUnjittered),   // world → prev clip (HLSL column-major)
         };
         *(LumenSun*)sunCbMapped = new LumenSun
@@ -624,11 +624,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // traversal/dispatch-bound, not pixel-bound) but DID cost quality (Cornell/Bistro hotspot ~5-8%). So the
         // scale stays opt-in (BALLISTIC_DX12_LUMEN_RESSCALE=2/4) for 4K / weak-GPU cases where pixel count bites;
         // the depth-aware upsample + UV-sampled trace/denoise are kept so it's correct when enabled.
-        // #3 PROBE: the trace runs at probe resolution (low-res = 1 probe per scale×scale block) and accumulates
-        // temporally. Default scale = 2 (probe mode ON) — the temporal accumulation makes the low-res probe gather
-        // LOWER variance than the old full-res single-frame gather, not just cheaper. RESSCALE overrides (1 =
-        // full-res, no probe downsample; 2 = default; 4 = aggressive). The depth-aware combine upsamples probes.
-        int scale = Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_RESSCALE", 2f), 1, 4);
+        // #3 PROBE: the trace accumulates temporally. Default scale = 1 (FULL-res) — measured: half-res probes left
+        // a visible 2x2 'kare' block sparkle at higher GI intensity, and the cost is RT-traversal-bound (pixel
+        // count doesn't move the frame time here), so full-res is free AND cleaner. The temporal accumulation is
+        // what actually kills the per-ray sparkle. RESSCALE=2/4 stays available for weak-GPU / 4K. The depth-aware
+        // combine still upsamples when scale > 1.
+        int scale = Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_RESSCALE", 1f), 1, 4);
         int lw = Math.Max(1, fullW / scale), lh = Math.Max(1, fullH / scale);
         indirect?.Dispose();
         indirectFiltered?.Dispose();
