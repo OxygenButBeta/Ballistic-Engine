@@ -197,6 +197,9 @@ public sealed class DX12HDRenderer : HDRenderer
     // ProcSkyConstants structs moved into it). The pass draws the sky into the HDR color at the far plane.
     Dx12SkyPass skyPass;
 
+    // Lumen V2 GI (event 500): the single product GI pass. Owns the Lumen scene substrate + GI pipeline.
+    Dx12LumenGiPass lumenGiPass;
+
     // Reflections (event 600): the single RT-vs-SSR mode-branch pass. It owns the SSR rootsig/PSOs/targets
     // and the RT-reflection pipeline.
     Dx12ReflectionsPass reflectionsPass;
@@ -588,6 +591,12 @@ public sealed class DX12HDRenderer : HDRenderer
         // BuildTransparentPass + the inline DrawTransparents call.
         transparentsPass = new Dx12TransparentsPass(dev);
         graph.Add(transparentsPass);
+        // Lumen V2 GI (event 500 — the slot the legacy GI pass held, after Transparents, before Fog). Owns the
+        // Lumen scene substrate (shared TLAS + bindless geo + card atlases) and the GI pipeline. P1 = substrate
+        // + debug log only (no image change); gated behind BALLISTIC_DX12_LUMEN. Resolution-independent for now
+        // (the indirect buffer + its Resize land in P2), so registration order is R5-neutral.
+        lumenGiPass = new Dx12LumenGiPass(dev);
+        graph.Add(lumenGiPass);
         // Reflections (event 600) owns its resolution targets and branches between SSR and RT reflections.
         reflectionsPass = new Dx12ReflectionsPass(dev, targetW, targetH);
         graph.Add(reflectionsPass);

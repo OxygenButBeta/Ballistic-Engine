@@ -167,7 +167,12 @@ internal sealed class RenderCommand : ICommand {
         Console.Error.WriteLine($"  rendering {Path.GetFileName(outPath)} ({sceneRel})...");
         using Process process = Process.Start(psi)!;
         string stderr = process.StandardError.ReadToEnd();
-        process.StandardOutput.ReadToEnd();
+        // Mirror the player's stdout to OUR stderr (stdout carries the command JSON). The player's
+        // [PerfStats] / [Lumen] / [DX12] diagnostics are the agent's window into the headless render — without
+        // this they were silently discarded, so a `bal render` run could not surface GI substrate counts etc.
+        string stdout = process.StandardOutput.ReadToEnd();
+        if (stdout.Length > 0)
+            Console.Error.Write(stdout);
         if (!process.WaitForExit(300_000)) {
             try { process.Kill(entireProcessTree: true); } catch { }
             throw new Exception($"player timed out rendering '{outPath}'");

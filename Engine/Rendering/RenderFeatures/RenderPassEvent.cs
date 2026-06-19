@@ -23,6 +23,7 @@ public enum RenderPassEvent {
     Sky                   = 350,
     AerialPerspective     = 400,
     Transparents          = 450,
+    GlobalIllumination    = 500,
     Fog                   = 550,
     Reflections           = 600,
     PostProcess           = 650,
