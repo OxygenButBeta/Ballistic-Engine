@@ -72,8 +72,7 @@ public sealed class Dx12SkyPass : IRenderPass, IDisposable {
     // Asset cubemap skybox.
     ID3D12RootSignature skyRootSig;
     ID3D12PipelineState skyPso;
-    ID3D12Resource skyCb;          // upload heap, one SkyboxConstants, rewritten per frame
-    unsafe byte* skyCbMapped;
+    Dx12FrameCb<SkyboxConstants> skyCb;   // N-buffered, rewritten per frame (P0b frame overlap)
     Dx12DescriptorHeap skySrvVisible;   // one cube SRV copied per frame
 
     // Procedural sky. The FAST background path samples the baked env cube (procSkyBgPso, one cube fetch per
@@ -82,8 +81,7 @@ public sealed class Dx12SkyPass : IRenderPass, IDisposable {
     ID3D12RootSignature procSkyRootSig;
     ID3D12PipelineState procSkyPso;      // fallback: full SkyRadiance() march
     ID3D12PipelineState procSkyBgPso;    // primary: sample the baked env cube
-    ID3D12Resource procSkyCb;
-    unsafe byte* procSkyCbMapped;
+    Dx12FrameCb<ProcSkyConstants> procSkyCb;   // N-buffered, rewritten per frame (P0b frame overlap)
     Dx12DescriptorHeap procSkyEnvSrvVisible;   // env cube SRV copied per frame for the background sample
 
     // VERBATIM BuildSkybox + BuildProcSky. Owns both rootsigs/PSOs/CBs/heaps (resolution-independent — no
@@ -128,10 +126,7 @@ public sealed class Dx12SkyPass : IRenderPass, IDisposable {
         };
         skyPso = dev.Device.CreateGraphicsPipelineState(psoDesc);
 
-        int cbSize = (Marshal.SizeOf<SkyboxConstants>() + 255) & ~255;
-        skyCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        skyCbMapped = skyCb.Map<byte>(0);
+        skyCb = new Dx12FrameCb<SkyboxConstants>(dev);
         skySrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
@@ -172,10 +167,7 @@ public sealed class Dx12SkyPass : IRenderPass, IDisposable {
         psoDesc.PixelShader = psBg;
         procSkyBgPso = dev.Device.CreateGraphicsPipelineState(psoDesc);
 
-        int cbSize = (Marshal.SizeOf<ProcSkyConstants>() + 255) & ~255;
-        procSkyCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        procSkyCbMapped = procSkyCb.Map<byte>(0);
+        procSkyCb = new Dx12FrameCb<ProcSkyConstants>(dev);
         procSkyEnvSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
@@ -230,10 +222,10 @@ public sealed class Dx12SkyPass : IRenderPass, IDisposable {
             CloudWindAngle = Dx12SkyCloudParams.WindRadians(sky),
             CirrusCoverage = Math.Clamp(sky.CirrusCoverage, 0f, 1f), StarIntensity = MathF.Max(sky.StarIntensity, 0f),
         };
-        *(ProcSkyConstants*)procSkyCbMapped = sc;
+        procSkyCb.Write(sc);
 
         cl.SetGraphicsRootSignature(procSkyRootSig);
-        cl.SetGraphicsRootConstantBufferView(0, procSkyCb.GPUVirtualAddress);
+        cl.SetGraphicsRootConstantBufferView(0, procSkyCb.Gpu);
         cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
 
         // FAST PATH: the IBL baker already rendered the full SkyRadiance() kernel (atmosphere + clouds +
@@ -277,7 +269,7 @@ public sealed class Dx12SkyPass : IRenderPass, IDisposable {
             SkyRotation = Matrix4x4.Transpose(rot),
             Exposure = skyExposure,
         };
-        *(SkyboxConstants*)skyCbMapped = sc;
+        skyCb.Write(sc);
 
         dev.Device.CopyDescriptorsSimple(1, skySrvVisible.Cpu(0), cube.SrvCpu,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
@@ -285,7 +277,7 @@ public sealed class Dx12SkyPass : IRenderPass, IDisposable {
         cl.SetGraphicsRootSignature(skyRootSig);
         cl.SetPipelineState(skyPso);
         cl.SetDescriptorHeaps(skySrvVisible.Heap);
-        cl.SetGraphicsRootConstantBufferView(0, skyCb.GPUVirtualAddress);
+        cl.SetGraphicsRootConstantBufferView(0, skyCb.Gpu);
         cl.SetGraphicsRootDescriptorTable(1, skySrvVisible.Gpu(0));
         cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
         cl.DrawInstanced(36, 1, 0, 0);

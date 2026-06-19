@@ -51,8 +51,7 @@ public sealed class Dx12AerialPerspectivePass : IRenderPass, IDisposable {
     readonly Dx12AerialPerspectiveLut lut;   // the froxel volume + its bake, baked at the head of Record
     ID3D12RootSignature apRootSig;           // ApConstants CBV (b0) + depth+volume SRV table (t0,t1) + 2 samplers
     ID3D12PipelineState apPso;
-    ID3D12Resource apCb;
-    unsafe byte* apCbMapped;
+    Dx12FrameCb<ApConstants> apCb;           // N-buffered, rewritten per frame (P0b frame overlap)
     Dx12DescriptorHeap apSrvVisible;         // depth + froxel volume, copied per frame (2 descriptors)
 
     public unsafe Dx12AerialPerspectivePass(Dx12Device device) {
@@ -101,10 +100,7 @@ public sealed class Dx12AerialPerspectivePass : IRenderPass, IDisposable {
             DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
         });
 
-        int apCbSize = (Marshal.SizeOf<ApConstants>() + 255) & ~255;
-        apCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)apCbSize), ResourceStates.GenericRead);
-        apCbMapped = apCb.Map<byte>(0);
+        apCb = new Dx12FrameCb<ApConstants>(dev);
         apSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
@@ -140,11 +136,11 @@ public sealed class Dx12AerialPerspectivePass : IRenderPass, IDisposable {
         lut.Bake(invVP, camPos, sunDir, sunRadiance, skyTint, pSky, pf, apEnabled ? intensity : 0f);
 
         // 2) Fill the AP pass constants. MaxDistance MUST equal the bake's so the depth->slice map inverts it.
-        *(ApConstants*)apCbMapped = new ApConstants {
+        apCb.Write(new ApConstants {
             InvViewProj = Matrix4x4.Transpose(invVP),
             CameraPos = camPos, MaxDistance = MathF.Max(pf.AerialPerspectiveMaxDistance, 1f),
             Enabled = apEnabled ? 1f : 0f,
-        };
+        });
 
         // Head transition (R2): emit our own unless the graph already derived barriers.
         if (!ctx.BarriersDerived) gbuffer.DepthToShaderResource();
@@ -156,7 +152,7 @@ public sealed class Dx12AerialPerspectivePass : IRenderPass, IDisposable {
             cl.SetGraphicsRootSignature(apRootSig);
             cl.SetPipelineState(apPso);
             cl.SetDescriptorHeaps(apSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, apCb.GPUVirtualAddress);
+            cl.SetGraphicsRootConstantBufferView(0, apCb.Gpu);
             cl.SetGraphicsRootDescriptorTable(1, apSrvVisible.Gpu(0));
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);

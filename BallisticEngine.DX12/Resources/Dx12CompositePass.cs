@@ -70,8 +70,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
 
     ID3D12RootSignature compositeRootSig;   // CompositeConstants CBV (b0) + HDR+bloom SRV table + sampler
     ID3D12PipelineState compositePso;
-    ID3D12Resource compositeCb;
-    unsafe byte* compositeCbMapped;
+    Dx12FrameCb<CompositeConstants> compositeCb;
     Dx12DescriptorHeap compositeSrvVisible;  // HDR color + bloom + avg-lum, copied per frame
 
     // Auto-exposure: a 1×1 R16F target holding the metered exposure EV100 (LumAverage.hlsl).
@@ -95,8 +94,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
     readonly bool acesTonemapEnv;       // BALLISTIC_DX12_TONEMAP == "aces"
     readonly bool gradeDemoEnv;         // BALLISTIC_DX12_GRADE_DEMO == "1"
     Dx12DescriptorHeap lumSrvVisible;   // [0]=HDR color SRV, [1]=prev-EV history SRV, copied per frame
-    ID3D12Resource lumCb;
-    unsafe byte* lumCbMapped;
+    Dx12FrameCb<LumConstants> lumCb;
     int emaDebugFrame;
 
     // Bloom: progressive dual-filter mip pyramid (Jimenez/COD), fed into the composite (Bloom.hlsl).
@@ -149,10 +147,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
             DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
         });
 
-        int cbSize = (Marshal.SizeOf<CompositeConstants>() + 255) & ~255;
-        compositeCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        compositeCbMapped = compositeCb.Map<byte>(0);
+        compositeCb = new Dx12FrameCb<CompositeConstants>(dev);
         compositeSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true, framesInFlight: dev.FramesInFlight);
 
@@ -193,10 +188,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         lumSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true, framesInFlight: dev.FramesInFlight);
 
-        int lumCbSize = (Marshal.SizeOf<LumConstants>() + 255) & ~255;
-        lumCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)lumCbSize), ResourceStates.GenericRead);
-        lumCbMapped = lumCb.Map<byte>(0);
+        lumCb = new Dx12FrameCb<LumConstants>(dev);
     }
 
     unsafe void BuildBloom(int width, int height) {
@@ -432,14 +424,14 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
                 lumHistoryValid = true;                     // skip the first-frame snap so the seeded value eases
             }
             bool reset = DeterministicCapture || !lumHistoryValid || expDebug || !emaOn;
-            *(LumConstants*)lumCbMapped = new LumConstants {
+            lumCb.Write(new LumConstants {
                 LimitMin = pf.AutoExposureLimitMin, LimitMax = pf.AutoExposureLimitMax,
                 Calibrated = expDebug ? 2f : (calibrated ? 1f : 0f),
                 DeltaTime = (float)Time.DeltaTime,
                 SpeedDarkToLight = pf.AutoExposureSpeedDarkToLight,
                 SpeedLightToDark = pf.AutoExposureSpeedLightToDark,
                 Reset = reset ? 1f : 0f,
-            };
+            });
             // t0 = HDR scene; t1 = last frame's adapted EV (the ping-pong partner, already in PixelShaderResource).
             dev.Device.CopyDescriptorsSimple(1, lumSrvVisible.Cpu(0), hdr.ColorSrvCpu, heapType);
             dev.Device.CopyDescriptorsSimple(1, lumSrvVisible.Cpu(1), lumHistory.ColorSrvCpu, heapType);
@@ -448,7 +440,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
                 cl.SetGraphicsRootSignature(lumRootSig);
                 cl.SetPipelineState(lumPso);
                 cl.SetDescriptorHeaps(lumSrvVisible.Heap);
-                cl.SetGraphicsRootConstantBufferView(0, lumCb.GPUVirtualAddress);
+                cl.SetGraphicsRootConstantBufferView(0, lumCb.Gpu);
                 cl.SetGraphicsRootDescriptorTable(1, lumSrvVisible.Gpu(0));
                 cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
                 cl.DrawInstanced(3, 1, 0, 0);
@@ -482,7 +474,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         float contrast = gradeDemo ? 1.12f : pf.Contrast;
         float saturation = gradeDemo ? 1.15f : pf.Saturation;
         float vignette = gradeDemo ? 0.25f : pf.VignetteStrength;
-        *(CompositeConstants*)compositeCbMapped = new CompositeConstants {
+        compositeCb.Write(new CompositeConstants {
             ExposureMul = exposureMul,
             BloomIntensity = bloomOn ? pf.BloomIntensity : 0f,
             AutoExposure = useMeter ? 1f : 0f,
@@ -500,7 +492,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
             ChromaticAberration = pf.ChromaticAberration, LensDistortion = pf.LensDistortion,
             FilmGrain = DeterministicCapture ? 0f : pf.FilmGrain, GrainTime = grainTime,
             ScreenSize = new Vector2(outputW, outputH),
-        };
+        });
 
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(0), hdr.ColorSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(1),
@@ -512,7 +504,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
             cl.SetGraphicsRootSignature(compositeRootSig);
             cl.SetPipelineState(compositePso);
             cl.SetDescriptorHeaps(compositeSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, compositeCb.GPUVirtualAddress);
+            cl.SetGraphicsRootConstantBufferView(0, compositeCb.Gpu);
             cl.SetGraphicsRootDescriptorTable(1, compositeSrvVisible.Gpu(0));
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);

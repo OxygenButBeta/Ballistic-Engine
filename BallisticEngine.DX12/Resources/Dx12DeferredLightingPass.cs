@@ -72,8 +72,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
     readonly Dx12Device dev;
     ID3D12RootSignature deferredRootSig;   // LightConstants CBV(b0) + FrameConstants CBV(b1) + 13-SRV table + sampler
     ID3D12PipelineState deferredPso;
-    ID3D12Resource deferredCb;
-    unsafe byte* deferredCbMapped;
+    Dx12FrameCb<LightConstants> deferredCb;   // P0b: N-buffered (FrameSlot-offset)
     Dx12DescriptorHeap deferredSrvVisible;  // 14 SRVs copied per frame: G0..G3, depth, irradiance, prefilter, BRDF, shadow, cluster lights/grid/index, RT shadow mask, GTAO
 
     // BuildDeferredLighting moved VERBATIM into the ctor (re-rooted onto `dev`). clusteredLights stays
@@ -107,10 +106,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
             DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
         });
 
-        int cbSize = (Marshal.SizeOf<LightConstants>() + 255) & ~255;
-        deferredCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        deferredCbMapped = deferredCb.Map<byte>(0);
+        deferredCb = new Dx12FrameCb<LightConstants>(dev);
         deferredSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 14, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
@@ -144,7 +140,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         float specAaValue = 2f;
         if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_SPEC_AA"),
             System.Globalization.CultureInfo.InvariantCulture, out float sa)) specAaValue = sa;
-        *(LightConstants*)deferredCbMapped = new LightConstants {
+        deferredCb.Write(new LightConstants {
             InvViewProj = Matrix4x4.Transpose(invVP),
             View = Matrix4x4.Transpose(ctx.View),
             LightDir = ctx.LightDir, LightColor = ctx.LightColor, Ambient = ctx.Ambient, CameraPos = ctx.CamPos,
@@ -177,7 +173,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
             UseIBLSpecular = 0f,
             // Forward world→clip for the contact-shadow screen-space march (HLSL muls row-vector × matrix).
             ViewProjFwd = Matrix4x4.Transpose(ctx.ViewProj),
-        };
+        });
 
         // Copy the 14 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster
         // lights/grid/index (t9..t11), RT shadow mask (t12), GTAO (t13).
@@ -206,7 +202,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
             cl.SetGraphicsRootSignature(deferredRootSig);
             cl.SetPipelineState(deferredPso);
             cl.SetDescriptorHeaps(deferredSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, deferredCb.GPUVirtualAddress);
+            cl.SetGraphicsRootConstantBufferView(0, deferredCb.Gpu);
             cl.SetGraphicsRootConstantBufferView(1, ctx.FrameCbAddress);
             cl.SetGraphicsRootDescriptorTable(2, deferredSrvVisible.Gpu(b));
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);

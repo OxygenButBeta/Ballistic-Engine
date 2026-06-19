@@ -59,8 +59,7 @@ public sealed class Dx12TaaPass : IRenderPass, IDisposable {
     readonly Dx12Device dev;
     ID3D12RootSignature taaRootSig;     // TaaConstants CBV(b0) + 3-SRV table(current/history/motion) + sampler
     ID3D12PipelineState taaPso;
-    ID3D12Resource taaCb;
-    unsafe byte* taaCbMapped;
+    Dx12FrameCb<TaaConstants> taaCb;    // P0b: N-buffered (FrameSlot-offset)
     Dx12OffscreenTarget taaHistoryA, taaHistoryB;   // ping-pong accumulated HDR history
     Dx12OffscreenTarget taaResolved;                // this frame's TAA output (→ history + copied to target)
     Dx12DescriptorHeap taaSrvVisible;   // 3 SRVs per frame
@@ -93,10 +92,7 @@ public sealed class Dx12TaaPass : IRenderPass, IDisposable {
             SampleDescription = new SampleDescription(1, 0),
         });
 
-        int cbSize = (Marshal.SizeOf<TaaConstants>() + 255) & ~255;
-        taaCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        taaCbMapped = taaCb.Map<byte>(0);
+        taaCb = new Dx12FrameCb<TaaConstants>(dev);
         taaSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true, framesInFlight: dev.FramesInFlight);
         AllocTargets(width, height);
@@ -128,10 +124,10 @@ public sealed class Dx12TaaPass : IRenderPass, IDisposable {
         Dx12OffscreenTarget history = taaWriteB ? taaHistoryA : taaHistoryB;   // read from the OTHER buffer
         Dx12OffscreenTarget writeHist = taaWriteB ? taaHistoryB : taaHistoryA;
 
-        *(TaaConstants*)taaCbMapped = new TaaConstants {
+        taaCb.Write(new TaaConstants {
             Feedback = ctx.PostFX.TaaFeedback, ValidHistory = taaHistoryValid ? 1f : 0f,
             TexelSize = new Vector2(1f / targetW, 1f / targetH),
-        };
+        });
 
         // PHASE-2 V3: skip the manual SceneColor head when derived barriers are active (the graph emitted
         // ctx.SceneColor.ColorToShaderResource() before Record). history is pass-private → always inline.
@@ -146,7 +142,7 @@ public sealed class Dx12TaaPass : IRenderPass, IDisposable {
         writeHist.RenderColorOnly(cl => {
             cl.SetGraphicsRootSignature(taaRootSig); cl.SetPipelineState(taaPso);
             cl.SetDescriptorHeaps(taaSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, taaCb.GPUVirtualAddress);
+            cl.SetGraphicsRootConstantBufferView(0, taaCb.Gpu);
             cl.SetGraphicsRootDescriptorTable(1, taaSrvVisible.Gpu(b));
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
@@ -161,7 +157,7 @@ public sealed class Dx12TaaPass : IRenderPass, IDisposable {
 
     public void Dispose() {
         taaHistoryA?.Dispose(); taaHistoryB?.Dispose(); taaResolved?.Dispose();
-        taaSrvVisible?.Dispose(); taaCb?.Dispose();
+        taaSrvVisible?.Dispose(); taaCb?.Dispose();   // Dx12FrameCb.Dispose unmaps + releases
         taaPso?.Dispose(); taaRootSig?.Dispose();
     }
 }

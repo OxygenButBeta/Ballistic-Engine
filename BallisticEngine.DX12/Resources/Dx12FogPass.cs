@@ -71,8 +71,7 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
     readonly Dx12Device dev;
     ID3D12RootSignature fogRootSig;     // FogConstants CBV (b0) + depth+shadow SRV table (t0,t1) + sampler
     ID3D12PipelineState fogPso;
-    ID3D12Resource fogCb;
-    unsafe byte* fogCbMapped;
+    Dx12FrameCb<FogConstants> fogCb;    // N-buffered, rewritten per frame (P0b frame overlap)
     Dx12DescriptorHeap fogSrvVisible;   // depth + shadow array, copied per frame
 
     // VERBATIM BuildFog. Owns rootsig/PSO/CB/heap (resolution-independent — no Resize body).
@@ -115,10 +114,7 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
             DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
         });
 
-        int cbSize = (Marshal.SizeOf<FogConstants>() + 255) & ~255;
-        fogCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        fogCbMapped = fogCb.Map<byte>(0);
+        fogCb = new Dx12FrameCb<FogConstants>(dev);
         fogSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
@@ -174,7 +170,7 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
             // byte-identical captures. ~60 fps assumed for the seconds conversion.
             Time = ctx.FrameCounter * (1f / 60f), DustPad = 0f,
         };
-        *(FogConstants*)fogCbMapped = fc;
+        fogCb.Write(fc);
 
         // depth → SRV (G-buffer owns it), shadow array already SRV from RenderShadows. Copy both into the
         // fog heap. After the sky pass the G-buffer depth is in DepthRead; bring it to PixelShaderResource.
@@ -188,7 +184,7 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
             cl.SetGraphicsRootSignature(fogRootSig);
             cl.SetPipelineState(fogPso);
             cl.SetDescriptorHeaps(fogSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, fogCb.GPUVirtualAddress);
+            cl.SetGraphicsRootConstantBufferView(0, fogCb.Gpu);
             cl.SetGraphicsRootDescriptorTable(1, fogSrvVisible.Gpu(0));
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);

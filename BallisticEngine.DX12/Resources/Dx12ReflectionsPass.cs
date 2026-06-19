@@ -114,8 +114,14 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     // === DXR ray-traced reflections (Reflection volume SSR-vs-RT dropdown: PostFX.ReflectionMode) ===
     ID3D12RootSignature rtReflRootSig;          // HeapDirectlyIndexed; CBV b0/b1/b2 + table{t0-t6,u0} + root SRV t7/t8/t9/t10 + s0/s1
     ID3D12StateObject rtReflPso;
-    ID3D12Resource rtReflSbt, rtReflCb, rtReflSunCb, rtReflGridCb;
-    unsafe byte* rtReflCbMapped, rtReflSunCbMapped, rtReflGridCbMapped;
+    ID3D12Resource rtReflSbt;
+    // P0b: the three single-value-per-frame RT-reflection CBs are N-buffered (FrameSlot-offset). ssrCb stays a
+    // plain single-slot CB — it is WRITTEN+BOUND multiple times per frame with DIFFERENT values (march, temporal,
+    // combine), an intra-frame multi-write that Dx12FrameCb's per-FRAME slotting does not model. Built lazily in
+    // EnsureRtReflections (DXR may be unavailable / RT reflections never requested), so these allocate there.
+    Dx12FrameCb<RtReflConstants> rtReflCb;
+    Dx12FrameCb<RtGiSun> rtReflSunCb;
+    Dx12FrameCb<RtReflGridConstants> rtReflGridCb;
     bool rtReflBuilt;
     const int RtSbtSlot = 64;                   // shader-table record alignment
     // Phase-8 reflection table reserves its OWN 8-slot tail of the bindless heap, BELOW the ScreenProbe tail so
@@ -131,6 +137,11 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     }
     [StructLayout(LayoutKind.Sequential)]
     struct RtGiSun { public Vector3 SunDir; public float NormalBias; public Vector3 SunColor; public float LightCount; }
+    // The DdgiGrid CBV (b2) was always written as a zeroed 256-byte block (the closest-hit reads it but the
+    // current path supplies no DDGI grid → all-zero). A 256-byte blittable struct so it round-trips through
+    // Dx12FrameCb; written as `default` (all-zero, byte-identical to the old Span<byte>.Clear()).
+    [StructLayout(LayoutKind.Sequential, Size = 256)]
+    struct RtReflGridConstants { }
 
     // BuildSsr moved VERBATIM into the ctor (re-rooted onto dev). The SSR PSOs/CB/heap are built here; the SSR
     // targets allocate in Resize, called at the end of the ctor (the inline BuildSsr called AllocSsrTarget(); the
@@ -337,18 +348,9 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         System.Runtime.CompilerServices.Unsafe.CopyBlock(sp + 2 * RtSbtSlot, (void*)props.GetShaderIdentifier("HitGroup"), idSize);
         rtReflSbt.Unmap(0);
 
-        int cbSize = (Marshal.SizeOf<RtReflConstants>() + 255) & ~255;
-        rtReflCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
-        rtReflCbMapped = rtReflCb.Map<byte>(0);
-        int sunSize = (Marshal.SizeOf<RtGiSun>() + 255) & ~255;
-        rtReflSunCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)sunSize), ResourceStates.GenericRead);
-        rtReflSunCbMapped = rtReflSunCb.Map<byte>(0);
-        int gridSize = 256;
-        rtReflGridCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)gridSize), ResourceStates.GenericRead);
-        rtReflGridCbMapped = rtReflGridCb.Map<byte>(0);
+        rtReflCb = new Dx12FrameCb<RtReflConstants>(dev);
+        rtReflSunCb = new Dx12FrameCb<RtGiSun>(dev);
+        rtReflGridCb = new Dx12FrameCb<RtReflGridConstants>(dev);
         _ = ctx.Dxr.RtGeometry;   // was `rtGeometry ??= new Dx12RtGeometry(dev)` — reuse if GI already built it.
         return true;
     }
@@ -379,17 +381,17 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         // (so reflections see the same multi-bounce GI the diffuse does). Off → the hit re-shades direct+IBL.
         bool useCards = ctx.LumenActiveThisFrame && ctx.LumenScene is { Valid: true } && ctx.PostFX.LumenReflections
                         && ReflCardsAllowed;
-        *(RtReflConstants*)rtReflCbMapped = new RtReflConstants {
+        rtReflCb.Write(new RtReflConstants {
             InvViewProj = Matrix4x4.Transpose(invVP), CameraPos = camPos, Intensity = ForcedIntensity(ctx),
             PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f, NormalBias = 0.05f,
             UseCards = useCards ? 1f : 0f,
             Unused1 = 0f,
-        };
+        });
         Vector3 sunDir = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
-        *(RtGiSun*)rtReflSunCbMapped = new RtGiSun {
+        rtReflSunCb.Write(new RtGiSun {
             SunDir = sunDir, NormalBias = 0.03f, SunColor = lightColor, LightCount = clusteredLights.LightCount,
-        };
-        new Span<byte>(rtReflGridCbMapped, 256).Clear();
+        });
+        rtReflGridCb.Write(default);
 
         // The G-buffer is in the combined shader-read state; color (target) bring to SRV for the combine.
         target.ColorToShaderResource();
@@ -417,9 +419,9 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
             cl.SetDescriptorHeaps(bindless.Heap);   // bindless heap = the bound CBV/SRV/UAV heap (table + ResourceDescriptorHeap[])
             cl.SetComputeRootSignature(rtReflRootSig);
             cl.SetPipelineState1(rtReflPso);
-            cl.SetComputeRootConstantBufferView(0, rtReflCb.GPUVirtualAddress);
-            cl.SetComputeRootConstantBufferView(1, rtReflSunCb.GPUVirtualAddress);
-            cl.SetComputeRootConstantBufferView(2, rtReflGridCb.GPUVirtualAddress);
+            cl.SetComputeRootConstantBufferView(0, rtReflCb.Gpu);
+            cl.SetComputeRootConstantBufferView(1, rtReflSunCb.Gpu);
+            cl.SetComputeRootConstantBufferView(2, rtReflGridCb.Gpu);
             cl.SetComputeRootDescriptorTable(3, bindless.Gpu(RtReflTableBase));
             cl.SetComputeRootShaderResourceView(4, gpuDriven.MaterialsGpuAddress);       // t7 GpuMaterials
             cl.SetComputeRootShaderResourceView(5, rtGeometry.InstancesGpuAddress);      // t8 RtInstance[]
@@ -549,6 +551,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         ssrTarget?.Dispose(); ssrScene?.Dispose();
         ssrHistoryA?.Dispose(); ssrHistoryB?.Dispose();
         rtReflPso?.Dispose(); rtReflRootSig?.Dispose();
-        rtReflSbt?.Dispose(); rtReflCb?.Dispose(); rtReflSunCb?.Dispose(); rtReflGridCb?.Dispose();
+        rtReflSbt?.Dispose();
+        rtReflCb?.Dispose(); rtReflSunCb?.Dispose(); rtReflGridCb?.Dispose();   // Dx12FrameCb.Dispose unmaps + releases
     }
 }
