@@ -316,10 +316,7 @@ public sealed class Dx12GiPass : IRenderPass, IDisposable
         // (un-incremented) before Execute. Deterministic capture freezes grain to 0 regardless, so this is
         // live-path-only — but kept exact to avoid a silent off-by-one in the grain animation phase.
         ctx.GrainFrame = ssgiFrame;
-        float preExp = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
-            System.Globalization.CultureInfo.InvariantCulture, out float e)
-            ? e
-            : 1.0e-5f;
+        float preExp = SsgiPreExposure();
         float invPreExp = preExp > 0f ? 1f / preExp : 0f;
         *(SsgiConstants*)ssgiCbMapped = new SsgiConstants
         {
