@@ -24,12 +24,15 @@ namespace BallisticEngine.DX12;
 public sealed class Dx12RtGeometry : IDisposable {
     readonly Dx12Device dev;
 
-    // One record per TLAS instance — the 4 bindless indices the hit shader needs. Matches HLSL RtInstance.
+    // One record per TLAS instance — the bindless indices the hit shader needs. Matches HLSL RtInstance.
+    // PositionIdx (added for Lumen V2 P3 surface cards) exposes the mesh's POSITION buffer so a card-lighting
+    // compute pass can fetch a triangle's world vertices (centroid + area) to light it; the hit shaders that
+    // only need normal/uv/material ignore it. TriCount lets the card cache lay out per-instance triangle ranges.
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    struct RtInstance { public uint NormalIdx, UvIdx, IndexIdx, TriMatIdx; }
+    struct RtInstance { public uint NormalIdx, UvIdx, IndexIdx, TriMatIdx; public uint PositionIdx, TriCount, Pad0, Pad1; }
 
     // Per-unique-mesh bindless indices (so two instances of one mesh share the SRVs + tri-material buffer).
-    sealed class MeshEntry { public int NormalIdx, UvIdx, IndexIdx, TriMatIdx; public ID3D12Resource TriMatBuf; }
+    sealed class MeshEntry { public int NormalIdx, UvIdx, IndexIdx, TriMatIdx, PositionIdx, TriCount; public ID3D12Resource TriMatBuf; }
     readonly Dictionary<Mesh, MeshEntry> byMesh = new();
 
     ID3D12Resource instanceBuf;     // RtInstance[] — root SRV indexed by InstanceID()
@@ -76,6 +79,7 @@ public sealed class Dx12RtGeometry : IDisposable {
             records[i] = new RtInstance {
                 NormalIdx = (uint)e.NormalIdx, UvIdx = (uint)e.UvIdx,
                 IndexIdx = (uint)e.IndexIdx, TriMatIdx = (uint)e.TriMatIdx,
+                PositionIdx = (uint)e.PositionIdx, TriCount = (uint)e.TriCount,
             };
         }
 
@@ -92,12 +96,16 @@ public sealed class Dx12RtGeometry : IDisposable {
         var ib = (Dx12IndexBuffer)mesh.IndexBuffer;
         var nb = (Dx12Buffer<GLVector3>)mesh.NormalBuffer;
         var ub = mesh.UvBuffer as Dx12Buffer<Vector2>;
+        var vb = (Dx12Buffer<GLVector3>)mesh.VertexBuffer;   // positions (validated present by the caller's guard)
 
         var e = new MeshEntry {
             // Index buffer as a typed R32_UInt buffer SRV (fetch 3 indices of a triangle).
             IndexIdx = RegisterTypedSrv(ib.Resource, Format.R32_UInt, ib.ElementCount),
             // Normal buffer as StructuredBuffer<float3> (12B stride).
             NormalIdx = RegisterStructuredSrv(nb.Resource, nb.ElementCount, 12),
+            // Position buffer as StructuredBuffer<float3> (12B) — Lumen card lighting fetches triangle vertices.
+            PositionIdx = RegisterStructuredSrv(vb.Resource, vb.ElementCount, 12),
+            TriCount = ib.ElementCount / 3,
             // UV buffer as StructuredBuffer<float2> (8B). Some meshes may lack UVs → reuse normals as a stand-in
             // (the shader's albedo just samples garbage UVs → BaseColorFactor still tints; acceptable fallback).
             UvIdx = ub?.Resource is not null

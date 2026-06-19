@@ -17,10 +17,14 @@
 //   sealed black room stays black, color-bleed box bleeds (emissive hit term), thin wall does not leak
 //   (the RT ray hits the occluder). Temporal stabilization + cards come in P3/P4.
 //
-// CSTrace bindings (compute): TLAS t0, depth t1, world-normal t2, material t3, LIT scene color t4, sky
-// irradiance cube t5, sky prefilter cube t6; UAV indirect u0; LumenConstants b0, LumenSun b1; root SRVs
-// GpuMaterials t7 / RtInstance[] t8 / Lights t9; bindless heap (ResourceDescriptorHeap[] for per-instance
-// index/normal/uv buffers + albedo textures); static clamp s0 + wrap s1.
+// CSTrace bindings (compute): TLAS t0 (root SRV), depth t1, world-normal t2, material t3, LIT scene color t4,
+// sky irradiance cube t5, sky prefilter cube t6 (table); UAV indirect u0 (table); LumenConstants b0, LumenSun
+// b1; root SRVs GpuMaterials t7 / RtInstance[] t8 / Lights t9 / CardRadiance t10 / LumenInstanceMeta t11;
+// bindless heap (ResourceDescriptorHeap[] for per-instance buffers + albedo textures); clamp s0 + wrap s1.
+//
+// P3: an RT hit now SAMPLES the surface card (CardRadiance[meta.TriOffset + prim]) — the lit first-bounce
+// radiance a separate card-light pass wrote — instead of re-shading direct light per hit. Off-screen surfaces
+// contribute real albedo/emissive radiance, and P4 will accumulate multi-bounce into the same cache.
 
 RaytracingAccelerationStructure Scene : register(t0);
 Texture2D<float>  Depth     : register(t1);
@@ -36,7 +40,7 @@ cbuffer LumenConstants : register(b0) {
     float4x4 ViewProj;        // world → clip (transposed) — screen-trace reprojection
     float3 CameraPos;   float Intensity;         // GI intensity multiplier
     float2 TexelSize;   float RayCount;  float FrameIndex;   // 1/res; hemisphere rays per pixel; rotation seed
-    float NormalBias;   float MaxRayDist; float ScreenStepPx; float ScreenSteps;   // bias; world ray length; screen march
+    float NormalBias;   float MaxRayDist; float UseCards;   float ScreenSteps;   // bias; world ray length; >0.5 = sample cards on RT hit; screen march
     float SkyIntensity; float UseSky;    float Pad0; float Pad1;   // sky-miss scale; >0.5 = sky enters on miss
 };
 cbuffer LumenSun : register(b1) {
@@ -47,7 +51,7 @@ SamplerState LinearClamp : register(s0);
 SamplerState LinearWrap  : register(s1);
 
 // --- Bindless geometry + material (identical layout to DxrReflections.hlsl) ---
-struct RtInstance { uint NormalIdx, UvIdx, IndexIdx, TriMatIdx; };
+struct RtInstance { uint NormalIdx, UvIdx, IndexIdx, TriMatIdx; uint PositionIdx, TriCount, Pad0, Pad1; };
 struct GpuMaterial {
     uint DiffuseIdx, NormalIdx, MetallicIdx, RoughnessIdx;
     uint AoIdx, EmissiveIdx, Pad0, Pad1;
@@ -57,9 +61,12 @@ struct GpuMaterial {
     float Cutout, HasEmissive, Pad2, Pad3;
 };
 struct GpuLight { float4 PosRange; float4 Color; float4 DirCosOuter; float4 Extra; };
-StructuredBuffer<GpuMaterial> GpuMaterials : register(t7);
-StructuredBuffer<RtInstance>  RtInstances  : register(t8);
-StructuredBuffer<GpuLight>    Lights       : register(t9);
+struct LumenInstanceMeta { uint TriOffset, TriCount, Pad0, Pad1; float4x4 World; };
+StructuredBuffer<GpuMaterial>       GpuMaterials : register(t7);
+StructuredBuffer<RtInstance>        RtInstances  : register(t8);
+StructuredBuffer<GpuLight>          Lights       : register(t9);
+StructuredBuffer<float4>            CardRadiance : register(t10);   // P3: per-triangle lit radiance (the cards)
+StructuredBuffer<LumenInstanceMeta> InstanceMeta : register(t11);   // per-instance {triOffset, world}
 
 static const float PI = 3.14159265359;
 
@@ -235,9 +242,20 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
         q.TraceRayInline(Scene, 0, 0xFF, ray);
         q.Proceed();
         if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
-            float3 hitPos = origin + dir * q.CommittedRayT();
-            sum += ShadeHit(q.CommittedInstanceID(), q.CommittedPrimitiveIndex(),
-                            q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), dir, hitPos);
+            if (UseCards > 0.5) {
+                // P3: SAMPLE the surface card (lit first-bounce radiance the card-light pass wrote) — no per-hit
+                // relighting. Back-face hits (ray hit the far side of a one-sided card) get 0 (a card is lit on
+                // its front; a back hit contributes no radiance), matching the raster one-sided convention.
+                uint inst = q.CommittedInstanceID();
+                LumenInstanceMeta meta = InstanceMeta[inst];
+                uint gtri = meta.TriOffset + q.CommittedPrimitiveIndex();
+                sum += CardRadiance[gtri].rgb;
+            } else {
+                // A/B fallback (BALLISTIC_DX12_LUMEN_NOCARDS=1): re-shade the hit directly (the P2 path).
+                float3 hitPos = origin + dir * q.CommittedRayT();
+                sum += ShadeHit(q.CommittedInstanceID(), q.CommittedPrimitiveIndex(),
+                                q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), dir, hitPos);
+            }
         } else if (UseSky > 0.5) {
             // 3) Ray escaped → sky/IBL irradiance in that direction.
             sum += SkyIrradiance.SampleLevel(LinearClamp, dir, 0).rgb * SkyIntensity;

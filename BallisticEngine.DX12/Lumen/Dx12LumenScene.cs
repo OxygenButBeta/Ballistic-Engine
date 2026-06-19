@@ -1,10 +1,8 @@
 using System;
-using System.Collections.Generic;
 using System.Numerics;
+using System.Runtime.InteropServices;
 using Vortice.Direct3D12;
-using Vortice.DXGI;
 using BallisticEngine;          // IStaticMeshRenderer, RuntimeSet
-using GLVector3 = System.Numerics.Vector3;
 
 namespace BallisticEngine.DX12;
 
@@ -14,85 +12,62 @@ namespace BallisticEngine.DX12;
 //   - the shared BLAS/TLAS (Dx12SceneAS) and per-instance bindless geometry/material SRVs (Dx12RtGeometry),
 //     both reached through the shared DXR holder (ctx.Dxr) — Lumen does NOT build its own AS, it reuses the
 //     one RT shadows/reflections already maintain (stamp-cached: a static scene builds once).
-//   - a SURFACE-CARD allocation table: one coarse, stable surface record per scene object (P1 = one card per
-//     TLAS instance; P3 refines to oriented sub-cards). Cards are surface records, NOT camera pixels and NOT
-//     world probes — they are where off-screen albedo/emissive radiance is captured and lit so an RT hit can
-//     sample real surface radiance instead of IBL/probe mush.
-//   - the card ATLASES (albedo / normal / emissive / depth / radiance). Allocated here so P3 (capture) and
-//     P4 (radiance cache) have a fixed home; P1 only sizes + clears them (no writes → no image change).
-//   - DIRTY flags from the geometry/material stamp (transforms/materials/instances). Lights + camera coverage
-//     dirty bits are added when the capture/cache passes that consume them land (P3/P4).
+//   - the SURFACE CACHE: P3 realizes the plan's "surface cards" as a PER-TRIANGLE radiance cache. Each scene
+//     triangle is one coarse, stable surface record (a card) — they are surface records, NOT camera pixels and
+//     NOT world probes. A card-lighting pass writes each triangle's lit first-bounce radiance into CardRadiance
+//     (sun + punctual + emissive + sky-visibility), and an RT hit samples CardRadiance[triOffset+prim] instead
+//     of re-shading direct light per hit. This is parameterization-free (no UV unwrap), exact for the low-poly
+//     GI fixtures, and the place P4 accumulates multi-bounce temporally.
+//       Why per-triangle, not a 2D atlas: the engine meshes carry only ONE UV set (no lightmap UV), so an
+//       atlas card needs a surface parameterization that does not exist; the triangle IS the finest stable
+//       surface record and needs none.
+//   - the per-instance META the card-lighting compute reads: {triOffset, bindless geo indices, world 3x4}.
+//   - a geometry/material DIRTY stamp; logs object/card/dirty counts.
 //
-// P1 contract (plan §P1): wire to the existing TLAS/material infra, NO image change, and the debug log must
-// report object count, card count, atlas size, and dirty updates. Gated behind BALLISTIC_DX12_LUMEN so the
-// substrate only allocates + logs when Lumen is being worked on; default-off = byte-identical to a no-Lumen
-// frame (nothing is allocated, nothing is sampled).
+// Gated behind BALLISTIC_DX12_LUMEN: default-off = nothing allocated, byte-identical to a no-Lumen frame.
 public sealed class Dx12LumenScene : IDisposable
 {
     readonly Dx12Device dev;
 
-    // ---- Surface-card allocation table -------------------------------------------------------------------
-    // One entry per scene object (TLAS instance). P1 lays the table out over the card atlas as a simple square
-    // grid of fixed-size card tiles; P3 fills CardSize/atlas-rect per object from real surface area + captures
-    // into the tiles. Kept as a struct array (no per-object alloc churn) — rebuilt only when the stamp changes.
-    public struct Card
+    // ---- per-instance meta the card-lighting compute reads (matches HLSL LumenInstanceMeta) ----
+    // The bindless geo indices (normal/uv/index/position/triMat) come from Dx12RtGeometry's RtInstance[] (the
+    // card-light pass binds that buffer too); THIS meta carries only what RtInstance lacks: the per-instance
+    // global triangle offset into CardRadiance + the world matrix (for object→world vertex transform). Same
+    // instance order as RtGeometry/SceneAS so one index hits both buffers.
+    [StructLayout(LayoutKind.Sequential)]
+    struct LumenInstanceMeta
     {
-        public int InstanceIndex;   // TLAS InstanceID() this card represents (matches Dx12SceneAS iteration order)
-        public int AtlasX, AtlasY;  // top-left texel of this card's tile in the atlas
-        public int Size;            // square tile edge in texels (P1: uniform CardTile)
+        public uint TriOffset; public uint TriCount; public uint Pad0; public uint Pad1;
+        public Matrix4x4 World;   // object→world, transposed on upload (HLSL column-major)
     }
 
-    Card[] cards = Array.Empty<Card>();
-    public ReadOnlySpan<Card> Cards => cards;
-    public int CardCount { get; private set; }
-    public int ObjectCount { get; private set; }
+    ID3D12Resource instanceMeta;        // LumenInstanceMeta[] — root SRV, indexed by instance
+    public ulong InstanceMetaGpuAddress => instanceMeta?.GPUVirtualAddress ?? 0;
+    public int InstanceCount { get; private set; }
 
-    // ---- Card atlases ------------------------------------------------------------------------------------
-    // Fixed square atlas. CardTile is the per-object tile edge; the atlas holds CardsPerRow^2 tiles. P1 sizes
-    // for the current object count (next pow2 grid, clamped); P3 may grow/repack. All five share the layout
-    // (same tile rect per object) so a hit's bindless card lookup indexes one rect across every atlas.
-    const int CardTile = 32;                 // texels per card tile edge (coarse — cards are low-frequency)
-    const int MaxAtlasEdge = 4096;           // safety clamp on the atlas dimension
-    public int AtlasEdge { get; private set; }
-    public int CardsPerRow { get; private set; }
+    // ---- per-triangle radiance cache (the "cards") ----
+    ID3D12Resource cardRadiance;        // float4[totalTris]  (rgb radiance, a unused) — UAV (card-light writes) / SRV (hit reads)
+    public ID3D12Resource CardRadiance => cardRadiance;
+    public ulong CardRadianceGpuAddress => cardRadiance?.GPUVirtualAddress ?? 0;
+    public int TotalTriangles { get; private set; }
 
-    // albedo (RGBA8) / normal (RGBA16F packed) / emissive (RGBA16F) / depth (R32F) / radiance (RGBA16F).
-    // Allocated lazily on first Ensure when Lumen is armed; null until then (default-off = no VRAM cost).
-    Dx12OffscreenTarget cardAlbedo, cardNormal, cardEmissive, cardDepth, cardRadiance;
-    public Dx12OffscreenTarget CardAlbedo   => cardAlbedo;
-    public Dx12OffscreenTarget CardNormal   => cardNormal;
-    public Dx12OffscreenTarget CardEmissive => cardEmissive;
-    public Dx12OffscreenTarget CardDepth    => cardDepth;
-    public Dx12OffscreenTarget CardRadiance => cardRadiance;
-
-    // ---- Dirty tracking ----------------------------------------------------------------------------------
-    // Geometry/material/instance stamp (same shape as Dx12SceneAS's stamp). When it changes the card table is
-    // rebuilt and the atlases marked dirty (P3 re-captures). DirtyThisFrame is the per-frame edge the debug
-    // log reports; DirtyUpdateCount is the cumulative number of rebuilds since launch.
+    // ---- dirty tracking ----
     int stamp = -1;
     public bool DirtyThisFrame { get; private set; }
     public int DirtyUpdateCount { get; private set; }
 
-    bool atlasesBuilt;
     bool loggedThisStamp;
 
     public Dx12LumenScene(Dx12Device device) { dev = device; }
 
-    // True once the substrate holds a valid TLAS + at least one card. Passes (P2+) gate their RT dispatch on
-    // this; P1 just reports it.
-    public bool Valid => CardCount > 0 && cardRadiance != null;
+    public bool Valid => TotalTriangles > 0 && cardRadiance != null;
 
-    // Refresh the substrate for this frame: ensure the shared TLAS + bindless geometry, rebuild the card table
-    // on a stamp change, (re)allocate the atlases to fit, and log the P1 counts. Cheap no-op for a static
-    // scene after the first build (stamp compare short-circuits the rebuild). Returns whether the scene is
-    // usable this frame.
+    // Refresh the substrate for this frame: ensure the shared TLAS + bindless geometry, rebuild the per-instance
+    // triangle-range table + the CardRadiance cache on a stamp change, and log the counts. Returns usability.
     public bool Ensure(Dx12FrameContext ctx)
     {
         DirtyThisFrame = false;
 
-        // Reuse the shared DXR substrate — Lumen never builds its own AS. CheckAvailable is FORCE_NORT-aware;
-        // without HW ray tracing Lumen has no off-screen trace, so the substrate reports unavailable (P2's
-        // gate refuses to run rather than silently falling back to screen-space — plan non-goal #3 / gate #6).
         if (!ctx.Dxr.CheckAvailable("Lumen"))
             return false;
 
@@ -101,41 +76,26 @@ public sealed class Dx12LumenScene : IDisposable
         if (!sceneAS.Valid)
             return false;
 
-        // The per-instance bindless geometry/material table (normals/uvs/indices/per-tri material) the card
-        // capture + RT hit shading read. Must follow EnsureMaterialTable (which resets the bindless heap the
-        // SRVs live in), exactly like the reflections pass orders it.
         ctx.GpuDriven.EnsureMaterialTable(ctx.WholeMeshRenderers);
         Dx12RtGeometry rtGeo = ctx.Dxr.RtGeometry;
         rtGeo.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection, ctx.GpuDriven);
 
-        // The card table is laid out over TLAS instances. RtGeometry.InstanceCount is the authoritative count
-        // (same iteration order as Dx12SceneAS → InstanceID() lines up with a card's InstanceIndex).
         int objects = rtGeo.InstanceCount;
-
-        // Stamp: rebuild the table only when the instance/material set changed. RtGeometry already re-Rebuilds
-        // on that change; mirror it with the object count + a coverage hash so card layout follows geometry.
-        int s = ComputeStamp(objects);
-        if (s != stamp || !atlasesBuilt)
+        int s = ComputeStamp(sceneAS, objects);
+        if (s != stamp || cardRadiance == null)
         {
             stamp = s;
-            RebuildCards(objects);
-            EnsureAtlases();
+            Rebuild(sceneAS, rtGeo);
             DirtyThisFrame = true;
             DirtyUpdateCount++;
             loggedThisStamp = false;
         }
 
-        // P1 debug log: object/card/atlas/dirty. Print once per stamp (so a static scene logs once, not every
-        // frame) plus on every dirty edge. Honours the project's "no per-frame churn" rule.
         if (!loggedThisStamp)
         {
             loggedThisStamp = true;
-            // Console (same channel as the rest of the DX12 layer, e.g. the device's RT-availability line) so it
-            // shows on the headless screenshot path bal-render drives; mirrored to Debugging.Log for the editor
-            // console + a live player session. Once per stamp → no per-frame churn.
-            string line = $"[Lumen] scene: objects={ObjectCount} cards={CardCount} " +
-                          $"atlas={AtlasEdge}x{AtlasEdge} (tile={CardTile}, {CardsPerRow}/row) " +
-                          $"dirtyUpdates={DirtyUpdateCount}";
+            string line = $"[Lumen] scene: objects={InstanceCount} cards(tris)={TotalTriangles} " +
+                          $"cacheMB={(TotalTriangles * 16L) / (1024 * 1024.0):0.00} dirtyUpdates={DirtyUpdateCount}";
             Console.WriteLine(line);
             Debugging.Log(line);
         }
@@ -143,75 +103,57 @@ public sealed class Dx12LumenScene : IDisposable
         return Valid;
     }
 
-    // Build one card per TLAS instance, tiling the atlas left-to-right / top-to-bottom. P1 layout only — P3
-    // replaces the uniform tiling with surface-area-weighted card rects captured from the mesh.
-    void RebuildCards(int objects)
+    // Build the per-instance triangle-range table (prefix sum of tri counts) + the per-instance world-matrix
+    // meta + the CardRadiance cache buffer. The bindless geo indices come from rtGeo's RtInstance[] (the card-
+    // light pass reads that buffer); here we only need each instance's tri count (from the mesh) + world matrix.
+    unsafe void Rebuild(Dx12SceneAS sceneAS, Dx12RtGeometry rtGeo)
     {
-        ObjectCount = objects;
-        CardCount = objects;   // P1: exactly one card per object
+        int n = sceneAS.InstanceCount;
+        InstanceCount = n;
 
-        CardsPerRow = Math.Max(1, NextPow2((int)Math.Ceiling(Math.Sqrt(Math.Max(objects, 1)))));
-        AtlasEdge = Math.Min(MaxAtlasEdge, Math.Max(CardTile, CardsPerRow * CardTile));
-        // If the clamp bit (huge object count), recompute how many tiles actually fit per row.
-        CardsPerRow = Math.Max(1, AtlasEdge / CardTile);
-
-        if (cards.Length < objects)
-            cards = new Card[Math.Max(objects, 1)];
-
-        for (int i = 0; i < objects; i++)
+        var meta = new LumenInstanceMeta[Math.Max(n, 1)];
+        int offset = 0;
+        for (int i = 0; i < n; i++)
         {
-            int col = i % CardsPerRow;
-            int row = i / CardsPerRow;
-            cards[i] = new Card
+            int tris = sceneAS.InstanceTriangleCount(i);
+            meta[i] = new LumenInstanceMeta
             {
-                InstanceIndex = i,
-                AtlasX = col * CardTile,
-                AtlasY = row * CardTile,
-                Size = CardTile,
+                TriOffset = (uint)offset, TriCount = (uint)tris,
+                World = Matrix4x4.Transpose(sceneAS.InstanceWorld(i)),
             };
+            offset += tris;
         }
+        TotalTriangles = offset;
+
+        instanceMeta?.Dispose();
+        instanceMeta = n > 0 ? dev.CreateUavBuffer<LumenInstanceMeta>(meta, ResourceStates.GenericRead) : null;
+
+        cardRadiance?.Dispose();
+        // float4 per triangle; UAV (card-light writes) readable as a StructuredBuffer SRV by the hit trace.
+        int count = Math.Max(TotalTriangles, 1);
+        var zero = new Vector4[count];   // start cleared (no stale radiance on a fresh build)
+        cardRadiance = dev.CreateUavBuffer<Vector4>(zero, ResourceStates.UnorderedAccess);
+        cardRadianceState = ResourceStates.UnorderedAccess;
     }
 
-    // (Re)allocate the five card atlases at AtlasEdge². Committed targets (cross-frame surface cache → never
-    // pooled, like the other history targets). P1 leaves them cleared; P3 captures into them.
-    void EnsureAtlases()
-    {
-        DisposeAtlases();
-        int e = Math.Max(CardTile, AtlasEdge);
-        cardAlbedo   = new Dx12OffscreenTarget(dev, e, e, withDepth: false, colorFormat: Format.R8G8B8A8_UNorm,        colorReadable: true, allowUav: true);
-        cardNormal   = new Dx12OffscreenTarget(dev, e, e, withDepth: false, colorFormat: Format.R16G16B16A16_Float,   colorReadable: true, allowUav: true);
-        cardEmissive = new Dx12OffscreenTarget(dev, e, e, withDepth: false, colorFormat: Format.R16G16B16A16_Float,   colorReadable: true, allowUav: true);
-        cardDepth    = new Dx12OffscreenTarget(dev, e, e, withDepth: false, colorFormat: Format.R32_Float,            colorReadable: true, allowUav: true);
-        cardRadiance = new Dx12OffscreenTarget(dev, e, e, withDepth: false, colorFormat: Format.R16G16B16A16_Float,   colorReadable: true, allowUav: true);
-        atlasesBuilt = true;
-    }
+    public ResourceStates cardRadianceState = ResourceStates.UnorderedAccess;
 
-    int ComputeStamp(int objects)
+    int ComputeStamp(Dx12SceneAS sceneAS, int objects)
     {
         var h = new HashCode();
         h.Add(objects);
-        // RtGeometry's own stamp already folds the instance set + material table; fold the object count so a
-        // pure add/remove that leaves the hash otherwise equal still re-lays the table.
+        for (int i = 0; i < sceneAS.InstanceCount; i++)
+        {
+            h.Add(sceneAS.InstanceTriangleCount(i));
+            Matrix4x4 w = sceneAS.InstanceWorld(i);
+            h.Add(w.M41); h.Add(w.M42); h.Add(w.M43);   // translation is enough to detect a moved instance
+        }
         return h.ToHashCode();
-    }
-
-    static int NextPow2(int v)
-    {
-        if (v <= 1) return 1;
-        v--; v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16; return v + 1;
-    }
-
-    void DisposeAtlases()
-    {
-        cardAlbedo?.Dispose(); cardNormal?.Dispose(); cardEmissive?.Dispose();
-        cardDepth?.Dispose(); cardRadiance?.Dispose();
-        cardAlbedo = cardNormal = cardEmissive = cardDepth = cardRadiance = null;
-        atlasesBuilt = false;
     }
 
     public void Dispose()
     {
-        DisposeAtlases();
-        cards = Array.Empty<Card>();
+        instanceMeta?.Dispose(); instanceMeta = null;
+        cardRadiance?.Dispose(); cardRadiance = null;
     }
 }

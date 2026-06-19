@@ -36,7 +36,7 @@ SamplerState LinearClamp : register(s0);
 SamplerState LinearWrap  : register(s1);
 
 // --- Bindless geometry + material ---
-struct RtInstance { uint NormalIdx, UvIdx, IndexIdx, TriMatIdx; };
+struct RtInstance { uint NormalIdx, UvIdx, IndexIdx, TriMatIdx; uint PositionIdx, TriCount, Pad0, Pad1; };
 struct GpuMaterial {
     uint DiffuseIdx, NormalIdx, MetallicIdx, RoughnessIdx;
     uint AoIdx, EmissiveIdx, Pad0, Pad1;

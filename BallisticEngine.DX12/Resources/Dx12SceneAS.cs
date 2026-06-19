@@ -27,6 +27,13 @@ public sealed class Dx12SceneAS : IDisposable {
     public ulong TlasAddress => tlas?.GPUVirtualAddress ?? 0;
     public bool Valid => tlas != null;
 
+    // Per-instance accessors (same iteration order as Dx12RtGeometry → InstanceID() lines up). Lumen V2 P3
+    // reads each instance's world matrix to transform the mesh's object-space triangle vertices into world
+    // space for card lighting. Read-only snapshot of the last Ensure.
+    public int InstanceCount => instances.Count;
+    public Matrix4x4 InstanceWorld(int i) => instances[i].world;
+    public int InstanceTriangleCount(int i) => instances[i].mesh.IndexBuffer.ElementCount / 3;
+
     public Dx12SceneAS(Dx12Device device) {
         dev = device;
         device5 = dev.Device.QueryInterface<ID3D12Device5>();

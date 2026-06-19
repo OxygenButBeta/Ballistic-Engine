@@ -74,12 +74,28 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public Matrix4x4 ViewProj;
         public Vector3 CameraPos; public float Intensity;
         public Vector2 TexelSize; public float RayCount; public float FrameIndex;
-        public float NormalBias; public float MaxRayDist; public float ScreenStepPx; public float ScreenSteps;
+        public float NormalBias; public float MaxRayDist; public float UseCards; public float ScreenSteps;
         public float SkyIntensity; public float UseSky; public float Pad0; public float Pad1;
     }
 
     [StructLayout(LayoutKind.Sequential)]
     struct LumenSun { public Vector3 SunDir; public float SunBias; public Vector3 SunColor; public float LightCount; }
+
+    // Card-lighting pass (LumenCardLight.hlsl): lights every triangle "card" before the trace samples them.
+    ID3D12RootSignature cardRootSig;
+    ID3D12PipelineState cardPso;
+    ID3D12Resource cardCb;
+    unsafe byte* cardCbMapped;
+    const int CardSkyTableBase = Dx12BindlessTail.LumenCardTableBase;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct LumenCardConstants
+    {
+        public Vector3 SunDir; public float SunBias;
+        public Vector3 SunColor; public float LightCount;
+        public uint InstanceCount; public uint TotalTris; public float SkyIntensity; public float UseSky;
+        public float SkyVisRays; public float Pad0; public float Pad1; public float Pad2;
+    }
 
     int frameCounter;
 
@@ -105,6 +121,14 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         float maxDist = EnvF("BALLISTIC_DX12_LUMEN_DIST", 40f);
         float skyIntensity = EnvF("BALLISTIC_DX12_LUMEN_SKY", 1f);
         bool useSky = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOSKY") != "1";
+        bool useCards = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOCARDS") != "1";
+
+        Vector3 sunDirN = ctx.LightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(ctx.LightDir);
+
+        // === CARD LIGHTING (P3): light every triangle card into CardRadiance before the trace samples them.
+        // 1D dispatch over all scene triangles. Skipped when cards are off (A/B re-shade path). ===
+        if (useCards && scene.TotalTriangles > 0)
+            LightCards(ctx, sunDirN, clusteredLights, ibl, skyIntensity, useSky);
 
         *(LumenConstants*)traceCbMapped = new LumenConstants
         {
@@ -113,13 +137,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             CameraPos = ctx.CamPos, Intensity = intensity,
             TexelSize = new Vector2(1f / indirect.Width, 1f / indirect.Height),
             RayCount = rayCount, FrameIndex = ctx.DeterministicCapture ? 0f : frameCounter,
-            NormalBias = 0.03f, MaxRayDist = maxDist, ScreenStepPx = 0f, ScreenSteps = 16f,
+            NormalBias = 0.03f, MaxRayDist = maxDist, UseCards = useCards ? 1f : 0f, ScreenSteps = 16f,
             SkyIntensity = skyIntensity, UseSky = useSky ? 1f : 0f,
         };
-        Vector3 sunDir = ctx.LightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(ctx.LightDir);
         *(LumenSun*)sunCbMapped = new LumenSun
         {
-            SunDir = sunDir, SunBias = 0.03f, SunColor = ctx.LightColor, LightCount = clusteredLights.LightCount,
+            SunDir = sunDirN, SunBias = 0.03f, SunColor = ctx.LightColor, LightCount = clusteredLights.LightCount,
         };
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
@@ -156,6 +179,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.SetComputeRootShaderResourceView(4, ctx.GpuDriven.MaterialsGpuAddress);    // t7 GpuMaterials
             cl.SetComputeRootShaderResourceView(5, rtGeo.InstancesGpuAddress);            // t8 RtInstance[]
             cl.SetComputeRootShaderResourceView(6, clusteredLights.LightBufGpuAddress);   // t9 punctual lights
+            cl.SetComputeRootShaderResourceView(7, scene.CardRadianceGpuAddress);         // t10 CardRadiance (cards)
+            cl.SetComputeRootShaderResourceView(8, scene.InstanceMetaGpuAddress);         // t11 InstanceMeta
             cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
         });
         indirect.ColorToShaderResource();
@@ -186,6 +211,49 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         frameCounter++;
     }
 
+    // P3 card lighting: 1D dispatch over all scene triangles, writing each triangle's lit first-bounce radiance
+    // into scene.CardRadiance. Reads the shared TLAS (shadow rays) + bindless geo/material + the per-instance
+    // meta. The trace then samples these cards on RT hits (no per-hit relighting).
+    unsafe void LightCards(Dx12FrameContext ctx, Vector3 sunDir, Dx12ClusteredLights clusteredLights,
+                           Dx12IblBaker ibl, float skyIntensity, bool useSky)
+    {
+        var sceneAS = ctx.Dxr.SceneAS;
+        *(LumenCardConstants*)cardCbMapped = new LumenCardConstants
+        {
+            SunDir = sunDir, SunBias = 0.03f, SunColor = ctx.LightColor, LightCount = clusteredLights.LightCount,
+            InstanceCount = (uint)scene.InstanceCount, TotalTris = (uint)scene.TotalTriangles,
+            SkyIntensity = skyIntensity, UseSky = useSky ? 1f : 0f, SkyVisRays = 4f,
+        };
+
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        Dx12DescriptorHeap bindless = Dx12Backend.BindlessHeap;
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(CardSkyTableBase + 0), ibl.IrradianceSrv, heapType);   // t1 sky cube
+
+        // CardRadiance is the card-light UAV target this dispatch; it was left in UnorderedAccess by Rebuild (or
+        // CopySource/Pixel by a prior frame). Bring it to UAV, dispatch, then to NonPixelShaderResource for the
+        // trace's root-SRV read (a root SRV still needs the resource in a readable state for the compute stage).
+        ID3D12Resource card = scene.CardRadiance;
+        dev.ExecuteSync(cl =>
+        {
+            if (scene.cardRadianceState != ResourceStates.UnorderedAccess)
+                cl.ResourceBarrierTransition(card, scene.cardRadianceState, ResourceStates.UnorderedAccess);
+            cl.SetDescriptorHeaps(bindless.Heap);
+            cl.SetComputeRootSignature(cardRootSig);
+            cl.SetPipelineState(cardPso);
+            cl.SetComputeRootConstantBufferView(0, cardCb.GPUVirtualAddress);
+            cl.SetComputeRootShaderResourceView(1, sceneAS.TlasAddress);                 // t0 TLAS
+            cl.SetComputeRootUnorderedAccessView(2, scene.CardRadianceGpuAddress);       // u0 CardRadiance
+            cl.SetComputeRootDescriptorTable(3, bindless.Gpu(CardSkyTableBase));         // t1 sky cube
+            cl.SetComputeRootShaderResourceView(4, scene.InstanceMetaGpuAddress);        // t2 LumenInstanceMeta
+            cl.SetComputeRootShaderResourceView(5, ctx.Dxr.RtGeometry.InstancesGpuAddress); // t3 RtInstance[]
+            cl.SetComputeRootShaderResourceView(6, ctx.GpuDriven.MaterialsGpuAddress);   // t4 GpuMaterials
+            cl.SetComputeRootShaderResourceView(7, clusteredLights.LightBufGpuAddress);  // t5 Lights
+            cl.Dispatch((uint)((scene.TotalTriangles + 63) / 64), 1, 1);
+            cl.ResourceBarrierTransition(card, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+        });
+        scene.cardRadianceState = ResourceStates.NonPixelShaderResource;
+    }
+
     static float EnvF(string name, float fallback) =>
         float.TryParse(Environment.GetEnvironmentVariable(name), System.Globalization.CultureInfo.InvariantCulture,
             out float v) ? v : fallback;
@@ -207,6 +275,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         var matSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All);
         var instSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(8, 0), ShaderVisibility.All);
         var lightSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(9, 0), ShaderVisibility.All);
+        var cardSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(10, 0), ShaderVisibility.All);  // t10 CardRadiance
+        var metaSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(11, 0), ShaderVisibility.All);  // t11 InstanceMeta
         var clampSamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
         {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
@@ -222,7 +292,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         traceRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { cbv0, cbv1, tlasSrv, table, matSrv, instSrv, lightSrv }, new[] { clampSamp, wrapSamp })));
+                new[] { cbv0, cbv1, tlasSrv, table, matSrv, instSrv, lightSrv, cardSrv, metaSrv }, new[] { clampSamp, wrapSamp })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumenGi.hlsl");
         byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSTrace", "LumenGi.hlsl");
@@ -271,6 +341,47 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
 
         combineSrv = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 8, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+
+        BuildCardPipeline();
+    }
+
+    // Card-lighting compute (LumenCardLight.hlsl): TLAS t0 (root SRV) | CardRadiance u0 (root UAV) | sky cube
+    // t1 (table, in the bindless tail) | LumenInstanceMeta t2 / RtInstance[] t3 / GpuMaterials t4 / Lights t5
+    // (root SRVs) | b0 | HeapDirectlyIndexed for the bindless geo reads | s0/s1.
+    unsafe void BuildCardPipeline()
+    {
+        var cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var tlasSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.All);   // t0 TLAS
+        var uavRoot = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(0, 0), ShaderVisibility.All);  // u0 CardRadiance
+        var skyRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 1);   // t1 sky cube (table)
+        var skyTable = new RootParameter1(new RootDescriptorTable1(skyRange), ShaderVisibility.All);
+        var instMeta = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(2, 0), ShaderVisibility.All);  // t2
+        var rtInst = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(3, 0), ShaderVisibility.All);    // t3
+        var mats = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(4, 0), ShaderVisibility.All);      // t4
+        var lights = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(5, 0), ShaderVisibility.All);    // t5
+        var clamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
+        {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
+            AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1, ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        var wrap = new StaticSamplerDescription(ShaderVisibility.All, 1, 0)
+        {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap, AddressV = TextureAddressMode.Wrap,
+            AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 1, ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        cardRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(
+                RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
+                new[] { cbv0, tlasSrv, uavRoot, skyTable, instMeta, rtInst, mats, lights }, new[] { clamp, wrap })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumenCardLight.hlsl");
+        byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSMain", "LumenCardLight.hlsl");
+        cardPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription { RootSignature = cardRootSig, ComputeShader = cs });
+
+        int cbSize = (Marshal.SizeOf<LumenCardConstants>() + 255) & ~255;
+        cardCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+        cardCbMapped = cardCb.Map<byte>(0);
     }
 
     // The indirect buffer + the (unused-in-P2) scratch reallocate with the render resolution. Full-res for now
@@ -286,6 +397,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     {
         scene.Dispose();
         tracePso?.Dispose(); traceRootSig?.Dispose(); traceCb?.Dispose(); sunCb?.Dispose();
+        cardPso?.Dispose(); cardRootSig?.Dispose(); cardCb?.Dispose();
         combinePso?.Dispose(); combineDebugPso?.Dispose(); combineRootSig?.Dispose(); combineSrv?.Dispose();
         indirect?.Dispose();
     }
