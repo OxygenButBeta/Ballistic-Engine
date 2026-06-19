@@ -119,6 +119,11 @@ public sealed class Dx12FrameContext {
     public bool   IblActiveThisFrame { get; set; }
     public bool   ShadowsThisFrame   { get; set; }
     public bool   RtShadowsThisFrame { get; set; }
+    // Lumen V2 GI is active this frame (BALLISTIC_DX12_LUMEN armed + HW RT + valid scene AS). Resolved at ctx
+    // build so the DEFERRED pass (event 300) can suppress its IBL diffuse ambient BEFORE the Lumen GI pass
+    // (event 500) adds its own diffuse indirect — the two must agree to avoid double-counting. The Lumen pass's
+    // own Enabled() recomputes the same predicate; this field mirrors it for upstream consumers.
+    public bool   LumenActiveThisFrame { get; set; }
 
     // The film-grain animation counter. The orchestrator seeds it just before the single graph.Execute.
     // The composite reads it for the non-deterministic grain phase only (frozen to 0 under DeterministicCapture).

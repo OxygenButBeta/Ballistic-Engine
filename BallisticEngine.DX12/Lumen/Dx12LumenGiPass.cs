@@ -1,21 +1,30 @@
 using System;
-using BallisticEngine;          // IStaticMeshRenderer
+using System.Numerics;
+using System.Runtime.InteropServices;
+using BallisticEngine;          // RuntimeSet, IStaticMeshRenderer
+using Vortice.Direct3D;         // PrimitiveTopology
 using Vortice.Direct3D12;
+using Vortice.Dxc;              // DxcShaderStage
+using Vortice.DXGI;             // Format, SampleDescription
 
 namespace BallisticEngine.DX12;
 
-// Lumen V2 — the single product-facing GI pass (plan §Target Shape: one `Lumen` path, screen traces first,
+// Lumen V2 — the single product-facing GI pass (plan §Target Shape: one `Lumen` path; screen traces first,
 // hardware RT for off-screen hits, surface/radiance cache for stable indirect). Event = GlobalIllumination
 // (500), the slot the legacy GI pass occupied (after Transparents, before Fog).
 //
-// This pass owns the Lumen scene substrate (Dx12LumenScene) and, across the milestones, the screen-trace +
-// HW-RT pipelines, the radiance cache, and the final gather. It writes ONE clean diffuse-indirect buffer the
-// deferred/compose path adds without double-counting IBL.
+// P2 (THIS milestone — "minimal truthful GI"): one diffuse bounce, NO surface cache, NO temporal history.
+//   1. CSTrace (LumenGi.hlsl) integrates incoming diffuse irradiance per pixel: screen-trace the depth buffer
+//      first (free near-field contact bounce), inline-RayQuery the scene TLAS on a screen miss (off-screen +
+//      occluded), sky/IBL on an RT miss. RT hits are shaded with REAL first-bounce radiance (emissive + sun
+//      + punctual, shadow-rayed, × bindless albedo). Writes incoming irradiance E into `indirect`.
+//   2. PSCombine adds E*albedo*ao/PI into the HDR scene color (additive One/One). The deferred pass already
+//      suppressed its IBL diffuse ambient (ctx.LumenActiveThisFrame → UseIBLDiffuse=0), so no double count.
+// "Noisy but truthful": low ray count, no denoise. Gates are correctness — black room black, color bleed
+// bleeds, thin wall no leak. Cards (P3) + radiance cache/temporal (P4) build on this.
 //
-// P1 (THIS commit): substrate only. Record ensures Dx12LumenScene (shared TLAS + bindless geometry + card
-// table + atlases) and logs object/card/atlas/dirty counts. NO shading, NO indirect buffer yet → byte-
-// identical to a no-Lumen frame. Gated behind BALLISTIC_DX12_LUMEN=1 (product `GiMode` volume comes later);
-// default-off means the substrate never allocates and this pass is a no-op.
+// Owns the Lumen scene substrate (Dx12LumenScene) and `indirect`. Gated behind BALLISTIC_DX12_LUMEN; default-
+// off = no substrate alloc + no-op Record. HW-RT only (plan gate #6: no hidden SSGI fallback).
 public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
 {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.GlobalIllumination;
@@ -24,32 +33,260 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     readonly Dx12Device dev;
     readonly Dx12LumenScene scene;
 
-    public Dx12LumenGiPass(Dx12Device device)
+    public Dx12LumenGiPass(Dx12Device device, int width, int height)
     {
         dev = device;
         scene = new Dx12LumenScene(device);
+        BuildPipelines();
+        Resize(width, height);
     }
 
     // The product door. BALLISTIC_DX12_LUMEN=1 arms Lumen; unset/0 = off (no substrate alloc, no-op Record).
-    // Resolved once (no per-frame env churn). A `GiMode` volume parameter will drive this once the path ships.
     int? armed;
-    bool Armed => (armed ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN") == "1" ? 1 : 0) == 1;
+    public bool Armed => (armed ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN") == "1" ? 1 : 0) == 1;
 
-    public bool Enabled(Dx12FrameContext ctx)
+    // The frame-level "Lumen runs" predicate, shared with the orchestrator (which mirrors it into
+    // ctx.LumenActiveThisFrame so the deferred pass suppresses its IBL diffuse ambient before this pass adds
+    // its own diffuse indirect). Lumen is HW-RT only — no hidden SSGI fallback (plan gate #6).
+    public static bool WouldRun(Dx12FrameContext ctx, bool armed) =>
+        !ctx.Doors.Minimal && armed && ctx.Dev.HasHardwareRayTracing && ctx.Dxr?.SceneAS != null;
+
+    public bool Enabled(Dx12FrameContext ctx) => WouldRun(ctx, Armed);
+
+    // ---- trace (inline RayQuery compute) ----
+    ID3D12RootSignature traceRootSig;   // HeapDirectlyIndexed; CBV b0/b1 + table{t0-t6, u0} + root SRV t7/t8/t9 + s0/s1
+    ID3D12PipelineState tracePso;
+    ID3D12Resource traceCb, sunCb;
+    unsafe byte* traceCbMapped, sunCbMapped;
+    const int LumenTableBase = Dx12BindlessTail.LumenTableBase;
+    Dx12OffscreenTarget indirect;       // full-res RGBA16F incoming irradiance E (cross-pass scratch; rebuilt on resize)
+
+    // ---- combine (additive fullscreen) ----
+    ID3D12RootSignature combineRootSig; // 4-SRV table + sampler
+    ID3D12PipelineState combinePso;
+    ID3D12PipelineState combineDebugPso; // OPAQUE replace — BALLISTIC_DX12_LUMEN_DEBUG=1 shows raw E (no add)
+    Dx12DescriptorHeap combineSrv;      // 4 SRVs per pass
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct LumenConstants
     {
-        if (ctx.Doors.Minimal) return false;
-        if (!Armed) return false;
-        // Lumen is HW-RT only (plan gate #6: no hidden fallback to SSGI). Without ray tracing the pass is
-        // simply unavailable — the scene Ensure also re-checks, but gate here so we don't even Record.
-        return ctx.Dev.HasHardwareRayTracing && ctx.Dxr?.SceneAS != null;
+        public Matrix4x4 InvViewProj;
+        public Matrix4x4 ViewProj;
+        public Vector3 CameraPos; public float Intensity;
+        public Vector2 TexelSize; public float RayCount; public float FrameIndex;
+        public float NormalBias; public float MaxRayDist; public float ScreenStepPx; public float ScreenSteps;
+        public float SkyIntensity; public float UseSky; public float Pad0; public float Pad1;
     }
 
-    public void Record(Dx12FrameContext ctx)
+    [StructLayout(LayoutKind.Sequential)]
+    struct LumenSun { public Vector3 SunDir; public float SunBias; public Vector3 SunColor; public float LightCount; }
+
+    int frameCounter;
+
+    public unsafe void Record(Dx12FrameContext ctx)
     {
-        // P1: build/refresh the substrate and log its counts. No shading. The returned validity drives nothing
-        // yet (P2 gates the screen-trace + RT dispatch on it).
-        scene.Ensure(ctx);
+        // Build/refresh the substrate (shared TLAS + bindless geo + card table + atlases) and log its counts.
+        if (!scene.Ensure(ctx))
+            return;   // no valid scene AS → nothing to trace (Lumen is HW-RT only; no SSGI fallback)
+
+        var sceneAS = ctx.Dxr.SceneAS;
+        var rtGeo = ctx.Dxr.RtGeometry;
+        if (!rtGeo.Valid) return;
+
+        var gbuffer = ctx.GBuffer;
+        var ibl = ctx.Ibl;
+        var clusteredLights = ctx.ClusteredLights;
+        var target = ctx.SceneColor;
+
+        Matrix4x4.Invert(ctx.ViewProj, out Matrix4x4 invVP);
+
+        float intensity = EnvF("BALLISTIC_DX12_LUMEN_INTENSITY", 1f);
+        float rayCount = MathF.Round(EnvF("BALLISTIC_DX12_LUMEN_RAYS", 4f));
+        float maxDist = EnvF("BALLISTIC_DX12_LUMEN_DIST", 40f);
+        float skyIntensity = EnvF("BALLISTIC_DX12_LUMEN_SKY", 1f);
+        bool useSky = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOSKY") != "1";
+
+        *(LumenConstants*)traceCbMapped = new LumenConstants
+        {
+            InvViewProj = Matrix4x4.Transpose(invVP),
+            ViewProj = Matrix4x4.Transpose(ctx.ViewProj),
+            CameraPos = ctx.CamPos, Intensity = intensity,
+            TexelSize = new Vector2(1f / indirect.Width, 1f / indirect.Height),
+            RayCount = rayCount, FrameIndex = ctx.DeterministicCapture ? 0f : frameCounter,
+            NormalBias = 0.03f, MaxRayDist = maxDist, ScreenStepPx = 0f, ScreenSteps = 16f,
+            SkyIntensity = skyIntensity, UseSky = useSky ? 1f : 0f,
+        };
+        Vector3 sunDir = ctx.LightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(ctx.LightDir);
+        *(LumenSun*)sunCbMapped = new LumenSun
+        {
+            SunDir = sunDir, SunBias = 0.03f, SunColor = ctx.LightColor, LightCount = clusteredLights.LightCount,
+        };
+
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        Dx12DescriptorHeap bindless = Dx12Backend.BindlessHeap;
+        // TLAS is a ROOT SRV (bound below); the table holds t1-t6 + u0 in the reserved tail (so the one bound
+        // CBV/SRV/UAV heap serves both the table AND the closest-hit's ResourceDescriptorHeap[] bindless reads).
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(LumenTableBase + 0), gbuffer.DepthSrvCpu, heapType);     // t1 depth
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(LumenTableBase + 1), gbuffer.ColorSrvCpu(1), heapType);  // t2 world normal
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(LumenTableBase + 2), gbuffer.ColorSrvCpu(2), heapType);  // t3 material
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(LumenTableBase + 3), target.ColorSrvCpu, heapType);      // t4 lit scene color
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(LumenTableBase + 4), ibl.IrradianceSrv, heapType);       // t5 sky irradiance
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(LumenTableBase + 5), ibl.PrefilterSrv, heapType);        // t6 sky prefilter
+        dev.Device.CreateUnorderedAccessView(indirect.RenderTarget, null, new UnorderedAccessViewDescription
+        {
+            Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+        }, bindless.Cpu(LumenTableBase + 6));                                                                      // u0 indirect
+
+        // The trace reads depth/normal/material/scene-color as SRVs from the COMPUTE (non-pixel) stage, and the
+        // scene color must be readable too. Promote: G-buffer to the combined read; scene color to SRV. ALL in
+        // one list so state tracking is exact (the RTAO-pass pattern that avoided the split-submit barrier bugs).
+        gbuffer.ToShaderResource();
+        target.ColorToShaderResource();
+        indirect.ColorToUnorderedAccess();
+
+        dev.ExecuteSync(cl =>
+        {
+            cl.SetDescriptorHeaps(bindless.Heap);
+            cl.SetComputeRootSignature(traceRootSig);
+            cl.SetPipelineState(tracePso);
+            cl.SetComputeRootConstantBufferView(0, traceCb.GPUVirtualAddress);
+            cl.SetComputeRootConstantBufferView(1, sunCb.GPUVirtualAddress);
+            cl.SetComputeRootShaderResourceView(2, sceneAS.TlasAddress);                  // t0 TLAS (root SRV)
+            cl.SetComputeRootDescriptorTable(3, bindless.Gpu(LumenTableBase));            // t1-t6 + u0
+            cl.SetComputeRootShaderResourceView(4, ctx.GpuDriven.MaterialsGpuAddress);    // t7 GpuMaterials
+            cl.SetComputeRootShaderResourceView(5, rtGeo.InstancesGpuAddress);            // t8 RtInstance[]
+            cl.SetComputeRootShaderResourceView(6, clusteredLights.LightBufGpuAddress);   // t9 punctual lights
+            cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
+        });
+        indirect.ColorToShaderResource();
+
+        // === COMBINE: add E*albedo*ao/PI directly into the HDR scene color via an additive (One/One) fullscreen
+        // PSO — no scratch target needed. The deferred pass already suppressed its IBL diffuse ambient
+        // (ctx.LumenActiveThisFrame → UseIBLDiffuse=0), so this adds Lumen's diffuse indirect without double-count.
+        // BALLISTIC_DX12_LUMEN_DEBUG=1 swaps to an OPAQUE-replace PSO that shows the raw irradiance E instead. ===
+        gbuffer.ToShaderResource();
+        combineSrv.Reset();
+        int cb = combineSrv.AllocateRange(4);
+        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 0), indirect.ColorSrvCpu, heapType);          // t0 E
+        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 1), gbuffer.ColorSrvCpu(0), heapType);        // t1 albedo
+        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 2), gbuffer.ColorSrvCpu(2), heapType);        // t2 material (ao)
+        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 3), gbuffer.DepthSrvCpu, heapType);           // t3 depth
+        bool debugE = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_DEBUG") == "1";
+        ID3D12PipelineState pso = debugE ? combineDebugPso : combinePso;
+        target.RenderColorOnly(cl =>
+        {
+            cl.SetGraphicsRootSignature(combineRootSig);
+            cl.SetPipelineState(pso);                  // additive One/One blend (or opaque replace when debugE)
+            cl.SetDescriptorHeaps(combineSrv.Heap);
+            cl.SetGraphicsRootDescriptorTable(0, combineSrv.Gpu(cb));
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
+
+        frameCounter++;
     }
 
-    public void Dispose() => scene.Dispose();
+    static float EnvF(string name, float fallback) =>
+        float.TryParse(Environment.GetEnvironmentVariable(name), System.Globalization.CultureInfo.InvariantCulture,
+            out float v) ? v : fallback;
+
+    unsafe void BuildPipelines()
+    {
+        // --- trace root sig. HeapDirectlyIndexed so the inline-RayQuery hit decode reads ResourceDescriptorHeap[]
+        // for per-instance geo/material. The TLAS is a ROOT SRV (t0), NOT a table descriptor: inline RayQuery's
+        // Scene reads through a table descriptor unreliably when HeapDirectlyIndexed is set (the table-bound TLAS
+        // returned ZERO hits on the RX 9070 XT — proven by the hit/miss probe; RTAO works only because it does NOT
+        // set HeapDirectlyIndexed). A root-SRV TLAS sidesteps the heap-indexing mode entirely. CBV b0/b1 +
+        // root SRV t0 TLAS + table{t1-t6, u0} + root SRV t7 GpuMaterials / t8 RtInstance[] / t9 Lights + s0/s1. ---
+        var cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var cbv1 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.All);
+        var tlasSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.All);   // t0 TLAS (root)
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 6, baseShaderRegister: 1);   // t1-t6
+        var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);  // u0
+        var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange), ShaderVisibility.All);
+        var matSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All);
+        var instSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(8, 0), ShaderVisibility.All);
+        var lightSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(9, 0), ShaderVisibility.All);
+        var clampSamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
+        {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        var wrapSamp = new StaticSamplerDescription(ShaderVisibility.All, 1, 0)
+        {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap,
+            AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        traceRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(
+                RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
+                new[] { cbv0, cbv1, tlasSrv, table, matSrv, instSrv, lightSrv }, new[] { clampSamp, wrapSamp })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumenGi.hlsl");
+        byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSTrace", "LumenGi.hlsl");
+        tracePso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription
+        {
+            RootSignature = traceRootSig, ComputeShader = cs,
+        });
+
+        int cbSize = (Marshal.SizeOf<LumenConstants>() + 255) & ~255;
+        traceCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
+        traceCbMapped = traceCb.Map<byte>(0);
+        int sunSize = (Marshal.SizeOf<LumenSun>() + 255) & ~255;
+        sunCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)sunSize), ResourceStates.GenericRead);
+        sunCbMapped = sunCb.Map<byte>(0);
+
+        // --- combine root sig: 4-SRV table (E / albedo / material / depth) + clamp sampler. Additive PSO. ---
+        var combRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 4, baseShaderRegister: 0);
+        var combTable = new RootParameter1(new RootDescriptorTable1(combRange), ShaderVisibility.Pixel);
+        var combSamp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0)
+        {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        combineRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { combTable }, new[] { combSamp })));
+
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSCombine", "LumenGi.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSCombine", "LumenGi.hlsl");
+        var additive = new BlendDescription(Blend.One, Blend.One);   // src=One dest=One op=Add → ADD onto the HDR color
+        GraphicsPipelineStateDescription MakeCombine(byte[] pixel, BlendDescription blend) =>
+            new()
+            {
+                RootSignature = combineRootSig, VertexShader = vs, PixelShader = pixel, InputLayout = null,
+                PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+                RasterizerState = RasterizerDescription.CullNone, BlendState = blend,
+                DepthStencilState = DepthStencilDescription.None,
+                RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
+                DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
+            };
+        combinePso = dev.Device.CreateGraphicsPipelineState(MakeCombine(ps, additive));
+        byte[] psDebug = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSDebugE", "LumenGi.hlsl");
+        combineDebugPso = dev.Device.CreateGraphicsPipelineState(MakeCombine(psDebug, BlendDescription.Opaque));
+
+        combineSrv = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 8, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+    }
+
+    // The indirect buffer + the (unused-in-P2) scratch reallocate with the render resolution. Full-res for now
+    // (half-res + depth-aware upsample is a P4 perf follow-up). Committed (cross-pass scratch; never pooled).
+    public void Resize(int w, int h)
+    {
+        indirect?.Dispose();
+        indirect = new Dx12OffscreenTarget(dev, Math.Max(1, w), Math.Max(1, h), withDepth: false,
+            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
+    }
+
+    public void Dispose()
+    {
+        scene.Dispose();
+        tracePso?.Dispose(); traceRootSig?.Dispose(); traceCb?.Dispose(); sunCb?.Dispose();
+        combinePso?.Dispose(); combineDebugPso?.Dispose(); combineRootSig?.Dispose(); combineSrv?.Dispose();
+        indirect?.Dispose();
+    }
 }

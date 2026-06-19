@@ -23,7 +23,7 @@ cbuffer LightConstants : register(b0) {
     float    SpecClamp;                            // V2: max per-light specular LUMA (0 = off); caps NDF fireflies
     float    SpecAaStrength;                       // V2: geometric specular AA strength (0 = off); roughens noisy normals
     float    UseSsao;                              // >0.5 = multiply the GTAO term into the IBL ambient (ambient-only)
-    float    Pad3;
+    float    UseIBLDiffuse;                         // >0.5 = add the IBL diffuse-irradiance ambient; 0 when Lumen owns diffuse GI
     float    Pad4;
     float4x4 ViewProjFwd;                          // world → clip (transposed on upload); contact-shadow march reprojection
 };
@@ -361,7 +361,10 @@ float4 PSMain(VSOut i) : SV_Target {
         float3 Famb = FresnelSchlickRoughness(NdotVamb, F0, roughness);
         float3 kD = (1.0 - Famb) * (1.0 - metallic);
         float3 irradiance = IrradianceMap.SampleLevel(LinearClamp, N, 0).rgb;
-        float3 ambientDiffuse = kD * irradiance * albedo * ao;
+        // When Lumen V2 owns diffuse GI (UseIBLDiffuse=0), suppress the IBL diffuse-irradiance ambient here so
+        // the Lumen GI combine (which ADDS its own sky-visibility-aware diffuse indirect) does not double-count.
+        // Specular IBL below is untouched — Lumen P2 is diffuse-only; reflections stay on the IBL/RT path.
+        float3 ambientDiffuse = (UseIBLDiffuse > 0.5) ? kD * irradiance * albedo * ao : 0.0.xxx;
         float3 R = reflect(-V, N);
         float mip = clamp(roughness * PrefilterMaxMip, 0.0, PrefilterMaxMip);
         float3 prefiltered = PrefilterMap.SampleLevel(LinearClamp, R, mip).rgb;

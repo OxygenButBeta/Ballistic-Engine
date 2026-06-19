@@ -592,10 +592,9 @@ public sealed class DX12HDRenderer : HDRenderer
         transparentsPass = new Dx12TransparentsPass(dev);
         graph.Add(transparentsPass);
         // Lumen V2 GI (event 500 — the slot the legacy GI pass held, after Transparents, before Fog). Owns the
-        // Lumen scene substrate (shared TLAS + bindless geo + card atlases) and the GI pipeline. P1 = substrate
-        // + debug log only (no image change); gated behind BALLISTIC_DX12_LUMEN. Resolution-independent for now
-        // (the indirect buffer + its Resize land in P2), so registration order is R5-neutral.
-        lumenGiPass = new Dx12LumenGiPass(dev);
+        // Lumen scene substrate (shared TLAS + bindless geo + card atlases), the screen-trace + HW-RT pipeline,
+        // and the full-res `indirect` buffer it Resizes. Gated behind BALLISTIC_DX12_LUMEN; default-off = no-op.
+        lumenGiPass = new Dx12LumenGiPass(dev, targetW, targetH);
         graph.Add(lumenGiPass);
         // Reflections (event 600) owns its resolution targets and branches between SSR and RT reflections.
         reflectionsPass = new Dx12ReflectionsPass(dev, targetW, targetH);
@@ -1599,6 +1598,11 @@ public sealed class DX12HDRenderer : HDRenderer
             ShadowsThisFrame = shadowsThisFrame,
             RtShadowsThisFrame = rtShadowsThisFrame,
         };
+
+        // Lumen V2 GI active this frame — resolved from the SAME predicate the Lumen pass's Enabled() uses, so
+        // the deferred pass (event 300) suppresses its IBL diffuse ambient iff the Lumen pass (event 500) will
+        // add its own diffuse indirect. Set after ctx build (Doors/Dev/Dxr are populated in the initializer).
+        ctx.LumenActiveThisFrame = Dx12LumenGiPass.WouldRun(ctx, lumenGiPass.Armed);
 
         // Seed the film-grain counter. Grain is frozen to 0 under deterministic capture.
         ctx.GrainFrame = DeterministicCapture ? 0 : frameCounter;

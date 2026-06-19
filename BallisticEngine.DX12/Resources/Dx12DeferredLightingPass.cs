@@ -65,7 +65,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         public Vector2 ClusterNearFar;
         public float UseRtShadows; public float SpecClamp;   // SpecClamp: max per-light specular luma (V2 firefly cap; 0 = off)
         public float SpecAaStrength; public float UseSsao;   // V2: geometric specular AA strength (0 = off); UseSsao: GTAO into ambient
-        public float Pad3; public float Pad4;
+        public float UseIBLDiffuse; public float Pad4;        // UseIBLDiffuse: 0 when Lumen V2 owns diffuse GI (no double-count)
         public Matrix4x4 ViewProjFwd;                        // world → clip (transposed); contact-shadow march reprojection
     }
 
@@ -162,7 +162,9 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
             // GTAO into the ambient term — on only when AO is actually rendered this frame (door + volume enable).
             // Matches Dx12GtaoPass.Enabled so the t13 bind below holds the real AO target when this is 1.
             UseSsao = ctx.Doors.Ssao && ctx.PostFX.SSAOEnabled ? 1f : 0f,
-            Pad3 = 0f,
+            // Lumen V2 owns diffuse GI when active → suppress the IBL diffuse ambient here so the Lumen combine
+            // (event 500) doesn't double-count it. Specular IBL stays (Lumen P2 is diffuse-only).
+            UseIBLDiffuse = ctx.LumenActiveThisFrame ? 0f : 1f,
             Pad4 = 0f,
             // Forward world→clip for the contact-shadow screen-space march (HLSL muls row-vector × matrix).
             ViewProjFwd = Matrix4x4.Transpose(ctx.ViewProj),
