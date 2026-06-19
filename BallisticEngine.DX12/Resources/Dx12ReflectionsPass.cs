@@ -59,6 +59,12 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     static bool ReflTemporalEnabled =>
         reflTemporalEnabled ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_REFL_NOTEMPORAL") != "1";
 
+    // P2 — RT-reflections + card env doors cached on first use (process-scoped; were re-read every record).
+    static string? rtrEnvCached; static bool rtrEnvRead;
+    static string RtrEnv() { if (!rtrEnvRead) { rtrEnvCached = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RT_REFLECTIONS"); rtrEnvRead = true; } return rtrEnvCached!; }
+    static bool? reflNoCards;
+    static bool ReflCardsAllowed => !(reflNoCards ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_REFL_NOCARDS") == "1");
+
     // PHASE-2 V1: reads the G-buffer (depth + normal/roughness for the SSR march) and read-modify-writes the HDR
     // scene color (marches reflections from `target`, then CopyColorFrom(ssrScene) back into `target`). RT
     // reflections additionally use the DXR AS (inline-core in V1) — declaring G-buffer + SceneColor suffices for
@@ -142,7 +148,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     // tag is dropped — the GRAPH already times the pass under Name ("Reflections").
     public unsafe void Record(Dx12FrameContext ctx) {
         Dx12RenderTargetPool.PoolBarrier(ctx.Dev, "ssrTarget", "ssrScene");   // V2: aliasing barrier + discard the produced placed targets (no-op when pool off)
-        string rtrEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RT_REFLECTIONS");
+        string rtrEnv = RtrEnv();
         bool rtReflWanted = rtrEnv == "1" || (rtrEnv != "0" && ctx.PostFX.ReflectionMode == ReflectionMode.RayTraced);
         if (rtReflWanted && EnsureRtReflections(ctx))
             DrawRtReflections(ctx);
@@ -372,7 +378,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         // P5: sample the Lumen card cache at reflection hits when Lumen is active this frame + has a valid cache
         // (so reflections see the same multi-bounce GI the diffuse does). Off → the hit re-shades direct+IBL.
         bool useCards = ctx.LumenActiveThisFrame && ctx.LumenScene is { Valid: true } && ctx.PostFX.LumenReflections
-                        && Environment.GetEnvironmentVariable("BALLISTIC_DX12_REFL_NOCARDS") != "1";
+                        && ReflCardsAllowed;
         *(RtReflConstants*)rtReflCbMapped = new RtReflConstants {
             InvViewProj = Matrix4x4.Transpose(invVP), CameraPos = camPos, Intensity = ForcedIntensity(ctx),
             PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f, NormalBias = 0.05f,

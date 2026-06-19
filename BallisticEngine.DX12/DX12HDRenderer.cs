@@ -535,6 +535,16 @@ public sealed class DX12HDRenderer : HDRenderer
         hizWanted = gpuDrivenOn && Environment.GetEnvironmentVariable("BALLISTIC_DX12_GPUDRIVEN_HIZ") != "0";
         // Cascade caching: DEFAULT ON (BALLISTIC_DX12_SHADOW_CACHE=0 disables).
         shadowCacheOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SHADOW_CACHE") != "0";
+        // P2 — freeze the per-frame env-var doors once (see field comments). Byte-identical: these are
+        // process-scoped A/B/diagnostic switches, previously re-read every BeginRender.
+        skyTlutOn        = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SKY_TLUT") != "0";
+        exposureOverride = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
+                               System.Globalization.CultureInfo.InvariantCulture, out float exOv) ? exOv : 1.0e-5f;
+        frameProfileOn   = Environment.GetEnvironmentVariable("BALLISTIC_DX12_FRAME_PROFILE") == "1";
+        hizDebugOn       = Environment.GetEnvironmentVariable("BALLISTIC_DX12_HIZ_DEBUG") == "1";
+        rtShadowsEnv     = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RT_SHADOWS");
+        fsrEnv           = Environment.GetEnvironmentVariable("BALLISTIC_DX12_FSR");
+        shadowCacheDebugOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SHADOW_CACHE_DEBUG") == "1";
         // Resolve the per-feature doors ONCE (the BALLISTIC_DX12_MINIMAL switch + cached env reads).
         doors = Dx12RenderDoors.Resolve();
         if (doors.Minimal)
@@ -788,6 +798,18 @@ public sealed class DX12HDRenderer : HDRenderer
     // ctx.BarriersDerived tells the migrated pass to skip its own manual head transition (emit derived ONLY).
     // Default off → migrated passes emit their manual head transitions, byte-identical to V1/V2.
     bool barriersPath;
+
+    // P2 — per-frame env-var doors resolved ONCE at init (kill the per-frame Environment.GetEnvironmentVariable
+    // churn in BeginRender: each is a process-env hashtable lookup + string alloc + GC pressure). These were read
+    // EVERY frame at the BeginRender sites noted below; they're A/B/diagnostic doors set once per process, so
+    // caching them is byte-identical. (Volume-driven toggles stay live; only the static env doors are frozen.)
+    bool skyTlutOn;           // BALLISTIC_DX12_SKY_TLUT != "0" — sun reddening via SunTransmittance (was read ~:1197)
+    float exposureOverride;   // BALLISTIC_DX12_EXPOSURE float, else 1e-5f (was read ~:1215)
+    bool frameProfileOn;      // BALLISTIC_DX12_FRAME_PROFILE == "1" — per-stage [FrameProf] timers (was read ~:1232)
+    bool hizDebugOn;          // BALLISTIC_DX12_HIZ_DEBUG == "1" (was read ~:1560)
+    string? rtShadowsEnv;     // BALLISTIC_DX12_RT_SHADOWS (was read ~:1580; null/"0"/"1" tri-state preserved)
+    string? fsrEnv;           // BALLISTIC_DX12_FSR (was read ~:1738)
+    bool shadowCacheDebugOn;  // BALLISTIC_DX12_SHADOW_CACHE_DEBUG == "1" (was read ~:1992)
 
     // Cascade caching: skip re-rendering the sun cascades when the texel-snapped fit matrices AND the caster
     // geometry are unchanged (the depth-array layers are retained → byte-identical; big win for a static camera).
@@ -1194,8 +1216,7 @@ public sealed class DX12HDRenderer : HDRenderer
         // ProceduralSky.SunTransmittance was never called on DX12 — the sun was the raw white-balanced colour
         // at every elevation. Multiply it in here so geometry, the IBL bake and the sun disk all warm + fade
         // at low sun. BALLISTIC_DX12_SKY_TLUT=0 keeps the old (un-reddened) sun for A/B.
-        bool tlutOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SKY_TLUT") != "0";
-        if (tlutOn && ProceduralSky.Active is { } skyForSun && lightDir.LengthSquared() > 1e-8f)
+        if (skyTlutOn && ProceduralSky.Active is { } skyForSun && lightDir.LengthSquared() > 1e-8f)
         {
             var st = skyForSun.SunTransmittance(new System.Numerics.Vector3(lightDir.X, lightDir.Y, lightDir.Z));
             lightColor *= new Vector3(st.X, st.Y, st.Z);
@@ -1212,10 +1233,7 @@ public sealed class DX12HDRenderer : HDRenderer
         // first light). Tunable via BALLISTIC_DX12_EXPOSURE while dialing against the frozen baseline.
         // 1e-5 lands the PBR path (energy-conserving ÷π diffuse) near the GL baseline brightness; the DX12
         // image is intentionally a touch dimmer (no IBL ambient / shadows yet — those are next milestones).
-        float exposure = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
-            System.Globalization.CultureInfo.InvariantCulture, out float e)
-            ? e
-            : 1.0e-5f;
+        float exposure = exposureOverride;
 
         // GPU-driven: collect whole-mesh renderers once (used by BOTH the shadow pass and the geometry pass).
         wholeMeshRenderers.Clear();
@@ -1229,7 +1247,7 @@ public sealed class DX12HDRenderer : HDRenderer
         // Shadows first: render the sun cascades' depth (own upload command list) before opaque. Fit with the
         // UNJITTERED proj so the cascades are stable frame-to-frame (cascade caching + no TAA shadow jitter).
         // doors.Shadows = off under BARE-MINIMUM (the deferred shadow term hard-1.0s via fc.ShadowsEnabled below).
-        bool fprof = Environment.GetEnvironmentVariable("BALLISTIC_DX12_FRAME_PROFILE") == "1";
+        bool fprof = frameProfileOn;
         var fpsw = fprof ? System.Diagnostics.Stopwatch.StartNew() : null;
         void FP(string t) { if (fprof) { fpsw.Stop(); Console.WriteLine($"[FrameProf] {t} {fpsw.Elapsed.TotalMilliseconds:0.00}ms"); fpsw.Restart(); } }
 
@@ -1556,8 +1574,7 @@ public sealed class DX12HDRenderer : HDRenderer
         });
 
         // Hi-Z debug door: how many whole-mesh submeshes survived the GPU cull (frustum + Hi-Z occlusion).
-        if (gpuDrivenOn && wholeMeshRenderers.Count > 0
-                        && Environment.GetEnvironmentVariable("BALLISTIC_DX12_HIZ_DEBUG") == "1")
+        if (gpuDrivenOn && wholeMeshRenderers.Count > 0 && hizDebugOn)
         {
             var (vis, tot) = gpuDriven.DebugVisibleCount();
             Console.WriteLine($"[HiZDebug] visible submeshes {vis}/{tot} (hizEnabled={(hizEnabled ? 1 : 0)})");
@@ -1577,7 +1594,7 @@ public sealed class DX12HDRenderer : HDRenderer
         // DrawRtShadows emits its OWN head gbuffer.ToShaderResource() (idempotent, the safety net). rtShadowsThis
         // Frame must resolve HERE — the deferred pass reads it via ctx, which is built right after. ===
         rtShadowsThisFrame = false;
-        string rtsEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RT_SHADOWS");
+        string? rtsEnv = rtShadowsEnv;
         bool rtShadowsWanted = rtsEnv == "1" || (rtsEnv != "0" && PostFX.RayTracedShadows);
         if (rtShadowsWanted && EnsureRtShadows())
             DrawRtShadows(viewProj, lightDir);
@@ -1735,7 +1752,7 @@ public sealed class DX12HDRenderer : HDRenderer
     // headless A/B (off/nativeaa/quality/balanced/performance/ultra) — a kept test door.
     UpscaleMode ResolveUpscaleMode()
     {
-        string env = Environment.GetEnvironmentVariable("BALLISTIC_DX12_FSR");
+        string? env = fsrEnv;
         if (string.IsNullOrEmpty(env)) return PostFX.UpscaleMode;
         return env.Trim().ToLowerInvariant() switch
         {
@@ -1989,7 +2006,7 @@ public sealed class DX12HDRenderer : HDRenderer
         if (shadowCacheOn && cascadesUnchanged)
         {
             shadowsThisFrame = true; // the cached shadow map is still valid
-            if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_SHADOW_CACHE_DEBUG") == "1")
+            if (shadowCacheDebugOn)
                 Console.WriteLine("[ShadowCache] cascades unchanged — skipped re-render.");
             return;
         }

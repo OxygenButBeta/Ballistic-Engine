@@ -35,6 +35,8 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
     public Dx12RtaoPass(Dx12Device device, Dx12GtaoPass gtaoPass) { dev = device; gtao = gtaoPass; }
 
     int? envCached;
+    // P2 — RTAO intensity/length env doors cached on first use (process-scoped; was parsed every dispatch).
+    float? intensityCached, rayLenCached;
     public bool Enabled(Dx12FrameContext ctx) {
         if (!ctx.Doors.Ssao || !ctx.PostFX.SSAOEnabled) return false;
         // DEFAULT ON (HW-RT gated). Sky-occlusion is the only term that gates the IBL ambient by REAL openness
@@ -74,12 +76,10 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
         EnsureBuilt(ao.Width, ao.Height);
         Matrix4x4.Invert(ctx.ViewProj, out Matrix4x4 invVP);
 
-        float intensity = 1f;
-        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_RTAO_INTENSITY"),
-            System.Globalization.CultureInfo.InvariantCulture, out float ri)) intensity = Math.Clamp(ri, 0f, 1f);
-        float rayLen = 30f;
-        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_RTAO_LENGTH"),
-            System.Globalization.CultureInfo.InvariantCulture, out float rl)) rayLen = MathF.Max(rl, 0.1f);
+        float intensity = intensityCached ??= float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_RTAO_INTENSITY"),
+            System.Globalization.CultureInfo.InvariantCulture, out float ri) ? Math.Clamp(ri, 0f, 1f) : 1f;
+        float rayLen = rayLenCached ??= float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_RTAO_LENGTH"),
+            System.Globalization.CultureInfo.InvariantCulture, out float rl) ? MathF.Max(rl, 0.1f) : 30f;
 
         *(RtaoConstants*)cbMapped = new RtaoConstants {
             InvViewProj = Matrix4x4.Transpose(invVP),

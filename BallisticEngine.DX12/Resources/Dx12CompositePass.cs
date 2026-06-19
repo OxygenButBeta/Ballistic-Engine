@@ -83,6 +83,17 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
     Dx12OffscreenTarget lumTarget, lumHistory;
     bool lumHistoryValid;               // V1b: false until the first metered frame populates history → snap (Reset)
     bool exposureDebugDumped;           // V1: one-shot BALLISTIC_DX12_EXPOSURE_DEBUG avgLum readback latch
+
+    // P2 — exposure/tonemap/grade env doors resolved ONCE (was re-read every DrawComposite). Process-scoped
+    // A/B switches → byte-identical to the per-frame reads. The debug-only doors (EXPOSURE_DEBUG, EMA_DEBUG,
+    // EMA_SEED) stay inline: they're never on the production path and one is a one-shot latch.
+    readonly bool manualExposureSet;    // BALLISTIC_DX12_EXPOSURE parses → manual exposure mode
+    readonly float manualExposureValue;
+    readonly bool forceAutoExp;         // BALLISTIC_DX12_AUTOEXP == "1"
+    readonly bool exposureCalibrated;   // BALLISTIC_DX12_EXPOSURE_CALIB != "0"
+    readonly bool exposureEmaOn;        // BALLISTIC_DX12_EXPOSURE_EMA != "0"
+    readonly bool acesTonemapEnv;       // BALLISTIC_DX12_TONEMAP == "aces"
+    readonly bool gradeDemoEnv;         // BALLISTIC_DX12_GRADE_DEMO == "1"
     Dx12DescriptorHeap lumSrvVisible;   // [0]=HDR color SRV, [1]=prev-EV history SRV, copied per frame
     ID3D12Resource lumCb;
     unsafe byte* lumCbMapped;
@@ -105,6 +116,14 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
     // VERBATIM BuildComposite (which chained BuildLumAverage → BuildBloom). Allocates everything once.
     public unsafe Dx12CompositePass(Dx12Device device, int width, int height) {
         dev = device;
+        // P2 — resolve the per-frame exposure/tonemap/grade env doors once (see field comments).
+        manualExposureSet  = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
+                                 System.Globalization.CultureInfo.InvariantCulture, out manualExposureValue);
+        forceAutoExp       = Environment.GetEnvironmentVariable("BALLISTIC_DX12_AUTOEXP") == "1";
+        exposureCalibrated = Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_CALIB") != "0";
+        exposureEmaOn      = Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_EMA") != "0";
+        acesTonemapEnv     = Environment.GetEnvironmentVariable("BALLISTIC_DX12_TONEMAP") == "aces";
+        gradeDemoEnv       = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GRADE_DEMO") == "1";
         // CompositeConstants CBV (b0) + 3-SRV table (HDR t0, bloom t1, avg-lum t2) + clamp sampler s0.
         // (The old AO t3 slot is gone — GTAO now multiplies into ambient in deferred lighting, not here.)
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
@@ -374,10 +393,10 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         //   3. Automatic / AutomaticHistogram — run the 1×1 metering pass (writes the metered EV100); the
         //      composite shader turns that EV into the multiplier (same 1/(1.2*2^(EV-comp)) formula).
         var pf = ctx.PostFX;
-        bool manual = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
-            System.Globalization.CultureInfo.InvariantCulture, out float manualExp);
+        bool manual = manualExposureSet;
+        float manualExp = manualExposureValue;
         // BALLISTIC_DX12_AUTOEXP=1 forces Automatic metering even with no Exposure volume (A/B test door).
-        bool forceAuto = Environment.GetEnvironmentVariable("BALLISTIC_DX12_AUTOEXP") == "1";
+        bool forceAuto = forceAutoExp;
         bool useMeter = !manual && (forceAuto || pf.ExposureMode != ExposureMode.Fixed);
         // Resolved CPU multiplier for the manual / Fixed paths (Automatic resolves it in the shader from the EV).
         float exposureMul = manual ? manualExp : pf.ExposureMultiplier;
@@ -393,7 +412,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
             // Auto-exposure metering: reduce the HDR source to a 1×1 adapted EV100 (LumAverage.hlsl).
             // V1: the meter is grey-anchored (self-calibrating to the lux-scaled DX12 radiance) by default;
             // BALLISTIC_DX12_EXPOSURE_CALIB=0 restores the legacy photometric anchor (the pre-V1 blow-out) for A/B.
-            bool calibrated = Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_CALIB") != "0";
+            bool calibrated = exposureCalibrated;
             // V1 diagnostic: BALLISTIC_DX12_EXPOSURE_DEBUG=1 makes the meter emit raw geomean luminance into the
             // 1×1 target (Calibrated=2), read back once below to ground-truth the calibration constant.
             bool expDebug = !exposureDebugDumped && Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_DEBUG") == "1";
@@ -402,7 +421,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
             // frame (history uninitialized — easing up from EV 0 would flash dark→correct), or the debug probe
             // (it emits raw avgLum, which must not be temporally eased). Eased frames need the real frame dt.
             // BALLISTIC_DX12_EXPOSURE_EMA=0 forces instantaneous (the pre-V1b behaviour) for A/B.
-            bool emaOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_EMA") != "0";
+            bool emaOn = exposureEmaOn;
             // V1b debug: BALLISTIC_DX12_EXPOSURE_EMA_SEED=<ev> seeds the FIRST frame's history to a deliberately-
             // off EV (instead of snapping to metered) so the easing curve toward the true metered EV is
             // observable headlessly. Debug-only; never set on the production path.
@@ -453,13 +472,13 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         if (bloomOn) DrawBloom(hdr, pf.BloomThreshold, pf.BloomKnee);
 
         // Tonemap: AgX by default (graceful highlight desaturation, the "less çiğ" look); ACES via the door.
-        bool acesTonemap = Environment.GetEnvironmentVariable("BALLISTIC_DX12_TONEMAP") == "aces";
+        bool acesTonemap = acesTonemapEnv;
         // Film grain is time-dependent → frozen (0) under deterministic capture so paused frames stay diffable.
         float grainTime = DeterministicCapture ? 0f : (ctx.GrainFrame & 1023);
         // Stylistic grade comes from the volume stack (all neutral by default). BALLISTIC_DX12_GRADE_DEMO=1 is
         // an A/B door that applies a mild cinematic film look (a sensible starting grade) when no ColorAdjustments
         // volume is authored — proves the grade chain and shows what a light touch buys.
-        bool gradeDemo = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GRADE_DEMO") == "1";
+        bool gradeDemo = gradeDemoEnv;
         float contrast = gradeDemo ? 1.12f : pf.Contrast;
         float saturation = gradeDemo ? 1.15f : pf.Saturation;
         float vignette = gradeDemo ? 0.25f : pf.VignetteStrength;
