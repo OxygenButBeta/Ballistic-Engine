@@ -172,17 +172,26 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     }
 
     static int spEnvDoor = -2;   // -2 unread, -1 unset(default), 0 force-off, 1 force-on
-    bool WantScreenProbe()
+    bool WantScreenProbe(Dx12FrameContext ctx)
     {
         if (spEnvDoor == -2)
         {
             string v = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_SCREENPROBE");
             spEnvDoor = v == "1" ? 1 : v == "0" ? 0 : -1;
         }
-        return spEnvDoor == 1 || (spEnvDoor == -1 && ScreenProbeDefaultOn);
+        if (spEnvDoor == 1) return true;    // explicit force-on (overrides the deterministic guard, for A/B)
+        if (spEnvDoor == 0) return false;
+        // DEFAULT path. Screen probes are the GI front end in PLAY — they accumulate over real frames into a clean,
+        // low-variance gather (measured: on par with / smoother than the per-pixel trace; SunTemple grain 0.262 vs
+        // 0.304, Bistro 0.504 vs 0.562). BUT a DETERMINISTIC CAPTURE forces the card cache's temporal EMA + multi-
+        // bounce OFF (for byte-reproducibility), which starves the sparse screen-probe gather (the per-pixel trace,
+        // shooting a ray from EVERY pixel, tolerates the weaker cache far better). So under a deterministic capture
+        // we fall back to the per-pixel trace → golden/diffable captures stay stable, play uses the better gather.
+        return ScreenProbeDefaultOn && !ctx.DeterministicCapture;
     }
-    // Flip to true once the A/B proves screen probes are >= the per-pixel trace (per the work plan).
-    const bool ScreenProbeDefaultOn = false;
+    // Screen probes are the default GI gather in play (proven on par / smoother). The deterministic-capture guard in
+    // WantScreenProbe keeps golden captures on the per-pixel path.
+    const bool ScreenProbeDefaultOn = true;
 
     int frameCounter;
 
@@ -292,7 +301,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         probeHistory.ColorToShaderResource();   // #3: the trace reads last frame's accumulated probes (table t14)
         indirect.ColorToUnorderedAccess();
 
-        if (WantScreenProbe())
+        if (WantScreenProbe(ctx))
         {
             // Sıra 1: SCREEN-PROBE front end fills `indirect` (place → trace → integrate). Same E contract.
             TraceScreenProbe(ctx, sceneAS, rtGeo, clusteredLights, intensity, maxDist, skyIntensity, useSky, useCards);
