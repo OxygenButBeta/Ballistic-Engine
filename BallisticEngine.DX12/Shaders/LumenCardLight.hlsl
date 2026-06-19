@@ -47,6 +47,7 @@ cbuffer LumenCardConstants : register(b0) {
     uint InstanceCount; uint TotalTris; float SkyIntensity; float UseSky;
     float SkyVisRays; float EmaAlpha; float BounceRays; float HistoryValid;   // P4: temporal blend + 2nd-bounce gather
     uint FrameIndex; uint UpdateStride; uint ForceFull; uint Pad0;   // P7 #1: update-budget round-robin
+    float BounceEnergy; float FalloffDist; float Pad1; float Pad2;   // leak fix: per-bounce energy loss + bounce distance falloff
 };
 SamplerState LinearClamp : register(s0);
 SamplerState LinearWrap  : register(s1);
@@ -192,12 +193,19 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
         RayQuery<RAY_FLAG_FORCE_OPAQUE> q; q.TraceRayInline(Scene, 0, 0xFF, rd); q.Proceed();
         if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
             // Second bounce from the previous cache (only when HistoryValid + bounce enabled; else 0 = direct-only).
-            // #2A: map the hit triangle to its cluster RECORD (ClusterOffset + local cluster of the hit triangle).
             if (HistoryValid > 0.5 && BounceRays > 0.5) {
                 uint hi = q.CommittedInstanceID();
                 LumenInstanceMeta hm = Instances[hi];
                 uint hrec = hm.ClusterOffset + TriToCluster[hm.TriOffset + q.CommittedPrimitiveIndex()];
-                indirect += PrevCard[hrec].rgb;
+                // LIGHT-LEAK FIX: attenuate the bounced radiance by (a) BounceEnergy < 1 — each bounce loses energy
+                // (physical) AND damps the frame-over-frame multi-bounce PUMPING that grew exterior light into the
+                // interior (measured: the glow built up over the first ~30 frames), and (b) a DISTANCE falloff so a
+                // FAR sun-lit exterior card doesn't pump its full radiance into an interior card 30 m away (the
+                // bounce ray's TMax was 10 km). Together these stop "outside light leaking in" at its source — the
+                // cache — not just at the final gather.
+                float bt = q.CommittedRayT();
+                float bfall = (FalloffDist > 0.01) ? exp2(-bt / FalloffDist) : 1.0;
+                indirect += PrevCard[hrec].rgb * (BounceEnergy * bfall);
             }
         } else if (UseSky > 0.5) {
             indirect += SkyIrradiance.SampleLevel(LinearClamp, d, 0).rgb * SkyIntensity;
