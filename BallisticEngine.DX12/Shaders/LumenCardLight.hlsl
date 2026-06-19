@@ -40,13 +40,17 @@ StructuredBuffer<GpuLight>          Lights      : register(t5);
 StructuredBuffer<float4>            PrevCard    : register(t6);   // P4: PREVIOUS frame's cache (multi-bounce + EMA)
 StructuredBuffer<uint>              TriToCluster : register(t7);   // #2A: global tri index → LOCAL cluster index (2nd-bounce hit→record)
 StructuredBuffer<uint>              ClusterToTri : register(t8);   // #2A: record (global cluster) → global representative tri
+// Sıra 5: per-record WORLD-space card plane frame. A texel (tx,ty) in [0,TexelDim)² maps to a world point on the
+// card plane → lit independently → cluster-interior detail. Cache index = record*TexelsPerRecord + ty*TexelDim+tx.
+struct ClusterCard { float3 Origin; float InvExtentU; float3 U; float InvExtentV; float3 V; float Pad0; float3 Normal; float Pad1; };
+StructuredBuffer<ClusterCard>       ClusterCards : register(t9);   // [recordCount]
 
 cbuffer LumenCardConstants : register(b0) {
     float3 SunDir;   float SunBias;      // TO the sun (normalized), world; shadow-ray origin offset
     float3 SunColor; float LightCount;   // sun radiance (RAW HDR); # punctual lights
     uint InstanceCount; uint TotalTris; float SkyIntensity; float UseSky;
     float SkyVisRays; float EmaAlpha; float BounceRays; float HistoryValid;   // P4: temporal blend + 2nd-bounce gather
-    uint FrameIndex; uint UpdateStride; uint ForceFull; uint Pad0;   // P7 #1: update-budget round-robin
+    uint FrameIndex; uint UpdateStride; uint ForceFull; uint TexelDim;   // P7 #1 round-robin; Sıra 5 TexelDim (1=legacy)
 };
 SamplerState LinearClamp : register(s0);
 SamplerState LinearWrap  : register(s1);
@@ -150,71 +154,83 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
         emissive = emissiveMap.SampleLevel(LinearWrap, uv, 0).rgb * m.EmissiveFactor.rgb;
     }
 
-    // Direct sun (shadow-rayed).
-    float3 sunDir = normalize(SunDir);
-    float ndl = saturate(dot(N, sunDir));
-    float3 sun = (ndl > 0.0) ? SunColor * ndl * Visibility(triCenter, N, sunDir, 1e4) : 0.0.xxx;
-
-    // Punctual (shadow-rayed).
-    float3 punctual = 0.0.xxx;
-    int nl = min((int)LightCount, 32);
-    [loop] for (int i = 0; i < nl; i++) {
-        GpuLight L = Lights[i];
-        float3 toL = L.PosRange.xyz - triCenter;
-        float dist = length(toL);
-        if (dist > L.PosRange.w || dist < 1e-4) continue;
-        float3 Ld = toL / dist;
-        float nd = saturate(dot(N, Ld));
-        if (nd <= 0.0) continue;
-        float t = saturate(1.0 - pow(dist / L.PosRange.w, 4.0));
-        float3 rad = L.Color.rgb * (t * t / max(dist * dist, 1e-4));
-        if (L.Color.w >= 0.5) {
-            float cosA = dot(-Ld, normalize(L.DirCosOuter.xyz));
-            float cone = saturate((cosA - L.DirCosOuter.w) / max(L.Extra.x - L.DirCosOuter.w, 1e-4));
-            if (cone <= 0.0) continue;
-            rad *= cone * cone;
-        }
-        punctual += rad * nd * Visibility(triCenter, N, Ld, dist);
-    }
-
-    // Hemisphere gather: ONE cosine-hemisphere ray set serves BOTH the sky-visibility ambient AND the P4
-    // second bounce. Each ray: if it escapes → sky irradiance (occlusion-correct: a sealed surface sees no
-    // sky); if it HITS a triangle → that triangle's PREVIOUS-frame cache radiance (multi-bounce — over frames
-    // the cache converges to full multi-bounce GI, the Lumen radiance-cache trick). The incoming irradiance is
-    // averaged; * albedo gives this surface's indirect response.
-    float3 indirect = 0.0.xxx;
-    uint sr = (uint)clamp(max(SkyVisRays, BounceRays), 1.0, 8.0);
-    float jit = Hash(record * 2654435761u);
-    float3x3 basis = BuildBasis(N);
-    [loop] for (uint k = 0; k < sr; k++) {
-        float3 d = normalize(mul(CosineHemisphere(k, sr, jit), basis));
-        RayDesc rd; rd.Origin = triCenter + N * max(SunBias, 0.004); rd.Direction = d; rd.TMin = 0.02; rd.TMax = 1e4;
-        RayQuery<RAY_FLAG_FORCE_OPAQUE> q; q.TraceRayInline(Scene, 0, 0xFF, rd); q.Proceed();
-        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
-            // Second bounce from the previous cache (only when HistoryValid + bounce enabled; else 0 = direct-only).
-            if (HistoryValid > 0.5 && BounceRays > 0.5) {
-                uint hi = q.CommittedInstanceID();
-                LumenInstanceMeta hm = Instances[hi];
-                uint hrec = hm.ClusterOffset + TriToCluster[hm.TriOffset + q.CommittedPrimitiveIndex()];
-                indirect += PrevCard[hrec].rgb;
-            }
-        } else if (UseSky > 0.5) {
-            indirect += SkyIrradiance.SampleLevel(LinearClamp, d, 0).rgb * SkyIntensity;
-        }
-    }
-    indirect /= float(sr);
-
-    // Outgoing radiance leaving the surface = albedo * (direct + indirect) + emissive. (Lambertian: the /PI is
-    // folded at the RECEIVER's gather in LumenGi; here we store leaving radiance so the hit-sample is what the
-    // receiver integrates.)
-    float3 lit = albedo * (sun + punctual + indirect) + emissive;
-
-    // P4 conservative TEMPORAL update: EMA-blend over the previous cache (per-RECORD, view-independent → no
-    // reprojection). First frame after a (re)build (HistoryValid=0) takes the lit value straight (alpha=1).
+    // === Sıra 5: per-TEXEL lighting. The albedo/emissive/material are cluster-wide (one submesh → one material),
+    // computed once above. The DIRECT + sky-vis + 2nd-bounce terms are recomputed at EACH texel's own world point on
+    // the card plane → cluster-interior detail (a sun shadow edge or punctual falloff inside the cluster). TexelDim
+    // 1 (mesh-cards off) → ONE texel at the representative triangle center → byte-identical to the pre-Sıra-5 path. ===
+    uint texelDim = max(TexelDim, 1u);
+    uint tpr = texelDim * texelDim;
+    ClusterCard card = ClusterCards[record];
     float alpha = HistoryValid > 0.5 ? saturate(EmaAlpha) : 1.0;
-    float3 prev = PrevCard[record].rgb;
-    float3 radiance = lerp(prev, lit, alpha);
-    CardRadiance[record] = float4(Sanitize(radiance), 1.0);
+
+    [loop] for (uint texel = 0; texel < tpr; texel++)
+    {
+        // Texel center world position + shading normal. TexelDim 1 → the representative triangle center + normal
+        // (exact legacy behaviour). TexelDim >1 → a point on the card plane at this texel's UV, card-plane normal.
+        float3 P, Ntex;
+        if (texelDim == 1u) { P = triCenter; Ntex = N; }
+        else {
+            float2 uvc = (float2(texel % texelDim, texel / texelDim) + 0.5) / float(texelDim);   // texel center [0,1]²
+            P = card.Origin + card.U * (uvc.x / max(card.InvExtentU, 1e-8))
+                            + card.V * (uvc.y / max(card.InvExtentV, 1e-8));
+            Ntex = card.Normal;
+        }
+
+        // Direct sun (shadow-rayed) at this texel.
+        float3 sunDir = normalize(SunDir);
+        float ndl = saturate(dot(Ntex, sunDir));
+        float3 sun = (ndl > 0.0) ? SunColor * ndl * Visibility(P, Ntex, sunDir, 1e4) : 0.0.xxx;
+
+        // Punctual (shadow-rayed) at this texel.
+        float3 punctual = 0.0.xxx;
+        int nl = min((int)LightCount, 32);
+        [loop] for (int i = 0; i < nl; i++) {
+            GpuLight L = Lights[i];
+            float3 toL = L.PosRange.xyz - P;
+            float dist = length(toL);
+            if (dist > L.PosRange.w || dist < 1e-4) continue;
+            float3 Ld = toL / dist;
+            float nd = saturate(dot(Ntex, Ld));
+            if (nd <= 0.0) continue;
+            float t = saturate(1.0 - pow(dist / L.PosRange.w, 4.0));
+            float3 rad = L.Color.rgb * (t * t / max(dist * dist, 1e-4));
+            if (L.Color.w >= 0.5) {
+                float cosA = dot(-Ld, normalize(L.DirCosOuter.xyz));
+                float cone = saturate((cosA - L.DirCosOuter.w) / max(L.Extra.x - L.DirCosOuter.w, 1e-4));
+                if (cone <= 0.0) continue;
+                rad *= cone * cone;
+            }
+            punctual += rad * nd * Visibility(P, Ntex, Ld, dist);
+        }
+
+        // Sky-visibility + 2nd-bounce hemisphere gather at this texel.
+        float3 indirect = 0.0.xxx;
+        uint sr = (uint)clamp(max(SkyVisRays, BounceRays), 1.0, 8.0);
+        float jit = Hash((record * 2654435761u) ^ (texel * 40503u));
+        float3x3 basis = BuildBasis(Ntex);
+        [loop] for (uint k = 0; k < sr; k++) {
+            float3 d = normalize(mul(CosineHemisphere(k, sr, jit), basis));
+            RayDesc rd; rd.Origin = P + Ntex * max(SunBias, 0.004); rd.Direction = d; rd.TMin = 0.02; rd.TMax = 1e4;
+            RayQuery<RAY_FLAG_FORCE_OPAQUE> q; q.TraceRayInline(Scene, 0, 0xFF, rd); q.Proceed();
+            if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+                if (HistoryValid > 0.5 && BounceRays > 0.5) {
+                    uint hi = q.CommittedInstanceID();
+                    LumenInstanceMeta hm = Instances[hi];
+                    uint hrec = hm.ClusterOffset + TriToCluster[hm.TriOffset + q.CommittedPrimitiveIndex()];
+                    indirect += PrevCard[hrec * tpr].rgb;   // sample the hit record's texel 0 (coarse 2nd bounce)
+                }
+            } else if (UseSky > 0.5) {
+                indirect += SkyIrradiance.SampleLevel(LinearClamp, d, 0).rgb * SkyIntensity;
+            }
+        }
+        indirect /= float(sr);
+
+        float3 lit = albedo * (sun + punctual + indirect) + emissive;
+        uint cacheIdx = record * tpr + texel;
+        float3 prev = PrevCard[cacheIdx].rgb;
+        float3 radiance = lerp(prev, lit, alpha);
+        CardRadiance[cacheIdx] = float4(Sanitize(radiance), 1.0);
+    }
 
     // P7 #1: stamp this record as updated this frame (FrameIndex+1 so it's never 0 — 0 means "never updated").
     LastUpdated[record] = FrameIndex + 1u;

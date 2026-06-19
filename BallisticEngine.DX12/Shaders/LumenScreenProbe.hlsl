@@ -41,7 +41,7 @@ cbuffer ProbeConstants : register(b0) {
     float SkyIntensity; float UseSky;     float UseScreenTrace; float ScreenRange;
     float FalloffDist;  float ProbeTile;  float ProbeStride;    float OctSize;       // ProbeStride=16; OctSize=8 (8x8 tile)
     uint  ProbesX;      uint ProbesY;     uint FullW;           uint FullH;
-    float HistoryValid; float ProbeEma;   float SpPad0;         float SpPad1;        // Sıra 3: prev-atlas EMA accumulation
+    float HistoryValid; float ProbeEma;   float TexelDim;       float SpPad1;        // Sıra 3 EMA; Sıra 5 mesh-card grid edge (1=legacy)
 };
 cbuffer ProbeSun : register(b1) {
     float3 SunDir;   float SunBias;
@@ -76,8 +76,22 @@ StructuredBuffer<GpuLight>          Lights       : register(t9);
 StructuredBuffer<float4>            CardRadiance : register(t10);
 StructuredBuffer<LumenInstanceMeta> InstanceMeta : register(t11);
 StructuredBuffer<uint>              TriToCluster : register(t12);
+struct ClusterCard { float3 Origin; float InvExtentU; float3 U; float InvExtentV; float3 V; float Pad0; float3 Normal; float Pad1; };
+StructuredBuffer<ClusterCard>       ClusterCards : register(t17);   // Sıra 5: per-record world card plane (texel lookup)
 
 static const float PI = 3.14159265359;
+
+// Sıra 5: hit world point → texel index within a record's card grid (TexelDim from the CB; 1 → texel 0).
+uint CardTexelIndex(uint record, float3 hitPos) {
+    uint td = (uint)max(TexelDim, 1.0);
+    if (td == 1u) return 0u;
+    ClusterCard c = ClusterCards[record];
+    float3 rel = hitPos - c.Origin;
+    float u = saturate(dot(rel, c.U) * c.InvExtentU);
+    float v = saturate(dot(rel, c.V) * c.InvExtentV);
+    return min((uint)(v * td), td - 1u) * td + min((uint)(u * td), td - 1u);
+}
+uint CardBaseIndex(uint record) { uint td = (uint)max(TexelDim, 1.0); return record * td * td; }
 
 float3 Sanitize(float3 v) {
     return float3(isnan(v.x) || isinf(v.x) ? 0.0 : v.x,
@@ -206,7 +220,8 @@ float3 TraceRay(float3 origin, float3 dir) {
             uint inst = q.CommittedInstanceID();
             LumenInstanceMeta meta = InstanceMeta[inst];
             uint record = meta.ClusterOffset + TriToCluster[meta.TriOffset + q.CommittedPrimitiveIndex()];
-            return CardRadiance[record].rgb * falloff;
+            float3 hitP = origin + dir * hitT;   // Sıra 5: pick the card texel from the hit point (TexelDim 1 → texel 0)
+            return CardRadiance[CardBaseIndex(record) + CardTexelIndex(record, hitP)].rgb * falloff;
         } else {
             float3 hitPos = origin + dir * hitT;
             return ShadeHit(q.CommittedInstanceID(), q.CommittedPrimitiveIndex(),

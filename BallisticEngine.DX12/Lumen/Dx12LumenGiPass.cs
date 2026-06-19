@@ -114,7 +114,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public Vector2 TexelSize; public float RayCount; public float FrameIndex;
         public float NormalBias; public float MaxRayDist; public float UseCards; public float ScreenSteps;
         public float SkyIntensity; public float UseSky; public float UseScreenTrace; public float ScreenRange;
-        public float HistoryValid; public float ProbeAlpha; public float ImportanceSampling; public float Pad1;   // #3 temporal; #4 importance
+        public float HistoryValid; public float ProbeAlpha; public float ImportanceSampling; public float TexelDim;   // #3 temporal; #4 importance; Sıra 5 mesh-card grid edge
         public Matrix4x4 PrevViewProj;   // #3: previous-frame UNJITTERED view*proj — camera-motion-robust probe reprojection
     }
 
@@ -135,7 +135,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public Vector3 SunColor; public float LightCount;
         public uint InstanceCount; public uint TotalTris; public float SkyIntensity; public float UseSky;
         public float SkyVisRays; public float EmaAlpha; public float BounceRays; public float HistoryValid;
-        public uint FrameIndex; public uint UpdateStride; public uint ForceFull; public uint Pad0;   // P7 #1
+        public uint FrameIndex; public uint UpdateStride; public uint ForceFull; public uint TexelDim;   // P7 #1; Sıra 5 mesh-card grid edge
     }
 
     // ---- Sıra 1: SCREEN-SPACE RADIANCE PROBES (LumenScreenProbe.hlsl) ----
@@ -168,7 +168,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public float SkyIntensity; public float UseSky; public float UseScreenTrace; public float ScreenRange;
         public float FalloffDist; public float ProbeTile; public float ProbeStride; public float OctSize;
         public uint ProbesX; public uint ProbesY; public uint FullW; public uint FullH;
-        public float HistoryValid; public float ProbeEma; public float SpPad0; public float SpPad1;
+        public float HistoryValid; public float ProbeEma; public float TexelDim; public float SpPad1;
     }
 
     static int spEnvDoor = -2;   // -2 unread, -1 unset(default), 0 force-off, 1 force-on
@@ -269,6 +269,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             // ReSTIR) — too big a lift for the marginal gain now that temporal accumulation already cleans the
             // grain. Kept opt-in (BALLISTIC_DX12_LUMEN_IMPORTANCE=1) for genuinely sun-dominant scenes.
             ImportanceSampling = EnvF("BALLISTIC_DX12_LUMEN_IMPORTANCE", 0f),
+            TexelDim = scene.TexelDim,
             PrevViewProj = Matrix4x4.Transpose(ctx.PrevViewProjUnjittered),   // world → prev clip (HLSL column-major)
         };
         *(LumenSun*)sunCbMapped = new LumenSun
@@ -323,6 +324,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                 cl.SetComputeRootShaderResourceView(7, scene.CardRadianceWriteGpu);           // t10 CardRadiance (this frame's stable cache)
                 cl.SetComputeRootShaderResourceView(8, scene.InstanceMetaGpuAddress);         // t11 InstanceMeta
                 cl.SetComputeRootShaderResourceView(9, scene.TriToClusterGpuAddress);         // t12 TriToCluster (#2A)
+                cl.SetComputeRootShaderResourceView(10, scene.ClusterCardsGpuAddress);    // t13 ClusterCards (Sıra 5)
                 cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
             });
         }
@@ -476,6 +478,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             EmaAlpha = emaAlpha, BounceRays = bounce ? 4f : 0f,
             HistoryValid = (scene.HistoryValid && !ctx.DeterministicCapture) ? 1f : 0f,
             FrameIndex = (uint)frameCounter, UpdateStride = stride, ForceFull = forceFull,
+            TexelDim = (uint)scene.TexelDim,
         };
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
@@ -511,6 +514,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.SetComputeRootUnorderedAccessView(9, scene.LastUpdatedGpu);               // u1 LastUpdated (age)
             cl.SetComputeRootShaderResourceView(10, scene.TriToClusterGpuAddress);       // t7 TriToCluster
             cl.SetComputeRootShaderResourceView(11, scene.ClusterToTriGpuAddress);       // t8 ClusterToTri
+            cl.SetComputeRootShaderResourceView(12, scene.ClusterCardsGpuAddress);       // t9 ClusterCards (Sıra 5)
             cl.Dispatch((uint)((scene.RecordCount + 63) / 64), 1, 1);                     // #2A: one thread per record
             cl.ResourceBarrierTransition(cardW, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
         });
@@ -551,6 +555,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             // reproducible accumulation over the static camera — the converged result is what we measure).
             HistoryValid = spHistoryValid ? 1f : 0f,
             ProbeEma = EnvF("BALLISTIC_DX12_LUMEN_PROBE_EMA", 0.1f),   // this-frame weight; low = strong accumulation
+            TexelDim = scene.TexelDim,
         };
         *(LumenSun*)spSunCbMapped = new LumenSun
         {
@@ -594,6 +599,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.SetComputeRootShaderResourceView(9, scene.TriToClusterGpuAddress);         // t12 TriToCluster
             cl.SetComputeRootUnorderedAccessView(10, probeHeaders.GPUVirtualAddress);     // u0 ProbeHeaders (root UAV — buffer)
             cl.SetComputeRootShaderResourceView(12, probeHeadersPrev.GPUVirtualAddress);  // t16 prev headers (root SRV — buffer)
+            cl.SetComputeRootShaderResourceView(13, scene.ClusterCardsGpuAddress);        // t17 ClusterCards (Sıra 5)
         }
 
         // Root slot 11 table = u2 indirect (SpTableBase+7) + t13 atlas history (SpTableBase+8), bound from the
@@ -684,6 +690,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         var cardSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(10, 0), ShaderVisibility.All);  // t10 CardRadiance
         var metaSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(11, 0), ShaderVisibility.All);  // t11 InstanceMeta
         var triClusterSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(12, 0), ShaderVisibility.All);  // t12 TriToCluster (#2A)
+        var cardsSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(13, 0), ShaderVisibility.All);  // t13 ClusterCards (Sıra 5)
         var clampSamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
         {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
@@ -699,7 +706,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         traceRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { cbv0, cbv1, tlasSrv, table, matSrv, instSrv, lightSrv, cardSrv, metaSrv, triClusterSrv }, new[] { clampSamp, wrapSamp })));
+                new[] { cbv0, cbv1, tlasSrv, table, matSrv, instSrv, lightSrv, cardSrv, metaSrv, triClusterSrv, cardsSrv }, new[] { clampSamp, wrapSamp })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumenGi.hlsl");
         byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSTrace", "LumenGi.hlsl");
@@ -776,6 +783,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         var ageUav = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(1, 0), ShaderVisibility.All);  // u1 LastUpdated
         var triClus = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All);  // t7 TriToCluster
         var clusTri = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(8, 0), ShaderVisibility.All);  // t8 ClusterToTri
+        var clusCards = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(9, 0), ShaderVisibility.All);  // t9 ClusterCards (Sıra 5)
         var clamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
         {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
@@ -789,7 +797,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         cardRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { cbv0, tlasSrv, uavRoot, skyTable, instMeta, rtInst, mats, lights, prevCard, ageUav, triClus, clusTri }, new[] { clamp, wrap })));
+                new[] { cbv0, tlasSrv, uavRoot, skyTable, instMeta, rtInst, mats, lights, prevCard, ageUav, triClus, clusTri, clusCards }, new[] { clamp, wrap })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumenCardLight.hlsl");
         byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSMain", "LumenCardLight.hlsl");
@@ -873,6 +881,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             registerSpace: 0, offsetInDescriptorsFromTableStart: 1, flags: Vol);   // t13 atlas history
         var indirectTable = new RootParameter1(new RootDescriptorTable1(indirectUavRange, atlasHistRange), ShaderVisibility.All);
         var prevHeaderSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(16, 0), ShaderVisibility.All);  // t16 prev headers (root SRV, buffer)
+        var spCardsSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(17, 0), ShaderVisibility.All);  // t17 ClusterCards (Sıra 5)
         var clampSamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
         {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
@@ -885,11 +894,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 1,
             ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
         };
-        // Roots: 0 cbv0, 1 cbv1, 2 t0 TLAS, 3 table{t1-t6,u1}, 4-9 t7-t12, 10 u0 headers, 11 table{u2 indirect,t13 hist}, 12 t16 prev headers.
+        // Roots: 0 cbv0,1 cbv1,2 t0 TLAS,3 table{t1-t6,u1},4-9 t7-t12,10 u0 headers,11 table{u2,t13 hist},12 t16 prev,13 t17 cards.
         spRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { cbv0, cbv1, tlasSrv, table, matSrv, instSrv, lightSrv, cardSrv, metaSrv, triClusterSrv, headerUav, indirectTable, prevHeaderSrv },
+                new[] { cbv0, cbv1, tlasSrv, table, matSrv, instSrv, lightSrv, cardSrv, metaSrv, triClusterSrv, headerUav, indirectTable, prevHeaderSrv, spCardsSrv },
                 new[] { clampSamp, wrapSamp })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumenScreenProbe.hlsl");

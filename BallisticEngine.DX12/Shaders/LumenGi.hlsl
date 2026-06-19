@@ -42,7 +42,7 @@ cbuffer LumenConstants : register(b0) {
     float2 TexelSize;   float RayCount;  float FrameIndex;   // 1/res; hemisphere rays per pixel; rotation seed
     float NormalBias;   float MaxRayDist; float UseCards;   float ScreenSteps;   // bias; world ray length; >0.5 = sample cards on RT hit; screen march
     float SkyIntensity; float UseSky;    float UseScreenTrace; float ScreenRange;   // sky-miss scale; >0.5 sky; >0.5 screen-trace; contact range (m)
-    float HistoryValid; float ProbeAlpha; float ImportanceSampling; float Pad1;   // #3 temporal; #4 importance
+    float HistoryValid; float ProbeAlpha; float ImportanceSampling; float TexelDim;   // #3 temporal; #4 importance; Sıra 5 mesh-card grid edge (1=legacy)
     float4x4 PrevViewProj;   // #3: previous-frame UNJITTERED view*proj (world→prev clip) for camera-robust reprojection
 };
 cbuffer LumenSun : register(b1) {
@@ -70,7 +70,24 @@ StructuredBuffer<GpuLight>          Lights       : register(t9);
 StructuredBuffer<float4>            CardRadiance : register(t10);   // #2A: per-CLUSTER lit radiance (the records)
 StructuredBuffer<LumenInstanceMeta> InstanceMeta : register(t11);   // per-instance {triOffset, clusterOffset, world}
 StructuredBuffer<uint>              TriToCluster : register(t12);   // #2A: global tri index → LOCAL cluster index
+struct ClusterCard { float3 Origin; float InvExtentU; float3 U; float InvExtentV; float3 V; float Pad0; float3 Normal; float Pad1; };
+StructuredBuffer<ClusterCard>       ClusterCards : register(t13);   // Sıra 5: per-record world card plane (texel lookup)
 Texture2D<float4>                   ProbeHistory : register(t14);   // #3: last frame's accumulated E (rgb) + depth (a)
+
+// Sıra 5: map a world hit point to a TEXEL index within a record's card grid. TexelDim 1 → always texel 0
+// (legacy single-value record). Else project the hit onto the card plane → UV → clamped texel.
+uint CardTexelIndex(uint record, float3 hitPos) {
+    uint td = (uint)max(TexelDim, 1.0);
+    if (td == 1u) return 0u;
+    ClusterCard c = ClusterCards[record];
+    float3 rel = hitPos - c.Origin;
+    float u = saturate(dot(rel, c.U) * c.InvExtentU);
+    float v = saturate(dot(rel, c.V) * c.InvExtentV);
+    uint tx = min((uint)(u * td), td - 1u);
+    uint ty = min((uint)(v * td), td - 1u);
+    return ty * td + tx;
+}
+uint CardBaseIndex(uint record) { uint td = (uint)max(TexelDim, 1.0); return record * td * td; }
 Texture2D<float2>                   Motion       : register(t15);   // #3: screen motion (prevUV-currUV) for ghosting reject
 
 static const float PI = 3.14159265359;
@@ -281,11 +298,13 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
         if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
             if (UseCards > 0.5) {
                 // #2A: SAMPLE the surface card at the hit triangle's CLUSTER RECORD (the lit radiance the card-
-                // light pass wrote per cluster) — no per-hit relighting.
+                // light pass wrote) — no per-hit relighting. Sıra 5: pick the TEXEL within the record's card grid
+                // from the hit's world position (TexelDim 1 → texel 0 → byte-identical legacy).
                 uint inst = q.CommittedInstanceID();
                 LumenInstanceMeta meta = InstanceMeta[inst];
                 uint record = meta.ClusterOffset + TriToCluster[meta.TriOffset + q.CommittedPrimitiveIndex()];
-                sum += CardRadiance[record].rgb;
+                float3 hitP = origin + dir * q.CommittedRayT();
+                sum += CardRadiance[CardBaseIndex(record) + CardTexelIndex(record, hitP)].rgb;
             } else {
                 // A/B fallback (BALLISTIC_DX12_LUMEN_NOCARDS=1): re-shade the hit directly (the P2 path).
                 float3 hitPos = origin + dir * q.CommittedRayT();
