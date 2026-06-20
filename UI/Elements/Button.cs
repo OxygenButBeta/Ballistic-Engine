@@ -10,8 +10,26 @@ public class Button : Label
 {
     public event Action Clicked;
 
-    public Button() { TextAlign = TextAlign.MiddleCenter; }
-    public Button(string text) : base(text) { TextAlign = TextAlign.MiddleCenter; }
+    public Button() { Init(); }
+    public Button(string text) : base(text) { Init(); }
+
+    void Init()
+    {
+        TextAlign = TextAlign.MiddleCenter;
+        Focusable = true;                 // keyboard-navigable (P3.2)
+        // Activate on Enter/Space when focused (P3.3 navigation submit).
+        KeyDown += e =>
+        {
+            if (e.Handled || !Enabled) return;
+            if (e.Key is OpenTK.Windowing.GraphicsLibraryFramework.Keys.Enter
+                or OpenTK.Windowing.GraphicsLibraryFramework.Keys.KeyPadEnter
+                or OpenTK.Windowing.GraphicsLibraryFramework.Keys.Space)
+            {
+                InvokeClick();
+                e.Handled = true;
+            }
+        };
+    }
 
     // Called by the input layer when a click completes on this button (and it's enabled). Kept
     // internal so only the UI input pipeline triggers it, never arbitrary code.

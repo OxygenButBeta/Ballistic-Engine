@@ -60,6 +60,33 @@ public class VisualElement
     public event System.Action<PointerEvent> PointerDown;
     public event System.Action<PointerEvent> PointerUp;
     public event System.Action<PointerEvent> PointerClick;
+    public event System.Action<PointerEvent> PointerDoubleClick; // P3.1 — second click within the double-click window
+    public event System.Action<PointerEvent> PointerMove;    // P3.1 — fires while the pointer moves over/captured
+    public event System.Action<PointerEvent> PointerWheel;   // P3.6 — scroll wheel over the element (bubbles)
+
+    // Keyboard + text events (P3.3) — fire on the focused element and bubble. KeyDown/Up carry an OpenTK
+    // Key; TextInput carries a typed character (host pushes it via UIInputModule.QueueChar).
+    public event System.Action<KeyEvent> KeyDown;
+    public event System.Action<KeyEvent> KeyUp;
+    public event System.Action<char> TextInput;
+
+    // Focus events (P3.2).
+    public event System.Action FocusIn;
+    public event System.Action FocusOut;
+
+    // Whether this element can receive keyboard focus (P3.2). Controls (Button/TextField/Slider) set it;
+    // plain containers don't. TabIndex orders the Tab ring (lower first; equal = tree order).
+    public bool Focusable { get; set; }
+    public int TabIndex { get; set; }
+
+    internal void FirePointerDoubleClick(PointerEvent e) => PointerDoubleClick?.Invoke(e);
+    internal void FirePointerMove(PointerEvent e) => PointerMove?.Invoke(e);
+    internal void FirePointerWheel(PointerEvent e) => PointerWheel?.Invoke(e);
+    internal void FireKeyDown(KeyEvent e) => KeyDown?.Invoke(e);
+    internal void FireKeyUp(KeyEvent e) => KeyUp?.Invoke(e);
+    internal void FireTextInput(char c) => TextInput?.Invoke(c);
+    internal void FireFocusIn() => FocusIn?.Invoke();
+    internal void FireFocusOut() => FocusOut?.Invoke();
 
     // The document this element's tree belongs to, set when the tree is built/attached. Used to request a
     // restyle when a class or interaction state changes (P2.2) so :hover/:active/:focus and dynamic class

@@ -77,6 +77,13 @@ public sealed class Dx12WindowedRuntime : GameWindow, IBallisticEngineRuntime, I
         }
     }
 
+    protected override void OnTextInput(TextInputEventArgs e) {
+        base.OnTextInput(e);
+        // Feed typed characters to the UI text-input buffer (UI TextField drains it). Unicode -> char(s).
+        foreach (var ch in char.ConvertFromUtf32(e.Unicode))
+            Input.PushTypedChar(ch);
+    }
+
     protected override void OnLoad() {
         base.OnLoad();
         IsVisible = true;
