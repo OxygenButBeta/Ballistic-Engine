@@ -778,7 +778,7 @@ internal sealed class EditorApplication {
             profilerPanel.DrawStandalone(gui);
             buildPanel.DrawStandalone(gui);
             CurveEditorWindow.Instance.DrawStandalone(gui);
-            ComponentEditorWindow.Draw(S);
+            ComponentEditorWindow.Instance.DrawStandalone(gui);
             UnityImportWindow.Draw(S);
             UserEditorWindowRegistry.DrawAll(gui);   // includes RenderPassToggles ([EditorWindowMeta], auto-discovered)
             DrawUnsavedPrompt();
@@ -862,7 +862,7 @@ internal sealed class EditorApplication {
         profilerPanel.DrawStandalone(gui);
         buildPanel.DrawStandalone(gui);
         CurveEditorWindow.Instance.DrawStandalone(gui);
-        ComponentEditorWindow.Draw(S);   // standalone component window — was only drawn while fullscreen
+        ComponentEditorWindow.Instance.DrawStandalone(gui);   // standalone component window
         UnityImportWindow.Draw(S);
         // [EditorWindowMeta] windows — built-in (RenderPassToggles) AND user-authored game-editor scripts.
         UserEditorWindowRegistry.DrawAll(gui);

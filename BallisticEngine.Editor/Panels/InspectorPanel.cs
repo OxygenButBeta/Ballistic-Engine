@@ -1314,7 +1314,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             if (ImGui.Button($"{EditorIcons.Maximize}  {label}###win_{type.Name}_{method.Name}", new SysVec2(-1, 0))) {
                 try { method.Invoke(target, null); }
                 catch (Exception e) { Debugging.LogError($"Editor window method threw: {e.Message}"); }
-                ComponentEditorWindow.Open(target, attr?.Title ?? Prettify(type.Name));
+                ComponentEditorWindow.Show(target, attr?.Title ?? Prettify(type.Name));
             }
         }
     }
