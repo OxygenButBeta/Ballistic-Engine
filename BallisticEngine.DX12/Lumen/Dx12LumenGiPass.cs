@@ -761,8 +761,15 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // Root slot 11 table = u2 indirect (SpTableBase+7) + t13 atlas history (SpTableBase+8), bound from the
         // SAME bindless heap as slot 3. The descriptors are written ONCE above (not per-dispatch) → no
         // StaticDescriptorInvalidDescriptorChange; one SetDescriptorHeaps(bindless) serves all tables → no
-        // SetDescriptorTableInvalid. The 3 dispatches are separate ExecuteSync; GPU work is serialised by each
-        // submit's WaitForGpu so no inter-dispatch UAV barrier is needed.
+        // SetDescriptorTableInvalid.
+        //
+        // UAV HAZARDS: the front-end is a RAW chain on shared UAV buffers/textures —
+        //   Place(w probeHeaders) → Trace(r probeHeaders, w probeAtlas) → Filter(r probeAtlas, w probeAtlasFiltered)
+        //   → SH(r probeAtlasFiltered, w probeSH) → Integrate(r probeAtlasFiltered + probeSH).
+        // Under P0a these dispatches record into the SAME open frame list with NO submit/WaitForGpu between them
+        // (Dx12Device.ExecuteSync: frame thread just appends), so each read-after-write needs an explicit UAV
+        // barrier — there is no implicit per-submit serialisation any more. State stays UNORDERED_ACCESS across the
+        // chain (so no TransitionTo fires), which is exactly why a UAV barrier, not a transition, is required.
         var slot11 = bindless.Gpu(SpTableBase + 7);
 
         // PLACE — writes probeHeaders (root UAV). indirect + atlas already UAV.
@@ -774,6 +781,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             SetCommonRoots(cl);
             cl.SetComputeRootDescriptorTable(11, slot11);
             cl.Dispatch((uint)((probesX + 7) / 8), (uint)((probesY + 7) / 8), 1);
+            cl.ResourceBarrierUnorderedAccessView(probeHeaders);   // Place(w) → Trace(r) probeHeaders
         });
 
         // TRACE — reads the previous accumulated atlas (t13) from a COMPUTE shader → NON_PIXEL state (not the
@@ -787,6 +795,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             SetCommonRoots(cl);
             cl.SetComputeRootDescriptorTable(11, slot11);
             cl.Dispatch((uint)((probesX * octSize + 7) / 8), (uint)((probesY * octSize + 7) / 8), 1);
+            cl.ResourceBarrierUnorderedAccessView(probeAtlas.RenderTarget);   // Trace(w) → snapshot-copy + Filter(r) probeAtlas
         });
 
         // Snapshot this frame's accumulated atlas + headers into the history for next frame's EMA + reproject test.
@@ -819,11 +828,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                 SetCommonRoots(cl);
                 cl.SetComputeRootDescriptorTable(11, slot11);
                 cl.Dispatch((uint)((probesX * octSize + 7) / 8), (uint)((probesY * octSize + 7) / 8), 1);
+                cl.ResourceBarrierUnorderedAccessView(probeAtlasFiltered.RenderTarget);   // Filter(w) → SH + Integrate(r)
             });
         }
         else
         {
-            probeAtlasFiltered.CopyColorFrom(probeAtlas);
+            probeAtlasFiltered.CopyColorFrom(probeAtlas);   // copy-barriers already serialise the write
             probeAtlas.ColorToUnorderedAccess();
             probeAtlasFiltered.ColorToUnorderedAccess();
         }
@@ -843,6 +853,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                 SetCommonRoots(cl);
                 cl.SetComputeRootDescriptorTable(11, slot11);
                 cl.Dispatch((uint)((probesX * probesY + 63) / 64), 1, 1);
+                cl.ResourceBarrierUnorderedAccessView(probeSH);   // SH(w) → Integrate(r) probeSH
             });
         }
 
