@@ -95,6 +95,16 @@ public sealed class Style
     public float Margin { set => L.SetMarginPoints(Edge.All, value); }
     public float Padding { set => L.SetPaddingPoints(Edge.All, value); }
 
+    // CSS gap / row-gap / column-gap — spacing between flex items (P4.5).
+    float _gap, _rowGap, _columnGap;
+    public float Gap { get => _gap; set { _gap = value; L.SetGap(Gutter.All, value); } }
+    public float RowGap { get => _rowGap; set { _rowGap = value; L.SetGap(Gutter.Row, value); } }
+    public float ColumnGap { get => _columnGap; set { _columnGap = value; L.SetGap(Gutter.Column, value); } }
+
+    // CSS aspect-ratio (w/h). 0/NaN = unset (P4.6).
+    float _aspectRatio = float.NaN;
+    public float AspectRatio { get => _aspectRatio; set { _aspectRatio = value; L.AspectRatio = value; } }
+
     // ---------------------------------------------------------------- visual (renderer reads these)
 
     public Color BackgroundColor = Color.Transparent;
@@ -141,6 +151,12 @@ public sealed class Style
     public float TextShadowOffsetX, TextShadowOffsetY, TextShadowBlur;
     public Color TextShadowColor = Color.Transparent;
 
+    // Text flow (P4.8). WhiteSpace.Normal wraps to the box width; NoWrap keeps one line. TextOverflow
+    // controls what happens when a NoWrap line is clipped by overflow:hidden (Clip or Ellipsis). These
+    // INHERIT like CSS text properties.
+    public WhiteSpace WhiteSpace = WhiteSpace.NoWrap;   // Unity/UITK default is nowrap
+    public TextOverflow TextOverflow = TextOverflow.Clip;
+
     // ---------------------------------------------------------------- helpers
 
     // P2.1 — reset EVERY property to its CSS/web default and push the defaults through to the LayoutNode.
@@ -168,6 +184,8 @@ public sealed class Style
         Width = Length.Auto;
         Height = Length.Auto;
         MinWidth = 0f; MinHeight = 0f; MaxWidth = float.NaN; MaxHeight = float.NaN;
+        Gap = 0f; RowGap = 0f; ColumnGap = 0f;
+        AspectRatio = float.NaN;
         // layout: edges (reset all four on each)
         L.SetMarginPoints(Edge.All, 0f);
         L.SetPaddingPoints(Edge.All, 0f);
@@ -189,6 +207,8 @@ public sealed class Style
         HasTextShadow = false;
         TextShadowOffsetX = 0f; TextShadowOffsetY = 0f; TextShadowBlur = 0f;
         TextShadowColor = Color.Transparent;
+        WhiteSpace = WhiteSpace.NoWrap;
+        TextOverflow = TextOverflow.Clip;
     }
 
     // Inherited properties (CSS-inherited subset, P2.3): a child that doesn't override these takes the
@@ -202,6 +222,8 @@ public sealed class Style
         FontFamily = parent.FontFamily;
         LetterSpacing = parent.LetterSpacing;
         TextAlign = parent.TextAlign;
+        WhiteSpace = parent.WhiteSpace;
+        TextOverflow = parent.TextOverflow;
         // visibility-ish: opacity is NOT inherited in CSS (it composites) — the walker already multiplies
         // opacity down the tree, so we leave Opacity per-element here.
     }

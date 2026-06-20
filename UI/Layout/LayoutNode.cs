@@ -50,19 +50,25 @@ public sealed class LayoutNode
     public void MarkDirty() => YGNodeMarkDirty(_node);
     public bool IsDirty => YGNodeIsDirty(_node);
 
-    // Installs an intrinsic-size measure callback (used by leaf content like text). The callback gets
-    // the available width/height and returns the desired (width, height) in pixels. Yoga calls it
-    // during layout for nodes with no children. Pass null to clear. A measured node must have no
-    // children (Yoga requirement) — Labels are leaves, so that holds.
-    public void SetMeasure(Func<float, float, (float w, float h)> measure)
+    // Installs an intrinsic-size measure callback (used by leaf content like text). The callback gets the
+    // available width/height AND their measure modes (Undefined/Exactly/AtMost) so text can WRAP to the
+    // available width (P4.3/P4.4). Yoga calls it during layout for childless nodes. Pass null to clear.
+    public void SetMeasure(Func<float, BallisticEngine.UI.MeasureMode, float, BallisticEngine.UI.MeasureMode, (float w, float h)> measure)
     {
         if (measure == null) { YGNodeSetMeasureFunc(_node, null); return; }
         YGNodeSetMeasureFunc(_node, (n, availW, wMode, availH, hMode) =>
         {
-            var (w, h) = measure(availW, availH);
+            var (w, h) = measure(availW, FromYoga(wMode), availH, FromYoga(hMode));
             return new YGSize { Width = w, Height = h };
         });
     }
+
+    static BallisticEngine.UI.MeasureMode FromYoga(Facebook.Yoga.MeasureMode m) => m switch
+    {
+        Facebook.Yoga.MeasureMode.Exactly => BallisticEngine.UI.MeasureMode.Exactly,
+        Facebook.Yoga.MeasureMode.AtMost => BallisticEngine.UI.MeasureMode.AtMost,
+        _ => BallisticEngine.UI.MeasureMode.Undefined,
+    };
 
     // Call when a measured node's content changes (text/size) so Yoga re-measures it next layout.
     public void MarkDirtyIfMeasured() { if (IsMeasureSet) YGNodeMarkDirty(_node); }
@@ -127,6 +133,17 @@ public sealed class LayoutNode
     public void SetPositionPercent(Edge e, float p) => YGNodeStyleSetPositionPercent(_node, ToYoga(e), p);
 
     public float AspectRatio { set => YGNodeStyleSetAspectRatio(_node, value); }
+
+    // Flex gap (CSS gap / row-gap / column-gap) — spacing between flex items. The UI-side `Gutter` enum
+    // keeps Style free of the Yoga reference (layering rule). (P4.5)
+    public void SetGap(Gutter gutter, float points) => YGNodeStyleSetGap(_node, ToYoga(gutter), points);
+
+    static YGGutter ToYoga(Gutter g) => g switch
+    {
+        Gutter.Row => YGGutter.Row,
+        Gutter.Column => YGGutter.Column,
+        _ => YGGutter.All,
+    };
 
     // --- enum translation (the actual point of the facade) ---
 

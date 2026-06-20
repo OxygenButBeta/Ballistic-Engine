@@ -91,7 +91,17 @@ style with a revertible baseline. This single change unblocks the cluster of "ca
   clicking invisible clipped rows + translated-button mis-pick.
 - **P3.6 Wheel/scroll events** (feeds ScrollView in P5).
 
-## P4 — Layout completeness
+## P4 — Layout completeness   ✅ DONE (P4.7 grid deferred)
+
+> Status: P4.1/4.2 measure invalidation (font size/family/letter-spacing/wrap change + font-version →
+> RefreshMeasureIfStale, flushed in UpdateFrame), P4.3 word-wrap (FontAtlas.MeasureWrapped + Label wrap on
+> AtMost), P4.4 MeasureMode plumbed through the facade, P4.5 gap/row-gap/column-gap, P4.6 aspect-ratio,
+> P4.8 white-space + text-overflow — all implemented + proven (6/6 tests). P4.9: Yoga already skips clean
+> subtrees internally (the real cost); C#-side propagate is a cheap rect copy, left as-is.
+> DEFERRED — P4.7 CSS Grid: the vendored Yoga port has grid STYLE setters but NO grid algorithm in
+> CalculateLayout (flexbox only), so `display:grid` would be a fake feature. Real support needs porting
+> Yoga's grid solver (large); flexbox + gap + wrap covers the common dashboard layouts meanwhile.
+
 
 - **P4.1 Measure invalidation**: re-measure on font-size/family/letter-spacing change, not just text.
 - **P4.2 Font-loaded-after-layout** triggers re-measure (UIFonts.Version → mark measured nodes dirty).

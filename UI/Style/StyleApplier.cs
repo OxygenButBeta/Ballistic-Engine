@@ -122,6 +122,16 @@ public static class StyleApplier
             case "position": style.Position = ParsePosition(value); break;
             case "display": style.Display = value.Trim().Equals("none", StringComparison.OrdinalIgnoreCase) ? DisplayStyle.None : DisplayStyle.Flex; break;
             case "overflow": style.Overflow = ParseOverflow(value); break;
+            case "gap": style.Gap = ParsePx(value); break;
+            case "row-gap": style.RowGap = ParsePx(value); break;
+            case "column-gap": style.ColumnGap = ParsePx(value); break;
+            case "aspect-ratio": style.AspectRatio = ParseAspectRatio(value); break;
+            case "white-space":
+                style.WhiteSpace = value.Trim().Equals("nowrap", StringComparison.OrdinalIgnoreCase)
+                    ? WhiteSpace.NoWrap : WhiteSpace.Normal; break;
+            case "text-overflow":
+                style.TextOverflow = value.Trim().Equals("ellipsis", StringComparison.OrdinalIgnoreCase)
+                    ? TextOverflow.Ellipsis : TextOverflow.Clip; break;
 
             // ---- sizing ----
             case "width": style.Width = ParseLength(value); break;
@@ -218,6 +228,22 @@ public static class StyleApplier
     // "none" -> the given sentinel (no constraint); otherwise a px scalar.
     static float NoneOrPx(string v, float none) =>
         v.Trim().Equals("none", StringComparison.OrdinalIgnoreCase) ? none : ParsePx(v);
+
+    // aspect-ratio: "16 / 9" or "1.777" or "auto" (auto -> NaN = unset).
+    static float ParseAspectRatio(string v)
+    {
+        v = v.Trim();
+        if (v.Equals("auto", StringComparison.OrdinalIgnoreCase)) return float.NaN;
+        int slash = v.IndexOf('/');
+        if (slash > 0)
+        {
+            float w = ParseFloat(v[..slash]);
+            float h = ParseFloat(v[(slash + 1)..]);
+            return h != 0 ? w / h : float.NaN;
+        }
+        float r = ParseFloat(v);
+        return r > 0 ? r : float.NaN;
+    }
 
     // text-shadow: "offsetX offsetY blur color". CSS allows a comma list of shadows; we pick the one
     // with the LARGEST blur (the glow, the visually dominant layer) since the renderer draws a single

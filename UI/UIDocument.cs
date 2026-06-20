@@ -167,6 +167,13 @@ public class UIDocument : Behaviour
         for (int i = 0; i < children.Count; i++) AssignOwner(children[i]);
     }
 
+    static void RefreshMeasures(VisualElement el)
+    {
+        if (el is Label lbl) lbl.RefreshMeasureIfStale();
+        var children = el.Children;
+        for (int i = 0; i < children.Count; i++) RefreshMeasures(children[i]);
+    }
+
     // Re-resolve one element + its inheriting subtree (P2.2). Called when a class/state toggles so
     // :hover/:active/:focus and dynamic class changes revert correctly without a full-tree pass.
     public void RestyleElement(VisualElement el)
@@ -217,6 +224,11 @@ public class UIDocument : Behaviour
         Vector2 logical = ComputeLogicalSize(viewport.Size, out float scale);
         ResolvedScale = scale;
         LogicalSize = logical;
+
+        // Re-dirty any Label whose measure inputs changed (font size/family/letter-spacing/wrap, or a
+        // font finished loading) so the solve re-measures it (P4.1/P4.2). Cheap walk; Yoga skips clean
+        // subtrees internally.
+        RefreshMeasures(Root);
 
         // Root fills the logical canvas unless the design set explicit root dimensions.
         LayoutPass.Solve(Root, logical.X, logical.Y);
