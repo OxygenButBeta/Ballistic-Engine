@@ -13,22 +13,34 @@ internal sealed class ImGuiEditorGui : IEditorGui {
 
     // ---- layout / id / scope ----
     public void PushId(string id) => ImGui.PushID(id);
+    public void PushId(int id) => ImGui.PushID(id);
     public void PopId() => ImGui.PopID();
     public void BeginDisabled() => ImGui.BeginDisabled();
+    public void BeginDisabled(bool disabled) => ImGui.BeginDisabled(disabled);
     public void EndDisabled() => ImGui.EndDisabled();
     public void SameLine(float offset = 0) => ImGui.SameLine(offset);
+    public void SameLine(float offset, float spacing) => ImGui.SameLine(offset, spacing);
     public void Separator() => ImGui.Separator();
     public void Spacing() => ImGui.Spacing();
+    public void NewLine() => ImGui.NewLine();
     public void Dummy(Vector2 size) => ImGui.Dummy(size);
+    public void AlignTextToFramePadding() => ImGui.AlignTextToFramePadding();
     public void SetNextItemWidth(float width) => ImGui.SetNextItemWidth(width);
     public float Scale => EditorTheme.UiScale;
     public Vector2 ContentRegionAvail => ImGui.GetContentRegionAvail();
     public Vector2 CursorScreenPos => ImGui.GetCursorScreenPos();
+    public float CursorPosX { get => ImGui.GetCursorPosX(); set => ImGui.SetCursorPosX(value); }
+    public float CursorPosY { get => ImGui.GetCursorPosY(); set => ImGui.SetCursorPosY(value); }
+    public float FrameHeight => ImGui.GetFrameHeight();
+    public Vector2 WindowPadding => ImGui.GetStyle().WindowPadding;
+    public Vector2 CalcTextSize(string text) => ImGui.CalcTextSize(text);
 
     // ---- text ----
     public void Text(string text) => ImGui.Text(text);
+    public void TextUnformatted(string text) => ImGui.TextUnformatted(text);
     public void TextDisabled(string text) => ImGui.TextDisabled(text);
     public void TextWrapped(string text) => ImGui.TextWrapped(text);
+    public void TextColored(Vector4 color, string text) => ImGui.TextColored(color, text);
 
     // ---- buttons / toggles ----
     public bool Button(string label, Vector2 size = default) => ImGui.Button(label, size);
@@ -46,35 +58,79 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public bool DragFloat3(string label, ref Vector3 v, float speed) => ImGui.DragFloat3(label, ref v, speed);
     public bool DragInt(string label, ref int v) => ImGui.DragInt(label, ref v);
     public bool InputText(string label, ref string v, int maxLength) => ImGui.InputText(label, ref v, (uint)maxLength);
+    public bool InputTextWithHint(string label, string hint, ref string v, int maxLength) =>
+        ImGui.InputTextWithHint(label, hint, ref v, (uint)maxLength);
     public bool Combo(string label, ref int index, string[] names) => ImGui.Combo(label, ref index, names, names.Length);
-    public bool ColorEdit3(string label, ref Vector3 v, bool hdr) =>
-        ImGui.ColorEdit3(label, ref v, hdr ? ImGuiColorEditFlags.Hdr | ImGuiColorEditFlags.Float : ImGuiColorEditFlags.None);
+    public bool ColorEdit3(string label, ref Vector3 v) => ImGui.ColorEdit3(label, ref v);
+    public bool ColorEdit3Hdr(string label, ref Vector3 v) =>
+        ImGui.ColorEdit3(label, ref v, ImGuiColorEditFlags.Hdr | ImGuiColorEditFlags.Float);
+    public void PlotLines(string label, float[] values, int count, string overlay, float min, float max, Vector2 size) {
+        if (count <= 0) return;
+        ImGui.PlotLines(label, ref values[0], count, 0, overlay, min, max, size);
+    }
 
     // ---- structure ----
     public bool TreeNode(string label) => ImGui.TreeNode(label);
     public void TreePop() => ImGui.TreePop();
     public bool Selectable(string label, bool selected) => ImGui.Selectable(label, selected);
     public bool CollapsingHeader(string label) => ImGui.CollapsingHeader(label);
+    public bool CollapsingHeader(string label, bool defaultOpen) =>
+        ImGui.CollapsingHeader(label, defaultOpen ? ImGuiTreeNodeFlags.DefaultOpen : ImGuiTreeNodeFlags.None);
     public bool BeginChild(string id, Vector2 size, bool border) =>
         ImGui.BeginChild(id, size, border ? ImGuiChildFlags.Borders : ImGuiChildFlags.None);
+    public bool BeginChild(string id, Vector2 size, bool border, bool horizontalScroll) =>
+        ImGui.BeginChild(id, size, border ? ImGuiChildFlags.Borders : ImGuiChildFlags.None,
+            horizontalScroll ? ImGuiWindowFlags.HorizontalScrollbar : ImGuiWindowFlags.None);
     public void EndChild() => ImGui.EndChild();
     public bool BeginCombo(string label, string preview) => ImGui.BeginCombo(label, preview);
     public void EndCombo() => ImGui.EndCombo();
     public bool BeginPopup(string id) => ImGui.BeginPopup(id);
     public void EndPopup() => ImGui.EndPopup();
     public void OpenPopup(string id) => ImGui.OpenPopup(id);
+    public bool BeginMenu(string label) => ImGui.BeginMenu(label);
+    public void EndMenu() => ImGui.EndMenu();
     public bool MenuItem(string label, bool enabled = true) => ImGui.MenuItem(label, "", false, enabled);
+    public bool MenuItem(string label, string shortcut, bool enabled = true) =>
+        ImGui.MenuItem(label, shortcut, false, enabled);
 
     // ---- tables ----
     public bool BeginTable(string id, int columns) => ImGui.BeginTable(id, columns);
+    public bool BeginTable(string id, int columns, EditorTableFlags flags, Vector2 outerSize = default) =>
+        ImGui.BeginTable(id, columns, MapTableFlags(flags), outerSize);
     public void EndTable() => ImGui.EndTable();
     public void TableNextRow() => ImGui.TableNextRow();
     public void TableNextColumn() => ImGui.TableNextColumn();
     public void TableSetupColumn(string label) => ImGui.TableSetupColumn(label);
+    public void TableSetupColumn(string label, EditorColumnFlags flags, float width = 0) =>
+        ImGui.TableSetupColumn(label, MapColumnFlags(flags), width);
+    public void TableSetupScrollFreeze(int cols, int rows) => ImGui.TableSetupScrollFreeze(cols, rows);
+    public void TableHeadersRow() => ImGui.TableHeadersRow();
+
+    static ImGuiTableFlags MapTableFlags(EditorTableFlags f) {
+        ImGuiTableFlags r = ImGuiTableFlags.None;
+        if (f.HasFlag(EditorTableFlags.RowBg)) r |= ImGuiTableFlags.RowBg;
+        if (f.HasFlag(EditorTableFlags.BordersInnerV)) r |= ImGuiTableFlags.BordersInnerV;
+        if (f.HasFlag(EditorTableFlags.BordersOuter)) r |= ImGuiTableFlags.BordersOuter;
+        if (f.HasFlag(EditorTableFlags.ScrollY)) r |= ImGuiTableFlags.ScrollY;
+        if (f.HasFlag(EditorTableFlags.SizingStretchProp)) r |= ImGuiTableFlags.SizingStretchProp;
+        if (f.HasFlag(EditorTableFlags.Resizable)) r |= ImGuiTableFlags.Resizable;
+        return r;
+    }
+
+    static ImGuiTableColumnFlags MapColumnFlags(EditorColumnFlags f) {
+        ImGuiTableColumnFlags r = ImGuiTableColumnFlags.None;
+        if (f.HasFlag(EditorColumnFlags.WidthStretch)) r |= ImGuiTableColumnFlags.WidthStretch;
+        if (f.HasFlag(EditorColumnFlags.WidthFixed)) r |= ImGuiTableColumnFlags.WidthFixed;
+        return r;
+    }
 
     // ---- tooltips / item query ----
     public void Tooltip(string text) => ImGui.SetTooltip(text);
     public bool IsItemHovered() => ImGui.IsItemHovered();
+    public bool IsItemClicked() => ImGui.IsItemClicked();
+    public bool IsItemActive() => ImGui.IsItemActive();
+    public bool IsItemActivated() => ImGui.IsItemActivated();
+    public bool IsItemDeactivatedAfterEdit() => ImGui.IsItemDeactivatedAfterEdit();
 
     // ---- custom draw + input ----
     public IEditorInput Input => input;

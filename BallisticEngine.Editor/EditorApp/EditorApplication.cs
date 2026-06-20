@@ -58,7 +58,7 @@ internal sealed class EditorApplication {
     readonly SettingsPanel settings;
     readonly TagsLayersPanel tagsLayers = new();
     readonly LayerCollisionMatrixPanel layerCollision = new();   // EF8: matrix split into its own window
-    readonly ProfilerPanel profilerPanel = new();
+    readonly ProfilerPanel profilerPanel;   // constructed after `profiler` (the backend it reads)
     readonly BuildPanel buildPanel;
     readonly EditorProfilerBackend profiler;
     readonly TransformGizmo gizmo = new();
@@ -119,6 +119,7 @@ internal sealed class EditorApplication {
         // Program.cs installed it (BALLISTIC_TRACY=1).
         profiler = new EditorProfilerBackend(Profiler.Backend);
         Profiler.Backend = profiler;
+        profilerPanel = new ProfilerPanel(profiler);   // the panel reads this backend each frame
 
         // Defer the (slow) asset import: bring the window up first, then refresh asynchronously behind
         // the busy overlay. The startup scene loads once that first import completes (see OnRender).
@@ -754,10 +755,10 @@ internal sealed class EditorApplication {
             // Floating tool windows stay available while a panel is fullscreen — keep this list in sync
             // with the normal-path block below (both must draw EVERY floating window or it vanishes in
             // one mode). tagsLayers was previously missing here, so Tags & Layers disappeared in fullscreen.
-            settings.Draw(S);
-            tagsLayers.Draw(S);
-            layerCollision.Draw(S);
-            profilerPanel.Draw(profiler, S);
+            settings.DrawStandalone(gui);
+            tagsLayers.DrawStandalone(gui);
+            layerCollision.DrawStandalone(gui);
+            profilerPanel.DrawStandalone(gui);
             buildPanel.Draw(S);
             CurveEditorWindow.Draw(S);
             ComponentEditorWindow.Draw(S);
@@ -838,9 +839,10 @@ internal sealed class EditorApplication {
         // Scene + Game are separate dockable windows (were inner viewport tabs).
         DrawViewportWindows();
 
-        settings.Draw(S);
-        tagsLayers.Draw(S);
-        profilerPanel.Draw(profiler, S);
+        settings.DrawStandalone(gui);
+        tagsLayers.DrawStandalone(gui);
+        layerCollision.DrawStandalone(gui);   // (was missing from this block — only drew while fullscreen)
+        profilerPanel.DrawStandalone(gui);
         buildPanel.Draw(S);
         CurveEditorWindow.Draw(S);
         ComponentEditorWindow.Draw(S);   // standalone component window — was only drawn while fullscreen

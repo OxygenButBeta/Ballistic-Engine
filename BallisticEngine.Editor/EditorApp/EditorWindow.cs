@@ -24,6 +24,14 @@ public abstract class EditorWindow {
     // Default floating size used the first time the window is shown (FirstUseEver).
     public Vector2 DesiredSize { get; protected set; } = new(420, 540);
 
+    // Standalone (floating, Window-menu-toggled) windows own their own show state here — the menu's
+    // Toggle/Open/checkmark flips this, and DrawStandalone routes the body through WindowShell with it.
+    // Docked CORE panels do NOT use this: their show state is owned by EditorPanelRegistry.Descriptor.Shown.
+    public bool Open;
+
+    // Standalone windows that want a NoCollapse title bar (Settings / Tags & Layers / matrix) set this.
+    public bool NoCollapse { get; protected set; }
+
     // Shown (focus-opened) / hidden (closed via the X). Override to allocate/release per-open resources.
     public virtual void OnEnable() { }
     public virtual void OnDisable() { }
@@ -33,4 +41,14 @@ public abstract class EditorWindow {
 
     // WindowShell calls this between Begin and End (only when the window is visible).
     internal void Frame(IEditorGui gui) => OnGui(gui);
+
+    // Draw this as a standalone floating window when Open: routes through WindowShell (the single Begin/End
+    // owner) with the panel-owned Open flag. A no-op while closed. Used by the Window-menu-toggled panels
+    // (Settings / Tags & Layers / Layer Collision Matrix / Profiler) — NOT the docked core panels.
+    public void DrawStandalone(IEditorGui gui) {
+        if (!Open) return;
+        bool open = Open;
+        WindowShell.DrawStandalone(this, gui, ref open);
+        Open = open;
+    }
 }

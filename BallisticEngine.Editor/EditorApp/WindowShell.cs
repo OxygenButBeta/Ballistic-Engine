@@ -36,6 +36,26 @@ internal static class WindowShell {
         ImGui.End();
     }
 
+    // Draw a standalone FLOATING window (Window-menu-toggled: Settings / Tags & Layers / matrix / Profiler).
+    // Same Begin/End-pairing invariant as the docked path. The window owns `shown` (the X writes back); the
+    // identity is the docked `###DockKey` so a saved floating position persists per window. NoCollapse is
+    // honored per-window (the old panels passed ImGuiWindowFlags.NoCollapse).
+    public static void DrawStandalone(EditorWindow win, IEditorGui gui, ref bool shown) {
+        if (win.IsViewport)
+            return;
+
+        ImGui.SetNextWindowSize(win.DesiredSize * gui.Scale, ImGuiCond.FirstUseEver);
+        ImGuiWindowFlags flags = win.NoCollapse ? ImGuiWindowFlags.NoCollapse : ImGuiWindowFlags.None;
+        // Show icon + title when an icon is set (the old standalone panels prefixed the icon inline); the
+        // ###DockKey keeps the persisted-window identity stable regardless of the visible prefix.
+        string visibleTitle = string.IsNullOrEmpty(win.Icon) ? win.Title : $"{win.Icon}  {win.Title}";
+        string label = $"{visibleTitle}###{win.DockKey}";
+        bool visible = ImGui.Begin(label, ref shown, flags);
+        if (visible)
+            win.Frame(gui);
+        ImGui.End();
+    }
+
     // Draw a window filling a given rect (the maximize path). Returns the (possibly close-button-flipped)
     // shown state so the caller persists it. Mirrors the docked path's End-always pairing.
     //

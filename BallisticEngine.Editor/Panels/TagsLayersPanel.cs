@@ -1,7 +1,5 @@
+using System.Numerics;
 using BallisticEngine.AssetPipeline;
-using Hexa.NET.ImGui;
-using SysVec2 = System.Numerics.Vector2;
-using SysVec4 = System.Numerics.Vector4;
 
 namespace BallisticEngine.Editor;
 
@@ -10,85 +8,82 @@ namespace BallisticEngine.Editor;
 // (project-level config, not scene state — no scene undo, same as other project settings).
 // EF8: the Layer Collision Matrix was SPLIT out into LayerCollisionMatrixPanel (Window > Layer Collision
 // Matrix); this panel now owns only tag + layer definitions. Both read the same LayerManager store.
-internal sealed class TagsLayersPanel {
-    public bool Open;
-
+//
+// Phase-2 EditorWindow: the body draws through IEditorGui (no raw ImGui). WindowShell owns Begin/End and
+// the title###DockKey identity. The few custom widgets (GhostButtonSmall) stay EditorIcons helper calls.
+internal sealed class TagsLayersPanel : EditorWindow {
     string newTag = "";
 
-    void Persist() {
+    public TagsLayersPanel() {
+        DockKey = "win.tagslayers";   // stable ImGui ###id for this floating window (matches the old hash target loosely)
+        Title = "Tags & Layers";
+        Icon = EditorIcons.Settings;
+        NoCollapse = true;
+        DesiredSize = new Vector2(560, 560);
+    }
+
+    static void Persist() {
         if (AssetDatabase.Project is not null)
             LayerSettings.Save(AssetDatabase.Project);
     }
 
-    public void Draw(float scale) {
-        if (!Open)
-            return;
-
-        ImGui.SetNextWindowSize(new SysVec2(560 * scale, 560 * scale), ImGuiCond.FirstUseEver);
-        if (!ImGui.Begin($"{EditorIcons.Settings}  Tags & Layers", ref Open, ImGuiWindowFlags.NoCollapse)) {
-            ImGui.End();
-            return;
-        }
-
-        DrawTags();
-        ImGui.Spacing();
-        DrawLayers(scale);
-
-        ImGui.End();
+    protected override void OnGui(IEditorGui gui) {
+        DrawTags(gui);
+        gui.Spacing();
+        DrawLayers(gui);
     }
 
-    void DrawTags() {
-        if (!ImGui.CollapsingHeader("Tags", ImGuiTreeNodeFlags.DefaultOpen))
+    void DrawTags(IEditorGui gui) {
+        if (!gui.CollapsingHeader("Tags", defaultOpen: true))
             return;
 
         // Existing tags, each with a remove button. "Untagged" is the reserved default — not removable.
         foreach (string tag in TagManager.Tags.ToArray()) {
-            ImGui.PushID(tag);
+            gui.PushId(tag);
             bool reserved = tag == TagManager.Untagged;
-            ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted($"{EditorIcons.Pin}  {tag}");
+            gui.AlignTextToFramePadding();
+            gui.TextUnformatted($"{EditorIcons.Pin}  {tag}");
             if (!reserved) {
-                ImGui.SameLine(ImGui.GetContentRegionAvail().X - ImGui.GetFrameHeight());
+                gui.SameLine(gui.ContentRegionAvail.X - gui.FrameHeight);
                 if (EditorIcons.GhostButtonSmall("rm", EditorIcons.Delete, "Remove tag")) {
                     TagManager.RemoveTag(tag);
                     Persist();
                 }
             }
-            ImGui.PopID();
+            gui.PopId();
         }
 
-        ImGui.Spacing();
-        ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X - 90 * ImGui.GetIO().DisplayFramebufferScale.X - 100);
-        ImGui.InputTextWithHint("##newtag", "New tag name...", ref newTag, 64);
-        ImGui.SameLine();
-        ImGui.BeginDisabled(string.IsNullOrWhiteSpace(newTag) || TagManager.IsDefined(newTag));
-        if (ImGui.Button($"{EditorIcons.Add}  Add Tag")) {
+        gui.Spacing();
+        gui.SetNextItemWidth(gui.ContentRegionAvail.X - 100);
+        gui.InputTextWithHint("##newtag", "New tag name...", ref newTag, 64);
+        gui.SameLine();
+        gui.BeginDisabled(string.IsNullOrWhiteSpace(newTag) || TagManager.IsDefined(newTag));
+        if (gui.Button($"{EditorIcons.Add}  Add Tag")) {
             TagManager.AddTag(newTag.Trim());
             newTag = "";
             Persist();
         }
-        ImGui.EndDisabled();
+        gui.EndDisabled();
     }
 
-    void DrawLayers(float scale) {
-        if (!ImGui.CollapsingHeader("Layers", ImGuiTreeNodeFlags.DefaultOpen))
+    void DrawLayers(IEditorGui gui) {
+        if (!gui.CollapsingHeader("Layers", defaultOpen: true))
             return;
 
         // All 32 slots. 0..7 are conventionally builtin (Default etc.) — still editable, Unity lets you
         // rename them too. An empty name = an undefined/unused layer.
         for (var i = 0; i < LayerManager.LayerCount; i++) {
-            ImGui.PushID(i);
-            ImGui.AlignTextToFramePadding();
-            ImGui.TextDisabled($"{i,2}");
-            ImGui.SameLine(40 * scale);
-            ImGui.SetNextItemWidth(-1);
+            gui.PushId(i);
+            gui.AlignTextToFramePadding();
+            gui.TextDisabled($"{i,2}");
+            gui.SameLine(40 * gui.Scale);
+            gui.SetNextItemWidth(-1);
             var name = LayerManager.NameOf(i) ?? "";
-            if (ImGui.InputText("##name", ref name, 64)) {
+            if (gui.InputText("##name", ref name, 64))
                 LayerManager.SetName(i, name);
-            }
-            if (ImGui.IsItemDeactivatedAfterEdit())
+            if (gui.IsItemDeactivatedAfterEdit())
                 Persist();
-            ImGui.PopID();
+            gui.PopId();
         }
     }
 }

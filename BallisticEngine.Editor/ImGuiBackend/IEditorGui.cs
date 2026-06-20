@@ -18,22 +18,34 @@ namespace BallisticEngine.Editor;
 public interface IEditorGui {
     // ---- layout / id / scope ----
     void PushId(string id);
+    void PushId(int id);
     void PopId();
     void BeginDisabled();
+    void BeginDisabled(bool disabled);
     void EndDisabled();
     void SameLine(float offset = 0);
+    void SameLine(float offset, float spacing);
     void Separator();
     void Spacing();
+    void NewLine();
     void Dummy(Vector2 size);
+    void AlignTextToFramePadding();
     void SetNextItemWidth(float width);
     float Scale { get; }                       // == EditorTheme.UiScale (replaces the threaded `scale` arg)
     Vector2 ContentRegionAvail { get; }
     Vector2 CursorScreenPos { get; }
+    float CursorPosX { get; set; }
+    float CursorPosY { get; set; }
+    float FrameHeight { get; }
+    Vector2 WindowPadding { get; }             // ImGui.GetStyle().WindowPadding (for right-aligned widgets)
+    Vector2 CalcTextSize(string text);
 
     // ---- text ----
     void Text(string text);
+    void TextUnformatted(string text);         // no printf parsing (literal text with '%' etc.)
     void TextDisabled(string text);
     void TextWrapped(string text);
+    void TextColored(Vector4 color, string text);
 
     // ---- buttons / toggles ----
     bool Button(string label, Vector2 size = default);
@@ -48,38 +60,74 @@ public interface IEditorGui {
     bool DragFloat3(string label, ref Vector3 v, float speed);
     bool DragInt(string label, ref int v);
     bool InputText(string label, ref string v, int maxLength);
+    bool InputTextWithHint(string label, string hint, ref string v, int maxLength);
     bool Combo(string label, ref int index, string[] names);
-    bool ColorEdit3(string label, ref Vector3 v, bool hdr);
+    bool ColorEdit3(string label, ref Vector3 v);
+    bool ColorEdit3Hdr(string label, ref Vector3 v);
+    void PlotLines(string label, float[] values, int count, string overlay, float min, float max, Vector2 size);
 
     // ---- structure ----
     bool TreeNode(string label);
     void TreePop();
     bool Selectable(string label, bool selected);
     bool CollapsingHeader(string label);
+    bool CollapsingHeader(string label, bool defaultOpen);
     bool BeginChild(string id, Vector2 size, bool border);
+    bool BeginChild(string id, Vector2 size, bool border, bool horizontalScroll);
     void EndChild();
     bool BeginCombo(string label, string preview);
     void EndCombo();
     bool BeginPopup(string id);
     void EndPopup();
     void OpenPopup(string id);
+    bool BeginMenu(string label);
+    void EndMenu();
     bool MenuItem(string label, bool enabled = true);
+    bool MenuItem(string label, string shortcut, bool enabled = true);
 
-    // ---- tables (Console / Stats / Build) ----
+    // ---- tables (Console / Stats / Build / Profiler) ----
     bool BeginTable(string id, int columns);
+    bool BeginTable(string id, int columns, EditorTableFlags flags, Vector2 outerSize = default);
     void EndTable();
     void TableNextRow();
     void TableNextColumn();
     void TableSetupColumn(string label);
+    void TableSetupColumn(string label, EditorColumnFlags flags, float width = 0);
+    void TableSetupScrollFreeze(int cols, int rows);
+    void TableHeadersRow();
 
     // ---- tooltips / item query ----
     void Tooltip(string text);
     bool IsItemHovered();
+    bool IsItemClicked();
+    bool IsItemActive();
+    bool IsItemActivated();
+    bool IsItemDeactivatedAfterEdit();
 
     // ---- custom draw + immediate input (curve editor, decorations) ----
     IEditorInput Input { get; }
     IEditorDrawList WindowDrawList { get; }
     uint ColorU32(Vector4 rgba);
+}
+
+// Seam-local table flags (subset actually used by panels) — keeps ImGuiTableFlags out of window bodies.
+[System.Flags]
+public enum EditorTableFlags {
+    None = 0,
+    RowBg = 1 << 0,
+    BordersInnerV = 1 << 1,
+    BordersOuter = 1 << 2,
+    ScrollY = 1 << 3,
+    SizingStretchProp = 1 << 4,
+    Resizable = 1 << 5,
+}
+
+// Seam-local column flags (subset).
+[System.Flags]
+public enum EditorColumnFlags {
+    None = 0,
+    WidthStretch = 1 << 0,
+    WidthFixed = 1 << 1,
 }
 
 // Immediate mouse/keyboard polling for custom-drawn surfaces (the curve editor's key drag, pan/zoom,
