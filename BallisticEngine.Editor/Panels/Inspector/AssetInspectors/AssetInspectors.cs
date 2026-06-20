@@ -127,98 +127,21 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
         ImGui.TextDisabled($"Shader: {definition.Shader ?? "(none)"}");
         ImGui.Spacing();
 
+        // The inspector is GENERATED from the shader's DECLARED properties (Unity ShaderLab style) —
+        // no more hardcoded 6-slot + scalar block. A shader that declares a new property shows it here
+        // with zero editor wiring. The on-disk schema stays MaterialDefinition (the .mat JSON) with its
+        // null-means-default elision; MaterialPropertyBinding joins each declared property (by semantic)
+        // to its MaterialDefinition field, so editing one property writes the same JSON delta the old
+        // hand-rolled UI produced — .mat files don't churn on open.
+        var properties = ResolveShaderProperties(guid);
+
         var changed = false;
         if (InspectorPanel.BeginGrid("##matslots")) {
-            foreach (TextureType slot in new[] {
-                         TextureType.Diffuse, TextureType.Normal, TextureType.Metallic,
-                         TextureType.Roughness, TextureType.AO, TextureType.Emissive,
-                     }) {
-                definition.Textures.TryGetValue(slot.ToString(), out var reference);
-                var display = reference is null
-                    ? "None"
-                    : Path.GetFileName(ReferenceToPath(reference) ?? reference);
-
-                InspectorPanel.Row(slot.ToString());
-                ImGui.PushID((int)slot);
-                if (reference is null)
-                    ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
-                ImGui.Button(display, new SysVec2(-1, 0));
-                if (reference is null)
-                    ImGui.PopStyleColor();
-                if (InspectorPanel.AcceptGuidDrop(out Guid dropped)) {
-                    definition.Textures[slot.ToString()] = AssetRef.FromGuid(dropped);
-                    changed = true;
-                }
-                ImGui.PopID();
+            foreach (var prop in properties) {
+                // Honour the load-time conditional flags (PackedOrm/Cutout auto-detect) so the shown
+                // value matches what actually renders when the .mat leaves them unstated.
+                changed |= DrawShaderProperty(prop, definition);
             }
-
-            // Scalar material properties (stored in the .mat next to the texture refs).
-            // Base color: linear RGBA tint multiplying the albedo map (glTF baseColorFactor).
-            // White is the neutral "unstated" default, so it's stored as null and rendering
-            // is bit-identical to a .mat without the key.
-            InspectorPanel.Row("Base Color");
-            var baseColor = definition.BaseColor switch {
-                { Length: >= 4 } bc => new SysVec4(bc[0], bc[1], bc[2], bc[3]),
-                { Length: 3 } bc => new SysVec4(bc[0], bc[1], bc[2], 1f),
-                _ => SysVec4.One,
-            };
-            if (ImGui.ColorEdit4("##matbasecolor", ref baseColor)) {
-                definition.BaseColor = baseColor == SysVec4.One
-                    ? null
-                    : [baseColor.X, baseColor.Y, baseColor.Z, baseColor.W];
-                changed = true;
-            }
-
-            // Packed ORM: metallic texture carries (occlusion, roughness, metallic) in RGB.
-            // Auto-detected from "spec" file names when the .mat doesn't say explicitly.
-            InspectorPanel.Row("Packed ORM");
-            var packedOrm = MaterialLoader.ResolvePackedOrm(definition);
-            if (ImGui.Checkbox("##matpackedorm", ref packedOrm)) {
-                definition.PackedOrm = packedOrm;
-                changed = true;
-            }
-
-            // Alpha cutout: discard below 0.5 diffuse alpha + double-sided (foliage cards).
-            // Auto-detected from foliage-style texture names when not set explicitly.
-            InspectorPanel.Row("Alpha Cutout");
-            var cutout = MaterialLoader.ResolveCutout(definition);
-            if (ImGui.Checkbox("##matcutout", ref cutout)) {
-                definition.Cutout = cutout;
-                changed = true;
-            }
-
-            InspectorPanel.Row("Transparent");
-            var transparent = definition.Transparent;
-            if (ImGui.Checkbox("##mattransparent", ref transparent)) {
-                definition.Transparent = transparent;
-                changed = true;
-            }
-
-            if (definition.Transparent) {
-                InspectorPanel.Row("Opacity");
-                var opacity = definition.Opacity;
-                if (ImGui.SliderFloat("##matopacity", ref opacity, 0f, 1f)) {
-                    definition.Opacity = opacity;
-                    changed = true;
-                }
-            }
-
-            InspectorPanel.Row("Emissive Color");
-            var emissive = definition.EmissiveColor is { Length: >= 3 } c
-                ? new SysVec3(c[0], c[1], c[2])
-                : SysVec3.One;
-            if (ImGui.ColorEdit3("##matemissivecolor", ref emissive)) {
-                definition.EmissiveColor = [emissive.X, emissive.Y, emissive.Z];
-                changed = true;
-            }
-
-            InspectorPanel.Row("Emissive Intensity");
-            var emissivemntensity = definition.EmissiveIntensity;
-            if (ImGui.DragFloat("##matemissiveintensity", ref emissivemntensity, 0.05f, 0f, 100f)) {
-                definition.EmissiveIntensity = emissivemntensity;
-                changed = true;
-            }
-
             ImGui.EndTable();
         }
 
@@ -230,6 +153,79 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
 
         ImGui.Spacing();
         ImGui.TextDisabled("Drag textures from the Assets panel onto the slots.");
+    }
+
+    // The declared property list to render. Prefer the loaded material's actual shader (a custom shader
+    // would declare its own); fall back to the Standard set when the material isn't loaded yet.
+    static ShaderProperties ResolveShaderProperties(Guid guid) {
+        var mat = AssetDatabase.Load<Material>(guid);
+        var declared = mat?.Shader?.Properties;
+        return declared is { Count: > 0 } ? declared : StandardShaderProperties.Build();
+    }
+
+    // Render one declared property and write any edit back to the MaterialDefinition via its semantic.
+    // Returns true if the value changed. bool-as-float properties (NormalFlipY/Transparent/PackedOrm/
+    // Cutout) draw as checkboxes; IsEmissive is load-derived (not authorable) and skipped.
+    static bool DrawShaderProperty(ShaderProperty prop, MaterialDefinition definition) {
+        var binding = MaterialPropertyBinding.For(prop.Semantic);
+        if (binding is null) return false; // not an authorable channel (e.g. IsEmissive) — skip
+
+        InspectorPanel.Row(prop.DisplayName);
+        ImGui.PushID(prop.Name);
+        bool changed;
+        switch (prop.Type) {
+            case ShaderPropertyType.Texture2D: changed = DrawTextureSlot(binding, definition); break;
+            case ShaderPropertyType.Color: changed = DrawColor(binding, definition, prop); break;
+            case ShaderPropertyType.Range: changed = DrawRange(binding, definition, prop); break;
+            default: changed = DrawFloatOrBool(binding, definition, prop); break;
+        }
+        ImGui.PopID();
+        return changed;
+    }
+
+    static bool DrawTextureSlot(MaterialPropertyBinding b, MaterialDefinition definition) {
+        definition.Textures.TryGetValue(b.TextureKey, out var reference);
+        var display = reference is null ? "None" : Path.GetFileName(ReferenceToPath(reference) ?? reference);
+        if (reference is null)
+            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+        ImGui.Button(display, new SysVec2(-1, 0));
+        if (reference is null) ImGui.PopStyleColor();
+        if (InspectorPanel.AcceptGuidDrop(out Guid dropped)) {
+            definition.Textures[b.TextureKey] = AssetRef.FromGuid(dropped);
+            return true;
+        }
+        return false;
+    }
+
+    static bool DrawColor(MaterialPropertyBinding b, MaterialDefinition definition, ShaderProperty prop) {
+        var v = b.GetVector(definition, prop.DefaultVector);
+        // Emissive is RGB-only in the .mat; base color is RGBA. Drive by binding's component count.
+        if (b.ColorComponents == 3) {
+            var c = new SysVec3(v.X, v.Y, v.Z);
+            if (ImGui.ColorEdit3("##c", ref c)) { b.SetVector(definition, new SysVec4(c.X, c.Y, c.Z, 1f), prop.DefaultVector); return true; }
+            return false;
+        }
+        var c4 = new SysVec4(v.X, v.Y, v.Z, v.W);
+        if (ImGui.ColorEdit4("##c", ref c4)) { b.SetVector(definition, c4, prop.DefaultVector); return true; }
+        return false;
+    }
+
+    static bool DrawRange(MaterialPropertyBinding b, MaterialDefinition definition, ShaderProperty prop) {
+        var (min, max) = prop.Range ?? (0f, 1f);
+        var f = b.GetFloat(definition, prop.DefaultFloat);
+        if (ImGui.SliderFloat("##r", ref f, min, max)) { b.SetFloat(definition, f, prop.DefaultFloat); return true; }
+        return false;
+    }
+
+    static bool DrawFloatOrBool(MaterialPropertyBinding b, MaterialDefinition definition, ShaderProperty prop) {
+        if (b.IsBool) {
+            var on = b.GetFloat(definition, prop.DefaultFloat) != 0f;
+            if (ImGui.Checkbox("##b", ref on)) { b.SetFloat(definition, on ? 1f : 0f, prop.DefaultFloat); return true; }
+            return false;
+        }
+        var f = b.GetFloat(definition, prop.DefaultFloat);
+        if (ImGui.DragFloat("##f", ref f, 0.05f, 0f, 100f)) { b.SetFloat(definition, f, prop.DefaultFloat); return true; }
+        return false;
     }
 
     static string ReferenceToPath(string reference) =>

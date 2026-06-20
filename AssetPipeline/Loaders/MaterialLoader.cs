@@ -60,6 +60,13 @@ public static class MaterialLoader {
         material.RoughnessFactor = Math.Clamp(definition.Roughness ?? 1f, 0f, 1f);
         material.NormalStrength = MathF.Max(definition.NormalStrength ?? 1f, 0f);
         material.NormalFlipY = definition.NormalFlipY ?? true;
+
+        // Project the fully-resolved fields into the shader-declared property bag — the renderer reads
+        // the bag now (Stage 3), so EVERY path that resolves a material (load + the editor's live edit)
+        // must refresh it here. ApplyScalars is the sole default authority (incl. the metallic-map
+        // conditional above), so deriving the bag from its output keeps the two from ever drifting.
+        // (Texture slots are set by the caller BEFORE this runs, so they're already current.)
+        material.SyncBagFromTypedFields();
     }
 
     // Falcor/glTF-style "Specular" maps pack (occlusion, roughness, metallic) into RGB; reading

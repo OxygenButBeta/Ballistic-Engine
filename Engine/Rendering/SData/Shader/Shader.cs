@@ -5,6 +5,13 @@ public abstract class Shader : BObject, IDisposable, ISharedResource
 {
     public abstract ResourceIdentity Identity { get; }
     public abstract int UID { get; }
+
+    // The properties this shader DECLARES (Unity ShaderLab Properties block). A Material stores only
+    // overrides of these; the renderer packs them into the GPU layout via each property's semantic,
+    // and the editor generates the material inspector from this list. Default: none (a bare Shader
+    // declares nothing). StandardShader overrides it with the canonical PBR property set.
+    public virtual ShaderProperties Properties => ShaderProperties.Empty;
+
     static Shader ActiveShader;
     protected Shader() => SharedResources<Shader>.AddResource(this);
 

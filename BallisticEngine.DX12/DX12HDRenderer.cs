@@ -1634,20 +1634,26 @@ public sealed class DX12HDRenderer : HDRenderer
                         // The G-buffer geometry shader reads the material-shaping fields (factors, maps, flags);
                         // the per-light fields (LightDir/LightColor/Ambient/Exposure) are unused here (they live
                         // in the deferred pass now) but the struct is shared, so they're filled harmlessly.
+                        // Material-shaping fields are read THROUGH the shader-declared property bag (semantic-
+                        // keyed); the per-light + frame-derived fields (LightDir.., UseIBL, HasMetallicMap) are
+                        // NOT material properties and stay direct. The bag mirrors the typed fields 1:1, so this
+                        // is byte-identical to the old `mat.MetallicFactor` reads (verified by imgdiff).
+                        var ec = mat.GetVector(MaterialSemantic.EmissiveColor);
                         var c = new DrawConstants
                         {
                             Mvp = Matrix4x4.Transpose(mvp),
                             Model = Matrix4x4.Transpose(model),
                             LightDir = lightDir, Exposure = exposure,
-                            LightColor = lightColor, Metallic = mat.MetallicFactor,
-                            Ambient = ambient, Roughness = mat.RoughnessFactor,
-                            CameraPos = camPos, SpecularReflectance = mat.SpecularReflectance,
-                            BaseColorFactor = mat.BaseColorFactor,
-                            EmissiveFactor = mat.EmissiveColor * mat.EmissiveIntensity,
+                            LightColor = lightColor, Metallic = mat.GetFloat(MaterialSemantic.MetallicFactor),
+                            Ambient = ambient, Roughness = mat.GetFloat(MaterialSemantic.RoughnessFactor),
+                            CameraPos = camPos, SpecularReflectance = mat.GetFloat(MaterialSemantic.SpecularReflectance),
+                            BaseColorFactor = mat.GetVector(MaterialSemantic.BaseColorFactor),
+                            EmissiveFactor = new Vector3(ec.X, ec.Y, ec.Z) * mat.GetFloat(MaterialSemantic.EmissiveIntensity),
                             HasEmissive = emissive ? 1f : 0f,
-                            NormalStrength = mat.NormalStrength, NormalFlipY = mat.NormalFlipY ? 1f : 0f,
+                            NormalStrength = mat.GetFloat(MaterialSemantic.NormalStrength),
+                            NormalFlipY = mat.GetFloat(MaterialSemantic.NormalFlipY),
                             HasMetallicMap = hasMetal ? 1f : 0f, HasRoughnessMap = hasRough ? 1f : 0f,
-                            PackedOrm = mat.PackedOrm ? 1f : 0f, Cutout = mat.Cutout ? 1f : 0f,
+                            PackedOrm = mat.GetFloat(MaterialSemantic.PackedOrm), Cutout = mat.GetFloat(MaterialSemantic.Cutout),
                             UseIBL = iblActiveThisFrame ? 1f : 0f,
                             PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f,
                         };
@@ -1655,14 +1661,15 @@ public sealed class DX12HDRenderer : HDRenderer
                         cl.SetGraphicsRootConstantBufferView(0,
                             cbRing.GPUVirtualAddress + (ulong)(CbFrameOffset + (long)slot * cbSlotSize));
 
-                        // 6 material SRVs (t0..t5); null slots resolve to neutral defaults.
+                        // 6 material SRVs (t0..t5) bound from the declared texture properties (semantic order =
+                        // DiffuseMap..EmissiveMap); null slots resolve to neutral defaults.
                         int tableStart = srvVisible.AllocateRange(MaterialSrvCount);
-                        BindSrv(tableStart + 0, mat.Diffuse, TextureType.Diffuse, fallbackDiffuse);
-                        BindSrv(tableStart + 1, mat.Normal, TextureType.Normal, null);
-                        BindSrv(tableStart + 2, mat.Metallic, TextureType.Metallic, null);
-                        BindSrv(tableStart + 3, mat.Roughness, TextureType.Roughness, null);
-                        BindSrv(tableStart + 4, mat.AO, TextureType.AO, null);
-                        BindSrv(tableStart + 5, mat.Emissive, TextureType.Emissive, null);
+                        BindSrv(tableStart + 0, mat.GetTexture(MaterialSemantic.DiffuseMap), TextureType.Diffuse, fallbackDiffuse);
+                        BindSrv(tableStart + 1, mat.GetTexture(MaterialSemantic.NormalMap), TextureType.Normal, null);
+                        BindSrv(tableStart + 2, mat.GetTexture(MaterialSemantic.MetallicMap), TextureType.Metallic, null);
+                        BindSrv(tableStart + 3, mat.GetTexture(MaterialSemantic.RoughnessMap), TextureType.Roughness, null);
+                        BindSrv(tableStart + 4, mat.GetTexture(MaterialSemantic.AOMap), TextureType.AO, null);
+                        BindSrv(tableStart + 5, mat.GetTexture(MaterialSemantic.EmissiveMap), TextureType.Emissive, null);
                         cl.SetGraphicsRootDescriptorTable(1, srvVisible.Gpu(tableStart));
 
                         cl.DrawIndexedInstanced((uint)sub.IndexCount, 1, (uint)sub.IndexStart, 0, 0);
@@ -1786,20 +1793,22 @@ public sealed class DX12HDRenderer : HDRenderer
                     bool hasMetal = mat.Metallic is not null;
                     bool hasRough = mat.Roughness is not null;
                     bool emissive = mat.IsEmissive;
+                    var ec = mat.GetVector(MaterialSemantic.EmissiveColor);
                     var c = new DrawConstants
                     {
                         Mvp = Matrix4x4.Transpose(mvp),
                         Model = Matrix4x4.Transpose(model),
                         LightDir = lightDir, Exposure = exposure,
-                        LightColor = lightColor, Metallic = mat.MetallicFactor,
-                        Ambient = ambient, Roughness = mat.RoughnessFactor,
-                        CameraPos = camPos, SpecularReflectance = mat.SpecularReflectance,
-                        BaseColorFactor = mat.BaseColorFactor,
-                        EmissiveFactor = mat.EmissiveColor * mat.EmissiveIntensity,
+                        LightColor = lightColor, Metallic = mat.GetFloat(MaterialSemantic.MetallicFactor),
+                        Ambient = ambient, Roughness = mat.GetFloat(MaterialSemantic.RoughnessFactor),
+                        CameraPos = camPos, SpecularReflectance = mat.GetFloat(MaterialSemantic.SpecularReflectance),
+                        BaseColorFactor = mat.GetVector(MaterialSemantic.BaseColorFactor),
+                        EmissiveFactor = new Vector3(ec.X, ec.Y, ec.Z) * mat.GetFloat(MaterialSemantic.EmissiveIntensity),
                         HasEmissive = emissive ? 1f : 0f,
-                        NormalStrength = mat.NormalStrength, NormalFlipY = mat.NormalFlipY ? 1f : 0f,
+                        NormalStrength = mat.GetFloat(MaterialSemantic.NormalStrength),
+                        NormalFlipY = mat.GetFloat(MaterialSemantic.NormalFlipY),
                         HasMetallicMap = hasMetal ? 1f : 0f, HasRoughnessMap = hasRough ? 1f : 0f,
-                        PackedOrm = mat.PackedOrm ? 1f : 0f, Cutout = mat.Cutout ? 1f : 0f,
+                        PackedOrm = mat.GetFloat(MaterialSemantic.PackedOrm), Cutout = mat.GetFloat(MaterialSemantic.Cutout),
                         UseIBL = iblActiveThisFrame ? 1f : 0f,
                         PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f,
                     };
@@ -1808,12 +1817,12 @@ public sealed class DX12HDRenderer : HDRenderer
                         cbRing.GPUVirtualAddress + (ulong)(CbFrameOffset + (long)slot * cbSlotSize));
 
                     int tableStart = srvVisible.AllocateRange(MaterialSrvCount);
-                    BindSrv(tableStart + 0, mat.Diffuse, TextureType.Diffuse, fallbackDiffuse);
-                    BindSrv(tableStart + 1, mat.Normal, TextureType.Normal, null);
-                    BindSrv(tableStart + 2, mat.Metallic, TextureType.Metallic, null);
-                    BindSrv(tableStart + 3, mat.Roughness, TextureType.Roughness, null);
-                    BindSrv(tableStart + 4, mat.AO, TextureType.AO, null);
-                    BindSrv(tableStart + 5, mat.Emissive, TextureType.Emissive, null);
+                    BindSrv(tableStart + 0, mat.GetTexture(MaterialSemantic.DiffuseMap), TextureType.Diffuse, fallbackDiffuse);
+                    BindSrv(tableStart + 1, mat.GetTexture(MaterialSemantic.NormalMap), TextureType.Normal, null);
+                    BindSrv(tableStart + 2, mat.GetTexture(MaterialSemantic.MetallicMap), TextureType.Metallic, null);
+                    BindSrv(tableStart + 3, mat.GetTexture(MaterialSemantic.RoughnessMap), TextureType.Roughness, null);
+                    BindSrv(tableStart + 4, mat.GetTexture(MaterialSemantic.AOMap), TextureType.AO, null);
+                    BindSrv(tableStart + 5, mat.GetTexture(MaterialSemantic.EmissiveMap), TextureType.Emissive, null);
                     cl.SetGraphicsRootDescriptorTable(1, srvVisible.Gpu(tableStart));
 
                     cl.DrawIndexedInstanced((uint)sub.IndexCount, 1, (uint)sub.IndexStart, 0, 0);

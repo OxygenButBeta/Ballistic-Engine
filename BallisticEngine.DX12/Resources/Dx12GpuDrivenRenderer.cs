@@ -369,21 +369,29 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         if (mat is null || mat.Transparent || materialIds.ContainsKey(mat) || materialCount >= MaxMaterials) return;
         int id = materialCount++;
         materialIds[mat] = id;
-        bool hasMetal = mat.Metallic is not null, hasRough = mat.Roughness is not null;
+        // Material-shaping fields read through the shader-declared property bag (semantic-keyed); the
+        // map-presence flags (HasMetallicMap/HasRoughnessMap) are derived from the texture slots, not
+        // authored properties. Byte-identical to the old typed-field reads (the bag mirrors them 1:1).
+        bool hasMetal = mat.GetTexture(MaterialSemantic.MetallicMap) is not null;
+        bool hasRough = mat.GetTexture(MaterialSemantic.RoughnessMap) is not null;
+        var ec = mat.GetVector(MaterialSemantic.EmissiveColor);
+        float ei = mat.GetFloat(MaterialSemantic.EmissiveIntensity);
         var gm = new GpuMaterial {
-            DiffuseIdx = (uint)Bindless(mat.Diffuse, TextureType.Diffuse),
-            NormalIdx = (uint)Bindless(mat.Normal, TextureType.Normal),
-            MetallicIdx = (uint)Bindless(mat.Metallic, TextureType.Metallic),
-            RoughnessIdx = (uint)Bindless(mat.Roughness, TextureType.Roughness),
-            AoIdx = (uint)Bindless(mat.AO, TextureType.AO),
-            EmissiveIdx = (uint)Bindless(mat.Emissive, TextureType.Emissive),
-            BaseColorFactor = ToNum(mat.BaseColorFactor),
-            EmissiveFactor = new Vector4(mat.EmissiveColor.X, mat.EmissiveColor.Y, mat.EmissiveColor.Z, 0) * mat.EmissiveIntensity,
-            Metallic = mat.MetallicFactor, Roughness = mat.RoughnessFactor,
-            SpecularReflectance = mat.SpecularReflectance, NormalStrength = mat.NormalStrength,
-            NormalFlipY = mat.NormalFlipY ? 1f : 0f, HasMetallicMap = hasMetal ? 1f : 0f,
-            HasRoughnessMap = hasRough ? 1f : 0f, PackedOrm = mat.PackedOrm ? 1f : 0f,
-            Cutout = mat.Cutout ? 1f : 0f, HasEmissive = mat.IsEmissive ? 1f : 0f,
+            DiffuseIdx = (uint)Bindless(mat.GetTexture(MaterialSemantic.DiffuseMap), TextureType.Diffuse),
+            NormalIdx = (uint)Bindless(mat.GetTexture(MaterialSemantic.NormalMap), TextureType.Normal),
+            MetallicIdx = (uint)Bindless(mat.GetTexture(MaterialSemantic.MetallicMap), TextureType.Metallic),
+            RoughnessIdx = (uint)Bindless(mat.GetTexture(MaterialSemantic.RoughnessMap), TextureType.Roughness),
+            AoIdx = (uint)Bindless(mat.GetTexture(MaterialSemantic.AOMap), TextureType.AO),
+            EmissiveIdx = (uint)Bindless(mat.GetTexture(MaterialSemantic.EmissiveMap), TextureType.Emissive),
+            BaseColorFactor = mat.GetVector(MaterialSemantic.BaseColorFactor),
+            // W stays 0 (the old code multiplied a W=0 vector by intensity); the bag holds EmissiveColor
+            // with W=1, so build the RGB-only vector explicitly to preserve the exact bytes.
+            EmissiveFactor = new Vector4(ec.X, ec.Y, ec.Z, 0f) * ei,
+            Metallic = mat.GetFloat(MaterialSemantic.MetallicFactor), Roughness = mat.GetFloat(MaterialSemantic.RoughnessFactor),
+            SpecularReflectance = mat.GetFloat(MaterialSemantic.SpecularReflectance), NormalStrength = mat.GetFloat(MaterialSemantic.NormalStrength),
+            NormalFlipY = mat.GetFloat(MaterialSemantic.NormalFlipY), HasMetallicMap = hasMetal ? 1f : 0f,
+            HasRoughnessMap = hasRough ? 1f : 0f, PackedOrm = mat.GetFloat(MaterialSemantic.PackedOrm),
+            Cutout = mat.GetFloat(MaterialSemantic.Cutout), HasEmissive = mat.GetFloat(MaterialSemantic.IsEmissive),
         };
         // materials is stamp-gated (rebuilt only on a material-set change, not per frame), but N-buffered for
         // overlap safety: when a rebuild lands on frame F, an in-flight earlier frame may still be reading its
