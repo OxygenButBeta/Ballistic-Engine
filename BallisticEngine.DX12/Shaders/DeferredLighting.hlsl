@@ -27,6 +27,8 @@ cbuffer LightConstants : register(b0) {
     float    UseIBLSpecular;                        // >0.5 = add the IBL prefiltered-specular ambient; 0 when RT/SSR own reflections
     float    UseCapsuleShadows; float3 CapPad;      // >0.5 = multiply the capsule-shadow mask (t16) into the sun term
     float4x4 ViewProjFwd;                          // world → clip (transposed on upload); contact-shadow march reprojection
+    float    UseVsm; float VsmLevels; float VsmTexel; float VsmLevel0Extent;  // VSM (virtual shadow map) clipmap params; UseVsm>0.5 selects the VSM path
+    float3   VsmCamPos; float VsmPad0;              // camera world pos (VSM level select by distance)
 };
 
 // V2 specular firefly clamp (fixes D3): a normal-mapped surface lit by a sharp light produces single-pixel
@@ -60,6 +62,14 @@ cbuffer FrameConstants : register(b1) {
     float    FramePad0, FramePad1;
 };
 
+// VIRTUAL SHADOW MAP clipmap matrices (b2) — a SEPARATE cbuffer so the default cascade path's b1 layout is
+// untouched (byte-identical when VSM is off; b2 is simply never bound/read). Up to 16 camera-anchored,
+// texel-snapped clipmap-level light-space matrices (world → light clip, transposed on upload). Sampled by
+// VsmSunShadow when UseVsm > 0.5. Mirrors Dx12VirtualShadowMap.MaxLevels.
+cbuffer VsmConstants : register(b2) {
+    float4x4 VsmMatrix[16];
+};
+
 Texture2D GAlbedo   : register(t0);   // rgb albedo, a = specularReflectance
 Texture2D GNormal   : register(t1);   // rgb world normal packed [0,1]
 Texture2D GMaterial : register(t2);   // r metallic, g roughness, b ao, a = flags
@@ -87,6 +97,7 @@ Texture2D SsaoTex          : register(t13);                // GTAO (1 = unocclud
 Texture2D LtcMatTex        : register(t14);                // LTC inverse-matrix coeffs (area lights); 64x64 RGBA32F
 Texture2D LtcAmpTex        : register(t15);                // LTC amplitude/Fresnel split-sum (area lights)
 Texture2D CapsuleShadowTex : register(t16);                // analytic capsule sun-shadow occlusion (1 lit / 0 occluded)
+Texture2DArray VsmClipmap  : register(t17);                // VSM clipmap depth (R32_Float), one layer per level; manual PCF
 SamplerState LinearClamp : register(s0);
 
 static const float PI = 3.14159265359;
@@ -167,6 +178,58 @@ float ShadowPcss(int c, float2 base, float z, float bias) {
     float radiusTexels = clamp(penumbra * ShadowSoftness * 64.0, 0.75, 12.0);
     // 3) Variable-radius PCF (reuse the 5x5 kernel at the computed radius).
     return ShadowPcf(c, base, z, bias, radiusTexels);
+}
+
+// ===================================== VIRTUAL SHADOW MAP sampling =====================================
+// Clipmap-array VSM (the camera-anchored, log2-extent, per-level-cached form — see Dx12VirtualShadowMap.cs).
+// Select the FINEST clipmap level whose world half-extent covers the receiver's distance from the camera,
+// project into that level's light clip, and PCF-sample its array layer. Level i covers VsmLevel0Extent·2^i
+// world half-extent; picking by distance gives near geometry the densest texels (the VSM resolution win).
+//
+// One hard depth-compare tap into a VSM clipmap level layer.
+float VsmTapHard(int level, float2 uv, float z, float bias) {
+    float d = VsmClipmap.SampleLevel(LinearClamp, float3(uv, (float)level), 0).r;
+    return (z - bias) <= d ? 1.0 : 0.0;
+}
+
+// Fixed 3x3 PCF in one VSM level (texel size = VsmTexel). Small soft kernel — the clipmap level already
+// adapts the texel density, so a wide kernel isn't needed for a soft edge.
+float VsmPcf(int level, float2 base, float z, float bias, float radiusTexels) {
+    float lit = 0.0;
+    [unroll] for (int dy = -1; dy <= 1; dy++)
+    [unroll] for (int dx = -1; dx <= 1; dx++) {
+        float2 uv = base + float2(dx, dy) * VsmTexel * radiusTexels;
+        lit += VsmTapHard(level, uv, z, bias);
+    }
+    return lit / 9.0;
+}
+
+float VsmSunShadow(float3 N, float3 L, float3 worldPos) {
+    if (ShadowsEnabled < 0.5) return 1.0;
+    float ndl = saturate(dot(N, L));
+    int levels = (int)(VsmLevels + 0.5);
+
+    // Pick the finest level whose half-extent covers the receiver. Camera-relative distance (Chebyshev /
+    // max-axis) matches the square ortho footprint of a level better than Euclidean radius.
+    float3 rel = worldPos - VsmCamPos;
+    float dist = max(max(abs(rel.x), abs(rel.y)), abs(rel.z));
+    for (int level = 0; level < levels; level++) {
+        float extent = VsmLevel0Extent * exp2((float)level);
+        if (dist > extent * 0.95) continue;          // not covered by this (or any finer) level — try coarser
+        float4 clip = mul(float4(worldPos, 1.0), VsmMatrix[level]);
+        float3 proj = clip.xyz;
+        proj.xy = proj.xy * float2(0.5, -0.5) + 0.5;
+        // Guard against the rare snap-edge sliver where the receiver sits just outside this level's clip.
+        float edge = max(abs(clip.x), abs(clip.y));
+        if (edge > 1.0 || proj.z > 1.0 || proj.z < 0.0) continue;
+        // Bias scales with the level's texel size (coarser level = larger world texel = more bias needed).
+        float bias = max(0.0006 * (1.0 + (float)level), 0.0006) * (2.0 - ndl);
+        int mode = (int)(ShadowFiltering + 0.5);
+        if (mode == 0) return VsmTapHard(level, proj.xy, proj.z, bias);
+        float radiusTexels = clamp(ShadowSoftness * 0.75, 0.5, 4.0);
+        return VsmPcf(level, proj.xy, proj.z, bias, radiusTexels);
+    }
+    return 1.0;   // beyond the coarsest level — treat as lit (the CSM far-fade equivalent)
 }
 
 float SunShadow(float3 N, float3 L, float3 worldPos) {
@@ -452,6 +515,7 @@ float4 PSMain(VSOut i) : SV_Target {
     float3 diffuse = 0, specular = 0;
     if (NdotL > 0.0) {
         float shadow = (UseRtShadows > 0.5) ? RtShadowMask.SampleLevel(LinearClamp, i.Uv, 0).r
+                     : (UseVsm > 0.5)       ? VsmSunShadow(N, D, worldPos)
                                             : SunShadow(N, D, worldPos);
         // Contact shadows refine the cascade path (RT shadows already capture contact). Only darkens.
         if (UseRtShadows <= 0.5) shadow *= ContactShadow(worldPos, D);

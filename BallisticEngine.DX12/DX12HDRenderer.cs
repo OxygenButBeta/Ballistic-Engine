@@ -316,6 +316,14 @@ public sealed class DX12HDRenderer : HDRenderer
     readonly float[] cascadeDepthRanges = new float[MaxCascades];
     bool shadowsThisFrame;
 
+    // VIRTUAL SHADOW MAPS (opt-in, clipmap-array form — see Dx12VirtualShadowMap.cs). Lazily created on the
+    // first VSM frame; null until then. vsmWanted is resolved once at init (env door + the volume flag is read
+    // per frame from PostFX). When active, RenderVsm replaces RenderShadows for the sun; the deferred pass
+    // samples the VSM clipmap. When inactive, NONE of this runs → the default cascade path is byte-identical.
+    Dx12VirtualShadowMap vsm;
+    bool vsmWanted;                 // BALLISTIC_DX12_VSM=1 (env force); the volume flag is OR'd in per frame
+    bool vsmActiveThisFrame;
+
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct ShadowConstants
     {
@@ -441,12 +449,52 @@ public sealed class DX12HDRenderer : HDRenderer
         // slots are byte-neutral because each allocator reads only the passed size (R5).
         if (rtShadowMask != null) AllocRtShadowMask();
         AllocFsrOutput();
+        // RE-STAMP the alias pool to the new render res BEFORE fanning the resize out: pooled targets (ssrTarget,
+        // ssgi*, bloom*) were registered at the OLD resolution, and the pooled passes' Resize() calls below re-
+        // Acquire at the new size — which asserts a footprint mismatch (and would under-size the heap regions) if
+        // the registrations weren't rebuilt. Re-register + BuildPlan reproduces the init-time plan at the new size.
+        if (aliasPath && rtPool != null) RegisterAliasPool(internalW, internalH);
         // Fan the resize out to any pass that owns resolution-dependent targets. No-op while the graph is
         // empty (scaffold). Registration order matches the AllocXxx sequence above once passes populate it (R5).
         graph?.Resize(internalW, internalH);
         // PHASE-3 (chunk 20): the feature blitter's scratch HDR copy follows the render res (it also self-sizes to
         // the live SceneColor per-blit, so this is just to avoid a first-blit reallocation).
         featureBlitter?.Resize(internalW, internalH);
+    }
+
+    // (Re)register every pooled transient at render resolution (w,h) and rebuild the alias plan. Called once at
+    // init and again on every resize — Register() is idempotent per name (updates the interval/footprint), and
+    // BuildPlan() rebuilds the heap regions from the new sizes. Pass ORDER indices (refl/gi/comp) are stable
+    // across resizes (the compiled graph doesn't recompile on resolution change), so re-querying is safe.
+    void RegisterAliasPool(int w, int h)
+    {
+        int hw = Math.Max(1, w / 2), hh = Math.Max(1, h / 2);
+        var Hdr = Dx12OffscreenTarget.HdrFormat;
+        int refl = graph.OrderIndexOf("Reflections");
+        int gi = graph.OrderIndexOf("GI"), comp = graph.OrderIndexOf("Composite");
+        // POOLED (audit-passed full-overwrite-before-read transients). Format/size/uav MUST match the pass's
+        // actual AllocOrPool call (the pool asserts this on Acquire). History (ssgiHistory/taaHistory/lumTarget)
+        // is NOT registered → those passes' AllocOrPool calls fall through to committed (imported, never aliased).
+        //
+        // NOTE: GTAO's gtaoA/gtaoB are deliberately NOT pooled — their size depends on the AmbientOcclusion
+        // volume's Resolution dropdown (Full/Half/Quarter), which can change at runtime, so a fixed-size pool
+        // registration would break the pool's size-match assert. They fall through to committed targets (the
+        // pool is a perf optimisation, not a correctness requirement; committed is always valid).
+        //
+        // LIFETIME = [firstWritePass, lastReadPass] in compiled-graph order. The remaining pooled scratch is all
+        // PASS-PRIVATE (born + consumed inside ONE pass's Record → first==last==that pass).
+        rtPool.Register("ssrTarget", hw, hh, Hdr, true, refl, refl);
+        rtPool.Register("ssrScene", w, h, Hdr, false, refl, refl);
+        rtPool.Register("ssgiTarget", hw, hh, Hdr, true, gi, gi);
+        rtPool.Register("ssgiDenoised", hw, hh, Hdr, true, gi, gi);
+        rtPool.Register("ssgiScene", w, h, Hdr, false, gi, gi);
+        rtPool.Register("bloomA", hw, hh, Hdr, false, comp, comp);
+        rtPool.Register("bloomB", hw, hh, Hdr, false, comp, comp);
+        rtPool.BuildPlan();
+        // V2 SOUNDNESS GATE: assert no two aliased logicals have overlapping lifetimes (the invariant the whole
+        // pixel-neutral guarantee rests on). A violation throws here rather than corrupting memory mid-frame.
+        string overlap = rtPool.AuditNoOverlap();
+        if (overlap != null) throw new InvalidOperationException("[DX12 V2] alias plan UNSOUND — " + overlap);
     }
 
     void AllocFsrOutput()
@@ -598,6 +646,9 @@ public sealed class DX12HDRenderer : HDRenderer
         hizWanted = gpuDrivenOn && Environment.GetEnvironmentVariable("BALLISTIC_DX12_GPUDRIVEN_HIZ") != "0";
         // Cascade caching: DEFAULT ON (BALLISTIC_DX12_SHADOW_CACHE=0 disables).
         shadowCacheOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SHADOW_CACHE") != "0";
+        // Virtual shadow maps: OPT-IN. BALLISTIC_DX12_VSM=1 forces them on (the Shadows-volume
+        // UseVirtualShadowMaps flag is OR'd in per frame). DEFAULT OFF → the cascade path renders, byte-identical.
+        vsmWanted = Environment.GetEnvironmentVariable("BALLISTIC_DX12_VSM") == "1";
         // P2 — freeze the per-frame env-var doors once (see field comments). Byte-identical: these are
         // process-scoped A/B/diagnostic switches, previously re-read every BeginRender.
         skyTlutOn        = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SKY_TLUT") != "0";
@@ -768,33 +819,7 @@ public sealed class DX12HDRenderer : HDRenderer
         if (aliasPath)
         {
             rtPool = new Dx12RenderTargetPool(dev);
-            int hw = Math.Max(1, targetW / 2), hh = Math.Max(1, targetH / 2);
-            var Hdr = Dx12OffscreenTarget.HdrFormat;
-            int refl = graph.OrderIndexOf("Reflections");
-            int gi = graph.OrderIndexOf("GI"), comp = graph.OrderIndexOf("Composite");
-            // POOLED (audit-passed full-overwrite-before-read transients). Format/size/uav MUST match the pass's
-            // actual AllocOrPool call (the pool asserts this on Acquire). History (ssgiHistory/taaHistory/lumTarget)
-            // is NOT registered → those passes' AllocOrPool calls fall through to committed (imported, never aliased).
-            //
-            // NOTE: GTAO's gtaoA/gtaoB are deliberately NOT pooled — their size depends on the AmbientOcclusion
-            // volume's Resolution dropdown (Full/Half/Quarter), which can change at runtime, so a fixed-size pool
-            // registration would break the pool's size-match assert. They fall through to committed targets (the
-            // pool is a perf optimisation, not a correctness requirement; committed is always valid).
-            //
-            // LIFETIME = [firstWritePass, lastReadPass] in compiled-graph order. The remaining pooled scratch is all
-            // PASS-PRIVATE (born + consumed inside ONE pass's Record → first==last==that pass).
-            rtPool.Register("ssrTarget", hw, hh, Hdr, true, refl, refl);
-            rtPool.Register("ssrScene", targetW, targetH, Hdr, false, refl, refl);
-            rtPool.Register("ssgiTarget", hw, hh, Hdr, true, gi, gi);
-            rtPool.Register("ssgiDenoised", hw, hh, Hdr, true, gi, gi);
-            rtPool.Register("ssgiScene", targetW, targetH, Hdr, false, gi, gi);
-            rtPool.Register("bloomA", hw, hh, Hdr, false, comp, comp);
-            rtPool.Register("bloomB", hw, hh, Hdr, false, comp, comp);
-            rtPool.BuildPlan();
-            // V2 SOUNDNESS GATE: assert no two aliased logicals have overlapping lifetimes (the invariant the whole
-            // pixel-neutral guarantee rests on). A violation throws at init rather than corrupting memory mid-frame.
-            string overlap = rtPool.AuditNoOverlap();
-            if (overlap != null) throw new InvalidOperationException("[DX12 V2] alias plan UNSOUND — " + overlap);
+            RegisterAliasPool(targetW, targetH);   // registers + BuildPlan + soundness gate at init res
             Dx12RenderTargetPool.Active = rtPool;
             // Re-Resize so every pooled pass RE-ACQUIRES its target as a PLACED resource (its ctor allocated
             // committed targets before the pool existed; AllocOrPool now hands back placed ones, disposing the
@@ -1680,7 +1705,13 @@ public sealed class DX12HDRenderer : HDRenderer
         // N-buffered shadow CB at this frame's slot. Fit with the UNJITTERED proj for stable cascades. Must run
         // before the FrameConstants write below (it consumes cascadeMatrices) and before the geometry pass.
         GpuMark("Shadows");
-        if (doors.Shadows)
+        // VSM active when the env door forces it OR the Shadows-volume flag is set (and the volume bridge is on).
+        // When active, the clipmap-array VSM replaces the cascade render for the sun; the deferred pass samples
+        // the VSM clipmap (VsmSunShadow). When inactive, the cascade path runs exactly as before (byte-identical).
+        vsmActiveThisFrame = doors.Shadows && (vsmWanted || (doors.Volumes && PostFX.UseVirtualShadowMaps));
+        if (vsmActiveThisFrame)
+            RenderVsm(camPos, light);
+        else if (doors.Shadows)
             RenderShadows(view, projUnjittered, light);
         else
             shadowsThisFrame = false;
@@ -2233,6 +2264,7 @@ public sealed class DX12HDRenderer : HDRenderer
             Dev = dev, Target = target, Ldr = ldr, GBuffer = gbuffer,
             Ibl = ibl, SkyLuts = skyLuts, ClusteredLights = clusteredLights,
             ShadowMap = shadowMap, GpuDriven = gpuDriven,
+            Vsm = vsm, VsmActiveThisFrame = vsmActiveThisFrame, // VSM clipmap (deferred binds t17 + b2 when active)
             RtShadowMask = rtShadowMask, // chunk 9: deferred binds it to t12 when RtShadowsThisFrame (null → fallback)
             Dxr = dxr, // chunk 10: shared DXR substrate (sceneAS/device5/rtGeometry/ddgi) for the GI + Reflections passes
             LumenScene = lumenGiPass.Scene, // Lumen V2 P5: the radiance cache the Reflections pass samples for rough reflections
@@ -2858,6 +2890,117 @@ public sealed class DX12HDRenderer : HDRenderer
         // is open (e.g. pipelining disabled), so both paths are byte-identical in output.
         if (Pp1InlineSyncs) dev.ExecuteSync(recordShadows);
         else                dev.ExecuteUpload(recordShadows);
+        shadowsThisFrame = true;
+    }
+
+    // === VIRTUAL SHADOW MAPS (opt-in, clipmap-array form) ===
+    // The parallel sun-shadow path. Centres N log2 clipmap levels on the camera, texel-snaps each, renders ONLY
+    // the dirty levels' depth (cache: a level whose snapped centre + casters didn't move is reused), and leaves
+    // shadowsThisFrame set so the deferred pass shades sun shadows from the VSM clipmap (VsmSunShadow, t17/b2).
+    //
+    // Reuses the SAME depth PSO + root sig + per-submesh CB as the cascades (each level == a "cascade"). The
+    // whole-mesh GPU-driven renderers are drawn through the CPU per-submesh loop here too (the GPU-driven shadow
+    // path is hard-capped at 4 cascades; the CPU loop has no level cap). With per-level caching + a static
+    // camera, most levels are free after the first frame — the same big win as the cascade cache.
+    unsafe void RenderVsm(Vector3 camPos, LightUniforms light)
+    {
+        shadowsThisFrame = false;
+        if (DirectionalLight.Instance is null) return;
+        Vector3 sunTravel = -light.Direction;
+        if (sunTravel.LengthSquared() < 1e-8f) return;
+
+        // Volume-driven VSM config (env door overrides the volume flag for A/B). Recreate the clipmap array on a
+        // resolution / level / extent change (rare authoring edit). Defaults: 2048², 12 levels, 4 m level-0 extent.
+        bool volumesDriving = doors.Volumes;
+        int wantRes = volumesDriving ? Math.Clamp(SnapPow2(PostFX.VsmResolution), 512, 4096) : 2048;
+        int wantLevels = volumesDriving ? Math.Clamp(PostFX.VsmClipmapLevels, 1, Dx12VirtualShadowMap.MaxLevels) : 12;
+        float wantExtent = volumesDriving && PostFX.VsmLevel0Extent > 0f ? PostFX.VsmLevel0Extent : 4f;
+        if (vsm == null || vsm.Resolution != wantRes || vsm.Levels != wantLevels
+            || MathF.Abs(vsm.Level0Extent - wantExtent) > 1e-4f)
+        {
+            vsm?.Dispose();
+            vsm = new Dx12VirtualShadowMap(dev, wantRes, wantLevels, wantExtent);
+        }
+
+        int casterStamp = ComputeShadowCasterStamp();
+        vsm.Fit(camPos, sunTravel, casterStamp, shadowCacheOn);
+
+        bool anyDirty = false;
+        for (int i = 0; i < vsm.Levels; i++) anyDirty |= vsm.LevelDirty[i];
+        if (!anyDirty)
+        {
+            shadowsThisFrame = true;   // every level cached — the clipmap still holds valid depth
+            return;
+        }
+
+        // Fill per (level, submesh) LightMvp constants into THIS frame's N-buffered slab (same CB as cascades).
+        int slotBase = dev.FrameSlot * shadowCbSlotCount;
+        int slotEnd = slotBase + shadowCbSlotCount;
+        int slot = slotBase;
+        var fills = shadowFills;
+        fills.Clear();
+        for (int c = 0; c < vsm.Levels; c++)
+        {
+            if (!vsm.LevelDirty[c]) continue;   // cached level — keep its prior depth, no re-fill/re-draw
+            ExtractFrustumPlanes(vsm.LightMatrices[c]);
+            foreach (IStaticMeshRenderer r in RendererSet)
+            {
+                if (r is null || !r.IsActive || !r.IsRenderable) continue;
+                Mesh mesh = r.SharedMesh;
+                if (mesh is null) continue;
+                if (mesh.VertexBuffer is not Dx12Buffer<GLVector3> vb || vb.Resource is null) continue;
+                if (mesh.IndexBuffer is not Dx12IndexBuffer ib || ib.Resource is null) continue;
+                Matrix4x4 model = r.Transform.RenderMatrix;
+                Matrix4x4 lightMvp = model * vsm.LightMatrices[c];
+                int only = r.SubMeshIndex;
+                int first = only >= 0 ? only : 0;
+                int last = only >= 0 ? only : mesh.SubMeshes.Length - 1;
+                for (int s = first; s <= last; s++)
+                {
+                    if ((uint)s >= (uint)mesh.SubMeshes.Length) break;
+                    SubMeshData sub = mesh.SubMeshes[s];
+                    if (sub.IndexCount <= 0) continue;
+                    mesh.GetSubMeshBounds(s, out GLVector3 lmin, out GLVector3 lmax);
+                    if (!AabbInFrustum(lmin, lmax, model)) continue;   // outside this level's footprint
+                    if (slot >= slotEnd) break;
+                    *(ShadowConstants*)(shadowCbMapped + (long)slot * shadowCbSlotSize) =
+                        new ShadowConstants { LightMvp = Matrix4x4.Transpose(lightMvp) };
+                    fills.Add((c, vb, ib, sub.IndexStart, sub.IndexCount, slot));
+                    slot++;
+                }
+            }
+            vsm.MarkRendered(c);
+        }
+
+        if (fills.Count == 0) { shadowsThisFrame = true; return; }
+
+        Action<ID3D12GraphicsCommandList4> recordVsm = cl =>
+        {
+            vsm.ToDepthWrite(cl);
+            for (int c = 0; c < vsm.Levels; c++)
+            {
+                if (!vsm.LevelDirty[c]) continue;
+                vsm.RenderLevel(cl, c, clear: true, cc =>
+                {
+                    cc.SetGraphicsRootSignature(shadowRootSig);
+                    cc.SetPipelineState(shadowPso);
+                    cc.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+                    foreach (var f in fills)
+                    {
+                        if (f.cascade != c) continue;
+                        cc.SetGraphicsRootConstantBufferView(0,
+                            shadowCb.GPUVirtualAddress + (ulong)((long)f.cbSlot * shadowCbSlotSize));
+                        cc.IASetVertexBuffers(0,
+                            new VertexBufferView(f.vb.GpuAddress, (uint)f.vb.ByteSize, (uint)f.vb.Stride));
+                        cc.IASetIndexBuffer(new IndexBufferView(f.ib.GpuAddress, (uint)f.ib.ByteSize, Format.R32_UInt));
+                        cc.DrawIndexedInstanced((uint)f.count, 1, (uint)f.start, 0, 0);
+                    }
+                });
+            }
+            vsm.ToShaderResource(cl);
+        };
+        if (Pp1InlineSyncs) dev.ExecuteSync(recordVsm);
+        else                dev.ExecuteUpload(recordVsm);
         shadowsThisFrame = true;
     }
 

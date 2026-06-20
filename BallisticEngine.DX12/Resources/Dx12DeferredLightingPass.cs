@@ -68,13 +68,25 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         public float UseIBLDiffuse; public float UseIBLSpecular; // 0 when Lumen V2 owns diffuse GI / RT+SSR own reflections
         public float UseCapsuleShadows; public float CapPad0, CapPad1, CapPad2; // >0.5 = multiply the capsule-shadow mask (t16) into the sun term
         public Matrix4x4 ViewProjFwd;                        // world → clip (transposed); contact-shadow march reprojection
+        // VSM (virtual shadow map) clipmap params. UseVsm > 0.5 selects the VsmSunShadow path. All zero by
+        // default (UseVsm = 0) → the cascade path is taken, byte-identical to pre-VSM.
+        public float UseVsm; public float VsmLevels; public float VsmTexel; public float VsmLevel0Extent;
+        public Vector3 VsmCamPos; public float VsmPad0;
+    }
+
+    // VSM clipmap matrices (b2). A separate CB from FrameConstants (b1) so the cascade layout is untouched.
+    // 16 light-space matrices (one per clipmap level), uploaded transposed. Mirrors Dx12VirtualShadowMap.MaxLevels.
+    [StructLayout(LayoutKind.Sequential)]
+    unsafe struct VsmConstants {
+        public fixed float Matrices[16 * 16];   // 16 × float4x4, row-major transposed on fill
     }
 
     readonly Dx12Device dev;
     ID3D12RootSignature deferredRootSig;   // LightConstants CBV(b0) + FrameConstants CBV(b1) + 16-SRV table + sampler
     ID3D12PipelineState deferredPso;
     Dx12FrameCb<LightConstants> deferredCb;   // P0b: N-buffered (FrameSlot-offset)
-    Dx12DescriptorHeap deferredSrvVisible;  // 17 SRVs copied per frame: G0..G3, depth, irradiance, prefilter, BRDF, shadow, cluster lights/grid/index, RT shadow mask, GTAO, LTC mat (t14) + LTC amp (t15), capsule shadow mask (t16)
+    Dx12FrameCb<VsmConstants> vsmCb;          // VSM clipmap matrices (b2); unread when UseVsm=0 → byte-identical default
+    Dx12DescriptorHeap deferredSrvVisible;  // 18 SRVs copied per frame: G0..G3, depth, irradiance, prefilter, BRDF, shadow, cluster lights/grid/index, RT shadow mask, GTAO, LTC mat (t14) + LTC amp (t15), capsule shadow mask (t16), VSM clipmap (t17)
     Dx12LtcTables ltcTables;                // area/rect-light LTC lookup tables (t14/t15) — static, built once at init
 
     // BuildDeferredLighting moved VERBATIM into the ctor (re-rooted onto `dev`). clusteredLights stays
@@ -83,13 +95,16 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         dev = device;
         var lightCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Pixel);
         var frameCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.Pixel);
-        // 17 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster lights/grid/index
+        // 18 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster lights/grid/index
         // (t9..t11), RT shadow mask (t12), GTAO (t13), LTC matrix-inverse table (t14), LTC amplitude table (t15),
-        // capsule shadow mask (t16). The LTC tables (t14/t15) and the capsule mask (t16) are unread by the default
-        // path (no area lights / no capsule casters → UseCapsuleShadows=0), so the table growth 14→17 is
-        // byte-identical for the default path (the extra descriptors are bound but never sampled).
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 17, baseShaderRegister: 0);
+        // capsule shadow mask (t16), VSM clipmap (t17). The LTC tables (t14/t15), capsule mask (t16) and VSM
+        // clipmap (t17) are unread by the default path (no area lights / no capsule casters / UseVsm=0), so the
+        // table growth is byte-identical for the default path (the extra descriptors are bound but never sampled).
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 18, baseShaderRegister: 0);
         var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
+        // VSM clipmap matrices (b2) — a TRAILING root param the default cascade path never reads. Adding it is
+        // byte-identical for the default path (the CBV is bound but UseVsm=0 short-circuits before any read).
+        var vsmCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(2, 0), ShaderVisibility.Pixel);
         var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
             AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
@@ -97,7 +112,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         };
         deferredRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(RootSignatureFlags.None,
-                new[] { lightCbv, frameCbv, srvTable }, new[] { samp })));
+                new[] { lightCbv, frameCbv, srvTable, vsmCbv }, new[] { samp })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("DeferredLighting.hlsl");
         byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "DeferredLighting.hlsl");
@@ -112,8 +127,9 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         });
 
         deferredCb = new Dx12FrameCb<LightConstants>(dev);
+        vsmCb = new Dx12FrameCb<VsmConstants>(dev);
         deferredSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 17, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 18, shaderVisible: true, framesInFlight: dev.FramesInFlight);
         // Build the LTC tables once (CPU fit + GPU upload). Self-contained; no scene/asset dependency.
         ltcTables = new Dx12LtcTables(dev);
     }
@@ -183,12 +199,38 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
             UseCapsuleShadows = ctx.CapsuleShadowsThisFrame ? 1f : 0f,
             // Forward world→clip for the contact-shadow screen-space march (HLSL muls row-vector × matrix).
             ViewProjFwd = Matrix4x4.Transpose(ctx.ViewProj),
+            // VSM clipmap params — UseVsm=0 (the cascade path) unless VSM ran this frame. When active, the
+            // VsmSunShadow path selects a clipmap level by camera distance and PCF-samples t17. Default = all
+            // zero → the cascade SunShadow path, byte-identical.
+            UseVsm = (ctx.VsmActiveThisFrame && ctx.Vsm != null) ? 1f : 0f,
+            VsmLevels = ctx.Vsm != null ? ctx.Vsm.Levels : 0f,
+            VsmTexel = ctx.Vsm != null ? 1f / ctx.Vsm.Resolution : 0f,
+            VsmLevel0Extent = ctx.Vsm != null ? ctx.Vsm.Level0Extent : 0f,
+            VsmCamPos = ctx.CamPos,
         });
+
+        // VSM clipmap matrices (b2) — uploaded transposed (HLSL muls row-vector × matrix). Filled only when VSM
+        // is active; otherwise written as zero (unread, UseVsm=0). The CB is always bound so b2 is valid.
+        VsmConstants vsmConsts = default;
+        if (ctx.VsmActiveThisFrame && ctx.Vsm != null) {
+            unsafe {
+                for (int lvl = 0; lvl < ctx.Vsm.Levels && lvl < Dx12VirtualShadowMap.MaxLevels; lvl++) {
+                    Matrix4x4 m = Matrix4x4.Transpose(ctx.Vsm.LightMatrices[lvl]);
+                    // Row-major float4x4 → 16 contiguous floats.
+                    float* dst = vsmConsts.Matrices + lvl * 16;
+                    dst[0] = m.M11; dst[1] = m.M12; dst[2] = m.M13; dst[3] = m.M14;
+                    dst[4] = m.M21; dst[5] = m.M22; dst[6] = m.M23; dst[7] = m.M24;
+                    dst[8] = m.M31; dst[9] = m.M32; dst[10] = m.M33; dst[11] = m.M34;
+                    dst[12] = m.M41; dst[13] = m.M42; dst[14] = m.M43; dst[15] = m.M44;
+                }
+            }
+        }
+        vsmCb.Write(vsmConsts);
 
         // Copy the 16 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster
         // lights/grid/index (t9..t11), RT shadow mask (t12), GTAO (t13), LTC mat (t14), LTC amp (t15).
         deferredSrvVisible.Reset();
-        int b = deferredSrvVisible.AllocateRange(17);
+        int b = deferredSrvVisible.AllocateRange(18);
         // Only the 4 SHADED G-buffer RTs feed lighting (G0..G3 → t0..t3); the motion RT (RT4) is for TAA/FSR.
         for (int i = 0; i < Dx12GBuffer.ShadedRtCount; i++)
             dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + i), gbuffer.ColorSrvCpu(i), heapType);
@@ -216,6 +258,10 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         // unused fallback. UseCapsuleShadows gates the sample, so the fallback's contents never affect output.
         dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 16),
             ctx.CapsuleShadowsThisFrame ? ctx.CapsuleShadowMask : gbuffer.DepthSrvCpu, heapType);
+        // VSM clipmap (t17) — the real clipmap array when VSM ran this frame, else a valid unused fallback.
+        // UseVsm gates the sample, so the fallback's contents never affect the output (byte-identical default).
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 17),
+            (ctx.VsmActiveThisFrame && ctx.Vsm != null) ? ctx.Vsm.SrvCpu : gbuffer.DepthSrvCpu, heapType);
 
         target.RenderColorOnlyCleared(cl => {
             cl.SetGraphicsRootSignature(deferredRootSig);
@@ -224,6 +270,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
             cl.SetGraphicsRootConstantBufferView(0, deferredCb.Gpu);
             cl.SetGraphicsRootConstantBufferView(1, ctx.FrameCbAddress);
             cl.SetGraphicsRootDescriptorTable(2, deferredSrvVisible.Gpu(b));
+            cl.SetGraphicsRootConstantBufferView(3, vsmCb.Gpu);   // b2: VSM clipmap matrices (unread when UseVsm=0)
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
         });
@@ -233,6 +280,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         deferredPso?.Dispose();
         deferredRootSig?.Dispose();
         deferredCb?.Dispose();
+        vsmCb?.Dispose();
         deferredSrvVisible?.Dispose();
         ltcTables?.Dispose();
     }

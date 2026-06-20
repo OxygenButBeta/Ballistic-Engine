@@ -77,6 +77,12 @@ public sealed class Dx12FrameContext {
     public Dx12SkyLuts         SkyLuts        { get; init; }
     public Dx12ClusteredLights ClusteredLights{ get; init; }
     public Dx12ShadowMap       ShadowMap      { get; init; }
+    // VIRTUAL SHADOW MAP (clipmap-array form) — null unless VSM is active this frame. When VsmActiveThisFrame,
+    // the deferred pass binds its clipmap array (t17) + uploads its per-level matrices (b2) and selects the
+    // VsmSunShadow path; otherwise the field is null and the deferred pass binds a fallback SRV + UseVsm=0
+    // (byte-identical default). Owned by the orchestrator (lazily created on first VSM frame).
+    public Dx12VirtualShadowMap Vsm           { get; init; }
+    public bool VsmActiveThisFrame            { get; init; }
     public Dx12GpuDrivenRenderer GpuDriven    { get; init; }
     // Full-res R8 RT sun-shadow mask (1 lit / 0 shadowed) — null until RT shadows first run; the orchestrator
     // owns it (allocated/dispatched inline before deferred). The deferred pass (chunk 9) binds it to t12 when

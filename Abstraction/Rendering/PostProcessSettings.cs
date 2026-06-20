@@ -210,6 +210,16 @@ public sealed class PostProcessSettings {
     public int ShadowFiltering { get; set; } = 1;        // 0 = hard, 1 = PCF, 2 = PCSS
     public float ShadowSoftness { get; set; } = 2f;      // PCSS penumbra scale (1 = physical)
 
+    // VIRTUAL SHADOW MAPS (DX12) — opt-in clipmap-array sun shadows (the UE5-VSM equivalent: camera-anchored,
+    // log2 clipmap levels, per-level caching → effectively unlimited resolution near the camera). Replaces the
+    // cascaded shadow path when enabled (env door BALLISTIC_DX12_VSM=1 also forces it on). OFF by default →
+    // the cascade path renders, byte-identical. VsmResolution = per-level texel size; VsmClipmapLevels = number
+    // of log2 levels (more = farther coverage); VsmLevel0Extent = world half-extent of the densest level 0.
+    public bool UseVirtualShadowMaps { get; set; }
+    public int VsmResolution { get; set; } = 2048;
+    public int VsmClipmapLevels { get; set; } = 12;
+    public float VsmLevel0Extent { get; set; } = 4f;     // metres half-extent of level 0 (level i = 2^i × this)
+
     // Contact (screen-space) shadows: a short depth-buffer ray march toward the sun that catches
     // the fine object-to-ground occlusion the cascades miss at their texel size. Off by default.
     public bool ContactShadowsEnabled { get; set; }
