@@ -576,13 +576,14 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         //        the lightly-filtered iter-0 result, not the raw temporal and not the over-blurred final).
         //   3) lastResolved = final a-trous colour -> the combine reads it.
         // A deterministic capture KEEPS SVGF (it converges to a fixed point on a static camera -> still reproducible).
-        void MakeUav(Dx12OffscreenTarget t, System.IntPtr cpu) =>
+        void MakeUav(Dx12OffscreenTarget t, CpuDescriptorHandle cpu) =>
             dev.Device.CreateUnorderedAccessView(t.RenderTarget, null, new UnorderedAccessViewDescription
             { Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D }, cpu);
         uint dispX = (uint)((indirect.Width + 7) / 8), dispY = (uint)((indirect.Height + 7) / 8);
+        Matrix4x4.Invert(ctx.ViewProj, out Matrix4x4 svgfInvVP);
         var svgfBase = new SvgfConstants
         {
-            InvViewProj = Matrix4x4.Transpose(invVP),
+            InvViewProj = Matrix4x4.Transpose(svgfInvVP),
             CameraPos = ctx.CamPos,
             Texel = new Vector2(1f / indirect.Width, 1f / indirect.Height),
             W = (uint)indirect.Width, H = (uint)indirect.Height,

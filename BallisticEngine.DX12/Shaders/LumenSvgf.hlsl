@@ -53,13 +53,13 @@ float3 UnpackNormal(float4 n) { return n.rgb * 2.0 - 1.0; }
 // Reads fresh E + previous history (color+moments) + G-buffer (depth, normal, motion). Writes accumulated color,
 // the variance, and the updated moments/history-length. Disocclusion -> reset with spatial variance bootstrap.
 Texture2D<float4>   InE         : register(t0);   // fresh single-frame E (rgb), depth in .a from the integrate
-Texture2D<float4>   HistColor   : register(t1);   // prev: .rgb accumulated color C, .a = m1 (luminance moment 1)
-Texture2D<float4>   HistMoments : register(t2);   // prev: .r=m2, .g=N, .b=prevCamDist, .a=packed-normal-z proxy unused
+Texture2D<float4>   HistColor   : register(t1);   // prev: .rgb accumulated color C (.a is the à-trous-clobbered 1.0 — UNUSED)
+Texture2D<float4>   HistMoments : register(t2);   // prev: .r=m2, .g=N, .b=prevCamDist, .a=m1 (luminance moment 1) — see BUG#2 fix
 Texture2D<float>    Depth       : register(t3);   // current full-res depth [0,1]
 Texture2D<float4>   Normal      : register(t4);   // current world normal (packed N*0.5+0.5)
 Texture2D<float2>   Motion      : register(t5);   // RT4 = prevUV - currUV (unjittered)
-RWTexture2D<float4> OutColor    : register(u0);   // .rgb accumulated color, .a = m1
-RWTexture2D<float4> OutMoments  : register(u1);   // .r=m2, .g=N, .b=camDist, .a=variance (next-frame history)
+RWTexture2D<float4> OutColor    : register(u0);   // .rgb accumulated color (.a unused — the à-trous overwrites it)
+RWTexture2D<float4> OutMoments  : register(u1);   // .r=m2, .g=N, .b=camDist, .a=m1 (the moment store SURVIVES — never touched by à-trous)
 RWTexture2D<float4> OutVariance : register(u2);   // .r = scalar variance handed straight to the à-trous VarIn (RGBA16F.r)
 
 // Spatial variance bootstrap (SVGF 4.2): when history is missing/young, estimate variance from a 7x7 bilateral
@@ -96,15 +96,15 @@ void CSSvgfTemporal(uint3 dtid : SV_DispatchThreadID) {
     float depth = Depth.SampleLevel(LinearClamp, uv, 0).r;
     float lum = Lum(E);
 
-    // Sky / invalid → passthrough, mark reset (N=1) so it never feeds a stale history.
+    // Sky / invalid → passthrough, mark reset (N=1) so it never feeds a stale history. Moments .a = m1 = lum.
     if (depth >= 1.0) {
-        OutColor[px]   = float4(E, lum);
-        OutMoments[px] = float4(lum * lum, 1.0, 1e6, 0.0);
+        OutColor[px]   = float4(E, 0.0);
+        OutMoments[px] = float4(lum * lum, 1.0, 1e6, lum);
         OutVariance[px] = float4(0, 0, 0, 0);
         return;
     }
     float3 nc = UnpackNormal(Normal.SampleLevel(LinearClamp, uv, 0));
-    if (dot(nc, nc) < 0.1) { OutColor[px] = float4(E, lum); OutMoments[px] = float4(lum*lum, 1.0, 1e6, 0.0); OutVariance[px] = float4(0,0,0,0); return; }
+    if (dot(nc, nc) < 0.1) { OutColor[px] = float4(E, 0.0); OutMoments[px] = float4(lum*lum, 1.0, 1e6, lum); OutVariance[px] = float4(0,0,0,0); return; }
     nc = normalize(nc);
     float zc = CamDist(WorldFromUvDepth(uv, depth));
 
@@ -124,7 +124,10 @@ void CSSvgfTemporal(uint3 dtid : SV_DispatchThreadID) {
             // a-trous to catch silhouettes. (A prev-normal channel can be added later if needed.)
             if (acceptZ) {
                 consistent = true;
-                Cprev = San(hc.rgb); m1prev = hc.a; m2prev = hm.r; Nprev = hm.g;
+                // BUG#2 fix: m1 is read from the MOMENTS buffer (hm.a), NOT the color buffer (hc.a). The color
+                // buffer's .a is clobbered to 1.0 by the à-trous feedback, so reading m1 from there collapsed the
+                // variance estimate (m2-m1² → negative → 0 → à-trous stopped denoising). Color comes from hc.rgb.
+                Cprev = San(hc.rgb); m1prev = hm.a; m2prev = hm.r; Nprev = hm.g;
             }
         }
     }
@@ -147,8 +150,10 @@ void CSSvgfTemporal(uint3 dtid : SV_DispatchThreadID) {
         variance = SpatialVarianceBootstrap(px, uv, zc, nc);
     }
 
-    OutColor[px]    = float4(San(C), m1);
-    OutMoments[px]  = float4(m2, N, zc, max(variance, 0.0));
+    // BUG#2 fix: m1 now lives in the MOMENTS buffer's .a (it survives — à-trous never touches svgfMoments). The
+    // colour buffer's .a is free (the à-trous overwrites it with 1.0; harmless). Variance goes to its own buffer.
+    OutColor[px]    = float4(San(C), 0.0);
+    OutMoments[px]  = float4(m2, N, zc, m1);
     OutVariance[px] = float4(max(variance, 0.0), 0, 0, 0);
 }
 
