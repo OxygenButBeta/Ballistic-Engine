@@ -233,6 +233,15 @@ Triage flow per phase: `bal perf <scene>` for the relative pass deltas + `Render
 > vs-DrawIndexed rasterization nuance (single draw, no cull, no order → not slot/order/material/MVP) — visually
 > imperceptible, needs RenderDoc to pin. Whole-mesh default path stays byte-identical. R3a remains opt-in; the
 > sub-pixel residual is the only thing between it and default-ON.
+>
+> **RESOLVED-AS-INHERENT (2026-06-20).** Heatmap of R4-vs-ExecuteIndirect: maxError 0.0026 (< 1 LSB at 8-bit),
+> **hotspotError 6e-6** (the 32×32 region budget ≈ 0), differentPct 0 → SCATTERED single edge pixels, NOT
+> clustered. That's a rasterization tie-break: two DIFFERENT geometry pipelines (mesh-shader emit vs ExecuteIndirect
+> IA-raster; CPU-DrawIndexed vs ExecuteIndirect) are NOT required by the D3D12 spec to rasterize a triangle bit-
+> identically at coverage-boundary pixels. RenderDoc can't "fix" it — inherent. **Decision:** the R3a/R4 default-ON
+> gate is PERCEPTUAL parity (meanError 0, hotspot ≈ 0, < 1 LSB), which they pass — NOT byte-identical. Byte-
+> identical is the bar only for SAME-pipeline A/B (R2 CPU-bindless == CPU-descriptor; R3b compute-skin == VS-skin),
+> which they achieve.
 
 ### R3 — Collapse CPU per-submesh paths into unified GPU-driven ExecuteIndirect
 
