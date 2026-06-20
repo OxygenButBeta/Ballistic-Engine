@@ -143,6 +143,69 @@ public sealed class Style
 
     // ---------------------------------------------------------------- helpers
 
+    // P2.1 — reset EVERY property to its CSS/web default and push the defaults through to the LayoutNode.
+    // The resolved-style pipeline (StyleResolver) calls this before re-applying inherited + matched + inline
+    // declarations, so a removed class or a cleared :hover state REVERTS to base instead of sticking (the
+    // additive-cascade bug). Layout props go through the setters so Yoga is reset too; visual props are
+    // assigned directly. Keep this in sync with the field initializers above.
+    public void ResetToDefaults()
+    {
+        // layout: flex container
+        FlexDirection = FlexDirection.Row;
+        FlexWrap = FlexWrap.NoWrap;
+        JustifyContent = Justify.FlexStart;
+        AlignItems = Align.Stretch;
+        AlignContent = Align.FlexStart;
+        AlignSelf = Align.Auto;
+        // layout: flex item
+        FlexGrow = 0f;
+        FlexShrink = 1f;
+        FlexBasis = Length.Auto;
+        Position = PositionType.Relative;
+        Display = DisplayStyle.Flex;
+        Overflow = Overflow.Visible;
+        // layout: box size
+        Width = Length.Auto;
+        Height = Length.Auto;
+        MinWidth = 0f; MinHeight = 0f; MaxWidth = float.NaN; MaxHeight = float.NaN;
+        // layout: edges (reset all four on each)
+        L.SetMarginPoints(Edge.All, 0f);
+        L.SetPaddingPoints(Edge.All, 0f);
+        SetBorderWidth(Edge.All, 0f);
+        L.SetPositionPoints(Edge.Left, 0f); L.SetPositionPoints(Edge.Top, 0f);
+        L.SetPositionPoints(Edge.Right, 0f); L.SetPositionPoints(Edge.Bottom, 0f);
+        // visual
+        BackgroundColor = Color.Transparent;
+        BackgroundGradient = null;
+        BorderColor = Color.Transparent;
+        BorderRadius = 0f;
+        TextColor = Color.White;
+        FontSize = 14f;
+        Opacity = 1f;
+        TranslateX = 0f; TranslateY = 0f; RotationDegrees = 0f; Scale = 1f;
+        FontFamily = null;
+        LetterSpacing = 0f;
+        TextAlign = null;
+        HasTextShadow = false;
+        TextShadowOffsetX = 0f; TextShadowOffsetY = 0f; TextShadowBlur = 0f;
+        TextShadowColor = Color.Transparent;
+    }
+
+    // Inherited properties (CSS-inherited subset, P2.3): a child that doesn't override these takes the
+    // parent's RESOLVED value. Copies from `parent` into this style as the inheritance baseline, BEFORE
+    // matched rules/inline run (so an explicit child rule still wins). Mirrors UITK's inherited set.
+    public void InheritFrom(Style parent)
+    {
+        if (parent == null) return;
+        TextColor = parent.TextColor;
+        FontSize = parent.FontSize;
+        FontFamily = parent.FontFamily;
+        LetterSpacing = parent.LetterSpacing;
+        TextAlign = parent.TextAlign;
+        // visibility-ish: opacity is NOT inherited in CSS (it composites) — the walker already multiplies
+        // opacity down the tree, so we leave Opacity per-element here.
+    }
+
     static void ApplyLength(Length len, System.Action<float> points, System.Action<float> percent, System.Action auto)
     {
         switch (len.Unit)

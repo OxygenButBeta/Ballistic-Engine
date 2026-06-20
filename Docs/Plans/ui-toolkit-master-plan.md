@@ -48,7 +48,14 @@ Fix every confirmed DX12-renderer finding so the live path (R5) is built on soli
 - **P1.10 Image ScaleToFit/Crop** (med): real object-fit UV math (needs source aspect — query resource).
 - **P1.11 slot0 seed leak + clip-stack imbalance reset + zero-size early-out** (low): tidy-ups.
 
-## P2 — Resolved-style architecture   [the keystone]
+## P2 — Resolved-style architecture   [the keystone]   ✅ DONE (P2.5/P2.9 deferred)
+
+> Status: P2.1/2.2/2.3/2.4/2.6/2.7/2.8/2.10 implemented + proven (16/16 headless tests). `StyleResolver`
+> resolves from scratch (defaults → inherit → matched[normal] → inline[normal] → matched[important] →
+> inline[important]); :hover/:active/:focus apply AND revert; var()/!important/combinators/hsl/named work.
+> Deferred: P2.5 transitions (transition parse is a no-op for now — real tween bridge needs the P5 state
+> flow), P2.9 cascade perf bucketing (correctness first; optimize once profiled).
+
 
 Replace the write-only `Style` accumulator with a computed-style model: matched-rule-set → resolved
 style with a revertible baseline. This single change unblocks the cluster of "cascade" bugs.

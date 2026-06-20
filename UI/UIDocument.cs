@@ -77,7 +77,9 @@ public class UIDocument : Behaviour
     [NotSerialized] public float ResolvedScale { get; private set; } = 1f;
 
     readonly UIInputModule _input = new();
-    StyleSheet _sheet;
+    // Parsed stylesheets, in application order. `Uss` may name several sheets (newline/comma/semicolon
+    // separated) so a design can split base/theme/component sheets (P2.8). Single sheet = list of one.
+    readonly System.Collections.Generic.List<StyleSheet> _sheets = new();
 
     // Per-document tween engine for selection slides, fades, pulses (driven by the controller). Ticked
     // each frame in UpdateFrame before layout solves, so animated values are current when drawn.
@@ -131,30 +133,46 @@ public class UIDocument : Behaviour
         Root = UxmlLoader.LoadFromText(uxmlText);
         if (Root == null) return;
 
-        // Apply the stylesheet cascade. To preserve CSS precedence (inline > stylesheet), the loader
-        // records each element's inline declarations and we re-assert them AFTER the sheet runs — so a
-        // class rule can't clobber an explicit inline value. See UxmlLoader.CaptureInline.
-        _sheet = string.IsNullOrEmpty(Uss) ? null : StyleSheet.Parse(ResolveText(Uss) ?? "");
+        // Parse stylesheets. The resolved-style pipeline (StyleResolver) handles precedence — defaults →
+        // inheritance → matched rules (specificity) → inline — so no separate inline re-assert is needed.
+        _sheets.Clear();
+        if (!string.IsNullOrEmpty(Uss))
+        {
+            foreach (var path in Uss.Split(new[] { ',', ';', '\n', '\r' }, System.StringSplitOptions.RemoveEmptyEntries))
+            {
+                string ussText = ResolveText(path.Trim());
+                if (!string.IsNullOrEmpty(ussText))
+                    _sheets.Add(StyleSheet.Parse(ussText));
+            }
+        }
         ApplyStyles();
     }
 
-    // Re-runs the stylesheet cascade over the whole tree. Call after building dynamic content (rows,
-    // lists) so elements added AFTER Rebuild() pick up their USS — otherwise their classes were added
-    // after the initial cascade and they'd render unstyled. Public so controllers can invoke it.
+    // Re-resolve the whole tree from scratch (defaults → inherit → matched → inline). Call after building
+    // dynamic content (rows, lists) so new elements pick up their USS, or after bulk class changes. Single
+    // elements changing state use the per-element restyle path (RestyleElement) instead. Public so
+    // controllers can invoke it.
     public void ApplyStyles()
     {
         if (Root == null) return;
-        _sheet?.Apply(Root);
-        // Inline wins: re-apply captured inline declarations last.
-        ReassertInline(Root);
+        AssignOwner(Root);                       // so class/state changes route restyle requests back here
+        StyleResolver.ResolveTree(Root, _sheets, Root.Parent?.Style);
+        _restyleDirty.Clear();                    // a full resolve subsumes any queued per-element restyles
     }
 
-    static void ReassertInline(VisualElement el)
+    void AssignOwner(VisualElement el)
     {
-        if (el.InlineStyle != null)
-            StyleApplier.ApplyInline(el.Style, el.InlineStyle);
-        foreach (var c in el.Children)
-            ReassertInline(c);
+        el.OwnerDocument = this;
+        var children = el.Children;
+        for (int i = 0; i < children.Count; i++) AssignOwner(children[i]);
+    }
+
+    // Re-resolve one element + its inheriting subtree (P2.2). Called when a class/state toggles so
+    // :hover/:active/:focus and dynamic class changes revert correctly without a full-tree pass.
+    public void RestyleElement(VisualElement el)
+    {
+        if (el == null) return;
+        StyleResolver.ResolveTree(el, _sheets, el.Parent?.Style);
     }
 
     // ---- per-frame ----
@@ -165,9 +183,30 @@ public class UIDocument : Behaviour
     // calls ProcessInput separately. Kept as UpdateFrame for the renderer's existing call.
     public void UpdateFrame(Rect viewport) => UpdateFrame(viewport, 0f);
 
+    // Elements whose class/state changed this frame and need a from-scratch restyle before layout (P2.2).
+    readonly System.Collections.Generic.HashSet<VisualElement> _restyleDirty = new();
+
+    // Queue an element for restyle on the next UpdateFrame. Called by VisualElement when a class or
+    // :hover/:active/:focus state toggles. Deduped via the set so a burst of class changes costs one
+    // resolve. Safe to call before UpdateFrame; flushed there.
+    internal void MarkRestyleDirty(VisualElement el)
+    {
+        if (el != null) _restyleDirty.Add(el);
+    }
+
     public void UpdateFrame(Rect viewport, float dt)
     {
         if (Root == null) return;
+
+        // Flush pending restyles (hover/active/focus/class changes) BEFORE layout so the resolved style —
+        // including any size/flex change a state rule made — feeds this frame's solve. Re-resolving an
+        // element also re-resolves its inheriting subtree.
+        if (_restyleDirty.Count > 0)
+        {
+            foreach (var el in _restyleDirty)
+                StyleResolver.ResolveTree(el, _sheets, el.Parent?.Style);
+            _restyleDirty.Clear();
+        }
 
         // Advance animations first so tweened/looped values are current before layout + draw.
         if (dt > 0f) Animator.Tick(dt);
