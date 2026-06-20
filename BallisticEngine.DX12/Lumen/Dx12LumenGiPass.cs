@@ -116,10 +116,6 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     // Runs on `indirect` after the trace/gather, reprojecting the resolved history with the REAL G-buffer motion
     // vector (RT4) + neighbourhood AABB clamp + disocclusion reject. Replaces both the per-pixel inline temporal
     // (camera-only) and gives the screen-probe path a temporal it never had. `probeHistory` is the resolved history.
-    ID3D12RootSignature tempRootSig;   // CBV b0 + table{t0 InE, t1 History, t2 Depth, t3 Motion, u0 OutE} + sampler
-    ID3D12PipelineState tempPso;
-    Dx12FrameCb<TemporalConstants> tempCb;   // P0b N-buffered
-    Dx12DescriptorHeap tempSrv;        // 5 descriptors/frame
     Dx12OffscreenTarget indirectResolved; // temporal output (ping target so we don't read+write `indirect` in place)
     // The buffer the trace phase left the final filtered/resolved E in — the combine reads THIS (not a fixed field)
     // so the ping-pong path can hand the combine `indirectResolved` directly without a Copy into `indirectFiltered`.
@@ -1241,35 +1237,9 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         BuildTemporalPipeline();
     }
 
-    // Common motion-vector temporal resolve pipeline (LumenTemporal.hlsl): CBV b0 + table{t0 InE, t1 History,
-    // t2 Depth, t3 Motion (SRV) + u0 OutE (UAV)} + linear-clamp sampler.
-    unsafe void BuildTemporalPipeline()
-    {
-        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var srv = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 4, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 0);
-        var uav = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 4);
-        var table = new RootParameter1(new RootDescriptorTable1(srv, uav), ShaderVisibility.All);
-        var samp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
-        {
-            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
-            AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1, ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
-        };
-        tempRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, table }, new[] { samp })));
-
-        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumenTemporal.hlsl");
-        tempPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription
-        {
-            RootSignature = tempRootSig,
-            ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSTemporal", "LumenTemporal.hlsl"),
-        });
-        tempCb = new Dx12FrameCb<TemporalConstants>(dev);
-        tempSrv = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 8,
-            shaderVisible: true, framesInFlight: dev.FramesInFlight);
-
-        BuildSvgfPipeline();
-    }
+    // (Old CSTemporal/CSDenoise pipelines removed — replaced by SVGF. The LumenTemporal.hlsl shader and the
+    // LumenGi.CSDenoise entry are now dead but kept on disk for reference; nothing builds a PSO from them.)
+    unsafe void BuildTemporalPipeline() => BuildSvgfPipeline();
 
     // SVGF pipelines (LumenSvgf.hlsl). Two PSOs sharing one CB type:
     //   CSSvgfTemporal: CBV b0 + table{t0 InE, t1 HistColor, t2 HistMoments, t3 Depth, t4 Normal, t5 Motion (SRV),
@@ -1539,7 +1509,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         if (denoiseCbs != null) foreach (var cb in denoiseCbs) cb?.Dispose();
         combinePso?.Dispose(); combineDebugPso?.Dispose(); combineRootSig?.Dispose(); combineSrv?.Dispose(); combineCb?.Dispose();
         indirect?.Dispose(); indirectFiltered?.Dispose(); indirectFilteredB?.Dispose(); probeHistory?.Dispose();
-        tempPso?.Dispose(); tempRootSig?.Dispose(); tempCb?.Dispose(); tempSrv?.Dispose(); indirectResolved?.Dispose();
+        indirectResolved?.Dispose();
         spPlacePso?.Dispose(); spTracePso?.Dispose(); spIntegratePso?.Dispose(); spFilterPso?.Dispose(); spRootSig?.Dispose();
         probeAtlasFiltered?.Dispose();
         spProbeCb?.Dispose(); spSunCb?.Dispose();
