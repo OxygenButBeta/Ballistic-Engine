@@ -208,6 +208,19 @@ Triage flow per phase: `bal perf <scene>` for the relative pass deltas + `Render
 >
 > **R2 production validation (this session): split-import + GPUDRIVEN on, CPU_BINDLESS=1 == OFF byte-identical** on
 > the split fixture — R2's "needs a split-import scene" gap is now closed.
+>
+> **R3a residual 0.4% — isolation (2026-06-20):** Narrowed but not eliminated. Controls:
+> - whole-mesh **GPU-driven == CPU descriptor-table byte-identical** (CornellBox, Hi-Z off) — the GPU-driven
+>   path/cull/meta/shader is correct in isolation.
+> - single-submesh split, Hi-Z off, **R3a(GPU ExecuteIndirect) vs R2(CPU bindless DrawIndexed)**: same material
+>   table + same GBufferBindless.hlsl + same Transpose(model*viewProj) Mvp (GpuCull passes SubmeshMeta.Mvp through,
+>   does NOT recompute) → STILL 0.002 meanError / 0.4% px. So the delta is NOT shader, NOT material, NOT MVP, NOT
+>   Hi-Z, NOT multi-split — it's a pixel-level ExecuteIndirect-vs-DrawIndexed nuance that does NOT appear for
+>   whole-mesh (where the GPU-vs-CPU control is byte-identical). Leading remaining hypotheses: a per-frame draw-
+>   ORDER difference (ExecuteIndirect emits in cull-slot order; the CPU loop in renderer-iteration order — with
+>   depth-equal coplanar fragments at box seams the last-writer differs) OR a conservative-raster/PSO-state nuance.
+>   0.002 meanError is visually imperceptible; R3a is opt-in + hang-safe + already captures the CPU→indirect
+>   submit win. Resolving the 0.4% (likely the draw-order tie-break at coplanar seams) is the gate to default-ON.
 
 ### R3 — Collapse CPU per-submesh paths into unified GPU-driven ExecuteIndirect
 
