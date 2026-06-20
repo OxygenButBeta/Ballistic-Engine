@@ -21,7 +21,7 @@ internal static class ImGuiBoundaryTests {
     public static int Run() {
         var h = new Harness();
 
-        string repoRoot = FindRepoRoot();
+        string? repoRoot = FindRepoRoot();
         if (repoRoot is null) {
             // Can't locate the source tree (e.g. running from a packaged drop) — don't fail the suite,
             // but make the skip visible so it isn't a silent pass.
