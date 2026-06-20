@@ -55,10 +55,20 @@ public static class UIRenderWalker
         if (offsetX != 0f || offsetY != 0f)
             rect = new Rect(rect.X + offsetX, rect.Y + offsetY, rect.Width, rect.Height);
 
+        Vector4 radius = ClampRadius(rect, s);
+
+        // --- box-shadow (P6.1): drawn BEHIND the element ---
+        if (s.HasBoxShadow && s.BoxShadowColor.A > 0f)
+            r.DrawShadow(rect, radius, s.BoxShadowOffsetX, s.BoxShadowOffsetY, s.BoxShadowBlur,
+                         s.BoxShadowSpread, Premultiply(s.BoxShadowColor, opacity));
+
+        // --- backdrop blur (P6.2): frost what's behind, before the element's own fill ---
+        if (s.BackdropBlur > 0f)
+            r.DrawBackdropBlur(rect, radius, s.BackdropBlur);
+
         // --- self: background + border (skip when nothing is visible) ---
         Color border = Premultiply(s.BorderColor, opacity);
         float borderWidth = ResolveBorderWidth(el);
-        Vector4 radius = ClampRadius(rect, s);
 
         if (s.BackgroundGradient != null)
         {
@@ -88,6 +98,8 @@ public static class UIRenderWalker
                 Align = s.TextAlign ?? label.TextAlign,
                 FontFamily = s.FontFamily,
                 LetterSpacing = s.LetterSpacing,
+                Bold = s.Bold,
+                Italic = s.Italic,
                 HasShadow = s.HasTextShadow,
                 ShadowOffsetX = s.TextShadowOffsetX,
                 ShadowOffsetY = s.TextShadowOffsetY,

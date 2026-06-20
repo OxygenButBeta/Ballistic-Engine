@@ -157,6 +157,21 @@ public sealed class Style
     public WhiteSpace WhiteSpace = WhiteSpace.NoWrap;   // Unity/UITK default is nowrap
     public TextOverflow TextOverflow = TextOverflow.Clip;
 
+    // CSS box-shadow (P6.1): an offset + blur + spread + color drop shadow drawn BEHIND the element's box.
+    // HasBoxShadow gates it. (Single shadow in v1; CSS allows a list.)
+    public bool HasBoxShadow;
+    public float BoxShadowOffsetX, BoxShadowOffsetY, BoxShadowBlur, BoxShadowSpread;
+    public Color BoxShadowColor = Color.Transparent;
+
+    // CSS backdrop-filter: blur(px) (P6.2) — frosted-glass: the scene/UI behind this element is blurred
+    // within its box before the element draws. 0 = off.
+    public float BackdropBlur;
+
+    // Font weight/style (P6.4): selects a bold/italic atlas variant by family-name convention when the
+    // renderer has one registered (e.g. "Inter" + Bold -> "Inter-Bold").
+    public bool Bold;
+    public bool Italic;
+
     // ---------------------------------------------------------------- helpers
 
     // P2.1 — reset EVERY property to its CSS/web default and push the defaults through to the LayoutNode.
@@ -209,6 +224,11 @@ public sealed class Style
         TextShadowColor = Color.Transparent;
         WhiteSpace = WhiteSpace.NoWrap;
         TextOverflow = TextOverflow.Clip;
+        HasBoxShadow = false;
+        BoxShadowOffsetX = 0f; BoxShadowOffsetY = 0f; BoxShadowBlur = 0f; BoxShadowSpread = 0f;
+        BoxShadowColor = Color.Transparent;
+        BackdropBlur = 0f;
+        Bold = false; Italic = false;
     }
 
     // Inherited properties (CSS-inherited subset, P2.3): a child that doesn't override these takes the
@@ -224,6 +244,8 @@ public sealed class Style
         TextAlign = parent.TextAlign;
         WhiteSpace = parent.WhiteSpace;
         TextOverflow = parent.TextOverflow;
+        Bold = parent.Bold;
+        Italic = parent.Italic;
         // visibility-ish: opacity is NOT inherited in CSS (it composites) — the walker already multiplies
         // opacity down the tree, so we leave Opacity per-element here.
     }

@@ -127,7 +127,17 @@ Staged by dependency + frequency. Each = element + USS default style + INotifyVa
 - **P5.7 ListView / virtualized list** — the UITK perf control for big feeds.
 - **P5.8 ProgressBar, Tooltip, ContextMenu, ModalDialog**.
 
-## P6 — Effects
+## P6 — Effects   ✅ CORE DONE (rounded-clip/real-blur/nine-slice deferred)
+
+> Status: P6.1 box-shadow (SDF soft-falloff shadow behind the box, CSS box-shadow parse) + P6.4 bold/
+> italic (font-weight/style → UIFonts variant by name convention, falls back to base) implemented +
+> proven (5/5). P6.2 backdrop-blur: plumbed end-to-end (Style.BackdropBlur, DrawBackdropBlur, CSS
+> backdrop-filter); REAL blur needs a readable copy of the composited frame (read+write same RT is
+> illegal) — Dx12UIRenderer.SetBackdropSource is the hook for the renderer-merge; until then it draws a
+> faint frost so it's never a silent no-op. DEFERRED: P6.6 rounded-corner clip (current clip is
+> rectangular scissor; rounded needs a per-quad shader clip-rect+radius — a vertex-format addition),
+> P6.3 nine-slice/border-image, P6.5 outline/cursor/filter/text-transform (niche; add on demand).
+
 
 - **P6.1 box-shadow** element drop shadow (SDF-expanded blurred rect behind).
 - **P6.2 Backdrop blur / glassmorphism** (sample UI/scene backbuffer, separable blur) — Claude signature.

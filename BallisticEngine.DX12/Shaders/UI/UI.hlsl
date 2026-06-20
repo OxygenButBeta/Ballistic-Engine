@@ -104,6 +104,21 @@ float4 PSMain(VSOut i) : SV_Target
         return float4(i.color.rgb, i.color.a * alpha);
     }
 
+    // --- mode 4: box-shadow — SDF rounded box with a soft falloff over `bwidth` px outside the edge ---
+    if (i.mode == 4u)
+    {
+        float2 hh = i.rect.zw;
+        float rr = cornerRadius(i.local, i.radius);
+        rr = min(rr, min(hh.x, hh.y));
+        float d = sdRoundedBox(i.local, hh, rr);   // <0 inside, >0 outside the (spread-expanded) box
+        float blur = max(i.bwidth, 0.5);
+        // 1 inside, smoothly -> 0 at +blur outside. (Approximate gaussian with smoothstep — cheap, good.)
+        float a = 1.0 - smoothstep(0.0, blur, d);
+        a *= i.color.a;
+        if (a <= 0.0) discard;
+        return float4(i.color.rgb, a);
+    }
+
     // --- mode 3: image (RGBA texture * tint), clipped to the rounded box ---
     if (i.mode == 3u)
     {

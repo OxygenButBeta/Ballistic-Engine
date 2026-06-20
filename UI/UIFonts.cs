@@ -40,5 +40,20 @@ public static class UIFonts
         return _default;
     }
 
+    // Resolves a family + weight/style to a variant atlas by name convention (P6.4): "Inter" + bold ->
+    // "Inter-Bold", + italic -> "Inter-Italic", + both -> "Inter-BoldItalic". Falls back to the plain
+    // family, then Default, if a variant isn't registered — so bold text degrades to regular, never blank.
+    public static FontAtlas Resolve(string family, bool bold, bool italic)
+    {
+        if (!bold && !italic) return Resolve(family);
+        if (!string.IsNullOrEmpty(family))
+        {
+            string suffix = bold && italic ? "-BoldItalic" : bold ? "-Bold" : "-Italic";
+            if (_byName.TryGetValue(family + suffix, out var v)) return v;
+            if (_byName.TryGetValue(family, out var b)) return b;
+        }
+        return _default;
+    }
+
     public static IReadOnlyDictionary<string, FontAtlas> All => _byName;
 }

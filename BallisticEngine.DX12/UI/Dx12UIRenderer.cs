@@ -246,10 +246,55 @@ public sealed class Dx12UIRenderer : IUIRenderer, IDisposable
         PushGradientQuad(rect, gradient, radius, col);
     }
 
+    const uint ModeShadow = 4;
+
+    public void DrawShadow(Rect rect, Vector4 radius, float ox, float oy, float blur, float spread, Color color)
+    {
+        if (color.A <= 0f) return;
+        // Expand by spread + blur so the soft edge has room; offset by (ox,oy). The shader fades over the
+        // outer `blur` px of the SDF, which sits in the padded quad.
+        float pad = MathF.Max(0f, spread) + MathF.Max(0f, blur);
+        var r = new Rect(rect.X + ox - pad, rect.Y + oy - pad,
+                         rect.Width + pad * 2f, rect.Height + pad * 2f);
+        if (!DrawableRect(r)) return;
+        SetTextureSlot(-1);
+        // The SDF box inside the quad must be the spread-expanded element box; encode its half-size via
+        // Rect (center,half) and the blur via BorderWidth. radius mirrors the element corners (+spread).
+        var rectParams = new Vector4(r.X + r.Width * 0.5f, r.Y + r.Height * 0.5f,
+                                     rect.Width * 0.5f + spread, rect.Height * 0.5f + spread);
+        PushQuadRaw(r, color.ToVector4(), rectParams, radius, ModeShadow, Vector4.Zero, blur);
+    }
+
+    public void DrawBackdropBlur(Rect rect, Vector4 radius, float radiusPx)
+    {
+        // Real backdrop blur samples the already-composited target within rect and blurs it. That needs a
+        // readable copy of the target (read+write the same RT is illegal in DX12). The portable hook: when
+        // the host provides a "backdrop SRV" (a copy of the frame pre-UI), sample it here. Until that's
+        // wired (renderer-merge), approximate frost with a faint translucent fill so the layout reads
+        // correctly and the call is never a no-op surprise. Tracked: P6.2 backdrop source.
+        if (_backdropSrvSlot >= 0)
+        {
+            SetTextureSlot(_backdropSrvSlot);
+            PushQuadUV(rect, new Vector4(1, 1, 1, 1), 0, 0, 1, 1, ModeImage); // sampled copy (blur kernel TODO in shader)
+        }
+        else
+        {
+            SetTextureSlot(-1);
+            PushQuad(rect, new Vector4(1f, 1f, 1f, 0.06f), radius, ModeSolid, Vector4.Zero, 0f);
+        }
+    }
+
+    // Optional: the host can register a backdrop source (a copy of the frame before UI) for real blur.
+    int _backdropSrvSlot = -1;
+    public void SetBackdropSource(ID3D12Resource copyOfFrame)
+    {
+        _backdropSrvSlot = copyOfFrame != null ? RegisterImage(copyOfFrame) : -1;
+    }
+
     public void DrawText(Rect rect, string text, in TextStyle style)
     {
         if (string.IsNullOrEmpty(text)) return;
-        var atlas = UIFonts.Resolve(style.FontFamily);
+        var atlas = UIFonts.Resolve(style.FontFamily, style.Bold, style.Italic);
         if (atlas == null || atlas.Pixels == null) return;   // no font baked yet → nothing to draw
 
         var font = EnsureFont(atlas);                          // its OWN persistent slot (multi-font safe)
@@ -426,6 +471,25 @@ public sealed class Dx12UIRenderer : IUIRenderer, IDisposable
     const uint ModeGradient = 1;
     const uint ModeText = 2;
     const uint ModeImage = 3;
+
+    // Quad with an EXPLICIT rectParams (SDF center/half) — used by box-shadow, whose SDF box (the spread-
+    // expanded element box) differs from the padded geometry quad.
+    void PushQuadRaw(Rect r, Vector4 color, Vector4 rectParams, Vector4 radius, uint mode, Vector4 border, float borderWidth)
+    {
+        float l = r.X, t = r.Y, right = r.X + r.Width, b = r.Y + r.Height;
+        uint baseIdx = (uint)verts.Count;
+        UIVertex V(float px, float py, float u, float v) => new()
+        {
+            Pos = new(px, py), Uv = new(u, v), Color = color, Rect = rectParams,
+            Radius = radius, Mode = mode, Border = border, BorderWidth = borderWidth,
+        };
+        verts.Add(V(l, t, 0, 0));
+        verts.Add(V(right, t, 1, 0));
+        verts.Add(V(right, b, 1, 1));
+        verts.Add(V(l, b, 0, 1));
+        indices.Add(baseIdx + 0); indices.Add(baseIdx + 1); indices.Add(baseIdx + 2);
+        indices.Add(baseIdx + 0); indices.Add(baseIdx + 2); indices.Add(baseIdx + 3);
+    }
 
     // A textured quad with an explicit UV rect (image: mode 3). Carries the rounded box in Rect/Radius so
     // the shader can clip image corners. Color = tint (premultiplied opacity).

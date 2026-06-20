@@ -191,6 +191,13 @@ public static class StyleApplier
             case "translate-y": style.TranslateY = ParsePx(value); break;
             case "font-family": style.FontFamily = ParseFontFamily(value); break;
             case "text-shadow": ApplyTextShadow(style, value); break;
+            case "box-shadow": ApplyBoxShadow(style, value); break;
+            case "backdrop-filter":
+            case "-webkit-backdrop-filter": style.BackdropBlur = ParseBlurPx(value); break;
+            case "font-weight":
+                style.Bold = value.Trim() is "bold" or "700" or "800" or "900"
+                    || (int.TryParse(value.Trim(), out var fw) && fw >= 600); break;
+            case "font-style": style.Italic = value.Trim().Equals("italic", StringComparison.OrdinalIgnoreCase); break;
             // letter-spacing in px or em (em resolved against the current font size, like CSS).
             case "letter-spacing": style.LetterSpacing = ParseEmOrPx(value, style.FontSize); break;
             case "text-align":
@@ -271,6 +278,37 @@ public static class StyleApplier
                 style.TextShadowColor = col;
             }
         }
+    }
+
+    // box-shadow: "offsetX offsetY blur [spread] color" (CSS). "none" clears. Picks the first shadow in a
+    // comma list (v1 draws one). inset is ignored (outer shadow only).
+    static void ApplyBoxShadow(Style style, string value)
+    {
+        if (value.Trim().Equals("none", StringComparison.OrdinalIgnoreCase)) { style.HasBoxShadow = false; return; }
+        var first = SplitTopLevel(value)[0].Trim().Replace("inset", "").Trim();
+        int rgb = first.IndexOf("rgb", StringComparison.OrdinalIgnoreCase);
+        int hash = first.IndexOf('#');
+        int colorStart = rgb >= 0 ? rgb : hash;
+        Color col = Color.Rgba(0, 0, 0, 0.4f);
+        string lengths = first;
+        if (colorStart >= 0) { col = ParseColor(first[colorStart..].Trim()); lengths = first[..colorStart]; }
+        var nums = lengths.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (nums.Length < 2) return;
+        style.HasBoxShadow = true;
+        style.BoxShadowOffsetX = ParsePx(nums[0]);
+        style.BoxShadowOffsetY = ParsePx(nums[1]);
+        style.BoxShadowBlur = nums.Length >= 3 ? ParsePx(nums[2]) : 0f;
+        style.BoxShadowSpread = nums.Length >= 4 ? ParsePx(nums[3]) : 0f;
+        style.BoxShadowColor = col;
+    }
+
+    // "blur(8px)" -> 8. Bare number/px also accepted.
+    static float ParseBlurPx(string v)
+    {
+        v = v.Trim();
+        int open = v.IndexOf('('), close = v.IndexOf(')');
+        if (open >= 0 && close > open) return ParsePx(v[(open + 1)..close]);
+        return ParsePx(v);
     }
 
     static bool TryParseOneShadow(string s, out float ox, out float oy, out float blur, out Color col)
