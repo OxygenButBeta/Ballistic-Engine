@@ -604,6 +604,74 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     // R4 — draw `renderers` through the MESH-SHADER meshlet pipeline (one DispatchMesh per submesh; the AS shader
     // frustum/sphere-culls meshlets). Reuses the bindless material table + cpuPerDraws (PerDraw{Mvp,Model,MatId}).
     // Shading is byte-identical to GBufferBindless (MeshletGBuffer.PSMain is a verbatim copy). Returns draw count.
+    // R5 — exposes the pieces the visibility-buffer pass needs to reuse the GPU-driven substrate.
+    public ulong CpuPerDrawsAddress => cpuPerDraws.GPUVirtualAddress + (ulong)(dev.FrameSlot * cpuPerDrawsFrameStride);
+    public ulong MeshletCullCbAddress { get { EnsureMeshletCullCb(); return meshletCullCb.GPUVirtualAddress + (ulong)(dev.FrameSlot * meshletCullCbStride); } }
+
+    // R5 — raster the visibility id with `visPso`/`visRootSig` (VisBuffer.hlsl). Same meshlet draw loop as
+    // RenderIntoMeshlet but binds only PerDraws(t0)+meshlet SRVs(t2-t6)+cull CB(b2); the vis PS writes only the id.
+    // Fills the meshlet cull CB (frustum+cone+Hi-Z) exactly like RenderIntoMeshlet. Returns the draw count.
+    public unsafe int RenderVis(ID3D12GraphicsCommandList6 cl, List<IStaticMeshRenderer> renderers,
+        ID3D12RootSignature visRootSig, ID3D12PipelineState visPso,
+        Matrix4x4 viewProj, Vector4[] frustumPlanes, Vector3 cameraPos, bool coneCull,
+        Matrix4x4 viewProjUnjittered, Matrix4x4 view, float near, float far, ref int cpuDrawIndex) {
+        if (renderers.Count == 0) return 0;
+        EnsureMeshletCullCb();
+        long cullOff = (long)dev.FrameSlot * meshletCullCbStride;
+        byte* cb = meshletCullCbMapped + cullOff;
+        var pd = (Vector4*)cb;
+        for (int i = 0; i < 6; i++) pd[i] = frustumPlanes[i];
+        pd[6] = new Vector4(cameraPos, coneCull ? 1f : 0f);
+        long oo = 7 * 16;
+        *(Matrix4x4*)(cb + oo) = Matrix4x4.Transpose(viewProjUnjittered); oo += 64;
+        *(Matrix4x4*)(cb + oo) = Matrix4x4.Transpose(view); oo += 64;
+        bool hizOn = hizOnThisFrame && hizBindlessIndex >= 0;
+        *(Vector4*)(cb + oo) = new Vector4(hiz.Width, hiz.Height, hiz.MipCount, near); oo += 16;
+        *(Vector4*)(cb + oo) = new Vector4(far, hizOn ? 1f : 0f, Math.Max(hizBindlessIndex, 0), 0f);
+
+        cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);
+        cl.SetGraphicsRootSignature(visRootSig);
+        cl.SetPipelineState(visPso);
+        cl.SetGraphicsRootShaderResourceView(1, CpuPerDrawsAddress);   // t0 PerDraws
+        cl.SetGraphicsRootConstantBufferView(12, meshletCullCb.GPUVirtualAddress + (ulong)cullOff); // b2 cull
+        int draws = 0;
+        foreach (var r in renderers) {
+            Mesh mesh = r.SharedMesh; if (mesh is null) continue;
+            var pos = mesh.VertexBuffer as Dx12Buffer<GLVector3>;
+            if (pos?.Resource is null) continue;
+            Matrix4x4 model = ToNum(r.Transform.WorldMatrix);
+            Matrix4x4 mvp = model * viewProj;
+            int only = r.SubMeshIndex;
+            int sFirst = only >= 0 ? only : 0;
+            int sLast = only >= 0 ? only : mesh.SubMeshes.Length - 1;
+            cl.SetGraphicsRootShaderResourceView(7, pos.GpuAddress);   // t6 Positions
+            for (int s = sFirst; s <= sLast; s++) {
+                if ((uint)s >= (uint)mesh.SubMeshes.Length) break;
+                SubMeshData sub = mesh.SubMeshes[s];
+                if (sub.IndexCount <= 0) continue;
+                Material mat = r.MaterialFor(s);
+                if (mat is null || mat.Transparent) continue;
+                int mid = materialIds.TryGetValue(mat, out int rid) ? rid : ResolveOrRegisterMaterialId(mat);
+                if (mid < 0) continue;
+                if ((uint)cpuDrawIndex >= MaxCpuDraws) break;
+                long pdo = (long)dev.FrameSlot * cpuPerDrawsFrameStride + (long)cpuDrawIndex * perDrawStride;
+                *(PerDraw*)(cpuPerDrawsMapped + pdo) = new PerDraw {
+                    Mvp = Matrix4x4.Transpose(mvp), Model = Matrix4x4.Transpose(model), MaterialId = (uint)mid,
+                };
+                var ml = Dx12Meshlet.Build(dev, mesh, s);
+                cl.SetGraphicsRootShaderResourceView(3, ml.Meshlets.GPUVirtualAddress);
+                cl.SetGraphicsRootShaderResourceView(4, ml.Bounds.GPUVirtualAddress);
+                cl.SetGraphicsRootShaderResourceView(5, ml.Verts.GPUVirtualAddress);
+                cl.SetGraphicsRootShaderResourceView(6, ml.Prims.GPUVirtualAddress);
+                var rc = new MeshletDrawConst { DrawIndex = (uint)cpuDrawIndex, MeshletBase = 0, MeshletCount = (uint)ml.MeshletCount, Pad = 0 };
+                cl.SetGraphicsRoot32BitConstants(0, rc, 0);
+                cl.DispatchMesh((uint)((ml.MeshletCount + 31) / 32), 1, 1);
+                cpuDrawIndex++; draws++;
+            }
+        }
+        return draws;
+    }
+
     public unsafe int RenderIntoMeshlet(ID3D12GraphicsCommandList6 cl, List<IStaticMeshRenderer> renderers,
         Matrix4x4 viewProj, Vector4[] frustumPlanes, Vector3 cameraPos, bool coneCull,
         Matrix4x4 viewProjUnjittered, Matrix4x4 view, float near, float far,

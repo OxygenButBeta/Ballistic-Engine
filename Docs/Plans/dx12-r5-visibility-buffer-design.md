@@ -64,6 +64,23 @@ each pixel's material into the SAME fat G-buffer the deferred lighting already r
 - Full R5 on Bistro: `bal imgdiff` meanError ~0, hotspot ~0 vs ExecuteIndirect (perceptual parity, same bar as
   R3a/R4). DRED-clean. GBV zero new. Default OFF; default path unchanged.
 
+## BLOCKER found during integration (2026-06-20): per-draw vertex buffers
+
+The resolve compute is ONE dispatch over the whole screen, but each pixel's triangle lives in a DIFFERENT mesh's
+vertex buffers (Normal/UV/Tangent/Pos are separate `Dx12Buffer`s per mesh). A root SRV binds ONE buffer — so the
+resolve can't fetch the right mesh's verts per pixel as written. VisResolve.hlsl assumes a single global vertex
+stream. To make R5 correct, geometry needs ONE of:
+- **Bindless vertex buffers**: add per-mesh Pos/Normal/UV/Tangent bindless SRV indices to PerDraw; the resolve does
+  `ResourceDescriptorHeap[pd.PosIdx]` etc. Cleanest; ~the R2 bindless-material pattern extended to geometry.
+- **Unified mega-buffer**: concatenate all mesh vertex streams into 4 big buffers + a per-draw base-vertex offset.
+  Simpler shader, but a bigger upload/lifetime change.
+
+This is an infrastructure change LARGER than R5's own passes — it's the real reason a visibility buffer is a big
+commitment. **R5 is parked here:** shaders done (with the per-draw-bindless-geometry assumption to add), the
+typeless+UAV G-buffer done + byte-identical, the pass skeleton (PSOs/target/rootsigs) done. The next step is the
+bindless-geometry substrate, then wire the resolve. RenderVis (the vis raster draw loop) is done and reuses the
+meshlet cull; it works as soon as the resolve can read geometry bindlessly.
+
 ## Done vs pending
 
 - DONE: VisBuffer.hlsl (vis raster, reuses R4 cull), VisResolve.hlsl (perspective barycentric + QUAD-op manual mip

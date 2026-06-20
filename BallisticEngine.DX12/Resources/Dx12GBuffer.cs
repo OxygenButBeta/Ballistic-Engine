@@ -227,6 +227,20 @@ public sealed class Dx12GBuffer : IDisposable {
         cl.ResourceBarrierTransition(colors[i], colorState[i], target);
         colorState[i] = target;
     }
+
+    // R5: transition all color RTs to UnorderedAccess (resolve write), then create a non-SRGB UNORM UAV per color
+    // at the given heap slots, and after the resolve transition them to the combined shader-read state for lighting.
+    public void ColorsToUav(ID3D12GraphicsCommandList4 cl) {
+        for (int i = 0; i < RtCount; i++) ColorTransition(cl, i, ResourceStates.UnorderedAccess);
+    }
+    public void CreateColorUav(int i, CpuDescriptorHandle dst) {
+        dev.Device.CreateUnorderedAccessView(colors[i], null, new UnorderedAccessViewDescription {
+            Format = UavFormatOf(ColorFormats[i]), ViewDimension = UnorderedAccessViewDimension.Texture2D,
+        }, dst);
+    }
+    public void ColorsToShaderRead(ID3D12GraphicsCommandList4 cl) {
+        for (int i = 0; i < RtCount; i++) ColorTransition(cl, i, ShaderRead);
+    }
     void DepthTransition(ID3D12GraphicsCommandList4 cl, ResourceStates target) {
         if (depthState == target) return;
         cl.ResourceBarrierTransition(depth, depthState, target);
