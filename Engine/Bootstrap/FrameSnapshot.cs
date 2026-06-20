@@ -38,18 +38,57 @@ public static class FrameSnapshot {
     [System.ThreadStatic] static bool onRenderThread;
     public static bool IsRenderThreadDrawing => onRenderThread;
 
+    // Flat list of the renderers to publish this frame (rebuilt each publish; reused buffer, allocation-free).
+    // Separated from the matrix freeze so the freeze can be parallelised across job workers.
+    static readonly List<IStaticMeshRenderer> publishList = new(512);
+
+    // Above this many renderers, freeze the world matrices in PARALLEL across JobSystem workers (Phase B below).
+    // Below it the job dispatch overhead isn't worth it, so we stay serial. 256 is a conservative break-even;
+    // BALLISTIC_PARALLEL_PUBLISH_MIN overrides it (set =4 to exercise the parallel path on a small test scene).
+    static readonly int ParallelPublishThreshold =
+        int.TryParse(System.Environment.GetEnvironmentVariable("BALLISTIC_PARALLEL_PUBLISH_MIN"), out int t) && t > 0
+            ? t : 256;
+
     // GAME THREAD, end of Update: freeze the world into the snapshot the render thread will read.
     public static void PublishFromGameThread() {
-        // 1. Publish every active renderer's world matrix into its render-thread field, and snapshot membership.
+        // 1. Collect the active renderers into a stable list (membership snapshot + the parallel-publish index set).
         renderSetSnapshot.Clear();
+        publishList.Clear();
         foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
             if (r is null) continue;
-            r.Transform?.PublishWorldForRender();   // freeze world matrix on the game thread (safe cache touch)
             renderSetSnapshot.Add(r);
+            if (r.Transform is not null) publishList.Add(r);
         }
+
+        // 2. Freeze each renderer's world matrix.
+        //
+        // THREAD-SAFETY: WorldMatrix is a LAZY getter that, on a stale cache, WRITES cachedWorld/worldVersion AND
+        // recursively forces the PARENT's WorldMatrix. Two workers freezing a child and its shared parent at once
+        // would race that parent's cache write. So we do the freeze in two phases:
+        //   Phase A (SERIAL): warm every transform's WorldMatrix cache — this is where the lazy writes + parent
+        //     chain walks happen, on ONE thread, so no shared-cache race. (Cheap when nothing moved: version
+        //     stamps make a warm cache a no-op read.)
+        //   Phase B (PARALLEL): copy each warmed cachedWorld into its publishedWorld — PublishWorldForRender now
+        //     hits an already-warm cache, so it only reads the cache + writes the transform's OWN publishedWorld
+        //     (a distinct field per index). No shared write → data-parallel-safe.
+        // Below the threshold both phases just run as one serial loop (job overhead not worth it).
+        int n = publishList.Count;
+        if (n >= ParallelPublishThreshold) {
+            for (int i = 0; i < n; i++) _ = publishList[i].Transform.WorldMatrix;   // Phase A: warm caches serially
+            JobSystem.For(n, PublishIndex, batchSize: 64);                          // Phase B: copy in parallel
+        }
+        else {
+            for (int i = 0; i < n; i++) publishList[i].Transform.PublishWorldForRender();
+        }
+
         // The camera transform is read by the render thread too (view matrix) — freeze it as well.
         SceneManager.RenderCamera?.transform?.PublishWorldForRender();
     }
+
+    // Parallel-for body (Phase B): copy one renderer's already-warm world matrix into its publishedWorld. The
+    // cache was warmed serially in Phase A, so PublishWorldForRender here only reads cachedWorld + writes this
+    // transform's own publishedWorld field — no shared write across indices.
+    static readonly Action<int> PublishIndex = i => publishList[i].Transform.PublishWorldForRender();
 
     // RENDER THREAD: mark the draw region so the renderer reads the snapshot, not the live sets.
     public static void BeginRenderThreadFrame() => onRenderThread = true;
