@@ -33,4 +33,12 @@ public sealed class MaterialDefinition {
     // surface renders double-sided (foliage cards, fences). null = auto-detect from the
     // diffuse texture's file name.
     public bool? Cutout { get; set; }
+
+    // CUSTOM surface-shader property values (shader props declared with semantic None). Keyed by the
+    // declared property NAME (e.g. "_RimColor"). All nullable + omitted when empty so a Standard .mat
+    // serializes byte-identically. Floats are scalars; colors/vectors are [r,g,b(,a)]; textures are refs.
+    // Unstated → the shader's declared default (resolved in MaterialLoader, the default authority).
+    public Dictionary<string, float> CustomFloats { get; set; }
+    public Dictionary<string, float[]> CustomVectors { get; set; }
+    public Dictionary<string, string> CustomTextures { get; set; }
 }

@@ -28,7 +28,45 @@ public static class MaterialLoader {
             Slot(definition, TextureType.Emissive, assetPath));
 
         ApplyScalars(material, definition);
+        ApplyCustomProperties(material, definition);
         return material;
+    }
+
+    // Resolve the shader's CUSTOM (semantic == None) declared properties into the material's name-keyed
+    // custom bag: the .mat's custom value if stated, otherwise the property's DECLARED DEFAULT (the loader
+    // is the default authority here, mirroring ApplyScalars for Standard props). A Standard shader declares
+    // no None props → this is a no-op and the custom bag stays empty (byte-identical .mat round-trip).
+    public static void ApplyCustomProperties(Material material, MaterialDefinition definition) {
+        var props = material.Shader?.Properties;
+        if (props is null) return;
+        foreach (var p in props) {
+            if (p.Semantic != MaterialSemantic.None) continue;
+            switch (p.Type) {
+                case ShaderPropertyType.Texture2D: {
+                    string reference = definition.CustomTextures is not null &&
+                        definition.CustomTextures.TryGetValue(p.Name, out var r) ? r : p.DefaultTexture;
+                    var tex = reference is not null ? AssetDatabase.LoadRef<Texture2D>(reference) : null;
+                    material.SetCustom(p.Name, tex);
+                    break;
+                }
+                case ShaderPropertyType.Color:
+                case ShaderPropertyType.Vector: {
+                    Vector4 v = definition.CustomVectors is not null &&
+                        definition.CustomVectors.TryGetValue(p.Name, out var arr) && arr is { Length: >= 1 }
+                        ? new Vector4(arr[0], arr.Length > 1 ? arr[1] : 0f, arr.Length > 2 ? arr[2] : 0f,
+                                      arr.Length > 3 ? arr[3] : (p.Type == ShaderPropertyType.Color ? 1f : 0f))
+                        : p.DefaultVector;
+                    material.SetCustom(p.Name, v);
+                    break;
+                }
+                default: { // Float / Range
+                    float f = definition.CustomFloats is not null &&
+                        definition.CustomFloats.TryGetValue(p.Name, out var val) ? val : p.DefaultFloat;
+                    material.SetCustom(p.Name, f);
+                    break;
+                }
+            }
+        }
     }
 
     public static void ApplyScalars(Material material, MaterialDefinition definition) {

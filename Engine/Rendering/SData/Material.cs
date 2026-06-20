@@ -69,6 +69,26 @@ public class Material : BObject
 
     public IReadOnlyDictionary<MaterialSemantic, object> Properties => bag;
 
+    // ---- Custom (shader-declared, semantic == None) properties ----
+    //
+    // A custom surface shader declares properties with no Standard channel (MaterialSemantic.None) — a
+    // rim colour, a mask texture, etc. The semantic bag above can't hold them (all None props would
+    // collide on the single None key), so they live here keyed BY NAME (the declared ShaderProperty.Name,
+    // e.g. "_RimColor"). Values are float / Vector4 / Texture2D, mirroring the property kinds. The Standard
+    // packer never looks here; only the custom-surface GPU path reads these. Populated by MaterialLoader
+    // from the shader's declared None properties (+ the .mat's custom values, declared default otherwise).
+    readonly Dictionary<string, object> customBag = new(StringComparer.Ordinal);
+
+    public IReadOnlyDictionary<string, object> CustomProperties => customBag;
+    public void SetCustom(string name, object value) { if (name is not null) customBag[name] = value; }
+
+    public float GetCustomFloat(string name) =>
+        customBag.TryGetValue(name, out var v) && v is float f ? f : 0f;
+    public Vector4 GetCustomVector(string name) =>
+        customBag.TryGetValue(name, out var v) && v is Vector4 vec ? vec : default;
+    public Texture2D GetCustomTexture(string name) =>
+        customBag.TryGetValue(name, out var v) ? v as Texture2D : null;
+
     public Texture2D GetTexture(MaterialSemantic semantic) =>
         bag.TryGetValue(semantic, out var v) ? v as Texture2D : null;
 
@@ -185,6 +205,8 @@ public class Material : BObject
         // Mirror the bag onto the clone (values are immutable structs / shared texture refs).
         foreach (var kv in bag)
             copy.bag[kv.Key] = kv.Value;
+        foreach (var kv in customBag)
+            copy.customBag[kv.Key] = kv.Value;
         return copy;
     }
 
