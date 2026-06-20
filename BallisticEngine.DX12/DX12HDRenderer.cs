@@ -1800,8 +1800,12 @@ public sealed class DX12HDRenderer : HDRenderer
                     var cl6 = cl.QueryInterfaceOrNull<ID3D12GraphicsCommandList6>();
                     if (cl6 != null)
                     {
+                        // R4: meshlet backface cone cull on by default when meshlets are on (BALLISTIC_DX12_
+                        // MESHLET_CONE=0 to A/B). The cone is conservative (never culls front-facing meshlets) so
+                        // it stays byte-identical; it only drops meshlets whose every face points away.
+                        bool coneCull = Environment.GetEnvironmentVariable("BALLISTIC_DX12_MESHLET_CONE") != "0";
                         draws += gpuDriven.RenderIntoMeshlet(cl6, gpuDrivenGeometry, viewProj, frustumPlanes,
-                            motionCb.Gpu, ref cpuDrawIndex);
+                            new Vector3(camPos.X, camPos.Y, camPos.Z), coneCull, motionCb.Gpu, ref cpuDrawIndex);
                         tris += gpuDriven.MeshletTris;
                         cl6.Dispose();   // release the queried interface (does not release the underlying list)
                         drewMeshlet = true;

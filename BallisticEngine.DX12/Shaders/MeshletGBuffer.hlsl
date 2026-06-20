@@ -14,7 +14,8 @@ cbuffer MotionConstants : register(b1) {
     float3   _padMotion;
 };
 cbuffer CullCB : register(b2) {
-    float4 Planes[6];   // frustum planes (unjittered viewProj), xyz=normal, w=d
+    float4 Planes[6];      // frustum planes (unjittered viewProj), xyz=normal, w=d
+    float4 CameraPosCull;  // xyz = world camera position (for meshlet backface cone cull), w = coneCullOn (0/1)
 };
 
 struct PerDraw { float4x4 Mvp; float4x4 Model; uint MaterialId; uint3 _pad; };
@@ -66,13 +67,28 @@ bool SphereInFrustum(float4 sphere, float4x4 model) {
     return true;
 }
 
+// Backface cone cull (DirectXMesh convention): the meshlet's face normals lie within a cone (axis = average face
+// normal, half-angle = acos(cone.w) where cone.w = min dot(axis, faceNormal) = cos of the spread). The meshlet is
+// ENTIRELY backfacing — safe to drop — when the direction from the camera to the meshlet (center - camPos) is more
+// than 90deg from EVERY face normal, i.e. dot(centerDir, axis) > sin(spread) = sqrt(1 - cone.w^2). Conservative:
+// only culls when all faces point away. cone.w < 0 → spread wider than a hemisphere → never cull.
+bool ConeBackface(float4 sphere, float4 cone, float4x4 model) {
+    if (cone.w < 0.0 || CameraPosCull.w < 0.5) return false;
+    float3 axisW = normalize(mul(float4(cone.xyz, 0.0), model).xyz);
+    float3 centerW = mul(float4(sphere.xyz, 1.0), model).xyz;
+    float3 centerDir = normalize(centerW - CameraPosCull.xyz);   // camera -> meshlet
+    float sinSpread = sqrt(saturate(1.0 - cone.w * cone.w));
+    return dot(centerDir, axisW) > sinSpread;   // all faces point away from the camera
+}
+
 [numthreads(32, 1, 1)]
 void ASMain(uint dtid : SV_DispatchThreadID, uint gtid : SV_GroupThreadID) {
     PerDraw pd = PerDraws[DrawIndex];
     bool visible = false;
     uint mi = MeshletBase + dtid;
     if (dtid < MeshletCount) {
-        visible = SphereInFrustum(Bounds[mi].Sphere, pd.Model);
+        visible = SphereInFrustum(Bounds[mi].Sphere, pd.Model)
+               && !ConeBackface(Bounds[mi].Sphere, Bounds[mi].Cone, pd.Model);
     }
     // compact survivors into the payload
     uint slot = WavePrefixCountBits(visible);

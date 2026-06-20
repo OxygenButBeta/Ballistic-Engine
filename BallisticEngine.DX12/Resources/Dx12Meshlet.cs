@@ -66,7 +66,7 @@ internal static class Dx12Meshlet {
                 VertOffset = (uint)vOff, VertCount = (uint)curVerts.Count,
                 PrimOffset = (uint)pOff, PrimCount = (uint)curPrims.Count,
             });
-            bounds.Add(ComputeBounds(curVerts, verts));
+            bounds.Add(ComputeBounds(curVerts, curPrims, verts));
             localMap.Clear(); curVerts.Clear(); curPrims.Clear();
         }
 
@@ -107,15 +107,44 @@ internal static class Dx12Meshlet {
         return l;
     }
 
-    static MeshletBounds ComputeBounds(List<uint> vertIdx, Vector3[] verts) {
-        // Bounding sphere (centroid + max radius) — coarse but fine for frustum cull. Cone left neutral (w=-1 =>
-        // never backface-culled) for now; a proper normal cone is a follow-up (needs per-vertex normals).
+    static MeshletBounds ComputeBounds(List<uint> vertIdx, List<uint> prims, Vector3[] verts) {
+        // Bounding sphere (centroid + max radius) for frustum cull.
         Vector3 c = Vector3.Zero;
         for (int i = 0; i < vertIdx.Count; i++) c += verts[vertIdx[i]];
         c /= Math.Max(vertIdx.Count, 1);
         float r = 0;
         for (int i = 0; i < vertIdx.Count; i++) r = MathF.Max(r, Vector3.Distance(c, verts[vertIdx[i]]));
-        return new MeshletBounds { Sphere = new Vector4(c, r), Cone = new Vector4(0, 0, 0, -1) };
+
+        // Normal cone for backface cull: average the triangle FACE normals (area-independent, just direction),
+        // pick the axis, then the cone half-angle = max angle between the axis and any face normal. The AS shader
+        // backface-culls the meshlet when the view direction lies fully OUTSIDE the cone (all faces point away).
+        // Degenerate / wide spread (>~90deg) → axis.w = -1 (never cull, the conservative case).
+        Vector3 axis = Vector3.Zero;
+        int triN = prims.Count;
+        var faceNormals = new Vector3[triN];
+        for (int t = 0; t < triN; t++) {
+            uint packed = prims[t];
+            Vector3 p0 = verts[vertIdx[(int)(packed & 0xFF)]];
+            Vector3 p1 = verts[vertIdx[(int)((packed >> 8) & 0xFF)]];
+            Vector3 p2 = verts[vertIdx[(int)((packed >> 16) & 0xFF)]];
+            Vector3 n = Vector3.Cross(p1 - p0, p2 - p0);
+            float len = n.Length();
+            n = len > 1e-12f ? n / len : Vector3.UnitY;
+            faceNormals[t] = n;
+            axis += n;
+        }
+        float al = axis.Length();
+        Vector4 cone;
+        if (triN == 0 || al < 1e-6f) cone = new Vector4(0, 0, 0, -1);   // no consistent axis → never cull
+        else {
+            axis /= al;
+            float minDot = 1f;
+            for (int t = 0; t < triN; t++) minDot = MathF.Min(minDot, Vector3.Dot(axis, faceNormals[t]));
+            // cone.w = the cull threshold: a meshlet is backfacing when dot(viewDir, axis) > cos(angle+90deg).
+            // Store w = the spread cos (minDot); if minDot <= 0 the cone is wider than a hemisphere → never cull.
+            cone = minDot <= 0f ? new Vector4(0, 0, 0, -1) : new Vector4(axis, minDot);
+        }
+        return new MeshletBounds { Sphere = new Vector4(c, r), Cone = cone };
     }
 
     static unsafe ID3D12Resource Upload<T>(Dx12Device dev, T[] data) where T : unmanaged =>

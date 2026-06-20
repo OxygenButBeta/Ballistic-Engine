@@ -599,14 +599,16 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     // frustum/sphere-culls meshlets). Reuses the bindless material table + cpuPerDraws (PerDraw{Mvp,Model,MatId}).
     // Shading is byte-identical to GBufferBindless (MeshletGBuffer.PSMain is a verbatim copy). Returns draw count.
     public unsafe int RenderIntoMeshlet(ID3D12GraphicsCommandList6 cl, List<IStaticMeshRenderer> renderers,
-        Matrix4x4 viewProj, Vector4[] frustumPlanes, ulong motionCbAddress, ref int cpuDrawIndex) {
+        Matrix4x4 viewProj, Vector4[] frustumPlanes, Vector3 cameraPos, bool coneCull,
+        ulong motionCbAddress, ref int cpuDrawIndex) {
         if (meshletPso == null || renderers.Count == 0) return 0;
         meshletTris = 0;
         EnsureMeshletCullCb();
-        // Cull-planes CB (b2): the 6 unjittered frustum planes.
+        // Cull CB (b2): the 6 unjittered frustum planes + camera pos (xyz) and the cone-cull flag (w).
         long cullOff = (long)dev.FrameSlot * meshletCullCbStride;
         var planesDst = (Vector4*)(meshletCullCbMapped + cullOff);
         for (int i = 0; i < 6; i++) planesDst[i] = frustumPlanes[i];
+        planesDst[6] = new Vector4(cameraPos, coneCull ? 1f : 0f);
 
         cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);   // ResourceDescriptorHeap[] for bindless materials
         cl.SetGraphicsRootSignature(meshletRootSig);
