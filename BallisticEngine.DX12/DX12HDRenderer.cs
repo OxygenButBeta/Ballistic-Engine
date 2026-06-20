@@ -928,10 +928,42 @@ public sealed class DX12HDRenderer : HDRenderer
     InputLayoutDescription gbufferLayout;
     byte[] gbufferVsBytecode;
 
-    // Per-material custom Surface PSOs (Stage B+). Built lazily off gbufferRootSig + the cached state
-    // above so they're drop-in for the Standard PSO; a compile failure yields the magenta-checker
-    // fallback. Not consumed by any draw yet (Stage C wires selection on the legacy CPU path).
+    // Per-material custom Surface PSOs. Built lazily off gbufferRootSig + the cached state above so they're
+    // drop-in for the Standard PSO; a compile failure yields the magenta-checker fallback. Consumed on the
+    // legacy CPU path (custom-surface materials are demoted there — they can't ride GPU-driven/bindless).
     internal Dx12SurfaceShaderCache surfaceCache;
+
+    // The custom Surface() body of a material's shader, or null for the Standard path. The shader's
+    // SurfaceSource lives on the backend-agnostic StandardShader (set by the asset loader).
+    static StandardShader CustomShaderOf(Material mat) =>
+        mat?.Shader is StandardShader { HasCustomSurface: true } s ? s : null;
+
+    // Does this renderer use a custom-surface material on ANY of its drawn submeshes? Such renderers are
+    // demoted from the GPU-driven sets to the legacy CPU path (one ExecuteIndirect can't do per-material
+    // PSOs). The SAME predicate gates the GPU-driven set build AND the CPU loop's skip, so a demoted
+    // renderer is drawn exactly once (never double-drawn or dropped).
+    static bool RendererHasCustomSurface(IStaticMeshRenderer r) {
+        Mesh mesh = r.SharedMesh;
+        if (mesh is null) return false;
+        int only = r.SubMeshIndex;
+        int first = only >= 0 ? only : 0;
+        int last = only >= 0 ? only : mesh.SubMeshes.Length - 1;
+        for (int s = first; s <= last; s++) {
+            if ((uint)s >= (uint)mesh.SubMeshes.Length) break;
+            if (CustomShaderOf(r.MaterialFor(s)) is not null) return true;
+        }
+        return false;
+    }
+
+    // Any active opaque renderer this frame using a custom surface? Gates the whole-frame cpuBindless-off
+    // decision (the legacy path then draws everything). O(renderers·submeshes) but only when CpuBindless
+    // is on; a Standard-only scene returns false on the first cheap check per renderer.
+    bool SceneHasCustomSurface() {
+        foreach (IStaticMeshRenderer r in RendererSet)
+            if (r is { IsActive: true, IsRenderable: true } && RendererHasCustomSurface(r))
+                return true;
+        return false;
+    }
 
     // Skinned-geometry PSO: same G-buffer target/state as BuildGeometryPass, but the vertex stage skins by
     // per-bone matrices (GBufferSkinned.hlsl). Root sig adds a bone-matrix SRV (t6, root SRV) on top of the
@@ -1376,6 +1408,10 @@ public sealed class DX12HDRenderer : HDRenderer
             foreach (IStaticMeshRenderer r in RendererSet)
             {
                 if (r is not { IsActive: true, IsRenderable: true } || r.SharedMesh == null) continue;
+                // Custom-surface renderers can't ride GPU-driven (one PSO per ExecuteIndirect) — they're
+                // demoted to the legacy CPU path (per-draw PSO). Exclude them from BOTH GPU-driven sets so
+                // the CPU loop draws them instead (its skip predicate matches this one — see RenderGeometry).
+                if (RendererHasCustomSurface(r)) continue;
                 if (r.SubMeshIndex < 0) wholeMeshRenderers.Add(r);
                 else if (split && !r.IsSkinned) splitMeshRenderers.Add(r);
             }
@@ -1495,6 +1531,14 @@ public sealed class DX12HDRenderer : HDRenderer
         // uses is present + the heap is touched only here. If the table fills, the WHOLE frame falls back to the
         // legacy descriptor-table path (clean all-or-nothing, never a mid-list heap swap).
         bool cpuBindless = CpuBindless;
+        // A custom-surface material draws on the legacy descriptor-table path (per-draw PSO swap) which
+        // needs srvVisible.Heap bound — incompatible with cpuBindless's static BindlessHeap (a mid-list
+        // heap swap is the documented TDR). So if ANY opaque renderer this frame uses a custom surface,
+        // turn cpuBindless OFF for the whole frame (the legacy path draws everything, Standard + custom).
+        // GPU-driven (ExecuteIndirect) is independent and stays ON — only its custom-surface renderers are
+        // demoted per-renderer (excluded from the set above). Standard-only frames never trip this.
+        if (cpuBindless && SceneHasCustomSurface())
+            cpuBindless = false;
         if (cpuBindless)
         {
             bool allRegistered = true;
@@ -1571,12 +1615,16 @@ public sealed class DX12HDRenderer : HDRenderer
             foreach (IStaticMeshRenderer r in RendererSet)
             {
                 if (r is null || !r.IsActive || !r.IsRenderable) continue;
+                // Custom-surface renderers were EXCLUDED from the GPU-driven sets (per-material PSO needs the
+                // legacy path) — so they must NOT be skipped here even though they're whole-mesh/split. The
+                // skip predicates below match the GPU-driven set build exactly (RendererHasCustomSurface).
+                bool customSurfaceR = RendererHasCustomSurface(r);
                 // Whole-mesh renderers are GPU-driven (compute cull + ExecuteIndirect) — skip them here.
-                if (gpuDrivenOn && r.SubMeshIndex < 0) continue;
+                if (!customSurfaceR && gpuDrivenOn && r.SubMeshIndex < 0) continue;
                 // R3a: split-import (SubMeshIndex>=0) non-skinned renderers also go GPU-driven when GPUDRIVEN_SPLIT
                 // is on — skip them in the CPU loop (they're in splitMeshRenderers → RenderInto). Skinned split
                 // imports stay CPU (R3 compute-skinning follow-up).
-                if (gpuDrivenOn && GpuDrivenSplit && r.SubMeshIndex >= 0 && !r.IsSkinned) continue;
+                if (!customSurfaceR && gpuDrivenOn && GpuDrivenSplit && r.SubMeshIndex >= 0 && !r.IsSkinned) continue;
                 // Skinned meshes draw in the dedicated skinned block below (different PSO + bone matrices).
                 if (r.IsSkinned) continue;
                 Mesh mesh = r.SharedMesh;
@@ -1696,7 +1744,23 @@ public sealed class DX12HDRenderer : HDRenderer
                         BindSrv(tableStart + 5, mat.GetTexture(MaterialSemantic.EmissiveMap), TextureType.Emissive, null);
                         cl.SetGraphicsRootDescriptorTable(1, srvVisible.Gpu(tableStart));
 
-                        cl.DrawIndexedInstanced((uint)sub.IndexCount, 1, (uint)sub.IndexStart, 0, 0);
+                        // CUSTOM SURFACE: swap in the material's custom PSO for this one draw, then restore the
+                        // Standard PSO. Safe mid-list ONLY because the root signature is the SAME object
+                        // (gbufferRootSig) — the b0 CBV / t0-t5 table / b1 binds just set stay valid; the custom
+                        // shader reads the identical DrawConstants + maps, only the surface math differs. A
+                        // compile failure draws the magenta-checker fallback. This path runs only when
+                        // cpuBindless is off (forced off above when the scene has any custom surface), so the
+                        // heap is srvVisible.Heap as the legacy path requires.
+                        var css = CustomShaderOf(mat);
+                        if (css is not null) {
+                            var entry = surfaceCache.GetOrCompile(css.SurfaceSource, css.SurfaceKey);
+                            if (entry.Pso is not null) cl.SetPipelineState(entry.Pso);
+                            cl.DrawIndexedInstanced((uint)sub.IndexCount, 1, (uint)sub.IndexStart, 0, 0);
+                            cl.SetPipelineState(gbufferPso);   // restore for the next Standard draw
+                        }
+                        else {
+                            cl.DrawIndexedInstanced((uint)sub.IndexCount, 1, (uint)sub.IndexStart, 0, 0);
+                        }
                         draws++; tris += sub.IndexCount / 3;
                     }
                     slot++;

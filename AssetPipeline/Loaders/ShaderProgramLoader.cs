@@ -12,6 +12,12 @@ public sealed class ShaderDefinition {
     public string Vertex { get; set; }
     public string Fragment { get; set; }
     public ShaderPropertyDef[] Properties { get; set; }
+
+    // OPTIONAL custom surface shader. A ref to a .hlsl/.surface asset containing a Unity-style
+    // `SurfaceOutput Surface(SurfaceInput i)` body. When present, materials using this shader render with
+    // a per-material PSO built from this body + the engine's G-buffer skeleton (z-prepass/MRT contract
+    // stays engine-owned). Omit it → the Standard PBR shader (unchanged, byte-identical).
+    public string Surface { get; set; }
 }
 
 // JSON-serializable form of one declared property (the .shader Properties-block entry). Converted to
@@ -90,6 +96,23 @@ public static class ShaderProgramLoader {
             for (int i = 0; i < defs.Length; i++)
                 props[i] = defs[i].ToShaderProperty(assetPath);
             shader.SetProperties(new ShaderProperties(props));
+        }
+
+        // Custom surface body: read the referenced .hlsl/.surface text and hand it to the shader. The
+        // backend (DX12) compiles a per-material PSO from it lazily. SurfaceKey = the resolved asset path
+        // (+ a content hash so hot-reload busts the PSO cache on edit). A broken/missing ref logs + leaves
+        // the shader Standard (no surface), NOT a hard failure — the material still renders (as Standard).
+        if (shader is not null && !string.IsNullOrWhiteSpace(definition.Surface)) {
+            string surfacePath = AssetRef.IsGuidRef(definition.Surface, out Guid sg)
+                ? AssetDatabase.GuidToAssetPath(sg) : definition.Surface;
+            string body = surfacePath is not null ? ContentText.Read(project, surfacePath) : null;
+            if (body is null)
+                Debugging.LogError($"'{assetPath}': surface source '{definition.Surface}' did not load; " +
+                                   "material renders as Standard.");
+            else {
+                shader.SurfaceSource = body;
+                shader.SurfaceKey = $"{surfacePath}#{body.GetHashCode():x8}";
+            }
         }
         return shader;
     }

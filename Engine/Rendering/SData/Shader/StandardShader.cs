@@ -17,5 +17,15 @@ public abstract class StandardShader(string vertexCode, string fragmentCode) : S
     public override ShaderProperties Properties => properties;
     public void SetProperties(ShaderProperties value) => properties = value ?? StandardShaderProperties.Build();
 
+    // Custom Surface() HLSL body (Unity-style surface shader). When non-null, the renderer draws materials
+    // using this shader through a per-material PSO (compiled from the surface body + the engine's G-buffer
+    // skeleton) on the legacy CPU path, instead of the embedded Standard PSO. Null = the Standard path (the
+    // common case — byte-identical). SurfaceKey is a stable identity for the PSO cache + hot-reload (the
+    // source asset path + a content hash). Lives on the backend-agnostic StandardShader so the asset loader
+    // sets it without a DX12 reference.
+    public string SurfaceSource { get; set; }
+    public string SurfaceKey { get; set; }
+    public bool HasCustomSurface => SurfaceSource is not null;
+
     protected abstract void Compile(string vertexCode, string fragmentCode);
 }
