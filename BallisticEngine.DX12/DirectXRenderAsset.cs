@@ -104,6 +104,6 @@ public sealed class DirectXRenderAsset : RenderAsset {
         return tex;
     }
 
-    public override StandardShader CreateStandardShader(string vertexCode, string fragmentCode) =>
-        new Dx12StandardShader(vertexCode, fragmentCode);
+    public override StandardShader CreateStandardShader(string vertexCode, string fragmentCode, string identityExtra = null) =>
+        new Dx12StandardShader(vertexCode, fragmentCode, identityExtra);
 }

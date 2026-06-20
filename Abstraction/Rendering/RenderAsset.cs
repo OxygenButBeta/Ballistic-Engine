@@ -27,5 +27,5 @@ public abstract class RenderAsset
     // Backend-created shader program. The factory lives here (not hardcoded in GraphicAPI) so the
     // active backend decides the concrete type — GL builds a GLSL program, a DX12 backend would build
     // an HLSL one — exactly like the buffer/texture factories above.
-    public abstract StandardShader CreateStandardShader(string vertexCode, string fragmentCode);
+    public abstract StandardShader CreateStandardShader(string vertexCode, string fragmentCode, string identityExtra = null);
 }

@@ -215,6 +215,16 @@ public sealed class DX12HDRenderer : HDRenderer
     long CbFrameOffset => (long)dev.FrameSlot * cbFrameStride;
     unsafe byte* cbMapped;
 
+    // Custom-surface CustomProps (b2) CB ring — parallel to cbRing but only written for custom-surface
+    // draws (rare). One 256-byte slot per custom draw, N-buffered like cbRing. Each slot holds the
+    // material's custom props packed at 16*index (straddle-safe, matches GenerateCustomDecls).
+    ID3D12Resource customCbRing;
+    int customCbSlotSize, customCbSlotCount;
+    long customCbFrameStride;
+    long CustomCbFrameOffset => (long)dev.FrameSlot * customCbFrameStride;
+    unsafe byte* customCbMapped;
+    int customDrawSlot;   // running custom-draw slot this frame (reset each BeginRender)
+
     // Shader-visible SRV heap: per draw we copy the material's diffuse SRV into the next slot and point
     // the root descriptor table at it. Reset each frame.
     Dx12DescriptorHeap srvVisible;
@@ -505,6 +515,17 @@ public sealed class DX12HDRenderer : HDRenderer
             HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)(cbFrameStride * dev.FramesInFlight)), ResourceStates.GenericRead);
         cbMapped = cbRing.Map<byte>(0);
+
+        // Custom-surface CustomProps (b2) ring: one 256-byte slot per custom draw. A custom CB holds up to
+        // a handful of 16-byte-padded props; 256 bytes = 16 prop slots, ample. Sized for a modest custom-
+        // draw count (custom shaders are opt-in/rare); over budget drops the b2 bind for that draw.
+        customCbSlotSize = 256;
+        customCbSlotCount = 1024;
+        customCbFrameStride = (long)customCbSlotSize * customCbSlotCount;
+        customCbRing = dev.Device.CreateCommittedResource(
+            HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)(customCbFrameStride * dev.FramesInFlight)), ResourceStates.GenericRead);
+        customCbMapped = customCbRing.Map<byte>(0);
 
         // 6 SRVs per draw (the material table) — size the ring for the worst-case draw count.
         srvVisible = new Dx12DescriptorHeap(dev,
@@ -1004,6 +1025,67 @@ public sealed class DX12HDRenderer : HDRenderer
     // SurfaceSource lives on the backend-agnostic StandardShader (set by the asset loader).
     static StandardShader CustomShaderOf(Material mat) =>
         mat?.Shader is StandardShader { HasCustomSurface: true } s ? s : null;
+
+    // Pack the material's CUSTOM props into a b2 CB slot + bind its custom textures at t6.., in the
+    // shader's DECLARED None-prop order — the exact order GenerateCustomDecls emitted, so the packed
+    // bytes line up with the HLSL cbuffer. Layout is straddle-safe 16-byte slots (float|float4 each at
+    // 16*cbIndex). Only Float/Range/Color/Vector go in the CB; Texture2D goes in the t6 table. A draw
+    // over the custom-CB budget skips the b2 bind (its props read zero, acceptable for the rare overflow).
+    unsafe void BindCustomProps(ID3D12GraphicsCommandList cl, Material mat, ShaderProperties props,
+        Dx12Texture2D fallbackTex) {
+        if (props is null) return;
+
+        // --- b2: pack scalars/vectors into one 256-byte slot (16 bytes per declared CB member) ---
+        if (customDrawSlot < customCbSlotCount) {
+            long baseOff = CustomCbFrameOffset + (long)customDrawSlot * customCbSlotSize;
+            byte* dst = customCbMapped + baseOff;
+            int cbIndex = 0;
+            foreach (var p in props) {
+                if (p.Semantic != MaterialSemantic.None) continue;
+                switch (p.Type) {
+                    case ShaderPropertyType.Texture2D: continue; // textures go in the t6 table, not the CB
+                    case ShaderPropertyType.Color:
+                    case ShaderPropertyType.Vector: {
+                        var v = mat.GetCustomVector(p.Name);
+                        if ((cbIndex + 1) * 16 <= customCbSlotSize)
+                            *(Vector4*)(dst + cbIndex * 16) = v;
+                        cbIndex++;
+                        break;
+                    }
+                    default: { // Float / Range — first lane of its own 16-byte slot
+                        float f = mat.GetCustomFloat(p.Name);
+                        if ((cbIndex + 1) * 16 <= customCbSlotSize)
+                            *(float*)(dst + cbIndex * 16) = f;
+                        cbIndex++;
+                        break;
+                    }
+                }
+            }
+            if (cbIndex > 0)
+                cl.SetGraphicsRootConstantBufferView(3, customCbRing.GPUVirtualAddress + (ulong)baseOff);
+            customDrawSlot++;
+        }
+
+        // --- t6..: bind custom textures in declared order (null -> neutral white default) ---
+        int texCount = 0;
+        foreach (var p in props)
+            if (p.Semantic == MaterialSemantic.None && p.Type == ShaderPropertyType.Texture2D) texCount++;
+        if (texCount > 0) {
+            int n = Math.Min(texCount, MaxCustomTex);
+            int tbl = srvVisible.AllocateRange(MaxCustomTex);
+            int i = 0;
+            foreach (var p in props) {
+                if (p.Semantic != MaterialSemantic.None || p.Type != ShaderPropertyType.Texture2D) continue;
+                if (i >= MaxCustomTex) break;
+                BindSrv(tbl + i, mat.GetCustomTexture(p.Name), TextureType.Diffuse, fallbackTex);
+                i++;
+            }
+            // Fill any unused table slots so the descriptor table is fully populated (no garbage SRV).
+            for (; i < MaxCustomTex; i++)
+                BindSrv(tbl + i, null, TextureType.Diffuse, fallbackTex);
+            cl.SetGraphicsRootDescriptorTable(4, srvVisible.Gpu(tbl));
+        }
+    }
 
     // Does this renderer use a custom-surface material on ANY of its drawn submeshes? Such renderers are
     // demoted from the GPU-driven sets to the legacy CPU path (one ExecuteIndirect can't do per-material
@@ -1581,6 +1663,7 @@ public sealed class DX12HDRenderer : HDRenderer
         long tris = 0;
         srvVisible.Reset();
         int slot = 0;
+        customDrawSlot = 0;   // custom-surface b2 CB slot, advanced per custom draw
 
         // Camera frustum planes from the UNJITTERED viewProj — per-submesh cull in the geometry pass.
         ExtractFrustumPlanes(viewProjUnjittered);
@@ -1826,8 +1909,15 @@ public sealed class DX12HDRenderer : HDRenderer
                         // heap is srvVisible.Heap as the legacy path requires.
                         var css = CustomShaderOf(mat);
                         if (css is not null) {
-                            var entry = surfaceCache.GetOrCompile(css.SurfaceSource, css.SurfaceKey, css.SurfaceSourcePath);
+                            var entry = surfaceCache.GetOrCompile(css.SurfaceSource, css.SurfaceKey,
+                                css.SurfaceSourcePath, css.Properties);
                             if (entry.Pso is not null) cl.SetPipelineState(entry.Pso);
+                            // Bind the material's custom props (b2 CBV) + custom textures (t6..) in the shader's
+                            // DECLARED None-prop order — the SAME order GenerateCustomDecls used, so the packed
+                            // layout matches the HLSL cbuffer exactly. Standard binds (b0/t0-t5/b1) above stay
+                            // valid (same root sig); we only ADD params 3+4. A shader with no custom props
+                            // binds nothing here (the loop bodies are empty) — the PSO doesn't read b2/t6.
+                            BindCustomProps(cl, mat, css.Properties, fallbackDiffuse);
                             cl.DrawIndexedInstanced((uint)sub.IndexCount, 1, (uint)sub.IndexStart, 0, 0);
                             cl.SetPipelineState(gbufferPso);   // restore for the next Standard draw
                         }

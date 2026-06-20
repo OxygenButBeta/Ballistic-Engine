@@ -15,7 +15,8 @@ public sealed class Dx12StandardShader : StandardShader {
     public override int UID { get; }
     static int nextId = 1;
 
-    public Dx12StandardShader(string vertexCode, string fragmentCode) : base(vertexCode, fragmentCode) {
+    public Dx12StandardShader(string vertexCode, string fragmentCode, string identityExtra = null)
+        : base(vertexCode, fragmentCode, identityExtra) {
         UID = nextId++;
     }
 

@@ -1,7 +1,12 @@
 ﻿namespace BallisticEngine;
 
-public abstract class StandardShader(string vertexCode, string fragmentCode) : Shader {
-    public override ResourceIdentity Identity { get; } = ResourceIdentity.Combine(vertexCode, fragmentCode);
+public abstract class StandardShader(string vertexCode, string fragmentCode, string identityExtra = null) : Shader {
+    // identityExtra (the .shader asset path for custom shaders) keeps a custom shader's cached instance
+    // distinct from the plain Standard shader that shares the same vertex/fragment GLSL — otherwise the
+    // loader's SurfaceSource/SetProperties would leak across them. Null for plain Standard → unchanged key.
+    public override ResourceIdentity Identity { get; } = identityExtra is null
+        ? ResourceIdentity.Combine(vertexCode, fragmentCode)
+        : ResourceIdentity.Combine(vertexCode, fragmentCode, identityExtra);
 
     // Retained so the renderer can derive depth-only companions (z-prepass) that rasterize
     // with this shader's exact vertex math, AND GPU-driven companions (MDI + bindless) that

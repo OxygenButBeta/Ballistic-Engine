@@ -88,7 +88,12 @@ public static class ShaderProgramLoader {
         if (vertexCode is null || fragmentCode is null)
             return null;
 
-        var shader = GraphicAPI.CreateStandardShader(vertexCode, fragmentCode);
+        // A shader with a custom surface body OR a custom Properties block must NOT share the cached
+        // instance of the plain Standard shader (same Vert/Frag.glsl → same default identity) — its
+        // SetProperties/SurfaceSource would leak onto every Standard material. Give such shaders a distinct
+        // cache key (the .shader asset path). Plain Standard shaders pass null → unchanged shared instance.
+        bool isCustom = definition.Properties is { Length: > 0 } || !string.IsNullOrWhiteSpace(definition.Surface);
+        var shader = GraphicAPI.CreateStandardShader(vertexCode, fragmentCode, isCustom ? assetPath : null);
         // Custom Properties block overrides the built-in Standard declaration; omit it (the common
         // case, incl. the legacy .shader assets) and the shader keeps StandardShaderProperties.
         if (shader is not null && definition.Properties is { Length: > 0 } defs) {
