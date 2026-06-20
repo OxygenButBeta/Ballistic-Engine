@@ -78,8 +78,12 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
 
         float intensity = intensityCached ??= float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_RTAO_INTENSITY"),
             System.Globalization.CultureInfo.InvariantCulture, out float ri) ? Math.Clamp(ri, 0f, 1f) : 1f;
+        // 10 m (was 30): sky-occlusion only needs to find NEARBY occluders — a point either has a close wall/
+        // ceiling over it (sealed) or it doesn't. A 30 m ray spends most of its TLAS traversal past any relevant
+        // occluder; 10 m finds the same sealing geometry with a much shorter (cheaper) ray. Measured 4K 76→81 fps,
+        // interior sky-gate visually unchanged (MultiLightInterior imgdiff mean 0). BALLISTIC_DX12_RTAO_LENGTH overrides.
         float rayLen = rayLenCached ??= float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_RTAO_LENGTH"),
-            System.Globalization.CultureInfo.InvariantCulture, out float rl) ? MathF.Max(rl, 0.1f) : 30f;
+            System.Globalization.CultureInfo.InvariantCulture, out float rl) ? MathF.Max(rl, 0.1f) : 10f;
 
         // Sky-occlusion ray count. Was 6 — but this is a low-frequency openness signal (how much sky a point
         // sees), the temporal denoise + half-res already smooth it, and the per-pixel RT traversal is the whole
