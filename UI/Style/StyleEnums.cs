@@ -23,6 +23,25 @@ public enum DisplayStyle { Flex, None }
 
 public enum Overflow { Visible, Hidden, Scroll }
 
+// Constraint mode for a measure callback's available width/height (Yoga's MeasureMode), so a measured
+// leaf (text) knows whether the available size is a hard size (Exactly), an upper bound to wrap within
+// (AtMost), or unconstrained (Undefined). (P4.4)
+public enum MeasureMode { Undefined, Exactly, AtMost }
+
+// CSS white-space (subset): Normal wraps at the available width; NoWrap keeps one line (honoring '\n').
+// (P4.8)
+public enum WhiteSpace { Normal, NoWrap }
+
+// CSS text-overflow when content is clipped (overflow:hidden): Clip cuts; Ellipsis appends "…". (P4.8)
+public enum TextOverflow { Clip, Ellipsis }
+
 // Which edge a position/margin/padding/border value targets. Mirrors CSS edges; "Horizontal"/
 // "Vertical"/"All" are convenience shorthands Yoga supports natively.
 public enum Edge { Left, Top, Right, Bottom, Start, End, Horizontal, Vertical, All }
+
+// Which axis a flex gap targets (CSS gap / row-gap / column-gap). (P4.5)
+public enum Gutter { All, Row, Column }
+
+// Text + layout direction (CSS direction). RTL mirrors the main axis + flips default text alignment.
+// (P9.1 — basic bidi container support; full per-run bidi reordering is a shaping concern.)
+public enum LayoutDirection { LTR, RTL }

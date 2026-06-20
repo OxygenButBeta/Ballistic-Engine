@@ -40,5 +40,43 @@ public static class UIFonts
         return _default;
     }
 
+    // Resolves a family + weight/style to a variant atlas by name convention (P6.4): "Inter" + bold ->
+    // "Inter-Bold", + italic -> "Inter-Italic", + both -> "Inter-BoldItalic". Falls back to the plain
+    // family, then Default, if a variant isn't registered — so bold text degrades to regular, never blank.
+    public static FontAtlas Resolve(string family, bool bold, bool italic)
+    {
+        if (!bold && !italic) return Resolve(family);
+        if (!string.IsNullOrEmpty(family))
+        {
+            string suffix = bold && italic ? "-BoldItalic" : bold ? "-Bold" : "-Italic";
+            if (_byName.TryGetValue(family + suffix, out var v)) return v;
+            if (_byName.TryGetValue(family, out var b)) return b;
+        }
+        return _default;
+    }
+
     public static IReadOnlyDictionary<string, FontAtlas> All => _byName;
+
+    // Font fallback chain (P9.1): atlases tried IN ORDER when the primary font lacks a glyph (CJK, emoji,
+    // symbols). Register e.g. an emoji atlas + a CJK atlas here; text rendering picks the first atlas that
+    // has each codepoint, so mixed-script strings render instead of showing tofu boxes.
+    static readonly List<FontAtlas> _fallbacks = new();
+    public static IReadOnlyList<FontAtlas> Fallbacks => _fallbacks;
+
+    public static void AddFallback(FontAtlas atlas)
+    {
+        if (atlas != null && !_fallbacks.Contains(atlas)) { _fallbacks.Add(atlas); Version++; }
+    }
+
+    public static void ClearFallbacks() { if (_fallbacks.Count > 0) { _fallbacks.Clear(); Version++; } }
+
+    // Resolve which atlas should render `codepoint` for a primary atlas: the primary if it has the glyph,
+    // else the first fallback that does, else the primary (renders its .notdef/skips).
+    public static FontAtlas AtlasForGlyph(FontAtlas primary, char codepoint)
+    {
+        if (primary != null && primary.Glyphs.ContainsKey(codepoint)) return primary;
+        for (int i = 0; i < _fallbacks.Count; i++)
+            if (_fallbacks[i].Glyphs.ContainsKey(codepoint)) return _fallbacks[i];
+        return primary;
+    }
 }

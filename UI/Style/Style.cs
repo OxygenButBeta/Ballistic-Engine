@@ -14,6 +14,26 @@ public sealed class Style
 
     internal Style(VisualElement el) => _el = el;
 
+    // --- imperative-override preservation (Unity parity for element.style.*) --------------------------
+    // Code/controls that set Style.* directly (a Slider sizing its track in its ctor; game code doing
+    // btn.Style.Width = 100) must SURVIVE a USS resolve. The resolver records the imperative declarations
+    // an element carries (captured the moment it's first resolved, as the diff from defaults) and re-applies
+    // them as the HIGHEST-precedence layer — exactly like UITK's inline element.style. We capture them ONCE
+    // (the first resolve, before any cascade has run) into _imperativeOverrides; subsequent resolves replay
+    // them. A control's ctor runs before the first resolve, so its ctor styles are captured.
+    string _imperativeOverrides;          // serialized "prop:val;" of the imperative deltas, or null
+    bool _capturedOverrides;
+
+    // Capture the current style as imperative overrides (diff vs a fresh default Style), once. Returns the
+    // serialized overrides to re-apply after reset+cascade.
+    internal string CaptureImperativeOverrides()
+    {
+        if (_capturedOverrides) return _imperativeOverrides;
+        _capturedOverrides = true;
+        _imperativeOverrides = StyleSerialize.DiffFromDefaults(this);
+        return _imperativeOverrides;
+    }
+
     // ---------------------------------------------------------------- layout: flex container
 
     FlexDirection _flexDirection = FlexDirection.Row; // web default (matches HTML <div>)
@@ -53,6 +73,10 @@ public sealed class Style
 
     Overflow _overflow = Overflow.Visible;
     public Overflow Overflow { get => _overflow; set { _overflow = value; L.Overflow = value; } }
+
+    // CSS direction (P9.1) — RTL mirrors the flex main axis. Set on the root (Yoga propagates). Inherited.
+    LayoutDirection _direction = LayoutDirection.LTR;
+    public LayoutDirection Direction { get => _direction; set { _direction = value; L.Direction = value; } }
 
     // ---------------------------------------------------------------- layout: box size
 
@@ -94,6 +118,16 @@ public sealed class Style
     // Shorthand: same value on all four edges (CSS `margin: 8px` / `padding: 12px`).
     public float Margin { set => L.SetMarginPoints(Edge.All, value); }
     public float Padding { set => L.SetPaddingPoints(Edge.All, value); }
+
+    // CSS gap / row-gap / column-gap — spacing between flex items (P4.5).
+    float _gap, _rowGap, _columnGap;
+    public float Gap { get => _gap; set { _gap = value; L.SetGap(Gutter.All, value); } }
+    public float RowGap { get => _rowGap; set { _rowGap = value; L.SetGap(Gutter.Row, value); } }
+    public float ColumnGap { get => _columnGap; set { _columnGap = value; L.SetGap(Gutter.Column, value); } }
+
+    // CSS aspect-ratio (w/h). 0/NaN = unset (P4.6).
+    float _aspectRatio = float.NaN;
+    public float AspectRatio { get => _aspectRatio; set { _aspectRatio = value; L.AspectRatio = value; } }
 
     // ---------------------------------------------------------------- visual (renderer reads these)
 
@@ -141,7 +175,106 @@ public sealed class Style
     public float TextShadowOffsetX, TextShadowOffsetY, TextShadowBlur;
     public Color TextShadowColor = Color.Transparent;
 
+    // Text flow (P4.8). WhiteSpace.Normal wraps to the box width; NoWrap keeps one line. TextOverflow
+    // controls what happens when a NoWrap line is clipped by overflow:hidden (Clip or Ellipsis). These
+    // INHERIT like CSS text properties.
+    public WhiteSpace WhiteSpace = WhiteSpace.NoWrap;   // Unity/UITK default is nowrap
+    public TextOverflow TextOverflow = TextOverflow.Clip;
+
+    // CSS box-shadow (P6.1): an offset + blur + spread + color drop shadow drawn BEHIND the element's box.
+    // HasBoxShadow gates it. (Single shadow in v1; CSS allows a list.)
+    public bool HasBoxShadow;
+    public float BoxShadowOffsetX, BoxShadowOffsetY, BoxShadowBlur, BoxShadowSpread;
+    public Color BoxShadowColor = Color.Transparent;
+
+    // CSS backdrop-filter: blur(px) (P6.2) — frosted-glass: the scene/UI behind this element is blurred
+    // within its box before the element draws. 0 = off.
+    public float BackdropBlur;
+
+    // Font weight/style (P6.4): selects a bold/italic atlas variant by family-name convention when the
+    // renderer has one registered (e.g. "Inter" + Bold -> "Inter-Bold").
+    public bool Bold;
+    public bool Italic;
+
     // ---------------------------------------------------------------- helpers
+
+    // P2.1 — reset EVERY property to its CSS/web default and push the defaults through to the LayoutNode.
+    // The resolved-style pipeline (StyleResolver) calls this before re-applying inherited + matched + inline
+    // declarations, so a removed class or a cleared :hover state REVERTS to base instead of sticking (the
+    // additive-cascade bug). Layout props go through the setters so Yoga is reset too; visual props are
+    // assigned directly. Keep this in sync with the field initializers above.
+    public void ResetToDefaults()
+    {
+        // layout: flex container
+        FlexDirection = FlexDirection.Row;
+        FlexWrap = FlexWrap.NoWrap;
+        JustifyContent = Justify.FlexStart;
+        AlignItems = Align.Stretch;
+        AlignContent = Align.FlexStart;
+        AlignSelf = Align.Auto;
+        // layout: flex item
+        FlexGrow = 0f;
+        FlexShrink = 1f;
+        FlexBasis = Length.Auto;
+        Position = PositionType.Relative;
+        Display = DisplayStyle.Flex;
+        Overflow = Overflow.Visible;
+        Direction = LayoutDirection.LTR;
+        // layout: box size
+        Width = Length.Auto;
+        Height = Length.Auto;
+        MinWidth = 0f; MinHeight = 0f; MaxWidth = float.NaN; MaxHeight = float.NaN;
+        Gap = 0f; RowGap = 0f; ColumnGap = 0f;
+        AspectRatio = float.NaN;
+        // layout: edges (reset all four on each)
+        L.SetMarginPoints(Edge.All, 0f);
+        L.SetPaddingPoints(Edge.All, 0f);
+        SetBorderWidth(Edge.All, 0f);
+        L.SetPositionPoints(Edge.Left, 0f); L.SetPositionPoints(Edge.Top, 0f);
+        L.SetPositionPoints(Edge.Right, 0f); L.SetPositionPoints(Edge.Bottom, 0f);
+        // visual
+        BackgroundColor = Color.Transparent;
+        BackgroundGradient = null;
+        BorderColor = Color.Transparent;
+        BorderRadius = 0f;
+        TextColor = Color.White;
+        FontSize = 14f;
+        Opacity = 1f;
+        TranslateX = 0f; TranslateY = 0f; RotationDegrees = 0f; Scale = 1f;
+        FontFamily = null;
+        LetterSpacing = 0f;
+        TextAlign = null;
+        HasTextShadow = false;
+        TextShadowOffsetX = 0f; TextShadowOffsetY = 0f; TextShadowBlur = 0f;
+        TextShadowColor = Color.Transparent;
+        WhiteSpace = WhiteSpace.NoWrap;
+        TextOverflow = TextOverflow.Clip;
+        HasBoxShadow = false;
+        BoxShadowOffsetX = 0f; BoxShadowOffsetY = 0f; BoxShadowBlur = 0f; BoxShadowSpread = 0f;
+        BoxShadowColor = Color.Transparent;
+        BackdropBlur = 0f;
+        Bold = false; Italic = false;
+    }
+
+    // Inherited properties (CSS-inherited subset, P2.3): a child that doesn't override these takes the
+    // parent's RESOLVED value. Copies from `parent` into this style as the inheritance baseline, BEFORE
+    // matched rules/inline run (so an explicit child rule still wins). Mirrors UITK's inherited set.
+    public void InheritFrom(Style parent)
+    {
+        if (parent == null) return;
+        TextColor = parent.TextColor;
+        FontSize = parent.FontSize;
+        FontFamily = parent.FontFamily;
+        LetterSpacing = parent.LetterSpacing;
+        TextAlign = parent.TextAlign;
+        WhiteSpace = parent.WhiteSpace;
+        TextOverflow = parent.TextOverflow;
+        Bold = parent.Bold;
+        Italic = parent.Italic;
+        Direction = parent.Direction;
+        // visibility-ish: opacity is NOT inherited in CSS (it composites) — the walker already multiplies
+        // opacity down the tree, so we leave Opacity per-element here.
+    }
 
     static void ApplyLength(Length len, System.Action<float> points, System.Action<float> percent, System.Action auto)
     {

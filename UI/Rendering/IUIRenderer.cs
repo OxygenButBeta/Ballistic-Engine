@@ -20,6 +20,16 @@ public interface IUIRenderer
     // (TL, TR, BR, BL) in pixels, already clamped by the walker to <= half the min side (so a pill
     // request can't over-arc). borderWidth 0 = no border. Colors are straight RGBA (premultiplied
     // opacity already folded in by the walker).
+    // A drop shadow behind `rect` (P6.1): a rounded box expanded by `spread`, offset by (ox,oy), blurred
+    // by `blur` pixels, in `color`. Drawn BEFORE the element so the element sits on top. radius is the
+    // element's per-corner radius (the shadow mirrors the box shape).
+    void DrawShadow(Rect rect, Vector4 radius, float ox, float oy, float blur, float spread, Color color);
+
+    // Backdrop blur (P6.2): blur whatever is already in the target within `rect` (frosted glass) before
+    // the element's own fill draws. `radius` clips the blur to the rounded box. No-op if the backend has
+    // no source to sample. radiusPx = blur kernel radius in pixels.
+    void DrawBackdropBlur(Rect rect, Vector4 radius, float radiusPx);
+
     void DrawRect(Rect rect, Color fill, Vector4 radius, float borderWidth, Color borderColor);
 
     // A gradient-filled (optionally rounded) rectangle. `opacity` is the element's effective opacity
@@ -53,6 +63,8 @@ public struct TextStyle
     public TextAlign Align;
     public string FontFamily;
     public float LetterSpacing;
+    public bool Bold;          // P6.4 — selects a bold atlas variant if registered
+    public bool Italic;        // P6.4 — selects an italic atlas variant if registered
 
     // Optional drop-shadow / glow drawn behind the glyphs.
     public bool HasShadow;

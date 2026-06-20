@@ -55,6 +55,11 @@ public class UIDocument : Behaviour
         // Author against ReferenceResolution; the panel scales to fit the real viewport. Default so
         // ported designs (which assume a fixed canvas) look right on any display.
         ScaleWithScreenSize,
+        // Expand: scale so the reference FITS inside the viewport (min of the two scales) — never crops,
+        // may letterbox. Shrink: only scale DOWN if the viewport is smaller (max with 1 inverse) — keeps
+        // 1:1 on big screens, fits on small. (P8.5, Unity's Expand/Shrink screen-match modes.)
+        Expand,
+        Shrink,
     }
     public ScaleMode Scale { get; set; } = ScaleMode.ScaleWithScreenSize;
 
@@ -76,8 +81,16 @@ public class UIDocument : Behaviour
     [NotSerialized] public VisualElement Root { get; private set; }
     [NotSerialized] public float ResolvedScale { get; private set; } = 1f;
 
+    // Overlay layer for popups (Dropdown lists, ContextMenu, Tooltip, Modal). It's the LAST child of Root
+    // — absolute, full-size, picking passes through except where a popup sits — so popups draw above all
+    // content (painter's order) and share the same solve/walk/input pass. Controls add their popups here
+    // via OwnerDocument.OverlayLayer.
+    [NotSerialized] public VisualElement OverlayLayer { get; private set; }
+
     readonly UIInputModule _input = new();
-    StyleSheet _sheet;
+    // Parsed stylesheets, in application order. `Uss` may name several sheets (newline/comma/semicolon
+    // separated) so a design can split base/theme/component sheets (P2.8). Single sheet = list of one.
+    readonly System.Collections.Generic.List<StyleSheet> _sheets = new();
 
     // Per-document tween engine for selection slides, fades, pulses (driven by the controller). Ticked
     // each frame in UpdateFrame before layout solves, so animated values are current when drawn.
@@ -131,30 +144,75 @@ public class UIDocument : Behaviour
         Root = UxmlLoader.LoadFromText(uxmlText);
         if (Root == null) return;
 
-        // Apply the stylesheet cascade. To preserve CSS precedence (inline > stylesheet), the loader
-        // records each element's inline declarations and we re-assert them AFTER the sheet runs — so a
-        // class rule can't clobber an explicit inline value. See UxmlLoader.CaptureInline.
-        _sheet = string.IsNullOrEmpty(Uss) ? null : StyleSheet.Parse(ResolveText(Uss) ?? "");
+        AddOverlayLayer();
+
+        // Parse stylesheets. The resolved-style pipeline (StyleResolver) handles precedence — defaults →
+        // inheritance → matched rules (specificity) → inline — so no separate inline re-assert is needed.
+        _sheets.Clear();
+        if (!string.IsNullOrEmpty(Uss))
+        {
+            foreach (var path in Uss.Split(new[] { ',', ';', '\n', '\r' }, System.StringSplitOptions.RemoveEmptyEntries))
+            {
+                string ussText = ResolveText(path.Trim());
+                if (!string.IsNullOrEmpty(ussText))
+                    _sheets.Add(StyleSheet.Parse(ussText));
+            }
+        }
         ApplyStyles();
     }
 
-    // Re-runs the stylesheet cascade over the whole tree. Call after building dynamic content (rows,
-    // lists) so elements added AFTER Rebuild() pick up their USS — otherwise their classes were added
-    // after the initial cascade and they'd render unstyled. Public so controllers can invoke it.
+    // Re-resolve the whole tree from scratch (defaults → inherit → matched → inline). Call after building
+    // dynamic content (rows, lists) so new elements pick up their USS, or after bulk class changes. Single
+    // elements changing state use the per-element restyle path (RestyleElement) instead. Public so
+    // controllers can invoke it.
     public void ApplyStyles()
     {
         if (Root == null) return;
-        _sheet?.Apply(Root);
-        // Inline wins: re-apply captured inline declarations last.
-        ReassertInline(Root);
+        AssignOwner(Root);                       // so class/state changes route restyle requests back here
+        StyleResolver.ResolveTree(Root, _sheets, Root.Parent?.Style);
+        _restyleDirty.Clear();                    // a full resolve subsumes any queued per-element restyles
     }
 
-    static void ReassertInline(VisualElement el)
+    // Creates the overlay layer as Root's last child (absolute, fills the canvas, picking passes through
+    // so it never steals input from content; popups added to it ARE pickable as normal children).
+    void AddOverlayLayer()
     {
-        if (el.InlineStyle != null)
-            StyleApplier.ApplyInline(el.Style, el.InlineStyle);
-        foreach (var c in el.Children)
-            ReassertInline(c);
+        OverlayLayer = new Panel();
+        OverlayLayer.Name = "__overlay";
+        OverlayLayer.PickingEnabled = false;
+        OverlayLayer.Style.Position = PositionType.Absolute;
+        OverlayLayer.Style.Left = 0; OverlayLayer.Style.Top = 0;
+        OverlayLayer.Style.Right = 0; OverlayLayer.Style.Bottom = 0;
+        Root.Add(OverlayLayer);
+    }
+
+    void AssignOwner(VisualElement el)
+    {
+        el.OwnerDocument = this;
+        var children = el.Children;
+        for (int i = 0; i < children.Count; i++) AssignOwner(children[i]);
+    }
+
+    static void RefreshMeasures(VisualElement el)
+    {
+        if (el is Label lbl) lbl.RefreshMeasureIfStale();
+        var children = el.Children;
+        for (int i = 0; i < children.Count; i++) RefreshMeasures(children[i]);
+    }
+
+    static void RunPostLayout(VisualElement el)
+    {
+        if (el is IPostLayout p) p.OnAfterLayout();
+        var children = el.Children;
+        for (int i = 0; i < children.Count; i++) RunPostLayout(children[i]);
+    }
+
+    // Re-resolve one element + its inheriting subtree (P2.2). Called when a class/state toggles so
+    // :hover/:active/:focus and dynamic class changes revert correctly without a full-tree pass.
+    public void RestyleElement(VisualElement el)
+    {
+        if (el == null) return;
+        StyleResolver.ResolveTree(el, _sheets, el.Parent?.Style);
     }
 
     // ---- per-frame ----
@@ -165,9 +223,30 @@ public class UIDocument : Behaviour
     // calls ProcessInput separately. Kept as UpdateFrame for the renderer's existing call.
     public void UpdateFrame(Rect viewport) => UpdateFrame(viewport, 0f);
 
+    // Elements whose class/state changed this frame and need a from-scratch restyle before layout (P2.2).
+    readonly System.Collections.Generic.HashSet<VisualElement> _restyleDirty = new();
+
+    // Queue an element for restyle on the next UpdateFrame. Called by VisualElement when a class or
+    // :hover/:active/:focus state toggles. Deduped via the set so a burst of class changes costs one
+    // resolve. Safe to call before UpdateFrame; flushed there.
+    internal void MarkRestyleDirty(VisualElement el)
+    {
+        if (el != null) _restyleDirty.Add(el);
+    }
+
     public void UpdateFrame(Rect viewport, float dt)
     {
         if (Root == null) return;
+
+        // Flush pending restyles (hover/active/focus/class changes) BEFORE layout so the resolved style —
+        // including any size/flex change a state rule made — feeds this frame's solve. Re-resolving an
+        // element also re-resolves its inheriting subtree.
+        if (_restyleDirty.Count > 0)
+        {
+            foreach (var el in _restyleDirty)
+                StyleResolver.ResolveTree(el, _sheets, el.Parent?.Style);
+            _restyleDirty.Clear();
+        }
 
         // Advance animations first so tweened/looped values are current before layout + draw.
         if (dt > 0f) Animator.Tick(dt);
@@ -179,8 +258,16 @@ public class UIDocument : Behaviour
         ResolvedScale = scale;
         LogicalSize = logical;
 
+        // Re-dirty any Label whose measure inputs changed (font size/family/letter-spacing/wrap, or a
+        // font finished loading) so the solve re-measures it (P4.1/P4.2). Cheap walk; Yoga skips clean
+        // subtrees internally.
+        RefreshMeasures(Root);
+
         // Root fills the logical canvas unless the design set explicit root dimensions.
         LayoutPass.Solve(Root, logical.X, logical.Y);
+
+        // Post-layout: controls that position sub-parts from solved sizes (ScrollView thumb, etc.) run now.
+        RunPostLayout(Root);
     }
 
     // The logical canvas size from the last solve (pixels). Hosts need it to map screen-space mouse
@@ -213,9 +300,16 @@ public class UIDocument : Behaviour
         Vector2 reference = ReferenceResolution;
         float scaleW = viewportPx.X / Math.Max(1f, reference.X);
         float scaleH = viewportPx.Y / Math.Max(1f, reference.Y);
-        float logW = MathF.Log(Math.Max(1e-4f, scaleW));
-        float logH = MathF.Log(Math.Max(1e-4f, scaleH));
-        scale = MathF.Exp(logW * (1f - MatchWidthOrHeight) + logH * MatchWidthOrHeight);
+        if (Scale == ScaleMode.Expand)
+            scale = Math.Min(scaleW, scaleH);                 // fit-inside (never crop)
+        else if (Scale == ScaleMode.Shrink)
+            scale = Math.Min(1f, Math.Min(scaleW, scaleH));   // 1:1 on big screens, shrink on small
+        else
+        {
+            float logW = MathF.Log(Math.Max(1e-4f, scaleW));
+            float logH = MathF.Log(Math.Max(1e-4f, scaleH));
+            scale = MathF.Exp(logW * (1f - MatchWidthOrHeight) + logH * MatchWidthOrHeight);
+        }
 
         // The logical canvas is the viewport divided by the scale, so it covers the whole screen.
         return new Vector2(viewportPx.X / scale, viewportPx.Y / scale);

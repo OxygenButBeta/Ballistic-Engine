@@ -8,7 +8,7 @@ namespace BallisticEngine.UI;
 // what a UI would draw. Not used in the real engine render loop.
 public sealed class RecordingUIRenderer : IUIRenderer
 {
-    public enum Op { Begin, End, Rect, Gradient, Text, Image, PushClip, PopClip }
+    public enum Op { Begin, End, Rect, Gradient, Text, Image, PushClip, PopClip, Shadow, BackdropBlur }
 
     public readonly struct Command
     {
@@ -53,6 +53,12 @@ public sealed class RecordingUIRenderer : IUIRenderer
 
     public void DrawImage(Rect rect, object texture, Color tint, ScaleMode scaleMode) =>
         Commands.Add(new Command(Op.Image, rect, tint, texture: texture));
+
+    public void DrawShadow(Rect rect, Vector4 radius, float ox, float oy, float blur, float spread, Color color) =>
+        Commands.Add(new Command(Op.Shadow, rect, color, radius, blur));
+
+    public void DrawBackdropBlur(Rect rect, Vector4 radius, float radiusPx) =>
+        Commands.Add(new Command(Op.BackdropBlur, rect, default, radius, radiusPx));
 
     public void PushClip(Rect rect) => Commands.Add(new Command(Op.PushClip, rect));
     public void PopClip() => Commands.Add(new Command(Op.PopClip));

@@ -30,20 +30,35 @@ public static class LayoutPass
 
     // Pointer hit-test: the topmost pickable element whose resolved box contains the point. Walks the
     // tree back-to-front (last child = drawn on top = checked first) so overlapping siblings resolve
-    // like the visual stacking order. Skips elements with PickingEnabled=false (overlays) and never
-    // descends into a non-pickable subtree's children for the hit itself — but still tests children of
-    // pickable parents. Returns null when nothing is hit.
+    // like the visual stacking order. Skips display:none subtrees and elements with PickingEnabled=false.
+    //
+    // CLIP-AWARE (P3.5): a point OUTSIDE an overflow:hidden/scroll element's box cannot hit that element's
+    // CHILDREN — they're visually clipped, so they must not be clickable either (fixes "click an invisible
+    // clipped row"). TRANSFORM-AWARE (P3.5): CSS translate shifts an element + subtree visually; the hit
+    // point is shifted by the inverse so a translated button picks where it's drawn, not its layout box.
     public static VisualElement HitTest(VisualElement root, Vector2 point)
     {
-        if (root == null || !root.ResolvedRect.Contains(point)) return null;
+        if (root == null || root.Style.Display == DisplayStyle.None) return null;
+
+        // Undo this element's render-time translate so children are tested in the same space they're drawn.
+        var s = root.Style;
+        Vector2 p = point;
+        if (s.TranslateX != 0f || s.TranslateY != 0f)
+            p = new Vector2(point.X - s.TranslateX, point.Y - s.TranslateY);
+
+        bool insideSelf = root.ResolvedRect.Contains(p);
+
+        // overflow != visible: a point outside the box clips the whole subtree away.
+        if (!insideSelf && s.Overflow != Overflow.Visible)
+            return null;
 
         var children = root.Children;
         for (int i = children.Count - 1; i >= 0; i--)
         {
-            var hit = HitTest(children[i], point);
+            var hit = HitTest(children[i], p);
             if (hit != null) return hit;
         }
 
-        return root.PickingEnabled ? root : null;
+        return insideSelf && root.PickingEnabled ? root : null;
     }
 }

@@ -28,6 +28,18 @@ public static class ElementFactory
         ["span"] = () => new Label(),
         ["p"] = () => new Label(),
         ["img"] = () => new Image(),
+
+        // Controls library (P5) — usable straight from UXML.
+        ["ScrollView"] = () => new ScrollView(),
+        ["TextField"] = () => new TextField(),
+        ["Toggle"] = () => new Toggle(),
+        ["Slider"] = () => new Slider(),
+        ["Dropdown"] = () => new Dropdown(),
+        ["DropdownField"] = () => new Dropdown(),
+        ["Foldout"] = () => new Foldout(),
+        ["TabView"] = () => new TabView(),
+        ["ListView"] = () => new ListView(),
+        ["ProgressBar"] = () => new ProgressBar(),
     };
 
     public static void Register(string tag, Func<VisualElement> factory)

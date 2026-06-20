@@ -45,6 +45,25 @@ public static class Input
     // leak mouse motion into game scripts.
     public static Vector2 MouseDelta => Enabled ? Provider.MouseDelta : Vector2.Zero;
 
+    // ---- Typed text (for text fields) -----------------------------------------------------------
+    // Character input is event-driven (the window's text-input callback), not pollable device state, so
+    // it doesn't live on IInputProvider. The host pushes each typed char here; UI text fields drain the
+    // buffer per frame. Gated by Enabled so editor edit-mode doesn't leak typing into a game field.
+    static readonly System.Collections.Generic.Queue<char> _typed = new();
+
+    // Host: call from the window's OnTextInput (or equivalent) for each character produced.
+    public static void PushTypedChar(char c) { if (Enabled) _typed.Enqueue(c); }
+
+    // Consumer (UI): dequeue the next typed char, or '\0' if none this frame. Drain in a loop.
+    public static bool TryReadTypedChar(out char c)
+    {
+        if (_typed.Count > 0) { c = _typed.Dequeue(); return true; }
+        c = '\0'; return false;
+    }
+
+    // Clear any buffered typed chars (e.g. when focus leaves all fields).
+    public static void ClearTypedChars() => _typed.Clear();
+
     // ---- Gamepad (Xbox-style, player 0 by default) ----------------------------------------------
     // All gated by Enabled like the rest, and safe when no controller is connected (false / 0).
 

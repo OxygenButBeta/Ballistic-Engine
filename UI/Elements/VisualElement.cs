@@ -60,11 +60,76 @@ public class VisualElement
     public event System.Action<PointerEvent> PointerDown;
     public event System.Action<PointerEvent> PointerUp;
     public event System.Action<PointerEvent> PointerClick;
+    public event System.Action<PointerEvent> PointerDoubleClick; // P3.1 — second click within the double-click window
+    public event System.Action<PointerEvent> PointerMove;    // P3.1 — fires while the pointer moves over/captured
+    public event System.Action<PointerEvent> PointerWheel;   // P3.6 — scroll wheel over the element (bubbles)
+
+    // Keyboard + text events (P3.3) — fire on the focused element and bubble. KeyDown/Up carry an OpenTK
+    // Key; TextInput carries a typed character (host pushes it via UIInputModule.QueueChar).
+    public event System.Action<KeyEvent> KeyDown;
+    public event System.Action<KeyEvent> KeyUp;
+    public event System.Action<char> TextInput;
+
+    // Focus events (P3.2).
+    public event System.Action FocusIn;
+    public event System.Action FocusOut;
+
+    // Whether this element can receive keyboard focus (P3.2). Controls (Button/TextField/Slider) set it;
+    // plain containers don't. TabIndex orders the Tab ring (lower first; equal = tree order).
+    public bool Focusable { get; set; }
+    public int TabIndex { get; set; }
+
+    // General-purpose user data slots (UITK's userData) — controls (ListView rows) stash an index/model
+    // here; game code can attach anything. Not serialized, not styled.
+    public object UserData { get; set; }
+    public int UserIndex { get; set; }
+
+    // Accessibility (P9.2): a semantic role ("button", "checkbox", "slider", "textfield", "list", ...)
+    // and a human label for screen readers / automation. Controls set Role; AccessibleLabel defaults to
+    // the element's text when unset. Exported by UIIntrospect so an agent (or an a11y backend) sees the
+    // semantic tree, not just boxes.
+    public string Role { get; set; }
+    public string AccessibleLabel { get; set; }
+
+    internal void FirePointerDoubleClick(PointerEvent e) => PointerDoubleClick?.Invoke(e);
+    internal void FirePointerMove(PointerEvent e) => PointerMove?.Invoke(e);
+    internal void FirePointerWheel(PointerEvent e) => PointerWheel?.Invoke(e);
+    internal void FireKeyDown(KeyEvent e) => KeyDown?.Invoke(e);
+    internal void FireKeyUp(KeyEvent e) => KeyUp?.Invoke(e);
+    internal void FireTextInput(char c) => TextInput?.Invoke(c);
+    internal void FireFocusIn() => FocusIn?.Invoke();
+    internal void FireFocusOut() => FocusOut?.Invoke();
+
+    // The document this element's tree belongs to, set when the tree is built/attached. Used to request a
+    // restyle when a class or interaction state changes (P2.2) so :hover/:active/:focus and dynamic class
+    // toggles re-resolve from scratch (and revert) instead of sticking. Null for detached/test trees.
+    internal UIDocument OwnerDocument;
+
+    // Request a from-scratch restyle of this element + its inheriting subtree on the next frame. No-op
+    // when detached (no owner) — tests resolve explicitly.
+    internal void RequestRestyle() => OwnerDocument?.MarkRestyleDirty(this);
 
     // Whether the pointer is currently over this element — kept in sync by the input module so the
-    // cascade can apply :hover, and so a subclass can react. Read-only to the outside.
-    public bool IsHovered { get; internal set; }
-    public bool IsPressed { get; internal set; }
+    // cascade can apply :hover, and so a subclass can react. Read-only to the outside. Toggling either
+    // flips the matching pseudo-class AND requests a restyle so the :hover/:active rules apply + revert.
+    bool _isHovered, _isPressed;
+    public bool IsHovered
+    {
+        get => _isHovered;
+        internal set { if (_isHovered == value) return; _isHovered = value; EnableInClassList("hover", value); }
+    }
+    public bool IsPressed
+    {
+        get => _isPressed;
+        internal set { if (_isPressed == value) return; _isPressed = value; EnableInClassList("active", value); }
+    }
+    // Focus state (P3.2 wires the focus system; here we model the class + restyle so :focus styles work).
+    bool _isFocused;
+    public bool IsFocused
+    {
+        get => _isFocused;
+        internal set { if (_isFocused == value) return; _isFocused = value; EnableInClassList("focus", value); }
+    }
 
     internal void FirePointerEnter(PointerEvent e) => PointerEnter?.Invoke(e);
     internal void FirePointerLeave(PointerEvent e) => PointerLeave?.Invoke(e);
@@ -141,9 +206,13 @@ public class VisualElement
     {
         if (string.IsNullOrEmpty(className) || _classes.Contains(className)) return;
         _classes.Add(className);
+        RequestRestyle();
     }
 
-    public void RemoveFromClassList(string className) => _classes.Remove(className);
+    public void RemoveFromClassList(string className)
+    {
+        if (_classes.Remove(className)) RequestRestyle();
+    }
 
     public bool ClassListContains(string className) => _classes.Contains(className);
 
