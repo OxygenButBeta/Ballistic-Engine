@@ -120,7 +120,11 @@ public static class GameScripts {
         if (!Directory.Exists(project.AssetsPath))
             return [];
 
+        // Exclude Assets\Editor\ — those compile into the editor-only EditorScripts.dll, not here (the
+        // csproj's Compile glob excludes them too; this keeps the up-to-date stamp's source set in sync).
+        string editorDir = Path.Combine(project.AssetsPath, "Editor") + Path.DirectorySeparatorChar;
         return Directory.EnumerateFiles(project.AssetsPath, "*.cs", SearchOption.AllDirectories)
+            .Where(p => !p.StartsWith(editorDir, StringComparison.OrdinalIgnoreCase))
             .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
@@ -185,7 +189,11 @@ public static class GameScripts {
               </PropertyGroup>
 
               <ItemGroup>
-                <Compile Include="Assets\**\*.cs" />
+                <!-- Assets\Editor\ is EXCLUDED: those are editor-only scripts (custom EditorWindows) that
+                     reference BallisticEngine.Editor.dll and compile into a SEPARATE EditorScripts.dll the
+                     player never loads. Letting them into GameScripts.dll would crash the player (no editor
+                     assembly there). See GameEditorScripts in the editor. -->
+                <Compile Include="Assets\**\*.cs" Exclude="Assets\Editor\**\*.cs" />
               </ItemGroup>
 
               <ItemGroup>

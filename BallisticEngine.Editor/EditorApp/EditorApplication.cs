@@ -121,6 +121,17 @@ internal sealed class EditorApplication {
         Profiler.Backend = profiler;
         profilerPanel = new ProfilerPanel(profiler);   // the panel reads this backend each frame
 
+        // User editor scripts (Assets\Editor\): compile the editor-only EditorScripts.dll and inject it into
+        // the reflection scan set BEFORE bootstrap builds the component registry / TypeCache (which happens
+        // inside the EngineBootstrap ctor below). The provider is lazy — it fires during that ctor, after the
+        // project is opened — so a game dev's custom [EditorWindowMeta] windows are discovered at startup.
+        // (A shipped player never sets this, so EditorScripts.dll never enters the player build.)
+        EngineBootstrap.ExtraScanAssemblies = () => {
+            System.Reflection.Assembly asm = GameEditorScripts.CompileAndLoad(
+                BallisticEngine.AssetPipeline.BallisticProject.Open(projectPath));
+            return asm is null ? System.Array.Empty<System.Reflection.Assembly>() : [asm];
+        };
+
         // Defer the (slow) asset import: bring the window up first, then refresh asynchronously behind
         // the busy overlay. The startup scene loads once that first import completes (see OnRender).
         bootstrap = new EngineBootstrap(runtime, projectPath, deferAssetRefresh: true);

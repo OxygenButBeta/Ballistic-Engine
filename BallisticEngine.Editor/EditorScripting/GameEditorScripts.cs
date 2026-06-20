@@ -1,0 +1,333 @@
+using System.Diagnostics;
+using System.Reflection;
+using System.Runtime.Loader;
+using BallisticEngine.AssetPipeline;
+
+namespace BallisticEngine.Editor;
+
+// Editor-only game scripting (Unity's `Assets/Editor/` model): every .cs under Assets\Editor\ compiles
+// into a SEPARATE assembly — EditorScripts.dll — that references BallisticEngine.Editor.dll, so a game
+// developer can write custom EditorWindow subclasses (and other editor tooling) against the public
+// EditorWindow + IEditorGui API. This assembly is loaded ONLY by the editor and NEVER enters the player
+// build, which is why editor windows must live here and not in the regular GameScripts.dll: the player
+// has no editor assembly, so a GameScripts type referencing EditorWindow would fail to load and crash the
+// player. Separating them keeps that rule mechanical (the player simply never compiles/loads this).
+//
+// Mirrors GameScripts (collectible ALC, byte-load so the file stays unlocked, engine/editor types resolve
+// from the default context so identity never splits). The compile references the RUNNING editor's binaries
+// plus the project's already-built GameScripts.dll, so an editor window can use the game's own types.
+//
+// Discovery: the editor injects LoadedAssembly into EngineBootstrap.ExtraScanAssemblies, so TypeCache scans
+// it and UserEditorWindowRegistry finds the [EditorWindowMeta] windows exactly like built-in ones — and a
+// hot-reload re-runs the whole thing.
+internal static class GameEditorScripts {
+    public const string AssemblyName = "EditorScripts";
+
+    static EditorScriptLoadContext loadContext;
+
+    public static Assembly LoadedAssembly { get; private set; }
+
+    public static IReadOnlyList<ScriptDiagnostic> LastDiagnostics { get; private set; } = [];
+    public static bool CompileFailed { get; private set; }
+
+    // Compile (if Assets\Editor\ has any .cs) and load into a fresh collectible context. Returns the
+    // loaded assembly, or null when there are no editor scripts / the build failed (the editor keeps
+    // running either way; errors go to the Console). Unloads any previously-loaded copy first.
+    public static Assembly CompileAndLoad(BallisticProject project) {
+        if (!TryCompile(project, out string assemblyPath) || assemblyPath is null)
+            return null;
+        Unload();
+        return LoadFrom(assemblyPath);
+    }
+
+    public static bool TryCompile(BallisticProject project, out string assemblyPath) {
+        assemblyPath = null;
+
+        List<string> sources = FindSources(project);
+        if (sources.Count == 0) {
+            CompileFailed = false;
+            return true;   // no editor scripts — not an error
+        }
+
+        string csprojPath = EnsureProjectFile(project);
+        string dllPath = Path.Combine(project.LibraryPath, "ScriptAssemblies", AssemblyName + ".dll");
+
+        if (IsUpToDate(csprojPath, sources, dllPath)) {
+            CompileFailed = false;
+            assemblyPath = dllPath;
+            return true;
+        }
+
+        if (!RunBuild(project, csprojPath)) {
+            CompileFailed = true;
+            return false;
+        }
+
+        CompileFailed = false;
+        File.WriteAllText(StampPath(dllPath), StampContent(project, sources));
+        assemblyPath = dllPath;
+        return true;
+    }
+
+    public static Assembly LoadFrom(string assemblyPath) {
+        if (!File.Exists(assemblyPath)) {
+            Debugging.LogError($"Editor scripts: built assembly not found at '{assemblyPath}'.");
+            return null;
+        }
+
+        loadContext = new EditorScriptLoadContext(Path.GetDirectoryName(assemblyPath));
+        LoadedAssembly = loadContext.LoadFromBytes(assemblyPath);
+
+        var windowNames = LoadedAssembly.GetTypes()
+            .Where(t => !t.IsAbstract && typeof(EditorWindow).IsAssignableFrom(t))
+            .Select(t => t.Name)
+            .ToList();
+        Debugging.Log($"Editor scripts: loaded {Path.GetFileName(assemblyPath)} " +
+                      $"({windowNames.Count} editor window(s): {string.Join(", ", windowNames)})");
+        return LoadedAssembly;
+    }
+
+    public static void Unload() {
+        if (loadContext is null)
+            return;
+        loadContext.Unload();
+        loadContext = null;
+        LoadedAssembly = null;
+    }
+
+    // Only Assets\Editor\**\*.cs — the Unity convention. (The regular GameScripts build EXCLUDES this
+    // folder, see EnsureProjectFile below; the two source sets are disjoint.)
+    static List<string> FindSources(BallisticProject project) {
+        string editorDir = Path.Combine(project.AssetsPath, "Editor");
+        if (!Directory.Exists(editorDir))
+            return [];
+        return Directory.EnumerateFiles(editorDir, "*.cs", SearchOption.AllDirectories)
+            .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    const string GeneratedMarker = "Generated by Ballistic Engine";
+
+    // Returns the project's EditorScripts.csproj path, (re)generating it when engine-managed (same
+    // marker-comment ownership rule as Scripts.csproj). References the running editor's binaries so editor
+    // scripts compile against exactly the editor they'll run inside.
+    public static string EnsureProjectFile(BallisticProject project) {
+        string csproj = Path.Combine(project.RootPath, "EditorScripts.csproj");
+        string content = GeneratedProjectContent(project);
+
+        if (!File.Exists(csproj)) {
+            File.WriteAllText(csproj, content);
+        }
+        else {
+            string existing = File.ReadAllText(csproj);
+            if (existing.Contains(GeneratedMarker) && existing != content)
+                File.WriteAllText(csproj, content);
+        }
+        return csproj;
+    }
+
+    // Binaries dir of the RUNNING editor host (where BallisticEngine.Editor.dll + engine dlls live).
+    static string EditorBinariesDir() =>
+        Path.GetDirectoryName(typeof(GameEditorScripts).Assembly.Location);
+
+    static string GeneratedProjectContent(BallisticProject project) {
+        string editorDir = EditorBinariesDir();
+        // Reference the project's own GameScripts.dll too (so an editor window can use the game's types).
+        string gameScriptsDll = Path.Combine(project.LibraryPath, "ScriptAssemblies", GameScripts.AssemblyName + ".dll");
+        string gameScriptsRef = File.Exists(gameScriptsDll)
+            ? $"""
+                    <Reference Include="{GameScripts.AssemblyName}">
+                      <HintPath>{gameScriptsDll}</HintPath>
+                      <Private>false</Private>
+                    </Reference>
+            """
+            : "";
+
+        return $"""
+            <Project Sdk="Microsoft.NET.Sdk">
+
+              <!-- Generated by Ballistic Engine: compiles Assets\Editor\**\*.cs into
+                   Library\ScriptAssemblies\EditorScripts.dll (EDITOR-ONLY — never shipped in the player).
+                   Write custom EditorWindow subclasses here, against the editor's public EditorWindow +
+                   IEditorGui API. The engine rewrites this file while this marker comment is present;
+                   DELETE the comment to take ownership (NuGet packages / settings). -->
+
+              <PropertyGroup>
+                <TargetFramework>net9.0</TargetFramework>
+                <ImplicitUsings>enable</ImplicitUsings>
+                <Nullable>disable</Nullable>
+                <AssemblyName>{AssemblyName}</AssemblyName>
+                <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+                <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+                <OutputPath>Library\ScriptAssemblies\</OutputPath>
+                <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+                <DebugType>portable</DebugType>
+                <BallisticEditorDir Condition="'$(BallisticEditorDir)' == ''">{editorDir}</BallisticEditorDir>
+              </PropertyGroup>
+
+              <ItemGroup>
+                <Compile Include="Assets\Editor\**\*.cs" />
+              </ItemGroup>
+
+              <ItemGroup>
+                <Reference Include="BallisticEngine">
+                  <HintPath>$(BallisticEditorDir)\BallisticEngine.dll</HintPath>
+                  <Private>false</Private>
+                </Reference>
+                <Reference Include="BallisticEngine.Editor">
+                  <HintPath>$(BallisticEditorDir)\BallisticEngine.Editor.dll</HintPath>
+                  <Private>false</Private>
+                </Reference>
+                <Reference Include="OpenTK.Windowing.GraphicsLibraryFramework">
+                  <HintPath>$(BallisticEditorDir)\OpenTK.Windowing.GraphicsLibraryFramework.dll</HintPath>
+                  <Private>false</Private>
+                </Reference>
+            {gameScriptsRef}
+              </ItemGroup>
+
+            </Project>
+            """;
+    }
+
+    static string StampPath(string dllPath) => dllPath + ".sources";
+
+    static string StampContent(BallisticProject project, List<string> sources) =>
+        string.Join('\n', sources.Select(project.ToAssetPath));
+
+    static bool IsUpToDate(string csprojPath, List<string> sources, string dllPath) {
+        if (!File.Exists(dllPath) || !File.Exists(StampPath(dllPath)))
+            return false;
+
+        DateTime built = File.GetLastWriteTimeUtc(dllPath);
+        if (File.GetLastWriteTimeUtc(csprojPath) > built)
+            return false;
+        if (sources.Any(s => File.GetLastWriteTimeUtc(s) > built))
+            return false;
+        return StampMatches(File.ReadAllText(StampPath(dllPath)), sources);
+    }
+
+    static bool StampMatches(string stamped, List<string> sources) {
+        var stampedSet = stamped.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        if (stampedSet.Length != sources.Count)
+            return false;
+        for (var i = 0; i < sources.Count; i++) {
+            var normalized = sources[i].Replace(Path.DirectorySeparatorChar, '/');
+            if (!normalized.EndsWith(stampedSet[i], StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+        return true;
+    }
+
+    // ---- dotnet build -------------------------------------------------------
+
+    static readonly System.Text.RegularExpressions.Regex DiagnosticPattern = new(
+        @"^\s*(?<file>[^(]+)\((?<line>\d+),(?<col>\d+)\):\s+(?<sev>error|warning)\s+(?<code>[A-Za-z]+\d+):\s+(?<msg>.+?)(\s+\[[^\]]+\])?$",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    static bool RunBuild(BallisticProject project, string csprojPath) {
+        var stopwatch = Stopwatch.StartNew();
+
+        var startInfo = new ProcessStartInfo("dotnet") {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = project.RootPath,
+        };
+        startInfo.ArgumentList.Add("build");
+        startInfo.ArgumentList.Add(csprojPath);
+        startInfo.ArgumentList.Add("-nologo");
+        startInfo.ArgumentList.Add("-v:m");
+        startInfo.ArgumentList.Add($"-p:BallisticEditorDir={EditorBinariesDir()}");
+
+        string output;
+        int exitCode;
+        try {
+            using Process process = Process.Start(startInfo);
+            output = process.StandardOutput.ReadToEnd() + process.StandardError.ReadToEnd();
+            if (!process.WaitForExit(120_000)) {
+                process.Kill(entireProcessTree: true);
+                Debugging.LogError("Editor scripts: `dotnet build` timed out after 120s.");
+                return false;
+            }
+            exitCode = process.ExitCode;
+        }
+        catch (Exception e) {
+            Debugging.LogError($"Editor scripts: failed to run `dotnet build`: {e.Message}");
+            return false;
+        }
+
+        List<ScriptDiagnostic> diagnostics = ParseDiagnostics(project, output);
+        LastDiagnostics = diagnostics;
+        foreach (ScriptDiagnostic d in diagnostics) {
+            if (d.IsError) Debugging.LogError($"Editor scripts: {d}");
+            else Debugging.LogWarning($"Editor scripts: {d}");
+        }
+
+        var errors = diagnostics.Count(d => d.IsError);
+        var warnings = diagnostics.Count - errors;
+        if (exitCode != 0) {
+            if (errors == 0)
+                Debugging.LogError($"Editor scripts: build failed (exit {exitCode}). Output tail:\n" +
+                                   string.Join('\n', output.Split('\n').TakeLast(15)));
+            else
+                Debugging.LogError($"Editor scripts: build FAILED — {errors} error(s), {warnings} warning(s).");
+            return false;
+        }
+
+        Debugging.Log($"Editor scripts: build succeeded in {stopwatch.ElapsedMilliseconds} ms" +
+                      (warnings > 0 ? $" ({warnings} warning(s))" : "") + ".");
+        return true;
+    }
+
+    static List<ScriptDiagnostic> ParseDiagnostics(BallisticProject project, string output) {
+        List<ScriptDiagnostic> diagnostics = [];
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var line in output.Split('\n')) {
+            System.Text.RegularExpressions.Match match = DiagnosticPattern.Match(line.TrimEnd('\r'));
+            if (!match.Success)
+                continue;
+            var file = match.Groups["file"].Value.Trim();
+            if (Path.IsPathRooted(file) && file.StartsWith(project.RootPath, StringComparison.OrdinalIgnoreCase))
+                file = project.ToAssetPath(file);
+            var diagnostic = new ScriptDiagnostic(
+                file,
+                int.Parse(match.Groups["line"].Value),
+                int.Parse(match.Groups["col"].Value),
+                match.Groups["sev"].Value == "error",
+                match.Groups["code"].Value,
+                match.Groups["msg"].Value.Trim());
+            if (seen.Add(diagnostic.ToString()))
+                diagnostics.Add(diagnostic);
+        }
+        return diagnostics;
+    }
+
+    // ---- Load context -------------------------------------------------------
+
+    sealed class EditorScriptLoadContext : AssemblyLoadContext {
+        readonly string assembliesDir;
+
+        public EditorScriptLoadContext(string assembliesDir) : base(AssemblyName, isCollectible: true) {
+            this.assembliesDir = assembliesDir;
+        }
+
+        // Engine, editor, OpenTK, and BCL assemblies resolve from the DEFAULT context (return null to fall
+        // back) — a second copy would split type identity and break every `is EditorWindow` check. Only
+        // sibling dlls in ScriptAssemblies (the editor csproj's package deps, e.g. EditorScripts' own
+        // GameScripts.dll reference) load here.
+        protected override Assembly Load(AssemblyName name) {
+            var candidate = Path.Combine(assembliesDir, name.Name + ".dll");
+            return File.Exists(candidate) ? LoadFromBytes(candidate) : null;
+        }
+
+        public Assembly LoadFromBytes(string path) {
+            using var dll = new MemoryStream(File.ReadAllBytes(path));
+            var pdbPath = Path.ChangeExtension(path, ".pdb");
+            if (!File.Exists(pdbPath))
+                return LoadFromStream(dll);
+            using var pdb = new MemoryStream(File.ReadAllBytes(pdbPath));
+            return LoadFromStream(dll, pdb);
+        }
+    }
+}
