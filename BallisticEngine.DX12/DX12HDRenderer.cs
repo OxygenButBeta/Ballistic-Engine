@@ -1018,8 +1018,12 @@ public sealed class DX12HDRenderer : HDRenderer
         shadowCbSlotSize = (System.Runtime.InteropServices.Marshal.SizeOf<ShadowConstants>() + 255) & ~255;
         // MaxCascades × submesh draws per frame (sized for the full cascade budget).
         shadowCbSlotCount = MaxCascades * 4096;
+        // PP1: N-buffer the shadow CB by FramesInFlight. RenderShadows now RECORDS its depth draws into the open
+        // frame list (no per-frame ExecuteUpload submit+wait), so under CPU↔GPU overlap (P0b) the CPU can be
+        // filling frame N+1's LightMvp slots while the GPU is still reading frame N's. A single shared slab would
+        // be stomped — give each in-flight frame its own slab (base offset = FrameSlot * shadowCbSlotCount).
         shadowCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)((long)shadowCbSlotSize * shadowCbSlotCount)),
+            ResourceDescription.Buffer((ulong)((long)shadowCbSlotSize * shadowCbSlotCount * dev.FramesInFlight)),
             ResourceStates.GenericRead);
         shadowCbMapped = shadowCb.Map<byte>(0);
     }
@@ -1110,6 +1114,14 @@ public sealed class DX12HDRenderer : HDRenderer
     // the .stats.json / `bal perf` sidecar already serializes.
     readonly System.Diagnostics.Stopwatch passSw = new();
     bool? passTimingOn;
+
+    // PP1 kill-switch: BALLISTIC_DX12_PP1_INLINE_SYNCS=0 reverts shadow rendering to the legacy standalone
+    // ExecuteUpload (submit + fence-wait per frame) instead of recording into the open frame list. Default ON.
+    // Byte-identical either way (ExecuteUpload drains the GPU before the frame reads the map; recording lets the
+    // frame pipeline it) — the door exists for A/B isolation and gpu-hang bisection.
+    bool? pp1InlineSyncsOn;
+    bool Pp1InlineSyncs => pp1InlineSyncsOn ??=
+        Environment.GetEnvironmentVariable("BALLISTIC_DX12_PP1_INLINE_SYNCS") != "0";
 
     // GI motion harness: per-frame camera yaw (deg) injected in BeginRender so a headless sequence has real motion.
     int motionYawFrame;
@@ -1271,11 +1283,9 @@ public sealed class DX12HDRenderer : HDRenderer
         var fpsw = fprof ? System.Diagnostics.Stopwatch.StartNew() : null;
         void FP(string t) { if (fprof) { fpsw.Stop(); Console.WriteLine($"[FrameProf] {t} {fpsw.Elapsed.TotalMilliseconds:0.00}ms"); fpsw.Restart(); } }
 
-        if (doors.Shadows)
-            RenderShadows(view, projUnjittered, light);
-        else
-            shadowsThisFrame = false;
-        FP("RenderShadows");
+        // PP1: shadow rendering MOVED below dev.BeginFrame() — its cascade depth draws now record into the open
+        // frame list (no per-frame ExecuteUpload submit+wait). The cascade FIT is still computed before the
+        // FrameConstants write (which transposes cascadeMatrices into b1), so ordering is preserved.
 
         // IBL: bake the env→irradiance/prefilter/BRDF from the procedural sky (re-bakes only on param
         // change). Own upload command list, before the render list. Only when a ProceduralSky is active.
@@ -1300,6 +1310,16 @@ public sealed class DX12HDRenderer : HDRenderer
         // exposure-debug) use ExecuteSyncImmediate, which flushes the open list first. No-op when
         // BALLISTIC_DX12_PIPELINED=0 (then every pass submits+waits as before — the byte-identical fallback).
         dev.BeginFrame();
+
+        // PP1: render the sun cascades' depth NOW (after BeginFrame so FrameSlot is set + the frame list is open).
+        // RenderShadows records into the open frame list via ExecuteSync's frame-aware fast path and fills its
+        // N-buffered shadow CB at this frame's slot. Fit with the UNJITTERED proj for stable cascades. Must run
+        // before the FrameConstants write below (it consumes cascadeMatrices) and before the geometry pass.
+        if (doors.Shadows)
+            RenderShadows(view, projUnjittered, light);
+        else
+            shadowsThisFrame = false;
+        FP("RenderShadows");
 
         // P0b: write the motion CB into THIS frame's N-buffer slot (FrameSlot is now set by BeginFrame).
         motionCb.Write(motionConstants);
@@ -2049,7 +2069,11 @@ public sealed class DX12HDRenderer : HDRenderer
 
         // Fill per (cascade, submesh) LightMvp constants, mirroring the opaque iteration. P4: reuse a
         // pre-allocated list across frames (the old per-call `new List` churned the GC every shadow re-render).
-        int slot = 0;
+        // PP1: slots index into THIS frame's N-buffered slab (base = FrameSlot * shadowCbSlotCount), so the CPU's
+        // fill never overwrites a slab the GPU is still reading for an overlapped in-flight frame.
+        int slotBase = dev.FrameSlot * shadowCbSlotCount;
+        int slotEnd = slotBase + shadowCbSlotCount;
+        int slot = slotBase;
         var fills = shadowFills;
         fills.Clear();
         for (int c = 0; c < activeCascadeCount; c++)
@@ -2078,7 +2102,7 @@ public sealed class DX12HDRenderer : HDRenderer
                     if (sub.IndexCount <= 0) continue;
                     mesh.GetSubMeshBounds(s, out GLVector3 lmin, out GLVector3 lmax);
                     if (!AabbInFrustum(lmin, lmax, model)) continue; // outside this cascade
-                    if (slot >= shadowCbSlotCount) break;
+                    if (slot >= slotEnd) break;
                     *(ShadowConstants*)(shadowCbMapped + (long)slot * shadowCbSlotSize) =
                         new ShadowConstants { LightMvp = Matrix4x4.Transpose(lightMvp) };
                     fills.Add((c, vb, ib, sub.IndexStart, sub.IndexCount, slot));
@@ -2090,7 +2114,13 @@ public sealed class DX12HDRenderer : HDRenderer
         bool gpuShadows = gpuDrivenOn && wholeMeshRenderers.Count > 0;
         if (fills.Count == 0 && !gpuShadows) return;
 
-        dev.ExecuteUpload(cl =>
+        // PP1: RECORD the cascade depth draws into the OPEN frame list instead of a standalone ExecuteUpload
+        // submit+fence-wait. RenderShadows is now called AFTER dev.BeginFrame() (see BeginRender), so ExecuteSync
+        // takes its frame-aware fast path — appends to the single per-frame command list, no mid-frame GPU stall.
+        // Sequenced before the geometry pass, the shadow depth + ToShaderResource barrier still complete on the
+        // GPU before deferred lighting samples the map. The kill-switch reverts to the legacy ExecuteUpload
+        // (submit+wait) for A/B. The shadow CB it reads is N-buffered by FrameSlot (above), safe under overlap.
+        Action<ID3D12GraphicsCommandList4> recordShadows = cl =>
         {
             // GPU-driven whole-mesh casters: per-cascade compute cull (must precede the depth draws).
             if (gpuShadows) gpuDriven.BuildShadowCull(cl, wholeMeshRenderers, cascadeMatrices, activeCascadeCount);
@@ -2120,7 +2150,12 @@ public sealed class DX12HDRenderer : HDRenderer
             }
 
             shadowMap.ToShaderResource(cl);
-        });
+        };
+        // PP1 ON (default): record into the open frame list (frame-aware ExecuteSync — no stall). OFF: legacy
+        // standalone ExecuteUpload (submit + fence-wait). ExecuteSync also falls back to submit+wait if no frame
+        // is open (e.g. pipelining disabled), so both paths are byte-identical in output.
+        if (Pp1InlineSyncs) dev.ExecuteSync(recordShadows);
+        else                dev.ExecuteUpload(recordShadows);
         shadowsThisFrame = true;
     }
 
