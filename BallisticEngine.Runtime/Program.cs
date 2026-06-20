@@ -45,14 +45,24 @@ internal class Program {
                             || Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_MOTION_DUMP") is not null
                             || Environment.GetEnvironmentVariable("BALLISTIC_DX12_FPSBENCH") is not null
                             || Environment.GetEnvironmentVariable("BALLISTIC_DX12_RESIZE_STRESS") == "1";
+        // Resolution override (BALLISTIC_RES=WIDTHxHEIGHT, e.g. 3840x2160) — lets the headless bench/capture run
+        // at an arbitrary resolution (4K perf measurement) without changing the project settings. Falls back to
+        // the project's configured size. Parsed once.
+        int resW = player.Width, resH = player.Height;
+        if (Environment.GetEnvironmentVariable("BALLISTIC_RES") is { } resEnv) {
+            var parts = resEnv.Split('x', 'X');
+            if (parts.Length == 2 && int.TryParse(parts[0], out int rw) && int.TryParse(parts[1], out int rh)
+                && rw > 0 && rh > 0) { resW = rw; resH = rh; }
+        }
+
         IBallisticEngineRuntime runtime;
         if (headlessMode) {
-            Console.WriteLine("[Backend] DX12 host (headless — screenshot/query path).");
-            runtime = new Dx12HeadlessRuntime(player.Width, player.Height);
+            Console.WriteLine($"[Backend] DX12 host (headless — screenshot/query path) {resW}x{resH}.");
+            runtime = new Dx12HeadlessRuntime(resW, resH);
         }
         else {
             Console.WriteLine("[Backend] DX12 host (windowed player).");
-            runtime = new Dx12WindowedRuntime(player.Width, player.Height,
+            runtime = new Dx12WindowedRuntime(resW, resH,
                 fullscreen: mode == WindowMode.Fullscreen,
                 borderless: mode == WindowMode.Borderless,
                 title: player.ProductName);

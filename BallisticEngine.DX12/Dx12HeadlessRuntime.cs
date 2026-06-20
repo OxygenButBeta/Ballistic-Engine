@@ -43,6 +43,13 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
         OnWindowShow?.Invoke();
         const double dt = 1.0 / 60.0;   // fixed step — deterministic frames for verification
 
+        // The renderer inits its scene target at a hardcoded 1920x1080; sync it to the host's actual size so a
+        // BALLISTIC_RES override (e.g. 4K perf measurement) RENDERS at that resolution instead of a 1080p target
+        // the readback then reports as 1080p. No-op when the size already matches (the common 1080p path).
+        if ((window.Width != 1920 || window.Height != 1080)
+            && RenderAsset.Current.Renderer is DX12HDRenderer rr)
+            rr.ResizeSceneTarget(window.Width, window.Height);
+
         // EF3 resize-stress diagnostic (BALLISTIC_DX12_RESIZE_STRESS=1): reproduce the editor's drag-resize
         // GPU HANG headlessly. DRED reported PageFaultVA=0x0 on the live crash → NOT a use-after-free but a
         // runaway/degenerate-extent shader. The editor renders the scene at the PANEL pixel size, which
