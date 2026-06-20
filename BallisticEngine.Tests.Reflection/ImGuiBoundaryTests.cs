@@ -107,7 +107,7 @@ internal static class ImGuiBoundaryTests {
         "BallisticEngine.Editor/Panels/Inspector/Adapters/ScalarField.cs",
         // (ImGuiVolumeGui + ImGuiComponentGui migrated — route through EditorGui.Shared; dropped from list.)
         "BallisticEngine.Editor/Panels/Inspector/Preview/ComponentPreviews.cs",
-        "BallisticEngine.Editor/Panels/Inspector/InspectorLayout.cs",
+        // (InspectorLayout migrated — its 2 draw helpers route through EditorGui.Shared; rest is arithmetic.)
         "BallisticEngine.Editor/Panels/Inspector/AssetInspectors/AssetInspectors.cs",
         // Hierarchy + Assets (Phase 5): drag-drop heavy, needs seam drag-drop/context-menu first.
         "BallisticEngine.Editor/Panels/HierarchyPanel.cs",
