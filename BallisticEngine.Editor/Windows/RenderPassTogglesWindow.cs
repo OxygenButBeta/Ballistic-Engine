@@ -1,6 +1,5 @@
-using Hexa.NET.ImGui;
+using System.Numerics;
 using BallisticEngine.DX12;
-using SysVec2 = System.Numerics.Vector2;
 
 namespace BallisticEngine.Editor;
 
@@ -10,68 +9,61 @@ namespace BallisticEngine.Editor;
 //     the renderer copies its Doors struct into the next frame's context, so the change takes effect next frame.
 //   - POSTFX/Volume-gated passes (Fog/SSR) → flip the renderer's live PostFX flags (the same object the
 //     Volume framework writes every frame). These were already live; this window just gives them a checkbox too.
-// Standalone, fully-static (no field on EditorApplication needed). Self-registers a Window-menu entry in
-// EditorMenus. Diagnostic only — nothing here is serialized; it resets to the env-resolved doors on relaunch.
-internal static class RenderPassTogglesWindow {
-    static bool open;
-    public static bool IsOpen => open;
-    public static void Toggle() => open = !open;
-    public static void Open() => open = true;
+// Diagnostic only — nothing here is serialized; it resets to the env-resolved doors on relaunch.
+//
+// Phase-6 EditorWindow: was a fully-static singleton (static open/Toggle/Draw + a hand-wired [MenuItem] +
+// two Draw() call sites). Now it's an ordinary EditorWindow discovered through [EditorWindowMeta] — the
+// SAME path a user-authored window takes — so the menu entry, the toggle, and the draw are all automatic
+// (UserEditorWindowRegistry). A built-in window eating its own dogfood.
+[EditorWindowMeta("Render Pass Toggles", "Window/Render Pass Toggles", order: 26, Width = 300, Height = 360)]
+internal sealed class RenderPassTogglesWindow : EditorWindow {
+    public RenderPassTogglesWindow() {
+        NoCollapse = true;   // identity/title/size come from the attribute via ConfigureFromMeta
+    }
 
     // The live DX12 renderer, or null when the active backend isn't DX12 (then the window shows a notice).
     static DX12HDRenderer Renderer =>
         RenderAsset.Current?.Renderer as DX12HDRenderer;
 
-    public static void Draw(float scale) {
-        if (!open) return;
-
-        ImGui.SetNextWindowSize(new SysVec2(300 * scale, 360 * scale), ImGuiCond.FirstUseEver);
-        if (!ImGui.Begin("Render Pass Toggles###RenderPassToggles", ref open, ImGuiWindowFlags.NoCollapse)) {
-            ImGui.End();
-            return;
-        }
-
+    protected override void OnGui(IEditorGui gui) {
         DX12HDRenderer r = Renderer;
         if (r is null) {
-            ImGui.TextWrapped("No active DX12 renderer. (Toggles apply to the live DX12 backend.)");
-            ImGui.End();
+            gui.TextWrapped("No active DX12 renderer. (Toggles apply to the live DX12 backend.)");
             return;
         }
 
-        ImGui.TextDisabled("Door-gated passes (live)");
-        ImGui.Separator();
+        gui.TextDisabled("Door-gated passes (live)");
+        gui.Separator();
         Dx12RenderDoors d = r.Doors;
-        DoorRow(r, "Shadows", "Shadows", d.Shadows);
-        DoorRow(r, "IBL (irradiance / prefilter ambient)", "Ibl", d.Ibl);
-        DoorRow(r, "Sky", "Sky", d.Sky);
-        DoorRow(r, "SSAO", "Ssao", d.Ssao);
-        DoorRow(r, "Bloom", "Bloom", d.Bloom);
-        DoorRow(r, "Aerial Perspective (haze)", "AerialPersp", d.AerialPersp);
-        DoorRow(r, "Volume -> PostFX bridge", "Volumes", d.Volumes);
+        DoorRow(gui, r, "Shadows", "Shadows", d.Shadows);
+        DoorRow(gui, r, "IBL (irradiance / prefilter ambient)", "Ibl", d.Ibl);
+        DoorRow(gui, r, "Sky", "Sky", d.Sky);
+        DoorRow(gui, r, "SSAO", "Ssao", d.Ssao);
+        DoorRow(gui, r, "Bloom", "Bloom", d.Bloom);
+        DoorRow(gui, r, "Aerial Perspective (haze)", "AerialPersp", d.AerialPersp);
+        DoorRow(gui, r, "Volume -> PostFX bridge", "Volumes", d.Volumes);
 
-        ImGui.Spacing();
-        ImGui.TextDisabled("PostFX / volume-gated passes (live)");
-        ImGui.Separator();
+        gui.Spacing();
+        gui.TextDisabled("PostFX / volume-gated passes (live)");
+        gui.Separator();
         var pfx = r.PostFX;
         bool fog = pfx.VolumetricEnabled;
-        if (ImGui.Checkbox("Volumetric Fog", ref fog)) pfx.VolumetricEnabled = fog;
+        if (gui.Checkbox("Volumetric Fog", ref fog)) pfx.VolumetricEnabled = fog;
         bool ssr = pfx.SsrEnabled;
-        if (ImGui.Checkbox("SSR / Reflections", ref ssr)) {
+        if (gui.Checkbox("SSR / Reflections", ref ssr)) {
             pfx.SsrEnabled = ssr;
             pfx.ReflectionMode = ssr && pfx.ReflectionMode == ReflectionMode.Off ? ReflectionMode.ScreenSpace
                                : ssr ? pfx.ReflectionMode : ReflectionMode.Off;
         }
 
         if (d.Minimal) {
-            ImGui.Spacing();
-            ImGui.TextDisabled("(launched with BALLISTIC_DX12_MINIMAL=1)");
+            gui.Spacing();
+            gui.TextDisabled("(launched with BALLISTIC_DX12_MINIMAL=1)");
         }
-
-        ImGui.End();
     }
 
-    static void DoorRow(DX12HDRenderer r, string label, string door, bool value) {
+    static void DoorRow(IEditorGui gui, DX12HDRenderer r, string label, string door, bool value) {
         bool v = value;
-        if (ImGui.Checkbox(label, ref v)) r.SetDoor(door, v);
+        if (gui.Checkbox(label, ref v)) r.SetDoor(door, v);
     }
 }

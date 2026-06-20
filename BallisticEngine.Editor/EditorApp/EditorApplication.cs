@@ -775,8 +775,7 @@ internal sealed class EditorApplication {
             CurveEditorWindow.Draw(S);
             ComponentEditorWindow.Draw(S);
             UnityImportWindow.Draw(S);
-            RenderPassTogglesWindow.Draw(S);
-            UserEditorWindowRegistry.DrawAll(gui);
+            UserEditorWindowRegistry.DrawAll(gui);   // includes RenderPassToggles ([EditorWindowMeta], auto-discovered)
             DrawUnsavedPrompt();
             return;
         }
@@ -860,8 +859,8 @@ internal sealed class EditorApplication {
         CurveEditorWindow.Draw(S);
         ComponentEditorWindow.Draw(S);   // standalone component window — was only drawn while fullscreen
         UnityImportWindow.Draw(S);
-        RenderPassTogglesWindow.Draw(S);
-        UserEditorWindowRegistry.DrawAll(gui);   // user-authored [EditorWindowMeta] windows (game-editor scripts)
+        // [EditorWindowMeta] windows — built-in (RenderPassToggles) AND user-authored game-editor scripts.
+        UserEditorWindowRegistry.DrawAll(gui);
         DrawUnsavedPrompt();
 
         // Persist the layout whenever ImGui says it changed (drag/dock/resize/tab).
