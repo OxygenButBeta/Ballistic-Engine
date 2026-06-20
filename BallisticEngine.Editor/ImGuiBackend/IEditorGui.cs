@@ -127,6 +127,9 @@ public interface IEditorGui {
     bool IsItemActivated();
     bool IsItemFocused();
     bool IsItemDeactivatedAfterEdit();
+    bool IsAnyItemActive();
+    float TextLineHeightWithSpacing { get; }
+    float FrameHeightWithSpacing { get; }
 
     // ---- item geometry + focus (custom overlays: the volume override header) ----
     Vector2 ItemRectMin { get; }

@@ -156,6 +156,9 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public bool IsItemActivated() => ImGui.IsItemActivated();
     public bool IsItemFocused() => ImGui.IsItemFocused();
     public bool IsItemDeactivatedAfterEdit() => ImGui.IsItemDeactivatedAfterEdit();
+    public bool IsAnyItemActive() => ImGui.IsAnyItemActive();
+    public float TextLineHeightWithSpacing => ImGui.GetTextLineHeightWithSpacing();
+    public float FrameHeightWithSpacing => ImGui.GetFrameHeightWithSpacing();
 
     // ---- item geometry + focus ----
     public Vector2 ItemRectMin => ImGui.GetItemRectMin();

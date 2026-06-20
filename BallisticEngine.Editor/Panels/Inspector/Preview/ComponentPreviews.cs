@@ -2,11 +2,18 @@ using System.IO;
 using System.Linq;
 using BallisticEngine.AssetPipeline.Loaders;
 using BallisticEngine.UI;
-using Hexa.NET.ImGui;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec4 = System.Numerics.Vector4;
+using static BallisticEngine.Editor.Inspector.Preview.ComponentPreviewGuiAccess;
 
 namespace BallisticEngine.Editor.Inspector.Preview;
+
+// Phase-7: the component previews below draw through the IEditorGui seam (zero raw ImGui). A shared static
+// `gui` accessor (imported via `using static`) exposes the seam to every preview class without each
+// needing its own field. EditorGui.Shared is the editor's single stateless seam handle, set at startup.
+internal static class ComponentPreviewGuiAccess {
+    internal static IEditorGui gui => EditorGui.Shared;
+}
 
 // The per-component preview sections (editor-rework Rule 1 / Phase B1), one self-registering
 // IComponentPreview each. These REPLACE the `if (behaviour is Renderer/Volume/Terrain/...) DrawXxxSection`
@@ -55,29 +62,29 @@ internal sealed class RendererPreview : IComponentPreview {
         const int ScrollThreshold = 8;
         bool scroll = subMeshes.Length > ScrollThreshold;
         if (scroll) {
-            float rowH = ImGui.GetFrameHeightWithSpacing() + ImGui.GetTextLineHeightWithSpacing();
-            ImGui.BeginChild("##submatscroll", new SysVec2(0, Math.Min(10, subMeshes.Length) * rowH),
-                ImGuiChildFlags.Borders);
+            float rowH = gui.FrameHeightWithSpacing + gui.TextLineHeightWithSpacing;
+            gui.BeginChild("##submatscroll", new SysVec2(0, Math.Min(10, subMeshes.Length) * rowH),
+                border: true);
         }
         for (var i = 0; i < subMeshes.Length; i++)
             DrawSlotRow(renderer, panel, subMeshes[i], i);
         if (scroll)
-            ImGui.EndChild();
+            gui.EndChild();
     }
 
     // One submesh row: the submesh name as a label, then its editable material-override slot below it. A null
     // override inherits the material baked into the mesh; assigning one overrides just that submesh.
     static void DrawSlotRow(Renderer renderer, InspectorPanel panel, SubMeshData sub, int i) {
-        ImGui.PushID(i);
+        gui.PushId(i);
         string label = string.IsNullOrEmpty(sub.Name) ? $"Submesh {i}" : sub.Name;
-        ImGui.TextUnformatted(label);
-        if (ImGui.IsItemHovered() && !string.IsNullOrEmpty(sub.MaterialRef))
-            ImGui.SetTooltip($"{label}\nBaked: {sub.MaterialRef}");
+        gui.TextUnformatted(label);
+        if (gui.IsItemHovered() && !string.IsNullOrEmpty(sub.MaterialRef))
+            gui.Tooltip($"{label}\nBaked: {sub.MaterialRef}");
 
         Material baked = string.IsNullOrEmpty(sub.MaterialRef) ? null
             : AssetDatabase.LoadRef<Material>(sub.MaterialRef);
         panel.DrawSubMeshMaterialSlot(renderer, i, baked);
-        ImGui.PopID();
+        gui.PopId();
     }
 }
 
@@ -95,12 +102,12 @@ internal sealed class VolumePreview : IComponentPreview {
         var entity = ctx.Entity;
         var volume = (Volume)ctx.Behaviour;
         InspectorPanel panel = ctx.Panel;
-        ImGui.Spacing();
+        gui.Spacing();
 
         if (volume.Profile is null) {
-            if (ImGui.Button($"{EditorIcons.Add}  New Profile", new SysVec2(-1, 0)))
+            if (gui.Button($"{EditorIcons.Add}  New Profile", new SysVec2(-1, 0)))
                 CreateProfileAsset(entity, volume);
-            ImGui.TextDisabled("Creates a .volume asset and assigns it.");
+            gui.TextDisabled("Creates a .volume asset and assigns it.");
             return;
         }
 
@@ -125,7 +132,7 @@ internal sealed class VolumePreview : IComponentPreview {
             // edit already happened during VolumeProfileEditor.Draw above, so the mutate step is a no-op --
             // EditAsset only records the before/after revert pair here. Byte-identical to the prior
             // PushCallback (same label, same applyOld/applyNew closures).
-            if (!ImGui.IsAnyItemActive()) {
+            if (!gui.IsAnyItemActive()) {
                 object before = volumeUndoBefore;
                 object after = VolumeProfileEditor.Snapshot(prof);
                 EditorCommands.EditAsset("Edit Volume Override",
@@ -135,7 +142,7 @@ internal sealed class VolumePreview : IComponentPreview {
                 volumeUndoBefore = null;
             }
         }
-        else if (!ImGui.IsAnyItemActive()) {
+        else if (!gui.IsAnyItemActive()) {
             // Idle: this clean snapshot is the "before" for the next edit.
             volumeUndoLastClean = beforeSnap;
             volumeUndoBefore = null;
@@ -177,10 +184,10 @@ internal sealed class TerrainPreview : IComponentPreview {
     public void Draw(in ComponentPreviewContext ctx) => DrawTerrainBrushSection((Terrain)ctx.Behaviour);
 
     static void DrawTerrainBrushSection(Terrain terrain) {
-        ImGui.Spacing();
+        gui.Spacing();
 
         if (terrain.Terrain3D is null) {
-            ImGui.TextDisabled("Assign a Terrain asset to sculpt (or create one: Assets > New Terrain).");
+            gui.TextDisabled("Assign a Terrain asset to sculpt (or create one: Assets > New Terrain).");
             TerrainTool.Armed = false;
             return;
         }
@@ -188,10 +195,10 @@ internal sealed class TerrainPreview : IComponentPreview {
         EditorDecoration.DrawSectionHeader("Sculpt");
 
         bool armed = TerrainTool.Armed;
-        if (ImGui.Checkbox("Enable Brush", ref armed))
+        if (gui.Checkbox("Enable Brush", ref armed))
             TerrainTool.Armed = armed;
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Left-drag in the Scene view to sculpt. While on, clicks paint instead of selecting.");
+        if (gui.IsItemHovered())
+            gui.Tooltip("Left-drag in the Scene view to sculpt. While on, clicks paint instead of selecting.");
 
         if (!armed)
             return;
@@ -199,28 +206,28 @@ internal sealed class TerrainPreview : IComponentPreview {
         // Brush mode.
         string[] modes = ["Raise", "Lower", "Smooth", "Flatten", "Set"];
         int mode = (int)TerrainTool.Brush;
-        ImGui.SetNextItemWidth(-1);
-        if (ImGui.Combo("##terrainbrush", ref mode, modes, modes.Length))
+        gui.SetNextItemWidth(-1);
+        if (gui.Combo("##terrainbrush", ref mode, modes))
             TerrainTool.Brush = (TerrainSculpt.Brush)mode;
 
         float radius = TerrainTool.Radius;
-        if (ImGui.SliderFloat("Radius", ref radius, 0.5f, 60f, "%.1f"))
+        if (gui.SliderFloat("Radius", ref radius, 0.5f, 60f, "%.1f"))
             TerrainTool.Radius = radius;
 
         float strength = TerrainTool.Strength;
-        if (ImGui.SliderFloat("Strength", ref strength, 0.01f, 2f, "%.2f"))
+        if (gui.SliderFloat("Strength", ref strength, 0.01f, 2f, "%.2f"))
             TerrainTool.Strength = strength;
 
         // Flatten/Set converge toward a target height (0..1 of the terrain's HeightScale).
         if (TerrainTool.Brush is TerrainSculpt.Brush.Flatten or TerrainSculpt.Brush.Set) {
             float target = TerrainTool.TargetHeight;
-            if (ImGui.SliderFloat("Target Height", ref target, 0f, 1f, "%.2f"))
+            if (gui.SliderFloat("Target Height", ref target, 0f, 1f, "%.2f"))
                 TerrainTool.TargetHeight = target;
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("Normalized height (x HeightScale) the brush levels toward.");
+            if (gui.IsItemHovered())
+                gui.Tooltip("Normalized height (x HeightScale) the brush levels toward.");
         }
 
-        ImGui.TextDisabled("Pick Lower to dig; Smooth/Flatten to level.");
+        gui.TextDisabled("Pick Lower to dig; Smooth/Flatten to level.");
     }
 }
 
@@ -236,12 +243,12 @@ internal sealed class AudioSourcePreview : IComponentPreview {
         EditorDecoration.DrawSectionHeader("Preview");
 
         if (source.Clip is null) {
-            ImGui.TextDisabled("Assign a Clip to preview.");
+            gui.TextDisabled("Assign a Clip to preview.");
             return;
         }
 
         bool playing = InspectorPanel.audioPreviewVoice is { IsPlaying: true };
-        if (ImGui.Button(playing ? $"{EditorIcons.Pause}  Stop" : $"{EditorIcons.Play}  Preview",
+        if (gui.Button(playing ? $"{EditorIcons.Pause}  Stop" : $"{EditorIcons.Play}  Preview",
                 new SysVec2(120, 0))) {
             InspectorPanel.audioPreviewVoice?.Stop();
             InspectorPanel.audioPreviewVoice = playing
@@ -249,14 +256,14 @@ internal sealed class AudioSourcePreview : IComponentPreview {
                 : Audio.Play(source.Clip, source.Volume, source.Pitch, loop: false);
             playing = !playing;
         }
-        ImGui.SameLine();
-        ImGui.TextDisabled($"{source.Clip.DurationSeconds:F1}s, {source.Clip.Channels}ch, {source.Clip.SampleRate}Hz");
+        gui.SameLine();
+        gui.TextDisabled($"{source.Clip.DurationSeconds:F1}s, {source.Clip.Channels}ch, {source.Clip.SampleRate}Hz");
 
         EditorWidgets.AudioScrubber(source.Clip, source.Volume, source.Pitch,
             ref InspectorPanel.audioPreviewVoice, ref InspectorPanel.audioPreviewTime, ctx.Panel.MarkViewportDirty);
 
         if (!Audio.IsAvailable)
-            ImGui.TextDisabled("(no audio device on this machine — preview is silent)");
+            gui.TextDisabled("(no audio device on this machine — preview is silent)");
     }
 }
 
@@ -286,33 +293,33 @@ internal sealed class AnimatorControllerPreview : IComponentPreview {
         EditorDecoration.DrawSectionHeader("State Machine");
 
         if (controller.StateCount == 0) {
-            ImGui.TextDisabled("No states. Build the graph in a script's OnBegin:");
-            ImGui.TextDisabled("  AddState(name, clip); state.To(target, param, Compare, ...)");
+            gui.TextDisabled("No states. Build the graph in a script's OnBegin:");
+            gui.TextDisabled("  AddState(name, clip); state.To(target, param, Compare, ...)");
             return;
         }
 
         if (!SceneManager.IsPlaying)
-            ImGui.TextDisabled("Enter play mode to drive the graph.");
+            gui.TextDisabled("Enter play mode to drive the graph.");
 
         // Current state banner.
         string cur = controller.CurrentStateName ?? "(none)";
-        ImGui.Text("Current: ");
-        ImGui.SameLine();
-        ImGui.TextColored(EditorTheme.Info, cur);
+        gui.Text("Current: ");
+        gui.SameLine();
+        gui.TextColored(EditorTheme.Info, cur);
 
         // State list with the active one highlighted.
-        ImGui.Spacing();
-        ImGui.TextDisabled($"States ({controller.StateCount})");
+        gui.Spacing();
+        gui.TextDisabled($"States ({controller.StateCount})");
         foreach (AnimatorController.State s in controller.States) {
             bool isCurrent = s.Name == controller.CurrentStateName;
             string label = $"{(isCurrent ? EditorIcons.Play + " " : "   ")}{s.Name}";
             string clipName = s.Clip is not null ? s.Clip.Name : "(no clip)";
             if (isCurrent)
-                ImGui.TextColored(EditorTheme.Info, $"{label}  ->  {clipName}");
+                gui.TextColored(EditorTheme.Info, $"{label}  ->  {clipName}");
             else
-                ImGui.TextDisabled($"{label}  ->  {clipName}");
+                gui.TextDisabled($"{label}  ->  {clipName}");
             // A click jumps to the state (play mode) — handy for testing.
-            if (SceneManager.IsPlaying && ImGui.IsItemClicked())
+            if (SceneManager.IsPlaying && gui.IsItemClicked())
                 controller.Play(s.Name);
         }
 
@@ -325,24 +332,24 @@ internal sealed class AnimatorControllerPreview : IComponentPreview {
                 switch (kv.Value) {
                     case AnimatorController.ParamKind.Bool: {
                         bool b = controller.GetBool(name);
-                        if (ImGui.Checkbox(name, ref b)) controller.SetBool(name, b);
+                        if (gui.Checkbox(name, ref b)) controller.SetBool(name, b);
                         break;
                     }
                     case AnimatorController.ParamKind.Trigger: {
-                        if (ImGui.Button($"{EditorIcons.Play} {name}", new SysVec2(140, 0)))
+                        if (gui.Button($"{EditorIcons.Play} {name}", new SysVec2(140, 0)))
                             controller.SetTrigger(name);
-                        ImGui.SameLine();
-                        ImGui.TextDisabled(controller.GetTrigger(name) ? "(set)" : "");
+                        gui.SameLine();
+                        gui.TextDisabled(controller.GetTrigger(name) ? "(set)" : "");
                         break;
                     }
                     case AnimatorController.ParamKind.Int: {
                         int iv = controller.GetInt(name);
-                        if (ImGui.DragInt(name, ref iv)) controller.SetInt(name, iv);
+                        if (gui.DragInt(name, ref iv)) controller.SetInt(name, iv);
                         break;
                     }
                     default: { // Float
                         float fv = controller.GetFloat(name);
-                        if (ImGui.DragFloat(name, ref fv, 0.05f)) controller.SetFloat(name, fv);
+                        if (gui.DragFloat(name, ref fv, 0.05f)) controller.SetFloat(name, fv);
                         break;
                     }
                 }
@@ -370,19 +377,19 @@ internal sealed class LightAnimatorPreview : IComponentPreview {
         bool hasLight = lightAnim.GetComponent<PointLight>() is not null
                      || lightAnim.GetComponent<SpotLight>() is not null;
         if (!hasLight) {
-            ImGui.TextColored(EditorTheme.Warning, "No PointLight or SpotLight on this entity.");
-            ImGui.TextDisabled("Add one — the animator drives its Intensity + Color.");
+            gui.TextColored(EditorTheme.Warning, "No PointLight or SpotLight on this entity.");
+            gui.TextDisabled("Add one — the animator drives its Intensity + Color.");
             return;
         }
 
-        if (ImGui.Button(lightAnimPreview ? $"{EditorIcons.Pause}  Stop Preview" : $"{EditorIcons.Play}  Preview",
+        if (gui.Button(lightAnimPreview ? $"{EditorIcons.Pause}  Stop Preview" : $"{EditorIcons.Play}  Preview",
                 new SysVec2(140, 0))) {
             lightAnimPreview = !lightAnimPreview;
             if (lightAnimPreview) lightAnimPreviewClock = 0f;
             else { lightAnim.RestoreBase(); ctx.Panel.MarkViewportDirty(); } // un-dim the light when stopping
         }
-        ImGui.SameLine();
-        ImGui.TextDisabled(lightAnim.Animation.ToString());
+        gui.SameLine();
+        gui.TextDisabled(lightAnim.Animation.ToString());
 
         // Drive the light in edit mode along its own preview clock (play mode runs Tick itself).
         if (lightAnimPreview && !SceneManager.IsPlaying) {
@@ -403,20 +410,20 @@ internal sealed class SpawnerPreview : IComponentPreview {
         EditorDecoration.DrawSectionHeader("Spawner");
 
         if (spawner.Prefab is null) {
-            ImGui.TextColored(EditorTheme.Warning, "Assign a Prefab to spawn.");
+            gui.TextColored(EditorTheme.Warning, "Assign a Prefab to spawn.");
             return;
         }
 
-        ImGui.Text($"Alive: {spawner.AliveCount} / {spawner.MaxAlive}");
-        ImGui.SameLine();
-        ImGui.TextDisabled($"(pooled: {spawner.PooledCount})");
+        gui.Text($"Alive: {spawner.AliveCount} / {spawner.MaxAlive}");
+        gui.SameLine();
+        gui.TextDisabled($"(pooled: {spawner.PooledCount})");
 
-        if (ImGui.Button($"{EditorIcons.Play}  Spawn One", new SysVec2(120, 0))) {
+        if (gui.Button($"{EditorIcons.Play}  Spawn One", new SysVec2(120, 0))) {
             spawner.Spawn();
             ctx.Panel.MarkViewportDirty();
         }
-        ImGui.SameLine();
-        if (ImGui.Button($"{EditorIcons.Refresh}  Clear", new SysVec2(120, 0))) {
+        gui.SameLine();
+        if (gui.Button($"{EditorIcons.Refresh}  Clear", new SysVec2(120, 0))) {
             spawner.Clear();
             ctx.Panel.MarkViewportDirty();
         }
@@ -435,30 +442,30 @@ internal sealed class HealthPreview : IComponentPreview {
 
         float frac = health.HealthFraction;
         // Manual bar (green->red by remaining fraction), so it works without ProgressBar styling.
-        var draw = ImGui.GetWindowDrawList();
-        SysVec2 p = ImGui.GetCursorScreenPos();
-        float w = MathF.Max(ImGui.GetContentRegionAvail().X, 60f);
+        IEditorDrawList draw = gui.WindowDrawList;
+        SysVec2 p = gui.CursorScreenPos;
+        float w = MathF.Max(gui.ContentRegionAvail.X, 60f);
         const float h = 18f;
         draw.AddRectFilled(p, p + new SysVec2(w, h), 0xFF202428, 3f);
-        var barCol = ImGui.GetColorU32(new SysVec4(1f - frac, frac, 0.12f, 1f));
+        var barCol = gui.ColorU32(new SysVec4(1f - frac, frac, 0.12f, 1f));
         if (frac > 0f)
             draw.AddRectFilled(p, p + new SysVec2(w * frac, h), barCol, 3f);
         draw.AddRect(p, p + new SysVec2(w, h), 0xFF000000, 3f);
         string label = health.IsDead ? "DEAD" : $"{health.CurrentHealth:0} / {health.MaxHealth:0}";
-        SysVec2 ts = ImGui.CalcTextSize(label);
+        SysVec2 ts = gui.CalcTextSize(label);
         draw.AddText(p + new SysVec2((w - ts.X) * 0.5f, (h - ts.Y) * 0.5f), 0xFFFFFFFF, label);
-        ImGui.Dummy(new SysVec2(w, h));
+        gui.Dummy(new SysVec2(w, h));
 
-        if (ImGui.Button("Damage 10", new SysVec2(90, 0))) { health.TakeDamage(10f); ctx.Panel.MarkViewportDirty(); }
-        ImGui.SameLine();
-        if (ImGui.Button("Heal 10", new SysVec2(90, 0))) { health.Heal(10f); ctx.Panel.MarkViewportDirty(); }
-        ImGui.SameLine();
-        if (ImGui.Button("Kill", new SysVec2(70, 0))) { health.Kill(); ctx.Panel.MarkViewportDirty(); }
-        ImGui.SameLine();
-        if (ImGui.Button("Revive", new SysVec2(70, 0))) { health.Revive(); ctx.Panel.MarkViewportDirty(); }
+        if (gui.Button("Damage 10", new SysVec2(90, 0))) { health.TakeDamage(10f); ctx.Panel.MarkViewportDirty(); }
+        gui.SameLine();
+        if (gui.Button("Heal 10", new SysVec2(90, 0))) { health.Heal(10f); ctx.Panel.MarkViewportDirty(); }
+        gui.SameLine();
+        if (gui.Button("Kill", new SysVec2(70, 0))) { health.Kill(); ctx.Panel.MarkViewportDirty(); }
+        gui.SameLine();
+        if (gui.Button("Revive", new SysVec2(70, 0))) { health.Revive(); ctx.Panel.MarkViewportDirty(); }
 
         if (!SceneManager.IsPlaying)
-            ImGui.TextDisabled("Edit-mode tests don't fire DestroyOnDeath (play only).");
+            gui.TextDisabled("Edit-mode tests don't fire DestroyOnDeath (play only).");
     }
 }
 
@@ -474,17 +481,17 @@ internal sealed class UIDocumentPreview : IComponentPreview {
         EditorDecoration.DrawSectionHeader("Markup & Style");
         DrawPathDropField(panel, "UXML (markup)", doc.Uxml, [".uxml", ".uihtml", ".html"], p => doc.Uxml = p);
         DrawPathDropField(panel, "USS (style)", doc.Uss, [".uss", ".uicss", ".css"], p => doc.Uss = p);
-        ImGui.TextDisabled("Drag a markup/style asset here, or type its Assets/... path.");
+        gui.TextDisabled("Drag a markup/style asset here, or type its Assets/... path.");
     }
 
     // A text field for an asset PATH that also accepts a drag-drop of a matching-extension asset (sets
     // the field to the dropped asset's path). `exts` are the accepted extensions (lowercase, with dot).
     static void DrawPathDropField(InspectorPanel panel, string label, string current, string[] exts, Action<string> apply) {
-        ImGui.PushID(label);
-        ImGui.TextDisabled(label);
+        gui.PushId(label);
+        gui.TextDisabled(label);
         var s = current ?? "";
-        ImGui.SetNextItemWidth(-1);
-        if (ImGui.InputText("##path", ref s, 256)) {
+        gui.SetNextItemWidth(-1);
+        if (gui.InputText("##path", ref s, 256)) {
             // `apply` is an opaque closure that may write any target (UIDocument paths etc.) and the
             // entity is not reachable here, so this stays a whole-scene structural snapshot.
             EditorCommands.Structural($"Edit {label}", () => { apply(s); panel.MarkViewportDirty(); });
@@ -496,7 +503,7 @@ internal sealed class UIDocumentPreview : IComponentPreview {
                 EditorCommands.Structural($"Assign {label}", () => { apply(path); panel.MarkViewportDirty(); });
             }
         }
-        ImGui.PopID();
+        gui.PopId();
     }
 }
 
@@ -512,14 +519,14 @@ internal sealed class ParticleSystemPreview : IComponentPreview {
         // Two equal half-width buttons that fill the row (auto-width 110px clipped the labels to
         // "Resta.../Emit 5" in a narrow inspector); the live count goes on its own line so nothing
         // gets squeezed off.
-        float spacing = ImGui.GetStyle().ItemSpacing.X;
-        float w = (ImGui.GetContentRegionAvail().X - spacing) * 0.5f;
-        if (ImGui.Button($"{EditorIcons.Refresh}  Restart", new SysVec2(w, 0)))
+        float spacing = gui.ItemSpacing.X;
+        float w = (gui.ContentRegionAvail.X - spacing) * 0.5f;
+        if (gui.Button($"{EditorIcons.Refresh}  Restart", new SysVec2(w, 0)))
             particles.Clear();
-        ImGui.SameLine();
-        if (ImGui.Button($"{EditorIcons.Play}  Emit 50", new SysVec2(w, 0)))
+        gui.SameLine();
+        if (gui.Button($"{EditorIcons.Play}  Emit 50", new SysVec2(w, 0)))
             particles.Emit(50);
-        ImGui.TextDisabled($"{particles.LiveCount} live");
+        gui.TextDisabled($"{particles.LiveCount} live");
 
         if (particles.LiveCount > 0)
             ctx.Panel.MarkViewportDirty();
@@ -533,9 +540,9 @@ internal sealed class TrailRendererPreview : IComponentPreview {
         var trail = (TrailRenderer)ctx.Behaviour;
         EditorDecoration.DrawSectionHeader("Preview");
 
-        if (ImGui.Button($"{EditorIcons.Refresh}  Clear", new SysVec2(-1, 0)))
+        if (gui.Button($"{EditorIcons.Refresh}  Clear", new SysVec2(-1, 0)))
             trail.Clear();
-        ImGui.TextDisabled($"{trail.PointCount} points");
+        gui.TextDisabled($"{trail.PointCount} points");
 
         if (trail.PointCount > 0)
             ctx.Panel.MarkViewportDirty();
