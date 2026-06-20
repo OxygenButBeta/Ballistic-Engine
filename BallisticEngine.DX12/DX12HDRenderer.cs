@@ -1145,6 +1145,12 @@ public sealed class DX12HDRenderer : HDRenderer
     bool GpuDrivenSplit => gpuDrivenSplitOn ??=
         Environment.GetEnvironmentVariable("BALLISTIC_DX12_GPUDRIVEN_SPLIT") == "1";
 
+    // Geometric-LOD opt-in: BALLISTIC_DX12_LOD=1 enables screen-size LOD selection on the GPU cull (and the CPU
+    // per-submesh path). Default OFF → every submesh draws LOD0 → byte-identical. BALLISTIC_DX12_LOD_BIAS=<f>
+    // overrides the global span bias; BALLISTIC_DX12_LOD_FORCE=<n> pins every submesh to LOD n (A/B captures).
+    bool? lodOn;
+    bool LodEnabled => lodOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_LOD") == "1";
+
     // R3b opt-in: BALLISTIC_DX12_GPUDRIVEN_SKINNED=1 skins on the compute path into transient buffers, then draws
     // the skinned result through the static GPU-driven bindless path (no skinned VS / skinned PSO). Default OFF
     // (a new compute pass + UAV<->vertex state dance — DRED + SkinTest byte-identical gated before default-ON).
@@ -1202,6 +1208,17 @@ public sealed class DX12HDRenderer : HDRenderer
             return default;
         cpuFrameSw.Restart(); // CPU render-submission cost (the AI-measurable frame budget)
         if (PassTimingEnabled) RenderStats.Scene.GpuPasses.Clear(); // fresh per-pass GPU timings each frame
+
+        // Geometric LOD wiring (the GPU cull + CPU path read LodSettings). FreezeForDeterminism forces LOD0 under
+        // deterministic capture so paused goldens/diffs stay bit-exact and frame 60 == frame 240. Door OFF or
+        // freeze ⇒ Active is false ⇒ every submesh draws LOD0 ⇒ byte-identical.
+        LodSettings.Enabled = LodEnabled;
+        LodSettings.FreezeForDeterminism = DeterministicCapture;
+        if (LodEnabled) {
+            LodSettings.GlobalBias = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_LOD_BIAS"),
+                System.Globalization.CultureInfo.InvariantCulture, out float lb) ? lb : 1f;
+            LodSettings.ForceLod = int.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_LOD_FORCE"), out int fl) ? fl : -1;
+        }
 
         // Resolve the upscale mode (volume, or a BALLISTIC_DX12_FSR env override for headless A/B) and make
         // the internal render resolution + FSR context match it (reallocates targets only on a mode change).

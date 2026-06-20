@@ -10,6 +10,8 @@ struct SubmeshMeta {
     float4 AabbMin;        // world-space AABB (CPU 8-corner transform); w unused
     float4 AabbMax;
     uint FirstIndex; uint IndexCount; uint MaterialId; uint Flags;
+    uint LodCount; float LodBias; uint _lp0, _lp1;     // geometric LOD: count + per-submesh screen-size bias
+    uint2 LodRanges[4];                                 // LOD1..4 (FirstIndex, IndexCount); LOD0 = FirstIndex/IndexCount above
 };
 // [drawIndex root-constant][D3D12 DrawIndexedArguments] — matches the command-signature layout exactly.
 struct DrawCommand {
@@ -29,6 +31,8 @@ cbuffer CullParams : register(b0) {
     float4x4 View;         // world -> view, for the AABB's linear view distance
     float4 HizParams;      // x = pyramid width, y = height, z = mip count, w = camera near
     float4 HizFar;         // x = camera far
+    float4 LodSpanThresholds;  // x=LOD1 thr, y=LOD2, z=LOD3, w=LOD4 — pixel span below which that LOD is chosen
+    float4 LodControl;     // x = global bias, y = lodEnabled (0/1), zw spare
 };
 
 StructuredBuffer<SubmeshMeta> Metas    : register(t0);
@@ -52,26 +56,51 @@ float linearViewDist(float d) {
     return (n * f) / max(f - d * (f - n), 1e-6);
 }
 
-// Conservative Hi-Z occlusion (port of GpuCull_Comp.glsl occludedByHiZ). Projects the world AABB's 8
-// corners; bails (visible) on the near plane / screen edge / big footprint / sky; else culls only when the
-// nearest corner is strictly behind the MAX occluder depth over the footprint (+ bias). Never false-culls.
-bool occludedByHiZ(float3 mn, float3 mx) {
-    if (HizEnabled == 0u) return false;
-    Texture2D<float> HiZ = ResourceDescriptorHeap[HizIndex];   // SM6.6 bindless
-    float2 uvMin = 1e9, uvMax = -1e9;
-    float nearDist = 1e9;
+// Project the world AABB's 8 corners to screen and return the pixel span + uv bounds + nearest view distance.
+// Shared by Hi-Z occlusion AND LOD selection (both need the footprint). `offscreen` = any corner behind near or
+// off the screen edge (Hi-Z bails to visible, LOD bails to LOD0). Depends ONLY on ViewProj + HizParams.xy
+// (target dims), NOT the Hi-Z texture, so LOD has a valid span even when Hi-Z is off this frame.
+float aabbPixelSpan(float3 mn, float3 mx, out float2 uvMin, out float2 uvMax, out float nearDist, out bool offscreen) {
+    uvMin = 1e9; uvMax = -1e9; nearDist = 1e9; offscreen = false;
     [unroll] for (int c = 0; c < 8; c++) {
         float3 corner = float3((c & 1) == 0 ? mn.x : mx.x, (c & 2) == 0 ? mn.y : mx.y, (c & 4) == 0 ? mn.z : mx.z);
         float4 clip = mul(float4(corner, 1.0), ViewProj);
-        if (clip.w <= 1e-5) return false;                 // near plane — don't risk it
+        if (clip.w <= 1e-5) { offscreen = true; return 0.0; }
         float3 ndc = clip.xyz / clip.w;
-        if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0) return false;   // screen edge
-        float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);   // DX texture uv (y down)
+        if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0) { offscreen = true; return 0.0; }
+        float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
         uvMin = min(uvMin, uv); uvMax = max(uvMax, uv);
         nearDist = min(nearDist, -mul(float4(corner, 1.0), View).z);
     }
     float2 sizePx = (uvMax - uvMin) * HizParams.xy;
-    float maxSpanPx = max(sizePx.x, sizePx.y);
+    return max(sizePx.x, sizePx.y);
+}
+
+// Geometric LOD: pick a level from the AABB's pixel span. Returns 0 (full detail) when LOD is off, the submesh
+// has no chain, or the AABB is off-screen/near (safest). A smaller span ⇒ a coarser LOD.
+uint selectLod(SubmeshMeta m) {
+    if (LodControl.y < 0.5 || m.LodCount <= 1u) return 0u;
+    int force = (int)LodControl.z;                           // >=0 ⇒ force this level (A/B capture); -1 = auto
+    if (force >= 0) return min((uint)force, m.LodCount - 1u);
+    float2 uvmn, uvmx; float nd; bool off;
+    float spanPx = aabbPixelSpan(m.AabbMin.xyz, m.AabbMax.xyz, uvmn, uvmx, nd, off);
+    if (off) return 0u;
+    spanPx *= LodControl.x * m.LodBias;
+    uint lod = 0u;
+    [unroll] for (uint k = 0u; k < 4u; k++)
+        if (k + 1u < m.LodCount && spanPx < LodSpanThresholds[k]) lod = k + 1u;
+    return lod;
+}
+
+// Conservative Hi-Z occlusion (port of GpuCull_Comp.glsl occludedByHiZ). Reuses aabbPixelSpan; bails (visible)
+// on the near plane / screen edge / big footprint / sky; else culls only when the nearest corner is strictly
+// behind the MAX occluder depth over the footprint (+ bias). Never false-culls.
+bool occludedByHiZ(float3 mn, float3 mx) {
+    if (HizEnabled == 0u) return false;
+    Texture2D<float> HiZ = ResourceDescriptorHeap[HizIndex];   // SM6.6 bindless
+    float2 uvMin, uvMax; float nearDist; bool offscreen;
+    float maxSpanPx = aabbPixelSpan(mn, mx, uvMin, uvMax, nearDist, offscreen);
+    if (offscreen) return false;                              // near plane / screen edge — don't risk it
     if (maxSpanPx > 0.4 * max(HizParams.x, HizParams.y)) return false;   // big footprint — 5 taps can't bound it
     float level = clamp(ceil(log2(max(maxSpanPx * 0.5, 1.0))), 0.0, HizParams.z - 1.0);
     float o0 = HiZ.SampleLevel(PointClamp, float2(uvMin.x, uvMin.y), level);
@@ -99,11 +128,18 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
     bool visible = (m.IndexCount != 0u) && AabbInFrustum(m.AabbMin.xyz, m.AabbMax.xyz)
                  && !occludedByHiZ(m.AabbMin.xyz, m.AabbMax.xyz);
 
+    // LOD select (LOD0 ⇒ FirstIndex/IndexCount, byte-identical when LOD is off / no chain). Only the index range
+    // changes — slot ownership, draw order, InstanceCount logic stay identical, so the order-preserving + cull
+    // byte-identity invariants hold by construction.
+    uint lod = selectLod(m);
+    uint firstIdx = (lod == 0u) ? m.FirstIndex : m.LodRanges[lod - 1u].x;
+    uint idxCount = (lod == 0u) ? m.IndexCount : m.LodRanges[lod - 1u].y;
+
     DrawCommand c;
     c.DrawIndex = slot;
-    c.IndexCountPerInstance = m.IndexCount;
+    c.IndexCountPerInstance = idxCount;
     c.InstanceCount = visible ? 1u : 0u;
-    c.StartIndexLocation = m.FirstIndex;
+    c.StartIndexLocation = firstIdx;
     c.BaseVertexLocation = 0;
     c.StartInstanceLocation = 0u;
     Commands[slot] = c;

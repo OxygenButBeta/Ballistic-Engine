@@ -84,6 +84,8 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         public Matrix4x4 Mvp; public Matrix4x4 Model;
         public Vector4 AabbMin; public Vector4 AabbMax;
         public uint FirstIndex, IndexCount, MaterialId, Flags;
+        public uint LodCount; public float LodBias; public uint Lp0, Lp1;   // geometric LOD: count + per-submesh bias
+        public uint LodR0a, LodR0b, LodR1a, LodR1b, LodR2a, LodR2b, LodR3a, LodR3b;  // LodRanges[4] (FirstIndex,IndexCount)
     }
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct PerDraw { public Matrix4x4 Mvp; public Matrix4x4 Model; public uint MaterialId; public uint P0, P1, P2; }
@@ -107,6 +109,8 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         public Matrix4x4 View;
         public Vector4 HizParams;    // x=w, y=h, z=mipCount, w=near
         public Vector4 HizFar;       // x=far
+        public Vector4 LodSpanThresholds;   // x=LOD1 thr, y=LOD2, z=LOD3, w=LOD4 (px)
+        public Vector4 LodControl;          // x=globalBias, y=lodEnabled(0/1), zw spare
     }
 
     // Material table cache (rebuilt when the material set changes).
@@ -812,12 +816,24 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
                     if (!materialIds.TryGetValue(mat, out int matId)) continue;
                     mesh.GetSubMeshBounds(s, out GLVector3 lmin, out GLVector3 lmax);
                     WorldAabb(lmin, lmax, model, out Vector3 wlo, out Vector3 whi);
-                    *(SubmeshMeta*)(metaMapped + metaSlot + (long)total * metaStride) = new SubmeshMeta {
+                    var meta = new SubmeshMeta {
                         Mvp = Matrix4x4.Transpose(mvp), Model = Matrix4x4.Transpose(model),
                         AabbMin = new Vector4(wlo, 0), AabbMax = new Vector4(whi, 0),
                         FirstIndex = (uint)sub.IndexStart, IndexCount = (uint)sub.IndexCount,
                         MaterialId = (uint)matId, Flags = 0,
+                        LodCount = 1, LodBias = r.LodBias,
                     };
+                    // Pack up to 4 extra LOD ranges (LOD1..4) so the GPU cull can pick by screen span. LodCount<=1
+                    // ⇒ the shader takes the LOD0 (FirstIndex/IndexCount) branch → byte-identical when no chain.
+                    if (sub.Lods is { Length: > 1 } lods) {
+                        int n = Math.Min(lods.Length, 5);   // LOD0 + up to 4 extra
+                        meta.LodCount = (uint)n;
+                        if (n > 1) { meta.LodR0a = (uint)lods[1].FirstIndex; meta.LodR0b = (uint)lods[1].IndexCount; }
+                        if (n > 2) { meta.LodR1a = (uint)lods[2].FirstIndex; meta.LodR1b = (uint)lods[2].IndexCount; }
+                        if (n > 3) { meta.LodR2a = (uint)lods[3].FirstIndex; meta.LodR2b = (uint)lods[3].IndexCount; }
+                        if (n > 4) { meta.LodR3a = (uint)lods[4].FirstIndex; meta.LodR3b = (uint)lods[4].IndexCount; }
+                    }
+                    *(SubmeshMeta*)(metaMapped + metaSlot + (long)total * metaStride) = meta;
                     triAccum += sub.IndexCount / 3;
                     total++;
                 }
@@ -832,6 +848,9 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
                 HizEnabled = hizOnThisFrame ? 1u : 0u, HizIndex = (uint)Math.Max(hizBindlessIndex, 0),
                 ViewProj = Matrix4x4.Transpose(viewProjUnjittered), View = Matrix4x4.Transpose(view),
                 HizParams = new Vector4(hiz.Width, hiz.Height, hiz.MipCount, near), HizFar = new Vector4(far, 0, 0, 0),
+                LodSpanThresholds = new Vector4(LodSettings.SpanThresholds[0], LodSettings.SpanThresholds[1],
+                                                LodSettings.SpanThresholds[2], LodSettings.SpanThresholds[3]),
+                LodControl = new Vector4(LodSettings.GlobalBias, LodSettings.Active ? 1f : 0f, LodSettings.ForceLod, 0),
             };
             *(GeoCullParams*)(cullParamMapped + cullParamSlot + (long)groupCount * geoCullParamSlotSize) = cp;
             groups.Add((vb, nb, ub, tb, ib, groupBase, groupTotal));

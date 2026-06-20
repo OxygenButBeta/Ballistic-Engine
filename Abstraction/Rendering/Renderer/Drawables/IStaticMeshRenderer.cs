@@ -9,6 +9,10 @@ public interface IStaticMeshRenderer : IDrawable {
     // so per-object entities cost no geometry duplication.
     int SubMeshIndex { get; }
 
+    // Geometric-LOD per-renderer screen-size bias (Unity's LODBias). Default 1 → no effect unless the mesh has an
+    // imported LOD chain and LodSettings is active.
+    float LodBias => 1f;
+
     // The material a given submesh of SharedMesh renders with — the mesh's baked material for
     // that range, or SharedMaterial as fallback. Null means the submesh is skipped.
     Material MaterialFor(int submeshIndex);

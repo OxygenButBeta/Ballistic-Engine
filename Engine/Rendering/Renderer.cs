@@ -8,6 +8,12 @@ public abstract class Renderer : Behaviour, IStaticMeshRenderer {
     // -1 = whole mesh. Concrete renderers override to serialize it (members declared on this
     // base class are excluded from serialization by ComponentReflection).
     public virtual int SubMeshIndex { get; set; } = -1;
+
+    // Geometric-LOD screen-size bias (Unity's per-renderer LODBias). >1 keeps higher detail at a given distance,
+    // <1 drops detail sooner. Only consulted when the mesh has an imported LOD chain AND LodSettings is active;
+    // 1.0 default → no effect unless LOD is on, so byte-identical to a no-LOD build.
+    public virtual float LodBias { get; set; } = 1f;
+
     public Transform Transform => transform;
     public bool RenderedThisFrame { get; set; }
 

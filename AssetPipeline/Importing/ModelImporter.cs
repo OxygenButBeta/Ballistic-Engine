@@ -29,7 +29,9 @@ public sealed class ModelImporter : IAssetImporter {
     //     scaleFactor setting (0 = auto from file units).
     // v9: FBX Z-up axis conversion (UpAxis=2 → -90°X bake, Unity-importer parity) — scan-pack
     //     meshes no longer lie tipped 90° relative to converted Unity scene transforms.
-    public int Version => 9;
+    // v10: optional geometric-LOD chain (generateLODs, default OFF) — per-submesh quadric decimation appended to
+    //      the shared index buffer (.bmesh v7). LOD-less imports stay byte-identical (artifact written as v6).
+    public int Version => 10;
     public string ArtifactExtension => ".bmesh";
 
     // Generates a sibling "<Model>_Materials/" folder of .mat assets.
@@ -51,6 +53,13 @@ public sealed class ModelImporter : IAssetImporter {
         // UnitScaleFactor — cm-authored content imports at the right metric size instead of 100x).
         // Set a positive value to force a scale (Unity's "Scale Factor").
         ["scaleFactor"] = 0.0,
+        // Geometric LOD chain (per-submesh quadric decimation, appended to the shared index buffer). OFF by
+        // default → artifacts stay byte-identical (written as .bmesh v6). On → LOD1..(lodCount-1) at lodReduction^k
+        // triangles; submeshes at/below lodMinTris keep full detail. Skinned meshes are never decimated (v1).
+        ["generateLODs"] = false,
+        ["lodCount"] = 4,
+        ["lodReduction"] = 0.5,
+        ["lodMinTris"] = 64,
     };
 
     public void Import(AssetImportContext context) {
@@ -93,7 +102,20 @@ public sealed class ModelImporter : IAssetImporter {
         DecodedModel model = AssimpMeshDecoder.DecodeScene(
             context.SourceAbsolutePath, flipUVs, splitByNodes, scaleFactor);
         MeshData data = generateMaterials ? GenerateMaterials(context, model) : model.Mesh;
+        data = BuildLods(context, data);
         MeshArtifact.Write(context.ArtifactAbsolutePath, in data);
+    }
+
+    // Opt-in geometric-LOD generation (static meshes only). Returns `data` unchanged when disabled or when the
+    // builder produced nothing (every submesh too small) → LOD-less artifact stays byte-identical (v6).
+    static MeshData BuildLods(AssetImportContext context, in MeshData data) {
+        bool gen = context.Settings?["generateLODs"]?.GetValue<bool>() ?? false;
+        if (!gen || data.IsSkinned) return data;
+        int lodCount = context.Settings?["lodCount"]?.GetValue<int>() ?? 4;
+        float reduction = (float)(context.Settings?["lodReduction"]?.GetValue<double>() ?? 0.5);
+        int minTris = context.Settings?["lodMinTris"]?.GetValue<int>() ?? 64;
+        return Importing.Decimation.LodChainBuilder.Build(data,
+            new Importing.Decimation.LodChainBuilder.Settings(lodCount, reduction, minTris));
     }
 
     // ---- Skinned import -----------------------------------------------------
