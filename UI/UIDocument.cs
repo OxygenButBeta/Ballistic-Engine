@@ -55,6 +55,11 @@ public class UIDocument : Behaviour
         // Author against ReferenceResolution; the panel scales to fit the real viewport. Default so
         // ported designs (which assume a fixed canvas) look right on any display.
         ScaleWithScreenSize,
+        // Expand: scale so the reference FITS inside the viewport (min of the two scales) — never crops,
+        // may letterbox. Shrink: only scale DOWN if the viewport is smaller (max with 1 inverse) — keeps
+        // 1:1 on big screens, fits on small. (P8.5, Unity's Expand/Shrink screen-match modes.)
+        Expand,
+        Shrink,
     }
     public ScaleMode Scale { get; set; } = ScaleMode.ScaleWithScreenSize;
 
@@ -295,9 +300,16 @@ public class UIDocument : Behaviour
         Vector2 reference = ReferenceResolution;
         float scaleW = viewportPx.X / Math.Max(1f, reference.X);
         float scaleH = viewportPx.Y / Math.Max(1f, reference.Y);
-        float logW = MathF.Log(Math.Max(1e-4f, scaleW));
-        float logH = MathF.Log(Math.Max(1e-4f, scaleH));
-        scale = MathF.Exp(logW * (1f - MatchWidthOrHeight) + logH * MatchWidthOrHeight);
+        if (Scale == ScaleMode.Expand)
+            scale = Math.Min(scaleW, scaleH);                 // fit-inside (never crop)
+        else if (Scale == ScaleMode.Shrink)
+            scale = Math.Min(1f, Math.Min(scaleW, scaleH));   // 1:1 on big screens, shrink on small
+        else
+        {
+            float logW = MathF.Log(Math.Max(1e-4f, scaleW));
+            float logH = MathF.Log(Math.Max(1e-4f, scaleH));
+            scale = MathF.Exp(logW * (1f - MatchWidthOrHeight) + logH * MatchWidthOrHeight);
+        }
 
         // The logical canvas is the viewport divided by the scale, so it covers the whole screen.
         return new Vector2(viewportPx.X / scale, viewportPx.Y / scale);

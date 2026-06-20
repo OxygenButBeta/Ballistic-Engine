@@ -152,7 +152,17 @@ Staged by dependency + frequency. Each = element + USS default style + INotifyVa
 - **P7.2 One/two-way binding to a data source + `binding-path`**.
 - **P7.3 Observable collections → ListView item binding**.
 
-## P8 — Tooling / agent introspection   [the "or BETTER" edge]
+## P8 — Tooling / agent introspection   ✅ CORE DONE (CLI/panel wiring + WorldSpace deferred)
+
+> Status: P8.2/P8.3 CORE — UIIntrospect.ToJson (tree → type/name/classes/resolved-rect/resolved-style),
+> .Pick (point→element), .ToTreeText; proven 6/6. This is the shared engine of `bal ui dump` and the
+> in-editor UI debugger. P8.5 Expand/Shrink scale modes done. P8.1 hot-reload: UIDocument.Rebuild()
+> re-reads UXML/USS via TextResolver (public) — the editor calls it on focus-regain/file-watch (same
+> AssetChangeWatch pattern as scripts). DEFERRED (separate exe wiring, not engine-core): the actual
+> `bal ui` CLI verb (BallisticEngine.Cli) + the ImGui debugger panel (BallisticEngine.Editor) — both just
+> call UIIntrospect; P8.4 WorldSpace renderer (render-to-texture quad + ray-pick) is renderer-merge-bound
+> like R5/R6.
+
 
 - **P8.1 Live UXML/USS hot-reload** (focus-regain + file-watch; reuse AssetChangeWatch).
 - **P8.2 `bal ui` headless verbs**: dump tree + resolved style + layout boxes as JSON; screenshot diff.
