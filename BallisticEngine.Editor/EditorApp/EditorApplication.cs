@@ -233,6 +233,11 @@ internal sealed class EditorApplication {
         // persisted closed-panel set so a panel the user closed last session stays closed across restart.
         panels.ApplyHidden(EditorLayout.LoadPanelState());
 
+        // Headless verification door: open the Curve editor on a test curve so a 20s run exercises its
+        // full seam draw path (canvas/grid/handles via gui.WindowDrawList + gui.Input). Harmless when unset.
+        if (Environment.GetEnvironmentVariable("BALLISTIC_CURVE_WINDOW") == "1")
+            CurveEditorWindow.Edit(AnimationCurve.EaseInOut(), "Verify", () => { });
+
         // Restore the Scene-view camera to wherever it was last left in this project.
         editorCamera.RestorePose(EditorPrefs.GetLastCamera(bootstrap.Project.RootPath));
 
@@ -772,7 +777,7 @@ internal sealed class EditorApplication {
             layerCollision.DrawStandalone(gui);
             profilerPanel.DrawStandalone(gui);
             buildPanel.DrawStandalone(gui);
-            CurveEditorWindow.Draw(S);
+            CurveEditorWindow.Instance.DrawStandalone(gui);
             ComponentEditorWindow.Draw(S);
             UnityImportWindow.Draw(S);
             UserEditorWindowRegistry.DrawAll(gui);   // includes RenderPassToggles ([EditorWindowMeta], auto-discovered)
@@ -856,7 +861,7 @@ internal sealed class EditorApplication {
         layerCollision.DrawStandalone(gui);   // (was missing from this block — only drew while fullscreen)
         profilerPanel.DrawStandalone(gui);
         buildPanel.DrawStandalone(gui);
-        CurveEditorWindow.Draw(S);
+        CurveEditorWindow.Instance.DrawStandalone(gui);
         ComponentEditorWindow.Draw(S);   // standalone component window — was only drawn while fullscreen
         UnityImportWindow.Draw(S);
         // [EditorWindowMeta] windows — built-in (RenderPassToggles) AND user-authored game-editor scripts.

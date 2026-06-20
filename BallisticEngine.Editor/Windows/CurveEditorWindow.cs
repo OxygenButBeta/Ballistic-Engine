@@ -1,6 +1,4 @@
-using Hexa.NET.ImGui;
-using SysVec2 = System.Numerics.Vector2;
-using SysVec4 = System.Numerics.Vector4;
+using System.Numerics;
 
 namespace BallisticEngine.Editor;
 
@@ -14,186 +12,205 @@ namespace BallisticEngine.Editor;
 // modes), a numeric keyframe inspector (time / value / tangents), pre/post wrap-mode dropdowns, and a
 // live readout. Undo is whole-curve snapshots pushed before each interaction (EditorUndo.PushCallback),
 // so Ctrl+Z restores the curve regardless of which component owns it.
-internal static class CurveEditorWindow {
-    static bool open;
-    static AnimationCurve target;
-    static string title = "Curve";
-    static Action onChanged;
+//
+// Phase-8 EditorWindow: the window is now an EditorWindow INSTANCE drawn through IEditorGui + WindowShell
+// (zero raw ImGui — the canvas paints via gui.WindowDrawList and reads input via gui.Input). It keeps a
+// static singleton facade (Open / IsOpen / CloseIfEditing) because the inspector targets it by a global
+// call, exactly like Unity's single shared curve editor — that retarget is a thin service over the one
+// instance, not cross-thread state. EditorApplication holds the instance and draws it standalone.
+internal sealed class CurveEditorWindow : EditorWindow {
+    // The single shared curve editor (Unity has one). The inspector's Open(...) targets THIS instance.
+    public static readonly CurveEditorWindow Instance = new();
+
+    public CurveEditorWindow() {
+        DockKey = "win.curveeditor";
+        Title = "Curve";
+        Icon = EditorIcons.Grid;
+        NoCollapse = true;
+        DesiredSize = new Vector2(620, 460);
+    }
+
+    AnimationCurve target;
+    string curveTitle = "Curve";
+    Action onChanged;
 
     // View transform: value/time window currently shown. Auto-framed on open, then user-controlled.
-    static float viewT0, viewT1 = 1f, viewV0, viewV1 = 1f;
-    static bool framed;
+    float viewT0, viewT1 = 1f, viewV0, viewV1 = 1f;
+    bool framed;
 
-    static int selectedKey = -1;
-    static int dragKey = -1;
-    static int dragTangent;     // 0 none, -1 in handle, +1 out handle
-    static bool snapshotPushed;
+    int selectedKey = -1;
+    int dragKey = -1;
+    int dragTangent;     // 0 none, -1 in handle, +1 out handle
+    bool snapshotPushed;
 
-    public static bool IsOpen => open;
+    // ---- static facade (the inspector + EditorApplication call these) --------
+
+    public static bool IsOpen => Instance.Open;
 
     // Opens (or retargets) the window onto a curve. onChanged fires after every mutation so the caller
-    // can mark its scene/asset dirty. Reframes the view to fit the curve.
-    public static void Open(AnimationCurve curve, string label, Action changed) {
-        target = curve;
-        title = label ?? "Curve";
-        onChanged = changed;
-        open = true;
-        framed = false;
-        selectedKey = curve.Count > 0 ? 0 : -1;
+    // can mark its scene/asset dirty. Reframes the view to fit the curve. (Named Edit, not Open, because
+    // EditorWindow.Open is the instance show-state field.)
+    public static void Edit(AnimationCurve curve, string label, Action changed) {
+        Instance.OpenInstance(curve, label, changed);
     }
 
     // If the inspector destroys/replaces the curve instance it was editing, drop the reference so we
     // don't mutate a detached object.
     public static void CloseIfEditing(AnimationCurve curve) {
-        if (open && ReferenceEquals(target, curve)) open = false;
+        if (Instance.Open && ReferenceEquals(Instance.target, curve)) Instance.Open = false;
     }
 
-    public static void Draw(float scale) {
-        if (!open) return;
-        if (target is null) { open = false; return; }
+    void OpenInstance(AnimationCurve curve, string label, Action changed) {
+        target = curve;
+        curveTitle = label ?? "Curve";
+        Title = $"Curve  -  {curveTitle}";   // WindowShell shows "{Icon}  {Title}###DockKey"
+        onChanged = changed;
+        Open = true;
+        framed = false;
+        selectedKey = curve.Count > 0 ? 0 : -1;
+    }
 
-        ImGui.SetNextWindowSize(new SysVec2(620 * scale, 460 * scale), ImGuiCond.FirstUseEver);
-        if (!ImGui.Begin($"{EditorIcons.Grid}  Curve  -  {title}###CurveEditorWindow", ref open,
-                ImGuiWindowFlags.NoCollapse)) {
-            ImGui.End();
-            return;
-        }
+    // ---- body (drawn by WindowShell through the seam) ------------------------
+
+    protected override void OnGui(IEditorGui gui) {
+        if (target is null) { Open = false; return; }
 
         if (!framed) { FrameAll(); framed = true; }
 
-        DrawToolbar(scale);
-        ImGui.Separator();
+        float scale = gui.Scale;
+        DrawToolbar(gui);
+        gui.Separator();
 
         // Split: canvas on the left, the keyframe inspector on the right.
         float inspectorW = 190 * scale;
-        float canvasW = ImGui.GetContentRegionAvail().X - inspectorW - ImGui.GetStyle().ItemSpacing.X;
-        if (canvasW < 120) canvasW = ImGui.GetContentRegionAvail().X; // too narrow: drop the side panel
+        float canvasW = gui.ContentRegionAvail.X - inspectorW - gui.ItemSpacing.X;
+        if (canvasW < 120) canvasW = gui.ContentRegionAvail.X; // too narrow: drop the side panel
 
-        DrawCanvas(new SysVec2(canvasW, ImGui.GetContentRegionAvail().Y), scale);
+        DrawCanvas(gui, new Vector2(canvasW, gui.ContentRegionAvail.Y));
 
-        if (canvasW < ImGui.GetContentRegionAvail().X + 1) {
-            ImGui.SameLine();
-            ImGui.BeginChild("##keyinspector", new SysVec2(inspectorW, 0), ImGuiChildFlags.Borders);
-            DrawKeyInspector(scale);
-            ImGui.EndChild();
+        if (canvasW < gui.ContentRegionAvail.X + 1) {
+            gui.SameLine();
+            gui.BeginChild("##keyinspector", new Vector2(inspectorW, 0), border: true);
+            DrawKeyInspector(gui);
+            gui.EndChild();
         }
-
-        ImGui.End();
     }
 
     // ---- Toolbar -------------------------------------------------------------
 
-    static void DrawToolbar(float scale) {
-        if (ImGui.SmallButton("Linear")) Preset(AnimationCurve.Linear());
-        ImGui.SameLine();
-        if (ImGui.SmallButton("Ease")) Preset(AnimationCurve.EaseInOut());
-        ImGui.SameLine();
-        if (ImGui.SmallButton("Const")) Preset(AnimationCurve.Constant());
-        ImGui.SameLine();
-        ImGui.TextDisabled("|");
-        ImGui.SameLine();
-        if (ImGui.SmallButton($"{EditorIcons.Maximize} Frame all")) FrameAll();
-        ImGui.SameLine();
+    void DrawToolbar(IEditorGui gui) {
+        float scale = gui.Scale;
+        if (gui.SmallButton("Linear")) Preset(AnimationCurve.Linear());
+        gui.SameLine();
+        if (gui.SmallButton("Ease")) Preset(AnimationCurve.EaseInOut());
+        gui.SameLine();
+        if (gui.SmallButton("Const")) Preset(AnimationCurve.Constant());
+        gui.SameLine();
+        gui.TextDisabled("|");
+        gui.SameLine();
+        if (gui.SmallButton($"{EditorIcons.Maximize} Frame all")) FrameAll();
+        gui.SameLine();
 
         // Wrap-mode dropdowns.
-        ImGui.SameLine();
-        ImGui.TextDisabled("|");
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(90 * scale);
-        WrapCombo("Pre", () => target.PreWrap, m => target.PreWrap = m);
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(90 * scale);
-        WrapCombo("Post", () => target.PostWrap, m => target.PostWrap = m);
+        gui.SameLine();
+        gui.TextDisabled("|");
+        gui.SameLine();
+        gui.SetNextItemWidth(90 * scale);
+        WrapCombo(gui, "Pre", () => target.PreWrap, m => target.PreWrap = m);
+        gui.SameLine();
+        gui.SetNextItemWidth(90 * scale);
+        WrapCombo(gui, "Post", () => target.PostWrap, m => target.PostWrap = m);
 
-        ImGui.SameLine();
-        ImGui.TextDisabled($"{target.Count} keys");
+        gui.SameLine();
+        gui.TextDisabled($"{target.Count} keys");
     }
 
-    static void WrapCombo(string id, Func<AnimationCurve.WrapMode> get, Action<AnimationCurve.WrapMode> set) {
+    void WrapCombo(IEditorGui gui, string id, Func<AnimationCurve.WrapMode> get, Action<AnimationCurve.WrapMode> set) {
         AnimationCurve.WrapMode cur = get();
-        if (ImGui.BeginCombo($"##wrap{id}", $"{id}: {cur}")) {
+        if (gui.BeginCombo($"##wrap{id}", $"{id}: {cur}")) {
             foreach (AnimationCurve.WrapMode m in Enum.GetValues<AnimationCurve.WrapMode>()) {
-                if (ImGui.Selectable(m.ToString(), m == cur) && m != cur) {
+                if (gui.Selectable(m.ToString(), m == cur) && m != cur) {
                     PushUndo();
                     set(m);
                     Changed();
                 }
             }
-            ImGui.EndCombo();
+            gui.EndCombo();
         }
     }
 
     // ---- Canvas --------------------------------------------------------------
 
-    static void DrawCanvas(SysVec2 size, float scale) {
+    void DrawCanvas(IEditorGui gui, Vector2 size) {
         if (size.X < 20 || size.Y < 20) return;
-        SysVec2 origin = ImGui.GetCursorScreenPos();
-        ImDrawListPtr draw = ImGui.GetWindowDrawList();
+        float scale = gui.Scale;
+        Vector2 origin = gui.CursorScreenPos;
+        IEditorDrawList draw = gui.WindowDrawList;
 
-        draw.AddRectFilled(origin, origin + size, ImGui.GetColorU32(new SysVec4(0.09f, 0.10f, 0.12f, 1f)), 4f);
+        draw.AddRectFilled(origin, origin + size, gui.ColorU32(new Vector4(0.09f, 0.10f, 0.12f, 1f)), 4f);
 
-        SysVec2 ToScreen(float t, float v) => new(
+        Vector2 ToScreen(float t, float v) => new(
             origin.X + (t - viewT0) / (viewT1 - viewT0) * size.X,
             origin.Y + (1f - (v - viewV0) / (viewV1 - viewV0)) * size.Y);
         float TimeAt(float sx) => viewT0 + (sx - origin.X) / size.X * (viewT1 - viewT0);
         float ValueAt(float sy) => viewV1 - (sy - origin.Y) / size.Y * (viewV1 - viewV0);
 
-        DrawGrid(draw, origin, size, scale);
+        DrawGrid(gui, draw, origin, size);
 
         // Curve polyline (sampled across the visible time window — extrapolation shows wrap modes).
         const int Samples = 160;
-        uint ccol = ImGui.GetColorU32(new SysVec4(0.45f, 0.85f, 1f, 1f));
-        SysVec2 prev = default;
+        uint ccol = gui.ColorU32(new Vector4(0.45f, 0.85f, 1f, 1f));
+        Vector2 prev = default;
         for (int s = 0; s <= Samples; s++) {
             float t = viewT0 + (viewT1 - viewT0) * s / Samples;
-            SysVec2 p = ToScreen(t, target.Evaluate(t));
+            Vector2 p = ToScreen(t, target.Evaluate(t));
             if (s > 0) draw.AddLine(prev, p, ccol, 2f);
             prev = p;
         }
 
-        ImGui.InvisibleButton("##curvecanvas", size);
-        bool hovered = ImGui.IsItemHovered();
-        SysVec2 mouse = ImGui.GetMousePos();
+        gui.Input.InvisibleButton("##curvecanvas", size);
+        bool hovered = gui.IsItemHovered();
+        Vector2 mouse = gui.Input.MousePos;
 
-        HandleZoomPan(hovered, mouse, origin, size);
+        HandleZoomPan(gui, hovered, mouse, origin, size);
 
         // Tangent handles for the selected key are tested FIRST so a tangent grab wins over a nearby
         // keyframe dot (the out-handle bug). The flag resets each frame.
         tangentGrabbedThisClick = false;
         if (selectedKey >= 0 && selectedKey < target.Count)
-            DrawTangentHandles(draw, ToScreen, mouse, hovered);
+            DrawTangentHandles(gui, draw, ToScreen, mouse, hovered);
 
         // Keyframe dots + hit test.
         const float dotR = 5.5f;
         int hoverKey = -1;
         for (int i = 0; i < target.Count; i++) {
             AnimationCurve.Keyframe k = target.Keys[i];
-            SysVec2 sp = ToScreen(k.Time, k.Value);
+            Vector2 sp = ToScreen(k.Time, k.Value);
             bool near = (mouse - sp).LengthSquared() <= (dotR + 4f) * (dotR + 4f);
             if (near && hovered) hoverKey = i;
-            uint dc = i == selectedKey ? ImGui.GetColorU32(new SysVec4(1f, 0.85f, 0.3f, 1f))
-                    : near ? ImGui.GetColorU32(new SysVec4(1f, 0.95f, 0.7f, 1f))
-                    : ImGui.GetColorU32(new SysVec4(1f, 1f, 1f, 1f));
+            uint dc = i == selectedKey ? gui.ColorU32(new Vector4(1f, 0.85f, 0.3f, 1f))
+                    : near ? gui.ColorU32(new Vector4(1f, 0.95f, 0.7f, 1f))
+                    : gui.ColorU32(new Vector4(1f, 1f, 1f, 1f));
             draw.AddCircleFilled(sp, dotR, dc);
-            draw.AddCircle(sp, dotR, ImGui.GetColorU32(new SysVec4(0, 0, 0, 0.7f)), 0, 1.5f);
+            draw.AddCircle(sp, dotR, gui.ColorU32(new Vector4(0, 0, 0, 0.7f)), 0, 1.5f);
         }
 
         // Begin dragging a key — but NOT if a tangent handle already grabbed this click.
         if (hovered && hoverKey >= 0 && dragTangent == 0 && !tangentGrabbedThisClick &&
-            ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
+            gui.Input.MouseClicked(0)) {
             selectedKey = hoverKey;
             dragKey = hoverKey;
             PushUndo();
         }
-        if (dragKey >= 0 && dragKey < target.Count && ImGui.IsMouseDown(ImGuiMouseButton.Left)) {
+        if (dragKey >= 0 && dragKey < target.Count && gui.Input.MouseDown(0)) {
             float nt = TimeAt(mouse.X), nv = ValueAt(mouse.Y);
             selectedKey = dragKey = target.MoveKey(dragKey, nt, nv);
             Changed();
         }
-        if (ImGui.IsMouseReleased(ImGuiMouseButton.Left)) { dragKey = -1; dragTangent = 0; snapshotPushed = false; }
+        if (gui.Input.MouseReleased(0)) { dragKey = -1; dragTangent = 0; snapshotPushed = false; }
 
         // Double-click empty space adds a key.
-        if (hovered && hoverKey < 0 && dragTangent == 0 && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) {
+        if (hovered && hoverKey < 0 && dragTangent == 0 && gui.Input.MouseDoubleClicked(0)) {
             PushUndo();
             selectedKey = target.AddKey(TimeAt(mouse.X), ValueAt(mouse.Y));
             Changed();
@@ -201,58 +218,59 @@ internal static class CurveEditorWindow {
 
         // Right-click → context menu (Unity's curve right-click): on a key, key ops + tangent modes;
         // on empty space, "Add Key Here". Remember the click position so Add Key lands where clicked.
-        if (hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Right)) {
+        if (hovered && gui.Input.MouseClicked(1)) {
             ctxKey = hoverKey;
             ctxTime = TimeAt(mouse.X);
             ctxValue = ValueAt(mouse.Y);
-            ImGui.OpenPopup("##curvectx");
+            gui.OpenPopup("##curvectx");
         }
-        DrawContextMenu();
+        DrawContextMenu(gui);
 
         // F frames all (Unity).
-        if (hovered && ImGui.IsKeyPressed(ImGuiKey.F)) FrameAll();
+        if (hovered && gui.Input.KeyPressed(EditorGuiKey.F)) FrameAll();
     }
 
-    static int ctxKey = -1;
-    static float ctxTime, ctxValue;
+    int ctxKey = -1;
+    float ctxTime, ctxValue;
 
-    static void DrawContextMenu() {
-        if (!ImGui.BeginPopup("##curvectx"))
+    void DrawContextMenu(IEditorGui gui) {
+        if (!gui.BeginPopup("##curvectx"))
             return;
 
         if (ctxKey >= 0 && ctxKey < target.Count) {
-            ImGui.TextDisabled($"Key #{ctxKey}");
-            ImGui.Separator();
+            gui.TextDisabled($"Key #{ctxKey}");
+            gui.Separator();
             // Tangent modes for this key (Unity's Flat / Linear / Constant + Free).
-            if (ImGui.MenuItem("Flat")) { selectedKey = ctxKey; SetTangentMode(0f, 0f); }
-            if (ImGui.MenuItem("Linear")) { selectedKey = ctxKey; SetTangentModeLinear(); }
-            if (ImGui.MenuItem("Constant (Step)")) { selectedKey = ctxKey; SetTangentMode(float.PositiveInfinity, float.PositiveInfinity); }
-            ImGui.Separator();
-            ImGui.BeginDisabled(target.Count <= 1);
-            if (ImGui.MenuItem("Delete Key")) {
+            if (gui.MenuItem("Flat")) { selectedKey = ctxKey; SetTangentMode(0f, 0f); }
+            if (gui.MenuItem("Linear")) { selectedKey = ctxKey; SetTangentModeLinear(); }
+            if (gui.MenuItem("Constant (Step)")) { selectedKey = ctxKey; SetTangentMode(float.PositiveInfinity, float.PositiveInfinity); }
+            gui.Separator();
+            gui.BeginDisabled(target.Count <= 1);
+            if (gui.MenuItem("Delete Key")) {
                 PushUndo();
                 target.RemoveKey(ctxKey);
                 selectedKey = Math.Clamp(selectedKey, 0, target.Count - 1);
                 snapshotPushed = false;
                 Changed();
             }
-            ImGui.EndDisabled();
+            gui.EndDisabled();
         }
         else {
-            if (ImGui.MenuItem("Add Key Here")) {
+            if (gui.MenuItem("Add Key Here")) {
                 PushUndo();
                 selectedKey = target.AddKey(ctxTime, ctxValue);
                 snapshotPushed = false;
                 Changed();
             }
         }
-        ImGui.EndPopup();
+        gui.EndPopup();
     }
 
-    static void DrawGrid(ImDrawListPtr draw, SysVec2 origin, SysVec2 size, float scale) {
-        uint line = ImGui.GetColorU32(new SysVec4(1f, 1f, 1f, 0.06f));
-        uint axis = ImGui.GetColorU32(new SysVec4(1f, 1f, 1f, 0.22f));
-        uint txt = ImGui.GetColorU32(new SysVec4(0.7f, 0.72f, 0.78f, 1f));
+    void DrawGrid(IEditorGui gui, IEditorDrawList draw, Vector2 origin, Vector2 size) {
+        float scale = gui.Scale;
+        uint line = gui.ColorU32(new Vector4(1f, 1f, 1f, 0.06f));
+        uint axis = gui.ColorU32(new Vector4(1f, 1f, 1f, 0.22f));
+        uint txt = gui.ColorU32(new Vector4(0.7f, 0.72f, 0.78f, 1f));
 
         // Pick a "nice" step for each axis so labels stay readable at any zoom.
         float tStep = NiceStep(viewT1 - viewT0, size.X / (70f * scale));
@@ -260,14 +278,14 @@ internal static class CurveEditorWindow {
 
         for (float t = MathF.Ceiling(viewT0 / tStep) * tStep; t <= viewT1; t += tStep) {
             float x = origin.X + (t - viewT0) / (viewT1 - viewT0) * size.X;
-            draw.AddLine(new SysVec2(x, origin.Y), new SysVec2(x, origin.Y + size.Y), line);
-            draw.AddText(new SysVec2(x + 2, origin.Y + size.Y - 14 * scale), txt, t.ToString("0.##"));
+            draw.AddLine(new Vector2(x, origin.Y), new Vector2(x, origin.Y + size.Y), line);
+            draw.AddText(new Vector2(x + 2, origin.Y + size.Y - 14 * scale), txt, t.ToString("0.##"));
         }
         for (float v = MathF.Ceiling(viewV0 / vStep) * vStep; v <= viewV1; v += vStep) {
             float y = origin.Y + (1f - (v - viewV0) / (viewV1 - viewV0)) * size.Y;
             bool isZero = MathF.Abs(v) < vStep * 0.001f;
-            draw.AddLine(new SysVec2(origin.X, y), new SysVec2(origin.X + size.X, y), isZero ? axis : line);
-            draw.AddText(new SysVec2(origin.X + 2, y + 1), txt, v.ToString("0.##"));
+            draw.AddLine(new Vector2(origin.X, y), new Vector2(origin.X + size.X, y), isZero ? axis : line);
+            draw.AddText(new Vector2(origin.X + 2, y + 1), txt, v.ToString("0.##"));
         }
     }
 
@@ -281,30 +299,30 @@ internal static class CurveEditorWindow {
         return nice * mag;
     }
 
-    static void DrawTangentHandles(ImDrawListPtr draw, Func<float, float, SysVec2> toScreen, SysVec2 mouse, bool hovered) {
+    void DrawTangentHandles(IEditorGui gui, IEditorDrawList draw, Func<float, float, Vector2> toScreen, Vector2 mouse, bool hovered) {
         AnimationCurve.Keyframe k = target.Keys[selectedKey];
-        SysVec2 kp = toScreen(k.Time, k.Value);
+        Vector2 kp = toScreen(k.Time, k.Value);
         const float handleLen = 40f;
-        uint hcol = ImGui.GetColorU32(new SysVec4(0.9f, 0.6f, 0.3f, 1f));
+        uint hcol = gui.ColorU32(new Vector4(0.9f, 0.6f, 0.3f, 1f));
 
         // Handle endpoints: step along the tangent slope in screen space (a fixed pixel length).
-        SysVec2 InDir() => SlopeDir(k.InTangent, toScreen) * -1f;
-        SysVec2 OutDir() => SlopeDir(k.OutTangent, toScreen);
+        Vector2 InDir() => SlopeDir(k.InTangent, toScreen) * -1f;
+        Vector2 OutDir() => SlopeDir(k.OutTangent, toScreen);
 
-        SysVec2 inP = kp + InDir() * handleLen;
-        SysVec2 outP = kp + OutDir() * handleLen;
+        Vector2 inP = kp + InDir() * handleLen;
+        Vector2 outP = kp + OutDir() * handleLen;
         draw.AddLine(kp, inP, hcol, 1.5f);
         draw.AddLine(kp, outP, hcol, 1.5f);
 
-        DrawTangentDot(draw, inP, mouse, hovered, -1);
-        DrawTangentDot(draw, outP, mouse, hovered, +1);
+        DrawTangentDot(gui, draw, inP, mouse, hovered, -1);
+        DrawTangentDot(gui, draw, outP, mouse, hovered, +1);
 
         // Drag a tangent handle: convert the cursor offset from the key into a slope. BOTH handles use
         // the same forward delta math; the in-handle drags backward, so negate its delta. (The earlier
         // out-handle bug was a hit-test one — the keyframe dot stole the click; fixed below by testing
         // tangent dots BEFORE keyframes and using a wider grab radius.)
-        if (dragTangent != 0 && ImGui.IsMouseDown(ImGuiMouseButton.Left)) {
-            SysVec2 d = mouse - kp;
+        if (dragTangent != 0 && gui.Input.MouseDown(0)) {
+            Vector2 d = mouse - kp;
             if (dragTangent < 0) d = -d; // in-handle points backward
             float slope = SlopeFromScreenDelta(d, toScreen);
             float inT = k.InTangent, outT = k.OutTangent;
@@ -314,11 +332,11 @@ internal static class CurveEditorWindow {
         }
     }
 
-    static void DrawTangentDot(ImDrawListPtr draw, SysVec2 p, SysVec2 mouse, bool hovered, int which) {
+    void DrawTangentDot(IEditorGui gui, IEditorDrawList draw, Vector2 p, Vector2 mouse, bool hovered, int which) {
         const float r = 5f, grab = 9f;   // wider grab than the visual radius so it's easy to catch
         bool near = (mouse - p).LengthSquared() <= grab * grab;
-        draw.AddCircleFilled(p, r, ImGui.GetColorU32(near ? new SysVec4(1f, 0.85f, 0.4f, 1f) : new SysVec4(0.9f, 0.6f, 0.3f, 1f)));
-        if (hovered && near && dragTangent == 0 && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
+        draw.AddCircleFilled(p, r, gui.ColorU32(near ? new Vector4(1f, 0.85f, 0.4f, 1f) : new Vector4(0.9f, 0.6f, 0.3f, 1f)));
+        if (hovered && near && dragTangent == 0 && gui.Input.MouseClicked(0)) {
             dragTangent = which;
             tangentGrabbedThisClick = true;   // suppress the keyframe-drag that runs later this frame
             PushUndo();
@@ -327,31 +345,31 @@ internal static class CurveEditorWindow {
 
     // Set true when a tangent dot grabbed this frame's click, so the keyframe hit-test below skips it
     // (the out-handle sits near its key — without this the key dot stole the drag).
-    static bool tangentGrabbedThisClick;
+    bool tangentGrabbedThisClick;
 
     // Screen-space unit direction of a value/time slope (accounts for the view's non-uniform scale).
-    static SysVec2 SlopeDir(float slope, Func<float, float, SysVec2> toScreen) {
-        if (float.IsInfinity(slope)) return new SysVec2(0f, slope > 0 ? -1f : 1f); // constant ≈ vertical
-        SysVec2 a = toScreen(0f, 0f);
-        SysVec2 b = toScreen(1f, slope);
-        SysVec2 d = b - a;
+    static Vector2 SlopeDir(float slope, Func<float, float, Vector2> toScreen) {
+        if (float.IsInfinity(slope)) return new Vector2(0f, slope > 0 ? -1f : 1f); // constant ≈ vertical
+        Vector2 a = toScreen(0f, 0f);
+        Vector2 b = toScreen(1f, slope);
+        Vector2 d = b - a;
         float len = d.Length();
-        return len > 1e-4f ? d / len : new SysVec2(1f, 0f);
+        return len > 1e-4f ? d / len : new Vector2(1f, 0f);
     }
 
     // Inverse: a screen-space delta from the key → a value/time slope.
-    static float SlopeFromScreenDelta(SysVec2 screenDelta, Func<float, float, SysVec2> toScreen) {
-        SysVec2 a = toScreen(0f, 0f);
-        SysVec2 unitT = toScreen(1f, 0f) - a;   // screen vector for +1 time
-        SysVec2 unitV = toScreen(0f, 1f) - a;   // screen vector for +1 value
+    static float SlopeFromScreenDelta(Vector2 screenDelta, Func<float, float, Vector2> toScreen) {
+        Vector2 a = toScreen(0f, 0f);
+        Vector2 unitT = toScreen(1f, 0f) - a;   // screen vector for +1 time
+        Vector2 unitV = toScreen(0f, 1f) - a;   // screen vector for +1 value
         float dt = unitT.X != 0 ? screenDelta.X / unitT.X : 0f;
         float dv = unitV.Y != 0 ? screenDelta.Y / unitV.Y : 0f;
         return MathF.Abs(dt) < 1e-4f ? (dv >= 0 ? float.PositiveInfinity : float.NegativeInfinity) : dv / dt;
     }
 
-    static void HandleZoomPan(bool hovered, SysVec2 mouse, SysVec2 origin, SysVec2 size) {
+    void HandleZoomPan(IEditorGui gui, bool hovered, Vector2 mouse, Vector2 origin, Vector2 size) {
         if (!hovered) return;
-        float wheel = ImGui.GetIO().MouseWheel;
+        float wheel = gui.Input.MouseWheel;
         if (wheel != 0f) {
             // Zoom toward the cursor.
             float zoom = MathF.Pow(0.9f, wheel);
@@ -361,8 +379,8 @@ internal static class CurveEditorWindow {
             viewV0 = cv + (viewV0 - cv) * zoom; viewV1 = cv + (viewV1 - cv) * zoom;
         }
         // Middle-drag pan.
-        if (ImGui.IsMouseDragging(ImGuiMouseButton.Middle)) {
-            SysVec2 d = ImGui.GetIO().MouseDelta;
+        if (gui.Input.MouseDragging(2)) {
+            Vector2 d = gui.Input.MouseDelta;
             float dt = d.X / size.X * (viewT1 - viewT0);
             float dv = d.Y / size.Y * (viewV1 - viewV0);
             viewT0 -= dt; viewT1 -= dt;
@@ -372,48 +390,48 @@ internal static class CurveEditorWindow {
 
     // ---- Keyframe inspector (right panel) ------------------------------------
 
-    static void DrawKeyInspector(float scale) {
-        ImGui.TextDisabled("Keyframe");
-        ImGui.Separator();
+    void DrawKeyInspector(IEditorGui gui) {
+        gui.TextDisabled("Keyframe");
+        gui.Separator();
         if (selectedKey < 0 || selectedKey >= target.Count) {
-            ImGui.TextWrapped("Click a key to edit it, or double-click the canvas to add one.");
+            gui.TextWrapped("Click a key to edit it, or double-click the canvas to add one.");
             return;
         }
 
         AnimationCurve.Keyframe k = target.Keys[selectedKey];
-        ImGui.TextDisabled($"#{selectedKey}");
+        gui.TextDisabled($"#{selectedKey}");
 
         float time = k.Time, value = k.Value;
-        ImGui.SetNextItemWidth(-1);
-        if (DragWithUndo("Time##k", ref time, 0.01f)) { selectedKey = target.MoveKey(selectedKey, time, value); Changed(); }
+        gui.SetNextItemWidth(-1);
+        if (DragWithUndo(gui, "Time##k", ref time, 0.01f)) { selectedKey = target.MoveKey(selectedKey, time, value); Changed(); }
         k = target.Keys[selectedKey]; value = k.Value;
-        ImGui.SetNextItemWidth(-1);
-        if (DragWithUndo("Value##k", ref value, 0.01f)) { selectedKey = target.MoveKey(selectedKey, target.Keys[selectedKey].Time, value); Changed(); }
+        gui.SetNextItemWidth(-1);
+        if (DragWithUndo(gui, "Value##k", ref value, 0.01f)) { selectedKey = target.MoveKey(selectedKey, target.Keys[selectedKey].Time, value); Changed(); }
 
-        ImGui.Dummy(new SysVec2(0, 4));
-        ImGui.TextDisabled("Tangents");
+        gui.Dummy(new Vector2(0, 4));
+        gui.TextDisabled("Tangents");
         k = target.Keys[selectedKey];
         float inT = k.InTangent, outT = k.OutTangent;
         bool stepped = float.IsInfinity(inT) || float.IsInfinity(outT);
         if (!stepped) {
-            ImGui.SetNextItemWidth(-1);
-            if (DragWithUndo("In##t", ref inT, 0.05f)) { target.SetTangents(selectedKey, inT, target.Keys[selectedKey].OutTangent); Changed(); }
-            ImGui.SetNextItemWidth(-1);
-            if (DragWithUndo("Out##t", ref outT, 0.05f)) { target.SetTangents(selectedKey, target.Keys[selectedKey].InTangent, outT); Changed(); }
+            gui.SetNextItemWidth(-1);
+            if (DragWithUndo(gui, "In##t", ref inT, 0.05f)) { target.SetTangents(selectedKey, inT, target.Keys[selectedKey].OutTangent); Changed(); }
+            gui.SetNextItemWidth(-1);
+            if (DragWithUndo(gui, "Out##t", ref outT, 0.05f)) { target.SetTangents(selectedKey, target.Keys[selectedKey].InTangent, outT); Changed(); }
         } else {
-            ImGui.TextDisabled("(stepped)");
+            gui.TextDisabled("(stepped)");
         }
 
-        ImGui.Dummy(new SysVec2(0, 4));
-        ImGui.TextDisabled("Tangent mode");
-        if (ImGui.SmallButton("Flat")) SetTangentMode(0f, 0f);
-        ImGui.SameLine();
-        if (ImGui.SmallButton("Linear")) SetTangentModeLinear();
-        ImGui.SameLine();
-        if (ImGui.SmallButton("Step")) SetTangentMode(float.PositiveInfinity, float.PositiveInfinity);
+        gui.Dummy(new Vector2(0, 4));
+        gui.TextDisabled("Tangent mode");
+        if (gui.SmallButton("Flat")) SetTangentMode(0f, 0f);
+        gui.SameLine();
+        if (gui.SmallButton("Linear")) SetTangentModeLinear();
+        gui.SameLine();
+        if (gui.SmallButton("Step")) SetTangentMode(float.PositiveInfinity, float.PositiveInfinity);
 
-        ImGui.Dummy(new SysVec2(0, 8));
-        if (target.Count > 1 && ImGui.Button($"{EditorIcons.Delete} Delete key", new SysVec2(-1, 0))) {
+        gui.Dummy(new Vector2(0, 8));
+        if (target.Count > 1 && gui.Button($"{EditorIcons.Delete} Delete key", new Vector2(-1, 0))) {
             PushUndo();
             target.RemoveKey(selectedKey);
             selectedKey = Math.Clamp(selectedKey, 0, target.Count - 1);
@@ -422,14 +440,14 @@ internal static class CurveEditorWindow {
     }
 
     // A float drag that snapshots once when the drag begins (so Ctrl+Z undoes the whole drag, not steps).
-    static bool DragWithUndo(string label, ref float v, float speed) {
-        bool changed = ImGui.DragFloat(label, ref v, speed);
-        if (ImGui.IsItemActivated()) PushUndo();
-        if (ImGui.IsItemDeactivatedAfterEdit()) snapshotPushed = false;
+    bool DragWithUndo(IEditorGui gui, string label, ref float v, float speed) {
+        bool changed = gui.DragFloat(label, ref v, speed);
+        if (gui.IsItemActivated()) PushUndo();
+        if (gui.IsItemDeactivatedAfterEdit()) snapshotPushed = false;
         return changed;
     }
 
-    static void SetTangentMode(float inT, float outT) {
+    void SetTangentMode(float inT, float outT) {
         if (selectedKey < 0) return;
         PushUndo();
         target.SetTangents(selectedKey, inT, outT);
@@ -438,7 +456,7 @@ internal static class CurveEditorWindow {
     }
 
     // Linear: point both tangents at the neighbouring keys' slopes.
-    static void SetTangentModeLinear() {
+    void SetTangentModeLinear() {
         if (selectedKey < 0) return;
         PushUndo();
         AnimationCurve.Keyframe k = target.Keys[selectedKey];
@@ -460,7 +478,7 @@ internal static class CurveEditorWindow {
 
     // ---- View / undo / dirty helpers -----------------------------------------
 
-    static void FrameAll() {
+    void FrameAll() {
         if (target.Count == 0) { viewT0 = 0; viewT1 = 1; viewV0 = 0; viewV1 = 1; return; }
         float t0 = target.Keys[0].Time, t1 = target.Keys[target.Count - 1].Time;
         float v0 = float.MaxValue, v1 = float.MinValue;
@@ -475,7 +493,7 @@ internal static class CurveEditorWindow {
         viewV0 = v0 - vp; viewV1 = v1 + vp;
     }
 
-    static void Preset(AnimationCurve src) {
+    void Preset(AnimationCurve src) {
         PushUndo();
         target.Clear();
         for (int i = 0; i < src.Count; i++) target.AddKey(src.Keys[i]);
@@ -489,7 +507,7 @@ internal static class CurveEditorWindow {
 
     // Holds the post-edit curve string for the currently-open gesture, so the undo entry's REDO can
     // re-apply it. Updated on every Changed() until the gesture commits (snapshotPushed flips false).
-    static string[] pendingAfter;
+    string[] pendingAfter;
 
     // Whole-curve snapshot undo: capture the compact string before/after via a callback entry, so the
     // edit is reversible no matter which component (or .volume) owns the curve. Pushed once per gesture.
@@ -499,7 +517,7 @@ internal static class CurveEditorWindow {
     // mutation happens during the live gesture (and Changed() keeps after[0] current), so the mutate step
     // is a no-op here -- EditAsset only records the before/after revert pair. Byte-identical to the prior
     // PushCallback (same label, same applyOld/applyNew closures, one entry per gesture).
-    static void PushUndo() {
+    void PushUndo() {
         if (snapshotPushed) return;
         snapshotPushed = true;
         AnimationCurve curve = target;          // capture for the closures
@@ -507,7 +525,7 @@ internal static class CurveEditorWindow {
         string before = curve.ToCompactString();
         string[] after = [before];              // filled in by Changed() as the gesture proceeds
         pendingAfter = after;
-        EditorCommands.EditAsset($"Curve {title}",
+        EditorCommands.EditAsset($"Curve {curveTitle}",
             applyOld: () => { ApplyString(curve, before); changed?.Invoke(); },
             applyNew: () => { ApplyString(curve, after[0]); changed?.Invoke(); },
             mutate: () => { });
@@ -521,7 +539,7 @@ internal static class CurveEditorWindow {
         curve.PostWrap = parsed.PostWrap;
     }
 
-    static void Changed() {
+    void Changed() {
         // Keep the open gesture's redo target in sync with the live curve.
         if (snapshotPushed && pendingAfter is not null)
             pendingAfter[0] = target.ToCompactString();
