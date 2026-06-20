@@ -768,6 +768,11 @@ public sealed class DX12HDRenderer : HDRenderer
     Vector3 hizLastCamPos;
     bool hizPrimed; // false until we have a valid previous-frame depth (first frame / after a big jump)
     readonly System.Collections.Generic.List<IStaticMeshRenderer> wholeMeshRenderers = new();
+    // R3a: split-import (SubMeshIndex>=0) renderers routed through GPU-driven geometry (separate from the shadow
+    // caster list). `gpuDrivenGeometry` = wholeMeshRenderers + splitMeshRenderers, fed to the GEOMETRY pass's
+    // material table + RenderInto; the SHADOW pass keeps using wholeMeshRenderers only (split shadows stay CPU).
+    readonly System.Collections.Generic.List<IStaticMeshRenderer> splitMeshRenderers = new();
+    readonly System.Collections.Generic.List<IStaticMeshRenderer> gpuDrivenGeometry = new();
 
     // The pluggable pass list (phase 1 — the URP pre-RenderGraph model: a stably-event-ordered IRenderPass
     // list). PHASE 1 COMPLETE: every non-core pass is registered here and run by graph.Execute(ctx) (the event
@@ -1132,6 +1137,14 @@ public sealed class DX12HDRenderer : HDRenderer
     bool CpuBindless => cpuBindlessOn ??=
         Environment.GetEnvironmentVariable("BALLISTIC_DX12_CPU_BINDLESS") == "1";
 
+    // R3a opt-in: BALLISTIC_DX12_GPUDRIVEN_SPLIT=1 routes split-import renderers (SubMeshIndex >= 0, non-skinned,
+    // single-shader) through the SAME GPU compute-cull + ExecuteIndirect path as whole-mesh, instead of the CPU
+    // per-submesh loop — collapsing the last CPU-submit geometry path. Default OFF (bring-up: it changes the
+    // GPU-driven meta/cull, the EXACT surface whose mis-bind caused the R2 hang). Requires GPU-driven on.
+    bool? gpuDrivenSplitOn;
+    bool GpuDrivenSplit => gpuDrivenSplitOn ??=
+        Environment.GetEnvironmentVariable("BALLISTIC_DX12_GPUDRIVEN_SPLIT") == "1";
+
     // GI motion harness: per-frame camera yaw (deg) injected in BeginRender so a headless sequence has real motion.
     int motionYawFrame;
     float? motionYawCached;
@@ -1278,12 +1291,24 @@ public sealed class DX12HDRenderer : HDRenderer
 
         // GPU-driven: collect whole-mesh renderers once (used by BOTH the shadow pass and the geometry pass).
         wholeMeshRenderers.Clear();
+        // R3a: split-import (SubMeshIndex>=0, non-skinned) renderers routed through GPU-driven for the GEOMETRY
+        // pass ONLY (shadows stay on the CPU caster path for now — smaller surface). Collected separately so the
+        // shadow pass's wholeMeshRenderers list is unchanged.
+        splitMeshRenderers.Clear();
         if (gpuDrivenOn)
         {
+            bool split = GpuDrivenSplit;
             foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
-                if (r is { IsActive: true, IsRenderable: true } && r.SubMeshIndex < 0 && r.SharedMesh != null)
-                    wholeMeshRenderers.Add(r);
+            {
+                if (r is not { IsActive: true, IsRenderable: true } || r.SharedMesh == null) continue;
+                if (r.SubMeshIndex < 0) wholeMeshRenderers.Add(r);
+                else if (split && !r.IsSkinned) splitMeshRenderers.Add(r);
+            }
         }
+        // R3a: the GEOMETRY pass's GPU-driven set = whole-mesh + split-import (the shadow pass uses wholeMesh only).
+        gpuDrivenGeometry.Clear();
+        gpuDrivenGeometry.AddRange(wholeMeshRenderers);
+        gpuDrivenGeometry.AddRange(splitMeshRenderers);
 
         // Shadows first: render the sun cascades' depth (own upload command list) before opaque. Fit with the
         // UNJITTERED proj so the cascades are stable frame-to-frame (cascade caching + no TAA shadow jitter).
@@ -1369,8 +1394,10 @@ public sealed class DX12HDRenderer : HDRenderer
         // whole-mesh list is empty) — EnsureMaterialTable then resets the bindless heap + stamp; the CPU loop's
         // ResolveOrRegisterMaterialId fills the table mid-frame. Keeps scene-swap (RenderSetsCleared) re-pointing
         // correct on the CPU-only path too.
+        // R3a: register split-import materials too (gpuDrivenGeometry = whole + split). Split list is empty unless
+        // BALLISTIC_DX12_GPUDRIVEN_SPLIT=1, so this is byte-identical to feeding wholeMeshRenderers when off.
         if (gpuDrivenOn || CpuBindless)
-            gpuDriven.EnsureMaterialTable(wholeMeshRenderers);
+            gpuDriven.EnsureMaterialTable(gpuDrivenGeometry);
 
         // R2: PRE-REGISTER every CPU-path opaque material into the bindless table HERE — right after
         // EnsureMaterialTable, BEFORE BuildHiZ or any pass binds the BindlessHeap to a command list. GBV proved two
@@ -1458,6 +1485,10 @@ public sealed class DX12HDRenderer : HDRenderer
                 if (r is null || !r.IsActive || !r.IsRenderable) continue;
                 // Whole-mesh renderers are GPU-driven (compute cull + ExecuteIndirect) — skip them here.
                 if (gpuDrivenOn && r.SubMeshIndex < 0) continue;
+                // R3a: split-import (SubMeshIndex>=0) non-skinned renderers also go GPU-driven when GPUDRIVEN_SPLIT
+                // is on — skip them in the CPU loop (they're in splitMeshRenderers → RenderInto). Skinned split
+                // imports stay CPU (R3 compute-skinning follow-up).
+                if (gpuDrivenOn && GpuDrivenSplit && r.SubMeshIndex >= 0 && !r.IsSkinned) continue;
                 // Skinned meshes draw in the dedicated skinned block below (different PSO + bone matrices).
                 if (r.IsSkinned) continue;
                 Mesh mesh = r.SharedMesh;
@@ -1704,9 +1735,12 @@ public sealed class DX12HDRenderer : HDRenderer
             // GPU-driven whole-mesh geometry: compute cull + ExecuteIndirect + bindless materials, into the
             // same G-buffer. Uses the JITTERED viewProj for the per-draw Mvp (matches the CPU path) and the
             // UNJITTERED frustum planes for culling (byte-identical visible set).
-            if (gpuDrivenOn && wholeMeshRenderers.Count > 0)
+            // R3a: gpuDrivenGeometry = whole-mesh + split-import (split empty unless GPUDRIVEN_SPLIT=1 → byte-
+            // identical to wholeMeshRenderers when off). RenderInto clamps each renderer's submesh range by its
+            // SubMeshIndex, so split-import children draw only their one submesh.
+            if (gpuDrivenOn && gpuDrivenGeometry.Count > 0)
             {
-                draws += gpuDriven.RenderInto(cl, wholeMeshRenderers, viewProj, frustumPlanes,
+                draws += gpuDriven.RenderInto(cl, gpuDrivenGeometry, viewProj, frustumPlanes,
                     viewProjUnjittered, view, CameraNear, CameraFar, motionCb.Gpu);
                 tris += gpuDriven.LastTris;
             }

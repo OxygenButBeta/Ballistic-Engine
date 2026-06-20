@@ -189,6 +189,26 @@ Triage flow per phase: `bal perf <scene>` for the relative pass deltas + `Render
 - **Env door:** `BALLISTIC_DX12_BINDLESS=0` restores the ring + per-draw copies (byte-identical).
 - **Gate:** byte-identical; Tracy shows per-draw copy cost gone from CPU submit + ring rebuild gone; full matrix incl. a scene-swap (validates re-point on `RenderSetsCleared`) and a resize (validates re-point on realloc).
 
+### R3a STATUS (2026-06-20): split-import GPU-driven landed opt-in, NOT yet byte-identical
+
+> `BALLISTIC_DX12_GPUDRIVEN_SPLIT=1` routes split-import (SubMeshIndex>=0, non-skinned, single-shader) renderers
+> through the GPU compute-cull + ExecuteIndirect path (geometry pass only; shadows stay CPU). RenderInto now clamps
+> each renderer's submesh range by its SubMeshIndex. Validated on a synthetic split fixture
+> (`SampleProject/Assets/CornellBox/CornellBoxSplit.scene`, 4 entities sharing CornellBox.obj at SubMeshIndex 0..3):
+> - **No hang** (DRED clean), `draws` collapses 4→1 ExecuteIndirect — the mechanism works.
+> - **NOT byte-identical:** meanError 0.06 (11.9% px) full; with Hi-Z occlusion off it drops to 0.0035 (1%), and a
+>   single-submesh split with Hi-Z off still differs 0.002 (0.4%). So TWO diff sources: (1) Hi-Z occlusion culls
+>   overlapping split siblings the CPU path doesn't (the fixture is pathological — same position; real split-import
+>   has distinct node transforms, may not trigger it); (2) a residual ~0.4% per-submesh GPU-ExecuteIndirect vs
+>   CPU-DrawIndexed difference (FP/cull-ordering or SubmeshMeta write — R2's CPU-bindless path through the SAME
+>   GBufferBindless.hlsl IS byte-identical, so the delta is in the GPU cull/meta, not the shader).
+> - **Default OFF**, byte-identical when off. Ship ON only after both diff sources are resolved (align split Hi-Z
+>   with the CPU semantics + find the 0.4%). R2's CPU-bindless split path remains byte-identical and is the safe
+>   default for split-import bindless until R3a is exact.
+>
+> **R2 production validation (this session): split-import + GPUDRIVEN on, CPU_BINDLESS=1 == OFF byte-identical** on
+> the split fixture — R2's "needs a split-import scene" gap is now closed.
+
 ### R3 — Collapse CPU per-submesh paths into unified GPU-driven ExecuteIndirect
 
 - **Goal:** route split-by-node (`SubMeshIndex ≥ 0`), skinned, and mixed-shader renderers through the **same** GPU compute frustum/Hi-Z cull + ExecuteIndirect path the whole-mesh renderer uses — eliminating the CPU per-submesh loop at `DX12HDRenderer.cs:1367–1578`. **Pairs with R2** (bindless materials for every draw).

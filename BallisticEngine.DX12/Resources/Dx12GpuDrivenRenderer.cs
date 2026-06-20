@@ -463,7 +463,14 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             foreach (var r in kv.Value) {
                 Matrix4x4 model = ToNum(r.Transform.WorldMatrix);
                 Matrix4x4 mvp = model * viewProj;
-                for (int s = 0; s < mesh.SubMeshes.Length && total < Capacity; s++) {
+                // R3a: a split-import renderer (SubMeshIndex >= 0) draws ONLY its one submesh; a whole-mesh
+                // renderer (< 0) draws all submeshes. Clamp the loop range per renderer so split-import children
+                // can share the GPU-driven path without each one pulling in the whole mesh's submeshes.
+                int only = r.SubMeshIndex;
+                int sFirst = only >= 0 ? only : 0;
+                int sLast = only >= 0 ? only : mesh.SubMeshes.Length - 1;
+                for (int s = sFirst; s <= sLast && total < Capacity; s++) {
+                    if ((uint)s >= (uint)mesh.SubMeshes.Length) break;
                     SubMeshData sub = mesh.SubMeshes[s];
                     if (sub.IndexCount <= 0) continue;
                     Material mat = r.MaterialFor(s);
