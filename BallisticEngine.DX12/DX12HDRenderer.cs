@@ -916,6 +916,10 @@ public sealed class DX12HDRenderer : HDRenderer
             RenderTargetFormats = Dx12GBuffer.ColorFormats,
             DepthStencilFormat = Dx12GBuffer.DepthFormat, SampleDescription = new SampleDescription(1, 0),
         });
+
+        surfaceCache = new Dx12SurfaceShaderCache(dev.Device, gbufferRootSig, gbufferLayout, gbufferVsBytecode);
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_SURFACE_SELFTEST") == "1")
+            surfaceCache.SelfTest();
     }
 
     // Cached opaque-PSO ingredients so the surface-shader cache (Stage B) can build per-material PSOs
@@ -923,6 +927,11 @@ public sealed class DX12HDRenderer : HDRenderer
     // engine's VSMain → z-prepass depth stays bit-identical regardless of the custom surface body.
     InputLayoutDescription gbufferLayout;
     byte[] gbufferVsBytecode;
+
+    // Per-material custom Surface PSOs (Stage B+). Built lazily off gbufferRootSig + the cached state
+    // above so they're drop-in for the Standard PSO; a compile failure yields the magenta-checker
+    // fallback. Not consumed by any draw yet (Stage C wires selection on the legacy CPU path).
+    internal Dx12SurfaceShaderCache surfaceCache;
 
     // Skinned-geometry PSO: same G-buffer target/state as BuildGeometryPass, but the vertex stage skins by
     // per-bone matrices (GBufferSkinned.hlsl). Root sig adds a bone-matrix SRV (t6, root SRV) on top of the

@@ -107,6 +107,12 @@ VSOutput VSMain(VSInput v) {
     return o;
 }
 
+// The surface-shader cache replaces the marker line below with a custom Surface() body, placed HERE
+// (before PSMain, so its call resolves — HLSL has no forward declaration). No substitution → the
+// default Standard body compiles (standalone/embedded build + the BALLISTIC_DX12_SURFACE_SKELETON
+// door). A custom build defines CUSTOM_SURFACE so the default below is omitted.
+//USER_SURFACE_MARKER
+
 // ---- Default (Standard PBR) Surface body. A custom shader replaces this; the cache omits it then. ----
 #ifndef CUSTOM_SURFACE
 SurfaceOutput Surface(SurfaceInput i) {
