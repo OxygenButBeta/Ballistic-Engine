@@ -38,6 +38,12 @@ internal static class WindowShell {
 
     // Draw a window filling a given rect (the maximize path). Returns the (possibly close-button-flipped)
     // shown state so the caller persists it. Mirrors the docked path's End-always pairing.
+    //
+    // EF9b (doesn't-fight-docking): the maximized window gets its OWN dedicated `###maxpanel` id with
+    // NoSavedSettings — NOT the docked `###DockKey` — so ImGui doesn't force-undock the panel or write the
+    // fullscreen geometry into the docked window's saved settings. `titleStrip` still gets the real DockKey
+    // (the maximize KEY) so the title double-click restores the right panel. Content is the SAME OnGui, so
+    // docked and maximized views share one instance/state.
     public static bool DrawMaximized(EditorWindow win, IEditorGui gui,
                                      SysVec2 pos, SysVec2 size, System.Action<string> titleStrip) {
         if (win.IsViewport)
@@ -47,9 +53,11 @@ internal static class WindowShell {
         ImGui.SetNextWindowSize(size);
 
         bool shown = true;
-        string label = $"{win.Title}###{win.DockKey}";
+        // Visible title from the window; fixed `###maxpanel` id (dedicated fullscreen identity).
+        string label = $"{win.Icon}  {win.Title}###maxpanel";
         bool visible = ImGui.Begin(label, ref shown,
-            ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoCollapse);
+            ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoCollapse |
+            ImGuiWindowFlags.NoDocking | ImGuiWindowFlags.NoSavedSettings);
         if (visible) {
             titleStrip?.Invoke(win.DockKey);
             win.Frame(gui);

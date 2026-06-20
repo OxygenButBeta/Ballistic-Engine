@@ -21,7 +21,7 @@ internal sealed class EditorPanelRegistry {
         public string Key;                  // the EditorLayout.* dock name (also the ImGui ### id + maximize key)
         public string Title;
         public string Icon;
-        public System.Action DrawContents;  // draws the panel body (null for viewports — they use the compositing path)
+        public EditorWindow Window;         // Phase 3: the window this descriptor draws (a real subclass or a LegacyWindow bridge). Null for viewports.
         public bool IsViewport;             // Scene/Game views: special render-target compositing, not a generic body
         public bool Shown = true;           // current open state (owned here — replaces the showXxx fields). Viewports ignore it.
     }
@@ -31,14 +31,25 @@ internal sealed class EditorPanelRegistry {
 
     public IReadOnlyList<Descriptor> All => ordered;
 
-    public void Register(string key, string title, string icon, System.Action drawContents,
+    // Phase-3 registration: a core panel is declared by the EditorWindow that draws it. Viewports pass
+    // a null window (they composite their render target via DrawViewportWindows). Title/Icon/Key are
+    // taken from the window when present (single source), falling back to the args for viewports.
+    public void Register(EditorWindow window, string key, string title, string icon,
         bool isViewport = false) {
         var d = new Descriptor {
             Key = key, Title = title, Icon = icon,
-            DrawContents = drawContents, IsViewport = isViewport,
+            Window = window, IsViewport = isViewport,
         };
         byKey[key] = d;
         ordered.Add(d);
+    }
+
+    // Back-compat overload for not-yet-migrated panels: wrap the raw-ImGui body in a LegacyWindow so the
+    // descriptor still carries an EditorWindow. Viewports pass a null body (isViewport: true).
+    public void Register(string key, string title, string icon, System.Action drawContents,
+        bool isViewport = false) {
+        EditorWindow win = isViewport ? null : new LegacyWindow(key, title, icon, drawContents);
+        Register(win, key, title, icon, isViewport);
     }
 
     public Descriptor Get(string key) => byKey.TryGetValue(key, out Descriptor d) ? d : null;
@@ -106,19 +117,18 @@ internal sealed class EditorPanelRegistry {
     // Viewports are always available (one renderer target, never "closed"). Unregistered key -> false.
     public bool IsAvailable(string key) => IsShown(key);
 
-    // Draw every shown, non-viewport core panel in declaration order. `drawOne(key, ref shown, contents)`
-    // does the ImGui Begin/End with the close button bound to `shown`; the registry writes the result
-    // back into the descriptor so the close button updates the single-owned state. The viewports are
-    // excluded (their compositing path is DrawViewportWindows). Returns nothing — pure iteration.
-    public void DrawCore(CoreDrawer drawOne) {
+    // Phase 3: draw every shown, non-viewport core panel in declaration order THROUGH WindowShell, so the
+    // single Begin/End-pairing invariant lives in one place and every panel is an EditorWindow. The
+    // close-button X writes back through `ref shown` into the descriptor. `requestFocus(key)` surfaces a
+    // just-reopened panel (Unity focus-on-open); `titleStrip(key)` runs the maximize/Add-Tab tab handler
+    // right after a visible Begin. Viewports are excluded (their compositing path is DrawViewportWindows).
+    public void DrawCore(IEditorGui gui, System.Func<string, bool> requestFocus,
+        System.Action<string> titleStrip) {
         foreach (Descriptor d in ordered) {
-            if (d.IsViewport || !d.Shown) continue;
+            if (d.IsViewport || !d.Shown || d.Window is null) continue;
             bool shown = d.Shown;
-            drawOne(d.Key, ref shown, d.DrawContents);
+            WindowShell.Draw(d.Window, gui, ref shown, requestFocus(d.Key), titleStrip);
             d.Shown = shown;   // honour a close-button X that flipped it this frame
         }
     }
-
-    // The per-panel draw callback (a delegate so we can take `shown` by ref — lambdas can't capture ref).
-    public delegate void CoreDrawer(string key, ref bool shown, System.Action drawContents);
 }

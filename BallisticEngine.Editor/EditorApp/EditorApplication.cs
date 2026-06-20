@@ -37,6 +37,10 @@ internal sealed class EditorApplication {
     // A1b: the single descriptor table for the CORE dockable panels (one declaration per panel that the
     // normal draw, the maximize content path, and the maximize-availability check all read).
     readonly EditorPanelRegistry panels = new();
+
+    // The one IEditorGui seam instance, reused for every EditorWindow each frame (Phase 3). Stateless —
+    // holds no per-window data. WindowShell hands it to each window's OnGui.
+    readonly IEditorGui gui = new ImGuiEditorGui();
     // A1b: the maximize state machine (which panel fills the window) — replaces the bare `maximizedPanel`
     // string + its three hand-synced clear sites with one can't-get-stuck controller.
     readonly MaximizeController maximize = new();
@@ -181,7 +185,7 @@ internal sealed class EditorApplication {
         panels.Register(EditorLayout.SceneComponents, "Scene Components", EditorIcons.World, hierarchy.DrawSceneContents);
         panels.Register(EditorLayout.Inspector, "Details", EditorIcons.Wrench, inspector.DrawContents);  // EF12: KEY stays "Inspector", display = "Details"
         panels.Register(EditorLayout.Assets, "Assets", EditorIcons.Folder, assets.DrawContents);
-        panels.Register(EditorLayout.Console, "Console", EditorIcons.Document, console.DrawContents);
+        panels.Register(console, EditorLayout.Console, "Console", EditorIcons.Document);  // real EditorWindow (Phase 1 pilot)
         panels.Register(EditorLayout.SceneView, "Scene View", EditorIcons.Camera, null, isViewport: true);
         panels.Register(EditorLayout.GameView, "Game View", EditorIcons.Play, null, isViewport: true);
 
@@ -817,16 +821,14 @@ internal sealed class EditorApplication {
         ImGui.DockSpace(dockId, SysVec2.Zero, ImGuiDockNodeFlags.None);
         ImGui.End();
 
-        // Dockable core panels — normal windows ImGui places into the dock tree. A1b-deeper: walk the
-        // registry instead of five named DrawDockPanel calls; the registry owns each panel's Shown state
-        // and writes the close-button result back through DrawDockPanel's `ref show`. EditorApplication
-        // names no core panel here. The declaration order (Entities, Scene-components, Inspector, Assets,
-        // Console) reproduces the old draw order.
-        // IMPORTANT: once Begin() is called it MUST be paired with End(), even if Begin returns false
-        // (collapsed) OR the close button set show=false this frame. The old "if (show) End()" dropped
-        // the End() when the X was clicked (Begin already drew the content + opened a BeginChild that
-        // frame), leaving "Missing EndChild()" and corrupting all ImGui state. DrawDockPanel handles it.
-        panels.DrawCore(DrawDockPanel);
+        // Dockable core panels — normal windows ImGui places into the dock tree. Phase 3: every core panel
+        // is an EditorWindow (a real subclass or a LegacyWindow bridge), drawn through WindowShell, which
+        // owns the single Begin/End-pairing invariant (End is ALWAYS called once Begin ran, even on a
+        // close-X this frame — the old "if (show) End()" bug). The registry owns each panel's Shown state
+        // and writes the close-button result back. EditorApplication names no core panel here. `requestFocus`
+        // surfaces a Window-menu-reopened panel (EF9d); `titleStrip` runs the maximize/Add-Tab tab handler.
+        // The declaration order (Entities, Scene-components, Inspector, Assets, Console) is the draw order.
+        panels.DrawCore(gui, key => pendingFocusWindow == key, MaximizePanelOnTitleDoubleClick);
 
         // Extra (duplicated) panel instances opened from the Add Tab menu. (Drawn after the core panels
         // now that the latter are one registry loop; these are floating-centered windows ImGui places by
@@ -1462,30 +1464,6 @@ internal sealed class EditorApplication {
     // Draws one dockable panel with a CORRECT Begin/End pairing: End() is always called once Begin()
     // ran, even when Begin returns false or the close button just set `show` to false this frame. The
     // content (+ the maximize/add-tab strip handler) only runs when Begin returned true.
-    void DrawDockPanel(string name, ref bool show, Action drawContents) {
-        // EF9d: a core panel re-opened from the Window menu (ToggleWindow flipped Shown false->true and
-        // set pendingFocusWindow = key) must SURFACE — otherwise it re-appears behind whatever tab shares
-        // its dock node and the toggle reads as a no-op. DrawCore runs before DrawViewportWindows (which
-        // clears pendingFocusWindow), so the flag is still live here; the viewports consume their own keys
-        // (SceneView/GameView) and never match a core-panel key, so there is no conflict. Same Unity-style
-        // focus-on-open the viewports already get, now extended to the core dockable panels.
-        if (pendingFocusWindow == name) ImGui.SetNextWindowFocus();
-        // EF12: the docked tab/title is the descriptor's DISPLAY Title, with the panel KEY as the ImGui
-        // `###id`. ImHashStr resets at the last `###`, so the window id is still hash(name) — the dock-.ini
-        // `[Window][<key>]` entry, the dock-builder's DockBuilderDockWindow(key) target, and the `.panels`
-        // sidecar all match unchanged. This makes the docked title source agree with the maximized
-        // (DrawMaximizedPanel) and multi-instance (DockPanelHost) paths, which already show d.Title — and
-        // is what surfaces "Inspector"→"Details" (and "Scene"→"Scene Components") on the docked tab.
-        EditorPanelRegistry.Descriptor dd = panels.Get(name);
-        string label = dd is not null ? $"{dd.Title}###{name}" : name;
-        bool visible = ImGui.Begin(label, ref show);
-        if (visible) {
-            MaximizePanelOnTitleDoubleClick(name);
-            drawContents();
-        }
-        ImGui.End();
-    }
-
     // Double-clicking a window's tab/title strip toggles fullscreen for THAT panel (works for every
     // dockable panel now, not just the viewports). Call right after the panel's Begin. For a DOCKED
     // window the tab bar sits ABOVE the content origin, so the hit band extends upward by ~1.4 frame
@@ -1593,25 +1571,25 @@ internal sealed class EditorApplication {
         // the registry Shown flag (so it STICKS next frame, no redraw loop) AND clear the maximize state
         // this same frame so the docked layout returns immediately. Restore-by-title-double-click keys off
         // `name` (the maximize KEY), not the window label, so it stays a no-op-toggle that restores.
-        ImGui.SetNextWindowPos(pos);
-        ImGui.SetNextWindowSize(size);
-        const ImGuiWindowFlags flags = ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove |
-            ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking | ImGuiWindowFlags.NoSavedSettings;
         EditorPanelRegistry.Descriptor d = panels.Get(name);
-        string title = d is not null ? $"{d.Icon}  {d.Title}" : name;
-        bool open = panels.IsShown(name);
-        if (ImGui.Begin($"{title}###maxpanel", ref open, flags)) {
-            MaximizePanelOnTitleDoubleClick(name); // double-click its title again to restore (keys off the maximize key)
-            if (d?.DrawContents is not null)
-                d.DrawContents();
-            else {
-                // Not a registered, body-drawable panel (shouldn't reach here — the stale-drop clears an
-                // unknown target). Give a way out so it can never get stuck maximized.
+        if (d?.Window is null) {
+            // Not a registered, body-drawable panel (shouldn't reach here — the stale-drop clears an
+            // unknown target). Give a way out so it can never get stuck maximized.
+            ImGui.SetNextWindowPos(pos);
+            ImGui.SetNextWindowSize(size);
+            const ImGuiWindowFlags emptyFlags = ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove |
+                ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking | ImGuiWindowFlags.NoSavedSettings;
+            if (ImGui.Begin($"{name}###maxpanel", emptyFlags)) {
                 ImGui.TextDisabled("This panel can't be shown fullscreen.");
                 if (ImGui.Button("Exit Fullscreen")) maximize.Clear();
             }
+            ImGui.End();
+            return;
         }
-        ImGui.End();
+        // Phase 3: the maximized window draws through the SAME WindowShell as the docked path, with its
+        // dedicated `###maxpanel` identity (NoSavedSettings) so it doesn't fight docking (EF9b). The X is
+        // drawn + honored (EF9a): on close, flip the registry Shown flag and clear maximize this frame.
+        bool open = WindowShell.DrawMaximized(d.Window, gui, pos, size, MaximizePanelOnTitleDoubleClick);
         if (!open) {                  // X clicked while maximized: honor the close everywhere
             panels.SetShown(name, false);
             maximize.Clear();
