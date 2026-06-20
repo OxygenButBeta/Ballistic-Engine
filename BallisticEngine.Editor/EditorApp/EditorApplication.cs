@@ -779,7 +779,7 @@ internal sealed class EditorApplication {
             buildPanel.DrawStandalone(gui);
             CurveEditorWindow.Instance.DrawStandalone(gui);
             ComponentEditorWindow.Instance.DrawStandalone(gui);
-            UnityImportWindow.Draw(S);
+            UnityImportWindow.Instance.DrawStandalone(gui);
             UserEditorWindowRegistry.DrawAll(gui);   // includes RenderPassToggles ([EditorWindowMeta], auto-discovered)
             DrawUnsavedPrompt();
             return;
@@ -863,7 +863,7 @@ internal sealed class EditorApplication {
         buildPanel.DrawStandalone(gui);
         CurveEditorWindow.Instance.DrawStandalone(gui);
         ComponentEditorWindow.Instance.DrawStandalone(gui);   // standalone component window
-        UnityImportWindow.Draw(S);
+        UnityImportWindow.Instance.DrawStandalone(gui);
         // [EditorWindowMeta] windows — built-in (RenderPassToggles) AND user-authored game-editor scripts.
         UserEditorWindowRegistry.DrawAll(gui);
         DrawUnsavedPrompt();
@@ -1495,7 +1495,7 @@ internal sealed class EditorApplication {
             case EditorMenus.WindowKeys.TagsLayers: tagsLayers.Open = true; break;
             case EditorMenus.WindowKeys.LayerCollision: layerCollision.Open = true; break;
             case EditorMenus.WindowKeys.Settings: settings.Open = true; break;
-            case EditorMenus.WindowKeys.UnityImport: UnityImportWindow.Open(); break;
+            case EditorMenus.WindowKeys.UnityImport: UnityImportWindow.Show(); break;
             default:
                 if (UserEditorWindowRegistry.Get(key) is { } u) {
                     u.Window.Open = true;
