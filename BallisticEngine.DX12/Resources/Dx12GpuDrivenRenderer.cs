@@ -435,10 +435,18 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         var groups = new List<(Dx12Buffer<GLVector3> vb, Dx12Buffer<GLVector3> nb,
             Dx12Buffer<Vector2> ub, Dx12Buffer<Vector4> tb,
             Dx12IndexBuffer ib, int baseIdx, int count)>();
+        // DETERMINISTIC group order: a plain Dictionary's enumeration order is NOT stable (hash + insertion
+        // history), so iterating it assigned SubmeshMeta slots — and thus the ExecuteIndirect DRAW ORDER — in a
+        // run-to-run-varying order. For meshes that don't overlap (Bistro) draw order doesn't change pixels, so
+        // it went unnoticed; but for OVERLAPPING coplanar geometry (split-import siblings at the same transform)
+        // the last-writer at z-equal seams flipped, making the output non-deterministic AND diverge from the CPU
+        // loop. Fix: order groups by each mesh's FIRST appearance in `wholeMesh` (the renderer iteration order the
+        // CPU per-submesh loop also uses), via a parallel key list — so the draw order matches the CPU path.
+        var meshOrder = new List<Mesh>();
         var byMesh = new Dictionary<Mesh, List<IStaticMeshRenderer>>();
         foreach (var r in wholeMesh) {
             Mesh m = r.SharedMesh; if (m is null) continue;
-            if (!byMesh.TryGetValue(m, out var list)) { list = new(); byMesh[m] = list; }
+            if (!byMesh.TryGetValue(m, out var list)) { list = new(); byMesh[m] = list; meshOrder.Add(m); }
             list.Add(r);
         }
 
@@ -448,9 +456,9 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
 
         int total = 0, groupCount = 0;
         long triAccum = 0;
-        foreach (var kv in byMesh) {
+        foreach (Mesh mesh in meshOrder) {
             if (groupCount >= MaxGroups) break;
-            Mesh mesh = kv.Key;
+            var kvValue = byMesh[mesh];
             var vb = mesh.VertexBuffer as Dx12Buffer<GLVector3>;
             var ib = mesh.IndexBuffer as Dx12IndexBuffer;
             var nb = mesh.NormalBuffer as Dx12Buffer<GLVector3>;
@@ -460,7 +468,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
                 ub?.Resource is null || tb?.Resource is null) continue;
 
             int groupBase = total;
-            foreach (var r in kv.Value) {
+            foreach (var r in kvValue) {
                 Matrix4x4 model = ToNum(r.Transform.WorldMatrix);
                 Matrix4x4 mvp = model * viewProj;
                 // R3a: a split-import renderer (SubMeshIndex >= 0) draws ONLY its one submesh; a whole-mesh
@@ -613,10 +621,13 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
                                        Matrix4x4[] cascadeMatrices, int activeCascades = ShadowCascades) {
         shadowSlices.Clear();
         int cascades = Math.Clamp(activeCascades, 1, ShadowCascades);
+        // Deterministic group order (see RenderInto): Dictionary enumeration order is unstable. Shadow depth is
+        // Less-tested so order rarely flips pixels, but keep it stable for parity with the geometry pass.
+        var meshOrder = new List<Mesh>();
         var byMesh = new Dictionary<Mesh, List<IStaticMeshRenderer>>();
         foreach (var r in wholeMesh) {
             Mesh m = r.SharedMesh; if (m is null) continue;
-            if (!byMesh.TryGetValue(m, out var list)) { list = new(); byMesh[m] = list; }
+            if (!byMesh.TryGetValue(m, out var list)) { list = new(); byMesh[m] = list; meshOrder.Add(m); }
             list.Add(r);
         }
 
@@ -628,14 +639,13 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         var planes = new Vector4[6];
         for (int c = 0; c < cascades; c++) {
             ExtractPlanes(cascadeMatrices[c], planes);
-            foreach (var kv in byMesh) {
+            foreach (Mesh mesh in meshOrder) {
                 if (sliceCount >= ShadowCascades * MaxGroups) break;
-                Mesh mesh = kv.Key;
                 var vb = mesh.VertexBuffer as Dx12Buffer<GLVector3>;
                 var ib = mesh.IndexBuffer as Dx12IndexBuffer;
                 if (vb?.Resource is null || ib?.Resource is null) continue;
                 int sliceBase = total;
-                foreach (var r in kv.Value) {
+                foreach (var r in byMesh[mesh]) {
                     Matrix4x4 model = ToNum(r.Transform.WorldMatrix);
                     Matrix4x4 lightMvp = Matrix4x4.Transpose(model * cascadeMatrices[c]);
                     for (int s = 0; s < mesh.SubMeshes.Length && total < ShadowCapacity; s++) {
