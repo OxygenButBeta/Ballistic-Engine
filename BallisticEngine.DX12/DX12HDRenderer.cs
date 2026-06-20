@@ -890,17 +890,26 @@ public sealed class DX12HDRenderer : HDRenderer
         normalLodBiasCached = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_NORMAL_LOD_BIAS"),
             System.Globalization.CultureInfo.InvariantCulture, out float nlbInit) ? nlbInit : 0.5f;
 
-        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("GBuffer.hlsl");
-        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "GBuffer.hlsl");
-        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "GBuffer.hlsl");
-        var layout = new InputLayoutDescription(
+        // The opaque G-buffer shader. Default = the monolithic GBuffer.hlsl. With the env door, compile
+        // the SurfaceSkeleton.hlsl (Standard body inlined) instead — same ABI/state, used to PROVE the
+        // surface skeleton is byte-identical before any per-material custom-shader wiring (Stage A).
+        bool useSkeleton = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SURFACE_SKELETON") == "1";
+        string shaderFile = useSkeleton ? "SurfaceSkeleton.hlsl" : "GBuffer.hlsl";
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl(shaderFile);
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", shaderFile);
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", shaderFile);
+        // The opaque PSO state — kept as a field-cloneable description so custom-surface PSOs (Stage B+)
+        // mirror it EXACTLY (only the pixel shader differs), guaranteeing z-prepass position invariance
+        // + identical MRT/depth/raster state.
+        gbufferLayout = new InputLayoutDescription(
             new InputElementDescription("POSITION", 0, Format.R32G32B32_Float, 0, 0),
             new InputElementDescription("NORMAL", 0, Format.R32G32B32_Float, 0, 1),
             new InputElementDescription("TEXCOORD", 0, Format.R32G32_Float, 0, 2),
             new InputElementDescription("TANGENT", 0, Format.R32G32B32A32_Float, 0, 3));
+        gbufferVsBytecode = vs;
         gbufferPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription
         {
-            RootSignature = gbufferRootSig, VertexShader = vs, PixelShader = ps, InputLayout = layout,
+            RootSignature = gbufferRootSig, VertexShader = vs, PixelShader = ps, InputLayout = gbufferLayout,
             PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
             RasterizerState = RasterizerDescription.CullClockwise, // back-face cull, CCW-from-front (forward parity)
             BlendState = BlendDescription.Opaque, DepthStencilState = DepthStencilDescription.Default,
@@ -908,6 +917,12 @@ public sealed class DX12HDRenderer : HDRenderer
             DepthStencilFormat = Dx12GBuffer.DepthFormat, SampleDescription = new SampleDescription(1, 0),
         });
     }
+
+    // Cached opaque-PSO ingredients so the surface-shader cache (Stage B) can build per-material PSOs
+    // that mirror gbufferPso's state byte-for-byte (only the pixel shader swapped). The VS is ALWAYS the
+    // engine's VSMain → z-prepass depth stays bit-identical regardless of the custom surface body.
+    InputLayoutDescription gbufferLayout;
+    byte[] gbufferVsBytecode;
 
     // Skinned-geometry PSO: same G-buffer target/state as BuildGeometryPass, but the vertex stage skins by
     // per-bone matrices (GBufferSkinned.hlsl). Root sig adds a bone-matrix SRV (t6, root SRV) on top of the
