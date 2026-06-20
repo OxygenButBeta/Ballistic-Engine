@@ -121,6 +121,9 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     Dx12FrameCb<TemporalConstants> tempCb;   // P0b N-buffered
     Dx12DescriptorHeap tempSrv;        // 5 descriptors/frame
     Dx12OffscreenTarget indirectResolved; // temporal output (ping target so we don't read+write `indirect` in place)
+    // The buffer the trace phase left the final filtered/resolved E in — the combine reads THIS (not a fixed field)
+    // so the ping-pong path can hand the combine `indirectResolved` directly without a Copy into `indirectFiltered`.
+    Dx12OffscreenTarget lastResolved;
 
     [StructLayout(LayoutKind.Sequential)]
     struct TemporalConstants { public Vector2 Texel; public float HistoryValid; public float Alpha; public uint W, H; public float Pad0, Pad1; }
@@ -480,8 +483,10 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         }
         else
         {
-            // LEGACY single-phase order: combine THIS frame's freshly-traced E now (byte-identical to before).
-            RecordCombine(ctx, gbuffer, target, fx, indirectFiltered);
+            // LEGACY single-phase order: combine THIS frame's freshly-traced E now. The trace phase records which
+            // buffer it left the resolved E in (`lastResolved`) — indirectResolved on the ping-pong path (no Copy),
+            // indirectFiltered on the legacy-Copy path. Output-identical either way.
+            RecordCombine(ctx, gbuffer, target, fx, lastResolved ?? indirectFiltered);
         }
 
         Prof("combine");
@@ -599,15 +604,25 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                 W = (uint)indirect.Width, H = (uint)indirect.Height,
                 Pad0 = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_TEMPORAL_NOMOTION") == "1" ? 1f : 0f,
             });
+            // PING-PONG (default): the temporal resolve reads history(probeHistory) and writes the resolved E
+            // straight into `indirectResolved`. The combine then reads `indirectResolved` DIRECTLY, and next frame
+            // `indirectResolved` IS the history — so we just swap the two roles instead of doing two full-res Copies
+            // (resolved→indirectFiltered for the combine + resolved→probeHistory for history). Two fewer full-res
+            // RGBA16F blits + their barriers per frame, output-identical. Kill: BALLISTIC_DX12_LUMEN_PINGPONG=0
+            // reverts to the explicit-Copy form (writes indirectFiltered, copies to probeHistory).
+            // asyncCl != null ⇒ we're recording the async-GI compute list (that path owns its own buffer swap and
+            // must keep writing indirectFiltered) → ping-pong only on the inline/sync path.
+            bool pingPong = asyncCl is null && Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_PINGPONG") != "0";
+            Dx12OffscreenTarget resolvedDst = indirectResolved;   // temporal writes here either way; ping-pong just reuses it as next-frame history
             ToShaderRead(probeHistory);
-            ToUav(indirectResolved);
+            ToUav(resolvedDst);
             tempSrv.Reset();
             int tb = tempSrv.AllocateRange(5);
             dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 0), indirect.ColorSrvCpu, heapType);          // t0 denoised fresh E
             dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 1), probeHistory.ColorSrvCpu, heapType);      // t1 history
             dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 2), gbuffer.DepthSrvCpu, heapType);           // t2 depth
             dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 3), gbuffer.ColorSrvCpu(4), heapType);        // t3 motion (RT4)
-            dev.Device.CreateUnorderedAccessView(indirectResolved.RenderTarget, null, new UnorderedAccessViewDescription
+            dev.Device.CreateUnorderedAccessView(resolvedDst.RenderTarget, null, new UnorderedAccessViewDescription
             {
                 Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
             }, tempSrv.Cpu(tb + 4));                                                                            // u0 resolved
@@ -621,12 +636,23 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                 cl.SetComputeRootDescriptorTable(1, tempSrv.Gpu(tb));
                 cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
             });
-            ToShaderRead(indirectResolved);
-            // resolved E → the combine reads it (via indirectFiltered) AND it becomes next frame's history.
-            Copy(indirectFiltered, indirectResolved);
-            ToShaderRead(indirectFiltered);
-            Copy(probeHistory, indirectResolved);
-            ToShaderRead(probeHistory);
+            ToShaderRead(resolvedDst);
+            if (pingPong)
+            {
+                // The combine reads `resolvedDst` (= indirectResolved) directly; next frame it becomes the history
+                // and the old `probeHistory` becomes the fresh resolve target. ZERO full-res copies.
+                lastResolved = resolvedDst;
+                (indirectResolved, probeHistory) = (probeHistory, indirectResolved);
+            }
+            else
+            {
+                // Legacy explicit-Copy form (kept for A/B + the async path, which owns its own buffer swap).
+                Copy(indirectFiltered, indirectResolved);
+                ToShaderRead(indirectFiltered);
+                Copy(probeHistory, indirectResolved);
+                ToShaderRead(probeHistory);
+                lastResolved = indirectFiltered;
+            }
             probeHistoryValid = true;
         }
         else
@@ -636,6 +662,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             ToShaderRead(indirectFiltered);
             Copy(probeHistory, indirect);
             ToShaderRead(probeHistory);
+            lastResolved = indirectFiltered;
             probeHistoryValid = true;
         }
         Prof("temporal");
