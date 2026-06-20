@@ -106,6 +106,16 @@ float3 Sanitize(float3 v) {
                   isnan(v.y) || isinf(v.y) ? 0.0 : v.y,
                   isnan(v.z) || isinf(v.z) ? 0.0 : v.z);
 }
+// FIREFLY CLAMP: a single probe ray that happens to hit a bright surface/light returns a radiance far above the
+// hemisphere mean. With only oct² rays per probe, that one sample blows up the average → a bright speck the EMA
+// can't fully smooth, and it's WORST in dark areas (the sample dwarfs the near-zero true signal → the "düşük ışıkta
+// patlıyor" blobs). Clamp each ray's luminance to a ceiling while preserving its hue (scale RGB, don't desaturate).
+// This is the standard MC-GI firefly fix and adds ZERO rays — pure post-trace ALU. maxLum is generous so genuine
+// bright bounces still read bright; it only shaves the outliers that the sparse sampling can't resolve.
+float3 FireflyClamp(float3 c, float maxLum) {
+    float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
+    return (lum > maxLum) ? c * (maxLum / max(lum, 1e-5)) : c;
+}
 float Hash(uint s) {
     s = (s ^ 61u) ^ (s >> 16); s *= 9u; s ^= s >> 4; s *= 0x27d4eb2du; s ^= s >> 15;
     return float(s & 0x7fffffffu) / float(0x7fffffff);
@@ -405,6 +415,9 @@ void CSProbeTrace(uint3 dtid : SV_DispatchThreadID) {
     } else {
         float3 origin = P + N * NormalBias;
         rad = Sanitize(TraceRay(origin, dir));
+        // Firefly clamp the fresh sample BEFORE it enters the EMA, so an outlier ray can't poison the accumulated
+        // history. SpPad2 carries the ceiling (BALLISTIC_DX12_LUMEN_FIREFLY, 0 = off → byte-identical legacy).
+        if (SpPad2 > 0.0) rad = FireflyClamp(rad, SpPad2);
         if (sameSurface) rad = lerp(prev, rad, saturate(ProbeEma));   // low alpha → strong accumulation
     }
     ProbeAtlas[atlasPx] = float4(rad, 1.0);

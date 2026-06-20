@@ -865,6 +865,10 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                             && !ctx.DeterministicCapture) ? 1f : 0f,
             AdaptiveStride = EnvF("BALLISTIC_DX12_LUMEN_PROBE_ADAPTIVE_STRIDE", 3f),
             AdaptiveVar = EnvF("BALLISTIC_DX12_LUMEN_PROBE_ADAPTIVE_VAR", 0.06f),
+            // Firefly clamp ceiling (luminance). Default ON: one outlier ray per sparse probe is the root of the
+            // "düşük ışıkta patlayan" blobs. 0 disables (byte-identical legacy). Deterministic capture keeps it ON
+            // (it's a deterministic per-sample clamp, not frame-phased — golden stays stable and cleaner).
+            SpPad2 = EnvF("BALLISTIC_DX12_LUMEN_FIREFLY", 8f),
         });
         spSunCb.Write(new LumenSun
         {
