@@ -78,10 +78,16 @@ The attribute is the single source of identity — you don't set the title/icon/
 
 ## `IEditorGui` — the drawing seam
 
-`OnGui(IEditorGui gui)` is called once per frame while the window is open. `IEditorGui` mirrors the
-common immediate-mode surface: text, buttons, sliders/drag/input fields, combos, checkboxes, tree nodes,
-collapsing headers, child regions, tables, popups, menus, tooltips. For custom drawing there's
-`gui.WindowDrawList` (lines/rects/circles/text/bezier) and `gui.Input` (mouse/keyboard polling).
+`OnGui(IEditorGui gui)` is called once per frame while the window is open. `IEditorGui` is a
+**comprehensive** immediate-mode surface — the entire built-in editor (inspector, hierarchy, asset
+browser, every panel and window) is drawn through it, so anything the editor can render, your window can
+too: text/buttons/sliders/drag/input fields, combos, checkboxes, tree nodes (incl. flagged foldouts),
+collapsing/framed headers, child regions, sortable tables, popups + modals, menus (incl. toggles),
+tooltips, the named editor fonts (`gui.PushFont(EditorFont.Header)`), a style scope
+(`gui.PushColor`/`PushFramePadding`/...), drag-and-drop (sources + targets), and image/thumbnail buttons.
+For custom drawing there's `gui.WindowDrawList` (lines/rects/circles/text/bezier/channels/clip-rect) and
+`gui.Input` (mouse/keyboard polling). If something is genuinely missing, it's a one-line addition to the
+seam adapter — but in practice the surface already covers the whole editor.
 
 A few conventions:
 
