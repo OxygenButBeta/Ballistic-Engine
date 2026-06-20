@@ -126,6 +126,10 @@ internal sealed class EditorApplication {
         // inside the EngineBootstrap ctor below). The provider is lazy — it fires during that ctor, after the
         // project is opened — so a game dev's custom [EditorWindowMeta] windows are discovered at startup.
         // (A shipped player never sets this, so EditorScripts.dll never enters the player build.)
+        // Publish the single shared seam handle so the inspector's IInspectorGui adapters can route through
+        // IEditorGui without threading it through the whole inspector pipeline (see EditorGui).
+        EditorGui.Shared = gui;
+
         EngineBootstrap.ExtraScanAssemblies = () => {
             System.Reflection.Assembly asm = GameEditorScripts.CompileAndLoad(
                 BallisticEngine.AssetPipeline.BallisticProject.Open(projectPath));
