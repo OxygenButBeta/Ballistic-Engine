@@ -1,12 +1,20 @@
 using BallisticEngine.AssetPipeline;
 using BallisticEngine.AssetPipeline.Loaders;
 using BallisticEngine.Serialization;
-using Hexa.NET.ImGui;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec3 = System.Numerics.Vector3;
 using SysVec4 = System.Numerics.Vector4;
+using static BallisticEngine.Editor.Inspector.AssetInspectors.AssetInspectorGuiAccess;
 
 namespace BallisticEngine.Editor.Inspector.AssetInspectors;
+
+// Phase-7: the asset inspectors below draw through the IEditorGui seam (zero raw ImGui). Each one is a
+// tiny IAssetInspector; rather than give every class its own gui accessor, this one shared static (imported
+// via `using static` above) exposes `gui` to all of them. EditorGui.Shared is the editor's single stateless
+// seam handle, set once at startup — safe to reach statically from any mid-frame draw.
+internal static class AssetInspectorGuiAccess {
+    internal static IEditorGui gui => EditorGui.Shared;
+}
 
 // The per-extension asset inspectors (editor-rework Rule 1 / Phase B2), one self-registering IAssetInspector
 // each. These REPLACE the `switch (ext) { case ".mat": ...; case ".png" or ...: ...; }` body of
@@ -38,7 +46,7 @@ internal sealed class TextureAssetInspector : IAssetInspector {
 
     static void DrawTextureImportSettings(string path, Guid guid, MetaFile meta) {
         if (meta is null) {
-            ImGui.TextDisabled("No import settings.");
+            gui.TextDisabled("No import settings.");
             return;
         }
 
@@ -47,19 +55,19 @@ internal sealed class TextureAssetInspector : IAssetInspector {
             TextureType current = TextureImporter.TypeFromSettings(meta.Settings);
             string[] names = Enum.GetNames<TextureType>();
             int index = Array.IndexOf(names, current.ToString());
-            ImGui.SetNextItemWidth(-1);
-            if (ImGui.Combo("##textype", ref index, names, names.Length)) {
+            gui.SetNextItemWidth(-1);
+            if (gui.Combo("##textype", ref index, names)) {
                 meta.Settings["textureType"] = names[index];
                 meta.Save(MetaFile.PathFor(AssetDatabase.Project.ResolveAbsolute(path)));
                 Guid reimported = guid;
                 AsyncAssetImport.Request("Reimporting texture...",
                     onFinished: () => AssetDatabase.Invalidate(reimported));
             }
-            ImGui.EndTable();
+            gui.EndTable();
         }
 
-        ImGui.Spacing();
-        ImGui.TextDisabled("Changing the type reimports. Loaded materials keep the\nold instance until the scene reloads.");
+        gui.Spacing();
+        gui.TextDisabled("Changing the type reimports. Loaded materials keep the\nold instance until the scene reloads.");
     }
 }
 
@@ -102,10 +110,10 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
 
         if (materialPreviewTex != 0) {
             float size = 120f;
-            float pad = (ImGui.GetContentRegionAvail().X - size) * 0.5f;
-            if (pad > 0) ImGui.SetCursorPosX(ImGui.GetCursorPosX() + pad);
-            ImGui.Image(EditorApplication.Tex(materialPreviewTex), new SysVec2(size, size));
-            ImGui.Spacing();
+            float pad = (gui.ContentRegionAvail.X - size) * 0.5f;
+            if (pad > 0) gui.CursorPosX += pad;
+            gui.Image(materialPreviewTex, new SysVec2(size, size));
+            gui.Spacing();
         }
     }
 
@@ -116,7 +124,7 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
             definition = PipelineJson.Read<MaterialDefinition>(absolute);
         }
         catch (Exception exception) {
-            ImGui.TextDisabled($"Unreadable material: {exception.Message}");
+            gui.TextDisabled($"Unreadable material: {exception.Message}");
             return;
         }
 
@@ -124,8 +132,8 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
         // material's serialized state changes), upload to a GL texture, show it centered.
         DrawMaterialPreview(guid, definition);
 
-        ImGui.TextDisabled($"Shader: {definition.Shader ?? "(none)"}");
-        ImGui.Spacing();
+        gui.TextDisabled($"Shader: {definition.Shader ?? "(none)"}");
+        gui.Spacing();
 
         var changed = false;
         if (InspectorPanel.BeginGrid("##matslots")) {
@@ -139,17 +147,17 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
                     : Path.GetFileName(ReferenceToPath(reference) ?? reference);
 
                 InspectorPanel.Row(slot.ToString());
-                ImGui.PushID((int)slot);
+                gui.PushId((int)slot);
                 if (reference is null)
-                    ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
-                ImGui.Button(display, new SysVec2(-1, 0));
+                    gui.PushColor(EditorStyleColor.Text, gui.StyleColor(EditorStyleColor.TextDisabled));
+                gui.Button(display, new SysVec2(-1, 0));
                 if (reference is null)
-                    ImGui.PopStyleColor();
+                    gui.PopColor();
                 if (InspectorPanel.AcceptGuidDrop(out Guid dropped)) {
                     definition.Textures[slot.ToString()] = AssetRef.FromGuid(dropped);
                     changed = true;
                 }
-                ImGui.PopID();
+                gui.PopId();
             }
 
             // Scalar material properties (stored in the .mat next to the texture refs).
@@ -162,7 +170,7 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
                 { Length: 3 } bc => new SysVec4(bc[0], bc[1], bc[2], 1f),
                 _ => SysVec4.One,
             };
-            if (ImGui.ColorEdit4("##matbasecolor", ref baseColor)) {
+            if (gui.ColorEdit4("##matbasecolor", ref baseColor)) {
                 definition.BaseColor = baseColor == SysVec4.One
                     ? null
                     : [baseColor.X, baseColor.Y, baseColor.Z, baseColor.W];
@@ -173,7 +181,7 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
             // Auto-detected from "spec" file names when the .mat doesn't say explicitly.
             InspectorPanel.Row("Packed ORM");
             var packedOrm = MaterialLoader.ResolvePackedOrm(definition);
-            if (ImGui.Checkbox("##matpackedorm", ref packedOrm)) {
+            if (gui.Checkbox("##matpackedorm", ref packedOrm)) {
                 definition.PackedOrm = packedOrm;
                 changed = true;
             }
@@ -182,14 +190,14 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
             // Auto-detected from foliage-style texture names when not set explicitly.
             InspectorPanel.Row("Alpha Cutout");
             var cutout = MaterialLoader.ResolveCutout(definition);
-            if (ImGui.Checkbox("##matcutout", ref cutout)) {
+            if (gui.Checkbox("##matcutout", ref cutout)) {
                 definition.Cutout = cutout;
                 changed = true;
             }
 
             InspectorPanel.Row("Transparent");
             var transparent = definition.Transparent;
-            if (ImGui.Checkbox("##mattransparent", ref transparent)) {
+            if (gui.Checkbox("##mattransparent", ref transparent)) {
                 definition.Transparent = transparent;
                 changed = true;
             }
@@ -197,7 +205,7 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
             if (definition.Transparent) {
                 InspectorPanel.Row("Opacity");
                 var opacity = definition.Opacity;
-                if (ImGui.SliderFloat("##matopacity", ref opacity, 0f, 1f)) {
+                if (gui.SliderFloat("##matopacity", ref opacity, 0f, 1f)) {
                     definition.Opacity = opacity;
                     changed = true;
                 }
@@ -207,19 +215,19 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
             var emissive = definition.EmissiveColor is { Length: >= 3 } c
                 ? new SysVec3(c[0], c[1], c[2])
                 : SysVec3.One;
-            if (ImGui.ColorEdit3("##matemissivecolor", ref emissive)) {
+            if (gui.ColorEdit3("##matemissivecolor", ref emissive)) {
                 definition.EmissiveColor = [emissive.X, emissive.Y, emissive.Z];
                 changed = true;
             }
 
             InspectorPanel.Row("Emissive Intensity");
             var emissivemntensity = definition.EmissiveIntensity;
-            if (ImGui.DragFloat("##matemissiveintensity", ref emissivemntensity, 0.05f, 0f, 100f)) {
+            if (gui.DragFloat("##matemissiveintensity", ref emissivemntensity, 0.05f, 0f, 100f)) {
                 definition.EmissiveIntensity = emissivemntensity;
                 changed = true;
             }
 
-            ImGui.EndTable();
+            gui.EndTable();
         }
 
         if (changed) {
@@ -228,8 +236,8 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
             panel.MarkViewportDirty();
         }
 
-        ImGui.Spacing();
-        ImGui.TextDisabled("Drag textures from the Assets panel onto the slots.");
+        gui.Spacing();
+        gui.TextDisabled("Drag textures from the Assets panel onto the slots.");
     }
 
     static string ReferenceToPath(string reference) =>
@@ -262,7 +270,7 @@ internal sealed class VolumeProfileAssetInspector : IAssetInspector {
     static void DrawVolumeProfileAsset(Guid guid) {
         var profile = AssetDatabase.Load<VolumeProfile>(guid);
         if (profile is null) {
-            ImGui.TextDisabled("Unreadable volume profile.");
+            gui.TextDisabled("Unreadable volume profile.");
             return;
         }
 
@@ -276,7 +284,7 @@ internal sealed class SceneAssetInspector : IAssetInspector {
     public void Draw(in AssetInspectorContext ctx) => DrawSceneAssetActions(ctx.Path);
 
     static void DrawSceneAssetActions(string path) {
-        if (ImGui.Button($"{EditorIcons.Play}  Open Scene", new SysVec2(-1, 0)))
+        if (gui.Button($"{EditorIcons.Play}  Open Scene", new SysVec2(-1, 0)))
             SceneCommands.Open(path);
     }
 }
@@ -284,7 +292,7 @@ internal sealed class SceneAssetInspector : IAssetInspector {
 [AssetInspector(".pyscene")]
 internal sealed class PysceneAssetInspector : IAssetInspector {
     public void Draw(in AssetInspectorContext ctx) =>
-        ImGui.TextWrapped("Falcor scene. On import it generates a sibling .scene you can open.");
+        gui.TextWrapped("Falcor scene. On import it generates a sibling .scene you can open.");
 }
 
 // Native text assets — a hint + Show-in-Explorer. Covers the .shader/.glsl/.cubemap group.
@@ -296,8 +304,8 @@ internal sealed class TextAssetInspector : IAssetInspector {
 
     // Native text assets: show a hint but no noisy "unsupported" line.
     static void DrawTextAssetHint(string path) {
-        ImGui.TextDisabled("Edit this file in a text editor.");
-        if (ImGui.Button($"{EditorIcons.FolderOpen}  Show in Explorer", new SysVec2(-1, 0)))
+        gui.TextDisabled("Edit this file in a text editor.");
+        if (gui.Button($"{EditorIcons.FolderOpen}  Show in Explorer", new SysVec2(-1, 0)))
             System.Diagnostics.Process.Start("explorer.exe",
                 $"/select,\"{AssetDatabase.Project.ResolveAbsolute(path)}\"");
     }
@@ -313,11 +321,11 @@ internal sealed class PrefabAssetInspector : IAssetInspector {
     static void DrawPrefabInspector(InspectorPanel panel, string path) {
         PrefabAsset prefab = AssetDatabase.Load<PrefabAsset>(path);
         if (prefab is null) {
-            ImGui.TextDisabled("Could not load prefab.");
+            gui.TextDisabled("Could not load prefab.");
             return;
         }
 
-        if (ImGui.Button($"{EditorIcons.Add}  Instantiate into Scene", new SysVec2(-1, 0))) {
+        if (gui.Button($"{EditorIcons.Add}  Instantiate into Scene", new SysVec2(-1, 0))) {
             // Plants a new entity tree into the scene -> whole-scene Structural snapshot.
             EditorCommands.Structural("Instantiate Prefab", () => {
                 Entity root = prefab.Instantiate();
@@ -327,14 +335,14 @@ internal sealed class PrefabAssetInspector : IAssetInspector {
             });
         }
 
-        ImGui.Spacing();
-        ImGui.TextDisabled($"Contents ({prefab.Entities.Count} entit{(prefab.Entities.Count == 1 ? "y" : "ies")})");
-        ImGui.Separator();
+        gui.Spacing();
+        gui.TextDisabled($"Contents ({prefab.Entities.Count} entit{(prefab.Entities.Count == 1 ? "y" : "ies")})");
+        gui.Separator();
         foreach (var doc in prefab.Entities) {
             float indent = doc.Transform?.Parent is null ? 0 : 16f;
-            if (indent > 0) ImGui.Indent(indent);
-            ImGui.TextUnformatted($"{EditorIcons.Package}  {doc.Name}");
-            if (indent > 0) ImGui.Unindent(indent);
+            if (indent > 0) gui.Indent(indent);
+            gui.TextUnformatted($"{EditorIcons.Package}  {doc.Name}");
+            if (indent > 0) gui.Unindent(indent);
         }
     }
 }
@@ -359,7 +367,7 @@ internal sealed class DataAssetInspector : IAssetInspector {
             dataAssetInstance = LoadDataAsset(path);
         }
         if (dataAssetInstance is not DataAsset asset) {
-            ImGui.TextDisabled("Could not load data asset (unknown or renamed type?).");
+            gui.TextDisabled("Could not load data asset (unknown or renamed type?).");
             return;
         }
 
@@ -399,21 +407,21 @@ internal sealed class AudioClipAssetInspector : IAssetInspector {
     static void DrawAudioClipAsset(string path) {
         AudioClip clip = AssetDatabase.Load<AudioClip>(path);
         if (clip is null) {
-            ImGui.TextDisabled("Could not load audio clip.");
+            gui.TextDisabled("Could not load audio clip.");
             return;
         }
 
         EditorDecoration.DrawSectionHeader("Preview");
         bool playing = InspectorPanel.audioPreviewVoice is { IsPlaying: true };
-        if (ImGui.Button(playing ? $"{EditorIcons.Pause}  Stop" : $"{EditorIcons.Play}  Play",
+        if (gui.Button(playing ? $"{EditorIcons.Pause}  Stop" : $"{EditorIcons.Play}  Play",
                 new SysVec2(120, 0))) {
             InspectorPanel.audioPreviewVoice?.Stop();
             InspectorPanel.audioPreviewVoice = playing ? null : Audio.Play(clip);
         }
-        ImGui.SameLine();
-        ImGui.TextDisabled($"{clip.DurationSeconds:F1}s  -  {clip.Channels}ch  -  {clip.SampleRate} Hz");
+        gui.SameLine();
+        gui.TextDisabled($"{clip.DurationSeconds:F1}s  -  {clip.Channels}ch  -  {clip.SampleRate} Hz");
         if (!Audio.IsAvailable)
-            ImGui.TextDisabled("(no audio device on this machine - preview is silent)");
+            gui.TextDisabled("(no audio device on this machine - preview is silent)");
     }
 }
 
@@ -427,16 +435,16 @@ internal sealed class AnimationClipAssetInspector : IAssetInspector {
     static void DrawAnimationClipAsset(string path) {
         AnimationClip clip = AssetDatabase.Load<AnimationClip>(path);
         if (clip is null) {
-            ImGui.TextDisabled("Could not load animation clip.");
+            gui.TextDisabled("Could not load animation clip.");
             return;
         }
 
         EditorDecoration.DrawSectionHeader("Animation");
-        ImGui.TextDisabled($"Duration: {clip.DurationSeconds:F2}s");
-        ImGui.TextDisabled($"Channels (animated bones): {clip.Data.Channels.Length}");
-        ImGui.TextDisabled($"Ticks/sec: {clip.TicksPerSecond:F0}");
-        ImGui.Spacing();
-        ImGui.TextWrapped("Assign this clip to an Animator on a skinned mesh, then use the Animator's " +
+        gui.TextDisabled($"Duration: {clip.DurationSeconds:F2}s");
+        gui.TextDisabled($"Channels (animated bones): {clip.Data.Channels.Length}");
+        gui.TextDisabled($"Ticks/sec: {clip.TicksPerSecond:F0}");
+        gui.Spacing();
+        gui.TextWrapped("Assign this clip to an Animator on a skinned mesh, then use the Animator's " +
             "scrub slider to preview the pose.");
     }
 }

@@ -74,6 +74,8 @@ public interface IEditorGui {
     bool Combo(string label, ref int index, string[] names);
     bool ColorEdit3(string label, ref Vector3 v);
     bool ColorEdit3Hdr(string label, ref Vector3 v);
+    bool ColorEdit4(string label, ref Vector4 v);
+    void Image(nint textureHandle, Vector2 size);    // an editor texture handle (RenderHandle.Value / nint)
     void PlotLines(string label, float[] values, int count, string overlay, float min, float max, Vector2 size);
 
     // ---- structure ----

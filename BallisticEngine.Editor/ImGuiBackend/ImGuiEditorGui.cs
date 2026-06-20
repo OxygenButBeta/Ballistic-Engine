@@ -74,6 +74,9 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public bool ColorEdit3(string label, ref Vector3 v) => ImGui.ColorEdit3(label, ref v);
     public bool ColorEdit3Hdr(string label, ref Vector3 v) =>
         ImGui.ColorEdit3(label, ref v, ImGuiColorEditFlags.Hdr | ImGuiColorEditFlags.Float);
+    public bool ColorEdit4(string label, ref Vector4 v) => ImGui.ColorEdit4(label, ref v);
+    public void Image(nint textureHandle, Vector2 size) =>
+        ImGui.Image(new ImTextureID((ulong)textureHandle), size);
     public void PlotLines(string label, float[] values, int count, string overlay, float min, float max, Vector2 size) {
         if (count <= 0) return;
         ImGui.PlotLines(label, ref values[0], count, 0, overlay, min, max, size);
