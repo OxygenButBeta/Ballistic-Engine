@@ -167,8 +167,12 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
     // Returns true if the value changed. bool-as-float properties (NormalFlipY/Transparent/PackedOrm/
     // Cutout) draw as checkboxes; IsEmissive is load-derived (not authorable) and skipped.
     static bool DrawShaderProperty(ShaderProperty prop, MaterialDefinition definition) {
-        var binding = MaterialPropertyBinding.For(prop.Semantic);
-        if (binding is null) return false; // not an authorable channel (e.g. IsEmissive) — skip
+        // Custom (semantic None) props bind by NAME into the .mat's Custom* dicts; Standard props bind by
+        // semantic into the fixed fields. A null binding = a non-authorable channel (e.g. IsEmissive) → skip.
+        var binding = prop.Semantic == MaterialSemantic.None
+            ? MaterialPropertyBinding.ForCustom(prop)
+            : MaterialPropertyBinding.For(prop.Semantic);
+        if (binding is null) return false;
 
         InspectorPanel.Row(prop.DisplayName);
         ImGui.PushID(prop.Name);
@@ -184,14 +188,18 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
     }
 
     static bool DrawTextureSlot(MaterialPropertyBinding b, MaterialDefinition definition) {
-        definition.Textures.TryGetValue(b.TextureKey, out var reference);
+        // Custom (None) texture props live in CustomTextures keyed by name; Standard maps in Textures.
+        bool custom = b.CustomTextureKey is not null;
+        string key = custom ? b.CustomTextureKey : b.TextureKey;
+        var dict = custom ? (definition.CustomTextures ??= new()) : definition.Textures;
+        dict.TryGetValue(key, out var reference);
         var display = reference is null ? "None" : Path.GetFileName(ReferenceToPath(reference) ?? reference);
         if (reference is null)
             ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
         ImGui.Button(display, new SysVec2(-1, 0));
         if (reference is null) ImGui.PopStyleColor();
         if (InspectorPanel.AcceptGuidDrop(out Guid dropped)) {
-            definition.Textures[b.TextureKey] = AssetRef.FromGuid(dropped);
+            dict[key] = AssetRef.FromGuid(dropped);
             return true;
         }
         return false;
@@ -243,6 +251,9 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
         material.AO = LoadSlot(definition, TextureType.AO);
         material.Emissive = LoadSlot(definition, TextureType.Emissive);
         MaterialLoader.ApplyScalars(material, definition);
+        // Custom (semantic None) props too, so editing _RimColor etc. in the inspector flows to the render
+        // path live (the renderer reads the material's custom bag for the b2 CB).
+        MaterialLoader.ApplyCustomProperties(material, definition);
     }
 
     static Texture2D LoadSlot(MaterialDefinition definition, TextureType slot) =>

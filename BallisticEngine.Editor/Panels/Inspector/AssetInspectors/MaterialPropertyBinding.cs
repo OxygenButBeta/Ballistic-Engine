@@ -99,4 +99,32 @@ sealed class MaterialPropertyBinding {
     static MaterialPropertyBinding Flag(Func<MaterialDefinition, float> get,
         Action<MaterialDefinition, float> set) =>
         new() { IsBool = true, getFloat = (d, _) => get(d), setFloat = (d, v, _) => set(d, v) };
+
+    // The .mat dict key for a custom (semantic None) texture property; null for non-custom bindings.
+    public string CustomTextureKey { get; private init; }
+
+    // Binding for a CUSTOM (semantic None) shader property — read/write by NAME into the MaterialDefinition's
+    // CustomFloats/CustomVectors/CustomTextures dicts (not the fixed fields). Preserves the same null-elision:
+    // a value equal to the declared default removes the key so an unchanged .mat doesn't churn. Color/Vector
+    // both use CustomVectors; Float/Range use CustomFloats; Texture2D uses CustomTextures.
+    public static MaterialPropertyBinding ForCustom(ShaderProperty prop) => prop.Type switch {
+        ShaderPropertyType.Texture2D => new MaterialPropertyBinding { CustomTextureKey = prop.Name },
+        ShaderPropertyType.Color or ShaderPropertyType.Vector => new MaterialPropertyBinding {
+            ColorComponents = prop.Type == ShaderPropertyType.Color ? 4 : 4,
+            getVector = (d, dflt) => d.CustomVectors is not null && d.CustomVectors.TryGetValue(prop.Name, out var a) && a is { Length: >= 1 }
+                ? new SysVec4(a[0], a.Length > 1 ? a[1] : 0f, a.Length > 2 ? a[2] : 0f, a.Length > 3 ? a[3] : dflt.W) : dflt,
+            setVector = (d, v, dflt) => {
+                if (v == dflt) { d.CustomVectors?.Remove(prop.Name); return; }
+                (d.CustomVectors ??= new()).Remove(prop.Name);
+                d.CustomVectors[prop.Name] = [v.X, v.Y, v.Z, v.W];
+            },
+        },
+        _ => new MaterialPropertyBinding {  // Float / Range
+            getFloat = (d, dflt) => d.CustomFloats is not null && d.CustomFloats.TryGetValue(prop.Name, out var f) ? f : dflt,
+            setFloat = (d, v, dflt) => {
+                if (v == dflt) { d.CustomFloats?.Remove(prop.Name); return; }
+                (d.CustomFloats ??= new())[prop.Name] = v;
+            },
+        },
+    };
 }
