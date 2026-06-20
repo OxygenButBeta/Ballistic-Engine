@@ -100,19 +100,15 @@ internal static class ImGuiBoundaryTests {
     // migration. The ratchet above forbids any file NOT on this list from importing ImGui, and forbids stale
     // entries — so the list can only shrink. Paths are repo-relative with forward slashes.
     // (Standalone windows are all migrated; Windows\ carries none here.)
+    // The EntireEditor migration is COMPLETE: every panel + window + inspector subfile draws through the
+    // IEditorGui seam. Only these two PERMANENT exemptions keep raw ImGui by design:
+    //   - ScalarField: the double-click-to-type drag widget — a leaf input helper the seam deliberately
+    //     doesn't model (the plan's pragmatic boundary; the inspector adapters call it as a static helper).
+    //   - StatsPanel: a viewport overlay with bespoke window flags + pivot positioning + per-frame anchor
+    //     geometry that doesn't fit the dockable EditorWindow model.
+    // Anything else in Panels/ or Windows/ importing ImGui is now a regression and fails the ratchet.
     static readonly string[] PendingImGuiMigration = {
-        // Inspector — the big one (Phase 7): the panel shell + its adapters/preview/layout subfiles. Several
-        // adapters legitimately keep style/ScalarField raw-ImGui (the plan's pragmatic boundary) and stay.
-        // (InspectorPanel — the 3068-line shell — migrated; the whole inspector is now seam-based.)
         "BallisticEngine.Editor/Panels/Inspector/Adapters/ScalarField.cs",
-        // (ImGuiVolumeGui + ImGuiComponentGui migrated — route through EditorGui.Shared; dropped from list.)
-        // (InspectorLayout + AssetInspectors + ComponentPreviews migrated — route through EditorGui.Shared.)
-        // (HierarchyPanel migrated — drag-source/target + context menus + keyboard through the seam.)
-        // Assets (Phase 5): drag-drop heavy.
-        "BallisticEngine.Editor/Panels/AssetBrowserPanel.cs",
-        // (ConsolePanel migrated — now draws through the seam's style scope; dropped from the list.)
-        // (VolumeProfileEditor + BEventEditor migrated — BEvent incl. entity/asset drag-drop via the seam.)
-        // Viewport overlay — bespoke window flags + pivot positioning; doesn't fit the dockable model (exempt).
         "BallisticEngine.Editor/Panels/StatsPanel.cs",
     };
 

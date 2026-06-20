@@ -54,6 +54,8 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     // ---- buttons / toggles ----
     public bool Button(string label, Vector2 size = default) => ImGui.Button(label, size);
     public bool SmallButton(string label) => ImGui.SmallButton(label);
+    public bool ImageButton(string id, nint textureHandle, Vector2 size) =>
+        ImGui.ImageButton(id, new ImTextureID((ulong)textureHandle), size, new Vector2(0, 0), new Vector2(1, 1));
     public bool Checkbox(string label, ref bool v) => ImGui.Checkbox(label, ref v);
 
     // ---- scalars ----
@@ -68,6 +70,8 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public bool DragInt(string label, ref int v) => ImGui.DragInt(label, ref v);
     public bool InputInt(string label, ref int v, int step = 1) => ImGui.InputInt(label, ref v, step);
     public bool InputText(string label, ref string v, int maxLength) => ImGui.InputText(label, ref v, (uint)maxLength);
+    public bool InputTextEnter(string label, ref string v, int maxLength) =>
+        ImGui.InputText(label, ref v, (uint)maxLength, ImGuiInputTextFlags.EnterReturnsTrue);
     public bool InputTextWithHint(string label, string hint, ref string v, int maxLength) =>
         ImGui.InputTextWithHint(label, hint, ref v, (uint)maxLength);
     public bool Combo(string label, ref int index, string[] names) => ImGui.Combo(label, ref index, names, names.Length);
@@ -92,6 +96,8 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public bool Selectable(string label, bool selected = false) => ImGui.Selectable(label, selected);
     public bool Selectable(string label, bool selected, Vector2 size) =>
         ImGui.Selectable(label, selected, ImGuiSelectableFlags.None, size);
+    public bool SelectableRow(string label, bool selected) =>
+        ImGui.Selectable(label, selected, ImGuiSelectableFlags.SpanAllColumns | ImGuiSelectableFlags.AllowDoubleClick);
     public bool CollapsingHeader(string label) => ImGui.CollapsingHeader(label);
     public bool CollapsingHeader(string label, bool defaultOpen) =>
         ImGui.CollapsingHeader(label, defaultOpen ? ImGuiTreeNodeFlags.DefaultOpen : ImGuiTreeNodeFlags.None);
@@ -124,6 +130,7 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public bool BeginCombo(string label, string preview) => ImGui.BeginCombo(label, preview);
     public void EndCombo() => ImGui.EndCombo();
     public bool BeginPopup(string id) => ImGui.BeginPopup(id);
+    public bool BeginPopupModalAutoResize(string id) => ImGui.BeginPopupModal(id, ImGuiWindowFlags.AlwaysAutoResize);
     public void EndPopup() => ImGui.EndPopup();
     public void OpenPopup(string id) => ImGui.OpenPopup(id);
     public bool BeginPopupContextItem(string id) => ImGui.BeginPopupContextItem(id);
@@ -135,6 +142,9 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public bool MenuItem(string label, bool enabled = true) => ImGui.MenuItem(label, "", false, enabled);
     public bool MenuItem(string label, string shortcut, bool enabled = true) =>
         ImGui.MenuItem(label, shortcut, false, enabled);
+    public bool MenuItem(string label, string shortcut, bool selected, bool enabled) =>
+        ImGui.MenuItem(label, shortcut, selected, enabled);
+    public bool MenuItemToggle(string label, ref bool selected) => ImGui.MenuItem(label, "", ref selected);
     public bool FramedHeader(string label) => ImGui.TreeNodeEx(label,
         ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.AllowOverlap | ImGuiTreeNodeFlags.Framed |
         ImGuiTreeNodeFlags.SpanAvailWidth | ImGuiTreeNodeFlags.NoTreePushOnOpen);
@@ -153,6 +163,14 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public void TableSetupScrollFreeze(int cols, int rows) => ImGui.TableSetupScrollFreeze(cols, rows);
     public void TableHeadersRow() => ImGui.TableHeadersRow();
     public void TableSetRowBgColor(uint color) => ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0, color);
+    public unsafe bool TableGetSortSpec(out int column, out bool ascending) {
+        column = 0; ascending = true;
+        ImGuiTableSortSpecsPtr specs = ImGui.TableGetSortSpecs();
+        if (specs.IsNull || specs.SpecsCount == 0) return false;
+        column = specs.Specs.ColumnIndex;
+        ascending = specs.Specs.SortDirection == ImGuiSortDirection.Ascending;
+        return true;
+    }
 
     static ImGuiTableFlags MapTableFlags(EditorTableFlags f) {
         ImGuiTableFlags r = ImGuiTableFlags.None;
@@ -164,6 +182,7 @@ internal sealed class ImGuiEditorGui : IEditorGui {
         if (f.HasFlag(EditorTableFlags.Resizable)) r |= ImGuiTableFlags.Resizable;
         if (f.HasFlag(EditorTableFlags.PadOuterX)) r |= ImGuiTableFlags.PadOuterX;
         if (f.HasFlag(EditorTableFlags.SizingFixedFit)) r |= ImGuiTableFlags.SizingFixedFit;
+        if (f.HasFlag(EditorTableFlags.Sortable)) r |= ImGuiTableFlags.Sortable;
         return r;
     }
 
@@ -171,6 +190,7 @@ internal sealed class ImGuiEditorGui : IEditorGui {
         ImGuiTableColumnFlags r = ImGuiTableColumnFlags.None;
         if (f.HasFlag(EditorColumnFlags.WidthStretch)) r |= ImGuiTableColumnFlags.WidthStretch;
         if (f.HasFlag(EditorColumnFlags.WidthFixed)) r |= ImGuiTableColumnFlags.WidthFixed;
+        if (f.HasFlag(EditorColumnFlags.DefaultSort)) r |= ImGuiTableColumnFlags.DefaultSort;
         return r;
     }
 
@@ -178,6 +198,19 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public void Tooltip(string text) => ImGui.SetTooltip(text);
     public bool IsItemHovered() => ImGui.IsItemHovered();
     public bool IsWindowHovered() => ImGui.IsWindowHovered();
+    public bool IsWindowHoveredAllowBlocked() => ImGui.IsWindowHovered(ImGuiHoveredFlags.AllowWhenBlockedByActiveItem);
+    public bool IsAnyItemHovered() => ImGui.IsAnyItemHovered();
+    public bool IsMouseClicked(int button) => ImGui.IsMouseClicked((ImGuiMouseButton)button);
+    public void SetMouseCursorResizeEW() => ImGui.SetMouseCursor(ImGuiMouseCursor.ResizeEw);
+    public void CenterNextWindow(Vector2 size) {
+        ImGui.SetNextWindowSize(size, ImGuiCond.Appearing);
+        CenterNextWindowPos();
+    }
+    public void CenterNextWindowPos() {
+        ImGuiViewportPtr vp = ImGui.GetMainViewport();
+        ImGui.SetNextWindowPos(new Vector2(vp.Pos.X + vp.Size.X * 0.5f, vp.Pos.Y + vp.Size.Y * 0.5f),
+            ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
+    }
     public bool IsMouseHoveringRect(Vector2 min, Vector2 max, bool clip = true) => ImGui.IsMouseHoveringRect(min, max, clip);
     public bool IsItemClicked() => ImGui.IsItemClicked();
     public bool IsItemActive() => ImGui.IsItemActive();
@@ -208,6 +241,10 @@ internal sealed class ImGuiEditorGui : IEditorGui {
         fixed (byte* p = bytes)
             ImGui.SetDragDropPayload(type, p, (nuint)bytes.Length);
     }
+    public unsafe void SetDragDropPayloadBytes(string type, byte[] payload) {
+        fixed (byte* p = payload)
+            ImGui.SetDragDropPayload(type, p, (nuint)payload.Length);
+    }
 
     // ---- misc item / window / tree / input ----
     public bool IsItemDeactivated() => ImGui.IsItemDeactivated();
@@ -216,6 +253,8 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public bool IsWindowFocusedIncludingChildren() => ImGui.IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows);
     public bool IsMouseDoubleClicked(int button) => ImGui.IsMouseDoubleClicked((ImGuiMouseButton)button);
     public void SetNextItemOpen(bool open) => ImGui.SetNextItemOpen(open);
+    public void SetNextItemOpenOnce(bool open) => ImGui.SetNextItemOpen(open, ImGuiCond.Once);
+    public void SetNextItemOpenAlways(bool open) => ImGui.SetNextItemOpen(open, ImGuiCond.Always);
     public bool BeginPopupContextWindow(string id) => ImGui.BeginPopupContextWindow(id);
     public bool BeginPopupContextWindowEmpty(string id) =>
         ImGui.BeginPopupContextWindow(id, ImGuiPopupFlags.MouseButtonRight | ImGuiPopupFlags.NoOpenOverItems);
@@ -262,9 +301,14 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public void PopColor(int count = 1) => ImGui.PopStyleColor(count);
     public void PushFramePadding(Vector2 padding) => ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, padding);
     public void PushItemSpacing(Vector2 spacing) => ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, spacing);
+    public void PushWindowPadding(Vector2 padding) => ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, padding);
+    public void PushFrameRounding(float rounding) => ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, rounding);
+    public void PushAlphaScaled(float factor) => ImGui.PushStyleVar(ImGuiStyleVar.Alpha, ImGui.GetStyle().Alpha * factor);
+    public void PushPopupBg(Vector4 rgba) => ImGui.PushStyleColor(ImGuiCol.PopupBg, rgba);
     public void PopStyleVar(int count = 1) => ImGui.PopStyleVar(count);
     public float FrameRounding => ImGui.GetStyle().FrameRounding;
     public float IndentSpacing => ImGui.GetStyle().IndentSpacing;
+    public float Alpha => ImGui.GetStyle().Alpha;
     public Vector4 StyleColor(EditorStyleColor which) => ImGui.GetStyle().Colors[(int)MapColor(which)];
 
     static ImGuiCol MapColor(EditorStyleColor c) => c switch {
@@ -278,6 +322,7 @@ internal sealed class ImGuiEditorGui : IEditorGui {
         EditorStyleColor.SliderGrab => ImGuiCol.SliderGrab,
         EditorStyleColor.CheckMark => ImGuiCol.CheckMark,
         EditorStyleColor.ChildBg => ImGuiCol.ChildBg,
+        EditorStyleColor.Border => ImGuiCol.Border,
         _ => ImGuiCol.Text,
     };
 
@@ -318,6 +363,9 @@ internal sealed class ImGuiInputAdapter : IEditorInput {
         EditorGuiKey.D => ImGuiKey.D,
         EditorGuiKey.G => ImGuiKey.G,
         EditorGuiKey.F2 => ImGuiKey.F2,
+        EditorGuiKey.C => ImGuiKey.C,
+        EditorGuiKey.X => ImGuiKey.X,
+        EditorGuiKey.V => ImGuiKey.V,
         _ => ImGuiKey.None,
     };
 }
@@ -363,6 +411,9 @@ internal sealed class ImGuiDrawListAdapter : IEditorDrawList {
     public void ChannelsSplit(int count) => draw.ChannelsSplit(count);
     public void ChannelsSetCurrent(int channel) => draw.ChannelsSetCurrent(channel);
     public void ChannelsMerge() => draw.ChannelsMerge();
+    public void PushClipRect(Vector2 min, Vector2 max, bool intersectWithCurrent) =>
+        draw.PushClipRect(min, max, intersectWithCurrent);
+    public void PopClipRect() => draw.PopClipRect();
     public void AddBezierCubic(Vector2 p0, Vector2 p1, Vector2 p2, Vector2 p3, uint col, float thickness) =>
         draw.AddBezierCubic(p0, p1, p2, p3, col, thickness, 0);
 }

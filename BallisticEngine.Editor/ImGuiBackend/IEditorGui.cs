@@ -59,6 +59,7 @@ public interface IEditorGui {
     // ---- buttons / toggles ----
     bool Button(string label, Vector2 size = default);
     bool SmallButton(string label);
+    bool ImageButton(string id, nint textureHandle, Vector2 size);   // asset-tile thumbnail button
     bool Checkbox(string label, ref bool v);
 
     // ---- scalars (cover both inspector value widgets and free window use) ----
@@ -70,6 +71,7 @@ public interface IEditorGui {
     bool DragInt(string label, ref int v);
     bool InputInt(string label, ref int v, int step = 1);
     bool InputText(string label, ref string v, int maxLength);
+    bool InputTextEnter(string label, ref string v, int maxLength);   // returns true only on Enter (modal name fields)
     bool InputTextWithHint(string label, string hint, ref string v, int maxLength);
     bool Combo(string label, ref int index, string[] names);
     bool ColorEdit3(string label, ref Vector3 v);
@@ -87,6 +89,7 @@ public interface IEditorGui {
     float TreeNodeToLabelSpacing { get; }
     bool Selectable(string label, bool selected = false);
     bool Selectable(string label, bool selected, Vector2 size);   // fixed-height picker rows
+    bool SelectableRow(string label, bool selected);              // SpanAllColumns | AllowDoubleClick (table rows)
     bool CollapsingHeader(string label);
     bool CollapsingHeader(string label, bool defaultOpen);
     bool CollapsingHeaderFramed(string label);          // DefaultOpen | Framed — the inspector section header
@@ -98,6 +101,7 @@ public interface IEditorGui {
     bool BeginCombo(string label, string preview);
     void EndCombo();
     bool BeginPopup(string id);
+    bool BeginPopupModalAutoResize(string id);       // a modal dialog (New Asset / New Script), auto-sized
     void EndPopup();
     void OpenPopup(string id);
     bool BeginPopupContextItem(string id);           // right-click-the-last-item context menu
@@ -108,6 +112,8 @@ public interface IEditorGui {
     void EndMenu();
     bool MenuItem(string label, bool enabled = true);
     bool MenuItem(string label, string shortcut, bool enabled = true);
+    bool MenuItem(string label, string shortcut, bool selected, bool enabled);
+    bool MenuItemToggle(string label, ref bool selected);            // a checkable menu item
 
     // A framed, full-width, default-open tree header with overlay allowed (the inspector/volume override
     // header: a framed bar the caller paints a checkbox + "…" menu over). Returns the open state. Pushes
@@ -127,11 +133,20 @@ public interface IEditorGui {
     void TableSetupScrollFreeze(int cols, int rows);
     void TableHeadersRow();
     void TableSetRowBgColor(uint color);             // hover wash on the current row (RowBg0 target)
+    // Read the active sort column/direction from a Sortable table (after TableHeadersRow). Returns false
+    // when there is no sort spec; else writes column + ascending.
+    bool TableGetSortSpec(out int column, out bool ascending);
 
     // ---- tooltips / item query ----
     void Tooltip(string text);
     bool IsItemHovered();
     bool IsWindowHovered();
+    bool IsWindowHoveredAllowBlocked();              // AllowWhenBlockedByActiveItem (grid empty-click)
+    bool IsAnyItemHovered();
+    bool IsMouseClicked(int button);
+    void SetMouseCursorResizeEW();                   // the column-splitter drag cursor
+    void CenterNextWindow(Vector2 size);             // center a popup on the main viewport (Appearing)
+    void CenterNextWindowPos();                       // center position only (for auto-resizing modals)
     bool IsMouseHoveringRect(Vector2 min, Vector2 max, bool clip = true);
     bool IsItemClicked();
     bool IsItemActive();
@@ -169,6 +184,7 @@ public interface IEditorGui {
     bool BeginDragDropSource();
     void SetDragDropPayloadInt(string type, int value);
     void SetDragDropPayloadString(string type, string value);
+    void SetDragDropPayloadBytes(string type, byte[] payload);   // pre-encoded asset-drag payload
     void EndDragDropSource();
 
     // ---- misc item / window / tree / input state ----
@@ -178,6 +194,8 @@ public interface IEditorGui {
     bool IsWindowFocusedIncludingChildren();         // RootAndChildWindows (hierarchy keyboard shortcuts)
     bool IsMouseDoubleClicked(int button);
     void SetNextItemOpen(bool open);
+    void SetNextItemOpenOnce(bool open);             // ImGuiCond.Once (default-open a tree node)
+    void SetNextItemOpenAlways(bool open);           // ImGuiCond.Always (force, e.g. reveal-in-tree)
     bool BeginPopupContextWindow(string id);
     bool BeginPopupContextWindowEmpty(string id);    // right-click only on EMPTY space (NoOpenOverItems)
     bool WantTextInput { get; }                      // a text field has keyboard focus (suppress shortcuts)
@@ -201,9 +219,14 @@ public interface IEditorGui {
     void PopColor(int count = 1);
     void PushFramePadding(Vector2 padding);
     void PushItemSpacing(Vector2 spacing);
+    void PushWindowPadding(Vector2 padding);
+    void PushFrameRounding(float rounding);
+    void PushAlphaScaled(float factor);              // dims the next scope (factor * current alpha)
+    void PushPopupBg(Vector4 rgba);                  // a coloured popup background (modal cards)
     void PopStyleVar(int count = 1);
     float FrameRounding { get; }
     float IndentSpacing { get; }
+    float Alpha { get; }
 
     // ---- misc window metrics / clipboard ----
     float WindowWidth { get; }
@@ -222,7 +245,7 @@ public enum EditorStyleColor {
     Text, TextDisabled,
     Button, ButtonHovered, ButtonActive,
     FrameBg, FrameBgHovered,
-    SliderGrab, CheckMark, ChildBg,
+    SliderGrab, CheckMark, ChildBg, Border,
 }
 
 // Seam-local named fonts (the editor builds these at startup — see EditorTheme / ImGuiController).
@@ -256,6 +279,7 @@ public enum EditorTableFlags {
     Resizable = 1 << 5,
     PadOuterX = 1 << 6,
     SizingFixedFit = 1 << 7,
+    Sortable = 1 << 8,
 }
 
 // Seam-local column flags (subset).
@@ -264,6 +288,7 @@ public enum EditorColumnFlags {
     None = 0,
     WidthStretch = 1 << 0,
     WidthFixed = 1 << 1,
+    DefaultSort = 1 << 2,
 }
 
 // Immediate mouse/keyboard polling for custom-drawn surfaces (the curve editor's key drag, pan/zoom,
@@ -300,6 +325,8 @@ public interface IEditorDrawList {
     void ChannelsSplit(int count);
     void ChannelsSetCurrent(int channel);
     void ChannelsMerge();
+    void PushClipRect(Vector2 min, Vector2 max, bool intersectWithCurrent);   // clip a label to its tile
+    void PopClipRect();
 }
 
 // Seam-local rounded-corner selector for AddRectFilled (the inspector's axis-chip left-rounded fill).
@@ -315,5 +342,5 @@ public enum EditorCorner {
 public enum EditorGuiKey {
     F, Delete, Escape, Enter,
     LeftArrow, RightArrow, UpArrow, DownArrow,
-    A, D, G, F2,
+    A, D, G, F2, C, X, V,
 }
