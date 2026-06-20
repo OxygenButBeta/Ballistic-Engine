@@ -1805,7 +1805,8 @@ public sealed class DX12HDRenderer : HDRenderer
                         // it stays byte-identical; it only drops meshlets whose every face points away.
                         bool coneCull = Environment.GetEnvironmentVariable("BALLISTIC_DX12_MESHLET_CONE") != "0";
                         draws += gpuDriven.RenderIntoMeshlet(cl6, gpuDrivenGeometry, viewProj, frustumPlanes,
-                            new Vector3(camPos.X, camPos.Y, camPos.Z), coneCull, motionCb.Gpu, ref cpuDrawIndex);
+                            new Vector3(camPos.X, camPos.Y, camPos.Z), coneCull,
+                            viewProjUnjittered, view, CameraNear, CameraFar, motionCb.Gpu, ref cpuDrawIndex);
                         tris += gpuDriven.MeshletTris;
                         cl6.Dispose();   // release the queried interface (does not release the underlying list)
                         drewMeshlet = true;

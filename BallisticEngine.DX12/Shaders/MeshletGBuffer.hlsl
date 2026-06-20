@@ -16,6 +16,10 @@ cbuffer MotionConstants : register(b1) {
 cbuffer CullCB : register(b2) {
     float4 Planes[6];      // frustum planes (unjittered viewProj), xyz=normal, w=d
     float4 CameraPosCull;  // xyz = world camera position (for meshlet backface cone cull), w = coneCullOn (0/1)
+    float4x4 HizViewProj;  // unjittered viewProj (Hi-Z screen projection of the meshlet AABB)
+    float4x4 HizView;      // world -> view (linear view distance)
+    float4 HizParams;      // x=w, y=h, z=mipCount, w=near
+    float4 HizFar;         // x=far, y=HizEnabled(0/1), z=HizIndex (bindless), w=unused
 };
 
 struct PerDraw { float4x4 Mvp; float4x4 Model; uint MaterialId; uint3 _pad; };
@@ -43,6 +47,7 @@ StructuredBuffer<float3>        Normals      : register(t7);
 StructuredBuffer<float2>        UVs          : register(t8);
 StructuredBuffer<float4>        Tangents     : register(t9);
 SamplerState LinearWrap : register(s0);
+SamplerState PointClamp : register(s1);   // Hi-Z occlusion sampling (point, clamp)
 
 struct VOut {
     float4 Position : SV_Position;
@@ -81,6 +86,48 @@ bool ConeBackface(float4 sphere, float4 cone, float4x4 model) {
     return dot(centerDir, axisW) > sinSpread;   // all faces point away from the camera
 }
 
+float linearViewDistMeshlet(float d) {
+    float n = HizParams.w, f = HizFar.x;
+    return (n * f) / max(f - d * (f - n), 1e-6);
+}
+
+// Conservative Hi-Z occlusion for a meshlet (port of GpuCull::occludedByHiZ). Derives a world AABB from the
+// meshlet's world-space bounding sphere, projects its 8 corners, and culls only when the nearest corner is
+// strictly behind the max occluder depth over the footprint (+ bias). Never false-culls → byte-identical.
+bool MeshletOccluded(float4 sphere, float4x4 model) {
+    if (HizFar.y < 0.5) return false;   // HizEnabled
+    float3 cW = mul(float4(sphere.xyz, 1.0), model).xyz;
+    float sx = length(model._m00_m01_m02), sy = length(model._m10_m11_m12), sz = length(model._m20_m21_m22);
+    float r = sphere.w * max(sx, max(sy, sz));
+    float3 mn = cW - r, mx = cW + r;
+    Texture2D<float> HiZ = ResourceDescriptorHeap[(uint)HizFar.z];
+    float2 uvMin = 1e9, uvMax = -1e9; float nearDist = 1e9;
+    [unroll] for (int c = 0; c < 8; c++) {
+        float3 corner = float3((c & 1) == 0 ? mn.x : mx.x, (c & 2) == 0 ? mn.y : mx.y, (c & 4) == 0 ? mn.z : mx.z);
+        float4 clip = mul(float4(corner, 1.0), HizViewProj);
+        if (clip.w <= 1e-5) return false;
+        float3 ndc = clip.xyz / clip.w;
+        if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0) return false;
+        float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
+        uvMin = min(uvMin, uv); uvMax = max(uvMax, uv);
+        nearDist = min(nearDist, -mul(float4(corner, 1.0), HizView).z);
+    }
+    float2 sizePx = (uvMax - uvMin) * HizParams.xy;
+    float maxSpanPx = max(sizePx.x, sizePx.y);
+    if (maxSpanPx > 0.4 * max(HizParams.x, HizParams.y)) return false;
+    float level = clamp(ceil(log2(max(maxSpanPx * 0.5, 1.0))), 0.0, HizParams.z - 1.0);
+    float o0 = HiZ.SampleLevel(PointClamp, float2(uvMin.x, uvMin.y), level);
+    float o1 = HiZ.SampleLevel(PointClamp, float2(uvMax.x, uvMin.y), level);
+    float o2 = HiZ.SampleLevel(PointClamp, float2(uvMin.x, uvMax.y), level);
+    float o3 = HiZ.SampleLevel(PointClamp, float2(uvMax.x, uvMax.y), level);
+    float oc = HiZ.SampleLevel(PointClamp, (uvMin + uvMax) * 0.5, level);
+    float maxOcc = max(max(max(o0, o1), max(o2, o3)), oc);
+    if (maxOcc >= 1.0) return false;
+    float occluderDist = linearViewDistMeshlet(maxOcc);
+    float bias = max(0.5, occluderDist * 0.03);
+    return nearDist > occluderDist + bias;
+}
+
 [numthreads(32, 1, 1)]
 void ASMain(uint dtid : SV_DispatchThreadID, uint gtid : SV_GroupThreadID) {
     PerDraw pd = PerDraws[DrawIndex];
@@ -88,7 +135,8 @@ void ASMain(uint dtid : SV_DispatchThreadID, uint gtid : SV_GroupThreadID) {
     uint mi = MeshletBase + dtid;
     if (dtid < MeshletCount) {
         visible = SphereInFrustum(Bounds[mi].Sphere, pd.Model)
-               && !ConeBackface(Bounds[mi].Sphere, Bounds[mi].Cone, pd.Model);
+               && !ConeBackface(Bounds[mi].Sphere, Bounds[mi].Cone, pd.Model)
+               && !MeshletOccluded(Bounds[mi].Sphere, pd.Model);
     }
     // compact survivors into the payload
     uint slot = WavePrefixCountBits(visible);

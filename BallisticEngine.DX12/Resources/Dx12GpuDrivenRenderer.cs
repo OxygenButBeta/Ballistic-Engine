@@ -212,10 +212,16 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
                 AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 16, ComparisonFunction = ComparisonFunction.Never,
                 MinLOD = 0, MaxLOD = float.MaxValue,
             };
+            // s1 point-clamp for the AS meshlet Hi-Z occlusion sample (visible to the amplification stage = All).
+            var msPoint = new StaticSamplerDescription(ShaderVisibility.All, 1, 0) {
+                Filter = Filter.MinMagMipPoint, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
+                AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1, ComparisonFunction = ComparisonFunction.Never,
+                MinLOD = 0, MaxLOD = float.MaxValue,
+            };
             meshletRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
                 new RootSignatureDescription1(
                     RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                    mp.ToArray(), new[] { msWrap })));
+                    mp.ToArray(), new[] { msWrap, msPoint })));
             string mh = EmbeddedShaderSource.ReadHlsl("MeshletGBuffer.hlsl");
             byte[] asb = Dx12ShaderCompiler.Compile(DxcShaderStage.Amplification, mh, "ASMain", "MeshletGBuffer.hlsl");
             byte[] msb = Dx12ShaderCompiler.Compile(DxcShaderStage.Mesh, mh, "MSMain", "MeshletGBuffer.hlsl");
@@ -582,7 +588,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     ID3D12Resource meshletCullCb; unsafe byte* meshletCullCbMapped; long meshletCullCbStride;
     unsafe void EnsureMeshletCullCb() {
         if (meshletCullCb != null) return;
-        meshletCullCbStride = 256;   // 6 float4 planes fit in 96B; 256 for CB alignment
+        meshletCullCbStride = 512;   // Planes[6](96)+CameraPos(16)+HizVP(64)+HizView(64)+HizParams(16)+HizFar(16)=272
         meshletCullCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)(meshletCullCbStride * dev.FramesInFlight)), ResourceStates.GenericRead);
         meshletCullCbMapped = meshletCullCb.Map<byte>(0);
@@ -600,15 +606,25 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     // Shading is byte-identical to GBufferBindless (MeshletGBuffer.PSMain is a verbatim copy). Returns draw count.
     public unsafe int RenderIntoMeshlet(ID3D12GraphicsCommandList6 cl, List<IStaticMeshRenderer> renderers,
         Matrix4x4 viewProj, Vector4[] frustumPlanes, Vector3 cameraPos, bool coneCull,
+        Matrix4x4 viewProjUnjittered, Matrix4x4 view, float near, float far,
         ulong motionCbAddress, ref int cpuDrawIndex) {
         if (meshletPso == null || renderers.Count == 0) return 0;
         meshletTris = 0;
         EnsureMeshletCullCb();
-        // Cull CB (b2): the 6 unjittered frustum planes + camera pos (xyz) and the cone-cull flag (w).
+        // Cull CB (b2): 6 unjittered frustum planes + camera pos (xyz)/cone flag (w) + Hi-Z occlusion fields.
         long cullOff = (long)dev.FrameSlot * meshletCullCbStride;
-        var planesDst = (Vector4*)(meshletCullCbMapped + cullOff);
+        byte* cb = meshletCullCbMapped + cullOff;
+        var planesDst = (Vector4*)cb;
         for (int i = 0; i < 6; i++) planesDst[i] = frustumPlanes[i];
         planesDst[6] = new Vector4(cameraPos, coneCull ? 1f : 0f);
+        // Hi-Z: reuse the GPU-driven pyramid (same one ExecuteIndirect occludes against). Enabled only when the
+        // pyramid is primed this frame + the bindless slot is valid. Conservative (never false-culls) → byte-id.
+        long o = 7 * 16;   // after Planes[6] + CameraPosCull
+        *(Matrix4x4*)(cb + o) = Matrix4x4.Transpose(viewProjUnjittered); o += 64;
+        *(Matrix4x4*)(cb + o) = Matrix4x4.Transpose(view); o += 64;
+        bool hizOn = hizOnThisFrame && hizBindlessIndex >= 0;
+        *(Vector4*)(cb + o) = new Vector4(hiz.Width, hiz.Height, hiz.MipCount, near); o += 16;
+        *(Vector4*)(cb + o) = new Vector4(far, hizOn ? 1f : 0f, Math.Max(hizBindlessIndex, 0), 0f);
 
         cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);   // ResourceDescriptorHeap[] for bindless materials
         cl.SetGraphicsRootSignature(meshletRootSig);
