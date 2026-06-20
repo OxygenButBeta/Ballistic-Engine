@@ -194,6 +194,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public float FalloffDist; public float UseSH; public float ProbeStride; public float OctSize;
         public uint ProbesX; public uint ProbesY; public uint FullW; public uint FullH;
         public float HistoryValid; public float ProbeEma; public float TexelDim; public float SpPad1;
+        public float AdaptiveRays; public float AdaptiveStride; public float AdaptiveVar; public float SpPad2;
     }
 
     static int spEnvDoor = -2;   // -2 unread, -1 unset(default), 0 force-off, 1 force-on
@@ -698,6 +699,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             ProbeEma = EnvF("BALLISTIC_DX12_LUMEN_PROBE_EMA", 0.1f),   // this-frame weight; low = strong accumulation
             TexelDim = scene.TexelDim,
             SpPad1 = EnvF("BALLISTIC_DX12_LUMEN_PROBE_FILTER_RADIUS", 2f),   // probe-space spatial filter radius (blob fix)
+            // Variance-guided adaptive ray. OFF under deterministic capture (history+frame-phased → would shift the
+            // golden) so paused captures stay byte-identical; ON in live play, killable via the env door.
+            AdaptiveRays = (Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_PROBE_ADAPTIVE") != "0"
+                            && !ctx.DeterministicCapture) ? 1f : 0f,
+            AdaptiveStride = EnvF("BALLISTIC_DX12_LUMEN_PROBE_ADAPTIVE_STRIDE", 3f),
+            AdaptiveVar = EnvF("BALLISTIC_DX12_LUMEN_PROBE_ADAPTIVE_VAR", 0.06f),
         });
         spSunCb.Write(new LumenSun
         {

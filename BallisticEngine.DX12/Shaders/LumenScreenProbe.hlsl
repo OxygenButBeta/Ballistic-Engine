@@ -42,6 +42,7 @@ cbuffer ProbeConstants : register(b0) {
     float FalloffDist;  float UseSH;      float ProbeStride;    float OctSize;       // UseSH=1 → CSIntegrate evaluates the SH cache (was ProbeTile, unused)
     uint  ProbesX;      uint ProbesY;     uint FullW;           uint FullH;
     float HistoryValid; float ProbeEma;   float TexelDim;       float SpPad1;        // Sıra 3 EMA; Sıra 5 mesh-card grid edge (1=legacy)
+    float AdaptiveRays; float AdaptiveStride; float AdaptiveVar; float SpPad2;        // variance-guided adaptive ray (0=off, byte-identical)
 };
 cbuffer ProbeSun : register(b1) {
     float3 SunDir;   float SunBias;
@@ -351,24 +352,60 @@ void CSProbeTrace(uint3 dtid : SV_DispatchThreadID) {
     float2 octUv = (float2(lcell) + float2(frac(jitter * 1.61803), frac(jitter * 2.41421))) / float(oct);
     float3 dir = OctDecode(octUv);
 
-    float3 origin = P + N * NormalBias;
-    float3 rad = TraceRay(origin, dir);
-    rad = Sanitize(rad);
-
     // Sıra 3 — TEMPORAL ACCUMULATION. The single-frame few-ray probe is noisy/blobby; EMA it over the previous
     // frame's atlas → many effective rays per probe at no extra trace cost (the published Lumen screen-probe
     // temporal filter). Cells are screen-tile-anchored; on a static camera the same probe maps to the same atlas
     // cell across frames, so a straight EMA per cell is correct. On a moving camera the probe at this grid cell may
     // now cover DIFFERENT geometry — reject (take fresh) when the previous probe at the same cell sat on a surface
     // far from this one (disocclusion), so we accumulate instead of smearing a trail.
+    //
+    // The reproject test is computed ONCE here and shared by both the EMA and the adaptive-ray gate below.
+    bool sameSurface = false;
+    float3 prev = 0.0.xxx;
     [branch] if (HistoryValid > 0.5) {
         ProbeHeader hp = ProbeHeadersPrev[pidx];
         float posDiff = distance(hp.PosValid.xyz, P);
-        bool sameSurface = hp.PosValid.w > 0.5 && posDiff < max(0.5, length(P - CameraPos) * 0.03);
-        if (sameSurface) {
-            float3 prev = Sanitize(ProbeAtlasHistory[atlasPx].rgb);
-            rad = lerp(prev, rad, saturate(ProbeEma));   // low alpha → strong accumulation, kills grain/blob flicker
+        sameSurface = hp.PosValid.w > 0.5 && posDiff < max(0.5, length(P - CameraPos) * 0.03);
+        if (sameSurface) prev = Sanitize(ProbeAtlasHistory[atlasPx].rgb);
+    }
+
+    // VARIANCE-GUIDED ADAPTIVE RAY (AdaptiveRays>0.5; OFF in deterministic capture → byte-identical golden).
+    // On a reprojected (sameSurface) probe cell, measure the local DIRECTIONAL variance of the already-converged
+    // previous atlas over this probe's own oct block. A flat (low coefficient-of-variation) cell carries no new
+    // information frame-to-frame, so it traces only 1-in-AdaptiveStride frames (round-robin phase so every flat
+    // cell still fully refreshes over the stride window) and inherits the converged history on the off-frames.
+    // High-variance cells (silhouettes, sharp lighting, color-bleed boundaries) and disoccluded cells always
+    // trace. The skipped path writes `prev` verbatim, so the atlas tile stays fully populated — Filter/SH/
+    // Integrate downstream are byte-unaffected. This drops TraceRay calls on flat probes with no visual change.
+    bool traceThisFrame = true;
+    [branch] if (AdaptiveRays > 0.5 && sameSurface) {
+        uint2 tileMin = probe * oct;
+        uint2 tileMax = tileMin + (oct - 1u);
+        const float3 LUM = float3(0.2126, 0.7152, 0.0722);
+        float3 cC = prev;
+        float3 cL = Sanitize(ProbeAtlasHistory[uint2(max(atlasPx.x, tileMin.x + 1u) - 1u, atlasPx.y)].rgb);
+        float3 cR = Sanitize(ProbeAtlasHistory[uint2(min(atlasPx.x + 1u, tileMax.x), atlasPx.y)].rgb);
+        float3 cD = Sanitize(ProbeAtlasHistory[uint2(atlasPx.x, max(atlasPx.y, tileMin.y + 1u) - 1u)].rgb);
+        float3 cU = Sanitize(ProbeAtlasHistory[uint2(atlasPx.x, min(atlasPx.y + 1u, tileMax.y))].rgb);
+        float m = dot((cC + cL + cR + cD + cU) / 5.0, LUM);
+        float v = abs(dot(cC, LUM) - m) + abs(dot(cL, LUM) - m) + abs(dot(cR, LUM) - m)
+                + abs(dot(cD, LUM) - m) + abs(dot(cU, LUM) - m);
+        v /= 5.0;
+        float cov = v / max(m, 1e-4);   // coefficient of variation → scale-invariant (bright & dark gate alike)
+        if (cov < AdaptiveVar) {
+            uint stride = (uint)max(AdaptiveStride, 1.0);
+            uint phase = (lcell.x * 7u + lcell.y * 13u + pidx) % stride;
+            traceThisFrame = (((uint)FrameIndex) % stride) == phase;
         }
+    }
+
+    float3 rad;
+    [branch] if (!traceThisFrame) {
+        rad = prev;   // INHERIT — skip the TraceRay this frame (the cost saving on flat probes)
+    } else {
+        float3 origin = P + N * NormalBias;
+        rad = Sanitize(TraceRay(origin, dir));
+        if (sameSurface) rad = lerp(prev, rad, saturate(ProbeEma));   // low alpha → strong accumulation
     }
     ProbeAtlas[atlasPx] = float4(rad, 1.0);
 }
