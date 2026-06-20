@@ -50,6 +50,25 @@ public sealed class Dx12ClusteredLights : IDisposable {
     // GPU compute cull (default; BALLISTIC_DX12_GPU_LIGHTCULL=0 = CPU fallback). Inputs uploaded by the CPU
     // (view-space light pos + cluster AABBs) so the cull decision is byte-identical; the loop runs on GPU.
     readonly bool gpuCullOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GPU_LIGHTCULL") != "0";
+    // Async-compute PILOT (proven cross-queue template; NOT a shipping win for THIS pass — see below). Routes the
+    // GPU light cull onto the async COMPUTE queue so it overlaps the graphics queue's RT-shadows + pre-deferred
+    // work. Doubly gated: needs the async infra (BALLISTIC_DX12_ASYNC_COMPUTE=1) AND this door (default ON when the
+    // infra is up; =0 forces inline). Since the infra itself is OFF by default, the shipping path is ALWAYS inline.
+    //
+    // Why this pass was the safest pilot: pure compute, ALL root descriptors (no descriptor heap → the R2
+    // heap-hang class can't apply), inputs CPU-uploaded (not G-buffer-derived) so the hand-off has no graphics
+    // input dependency, output (grid/index) consumed only by deferred (event 300) — a wide window. Verified
+    // byte-identical (MultiLightInterior 11-light + CornellBox 0-light paused md5-identical async ON==OFF; 250-frame
+    // play device-stable; GBV+DRED clean).
+    //
+    // MEASURED RESULT (RX 9070 XT, FPSBENCH): async is a small NET LOSS here — BistroExt 299→290, BistroInt
+    // 359→345, MultiLightInterior 637→590 fps. The cull dispatch is tiny (3456 clusters, one dispatch ~µs) and
+    // the hand-off cost (extra graphics submit + two cross-queue fences + a post-split allocator reset) exceeds
+    // the overlap it buys. Async compute pays off only for a LARGE, graphics-independent, long-running compute
+    // pass (e.g. the Lumen probe trace) — light cull is the wrong workload. Kept OFF by default + documented so the
+    // proven cross-queue state dance (graphics owns every PIXEL↔UAV transition; compute sees UAV only) can be
+    // lifted onto the right pass later without re-deriving it.
+    readonly bool asyncCullDoor = Environment.GetEnvironmentVariable("BALLISTIC_DX12_ASYNC_LIGHTCULL") != "0";
     ID3D12RootSignature cullRootSig; ID3D12PipelineState cullPso;
     ID3D12Resource lightViewBuf; unsafe byte* lightViewMapped;  // float4 per light: xyz view pos, w range
     ID3D12Resource clusterMinBuf; unsafe byte* clusterMinMapped;
@@ -274,6 +293,15 @@ public sealed class Dx12ClusteredLights : IDisposable {
 
     // GPU compute cull: reset the counter, dispatch one thread per cluster (writes grid + index), leave
     // grid/index in PixelShaderResource for the deferred lighting read. Byte-identical to the CPU path.
+    //
+    // ASYNC vs INLINE — the GPU work (counter reset + dispatch) is recorded by `recordCull` either onto the
+    // async COMPUTE queue (RecordAsyncCompute) or inline on the graphics frame list (ExecuteSync). The two
+    // produce IDENTICAL grid/index contents — only the queue and the surrounding state transitions differ:
+    //  • INLINE: one Direct list does UAV→…→dispatch→PixelShaderResource. PixelShaderResource is legal on Direct.
+    //  • ASYNC: the COMPUTE list leaves grid/index in UNORDERED_ACCESS (a Compute queue CANNOT transition to
+    //    PIXEL_SHADER_RESOURCE — that state is graphics-only), then the GRAPHICS post-split segment transitions
+    //    UAV→PixelShaderResource for deferred. The cross-queue fence (inside RecordAsyncCompute) orders the two;
+    //    the transition handles state. counterBuf reset (CopySource/Dest copy) is legal on a Compute queue.
     unsafe void GpuCull() {
         // P0b: read/bind THIS frame's slabs (N==1 → offsets 0 → byte-identical). grid/index/counter are
         // GPU-only DEFAULT-heap (single slab) → bound at base. cluster AABBs were written for this slot in EnsureClusters.
@@ -283,8 +311,14 @@ public sealed class Dx12ClusteredLights : IDisposable {
         cb[1] = ClusterCount;
         cb[2] = MaxLightIndices;
         cb[3] = MaxLightsPerCluster;
-        dev.ExecuteSync(cl => {
-            TransitionGridIndex(cl, ResourceStates.UnorderedAccess);
+
+        bool async = asyncCullDoor && dev.AsyncComputeEnabled && dev.FrameOpen;
+
+        // The dispatch itself, queue-agnostic: it assumes grid/index/counter are ALREADY in UnorderedAccess and
+        // leaves them there. A Compute command list can ONLY express COMMON/UAV/COPY states — never
+        // PIXEL_SHADER_RESOURCE — so ALL PixelShaderResource transitions live on the graphics list (below), and
+        // the compute list sees grid/index purely as UAV (its starting state on the async path).
+        Action<ID3D12GraphicsCommandList4> dispatchCull = cl => {
             cl.ResourceBarrierTransition(counterBuf, ResourceStates.UnorderedAccess, ResourceStates.CopyDest);
             cl.CopyBufferRegion(counterBuf, 0, zeroCounter, 0, sizeof(uint));
             cl.ResourceBarrierTransition(counterBuf, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
@@ -298,8 +332,25 @@ public sealed class Dx12ClusteredLights : IDisposable {
             cl.SetComputeRootUnorderedAccessView(5, indexBuf.GPUVirtualAddress);
             cl.SetComputeRootUnorderedAccessView(6, counterBuf.GPUVirtualAddress);
             cl.Dispatch((ClusterCount + 63) / 64, 1, 1);
-            TransitionGridIndex(cl, ResourceStates.PixelShaderResource);
-        });
+        };
+
+        if (async) {
+            // GRAPHICS (pre-split): take grid/index PixelShaderResource→UnorderedAccess. This records onto the
+            // graphics frame list BEFORE the hand-off, so the Direct queue performs the only PIXEL→UAV transition;
+            // the compute queue then sees them already as UAV.
+            dev.ExecuteSync(cl => TransitionGridIndex(cl, ResourceStates.UnorderedAccess));
+            // COMPUTE (async): the dispatch overlaps the graphics RT-shadows + pre-deferred work on the GPU.
+            dev.RecordAsyncCompute(dispatchCull);
+            // GRAPHICS (post-split): the cross-queue fence (inside RecordAsyncCompute) guarantees the cull is done;
+            // transition UAV→PixelShaderResource for the deferred read. gridIndexState is still UAV.
+            dev.ExecuteSync(cl => TransitionGridIndex(cl, ResourceStates.PixelShaderResource));
+        } else {
+            dev.ExecuteSync(cl => {
+                TransitionGridIndex(cl, ResourceStates.UnorderedAccess);
+                dispatchCull(cl);
+                TransitionGridIndex(cl, ResourceStates.PixelShaderResource);
+            });
+        }
     }
 
     void TransitionGridIndex(ID3D12GraphicsCommandList4 cl, ResourceStates target) {
