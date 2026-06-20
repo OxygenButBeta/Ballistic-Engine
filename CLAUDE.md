@@ -179,8 +179,21 @@ loop returns or the process never exits.
   `//USER_SURFACE_MARKER`, before PSMain — HLSL has no forward decl) with the engine's VSMain (z-prepass
   position invariance stays bit-identical), motion, 5-MRT packing, and the b0/t0-t5/b1/s0 ABI. The user
   shader gets a per-material PSO (`Dx12SurfaceShaderCache`, cloned from the Standard PSO state, only the
-  PS differs). A custom surface body can read `DrawConstants` fields + the bound maps; it CANNOT write a
-  custom vertex stage, and `MaterialSemantic.None` properties don't reach the GPU yet (no generic CB).
+  PS differs). It CANNOT write a custom vertex stage (VSMain is engine-owned, for prepass invariance).
+- **Custom properties (the surface body's own uniforms/textures).** A `.shader`'s `properties:[]` entries
+  with `semantic: "None"` are custom — the material sets their values in the `.mat` (`customFloats`/
+  `customVectors`/`customTextures`, keyed by property name). The skeleton auto-generates a `cbuffer
+  CustomProps : register(b2)` + `Texture2D _X : register(t6..)` from the declared None-props (`Dx12Surface
+  ShaderCache.GenerateCustomDecls`), so the body reads them by name. **Straddle-safe layout**: every scalar
+  gets its OWN 16-byte cbuffer slot (`float`+`float3` pad), so the C# pack offset is `16*index` and can't
+  misalign. The renderer packs `b2` + binds `t6..` per custom draw (`BindCustomProps`, declared order ==
+  the codegen order). The root sig gained TRAILING `b2`/`t6` params the Standard shader never reads →
+  byte-identical. **GOTCHA — shader-instance identity**: a custom `.shader` reuses the Standard `Vert/
+  Frag.glsl`, so `StandardShader.Identity` (was `Combine(vertex, fragment)`) collided with the plain
+  Standard shader in `SharedResources` — the loader's `SetProperties`/`SurfaceSource` then leaked onto
+  EVERY Standard material. Fixed: `CreateStandardShader(…, identityExtra)` (the `.shader` path) for custom
+  shaders only; plain Standard passes null → unchanged key. The editor inspector edits custom props via
+  `MaterialPropertyBinding.ForCustom` (name-keyed into the `Custom*` dicts, same null-elision).
 - **Compile-fail = magenta checker, never a crash.** A bad surface shader (load or hot-reload) draws the
   `SurfaceFallback.hlsl` black/magenta world-space checker (emissive, visible unlit) + logs the DXC
   error; the failed key caches the fallback so it doesn't recompile every frame.
