@@ -31,6 +31,8 @@ public interface IEditorGui {
     void Dummy(Vector2 size);
     void AlignTextToFramePadding();
     void SetNextItemWidth(float width);
+    void Indent(float w = 0);
+    void Unindent(float w = 0);
     float Scale { get; }                       // == EditorTheme.UiScale (replaces the threaded `scale` arg)
     Vector2 ContentRegionAvail { get; }
     Vector2 CursorScreenPos { get; }
@@ -38,7 +40,14 @@ public interface IEditorGui {
     float CursorPosY { get; set; }
     float FrameHeight { get; }
     Vector2 WindowPadding { get; }             // ImGui.GetStyle().WindowPadding (for right-aligned widgets)
+    Vector2 ItemSpacing { get; }               // ImGui.GetStyle().ItemSpacing
+    Vector2 FramePadding { get; }              // ImGui.GetStyle().FramePadding
     Vector2 CalcTextSize(string text);
+
+    // ---- scroll (log-tailing panels) ----
+    float ScrollY { get; }
+    float ScrollMaxY { get; }
+    void SetScrollHereY(float ratio = 0.5f);
 
     // ---- text ----
     void Text(string text);
@@ -59,6 +68,7 @@ public interface IEditorGui {
     bool DragFloat2(string label, ref Vector2 v, float speed);
     bool DragFloat3(string label, ref Vector3 v, float speed);
     bool DragInt(string label, ref int v);
+    bool InputInt(string label, ref int v, int step = 1);
     bool InputText(string label, ref string v, int maxLength);
     bool InputTextWithHint(string label, string hint, ref string v, int maxLength);
     bool Combo(string label, ref int index, string[] names);
@@ -80,6 +90,8 @@ public interface IEditorGui {
     bool BeginPopup(string id);
     void EndPopup();
     void OpenPopup(string id);
+    void CloseCurrentPopup();
+    void SetNextWindowSizeAppearing(Vector2 size);   // popups that want a sensible first-open size
     bool BeginMenu(string label);
     void EndMenu();
     bool MenuItem(string label, bool enabled = true);

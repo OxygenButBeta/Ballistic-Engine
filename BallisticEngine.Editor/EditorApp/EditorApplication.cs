@@ -759,7 +759,7 @@ internal sealed class EditorApplication {
             tagsLayers.DrawStandalone(gui);
             layerCollision.DrawStandalone(gui);
             profilerPanel.DrawStandalone(gui);
-            buildPanel.Draw(S);
+            buildPanel.DrawStandalone(gui);
             CurveEditorWindow.Draw(S);
             ComponentEditorWindow.Draw(S);
             UnityImportWindow.Draw(S);
@@ -843,7 +843,7 @@ internal sealed class EditorApplication {
         tagsLayers.DrawStandalone(gui);
         layerCollision.DrawStandalone(gui);   // (was missing from this block — only drew while fullscreen)
         profilerPanel.DrawStandalone(gui);
-        buildPanel.Draw(S);
+        buildPanel.DrawStandalone(gui);
         CurveEditorWindow.Draw(S);
         ComponentEditorWindow.Draw(S);   // standalone component window — was only drawn while fullscreen
         UnityImportWindow.Draw(S);

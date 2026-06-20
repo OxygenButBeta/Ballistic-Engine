@@ -26,6 +26,8 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public void Dummy(Vector2 size) => ImGui.Dummy(size);
     public void AlignTextToFramePadding() => ImGui.AlignTextToFramePadding();
     public void SetNextItemWidth(float width) => ImGui.SetNextItemWidth(width);
+    public void Indent(float w = 0) => ImGui.Indent(w);
+    public void Unindent(float w = 0) => ImGui.Unindent(w);
     public float Scale => EditorTheme.UiScale;
     public Vector2 ContentRegionAvail => ImGui.GetContentRegionAvail();
     public Vector2 CursorScreenPos => ImGui.GetCursorScreenPos();
@@ -33,7 +35,14 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public float CursorPosY { get => ImGui.GetCursorPosY(); set => ImGui.SetCursorPosY(value); }
     public float FrameHeight => ImGui.GetFrameHeight();
     public Vector2 WindowPadding => ImGui.GetStyle().WindowPadding;
+    public Vector2 ItemSpacing => ImGui.GetStyle().ItemSpacing;
+    public Vector2 FramePadding => ImGui.GetStyle().FramePadding;
     public Vector2 CalcTextSize(string text) => ImGui.CalcTextSize(text);
+
+    // ---- scroll ----
+    public float ScrollY => ImGui.GetScrollY();
+    public float ScrollMaxY => ImGui.GetScrollMaxY();
+    public void SetScrollHereY(float ratio = 0.5f) => ImGui.SetScrollHereY(ratio);
 
     // ---- text ----
     public void Text(string text) => ImGui.Text(text);
@@ -57,6 +66,7 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public bool DragFloat2(string label, ref Vector2 v, float speed) => ImGui.DragFloat2(label, ref v, speed);
     public bool DragFloat3(string label, ref Vector3 v, float speed) => ImGui.DragFloat3(label, ref v, speed);
     public bool DragInt(string label, ref int v) => ImGui.DragInt(label, ref v);
+    public bool InputInt(string label, ref int v, int step = 1) => ImGui.InputInt(label, ref v, step);
     public bool InputText(string label, ref string v, int maxLength) => ImGui.InputText(label, ref v, (uint)maxLength);
     public bool InputTextWithHint(string label, string hint, ref string v, int maxLength) =>
         ImGui.InputTextWithHint(label, hint, ref v, (uint)maxLength);
@@ -87,6 +97,8 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public bool BeginPopup(string id) => ImGui.BeginPopup(id);
     public void EndPopup() => ImGui.EndPopup();
     public void OpenPopup(string id) => ImGui.OpenPopup(id);
+    public void CloseCurrentPopup() => ImGui.CloseCurrentPopup();
+    public void SetNextWindowSizeAppearing(Vector2 size) => ImGui.SetNextWindowSize(size, ImGuiCond.Appearing);
     public bool BeginMenu(string label) => ImGui.BeginMenu(label);
     public void EndMenu() => ImGui.EndMenu();
     public bool MenuItem(string label, bool enabled = true) => ImGui.MenuItem(label, "", false, enabled);
