@@ -25,6 +25,9 @@ public abstract class StandardShader(string vertexCode, string fragmentCode) : S
     // sets it without a DX12 reference.
     public string SurfaceSource { get; set; }
     public string SurfaceKey { get; set; }
+    // Project-relative path of the surface source asset (for hot-reload's file watch). Null when the
+    // surface was inline / unresolved.
+    public string SurfaceSourcePath { get; set; }
     public bool HasCustomSurface => SurfaceSource is not null;
 
     protected abstract void Compile(string vertexCode, string fragmentCode);

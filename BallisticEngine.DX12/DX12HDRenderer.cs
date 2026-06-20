@@ -933,6 +933,44 @@ public sealed class DX12HDRenderer : HDRenderer
     // legacy CPU path (custom-surface materials are demoted there — they can't ride GPU-driven/bindless).
     internal Dx12SurfaceShaderCache surfaceCache;
 
+    // Live hot-reload of custom surface shaders (file watch → recompile between frames). Lazy-init on the
+    // first frame that has a project. Raised after a successful reload so the host (editor) can repaint
+    // its on-demand viewport; the standalone player renders every frame anyway and ignores it.
+    Dx12SurfaceWatcher surfaceWatcher;
+    bool surfaceWatcherTried;
+    public event Action SurfaceShaderReloaded;
+
+    // Drain file-watch edits and recompile affected surface PSOs (main thread, between frames). Also frees
+    // PSOs whose deferred-dispose deadline has passed.
+    void ProcessSurfaceHotReload() {
+        if (surfaceCache is null) return;
+        surfaceCache.DrainDeferred(frameCounter);
+
+        var project = AssetDatabase.Project;
+        if (!surfaceWatcherTried && project is not null) {
+            surfaceWatcherTried = true;
+            surfaceCache.FramesInFlight = dev.FramesInFlight;
+            surfaceWatcher = new Dx12SurfaceWatcher(project.AssetsPath);
+            if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_SURFACE_HRDEBUG") == "1")
+                Console.WriteLine($"[surface] watcher init on '{project.AssetsPath}'");
+        }
+        var changed = surfaceWatcher?.DrainPending();
+        if (changed is null || project is null) return;
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_SURFACE_HRDEBUG") == "1")
+            Console.WriteLine($"[surface] drained {changed.Count} changed file(s)");
+
+        bool any = false;
+        foreach (string abs in changed) {
+            // Map the absolute path back to the "Assets/..." form the loader stored as SourcePath.
+            string rel = project.ToAssetPath(abs);
+            string body;
+            try { body = System.IO.File.ReadAllText(abs); }
+            catch (System.IO.IOException) { continue; } // editor still writing — next event picks it up
+            if (surfaceCache.Reload(rel, body, frameCounter) > 0) any = true;
+        }
+        if (any) SurfaceShaderReloaded?.Invoke();
+    }
+
     // The custom Surface() body of a material's shader, or null for the Standard path. The shader's
     // SurfaceSource lives on the backend-agnostic StandardShader (set by the asset loader).
     static StandardShader CustomShaderOf(Material mat) =>
@@ -1283,6 +1321,12 @@ public sealed class DX12HDRenderer : HDRenderer
         IViewProjectionProvider vp = args.viewProjectionProvider;
         if (vp is null || target is null)
             return default;
+
+        // Custom-surface hot-reload: drain any .surface/.hlsl edits the file watcher saw and recompile
+        // the affected PSOs HERE — between frames, on the main thread (PSO creation is main-thread-safe),
+        // never inside a draw list. Old PSOs are deferred-disposed past FramesInFlight. Free matured ones.
+        ProcessSurfaceHotReload();
+
         cpuFrameSw.Restart(); // CPU render-submission cost (the AI-measurable frame budget)
         if (PassTimingEnabled) RenderStats.Scene.GpuPasses.Clear(); // fresh per-pass GPU timings each frame
 
@@ -1753,7 +1797,7 @@ public sealed class DX12HDRenderer : HDRenderer
                         // heap is srvVisible.Heap as the legacy path requires.
                         var css = CustomShaderOf(mat);
                         if (css is not null) {
-                            var entry = surfaceCache.GetOrCompile(css.SurfaceSource, css.SurfaceKey);
+                            var entry = surfaceCache.GetOrCompile(css.SurfaceSource, css.SurfaceKey, css.SurfaceSourcePath);
                             if (entry.Pso is not null) cl.SetPipelineState(entry.Pso);
                             cl.DrawIndexedInstanced((uint)sub.IndexCount, 1, (uint)sub.IndexStart, 0, 0);
                             cl.SetPipelineState(gbufferPso);   // restore for the next Standard draw

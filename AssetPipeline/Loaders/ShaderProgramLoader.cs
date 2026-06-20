@@ -111,7 +111,11 @@ public static class ShaderProgramLoader {
                                    "material renders as Standard.");
             else {
                 shader.SurfaceSource = body;
-                shader.SurfaceKey = $"{surfacePath}#{body.GetHashCode():x8}";
+                // Key = the resolved asset path (stable across edits). The PSO cache keys by this path
+                // and tracks the source content itself, so hot-reload recompiles the SAME key in place
+                // (the material keeps its key; only the cache's PSO + source change).
+                shader.SurfaceKey = surfacePath ?? definition.Surface;
+                shader.SurfaceSourcePath = surfacePath;
             }
         }
         return shader;

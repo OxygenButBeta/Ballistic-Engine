@@ -7,11 +7,14 @@ using Vortice.Dxc;
 namespace BallisticEngine.DX12;
 
 // One compiled custom-surface pipeline. IsFallback = the source failed to compile and this is the
-// magenta-checker error PSO; Error carries the DXC log for the Console.
+// magenta-checker error PSO; Error carries the DXC log for the Console. SourcePath/Source track what
+// was compiled so hot-reload can recompile the same cache entry in place.
 public sealed class Dx12SurfacePso {
     public ID3D12PipelineState Pso;
     public bool IsFallback;
     public string Error;
+    public string SourcePath;   // project-relative source asset path (for hot-reload watch)
+    public string Source;       // the surface body that produced Pso
 }
 
 // Compiles user Surface() bodies into G-buffer PSOs that are drop-in for the Standard opaque PSO:
@@ -32,6 +35,12 @@ public sealed class Dx12SurfaceShaderCache : IDisposable {
 
     readonly Dictionary<string, Dx12SurfacePso> cache = new();
     Dx12SurfacePso fallback;                    // compiled once, reused for every failed material
+
+    // Hot-reload: PSOs replaced by a reload can't be freed immediately (the GPU may still reference them
+    // for FramesInFlight frames). They're parked here with the frame index after which they're safe to
+    // dispose; DrainDeferred(currentFrame) frees the matured ones. Set FramesInFlight from the renderer.
+    readonly List<(ID3D12PipelineState pso, long safeAfterFrame)> deferredDispose = new();
+    public int FramesInFlight = 3;
 
     public Dx12SurfaceShaderCache(ID3D12Device device, ID3D12RootSignature gbufferRootSig,
         InputLayoutDescription gbufferLayout, byte[] gbufferVs) {
@@ -60,26 +69,58 @@ public sealed class Dx12SurfaceShaderCache : IDisposable {
     // Get (or compile) the PSO for a custom surface body. `key` is a stable identity (shader GUID +
     // content hash) — same key returns the cached PSO. Compile failure caches+returns the fallback so
     // a broken material doesn't recompile every frame.
-    public Dx12SurfacePso GetOrCompile(string surfaceBody, string key) {
+    public Dx12SurfacePso GetOrCompile(string surfaceBody, string key, string sourcePath = null) {
         if (cache.TryGetValue(key, out var hit)) return hit;
-        Dx12SurfacePso entry;
-        try {
-            entry = new Dx12SurfacePso { Pso = BuildPso(surfaceBody, key) };
-        }
-        catch (Exception e) {
-            Debugging.LogError($"[surface] '{key}' compile failed; drawing magenta fallback:\n{e.Message}");
-            var fb = Fallback();
-            entry = new Dx12SurfacePso { Pso = fb.Pso, IsFallback = true, Error = e.Message };
-        }
+        var entry = Compile(surfaceBody, key, sourcePath);
         cache[key] = entry;
         return entry;
     }
 
-    // Drop a cached entry so the next GetOrCompile recompiles (hot-reload). Returns the old PSO (if any)
-    // so the caller can defer-dispose it past the GPU's in-flight frames.
-    public ID3D12PipelineState Invalidate(string key) {
-        if (cache.Remove(key, out var old) && !old.IsFallback) return old.Pso;
-        return null;
+    // Build one cache entry (compile or fall back). Records SourcePath/Source so hot-reload can match
+    // a changed file to its entries and recompile in place.
+    Dx12SurfacePso Compile(string surfaceBody, string key, string sourcePath) {
+        try {
+            return new Dx12SurfacePso { Pso = BuildPso(surfaceBody, key), SourcePath = sourcePath, Source = surfaceBody };
+        }
+        catch (Exception e) {
+            Debugging.LogError($"[surface] '{key}' compile failed; drawing magenta fallback:\n{e.Message}");
+            var fb = Fallback();
+            return new Dx12SurfacePso { Pso = fb.Pso, IsFallback = true, Error = e.Message,
+                SourcePath = sourcePath, Source = surfaceBody };
+        }
+    }
+
+    // HOT-RELOAD: recompile every cache entry whose source asset is `changedPath`, with `newSource`. The
+    // old (non-fallback) PSO is DEFERRED-disposed past FramesInFlight frames — freeing it now would be a
+    // use-after-free while the GPU is still drawing the in-flight frame. Returns the number of entries
+    // reloaded (0 = the changed file wasn't a live surface source). MUST run between frames (the renderer
+    // calls this before BeginRender), never inside a draw list. `currentFrame` is a monotonically
+    // increasing frame counter.
+    public int Reload(string changedPath, string newSource, long currentFrame) {
+        int n = 0;
+        foreach (var k in new List<string>(cache.Keys)) {
+            var old = cache[k];
+            if (!string.Equals(old.SourcePath, changedPath, StringComparison.OrdinalIgnoreCase)) continue;
+            if (old.Source == newSource) continue; // unchanged content (editor saved without edits)
+            var fresh = Compile(newSource, k, changedPath);
+            cache[k] = fresh;
+            if (!old.IsFallback && old.Pso is not null)
+                deferredDispose.Add((old.Pso, currentFrame + FramesInFlight));
+            n++;
+            Debugging.Log($"[surface] hot-reloaded '{changedPath}' -> {(fresh.IsFallback ? "FALLBACK (compile error)" : "OK")}");
+        }
+        return n;
+    }
+
+    // Free PSOs whose deferred-dispose deadline has passed (the GPU is no longer reading them). Called
+    // once per frame by the renderer with the current frame counter.
+    public void DrainDeferred(long currentFrame) {
+        for (int i = deferredDispose.Count - 1; i >= 0; i--) {
+            if (deferredDispose[i].safeAfterFrame <= currentFrame) {
+                deferredDispose[i].pso?.Dispose();
+                deferredDispose.RemoveAt(i);
+            }
+        }
     }
 
     // Compiles the fallback + a trivial custom body + a deliberately-broken body, logging each result.
