@@ -115,11 +115,21 @@ public sealed class Dx12GpuProfiler : IDisposable {
         for (int i = 0; i < count; i++) {
             ulong begin = p[baseSlot + i * 2], end = p[baseSlot + i * 2 + 1];
             double ms = end > begin ? (end - begin) * 1000.0 / frequency : 0.0;
-            total += ms;
-            sb.Append($" {ringNames[ring][i]}={ms:0.000}");
+            // A pass that FLUSHED + reopened the frame list mid-record (e.g. the Lumen scene's TLAS rebuild via
+            // ExecuteSyncImmediate) has its begin/end timestamps in DIFFERENT GPU submissions, so the delta spans a
+            // CPU↔GPU sync and is meaningless (reads as tens/hundreds of ms). Flag those instead of trusting the
+            // number — a single pass can't exceed a plausible frame budget, so >FlushGuardMs is a flush artefact,
+            // not a real pass cost. (The real per-pass cost is then measurable by an A/B toggle of that feature.)
+            const double FlushGuardMs = 6.0;
+            if (ms > FlushGuardMs) {
+                sb.Append($" {ringNames[ring][i]}=~flush?");   // span straddled a submit boundary — not a real reading
+            } else {
+                total += ms;
+                sb.Append($" {ringNames[ring][i]}={ms:0.000}");
+            }
         }
         UnmapReadback();
-        sb.Append($" | sum={total:0.000}ms");
+        sb.Append($" | sum(valid)={total:0.000}ms");
         _ = data;
         return sb.ToString();
     }
