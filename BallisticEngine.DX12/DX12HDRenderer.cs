@@ -1357,7 +1357,8 @@ public sealed class DX12HDRenderer : HDRenderer
         // doors.Shadows = off under BARE-MINIMUM (the deferred shadow term hard-1.0s via fc.ShadowsEnabled below).
         bool fprof = frameProfileOn;
         var fpsw = fprof ? System.Diagnostics.Stopwatch.StartNew() : null;
-        void FP(string t) { if (fprof) { fpsw.Stop(); Console.WriteLine($"[FrameProf] {t} {fpsw.Elapsed.TotalMilliseconds:0.00}ms"); fpsw.Restart(); } }
+        long fpGc = fprof ? GC.GetTotalAllocatedBytes() : 0;
+        void FP(string t) { if (fprof) { fpsw.Stop(); long g = GC.GetTotalAllocatedBytes(); Console.WriteLine($"[FrameProf] {t} {fpsw.Elapsed.TotalMilliseconds:0.00}ms alloc={g-fpGc}B"); fpGc = g; fpsw.Restart(); } }
 
         // PP1: shadow rendering MOVED below dev.BeginFrame() — its cascade depth draws now record into the open
         // frame list (no per-frame ExecuteUpload submit+wait). The cascade FIT is still computed before the

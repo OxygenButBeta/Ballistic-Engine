@@ -123,23 +123,42 @@ public class Scene : BObject
                 entity.FireEnd();
     }
 
-    // Snapshot (ToArray) so a behaviour that Instantiates or Destroys an entity during Tick —
-    // a normal gameplay action (spawn a projectile, despawn on death) — doesn't invalidate this
-    // enumeration. A newly spawned entity ran its own OnBegin/OnEnabled via AddComponent already;
-    // it starts ticking next frame. An entity destroyed mid-frame stays in the snapshot but is
-    // skipped via IsDestroyed (its components already tore down).
+    // Reused snapshot buffers for the per-frame Update / FixedUpdate sweeps. The OLD code did
+    // `entities.ToArray()` every call — a fresh heap array per frame (and per fixed step, 0–4×/frame),
+    // which on a CPU-heavy scene with many entities is steady GC pressure (and a GC spike is a frame
+    // hitch, the thing that hurts a real game more than a fraction of a ms of average). Copying into a
+    // reused list (Clear + AddRange) is allocation-free once the buffer has grown to the entity count.
+    // We STILL snapshot (don't iterate `entities` directly) so a behaviour that spawns/destroys an entity
+    // mid-tick — normal gameplay — can't invalidate the sweep. Separate buffers for Update vs FixedUpdate
+    // because a FixedUpdate can run nested inside the physics step within a frame; they never alias.
+    readonly List<Entity> updateSnapshot = new(capacity: 200);
+    readonly List<Entity> fixedSnapshot = new(capacity: 200);
+
+    // A newly spawned entity ran its own OnBegin/OnEnabled via AddComponent already; it starts ticking
+    // next frame. An entity destroyed mid-frame stays in the snapshot but is skipped via IsDestroyed
+    // (its components already tore down). Index loop (not foreach) avoids the List enumerator too.
     public void Update(in float deltaTime)
     {
-        foreach (Entity entity in entities.ToArray())
+        updateSnapshot.Clear();
+        updateSnapshot.AddRange(entities);
+        for (int i = 0; i < updateSnapshot.Count; i++)
+        {
+            Entity entity = updateSnapshot[i];
             if (entity.IsActive && !entity.IsDestroyed)
                 entity.Update(in deltaTime);
+        }
     }
 
     // Runs FixedTick across the scene; called by the fixed-step physics loop, before each step.
     public void FixedUpdate(in float fixedDelta)
     {
-        foreach (Entity entity in entities.ToArray())
+        fixedSnapshot.Clear();
+        fixedSnapshot.AddRange(entities);
+        for (int i = 0; i < fixedSnapshot.Count; i++)
+        {
+            Entity entity = fixedSnapshot[i];
             if (entity.IsActive && !entity.IsDestroyed)
                 entity.FixedUpdate(in fixedDelta);
+        }
     }
 }

@@ -285,11 +285,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
 
     static readonly bool LumenProfile = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_PROFILE") == "1";
     System.Diagnostics.Stopwatch profSw = new();
-    void Prof(string tag) { if (LumenProfile) { profSw.Stop(); Console.WriteLine($"[LumenProf] {tag} {profSw.Elapsed.TotalMilliseconds:0.00}ms"); profSw.Restart(); } }
+    long profGc;
+    void Prof(string tag) { if (LumenProfile) { profSw.Stop(); long g = GC.GetTotalAllocatedBytes(); Console.WriteLine($"[LumenProf] {tag} {profSw.Elapsed.TotalMilliseconds:0.00}ms alloc={g-profGc}B"); profGc = g; profSw.Restart(); } }
 
     public unsafe void Record(Dx12FrameContext ctx)
     {
-        if (LumenProfile) profSw.Restart();
+        if (LumenProfile) { profSw.Restart(); profGc = GC.GetTotalAllocatedBytes(); }
         // Build/refresh the substrate (shared TLAS + bindless geo + card table + atlases) and log its counts.
         if (!scene.Ensure(ctx))
             return;   // no valid scene AS → nothing to trace (Lumen is HW-RT only; no SSGI fallback)

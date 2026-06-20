@@ -64,14 +64,23 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
         if (int.TryParse(fpsBenchEnv, out int benchFrames) && benchFrames > 0) {
             int warm = Math.Min(30, benchFrames / 4);
             for (int f = 0; f < warm; f++) { WindowUpdateCallback?.Invoke(dt); WindowRenderCallback?.Invoke(dt); }
+            // GC instrumentation: managed bytes allocated + gen0/1/2 collection counts ACROSS the timed window.
+            // This is the metric CPU-side optimisations (allocation removal) actually move — invisible in fps on a
+            // GPU-bound machine, but a real game's frame hitches come from GC spikes, so bytes/frame matters. The
+            // warm-up above is excluded so first-frame/JIT allocation doesn't skew it.
+            long gcBytes0 = GC.GetTotalAllocatedBytes(precise: false);
+            int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
             var sw = System.Diagnostics.Stopwatch.StartNew();
             for (int f = 0; f < benchFrames; f++) { WindowUpdateCallback?.Invoke(dt); WindowRenderCallback?.Invoke(dt); }
             sw.Stop();
+            long gcBytes = GC.GetTotalAllocatedBytes(precise: false) - gcBytes0;
+            int dg0 = GC.CollectionCount(0) - g0, dg1 = GC.CollectionCount(1) - g1, dg2 = GC.CollectionCount(2) - g2;
             double msPerFrame = sw.Elapsed.TotalMilliseconds / benchFrames;
             // Report the ACTUAL frames-in-flight from the device, not a stale env check — overlap is now default-ON
             // (gated on OVERLAP!="0"), so the old `=="1"` label misreported the default run as "off".
             int fif = RenderAsset.Current.Renderer is DX12HDRenderer rb ? rb.Device.FramesInFlight : 1;
             Console.WriteLine($"[FpsBench] frames={benchFrames} warmup={warm} avgFrameMs={msPerFrame:0.000} fps={1000.0 / msPerFrame:0.0} framesInFlight={fif} overlap={(fif > 1 ? "ON" : "off")}");
+            Console.WriteLine($"[FpsBench] gcAllocKB={gcBytes / 1024.0:0.0} bytesPerFrame={(double)gcBytes / benchFrames:0} gen0={dg0} gen1={dg1} gen2={dg2}");
             return;
         }
 

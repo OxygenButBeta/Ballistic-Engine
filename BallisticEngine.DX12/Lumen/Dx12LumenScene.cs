@@ -49,6 +49,17 @@ public sealed class Dx12LumenScene : IDisposable
     public ulong InstanceMetaGpuAddress => instanceMeta?.GPUVirtualAddress ?? 0;
     public int InstanceCount { get; private set; }
 
+    // REUSED CPU staging buffers for BuildMetaArray. The old code `new`'d a LumenInstanceMeta[], a uint[], and two
+    // Lists EVERY call — and RefreshTransforms runs EVERY frame an instance moves (CarDemo: car + 4 wheels ⇒ every
+    // frame), so on a scene with many clusters that was MEGABYTES/frame of garbage (measured ~2.6 MB/frame on
+    // CarDemo → 74 gen2 GCs over 600 frames = a frame hitch every ~8 frames). These reused buffers make the
+    // steady-state refresh allocation-free (Clear keeps capacity; arrays grow only when the instance count does).
+    // The GPU upload reads them via CollectionsMarshal.AsSpan (no ToArray copy). Single-threaded with the GI pass.
+    LumenInstanceMeta[] metaReused = System.Array.Empty<LumenInstanceMeta>();
+    readonly List<uint> triClusterReused = new(256);
+    readonly List<uint> clusterTriReused = new(64);
+    readonly List<GpuClusterCard> cardListReused = new(64);
+
     // ---- per-triangle radiance cache (the "cards") — DOUBLE-BUFFERED for P4 temporal accumulation + multi-
     // bounce. Each frame the card-light pass WRITES the "current" buffer while READING the "previous": it EMA-
     // blends the new lit radiance over the previous (conservative temporal stabilization → kills the P2 noise
@@ -218,9 +229,13 @@ public sealed class Dx12LumenScene : IDisposable
 
         // #2A: build the per-instance meta AND the global triangle→cluster map + record (cluster) count in one
         // pass. The cache is sized by RecordCount (clusters), not TotalTriangles — the 30-50× shrink.
-        LumenInstanceMeta[] meta = BuildMetaArray(sceneAS, out int total, out int records, out uint[] triCluster, out uint[] clusTri, out GpuClusterCard[] cards);
+        BuildMetaArray(sceneAS, out int total, out int records);
         TotalTriangles = total;
         RecordCount = records;
+        ReadOnlySpan<LumenInstanceMeta> meta = metaReused.AsSpan(0, Math.Max(n, 1));
+        ReadOnlySpan<uint> triCluster = SpanOrOne(triClusterReused, ref oneU);
+        ReadOnlySpan<uint> clusTri = SpanOrOne(clusterTriReused, ref oneU);
+        ReadOnlySpan<GpuClusterCard> cards = SpanOrOne(cardListReused, ref oneCard);
 
         // Sıra 5: mesh-card texel grid. Armed by BALLISTIC_DX12_LUMEN_MESHCARDS=1 → TexelDim N (default 4, 16
         // texels/record); off → TexelDim 1 (legacy single-value record, cache byte-identical to pre-Sıra-5). The
@@ -323,8 +338,9 @@ public sealed class Dx12LumenScene : IDisposable
         // away here as `out _`) are NOT re-derived every moving frame — the big CPU loop over totalTris is skipped.
         // BALLISTIC_DX12_LUMEN_PARTIAL_REFRESH=0 reverts to the full rebuild (needTriMaps=true) for A/B.
         bool partial = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_PARTIAL_REFRESH") != "0";
-        LumenInstanceMeta[] meta = BuildMetaArray(sceneAS, out _, out _, out _, out _, out GpuClusterCard[] cards,
-                                                  needTriMaps: !partial);
+        BuildMetaArray(sceneAS, out _, out _, needTriMaps: !partial);
+        ReadOnlySpan<LumenInstanceMeta> meta = metaReused.AsSpan(0, Math.Max(sceneAS.InstanceCount, 1));
+        ReadOnlySpan<GpuClusterCard> cards = SpanOrOne(cardListReused, ref oneCard);
         // P0b: DEFER the old buffers' release — the GPU may still read them for the frame in flight under overlap
         // (immediate Dispose = use-after-free → device removal). Freed once the GPU passes the in-flight frame.
         dev.DeferredRelease(instanceMeta);
@@ -349,16 +365,17 @@ public sealed class Dx12LumenScene : IDisposable
     // pure waste (RefreshTransforms threw them away as `out _` anyway). On false they come back as empty 1-element
     // arrays (callers ignore them) and the per-triangle copy loop + totalTris allocation are skipped entirely.
     // Only the per-instance world meta + the world-space card frames (which DO depend on the matrix) are rebuilt.
-    LumenInstanceMeta[] BuildMetaArray(Dx12SceneAS sceneAS, out int total, out int records, out uint[] triCluster,
-                                       out uint[] clusterTri, out GpuClusterCard[] cards, bool needTriMaps = true)
+    // Fills the REUSED staging buffers (metaReused[0..n), triClusterReused, clusterTriReused, cardListReused) with
+    // this frame's per-instance meta + (when needTriMaps) the topology maps + the world-space card frames. Returns
+    // counts via out params; callers upload from the reused buffers via CollectionsMarshal.AsSpan (no ToArray copy).
+    // Allocation-free in steady state — the only growth is metaReused when the instance count rises.
+    void BuildMetaArray(Dx12SceneAS sceneAS, out int total, out int records, bool needTriMaps = true)
     {
         int n = sceneAS.InstanceCount;
-        var meta = new LumenInstanceMeta[Math.Max(n, 1)];
-        int totalTris = 0;
-        for (int i = 0; i < n; i++) totalTris += sceneAS.InstanceTriangleCount(i);
-        triCluster = needTriMaps ? new uint[Math.Max(totalTris, 1)] : new uint[1];
-        var clusterTriList = needTriMaps ? new List<uint>(Math.Max(totalTris / 64, 16)) : null;   // record → global representative tri
-        var cardList = new List<GpuClusterCard>(Math.Max(totalTris / 64, 16));   // record → WORLD-space card frame
+        if (metaReused.Length < Math.Max(n, 1)) metaReused = new LumenInstanceMeta[Math.Max(n, 1)];
+        triClusterReused.Clear();
+        clusterTriReused.Clear();
+        cardListReused.Clear();
 
         int offset = 0, clusterOffset = 0;
         for (int i = 0; i < n; i++)
@@ -371,11 +388,14 @@ public sealed class Dx12LumenScene : IDisposable
             if (needTriMaps)
             {
                 int copyN = Math.Min(tris, mc.TriToCluster.Length);
-                for (int t = 0; t < copyN; t++) triCluster[offset + t] = (uint)mc.TriToCluster[t];
+                // triClusterReused is global-tri-indexed; the list must reach offset+copyN. Append in tri order
+                // (the loop below visits instances in ascending offset, so the list stays index-aligned).
+                for (int t = 0; t < copyN; t++) triClusterReused.Add((uint)mc.TriToCluster[t]);
+                for (int t = copyN; t < tris; t++) triClusterReused.Add(0u);   // pad any tail (copyN<tris) to keep offset alignment
                 // Append this instance's cluster representatives in LOCAL-cluster order — that matches the global
-                // record index (clusterOffset + localCluster), so clusterTriList[record] is the representative.
+                // record index (clusterOffset + localCluster), so clusterTriReused[record] is the representative.
                 for (int c = 0; c < mc.ClusterFirstTri.Length; c++)
-                    clusterTriList.Add((uint)(offset + mc.ClusterFirstTri[c]));   // global representative tri index
+                    clusterTriReused.Add((uint)(offset + mc.ClusterFirstTri[c]));   // global representative tri index
             }
 
             // Sıra 5: transform each cluster's OBJECT-space card frame into WORLD space for THIS instance, in the
@@ -390,7 +410,7 @@ public sealed class Dx12LumenScene : IDisposable
                 Vector3 wv = Vector3.TransformNormal(card.V, w);
                 Vector3 wn = Vector3.TransformNormal(card.Normal, w);
                 float ulen = wu.Length(); float vlen = wv.Length();
-                cardList.Add(new GpuClusterCard
+                cardListReused.Add(new GpuClusterCard
                 {
                     Origin = wo, InvExtentU = card.InvExtentU / MathF.Max(ulen, 1e-6f),
                     U = ulen > 1e-6f ? wu / ulen : Vector3.UnitX, InvExtentV = card.InvExtentV / MathF.Max(vlen, 1e-6f),
@@ -399,7 +419,7 @@ public sealed class Dx12LumenScene : IDisposable
                 });
             }
 
-            meta[i] = new LumenInstanceMeta
+            metaReused[i] = new LumenInstanceMeta
             {
                 TriOffset = (uint)offset, TriCount = (uint)tris,
                 ClusterOffset = (uint)clusterOffset, ClusterCount = (uint)mc.ClusterCount,
@@ -410,10 +430,18 @@ public sealed class Dx12LumenScene : IDisposable
         }
         total = offset;
         records = clusterOffset;
-        clusterTri = (clusterTriList is { Count: > 0 }) ? clusterTriList.ToArray() : new uint[1];
-        cards = cardList.Count > 0 ? cardList.ToArray() : new GpuClusterCard[1];
-        return meta;
     }
+
+    // Upload helpers: a non-empty reused span, or a 1-element fallback span (the buffer must be valid even when the
+    // list is empty). Reads straight from the reused list's backing array — no per-frame ToArray allocation.
+    static ReadOnlySpan<T> SpanOrOne<T>(List<T> list, ref T[] oneFallback) where T : struct
+    {
+        if (list.Count > 0) return CollectionsMarshal.AsSpan(list);
+        oneFallback ??= new T[1];
+        return oneFallback;
+    }
+    uint[] oneU = new uint[1];
+    GpuClusterCard[] oneCard = new GpuClusterCard[1];
 
     public void Dispose()
     {
