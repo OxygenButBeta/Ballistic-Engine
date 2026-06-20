@@ -601,7 +601,7 @@ public sealed class DX12HDRenderer : HDRenderer
         // same relative order as today's inline frame (AP before transparents, fog before SSR; both
         // before SSAO). Was BuildAerialPerspective / BuildFog.
         apPass = new Dx12AerialPerspectivePass(dev);
-        fogPass = new Dx12FogPass(dev);
+        fogPass = new Dx12FogPass(dev, targetW, targetH);
         graph.Add(apPass);
         graph.Add(fogPass);
         // chunk 8: Transparents (event 450 — after Sky 350 + AP 400, before Fog/SSR). Resolution-independent

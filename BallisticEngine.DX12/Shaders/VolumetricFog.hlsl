@@ -30,7 +30,16 @@ cbuffer FogConstants : register(b0) {
 
 Texture2D      DepthTex      : register(t0);
 Texture2DArray ShadowCascades: register(t1);
+Texture2D      SceneTex      : register(t2);   // combine pass: full-res lit HDR scene (unused by the march)
+Texture2D      FogHalfTex    : register(t3);   // combine pass: half-res (scatter.rgb, transmittance.a)
 SamplerState   LinearClamp   : register(s0);
+SamplerState   PointClamp    : register(s1);   // combine: nearest-depth tap so a tile doesn't straddle a silhouette
+
+// HalfTexel = 1/half-res size (combine only); InvProjection for the depth-aware upsample (LinearDepth).
+cbuffer FogCombineConstants : register(b1) {
+    float4x4 InvProjection;   // transposed on upload
+    float2   HalfTexel;       float2 CombinePad;
+};
 
 static const float PI = 3.14159265359;
 static const float ALBEDO = 0.92;
@@ -134,8 +143,11 @@ float DustMotes(float3 worldPos) {
 }
 float DustField(float3 worldPos) { return DustMotes(worldPos); }
 
-float4 PSMain(VSOut i) : SV_Target {
-    float depth = DepthTex.SampleLevel(LinearClamp, i.Uv, 0).r;
+// The march. Output (scatter.rgb, transmittance.a). Run full-res (legacy blend path) OR half-res (the new
+// default; a PSCombine then depth-aware-upsamples + composites). Depth is point-sampled so a half-res sample's
+// world-pos reconstruction stays on ONE surface (a bilinear-blended depth across a silhouette smears the march).
+float4 PSMarch(VSOut i) : SV_Target {
+    float depth = DepthTex.SampleLevel(PointClamp, i.Uv, 0).r;
     float3 rayStart = CameraPos;
     bool isSky = depth >= 1.0;
     float3 endPos = WorldPos(i.Uv, min(depth, 0.999999));
@@ -227,6 +239,46 @@ float4 PSMain(VSOut i) : SV_Target {
     if (any(isnan(scatter)) || any(isinf(scatter))) scatter = 0;
 
     // Fog now composites in HDR (the scene target is R16F; the final composite tonemaps). Output RAW HDR
-    // scatter + transmittance; blend = dest*transmittance + scatter, all pre-tonemap. (Exposure unused.)
+    // scatter + transmittance; the composite = dest*transmittance + scatter, all pre-tonemap. (Exposure unused.)
     return float4(scatter, saturate(transmittance));
+}
+
+float LinearDepthFog(float d) {
+    float4 v = mul(float4(0.0, 0.0, d, 1.0), InvProjection);
+    return v.z / v.w;
+}
+// Component-SELECT NaN/Inf scrub (never mix(v,0,flag): NaN*0==NaN — the proven AMD leak). The EXR sun's
+// in-scatter can produce an Inf the bilinear upsample would otherwise turn into a screen-eating NaN.
+float4 SanitizeFog(float4 v) {
+    return float4(isnan(v.x) || isinf(v.x) ? 0.0 : v.x,
+                  isnan(v.y) || isinf(v.y) ? 0.0 : v.y,
+                  isnan(v.z) || isinf(v.z) ? 0.0 : v.z,
+                  isnan(v.w) || isinf(v.w) ? 0.0 : v.w);
+}
+
+// COMBINE: depth-aware bilinear upsample of the half-res (scatter, transmittance), then the SAME composite the
+// old fixed-function blend did — outColor = scene*transmittance + scatter. Mirrors Ssr.hlsl PSCombine; only the
+// final op differs (fog composite vs SSR's Fresnel lerp). Output is the new full-res scene color.
+float4 PSCombine(VSOut i) : SV_Target {
+    float3 scene = SceneTex.SampleLevel(LinearClamp, i.Uv, 0).rgb;
+
+    float2 fogSize = 1.0 / HalfTexel;
+    float2 pos = i.Uv * fogSize - 0.5;
+    float2 baseUV = (floor(pos) + 0.5) * HalfTexel;
+    float2 f = frac(pos);
+    float centerZ = LinearDepthFog(DepthTex.SampleLevel(LinearClamp, i.Uv, 0).r);
+
+    float4 acc = 0.0.xxxx; float wSum = 0.0;
+    [unroll] for (int k = 0; k < 4; k++) {
+        float2 corner = float2(k & 1, k >> 1);
+        float2 uv = baseUV + corner * HalfTexel;
+        float wBil = (corner.x > 0.5 ? f.x : 1.0 - f.x) * (corner.y > 0.5 ? f.y : 1.0 - f.y);
+        float tapZ = LinearDepthFog(DepthTex.SampleLevel(LinearClamp, uv, 0).r);
+        float wDepth = 1.0 / (1.0 + abs(tapZ - centerZ) * 2.0);
+        float w = wBil * wDepth + 1e-5;
+        acc += SanitizeFog(FogHalfTex.SampleLevel(LinearClamp, uv, 0)) * w;
+        wSum += w;
+    }
+    float4 fog = acc / wSum;            // fog.rgb = scatter, fog.a = transmittance
+    return float4(scene * fog.a + fog.rgb, 1.0);   // == the old blend dest*transmittance + scatter
 }
