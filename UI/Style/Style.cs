@@ -14,6 +14,26 @@ public sealed class Style
 
     internal Style(VisualElement el) => _el = el;
 
+    // --- imperative-override preservation (Unity parity for element.style.*) --------------------------
+    // Code/controls that set Style.* directly (a Slider sizing its track in its ctor; game code doing
+    // btn.Style.Width = 100) must SURVIVE a USS resolve. The resolver records the imperative declarations
+    // an element carries (captured the moment it's first resolved, as the diff from defaults) and re-applies
+    // them as the HIGHEST-precedence layer — exactly like UITK's inline element.style. We capture them ONCE
+    // (the first resolve, before any cascade has run) into _imperativeOverrides; subsequent resolves replay
+    // them. A control's ctor runs before the first resolve, so its ctor styles are captured.
+    string _imperativeOverrides;          // serialized "prop:val;" of the imperative deltas, or null
+    bool _capturedOverrides;
+
+    // Capture the current style as imperative overrides (diff vs a fresh default Style), once. Returns the
+    // serialized overrides to re-apply after reset+cascade.
+    internal string CaptureImperativeOverrides()
+    {
+        if (_capturedOverrides) return _imperativeOverrides;
+        _capturedOverrides = true;
+        _imperativeOverrides = StyleSerialize.DiffFromDefaults(this);
+        return _imperativeOverrides;
+    }
+
     // ---------------------------------------------------------------- layout: flex container
 
     FlexDirection _flexDirection = FlexDirection.Row; // web default (matches HTML <div>)

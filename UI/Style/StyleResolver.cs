@@ -31,6 +31,11 @@ public static class StyleResolver
     // change) where only the element + its inheriting subtree need re-resolving.
     public static void ResolveElement(VisualElement el, IReadOnlyList<StyleSheet> sheets, Style parentStyle)
     {
+        // Capture imperative (code/control) overrides ONCE before any cascade runs, so a control's ctor
+        // styles + game-code Style.* survive the from-scratch resolve as the highest-precedence layer
+        // (Unity element.style parity). Replayed at the very end below.
+        string imperative = el.Style.CaptureImperativeOverrides();
+
         el.Style.ResetToDefaults();
         el.Style.InheritFrom(parentStyle);
 
@@ -61,17 +66,22 @@ public static class StyleResolver
                     StyleApplier.ApplyInline(el.Style, matched[i].Declarations, StyleApplier.Pass.Important, vars);
                 if (!string.IsNullOrEmpty(el.InlineStyle))
                     StyleApplier.ApplyInline(el.Style, el.InlineStyle, StyleApplier.Pass.Important, vars);
-                return;
+            }
+            else if (!string.IsNullOrEmpty(el.InlineStyle))
+            {
+                StyleApplier.ApplyInline(el.Style, el.InlineStyle, StyleApplier.Pass.All, BuildVarStore(sheets));
             }
         }
-
-        // No matched rules — just inline (both passes; var store from sheets if any).
-        if (!string.IsNullOrEmpty(el.InlineStyle))
+        else if (!string.IsNullOrEmpty(el.InlineStyle))
         {
-            var vars = BuildVarStore(sheets);
-            StyleApplier.ApplyInline(el.Style, el.InlineStyle, StyleApplier.Pass.Normal, vars);
-            StyleApplier.ApplyInline(el.Style, el.InlineStyle, StyleApplier.Pass.Important, vars);
+            // No sheets — UXML inline only.
+            StyleApplier.ApplyInline(el.Style, el.InlineStyle, StyleApplier.Pass.All, null);
         }
+
+        // Imperative (code/control) overrides are the HIGHEST layer — re-applied last so they beat the
+        // cascade + inline, matching Unity's element.style precedence.
+        if (!string.IsNullOrEmpty(imperative))
+            StyleApplier.ApplyInline(el.Style, imperative, StyleApplier.Pass.All, null);
     }
 
     // Merge custom properties across all sheets (later sheets win) into one var resolver. Cheap: built
