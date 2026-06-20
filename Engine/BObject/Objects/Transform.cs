@@ -109,6 +109,28 @@ public class Transform : Component {
         }
     }
 
+    // ---- DECOUPLED-RENDER-THREAD support (BALLISTIC_DX12_RENDER_THREAD) ----
+    // The render thread must not call WorldMatrix: that getter LAZILY recomputes (writes cachedWorld, bumps
+    // worldVersion, walks the parent chain) and races the game thread's setters → torn matrices. Instead the
+    // game thread calls PublishWorldForRender() at the END of its Update (after all Tick/physics motion settled,
+    // when WorldMatrix is final), snapshotting the world matrix into `publishedWorld`. The render thread reads
+    // RenderMatrix, which returns that frozen copy — no recompute, no shared-state write, no race.
+    //
+    // When the render thread is OFF (the default), RenderMatrix falls straight through to WorldMatrix, so the
+    // single-threaded path is byte-identical and pays nothing (no publish step runs).
+    Matrix4 publishedWorld;
+    bool hasPublished;
+
+    // Game thread, end of frame: freeze this transform's current world matrix for the render thread to read.
+    public void PublishWorldForRender() {
+        publishedWorld = WorldMatrix;   // computed on the GAME thread (safe to touch the lazy cache here)
+        hasPublished = true;
+    }
+
+    // Render thread reads THIS, never WorldMatrix. Falls back to the live matrix until the first publish (the
+    // first frame) and whenever the render thread is disabled.
+    public Matrix4 RenderMatrix => hasPublished ? publishedWorld : WorldMatrix;
+
     public Transform? Parent { get; private set; }
 
     // The entity this transform belongs to. Lets hierarchy walks (e.g. Entity.IsActiveInHierarchy)

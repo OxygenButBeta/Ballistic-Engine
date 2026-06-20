@@ -113,12 +113,28 @@ public sealed class Dx12WindowedRuntime : GameWindow, IBallisticEngineRuntime, I
 
     protected override void OnRenderFrame(FrameEventArgs args) {
         if (swapChain == null) { base.OnRenderFrame(args); return; }
+        // Decoupled render thread: rendering + present happen on the render thread (driven from OnUpdateFrame via
+        // EngineLoop), NOT here. OnRenderFrame just pumps the OpenTK frame so the window stays responsive.
+        if (BallisticEngine.RenderThread.Enabled) { base.OnRenderFrame(args); Profiler.FrameMark(); return; }
+
         using (Profiler.Zone("RenderFrame"))
             WindowRenderCallback?.Invoke(args.Time);   // engine renders the scene into the renderer's LDR target
         var r = RenderAsset.Current.Renderer as DX12HDRenderer;
         if (r?.DisplayResource != null)
             swapChain.PresentTexture(r.DisplayResource, vsync: VSync);
         base.OnRenderFrame(args);
+        Profiler.FrameMark();
+    }
+
+    // Decoupled render thread: present the just-drawn LDR target. Called ON the render thread from EngineLoop
+    // after RenderCamera() has finished recording + submitting the frame. DXGI Present is thread-safe to call
+    // here; the swapchain is owned by this host. (The render thread also owns the DX12 frame submission, so the
+    // present's preceding EndFrame ran on the same thread — correct ordering.)
+    public void PresentFromRenderThread() {
+        if (swapChain == null) return;
+        var r = RenderAsset.Current.Renderer as DX12HDRenderer;
+        if (r?.DisplayResource != null)
+            swapChain.PresentTexture(r.DisplayResource, vsync: VSync);
         Profiler.FrameMark();
     }
 
