@@ -149,7 +149,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     System.IntPtr[] svgfAtrousCbMapped;
     int svgfAtrousCbStride;
     Dx12DescriptorHeap svgfSrv;                // temporal(6 srv+2 uav=8) + atrous iters(4 srv+2 uav=6 each)
-    Dx12OffscreenTarget svgfMoments, svgfMomentsPrev;   // RGBA16F: r=m2, g=N, b=camDist, a=variance (ping-pong by frame)
+    Dx12OffscreenTarget svgfMoments, svgfMomentsPrev;   // RGBA16F: r=m2, g=N, b=camDist, a=m1 (ping-pong by frame; variance lives in svgfVarA/B)
     Dx12OffscreenTarget svgfVarA, svgfVarB;             // R16F variance ping-pong for à-trous iterations
     Dx12OffscreenTarget svgfColorA, svgfColorB;         // RGBA16F color ping-pong for à-trous iterations
     bool svgfHistoryValid;
@@ -1469,7 +1469,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
 
         // SVGF buffers (all à-trous-res = E-res). moments/momentsPrev ping-pong cross-frame (pass-owned, NEVER
         // pooled); var/color A/B are per-frame à-trous scratch. All RGBA16F for a single consistent SRV/UAV path
-        // (variance lives in the .r channel of the var buffers; the moments buffer packs m2/N/camDist/variance).
+        // (variance lives in the .r channel of the var buffers; the moments buffer packs m2/N/camDist/m1 (variance is its own svgfVar buffers)).
         foreach (var b in new[] { svgfMoments, svgfMomentsPrev, svgfVarA, svgfVarB, svgfColorA, svgfColorB }) b?.Dispose();
         Dx12OffscreenTarget MkHdr() => new Dx12OffscreenTarget(dev, lw, lh, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
