@@ -1137,6 +1137,15 @@ public sealed class DX12HDRenderer : HDRenderer
     bool CpuBindless => cpuBindlessOn ??=
         Environment.GetEnvironmentVariable("BALLISTIC_DX12_CPU_BINDLESS") == "1";
 
+    // The renderer set to iterate this frame. On the decoupled render thread (BALLISTIC_DX12_RENDER_THREAD) the
+    // game thread published a STABLE snapshot (FrameSnapshot.RenderSet) that can't be mutated mid-draw by a
+    // spawn/destroy; off the render thread (the default + asset/AS paths) it's the live RuntimeSet. Identical
+    // membership either way — the snapshot is just a frozen copy taken at the end of Update.
+    static System.Collections.Generic.IReadOnlyCollection<IStaticMeshRenderer> RendererSet =>
+        FrameSnapshot.IsRenderThreadDrawing
+            ? (System.Collections.Generic.IReadOnlyCollection<IStaticMeshRenderer>)FrameSnapshot.RenderSet
+            : RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection;
+
     // R3a: BALLISTIC_DX12_GPUDRIVEN_SPLIT routes split-import renderers (SubMeshIndex >= 0, non-skinned,
     // single-shader) through the SAME GPU compute-cull + ExecuteIndirect path as whole-mesh, instead of the CPU
     // per-submesh loop — collapsing the last CPU-submit geometry path. **DEFAULT ON** (!= "0"): perceptual-parity
@@ -1340,7 +1349,7 @@ public sealed class DX12HDRenderer : HDRenderer
         if (gpuDrivenOn)
         {
             bool split = GpuDrivenSplit;
-            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
+            foreach (IStaticMeshRenderer r in RendererSet)
             {
                 if (r is not { IsActive: true, IsRenderable: true } || r.SharedMesh == null) continue;
                 if (r.SubMeshIndex < 0) wholeMeshRenderers.Add(r);
@@ -1454,7 +1463,7 @@ public sealed class DX12HDRenderer : HDRenderer
         if (cpuBindless)
         {
             bool allRegistered = true;
-            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
+            foreach (IStaticMeshRenderer r in RendererSet)
             {
                 if (r is null || !r.IsActive || !r.IsRenderable) continue;
                 if (gpuDrivenOn && r.SubMeshIndex < 0) continue;   // whole-mesh = GPU-driven, registered already
@@ -1524,7 +1533,7 @@ public sealed class DX12HDRenderer : HDRenderer
             }
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
 
-            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
+            foreach (IStaticMeshRenderer r in RendererSet)
             {
                 if (r is null || !r.IsActive || !r.IsRenderable) continue;
                 // Whole-mesh renderers are GPU-driven (compute cull + ExecuteIndirect) — skip them here.
@@ -1546,7 +1555,7 @@ public sealed class DX12HDRenderer : HDRenderer
                 if (vb?.Resource is null || ib?.Resource is null ||
                     nb?.Resource is null || ub?.Resource is null || tb?.Resource is null) continue;
 
-                Matrix4x4 model = r.Transform.WorldMatrix;
+                Matrix4x4 model = r.Transform.RenderMatrix;
                 Matrix4x4 mvp = model * viewProj;
 
                 Span<VertexBufferView> vbViews = stackalloc VertexBufferView[4];
@@ -1657,7 +1666,7 @@ public sealed class DX12HDRenderer : HDRenderer
             // root sig + PSO once, then draw every skinned renderer with the 6-stream layout + a bone SRV. ===
             int boneSlot = 0;
             bool skinnedStateSet = false;
-            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
+            foreach (IStaticMeshRenderer r in RendererSet)
             {
                 if (r is null || !r.IsActive || !r.IsRenderable || !r.IsSkinned) continue;
                 Mesh mesh = r.SharedMesh;
@@ -1693,7 +1702,7 @@ public sealed class DX12HDRenderer : HDRenderer
                 if (GpuDrivenSkinned && cpuBindless)
                 {
                     int vcount = vb.ElementCount;
-                    Matrix4x4 sModel = r.Transform.WorldMatrix;
+                    Matrix4x4 sModel = r.Transform.RenderMatrix;
                     Matrix4x4 sMvp = sModel * viewProj;
                     // Transition the bind-pose input streams to a compute-SRV-readable state (and back after).
                     cl.ResourceBarrierTransition(vb.Resource, ResourceStates.VertexAndConstantBuffer, ResourceStates.NonPixelShaderResource);
@@ -1735,7 +1744,7 @@ public sealed class DX12HDRenderer : HDRenderer
 
                 cl.SetGraphicsRootShaderResourceView(3, boneGpuAddr); // t6 bone matrices (root SRV)
 
-                Matrix4x4 model = r.Transform.WorldMatrix;
+                Matrix4x4 model = r.Transform.RenderMatrix;
                 Matrix4x4 mvp = model * viewProj;
 
                 Span<VertexBufferView> sViews = stackalloc VertexBufferView[6];
@@ -2146,7 +2155,7 @@ public sealed class DX12HDRenderer : HDRenderer
     unsafe void DrawRtShadows(Matrix4x4 viewProj, Vector3 lightDir)
     {
         var sceneAS = dxr.SceneAS; // shared scene AS (chunk 10)
-        sceneAS.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection);
+        sceneAS.Ensure(RendererSet);
         if (!sceneAS.Valid) return;
 
         // R2 / Decision 4: RT shadows is ALSO a consumer of the G-buffer-as-SRV — it reads gbuffer depth +
@@ -2222,10 +2231,10 @@ public sealed class DX12HDRenderer : HDRenderer
     int ComputeShadowCasterStamp()
     {
         var h = new System.HashCode();
-        foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
+        foreach (IStaticMeshRenderer r in RendererSet)
         {
             if (r is null || !r.IsActive || !r.IsRenderable) continue;
-            GLMatrix4 m = r.Transform.WorldMatrix;
+            GLMatrix4 m = r.Transform.RenderMatrix;
             h.Add(m.M11);
             h.Add(m.M12);
             h.Add(m.M13);
@@ -2332,7 +2341,7 @@ public sealed class DX12HDRenderer : HDRenderer
             // Cull shadow casters against THIS cascade's light frustum (a caster off-screen for the camera
             // but inside this cascade still casts — that's why we cull per the LIGHT frustum, not the camera).
             ExtractFrustumPlanes(cascadeMatrices[c]);
-            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
+            foreach (IStaticMeshRenderer r in RendererSet)
             {
                 if (r is null || !r.IsActive || !r.IsRenderable) continue;
                 // Whole-mesh casters are GPU-driven (per-cascade compute cull + ExecuteIndirect) — skip here.
@@ -2341,7 +2350,7 @@ public sealed class DX12HDRenderer : HDRenderer
                 if (mesh is null) continue;
                 if (mesh.VertexBuffer is not Dx12Buffer<GLVector3> vb || vb.Resource is null) continue;
                 if (mesh.IndexBuffer is not Dx12IndexBuffer ib || ib.Resource is null) continue;
-                Matrix4x4 model = r.Transform.WorldMatrix;
+                Matrix4x4 model = r.Transform.RenderMatrix;
                 Matrix4x4 lightMvp = model * cascadeMatrices[c];
                 int only = r.SubMeshIndex;
                 int first = only >= 0 ? only : 0;
@@ -2473,7 +2482,7 @@ public sealed class DX12HDRenderer : HDRenderer
 
     public override void PostRenderCleanUp()
     {
-        foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
+        foreach (IStaticMeshRenderer r in RendererSet)
             if (r != null)
                 r.RenderedThisFrame = false;
     }

@@ -27,7 +27,13 @@ using System.Threading;
 // the render-set copy, camera/light/volume freeze) is done by the main thread in EngineLoop; the actual DRAW
 // (renderCallback) is whatever the host renders — it reads the published snapshot through the same contracts.
 public sealed class RenderThread {
-    public static bool Enabled { get; } =
+    // The decoupled render thread is for the LIVE windowed player (game∥render overlap during real play). It is
+    // force-OFF on the headless capture path: that path renders a fixed number of deterministic frames and reads
+    // the target back per frame, so parallelism would only add a sync point with zero benefit (and the readback
+    // must see a fully-drawn frame). HeadlessSuppressed is set by the headless host at construction.
+    public static bool HeadlessSuppressed { get; set; }
+    public static bool Enabled =>
+        !HeadlessSuppressed &&
         System.Environment.GetEnvironmentVariable("BALLISTIC_DX12_RENDER_THREAD") == "1";
 
     readonly Thread renderThread;

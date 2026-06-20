@@ -30,6 +30,9 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
     static readonly bool ScreenshotExit = Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT_EXIT") != "0";
 
     public Dx12HeadlessRuntime(int width = 1920, int height = 1080) {
+        // The decoupled render thread is windowed-player-only — the headless capture path renders deterministic
+        // frames with a per-frame readback, so it must stay single-threaded (a fully-drawn frame before readback).
+        RenderThread.HeadlessSuppressed = true;
         window = new HeadlessWindow(width, height, this);
         Window = window;
     }

@@ -131,6 +131,11 @@ public class Transform : Component {
     // first frame) and whenever the render thread is disabled.
     public Matrix4 RenderMatrix => hasPublished ? publishedWorld : WorldMatrix;
 
+    // Render-thread-safe world position/rotation, derived from the FROZEN matrix (the camera view matrix reads
+    // these on the render thread). Identical to WorldPosition/WorldRotation when nothing was published (OFF path).
+    public Vector3 RenderWorldPosition => RenderMatrix.ExtractTranslation();
+    public Quaternion RenderWorldRotation => RenderMatrix.ExtractRotation();
+
     public Transform? Parent { get; private set; }
 
     // The entity this transform belongs to. Lets hierarchy walks (e.g. Entity.IsActiveInHierarchy)

@@ -31,8 +31,10 @@ public class HDCamera : Behaviour, IViewProjectionProvider
         // World-space, not local: the camera may be PARENTED (e.g. under a player controller), so it
         // must render from where it actually is in the world, not from its local offset near the
         // parent's origin. WorldRotation drives the basis so look direction follows the parent too.
-        Vector3 eye = transform.WorldPosition;
-        Quaternion worldRotation = transform.WorldRotation;
+        // Render-thread-safe: on the decoupled render thread these read the FROZEN published matrix; on the
+        // single-threaded path they fall through to the live WorldPosition/WorldRotation (byte-identical).
+        Vector3 eye = transform.RenderWorldPosition;
+        Quaternion worldRotation = transform.RenderWorldRotation;
         Vector3 forward = Vector3.Transform(Vector3.UnitZ, worldRotation);
         Vector3 up = Vector3.Transform(Vector3.UnitY, worldRotation);
         return BMatrix.LookAt(eye, eye + forward, up);
