@@ -117,9 +117,19 @@ Triage flow per phase: `bal perf <scene>` for the relative pass deltas + `Render
 - **Env door:** `BALLISTIC_DX12_PP1_INLINE_SYNCS=0` restores the old `ExecuteSync`/`ExecuteUpload`.
 - **Gate:** byte-identical on full matrix; Tracy shows the two mid-frame GPU bubbles gone (one continuous graphics lane); Lumen stability gate (shadow timing feeds GI).
 
-### PP2 — Lumen à-trous denoise: full-res → half-res + depth-aware upsample
+### PP2 — Lumen à-trous denoise: full-res → half-res + depth-aware upsample — ❌ CANCELLED (premise refuted by source)
 
-- **Goal:** halve the denoise pass cost by running the à-trous spatial denoise at half resolution then depth-aware-upsampling, matching SSR's existing half-res pattern.
+> **2026-06-20 verdict: do NOT implement.** Reading the real code refuted the premise. The Lumen front end
+> ALREADY has a resolution-scale knob (`BALLISTIC_DX12_LUMEN_RESSCALE`, `Dx12LumenGiPass.Resize`) that runs the
+> whole GI chain — trace + integrate + **denoise** + temporal — at half/quarter res with a depth-aware upsample
+> in combine. It is deliberately defaulted to FULL-res because it was **measured** on the RX 9070 XT: half/quarter
+> res gave **NO perf win** (Lumen here is RT-traversal/dispatch-bound, not pixel-bound) and **cost quality**
+> (Cornell/Bistro hotspot +5–8%, a visible 2×2 block sparkle at half-res probes). Post-SH-cache Lumen is ~0.15ms
+> total (`bal perf`), so the denoise sub-pass is well under 0.1ms — there is no half-res win to capture, only a
+> quality regression to re-introduce. The plan's "denoise is GPU-heavy" came from the PASS_TIMING-inflated
+> triage number; the real pipelined cost is already negligible. **Skipped, gerekçeli.**
+
+- **Goal (obsolete):** halve the denoise pass cost by running the à-trous spatial denoise at half resolution then depth-aware-upsampling, matching SSR's existing half-res pattern.
 - **Files/symbols:** the Lumen à-trous denoise pass under `BallisticEngine.DX12/Lumen/` (the per-pixel indirect spatial denoise referenced in `lumen-v2-replacement.md` as P7 #1b, deferred there). Add a half-res target from the transient RT pool + a depth-aware upsample step (reuse SSR's depth-aware upsample pattern — do NOT hand-roll a new one).
 - **Mechanism:** denoise at half-res, bilateral/depth-aware upsample to full-res before the indirect is added into HDR color.
 - **Hazards:** this is **quality-affecting** (half-res denoise ≠ byte-identical). Gated on the **Lumen stability + visual-parity** bar, NOT byte-identical — call it out in the commit. Half-res denoise amplifies fireflies if inputs aren't sanitized — confirm the existing NaN-scrub ternaries survive (the `lerp(v,0,flag)` AMD trap rule).

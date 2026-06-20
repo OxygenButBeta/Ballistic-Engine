@@ -319,7 +319,12 @@ public sealed class Dx12LumenScene : IDisposable
         // Re-cluster is a cached per-mesh no-op (topology unchanged), so this just rebuilds the meta with the same
         // cluster offsets + re-uploads world matrices. The triToCluster map is unchanged → not re-uploaded. Sıra 5:
         // the card frames ARE world-space, so a moved instance needs them re-uploaded too (rebuilt by BuildMetaArray).
-        LumenInstanceMeta[] meta = BuildMetaArray(sceneAS, out _, out _, out _, out _, out GpuClusterCard[] cards);
+        // PP3: pass needTriMaps=false so the per-triangle triCluster/clusterTri maps (topology-invariant, and thrown
+        // away here as `out _`) are NOT re-derived every moving frame — the big CPU loop over totalTris is skipped.
+        // BALLISTIC_DX12_LUMEN_PARTIAL_REFRESH=0 reverts to the full rebuild (needTriMaps=true) for A/B.
+        bool partial = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_PARTIAL_REFRESH") != "0";
+        LumenInstanceMeta[] meta = BuildMetaArray(sceneAS, out _, out _, out _, out _, out GpuClusterCard[] cards,
+                                                  needTriMaps: !partial);
         // P0b: DEFER the old buffers' release — the GPU may still read them for the frame in flight under overlap
         // (immediate Dispose = use-after-free → device removal). Freed once the GPU passes the in-flight frame.
         dev.DeferredRelease(instanceMeta);
@@ -338,15 +343,21 @@ public sealed class Dx12LumenScene : IDisposable
     // Per-instance {triOffset, triCount, clusterOffset, clusterCount, world} + the GLOBAL triangle→local-cluster
     // map + the record→global-representative-tri map + the total record (cluster) count. Shared by Rebuild
     // (topology change) and RefreshTransforms (motion only — clustering is mesh-cached so re-calling is cheap).
+    // PP3: `needTriMaps` controls whether the topology-only triangle→cluster / cluster→tri maps are (re)built.
+    // Rebuild (topology change) passes true. RefreshTransforms (motion only — same topology) passes false: those
+    // two maps are index-into-mesh, INVARIANT under instance motion, so re-deriving them every moving frame is
+    // pure waste (RefreshTransforms threw them away as `out _` anyway). On false they come back as empty 1-element
+    // arrays (callers ignore them) and the per-triangle copy loop + totalTris allocation are skipped entirely.
+    // Only the per-instance world meta + the world-space card frames (which DO depend on the matrix) are rebuilt.
     LumenInstanceMeta[] BuildMetaArray(Dx12SceneAS sceneAS, out int total, out int records, out uint[] triCluster,
-                                       out uint[] clusterTri, out GpuClusterCard[] cards)
+                                       out uint[] clusterTri, out GpuClusterCard[] cards, bool needTriMaps = true)
     {
         int n = sceneAS.InstanceCount;
         var meta = new LumenInstanceMeta[Math.Max(n, 1)];
         int totalTris = 0;
         for (int i = 0; i < n; i++) totalTris += sceneAS.InstanceTriangleCount(i);
-        triCluster = new uint[Math.Max(totalTris, 1)];
-        var clusterTriList = new List<uint>(Math.Max(totalTris / 64, 16));   // record → global representative tri
+        triCluster = needTriMaps ? new uint[Math.Max(totalTris, 1)] : new uint[1];
+        var clusterTriList = needTriMaps ? new List<uint>(Math.Max(totalTris / 64, 16)) : null;   // record → global representative tri
         var cardList = new List<GpuClusterCard>(Math.Max(totalTris / 64, 16));   // record → WORLD-space card frame
 
         int offset = 0, clusterOffset = 0;
@@ -354,12 +365,18 @@ public sealed class Dx12LumenScene : IDisposable
         {
             int tris = sceneAS.InstanceTriangleCount(i);
             var mc = Dx12LumenCluster.Cluster(sceneAS.InstanceMesh(i));
-            int copyN = Math.Min(tris, mc.TriToCluster.Length);
-            for (int t = 0; t < copyN; t++) triCluster[offset + t] = (uint)mc.TriToCluster[t];
-            // Append this instance's cluster representatives in LOCAL-cluster order — that matches the global
-            // record index (clusterOffset + localCluster), so clusterTriList[record] is the representative.
-            for (int c = 0; c < mc.ClusterFirstTri.Length; c++)
-                clusterTriList.Add((uint)(offset + mc.ClusterFirstTri[c]));   // global representative tri index
+            // PP3: the triangle→cluster + cluster→tri maps are topology-only (no world matrix) — skip when the
+            // caller (RefreshTransforms) doesn't need them. The clustering itself (Dx12LumenCluster.Cluster) is
+            // mesh-cached either way, so this only skips the per-triangle copy + the representative-list append.
+            if (needTriMaps)
+            {
+                int copyN = Math.Min(tris, mc.TriToCluster.Length);
+                for (int t = 0; t < copyN; t++) triCluster[offset + t] = (uint)mc.TriToCluster[t];
+                // Append this instance's cluster representatives in LOCAL-cluster order — that matches the global
+                // record index (clusterOffset + localCluster), so clusterTriList[record] is the representative.
+                for (int c = 0; c < mc.ClusterFirstTri.Length; c++)
+                    clusterTriList.Add((uint)(offset + mc.ClusterFirstTri[c]));   // global representative tri index
+            }
 
             // Sıra 5: transform each cluster's OBJECT-space card frame into WORLD space for THIS instance, in the
             // SAME local-cluster order → record-indexed. Origin = point (w=1); U/V/Normal = directions (w=0). The
@@ -393,7 +410,7 @@ public sealed class Dx12LumenScene : IDisposable
         }
         total = offset;
         records = clusterOffset;
-        clusterTri = clusterTriList.Count > 0 ? clusterTriList.ToArray() : new uint[1];
+        clusterTri = (clusterTriList is { Count: > 0 }) ? clusterTriList.ToArray() : new uint[1];
         cards = cardList.Count > 0 ? cardList.ToArray() : new GpuClusterCard[1];
         return meta;
     }
