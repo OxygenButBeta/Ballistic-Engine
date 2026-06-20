@@ -2465,8 +2465,8 @@ public sealed class DX12HDRenderer : HDRenderer
                 },
                 new
                 {
-                    name = "normal", file = "normal.bin", format = "R16G16B16A16_Float", bytesPerPixel = normalBpp,
-                    encoding = "world normal PACKED as N*0.5+0.5 in RGB (half floats); unpack N = rgb*2-1"
+                    name = "normal", file = "normal.bin", format = Dx12GBuffer.ColorFormats[1].ToString(), bytesPerPixel = normalBpp,
+                    encoding = "world normal PACKED as N*0.5+0.5 in RGB; unpack N = rgb*2-1 (RGB10A2 when GBUFFER_PACK, else RGBA16F)"
                 },
                 new
                 {

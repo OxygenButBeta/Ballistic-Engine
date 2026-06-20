@@ -23,12 +23,20 @@ public sealed class Dx12GBuffer : IDisposable {
     public const int RtCount = 5;          // total MRTs (4 shaded + 1 motion)
     public const int ShadedRtCount = 4;    // G0..G3 — the surface attributes the deferred lighting pass reads
     public const int MotionRtIndex = 4;    // RG16F screen-space motion (TAA reprojection + FSR upscaler)
+    // BANDWIDTH PACK (BALLISTIC_DX12_GBUFFER_PACK=1, opt-in): normal RGBA16F(8B)→RGB10A2_UNorm(4B) and
+    // emissive RGBA16F(8B)→R11G11B10_Float(4B). The geo-pass MRT write drops 8B/px and every reader (GTAO/SSR/
+    // RTAO/deferred/Lumen) reads less. RGB10A2 is chosen over an oct-encode so NO reader shader changes: the
+    // normal is already stored [0,1] (N*0.5+0.5) and HW normalises RGB10A2 reads back to [0,1] — the existing
+    // rgb*2-1 decode works verbatim. Emissive R11G11B10F max ≈ 65024 covers material emissive (not the EXR sun,
+    // which is in SceneColor, not the G-buffer). Read ONCE at static init so RTV/SRV/UAV/PSO all derive the same
+    // format from this array; default OFF keeps the shipping path byte-identical.
+    static readonly bool Pack = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GBUFFER_PACK") == "1";
     public static readonly Format[] ColorFormats = {
-        Format.R8G8B8A8_UNorm_SRgb,     // albedo + specF0
-        Format.R16G16B16A16_Float,      // world normal
-        Format.R8G8B8A8_UNorm,          // metallic/roughness/ao/flags
-        Format.R16G16B16A16_Float,      // emissive (HDR)
-        Format.R16G16_Float,            // motion vectors (prevUV - currUV)
+        Format.R8G8B8A8_UNorm_SRgb,                                   // albedo + specF0
+        Pack ? Format.R10G10B10A2_UNorm : Format.R16G16B16A16_Float,  // world normal
+        Format.R8G8B8A8_UNorm,                                        // metallic/roughness/ao/flags
+        Pack ? Format.R11G11B10_Float   : Format.R16G16B16A16_Float,  // emissive (HDR)
+        Format.R16G16_Float,                                          // motion vectors (prevUV - currUV)
     };
     public const Format DepthFormat = Format.D32_Float;
 
@@ -39,6 +47,7 @@ public sealed class Dx12GBuffer : IDisposable {
         Format.R8G8B8A8_UNorm      => Format.R8G8B8A8_Typeless,
         Format.R16G16B16A16_Float  => Format.R16G16B16A16_Typeless,
         Format.R16G16_Float        => Format.R16G16_Typeless,
+        Format.R10G10B10A2_UNorm   => Format.R10G10B10A2_Typeless,   // packed normal (no _Typeless for R11G11B10F → default)
         _ => shaded,
     };
     // The format the resolve UAV writes through (SRGB → plain UNORM; floats unchanged).
