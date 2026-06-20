@@ -61,7 +61,77 @@ internal static class ImGuiBoundaryTests {
             offendingSources.Count == 0,
             offendingSources.Count == 0 ? "" : "leaked in: " + string.Join(", ", offendingSources));
 
+        // 3) RATCHET (Phase-9 strict, in progress): inside the editor, panel/window BODIES should draw
+        //    through the IEditorGui seam, not raw ImGui. The EditorWindow-framework migration removes ImGui
+        //    from Panels\ + Windows\ one file at a time. This check freezes the CURRENT set: every Panels\ or
+        //    Windows\ .cs that still imports ImGui must be on PendingImGuiMigration, and the list must have no
+        //    STALE entries (a file that no longer imports ImGui must be dropped). So a NEW leak fails, a
+        //    REGRESSION that re-adds ImGui to a migrated panel fails, and finishing a migration without
+        //    pruning the list fails — the only green path is forward. When the list empties, this becomes the
+        //    absolute "no ImGui in Panels/Windows" guard. Seam adapters that legitimately keep style/ScalarField
+        //    raw-ImGui (the plan's pragmatic boundary) stay on the list permanently; everything else burns down.
+        string panelsDir = Path.Combine(repoRoot, EditorProjectDir, "Panels") + Path.DirectorySeparatorChar;
+        string windowsDir = Path.Combine(repoRoot, EditorProjectDir, "Windows") + Path.DirectorySeparatorChar;
+        var importsImGui = new List<string>();
+        foreach (string cs in Directory.EnumerateFiles(repoRoot, "*.cs", SearchOption.AllDirectories)) {
+            if (IsUnderGeneratedOrBin(repoRoot, cs)) continue;
+            string full = Path.GetFullPath(cs);
+            bool underPanels = full.StartsWith(panelsDir, StringComparison.OrdinalIgnoreCase);
+            bool underWindows = full.StartsWith(windowsDir, StringComparison.OrdinalIgnoreCase);
+            if (!underPanels && !underWindows) continue;
+            // A real `using` line — not a comment that merely names the namespace (the example/test files).
+            if (HasImGuiUsing(ReadSafe(cs)))
+                importsImGui.Add(Rel(repoRoot, cs));
+        }
+        var allow = new HashSet<string>(PendingImGuiMigration, StringComparer.OrdinalIgnoreCase);
+        var unexpected = importsImGui.Where(f => !allow.Contains(f)).ToList();
+        var stale = PendingImGuiMigration.Where(f => !importsImGui.Contains(f, StringComparer.OrdinalIgnoreCase)).ToList();
+        h.Check("No NEW raw-ImGui leak into Panels/Windows (migrate through IEditorGui)",
+            unexpected.Count == 0,
+            unexpected.Count == 0 ? "" : "not on the allowlist: " + string.Join(", ", unexpected));
+        h.Check("No STALE Panels/Windows allowlist entries (prune as panels migrate)",
+            stale.Count == 0,
+            stale.Count == 0 ? "" : "migrated — remove from PendingImGuiMigration: " + string.Join(", ", stale));
+
         return h.Report("ImGuiBoundary");
+    }
+
+    // The Panels\/Windows\ .cs files that STILL draw with raw ImGui, pending their EditorWindow-framework
+    // migration. The ratchet above forbids any file NOT on this list from importing ImGui, and forbids stale
+    // entries — so the list can only shrink. Paths are repo-relative with forward slashes.
+    // (Standalone windows are all migrated; Windows\ carries none here.)
+    static readonly string[] PendingImGuiMigration = {
+        // Inspector — the big one (Phase 7): the panel shell + its adapters/preview/layout subfiles. Several
+        // adapters legitimately keep style/ScalarField raw-ImGui (the plan's pragmatic boundary) and stay.
+        "BallisticEngine.Editor/Panels/InspectorPanel.cs",
+        "BallisticEngine.Editor/Panels/Inspector/Adapters/ScalarField.cs",
+        "BallisticEngine.Editor/Panels/Inspector/Adapters/ImGuiVolumeGui.cs",
+        "BallisticEngine.Editor/Panels/Inspector/Adapters/ImGuiComponentGui.cs",
+        "BallisticEngine.Editor/Panels/Inspector/Preview/ComponentPreviews.cs",
+        "BallisticEngine.Editor/Panels/Inspector/InspectorLayout.cs",
+        "BallisticEngine.Editor/Panels/Inspector/AssetInspectors/AssetInspectors.cs",
+        // Hierarchy + Assets (Phase 5): drag-drop heavy, needs seam drag-drop/context-menu first.
+        "BallisticEngine.Editor/Panels/HierarchyPanel.cs",
+        "BallisticEngine.Editor/Panels/AssetBrowserPanel.cs",
+        // Console (Phase-1 EditorWindow; body still raw — per-row severity PushStyleColor tinting).
+        "BallisticEngine.Editor/Panels/ConsolePanel.cs",
+        // Inline inspector drawers (Phase 7): VolumeProfile + BEvent — custom-header ImGui, plan-exempt.
+        "BallisticEngine.Editor/Panels/VolumeProfileEditor.cs",
+        "BallisticEngine.Editor/Panels/BEventEditor.cs",
+        // Viewport overlay — bespoke window flags + pivot positioning; doesn't fit the dockable model (exempt).
+        "BallisticEngine.Editor/Panels/StatsPanel.cs",
+    };
+
+    // True if the text has a real `using Hexa.NET.ImGui;` directive (start of a line, ignoring leading space),
+    // not just a comment mentioning the namespace.
+    static bool HasImGuiUsing(string text) {
+        foreach (string raw in text.Split('\n')) {
+            string line = raw.TrimStart();
+            if (line.StartsWith("using " + ImGuiNamespace, StringComparison.Ordinal) &&
+                (line.Contains(";", StringComparison.Ordinal)))
+                return true;
+        }
+        return false;
     }
 
     // Walk up from the harness's base directory to the repo root (the dir containing BallisticEngine.slnx).
