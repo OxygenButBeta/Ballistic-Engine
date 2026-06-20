@@ -1,5 +1,6 @@
 using System;
 using Hexa.NET.ImGui;
+using SysVec2 = System.Numerics.Vector2;
 using SysVec3 = System.Numerics.Vector3;
 
 namespace BallisticEngine.Editor.Inspector;
@@ -25,7 +26,9 @@ public sealed class ImGuiVolumeGui : IInspectorGui {
         ImGui.TableSetColumnIndex(0);
 
         bool overridden = p.Overridden;
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new SysVec2(2, 2) * EditorTheme.UiScale);
         if (ImGui.Checkbox("##override", ref overridden)) { p.Overridden = overridden; overrideChanged = true; }
+        ImGui.PopStyleVar();
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip(overridden ? "Overriding. Click to use the default." : "Click to override this parameter.");
 
@@ -49,21 +52,26 @@ public sealed class ImGuiVolumeGui : IInspectorGui {
     public void Space(float h) { }
     public void HelpBox(string t) { ImGui.TextDisabled(t); }
 
-    public bool Checkbox(ref bool v) => ImGui.Checkbox("##v", ref v);
+    public bool Checkbox(ref bool v) {
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new SysVec2(2, 2) * EditorTheme.UiScale);
+        bool changed = ImGui.Checkbox("##v", ref v);
+        ImGui.PopStyleVar();
+        return changed;
+    }
     public bool SliderFloat(ref float v, float min, float max) {
         ImGui.PushStyleColor(ImGuiCol.SliderGrab, EditorTheme.SliderGrabRest);   // EF11: legible value over the grab
-        bool changed = ImGui.SliderFloat("##v", ref v, min, max);
+        bool changed = ScalarField.SliderFloat("##v", ref v, min, max, "%.3f");  // double-click to type
         ImGui.PopStyleColor();
         return changed;
     }
-    public bool DragFloat(ref float v, float speed) => ImGui.DragFloat("##v", ref v, speed);
+    public bool DragFloat(ref float v, float speed) => ScalarField.DragFloat("##v", ref v, speed, 0, 0, "%.3f");
     public bool SliderInt(ref int v, int min, int max) {
         ImGui.PushStyleColor(ImGuiCol.SliderGrab, EditorTheme.SliderGrabRest);   // EF11: legible value over the grab
-        bool changed = ImGui.SliderInt("##v", ref v, min, max);
+        bool changed = ScalarField.SliderInt("##v", ref v, min, max);
         ImGui.PopStyleColor();
         return changed;
     }
-    public bool DragInt(ref int v) => ImGui.DragInt("##v", ref v);
+    public bool DragInt(ref int v) => ScalarField.DragInt("##v", ref v);
     public bool InputText(ref string v, int maxLength) => ImGui.InputText("##v", ref v, (uint)maxLength);
     public bool Combo(ref int index, string[] names) => ImGui.Combo("##v", ref index, names, names.Length);
     public bool ColorEdit3(ref SysVec3 v, bool hdr) =>

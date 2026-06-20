@@ -311,6 +311,17 @@ internal sealed class ImGuiController : IDisposable {
     // NOTE: the bg0..titleBg ramp below is mirrored byte-for-byte in EditorTheme (Bg0..TitleBg) for the
     // in-viewport overlay chrome — RETUNE EditorTheme TOO when this changes (its comment mandates the sync).
     static void ApplyColors(SysVec4 accent) {
+        // A/B doors: env-var swaps in a ported theme instead of the engine's graphite palette, for
+        // comparison. Off by default — the graphite theme is the default.
+        if (Environment.GetEnvironmentVariable("BALLISTIC_SPECTRUM") == "1") {
+            SpectrumTheme.Apply();
+            return;
+        }
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DRACULA") == "1") {
+            DraculaTheme.Apply();
+            return;
+        }
+
         var c = ImGui.GetStyle().Colors;
 
         // EF5i — NEUTRAL graphite ramp + warm amber accent (user rejected the EF5e/h blue cast: "bu genel

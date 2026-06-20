@@ -532,6 +532,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             Prettify(b.GetType().Name).Contains(componentQuery, StringComparison.OrdinalIgnoreCase);
 
         var typeIndex = new Dictionary<Type, int>();
+        var componentOrdinal = 0;   // running count of DRAWN components, for alternating body-bg banding
         foreach (Behaviour behaviour in behaviours) {
             Type bt = behaviour.GetType();
             int idx = typeIndex.TryGetValue(bt, out int i) ? i : 0;
@@ -540,7 +541,11 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             // Nth-of-type index) even for components the filter hides, so hiding a component never shifts a
             // visible sibling's index. Increment FIRST (above), then skip the draw.
             if (!ComponentMatch(behaviour)) continue;
-            DrawComponent(entity, behaviour, idx);
+            // Breathing room between component blocks (the banding reads as separate cards). Skip before
+            // the first one so it sits snug under the transform/tag rows.
+            if (componentOrdinal > 0)
+                ImGui.Dummy(new SysVec2(0, 6 * EditorTheme.UiScale));
+            DrawComponent(entity, behaviour, idx, componentOrdinal++);
         }
 
         ImGui.Spacing();
@@ -844,9 +849,20 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         return open;
     }
 
-    void DrawComponent(Entity entity, Behaviour behaviour, int typeIndex = 0) {
+    void DrawComponent(Entity entity, Behaviour behaviour, int typeIndex = 0, int componentOrdinal = 0) {
         Type type = behaviour.GetType();
         ImGui.PushID(behaviour.InstanceId.GetHashCode());
+
+        // Component-level background banding: paint each component's WHOLE body (header + members) in an
+        // alternating tint so adjacent components separate as blocks (the grouping the user asked for),
+        // replacing the per-row zebra. Immediate mode can't draw behind content we haven't laid out yet,
+        // so split the window draw list: content goes on channel 1, and after we know the body's height we
+        // fill the band on channel 0 (behind it), then merge. The bands are a hair lighter/darker than the
+        // panel so they read as "two close tones", not stripes.
+        var draw = ImGui.GetWindowDrawList();
+        draw.ChannelsSplit(2);
+        draw.ChannelsSetCurrent(1);
+        SysVec2 bandStart = ImGui.GetCursorScreenPos();
 
         bool enabled = behaviour.IsEnabled;
         bool open = ComponentHeader(Prettify(type.Name), type, ref enabled, out bool menuRequested);
@@ -926,6 +942,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                 entity.RemoveComponent(behaviour);
                 state.MarkViewportDirty();
             });
+            draw.ChannelsMerge();   // balance the split before the early-out (component is being removed)
             ImGui.PopID();
             return;
         }
@@ -944,6 +961,21 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
             ImGui.Spacing();
         }
+
+        // Fill the component's body band behind everything (channel 0), then merge. Span the full panel
+        // width regardless of inner tables. Even/odd ordinal alternates between two close tints so each
+        // component is its own block and the next is a near neighbour, not a hard contrast.
+        float bandEndY = ImGui.GetCursorScreenPos().Y;
+        float wx0 = ImGui.GetWindowPos().X;
+        float wx1 = wx0 + ImGui.GetWindowSize().X;
+        // Every component body gets the SAME card wash so each reads as a distinct raised surface; the
+        // gap between components (Dummy in the draw loop) separates them. Visible enough to actually read
+        // as a card on the dark panel (the previous ~2% was invisible), but still subtle.
+        SysVec4 band = new SysVec4(1f, 1f, 1f, 0.05f);
+        draw.ChannelsSetCurrent(0);
+        draw.AddRectFilled(new SysVec2(wx0, bandStart.Y - 2), new SysVec2(wx1, bandEndY + 4),
+                           ImGui.GetColorU32(band), 6f);
+        draw.ChannelsMerge();
 
         ImGui.PopID();
     }
@@ -1072,11 +1104,15 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
         SysVec2 cursor = ImGui.GetCursorScreenPos();
 
-        // Enable checkbox right after the disclosure arrow.
+        // Enable checkbox right after the disclosure arrow. The global FramePadding is roomy for inputs,
+        // which makes a checkbox (sized FontSize + FramePadding*2) read as oversized in a header — shrink
+        // the padding just for the box so the tick stays proportionate to the title text.
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new SysVec2(2, 2) * EditorTheme.UiScale);
         float frameH = ImGui.GetFrameHeight();
         float chkX = min.X + arrowW;
         ImGui.SetCursorScreenPos(new SysVec2(chkX, min.Y + (headerH - frameH) * 0.5f));
         ImGui.Checkbox($"##en_{label}", ref enabled);
+        ImGui.PopStyleVar();
 
         // Type icon + label after the checkbox. EF5e: the component title uses the larger semantic HEADER
         // font (not body-size Bold) so a component header reads as a real header — the type-scale hierarchy
@@ -1388,11 +1424,16 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         float h = ImGui.GetFrameHeight();
         float rounding = ImGui.GetStyle().FrameRounding;
 
-        draw.AddRectFilled(pos, pos + new SysVec2(chipW, h), ImGui.GetColorU32(color),
+        // Calmer than a saturated filled chip (which made vector rows read as noisy): a NEUTRAL chip
+        // background (same family as the field) with the axis color carried only by the LETTER. The axis
+        // is still instantly readable, but three bright blocks per row no longer fight the rest of the UI.
+        SysVec4 chipBg = ImGui.GetStyle().Colors[(int)ImGuiCol.FrameBg];
+        draw.AddRectFilled(pos, pos + new SysVec2(chipW, h),
+            ImGui.GetColorU32(new SysVec4(chipBg.X, chipBg.Y, chipBg.Z, 1f)),
             rounding, ImDrawFlags.RoundCornersLeft);
         SysVec2 ts = ImGui.CalcTextSize(letter);
         draw.AddText(pos + new SysVec2((chipW - ts.X) * 0.5f, (h - ts.Y) * 0.5f),
-            ImGui.GetColorU32(new SysVec4(0.07f, 0.08f, 0.09f, 1f)), letter);
+            ImGui.GetColorU32(color), letter);
 
         ImGui.Dummy(new SysVec2(chipW, h));
         ImGui.SameLine(0, 0);
@@ -2873,11 +2914,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         float x0 = ImGui.GetWindowPos().X;
         float x1 = x0 + ImGui.GetWindowSize().X;
 
-        // Zebra: every other row gets a faint white wash (alternating bands). Cheap — one TableSetBgColor.
-        bool oddRow = (rowZebraIndex++ & 1) == 1;
-        if (oddRow)
-            ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0,
-                ImGui.GetColorU32(new SysVec4(1f, 1f, 1f, 0.022f)));
+        // Per-row zebra striping was removed — it read as noisy. Component-level background banding
+        // (DrawComponent paints each component's whole body in an alternating tint) gives the grouping
+        // rhythm instead. The counter is kept (harmless) so callers/Reset stay valid.
+        rowZebraIndex++;
 
         bool hovered = ImGui.IsWindowHovered(ImGuiHoveredFlags.ChildWindows) &&
                        ImGui.IsMouseHoveringRect(new SysVec2(x0, rowStart.Y),
