@@ -869,7 +869,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             // DBG: BALLISTIC_DX12_LUMEN_NOACCUM=1 forces history off every frame → each frame is a raw single-sample
             // trace+filter+integrate, no temporal masking. This is exactly what the user sees UNDER MOTION (history
             // can't accumulate while reprojecting) — the honest noise metric. Static capture hides it (EMA converges).
-            HistoryValid = (spHistoryValid && Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOACCUM") != "1") ? 1f : 0f,
+            HistoryValid = (spHistoryValid && Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOACCUM") != "1" && Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_PROBE_EMA_OFF") != "1") ? 1f : 0f,
             ProbeEma = EnvF("BALLISTIC_DX12_LUMEN_PROBE_EMA", 0.1f),   // this-frame weight; low = strong accumulation
             TexelDim = scene.TexelDim,
             SpPad1 = EnvF("BALLISTIC_DX12_LUMEN_PROBE_FILTER_RADIUS", 2f),   // probe-space spatial filter radius (blob fix)
