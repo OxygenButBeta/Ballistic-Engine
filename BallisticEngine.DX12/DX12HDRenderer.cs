@@ -1145,6 +1145,13 @@ public sealed class DX12HDRenderer : HDRenderer
     bool GpuDrivenSplit => gpuDrivenSplitOn ??=
         Environment.GetEnvironmentVariable("BALLISTIC_DX12_GPUDRIVEN_SPLIT") == "1";
 
+    // R3b opt-in: BALLISTIC_DX12_GPUDRIVEN_SKINNED=1 skins on the compute path into transient buffers, then draws
+    // the skinned result through the static GPU-driven bindless path (no skinned VS / skinned PSO). Default OFF
+    // (a new compute pass + UAV<->vertex state dance — DRED + SkinTest byte-identical gated before default-ON).
+    bool? gpuDrivenSkinnedOn;
+    bool GpuDrivenSkinned => gpuDrivenSkinnedOn ??=
+        Environment.GetEnvironmentVariable("BALLISTIC_DX12_GPUDRIVEN_SKINNED") == "1";
+
     // GI motion harness: per-frame camera yaw (deg) injected in BeginRender so a headless sequence has real motion.
     int motionYawFrame;
     float? motionYawCached;
@@ -1458,7 +1465,8 @@ public sealed class DX12HDRenderer : HDRenderer
         // that can't fit (perDraws over MaxCpuDraws) or whose material can't register (table full) skips bindless
         // for that submesh and uses the legacy descriptor-table path (the two PSOs are interchangeable per draw —
         // each submesh rebinds its own state below).
-        int cpuDrawIndex = 0;   // running PerDraw slot for the bindless CPU draws this frame
+        int cpuDrawIndex = 0;   // running PerDraw slot for the bindless CPU draws this frame (R2 + R3b skinned)
+        bool skinnedBindlessBound = false;   // R3b: bindless graphics state bound for the first skinned bindless draw
 
         // === GEOMETRY PASS: fill the fat G-buffer (no lighting — GBuffer.hlsl writes albedo/normal/ORM/
         // emissive + depth). Same vertex transform + material sampling as the old forward opaque. ===
@@ -1641,6 +1649,43 @@ public sealed class DX12HDRenderer : HDRenderer
                     mptr[b] = Matrix4x4.Transpose(skin[b]);
                 // Any unset slot stays whatever was there; only indices < boneCount are referenced by weights.
                 ulong boneGpuAddr = boneMatrixRing.GPUVirtualAddress + (ulong)(BoneFrameOffset + (long)boneSlot * boneMatrixSlotSize);
+
+                // R3b: skin on the compute path into transient buffers, then draw the skinned result through the
+                // static GPU-driven bindless path (no skinned VS / skinned PSO). Requires CPU bindless armed (it
+                // shares the bindless material table + GBufferBindless draw state). The input bind-pose streams are
+                // transitioned to NonPixelShaderResource for the compute SRV read, then back to vertex state.
+                if (GpuDrivenSkinned && cpuBindless)
+                {
+                    int vcount = vb.ElementCount;
+                    Matrix4x4 sModel = r.Transform.WorldMatrix;
+                    Matrix4x4 sMvp = sModel * viewProj;
+                    // Transition the bind-pose input streams to a compute-SRV-readable state (and back after).
+                    cl.ResourceBarrierTransition(vb.Resource, ResourceStates.VertexAndConstantBuffer, ResourceStates.NonPixelShaderResource);
+                    cl.ResourceBarrierTransition(nb.Resource, ResourceStates.VertexAndConstantBuffer, ResourceStates.NonPixelShaderResource);
+                    cl.ResourceBarrierTransition(tb.Resource, ResourceStates.VertexAndConstantBuffer, ResourceStates.NonPixelShaderResource);
+                    cl.ResourceBarrierTransition(bib.Resource, ResourceStates.VertexAndConstantBuffer, ResourceStates.NonPixelShaderResource);
+                    cl.ResourceBarrierTransition(bwb.Resource, ResourceStates.VertexAndConstantBuffer, ResourceStates.NonPixelShaderResource);
+                    var skb = gpuDriven.DispatchSkin(cl, r, boneSlot, boneGpuAddr,
+                        vb.GpuAddress, nb.GpuAddress, tb.GpuAddress, bib.GpuAddress, bwb.GpuAddress, vcount);
+                    cl.ResourceBarrierTransition(vb.Resource, ResourceStates.NonPixelShaderResource, ResourceStates.VertexAndConstantBuffer);
+                    cl.ResourceBarrierTransition(nb.Resource, ResourceStates.NonPixelShaderResource, ResourceStates.VertexAndConstantBuffer);
+                    cl.ResourceBarrierTransition(tb.Resource, ResourceStates.NonPixelShaderResource, ResourceStates.VertexAndConstantBuffer);
+                    cl.ResourceBarrierTransition(bib.Resource, ResourceStates.NonPixelShaderResource, ResourceStates.VertexAndConstantBuffer);
+                    cl.ResourceBarrierTransition(bwb.Resource, ResourceStates.NonPixelShaderResource, ResourceStates.VertexAndConstantBuffer);
+                    if (skb != null)
+                    {
+                        // Bind the bindless draw state ONCE before the first skinned bindless draw (the geometry
+                        // loop's bindless state may have been left by the static path, but the skinned dispatch
+                        // above bound a COMPUTE root sig — so rebind the graphics bindless state here).
+                        if (!skinnedBindlessBound) { gpuDriven.CpuBindlessBegin(cl, motionCb.Gpu); cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList); skinnedBindlessBound = true; }
+                        if (DrawSkinnedBindless(cl, r, mesh, skb, ub, ib, sModel, sMvp, ref slot, ref draws, ref tris, ref cpuDrawIndex))
+                        {
+                            boneSlot++;
+                            continue;   // skinned via compute + bindless; skip the legacy skinned VS path
+                        }
+                    }
+                    // fell through (capacity / null) → legacy skinned VS path below
+                }
 
                 if (!skinnedStateSet)
                 {
@@ -2289,6 +2334,50 @@ public sealed class DX12HDRenderer : HDRenderer
         shadowsThisFrame = true;
     }
 
+
+    // R3b: draw one skinned renderer's compute-skinned result through the GPU-driven bindless path. The skinned
+    // out-buffers (pos/normal/tangent) replace the bind-pose vertex streams; UV + index come from the ORIGINAL
+    // mesh buffers. Per submesh: register material → write PerDraw{Mvp,Model,MaterialId} → DrawIndex root const →
+    // DrawIndexedInstanced. `cpuDrawIndex` advances through the shared cpuPerDraws buffer. Returns false (capacity)
+    // → caller falls back to the legacy skinned VS path for this renderer. State (drawRootSig/drawPso/heap) must
+    // be bound by the caller via gpuDriven.CpuBindlessBegin before the first skinned bindless draw.
+    unsafe bool DrawSkinnedBindless(ID3D12GraphicsCommandList4 cl, IStaticMeshRenderer r, Mesh mesh,
+        Dx12GpuDrivenRenderer.SkinnedBuffers skb, Dx12Buffer<Vector2> ub, Dx12IndexBuffer ib,
+        Matrix4x4 model, Matrix4x4 mvp, ref int slot, ref int draws, ref long tris, ref int cpuDrawIndex)
+    {
+        // Bind the skinned vertex streams: pos(0)/normal(1)/uv(2)/tangent(3) — same 4-stream layout GBufferBindless
+        // expects. Pos/Normal/Tangent are the compute-skinned out-buffers; UV is the original (skinning doesn't
+        // touch UV). Strides match the source: float3=12, float2=8, float4=16.
+        Span<VertexBufferView> v = stackalloc VertexBufferView[4];
+        int vcount = skb.VertexCount;
+        v[0] = new VertexBufferView(skb.Pos.GPUVirtualAddress, (uint)(vcount * 12), 12);
+        v[1] = new VertexBufferView(skb.Normal.GPUVirtualAddress, (uint)(vcount * 12), 12);
+        v[2] = new VertexBufferView(ub.GpuAddress, (uint)ub.ByteSize, (uint)ub.Stride);
+        v[3] = new VertexBufferView(skb.Tangent.GPUVirtualAddress, (uint)(vcount * 16), 16);
+        cl.IASetVertexBuffers(0, v);
+        cl.IASetIndexBuffer(new IndexBufferView(ib.GpuAddress, (uint)ib.ByteSize, Format.R32_UInt));
+
+        int only = r.SubMeshIndex;
+        int first = only >= 0 ? only : 0;
+        int last = only >= 0 ? only : mesh.SubMeshes.Length - 1;
+        for (int s = first; s <= last; s++)
+        {
+            if ((uint)s >= (uint)mesh.SubMeshes.Length) break;
+            SubMeshData sub = mesh.SubMeshes[s];
+            if (sub.IndexCount <= 0) continue;
+            Material mat = r.MaterialFor(s);
+            if (mat is null || mat.Transparent) continue;
+            int mid = gpuDriven.TryMaterialId(mat, out int rid) ? rid : gpuDriven.ResolveOrRegisterMaterialId(mat);
+            if (mid < 0) return false;
+            if (!gpuDriven.CpuBindlessWrite(cpuDrawIndex, mvp, model, mid)) return false;
+            cl.SetGraphicsRoot32BitConstant(0, (uint)cpuDrawIndex, 0);   // DrawIndex (b0)
+            cl.DrawIndexedInstanced((uint)sub.IndexCount, 1, (uint)sub.IndexStart, 0, 0);
+            cpuDrawIndex++;
+            draws++; tris += sub.IndexCount / 3;
+            slot++;
+        }
+        return true;
+    }
 
     // Copy one material texture's persistent SRV into the shader-visible table at `visibleSlot`. A null
     // texture resolves to that slot's neutral default (DefaultTextures.Neutral) so the descriptor is

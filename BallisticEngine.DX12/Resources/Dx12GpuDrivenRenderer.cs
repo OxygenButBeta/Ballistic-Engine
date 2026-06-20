@@ -48,6 +48,21 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     ID3D12Resource cpuPerDraws;     unsafe byte* cpuPerDrawsMapped;
     long cpuPerDrawsFrameStride;    // perDrawStride*MaxCpuDraws bytes per frame slot
     const int MaxCpuDraws = 8192;   // CPU-path opaque submeshes per frame (split-import scenes); over → old path
+
+    // R3b — compute skinning: skin pos/normal/tangent on the compute path into per-renderer transient buffers,
+    // then the skinned result draws through the static GPU-driven path. Root SRV/UAV only (no descriptor heap).
+    ID3D12RootSignature skinRootSig;
+    ID3D12PipelineState skinPso;
+    // Transient skinned out-buffers, keyed by skinned renderer instance, recreated when its vertex count changes.
+    // Pos/Normal are float3, Tangent float4 — same layout as the source streams so they're drop-in vertex buffers.
+    // GPU-written (UAV) then GPU-read (vertex buffer) the SAME frame; under P0b overlap a frame N+1 reuse can't
+    // race frame N's read because each skinned renderer's buffers are only rewritten by ITS dispatch each frame
+    // and the draw that reads them is in the same command list after a UAV→vertex barrier (intra-frame ordered).
+    public sealed class SkinnedBuffers {
+        public ID3D12Resource Pos, Normal, Tangent; public int VertexCount;
+        public ResourceStates State = ResourceStates.UnorderedAccess;   // tracked so barriers never mismatch (GBV)
+    }
+    readonly Dictionary<IStaticMeshRenderer, SkinnedBuffers> skinnedBuffers = new();
     int cullParamSlotSize;       // shadow CullParams slot
     int geoCullParamSlotSize;    // geometry GeoCullParams slot (bigger — has the Hi-Z fields)
     int metaStride, perDrawStride, materialStride;
@@ -153,6 +168,29 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
                 cullParams, new[] { pointClamp })));
+
+        // --- R3b compute-skinning root sig: CBV b0 (SkinParams) + root SRV t0 bones + t1..t5 in-streams +
+        // root UAV u0..u2 out-streams. ALL root descriptors (raw buffers) — no descriptor heap, so the descriptor-
+        // lifetime hang class (R2) can't apply here. ---
+        var skinParams = new[] {
+            new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All),
+            new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.All), // t0 bones
+            new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(1, 0), ShaderVisibility.All), // t1 pos
+            new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(2, 0), ShaderVisibility.All), // t2 normal
+            new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(3, 0), ShaderVisibility.All), // t3 tangent
+            new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(4, 0), ShaderVisibility.All), // t4 boneIdx
+            new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(5, 0), ShaderVisibility.All), // t5 boneWt
+            new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(0, 0), ShaderVisibility.All), // u0 outPos
+            new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(1, 0), ShaderVisibility.All), // u1 outNormal
+            new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(2, 0), ShaderVisibility.All), // u2 outTangent
+        };
+        skinRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, skinParams)));
+        skinPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription {
+            RootSignature = skinRootSig,
+            ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute,
+                EmbeddedShaderSource.ReadHlsl("SkinCompute.hlsl"), "CSMain", "SkinCompute.hlsl"),
+        });
 
         string cullHlsl = EmbeddedShaderSource.ReadHlsl("GpuCull.hlsl");
         cullPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription {
@@ -363,6 +401,86 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             cpuPerDraws.GPUVirtualAddress + (ulong)(dev.FrameSlot * cpuPerDrawsFrameStride));
         cl.SetGraphicsRootShaderResourceView(2, MaterialsGpuAddress);   // t1 GpuMaterials (this frame's slot)
         cl.SetGraphicsRootConstantBufferView(3, motionCbAddress);       // b1 MotionConstants (per pass)
+    }
+
+    // R3b — SkinParams CB (just VertexCount), N-buffered + a small per-dispatch stride so several skinned
+    // renderers in one frame don't stomp each other's CB. Lazily created.
+    ID3D12Resource skinCb; unsafe byte* skinCbMapped; int skinCbStride; long skinCbFrameStride;
+    const int MaxSkinnedPerFrame = 256;
+    unsafe void EnsureSkinCb() {
+        if (skinCb != null) return;
+        skinCbStride = 256;   // one SkinParams slot (CB alignment)
+        skinCbFrameStride = (long)skinCbStride * MaxSkinnedPerFrame;
+        skinCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)(skinCbFrameStride * dev.FramesInFlight)), ResourceStates.GenericRead);
+        skinCbMapped = skinCb.Map<byte>(0);
+    }
+
+    // Ensure this skinned renderer's transient out-buffers exist at the right vertex count (recreated on change).
+    SkinnedBuffers EnsureSkinnedBuffers(IStaticMeshRenderer r, int vertexCount) {
+        if (!skinnedBuffers.TryGetValue(r, out var sb)) { sb = new SkinnedBuffers(); skinnedBuffers[r] = sb; }
+        if (sb.VertexCount == vertexCount && sb.Pos != null) return sb;
+        // Vertex count changed (or first use) — (re)create. Defer-release the old ones under overlap.
+        if (sb.Pos != null) { dev.DeferredRelease(sb.Pos); dev.DeferredRelease(sb.Normal); dev.DeferredRelease(sb.Tangent); }
+        ID3D12Resource MakeUav(int bytes) => dev.Device.CreateCommittedResource(
+            HeapProperties.DefaultHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)bytes, ResourceFlags.AllowUnorderedAccess), ResourceStates.UnorderedAccess);
+        sb.Pos = MakeUav(vertexCount * 12);      // float3
+        sb.Normal = MakeUav(vertexCount * 12);   // float3
+        sb.Tangent = MakeUav(vertexCount * 16);  // float4
+        sb.VertexCount = vertexCount;
+        return sb;
+    }
+
+    // R3b — dispatch compute skinning for one skinned renderer. `boneGpuAddr` = the transposed bone-matrix SRV
+    // (the SAME buffer the skinned VS read). in* = the mesh's bind-pose streams (raw root SRVs). Writes the
+    // animated pos/normal/tangent into this renderer's transient out-buffers, left in NonPixelShaderResource so
+    // the subsequent draw can bind them as vertex buffers (a vertex buffer read is legal from a
+    // VertexAndConstantBuffer state; the caller transitions out-buffers to that before the draw — see
+    // SkinnedBuffersForDraw). Returns the out-buffers (or null if streams are missing). `skinIndex` = a per-frame
+    // counter so each renderer's SkinParams CB slot is distinct.
+    public unsafe SkinnedBuffers DispatchSkin(ID3D12GraphicsCommandList4 cl, IStaticMeshRenderer r, int skinIndex,
+        ulong boneGpuAddr, ulong inPos, ulong inNormal, ulong inTangent, ulong inBoneIdx, ulong inBoneWt,
+        int vertexCount) {
+        if (vertexCount <= 0 || skinIndex >= MaxSkinnedPerFrame) return null;
+        EnsureSkinCb();
+        var sb = EnsureSkinnedBuffers(r, vertexCount);
+        // SkinParams CB (VertexCount).
+        long cbOff = (long)dev.FrameSlot * skinCbFrameStride + (long)skinIndex * skinCbStride;
+        *(uint*)(skinCbMapped + cbOff) = (uint)vertexCount;
+        // The out-buffers are in UnorderedAccess (fresh) or NonPixelShaderResource (from last frame's draw) —
+        // ensure UAV for the dispatch write. Use the TRACKED state so the barrier's before-state always matches
+        // (a fixed before-state mismatches on the first frame → GBV ResourceBarrierBeforeAfterMismatch).
+        if (sb.State != ResourceStates.UnorderedAccess) {
+            Barrier(cl, sb.Pos, sb.State, ResourceStates.UnorderedAccess);
+            Barrier(cl, sb.Normal, sb.State, ResourceStates.UnorderedAccess);
+            Barrier(cl, sb.Tangent, sb.State, ResourceStates.UnorderedAccess);
+            sb.State = ResourceStates.UnorderedAccess;
+        }
+        cl.SetComputeRootSignature(skinRootSig);
+        cl.SetPipelineState(skinPso);
+        cl.SetComputeRootConstantBufferView(0, skinCb.GPUVirtualAddress + (ulong)cbOff);
+        cl.SetComputeRootShaderResourceView(1, boneGpuAddr);
+        cl.SetComputeRootShaderResourceView(2, inPos);
+        cl.SetComputeRootShaderResourceView(3, inNormal);
+        cl.SetComputeRootShaderResourceView(4, inTangent);
+        cl.SetComputeRootShaderResourceView(5, inBoneIdx);
+        cl.SetComputeRootShaderResourceView(6, inBoneWt);
+        cl.SetComputeRootUnorderedAccessView(7, sb.Pos.GPUVirtualAddress);
+        cl.SetComputeRootUnorderedAccessView(8, sb.Normal.GPUVirtualAddress);
+        cl.SetComputeRootUnorderedAccessView(9, sb.Tangent.GPUVirtualAddress);
+        cl.Dispatch((uint)((vertexCount + 63) / 64), 1, 1);
+        // UAV write done → transition out-buffers to a state legal as a vertex-buffer input for the draw.
+        // VertexAndConstantBuffer is the correct read state for IASetVertexBuffers.
+        Barrier(cl, sb.Pos, ResourceStates.UnorderedAccess, ResourceStates.VertexAndConstantBuffer);
+        Barrier(cl, sb.Normal, ResourceStates.UnorderedAccess, ResourceStates.VertexAndConstantBuffer);
+        Barrier(cl, sb.Tangent, ResourceStates.UnorderedAccess, ResourceStates.VertexAndConstantBuffer);
+        sb.State = ResourceStates.VertexAndConstantBuffer;
+        return sb;
+    }
+
+    static void Barrier(ID3D12GraphicsCommandList4 cl, ID3D12Resource res, ResourceStates from, ResourceStates to) {
+        if (from != to) cl.ResourceBarrierTransition(res, from, to);
     }
 
     // Write one CPU draw's PerDraw entry into this frame's slot at `drawIndex` and return whether it fit
@@ -762,5 +880,8 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         hiz?.Dispose();
         shadowCullPso?.Dispose(); shadowDrawRootSig?.Dispose(); shadowDrawPso?.Dispose(); shadowCmdSig?.Dispose();
         shadowCommands?.Dispose(); shadowPerDraws?.Dispose(); shadowMetaUpload?.Dispose(); shadowCullParamUpload?.Dispose();
+        // R3b compute skinning.
+        skinRootSig?.Dispose(); skinPso?.Dispose(); skinCb?.Dispose();
+        foreach (var sb in skinnedBuffers.Values) { sb.Pos?.Dispose(); sb.Normal?.Dispose(); sb.Tangent?.Dispose(); }
     }
 }
