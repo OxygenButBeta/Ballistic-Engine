@@ -160,6 +160,45 @@ loop returns or the process never exits.
   `BallisticEngine.csproj` globs `**/*.cs`: game-project folders (SampleProject) must stay
   in its `<Compile Remove>` list or game scripts compile into the engine itself.
 
+## Material / shader system (shader-declared property bag + custom surface shaders)
+
+- **Material = property bag, NOT fixed slots.** A `.shader` DECLARES its properties (Unity ShaderLab
+  style — `Shader.Properties`, an optional `properties:[...]` block in the `.shader` JSON; the built-in
+  Standard declares 20 in `StandardShaderProperties`). A `Material` holds only OVERRIDE values in a
+  `MaterialSemantic`-keyed bag. The renderer packs them into the FIXED `DrawConstants`/`GpuMaterial`
+  layout via each property's `MaterialSemantic` (the bridge) — so the embedded G-buffer HLSL is
+  unchanged and Standard materials render byte-identical. `MaterialLoader.ApplyScalars` is the SOLE
+  default authority (the metallic-map-conditional default, PackedOrm/Cutout filename auto-detect); the
+  bag is DERIVED from its output (`SyncBagFromTypedFields`, called inside ApplyScalars), never resolves
+  defaults itself. The editor material inspector is GENERATED from the declared property list (no
+  hardcoded slot UI); `MaterialPropertyBinding` joins each semantic to its `MaterialDefinition` field,
+  preserving the `.mat` null-means-default elision.
+- **Custom surface shaders (Unity-style).** A `.shader` may add `"surface": "Assets/.../X.surface"` — an
+  HLSL file with `SurfaceOutput Surface(SurfaceInput i)` (albedo/normal/metallic/roughness/ao/emissive/
+  alpha). The engine OWNS the rest: `SurfaceSkeleton.hlsl` wraps the body (injected at the
+  `//USER_SURFACE_MARKER`, before PSMain — HLSL has no forward decl) with the engine's VSMain (z-prepass
+  position invariance stays bit-identical), motion, 5-MRT packing, and the b0/t0-t5/b1/s0 ABI. The user
+  shader gets a per-material PSO (`Dx12SurfaceShaderCache`, cloned from the Standard PSO state, only the
+  PS differs). A custom surface body can read `DrawConstants` fields + the bound maps; it CANNOT write a
+  custom vertex stage, and `MaterialSemantic.None` properties don't reach the GPU yet (no generic CB).
+- **Compile-fail = magenta checker, never a crash.** A bad surface shader (load or hot-reload) draws the
+  `SurfaceFallback.hlsl` black/magenta world-space checker (emissive, visible unlit) + logs the DXC
+  error; the failed key caches the fallback so it doesn't recompile every frame.
+- **Live hot-reload.** `Dx12SurfaceWatcher` (FileSystemWatcher on Assets\) flags `.surface`/`.hlsl`
+  edits; the watcher thread only enqueues. The renderer drains + recompiles in `BeginRender` (main
+  thread, BETWEEN frames — PSO creation is main-thread-safe, never mid-draw-list). The old PSO is
+  DEFERRED-disposed past `FramesInFlight` (freeing it while the GPU reads it = use-after-free crash). The
+  editor renders on-demand, so `HDRenderer.PollSurfaceReload()` → `MarkSceneDirty()` wakes the viewport.
+- **Custom-shader materials are DEMOTED to the legacy CPU path** (per-draw `SetPipelineState`, root sig
+  unchanged → safe). They CANNOT ride GPU-driven ExecuteIndirect (one PSO per indirect draw) or the CPU
+  bindless path (one PSO/frame, swap-forbidden — the TDR rule). The SAME `RendererHasCustomSurface`
+  predicate excludes them from the GPU-driven sets AND gates the CPU-loop skips (drawn exactly once);
+  `cpuBindless` turns off whole-frame when any custom surface is present. Standard whole-mesh renderers
+  stay GPU-driven (a custom-shadered Bistro-scale whole mesh is a perf cliff — opt-in, rare).
+- Doors: `BALLISTIC_DX12_SURFACE_SKELETON=1` (compile the skeleton in place of GBuffer.hlsl — byte-id
+  proof), `_SURFACE_SELFTEST=1` (compile fallback + ok + broken bodies at init, log results),
+  `_SURFACE_HRDEBUG=1` (log watcher init + drained-file counts).
+
 ## Scenes & components
 
 - `.scene` = YAML: `sceneComponents:` (scene-wide `SceneBehaviour`s) + `entities:` with
