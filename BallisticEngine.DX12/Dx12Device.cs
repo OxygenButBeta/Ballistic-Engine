@@ -494,6 +494,15 @@ public sealed class Dx12Device : IDisposable {
     // (EndFrame already signalled it). frameSlot advances ONLY here, so it's frozen for the whole frame — every
     // per-frame CPU-mapped upload + descriptor copy this frame indexes the same slab the GPU will read. Must be
     // paired with EndFrame; nesting is not supported (the slot would advance mid-frame).
+    // PIPELINED per-pass GPU profiler (BALLISTIC_DX12_GPU_PROFILE=1) — inline timestamp queries in the frame list,
+    // no per-pass submit/wait (so it doesn't serialise/inflate like the legacy GpuTimer*). Lazily created.
+    Dx12GpuProfiler gpuProfiler;
+    public Dx12GpuProfiler GpuProfiler => gpuProfiler ??= new Dx12GpuProfiler(this);
+    int profileFrameCounter;
+    // The open frame's command list — exposed so the renderer can write profiler timestamp queries into it. Only
+    // valid between BeginFrame and EndFrame, on the frame thread.
+    public ID3D12GraphicsCommandList4 FrameList => frameList;
+
     public void BeginFrame() {
         if (!pipelinedFrames || frameOpen) return;
         frameSlot = (frameSlot + 1) % FramesInFlight;
@@ -512,6 +521,7 @@ public sealed class Dx12Device : IDisposable {
         frameSplitThisFrame = false;
         frameThreadId = Environment.CurrentManagedThreadId;
         frameOpen = true;
+        if (gpuProfiler is { Enabled: true }) gpuProfiler.BeginFrame(profileFrameCounter++);
     }
 
     // P0b — DEFERRED GPU-RESOURCE RELEASE. A per-frame pass that recreates a GPU resource (e.g. Lumen's
@@ -542,11 +552,20 @@ public sealed class Dx12Device : IDisposable {
     public bool EndFrame() {
         if (!frameOpen) return false;
         frameOpen = false;
+        // GPU profiler: resolve this frame's inline timestamp queries into the readback buffer BEFORE closing the
+        // list, tagged with the fence value this frame will reach (read back once the GPU passes it).
+        ulong profTarget = frameFenceValue + 1;
+        if (gpuProfiler is { Enabled: true }) gpuProfiler.ResolveInto(frameList, profTarget);
         frameList.Close();
         Queue.ExecuteCommandList(frameList);
         ulong target = ++frameFenceValue;
         Queue.Signal(frameFence, target);
         frameFenceTargets[frameSlot] = target;
+        // Drain any retired profiler frame (prints the per-pass GPU ms a few frames late).
+        if (gpuProfiler is { Enabled: true }) {
+            string line = gpuProfiler.Drain(frameFence.CompletedValue);
+            if (line is not null) Console.WriteLine(line);
+        }
         // P0b: drain when overlap is off (FramesInFlight==1, the P0a fallback) OR when a pass requested a sync
         // this frame. RequestFrameSync lets a pass that recreated/realloc'd a GPU resource MID-FRAME (e.g. the
         // Lumen scene's TLAS-driven buffer rebuild, whose lifecycle isn't N-buffered) force this one frame to

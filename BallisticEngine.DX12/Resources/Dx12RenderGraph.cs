@@ -110,12 +110,22 @@ public sealed class Dx12RenderGraph {
     public void Execute(Dx12FrameContext ctx, int minEventInclusive, int maxEventExclusive) {
         if (!built) Build();
         var list = ordered;
+        // PIPELINED per-pass GPU timing: bracket each graph pass with an inline timestamp query (no submit) so the
+        // frame stays pipelined — the REAL GPU ms of each post/lighting pass as it runs in the shipping frame.
+        // Only active under BALLISTIC_DX12_GPU_PROFILE=1; the device profiler + frame list come from ctx.Dev.
+        var prof = ctx.Dev?.GpuProfiler;
+        bool profOn = prof is { Enabled: true };
         for (int i = 0; i < list.Length; i++) {
             IRenderPass pass = list[i];
             int ev = (int)pass.Event;
             if (ev < minEventInclusive || ev >= maxEventExclusive) continue;
             if (!pass.Enabled(ctx)) continue;
-            if (timePass != null) timePass(pass.Name, () => pass.Record(ctx));
+            if (profOn && ctx.Dev.FrameList is { } fl) {
+                prof.Begin(fl, pass.Name);
+                if (timePass != null) timePass(pass.Name, () => pass.Record(ctx)); else pass.Record(ctx);
+                if (ctx.Dev.FrameList is { } fl2) prof.End(fl2);   // re-read: a pass may have flushed+reopened the list
+            }
+            else if (timePass != null) timePass(pass.Name, () => pass.Record(ctx));
             else pass.Record(ctx);
         }
     }

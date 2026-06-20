@@ -1369,6 +1369,14 @@ public sealed class DX12HDRenderer : HDRenderer
         long fpGc = fprof ? GC.GetTotalAllocatedBytes() : 0;
         void FP(string t) { if (fprof) { fpsw.Stop(); long g = GC.GetTotalAllocatedBytes(); Console.WriteLine($"[FrameProf] {t} {fpsw.Elapsed.TotalMilliseconds:0.00}ms alloc={g-fpGc}B"); fpGc = g; fpsw.Restart(); } }
 
+        // PIPELINED per-pass GPU timing: bracket a frame-list section with GpuMark(name)…GpuMarkEnd(). Writes
+        // inline timestamp queries (no submit) so the frame stays pipelined — the REAL GPU ms of each section,
+        // unlike PASS_TIMING which serialises. Only active under BALLISTIC_DX12_GPU_PROFILE=1. Marks must sit
+        // inside the open frame (after dev.BeginFrame). No-op otherwise.
+        var prof = dev.GpuProfiler;
+        void GpuMark(string name) { if (prof.Enabled && dev.FrameList is { } fl) prof.Begin(fl, name); }
+        void GpuMarkEnd() { if (prof.Enabled && dev.FrameList is { } fl) prof.End(fl); }
+
         // PP1: shadow rendering MOVED below dev.BeginFrame() — its cascade depth draws now record into the open
         // frame list (no per-frame ExecuteUpload submit+wait). The cascade FIT is still computed before the
         // FrameConstants write (which transposes cascadeMatrices into b1), so ordering is preserved.
@@ -1401,10 +1409,13 @@ public sealed class DX12HDRenderer : HDRenderer
         // RenderShadows records into the open frame list via ExecuteSync's frame-aware fast path and fills its
         // N-buffered shadow CB at this frame's slot. Fit with the UNJITTERED proj for stable cascades. Must run
         // before the FrameConstants write below (it consumes cascadeMatrices) and before the geometry pass.
+        GpuMark("Shadows");
         if (doors.Shadows)
             RenderShadows(view, projUnjittered, light);
         else
             shadowsThisFrame = false;
+        GpuMarkEnd();
+        GpuMark("Geometry+Deferred");   // spans through the geometry/deferred/setup block; closed before the graph
         FP("RenderShadows");
 
         // P0b: write the motion CB into THIS frame's N-buffer slot (FrameSlot is now set by BeginFrame).
@@ -1962,7 +1973,10 @@ public sealed class DX12HDRenderer : HDRenderer
         // every frame → the graph stays the built-in set → byte-identical to golden), so it's unconditional here.
         featureBridge.Apply();
         FP("geometry+deferred+setup");
+        GpuMarkEnd();   // closes the "Geometry+Deferred" span opened right after shadows (see below)
 
+        // (graph passes are timed individually inside graph.Execute via the GPU profiler — no outer span here,
+        //  which would straddle any mid-graph frame-list flush and read garbage.)
         if (graphPath) graph.ExecuteGraph(ctx);
         else graph.Execute(ctx);
         FP("graph.Execute(all passes)");
