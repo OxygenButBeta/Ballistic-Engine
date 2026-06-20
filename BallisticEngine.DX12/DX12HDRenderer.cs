@@ -136,6 +136,18 @@ public sealed class DX12HDRenderer : HDRenderer
     bool rtShadowBuilt;
     bool rtShadowsThisFrame;
     const int RtSbtSlot = 64; // shader-table record alignment
+    // Default soft penumbra: 8 cone-sampled rays + a 2-pass bilateral denoise. Forced to 1 (hard, no denoise)
+    // by BALLISTIC_DX12_RT_SHADOW_RAYS=1 (A/B against the old result) — that path is bit-identical to before.
+    const int RtShadowSoftRays = 8;
+
+    // Soft-shadow bilateral denoise (separable H/V, depth+normal guided) — mirrors the GTAO blur idiom. A
+    // committed R8 scratch (rtShadowDenoiseScratch) is the ping-pong target; the result lands back in rtShadowMask.
+    ID3D12RootSignature rtShadowDenoiseRootSig;
+    ID3D12PipelineState rtShadowDenoiseHPso, rtShadowDenoiseVPso;
+    ID3D12Resource rtShadowDenoiseCb;
+    unsafe byte* rtShadowDenoiseCbMapped;
+    Dx12OffscreenTarget rtShadowDenoiseScratch;   // full-res R8 RTV+SRV ping-pong
+    Dx12DescriptorHeap rtShadowDenoiseHeap;        // 3 SRVs × 2 passes = 6 contiguous slots
 
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct RtShadowConstants
@@ -143,6 +155,20 @@ public sealed class DX12HDRenderer : HDRenderer
         public Matrix4x4 InvViewProj;
         public Vector3 SunDir;
         public float NormalBias;
+        public float SunAngularRadius;   // radians (0.5 * AngularDiameter); 0 or RayCount<=1 → hard fast path
+        public int RayCount;             // shadow rays per pixel (1 = hard)
+        public int FrameIndex;           // temporal jitter rotation (0 under deterministic capture)
+        public float Pad0;
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct RtShadowDenoiseConstants
+    {
+        public Vector2 TexelSize;
+        public float DepthSigma;
+        public float NormalSigma;
+        public Vector2 Direction;        // (1,0) H pass / (0,1) V pass
+        public Vector2 Pad;
     }
 
     // --- DXR ray-traced reflections (Reflection volume SSR-vs-RT dropdown: PostFX.ReflectionMode) ---
@@ -185,6 +211,7 @@ public sealed class DX12HDRenderer : HDRenderer
     // ran post-deferred and post-multiplied the whole HDR colour). All params come from the AmbientOcclusion volume.
     Dx12GtaoPass gtaoPass;
     Dx12RtaoPass rtaoPass;
+    Dx12CapsuleShadowPass capsuleShadowPass; // analytic capsule sun shadows (BeforeOpaqueLighting 250)
 
     // chunk 9: Deferred lighting (event 300 — OpaqueLighting). Owns the deferred rootsig/PSO/CB/13-SRV heap;
     // reads ctx light/IBL/cluster/rtShadow state + draws the full-screen lit HDR into `target` (head transition
@@ -579,6 +606,8 @@ public sealed class DX12HDRenderer : HDRenderer
         frameProfileOn   = Environment.GetEnvironmentVariable("BALLISTIC_DX12_FRAME_PROFILE") == "1";
         hizDebugOn       = Environment.GetEnvironmentVariable("BALLISTIC_DX12_HIZ_DEBUG") == "1";
         rtShadowsEnv     = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RT_SHADOWS");
+        // BALLISTIC_DX12_RT_SHADOW_RAYS=1 forces the OLD single-ray hard path (A/B vs the new soft penumbra).
+        rtShadowHardForce = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RT_SHADOW_RAYS") == "1";
         fsrEnv           = Environment.GetEnvironmentVariable("BALLISTIC_DX12_FSR");
         shadowCacheDebugOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_SHADOW_CACHE_DEBUG") == "1";
         // Resolve the per-feature doors ONCE (the BALLISTIC_DX12_MINIMAL switch + cached env reads).
@@ -618,6 +647,11 @@ public sealed class DX12HDRenderer : HDRenderer
         // is gated by how open each pixel is (a closed interior stops glowing from ambient it can't receive).
         rtaoPass = new Dx12RtaoPass(dev, gtaoPass);
         graph.Add(rtaoPass);
+        // Capsule shadows (BeforeOpaqueLighting 250): analytic soft sun shadows from CapsuleShadowCaster proxy
+        // capsules. Enabled() returns false (no record, no SrvStore alloc) when no caster is in the scene, so the
+        // default path is byte-identical. The deferred pass multiplies its mask into the sun term (t16).
+        capsuleShadowPass = new Dx12CapsuleShadowPass(dev);
+        graph.Add(capsuleShadowPass);
         // chunk 8: Sky (event 350 — skybox + procedural atmosphere). Resolution-independent (no Resize body)
         // so registration order doesn't touch R5; the event sort places it FIRST of the converted passes (350
         // < AP 400 < Fog 550 < PostProcess 650). Registered before apPass for same-event-tiebreak hygiene (R1),
@@ -867,6 +901,7 @@ public sealed class DX12HDRenderer : HDRenderer
     bool frameProfileOn;      // BALLISTIC_DX12_FRAME_PROFILE == "1" — per-stage [FrameProf] timers (was read ~:1232)
     bool hizDebugOn;          // BALLISTIC_DX12_HIZ_DEBUG == "1" (was read ~:1560)
     string? rtShadowsEnv;     // BALLISTIC_DX12_RT_SHADOWS (was read ~:1580; null/"0"/"1" tri-state preserved)
+    bool rtShadowHardForce;   // BALLISTIC_DX12_RT_SHADOW_RAYS == "1" — force the old single-ray HARD path (A/B)
     string? fsrEnv;           // BALLISTIC_DX12_FSR (was read ~:1738)
     bool shadowCacheDebugOn;  // BALLISTIC_DX12_SHADOW_CACHE_DEBUG == "1" (was read ~:1992)
 
@@ -2445,6 +2480,47 @@ public sealed class DX12HDRenderer : HDRenderer
         rtShadowHeap = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4, shaderVisible: true,
             framesInFlight: dev.FramesInFlight);
+
+        // --- Soft-shadow bilateral denoise PSOs (fullscreen H/V, depth+normal guided; built once) ---
+        // Rootsig: DenoiseConstants CBV(b0) + 3-SRV table {t0 mask, t1 depth, t2 normal} + linear-clamp sampler.
+        var dnCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0),
+            ShaderVisibility.Pixel);
+        var dnSrvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 3, baseShaderRegister: 0);
+        var dnSrvTable = new RootParameter1(new RootDescriptorTable1(dnSrvRange), ShaderVisibility.Pixel);
+        var dnSamp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0)
+        {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        rtShadowDenoiseRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { dnCbv, dnSrvTable }, new[] { dnSamp })));
+
+        string dnHlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("DxrShadowDenoise.hlsl");
+        byte[] dnVs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, dnHlsl, "VSMain", "DxrShadowDenoise.hlsl");
+        ID3D12PipelineState MakeDenoisePso(string entry) => dev.Device.CreateGraphicsPipelineState(
+            new GraphicsPipelineStateDescription
+            {
+                RootSignature = rtShadowDenoiseRootSig, VertexShader = dnVs,
+                PixelShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, dnHlsl, entry, "DxrShadowDenoise.hlsl"),
+                InputLayout = null, PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+                RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
+                DepthStencilState = DepthStencilDescription.None,
+                RenderTargetFormats = new[] { Format.R8_UNorm }, DepthStencilFormat = Format.Unknown,
+                SampleDescription = new SampleDescription(1, 0),
+            });
+        rtShadowDenoiseHPso = MakeDenoisePso("PSBlurH");
+        rtShadowDenoiseVPso = MakeDenoisePso("PSBlurV");
+
+        int dnCbSize = (System.Runtime.InteropServices.Marshal.SizeOf<RtShadowDenoiseConstants>() + 255) & ~255;
+        rtShadowDenoiseCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)dnCbSize), ResourceStates.GenericRead);
+        rtShadowDenoiseCbMapped = rtShadowDenoiseCb.Map<byte>(0);
+        // 3 SRVs × 2 passes (H then V) = 6 contiguous slots.
+        rtShadowDenoiseHeap = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 6, shaderVisible: true,
+            framesInFlight: dev.FramesInFlight);
+
         AllocRtShadowMask();
         return true;
     }
@@ -2454,6 +2530,13 @@ public sealed class DX12HDRenderer : HDRenderer
         rtShadowMask?.Dispose();
         rtShadowMask = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false,
             colorFormat: Format.R8_UNorm, colorReadable: true, allowUav: true);
+        // Denoise ping-pong scratch (only allocated once the RT-shadow pipeline is built, i.e. RT shadows used).
+        if (rtShadowDenoiseRootSig != null)
+        {
+            rtShadowDenoiseScratch?.Dispose();
+            rtShadowDenoiseScratch = new Dx12OffscreenTarget(dev, targetW, targetH, withDepth: false,
+                colorFormat: Format.R8_UNorm, colorReadable: true, allowUav: false);
+        }
     }
 
     // RT sun shadows: ensure the scene AS, then DispatchRays one shadow ray per pixel → rtShadowMask. The
@@ -2475,9 +2558,20 @@ public sealed class DX12HDRenderer : HDRenderer
 
         Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
         Vector3 sun = lightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(lightDir);
+
+        // Soft penumbra: the sun's angular RADIUS (radians) = 0.5 * AngularDiameter (degrees). A wider disk =
+        // softer shadow. BALLISTIC_DX12_RT_SHADOW_RAYS=1 forces RayCount=1 (the old single-ray HARD path, which
+        // the shader's fast path makes bit-identical to the original result regardless of the angle).
+        float angularDiamDeg = DirectionalLight.Instance?.AngularDiameter ?? 0.53f;
+        float sunAngularRadius = angularDiamDeg * 0.5f * (MathF.PI / 180f);
+        int rayCount = rtShadowHardForce ? 1 : RtShadowSoftRays;
+        // Temporal jitter index — frozen to 0 under deterministic capture so paused/bal-render frames are
+        // byte-identical run-to-run. The hard path ignores FrameIndex entirely.
+        int frameIdx = DeterministicCapture ? 0 : frameCounter;
         rtShadowCb.Write(new RtShadowConstants
         {
             InvViewProj = Matrix4x4.Transpose(invVP), SunDir = sun, NormalBias = 0.05f,
+            SunAngularRadius = sunAngularRadius, RayCount = rayCount, FrameIndex = frameIdx,
         });
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
@@ -2516,7 +2610,48 @@ public sealed class DX12HDRenderer : HDRenderer
             });
         });
         rtShadowMask.ColorToShaderResource();
+
+        // SOFT path only: bilateral-denoise the few-ray noise. The HARD path (rayCount==1) produces a binary
+        // 0/1 mask and SKIPS the denoise entirely → bit-identical to the original single-ray result.
+        if (rayCount > 1)
+            DenoiseRtShadowMask();
+
         rtShadowsThisFrame = true;
+    }
+
+    // Separable depth+normal-guided bilateral denoise of the soft RT shadow mask. Two fullscreen passes:
+    // mask -> scratch (horizontal), scratch -> mask (vertical), so the final cleaned mask is back in
+    // rtShadowMask (PixelShaderResource) for the deferred sun term. Mirrors the GTAO blur idiom.
+    unsafe void DenoiseRtShadowMask()
+    {
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        Vector2 texel = new(1f / targetW, 1f / targetH);
+
+        void Pass(ID3D12PipelineState pso, Dx12OffscreenTarget src, Dx12OffscreenTarget dst, Vector2 dir,
+            int srvSlot)
+        {
+            *(RtShadowDenoiseConstants*)rtShadowDenoiseCbMapped = new RtShadowDenoiseConstants
+            {
+                TexelSize = texel, DepthSigma = 0.05f, NormalSigma = 16f, Direction = dir,
+            };
+            src.ColorToShaderResource();
+            dev.Device.CopyDescriptorsSimple(1, rtShadowDenoiseHeap.Cpu(srvSlot), src.ColorSrvCpu, heapType);
+            dev.Device.CopyDescriptorsSimple(1, rtShadowDenoiseHeap.Cpu(srvSlot + 1), gbuffer.DepthSrvCpu, heapType);
+            dev.Device.CopyDescriptorsSimple(1, rtShadowDenoiseHeap.Cpu(srvSlot + 2), gbuffer.ColorSrvCpu(1), heapType);
+            dst.RenderColorOnly(cl =>
+            {
+                cl.SetGraphicsRootSignature(rtShadowDenoiseRootSig);
+                cl.SetPipelineState(pso);
+                cl.SetDescriptorHeaps(rtShadowDenoiseHeap.Heap);
+                cl.SetGraphicsRootConstantBufferView(0, rtShadowDenoiseCb.GPUVirtualAddress);
+                cl.SetGraphicsRootDescriptorTable(1, rtShadowDenoiseHeap.Gpu(srvSlot));
+                cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+                cl.DrawInstanced(3, 1, 0, 0);
+            });
+        }
+        Pass(rtShadowDenoiseHPso, rtShadowMask, rtShadowDenoiseScratch, new Vector2(1f, 0f), 0);
+        Pass(rtShadowDenoiseVPso, rtShadowDenoiseScratch, rtShadowMask, new Vector2(0f, 1f), 3);
+        rtShadowMask.ColorToShaderResource(); // deferred samples it as an SRV next
     }
 
     // GTAO is Dx12GtaoPass.Record. It runs at the AfterGBuffer event (200) via graph.Execute; the deferred

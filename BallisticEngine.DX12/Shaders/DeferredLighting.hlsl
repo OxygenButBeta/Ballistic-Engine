@@ -25,6 +25,7 @@ cbuffer LightConstants : register(b0) {
     float    UseSsao;                              // >0.5 = multiply the GTAO term into the IBL ambient (ambient-only)
     float    UseIBLDiffuse;                         // >0.5 = add the IBL diffuse-irradiance ambient; 0 when Lumen owns diffuse GI
     float    UseIBLSpecular;                        // >0.5 = add the IBL prefiltered-specular ambient; 0 when RT/SSR own reflections
+    float    UseCapsuleShadows; float3 CapPad;      // >0.5 = multiply the capsule-shadow mask (t16) into the sun term
     float4x4 ViewProjFwd;                          // world → clip (transposed on upload); contact-shadow march reprojection
 };
 
@@ -85,6 +86,7 @@ Texture2D RtShadowMask     : register(t12);                // ray-traced sun sha
 Texture2D SsaoTex          : register(t13);                // GTAO (1 = unoccluded); multiplied into ambient only
 Texture2D LtcMatTex        : register(t14);                // LTC inverse-matrix coeffs (area lights); 64x64 RGBA32F
 Texture2D LtcAmpTex        : register(t15);                // LTC amplitude/Fresnel split-sum (area lights)
+Texture2D CapsuleShadowTex : register(t16);                // analytic capsule sun-shadow occlusion (1 lit / 0 occluded)
 SamplerState LinearClamp : register(s0);
 
 static const float PI = 3.14159265359;
@@ -453,6 +455,11 @@ float4 PSMain(VSOut i) : SV_Target {
                                             : SunShadow(N, D, worldPos);
         // Contact shadows refine the cascade path (RT shadows already capture contact). Only darkens.
         if (UseRtShadows <= 0.5) shadow *= ContactShadow(worldPos, D);
+        // Capsule shadows (character proxy capsules) — combine via product (independent occluder). The mask is
+        // 1 (lit) when no caster covers this pixel, so multiplying is min-like and only darkens. Gated off
+        // (UseCapsuleShadows=0) when no caster ran → byte-identical default.
+        if (UseCapsuleShadows > 0.5)
+            shadow *= CapsuleShadowTex.SampleLevel(LinearClamp, i.Uv, 0).r;
         float3 radiance = LightColor * shadow;
         float3 H = normalize(V + D);
         float NDF = DistributionGGX(N, H, roughness);

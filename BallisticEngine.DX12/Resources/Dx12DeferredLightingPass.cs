@@ -66,6 +66,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         public float UseRtShadows; public float SpecClamp;   // SpecClamp: max per-light specular luma (V2 firefly cap; 0 = off)
         public float SpecAaStrength; public float UseSsao;   // V2: geometric specular AA strength (0 = off); UseSsao: GTAO into ambient
         public float UseIBLDiffuse; public float UseIBLSpecular; // 0 when Lumen V2 owns diffuse GI / RT+SSR own reflections
+        public float UseCapsuleShadows; public float CapPad0, CapPad1, CapPad2; // >0.5 = multiply the capsule-shadow mask (t16) into the sun term
         public Matrix4x4 ViewProjFwd;                        // world → clip (transposed); contact-shadow march reprojection
     }
 
@@ -73,7 +74,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
     ID3D12RootSignature deferredRootSig;   // LightConstants CBV(b0) + FrameConstants CBV(b1) + 16-SRV table + sampler
     ID3D12PipelineState deferredPso;
     Dx12FrameCb<LightConstants> deferredCb;   // P0b: N-buffered (FrameSlot-offset)
-    Dx12DescriptorHeap deferredSrvVisible;  // 16 SRVs copied per frame: G0..G3, depth, irradiance, prefilter, BRDF, shadow, cluster lights/grid/index, RT shadow mask, GTAO, LTC mat (t14) + LTC amp (t15)
+    Dx12DescriptorHeap deferredSrvVisible;  // 17 SRVs copied per frame: G0..G3, depth, irradiance, prefilter, BRDF, shadow, cluster lights/grid/index, RT shadow mask, GTAO, LTC mat (t14) + LTC amp (t15), capsule shadow mask (t16)
     Dx12LtcTables ltcTables;                // area/rect-light LTC lookup tables (t14/t15) — static, built once at init
 
     // BuildDeferredLighting moved VERBATIM into the ctor (re-rooted onto `dev`). clusteredLights stays
@@ -82,11 +83,12 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         dev = device;
         var lightCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Pixel);
         var frameCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.Pixel);
-        // 16 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster lights/grid/index
-        // (t9..t11), RT shadow mask (t12), GTAO (t13), LTC matrix-inverse table (t14), LTC amplitude table (t15).
-        // The two LTC tables (t14/t15) are static area-light data; point/spot scenes never sample them, so the
-        // table growth 14→16 is byte-identical for the default path (the extra descriptors are unread).
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 16, baseShaderRegister: 0);
+        // 17 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster lights/grid/index
+        // (t9..t11), RT shadow mask (t12), GTAO (t13), LTC matrix-inverse table (t14), LTC amplitude table (t15),
+        // capsule shadow mask (t16). The LTC tables (t14/t15) and the capsule mask (t16) are unread by the default
+        // path (no area lights / no capsule casters → UseCapsuleShadows=0), so the table growth 14→17 is
+        // byte-identical for the default path (the extra descriptors are bound but never sampled).
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 17, baseShaderRegister: 0);
         var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
         var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
@@ -111,7 +113,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
 
         deferredCb = new Dx12FrameCb<LightConstants>(dev);
         deferredSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 16, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 17, shaderVisible: true, framesInFlight: dev.FramesInFlight);
         // Build the LTC tables once (CPU fit + GPU upload). Self-contained; no scene/asset dependency.
         ltcTables = new Dx12LtcTables(dev);
     }
@@ -176,6 +178,9 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
             // a broad untextured veil (the orange "tent" on a roofed Bistro hall). Reflections come from Lumen RT /
             // SSR (sky-visibility-aware); the Skybox path never baked IBL (UseIBL=0) so both skies now match.
             UseIBLSpecular = 0f,
+            // Capsule shadows — multiply the analytic capsule-occlusion mask (t16) into the sun term when a
+            // CapsuleShadowCaster ran this frame. 0 when no caster (mask unbound-effective) → byte-identical.
+            UseCapsuleShadows = ctx.CapsuleShadowsThisFrame ? 1f : 0f,
             // Forward world→clip for the contact-shadow screen-space march (HLSL muls row-vector × matrix).
             ViewProjFwd = Matrix4x4.Transpose(ctx.ViewProj),
         });
@@ -183,7 +188,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         // Copy the 16 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster
         // lights/grid/index (t9..t11), RT shadow mask (t12), GTAO (t13), LTC mat (t14), LTC amp (t15).
         deferredSrvVisible.Reset();
-        int b = deferredSrvVisible.AllocateRange(16);
+        int b = deferredSrvVisible.AllocateRange(17);
         // Only the 4 SHADED G-buffer RTs feed lighting (G0..G3 → t0..t3); the motion RT (RT4) is for TAA/FSR.
         for (int i = 0; i < Dx12GBuffer.ShadedRtCount; i++)
             dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + i), gbuffer.ColorSrvCpu(i), heapType);
@@ -207,6 +212,10 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         // their presence is byte-identical for the default path.
         dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 14), ltcTables.Ltc1SrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 15), ltcTables.Ltc2SrvCpu, heapType);
+        // Capsule shadow mask (t16) — the real mask when a CapsuleShadowCaster ran this frame, else a valid
+        // unused fallback. UseCapsuleShadows gates the sample, so the fallback's contents never affect output.
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 16),
+            ctx.CapsuleShadowsThisFrame ? ctx.CapsuleShadowMask : gbuffer.DepthSrvCpu, heapType);
 
         target.RenderColorOnlyCleared(cl => {
             cl.SetGraphicsRootSignature(deferredRootSig);

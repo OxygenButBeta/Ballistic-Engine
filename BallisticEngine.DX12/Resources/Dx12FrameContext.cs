@@ -83,6 +83,13 @@ public sealed class Dx12FrameContext {
     // RtShadowsThisFrame, else a valid unused fallback (gbuffer depth). Reference is stable per frame.
     public Dx12OffscreenTarget RtShadowMask   { get; init; }
 
+    // Capsule shadows (Dx12CapsuleShadowPass, event BeforeOpaqueLighting 250): an R8 occlusion mask SRV
+    // (1 lit / 0 occluded) the deferred sun term multiplies in when CapsuleShadowsThisFrame. The pass writes
+    // its own committed UAV target and exposes the SRV handle here; null/default when no caster is in the
+    // scene (then CapsuleShadowsThisFrame is false and the deferred bind falls back to a valid unused SRV).
+    public CpuDescriptorHandle CapsuleShadowMask { get; set; }
+    public bool CapsuleShadowsThisFrame { get; set; }
+
     // The per-frame FrameConstants CB's GPU virtual address. The orchestrator owns `frameCb` (a shared
     // per-frame resource, filled once before the graph runs — see "what STAYS inline"); the Transparents
     // pass (chunk 8) binds it to its b1 FrameConstants root CBV. Read-only (the address is stable per frame).
