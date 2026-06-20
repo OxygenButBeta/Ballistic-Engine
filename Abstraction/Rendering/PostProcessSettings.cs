@@ -48,6 +48,7 @@ public enum UpscaleMode {
     Balanced,         // 1.7x
     Performance,      // 2.0x
     UltraPerformance, // 3.0x
+    Auto,             // hardware-tier: the DX12 backend picks a concrete mode from GPU VRAM at runtime (Dx12 only)
 }
 
 // Tunables for the HDR -> display pipeline. Neutral by default: only exposure,

@@ -28,6 +28,9 @@ public sealed class Dx12Device : IDisposable {
     // adapter's UMD version (CheckInterfaceSupport on IDXGIDevice), formatted as the familiar a.b.c.d.
     public string AdapterDescription { get; }
     public string AdapterDriverVersion { get; }
+    // Dedicated VRAM in bytes (0 if the query failed). Used by the FSR Auto upscale tier — VRAM is the cheap,
+    // robust hardware proxy (adapter-name parsing is brittle). Captured while the adapter is still live.
+    public ulong DedicatedVideoMemoryBytes { get; }
 
     // Hardware ray-tracing (DXR Tier 1.0+) support, queried ONCE at device creation. The renderer reads this
     // eagerly to AUTO-DOWNGRADE RayTraced GI/reflections/shadows to their screen-space fallbacks on a no-RT GPU
@@ -200,6 +203,7 @@ public sealed class Dx12Device : IDisposable {
         // familiar AMD/NVIDIA driver-version form. Best-effort; both stay "" on failure (never blocks the
         // device). Done while the adapter is still live (it's disposed immediately after).
         try { AdapterDescription = adapter.Description1.Description?.Trim() ?? ""; } catch { AdapterDescription = ""; }
+        try { DedicatedVideoMemoryBytes = (ulong)adapter.Description1.DedicatedVideoMemory; } catch { DedicatedVideoMemoryBytes = 0; }
         try {
             // UMD version is queried against the IDXGIDevice interface GUID (the canonical "driver version"
             // probe). The generic CheckInterfaceSupport<T> overload infers the interface from T.

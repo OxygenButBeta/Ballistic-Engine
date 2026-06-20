@@ -16,7 +16,7 @@
     <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
     <DebugType>portable</DebugType>
     <!-- Passed by the engine at build time; the literal path is an IDE fallback. -->
-    <BallisticEngineDir Condition="'$(BallisticEngineDir)' == ''">E:\Unity Projects\Ballistic-Engine\BallisticEngine.Runtime\bin\Debug\net9.0</BallisticEngineDir>
+    <BallisticEngineDir Condition="'$(BallisticEngineDir)' == ''">E:\Unity Projects\Ballistic-Engine\BallisticEngine.Runtime\bin\Release\net9.0</BallisticEngineDir>
   </PropertyGroup>
 
   <ItemGroup>

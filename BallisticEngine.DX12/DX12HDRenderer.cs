@@ -2009,8 +2009,9 @@ public sealed class DX12HDRenderer : HDRenderer
     // headless A/B (off/nativeaa/quality/balanced/performance/ultra) — a kept test door.
     UpscaleMode ResolveUpscaleMode()
     {
+        UpscaleMode Resolve(UpscaleMode m) => m == UpscaleMode.Auto ? AutoUpscaleModeForHardware() : m;
         string? env = fsrEnv;
-        if (string.IsNullOrEmpty(env)) return PostFX.UpscaleMode;
+        if (string.IsNullOrEmpty(env)) return Resolve(PostFX.UpscaleMode);
         return env.Trim().ToLowerInvariant() switch
         {
             "0" or "off" => UpscaleMode.Off,
@@ -2019,8 +2020,23 @@ public sealed class DX12HDRenderer : HDRenderer
             "balanced" or "b" => UpscaleMode.Balanced,
             "performance" or "perf" or "p" => UpscaleMode.Performance,
             "ultra" or "ultraperformance" or "up" => UpscaleMode.UltraPerformance,
-            _ => PostFX.UpscaleMode,
+            "auto" or "a" => AutoUpscaleModeForHardware(),
+            _ => Resolve(PostFX.UpscaleMode),
         };
+    }
+
+    // FSR Auto: pick a concrete upscale mode from the GPU's dedicated VRAM tier. VRAM is the cheap, robust proxy
+    // (adapter-name parsing is brittle, and a low-VRAM card is exactly the GPU-bound case FSR helps most). A
+    // high-VRAM card has the budget to render native, so it stays Off — FSR's temporal softening isn't worth it
+    // there. Never picks UltraPerformance (too soft for an automatic default). Unknown VRAM → Off (safe native).
+    UpscaleMode AutoUpscaleModeForHardware()
+    {
+        ulong vramMB = dev.DedicatedVideoMemoryBytes / (1024 * 1024);
+        if (vramMB == 0)     return UpscaleMode.Off;          // unknown → safe native
+        if (vramMB <  5000)  return UpscaleMode.Performance;  // ~4 GB and below: aggressive upscale
+        if (vramMB <  9000)  return UpscaleMode.Balanced;     // ~6–8 GB
+        if (vramMB < 13000)  return UpscaleMode.Quality;      // ~10–12 GB
+        return UpscaleMode.Off;                                // >=12 GB: render native
     }
 
     // RunFsr moved VERBATIM into Resources/Dx12FsrPass.Record (chunk 7). The pass runs at the PostProcess event
