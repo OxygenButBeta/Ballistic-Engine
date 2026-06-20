@@ -312,7 +312,13 @@ public sealed class Dx12ClusteredLights : IDisposable {
         cb[2] = MaxLightIndices;
         cb[3] = MaxLightsPerCluster;
 
-        bool async = asyncCullDoor && dev.AsyncComputeEnabled && dev.FrameOpen;
+        // YIELD to Lumen async-GI: only ONE async-compute hand-off per frame is supported (frameSplitThisFrame),
+        // and the Lumen probe-trace hand-off is the far larger overlap win (light cull is a tiny dispatch that
+        // measured a NET LOSS async). When the async-GI door is set, force cull inline so the single hand-off is
+        // Lumen's. Frame-independent door check (Lumen runs LATER in the frame than cull, so a per-frame flag from
+        // it couldn't be seen here — but the env door is constant for the process).
+        bool async = asyncCullDoor && dev.AsyncComputeEnabled && dev.FrameOpen
+                     && !Dx12LumenGiPass.AsyncGiDoorOn;
 
         // The dispatch itself, queue-agnostic: it assumes grid/index/counter are ALREADY in UnorderedAccess and
         // leaves them there. A Compute command list can ONLY express COMMON/UAV/COPY states — never

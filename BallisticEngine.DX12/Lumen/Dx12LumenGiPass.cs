@@ -59,6 +59,31 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         return envDoor == 1 || (envDoor == -1 && ctx.PostFX.LumenEnabled);
     }
 
+    // ---- ASYNC (1-frame-delayed) GI door ----
+    // BALLISTIC_DX12_LUMEN_ASYNC_GI=="1" decouples the GI trace chain from the combine: the combine adds the
+    // PREVIOUS frame's traced indirect into THIS frame's HDR color, then the (heavy) trace/denoise/temporal chain
+    // for THIS frame is recorded AFTER the combine so it overlaps the rest of the frame's graphics. Default OFF →
+    // the combine reads this frame's freshly-traced indirect, byte-identical to the legacy single-phase Record.
+    // ALWAYS forced off under a deterministic capture (a 1-frame delay would shift the golden — paused diffs must
+    // stay byte-identical).
+    static int asyncGiDoor = -2;   // -2 unread, 0 off (default), 1 on
+    static bool AsyncGiDoorRaw() {
+        if (asyncGiDoor == -2)
+            asyncGiDoor = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_ASYNC_GI") == "1" ? 1 : 0;
+        return asyncGiDoor == 1;
+    }
+    // The real compute-queue hand-off (RecordAsyncCompute) is gated additionally on the async-compute INFRA being
+    // up (BALLISTIC_DX12_ASYNC_COMPUTE=1). Door on but infra off → the trace runs inline (RecordAsyncCompute falls
+    // back) so a runtime-correct path with no overlap; byte-identical to door-off when neither is set.
+    static bool AsyncGiArmed(Dx12FrameContext ctx) => AsyncGiDoorRaw() && !ctx.DeterministicCapture;
+
+    // Frame-independent "the async-GI door is set" predicate, read by Dx12ClusteredLights so it YIELDS the single
+    // per-frame async-compute hand-off to Lumen (forces its own cull inline) — both passes target the SAME hand-off
+    // (frameSplitThisFrame allows only one), and the Lumen trace is the far larger overlap win. See the collision
+    // note in Dx12ClusteredLights.GpuCull. The deterministic guard lives in AsyncGiArmed (the door alone here is
+    // frame-independent; under a deterministic capture Lumen runs inline anyway, and so should cull → this is fine).
+    public static bool AsyncGiDoorOn => AsyncGiDoorRaw();
+
     // The frame-level "Lumen runs" predicate, shared with the orchestrator (which mirrors it into
     // ctx.LumenActiveThisFrame so the deferred pass suppresses its IBL diffuse ambient before this pass adds
     // its own diffuse indirect). Lumen is HW-RT only — no hidden SSGI fallback (plan gate #6).
@@ -105,7 +130,16 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     ID3D12PipelineState denoisePso;
     // (per-pass denoise CBs live in denoiseCbs[]/denoiseCbMappedArr[] — see BuildDenoisePipeline)
     Dx12DescriptorHeap denoiseSrv;      // 4 descriptors (E/depth/normal SRV + filtered UAV)
-    Dx12OffscreenTarget indirectFiltered; // full-res filtered E the combine reads
+    Dx12OffscreenTarget indirectFiltered; // full-res filtered E the combine reads (the trace/temporal write target)
+
+    // ---- ASYNC GI double-buffer ----
+    // When the async-GI door is ON the combine adds the PREVIOUS frame's filtered E, so the trace chain (which
+    // writes the CURRENT frame's filtered E) can be re-ordered after the combine (decoupled). Two filtered
+    // buffers ping-pong by frame: `indirectFiltered` is the trace WRITE target this frame, `indirectFilteredB`
+    // holds last frame's result the combine READS. They swap at the END of Record. When the door is OFF the B
+    // buffer is never touched (single-buffer legacy path), so default behaviour is byte-identical.
+    Dx12OffscreenTarget indirectFilteredB;   // the "previous frame" filtered E the async combine reads
+    bool asyncHistoryValid;                  // false until the trace has filled at least one buffer (first async frame skips combine)
 
     [StructLayout(LayoutKind.Sequential)]
     struct DenoiseConstants { public Vector2 Texel; public float Step; public float Enabled; }
@@ -220,6 +254,25 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
 
     int frameCounter;
 
+    // ---- ASYNC trace-phase command-list sink ----
+    // When the async-GI hand-off is taken, the ENTIRE trace phase (TraceScreenProbe / per-pixel trace + denoise +
+    // temporal + every copy/transition between them) is recorded into ONE compute command list passed by
+    // RecordAsyncCompute. The trace code is written queue-agnostically: every GPU command goes through Emit(), every
+    // texture state change through ToSrv/ToNonPixel/ToUav, every texture copy through Copy(). When `asyncCl` is null
+    // (the door-off / inline path) those helpers fall back to the per-call dev.ExecuteSync + Dx12OffscreenTarget
+    // methods — byte-identical to the legacy code, since each helper expands to the exact same ExecuteSync it
+    // replaced. When `asyncCl` is non-null they append to the single compute list instead (no submit between them).
+    ID3D12GraphicsCommandList4 asyncCl;
+
+    // Emit a block of GPU commands: append to the open async compute list, or run as its own graphics submit inline.
+    void Emit(Action<ID3D12GraphicsCommandList4> rec) { if (asyncCl != null) rec(asyncCl); else dev.ExecuteSync(rec); }
+    // Texture state helpers — on the async path a compute list can ONLY reach UAV / NonPixelSRV / Copy states
+    // (PixelShaderResource is graphics-only), so the SRV read state is NonPixel there; inline keeps the legacy state.
+    void ToShaderRead(Dx12OffscreenTarget t) { if (asyncCl != null) t.ColorTransitionInList(asyncCl, ResourceStates.NonPixelShaderResource); else t.ColorToShaderResource(); }
+    void ToNonPixel(Dx12OffscreenTarget t)   { if (asyncCl != null) t.ColorTransitionInList(asyncCl, ResourceStates.NonPixelShaderResource); else t.ColorToNonPixelShaderResource(); }
+    void ToUav(Dx12OffscreenTarget t)        { if (asyncCl != null) t.ColorTransitionInList(asyncCl, ResourceStates.UnorderedAccess); else t.ColorToUnorderedAccess(); }
+    void Copy(Dx12OffscreenTarget dst, Dx12OffscreenTarget src) { if (asyncCl != null) dst.CopyColorFromInList(asyncCl, src); else dst.CopyColorFrom(src); }
+
     // P7 #1 update-budget dirty tracking: the sun dir/color + light count the cache was last FULLY relit with.
     // A change (or a topology rebuild) → ForceFull this frame so the round-robin budget never starves a light
     // change of latency. NaN sentinel forces a full relight on the first frame.
@@ -248,6 +301,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         var clusteredLights = ctx.ClusteredLights;
         var target = ctx.SceneColor;
 
+        // ASYNC GI: when armed, the combine adds the PREVIOUS frame's filtered E (indirectFilteredB) into the HDR
+        // color NOW, then the trace chain for THIS frame is recorded afterwards (writing indirectFiltered) so it
+        // decouples from / overlaps the combine. First async frame has no history → combine is skipped (GI invisible
+        // that one frame, accepted). Door off → asyncGi false → legacy single-phase order (combine reads this frame).
+        bool asyncGi = AsyncGiArmed(ctx);
+
         Matrix4x4.Invert(ctx.ViewProj, out Matrix4x4 invVP);
 
         // Dials: the GlobalIllumination VOLUME (ctx.PostFX) drives them; the BALLISTIC_DX12_LUMEN_* env doors
@@ -272,6 +331,14 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         if (useCards && scene.TotalTriangles > 0)
             LightCards(ctx, sunDirN, clusteredLights, ibl, skyIntensity, useSky);
         Prof("LightCards");
+
+        // ASYNC GI — PHASE A (combine of the PREVIOUS frame's GI), recorded BEFORE this frame's trace chain so the
+        // trace overlaps. Skipped on the very first async frame (no history yet). The combine reads indirectFilteredB.
+        if (asyncGi && asyncHistoryValid)
+        {
+            RecordCombine(ctx, gbuffer, target, fx, indirectFilteredB);
+            Prof("combine(async-prev)");
+        }
 
         traceCb.Write(new LumenConstants
         {
@@ -339,12 +406,107 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // The trace reads depth/normal/material/scene-color as SRVs from the COMPUTE (non-pixel) stage, and the
         // scene color must be readable too. Promote: G-buffer to the combined read; scene color to SRV. ALL in
         // one list so state tracking is exact (the RTAO-pass pattern that avoided the split-submit barrier bugs).
+        //
+        // ASYNC GI cross-queue state ownership: when the trace will be recorded on the COMPUTE queue, the GRAPHICS
+        // queue must leave every INPUT it reads in a COMPUTE-legal state BEFORE the hand-off (a compute list cannot
+        // reach PIXEL_SHADER_RESOURCE). gbuffer.ToShaderResource() is already the combined PIXEL|NON_PIXEL superset
+        // (compute-legal). target (lit scene color, t4 — only read when screen-trace is on) + probeHistory (t14) +
+        // probeAtlasHistory (t13, used by the screen-probe path) → NON_PIXEL here on graphics; the compute trace
+        // only READS them. Cards (CardRadiance) were already left NonPixelShaderResource by LightCards (above) — a
+        // compute-legal state — so the compute trace's root-SRV read is valid with no extra transition.
+        bool asyncTrace = asyncGi && dev.AsyncComputeEnabled && dev.FrameOpen && !scene.DirtyThisFrame;
         gbuffer.ToShaderResource();
-        target.ColorToShaderResource();
-        probeHistory.ColorToShaderResource();   // #3: the trace reads last frame's accumulated probes (table t14)
-        indirect.ColorToUnorderedAccess();
+        if (asyncTrace)
+        {
+            target.ColorToNonPixelShaderResource();
+            probeHistory.ColorToNonPixelShaderResource();
+            probeAtlasHistory.ColorToNonPixelShaderResource();   // screen-probe path reads it as t13 (NON_PIXEL)
+            // ROOT CAUSE 1 — a COMPUTE list can ONLY express COMMON/UAV/NON_PIXEL/COPY states; it can NEVER write a
+            // ResourceBarrier from/to RENDER_TARGET (GBV: "D3D12_RESOURCE_STATES has invalid flags (0x4) for compute
+            // command list"). Every offscreen scratch the trace phase touches RESTS in RENDER_TARGET (its ctor state).
+            // So the GRAPHICS queue must move them ALL into their compute-legal trace state HERE, pre-hand-off — then
+            // the ToUav()/ToShaderRead() calls inside RecordTracePhase (which run on the compute list) become NO-OPS
+            // (ColorTransitionInList → TransitionTo is idempotent: state==target writes no barrier). The light-cull
+            // pattern, applied to textures: the Direct queue performs the only RENDER_TARGET transitions; the compute
+            // queue sees these targets already in UAV/NON_PIXEL and only ever transitions among compute-legal states.
+            //   indirect / indirectFiltered / indirectResolved / probeAtlas / probeAtlasFiltered → UAV (trace writes them)
+            //   probeAtlasHistory + target + probeHistory → NON_PIXEL (above; trace only reads them)
+            // These pre-hand-off transitions are ASYNC-PATH ONLY — the inline/door-off path is untouched (below).
+            indirect.ColorToUnorderedAccess();
+            indirectFiltered.ColorToUnorderedAccess();
+            indirectResolved.ColorToUnorderedAccess();
+            probeAtlas.ColorToUnorderedAccess();
+            probeAtlasFiltered.ColorToUnorderedAccess();
+        }
+        else
+        {
+            target.ColorToShaderResource();
+            probeHistory.ColorToShaderResource();   // #3: the trace reads last frame's accumulated probes (table t14)
+            indirect.ColorToUnorderedAccess();
+        }
 
         Prof("pre-trace setup");
+
+        // The trace PHASE — per-pixel/screen-probe front end + denoise + temporal + history snapshot. Recorded as
+        // one block so it runs EITHER inline on the graphics frame list (door off → byte-identical) OR on the async
+        // compute queue (door on → overlaps the post-handoff graphics: Fog/Reflections/Post). RecordAsyncCompute
+        // falls back to inline when the infra is off or a frame isn't open.
+        if (asyncTrace)
+        {
+            dev.RecordAsyncCompute(cl =>
+            {
+                asyncCl = cl;
+                try { RecordTracePhase(ctx, sceneAS, rtGeo, clusteredLights, ibl, target, gbuffer, fx,
+                                       intensity, maxDist, skyIntensity, useSky, useCards); }
+                finally { asyncCl = null; }
+            });
+        }
+        else
+        {
+            RecordTracePhase(ctx, sceneAS, rtGeo, clusteredLights, ibl, target, gbuffer, fx,
+                             intensity, maxDist, skyIntensity, useSky, useCards);
+        }
+        Prof("TRACE/gather");
+
+        if (asyncGi)
+        {
+            // ASYNC GI — PHASE B done: the trace chain above wrote THIS frame's filtered E into indirectFiltered.
+            // The combine for this frame already ran (Phase A, reading last frame's buffer), so DON'T combine again
+            // here. Swap the two filtered buffers so this frame's freshly-written E becomes next frame's "previous"
+            // the combine reads, and the now-stale B buffer becomes next frame's trace write target. Mark history
+            // valid so the next frame's Phase A combine fires.
+            (indirectFiltered, indirectFilteredB) = (indirectFilteredB, indirectFiltered);
+            asyncHistoryValid = true;
+        }
+        else
+        {
+            // LEGACY single-phase order: combine THIS frame's freshly-traced E now (byte-identical to before).
+            RecordCombine(ctx, gbuffer, target, fx, indirectFiltered);
+        }
+
+        Prof("combine");
+        // Swap the cache ping-pong: this frame's written cache becomes next frame's "previous" (EMA + bounce
+        // source). Only when cards actually ran this frame (else the read/write buffers didn't advance).
+        if (useCards && scene.TotalTriangles > 0)
+            scene.SwapCache();
+        frameCounter++;
+    }
+
+    // TRACE PHASE — the heavy GI work: front-end trace (screen-probe place/trace/integrate OR per-pixel CSTrace),
+    // spatial denoise, motion-vector temporal resolve, and the history snapshot that writes `indirectFiltered`. The
+    // INPUTS are already promoted to the right state by the caller (gbuffer combined-read; on the async path target/
+    // probeHistory/probeAtlasHistory in NON_PIXEL, on graphics, before the hand-off). Every GPU command goes through
+    // Emit()/Copy()/ToShaderRead()/ToUav() so the SAME code records either inline on the graphics frame list (door
+    // off → byte-identical to the legacy single-phase order, each helper expanding to the exact ExecuteSync it
+    // replaced) or into ONE compute command list (door on, `asyncCl` set → overlaps the post-hand-off graphics).
+    unsafe void RecordTracePhase(Dx12FrameContext ctx, Dx12SceneAS sceneAS, Dx12RtGeometry rtGeo,
+                                 Dx12ClusteredLights clusteredLights, Dx12IblBaker ibl, Dx12OffscreenTarget target,
+                                 Dx12GBuffer gbuffer, PostProcessSettings fx, float intensity, float maxDist,
+                                 float skyIntensity, bool useSky, bool useCards)
+    {
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        Dx12DescriptorHeap bindless = Dx12Backend.BindlessHeap;
+
         if (WantScreenProbe(ctx))
         {
             // Sıra 1: SCREEN-PROBE front end fills `indirect` (place → trace → integrate). Same E contract.
@@ -352,7 +514,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         }
         else
         {
-            dev.ExecuteSync(cl =>
+            Emit(cl =>
             {
                 cl.SetDescriptorHeaps(bindless.Heap);
                 cl.SetComputeRootSignature(traceRootSig);
@@ -371,39 +533,17 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                 cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
             });
         }
-        indirect.ColorToShaderResource();
-        Prof("TRACE/gather");
+        ToShaderRead(indirect);
 
         // === COMMON MOTION-VECTOR TEMPORAL RESOLVE (LumenTemporal) ===
-        // Reproject the resolved history with the REAL G-buffer motion vector (RT4) + neighbourhood AABB clamp +
-        // disocclusion reject, EMA-blend the fresh E → writes the resolved E to `indirectResolved`, which then
-        // feeds the denoise/combine, and snapshots into `probeHistory` for next frame. This is the proper
-        // motion-stability fix (covers BOTH the per-pixel and screen-probe paths; the old inline temporal was
-        // camera-only and screen-probe had none). BALLISTIC_DX12_LUMEN_NOTEMPORAL=1 bypasses it (raw E).
         bool temporalOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOTEMPORAL") != "1"
                           && !ctx.DeterministicCapture;   // deterministic capture: skip (single frame, fresh) for golden stability
-        // ADAPTIVE DENOISE signal: capture whether THIS frame had a valid temporal history BEFORE the temporal
-        // pass overwrites it. A history miss (first frame / resize / a big disocclusion that rejected most of the
-        // reprojected E) means the indirect is still single-frame-noisy → the denoise temporarily widens to clean
-        // it; in steady state (history valid) the temporal accumulation already did the heavy lifting so 1 pass is
-        // enough. This is what lets the Balanced/Performance tiers run denoise=1 without grain on camera cuts.
         bool historyMissThisFrame = !probeHistoryValid;
 
-        // === SPATIAL DENOISE FIRST (was AFTER temporal — the reorder is the flicker fix). === The à-trous blur is a
-        // SPATIAL filter of the per-pixel grain; the temporal resolve is what stabilises the result over frames. The
-        // old order (temporal → denoise → combine, history snapshot taken BEFORE the denoise) had two faults that
-        // produced a STATIC-camera 2-frame ping-pong (measured: hotspot 0.027 with denoise, 0 without; the user's
-        // "indirect ışıkta parıltı"): (1) the denoised image the COMBINE shows was NOT the image fed back as history,
-        // so the temporal accumulation could never converge the thing actually on screen — the blur re-spread each
-        // frame's residual cache/probe wobble across neighbours every frame, unbounded by the history; (2) the blur
-        // AMPLIFIES a sparse per-frame wobble (a few cache-updated texels) into a wide visible patch. Denoising FIRST,
-        // then resolving the denoised E temporally — and snapshotting THAT same denoised+resolved E as the history —
-        // closes the loop: the temporal EMA + rate-limit now bound the denoised signal frame-to-frame, so a residual
-        // wobble is smeared over many frames (invisible) instead of flashing. Combine and history read ONE signal.
+        // === SPATIAL DENOISE FIRST (the flicker fix): à-trous blur of the per-pixel grain, BEFORE the temporal
+        // resolve, so combine + history read the SAME denoised+resolved signal. ===
         bool denoise = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NODENOISE") != "1" && fx.LumenDenoisePasses > 0;
         int dnPasses = denoise ? Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_DENOISE_PASSES", fx.LumenDenoisePasses), 1, MaxDenoisePasses) : 1;
-        // ADAPTIVE: on a history miss (camera cut / resize) the indirect is still raw-noisy → widen to ≥3 passes this
-        // frame; steady-state keeps the tier count (1). Env door fixes the count (no adaptivity). Determinism: fixed.
         bool adaptiveDenoise = denoise && Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_DENOISE_PASSES") == null
                                && !ctx.DeterministicCapture;
         if (adaptiveDenoise && historyMissThisFrame)
@@ -414,14 +554,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         denoiseSrv.Reset();   // ONCE per frame — each pass takes a DISTINCT 4-descriptor range (no cross-pass alias)
         for (int pass = 0; pass < dnPasses; pass++)
         {
-            unsafe
+            *(DenoiseConstants*)denoiseCbMappedArr[pass] = new DenoiseConstants
             {
-                *(DenoiseConstants*)denoiseCbMappedArr[pass] = new DenoiseConstants
-                {
-                    Texel = new Vector2(1f / indirect.Width, 1f / indirect.Height),
-                    Step = denoise ? (1 << pass) : 1f, Enabled = denoise ? 1f : 0f,
-                };
-            }
+                Texel = new Vector2(1f / indirect.Width, 1f / indirect.Height),
+                Step = denoise ? (1 << pass) : 1f, Enabled = denoise ? 1f : 0f,
+            };
             int db = denoiseSrv.AllocateRange(4);
             dev.Device.CopyDescriptorsSimple(1, denoiseSrv.Cpu(db + 0), src.ColorSrvCpu, heapType);           // t0 E in
             dev.Device.CopyDescriptorsSimple(1, denoiseSrv.Cpu(db + 1), gbuffer.DepthSrvCpu, heapType);       // t1 depth
@@ -430,9 +567,9 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             {
                 Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
             }, denoiseSrv.Cpu(db + 3));                                                                        // u0 E out
-            dst.ColorToUnorderedAccess();
+            ToUav(dst);
             ulong passCbAddr = denoiseCbs[pass].GPUVirtualAddress + (ulong)DenoiseCbOffset;
-            dev.ExecuteSync(cl =>
+            Emit(cl =>
             {
                 cl.SetDescriptorHeaps(denoiseSrv.Heap);
                 cl.SetComputeRootSignature(denoiseRootSig);
@@ -441,21 +578,17 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                 cl.SetComputeRootDescriptorTable(1, denoiseSrv.Gpu(db));
                 cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
             });
-            dst.ColorToShaderResource();
+            ToShaderRead(dst);
             (src, dst) = (dst, src);
         }
         // Land the denoised result back in `indirect` (the temporal pass's t0 fresh-E input). `src` holds the last
         // written buffer; copy it into indirect when that isn't already indirect.
         if (!ReferenceEquals(src, indirect))
-            indirect.CopyColorFrom(src);
-        indirect.ColorToShaderResource();
+            Copy(indirect, src);
+        ToShaderRead(indirect);
         Prof("denoise");
 
-        // === COMMON MOTION-VECTOR TEMPORAL RESOLVE (LumenTemporal) — now AFTER the denoise ===
-        // Reproject the resolved history with the REAL G-buffer motion vector (RT4) + AABB clamp + disocclusion
-        // reject + per-frame rate-limit, EMA-blend the DENOISED fresh E → indirectResolved, which feeds the combine
-        // AND becomes next frame's history. Reading the denoised E (not the raw trace) means combine and history are
-        // the SAME signal, so the EMA converges on a static camera (the ping-pong fix). NOTEMPORAL=1 bypasses (raw).
+        // === COMMON MOTION-VECTOR TEMPORAL RESOLVE (LumenTemporal) — AFTER the denoise ===
         if (temporalOn)
         {
             tempCb.Write(new TemporalConstants
@@ -466,8 +599,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                 W = (uint)indirect.Width, H = (uint)indirect.Height,
                 Pad0 = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_TEMPORAL_NOMOTION") == "1" ? 1f : 0f,
             });
-            probeHistory.ColorToShaderResource();
-            indirectResolved.ColorToUnorderedAccess();
+            ToShaderRead(probeHistory);
+            ToUav(indirectResolved);
             tempSrv.Reset();
             int tb = tempSrv.AllocateRange(5);
             dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 0), indirect.ColorSrvCpu, heapType);          // t0 denoised fresh E
@@ -479,7 +612,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                 Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
             }, tempSrv.Cpu(tb + 4));                                                                            // u0 resolved
             ulong tcb = tempCb.Gpu;
-            dev.ExecuteSync(cl =>
+            Emit(cl =>
             {
                 cl.SetDescriptorHeaps(tempSrv.Heap);
                 cl.SetComputeRootSignature(tempRootSig);
@@ -488,31 +621,37 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                 cl.SetComputeRootDescriptorTable(1, tempSrv.Gpu(tb));
                 cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
             });
-            indirectResolved.ColorToShaderResource();
+            ToShaderRead(indirectResolved);
             // resolved E → the combine reads it (via indirectFiltered) AND it becomes next frame's history.
-            indirectFiltered.CopyColorFrom(indirectResolved);
-            indirectFiltered.ColorToShaderResource();
-            probeHistory.CopyColorFrom(indirectResolved);
-            probeHistory.ColorToShaderResource();
+            Copy(indirectFiltered, indirectResolved);
+            ToShaderRead(indirectFiltered);
+            Copy(probeHistory, indirectResolved);
+            ToShaderRead(probeHistory);
             probeHistoryValid = true;
         }
         else
         {
             // No temporal (deterministic/off): the combine reads the denoised E; snapshot it as history too.
-            indirectFiltered.CopyColorFrom(indirect);
-            indirectFiltered.ColorToShaderResource();
-            probeHistory.CopyColorFrom(indirect);
-            probeHistory.ColorToShaderResource();
+            Copy(indirectFiltered, indirect);
+            ToShaderRead(indirectFiltered);
+            Copy(probeHistory, indirect);
+            ToShaderRead(probeHistory);
             probeHistoryValid = true;
         }
         Prof("temporal");
+    }
 
-        // === COMBINE: add E*albedo*ao/PI directly into the HDR scene color via an additive (One/One) fullscreen
-        // PSO — no scratch target needed. The deferred pass already suppressed its IBL diffuse ambient
-        // (ctx.LumenActiveThisFrame → UseIBLDiffuse=0), so this adds Lumen's diffuse indirect without double-count.
-        // BALLISTIC_DX12_LUMEN_DEBUG=1 swaps to an OPAQUE-replace PSO that shows the raw irradiance E instead. ===
-        Prof("denoise");
+    // COMBINE: add E*albedo*ao/PI from `eBuffer` (a filtered indirect-irradiance target) directly into the HDR
+    // scene color via an additive (One/One) fullscreen PSO — no scratch target needed. The deferred pass already
+    // suppressed its IBL diffuse ambient (ctx.LumenActiveThisFrame → UseIBLDiffuse=0), so this adds Lumen's diffuse
+    // indirect without double-count. BALLISTIC_DX12_LUMEN_DEBUG=1 swaps to an OPAQUE-replace PSO showing raw E.
+    // `eBuffer` = this frame's trace output (legacy/sync path) OR last frame's (async-GI path) — same shape either way.
+    unsafe void RecordCombine(Dx12FrameContext ctx, Dx12GBuffer gbuffer, Dx12OffscreenTarget target,
+                              PostProcessSettings fx, Dx12OffscreenTarget eBuffer)
+    {
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         gbuffer.ToShaderResource();
+        eBuffer.ColorToShaderResource();   // the combine reads E as a pixel-shader SRV (idempotent if already SRV)
         // GTAO into the GI combine at the AmbientOcclusion volume's strength (env override _LUMEN_AO). The GTAO
         // buffer is ctx.AoResult when AO is actually rendered this frame; else a valid fallback + AoStrength 0
         // (so the fallback's contents never affect the output). This is what makes the AmbientOcclusion override
@@ -528,11 +667,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         combineCb.Write(new CombineConstants
         {
             AoStrength = aoStrength,
-            IndirectTexel = new Vector2(1f / indirect.Width, 1f / indirect.Height),   // half-res texel for the upsample
+            IndirectTexel = new Vector2(1f / eBuffer.Width, 1f / eBuffer.Height),   // half-res texel for the upsample
         });
         combineSrv.Reset();
         int cb = combineSrv.AllocateRange(5);
-        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 0), indirectFiltered.ColorSrvCpu, heapType);  // t0 E (denoised)
+        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 0), eBuffer.ColorSrvCpu, heapType);           // t0 E (denoised)
         dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 1), gbuffer.ColorSrvCpu(0), heapType);        // t1 albedo
         dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 2), gbuffer.ColorSrvCpu(2), heapType);        // t2 material (baked ao)
         dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(cb + 3), gbuffer.DepthSrvCpu, heapType);           // t3 depth
@@ -549,13 +688,6 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
         });
-
-        Prof("combine");
-        // Swap the cache ping-pong: this frame's written cache becomes next frame's "previous" (EMA + bounce
-        // source). Only when cards actually ran this frame (else the read/write buffers didn't advance).
-        if (useCards && scene.TotalTriangles > 0)
-            scene.SwapCache();
-        frameCounter++;
     }
 
     // P3 card lighting: 1D dispatch over all scene triangles, writing each triangle's lit first-bounce radiance
@@ -744,8 +876,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             }, bindless.Cpu(SpTableBase + 9));                                                                      // u3 probe atlas FILTERED (blob fix)
         }
 
-        probeAtlas.ColorToUnorderedAccess();
-        probeAtlasFiltered.ColorToUnorderedAccess();
+        ToUav(probeAtlas);
+        ToUav(probeAtlasFiltered);
 
         void SetCommonRoots(ID3D12GraphicsCommandList cl)
         {
@@ -780,7 +912,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         var slot11 = bindless.Gpu(SpTableBase + 7);
 
         // PLACE — writes probeHeaders (root UAV). indirect + atlas already UAV.
-        dev.ExecuteSync(cl =>
+        Emit(cl =>
         {
             cl.SetDescriptorHeaps(bindless.Heap);
             cl.SetComputeRootSignature(spRootSig);
@@ -793,8 +925,10 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
 
         // TRACE — reads the previous accumulated atlas (t13) from a COMPUTE shader → NON_PIXEL state (not the
         // default PIXEL from ColorToShaderResource; that PIXEL/NON_PIXEL mismatch was a GBV InvalidSubresourceState).
-        probeAtlasHistory.ColorToNonPixelShaderResource();
-        dev.ExecuteSync(cl =>
+        // On the async path the caller already left probeAtlasHistory NON_PIXEL on the GRAPHICS queue before the
+        // hand-off (a compute list could not transition from PIXEL) — ToNonPixel is then idempotent (no barrier).
+        ToNonPixel(probeAtlasHistory);
+        Emit(cl =>
         {
             cl.SetDescriptorHeaps(bindless.Heap);
             cl.SetComputeRootSignature(spRootSig);
@@ -806,15 +940,18 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         });
 
         // Snapshot this frame's accumulated atlas + headers into the history for next frame's EMA + reproject test.
-        probeAtlasHistory.CopyColorFrom(probeAtlas);
-        // headers → prev (a plain buffer copy; both are committed UAV/SRV-readable structured buffers).
-        dev.ExecuteSync(cl =>
+        Copy(probeAtlasHistory, probeAtlas);
+        // headers → prev (a plain buffer copy; both are committed UAV/SRV-readable structured buffers). probeHeadersPrev
+        // rests in NON_PIXEL (it is only ever read as a root SRV from CSIntegrate, a COMPUTE shader). UAV/COPY/NON_PIXEL
+        // are ALL compute-legal, so this records identically on either queue — GenericRead (here previously) could NOT,
+        // its PIXEL_SHADER_RESOURCE bit is illegal on a COMPUTE list and tripped Close() → E_INVALIDARG.
+        Emit(cl =>
         {
             cl.ResourceBarrierTransition(probeHeaders, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
-            cl.ResourceBarrierTransition(probeHeadersPrev, ResourceStates.GenericRead, ResourceStates.CopyDest);
+            cl.ResourceBarrierTransition(probeHeadersPrev, ResourceStates.NonPixelShaderResource, ResourceStates.CopyDest);
             cl.CopyResource(probeHeadersPrev, probeHeaders);
             cl.ResourceBarrierTransition(probeHeaders, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
-            cl.ResourceBarrierTransition(probeHeadersPrev, ResourceStates.CopyDest, ResourceStates.GenericRead);
+            cl.ResourceBarrierTransition(probeHeadersPrev, ResourceStates.CopyDest, ResourceStates.NonPixelShaderResource);
         });
         spHistoryValid = true;
 
@@ -822,12 +959,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // of neighbouring probes (depth/normal/world bilateral) → removes the probe-to-probe variance (blob) at its
         // SOURCE, cheaply (probe-res, not full-res). Reads ProbeAtlas (u1), writes ProbeAtlasFiltered (u3); the
         // integrate then reads ProbeAtlasFiltered. BALLISTIC_DX12_LUMEN_PROBE_NOFILTER=1 bypasses (copy raw → filtered).
-        probeAtlas.ColorToUnorderedAccess();
+        ToUav(probeAtlas);
         bool probeFilter = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_PROBE_NOFILTER") != "1";
         if (probeFilter)
         {
-            probeAtlasFiltered.ColorToUnorderedAccess();
-            dev.ExecuteSync(cl =>
+            ToUav(probeAtlasFiltered);
+            Emit(cl =>
             {
                 cl.SetDescriptorHeaps(bindless.Heap);
                 cl.SetComputeRootSignature(spRootSig);
@@ -840,9 +977,9 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         }
         else
         {
-            probeAtlasFiltered.CopyColorFrom(probeAtlas);   // copy-barriers already serialise the write
-            probeAtlas.ColorToUnorderedAccess();
-            probeAtlasFiltered.ColorToUnorderedAccess();
+            Copy(probeAtlasFiltered, probeAtlas);   // copy-barriers already serialise the write
+            ToUav(probeAtlas);
+            ToUav(probeAtlasFiltered);
         }
 
         // PROBE-SH PROJECTION — the integrate-cost fix. Project each probe's filtered oct tile into 9 RGB
@@ -852,7 +989,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         bool probeSHOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_PROBE_NOSH") != "1";
         if (probeSHOn)
         {
-            dev.ExecuteSync(cl =>
+            Emit(cl =>
             {
                 cl.SetDescriptorHeaps(bindless.Heap);
                 cl.SetComputeRootSignature(spRootSig);
@@ -866,7 +1003,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
 
         // INTEGRATE — reads ProbeAtlasFiltered (u3) + the history SRV. The atlas/filtered are UAV. With SH on it
         // reads probeSH (u4) and ignores the oct tile; the spIntegratePso shader picks the path by a CB flag.
-        dev.ExecuteSync(cl =>
+        Emit(cl =>
         {
             cl.SetDescriptorHeaps(bindless.Heap);
             cl.SetComputeRootSignature(spRootSig);
@@ -1202,11 +1339,18 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         int lw = Math.Max(1, fullW / scale), lh = Math.Max(1, fullH / scale);
         indirect?.Dispose();
         indirectFiltered?.Dispose();
+        indirectFilteredB?.Dispose();
         probeHistory?.Dispose();
         indirect = new Dx12OffscreenTarget(dev, lw, lh, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
         indirectFiltered = new Dx12OffscreenTarget(dev, lw, lh, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
+        // Async-GI second filtered buffer (the previous-frame E the decoupled combine reads). Allocated
+        // unconditionally (cheap, one HDR target) so a runtime async-door flip needs no reallocation; untouched
+        // when the door is off. A resize invalidates the cross-frame history → first async frame skips the combine.
+        indirectFilteredB = new Dx12OffscreenTarget(dev, lw, lh, withDepth: false,
+            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
+        asyncHistoryValid = false;
         probeHistory = new Dx12OffscreenTarget(dev, lw, lh, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
         probeHistoryValid = false;   // a resized history is stale → first frame takes the raw E (alpha=1)
@@ -1233,8 +1377,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             ResourceDescription.Buffer((ulong)(probeHeaderCount * 32), ResourceFlags.AllowUnorderedAccess),
             ResourceStates.UnorderedAccess);
         probeHeadersPrev?.Dispose();   // Sıra 3: previous-frame headers (reproject reject) — copy dest / root SRV
+        // NON_PIXEL (not GenericRead): this buffer is only ever read as a root SRV from CSIntegrate (a COMPUTE
+        // shader), never in a pixel stage. NON_PIXEL is legal in BOTH the graphics and the async-compute path,
+        // whereas GenericRead's PIXEL_SHADER_RESOURCE bit cannot be expressed on a COMPUTE command list
+        // (Close() → E_INVALIDARG). Created in this resting state so the first CopyDest transition matches.
         probeHeadersPrev = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)(probeHeaderCount * 32)), ResourceStates.GenericRead);
+            ResourceDescription.Buffer((ulong)(probeHeaderCount * 32)), ResourceStates.NonPixelShaderResource);
         // SH irradiance cache: 7 float4 (112 bytes) per probe. Sized off probe COUNT (oct-independent), so it
         // survives a tier octSize change (only the atlas trio re-sizes there). CSProbeSH writes it; CSIntegrate reads.
         probeSH?.Dispose();
@@ -1270,7 +1418,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         denoisePso?.Dispose(); denoiseRootSig?.Dispose(); denoiseSrv?.Dispose();
         if (denoiseCbs != null) foreach (var cb in denoiseCbs) cb?.Dispose();
         combinePso?.Dispose(); combineDebugPso?.Dispose(); combineRootSig?.Dispose(); combineSrv?.Dispose(); combineCb?.Dispose();
-        indirect?.Dispose(); indirectFiltered?.Dispose(); probeHistory?.Dispose();
+        indirect?.Dispose(); indirectFiltered?.Dispose(); indirectFilteredB?.Dispose(); probeHistory?.Dispose();
         tempPso?.Dispose(); tempRootSig?.Dispose(); tempCb?.Dispose(); tempSrv?.Dispose(); indirectResolved?.Dispose();
         spPlacePso?.Dispose(); spTracePso?.Dispose(); spIntegratePso?.Dispose(); spFilterPso?.Dispose(); spRootSig?.Dispose();
         probeAtlasFiltered?.Dispose();

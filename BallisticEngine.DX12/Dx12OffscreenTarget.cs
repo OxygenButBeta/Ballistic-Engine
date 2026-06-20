@@ -201,6 +201,19 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         });
     }
 
+    // Like CopyColorFrom but records into a CALLER-supplied list (state-tracked) and leaves BOTH targets in a
+    // COMPUTE-legal state (NonPixelShaderResource) instead of RenderTarget — so the whole copy can run on the
+    // ASYNC COMPUTE queue (a compute list cannot express RENDER_TARGET). Used by the Lumen async-GI trace phase,
+    // which records its entire copy/dispatch chain into one compute command list. The end state is a valid SRV
+    // for a subsequent compute read; a later graphics pass re-transitions to whatever it needs.
+    public void CopyColorFromInList(ID3D12GraphicsCommandList4 cl, Dx12OffscreenTarget src) {
+        TransitionTo(cl, ResourceStates.CopyDest);
+        src.TransitionTo(cl, ResourceStates.CopySource);
+        cl.CopyResource(RenderTarget, src.RenderTarget);
+        TransitionTo(cl, ResourceStates.NonPixelShaderResource);
+        src.TransitionTo(cl, ResourceStates.NonPixelShaderResource);
+    }
+
     // Color state transitions: the composite reads the HDR scene color as an SRV.
     public void ColorToShaderResource() {
         dev.ExecuteSync(cl => TransitionTo(cl, ResourceStates.PixelShaderResource));

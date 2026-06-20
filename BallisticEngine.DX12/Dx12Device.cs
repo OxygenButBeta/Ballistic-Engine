@@ -627,7 +627,11 @@ public sealed class Dx12Device : IDisposable {
         cAlloc.Reset();
         cList.Reset(cAlloc, null);
         record(cList);
-        cList.Close();
+        try { cList.Close(); }
+        catch (Exception ex) {
+            if (HasInfoQueue) Console.Error.WriteLine($"[ASYNC-CLOSE-FAIL] {ex.Message}\n{DrainDebugMessages()}");
+            throw;
+        }
         computeQueue.ExecuteCommandList(cList);
         ulong b = ++asyncFenceValue;
         computeQueue.Signal(asyncFence, b);
