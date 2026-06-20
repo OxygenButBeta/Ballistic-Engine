@@ -37,10 +37,11 @@ Texture2DArray ShadowCascades : register(t9);   // sun cascade depth (R32_Float)
 
 // Clustered punctual lights (faithful to the GL / deferred clustered path).
 struct GpuLight {
-    float4 PosRange;     // xyz world pos, w range
-    float4 Color;        // xyz radiance (HDR), w type (0 point / 1 spot)
-    float4 DirCosOuter;  // xyz spot dir, w cosOuter
-    float4 Extra;        // x cosInner, y shadowSlot, z sourceRadius, w pad
+    float4 PosRange;        // xyz world pos, w range
+    float4 Color;           // xyz radiance (HDR), w type (0 point / 1 spot / 2 rect)
+    float4 DirCosOuter;     // xyz spot dir, w cosOuter
+    float4 Extra;           // x cosInner, y shadowSlot, z sourceRadius, w pad
+    float4 RightAxisHalfW;  // 80B: rect right-axis (0 for point/spot) — must match Dx12ClusteredLights.GpuLight stride
 };
 StructuredBuffer<GpuLight> ClusterLights : register(t10);
 Buffer<int2>               ClusterGrid   : register(t11);  // per-cluster {offset, count}
@@ -272,7 +273,11 @@ float4 PSMain(VSOutput i) : SV_Target {
         int2 range = ClusterGrid[cluster];   // {offset, count}
         for (int k = 0; k < range.y; k++) {
             uint li = ClusterIndex[range.x + k];
-            punctual += ShadePunctual(ClusterLights[li], N, V, i.PosW, albedo, metallic, roughness, F0);
+            GpuLight gl = ClusterLights[li];
+            // Area/rect lights (type 2) are LTC and shaded on the DEFERRED (opaque) path only — skip them here
+            // so a rect doesn't get mis-shaded as a spot. Transparent area-light support is a v1 follow-up.
+            if (gl.Color.w >= 1.5) continue;
+            punctual += ShadePunctual(gl, N, V, i.PosW, albedo, metallic, roughness, F0);
         }
     }
 

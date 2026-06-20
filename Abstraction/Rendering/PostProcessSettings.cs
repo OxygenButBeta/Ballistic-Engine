@@ -49,7 +49,16 @@ public enum UpscaleMode {
     Performance,      // 2.0x
     UltraPerformance, // 3.0x
     Auto,             // hardware-tier: the DX12 backend picks a concrete mode from GPU VRAM at runtime (Dx12 only)
+    // The above seven select FSR (the always-available vendor-agnostic path). The vendor-specific upscalers
+    // below are picked when the matching hardware + native runtime DLL are present and gracefully FALL BACK to
+    // the equivalent FSR ratio otherwise (DLSS needs an NVIDIA RTX GPU + nvngx_dlss.dll / sl.interposer.dll;
+    // XeSS prefers Intel Arc XMX but runs the DP4a path on any SM6 GPU + libxess.dll). Same render-ratio tiers.
+    DlssQuality, DlssBalanced, DlssPerformance, DlssUltraPerformance,
+    XessQuality, XessBalanced, XessPerformance, XessUltraPerformance,
 }
+
+// Which upscaler family a UpscaleMode selects (resolved once by the backend; FSR is the universal fallback).
+public enum UpscalerKind { Fsr, Dlss, Xess }
 
 // Tunables for the HDR -> display pipeline. Neutral by default: only exposure,
 // ACES tonemapping and gamma always run; everything stylistic is opt-in so the
@@ -235,6 +244,16 @@ public sealed class PostProcessSettings {
     public float DofFocalLength { get; set; } = 0.05f;  // 50mm-ish; larger = shallower DoF
     public float DofAperture { get; set; } = 2.8f;      // f-number; smaller = shallower DoF
     public float DofMaxCoc { get; set; } = 0.03f;       // blur-radius clamp (fraction of frame height)
+
+    // Motion blur (per-pixel velocity-buffer reconstruction, McGuire-style tile-max + neighbour-max
+    // gather). Smears the frame along the screen-space motion vectors TAA/FSR already produce, so the
+    // shutter trail matches the actual per-pixel velocity (camera AND object motion). Off by default;
+    // a scene opts in via the MotionBlur volume. Frozen under deterministic capture (jitter/motion off →
+    // zero velocity → byte-identical paused frames). Runs AFTER the upscaler/TAA resolve, before tonemap.
+    public bool MotionBlurEnabled { get; set; }
+    public float MotionBlurIntensity { get; set; } = 1f;   // shutter-trail strength (1 = a 1/2-frame shutter)
+    public int MotionBlurSamples { get; set; } = 12;       // gather taps along the velocity vector (more = smoother trail)
+    public float MotionBlurMaxVelocity { get; set; } = 0.05f; // clamp on the smear length (fraction of frame; stops a fast object eating the screen)
 
     // The old realtime-GI and baked-GI settings were removed with the GI renderer.
 

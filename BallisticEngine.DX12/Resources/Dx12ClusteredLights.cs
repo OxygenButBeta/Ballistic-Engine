@@ -24,15 +24,20 @@ public sealed class Dx12ClusteredLights : IDisposable {
     public const int MaxLightsPerCluster = 128;
     public const int MaxLightIndices = ClusterCount * 32;             // 110,592
 
-    // 64-byte GPU light record, byte-identical to the GL GpuLight (StructuredBuffer<GpuLight> in HLSL).
+    // 80-byte GPU light record (StructuredBuffer<GpuLight> in HLSL). Was 64 bytes (point/spot); GREW by one
+    // float4 (RightAxisHalfW) to carry RECT (area / LTC) lights — a rect needs center + forward(normal) +
+    // RIGHT axis + halfWidth + halfHeight + radiance + type, which is one float4 more than point/spot's 64B.
+    // For point/spot the new field is ZERO and UNREAD by the shader → their 64-byte content is bit-unchanged;
+    // only the SRV stride is 80. The up-axis is derived in-shader as normalize(cross(forward, right)).
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     public struct GpuLight {
-        public Vector4 PosRange;     // xyz world pos, w range
-        public Vector4 Color;        // xyz radiance (HDR, NOT pre-exposed — composite meters it), w type (0 point/1 spot)
-        public Vector4 DirCosOuter;  // xyz spot dir (world), w cosOuter
-        public Vector4 Extra;        // x cosInner, y shadowSlot(-1), z sourceRadius, w pad
+        public Vector4 PosRange;        // xyz world pos/center, w range
+        public Vector4 Color;           // xyz radiance (HDR, NOT pre-exposed — composite meters it), w type (0 point/1 spot/2 rect)
+        public Vector4 DirCosOuter;     // point/spot: xyz spot dir, w cosOuter. rect: xyz forward(normal), w halfWidth
+        public Vector4 Extra;           // x cosInner, y shadowSlot(-1), z sourceRadius. rect: w=halfHeight (else pad), x=twoSided
+        public Vector4 RightAxisHalfW;  // RECT ONLY: xyz right axis (unit), w halfWidth (dup of DirCosOuter.w for clarity). 0 for point/spot.
     }
-    public const int GpuLightBytes = 64;
+    public const int GpuLightBytes = 80;
 
     readonly Dx12Device dev;
 
@@ -230,6 +235,25 @@ public sealed class Dx12ClusteredLights : IDisposable {
             Color = new Vector4(radianceHdr, 1f),           // type 1 = spot
             DirCosOuter = new Vector4(Vector3.Normalize(dir), cosOuter),
             Extra = new Vector4(cosInner, -1f, sourceRadius, 0f),
+            RightAxisHalfW = Vector4.Zero,                  // unused for spot
+        };
+        lightCount++;
+    }
+
+    // Area / RECT light (LTC, type 2). `forward` is the emitting normal, `right`/`up` the rect's local axes
+    // (unit). halfW/halfH are HALF extents. The froxel cull treats it as a sphere of radius ~max(halfW,halfH)+
+    // range around the center, so a rect's whole influence reaches the right clusters (mirrors AddSpot's sphere).
+    public void AddRect(Vector3 center, Vector3 forward, Vector3 right, float halfW, float halfH,
+        float range, Vector3 radianceHdr, bool twoSided) {
+        if (lightCount >= MaxLights) return;
+        // Cull radius: the rect extends halfW/halfH from the center, and its light reaches `range` past that.
+        float cullR = MathF.Max(range, 1e-3f) + MathF.Max(halfW, halfH);
+        lights[lightCount] = new GpuLight {
+            PosRange = new Vector4(center, cullR),          // w = cull/influence radius (range cutoff is range+extent)
+            Color = new Vector4(radianceHdr, 2f),           // type 2 = rect
+            DirCosOuter = new Vector4(Vector3.Normalize(forward), halfW),
+            Extra = new Vector4(twoSided ? 1f : 0f, -1f, range, halfH), // x twoSided, y shadowSlot, z range, w halfHeight
+            RightAxisHalfW = new Vector4(Vector3.Normalize(right), halfW),
         };
         lightCount++;
     }

@@ -65,6 +65,14 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
     }
     [StructLayout(LayoutKind.Sequential)]
     struct BloomConstants { public Vector2 TexelSize; public float Threshold; public float Knee; }
+    // Histogram auto-exposure (ExposureMode.AutomaticHistogram). Mirrors ExposureHistogram.hlsl's HistConstants.
+    [StructLayout(LayoutKind.Sequential)]
+    struct HistConstants {
+        public uint SrcWidth; public uint SrcHeight; public float MinLogLum; public float InvLogLumRange;     // row 0
+        public float MeteringMode; public float LuxMeterAnchor; public float LimitMin; public float LimitMax;  // row 1
+        public float FilterMin; public float FilterMax; public float DeltaTime; public float SpeedDarkToLight; // row 2
+        public float SpeedLightToDark; public float Reset; public float Pad0; public float Pad1;               // row 3
+    }
 
     readonly Dx12Device dev;
 
@@ -89,6 +97,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
     readonly bool manualExposureSet;    // BALLISTIC_DX12_EXPOSURE parses → manual exposure mode
     readonly float manualExposureValue;
     readonly bool forceAutoExp;         // BALLISTIC_DX12_AUTOEXP == "1"
+    readonly bool forceHistogramExp;    // BALLISTIC_DX12_EXPOSURE_HISTOGRAM == "1" (force the histogram meter for A/B)
     readonly bool exposureCalibrated;   // BALLISTIC_DX12_EXPOSURE_CALIB != "0"
     readonly bool exposureEmaOn;        // BALLISTIC_DX12_EXPOSURE_EMA != "0"
     readonly bool acesTonemapEnv;       // BALLISTIC_DX12_TONEMAP == "aces"
@@ -96,6 +105,30 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
     Dx12DescriptorHeap lumSrvVisible;   // [0]=HDR color SRV, [1]=prev-EV history SRV, copied per frame
     Dx12FrameCb<LumConstants> lumCb;
     int emaDebugFrame;
+
+    // ===== Histogram auto-exposure (ExposureMode.AutomaticHistogram) — the production percentile-clip meter.
+    // Three compute kernels (clear → build → resolve, ExposureHistogram.hlsl). A 256-uint RWByteAddressBuffer
+    // holds the weighted log-luminance histogram; CSResolve percentile-clips it, averages the surviving band,
+    // converts to a metered EV and EMA-eases it into a 1×1 R32F UAV target the composite reads. Two such EV
+    // targets are CPU ping-ponged (like lumTarget/lumHistory) so the meter reads last frame's adapted EV
+    // without a GPU→CPU readback. All histogram resources are LAZILY created on the first AutomaticHistogram
+    // frame — a scene that never uses histogram mode allocates nothing (Fixed/Automatic untouched).
+    const int HistogramBins = 256;
+    ID3D12RootSignature histClearRootSig, histBuildRootSig, histResolveRootSig;
+    ID3D12PipelineState histClearPso, histBuildPso, histResolvePso;
+    ID3D12Resource histogramBuffer;                 // 256 uints (1024 bytes), UAV (u0)
+    Dx12FrameCb<HistConstants> histCb;
+    Dx12DescriptorHeap histClearHeap;               // [0] = histogram UAV
+    Dx12DescriptorHeap histBuildHeap;               // [0] = histogram UAV, [1] = HDR SRV
+    Dx12DescriptorHeap histResolveHeap;             // [0] = histogram UAV, [1] = prev-EV SRV, [2] = adapted-EV UAV
+    // Ping-pong 1×1 R32F EV targets (this frame's adapted EV + last frame's, swapped each frame). Plain
+    // committed resources (not Dx12OffscreenTarget — those force an RTV+RenderTarget initial state; here the
+    // resource is a UAV that the composite reads as an SRV). Each carries its own SRV + UAV descriptor.
+    ID3D12Resource histEvA, histEvB;
+    CpuDescriptorHandle histEvASrv, histEvAUav, histEvBSrv, histEvBUav;
+    ResourceStates histEvAState, histEvBState;
+    bool histBuilt;                                  // lazily-created resources exist
+    bool histHistoryValid;                           // false until the first histogram frame populates history → snap
 
     // Bloom: progressive dual-filter mip pyramid (Jimenez/COD), fed into the composite (Bloom.hlsl).
     // A chain of half-res→quarter→… HDR targets: downsample (level 0 thresholds + Karis), then tent-upsample
@@ -120,6 +153,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         manualExposureSet  = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE"),
                                  System.Globalization.CultureInfo.InvariantCulture, out manualExposureValue);
         forceAutoExp       = Environment.GetEnvironmentVariable("BALLISTIC_DX12_AUTOEXP") == "1";
+        forceHistogramExp  = Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_HISTOGRAM") == "1";
         exposureCalibrated = Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_CALIB") != "0";
         exposureEmaOn      = Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_EMA") != "0";
         acesTonemapEnv     = Environment.GetEnvironmentVariable("BALLISTIC_DX12_TONEMAP") == "aces";
@@ -191,6 +225,104 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 2, shaderVisible: true, framesInFlight: dev.FramesInFlight);
 
         lumCb = new Dx12FrameCb<LumConstants>(dev);
+    }
+
+    // Lazily build the histogram auto-exposure pipeline (three compute kernels + buffer + ping-pong EV targets).
+    // Called on the first AutomaticHistogram frame so Fixed/Automatic scenes never pay for it.
+    unsafe void BuildHistogram() {
+        if (histBuilt) return;
+        var samp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
+            ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        // CSClear: CBV b0 + UAV table (histogram u0).
+        var cbvB0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var uavHist = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);
+        histClearRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] {
+                cbvB0, new RootParameter1(new RootDescriptorTable1(uavHist), ShaderVisibility.All) })));
+        // CSBuild: CBV b0 + table[ UAV u0(hist), SRV t0(HDR) ] + sampler s0. The histogram UAV (u0) and the HDR
+        // SRV (t0) sit in ONE descriptor table (UAVs and SRVs may share a table range when contiguous in the
+        // heap); build the table as a UAV range (u0) then an SRV range (t0) over two consecutive heap slots.
+        var buildUav = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 0);
+        var buildSrv = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 1);
+        histBuildRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] {
+                cbvB0, new RootParameter1(new RootDescriptorTable1(buildUav, buildSrv), ShaderVisibility.All) },
+                new[] { samp })));
+        // CSResolve: CBV b0 + table[ UAV u0(hist) @0, SRV t1(prevEV) @1, UAV u1(adaptedEV) @2 ].
+        var resHistUav = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 0);
+        var resPrevSrv = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 1, registerSpace: 0, offsetInDescriptorsFromTableStart: 1);
+        var resEvUav   = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 1, registerSpace: 0, offsetInDescriptorsFromTableStart: 2);
+        histResolveRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] {
+                cbvB0, new RootParameter1(new RootDescriptorTable1(resHistUav, resPrevSrv, resEvUav), ShaderVisibility.All) },
+                new[] { samp })));
+
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("ExposureHistogram.hlsl");
+        histClearPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription {
+            RootSignature = histClearRootSig,
+            ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSClear", "ExposureHistogram.hlsl"),
+        });
+        histBuildPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription {
+            RootSignature = histBuildRootSig,
+            ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSBuild", "ExposureHistogram.hlsl"),
+        });
+        histResolvePso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription {
+            RootSignature = histResolveRootSig,
+            ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSResolve", "ExposureHistogram.hlsl"),
+        });
+
+        // The 256-uint histogram (default heap, UAV). CSClear zeroes it each frame, so the initial state's
+        // contents don't matter.
+        histogramBuffer = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)(HistogramBins * 4), ResourceFlags.AllowUnorderedAccess),
+            ResourceStates.UnorderedAccess);
+        histogramBuffer.Name = "ExposureHistogram";
+
+        histCb = new Dx12FrameCb<HistConstants>(dev);
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        histClearHeap   = new Dx12DescriptorHeap(dev, heapType, 1, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+        histBuildHeap   = new Dx12DescriptorHeap(dev, heapType, 2, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+        histResolveHeap = new Dx12DescriptorHeap(dev, heapType, 3, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+        // The histogram UAV (u0, raw buffer) is STATIC (same buffer every frame) — create it once into slot 0 of
+        // every heap, in every N-buffer slab. Only the per-frame SRVs (HDR/prevEV) and the evOut UAV are copied
+        // per frame. CpuPhysical addresses the physical slot in a given slab (HiZ pattern).
+        for (int slab = 0; slab < dev.FramesInFlight; slab++) {
+            CreateHistUav(histClearHeap.CpuPhysical(slab * 1 + 0));
+            CreateHistUav(histBuildHeap.CpuPhysical(slab * 2 + 0));
+            CreateHistUav(histResolveHeap.CpuPhysical(slab * 3 + 0));
+        }
+
+        // The ping-pong 1×1 R32F EV targets + their SRV/UAV descriptors (in the non-shader-visible SrvStore).
+        (histEvA, histEvASrv, histEvAUav) = MakeEvTarget();
+        (histEvB, histEvBSrv, histEvBUav) = MakeEvTarget();
+        histEvAState = histEvBState = ResourceStates.UnorderedAccess;
+        histBuilt = true;
+    }
+
+    // A 1×1 R32_Float UAV texture + an SRV (composite/prev-EV read) + a UAV (resolve write), in SrvStore.
+    (ID3D12Resource res, CpuDescriptorHandle srv, CpuDescriptorHandle uav) MakeEvTarget() {
+        var desc = ResourceDescription.Texture2D(Format.R32_Float, 1, 1, mipLevels: 1, arraySize: 1);
+        desc.Flags = ResourceFlags.AllowUnorderedAccess;
+        ID3D12Resource res = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None,
+            desc, ResourceStates.UnorderedAccess);
+        res.Name = "ExposureAdaptedEv";
+        int srvIdx = Dx12Backend.SrvStore.Allocate();
+        int uavIdx = Dx12Backend.SrvStore.Allocate();
+        CpuDescriptorHandle srv = Dx12Backend.SrvStore.Cpu(srvIdx);
+        CpuDescriptorHandle uav = Dx12Backend.SrvStore.Cpu(uavIdx);
+        dev.Device.CreateShaderResourceView(res, new ShaderResourceViewDescription {
+            Format = Format.R32_Float, ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
+            Shader4ComponentMapping = ShaderComponentMapping.Default,
+            Texture2D = new Texture2DShaderResourceView { MipLevels = 1, MostDetailedMip = 0 },
+        }, srv);
+        dev.Device.CreateUnorderedAccessView(res, null, new UnorderedAccessViewDescription {
+            Format = Format.R32_Float, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+            Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0 },
+        }, uav);
+        return (res, srv, uav);
     }
 
     unsafe void BuildBloom(int width, int height) {
@@ -368,6 +500,112 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
             $"speedUp={pf.AutoExposureSpeedDarkToLight}  speedDown={pf.AutoExposureSpeedLightToDark}"));
     }
 
+    // Histogram auto-exposure (ExposureMode.AutomaticHistogram). Runs three compute kernels — clear → build →
+    // resolve — to produce this frame's adapted EV in a 1×1 R32F target, then sets `meteredEvSrv` to that
+    // target's SRV so the composite samples it exactly like the legacy meter's R16F target. CPU ping-pongs the
+    // two EV targets so the resolve reads last frame's adapted EV (history) without a GPU readback. Under
+    // DeterministicCapture the EMA is bypassed (Reset = snap) so paused captures stay byte-identical.
+    unsafe void RecordHistogramMeter(Dx12FrameContext ctx, Dx12OffscreenTarget hdr, ref CpuDescriptorHandle meteredEvSrv) {
+        BuildHistogram();
+        var pf = ctx.PostFX;
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+
+        // This frame: write into histEvA (the "out" target), read history from histEvB. State is tracked per
+        // FIELD (histEvAState pairs with histEvA, histEvBState with histEvB); the fields swap at the very end.
+        ID3D12Resource evOut = histEvA, evPrev = histEvB;
+
+        // Downsample grid for the build: a fixed coarse grid (deterministic, cheap) capped to the output size.
+        // 256×144 ≈ 37k samples — plenty to fill 256 bins robustly; the percentile clip cares about the
+        // distribution shape, not exact pixel counts.
+        uint gridW = (uint)Math.Min(256, Math.Max(1, ctx.OutputW));
+        uint gridH = (uint)Math.Min(144, Math.Max(1, ctx.OutputH));
+
+        // Log-luminance window for the 256 bins. [2^-10, 2^14] spans the engine's lux-scaled radiance (very dark
+        // interior shadow ~1e-3 .. bright lit surface ~1e4); pixels outside clamp to the end bins (the percentile
+        // clip rejects them anyway). MinLogLum=-10, range=24 → InvLogLumRange=1/24.
+        const float minLogLum = -10f, logLumRange = 24f;
+
+        // EMA reset (snap, no ease): deterministic capture (the paused-frame oracle) or the first histogram frame
+        // (no valid history). Otherwise ease at the volume's stops/sec, brighten-fast / darken-slow.
+        bool reset = ctx.DeterministicCapture || !histHistoryValid;
+
+        // The out target must be writable as u1 (UAV); the history target readable as t1 (SRV).
+        EnsureHistEvState(ref histEvAState, evOut, ResourceStates.UnorderedAccess);
+        EnsureHistEvState(ref histEvBState, evPrev, ResourceStates.PixelShaderResource);
+
+        histCb.Write(new HistConstants {
+            SrcWidth = gridW, SrcHeight = gridH, MinLogLum = minLogLum, InvLogLumRange = 1f / logLumRange,
+            MeteringMode = (float)(int)pf.MeteringMode, LuxMeterAnchor = 8.0f,
+            LimitMin = pf.AutoExposureLimitMin, LimitMax = pf.AutoExposureLimitMax,
+            FilterMin = pf.HistogramFilterMin, FilterMax = pf.HistogramFilterMax,
+            DeltaTime = (float)Time.DeltaTime,
+            SpeedDarkToLight = pf.AutoExposureSpeedDarkToLight, SpeedLightToDark = pf.AutoExposureSpeedLightToDark,
+            Reset = reset ? 1f : 0f,
+        });
+
+        // Per-frame descriptor copies (the static histogram UAV at slot 0 of each heap was created at build).
+        dev.Device.CopyDescriptorsSimple(1, histBuildHeap.Cpu(1), hdr.ColorSrvCpu, heapType);     // build:   t0 = HDR scene
+        dev.Device.CopyDescriptorsSimple(1, histResolveHeap.Cpu(1), histEvBSrv, heapType);        // resolve: t1 = prev adapted EV (history target)
+        dev.Device.CopyDescriptorsSimple(1, histResolveHeap.Cpu(2), histEvAUav, heapType);        // resolve: u1 = adapted EV out
+
+        dev.ExecuteSync(cl => {
+            // ---- CSClear: zero the histogram ----
+            cl.SetComputeRootSignature(histClearRootSig);
+            cl.SetPipelineState(histClearPso);
+            cl.SetDescriptorHeaps(histClearHeap.Heap);
+            cl.SetComputeRootConstantBufferView(0, histCb.Gpu);
+            cl.SetComputeRootDescriptorTable(1, histClearHeap.Gpu(0));
+            cl.Dispatch((HistogramBins + 255) / 256, 1, 1);
+            cl.ResourceBarrierUnorderedAccessView(histogramBuffer);
+
+            // ---- CSBuild: scatter weighted log-luminance into bins ----
+            cl.SetComputeRootSignature(histBuildRootSig);
+            cl.SetPipelineState(histBuildPso);
+            cl.SetDescriptorHeaps(histBuildHeap.Heap);
+            cl.SetComputeRootConstantBufferView(0, histCb.Gpu);
+            cl.SetComputeRootDescriptorTable(1, histBuildHeap.Gpu(0));
+            cl.Dispatch((gridW + 15) / 16, (gridH + 15) / 16, 1);
+            cl.ResourceBarrierUnorderedAccessView(histogramBuffer);
+
+            // ---- CSResolve: percentile-clip → metered EV → EMA → 1×1 EV out ----
+            cl.SetComputeRootSignature(histResolveRootSig);
+            cl.SetPipelineState(histResolvePso);
+            cl.SetDescriptorHeaps(histResolveHeap.Heap);
+            cl.SetComputeRootConstantBufferView(0, histCb.Gpu);
+            cl.SetComputeRootDescriptorTable(1, histResolveHeap.Gpu(0));
+            cl.Dispatch(1, 1, 1);
+        });
+
+        // The out target now holds this frame's adapted EV → transition to PixelShaderResource for the composite.
+        EnsureHistEvState(ref histEvAState, evOut, ResourceStates.PixelShaderResource);
+        meteredEvSrv = histEvASrv;
+        histHistoryValid = true;
+        // Ping-pong: next frame writes the OTHER target and reads this one as history. Swap the matched
+        // (resource, srv, uav, state) tuples together so the field/state pairing stays consistent.
+        (histEvA, histEvB) = (histEvB, histEvA);
+        (histEvASrv, histEvBSrv) = (histEvBSrv, histEvASrv);
+        (histEvAUav, histEvBUav) = (histEvBUav, histEvAUav);
+        (histEvAState, histEvBState) = (histEvBState, histEvAState);
+    }
+
+    // Transition one of the 1×1 EV targets to `to`, tracking its state in the matching ref field.
+    void EnsureHistEvState(ref ResourceStates state, ID3D12Resource res, ResourceStates to) {
+        if (state == to) return;
+        ResourceStates from = state;
+        dev.ExecuteSync(cl => cl.ResourceBarrierTransition(res, from, to));
+        state = to;
+    }
+
+    void CreateHistUav(CpuDescriptorHandle dst) {
+        dev.Device.CreateUnorderedAccessView(histogramBuffer, null, new UnorderedAccessViewDescription {
+            Format = Format.R32_Typeless, ViewDimension = UnorderedAccessViewDimension.Buffer,
+            Buffer = new BufferUnorderedAccessView {
+                FirstElement = 0, NumElements = HistogramBins, StructureByteStride = 0,
+                Flags = BufferUnorderedAccessViewFlags.Raw,
+            },
+        }, dst);
+    }
+
     // VERBATIM DrawComposite (re-rooted onto ctx). Tonemap the HDR `hdr` (= ctx.SceneColor — native scene
     // target or FSR output) into the LDR `ldr` at OUTPUT resolution. Auto-exposure metering + bloom run first
     // (private sub-steps). The old (bool ssaoOn, Dx12OffscreenTarget hdr) params are now ctx.SceneColor only —
@@ -394,7 +632,14 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         float manualExp = manualExposureValue;
         // BALLISTIC_DX12_AUTOEXP=1 forces Automatic metering even with no Exposure volume (A/B test door).
         bool forceAuto = forceAutoExp;
-        bool useMeter = !manual && (forceAuto || pf.ExposureMode != ExposureMode.Fixed);
+        // forceHistogram (BALLISTIC_DX12_EXPOSURE_HISTOGRAM=1) forces the histogram meter for A/B even with no
+        // Exposure volume (like forceAuto but the histogram path).
+        bool forceHistogram = forceHistogramExp;
+        bool useMeter = !manual && (forceAuto || forceHistogram || pf.ExposureMode != ExposureMode.Fixed);
+        // AutomaticHistogram routes through the percentile-clip histogram meter (compute) instead of the 1×1
+        // geometric-mean meter. forceAuto (the A/B door, no volume) keeps the legacy geomean path. Fixed/Automatic
+        // are BYTE-IDENTICAL (the histogram resources aren't even allocated for them).
+        bool useHistogram = useMeter && (forceHistogram || (!forceAuto && pf.ExposureMode == ExposureMode.AutomaticHistogram));
         // Resolved CPU multiplier for the manual / Fixed paths (Automatic resolves it in the shader from the EV).
         float exposureMul = manual ? manualExp : pf.ExposureMultiplier;
 
@@ -405,7 +650,12 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         // V1b: the physical 1×1 target holding THIS frame's adapted EV (captured pre-swap so the composite
         // SRV + the frame-end RT transition keep pointing at it after the ping-pong swaps the fields).
         Dx12OffscreenTarget meteredEvTarget = lumTarget;
-        if (useMeter) {
+        // The 1×1 adapted-EV SRV the composite samples. Defaults to the legacy ping-pong target; histogram mode
+        // overrides it with the compute meter's R32F EV target. Resolved below so the composite SRV copy is
+        // path-agnostic.
+        CpuDescriptorHandle meteredEvSrv = lumTarget.ColorSrvCpu;
+        if (useHistogram) RecordHistogramMeter(ctx, hdr, ref meteredEvSrv);
+        if (useMeter && !useHistogram) {
             // Auto-exposure metering: reduce the HDR source to a 1×1 adapted EV100 (LumAverage.hlsl).
             // V1: the meter is grey-anchored (self-calibrating to the lux-scaled DX12 radiance) by default;
             // BALLISTIC_DX12_EXPOSURE_CALIB=0 restores the legacy photometric anchor (the pre-V1 blow-out) for A/B.
@@ -460,6 +710,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
             // V1b debug trace (off by default; stalls — never on the production path): log the adapted EV.
             if (!expDebug && Environment.GetEnvironmentVariable("BALLISTIC_DX12_EXPOSURE_EMA_DEBUG") == "1")
                 DumpAdaptedEv(meteredEvTarget, pf);
+            meteredEvSrv = meteredEvTarget.ColorSrvCpu;   // composite samples the legacy ping-pong EV target
         }
 
         // Bloom: progressive mip-pyramid bright-pass + blur of the HDR into the half-res level 0. The env door
@@ -503,7 +754,7 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(1),
             bloomOn && bloomLevelCount > 0 ? bloomLevels[0].ColorSrvCpu : hdr.ColorSrvCpu, heapType);   // bloom slot (half-res level 0)
         dev.Device.CopyDescriptorsSimple(1, compositeSrvVisible.Cpu(2),
-            useMeter ? meteredEvTarget.ColorSrvCpu : hdr.ColorSrvCpu, heapType);   // adapted-EV slot (Automatic only)
+            useMeter ? meteredEvSrv : hdr.ColorSrvCpu, heapType);   // adapted-EV slot (Automatic/AutomaticHistogram)
 
         ldr.RenderColorOnly(cl => {
             cl.SetGraphicsRootSignature(compositeRootSig);
@@ -518,7 +769,8 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         // legacy V1 frame-end tidy. With the V1b ping-pong it's now the `lumHistory` field; next frame the
         // meter reads it as the t1 SRV (its own ColorToShaderResource handles that transition) and renders
         // into the OTHER target. The state tracker makes either order valid; this keeps it consistent.
-        if (useMeter) meteredEvTarget.ColorToRenderTarget();
+        // (Histogram mode owns its own EV-target transitions in RecordHistogramMeter — skip the legacy tidy.)
+        if (useMeter && !useHistogram) meteredEvTarget.ColorToRenderTarget();
         // Restore the INTERNAL scene target to RenderTarget for next frame's geometry/deferred pass (FSR
         // left it in PixelShaderResource; in the native path hdr == target). fsrOutput stays in shader-read
         // — RunFsr transitions it to UAV next frame from any state.
@@ -534,6 +786,12 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         lumTarget?.Dispose(); lumHistory?.Dispose();
         lumSrvVisible?.Dispose(); lumCb?.Dispose();
         lumPso?.Dispose(); lumRootSig?.Dispose();
+        // Histogram auto-exposure (lazily built; null when AutomaticHistogram was never used).
+        histEvA?.Dispose(); histEvB?.Dispose();
+        histogramBuffer?.Dispose(); histCb?.Dispose();
+        histClearHeap?.Dispose(); histBuildHeap?.Dispose(); histResolveHeap?.Dispose();
+        histClearPso?.Dispose(); histBuildPso?.Dispose(); histResolvePso?.Dispose();
+        histClearRootSig?.Dispose(); histBuildRootSig?.Dispose(); histResolveRootSig?.Dispose();
         compositeSrvVisible?.Dispose(); compositeCb?.Dispose();
         compositePso?.Dispose(); compositeRootSig?.Dispose();
     }

@@ -38,3 +38,9 @@ native/**/*.pdb
 
 # Game-script build intermediates (Scripts.csproj output goes to Library\, already ignored)
 SampleProject/obj/
+
+# Vendor upscaler SDK extract trees (DLLs/headers re-fetched via README)
+native/dlss/sl/
+native/xess/inc/
+native/xess/lib/
+native/**/*.zip

@@ -110,6 +110,8 @@ public sealed class DX12HDRenderer : HDRenderer
     // composite) in the native path only (FSR replaces it). Was BuildTaa/AllocTaaTargets/DrawTaa.
     Dx12TaaPass taaPass;
     Dx12FsrPass fsrPass; // chunk 7: FSR dispatch (Record only); fsr/fsrOutput stay orchestrator-owned
+    Dx12MotionBlurPass motionBlurPass; // velocity-buffer motion blur (event 650, after upscale, before DoF/composite)
+    Dx12DepthOfFieldPass dofPass;      // thin-lens bokeh DoF (event 650, after motion blur, before composite)
     int taaFrame; // jitter phase counter (shared by TAA + FSR; advanced in the frame tail)
     int frameCounter; // monotonic frame index, advanced EVERY BeginRender (drives time-animated FX like dust drift)
     Vector2 currentJitter; // this frame's sub-pixel jitter (pixels) — exposed for FSR reuse
@@ -653,6 +655,14 @@ public sealed class DX12HDRenderer : HDRenderer
         // so no Resize. Sets ctx.SceneColor = fsrOutput. Was RunFsr.
         fsrPass = new Dx12FsrPass(dev);
         graph.Add(fsrPass);
+        // Motion blur + DoF (event 650, registered AFTER TAA/FSR so they smear/blur the RESOLVED scene color, and
+        // BEFORE Composite/tonemap). Same-event stable tiebreak (R1) = registration order: MotionBlur first
+        // (velocity smear on the sharp resolved frame), then DoF (lens bokeh on top). Both no-op (Enabled=false)
+        // unless their volume turns them on AND not deterministic-capture → byte-identical default path.
+        motionBlurPass = new Dx12MotionBlurPass(dev, targetW, targetH);
+        graph.Add(motionBlurPass);
+        dofPass = new Dx12DepthOfFieldPass(dev, targetW, targetH);
+        graph.Add(dofPass);
         // chunk 7: Composite (event 700, after SSAO/TAA at PostProcess=650). Owns bloomA/B (the half-res
         // ping-pong); its Resize fans out LAST in registration order. The original AllocBloomTargets ran FIRST in
         // AllocateResolutionTargets, but the bloom allocator reads only the passed size (no cross-pass dependency)
@@ -678,11 +688,15 @@ public sealed class DX12HDRenderer : HDRenderer
         graph.Compile();
         // Resolve the phase-2 V1 door once at init (kills per-frame env churn). When set, BeginRender calls
         // graph.ExecuteGraph(ctx) (compiled order) instead of graph.Execute(ctx) (event sort).
-        graphPath = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GRAPH") == "1";
+        // DEFAULT ON (set BALLISTIC_DX12_GRAPH=0 to fall back to the phase-1 event-sorted Execute). The compiled
+        // order is provably == the event-sort order (PQ-keyed Kahn topo, R1), so flipping the default is pixel-
+        // neutral; Compile() above already surfaced any Declare/cycle error at init. The event-list path stays as
+        // the explicit opt-out escape hatch.
+        graphPath = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GRAPH") != "0";
         if (graphPath)
         {
             Console.Error.WriteLine(
-                "[DX12] Render graph (phase-2 V1): COMPILED ORDER active (BALLISTIC_DX12_GRAPH=1).");
+                "[DX12] Render graph (phase-2 V1): COMPILED ORDER active (default; BALLISTIC_DX12_GRAPH=0 to disable).");
             Console.Error.WriteLine(graph.LastCompileReport);
         }
 
@@ -692,12 +706,15 @@ public sealed class DX12HDRenderer : HDRenderer
         // transition (ctx.BarriersDerived). Default off → migrated passes emit their manual head transitions,
         // byte-identical to V1/V2. Compile already built + plan-level-validated the deriver (CompareToManual);
         // print the comparison so the manual-vs-derived sets are auditable.
-        barriersPath = graphPath && Environment.GetEnvironmentVariable("BALLISTIC_DX12_GRAPH_BARRIERS") == "1";
+        // DEFAULT ON when the graph runs (set BALLISTIC_DX12_GRAPH_BARRIERS=0 to keep manual head transitions).
+        // Every shipping pass is migrated (DeriveBarriers + ManualReference entry) and Compile()'s CompareToManual
+        // already threw at init if the derived set didn't cover the manual reference — so the derived emit is sound.
+        barriersPath = graphPath && Environment.GetEnvironmentVariable("BALLISTIC_DX12_GRAPH_BARRIERS") != "0";
         graph.SetBarriersDerived(barriersPath);
         if (barriersPath)
         {
             Console.Error.WriteLine(
-                "[DX12] Render graph (phase-2 V3): AUTO-DERIVED BARRIERS active (BALLISTIC_DX12_GRAPH_BARRIERS=1).");
+                "[DX12] Render graph (phase-2 V3): AUTO-DERIVED BARRIERS active (default; BALLISTIC_DX12_GRAPH_BARRIERS=0 to disable).");
             Console.Error.WriteLine(graph.LastDeriverReport);
         }
 
@@ -710,7 +727,10 @@ public sealed class DX12HDRenderer : HDRenderer
         // position. Targets in the SAME pass coexist (must NOT alias → distinct regions); targets in DIFFERENT
         // passes have disjoint lifetimes (CAN alias). Registering each with first==last==passOrder makes the greedy
         // interval-coloring produce exactly that (same-pass overlap → separate region; cross-pass disjoint → share).
-        aliasPath = graphPath && Environment.GetEnvironmentVariable("BALLISTIC_DX12_GRAPH_ALIAS") == "1";
+        // DEFAULT ON when the graph runs (set BALLISTIC_DX12_GRAPH_ALIAS=0 to use committed transients). The alias
+        // plan is audited at init (AuditNoOverlap throws on any overlapping aliased lifetime), so enabling by
+        // default only reclaims VRAM — it can't corrupt a frame that passed the soundness gate below.
+        aliasPath = graphPath && Environment.GetEnvironmentVariable("BALLISTIC_DX12_GRAPH_ALIAS") != "0";
         if (aliasPath)
         {
             rtPool = new Dx12RenderTargetPool(dev);
@@ -2298,6 +2318,19 @@ public sealed class DX12HDRenderer : HDRenderer
             float outer = Math.Clamp(MathF.Max(s.OuterAngle, s.InnerAngle), 0f, 89.9f) * (MathF.PI / 180f);
             clusteredLights.AddSpot(s.transform.WorldPosition, dir, s.Range,
                 s.PhysicalColor, MathF.Cos(inner), MathF.Cos(outer), s.SourceRadius);
+        }
+
+        // Area / RECT lights (LTC). forward = emitting normal (local +Z), right = local +X. The rect lies in
+        // the entity's local XY plane; the shader derives up = cross(forward, right).
+        foreach (RectLight rl in RuntimeSet<RectLight>.ReadOnlyCollection)
+        {
+            if (rl is null || !rl.IsActive) continue;
+            Quaternion rot = rl.transform.WorldRotation;
+            Vector3 fwd = Vector3.Transform(Vector3.UnitZ, rot);
+            Vector3 right = Vector3.Transform(Vector3.UnitX, rot);
+            clusteredLights.AddRect(rl.transform.WorldPosition, fwd, right,
+                MathF.Max(rl.Width, 0.001f) * 0.5f, MathF.Max(rl.Height, 0.001f) * 0.5f,
+                rl.Range, rl.PhysicalColor, rl.TwoSided);
         }
 
         clusteredLights.Cull(view, proj, targetW, targetH, CameraNear, CameraFar);

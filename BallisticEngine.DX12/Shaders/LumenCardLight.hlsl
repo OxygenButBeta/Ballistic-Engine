@@ -32,7 +32,7 @@ struct GpuMaterial {
     float NormalFlipY, HasMetallicMap, HasRoughnessMap, PackedOrm;
     float Cutout, HasEmissive, Pad2, Pad3;
 };
-struct GpuLight { float4 PosRange; float4 Color; float4 DirCosOuter; float4 Extra; };
+struct GpuLight { float4 PosRange; float4 Color; float4 DirCosOuter; float4 Extra; float4 RightAxisHalfW; }; // 80B (RightAxisHalfW = rect right-axis; 0 for point/spot — must match Dx12ClusteredLights.GpuLight stride)
 StructuredBuffer<LumenInstanceMeta> Instances   : register(t2);
 StructuredBuffer<RtInstance>        RtInstances : register(t3);
 StructuredBuffer<GpuMaterial>       GpuMaterials: register(t4);
@@ -217,6 +217,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
         int nl = min((int)LightCount, 32);
         [loop] for (int i = 0; i < nl; i++) {
             GpuLight L = Lights[i];
+            if (L.Color.w >= 1.5) continue;   // skip area/rect lights (type 2) — not in GI v1 (deferred LTC only)
             float3 toL = L.PosRange.xyz - P;
             float dist = length(toL);
             if (dist > L.PosRange.w || dist < 1e-4) continue;

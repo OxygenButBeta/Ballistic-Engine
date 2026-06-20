@@ -45,7 +45,7 @@ struct GpuMaterial {
     float NormalFlipY, HasMetallicMap, HasRoughnessMap, PackedOrm;
     float Cutout, HasEmissive, Pad2, Pad3;
 };
-struct GpuLight { float4 PosRange; float4 Color; float4 DirCosOuter; float4 Extra; };
+struct GpuLight { float4 PosRange; float4 Color; float4 DirCosOuter; float4 Extra; float4 RightAxisHalfW; }; // 80B (RightAxisHalfW = rect right-axis; 0 for point/spot — must match Dx12ClusteredLights.GpuLight stride)
 struct LumenInstanceMeta { uint TriOffset, TriCount, ClusterOffset, ClusterCount; float4x4 World; };
 StructuredBuffer<GpuMaterial>       GpuMaterials : register(t7);
 StructuredBuffer<RtInstance>        RtInstances  : register(t8);
@@ -79,6 +79,7 @@ float3 PunctualDiffuse(float3 hit, float3 N) {
     int n = min((int)LightCount, 64);
     [loop] for (int i = 0; i < n; i++) {
         GpuLight L = Lights[i];
+        if (L.Color.w >= 1.5) continue;   // skip area/rect lights (type 2) — not in RT reflections v1 (deferred LTC only)
         float3 toL = L.PosRange.xyz - hit;
         float dist = length(toL);
         if (dist > L.PosRange.w || dist < 1e-4) continue;

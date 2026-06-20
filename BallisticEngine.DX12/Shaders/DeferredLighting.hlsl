@@ -69,18 +69,22 @@ TextureCube PrefilterMap    : register(t6);
 Texture2D   BrdfLut         : register(t7);
 Texture2DArray ShadowCascades : register(t8);   // sun cascade depth (R32_Float), manual PCF
 
-// Clustered punctual lights (faithful to the GL clustered path).
+// Clustered lights (faithful to the GL clustered path). Now 80 bytes — grew one float4 (RightAxisHalfW) for
+// RECT (area / LTC) lights. Point/spot leave the new field 0 and never read it → their bits are unchanged.
 struct GpuLight {
-    float4 PosRange;     // xyz world pos, w range
-    float4 Color;        // xyz radiance (HDR), w type (0 point / 1 spot)
-    float4 DirCosOuter;  // xyz spot dir, w cosOuter
-    float4 Extra;        // x cosInner, y shadowSlot, z sourceRadius, w pad
+    float4 PosRange;        // xyz world pos/center, w range (rect: w = cull radius)
+    float4 Color;           // xyz radiance (HDR), w type (0 point / 1 spot / 2 rect)
+    float4 DirCosOuter;     // point/spot: xyz dir, w cosOuter. rect: xyz forward(normal), w halfWidth
+    float4 Extra;           // point/spot: x cosInner, y shadowSlot, z sourceRadius. rect: x twoSided, z range, w halfHeight
+    float4 RightAxisHalfW;  // RECT ONLY: xyz right axis (unit), w halfWidth. 0 for point/spot.
 };
 StructuredBuffer<GpuLight> ClusterLights : register(t9);
 Buffer<int2>               ClusterGrid   : register(t10);  // per-cluster {offset, count}
 Buffer<uint>               ClusterIndex  : register(t11);  // flat light-index list
 Texture2D RtShadowMask     : register(t12);                // ray-traced sun shadow (1 lit / 0 shadowed)
 Texture2D SsaoTex          : register(t13);                // GTAO (1 = unoccluded); multiplied into ambient only
+Texture2D LtcMatTex        : register(t14);                // LTC inverse-matrix coeffs (area lights); 64x64 RGBA32F
+Texture2D LtcAmpTex        : register(t15);                // LTC amplitude/Fresnel split-sum (area lights)
 SamplerState LinearClamp : register(s0);
 
 static const float PI = 3.14159265359;
@@ -238,6 +242,124 @@ float DistanceAttenuation(float dist, float range, float sourceRadius) {
     return inv * t * t;
 }
 
+// ================================ AREA / RECT LIGHTS (LTC, Heitz et al. 2016) =========================
+// Linearly-Transformed Cosines: shade a rectangular emitter by transforming the GGX specular lobe into a
+// clamped-cosine distribution (via the per-(NdotV,roughness) inverse matrix in LtcMatTex), then analytically
+// integrating that cosine over the rect polygon (the edge-integral below). Diffuse uses the identity matrix
+// (the cosine lobe directly). Ported from selfshadow/ltc_code (Hill/Heitz), the canonical reference impl.
+
+static const float LTC_LUT_SIZE = 64.0;
+static const float LTC_LUT_SCALE = (LTC_LUT_SIZE - 1.0) / LTC_LUT_SIZE;
+static const float LTC_LUT_BIAS  = 0.5 / LTC_LUT_SIZE;
+
+// Integrate one polygon edge of the (already cosine-space) clamped-cosine distribution. Returns the vector
+// form (Baum's formula) — the z component is the form factor, accumulated per edge.
+float3 LtcIntegrateEdgeVec(float3 v1, float3 v2) {
+    float x = dot(v1, v2);
+    float y = abs(x);
+    float a = 0.8543985 + (0.4965155 + 0.0145206 * y) * y;
+    float b = 3.4175940 + (4.1616724 + y) * y;
+    float v = a / b;
+    float theta_sintheta = (x > 0.0) ? v : 0.5 * rsqrt(max(1.0 - x * x, 1e-7)) - v;
+    return cross(v1, v2) * theta_sintheta;
+}
+
+// Evaluate the LTC over the rect with corners p0..p3 (world), from shading point P with normal N and view V.
+// Minv = the inverse LTC matrix (identity for diffuse). twoSided: light both faces. Returns the (scalar)
+// irradiance the rect contributes through this lobe. (Horizon-clipping the simple way: clamp the form factor.)
+float LtcEvaluate(float3 N, float3 V, float3 P, float3x3 Minv,
+                  float3 p0, float3 p1, float3 p2, float3 p3, bool twoSided) {
+    // Build an orthonormal basis around N (tangent T1 in the view-tangent plane).
+    float3 T1 = normalize(V - N * dot(V, N));
+    float3 T2 = cross(N, T1);
+    // Rotate the rect into the tangent frame, then apply Minv.
+    float3x3 R = transpose(float3x3(T1, T2, N));
+    Minv = mul(Minv, R);
+
+    float3 L0 = mul(Minv, p0 - P);
+    float3 L1 = mul(Minv, p1 - P);
+    float3 L2 = mul(Minv, p2 - P);
+    float3 L3 = mul(Minv, p3 - P);
+
+    // Approximate horizon clipping: if all corners are below the local horizon, no contribution.
+    float3 dir = p0 - P;
+    float3 lightNormal = cross(p1 - p0, p3 - p0);
+    bool behind = dot(dir, lightNormal) < 0.0;
+    if (behind && !twoSided) return 0.0;
+
+    L0 = normalize(L0); L1 = normalize(L1); L2 = normalize(L2); L3 = normalize(L3);
+
+    float3 vsum = 0.0.xxx;
+    vsum += LtcIntegrateEdgeVec(L0, L1);
+    vsum += LtcIntegrateEdgeVec(L1, L2);
+    vsum += LtcIntegrateEdgeVec(L2, L3);
+    vsum += LtcIntegrateEdgeVec(L3, L0);
+
+    // The form factor is the length of the accumulated edge-vector sum (the irradiance of the clamped-cosine
+    // polygon integral). Two-sided takes the absolute contribution; one-sided drops the back face.
+    float sum = length(vsum);
+    if (!twoSided && behind) sum = 0.0;
+    return max(sum, 0.0);
+}
+
+// One AREA / RECT light via LTC. radiance is the rect's HDR radiance (already power/(area*pi)-normalized on
+// the CPU). Diffuse uses the identity LTC (cosine); specular uses the matrix at (NdotV, roughness). NO shadows.
+float3 ShadeRect(GpuLight L, float3 N, float3 V, float3 worldPos, float3 albedo,
+                 float metallic, float roughness, float3 F0) {
+    float3 center = L.PosRange.xyz;
+    float range = L.Extra.z;                                  // rect influence range (Extra.z), separate from cull radius
+    float3 toCenter = center - worldPos;
+    float dist = length(toCenter);
+    if (dist > range + max(L.DirCosOuter.w, L.Extra.w)) return 0.0.xxx;  // range cull (range + extent)
+
+    float3 fwd  = normalize(L.DirCosOuter.xyz);               // rect normal (emitting face = +fwd)
+    float3 right = normalize(L.RightAxisHalfW.xyz);
+    float3 up   = normalize(cross(fwd, right));
+    float halfW = L.DirCosOuter.w, halfH = L.Extra.w;
+    bool twoSided = L.Extra.x > 0.5;
+
+    // The four rect corners in world space.
+    float3 ex = right * halfW, ey = up * halfH;
+    float3 p0 = center - ex - ey;
+    float3 p1 = center + ex - ey;
+    float3 p2 = center + ex + ey;
+    float3 p3 = center - ex + ey;
+
+    // Smooth range window (parity with DistanceAttenuation's windowing, distance to the rect center).
+    float win = saturate(1.0 - pow(saturate(dist / max(range, 1e-3)), 4.0));
+    win *= win;
+    if (win <= 0.0) return 0.0.xxx;
+
+    float NdotV = saturate(dot(N, V));
+    // LUT fetch at (NdotV, roughness).
+    float2 uv = float2(NdotV, roughness);
+    uv = uv * LTC_LUT_SCALE + LTC_LUT_BIAS;
+    float4 t1 = LtcMatTex.SampleLevel(LinearClamp, uv, 0);    // r=m00, g=m20, b=m02, a=m11 (Heitz packing)
+    float4 t2 = LtcAmpTex.SampleLevel(LinearClamp, uv, 0);    // r=magnitude, g=fresnel
+
+    // Rebuild the inverse LTC matrix: Minv = {{ a, 0, b },{ 0, 1, 0 },{ c, 0, 1 }} with the 4 stored coeffs.
+    float3x3 Minv = float3x3(
+        t1.x, 0.0,  t1.z,
+        0.0,  t1.w, 0.0,
+        t1.y, 0.0,  1.0);
+    float3x3 identity = float3x3(1,0,0, 0,1,0, 0,0,1);
+
+    // Diffuse (cosine lobe = identity LTC) and specular (the fitted matrix).
+    float diff = LtcEvaluate(N, V, worldPos, identity, p0, p1, p2, p3, twoSided);
+    float spec = LtcEvaluate(N, V, worldPos, Minv,     p0, p1, p2, p3, twoSided);
+
+    // Split-sum GGX scale/bias on the specular (Karis): F0 * scale + bias-from-Fresnel.
+    float3 specColor = F0 * t2.x + (1.0.xxx - F0) * t2.y;
+    float3 kD = (1.0 - metallic);                             // metals have no diffuse
+    float3 radiance = L.Color.rgb * win;
+
+    // 1/(2*PI) normalization is folded into the table fit (the reference applies it on the result).
+    float3 diffuseTerm = kD * albedo * diff;
+    float3 specTerm = specColor * spec;
+    float3 outv = (diffuseTerm + specTerm) * radiance * (1.0 / (2.0 * PI));
+    return ClampSpecular(outv, SpecClamp);
+}
+
 // One punctual light (point or spot) via the SAME Cook-Torrance BRDF as the sun. radiance already folds
 // attenuation × cone. No punctual shadows yet (shadowSlot is -1 for now).
 float3 ShadePunctual(GpuLight L, float3 N, float3 V, float3 worldPos, float3 albedo,
@@ -350,7 +472,12 @@ float4 PSMain(VSOut i) : SV_Target {
         int2 range = ClusterGrid[cluster];   // {offset, count}
         for (int k = 0; k < range.y; k++) {
             uint li = ClusterIndex[range.x + k];
-            punctual += ShadePunctual(ClusterLights[li], N, V, worldPos, albedo, metallic, roughness, F0);
+            GpuLight gl = ClusterLights[li];
+            // Type branch: <0.5 point, <1.5 spot (both Cook-Torrance), <2.5 rect/area (LTC).
+            if (gl.Color.w < 1.5)
+                punctual += ShadePunctual(gl, N, V, worldPos, albedo, metallic, roughness, F0);
+            else
+                punctual += ShadeRect(gl, N, V, worldPos, albedo, metallic, roughness, F0);
         }
     }
 

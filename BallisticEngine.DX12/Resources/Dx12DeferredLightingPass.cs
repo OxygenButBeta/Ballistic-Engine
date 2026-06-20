@@ -70,10 +70,11 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
     }
 
     readonly Dx12Device dev;
-    ID3D12RootSignature deferredRootSig;   // LightConstants CBV(b0) + FrameConstants CBV(b1) + 13-SRV table + sampler
+    ID3D12RootSignature deferredRootSig;   // LightConstants CBV(b0) + FrameConstants CBV(b1) + 16-SRV table + sampler
     ID3D12PipelineState deferredPso;
     Dx12FrameCb<LightConstants> deferredCb;   // P0b: N-buffered (FrameSlot-offset)
-    Dx12DescriptorHeap deferredSrvVisible;  // 14 SRVs copied per frame: G0..G3, depth, irradiance, prefilter, BRDF, shadow, cluster lights/grid/index, RT shadow mask, GTAO
+    Dx12DescriptorHeap deferredSrvVisible;  // 16 SRVs copied per frame: G0..G3, depth, irradiance, prefilter, BRDF, shadow, cluster lights/grid/index, RT shadow mask, GTAO, LTC mat (t14) + LTC amp (t15)
+    Dx12LtcTables ltcTables;                // area/rect-light LTC lookup tables (t14/t15) — static, built once at init
 
     // BuildDeferredLighting moved VERBATIM into the ctor (re-rooted onto `dev`). clusteredLights stays
     // orchestrator-owned (the CPU froxel gather runs inline before deferred); the pass reads it via ctx.
@@ -81,9 +82,11 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         dev = device;
         var lightCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Pixel);
         var frameCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.Pixel);
-        // 14 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster lights/grid/index
-        // (t9..t11), RT shadow mask (t12), GTAO (t13).
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 14, baseShaderRegister: 0);
+        // 16 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster lights/grid/index
+        // (t9..t11), RT shadow mask (t12), GTAO (t13), LTC matrix-inverse table (t14), LTC amplitude table (t15).
+        // The two LTC tables (t14/t15) are static area-light data; point/spot scenes never sample them, so the
+        // table growth 14→16 is byte-identical for the default path (the extra descriptors are unread).
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 16, baseShaderRegister: 0);
         var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
         var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
@@ -108,7 +111,9 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
 
         deferredCb = new Dx12FrameCb<LightConstants>(dev);
         deferredSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 14, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 16, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+        // Build the LTC tables once (CPU fit + GPU upload). Self-contained; no scene/asset dependency.
+        ltcTables = new Dx12LtcTables(dev);
     }
 
     // DrawDeferredLighting moved VERBATIM. Re-rooted onto ctx: view/viewProj/camPos/light from ctx; IBL/
@@ -175,10 +180,10 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
             ViewProjFwd = Matrix4x4.Transpose(ctx.ViewProj),
         });
 
-        // Copy the 14 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster
-        // lights/grid/index (t9..t11), RT shadow mask (t12), GTAO (t13).
+        // Copy the 16 SRVs: G0..G3, depth, irradiance, prefilter, BRDF, shadow (t0..t8), cluster
+        // lights/grid/index (t9..t11), RT shadow mask (t12), GTAO (t13), LTC mat (t14), LTC amp (t15).
         deferredSrvVisible.Reset();
-        int b = deferredSrvVisible.AllocateRange(14);
+        int b = deferredSrvVisible.AllocateRange(16);
         // Only the 4 SHADED G-buffer RTs feed lighting (G0..G3 → t0..t3); the motion RT (RT4) is for TAA/FSR.
         for (int i = 0; i < Dx12GBuffer.ShadedRtCount; i++)
             dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + i), gbuffer.ColorSrvCpu(i), heapType);
@@ -197,6 +202,11 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         // valid unused fallback. UseSsao gates the sample, so the fallback's contents never affect the output.
         dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 13),
             (ctx.Doors.Ssao && ctx.PostFX.SSAOEnabled) ? ctx.AoResult : gbuffer.DepthSrvCpu, heapType);
+        // LTC tables (t14 = matrix inverse, t15 = amplitude/Fresnel) — static area-light data, bound every
+        // frame. Point/spot scenes never sample them (the rect type-branch in ShadePunctual is skipped), so
+        // their presence is byte-identical for the default path.
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 14), ltcTables.Ltc1SrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, deferredSrvVisible.Cpu(b + 15), ltcTables.Ltc2SrvCpu, heapType);
 
         target.RenderColorOnlyCleared(cl => {
             cl.SetGraphicsRootSignature(deferredRootSig);
@@ -215,5 +225,6 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         deferredRootSig?.Dispose();
         deferredCb?.Dispose();
         deferredSrvVisible?.Dispose();
+        ltcTables?.Dispose();
     }
 }
