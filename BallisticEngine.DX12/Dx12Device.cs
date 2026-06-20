@@ -104,6 +104,35 @@ public sealed class Dx12Device : IDisposable {
     ulong uploadFenceValue;
     readonly System.Threading.AutoResetEvent uploadEvent = new(false);
 
+    // ========================= R1 — ASYNC COMPUTE QUEUE (opt-in, default OFF) =========================
+    // A second hardware queue (COMPUTE type) so a compute-only pass (GTAO, the Lumen RayQuery trace) can run on
+    // the GPU CONCURRENTLY with the graphics queue's work, instead of serialized behind it on the single Direct
+    // queue. The graphics frame fences the compute result exactly where it consumes it (cross-queue fence: state
+    // transitions do NOT synchronize across queues in D3D12 — only a fence does).
+    //
+    // GATED OFF by default (AsyncComputeEnabled == BALLISTIC_DX12_ASYNC_COMPUTE=1). When off, EVERY async-eligible
+    // pass records into the normal Direct frame list as before — byte-identical, single-queue. The infra below is
+    // created unconditionally (cheap: one queue + allocators + a shared fence) but is INERT until a pass routes
+    // work through RecordAsyncCompute(). N-buffered allocators/lists mirror the frame path so an in-flight compute
+    // submit's allocator is never reset under it (fence-gated per slot, same as the graphics frame slots).
+    public bool AsyncComputeEnabled { get; }
+    ID3D12CommandQueue computeQueue;
+    ID3D12CommandAllocator[] computeAllocators;     // [FramesInFlight]
+    ID3D12GraphicsCommandList4[] computeLists;      // [FramesInFlight]
+    ulong[] computeFenceTargets;                    // [FramesInFlight] value computeFence reaches when that slot is done
+    // Splitting the graphics frame at an async hand-off point needs a SECOND graphics allocator per slot for the
+    // post-split segment: the pre-split commands may still be executing on the GPU out of frameAllocators[slot],
+    // so the post-split segment must allocate from a DIFFERENT allocator (resetting the pre-split one mid-flight
+    // is illegal). One extra allocator per slot covers ONE async hand-off per frame (the GTAO/Lumen overlap point);
+    // a second hand-off in the same frame would need a third — asserted against. Reset per-slot in BeginFrame.
+    ID3D12CommandAllocator[] framePostAllocators;   // [FramesInFlight] post-async-split graphics segment
+    bool frameSplitThisFrame;                       // guards against a 2nd async hand-off in one frame
+    // ONE shared fence used for BOTH directions of the cross-queue handshake (a fence is just a monotonic
+    // counter; graphics and compute each Signal distinct rising values and Wait on the other's). asyncFenceValue
+    // is the single ever-increasing producer; each Signal takes the next value, each Wait targets a recorded one.
+    ID3D12Fence asyncFence;
+    ulong asyncFenceValue;
+
     public Dx12Device(bool enableDebugLayer = true) {
         // GPU-Based Validation (GBV) — the deterministic gate for the BARRIER/STATE bug class the
         // pass-graph migration relies on (W1 of the dx12-passgraph plan). GBV validates each resource's
@@ -247,6 +276,23 @@ public sealed class Dx12Device : IDisposable {
         frameList = frameLists[0];
         frameFence = Device.CreateFence(0, FenceFlags.None);
         frameFenceTargets = new ulong[FramesInFlight];   // all 0 → the first N BeginFrames never wait (slots fresh)
+
+        // R1 — async compute infra. Created always (inert until a pass routes work through it); ENABLED only by
+        // the opt-in. N-buffered to FramesInFlight so a compute submit's allocator is fence-gated per slot.
+        AsyncComputeEnabled = Environment.GetEnvironmentVariable("BALLISTIC_DX12_ASYNC_COMPUTE") == "1";
+        computeQueue = Device.CreateCommandQueue(new CommandQueueDescription(CommandListType.Compute));
+        computeAllocators = new ID3D12CommandAllocator[FramesInFlight];
+        computeLists = new ID3D12GraphicsCommandList4[FramesInFlight];
+        framePostAllocators = new ID3D12CommandAllocator[FramesInFlight];
+        for (int i = 0; i < FramesInFlight; i++) {
+            computeAllocators[i] = Device.CreateCommandAllocator(CommandListType.Compute);
+            computeLists[i] = Device.CreateCommandList<ID3D12GraphicsCommandList4>(
+                CommandListType.Compute, computeAllocators[i], null);
+            computeLists[i].Close();
+            framePostAllocators[i] = Device.CreateCommandAllocator(CommandListType.Direct);
+        }
+        asyncFence = Device.CreateFence(0, FenceFlags.None);
+        computeFenceTargets = new ulong[FramesInFlight];
 
         // Debug info queue (if the debug layer loaded): lets us print the REAL D3D12 message text on an
         // E_FAIL instead of the opaque HRESULT. Stored-message log by default.
@@ -439,6 +485,10 @@ public sealed class Dx12Device : IDisposable {
         frameList = frameLists[frameSlot];
         frameAllocators[frameSlot].Reset();
         frameList.Reset(frameAllocators[frameSlot], null);
+        // R1: this slot's previous frame is GPU-complete (the WaitFrameFence above gates slot reuse), so the
+        // post-async-split graphics allocator for this slot is safe to reset too. Inert when async compute is off.
+        if (AsyncComputeEnabled) framePostAllocators[frameSlot].Reset();
+        frameSplitThisFrame = false;
         frameThreadId = Environment.CurrentManagedThreadId;
         frameOpen = true;
     }
@@ -513,6 +563,62 @@ public sealed class Dx12Device : IDisposable {
     // frame (signalled only on frameFence, not the shared `fence`) is fully drained before ResizeBuffers/Present.
     public ulong LastFrameFenceTarget => frameFenceValue;
     public void WaitForFrame(ulong target) => WaitFrameFence(target);
+
+    // ===================== R1 — record a compute-only pass on the ASYNC COMPUTE queue =====================
+    // `record` is the pass's compute work (Dispatch + its barriers). It runs on the COMPUTE queue, overlapping the
+    // graphics queue on the GPU. The handshake (all GPU-side — the CPU never blocks here, so overlap is real):
+    //   1. Close + submit the graphics frame recorded SO FAR (the compute pass's INPUTS — e.g. the G-buffer the
+    //      GTAO reads — were recorded before this call, so they must be in flight before compute can consume them),
+    //      then Signal asyncFence=A on the GRAPHICS queue.
+    //   2. computeQueue.Wait(asyncFence, A) — compute won't start until the graphics inputs are submitted.
+    //   3. Record + submit the compute list; Signal asyncFence=B on the COMPUTE queue.
+    //   4. Reopen a fresh graphics frame segment (same slot) and Queue.Wait(asyncFence, B) on the GRAPHICS queue —
+    //      so everything the graphics frame records AFTER this call (the consumer, e.g. deferred lighting reading
+    //      the AO) waits for the compute result on the GPU.
+    // The cross-queue Waits are GPU-side fence waits (ID3D12CommandQueue.Wait), NOT CPU blocks — the CPU keeps
+    // recording. Resource STATE across the queue boundary is the caller's responsibility: a UAV written on compute
+    // and read on graphics must be left in a state legal for the consumer; the fence orders execution, the barrier
+    // (recorded by the consumer) handles the state. When async is OFF (or no frame open), `record` runs inline on
+    // the graphics frame list (byte-identical single-queue path) — the caller is identical either way.
+    public void RecordAsyncCompute(Action<ID3D12GraphicsCommandList4> record) {
+        if (!AsyncComputeEnabled || !(frameOpen && Environment.CurrentManagedThreadId == frameThreadId)) {
+            // Inline fallback: just record into the graphics frame list (or plain ExecuteSync if no frame open).
+            ExecuteSync(record);
+            return;
+        }
+        if (frameSplitThisFrame) {
+            // Only one async hand-off per frame is supported (one post-split allocator). A second would reset an
+            // allocator whose post-split commands are still in flight — fall back to inline to stay correct.
+            ExecuteSync(record);
+            return;
+        }
+        frameSplitThisFrame = true;
+        // 1. Submit the graphics frame recorded SO FAR (the compute pass's inputs) + signal A on the graphics queue.
+        frameList.Close();
+        Queue.ExecuteCommandList(frameList);
+        ulong a = ++asyncFenceValue;
+        Queue.Signal(asyncFence, a);
+        // 2. Compute waits (GPU-side) for the graphics inputs to be in flight.
+        computeQueue.Wait(asyncFence, a);
+        // 3. Record + submit the compute work on this slot's compute allocator/list, then signal B on compute.
+        var cAlloc = computeAllocators[frameSlot];
+        var cList = computeLists[frameSlot];
+        cAlloc.Reset();
+        cList.Reset(cAlloc, null);
+        record(cList);
+        cList.Close();
+        computeQueue.ExecuteCommandList(cList);
+        ulong b = ++asyncFenceValue;
+        computeQueue.Signal(asyncFence, b);
+        computeFenceTargets[frameSlot] = b;
+        // 4. Reopen the graphics frame on the SLOT'S POST-SPLIT allocator (the pre-split allocator may still be in
+        //    flight — resetting it now would be illegal). Then Queue.Wait(B): everything the graphics frame records
+        //    AFTER this call waits, GPU-side, for the compute result. The CPU never blocked → graphics and compute
+        //    overlap on the GPU between A and the consumer. frameList continues as the open frame list; EndFrame
+        //    closes + submits this post-split segment normally.
+        frameList.Reset(framePostAllocators[frameSlot], null);
+        Queue.Wait(asyncFence, b);
+    }
 
     // P0a — true while a pipelined frame is recording on the current thread (passes can branch on it if they
     // must do a real GPU round-trip mid-frame; readbacks use ExecuteSyncImmediate which handles this).
@@ -708,6 +814,13 @@ public sealed class Dx12Device : IDisposable {
     public void Dispose() {
         WaitForGpu();
         WaitFrameFence(frameFenceValue);   // P0b: drain any overlapped frame (signalled only on frameFence)
+        // R1: drain any in-flight async-compute work too. In steady state the graphics frame already waited on
+        // asyncFence=B (so frameFence completion implies compute completion), but a frame that submitted compute
+        // and then errored before its graphics wait could leave compute in flight — block on the last value.
+        if (asyncFenceValue > 0 && asyncFence.CompletedValue < asyncFenceValue) {
+            asyncFence.SetEventOnCompletion(asyncFenceValue, frameFenceEvent.SafeWaitHandle.DangerousGetHandle());
+            frameFenceEvent.WaitOne();
+        }
         while (deferredReleases.Count > 0) deferredReleases.Dequeue().res.Dispose();   // free any pending GPU resources
         fenceEvent.Dispose();
         fence.Dispose();
@@ -721,6 +834,12 @@ public sealed class Dx12Device : IDisposable {
         uploadFence.Dispose();
         uploadList.Dispose();
         uploadAllocator.Dispose();
+        // R1 async-compute resources.
+        foreach (var l in computeLists) l.Dispose();
+        foreach (var a in computeAllocators) a.Dispose();
+        foreach (var a in framePostAllocators) a.Dispose();
+        asyncFence.Dispose();
+        computeQueue.Dispose();
         infoQueue?.Dispose();
         Queue.Dispose();
         Device.Dispose();

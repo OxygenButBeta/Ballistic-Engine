@@ -147,7 +147,25 @@ Triage flow per phase: `bal perf <scene>` for the relative pass deltas + `Render
 
 ---
 
-### R1 — Async compute queue (highest certain GPU win)
+### R1 — Async compute queue — ⚙️ INFRA SHIPPED, pilot-pass binding deferred (needs live-GPU validation)
+
+> **2026-06-20 status.** The async-compute INFRASTRUCTURE is built, compiles, and is byte-identical with the
+> default OFF (`BALLISTIC_DX12_ASYNC_COMPUTE` unset): a 2nd `ID3D12CommandQueue(Compute)` + a shared cross-queue
+> `asyncFence` + N-buffered compute allocators/lists + a per-slot post-split graphics allocator + the
+> `Dx12Device.RecordAsyncCompute(record)` hand-off (submit graphics-so-far → signal A → compute waits A → run
+> compute → signal B → reopen graphics on the post-split allocator → graphics waits B; all GPU-side, CPU never
+> blocks → real overlap). Drained in Dispose; inert until a pass routes work through it.
+>
+> **Pilot-pass binding NOT done, deliberately.** Auditing the frame for a SAFE first async pass found none that
+> can be flipped blind: **GTAO is a graphics PSO** (pixel-shader fullscreen draw → can't run on the compute
+> queue); **RTAO** is compute but its Record transitions the shared AO/depth/normal through `PixelShaderResource`
+> and does a copy-back — states that are ILLEGAL on a compute queue, and its own comment records that a
+> split-submit version already "tripped 580 InvalidSubresourceState"; **the Lumen trace** is the genuinely
+> overlap-worthy candidate but it's the active lumen-fidelity WIP surface and the most stability-sensitive pass.
+> Binding any of these without a live GPU + Tracy to prove (a) the overlap actually materializes and (b) no
+> cross-queue state-hazard hang would violate the absolute gpu-hang-launch-safety rule. So R1 ships the substrate;
+> the pilot binding is a follow-up that pairs a state-clean candidate (Lumen trace, or RTAO with its copy-back
+> split back to the graphics queue) with a live Tracy capture. Kill-switch: `BALLISTIC_DX12_ASYNC_COMPUTE=1`.
 
 - **Goal:** add a second `ID3D12CommandQueue(Compute)` and overlap compute-only passes with graphics: **GTAO** + **shadow-cull** with graphics, and the **Lumen RayQuery trace** (~2–5 ms GPU on Bistro) behind deferred shading. Byte-identical, no shader changes.
 - **Files/symbols:**
