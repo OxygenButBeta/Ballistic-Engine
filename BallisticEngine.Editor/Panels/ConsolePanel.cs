@@ -1,8 +1,6 @@
+using System.Numerics;
 using System.Text;
 using System.Text.RegularExpressions;
-using Hexa.NET.ImGui;
-using SysVec2 = System.Numerics.Vector2;
-using SysVec4 = System.Numerics.Vector4;
 
 namespace BallisticEngine.Editor;
 
@@ -11,12 +9,11 @@ namespace BallisticEngine.Editor;
 // consecutive duplicates (with a count badge), copy-to-clipboard, and double-click-to-open-source for
 // rows that carry an "Assets/...cs(line,col)" reference (script errors).
 //
-// Framework pilot (Phase 1): first panel ported to the EditorWindow base. Identity (dock key/title/icon)
-// lives in the base; OnGui routes to DrawContents. The body still calls ImGui directly — that is allowed
-// (the architecture rule is only that the PLAYER never sees ImGui; inside the editor it's free). The
-// registry still drives DrawContents today; Phase 3 switches it to drive the window through WindowShell.
+// Phase-7 EditorWindow: the body now draws entirely through IEditorGui (zero raw ImGui). Per-row severity
+// tinting + the filter chips route through the seam's style scope (gui.PushColor/PopColor); the icon-button
+// (GhostButton) and divider stay EditorIcons/EditorDecoration helper calls (seam-adjacent widgets).
 internal sealed class ConsolePanel : EditorWindow {
-    protected override void OnGui(IEditorGui gui) => DrawContents();
+    protected override void OnGui(IEditorGui gui) => DrawContents(gui);
 
     readonly record struct Entry(string Message, int Level, string Time);
 
@@ -28,10 +25,8 @@ internal sealed class ConsolePanel : EditorWindow {
     bool collapse = true;
     string search = "";
 
-    // Severity tints come from the central theme (EditorTheme.LogLevel: info/warning/error). EF5b — the
-    // per-level array used to be hand-typed here; routed through the theme so the console reads with the
-    // same status palette as the rest of the editor.
-    static SysVec4[] LevelColors => EditorTheme.LogLevel;
+    // Severity tints come from the central theme (EditorTheme.LogLevel: info/warning/error).
+    static Vector4[] LevelColors => EditorTheme.LogLevel;
 
     static readonly string[] LevelIcons = [EditorIcons.Info, EditorIcons.Warning, EditorIcons.Error];
 
@@ -46,8 +41,7 @@ internal sealed class ConsolePanel : EditorWindow {
         Singleton = false;        // duplicable via the Add-Tab host
 
         Debugging.OnMessage += (message, level) => {
-            // Timestamp at log time (HH:mm:ss). DateTime.Now is fine here — this is wall-clock display,
-            // not gameplay timing.
+            // Timestamp at log time (HH:mm:ss). DateTime.Now is fine here — this is wall-clock display.
             string time = DateTime.Now.ToString("HH:mm:ss");
             lock (gate) {
                 entries.Add(new Entry(message, level, time));
@@ -57,7 +51,7 @@ internal sealed class ConsolePanel : EditorWindow {
         };
     }
 
-    public void DrawContents() {
+    public void DrawContents(IEditorGui gui) {
         int infoCount, warnCount, errorCount;
         Entry[] snapshot;
         lock (gate) {
@@ -70,29 +64,29 @@ internal sealed class ConsolePanel : EditorWindow {
         // ---- Toolbar row 1: clear / copy / filter chips / auto-scroll ----
         if (EditorIcons.GhostButton("clearlog", EditorIcons.Delete, "Clear the log"))
             lock (gate) entries.Clear();
-        ImGui.SameLine(0, 2);
+        gui.SameLine(0, 2);
         if (EditorIcons.GhostButton("copylog", EditorIcons.Document, "Copy visible log to clipboard"))
-            CopyToClipboard(snapshot);
+            CopyToClipboard(gui, snapshot);
 
-        ImGui.SameLine(0, 10);
-        FilterChip("Info", infoCount, 0, ref showInfo);
-        ImGui.SameLine(0, 4);
-        FilterChip("Warnings", warnCount, 1, ref showWarnings);
-        ImGui.SameLine(0, 4);
-        FilterChip("Errors", errorCount, 2, ref showErrors);
+        gui.SameLine(0, 10);
+        FilterChip(gui, "Info", infoCount, 0, ref showInfo);
+        gui.SameLine(0, 4);
+        FilterChip(gui, "Warnings", warnCount, 1, ref showWarnings);
+        gui.SameLine(0, 4);
+        FilterChip(gui, "Errors", errorCount, 2, ref showErrors);
 
-        ImGui.SameLine(0, 16);
-        ImGui.Checkbox("Collapse", ref collapse);
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Collapse consecutive identical messages into one row + count.");
-        ImGui.SameLine(0, 10);
-        ImGui.Checkbox("Auto-scroll", ref autoScroll);
+        gui.SameLine(0, 16);
+        gui.Checkbox("Collapse", ref collapse);
+        if (gui.IsItemHovered()) gui.Tooltip("Collapse consecutive identical messages into one row + count.");
+        gui.SameLine(0, 10);
+        gui.Checkbox("Auto-scroll", ref autoScroll);
 
         // ---- Toolbar row 2: search ----
-        ImGui.SetNextItemWidth(-1);
-        ImGui.InputTextWithHint("##consolesearch", $"{EditorIcons.Search} Filter log...", ref search, 128);
+        gui.SetNextItemWidth(-1);
+        gui.InputTextWithHint("##consolesearch", $"{EditorIcons.Search} Filter log...", ref search, 128);
         EditorDecoration.DrawDivider();
 
-        ImGui.BeginChild("##log", default, ImGuiChildFlags.None, ImGuiWindowFlags.HorizontalScrollbar);
+        gui.BeginChild("##log", default, border: false, horizontalScroll: true);
 
         var anyVisible = false;
         for (var i = 0; i < snapshot.Length; i++) {
@@ -113,60 +107,60 @@ internal sealed class ConsolePanel : EditorWindow {
             }
 
             anyVisible = true;
-            DrawRow(e, dupCount, i);
+            DrawRow(gui, e, dupCount, i);
         }
 
         if (!anyVisible)
-            ImGui.TextDisabled(snapshot.Length == 0 ? "No log messages yet."
+            gui.TextDisabled(snapshot.Length == 0 ? "No log messages yet."
                 : search.Length > 0 ? "No messages match the filter." : "All messages filtered out.");
 
-        if (autoScroll && ImGui.GetScrollY() >= ImGui.GetScrollMaxY() - 4)
-            ImGui.SetScrollHereY(1f);
+        if (autoScroll && gui.ScrollY >= gui.ScrollMaxY - 4)
+            gui.SetScrollHereY(1f);
 
-        ImGui.EndChild();
+        gui.EndChild();
     }
 
-    void DrawRow(Entry e, int dupCount, int id) {
-        ImGui.PushID(id);
+    void DrawRow(IEditorGui gui, Entry e, int dupCount, int id) {
+        gui.PushId(id);
 
-        // Timestamp (dim, fixed-ish width via the monospace-y digits of the UI font).
-        ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
-        ImGui.TextUnformatted(e.Time);
-        ImGui.PopStyleColor();
-        ImGui.SameLine(0, 8);
+        // Timestamp (dim).
+        gui.PushColor(EditorStyleColor.Text, gui.StyleColor(EditorStyleColor.TextDisabled));
+        gui.TextUnformatted(e.Time);
+        gui.PopColor();
+        gui.SameLine(0, 8);
 
         // Severity icon.
-        ImGui.PushStyleColor(ImGuiCol.Text, LevelColors[e.Level]);
-        ImGui.TextUnformatted(LevelIcons[e.Level]);
-        ImGui.PopStyleColor();
-        ImGui.SameLine(0, 8);
+        gui.PushColor(EditorStyleColor.Text, LevelColors[e.Level]);
+        gui.TextUnformatted(LevelIcons[e.Level]);
+        gui.PopColor();
+        gui.SameLine(0, 8);
 
         // Message (errors/warnings tinted). Selectable so a double-click can open the source ref.
         if (e.Level > 0)
-            ImGui.PushStyleColor(ImGuiCol.Text, LevelColors[e.Level]);
-        ImGui.Selectable(e.Message, false, ImGuiSelectableFlags.AllowDoubleClick);
+            gui.PushColor(EditorStyleColor.Text, LevelColors[e.Level]);
+        gui.Selectable(e.Message, false);
         if (e.Level > 0)
-            ImGui.PopStyleColor();
+            gui.PopColor();
 
         Match m = SourceRef.Match(e.Message);
-        if (m.Success && ImGui.IsItemHovered()) {
-            ImGui.SetTooltip($"Double-click to open {m.Groups[1].Value}:{m.Groups[2].Value}");
-            if (ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
+        if (m.Success && gui.IsItemHovered()) {
+            gui.Tooltip($"Double-click to open {m.Groups[1].Value}:{m.Groups[2].Value}");
+            if (gui.Input.MouseDoubleClicked(0))
                 OpenSource(m.Groups[1].Value, int.Parse(m.Groups[2].Value));
         }
 
         // Duplicate-count badge on the right.
         if (dupCount > 1) {
             string badge = $"x{dupCount}";
-            float right = ImGui.GetWindowWidth() - ImGui.CalcTextSize(badge).X - ImGui.GetStyle().ScrollbarSize - 8;
-            ImGui.SameLine();
-            ImGui.SetCursorPosX(Math.Max(ImGui.GetCursorPosX(), right));
-            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
-            ImGui.TextUnformatted(badge);
-            ImGui.PopStyleColor();
+            float right = gui.WindowWidth - gui.CalcTextSize(badge).X - gui.ScrollbarSize - 8;
+            gui.SameLine();
+            gui.CursorPosX = Math.Max(gui.CursorPosX, right);
+            gui.PushColor(EditorStyleColor.Text, gui.StyleColor(EditorStyleColor.TextDisabled));
+            gui.TextUnformatted(badge);
+            gui.PopColor();
         }
 
-        ImGui.PopID();
+        gui.PopId();
     }
 
     static void OpenSource(string assetRelativePath, int line) {
@@ -191,7 +185,7 @@ internal sealed class ConsolePanel : EditorWindow {
         }
     }
 
-    void CopyToClipboard(Entry[] snapshot) {
+    void CopyToClipboard(IEditorGui gui, Entry[] snapshot) {
         var sb = new StringBuilder();
         foreach (Entry e in snapshot) {
             if (!(e.Level switch { 0 => showInfo, 1 => showWarnings, _ => showErrors }))
@@ -201,29 +195,29 @@ internal sealed class ConsolePanel : EditorWindow {
             string tag = e.Level switch { 1 => "WARN", 2 => "ERROR", _ => "INFO" };
             sb.Append('[').Append(e.Time).Append("] ").Append(tag).Append(": ").AppendLine(e.Message);
         }
-        ImGui.SetClipboardText(sb.ToString());
+        gui.SetClipboardText(sb.ToString());
     }
 
     // Icon + count toggle chip; filled with the severity tint while enabled.
-    static void FilterChip(string label, int count, int level, ref bool enabled) {
-        SysVec4 tint = LevelColors[level];
+    static void FilterChip(IEditorGui gui, string label, int count, int level, ref bool enabled) {
+        Vector4 tint = LevelColors[level];
         if (enabled) {
-            ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(tint.X, tint.Y, tint.Z, 0.16f));
-            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(tint.X, tint.Y, tint.Z, 0.26f));
-            ImGui.PushStyleColor(ImGuiCol.ButtonActive, new SysVec4(tint.X, tint.Y, tint.Z, 0.36f));
-            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.Text]);
+            gui.PushColor(EditorStyleColor.Button, new Vector4(tint.X, tint.Y, tint.Z, 0.16f));
+            gui.PushColor(EditorStyleColor.ButtonHovered, new Vector4(tint.X, tint.Y, tint.Z, 0.26f));
+            gui.PushColor(EditorStyleColor.ButtonActive, new Vector4(tint.X, tint.Y, tint.Z, 0.36f));
+            gui.PushColor(EditorStyleColor.Text, gui.StyleColor(EditorStyleColor.Text));
         }
         else {
-            ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(0, 0, 0, 0));
-            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(1, 1, 1, 0.06f));
-            ImGui.PushStyleColor(ImGuiCol.ButtonActive, new SysVec4(1, 1, 1, 0.10f));
-            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+            gui.PushColor(EditorStyleColor.Button, new Vector4(0, 0, 0, 0));
+            gui.PushColor(EditorStyleColor.ButtonHovered, new Vector4(1, 1, 1, 0.06f));
+            gui.PushColor(EditorStyleColor.ButtonActive, new Vector4(1, 1, 1, 0.10f));
+            gui.PushColor(EditorStyleColor.Text, gui.StyleColor(EditorStyleColor.TextDisabled));
         }
 
-        if (ImGui.Button($"{LevelIcons[level]} {count}##chip{label}"))
+        if (gui.Button($"{LevelIcons[level]} {count}##chip{label}"))
             enabled = !enabled;
-        ImGui.PopStyleColor(4);
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip(enabled ? $"Hide {label.ToLowerInvariant()}" : $"Show {label.ToLowerInvariant()}");
+        gui.PopColor(4);
+        if (gui.IsItemHovered())
+            gui.Tooltip(enabled ? $"Hide {label.ToLowerInvariant()}" : $"Show {label.ToLowerInvariant()}");
     }
 }

@@ -144,6 +144,30 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public bool IsItemActivated() => ImGui.IsItemActivated();
     public bool IsItemDeactivatedAfterEdit() => ImGui.IsItemDeactivatedAfterEdit();
 
+    // ---- style scope ----
+    public void PushColor(EditorStyleColor which, Vector4 rgba) => ImGui.PushStyleColor(MapColor(which), rgba);
+    public void PopColor(int count = 1) => ImGui.PopStyleColor(count);
+    public void PushFramePadding(Vector2 padding) => ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, padding);
+    public void PopStyleVar(int count = 1) => ImGui.PopStyleVar(count);
+    public Vector4 StyleColor(EditorStyleColor which) => ImGui.GetStyle().Colors[(int)MapColor(which)];
+
+    static ImGuiCol MapColor(EditorStyleColor c) => c switch {
+        EditorStyleColor.Text => ImGuiCol.Text,
+        EditorStyleColor.TextDisabled => ImGuiCol.TextDisabled,
+        EditorStyleColor.Button => ImGuiCol.Button,
+        EditorStyleColor.ButtonHovered => ImGuiCol.ButtonHovered,
+        EditorStyleColor.ButtonActive => ImGuiCol.ButtonActive,
+        EditorStyleColor.FrameBg => ImGuiCol.FrameBg,
+        EditorStyleColor.FrameBgHovered => ImGuiCol.FrameBgHovered,
+        EditorStyleColor.SliderGrab => ImGuiCol.SliderGrab,
+        _ => ImGuiCol.Text,
+    };
+
+    // ---- misc window metrics / clipboard ----
+    public float WindowWidth => ImGui.GetWindowWidth();
+    public float ScrollbarSize => ImGui.GetStyle().ScrollbarSize;
+    public void SetClipboardText(string text) => ImGui.SetClipboardText(text);
+
     // ---- custom draw + input ----
     public IEditorInput Input => input;
     public IEditorDrawList WindowDrawList { get { drawList.Bind(ImGui.GetWindowDrawList()); return drawList; } }

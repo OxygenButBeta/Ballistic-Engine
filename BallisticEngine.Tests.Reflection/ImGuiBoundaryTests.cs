@@ -113,8 +113,7 @@ internal static class ImGuiBoundaryTests {
         // Hierarchy + Assets (Phase 5): drag-drop heavy, needs seam drag-drop/context-menu first.
         "BallisticEngine.Editor/Panels/HierarchyPanel.cs",
         "BallisticEngine.Editor/Panels/AssetBrowserPanel.cs",
-        // Console (Phase-1 EditorWindow; body still raw — per-row severity PushStyleColor tinting).
-        "BallisticEngine.Editor/Panels/ConsolePanel.cs",
+        // (ConsolePanel migrated — now draws through the seam's style scope; dropped from the list.)
         // Inline inspector drawers (Phase 7): VolumeProfile + BEvent — custom-header ImGui, plan-exempt.
         "BallisticEngine.Editor/Panels/VolumeProfileEditor.cs",
         "BallisticEngine.Editor/Panels/BEventEditor.cs",

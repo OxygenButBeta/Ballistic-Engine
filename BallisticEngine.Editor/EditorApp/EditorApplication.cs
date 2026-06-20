@@ -181,7 +181,7 @@ internal sealed class EditorApplication {
         extraPanels.Register(EditorLayout.Assets, "Assets", EditorIcons.Folder,
             () => new AssetBrowserPanel(editorState, () => imgui.Scale), p => ((AssetBrowserPanel)p).DrawContents());
         extraPanels.Register(EditorLayout.Console, "Console", EditorIcons.Document,
-            () => new ConsolePanel(), p => ((ConsolePanel)p).DrawContents());
+            () => new ConsolePanel(), p => ((ConsolePanel)p).DrawContents(gui));
         extraPanels.OnTitleStrip = MaximizePanelOnTitleDoubleClick;
 
         // A1b-deeper: declare the CORE dockable panels ONCE in the registry, which now OWNS their show

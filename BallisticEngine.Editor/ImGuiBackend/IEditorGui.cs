@@ -116,10 +116,33 @@ public interface IEditorGui {
     bool IsItemActivated();
     bool IsItemDeactivatedAfterEdit();
 
+    // ---- style scope (push/pop, balanced) ----
+    // Lets a window body tint a few widgets (severity colours, filter chips, tighter checkbox padding)
+    // WITHOUT importing ImGui's style enums. Push N colours then Pop the SAME N; push one var then PopVar.
+    // Covers exactly the cases the panels use today (Text + Button family + FramePadding); extend on demand.
+    void PushColor(EditorStyleColor which, Vector4 rgba);
+    void PopColor(int count = 1);
+    void PushFramePadding(Vector2 padding);
+    void PopStyleVar(int count = 1);
+
+    // ---- misc window metrics / clipboard ----
+    float WindowWidth { get; }
+    float ScrollbarSize { get; }
+    void SetClipboardText(string text);
+
     // ---- custom draw + immediate input (curve editor, decorations) ----
     IEditorInput Input { get; }
     IEditorDrawList WindowDrawList { get; }
     uint ColorU32(Vector4 rgba);
+    Vector4 StyleColor(EditorStyleColor which);   // read the current themed colour (e.g. TextDisabled)
+}
+
+// Seam-local style-colour ids (subset the panels tint) — keeps ImGuiCol out of window bodies.
+public enum EditorStyleColor {
+    Text, TextDisabled,
+    Button, ButtonHovered, ButtonActive,
+    FrameBg, FrameBgHovered,
+    SliderGrab,
 }
 
 // Seam-local table flags (subset actually used by panels) — keeps ImGuiTableFlags out of window bodies.
