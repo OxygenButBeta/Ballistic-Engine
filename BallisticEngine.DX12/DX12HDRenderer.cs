@@ -1123,6 +1123,15 @@ public sealed class DX12HDRenderer : HDRenderer
     bool Pp1InlineSyncs => pp1InlineSyncsOn ??=
         Environment.GetEnvironmentVariable("BALLISTIC_DX12_PP1_INLINE_SYNCS") != "0";
 
+    // R2 opt-in: BALLISTIC_DX12_CPU_BINDLESS=1 routes the CPU per-submesh OPAQUE path through the shared bindless
+    // material table instead of the legacy per-draw 6× CopyDescriptorsSimple + root descriptor table. Default OFF
+    // during bring-up (a new draw path that mid-pass swaps the shader-visible descriptor heap to BindlessHeap +
+    // mid-frame-registers materials — exactly the descriptor-lifetime class that has caused TDRs here; ship ON
+    // only after a live-GPU + DRED pass on a real SubMeshIndex>=0 scene confirms it's hang-free + byte-identical).
+    bool? cpuBindlessOn;
+    bool CpuBindless => cpuBindlessOn ??=
+        Environment.GetEnvironmentVariable("BALLISTIC_DX12_CPU_BINDLESS") == "1";
+
     // GI motion harness: per-frame camera yaw (deg) injected in BeginRender so a headless sequence has real motion.
     int motionYawFrame;
     float? motionYawCached;
@@ -1356,7 +1365,11 @@ public sealed class DX12HDRenderer : HDRenderer
         ExtractFrustumPlanes(viewProjUnjittered);
 
         // GPU-driven: whole-mesh renderers were collected before RenderShadows; build their bindless table.
-        if (gpuDrivenOn)
+        // R2: also build it when the CPU per-submesh path will use bindless materials but GPU-driven is OFF (so the
+        // whole-mesh list is empty) — EnsureMaterialTable then resets the bindless heap + stamp; the CPU loop's
+        // ResolveOrRegisterMaterialId fills the table mid-frame. Keeps scene-swap (RenderSetsCleared) re-pointing
+        // correct on the CPU-only path too.
+        if (gpuDrivenOn || CpuBindless)
             gpuDriven.EnsureMaterialTable(wholeMeshRenderers);
 
         // Hi-Z: build the occlusion pyramid from the PREVIOUS frame's depth (before the geometry pass clears
@@ -1374,14 +1387,36 @@ public sealed class DX12HDRenderer : HDRenderer
 
         var fallbackDiffuse = DefaultTextures.Neutral(TextureType.Diffuse) as Dx12Texture2D;
 
+        // R2: route the CPU per-submesh OPAQUE path through the SAME bindless material table + GBufferBindless.hlsl
+        // PSO the GPU-driven whole-mesh path uses (shading byte-identical to gbufferPso) — no per-draw 6×
+        // CopyDescriptorsSimple. Gated on: kill-switch ON, GPU-driven on (the table exists). The DrawIndex root
+        // const selects this draw's PerDraw entry; the material is resolved into the shared table by id. A draw
+        // that can't fit (perDraws over MaxCpuDraws) or whose material can't register (table full) skips bindless
+        // for that submesh and uses the legacy descriptor-table path (the two PSOs are interchangeable per draw —
+        // each submesh rebinds its own state below).
+        bool cpuBindless = CpuBindless;   // material table is ensured above whenever this is on (GPU-driven or not)
+        int cpuDrawIndex = 0;   // running PerDraw slot for the bindless CPU draws this frame
+
         // === GEOMETRY PASS: fill the fat G-buffer (no lighting — GBuffer.hlsl writes albedo/normal/ORM/
         // emissive + depth). Same vertex transform + material sampling as the old forward opaque. ===
         gbuffer.RenderGeometry(cl =>
         {
-            cl.SetGraphicsRootSignature(gbufferRootSig);
-            cl.SetPipelineState(gbufferPso);
-            cl.SetDescriptorHeaps(srvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(2, motionCb.Gpu); // b1 motion (per pass)
+            // `boundBindless` tracks which PSO/root-sig is currently set so we switch only when a draw needs the
+            // other path (almost all CPU opaque draws take bindless; a register-fail falls back to gbufferPso).
+            bool boundBindless = false;
+            void BindLegacyState() {
+                cl.SetGraphicsRootSignature(gbufferRootSig);
+                cl.SetPipelineState(gbufferPso);
+                cl.SetDescriptorHeaps(srvVisible.Heap);
+                cl.SetGraphicsRootConstantBufferView(2, motionCb.Gpu); // b1 motion (per pass)
+                boundBindless = false;
+            }
+            void BindBindlessState() {
+                gpuDriven.CpuBindlessBegin(cl, motionCb.Gpu);   // drawRootSig + drawPso + PerDraws/GpuMaterials/Motion + bindless heap
+                boundBindless = true;
+            }
+            // Default initial state: bindless when armed (most opaque draws use it), else legacy.
+            if (cpuBindless) BindBindlessState(); else BindLegacyState();
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
 
             foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
@@ -1437,46 +1472,68 @@ public sealed class DX12HDRenderer : HDRenderer
                     if (mat.Transparent) continue;
                     if (slot >= cbSlotCount) break;
 
-                    bool hasMetal = mat.Metallic is not null;
-                    bool hasRough = mat.Roughness is not null;
-                    bool emissive = mat.IsEmissive;
-                    // The G-buffer geometry shader reads the material-shaping fields (factors, maps, flags);
-                    // the per-light fields (LightDir/LightColor/Ambient/Exposure) are unused here (they live
-                    // in the deferred pass now) but the struct is shared, so they're filled harmlessly.
-                    var c = new DrawConstants
+                    // R2 — BINDLESS FAST PATH: resolve the material into the shared GpuMaterials table + write this
+                    // draw's PerDraw{Mvp,Model,MaterialId}; the DrawIndex root const selects it. No 6× descriptor
+                    // copies, no per-draw CBV. Falls through to the legacy path if the material can't register
+                    // (table full) or the PerDraw buffer is full (over MaxCpuDraws).
+                    bool drewBindless = false;
+                    if (cpuBindless)
                     {
-                        Mvp = Matrix4x4.Transpose(mvp),
-                        Model = Matrix4x4.Transpose(model),
-                        LightDir = lightDir, Exposure = exposure,
-                        LightColor = lightColor, Metallic = mat.MetallicFactor,
-                        Ambient = ambient, Roughness = mat.RoughnessFactor,
-                        CameraPos = camPos, SpecularReflectance = mat.SpecularReflectance,
-                        BaseColorFactor = mat.BaseColorFactor,
-                        EmissiveFactor = mat.EmissiveColor * mat.EmissiveIntensity,
-                        HasEmissive = emissive ? 1f : 0f,
-                        NormalStrength = mat.NormalStrength, NormalFlipY = mat.NormalFlipY ? 1f : 0f,
-                        HasMetallicMap = hasMetal ? 1f : 0f, HasRoughnessMap = hasRough ? 1f : 0f,
-                        PackedOrm = mat.PackedOrm ? 1f : 0f, Cutout = mat.Cutout ? 1f : 0f,
-                        UseIBL = iblActiveThisFrame ? 1f : 0f,
-                        PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f,
-                    };
-                    *(DrawConstants*)(cbMapped + CbFrameOffset + (long)slot * cbSlotSize) = c;
-                    cl.SetGraphicsRootConstantBufferView(0,
-                        cbRing.GPUVirtualAddress + (ulong)(CbFrameOffset + (long)slot * cbSlotSize));
+                        int mid = gpuDriven.ResolveOrRegisterMaterialId(mat);
+                        if (mid >= 0 && gpuDriven.CpuBindlessWrite(cpuDrawIndex, mvp, model, mid))
+                        {
+                            if (!boundBindless) BindBindlessState();
+                            cl.SetGraphicsRoot32BitConstant(0, (uint)cpuDrawIndex, 0);   // DrawIndex (b0)
+                            cl.DrawIndexedInstanced((uint)sub.IndexCount, 1, (uint)sub.IndexStart, 0, 0);
+                            cpuDrawIndex++;
+                            draws++; tris += sub.IndexCount / 3;
+                            drewBindless = true;
+                        }
+                    }
+                    if (!drewBindless)
+                    {
+                        if (boundBindless) BindLegacyState();   // switch back to the descriptor-table PSO
 
-                    // 6 material SRVs (t0..t5); null slots resolve to neutral defaults.
-                    int tableStart = srvVisible.AllocateRange(MaterialSrvCount);
-                    BindSrv(tableStart + 0, mat.Diffuse, TextureType.Diffuse, fallbackDiffuse);
-                    BindSrv(tableStart + 1, mat.Normal, TextureType.Normal, null);
-                    BindSrv(tableStart + 2, mat.Metallic, TextureType.Metallic, null);
-                    BindSrv(tableStart + 3, mat.Roughness, TextureType.Roughness, null);
-                    BindSrv(tableStart + 4, mat.AO, TextureType.AO, null);
-                    BindSrv(tableStart + 5, mat.Emissive, TextureType.Emissive, null);
-                    cl.SetGraphicsRootDescriptorTable(1, srvVisible.Gpu(tableStart));
+                        bool hasMetal = mat.Metallic is not null;
+                        bool hasRough = mat.Roughness is not null;
+                        bool emissive = mat.IsEmissive;
+                        // The G-buffer geometry shader reads the material-shaping fields (factors, maps, flags);
+                        // the per-light fields (LightDir/LightColor/Ambient/Exposure) are unused here (they live
+                        // in the deferred pass now) but the struct is shared, so they're filled harmlessly.
+                        var c = new DrawConstants
+                        {
+                            Mvp = Matrix4x4.Transpose(mvp),
+                            Model = Matrix4x4.Transpose(model),
+                            LightDir = lightDir, Exposure = exposure,
+                            LightColor = lightColor, Metallic = mat.MetallicFactor,
+                            Ambient = ambient, Roughness = mat.RoughnessFactor,
+                            CameraPos = camPos, SpecularReflectance = mat.SpecularReflectance,
+                            BaseColorFactor = mat.BaseColorFactor,
+                            EmissiveFactor = mat.EmissiveColor * mat.EmissiveIntensity,
+                            HasEmissive = emissive ? 1f : 0f,
+                            NormalStrength = mat.NormalStrength, NormalFlipY = mat.NormalFlipY ? 1f : 0f,
+                            HasMetallicMap = hasMetal ? 1f : 0f, HasRoughnessMap = hasRough ? 1f : 0f,
+                            PackedOrm = mat.PackedOrm ? 1f : 0f, Cutout = mat.Cutout ? 1f : 0f,
+                            UseIBL = iblActiveThisFrame ? 1f : 0f,
+                            PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f,
+                        };
+                        *(DrawConstants*)(cbMapped + CbFrameOffset + (long)slot * cbSlotSize) = c;
+                        cl.SetGraphicsRootConstantBufferView(0,
+                            cbRing.GPUVirtualAddress + (ulong)(CbFrameOffset + (long)slot * cbSlotSize));
 
-                    cl.DrawIndexedInstanced((uint)sub.IndexCount, 1, (uint)sub.IndexStart, 0, 0);
-                    draws++;
-                    tris += sub.IndexCount / 3;
+                        // 6 material SRVs (t0..t5); null slots resolve to neutral defaults.
+                        int tableStart = srvVisible.AllocateRange(MaterialSrvCount);
+                        BindSrv(tableStart + 0, mat.Diffuse, TextureType.Diffuse, fallbackDiffuse);
+                        BindSrv(tableStart + 1, mat.Normal, TextureType.Normal, null);
+                        BindSrv(tableStart + 2, mat.Metallic, TextureType.Metallic, null);
+                        BindSrv(tableStart + 3, mat.Roughness, TextureType.Roughness, null);
+                        BindSrv(tableStart + 4, mat.AO, TextureType.AO, null);
+                        BindSrv(tableStart + 5, mat.Emissive, TextureType.Emissive, null);
+                        cl.SetGraphicsRootDescriptorTable(1, srvVisible.Gpu(tableStart));
+
+                        cl.DrawIndexedInstanced((uint)sub.IndexCount, 1, (uint)sub.IndexStart, 0, 0);
+                        draws++; tris += sub.IndexCount / 3;
+                    }
                     slot++;
                 }
             }

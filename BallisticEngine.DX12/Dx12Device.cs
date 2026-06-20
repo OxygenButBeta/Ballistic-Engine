@@ -277,22 +277,26 @@ public sealed class Dx12Device : IDisposable {
         frameFence = Device.CreateFence(0, FenceFlags.None);
         frameFenceTargets = new ulong[FramesInFlight];   // all 0 → the first N BeginFrames never wait (slots fresh)
 
-        // R1 — async compute infra. Created always (inert until a pass routes work through it); ENABLED only by
-        // the opt-in. N-buffered to FramesInFlight so a compute submit's allocator is fence-gated per slot.
+        // R1 — async compute infra. Created ONLY when the opt-in is on, so the default path creates ZERO new
+        // device resources (no extra queue/allocators/fence) → byte-identical to pre-R1 and cannot perturb the
+        // graphics queue. When off, computeQueue/asyncFence stay null and RecordAsyncCompute takes its inline
+        // fallback. (Created-always was the bring-up form; gated here so a TDR can't be blamed on an inert queue.)
         AsyncComputeEnabled = Environment.GetEnvironmentVariable("BALLISTIC_DX12_ASYNC_COMPUTE") == "1";
-        computeQueue = Device.CreateCommandQueue(new CommandQueueDescription(CommandListType.Compute));
-        computeAllocators = new ID3D12CommandAllocator[FramesInFlight];
-        computeLists = new ID3D12GraphicsCommandList4[FramesInFlight];
-        framePostAllocators = new ID3D12CommandAllocator[FramesInFlight];
-        for (int i = 0; i < FramesInFlight; i++) {
-            computeAllocators[i] = Device.CreateCommandAllocator(CommandListType.Compute);
-            computeLists[i] = Device.CreateCommandList<ID3D12GraphicsCommandList4>(
-                CommandListType.Compute, computeAllocators[i], null);
-            computeLists[i].Close();
-            framePostAllocators[i] = Device.CreateCommandAllocator(CommandListType.Direct);
+        if (AsyncComputeEnabled) {
+            computeQueue = Device.CreateCommandQueue(new CommandQueueDescription(CommandListType.Compute));
+            computeAllocators = new ID3D12CommandAllocator[FramesInFlight];
+            computeLists = new ID3D12GraphicsCommandList4[FramesInFlight];
+            framePostAllocators = new ID3D12CommandAllocator[FramesInFlight];
+            for (int i = 0; i < FramesInFlight; i++) {
+                computeAllocators[i] = Device.CreateCommandAllocator(CommandListType.Compute);
+                computeLists[i] = Device.CreateCommandList<ID3D12GraphicsCommandList4>(
+                    CommandListType.Compute, computeAllocators[i], null);
+                computeLists[i].Close();
+                framePostAllocators[i] = Device.CreateCommandAllocator(CommandListType.Direct);
+            }
+            asyncFence = Device.CreateFence(0, FenceFlags.None);
+            computeFenceTargets = new ulong[FramesInFlight];
         }
-        asyncFence = Device.CreateFence(0, FenceFlags.None);
-        computeFenceTargets = new ulong[FramesInFlight];
 
         // Debug info queue (if the debug layer loaded): lets us print the REAL D3D12 message text on an
         // E_FAIL instead of the opaque HRESULT. Stored-message log by default.
@@ -817,7 +821,7 @@ public sealed class Dx12Device : IDisposable {
         // R1: drain any in-flight async-compute work too. In steady state the graphics frame already waited on
         // asyncFence=B (so frameFence completion implies compute completion), but a frame that submitted compute
         // and then errored before its graphics wait could leave compute in flight — block on the last value.
-        if (asyncFenceValue > 0 && asyncFence.CompletedValue < asyncFenceValue) {
+        if (asyncFence is not null && asyncFenceValue > 0 && asyncFence.CompletedValue < asyncFenceValue) {
             asyncFence.SetEventOnCompletion(asyncFenceValue, frameFenceEvent.SafeWaitHandle.DangerousGetHandle());
             frameFenceEvent.WaitOne();
         }
@@ -834,12 +838,12 @@ public sealed class Dx12Device : IDisposable {
         uploadFence.Dispose();
         uploadList.Dispose();
         uploadAllocator.Dispose();
-        // R1 async-compute resources.
-        foreach (var l in computeLists) l.Dispose();
-        foreach (var a in computeAllocators) a.Dispose();
-        foreach (var a in framePostAllocators) a.Dispose();
-        asyncFence.Dispose();
-        computeQueue.Dispose();
+        // R1 async-compute resources (null unless AsyncComputeEnabled).
+        if (computeLists is not null) foreach (var l in computeLists) l.Dispose();
+        if (computeAllocators is not null) foreach (var a in computeAllocators) a.Dispose();
+        if (framePostAllocators is not null) foreach (var a in framePostAllocators) a.Dispose();
+        asyncFence?.Dispose();
+        computeQueue?.Dispose();
         infoQueue?.Dispose();
         Queue.Dispose();
         Device.Dispose();
