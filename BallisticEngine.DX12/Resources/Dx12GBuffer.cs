@@ -32,6 +32,21 @@ public sealed class Dx12GBuffer : IDisposable {
     };
     public const Format DepthFormat = Format.D32_Float;
 
+    // R5: the typeless storage format for each shaded color (resource is typeless; RTV/SRV use the shaded format,
+    // the resolve UAV uses the non-SRGB UNORM aliasing format).
+    static Format TypelessOf(Format shaded) => shaded switch {
+        Format.R8G8B8A8_UNorm_SRgb => Format.R8G8B8A8_Typeless,
+        Format.R8G8B8A8_UNorm      => Format.R8G8B8A8_Typeless,
+        Format.R16G16B16A16_Float  => Format.R16G16B16A16_Typeless,
+        Format.R16G16_Float        => Format.R16G16_Typeless,
+        _ => shaded,
+    };
+    // The format the resolve UAV writes through (SRGB → plain UNORM; floats unchanged).
+    public static Format UavFormatOf(Format shaded) => shaded switch {
+        Format.R8G8B8A8_UNorm_SRgb => Format.R8G8B8A8_UNorm,
+        _ => shaded,
+    };
+
     public int Width { get; }
     public int Height { get; }
 
@@ -58,21 +73,29 @@ public sealed class Dx12GBuffer : IDisposable {
         rtvInc = dev.Device.GetDescriptorHandleIncrementSize(DescriptorHeapType.RenderTargetView);
         CpuDescriptorHandle rtvStart = rtvHeap.GetCPUDescriptorHandleForHeapStart();
 
+        // R5: each color is created TYPELESS so the SAME resource serves a shaded-format RTV/SRV (the raster path +
+        // lighting, unchanged) AND a non-SRGB UNORM UAV (the visibility-buffer resolve compute writes through it —
+        // a UAV can't be SRGB). The typeless resource is byte-for-byte the shaded format; only the views differ.
+        // When R5 is off this is invisible (the RTV/SRV use the shaded format exactly as before).
         for (int i = 0; i < RtCount; i++) {
-            Format f = ColorFormats[i];
-            var rtDesc = ResourceDescription.Texture2D(f, (uint)width, (uint)height, mipLevels: 1, arraySize: 1);
-            rtDesc.Flags = ResourceFlags.AllowRenderTarget;
-            var clearVal = new ClearValue(f, new Vortice.Mathematics.Color4(0, 0, 0, 0));
+            Format shaded = ColorFormats[i];
+            Format typeless = TypelessOf(shaded);
+            var rtDesc = ResourceDescription.Texture2D(typeless, (uint)width, (uint)height, mipLevels: 1, arraySize: 1);
+            rtDesc.Flags = ResourceFlags.AllowRenderTarget | ResourceFlags.AllowUnorderedAccess;
+            var clearVal = new ClearValue(shaded, new Vortice.Mathematics.Color4(0, 0, 0, 0));
             colors[i] = dev.Device.CreateCommittedResource(
                 HeapProperties.DefaultHeapProperties, HeapFlags.None, rtDesc,
                 ResourceStates.RenderTarget, clearVal);
             colors[i].Name = $"GBuffer{i}";
             colorState[i] = ResourceStates.RenderTarget;
-            dev.Device.CreateRenderTargetView(colors[i], null, RtvHandle(i));
+            // RTV + SRV in the SHADED format (SRGB for RT0) — the raster path + lighting are unchanged.
+            dev.Device.CreateRenderTargetView(colors[i], new RenderTargetViewDescription {
+                Format = shaded, ViewDimension = RenderTargetViewDimension.Texture2D,
+            }, RtvHandle(i));
 
             colorSrv[i] = Dx12Backend.SrvStore.Allocate();
             dev.Device.CreateShaderResourceView(colors[i], new ShaderResourceViewDescription {
-                Format = f,
+                Format = shaded,
                 ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
                 Shader4ComponentMapping = ShaderComponentMapping.Default,
                 Texture2D = new Texture2DShaderResourceView { MipLevels = 1, MostDetailedMip = 0 },
