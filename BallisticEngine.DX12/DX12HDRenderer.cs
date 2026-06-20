@@ -1372,6 +1372,43 @@ public sealed class DX12HDRenderer : HDRenderer
         if (gpuDrivenOn || CpuBindless)
             gpuDriven.EnsureMaterialTable(wholeMeshRenderers);
 
+        // R2: PRE-REGISTER every CPU-path opaque material into the bindless table HERE — right after
+        // EnsureMaterialTable, BEFORE BuildHiZ or any pass binds the BindlessHeap to a command list. GBV proved two
+        // bugs in the earlier mid-loop form: (1) heap not set before the directly-indexed root sig (→ GPU hang),
+        // fixed in CpuBindlessBegin; (2) CopyDescriptorsSimple into BindlessHeap while it was STATIC-bound on an
+        // in-flight command list (mid-draw register). Doing ALL registration in this one window — same window
+        // EnsureMaterialTable uses, before the heap is bound for drawing — means every MaterialId the draw loop
+        // uses is present + the heap is touched only here. If the table fills, the WHOLE frame falls back to the
+        // legacy descriptor-table path (clean all-or-nothing, never a mid-list heap swap).
+        bool cpuBindless = CpuBindless;
+        if (cpuBindless)
+        {
+            bool allRegistered = true;
+            foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
+            {
+                if (r is null || !r.IsActive || !r.IsRenderable) continue;
+                if (gpuDrivenOn && r.SubMeshIndex < 0) continue;   // whole-mesh = GPU-driven, registered already
+                if (r.IsSkinned) continue;                         // skinned = its own path (not bindless in R2)
+                Mesh m = r.SharedMesh; if (m is null) continue;
+                int only = r.SubMeshIndex;
+                int f = only >= 0 ? only : 0;
+                int l = only >= 0 ? only : m.SubMeshes.Length - 1;
+                for (int s = f; s <= l; s++)
+                {
+                    if ((uint)s >= (uint)m.SubMeshes.Length) break;
+                    Material mm = r.MaterialFor(s);
+                    if (mm is null || mm.Transparent) continue;
+                    if (gpuDriven.ResolveOrRegisterMaterialId(mm) < 0) { allRegistered = false; break; }
+                }
+                if (!allRegistered) break;
+            }
+            if (!allRegistered)
+            {
+                cpuBindless = false;   // table full → whole-frame fallback to the legacy path
+                Debugging.Log("[R2] bindless material table full — CPU opaque path fell back to descriptor tables this frame.");
+            }
+        }
+
         // Hi-Z: build the occlusion pyramid from the PREVIOUS frame's depth (before the geometry pass clears
         // it). Camera-delta gate: disable for one frame after a big jump (stale depth) + the first frame.
         bool hizEnabled = false;
@@ -1394,29 +1431,26 @@ public sealed class DX12HDRenderer : HDRenderer
         // that can't fit (perDraws over MaxCpuDraws) or whose material can't register (table full) skips bindless
         // for that submesh and uses the legacy descriptor-table path (the two PSOs are interchangeable per draw —
         // each submesh rebinds its own state below).
-        bool cpuBindless = CpuBindless;   // material table is ensured above whenever this is on (GPU-driven or not)
         int cpuDrawIndex = 0;   // running PerDraw slot for the bindless CPU draws this frame
 
         // === GEOMETRY PASS: fill the fat G-buffer (no lighting — GBuffer.hlsl writes albedo/normal/ORM/
         // emissive + depth). Same vertex transform + material sampling as the old forward opaque. ===
         gbuffer.RenderGeometry(cl =>
         {
-            // `boundBindless` tracks which PSO/root-sig is currently set so we switch only when a draw needs the
-            // other path (almost all CPU opaque draws take bindless; a register-fail falls back to gbufferPso).
-            bool boundBindless = false;
-            void BindLegacyState() {
+            // R2: the heap + PSO are bound ONCE for the whole frame and NEVER swapped — cpuBindless is now a fixed
+            // per-frame decision (all materials pre-registered, or whole-frame fallback). Bindless → the GPU-driven
+            // draw state; legacy → the descriptor-table state. No mid-list SetDescriptorHeaps swap (the TDR cause).
+            if (cpuBindless)
+            {
+                gpuDriven.CpuBindlessBegin(cl, motionCb.Gpu);   // drawRootSig + drawPso + PerDraws/GpuMaterials/Motion + bindless heap
+            }
+            else
+            {
                 cl.SetGraphicsRootSignature(gbufferRootSig);
                 cl.SetPipelineState(gbufferPso);
                 cl.SetDescriptorHeaps(srvVisible.Heap);
                 cl.SetGraphicsRootConstantBufferView(2, motionCb.Gpu); // b1 motion (per pass)
-                boundBindless = false;
             }
-            void BindBindlessState() {
-                gpuDriven.CpuBindlessBegin(cl, motionCb.Gpu);   // drawRootSig + drawPso + PerDraws/GpuMaterials/Motion + bindless heap
-                boundBindless = true;
-            }
-            // Default initial state: bindless when armed (most opaque draws use it), else legacy.
-            if (cpuBindless) BindBindlessState(); else BindLegacyState();
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
 
             foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
@@ -1472,28 +1506,33 @@ public sealed class DX12HDRenderer : HDRenderer
                     if (mat.Transparent) continue;
                     if (slot >= cbSlotCount) break;
 
-                    // R2 — BINDLESS FAST PATH: resolve the material into the shared GpuMaterials table + write this
-                    // draw's PerDraw{Mvp,Model,MaterialId}; the DrawIndex root const selects it. No 6× descriptor
-                    // copies, no per-draw CBV. Falls through to the legacy path if the material can't register
-                    // (table full) or the PerDraw buffer is full (over MaxCpuDraws).
+                    // R2 — BINDLESS FAST PATH: the material was PRE-REGISTERED above (so its id is valid + the heap
+                    // is already bound, never swapped mid-list). Write this draw's PerDraw{Mvp,Model,MaterialId};
+                    // the DrawIndex root const selects it. No 6× descriptor copies, no per-draw CBV, no heap swap.
+                    // The ONLY skip is the PerDraw buffer being full (over MaxCpuDraws) — that submesh is dropped
+                    // (logged once via the running count), NOT drawn through a heap-swapping fallback.
                     bool drewBindless = false;
                     if (cpuBindless)
                     {
-                        int mid = gpuDriven.ResolveOrRegisterMaterialId(mat);
+                        // PURE LOOKUP (TryMaterialId, NOT ResolveOrRegister) — the material was already registered in
+                        // the pre-register window; touching the BindlessHeap here (mid-draw, heap STATIC-bound) is the
+                        // GBV "StaticDescriptorInvalidDescriptorChange" the pre-register pass exists to avoid.
+                        int mid = gpuDriven.TryMaterialId(mat, out int rid) ? rid : -1;
                         if (mid >= 0 && gpuDriven.CpuBindlessWrite(cpuDrawIndex, mvp, model, mid))
                         {
-                            if (!boundBindless) BindBindlessState();
                             cl.SetGraphicsRoot32BitConstant(0, (uint)cpuDrawIndex, 0);   // DrawIndex (b0)
                             cl.DrawIndexedInstanced((uint)sub.IndexCount, 1, (uint)sub.IndexStart, 0, 0);
                             cpuDrawIndex++;
                             draws++; tris += sub.IndexCount / 3;
                             drewBindless = true;
                         }
+                        else
+                        {
+                            drewBindless = true;   // over MaxCpuDraws: drop this submesh (do NOT swap heaps mid-list)
+                        }
                     }
                     if (!drewBindless)
                     {
-                        if (boundBindless) BindLegacyState();   // switch back to the descriptor-table PSO
-
                         bool hasMetal = mat.Metallic is not null;
                         bool hasRough = mat.Roughness is not null;
                         bool emissive = mat.IsEmissive;

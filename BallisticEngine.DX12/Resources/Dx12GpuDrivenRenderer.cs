@@ -39,8 +39,15 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     ID3D12Resource metaUpload;      unsafe byte* metaMapped;        // SubmeshMeta[] (rebuilt per frame)
     ID3D12Resource cullParamUpload; unsafe byte* cullParamMapped;   // CullParams[MaxGroups] (256B slots)
     ID3D12Resource commands;        // DEFAULT UAV — indirect draw commands (one slot per submesh, in order)
-    ID3D12Resource perDraws;        // DEFAULT UAV — per-draw Mvp/Model/MaterialId
+    ID3D12Resource perDraws;        // DEFAULT UAV — per-draw Mvp/Model/MaterialId (GPU cull writes these)
     ID3D12Resource materials;       unsafe byte* materialsMapped;   // GpuMaterial[] (built on material change)
+    // R2 — CPU per-submesh bindless: the CPU draw loop reuses drawPso/drawRootSig/GBufferBindless.hlsl + this
+    // exact GpuMaterials table, but writes its OWN PerDraw entries (Mvp/Model/MaterialId) into a CPU-mapped,
+    // N-buffered UPLOAD buffer (the GPU-driven `perDraws` is a DEFAULT UAV the cull writes — the CPU can't map it).
+    // One draw = one entry; DrawIndex root const selects it, same as the indirect path. Capacity = MaxCpuDraws.
+    ID3D12Resource cpuPerDraws;     unsafe byte* cpuPerDrawsMapped;
+    long cpuPerDrawsFrameStride;    // perDrawStride*MaxCpuDraws bytes per frame slot
+    const int MaxCpuDraws = 8192;   // CPU-path opaque submeshes per frame (split-import scenes); over → old path
     int cullParamSlotSize;       // shadow CullParams slot
     int geoCullParamSlotSize;    // geometry GeoCullParams slot (bigger — has the Hi-Z fields)
     int metaStride, perDrawStride, materialStride;
@@ -222,6 +229,12 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         materials = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)(materialsFrameStride * dev.FramesInFlight)), ResourceStates.GenericRead);
         materialsMapped = materials.Map<byte>(0);
+
+        // R2: CPU per-submesh bindless PerDraws — UPLOAD heap (CPU-mapped), N-buffered by FrameSlot like materials.
+        cpuPerDrawsFrameStride = (long)perDrawStride * MaxCpuDraws;
+        cpuPerDraws = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)(cpuPerDrawsFrameStride * dev.FramesInFlight)), ResourceStates.GenericRead);
+        cpuPerDrawsMapped = cpuPerDraws.Map<byte>(0);
     }
 
     // Drop the cached material table so the NEXT EnsureMaterialTable rebuilds from scratch. Called on a scene
@@ -327,6 +340,41 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     // draw does). FramesInFlight==1 → FrameSlot 0 → offset 0 → byte-identical to pre-P0b.
     public ulong MaterialsGpuAddress => materials is null ? 0 : materials.GPUVirtualAddress + (ulong)(dev.FrameSlot * materialsFrameStride);
     public int MaterialCount => materialCount;
+
+    // ===================== R2 — CPU per-submesh bindless draw =====================
+    // The CPU per-submesh opaque loop reuses the GPU-driven bindless draw PSO/root sig (GBufferBindless.hlsl —
+    // shading byte-identical to GBuffer.hlsl) instead of binding 6 material descriptors per draw. The CPU writes
+    // each draw's PerDraw{Mvp,Model,MaterialId} into cpuPerDraws (its own N-buffered upload buffer) and selects it
+    // with the DrawIndex root constant — exactly like the indirect path, just CPU-submitted one draw at a time.
+    //
+    // Bind ONCE before the CPU draws: root sig + PSO, PerDraws(t0)=cpuPerDraws (this frame's slot), GpuMaterials
+    // (t1) = the shared table, Motion CBV (b1), and the bindless heap. The geometry pass already bound the bindless
+    // heap via SetDescriptorHeaps(srvVisible.Heap)? — NO: bindless needs Dx12Backend.BindlessHeap. The caller binds
+    // it here. The vertex/index buffers are still bound per-renderer by the caller (mesh streams differ per mesh).
+    public void CpuBindlessBegin(ID3D12GraphicsCommandList4 cl, ulong motionCbAddress) {
+        // ORDER IS LOAD-BEARING: SetDescriptorHeaps MUST precede SetGraphicsRootSignature for a root sig with the
+        // CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED flag (else GBV: DescriptorHeapNotSetBeforeRootSignature... → GPU hang).
+        // The GPU-driven RenderInto does the same ("GOTCHA: before the root sig"). Getting this backwards was the
+        // DRED PageFaultVA=0 "bad bind" hang on the forced-CPU Bistro stress.
+        cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);   // ResourceDescriptorHeap[] source for the bindless reads
+        cl.SetGraphicsRootSignature(drawRootSig);
+        cl.SetPipelineState(drawPso);
+        cl.SetGraphicsRootShaderResourceView(1,                  // t0 PerDraws (this frame's slot)
+            cpuPerDraws.GPUVirtualAddress + (ulong)(dev.FrameSlot * cpuPerDrawsFrameStride));
+        cl.SetGraphicsRootShaderResourceView(2, MaterialsGpuAddress);   // t1 GpuMaterials (this frame's slot)
+        cl.SetGraphicsRootConstantBufferView(3, motionCbAddress);       // b1 MotionConstants (per pass)
+    }
+
+    // Write one CPU draw's PerDraw entry into this frame's slot at `drawIndex` and return whether it fit
+    // (drawIndex < MaxCpuDraws). The caller then SetGraphicsRoot32BitConstant(0, drawIndex) + DrawIndexedInstanced.
+    public unsafe bool CpuBindlessWrite(int drawIndex, Matrix4x4 mvp, Matrix4x4 model, int materialId) {
+        if ((uint)drawIndex >= MaxCpuDraws) return false;
+        long off = (long)dev.FrameSlot * cpuPerDrawsFrameStride + (long)drawIndex * perDrawStride;
+        *(PerDraw*)(cpuPerDrawsMapped + off) = new PerDraw {
+            Mvp = Matrix4x4.Transpose(mvp), Model = Matrix4x4.Transpose(model), MaterialId = (uint)materialId,
+        };
+        return true;
+    }
     public bool TryMaterialId(Material mat, out int id) {
         if (mat is not null) return materialIds.TryGetValue(mat, out id);
         id = 0; return false;
@@ -692,7 +740,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
 
     public void Dispose() {
         cullRootSig?.Dispose(); geoCullRootSig?.Dispose(); cullPso?.Dispose(); drawRootSig?.Dispose(); drawPso?.Dispose();
-        cmdSig?.Dispose(); commands?.Dispose(); perDraws?.Dispose();
+        cmdSig?.Dispose(); commands?.Dispose(); perDraws?.Dispose(); cpuPerDraws?.Dispose();
         metaUpload?.Dispose(); cullParamUpload?.Dispose(); materials?.Dispose();
         hiz?.Dispose();
         shadowCullPso?.Dispose(); shadowDrawRootSig?.Dispose(); shadowDrawPso?.Dispose(); shadowCmdSig?.Dispose();
