@@ -37,6 +37,10 @@ internal sealed class EditorApplication {
     // A1b: the single descriptor table for the CORE dockable panels (one declaration per panel that the
     // normal draw, the maximize content path, and the maximize-availability check all read).
     readonly EditorPanelRegistry panels = new();
+
+    // The one IEditorGui seam instance, reused for every EditorWindow each frame (Phase 3). Stateless —
+    // holds no per-window data. WindowShell hands it to each window's OnGui.
+    readonly IEditorGui gui = new ImGuiEditorGui();
     // A1b: the maximize state machine (which panel fills the window) — replaces the bare `maximizedPanel`
     // string + its three hand-synced clear sites with one can't-get-stuck controller.
     readonly MaximizeController maximize = new();
@@ -54,7 +58,7 @@ internal sealed class EditorApplication {
     readonly SettingsPanel settings;
     readonly TagsLayersPanel tagsLayers = new();
     readonly LayerCollisionMatrixPanel layerCollision = new();   // EF8: matrix split into its own window
-    readonly ProfilerPanel profilerPanel = new();
+    readonly ProfilerPanel profilerPanel;   // constructed after `profiler` (the backend it reads)
     readonly BuildPanel buildPanel;
     readonly EditorProfilerBackend profiler;
     readonly TransformGizmo gizmo = new();
@@ -115,6 +119,22 @@ internal sealed class EditorApplication {
         // Program.cs installed it (BALLISTIC_TRACY=1).
         profiler = new EditorProfilerBackend(Profiler.Backend);
         Profiler.Backend = profiler;
+        profilerPanel = new ProfilerPanel(profiler);   // the panel reads this backend each frame
+
+        // User editor scripts (Assets\Editor\): compile the editor-only EditorScripts.dll and inject it into
+        // the reflection scan set BEFORE bootstrap builds the component registry / TypeCache (which happens
+        // inside the EngineBootstrap ctor below). The provider is lazy — it fires during that ctor, after the
+        // project is opened — so a game dev's custom [EditorWindowMeta] windows are discovered at startup.
+        // (A shipped player never sets this, so EditorScripts.dll never enters the player build.)
+        // Publish the single shared seam handle so the inspector's IInspectorGui adapters can route through
+        // IEditorGui without threading it through the whole inspector pipeline (see EditorGui).
+        EditorGui.Shared = gui;
+
+        EngineBootstrap.ExtraScanAssemblies = () => {
+            System.Reflection.Assembly asm = GameEditorScripts.CompileAndLoad(
+                BallisticEngine.AssetPipeline.BallisticProject.Open(projectPath));
+            return asm is null ? System.Array.Empty<System.Reflection.Assembly>() : [asm];
+        };
 
         // Defer the (slow) asset import: bring the window up first, then refresh asynchronously behind
         // the busy overlay. The startup scene loads once that first import completes (see OnRender).
@@ -165,7 +185,7 @@ internal sealed class EditorApplication {
         extraPanels.Register(EditorLayout.Assets, "Assets", EditorIcons.Folder,
             () => new AssetBrowserPanel(editorState, () => imgui.Scale), p => ((AssetBrowserPanel)p).DrawContents());
         extraPanels.Register(EditorLayout.Console, "Console", EditorIcons.Document,
-            () => new ConsolePanel(), p => ((ConsolePanel)p).DrawContents());
+            () => new ConsolePanel(), p => ((ConsolePanel)p).DrawContents(gui));
         extraPanels.OnTitleStrip = MaximizePanelOnTitleDoubleClick;
 
         // A1b-deeper: declare the CORE dockable panels ONCE in the registry, which now OWNS their show
@@ -181,7 +201,7 @@ internal sealed class EditorApplication {
         panels.Register(EditorLayout.SceneComponents, "Scene Components", EditorIcons.World, hierarchy.DrawSceneContents);
         panels.Register(EditorLayout.Inspector, "Details", EditorIcons.Wrench, inspector.DrawContents);  // EF12: KEY stays "Inspector", display = "Details"
         panels.Register(EditorLayout.Assets, "Assets", EditorIcons.Folder, assets.DrawContents);
-        panels.Register(EditorLayout.Console, "Console", EditorIcons.Document, console.DrawContents);
+        panels.Register(console, EditorLayout.Console, "Console", EditorIcons.Document);  // real EditorWindow (Phase 1 pilot)
         panels.Register(EditorLayout.SceneView, "Scene View", EditorIcons.Camera, null, isViewport: true);
         panels.Register(EditorLayout.GameView, "Game View", EditorIcons.Play, null, isViewport: true);
 
@@ -197,6 +217,7 @@ internal sealed class EditorApplication {
         // already built by EngineBootstrap above).
         EditorWindows.Bind(ToggleWindow, OpenWindow, IsWindowOpen, IsWindowEnabled);
         EditorWindowRegistry.Rebuild();
+        UserEditorWindowRegistry.Rebuild();   // discover user [EditorWindowMeta] windows from game-editor scripts
 
         // B1 (Rule 1): warm the component-preview registry the same way, so the first inspector draw doesn't
         // pay the [ComponentPreview] reflection scan. The inspector resolves custom sections from this registry
@@ -215,6 +236,11 @@ internal sealed class EditorApplication {
         // EF9c: the .ini restores each panel's geometry/dock node but not whether it's open. Re-apply the
         // persisted closed-panel set so a panel the user closed last session stays closed across restart.
         panels.ApplyHidden(EditorLayout.LoadPanelState());
+
+        // Headless verification door: open the Curve editor on a test curve so a 20s run exercises its
+        // full seam draw path (canvas/grid/handles via gui.WindowDrawList + gui.Input). Harmless when unset.
+        if (Environment.GetEnvironmentVariable("BALLISTIC_CURVE_WINDOW") == "1")
+            CurveEditorWindow.Edit(AnimationCurve.EaseInOut(), "Verify", () => { });
 
         // Restore the Scene-view camera to wherever it was last left in this project.
         editorCamera.RestorePose(EditorPrefs.GetLastCamera(bootstrap.Project.RootPath));
@@ -756,15 +782,15 @@ internal sealed class EditorApplication {
             // Floating tool windows stay available while a panel is fullscreen — keep this list in sync
             // with the normal-path block below (both must draw EVERY floating window or it vanishes in
             // one mode). tagsLayers was previously missing here, so Tags & Layers disappeared in fullscreen.
-            settings.Draw(S);
-            tagsLayers.Draw(S);
-            layerCollision.Draw(S);
-            profilerPanel.Draw(profiler, S);
-            buildPanel.Draw(S);
-            CurveEditorWindow.Draw(S);
-            ComponentEditorWindow.Draw(S);
-            UnityImportWindow.Draw(S);
-            RenderPassTogglesWindow.Draw(S);
+            settings.DrawStandalone(gui);
+            tagsLayers.DrawStandalone(gui);
+            layerCollision.DrawStandalone(gui);
+            profilerPanel.DrawStandalone(gui);
+            buildPanel.DrawStandalone(gui);
+            CurveEditorWindow.Instance.DrawStandalone(gui);
+            ComponentEditorWindow.Instance.DrawStandalone(gui);
+            UnityImportWindow.Instance.DrawStandalone(gui);
+            UserEditorWindowRegistry.DrawAll(gui);   // includes RenderPassToggles ([EditorWindowMeta], auto-discovered)
             DrawUnsavedPrompt();
             return;
         }
@@ -823,16 +849,14 @@ internal sealed class EditorApplication {
         ImGui.DockSpace(dockId, SysVec2.Zero, ImGuiDockNodeFlags.None);
         ImGui.End();
 
-        // Dockable core panels — normal windows ImGui places into the dock tree. A1b-deeper: walk the
-        // registry instead of five named DrawDockPanel calls; the registry owns each panel's Shown state
-        // and writes the close-button result back through DrawDockPanel's `ref show`. EditorApplication
-        // names no core panel here. The declaration order (Entities, Scene-components, Inspector, Assets,
-        // Console) reproduces the old draw order.
-        // IMPORTANT: once Begin() is called it MUST be paired with End(), even if Begin returns false
-        // (collapsed) OR the close button set show=false this frame. The old "if (show) End()" dropped
-        // the End() when the X was clicked (Begin already drew the content + opened a BeginChild that
-        // frame), leaving "Missing EndChild()" and corrupting all ImGui state. DrawDockPanel handles it.
-        panels.DrawCore(DrawDockPanel);
+        // Dockable core panels — normal windows ImGui places into the dock tree. Phase 3: every core panel
+        // is an EditorWindow (a real subclass or a LegacyWindow bridge), drawn through WindowShell, which
+        // owns the single Begin/End-pairing invariant (End is ALWAYS called once Begin ran, even on a
+        // close-X this frame — the old "if (show) End()" bug). The registry owns each panel's Shown state
+        // and writes the close-button result back. EditorApplication names no core panel here. `requestFocus`
+        // surfaces a Window-menu-reopened panel (EF9d); `titleStrip` runs the maximize/Add-Tab tab handler.
+        // The declaration order (Entities, Scene-components, Inspector, Assets, Console) is the draw order.
+        panels.DrawCore(gui, key => pendingFocusWindow == key, MaximizePanelOnTitleDoubleClick);
 
         // Extra (duplicated) panel instances opened from the Add Tab menu. (Drawn after the core panels
         // now that the latter are one registry loop; these are floating-centered windows ImGui places by
@@ -842,14 +866,16 @@ internal sealed class EditorApplication {
         // Scene + Game are separate dockable windows (were inner viewport tabs).
         DrawViewportWindows();
 
-        settings.Draw(S);
-        tagsLayers.Draw(S);
-        profilerPanel.Draw(profiler, S);
-        buildPanel.Draw(S);
-        CurveEditorWindow.Draw(S);
-        ComponentEditorWindow.Draw(S);   // standalone component window — was only drawn while fullscreen
-        UnityImportWindow.Draw(S);
-        RenderPassTogglesWindow.Draw(S);
+        settings.DrawStandalone(gui);
+        tagsLayers.DrawStandalone(gui);
+        layerCollision.DrawStandalone(gui);   // (was missing from this block — only drew while fullscreen)
+        profilerPanel.DrawStandalone(gui);
+        buildPanel.DrawStandalone(gui);
+        CurveEditorWindow.Instance.DrawStandalone(gui);
+        ComponentEditorWindow.Instance.DrawStandalone(gui);   // standalone component window
+        UnityImportWindow.Instance.DrawStandalone(gui);
+        // [EditorWindowMeta] windows — built-in (RenderPassToggles) AND user-authored game-editor scripts.
+        UserEditorWindowRegistry.DrawAll(gui);
         DrawUnsavedPrompt();
 
         // Persist the layout whenever ImGui says it changed (drag/dock/resize/tab).
@@ -990,6 +1016,35 @@ internal sealed class EditorApplication {
                 bool enabled = !isToggle || EditorWindows.IsEnabled(key);
                 if (ImGui.MenuItem(entry.Leaf, (string)null, selected, enabled))
                     entry.Invoke();
+            }
+            for (int i = 0; i < opened; i++)
+                ImGui.EndMenu();
+        }
+
+        // User-authored [EditorWindowMeta] windows under this top menu (discovered from game-editor scripts).
+        // They follow the SAME leaf/sub-menu/checkmark idiom; the toggle goes through EditorWindows keyed by
+        // the window's type FullName. A divider separates them from the built-in [MenuItem] entries above.
+        bool firstUser = true;
+        foreach (UserEditorWindowRegistry.Entry uw in UserEditorWindowRegistry.Items) {
+            int slash = uw.MenuPath.IndexOf('/');
+            string uwTop = slash < 0 ? uw.MenuPath : uw.MenuPath[..slash];
+            if (uwTop != topMenu) continue;
+
+            if (firstUser) { ImGui.Separator(); firstUser = false; }
+
+            string[] parts = uw.MenuPath.Split('/');
+            string leaf = parts[^1];
+            var subs = parts.Length > 2 ? parts[1..^1] : System.Array.Empty<string>();
+            var opened = 0;
+            var skip = false;
+            foreach (string sub in subs) {
+                if (!ImGui.BeginMenu(sub)) { skip = true; break; }
+                opened++;
+            }
+            if (!skip) {
+                bool selected = EditorWindows.IsOpen(uw.Key);
+                if (ImGui.MenuItem(leaf, (string)null, selected, true))
+                    EditorWindows.Toggle(uw.Key);
             }
             for (int i = 0; i < opened; i++)
                 ImGui.EndMenu();
@@ -1424,6 +1479,13 @@ internal sealed class EditorApplication {
             case EditorMenus.WindowKeys.TagsLayers: tagsLayers.Open = !tagsLayers.Open; break;
             case EditorMenus.WindowKeys.LayerCollision: layerCollision.Open = !layerCollision.Open; break;
             case EditorMenus.WindowKeys.Settings: settings.Open = !settings.Open; break;
+            // User-authored [EditorWindowMeta] window (keyed by type FullName): flip its Open flag + focus.
+            default:
+                if (UserEditorWindowRegistry.Get(key) is { } u) {
+                    u.Window.Open = !u.Window.Open;
+                    if (u.Window.Open) pendingFocusWindow = u.Window.DockKey;
+                }
+                break;
         }
     }
 
@@ -1443,7 +1505,13 @@ internal sealed class EditorApplication {
             case EditorMenus.WindowKeys.TagsLayers: tagsLayers.Open = true; break;
             case EditorMenus.WindowKeys.LayerCollision: layerCollision.Open = true; break;
             case EditorMenus.WindowKeys.Settings: settings.Open = true; break;
-            case EditorMenus.WindowKeys.UnityImport: UnityImportWindow.Open(); break;
+            case EditorMenus.WindowKeys.UnityImport: UnityImportWindow.Show(); break;
+            default:
+                if (UserEditorWindowRegistry.Get(key) is { } u) {
+                    u.Window.Open = true;
+                    pendingFocusWindow = u.Window.DockKey;
+                }
+                break;
         }
     }
 
@@ -1458,7 +1526,7 @@ internal sealed class EditorApplication {
             EditorMenus.WindowKeys.LayerCollision => layerCollision.Open,
             EditorMenus.WindowKeys.Settings => settings.Open,
             EditorMenus.WindowKeys.UnityImport => UnityImportWindow.IsOpen,
-            _ => false,
+            _ => UserEditorWindowRegistry.Get(key)?.Window.Open ?? false,
         };
     }
 
@@ -1468,30 +1536,6 @@ internal sealed class EditorApplication {
     // Draws one dockable panel with a CORRECT Begin/End pairing: End() is always called once Begin()
     // ran, even when Begin returns false or the close button just set `show` to false this frame. The
     // content (+ the maximize/add-tab strip handler) only runs when Begin returned true.
-    void DrawDockPanel(string name, ref bool show, Action drawContents) {
-        // EF9d: a core panel re-opened from the Window menu (ToggleWindow flipped Shown false->true and
-        // set pendingFocusWindow = key) must SURFACE — otherwise it re-appears behind whatever tab shares
-        // its dock node and the toggle reads as a no-op. DrawCore runs before DrawViewportWindows (which
-        // clears pendingFocusWindow), so the flag is still live here; the viewports consume their own keys
-        // (SceneView/GameView) and never match a core-panel key, so there is no conflict. Same Unity-style
-        // focus-on-open the viewports already get, now extended to the core dockable panels.
-        if (pendingFocusWindow == name) ImGui.SetNextWindowFocus();
-        // EF12: the docked tab/title is the descriptor's DISPLAY Title, with the panel KEY as the ImGui
-        // `###id`. ImHashStr resets at the last `###`, so the window id is still hash(name) — the dock-.ini
-        // `[Window][<key>]` entry, the dock-builder's DockBuilderDockWindow(key) target, and the `.panels`
-        // sidecar all match unchanged. This makes the docked title source agree with the maximized
-        // (DrawMaximizedPanel) and multi-instance (DockPanelHost) paths, which already show d.Title — and
-        // is what surfaces "Inspector"→"Details" (and "Scene"→"Scene Components") on the docked tab.
-        EditorPanelRegistry.Descriptor dd = panels.Get(name);
-        string label = dd is not null ? $"{dd.Title}###{name}" : name;
-        bool visible = ImGui.Begin(label, ref show);
-        if (visible) {
-            MaximizePanelOnTitleDoubleClick(name);
-            drawContents();
-        }
-        ImGui.End();
-    }
-
     // Double-clicking a window's tab/title strip toggles fullscreen for THAT panel (works for every
     // dockable panel now, not just the viewports). Call right after the panel's Begin. For a DOCKED
     // window the tab bar sits ABOVE the content origin, so the hit band extends upward by ~1.4 frame
@@ -1599,25 +1643,25 @@ internal sealed class EditorApplication {
         // the registry Shown flag (so it STICKS next frame, no redraw loop) AND clear the maximize state
         // this same frame so the docked layout returns immediately. Restore-by-title-double-click keys off
         // `name` (the maximize KEY), not the window label, so it stays a no-op-toggle that restores.
-        ImGui.SetNextWindowPos(pos);
-        ImGui.SetNextWindowSize(size);
-        const ImGuiWindowFlags flags = ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove |
-            ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking | ImGuiWindowFlags.NoSavedSettings;
         EditorPanelRegistry.Descriptor d = panels.Get(name);
-        string title = d is not null ? $"{d.Icon}  {d.Title}" : name;
-        bool open = panels.IsShown(name);
-        if (ImGui.Begin($"{title}###maxpanel", ref open, flags)) {
-            MaximizePanelOnTitleDoubleClick(name); // double-click its title again to restore (keys off the maximize key)
-            if (d?.DrawContents is not null)
-                d.DrawContents();
-            else {
-                // Not a registered, body-drawable panel (shouldn't reach here — the stale-drop clears an
-                // unknown target). Give a way out so it can never get stuck maximized.
+        if (d?.Window is null) {
+            // Not a registered, body-drawable panel (shouldn't reach here — the stale-drop clears an
+            // unknown target). Give a way out so it can never get stuck maximized.
+            ImGui.SetNextWindowPos(pos);
+            ImGui.SetNextWindowSize(size);
+            const ImGuiWindowFlags emptyFlags = ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove |
+                ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoDocking | ImGuiWindowFlags.NoSavedSettings;
+            if (ImGui.Begin($"{name}###maxpanel", emptyFlags)) {
                 ImGui.TextDisabled("This panel can't be shown fullscreen.");
                 if (ImGui.Button("Exit Fullscreen")) maximize.Clear();
             }
+            ImGui.End();
+            return;
         }
-        ImGui.End();
+        // Phase 3: the maximized window draws through the SAME WindowShell as the docked path, with its
+        // dedicated `###maxpanel` identity (NoSavedSettings) so it doesn't fight docking (EF9b). The X is
+        // drawn + honored (EF9a): on close, flip the registry Shown flag and clear maximize this frame.
+        bool open = WindowShell.DrawMaximized(d.Window, gui, pos, size, MaximizePanelOnTitleDoubleClick);
         if (!open) {                  // X clicked while maximized: honor the close everywhere
             panels.SetShown(name, false);
             maximize.Clear();

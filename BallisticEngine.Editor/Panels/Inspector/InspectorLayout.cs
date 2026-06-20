@@ -1,6 +1,3 @@
-using Hexa.NET.ImGui;
-using SysVec2 = System.Numerics.Vector2;
-
 namespace BallisticEngine.Editor.Inspector;
 
 // EF-LAYOUT — the ONE inspector layout model the inspector member grid is built on. This is the shared
@@ -36,6 +33,11 @@ namespace BallisticEngine.Editor.Inspector;
 // PERFORMANCE (plan §4): pure arithmetic + the existing ImGui calls. No per-frame reflection / allocation;
 // the ellipsis path only runs when a label actually overflows its column.
 internal static class InspectorLayout {
+    // Phase-7: the two drawing helpers below route through the seam (EditorGui.Shared) — zero raw ImGui.
+    // Everything else here is pure arithmetic / constants. (Reached statically because these are static
+    // utilities called mid-inspector-frame, like the adapters.)
+    static IEditorGui gui => EditorGui.Shared;
+
     // --- Metrics (pre-DPI-scale; multiply by the caller's UI scale `S`) -------------------------------
     // The smallest the adaptive label column may shrink to before it starts ellipsing. Roomy enough for a
     // short word ("Size", "Mass") at the body font; long labels ellipse rather than push past it.
@@ -96,7 +98,7 @@ internal static class InspectorLayout {
     public static void DrawLabelCell(string label, int depth, float columnWidth, float s, string tooltip) {
         float indent = DepthIndentTotal(depth, s);
         if (indent > 0f)
-            ImGui.Indent(indent);
+            gui.Indent(indent);
 
         // The text occupies [indent .. columnWidth − gap]; subtract BOTH so a deeply-indented label still
         // ellipsizes before it touches the value field (EF11 — `columnWidth` is the cell's full width measured
@@ -105,19 +107,19 @@ internal static class InspectorLayout {
         string shown = Ellipsize(label, avail);
         bool clipped = !ReferenceEquals(shown, label);
 
-        ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.RowLabel);
-        ImGui.TextUnformatted(shown);
-        ImGui.PopStyleColor();
+        gui.PushColor(EditorStyleColor.Text, EditorTheme.RowLabel);
+        gui.TextUnformatted(shown);
+        gui.PopColor();
 
         // EF11: a clipped label is never silently lost — hovering it shows the full text. A real [Tooltip]
         // wins (shows the explanation); a clip with no tooltip shows the full label.
-        if (ImGui.IsItemHovered()) {
-            if (tooltip is not null) ImGui.SetTooltip(tooltip);
-            else if (clipped) ImGui.SetTooltip(label);
+        if (gui.IsItemHovered()) {
+            if (tooltip is not null) gui.Tooltip(tooltip);
+            else if (clipped) gui.Tooltip(label);
         }
 
         if (indent > 0f)
-            ImGui.Unindent(indent);
+            gui.Unindent(indent);
     }
 
     // Returns `label` unchanged when it fits in `maxWidth`, otherwise the longest prefix that fits with a
@@ -126,18 +128,18 @@ internal static class InspectorLayout {
     public static string Ellipsize(string label, float maxWidth) {
         if (string.IsNullOrEmpty(label) || maxWidth <= 0f)
             return label;
-        if (ImGui.CalcTextSize(label).X <= maxWidth)
+        if (gui.CalcTextSize(label).X <= maxWidth)
             return label;                                   // fits — caller sees ReferenceEquals == true
 
         const string ell = "…";
-        float ellW = ImGui.CalcTextSize(ell).X;
+        float ellW = gui.CalcTextSize(ell).X;
         if (ellW >= maxWidth)
             return ell;                                     // column too thin even for the ellipsis glyph
 
         int lo = 0, hi = label.Length;
         while (lo < hi) {
             int mid = (lo + hi + 1) >> 1;
-            if (ImGui.CalcTextSize(label[..mid]).X + ellW <= maxWidth) lo = mid;
+            if (gui.CalcTextSize(label[..mid]).X + ellW <= maxWidth) lo = mid;
             else hi = mid - 1;
         }
         return label[..lo] + ell;

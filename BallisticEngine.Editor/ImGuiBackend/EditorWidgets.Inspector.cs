@@ -138,7 +138,7 @@ internal static partial class EditorWidgets {
         if (ImGui.SmallButton("Const")) { EditorUndo.Push($"Preset {id}"); ReplaceCurve(curve, AnimationCurve.Constant()); edited = true; }
         ImGui.SameLine();
         if (ImGui.SmallButton($"{EditorIcons.Maximize} Edit"))
-            CurveEditorWindow.Open(curve, id, onExternalEdit ?? (() => { }));
+            CurveEditorWindow.Edit(curve, id, onExternalEdit ?? (() => { }));
         ImGui.SameLine();
         ImGui.TextDisabled($"{curve.Count} keys");
 

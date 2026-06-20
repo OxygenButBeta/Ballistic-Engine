@@ -1,5 +1,5 @@
 using System;
-using Hexa.NET.ImGui;
+using SysVec2 = System.Numerics.Vector2;
 using SysVec3 = System.Numerics.Vector3;
 
 namespace BallisticEngine.Editor.Inspector;
@@ -9,66 +9,79 @@ namespace BallisticEngine.Editor.Inspector;
 // when not overridden (exactly VolumeProfileEditor.DrawParameter's chrome). The host loop owns the
 // 2-column table; per row it calls pipeline.Draw, then OR's in TakeOverrideChanged() so toggling an
 // override checkbox still marks the profile dirty even when the value itself didn't change.
+//
+// Phase-7: routes through the IEditorGui seam (EditorGui.Shared) instead of raw ImGui — zero ImGui import.
+// The double-click-to-type ScalarField helper stays a static call (the plan's pragmatic boundary; it owns
+// its own raw-ImGui widget). gui is the process-wide shared seam handle (the editor has one).
 public sealed class ImGuiVolumeGui : IInspectorGui {
+    static IEditorGui gui => EditorGui.Shared;
+
     bool gatedByOverride;
     bool overrideChanged;
 
     public bool TakeOverrideChanged() { bool c = overrideChanged; overrideChanged = false; return c; }
 
-    public void PushId(string id) => ImGui.PushID(id);
-    public void PopId() => ImGui.PopID();
-    public void BeginDisabled() => ImGui.BeginDisabled();
-    public void EndDisabled() => ImGui.EndDisabled();
+    public void PushId(string id) => gui.PushId(id);
+    public void PopId() => gui.PopId();
+    public void BeginDisabled() => gui.BeginDisabled();
+    public void EndDisabled() => gui.EndDisabled();
 
     public void BeginRow(IProperty p) {
-        ImGui.TableNextRow();
-        ImGui.TableSetColumnIndex(0);
+        gui.TableNextRow();
+        gui.TableSetColumnIndex(0);
 
         bool overridden = p.Overridden;
-        if (ImGui.Checkbox("##override", ref overridden)) { p.Overridden = overridden; overrideChanged = true; }
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip(overridden ? "Overriding. Click to use the default." : "Click to override this parameter.");
+        gui.PushFramePadding(new SysVec2(2, 2) * EditorTheme.UiScale);
+        if (gui.Checkbox("##override", ref overridden)) { p.Overridden = overridden; overrideChanged = true; }
+        gui.PopStyleVar();
+        if (gui.IsItemHovered())
+            gui.Tooltip(overridden ? "Overriding. Click to use the default." : "Click to override this parameter.");
 
-        ImGui.SameLine();
-        ImGui.AlignTextToFramePadding();
-        ImGui.TextDisabled(p.Label);
-        if (p.Tooltip is not null && ImGui.IsItemHovered())
-            ImGui.SetTooltip(p.Tooltip);
+        gui.SameLine();
+        gui.AlignTextToFramePadding();
+        gui.TextDisabled(p.Label);
+        if (p.Tooltip is not null && gui.IsItemHovered())
+            gui.Tooltip(p.Tooltip);
 
-        ImGui.TableSetColumnIndex(1);
-        ImGui.SetNextItemWidth(-1);
+        gui.TableSetColumnIndex(1);
+        gui.SetNextItemWidth(-1);
 
         gatedByOverride = !p.Overridden;
-        if (gatedByOverride) ImGui.BeginDisabled();
+        if (gatedByOverride) gui.BeginDisabled();
     }
 
-    public void EndRow() { if (gatedByOverride) ImGui.EndDisabled(); }
+    public void EndRow() { if (gatedByOverride) gui.EndDisabled(); }
 
     // Volume params carry no Header/Space today; keep them inert inside the table.
     public void Header(string t) { }
     public void Space(float h) { }
-    public void HelpBox(string t) { ImGui.TextDisabled(t); }
+    public void HelpBox(string t) { gui.TextDisabled(t); }
 
-    public bool Checkbox(ref bool v) => ImGui.Checkbox("##v", ref v);
+    public bool Checkbox(ref bool v) {
+        gui.PushFramePadding(new SysVec2(2, 2) * EditorTheme.UiScale);
+        bool changed = gui.Checkbox("##v", ref v);
+        gui.PopStyleVar();
+        return changed;
+    }
     public bool SliderFloat(ref float v, float min, float max) {
-        ImGui.PushStyleColor(ImGuiCol.SliderGrab, EditorTheme.SliderGrabRest);   // EF11: legible value over the grab
-        bool changed = ImGui.SliderFloat("##v", ref v, min, max);
-        ImGui.PopStyleColor();
+        gui.PushColor(EditorStyleColor.SliderGrab, EditorTheme.SliderGrabRest);   // EF11: legible value over the grab
+        bool changed = ScalarField.SliderFloat("##v", ref v, min, max, "%.3f");   // double-click to type
+        gui.PopColor();
         return changed;
     }
-    public bool DragFloat(ref float v, float speed) => ImGui.DragFloat("##v", ref v, speed);
+    public bool DragFloat(ref float v, float speed) => ScalarField.DragFloat("##v", ref v, speed, 0, 0, "%.3f");
     public bool SliderInt(ref int v, int min, int max) {
-        ImGui.PushStyleColor(ImGuiCol.SliderGrab, EditorTheme.SliderGrabRest);   // EF11: legible value over the grab
-        bool changed = ImGui.SliderInt("##v", ref v, min, max);
-        ImGui.PopStyleColor();
+        gui.PushColor(EditorStyleColor.SliderGrab, EditorTheme.SliderGrabRest);   // EF11: legible value over the grab
+        bool changed = ScalarField.SliderInt("##v", ref v, min, max);
+        gui.PopColor();
         return changed;
     }
-    public bool DragInt(ref int v) => ImGui.DragInt("##v", ref v);
-    public bool InputText(ref string v, int maxLength) => ImGui.InputText("##v", ref v, (uint)maxLength);
-    public bool Combo(ref int index, string[] names) => ImGui.Combo("##v", ref index, names, names.Length);
+    public bool DragInt(ref int v) => ScalarField.DragInt("##v", ref v);
+    public bool InputText(ref string v, int maxLength) => gui.InputText("##v", ref v, maxLength);
+    public bool Combo(ref int index, string[] names) => gui.Combo("##v", ref index, names);
     public bool ColorEdit3(ref SysVec3 v, bool hdr) =>
-        ImGui.ColorEdit3("##v", ref v, hdr ? ImGuiColorEditFlags.Hdr | ImGuiColorEditFlags.Float : ImGuiColorEditFlags.None);
-    public bool DragFloat2(ref System.Numerics.Vector2 v, float speed) => ImGui.DragFloat2("##v", ref v, speed);
-    public bool DragFloat3(ref SysVec3 v, float speed) => ImGui.DragFloat3("##v", ref v, speed);
-    public void Unsupported(Type t) => ImGui.TextDisabled($"({t.Name})");
+        hdr ? gui.ColorEdit3Hdr("##v", ref v) : gui.ColorEdit3("##v", ref v);
+    public bool DragFloat2(ref System.Numerics.Vector2 v, float speed) => gui.DragFloat2("##v", ref v, speed);
+    public bool DragFloat3(ref SysVec3 v, float speed) => gui.DragFloat3("##v", ref v, speed);
+    public void Unsupported(Type t) => gui.TextDisabled($"({t.Name})");
 }

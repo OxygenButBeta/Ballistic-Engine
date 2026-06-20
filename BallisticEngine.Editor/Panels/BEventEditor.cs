@@ -1,6 +1,5 @@
 using System.Reflection;
 using BallisticEngine.AssetPipeline;
-using Hexa.NET.ImGui;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec4 = System.Numerics.Vector4;
 
@@ -13,27 +12,30 @@ namespace BallisticEngine.Editor;
 //
 // Target = an Entity in the current scene, or a Behaviour on it; the method dropdown lists that
 // target's invokable methods (BEventReflection) split by Void / 1-arg, with a "(Dynamic <T>)" group
-// when the event carries a runtime value (BEvent<T>). Pure ImGui; no engine mutation outside the
-// listener list it's handed.
+// when the event carries a runtime value (BEvent<T>). No engine mutation outside the listener list.
+//
+// Phase-7: routes through the IEditorGui seam (EditorGui.Shared) — zero raw ImGui, including the entity /
+// asset drag-drop targets (gui.BeginDragDropTarget + AcceptDragDropPayloadInt/String).
 internal static class BEventEditor {
+    static IEditorGui gui => EditorGui.Shared;
 
     // Draws the whole BEvent block (header already drawn by the caller's Row). Returns true if any
     // listener was changed (the caller doesn't need it today, but it mirrors the other drawers).
     public static bool Draw(string id, BEvent evt) {
         if (evt is null) {
-            ImGui.TextDisabled("(null event)");
+            gui.TextDisabled("(null event)");
             return false;
         }
 
-        ImGui.PushID(id);
+        gui.PushId(id);
         var changed = false;
 
         Type dynamicType = evt.DynamicArgType;
         string subtitle = dynamicType is null ? "Event" : $"Event<{Pretty(dynamicType)}>";
-        ImGui.TextDisabled($"{subtitle} — {evt.PersistentListeners.Count} listener(s)");
+        gui.TextDisabled($"{subtitle} — {evt.PersistentListeners.Count} listener(s)");
 
         for (var i = 0; i < evt.PersistentListeners.Count; i++) {
-            ImGui.PushID(i);
+            gui.PushId(i);
             PersistentListener listener = evt.PersistentListeners[i];
 
             if (DrawListenerCard(listener, dynamicType, out bool removeRequested))
@@ -44,20 +46,20 @@ internal static class BEventEditor {
                 evt.PersistentListeners.RemoveAt(i);
                 i--;
                 changed = true;
-                ImGui.PopID();
+                gui.PopId();
                 continue;
             }
-            ImGui.PopID();
+            gui.PopId();
         }
 
-        ImGui.Spacing();
-        if (ImGui.Button($"{EditorIcons.Add}  Add Listener", new SysVec2(-1, 0))) {
+        gui.Spacing();
+        if (gui.Button($"{EditorIcons.Add}  Add Listener", new SysVec2(-1, 0))) {
             EditorUndo.Push("Add Event Listener");
             evt.PersistentListeners.Add(new PersistentListener());
             changed = true;
         }
 
-        ImGui.PopID();
+        gui.PopId();
         return changed;
     }
 
@@ -67,25 +69,23 @@ internal static class BEventEditor {
         removeRequested = false;
         var changed = false;
 
-        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new SysVec2(6, 3));
-        // AutoResizeY sizes the card to its content (two lines + the optional arg widget); the Y in
-        // the size vector is ignored when AutoResizeY is set.
-        ImGui.BeginChild("card", new SysVec2(0, 0),
-            ImGuiChildFlags.Borders | ImGuiChildFlags.AutoResizeY);
+        gui.PushFramePadding(new SysVec2(6, 3));
+        // AutoResizeY sizes the card to its content (two lines + the optional arg widget).
+        gui.BeginChildAutoResizeY("card", border: true);
 
         // ---- Line 1: target + remove ----------------------------------------
-        float removeW = ImGui.GetFrameHeight();
-        ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X - removeW - 6);
+        float removeW = gui.FrameHeight;
+        gui.SetNextItemWidth(gui.ContentRegionAvail.X - removeW - 6);
         if (DrawTargetPicker(listener))
             changed = true;
-        ImGui.SameLine();
+        gui.SameLine();
         if (EditorIcons.GhostButton("rm", EditorIcons.Delete, "Remove listener", removeW))
             removeRequested = true;
 
         // ---- Line 2: method + mode ------------------------------------------
         BObject target = listener.ResolveTarget();
         if (target is null) {
-            ImGui.TextDisabled(listener.TargetId == Guid.Empty
+            gui.TextDisabled(listener.TargetId == Guid.Empty
                 ? "Pick a target to choose a method."
                 : "Target not found in this scene.");
         }
@@ -95,14 +95,14 @@ internal static class BEventEditor {
 
             // Static argument widget, only when the bound method takes one in Static mode.
             if (listener.Mode == PersistentListener.CallMode.Static && listener.StaticArgumentType is not null) {
-                ImGui.SetNextItemWidth(-1);
+                gui.SetNextItemWidth(-1);
                 if (DrawStaticArg(listener))
                     changed = true;
             }
         }
 
-        ImGui.EndChild();
-        ImGui.PopStyleVar();
+        gui.EndChild();
+        gui.PopStyleVar();
         return changed;
     }
 
@@ -119,8 +119,8 @@ internal static class BEventEditor {
         };
 
         var changed = false;
-        if (ImGui.Button(label, new SysVec2(-1, 0)))
-            ImGui.OpenPopup("##targetpick");
+        if (gui.Button(label, new SysVec2(-1, 0)))
+            gui.OpenPopup("##targetpick");
 
         // DRAG-DROP: drop an entity from the Hierarchy straight onto the target button (no need to
         // open the list and find it). Sets the entity as the target.
@@ -129,29 +129,29 @@ internal static class BEventEditor {
             changed = true;
         }
 
-        if (ImGui.BeginPopup("##targetpick")) {
+        if (gui.BeginPopup("##targetpick")) {
             // SEARCH: filter the entity/component list by name (large scenes had no way to find one).
-            if (ImGui.IsWindowAppearing()) { targetSearch = ""; ImGui.SetKeyboardFocusHere(); }
-            ImGui.SetNextItemWidth(240);
-            ImGui.InputTextWithHint("##targetsearch", $"{EditorIcons.Search} Search...", ref targetSearch, 64);
-            ImGui.Separator();
+            if (gui.IsWindowAppearing()) { targetSearch = ""; gui.SetKeyboardFocusHere(); }
+            gui.SetNextItemWidth(240);
+            gui.InputTextWithHint("##targetsearch", $"{EditorIcons.Search} Search...", ref targetSearch, 64);
+            gui.Separator();
 
-            if (ImGui.Selectable("None")) {
+            if (gui.Selectable("None")) {
                 EditorUndo.Push("Set Event Target");
                 listener.TargetId = Guid.Empty;
                 listener.MethodName = null;
                 changed = true;
             }
-            ImGui.Separator();
+            gui.Separator();
 
-            ImGui.BeginChild("##targetlist", new SysVec2(240, 320));
+            gui.BeginChild("##targetlist", new SysVec2(240, 320), border: false);
             bool searching = targetSearch.Length > 0;
             bool Match(string s) => !searching || s.Contains(targetSearch, StringComparison.OrdinalIgnoreCase);
             foreach (Entity entity in SceneManager.GetCurrentScene().Entities) {
-                ImGui.PushID(entity.InstanceId.GetHashCode());
+                gui.PushId(entity.InstanceId.GetHashCode());
 
                 // The entity itself as a target (for Entity.SetActive etc.).
-                if (Match(entity.Name ?? "") && ImGui.Selectable($"{EditorIcons.Package}  {entity.Name}")) {
+                if (Match(entity.Name ?? "") && gui.Selectable($"{EditorIcons.Package}  {entity.Name}")) {
                     SetTarget(listener, entity);
                     changed = true;
                 }
@@ -159,15 +159,15 @@ internal static class BEventEditor {
                 foreach (Behaviour behaviour in entity.Behaviours) {
                     string comp = Pretty(behaviour.GetType());
                     if ((Match(comp) || Match($"{entity.Name}/{comp}")) &&
-                        ImGui.Selectable($"        {EditorIcons.Wrench}  {comp}##{behaviour.InstanceId}")) {
+                        gui.Selectable($"        {EditorIcons.Wrench}  {comp}##{behaviour.InstanceId}")) {
                         SetTarget(listener, behaviour);
                         changed = true;
                     }
                 }
-                ImGui.PopID();
+                gui.PopId();
             }
-            ImGui.EndChild();
-            ImGui.EndPopup();
+            gui.EndChild();
+            gui.EndPopup();
         }
         return changed;
     }
@@ -176,17 +176,15 @@ internal static class BEventEditor {
 
     // Accepts a Hierarchy entity-drag payload (int = entity InstanceId hash) onto the current item and
     // resolves it back to the live entity. Mirrors HierarchyPanel's EntityDragType + hash payload.
-    static unsafe bool AcceptEntityDrop(out Entity entity) {
+    static bool AcceptEntityDrop(out Entity entity) {
         entity = null;
-        if (!ImGui.BeginDragDropTarget())
+        if (!gui.BeginDragDropTarget())
             return false;
-        ImGuiPayloadPtr payload = ImGui.AcceptDragDropPayload("BALLISTIC_ENTITY");
-        if (!payload.IsNull && payload.Data != null) {
-            int hash = *(int*)payload.Data;
+        if (gui.AcceptDragDropPayloadInt("BALLISTIC_ENTITY") is { } hash) {
             foreach (Entity e in SceneManager.GetCurrentScene().Entities)
                 if (e.InstanceId.GetHashCode() == hash) { entity = e; break; }
         }
-        ImGui.EndDragDropTarget();
+        gui.EndDragDropTarget();
         return entity is not null;
     }
 
@@ -209,8 +207,8 @@ internal static class BEventEditor {
             : $"{Pretty(listener.MethodName)}{ModeSuffix(listener)}";
 
         var changed = false;
-        ImGui.SetNextItemWidth(-1);
-        if (!ImGui.BeginCombo("##method", current))
+        gui.SetNextItemWidth(-1);
+        if (!gui.BeginCombo("##method", current))
             return false;
 
         foreach (MethodInfo method in BEventReflection.InvokableMethods(target.GetType())
@@ -218,7 +216,7 @@ internal static class BEventEditor {
             ParameterInfo[] ps = method.GetParameters();
 
             if (ps.Length == 0) {
-                if (ImGui.Selectable($"{Pretty(method.Name)} ()")) {
+                if (gui.Selectable($"{Pretty(method.Name)} ()")) {
                     Bind(listener, method, PersistentListener.CallMode.Void, null);
                     changed = true;
                 }
@@ -229,19 +227,19 @@ internal static class BEventEditor {
 
             // Dynamic entry first when this event passes a compatible runtime value.
             if (dynamicType is not null && paramType.IsAssignableFrom(dynamicType)) {
-                if (ImGui.Selectable($"{Pretty(method.Name)} (dynamic {Pretty(paramType)})")) {
+                if (gui.Selectable($"{Pretty(method.Name)} (dynamic {Pretty(paramType)})")) {
                     Bind(listener, method, PersistentListener.CallMode.Dynamic, paramType);
                     changed = true;
                 }
             }
             // Static (fixed-argument) entry.
-            if (ImGui.Selectable($"{Pretty(method.Name)} ({Pretty(paramType)})")) {
+            if (gui.Selectable($"{Pretty(method.Name)} ({Pretty(paramType)})")) {
                 Bind(listener, method, PersistentListener.CallMode.Static, paramType);
                 changed = true;
             }
         }
 
-        ImGui.EndCombo();
+        gui.EndCombo();
         return changed;
     }
 
@@ -269,30 +267,30 @@ internal static class BEventEditor {
 
         if (t == typeof(float)) {
             float v = listener.StaticArgument is float f ? f : 0f;
-            if (ImGui.DragFloat("##arg", ref v, 0.05f)) { Commit(listener, v); changed = true; }
+            if (gui.DragFloat("##arg", ref v, 0.05f)) { Commit(listener, v); changed = true; }
         }
         else if (t == typeof(int)) {
             int v = listener.StaticArgument is int n ? n : 0;
-            if (ImGui.DragInt("##arg", ref v)) { Commit(listener, v); changed = true; }
+            if (gui.DragInt("##arg", ref v)) { Commit(listener, v); changed = true; }
         }
         else if (t == typeof(bool)) {
             bool v = listener.StaticArgument is bool b && b;
-            if (ImGui.Checkbox("##arg", ref v)) { Commit(listener, v); changed = true; }
+            if (gui.Checkbox("##arg", ref v)) { Commit(listener, v); changed = true; }
         }
         else if (t == typeof(string)) {
             string v = listener.StaticArgument as string ?? "";
-            if (ImGui.InputText("##arg", ref v, 256)) { Commit(listener, v); changed = true; }
+            if (gui.InputText("##arg", ref v, 256)) { Commit(listener, v); changed = true; }
         }
         else if (t.IsEnum) {
             string[] names = Enum.GetNames(t);
             int idx = listener.StaticArgument is null ? 0 : Math.Max(0, Array.IndexOf(names, listener.StaticArgument.ToString()));
-            if (ImGui.Combo("##arg", ref idx, names, names.Length)) { Commit(listener, Enum.Parse(t, names[idx])); changed = true; }
+            if (gui.Combo("##arg", ref idx, names)) { Commit(listener, Enum.Parse(t, names[idx])); changed = true; }
         }
         else if (typeof(BObject).IsAssignableFrom(t)) {
             changed = DrawAssetArg(listener, t);
         }
         else {
-            ImGui.TextDisabled($"(unsupported arg: {Pretty(t)})");
+            gui.TextDisabled($"(unsupported arg: {Pretty(t)})");
         }
         return changed;
     }
@@ -305,27 +303,24 @@ internal static class BEventEditor {
         if (asset is not null && AssetDatabase.TryGetAssetGuid(asset, out Guid g))
             display = System.IO.Path.GetFileName(AssetDatabase.GuidToAssetPath(g) ?? asset.Name);
 
-        ImGui.Button($"{EditorIcons.Document}  {display}", new SysVec2(-1, 0));
-        if (!ImGui.BeginDragDropTarget())
+        gui.Button($"{EditorIcons.Document}  {display}", new SysVec2(-1, 0));
+        if (!gui.BeginDragDropTarget())
             return false;
 
         var changed = false;
-        unsafe {
-            ImGuiPayloadPtr payload = ImGui.AcceptDragDropPayload(AssetBrowserPanel.DragType);
-            if (!payload.IsNull && payload.Data != null) {
-                var text = System.Runtime.InteropServices.Marshal.PtrToStringAnsi((IntPtr)payload.Data, payload.DataSize);
-                var first = text?.Split(';', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
-                if (Guid.TryParse(first, out Guid dropped)) {
-                    MethodInfo load = typeof(AssetDatabase).GetMethod(nameof(AssetDatabase.Load), [typeof(Guid)])!
-                        .MakeGenericMethod(assetType);
-                    if (load.Invoke(null, [dropped]) is BObject loaded) {
-                        Commit(listener, loaded);
-                        changed = true;
-                    }
+        string text = gui.AcceptDragDropPayloadString(AssetBrowserPanel.DragType);
+        if (text is not null) {
+            var first = text.Split(';', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+            if (Guid.TryParse(first, out Guid dropped)) {
+                MethodInfo load = typeof(AssetDatabase).GetMethod(nameof(AssetDatabase.Load), [typeof(Guid)])!
+                    .MakeGenericMethod(assetType);
+                if (load.Invoke(null, [dropped]) is BObject loaded) {
+                    Commit(listener, loaded);
+                    changed = true;
                 }
             }
         }
-        ImGui.EndDragDropTarget();
+        gui.EndDragDropTarget();
         return changed;
     }
 

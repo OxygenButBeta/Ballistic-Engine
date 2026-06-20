@@ -60,7 +60,8 @@ internal static class EditorMenus {
     [MenuItem("Window/Layer Collision Matrix", 25)] static void LayerCollision() => EditorWindows.Toggle(WindowKeys.LayerCollision);   // EF8
     [MenuItem("Window/Settings", 24)] static void Settings() => EditorWindows.Toggle(WindowKeys.Settings);
     // Standalone, self-managed window (no facade key needed) — toggles its own static open flag.
-    [MenuItem("Window/Render Pass Toggles", 26)] static void RenderPassToggles() => RenderPassTogglesWindow.Toggle();
+    // Render Pass Toggles is now an [EditorWindowMeta] window (auto-discovered by UserEditorWindowRegistry) —
+    // its menu entry + toggle come from the attribute, so no [MenuItem] here. (Phase 6: eat our own dogfood.)
 
     // ── Assets menu — the Unity-package importer self-registers here (was hand-listed in the Assets menu) ─
     [MenuItem("Assets/Import Unity Package...", 10)] static void ImportUnityPackage() =>

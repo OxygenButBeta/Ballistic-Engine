@@ -172,10 +172,22 @@ public sealed class EngineBootstrap {
             Debugging.LogWarning("No UI font found; UI text will not render until one is provided.");
     }
 
+    // Editor-only injection hook (layer-clean): the EDITOR sets this to contribute extra assemblies to the
+    // reflection scan — specifically the editor-only GameEditorScripts.dll, so user [EditorWindowMeta]
+    // windows are discovered exactly like game components. The engine never references the editor; it just
+    // calls this provider when assembling the scan set. Null in the player (no editor scripts there).
+    // Re-evaluated on every BuildComponentRegistry (incl. hot-reload), so a reloaded editor-script assembly
+    // is re-scanned. The editor is responsible for compiling/loading those assemblies before this runs.
+    public static Func<IEnumerable<System.Reflection.Assembly>> ExtraScanAssemblies;
+
     void BuildComponentRegistry(System.Reflection.Assembly gameScripts) {
-        System.Reflection.Assembly[] assemblies = gameScripts is null
-            ? [typeof(SceneManager).Assembly, Runtime.GetType().Assembly]
-            : [typeof(SceneManager).Assembly, Runtime.GetType().Assembly, gameScripts];
+        var list = new List<System.Reflection.Assembly> { typeof(SceneManager).Assembly, Runtime.GetType().Assembly };
+        if (gameScripts is not null)
+            list.Add(gameScripts);
+        if (ExtraScanAssemblies?.Invoke() is { } extra)
+            foreach (System.Reflection.Assembly a in extra)
+                if (a is not null) list.Add(a);
+        System.Reflection.Assembly[] assemblies = list.ToArray();
         ComponentRegistry.Build(assemblies);
 
         // The general reflection substrate (editor-rework P0.1) — built from the SAME assembly set,

@@ -1,9 +1,8 @@
+using System.Numerics;
 using System.Threading.Tasks;
 using BallisticEngine.AssetPipeline;
 using BallisticEngine.AssetPipeline.Loaders;
 using BallisticEngine.AssetPipeline.Unity;
-using Hexa.NET.ImGui;
-using SysVec2 = System.Numerics.Vector2;
 
 namespace BallisticEngine.Editor;
 
@@ -19,8 +18,22 @@ namespace BallisticEngine.Editor;
 // This is the answer to "FBX-only packs have no layout": grab the Unity version of an asset and its
 // dressed scene/prefab comes across as an openable Ballistic scene. The conversion runs on the
 // background import thread; progress shows in the same busy overlay as a normal refresh.
-internal static class UnityImportWindow {
-    static bool open;
+// Phase-6/8 EditorWindow: the WINDOW is an EditorWindow instance drawn through WindowShell + IEditorGui
+// (zero raw ImGui in the body). The SERVICE half stays static — ImportPackage (remote pipe), the
+// BusyOverlay status fields, and the worker-touched state are shared across threads and not tied to the
+// window instance. A static facade (Open / IsOpen) targets the single shared Instance. The helper classes
+// below (PrefabMeshResolver / UnityMaterialGenerator) and the GuidToProjectRef they call stay as-is.
+internal sealed class UnityImportWindow : EditorWindow {
+    public static readonly UnityImportWindow Instance = new();
+
+    public UnityImportWindow() {
+        DockKey = "win.unityimport";
+        Title = "Import Unity Package";
+        Icon = EditorIcons.Package;
+        NoCollapse = true;
+        DesiredSize = new Vector2(560, 340);
+    }
+
     static string lastLog = "";
     static string sourcePath = "";            // the picked .unitypackage or Unity Assets folder
     static string subfolder = "Imported";     // Assets/<subfolder> destination for a package
@@ -30,8 +43,9 @@ internal static class UnityImportWindow {
     static volatile string progressStatus = "";
     static volatile float progressFraction;
 
-    public static bool IsOpen => open;
-    public static void Open() => open = true;
+    public static bool IsOpen => Instance.Open;
+    // Named Show, not Open (EditorWindow.Open is the instance show-state field).
+    public static void Show() => Instance.Open = true;
 
     // Headless/remote entrypoint (the editor command pipe): kick off an import without the GUI dialog.
     // Returns immediately; progress shows in the BusyOverlay and the result lands in lastLog.
@@ -57,62 +71,52 @@ internal static class UnityImportWindow {
         progressFraction = Math.Clamp(fraction, 0f, 1f);
     }
 
-    public static void Draw(float scale) {
-        if (!open) return;
-
-        ImGui.SetNextWindowSize(new SysVec2(560 * scale, 340 * scale), ImGuiCond.FirstUseEver);
-        if (!ImGui.Begin($"{EditorIcons.Package}  Import Unity Package###UnityImportWindow", ref open,
-                ImGuiWindowFlags.NoCollapse)) {
-            ImGui.End();
-            return;
-        }
-
-        ImGui.TextWrapped(
+    protected override void OnGui(IEditorGui gui) {
+        float scale = gui.Scale;
+        gui.TextWrapped(
             "Import a Unity asset (.unitypackage) or an unpacked Unity \"Assets\" folder. Meshes, " +
             "textures and materials come across; any Unity scenes/prefabs become openable .scene files.");
-        ImGui.Separator();
+        gui.Separator();
 
-        ImGui.TextDisabled("Source");
-        ImGui.SetNextItemWidth(-110 * scale);
-        ImGui.InputText("##src", ref sourcePath, 1024);
-        ImGui.SameLine();
-        if (ImGui.Button(".unitypackage", new SysVec2(100 * scale, 0))) {
+        gui.TextDisabled("Source");
+        gui.SetNextItemWidth(-110 * scale);
+        gui.InputText("##src", ref sourcePath, 1024);
+        gui.SameLine();
+        if (gui.Button(".unitypackage", new Vector2(100 * scale, 0))) {
             var picked = NativeDialogs.PickFile("Select Unity Package", "Unity Package", [".unitypackage"]);
             if (picked is not null) sourcePath = picked;
         }
-        ImGui.SameLine();
+        gui.SameLine();
         // (folder button on its own line below to keep the row from overflowing)
-        if (ImGui.Button("Folder...", new SysVec2(-1, 0))) {
+        if (gui.Button("Folder...", new Vector2(-1, 0))) {
             var picked = NativeDialogs.PickFolder("Select Unpacked Unity Assets Folder");
             if (picked is not null) sourcePath = picked;
         }
 
         var isPackage = sourcePath.EndsWith(".unitypackage", StringComparison.OrdinalIgnoreCase);
         if (isPackage) {
-            ImGui.Dummy(new SysVec2(0, 4));
-            ImGui.TextDisabled("Destination subfolder (under Assets/)");
-            ImGui.SetNextItemWidth(-1);
-            ImGui.InputText("##sub", ref subfolder, 256);
+            gui.Dummy(new Vector2(0, 4));
+            gui.TextDisabled("Destination subfolder (under Assets/)");
+            gui.SetNextItemWidth(-1);
+            gui.InputText("##sub", ref subfolder, 256);
         }
 
-        ImGui.Dummy(new SysVec2(0, 8));
+        gui.Dummy(new Vector2(0, 8));
         bool canImport = !running && sourcePath.Length > 0 &&
                          (File.Exists(sourcePath) || Directory.Exists(sourcePath));
-        ImGui.BeginDisabled(!canImport);
-        if (ImGui.Button(running ? "Importing..." : $"{EditorIcons.Package}  Import", new SysVec2(160 * scale, 0)))
+        gui.BeginDisabled(!canImport);
+        if (gui.Button(running ? "Importing..." : $"{EditorIcons.Package}  Import", new Vector2(160 * scale, 0)))
             StartImport(isPackage);
-        ImGui.EndDisabled();
+        gui.EndDisabled();
 
         if (!string.IsNullOrEmpty(lastLog)) {
-            ImGui.Dummy(new SysVec2(0, 8));
-            ImGui.Separator();
-            ImGui.TextDisabled("Result");
-            ImGui.BeginChild("##unityimportlog", new SysVec2(0, 0), ImGuiChildFlags.Borders);
-            ImGui.TextWrapped(lastLog);
-            ImGui.EndChild();
+            gui.Dummy(new Vector2(0, 8));
+            gui.Separator();
+            gui.TextDisabled("Result");
+            gui.BeginChild("##unityimportlog", new Vector2(0, 0), border: true);
+            gui.TextWrapped(lastLog);
+            gui.EndChild();
         }
-
-        ImGui.End();
     }
 
     static void StartImport(bool isPackage) {

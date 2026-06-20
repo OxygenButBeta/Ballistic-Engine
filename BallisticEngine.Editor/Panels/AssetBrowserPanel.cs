@@ -1,7 +1,6 @@
 using System.Reflection;
 using System.Text;
 using BallisticEngine.Serialization;
-using Hexa.NET.ImGui;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec4 = System.Numerics.Vector4;
 
@@ -16,6 +15,9 @@ namespace BallisticEngine.Editor;
 // visible, Delete removes the whole selection, dragging a selected tile drags all of them
 // (payload = ';'-joined GUIDs), and the context menu switches to batch actions.
 internal sealed class AssetBrowserPanel {
+    // Phase-5: draws through the IEditorGui seam (EditorGui.Shared).
+    static IEditorGui gui => EditorGui.Shared;
+
     public const string DragType = "BALLISTIC_ASSET";
 
     readonly EditorState state;
@@ -86,15 +88,15 @@ internal sealed class AssetBrowserPanel {
         // Two panes, Unity-style: folder tree on the left, tile grid on the right,
         // separated by a draggable splitter (width persists in EditorPrefs).
         float treeW = Math.Clamp(EditorPrefs.Current.AssetTreeWidth, 140f, 420f) * s;
-        ImGui.BeginChild("##foldertree", new SysVec2(treeW, 0));
+        gui.BeginChild("##foldertree", new SysVec2(treeW, 0), border: false);
         DrawFolderTree();
-        ImGui.EndChild();
+        gui.EndChild();
 
         DrawTreeSplitter(s);
 
-        ImGui.BeginChild("##browserright", new SysVec2(0, 0));
+        gui.BeginChild("##browserright", new SysVec2(0, 0), border: false);
         DrawGridPane(s);
-        ImGui.EndChild();
+        gui.EndChild();
     }
 
     void DrawGridPane(float s) {
@@ -208,81 +210,79 @@ internal sealed class AssetBrowserPanel {
             openNewAssetPrompt = false;
             newAssetName = pendingDefaultName;
             focusNewAssetName = true;   // focus the field on the first drawn frame only (see below)
-            ImGui.OpenPopup("##newasset");
+            gui.OpenPopup("##newasset");
         }
 
-        ImGuiViewportPtr vp = ImGui.GetMainViewport();
-        SysVec2 center = new(vp.Pos.X + vp.Size.X * 0.5f, vp.Pos.Y + vp.Size.Y * 0.5f);
-        ImGui.SetNextWindowPos(center, ImGuiCond.Appearing, new SysVec2(0.5f, 0.5f));
+        gui.CenterNextWindowPos();
         PushPromptStyle();
-        if (!ImGui.BeginPopupModal("##newasset", ImGuiWindowFlags.AlwaysAutoResize)) {
+        if (!gui.BeginPopupModalAutoResize("##newasset")) {
             PopPromptStyle();
             return;
         }
 
         // Bright title (the default text is dim/grey which read as "disabled").
-        ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.Text);
-        ImGui.TextUnformatted($"New {newAssetKind}");
-        ImGui.PopStyleColor();
-        ImGui.Separator();
-        ImGui.Spacing();
-        ImGui.TextUnformatted("Name");
+        gui.PushColor(EditorStyleColor.Text, EditorTheme.Text);
+        gui.TextUnformatted($"New {newAssetKind}");
+        gui.PopColor();
+        gui.Separator();
+        gui.Spacing();
+        gui.TextUnformatted("Name");
         // Focus ONLY on the first frame the popup is open. IsWindowAppearing can re-fire (AlwaysAutoResize
         // relayouts the modal), and re-grabbing focus every frame was resetting the input -> typed text
         // never stuck. A one-shot flag avoids that.
         if (focusNewAssetName) {
             focusNewAssetName = false;
-            ImGui.SetKeyboardFocusHere();
+            gui.SetKeyboardFocusHere();
         }
-        ImGui.SetNextItemWidth(300);
-        bool enter = ImGui.InputText("##newassetname", ref newAssetName, 96, ImGuiInputTextFlags.EnterReturnsTrue);
+        gui.SetNextItemWidth(300);
+        bool enter = gui.InputTextEnter("##newassetname", ref newAssetName, 96);
 
         string trimmed = newAssetName.Trim();
         bool valid = trimmed.Length > 0 && trimmed.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
         if (!valid && trimmed.Length > 0)
-            ImGui.TextColored(EditorTheme.Error, "Invalid file name.");
+            gui.TextColored(EditorTheme.Error, "Invalid file name.");
         else
-            ImGui.TextDisabled($"Creates {trimmed}{newAssetExt}");
+            gui.TextDisabled($"Creates {trimmed}{newAssetExt}");
 
-        ImGui.Spacing();
+        gui.Spacing();
         PromptButtons(out bool create, valid);
         if (create || (enter && valid)) {
             CreateNamedAsset(trimmed);
-            ImGui.CloseCurrentPopup();
+            gui.CloseCurrentPopup();
         }
-        ImGui.EndPopup();
+        gui.EndPopup();
         PopPromptStyle();
     }
 
     // A lighter, roomier look for the create modals (the default was a dim, cramped box).
     static void PushPromptStyle() {
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new SysVec2(20, 18));
-        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 5f);
-        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new SysVec2(8, 8));
-        ImGui.PushStyleColor(ImGuiCol.PopupBg, EditorTheme.PopupBg);
-        ImGui.PushStyleColor(ImGuiCol.FrameBg, EditorTheme.InputBg);
+        gui.PushWindowPadding(new SysVec2(20, 18));
+        gui.PushFrameRounding(5f);
+        gui.PushItemSpacing(new SysVec2(8, 8));
+        gui.PushPopupBg(EditorTheme.PopupBg);
+        gui.PushColor(EditorStyleColor.FrameBg, EditorTheme.InputBg);
     }
 
     static void PopPromptStyle() {
-        ImGui.PopStyleColor(2);
-        ImGui.PopStyleVar(3);
+        gui.PopColor(2);
+        gui.PopStyleVar(3);
     }
 
     // Cancel (neutral) + Create (accent-coloured) button row for the create prompts. `create` is true
     // when Create was clicked; Cancel closes the popup itself.
     static void PromptButtons(out bool create, bool createEnabled) {
         create = false;
-        if (ImGui.Button("Cancel", new SysVec2(120, 0)))
-            ImGui.CloseCurrentPopup();
-        ImGui.SameLine();
+        if (gui.Button("Cancel", new SysVec2(120, 0)))
+            gui.CloseCurrentPopup();
+        gui.SameLine();
         // Coloured Create button (greyed when disabled) so it reads as the primary action.
-        ImGui.BeginDisabled(!createEnabled);
-        ImGui.PushStyleColor(ImGuiCol.Button, EditorTheme.PrimaryAction);
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, EditorTheme.PrimaryActionHovered);
-        ImGui.PushStyleColor(ImGuiCol.ButtonActive, EditorTheme.PrimaryActionActive);
-        create = ImGui.Button("Create", new SysVec2(120, 0));
-        ImGui.PopStyleColor(3);
-        ImGui.EndDisabled();
+        gui.BeginDisabled(!createEnabled);
+        gui.PushColor(EditorStyleColor.Button, EditorTheme.PrimaryAction);
+        gui.PushColor(EditorStyleColor.ButtonHovered, EditorTheme.PrimaryActionHovered);
+        gui.PushColor(EditorStyleColor.ButtonActive, EditorTheme.PrimaryActionActive);
+        create = gui.Button("Create", new SysVec2(120, 0));
+        gui.PopColor(3);
+        gui.EndDisabled();
     }
 
     // Writes the named asset (or folder) into the current folder and imports it. Uniqueness still
@@ -314,44 +314,42 @@ internal sealed class AssetBrowserPanel {
         if (openNewScriptPrompt) {
             openNewScriptPrompt = false;
             newScriptName = "NewBehaviour";
-            ImGui.OpenPopup("##newscript");
+            gui.OpenPopup("##newscript");
         }
 
         // Center the modal (ImGuiViewport has no GetCenter in this binding — compute it).
-        ImGuiViewportPtr vp = ImGui.GetMainViewport();
-        SysVec2 center = new(vp.Pos.X + vp.Size.X * 0.5f, vp.Pos.Y + vp.Size.Y * 0.5f);
-        ImGui.SetNextWindowPos(center, ImGuiCond.Appearing, new SysVec2(0.5f, 0.5f));
+        gui.CenterNextWindowPos();
         PushPromptStyle();
-        if (!ImGui.BeginPopupModal("##newscript", ImGuiWindowFlags.AlwaysAutoResize)) {
+        if (!gui.BeginPopupModalAutoResize("##newscript")) {
             PopPromptStyle();
             return;
         }
 
-        ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.Text);
-        ImGui.TextUnformatted("New Script");
-        ImGui.PopStyleColor();
-        ImGui.Separator();
-        ImGui.Spacing();
-        ImGui.TextUnformatted("Class name (= file name)");
-        if (ImGui.IsWindowAppearing())
-            ImGui.SetKeyboardFocusHere();
-        ImGui.SetNextItemWidth(300);
-        bool enter = ImGui.InputText("##scriptname", ref newScriptName, 64, ImGuiInputTextFlags.EnterReturnsTrue);
+        gui.PushColor(EditorStyleColor.Text, EditorTheme.Text);
+        gui.TextUnformatted("New Script");
+        gui.PopColor();
+        gui.Separator();
+        gui.Spacing();
+        gui.TextUnformatted("Class name (= file name)");
+        if (gui.IsWindowAppearing())
+            gui.SetKeyboardFocusHere();
+        gui.SetNextItemWidth(300);
+        bool enter = gui.InputTextEnter("##scriptname", ref newScriptName, 64);
 
         string className = ScriptTemplates.ClassName(newScriptName.Trim());
         bool valid = IsValidIdentifier(className);
         if (!valid && newScriptName.Trim().Length > 0)
-            ImGui.TextColored(EditorTheme.Error, "Not a valid C# class name.");
+            gui.TextColored(EditorTheme.Error, "Not a valid C# class name.");
         else
-            ImGui.TextDisabled($"Creates {className}.cs : Behaviour");
+            gui.TextDisabled($"Creates {className}.cs : Behaviour");
 
-        ImGui.Spacing();
+        gui.Spacing();
         PromptButtons(out bool create, valid);
         if (create || (enter && valid)) {
             CreateScriptNamed(className);
-            ImGui.CloseCurrentPopup();
+            gui.CloseCurrentPopup();
         }
-        ImGui.EndPopup();
+        gui.EndPopup();
         PopPromptStyle();
     }
 
@@ -402,37 +400,37 @@ internal sealed class AssetBrowserPanel {
     }
 
     void DrawNavigationBar(float s) {
-        ImGui.BeginDisabled(CurrentFolder == "Assets");
+        gui.BeginDisabled(CurrentFolder == "Assets");
         if (EditorIcons.GhostButton("navback", EditorIcons.Back, "Back", 30 * s)) {
             var slash = CurrentFolder.LastIndexOf('/');
             NavigateTo(slash > 0 ? CurrentFolder[..slash] : "Assets");
         }
-        ImGui.EndDisabled();
+        gui.EndDisabled();
 
-        ImGui.SameLine();
+        gui.SameLine();
         DrawBreadcrumb();
 
         // Right-aligned toolbar cluster (view toggle, refresh, type filter, search). Clamp the start X
         // so a NARROW panel never pushes the search box off the right edge — it shrinks toward the
         // breadcrumb instead of vanishing.
         float clusterW = 430 * s;
-        float startX = MathF.Max(ImGui.GetCursorPosX() + 8, ImGui.GetWindowWidth() - clusterW);
-        ImGui.SameLine(startX);
+        float startX = MathF.Max(gui.CursorPosX + 8, gui.WindowWidth - clusterW);
+        gui.SameLine(startX);
         // Grid / list view toggle.
         if (EditorIcons.GhostButton("viewmode", listView ? EditorIcons.Grid : EditorIcons.More,
                 listView ? "Switch to grid view" : "Switch to list view", 30 * s))
             listView = !listView;
-        ImGui.SameLine(0, 4);
+        gui.SameLine(0, 4);
         if (EditorIcons.GhostButton("navrefresh", EditorIcons.Refresh, "Reimport changed assets"))
             AsyncAssetImport.Request("Refreshing assets...", onFinished: thumbnails.InvalidateAll);
-        ImGui.SameLine(0, 4);
-        ImGui.SetNextItemWidth(110 * s);
-        ImGui.Combo("##typefilter", ref typeFilter, TypeFilterLabels, TypeFilterLabels.Length);
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Filter by asset type (searches the whole project)");
-        ImGui.SameLine(0, 4);
-        ImGui.SetNextItemWidth(190 * s);
-        ImGui.InputTextWithHint("##filter", $"{EditorIcons.Search} Search (t:Material)...", ref filter, 128);
+        gui.SameLine(0, 4);
+        gui.SetNextItemWidth(110 * s);
+        gui.Combo("##typefilter", ref typeFilter, TypeFilterLabels);
+        if (gui.IsItemHovered())
+            gui.Tooltip("Filter by asset type (searches the whole project)");
+        gui.SameLine(0, 4);
+        gui.SetNextItemWidth(190 * s);
+        gui.InputTextWithHint("##filter", $"{EditorIcons.Search} Search (t:Material)...", ref filter, 128);
     }
 
     // Set when navigation comes from OUTSIDE the tree (breadcrumb, back, tile double-click):
@@ -467,35 +465,35 @@ internal sealed class AssetBrowserPanel {
         if (favs.Count == 0)
             return;
 
-        ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
-        ImGui.TextUnformatted($"{EditorIcons.Pin}  Favourites");
-        ImGui.PopStyleColor();
+        gui.PushColor(EditorStyleColor.Text, gui.StyleColor(EditorStyleColor.TextDisabled));
+        gui.TextUnformatted($"{EditorIcons.Pin}  Favourites");
+        gui.PopColor();
 
         string remove = null;
         for (var i = 0; i < favs.Count; i++) {
             string fav = favs[i];
             string name = fav == "Assets" ? "Assets" : fav[(fav.LastIndexOf('/') + 1)..];
-            ImGui.PushID($"fav{i}");
+            gui.PushId($"fav{i}");
             bool current = string.Equals(fav, CurrentFolder, StringComparison.OrdinalIgnoreCase);
-            ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.FolderTint);
-            ImGui.TextUnformatted(EditorIcons.Folder);
-            ImGui.PopStyleColor();
-            ImGui.SameLine(0, 6);
-            if (ImGui.Selectable($"  {name}##fav", current))
+            gui.PushColor(EditorStyleColor.Text, EditorTheme.FolderTint);
+            gui.TextUnformatted(EditorIcons.Folder);
+            gui.PopColor();
+            gui.SameLine(0, 6);
+            if (gui.Selectable($"  {name}##fav", current))
                 NavigateTo(fav);
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip($"{fav}\nRight-click to remove from favourites.");
-            if (ImGui.BeginPopupContextItem($"##favctx{i}")) {
-                if (ImGui.MenuItem("Remove from Favourites")) remove = fav;
-                ImGui.EndPopup();
+            if (gui.IsItemHovered())
+                gui.Tooltip($"{fav}\nRight-click to remove from favourites.");
+            if (gui.BeginPopupContextItem($"##favctx{i}")) {
+                if (gui.MenuItem("Remove from Favourites")) remove = fav;
+                gui.EndPopup();
             }
-            ImGui.PopID();
+            gui.PopId();
         }
         if (remove is not null) {
             favs.Remove(remove);
             EditorPrefs.Save();
         }
-        ImGui.Separator();
+        gui.Separator();
     }
 
     static bool IsFavorite(string folderPath) => EditorPrefs.Current.FavoriteFolders.Contains(folderPath);
@@ -513,9 +511,9 @@ internal sealed class AssetBrowserPanel {
         revealPending = false;
 
         // Dropping on empty tree space moves assets to the root.
-        SysVec2 rest = ImGui.GetContentRegionAvail();
+        SysVec2 rest = gui.ContentRegionAvail;
         if (rest.Y > 4) {
-            ImGui.Dummy(rest);
+            gui.Dummy(rest);
             AcceptAssetMoveDrop("Assets");
         }
     }
@@ -538,20 +536,20 @@ internal sealed class AssetBrowserPanel {
         var isCurrent = string.Equals(folderPath, CurrentFolder, StringComparison.OrdinalIgnoreCase);
         var isAncestor = CurrentFolder.StartsWith(folderPath + "/", StringComparison.OrdinalIgnoreCase);
 
-        var flags = ImGuiTreeNodeFlags.OpenOnArrow | ImGuiTreeNodeFlags.SpanAvailWidth;
-        if (subDirs.Length == 0) flags |= ImGuiTreeNodeFlags.Leaf | ImGuiTreeNodeFlags.NoTreePushOnOpen;
-        if (isCurrent) flags |= ImGuiTreeNodeFlags.Selected;
+        var flags = EditorTreeFlags.OpenOnArrow | EditorTreeFlags.SpanAvailWidth;
+        if (subDirs.Length == 0) flags |= EditorTreeFlags.Leaf | EditorTreeFlags.NoTreePushOnOpen;
+        if (isCurrent) flags |= EditorTreeFlags.Selected;
 
         if (folderPath == "Assets")
-            ImGui.SetNextItemOpen(true, ImGuiCond.Once);
+            gui.SetNextItemOpenOnce(true);
         else if (isAncestor)
-            ImGui.SetNextItemOpen(true, revealPending ? ImGuiCond.Always : ImGuiCond.Once);
+            if (revealPending) gui.SetNextItemOpenAlways(true); else gui.SetNextItemOpenOnce(true);
 
         // Leading spaces leave room for the folder icon overlaid after the arrow.
-        bool open = ImGui.TreeNodeEx($"      {name}##tn{folderPath}", flags);
-        SysVec2 rowMin = ImGui.GetItemRectMin();
+        bool open = gui.TreeNodeEx($"      {name}##tn{folderPath}", flags);
+        SysVec2 rowMin = gui.ItemRectMin;
 
-        if (ImGui.IsItemClicked() && !ImGui.IsItemToggledOpen())
+        if (gui.IsItemClicked() && !gui.IsItemToggledOpen())
             CurrentFolder = folderPath;     // already visible in the tree; no reveal needed
 
         AcceptAssetMoveDrop(folderPath);
@@ -560,47 +558,46 @@ internal sealed class AssetBrowserPanel {
         var tint = isCurrent || isAncestor
             ? EditorTheme.FolderTint
             : EditorTheme.FolderTintDim;
-        EditorIcons.DrawAt(new SysVec2(rowMin.X + ImGui.GetTreeNodeToLabelSpacing(), rowMin.Y),
+        EditorIcons.DrawAt(new SysVec2(rowMin.X + gui.TreeNodeToLabelSpacing, rowMin.Y),
             expanded ? EditorIcons.FolderOpen : EditorIcons.Folder, tint);
 
         if (expanded) {
             foreach (var dir in subDirs)
                 DrawFolderNode(folderPath + "/" + Path.GetFileName(dir));
-            ImGui.TreePop();
+            gui.TreePop();
         }
     }
 
     // Vertical splitter between the tree and the grid; drag to resize, width persists.
     void DrawTreeSplitter(float s) {
-        ImGui.SameLine(0, 0);
-        ImGui.InvisibleButton("##treesplitter", new SysVec2(6 * s, ImGui.GetContentRegionAvail().Y));
-        if (ImGui.IsItemHovered() || ImGui.IsItemActive())
-            ImGui.SetMouseCursor(ImGuiMouseCursor.ResizeEw);
-        if (ImGui.IsItemActive())
+        gui.SameLine(0, 0);
+        gui.Input.InvisibleButton("##treesplitter", new SysVec2(6 * s, gui.ContentRegionAvail.Y));
+        if (gui.IsItemHovered() || gui.IsItemActive())
+            gui.SetMouseCursorResizeEW();
+        if (gui.IsItemActive())
             EditorPrefs.Current.AssetTreeWidth =
-                Math.Clamp(EditorPrefs.Current.AssetTreeWidth + ImGui.GetIO().MouseDelta.X / s, 140f, 420f);
-        if (ImGui.IsItemDeactivated())
+                Math.Clamp(EditorPrefs.Current.AssetTreeWidth + gui.Input.MouseDelta.X / s, 140f, 420f);
+        if (gui.IsItemDeactivated())
             EditorPrefs.Save();
 
-        SysVec2 min = ImGui.GetItemRectMin();
-        SysVec2 max = ImGui.GetItemRectMax();
+        SysVec2 min = gui.ItemRectMin;
+        SysVec2 max = gui.ItemRectMax;
         float x = (min.X + max.X) * 0.5f;
-        ImGui.GetWindowDrawList().AddLine(new SysVec2(x, min.Y), new SysVec2(x, max.Y),
-            ImGui.GetColorU32(ImGui.IsItemActive() ? ImGuiCol.CheckMark : ImGuiCol.Border));
-        ImGui.SameLine(0, 0);
+        gui.WindowDrawList.AddLine(new SysVec2(x, min.Y), new SysVec2(x, max.Y),
+            gui.ColorU32(gui.StyleColor(gui.IsItemActive() ? EditorStyleColor.CheckMark : EditorStyleColor.Border)));
+        gui.SameLine(0, 0);
     }
 
     // Drop target that MOVES the dragged asset(s) into `targetFolder` (GUIDs survive — the .meta
     // moves with each file, so scene/material references stay intact).
-    unsafe void AcceptAssetMoveDrop(string targetFolder) {
-        if (!ImGui.BeginDragDropTarget())
+    void AcceptAssetMoveDrop(string targetFolder) {
+        if (!gui.BeginDragDropTarget())
             return;
 
-        ImGuiPayloadPtr payload = ImGui.AcceptDragDropPayload(DragType);
-        if (!payload.IsNull && payload.Data != null) {
-            var text = System.Runtime.InteropServices.Marshal.PtrToStringAnsi((IntPtr)payload.Data, payload.DataSize);
+        string text = gui.AcceptDragDropPayloadString(DragType);
+        if (text is not null) {
             var guids = new List<Guid>();
-            foreach (var part in text?.Split(';', StringSplitOptions.RemoveEmptyEntries) ?? [])
+            foreach (var part in text.Split(';', StringSplitOptions.RemoveEmptyEntries))
                 if (Guid.TryParse(part, out Guid guid))
                     guids.Add(guid);
             MoveAssets(guids, targetFolder);
@@ -608,14 +605,12 @@ internal sealed class AssetBrowserPanel {
 
         // Dropping a HIERARCHY entity onto a folder turns it into a .prefab there (Unity's drag-to-create-
         // prefab). The hierarchy ships the entity's instance-id hash as the payload; resolve it back.
-        ImGuiPayloadPtr entityPayload = ImGui.AcceptDragDropPayload("BALLISTIC_ENTITY");
-        if (!entityPayload.IsNull && entityPayload.Data != null) {
-            int hash = *(int*)entityPayload.Data;
+        if (gui.AcceptDragDropPayloadInt("BALLISTIC_ENTITY") is { } hash) {
             Entity entity = FindEntityByHash(hash);
             if (entity is not null)
                 CreatePrefabFromEntity(entity, targetFolder);
         }
-        ImGui.EndDragDropTarget();
+        gui.EndDragDropTarget();
     }
 
     static Entity FindEntityByHash(int hash) {
@@ -728,29 +723,29 @@ internal sealed class AssetBrowserPanel {
     // Clickable path: each segment jumps to that folder. "Assets > Default > Sky".
     void DrawBreadcrumb() {
         var segments = CurrentFolder.Split('/');
-        ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(0, 0, 0, 0));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(1, 1, 1, 0.08f));
-        ImGui.AlignTextToFramePadding();
+        gui.PushColor(EditorStyleColor.Button, new SysVec4(0, 0, 0, 0));
+        gui.PushColor(EditorStyleColor.ButtonHovered, new SysVec4(1, 1, 1, 0.08f));
+        gui.AlignTextToFramePadding();
 
         var cumulative = "";
         for (var i = 0; i < segments.Length; i++) {
             cumulative = i == 0 ? segments[0] : cumulative + "/" + segments[i];
             if (i > 0) {
-                ImGui.SameLine(0, 2);
-                ImGui.TextDisabled(EditorIcons.ChevronRight);
-                ImGui.SameLine(0, 2);
+                gui.SameLine(0, 2);
+                gui.TextDisabled(EditorIcons.ChevronRight);
+                gui.SameLine(0, 2);
             }
             var target = cumulative;
             var last = i == segments.Length - 1;
             if (!last)
-                ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
-            if (ImGui.Button($"{segments[i]}##crumb{i}"))
+                gui.PushColor(EditorStyleColor.Text, gui.StyleColor(EditorStyleColor.TextDisabled));
+            if (gui.Button($"{segments[i]}##crumb{i}"))
                 NavigateTo(target);
             if (!last)
-                ImGui.PopStyleColor();
+                gui.PopColor();
         }
 
-        ImGui.PopStyleColor(2);
+        gui.PopColor(2);
     }
 
     float tileScale = 1f;
@@ -761,13 +756,13 @@ internal sealed class AssetBrowserPanel {
 
     void DrawGrid(List<string> folders, List<(string path, Guid guid)> files, float s) {
         // Ctrl+scroll over the grid resizes the tiles (uses last frame's hover state).
-        ImGuiIOPtr io = ImGui.GetIO();
-        if (gridHovered && io.KeyCtrl && io.MouseWheel != 0)
-            tileScale = Math.Clamp(tileScale + io.MouseWheel * 0.12f, 0.55f, 2.4f);
+        
+        if (gridHovered && gui.KeyCtrl && gui.Input.MouseWheel != 0)
+            tileScale = Math.Clamp(tileScale + gui.Input.MouseWheel * 0.12f, 0.55f, 2.4f);
 
         float tile = 86 * s * tileScale;
-        float cellW = tile + ImGui.GetStyle().ItemSpacing.X;
-        var columns = Math.Max(1, (int)(ImGui.GetContentRegionAvail().X / cellW));
+        float cellW = tile + gui.ItemSpacing.X;
+        var columns = Math.Max(1, (int)(gui.ContentRegionAvail.X / cellW));
 
         visibleFiles.Clear();
         visibleFiles.AddRange(files);
@@ -777,8 +772,8 @@ internal sealed class AssetBrowserPanel {
             return;
         }
 
-        ImGui.BeginChild("##grid");
-        gridHovered = ImGui.IsWindowHovered(ImGuiHoveredFlags.AllowWhenBlockedByActiveItem);
+        gui.BeginChild("##grid", default, border: false);
+        gridHovered = gui.IsWindowHoveredAllowBlocked();
         var column = 0;
 
         foreach (var folder in folders) {
@@ -795,90 +790,86 @@ internal sealed class AssetBrowserPanel {
             DrawEmptyState(s);
 
         // Click empty space (left button) clears the selection, Windows-Explorer style.
-        if (gridHovered && ImGui.IsMouseClicked(ImGuiMouseButton.Left) &&
-            !ImGui.IsAnyItemHovered() && renamingPath is null)
+        if (gridHovered && gui.IsMouseClicked(0) &&
+            !gui.IsAnyItemHovered() && renamingPath is null)
             state.ClearAssetSelection();
 
         // Right-click empty space: creation + folder actions.
-        if (ImGui.BeginPopupContextWindow("##gridctx",
-                ImGuiPopupFlags.MouseButtonRight | ImGuiPopupFlags.NoOpenOverItems)) {
+        if (gui.BeginPopupContextWindowEmpty("##gridctx")) {
             // Paste into the current folder (empty-space right-click), enabled only when something
             // was copied/cut.
-            if (ImGui.MenuItem($"{EditorIcons.Add}  Paste", "Ctrl+V", false, ClipboardHasContent))
+            if (gui.MenuItem($"{EditorIcons.Add}  Paste", "Ctrl+V", false, ClipboardHasContent))
                 ClipboardPaste();
-            ImGui.Separator();
-            if (ImGui.MenuItem($"{EditorIcons.Folder}  New Folder"))
+            gui.Separator();
+            if (gui.MenuItem($"{EditorIcons.Folder}  New Folder"))
                 PromptNewAsset("Folder", "New Folder", "", null);
-            if (ImGui.MenuItem($"{EditorIcons.Code}  New Script"))
+            if (gui.MenuItem($"{EditorIcons.Code}  New Script"))
                 openNewScriptPrompt = true;
-            if (ImGui.MenuItem($"{EditorIcons.Color}  New Material"))
+            if (gui.MenuItem($"{EditorIcons.Color}  New Material"))
                 PromptNewAsset("Material", "New Material", ".mat", _ =>
                     "{\n  \"version\": 1,\n  \"shader\": \"Assets/Default/Shaders/Standard.shader\",\n  \"textures\": {}\n}\n");
-            if (ImGui.MenuItem($"{EditorIcons.Home}  New Scene"))
+            if (gui.MenuItem($"{EditorIcons.Home}  New Scene"))
                 PromptNewAsset("Scene", "New Scene", ".scene", n =>
                     $"version: 1\nname: {n}\nentities: []\n");
-            if (ImGui.MenuItem($"{EditorIcons.Grid}  New Terrain"))
+            if (gui.MenuItem($"{EditorIcons.Grid}  New Terrain"))
                 PromptNewAsset("Terrain", "New Terrain", ".terrain", _ =>
                     "{\n  \"version\": 1,\n  \"resolution\": 256,\n  \"sizeX\": 100,\n  \"sizeZ\": 100,\n  \"heightScale\": 20\n}\n");
             DrawDataAssetCreateMenu();
-            ImGui.Separator();
-            if (ImGui.MenuItem($"{EditorIcons.Code}  Open C# Project"))
+            gui.Separator();
+            if (gui.MenuItem($"{EditorIcons.Code}  Open C# Project"))
                 OpenCSharpProject();
-            ImGui.MenuItem("Show Source Files", (string)null, ref showSourceFiles);
-            if (ImGui.MenuItem("Show in Explorer"))
+            gui.MenuItemToggle("Show Source Files", ref showSourceFiles);
+            if (gui.MenuItem("Show in Explorer"))
                 ShowInExplorer(AssetDatabase.Project.ResolveAbsolute(CurrentFolder), select: false);
-            if (ImGui.MenuItem("Refresh"))
+            if (gui.MenuItem("Refresh"))
                 AsyncAssetImport.Request("Refreshing assets...", onFinished: thumbnails.InvalidateAll);
-            if (ImGui.MenuItem("Force Reimport All"))
+            if (gui.MenuItem("Force Reimport All"))
                 AsyncAssetImport.Request("Reimporting all assets...",
                     onFinished: thumbnails.InvalidateAll, forceAll: true);
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("Rebuilds every Library artifact from source (slow on big projects).\n" +
+            if (gui.IsItemHovered())
+                gui.Tooltip("Rebuilds every Library artifact from source (slow on big projects).\n" +
                                  "Assets already loaded in the open scene pick the rebuilt data up on the next scene load.");
-            ImGui.EndPopup();
+            gui.EndPopup();
         }
 
         // Selection keyboard ops while the grid has focus and no rename is active.
-        if (ImGui.IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows) && renamingPath is null &&
-            !ImGui.GetIO().WantTextInput) {
-            if (io.KeyCtrl && ImGui.IsKeyPressed(ImGuiKey.A) && visibleFiles.Count > 0)
+        if (gui.IsWindowFocusedIncludingChildren() && renamingPath is null &&
+            !gui.WantTextInput) {
+            if (gui.KeyCtrl && gui.KeyPressed(EditorGuiKey.A) && visibleFiles.Count > 0)
                 state.SelectAssets(visibleFiles, visibleFiles[^1]);
-            if (ImGui.IsKeyPressed(ImGuiKey.Delete) && state.SelectedAssets.Count > 0)
+            if (gui.KeyPressed(EditorGuiKey.Delete) && state.SelectedAssets.Count > 0)
                 AssetOps.DeleteAssets(state, state.SelectedAssets, thumbnails.InvalidateAll);
             // Explorer-style clipboard: Ctrl+C copy, Ctrl+X cut, Ctrl+V paste, Ctrl+D duplicate.
-            if (io.KeyCtrl && ImGui.IsKeyPressed(ImGuiKey.C) && state.SelectedAssets.Count > 0) ClipboardCopy(cut: false);
-            if (io.KeyCtrl && ImGui.IsKeyPressed(ImGuiKey.X) && state.SelectedAssets.Count > 0) ClipboardCopy(cut: true);
-            if (io.KeyCtrl && ImGui.IsKeyPressed(ImGuiKey.V) && ClipboardHasContent) ClipboardPaste();
-            if (io.KeyCtrl && ImGui.IsKeyPressed(ImGuiKey.D) && state.SelectedAssets.Count > 0) { ClipboardCopy(cut: false); ClipboardPaste(); }
+            if (gui.KeyCtrl && gui.KeyPressed(EditorGuiKey.C) && state.SelectedAssets.Count > 0) ClipboardCopy(cut: false);
+            if (gui.KeyCtrl && gui.KeyPressed(EditorGuiKey.X) && state.SelectedAssets.Count > 0) ClipboardCopy(cut: true);
+            if (gui.KeyCtrl && gui.KeyPressed(EditorGuiKey.V) && ClipboardHasContent) ClipboardPaste();
+            if (gui.KeyCtrl && gui.KeyPressed(EditorGuiKey.D) && state.SelectedAssets.Count > 0) { ClipboardCopy(cut: false); ClipboardPaste(); }
         }
 
-        ImGui.EndChild();
+        gui.EndChild();
     }
 
     // Detail list view: a sortable table (Name / Type / Size / Modified). Folders sort first; rows
     // reuse the same click/drag/context/double-click handlers as the grid tiles.
     void DrawList(List<string> folders, List<(string path, Guid guid)> files, float s) {
-        const ImGuiTableFlags flags = ImGuiTableFlags.Sortable | ImGuiTableFlags.Resizable |
-            ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY | ImGuiTableFlags.BordersInnerV |
-            ImGuiTableFlags.SizingStretchProp;
+        const EditorTableFlags flags = EditorTableFlags.Sortable | EditorTableFlags.Resizable |
+            EditorTableFlags.RowBg | EditorTableFlags.ScrollY | EditorTableFlags.BordersInnerV |
+            EditorTableFlags.SizingStretchProp;
 
-        if (!ImGui.BeginTable("##assetlist", 4, flags))
+        if (!gui.BeginTable("##assetlist", 4, flags))
             return;
 
-        ImGui.TableSetupScrollFreeze(0, 1);
-        ImGui.TableSetupColumn("Name", ImGuiTableColumnFlags.DefaultSort | ImGuiTableColumnFlags.WidthStretch, 3f);
-        ImGui.TableSetupColumn("Type", ImGuiTableColumnFlags.WidthStretch, 1f);
-        ImGui.TableSetupColumn("Size", ImGuiTableColumnFlags.WidthStretch, 1f);
-        ImGui.TableSetupColumn("Modified", ImGuiTableColumnFlags.WidthStretch, 1.5f);
-        ImGui.TableHeadersRow();
+        gui.TableSetupScrollFreeze(0, 1);
+        gui.TableSetupColumn("Name", EditorColumnFlags.DefaultSort | EditorColumnFlags.WidthStretch, 3f);
+        gui.TableSetupColumn("Type", EditorColumnFlags.WidthStretch, 1f);
+        gui.TableSetupColumn("Size", EditorColumnFlags.WidthStretch, 1f);
+        gui.TableSetupColumn("Modified", EditorColumnFlags.WidthStretch, 1.5f);
+        gui.TableHeadersRow();
 
         // Read the requested sort from the table specs.
-        unsafe {
-            ImGuiTableSortSpecsPtr specs = ImGui.TableGetSortSpecs();
-            if (!specs.IsNull && specs.SpecsCount > 0) {
-                sortColumn = specs.Specs.ColumnIndex;
-                sortAscending = specs.Specs.SortDirection == ImGuiSortDirection.Ascending;
-            }
+        if (gui.TableGetSortSpec(out int sc, out bool asc)) {
+            sortColumn = sc;
+            sortAscending = asc;
         }
 
         // Build rows (folders first, then files), enrich with FileInfo, then sort.
@@ -892,9 +883,9 @@ internal sealed class AssetBrowserPanel {
         SortRows(rows);
 
         foreach (var row in rows) {
-            ImGui.TableNextRow();
-            ImGui.TableSetColumnIndex(0);
-            ImGui.PushID(row.path);
+            gui.TableNextRow();
+            gui.TableSetColumnIndex(0);
+            gui.PushId(row.path);
 
             string name = Path.GetFileName(row.path);
             string ext = row.isFolder ? "" : Path.GetExtension(row.path).ToLowerInvariant();
@@ -903,18 +894,17 @@ internal sealed class AssetBrowserPanel {
                 : EditorIcons.ForAssetExtension(ext);
 
             bool selected = !row.isFolder && state.IsAssetSelected(row.guid);
-            ImGui.PushStyleColor(ImGuiCol.Text, tint);
-            ImGui.TextUnformatted(icon);
-            ImGui.PopStyleColor();
-            ImGui.SameLine(0, 6);
+            gui.PushColor(EditorStyleColor.Text, tint);
+            gui.TextUnformatted(icon);
+            gui.PopColor();
+            gui.SameLine(0, 6);
 
             int index = row.isFolder ? -1 : visibleFiles.FindIndex(f => f.guid == row.guid);
-            if (ImGui.Selectable($"{name}##row", selected,
-                    ImGuiSelectableFlags.SpanAllColumns | ImGuiSelectableFlags.AllowDoubleClick)) {
+            if (gui.SelectableRow($"{name}##row", selected)) {
                 if (row.isFolder) {
-                    if (ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) NavigateTo(row.path);
+                    if (gui.IsMouseDoubleClicked(0)) NavigateTo(row.path);
                 }
-                else if (ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) OpenAsset(row.path, ext);
+                else if (gui.IsMouseDoubleClicked(0)) OpenAsset(row.path, ext);
                 else HandleTileClick(row.path, row.guid, Math.Max(0, index));
             }
             if (!row.isFolder) {
@@ -922,17 +912,17 @@ internal sealed class AssetBrowserPanel {
                 BeginAssetDragSource(name, row.guid);
             }
 
-            ImGui.TableSetColumnIndex(1);
-            ImGui.TextDisabled(row.isFolder ? "Folder" : Style(ext).Item1);
-            ImGui.TableSetColumnIndex(2);
-            ImGui.TextDisabled(row.isFolder ? "" : HumanSize(row.size));
-            ImGui.TableSetColumnIndex(3);
-            ImGui.TextDisabled(row.modified == DateTime.MinValue ? "" : row.modified.ToString("yyyy-MM-dd HH:mm"));
+            gui.TableSetColumnIndex(1);
+            gui.TextDisabled(row.isFolder ? "Folder" : Style(ext).Item1);
+            gui.TableSetColumnIndex(2);
+            gui.TextDisabled(row.isFolder ? "" : HumanSize(row.size));
+            gui.TableSetColumnIndex(3);
+            gui.TextDisabled(row.modified == DateTime.MinValue ? "" : row.modified.ToString("yyyy-MM-dd HH:mm"));
 
-            ImGui.PopID();
+            gui.PopId();
         }
 
-        ImGui.EndTable();
+        gui.EndTable();
     }
 
     void SortRows(List<(string path, Guid guid, bool isFolder, long size, DateTime modified)> rows) {
@@ -969,15 +959,15 @@ internal sealed class AssetBrowserPanel {
     }
 
     unsafe void DrawEmptyState(float s) {
-        ImGui.Dummy(new SysVec2(0, ImGui.GetContentRegionAvail().Y * 0.28f));
+        gui.Dummy(new SysVec2(0, gui.ContentRegionAvail.Y * 0.28f));
         if (ImGuiController.HasIcons) {
             float iconSize = 40 * s;
-            ImGui.SetCursorPosX((ImGui.GetWindowWidth() - iconSize) * 0.5f);
-            ImGui.GetWindowDrawList().AddText(ImGuiController.LargeIcons, iconSize,
-                ImGui.GetCursorScreenPos(), ImGui.GetColorU32(new SysVec4(1, 1, 1, 0.07f)),
+            gui.CursorPosX = ((gui.WindowWidth - iconSize) * 0.5f);
+            gui.WindowDrawList.AddText(EditorFont.LargeIcons, iconSize,
+                gui.CursorScreenPos, gui.ColorU32(new SysVec4(1, 1, 1, 0.07f)),
                 filter.Length > 0 ? EditorIcons.Search : EditorIcons.FolderOpen);
-            ImGui.Dummy(new SysVec2(iconSize, iconSize));
-            ImGui.Spacing();
+            gui.Dummy(new SysVec2(iconSize, iconSize));
+            gui.Spacing();
         }
         CenteredDisabledText(filter.Length > 0 ? "No assets match." : "Empty folder");
         if (filter.Length == 0)
@@ -985,9 +975,9 @@ internal sealed class AssetBrowserPanel {
     }
 
     static void CenteredDisabledText(string text) {
-        float w = ImGui.CalcTextSize(text).X;
-        ImGui.SetCursorPosX(Math.Max(0, (ImGui.GetWindowWidth() - w) * 0.5f));
-        ImGui.TextDisabled(text);
+        float w = gui.CalcTextSize(text).X;
+        gui.CursorPosX = (Math.Max(0, (gui.WindowWidth - w) * 0.5f));
+        gui.TextDisabled(text);
     }
 
     void BeginRename(string path) {
@@ -1007,12 +997,12 @@ internal sealed class AssetBrowserPanel {
         if (renamingPath != path)
             return false;
 
-        ImGui.SetNextItemWidth(tile);
-        if (renameFocusPending) { ImGui.SetKeyboardFocusHere(); renameFocusPending = false; }
-        ImGui.InputText("##renamefield", ref renameBuffer, 128);
+        gui.SetNextItemWidth(tile);
+        if (renameFocusPending) { gui.SetKeyboardFocusHere(); renameFocusPending = false; }
+        gui.InputText("##renamefield", ref renameBuffer, 128);
 
-        var enter = ImGui.IsItemDeactivatedAfterEdit() || ImGui.IsKeyPressed(ImGuiKey.Enter);
-        if (enter || ImGui.IsItemDeactivated()) {
+        var enter = gui.IsItemDeactivatedAfterEdit() || gui.KeyPressed(EditorGuiKey.Enter);
+        if (enter || gui.IsItemDeactivated()) {
             if (enter && !string.IsNullOrWhiteSpace(renameBuffer))
                 CommitRename(path, renameBuffer, isFolder);
             renamingPath = null;
@@ -1118,17 +1108,17 @@ internal sealed class AssetBrowserPanel {
         var entries = ComponentRegistry.DataAssetMenu;
         if (entries.Count == 0)
             return;
-        ImGui.Separator();
+        gui.Separator();
         foreach (ComponentEntry entry in entries) {
             // A non-empty Menu nests the item under that submenu; otherwise it's top-level.
             if (string.IsNullOrEmpty(entry.Menu)) {
-                if (ImGui.MenuItem($"{EditorIcons.Settings}  {entry.DisplayName}"))
+                if (gui.MenuItem($"{EditorIcons.Settings}  {entry.DisplayName}"))
                     CreateDataAsset(entry.Type);
             }
-            else if (ImGui.BeginMenu($"{EditorIcons.Settings}  {entry.Menu}")) {
-                if (ImGui.MenuItem(entry.DisplayName))
+            else if (gui.BeginMenu($"{EditorIcons.Settings}  {entry.Menu}")) {
+                if (gui.MenuItem(entry.DisplayName))
                     CreateDataAsset(entry.Type);
-                ImGui.EndMenu();
+                gui.EndMenu();
             }
         }
     }
@@ -1200,53 +1190,53 @@ internal sealed class AssetBrowserPanel {
         if (column >= columns)
             column = 0;
         else
-            ImGui.SameLine();
+            gui.SameLine();
     }
 
     void DrawFolderTile(string folderPath, float tile) {
         var name = folderPath[(folderPath.LastIndexOf('/') + 1)..];
 
-        ImGui.PushID(folderPath);
-        ImGui.BeginGroup();
+        gui.PushId(folderPath);
+        gui.BeginGroup();
 
-        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 6f);
-        ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(1, 1, 1, 0.025f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(1, 1, 1, 0.07f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new SysVec4(1, 1, 1, 0.11f));
-        ImGui.Button("##folder", new SysVec2(tile, tile));
-        ImGui.PopStyleColor(3);
-        ImGui.PopStyleVar();
+        gui.PushFrameRounding(6f);
+        gui.PushColor(EditorStyleColor.Button, new SysVec4(1, 1, 1, 0.025f));
+        gui.PushColor(EditorStyleColor.ButtonHovered, new SysVec4(1, 1, 1, 0.07f));
+        gui.PushColor(EditorStyleColor.ButtonActive, new SysVec4(1, 1, 1, 0.11f));
+        gui.Button("##folder", new SysVec2(tile, tile));
+        gui.PopColor(3);
+        gui.PopStyleVar();
 
         // Full vs empty folder reads at a glance: an open, bright folder when it has content; a plain,
         // dimmer folder when empty (FolderIcon decides from the folder's contents, cached per mtime).
         (string fIcon, SysVec4 fTint) = FolderIcon(folderPath);
-        DrawFolderGlyph(ImGui.GetItemRectMin(), ImGui.GetItemRectMax(), fIcon, fTint);
+        DrawFolderGlyph(gui.ItemRectMin, gui.ItemRectMax, fIcon, fTint);
 
-        if (ImGui.IsItemHovered() && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
+        if (gui.IsItemHovered() && gui.IsMouseDoubleClicked(0))
             NavigateTo(folderPath);
 
         // Dropping assets on a folder tile moves them into it (same as the tree).
         AcceptAssetMoveDrop(folderPath);
 
-        if (ImGui.BeginPopupContextItem("##folderctx")) {
-            if (ImGui.MenuItem("Open"))
+        if (gui.BeginPopupContextItem("##folderctx")) {
+            if (gui.MenuItem("Open"))
                 NavigateTo(folderPath);
-            if (ImGui.MenuItem(IsFavorite(folderPath) ? $"{EditorIcons.Pin}  Remove from Favourites" : $"{EditorIcons.Pin}  Add to Favourites"))
+            if (gui.MenuItem(IsFavorite(folderPath) ? $"{EditorIcons.Pin}  Remove from Favourites" : $"{EditorIcons.Pin}  Add to Favourites"))
                 ToggleFavorite(folderPath);
-            if (ImGui.MenuItem("Rename"))
+            if (gui.MenuItem("Rename"))
                 BeginRename(folderPath);
-            if (ImGui.MenuItem("Show in Explorer"))
+            if (gui.MenuItem("Show in Explorer"))
                 ShowInExplorer(AssetDatabase.Project.ResolveAbsolute(folderPath), select: false);
-            ImGui.Separator();
-            if (ImGui.MenuItem("Delete Folder"))
+            gui.Separator();
+            if (gui.MenuItem("Delete Folder"))
                 DeleteFolder(folderPath);
-            ImGui.EndPopup();
+            gui.EndPopup();
         }
 
         if (!DrawRenameField(folderPath, tile, isFolder: true))
             TileLabel(name, tile);
-        ImGui.EndGroup();
-        ImGui.PopID();
+        gui.EndGroup();
+        gui.PopId();
     }
 
     void DrawAssetTile(string path, Guid guid, float tile, int index) {
@@ -1257,15 +1247,15 @@ internal sealed class AssetBrowserPanel {
         var selected = state.IsAssetSelected(guid);
         var active = state.SelectedAssetGuid == guid;
 
-        ImGui.PushID(path);
-        ImGui.BeginGroup();
-        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 6f);
+        gui.PushId(path);
+        gui.BeginGroup();
+        gui.PushFrameRounding(6f);
 
         // A tile that's been CUT (Ctrl+X, awaiting paste) dims so you can tell it's "in the clipboard
         // to move" — Explorer/Unity behaviour. Popped at the end of the group.
         bool cutGhost = clipboardCut && clipboardPaths.Contains(path);
         if (cutGhost)
-            ImGui.PushStyleVar(ImGuiStyleVar.Alpha, ImGui.GetStyle().Alpha * 0.45f);
+            gui.PushAlphaScaled(0.45f);
 
         // Images and meshes render a real preview; everything else gets a dark tile with a big
         // type icon tinted by category (+ the short tag below it).
@@ -1274,29 +1264,28 @@ internal sealed class AssetBrowserPanel {
                          ext is ".fbx" or ".obj" or ".gltf" or ".glb" or ".dae" or ".mat";
         var thumb = hasPreview ? thumbnails.Get(guid, path) : 0;
         if (thumb != 0) {
-            clicked = ImGui.ImageButton($"##thumb{guid}", EditorApplication.Tex(thumb),
-                new SysVec2(tile - 8, tile - 8), new SysVec2(0, 0), new SysVec2(1, 1));
+            clicked = gui.ImageButton($"##thumb{guid}", thumb, new SysVec2(tile - 8, tile - 8));
         }
         else {
-            ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(color.X, color.Y, color.Z, 0.55f));
-            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(color.X, color.Y, color.Z, 0.75f));
-            ImGui.PushStyleColor(ImGuiCol.ButtonActive, new SysVec4(color.X, color.Y, color.Z, 0.95f));
+            gui.PushColor(EditorStyleColor.Button, new SysVec4(color.X, color.Y, color.Z, 0.55f));
+            gui.PushColor(EditorStyleColor.ButtonHovered, new SysVec4(color.X, color.Y, color.Z, 0.75f));
+            gui.PushColor(EditorStyleColor.ButtonActive, new SysVec4(color.X, color.Y, color.Z, 0.95f));
             // Button fires on RELEASE, so starting a drag does NOT change the selection —
             // you can drag an asset onto an Inspector slot without losing what's inspected.
-            clicked = ImGui.Button("##typetile", new SysVec2(tile, tile));
-            ImGui.PopStyleColor(3);
-            DrawTypeGlyph(ImGui.GetItemRectMin(), ImGui.GetItemRectMax(), ext, tag);
+            clicked = gui.Button("##typetile", new SysVec2(tile, tile));
+            gui.PopColor(3);
+            DrawTypeGlyph(gui.ItemRectMin, gui.ItemRectMax, ext, tag);
         }
-        ImGui.PopStyleVar();
+        gui.PopStyleVar();
 
-        SysVec2 tileMin = ImGui.GetItemRectMin();
-        SysVec2 tileMax = ImGui.GetItemRectMax();
+        SysVec2 tileMin = gui.ItemRectMin;
+        SysVec2 tileMax = gui.ItemRectMax;
 
         if (selected) {
-            SysVec4 accent = ImGui.GetStyle().Colors[(int)ImGuiCol.CheckMark];
-            ImGui.GetWindowDrawList().AddRect(tileMin, tileMax,
-                ImGui.GetColorU32(active ? accent : new SysVec4(accent.X, accent.Y, accent.Z, 0.55f)),
-                6f, ImDrawFlags.None, active ? 2.5f : 2f);
+            SysVec4 accent = gui.StyleColor(EditorStyleColor.CheckMark);
+            gui.WindowDrawList.AddRect(tileMin, tileMax,
+                gui.ColorU32(active ? accent : new SysVec4(accent.X, accent.Y, accent.Z, 0.55f)),
+                6f, active ? 2.5f : 2f);
         }
 
         // Extension badge over preview thumbnails (type tiles already show the tag).
@@ -1308,20 +1297,20 @@ internal sealed class AssetBrowserPanel {
 
         DrawTileContextMenu(path, guid, ext);
 
-        if (ImGui.IsItemHovered()) {
-            if (ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
+        if (gui.IsItemHovered()) {
+            if (gui.IsMouseDoubleClicked(0))
                 OpenAsset(path, ext);
             if (state.SelectedAssets.Count <= 1)
-                ImGui.SetTooltip(path);
+                gui.Tooltip(path);
         }
 
         BeginAssetDragSource(name, guid);
         if (!DrawRenameField(path, tile, isFolder: false))
             TileLabel(name, tile);
         if (cutGhost)
-            ImGui.PopStyleVar();
-        ImGui.EndGroup();
-        ImGui.PopID();
+            gui.PopStyleVar();
+        gui.EndGroup();
+        gui.PopId();
     }
 
     // Double-click action shared by grid tiles and list rows: open folders/scenes/scripts/prefabs.
@@ -1335,9 +1324,9 @@ internal sealed class AssetBrowserPanel {
 
     // Explorer-style selection: plain click = single, Ctrl = toggle, Shift = range from anchor.
     void HandleTileClick(string path, Guid guid, int index) {
-        ImGuiIOPtr io = ImGui.GetIO();
+        
 
-        if (io.KeyShift && anchorGuid != Guid.Empty) {
+        if (gui.KeyShift && anchorGuid != Guid.Empty) {
             var anchorIndex = visibleFiles.FindIndex(f => f.guid == anchorGuid);
             if (anchorIndex >= 0) {
                 int from = Math.Min(anchorIndex, index), to = Math.Max(anchorIndex, index);
@@ -1346,7 +1335,7 @@ internal sealed class AssetBrowserPanel {
             }
         }
 
-        if (io.KeyCtrl) {
+        if (gui.KeyCtrl) {
             state.ToggleAsset(path, guid);
             anchorGuid = guid;
             return;
@@ -1357,7 +1346,7 @@ internal sealed class AssetBrowserPanel {
     }
 
     void DrawTileContextMenu(string path, Guid guid, string ext) {
-        if (!ImGui.BeginPopupContextItem("##assetctx"))
+        if (!gui.BeginPopupContextItem("##assetctx"))
             return;
 
         // Right-clicking outside the current selection re-targets it (Explorer behavior).
@@ -1368,46 +1357,46 @@ internal sealed class AssetBrowserPanel {
 
         int count = state.SelectedAssets.Count;
         if (count > 1) {
-            ImGui.TextDisabled($"{count} assets selected");
-            ImGui.Separator();
-            if (ImGui.MenuItem($"{EditorIcons.Document}  Copy", "Ctrl+C")) ClipboardCopy(cut: false);
-            if (ImGui.MenuItem("Cut", "Ctrl+X")) ClipboardCopy(cut: true);
-            if (ImGui.MenuItem($"{EditorIcons.Add}  Paste", "Ctrl+V", false, ClipboardHasContent)) ClipboardPaste();
-            if (ImGui.MenuItem("Copy Paths"))
-                ImGui.SetClipboardText(string.Join('\n', state.SelectedAssets.Select(a => a.Path)));
-            ImGui.Separator();
-            if (ImGui.MenuItem($"{EditorIcons.Delete}  Delete {count} Assets"))
+            gui.TextDisabled($"{count} assets selected");
+            gui.Separator();
+            if (gui.MenuItem($"{EditorIcons.Document}  Copy", "Ctrl+C")) ClipboardCopy(cut: false);
+            if (gui.MenuItem("Cut", "Ctrl+X")) ClipboardCopy(cut: true);
+            if (gui.MenuItem($"{EditorIcons.Add}  Paste", "Ctrl+V", false, ClipboardHasContent)) ClipboardPaste();
+            if (gui.MenuItem("Copy Paths"))
+                gui.SetClipboardText(string.Join('\n', state.SelectedAssets.Select(a => a.Path)));
+            gui.Separator();
+            if (gui.MenuItem($"{EditorIcons.Delete}  Delete {count} Assets"))
                 AssetOps.DeleteAssets(state, state.SelectedAssets, thumbnails.InvalidateAll);
         }
         else {
-            if (ext == ".scene" && ImGui.MenuItem($"{EditorIcons.Play}  Open Scene"))
+            if (ext == ".scene" && gui.MenuItem($"{EditorIcons.Play}  Open Scene"))
                 LoadScene(path);
-            if (ext == ".cs" && ImGui.MenuItem($"{EditorIcons.Code}  Edit Script"))
+            if (ext == ".cs" && gui.MenuItem($"{EditorIcons.Code}  Edit Script"))
                 OpenScript(path);
-            if (ModelInstantiation.IsModel(guid) && ImGui.MenuItem($"{EditorIcons.Add}  Add to Scene")) {
+            if (ModelInstantiation.IsModel(guid) && gui.MenuItem($"{EditorIcons.Add}  Add to Scene")) {
                 EditorUndo.Push("Add Model");
                 Entity entity = ModelInstantiation.Instantiate(SceneManager.GetCurrentScene(), guid);
                 if (entity is not null)
                     state.Select(entity);
             }
-            ImGui.Separator();
-            if (ImGui.MenuItem($"{EditorIcons.Document}  Copy", "Ctrl+C")) ClipboardCopy(cut: false);
-            if (ImGui.MenuItem("Cut", "Ctrl+X")) ClipboardCopy(cut: true);
-            if (ImGui.MenuItem($"{EditorIcons.Add}  Paste", "Ctrl+V", false, ClipboardHasContent)) ClipboardPaste();
-            if (ImGui.MenuItem("Duplicate", "Ctrl+D")) { ClipboardCopy(cut: false); ClipboardPaste(); }
-            ImGui.Separator();
-            if (ImGui.MenuItem("Rename"))
+            gui.Separator();
+            if (gui.MenuItem($"{EditorIcons.Document}  Copy", "Ctrl+C")) ClipboardCopy(cut: false);
+            if (gui.MenuItem("Cut", "Ctrl+X")) ClipboardCopy(cut: true);
+            if (gui.MenuItem($"{EditorIcons.Add}  Paste", "Ctrl+V", false, ClipboardHasContent)) ClipboardPaste();
+            if (gui.MenuItem("Duplicate", "Ctrl+D")) { ClipboardCopy(cut: false); ClipboardPaste(); }
+            gui.Separator();
+            if (gui.MenuItem("Rename"))
                 BeginRename(path);
-            if (ImGui.MenuItem("Show in Explorer"))
+            if (gui.MenuItem("Show in Explorer"))
                 ShowInExplorer(AssetDatabase.Project.ResolveAbsolute(path), select: true);
-            if (ImGui.MenuItem("Copy Path"))
-                ImGui.SetClipboardText(path);
-            ImGui.Separator();
-            if (ImGui.MenuItem($"{EditorIcons.Delete}  Delete"))
+            if (gui.MenuItem("Copy Path"))
+                gui.SetClipboardText(path);
+            gui.Separator();
+            if (gui.MenuItem($"{EditorIcons.Delete}  Delete"))
                 AssetOps.DeleteAssets(state, [(path, guid)], thumbnails.InvalidateAll);
         }
 
-        ImGui.EndPopup();
+        gui.EndPopup();
     }
 
     // ---- Asset clipboard (copy / cut / paste files in the browser) -----------------------------
@@ -1463,68 +1452,68 @@ internal sealed class AssetBrowserPanel {
     static void TileLabel(string name, float tile) {
         // Hard-clipped to the tile width via the draw list (text can never spill into the
         // neighboring cell); short names are centered.
-        SysVec2 pos = ImGui.GetCursorScreenPos();
-        float height = ImGui.GetTextLineHeight();
-        SysVec2 textSize = ImGui.CalcTextSize(name);
+        SysVec2 pos = gui.CursorScreenPos;
+        float height = gui.TextLineHeight;
+        SysVec2 textSize = gui.CalcTextSize(name);
         float x = textSize.X < tile ? pos.X + (tile - textSize.X) * 0.5f : pos.X;
 
-        ImDrawListPtr draw = ImGui.GetWindowDrawList();
+        IEditorDrawList draw = gui.WindowDrawList;
         draw.PushClipRect(pos, new SysVec2(pos.X + tile, pos.Y + height), true);
-        draw.AddText(new SysVec2(x, pos.Y), ImGui.GetColorU32(ImGuiCol.Text), name);
+        draw.AddText(new SysVec2(x, pos.Y), gui.ColorU32(gui.StyleColor(EditorStyleColor.Text)), name);
         draw.PopClipRect();
 
-        ImGui.Dummy(new SysVec2(tile, height)); // reserve exactly the tile's width
+        gui.Dummy(new SysVec2(tile, height)); // reserve exactly the tile's width
     }
 
     // Folder icon glyph centered on the tile (crisp: baked large in the icon atlas).
     static unsafe void DrawFolderGlyph(SysVec2 min, SysVec2 max, string icon, SysVec4 tint) {
-        ImDrawListPtr draw = ImGui.GetWindowDrawList();
+        IEditorDrawList draw = gui.WindowDrawList;
         SysVec2 size = max - min;
 
         if (ImGuiController.HasIcons) {
             float glyph = size.Y * 0.52f;
-            draw.AddText(ImGuiController.LargeIcons, glyph,
+            draw.AddText(EditorFont.LargeIcons, glyph,
                 new SysVec2(min.X + (size.X - glyph) * 0.5f, min.Y + (size.Y - glyph) * 0.48f),
-                ImGui.GetColorU32(tint), icon);
+                gui.ColorU32(tint), icon);
             return;
         }
 
         // Fallback: a simple drawn folder (tab + body), dimmed to the tint's alpha for empty folders.
-        var bodyColor = ImGui.GetColorU32(new SysVec4(0.78f, 0.63f, 0.27f, tint.W));
-        var tabColor = ImGui.GetColorU32(new SysVec4(0.88f, 0.74f, 0.38f, tint.W));
+        var bodyColor = gui.ColorU32(new SysVec4(0.78f, 0.63f, 0.27f, tint.W));
+        var tabColor = gui.ColorU32(new SysVec4(0.88f, 0.74f, 0.38f, tint.W));
         draw.AddRectFilled(min + size * new SysVec2(0.18f, 0.24f), min + size * new SysVec2(0.48f, 0.36f), tabColor, 3f);
         draw.AddRectFilled(min + size * new SysVec2(0.18f, 0.32f), min + size * new SysVec2(0.82f, 0.78f), bodyColor, 3f);
     }
 
     // Big type icon + small tag text for assets without a real preview.
     static unsafe void DrawTypeGlyph(SysVec2 min, SysVec2 max, string ext, string tag) {
-        ImDrawListPtr draw = ImGui.GetWindowDrawList();
+        IEditorDrawList draw = gui.WindowDrawList;
         SysVec2 size = max - min;
 
         if (ImGuiController.HasIcons) {
             (string icon, _) = EditorIcons.ForAssetExtension(ext);
             float glyph = size.Y * 0.42f;
-            draw.AddText(ImGuiController.LargeIcons, glyph,
+            draw.AddText(EditorFont.LargeIcons, glyph,
                 new SysVec2(min.X + (size.X - glyph) * 0.5f, min.Y + size.Y * 0.18f),
-                ImGui.GetColorU32(new SysVec4(1, 1, 1, 0.85f)), icon);
+                gui.ColorU32(new SysVec4(1, 1, 1, 0.85f)), icon);
         }
 
-        SysVec2 tagSize = ImGui.CalcTextSize(tag);
+        SysVec2 tagSize = gui.CalcTextSize(tag);
         draw.AddText(new SysVec2(min.X + (size.X - tagSize.X) * 0.5f, max.Y - size.Y * 0.16f - tagSize.Y * 0.5f),
-            ImGui.GetColorU32(new SysVec4(1, 1, 1, 0.55f)), tag);
+            gui.ColorU32(new SysVec4(1, 1, 1, 0.55f)), tag);
     }
 
     // Small rounded extension chip in the thumbnail's bottom-left corner.
     static void DrawExtensionBadge(SysVec2 min, SysVec2 max, string tag, SysVec4 color) {
-        ImDrawListPtr draw = ImGui.GetWindowDrawList();
-        SysVec2 textSize = ImGui.CalcTextSize(tag);
+        IEditorDrawList draw = gui.WindowDrawList;
+        SysVec2 textSize = gui.CalcTextSize(tag);
         SysVec2 pad = new(5, 2);
         SysVec2 badgeMin = new(min.X + 5, max.Y - textSize.Y - pad.Y * 2 - 5);
         SysVec2 badgeMax = badgeMin + textSize + pad * 2;
 
         draw.AddRectFilled(badgeMin, badgeMax,
-            ImGui.GetColorU32(new SysVec4(color.X * 0.6f, color.Y * 0.6f, color.Z * 0.6f, 0.92f)), 4f);
-        draw.AddText(badgeMin + pad, ImGui.GetColorU32(new SysVec4(1, 1, 1, 0.92f)), tag);
+            gui.ColorU32(new SysVec4(color.X * 0.6f, color.Y * 0.6f, color.Z * 0.6f, 0.92f)), 4f);
+        draw.AddText(badgeMin + pad, gui.ColorU32(new SysVec4(1, 1, 1, 0.92f)), tag);
     }
 
     // Per-extension type taxonomy: the (tag, tint) for an asset's type tile/badge. This is a self-
@@ -1548,7 +1537,7 @@ internal sealed class AssetBrowserPanel {
     // Drag source: a tile inside the multi-selection drags the WHOLE selection
     // (';'-joined GUIDs — single-asset targets take the first).
     unsafe void BeginAssetDragSource(string fileName, Guid guid) {
-        if (!ImGui.BeginDragDropSource())
+        if (!gui.BeginDragDropSource())
             return;
 
         var dragAll = state.IsAssetSelected(guid) && state.SelectedAssets.Count > 1;
@@ -1556,12 +1545,10 @@ internal sealed class AssetBrowserPanel {
             ? string.Join(';', state.SelectedAssets.Select(a => a.Guid.ToString("N")))
             : guid.ToString("N");
 
-        byte[] payload = Encoding.ASCII.GetBytes(payloadText);
-        fixed (byte* p = payload)
-            ImGui.SetDragDropPayload(DragType, p, (ulong)payload.Length);
+        gui.SetDragDropPayloadString(DragType, payloadText);
 
-        ImGui.Text(dragAll ? $"{EditorIcons.Document} {state.SelectedAssets.Count} assets" : fileName);
-        ImGui.EndDragDropSource();
+        gui.Text(dragAll ? $"{EditorIcons.Document} {state.SelectedAssets.Count} assets" : fileName);
+        gui.EndDragDropSource();
     }
 
     static void LoadScene(string assetPath) => SceneCommands.Open(assetPath);

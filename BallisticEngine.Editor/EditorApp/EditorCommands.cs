@@ -1,5 +1,4 @@
 using BallisticEngine.Serialization;
-using Hexa.NET.ImGui;
 
 namespace BallisticEngine.Editor;
 
@@ -41,6 +40,10 @@ namespace BallisticEngine.Editor;
 // choke point. (Was InspectorUndo.Track -- relocated here so EditorCommands is the only undo entry
 // point; InspectorUndo now forwards to keep its call sites byte-identical.)
 internal static class EditorCommands {
+    // Phase-7: the 3 widget item-query calls in TrackEdit route through the seam (EditorGui.Shared) — this
+    // undo choke point no longer imports ImGui.
+    static IEditorGui gui => EditorGui.Shared;
+
     // A discrete structural change to the scene graph (add/remove/reparent/delete/create/group). Takes
     // a whole-scene snapshot first, then applies. Equivalent to "EditorUndo.Push(label); mutate();".
     public static void Structural(string label, Action mutate) {
@@ -107,7 +110,7 @@ internal static class EditorCommands {
     // that entity, selection survives, no IrradianceVolume re-bake); null -> whole-scene snapshot
     // (Structural-equivalent, for multi-selection broadcasts / scene-behaviour / asset edits).
     public static bool TrackEdit(string label, Entity scopeEntity, bool changed) {
-        if (ImGui.IsItemActivated()) {
+        if (gui.IsItemActivated()) {
             pendingLabel = label;
             pendingEntity = scopeEntity;
             pendingScoped = scopeEntity is not null;
@@ -117,14 +120,14 @@ internal static class EditorCommands {
                 pendingDoc = SceneSerializer.CaptureEntity(scopeEntity);
         }
 
-        if (ImGui.IsItemDeactivatedAfterEdit()) {
+        if (gui.IsItemDeactivatedAfterEdit()) {
             if (pendingScoped && pendingDoc is not null)
                 EditorUndo.PushEntitySnapshot(pendingLabel, pendingEntity, pendingDoc);
             else if (pendingYaml is not null)
                 EditorUndo.PushSnapshot(pendingLabel, pendingYaml);
             ClearPending();
         }
-        else if (ImGui.IsItemDeactivated()) {
+        else if (gui.IsItemDeactivated()) {
             ClearPending(); // aborted / no net change
         }
 

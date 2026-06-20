@@ -4,7 +4,6 @@ using BallisticEngine.AssetPipeline.Loaders;
 using BallisticEngine.Editor.Inspector;
 using BallisticEngine.Editor.Inspector.AssetInspectors;
 using BallisticEngine.Serialization;
-using Hexa.NET.ImGui;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec3 = System.Numerics.Vector3;
 using SysVec4 = System.Numerics.Vector4;
@@ -19,6 +18,11 @@ namespace BallisticEngine.Editor;
 // Styling: an entity header card, component headers with type icon + tinted stripe + overlaid
 // enable checkbox + a "..." menu, and Unity-style colored X/Y/Z chips on vector rows.
 internal sealed class InspectorPanel : IComponentInspectorHost {
+    // Phase-7: the panel draws through the IEditorGui seam (EditorGui.Shared). Static so the internal-static
+    // grid/row helpers (Row/BeginGrid/AcceptGuidDrop — shared with ComponentPreviews/AssetInspectors) reach
+    // it too. The single stateless seam handle is set once at startup.
+    static IEditorGui gui => EditorGui.Shared;
+
     readonly EditorState state;
 
     // Shared inspector drawer STACK (Odin-style, B0): one registry of value drawers + a composable, recursive,
@@ -154,10 +158,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     void IComponentInspectorHost.DrawNestedSlot(Inspector.IProperty property, Type declaredType) => DrawNestedSlot(property, declaredType);
 
     public void DrawContents() {
-        ImGui.PushID(instanceId);   // namespace all ids so a 2nd Inspector window doesn't collide
+        gui.PushId(instanceId);   // namespace all ids so a 2nd Inspector window doesn't collide
         // Denser rows than the global style so more fits on screen.
-        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new SysVec2(8, 4));
-        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new SysVec2(8, 4));
+        gui.PushItemSpacing(new SysVec2(8, 4));
+        gui.PushFramePadding(new SysVec2(8, 4));
 
         DrawLockBar();
 
@@ -183,12 +187,12 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             if (state.SelectedEntities.Count > 1) {
                 // RW4: the selection count reads as a small accent chip (badge) instead of inline grey text,
                 // so the multi-edit state is glanceable; the explanatory line + divider stay below.
-                ImGui.AlignTextToFramePadding();
-                ImGui.TextDisabled($"{EditorIcons.Package}");
-                ImGui.SameLine(0, 6);
+                gui.AlignTextToFramePadding();
+                gui.TextDisabled($"{EditorIcons.Package}");
+                gui.SameLine(0, 6);
                 SysVec4 accent = EditorPrefs.Current.Accent;
                 EditorDecoration.DrawBadge($"{state.SelectedEntities.Count} entities", new SysVec4(accent.X, accent.Y, accent.Z, 0.30f));
-                ImGui.TextDisabled("Edits apply to ALL selected (matching components).");
+                gui.TextDisabled("Edits apply to ALL selected (matching components).");
                 EditorDecoration.DrawDivider();
             }
             // Scoped undo: ONLY for a single-entity selection (a multi-selection edit broadcasts to
@@ -204,49 +208,49 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         if (openPicker) {
             openPicker = false;
             pickerSearch = "";
-            ImGui.OpenPopup("##assetpicker");
+            gui.OpenPopup("##assetpicker");
         }
         DrawAssetPickerPopup();
 
         if (openSceneRefPicker) {
             openSceneRefPicker = false;
             sceneRefSearch = "";
-            ImGui.OpenPopup("##scenerefpicker");
+            gui.OpenPopup("##scenerefpicker");
         }
         DrawSceneObjectPickerPopup();
 
-        ImGui.PopStyleVar(2);
-        ImGui.PopID();
+        gui.PopStyleVar(2);
+        gui.PopId();
     }
 
     // A slim right-aligned lock toggle at the top of the inspector. Locking pins the current entity so
     // selecting other objects doesn't change what's shown (Unity's padlock).
     void DrawLockBar() {
-        float btn = ImGui.GetFrameHeight();
-        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - btn);
+        float btn = gui.FrameHeight;
+        gui.CursorPosX = (gui.CursorPosX + gui.ContentRegionAvail.X - btn);
         if (locked) {
-            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.CheckMark]);
+            gui.PushColor(EditorStyleColor.Text, gui.StyleColor(EditorStyleColor.CheckMark));
             if (EditorIcons.GhostButtonSmall("inspectorlock", EditorIcons.Lock, "Inspector locked - click to unlock")) {
                 locked = false;
                 lockedEntity = null;
             }
-            ImGui.PopStyleColor();
+            gui.PopColor();
         }
         else {
-            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+            gui.PushColor(EditorStyleColor.Text, gui.StyleColor(EditorStyleColor.TextDisabled));
             if (EditorIcons.GhostButtonSmall("inspectorlock", EditorIcons.LockOpen, "Lock inspector to the current entity")) {
                 lockedEntity = state.Selected;
                 locked = lockedEntity is not null;
             }
-            ImGui.PopStyleColor();
+            gui.PopColor();
         }
     }
 
     // Centered hint when nothing is selected, instead of a lone text line in the corner. RW4 (Phase E): the
     // prompt sits inside a faint empty-state card so the panel reads as a crafted surface, not a bare void.
     static void DrawEmptyState() {
-        SysVec2 avail = ImGui.GetContentRegionAvail();
-        SysVec2 origin = ImGui.GetCursorScreenPos();
+        SysVec2 avail = gui.ContentRegionAvail;
+        SysVec2 origin = gui.CursorScreenPos;
         // Card spans the content width, centered vertically-ish around the prompt block.
         float cardTop = avail.Y * 0.30f;
         float cardH = MathF.Min(avail.Y * 0.42f, 150f);
@@ -256,9 +260,9 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         if (cardMax.X > cardMin.X + 8 && cardMax.Y > cardMin.Y + 8)
             EditorDecoration.DrawEmptyCard(cardMin, cardMax);
 
-        ImGui.Dummy(new SysVec2(0, cardTop + cardH * 0.5f - 34f));
+        gui.Dummy(new SysVec2(0, cardTop + cardH * 0.5f - 34f));
         CenteredIcon(EditorIcons.Search, 34f, new SysVec4(1, 1, 1, 0.08f));
-        ImGui.Spacing();
+        gui.Spacing();
         CenteredDisabledText("Nothing selected");
         CenteredDisabledText("Select an entity or asset to inspect it.");
     }
@@ -267,35 +271,35 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         if (!ImGuiController.HasIcons)
             return;
         float w = size; // icon glyphs are roughly square
-        ImGui.SetCursorPosX((ImGui.GetWindowWidth() - w) * 0.5f);
-        SysVec2 pos = ImGui.GetCursorScreenPos();
-        ImGui.GetWindowDrawList().AddText(ImGuiController.LargeIcons, size, pos,
-            ImGui.GetColorU32(tint), icon);
-        ImGui.Dummy(new SysVec2(w, size));
+        gui.CursorPosX = ((gui.WindowWidth - w) * 0.5f);
+        SysVec2 pos = gui.CursorScreenPos;
+        gui.WindowDrawList.AddText(EditorFont.LargeIcons, size, pos,
+            gui.ColorU32(tint), icon);
+        gui.Dummy(new SysVec2(w, size));
     }
 
     static void CenteredDisabledText(string text) {
-        float w = ImGui.CalcTextSize(text).X;
-        ImGui.SetCursorPosX(Math.Max(0, (ImGui.GetWindowWidth() - w) * 0.5f));
-        ImGui.TextDisabled(text);
+        float w = gui.CalcTextSize(text).X;
+        gui.CursorPosX = (Math.Max(0, (gui.WindowWidth - w) * 0.5f));
+        gui.TextDisabled(text);
     }
 
     // ---- Scene behaviour inspector --------------------------------------------
 
     void DrawSceneBehaviourInspector(SceneBehaviour behaviour) {
         Type type = behaviour.GetType();
-        ImGui.PushID(behaviour.InstanceId.GetHashCode());
+        gui.PushId(behaviour.InstanceId.GetHashCode());
 
         bool enabled = behaviour.IsEnabled;
         bool open = ComponentHeader(Prettify(type.Name), type, ref enabled, out bool menuRequested);
         if (enabled != behaviour.IsEnabled) EditorCommands.EditScene($"Toggle {Prettify(type.Name)}", () => { behaviour.IsEnabled = enabled; state.MarkViewportDirty(); });
 
         if (menuRequested)
-            ImGui.OpenPopup("##componentctx");
+            gui.OpenPopup("##componentctx");
         var removeClicked = false;
-        if (ImGui.BeginPopup("##componentctx")) {
-            if (ImGui.MenuItem("Remove Component")) removeClicked = true;
-            ImGui.EndPopup();
+        if (gui.BeginPopup("##componentctx")) {
+            if (gui.MenuItem("Remove Component")) removeClicked = true;
+            gui.EndPopup();
         }
 
         if (open) {
@@ -315,7 +319,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             });
         }
 
-        ImGui.PopID();
+        gui.PopId();
     }
 
     // ---- Render-feature list (phase-3 chunk 22) -------------------------------
@@ -335,7 +339,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         EditorDecoration.DrawSectionHeader("Render Features");
 
         if (list.Count == 0)
-            ImGui.TextDisabled("No render features. Add one below.");
+            gui.TextDisabled("No render features. Add one below.");
 
         int moveFrom = -1, moveTo = -1, removeAt = -1;
 
@@ -343,55 +347,55 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             RenderFeature feature = list[i];
             if (feature is null) continue;
             Type ft = feature.GetType();
-            ImGui.PushID(i);
+            gui.PushId(i);
 
             // Active toggle (left of the header).
             bool active = feature.Active;
-            if (ImGui.Checkbox("##featactive", ref active)) {
+            if (gui.Checkbox("##featactive", ref active)) {
                 EditorUndo.Push(active ? "Enable Render Feature" : "Disable Render Feature");
                 feature.Active = active;
                 state.MarkViewportDirty();
             }
-            ImGui.SameLine();
+            gui.SameLine();
 
             // Collapsible feature header carrying the (display) type name.
             string display = ComponentRegistry.RenderFeatureMenu
                 .FirstOrDefault(e => e.Type == ft).DisplayName ?? Prettify(ft.Name);
-            ImGui.PushStyleColor(ImGuiCol.Text,
-                ImGui.GetStyle().Colors[(int)(active ? ImGuiCol.Text : ImGuiCol.TextDisabled)]);
-            bool open = ImGui.CollapsingHeader($"{display}###feathdr{i}", ImGuiTreeNodeFlags.DefaultOpen);
-            ImGui.PopStyleColor();
+            gui.PushColor(EditorStyleColor.Text,
+                gui.StyleColor(active ? EditorStyleColor.Text : EditorStyleColor.TextDisabled));
+            bool open = gui.CollapsingHeader($"{display}###feathdr{i}", defaultOpen: true);
+            gui.PopColor();
 
             // Reorder + remove controls (right-aligned on the header row). After SameLine,
             // GetContentRegionAvail().X is the width remaining to the right edge — reserve three
             // small buttons' worth and push the cursor there (same idiom as DrawLockBar).
-            float btnW = ImGui.GetFrameHeight();
-            ImGui.SameLine();
-            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - btnW * 3 - 8);
-            ImGui.BeginDisabled(i == 0);
-            if (ImGui.SmallButton("^##fup")) { moveFrom = i; moveTo = i - 1; }
-            ImGui.EndDisabled();
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Move up");
-            ImGui.SameLine();
-            ImGui.BeginDisabled(i == list.Count - 1);
-            if (ImGui.SmallButton("v##fdn")) { moveFrom = i; moveTo = i + 1; }
-            ImGui.EndDisabled();
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Move down");
-            ImGui.SameLine();
-            ImGui.PushStyleColor(ImGuiCol.Text, EditorIcons.AxisX);
-            if (ImGui.SmallButton($"{EditorIcons.Delete}##frm")) removeAt = i;
-            ImGui.PopStyleColor();
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Remove feature");
+            float btnW = gui.FrameHeight;
+            gui.SameLine();
+            gui.CursorPosX = (gui.CursorPosX + gui.ContentRegionAvail.X - btnW * 3 - 8);
+            gui.BeginDisabled(i == 0);
+            if (gui.SmallButton("^##fup")) { moveFrom = i; moveTo = i - 1; }
+            gui.EndDisabled();
+            if (gui.IsItemHovered()) gui.Tooltip("Move up");
+            gui.SameLine();
+            gui.BeginDisabled(i == list.Count - 1);
+            if (gui.SmallButton("v##fdn")) { moveFrom = i; moveTo = i + 1; }
+            gui.EndDisabled();
+            if (gui.IsItemHovered()) gui.Tooltip("Move down");
+            gui.SameLine();
+            gui.PushColor(EditorStyleColor.Text, EditorIcons.AxisX);
+            if (gui.SmallButton($"{EditorIcons.Delete}##frm")) removeAt = i;
+            gui.PopColor();
+            if (gui.IsItemHovered()) gui.Tooltip("Remove feature");
 
             // The feature's reflected params (Event/Tint/Strength/…) via the shared drawer pipeline.
             // Undo for a param edit is taken per-widget by the same InspectorUndo path components use.
             if (open) {
-                ImGui.Indent();
+                gui.Indent();
                 DrawMemberList(ft, feature);
-                ImGui.Unindent();
+                gui.Unindent();
             }
 
-            ImGui.PopID();
+            gui.PopId();
         }
 
         // Apply structural changes AFTER the loop (mutating the list mid-iteration is unsafe).
@@ -406,25 +410,25 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             state.MarkViewportDirty();
         }
 
-        ImGui.Spacing();
+        gui.Spacing();
         DrawAddFeatureButton(host);
     }
 
     void DrawAddFeatureButton(RenderFeatures host) {
-        float avail = ImGui.GetContentRegionAvail().X;
+        float avail = gui.ContentRegionAvail.X;
         float w = Math.Clamp(avail * 0.72f, 180f, 320f);
-        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (avail - w) * 0.5f);
+        gui.CursorPosX = (gui.CursorPosX + (avail - w) * 0.5f);
 
-        SysVec4 accent = ImGui.GetStyle().Colors[(int)ImGuiCol.CheckMark];
-        ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(accent.X, accent.Y, accent.Z, 0.16f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(accent.X, accent.Y, accent.Z, 0.30f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new SysVec4(accent.X, accent.Y, accent.Z, 0.42f));
-        var clicked = ImGui.Button($"{EditorIcons.Add}  Add Feature", new SysVec2(w, 0));
-        ImGui.PopStyleColor(3);
+        SysVec4 accent = gui.StyleColor(EditorStyleColor.CheckMark);
+        gui.PushColor(EditorStyleColor.Button, new SysVec4(accent.X, accent.Y, accent.Z, 0.16f));
+        gui.PushColor(EditorStyleColor.ButtonHovered, new SysVec4(accent.X, accent.Y, accent.Z, 0.30f));
+        gui.PushColor(EditorStyleColor.ButtonActive, new SysVec4(accent.X, accent.Y, accent.Z, 0.42f));
+        var clicked = gui.Button($"{EditorIcons.Add}  Add Feature", new SysVec2(w, 0));
+        gui.PopColor(3);
 
         if (clicked) {
             addFeatureSearch = "";
-            ImGui.OpenPopup("##addfeature");
+            gui.OpenPopup("##addfeature");
         }
 
         DrawAddFeaturePopup(host);
@@ -434,25 +438,25 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // instance to the host's feature list (URP lets the same feature type be added multiple times, so no
     // "already present" filtering — duplicates are allowed by design, §5 D1).
     void DrawAddFeaturePopup(RenderFeatures host) {
-        float u = ImGui.GetFontSize();
-        ImGui.SetNextWindowSize(new SysVec2(u * 26f, u * 24f), ImGuiCond.Appearing);
-        if (!ImGui.BeginPopup("##addfeature"))
+        float u = gui.FontSize;
+        gui.SetNextWindowSizeAppearing(new SysVec2(u * 26f, u * 24f));
+        if (!gui.BeginPopup("##addfeature"))
             return;
 
-        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new SysVec2(8, 6));
+        gui.PushItemSpacing(new SysVec2(8, 6));
 
-        ImGui.PushFont(ImGuiController.Bold);
-        ImGui.TextUnformatted("Add Render Feature");
-        ImGui.PopFont();
-        ImGui.Spacing();
+        gui.PushFont(EditorFont.Bold);
+        gui.TextUnformatted("Add Render Feature");
+        gui.PopFont();
+        gui.Spacing();
 
-        if (ImGui.IsWindowAppearing())
-            ImGui.SetKeyboardFocusHere();
-        ImGui.SetNextItemWidth(-1);
-        ImGui.InputTextWithHint("##addfeatsearch", $"{EditorIcons.Search} Search features...",
+        if (gui.IsWindowAppearing())
+            gui.SetKeyboardFocusHere();
+        gui.SetNextItemWidth(-1);
+        gui.InputTextWithHint("##addfeatsearch", $"{EditorIcons.Search} Search features...",
             ref addFeatureSearch, 128);
-        bool enter = ImGui.IsItemFocused() && ImGui.IsKeyPressed(ImGuiKey.Enter);
-        ImGui.Separator();
+        bool enter = gui.IsItemFocused() && gui.KeyPressed(EditorGuiKey.Enter);
+        gui.Separator();
 
         bool searching = addFeatureSearch.Length > 0;
         bool Matches(ComponentEntry e) =>
@@ -464,15 +468,15 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             EditorUndo.Push($"Add {e.DisplayName}");
             (host.Features ??= new()).Add(feature);
             state.MarkViewportDirty();
-            ImGui.CloseCurrentPopup();
+            gui.CloseCurrentPopup();
         }
 
-        ImGui.BeginChild("##addfeatlist");
+        gui.BeginChild("##addfeatlist", default, border: false);
 
         IReadOnlyList<ComponentEntry> entries = ComponentRegistry.RenderFeatureMenu;
         if (entries.Count == 0) {
-            ImGui.TextDisabled("No render features are defined.");
-            ImGui.TextDisabled("Author a RenderFeature subclass in your project scripts.");
+            gui.TextDisabled("No render features are defined.");
+            gui.TextDisabled("Author a RenderFeature subclass in your project scripts.");
         }
         else {
             ComponentEntry? first = null;
@@ -485,14 +489,14 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                     Add(entry);
             }
             if (!any)
-                ImGui.TextDisabled("No features match.");
+                gui.TextDisabled("No features match.");
             if (enter && first is { } f)
                 Add(f);
         }
 
-        ImGui.EndChild();
-        ImGui.PopStyleVar();
-        ImGui.EndPopup();
+        gui.EndChild();
+        gui.PopStyleVar();
+        gui.EndPopup();
     }
 
     // ---- Entity inspector ----------------------------------------------------
@@ -509,7 +513,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
         DrawTagLayerRow(entity);
 
-        ImGui.Spacing();
+        gui.Spacing();
 
         DrawTransform(entity.transform);
 
@@ -524,7 +528,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             if (EditorWidgets.SearchField("##componentsearch", "Search components...", ref componentListSearch))
                 state.MarkViewportDirty();
             componentQuery = componentListSearch;
-            ImGui.Spacing();
+            gui.Spacing();
         }
 
         bool ComponentMatch(Behaviour b) =>
@@ -532,6 +536,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             Prettify(b.GetType().Name).Contains(componentQuery, StringComparison.OrdinalIgnoreCase);
 
         var typeIndex = new Dictionary<Type, int>();
+        var componentOrdinal = 0;   // running count of DRAWN components, for alternating body-bg banding
         foreach (Behaviour behaviour in behaviours) {
             Type bt = behaviour.GetType();
             int idx = typeIndex.TryGetValue(bt, out int i) ? i : 0;
@@ -540,13 +545,17 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             // Nth-of-type index) even for components the filter hides, so hiding a component never shifts a
             // visible sibling's index. Increment FIRST (above), then skip the draw.
             if (!ComponentMatch(behaviour)) continue;
-            DrawComponent(entity, behaviour, idx);
+            // Breathing room between component blocks (the banding reads as separate cards). Skip before
+            // the first one so it sits snug under the transform/tag rows.
+            if (componentOrdinal > 0)
+                gui.Dummy(new SysVec2(0, 6 * EditorTheme.UiScale));
+            DrawComponent(entity, behaviour, idx, componentOrdinal++);
         }
 
-        ImGui.Spacing();
-        ImGui.Spacing();
+        gui.Spacing();
+        gui.Spacing();
         DrawAddComponent(entity);
-        ImGui.Spacing();
+        gui.Spacing();
     }
 
     // True if any member of this component differs from the prefab definition (drives the header dot).
@@ -563,44 +572,44 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         // Justified literal (EF5d): a deep, desaturated navy SURFACE backing for Unity's prefab strip — a
         // dark low-alpha bar, NOT an alpha of the bright PrefabBlue foreground; the blue TEXT/dot above use
         // the EditorTheme.PrefabBlue token. (A direct alpha of PrefabBlue would read far too bright here.)
-        ImGui.PushStyleColor(ImGuiCol.ChildBg, new SysVec4(0.16f, 0.22f, 0.34f, 0.55f));
-        ImGui.BeginChild("##prefabbar", new SysVec2(0, ImGui.GetFrameHeight() + 10), ImGuiChildFlags.AutoResizeY);
-        ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.PrefabBlue);
-        ImGui.AlignTextToFramePadding();
-        ImGui.TextUnformatted($"{EditorIcons.Package}  Prefab: {name}");
-        ImGui.PopStyleColor();
+        gui.PushColor(EditorStyleColor.ChildBg, new SysVec4(0.16f, 0.22f, 0.34f, 0.55f));
+        gui.BeginChildAutoResizeY("##prefabbar", border: false);
+        gui.PushColor(EditorStyleColor.Text, EditorTheme.PrefabBlue);
+        gui.AlignTextToFramePadding();
+        gui.TextUnformatted($"{EditorIcons.Package}  Prefab: {name}");
+        gui.PopColor();
 
         if (path is not null) {
-            ImGui.SameLine();
-            if (ImGui.SmallButton("Select")) state.RequestRevealAsset(path);
+            gui.SameLine();
+            if (gui.SmallButton("Select")) state.RequestRevealAsset(path);
         }
 
         bool hasOverrides = PrefabOverrides.HasAnyOverride;
-        ImGui.BeginDisabled(!hasOverrides || path is null);
-        ImGui.SameLine();
-        if (ImGui.SmallButton("Apply All")) PrefabInstanceOps.ApplyAll(entity);
-        ImGui.SameLine();
-        if (ImGui.SmallButton("Revert All")) { PrefabInstanceOps.RevertAll(entity); state.MarkViewportDirty(); }
-        ImGui.EndDisabled();
+        gui.BeginDisabled(!hasOverrides || path is null);
+        gui.SameLine();
+        if (gui.SmallButton("Apply All")) PrefabInstanceOps.ApplyAll(entity);
+        gui.SameLine();
+        if (gui.SmallButton("Revert All")) { PrefabInstanceOps.RevertAll(entity); state.MarkViewportDirty(); }
+        gui.EndDisabled();
 
-        ImGui.EndChild();
-        ImGui.PopStyleColor();
-        ImGui.Spacing();
+        gui.EndChild();
+        gui.PopColor();
+        gui.Spacing();
     }
 
     // Rounded card with the entity's type icon, active checkbox, name field and a meta line.
     unsafe void DrawEntityHeaderCard(Entity entity, int componentCount) {
-        var draw = ImGui.GetWindowDrawList();
-        SysVec2 avail = ImGui.GetContentRegionAvail();
-        SysVec2 cardMin = ImGui.GetCursorScreenPos();
+        var draw = gui.WindowDrawList;
+        SysVec2 avail = gui.ContentRegionAvail;
+        SysVec2 cardMin = gui.CursorScreenPos;
 
         float pad = 10f;
-        float frameH = ImGui.GetFrameHeight();
+        float frameH = gui.FrameHeight;
         // RW2: row 1 hosts the name field in the larger Header font, so its frame is taller than the
         // default frameH — size the card from the header frame height so the bigger title never clips.
-        float headerFrameH = EditorTheme.Header.FontSize + ImGui.GetStyle().FramePadding.Y * 2;
+        float headerFrameH = gui.FontSizeOf(EditorFont.Header) + gui.FramePadding.Y * 2;
         float row1H = MathF.Max(frameH, headerFrameH);
-        float cardH = pad + row1H + 4 + ImGui.GetTextLineHeight() + pad;
+        float cardH = pad + row1H + 4 + gui.TextLineHeight + pad;
         SysVec2 cardMax = cardMin + new SysVec2(avail.X, cardH);
 
         // RW4 (Phase E decoration): the entity-header card surface now comes from the shared
@@ -614,63 +623,62 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         float iconSize = cardH - pad * 2 + 6;
         float contentX = cardMin.X + pad;
         if (ImGuiController.HasIcons) {
-            draw.AddText(ImGuiController.LargeIcons, iconSize,
+            draw.AddText(EditorFont.LargeIcons, iconSize,
                 new SysVec2(cardMin.X + pad, cardMin.Y + (cardH - iconSize) * 0.5f),
-                ImGui.GetColorU32(entity.IsActive ? tint : new SysVec4(tint.X, tint.Y, tint.Z, 0.4f)),
+                gui.ColorU32(entity.IsActive ? tint : new SysVec4(tint.X, tint.Y, tint.Z, 0.4f)),
                 icon);
             contentX += iconSize + pad;
         }
 
         // Row 1: active checkbox + name field.
-        ImGui.SetCursorScreenPos(new SysVec2(contentX, cardMin.Y + pad));
+        gui.SetCursorScreenPos(new SysVec2(contentX, cardMin.Y + pad));
         bool active = entity.IsActive;
-        if (ImGui.Checkbox("##active", ref active)) { }
+        if (gui.Checkbox("##active", ref active)) { }
         // Snapshot fires on activation; the SetActive mutate lands on a later branch/frame, so the
         // grab-frame snapshot is preserved with a no-op mutate (Push->PushEntity scoping aside, byte-identical).
-        if (ImGui.IsItemActivated()) EditorCommands.EditEntity(entity, "Toggle Active", () => { });
+        if (gui.IsItemActivated()) EditorCommands.EditEntity(entity, "Toggle Active", () => { });
         if (active != entity.IsActive) { entity.SetActive(active); state.MarkViewportDirty(); }
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Active");
+        if (gui.IsItemHovered())
+            gui.Tooltip("Active");
 
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(cardMax.X - pad - ImGui.GetCursorScreenPos().X);
-        ImGui.PushStyleColor(ImGuiCol.FrameBg, new SysVec4(0, 0, 0, 0.30f));
+        gui.SameLine();
+        gui.SetNextItemWidth(cardMax.X - pad - gui.CursorScreenPos.X);
+        gui.PushColor(EditorStyleColor.FrameBg, new SysVec4(0, 0, 0, 0.30f));
         // RW2: the entity NAME is the top of the inspector's type hierarchy — draw it in the Header
         // (semibold, larger) font so it reads as the title, not just another body-size field.
-        ImGui.PushFont(EditorTheme.Header);
+        gui.PushFont(EditorFont.Header);
         var name = entity.Name ?? "";
-        var renamed = ImGui.InputText("##name", ref name, 128);
-        ImGui.PopFont();
-        ImGui.PopStyleColor();
+        var renamed = gui.InputText("##name", ref name, 128);
+        gui.PopFont();
+        gui.PopColor();
         // Snapshot on activation; the rename mutate (entity.Name) lands on a later edit frame, so the
         // grab-frame snapshot is preserved with a no-op mutate.
-        if (ImGui.IsItemActivated()) EditorCommands.EditEntity(entity, "Rename", () => { });
+        if (gui.IsItemActivated()) EditorCommands.EditEntity(entity, "Rename", () => { });
         if (renamed) entity.Name = name;
 
         // Row 2: meta line. RW2: caption font + recessive caption color so it reads as secondary metadata.
-        ImGui.SetCursorScreenPos(new SysVec2(contentX, cardMin.Y + pad + row1H + 4));
-        ImGui.PushFont(EditorTheme.Caption);
-        ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.RowCaption);
-        ImGui.TextUnformatted(componentCount == 1 ? "1 component" : $"{componentCount} components");
-        ImGui.PopStyleColor();
-        ImGui.PopFont();
+        gui.SetCursorScreenPos(new SysVec2(contentX, cardMin.Y + pad + row1H + 4));
+        gui.PushFont(EditorFont.Caption);
+        gui.PushColor(EditorStyleColor.Text, EditorTheme.RowCaption);
+        gui.TextUnformatted(componentCount == 1 ? "1 component" : $"{componentCount} components");
+        gui.PopColor();
+        gui.PopFont();
 
         // Reserve the card's space in the layout — and make it a SCRIPT DROP TARGET: dragging a .cs
         // tile from the asset browser onto the header adds that component to the entity (Unity parity;
         // the hierarchy already accepts this, the inspector didn't).
-        ImGui.SetCursorScreenPos(cardMin);
-        ImGui.Dummy(new SysVec2(avail.X, cardH));
+        gui.SetCursorScreenPos(cardMin);
+        gui.Dummy(new SysVec2(avail.X, cardH));
         AcceptScriptDrop(entity);
     }
 
     // Drop target for .cs script tiles (asset-browser drag payload = ';'-separated GUIDs). Each that
     // resolves to a compiled Behaviour type is added as a component (skipping dupes), one undo step.
-    unsafe void AcceptScriptDrop(Entity entity) {
-        if (!ImGui.BeginDragDropTarget())
+    void AcceptScriptDrop(Entity entity) {
+        if (!gui.BeginDragDropTarget())
             return;
-        ImGuiPayloadPtr payload = ImGui.AcceptDragDropPayload(AssetBrowserPanel.DragType);
-        if (!payload.IsNull && payload.Data != null) {
-            string text = System.Runtime.InteropServices.Marshal.PtrToStringAnsi((IntPtr)payload.Data, payload.DataSize);
+        string text = gui.AcceptDragDropPayloadString(AssetBrowserPanel.DragType);
+        if (text is not null) {
             // Resolve the addable script types FIRST (pure read), so the structural snapshot is taken
             // exactly once before any AddComponent -- byte-identical to the old lazy `pushed` flag, but
             // the snapshot+mutate stay atomic inside EditorCommands.Structural.
@@ -688,22 +696,22 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                     state.MarkViewportDirty();
                 });
         }
-        ImGui.EndDragDropTarget();
+        gui.EndDragDropTarget();
     }
 
     // Unity-style Tag + Layer row under the entity header. Both are entity state serialized in the
     // scene, so edits push a scene undo and mark the viewport dirty. Tag options come from TagManager;
     // Layer options from LayerManager.DefinedLayers() (named layers only).
     void DrawTagLayerRow(Entity entity) {
-        ImGui.Spacing();
-        float half = (ImGui.GetContentRegionAvail().X - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
+        gui.Spacing();
+        float half = (gui.ContentRegionAvail.X - gui.ItemSpacing.X) * 0.5f;
 
         // Tag combo.
-        ImGui.SetNextItemWidth(half);
+        gui.SetNextItemWidth(half);
         string currentTag = string.IsNullOrEmpty(entity.Tag) ? TagManager.Untagged : entity.Tag;
-        if (ImGui.BeginCombo("##tag", $"{EditorIcons.Pin} {currentTag}")) {
+        if (gui.BeginCombo("##tag", $"{EditorIcons.Pin} {currentTag}")) {
             foreach (string tag in TagManager.Tags) {
-                if (ImGui.Selectable(tag, tag == currentTag) && tag != entity.Tag) {
+                if (gui.Selectable(tag, tag == currentTag) && tag != entity.Tag) {
                     EditorCommands.EditEntity(entity, "Change Tag", () => {
                         entity.Tag = tag;
                         state.MarkViewportDirty();
@@ -713,21 +721,21 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             // EF7: "Add Tag…" at the bottom opens the Tags & Layers project window (where tags are
             // defined). New tags persist in TagManager and appear in this dropdown next frame. Routed
             // through the EditorWindows facade so the inspector needs no reference to the window/app.
-            ImGui.Separator();
-            if (ImGui.Selectable($"{EditorIcons.Add} Add Tag..."))
+            gui.Separator();
+            if (gui.Selectable($"{EditorIcons.Add} Add Tag..."))
                 EditorWindows.Open(EditorMenus.WindowKeys.TagsLayers);
-            ImGui.EndCombo();
+            gui.EndCombo();
         }
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Tag");
+        if (gui.IsItemHovered()) gui.Tooltip("Tag");
 
-        ImGui.SameLine();
+        gui.SameLine();
 
         // Layer combo (named layers only).
-        ImGui.SetNextItemWidth(half);
+        gui.SetNextItemWidth(half);
         string currentLayerName = LayerManager.NameOf(entity.Layer);
-        if (ImGui.BeginCombo("##layer", $"{EditorIcons.Grid} {currentLayerName}")) {
+        if (gui.BeginCombo("##layer", $"{EditorIcons.Grid} {currentLayerName}")) {
             foreach ((int index, string name) in LayerManager.DefinedLayers()) {
-                if (ImGui.Selectable($"{index}: {name}", index == entity.Layer) && index != entity.Layer) {
+                if (gui.Selectable($"{index}: {name}", index == entity.Layer) && index != entity.Layer) {
                     EditorCommands.EditEntity(entity, "Change Layer", () => {
                         entity.Layer = index;
                         state.MarkViewportDirty();
@@ -736,12 +744,12 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             }
             // EF7: "Add Layer…" opens the same Tags & Layers window (layers are named there); a newly
             // named layer shows up in this dropdown next frame via LayerManager.DefinedLayers().
-            ImGui.Separator();
-            if (ImGui.Selectable($"{EditorIcons.Add} Add Layer..."))
+            gui.Separator();
+            if (gui.Selectable($"{EditorIcons.Add} Add Layer..."))
                 EditorWindows.Open(EditorMenus.WindowKeys.TagsLayers);
-            ImGui.EndCombo();
+            gui.EndCombo();
         }
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Layer");
+        if (gui.IsItemHovered()) gui.Tooltip("Layer");
     }
 
     void DrawTransform(Transform transform) {
@@ -754,10 +762,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         bool rotOv = PrefabOverrides.IsOverridden(PrefabOverrides.TransformRotationKey);
         bool sclOv = PrefabOverrides.IsOverridden(PrefabOverrides.TransformScaleKey);
         if (posOv || rotOv || sclOv) {
-            SysVec2 hp = ImGui.GetItemRectMax();
-            ImGui.GetWindowDrawList().AddCircleFilled(
-                new SysVec2(hp.X - 12, (ImGui.GetItemRectMin().Y + hp.Y) * 0.5f), 3.5f,
-                ImGui.GetColorU32(EditorTheme.PrefabBlue));
+            SysVec2 hp = gui.ItemRectMax;
+            gui.WindowDrawList.AddCircleFilled(
+                new SysVec2(hp.X - 12, (gui.ItemRectMin.Y + hp.Y) * 0.5f), 3.5f,
+                gui.ColorU32(EditorTheme.PrefabBlue));
         }
 
         // The other selected entities' transforms, if this is a multi-selection — edits apply to all
@@ -766,20 +774,20 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         var others = MultiTransforms(transform);
 
         // Right-click the header for Unity-style resets (apply to the whole selection).
-        if (ImGui.BeginPopupContextItem("##transformctx")) {
+        if (gui.BeginPopupContextItem("##transformctx")) {
             // These reset the WHOLE multi-selection (transform + every `others`), so they stay a
             // whole-scene structural snapshot (not a single-entity EditEntity).
-            if (ImGui.MenuItem("Reset Position")) EditorCommands.Structural("Reset Position", () => { transform.Position = Vector3.Zero; foreach (Transform o in others) o.Position = Vector3.Zero; });
-            if (ImGui.MenuItem("Reset Rotation")) EditorCommands.Structural("Reset Rotation", () => { transform.EulerAngles = Vector3.Zero; foreach (Transform o in others) o.EulerAngles = Vector3.Zero; });
-            if (ImGui.MenuItem("Reset Scale")) EditorCommands.Structural("Reset Scale", () => { transform.Scale = Vector3.One; foreach (Transform o in others) o.Scale = Vector3.One; });
-            ImGui.Separator();
-            if (ImGui.MenuItem("Reset All")) {
+            if (gui.MenuItem("Reset Position")) EditorCommands.Structural("Reset Position", () => { transform.Position = Vector3.Zero; foreach (Transform o in others) o.Position = Vector3.Zero; });
+            if (gui.MenuItem("Reset Rotation")) EditorCommands.Structural("Reset Rotation", () => { transform.EulerAngles = Vector3.Zero; foreach (Transform o in others) o.EulerAngles = Vector3.Zero; });
+            if (gui.MenuItem("Reset Scale")) EditorCommands.Structural("Reset Scale", () => { transform.Scale = Vector3.One; foreach (Transform o in others) o.Scale = Vector3.One; });
+            gui.Separator();
+            if (gui.MenuItem("Reset All")) {
                 EditorCommands.Structural("Reset Transform", () => {
                     transform.Position = Vector3.Zero; transform.EulerAngles = Vector3.Zero; transform.Scale = Vector3.One;
                     foreach (Transform o in others) { o.Position = Vector3.Zero; o.EulerAngles = Vector3.Zero; o.Scale = Vector3.One; }
                 });
             }
-            ImGui.EndPopup();
+            gui.EndPopup();
         }
 
         if (!open)
@@ -805,10 +813,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                 Vector3 d = v - transform.Scale; transform.Scale = v;
                 foreach (Transform o in others) o.Scale += d;
             }, 0.05f, allowUniformLock: true);
-            ImGui.EndTable();
+            gui.EndTable();
         }
 
-        ImGui.Spacing();
+        gui.Spacing();
     }
 
     // The transforms of the OTHER selected entities (everything except `active`), when more than one
@@ -825,28 +833,38 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
     // Framed header with an accent stripe and a bold label, no enable checkbox (Transform).
     static unsafe bool PlainHeader(string label) {
-        ImGui.Spacing();
-        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new SysVec2(10, 7));
-        float labelX = ImGui.GetTreeNodeToLabelSpacing();
-        bool open = ImGui.CollapsingHeader($"###hdr_{label}",
-            ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.Framed);
-        ImGui.PopStyleVar();
+        gui.Spacing();
+        gui.PushFramePadding(new SysVec2(10, 7));
+        float labelX = gui.TreeNodeToLabelSpacing;
+        bool open = gui.CollapsingHeaderFramed($"###hdr_{label}");
+        gui.PopStyleVar();
 
-        SysVec2 min = ImGui.GetItemRectMin();
-        SysVec2 max = ImGui.GetItemRectMax();
-        var draw = ImGui.GetWindowDrawList();
+        SysVec2 min = gui.ItemRectMin;
+        SysVec2 max = gui.ItemRectMax;
+        var draw = gui.WindowDrawList;
         // RW4: the accent stripe goes through the shared decoration primitive (same 3px geometry), keeping
         // the CheckMark accent color this header has always used.
-        EditorDecoration.DrawAccentStripe(min, max.Y - min.Y, ImGui.GetStyle().Colors[(int)ImGuiCol.CheckMark]);
-        draw.AddText(ImGuiController.Bold, ImGui.GetFontSize(),
-            new SysVec2(min.X + labelX, min.Y + (max.Y - min.Y - ImGui.GetFontSize()) * 0.5f),
-            ImGui.GetColorU32(ImGuiCol.Text), label);
+        EditorDecoration.DrawAccentStripe(min, max.Y - min.Y, gui.StyleColor(EditorStyleColor.CheckMark));
+        draw.AddText(EditorFont.Bold, gui.FontSize,
+            new SysVec2(min.X + labelX, min.Y + (max.Y - min.Y - gui.FontSize) * 0.5f),
+            gui.ColorU32(gui.StyleColor(EditorStyleColor.Text)), label);
         return open;
     }
 
-    void DrawComponent(Entity entity, Behaviour behaviour, int typeIndex = 0) {
+    void DrawComponent(Entity entity, Behaviour behaviour, int typeIndex = 0, int componentOrdinal = 0) {
         Type type = behaviour.GetType();
-        ImGui.PushID(behaviour.InstanceId.GetHashCode());
+        gui.PushId(behaviour.InstanceId.GetHashCode());
+
+        // Component-level background banding: paint each component's WHOLE body (header + members) in an
+        // alternating tint so adjacent components separate as blocks (the grouping the user asked for),
+        // replacing the per-row zebra. Immediate mode can't draw behind content we haven't laid out yet,
+        // so split the window draw list: content goes on channel 1, and after we know the body's height we
+        // fill the band on channel 0 (behind it), then merge. The bands are a hair lighter/darker than the
+        // panel so they read as "two close tones", not stripes.
+        var draw = gui.WindowDrawList;
+        draw.ChannelsSplit(2);
+        draw.ChannelsSetCurrent(1);
+        SysVec2 bandStart = gui.CursorScreenPos;
 
         bool enabled = behaviour.IsEnabled;
         bool open = ComponentHeader(Prettify(type.Name), type, ref enabled, out bool menuRequested);
@@ -854,10 +872,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         // Prefab override badge on the component header: a blue dot if ANY member of this component
         // (matched by registry name + type-index) differs from the prefab definition.
         if (entity.IsPrefabInstance && ComponentHasOverride(behaviour, typeIndex)) {
-            SysVec2 mx = ImGui.GetItemRectMax();
-            ImGui.GetWindowDrawList().AddCircleFilled(
-                new SysVec2(mx.X - 30, (ImGui.GetItemRectMin().Y + mx.Y) * 0.5f), 3.5f,
-                ImGui.GetColorU32(EditorTheme.PrefabBlue));
+            SysVec2 mx = gui.ItemRectMax;
+            gui.WindowDrawList.AddCircleFilled(
+                new SysVec2(mx.X - 30, (gui.ItemRectMin.Y + mx.Y) * 0.5f), 3.5f,
+                gui.ColorU32(EditorTheme.PrefabBlue));
         }
         if (enabled != behaviour.IsEnabled) {
             // Toggle propagates to the matching component on every selected entity (multi-select), so
@@ -871,31 +889,31 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         }
 
         if (menuRequested)
-            ImGui.OpenPopup("##componentctx");
+            gui.OpenPopup("##componentctx");
 
         var removeClicked = false;
-        if (ImGui.BeginPopup("##componentctx")) {
+        if (gui.BeginPopup("##componentctx")) {
             int index = entity.Behaviours.IndexOf(behaviour);
-            ImGui.BeginDisabled(index <= 0);
-            if (ImGui.MenuItem($"{EditorIcons.ChevronRight}  Move Up")) MoveComponent(entity, behaviour, -1);
-            ImGui.EndDisabled();
-            ImGui.BeginDisabled(index < 0 || index >= entity.Behaviours.Count - 1);
-            if (ImGui.MenuItem($"{EditorIcons.ChevronRight}  Move Down")) MoveComponent(entity, behaviour, +1);
-            ImGui.EndDisabled();
-            ImGui.Separator();
-            if (ImGui.MenuItem($"{EditorIcons.Refresh}  Reset")) ResetComponent(behaviour);
-            if (ImGui.MenuItem($"{EditorIcons.Document}  Copy Component")) CopyComponent(behaviour);
-            ImGui.BeginDisabled(!CanPasteInto(type));
-            if (ImGui.MenuItem($"{EditorIcons.Add}  Paste Component Values")) PasteComponent(behaviour);
-            ImGui.EndDisabled();
+            gui.BeginDisabled(index <= 0);
+            if (gui.MenuItem($"{EditorIcons.ChevronRight}  Move Up")) MoveComponent(entity, behaviour, -1);
+            gui.EndDisabled();
+            gui.BeginDisabled(index < 0 || index >= entity.Behaviours.Count - 1);
+            if (gui.MenuItem($"{EditorIcons.ChevronRight}  Move Down")) MoveComponent(entity, behaviour, +1);
+            gui.EndDisabled();
+            gui.Separator();
+            if (gui.MenuItem($"{EditorIcons.Refresh}  Reset")) ResetComponent(behaviour);
+            if (gui.MenuItem($"{EditorIcons.Document}  Copy Component")) CopyComponent(behaviour);
+            gui.BeginDisabled(!CanPasteInto(type));
+            if (gui.MenuItem($"{EditorIcons.Add}  Paste Component Values")) PasteComponent(behaviour);
+            gui.EndDisabled();
 
             // [ContextMenu] methods (Unity's): each parameterless [ContextMenu]-marked method shows
             // here and runs on click, ScriptGuard-protected so a throwing one can't take the editor down.
             bool firstCtx = true;
             foreach (MethodInfo ctxMethod in ComponentReflection.InspectorContextMenus(type)) {
-                if (firstCtx) { ImGui.Separator(); firstCtx = false; }
+                if (firstCtx) { gui.Separator(); firstCtx = false; }
                 string ctxLabel = ctxMethod.GetCustomAttribute<ContextMenuAttribute>()?.Label ?? Prettify(ctxMethod.Name);
-                if (ImGui.MenuItem($"{EditorIcons.Wrench}  {ctxLabel}")) {
+                if (gui.MenuItem($"{EditorIcons.Wrench}  {ctxLabel}")) {
                     EditorCommands.EditEntity(entity, ctxLabel, () => {
                         try { ctxMethod.Invoke(behaviour, null); }
                         catch (Exception ex) { Debugging.LogError($"[ContextMenu] '{ctxLabel}' threw: {ex.InnerException?.Message ?? ex.Message}"); }
@@ -907,14 +925,14 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             // Edit Script — for game-script components (compiled into GameScripts.dll), open the
             // backing .cs in the OS's default C# editor (item 9). Engine components have no source file.
             if (IsGameScript(type)) {
-                ImGui.Separator();
-                if (ImGui.MenuItem($"{EditorIcons.Code}  Edit Script"))
+                gui.Separator();
+                if (gui.MenuItem($"{EditorIcons.Code}  Edit Script"))
                     OpenComponentScript(type);
             }
 
-            ImGui.Separator();
-            if (ImGui.MenuItem($"{EditorIcons.Delete}  Remove Component")) removeClicked = true;
-            ImGui.EndPopup();
+            gui.Separator();
+            if (gui.MenuItem($"{EditorIcons.Delete}  Remove Component")) removeClicked = true;
+            gui.EndPopup();
         }
 
         if (removeClicked) {
@@ -926,7 +944,8 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                 entity.RemoveComponent(behaviour);
                 state.MarkViewportDirty();
             });
-            ImGui.PopID();
+            draw.ChannelsMerge();   // balance the split before the early-out (component is being removed)
+            gui.PopId();
             return;
         }
 
@@ -942,10 +961,25 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             foreach (var preview in BallisticEngine.Editor.ComponentPreviewRegistry.PreviewsFor(type))
                 preview.Draw(in previewCtx);
 
-            ImGui.Spacing();
+            gui.Spacing();
         }
 
-        ImGui.PopID();
+        // Fill the component's body band behind everything (channel 0), then merge. Span the full panel
+        // width regardless of inner tables. Even/odd ordinal alternates between two close tints so each
+        // component is its own block and the next is a near neighbour, not a hard contrast.
+        float bandEndY = gui.CursorScreenPos.Y;
+        float wx0 = gui.WindowPos.X;
+        float wx1 = wx0 + gui.WindowSize.X;
+        // Every component body gets the SAME card wash so each reads as a distinct raised surface; the
+        // gap between components (Dummy in the draw loop) separates them. Visible enough to actually read
+        // as a card on the dark panel (the previous ~2% was invisible), but still subtle.
+        SysVec4 band = new SysVec4(1f, 1f, 1f, 0.05f);
+        draw.ChannelsSetCurrent(0);
+        draw.AddRectFilled(new SysVec2(wx0, bandStart.Y - 2), new SysVec2(wx1, bandEndY + 4),
+                           gui.ColorU32(band), 6f);
+        draw.ChannelsMerge();
+
+        gui.PopId();
     }
 
     // ---- Component reorder / copy-paste / reset (Unity-style "..." menu) ------
@@ -1053,55 +1087,58 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         menuRequested = false;
         (string icon, SysVec4 tint) = EditorIcons.ForComponentType(type);
 
-        ImGui.Spacing();
-        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new SysVec2(10, 7));
-        float arrowW = ImGui.GetTreeNodeToLabelSpacing();
-        bool open = ImGui.CollapsingHeader($"###cmphdr_{label}",
-            ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.AllowOverlap | ImGuiTreeNodeFlags.Framed);
-        ImGui.PopStyleVar();
-        ImGui.OpenPopupOnItemClick("##componentctx", ImGuiPopupFlags.MouseButtonRight);
+        gui.Spacing();
+        gui.PushFramePadding(new SysVec2(10, 7));
+        float arrowW = gui.TreeNodeToLabelSpacing;
+        bool open = gui.CollapsingHeaderFramedOverlay($"###cmphdr_{label}");
+        gui.PopStyleVar();
+        gui.OpenPopupOnItemClick("##componentctx");
 
-        SysVec2 min = ImGui.GetItemRectMin();
-        SysVec2 max = ImGui.GetItemRectMax();
+        SysVec2 min = gui.ItemRectMin;
+        SysVec2 max = gui.ItemRectMax;
         float headerH = max.Y - min.Y;
-        var draw = ImGui.GetWindowDrawList();
+        var draw = gui.WindowDrawList;
 
         // Category stripe down the left edge. RW4: drawn via the shared EditorDecoration primitive (same
         // 3px geometry as before) so the component-header stripe and any card-with-stripe use ONE source.
         EditorDecoration.DrawAccentStripe(min, headerH, tint);
 
-        SysVec2 cursor = ImGui.GetCursorScreenPos();
+        SysVec2 cursor = gui.CursorScreenPos;
 
-        // Enable checkbox right after the disclosure arrow.
-        float frameH = ImGui.GetFrameHeight();
+        // Enable checkbox right after the disclosure arrow. The global FramePadding is roomy for inputs,
+        // which makes a checkbox (sized FontSize + FramePadding*2) read as oversized in a header — shrink
+        // the padding just for the box so the tick stays proportionate to the title text.
+        gui.PushFramePadding(new SysVec2(2, 2) * EditorTheme.UiScale);
+        float frameH = gui.FrameHeight;
         float chkX = min.X + arrowW;
-        ImGui.SetCursorScreenPos(new SysVec2(chkX, min.Y + (headerH - frameH) * 0.5f));
-        ImGui.Checkbox($"##en_{label}", ref enabled);
+        gui.SetCursorScreenPos(new SysVec2(chkX, min.Y + (headerH - frameH) * 0.5f));
+        gui.Checkbox($"##en_{label}", ref enabled);
+        gui.PopStyleVar();
 
         // Type icon + label after the checkbox. EF5e: the component title uses the larger semantic HEADER
         // font (not body-size Bold) so a component header reads as a real header — the type-scale hierarchy
         // that breaks the "flat wall of same-size text" feel. (Header has icon glyphs merged in, so the icon
         // renders from the same font at the same size and stays baseline-aligned with the label.)
-        float headerFontSize = EditorTheme.Header.FontSize;
+        float headerFontSize = gui.FontSizeOf(EditorFont.Header);
         float textY = min.Y + (headerH - headerFontSize) * 0.5f;
         float iconX = chkX + frameH + 6;
         var dimmed = enabled ? 1f : 0.45f;
-        draw.AddText(EditorTheme.Header, headerFontSize, new SysVec2(iconX, textY),
-            ImGui.GetColorU32(new SysVec4(tint.X, tint.Y, tint.Z, dimmed)), icon);
-        draw.AddText(EditorTheme.Header, headerFontSize,
+        draw.AddText(EditorFont.Header, headerFontSize, new SysVec2(iconX, textY),
+            gui.ColorU32(new SysVec4(tint.X, tint.Y, tint.Z, dimmed)), icon);
+        draw.AddText(EditorFont.Header, headerFontSize,
             new SysVec2(iconX + headerFontSize + 8, textY),
-            ImGui.GetColorU32(enabled ? ImGuiCol.Text : ImGuiCol.TextDisabled), label);
+            gui.ColorU32(gui.StyleColor(enabled ? EditorStyleColor.Text : EditorStyleColor.TextDisabled)), label);
 
         // "..." menu pinned to the right edge.
         float moreW = EditorIcons.SmallButtonWidth(EditorIcons.More);
-        ImGui.SetCursorScreenPos(new SysVec2(max.X - moreW - 6,
-            min.Y + (headerH - ImGui.GetTextLineHeight()) * 0.5f - ImGui.GetStyle().FramePadding.Y * 0.5f + 2));
-        ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+        gui.SetCursorScreenPos(new SysVec2(max.X - moreW - 6,
+            min.Y + (headerH - gui.TextLineHeight) * 0.5f - gui.FramePadding.Y * 0.5f + 2));
+        gui.PushColor(EditorStyleColor.Text, gui.StyleColor(EditorStyleColor.TextDisabled));
         if (EditorIcons.GhostButtonSmall($"more_{label}", EditorIcons.More, "Component menu"))
             menuRequested = true;
-        ImGui.PopStyleColor();
+        gui.PopColor();
 
-        ImGui.SetCursorScreenPos(cursor);
+        gui.SetCursorScreenPos(cursor);
         return open;
     }
 
@@ -1137,7 +1174,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             if (EditorWidgets.SearchField($"##membersearch_{type.Name}", "Search properties...", ref box.Value))
                 state.MarkViewportDirty();
             query = box.Value;
-            ImGui.Spacing();
+            gui.Spacing();
         }
 
         // EF10a — when a query is active, `matches` is the set of members whose DISPLAYED label (the same
@@ -1199,14 +1236,14 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         }
 
         void CloseGrid() {
-            if (gridOpen) { ImGui.EndTable(); gridOpen = false; }
+            if (gridOpen) { gui.EndTable(); gridOpen = false; }
         }
 
         void EndGroup() {
             if (currentGroup is null)
                 return;
             CloseGrid();
-            if (groupOpen) ImGui.TreePop();   // balance the open TreeNodeEx
+            if (groupOpen) gui.TreePop();   // balance the open TreeNodeEx
             currentGroup = null;
             groupOpen = true;
         }
@@ -1233,7 +1270,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             // No query → HeaderVisible always true → byte-identical.
             // A [Space] shows when the member it decorates (or that member's section header) is going to draw,
             // so the gap never orphans above a filtered-out field.
-            if (attrs.Space is not null && (MemberVisible(member) || HeaderVisible(member))) { CloseGrid(); ImGui.Dummy(new SysVec2(0, attrs.Space.Height)); }
+            if (attrs.Space is not null && (MemberVisible(member) || HeaderVisible(member))) { CloseGrid(); gui.Dummy(new SysVec2(0, attrs.Space.Height)); }
             if (attrs.Header is not null && HeaderVisible(member)) { CloseGrid(); EditorDecoration.DrawSectionHeader(attrs.Header.Text); }
 
             // Entering a new foldout group: draw its collapsible header once. When open, the matching
@@ -1241,9 +1278,9 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             // the group is visible under the filter — GroupVisible gated above.)
             if (group is not null && group != currentGroup) {
                 CloseGrid();
-                var flags = attrs.Foldout.DefaultOpen ? ImGuiTreeNodeFlags.DefaultOpen : ImGuiTreeNodeFlags.None;
-                groupOpen = ImGui.TreeNodeEx($"{group}###fold_{type.Name}_{group}",
-                    flags | ImGuiTreeNodeFlags.Framed | ImGuiTreeNodeFlags.SpanAvailWidth);
+                var flags = EditorTreeFlags.Framed | EditorTreeFlags.SpanAvailWidth |
+                    (attrs.Foldout.DefaultOpen ? EditorTreeFlags.DefaultOpen : EditorTreeFlags.None);
+                groupOpen = gui.TreeNodeEx($"{group}###fold_{type.Name}_{group}", flags);
                 currentGroup = group;
             }
 
@@ -1266,7 +1303,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         // self-resetting bool checkboxes for one-shot operations like a probe bake).
         foreach (MethodInfo method in ComponentReflection.InspectorButtons(type)) {
             var label = method.GetCustomAttribute<ButtonAttribute>()?.Label ?? method.Name;
-            if (ImGui.Button($"{label}###btn_{type.Name}_{method.Name}", new SysVec2(-1, 0)))
+            if (gui.Button($"{label}###btn_{type.Name}_{method.Name}", new SysVec2(-1, 0)))
                 method.Invoke(target, null);
         }
 
@@ -1275,10 +1312,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         foreach (MethodInfo method in ComponentReflection.InspectorWindowPoints(type)) {
             var attr = method.GetCustomAttribute<EditorWindowExecutionPointAttribute>();
             string label = attr?.Title ?? $"Open {Prettify(type.Name)} Window";
-            if (ImGui.Button($"{EditorIcons.Maximize}  {label}###win_{type.Name}_{method.Name}", new SysVec2(-1, 0))) {
+            if (gui.Button($"{EditorIcons.Maximize}  {label}###win_{type.Name}_{method.Name}", new SysVec2(-1, 0))) {
                 try { method.Invoke(target, null); }
                 catch (Exception e) { Debugging.LogError($"Editor window method threw: {e.Message}"); }
-                ComponentEditorWindow.Open(target, attr?.Title ?? Prettify(type.Name));
+                ComponentEditorWindow.Show(target, attr?.Title ?? Prettify(type.Name));
             }
         }
     }
@@ -1334,10 +1371,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             if (differs) break;
         }
         if (differs) {
-            ImGui.SameLine(0, 4);
-            ImGui.TextColored(EditorTheme.Warning, "—");
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("Values differ across the selection. Editing sets them all to this value.");
+            gui.SameLine(0, 4);
+            gui.TextColored(EditorTheme.Warning, "—");
+            if (gui.IsItemHovered())
+                gui.Tooltip("Values differ across the selection. Editing sets them all to this value.");
         }
     }
 
@@ -1369,35 +1406,40 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // InspectorUndo.Track (the single static pending slot is safe — only one axis edits at a time).
     static bool AxisVec3(string id, string label, ref SysVec3 v, float speed) {
         float gap = 4;
-        float chipW = MathF.Round(ImGui.GetFontSize() * 0.92f);
-        float cellW = (ImGui.GetContentRegionAvail().X - gap * 2) / 3f;
+        float chipW = MathF.Round(gui.FontSize * 0.92f);
+        float cellW = (gui.ContentRegionAvail.X - gap * 2) / 3f;
         float fieldW = Math.Max(26f, cellW - chipW);
 
         var changed = AxisDrag($"##{id}x", "X", label, EditorIcons.AxisX, ref v.X, speed, chipW, fieldW);
-        ImGui.SameLine(0, gap);
+        gui.SameLine(0, gap);
         changed |= AxisDrag($"##{id}y", "Y", label, EditorIcons.AxisY, ref v.Y, speed, chipW, fieldW);
-        ImGui.SameLine(0, gap);
+        gui.SameLine(0, gap);
         changed |= AxisDrag($"##{id}z", "Z", label, EditorIcons.AxisZ, ref v.Z, speed, chipW, fieldW);
         return changed;
     }
 
     static bool AxisDrag(string id, string letter, string label, SysVec4 color, ref float value,
         float speed, float chipW, float fieldW) {
-        var draw = ImGui.GetWindowDrawList();
-        SysVec2 pos = ImGui.GetCursorScreenPos();
-        float h = ImGui.GetFrameHeight();
-        float rounding = ImGui.GetStyle().FrameRounding;
+        var draw = gui.WindowDrawList;
+        SysVec2 pos = gui.CursorScreenPos;
+        float h = gui.FrameHeight;
+        float rounding = gui.FrameRounding;
 
-        draw.AddRectFilled(pos, pos + new SysVec2(chipW, h), ImGui.GetColorU32(color),
-            rounding, ImDrawFlags.RoundCornersLeft);
-        SysVec2 ts = ImGui.CalcTextSize(letter);
+        // Calmer than a saturated filled chip (which made vector rows read as noisy): a NEUTRAL chip
+        // background (same family as the field) with the axis color carried only by the LETTER. The axis
+        // is still instantly readable, but three bright blocks per row no longer fight the rest of the UI.
+        SysVec4 chipBg = gui.StyleColor(EditorStyleColor.FrameBg);
+        draw.AddRectFilled(pos, pos + new SysVec2(chipW, h),
+            gui.ColorU32(new SysVec4(chipBg.X, chipBg.Y, chipBg.Z, 1f)),
+            rounding, EditorCorner.Left);
+        SysVec2 ts = gui.CalcTextSize(letter);
         draw.AddText(pos + new SysVec2((chipW - ts.X) * 0.5f, (h - ts.Y) * 0.5f),
-            ImGui.GetColorU32(new SysVec4(0.07f, 0.08f, 0.09f, 1f)), letter);
+            gui.ColorU32(color), letter);
 
-        ImGui.Dummy(new SysVec2(chipW, h));
-        ImGui.SameLine(0, 0);
-        ImGui.SetNextItemWidth(fieldW);
-        return InspectorUndo.Track(label, ImGui.DragFloat(id, ref value, speed, 0, 0, "%.2f"));
+        gui.Dummy(new SysVec2(chipW, h));
+        gui.SameLine(0, 0);
+        gui.SetNextItemWidth(fieldW);
+        return InspectorUndo.Track(label, gui.DragFloat(id, ref value, speed, 0, 0, "%.2f"));
     }
 
     // RW1.1: DrawSubMeshMaterials / DrawSubMeshMaterialRow were MOVED into RendererPreview
@@ -1413,10 +1455,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         var hasGuid = asset is not null && AssetDatabase.TryGetAssetGuid(asset, out guid);
 
         if (asset is null) {
-            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
-            if (ImGui.Button($"None  {EditorIcons.ChevronDown}", new SysVec2(-1, 0)))
+            gui.PushColor(EditorStyleColor.Text, gui.StyleColor(EditorStyleColor.TextDisabled));
+            if (gui.Button($"None  {EditorIcons.ChevronDown}", new SysVec2(-1, 0)))
                 OpenPickerFor(member, target, assetType);
-            ImGui.PopStyleColor();
+            gui.PopColor();
             if (AcceptGuidDrop(out Guid d0))
                 AssignAsset(member, target, assetType, d0);
             return;
@@ -1427,16 +1469,16 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         (string icon, _) = EditorIcons.ForAssetExtension(
             path is not null ? Path.GetExtension(path).ToLowerInvariant() : "");
 
-        float pickerW = ImGui.GetFrameHeight() + 6;
-        if (ImGui.Button($"{icon}  {display}", new SysVec2(-pickerW - 4, 0)) && path is not null)
+        float pickerW = gui.FrameHeight + 6;
+        if (gui.Button($"{icon}  {display}", new SysVec2(-pickerW - 4, 0)) && path is not null)
             state.RequestRevealAsset(path); // jump to it in the asset browser, don't swap the inspector
         if (AcceptGuidDrop(out Guid d1))
             AssignAsset(member, target, assetType, d1);
-        if (ImGui.IsItemHovered() && path is not null)
-            ImGui.SetTooltip($"{path}\nClick to reveal in the asset browser.");
+        if (gui.IsItemHovered() && path is not null)
+            gui.Tooltip($"{path}\nClick to reveal in the asset browser.");
 
-        ImGui.SameLine();
-        if (ImGui.Button(EditorIcons.ChevronDown, new SysVec2(pickerW, 0)))
+        gui.SameLine();
+        if (gui.Button(EditorIcons.ChevronDown, new SysVec2(pickerW, 0)))
             OpenPickerFor(member, target, assetType);
         if (AcceptGuidDrop(out Guid d2))
             AssignAsset(member, target, assetType, d2);
@@ -1476,10 +1518,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         bool hasGuid = asset is not null && AssetDatabase.TryGetAssetGuid(asset, out guid);
 
         if (asset is null) {
-            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
-            if (ImGui.Button($"None  {EditorIcons.ChevronDown}", new SysVec2(-1, 0)))
+            gui.PushColor(EditorStyleColor.Text, gui.StyleColor(EditorStyleColor.TextDisabled));
+            if (gui.Button($"None  {EditorIcons.ChevronDown}", new SysVec2(-1, 0)))
                 OpenPickerForProperty(p);
-            ImGui.PopStyleColor();
+            gui.PopColor();
             if (AcceptGuidDrop(out Guid d0))
                 AssignAssetToProperty(p, assetType, d0);
             return;
@@ -1490,16 +1532,16 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         (string icon, _) = EditorIcons.ForAssetExtension(
             path is not null ? Path.GetExtension(path).ToLowerInvariant() : "");
 
-        float pickerW = ImGui.GetFrameHeight() + 6;
-        if (ImGui.Button($"{icon}  {display}", new SysVec2(-pickerW - 4, 0)) && path is not null)
+        float pickerW = gui.FrameHeight + 6;
+        if (gui.Button($"{icon}  {display}", new SysVec2(-pickerW - 4, 0)) && path is not null)
             state.RequestRevealAsset(path);
         if (AcceptGuidDrop(out Guid d1))
             AssignAssetToProperty(p, assetType, d1);
-        if (ImGui.IsItemHovered() && path is not null)
-            ImGui.SetTooltip($"{path}\nClick to reveal in the asset browser.");
+        if (gui.IsItemHovered() && path is not null)
+            gui.Tooltip($"{path}\nClick to reveal in the asset browser.");
 
-        ImGui.SameLine();
-        if (ImGui.Button(EditorIcons.ChevronDown, new SysVec2(pickerW, 0)))
+        gui.SameLine();
+        if (gui.Button(EditorIcons.ChevronDown, new SysVec2(pickerW, 0)))
             OpenPickerForProperty(p);
         if (AcceptGuidDrop(out Guid d2))
             AssignAssetToProperty(p, assetType, d2);
@@ -1529,11 +1571,11 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             string bakedName = AssetDatabase.TryGetAssetGuid(baked, out Guid g)
                 ? Path.GetFileNameWithoutExtension(AssetDatabase.GuidToAssetPath(g))
                 : baked.GetType().Name;
-            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
-            ImGui.TextUnformatted($"{EditorIcons.Color} from mesh: {bakedName}");
-            ImGui.PopStyleColor();
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("Inheriting the material baked into the mesh for this submesh.\nAssign one above to override just this slot.");
+            gui.PushColor(EditorStyleColor.Text, gui.StyleColor(EditorStyleColor.TextDisabled));
+            gui.TextUnformatted($"{EditorIcons.Color} from mesh: {bakedName}");
+            gui.PopColor();
+            if (gui.IsItemHovered())
+                gui.Tooltip("Inheriting the material baked into the mesh for this submesh.\nAssign one above to override just this slot.");
         }
     }
 
@@ -1559,38 +1601,38 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
     // Mini asset-picker window: search + every compatible asset; click to assign.
     void DrawAssetPickerPopup() {
-        float u = ImGui.GetFontSize();
-        ImGui.SetNextWindowSize(new SysVec2(u * 28f, u * 30f), ImGuiCond.Appearing);
-        if (!ImGui.BeginPopup("##assetpicker"))
+        float u = gui.FontSize;
+        gui.SetNextWindowSizeAppearing(new SysVec2(u * 28f, u * 30f));
+        if (!gui.BeginPopup("##assetpicker"))
             return;
 
-        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new SysVec2(8, 6));
+        gui.PushItemSpacing(new SysVec2(8, 6));
 
         // Header: "Select <Type>" in bold + a hint of which extensions qualify.
         string typeName = pickerType is null ? "Asset" : Prettify(pickerType.Name);
-        ImGui.PushFont(ImGuiController.Bold);
-        ImGui.TextUnformatted($"Select {typeName}");
-        ImGui.PopFont();
+        gui.PushFont(EditorFont.Bold);
+        gui.TextUnformatted($"Select {typeName}");
+        gui.PopFont();
 
         string[] extensions = CompatibleExtensions(pickerType);
         if (extensions.Length > 0) {
-            ImGui.SameLine();
-            ImGui.TextDisabled($"({string.Join(" ", extensions)})");
+            gui.SameLine();
+            gui.TextDisabled($"({string.Join(" ", extensions)})");
         }
-        ImGui.Spacing();
+        gui.Spacing();
 
-        if (ImGui.IsWindowAppearing())
-            ImGui.SetKeyboardFocusHere();
-        ImGui.SetNextItemWidth(-1);
-        ImGui.InputTextWithHint("##search", $"{EditorIcons.Search} Search {typeName.ToLowerInvariant()}s...",
+        if (gui.IsWindowAppearing())
+            gui.SetKeyboardFocusHere();
+        gui.SetNextItemWidth(-1);
+        gui.InputTextWithHint("##search", $"{EditorIcons.Search} Search {typeName.ToLowerInvariant()}s...",
             ref pickerSearch, 128);
-        ImGui.Separator();
+        gui.Separator();
 
-        ImGui.BeginChild("##list");
+        gui.BeginChild("##list", default, border: false);
 
         // (None) clears the slot.
-        ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
-        if (ImGui.Selectable($"  (None)", false, ImGuiSelectableFlags.None, new SysVec2(0, ImGui.GetFrameHeight()))) {
+        gui.PushColor(EditorStyleColor.Text, gui.StyleColor(EditorStyleColor.TextDisabled));
+        if (gui.Selectable($"  (None)", false, new SysVec2(0, gui.FrameHeight))) {
             if (pickerProperty is not null) {
                 // G2-editor: property-backed slot (collection element) -> clear via Set (collection write-back,
                 // ApplyMember broadcast) -> whole-scene Structural.
@@ -1603,9 +1645,9 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                     () => ComponentReflection.SetValue(pickerMember, pickerTarget, null));
             }
             state.MarkViewportDirty();
-            ImGui.CloseCurrentPopup();
+            gui.CloseCurrentPopup();
         }
-        ImGui.PopStyleColor();
+        gui.PopColor();
 
         var any = false;
         foreach ((string path, Guid guid) in AssetDatabase.EnumerateAssets()
@@ -1621,30 +1663,29 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
             any = true;
             (string icon, SysVec4 tint) = EditorIcons.ForAssetExtension(ext);
-            bool clicked = ImGui.Selectable($"      {Path.GetFileName(path)}##{guid}", false,
-                ImGuiSelectableFlags.None, new SysVec2(0, ImGui.GetFrameHeight()));
-            SysVec2 rmin = ImGui.GetItemRectMin();
+            bool clicked = gui.Selectable($"      {Path.GetFileName(path)}##{guid}", false, new SysVec2(0, gui.FrameHeight));
+            SysVec2 rmin = gui.ItemRectMin;
             EditorIcons.DrawAt(new SysVec2(rmin.X + 6,
-                rmin.Y + (ImGui.GetFrameHeight() - ImGui.GetTextLineHeight()) * 0.5f), icon, tint);
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip(path);
+                rmin.Y + (gui.FrameHeight - gui.TextLineHeight) * 0.5f), icon, tint);
+            if (gui.IsItemHovered())
+                gui.Tooltip(path);
             if (clicked) {
                 if (pickerProperty is not null)
                     AssignAssetToProperty(pickerProperty, pickerType, guid);  // G2-editor: collection element
                 else
                     AssignAsset(pickerMember, pickerTarget, pickerType, guid);
-                ImGui.CloseCurrentPopup();
+                gui.CloseCurrentPopup();
             }
         }
 
         if (!any)
-            ImGui.TextDisabled(pickerSearch.Length > 0
+            gui.TextDisabled(pickerSearch.Length > 0
                 ? "No matching assets."
                 : $"No {typeName.ToLowerInvariant()} assets in the project.");
 
-        ImGui.EndChild();
-        ImGui.PopStyleVar();
-        ImGui.EndPopup();
+        gui.EndChild();
+        gui.PopStyleVar();
+        gui.EndPopup();
     }
 
     // G1-editor: the interactive scene-object SLOT for an EntityRef / ComponentRef member (the parallel of
@@ -1670,7 +1711,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         SysVec4 iconTint = EditorIcons.TintGeneric;
         if (instanceId == Guid.Empty) {
             label = "None";
-            textCol = ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled];
+            textCol = gui.StyleColor(EditorStyleColor.TextDisabled);
             icon = isComponentRef ? EditorIcons.Wrench : EditorIcons.Package;
         }
         else if (resolved is null) {
@@ -1681,29 +1722,29 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         else if (resolved is Behaviour b) {
             (icon, iconTint) = EditorIcons.ForComponentType(b.GetType());
             label = $"{b.Entity?.Name} ({Prettify(b.GetType().Name)})";
-            textCol = ImGui.GetStyle().Colors[(int)ImGuiCol.Text];
+            textCol = gui.StyleColor(EditorStyleColor.Text);
         }
         else {
             (icon, iconTint) = resolved is Entity ent ? EditorIcons.ForEntity(ent) : (EditorIcons.Package, EditorIcons.TintGeneric);
             label = resolved.Name;
-            textCol = ImGui.GetStyle().Colors[(int)ImGuiCol.Text];
+            textCol = gui.StyleColor(EditorStyleColor.Text);
         }
 
-        float pickerW = ImGui.GetFrameHeight() + 6;
-        ImGui.PushStyleColor(ImGuiCol.Text, textCol);
-        bool clicked = ImGui.Button($"{icon}  {label}", new SysVec2(-pickerW - 4, 0));
-        ImGui.PopStyleColor();
+        float pickerW = gui.FrameHeight + 6;
+        gui.PushColor(EditorStyleColor.Text, textCol);
+        bool clicked = gui.Button($"{icon}  {label}", new SysVec2(-pickerW - 4, 0));
+        gui.PopColor();
         // The main button opens the picker too (no "reveal" action for scene objects -- selecting one would
         // swap the inspector away from the edited entity, which is surprising; click = pick, like None).
         if (clicked)
             OpenSceneRefPickerFor(p);
         if (AcceptEntityDrop(out Entity dropped) && !isComponentRef)
             AssignSceneRef(p, new EntityRef(dropped));
-        else if (resolved is not null && ImGui.IsItemHovered())
-            ImGui.SetTooltip(isComponentRef ? "Click to pick a component." : "Click to pick an entity, or drag a Hierarchy row here.");
+        else if (resolved is not null && gui.IsItemHovered())
+            gui.Tooltip(isComponentRef ? "Click to pick a component." : "Click to pick an entity, or drag a Hierarchy row here.");
 
-        ImGui.SameLine();
-        if (ImGui.Button(EditorIcons.ChevronDown, new SysVec2(pickerW, 0)))
+        gui.SameLine();
+        if (gui.Button(EditorIcons.ChevronDown, new SysVec2(pickerW, 0)))
             OpenSceneRefPickerFor(p);
         if (AcceptEntityDrop(out Entity dropped2) && !isComponentRef)
             AssignSceneRef(p, new EntityRef(dropped2));
@@ -1747,20 +1788,20 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         // Header row inside the value column: item count + a Clear button + an Add button (full row width).
         // Add is right-aligned; Clear sits just left of it (only when the list is non-empty, so an empty list
         // never shows a no-op Clear). Both are structural single-undo edits like Add.
-        ImGui.AlignTextToFramePadding();
-        ImGui.TextDisabled($"{count} item{(count == 1 ? "" : "s")}");
-        float addW = ImGui.GetFrameHeight() + 24;
-        float clearW = count > 0 ? ImGui.GetFrameHeight() + 32 : 0f;
+        gui.AlignTextToFramePadding();
+        gui.TextDisabled($"{count} item{(count == 1 ? "" : "s")}");
+        float addW = gui.FrameHeight + 24;
+        float clearW = count > 0 ? gui.FrameHeight + 32 : 0f;
         float gap = count > 0 ? 6f : 0f;
-        ImGui.SameLine();
-        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + Math.Max(0, ImGui.GetContentRegionAvail().X - addW - clearW - gap));
+        gui.SameLine();
+        gui.CursorPosX = (gui.CursorPosX + Math.Max(0, gui.ContentRegionAvail.X - addW - clearW - gap));
         bool clearClicked = false;
         if (count > 0) {
-            if (ImGui.Button($"{EditorIcons.Delete} Clear##clearcol_{p.Name}", new SysVec2(clearW, 0)))
+            if (gui.Button($"{EditorIcons.Delete} Clear##clearcol_{p.Name}", new SysVec2(clearW, 0)))
                 clearClicked = true;
-            ImGui.SameLine(0, gap);
+            gui.SameLine(0, gap);
         }
-        if (ImGui.Button($"{EditorIcons.Add} Add##addcol_{p.Name}", new SysVec2(addW, 0))) {
+        if (gui.Button($"{EditorIcons.Add} Add##addcol_{p.Name}", new SysVec2(addW, 0))) {
             CollectionAdd(p, collType, elemType, list, isArray);
             return; // structural change: redraw next frame against the new collection (avoids a stale row)
         }
@@ -1777,13 +1818,13 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         // values keep distinct ImGui ids. Structural edits (move/insert/remove) are DEFERRED past the loop so
         // the collection is not mutated mid-iteration (a stale row + redraw next frame, like Add).
         int removeIndex = -1, insertIndex = -1, moveFrom = -1, moveTo = -1;
-        float btnW = ImGui.GetFrameHeight();
+        float btnW = gui.FrameHeight;
         // 4 trailing buttons (up, down, insert, remove) each btnW wide, with 4px gaps.
         float controlsW = btnW * 4 + 4 * 3 + 6;
         for (int i = 0; i < count; i++) {
-            ImGui.PushID(i);
+            gui.PushId(i);
             int captured = i;
-            float elemW = Math.Max(40f, ImGui.GetContentRegionAvail().X - controlsW);
+            float elemW = Math.Max(40f, gui.ContentRegionAvail.X - controlsW);
 
             var elemProp = new Inspector.CollectionElementProperty(
                 $"Element {i}", elemType,
@@ -1791,40 +1832,40 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                 v => CollectionSetElement(p, list, captured, v));
 
             ITypeDrawer drawer = memberRegistry.Resolve(elemType);
-            ImGui.SetNextItemWidth(elemW);
+            gui.SetNextItemWidth(elemW);
             if (drawer is not null) {
                 componentGui.SetUndoLabel($"Edit {p.Label} [{i}]");
                 drawer.Draw(elemProp, componentGui);
             }
             else {
-                ImGui.TextDisabled($"({elemType.Name})"); // no drawer for this element type (e.g. nested struct)
+                gui.TextDisabled($"({elemType.Name})"); // no drawer for this element type (e.g. nested struct)
             }
 
             // Move up (disabled on the first row): swap with the previous element.
-            ImGui.SameLine(0, 6);
-            ImGui.BeginDisabled(captured == 0);
-            if (ImGui.Button($"{EditorIcons.ChevronUp}##up", new SysVec2(btnW, 0))) { moveFrom = captured; moveTo = captured - 1; }
-            ImGui.EndDisabled();
-            if (ImGui.IsItemHovered() && captured > 0) ImGui.SetTooltip("Move up");
+            gui.SameLine(0, 6);
+            gui.BeginDisabled(captured == 0);
+            if (gui.Button($"{EditorIcons.ChevronUp}##up", new SysVec2(btnW, 0))) { moveFrom = captured; moveTo = captured - 1; }
+            gui.EndDisabled();
+            if (gui.IsItemHovered() && captured > 0) gui.Tooltip("Move up");
 
             // Move down (disabled on the last row): swap with the next element.
-            ImGui.SameLine(0, 4);
-            ImGui.BeginDisabled(captured == count - 1);
-            if (ImGui.Button($"{EditorIcons.ChevronDown}##down", new SysVec2(btnW, 0))) { moveFrom = captured; moveTo = captured + 1; }
-            ImGui.EndDisabled();
-            if (ImGui.IsItemHovered() && captured < count - 1) ImGui.SetTooltip("Move down");
+            gui.SameLine(0, 4);
+            gui.BeginDisabled(captured == count - 1);
+            if (gui.Button($"{EditorIcons.ChevronDown}##down", new SysVec2(btnW, 0))) { moveFrom = captured; moveTo = captured + 1; }
+            gui.EndDisabled();
+            if (gui.IsItemHovered() && captured < count - 1) gui.Tooltip("Move down");
 
             // Insert a default element BEFORE this row.
-            ImGui.SameLine(0, 4);
-            if (ImGui.Button($"{EditorIcons.Add}##ins", new SysVec2(btnW, 0))) insertIndex = captured;
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Insert above");
+            gui.SameLine(0, 4);
+            if (gui.Button($"{EditorIcons.Add}##ins", new SysVec2(btnW, 0))) insertIndex = captured;
+            if (gui.IsItemHovered()) gui.Tooltip("Insert above");
 
             // Remove this row.
-            ImGui.SameLine(0, 4);
-            if (ImGui.Button($"{EditorIcons.Delete}##rm", new SysVec2(btnW, 0))) removeIndex = captured;
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Remove");
+            gui.SameLine(0, 4);
+            if (gui.Button($"{EditorIcons.Delete}##rm", new SysVec2(btnW, 0))) removeIndex = captured;
+            if (gui.IsItemHovered()) gui.Tooltip("Remove");
 
-            ImGui.PopID();
+            gui.PopId();
         }
 
         // Apply at most ONE structural change per frame (the buttons are mutually exclusive in practice — a
@@ -1988,12 +2029,12 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         int count = dict?.Count ?? 0;
 
         // Header row inside the value column: entry count + an Add button (full row width split).
-        ImGui.AlignTextToFramePadding();
-        ImGui.TextDisabled($"{count} {(count == 1 ? "entry" : "entries")}");
-        ImGui.SameLine();
-        float addW = ImGui.GetFrameHeight() + 24;
-        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + Math.Max(0, ImGui.GetContentRegionAvail().X - addW));
-        if (ImGui.Button($"{EditorIcons.Add} Add##adddict_{p.Name}", new SysVec2(addW, 0))) {
+        gui.AlignTextToFramePadding();
+        gui.TextDisabled($"{count} {(count == 1 ? "entry" : "entries")}");
+        gui.SameLine();
+        float addW = gui.FrameHeight + 24;
+        gui.CursorPosX = (gui.CursorPosX + Math.Max(0, gui.ContentRegionAvail.X - addW));
+        if (gui.Button($"{EditorIcons.Add} Add##adddict_{p.Name}", new SysVec2(addW, 0))) {
             DictionaryAdd(p, dictType, keyType, valueType, dict);
             return; // structural change: redraw next frame against the new dictionary (avoids a stale row)
         }
@@ -2011,20 +2052,20 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         object removeKey = null;
         bool hasRemove = false;
         for (int i = 0; i < keys.Count; i++) {
-            ImGui.PushID(i);
+            gui.PushId(i);
             object key = keys[i];
-            float removeW = ImGui.GetFrameHeight();
-            float avail = ImGui.GetContentRegionAvail().X;
+            float removeW = gui.FrameHeight;
+            float avail = gui.ContentRegionAvail.X;
             float keyW = Math.Max(40f, avail * 0.4f);
             float valW = Math.Max(40f, avail - keyW - removeW - 12);
 
             // Key: read-only label (Dictionary keys are immutable in this version).
-            ImGui.AlignTextToFramePadding();
-            ImGui.SetNextItemWidth(keyW);
-            ImGui.Text(key?.ToString() ?? "(null)");
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("Dictionary key (read-only)");
-            ImGui.SameLine(0, 6);
+            gui.AlignTextToFramePadding();
+            gui.SetNextItemWidth(keyW);
+            gui.Text(key?.ToString() ?? "(null)");
+            if (gui.IsItemHovered())
+                gui.Tooltip("Dictionary key (read-only)");
+            gui.SameLine(0, 6);
 
             // Value: recursive terminal drawer (a value edit writes dict[key] = v then the whole dict back).
             var valProp = new Inspector.DictionaryValueProperty(
@@ -2033,22 +2074,22 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                 v => DictionarySetValue(p, dict, key, v));
 
             ITypeDrawer drawer = memberRegistry.Resolve(valueType);
-            ImGui.SetNextItemWidth(valW);
+            gui.SetNextItemWidth(valW);
             if (drawer is not null) {
                 componentGui.SetUndoLabel($"Edit {p.Label} [{key}]");
                 drawer.Draw(valProp, componentGui);
             }
             else {
-                ImGui.TextDisabled($"({valueType.Name})"); // no drawer for this value type (e.g. nested struct)
+                gui.TextDisabled($"({valueType.Name})"); // no drawer for this value type (e.g. nested struct)
             }
 
-            ImGui.SameLine(0, 6);
-            if (ImGui.Button($"{EditorIcons.Delete}", new SysVec2(removeW, 0))) {
+            gui.SameLine(0, 6);
+            if (gui.Button($"{EditorIcons.Delete}", new SysVec2(removeW, 0))) {
                 removeKey = key;
                 hasRemove = true;
             }
 
-            ImGui.PopID();
+            gui.PopId();
         }
 
         if (hasRemove)
@@ -2149,10 +2190,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
         string current = actual is null ? "None" : Prettify(actual.Name);
         bool typeChanged = false;
-        ImGui.SetNextItemWidth(-1);
-        if (ImGui.BeginCombo($"##poly_{p.Name}", current)) {
+        gui.SetNextItemWidth(-1);
+        if (gui.BeginCombo($"##poly_{p.Name}", current)) {
             // None
-            if (ImGui.Selectable("None", actual is null) && actual is not null) {
+            if (gui.Selectable("None", actual is null) && actual is not null) {
                 PolymorphicSet(p, null);
                 typeChanged = true;
             }
@@ -2160,14 +2201,14 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             for (int i = 0; i < derived.Count; i++) {
                 Type t = derived[i];
                 bool isSel = t == actual;
-                if (ImGui.Selectable($"{Prettify(t.Name)}##{i}", isSel) && !isSel) {
+                if (gui.Selectable($"{Prettify(t.Name)}##{i}", isSel) && !isSel) {
                     PolymorphicSet(p, Activator.CreateInstance(t));
                     typeChanged = true;
                 }
-                if (ImGui.IsItemHovered())
-                    ImGui.SetTooltip(t.FullName);
+                if (gui.IsItemHovered())
+                    gui.Tooltip(t.FullName);
             }
-            ImGui.EndCombo();
+            gui.EndCombo();
         }
 
         // Structural change this frame: the slot's value is a new instance / null now -- redraw next frame
@@ -2177,8 +2218,8 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
         // A value is set: draw its members in a collapsible foldout (the recursion). The members go in their own
         // nested grid (BeginGrid) so the shared stack's BeginRow (TableNextRow) has an open table to write into.
-        if (ImGui.TreeNodeEx($"{Prettify(actual.Name)}###polybody_{p.Name}",
-                ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.SpanAvailWidth)) {
+        if (gui.TreeNodeEx($"{Prettify(actual.Name)}###polybody_{p.Name}",
+                EditorTreeFlags.DefaultOpen | EditorTreeFlags.SpanAvailWidth)) {
             object boundInstance = instance; // capture for the per-member apply delegates
             // EF16: draw the body grid one depth deeper with the TreeNode's full indent cancelled + a
             // fixed-width label column, so the value boxes keep full width at every nesting level.
@@ -2202,10 +2243,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                             state.MarkViewportDirty();
                         }), componentGui);
                 }
-                ImGui.EndTable();
+                gui.EndTable();
             }
             });
-            ImGui.TreePop();
+            gui.TreePop();
         }
     }
 
@@ -2250,7 +2291,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             } else {
                 object created;
                 try { created = Activator.CreateInstance(declaredType); }
-                catch { ImGui.TextDisabled($"({Prettify(declaredType.Name)})"); return; }
+                catch { gui.TextDisabled($"({Prettify(declaredType.Name)})"); return; }
                 // p.Set routes through ApplyMember (multi-select broadcast) -> whole-scene Structural.
                 EditorCommands.Structural($"Set {p.Label}", () => {
                     p.Set(created);             // structural change: the member is no longer null
@@ -2263,8 +2304,8 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         Type actual = instance.GetType();
         // Draw the instance's members in a collapsible foldout (the recursion). The members go in their own
         // nested grid so the shared stack's BeginRow (TableNextRow) has an open table to write into.
-        if (ImGui.TreeNodeEx($"{Prettify(declaredType.Name)}###nestedbody_{p.Name}",
-                ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.SpanAvailWidth)) {
+        if (gui.TreeNodeEx($"{Prettify(declaredType.Name)}###nestedbody_{p.Name}",
+                EditorTreeFlags.DefaultOpen | EditorTreeFlags.SpanAvailWidth)) {
             object boundInstance = instance;    // capture for the per-member apply delegates (boxed for a struct)
             // EF16: body grid drawn one depth deeper with the TreeNode's full indent cancelled + fixed-width
             // label column, so the value boxes keep full width at every nesting level (see DrawNestedBody).
@@ -2282,27 +2323,25 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                             state.MarkViewportDirty();
                         }), componentGui);
                 }
-                ImGui.EndTable();
+                gui.EndTable();
             }
             });
-            ImGui.TreePop();
+            gui.TreePop();
         }
     }
 
     // Accepts a Hierarchy entity-drag payload (int = entity InstanceId hash, set by HierarchyPanel's
     // EntityDragType source) onto the current item and resolves it back to the live entity. Mirrors
     // BEventEditor.AcceptEntityDrop exactly so the drag-onto-slot UX matches the event editor.
-    static unsafe bool AcceptEntityDrop(out Entity entity) {
+    static bool AcceptEntityDrop(out Entity entity) {
         entity = null;
-        if (!ImGui.BeginDragDropTarget())
+        if (!gui.BeginDragDropTarget())
             return false;
-        ImGuiPayloadPtr payload = ImGui.AcceptDragDropPayload("BALLISTIC_ENTITY");
-        if (!payload.IsNull && payload.Data != null) {
-            int hash = *(int*)payload.Data;
+        if (gui.AcceptDragDropPayloadInt("BALLISTIC_ENTITY") is { } hash) {
             foreach (Entity e in SceneManager.GetCurrentScene().Entities)
                 if (e.InstanceId.GetHashCode() == hash) { entity = e; break; }
         }
-        ImGui.EndDragDropTarget();
+        gui.EndDragDropTarget();
         return entity is not null;
     }
 
@@ -2310,39 +2349,39 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // entity (ComponentRef); click to assign, (None) clears. The parallel of DrawAssetPickerPopup, but over
     // the live scene (SceneManager.GetCurrentScene().Entities) instead of the AssetDatabase.
     void DrawSceneObjectPickerPopup() {
-        float u = ImGui.GetFontSize();
-        ImGui.SetNextWindowSize(new SysVec2(u * 28f, u * 30f), ImGuiCond.Appearing);
-        if (!ImGui.BeginPopup("##scenerefpicker"))
+        float u = gui.FontSize;
+        gui.SetNextWindowSizeAppearing(new SysVec2(u * 28f, u * 30f));
+        if (!gui.BeginPopup("##scenerefpicker"))
             return;
 
-        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new SysVec2(8, 6));
+        gui.PushItemSpacing(new SysVec2(8, 6));
 
         Inspector.IProperty p = sceneRefPickerProperty;
         bool isComponentRef = p is not null && p.ValueType == typeof(ComponentRef);
         string typeName = isComponentRef ? "Component" : "Entity";
 
-        ImGui.PushFont(ImGuiController.Bold);
-        ImGui.TextUnformatted($"Select {typeName}");
-        ImGui.PopFont();
-        ImGui.Spacing();
+        gui.PushFont(EditorFont.Bold);
+        gui.TextUnformatted($"Select {typeName}");
+        gui.PopFont();
+        gui.Spacing();
 
-        if (ImGui.IsWindowAppearing())
-            ImGui.SetKeyboardFocusHere();
-        ImGui.SetNextItemWidth(-1);
-        ImGui.InputTextWithHint("##search", $"{EditorIcons.Search} Search {typeName.ToLowerInvariant()}s...",
+        if (gui.IsWindowAppearing())
+            gui.SetKeyboardFocusHere();
+        gui.SetNextItemWidth(-1);
+        gui.InputTextWithHint("##search", $"{EditorIcons.Search} Search {typeName.ToLowerInvariant()}s...",
             ref sceneRefSearch, 128);
-        ImGui.Separator();
+        gui.Separator();
 
-        ImGui.BeginChild("##list");
+        gui.BeginChild("##list", default, border: false);
 
         // (None) clears the slot to the default (Guid.Empty) ref.
-        ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
-        if (ImGui.Selectable("  (None)", false, ImGuiSelectableFlags.None, new SysVec2(0, ImGui.GetFrameHeight()))) {
+        gui.PushColor(EditorStyleColor.Text, gui.StyleColor(EditorStyleColor.TextDisabled));
+        if (gui.Selectable("  (None)", false, new SysVec2(0, gui.FrameHeight))) {
             if (p is not null)
                 AssignSceneRef(p, isComponentRef ? (object)ComponentRef.None : EntityRef.None);
-            ImGui.CloseCurrentPopup();
+            gui.CloseCurrentPopup();
         }
-        ImGui.PopStyleColor();
+        gui.PopColor();
 
         var any = false;
         if (p is not null) {
@@ -2356,7 +2395,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                     (string icon, SysVec4 tint) = EditorIcons.ForEntity(e);
                     if (SceneRefRow(icon, tint, e.Name, e.InstanceId)) {
                         AssignSceneRef(p, new EntityRef(e));
-                        ImGui.CloseCurrentPopup();
+                        gui.CloseCurrentPopup();
                     }
                 }
                 else {
@@ -2370,7 +2409,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                         (string icon, SysVec4 tint) = EditorIcons.ForComponentType(b.GetType());
                         if (SceneRefRow(icon, tint, rowName, b.InstanceId)) {
                             AssignSceneRef(p, new ComponentRef(b));
-                            ImGui.CloseCurrentPopup();
+                            gui.CloseCurrentPopup();
                         }
                     }
                 }
@@ -2378,13 +2417,13 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         }
 
         if (!any)
-            ImGui.TextDisabled(sceneRefSearch.Length > 0
+            gui.TextDisabled(sceneRefSearch.Length > 0
                 ? "No matching scene objects."
                 : $"No {typeName.ToLowerInvariant()}s in the scene.");
 
-        ImGui.EndChild();
-        ImGui.PopStyleVar();
-        ImGui.EndPopup();
+        gui.EndChild();
+        gui.PopStyleVar();
+        gui.EndPopup();
     }
 
     bool MatchesSearch(string name) =>
@@ -2392,11 +2431,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
     // One picker row (icon + name), keyed by the target InstanceId so duplicate names stay distinct ids.
     static bool SceneRefRow(string icon, SysVec4 tint, string name, Guid instanceId) {
-        bool clicked = ImGui.Selectable($"      {name}##{instanceId:N}", false,
-            ImGuiSelectableFlags.None, new SysVec2(0, ImGui.GetFrameHeight()));
-        SysVec2 rmin = ImGui.GetItemRectMin();
+        bool clicked = gui.Selectable($"      {name}##{instanceId:N}", false, new SysVec2(0, gui.FrameHeight));
+        SysVec2 rmin = gui.ItemRectMin;
         EditorIcons.DrawAt(new SysVec2(rmin.X + 6,
-            rmin.Y + (ImGui.GetFrameHeight() - ImGui.GetTextLineHeight()) * 0.5f), icon, tint);
+            rmin.Y + (gui.FrameHeight - gui.TextLineHeight) * 0.5f), icon, tint);
         return clicked;
     }
 
@@ -2430,20 +2468,20 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
     // Centered accent-tinted Add Component button with a searchable popup, Unity-style.
     void DrawAddComponent(Entity entity) {
-        float avail = ImGui.GetContentRegionAvail().X;
+        float avail = gui.ContentRegionAvail.X;
         float w = Math.Clamp(avail * 0.72f, 180f, 320f);
-        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (avail - w) * 0.5f);
+        gui.CursorPosX = (gui.CursorPosX + (avail - w) * 0.5f);
 
-        SysVec4 accent = ImGui.GetStyle().Colors[(int)ImGuiCol.CheckMark];
-        ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(accent.X, accent.Y, accent.Z, 0.16f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(accent.X, accent.Y, accent.Z, 0.30f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new SysVec4(accent.X, accent.Y, accent.Z, 0.42f));
-        var clicked = ImGui.Button($"{EditorIcons.Add}  Add Component", new SysVec2(w, 0));
-        ImGui.PopStyleColor(3);
+        SysVec4 accent = gui.StyleColor(EditorStyleColor.CheckMark);
+        gui.PushColor(EditorStyleColor.Button, new SysVec4(accent.X, accent.Y, accent.Z, 0.16f));
+        gui.PushColor(EditorStyleColor.ButtonHovered, new SysVec4(accent.X, accent.Y, accent.Z, 0.30f));
+        gui.PushColor(EditorStyleColor.ButtonActive, new SysVec4(accent.X, accent.Y, accent.Z, 0.42f));
+        var clicked = gui.Button($"{EditorIcons.Add}  Add Component", new SysVec2(w, 0));
+        gui.PopColor(3);
 
         if (clicked) {
             addComponentSearch = "";
-            ImGui.OpenPopup("##addcomponent");
+            gui.OpenPopup("##addcomponent");
         }
 
         DrawAddComponentPopup(entity);
@@ -2454,29 +2492,29 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // Enter adds the top hit. Rows carry the type icon + tint.
     void DrawAddComponentPopup(Entity entity) {
         // Sized off the current font so it scales with DPI/UI-scale without a controller handle.
-        float u = ImGui.GetFontSize();
-        ImGui.SetNextWindowSize(new SysVec2(u * 26f, u * 31f), ImGuiCond.Appearing);
-        if (!ImGui.BeginPopup("##addcomponent"))
+        float u = gui.FontSize;
+        gui.SetNextWindowSizeAppearing(new SysVec2(u * 26f, u * 31f));
+        if (!gui.BeginPopup("##addcomponent"))
             return;
 
-        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new SysVec2(8, 6));
+        gui.PushItemSpacing(new SysVec2(8, 6));
 
         // Header.
-        ImGui.PushFont(ImGuiController.Bold);
-        ImGui.TextUnformatted("Add Component");
-        ImGui.PopFont();
-        ImGui.Spacing();
+        gui.PushFont(EditorFont.Bold);
+        gui.TextUnformatted("Add Component");
+        gui.PopFont();
+        gui.Spacing();
 
-        if (ImGui.IsWindowAppearing())
-            ImGui.SetKeyboardFocusHere();
-        ImGui.SetNextItemWidth(-1);
+        if (gui.IsWindowAppearing())
+            gui.SetKeyboardFocusHere();
+        gui.SetNextItemWidth(-1);
         // NOTE: do NOT use EnterReturnsTrue here — with Hexa's managed ref-string overload that flag
         // defers the buffer write-back until Enter, so live typing wouldn't filter. Detect Enter
         // separately while the field is active.
-        ImGui.InputTextWithHint("##addsearch", $"{EditorIcons.Search} Search components...",
+        gui.InputTextWithHint("##addsearch", $"{EditorIcons.Search} Search components...",
             ref addComponentSearch, 128);
-        bool enter = ImGui.IsItemFocused() && ImGui.IsKeyPressed(ImGuiKey.Enter);
-        ImGui.Separator();
+        bool enter = gui.IsItemFocused() && gui.KeyPressed(EditorGuiKey.Enter);
+        gui.Separator();
 
         bool searching = addComponentSearch.Length > 0;
         bool Matches(ComponentEntry e) =>
@@ -2498,10 +2536,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                 }
                 state.MarkViewportDirty();
             });
-            ImGui.CloseCurrentPopup();
+            gui.CloseCurrentPopup();
         }
 
-        ImGui.BeginChild("##addlist");
+        gui.BeginChild("##addlist", default, border: false);
 
         if (searching) {
             // Flat filtered list; Enter adds the first hit.
@@ -2515,7 +2553,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
                     Add(entry);
             }
             if (!any)
-                ImGui.TextDisabled("No components match.");
+                gui.TextDisabled("No components match.");
             if (enter && first is { } f)
                 Add(f);
         }
@@ -2524,7 +2562,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             foreach (var group in ComponentRegistry.Menu
                          .GroupBy(e => string.IsNullOrEmpty(e.Menu) ? "General" : e.Menu)
                          .OrderBy(g => g.Key == "General" ? "zzz" : g.Key)) {
-                if (!ImGui.CollapsingHeader(group.Key, ImGuiTreeNodeFlags.DefaultOpen))
+                if (!gui.CollapsingHeader(group.Key, defaultOpen: true))
                     continue;
                 foreach (ComponentEntry entry in group)
                     if (AddComponentRow(entry))
@@ -2532,18 +2570,18 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             }
         }
 
-        ImGui.EndChild();
-        ImGui.PopStyleVar();
-        ImGui.EndPopup();
+        gui.EndChild();
+        gui.PopStyleVar();
+        gui.EndPopup();
     }
 
     // One selectable component row: type icon + display name, taller than a default row.
     static bool AddComponentRow(ComponentEntry entry) {
         (string icon, SysVec4 tint) = EditorIcons.ForComponentType(entry.Type);
-        bool clicked = ImGui.Selectable($"      {entry.DisplayName}##add{entry.Type.FullName}",
-            false, ImGuiSelectableFlags.None, new SysVec2(0, ImGui.GetFrameHeight()));
-        SysVec2 min = ImGui.GetItemRectMin();
-        EditorIcons.DrawAt(new SysVec2(min.X + 6, min.Y + (ImGui.GetFrameHeight() - ImGui.GetTextLineHeight()) * 0.5f),
+        bool clicked = gui.Selectable($"      {entry.DisplayName}##add{entry.Type.FullName}",
+            false, new SysVec2(0, gui.FrameHeight));
+        SysVec2 min = gui.ItemRectMin;
+        EditorIcons.DrawAt(new SysVec2(min.X + 6, min.Y + (gui.FrameHeight - gui.TextLineHeight) * 0.5f),
             icon, tint);
         return clicked;
     }
@@ -2556,23 +2594,23 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         var assets = state.SelectedAssets;
 
         // Header.
-        var draw = ImGui.GetWindowDrawList();
-        SysVec2 start = ImGui.GetCursorScreenPos();
+        var draw = gui.WindowDrawList;
+        SysVec2 start = gui.CursorScreenPos;
         float iconSize = 36f;
         if (ImGuiController.HasIcons) {
-            draw.AddText(ImGuiController.LargeIcons, iconSize, start + new SysVec2(0, 2),
-                ImGui.GetColorU32(new SysVec4(0.70f, 0.76f, 0.86f, 1f)), EditorIcons.Document);
-            ImGui.SetCursorScreenPos(start + new SysVec2(iconSize + 10, 0));
+            draw.AddText(EditorFont.LargeIcons, iconSize, start + new SysVec2(0, 2),
+                gui.ColorU32(new SysVec4(0.70f, 0.76f, 0.86f, 1f)), EditorIcons.Document);
+            gui.SetCursorScreenPos(start + new SysVec2(iconSize + 10, 0));
         }
-        ImGui.BeginGroup();
-        draw.AddText(ImGuiController.Bold, ImGui.GetFontSize(), ImGui.GetCursorScreenPos(),
-            ImGui.GetColorU32(ImGuiCol.Text), $"{assets.Count} assets selected");
-        ImGui.Dummy(new SysVec2(0, ImGui.GetTextLineHeight()));
-        ImGui.TextDisabled("Edits below apply to the whole selection.");
-        ImGui.EndGroup();
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
+        gui.BeginGroup();
+        draw.AddText(EditorFont.Bold, gui.FontSize, gui.CursorScreenPos,
+            gui.ColorU32(gui.StyleColor(EditorStyleColor.Text)), $"{assets.Count} assets selected");
+        gui.Dummy(new SysVec2(0, gui.TextLineHeight));
+        gui.TextDisabled("Edits below apply to the whole selection.");
+        gui.EndGroup();
+        gui.Spacing();
+        gui.Separator();
+        gui.Spacing();
 
         // BY-TYPE breakdown instead of a flat file list: "3 Volume", "2 Terrain", ... — and clicking
         // a type row narrows the selection to just that type (Unity-style "select all of a kind").
@@ -2580,24 +2618,24 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             .GroupBy(a => Path.GetExtension(a.Path).ToLowerInvariant())
             .OrderByDescending(g => g.Count())
             .ToList();
-        ImGui.TextDisabled("By type (click to select just that kind):");
-        ImGui.Spacing();
+        gui.TextDisabled("By type (click to select just that kind):");
+        gui.Spacing();
         foreach (var group in byExt) {
             string ext = group.Key;
             (string icon, SysVec4 tint) = EditorIcons.ForAssetExtension(ext);
             string typeName = string.IsNullOrEmpty(ext) ? "File" : ext.TrimStart('.');
             int n = group.Count();
-            ImGui.PushStyleColor(ImGuiCol.Text, tint);
-            ImGui.TextUnformatted(icon);
-            ImGui.PopStyleColor();
-            ImGui.SameLine(0, 6);
-            if (ImGui.Selectable($"{n}  {typeName}{(n == 1 ? "" : "s")}##type{ext}", false)) {
+            gui.PushColor(EditorStyleColor.Text, tint);
+            gui.TextUnformatted(icon);
+            gui.PopColor();
+            gui.SameLine(0, 6);
+            if (gui.Selectable($"{n}  {typeName}{(n == 1 ? "" : "s")}##type{ext}", false)) {
                 var ofType = group.ToList();
                 state.SelectAssets(ofType, ofType[^1]);
             }
         }
 
-        ImGui.Spacing();
+        gui.Spacing();
 
         // Batch texture type — only when every selected asset is an image with a meta file.
         var allmmages = assets.All(a => Path.GetExtension(a.Path).ToLowerInvariant()
@@ -2605,15 +2643,15 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         if (allmmages)
             DrawBatchTextureType(assets);
 
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
+        gui.Spacing();
+        gui.Separator();
+        gui.Spacing();
 
-        ImGui.PushStyleColor(ImGuiCol.Button, EditorTheme.Destructive);
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, EditorTheme.DestructiveHovered);
-        if (ImGui.Button($"{EditorIcons.Delete}  Delete {assets.Count} Assets", new SysVec2(-1, 0)))
+        gui.PushColor(EditorStyleColor.Button, EditorTheme.Destructive);
+        gui.PushColor(EditorStyleColor.ButtonHovered, EditorTheme.DestructiveHovered);
+        if (gui.Button($"{EditorIcons.Delete}  Delete {assets.Count} Assets", new SysVec2(-1, 0)))
             AssetOps.DeleteAssets(state, assets);
-        ImGui.PopStyleColor(2);
+        gui.PopColor(2);
     }
 
     static void DrawBatchTextureType(List<(string Path, Guid Guid)> assets) {
@@ -2634,8 +2672,8 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         Row(mixed ? "Texture Type (mixed)" : "Texture Type");
         string[] names = Enum.GetNames<TextureType>();
         int index = mixed || shared is null ? -1 : Array.IndexOf(names, shared.ToString());
-        ImGui.SetNextItemWidth(-1);
-        if (ImGui.Combo("##batchtextype", ref index, names, names.Length) && index >= 0) {
+        gui.SetNextItemWidth(-1);
+        if (gui.Combo("##batchtextype", ref index, names) && index >= 0) {
             var reimport = new List<Guid>();
             foreach ((string path, Guid guid) in assets) {
                 if (!AssetDatabase.TryGetMeta(guid, out MetaFile meta))
@@ -2650,7 +2688,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
             });
         }
 
-        ImGui.EndTable();
+        gui.EndTable();
     }
 
     // ---- Asset inspector -----------------------------------------------------
@@ -2668,7 +2706,7 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         AssetDatabase.TryGetMeta(guid, out MetaFile meta);
 
         DrawAssetHeader(path, ext, meta);
-        ImGui.Spacing();
+        gui.Spacing();
 
         IAssetInspector inspector = AssetInspectorRegistry.InspectorFor(ext);
         inspector?.Draw(new AssetInspectorContext(this, path, guid, ext, meta));
@@ -2683,27 +2721,27 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // Big type icon + bold file name + dim path/importer lines, divided from the body.
     static unsafe void DrawAssetHeader(string path, string ext, MetaFile meta) {
         (string icon, SysVec4 tint) = EditorIcons.ForAssetExtension(ext);
-        var draw = ImGui.GetWindowDrawList();
-        SysVec2 start = ImGui.GetCursorScreenPos();
+        var draw = gui.WindowDrawList;
+        SysVec2 start = gui.CursorScreenPos;
 
         float iconSize = 36f;
         if (ImGuiController.HasIcons) {
-            draw.AddText(ImGuiController.LargeIcons, iconSize, start + new SysVec2(0, 2),
-                ImGui.GetColorU32(tint), icon);
-            ImGui.SetCursorScreenPos(start + new SysVec2(iconSize + 10, 0));
+            draw.AddText(EditorFont.LargeIcons, iconSize, start + new SysVec2(0, 2),
+                gui.ColorU32(tint), icon);
+            gui.SetCursorScreenPos(start + new SysVec2(iconSize + 10, 0));
         }
 
-        ImGui.BeginGroup();
-        draw.AddText(ImGuiController.Bold, ImGui.GetFontSize(), ImGui.GetCursorScreenPos(),
-            ImGui.GetColorU32(ImGuiCol.Text), Path.GetFileName(path));
-        ImGui.Dummy(new SysVec2(0, ImGui.GetTextLineHeight()));
-        ImGui.TextDisabled(path);
+        gui.BeginGroup();
+        draw.AddText(EditorFont.Bold, gui.FontSize, gui.CursorScreenPos,
+            gui.ColorU32(gui.StyleColor(EditorStyleColor.Text)), Path.GetFileName(path));
+        gui.Dummy(new SysVec2(0, gui.TextLineHeight));
+        gui.TextDisabled(path);
         if (meta is not null)
-            ImGui.TextDisabled(meta.Importer);
-        ImGui.EndGroup();
+            gui.TextDisabled(meta.Importer);
+        gui.EndGroup();
 
-        ImGui.Spacing();
-        ImGui.Separator();
+        gui.Spacing();
+        gui.Separator();
     }
 
     // RW1.4: DrawTextureImportSettings body MOVED into TextureAssetInspector
@@ -2714,21 +2752,20 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // body is byte-identical to the old inline material editor; only its home changed (the [AssetInspector(".mat")]
     // shim now owns the single preview cache the panel field used to).
 
-    internal static unsafe bool AcceptGuidDrop(out Guid guid) {
+    internal static bool AcceptGuidDrop(out Guid guid) {
         guid = Guid.Empty;
-        if (!ImGui.BeginDragDropTarget())
+        if (!gui.BeginDragDropTarget())
             return false;
 
-        ImGuiPayloadPtr payload = ImGui.AcceptDragDropPayload(AssetBrowserPanel.DragType);
         var accepted = false;
-        if (!payload.IsNull && payload.Data != null) {
-            var text = System.Runtime.InteropServices.Marshal.PtrToStringAnsi((IntPtr)payload.Data, payload.DataSize);
+        string text = gui.AcceptDragDropPayloadString(AssetBrowserPanel.DragType);
+        if (text is not null) {
             // Multi-select drags carry several GUIDs separated by ';' — a single slot takes the first.
-            var first = text?.Split(';', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+            var first = text.Split(';', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
             accepted = Guid.TryParse(first, out guid);
         }
 
-        ImGui.EndDragDropTarget();
+        gui.EndDragDropTarget();
         return accepted;
     }
 
@@ -2737,10 +2774,10 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     internal static bool BeginGrid(string id) {
         // PadOuterX keeps the value column off the panel edge; the slight indent (via a leading
         // column) and inner spacing give the rows a calmer, more deliberate rhythm.
-        if (!ImGui.BeginTable(id, 2, ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.PadOuterX))
+        if (!gui.BeginTable(id, 2, EditorTableFlags.SizingStretchProp | EditorTableFlags.PadOuterX))
             return false;
-        ImGui.TableSetupColumn("label", ImGuiTableColumnFlags.WidthStretch, 0.38f);
-        ImGui.TableSetupColumn("value", ImGuiTableColumnFlags.WidthStretch, 0.62f);
+        gui.TableSetupColumn("label", EditorColumnFlags.WidthStretch, 0.38f);
+        gui.TableSetupColumn("value", EditorColumnFlags.WidthStretch, 0.62f);
         ResetRowZebra();   // EF5e: each grid stripes from row 0 so zebra is stable + per-component
         return true;
     }
@@ -2769,15 +2806,15 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // values off-screen"). The top-level proportional BeginGrid (:2459) is untouched → depth-0 byte-identical.
     static bool BeginNestedGrid(string id) {
         float s = EditorTheme.UiScale;
-        float valueLeft = Inspector.InspectorLayout.ValueColumnLeft(ImGui.GetContentRegionAvail().X, s);
+        float valueLeft = Inspector.InspectorLayout.ValueColumnLeft(gui.ContentRegionAvail.X, s);
 
-        if (!ImGui.BeginTable(id, 2, ImGuiTableFlags.SizingFixedFit | ImGuiTableFlags.PadOuterX))
+        if (!gui.BeginTable(id, 2, EditorTableFlags.SizingFixedFit | EditorTableFlags.PadOuterX))
             return false;
         // LabelColumnWidth subtracts the small per-depth label indent so the value field's left edge resolves
         // back to `valueLeft` even though Row/RowWithTooltip indent the label text by DepthIndentTotal.
         float labelW = Inspector.InspectorLayout.LabelColumnWidth(nestDepth, valueLeft, s);
-        ImGui.TableSetupColumn("label", ImGuiTableColumnFlags.WidthFixed, labelW);
-        ImGui.TableSetupColumn("value", ImGuiTableColumnFlags.WidthStretch, 1f);
+        gui.TableSetupColumn("label", EditorColumnFlags.WidthFixed, labelW);
+        gui.TableSetupColumn("value", EditorColumnFlags.WidthStretch, 1f);
         ResetRowZebra();
         return true;
     }
@@ -2789,13 +2826,13 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // never leaves the cursor mis-indented. `nestDepth` is bumped for the duration so the child grid + its
     // row labels resolve their column width / label indent at the correct depth.
     static void DrawNestedBody(Action body) {
-        float indent = ImGui.GetStyle().IndentSpacing;
-        ImGui.Unindent(indent);              // cancel the TreeNode's full per-level indent for the body grid
+        float indent = gui.IndentSpacing;
+        gui.Unindent(indent);              // cancel the TreeNode's full per-level indent for the body grid
         nestDepth++;
         try { body(); }
         finally {
             nestDepth--;
-            ImGui.Indent(indent);
+            gui.Indent(indent);
         }
     }
 
@@ -2807,13 +2844,13 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // RowChrome. ALL member rows route through here (component members via ImGuiComponentGui.BeginRow ->
     // RowWithTooltip, plus every shim Row), so the whole inspector picks up the look in one place.
     internal static void Row(string label) {
-        ImGui.TableNextRow();
+        gui.TableNextRow();
         RowChrome();
-        ImGui.TableSetColumnIndex(0);
-        ImGui.AlignTextToFramePadding();
+        gui.TableSetColumnIndex(0);
+        gui.AlignTextToFramePadding();
         DrawRowLabel(label, null);
-        ImGui.TableSetColumnIndex(1);
-        ImGui.SetNextItemWidth(-1);
+        gui.TableSetColumnIndex(1);
+        gui.SetNextItemWidth(-1);
     }
 
     // EF11: the ONE label-drawing primitive both Row and RowWithTooltip route through. Replaces the old
@@ -2827,30 +2864,30 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     // Depth 0 (top-level + the ComponentPreviews/AssetInspectors shim rows, which never nest) → 0px indent +
     // a label that fits → DrawLabelCell returns the label unchanged → visually equivalent to the old path.
     static void DrawRowLabel(string label, string tooltip) {
-        float columnWidth = ImGui.GetContentRegionAvail().X;
+        float columnWidth = gui.ContentRegionAvail.X;
         Inspector.InspectorLayout.DrawLabelCell(label, nestDepth, columnWidth, EditorTheme.UiScale, tooltip);
     }
 
     // Like Row, but appends a "(?)" marker that shows the tooltip on hover (when one is supplied).
     static void RowWithTooltip(string label, string tooltip) {
-        ImGui.TableNextRow();
+        gui.TableNextRow();
         RowChrome();
-        ImGui.TableSetColumnIndex(0);
-        ImGui.AlignTextToFramePadding();
+        gui.TableSetColumnIndex(0);
+        gui.AlignTextToFramePadding();
         // EF11: the label (with per-depth indent + ellipsis + full-text/[Tooltip] hover) is drawn by the shared
         // DrawLabelCell — including the Unity-style tooltip ON THE LABEL ITSELF (what made [Tooltip] feel
         // "broken" was having to find the tiny "(?)" marker). The "(?)" badge is kept as a redundant affordance.
         DrawRowLabel(label, tooltip);
         if (tooltip is not null) {
-            ImGui.SameLine(0, 4);
-            ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.RowCaption);
-            ImGui.TextUnformatted("(?)");
-            ImGui.PopStyleColor();
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip(tooltip);
+            gui.SameLine(0, 4);
+            gui.PushColor(EditorStyleColor.Text, EditorTheme.RowCaption);
+            gui.TextUnformatted("(?)");
+            gui.PopColor();
+            if (gui.IsItemHovered())
+                gui.Tooltip(tooltip);
         }
-        ImGui.TableSetColumnIndex(1);
-        ImGui.SetNextItemWidth(-1);
+        gui.TableSetColumnIndex(1);
+        gui.SetNextItemWidth(-1);
     }
 
     // RW2 (Phase E, drawer-row affordance): on the CURRENT table row, if the mouse hovers it, paint a faint
@@ -2866,33 +2903,32 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
 
     static void RowChrome() {
         // The row's vertical band: cursor Y at row start .. + a frame height (the row's content height).
-        SysVec2 rowStart = ImGui.GetCursorScreenPos();
-        float rowH = ImGui.GetFrameHeightWithSpacing();
+        SysVec2 rowStart = gui.CursorScreenPos;
+        float rowH = gui.FrameHeightWithSpacing;
         // Full panel content width (the table spans it); use the window inner rect so the band covers both
         // columns regardless of the table's internal split.
-        float x0 = ImGui.GetWindowPos().X;
-        float x1 = x0 + ImGui.GetWindowSize().X;
+        float x0 = gui.WindowPos.X;
+        float x1 = x0 + gui.WindowSize.X;
 
-        // Zebra: every other row gets a faint white wash (alternating bands). Cheap — one TableSetBgColor.
-        bool oddRow = (rowZebraIndex++ & 1) == 1;
-        if (oddRow)
-            ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0,
-                ImGui.GetColorU32(new SysVec4(1f, 1f, 1f, 0.022f)));
+        // Per-row zebra striping was removed — it read as noisy. Component-level background banding
+        // (DrawComponent paints each component's whole body in an alternating tint) gives the grouping
+        // rhythm instead. The counter is kept (harmless) so callers/Reset stay valid.
+        rowZebraIndex++;
 
-        bool hovered = ImGui.IsWindowHovered(ImGuiHoveredFlags.ChildWindows) &&
-                       ImGui.IsMouseHoveringRect(new SysVec2(x0, rowStart.Y),
+        bool hovered = gui.IsWindowHovered() &&
+                       gui.IsMouseHoveringRect(new SysVec2(x0, rowStart.Y),
                                                  new SysVec2(x1, rowStart.Y + rowH), clip: false);
         if (!hovered)
             return;
 
         SysVec4 accent = EditorPrefs.Current.Accent;
-        ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0,
-            ImGui.GetColorU32(EditorTheme.RowHoverFill(accent)));
-        var draw = ImGui.GetWindowDrawList();
+        gui.TableSetRowBgColor(
+            gui.ColorU32(EditorTheme.RowHoverFill(accent)));
+        var draw = gui.WindowDrawList;
         float w = EditorTheme.RowAccentBarWidth;
         draw.AddRectFilled(new SysVec2(x0, rowStart.Y),
                            new SysVec2(x0 + w, rowStart.Y + rowH),
-                           ImGui.GetColorU32(EditorTheme.RowHoverBar(accent)));
+                           gui.ColorU32(EditorTheme.RowHoverBar(accent)));
     }
 
     void SysVec3Row(string label, Vector3 value, Action<Vector3> apply, float speed) =>
@@ -2910,19 +2946,19 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
         // Position/Rotation. Row() already moved us to column 1; hop back to 0, draw the lock, return.
         bool locked = allowUniformLock && uniformLocks.GetValueOrDefault(label);
         if (allowUniformLock) {
-            ImGui.TableSetColumnIndex(0);
+            gui.TableSetColumnIndex(0);
             string icon = locked ? EditorIcons.Lock : EditorIcons.LockOpen;
-            float btn = ImGui.GetFrameHeight();
-            ImGui.SameLine();
-            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - btn);
+            float btn = gui.FrameHeight;
+            gui.SameLine();
+            gui.CursorPosX = (gui.CursorPosX + gui.ContentRegionAvail.X - btn);
             if (EditorIcons.GhostButtonSmall($"ulock_{label}", icon,
                     locked ? "Proportions locked - editing one axis scales the others"
                            : "Lock proportions (uniform scaling)")) {
                 uniformLocks[label] = !locked;
                 locked = !locked;
             }
-            ImGui.TableSetColumnIndex(1);
-            ImGui.SetNextItemWidth(-1);
+            gui.TableSetColumnIndex(1);
+            gui.SetNextItemWidth(-1);
         }
 
         var sv = new SysVec3(value.X, value.Y, value.Z);

@@ -26,6 +26,7 @@ exit += NestedTests.Run();             // G4 -- inserts a scene (no public unloa
 exit += UndoCoverageTests.Run();       // F3 -- undo coverage harness (inserts a scene; engine-only)
 exit += RemoteSchemaTests.Run();       // D2 -- command-port boundary schema validation (no scene; pure)
 exit += McpBoundaryTests.Run();        // D2 -- MCP tool surface <-> RemoteSchema parity (no scene; pure)
+exit += ImGuiBoundaryTests.Run();      // arch guard -- ImGui only in BallisticEngine.Editor (player never sees it)
 exit += SerializerDropTests.Run();   // G0 — runs LAST (inserts a scene with no public unload)
 return exit;
 
