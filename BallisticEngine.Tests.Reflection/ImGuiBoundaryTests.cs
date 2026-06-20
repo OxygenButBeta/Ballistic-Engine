@@ -113,9 +113,7 @@ internal static class ImGuiBoundaryTests {
         "BallisticEngine.Editor/Panels/HierarchyPanel.cs",
         "BallisticEngine.Editor/Panels/AssetBrowserPanel.cs",
         // (ConsolePanel migrated — now draws through the seam's style scope; dropped from the list.)
-        // (VolumeProfileEditor migrated — incl. its custom override header via FramedHeader + item-rect.)
-        // Inline inspector drawer (Phase 7): BEvent.
-        "BallisticEngine.Editor/Panels/BEventEditor.cs",
+        // (VolumeProfileEditor + BEventEditor migrated — BEvent incl. entity/asset drag-drop via the seam.)
         // Viewport overlay — bespoke window flags + pivot positioning; doesn't fit the dockable model (exempt).
         "BallisticEngine.Editor/Panels/StatsPanel.cs",
     };

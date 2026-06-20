@@ -82,7 +82,7 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     // ---- structure ----
     public bool TreeNode(string label) => ImGui.TreeNode(label);
     public void TreePop() => ImGui.TreePop();
-    public bool Selectable(string label, bool selected) => ImGui.Selectable(label, selected);
+    public bool Selectable(string label, bool selected = false) => ImGui.Selectable(label, selected);
     public bool CollapsingHeader(string label) => ImGui.CollapsingHeader(label);
     public bool CollapsingHeader(string label, bool defaultOpen) =>
         ImGui.CollapsingHeader(label, defaultOpen ? ImGuiTreeNodeFlags.DefaultOpen : ImGuiTreeNodeFlags.None);
@@ -91,6 +91,9 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public bool BeginChild(string id, Vector2 size, bool border, bool horizontalScroll) =>
         ImGui.BeginChild(id, size, border ? ImGuiChildFlags.Borders : ImGuiChildFlags.None,
             horizontalScroll ? ImGuiWindowFlags.HorizontalScrollbar : ImGuiWindowFlags.None);
+    public bool BeginChildAutoResizeY(string id, bool border) =>
+        ImGui.BeginChild(id, default,
+            (border ? ImGuiChildFlags.Borders : ImGuiChildFlags.None) | ImGuiChildFlags.AutoResizeY);
     public void EndChild() => ImGui.EndChild();
     public bool BeginCombo(string label, string preview) => ImGui.BeginCombo(label, preview);
     public void EndCombo() => ImGui.EndCombo();
@@ -158,6 +161,24 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public bool IsWindowAppearing() => ImGui.IsWindowAppearing();
     public void SetKeyboardFocusHere() => ImGui.SetKeyboardFocusHere();
     public bool KeyPressed(EditorGuiKey key) => input.KeyPressed(key);
+
+    // ---- drag-drop (targets) ----
+    public bool BeginDragDropTarget() => ImGui.BeginDragDropTarget();
+    public void EndDragDropTarget() => ImGui.EndDragDropTarget();
+
+    public unsafe int? AcceptDragDropPayloadInt(string type) {
+        ImGuiPayloadPtr payload = ImGui.AcceptDragDropPayload(type);
+        if (payload.IsNull || payload.Data == null) return null;
+        return *(int*)payload.Data;
+    }
+
+    public unsafe string AcceptDragDropPayloadString(string type) {
+        ImGuiPayloadPtr payload = ImGui.AcceptDragDropPayload(type);
+        if (payload.IsNull || payload.Data == null) return null;
+        // The asset drag payload is a byte string of payload.DataSize bytes (the asset browser writes it as
+        // ANSI; match PtrToStringAnsi exactly so the GUID-list parsing downstream is byte-identical).
+        return System.Runtime.InteropServices.Marshal.PtrToStringAnsi((IntPtr)payload.Data, payload.DataSize);
+    }
 
     // ---- style scope ----
     public void PushColor(EditorStyleColor which, Vector4 rgba) => ImGui.PushStyleColor(MapColor(which), rgba);

@@ -79,11 +79,12 @@ public interface IEditorGui {
     // ---- structure ----
     bool TreeNode(string label);
     void TreePop();
-    bool Selectable(string label, bool selected);
+    bool Selectable(string label, bool selected = false);
     bool CollapsingHeader(string label);
     bool CollapsingHeader(string label, bool defaultOpen);
     bool BeginChild(string id, Vector2 size, bool border);
     bool BeginChild(string id, Vector2 size, bool border, bool horizontalScroll);
+    bool BeginChildAutoResizeY(string id, bool border);   // card sizes to content height (BEvent listener card)
     void EndChild();
     bool BeginCombo(string label, string preview);
     void EndCombo();
@@ -132,6 +133,17 @@ public interface IEditorGui {
     bool IsWindowAppearing();
     void SetKeyboardFocusHere();
     bool KeyPressed(EditorGuiKey key);               // window-level key (vs gui.Input for canvas surfaces)
+
+    // ---- drag-drop (targets) ----
+    // Call after the widget that should accept a drop. BeginDragDropTarget gates; AcceptPayload* return the
+    // payload value when a matching drag is released over the item (else null). The engine's two payload
+    // shapes: an int hash (entity drag — "BALLISTIC_ENTITY") and a string path (asset drag). Wrap a
+    // Begin/Accept/End trio per target. Sources (BeginDragDropSource) are added when a panel needs to START
+    // a drag — Hierarchy/Assets will extend this in Phase 5.
+    bool BeginDragDropTarget();
+    int? AcceptDragDropPayloadInt(string type);
+    string AcceptDragDropPayloadString(string type);
+    void EndDragDropTarget();
 
     // ---- style scope (push/pop, balanced) ----
     // Lets a window body tint a few widgets (severity colours, filter chips, tighter checkbox padding)
