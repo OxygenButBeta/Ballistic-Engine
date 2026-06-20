@@ -53,6 +53,9 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     // then the skinned result draws through the static GPU-driven path. Root SRV/UAV only (no descriptor heap).
     ID3D12RootSignature skinRootSig;
     ID3D12PipelineState skinPso;
+    // R4 — mesh-shader meshlet pipeline (null unless dev.HasMeshShaders).
+    ID3D12RootSignature meshletRootSig;
+    ID3D12PipelineState meshletPso;
     // Transient skinned out-buffers, keyed by skinned renderer instance, recreated when its vertex count changes.
     // Pos/Normal are float3, Tangent float4 — same layout as the source streams so they're drop-in vertex buffers.
     // GPU-written (UAV) then GPU-read (vertex buffer) the SAME frame; under P0b overlap a frame N+1 reuse can't
@@ -191,6 +194,36 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute,
                 EmbeddedShaderSource.ReadHlsl("SkinCompute.hlsl"), "CSMain", "SkinCompute.hlsl"),
         });
+
+        // --- R4 mesh-shader meshlet pipeline (AS+MS+PS). Root sig: root const b0 (DrawIndex/MeshletBase/Count) +
+        // root SRV t0..t9 (PerDraws, GpuMaterials, Meshlets, Bounds, Verts, Prims, Pos, Normal, UV, Tangent) + CBV
+        // b1 (motion) + CBV b2 (cull planes) + static sampler s0 + the directly-indexed flag (PS reads
+        // ResourceDescriptorHeap for bindless material textures). Built only when HW mesh shaders are available. ---
+        if (dev.HasMeshShaders) {
+            var mp = new System.Collections.Generic.List<RootParameter1> {
+                new(new RootConstants(0, 0, 4), ShaderVisibility.All),   // b0 DrawIndexCB (4 uints)
+            };
+            for (int t = 0; t <= 9; t++)   // t0..t9 root SRVs
+                mp.Add(new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1((uint)t, 0), ShaderVisibility.All));
+            mp.Add(new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.All)); // b1 motion
+            mp.Add(new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(2, 0), ShaderVisibility.All)); // b2 cull
+            var msWrap = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+                Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap, AddressV = TextureAddressMode.Wrap,
+                AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 16, ComparisonFunction = ComparisonFunction.Never,
+                MinLOD = 0, MaxLOD = float.MaxValue,
+            };
+            meshletRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+                new RootSignatureDescription1(
+                    RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
+                    mp.ToArray(), new[] { msWrap })));
+            string mh = EmbeddedShaderSource.ReadHlsl("MeshletGBuffer.hlsl");
+            byte[] asb = Dx12ShaderCompiler.Compile(DxcShaderStage.Amplification, mh, "ASMain", "MeshletGBuffer.hlsl");
+            byte[] msb = Dx12ShaderCompiler.Compile(DxcShaderStage.Mesh, mh, "MSMain", "MeshletGBuffer.hlsl");
+            byte[] psb = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, mh, "PSMain", "MeshletGBuffer.hlsl");
+            meshletPso = Dx12MeshShaderPso.Create(dev.Device, meshletRootSig, asb, msb, psb,
+                RasterizerDescription.CullClockwise, BlendDescription.Opaque, DepthStencilDescription.Default,
+                Dx12GBuffer.ColorFormats, Dx12GBuffer.DepthFormat);
+        }
 
         string cullHlsl = EmbeddedShaderSource.ReadHlsl("GpuCull.hlsl");
         cullPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription {
@@ -545,6 +578,95 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     // the G-buffer MRT + viewport already bound). `frustumPlanes` are the SAME 6 normalized planes the CPU
     // cull uses (from viewProjUnjittered). viewProjUnjittered/view drive the Hi-Z occlusion test. Returns the
     // ExecuteIndirect count for stats.
+    // R4 — cull-planes CB for the meshlet AS shader (b2), N-buffered. Lazily created.
+    ID3D12Resource meshletCullCb; unsafe byte* meshletCullCbMapped; long meshletCullCbStride;
+    unsafe void EnsureMeshletCullCb() {
+        if (meshletCullCb != null) return;
+        meshletCullCbStride = 256;   // 6 float4 planes fit in 96B; 256 for CB alignment
+        meshletCullCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)(meshletCullCbStride * dev.FramesInFlight)), ResourceStates.GenericRead);
+        meshletCullCbMapped = meshletCullCb.Map<byte>(0);
+    }
+
+    public bool MeshletAvailable => meshletPso != null;
+    public long MeshletTris => meshletTris;
+    long meshletTris;
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct MeshletDrawConst { public uint DrawIndex, MeshletBase, MeshletCount, Pad; }
+
+    // R4 — draw `renderers` through the MESH-SHADER meshlet pipeline (one DispatchMesh per submesh; the AS shader
+    // frustum/sphere-culls meshlets). Reuses the bindless material table + cpuPerDraws (PerDraw{Mvp,Model,MatId}).
+    // Shading is byte-identical to GBufferBindless (MeshletGBuffer.PSMain is a verbatim copy). Returns draw count.
+    public unsafe int RenderIntoMeshlet(ID3D12GraphicsCommandList6 cl, List<IStaticMeshRenderer> renderers,
+        Matrix4x4 viewProj, Vector4[] frustumPlanes, ulong motionCbAddress, ref int cpuDrawIndex) {
+        if (meshletPso == null || renderers.Count == 0) return 0;
+        meshletTris = 0;
+        EnsureMeshletCullCb();
+        // Cull-planes CB (b2): the 6 unjittered frustum planes.
+        long cullOff = (long)dev.FrameSlot * meshletCullCbStride;
+        var planesDst = (Vector4*)(meshletCullCbMapped + cullOff);
+        for (int i = 0; i < 6; i++) planesDst[i] = frustumPlanes[i];
+
+        cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);   // ResourceDescriptorHeap[] for bindless materials
+        cl.SetGraphicsRootSignature(meshletRootSig);
+        cl.SetPipelineState(meshletPso);
+        // Root params: 0=root const b0, 1..10=SRV t0..t9, 11=CBV b1 motion, 12=CBV b2 cull.
+        cl.SetGraphicsRootShaderResourceView(1, cpuPerDraws.GPUVirtualAddress + (ulong)(dev.FrameSlot * cpuPerDrawsFrameStride)); // t0 PerDraws
+        cl.SetGraphicsRootShaderResourceView(2, MaterialsGpuAddress);   // t1 GpuMaterials
+        cl.SetGraphicsRootConstantBufferView(11, motionCbAddress);      // b1 motion
+        cl.SetGraphicsRootConstantBufferView(12, meshletCullCb.GPUVirtualAddress + (ulong)cullOff); // b2 cull planes
+
+        int draws = 0;
+        foreach (var r in renderers) {
+            Mesh mesh = r.SharedMesh; if (mesh is null) continue;
+            var pos = mesh.VertexBuffer as Dx12Buffer<GLVector3>;
+            var nrm = mesh.NormalBuffer as Dx12Buffer<GLVector3>;
+            var uv = mesh.UvBuffer as Dx12Buffer<Vector2>;
+            var tan = mesh.TangentBuffer as Dx12Buffer<Vector4>;
+            if (pos?.Resource is null || nrm?.Resource is null || uv?.Resource is null || tan?.Resource is null) continue;
+            Matrix4x4 model = ToNum(r.Transform.WorldMatrix);
+            Matrix4x4 mvp = model * viewProj;
+            int only = r.SubMeshIndex;
+            int sFirst = only >= 0 ? only : 0;
+            int sLast = only >= 0 ? only : mesh.SubMeshes.Length - 1;
+            // Vertex streams bound as root SRVs (t6..t9) once per renderer (same mesh for all its submeshes).
+            cl.SetGraphicsRootShaderResourceView(7, pos.GpuAddress);
+            cl.SetGraphicsRootShaderResourceView(8, nrm.GpuAddress);
+            cl.SetGraphicsRootShaderResourceView(9, uv.GpuAddress);
+            cl.SetGraphicsRootShaderResourceView(10, tan.GpuAddress);
+            for (int s = sFirst; s <= sLast; s++) {
+                if ((uint)s >= (uint)mesh.SubMeshes.Length) break;
+                SubMeshData sub = mesh.SubMeshes[s];
+                if (sub.IndexCount <= 0) continue;
+                Material mat = r.MaterialFor(s);
+                if (mat is null || mat.Transparent) continue;
+                int mid = materialIds.TryGetValue(mat, out int rid) ? rid : ResolveOrRegisterMaterialId(mat);
+                if (mid < 0) continue;
+                if ((uint)cpuDrawIndex >= MaxCpuDraws) break;
+                // PerDraw entry (shared cpuPerDraws buffer).
+                long pdOff = (long)dev.FrameSlot * cpuPerDrawsFrameStride + (long)cpuDrawIndex * perDrawStride;
+                *(PerDraw*)(cpuPerDrawsMapped + pdOff) = new PerDraw {
+                    Mvp = Matrix4x4.Transpose(mvp), Model = Matrix4x4.Transpose(model), MaterialId = (uint)mid,
+                };
+                var ml = Dx12Meshlet.Build(dev, mesh, s);
+                // Per-submesh meshlet SRVs (t2..t5).
+                cl.SetGraphicsRootShaderResourceView(3, ml.Meshlets.GPUVirtualAddress);
+                cl.SetGraphicsRootShaderResourceView(4, ml.Bounds.GPUVirtualAddress);
+                cl.SetGraphicsRootShaderResourceView(5, ml.Verts.GPUVirtualAddress);
+                cl.SetGraphicsRootShaderResourceView(6, ml.Prims.GPUVirtualAddress);
+                // DrawIndexCB b0: { DrawIndex, MeshletBase=0, MeshletCount, pad } — meshlets are per-submesh so base 0.
+                var rc = new MeshletDrawConst { DrawIndex = (uint)cpuDrawIndex, MeshletBase = 0, MeshletCount = (uint)ml.MeshletCount, Pad = 0 };
+                cl.SetGraphicsRoot32BitConstants(0, rc, 0);
+                // One AS threadgroup per 32 meshlets.
+                cl.DispatchMesh((uint)((ml.MeshletCount + 31) / 32), 1, 1);
+                cpuDrawIndex++; draws++;
+                meshletTris += sub.IndexCount / 3;   // pre-cull upper bound (for stats parity with ExecuteIndirect)
+            }
+        }
+        return draws;
+    }
+
     public unsafe int RenderInto(ID3D12GraphicsCommandList4 cl, List<IStaticMeshRenderer> wholeMesh,
                                  Matrix4x4 viewProj, Vector4[] frustumPlanes,
                                  Matrix4x4 viewProjUnjittered, Matrix4x4 view, float near, float far,
@@ -883,5 +1005,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         // R3b compute skinning.
         skinRootSig?.Dispose(); skinPso?.Dispose(); skinCb?.Dispose();
         foreach (var sb in skinnedBuffers.Values) { sb.Pos?.Dispose(); sb.Normal?.Dispose(); sb.Tangent?.Dispose(); }
+        // R4 meshlet pipeline.
+        meshletRootSig?.Dispose(); meshletPso?.Dispose(); meshletCullCb?.Dispose(); Dx12Meshlet.Clear();
     }
 }

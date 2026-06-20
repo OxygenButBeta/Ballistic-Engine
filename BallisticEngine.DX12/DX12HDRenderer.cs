@@ -1152,6 +1152,12 @@ public sealed class DX12HDRenderer : HDRenderer
     bool GpuDrivenSkinned => gpuDrivenSkinnedOn ??=
         Environment.GetEnvironmentVariable("BALLISTIC_DX12_GPUDRIVEN_SKINNED") == "1";
 
+    // R4 opt-in: BALLISTIC_DX12_MESHLETS=1 draws whole-mesh geometry through the mesh-shader meshlet pipeline
+    // (amplification meshlet cull + mesh shader) instead of ExecuteIndirect. Default OFF; requires HW mesh shaders.
+    bool? meshletsOn;
+    bool MeshletsEnabled => meshletsOn ??=
+        Environment.GetEnvironmentVariable("BALLISTIC_DX12_MESHLETS") == "1";
+
     // GI motion harness: per-frame camera yaw (deg) injected in BeginRender so a headless sequence has real motion.
     int motionYawFrame;
     float? motionYawCached;
@@ -1785,9 +1791,28 @@ public sealed class DX12HDRenderer : HDRenderer
             // SubMeshIndex, so split-import children draw only their one submesh.
             if (gpuDrivenOn && gpuDrivenGeometry.Count > 0)
             {
-                draws += gpuDriven.RenderInto(cl, gpuDrivenGeometry, viewProj, frustumPlanes,
-                    viewProjUnjittered, view, CameraNear, CameraFar, motionCb.Gpu);
-                tris += gpuDriven.LastTris;
+                // R4: draw whole-mesh geometry through the mesh-shader meshlet pipeline when enabled + supported.
+                // DispatchMesh needs ID3D12GraphicsCommandList6 (the frame list is a List4 — query the richer
+                // interface). Falls back to ExecuteIndirect when meshlets are off / unavailable / the cast fails.
+                bool drewMeshlet = false;
+                if (MeshletsEnabled && gpuDriven.MeshletAvailable)
+                {
+                    var cl6 = cl.QueryInterfaceOrNull<ID3D12GraphicsCommandList6>();
+                    if (cl6 != null)
+                    {
+                        draws += gpuDriven.RenderIntoMeshlet(cl6, gpuDrivenGeometry, viewProj, frustumPlanes,
+                            motionCb.Gpu, ref cpuDrawIndex);
+                        tris += gpuDriven.MeshletTris;
+                        cl6.Dispose();   // release the queried interface (does not release the underlying list)
+                        drewMeshlet = true;
+                    }
+                }
+                if (!drewMeshlet)
+                {
+                    draws += gpuDriven.RenderInto(cl, gpuDrivenGeometry, viewProj, frustumPlanes,
+                        viewProjUnjittered, view, CameraNear, CameraFar, motionCb.Gpu);
+                    tris += gpuDriven.LastTris;
+                }
             }
         });
 

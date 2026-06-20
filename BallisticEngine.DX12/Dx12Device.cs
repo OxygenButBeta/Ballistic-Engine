@@ -36,6 +36,7 @@ public sealed class Dx12Device : IDisposable {
     // lazy CheckFeatureSupport checks now read this flag. BALLISTIC_DX12_FORCE_NORT=1 reports false even on an
     // RT-capable GPU — the dev-machine A/B door for the no-RT fallback (the dev card has RT, so it won't crash).
     public bool HasHardwareRayTracing { get; }
+    public bool HasMeshShaders { get; }   // R4 — Options7 MeshShaderTier >= Tier1 (gates the meshlet pipeline)
 
     readonly ID3D12CommandAllocator allocator;
     readonly ID3D12GraphicsCommandList4 commandList; // 4 = supports DXR DispatchRays later
@@ -224,6 +225,18 @@ public sealed class Dx12Device : IDisposable {
         HasHardwareRayTracing = rt;
         Console.WriteLine(rt ? "[DX12] Hardware ray tracing: AVAILABLE (DXR Tier 1.0+)"
                              : "[DX12] Hardware ray tracing: NOT available — RayTraced GI/reflections/shadows will use screen-space fallbacks.");
+
+        // R4 — mesh-shader (Options7) capability probe. Gates the meshlet pipeline; absent → the meshlet path is
+        // disabled and geometry stays on ExecuteIndirect (R3a) / classic IA. Best-effort (CheckFeatureSupport can
+        // throw on old runtimes). Tier1 is enough for the amplification+mesh meshlet-cull path.
+        bool ms = false;
+        try {
+            var opt7 = Device.CheckFeatureSupport<FeatureDataD3D12Options7>(Vortice.Direct3D12.Feature.Options7);
+            ms = opt7.MeshShaderTier >= MeshShaderTier.Tier1;
+        } catch { ms = false; }
+        HasMeshShaders = ms;
+        Console.WriteLine(ms ? "[DX12] Mesh shaders: AVAILABLE (Tier 1+)"
+                             : "[DX12] Mesh shaders: NOT available — the meshlet pipeline (R4) is disabled.");
 
         Queue = Device.CreateCommandQueue(new CommandQueueDescription(CommandListType.Direct));
         allocator = Device.CreateCommandAllocator(CommandListType.Direct);
