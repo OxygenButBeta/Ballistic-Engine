@@ -10,7 +10,14 @@ namespace BallisticEngine.Editor;
 // count), a per-row severity icon, a per-message timestamp, free-text search, optional collapsing of
 // consecutive duplicates (with a count badge), copy-to-clipboard, and double-click-to-open-source for
 // rows that carry an "Assets/...cs(line,col)" reference (script errors).
-internal sealed class ConsolePanel {
+//
+// Framework pilot (Phase 1): first panel ported to the EditorWindow base. Identity (dock key/title/icon)
+// lives in the base; OnGui routes to DrawContents. The body still calls ImGui directly — that is allowed
+// (the architecture rule is only that the PLAYER never sees ImGui; inside the editor it's free). The
+// registry still drives DrawContents today; Phase 3 switches it to drive the window through WindowShell.
+internal sealed class ConsolePanel : EditorWindow {
+    protected override void OnGui(IEditorGui gui) => DrawContents();
+
     readonly record struct Entry(string Message, int Level, string Time);
 
     readonly List<Entry> entries = new();
@@ -33,6 +40,11 @@ internal sealed class ConsolePanel {
         new(@"(Assets[\\/][^\s:()]+\.cs)[(:](\d+)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     public ConsolePanel() {
+        DockKey = EditorLayout.Console;
+        Title = "Console";
+        Icon = EditorIcons.Document;
+        Singleton = false;        // duplicable via the Add-Tab host
+
         Debugging.OnMessage += (message, level) => {
             // Timestamp at log time (HH:mm:ss). DateTime.Now is fine here — this is wall-clock display,
             // not gameplay timing.

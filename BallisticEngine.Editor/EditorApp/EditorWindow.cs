@@ -16,10 +16,10 @@ public abstract class EditorWindow {
 
     // Scene/Game views: special render-target compositing instead of a generic body. A viewport window
     // has no OnGui body (WindowShell skips it; EditorApplication composites it via DrawViewportWindows).
-    public bool IsViewport { get; protected init; }
+    public bool IsViewport { get; protected set; }
 
     // false => DockPanelHost may open additional independent instances ("Add Tab"); true => one instance.
-    public bool Singleton { get; protected init; } = true;
+    public bool Singleton { get; protected set; } = true;
 
     // Default floating size used the first time the window is shown (FirstUseEver).
     public Vector2 DesiredSize { get; protected set; } = new(420, 540);
