@@ -221,6 +221,18 @@ Triage flow per phase: `bal perf <scene>` for the relative pass deltas + `Render
 >   depth-equal coplanar fragments at box seams the last-writer differs) OR a conservative-raster/PSO-state nuance.
 >   0.002 meanError is visually imperceptible; R3a is opt-in + hang-safe + already captures the CPU→indirect
 >   submit win. Resolving the 0.4% (likely the draw-order tie-break at coplanar seams) is the gate to default-ON.
+>
+> **RESOLVED (2026-06-20, commit bcaccf79): the bulk was DRAW-ORDER NON-DETERMINISM.** RenderInto/BuildShadowCull
+> grouped via `foreach (kv in Dictionary)` — unstable enumeration order → SubmeshMeta slot (= ExecuteIndirect draw
+> order) varied run-to-run. Invisible for non-overlapping geometry (Bistro), but split siblings sharing a mesh
+> exposed it (output non-deterministic AND diverging from the CPU loop at z-equal seams). The HashSet-backed
+> `RuntimeSet` feeding the renderers compounds it. Fix: iterate groups in first-appearance order (parallel
+> meshOrder list), matching the CPU loop's renderer order. After the fix, on a NON-overlapping split fixture both
+> base and R3a are deterministic and the R3a-vs-CPU delta fell 0.06 → 0.0016; a SINGLE object is 0.0004 meanError
+> (maxError 0.645 on a handful of silhouette-edge pixels). That last sub-pixel residual is a true ExecuteIndirect-
+> vs-DrawIndexed rasterization nuance (single draw, no cull, no order → not slot/order/material/MVP) — visually
+> imperceptible, needs RenderDoc to pin. Whole-mesh default path stays byte-identical. R3a remains opt-in; the
+> sub-pixel residual is the only thing between it and default-ON.
 
 ### R3 — Collapse CPU per-submesh paths into unified GPU-driven ExecuteIndirect
 
