@@ -1137,19 +1137,27 @@ public sealed class DX12HDRenderer : HDRenderer
     bool CpuBindless => cpuBindlessOn ??=
         Environment.GetEnvironmentVariable("BALLISTIC_DX12_CPU_BINDLESS") == "1";
 
-    // R3a opt-in: BALLISTIC_DX12_GPUDRIVEN_SPLIT=1 routes split-import renderers (SubMeshIndex >= 0, non-skinned,
+    // R3a: BALLISTIC_DX12_GPUDRIVEN_SPLIT routes split-import renderers (SubMeshIndex >= 0, non-skinned,
     // single-shader) through the SAME GPU compute-cull + ExecuteIndirect path as whole-mesh, instead of the CPU
-    // per-submesh loop — collapsing the last CPU-submit geometry path. Default OFF (bring-up: it changes the
-    // GPU-driven meta/cull, the EXACT surface whose mis-bind caused the R2 hang). Requires GPU-driven on.
+    // per-submesh loop — collapsing the last CPU-submit geometry path. **DEFAULT ON** (!= "0"): perceptual-parity
+    // with the CPU path on real content (Bistro Exterior meanError 0, hotspot 2.2e-5, maxError <1 LSB — an inherent
+    // ExecuteIndirect-vs-IA rasterization tie-break, NOT byte-identical). Measured FPS-neutral on Bistro (188.5 →
+    // 188.4 — Bistro has little split-import geometry) but removes the CPU per-submesh submit for split-import-heavy
+    // scenes at zero cost elsewhere. Shadows for split-import stay on the CPU caster path (byte-identical, unchanged);
+    // draw order is deterministic (first-appearance meshOrder). Kill: BALLISTIC_DX12_GPUDRIVEN_SPLIT=0.
     bool? gpuDrivenSplitOn;
     bool GpuDrivenSplit => gpuDrivenSplitOn ??=
-        Environment.GetEnvironmentVariable("BALLISTIC_DX12_GPUDRIVEN_SPLIT") == "1";
+        Environment.GetEnvironmentVariable("BALLISTIC_DX12_GPUDRIVEN_SPLIT") != "0";
 
-    // Geometric-LOD opt-in: BALLISTIC_DX12_LOD=1 enables screen-size LOD selection on the GPU cull (and the CPU
-    // per-submesh path). Default OFF → every submesh draws LOD0 → byte-identical. BALLISTIC_DX12_LOD_BIAS=<f>
-    // overrides the global span bias; BALLISTIC_DX12_LOD_FORCE=<n> pins every submesh to LOD n (A/B captures).
+    // Geometric LOD: BALLISTIC_DX12_LOD enables screen-size LOD selection on the GPU cull. **DEFAULT ON** (!= "0").
+    // Deterministic/paused capture still forces LOD0 (FreezeForDeterminism) so goldens stay bit-exact, so this is
+    // byte-identical under every deterministic diff; the live selection only kicks in for real (non-deterministic)
+    // play/editor frames, where far/small submeshes drop to a decimated LOD. **FPS-neutral on Bistro Exterior**
+    // (188.5 → 188.7; even LOD_FORCE=3 is neutral) — that scene is Lumen-trace-bound, not geometry-bound, so cutting
+    // triangles doesn't move the frame; LOD pays only on a geometry/vertex-bound scene or a weaker GPU, at zero cost
+    // here. BALLISTIC_DX12_LOD_BIAS=<f> scales the span bias; BALLISTIC_DX12_LOD_FORCE=<n> pins LOD n. Kill: =0.
     bool? lodOn;
-    bool LodEnabled => lodOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_LOD") == "1";
+    bool LodEnabled => lodOn ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_LOD") != "0";
 
     // R3b opt-in: BALLISTIC_DX12_GPUDRIVEN_SKINNED=1 skins on the compute path into transient buffers, then draws
     // the skinned result through the static GPU-driven bindless path (no skinned VS / skinned PSO). Default OFF
@@ -1160,6 +1168,10 @@ public sealed class DX12HDRenderer : HDRenderer
 
     // R4 opt-in: BALLISTIC_DX12_MESHLETS=1 draws whole-mesh geometry through the mesh-shader meshlet pipeline
     // (amplification meshlet cull + mesh shader) instead of ExecuteIndirect. Default OFF; requires HW mesh shaders.
+    // **MEASURED NET LOSS on the RX 9070 XT** (Bistro Exterior 188.5 → 171 fps, −9%): the per-meshlet AS+MS dispatch
+    // granularity (≤64 vert / ≤124 prim) costs more than ExecuteIndirect's single indirect draw for Bistro's large
+    // submeshes — the meshlet cull does not recover it on this scene/GPU. Stays opt-in (HW-gated fallback to
+    // ExecuteIndirect inside) until a workload where per-meshlet cull pays (very high-poly, heavy occlusion) is found.
     bool? meshletsOn;
     bool MeshletsEnabled => meshletsOn ??=
         Environment.GetEnvironmentVariable("BALLISTIC_DX12_MESHLETS") == "1";

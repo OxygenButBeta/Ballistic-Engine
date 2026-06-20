@@ -53,10 +53,11 @@ public sealed class ModelImporter : IAssetImporter {
         // UnitScaleFactor — cm-authored content imports at the right metric size instead of 100x).
         // Set a positive value to force a scale (Unity's "Scale Factor").
         ["scaleFactor"] = 0.0,
-        // Geometric LOD chain (per-submesh quadric decimation, appended to the shared index buffer). OFF by
-        // default → artifacts stay byte-identical (written as .bmesh v6). On → LOD1..(lodCount-1) at lodReduction^k
-        // triangles; submeshes at/below lodMinTris keep full detail. Skinned meshes are never decimated (v1).
-        ["generateLODs"] = false,
+        // Geometric LOD chain (per-submesh quadric decimation, appended to the shared index buffer). ON by
+        // default (matches the renderer's BALLISTIC_DX12_LOD default) → new imports get LOD1..(lodCount-1) at
+        // lodReduction^k triangles; submeshes at/below lodMinTris keep full detail. Skinned meshes are never
+        // decimated (v1). Set false per asset to skip decimation (artifact then written as .bmesh v6).
+        ["generateLODs"] = true,
         ["lodCount"] = 4,
         ["lodReduction"] = 0.5,
         ["lodMinTris"] = 64,
