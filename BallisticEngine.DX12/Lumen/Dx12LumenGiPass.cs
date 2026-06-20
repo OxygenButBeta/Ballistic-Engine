@@ -387,71 +387,28 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // it; in steady state (history valid) the temporal accumulation already did the heavy lifting so 1 pass is
         // enough. This is what lets the Balanced/Performance tiers run denoise=1 without grain on camera cuts.
         bool historyMissThisFrame = !probeHistoryValid;
-        if (temporalOn)
-        {
-            tempCb.Write(new TemporalConstants
-            {
-                Texel = new Vector2(1f / indirect.Width, 1f / indirect.Height),
-                HistoryValid = probeHistoryValid ? 1f : 0f,
-                Alpha = EnvF("BALLISTIC_DX12_LUMEN_TEMPORAL_ALPHA", 0.1f),
-                W = (uint)indirect.Width, H = (uint)indirect.Height,
-                Pad0 = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_TEMPORAL_NOMOTION") == "1" ? 1f : 0f,
-            });
-            probeHistory.ColorToShaderResource();
-            indirectResolved.ColorToUnorderedAccess();
-            tempSrv.Reset();
-            int tb = tempSrv.AllocateRange(5);
-            dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 0), indirect.ColorSrvCpu, heapType);          // t0 fresh E
-            dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 1), probeHistory.ColorSrvCpu, heapType);      // t1 history
-            dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 2), gbuffer.DepthSrvCpu, heapType);           // t2 depth
-            dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 3), gbuffer.ColorSrvCpu(4), heapType);        // t3 motion (RT4)
-            dev.Device.CreateUnorderedAccessView(indirectResolved.RenderTarget, null, new UnorderedAccessViewDescription
-            {
-                Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
-            }, tempSrv.Cpu(tb + 4));                                                                            // u0 resolved
-            ulong tcb = tempCb.Gpu;
-            dev.ExecuteSync(cl =>
-            {
-                cl.SetDescriptorHeaps(tempSrv.Heap);
-                cl.SetComputeRootSignature(tempRootSig);
-                cl.SetPipelineState(tempPso);
-                cl.SetComputeRootConstantBufferView(0, tcb);
-                cl.SetComputeRootDescriptorTable(1, tempSrv.Gpu(tb));
-                cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
-            });
-            indirectResolved.ColorToShaderResource();
-            // The resolved E becomes `indirect` for the denoise/combine, and the history for next frame.
-            indirect.CopyColorFrom(indirectResolved);
-            indirect.ColorToShaderResource();
-            probeHistory.CopyColorFrom(indirectResolved);
-            probeHistory.ColorToShaderResource();
-            probeHistoryValid = true;
-        }
-        else
-        {
-            // No temporal (deterministic/off): snapshot raw E so the inline-temporal A/B door still has a history.
-            probeHistory.CopyColorFrom(indirect);
-            probeHistory.ColorToShaderResource();
-            probeHistoryValid = true;
-        }
-        Prof("temporal");
 
-        // === SPATIAL DENOISE: edge-aware à-trous blur of the raw indirect E (diffuse GI is low-frequency, so a
-        // wide bilateral blur removes the per-pixel hemisphere-ray grain without a screen-space temporal
-        // history). 3 iterations at increasing stride (1,2,4) ping-ponging indirect↔indirectFiltered → an
-        // effective ~33px footprint. The LAST written buffer is indirectFiltered (the combine reads it).
-        // BALLISTIC_DX12_LUMEN_NODENOISE=1 passes through (raw E). ===
+        // === SPATIAL DENOISE FIRST (was AFTER temporal — the reorder is the flicker fix). === The à-trous blur is a
+        // SPATIAL filter of the per-pixel grain; the temporal resolve is what stabilises the result over frames. The
+        // old order (temporal → denoise → combine, history snapshot taken BEFORE the denoise) had two faults that
+        // produced a STATIC-camera 2-frame ping-pong (measured: hotspot 0.027 with denoise, 0 without; the user's
+        // "indirect ışıkta parıltı"): (1) the denoised image the COMBINE shows was NOT the image fed back as history,
+        // so the temporal accumulation could never converge the thing actually on screen — the blur re-spread each
+        // frame's residual cache/probe wobble across neighbours every frame, unbounded by the history; (2) the blur
+        // AMPLIFIES a sparse per-frame wobble (a few cache-updated texels) into a wide visible patch. Denoising FIRST,
+        // then resolving the denoised E temporally — and snapshotting THAT same denoised+resolved E as the history —
+        // closes the loop: the temporal EMA + rate-limit now bound the denoised signal frame-to-frame, so a residual
+        // wobble is smeared over many frames (invisible) instead of flashing. Combine and history read ONE signal.
         bool denoise = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NODENOISE") != "1" && fx.LumenDenoisePasses > 0;
         int dnPasses = denoise ? Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_DENOISE_PASSES", fx.LumenDenoisePasses), 1, MaxDenoisePasses) : 1;
-        // ADAPTIVE: on a history miss (camera cut / resize / heavy disocclusion) the indirect is still raw-noisy,
-        // so widen the à-trous to at least 3 passes THIS frame to kill the grain before it's visible; steady-state
-        // frames keep the tier's count (1 for Balanced/Performance). The temporal accumulation re-converges within
-        // a few frames, so this transient cost is paid only on the cut, not continuously. Env door fixes the count
-        // (DENOISE_PASSES set) → no adaptivity, for deterministic A/B. Determinism keeps a fixed count too.
+        // ADAPTIVE: on a history miss (camera cut / resize) the indirect is still raw-noisy → widen to ≥3 passes this
+        // frame; steady-state keeps the tier count (1). Env door fixes the count (no adaptivity). Determinism: fixed.
         bool adaptiveDenoise = denoise && Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_DENOISE_PASSES") == null
                                && !ctx.DeterministicCapture;
         if (adaptiveDenoise && historyMissThisFrame)
             dnPasses = Math.Clamp(Math.Max(dnPasses, 3), 1, MaxDenoisePasses);
+        // Denoise the FRESH trace E (indirect) into indirectFiltered, ping-ponging indirect↔indirectFiltered. The
+        // final denoised result is left in `indirect` (so the temporal pass below reads the denoised fresh E as t0).
         Dx12OffscreenTarget src = indirect, dst = indirectFiltered;
         denoiseSrv.Reset();   // ONCE per frame — each pass takes a DISTINCT 4-descriptor range (no cross-pass alias)
         for (int pass = 0; pass < dnPasses; pass++)
@@ -484,14 +441,70 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                 cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
             });
             dst.ColorToShaderResource();
-            // Ping-pong for the next iteration; ensure the FINAL result lands in indirectFiltered.
             (src, dst) = (dst, src);
         }
-        // After the loop `src` holds the last-written result. If that isn't indirectFiltered, the combine must
-        // read `src` — but to keep the combine bind stable, copy the result into indirectFiltered when needed.
-        if (!ReferenceEquals(src, indirectFiltered))
-            indirectFiltered.CopyColorFrom(src);
-        indirectFiltered.ColorToShaderResource();
+        // Land the denoised result back in `indirect` (the temporal pass's t0 fresh-E input). `src` holds the last
+        // written buffer; copy it into indirect when that isn't already indirect.
+        if (!ReferenceEquals(src, indirect))
+            indirect.CopyColorFrom(src);
+        indirect.ColorToShaderResource();
+        Prof("denoise");
+
+        // === COMMON MOTION-VECTOR TEMPORAL RESOLVE (LumenTemporal) — now AFTER the denoise ===
+        // Reproject the resolved history with the REAL G-buffer motion vector (RT4) + AABB clamp + disocclusion
+        // reject + per-frame rate-limit, EMA-blend the DENOISED fresh E → indirectResolved, which feeds the combine
+        // AND becomes next frame's history. Reading the denoised E (not the raw trace) means combine and history are
+        // the SAME signal, so the EMA converges on a static camera (the ping-pong fix). NOTEMPORAL=1 bypasses (raw).
+        if (temporalOn)
+        {
+            tempCb.Write(new TemporalConstants
+            {
+                Texel = new Vector2(1f / indirect.Width, 1f / indirect.Height),
+                HistoryValid = probeHistoryValid ? 1f : 0f,
+                Alpha = EnvF("BALLISTIC_DX12_LUMEN_TEMPORAL_ALPHA", 0.1f),
+                W = (uint)indirect.Width, H = (uint)indirect.Height,
+                Pad0 = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_TEMPORAL_NOMOTION") == "1" ? 1f : 0f,
+            });
+            probeHistory.ColorToShaderResource();
+            indirectResolved.ColorToUnorderedAccess();
+            tempSrv.Reset();
+            int tb = tempSrv.AllocateRange(5);
+            dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 0), indirect.ColorSrvCpu, heapType);          // t0 denoised fresh E
+            dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 1), probeHistory.ColorSrvCpu, heapType);      // t1 history
+            dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 2), gbuffer.DepthSrvCpu, heapType);           // t2 depth
+            dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 3), gbuffer.ColorSrvCpu(4), heapType);        // t3 motion (RT4)
+            dev.Device.CreateUnorderedAccessView(indirectResolved.RenderTarget, null, new UnorderedAccessViewDescription
+            {
+                Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
+            }, tempSrv.Cpu(tb + 4));                                                                            // u0 resolved
+            ulong tcb = tempCb.Gpu;
+            dev.ExecuteSync(cl =>
+            {
+                cl.SetDescriptorHeaps(tempSrv.Heap);
+                cl.SetComputeRootSignature(tempRootSig);
+                cl.SetPipelineState(tempPso);
+                cl.SetComputeRootConstantBufferView(0, tcb);
+                cl.SetComputeRootDescriptorTable(1, tempSrv.Gpu(tb));
+                cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
+            });
+            indirectResolved.ColorToShaderResource();
+            // resolved E → the combine reads it (via indirectFiltered) AND it becomes next frame's history.
+            indirectFiltered.CopyColorFrom(indirectResolved);
+            indirectFiltered.ColorToShaderResource();
+            probeHistory.CopyColorFrom(indirectResolved);
+            probeHistory.ColorToShaderResource();
+            probeHistoryValid = true;
+        }
+        else
+        {
+            // No temporal (deterministic/off): the combine reads the denoised E; snapshot it as history too.
+            indirectFiltered.CopyColorFrom(indirect);
+            indirectFiltered.ColorToShaderResource();
+            probeHistory.CopyColorFrom(indirect);
+            probeHistory.ColorToShaderResource();
+            probeHistoryValid = true;
+        }
+        Prof("temporal");
 
         // === COMBINE: add E*albedo*ao/PI directly into the HDR scene color via an additive (One/One) fullscreen
         // PSO — no scratch target needed. The deferred pass already suppressed its IBL diffuse ambient
@@ -551,7 +564,9 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                            Dx12IblBaker ibl, float skyIntensity, bool useSky)
     {
         var sceneAS = ctx.Dxr.SceneAS;
-        float emaAlpha = EnvF("BALLISTIC_DX12_LUMEN_EMA", 0.1f);          // conservative temporal blend (0.1 = slow, stable)
+        float emaAlpha = EnvF("BALLISTIC_DX12_LUMEN_EMA", 0.05f);         // 0.05 (was 0.1): smaller per-relight radiance step so a
+        // round-robin card update is a gentler jump → less visible per-cluster flash. Slower to react to a real light
+        // change, but ForceFull (sun/light/topology dirty) bypasses the EMA entirely so genuine changes stay instant.
         bool bounce = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOBOUNCE") != "1" && ctx.PostFX.LumenMultiBounce;
 
         // === P7 #1 UPDATE BUDGET ===
@@ -568,7 +583,9 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // deterministic → byte-identical across runs. Hence budget is safe under DeterministicCapture (it does NOT
         // disable it like the EMA does), so `bal perf` measures the real budgeted cost.
         if (budget > 0 && tris > budget)
-            stride = (uint)Math.Min(8, (tris + budget - 1) / budget);   // cap at 8 → at most ~8-frame react latency
+            stride = (uint)Math.Min(4, (tris + budget - 1) / budget);   // cap at 4 → ≤4-frame relight period (was 8: an 8-frame
+        // window meant each cluster held stale 8 frames then STEPPED its radiance at once — a ~7-8 Hz per-cluster flash
+        // (the user's "saniyede bir parlama"). Halving the cap halves both the stale window AND the per-step jump.
 
         // ForceFull this frame when the light state changed (or topology rebuilt) so the budget never delays a
         // light change. Compared against the values the cache was last fully relit with.

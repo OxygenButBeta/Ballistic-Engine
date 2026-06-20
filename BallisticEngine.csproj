@@ -24,6 +24,7 @@
       <Compile Remove="Tools\**\*.cs" />
       <Compile Remove="SampleProject\**\*.cs" />
       <Compile Remove="Docs\**\*.cs" />   <!-- validation harnesses (e.g. dx12-resize-harness) are standalone exes, not engine sources -->
+      <Compile Include="SampleProject\Assets\Test.cs" />
     </ItemGroup>
 
     <ItemGroup>

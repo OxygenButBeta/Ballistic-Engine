@@ -70,11 +70,44 @@ void CSTemporal(uint3 dtid : SV_DispatchThreadID) {
     // (measured: tight clamp left boiling ~0.8 even at alpha 0.01). Expand the AABB by a margin tied to the local
     // spread so the converged (low-variance) history is NOT pulled back into the noisy per-frame range — the clamp
     // then only catches a genuine lighting change (history far outside the widened band), not Monte-Carlo grain.
-    float3 ext = (nmax - nmin) * 1.5 + 1e-3;
+    // The absolute 1e-3 floor was too LOOSE in the dark: when E itself is ~1e-3, the band (nmax+ext) is several×
+    // the signal, so the clamp never bites and the history's per-frame wobble leaks through as flicker (the user's
+    // "düşük ışıkta daha belirgin"). Make the floor RELATIVE to the local mean brightness so it scales down with the
+    // signal — the band stays a fixed FRACTION of the local radiance, binding the history just as tightly in shadow
+    // as in light, while the (nmax-nmin)*1.5 spread term still keeps it loose enough not to re-inject Monte-Carlo grain.
+    float3 nmean = (nmin + nmax) * 0.5;
+    float3 ext = (nmax - nmin) * 1.5 + nmean * 0.25 + 1e-4;
     float3 clampedHist = clamp(hist.rgb, nmin - ext, nmax + ext);
 
     // EMA: trusted → slow accumulation (low alpha); untrusted (disocclusion) → fresh E. lerp toward fresh, never black.
     float alpha = lerp(1.0, saturate(Alpha), trust);
     float3 resolved = lerp(lerp(E, clampedHist, trust), E, alpha);
+
+    // TEMPORAL RATE-LIMIT — the real fix for the "saniyede bir parlama". The GI card-radiance cache relights only a
+    // ROUND-ROBIN SLICE of records per frame (391k records ≫ 50k budget), so every ~8 frames a whole cluster of cards
+    // STEPS its radiance (EmaAlpha) at once. That step is spatially COHERENT (the entire card jumps together), so the
+    // neighbourhood AABB clamp above can't catch it — nmin/nmax jump with it — and the EMA alone lets ~alpha of the
+    // step through each frame, a visible per-cluster flash. Bound how far the resolved value may move from the trusted
+    // history in ONE frame to a small fraction of the local brightness: a coherent cache step is then SMEARED over
+    // many frames (invisible ramp) instead of flashing, while genuine lighting changes (sun moves) just take a few
+    // extra frames to settle. Only applied when the history is trusted (a real disocclusion already took fresh E).
+    // The limit is applied UNCONDITIONALLY (NOT ×trust). Earlier it was eased out by `trust`, but on a STATIC scene
+    // there is no real disocclusion — the only thing pulling trust below 1 is reprojection/edge noise (e.g. the high-
+    // contrast rim around a street lamp, exactly the spot the user flagged). Easing the rate-limit there let the big
+    // per-cluster step flash through precisely at the visible edges. A genuine disocclusion already took fresh E in
+    // the `lerp(E, clampedHist, trust)` above (trust→0 ⇒ resolved≈E), and clampedHist≈E there too, so the limit is a
+    // no-op on real disocclusion anyway — making it unconditional only bites the static-scene cache step we want gone.
+    // Reference = the trust-blended history (NOT raw clampedHist): on a real disocclusion trust→0 so lhRef→E and the
+    // limit is a no-op (fresh E passes, no trail); on a static surface trust→1 so lhRef→clampedHist and the limit
+    // bites the cache step. This keeps the rate-limit unconditional WITHOUT trapping disoccluded pixels on stale
+    // history. (clampedHist≈E on disocclusion too, since the AABB is built from this frame's E, so lhRef→E either way.)
+    float3 lhRef = lerp(E, clampedHist, trust);
+    float lref = max(dot(lhRef, float3(0.2126, 0.7152, 0.0722)), 1e-4);
+    float maxStep = lref * 0.04 + 1e-4;                          // ≤4% of local brightness per frame (was 6%)
+    float3 delta = resolved - lhRef;
+    float dlen = max(max(abs(delta.r), abs(delta.g)), abs(delta.b));
+    float limited = (dlen > maxStep) ? maxStep / dlen : 1.0;
+    resolved = lhRef + delta * limited;
+
     OutE[px] = float4(San(resolved), depth);
 }

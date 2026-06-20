@@ -134,11 +134,17 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
         float staleness = float(FrameIndex - lastFrame);                // ≥1 (frames since relight)
         float dist = length(ClusterCards[record].Origin - CameraPos);
         float nearW = PriorityNearDist / (PriorityNearDist + dist);     // 1 at camera → 0 far (smooth, no cliff)
-        // Priority grows with staleness AND proximity. Divide by PriorityScale (C# sets it so the mean due-rate
-        // matches the budget) → a probability; a fixed per-record/per-frame hash gates it. saturate keeps very
-        // stale/near cards at prob 1 (always due) so they never lag.
-        float prob = saturate((staleness * (0.25 + nearW)) / max(PriorityScale, 1e-3));
-        due = Hash(record * 2654435761u ^ (FrameIndex * 40503u)) < prob;
+        // DETERMINISTIC staleness threshold (was: stochastic Hash(record ^ FrameIndex) < prob). The stochastic gate
+        // re-rolled which records relit EVERY frame, so on a STATIC camera a given card relit at IRREGULAR intervals;
+        // combined with the EmaAlpha blend its radiance stepped up, carried forward, then stepped again — a low-
+        // frequency cache-space FLICKER (the reported "sabit karede git-gel", worst on flat mid-lit walls and in the
+        // dark where the temporal AABB clamp is loose). A record now relights once its staleness reaches a PERIOD set
+        // by priority: near/stale cards have a SHORT period (relight often), far cards a long one. On a static scene
+        // each record then relights on a FIXED cadence → the EMA converges → no flicker. Starvation-free (period is
+        // finite) and latency-preserving (near cards keep a 1-2 frame period). Mean period ≈ recordCount/budget so
+        // the average records/frame still matches the budget. PriorityScale ≈ recordCount/budget·0.85 (C#).
+        float period = max(PriorityScale / (0.25 + nearW), 1.0);        // frames between relights for this card
+        due = staleness >= period;
     } else {
         due = (record % UpdateStride) == (FrameIndex % UpdateStride);   // legacy flat round-robin
     }

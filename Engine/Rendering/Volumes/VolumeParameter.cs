@@ -36,13 +36,10 @@ public class VolumeParameter<T> : VolumeParameter {
         value = ((VolumeParameter<T>)source).value;
 }
 
-public class BoolParameter : VolumeParameter<bool> {
-    public BoolParameter(bool value, bool overridden = false) : base(value, overridden) { }
-}
+public class BoolParameter(bool value, bool overridden = false) : VolumeParameter<bool>(value, overridden);
 
-public class FloatParameter : VolumeParameter<float> {
-    public FloatParameter(float value, bool overridden = false) : base(value, overridden) { }
-
+public class FloatParameter(float value, bool overridden = false) : VolumeParameter<float>(value, overridden)
+{
     internal override void Interp(VolumeParameter to, float t) =>
         value += (((VolumeParameter<float>)to).Value - value) * t;
 }
@@ -73,11 +70,11 @@ public interface IEnumParameter {
 }
 
 // Enum choice; snaps to the target under blending like every non-numeric parameter.
-public class EnumParameter<T> : VolumeParameter<T>, IEnumParameter where T : struct, Enum {
+public class EnumParameter<T>(T value, bool overridden = false) : VolumeParameter<T>(value, overridden), IEnumParameter
+    where T : struct, Enum
+{
     static readonly T[] Values = Enum.GetValues<T>();
     static readonly string[] ValueNames = Enum.GetNames<T>();
-
-    public EnumParameter(T value, bool overridden = false) : base(value, overridden) { }
 
     public string[] Names => ValueNames;
 
@@ -87,9 +84,8 @@ public class EnumParameter<T> : VolumeParameter<T>, IEnumParameter where T : str
     }
 }
 
-public class IntParameter : VolumeParameter<int> {
-    public IntParameter(int value, bool overridden = false) : base(value, overridden) { }
-
+public class IntParameter(int value, bool overridden = false) : VolumeParameter<int>(value, overridden)
+{
     internal override void Interp(VolumeParameter to, float t) =>
         value = (int)MathF.Round(value + (((VolumeParameter<int>)to).Value - value) * t);
 }
@@ -111,19 +107,15 @@ public class ClampedIntParameter : IntParameter {
     }
 }
 
-public class Vector3Parameter : VolumeParameter<Vector3> {
-    public Vector3Parameter(Vector3 value, bool overridden = false) : base(value, overridden) { }
-
+public class Vector3Parameter(Vector3 value, bool overridden = false) : VolumeParameter<Vector3>(value, overridden)
+{
     internal override void Interp(VolumeParameter to, float t) =>
         value = Vector3.Lerp(value, ((VolumeParameter<Vector3>)to).Value, t);
 }
 
 // Vector3 drawn as a color picker in the editor (Hdr allows components > 1).
-public class ColorParameter : Vector3Parameter {
-    public bool Hdr { get; }
-
-    public ColorParameter(Vector3 value, bool hdr = false, bool overridden = false)
-        : base(value, overridden) {
-        Hdr = hdr;
-    }
+public class ColorParameter(Vector3 value, bool hdr = false, bool overridden = false)
+    : Vector3Parameter(value, overridden)
+{
+    public bool Hdr { get; } = hdr;
 }
