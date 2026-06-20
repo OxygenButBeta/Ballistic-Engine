@@ -42,6 +42,17 @@ public abstract class EditorWindow {
     // WindowShell calls this between Begin and End (only when the window is visible).
     internal void Frame(IEditorGui gui) => OnGui(gui);
 
+    // UserEditorWindowRegistry calls this on a freshly-instantiated [EditorWindowMeta] window so the author
+    // doesn't have to wire DockKey/Title/Icon/size in their ctor — the attribute is the single source. Only
+    // fills fields the author left unset (a ctor that DID set Title/Icon/size wins).
+    internal void ConfigureFromMeta(string key, EditorWindowMetaAttribute meta) {
+        DockKey ??= key;
+        Title ??= meta.Title;
+        Icon ??= meta.Icon;
+        if (DesiredSize == new Vector2(420, 540))   // still the base default → take the attribute's size
+            DesiredSize = new Vector2(meta.Width, meta.Height);
+    }
+
     // Draw this as a standalone floating window when Open: routes through WindowShell (the single Begin/End
     // owner) with the panel-owned Open flag. A no-op while closed. Used by the Window-menu-toggled panels
     // (Settings / Tags & Layers / Layer Collision Matrix / Profiler) — NOT the docked core panels.

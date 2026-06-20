@@ -202,6 +202,7 @@ internal sealed class EditorApplication {
         // already built by EngineBootstrap above).
         EditorWindows.Bind(ToggleWindow, OpenWindow, IsWindowOpen, IsWindowEnabled);
         EditorWindowRegistry.Rebuild();
+        UserEditorWindowRegistry.Rebuild();   // discover user [EditorWindowMeta] windows from game-editor scripts
 
         // B1 (Rule 1): warm the component-preview registry the same way, so the first inspector draw doesn't
         // pay the [ComponentPreview] reflection scan. The inspector resolves custom sections from this registry
@@ -764,6 +765,7 @@ internal sealed class EditorApplication {
             ComponentEditorWindow.Draw(S);
             UnityImportWindow.Draw(S);
             RenderPassTogglesWindow.Draw(S);
+            UserEditorWindowRegistry.DrawAll(gui);
             DrawUnsavedPrompt();
             return;
         }
@@ -848,6 +850,7 @@ internal sealed class EditorApplication {
         ComponentEditorWindow.Draw(S);   // standalone component window — was only drawn while fullscreen
         UnityImportWindow.Draw(S);
         RenderPassTogglesWindow.Draw(S);
+        UserEditorWindowRegistry.DrawAll(gui);   // user-authored [EditorWindowMeta] windows (game-editor scripts)
         DrawUnsavedPrompt();
 
         // Persist the layout whenever ImGui says it changed (drag/dock/resize/tab).
@@ -988,6 +991,35 @@ internal sealed class EditorApplication {
                 bool enabled = !isToggle || EditorWindows.IsEnabled(key);
                 if (ImGui.MenuItem(entry.Leaf, (string)null, selected, enabled))
                     entry.Invoke();
+            }
+            for (int i = 0; i < opened; i++)
+                ImGui.EndMenu();
+        }
+
+        // User-authored [EditorWindowMeta] windows under this top menu (discovered from game-editor scripts).
+        // They follow the SAME leaf/sub-menu/checkmark idiom; the toggle goes through EditorWindows keyed by
+        // the window's type FullName. A divider separates them from the built-in [MenuItem] entries above.
+        bool firstUser = true;
+        foreach (UserEditorWindowRegistry.Entry uw in UserEditorWindowRegistry.Items) {
+            int slash = uw.MenuPath.IndexOf('/');
+            string uwTop = slash < 0 ? uw.MenuPath : uw.MenuPath[..slash];
+            if (uwTop != topMenu) continue;
+
+            if (firstUser) { ImGui.Separator(); firstUser = false; }
+
+            string[] parts = uw.MenuPath.Split('/');
+            string leaf = parts[^1];
+            var subs = parts.Length > 2 ? parts[1..^1] : System.Array.Empty<string>();
+            var opened = 0;
+            var skip = false;
+            foreach (string sub in subs) {
+                if (!ImGui.BeginMenu(sub)) { skip = true; break; }
+                opened++;
+            }
+            if (!skip) {
+                bool selected = EditorWindows.IsOpen(uw.Key);
+                if (ImGui.MenuItem(leaf, (string)null, selected, true))
+                    EditorWindows.Toggle(uw.Key);
             }
             for (int i = 0; i < opened; i++)
                 ImGui.EndMenu();
@@ -1422,6 +1454,13 @@ internal sealed class EditorApplication {
             case EditorMenus.WindowKeys.TagsLayers: tagsLayers.Open = !tagsLayers.Open; break;
             case EditorMenus.WindowKeys.LayerCollision: layerCollision.Open = !layerCollision.Open; break;
             case EditorMenus.WindowKeys.Settings: settings.Open = !settings.Open; break;
+            // User-authored [EditorWindowMeta] window (keyed by type FullName): flip its Open flag + focus.
+            default:
+                if (UserEditorWindowRegistry.Get(key) is { } u) {
+                    u.Window.Open = !u.Window.Open;
+                    if (u.Window.Open) pendingFocusWindow = u.Window.DockKey;
+                }
+                break;
         }
     }
 
@@ -1442,6 +1481,12 @@ internal sealed class EditorApplication {
             case EditorMenus.WindowKeys.LayerCollision: layerCollision.Open = true; break;
             case EditorMenus.WindowKeys.Settings: settings.Open = true; break;
             case EditorMenus.WindowKeys.UnityImport: UnityImportWindow.Open(); break;
+            default:
+                if (UserEditorWindowRegistry.Get(key) is { } u) {
+                    u.Window.Open = true;
+                    pendingFocusWindow = u.Window.DockKey;
+                }
+                break;
         }
     }
 
@@ -1456,7 +1501,7 @@ internal sealed class EditorApplication {
             EditorMenus.WindowKeys.LayerCollision => layerCollision.Open,
             EditorMenus.WindowKeys.Settings => settings.Open,
             EditorMenus.WindowKeys.UnityImport => UnityImportWindow.IsOpen,
-            _ => false,
+            _ => UserEditorWindowRegistry.Get(key)?.Window.Open ?? false,
         };
     }
 
