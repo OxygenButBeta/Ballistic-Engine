@@ -112,6 +112,7 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public void EndTable() => ImGui.EndTable();
     public void TableNextRow() => ImGui.TableNextRow();
     public void TableNextColumn() => ImGui.TableNextColumn();
+    public void TableSetColumnIndex(int column) => ImGui.TableSetColumnIndex(column);
     public void TableSetupColumn(string label) => ImGui.TableSetupColumn(label);
     public void TableSetupColumn(string label, EditorColumnFlags flags, float width = 0) =>
         ImGui.TableSetupColumn(label, MapColumnFlags(flags), width);

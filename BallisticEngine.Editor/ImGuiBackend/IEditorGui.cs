@@ -103,6 +103,7 @@ public interface IEditorGui {
     void EndTable();
     void TableNextRow();
     void TableNextColumn();
+    void TableSetColumnIndex(int column);
     void TableSetupColumn(string label);
     void TableSetupColumn(string label, EditorColumnFlags flags, float width = 0);
     void TableSetupScrollFreeze(int cols, int rows);
