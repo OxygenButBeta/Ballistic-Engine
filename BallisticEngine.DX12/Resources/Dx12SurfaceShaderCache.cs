@@ -15,6 +15,7 @@ public sealed class Dx12SurfacePso {
     public string Error;
     public string SourcePath;   // project-relative source asset path (for hot-reload watch)
     public string Source;       // the surface body that produced Pso
+    public BallisticEngine.ShaderProperties Props;   // declared props (for the custom cbuffer/texture layout)
 }
 
 // Compiles user Surface() bodies into G-buffer PSOs that are drop-in for the Standard opaque PSO:
@@ -69,24 +70,26 @@ public sealed class Dx12SurfaceShaderCache : IDisposable {
     // Get (or compile) the PSO for a custom surface body. `key` is a stable identity (shader GUID +
     // content hash) — same key returns the cached PSO. Compile failure caches+returns the fallback so
     // a broken material doesn't recompile every frame.
-    public Dx12SurfacePso GetOrCompile(string surfaceBody, string key, string sourcePath = null) {
+    public Dx12SurfacePso GetOrCompile(string surfaceBody, string key, string sourcePath = null,
+        BallisticEngine.ShaderProperties props = null) {
         if (cache.TryGetValue(key, out var hit)) return hit;
-        var entry = Compile(surfaceBody, key, sourcePath);
+        var entry = Compile(surfaceBody, key, sourcePath, props);
         cache[key] = entry;
         return entry;
     }
 
-    // Build one cache entry (compile or fall back). Records SourcePath/Source so hot-reload can match
-    // a changed file to its entries and recompile in place.
-    Dx12SurfacePso Compile(string surfaceBody, string key, string sourcePath) {
+    // Build one cache entry (compile or fall back). Records SourcePath/Source/Props so hot-reload can match
+    // a changed file to its entries and recompile in place with the same declared property layout.
+    Dx12SurfacePso Compile(string surfaceBody, string key, string sourcePath, BallisticEngine.ShaderProperties props) {
         try {
-            return new Dx12SurfacePso { Pso = BuildPso(surfaceBody, key), SourcePath = sourcePath, Source = surfaceBody };
+            return new Dx12SurfacePso { Pso = BuildPso(surfaceBody, key, props), SourcePath = sourcePath,
+                Source = surfaceBody, Props = props };
         }
         catch (Exception e) {
             Debugging.LogError($"[surface] '{key}' compile failed; drawing magenta fallback:\n{e.Message}");
             var fb = Fallback();
             return new Dx12SurfacePso { Pso = fb.Pso, IsFallback = true, Error = e.Message,
-                SourcePath = sourcePath, Source = surfaceBody };
+                SourcePath = sourcePath, Source = surfaceBody, Props = props };
         }
     }
 
@@ -102,7 +105,7 @@ public sealed class Dx12SurfaceShaderCache : IDisposable {
             var old = cache[k];
             if (!string.Equals(old.SourcePath, changedPath, StringComparison.OrdinalIgnoreCase)) continue;
             if (old.Source == newSource) continue; // unchanged content (editor saved without edits)
-            var fresh = Compile(newSource, k, changedPath);
+            var fresh = Compile(newSource, k, changedPath, old.Props);
             cache[k] = fresh;
             if (!old.IsFallback && old.Pso is not null)
                 deferredDispose.Add((old.Pso, currentFrame + FramesInFlight));
@@ -139,19 +142,74 @@ public sealed class Dx12SurfaceShaderCache : IDisposable {
         const string broken = "SurfaceOutput Surface(SurfaceInput i){ this is not valid hlsl }";
         var bad = GetOrCompile(broken, "__selftest_broken__");
         Console.WriteLine($"[surface] selftest: broken body -> {(bad.IsFallback ? "fallback (correct)" : "compiled (WRONG)")}");
+
+        // Custom-property body: declares _RimPower (Float) + _RimColor (Color) + _RimMask (Texture2D) and
+        // reads all three — proves GenerateCustomDecls emits a compilable cbuffer b2 + texture t6.
+        var props = new BallisticEngine.ShaderProperties(new[] {
+            BallisticEngine.ShaderProperty.FloatProp("_RimPower", "Rim Power", BallisticEngine.MaterialSemantic.None, 2f),
+            BallisticEngine.ShaderProperty.ColorProp("_RimColor", "Rim Color", BallisticEngine.MaterialSemantic.None, new System.Numerics.Vector4(1,0,1,1)),
+            BallisticEngine.ShaderProperty.Texture("_RimMask", "Rim Mask", BallisticEngine.MaterialSemantic.None),
+        });
+        const string custom = "SurfaceOutput Surface(SurfaceInput i){ SurfaceOutput s;" +
+            " float m = _RimMask.Sample(LinearWrap, i.Uv).r;" +
+            " s.Albedo = _RimColor.rgb * pow(m, _RimPower); s.Emissive = s.Albedo;" +
+            " s.Normal = normalize(i.NormalW); s.Metallic=0; s.Roughness=0.5; s.AO=1; s.Alpha=1; return s; }";
+        var c2 = GetOrCompile(custom, "__selftest_custom__", null, props);
+        Console.WriteLine($"[surface] selftest: custom-prop body (b2 cbuffer + t6) -> {(c2.IsFallback ? "FELL BACK (WRONG): " + c2.Error : "OK")}");
         Console.WriteLine("[surface] SELFTEST end");
     }
 
-    ID3D12PipelineState BuildPso(string surfaceBody, string fileName) {
-        // Inject the custom Surface() body at the __USER_SURFACE__ marker — which sits BEFORE PSMain, so
-        // its call to Surface() resolves (HLSL has no forward declaration). CUSTOM_SURFACE (defined first)
-        // omits the skeleton's default Standard body via its #ifndef, so the injected body is the only
-        // Surface(). Appending after the skeleton instead would place the body after PSMain → "undeclared
-        // identifier 'Surface'".
-        const string marker = "//USER_SURFACE_MARKER";
-        if (!skeleton.Contains(marker))
+    // The skeleton marker the cache replaces with custom decls + the user Surface() body.
+    const string CustomDeclMarker = "//CUSTOM_DECLS_MARKER";
+    const string SurfaceMarker = "//USER_SURFACE_MARKER";
+
+    // Generate the HLSL custom-property declarations (cbuffer CustomProps b2 + custom Texture2D t6..) from
+    // the shader's declared semantic-None properties, in declared order. STRADDLE-SAFE layout: every scalar
+    // property occupies its OWN 16-byte cbuffer slot (a float + float3 pad), so the C# packing offset is
+    // exactly 16*index and a vector can never cross a 16-byte boundary. The body reads each by its declared
+    // name (e.g. _RimPower, _RimColor). Returns "" when the shader has no custom props (Standard / no-None →
+    // byte-identical to today's emitted source).
+    public static string GenerateCustomDecls(BallisticEngine.ShaderProperties props) {
+        if (props is null) return "";
+        var cb = new System.Text.StringBuilder();
+        var texDecls = new System.Text.StringBuilder();
+        int cbMembers = 0, texSlot = 6, padIdx = 0;
+        cb.Append("cbuffer CustomProps : register(b2) {\n");
+        foreach (var p in props) {
+            if (p.Semantic != BallisticEngine.MaterialSemantic.None) continue;
+            switch (p.Type) {
+                case BallisticEngine.ShaderPropertyType.Texture2D:
+                    if (texSlot < 6 + MaxCustomTexHlsl)
+                        texDecls.Append($"Texture2D {p.Name} : register(t{texSlot++});\n");
+                    break;
+                case BallisticEngine.ShaderPropertyType.Color:
+                case BallisticEngine.ShaderPropertyType.Vector:
+                    cb.Append($"    float4 {p.Name};\n"); cbMembers++;
+                    break;
+                default: // Float / Range — own 16-byte slot (float + float3 pad), no straddle
+                    cb.Append($"    float {p.Name}; float3 _cpad{padIdx++};\n"); cbMembers++;
+                    break;
+            }
+        }
+        cb.Append("};\n");
+        // No custom cbuffer members AND no textures → emit nothing (byte-identical to the pre-custom source).
+        if (cbMembers == 0 && texSlot == 6) return "";
+        // An empty cbuffer is illegal in HLSL; only emit the cbuffer block when it has members.
+        return (cbMembers > 0 ? cb.ToString() : "") + texDecls.ToString();
+    }
+
+    // Mirror of MaxCustomTex on the renderer (kept local so the cache has no renderer dependency).
+    public const int MaxCustomTexHlsl = 4;
+
+    ID3D12PipelineState BuildPso(string surfaceBody, string fileName, BallisticEngine.ShaderProperties props = null) {
+        // Inject the custom Surface() body at the marker — which sits BEFORE PSMain, so its call to Surface()
+        // resolves (HLSL has no forward declaration). CUSTOM_SURFACE (defined first) omits the skeleton's
+        // default Standard body. The custom-property decls (cbuffer b2 + custom textures) go at the
+        // CUSTOM_DECLS_MARKER (after the Standard cbuffers/textures, before any function uses them).
+        if (!skeleton.Contains(SurfaceMarker))
             throw new InvalidOperationException("SurfaceSkeleton.hlsl is missing the //USER_SURFACE_MARKER line.");
-        string injected = skeleton.Replace(marker, surfaceBody);
+        string injected = skeleton.Replace(SurfaceMarker, surfaceBody);
+        injected = injected.Replace(CustomDeclMarker, GenerateCustomDecls(props));
         string source = "#define CUSTOM_SURFACE 1\n" + injected;
         byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, source, "PSMain", fileName);
         // VS is ALWAYS the engine's prebuilt VSMain bytecode — never recompiled, so prepass depth is

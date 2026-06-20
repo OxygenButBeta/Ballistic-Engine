@@ -38,6 +38,12 @@ Texture2D AOMap        : register(t4);
 Texture2D EmissiveMap  : register(t5);
 SamplerState LinearWrap : register(s0);
 
+// Custom surface shaders: the cache replaces this marker with an auto-generated `cbuffer CustomProps :
+// register(b2)` (from the shader's declared semantic-None properties, each scalar in its own straddle-safe
+// 16-byte slot) + custom `Texture2D _X : register(t6..)`. A shader with no custom props emits nothing here,
+// so the Standard / no-None source is byte-identical. The body reads each custom prop by its declared name.
+//CUSTOM_DECLS_MARKER
+
 struct VSInput {
     float3 Pos : POSITION; float3 Normal : NORMAL; float2 Uv : TEXCOORD0; float4 Tangent : TANGENT;
 };

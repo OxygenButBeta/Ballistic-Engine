@@ -243,6 +243,11 @@ public sealed class DX12HDRenderer : HDRenderer
     // The 6 material maps in HLSL register(t0..t5) order.
     const int MaterialSrvCount = 6;
 
+    // Custom surface shaders bind up to this many custom textures at t6..t6+N-1 (declared order). Small
+    // and fixed so the root sig + the srvVisible heap headroom are bounded; a shader declaring more custom
+    // textures than this gets the extras dropped (logged). The custom CBV is b2.
+    const int MaxCustomTex = 4;
+
     // IBL: baker (env→irradiance/prefilter/BRDF) + a per-frame 3-SRV shader-visible table (t6..t8).
     Dx12IblBaker ibl;
     Dx12DescriptorHeap iblSrvVisible; // 3 contiguous SRVs copied per frame
@@ -875,6 +880,16 @@ public sealed class DX12HDRenderer : HDRenderer
         var matTable = new RootParameter1(new RootDescriptorTable1(matRange), ShaderVisibility.Pixel);
         var motionCbv = new RootParameter1(RootParameterType.ConstantBufferView,
             new RootDescriptor1(1, 0), ShaderVisibility.Pixel);
+        // Custom surface shaders: b2 = a per-draw CustomProps CBV, t6..t6+N = a custom-texture table. These
+        // are TRAILING root params appended after the Standard b0/t0-t5/b1 — the Standard GBuffer.hlsl never
+        // declares b2/t6, so they're unbound no-ops for Standard draws (root sig stays byte-identical in
+        // effect). Custom-surface PSOs share this exact root sig so the per-draw PSO swap stays valid WITHOUT
+        // a mid-list SetGraphicsRootSignature (which would reset b0/t0-t5/b1 — the TDR hazard we avoid).
+        var customCbv = new RootParameter1(RootParameterType.ConstantBufferView,
+            new RootDescriptor1(2, 0), ShaderVisibility.Pixel);
+        var customTexRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, MaxCustomTex,
+            baseShaderRegister: 6);
+        var customTexTable = new RootParameter1(new RootDescriptorTable1(customTexRange), ShaderVisibility.Pixel);
         var wrap = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0)
         {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap,
@@ -883,7 +898,7 @@ public sealed class DX12HDRenderer : HDRenderer
         };
         gbufferRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(RootSignatureFlags.AllowInputAssemblerInputLayout,
-                new[] { cbv, matTable, motionCbv }, new[] { wrap })));
+                new[] { cbv, matTable, motionCbv, customCbv, customTexTable }, new[] { wrap })));
 
         motionCb = new Dx12FrameCb<MotionConstants>(dev);
         // P2 — cache the normal-map LOD bias env door once (was parsed every BeginRender).
