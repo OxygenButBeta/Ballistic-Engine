@@ -198,6 +198,7 @@ public static class StyleApplier
                 style.Bold = value.Trim() is "bold" or "700" or "800" or "900"
                     || (int.TryParse(value.Trim(), out var fw) && fw >= 600); break;
             case "font-style": style.Italic = value.Trim().Equals("italic", StringComparison.OrdinalIgnoreCase); break;
+            case "direction": style.Direction = value.Trim().Equals("rtl", StringComparison.OrdinalIgnoreCase) ? LayoutDirection.RTL : LayoutDirection.LTR; break;
             // letter-spacing in px or em (em resolved against the current font size, like CSS).
             case "letter-spacing": style.LetterSpacing = ParseEmOrPx(value, style.FontSize); break;
             case "text-align":

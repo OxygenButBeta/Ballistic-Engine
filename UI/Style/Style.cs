@@ -54,6 +54,10 @@ public sealed class Style
     Overflow _overflow = Overflow.Visible;
     public Overflow Overflow { get => _overflow; set { _overflow = value; L.Overflow = value; } }
 
+    // CSS direction (P9.1) — RTL mirrors the flex main axis. Set on the root (Yoga propagates). Inherited.
+    LayoutDirection _direction = LayoutDirection.LTR;
+    public LayoutDirection Direction { get => _direction; set { _direction = value; L.Direction = value; } }
+
     // ---------------------------------------------------------------- layout: box size
 
     Length _width = Length.Auto;
@@ -195,6 +199,7 @@ public sealed class Style
         Position = PositionType.Relative;
         Display = DisplayStyle.Flex;
         Overflow = Overflow.Visible;
+        Direction = LayoutDirection.LTR;
         // layout: box size
         Width = Length.Auto;
         Height = Length.Auto;
@@ -246,6 +251,7 @@ public sealed class Style
         TextOverflow = parent.TextOverflow;
         Bold = parent.Bold;
         Italic = parent.Italic;
+        Direction = parent.Direction;
         // visibility-ish: opacity is NOT inherited in CSS (it composites) — the walker already multiplies
         // opacity down the tree, so we leave Opacity per-element here.
     }

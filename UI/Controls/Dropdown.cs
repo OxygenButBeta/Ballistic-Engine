@@ -32,7 +32,7 @@ public class Dropdown : VisualElement, INotifyValueChanged<int>
     public Dropdown(IEnumerable<string> choices = null)
     {
         AddToClassList("dropdown");
-        Focusable = true;
+        Focusable = true; Role = "combobox";
         Style.FlexDirection = FlexDirection.Row;
         Style.AlignItems = Align.Center;
         Style.JustifyContent = Justify.SpaceBetween;

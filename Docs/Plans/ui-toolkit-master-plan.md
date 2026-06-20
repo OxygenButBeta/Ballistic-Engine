@@ -170,7 +170,16 @@ Staged by dependency + frequency. Each = element + USS default style + INotifyVa
 - **P8.4 WorldSpace renderer** (quad + ray-into-quad picking).
 - **P8.5 ScaleWithScreenSize Expand/Shrink modes**.
 
-## P9 — i18n / a11y   [last]
+## P9 — i18n / a11y   ✅ CORE DONE (HarfBuzz shaping deferred)
+
+> Status: font fallback chains (UIFonts.AddFallback + AtlasForGlyph; DrawText routes each missing glyph
+> to the first fallback atlas that has it, binding that atlas's slot — mixed-script/emoji render instead
+> of tofu), basic RTL (Style.Direction → Yoga RTL, mirrors the flex main axis), a11y roles+labels
+> (VisualElement.Role/AccessibleLabel on every control; UIIntrospect exports a semantic tree). 6/6 tests.
+> DEFERRED: full complex-script SHAPING (Arabic joining, Indic reordering, ligatures) — needs a HarfBuzz-
+> class shaper (large native dep); the single-advance glyph loop + fallback covers Latin/CJK/emoji + RTL
+> block order. Accessibility focus-order export + screen-reader backend are a host concern on top of the
+> exported semantic tree.
 
 - **P9.1 RTL + complex-script shaping (HarfBuzz-class) + font fallback chains + emoji**.
 - **P9.2 Accessibility roles/labels/focus-order export**.

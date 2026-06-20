@@ -84,6 +84,13 @@ public class VisualElement
     public object UserData { get; set; }
     public int UserIndex { get; set; }
 
+    // Accessibility (P9.2): a semantic role ("button", "checkbox", "slider", "textfield", "list", ...)
+    // and a human label for screen readers / automation. Controls set Role; AccessibleLabel defaults to
+    // the element's text when unset. Exported by UIIntrospect so an agent (or an a11y backend) sees the
+    // semantic tree, not just boxes.
+    public string Role { get; set; }
+    public string AccessibleLabel { get; set; }
+
     internal void FirePointerDoubleClick(PointerEvent e) => PointerDoubleClick?.Invoke(e);
     internal void FirePointerMove(PointerEvent e) => PointerMove?.Invoke(e);
     internal void FirePointerWheel(PointerEvent e) => PointerWheel?.Invoke(e);

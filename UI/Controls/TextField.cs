@@ -46,7 +46,7 @@ public class TextField : VisualElement, INotifyValueChanged<string>, IPostLayout
     public TextField(string text = "")
     {
         AddToClassList("text-field");
-        Focusable = true;
+        Focusable = true; Role = "textbox";
         Style.Overflow = Overflow.Hidden;
         Style.SetBorderWidth(Edge.All, 1);
         Style.BorderColor = Color.Rgb(120, 120, 120);

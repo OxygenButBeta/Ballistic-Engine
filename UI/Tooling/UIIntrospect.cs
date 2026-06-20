@@ -37,6 +37,11 @@ public static class UIIntrospect
         sb.Append(",\"picking\":").Append(el.PickingEnabled ? "true" : "false");
         if (el.Focusable) sb.Append(",\"focusable\":true");
 
+        // Accessibility (P9.2): role + label, so the JSON IS a semantic tree (screen-reader / automation).
+        if (!string.IsNullOrEmpty(el.Role)) { sb.Append(",\"role\":"); Json(sb, el.Role); }
+        string a11yLabel = el.AccessibleLabel ?? (el is Label lbl ? lbl.Text : null);
+        if (!string.IsNullOrEmpty(a11yLabel)) { sb.Append(",\"label\":"); Json(sb, a11yLabel); }
+
         if (includeStyle)
         {
             var s = el.Style;

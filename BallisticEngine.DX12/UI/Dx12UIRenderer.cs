@@ -341,23 +341,29 @@ public sealed class Dx12UIRenderer : IUIRenderer, IDisposable
 
             for (int ci = 0; ci < line.Length; ci++)
             {
-                if (!atlas.TryGetGlyph(line[ci], out var g))
+                char ch = line[ci];
+                // Font fallback (P9.1): if the primary atlas lacks this glyph, pull it from the first
+                // fallback atlas that has it (CJK/emoji/symbols), binding that atlas's own GPU slot.
+                var glyphAtlas = UIFonts.AtlasForGlyph(atlas, ch);
+                if (!glyphAtlas.TryGetGlyph(ch, out var g))
                 {
-                    // Unknown glyph: advance by a space if we have one, else skip without stalling.
                     if (atlas.TryGetGlyph(' ', out var sp)) penX += sp.Advance * s;
                     continue;
                 }
+                var gfont = (glyphAtlas == atlas) ? font : EnsureFont(glyphAtlas);
+                SetTextureSlot(gfont.Slot);
+                float gInvAW = 1f / gfont.W, gInvAH = 1f / gfont.H;
+                float gs = glyphAtlas.BakePixelHeight > 0 ? fontSize / glyphAtlas.BakePixelHeight : s;
 
-                float gw = g.Width * s, gh = g.Height * s;
-                float gx = penX + g.OffsetX * s;
-                float gy = baseline + g.OffsetY * s;   // OffsetY is from baseline to glyph-quad top
+                float gw = g.Width * gs, gh = g.Height * gs;
+                float gx = penX + g.OffsetX * gs;
+                float gy = baseline + g.OffsetY * gs;
 
                 if (gw > 0 && gh > 0 && g.AtlasX1 > g.AtlasX0)
                 {
-                    float u0 = g.AtlasX0 * invAW, v0 = g.AtlasY0 * invAH;
-                    float u1 = g.AtlasX1 * invAW, v1 = g.AtlasY1 * invAH;
+                    float u0 = g.AtlasX0 * gInvAW, v0 = g.AtlasY0 * gInvAH;
+                    float u1 = g.AtlasX1 * gInvAW, v1 = g.AtlasY1 * gInvAH;
 
-                    // Drop shadow / glow: a second glyph pass behind, offset + tinted (P1.4).
                     if (style.HasShadow && style.ShadowColor.A > 0f)
                     {
                         Vector4 sc = style.ShadowColor.ToVector4();
@@ -365,7 +371,7 @@ public sealed class Dx12UIRenderer : IUIRenderer, IDisposable
                     }
                     PushGlyphQuad(gx, gy, gw, gh, u0, v0, u1, v1, col);
                 }
-                penX += g.Advance * s + (ci < line.Length - 1 ? letter : 0f);
+                penX += g.Advance * gs + (ci < line.Length - 1 ? letter : 0f);
             }
         }
     }

@@ -34,7 +34,7 @@ public class Slider : VisualElement, INotifyValueChanged<float>, IPostLayout
     public Slider()
     {
         AddToClassList("slider");
-        Focusable = true;
+        Focusable = true; Role = "slider";
         Style.Height = Length.Points(20);
         Style.JustifyContent = Justify.Center;
 

@@ -79,8 +79,12 @@ public sealed class LayoutNode
     // Solve the whole subtree rooted here. Call on the UIDocument root with the panel's pixel size;
     // afterwards every node's LayoutLeft/Top/Width/Height is the final box, in pixels, relative to
     // its parent's content box (Yoga convention).
+    // Layout direction for this (root) node — RTL mirrors the main axis (P9.1). Yoga propagates it down.
+    public LayoutDirection Direction { get; set; } = LayoutDirection.LTR;
+
     public void CalculateLayout(float availableWidth, float availableHeight) =>
-        YGNodeCalculateLayout(_node, availableWidth, availableHeight, YGDirection.LTR);
+        YGNodeCalculateLayout(_node, availableWidth, availableHeight,
+            Direction == LayoutDirection.RTL ? YGDirection.RTL : YGDirection.LTR);
 
     public float LayoutLeft => YGNodeLayoutGetLeft(_node);
     public float LayoutTop => YGNodeLayoutGetTop(_node);

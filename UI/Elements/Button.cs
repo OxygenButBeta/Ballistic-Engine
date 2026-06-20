@@ -16,7 +16,7 @@ public class Button : Label
     void Init()
     {
         TextAlign = TextAlign.MiddleCenter;
-        Focusable = true;                 // keyboard-navigable (P3.2)
+        Focusable = true; Role = "button";                 // keyboard-navigable (P3.2)
         // Activate on Enter/Space when focused (P3.3 navigation submit).
         KeyDown += e =>
         {

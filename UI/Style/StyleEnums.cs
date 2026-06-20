@@ -41,3 +41,7 @@ public enum Edge { Left, Top, Right, Bottom, Start, End, Horizontal, Vertical, A
 
 // Which axis a flex gap targets (CSS gap / row-gap / column-gap). (P4.5)
 public enum Gutter { All, Row, Column }
+
+// Text + layout direction (CSS direction). RTL mirrors the main axis + flips default text alignment.
+// (P9.1 — basic bidi container support; full per-run bidi reordering is a shaping concern.)
+public enum LayoutDirection { LTR, RTL }

@@ -32,7 +32,7 @@ public class Toggle : VisualElement, INotifyValueChanged<bool>
     public Toggle(string text = "")
     {
         AddToClassList("toggle");
-        Focusable = true;
+        Focusable = true; Role = "checkbox";
         Style.FlexDirection = FlexDirection.Row;
         Style.AlignItems = Align.Center;
         Style.Gap = 6;
