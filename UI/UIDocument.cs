@@ -76,6 +76,12 @@ public class UIDocument : Behaviour
     [NotSerialized] public VisualElement Root { get; private set; }
     [NotSerialized] public float ResolvedScale { get; private set; } = 1f;
 
+    // Overlay layer for popups (Dropdown lists, ContextMenu, Tooltip, Modal). It's the LAST child of Root
+    // — absolute, full-size, picking passes through except where a popup sits — so popups draw above all
+    // content (painter's order) and share the same solve/walk/input pass. Controls add their popups here
+    // via OwnerDocument.OverlayLayer.
+    [NotSerialized] public VisualElement OverlayLayer { get; private set; }
+
     readonly UIInputModule _input = new();
     // Parsed stylesheets, in application order. `Uss` may name several sheets (newline/comma/semicolon
     // separated) so a design can split base/theme/component sheets (P2.8). Single sheet = list of one.
@@ -133,6 +139,8 @@ public class UIDocument : Behaviour
         Root = UxmlLoader.LoadFromText(uxmlText);
         if (Root == null) return;
 
+        AddOverlayLayer();
+
         // Parse stylesheets. The resolved-style pipeline (StyleResolver) handles precedence — defaults →
         // inheritance → matched rules (specificity) → inline — so no separate inline re-assert is needed.
         _sheets.Clear();
@@ -160,6 +168,19 @@ public class UIDocument : Behaviour
         _restyleDirty.Clear();                    // a full resolve subsumes any queued per-element restyles
     }
 
+    // Creates the overlay layer as Root's last child (absolute, fills the canvas, picking passes through
+    // so it never steals input from content; popups added to it ARE pickable as normal children).
+    void AddOverlayLayer()
+    {
+        OverlayLayer = new Panel();
+        OverlayLayer.Name = "__overlay";
+        OverlayLayer.PickingEnabled = false;
+        OverlayLayer.Style.Position = PositionType.Absolute;
+        OverlayLayer.Style.Left = 0; OverlayLayer.Style.Top = 0;
+        OverlayLayer.Style.Right = 0; OverlayLayer.Style.Bottom = 0;
+        Root.Add(OverlayLayer);
+    }
+
     void AssignOwner(VisualElement el)
     {
         el.OwnerDocument = this;
@@ -172,6 +193,13 @@ public class UIDocument : Behaviour
         if (el is Label lbl) lbl.RefreshMeasureIfStale();
         var children = el.Children;
         for (int i = 0; i < children.Count; i++) RefreshMeasures(children[i]);
+    }
+
+    static void RunPostLayout(VisualElement el)
+    {
+        if (el is IPostLayout p) p.OnAfterLayout();
+        var children = el.Children;
+        for (int i = 0; i < children.Count; i++) RunPostLayout(children[i]);
     }
 
     // Re-resolve one element + its inheriting subtree (P2.2). Called when a class/state toggles so
@@ -232,6 +260,9 @@ public class UIDocument : Behaviour
 
         // Root fills the logical canvas unless the design set explicit root dimensions.
         LayoutPass.Solve(Root, logical.X, logical.Y);
+
+        // Post-layout: controls that position sub-parts from solved sizes (ScrollView thumb, etc.) run now.
+        RunPostLayout(Root);
     }
 
     // The logical canvas size from the last solve (pixels). Hosts need it to map screen-space mouse

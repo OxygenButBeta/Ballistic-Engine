@@ -79,6 +79,11 @@ public class VisualElement
     public bool Focusable { get; set; }
     public int TabIndex { get; set; }
 
+    // General-purpose user data slots (UITK's userData) — controls (ListView rows) stash an index/model
+    // here; game code can attach anything. Not serialized, not styled.
+    public object UserData { get; set; }
+    public int UserIndex { get; set; }
+
     internal void FirePointerDoubleClick(PointerEvent e) => PointerDoubleClick?.Invoke(e);
     internal void FirePointerMove(PointerEvent e) => PointerMove?.Invoke(e);
     internal void FirePointerWheel(PointerEvent e) => PointerWheel?.Invoke(e);
