@@ -17,7 +17,7 @@ namespace BallisticEngine.Editor;
 //
 // Styling: an entity header card, component headers with type icon + tinted stripe + overlaid
 // enable checkbox + a "..." menu, and Unity-style colored X/Y/Z chips on vector rows.
-internal sealed class InspectorPanel : IComponentInspectorHost {
+internal sealed class InspectorPanel : EditorWindow, IComponentInspectorHost {
     // Phase-7: the panel draws through the IEditorGui seam (EditorGui.Shared). Static so the internal-static
     // grid/row helpers (Row/BeginGrid/AcceptGuidDrop — shared with ComponentPreviews/AssetInspectors) reach
     // it too. The single stateless seam handle is set once at startup.
@@ -80,7 +80,16 @@ internal sealed class InspectorPanel : IComponentInspectorHost {
     static int instanceCounter;
     readonly int instanceId = instanceCounter++;
 
+    // EditorWindow identity: KEY stays EditorLayout.Inspector (the dock-.ini / sidecar id), DISPLAY is
+    // "Details" (EF12). WindowShell owns Begin/End; OnGui routes to the existing DrawContents body.
+    protected override void OnGui(IEditorGui gui) => DrawContents();
+
     public InspectorPanel(EditorState state) {
+        DockKey = EditorLayout.Inspector;
+        Title = "Details";
+        Icon = EditorIcons.Wrench;
+        Singleton = false;        // duplicable via the Add-Tab host
+
         this.state = state;
         componentGui = new ImGuiComponentGui(this);
         // The component-path drawer stack shares memberRegistry as its terminal type-drawer source, so the

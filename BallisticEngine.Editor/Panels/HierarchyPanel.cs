@@ -3,11 +3,12 @@ using SysVec4 = System.Numerics.Vector4;
 
 namespace BallisticEngine.Editor;
 
-// Two hierarchies as tabs: "Entities" (the scene's entity list) and "Scene" (scene-wide
-// SceneBehaviours: skybox, fog, ...). Selection from either drives the Inspector.
-// Rows carry a type icon (camera/light/mesh), an eye visibility toggle on the right edge,
-// and an accent bar marks the selection. The search box filters to a flat list.
-internal sealed class HierarchyPanel {
+// The ENTITY hierarchy window ("Entities"): the scene's entity tree. Rows carry a type icon
+// (camera/light/mesh), an eye visibility toggle on the right edge, and an accent bar marks the
+// selection. The search box filters to a flat list. The scene-wide SceneBehaviour list ("Scene
+// Components") is its own SceneHierarchyWindow below. (Kept the name HierarchyPanel so the engine's
+// HierarchyPanel.ScriptComponentType / .DropAssetsIntoScene call sites stay byte-identical.)
+internal sealed class HierarchyPanel : EditorWindow {
     // Phase-5: draws through the IEditorGui seam (EditorGui.Shared). Static so the internal-static drop
     // helpers (AcceptEntityDrop/AcceptAssetDrop) reach it too.
     static IEditorGui gui => EditorGui.Shared;
@@ -40,12 +41,20 @@ internal sealed class HierarchyPanel {
     // Prefab" writes the .prefab next to whatever the user is browsing. Falls back to "Assets".
     public Func<string> CurrentAssetFolder;
 
-    public HierarchyPanel(EditorState state) => this.state = state;
+    public HierarchyPanel(EditorState state) {
+        DockKey = EditorLayout.Entities;
+        Title = "Entities";
+        Icon = EditorIcons.Package;
+        Singleton = false;        // duplicable via the Add-Tab host
+        this.state = state;
+    }
 
-    // Entities and Scene-components are now SEPARATE dockable windows (hosted by EditorApplication),
-    // not inner tabs — so they can be split/rearranged. These are the two window bodies.
+    // This window draws the entity tree. The scene-wide SceneBehaviour list is the separate
+    // SceneHierarchyWindow (below). WindowShell owns Begin/End; OnGui routes to the entity body.
+    protected override void OnGui(IEditorGui gui) => DrawEntities();
+
+    // Public body for the DockPanelHost Add-Tab duplicate path (delegate-based, not yet EditorWindow).
     public void DrawEntitiesContents() => DrawEntities();
-    public void DrawSceneContents() => DrawSceneBehaviours();
 
     void DrawEntities() {
         Scene scene = SceneManager.GetCurrentScene();
@@ -453,14 +462,15 @@ internal sealed class HierarchyPanel {
         }
     }
 
-    static void DrawRowIcon(SysVec2 pos, string icon, SysVec4 tint, bool active) {
+    // internal so SceneHierarchyWindow (the sibling scene-component window) shares the same row chrome.
+    internal static void DrawRowIcon(SysVec2 pos, string icon, SysVec4 tint, bool active) {
         if (!active)
             tint = new SysVec4(tint.X, tint.Y, tint.Z, 0.45f);
         EditorIcons.DrawAt(pos, icon, tint);
     }
 
     // A slim accent bar on the window's left edge marking the selected row.
-    static void DrawSelectionBar(SysVec2 rowMin, SysVec2 rowMax) {
+    internal static void DrawSelectionBar(SysVec2 rowMin, SysVec2 rowMax) {
         float x = gui.WindowPos.X + 1;
         gui.WindowDrawList.AddRectFilled(new SysVec2(x, rowMin.Y), new SysVec2(x + 3, rowMax.Y),
             gui.ColorU32(gui.StyleColor(EditorStyleColor.CheckMark)));
@@ -877,6 +887,29 @@ internal sealed class HierarchyPanel {
         renameFocusPending = true;
     }
 
+}
+
+// The SCENE-COMPONENTS hierarchy window ("Scene Components"): the scene-wide SceneBehaviour list
+// (skybox, fog, lighting, ...). A separate dockable EditorWindow from the entity tree so the two can
+// be split/rearranged. Shares the entity hierarchy's row chrome (DrawRowIcon / DrawSelectionBar).
+internal sealed class SceneHierarchyWindow : EditorWindow {
+    static IEditorGui gui => EditorGui.Shared;
+
+    readonly EditorState state;
+
+    public SceneHierarchyWindow(EditorState state) {
+        DockKey = EditorLayout.SceneComponents;
+        Title = "Scene Components";
+        Icon = EditorIcons.World;
+        Singleton = false;        // duplicable via the Add-Tab host
+        this.state = state;
+    }
+
+    protected override void OnGui(IEditorGui gui) => DrawSceneBehaviours();
+
+    // Public body for the DockPanelHost Add-Tab duplicate path (delegate-based, not yet EditorWindow).
+    public void DrawSceneContents() => DrawSceneBehaviours();
+
     void DrawSceneBehaviours() {
         Scene scene = SceneManager.GetCurrentScene();
 
@@ -917,9 +950,9 @@ internal sealed class HierarchyPanel {
             if (!behaviour.IsEnabled)
                 gui.PopColor();
 
-            DrawRowIcon(gui.ItemRectMin + new SysVec2(4, 0), icon, tint, behaviour.IsEnabled);
+            HierarchyPanel.DrawRowIcon(gui.ItemRectMin + new SysVec2(4, 0), icon, tint, behaviour.IsEnabled);
             if (selected)
-                DrawSelectionBar(gui.ItemRectMin, gui.ItemRectMax);
+                HierarchyPanel.DrawSelectionBar(gui.ItemRectMin, gui.ItemRectMax);
 
             if (gui.BeginPopupContextItem($"##sbctx{behaviour.InstanceId}")) {
                 if (gui.MenuItem("Remove")) {

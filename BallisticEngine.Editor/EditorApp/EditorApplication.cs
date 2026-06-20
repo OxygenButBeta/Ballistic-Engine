@@ -27,6 +27,7 @@ internal sealed class EditorApplication {
     readonly ViewportRenderer viewport;   // single source for the Scene/Game offscreen render sequence
 
     readonly HierarchyPanel hierarchy;
+    readonly SceneHierarchyWindow sceneHierarchy;
     readonly InspectorPanel inspector;
     readonly AssetBrowserPanel assets;
 
@@ -166,6 +167,7 @@ internal sealed class EditorApplication {
                 pendingFocusWindow = EditorLayout.SceneView;
             });
         hierarchy = new HierarchyPanel(editorState);
+        sceneHierarchy = new SceneHierarchyWindow(editorState);
         inspector = new InspectorPanel(editorState);
         assets = new AssetBrowserPanel(editorState, () => imgui.Scale);
         assets.RequestScriptRebuild = RebuildScripts;
@@ -181,7 +183,7 @@ internal sealed class EditorApplication {
         extraPanels.Register(EditorLayout.Entities, "Entities", EditorIcons.Package,
             () => new HierarchyPanel(editorState), p => ((HierarchyPanel)p).DrawEntitiesContents());
         extraPanels.Register(EditorLayout.SceneComponents, "Scene Components", EditorIcons.World,
-            () => new HierarchyPanel(editorState), p => ((HierarchyPanel)p).DrawSceneContents());
+            () => new SceneHierarchyWindow(editorState), p => ((SceneHierarchyWindow)p).DrawSceneContents());
         extraPanels.Register(EditorLayout.Assets, "Assets", EditorIcons.Folder,
             () => new AssetBrowserPanel(editorState, () => imgui.Scale), p => ((AssetBrowserPanel)p).DrawContents());
         extraPanels.Register(EditorLayout.Console, "Console", EditorIcons.Document,
@@ -197,10 +199,10 @@ internal sealed class EditorApplication {
         // view and the docked view share one instance/state). The two viewports are flagged IsViewport
         // (their fullscreen draw is the render-target compositing path in DrawMaximizedViewport, not a
         // generic body) and are always available; registration order == the old hardcoded draw order.
-        panels.Register(EditorLayout.Entities, "Entities", EditorIcons.Package, hierarchy.DrawEntitiesContents);
-        panels.Register(EditorLayout.SceneComponents, "Scene Components", EditorIcons.World, hierarchy.DrawSceneContents);
-        panels.Register(EditorLayout.Inspector, "Details", EditorIcons.Wrench, inspector.DrawContents);  // EF12: KEY stays "Inspector", display = "Details"
-        panels.Register(EditorLayout.Assets, "Assets", EditorIcons.Folder, assets.DrawContents);
+        panels.Register(hierarchy, EditorLayout.Entities, "Entities", EditorIcons.Package);  // real EditorWindow
+        panels.Register(sceneHierarchy, EditorLayout.SceneComponents, "Scene Components", EditorIcons.World);  // real EditorWindow
+        panels.Register(inspector, EditorLayout.Inspector, "Details", EditorIcons.Wrench);  // real EditorWindow (EF12: KEY "Inspector", display "Details")
+        panels.Register(assets, EditorLayout.Assets, "Assets", EditorIcons.Folder);  // real EditorWindow
         panels.Register(console, EditorLayout.Console, "Console", EditorIcons.Document);  // real EditorWindow (Phase 1 pilot)
         panels.Register(EditorLayout.SceneView, "Scene View", EditorIcons.Camera, null, isViewport: true);
         panels.Register(EditorLayout.GameView, "Game View", EditorIcons.Play, null, isViewport: true);

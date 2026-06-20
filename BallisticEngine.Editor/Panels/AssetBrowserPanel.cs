@@ -14,7 +14,7 @@ namespace BallisticEngine.Editor;
 // Multi-selection: Ctrl+click toggles, Shift+click range-selects, Ctrl+A selects everything
 // visible, Delete removes the whole selection, dragging a selected tile drags all of them
 // (payload = ';'-joined GUIDs), and the context menu switches to batch actions.
-internal sealed class AssetBrowserPanel {
+internal sealed class AssetBrowserPanel : EditorWindow {
     // Phase-5: draws through the IEditorGui seam (EditorGui.Shared).
     static IEditorGui gui => EditorGui.Shared;
 
@@ -70,7 +70,15 @@ internal sealed class AssetBrowserPanel {
     // after creating/renaming a .cs so the component shows up in Add Component immediately.
     public Action RequestScriptRebuild;
 
+    // EditorWindow identity (WindowShell owns Begin/End; OnGui routes to the existing DrawContents body).
+    protected override void OnGui(IEditorGui gui) => DrawContents();
+
     public AssetBrowserPanel(EditorState state, Func<float> scale) {
+        DockKey = EditorLayout.Assets;
+        Title = "Assets";
+        Icon = EditorIcons.Folder;
+        Singleton = false;        // duplicable via the Add-Tab host
+
         this.state = state;
         this.scale = scale;
     }

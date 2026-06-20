@@ -311,13 +311,14 @@ internal sealed class ImGuiController : IDisposable {
     // NOTE: the bg0..titleBg ramp below is mirrored byte-for-byte in EditorTheme (Bg0..TitleBg) for the
     // in-viewport overlay chrome — RETUNE EditorTheme TOO when this changes (its comment mandates the sync).
     static void ApplyColors(SysVec4 accent) {
-        // A/B doors: env-var swaps in a ported theme instead of the engine's graphite palette, for
-        // comparison. Off by default — the graphite theme is the default.
+        // Theme selection. DEFAULT is now "Soft Dracula" (neutral elevation ramp + a single muted-purple
+        // accent). The two alternates are env-var opt-ins: BALLISTIC_SPECTRUM=1 for the Adobe-Spectrum port,
+        // BALLISTIC_GRAPHITE=1 for the original graphite+amber palette. Safe to re-run any frame (colors only).
         if (Environment.GetEnvironmentVariable("BALLISTIC_SPECTRUM") == "1") {
             SpectrumTheme.Apply();
             return;
         }
-        if (Environment.GetEnvironmentVariable("BALLISTIC_DRACULA") == "1") {
+        if (Environment.GetEnvironmentVariable("BALLISTIC_GRAPHITE") != "1") {
             DraculaTheme.Apply();
             return;
         }
