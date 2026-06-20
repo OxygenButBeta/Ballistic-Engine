@@ -105,8 +105,7 @@ internal static class ImGuiBoundaryTests {
         // adapters legitimately keep style/ScalarField raw-ImGui (the plan's pragmatic boundary) and stay.
         "BallisticEngine.Editor/Panels/InspectorPanel.cs",
         "BallisticEngine.Editor/Panels/Inspector/Adapters/ScalarField.cs",
-        // (ImGuiVolumeGui migrated — routes through EditorGui.Shared; dropped from the list.)
-        "BallisticEngine.Editor/Panels/Inspector/Adapters/ImGuiComponentGui.cs",
+        // (ImGuiVolumeGui + ImGuiComponentGui migrated — route through EditorGui.Shared; dropped from list.)
         "BallisticEngine.Editor/Panels/Inspector/Preview/ComponentPreviews.cs",
         "BallisticEngine.Editor/Panels/Inspector/InspectorLayout.cs",
         "BallisticEngine.Editor/Panels/Inspector/AssetInspectors/AssetInspectors.cs",

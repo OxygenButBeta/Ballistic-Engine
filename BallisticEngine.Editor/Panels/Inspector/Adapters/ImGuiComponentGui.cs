@@ -1,6 +1,5 @@
 using System;
 using System.Reflection;
-using Hexa.NET.ImGui;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec3 = System.Numerics.Vector3;
 
@@ -76,7 +75,12 @@ public interface IComponentInspectorHost {
     void DrawNestedSlot(IProperty property, Type declaredType);
 }
 
+// Phase-7: routes through the IEditorGui seam (EditorGui.Shared) instead of raw ImGui — zero ImGui import.
+// The host callbacks (RowWithTooltip / DrawMixedMarker / TrackUndo / AxisVec3) carry the InspectorPanel's
+// undo + multi-select machinery and stay; ScalarField stays a static helper (plan's pragmatic boundary).
 public sealed class ImGuiComponentGui : IInspectorGui {
+    static IEditorGui gui => EditorGui.Shared;
+
     readonly IComponentInspectorHost host;
     string label;
 
@@ -87,49 +91,49 @@ public sealed class ImGuiComponentGui : IInspectorGui {
     // host that wants to override the label before a manual drawer call (none today; harmless to retain).
     public void SetUndoLabel(string fullLabel) => label = fullLabel;
 
-    public void PushId(string id) => ImGui.PushID(id);
-    public void PopId() => ImGui.PopID();
-    public void BeginDisabled() => ImGui.BeginDisabled();
-    public void EndDisabled() => ImGui.EndDisabled();
+    public void PushId(string id) => gui.PushId(id);
+    public void PopId() => gui.PopId();
+    public void BeginDisabled() => gui.BeginDisabled();
+    public void EndDisabled() => gui.EndDisabled();
 
     public void BeginRow(IProperty p) {
         host.RowWithTooltip(p.Label, p.Tooltip);
         if (p is MemberProperty mp) host.DrawMixedMarker(mp.Member, mp.Owner, mp.Get());
-        ImGui.SetNextItemWidth(-1);
+        gui.SetNextItemWidth(-1);
         label = $"Edit {p.Label}";
     }
     public void EndRow() { }
 
     public void Header(string t) => EditorDecoration.DrawSectionHeader(t);
-    public void Space(float h) => ImGui.Dummy(new SysVec2(0, h));
-    public void HelpBox(string t) => ImGui.TextWrapped(t);
+    public void Space(float h) => gui.Dummy(new SysVec2(0, h));
+    public void HelpBox(string t) => gui.TextWrapped(t);
 
     public bool Checkbox(ref bool v) {
         // Tighter padding than the global FramePadding so a checkbox isn't an oversized input-sized box.
-        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new SysVec2(2, 2) * EditorTheme.UiScale);
-        bool changed = host.TrackUndo(label, ImGui.Checkbox("##v", ref v));
-        ImGui.PopStyleVar();
+        gui.PushFramePadding(new SysVec2(2, 2) * EditorTheme.UiScale);
+        bool changed = host.TrackUndo(label, gui.Checkbox("##v", ref v));
+        gui.PopStyleVar();
         return changed;
     }
     public bool SliderFloat(ref float v, float min, float max) {
-        ImGui.PushStyleColor(ImGuiCol.SliderGrab, EditorTheme.SliderGrabRest);   // EF11: legible value over the grab
+        gui.PushColor(EditorStyleColor.SliderGrab, EditorTheme.SliderGrabRest);   // EF11: legible value over the grab
         bool changed = host.TrackUndo(label, ScalarField.SliderFloat("##v", ref v, min, max, "%.3f"));  // double-click to type
-        ImGui.PopStyleColor();
+        gui.PopColor();
         return changed;
     }
     public bool DragFloat(ref float v, float speed) => host.TrackUndo(label, ScalarField.DragFloat("##v", ref v, speed, 0, 0, "%.3f"));
     public bool SliderInt(ref int v, int min, int max) {
-        ImGui.PushStyleColor(ImGuiCol.SliderGrab, EditorTheme.SliderGrabRest);   // EF11: legible value over the grab
+        gui.PushColor(EditorStyleColor.SliderGrab, EditorTheme.SliderGrabRest);   // EF11: legible value over the grab
         bool changed = host.TrackUndo(label, ScalarField.SliderInt("##v", ref v, min, max));
-        ImGui.PopStyleColor();
+        gui.PopColor();
         return changed;
     }
     public bool DragInt(ref int v) => host.TrackUndo(label, ScalarField.DragInt("##v", ref v));
-    public bool InputText(ref string v, int maxLength) => host.TrackUndo(label, ImGui.InputText("##v", ref v, (uint)maxLength));
-    public bool Combo(ref int index, string[] names) => host.TrackUndo(label, ImGui.Combo("##v", ref index, names, names.Length));
+    public bool InputText(ref string v, int maxLength) => host.TrackUndo(label, gui.InputText("##v", ref v, maxLength));
+    public bool Combo(ref int index, string[] names) => host.TrackUndo(label, gui.Combo("##v", ref index, names));
     public bool ColorEdit3(ref SysVec3 v, bool hdr) =>
-        host.TrackUndo(label, ImGui.ColorEdit3("##v", ref v, hdr ? ImGuiColorEditFlags.Hdr | ImGuiColorEditFlags.Float : ImGuiColorEditFlags.None));
-    public bool DragFloat2(ref SysVec2 v, float speed) => host.TrackUndo(label, ImGui.DragFloat2("##v", ref v, speed));
+        host.TrackUndo(label, hdr ? gui.ColorEdit3Hdr("##v", ref v) : gui.ColorEdit3("##v", ref v));
+    public bool DragFloat2(ref SysVec2 v, float speed) => host.TrackUndo(label, gui.DragFloat2("##v", ref v, speed));
     public bool DragFloat3(ref SysVec3 v, float speed) => host.AxisVec3("v3", label, ref v, speed); // AxisVec3 owns its undo
-    public void Unsupported(Type t) => ImGui.TextDisabled($"({t.Name})");
+    public void Unsupported(Type t) => gui.TextDisabled($"({t.Name})");
 }
