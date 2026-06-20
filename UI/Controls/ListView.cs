@@ -23,10 +23,41 @@ public class ListView : VisualElement, IPostLayout
     public int BufferRows { get; set; } = 2;        // extra rows above/below the viewport
 
     IList _items;
+    Action _observableHandler;
     public IList ItemsSource
     {
         get => _items;
-        set { _items = value; _spacer.Style.Height = Length.Points(TotalHeight); _scroll.ScrollOffset = 0; Rebuild(); }
+        set
+        {
+            // Detach from a previous observable source.
+            if (_items is { } prev && _observableHandler != null && prev.GetType().GetEvent("Changed") is { } ev)
+                ev.RemoveEventHandler(prev, _observableHandler);
+
+            _items = value;
+
+            // Auto-refresh when the source is observable (P7.3): subscribe to its Changed event.
+            _observableHandler = null;
+            var evt = value?.GetType().GetEvent("Changed");
+            if (evt != null)
+            {
+                _observableHandler = OnSourceChanged;
+                evt.AddEventHandler(value, _observableHandler);
+            }
+
+            _spacer.Style.Height = Length.Points(TotalHeight);
+            _scroll.ScrollOffset = 0;
+            Rebuild();
+        }
+    }
+
+    void OnSourceChanged()
+    {
+        // Data changed: drop realized rows so they rebind to the new contents, resize the virtual height.
+        foreach (var kv in _realized) { kv.Value.Style.Display = DisplayStyle.None; _pool.Push(kv.Value); }
+        _realized.Clear();
+        _spacer.Style.Height = Length.Points(TotalHeight);
+        _lastScroll = -1;   // force a re-virtualize next layout
+        Rebuild();
     }
 
     public event Action<int> ItemClicked;
