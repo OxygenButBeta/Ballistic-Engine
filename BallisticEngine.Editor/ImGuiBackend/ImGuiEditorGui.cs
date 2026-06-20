@@ -105,6 +105,11 @@ internal sealed class ImGuiEditorGui : IEditorGui {
         if (f.HasFlag(EditorTreeFlags.DefaultOpen)) r |= ImGuiTreeNodeFlags.DefaultOpen;
         if (f.HasFlag(EditorTreeFlags.Framed)) r |= ImGuiTreeNodeFlags.Framed;
         if (f.HasFlag(EditorTreeFlags.SpanAvailWidth)) r |= ImGuiTreeNodeFlags.SpanAvailWidth;
+        if (f.HasFlag(EditorTreeFlags.OpenOnArrow)) r |= ImGuiTreeNodeFlags.OpenOnArrow;
+        if (f.HasFlag(EditorTreeFlags.AllowOverlap)) r |= ImGuiTreeNodeFlags.AllowOverlap;
+        if (f.HasFlag(EditorTreeFlags.Selected)) r |= ImGuiTreeNodeFlags.Selected;
+        if (f.HasFlag(EditorTreeFlags.Leaf)) r |= ImGuiTreeNodeFlags.Leaf;
+        if (f.HasFlag(EditorTreeFlags.NoTreePushOnOpen)) r |= ImGuiTreeNodeFlags.NoTreePushOnOpen;
         return r;
     }
     public bool BeginChild(string id, Vector2 size, bool border) =>
@@ -192,6 +197,31 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public bool IsWindowAppearing() => ImGui.IsWindowAppearing();
     public void SetKeyboardFocusHere() => ImGui.SetKeyboardFocusHere();
     public bool KeyPressed(EditorGuiKey key) => input.KeyPressed(key);
+
+    // ---- drag-drop (sources) ----
+    public bool BeginDragDropSource() => ImGui.BeginDragDropSource();
+    public void EndDragDropSource() => ImGui.EndDragDropSource();
+    public unsafe void SetDragDropPayloadInt(string type, int value) =>
+        ImGui.SetDragDropPayload(type, &value, sizeof(int));
+    public unsafe void SetDragDropPayloadString(string type, string value) {
+        byte[] bytes = System.Text.Encoding.ASCII.GetBytes(value ?? "");
+        fixed (byte* p = bytes)
+            ImGui.SetDragDropPayload(type, p, (nuint)bytes.Length);
+    }
+
+    // ---- misc item / window / tree / input ----
+    public bool IsItemDeactivated() => ImGui.IsItemDeactivated();
+    public bool IsItemToggledOpen() => ImGui.IsItemToggledOpen();
+    public bool IsWindowFocused() => ImGui.IsWindowFocused();
+    public bool IsWindowFocusedIncludingChildren() => ImGui.IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows);
+    public bool IsMouseDoubleClicked(int button) => ImGui.IsMouseDoubleClicked((ImGuiMouseButton)button);
+    public void SetNextItemOpen(bool open) => ImGui.SetNextItemOpen(open);
+    public bool BeginPopupContextWindow(string id) => ImGui.BeginPopupContextWindow(id);
+    public bool BeginPopupContextWindowEmpty(string id) =>
+        ImGui.BeginPopupContextWindow(id, ImGuiPopupFlags.MouseButtonRight | ImGuiPopupFlags.NoOpenOverItems);
+    public bool WantTextInput => ImGui.GetIO().WantTextInput;
+    public bool KeyCtrl => ImGui.GetIO().KeyCtrl;
+    public bool KeyShift => ImGui.GetIO().KeyShift;
 
     // ---- drag-drop (targets) ----
     public bool BeginDragDropTarget() => ImGui.BeginDragDropTarget();
@@ -284,6 +314,10 @@ internal sealed class ImGuiInputAdapter : IEditorInput {
         EditorGuiKey.RightArrow => ImGuiKey.RightArrow,
         EditorGuiKey.UpArrow => ImGuiKey.UpArrow,
         EditorGuiKey.DownArrow => ImGuiKey.DownArrow,
+        EditorGuiKey.A => ImGuiKey.A,
+        EditorGuiKey.D => ImGuiKey.D,
+        EditorGuiKey.G => ImGuiKey.G,
+        EditorGuiKey.F2 => ImGuiKey.F2,
         _ => ImGuiKey.None,
     };
 }

@@ -163,6 +163,27 @@ public interface IEditorGui {
     string AcceptDragDropPayloadString(string type);
     void EndDragDropTarget();
 
+    // ---- drag-drop (sources, Phase 5) ----
+    // Begin a drag FROM the last item; set the payload (int hash for entities, string for asset paths); draw
+    // a small drag preview; End. Wrap a Begin/Set/preview/End block guarded by the BeginDragDropSource bool.
+    bool BeginDragDropSource();
+    void SetDragDropPayloadInt(string type, int value);
+    void SetDragDropPayloadString(string type, string value);
+    void EndDragDropSource();
+
+    // ---- misc item / window / tree / input state ----
+    bool IsItemDeactivated();
+    bool IsItemToggledOpen();
+    bool IsWindowFocused();
+    bool IsWindowFocusedIncludingChildren();         // RootAndChildWindows (hierarchy keyboard shortcuts)
+    bool IsMouseDoubleClicked(int button);
+    void SetNextItemOpen(bool open);
+    bool BeginPopupContextWindow(string id);
+    bool BeginPopupContextWindowEmpty(string id);    // right-click only on EMPTY space (NoOpenOverItems)
+    bool WantTextInput { get; }                      // a text field has keyboard focus (suppress shortcuts)
+    bool KeyCtrl { get; }
+    bool KeyShift { get; }
+
     // ---- fonts ----
     // The editor's named fonts (Body/Header/Caption/Display + the Bold variant). Push one, draw, pop — keeps
     // ImFontPtr out of window bodies. FontSize reads a font's pixel size (header-card layout math).
@@ -216,6 +237,11 @@ public enum EditorTreeFlags {
     DefaultOpen = 1 << 0,
     Framed = 1 << 1,
     SpanAvailWidth = 1 << 2,
+    OpenOnArrow = 1 << 3,
+    AllowOverlap = 1 << 4,
+    Selected = 1 << 5,
+    Leaf = 1 << 6,
+    NoTreePushOnOpen = 1 << 7,
 }
 
 // Seam-local table flags (subset actually used by panels) — keeps ImGuiTableFlags out of window bodies.
@@ -289,4 +315,5 @@ public enum EditorCorner {
 public enum EditorGuiKey {
     F, Delete, Escape, Enter,
     LeftArrow, RightArrow, UpArrow, DownArrow,
+    A, D, G, F2,
 }

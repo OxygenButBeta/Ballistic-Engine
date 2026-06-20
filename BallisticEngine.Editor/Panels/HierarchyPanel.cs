@@ -1,4 +1,3 @@
-using Hexa.NET.ImGui;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec4 = System.Numerics.Vector4;
 
@@ -9,6 +8,10 @@ namespace BallisticEngine.Editor;
 // Rows carry a type icon (camera/light/mesh), an eye visibility toggle on the right edge,
 // and an accent bar marks the selection. The search box filters to a flat list.
 internal sealed class HierarchyPanel {
+    // Phase-5: draws through the IEditorGui seam (EditorGui.Shared). Static so the internal-static drop
+    // helpers (AcceptEntityDrop/AcceptAssetDrop) reach it too.
+    static IEditorGui gui => EditorGui.Shared;
+
     readonly EditorState state;
 
     // Inline-rename state: the entity being renamed (by id) and the edit buffer.
@@ -49,29 +52,29 @@ internal sealed class HierarchyPanel {
 
         // Toolbar: create (+), delete, then the search field filling the rest of the row.
         if (EditorIcons.GhostButton("hieradd", EditorIcons.Add, "Create entity"))
-            ImGui.OpenPopup("##hiercreate");
-        if (ImGui.BeginPopup("##hiercreate")) {
+            gui.OpenPopup("##hiercreate");
+        if (gui.BeginPopup("##hiercreate")) {
             DrawCreateMenu(scene);
-            ImGui.EndPopup();
+            gui.EndPopup();
         }
 
-        ImGui.SameLine(0, 2);
-        ImGui.BeginDisabled(state.Selected is null);
+        gui.SameLine(0, 2);
+        gui.BeginDisabled(state.Selected is null);
         if (EditorIcons.GhostButton("hierdel", EditorIcons.Delete, "Delete selected (Del)"))
             DeleteSelected(scene);
-        ImGui.EndDisabled();
+        gui.EndDisabled();
 
         // Collapse-all / expand-all: arm a one-frame force the tree applies via SetNextItemOpen (EF13).
-        ImGui.SameLine(0, 2);
+        gui.SameLine(0, 2);
         if (EditorIcons.GhostButton("hiercollapse", EditorIcons.ChevronRight, "Collapse All"))
             pendingForce = ExpandForce.CollapseAll;
-        ImGui.SameLine(0, 2);
+        gui.SameLine(0, 2);
         if (EditorIcons.GhostButton("hierexpand", EditorIcons.ChevronDown, "Expand All"))
             pendingForce = ExpandForce.ExpandAll;
 
-        ImGui.SameLine(0, 6);
-        ImGui.SetNextItemWidth(-1);
-        ImGui.InputTextWithHint("##hiersearch", $"{EditorIcons.Search} Search (t:Component)...", ref search, 128);
+        gui.SameLine(0, 6);
+        gui.SetNextItemWidth(-1);
+        gui.InputTextWithHint("##hiersearch", $"{EditorIcons.Search} Search (t:Component)...", ref search, 128);
 
         EditorDecoration.DrawDivider();
 
@@ -86,7 +89,7 @@ internal sealed class HierarchyPanel {
 
         // A full-height child as the drop area (minus a slim count footer), so dragging an
         // entity onto empty space unparents it.
-        ImGui.BeginChild("##hiertree", new SysVec2(0, -ImGui.GetTextLineHeightWithSpacing()));
+        gui.BeginChild("##hiertree", new SysVec2(0, -gui.TextLineHeightWithSpacing), border: false);
 
         if (search.Length > 0) {
             DrawFilteredList(entities);
@@ -99,13 +102,12 @@ internal sealed class HierarchyPanel {
 
         // Right-click empty space INSIDE the child (where the empty area actually is) â†’ create menu.
         // Must be opened against this child window, not the outer Hierarchy window.
-        if (ImGui.BeginPopupContextWindow("##hierctx",
-                ImGuiPopupFlags.MouseButtonRight | ImGuiPopupFlags.NoOpenOverItems)) {
+        if (gui.BeginPopupContextWindowEmpty("##hierctx")) {
             DrawCreateMenu(scene);
-            ImGui.EndPopup();
+            gui.EndPopup();
         }
 
-        ImGui.EndChild();
+        gui.EndChild();
 
         // The collapse/expand-all force is consumed for exactly this one frame — every node has now
         // read it (or, while filtering, none did). Clear it so the user's subsequent toggles stick.
@@ -114,7 +116,7 @@ internal sealed class HierarchyPanel {
         // Drop on the empty child area â†’ unparent to world; model assets from the browser
         // instantiate as entities (one per source mesh for splitByNodes imports); script assets
         // create a fresh entity carrying that component (Unity behavior).
-        if (ImGui.BeginDragDropTarget()) {
+        if (gui.BeginDragDropTarget()) {
             if (AcceptEntityDrop(entities, out Entity dropped) && dropped.transform.Parent is not null) {
                 EditorCommands.Structural("Unparent", () => dropped.transform.SetParentKeepingWorld(null));
             }
@@ -123,24 +125,24 @@ internal sealed class HierarchyPanel {
                 InstantiatePrefabs(droppedAssets);
                 CreateEntitiesFromScripts(scene, droppedAssets);
             }
-            ImGui.EndDragDropTarget();
+            gui.EndDragDropTarget();
         }
 
-        ImGui.TextDisabled(entities.Length == 1 ? "1 entity" : $"{entities.Length} entities");
+        gui.TextDisabled(entities.Length == 1 ? "1 entity" : $"{entities.Length} entities");
 
         // Keyboard shortcuts when the hierarchy is focused and not mid-rename. Operate on the whole
         // multi-selection. Ctrl+A selects every visible entity.
-        if (ImGui.IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows) && renamingId == -1 &&
-            !ImGui.GetIO().WantTextInput) {
-            if (ImGui.GetIO().KeyCtrl && ImGui.IsKeyPressed(ImGuiKey.A) && entities.Length > 0)
+        if (gui.IsWindowFocusedIncludingChildren() && renamingId == -1 &&
+            !gui.WantTextInput) {
+            if (gui.KeyCtrl && gui.KeyPressed(EditorGuiKey.A) && entities.Length > 0)
                 state.SelectEntities(entities, entities[^1]);
             if (state.Selected is not null) {
-                if (ImGui.GetIO().KeyCtrl && ImGui.IsKeyPressed(ImGuiKey.D))
+                if (gui.KeyCtrl && gui.KeyPressed(EditorGuiKey.D))
                     DuplicateSelected(scene);
-                if (ImGui.IsKeyPressed(ImGuiKey.Delete))
+                if (gui.KeyPressed(EditorGuiKey.Delete))
                     DeleteSelected(scene);
                 // Ctrl+Shift+G: wrap the selection in a new parent "Group" (Unity), keeping world poses.
-                if (ImGui.GetIO().KeyCtrl && ImGui.GetIO().KeyShift && ImGui.IsKeyPressed(ImGuiKey.G))
+                if (gui.KeyCtrl && gui.KeyShift && gui.KeyPressed(EditorGuiKey.G))
                     GroupSelected(scene);
             }
         }
@@ -280,17 +282,17 @@ internal sealed class HierarchyPanel {
             (string icon, SysVec4 tint) = EditorIcons.ForEntity(entity);
 
             if (!entity.IsActive)
-                ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
-            if (ImGui.Selectable($"      {entity.Name}##s{id}", selected)) {
-                if (ImGui.GetIO().KeyCtrl) state.ToggleEntity(entity);
+                gui.PushColor(EditorStyleColor.Text, gui.StyleColor(EditorStyleColor.TextDisabled));
+            if (gui.Selectable($"      {entity.Name}##s{id}", selected)) {
+                if (gui.KeyCtrl) state.ToggleEntity(entity);
                 else state.Select(entity);
             }
             if (!entity.IsActive)
-                ImGui.PopStyleColor();
+                gui.PopColor();
 
-            DrawRowIcon(ImGui.GetItemRectMin() + new SysVec2(4, 0), icon, tint, entity.IsActive);
+            DrawRowIcon(gui.ItemRectMin + new SysVec2(4, 0), icon, tint, entity.IsActive);
             if (selected)
-                DrawSelectionBar(ImGui.GetItemRectMin(), ImGui.GetItemRectMax());
+                DrawSelectionBar(gui.ItemRectMin, gui.ItemRectMax);
         }
     }
 
@@ -299,11 +301,11 @@ internal sealed class HierarchyPanel {
 
         // Inline rename takes over the row.
         if (renamingId == id) {
-            ImGui.SetNextItemWidth(-1);
-            if (renameFocusPending) { ImGui.SetKeyboardFocusHere(); renameFocusPending = false; }
-            ImGui.InputText($"##rename{id}", ref renameBuffer, 128);
-            var commit = ImGui.IsItemDeactivatedAfterEdit() || ImGui.IsKeyPressed(ImGuiKey.Enter);
-            if (commit || ImGui.IsItemDeactivated()) {
+            gui.SetNextItemWidth(-1);
+            if (renameFocusPending) { gui.SetKeyboardFocusHere(); renameFocusPending = false; }
+            gui.InputText($"##rename{id}", ref renameBuffer, 128);
+            var commit = gui.IsItemDeactivatedAfterEdit() || gui.KeyPressed(EditorGuiKey.Enter);
+            if (commit || gui.IsItemDeactivated()) {
                 if (commit && !string.IsNullOrWhiteSpace(renameBuffer)) {
                     // Single-entity value edit -> scoped through EditorCommands.EditEntity (PushEntity:
                     // selection survives, no whole-scene re-bake), the preferred path for one-entity edits.
@@ -330,15 +332,15 @@ internal sealed class HierarchyPanel {
                     ExpandForce.CollapseAll => false,
                     _ => false,   // first-seen default = collapsed (EF14)
                 };
-                ImGui.SetNextItemOpen(wantOpen);
+                gui.SetNextItemOpen(wantOpen);
                 openState[id] = wantOpen;
             }
         }
 
-        var flags = ImGuiTreeNodeFlags.OpenOnArrow | ImGuiTreeNodeFlags.SpanAvailWidth |
-                    ImGuiTreeNodeFlags.AllowOverlap;
-        if (selected) flags |= ImGuiTreeNodeFlags.Selected;
-        if (children.Count == 0) flags |= ImGuiTreeNodeFlags.Leaf | ImGuiTreeNodeFlags.NoTreePushOnOpen;
+        var flags = EditorTreeFlags.OpenOnArrow | EditorTreeFlags.SpanAvailWidth |
+                    EditorTreeFlags.AllowOverlap;
+        if (selected) flags |= EditorTreeFlags.Selected;
+        if (children.Count == 0) flags |= EditorTreeFlags.Leaf | EditorTreeFlags.NoTreePushOnOpen;
 
         // Label colour priority: inactive greys out, then a prefab-instance root tints blue (Unity's
         // prefab colour), then CHILD entities (anything with a parent) read slightly dimmer than roots
@@ -346,14 +348,14 @@ internal sealed class HierarchyPanel {
         bool isChild = entity.transform.Parent is not null;
         bool tinted = !entity.IsActive || entity.IsPrefabInstance || isChild;
         if (tinted) {
-            SysVec4 col = !entity.IsActive ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
+            SysVec4 col = !entity.IsActive ? gui.StyleColor(EditorStyleColor.TextDisabled)
                 : entity.IsPrefabInstance ? EditorTheme.PrefabBlue   // Unity's prefab-instance tint
                 : EditorTheme.RowChild;   // child: dimmer than a root's white
-            ImGui.PushStyleColor(ImGuiCol.Text, col);
+            gui.PushColor(EditorStyleColor.Text, col);
         }
 
         // Leading spaces leave room for the type icon overlaid after the arrow.
-        bool open = ImGui.TreeNodeEx($"     {entity.Name}##{id}", flags);
+        bool open = gui.TreeNodeEx($"     {entity.Name}##{id}", flags);
 
         // Remember ImGui's actual open state so a manual arrow toggle persists across frames (and so the
         // next Collapse/Expand-All starts from the truth). A leaf reports closed but has nothing to track.
@@ -361,21 +363,20 @@ internal sealed class HierarchyPanel {
             openState[id] = open;
 
         if (tinted)
-            ImGui.PopStyleColor();
+            gui.PopColor();
 
         // Capture the row rect/hover NOW â€” popups and drag-drop below overwrite "last item" data.
-        SysVec2 rowMin = ImGui.GetItemRectMin();
-        SysVec2 rowMax = ImGui.GetItemRectMax();
-        bool rowHovered = ImGui.IsItemHovered();
+        SysVec2 rowMin = gui.ItemRectMin;
+        SysVec2 rowMax = gui.ItemRectMax;
+        bool rowHovered = gui.IsItemHovered();
 
         // Click (not on the arrow) selects. Ctrl toggles into the multi-selection; Shift extends a
         // range from the active entity over the currently visible (flattened) order; plain click selects
         // just this one (Unity behavior).
-        if (ImGui.IsItemClicked() && !ImGui.IsItemToggledOpen()) {
-            ImGuiIOPtr io = ImGui.GetIO();
-            if (io.KeyCtrl)
+        if (gui.IsItemClicked() && !gui.IsItemToggledOpen()) {
+            if (gui.KeyCtrl)
                 state.ToggleEntity(entity);
-            else if (io.KeyShift && state.Selected is not null)
+            else if (gui.KeyShift && state.Selected is not null)
                 state.SelectEntities(RangeBetween(allEntities, state.Selected, entity), entity);
             else
                 state.Select(entity);
@@ -384,15 +385,15 @@ internal sealed class HierarchyPanel {
         // Drag source: carries the entity id. Drop target: reparent the dragged entity onto this one.
         HandleDragDrop(scene, entity, allEntities);
 
-        if (selected && (ImGui.IsKeyPressed(ImGuiKey.F2) ||
-                         (rowHovered && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))))
+        if (selected && (gui.KeyPressed(EditorGuiKey.F2) ||
+                         (rowHovered && gui.IsMouseDoubleClicked(0))))
             BeginRename(entity);
 
         DrawEntityContextMenu(scene, entity, id);
 
         // Type icon between the arrow and the label.
         (string icon, SysVec4 tint) = EditorIcons.ForEntity(entity);
-        DrawRowIcon(new SysVec2(rowMin.X + ImGui.GetTreeNodeToLabelSpacing(), rowMin.Y), icon, tint,
+        DrawRowIcon(new SysVec2(rowMin.X + gui.TreeNodeToLabelSpacing, rowMin.Y), icon, tint,
             entity.IsActive);
 
         if (selected)
@@ -401,10 +402,10 @@ internal sealed class HierarchyPanel {
         // Eye toggle pinned to the row's right edge; shown when relevant so rows stay calm.
         if (rowHovered || !entity.IsActive || selected) {
             float eyeW = EditorIcons.SmallButtonWidth(EditorIcons.Eye);
-            ImGui.SameLine();
-            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - eyeW);
-            ImGui.PushStyleColor(ImGuiCol.Text, entity.IsActive
-                ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
+            gui.SameLine();
+            gui.CursorPosX = (gui.CursorPosX + gui.ContentRegionAvail.X - eyeW);
+            gui.PushColor(EditorStyleColor.Text, entity.IsActive
+                ? gui.StyleColor(EditorStyleColor.TextDisabled)
                 : EditorTheme.IconMuted);
             if (EditorIcons.GhostButtonSmall($"eye{id}", EditorIcons.Eye,
                     entity.IsActive ? "Hide (deactivate)" : "Show (activate)")) {
@@ -422,24 +423,24 @@ internal sealed class HierarchyPanel {
                 });
                 state.MarkViewportDirty();
             }
-            ImGui.PopStyleColor();
+            gui.PopColor();
         }
 
         if (open && children.Count > 0) {
             // Tree connector lines (code-editor / Unity style): a vertical guide down the indent gutter
             // plus a short horizontal "elbow" into each child row. Drawn after the children so we know
             // their row Ys; the vertical stops at the LAST child's elbow (Unity convention).
-            ImDrawListPtr dl = ImGui.GetWindowDrawList();
-            uint lineCol = ImGui.GetColorU32(EditorTheme.TreeGuide);
-            float gutterX = rowMin.X + ImGui.GetTreeNodeToLabelSpacing() * 0.5f;
-            float elbowW = ImGui.GetTreeNodeToLabelSpacing() * 0.42f;
-            float halfRow = ImGui.GetFrameHeight() * 0.5f;
+            IEditorDrawList dl = gui.WindowDrawList;
+            uint lineCol = gui.ColorU32(EditorTheme.TreeGuide);
+            float gutterX = rowMin.X + gui.TreeNodeToLabelSpacing * 0.5f;
+            float elbowW = gui.TreeNodeToLabelSpacing * 0.42f;
+            float halfRow = gui.FrameHeight * 0.5f;
             float lastChildY = rowMin.Y;
 
             foreach (Entity child in children) {
                 // Capture the child row's top BEFORE drawing it — a child with its own subtree changes
                 // "last item", so derive the elbow Y from the cursor (this child's row top) instead.
-                float childTopY = ImGui.GetCursorScreenPos().Y;
+                float childTopY = gui.CursorScreenPos.Y;
                 DrawEntityNode(scene, child, allEntities);
                 float midY = childTopY + halfRow;
                 dl.AddLine(new SysVec2(gutterX, midY), new SysVec2(gutterX + elbowW, midY), lineCol, 1f);
@@ -448,7 +449,7 @@ internal sealed class HierarchyPanel {
             // Vertical guide from just under this node's row down to the last child's elbow.
             dl.AddLine(new SysVec2(gutterX, rowMax.Y), new SysVec2(gutterX, lastChildY), lineCol, 1f);
 
-            ImGui.TreePop();
+            gui.TreePop();
         }
     }
 
@@ -460,13 +461,13 @@ internal sealed class HierarchyPanel {
 
     // A slim accent bar on the window's left edge marking the selected row.
     static void DrawSelectionBar(SysVec2 rowMin, SysVec2 rowMax) {
-        float x = ImGui.GetWindowPos().X + 1;
-        ImGui.GetWindowDrawList().AddRectFilled(new SysVec2(x, rowMin.Y), new SysVec2(x + 3, rowMax.Y),
-            ImGui.GetColorU32(ImGuiCol.CheckMark));
+        float x = gui.WindowPos.X + 1;
+        gui.WindowDrawList.AddRectFilled(new SysVec2(x, rowMin.Y), new SysVec2(x + 3, rowMax.Y),
+            gui.ColorU32(gui.StyleColor(EditorStyleColor.CheckMark)));
     }
 
     void DrawEntityContextMenu(Scene scene, Entity entity, int id) {
-        if (!ImGui.BeginPopupContextItem($"##entctx{id}"))
+        if (!gui.BeginPopupContextItem($"##entctx{id}"))
             return;
 
         // Right-clicking a row that's NOT already in the selection selects just it (Unity); right-
@@ -477,50 +478,49 @@ internal sealed class HierarchyPanel {
         int count = state.SelectedEntities.Count;
         string suffix = count > 1 ? $" ({count})" : "";
 
-        if (count == 1 && ImGui.MenuItem("Rename", "F2")) BeginRename(entity);
+        if (count == 1 && gui.MenuItem("Rename", "F2")) BeginRename(entity);
         if (count == 1 && !entity.IsPrefabInstance &&
-            ImGui.MenuItem($"{EditorIcons.Package}  Create Prefab")) CreatePrefab(entity);
+            gui.MenuItem($"{EditorIcons.Package}  Create Prefab")) CreatePrefab(entity);
 
         // Prefab instance actions (Unity's right-click > Prefab submenu): Apply pushes overrides to the
         // asset, Revert discards them, Select reveals the source .prefab in the browser.
-        if (count == 1 && entity.IsPrefabInstance && ImGui.BeginMenu($"{EditorIcons.Package}  Prefab")) {
-            if (ImGui.MenuItem("Select Asset")) {
+        if (count == 1 && entity.IsPrefabInstance && gui.BeginMenu($"{EditorIcons.Package}  Prefab")) {
+            if (gui.MenuItem("Select Asset")) {
                 string p = AssetDatabase.GuidToAssetPath(entity.PrefabSource);
                 if (p is not null) state.RequestRevealAsset(p);
             }
-            if (ImGui.MenuItem("Apply Overrides")) PrefabInstanceOps.ApplyAll(entity);
-            if (ImGui.MenuItem("Revert Overrides")) { PrefabInstanceOps.RevertAll(entity); state.MarkViewportDirty(); }
-            ImGui.Separator();
+            if (gui.MenuItem("Apply Overrides")) PrefabInstanceOps.ApplyAll(entity);
+            if (gui.MenuItem("Revert Overrides")) { PrefabInstanceOps.RevertAll(entity); state.MarkViewportDirty(); }
+            gui.Separator();
             // F1 pilot: a single-entity edit -- scoped through EditorCommands.EditEntity (maps to
             // PushEntity, byte-identical: selection survives, no whole-scene rebuild).
-            if (ImGui.MenuItem("Unpack")) EditorCommands.EditEntity(entity, "Unpack Prefab", () => entity.PrefabSource = Guid.Empty);
-            ImGui.EndMenu();
+            if (gui.MenuItem("Unpack")) EditorCommands.EditEntity(entity, "Unpack Prefab", () => entity.PrefabSource = Guid.Empty);
+            gui.EndMenu();
         }
-        if (ImGui.MenuItem($"Duplicate{suffix}", "Ctrl+D")) DuplicateSelected(scene);
-        if (ImGui.MenuItem($"Group{suffix}", "Ctrl+Shift+G")) GroupSelected(scene);
-        if (entity.transform.Parent is not null && ImGui.MenuItem($"Unparent{suffix}")) {
+        if (gui.MenuItem($"Duplicate{suffix}", "Ctrl+D")) DuplicateSelected(scene);
+        if (gui.MenuItem($"Group{suffix}", "Ctrl+Shift+G")) GroupSelected(scene);
+        if (entity.transform.Parent is not null && gui.MenuItem($"Unparent{suffix}")) {
             EditorCommands.Structural("Unparent", () => {
                 foreach (Entity e in state.SelectedEntities.ToArray())
                     e.transform.SetParentKeepingWorld(null);
                 state.MarkViewportDirty();
             });
         }
-        ImGui.Separator();
+        gui.Separator();
         DrawCreateMenu(scene);   // create children/objects from a node too
-        ImGui.Separator();
-        if (ImGui.MenuItem($"Delete{suffix}", "Del")) DeleteSelected(scene);
-        ImGui.EndPopup();
+        gui.Separator();
+        if (gui.MenuItem($"Delete{suffix}", "Del")) DeleteSelected(scene);
+        gui.EndPopup();
     }
 
     unsafe void HandleDragDrop(Scene scene, Entity entity, Entity[] allEntities) {
-        if (ImGui.BeginDragDropSource()) {
-            int payload = entity.InstanceId.GetHashCode();
-            ImGui.SetDragDropPayload(EntityDragType, &payload, (ulong)sizeof(int));
-            ImGui.Text($"{EditorIcons.Package} {entity.Name}");
-            ImGui.EndDragDropSource();
+        if (gui.BeginDragDropSource()) {
+            gui.SetDragDropPayloadInt(EntityDragType, entity.InstanceId.GetHashCode());
+            gui.Text($"{EditorIcons.Package} {entity.Name}");
+            gui.EndDragDropSource();
         }
 
-        if (ImGui.BeginDragDropTarget()) {
+        if (gui.BeginDragDropTarget()) {
             if (AcceptEntityDrop(allEntities, out Entity dragged) &&
                 !ReferenceEquals(dragged, entity) &&
                 !entity.transform.IsDescendantOf(dragged.transform)) {   // no cycles
@@ -529,7 +529,7 @@ internal sealed class HierarchyPanel {
             // Script asset dropped onto an entity row â†’ add its component (Unity behavior).
             if (AcceptAssetDrop(out List<Guid> droppedAssets))
                 AddScriptComponents(entity, droppedAssets);
-            ImGui.EndDragDropTarget();
+            gui.EndDragDropTarget();
         }
     }
 
@@ -609,15 +609,14 @@ internal sealed class HierarchyPanel {
     const string EntityDragType = "BALLISTIC_ENTITY";
 
     // Asset-browser drops carry ';'-separated GUIDs (multi-select drags several at once).
-    static unsafe bool AcceptAssetDrop(out List<Guid> guids) {
+    static bool AcceptAssetDrop(out List<Guid> guids) {
         guids = null;
-        ImGuiPayloadPtr payload = ImGui.AcceptDragDropPayload(AssetBrowserPanel.DragType);
-        if (payload.IsNull || payload.Data == null)
+        string text = gui.AcceptDragDropPayloadString(AssetBrowserPanel.DragType);
+        if (text is null)
             return false;
 
-        var text = System.Runtime.InteropServices.Marshal.PtrToStringAnsi((IntPtr)payload.Data, payload.DataSize);
         guids = new List<Guid>();
-        foreach (var part in text?.Split(';', StringSplitOptions.RemoveEmptyEntries) ?? [])
+        foreach (var part in text.Split(';', StringSplitOptions.RemoveEmptyEntries))
             if (Guid.TryParse(part, out Guid guid))
                 guids.Add(guid);
         return guids.Count > 0;
@@ -660,13 +659,11 @@ internal sealed class HierarchyPanel {
         });
     }
 
-    static unsafe bool AcceptEntityDrop(Entity[] entities, out Entity entity) {
+    static bool AcceptEntityDrop(Entity[] entities, out Entity entity) {
         entity = null;
-        ImGuiPayloadPtr payload = ImGui.AcceptDragDropPayload(EntityDragType);
-        if (payload.IsNull || payload.Data == null)
+        if (gui.AcceptDragDropPayloadInt(EntityDragType) is not { } id)
             return false;
 
-        int id = *(int*)payload.Data;
         foreach (Entity e in entities)
             if (e.InstanceId.GetHashCode() == id) { entity = e; return true; }
         return false;
@@ -733,42 +730,42 @@ internal sealed class HierarchyPanel {
 
     // Shared "create" submenu used by the empty-space context menu and the toolbar + button.
     void DrawCreateMenu(Scene scene) {
-        if (ImGui.MenuItem("Create Empty")) {
+        if (gui.MenuItem("Create Empty")) {
             // F1 pilot: structural create routed through the EditorCommands choke point (byte-identical
             // to the old "Push(); mutate();" -- the snapshot scope is now chosen by EditorCommands, not here).
             EditorCommands.Structural("Create Empty", () => state.Select(Spawn(scene, "Entity")));
         }
-        if (ImGui.BeginMenu($"{EditorIcons.Package} 3D Object")) {
-            if (ImGui.MenuItem("Cube")) CreatePrimitive(scene, PrimitiveKind.Cube);
-            if (ImGui.MenuItem("Sphere")) CreatePrimitive(scene, PrimitiveKind.Sphere);
-            if (ImGui.MenuItem("Plane")) CreatePrimitive(scene, PrimitiveKind.Plane);
-            ImGui.EndMenu();
+        if (gui.BeginMenu($"{EditorIcons.Package} 3D Object")) {
+            if (gui.MenuItem("Cube")) CreatePrimitive(scene, PrimitiveKind.Cube);
+            if (gui.MenuItem("Sphere")) CreatePrimitive(scene, PrimitiveKind.Sphere);
+            if (gui.MenuItem("Plane")) CreatePrimitive(scene, PrimitiveKind.Plane);
+            gui.EndMenu();
         }
-        if (ImGui.MenuItem($"{EditorIcons.Grid} Terrain"))
+        if (gui.MenuItem($"{EditorIcons.Grid} Terrain"))
             CreateTerrain(scene);
-        if (ImGui.BeginMenu($"{EditorIcons.Lightbulb} Light")) {
-            if (ImGui.MenuItem("Directional Light")) CreateWithComponent<DirectionalLight>(scene, "Directional Light");
-            if (ImGui.MenuItem("Point Light")) CreateWithComponent<PointLight>(scene, "Point Light");
-            if (ImGui.MenuItem("Spot Light")) CreateWithComponent<SpotLight>(scene, "Spot Light");
-            ImGui.EndMenu();
+        if (gui.BeginMenu($"{EditorIcons.Lightbulb} Light")) {
+            if (gui.MenuItem("Directional Light")) CreateWithComponent<DirectionalLight>(scene, "Directional Light");
+            if (gui.MenuItem("Point Light")) CreateWithComponent<PointLight>(scene, "Point Light");
+            if (gui.MenuItem("Spot Light")) CreateWithComponent<SpotLight>(scene, "Spot Light");
+            gui.EndMenu();
         }
-        if (ImGui.MenuItem($"{EditorIcons.Camera} Camera"))
+        if (gui.MenuItem($"{EditorIcons.Camera} Camera"))
             CreateWithComponent<HDCamera>(scene, "Camera");
 
         // Audio quick-create (a listener + a source are the common pair).
-        if (ImGui.BeginMenu($"{EditorIcons.Cloud} Audio")) {
-            if (ImGui.MenuItem("Audio Source")) CreateWithComponentNamed(scene, "Audio Source", "AudioSource");
-            if (ImGui.MenuItem("Audio Listener")) CreateWithComponentNamed(scene, "Audio Listener", "AudioListener");
-            ImGui.EndMenu();
+        if (gui.BeginMenu($"{EditorIcons.Cloud} Audio")) {
+            if (gui.MenuItem("Audio Source")) CreateWithComponentNamed(scene, "Audio Source", "AudioSource");
+            if (gui.MenuItem("Audio Listener")) CreateWithComponentNamed(scene, "Audio Listener", "AudioListener");
+            gui.EndMenu();
         }
 
-        ImGui.Separator();
+        gui.Separator();
         // Every registered component, grouped by its [Component] Menu category — so an entity with ANY
         // component (Particle System, Trail/Line Renderer, Spawner, Health, Animator, ...) is one click
         // away, and new components appear here automatically with no per-item wiring.
-        if (ImGui.BeginMenu($"{EditorIcons.Add} Component")) {
+        if (gui.BeginMenu($"{EditorIcons.Add} Component")) {
             DrawComponentCreateMenu(scene);
-            ImGui.EndMenu();
+            gui.EndMenu();
         }
     }
 
@@ -782,9 +779,9 @@ internal sealed class HierarchyPanel {
             .OrderBy(g => g.Key, StringComparer.OrdinalIgnoreCase);
 
         foreach (var group in groups) {
-            if (ImGui.BeginMenu(group.Key)) {
+            if (gui.BeginMenu(group.Key)) {
                 foreach (ComponentEntry entry in group.OrderBy(e => e.DisplayName, StringComparer.OrdinalIgnoreCase)) {
-                    if (ImGui.MenuItem(entry.DisplayName)) {
+                    if (gui.MenuItem(entry.DisplayName)) {
                         EditorCommands.Structural($"Create {entry.DisplayName}", () => {
                             Entity e = Spawn(scene, entry.DisplayName);
                             e.AddComponent(entry.Type);
@@ -792,7 +789,7 @@ internal sealed class HierarchyPanel {
                         });
                     }
                 }
-                ImGui.EndMenu();
+                gui.EndMenu();
             }
         }
     }
@@ -883,28 +880,28 @@ internal sealed class HierarchyPanel {
     void DrawSceneBehaviours() {
         Scene scene = SceneManager.GetCurrentScene();
 
-        if (ImGui.Button($"{EditorIcons.Add}  Add Scene Component", new SysVec2(-1, 0)))
-            ImGui.OpenPopup("##addscenebehaviour");
+        if (gui.Button($"{EditorIcons.Add}  Add Scene Component", new SysVec2(-1, 0)))
+            gui.OpenPopup("##addscenebehaviour");
 
-        if (ImGui.BeginPopup("##addscenebehaviour")) {
+        if (gui.BeginPopup("##addscenebehaviour")) {
             foreach (ComponentEntry entry in ComponentRegistry.SceneMenu) {
                 (string entryIcon, _) = EditorIcons.ForComponentType(entry.Type);
-                if (ImGui.MenuItem($"{entryIcon}  {entry.DisplayName}")) {
+                if (gui.MenuItem($"{entryIcon}  {entry.DisplayName}")) {
                     // Scene-wide edit (a SceneBehaviour lives on the Scene, not an entity) -> EditScene.
                     EditorCommands.EditScene($"Add {entry.DisplayName}",
                         () => state.SelectSceneBehaviour(scene.AddSceneBehaviour(entry.Type)));
                 }
             }
-            ImGui.EndPopup();
+            gui.EndPopup();
         }
 
-        ImGui.Separator();
+        gui.Separator();
 
         var behaviours = scene.SceneBehaviours.ToArray();
         if (behaviours.Length == 0) {
-            ImGui.Spacing();
-            ImGui.TextDisabled("No scene components.");
-            ImGui.TextDisabled("Add a Skybox to get started.");
+            gui.Spacing();
+            gui.TextDisabled("No scene components.");
+            gui.TextDisabled("Add a Skybox to get started.");
         }
 
         foreach (SceneBehaviour behaviour in behaviours) {
@@ -912,27 +909,27 @@ internal sealed class HierarchyPanel {
             (string icon, SysVec4 tint) = EditorIcons.ForComponentType(behaviour.GetType());
 
             if (!behaviour.IsEnabled)
-                ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+                gui.PushColor(EditorStyleColor.Text, gui.StyleColor(EditorStyleColor.TextDisabled));
 
-            if (ImGui.Selectable($"      {behaviour.GetType().Name}##{behaviour.InstanceId}", selected))
+            if (gui.Selectable($"      {behaviour.GetType().Name}##{behaviour.InstanceId}", selected))
                 state.SelectSceneBehaviour(behaviour);
 
             if (!behaviour.IsEnabled)
-                ImGui.PopStyleColor();
+                gui.PopColor();
 
-            DrawRowIcon(ImGui.GetItemRectMin() + new SysVec2(4, 0), icon, tint, behaviour.IsEnabled);
+            DrawRowIcon(gui.ItemRectMin + new SysVec2(4, 0), icon, tint, behaviour.IsEnabled);
             if (selected)
-                DrawSelectionBar(ImGui.GetItemRectMin(), ImGui.GetItemRectMax());
+                DrawSelectionBar(gui.ItemRectMin, gui.ItemRectMax);
 
-            if (ImGui.BeginPopupContextItem($"##sbctx{behaviour.InstanceId}")) {
-                if (ImGui.MenuItem("Remove")) {
+            if (gui.BeginPopupContextItem($"##sbctx{behaviour.InstanceId}")) {
+                if (gui.MenuItem("Remove")) {
                     EditorCommands.EditScene($"Remove {behaviour.GetType().Name}", () => {
                         scene.RemoveSceneBehaviour(behaviour);
                         if (ReferenceEquals(state.SelectedSceneBehaviour, behaviour))
                             state.SelectSceneBehaviour(null);
                     });
                 }
-                ImGui.EndPopup();
+                gui.EndPopup();
             }
         }
     }
