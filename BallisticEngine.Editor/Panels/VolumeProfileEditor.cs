@@ -1,7 +1,6 @@
 using System.Reflection;
 using BallisticEngine.AssetPipeline.Loaders;
 using BallisticEngine.Editor.Inspector;
-using Hexa.NET.ImGui;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec4 = System.Numerics.Vector4;
 
@@ -12,13 +11,20 @@ namespace BallisticEngine.Editor;
 // and an Add Override menu of the remaining VolumeComponent types. Drawn both inline under a
 // Volume component and as the asset view of a selected .volume file. Draw() returns true when
 // anything changed; SaveToAsset persists the live (AssetDatabase-cached) instance to its JSON.
+//
+// Phase-7: routes through the IEditorGui seam (EditorGui.Shared) — zero raw ImGui. The custom override
+// HEADER (a framed bar with an overlaid Active checkbox + "…" menu, positioned by item-rect geometry) uses
+// the seam's FramedHeader + ItemRectMin/Max + SetCursorScreenPos. The shared DrawerStack pipeline draws the
+// per-parameter rows through ImGuiVolumeGui (already on the seam).
 internal static class VolumeProfileEditor {
+    static IEditorGui gui => EditorGui.Shared;
+
     public static bool Draw(VolumeProfile profile) {
         var changed = false;
         VolumeComponent remove = null;
 
         foreach (VolumeComponent component in profile.Components) {
-            ImGui.PushID(component.GetType().Name);
+            gui.PushId(component.GetType().Name);
 
             bool active = component.Active;
             bool open = OverrideHeader(Prettify(component.GetType().Name), ref active, out bool removeRequested);
@@ -34,22 +40,22 @@ internal static class VolumeProfileEditor {
                 // even if its parameters are overridden — a common "I changed it and nothing happens"
                 // trap. Warn clearly, and offer a one-click Enable.
                 if (!component.Active && HasOverrides(component)) {
-                    ImGui.PushStyleColor(ImGuiCol.Text, EditorTheme.Warning);
-                    ImGui.TextWrapped($"{EditorIcons.Warning} This override is DISABLED — its parameters have no effect. " +
-                                      "Tick the checkbox by the name to enable it.");
-                    ImGui.PopStyleColor();
-                    if (ImGui.SmallButton("Enable")) {
+                    gui.PushColor(EditorStyleColor.Text, EditorTheme.Warning);
+                    gui.TextWrapped($"{EditorIcons.Warning} This override is DISABLED — its parameters have no effect. " +
+                                    "Tick the checkbox by the name to enable it.");
+                    gui.PopColor();
+                    if (gui.SmallButton("Enable")) {
                         component.Active = true;
                         changed = true;
                     }
-                    ImGui.Spacing();
+                    gui.Spacing();
                 }
 
                 changed |= DrawAllNoneRow(component);
                 changed |= DrawParameters(component);
             }
 
-            ImGui.PopID();
+            gui.PopId();
         }
 
         if (remove is not null) {
@@ -57,26 +63,26 @@ internal static class VolumeProfileEditor {
             changed = true;
         }
 
-        ImGui.Spacing();
-        if (ImGui.Button($"{EditorIcons.Add}  Add Override", new SysVec2(-1, 0))) {
+        gui.Spacing();
+        if (gui.Button($"{EditorIcons.Add}  Add Override", new SysVec2(-1, 0))) {
             addOverrideSearch = "";
-            ImGui.OpenPopup("##addoverride");
+            gui.OpenPopup("##addoverride");
         }
 
-        if (ImGui.BeginPopup("##addoverride")) {
+        if (gui.BeginPopup("##addoverride")) {
             // Search field (Unity's Add Override is searchable). Auto-focus on open; Enter adds the
             // first match.
-            if (ImGui.IsWindowAppearing())
-                ImGui.SetKeyboardFocusHere();
-            ImGui.SetNextItemWidth(220);
-            ImGui.InputTextWithHint("##search", "Search...", ref addOverrideSearch, 64);
-            bool enter = ImGui.IsItemFocused() && ImGui.IsKeyPressed(ImGuiKey.Enter);
-            ImGui.Separator();
+            if (gui.IsWindowAppearing())
+                gui.SetKeyboardFocusHere();
+            gui.SetNextItemWidth(220);
+            gui.InputTextWithHint("##search", "Search...", ref addOverrideSearch, 64);
+            bool enter = gui.IsItemFocused() && gui.KeyPressed(EditorGuiKey.Enter);
+            gui.Separator();
 
             bool searching = addOverrideSearch.Length > 0;
             bool any = false;
             ComponentEntry? firstMatch = null;
-            ImGui.BeginChild("##addlist", new SysVec2(220, 240));
+            gui.BeginChild("##addlist", new SysVec2(220, 240), border: false);
             foreach (ComponentEntry entry in ComponentRegistry.VolumeMenu) {
                 if (profile.Has(entry.Type))
                     continue;
@@ -84,22 +90,22 @@ internal static class VolumeProfileEditor {
                     continue;
                 any = true;
                 firstMatch ??= entry;
-                if (ImGui.MenuItem(entry.DisplayName)) {
+                if (gui.MenuItem(entry.DisplayName)) {
                     profile.Add(entry.Type);
                     changed = true;
-                    ImGui.CloseCurrentPopup();
+                    gui.CloseCurrentPopup();
                 }
             }
             if (!any)
-                ImGui.TextDisabled(searching ? "No match." : "All overrides added.");
-            ImGui.EndChild();
+                gui.TextDisabled(searching ? "No match." : "All overrides added.");
+            gui.EndChild();
 
             if (enter && firstMatch is { } hit) {
                 profile.Add(hit.Type);
                 changed = true;
-                ImGui.CloseCurrentPopup();
+                gui.CloseCurrentPopup();
             }
-            ImGui.EndPopup();
+            gui.EndPopup();
         }
 
         return changed;
@@ -124,13 +130,13 @@ internal static class VolumeProfileEditor {
     static bool DrawAllNoneRow(VolumeComponent component) {
         var changed = false;
 
-        ImGui.AlignTextToFramePadding();
-        ImGui.TextDisabled("Override:");
-        ImGui.SameLine();
-        if (ImGui.SmallButton("All"))
+        gui.AlignTextToFramePadding();
+        gui.TextDisabled("Override:");
+        gui.SameLine();
+        if (gui.SmallButton("All"))
             changed = SetAllOverrides(component, true);
-        ImGui.SameLine();
-        if (ImGui.SmallButton("None"))
+        gui.SameLine();
+        if (gui.SmallButton("None"))
             changed = SetAllOverrides(component, false);
 
         return changed;
@@ -164,10 +170,10 @@ internal static class VolumeProfileEditor {
     static readonly ImGuiVolumeGui volumeGui = new();
 
     static bool DrawParameters(VolumeComponent component) {
-        if (!ImGui.BeginTable("##params", 2, ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.PadOuterX))
+        if (!gui.BeginTable("##params", 2, EditorTableFlags.SizingStretchProp | EditorTableFlags.PadOuterX))
             return false;
-        ImGui.TableSetupColumn("label", ImGuiTableColumnFlags.WidthStretch, 0.45f);
-        ImGui.TableSetupColumn("value", ImGuiTableColumnFlags.WidthStretch, 0.55f);
+        gui.TableSetupColumn("label", EditorColumnFlags.WidthStretch, 0.45f);
+        gui.TableSetupColumn("value", EditorColumnFlags.WidthStretch, 0.55f);
 
         var changed = false;
         // [PropertyOrder] sorts via the single-sourced engine rule (stable: default 0 keeps slot order) --
@@ -179,8 +185,8 @@ internal static class VolumeProfileEditor {
             changed |= volumeGui.TakeOverrideChanged();   // toggling the override checkbox is also a change
         }
 
-        ImGui.EndTable();
-        ImGui.Spacing();
+        gui.EndTable();
+        gui.Spacing();
 
         if (changed)
             EnforceParametermnvariants(component);
@@ -208,41 +214,40 @@ internal static class VolumeProfileEditor {
     static bool OverrideHeader(string label, ref bool active, out bool removeRequested) {
         removeRequested = false;
 
-        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new SysVec2(8, 5));
-        bool open = ImGui.TreeNodeEx($"     {label}###ovr_{label}",
-            ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.AllowOverlap | ImGuiTreeNodeFlags.Framed |
-            ImGuiTreeNodeFlags.SpanAvailWidth | ImGuiTreeNodeFlags.NoTreePushOnOpen);
-        ImGui.PopStyleVar();
+        gui.PushFramePadding(new SysVec2(8, 5));
+        // 5-space indent leaves room for the overlaid Active checkbox; ###id keeps a stable header identity.
+        bool open = gui.FramedHeader($"     {label}###ovr_{label}");
+        gui.PopStyleVar();
 
-        if (ImGui.BeginPopupContextItem("##overridectx")) {
-            if (ImGui.MenuItem("Remove Override"))
+        if (gui.BeginPopupContextItem("##overridectx")) {
+            if (gui.MenuItem("Remove Override"))
                 removeRequested = true;
-            ImGui.EndPopup();
+            gui.EndPopup();
         }
 
-        SysVec2 min = ImGui.GetItemRectMin();
-        SysVec2 max = ImGui.GetItemRectMax();
-        SysVec2 cursor = ImGui.GetCursorScreenPos();
-        float rowCenterY = min.Y + (max.Y - min.Y - ImGui.GetFrameHeight()) * 0.5f + 1;
+        SysVec2 min = gui.ItemRectMin;
+        SysVec2 max = gui.ItemRectMax;
+        SysVec2 cursor = gui.CursorScreenPos;
+        float rowCenterY = min.Y + (max.Y - min.Y - gui.FrameHeight) * 0.5f + 1;
 
-        ImGui.SetCursorScreenPos(new SysVec2(min.X + 24, rowCenterY));
-        ImGui.Checkbox($"##active_{label}", ref active);
+        gui.SetCursorScreenPos(new SysVec2(min.X + 24, rowCenterY));
+        gui.Checkbox($"##active_{label}", ref active);
 
-        float menuW = ImGui.GetFrameHeight() + 8;
-        ImGui.SetCursorScreenPos(new SysVec2(max.X - menuW - 4, rowCenterY));
-        ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(0, 0, 0, 0));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(1, 1, 1, 0.08f));
-        var menuClicked = ImGui.Button($"{EditorIcons.More}##menu_{label}", new SysVec2(menuW, 0));
-        ImGui.PopStyleColor(2);
+        float menuW = gui.FrameHeight + 8;
+        gui.SetCursorScreenPos(new SysVec2(max.X - menuW - 4, rowCenterY));
+        gui.PushColor(EditorStyleColor.Button, new SysVec4(0, 0, 0, 0));
+        gui.PushColor(EditorStyleColor.ButtonHovered, new SysVec4(1, 1, 1, 0.08f));
+        var menuClicked = gui.Button($"{EditorIcons.More}##menu_{label}", new SysVec2(menuW, 0));
+        gui.PopColor(2);
         if (menuClicked)
-            ImGui.OpenPopup("##overridemenu");
-        if (ImGui.BeginPopup("##overridemenu")) {
-            if (ImGui.MenuItem("Remove Override"))
+            gui.OpenPopup("##overridemenu");
+        if (gui.BeginPopup("##overridemenu")) {
+            if (gui.MenuItem("Remove Override"))
                 removeRequested = true;
-            ImGui.EndPopup();
+            gui.EndPopup();
         }
 
-        ImGui.SetCursorScreenPos(cursor);
+        gui.SetCursorScreenPos(cursor);
         return open;
     }
 

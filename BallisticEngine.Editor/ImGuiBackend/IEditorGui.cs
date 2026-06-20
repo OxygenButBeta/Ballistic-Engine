@@ -90,12 +90,19 @@ public interface IEditorGui {
     bool BeginPopup(string id);
     void EndPopup();
     void OpenPopup(string id);
+    bool BeginPopupContextItem(string id);           // right-click-the-last-item context menu
     void CloseCurrentPopup();
     void SetNextWindowSizeAppearing(Vector2 size);   // popups that want a sensible first-open size
     bool BeginMenu(string label);
     void EndMenu();
     bool MenuItem(string label, bool enabled = true);
     bool MenuItem(string label, string shortcut, bool enabled = true);
+
+    // A framed, full-width, default-open tree header with overlay allowed (the inspector/volume override
+    // header: a framed bar the caller paints a checkbox + "…" menu over). Returns the open state. Pushes
+    // no tree level (the caller manages its own indent), matching TreeNodeEx(Framed|AllowOverlap|
+    // SpanAvailWidth|NoTreePushOnOpen|DefaultOpen).
+    bool FramedHeader(string label);
 
     // ---- tables (Console / Stats / Build / Profiler) ----
     bool BeginTable(string id, int columns);
@@ -115,7 +122,16 @@ public interface IEditorGui {
     bool IsItemClicked();
     bool IsItemActive();
     bool IsItemActivated();
+    bool IsItemFocused();
     bool IsItemDeactivatedAfterEdit();
+
+    // ---- item geometry + focus (custom overlays: the volume override header) ----
+    Vector2 ItemRectMin { get; }
+    Vector2 ItemRectMax { get; }
+    void SetCursorScreenPos(Vector2 pos);
+    bool IsWindowAppearing();
+    void SetKeyboardFocusHere();
+    bool KeyPressed(EditorGuiKey key);               // window-level key (vs gui.Input for canvas surfaces)
 
     // ---- style scope (push/pop, balanced) ----
     // Lets a window body tint a few widgets (severity colours, filter chips, tighter checkbox padding)
@@ -156,6 +172,7 @@ public enum EditorTableFlags {
     ScrollY = 1 << 3,
     SizingStretchProp = 1 << 4,
     Resizable = 1 << 5,
+    PadOuterX = 1 << 6,
 }
 
 // Seam-local column flags (subset).

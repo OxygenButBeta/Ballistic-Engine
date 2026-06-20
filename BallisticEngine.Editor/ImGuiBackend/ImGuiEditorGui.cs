@@ -97,6 +97,7 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public bool BeginPopup(string id) => ImGui.BeginPopup(id);
     public void EndPopup() => ImGui.EndPopup();
     public void OpenPopup(string id) => ImGui.OpenPopup(id);
+    public bool BeginPopupContextItem(string id) => ImGui.BeginPopupContextItem(id);
     public void CloseCurrentPopup() => ImGui.CloseCurrentPopup();
     public void SetNextWindowSizeAppearing(Vector2 size) => ImGui.SetNextWindowSize(size, ImGuiCond.Appearing);
     public bool BeginMenu(string label) => ImGui.BeginMenu(label);
@@ -104,6 +105,9 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public bool MenuItem(string label, bool enabled = true) => ImGui.MenuItem(label, "", false, enabled);
     public bool MenuItem(string label, string shortcut, bool enabled = true) =>
         ImGui.MenuItem(label, shortcut, false, enabled);
+    public bool FramedHeader(string label) => ImGui.TreeNodeEx(label,
+        ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.AllowOverlap | ImGuiTreeNodeFlags.Framed |
+        ImGuiTreeNodeFlags.SpanAvailWidth | ImGuiTreeNodeFlags.NoTreePushOnOpen);
 
     // ---- tables ----
     public bool BeginTable(string id, int columns) => ImGui.BeginTable(id, columns);
@@ -127,6 +131,7 @@ internal sealed class ImGuiEditorGui : IEditorGui {
         if (f.HasFlag(EditorTableFlags.ScrollY)) r |= ImGuiTableFlags.ScrollY;
         if (f.HasFlag(EditorTableFlags.SizingStretchProp)) r |= ImGuiTableFlags.SizingStretchProp;
         if (f.HasFlag(EditorTableFlags.Resizable)) r |= ImGuiTableFlags.Resizable;
+        if (f.HasFlag(EditorTableFlags.PadOuterX)) r |= ImGuiTableFlags.PadOuterX;
         return r;
     }
 
@@ -143,7 +148,16 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public bool IsItemClicked() => ImGui.IsItemClicked();
     public bool IsItemActive() => ImGui.IsItemActive();
     public bool IsItemActivated() => ImGui.IsItemActivated();
+    public bool IsItemFocused() => ImGui.IsItemFocused();
     public bool IsItemDeactivatedAfterEdit() => ImGui.IsItemDeactivatedAfterEdit();
+
+    // ---- item geometry + focus ----
+    public Vector2 ItemRectMin => ImGui.GetItemRectMin();
+    public Vector2 ItemRectMax => ImGui.GetItemRectMax();
+    public void SetCursorScreenPos(Vector2 pos) => ImGui.SetCursorScreenPos(pos);
+    public bool IsWindowAppearing() => ImGui.IsWindowAppearing();
+    public void SetKeyboardFocusHere() => ImGui.SetKeyboardFocusHere();
+    public bool KeyPressed(EditorGuiKey key) => input.KeyPressed(key);
 
     // ---- style scope ----
     public void PushColor(EditorStyleColor which, Vector4 rgba) => ImGui.PushStyleColor(MapColor(which), rgba);
