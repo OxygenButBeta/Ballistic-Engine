@@ -361,6 +361,12 @@ internal sealed class EditorApplication {
                 AsyncAssetImport.Request("Refreshing assets...", onFinished: assets.InvalidateThumbnails);
         }
 
+        // Live custom-surface-shader hot-reload: the renderer's file watch saw a .surface/.hlsl edit, so
+        // force a repaint (the editor renders on-demand). The actual recompile + PSO swap happens inside
+        // the next BeginRender (main-thread, between frames); this just wakes the viewport up.
+        if (Renderer is not null && Renderer.PollSurfaceReload())
+            MarkSceneDirty();
+
         // Game/engine input flows only while playing with the Game view focused; editor panels
         // and the scene camera otherwise own all input (kills the leaking debug hotkeys too).
         // A background import also locks input out â€” the busy overlay owns the screen.

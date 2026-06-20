@@ -46,6 +46,10 @@ public sealed class Dx12SurfaceWatcher : IDisposable {
         lock (gate) pending.Add(e.FullPath);   // thread: just record — no compile, no GPU here
     }
 
+    // Peek whether any change is queued, WITHOUT draining (the editor polls this to decide whether to
+    // repaint; the actual drain + recompile happens in the next BeginRender).
+    public bool HasPending { get { lock (gate) return pending.Count > 0; } }
+
     // Drain the changed-file set (called by the renderer between frames). Returns absolute paths to
     // recompile; empty when nothing changed. The caller maps each absolute path back to a project-
     // relative SourcePath and calls Dx12SurfaceShaderCache.Reload.

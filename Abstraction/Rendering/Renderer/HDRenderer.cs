@@ -74,5 +74,12 @@ public abstract class HDRenderer {
     // Editor-only: publish a coarse Scene-view depth grid (into GizmoDepthOcclusion) for gizmo depth
     // occlusion. Called after BeginRender(Scene) while the depth buffer is intact. No-op by default.
     public virtual void ReadSceneDepthGrid() { }
+
+    // Editor-only: returns true when a custom surface shader source changed on disk and a frame must be
+    // rendered to pick it up (the editor renders on-demand, so without this a hot-reload wouldn't show
+    // until the next unrelated repaint). The editor calls this each update and MarkSceneDirty()s on true;
+    // the actual recompile happens inside the next BeginRender (main-thread, between frames). No-op by
+    // default (the player renders every frame and reloads inline).
+    public virtual bool PollSurfaceReload() => false;
     public abstract void RenderInstancing(Mesh mesh, Material material, Matrix4[] transforms, RendererArgs args);
 }

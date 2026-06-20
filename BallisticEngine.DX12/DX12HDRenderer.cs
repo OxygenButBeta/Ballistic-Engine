@@ -940,20 +940,34 @@ public sealed class DX12HDRenderer : HDRenderer
     bool surfaceWatcherTried;
     public event Action SurfaceShaderReloaded;
 
+    // Lazy-init the file watcher once the project is open. Shared by the per-frame reload drain and the
+    // editor's PollSurfaceReload.
+    void EnsureSurfaceWatcher() {
+        var project = AssetDatabase.Project;
+        if (surfaceWatcherTried || surfaceCache is null || project is null) return;
+        surfaceWatcherTried = true;
+        surfaceCache.FramesInFlight = dev.FramesInFlight;
+        surfaceWatcher = new Dx12SurfaceWatcher(project.AssetsPath);
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_SURFACE_HRDEBUG") == "1")
+            Console.WriteLine($"[surface] watcher init on '{project.AssetsPath}'");
+    }
+
+    // Editor on-demand repaint trigger: true when a watched surface source changed, so the editor renders
+    // a frame (where ProcessSurfaceHotReload does the actual recompile). Peeks WITHOUT draining — the
+    // drain happens in BeginRender so the recompile is on the main thread between frames.
+    public override bool PollSurfaceReload() {
+        EnsureSurfaceWatcher();
+        return surfaceWatcher?.HasPending ?? false;
+    }
+
     // Drain file-watch edits and recompile affected surface PSOs (main thread, between frames). Also frees
     // PSOs whose deferred-dispose deadline has passed.
     void ProcessSurfaceHotReload() {
         if (surfaceCache is null) return;
         surfaceCache.DrainDeferred(frameCounter);
 
+        EnsureSurfaceWatcher();
         var project = AssetDatabase.Project;
-        if (!surfaceWatcherTried && project is not null) {
-            surfaceWatcherTried = true;
-            surfaceCache.FramesInFlight = dev.FramesInFlight;
-            surfaceWatcher = new Dx12SurfaceWatcher(project.AssetsPath);
-            if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_SURFACE_HRDEBUG") == "1")
-                Console.WriteLine($"[surface] watcher init on '{project.AssetsPath}'");
-        }
         var changed = surfaceWatcher?.DrainPending();
         if (changed is null || project is null) return;
         if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_SURFACE_HRDEBUG") == "1")
