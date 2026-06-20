@@ -52,7 +52,7 @@ cbuffer LumenCardConstants : register(b0) {
     float SkyVisRays; float EmaAlpha; float BounceRays; float HistoryValid;   // P4: temporal blend + 2nd-bounce gather
     uint FrameIndex; uint UpdateStride; uint ForceFull; uint TexelDim;   // P7 #1 round-robin; Sıra 5 TexelDim (1=legacy)
     float3 CameraPos; float PriorityScale;   // P7 #1b PRIORITY budget: per-record due prob = saturate(priority/scale)
-    float PriorityNearDist; float UsePriority; float Pad7a; float Pad7b;   // near falloff (m); UsePriority 1=priority,0=legacy stride
+    float PriorityNearDist; float UsePriority; float BounceBoost; float Pad7b;   // near falloff (m); UsePriority; 2nd-bounce gain
 };
 SamplerState LinearClamp : register(s0);
 SamplerState LinearWrap  : register(s1);
@@ -248,7 +248,11 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
                     uint hi = q.CommittedInstanceID();
                     LumenInstanceMeta hm = Instances[hi];
                     uint hrec = hm.ClusterOffset + TriToCluster[hm.TriOffset + q.CommittedPrimitiveIndex()];
-                    indirect += PrevCard[hrec * tpr].rgb;   // sample the hit record's texel 0 (coarse 2nd bounce)
+                    // 2nd-bounce: sample the hit record's lit radiance. BounceBoost (>1) amplifies multi-bounce so
+                    // shadowed surfaces with no direct light still accumulate energy from successive bounces (the
+                    // dark-area coverage fix). The card cache is a feedback loop, so a >1 gain compounds across
+                    // frames into a fuller GI — clamped by the firefly logic downstream so it can't run away.
+                    indirect += PrevCard[hrec * tpr].rgb * max(BounceBoost, 1.0);
                 }
             } else if (UseSky > 0.5) {
                 indirect += SkyIrradiance.SampleLevel(LinearClamp, d, 0).rgb * SkyIntensity;

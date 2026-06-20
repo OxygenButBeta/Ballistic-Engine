@@ -244,7 +244,7 @@ public sealed class PostProcessSettings {
     // no hidden screen-space fallback). The dials below were env-only during the Lumen build; the volume now
     // drives them, with the BALLISTIC_DX12_LUMEN_* env doors still overriding for A/B. ---
     public bool LumenEnabled { get; set; } = true;
-    public float LumenIntensity { get; set; } = 2f;          // master GI strength (tuned: visible indirect without washing out)
+    public float LumenIntensity { get; set; } = 1f;          // master GI strength (1 = physical; was 2 to compensate the combine's extra /π, fixed in LumenGi.hlsl)
     public float LumenSkyIntensity { get; set; } = 1.5f;     // skylight let in through open sky-visibility
     public int LumenRayCount { get; set; } = 16;             // hemisphere rays per pixel (temporal accumulation cleans the rest)
     public int LumenDenoisePasses { get; set; } = 1;         // à-trous spatial denoise iterations (0 = raw); Balanced default (adaptive bumps it on disocclusion)

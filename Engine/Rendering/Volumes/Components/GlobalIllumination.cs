@@ -27,7 +27,7 @@ public sealed class GlobalIllumination : VolumeComponent {
     public readonly EnumParameter<GiQuality> quality = new(GiQuality.Balanced);
 
     [Tooltip("Overall strength of the indirect (diffuse GI) contribution. 1 = physical.")]
-    public readonly ClampedFloatParameter intensity = new(2f, 0f, 4f);
+    public readonly ClampedFloatParameter intensity = new(1f, 0f, 4f);   // 1 = physical (was 2 to paper over the combine's extra /π — now fixed in LumenGi.hlsl)
 
     [Tooltip("How much skylight enters through open sky-visibility (a sealed interior stays dark regardless).")]
     public readonly ClampedFloatParameter skyIntensity = new(1.5f, 0f, 4f);

@@ -500,7 +500,13 @@ float4 PSCombine(VSOut i) : SV_Target {
     float matAo = GMaterial.SampleLevel(LinearClamp, i.Uv, 0).b;
     // GTAO eased by AoStrength (1 = no GTAO darkening; lerp toward the raw GTAO at full strength).
     float gtao = lerp(1.0, GtaoTex.SampleLevel(LinearClamp, i.Uv, 0).r, saturate(AoStrength));
-    float3 diffuseIndirect = E * albedo * matAo * gtao / PI;   // Lambertian: outgoing = E*albedo/PI
+    // E from BOTH probe paths is ALREADY irradiance/π (EvalProbeSH divides by π at LumenScreenProbe.hlsl:190; the
+    // oct SampleProbeTile returns a cosine-weighted MEAN radiance = E_true/π). So the correct Lambertian outgoing
+    // is E·albedo (the missing π is already folded in) — NOT E·albedo/π, which double-divided and made indirect
+    // π× (≈3.14×) too dim relative to the /π-correct direct diffuse (DeferredLighting.hlsl:342). That under-scale
+    // was the "deep shadows go pure black" bug: no single exposure could show both the (π× too dark) shadow
+    // indirect and the lit areas. Fixed: one /π only. (The GI intensity default was 2 to paper over this — drop to 1.)
+    float3 diffuseIndirect = E * albedo * matAo * gtao;   // Lambertian: E is already irradiance/π → outgoing = E·albedo
     return float4(Sanitize(diffuseIndirect), 1.0);   // additive blend (One/One) adds onto the HDR scene color
 }
 

@@ -210,7 +210,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public float SkyVisRays; public float EmaAlpha; public float BounceRays; public float HistoryValid;
         public uint FrameIndex; public uint UpdateStride; public uint ForceFull; public uint TexelDim;   // P7 #1; Sıra 5 mesh-card grid edge
         public Vector3 CameraPos; public float PriorityScale;   // P7 #1b priority budget
-        public float PriorityNearDist; public float UsePriority; public float Pad7a; public float Pad7b;
+        public float PriorityNearDist; public float UsePriority; public float BounceBoost; public float Pad7b;
     }
 
     // ---- Sıra 1: SCREEN-SPACE RADIANCE PROBES (LumenScreenProbe.hlsl) ----
@@ -775,12 +775,13 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             SunDir = sunDir, SunBias = 0.03f, SunColor = ctx.LightColor, LightCount = clusteredLights.LightCount,
             InstanceCount = (uint)scene.InstanceCount, TotalTris = (uint)scene.RecordCount,   // #2A: dispatch bound = record count
             SkyIntensity = skyIntensity, UseSky = useSky ? 1f : 0f, SkyVisRays = 4f,
-            EmaAlpha = emaAlpha, BounceRays = bounce ? 4f : 0f,
+            EmaAlpha = emaAlpha, BounceRays = bounce ? MathF.Round(EnvF("BALLISTIC_DX12_LUMEN_BOUNCE_RAYS", 4f)) : 0f,
             HistoryValid = (scene.HistoryValid && !ctx.DeterministicCapture) ? 1f : 0f,
             FrameIndex = (uint)frameCounter, UpdateStride = stride, ForceFull = forceFull,
             TexelDim = (uint)scene.TexelDim,
             CameraPos = ctx.CamPos, PriorityScale = priorityScale,
             PriorityNearDist = EnvF("BALLISTIC_DX12_LUMEN_PRIORITY_NEAR", 12f), UsePriority = priorityOn ? 1f : 0f,
+            BounceBoost = EnvF("BALLISTIC_DX12_LUMEN_BOUNCE_BOOST", 1f),   // 2nd-bounce gain (default 1 = physical; door for A/B). The real dark-shadow fix was the combine /π bug, not bounce.
         });
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
