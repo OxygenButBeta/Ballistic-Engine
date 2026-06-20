@@ -84,11 +84,29 @@ internal sealed class ImGuiEditorGui : IEditorGui {
 
     // ---- structure ----
     public bool TreeNode(string label) => ImGui.TreeNode(label);
+    public bool TreeNodeEx(string label, EditorTreeFlags flags) => ImGui.TreeNodeEx(label, MapTreeFlags(flags));
     public void TreePop() => ImGui.TreePop();
+    public void BeginGroup() => ImGui.BeginGroup();
+    public void EndGroup() => ImGui.EndGroup();
+    public float TreeNodeToLabelSpacing => ImGui.GetTreeNodeToLabelSpacing();
     public bool Selectable(string label, bool selected = false) => ImGui.Selectable(label, selected);
+    public bool Selectable(string label, bool selected, Vector2 size) =>
+        ImGui.Selectable(label, selected, ImGuiSelectableFlags.None, size);
     public bool CollapsingHeader(string label) => ImGui.CollapsingHeader(label);
     public bool CollapsingHeader(string label, bool defaultOpen) =>
         ImGui.CollapsingHeader(label, defaultOpen ? ImGuiTreeNodeFlags.DefaultOpen : ImGuiTreeNodeFlags.None);
+    public bool CollapsingHeaderFramed(string label) =>
+        ImGui.CollapsingHeader(label, ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.Framed);
+    public bool CollapsingHeaderFramedOverlay(string label) =>
+        ImGui.CollapsingHeader(label, ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.AllowOverlap | ImGuiTreeNodeFlags.Framed);
+
+    static ImGuiTreeNodeFlags MapTreeFlags(EditorTreeFlags f) {
+        ImGuiTreeNodeFlags r = ImGuiTreeNodeFlags.None;
+        if (f.HasFlag(EditorTreeFlags.DefaultOpen)) r |= ImGuiTreeNodeFlags.DefaultOpen;
+        if (f.HasFlag(EditorTreeFlags.Framed)) r |= ImGuiTreeNodeFlags.Framed;
+        if (f.HasFlag(EditorTreeFlags.SpanAvailWidth)) r |= ImGuiTreeNodeFlags.SpanAvailWidth;
+        return r;
+    }
     public bool BeginChild(string id, Vector2 size, bool border) =>
         ImGui.BeginChild(id, size, border ? ImGuiChildFlags.Borders : ImGuiChildFlags.None);
     public bool BeginChild(string id, Vector2 size, bool border, bool horizontalScroll) =>
@@ -104,6 +122,7 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public void EndPopup() => ImGui.EndPopup();
     public void OpenPopup(string id) => ImGui.OpenPopup(id);
     public bool BeginPopupContextItem(string id) => ImGui.BeginPopupContextItem(id);
+    public void OpenPopupOnItemClick(string id) => ImGui.OpenPopupOnItemClick(id, ImGuiPopupFlags.MouseButtonRight);
     public void CloseCurrentPopup() => ImGui.CloseCurrentPopup();
     public void SetNextWindowSizeAppearing(Vector2 size) => ImGui.SetNextWindowSize(size, ImGuiCond.Appearing);
     public bool BeginMenu(string label) => ImGui.BeginMenu(label);
@@ -128,6 +147,7 @@ internal sealed class ImGuiEditorGui : IEditorGui {
         ImGui.TableSetupColumn(label, MapColumnFlags(flags), width);
     public void TableSetupScrollFreeze(int cols, int rows) => ImGui.TableSetupScrollFreeze(cols, rows);
     public void TableHeadersRow() => ImGui.TableHeadersRow();
+    public void TableSetRowBgColor(uint color) => ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0, color);
 
     static ImGuiTableFlags MapTableFlags(EditorTableFlags f) {
         ImGuiTableFlags r = ImGuiTableFlags.None;
@@ -138,6 +158,7 @@ internal sealed class ImGuiEditorGui : IEditorGui {
         if (f.HasFlag(EditorTableFlags.SizingStretchProp)) r |= ImGuiTableFlags.SizingStretchProp;
         if (f.HasFlag(EditorTableFlags.Resizable)) r |= ImGuiTableFlags.Resizable;
         if (f.HasFlag(EditorTableFlags.PadOuterX)) r |= ImGuiTableFlags.PadOuterX;
+        if (f.HasFlag(EditorTableFlags.SizingFixedFit)) r |= ImGuiTableFlags.SizingFixedFit;
         return r;
     }
 
@@ -151,6 +172,8 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     // ---- tooltips / item query ----
     public void Tooltip(string text) => ImGui.SetTooltip(text);
     public bool IsItemHovered() => ImGui.IsItemHovered();
+    public bool IsWindowHovered() => ImGui.IsWindowHovered();
+    public bool IsMouseHoveringRect(Vector2 min, Vector2 max, bool clip = true) => ImGui.IsMouseHoveringRect(min, max, clip);
     public bool IsItemClicked() => ImGui.IsItemClicked();
     public bool IsItemActive() => ImGui.IsItemActive();
     public bool IsItemActivated() => ImGui.IsItemActivated();
@@ -163,6 +186,8 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     // ---- item geometry + focus ----
     public Vector2 ItemRectMin => ImGui.GetItemRectMin();
     public Vector2 ItemRectMax => ImGui.GetItemRectMax();
+    public Vector2 WindowPos => ImGui.GetWindowPos();
+    public Vector2 WindowSize => ImGui.GetWindowSize();
     public void SetCursorScreenPos(Vector2 pos) => ImGui.SetCursorScreenPos(pos);
     public bool IsWindowAppearing() => ImGui.IsWindowAppearing();
     public void SetKeyboardFocusHere() => ImGui.SetKeyboardFocusHere();
@@ -186,11 +211,30 @@ internal sealed class ImGuiEditorGui : IEditorGui {
         return System.Runtime.InteropServices.Marshal.PtrToStringAnsi((IntPtr)payload.Data, payload.DataSize);
     }
 
+    // ---- fonts ----
+    public void PushFont(EditorFont font) => ImGui.PushFont(MapFont(font));
+    public void PopFont() => ImGui.PopFont();
+    public float FontSize => ImGui.GetFontSize();
+    public float FontSizeOf(EditorFont font) => MapFont(font).FontSize;
+    public float TextLineHeight => ImGui.GetTextLineHeight();
+
+    static ImFontPtr MapFont(EditorFont f) => f switch {
+        EditorFont.Header => EditorTheme.Header,
+        EditorFont.Caption => EditorTheme.Caption,
+        EditorFont.Display => EditorTheme.Display,
+        EditorFont.Bold => ImGuiController.Bold,
+        EditorFont.LargeIcons => ImGuiController.LargeIcons,
+        _ => EditorTheme.Body,
+    };
+
     // ---- style scope ----
     public void PushColor(EditorStyleColor which, Vector4 rgba) => ImGui.PushStyleColor(MapColor(which), rgba);
     public void PopColor(int count = 1) => ImGui.PopStyleColor(count);
     public void PushFramePadding(Vector2 padding) => ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, padding);
+    public void PushItemSpacing(Vector2 spacing) => ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, spacing);
     public void PopStyleVar(int count = 1) => ImGui.PopStyleVar(count);
+    public float FrameRounding => ImGui.GetStyle().FrameRounding;
+    public float IndentSpacing => ImGui.GetStyle().IndentSpacing;
     public Vector4 StyleColor(EditorStyleColor which) => ImGui.GetStyle().Colors[(int)MapColor(which)];
 
     static ImGuiCol MapColor(EditorStyleColor c) => c switch {
@@ -202,6 +246,8 @@ internal sealed class ImGuiEditorGui : IEditorGui {
         EditorStyleColor.FrameBg => ImGuiCol.FrameBg,
         EditorStyleColor.FrameBgHovered => ImGuiCol.FrameBgHovered,
         EditorStyleColor.SliderGrab => ImGuiCol.SliderGrab,
+        EditorStyleColor.CheckMark => ImGuiCol.CheckMark,
+        EditorStyleColor.ChildBg => ImGuiCol.ChildBg,
         _ => ImGuiCol.Text,
     };
 
@@ -253,10 +299,36 @@ internal sealed class ImGuiDrawListAdapter : IEditorDrawList {
         draw.AddRect(min, max, col, rounding, ImDrawFlags.None, thickness);
     public void AddRectFilled(Vector2 min, Vector2 max, uint col, float rounding = 0f) =>
         draw.AddRectFilled(min, max, col, rounding);
+    public void AddRectFilled(Vector2 min, Vector2 max, uint col, float rounding, EditorCorner corners) =>
+        draw.AddRectFilled(min, max, col, rounding, MapCorner(corners));
+
+    static ImDrawFlags MapCorner(EditorCorner c) {
+        ImDrawFlags r = ImDrawFlags.None;
+        if (c.HasFlag(EditorCorner.TopLeft)) r |= ImDrawFlags.RoundCornersTopLeft;
+        if (c.HasFlag(EditorCorner.TopRight)) r |= ImDrawFlags.RoundCornersTopRight;
+        if (c.HasFlag(EditorCorner.BottomLeft)) r |= ImDrawFlags.RoundCornersBottomLeft;
+        if (c.HasFlag(EditorCorner.BottomRight)) r |= ImDrawFlags.RoundCornersBottomRight;
+        return r;
+    }
     public void AddCircle(Vector2 center, float radius, uint col, int segments = 0, float thickness = 1f) =>
         draw.AddCircle(center, radius, col, segments, thickness);
     public void AddCircleFilled(Vector2 center, float radius, uint col) => draw.AddCircleFilled(center, radius, col);
     public void AddText(Vector2 pos, uint col, string text) => draw.AddText(pos, col, text);
+    public unsafe void AddText(EditorFont font, float size, Vector2 pos, uint col, string text) =>
+        draw.AddText(MapFont(font), size, pos, col, text);
+
+    static ImFontPtr MapFont(EditorFont f) => f switch {
+        EditorFont.Header => EditorTheme.Header,
+        EditorFont.Caption => EditorTheme.Caption,
+        EditorFont.Display => EditorTheme.Display,
+        EditorFont.Bold => ImGuiController.Bold,
+        EditorFont.LargeIcons => ImGuiController.LargeIcons,
+        _ => EditorTheme.Body,
+    };
+
+    public void ChannelsSplit(int count) => draw.ChannelsSplit(count);
+    public void ChannelsSetCurrent(int channel) => draw.ChannelsSetCurrent(channel);
+    public void ChannelsMerge() => draw.ChannelsMerge();
     public void AddBezierCubic(Vector2 p0, Vector2 p1, Vector2 p2, Vector2 p3, uint col, float thickness) =>
         draw.AddBezierCubic(p0, p1, p2, p3, col, thickness, 0);
 }

@@ -80,10 +80,17 @@ public interface IEditorGui {
 
     // ---- structure ----
     bool TreeNode(string label);
+    bool TreeNodeEx(string label, EditorTreeFlags flags);   // foldout with explicit flags (poly/nested/group bodies)
     void TreePop();
+    void BeginGroup();
+    void EndGroup();
+    float TreeNodeToLabelSpacing { get; }
     bool Selectable(string label, bool selected = false);
+    bool Selectable(string label, bool selected, Vector2 size);   // fixed-height picker rows
     bool CollapsingHeader(string label);
     bool CollapsingHeader(string label, bool defaultOpen);
+    bool CollapsingHeaderFramed(string label);          // DefaultOpen | Framed — the inspector section header
+    bool CollapsingHeaderFramedOverlay(string label);   // + AllowOverlap — the component header (checkbox/menu painted over)
     bool BeginChild(string id, Vector2 size, bool border);
     bool BeginChild(string id, Vector2 size, bool border, bool horizontalScroll);
     bool BeginChildAutoResizeY(string id, bool border);   // card sizes to content height (BEvent listener card)
@@ -94,6 +101,7 @@ public interface IEditorGui {
     void EndPopup();
     void OpenPopup(string id);
     bool BeginPopupContextItem(string id);           // right-click-the-last-item context menu
+    void OpenPopupOnItemClick(string id);            // open `id` on a right-click of the last item
     void CloseCurrentPopup();
     void SetNextWindowSizeAppearing(Vector2 size);   // popups that want a sensible first-open size
     bool BeginMenu(string label);
@@ -118,10 +126,13 @@ public interface IEditorGui {
     void TableSetupColumn(string label, EditorColumnFlags flags, float width = 0);
     void TableSetupScrollFreeze(int cols, int rows);
     void TableHeadersRow();
+    void TableSetRowBgColor(uint color);             // hover wash on the current row (RowBg0 target)
 
     // ---- tooltips / item query ----
     void Tooltip(string text);
     bool IsItemHovered();
+    bool IsWindowHovered();
+    bool IsMouseHoveringRect(Vector2 min, Vector2 max, bool clip = true);
     bool IsItemClicked();
     bool IsItemActive();
     bool IsItemActivated();
@@ -134,6 +145,8 @@ public interface IEditorGui {
     // ---- item geometry + focus (custom overlays: the volume override header) ----
     Vector2 ItemRectMin { get; }
     Vector2 ItemRectMax { get; }
+    Vector2 WindowPos { get; }
+    Vector2 WindowSize { get; }
     void SetCursorScreenPos(Vector2 pos);
     bool IsWindowAppearing();
     void SetKeyboardFocusHere();
@@ -150,6 +163,15 @@ public interface IEditorGui {
     string AcceptDragDropPayloadString(string type);
     void EndDragDropTarget();
 
+    // ---- fonts ----
+    // The editor's named fonts (Body/Header/Caption/Display + the Bold variant). Push one, draw, pop — keeps
+    // ImFontPtr out of window bodies. FontSize reads a font's pixel size (header-card layout math).
+    void PushFont(EditorFont font);
+    void PopFont();
+    float FontSize { get; }                      // the CURRENT font's size (== ImGui.GetFontSize())
+    float FontSizeOf(EditorFont font);
+    float TextLineHeight { get; }
+
     // ---- style scope (push/pop, balanced) ----
     // Lets a window body tint a few widgets (severity colours, filter chips, tighter checkbox padding)
     // WITHOUT importing ImGui's style enums. Push N colours then Pop the SAME N; push one var then PopVar.
@@ -157,7 +179,10 @@ public interface IEditorGui {
     void PushColor(EditorStyleColor which, Vector4 rgba);
     void PopColor(int count = 1);
     void PushFramePadding(Vector2 padding);
+    void PushItemSpacing(Vector2 spacing);
     void PopStyleVar(int count = 1);
+    float FrameRounding { get; }
+    float IndentSpacing { get; }
 
     // ---- misc window metrics / clipboard ----
     float WindowWidth { get; }
@@ -176,7 +201,21 @@ public enum EditorStyleColor {
     Text, TextDisabled,
     Button, ButtonHovered, ButtonActive,
     FrameBg, FrameBgHovered,
-    SliderGrab,
+    SliderGrab, CheckMark, ChildBg,
+}
+
+// Seam-local named fonts (the editor builds these at startup — see EditorTheme / ImGuiController).
+public enum EditorFont {
+    Body, Header, Caption, Display, Bold, LargeIcons,
+}
+
+// Seam-local tree-node flags (subset the inspector's foldouts use).
+[System.Flags]
+public enum EditorTreeFlags {
+    None = 0,
+    DefaultOpen = 1 << 0,
+    Framed = 1 << 1,
+    SpanAvailWidth = 1 << 2,
 }
 
 // Seam-local table flags (subset actually used by panels) — keeps ImGuiTableFlags out of window bodies.
@@ -190,6 +229,7 @@ public enum EditorTableFlags {
     SizingStretchProp = 1 << 4,
     Resizable = 1 << 5,
     PadOuterX = 1 << 6,
+    SizingFixedFit = 1 << 7,
 }
 
 // Seam-local column flags (subset).
@@ -222,10 +262,25 @@ public interface IEditorDrawList {
     void AddLine(Vector2 a, Vector2 b, uint col, float thickness = 1f);
     void AddRect(Vector2 min, Vector2 max, uint col, float rounding = 0f, float thickness = 1f);
     void AddRectFilled(Vector2 min, Vector2 max, uint col, float rounding = 0f);
+    void AddRectFilled(Vector2 min, Vector2 max, uint col, float rounding, EditorCorner corners);
     void AddCircle(Vector2 center, float radius, uint col, int segments = 0, float thickness = 1f);
     void AddCircleFilled(Vector2 center, float radius, uint col);
     void AddText(Vector2 pos, uint col, string text);
+    void AddText(EditorFont font, float size, Vector2 pos, uint col, string text);   // bold component-header text
     void AddBezierCubic(Vector2 p0, Vector2 p1, Vector2 p2, Vector2 p3, uint col, float thickness);
+
+    // Channel split: paint a component-card background BEHIND content drawn earlier (the inspector's
+    // per-component banding). Split N channels, draw the band on channel 0 and content on channel 1, merge.
+    void ChannelsSplit(int count);
+    void ChannelsSetCurrent(int channel);
+    void ChannelsMerge();
+}
+
+// Seam-local rounded-corner selector for AddRectFilled (the inspector's axis-chip left-rounded fill).
+[System.Flags]
+public enum EditorCorner {
+    None = 0, TopLeft = 1, TopRight = 2, BottomLeft = 4, BottomRight = 8,
+    Left = TopLeft | BottomLeft, Right = TopRight | BottomRight, All = Left | Right,
 }
 
 // GUI-side key enum (the seam never exposes ImGuiKey). The adapter maps these to ImGuiKey. Named with a

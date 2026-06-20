@@ -103,7 +103,7 @@ internal static class ImGuiBoundaryTests {
     static readonly string[] PendingImGuiMigration = {
         // Inspector — the big one (Phase 7): the panel shell + its adapters/preview/layout subfiles. Several
         // adapters legitimately keep style/ScalarField raw-ImGui (the plan's pragmatic boundary) and stay.
-        "BallisticEngine.Editor/Panels/InspectorPanel.cs",
+        // (InspectorPanel — the 3068-line shell — migrated; the whole inspector is now seam-based.)
         "BallisticEngine.Editor/Panels/Inspector/Adapters/ScalarField.cs",
         // (ImGuiVolumeGui + ImGuiComponentGui migrated — route through EditorGui.Shared; dropped from list.)
         // (InspectorLayout + AssetInspectors + ComponentPreviews migrated — route through EditorGui.Shared.)
