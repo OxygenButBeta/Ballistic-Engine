@@ -128,6 +128,32 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     [StructLayout(LayoutKind.Sequential)]
     struct TemporalConstants { public Vector2 Texel; public float HistoryValid; public float Alpha; public uint W, H; public float Pad0, Pad1; }
 
+    // ---- SVGF spatio-temporal denoiser (LumenSvgf.hlsl) — replaces the broken CSTemporal + CSDenoise ----
+    // CSSvgfTemporal: 1/N adaptive-alpha EMA + luminance-moment variance, world-distance disocclusion, spatial
+    // variance bootstrap on reset. CSSvgfAtrous: 5-iter variance-guided à-trous; iteration 0 feeds back as history.
+    [StructLayout(LayoutKind.Sequential)]
+    struct SvgfConstants
+    {
+        public Matrix4x4 InvViewProj;
+        public Vector3 CameraPos; public float Pad0;
+        public Vector2 Texel; public uint W, H;
+        public float HistoryValid, AlphaMin, AlphaMinMoments, NMax;
+        public float TauZ, EpsZ, CosTauN, StepSize;
+        public float SigmaL, SigmaN, Pad1, Pad2;
+    }
+    ID3D12RootSignature svgfTempRootSig, svgfAtrousRootSig;
+    ID3D12PipelineState svgfTempPso, svgfAtrousPso;
+    Dx12FrameCb<SvgfConstants> svgfTempCb;
+    const int SvgfAtrousIters = 5;
+    ID3D12Resource[] svgfAtrousCbs;            // one CB per à-trous iteration (distinct StepSize, recorded in one list)
+    System.IntPtr[] svgfAtrousCbMapped;
+    int svgfAtrousCbStride;
+    Dx12DescriptorHeap svgfSrv;                // temporal(6 srv+2 uav=8) + atrous iters(4 srv+2 uav=6 each)
+    Dx12OffscreenTarget svgfMoments, svgfMomentsPrev;   // RGBA16F: r=m2, g=N, b=camDist, a=variance (ping-pong by frame)
+    Dx12OffscreenTarget svgfVarA, svgfVarB;             // R16F variance ping-pong for à-trous iterations
+    Dx12OffscreenTarget svgfColorA, svgfColorB;         // RGBA16F color ping-pong for à-trous iterations
+    bool svgfHistoryValid;
+
     // ---- spatial denoise (edge-aware blur of the per-pixel indirect E) ----
     ID3D12RootSignature denoiseRootSig; // CBV b0 + table{t0-t2 SRV, u0 UAV}
     ID3D12PipelineState denoisePso;
@@ -541,132 +567,110 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         }
         ToShaderRead(indirect);
 
-        // === COMMON MOTION-VECTOR TEMPORAL RESOLVE (LumenTemporal) ===
-        bool temporalOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOTEMPORAL") != "1"
-                          && !ctx.DeterministicCapture;   // deterministic capture: skip (single frame, fresh) for golden stability
-        bool historyMissThisFrame = !probeHistoryValid;
-
-        // === SPATIAL DENOISE FIRST (the flicker fix): à-trous blur of the per-pixel grain, BEFORE the temporal
-        // resolve, so combine + history read the SAME denoised+resolved signal. ===
-        bool denoise = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NODENOISE") != "1" && fx.LumenDenoisePasses > 0;
-        int dnPasses = denoise ? Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_DENOISE_PASSES", fx.LumenDenoisePasses), 1, MaxDenoisePasses) : 1;
-        bool adaptiveDenoise = denoise && Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_DENOISE_PASSES") == null
-                               && !ctx.DeterministicCapture;
-        if (adaptiveDenoise && historyMissThisFrame)
-            dnPasses = Math.Clamp(Math.Max(dnPasses, 3), 1, MaxDenoisePasses);
-        // Denoise the FRESH trace E (indirect) into indirectFiltered, ping-ponging indirect↔indirectFiltered. The
-        // final denoised result is left in `indirect` (so the temporal pass below reads the denoised fresh E as t0).
-        Dx12OffscreenTarget src = indirect, dst = indirectFiltered;
-        denoiseSrv.Reset();   // ONCE per frame — each pass takes a DISTINCT 4-descriptor range (no cross-pass alias)
-        for (int pass = 0; pass < dnPasses; pass++)
+        // ============================ SVGF SPATIO-TEMPORAL DENOISE ============================
+        // Replaces the old CSDenoise loop + CSTemporal. Pass chain (all at E-res):
+        //   1) CSSvgfTemporal: indirect(E) + probeHistory(prevColor) + svgfMomentsPrev + depth/normal/motion
+        //        -> svgfColorA (accumulated color), svgfMoments (m2/N/camDist/var), svgfVarA (variance)
+        //   2) CSSvgfAtrous x SvgfAtrousIters (step 1,2,4,8,16) ping-ponging colorA<->B, varA<->B.
+        //        After iteration 0 the colour is SNAPSHOT into probeHistory (the SVGF feedback detail - history is
+        //        the lightly-filtered iter-0 result, not the raw temporal and not the over-blurred final).
+        //   3) lastResolved = final a-trous colour -> the combine reads it.
+        // A deterministic capture KEEPS SVGF (it converges to a fixed point on a static camera -> still reproducible).
+        void MakeUav(Dx12OffscreenTarget t, System.IntPtr cpu) =>
+            dev.Device.CreateUnorderedAccessView(t.RenderTarget, null, new UnorderedAccessViewDescription
+            { Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D }, cpu);
+        uint dispX = (uint)((indirect.Width + 7) / 8), dispY = (uint)((indirect.Height + 7) / 8);
+        var svgfBase = new SvgfConstants
         {
-            *(DenoiseConstants*)denoiseCbMappedArr[pass] = new DenoiseConstants
-            {
-                Texel = new Vector2(1f / indirect.Width, 1f / indirect.Height),
-                Step = denoise ? (1 << pass) : 1f, Enabled = denoise ? 1f : 0f,
-            };
-            int db = denoiseSrv.AllocateRange(4);
-            dev.Device.CopyDescriptorsSimple(1, denoiseSrv.Cpu(db + 0), src.ColorSrvCpu, heapType);           // t0 E in
-            dev.Device.CopyDescriptorsSimple(1, denoiseSrv.Cpu(db + 1), gbuffer.DepthSrvCpu, heapType);       // t1 depth
-            dev.Device.CopyDescriptorsSimple(1, denoiseSrv.Cpu(db + 2), gbuffer.ColorSrvCpu(1), heapType);    // t2 normal
-            dev.Device.CreateUnorderedAccessView(dst.RenderTarget, null, new UnorderedAccessViewDescription
-            {
-                Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
-            }, denoiseSrv.Cpu(db + 3));                                                                        // u0 E out
-            ToUav(dst);
-            ulong passCbAddr = denoiseCbs[pass].GPUVirtualAddress + (ulong)DenoiseCbOffset;
-            Emit(cl =>
-            {
-                cl.SetDescriptorHeaps(denoiseSrv.Heap);
-                cl.SetComputeRootSignature(denoiseRootSig);
-                cl.SetPipelineState(denoisePso);
-                cl.SetComputeRootConstantBufferView(0, passCbAddr);
-                cl.SetComputeRootDescriptorTable(1, denoiseSrv.Gpu(db));
-                cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
-            });
-            ToShaderRead(dst);
-            (src, dst) = (dst, src);
-        }
-        // Land the denoised result back in `indirect` (the temporal pass's t0 fresh-E input). `src` holds the last
-        // written buffer; copy it into indirect when that isn't already indirect.
-        if (!ReferenceEquals(src, indirect))
-            Copy(indirect, src);
+            InvViewProj = Matrix4x4.Transpose(invVP),
+            CameraPos = ctx.CamPos,
+            Texel = new Vector2(1f / indirect.Width, 1f / indirect.Height),
+            W = (uint)indirect.Width, H = (uint)indirect.Height,
+            HistoryValid = (svgfHistoryValid && Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOTEMPORAL") != "1") ? 1f : 0f,
+            AlphaMin = EnvF("BALLISTIC_DX12_LUMEN_SVGF_ALPHA", 0.05f),
+            AlphaMinMoments = EnvF("BALLISTIC_DX12_LUMEN_SVGF_ALPHA_MOM", 0.2f),
+            NMax = EnvF("BALLISTIC_DX12_LUMEN_SVGF_NMAX", 32f),
+            TauZ = EnvF("BALLISTIC_DX12_LUMEN_SVGF_TAUZ", 0.05f),
+            EpsZ = EnvF("BALLISTIC_DX12_LUMEN_SVGF_EPSZ", 0.05f),
+            CosTauN = EnvF("BALLISTIC_DX12_LUMEN_SVGF_COSN", 0.906f),
+            SigmaL = EnvF("BALLISTIC_DX12_LUMEN_SVGF_SIGL", 4f),
+            SigmaN = EnvF("BALLISTIC_DX12_LUMEN_SVGF_SIGN", 64f),
+        };
+
+        svgfSrv.Reset();
+        // ---- Pass 1: temporal ----
         ToShaderRead(indirect);
-        Prof("denoise");
-
-        // === COMMON MOTION-VECTOR TEMPORAL RESOLVE (LumenTemporal) — AFTER the denoise ===
-        if (temporalOn)
+        ToShaderRead(probeHistory);
+        ToShaderRead(svgfMomentsPrev);
+        ToUav(svgfColorA); ToUav(svgfMoments); ToUav(svgfVarA);
+        svgfTempCb.Write(svgfBase);
         {
-            tempCb.Write(new TemporalConstants
-            {
-                Texel = new Vector2(1f / indirect.Width, 1f / indirect.Height),
-                HistoryValid = probeHistoryValid ? 1f : 0f,
-                Alpha = EnvF("BALLISTIC_DX12_LUMEN_TEMPORAL_ALPHA", 0.1f),
-                W = (uint)indirect.Width, H = (uint)indirect.Height,
-                Pad0 = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_TEMPORAL_NOMOTION") == "1" ? 1f : 0f,
-            });
-            // PING-PONG (default): the temporal resolve reads history(probeHistory) and writes the resolved E
-            // straight into `indirectResolved`. The combine then reads `indirectResolved` DIRECTLY, and next frame
-            // `indirectResolved` IS the history — so we just swap the two roles instead of doing two full-res Copies
-            // (resolved→indirectFiltered for the combine + resolved→probeHistory for history). Two fewer full-res
-            // RGBA16F blits + their barriers per frame, output-identical. Kill: BALLISTIC_DX12_LUMEN_PINGPONG=0
-            // reverts to the explicit-Copy form (writes indirectFiltered, copies to probeHistory).
-            // asyncCl != null ⇒ we're recording the async-GI compute list (that path owns its own buffer swap and
-            // must keep writing indirectFiltered) → ping-pong only on the inline/sync path.
-            bool pingPong = asyncCl is null && Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_PINGPONG") != "0";
-            Dx12OffscreenTarget resolvedDst = indirectResolved;   // temporal writes here either way; ping-pong just reuses it as next-frame history
-            ToShaderRead(probeHistory);
-            ToUav(resolvedDst);
-            tempSrv.Reset();
-            int tb = tempSrv.AllocateRange(5);
-            dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 0), indirect.ColorSrvCpu, heapType);          // t0 denoised fresh E
-            dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 1), probeHistory.ColorSrvCpu, heapType);      // t1 history
-            dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 2), gbuffer.DepthSrvCpu, heapType);           // t2 depth
-            dev.Device.CopyDescriptorsSimple(1, tempSrv.Cpu(tb + 3), gbuffer.ColorSrvCpu(4), heapType);        // t3 motion (RT4)
-            dev.Device.CreateUnorderedAccessView(resolvedDst.RenderTarget, null, new UnorderedAccessViewDescription
-            {
-                Format = Dx12OffscreenTarget.HdrFormat, ViewDimension = UnorderedAccessViewDimension.Texture2D,
-            }, tempSrv.Cpu(tb + 4));                                                                            // u0 resolved
-            ulong tcb = tempCb.Gpu;
+            int tb = svgfSrv.AllocateRange(9);
+            dev.Device.CopyDescriptorsSimple(1, svgfSrv.Cpu(tb + 0), indirect.ColorSrvCpu, heapType);          // t0 fresh E
+            dev.Device.CopyDescriptorsSimple(1, svgfSrv.Cpu(tb + 1), probeHistory.ColorSrvCpu, heapType);      // t1 hist color
+            dev.Device.CopyDescriptorsSimple(1, svgfSrv.Cpu(tb + 2), svgfMomentsPrev.ColorSrvCpu, heapType);   // t2 hist moments
+            dev.Device.CopyDescriptorsSimple(1, svgfSrv.Cpu(tb + 3), gbuffer.DepthSrvCpu, heapType);           // t3 depth
+            dev.Device.CopyDescriptorsSimple(1, svgfSrv.Cpu(tb + 4), gbuffer.ColorSrvCpu(1), heapType);        // t4 normal
+            dev.Device.CopyDescriptorsSimple(1, svgfSrv.Cpu(tb + 5), gbuffer.ColorSrvCpu(4), heapType);        // t5 motion
+            MakeUav(svgfColorA, svgfSrv.Cpu(tb + 6));   // u0
+            MakeUav(svgfMoments, svgfSrv.Cpu(tb + 7));  // u1
+            MakeUav(svgfVarA,    svgfSrv.Cpu(tb + 8));  // u2
+            ulong tcb = svgfTempCb.Gpu;
             Emit(cl =>
             {
-                cl.SetDescriptorHeaps(tempSrv.Heap);
-                cl.SetComputeRootSignature(tempRootSig);
-                cl.SetPipelineState(tempPso);
+                cl.SetDescriptorHeaps(svgfSrv.Heap);
+                cl.SetComputeRootSignature(svgfTempRootSig);
+                cl.SetPipelineState(svgfTempPso);
                 cl.SetComputeRootConstantBufferView(0, tcb);
-                cl.SetComputeRootDescriptorTable(1, tempSrv.Gpu(tb));
-                cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
+                cl.SetComputeRootDescriptorTable(1, svgfSrv.Gpu(tb));
+                cl.Dispatch(dispX, dispY, 1);
             });
-            ToShaderRead(resolvedDst);
-            if (pingPong)
-            {
-                // The combine reads `resolvedDst` (= indirectResolved) directly; next frame it becomes the history
-                // and the old `probeHistory` becomes the fresh resolve target. ZERO full-res copies.
-                lastResolved = resolvedDst;
-                (indirectResolved, probeHistory) = (probeHistory, indirectResolved);
-            }
-            else
-            {
-                // Legacy explicit-Copy form (kept for A/B + the async path, which owns its own buffer swap).
-                Copy(indirectFiltered, indirectResolved);
-                ToShaderRead(indirectFiltered);
-                Copy(probeHistory, indirectResolved);
-                ToShaderRead(probeHistory);
-                lastResolved = indirectFiltered;
-            }
-            probeHistoryValid = true;
         }
-        else
+        ToShaderRead(svgfColorA); ToShaderRead(svgfVarA);
+        Prof("svgf-temporal");
+
+        // ---- Pass 2: a-trous iterations (color/var ping-pong A->B->A...) ----
+        Dx12OffscreenTarget cSrc = svgfColorA, cDst = svgfColorB, vSrc = svgfVarA, vDst = svgfVarB;
+        for (int it = 0; it < SvgfAtrousIters; it++)
         {
-            // No temporal (deterministic/off): the combine reads the denoised E; snapshot it as history too.
-            Copy(indirectFiltered, indirect);
-            ToShaderRead(indirectFiltered);
-            Copy(probeHistory, indirect);
-            ToShaderRead(probeHistory);
-            lastResolved = indirectFiltered;
-            probeHistoryValid = true;
+            var cb = svgfBase; cb.StepSize = 1 << it;
+            *(SvgfConstants*)svgfAtrousCbMapped[it] = cb;
+            ulong acbAddr = svgfAtrousCbs[it].GPUVirtualAddress + (ulong)(svgfAtrousCbStride * dev.FrameSlot);
+
+            ToUav(cDst); ToUav(vDst);
+            int ab = svgfSrv.AllocateRange(6);
+            dev.Device.CopyDescriptorsSimple(1, svgfSrv.Cpu(ab + 0), cSrc.ColorSrvCpu, heapType);              // t0 color in
+            dev.Device.CopyDescriptorsSimple(1, svgfSrv.Cpu(ab + 1), vSrc.ColorSrvCpu, heapType);              // t1 var in
+            dev.Device.CopyDescriptorsSimple(1, svgfSrv.Cpu(ab + 2), gbuffer.DepthSrvCpu, heapType);           // t2 depth
+            dev.Device.CopyDescriptorsSimple(1, svgfSrv.Cpu(ab + 3), gbuffer.ColorSrvCpu(1), heapType);        // t3 normal
+            MakeUav(cDst, svgfSrv.Cpu(ab + 4));  // u0 color out
+            MakeUav(vDst, svgfSrv.Cpu(ab + 5));  // u1 var out
+            Emit(cl =>
+            {
+                cl.SetDescriptorHeaps(svgfSrv.Heap);
+                cl.SetComputeRootSignature(svgfAtrousRootSig);
+                cl.SetPipelineState(svgfAtrousPso);
+                cl.SetComputeRootConstantBufferView(0, acbAddr);
+                cl.SetComputeRootDescriptorTable(1, svgfSrv.Gpu(ab));
+                cl.Dispatch(dispX, dispY, 1);
+            });
+            ToShaderRead(cDst); ToShaderRead(vDst);
+
+            // SVGF feedback: iteration 0's colour becomes next frame's history (the lightly-filtered signal).
+            if (it == 0) { Copy(probeHistory, cDst); ToShaderRead(probeHistory); }
+
+            (cSrc, cDst) = (cDst, cSrc);
+            (vSrc, vDst) = (vDst, vSrc);
         }
-        Prof("temporal");
+        // cSrc now holds the final a-trous colour (last write target after the final swap). The combine reads it.
+        lastResolved = cSrc;
+        // Next-frame moments history (ping-pong).
+        (svgfMoments, svgfMomentsPrev) = (svgfMomentsPrev, svgfMoments);
+        probeHistoryValid = true;
+        svgfHistoryValid = true;
+        // The async combine reads `indirectFiltered`; keep it valid by copying the final SVGF colour into it.
+        if (asyncCl != null) { Copy(indirectFiltered, cSrc); ToShaderRead(indirectFiltered); lastResolved = indirectFiltered; }
+        Prof("svgf");
     }
 
     // COMBINE: add E*albedo*ao/PI from `eBuffer` (a filtered indirect-irradiance target) directly into the HDR
@@ -843,7 +847,13 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             ViewProj = Matrix4x4.Transpose(ctx.ViewProj),
             CameraPos = ctx.CamPos, Intensity = intensity,
             FullTexel = new Vector2(1f / indirect.Width, 1f / indirect.Height),
-            RayCount = octSize * octSize, FrameIndex = ctx.DeterministicCapture ? 0f : frameCounter,
+            RayCount = octSize * octSize,
+            // FrameIndex drives the per-cell ray jitter. DEFAULT now passes a value < -1.5 → the shader uses a FIXED
+            // (non-frame-rotating) jitter (the 4× noise fix). BALLISTIC_DX12_LUMEN_ROTJITTER=1 restores the legacy
+            // rotating jitter for A/B (passes the real frame counter, negated into the shader's door range).
+            FrameIndex = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_ROTJITTER") == "1"
+                         ? -(2f + (frameCounter % 64))                       // <-1.5 → shader re-injects this frame term
+                         : -1f,                                              // default: fixed per-cell jitter (no temporal rotation)
             NormalBias = 0.03f, MaxRayDist = maxDist, UseCards = useCards ? 1f : 0f, ScreenSteps = 16f,
             SkyIntensity = skyIntensity, UseSky = useSky ? 1f : 0f,
             UseScreenTrace = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOSCREEN") == "1" ? 0f : 1f,
@@ -855,7 +865,10 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             FullW = (uint)indirect.Width, FullH = (uint)indirect.Height,
             // Sıra 3 temporal accumulation. A deterministic capture KEEPS accumulation (fixed frame → fixed,
             // reproducible accumulation over the static camera — the converged result is what we measure).
-            HistoryValid = spHistoryValid ? 1f : 0f,
+            // DBG: BALLISTIC_DX12_LUMEN_NOACCUM=1 forces history off every frame → each frame is a raw single-sample
+            // trace+filter+integrate, no temporal masking. This is exactly what the user sees UNDER MOTION (history
+            // can't accumulate while reprojecting) — the honest noise metric. Static capture hides it (EMA converges).
+            HistoryValid = (spHistoryValid && Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOACCUM") != "1") ? 1f : 0f,
             ProbeEma = EnvF("BALLISTIC_DX12_LUMEN_PROBE_EMA", 0.1f),   // this-frame weight; low = strong accumulation
             TexelDim = scene.TexelDim,
             SpPad1 = EnvF("BALLISTIC_DX12_LUMEN_PROBE_FILTER_RADIUS", 2f),   // probe-space spatial filter radius (blob fix)
@@ -1253,6 +1266,69 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         tempSrv = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 8,
             shaderVisible: true, framesInFlight: dev.FramesInFlight);
+
+        BuildSvgfPipeline();
+    }
+
+    // SVGF pipelines (LumenSvgf.hlsl). Two PSOs sharing one CB type:
+    //   CSSvgfTemporal: CBV b0 + table{t0 InE, t1 HistColor, t2 HistMoments, t3 Depth, t4 Normal, t5 Motion (SRV),
+    //                   u0 OutColor, u1 OutMoments (UAV)} + linear-clamp sampler.
+    //   CSSvgfAtrous:   CBV b0 + table{t0 ColorIn, t1 VarIn, t2 Depth, t3 Normal (SRV), u0 ColorOut, u1 VarOut (UAV)}.
+    // One root sig per PSO (different SRV counts). The à-trous runs SvgfAtrousIters times in one list → one CB per
+    // iteration (distinct StepSize) and one descriptor range per iteration (no cross-pass alias — same lesson the
+    // denoise learned: a shared CB/heap made all passes read the last pass's stride and the GI went black).
+    unsafe void BuildSvgfPipeline()
+    {
+        string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("LumenSvgf.hlsl");
+        var samp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
+        {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
+            AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1, ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+
+        // --- Temporal: 6 SRV + 3 UAV (OutColor, OutMoments, OutVariance) ---
+        {
+            var srv = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 6, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 0);
+            var uav = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 3, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 6);
+            var table = new RootParameter1(new RootDescriptorTable1(srv, uav), ShaderVisibility.All);
+            svgfTempRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+                new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, table }, new[] { samp })));
+            svgfTempPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription
+            {
+                RootSignature = svgfTempRootSig,
+                ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSSvgfTemporal", "LumenSvgf.hlsl"),
+            });
+        }
+        // --- À-trous: 4 SRV + 2 UAV ---
+        {
+            var srv = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 4, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 0);
+            var uav = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 2, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 4);
+            var table = new RootParameter1(new RootDescriptorTable1(srv, uav), ShaderVisibility.All);
+            svgfAtrousRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+                new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, table }, new[] { samp })));
+            svgfAtrousPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription
+            {
+                RootSignature = svgfAtrousRootSig,
+                ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSSvgfAtrous", "LumenSvgf.hlsl"),
+            });
+        }
+
+        svgfTempCb = new Dx12FrameCb<SvgfConstants>(dev);
+        svgfAtrousCbStride = (Marshal.SizeOf<SvgfConstants>() + 255) & ~255;
+        svgfAtrousCbs = new ID3D12Resource[SvgfAtrousIters];
+        svgfAtrousCbMapped = new System.IntPtr[SvgfAtrousIters];
+        for (int i = 0; i < SvgfAtrousIters; i++)
+        {
+            svgfAtrousCbs[i] = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+                ResourceDescription.Buffer((ulong)(svgfAtrousCbStride * dev.FramesInFlight)), ResourceStates.GenericRead);
+            svgfAtrousCbMapped[i] = (System.IntPtr)svgfAtrousCbs[i].Map<byte>(0);
+        }
+        // Heap: temporal needs 9 (6 srv + 3 uav); each à-trous iter needs 6 (4 srv + 2 uav). One distinct range per
+        // dispatch in a list → 9 + SvgfAtrousIters*6 descriptors per frame slot.
+        svgfSrv = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 9 + SvgfAtrousIters * 6,
+            shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
     // Sıra 1 — screen-probe root sig (mirrors the GI trace) + 3 PSOs (place/trace/integrate) + CBs + a 1-descriptor
@@ -1389,6 +1465,17 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         indirectResolved?.Dispose();   // common motion-vector temporal output (ping target)
         indirectResolved = new Dx12OffscreenTarget(dev, lw, lh, withDepth: false,
             colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
+
+        // SVGF buffers (all à-trous-res = E-res). moments/momentsPrev ping-pong cross-frame (pass-owned, NEVER
+        // pooled); var/color A/B are per-frame à-trous scratch. All RGBA16F for a single consistent SRV/UAV path
+        // (variance lives in the .r channel of the var buffers; the moments buffer packs m2/N/camDist/variance).
+        foreach (var b in new[] { svgfMoments, svgfMomentsPrev, svgfVarA, svgfVarB, svgfColorA, svgfColorB }) b?.Dispose();
+        Dx12OffscreenTarget MkHdr() => new Dx12OffscreenTarget(dev, lw, lh, withDepth: false,
+            colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true, allowUav: true);
+        svgfMoments = MkHdr(); svgfMomentsPrev = MkHdr();
+        svgfVarA = MkHdr(); svgfVarB = MkHdr();
+        svgfColorA = MkHdr(); svgfColorB = MkHdr();
+        svgfHistoryValid = false;   // resized history is stale → first frame resets (N=1, spatial-bootstrap variance)
 
         // Sıra 1 — screen-probe grid + octahedral atlas, sized off the `indirect` resolution (the GI front-end
         // resolution). One probe per probeStride×probeStride tile; each probe holds an octSize×octSize oct tile.

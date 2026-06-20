@@ -358,7 +358,15 @@ void CSProbeTrace(uint3 dtid : SV_DispatchThreadID) {
     // from the probe normal (a silhouette / curved surface inside the tile) still reads valid directions. Tracing
     // only the probe-N hemisphere (the previous approach) left the pixel-hemisphere cells that fall in the probe's
     // BACK hemisphere empty → energy loss + the measured darkening/grain.
-    float jitter = Hash(pidx * 2654435761u ^ (lcell.x * 73856093u) ^ (lcell.y * 19349663u) ^ (uint)FrameIndex);
+    // Jitter the ray inside its oct cell. CRITICAL: the jitter is FIXED per (probe,cell) and does NOT rotate with
+    // FrameIndex. Measured (NOACCUM frame-to-frame diff, Bistro): a frame-rotating jitter gave 4× the per-frame noise
+    // (0.000634 vs 0.000157) — each frame re-aimed every ray, so every cell's radiance changed every frame and the
+    // EMA could never converge (the "wandering blobs / boil" the user saw). With a fixed per-cell direction the cell
+    // value changes ONLY with real scene/camera motion, which the EMA fully resolves. Spatial AA is preserved (cells
+    // are still hash-jittered relative to each other); only the temporal rotation — the noise source — is removed.
+    // BALLISTIC_DX12_LUMEN_ROTJITTER=1 (FrameIndex passed as -2 by C#) restores the old rotating jitter for A/B.
+    uint frameTerm = (FrameIndex < -1.5) ? (uint)(-FrameIndex) : 0u;   // default 0 = fixed; door re-injects a frame term
+    float jitter = Hash(pidx * 2654435761u ^ (lcell.x * 73856093u) ^ (lcell.y * 19349663u) ^ frameTerm);
     float2 octUv = (float2(lcell) + float2(frac(jitter * 1.61803), frac(jitter * 2.41421))) / float(oct);
     float3 dir = OctDecode(octUv);
 
