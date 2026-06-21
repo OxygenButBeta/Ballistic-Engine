@@ -18,8 +18,10 @@ namespace BallisticEngine.DX12;
 // D1: irradiance only. D3 adds a parallel visibility buffer (mean depth, depth²) for the Chebyshev leak fix.
 public sealed class Dx12DdgiProbeGrid : IDisposable
 {
-    public const int OctRes = 6;                  // octahedral cell edge (texels) per probe
+    public const int OctRes = 6;                  // octahedral cell edge (texels) per probe (irradiance)
     public const int OctTexels = OctRes * OctRes; // 36 float4 irradiance texels per probe
+    public const int VisRes = 16;                 // octahedral cell edge for the visibility moments (sharper)
+    public const int VisTexels = VisRes * VisRes; // 256 float2 (mean depth, mean depth²) per probe
 
     readonly Dx12Device dev;
 
@@ -42,6 +44,14 @@ public sealed class Dx12DdgiProbeGrid : IDisposable
     public ID3D12Resource IrradianceRead  => writeB ? irradA : irradB;   // previous frame
     public ulong IrradianceWriteGpu => IrradianceWrite?.GPUVirtualAddress ?? 0;
     public ulong IrradianceReadGpu  => IrradianceRead?.GPUVirtualAddress ?? 0;
+
+    // ---- visibility moments cache (ping-pong, D3) — float2 (mean dist, mean dist²) per oct texel for the
+    // Chebyshev (variance-shadow) leak test the sample pass uses to reject probes occluded from the surface. ----
+    ID3D12Resource visA, visB;
+    public ID3D12Resource VisibilityWrite => writeB ? visB : visA;
+    public ID3D12Resource VisibilityRead  => writeB ? visA : visB;
+    public ulong VisibilityWriteGpu => VisibilityWrite?.GPUVirtualAddress ?? 0;
+    public ulong VisibilityReadGpu  => VisibilityRead?.GPUVirtualAddress ?? 0;
 
     public bool HistoryValid { get; private set; }
     public bool Valid { get; private set; }
@@ -97,11 +107,9 @@ public sealed class Dx12DdgiProbeGrid : IDisposable
             GridOrigin = min;   // probe 0 sits at the AABB min corner; probe (N-1) at the max corner
 
             int needProbes = ProbeCount;
-            // Realloc only when the buffer must grow (probe count is the only size driver).
-            long bytes = (long)needProbes * OctTexels * 16;   // float4 = 16B
-            if (irradA == null || (long)CurrentCapacityProbes * OctTexels * 16 < bytes)
+            if (irradA == null || CurrentCapacityProbes < needProbes)
             {
-                ReallocIrradiance(needProbes);
+                Realloc(needProbes);
                 HistoryValid = false;   // fresh buffers → no usable history this frame
             }
             dimStamp = dims; lastMin = min; lastMax = max;
@@ -113,32 +121,35 @@ public sealed class Dx12DdgiProbeGrid : IDisposable
 
     int CurrentCapacityProbes;
 
-    void ReallocIrradiance(int probeCount)
+    ID3D12Resource MakeBuffer(long bytes) =>
+        dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)bytes, ResourceFlags.AllowUnorderedAccess), ResourceStates.UnorderedAccess);
+
+    void Realloc(int probeCount)
     {
-        irradA?.Dispose(); irradB?.Dispose();
-        long elems = (long)probeCount * OctTexels;
-        var desc = ResourceDescription.Buffer((ulong)(elems * 16), ResourceFlags.AllowUnorderedAccess);
-        irradA = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None,
-            desc, ResourceStates.UnorderedAccess);
-        irradB = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None,
-            desc, ResourceStates.UnorderedAccess);
+        irradA?.Dispose(); irradB?.Dispose(); visA?.Dispose(); visB?.Dispose();
+        long irrBytes = (long)probeCount * OctTexels * 16;   // float4
+        long visBytes = (long)probeCount * VisTexels * 8;    // float2
+        irradA = MakeBuffer(irrBytes); irradB = MakeBuffer(irrBytes);
+        visA = MakeBuffer(visBytes);   visB = MakeBuffer(visBytes);
         CurrentCapacityProbes = probeCount;
         writeB = false;
-        irradAState = irradBState = ResourceStates.UnorderedAccess;
+        states.Clear();
+        states[irradA] = states[irradB] = states[visA] = states[visB] = ResourceStates.UnorderedAccess;
     }
 
-    // Minimal self-tracked state for the two buffers (the relight pass transitions them each frame).
-    ResourceStates irradAState, irradBState;
-    public ResourceStates StateOf(ID3D12Resource r) => r == irradB ? irradBState : irradAState;
-    public void SetState(ID3D12Resource r, ResourceStates s) { if (r == irradB) irradBState = s; else irradAState = s; }
+    // Self-tracked resource states (the relight pass transitions all four buffers each frame).
+    readonly System.Collections.Generic.Dictionary<ID3D12Resource, ResourceStates> states = new();
+    public ResourceStates StateOf(ID3D12Resource r) => states.TryGetValue(r, out var s) ? s : ResourceStates.UnorderedAccess;
+    public void SetState(ID3D12Resource r, ResourceStates s) { states[r] = s; }
 
     // Swap the ping-pong + mark history valid (called at the end of the relight pass).
     public void SwapAndMarkHistory() { writeB = !writeB; HistoryValid = true; }
 
     public void Dispose()
     {
-        irradA?.Dispose(); irradB?.Dispose();
-        irradA = irradB = null;
+        irradA?.Dispose(); irradB?.Dispose(); visA?.Dispose(); visB?.Dispose();
+        irradA = irradB = visA = visB = null;
         Valid = false;
     }
 }

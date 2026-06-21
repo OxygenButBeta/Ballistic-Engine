@@ -67,7 +67,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         public Vector3 GridOrigin;   public float Pad0;
         public Vector3 ProbeSpacing; public float NormalBias;
         public uint CountX, CountY, CountZ; public uint W;
-        public uint H; public float Intensity; public float Pad1; public float Pad2;
+        public uint H; public float Intensity; public float UseVisibility; public float Pad2;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -185,12 +185,15 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
 
         var irradW = grid.IrradianceWrite;
         var irradR = grid.IrradianceRead;
+        var visW = grid.VisibilityWrite;
+        var visR = grid.VisibilityRead;
         dev.ExecuteSync(cl =>
         {
-            if (grid.StateOf(irradW) != ResourceStates.UnorderedAccess)
-                cl.ResourceBarrierTransition(irradW, grid.StateOf(irradW), ResourceStates.UnorderedAccess);
-            if (grid.StateOf(irradR) != ResourceStates.NonPixelShaderResource)
-                cl.ResourceBarrierTransition(irradR, grid.StateOf(irradR), ResourceStates.NonPixelShaderResource);
+            void ToState(ID3D12Resource r, ResourceStates s) { if (grid.StateOf(r) != s) { cl.ResourceBarrierTransition(r, grid.StateOf(r), s); grid.SetState(r, s); } }
+            ToState(irradW, ResourceStates.UnorderedAccess);
+            ToState(visW, ResourceStates.UnorderedAccess);
+            ToState(irradR, ResourceStates.NonPixelShaderResource);
+            ToState(visR, ResourceStates.NonPixelShaderResource);
 
             cl.SetDescriptorHeaps(bindless.Heap);
             cl.SetComputeRootSignature(relightRootSig);
@@ -203,11 +206,14 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             cl.SetComputeRootShaderResourceView(5, ctx.GpuDriven.MaterialsGpuAddress);    // t3 GpuMaterials
             cl.SetComputeRootShaderResourceView(6, ctx.ClusteredLights.LightBufGpuAddress); // t4 Lights
             cl.SetComputeRootDescriptorTable(7, bindless.Gpu(RelightSkyTableBase));       // t5 sky cube
+            cl.SetComputeRootUnorderedAccessView(8, grid.VisibilityWriteGpu);             // u1 Visibility
+            cl.SetComputeRootShaderResourceView(9, grid.VisibilityReadGpu);               // t6 PrevVis
             cl.Dispatch((uint)grid.ProbeCount, 1, 1);                                     // one GROUP per probe
             cl.ResourceBarrierTransition(irradW, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            cl.ResourceBarrierTransition(visW, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
         });
         grid.SetState(irradW, ResourceStates.NonPixelShaderResource);
-        grid.SetState(irradR, ResourceStates.NonPixelShaderResource);
+        grid.SetState(visW, ResourceStates.NonPixelShaderResource);
         grid.SwapAndMarkHistory();
     }
 
@@ -228,6 +234,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             CountX = (uint)grid.CountX, CountY = (uint)grid.CountY, CountZ = (uint)grid.CountZ,
             W = (uint)indirect.Width, H = (uint)indirect.Height,
             Intensity = 1f,
+            UseVisibility = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_NOVIS") == "1" ? 0f : 1f,
         });
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
@@ -252,7 +259,8 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             cl.SetPipelineState(samplePso);
             cl.SetComputeRootConstantBufferView(0, sampleCb.Gpu);
             cl.SetComputeRootShaderResourceView(1, irrad.GPUVirtualAddress);              // t2 Irradiance (root SRV)
-            cl.SetComputeRootDescriptorTable(2, sampleSrv.Gpu(0));                        // t0 depth, t1 normal, u0 Indirect
+            cl.SetComputeRootShaderResourceView(2, grid.VisibilityRead.GPUVirtualAddress); // t3 VisMoments (root SRV)
+            cl.SetComputeRootDescriptorTable(3, sampleSrv.Gpu(0));                        // t0 depth, t1 normal, u0 Indirect
             cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
         });
     }
@@ -307,11 +315,13 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         var lights = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(4, 0), ShaderVisibility.All);   // t4
         var skyRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 5);                    // t5 table
         var skyTable = new RootParameter1(new RootDescriptorTable1(skyRange), ShaderVisibility.All);
+        var visUav = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(1, 0), ShaderVisibility.All);  // u1 Visibility
+        var prevVis = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(6, 0), ShaderVisibility.All);  // t6 PrevVis
         var clamp = StaticClamp(0);
         relightRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { cbv0, tlas, irradUav, prevIrrad, rtInst, mats, lights, skyTable }, new[] { clamp })));
+                new[] { cbv0, tlas, irradUav, prevIrrad, rtInst, mats, lights, skyTable, visUav, prevVis }, new[] { clamp })));
 
         string hlsl = EmbeddedShaderSource.ReadHlsl("DdgiRelight.hlsl");
         byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSMain", "DdgiRelight.hlsl");
@@ -323,13 +333,14 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     {
         var cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
         var irrad = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(2, 0), ShaderVisibility.All);   // t2 Irradiance (root SRV)
+        var visMom = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(3, 0), ShaderVisibility.All);  // t3 VisMoments (root SRV)
         // table: t0 depth, t1 normal (SRV) + u0 Indirect (UAV)
         var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 0);
         var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);
         var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange), ShaderVisibility.All);
         var clamp = StaticClamp(0);
         sampleRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv0, irrad, table }, new[] { clamp })));
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv0, irrad, visMom, table }, new[] { clamp })));
 
         string hlsl = EmbeddedShaderSource.ReadHlsl("DdgiSample.hlsl");
         byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSMain", "DdgiSample.hlsl");

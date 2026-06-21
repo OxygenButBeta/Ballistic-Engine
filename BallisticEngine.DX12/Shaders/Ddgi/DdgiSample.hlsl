@@ -11,17 +11,20 @@ cbuffer DdgiSampleConstants : register(b0) {
     float3 GridOrigin;   float Pad0;
     float3 ProbeSpacing; float NormalBias;   // push the sample point off the surface along N (self-leak guard)
     uint   CountX, CountY, CountZ;  uint W;
-    uint   H;  float Intensity;  float Pad1;  float Pad2;
+    uint   H;  float Intensity;  float UseVisibility;  float Pad2;   // UseVisibility=1 → Chebyshev leak test (D3)
 };
 
 Texture2D<float>  Depth      : register(t0);
 Texture2D<float4> NormalTex  : register(t1);
 StructuredBuffer<float4> Irradiance : register(t2);
+StructuredBuffer<float2> VisMoments : register(t3);   // D3: per-probe visibility moments (mean dist, mean dist²)
 RWTexture2D<float4> Indirect : register(u0);
 SamplerState LinearClamp : register(s0);
 
 static const int OctRes = 6;
 static const int OctTexels = OctRes * OctRes;
+static const int VisRes = 16;
+static const int VisTexels = VisRes * VisRes;
 
 float2 OctEncode(float3 n) {
     n /= (abs(n.x) + abs(n.y) + abs(n.z));
@@ -44,6 +47,29 @@ float3 SampleProbeOct(uint probe, float3 dir) {
         c += Irradiance[probe * OctTexels + t.y * OctRes + t.x].rgb * w;
     }
     return c;
+}
+
+// Nearest visibility moments for `probe` in direction `dir` (toward the surface). The moments are the depth-
+// weighted mean + mean² of the probe's rays near that direction (filled in the relight pass).
+float2 SampleProbeVis(uint probe, float3 dir) {
+    int2 t = clamp((int2)floor(OctEncode(dir) * float(VisRes)), 0, VisRes - 1);
+    return VisMoments[probe * VisTexels + t.y * VisRes + t.x];
+}
+
+// Chebyshev (variance-shadow) visibility weight: how likely is the surface point visible from the probe? If the
+// surface is FARTHER than the probe's mean occluder distance in that direction, it is probably occluded → low
+// weight → the probe's radiance does not leak through the wall. dist = surface-to-probe distance along `dir`.
+float ChebyshevWeight(uint probe, float3 dirProbeToSurface, float dist, float bias) {
+    float2 mom = SampleProbeVis(probe, dirProbeToSurface);
+    float mean = mom.x;
+    // Bias the test distance DOWN by a fraction of the probe spacing: a surface within `bias` of the probe's
+    // mean occluder depth is still treated as visible. This kills the self-occlusion shimmer where a probe sits
+    // just above a floor (its downward rays hit at ~0, so an unbiased test would reject the very floor it lights).
+    if (dist - bias <= mean) return 1.0;
+    float variance = max(mom.y - mean * mean, 1e-4);
+    float d = (dist - bias) - mean;
+    float p = variance / (variance + d * d);            // Chebyshev upper bound on P(visible)
+    return max(p * p * p, 0.0);                          // cubed → sharper cutoff (standard DDGI)
 }
 
 uint ProbeIndex(uint3 c) { return c.z * (CountX * CountY) + c.y * CountX + c.x; }
@@ -81,14 +107,23 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
                            off.z == 0 ? 1.0 - frac.z : frac.z);
         float trilinear = tw.x * tw.y * tw.z;
 
-        // Backface weight: a probe behind the surface (its direction to P opposes N) contributes less. Smooth
-        // wrap so probes roughly in front dominate; D3 replaces the hard leak cases with Chebyshev visibility.
+        // Backface weight: a probe behind the surface (its direction to P opposes N) contributes less.
         float3 probePos = GridOrigin + (float3)c * ProbeSpacing;
         float3 dirToProbe = normalize(probePos - P);
         float backWeight = saturate(dot(dirToProbe, N) * 0.5 + 0.5);
-        backWeight = backWeight * backWeight + 0.05;   // soft, never fully zero (avoids holes pre-Chebyshev)
+        backWeight = backWeight * backWeight + 0.05;
 
-        float w = trilinear * backWeight;
+        // Chebyshev visibility (D3): reject probes that can't actually see the surface (occluded by a wall) →
+        // the leak fix. The moments were measured probe→world, so query in the probe→surface direction.
+        float vis = 1.0;
+        if (UseVisibility > 0.5) {
+            uint pidx = ProbeIndex(c);
+            float distPS = distance(probePos, P);
+            float bias = 0.5 * length(ProbeSpacing);   // half a cell: tolerates probes sitting near surfaces
+            vis = ChebyshevWeight(pidx, normalize(P - probePos), distPS, bias);
+        }
+
+        float w = trilinear * backWeight * vis;
         sum += SampleProbeOct(ProbeIndex(c), N) * w;
         wsum += w;
     }

@@ -17,6 +17,8 @@
 RaytracingAccelerationStructure Scene : register(t0);
 RWStructuredBuffer<float4> Irradiance  : register(u0);   // [probe*OctTexels + texel]  rgb=E, a=1
 StructuredBuffer<float4>   PrevIrrad   : register(t1);   // previous frame (EMA source)
+RWStructuredBuffer<float2> VisMomentsOut : register(u1); // [probe*VisTexels + texel]  x=mean dist, y=mean dist² (D3 Chebyshev)
+StructuredBuffer<float2>   PrevVis     : register(t6);   // previous frame visibility (EMA source)
 
 struct RtInstance { uint NormalIdx, UvIdx, IndexIdx, TriMatIdx; uint PositionIdx, TriCount, Pad0, Pad1; };
 struct GpuMaterial {
@@ -45,10 +47,14 @@ SamplerState LinearClamp : register(s0);
 
 static const int OctRes = 6;
 static const int OctTexels = OctRes * OctRes;   // 36
+static const int VisRes = 16;
+static const int VisTexels = VisRes * VisRes;   // 256
+static const float VisMaxDist = 1e4;            // miss/cap distance for the visibility moments
 static const float PI = 3.14159265359;
 
 groupshared float3 gRad[RAYS];
 groupshared float3 gDir[RAYS];
+groupshared float  gDist[RAYS];   // D3: per-ray hit distance (miss → a large cap) for the visibility moments
 
 float3 Sanitize(float3 v) {
     return float3(isnan(v.x) || isinf(v.x) ? 0.0 : v.x,
@@ -150,17 +156,21 @@ void CSMain(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
     float3 rad;
     RayDesc rd; rd.Origin = P; rd.Direction = d; rd.TMin = 0.0; rd.TMax = 1e4;
     RayQuery<RAY_FLAG_FORCE_OPAQUE> q; q.TraceRayInline(Scene, 0, 0xFF, rd); q.Proceed();
+    float dist;
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
-        float3 hitW = P + d * q.CommittedRayT();
+        dist = q.CommittedRayT();
+        float3 hitW = P + d * dist;
         rad = ShadeHit(q.CommittedInstanceID(), q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), hitW);
     } else {
+        dist = VisMaxDist;
         rad = (UseSky > 0.5) ? SkyIrradiance.SampleLevel(LinearClamp, d, 0).rgb * SkyIntensity : 0.0.xxx;
     }
-    gRad[gi] = rad; gDir[gi] = d;
+    gRad[gi] = rad; gDir[gi] = d; gDist[gi] = dist;
     GroupMemoryBarrierWithGroupSync();
 
-    // The first OctTexels threads each integrate one octahedral texel over all rays.
     float alpha = (HistoryValid > 0.5) ? saturate(EmaAlpha) : 1.0;
+
+    // (a) IRRADIANCE: the first OctTexels threads each integrate one octahedral texel cosine-weighted.
     if (gi < (uint)OctTexels) {
         uint texel = gi;
         float2 uv = (float2(texel % OctRes, texel / OctRes) + 0.5) / float(OctRes);
@@ -175,5 +185,24 @@ void CSMain(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
         uint idx = probe * OctTexels + texel;
         float3 prev = PrevIrrad[idx].rgb;
         Irradiance[idx] = float4(Sanitize(lerp(prev, E, alpha)), 1.0);
+    }
+
+    // (b) VISIBILITY MOMENTS (D3): VisTexels (256) > RAYS (64), so each thread strides over several texels.
+    // Each texel stores the depth-weighted mean distance + mean distance² of rays near its direction (a sharp
+    // cosine power focuses the moments) → the sample pass runs the Chebyshev test against them to reject probes
+    // occluded from the surface (the leak fix).
+    [loop] for (uint vt = gi; vt < (uint)VisTexels; vt += RAYS) {
+        float2 vuv = (float2(vt % VisRes, vt / VisRes) + 0.5) / float(VisRes);
+        float3 vdir = OctDecode(vuv);
+        float m1 = 0.0, m2 = 0.0, wsum = 0.0;
+        [unroll] for (uint r = 0; r < RAYS; r++) {
+            float w = pow(max(dot(vdir, gDir[r]), 0.0), 50.0);   // sharp lobe → directional depth
+            float dd = min(gDist[r], VisMaxDist);
+            m1 += dd * w; m2 += dd * dd * w; wsum += w;
+        }
+        float2 mom = (wsum > 1e-6) ? float2(m1 / wsum, m2 / wsum) : float2(VisMaxDist, VisMaxDist * VisMaxDist);
+        uint vidx = probe * VisTexels + vt;
+        float2 prev = PrevVis[vidx];
+        VisMomentsOut[vidx] = lerp(prev, mom, alpha);
     }
 }
