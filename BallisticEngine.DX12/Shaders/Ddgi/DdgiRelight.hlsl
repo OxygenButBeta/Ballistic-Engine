@@ -42,6 +42,7 @@ cbuffer DdgiRelightConstants : register(b0) {
     float3 SunDir;       float SunBias;       // TO the sun (normalized)
     float3 SunColor;     float LightCount;
     float  EmaAlpha;     float HistoryValid;  float Intensity;  float FrameJitter;  // FrameJitter<0 → fixed (deterministic)
+    float  MultiBounce;  float BounceBoost;   float Pad0;       float Pad1;          // D4: 2nd-bounce from prev-frame irradiance
 };
 SamplerState LinearClamp : register(s0);
 
@@ -67,6 +68,33 @@ float3 OctDecode(float2 f) {
     float t = saturate(-n.z);
     n.xy += float2(n.x >= 0.0 ? -t : t, n.y >= 0.0 ? -t : t);
     return normalize(n);
+}
+float2 OctEncode(float3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    float2 e = n.xy;
+    if (n.z < 0.0) e = (1.0 - abs(e.yx)) * float2(e.x >= 0.0 ? 1.0 : -1.0, e.y >= 0.0 ? 1.0 : -1.0);
+    return e * 0.5 + 0.5;
+}
+
+// D4 multi-bounce: gather the PREVIOUS frame's probe irradiance at a world hit point in direction N (the 8
+// bracketing probes, trilinear). This is the cheap second bounce — no extra rays, the cache feeds itself.
+float3 GatherPrevIrradiance(float3 P, float3 N) {
+    float3 g = (P - GridOrigin) / max(ProbeSpacing, 1e-4);
+    int3 baseC = clamp((int3)floor(g), int3(0,0,0), int3((int)CountX-2, (int)CountY-2, (int)CountZ-2));
+    float3 frac = saturate(g - (float3)baseC);
+    float2 oct = OctEncode(N);
+    int2 ot = clamp((int2)floor(oct * float(OctRes)), 0, OctRes - 1);   // nearest oct texel (cheap)
+    float3 sum = 0.0.xxx; float wsum = 0.0;
+    [unroll] for (int i = 0; i < 8; i++) {
+        int3 off = int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        uint3 c = (uint3)clamp(baseC + off, int3(0,0,0), int3((int)CountX-1, (int)CountY-1, (int)CountZ-1));
+        float3 tw = float3(off.x==0?1.0-frac.x:frac.x, off.y==0?1.0-frac.y:frac.y, off.z==0?1.0-frac.z:frac.z);
+        float w = tw.x * tw.y * tw.z;
+        uint probe = c.z * (CountX*CountY) + c.y * CountX + c.x;
+        sum += PrevIrrad[probe * OctTexels + ot.y * OctRes + ot.x].rgb * w;
+        wsum += w;
+    }
+    return (wsum > 1e-4) ? sum / wsum : 0.0.xxx;
 }
 float3 SphereDir(uint i, uint n, float jitter) {
     float gold = 2.39996322973;
@@ -134,7 +162,16 @@ float3 ShadeHit(uint instId, uint prim, float2 bary, float3 Pw) {
         }
         punctual += rad * nd * Visibility(Pw, Nw, Ld, dist);
     }
-    return albedo * (sun + punctual) + emissive;
+
+    // D4 MULTI-BOUNCE: add the previous frame's indirect light arriving at this hit (gathered from the probe
+    // grid) × albedo. The cache feeds itself → it converges to full multi-bounce GI over a few frames with NO
+    // extra rays. HistoryValid gates it (the first frame has no usable prev cache). BounceBoost (≥1) lets dark
+    // multi-bounce-only regions fill faster; the firefly clamp downstream keeps it from running away.
+    float3 bounce = 0.0.xxx;
+    if (MultiBounce > 0.5 && HistoryValid > 0.5)
+        bounce = albedo * GatherPrevIrradiance(Pw, Nw) * max(BounceBoost, 1.0);
+
+    return albedo * (sun + punctual) + emissive + bounce;
 }
 
 [numthreads(RAYS, 1, 1)]

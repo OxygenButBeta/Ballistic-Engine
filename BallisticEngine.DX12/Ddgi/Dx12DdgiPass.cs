@@ -58,6 +58,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         public Vector3 SunDir;       public float SunBias;
         public Vector3 SunColor;     public float LightCount;
         public float EmaAlpha;       public float HistoryValid; public float Intensity; public float FrameJitter;
+        public float MultiBounce;    public float BounceBoost;  public float Pad0;      public float Pad1;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -120,6 +121,8 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     }
 
     int frameCounter;
+    Vector3 prevSunDir = new(float.NaN, 0, 0);   // NaN → first frame counts as a light change
+    Vector3 prevSunColor;
 
     public void Resize(int width, int height)
     {
@@ -167,6 +170,14 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         // history must not change frame-to-frame → full replace (HistoryValid 0).
         bool det = ctx.DeterministicCapture;
 
+        // HYSTERESIS EMA (D4): when the sun direction/color changes a lot, blend the new radiance in fast (the
+        // old cache is stale); when the scene is settled, blend slowly (low noise). A static light → the cache
+        // converges then sits at the low alpha. Off under a deterministic capture (fixed sun, byte-stable).
+        bool lightChanged = !det && (Vector3.DistanceSquared(prevSunDir, sunDir) > 1e-6f
+                                     || Vector3.DistanceSquared(prevSunColor, ctx.LightColor) > 1e-4f);
+        prevSunDir = sunDir; prevSunColor = ctx.LightColor;
+        if (lightChanged) ema = MathF.Max(ema, 0.5f);   // snap toward the new lighting
+
         relightCb.Write(new RelightConstants
         {
             GridOrigin = grid.GridOrigin, RayCount = RelightRays,
@@ -177,6 +188,9 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             SunColor = ctx.LightColor, LightCount = ctx.ClusteredLights.LightCount,
             EmaAlpha = ema, HistoryValid = (grid.HistoryValid && !det) ? 1f : 0f,
             Intensity = intensity, FrameJitter = det ? -1f : (frameCounter % 64),
+            MultiBounce = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_NOBOUNCE") == "1" ? 0f
+                          : (ctx.PostFX.LumenMultiBounce ? 1f : 0f),
+            BounceBoost = EnvF("BALLISTIC_DX12_DDGI_BOUNCE_BOOST", 1f),
         });
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
