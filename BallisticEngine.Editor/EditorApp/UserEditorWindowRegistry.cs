@@ -81,7 +81,15 @@ internal static class UserEditorWindowRegistry {
     // Hot-reload contract (P0.3): drop the cached instances so the next access re-discovers over the rebuilt
     // TypeCache. Self-registered via the [ModuleInitializer] — joins TypeCache / the other reflection caches
     // in ReloadCaches, so a game-script reload re-scans without the reload site naming this registry.
-    static void ClearForReload() => cached = null;
+    // DISPOSE first: a window that holds GPU resources (e.g. the UI Builder's canvas RT + a UiHeap slot)
+    // would otherwise leak one set per hot-reload — exhausting the fixed UiHeap over a session. The new
+    // instances are recreated lazily on the next Items access.
+    static void ClearForReload() {
+        if (cached != null)
+            foreach (Entry e in cached)
+                if (e.Window is IDisposable d) { try { d.Dispose(); } catch { } }
+        cached = null;
+    }
 
     [System.Runtime.CompilerServices.ModuleInitializer]
     internal static void RegisterReloadInvalidation() => ReloadCaches.Register(ClearForReload);

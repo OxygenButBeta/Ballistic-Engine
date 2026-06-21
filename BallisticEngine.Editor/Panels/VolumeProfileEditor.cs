@@ -19,12 +19,32 @@ namespace BallisticEngine.Editor;
 internal static class VolumeProfileEditor {
     static IEditorGui gui => EditorGui.Shared;
 
+    // Per-override body height carried frame-to-frame so the alternating band can paint without a nested
+    // ChannelsSplit (the inspector body we draw inside is already split, and ImGui forbids nesting).
+    static readonly Dictionary<string, float> bandHeights = new();
+
     public static bool Draw(VolumeProfile profile) {
         var changed = false;
         VolumeComponent remove = null;
 
+        var componentOrdinal = 0;   // running count of overrides, for alternating body-bg banding
         foreach (VolumeComponent component in profile.Components) {
             gui.PushId(component.GetType().Name);
+
+            // Alternating per-override band (1-a, 2-b, 3-a ...). The editor draws this profile INLINE inside
+            // an inspector component body that is ALREADY mid-channel-split, and ImGui forbids nested
+            // ChannelsSplit. So instead of splitting to paint behind, we draw the band first against a
+            // measured height from the PREVIOUS frame (cached per component) — no split, nest-safe. The
+            // first frame a new override has no cached height yet, so it simply skips its band that one frame.
+            var draw = gui.WindowDrawList;
+            SysVec2 bandStart = gui.CursorScreenPos;
+            string bandKey = component.GetType().FullName ?? component.GetType().Name;
+            if ((componentOrdinal & 1) == 1 && bandHeights.TryGetValue(bandKey, out float prevH) && prevH > 0) {
+                float wx0 = gui.WindowPos.X;
+                float wx1 = wx0 + gui.WindowSize.X;
+                draw.AddRectFilled(new SysVec2(wx0, bandStart.Y - 2), new SysVec2(wx1, bandStart.Y + prevH + 4),
+                                   gui.ColorU32(new SysVec4(0f, 0f, 0f, 0.06f)), 6f);
+            }
 
             bool active = component.Active;
             bool open = OverrideHeader(Prettify(component.GetType().Name), ref active, out bool removeRequested);
@@ -55,6 +75,10 @@ internal static class VolumeProfileEditor {
                 changed |= DrawParameters(component);
             }
 
+            // Cache this override's body height so next frame can paint its band without a nested split.
+            bandHeights[bandKey] = gui.CursorScreenPos.Y - bandStart.Y;
+
+            componentOrdinal++;
             gui.PopId();
         }
 

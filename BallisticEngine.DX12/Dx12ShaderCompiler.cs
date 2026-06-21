@@ -21,6 +21,10 @@ public static class Dx12ShaderCompiler {
     // Set once at bootstrap to <project>\Library\ShaderCache. Null disables the on-disk cache.
     public static string CacheDirectory { get; set; }
 
+    // TEMP BOOT-PROFILE (remove after diagnosing startup freeze): cumulative DXC vs cache-hit accounting.
+    public static int CacheHits, DxcCompiles;
+    public static double DxcMs, CacheReadMs;
+
     // BALLISTIC_DX12_SHADER_CACHE=0 bypasses the on-disk DXIL cache entirely (always recompile) — the escape hatch
     // for a suspect/corrupt cache, byte-identical to the old always-compile behaviour. Default ON. Read once.
     static readonly bool DiskCacheEnabled =
@@ -33,11 +37,16 @@ public static class Dx12ShaderCompiler {
         string cachePath = CachePathFor(stage, source, entryPoint, fileName);
         if (cachePath is not null) {
             try {
-                if (File.Exists(cachePath))
-                    return File.ReadAllBytes(cachePath);
+                if (File.Exists(cachePath)) {
+                    var swc = System.Diagnostics.Stopwatch.StartNew();
+                    byte[] cached = File.ReadAllBytes(cachePath);
+                    CacheReadMs += swc.Elapsed.TotalMilliseconds; CacheHits++;
+                    return cached;
+                }
             }
             catch { /* unreadable cache entry — fall through to recompile */ }
         }
+        var swd = System.Diagnostics.Stopwatch.StartNew();
 
         var options = new DxcCompilerOptions {
             ShaderModel = DxcShaderModel.Model6_6, // SM6.6: bindless ResourceDescriptorHeap in Phase 4
@@ -47,6 +56,7 @@ public static class Dx12ShaderCompiler {
             throw new InvalidOperationException(
                 $"HLSL compile failed ({stage} {entryPoint} in {fileName}):\n{result.GetErrors()}");
         byte[] dxil = result.GetObjectBytecodeArray();
+        DxcMs += swd.Elapsed.TotalMilliseconds; DxcCompiles++;
 
         if (cachePath is not null) {
             try {

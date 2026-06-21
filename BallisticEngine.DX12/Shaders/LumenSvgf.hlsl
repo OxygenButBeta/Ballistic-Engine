@@ -199,7 +199,14 @@ void CSSvgfAtrous(uint3 dtid : SV_DispatchThreadID) {
     nC = normalize(nC);
     float zC = CamDist(WorldFromUvDepth(uv, depthC));
     float lumC = Lum(colC);
-    float sigLum = SigmaL * sqrt(max(GaussVar(px), 0.0)) + 1e-4;   // luminance edge-stop denominator (variance-guided)
+    // Luminance edge-stop denominator (variance-guided). The +1e-4 absolute floor was ~10x too small for HDR
+    // irradiance: in a converged dark region GaussVar≈0 → sigLum≈1e-4 → wl=exp(-|dL|/1e-4) is a NEAR-BINARY edge
+    // stop, so a single firefly pixel (|dL|>1e-3) is NEVER blurred into its dark neighbours and survives every
+    // à-trous iteration as an isolated dot. A RELATIVE floor (fraction of the local luminance) keeps the edge-stop
+    // meaningful at the scene's actual radiance scale so hot pixels can be pulled down. Pad2 carries the fraction
+    // (set by C#; 0 → legacy 1e-4 absolute floor, byte-identical).
+    float lumFloor = (Pad2 > 0.0) ? max(Pad2 * lumC, 1e-4) : 1e-4;
+    float sigLum = SigmaL * sqrt(max(GaussVar(px), 0.0)) + lumFloor;
 
     int step = (int)StepSize;
     float3 sumC = 0; float sumW = 0, sumVar = 0;

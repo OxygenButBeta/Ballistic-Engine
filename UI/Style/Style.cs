@@ -93,31 +93,57 @@ public sealed class Style
     public float MaxHeight { get => _maxHeight; set { _maxHeight = value; L.SetMaxHeightPoints(value); } }
 
     // ---------------------------------------------------------------- layout: inset / margin / padding
+    //
+    // Yoga has no readback for edge values, so Style mirrors every edge it writes into per-edge caches
+    // (NaN = unset, the CSS default). This lets the editor inspector + the serializer READ what was set
+    // (the visual UI Builder needs per-edge readback for insets/margin/padding/border). The cache is the
+    // single source of truth for "what was authored"; Yoga remains the layout authority.
+    readonly float[] _inset = { float.NaN, float.NaN, float.NaN, float.NaN };   // L,T,R,B (points)
+    readonly float[] _margin = { float.NaN, float.NaN, float.NaN, float.NaN };
+    readonly float[] _padding = { float.NaN, float.NaN, float.NaN, float.NaN };
+    readonly float[] _border = { 0f, 0f, 0f, 0f };
+
+    static int EdgeIndex(Edge e) => e switch { Edge.Left => 0, Edge.Top => 1, Edge.Right => 2, Edge.Bottom => 3, _ => -1 };
 
     // Position offsets when Position is Absolute/Relative — CSS top/right/bottom/left.
-    public void SetInset(Edge edge, Length len) => ApplyLengthEdge(edge, len, L.SetPositionPoints, L.SetPositionPercent);
-    public float Left { set => L.SetPositionPoints(Edge.Left, value); }
-    public float Top { set => L.SetPositionPoints(Edge.Top, value); }
-    public float Right { set => L.SetPositionPoints(Edge.Right, value); }
-    public float Bottom { set => L.SetPositionPoints(Edge.Bottom, value); }
+    public void SetInset(Edge edge, Length len)
+    {
+        ApplyLengthEdge(edge, len, L.SetPositionPoints, L.SetPositionPercent);
+        Cache(_inset, edge, len.Unit == Length.Kind.Auto ? float.NaN : len.Value);
+    }
+    public float GetInset(Edge edge) { int i = EdgeIndex(edge); return i < 0 ? float.NaN : _inset[i]; }
+    public float Left   { get => _inset[0]; set { L.SetPositionPoints(Edge.Left, value);   _inset[0] = value; } }
+    public float Top    { get => _inset[1]; set { L.SetPositionPoints(Edge.Top, value);    _inset[1] = value; } }
+    public float Right  { get => _inset[2]; set { L.SetPositionPoints(Edge.Right, value);  _inset[2] = value; } }
+    public float Bottom { get => _inset[3]; set { L.SetPositionPoints(Edge.Bottom, value); _inset[3] = value; } }
 
-    public void SetMargin(Edge edge, float points) => L.SetMarginPoints(edge, points);
-    public void SetPadding(Edge edge, float points) => L.SetPaddingPoints(edge, points);
+    public void SetMargin(Edge edge, float points) { L.SetMarginPoints(edge, points); Cache(_margin, edge, points); }
+    public void SetPadding(Edge edge, float points) { L.SetPaddingPoints(edge, points); Cache(_padding, edge, points); }
+    public float GetMargin(Edge edge) { int i = EdgeIndex(edge); return i < 0 ? float.NaN : _margin[i]; }
+    public float GetPadding(Edge edge) { int i = EdgeIndex(edge); return i < 0 ? float.NaN : _padding[i]; }
+    public float GetBorderWidth(Edge edge) { int i = EdgeIndex(edge); return i < 0 ? 0f : _border[i]; }
+
+    static void Cache(float[] arr, Edge edge, float v)
+    {
+        if (edge == Edge.All) { arr[0] = arr[1] = arr[2] = arr[3] = v; return; }
+        int i = EdgeIndex(edge);
+        if (i >= 0) arr[i] = v;
+    }
 
     // Border width feeds BOTH the layout (Yoga insets content by the border) AND the renderer (it
-    // draws a stroke of this width). Yoga has no readback for it, so we also keep a visual copy.
-    // v1 draws a uniform border, so the visual width tracks the last non-zero edge written (Edge.All
-    // is the common path via the StyleApplier).
+    // draws a stroke of this width). v1 draws a uniform border, so the visual width tracks the last
+    // non-zero edge written (Edge.All is the common path via the StyleApplier).
     public float BorderWidthVisual { get; private set; }
     public void SetBorderWidth(Edge edge, float points)
     {
         L.SetBorderPoints(edge, points);
+        Cache(_border, edge, points);
         BorderWidthVisual = points;
     }
 
     // Shorthand: same value on all four edges (CSS `margin: 8px` / `padding: 12px`).
-    public float Margin { set => L.SetMarginPoints(Edge.All, value); }
-    public float Padding { set => L.SetPaddingPoints(Edge.All, value); }
+    public float Margin { set => SetMargin(Edge.All, value); }
+    public float Padding { set => SetPadding(Edge.All, value); }
 
     // CSS gap / row-gap / column-gap — spacing between flex items (P4.5).
     float _gap, _rowGap, _columnGap;
@@ -226,10 +252,12 @@ public sealed class Style
         MinWidth = 0f; MinHeight = 0f; MaxWidth = float.NaN; MaxHeight = float.NaN;
         Gap = 0f; RowGap = 0f; ColumnGap = 0f;
         AspectRatio = float.NaN;
-        // layout: edges (reset all four on each)
-        L.SetMarginPoints(Edge.All, 0f);
-        L.SetPaddingPoints(Edge.All, 0f);
+        // layout: edges (reset all four on each — through SetX so the per-edge caches reset too; insets
+        // reset to NaN = unset, the CSS default, so a from-scratch resolve doesn't inherit a stale inset)
+        SetMargin(Edge.All, 0f);
+        SetPadding(Edge.All, 0f);
         SetBorderWidth(Edge.All, 0f);
+        _inset[0] = _inset[1] = _inset[2] = _inset[3] = float.NaN;
         L.SetPositionPoints(Edge.Left, 0f); L.SetPositionPoints(Edge.Top, 0f);
         L.SetPositionPoints(Edge.Right, 0f); L.SetPositionPoints(Edge.Bottom, 0f);
         // visual

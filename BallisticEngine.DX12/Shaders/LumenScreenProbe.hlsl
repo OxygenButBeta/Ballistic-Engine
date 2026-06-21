@@ -43,6 +43,7 @@ cbuffer ProbeConstants : register(b0) {
     uint  ProbesX;      uint ProbesY;     uint FullW;           uint FullH;
     float HistoryValid; float ProbeEma;   float TexelDim;       float SpPad1;        // Sıra 3 EMA; Sıra 5 mesh-card grid edge (1=legacy)
     float AdaptiveRays; float AdaptiveStride; float AdaptiveVar; float SpPad2;        // variance-guided adaptive ray (0=off, byte-identical)
+    float WorldDepthTol; float SpPad3; float SpPad4; float SpPad5;        // CSIntegrate world-distance depth bilateral tol (m); 0 = legacy non-linear
 };
 cbuffer ProbeSun : register(b1) {
     float3 SunDir;   float SunBias;
@@ -561,7 +562,16 @@ void CSIntegrate(uint3 dtid : SV_DispatchThreadID) {
     // Fallback bookkeeping: track the single highest-validity probe so a fully-rejected neighbourhood still
     // resolves to the best nearby probe (no black hole — the measured failure).
     float3 bestRad = 0.0.xxx; float bestW = -1.0; bool anyValid = false;
+    // FIREFLY-FIX fallback: also accumulate an UNWEIGHTED mean of every valid probe. When the bilateral weights
+    // all collapse (wsum tiny) the old code fell to `bestRad` = ONE unfiltered probe → an isolated bright speck on
+    // a black field (the reported fireflies). Averaging all valid probes instead spreads that into a smooth value.
+    float3 accAll = 0.0.xxx; uint countAll = 0u;
     int2 ibase = int2(base);
+    // WorldDepthTol (set by C#): when >0, the depth bilateral uses WORLD-SPACE distance (probe world pos vs pixel
+    // world pos) instead of the non-linear [0,1] hardware depth. The old `1/(1+|dz|*1500)` on NON-LINEAR depth
+    // underflowed to ~0 for ALL four probes on any normal surface (two pixels a few cm apart differ by ~1e-3 in
+    // NDC), so wsum fell below 1e-3 and the pixel collapsed to the single `bestRad` speck → fireflies + black.
+    // World distance is metric and uniform → the bilateral actually averages the 4 probes. 0 → legacy non-linear.
     // 4x4 neighbourhood — the blob is now removed at its SOURCE by the probe-space CSProbeFilter pass, so the
     // integrate only needs a modest bilinear-ish gather (cheaper than the 6x6 it briefly used → FPS back). The
     // depth/normal bilateral still keeps edges sharp.
@@ -575,7 +585,10 @@ void CSIntegrate(uint3 dtid : SV_DispatchThreadID) {
         anyValid = true;
         float2 d2 = (float2(pc) - probeF);
         float wSpatial = exp(-dot(d2, d2) * 0.5);
-        float wDepth = 1.0 / (1.0 + abs(h.NormalDepth.w - depth) * 1500.0);
+        // Depth bilateral — world-distance (metric, stable) when WorldDepthTol>0, else the legacy non-linear form.
+        float wDepth = (WorldDepthTol > 0.0)
+            ? 1.0 / (1.0 + distance(h.PosValid.xyz, worldPos) / max(WorldDepthTol, 1e-3))
+            : 1.0 / (1.0 + abs(h.NormalDepth.w - depth) * 1500.0);
         float wNormal = pow(saturate(dot(h.NormalDepth.xyz, Npix) * 0.5 + 0.5), 2.0);
         float w = wSpatial * wDepth * wNormal + 1e-5;
         // SH evaluate (integrate-cost fix): the per-probe directional radiance is precomputed as cosine-convolved
@@ -586,12 +599,13 @@ void CSIntegrate(uint3 dtid : SV_DispatchThreadID) {
         if (UseSH > 0.5) { float3 prc[9]; LoadProbeSH(pidx, prc); rad = EvalProbeSH(prc, Npix); }
         else             { rad = SampleProbeTile((uint2)pc, Npix); }
         acc += rad * w; wsum += w;
+        accAll += rad; countAll++;
         float fw = wSpatial * wDepth * (saturate(dot(h.NormalDepth.xyz, Npix)) + 0.1);
         if (fw > bestW) { bestW = fw; bestRad = rad; }
     }
     float3 E;
     if (wsum > 1e-3) E = acc / wsum;
-    else if (anyValid) E = bestRad;          // all weights collapsed → take the best single probe (no black hole)
+    else if (countAll > 0u) E = accAll / float(countAll);   // weights collapsed → MEAN of valid probes (not one speck)
     else E = 0.0.xxx;                        // genuinely no valid probe nearby (rare: tile fully sky/invalid)
     Indirect[px] = float4(Sanitize(E * Intensity), depth);   // depth in .a for the downstream probe-temporal + history copy
 }

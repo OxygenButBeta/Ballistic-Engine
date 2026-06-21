@@ -979,10 +979,11 @@ internal sealed class InspectorPanel : EditorWindow, IComponentInspectorHost {
         float bandEndY = gui.CursorScreenPos.Y;
         float wx0 = gui.WindowPos.X;
         float wx1 = wx0 + gui.WindowSize.X;
-        // Every component body gets the SAME card wash so each reads as a distinct raised surface; the
-        // gap between components (Dummy in the draw loop) separates them. Visible enough to actually read
-        // as a card on the dark panel (the previous ~2% was invisible), but still subtle.
-        SysVec4 band = new SysVec4(1f, 1f, 1f, 0.05f);
+        // Alternate the body wash by ordinal (1-a, 2-b, 3-a ...) so adjacent components separate as two
+        // close tones, not one flat wash: even ordinals get the lighter card, odd ones a touch darker.
+        SysVec4 band = (componentOrdinal & 1) == 0
+            ? new SysVec4(1f, 1f, 1f, 0.05f)
+            : new SysVec4(0f, 0f, 0f, 0.06f);
         draw.ChannelsSetCurrent(0);
         draw.AddRectFilled(new SysVec2(wx0, bandStart.Y - 2), new SysVec2(wx1, bandEndY + 4),
                            gui.ColorU32(band), 6f);

@@ -210,7 +210,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public float SkyVisRays; public float EmaAlpha; public float BounceRays; public float HistoryValid;
         public uint FrameIndex; public uint UpdateStride; public uint ForceFull; public uint TexelDim;   // P7 #1; Sıra 5 mesh-card grid edge
         public Vector3 CameraPos; public float PriorityScale;   // P7 #1b priority budget
-        public float PriorityNearDist; public float UsePriority; public float BounceBoost; public float Pad7b;
+        public float PriorityNearDist; public float UsePriority; public float BounceBoost; public float GiRangeScale;
+        public float PunctualSoftRadius; public float Pad7c; public float Pad7d; public float Pad7e;
     }
 
     // ---- Sıra 1: SCREEN-SPACE RADIANCE PROBES (LumenScreenProbe.hlsl) ----
@@ -254,6 +255,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public uint ProbesX; public uint ProbesY; public uint FullW; public uint FullH;
         public float HistoryValid; public float ProbeEma; public float TexelDim; public float SpPad1;
         public float AdaptiveRays; public float AdaptiveStride; public float AdaptiveVar; public float SpPad2;
+        public float WorldDepthTol; public float SpPad3; public float SpPad4; public float SpPad5;
     }
 
     static int spEnvDoor = -2;   // -2 unread, -1 unset(default), 0 force-off, 1 force-on
@@ -338,9 +340,20 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // Dials: the GlobalIllumination VOLUME (ctx.PostFX) drives them; the BALLISTIC_DX12_LUMEN_* env doors
         // override for A/B (EnvF returns the env value when set, else the volume-supplied fallback).
         var fx = ctx.PostFX;
+        // GI ENERGY/SMOOTHNESS FIX (2026-06-21): the diagnosed structural defects — punctual GI range used the
+        // gameplay cull radius as a hard energy wall (a 10m lamp couldn't bounce-fill past 10m), the per-pixel
+        // wDepth bilateral collapsed on NON-LINEAR depth (→ fireflies + black), the bestRad fallback was a single
+        // unfiltered probe speck, and the SVGF sigLum floor was so tight it preserved fireflies every iteration.
+        // All four are gated by this ONE door so A/B (and the byte-identical golden) is a single switch.
+        // BALLISTIC_DX12_LUMEN_FIX=0 → fully legacy (GiRangeScale 1, non-linear wDepth, abs sigLum floor); default ON.
+        // The four sub-fixes are read locally in the methods that need them (LightCards / RecordTracePhase /
+        // TraceScreenProbe), each gated by BALLISTIC_DX12_LUMEN_FIX. maxDist below is the one giFix value Record itself uses.
+        bool giFix = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_FIX") != "0";
         float intensity = EnvF("BALLISTIC_DX12_LUMEN_INTENSITY", fx.LumenIntensity);
         float rayCount = MathF.Round(EnvF("BALLISTIC_DX12_LUMEN_RAYS", fx.LumenRayCount));
-        float maxDist = EnvF("BALLISTIC_DX12_LUMEN_DIST", 40f);
+        // GI ray length. 40m cliff returned 0 (black) for any surface whose nearest lit geometry was farther — the
+        // far-field never filled. giFix extends to 120m so cross-room transport reaches; legacy 40.
+        float maxDist = EnvF("BALLISTIC_DX12_LUMEN_DIST", giFix ? 120f : 40f);
         float skyIntensity = EnvF("BALLISTIC_DX12_LUMEN_SKY", fx.LumenSkyIntensity);
         bool useSky = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOSKY") != "1";
         bool useCards = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOCARDS") != "1";
@@ -534,6 +547,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     {
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Dx12DescriptorHeap bindless = Dx12Backend.BindlessHeap;
+        bool giFix = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_FIX") != "0";
+        float sigLumFloorFrac = giFix ? EnvF("BALLISTIC_DX12_LUMEN_SIGLUM_FRAC", 0.25f) : 0f;
 
         if (WantScreenProbe(ctx))
         {
@@ -592,6 +607,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             CosTauN = EnvF("BALLISTIC_DX12_LUMEN_SVGF_COSN", 0.906f),
             SigmaL = EnvF("BALLISTIC_DX12_LUMEN_SVGF_SIGL", 4f),
             SigmaN = EnvF("BALLISTIC_DX12_LUMEN_SVGF_SIGN", 64f),
+            Pad2 = sigLumFloorFrac,   // à-trous luminance edge-stop RELATIVE floor (fraction of local luma); 0 = legacy 1e-4
         };
 
         svgfSrv.Reset();
@@ -730,6 +746,10 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // round-robin card update is a gentler jump → less visible per-cluster flash. Slower to react to a real light
         // change, but ForceFull (sun/light/topology dirty) bypasses the EMA entirely so genuine changes stay instant.
         bool bounce = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOBOUNCE") != "1" && ctx.PostFX.LumenMultiBounce;
+        // GI energy-range fix (see the master door in RecordGi). Local re-read here since LightCards is a separate method.
+        bool giFix = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_FIX") != "0";
+        float giRangeScale = giFix ? EnvF("BALLISTIC_DX12_LUMEN_GI_RANGE", 4f) : 1f;
+        float punctualSoftR = giFix ? EnvF("BALLISTIC_DX12_LUMEN_SOFT_RADIUS", 0.1f) : 0f;
 
         // === P7 #1 UPDATE BUDGET ===
         // Re-light only a round-robin slice of records each frame instead of the whole scene. stride = how many
@@ -781,7 +801,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             TexelDim = (uint)scene.TexelDim,
             CameraPos = ctx.CamPos, PriorityScale = priorityScale,
             PriorityNearDist = EnvF("BALLISTIC_DX12_LUMEN_PRIORITY_NEAR", 12f), UsePriority = priorityOn ? 1f : 0f,
-            BounceBoost = EnvF("BALLISTIC_DX12_LUMEN_BOUNCE_BOOST", 1f),   // 2nd-bounce gain (default 1 = physical; door for A/B). The real dark-shadow fix was the combine /π bug, not bounce.
+            // BounceBoost: with the range cliff fixed, far cards now hold real (small) radiance, so a >1 gain lets
+            // multi-bounce compound across frames to fill dark mid-field — the "natural bounce fill" the user wants.
+            // Clamped downstream by the firefly logic so it can't run away. giFix default 1.6; legacy 1.0 (physical).
+            BounceBoost = EnvF("BALLISTIC_DX12_LUMEN_BOUNCE_BOOST", giFix ? 1.6f : 1f),
+            GiRangeScale = giRangeScale, PunctualSoftRadius = punctualSoftR,
         });
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
@@ -836,6 +860,8 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         var gbuffer = ctx.GBuffer;
         var ibl = ctx.Ibl;
         var target = ctx.SceneColor;
+        bool giFix = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_FIX") != "0";
+        float worldDepthTol = giFix ? EnvF("BALLISTIC_DX12_LUMEN_WORLD_DEPTH_TOL", 0.5f) : 0f;
         Matrix4x4.Invert(ctx.ViewProj, out Matrix4x4 invVP);
         Vector3 sunDirN = ctx.LightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(ctx.LightDir);
 
@@ -856,7 +882,11 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             SkyIntensity = skyIntensity, UseSky = useSky ? 1f : 0f,
             UseScreenTrace = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOSCREEN") == "1" ? 0f : 1f,
             ScreenRange = EnvF("BALLISTIC_DX12_LUMEN_SCREEN_RANGE", 1.5f),
-            FalloffDist = EnvF("BALLISTIC_DX12_LUMEN_FALLOFF", 12f),
+            // FalloffDist: the per-hit exp2(-t/FalloffDist) DOUBLE-attenuates real transport on top of the trace's
+            // own occlusion (a 24m hit was crushed to 25%). With giFix the GI is meant to carry light across the
+            // scene, so the falloff is widened to 60m (still kills runaway energy past MaxRayDist, but no longer
+            // suppresses legitimate mid-field bounce). Legacy 12.
+            FalloffDist = EnvF("BALLISTIC_DX12_LUMEN_FALLOFF", giFix ? 60f : 12f),
             UseSH = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_PROBE_NOSH") != "1" ? 1f : 0f,
             ProbeStride = probeStride, OctSize = octSize,
             ProbesX = (uint)probesX, ProbesY = (uint)probesY,
@@ -880,6 +910,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             // "düşük ışıkta patlayan" blobs. 0 disables (byte-identical legacy). Deterministic capture keeps it ON
             // (it's a deterministic per-sample clamp, not frame-phased — golden stays stable and cleaner).
             SpPad2 = EnvF("BALLISTIC_DX12_LUMEN_FIREFLY", 8f),
+            WorldDepthTol = worldDepthTol,   // CSIntegrate world-distance depth bilateral (m); 0 = legacy non-linear
         });
         spSunCb.Write(new LumenSun
         {

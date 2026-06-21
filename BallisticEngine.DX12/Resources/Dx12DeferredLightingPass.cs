@@ -189,8 +189,13 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
             // Skybox path never baked IBL at all (UseIBL=0), so the two skies behaved completely differently
             // (user: "skybox ne yapıyorsa procedural de aynısını yapmalı"). Parity fix: NEITHER sky adds diffuse
             // sky-ambient here — diffuse indirect comes from Lumen GI alone (which DOES occlude via the TLAS).
-            // Specular IBL stays (reflections; occluded separately). When Lumen is active it owned this anyway.
-            UseIBLDiffuse = 0f,
+            // Specular IBL stays (reflections; occluded separately). When Lumen is active it owns the diffuse indirect.
+            // BUG (2026-06-21): this was hardcoded 0f UNCONDITIONALLY — so when Lumen is OFF (or contributes ~nothing,
+            // e.g. a night scene the GI can't fill), there is NEITHER IBL diffuse NOR Lumen diffuse → shadowed/sky-
+            // facing surfaces go pure black with no ambient floor at all. It must be GATED on Lumen being active:
+            // Lumen on → 0 (it owns diffuse, no double-count); Lumen off → 1 (IBL diffuse fills as before the migration).
+            // Door BALLISTIC_DX12_LUMEN_FIX=0 restores the unconditional-0 legacy.
+            UseIBLDiffuse = (Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_FIX") != "0" && !ctx.LumenActiveThisFrame) ? 1f : 0f,
             // Sky-IBL specular ALSO disabled on the deferred path (parity with the diffuse above). The prefiltered
             // cube has no sky-visibility, so a closed interior ate the procedural sky's bright sun-tinted average as
             // a broad untextured veil (the orange "tent" on a roofed Bistro hall). Reflections come from Lumen RT /

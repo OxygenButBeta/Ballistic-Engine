@@ -28,8 +28,10 @@ public class VisualElement
 
     // The raw inline declaration block from a UXML style="..." attribute, kept so the UIDocument can
     // RE-APPLY it after the USS cascade — preserving CSS precedence (inline beats stylesheet). Null
-    // when the element had no inline style. Set by the UXML loader.
-    public string InlineStyle { get; internal set; }
+    // when the element had no inline style. Set by the UXML loader AND by the visual UI Builder, which
+    // treats this as the authoritative inline-override store (so a class-resolved value is never frozen
+    // into the saved inline style — the inline-shadows-class bug).
+    public string InlineStyle { get; set; }
 
     // --- tree ---
 

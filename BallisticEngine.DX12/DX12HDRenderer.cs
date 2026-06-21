@@ -618,6 +618,10 @@ public sealed class DX12HDRenderer : HDRenderer
 
     public override unsafe void Initialize()
     {
+        // TEMP BOOT-PROFILE (remove after diagnosing startup freeze):
+        var __bsw = System.Diagnostics.Stopwatch.StartNew();
+        void __T(string t) { Console.Error.WriteLine($"[InitProf] {t} +{__bsw.ElapsedMilliseconds}ms"); }
+        __T("Initialize start");
         // Clustered-deferred: geometry → G-buffer (owns scene depth) → deferred lighting → HDR `target`
         // (color only) → sky/fog/post → composite into `ldr` (R8). `target` no longer owns depth.
         // At init internal == output (FSR off); EnsureUpscaleTargets adjusts once a volume requests FSR.
@@ -629,9 +633,9 @@ public sealed class DX12HDRenderer : HDRenderer
         RegisterLdrUi();
         ldr.ColorToShaderResource(); // sample-safe before first composite (see AllocateResolutionTargets)
         gbuffer = new Dx12GBuffer(dev, targetW, targetH);
-        BuildRootSignature();
-        BuildPipeline();
-        BuildGeometryPass();
+        BuildRootSignature(); __T("BuildRootSignature");
+        BuildPipeline(); __T("BuildPipeline");
+        BuildGeometryPass(); __T("BuildGeometryPass");
 
         cbSlotSize = (System.Runtime.InteropServices.Marshal.SizeOf<DrawConstants>() + 255) & ~255;
         cbSlotCount = 8192; // submesh draws per frame ceiling (SunTemple ~hundreds)
@@ -851,6 +855,9 @@ public sealed class DX12HDRenderer : HDRenderer
                 "[DX12] Render graph (phase-2 V1): COMPILED ORDER active (default; BALLISTIC_DX12_GRAPH=0 to disable).");
             Console.Error.WriteLine(graph.LastCompileReport);
         }
+        // TEMP BOOT-PROFILE (remove after diagnosing startup freeze):
+        Console.Error.WriteLine($"[BootProf] shaders: cacheHits={Dx12ShaderCompiler.CacheHits} ({Dx12ShaderCompiler.CacheReadMs:0}ms reads), " +
+            $"dxcCompiles={Dx12ShaderCompiler.DxcCompiles} ({Dx12ShaderCompiler.DxcMs:0}ms DXC)");
 
         // PHASE 2 V3 (chunk 14): auto-derived boundary barriers. Gated behind BALLISTIC_DX12_GRAPH_BARRIERS=1
         // (requires GRAPH=1 — it runs in ExecuteGraph). When set, the graph DERIVES each migrated pass's head
