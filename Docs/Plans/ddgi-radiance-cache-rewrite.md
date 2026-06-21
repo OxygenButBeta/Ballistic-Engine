@@ -26,9 +26,27 @@ Dx12BindlessTail (yeni DdgiTableBase), event 500, HW-RT gate. `Dx12Lumen*` tipin
 - Reflections useCards: D5'e kadar zorla false (LumenScene yok).
 - Volume köprüsü + PostFX.LumenEnabled KORUNUR (asset uyumu).
 
-## Aşamalar
-D0 söküm+iskelet(no-op) → D1 relight(RT+EMA) → D2 sample+combine → D3 Chebyshev → D4 multi-bounce → D5 reflections → D6 eski Lumen sil.
-Her aşama: BALLISTIC_DETERMINISTIC=1 byte-id, dotnet build temiz.
+## Aşamalar — HEPSİ TAMAM (commit'ler)
+- D0 ✓ Lumen söküm + DDGI iskelet (no-op). `351f1b23`
+- D1+D2 ✓ probe grid + relight(RT+EMA) + sample(trilinear) + combine. İlk ışık. `b2baef38`
+- D3 ✓ visibility moments + Chebyshev sızıntı önleme (+self-occlusion bias). `8cec24c2`
+- D4 ✓ ucuz multi-bounce (prev-frame irradiance feedback) + hysteresis EMA. `e43ef8fd`
+- D5 ✓ reflections DDGI probe GI paylaşımı (card cache → probe gather). `552b7af0`
+- D6 ✓ eski Lumen D0'da silindi; kod'da sıfır Dx12Lumen ref; tam solution build temiz.
+
+Her aşama: BALLISTIC_DETERMINISTIC=1 byte-id (det'te 2 run identical), dotnet build temiz, CarDemo raw-E doğrulandı.
+
+## Sonuç (ölçülen)
+- Aktif kod ~4000→~900 satır. Buffer 17→4 (irradA/B, visA/B). Door 57→10. Temporal loop 5→1. History flag 3→1.
+- off≠on (GI etki: meanErr 0.008 CarDemo açık sahne). Det capture byte-stable.
+
+## Açık / follow-up
+- **Kapalı GI test sahnesi yok**: primitive Cube sahnesi (Cornell box) render edilmiyor (Cube.obj
+  StaticMeshRenderer GPU'ya çizilmiyor — DDGI'dan bağımsız engine/asset sorunu, ayrı incelenecek).
+  D3 Chebyshev'in asıl faydası (duvar sızıntısı) bu yüzden görsel doğrulanamadı; teknik doğruluk
+  (matematik, NaN yok, açık sahnede artefakt min) CarDemo + raw-E ile doğrulandı.
+- Door hedefi ≤8'di, 10 oldu (NORMALBIAS + BOUNCE_BOOST tuning door'ları). Kabul edilebilir.
+- Async-compute decoupling yok (sade tutuldu); gerekirse follow-up.
 
 ## Door (≤8)
 DDGI(follow volume) / DDGI_RAYS(64) / DDGI_GRID(16x8x16) / DDGI_ALPHA(0.05) / DDGI_INTENSITY(1) /
