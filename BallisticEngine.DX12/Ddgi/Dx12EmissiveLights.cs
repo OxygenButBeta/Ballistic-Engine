@@ -71,10 +71,16 @@ public sealed class Dx12EmissiveLights : IDisposable {
                 s = s * 31 + mesh.GetHashCode();
                 s = s * 31 + sm;
                 s = s * 31 + (int)(rad.X * 13.7f + rad.Y * 7.1f + rad.Z * 3.3f);
+                // The stored triangles are WORLD-space, so a MOVED/rotated emitter (same mesh+material) must
+                // restamp or the GPU list keeps the emitter at its old position (stale area shadows / contact bleed).
+                s = s * 31 + world.GetHashCode();
             }
         }
         s = s * 31 + emitters.Count;
-        if (s == stamp && buf != null) return;   // unchanged → keep the cached list
+        // Unchanged stamp → keep the cached state (whether that's a built buffer OR a known-empty result). Keying
+        // on the stamp alone (not buf!=null) stops a per-frame CPU rebuild for an emissive material that yields no
+        // valid triangles (all degenerate) — buf stays null but the stamp short-circuits the re-walk.
+        if (s == stamp) return;
         stamp = s;
 
         // Collect candidate triangles (world-space) with area, then keep the budget's largest-area ones.

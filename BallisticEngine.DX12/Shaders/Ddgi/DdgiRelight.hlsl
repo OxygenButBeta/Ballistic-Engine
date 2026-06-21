@@ -220,38 +220,43 @@ float3 ShadeHit(uint instId, uint prim, float2 bary, float3 Pw) {
     float3 emitterLight = 0.0.xxx;
     int ne = (int)min(EmissiveCount, 256.0);
     if (ne > 0) {
-        // Per-hit deterministic random pair (hit position + a salt) for the triangle sample — stable per frame so
-        // the EMA integrates it (deterministic capture keeps a fixed seed via the position, no RNG state).
+        // PERF (kajiya lighting/sample_lights): pick ONE emitter per hit (uniform among the list) + ONE shadow
+        // ray, weighted by 1/pdf = ne, instead of looping ALL emitters with a shadow ray each. The EMA integrates
+        // the random pick over frames → converges to the full sum without the 256-rays-per-hit cliff (that would
+        // be 64·ProbeCount·256 shadow rays/frame). One light + one ray per hit keeps the relight realtime.
+        // Per-hit deterministic seed (hit position) — stable per frame so the EMA integrates it; det capture pins
+        // FrameJitter<0 → fixed Pw → byte-stable. The relight's per-frame ray rotation moves Pw → new pick each frame.
         uint seed = asuint(Pw.x) ^ (asuint(Pw.y) * 2654435761u) ^ (asuint(Pw.z) * 40503u);
-        [loop] for (int li = 0; li < ne; li++) {
-            EmissiveTri et = EmissiveLights[li];
-            // Uniform point on the triangle (sqrt barycentric warp), per kajiya sample_point_on_triangle.
-            float2 u = float2(Hash(seed + (uint)li * 7919u), Hash(seed + (uint)li * 104729u + 1u));
-            float su0 = sqrt(u.x);
-            float b0 = 1.0 - su0, b1 = u.y * su0;
-            float3 lp = et.V0.xyz + b0 * et.E0.xyz + b1 * et.E1.xyz;
-            float3 ln = cross(et.E0.xyz, et.E1.xyz);
-            float lnLen = length(ln);
-            if (lnLen < 1e-8) continue;
+        int li = min((int)(Hash(seed + 5237u) * (float)ne), ne - 1);   // uniform light pick
+        EmissiveTri et = EmissiveLights[li];
+        // Uniform point on the triangle (sqrt barycentric warp), per kajiya sample_point_on_triangle.
+        float2 u = float2(Hash(seed + 7919u), Hash(seed + 104729u));
+        float su0 = sqrt(u.x);
+        float b0 = 1.0 - su0, b1 = u.y * su0;
+        float3 lp = et.V0.xyz + b0 * et.E0.xyz + b1 * et.E1.xyz;
+        float3 ln = cross(et.E0.xyz, et.E1.xyz);
+        float lnLen = length(ln);
+        if (lnLen > 1e-8) {
             float3 lnN = ln / lnLen;
             float area = 0.5 * lnLen;
             float3 toL = lp - Pw;
             float d2 = dot(toL, toL);
-            if (d2 < 1e-6) continue;
-            float d = sqrt(d2);
-            float3 Ld = toL / d;
-            float ndl = dot(Nw, Ld);            // receiver cosine
-            // Emitter cosine — TWO-SIDED (abs): an authored emissive mesh's triangle winding is arbitrary, so its
-            // geometric normal may point either way. A one-sided test culls every interior receiver when the quad
-            // happens to wind outward (e.g. a Cornell-box ceiling light) → NEE silently does nothing. abs() makes
-            // the panel emit from both faces, the correct default for an area luminaire of unknown orientation.
-            float lndl = abs(dot(-Ld, lnN));
-            if (ndl <= 0.0 || lndl <= 0.0) continue;
-            // Projected-solid-angle metric × area (pdf = 1/area), kajiya to_psa_metric.
-            float psa = (ndl * lndl / d2) * area;
-            // Shadow ray to the sampled point (slightly short of the surface to avoid self-hit).
-            float vis = Visibility(Pw, Nw, Ld, d - 2e-3);
-            emitterLight += et.Radiance.xyz * (psa * vis * NeePad0);   // NeePad0 = NEE intensity (default 1)
+            if (d2 > 1e-6) {
+                float d = sqrt(d2);
+                float3 Ld = toL / d;
+                float ndl = dot(Nw, Ld);            // receiver cosine
+                // Emitter cosine — TWO-SIDED (abs): authored emissive-mesh winding is arbitrary, so the geometric
+                // normal may point either way; a one-sided test culls every interior receiver of an outward-wound
+                // quad (e.g. a Cornell-box ceiling light) → NEE does nothing. abs() = both faces emit.
+                float lndl = abs(dot(-Ld, lnN));
+                if (ndl > 0.0 && lndl > 0.0) {
+                    // Projected-solid-angle metric × area (pdf_area = 1/area), kajiya to_psa_metric, × the uniform
+                    // light-selection weight (1/pick_pdf = ne) so the single sample is an unbiased estimate of the sum.
+                    float psa = (ndl * lndl / d2) * area * (float)ne;
+                    float vis = Visibility(Pw, Nw, Ld, d - 2e-3);   // shadow ray, short of the emitter
+                    emitterLight = et.Radiance.xyz * (psa * vis * NeePad0);   // NeePad0 = NEE intensity (default 1)
+                }
+            }
         }
     }
 
