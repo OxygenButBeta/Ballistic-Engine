@@ -231,7 +231,11 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     unsafe void Relight(Dx12FrameContext ctx, Dx12SceneAS sceneAS, Dx12RtGeometry rtGeo)
     {
         Vector3 sunDir = ctx.LightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(ctx.LightDir);
-        bool useSky = ctx.Ibl != null;
+        // Sky on a probe-ray miss only when the IBL is actually BAKED. ctx.Ibl is a valid object even with no Sky
+        // component in the scene, but its env cube is then UNBAKED (black) — sampling it added nothing but also
+        // meant the "useSky" flag lied. Gate on HasBaked so a sky-less closed room correctly contributes zero on
+        // a miss (the indirect then comes purely from lit surface hits — point/sun light bounces).
+        bool useSky = ctx.Ibl != null && ctx.Ibl.HasBaked;
         float intensity = EnvF("BALLISTIC_DX12_DDGI_INTENSITY", ctx.PostFX.DdgiIntensity);
         float ema = EnvF("BALLISTIC_DX12_DDGI_ALPHA", ctx.PostFX.DdgiEmaAlpha);
         // Under a deterministic capture the per-frame jitter must be fixed (golden byte-identical) AND the EMA
