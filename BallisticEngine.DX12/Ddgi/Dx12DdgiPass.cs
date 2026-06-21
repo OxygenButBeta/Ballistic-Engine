@@ -321,7 +321,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         {
             InvViewProj = Matrix4x4.Transpose(invVP),
             GridOrigin = grid.GridOrigin, ProbeSpacing = grid.ProbeSpacing,
-            NormalBias = EnvF("BALLISTIC_DX12_DDGI_NORMALBIAS", 0.2f),
+            NormalBias = EnvF("BALLISTIC_DX12_DDGI_NORMALBIAS", ctx.PostFX.DdgiNormalBias),
             CountX = (uint)grid.CountX, CountY = (uint)grid.CountY, CountZ = (uint)grid.CountZ,
             W = (uint)indirect.Width, H = (uint)indirect.Height,
             Intensity = 1f,

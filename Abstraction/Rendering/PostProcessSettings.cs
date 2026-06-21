@@ -283,6 +283,7 @@ public sealed class PostProcessSettings {
     public float DdgiEmaAlpha { get; set; } = 0.05f;         // probe irradiance temporal blend (the ONE feedback loop)
     public bool DdgiMultiBounce { get; set; } = true;        // feed prev-frame irradiance back at each hit (cheap multi-bounce)
     public bool DdgiVisibility { get; set; } = true;         // Chebyshev visibility test (light-leak rejection)
+    public float DdgiNormalBias { get; set; } = 0.2f;        // sample-point offset along the surface normal (leak vs self-shadow)
     public bool DdgiReflections { get; set; } = true;        // reflections share the probe GI (else IBL cube)
     // How much the screen-space GTAO bites the GI's contact shading. DEFAULT 0: screen-space GTAO dragged a dark
     // "ghost of nearby geometry" smudge under camera motion, and the RT trace already carries macro occlusion.

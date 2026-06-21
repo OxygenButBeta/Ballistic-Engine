@@ -119,6 +119,7 @@ public static class VolumePostProcessing {
             fx.DdgiEmaAlpha = gi.emaAlpha.Value;
             fx.DdgiMultiBounce = gi.multiBounce.Value;
             fx.DdgiVisibility = gi.visibility.Value;
+            fx.DdgiNormalBias = gi.normalBias.Value;
             fx.DdgiAoStrength = gi.aoStrength.Value;
             fx.DdgiDebugProbes = gi.debugProbes.Value;
             fx.DdgiDebugRawIndirect = gi.debugRawIndirect.Value;

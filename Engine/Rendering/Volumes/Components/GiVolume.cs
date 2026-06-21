@@ -54,9 +54,14 @@ public sealed class GiVolume : VolumeComponent {
              "the grid work in enclosed geometry). Off → trilinear only (leaks through thin walls).")]
     public readonly BoolParameter visibility = new(true);
 
-    [Tooltip("Reflections sample the SAME probe GI as the primary view (rough reflections get GI). Off → the " +
-             "reflection hit falls back to the IBL cube.")]
-    public readonly BoolParameter reflections = new(true);
+    [Tooltip("Surface normal bias (metres) when a pixel gathers the probes: push the sample point off the surface " +
+             "along its normal. Higher = less self-shadow/acne but more leak through thin walls; lower = tighter " +
+             "contact but risk of self-occlusion darkening. Default 0.2.")]
+    public readonly ClampedFloatParameter normalBias = new(0.2f, 0f, 2f);
+
+    // NOTE: "reflections sample the GI" is controlled by the Reflections volume's `sampleRadianceCache` toggle
+    // (it feeds fx.DdgiReflections), NOT here — a duplicate dial on this component was dead (never plumbed) and
+    // was removed to avoid a knob that silently did nothing.
 
     [Tooltip("How much the AmbientOcclusion volume's GTAO darkens the GI's contact shading. DEFAULT 0: GTAO is " +
              "screen-space (ghosting under motion) and the RT trace already carries macro occlusion. 0 = none, 1 = full.")]
