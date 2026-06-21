@@ -18,8 +18,8 @@ namespace BallisticEngine.DX12;
 // D1: irradiance only. D3 adds a parallel visibility buffer (mean depth, depth²) for the Chebyshev leak fix.
 public sealed class Dx12DdgiProbeGrid : IDisposable
 {
-    public const int OctRes = 6;                  // octahedral cell edge (texels) per probe (irradiance)
-    public const int OctTexels = OctRes * OctRes; // 36 float4 irradiance texels per probe
+    public const int OctRes = 8;                  // octahedral cell edge (texels) per probe (irradiance, RTXGI std)
+    public const int OctTexels = OctRes * OctRes; // 64 float4 irradiance texels per probe
     public const int VisRes = 16;                 // octahedral cell edge for the visibility moments (sharper)
     public const int VisTexels = VisRes * VisRes; // 256 float2 (mean depth, mean depth²) per probe
 
@@ -52,6 +52,16 @@ public sealed class Dx12DdgiProbeGrid : IDisposable
     public ID3D12Resource VisibilityRead  => writeB ? visA : visB;
     public ulong VisibilityWriteGpu => VisibilityWrite?.GPUVirtualAddress ?? 0;
     public ulong VisibilityReadGpu  => VisibilityRead?.GPUVirtualAddress ?? 0;
+
+    // ---- probe state (occupancy-aware placement, set once on Ensure via GpuSceneQuery) ----
+    // float4 per probe: xyz = world-space RELOCATION offset (nudge from the nominal grid position into free
+    // space, so probes buried in walls/floors move out), w = active flag (1 = trace+sample, 0 = probe sits in
+    // solid with nowhere to go → relight skips it, sample weights it 0 so it can't leak). NOT ping-pong: it is
+    // static for a static layout (rebuilt only when the grid re-fits). Read by both relight and sample.
+    ID3D12Resource probeState;
+    public ID3D12Resource ProbeState => probeState;
+    public ulong ProbeStateGpu => probeState?.GPUVirtualAddress ?? 0;
+    public bool StatePlaced { get; private set; }   // false until the relocation pass has filled probeState
 
     public bool HistoryValid { get; private set; }
     public bool Valid { get; private set; }
@@ -113,6 +123,7 @@ public sealed class Dx12DdgiProbeGrid : IDisposable
                 HistoryValid = false;   // fresh buffers → no usable history this frame
             }
             dimStamp = dims; lastMin = min; lastMax = max;
+            StatePlaced = false;   // layout moved → the relocation/classification result is stale, re-run it
         }
 
         Valid = irradA != null;
@@ -127,15 +138,96 @@ public sealed class Dx12DdgiProbeGrid : IDisposable
 
     void Realloc(int probeCount)
     {
-        irradA?.Dispose(); irradB?.Dispose(); visA?.Dispose(); visB?.Dispose();
+        irradA?.Dispose(); irradB?.Dispose(); visA?.Dispose(); visB?.Dispose(); probeState?.Dispose();
         long irrBytes = (long)probeCount * OctTexels * 16;   // float4
         long visBytes = (long)probeCount * VisTexels * 8;    // float2
         irradA = MakeBuffer(irrBytes); irradB = MakeBuffer(irrBytes);
         visA = MakeBuffer(visBytes);   visB = MakeBuffer(visBytes);
+        probeState = MakeBuffer((long)probeCount * 16);      // float4 (offset.xyz, active)
         CurrentCapacityProbes = probeCount;
         writeB = false;
         states.Clear();
         states[irradA] = states[irradB] = states[visA] = states[visB] = ResourceStates.UnorderedAccess;
+        states[probeState] = ResourceStates.UnorderedAccess;
+    }
+
+    // Probe nominal world position (grid lattice, BEFORE relocation). The relocated position is this + offset.
+    public Vector3 ProbePos(int ix, int iy, int iz) => GridOrigin + new Vector3(ix, iy, iz) * ProbeSpacing;
+
+    // Occupancy-aware placement (run once per layout, on the CPU via GpuSceneQuery — NOT per frame). For each
+    // probe: classify its lattice position; nudge probes that sit in solid out to the nearest free space; mark a
+    // probe that is solid AND can't be nudged free as inactive. Fills probeState (offset.xyz, active) and uploads
+    // it. `query` shares the DDGI scene AS (same TLAS the relight traces) so this needs no second AS build.
+    public unsafe void PlaceProbes(Dx12Device device, GpuSceneQuery query)
+    {
+        if (probeState == null || StatePlaced) return;
+        int n = ProbeCount;
+
+        var pts = new Vector3[n];
+        for (int iz = 0, p = 0; iz < CountZ; iz++)
+            for (int iy = 0; iy < CountY; iy++)
+                for (int ix = 0; ix < CountX; ix++, p++)
+                    pts[p] = ProbePos(ix, iy, iz);
+
+        // Probe radius for classify/nudge: a couple of cells reaches a wall from inside a cell without scanning
+        // the whole scene (cheaper rays, and a probe should relocate to its OWN cell's free space, not far away).
+        float radius = 2.0f * MathF.Max(ProbeSpacing.X, MathF.Max(ProbeSpacing.Y, ProbeSpacing.Z));
+
+        // CPU readback (Map) — MUST run with the pipelined frame CLOSED (caller guarantees this; see RunPending
+        // placement). Inside an open frame list ExecuteSync only records, so the readback would read garbage and
+        // desync the fence → device removed.
+        GpuSceneQuery.SpaceClass[] cls = query.ClassifySpace(pts, radius);
+        Vector3[] nudged = query.NudgeToFreeSpace(pts, radius);
+
+        // Cap the relocation so a probe never teleports out of its cell (which would corrupt the trilinear
+        // bracketing the sample relies on). A solid probe that can't move free within the cap is marked inactive.
+        float maxMove = 0.9f * MathF.Min(ProbeSpacing.X, MathF.Min(ProbeSpacing.Y, ProbeSpacing.Z));
+
+        var state = new Vector4[n];
+        for (int i = 0; i < n; i++)
+        {
+            Vector3 offset = nudged[i] - pts[i];
+            float move = offset.Length();
+            bool solid = cls[i] == GpuSceneQuery.SpaceClass.Solid;
+
+            if (move > maxMove)
+            {
+                // Can't relocate within the cell. If it was solid → dead probe (inactive). If it was merely on a
+                // boundary the classify didn't flag solid, keep it active but DON'T apply the over-long move.
+                offset = Vector3.Zero;
+                state[i] = new Vector4(0, 0, 0, solid ? 0f : 1f);
+            }
+            else
+            {
+                // Relocate (offset) and stay active unless it was solid with a zero usable nudge.
+                bool active = !(solid && move < 1e-4f);
+                state[i] = new Vector4(offset.X, offset.Y, offset.Z, active ? 1f : 0f);
+            }
+        }
+
+        // Upload via an upload-heap staging copy into the default-heap probeState buffer.
+        UploadState(device, state);
+        StatePlaced = true;
+    }
+
+    unsafe void UploadState(Dx12Device device, Vector4[] state)
+    {
+        long bytes = (long)state.Length * 16;
+        ID3D12Resource upload = device.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties,
+            HeapFlags.None, ResourceDescription.Buffer((ulong)bytes), ResourceStates.GenericRead);
+        byte* dst = upload.Map<byte>(0);
+        fixed (Vector4* src = state) System.Buffer.MemoryCopy(src, dst, bytes, bytes);
+        upload.Unmap(0);
+
+        ResourceStates was = StateOf(probeState);
+        device.ExecuteSync(cl =>
+        {
+            if (was != ResourceStates.CopyDest) cl.ResourceBarrierTransition(probeState, was, ResourceStates.CopyDest);
+            cl.CopyBufferRegion(probeState, 0, upload, 0, (ulong)bytes);
+            cl.ResourceBarrierTransition(probeState, ResourceStates.CopyDest, ResourceStates.NonPixelShaderResource);
+        });
+        SetState(probeState, ResourceStates.NonPixelShaderResource);
+        upload.Dispose();
     }
 
     // Self-tracked resource states (the relight pass transitions all four buffers each frame).
@@ -153,8 +245,8 @@ public sealed class Dx12DdgiProbeGrid : IDisposable
 
     public void Dispose()
     {
-        irradA?.Dispose(); irradB?.Dispose(); visA?.Dispose(); visB?.Dispose();
-        irradA = irradB = visA = visB = null;
+        irradA?.Dispose(); irradB?.Dispose(); visA?.Dispose(); visB?.Dispose(); probeState?.Dispose();
+        irradA = irradB = visA = visB = probeState = null;
         Valid = false;
     }
 }

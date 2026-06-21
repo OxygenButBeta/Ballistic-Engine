@@ -43,8 +43,14 @@ public sealed class GpuSceneQuery : IDisposable {
     [StructLayout(LayoutKind.Sequential)]
     struct VisPair { public Vector3 A; public Vector3 B; }
 
-    public GpuSceneQuery(Dx12Device device, Dx12SceneAS shared = null) {
+    // When true the query trusts the shared AS to already be built+valid this frame and does NOT re-Ensure it.
+    // Critical when the caller (DDGI) built the TLAS from a DIFFERENT renderer set than RuntimeSet: a re-Ensure
+    // here would rebuild the AS under a new stamp, freeing the buffer the caller still traces → device removed.
+    readonly bool trustSharedScene;
+
+    public GpuSceneQuery(Dx12Device device, Dx12SceneAS shared = null, bool trustSharedScene = false) {
         dev = device;
+        this.trustSharedScene = trustSharedScene && shared != null;
         if (shared != null) { sceneAS = shared; ownsSceneAS = false; }
         else { sceneAS = new Dx12SceneAS(device); ownsSceneAS = true; }
     }
@@ -100,6 +106,7 @@ public sealed class GpuSceneQuery : IDisposable {
     // Refresh the AS from the live renderer set; returns false if there is no geometry to query against.
     bool EnsureScene() {
         if (testTlasWriter != null) return true;   // self-test injects its own TLAS
+        if (trustSharedScene) return sceneAS.Valid; // caller already built this frame's TLAS — must NOT rebuild
         sceneAS.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection);
         return sceneAS.Valid;
     }

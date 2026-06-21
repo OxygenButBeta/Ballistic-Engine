@@ -19,6 +19,7 @@ RWStructuredBuffer<float4> Irradiance  : register(u0);   // [probe*OctTexels + t
 StructuredBuffer<float4>   PrevIrrad   : register(t1);   // previous frame (EMA source)
 RWStructuredBuffer<float2> VisMomentsOut : register(u1); // [probe*VisTexels + texel]  x=mean dist, y=mean dist² (D3 Chebyshev)
 StructuredBuffer<float2>   PrevVis     : register(t6);   // previous frame visibility (EMA source)
+StructuredBuffer<float4>   ProbeState  : register(t7);   // xyz = relocation offset, w = active (occupancy-aware placement)
 
 struct RtInstance { uint NormalIdx, UvIdx, IndexIdx, TriMatIdx; uint PositionIdx, TriCount, Pad0, Pad1; };
 struct GpuMaterial {
@@ -46,8 +47,8 @@ cbuffer DdgiRelightConstants : register(b0) {
 };
 SamplerState LinearClamp : register(s0);
 
-static const int OctRes = 6;
-static const int OctTexels = OctRes * OctRes;   // 36
+static const int OctRes = 8;
+static const int OctTexels = OctRes * OctRes;   // 64
 static const int VisRes = 16;
 static const int VisTexels = VisRes * VisRes;   // 256
 static const float VisMaxDist = 1e4;            // miss/cap distance for the visibility moments
@@ -186,13 +187,21 @@ void CSMain(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
     uint probeCount = CountX * CountY * CountZ;
     if (probe >= probeCount) return;
 
+    // Occupancy-aware placement: skip a probe marked inactive (sits in solid with nowhere to relocate). Leave its
+    // irradiance untouched so a stale value can't flash; the sample pass weights it 0 anyway.
+    float4 ps = ProbeState[probe];
+    if (ps.w < 0.5) return;
+
     uint ix = probe % CountX;
     uint iy = (probe / CountX) % CountY;
     uint iz = probe / (CountX * CountY);
-    float3 P = GridOrigin + float3(ix, iy, iz) * ProbeSpacing;
+    float3 P = GridOrigin + float3(ix, iy, iz) * ProbeSpacing + ps.xyz;   // + relocation offset
 
+    // Per-frame ROTATED ray set + low EMA = true Monte-Carlo convergence (no fixed-set bias) while staying
+    // flicker-free on a static scene: each frame aims a different 64-ray Fibonacci rotation, the low-alpha EMA
+    // integrates them over time. FrameJitter<0 → deterministic capture path keeps a fixed rotation (byte-stable).
     float jitter = FrameJitter < 0.0 ? Hash(probe * 2654435761u) * 6.2831853
-                                     : Hash((probe * 2654435761u) ^ (uint)FrameJitter) * 6.2831853;
+                                     : (Hash(probe * 2654435761u) + frac(FrameJitter * 0.61803399)) * 6.2831853;
 
     // Each thread traces ONE ray (gi in [0,RAYS)).
     float3 d = SphereDir(gi, RAYS, jitter);

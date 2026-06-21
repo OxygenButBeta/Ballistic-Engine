@@ -29,6 +29,14 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     readonly Dx12DdgiProbeGrid grid;
     public Dx12DdgiProbeGrid Grid => grid;
 
+    // Occupancy-aware probe placement (relocation + classification) — lazily created, shares the DDGI scene AS
+    // (same TLAS the relight traces) so it needs no second AS build. The query does a CPU readback, so it MUST run
+    // with the pipelined frame CLOSED: Record (inside the open frame) only ARMS placementPending, and the renderer
+    // drains it via RunPendingPlacement() at the next BeginRender before dev.BeginFrame() (frame still closed).
+    GpuSceneQuery placementQuery;
+    bool placementPending;
+    Dx12SceneAS lastSceneAS;   // the TLAS DDGI built last Record — the deferred placement traces it
+
     // ---- relight (per-probe RT trace) ----
     ID3D12RootSignature relightRootSig;
     ID3D12PipelineState relightPso;
@@ -68,7 +76,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         public Vector3 GridOrigin;   public float Pad0;
         public Vector3 ProbeSpacing; public float NormalBias;
         public uint CountX, CountY, CountZ; public uint W;
-        public uint H; public float Intensity; public float UseVisibility; public float Pad2;
+        public uint H; public float Intensity; public float UseVisibility; public float UsePlacement;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -123,6 +131,10 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         if (!run) grid.ResetHistory();
         return run;
     }
+
+    // Occupancy-aware placement door: BALLISTIC_DX12_DDGI_NOPLACEMENT=1 disables relocation/classification
+    // (probes stay on the raw lattice — the pre-placement behaviour, for A/B). Default ON.
+    static bool placementEnabled = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_NOPLACEMENT") != "1";
 
     int gridX, gridY, gridZ;
     // Resolve the probe grid resolution: the GI volume (PostFX) drives it; BALLISTIC_DX12_DDGI_GRID="XxYxZ"
@@ -180,6 +192,13 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
 
         if (!logged) { logged = true; Console.WriteLine($"    DDGI [GlobalIllumination=500] {grid.CountX}x{grid.CountY}x{grid.CountZ}={grid.ProbeCount} probes"); }
 
+        // Occupancy-aware placement uses a CPU-readback GpuSceneQuery (Map) + an upload — which MUST run with the
+        // pipelined frame list CLOSED (an open-frame ExecuteSync only records, so the readback would read garbage
+        // and desync the fence → device removed). Record runs INSIDE the open frame, so we can't do it here: just
+        // arm it. The renderer drains it via RunPendingPlacement() at the next BeginRender, BEFORE dev.BeginFrame().
+        // The TLAS this frame built (sceneAS, stamp-cached) stays valid then, so the deferred placement traces it.
+        if (placementEnabled && !grid.StatePlaced) { placementPending = true; lastSceneAS = sceneAS; }
+
         Relight(ctx, sceneAS, rtGeo);
         Sample(ctx);
         Combine(ctx);
@@ -189,6 +208,19 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     }
 
     bool logged;
+
+    // Drain a pending occupancy-aware placement. MUST be called with the pipelined frame CLOSED (the renderer
+    // calls it at BeginRender BEFORE dev.BeginFrame()) — the query does a CPU readback + the upload waits on a
+    // fence, both of which need a real submit, not an open-frame record. Cheap no-op when nothing is pending
+    // (StatePlaced gates the actual work to once per grid layout). Idempotent + safe to call every frame.
+    public void RunPendingPlacement()
+    {
+        if (!placementPending || grid.StatePlaced || lastSceneAS == null) return;
+        if (!lastSceneAS.Valid) return;   // TLAS not ready (scene swap mid-flight) — retry next frame
+        placementQuery ??= new GpuSceneQuery(dev, lastSceneAS, trustSharedScene: true);
+        grid.PlaceProbes(dev, placementQuery);
+        placementPending = false;
+    }
 
     // Debug overlay: draw every probe as a small world-space sphere tinted by its irradiance, depth-tested
     // against the scene. Instanced billboard (6 verts × ProbeCount). Opt-in, after combine.
@@ -250,6 +282,15 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         prevSunDir = sunDir; prevSunColor = ctx.LightColor;
         if (lightChanged) ema = MathF.Max(ema, 0.5f);   // snap toward the new lighting
 
+        // ROTATED ray set (live path): each frame aims a different 64-ray Fibonacci rotation; the low EMA
+        // integrates them over time → true Monte-Carlo convergence with NO fixed-set bias, yet flicker-free on a
+        // static scene (the integral averages instead of jumping). With rotation the per-frame estimate is noisy,
+        // so cap the EMA LOW (a high alpha would let one noisy frame flash through). Deterministic capture keeps a
+        // fixed rotation (FrameJitter -1) + full replace for byte-stable goldens. Hysteresis still wins on a light
+        // change. The probe count gives the rotation index (wraps; varies the rotation without an RNG).
+        float frameJitter = det ? -1f : (frameCounter & 1023);
+        if (!det && !lightChanged) ema = MathF.Min(ema, 0.12f);   // settled + rotating → low alpha = clean convergence
+
         relightCb.Write(new RelightConstants
         {
             GridOrigin = grid.GridOrigin, RayCount = RelightRays,
@@ -259,12 +300,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             SunDir = sunDir, SunBias = 0.05f,
             SunColor = ctx.LightColor, LightCount = ctx.ClusteredLights.LightCount,
             EmaAlpha = ema, HistoryValid = (grid.HistoryValid && !det) ? 1f : 0f,
-            // FrameJitter = -1 → the relight uses a FIXED per-probe ray rotation every frame. A rotating jitter
-            // (frameCounter%64) re-aimed all 64 rays every frame, so on a STATIC scene each probe's integral kept
-            // jumping to a different sparse estimate and the EMA never settled → the visible flicker (probe colors
-            // changing while nothing moves). With a fixed ray set the integral is identical every frame, so the EMA
-            // converges and holds. Deterministic capture already used -1; now the live path does too.
-            Intensity = intensity, FrameJitter = -1f,
+            Intensity = intensity, FrameJitter = frameJitter,
             MultiBounce = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_NOBOUNCE") == "1" ? 0f
                           : (ctx.PostFX.DdgiMultiBounce ? 1f : 0f),
             BounceBoost = EnvF("BALLISTIC_DX12_DDGI_BOUNCE_BOOST", 1f),
@@ -303,6 +339,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             cl.SetComputeRootDescriptorTable(7, bindless.Gpu(RelightSkyTableBase));       // t5 sky cube
             cl.SetComputeRootUnorderedAccessView(8, grid.VisibilityWriteGpu);             // u1 Visibility
             cl.SetComputeRootShaderResourceView(9, grid.VisibilityReadGpu);               // t6 PrevVis
+            cl.SetComputeRootShaderResourceView(10, grid.ProbeStateGpu);                  // t7 ProbeState
             cl.Dispatch((uint)grid.ProbeCount, 1, 1);                                     // one GROUP per probe
             cl.ResourceBarrierTransition(irradW, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
             cl.ResourceBarrierTransition(visW, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
@@ -330,6 +367,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             W = (uint)indirect.Width, H = (uint)indirect.Height,
             Intensity = 1f,
             UseVisibility = (Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_NOVIS") == "1" || !ctx.PostFX.DdgiVisibility) ? 0f : 1f,
+            UsePlacement = (placementEnabled && grid.StatePlaced) ? 1f : 0f,
         });
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
@@ -355,7 +393,8 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             cl.SetComputeRootConstantBufferView(0, sampleCb.Gpu);
             cl.SetComputeRootShaderResourceView(1, irrad.GPUVirtualAddress);              // t2 Irradiance (root SRV)
             cl.SetComputeRootShaderResourceView(2, grid.VisibilityRead.GPUVirtualAddress); // t3 VisMoments (root SRV)
-            cl.SetComputeRootDescriptorTable(3, sampleSrv.Gpu(0));                        // t0 depth, t1 normal, u0 Indirect
+            cl.SetComputeRootShaderResourceView(3, grid.ProbeStateGpu);                   // t4 ProbeState (root SRV)
+            cl.SetComputeRootDescriptorTable(4, sampleSrv.Gpu(0));                        // t0 depth, t1 normal, u0 Indirect
             cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
         });
     }
@@ -413,11 +452,12 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         var skyTable = new RootParameter1(new RootDescriptorTable1(skyRange), ShaderVisibility.All);
         var visUav = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(1, 0), ShaderVisibility.All);  // u1 Visibility
         var prevVis = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(6, 0), ShaderVisibility.All);  // t6 PrevVis
+        var probeStateP = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All); // t7 ProbeState
         var clamp = StaticClamp(0);
         relightRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { cbv0, tlas, irradUav, prevIrrad, rtInst, mats, lights, skyTable, visUav, prevVis }, new[] { clamp })));
+                new[] { cbv0, tlas, irradUav, prevIrrad, rtInst, mats, lights, skyTable, visUav, prevVis, probeStateP }, new[] { clamp })));
 
         string hlsl = EmbeddedShaderSource.ReadHlsl("DdgiRelight.hlsl");
         byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSMain", "DdgiRelight.hlsl");
@@ -430,13 +470,14 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         var cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
         var irrad = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(2, 0), ShaderVisibility.All);   // t2 Irradiance (root SRV)
         var visMom = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(3, 0), ShaderVisibility.All);  // t3 VisMoments (root SRV)
+        var probeStateP = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(4, 0), ShaderVisibility.All); // t4 ProbeState (root SRV)
         // table: t0 depth, t1 normal (SRV) + u0 Indirect (UAV)
         var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 0);
         var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);
         var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange), ShaderVisibility.All);
         var clamp = StaticClamp(0);
         sampleRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv0, irrad, visMom, table }, new[] { clamp })));
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv0, irrad, visMom, probeStateP, table }, new[] { clamp })));
 
         string hlsl = EmbeddedShaderSource.ReadHlsl("DdgiSample.hlsl");
         byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSMain", "DdgiSample.hlsl");
@@ -512,6 +553,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     public void Dispose()
     {
         grid.Dispose();
+        placementQuery?.Dispose();
         indirect?.Dispose();
         relightCb?.Dispose(); sampleCb?.Dispose(); combineCb?.Dispose(); debugCb?.Dispose();
         sampleSrv?.Dispose(); combineSrv?.Dispose();

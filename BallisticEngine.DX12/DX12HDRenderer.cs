@@ -1512,6 +1512,20 @@ public sealed class DX12HDRenderer : HDRenderer
             ? (System.Collections.Generic.IReadOnlyCollection<IStaticMeshRenderer>)FrameSnapshot.RenderSet
             : RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection;
 
+    // Mesh-streaming priority: world position of an active renderer drawing this mesh, or null if none
+    // currently reference it (a not-yet-active mesh sorts last so visible geometry uploads first). A mesh
+    // asset can be shared by many renderers; the queue only needs ONE representative position to rank by
+    // camera distance, so the first active match is enough. RenderWorldPosition is render-thread-safe.
+    static System.Numerics.Vector3? NearestInstanceWorldPos(Mesh mesh)
+    {
+        foreach (IStaticMeshRenderer r in RendererSet) {
+            if (r is null || !r.IsActive || r.SharedMesh != mesh) continue;
+            var p = r.Transform.RenderWorldPosition;
+            return new System.Numerics.Vector3(p.X, p.Y, p.Z);
+        }
+        return null;
+    }
+
     // R3a: BALLISTIC_DX12_GPUDRIVEN_SPLIT routes split-import renderers (SubMeshIndex >= 0, non-skinned,
     // single-shader) through the SAME GPU compute-cull + ExecuteIndirect path as whole-mesh, instead of the CPU
     // per-submesh loop — collapsing the last CPU-submit geometry path. **DEFAULT ON** (!= "0"): perceptual-parity
@@ -1638,6 +1652,16 @@ public sealed class DX12HDRenderer : HDRenderer
         // across frames so cascade caching works; shadows shouldn't jitter)
         // UNJITTERED view*proj — used for motion vectors + the froxel/SSR/post math.
         Matrix4x4 viewProjUnjittered = view * proj;
+
+        // Mesh streaming: drain a few ms of deferred GPU uploads between frames (main thread). Meshes
+        // deserialized under Mesh.DeferUpload (scene open) land in the queue with their buffers empty; we
+        // upload the ones CLOSEST to the camera first so what the user looks at fills in before the far
+        // field. Draw paths already skip a mesh whose buffer Resource is null, so partially-streamed
+        // geometry renders correctly and the TLAS (Dx12SceneAS.Ensure) picks each mesh up as it arrives.
+        if (MeshUploadQueue.HasPending) {
+            Vector3 streamCamPos = Matrix4x4.Invert(view, out Matrix4x4 invView) ? invView.Translation : Vector3.Zero;
+            MeshUploadQueue.PumpUploads(NearestInstanceWorldPos, streamCamPos);
+        }
 
         // Sub-pixel jitter: offset the projection by a Halton amount so the whole frame (geometry + SSR +
         // shadows) is consistently jittered; TAA/FSR resolve it against history. FSR REPLACES TAA but still
@@ -1772,6 +1796,12 @@ public sealed class DX12HDRenderer : HDRenderer
             iblActiveThisFrame = ibl.HasBaked;
         }
         FP("IBL bake");
+
+        // DDGI occupancy-aware probe placement: drain any pending relocation/classification HERE, while the
+        // pipelined frame is still CLOSED. It runs a CPU-readback GpuSceneQuery + an upload (both need a real
+        // submit+wait), which would corrupt the open frame list / desync the fence if done inside Record (event
+        // 500). Armed by the previous frame's DDGI Record once per grid layout; a cheap no-op otherwise.
+        ddgiPass?.RunPendingPlacement();
 
         // P0a — OPEN the pipelined frame command list. Everything from here (Hi-Z, geometry, deferred, sky,
         // transparents, GI, post, composite) records into ONE list submitted once at EndFrame, replacing the

@@ -11,17 +11,18 @@ cbuffer DdgiSampleConstants : register(b0) {
     float3 GridOrigin;   float Pad0;
     float3 ProbeSpacing; float NormalBias;   // push the sample point off the surface along N (self-leak guard)
     uint   CountX, CountY, CountZ;  uint W;
-    uint   H;  float Intensity;  float UseVisibility;  float Pad2;   // UseVisibility=1 → Chebyshev leak test (D3)
+    uint   H;  float Intensity;  float UseVisibility;  float UsePlacement;  // UseVisibility=1 → Chebyshev (D3); UsePlacement=1 → occupancy-aware probe state
 };
 
 Texture2D<float>  Depth      : register(t0);
 Texture2D<float4> NormalTex  : register(t1);
 StructuredBuffer<float4> Irradiance : register(t2);
 StructuredBuffer<float2> VisMoments : register(t3);   // D3: per-probe visibility moments (mean dist, mean dist²)
+StructuredBuffer<float4> ProbeState : register(t4);   // xyz = relocation offset, w = active (occupancy-aware placement)
 RWTexture2D<float4> Indirect : register(u0);
 SamplerState LinearClamp : register(s0);
 
-static const int OctRes = 6;
+static const int OctRes = 8;   // MUST match Dx12DdgiProbeGrid.OctRes + DdgiRelight.hlsl (irradiance cell edge)
 static const int OctTexels = OctRes * OctRes;
 static const int VisRes = 16;
 static const int VisTexels = VisRes * VisRes;
@@ -101,6 +102,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     [unroll] for (int i = 0; i < 8; i++) {
         int3 off = int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
         uint3 c = (uint3)clamp(baseC + off, int3(0, 0, 0), int3(CountX - 1, CountY - 1, CountZ - 1));
+        uint pidxC = ProbeIndex(c);
 
         // Trilinear weight.
         float3 tw = float3(off.x == 0 ? 1.0 - frac.x : frac.x,
@@ -108,8 +110,15 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
                            off.z == 0 ? 1.0 - frac.z : frac.z);
         float trilinear = tw.x * tw.y * tw.z;
 
+        // Occupancy-aware placement: a probe relocated into free space contributes from its MOVED position
+        // (so its visibility/backface tests use where it actually traced); an inactive probe (buried with no
+        // relocation) is zero-weighted so it can't leak its garbage irradiance into the gather.
+        float probeActive = 1.0;
+        float3 probeOffset = 0.0.xxx;
+        if (UsePlacement > 0.5) { float4 st = ProbeState[pidxC]; probeOffset = st.xyz; probeActive = st.w; }
+
         // Backface weight: a probe behind the surface (its direction to P opposes N) contributes less.
-        float3 probePos = GridOrigin + (float3)c * ProbeSpacing;
+        float3 probePos = GridOrigin + (float3)c * ProbeSpacing + probeOffset;
         float3 dirToProbe = normalize(probePos - P);
         float backWeight = saturate(dot(dirToProbe, N) * 0.5 + 0.5);
         backWeight = backWeight * backWeight + 0.05;
@@ -118,14 +127,13 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         // the leak fix. The moments were measured probe→world, so query in the probe→surface direction.
         float vis = 1.0;
         if (UseVisibility > 0.5) {
-            uint pidx = ProbeIndex(c);
             float distPS = distance(probePos, P);
             float bias = 0.5 * length(ProbeSpacing);   // half a cell: tolerates probes sitting near surfaces
-            vis = ChebyshevWeight(pidx, normalize(P - probePos), distPS, bias);
+            vis = ChebyshevWeight(pidxC, normalize(P - probePos), distPS, bias);
         }
 
-        float w = trilinear * backWeight * vis;
-        float3 probeE = SampleProbeOct(ProbeIndex(c), N);
+        float w = trilinear * backWeight * vis * probeActive;
+        float3 probeE = SampleProbeOct(pidxC, N);
         sum += probeE * w;
         wsum += w;
         // Visibility-free accumulation, kept in parallel as a FALLBACK. On small/thin geometry (a box smaller
@@ -133,7 +141,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         // nearby lit probes — so wsum collapses to ~0 and the pixel goes pure black even though light is right
         // there. When that happens we fall back to the trilinear+backface gather (no visibility) so the face gets
         // soft GI instead of a black hole. This is the standard DDGI safety net for sub-cell geometry.
-        float wNoVis = trilinear * backWeight;
+        float wNoVis = trilinear * backWeight * probeActive;   // fallback still excludes dead probes
         sumNoVis += probeE * wNoVis;
         wsumNoVis += wNoVis;
     }
