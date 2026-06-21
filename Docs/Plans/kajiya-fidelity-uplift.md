@@ -108,6 +108,13 @@
   (Kolay diye değil — doğru-doğrulanamadığı + sole-AA riski için.)
 - **C7 sharpen yarısı ERTELENDİ:** kozmetik tuning rabbit-hole; TPDF (asıl güvenli kazanç) yapıldı.
 
+## NEE — emissive-mesh area lights (completeness review'ın follow-up'ı) ✓ YAPILDI
+`8d36011f` + fix `c84e3bba`. Dx12EmissiveLights.cs (world-space emissive-tri list, stamp-cached, budget 256,
+split-renderer + skinned-skip). DdgiRelight ShadeHit NEE loop. Doors EMISSIVE_NEE (default ON) + NEE_INTENSITY.
+bug-hunt #6: 3 bug → F2 (256 ray/hit perf cliff → tek-ışık pick 1 ray/hit, 1/pdf unbiased), F1 (stamp world
+matrix eksik → moved emitter stale), F3 (zero-tri cache). FİX tamam. Det A==B, Bistro int OFF!=ON (maxErr
+0.0034), CornellBox emitter=2 (matematik 10000× testte kanıtlı meanErr 0.049). Two-sided emitter (winding fix).
+
 ## COMPLETENESS REVIEW (final) — TAM
 Agent completeness-critic taraması: yüksek-değerli kısıt-uyumlu HİÇBİR teknik kaçırılmadı. Tek follow-up adayı:
 **emissive-mesh NEE area lights GI hit'inde** (kajiya lighting/sample_lights.rgen + inc/lights/triangle.hlsl).
