@@ -58,7 +58,21 @@
   kajiya `ircache/` rank sistemi + output-sensitive voting + normal-biasing. DDGI probe placement +
   multi-bounce gather'a uyarla (sızıntı azaltma). Mimari ama portable kavram.
 
-### FAZ B — Reflections (sonra)
+### FAZ B — Reflections (sonra) — İLERLEME
+- **B1+B2 ✓** VNDF GGX reflection sampling (Heitz/Falcor) + roughness>0.6 kesimi KALKTI (→1.0).
+  `4ab9e3ca`. Per-pixel R2 blue-noise urand (det fixed), below-surface mirror fallback, gentle
+  roughFade. Det A==B (Bistro ext), RT refl gerçek katkı (meanErr 0.007). Rough yüzeyler artık yansıyor.
+- **[bug-hunt #3 ✓]** B1/B2 VNDF math DOĞRU, crash/NaN/layout/det temiz. 1 regresyon (F2): rough
+  0.6-1.0 bandı kamera hareketinde gürültülü (tek-ray geniş cone + temporal motion'da kapanır).
+  FİX `a7fde3ed`: multi-sample VNDF (roughness'a göre 1→4 ray, decorrelated R2, ortalama). F6:
+  ctx.FrameCounter'a geçildi. Det A==B.
+- **B4 ✓** soft_color_clamp reflection temporal'a (kajiya inc/soft_color_clamp). `7f5ea340`. Hard box
+  clamp → soft 1σ→3σ ramp (anti-ghosting, rough VNDF history için). Det A==B.
+- **B3 (RTR reservoir) DEĞERLENDİRME:** B1/B2+multiray rough reflection boşluğunu ZATEN kapattı (temiz
+  glossy). Full RTR reservoir = ağır (screen-space reservoir history buffer'ları, reflection-only feedback).
+  Marjinal getiri vs yüksek efor. Karar: checkpoint review sonrası — değerse yap, değmezse atla.
+
+#### FAZ B kalan
 - **B1. VNDF (Heitz) GGX importance sampling + correlated Smith** ⏳
   kajiya `inc/brdf.hlsl:184`. 2-4x spec varyans ↓. `roughness>0.6` kesimini AÇAR.
 - **B2. Rough reflection (kesimi kaldır) + BRDF-footprint spatial resolve** ⏳
