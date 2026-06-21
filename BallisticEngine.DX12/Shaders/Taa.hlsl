@@ -99,30 +99,44 @@ float4 PSMain(VSOut i) : SV_Target {
     float3 sigma = sqrt(max(m2 / 9.0 - mean * mean, 0.0.xxx));
 
     float3 currYCoCg = RGBToYCoCg(current);
-    // C6 — firefly-clamped TAA input. RT reflections + Lumen/DDGI card churn enter the HDR BEFORE TAA with no
-    // other denoiser, so a lone bright pixel (finite but huge, the class the NaN-scrub gotcha warns about) would
-    // poison the feedback loop and crawl. If the centre luma far exceeds its brightest neighbour, it's a firefly —
-    // pull its luma down toward the neighbourhood max (chroma kept). Only bites genuine single-pixel spikes.
-    float fireflyCap = neighMaxLuma * 1.5 + 1e-3;
-    if (currYCoCg.x > fireflyCap) currYCoCg.x = fireflyCap;
+    float3 currRaw = currYCoCg;                                           // pre-firefly (for honest disagreement)
 
-    // C4 — confidence-WIDENED clamp box. A fixed Gamma over-clamps where current and history genuinely AGREE
-    // (eroding real accumulated detail → blur). kajiya widens the box by an input-probability; we drive the same
-    // idea cheaply from the luma agreement we already need below: high agreement → wider box (keep more history
-    // detail), disagreement → tight box (reject ghosting). box in [0.9 (tight), 2.4 (loose)] — kajiya's 0.8→3 range.
-    float lumaDiffPre = abs(currYCoCg.x - history.x) / max(max(currYCoCg.x, history.x), 0.2);
-    float confidence = saturate(1.0 - lumaDiffPre);
-    float Gamma = lerp(0.9, 2.4, confidence);
+    // C6 — firefly-clamped TAA input. RT reflections + Lumen/DDGI card churn enter the HDR BEFORE TAA with no
+    // other denoiser, so a lone bright pixel (finite but huge) would poison the feedback loop and crawl. If the
+    // centre luma far exceeds its brightest neighbour, it's likely a firefly — pull its luma down (chroma kept).
+    // Bug-hunt #4 F3: a SINGLE-pixel REAL highlight (star/glint) has dark neighbours too, so a tight cap would
+    // crush it. Use a generous 4× headroom + a soft pull (only fireflies >> neighbours bite hard; a real glint
+    // within a few× survives), preserving legitimate sub-pixel highlights TAA is meant to resolve.
+    float fireflyCap = neighMaxLuma * 4.0 + 0.05;
+    if (currYCoCg.x > fireflyCap) currYCoCg.x = lerp(currYCoCg.x, fireflyCap, 0.85);
+
+    // C4 — confidence-WIDENED clamp box. A fixed Gamma over-clamps where current and history genuinely agree AND
+    // the pixel is static (eroding accumulated detail → blur). Bug-hunt #4 F1/F2 fixes:
+    //  - confidence is gated by MOTION (a moving pixel never widens the box → no slow bright-trail smear), and
+    //    measured from the FULL YCoCg vector on the PRE-firefly current (so a firefly can't fake high confidence,
+    //    F3 second-order), not luma-only.
+    //  - the box only widens the LUMA extent; CHROMA stays at a fixed tight Gamma (F2: a luma-only confidence must
+    //    not loosen the chroma box → no equal-luma coloured ghosts).
+    //  - Gamma cap pulled in to 1.6 and the soft knee tightened to smoothstep(1,2) so full clip arrives by ~2·box
+    //    (F1: history is fully rejected by ~3.2σ, not ~7.2σ).
+    float2 motionPx = motion * texSize;
+    float motionMag = length(motionPx);
+    float still = saturate(1.0 - motionMag * 0.75);                      // 0 once the pixel moves ~1.3px
+    float3 vdiff = abs(currRaw - history);
+    float chromaDisagree = (vdiff.y + vdiff.z) / max(max(currRaw.x, history.x), 0.2);
+    float lumaDiffPre = abs(currRaw.x - history.x) / max(max(currRaw.x, history.x), 0.2);
+    float confidence = saturate(1.0 - max(lumaDiffPre, chromaDisagree)) * still;
+    float lumaGamma = lerp(0.9, 1.6, confidence);
+    float chromaGamma = 0.9;                                             // chroma box never widens
 
     // C1 — SOFT colour clamp (kajiya inc/soft_color_clamp), replacing the hard YCoCg clip. The hard clip snaps the
-    // moment maxUnit crosses 1; the soft form pulls history toward the box ONLY as it gets statistically far
-    // (1→3 unit ramp), so ghosting/disocclusion bleeds out smoothly without the hard-knee shimmer. Direction-
-    // preserving (scales the whole YCoCg delta vector, like the original clip).
-    float3 extents = Gamma * sigma + 1e-5;
+    // moment maxUnit crosses 1; the soft form pulls history toward the box as it gets statistically far (1→2 unit
+    // ramp), so ghosting bleeds out smoothly without the hard-knee shimmer. Direction-preserving.
+    float3 extents = float3(lumaGamma, chromaGamma, chromaGamma) * sigma + 1e-5;
     float3 delta = history - mean;
     float maxUnit = max(abs(delta.x / extents.x), max(abs(delta.y / extents.y), abs(delta.z / extents.z)));
     float3 clipped = mean + delta / max(maxUnit, 1.0);                    // the hard-clip target
-    history = lerp(history, clipped, smoothstep(1.0, 3.0, maxUnit));      // soft ramp into it
+    history = lerp(history, clipped, smoothstep(1.0, 2.0, maxUnit));      // soft ramp into it
 
     // Luma-adaptive feedback: agreement keeps full history; disagreement drops it (re-converge fast).
     float lumaDiff = abs(currYCoCg.x - history.x) / max(max(currYCoCg.x, history.x), 0.2);
