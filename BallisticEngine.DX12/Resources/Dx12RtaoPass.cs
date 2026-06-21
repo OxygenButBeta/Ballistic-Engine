@@ -52,7 +52,7 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
         public Matrix4x4 InvViewProj;
         public Vector2 TexelSize;
         public float RayLength; public float NormalBias;
-        public float RayCount; public float Intensity; public float FrameIndex; public float Pad;
+        public float RayCount; public float Intensity; public float FrameIndex; public float HistoryValid;
     }
 
     readonly Dx12Device dev;
@@ -60,8 +60,11 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
     ID3D12PipelineState pso;
     ID3D12Resource cb;
     unsafe byte* cbMapped;
-    Dx12DescriptorHeap heap;       // 5 descriptors: TLAS(t0), depth(t1), normal(t2), AO-in(t3), AO-out-UAV(u0)
+    Dx12DescriptorHeap heap;       // 7 descriptors: TLAS(t0), depth(t1), normal(t2), AO-in(t3), Hist-in(t4), AO-out-UAV(u0), Hist-out-UAV(u1)
     ID3D12Resource rtaoOut;        // own committed R8 UAV target (sky-vis-gated AO)
+    ID3D12Resource histA, histB;   // temporal history ping-pong: R16G16_Float (skyVis, depth)
+    bool histWriteB;
+    bool histValid;
     int outW, outH;
     bool built;
     int frameCounter;
@@ -90,7 +93,7 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
         // cost (RTAO measured 1.5ms@1080p / 6ms@4K — the single biggest 4K pass). 3 rays halves the dispatch for
         // a perceptually-identical result (interior sky-leak gate is unchanged). BALLISTIC_DX12_RTAO_RAYS overrides.
         float rayCount = rayCountCached ??= float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_RTAO_RAYS"),
-            System.Globalization.CultureInfo.InvariantCulture, out float rc) ? Math.Clamp(rc, 1f, 16f) : 3f;
+            System.Globalization.CultureInfo.InvariantCulture, out float rc) ? Math.Clamp(rc, 1f, 16f) : 8f;   // 8 (was 3): with the temporal EMA below this is cheap enough and far less quantized
         // Deterministic capture keeps the original 6 rays so existing paused goldens stay bit-exact (the 3-ray
         // result is perceptual-identical but not byte-identical; det mode is the golden/diff baseline, not a perf
         // path). Play / normal render uses the cached value (default 3) — that's where the FPS win lives.
@@ -100,16 +103,28 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
             TexelSize = new Vector2(1f / ao.Width, 1f / ao.Height),
             RayLength = rayLen, NormalBias = 0.05f, RayCount = rayCount, Intensity = intensity,
             FrameIndex = ctx.DeterministicCapture ? 0f : frameCounter,
+            // Temporal EMA off under a deterministic capture (byte-stable goldens) and on the first frame.
+            HistoryValid = (histValid && !ctx.DeterministicCapture) ? 1f : 0f,
         };
 
+        var histRead = histWriteB ? histA : histB;    // previous frame
+        var histWrite = histWriteB ? histB : histA;    // this frame
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         sceneAS.CreateTlasSrv(heap.Cpu(0));
         dev.Device.CopyDescriptorsSimple(1, heap.Cpu(1), gbuffer.DepthSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, heap.Cpu(2), gbuffer.ColorSrvCpu(1), heapType);   // world normal (RT1)
         dev.Device.CopyDescriptorsSimple(1, heap.Cpu(3), ao.ColorSrvCpu, heapType);            // GTAO AO as SRV (read)
+        dev.Device.CreateShaderResourceView(histRead, new ShaderResourceViewDescription {
+            Format = Format.R16G16_Float, ViewDimension = ShaderResourceViewDimension.Texture2D,
+            Shader4ComponentMapping = ShaderComponentMapping.Default,
+            Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
+        }, heap.Cpu(4));                                                                        // t4 history (prev frame)
         dev.Device.CreateUnorderedAccessView(rtaoOut, null,
             new UnorderedAccessViewDescription { Format = Format.R8_UNorm, ViewDimension = UnorderedAccessViewDimension.Texture2D },
-            heap.Cpu(4));
+            heap.Cpu(5));                                                                       // u0 AO out
+        dev.Device.CreateUnorderedAccessView(histWrite, null,
+            new UnorderedAccessViewDescription { Format = Format.R16G16_Float, ViewDimension = UnorderedAccessViewDimension.Texture2D },
+            heap.Cpu(6));                                                                       // u1 history out (this frame)
 
         // A compute-shader SRV read requires NON_PIXEL state. GTAO left depth/normal/AO in PIXEL only → transition
         // depth+normal to the combined read (covers both this compute read and the deferred pixel read that
@@ -120,6 +135,12 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
         dev.ExecuteSync(cl => {
             if (rtaoOutState != ResourceStates.UnorderedAccess)
                 cl.ResourceBarrierTransition(rtaoOut, rtaoOutState, ResourceStates.UnorderedAccess);
+            // History: read buffer → compute SRV (t4), write buffer → UAV (u1). Guard same-state (DX12 rejects a
+            // transition whose before==after).
+            if (histReadState(histRead) != ResourceStates.NonPixelShaderResource)
+                cl.ResourceBarrierTransition(histRead, histReadState(histRead), ResourceStates.NonPixelShaderResource);
+            if (histReadState(histWrite) != ResourceStates.UnorderedAccess)
+                cl.ResourceBarrierTransition(histWrite, histReadState(histWrite), ResourceStates.UnorderedAccess);
             ao.ColorTransitionInList(cl, ResourceStates.NonPixelShaderResource);   // GTAO AO as a COMPUTE SRV (t3)
             cl.SetComputeRootSignature(rootSig);
             cl.SetPipelineState(pso);
@@ -135,17 +156,23 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
             ao.ColorTransitionInList(cl, ResourceStates.PixelShaderResource);   // deferred samples it next (event 300)
         });
         rtaoOutState = ResourceStates.CopySource;
+        histStates[histRead] = ResourceStates.NonPixelShaderResource;
+        histStates[histWrite] = ResourceStates.UnorderedAccess;
+        histWriteB = !histWriteB;   // swap ping-pong
+        histValid = true;
         frameCounter++;
     }
 
     ResourceStates rtaoOutState = ResourceStates.UnorderedAccess;
+    readonly System.Collections.Generic.Dictionary<ID3D12Resource, ResourceStates> histStates = new();
+    ResourceStates histReadState(ID3D12Resource r) => histStates.TryGetValue(r, out var s) ? s : ResourceStates.UnorderedAccess;
 
     unsafe void EnsureBuilt(int w, int h) {
         if (built && outW == w && outH == h) return;
         if (!built) {
             var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-            var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 4, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 0);
-            var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 4);
+            var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 5, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 0);
+            var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 2, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 5);
             var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange), ShaderVisibility.All);
             rootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
                 new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, table })));
@@ -156,7 +183,7 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
             cb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
                 ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
             cbMapped = cb.Map<byte>(0);
-            heap = new Dx12DescriptorHeap(dev, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 5, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+            heap = new Dx12DescriptorHeap(dev, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 7, shaderVisible: true, framesInFlight: dev.FramesInFlight);
             built = true;
         }
         // (Re)create the own UAV target at the AO resolution.
@@ -166,10 +193,18 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
         rtaoOut = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None,
             desc, ResourceStates.UnorderedAccess);
         rtaoOutState = ResourceStates.UnorderedAccess;
+        // Temporal history ping-pong (skyVis, depth). Realloc on size change → invalidate history (no smear across resize).
+        histA?.Dispose(); histB?.Dispose();
+        var hdesc = ResourceDescription.Texture2D(Format.R16G16_Float, (uint)w, (uint)h, 1, 1);
+        hdesc.Flags = ResourceFlags.AllowUnorderedAccess;
+        histA = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None, hdesc, ResourceStates.UnorderedAccess);
+        histB = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None, hdesc, ResourceStates.UnorderedAccess);
+        histValid = false; histWriteB = false;
         outW = w; outH = h;
     }
 
     public void Dispose() {
         pso?.Dispose(); rootSig?.Dispose(); cb?.Dispose(); heap?.Dispose(); rtaoOut?.Dispose();
+        histA?.Dispose(); histB?.Dispose();
     }
 }

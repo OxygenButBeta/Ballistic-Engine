@@ -14,7 +14,9 @@ RaytracingAccelerationStructure Scene : register(t0);
 Texture2D<float>  Depth   : register(t1);
 Texture2D<float4> Normal  : register(t2);   // world normal packed [0,1]
 Texture2D<float>  AoIn    : register(t3);   // GTAO result (SRV read; 1 = unoccluded)
+Texture2D<float2> HistIn  : register(t4);   // previous frame's (skyVis, depth) — temporal EMA source
 RWTexture2D<float> AoOut  : register(u0);   // own target: AoIn * sky-vis (copied back into GTAO's AO afterwards)
+RWTexture2D<float2> HistOut : register(u1); // this frame's (skyVis, depth) for next frame's EMA
 
 cbuffer RtaoConstants : register(b0) {
     float4x4 InvViewProj;   // screen+depth -> world (transposed on upload)
@@ -24,7 +26,7 @@ cbuffer RtaoConstants : register(b0) {
     float  RayCount;        // hemisphere rays per pixel (clamped 1..16)
     float  Intensity;       // 0 = no effect (AO unchanged), 1 = full sky-vis gate
     float  FrameIndex;      // per-pixel rotation seed (frozen under deterministic capture)
-    float  Pad;
+    float  HistoryValid;    // 1 = blend with HistIn (temporal denoise); 0 = first frame / det capture
 };
 
 float Hash(uint s) {
@@ -86,9 +88,24 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
     }
     float skyVis = open / float(rays);
 
+    // TEMPORAL DENOISE: a few jittered rays per frame give a noisy, frame-varying skyVis (the "grey/black noise
+    // sliding across the screen as the camera moves" report). Blend with the previous frame's skyVis (EMA) so the
+    // few-ray estimate converges to a stable value — sky-occlusion is a low-frequency openness signal, so a plain
+    // depth-guarded EMA (reject the history when this pixel's depth jumped → disocclusion) is enough without full
+    // motion-vector reprojection. Off on the first frame / under deterministic capture (byte-stable goldens).
+    if (HistoryValid > 0.5) {
+        float2 h = HistIn[px];
+        float prevVis = h.x, prevDepth = h.y;
+        // Depth-relative disocclusion reject: if this pixel's depth changed a lot, the history is from different
+        // geometry → discard it (use this frame's value) instead of smearing.
+        bool reuse = abs(prevDepth - depth) <= 0.01 * max(depth, 1e-3);
+        if (reuse) skyVis = lerp(prevVis, skyVis, 0.1);   // 10% new per frame → ~stable in a few frames
+    }
+
     // Multiply sky-visibility INTO the existing AO (read-modify-write). Intensity lerps from "AO unchanged"
     // (0) to "full sky-vis gate" (1) so it's a tunable, opt-in dial. A sealed receiver (skyVis~0) drops its
     // IBL ambient to ~0; an open one (skyVis~1) is untouched.
     float ao = AoIn[px];
     AoOut[px] = ao * lerp(1.0, skyVis, saturate(Intensity));
+    HistOut[px] = float2(skyVis, depth);
 }
