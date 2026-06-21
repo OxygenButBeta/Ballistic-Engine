@@ -26,7 +26,7 @@ RWTexture2D<float4> Output  : register(u0);
 cbuffer ReflConstants : register(b0) {
     float4x4 InvViewProj;    // screen+depth → world (JITTERED, transposed)
     float3 CameraPos; float Intensity;
-    float PrefilterMaxMip; float NormalBias; float UseCards; float Unused1;   // UseCards: D5 — add DDGI probe GI at the reflection hit
+    float PrefilterMaxMip; float NormalBias; float UseCards; float FrameIndex;   // UseCards: D5 DDGI GI at hit; FrameIndex: VNDF temporal jitter (<0 = det fixed)
 };
 // D5: the DDGI probe grid, so a reflection hit gets the SAME diffuse GI the primary view does.
 cbuffer ReflDdgiGrid : register(b2) {
@@ -86,13 +86,60 @@ float3 DdgiGather(float3 P, float3 N) {
     return (wsum > 1e-4) ? sum / wsum : 0.0.xxx;
 }
 
-static const float MAX_ROUGHNESS = 0.6;
+// B1/B2: MAX_ROUGHNESS raised from 0.6 → 1.0 so ROUGH surfaces also get ray-traced reflections (previously hard-
+// cut to a mirror-only band; rough metals/floors fell back to the blurry IBL cube only). VNDF importance sampling
+// (below) makes the rough reflection ray properly distributed so the single per-pixel ray + temporal/spatial
+// resolve reconstructs a clean glossy reflection instead of mirror noise.
+static const float MAX_ROUGHNESS = 1.0;
 struct ReflPayload { float3 Color; float Roughness; };
 
 float3 Sanitize(float3 v) {   // ternary component-select — never mix(v,0,flag) (NaN*0==NaN; the proven AMD bug)
     return float3(isnan(v.x) || isinf(v.x) ? 0.0 : v.x,
                   isnan(v.y) || isinf(v.y) ? 0.0 : v.y,
                   isnan(v.z) || isinf(v.z) ? 0.0 : v.z);
+}
+
+// ---- B1: VNDF (Heitz 2018) GGX visible-normal importance sampling ----
+// A pure mirror ray (reflect(-V,N)) is only correct for a perfect mirror; on a rough surface the reflection lobe
+// is a CONE, and a mirror ray gives a too-sharp, wrong reflection. VNDF samples a microfacet half-vector H from
+// the distribution of VISIBLE normals (the Falcor/Heitz form kajiya uses, inc/brdf.hlsl), so reflect(-V,H) gives
+// a ray drawn from the actual GGX lobe — 2-4x lower variance than naive NDF sampling and the right rough shape.
+float2 R2(uint i) {   // plastic-constant low-discrepancy pair (blue-noise-like) for the VNDF urand
+    return frac(float2(0.7548776662466927, 0.5698402909980532) * (float)i + 0.5);
+}
+float Hash1(uint s) { s = (s ^ 61u) ^ (s >> 16); s *= 9u; s ^= s >> 4; s *= 0x27d4eb2du; s ^= s >> 15; return float(s & 0x7fffffffu) / float(0x7fffffff); }
+
+// Build an orthonormal tangent basis around N (Duff et al. branchless).
+void OnbFrame(float3 n, out float3 t, out float3 b) {
+    float s = n.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (s + n.z);
+    float bb = n.x * n.y * a;
+    t = float3(1.0 + s * n.x * n.x * a, s * bb, -s * n.x);
+    b = float3(bb, s + n.y * n.y * a, -n.y);
+}
+
+// Sample a microfacet half-vector H (world space) from the GGX VNDF, given world view dir V and roughness.
+float3 SampleVndfH(float3 N, float3 V, float roughness, float2 urand) {
+    float alpha = max(roughness * roughness, 1e-3);
+    float3 T, B;
+    OnbFrame(N, T, B);
+    // View dir into the tangent frame (z = N).
+    float3 wo = float3(dot(V, T), dot(V, B), dot(V, N));
+    wo = normalize(wo);
+    // Heitz VNDF (Falcor port).
+    float3 Vh = normalize(float3(alpha * wo.x, alpha * wo.y, wo.z));
+    float3 t1 = (Vh.z < 0.9999) ? normalize(cross(float3(0, 0, 1), Vh)) : float3(1, 0, 0);
+    float3 t2 = cross(Vh, t1);
+    float r = sqrt(urand.x);
+    float phi = 6.28318530718 * urand.y;
+    float p1 = r * cos(phi);
+    float p2 = r * sin(phi);
+    float s = 0.5 * (1.0 + Vh.z);
+    p2 = (1.0 - s) * sqrt(max(0.0, 1.0 - p1 * p1)) + s * p2;
+    float3 Nh = p1 * t1 + p2 * t2 + sqrt(max(0.0, 1.0 - p1 * p1 - p2 * p2)) * Vh;
+    float3 hTan = normalize(float3(alpha * Nh.x, alpha * Nh.y, max(0.0, Nh.z)));
+    // Back to world space.
+    return normalize(hTan.x * T + hTan.y * B + hTan.z * N);
 }
 
 // Inline shadow/visibility ray (RayQuery — no recursion, so the reflection PSO stays MaxTraceRecursionDepth=1).
@@ -151,14 +198,27 @@ void RayGen() {
     float3 N = normalize(worldN);
     float3 V = normalize(CameraPos - worldPos);
     float NdotV = max(dot(N, V), 0.0);
-    float3 R = reflect(-V, N);
+
+    // B1: VNDF-sampled reflection ray. A near-mirror surface (roughness→0) collapses to reflect(-V,N) (the VNDF
+    // half-vector → N), while a rough surface draws a ray from the GGX visible-normal lobe — the correct glossy
+    // cone. Per-pixel blue-noise (R2) urand, advanced per frame in the live path so the temporal/spatial resolve
+    // integrates the lobe; deterministic capture uses a FIXED per-pixel offset (byte-stable, no frame advance).
+    float2 baseRand = float2(Hash1(idx.x * 1973u + idx.y * 9277u + 1u),
+                             Hash1(idx.x * 26699u + idx.y * 8537u + 7u));
+    float2 urand = (FrameIndex < 0.0) ? baseRand : frac(baseRand + R2((uint)FrameIndex));
+    float3 H = SampleVndfH(N, V, roughness, urand);
+    float3 R = reflect(-V, H);
+    // Guard a sample that reflected below the surface (grazing VNDF tail) — fall back to the mirror about N.
+    if (dot(R, N) <= 0.0) R = reflect(-V, N);
 
     // Fresnel strength (matches Ssr.hlsl so the shared combine lerps consistently).
     float F0 = metallic >= 0.5 ? 0.6 : 0.04;
     float fres = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
     float grazeKeep = 1.0 - smoothstep(0.05, 0.45, roughness);
     fres = F0 + (fres - F0) * grazeKeep;
-    float roughFade = 1.0 - smoothstep(0.3, MAX_ROUGHNESS, roughness);
+    // B2: roughness no longer hard-fades to 0 at 0.6 — rough surfaces keep a (lower) reflection strength all the
+    // way to fully rough, where it blends with the IBL. Taper gently so very rough stays subtle, not absent.
+    float roughFade = 1.0 - smoothstep(0.5, 1.0, roughness) * 0.85;
     float strength = saturate(fres * Intensity) * roughFade;
     if (strength <= 0.001) return;
 

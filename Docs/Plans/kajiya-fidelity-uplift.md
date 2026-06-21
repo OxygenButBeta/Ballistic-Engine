@@ -110,4 +110,28 @@ Her ağır parça (A3/A4/B3) half-res trace + bilateral upsample default. Toplam
   ufuk taramasında görünür sample'larda near-field radyans (SceneColor) toplanır (kajiya fetch_lighting).
   Sample/Combine arası blend: yakın=SSGI, uzak=DDGI mesafeyle (smoothstep). Door-gated, realtime (half-
   res march mümkün). Bu en büyük görsel-gap parçası, kolay yol YOK.
-- (A4 implement ediliyor)
+- **A4 ✓** SSGI near-field complement. `1657bbda`. DdgiNearField.hlsl (radyans-taşıyan horizon march,
+  GTAO integralini reuse), current SceneColor okur (history YOK), Combine coverage-weighted additive
+  blend (near=SSGI far=DDGI). Door _NEARFIELD (default ON) + _INTENSITY/_RADIUS/_BLEND. Det A==B,
+  OFF byte-id, Bistro interior ON!=OFF (maxErr 0.13), açık CarDemo etkisiz (doğru). SceneColor
+  NonPixel→RT restore. 3slice×6step realtime. nearField 3. target.
+- **[bug-hunt #2 ✓]** A4 state/P0b denetlendi: crash/hang/race/leak YOK. 1 latent FSR bulgusu
+  (pre-existing, reflections'la paylaşık): near-field gather ctx.SceneColor yerine ctx.Target okumalı
+  (FSR'de SceneColor=empty fsrOutput). FİX `4be89c6b` (native byte-id, FSR-safe).
+- **A5 ✓** Cache-space sample validation (per-texel luma-ratio EMA boost). `e0505a4f`. kajiya
+  diffuse_validate kavramı cache-space'e. Staleness → alpha boost (lighting değişiminde hızlı yakınsama,
+  Lumen-runaway cure). Door _VALIDATE (default ON). Det inert (HistoryValid=0) → byte-id A4. Felsefe GÜÇLENDİ.
+- **A6 ATLANDI (gereksizlik kararı, kestirme DEĞİL):** L1 SH irradiance. Oct 8x8 atlas zaten HQ +
+  Chebyshev visibility çalışıyor; SH net upgrade değil, "daha ucuz olabilir" marjinal. Maksimum-kapsam
+  ama değer-katmayan → kullanıcının "değmeyenleri ele" yetkisiyle atlandı.
+- **A7 KISMİ/ATLANDI:** ircache leak-defense. normal-bias DDGI'de ZATEN var (NormalBias). rank+voting
+  ircache hash-grid'e özgü, DDGI probe-grid'e oturmaz (Chebyshev + occupancy-placement zaten leak-defense).
+  Net değer yok → atlandı.
+- **FAZ A KAPANDI.** GI fidelity: multi-scatter BRDF + blue-noise + spatial denoise + near-field SSGI +
+  cache validation. Hepsi byte-id default-korumalı, deterministik, realtime, tek-loop felsefe-güvenli.
+- **[geliştirme turu #1 ✓]** Agent quality review (FAZ A vs kajiya). P1 (near-field noise decorrelation),
+  P3 (radius 0.8→1.5m bridge), P4 (A5 hue-aware per-channel metric) YAPILDI `aed5c73d`. P5 (ShadeHit
+  Lambert KORUNDU — multi-scatter eklemek regresyon olurdu, agent doğruladı). P2/P6/P7 marjinal → ertelendi.
+  Perf doğrulandı: DDGI total 0.13ms GPU, gpuFrame 1.81ms (Bistro int 797K tris) → 60fps bol başlık.
+- **FAZ A TAM KAPANDI** (8 commit: A1-A5 + improve). GI fidelity büyük sıçrama, byte-id default, realtime.
+- (FAZ B sırada — reflections: VNDF + rough>0.6 kesimini kaldır + BRDF-footprint resolve + RTR reservoir)
