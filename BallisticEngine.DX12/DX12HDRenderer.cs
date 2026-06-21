@@ -718,6 +718,13 @@ public sealed class DX12HDRenderer : HDRenderer
             Console.WriteLine("[DX12] BARE-MINIMUM render: G-buffer + deferred (sun/punctual) + composite only. " +
                               "Re-enable per pass with BALLISTIC_DX12_{SHADOWS,SKY,IBL,SSAO,BLOOM,AP,VOLUMES}=1 / BALLISTIC_FX_VOLUMETRIC=1.");
         gpuDriven = new Dx12GpuDrivenRenderer(dev);
+        // Per-instance GPU cull (Unreal ISM/HISM equivalent): OPT-IN via BALLISTIC_DX12_INSTANCE_CULL=1. When OFF
+        // the existing upload-all instanced path runs unchanged (byte-identical — and currently inert since no
+        // scene authors instanced content / no engine code calls RenderInstancing). When ON, RenderInstancing
+        // routes through Dx12InstanceCuller: a compute pass frustum+Hi-Z culls each instance and compacts the
+        // survivors, then ONE DrawIndexedInstancedIndirect draws only them.
+        instanceCullOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_INSTANCE_CULL") == "1";
+        if (instanceCullOn) instanceCuller = new Dx12InstanceCuller(dev);
         // R5 — vis-buffer pass (built only when opt-in + HW mesh shaders; Available gates everything downstream).
         if (VisBufferOn && dev.HasMeshShaders)
         {
@@ -901,6 +908,12 @@ public sealed class DX12HDRenderer : HDRenderer
     }
 
     Dx12GpuDrivenRenderer gpuDriven;
+    Dx12InstanceCuller instanceCuller;   // per-instance GPU cull (BALLISTIC_DX12_INSTANCE_CULL=1); null when off
+    bool instanceCullOn;
+    // Pending instanced draws queued by RenderInstancing during a frame, flushed inside the geometry pass (where
+    // the command list + per-frame view/cull context live). RenderInstancing has no caller in the current engine,
+    // so this stays empty on every real scene → the instance-cull path is inert → byte-identical when off OR on.
+    readonly System.Collections.Generic.List<(Mesh mesh, Material mat, Matrix4x4[] transforms)> pendingInstanced = new();
     bool gpuDrivenOn;
     // R5 — visibility-buffer geometry path (opt-in, BALLISTIC_DX12_VISBUFFER=1 + HW mesh shaders). When active it
     // replaces the GPU-driven meshlet/ExecuteIndirect G-buffer fill for whole-mesh/split renderers: raster a vis-id
@@ -2284,6 +2297,16 @@ public sealed class DX12HDRenderer : HDRenderer
                     tris += gpuDriven.LastTris;
                 }
             }
+
+            // Per-instance GPU cull (opt-in): flush queued instanced draws (frustum + Hi-Z cull → compact →
+            // DrawIndexedInstancedIndirect). Inert when off or when nothing was queued (no caller → byte-identical).
+            // The optional self-test door synthesizes an instanced field from one whole-mesh renderer to exercise
+            // the GPU path end-to-end on real content (it REPLACES that renderer's normal draw — A/B only).
+            if (instanceCuller != null)
+            {
+                InstanceCullSelfTest(viewProj, viewProjUnjittered, view);
+                FlushInstanced(cl, viewProj, viewProjUnjittered, view);
+            }
         });
 
         // === R5 VISIBILITY-BUFFER GEOMETRY (opt-in). After the fat-G-buffer pass filled CPU-path geometry (skinned/
@@ -3252,10 +3275,74 @@ public sealed class DX12HDRenderer : HDRenderer
 
     public override void RenderInstancing(BatchGroup<IStaticMeshRenderer> batchGroup, RendererArgs args)
     {
+        // The batch-group instancing entry point is not driven by the current engine (no caller). Left as a
+        // no-op like before — the per-mesh overload below is the one the instance-cull path hooks.
     }
 
+    // Queue an instanced draw (one mesh + one material + N world transforms). When the per-instance GPU cull is
+    // ON (BALLISTIC_DX12_INSTANCE_CULL=1), the geometry pass flushes this through Dx12InstanceCuller (frustum +
+    // Hi-Z cull → compact → DrawIndexedInstancedIndirect). When OFF this still queues, but FlushInstanced only
+    // runs the culler when on — so with no caller the queue stays empty and the path is inert (byte-identical).
     public override void RenderInstancing(Mesh mesh, Material material, GLMatrix4[] transforms, RendererArgs args)
     {
+        if (mesh is null || material is null || transforms is null || transforms.Length == 0) return;
+        // GLMatrix4 is System.Numerics.Matrix4x4 in this backend (the alias) — clone the array so a caller reusing
+        // its buffer can't mutate our queued copy before the geometry pass flushes it.
+        var copy = (Matrix4x4[])transforms.Clone();
+        pendingInstanced.Add((mesh, material, copy));
+    }
+
+    // Flush queued instanced draws through the GPU per-instance culler inside the geometry pass. `cl` is the
+    // geometry command list; the view/cull context matches the whole-mesh GPU-driven cull exactly. Skips work
+    // (and clears the queue) when the cull is off or nothing was queued. Materials are resolved into the shared
+    // bindless table (gpuDriven.ResolveOrRegisterMaterialId) so shading is byte-identical to GBufferBindless.
+    void FlushInstanced(ID3D12GraphicsCommandList4 cl, Matrix4x4 viewProj, Matrix4x4 viewProjUnjittered,
+                        Matrix4x4 view)
+    {
+        if (instanceCuller is null || pendingInstanced.Count == 0) { pendingInstanced.Clear(); return; }
+        instanceCuller.BeginFrame();
+        instanceCuller.SetHizDims(gpuDriven.HizWidth, gpuDriven.HizHeight, gpuDriven.HizMipCount);
+        foreach (var (mesh, mat, transforms) in pendingInstanced)
+        {
+            if (mat.Transparent) continue;   // transparents can't be deferred-shaded (forward path)
+            int matId = gpuDriven.ResolveOrRegisterMaterialId(mat);
+            if (matId < 0) continue;
+            instanceCuller.RenderInstanced(cl, mesh, -1, matId, transforms, viewProj, frustumPlanes,
+                viewProjUnjittered, view, CameraNear, CameraFar, motionCb.Gpu, gpuDriven.MaterialsGpuAddress,
+                gpuDriven.HizBindlessIndex, gpuDriven.HizOn);
+        }
+        pendingInstanced.Clear();
+    }
+
+    bool instTestQueried;
+    Mesh instTestMesh; Material instTestMat;
+    // Self-test door (BALLISTIC_DX12_INSTANCE_CULL_TEST=1): there is no instanced content in the project, so to
+    // PROVE the GPU per-instance cull + indirect instanced draw actually renders, synthesize an instanced field
+    // from the first whole-mesh renderer's mesh+material and enqueue it. Pure A/B — only runs when the TEST door
+    // is set (default ON path leaves the queue empty → byte-identical). Spreads N instances on a grid; with all
+    // of them in front of the camera the cull keeps all → the grid of meshes appears (visual proof the path draws).
+    void InstanceCullSelfTest(Matrix4x4 viewProj, Matrix4x4 viewProjUnjittered, Matrix4x4 view)
+    {
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_INSTANCE_CULL_TEST") != "1") return;
+        if (!instTestQueried)
+        {
+            instTestQueried = true;
+            foreach (IStaticMeshRenderer r in RendererSet)
+            {
+                if (r is null || !r.IsActive || !r.IsRenderable || r.IsSkinned) continue;
+                Mesh m = r.SharedMesh; if (m is null || m.SubMeshes.Length == 0) continue;
+                Material mat = r.MaterialFor(0); if (mat is null || mat.Transparent) continue;
+                instTestMesh = m; instTestMat = mat; break;
+            }
+        }
+        if (instTestMesh is null) return;
+        const int grid = 4; const float spacing = 2.0f;
+        var xforms = new Matrix4x4[grid * grid];
+        int k = 0;
+        for (int z = 0; z < grid; z++)
+            for (int x = 0; x < grid; x++)
+                xforms[k++] = Matrix4x4.CreateTranslation((x - grid / 2f) * spacing, 0, (z - grid / 2f) * spacing);
+        pendingInstanced.Add((instTestMesh, instTestMat, xforms));
     }
 
     // --- Frustum culling (CPU, per submesh) ------------------------------------------------------------

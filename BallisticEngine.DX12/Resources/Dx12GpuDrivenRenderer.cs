@@ -31,6 +31,13 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     Dx12HiZ hiz;
     int hizBindlessIndex = -1;
     bool hizOnThisFrame;
+    // Exposed so the per-instance culler (Dx12InstanceCuller) can occlusion-cull against the SAME Hi-Z pyramid
+    // this frame built — its bindless slot, on-state, and pyramid dims. HizOn folds in the slot-valid check.
+    public int HizBindlessIndex => hizBindlessIndex;
+    public bool HizOn => hizOnThisFrame && hizBindlessIndex >= 0;
+    public int HizWidth => hiz?.Width ?? 0;
+    public int HizHeight => hiz?.Height ?? 0;
+    public int HizMipCount => hiz?.MipCount ?? 0;
     // GPU-driven G-buffer draw: DrawIndex root const(b0) + PerDraws SRV(t0) + GpuMaterials SRV(t1) + bindless.
     ID3D12RootSignature drawRootSig;
     ID3D12PipelineState drawPso;
