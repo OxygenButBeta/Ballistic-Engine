@@ -90,7 +90,39 @@
   kapalı → goldens byte-id. Live run temiz. DO-LATER: C5 (dilated velocity), C2 (perceptual space), C7 (sharpen+TPDF).
 - **[bug-hunt #4 sırada]** TAA C1/C4/C6 — sole-AA feedback loop, ghosting/instability/NaN denetimi.
 
-### FAZ C — kalan
+- **[bug-hunt #4 ✓]** TAA C1/C4/C6: 3 GERÇEK bug (F1 HIGH ghosting smear-trail, F2 chroma ghosting,
+  F3 highlight-crush). FİX `0fe48e22`: Gamma 2.4→1.6, motion-gated confidence, chroma sabit Gamma,
+  firefly 4× headroom + soft + pre-firefly confidence. Det byte-id.
+- **C7-dither ✓** TPDF output dither (kajiya post_combine). `e33a38c0`. ±1 LSB det dither, sky banding fix.
+  Det A==B, maxErr tam 1/255. (sharpen yarısı ertelendi.)
+- **C5 ✓** Dilated closest-depth velocity TAA. `63294696`. Hareketli silüet ghosting fix. Depth t3 bind.
+  Det byte-id (TAA off in det). Live temiz.
+- **[bug-hunt #5 sırada]** C5 depth-bind + dilation + C7 dither denetimi.
+
+- **[bug-hunt #5 ✓]** C5 depth-bind barrier-deriver'a declare edilmemişti (graph-barriers door'da wrong-
+  state). FİX `fec22f0a`. TPDF + dilation math/heap/convention temiz. Default byte-id, door-ON temiz.
+- **C2 (perceptual TAA accumulation) ERTELENDİ — gerekçeli, kestirme DEĞİL:** checkpoint review "en son,
+  marjinal getiri, sole-AA tüm-görüntü regresyon riski, HDR-sun NaN gotcha etkileşimi, door arkasında" dedi.
+  TAA bu oturumda 5× değişti + 3 ghosting bug çıktı; core blend space'i bir daha değiştirmenin door-ON yolu
+  headless (motion testi yok) düzgün DOĞRULANAMIYOR. Risk/getiri C2'yi haklı çıkarmıyor → bilinçli ertelendi.
+  (Kolay diye değil — doğru-doğrulanamadığı + sole-AA riski için.)
+- **C7 sharpen yarısı ERTELENDİ:** kozmetik tuning rabbit-hole; TPDF (asıl güvenli kazanç) yapıldı.
+
+## COMPLETENESS REVIEW (final) — TAM
+Agent completeness-critic taraması: yüksek-değerli kısıt-uyumlu HİÇBİR teknik kaçırılmadı. Tek follow-up adayı:
+**emissive-mesh NEE area lights GI hit'inde** (kajiya lighting/sample_lights.rgen + inc/lights/triangle.hlsl).
+Orta efor + DAR getiri (sadece emissive-yoğun içerik; test sahnelerinde sıfır etki) + yeni altyapı gerekir
+(per-frame emissive-triangle light list, motorda yok) + emissive-yoğun test sahnesi olmadığından doğrulanamaz.
+→ FOLLOW-UP olarak loglandı, bloklamıyor (A6/A7 ile aynı gerekçe). Notorious6 display transform = AgX zaten
+çözüyor (gap değil). DDGI ShadeHit zaten sun-shadow+punctual-shadow+emissive+multibounce yapıyor (plan'ın eski
+notu yanlıştı). DoF/MotionBlur/Sky zaten motor'da eşdeğer/daha iyi.
+
+## DURUM ÖZETİ — FAZ A/B/C SUBSTANTIVE TAMAM
+16 feature/fix commit (d39d7c8b→fec22f0a). 5 bug-hunt turu + 1 checkpoint + 1 geliştirme turu = 8 gerçek
+bug yakalandı+düzeltildi. Perf: gpuFrame 0.85ms (Bistro ext 2.8M tris, her şey açık) → 60fps bol başlık.
+Hepsi: byte-id default-korumalı, deterministik, realtime, tek-loop GI felsefe-güvenli.
+
+### FAZ C — kalan (DO-LATER, ertelendi)
 - **C1. soft_color_clamp → mevcut TAA clip** (drop-in, 5 satır)
 - **C2. Perceptual (sqrt-luma/crunch) accumulation space TAA**
 - **C3. Pre-exposure delta history compensation** (histogram exposure var → pump fix)
