@@ -51,6 +51,14 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     Dx12DescriptorHeap sampleSrv;   // per pass: depth SRV + normal SRV + Indirect UAV (3)
     Dx12OffscreenTarget indirect;   // full-res RGBA16F incoming irradiance E
 
+    // ---- A3: spatial denoise (compute, between Sample and Combine) ----
+    ID3D12RootSignature denoiseRootSig;
+    ID3D12PipelineState denoisePso;
+    Dx12FrameCb<DenoiseConstants> denoiseCb;
+    Dx12DescriptorHeap denoiseSrv;  // per pass: Indirect SRV + depth SRV + normal SRV + SSAO SRV + Filtered UAV (5)
+    Dx12OffscreenTarget indirectFiltered; // full-res RGBA16F denoised E (Combine reads this when denoise ran)
+    bool denoisedThisFrame;
+
     // ---- combine (additive fullscreen) ----
     ID3D12RootSignature combineRootSig;
     ID3D12PipelineState combinePso, combineDebugPso;
@@ -81,6 +89,13 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
 
     [StructLayout(LayoutKind.Sequential)]
     struct CombineConstants { public float AoStrength; public float Intensity; public float Pad0; public float Pad1; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct DenoiseConstants
+    {
+        public uint W, H; public float UseSsao; public float FrameIndex;   // FrameIndex<0 = deterministic (fixed spiral)
+        public float Strength; public float Pad0, Pad1, Pad2;
+    }
 
     // ---- debug probe overlay (BALLISTIC_DX12_DDGI_DEBUG_PROBES=1) ----
     ID3D12RootSignature debugRootSig;
@@ -194,6 +209,12 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         indirect?.Dispose();
         indirect = new Dx12OffscreenTarget(dev, width, height, colorFormat: Dx12OffscreenTarget.HdrFormat,
             colorReadable: true, allowUav: true);
+        // A3: spatial-denoise output (full-res RGBA16F). Combine reads THIS when the denoiser ran; otherwise it
+        // reads `indirect` directly (door off → byte-identical). Pass-owned, not pooled (it's a per-pass scratch
+        // but lives for the frame between Denoise and Combine, and persists across frames like `indirect`).
+        indirectFiltered?.Dispose();
+        indirectFiltered = new Dx12OffscreenTarget(dev, width, height, colorFormat: Dx12OffscreenTarget.HdrFormat,
+            colorReadable: true, allowUav: true);
     }
 
     public unsafe void Record(Dx12FrameContext ctx)
@@ -226,6 +247,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
 
         Relight(ctx, sceneAS, rtGeo);
         Sample(ctx);
+        Denoise(ctx);
         Combine(ctx);
         // Probe-sphere debug overlay: GiVolume.debugProbes toggle OR the env door. BALLISTIC_DX12_DDGI_DEBUG_PROBES=0
         // FORCE-disables it (overrides the volume) so a headless capture can see the real render even when the scene's
@@ -437,6 +459,59 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         });
     }
 
+    // ---- A3: spatial denoise (variance/validity-driven adaptive à-trous; spatial-only, no temporal feedback) ----
+    unsafe void Denoise(Dx12FrameContext ctx)
+    {
+        denoisedThisFrame = false;
+        // Door: BALLISTIC_DX12_DDGI_DENOISE (default ON; =0 = skip → Combine reads `indirect` directly, byte-id to
+        // pre-A3). Strength scales the max blur radius; 0 also disables. Deterministic capture KEEPS the denoise on
+        // (it's spatial, fully deterministic) but with a fixed spiral (FrameIndex<0) so goldens stay byte-stable.
+        string env = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_DENOISE");
+        if (env == "0") return;
+        float strength = EnvF("BALLISTIC_DX12_DDGI_DENOISE_STRENGTH", 1f);
+        if (strength <= 0f) return;
+
+        bool det = ctx.DeterministicCapture;
+        bool useSsao = ctx.Doors.Ssao && ctx.PostFX.SSAOEnabled;
+        var gbuffer = ctx.GBuffer;
+
+        denoiseCb.Write(new DenoiseConstants
+        {
+            W = (uint)indirect.Width, H = (uint)indirect.Height,
+            UseSsao = useSsao ? 1f : 0f,
+            FrameIndex = det ? -1f : (frameCounter & 1023),
+            Strength = strength,
+        });
+
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        // table order: t0 Indirect SRV, t1 depth SRV, t2 normal SRV, t3 SSAO SRV, u0 Filtered UAV.
+        indirect.ColorToShaderResource();
+        dev.Device.CopyDescriptorsSimple(1, denoiseSrv.Cpu(0), indirect.ColorSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, denoiseSrv.Cpu(1), gbuffer.DepthSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, denoiseSrv.Cpu(2), gbuffer.ColorSrvCpu(1), heapType);     // G1 normal
+        // SSAO: bind the real AO target when it ran this frame, else bind the normal SRV as a harmless stand-in
+        // (UseSsao=0 makes the shader ignore it). AoResult is a valid SRV handle either way.
+        dev.Device.CopyDescriptorsSimple(1, denoiseSrv.Cpu(3),
+            useSsao ? ctx.AoResult : gbuffer.ColorSrvCpu(1), heapType);
+        dev.Device.CreateUnorderedAccessView(indirectFiltered.RenderTarget, null,
+            new UnorderedAccessViewDescription { ViewDimension = UnorderedAccessViewDimension.Texture2D, Format = Dx12OffscreenTarget.HdrFormat },
+            denoiseSrv.Cpu(4));
+
+        gbuffer.DepthToNonPixelShaderResource();
+        indirectFiltered.ColorToUnorderedAccess();
+
+        dev.ExecuteSync(cl =>
+        {
+            cl.SetDescriptorHeaps(denoiseSrv.Heap);
+            cl.SetComputeRootSignature(denoiseRootSig);
+            cl.SetPipelineState(denoisePso);
+            cl.SetComputeRootConstantBufferView(0, denoiseCb.Gpu);
+            cl.SetComputeRootDescriptorTable(1, denoiseSrv.Gpu(0));
+            cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
+        });
+        denoisedThisFrame = true;
+    }
+
     // ---- Pass 3: combine (additive) ----
     unsafe void Combine(Dx12FrameContext ctx)
     {
@@ -454,10 +529,12 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             Intensity = 1f,
         });
 
-        indirect.ColorToShaderResource();
+        // A3: read the denoised indirect when the spatial filter ran this frame; otherwise the raw Sample output.
+        var src = denoisedThisFrame ? indirectFiltered : indirect;
+        src.ColorToShaderResource();
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(0), indirect.ColorSrvCpu, heapType);     // t0 finished indirect (E*albedo/π)
+        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(0), src.ColorSrvCpu, heapType);     // t0 finished indirect (E*albedo/π)
 
         target.RenderColorOnly(cl =>
         {
@@ -475,6 +552,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     {
         BuildRelightPipeline();
         BuildSamplePipeline();
+        BuildDenoisePipeline();
         BuildCombinePipeline();
         BuildDebugPipeline();
     }
@@ -530,6 +608,27 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         sampleCb = new Dx12FrameCb<SampleConstants>(dev);
         sampleSrv = new Dx12DescriptorHeap(dev, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
             4, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+    }
+
+    unsafe void BuildDenoisePipeline()
+    {
+        var cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        // One table: t0 Indirect, t1 depth, t2 normal, t3 SSAO (4 contiguous SRVs), then u0 Filtered (UAV at offset 4).
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 4, baseShaderRegister: 0,
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 0);
+        var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0,
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 4);
+        var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange), ShaderVisibility.All);
+        var clamp = StaticClamp(0);
+        denoiseRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv0, table }, new[] { clamp })));
+
+        string hlsl = EmbeddedShaderSource.ReadHlsl("DdgiSpatialDenoise.hlsl");
+        byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSMain", "DdgiSpatialDenoise.hlsl");
+        denoisePso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription { RootSignature = denoiseRootSig, ComputeShader = cs });
+        denoiseCb = new Dx12FrameCb<DenoiseConstants>(dev);
+        denoiseSrv = new Dx12DescriptorHeap(dev, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
+            5, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
     unsafe void BuildCombinePipeline()
@@ -606,10 +705,10 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     {
         grid.Dispose();
         placementQuery?.Dispose();
-        indirect?.Dispose();
-        relightCb?.Dispose(); sampleCb?.Dispose(); combineCb?.Dispose(); debugCb?.Dispose();
-        sampleSrv?.Dispose(); combineSrv?.Dispose();
-        relightRootSig?.Dispose(); sampleRootSig?.Dispose(); combineRootSig?.Dispose(); debugRootSig?.Dispose();
-        relightPso?.Dispose(); samplePso?.Dispose(); combinePso?.Dispose(); combineDebugPso?.Dispose(); debugPso?.Dispose();
+        indirect?.Dispose(); indirectFiltered?.Dispose();
+        relightCb?.Dispose(); sampleCb?.Dispose(); denoiseCb?.Dispose(); combineCb?.Dispose(); debugCb?.Dispose();
+        sampleSrv?.Dispose(); denoiseSrv?.Dispose(); combineSrv?.Dispose();
+        relightRootSig?.Dispose(); sampleRootSig?.Dispose(); denoiseRootSig?.Dispose(); combineRootSig?.Dispose(); debugRootSig?.Dispose();
+        relightPso?.Dispose(); samplePso?.Dispose(); denoisePso?.Dispose(); combinePso?.Dispose(); combineDebugPso?.Dispose(); debugPso?.Dispose();
     }
 }

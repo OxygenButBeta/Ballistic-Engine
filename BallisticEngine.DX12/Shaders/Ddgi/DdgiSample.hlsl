@@ -174,5 +174,21 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     // fixed the dead GI: the combine PS was binding G-buffer albedo while its real layout was RENDER_TARGET, so it
     // read 0 and E*albedo=0. Compute reads the G-buffer cleanly (NonPixel SRV).
     float3 albedo = Albedo.Load(int3(px, 0)).rgb;
-    Indirect[px] = float4(E * Intensity * albedo * (1.0 / DDGI_PI), 1.0);
+    // A3: per-pixel VALIDITY for the spatial denoiser, written into alpha. 1 = fully confident (well-bracketed,
+    // visibility-weighted gather succeeded) → the denoiser skips it. <1 = the gather had to fall back (Chebyshev
+    // rejected most/all bracketing probes — disocclusion seams, sub-cell geometry, corners) → exactly the pixels
+    // that carry probe-transition banding / seam noise, so the denoiser filters them with a wider kernel. Derived
+    // from which gather tier resolved + the visibility-weighted confidence (wsum normalized by the no-vis sum).
+    float validity;
+    if (wsum > 1e-3) {
+        // Confidence = how much of the unoccluded gather survived the visibility test. ~1 when no probe was
+        // rejected (open surface), lower near walls where Chebyshev culled leak-probes (the seam-prone pixels).
+        float conf = saturate(wsum / max(wsumNoVis, 1e-4));
+        validity = lerp(0.6, 1.0, conf);                 // even a fully-confident vis gather keeps a light filter floor
+    } else if (wsumNoVis > 1e-4) {
+        validity = 0.3;                                  // fell back past Chebyshev: filter moderately
+    } else {
+        validity = 0.0;                                  // all-dead bracket (raw fallback): filter hard
+    }
+    Indirect[px] = float4(E * Intensity * albedo * (1.0 / DDGI_PI), validity);
 }
