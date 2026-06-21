@@ -112,10 +112,11 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         uint3 c = (uint3)clamp(baseC + off, int3(0, 0, 0), int3(CountX - 1, CountY - 1, CountZ - 1));
         uint pidxC = ProbeIndex(c);
 
-        // Trilinear weight.
-        float3 tw = float3(off.x == 0 ? 1.0 - frac.x : frac.x,
-                           off.y == 0 ? 1.0 - frac.y : frac.y,
-                           off.z == 0 ? 1.0 - frac.z : frac.z);
+        // Trilinear weight — RTXGI form with a max(0.001) floor so no axis collapses to a hard 0 (a 0 trilinear
+        // is the seam that shows up as the stair-stepped corner banding).
+        float3 tw = max(0.001, float3(off.x == 0 ? 1.0 - frac.x : frac.x,
+                                      off.y == 0 ? 1.0 - frac.y : frac.y,
+                                      off.z == 0 ? 1.0 - frac.z : frac.z));
         float trilinear = tw.x * tw.y * tw.z;
 
         // Occupancy-aware placement: a probe relocated into free space contributes from its MOVED position
@@ -125,22 +126,27 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         float3 probeOffset = 0.0.xxx;
         if (UsePlacement > 0.5) { float4 st = ProbeState[pidxC]; probeOffset = st.xyz; probeActive = st.w; }
 
-        // Backface weight: a probe behind the surface (its direction to P opposes N) contributes less.
+        // Wrap-shading backface weight (RTXGI): a probe behind the surface contributes less, but the +0.2 floor
+        // keeps it nonzero so the transition is smooth (a hard 0 here is half the corner zigzag).
         float3 probePos = GridOrigin + (float3)c * ProbeSpacing + probeOffset;
         float3 dirToProbe = normalize(probePos - P);
-        float backWeight = saturate(dot(dirToProbe, N) * 0.5 + 0.5);
-        backWeight = backWeight * backWeight + 0.05;
+        float wrap = (dot(dirToProbe, N) + 1.0) * 0.5;
+        float backWeight = wrap * wrap + 0.2;
 
-        // Chebyshev visibility (D3): reject probes that can't actually see the surface (occluded by a wall) →
-        // the leak fix. The moments were measured probe→world, so query in the probe→surface direction.
+        // Chebyshev visibility (D3): reject probes occluded from the surface by a wall (the leak fix), but floor at
+        // 0.05 (RTXGI) so an occluded probe never drops to a hard 0 → smooth instead of a stair-stepped cutoff.
         float vis = 1.0;
         if (UseVisibility > 0.5) {
             float distPS = distance(probePos, P);
             float bias = 0.5 * length(ProbeSpacing);   // half a cell: tolerates probes sitting near surfaces
-            vis = ChebyshevWeight(pidxC, normalize(P - probePos), distPS, bias);
+            vis = max(0.05, ChebyshevWeight(pidxC, normalize(P - probePos), distPS, bias));
         }
 
         float w = trilinear * backWeight * vis * probeActive;
+        // Log-perceptual crush (RTXGI): compress very small weights so a near-rejected probe fades smoothly to
+        // black instead of popping — kills the residual banding the floors above don't catch.
+        const float crush = 0.2;
+        if (w < crush) w *= (w * w) * (1.0 / (crush * crush));
         float3 probeE = SampleProbeOct(pidxC, N);
         sum += probeE * w;
         wsum += w;
