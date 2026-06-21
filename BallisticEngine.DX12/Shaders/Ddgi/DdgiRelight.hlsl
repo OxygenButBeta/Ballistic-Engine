@@ -33,7 +33,7 @@ struct GpuLight { float4 PosRange; float4 Color; float4 DirCosOuter; float4 Extr
 StructuredBuffer<RtInstance>  RtInstances : register(t2);
 StructuredBuffer<GpuMaterial> GpuMaterials: register(t3);
 StructuredBuffer<GpuLight>    Lights      : register(t4);
-TextureCube SkyIrradiance : register(t5);
+TextureCube SkyRadiance : register(t5);   // env RADIANCE cube (per-ray sky sample; cosine-integrated by the probe)
 
 cbuffer DdgiRelightConstants : register(b0) {
     float3 GridOrigin;   float RayCount;
@@ -206,7 +206,7 @@ void CSMain(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
         rad = ShadeHit(q.CommittedInstanceID(), q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), hitW);
     } else {
         dist = VisMaxDist;
-        rad = (UseSky > 0.5) ? SkyIrradiance.SampleLevel(LinearClamp, d, 0).rgb * SkyIntensity : 0.0.xxx;
+        rad = (UseSky > 0.5) ? SkyRadiance.SampleLevel(LinearClamp, d, 0).rgb * SkyIntensity : 0.0.xxx;
     }
     gRad[gi] = rad; gDir[gi] = d; gDist[gi] = dist;
     GroupMemoryBarrierWithGroupSync();

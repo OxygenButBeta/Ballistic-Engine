@@ -255,7 +255,12 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             SunDir = sunDir, SunBias = 0.05f,
             SunColor = ctx.LightColor, LightCount = ctx.ClusteredLights.LightCount,
             EmaAlpha = ema, HistoryValid = (grid.HistoryValid && !det) ? 1f : 0f,
-            Intensity = intensity, FrameJitter = det ? -1f : (frameCounter % 64),
+            // FrameJitter = -1 → the relight uses a FIXED per-probe ray rotation every frame. A rotating jitter
+            // (frameCounter%64) re-aimed all 64 rays every frame, so on a STATIC scene each probe's integral kept
+            // jumping to a different sparse estimate and the EMA never settled → the visible flicker (probe colors
+            // changing while nothing moves). With a fixed ray set the integral is identical every frame, so the EMA
+            // converges and holds. Deterministic capture already used -1; now the live path does too.
+            Intensity = intensity, FrameJitter = -1f,
             MultiBounce = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_NOBOUNCE") == "1" ? 0f
                           : (ctx.PostFX.DdgiMultiBounce ? 1f : 0f),
             BounceBoost = EnvF("BALLISTIC_DX12_DDGI_BOUNCE_BOOST", 1f),
@@ -263,7 +268,11 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Dx12DescriptorHeap bindless = Dx12Backend.BindlessHeap;
-        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RelightSkyTableBase + 0), ctx.Ibl.IrradianceSrv, heapType);
+        // Bind the RADIANCE env cube (NOT the irradiance cube): each probe ray samples sky RADIANCE in its
+        // direction, and the per-probe cosine integration over the 64 rays produces the irradiance. Sampling the
+        // already-cosine-convolved irradiance cube per ray and integrating AGAIN double-convolves it → ~π× energy
+        // loss → the GI sky ambient came out far too dark (the "GI darkens instead of lights" report).
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RelightSkyTableBase + 0), ctx.Ibl.EnvSrv, heapType);
 
         var irradW = grid.IrradianceWrite;
         var irradR = grid.IrradianceRead;
