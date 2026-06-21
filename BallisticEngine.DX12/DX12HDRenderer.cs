@@ -2416,6 +2416,8 @@ public sealed class DX12HDRenderer : HDRenderer
             // contents change per frame, so binding it at ctx build is always correct.
             DeterministicCapture = DeterministicCapture,
             AoResult = gtaoPass.ResultSrvCpu,
+            AoToNonPixelShaderResource = () => gtaoPass.AoTarget.ColorToNonPixelShaderResource(),
+            SkyOcclusionActive = rtaoPass.WillRun(doors, PostFX, dxr, dev),
             TaaActive = taaOn, FsrActive = fsrActive, // chunk 7: TaaPass runs in native path; FsrPass when FsrActive
             Fsr = fsr, FsrOutput = fsrOutput, MotionPrevValid = motionPrevValid, // chunk 7: FsrPass dispatch inputs
             ActiveUpscaler = activeUpscaler, Dlss = dlss, Xess = xess, // generic upscale pass picks DLSS/XeSS/FSR

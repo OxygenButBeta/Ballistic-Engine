@@ -55,6 +55,15 @@ public sealed class Dx12FrameContext {
     // it and multiplies it into the IBL ambient term only (the physically-correct layer). A stable descriptor
     // handle (gtaoA.ColorSrvCpu) — only its contents change per frame, so binding it at ctx build is correct.
     public CpuDescriptorHandle AoResult { get; init; }
+    // Transition the GTAO target to NON_PIXEL_SHADER_RESOURCE so a COMPUTE pass (DDGI spatial denoise) can read
+    // AoResult legally — the GTAO pass leaves it in the pixel-only state for the deferred PIXEL read. Null when no
+    // GTAO this frame. Wired by the renderer to gtaoPass.AoTarget.ColorToNonPixelShaderResource.
+    public Action AoToNonPixelShaderResource { get; init; }
+    // True when the RT sky-occlusion pass ran this frame and overwrote AoResult's contents with sky-visibility-
+    // gated AO (not raw GTAO). The DDGI combine reads this to decide whether to bite the GI indirect with AO:
+    // raw GTAO is short-range and smudges the GI under camera motion (why DdgiAoStrength defaults to 0), but the
+    // sky-vis-gated + temporally-denoised RTAO IS the openness signal a sealed interior needs to stop glowing.
+    public bool SkyOcclusionActive { get; init; }
     // The resolved upscale/AA branch. TaaActive == PostFX.TaaEnabled && !FsrActive && !DeterministicCapture &&
     // !Minimal; FsrActive == the FSR mode is on. TAA + FSR are mutually exclusive. TaaPass runs in the native
     // path (Enabled=!FsrActive); even when TaaActive is false it resets the (pass-owned) history-valid flag.

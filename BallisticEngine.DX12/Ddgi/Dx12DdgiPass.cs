@@ -485,12 +485,18 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         // table order: t0 Indirect SRV, t1 depth SRV, t2 normal SRV, t3 SSAO SRV, u0 Filtered UAV.
-        indirect.ColorToShaderResource();
+        // COMPUTE read → the SRV must be in NON_PIXEL_SHADER_RESOURCE, not the pixel-only state (a compute SRV
+        // read of a pixel-state resource is a GPU hazard / debug-layer error — the same heap/state class as the
+        // known bindless-hang gotcha). `indirect` arrives in UnorderedAccess from Sample; move it to non-pixel.
+        indirect.ColorToNonPixelShaderResource();
         dev.Device.CopyDescriptorsSimple(1, denoiseSrv.Cpu(0), indirect.ColorSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, denoiseSrv.Cpu(1), gbuffer.DepthSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, denoiseSrv.Cpu(2), gbuffer.ColorSrvCpu(1), heapType);     // G1 normal
         // SSAO: bind the real AO target when it ran this frame, else bind the normal SRV as a harmless stand-in
-        // (UseSsao=0 makes the shader ignore it). AoResult is a valid SRV handle either way.
+        // (UseSsao=0 makes the shader ignore it). AoResult is a valid SRV handle either way. The GTAO target is
+        // left in the pixel-only state for the deferred pixel read, so a COMPUTE read here needs it moved to
+        // NON_PIXEL_SHADER_RESOURCE first (same heap/state hazard class as Finding 1).
+        if (useSsao) ctx.AoToNonPixelShaderResource?.Invoke();
         dev.Device.CopyDescriptorsSimple(1, denoiseSrv.Cpu(3),
             useSsao ? ctx.AoResult : gbuffer.ColorSrvCpu(1), heapType);
         dev.Device.CreateUnorderedAccessView(indirectFiltered.RenderTarget, null,
