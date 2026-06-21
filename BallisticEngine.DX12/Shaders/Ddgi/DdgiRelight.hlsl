@@ -167,9 +167,15 @@ float3 ShadeHit(uint instId, uint prim, float2 bary, float3 Pw) {
     // grid) × albedo. The cache feeds itself → it converges to full multi-bounce GI over a few frames with NO
     // extra rays. HistoryValid gates it (the first frame has no usable prev cache). BounceBoost (≥1) lets dark
     // multi-bounce-only regions fill faster; the firefly clamp downstream keeps it from running away.
+    // ENERGY-CONSISTENT multi-bounce: the value we GATHER (and store) is incident irradiance E; the radiance a
+    // Lambert surface re-emits is albedo*E/π — the SAME /π the combine applies. Without the /π each bounce
+    // injected π× too much energy, and since the cache feeds itself via the EMA that compounded every frame into
+    // a runaway glow (the green flood). albedo is already ≤0.95 (energy-conserving), so albedo*E/π < E and the
+    // feedback series converges. BounceBoost stays ≥1 for authoring but is NOT applied to the feedback term
+    // anymore (a >1 gain on a self-feeding loop is exactly what diverges).
     float3 bounce = 0.0.xxx;
     if (MultiBounce > 0.5 && HistoryValid > 0.5)
-        bounce = albedo * GatherPrevIrradiance(Pw, Nw) * max(BounceBoost, 1.0);
+        bounce = albedo * GatherPrevIrradiance(Pw, Nw) * (1.0 / 3.14159265359);
 
     return albedo * (sun + punctual) + emissive + bounce;
 }
@@ -221,7 +227,12 @@ void CSMain(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
 
         uint idx = probe * OctTexels + texel;
         float3 prev = PrevIrrad[idx].rgb;
-        Irradiance[idx] = float4(Sanitize(lerp(prev, E, alpha)), 1.0);
+        float3 blended = lerp(prev, E, alpha);
+        // Firefly / runaway guard: cap the stored irradiance. A diffuse cache should never exceed the brightest
+        // direct light by much; without a cap a feedback error (or a fp16 Inf sun texel) compounds through the EMA
+        // into a screen-eating glow. Generous ceiling so real bright skylight survives, but finite.
+        blended = min(blended, 32.0.xxx);
+        Irradiance[idx] = float4(Sanitize(blended), 1.0);
     }
 
     // (b) VISIBILITY MOMENTS (D3): VisTexels (256) > RAYS (64), so each thread strides over several texels.
