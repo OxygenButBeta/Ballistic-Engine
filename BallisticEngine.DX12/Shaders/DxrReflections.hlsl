@@ -199,18 +199,6 @@ void RayGen() {
     float3 V = normalize(CameraPos - worldPos);
     float NdotV = max(dot(N, V), 0.0);
 
-    // B1: VNDF-sampled reflection ray. A near-mirror surface (roughness→0) collapses to reflect(-V,N) (the VNDF
-    // half-vector → N), while a rough surface draws a ray from the GGX visible-normal lobe — the correct glossy
-    // cone. Per-pixel blue-noise (R2) urand, advanced per frame in the live path so the temporal/spatial resolve
-    // integrates the lobe; deterministic capture uses a FIXED per-pixel offset (byte-stable, no frame advance).
-    float2 baseRand = float2(Hash1(idx.x * 1973u + idx.y * 9277u + 1u),
-                             Hash1(idx.x * 26699u + idx.y * 8537u + 7u));
-    float2 urand = (FrameIndex < 0.0) ? baseRand : frac(baseRand + R2((uint)FrameIndex));
-    float3 H = SampleVndfH(N, V, roughness, urand);
-    float3 R = reflect(-V, H);
-    // Guard a sample that reflected below the surface (grazing VNDF tail) — fall back to the mirror about N.
-    if (dot(R, N) <= 0.0) R = reflect(-V, N);
-
     // Fresnel strength (matches Ssr.hlsl so the shared combine lerps consistently).
     float F0 = metallic >= 0.5 ? 0.6 : 0.04;
     float fres = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
@@ -222,17 +210,42 @@ void RayGen() {
     float strength = saturate(fres * Intensity) * roughFade;
     if (strength <= 0.001) return;
 
-    ReflPayload p;
-    p.Color = 0.0.xxx;
-    p.Roughness = roughness;
-    RayDesc ray;
-    ray.Origin = worldPos + N * NormalBias;
-    ray.Direction = R;
-    ray.TMin = 0.02;
-    ray.TMax = 1e4;
-    TraceRay(Scene, RAY_FLAG_FORCE_OPAQUE, 0xFF, 0, 1, 0, ray, p);
+    // B1: VNDF-sampled reflection ray(s). A near-mirror surface (roughness→0) collapses to reflect(-V,N), while a
+    // rough surface draws rays from the GGX visible-normal lobe — the correct glossy cone. The bug-hunt flagged
+    // that a SINGLE VNDF ray over a wide cone is noisy under camera motion (the temporal denoise hard-disables on
+    // motion), so MULTI-SAMPLE the rough band: 1 ray for near-mirror, up to SPP rays for fully rough, each with a
+    // decorrelated urand (per-sample R2 stride), averaged. This trades a few rays on the (rare, small-area) rough-
+    // reflective pixels for clean glossy reflections — the single-ray sparkle B2 would otherwise introduce.
+    // Per-pixel blue-noise base; live path advances by the canonical frame counter so the temporal/spatial resolve
+    // still integrates across frames; deterministic capture uses a FIXED per-pixel offset (byte-stable).
+    float2 baseRand = float2(Hash1(idx.x * 1973u + idx.y * 9277u + 1u),
+                             Hash1(idx.x * 26699u + idx.y * 8537u + 7u));
+    float2 frameRand = (FrameIndex < 0.0) ? 0.0.xx : R2((uint)FrameIndex);
+    // Sample count scales with roughness: smooth → 1 (mirror, no benefit from more), rough → SPP.
+    const uint SPP_MAX = 4u;
+    uint spp = (uint)clamp(1.0 + smoothstep(0.15, 0.8, roughness) * (float)(SPP_MAX - 1u) + 0.5, 1.0, (float)SPP_MAX);
 
-    Output[idx] = float4(Sanitize(p.Color), strength);
+    float3 colSum = 0.0.xxx; float wSum = 0.0;
+    [loop] for (uint si = 0u; si < SPP_MAX; ++si) {
+        if (si >= spp) break;
+        float2 urand = frac(baseRand + frameRand + R2(si * 977u + 13u));   // per-sample decorrelated
+        float3 H = SampleVndfH(N, V, roughness, urand);
+        float3 R = reflect(-V, H);
+        if (dot(R, N) <= 0.0) R = reflect(-V, N);   // grazing VNDF tail → mirror about N
+
+        ReflPayload p;
+        p.Color = 0.0.xxx;
+        p.Roughness = roughness;
+        RayDesc ray;
+        ray.Origin = worldPos + N * NormalBias;
+        ray.Direction = R;
+        ray.TMin = 0.02;
+        ray.TMax = 1e4;
+        TraceRay(Scene, RAY_FLAG_FORCE_OPAQUE, 0xFF, 0, 1, 0, ray, p);
+        colSum += Sanitize(p.Color); wSum += 1.0;
+    }
+    float3 col = (wSum > 0.0) ? colSum / wSum : 0.0.xxx;
+    Output[idx] = float4(col, strength);
 }
 
 [shader("miss")]

@@ -123,7 +123,6 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     // combine), an intra-frame multi-write that Dx12FrameCb's per-FRAME slotting does not model. Built lazily in
     // EnsureRtReflections (DXR may be unavailable / RT reflections never requested), so these allocate there.
     Dx12FrameCb<RtReflConstants> rtReflCb;
-    int rtVndfFrame;   // B1: VNDF temporal jitter counter (live path only; det uses -1)
     Dx12FrameCb<RtGiSun> rtReflSunCb;
     Dx12FrameCb<RtReflGridConstants> rtReflGridCb;
     bool rtReflBuilt;
@@ -392,9 +391,10 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         bool useCards = ctx.GiActiveThisFrame && ctx.DdgiGrid is { Valid: true } && ctx.PostFX.DdgiReflections
                         && ReflCardsAllowed;
         // B1: VNDF temporal jitter index. Deterministic capture uses -1 (fixed per-pixel VNDF offset → byte-stable
-        // goldens); the live path advances a frame counter so the per-pixel rough-reflection lobe is integrated by
-        // the existing temporal/spatial resolve. Wraps at 1024 (R2 sequence is periodic-friendly).
-        float reflFrameIndex = ctx.DeterministicCapture ? -1f : (rtVndfFrame++ & 1023);
+        // goldens); the live path uses the canonical per-frame counter (ctx.FrameCounter, already 0 under det and
+        // shared by GTAO/RTAO/sky-occlusion) so the per-pixel rough-reflection lobe is integrated across frames by
+        // the temporal/spatial resolve. Wraps at 1024 (R2 sequence is periodic-friendly).
+        float reflFrameIndex = ctx.DeterministicCapture ? -1f : (ctx.FrameCounter & 1023);
         rtReflCb.Write(new RtReflConstants {
             InvViewProj = Matrix4x4.Transpose(invVP), CameraPos = camPos, Intensity = ForcedIntensity(ctx),
             PrefilterMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f, NormalBias = 0.05f,
