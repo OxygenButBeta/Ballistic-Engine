@@ -113,7 +113,16 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     public static bool WouldRun(Dx12FrameContext ctx) =>
         !ctx.Doors.Minimal && Armed(ctx) && ctx.Dev.HasHardwareRayTracing && ctx.Dxr?.SceneAS != null;
 
-    public bool Enabled(Dx12FrameContext ctx) => WouldRun(ctx);
+    public bool Enabled(Dx12FrameContext ctx)
+    {
+        bool run = WouldRun(ctx);
+        // When GI is inactive the graph skips Record entirely, so the probe cache would freeze at its last
+        // (possibly stale/over-bright) state and snap back the instant GI is re-enabled. Invalidate the history
+        // here (Enabled is called every frame by the graph) so a re-enable rebuilds the cache clean — full
+        // replace, no EMA over stale data. Cheap flag; no-op while GI stays on. No dependency on the orchestrator.
+        if (!run) grid.ResetHistory();
+        return run;
+    }
 
     int gridX, gridY, gridZ;
     // Resolve the probe grid resolution: the GI volume (PostFX) drives it; BALLISTIC_DX12_DDGI_GRID="XxYxZ"
@@ -174,7 +183,8 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         Relight(ctx, sceneAS, rtGeo);
         Sample(ctx);
         Combine(ctx);
-        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_DEBUG_PROBES") == "1")
+        // Probe-sphere debug overlay: GiVolume.debugProbes toggle OR the env door.
+        if (ctx.PostFX.DdgiDebugProbes || Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_DEBUG_PROBES") == "1")
             DrawProbes(ctx);
     }
 
@@ -341,7 +351,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     unsafe void Combine(Dx12FrameContext ctx)
     {
         var target = ctx.SceneColor;
-        bool debug = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_DEBUG") == "1";
+        bool debug = ctx.PostFX.DdgiDebugRawIndirect || Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_DEBUG") == "1";
 
         combineCb.Write(new CombineConstants
         {

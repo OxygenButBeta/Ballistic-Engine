@@ -61,4 +61,12 @@ public sealed class GiVolume : VolumeComponent {
     [Tooltip("How much the AmbientOcclusion volume's GTAO darkens the GI's contact shading. DEFAULT 0: GTAO is " +
              "screen-space (ghosting under motion) and the RT trace already carries macro occlusion. 0 = none, 1 = full.")]
     public readonly ClampedFloatParameter aoStrength = new(0f, 0f, 1f);
+
+    [Tooltip("DEBUG: draw every probe as a world-space sphere tinted by its stored irradiance, depth-tested against " +
+             "the scene. Lets you SEE the probe grid + what each probe sampled. Off for normal rendering.")]
+    public readonly BoolParameter debugProbes = new(false);
+
+    [Tooltip("DEBUG: replace the scene with the raw indirect irradiance E (what the GI gathers per pixel before " +
+             "albedo/AO). Shows exactly what color each region is sampling. Off for normal rendering.")]
+    public readonly BoolParameter debugRawIndirect = new(false);
 }

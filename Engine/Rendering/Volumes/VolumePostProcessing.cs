@@ -120,6 +120,8 @@ public static class VolumePostProcessing {
             fx.DdgiMultiBounce = gi.multiBounce.Value;
             fx.DdgiVisibility = gi.visibility.Value;
             fx.DdgiAoStrength = gi.aoStrength.Value;
+            fx.DdgiDebugProbes = gi.debugProbes.Value;
+            fx.DdgiDebugRawIndirect = gi.debugRawIndirect.Value;
             // Quality tier → probe grid resolution. Custom honours the per-axis counts.
             switch (gi.quality.Value) {
                 case GiQuality.High:        fx.DdgiGridX = 24; fx.DdgiGridY = 12; fx.DdgiGridZ = 24; break;

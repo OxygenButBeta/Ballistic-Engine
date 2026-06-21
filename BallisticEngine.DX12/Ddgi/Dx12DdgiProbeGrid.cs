@@ -146,6 +146,11 @@ public sealed class Dx12DdgiProbeGrid : IDisposable
     // Swap the ping-pong + mark history valid (called at the end of the relight pass).
     public void SwapAndMarkHistory() { writeB = !writeB; HistoryValid = true; }
 
+    // Invalidate the temporal history so the NEXT relight does a full replace (alpha=1) instead of EMA-blending
+    // over stale data. Called by the orchestrator when GI is inactive this frame — so toggling GI off then on
+    // does not bring back a stale (or runaway) cache; it rebuilds clean. Idempotent + cheap (just a flag).
+    public void ResetHistory() { HistoryValid = false; }
+
     public void Dispose()
     {
         irradA?.Dispose(); irradB?.Dispose(); visA?.Dispose(); visB?.Dispose();

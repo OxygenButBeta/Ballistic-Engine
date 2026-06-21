@@ -287,4 +287,7 @@ public sealed class PostProcessSettings {
     // How much the screen-space GTAO bites the GI's contact shading. DEFAULT 0: screen-space GTAO dragged a dark
     // "ghost of nearby geometry" smudge under camera motion, and the RT trace already carries macro occlusion.
     public float DdgiAoStrength { get; set; } = 0f;
+    // DEBUG views (editor GiVolume toggles; env doors BALLISTIC_DX12_DDGI_DEBUG_PROBES / _DEBUG override).
+    public bool DdgiDebugProbes { get; set; } = false;       // draw probe spheres tinted by irradiance
+    public bool DdgiDebugRawIndirect { get; set; } = false;  // replace scene with raw indirect E
 }
