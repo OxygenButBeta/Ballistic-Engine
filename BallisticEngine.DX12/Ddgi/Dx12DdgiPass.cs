@@ -369,7 +369,9 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             NormalBias = EnvF("BALLISTIC_DX12_DDGI_NORMALBIAS", ctx.PostFX.DdgiNormalBias),
             CountX = (uint)grid.CountX, CountY = (uint)grid.CountY, CountZ = (uint)grid.CountZ,
             W = (uint)indirect.Width, H = (uint)indirect.Height,
-            Intensity = 1f,
+            // Intensity = user DISPLAY gain, applied on the final gather ONLY (not baked into the stored irradiance —
+            // that fed the multi-bounce loop an Intensity× gain every frame → runaway blow-out).
+            Intensity = EnvF("BALLISTIC_DX12_DDGI_INTENSITY", ctx.PostFX.DdgiIntensity),
             UseVisibility = (Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_NOVIS") == "1" || !ctx.PostFX.DdgiVisibility) ? 0f : 1f,
             UsePlacement = (placementEnabled && grid.StatePlaced) ? 1f : 0f,
         });

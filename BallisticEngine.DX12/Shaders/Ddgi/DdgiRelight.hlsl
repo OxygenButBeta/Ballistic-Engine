@@ -248,7 +248,13 @@ void CSMain(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
         // the indirect came out ~π² too weak, so wall→object bounce was invisible. Multiply by π here so the cache
         // holds real incident irradiance; the combine's /π is the receiver's BRDF and stays. (Matches the D4
         // multi-bounce term, which already re-emits albedo·E/π — consistent units now.)
-        float3 E = ((wsum > 1e-4) ? sum / wsum : 0.0.xxx) * (PI * Intensity);
+        // Store PHYSICAL irradiance (π·L̄), NO Intensity. Intensity is a user display gain applied at the sample
+        // output only. Baking it here was a RUNAWAY bug: the cache feeds itself (multi-bounce reads PrevIrrad), so an
+        // Intensity>1 in the stored value re-multiplied every frame through the EMA → loop gain albedo²·Intensity
+        // (>1 at Intensity=4) → bounce-dominated regions (point-light scenes, little direct on a surface) diverged
+        // toward white over time ("starts normal, then the unlit areas blow out"). Physical storage → loop gain
+        // ≤ albedo² < 1 → converges.
+        float3 E = ((wsum > 1e-4) ? sum / wsum : 0.0.xxx) * PI;
 
         uint idx = probe * OctTexels + texel;
         float3 prev = PrevIrrad[idx].rgb;
