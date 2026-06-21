@@ -144,7 +144,12 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     // current path supplies no DDGI grid → all-zero). A 256-byte blittable struct so it round-trips through
     // Dx12FrameCb; written as `default` (all-zero, byte-identical to the old Span<byte>.Clear()).
     [StructLayout(LayoutKind.Sequential, Size = 256)]
-    struct RtReflGridConstants { }
+    struct RtReflGridConstants
+    {
+        public System.Numerics.Vector3 Origin;  public float Pad0;
+        public System.Numerics.Vector3 Spacing; public float Pad1;
+        public uint CountX, CountY, CountZ;      public uint Pad2;
+    }
 
     // BuildSsr moved VERBATIM into the ctor (re-rooted onto dev). The SSR PSOs/CB/heap are built here; the SSR
     // targets allocate in Resize, called at the end of the ctor (the inline BuildSsr called AllocSsrTarget(); the
@@ -380,9 +385,10 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
-        // P5: sample the Lumen card cache at reflection hits when Lumen is active this frame + has a valid cache
-        // (so reflections see the same multi-bounce GI the diffuse does). Off → the hit re-shades direct+IBL.
-        bool useCards = ctx.LumenActiveThisFrame && ctx.LumenScene is { Valid: true } && ctx.PostFX.LumenReflections
+        // GI-shared reflections (D5): sample the DDGI probe grid at reflection hits when GI is active + the grid
+        // is valid, so rough reflections see the same GI the diffuse does. Wired in D5 — until then DdgiGrid is
+        // null so this is false and the hit re-shades direct+IBL (the no-GI reflection path).
+        bool useCards = ctx.GiActiveThisFrame && ctx.DdgiGrid is { Valid: true } && ctx.PostFX.DdgiReflections
                         && ReflCardsAllowed;
         rtReflCb.Write(new RtReflConstants {
             InvViewProj = Matrix4x4.Transpose(invVP), CameraPos = camPos, Intensity = ForcedIntensity(ctx),
@@ -394,7 +400,12 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         rtReflSunCb.Write(new RtGiSun {
             SunDir = sunDir, NormalBias = 0.03f, SunColor = lightColor, LightCount = clusteredLights.LightCount,
         });
-        rtReflGridCb.Write(default);
+        rtReflGridCb.Write(useCards
+            ? new RtReflGridConstants {
+                Origin = ctx.DdgiGrid.GridOrigin, Spacing = ctx.DdgiGrid.ProbeSpacing,
+                CountX = (uint)ctx.DdgiGrid.CountX, CountY = (uint)ctx.DdgiGrid.CountY, CountZ = (uint)ctx.DdgiGrid.CountZ,
+              }
+            : default);
 
         // The G-buffer is in the combined shader-read state; color (target) bring to SRV for the combine.
         target.ColorToShaderResource();
@@ -430,14 +441,13 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
             cl.SetComputeRootShaderResourceView(5, rtGeometry.InstancesGpuAddress);      // t8 RtInstance[]
             cl.SetComputeRootShaderResourceView(6, clusteredLights.LightBufGpuAddress);  // t9 punctual lights
             cl.SetComputeRootShaderResourceView(7, clusteredLights.LightBufGpuAddress);  // t10 (probe, unused → filler)
-            // P5: the Lumen card cache (this frame's lit + multi-bounce radiance, post-swap) + per-instance meta.
-            // When Lumen is off, bind valid filler (the light buffer) — UseCards=0 gates the shader read anyway.
-            ulong cardAddr = useCards ? ctx.LumenScene.CardRadianceReadGpu : clusteredLights.LightBufGpuAddress;
-            ulong metaAddr = useCards ? ctx.LumenScene.InstanceMetaGpuAddress : clusteredLights.LightBufGpuAddress;
-            ulong triClusAddr = useCards && ctx.LumenScene.TriToClusterGpuAddress != 0 ? ctx.LumenScene.TriToClusterGpuAddress : clusteredLights.LightBufGpuAddress;
-            cl.SetComputeRootShaderResourceView(8, cardAddr);                            // t11 CardRadiance
-            cl.SetComputeRootShaderResourceView(9, metaAddr);                            // t12 LumenInstanceMeta
-            cl.SetComputeRootShaderResourceView(10, triClusAddr);                         // t13 TriToCluster (#2A)
+            // GI-shared reflections (D5): t11 = the DDGI probe irradiance the hit gathers (UseCards gates the read,
+            // grid params in b2). When GI is off, bind valid filler (the light buffer) — the shader never reads it.
+            // t12/t13 are unused by the shader now (the old card-cache SRVs are gone) → bind filler too.
+            ulong giAddr = useCards ? ctx.DdgiGrid.IrradianceReadGpu : clusteredLights.LightBufGpuAddress;
+            cl.SetComputeRootShaderResourceView(8, giAddr);                              // t11 DdgiIrradiance
+            cl.SetComputeRootShaderResourceView(9, clusteredLights.LightBufGpuAddress);  // t12 (unused filler)
+            cl.SetComputeRootShaderResourceView(10, clusteredLights.LightBufGpuAddress); // t13 (unused filler)
             cl.DispatchRays(new DispatchRaysDescription {
                 Width = (uint)ssrTarget.Width, Height = (uint)ssrTarget.Height, Depth = 1,
                 RayGenerationShaderRecord = new GpuVirtualAddressRange { StartAddress = rtReflSbt.GPUVirtualAddress, SizeInBytes = idSize },

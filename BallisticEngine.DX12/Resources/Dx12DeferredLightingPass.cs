@@ -190,12 +190,11 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
             // (user: "skybox ne yapıyorsa procedural de aynısını yapmalı"). Parity fix: NEITHER sky adds diffuse
             // sky-ambient here — diffuse indirect comes from Lumen GI alone (which DOES occlude via the TLAS).
             // Specular IBL stays (reflections; occluded separately). When Lumen is active it owns the diffuse indirect.
-            // BUG (2026-06-21): this was hardcoded 0f UNCONDITIONALLY — so when Lumen is OFF (or contributes ~nothing,
-            // e.g. a night scene the GI can't fill), there is NEITHER IBL diffuse NOR Lumen diffuse → shadowed/sky-
-            // facing surfaces go pure black with no ambient floor at all. It must be GATED on Lumen being active:
-            // Lumen on → 0 (it owns diffuse, no double-count); Lumen off → 1 (IBL diffuse fills as before the migration).
-            // Door BALLISTIC_DX12_LUMEN_FIX=0 restores the unconditional-0 legacy.
-            UseIBLDiffuse = (Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_FIX") != "0" && !ctx.LumenActiveThisFrame) ? 1f : 0f,
+            // GATED on GI being active this frame (DDGI): GI on → 0 (DDGI owns the diffuse indirect, so adding IBL
+            // diffuse here too would DOUBLE-COUNT — the scene blows out); GI off → 1 (IBL diffuse fills the ambient
+            // floor so shadowed/sky-facing surfaces aren't pure black). Door BALLISTIC_DX12_LUMEN_FIX=0 forces the
+            // unconditional-0 legacy (no IBL diffuse regardless).
+            UseIBLDiffuse = (Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_FIX") != "0" && !ctx.GiActiveThisFrame) ? 1f : 0f,
             // Sky-IBL specular ALSO disabled on the deferred path (parity with the diffuse above). The prefiltered
             // cube has no sky-visibility, so a closed interior ate the procedural sky's bright sun-tinted average as
             // a broad untextured veil (the orange "tent" on a roofed Bistro hall). Reflections come from Lumen RT /

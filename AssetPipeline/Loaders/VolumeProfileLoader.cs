@@ -11,9 +11,11 @@ public static class VolumeProfileLoader {
     // back the new name on the next editor save).
     static readonly Dictionary<string, string> LegacyTypeNames = new() {
         ["VolumetricLight"] = "VolumetricFog",
-        // The old screen-space-GI / reflection volume components were REMOVED with the legacy GI stack
-        // (Lumen V2). Their on-disk type names are no longer remapped to anything — a profile that still
-        // names them warn-and-skips in Load (ResolveVolume → null), exactly like any unknown component.
+        // The Lumen V2 GI volume was renamed to GiVolume when the world-space DDGI rewrite replaced it. A
+        // profile saved under the old "GlobalIllumination" type still loads → its shared dials (enabled,
+        // intensity, skyIntensity, multiBounce, aoStrength, quality) carry over by name; the Lumen-only fields
+        // (rayCount/probeOct/cardBudget/denoisePasses) simply drop (no slot to feed). Next Save persists GiVolume.
+        ["GlobalIllumination"] = "GiVolume",
     };
 
     // Per-old-type parameter renames (none currently — the GI-consolidation renames were dropped with the

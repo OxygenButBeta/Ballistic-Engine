@@ -10,36 +10,18 @@ internal static class Dx12BindlessTail
 
     public const int RtReflTableBase = HeapCapacity - RtReflReserved;
 
-    // Lumen V2 GI trace table — its OWN reserved tail BELOW the RT-reflection tail so the two never collide.
-    // Slots used (7): t1 depth, t2 normal, t3 material, t4 lit scene color, t5 sky irradiance cube, t6 sky
-    // prefilter cube, u0 indirect UAV. (TLAS t0 + CardRadiance/InstanceMeta/materials/lights are ROOT SRVs,
-    // not table slots.)
-    const int LumenReserved = 16;
-    public const int LumenUsed = 9;   // #3: +7 = probe history SRV (t14), +8 = motion SRV (t15, ghosting reject)
-    public const int LumenTableBase = RtReflTableBase - LumenReserved;
+    // DDGI relight table — its OWN reserved tail BELOW the RT-reflection tail so the two never collide.
+    // Slots used: t1 sky irradiance cube (the per-probe RT trace samples it on a ray miss). TLAS + bindless
+    // geo/material/lights are ROOT SRVs (not table slots). 8 reserved for slack.
+    const int DdgiRelightReserved = 8;
+    public const int DdgiRelightUsed = 1;
+    public const int DdgiRelightTableBase = RtReflTableBase - DdgiRelightReserved;
 
-    // Lumen V2 card-LIGHTING pass table — one slot (the sky irradiance cube). Below the GI tail.
-    const int LumenCardReserved = 8;
-    public const int LumenCardUsed = 1;
-    public const int LumenCardTableBase = LumenTableBase - LumenCardReserved;
-
-    // Lumen V2 Sıra 1 — SCREEN-PROBE trace table (its own tail below the card tail). The probe trace mirrors the
-    // GI trace's binding shape: t1 depth, t2 normal, t3 material, t4 lit scene color, t5 sky irradiance, t6 sky
-    // prefilter (6 SRV) + u1 probe atlas UAV (u0 ProbeHeaders + u2 Indirect are ROOT UAVs). 9 reserved for slack.
-    // 9 used: t1-t6 SRV (6) + u1 atlas UAV + u2 indirect UAV + t13 atlas-history SRV. ALL in the ONE bindless heap
-    // (a single shader-visible CBV/SRV/UAV heap can be set at a time — a separate per-frame heap for u2/t13 caused
-    // SetDescriptorTableInvalid). 16 reserved for slack.
-    const int LumenScreenProbeReserved = 16;
-    public const int LumenScreenProbeUsed = 9;
-    public const int LumenScreenProbeTableBase = LumenCardTableBase - LumenScreenProbeReserved;
-
-    public const int TailStart = LumenScreenProbeTableBase;
+    public const int TailStart = DdgiRelightTableBase;
 
     const int A_RtReflFits = 1 / (RtReflUsed <= RtReflReserved ? 1 : 0);
-    const int A_LumenFits = 1 / (LumenUsed <= LumenReserved ? 1 : 0);
-    const int A_LumenCardFits = 1 / (LumenCardUsed <= LumenCardReserved ? 1 : 0);
-    const int A_LumenScreenProbeFits = 1 / (LumenScreenProbeUsed <= LumenScreenProbeReserved ? 1 : 0);
+    const int A_DdgiRelightFits = 1 / (DdgiRelightUsed <= DdgiRelightReserved ? 1 : 0);
     const int A_TailStartPositive = 1 / (TailStart > 0 ? 1 : 0);
 
-    static Dx12BindlessTail() => _ = A_RtReflFits + A_LumenFits + A_LumenCardFits + A_LumenScreenProbeFits + A_TailStartPositive;
+    static Dx12BindlessTail() => _ = A_RtReflFits + A_DdgiRelightFits + A_TailStartPositive;
 }

@@ -235,8 +235,9 @@ public sealed class DX12HDRenderer : HDRenderer
     // ProcSkyConstants structs moved into it). The pass draws the sky into the HDR color at the far plane.
     Dx12SkyPass skyPass;
 
-    // Lumen V2 GI (event 500): the single product GI pass. Owns the Lumen scene substrate + GI pipeline.
-    Dx12LumenGiPass lumenGiPass;
+    // DDGI GI (event 500): the single product GI pass. World-space irradiance probe grid (relight → sample →
+    // combine), view-independent radiance cache — replaced Lumen V2. Owns the probe grid + GI pipeline.
+    Dx12DdgiPass ddgiPass;
 
     // Reflections (event 600): the single RT-vs-SSR mode-branch pass. It owns the SSR rootsig/PSOs/targets
     // and the RT-reflection pipeline.
@@ -618,10 +619,6 @@ public sealed class DX12HDRenderer : HDRenderer
 
     public override unsafe void Initialize()
     {
-        // TEMP BOOT-PROFILE (remove after diagnosing startup freeze):
-        var __bsw = System.Diagnostics.Stopwatch.StartNew();
-        void __T(string t) { Console.Error.WriteLine($"[InitProf] {t} +{__bsw.ElapsedMilliseconds}ms"); }
-        __T("Initialize start");
         // Clustered-deferred: geometry → G-buffer (owns scene depth) → deferred lighting → HDR `target`
         // (color only) → sky/fog/post → composite into `ldr` (R8). `target` no longer owns depth.
         // At init internal == output (FSR off); EnsureUpscaleTargets adjusts once a volume requests FSR.
@@ -633,9 +630,9 @@ public sealed class DX12HDRenderer : HDRenderer
         RegisterLdrUi();
         ldr.ColorToShaderResource(); // sample-safe before first composite (see AllocateResolutionTargets)
         gbuffer = new Dx12GBuffer(dev, targetW, targetH);
-        BuildRootSignature(); __T("BuildRootSignature");
-        BuildPipeline(); __T("BuildPipeline");
-        BuildGeometryPass(); __T("BuildGeometryPass");
+        BuildRootSignature();
+        BuildPipeline();
+        BuildGeometryPass();
 
         cbSlotSize = (System.Runtime.InteropServices.Marshal.SizeOf<DrawConstants>() + 255) & ~255;
         cbSlotCount = 8192; // submesh draws per frame ceiling (SunTemple ~hundreds)
@@ -793,11 +790,12 @@ public sealed class DX12HDRenderer : HDRenderer
         // BuildTransparentPass + the inline DrawTransparents call.
         transparentsPass = new Dx12TransparentsPass(dev);
         graph.Add(transparentsPass);
-        // Lumen V2 GI (event 500 — the slot the legacy GI pass held, after Transparents, before Fog). Owns the
-        // Lumen scene substrate (shared TLAS + bindless geo + card atlases), the screen-trace + HW-RT pipeline,
-        // and the full-res `indirect` buffer it Resizes. Gated behind BALLISTIC_DX12_LUMEN; default-off = no-op.
-        lumenGiPass = new Dx12LumenGiPass(dev, targetW, targetH);
-        graph.Add(lumenGiPass);
+        // DDGI GI (event 500 — the slot the legacy GI pass held, after Transparents, before Fog). World-space
+        // irradiance probe grid: per-probe RT relight (shared TLAS + bindless geo) → full-res trilinear sample →
+        // additive combine. View-independent cache, single EMA feedback loop. Gated behind the GlobalIllumination
+        // volume + BALLISTIC_DX12_DDGI; default-off = no-op (HW-RT only).
+        ddgiPass = new Dx12DdgiPass(dev, targetW, targetH);
+        graph.Add(ddgiPass);
         // Reflections (event 600) owns its resolution targets and branches between SSR and RT reflections.
         reflectionsPass = new Dx12ReflectionsPass(dev, targetW, targetH);
         graph.Add(reflectionsPass);
@@ -855,9 +853,6 @@ public sealed class DX12HDRenderer : HDRenderer
                 "[DX12] Render graph (phase-2 V1): COMPILED ORDER active (default; BALLISTIC_DX12_GRAPH=0 to disable).");
             Console.Error.WriteLine(graph.LastCompileReport);
         }
-        // TEMP BOOT-PROFILE (remove after diagnosing startup freeze):
-        Console.Error.WriteLine($"[BootProf] shaders: cacheHits={Dx12ShaderCompiler.CacheHits} ({Dx12ShaderCompiler.CacheReadMs:0}ms reads), " +
-            $"dxcCompiles={Dx12ShaderCompiler.DxcCompiles} ({Dx12ShaderCompiler.DxcMs:0}ms DXC)");
 
         // PHASE 2 V3 (chunk 14): auto-derived boundary barriers. Gated behind BALLISTIC_DX12_GRAPH_BARRIERS=1
         // (requires GRAPH=1 — it runs in ExecuteGraph). When set, the graph DERIVES each migrated pass's head
@@ -2379,8 +2374,8 @@ public sealed class DX12HDRenderer : HDRenderer
             ShadowMap = shadowMap, GpuDriven = gpuDriven,
             Vsm = vsm, VsmActiveThisFrame = vsmActiveThisFrame, // VSM clipmap (deferred binds t17 + b2 when active)
             RtShadowMask = rtShadowMask, // chunk 9: deferred binds it to t12 when RtShadowsThisFrame (null → fallback)
-            Dxr = dxr, // chunk 10: shared DXR substrate (sceneAS/device5/rtGeometry/ddgi) for the GI + Reflections passes
-            LumenScene = lumenGiPass.Scene, // Lumen V2 P5: the radiance cache the Reflections pass samples for rough reflections
+            Dxr = dxr, // chunk 10: shared DXR substrate (sceneAS/device5/rtGeometry) for the GI + Reflections passes
+            DdgiGrid = ddgiPass.Grid, // the world-space probe grid; Reflections samples it for rough reflections (D5; null until then)
             FrameCbAddress =
                 frameCb.Gpu, // chunk 8: Transparents binds it; chunk 9: Deferred binds it too (b1 FrameConstants CBV)
             Doors = doors, PostFX = PostFX, Stats = RenderStats.Scene,
@@ -2401,10 +2396,10 @@ public sealed class DX12HDRenderer : HDRenderer
             RtShadowsThisFrame = rtShadowsThisFrame,
         };
 
-        // Lumen V2 GI active this frame — resolved from the SAME predicate the Lumen pass's Enabled() uses, so
-        // the deferred pass (event 300) suppresses its IBL diffuse ambient iff the Lumen pass (event 500) will
-        // add its own diffuse indirect. Set after ctx build (Doors/Dev/Dxr are populated in the initializer).
-        ctx.LumenActiveThisFrame = Dx12LumenGiPass.WouldRun(ctx);
+        // DDGI active this frame — resolved from the SAME predicate the GI pass's Enabled() uses, so the deferred
+        // pass (event 300) suppresses its IBL diffuse ambient iff the GI pass (event 500) will add its own diffuse
+        // indirect. Set after ctx build (Doors/Dev/Dxr are populated in the initializer).
+        ctx.GiActiveThisFrame = Dx12DdgiPass.WouldRun(ctx);
 
         // Seed the film-grain counter. Grain is frozen to 0 under deterministic capture.
         ctx.GrainFrame = DeterministicCapture ? 0 : frameCounter;

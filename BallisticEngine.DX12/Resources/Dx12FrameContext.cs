@@ -116,10 +116,10 @@ public sealed class Dx12FrameContext {
     // its own lazy-create); the ctx field is a stable reference (init-only). Null is never expected.
     public Dx12DxrShared Dxr { get; init; }
 
-    // Lumen V2 scene substrate (the per-triangle radiance cache + per-instance meta). The Reflections pass
-    // (event 600, after the Lumen GI pass at 500) reads it so rough reflections sample the SAME multi-bounce
-    // GI the diffuse uses (plan P5). Null when Lumen is off; reflections gates on LumenActiveThisFrame too.
-    public Dx12LumenScene LumenScene { get; init; }
+    // DDGI probe grid (world-space irradiance cache). The Reflections pass (event 600, after the GI pass at
+    // 500) will sample it so rough reflections share the SAME GI the diffuse uses (D5). Null until DDGI wires
+    // the reflections bridge; reflections gates on GiActiveThisFrame too.
+    public Dx12DdgiProbeGrid DdgiGrid { get; init; }
 
     // PHASE-2 V3 (chunk 14): true when BALLISTIC_DX12_GRAPH_BARRIERS=1 (requires GRAPH=1). A MIGRATED pass reads
     // this at the head of Record: when true, the graph ALREADY emitted the pass's boundary head transition (the
@@ -145,11 +145,11 @@ public sealed class Dx12FrameContext {
     public bool   IblActiveThisFrame { get; set; }
     public bool   ShadowsThisFrame   { get; set; }
     public bool   RtShadowsThisFrame { get; set; }
-    // Lumen V2 GI is active this frame (BALLISTIC_DX12_LUMEN armed + HW RT + valid scene AS). Resolved at ctx
-    // build so the DEFERRED pass (event 300) can suppress its IBL diffuse ambient BEFORE the Lumen GI pass
-    // (event 500) adds its own diffuse indirect — the two must agree to avoid double-counting. The Lumen pass's
-    // own Enabled() recomputes the same predicate; this field mirrors it for upstream consumers.
-    public bool   LumenActiveThisFrame { get; set; }
+    // Diffuse GI (DDGI) is active this frame (armed + HW RT + valid scene AS). Resolved at ctx build so the
+    // DEFERRED pass (event 300) can suppress its IBL diffuse ambient BEFORE the GI pass (event 500) adds its
+    // own diffuse indirect — the two must agree to avoid double-counting. The GI pass's own Enabled()
+    // recomputes the same predicate; this field mirrors it for upstream consumers.
+    public bool   GiActiveThisFrame { get; set; }
 
     // The film-grain animation counter. The orchestrator seeds it just before the single graph.Execute.
     // The composite reads it for the non-deterministic grain phase only (frozen to 0 under DeterministicCapture).

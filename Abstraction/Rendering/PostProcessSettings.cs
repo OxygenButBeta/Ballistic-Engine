@@ -267,28 +267,24 @@ public sealed class PostProcessSettings {
 
     // The old realtime-GI and baked-GI settings were removed with the GI renderer.
 
-    // --- Lumen V2 global illumination (the GlobalIllumination volume → these fields → the DX12 Lumen GI pass).
-    // Lumen is the product GI path (HW-RT diffuse one-/multi-bounce + surface-card radiance cache). LumenEnabled
-    // is the master on/off; default ON (the pass also hard-gates on hardware ray tracing — no HW RT = no GI,
-    // no hidden screen-space fallback). The dials below were env-only during the Lumen build; the volume now
-    // drives them, with the BALLISTIC_DX12_LUMEN_* env doors still overriding for A/B. ---
-    public bool LumenEnabled { get; set; } = true;
-    public float LumenIntensity { get; set; } = 1f;          // master GI strength (1 = physical; was 2 to compensate the combine's extra /π, fixed in LumenGi.hlsl)
-    public float LumenSkyIntensity { get; set; } = 1.5f;     // skylight let in through open sky-visibility
-    public int LumenRayCount { get; set; } = 16;             // hemisphere rays per pixel (temporal accumulation cleans the rest)
-    public int LumenDenoisePasses { get; set; } = 1;         // à-trous spatial denoise iterations (0 = raw); Balanced default (adaptive bumps it on disocclusion)
-    public bool LumenMultiBounce { get; set; } = true;       // accumulate multi-bounce in the radiance cache
-    // --- Lumen QUALITY TIER (perf preset). The GlobalIllumination volume's `quality` enum sets these; a tier is
-    // just (probeOct, cardBudget, denoisePasses) chosen for a frame-time target. The integrate cost is ~oct² per
-    // probe per pixel, so dropping oct is the strongest knob (measured: oct8→6→4 = 130→161→211 FPS Bistro ext).
-    // Default = Balanced (oct 6, budget 50k, denoise 1): Lumen on at ~+1.9ms instead of High's ~+5.9ms. The
-    // BALLISTIC_DX12_LUMEN_PROBE_OCT / _BUDGET / _DENOISE_PASSES env doors still override for A/B. ---
-    public int LumenProbeOct { get; set; } = 6;              // octahedral tile resolution per probe (oct × oct cells); Balanced default
-    public int LumenCardBudget { get; set; } = 50000;        // card-light records relit per frame (round-robin; 0 = unlimited)
-    public bool LumenReflections { get; set; } = true;       // feed RT reflections from the radiance cache
+    // --- DDGI global illumination (the GI volume → these fields → the DX12 DDGI pass). World-space irradiance
+    // probe grid; the product GI path (HW-RT, no screen-space fallback — no HW RT = no GI). DdgiEnabled is the
+    // master on/off (default ON). The dials drive the probe grid relight/sample; the BALLISTIC_DX12_DDGI_* env
+    // doors still override each one for A/B. Replaced the Lumen V2 fields (card cache / per-pixel rays / SVGF
+    // denoise / quality tier — none exist in DDGI). ---
+    public bool DdgiEnabled { get; set; } = true;
+    public float DdgiIntensity { get; set; } = 1f;           // master GI strength (1 = physical)
+    public float DdgiSkyIntensity { get; set; } = 1.5f;      // skylight let in on a probe-ray sky miss
+    // Rays per probe is fixed at the relight thread-group size (64) — it is the compute dispatch width, not a
+    // runtime dial — so it is intentionally NOT a volume field.
+    public int DdgiGridX { get; set; } = 16;                 // probe grid resolution (X×Y×Z over the scene AABB)
+    public int DdgiGridY { get; set; } = 8;
+    public int DdgiGridZ { get; set; } = 16;
+    public float DdgiEmaAlpha { get; set; } = 0.05f;         // probe irradiance temporal blend (the ONE feedback loop)
+    public bool DdgiMultiBounce { get; set; } = true;        // feed prev-frame irradiance back at each hit (cheap multi-bounce)
+    public bool DdgiVisibility { get; set; } = true;         // Chebyshev visibility test (light-leak rejection)
+    public bool DdgiReflections { get; set; } = true;        // reflections share the probe GI (else IBL cube)
     // How much the screen-space GTAO bites the GI's contact shading. DEFAULT 0: screen-space GTAO dragged a dark
-    // "ghost of nearby geometry" smudge under camera motion, and the RT trace already carries macro occlusion, so
-    // mixing GTAO in double-darkened. 0 = GI sees only its own RT occlusion (+ baked material AO); opt back in per
-    // scene if wanted.
-    public float LumenAoStrength { get; set; } = 0f;
+    // "ghost of nearby geometry" smudge under camera motion, and the RT trace already carries macro occlusion.
+    public float DdgiAoStrength { get; set; } = 0f;
 }

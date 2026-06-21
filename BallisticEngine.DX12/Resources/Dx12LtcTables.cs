@@ -15,9 +15,15 @@ namespace BallisticEngine.DX12;
 //
 // FIT METHOD (selfshadow/ltc_code, condensed): for each (NdotV, roughness) cell we importance-sample the GGX
 // BRDF to get its average direction + norm + Fresnel, build the initial LTC from that frame, then refine the
-// 3 free matrix params (m11, m22, m13) with a tiny Nelder-Mead minimizing the L3 error against the BRDF. 64x64
-// cells × a few hundred samples = a fraction of a second at init (one-time). This is the canonical fit, not an
-// analytic approximation, so the rect highlight is accurate at grazing angles + high roughness.
+// 3 free matrix params (m11, m22, m13) with a tiny Nelder-Mead minimizing the L3 error against the BRDF. This is
+// the canonical fit, not an analytic approximation, so the rect highlight is accurate at grazing/high-roughness.
+//
+// COST + DISK CACHE: 64×64 cells × Nelder-Mead(40 iters) × 32×32 BRDF samples is ~34 s in a Debug build — and it
+// ran on EVERY editor/runtime launch (it was the renderer-init startup-freeze culprit). The fit is fully
+// deterministic (no scene/asset/time input), so the result is persisted to <project>\Library\LtcCache keyed by
+// the fit parameters (FitVersion/N/FitSamples): a present cache is a ~ms file read, a miss fits once + writes it.
+// Changing any fit parameter (or bumping FitVersion when the math changes) invalidates the key → automatic
+// re-fit. Byte-identical to the always-fit path (same float[] either way).
 public sealed class Dx12LtcTables : IDisposable {
     public const int N = 64;                 // table resolution (NdotV × roughness)
     const int FitSamples = 32;               // GGX importance samples per cell (32×32 directions)
@@ -31,11 +37,59 @@ public sealed class Dx12LtcTables : IDisposable {
 
     public Dx12LtcTables(Dx12Device device) {
         dev = device;
-        BuildTables(out float[] m, out float[] amp);   // each N*N*4 floats, RGBA row-major
+        // Load the fitted tables from disk if present (~ms); else fit once (~34 s Debug) and persist. See the
+        // class-header COST + DISK CACHE note — the fit is deterministic so the cache is byte-identical.
+        if (!TryLoadCached(out float[] m, out float[] amp)) {
+            BuildTables(out m, out amp);   // each N*N*4 floats, RGBA row-major
+            TrySaveCached(m, amp);
+        }
         ltc1 = UploadRgba32f(m, "LtcMatInv");
         ltc2 = UploadRgba32f(amp, "LtcAmp");
         ltc1Srv = MakeSrv(ltc1);
         ltc2Srv = MakeSrv(ltc2);
+    }
+
+    // ---- on-disk fit cache (same Library dir as the shader DXIL cache) -------------------------------
+
+    // Key the cache by everything that changes the fitted values. BUMP this if the FIT MATH changes (not just
+    // when N/FitSamples change — those are already in the filename).
+    const int FitVersion = 1;
+
+    static string CachePath() {
+        string shaderDir = Dx12ShaderCompiler.CacheDirectory;   // <project>\Library\ShaderCache (null in headless tools)
+        if (string.IsNullOrEmpty(shaderDir)) return null;
+        string libDir = System.IO.Path.GetDirectoryName(shaderDir);   // <project>\Library
+        return System.IO.Path.Combine(libDir, "LtcCache", $"ltc_v{FitVersion}_n{N}_s{FitSamples}.bin");
+    }
+
+    static bool TryLoadCached(out float[] mat, out float[] amp) {
+        mat = amp = null;
+        string path = CachePath();
+        if (path is null || !System.IO.File.Exists(path)) return false;
+        try {
+            byte[] bytes = System.IO.File.ReadAllBytes(path);
+            int n = N * N * 4;
+            if (bytes.Length != n * 2 * sizeof(float)) return false;   // stale/corrupt → re-fit
+            mat = new float[n]; amp = new float[n];
+            Buffer.BlockCopy(bytes, 0, mat, 0, n * sizeof(float));
+            Buffer.BlockCopy(bytes, n * sizeof(float), amp, 0, n * sizeof(float));
+            return true;
+        } catch { mat = amp = null; return false; }   // unreadable → re-fit
+    }
+
+    static void TrySaveCached(float[] mat, float[] amp) {
+        string path = CachePath();
+        if (path is null) return;
+        try {
+            int n = N * N * 4;
+            var bytes = new byte[n * 2 * sizeof(float)];
+            Buffer.BlockCopy(mat, 0, bytes, 0, n * sizeof(float));
+            Buffer.BlockCopy(amp, 0, bytes, n * sizeof(float), n * sizeof(float));
+            System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path));
+            string tmp = path + ".tmp";   // temp+move so a crash mid-write never leaves a truncated blob
+            System.IO.File.WriteAllBytes(tmp, bytes);
+            System.IO.File.Move(tmp, path, overwrite: true);
+        } catch { /* best-effort; fitting still produced valid tables */ }
     }
 
     // ---- CPU LTC fit ---------------------------------------------------------------------------------
