@@ -174,14 +174,15 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("Composite.hlsl");
         byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "Composite.hlsl");
         byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "Composite.hlsl");
-        compositePso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+        // PSO cache (proof migration). "Composite" = the disk-library key. Byte-identical hit.
+        compositePso = dev.CreateGraphicsPso(new GraphicsPipelineStateDescription {
             RootSignature = compositeRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
             PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
             RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
             DepthStencilState = DepthStencilDescription.None,
             RenderTargetFormats = new[] { Dx12OffscreenTarget.ColorFormat },   // LDR output
             DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
-        });
+        }, "Composite");
 
         compositeCb = new Dx12FrameCb<CompositeConstants>(dev);
         compositeSrvVisible = new Dx12DescriptorHeap(dev,
@@ -548,6 +549,12 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
         dev.Device.CopyDescriptorsSimple(1, histResolveHeap.Cpu(1), histEvBSrv, heapType);        // resolve: t1 = prev adapted EV (history target)
         dev.Device.CopyDescriptorsSimple(1, histResolveHeap.Cpu(2), histEvAUav, heapType);        // resolve: u1 = adapted EV out
 
+        // The histogram meter (Clear→Build→Resolve) is COMPUTE-ONLY (histogram UAV + 1×1 EV UAVs + HDR SRV read).
+        // It is a candidate for the async-compute queue, BUT the HDR scene is in PIXEL_SHADER_RESOURCE here (a
+        // graphics-only state the compute queue can't read) — async routing would need HDR left in the combined
+        // ALL_SHADER (NON_PIXEL|PIXEL) state before the hand-off first. Until that state change is wired, it stays
+        // inline (correct + byte-identical). The N-hand-off infra (Dx12Device.RecordAsyncCompute) is now in place
+        // so this becomes a one-line RecordAsyncCompute swap once HDR's pre-hand-off state is widened.
         dev.ExecuteSync(cl => {
             // ---- CSClear: zero the histogram ----
             cl.SetComputeRootSignature(histClearRootSig);

@@ -40,10 +40,17 @@ public sealed class DX12HDRenderer : HDRenderer
     // FSR temporal upscaling: render at targetW/H (internal) -> fsrOutput (output res). Replaces TAA when
     // active. fsrUnavailable latches if the native DLLs fail to load (clean checkout) so we stop retrying.
     Dx12FsrUpscaler fsr;
-    Dx12OffscreenTarget fsrOutput; // HDR (R16F), output res, UAV-writable — FSR's reconstructed color
-    bool fsrActive;
+    Dx12OffscreenTarget fsrOutput; // HDR (R16F), output res, UAV-writable — the active upscaler's reconstructed color
+    bool fsrActive;                // master "an upscaler is running this frame" flag (mutually exclusive with TAA)
     bool fsrUnavailable;
     UpscaleMode currentUpscaleMode = UpscaleMode.Off;
+    // Vendor upscalers ALONGSIDE FSR (runtime-optional). Each latches unavailable on a failed init so we stop
+    // retrying and fall back to FSR (which itself falls back to native). activeUpscaler picks the concrete family.
+    Dx12DlssUpscaler dlss;
+    Dx12XessUpscaler xess;
+    bool dlssUnavailable;
+    bool xessUnavailable;
+    UpscalerKind activeUpscaler = UpscalerKind.Fsr;
     const float FovYRadians = 45f * (MathF.PI / 180f); // matches the projection's vertical FOV
 
     ID3D12RootSignature rootSig;
@@ -408,11 +415,14 @@ public sealed class DX12HDRenderer : HDRenderer
         outputW = width;
         outputH = height;
         // Reset to native (internal == output); BeginRender's EnsureUpscaleTargets re-derives the internal
-        // render resolution from the volume's UpscaleMode and reallocates if FSR wants a smaller render res.
+        // render resolution from the volume's UpscaleMode and reallocates if an upscaler wants a smaller render
+        // res. All upscaler contexts are size-bound so they're dropped here and recreated on the next Ensure.
         fsrActive = false;
+        activeUpscaler = UpscalerKind.Fsr;
         currentUpscaleMode = UpscaleMode.Off;
         fsr?.Dispose();
         fsr = null;
+        DisposeVendorUpscalers();
         AllocateResolutionTargets(width, height);
     }
 
@@ -516,53 +526,94 @@ public sealed class DX12HDRenderer : HDRenderer
         _ => FfxApi.QualityQuality,
     };
 
-    // Ensure the internal render resolution + FSR context match the requested upscale mode. Reallocates the
-    // internal-res targets (and recreates the FSR context) only when the mode actually changes. If the FSR
-    // DLLs can't load it latches off and renders native (graceful degrade on a clean checkout).
+    // Ensure the internal render resolution + the active upscaler context match the requested upscale mode.
+    // Reallocates the internal-res targets (and recreates the upscaler context) only when the effective mode
+    // actually changes. Resolves the VENDOR FALLBACK CHAIN here: a Dlss*/Xess* mode is honoured only when that
+    // vendor's runtime is available on this GPU (and not already latched unavailable); otherwise it degrades to
+    // the equivalent FSR ratio, and FSR itself degrades to native if its DLLs can't load. Off → no upscaler work.
     void EnsureUpscaleTargets(UpscaleMode mode)
     {
-        bool wantFsr = mode != UpscaleMode.Off && !fsrUnavailable;
-        int wantIW = outputW, wantIH = outputH;
-        if (wantFsr)
+        // Resolve which concrete family this mode wants, applying the availability latches (a failed init in a
+        // prior frame latches the family unavailable so we stop retrying and fall straight to FSR/native).
+        UpscalerKind wantKind = UpscalerKind.Fsr;
+        bool wantUpscale = mode != UpscaleMode.Off;
+        if (wantUpscale)
         {
-            try
+            UpscalerKind k = Dx12Upscaler.KindOf(mode);
+            if (k == UpscalerKind.Dlss && !dlssUnavailable) wantKind = UpscalerKind.Dlss;
+            else if (k == UpscalerKind.Xess && !xessUnavailable) wantKind = UpscalerKind.Xess;
+            else wantKind = UpscalerKind.Fsr;   // vendor latched off OR mode was already an FSR mode
+        }
+        // FSR availability gate (its loader DLLs can be absent on a clean checkout).
+        if (wantUpscale && wantKind == UpscalerKind.Fsr && fsrUnavailable) wantUpscale = false;
+
+        // Internal render resolution. Vendor families derive it from the SHARED ratio table (single source of
+        // truth → identical internal res across families); the FSR family keeps its native query (byte-unchanged).
+        int wantIW = outputW, wantIH = outputH;
+        if (wantUpscale)
+        {
+            if (wantKind == UpscalerKind.Fsr)
             {
-                (wantIW, wantIH) = Dx12FsrUpscaler.RenderResolutionFor(outputW, outputH, FsrQuality(mode));
+                try { (wantIW, wantIH) = Dx12FsrUpscaler.RenderResolutionFor(outputW, outputH, FsrQuality(mode)); }
+                catch (Exception e)
+                {
+                    Console.WriteLine($"[FSR] unavailable, rendering native: {e.Message}");
+                    fsrUnavailable = true; wantUpscale = false; wantIW = outputW; wantIH = outputH;
+                }
             }
-            catch (Exception e)
+            else
             {
-                Console.WriteLine($"[FSR] unavailable, rendering native: {e.Message}");
-                fsrUnavailable = true;
-                wantFsr = false;
-                wantIW = outputW;
-                wantIH = outputH;
+                (wantIW, wantIH) = Dx12Upscaler.RenderResolutionFor(outputW, outputH, mode);
             }
         }
 
-        if (target != null && wantIW == targetW && wantIH == targetH && fsrActive == wantFsr)
+        if (target != null && wantIW == targetW && wantIH == targetH && fsrActive == wantUpscale && activeUpscaler == wantKind)
         {
             currentUpscaleMode = mode;
             return; // nothing to reallocate
         }
 
         AllocateResolutionTargets(wantIW, wantIH);
-        if (wantFsr)
+
+        // Create the chosen upscaler context, falling back DOWN the chain on any failure. The fallback is a
+        // RE-ENTRANT call with the FSR-equivalent mode: it re-derives the FSR ratio + creates the FSR context,
+        // so the internal targets we just allocated are corrected if the ratio differs.
+        if (wantUpscale && wantKind == UpscalerKind.Dlss)
         {
-            try
-            {
-                fsr?.Dispose();
-                fsr = new Dx12FsrUpscaler(dev, wantIW, wantIH, outputW, outputH);
-            }
+            DisposeVendorUpscalers();
+            dlss = Dx12DlssUpscaler.TryCreate(dev, wantIW, wantIH, outputW, outputH, Dx12Upscaler.DlssQuality(mode));
+            if (dlss == null) { dlssUnavailable = true; EnsureUpscaleTargets(Dx12Upscaler.FsrEquivalent(mode)); return; }
+        }
+        else if (wantUpscale && wantKind == UpscalerKind.Xess)
+        {
+            DisposeVendorUpscalers();
+            xess = Dx12XessUpscaler.TryCreate(dev, outputW, outputH, Dx12Upscaler.XessQuality(mode));
+            if (xess == null) { xessUnavailable = true; EnsureUpscaleTargets(Dx12Upscaler.FsrEquivalent(mode)); return; }
+        }
+        else if (wantUpscale)   // FSR family
+        {
+            DisposeVendorUpscalers();
+            try { fsr?.Dispose(); fsr = new Dx12FsrUpscaler(dev, wantIW, wantIH, outputW, outputH); }
             catch (Exception e)
             {
                 Console.WriteLine($"[FSR] context create failed, rendering native: {e.Message}");
-                fsrUnavailable = true;
-                wantFsr = false;
+                fsrUnavailable = true; wantUpscale = false;
             }
         }
+        else
+        {
+            DisposeVendorUpscalers();   // Off → no upscaler holds resources
+        }
 
-        fsrActive = wantFsr;
+        fsrActive = wantUpscale;
+        activeUpscaler = wantUpscale ? wantKind : UpscalerKind.Fsr;
         currentUpscaleMode = mode;
+    }
+
+    void DisposeVendorUpscalers()
+    {
+        dlss?.Dispose(); dlss = null;
+        xess?.Dispose(); xess = null;
     }
 
     public override unsafe void Initialize()
@@ -2280,6 +2331,7 @@ public sealed class DX12HDRenderer : HDRenderer
             AoResult = gtaoPass.ResultSrvCpu,
             TaaActive = taaOn, FsrActive = fsrActive, // chunk 7: TaaPass runs in native path; FsrPass when FsrActive
             Fsr = fsr, FsrOutput = fsrOutput, MotionPrevValid = motionPrevValid, // chunk 7: FsrPass dispatch inputs
+            ActiveUpscaler = activeUpscaler, Dlss = dlss, Xess = xess, // generic upscale pass picks DLSS/XeSS/FSR
             // mutated-mid-frame fields, set to their resolved final value:
             SceneColor = fsrActive ? fsrOutput : target,
             IblActiveThisFrame = iblActiveThisFrame,
@@ -2419,7 +2471,9 @@ public sealed class DX12HDRenderer : HDRenderer
     // event via the graph (native path only); the TAA-skipped history reset moved into the pass too.
 
     // The active upscale mode: the volume's PostFX.UpscaleMode, overridable by BALLISTIC_DX12_FSR for
-    // headless A/B (off/nativeaa/quality/balanced/performance/ultra) — a kept test door.
+    // headless A/B — a kept test door. Now also forces the VENDOR families (dlss*/xess*) so the fallback chain
+    // can be exercised headlessly: off/nativeaa/quality/balanced/performance/ultra (FSR) +
+    // dlssquality.../xessquality... (vendor → fall back to FSR if the GPU/runtime is absent).
     UpscaleMode ResolveUpscaleMode()
     {
         UpscaleMode Resolve(UpscaleMode m) => m == UpscaleMode.Auto ? AutoUpscaleModeForHardware() : m;
@@ -2434,6 +2488,14 @@ public sealed class DX12HDRenderer : HDRenderer
             "performance" or "perf" or "p" => UpscaleMode.Performance,
             "ultra" or "ultraperformance" or "up" => UpscaleMode.UltraPerformance,
             "auto" or "a" => AutoUpscaleModeForHardware(),
+            "dlss" or "dlssquality" => UpscaleMode.DlssQuality,
+            "dlssbalanced" => UpscaleMode.DlssBalanced,
+            "dlssperformance" or "dlssperf" => UpscaleMode.DlssPerformance,
+            "dlssultra" or "dlssultraperformance" => UpscaleMode.DlssUltraPerformance,
+            "xess" or "xessquality" => UpscaleMode.XessQuality,
+            "xessbalanced" => UpscaleMode.XessBalanced,
+            "xessperformance" or "xessperf" => UpscaleMode.XessPerformance,
+            "xessultra" or "xessultraperformance" => UpscaleMode.XessUltraPerformance,
             _ => Resolve(PostFX.UpscaleMode),
         };
     }

@@ -117,14 +117,16 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("DeferredLighting.hlsl");
         byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "DeferredLighting.hlsl");
         byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "DeferredLighting.hlsl");
-        deferredPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+        // PSO cache (proof migration): dedupe in memory + warm-load from the disk pipeline library. "Deferred" is
+        // the disk-library key (unique). Byte-identical — a hit returns a PSO equal to this exact description.
+        deferredPso = dev.CreateGraphicsPso(new GraphicsPipelineStateDescription {
             RootSignature = deferredRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
             PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
             RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
             DepthStencilState = DepthStencilDescription.None,
             RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
             DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
-        });
+        }, "Deferred");
 
         deferredCb = new Dx12FrameCb<LightConstants>(dev);
         vsmCb = new Dx12FrameCb<VsmConstants>(dev);

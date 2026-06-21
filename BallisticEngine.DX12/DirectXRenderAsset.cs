@@ -15,6 +15,19 @@ public sealed class DirectXRenderAsset : RenderAsset {
 
     public override void Initialize() {
         Current = this;
+
+        // Persist compiled DXIL under Library\ShaderCache so a relaunch with unchanged .hlsl skips DXC
+        // entirely (boot used to re-compile ~150 shaders every launch — seconds between device-ready and
+        // first frame). Keyed by source hash, so a shader edit auto-invalidates. Headless tools without a
+        // project leave this null → always compile (old behaviour).
+        var project = AssetDatabase.Project;
+        if (project is not null) {
+            Dx12ShaderCompiler.CacheDirectory = System.IO.Path.Combine(project.LibraryPath, "ShaderCache");
+            // PSO disk cache (ID3D12PipelineLibrary) lives next to the DXIL cache. The shader cache skips the DXC
+            // FRONT-end (HLSL→DXIL); the PSO cache skips the driver BACK-end (DXIL→native PSO) on a warm start — the
+            // two stack for the full cold-start compile-stutter win. Both keyed/validated so a hit == a fresh build.
+            Dx12Device.PsoCacheDirectory = System.IO.Path.Combine(project.LibraryPath, "PsoCache");
+        }
         // Debug layer OFF by default: the D3D12 debug layer is not reliably thread-safe under the heavy
         // concurrent resource creation the engine's worker-thread asset loading does (it spuriously
         // E_FAILs CreateCommittedResource). Opt in with BALLISTIC_DX12_DEBUG=1 for single-threaded debugging.

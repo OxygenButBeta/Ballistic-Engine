@@ -65,8 +65,15 @@ public sealed class Dx12FrameContext {
     // because the internal-vs-output render-resolution lifecycle — EnsureUpscaleTargets / native reset / mode
     // change — is whole-frame resolution management, not a leaf-post concern). Fsr is null when FSR is off.
     public Dx12FsrUpscaler      Fsr            { get; init; }
-    public Dx12OffscreenTarget  FsrOutput      { get; init; }
-    public bool                 MotionPrevValid{ get; init; }   // false on first frame after a (re)alloc → FSR resets its history
+    public Dx12OffscreenTarget  FsrOutput      { get; init; }   // output-res HDR target ALL upscalers write (named for FSR; shared)
+    public bool                 MotionPrevValid{ get; init; }   // false on first frame after a (re)alloc → upscaler resets its history
+
+    // The concrete upscaler family active this frame (resolved in EnsureUpscaleTargets after vendor availability +
+    // graceful fallback). FsrActive is the master "an upscaler runs" flag (mutually exclusive with TAA); this says
+    // WHICH one. Dlss/Xess are null unless their family is the active one. Default Fsr (the universal path).
+    public UpscalerKind         ActiveUpscaler { get; init; }
+    public Dx12DlssUpscaler     Dlss           { get; init; }
+    public Dx12XessUpscaler     Xess           { get; init; }
 
     // --- shared backend resources (read-only references; the objects self-track their own state) ---
     public Dx12Device          Dev            { get; init; }

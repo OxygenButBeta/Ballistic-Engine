@@ -217,6 +217,10 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
             GBufferDump(r);
             HdrDump(r);
             DrainValidation(r);
+            // PSO disk cache: the headless screenshot path RETURNS (no device Dispose), so serialise the PSO
+            // pipeline library HERE so the next launch warm-loads it (the DXIL cache already wrote per-compile).
+            // Best-effort + no-op when the disk tier is off — never affects the captured frame.
+            r.Device.SavePsoCache();
         }
         else {
             Console.Error.WriteLine("[Screenshot] DX12 renderer not active; nothing saved.");

@@ -41,6 +41,27 @@ public sealed class Dx12Device : IDisposable {
     public bool HasHardwareRayTracing { get; }
     public bool HasMeshShaders { get; }   // R4 — Options7 MeshShaderTier >= Tier1 (gates the meshlet pipeline)
 
+    // PSO CACHE (Dx12PsoCache) — wraps Create{Graphics,Compute}PipelineState with an in-memory desc-hash dedupe
+    // (always on, byte-neutral) + an ID3D12PipelineLibrary disk tier (warm-start driver-compile skip; gated by
+    // BALLISTIC_DX12_PSO_CACHE, persisted to <project>\Library\PsoCache). Created lazily on first use (the cache
+    // dir is set at bootstrap, AFTER the device ctor) so the device ctor stays dependency-free. Passes migrate to
+    // CreateGraphicsPso/CreateComputePso to opt in; un-migrated sites still call Device.Create* directly (unchanged).
+    Dx12PsoCache psoCache;
+    // Set once at bootstrap to <project>\Library\PsoCache (null for headless tools → disk tier off, dedupe still on).
+    public static string PsoCacheDirectory { get; set; }
+    Dx12PsoCache PsoCache => psoCache ??= new Dx12PsoCache(Device, PsoCacheDirectory);
+
+    // Cache-wrapped PSO creation. `name` MUST be unique per distinct PSO (it's the disk-library key); it's only
+    // used for the disk tier — the in-memory dedupe keys off the description hash regardless. A cache HIT returns
+    // a PSO that renders byte-identically to a fresh create (same desc → same PSO). Thread-safe (the cache locks).
+    public ID3D12PipelineState CreateGraphicsPso(in GraphicsPipelineStateDescription desc, string name)
+        => PsoCache.CreateGraphics(desc, name);
+    public ID3D12PipelineState CreateComputePso(in ComputePipelineStateDescription desc, string name)
+        => PsoCache.CreateCompute(desc, name);
+    // Serialise the disk PSO library at shutdown so the next launch warm-loads it. Safe to call when the cache was
+    // never used (no-op). Called from the renderer's Dispose BEFORE the device is torn down.
+    public void SavePsoCache() => psoCache?.SaveToDisk();
+
     readonly ID3D12CommandAllocator allocator;
     readonly ID3D12GraphicsCommandList4 commandList; // 4 = supports DXR DispatchRays later
     readonly ID3D12Fence fence;
@@ -121,16 +142,24 @@ public sealed class Dx12Device : IDisposable {
     // submit's allocator is never reset under it (fence-gated per slot, same as the graphics frame slots).
     public bool AsyncComputeEnabled { get; }
     ID3D12CommandQueue computeQueue;
-    ID3D12CommandAllocator[] computeAllocators;     // [FramesInFlight]
-    ID3D12GraphicsCommandList4[] computeLists;      // [FramesInFlight]
+    // R1+ — N HAND-OFFS PER FRAME. The original R1 supported ONE async hand-off per frame (one compute allocator
+    // and one post-split graphics allocator per slot). That serialised a second async-eligible pass back onto the
+    // graphics queue. Now each per-frame slot owns MaxAsyncHandoffs compute allocators/lists AND MaxAsyncHandoffs
+    // post-split graphics allocators, so up to N independent compute passes can each take their OWN hand-off and
+    // overlap in turn. Indexed [slot][handoff]. handoff advances per RecordAsyncCompute call this frame; reset to 0
+    // each BeginFrame. Beyond N hand-offs in one frame, RecordAsyncCompute falls back to inline (correct, just not
+    // overlapped) — N is sized so that never bites in practice (Lumen + cull + one more = 3). GPU-result-identical:
+    // a hand-off only changes WHICH queue runs the compute, never the result.
+    const int MaxAsyncHandoffs = 4;
+    ID3D12CommandAllocator[,] computeAllocators;    // [FramesInFlight, MaxAsyncHandoffs]
+    ID3D12GraphicsCommandList4[,] computeLists;     // [FramesInFlight, MaxAsyncHandoffs]
     ulong[] computeFenceTargets;                    // [FramesInFlight] value computeFence reaches when that slot is done
-    // Splitting the graphics frame at an async hand-off point needs a SECOND graphics allocator per slot for the
-    // post-split segment: the pre-split commands may still be executing on the GPU out of frameAllocators[slot],
-    // so the post-split segment must allocate from a DIFFERENT allocator (resetting the pre-split one mid-flight
-    // is illegal). One extra allocator per slot covers ONE async hand-off per frame (the GTAO/Lumen overlap point);
-    // a second hand-off in the same frame would need a third — asserted against. Reset per-slot in BeginFrame.
-    ID3D12CommandAllocator[] framePostAllocators;   // [FramesInFlight] post-async-split graphics segment
-    bool frameSplitThisFrame;                       // guards against a 2nd async hand-off in one frame
+    // Splitting the graphics frame at an async hand-off point needs a SEPARATE graphics allocator for the post-split
+    // segment: the pre-split commands may still be executing on the GPU out of frameAllocators[slot] (or the prior
+    // hand-off's post allocator), so the post-split segment must allocate from a DIFFERENT, not-in-flight allocator.
+    // One post allocator PER hand-off per slot. Reset per-slot in BeginFrame.
+    ID3D12CommandAllocator[,] framePostAllocators;  // [FramesInFlight, MaxAsyncHandoffs] post-async-split graphics segment
+    int frameHandoffCount;                          // async hand-offs taken this frame (0..MaxAsyncHandoffs), reset each BeginFrame
     // ONE shared fence used for BOTH directions of the cross-queue handshake (a fence is just a monotonic
     // counter; graphics and compute each Signal distinct rising values and Wait on the other's). asyncFenceValue
     // is the single ever-increasing producer; each Signal takes the next value, each Wait targets a recorded one.
@@ -301,15 +330,17 @@ public sealed class Dx12Device : IDisposable {
         AsyncComputeEnabled = Environment.GetEnvironmentVariable("BALLISTIC_DX12_ASYNC_COMPUTE") == "1";
         if (AsyncComputeEnabled) {
             computeQueue = Device.CreateCommandQueue(new CommandQueueDescription(CommandListType.Compute));
-            computeAllocators = new ID3D12CommandAllocator[FramesInFlight];
-            computeLists = new ID3D12GraphicsCommandList4[FramesInFlight];
-            framePostAllocators = new ID3D12CommandAllocator[FramesInFlight];
+            computeAllocators = new ID3D12CommandAllocator[FramesInFlight, MaxAsyncHandoffs];
+            computeLists = new ID3D12GraphicsCommandList4[FramesInFlight, MaxAsyncHandoffs];
+            framePostAllocators = new ID3D12CommandAllocator[FramesInFlight, MaxAsyncHandoffs];
             for (int i = 0; i < FramesInFlight; i++) {
-                computeAllocators[i] = Device.CreateCommandAllocator(CommandListType.Compute);
-                computeLists[i] = Device.CreateCommandList<ID3D12GraphicsCommandList4>(
-                    CommandListType.Compute, computeAllocators[i], null);
-                computeLists[i].Close();
-                framePostAllocators[i] = Device.CreateCommandAllocator(CommandListType.Direct);
+                for (int h = 0; h < MaxAsyncHandoffs; h++) {
+                    computeAllocators[i, h] = Device.CreateCommandAllocator(CommandListType.Compute);
+                    computeLists[i, h] = Device.CreateCommandList<ID3D12GraphicsCommandList4>(
+                        CommandListType.Compute, computeAllocators[i, h], null);
+                    computeLists[i, h].Close();
+                    framePostAllocators[i, h] = Device.CreateCommandAllocator(CommandListType.Direct);
+                }
             }
             asyncFence = Device.CreateFence(0, FenceFlags.None);
             computeFenceTargets = new ulong[FramesInFlight];
@@ -515,10 +546,12 @@ public sealed class Dx12Device : IDisposable {
         frameList = frameLists[frameSlot];
         frameAllocators[frameSlot].Reset();
         frameList.Reset(frameAllocators[frameSlot], null);
-        // R1: this slot's previous frame is GPU-complete (the WaitFrameFence above gates slot reuse), so the
-        // post-async-split graphics allocator for this slot is safe to reset too. Inert when async compute is off.
-        if (AsyncComputeEnabled) framePostAllocators[frameSlot].Reset();
-        frameSplitThisFrame = false;
+        // R1: this slot's previous frame is GPU-complete (the WaitFrameFence above gates slot reuse), so ALL of this
+        // slot's post-async-split graphics allocators are safe to reset too. Inert when async compute is off. (The
+        // compute allocators are reset lazily per hand-off in RecordAsyncCompute — see there.)
+        if (AsyncComputeEnabled)
+            for (int h = 0; h < MaxAsyncHandoffs; h++) framePostAllocators[frameSlot, h].Reset();
+        frameHandoffCount = 0;
         frameThreadId = Environment.CurrentManagedThreadId;
         frameOpen = true;
         if (gpuProfiler is { Enabled: true }) gpuProfiler.BeginFrame(profileFrameCounter++);
@@ -626,13 +659,13 @@ public sealed class Dx12Device : IDisposable {
             ExecuteSync(record);
             return;
         }
-        if (frameSplitThisFrame) {
-            // Only one async hand-off per frame is supported (one post-split allocator). A second would reset an
-            // allocator whose post-split commands are still in flight — fall back to inline to stay correct.
+        if (frameHandoffCount >= MaxAsyncHandoffs) {
+            // Exhausted this frame's hand-off allocators (N taken already). A further split would reuse an allocator
+            // whose post-split commands may still be in flight — fall back to inline to stay correct (rare: N=4).
             ExecuteSync(record);
             return;
         }
-        frameSplitThisFrame = true;
+        int handoff = frameHandoffCount++;   // this hand-off's per-slot allocator index
         // 1. Submit the graphics frame recorded SO FAR (the compute pass's inputs) + signal A on the graphics queue.
         frameList.Close();
         Queue.ExecuteCommandList(frameList);
@@ -640,9 +673,11 @@ public sealed class Dx12Device : IDisposable {
         Queue.Signal(asyncFence, a);
         // 2. Compute waits (GPU-side) for the graphics inputs to be in flight.
         computeQueue.Wait(asyncFence, a);
-        // 3. Record + submit the compute work on this slot's compute allocator/list, then signal B on compute.
-        var cAlloc = computeAllocators[frameSlot];
-        var cList = computeLists[frameSlot];
+        // 3. Record + submit the compute work on this hand-off's compute allocator/list, then signal B on compute.
+        //    The allocator is reset HERE (lazily) not in BeginFrame: BeginFrame's per-slot fence wait already proved
+        //    the slot's prior frame is GPU-complete, so this hand-off's allocator from that frame is free to reuse.
+        var cAlloc = computeAllocators[frameSlot, handoff];
+        var cList = computeLists[frameSlot, handoff];
         cAlloc.Reset();
         cList.Reset(cAlloc, null);
         record(cList);
@@ -660,7 +695,7 @@ public sealed class Dx12Device : IDisposable {
         //    AFTER this call waits, GPU-side, for the compute result. The CPU never blocked → graphics and compute
         //    overlap on the GPU between A and the consumer. frameList continues as the open frame list; EndFrame
         //    closes + submits this post-split segment normally.
-        frameList.Reset(framePostAllocators[frameSlot], null);
+        frameList.Reset(framePostAllocators[frameSlot, handoff], null);
         Queue.Wait(asyncFence, b);
     }
 
@@ -878,12 +913,18 @@ public sealed class Dx12Device : IDisposable {
         uploadFence.Dispose();
         uploadList.Dispose();
         uploadAllocator.Dispose();
-        // R1 async-compute resources (null unless AsyncComputeEnabled).
+        // R1 async-compute resources (null unless AsyncComputeEnabled). 2D [slot, handoff] — foreach over a 2D
+        // array enumerates every element, so this disposes all N hand-offs per slot.
         if (computeLists is not null) foreach (var l in computeLists) l.Dispose();
         if (computeAllocators is not null) foreach (var a in computeAllocators) a.Dispose();
         if (framePostAllocators is not null) foreach (var a in framePostAllocators) a.Dispose();
         asyncFence?.Dispose();
         computeQueue?.Dispose();
+        // PSO cache: serialise the disk library (best-effort, no-op if unused) THEN dispose it. Done before the
+        // device is released — the library is a device child. The memoised PSOs are owned by the passes, not the
+        // cache, so the cache disposes only the library (see Dx12PsoCache.Dispose).
+        psoCache?.SaveToDisk();
+        psoCache?.Dispose();
         infoQueue?.Dispose();
         Queue.Dispose();
         Device.Dispose();

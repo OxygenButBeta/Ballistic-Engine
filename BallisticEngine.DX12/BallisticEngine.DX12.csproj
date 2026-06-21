@@ -37,4 +37,32 @@
       </None>
     </ItemGroup>
 
+    <!-- Intel XeSS upscaler runtime (libxess.dll, Dx12XessUpscaler P/Invokes it). Runs an XMX path on Intel Arc
+         and a DP4a fallback on any SM6.4 GPU (incl. AMD/NVIDIA), so it is NOT vendor-locked. Condition'd so a
+         clean checkout without the gitignored native DLL still builds (XeSS self-disables → falls back to FSR). -->
+    <ItemGroup Condition="Exists('..\native\xess\bin\libxess.dll')">
+      <None Include="..\native\xess\bin\libxess.dll">
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        <Link>%(Filename)%(Extension)</Link>
+      </None>
+    </ItemGroup>
+
+    <!-- NVIDIA DLSS Super Resolution model snippet (nvngx_dlss.dll). The NGX CORE loader (nvngx.dll) is installed
+         system-wide by the NVIDIA driver, NOT shipped here; Dx12DlssUpscaler P/Invokes nvngx.dll and the core
+         loads this snippet from the exe dir. On a non-NVIDIA box (or no driver) nvngx.dll is absent → the first
+         P/Invoke throws → DLSS falls back to FSR. We also stage the Streamline interposer DLLs (sl.interposer.dll /
+         sl.dlss.dll) for completeness, though the NGX-direct path does not load them. All Condition'd on Exists. -->
+    <ItemGroup Condition="Exists('..\native\dlss\nvngx_dlss.dll')">
+      <None Include="..\native\dlss\nvngx_dlss.dll">
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        <Link>%(Filename)%(Extension)</Link>
+      </None>
+    </ItemGroup>
+    <ItemGroup Condition="Exists('..\native\dlss\sl\bin\x64\sl.interposer.dll')">
+      <None Include="..\native\dlss\sl\bin\x64\sl.interposer.dll;..\native\dlss\sl\bin\x64\sl.dlss.dll">
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        <Link>%(Filename)%(Extension)</Link>
+      </None>
+    </ItemGroup>
+
 </Project>

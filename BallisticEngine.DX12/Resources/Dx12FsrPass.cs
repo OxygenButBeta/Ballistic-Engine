@@ -1,4 +1,5 @@
 using System;
+using BallisticEngine;   // UpscaleMode / UpscalerKind
 
 namespace BallisticEngine.DX12;
 
@@ -17,11 +18,17 @@ namespace BallisticEngine.DX12;
 // Event = PostProcess (650), registered AFTER TaaPass (TAA and FSR are mutually exclusive: FsrPass.Enabled =
 // ctx.FsrActive, TaaPass.Enabled = !ctx.FsrActive, so exactly one runs). It writes ctx.FsrOutput and sets
 // ctx.SceneColor = FsrOutput — the canonical composite-input branch the Composite pass (event 700) then reads.
+// GENERIC UPSCALE PASS (was FSR-only): dispatches whichever upscaler family is active this frame — FSR
+// (vendor-agnostic, the universal fallback), NVIDIA DLSS (NGX), or Intel XeSS. Enabled == FsrActive (the master
+// "an upscaler runs" flag, mutually exclusive with TAA); ctx.ActiveUpscaler picks the concrete one. All three
+// write the SAME output-res HDR target (ctx.FsrOutput) and set ctx.SceneColor = it, so the rest of the frame is
+// upscaler-agnostic. The class keeps its name (Dx12FsrPass) + "FSR" event identity so the pass-graph registration
+// order / SHA matrix stays stable; the FSR path is byte-unchanged.
 public sealed class Dx12FsrPass : IRenderPass, IDisposable {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.PostProcess;
     public string Name => "FSR";
 
-    // The VERBATIM outer-if predicate: `if (fsrActive) { RunFsr(); ... }`.
+    // The VERBATIM outer-if predicate: `if (fsrActive) { RunFsr(); ... }`. FsrActive == ANY upscaler is active.
     public bool Enabled(Dx12FrameContext ctx) => ctx.FsrActive;
 
     // PHASE-2 V1: reads the G-buffer (depth + motion for the upscaler) and the HDR scene color, then WRITES the
@@ -57,27 +64,56 @@ public sealed class Dx12FsrPass : IRenderPass, IDisposable {
         Dx12OffscreenTarget target = ctx.Target;
         Dx12GBuffer gbuffer = ctx.GBuffer;
         Dx12OffscreenTarget fsrOutput = ctx.FsrOutput;
-        Dx12FsrUpscaler fsr = ctx.Fsr;
         int targetW = ctx.TargetW, targetH = ctx.TargetH;
-
-        // PHASE-2 V3: skip the manual SceneColor + depth heads when derived barriers are active (the graph
-        // emitted ctx.SceneColor.ColorToShaderResource() + gbuffer.DepthToShaderResource() before Record).
-        if (!ctx.BarriersDerived) {
-            target.ColorToShaderResource();  // internal HDR scene -> PixelShaderResource
-            gbuffer.DepthToShaderResource(); // depth -> PixelShaderResource
-        }
-        // motion RT is already PixelShaderResource (gbuffer.ToShaderResource transitioned all colors).
-        fsrOutput.ColorToUnorderedAccess();
         bool reset = !ctx.MotionPrevValid;    // first frame after a (re)allocation = reset the history
+
+        if (ctx.ActiveUpscaler == UpscalerKind.Fsr) {
+            // === VERBATIM FSR PATH (byte-unchanged) ===
+            // PHASE-2 V3: skip the manual SceneColor + depth heads when derived barriers are active (the graph
+            // emitted ctx.SceneColor.ColorToShaderResource() + gbuffer.DepthToShaderResource() before Record).
+            if (!ctx.BarriersDerived) {
+                target.ColorToShaderResource();  // internal HDR scene -> PixelShaderResource
+                gbuffer.DepthToShaderResource(); // depth -> PixelShaderResource
+            }
+            // motion RT is already PixelShaderResource (gbuffer.ToShaderResource transitioned all colors).
+            fsrOutput.ColorToUnorderedAccess();
+            dev.ExecuteSync(cl => {
+                ctx.Fsr.Dispatch(cl, target.RenderTarget, gbuffer.DepthResource,
+                    gbuffer.MotionResource, fsrOutput.RenderTarget,
+                    targetW, targetH, new Dx12FsrUpscaler.Vector2Jitter(ctx.CurrentJitter.X, ctx.CurrentJitter.Y),
+                    16.6667f, reset, ctx.PostFX.UpscaleSharpness > 0f, ctx.PostFX.UpscaleSharpness,
+                    CameraNear, CameraFar, FovYRadians);
+            });
+            fsrOutput.ColorToShaderResource();    // ready for the composite to sample
+            ctx.SceneColor = fsrOutput;           // the canonical composite-input branch
+            return;
+        }
+
+        // === VENDOR PATH (DLSS / XeSS) ===
+        // Both NGX and XeSS read their inputs from a COMPUTE stage and the D3D12 contracts require
+        // NON_PIXEL_SHADER_RESOURCE (XeSS explicitly; NGX evaluates in compute). The G-buffer's ToShaderResource
+        // already left depth+motion in the combined PIXEL|NON_PIXEL superset (valid for both). Re-transition the
+        // scene color (FSR's derived head left it PixelShaderResource) to NON_PIXEL so the compute read is legal.
+        target.ColorToNonPixelShaderResource();
+        gbuffer.DepthToNonPixelShaderResource();   // idempotent if already in the superset
+        fsrOutput.ColorToUnorderedAccess();
+        bool ok = false;
         dev.ExecuteSync(cl => {
-            fsr.Dispatch(cl, target.RenderTarget, gbuffer.DepthResource,
-                gbuffer.MotionResource, fsrOutput.RenderTarget,
-                targetW, targetH, new Dx12FsrUpscaler.Vector2Jitter(ctx.CurrentJitter.X, ctx.CurrentJitter.Y),
-                16.6667f, reset, ctx.PostFX.UpscaleSharpness > 0f, ctx.PostFX.UpscaleSharpness,
-                CameraNear, CameraFar, FovYRadians);
+            if (ctx.ActiveUpscaler == UpscalerKind.Dlss && ctx.Dlss != null)
+                ok = ctx.Dlss.Dispatch(cl, target.RenderTarget, gbuffer.DepthResource,
+                    gbuffer.MotionResource, fsrOutput.RenderTarget,
+                    targetW, targetH, ctx.CurrentJitter.X, ctx.CurrentJitter.Y, reset);
+            else if (ctx.ActiveUpscaler == UpscalerKind.Xess && ctx.Xess != null)
+                ok = ctx.Xess.Dispatch(cl, target.RenderTarget, gbuffer.DepthResource,
+                    gbuffer.MotionResource, fsrOutput.RenderTarget,
+                    targetW, targetH, ctx.CurrentJitter.X, ctx.CurrentJitter.Y, reset);
         });
-        fsrOutput.ColorToShaderResource();    // ready for the composite to sample
-        ctx.SceneColor = fsrOutput;           // the canonical composite-input branch
+        fsrOutput.ColorToShaderResource();
+        ctx.SceneColor = fsrOutput;
+        // The vendor upscaler may fail at runtime (e.g. CreateFeature failed mid-session). Output is then
+        // whatever was last in fsrOutput — not a crash; the next EnsureUpscaleTargets will re-resolve and can
+        // latch the family unavailable so it falls back to FSR. (ok is consumed only for that purpose.)
+        _ = ok;
     }
 
     public void Dispose() { }   // owns no resources (ctx.Fsr / ctx.FsrOutput are orchestrator-owned)

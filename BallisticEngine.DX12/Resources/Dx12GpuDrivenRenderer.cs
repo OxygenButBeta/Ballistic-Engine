@@ -193,11 +193,12 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         };
         skinRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(RootSignatureFlags.None, skinParams)));
-        skinPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription {
+        // PSO cache (proof migration): dedupe + warm-load. Each name is a unique disk-library key.
+        skinPso = dev.CreateComputePso(new ComputePipelineStateDescription {
             RootSignature = skinRootSig,
             ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute,
                 EmbeddedShaderSource.ReadHlsl("SkinCompute.hlsl"), "CSMain", "SkinCompute.hlsl"),
-        });
+        }, "GpuDriven.Skin");
 
         // --- R4 mesh-shader meshlet pipeline (AS+MS+PS). Root sig: root const b0 (DrawIndex/MeshletBase/Count) +
         // root SRV t0..t9 (PerDraws, GpuMaterials, Meshlets, Bounds, Verts, Prims, Pos, Normal, UV, Tangent) + CBV
@@ -236,10 +237,10 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         }
 
         string cullHlsl = EmbeddedShaderSource.ReadHlsl("GpuCull.hlsl");
-        cullPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription {
+        cullPso = dev.CreateComputePso(new ComputePipelineStateDescription {
             RootSignature = geoCullRootSig,
             ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, cullHlsl, "CSMain", "GpuCull.hlsl"),
-        });
+        }, "GpuDriven.Cull");
 
         // --- Draw root sig: root const b0 (DrawIndex) + SRV t0 (PerDraws) + SRV t1 (GpuMaterials) +
         // CBV b1 (MotionConstants, per pass — matches the CPU GBuffer.hlsl b1) + bindless ---
@@ -268,14 +269,14 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             new InputElementDescription("NORMAL", 0, Vortice.DXGI.Format.R32G32B32_Float, 0, 1),
             new InputElementDescription("TEXCOORD", 0, Vortice.DXGI.Format.R32G32_Float, 0, 2),
             new InputElementDescription("TANGENT", 0, Vortice.DXGI.Format.R32G32B32A32_Float, 0, 3));
-        drawPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+        drawPso = dev.CreateGraphicsPso(new GraphicsPipelineStateDescription {
             RootSignature = drawRootSig, VertexShader = vs, PixelShader = ps, InputLayout = layout,
             PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
             RasterizerState = RasterizerDescription.CullClockwise,   // back-face cull (matches CPU GBuffer PSO)
             BlendState = BlendDescription.Opaque, DepthStencilState = DepthStencilDescription.Default,
             RenderTargetFormats = Dx12GBuffer.ColorFormats,
             DepthStencilFormat = Dx12GBuffer.DepthFormat, SampleDescription = new Vortice.DXGI.SampleDescription(1, 0),
-        });
+        }, "GpuDriven.Draw");
 
         // Command signature: [Constant -> root param 0][DrawIndexed]. References drawRootSig (root const).
         var argConstant = new IndirectArgumentDescription { Type = IndirectArgumentType.Constant };
@@ -916,10 +917,10 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
 
     unsafe void BuildShadowPipelines() {
         string cullHlsl = EmbeddedShaderSource.ReadHlsl("GpuCullShadow.hlsl");
-        shadowCullPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription {
+        shadowCullPso = dev.CreateComputePso(new ComputePipelineStateDescription {
             RootSignature = cullRootSig,   // same layout: CBV b0 + SRV t0 + UAV u0/u1
             ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, cullHlsl, "CSMain", "GpuCullShadow.hlsl"),
-        });
+        }, "GpuDriven.ShadowCull");
 
         // Draw root sig: root const b0 (DrawIndex) + SRV t0 (ShadowPerDraws). Depth-only, no samplers.
         var drawParams = new[] {
@@ -935,13 +936,13 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             new InputElementDescription("POSITION", 0, Vortice.DXGI.Format.R32G32B32_Float, 0, 0));
         var raster = RasterizerDescription.CullClockwise;     // matches the CPU shadow PSO bias exactly
         raster.DepthBias = 2000; raster.SlopeScaledDepthBias = 2.5f; raster.DepthBiasClamp = 0f;
-        shadowDrawPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+        shadowDrawPso = dev.CreateGraphicsPso(new GraphicsPipelineStateDescription {
             RootSignature = shadowDrawRootSig, VertexShader = vs, PixelShader = default, InputLayout = layout,
             PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
             RasterizerState = raster, BlendState = BlendDescription.Opaque, DepthStencilState = DepthStencilDescription.Default,
             RenderTargetFormats = Array.Empty<Vortice.DXGI.Format>(),
             DepthStencilFormat = Dx12ShadowMap.DepthFormat, SampleDescription = new Vortice.DXGI.SampleDescription(1, 0),
-        });
+        }, "GpuDriven.ShadowDraw");
 
         var argConstant = new IndirectArgumentDescription { Type = IndirectArgumentType.Constant };
         argConstant.Constant.RootParameterIndex = 0;
