@@ -495,7 +495,12 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
 
         bool det = ctx.DeterministicCapture;
         var gbuffer = ctx.GBuffer;
-        var scene = ctx.SceneColor;
+        // Gather radiance from the CANONICAL lit HDR target (ctx.Target), NOT ctx.SceneColor: when an upscaler
+        // (FSR/DLSS/XeSS) is active, ctx.SceneColor already points at the not-yet-written fsrOutput at event 500,
+        // so reading it would gather an empty/stale image. ctx.Target is the real render-res lit color the
+        // deferred+sky passes wrote, valid in BOTH the native and upscaler paths (the bug-hunt's latent FSR
+        // concern, fixed at the source for this pass). Combine still ADDS into ctx.SceneColor (the on-screen one).
+        var scene = ctx.Target;
         Matrix4x4.Invert(ctx.Proj, out Matrix4x4 invProj);
 
         nearFieldCb.Write(new NearFieldConstants
