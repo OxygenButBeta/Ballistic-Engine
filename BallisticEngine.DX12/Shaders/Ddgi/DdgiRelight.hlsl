@@ -43,7 +43,7 @@ cbuffer DdgiRelightConstants : register(b0) {
     float3 SunDir;       float SunBias;       // TO the sun (normalized)
     float3 SunColor;     float LightCount;
     float  EmaAlpha;     float HistoryValid;  float Intensity;  float FrameJitter;  // FrameJitter<0 → fixed (deterministic)
-    float  MultiBounce;  float BounceBoost;   float UsePlacement; float Pad1;         // D4: 2nd-bounce; UsePlacement: occupancy-aware probe state active
+    float  MultiBounce;  float BounceBoost;   float UsePlacement; float ValidateOn;   // D4: 2nd-bounce; UsePlacement: occupancy-aware; A5: ValidateOn = per-texel luma-ratio EMA boost (was Pad1)
 };
 SamplerState LinearClamp : register(s0);
 
@@ -314,7 +314,30 @@ void CSMain(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
 
         uint idx = probe * OctTexels + texel;
         float3 prev = PrevIrrad[idx].rgb;
-        float3 blended = lerp(prev, E, alpha);
+
+        // A5 — cache-space sample validation (kajiya diffuse_validate CONCEPT, adapted to the cache-space EMA;
+        // NO screen history, NO temporal feedback → tek-loop felsefe intact). The single global hysteresis can't
+        // see a PER-TEXEL staleness: when a light moves or a probe's view of the world changes, that one octahedral
+        // direction's new estimate E jumps sharply vs the cached prev, but the low EMA alpha would crawl toward it
+        // over ~30 frames (the visible GI lag). Detect the per-texel luminance RATIO between prev and E: a large
+        // jump (either direction) BOOSTS alpha toward 1 so the cache re-converges immediately where it went stale,
+        // while a small ratio leaves the low alpha untouched (clean, flicker-free convergence on a settled scene).
+        // This STRENGTHENS the single loop (faster correct convergence) rather than adding a second one. Also the
+        // Lumen-runaway cure: a sudden bright jump that would otherwise compound through the EMA is instead taken
+        // in (mostly) one step and then held, instead of ratcheting up frame after frame.
+        float adaptAlpha = alpha;
+        if (ValidateOn > 0.5 && HistoryValid > 0.5) {
+            float lp = dot(prev, float3(0.2126, 0.7152, 0.0722));
+            float le = dot(E,    float3(0.2126, 0.7152, 0.0722));
+            // Symmetric luminance ratio in [0,1]: 1 = identical, →0 = large jump (brighter OR darker).
+            float ratio = min(lp, le) / max(max(lp, le), 1e-5);
+            float staleness = 1.0 - ratio;                       // 0 = stable, 1 = total change
+            // Map staleness → an alpha boost. A small change (<~15%) keeps the base alpha; a large change ramps
+            // alpha up to a fast-converge cap so the stale texel snaps to the new value in a couple of frames.
+            float boost = smoothstep(0.15, 0.6, staleness);
+            adaptAlpha = lerp(alpha, max(alpha, 0.6), boost);
+        }
+        float3 blended = lerp(prev, E, adaptAlpha);
         // Firefly / runaway guard — an Inf/NaN + EMA-compounding catch, NOT a brightness cap. The OLD ceiling (32)
         // was sized for skylight irradiance, but a point/area light's first-bounce irradiance is legitimately
         // ~1e3–1e5 HDR (PunctualIntensityScale × inverse-square), the SAME scale the deferred direct lighting feeds

@@ -83,7 +83,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         public Vector3 SunDir;       public float SunBias;
         public Vector3 SunColor;     public float LightCount;
         public float EmaAlpha;       public float HistoryValid; public float Intensity; public float FrameJitter;
-        public float MultiBounce;    public float BounceBoost;  public float UsePlacement; public float Pad1;
+        public float MultiBounce;    public float BounceBoost;  public float UsePlacement; public float ValidateOn;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -385,6 +385,10 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
                           : (ctx.PostFX.DdgiMultiBounce ? 1f : 0f),
             BounceBoost = EnvF("BALLISTIC_DX12_DDGI_BOUNCE_BOOST", 1f),
             UsePlacement = (placementEnabled && grid.StatePlaced) ? 1f : 0f,
+            // A5: per-texel luma-ratio EMA boost (cache-space validation). Default ON; =0 = legacy fixed-alpha EMA
+            // (byte-identical to pre-A5). Deterministic capture uses HistoryValid=0 (full replace) so it's inert
+            // there → goldens unchanged regardless of this flag.
+            ValidateOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_VALIDATE") == "0" ? 0f : 1f,
         });
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
