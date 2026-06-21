@@ -112,22 +112,23 @@ public static class VolumePostProcessing {
             fx.DustSparkle = vlit.dustSparkle.Value;
         }
 
-        if (stack.GetComponent<GlobalIllumination>() is { } gi) {
-            fx.LumenEnabled = gi.enabled.Value;
-            fx.LumenIntensity = gi.intensity.Value;
-            fx.LumenSkyIntensity = gi.skyIntensity.Value;
-            fx.LumenRayCount = gi.rayCount.Value;
-            fx.LumenMultiBounce = gi.multiBounce.Value;
-            fx.LumenAoStrength = gi.aoStrength.Value;
-            // Quality tier → (probeOct, cardBudget, denoisePasses). Custom honours the per-dial overrides.
+        if (stack.GetComponent<GiVolume>() is { } gi) {
+            fx.DdgiEnabled = gi.enabled.Value;
+            fx.DdgiIntensity = gi.intensity.Value;
+            fx.DdgiSkyIntensity = gi.skyIntensity.Value;
+            fx.DdgiEmaAlpha = gi.emaAlpha.Value;
+            fx.DdgiMultiBounce = gi.multiBounce.Value;
+            fx.DdgiVisibility = gi.visibility.Value;
+            fx.DdgiAoStrength = gi.aoStrength.Value;
+            // Quality tier → probe grid resolution. Custom honours the per-axis counts.
             switch (gi.quality.Value) {
-                case GiQuality.High:        fx.LumenProbeOct = 8; fx.LumenCardBudget = 200000; fx.LumenDenoisePasses = 3; break;
-                case GiQuality.Balanced:    fx.LumenProbeOct = 6; fx.LumenCardBudget = 50000;  fx.LumenDenoisePasses = 1; break;
-                case GiQuality.Performance: fx.LumenProbeOct = 4; fx.LumenCardBudget = 25000;  fx.LumenDenoisePasses = 1; break;
+                case GiQuality.High:        fx.DdgiGridX = 24; fx.DdgiGridY = 12; fx.DdgiGridZ = 24; break;
+                case GiQuality.Balanced:    fx.DdgiGridX = 16; fx.DdgiGridY = 8;  fx.DdgiGridZ = 16; break;
+                case GiQuality.Performance: fx.DdgiGridX = 10; fx.DdgiGridY = 6;  fx.DdgiGridZ = 10; break;
                 default: // Custom
-                    fx.LumenProbeOct = gi.probeOct.Value;
-                    fx.LumenCardBudget = gi.cardBudget.Value;
-                    fx.LumenDenoisePasses = gi.denoisePasses.Value;
+                    fx.DdgiGridX = gi.gridX.Value;
+                    fx.DdgiGridY = gi.gridY.Value;
+                    fx.DdgiGridZ = gi.gridZ.Value;
                     break;
             }
         }
@@ -138,7 +139,7 @@ public static class VolumePostProcessing {
             fx.ReflectionMode = refl.mode.Value;
             fx.SsrEnabled = refl.mode.Value != ReflectionMode.Off;
             fx.SsrIntensity = refl.intensity.Value;
-            fx.LumenReflections = refl.sampleRadianceCache.Value;
+            fx.DdgiReflections = refl.sampleRadianceCache.Value;
         }
 
         if (stack.GetComponent<AerialPerspective>() is { } aerial) {

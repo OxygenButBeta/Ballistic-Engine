@@ -74,6 +74,22 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     [StructLayout(LayoutKind.Sequential)]
     struct CombineConstants { public float AoStrength; public float Intensity; public float Pad0; public float Pad1; }
 
+    // ---- debug probe overlay (BALLISTIC_DX12_DDGI_DEBUG_PROBES=1) ----
+    ID3D12RootSignature debugRootSig;
+    ID3D12PipelineState debugPso;
+    Dx12FrameCb<DebugConstants> debugCb;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct DebugConstants
+    {
+        public Matrix4x4 ViewProj;
+        public Vector3 GridOrigin;   public float ProbeRadius;
+        public Vector3 ProbeSpacing; public float Pad0;
+        public Vector3 CameraRight;  public float Pad1;
+        public Vector3 CameraUp;     public float Pad2;
+        public uint CountX, CountY, CountZ; public uint Pad3;
+    }
+
     public Dx12DdgiPass(Dx12Device device, int width, int height)
     {
         dev = device;
@@ -91,7 +107,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             string v = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI");
             envDoor = v == "1" ? 1 : v == "0" ? 0 : -1;
         }
-        return envDoor == 1 || (envDoor == -1 && ctx.PostFX.LumenEnabled);
+        return envDoor == 1 || (envDoor == -1 && ctx.PostFX.DdgiEnabled);
     }
 
     public static bool WouldRun(Dx12FrameContext ctx) =>
@@ -99,11 +115,14 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
 
     public bool Enabled(Dx12FrameContext ctx) => WouldRun(ctx);
 
-    static int gridX = -1, gridY, gridZ;
-    static void ReadGrid()
+    int gridX, gridY, gridZ;
+    // Resolve the probe grid resolution: the GI volume (PostFX) drives it; BALLISTIC_DX12_DDGI_GRID="XxYxZ"
+    // overrides for A/B. Read per-frame so a volume/quality-tier change takes effect live.
+    void ReadGrid(Dx12FrameContext ctx)
     {
-        if (gridX >= 0) return;
-        gridX = 16; gridY = 8; gridZ = 16;
+        gridX = Math.Max(2, ctx.PostFX.DdgiGridX);
+        gridY = Math.Max(2, ctx.PostFX.DdgiGridY);
+        gridZ = Math.Max(2, ctx.PostFX.DdgiGridZ);
         string v = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_GRID");
         if (!string.IsNullOrEmpty(v))
         {
@@ -133,7 +152,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
 
     public unsafe void Record(Dx12FrameContext ctx)
     {
-        ReadGrid();
+        ReadGrid(ctx);
         frameCounter++;
 
         // Build/refresh the shared TLAS (DDGI may be the first RT effect in the frame — RT shadows/reflections
@@ -155,17 +174,56 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         Relight(ctx, sceneAS, rtGeo);
         Sample(ctx);
         Combine(ctx);
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_DEBUG_PROBES") == "1")
+            DrawProbes(ctx);
     }
 
     bool logged;
+
+    // Debug overlay: draw every probe as a small world-space sphere tinted by its irradiance, depth-tested
+    // against the scene. Instanced billboard (6 verts × ProbeCount). Opt-in, after combine.
+    unsafe void DrawProbes(Dx12FrameContext ctx)
+    {
+        var target = ctx.SceneColor;
+        var gbuffer = ctx.GBuffer;
+
+        // Camera right/up from the view matrix rows (the billboard faces the camera).
+        Matrix4x4 v = ctx.View;
+        Vector3 camRight = new(v.M11, v.M21, v.M31);
+        Vector3 camUp = new(v.M12, v.M22, v.M32);
+        float radius = 0.25f * MathF.Min(grid.ProbeSpacing.X, MathF.Min(grid.ProbeSpacing.Y, grid.ProbeSpacing.Z));
+        radius = MathF.Max(radius, 0.05f);
+
+        debugCb.Write(new DebugConstants
+        {
+            ViewProj = Matrix4x4.Transpose(ctx.ViewProj),
+            GridOrigin = grid.GridOrigin, ProbeRadius = radius,
+            ProbeSpacing = grid.ProbeSpacing,
+            CameraRight = camRight, CameraUp = camUp,
+            CountX = (uint)grid.CountX, CountY = (uint)grid.CountY, CountZ = (uint)grid.CountZ,
+        });
+
+        var irrad = grid.IrradianceRead;   // this frame's irradiance (post-swap)
+        gbuffer.DepthToReadOnly();          // depth as a DSV the overlay tests against (no write)
+
+        target.RenderColorWithExternalDepth(gbuffer.DsvHandle, cl =>
+        {
+            cl.SetGraphicsRootSignature(debugRootSig);
+            cl.SetPipelineState(debugPso);
+            cl.SetGraphicsRootConstantBufferView(0, debugCb.Gpu);
+            cl.SetGraphicsRootShaderResourceView(1, irrad.GPUVirtualAddress);
+            cl.IASetPrimitiveTopology(Vortice.Direct3D.PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(6, (uint)grid.ProbeCount, 0, 0);
+        });
+    }
 
     // ---- Pass 1: per-probe relight ----
     unsafe void Relight(Dx12FrameContext ctx, Dx12SceneAS sceneAS, Dx12RtGeometry rtGeo)
     {
         Vector3 sunDir = ctx.LightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(ctx.LightDir);
         bool useSky = ctx.Ibl != null;
-        float intensity = EnvF("BALLISTIC_DX12_DDGI_INTENSITY", ctx.PostFX.LumenIntensity);
-        float ema = EnvF("BALLISTIC_DX12_DDGI_ALPHA", 0.05f);
+        float intensity = EnvF("BALLISTIC_DX12_DDGI_INTENSITY", ctx.PostFX.DdgiIntensity);
+        float ema = EnvF("BALLISTIC_DX12_DDGI_ALPHA", ctx.PostFX.DdgiEmaAlpha);
         // Under a deterministic capture the per-frame jitter must be fixed (golden byte-identical) AND the EMA
         // history must not change frame-to-frame → full replace (HistoryValid 0).
         bool det = ctx.DeterministicCapture;
@@ -181,7 +239,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         relightCb.Write(new RelightConstants
         {
             GridOrigin = grid.GridOrigin, RayCount = RelightRays,
-            ProbeSpacing = grid.ProbeSpacing, SkyIntensity = EnvF("BALLISTIC_DX12_DDGI_SKY", ctx.PostFX.LumenSkyIntensity),
+            ProbeSpacing = grid.ProbeSpacing, SkyIntensity = EnvF("BALLISTIC_DX12_DDGI_SKY", ctx.PostFX.DdgiSkyIntensity),
             CountX = (uint)grid.CountX, CountY = (uint)grid.CountY, CountZ = (uint)grid.CountZ,
             UseSky = useSky ? 1f : 0f,
             SunDir = sunDir, SunBias = 0.05f,
@@ -189,7 +247,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             EmaAlpha = ema, HistoryValid = (grid.HistoryValid && !det) ? 1f : 0f,
             Intensity = intensity, FrameJitter = det ? -1f : (frameCounter % 64),
             MultiBounce = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_NOBOUNCE") == "1" ? 0f
-                          : (ctx.PostFX.LumenMultiBounce ? 1f : 0f),
+                          : (ctx.PostFX.DdgiMultiBounce ? 1f : 0f),
             BounceBoost = EnvF("BALLISTIC_DX12_DDGI_BOUNCE_BOOST", 1f),
         });
 
@@ -248,7 +306,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             CountX = (uint)grid.CountX, CountY = (uint)grid.CountY, CountZ = (uint)grid.CountZ,
             W = (uint)indirect.Width, H = (uint)indirect.Height,
             Intensity = 1f,
-            UseVisibility = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_NOVIS") == "1" ? 0f : 1f,
+            UseVisibility = (Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_NOVIS") == "1" || !ctx.PostFX.DdgiVisibility) ? 0f : 1f,
         });
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
@@ -287,7 +345,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
 
         combineCb.Write(new CombineConstants
         {
-            AoStrength = ctx.PostFX.LumenAoStrength,
+            AoStrength = ctx.PostFX.DdgiAoStrength,
             Intensity = 1f,
         });
 
@@ -316,6 +374,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         BuildRelightPipeline();
         BuildSamplePipeline();
         BuildCombinePipeline();
+        BuildDebugPipeline();
     }
 
     unsafe void BuildRelightPipeline()
@@ -394,6 +453,32 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             3, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
+    unsafe void BuildDebugPipeline()
+    {
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var irrad = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.All);  // t0 Irradiance (root SRV)
+        debugRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, irrad }, System.Array.Empty<StaticSamplerDescription>())));
+
+        string hlsl = EmbeddedShaderSource.ReadHlsl("DdgiDebugProbes.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "DdgiDebugProbes.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "DdgiDebugProbes.hlsl");
+        // Depth-tested (LessEqual, no write) against the scene depth so probes behind geometry are hidden; OPAQUE.
+        var ds = DepthStencilDescription.Default;
+        ds.DepthWriteMask = DepthWriteMask.Zero;
+        ds.DepthFunc = ComparisonFunction.LessEqual;
+        debugPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription
+        {
+            RootSignature = debugRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
+            DepthStencilState = ds,
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
+            DepthStencilFormat = Dx12GBuffer.DepthFormat, SampleDescription = new SampleDescription(1, 0),
+        });
+        debugCb = new Dx12FrameCb<DebugConstants>(dev);
+    }
+
     static StaticSamplerDescription StaticClamp(int reg, ShaderVisibility vis = ShaderVisibility.All) => new(vis, (uint)reg, 0u)
     {
         Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
@@ -405,9 +490,9 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     {
         grid.Dispose();
         indirect?.Dispose();
-        relightCb?.Dispose(); sampleCb?.Dispose(); combineCb?.Dispose();
+        relightCb?.Dispose(); sampleCb?.Dispose(); combineCb?.Dispose(); debugCb?.Dispose();
         sampleSrv?.Dispose(); combineSrv?.Dispose();
-        relightRootSig?.Dispose(); sampleRootSig?.Dispose(); combineRootSig?.Dispose();
-        relightPso?.Dispose(); samplePso?.Dispose(); combinePso?.Dispose(); combineDebugPso?.Dispose();
+        relightRootSig?.Dispose(); sampleRootSig?.Dispose(); combineRootSig?.Dispose(); debugRootSig?.Dispose();
+        relightPso?.Dispose(); samplePso?.Dispose(); combinePso?.Dispose(); combineDebugPso?.Dispose(); debugPso?.Dispose();
     }
 }

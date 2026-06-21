@@ -388,7 +388,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         // GI-shared reflections (D5): sample the DDGI probe grid at reflection hits when GI is active + the grid
         // is valid, so rough reflections see the same GI the diffuse does. Wired in D5 — until then DdgiGrid is
         // null so this is false and the hit re-shades direct+IBL (the no-GI reflection path).
-        bool useCards = ctx.GiActiveThisFrame && ctx.DdgiGrid is { Valid: true } && ctx.PostFX.LumenReflections
+        bool useCards = ctx.GiActiveThisFrame && ctx.DdgiGrid is { Valid: true } && ctx.PostFX.DdgiReflections
                         && ReflCardsAllowed;
         rtReflCb.Write(new RtReflConstants {
             InvViewProj = Matrix4x4.Transpose(invVP), CameraPos = camPos, Intensity = ForcedIntensity(ctx),
