@@ -102,6 +102,11 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
     float3 sum = 0.0.xxx; float wsum = 0.0;
     float3 sumNoVis = 0.0.xxx; float wsumNoVis = 0.0;   // parallel visibility-free gather (fallback for sub-cell geometry)
+    float3 sumRaw = 0.0.xxx; float wsumRaw = 0.0;       // LAST-resort gather: ignores BOTH visibility AND the active
+                                                        // flag, so a surface bracketed entirely by inactive/dead probes
+                                                        // (placement marked the whole cell solid) still gets soft GI
+                                                        // instead of a pure-black hole — the real cause of the black
+                                                        // sphere underside (every bracketing probe was inactive).
     [unroll] for (int i = 0; i < 8; i++) {
         int3 off = int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
         uint3 c = (uint3)clamp(baseC + off, int3(0, 0, 0), int3(CountX - 1, CountY - 1, CountZ - 1));
@@ -147,11 +152,16 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         float wNoVis = trilinear * backWeight * probeActive;   // fallback still excludes dead probes
         sumNoVis += probeE * wNoVis;
         wsumNoVis += wNoVis;
+
+        float wRaw = trilinear * backWeight;                   // last-resort: ignore visibility AND active flag
+        sumRaw += probeE * wRaw;
+        wsumRaw += wRaw;
     }
 
     float3 E;
-    if (wsum > 1e-3) E = sum / wsum;                       // normal: visibility-weighted gather
-    else if (wsumNoVis > 1e-4) E = sumNoVis / wsumNoVis;   // fallback: every probe was rejected → no-visibility gather
+    if (wsum > 1e-3) E = sum / wsum;                       // normal: visibility-weighted, active-only gather
+    else if (wsumNoVis > 1e-4) E = sumNoVis / wsumNoVis;   // fallback 1: drop Chebyshev (sub-cell geometry)
+    else if (wsumRaw > 1e-4) E = sumRaw / wsumRaw;         // fallback 2: drop the active flag too (all-dead bracket)
     else E = 0.0.xxx;
     // Fold the receiver Lambert BRDF (albedo/π) HERE, in the compute pass, instead of in the combine PS. The combine
     // then only does an additive blend of a finished diffuse-indirect color and never binds the G-buffer — which
