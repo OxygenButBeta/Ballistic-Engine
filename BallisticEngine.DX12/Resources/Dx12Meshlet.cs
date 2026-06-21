@@ -22,6 +22,8 @@ internal sealed class Dx12MeshletData {
     public ID3D12Resource Verts;           // uint[]
     public ID3D12Resource Prims;           // uint[] (packed local tri indices)
     public int MeshletCount;
+    public int VertCount;                  // total elements in Verts (for the vis-buffer bindless SRV NumElements)
+    public int PrimCount;                  // total elements in Prims
 }
 
 internal static class Dx12Meshlet {
@@ -95,6 +97,8 @@ internal static class Dx12Meshlet {
         data.Bounds = Upload(dev, bounds.ToArray());
         data.Verts = Upload(dev, vertList.ToArray());
         data.Prims = Upload(dev, primList.ToArray());
+        data.VertCount = vertList.Count;
+        data.PrimCount = primList.Count;
         cache[key] = data;
         return data;
     }
