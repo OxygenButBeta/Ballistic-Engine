@@ -83,7 +83,14 @@
 - **B4. soft_color_clamp + working-color-space (crunch) reflection temporal** ⏳
   kajiya `inc/soft_color_clamp.hlsl` + `working_color_space.hlsl`. Anti-ghosting drop-in.
 
-### FAZ C — TAA + post cila
+### FAZ C — TAA + post cila — İLERLEME
+- **Checkpoint review #1 ✓:** B3 RTR reservoir SKIP (B1/B2/multiray zaten çözdü), C3 SKIP (TAA pre-exposure
+  HDR → pump yok), FAZ D hepsi SKIP (15ms headroom'da perf rework, 0 fidelity). DO-NOW: C1/C6/C4.
+- **C1+C4+C6 ✓** TAA soft clamp + confidence-widened box + firefly input clamp. `70b1ed3c`. TAA det'te
+  kapalı → goldens byte-id. Live run temiz. DO-LATER: C5 (dilated velocity), C2 (perceptual space), C7 (sharpen+TPDF).
+- **[bug-hunt #4 sırada]** TAA C1/C4/C6 — sole-AA feedback loop, ghosting/instability/NaN denetimi.
+
+### FAZ C — kalan
 - **C1. soft_color_clamp → mevcut TAA clip** (drop-in, 5 satır)
 - **C2. Perceptual (sqrt-luma/crunch) accumulation space TAA**
 - **C3. Pre-exposure delta history compensation** (histogram exposure var → pump fix)

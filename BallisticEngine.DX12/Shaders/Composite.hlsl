@@ -188,5 +188,17 @@ float4 PSMain(VSOut i) : SV_Target {
         float n = Hash(i.Uv * ScreenSize + GrainTime) - 0.5;
         srgb += n * FilmGrain;
     }
+
+    // C7 — TPDF (triangular-PDF) output dither (kajiya post_combine). 8-bit quantization of a smooth gradient
+    // (the Hillaire sky especially) bands visibly; a triangular-PDF dither of ±1 LSB decorrelates the quantization
+    // error so the banding dissolves into imperceptible noise — cleaner than the rectangular/ordered dither most
+    // engines ship, and far cheaper than more bits. TPDF = difference of two independent uniforms. Deterministic
+    // (per-pixel hash, no time term) so golden captures stay byte-stable; it's a quantization-correctness step,
+    // applied to ALL frames (not gated like grain). Scale = 1 LSB at 8-bit.
+    float2 px = i.Uv * ScreenSize;
+    float r1 = Hash(px + 0.5);
+    float r2 = Hash(px * 1.37 + 11.7);
+    float tpdf = (r1 - r2) * (1.0 / 255.0);                 // triangular PDF in [-1/255, +1/255]
+    srgb += tpdf;
     return float4(saturate(srgb), 1.0);
 }
