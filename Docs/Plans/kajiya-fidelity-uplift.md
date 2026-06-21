@@ -129,7 +129,15 @@ notu yanlıştı). DoF/MotionBlur/Sky zaten motor'da eşdeğer/daha iyi.
 bug yakalandı+düzeltildi. Perf: gpuFrame 0.85ms (Bistro ext 2.8M tris, her şey açık) → 60fps bol başlık.
 Hepsi: byte-id default-korumalı, deterministik, realtime, tek-loop GI felsefe-güvenli.
 
-### FAZ C — kalan (DO-LATER, ertelendi)
+- **C2 ✓ (artık YAPILDI):** Perceptual crunched sqrt-luma TAA accumulation. `7ec89bf0`. Door TAA_PERCEPTUAL
+  (default OFF, byte-id). CrunchYCoCg/Uncrunch round-trip. bug-hunt #7 F2 fix (`87be8b41`): crunch-consistent
+  firefly threshold (4×→2× sqrt-space).
+- **C7 sharpen ✓ (artık YAPILDI):** Perceptual luma-only edge-aware sharpen (kajiya post_combine). `1617ba78`.
+  Component-wise hue-shift/NaN riskini çözer (luma ratio, hue korunur). Door SHARPEN. bug-hunt #7 F3 fix
+  (`87be8b41`): sign-preserve (undershoot kararır). Det A==B, edge-lokalize etki.
+- **TÜM FAZ C İŞLENDİ (C1-C7).** Hiçbiri atlanmadı.
+
+### FAZ C — kalan (DO-LATER, hepsi yapıldı)
 - **C1. soft_color_clamp → mevcut TAA clip** (drop-in, 5 satır)
 - **C2. Perceptual (sqrt-luma/crunch) accumulation space TAA**
 - **C3. Pre-exposure delta history compensation** (histogram exposure var → pump fix)
