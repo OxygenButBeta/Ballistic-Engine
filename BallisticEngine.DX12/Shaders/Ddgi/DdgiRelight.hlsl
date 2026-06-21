@@ -178,7 +178,14 @@ float3 ShadeHit(uint instId, uint prim, float2 bary, float3 Pw) {
     if (MultiBounce > 0.5 && HistoryValid > 0.5)
         bounce = albedo * GatherPrevIrradiance(Pw, Nw) * (1.0 / 3.14159265359);
 
-    return albedo * (sun + punctual) + emissive + bounce;
+    // Lambert BRDF on the bounce surface: the radiance a diffuse surface re-emits from incident light is
+    // albedo/π · (sun + punctual). The /π was MISSING on direct sun+punctual here (deferred's ShadePunctual has
+    // it; the multi-bounce term above already uses albedo·E/π) — so the first bounce injected π× too much energy.
+    // Combined with PunctualIntensityScale (point radiance ~1e5) and the texel integral's ×π×Intensity, probes
+    // pinned at the firefly clamp (32) and the gather went flat → GI carried no contrast/colour, just a DC wash
+    // that vanished under exposure (the "GI does nothing / black sphere underside"). emissive is the surface's own
+    // emitted radiance (NOT reflected), so it does NOT take the /π.
+    return albedo * (sun + punctual) * (1.0 / 3.14159265359) + emissive + bounce;
 }
 
 [numthreads(RAYS, 1, 1)]
@@ -246,10 +253,14 @@ void CSMain(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
         uint idx = probe * OctTexels + texel;
         float3 prev = PrevIrrad[idx].rgb;
         float3 blended = lerp(prev, E, alpha);
-        // Firefly / runaway guard: cap the stored irradiance. A diffuse cache should never exceed the brightest
-        // direct light by much; without a cap a feedback error (or a fp16 Inf sun texel) compounds through the EMA
-        // into a screen-eating glow. Generous ceiling so real bright skylight survives, but finite.
-        blended = min(blended, 32.0.xxx);
+        // Firefly / runaway guard — an Inf/NaN + EMA-compounding catch, NOT a brightness cap. The OLD ceiling (32)
+        // was sized for skylight irradiance, but a point/area light's first-bounce irradiance is legitimately
+        // ~1e3–1e5 HDR (PunctualIntensityScale × inverse-square), the SAME scale the deferred direct lighting feeds
+        // into HDR before exposure. Clamping that to 32 pinned every probe near a light to a flat ceiling → the
+        // gather lost all contrast/colour → GI became an invisible DC wash (the dead-GI / black-sphere symptom).
+        // Keep a HIGH finite ceiling so a real fp16-Inf sun texel can't compound through the EMA, but let physical
+        // point/area bounce through untouched.
+        blended = min(blended, 65504.0.xxx);   // fp16 max — finite Inf guard, not a brightness cap
         Irradiance[idx] = float4(Sanitize(blended), 1.0);
     }
 
