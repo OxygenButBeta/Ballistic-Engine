@@ -51,6 +51,11 @@ public sealed class Dx12TaaPass : IRenderPass, IDisposable {
         // SceneColor→PSR transition, harmless (the ch15 Transparents idempotent-emit gotcha).
         b.DeriveBarriers();
         b.Use(Dx12ResourceUsage.SceneColorShaderRead);
+        // C5: TAA now also reads the G-buffer depth (t3) for closest-depth velocity dilation. Declare it so the
+        // barrier-deriver emits the depth→PSR head transition when the graph-barriers door is on (the inline
+        // gbuffer.DepthToShaderResource() is skipped under BarriersDerived). Without this, depth could be sampled
+        // in DepthRead state when a prior depth-writer (Sky/Transparents) was the last to touch it.
+        b.Use(Dx12ResourceUsage.GBufferDepthShaderRead);
     }
 
     [StructLayout(LayoutKind.Sequential)]
