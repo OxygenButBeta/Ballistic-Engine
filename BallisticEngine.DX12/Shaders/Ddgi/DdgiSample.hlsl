@@ -97,6 +97,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     float3 frac = saturate(g - (float3)baseC);
 
     float3 sum = 0.0.xxx; float wsum = 0.0;
+    float3 sumNoVis = 0.0.xxx; float wsumNoVis = 0.0;   // parallel visibility-free gather (fallback for sub-cell geometry)
     [unroll] for (int i = 0; i < 8; i++) {
         int3 off = int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
         uint3 c = (uint3)clamp(baseC + off, int3(0, 0, 0), int3(CountX - 1, CountY - 1, CountZ - 1));
@@ -124,10 +125,22 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         }
 
         float w = trilinear * backWeight * vis;
-        sum += SampleProbeOct(ProbeIndex(c), N) * w;
+        float3 probeE = SampleProbeOct(ProbeIndex(c), N);
+        sum += probeE * w;
         wsum += w;
+        // Visibility-free accumulation, kept in parallel as a FALLBACK. On small/thin geometry (a box smaller
+        // than the probe spacing) Chebyshev can reject EVERY bracketing probe — the surface self-occludes the
+        // nearby lit probes — so wsum collapses to ~0 and the pixel goes pure black even though light is right
+        // there. When that happens we fall back to the trilinear+backface gather (no visibility) so the face gets
+        // soft GI instead of a black hole. This is the standard DDGI safety net for sub-cell geometry.
+        float wNoVis = trilinear * backWeight;
+        sumNoVis += probeE * wNoVis;
+        wsumNoVis += wNoVis;
     }
 
-    float3 E = (wsum > 1e-4) ? sum / wsum : 0.0.xxx;
+    float3 E;
+    if (wsum > 1e-3) E = sum / wsum;                       // normal: visibility-weighted gather
+    else if (wsumNoVis > 1e-4) E = sumNoVis / wsumNoVis;   // fallback: every probe was rejected → no-visibility gather
+    else E = 0.0.xxx;
     Indirect[px] = float4(E * Intensity, 1.0);
 }
