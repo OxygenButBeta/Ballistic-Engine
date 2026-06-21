@@ -179,9 +179,13 @@ public sealed class Dx12DdgiProbeGrid : IDisposable
         GpuSceneQuery.SpaceClass[] cls = query.ClassifySpace(pts, radius);
         Vector3[] nudged = query.NudgeToFreeSpace(pts, radius);
 
-        // Cap the relocation so a probe never teleports out of its cell (which would corrupt the trilinear
-        // bracketing the sample relies on). A solid probe that can't move free within the cap is marked inactive.
-        float maxMove = 0.9f * MathF.Min(ProbeSpacing.X, MathF.Min(ProbeSpacing.Y, ProbeSpacing.Z));
+        // Cap the relocation. The sample gathers from the probe's MOVED position (offset is fed to the trilinear
+        // bracketing), so a relocation can spill into the neighbour cell without corrupting the gather — letting a
+        // probe buried deep in a thick wall slab escape to free space instead of being killed. Cap at ~1.5 cells
+        // (max axis) rather than 0.9 of the SMALLEST axis: the old tight cap killed most probes in scenes with thick
+        // walls / anisotropic spacing (the DGI box: min spacing 0.8 → cap 0.73, but the nudge out of a 10-unit slab
+        // needs far more → every slab probe went dead → black GI). Wider cap = far fewer dead probes = real GI.
+        float maxMove = 1.5f * MathF.Max(ProbeSpacing.X, MathF.Max(ProbeSpacing.Y, ProbeSpacing.Z));
 
         var state = new Vector4[n];
         for (int i = 0; i < n; i++)

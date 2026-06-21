@@ -202,8 +202,11 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         Relight(ctx, sceneAS, rtGeo);
         Sample(ctx);
         Combine(ctx);
-        // Probe-sphere debug overlay: GiVolume.debugProbes toggle OR the env door.
-        if (ctx.PostFX.DdgiDebugProbes || Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_DEBUG_PROBES") == "1")
+        // Probe-sphere debug overlay: GiVolume.debugProbes toggle OR the env door. BALLISTIC_DX12_DDGI_DEBUG_PROBES=0
+        // FORCE-disables it (overrides the volume) so a headless capture can see the real render even when the scene's
+        // GI volume left the overlay on.
+        string probesEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_DEBUG_PROBES");
+        if (probesEnv != "0" && (ctx.PostFX.DdgiDebugProbes || probesEnv == "1"))
             DrawProbes(ctx);
     }
 
