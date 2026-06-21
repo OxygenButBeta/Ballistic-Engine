@@ -59,6 +59,15 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     Dx12OffscreenTarget indirectFiltered; // full-res RGBA16F denoised E (Combine reads this when denoise ran)
     bool denoisedThisFrame;
 
+    // ---- A4: near-field SSGI complement (compute, reads current SceneColor; contact GI / crevice the coarse
+    // probes can't resolve). Spatial-only, no history. ----
+    ID3D12RootSignature nearFieldRootSig;
+    ID3D12PipelineState nearFieldPso;
+    Dx12FrameCb<NearFieldConstants> nearFieldCb;
+    Dx12DescriptorHeap nearFieldSrv;   // depth SRV + normal SRV + SceneColor SRV + NearField UAV (4)
+    Dx12OffscreenTarget nearField;     // full-res RGBA16F: rgb = near-field GI radiance, a = coverage
+    bool nearFieldThisFrame;
+
     // ---- combine (additive fullscreen) ----
     ID3D12RootSignature combineRootSig;
     ID3D12PipelineState combinePso, combineDebugPso;
@@ -88,13 +97,23 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    struct CombineConstants { public float AoStrength; public float Intensity; public float Pad0; public float Pad1; }
+    struct CombineConstants { public float AoStrength; public float Intensity; public float UseNearField; public float NearFieldBlend; }
 
     [StructLayout(LayoutKind.Sequential)]
     struct DenoiseConstants
     {
         public uint W, H; public float UseSsao; public float FrameIndex;   // FrameIndex<0 = deterministic (fixed spiral)
         public float Strength; public float Pad0, Pad1, Pad2;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct NearFieldConstants
+    {
+        public Matrix4x4 InvProjection;
+        public Matrix4x4 Projection;
+        public Matrix4x4 View;
+        public uint W, H; public float Radius; public float FrameIndex;
+        public float SliceCount; public float StepCount; public float Intensity; public float Thickness;
     }
 
     // ---- debug probe overlay (BALLISTIC_DX12_DDGI_DEBUG_PROBES=1) ----
@@ -215,6 +234,10 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         indirectFiltered?.Dispose();
         indirectFiltered = new Dx12OffscreenTarget(dev, width, height, colorFormat: Dx12OffscreenTarget.HdrFormat,
             colorReadable: true, allowUav: true);
+        // A4: near-field SSGI target (full-res RGBA16F; rgb = contact GI contribution, a = coverage).
+        nearField?.Dispose();
+        nearField = new Dx12OffscreenTarget(dev, width, height, colorFormat: Dx12OffscreenTarget.HdrFormat,
+            colorReadable: true, allowUav: true);
     }
 
     public unsafe void Record(Dx12FrameContext ctx)
@@ -247,6 +270,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
 
         Relight(ctx, sceneAS, rtGeo);
         Sample(ctx);
+        NearField(ctx);   // A4: reads SceneColor (lit, pre-DDGI-combine) → near-field one-bounce GI
         Denoise(ctx);
         Combine(ctx);
         // Probe-sphere debug overlay: GiVolume.debugProbes toggle OR the env door. BALLISTIC_DX12_DDGI_DEBUG_PROBES=0
@@ -459,6 +483,60 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         });
     }
 
+    // ---- A4: near-field SSGI complement (radiance-carrying horizon march on the current SceneColor) ----
+    unsafe void NearField(Dx12FrameContext ctx)
+    {
+        nearFieldThisFrame = false;
+        // Door BALLISTIC_DX12_DDGI_NEARFIELD (default ON; =0 = skip → no near-field, byte-identical pre-A4).
+        string env = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_NEARFIELD");
+        if (env == "0") return;
+        float intensity = EnvF("BALLISTIC_DX12_DDGI_NEARFIELD_INTENSITY", 1f);
+        if (intensity <= 0f) return;
+
+        bool det = ctx.DeterministicCapture;
+        var gbuffer = ctx.GBuffer;
+        var scene = ctx.SceneColor;
+        Matrix4x4.Invert(ctx.Proj, out Matrix4x4 invProj);
+
+        nearFieldCb.Write(new NearFieldConstants
+        {
+            InvProjection = Matrix4x4.Transpose(invProj),
+            Projection = Matrix4x4.Transpose(ctx.Proj),
+            View = Matrix4x4.Transpose(ctx.View),
+            W = (uint)nearField.Width, H = (uint)nearField.Height,
+            Radius = EnvF("BALLISTIC_DX12_DDGI_NEARFIELD_RADIUS", 0.8f),   // world metres — contact/crevice scale
+            FrameIndex = det ? -1f : (frameCounter & 1023),
+            SliceCount = 3f, StepCount = 6f,                              // half-budget march (realtime); TAA integrates
+            Intensity = intensity, Thickness = 0.5f,
+        });
+
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        // t0 depth, t1 normal (G1), t2 SceneColor (lit HDR), u0 NearField. All COMPUTE reads → non-pixel state.
+        gbuffer.DepthToNonPixelShaderResource();
+        scene.ColorToNonPixelShaderResource();
+        nearField.ColorToUnorderedAccess();
+        dev.Device.CopyDescriptorsSimple(1, nearFieldSrv.Cpu(0), gbuffer.DepthSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, nearFieldSrv.Cpu(1), gbuffer.ColorSrvCpu(1), heapType);  // t1 normal (G1)
+        dev.Device.CopyDescriptorsSimple(1, nearFieldSrv.Cpu(2), scene.ColorSrvCpu, heapType);       // t2 SceneColor
+        dev.Device.CopyDescriptorsSimple(1, nearFieldSrv.Cpu(3), gbuffer.ColorSrvCpu(0), heapType);  // t3 albedo (G0)
+        dev.Device.CreateUnorderedAccessView(nearField.RenderTarget, null,
+            new UnorderedAccessViewDescription { ViewDimension = UnorderedAccessViewDimension.Texture2D, Format = Dx12OffscreenTarget.HdrFormat },
+            nearFieldSrv.Cpu(4));
+
+        dev.ExecuteSync(cl =>
+        {
+            cl.SetDescriptorHeaps(nearFieldSrv.Heap);
+            cl.SetComputeRootSignature(nearFieldRootSig);
+            cl.SetPipelineState(nearFieldPso);
+            cl.SetComputeRootConstantBufferView(0, nearFieldCb.Gpu);
+            cl.SetComputeRootDescriptorTable(1, nearFieldSrv.Gpu(0));
+            cl.Dispatch((uint)((nearField.Width + 7) / 8), (uint)((nearField.Height + 7) / 8), 1);
+        });
+        // Restore SceneColor to a render-target state so Combine can additively blend into it.
+        scene.ColorToRenderTarget();
+        nearFieldThisFrame = true;
+    }
+
     // ---- A3: spatial denoise (variance/validity-driven adaptive à-trous; spatial-only, no temporal feedback) ----
     unsafe void Denoise(Dx12FrameContext ctx)
     {
@@ -533,6 +611,10 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         {
             AoStrength = ctx.PostFX.DdgiAoStrength,
             Intensity = 1f,
+            UseNearField = nearFieldThisFrame ? 1f : 0f,
+            // Near-field blend strength: how strongly the SSGI contact GI is added on top of the DDGI far-field
+            // (weighted per-pixel by the near-field coverage in nearField.a). 1 = full.
+            NearFieldBlend = nearFieldThisFrame ? EnvF("BALLISTIC_DX12_DDGI_NEARFIELD_BLEND", 1f) : 0f,
         });
 
         // A3: read the denoised indirect when the spatial filter ran this frame; otherwise the raw Sample output.
@@ -541,6 +623,14 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(0), src.ColorSrvCpu, heapType);     // t0 finished indirect (E*albedo/π)
+        // t1 near-field SSGI contribution. Bind the real target when it ran, else the indirect SRV as a harmless
+        // stand-in (UseNearField=0 makes the shader ignore it). Near-field is in UAV state from its dispatch.
+        if (nearFieldThisFrame) {
+            nearField.ColorToShaderResource();
+            dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(1), nearField.ColorSrvCpu, heapType);
+        } else {
+            dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(1), src.ColorSrvCpu, heapType);
+        }
 
         target.RenderColorOnly(cl =>
         {
@@ -558,6 +648,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     {
         BuildRelightPipeline();
         BuildSamplePipeline();
+        BuildNearFieldPipeline();
         BuildDenoisePipeline();
         BuildCombinePipeline();
         BuildDebugPipeline();
@@ -616,6 +707,27 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             4, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
+    unsafe void BuildNearFieldPipeline()
+    {
+        var cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        // One table: t0 depth, t1 normal, t2 SceneColor, t3 albedo (4 SRVs), then u0 NearField (UAV at offset 4).
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 4, baseShaderRegister: 0,
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 0);
+        var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0,
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 4);
+        var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange), ShaderVisibility.All);
+        var clamp = StaticClamp(0);
+        nearFieldRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv0, table }, new[] { clamp })));
+
+        string hlsl = EmbeddedShaderSource.ReadHlsl("DdgiNearField.hlsl");
+        byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSMain", "DdgiNearField.hlsl");
+        nearFieldPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription { RootSignature = nearFieldRootSig, ComputeShader = cs });
+        nearFieldCb = new Dx12FrameCb<NearFieldConstants>(dev);
+        nearFieldSrv = new Dx12DescriptorHeap(dev, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
+            5, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+    }
+
     unsafe void BuildDenoisePipeline()
     {
         var cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
@@ -646,7 +758,8 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         // bind (the G-buffer albedo at t1 reported as RENDER_TARGET) → the PS read zero albedo → E*albedo=0 → DDGI
         // added NOTHING (GI on/off byte-identical). DataVolatile only RELAXES a driver caching assumption (pixel-
         // neutral) and is the spec-correct flag for an aliasable resource; harmless for the committed G-buffer SRVs.
-        var range = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0,
+        // t0 Indirect (DDGI far), t1 NearField (A4 SSGI). Both transient/aliasable → DataVolatile.
+        var range = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 0,
             registerSpace: 0, offsetInDescriptorsFromTableStart: 0, flags: DescriptorRangeFlags.DataVolatile);
         var table = new RootParameter1(new RootDescriptorTable1(range), ShaderVisibility.Pixel);
         var clamp = StaticClamp(0, ShaderVisibility.Pixel);
@@ -671,7 +784,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         combineDebugPso = dev.Device.CreateGraphicsPipelineState(Make(psDebug, BlendDescription.Opaque));
         combineCb = new Dx12FrameCb<CombineConstants>(dev);
         combineSrv = new Dx12DescriptorHeap(dev, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
-            1, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+            2, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
     unsafe void BuildDebugPipeline()
@@ -711,10 +824,10 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     {
         grid.Dispose();
         placementQuery?.Dispose();
-        indirect?.Dispose(); indirectFiltered?.Dispose();
-        relightCb?.Dispose(); sampleCb?.Dispose(); denoiseCb?.Dispose(); combineCb?.Dispose(); debugCb?.Dispose();
-        sampleSrv?.Dispose(); denoiseSrv?.Dispose(); combineSrv?.Dispose();
-        relightRootSig?.Dispose(); sampleRootSig?.Dispose(); denoiseRootSig?.Dispose(); combineRootSig?.Dispose(); debugRootSig?.Dispose();
-        relightPso?.Dispose(); samplePso?.Dispose(); denoisePso?.Dispose(); combinePso?.Dispose(); combineDebugPso?.Dispose(); debugPso?.Dispose();
+        indirect?.Dispose(); indirectFiltered?.Dispose(); nearField?.Dispose();
+        relightCb?.Dispose(); sampleCb?.Dispose(); nearFieldCb?.Dispose(); denoiseCb?.Dispose(); combineCb?.Dispose(); debugCb?.Dispose();
+        sampleSrv?.Dispose(); nearFieldSrv?.Dispose(); denoiseSrv?.Dispose(); combineSrv?.Dispose();
+        relightRootSig?.Dispose(); sampleRootSig?.Dispose(); nearFieldRootSig?.Dispose(); denoiseRootSig?.Dispose(); combineRootSig?.Dispose(); debugRootSig?.Dispose();
+        relightPso?.Dispose(); samplePso?.Dispose(); nearFieldPso?.Dispose(); denoisePso?.Dispose(); combinePso?.Dispose(); combineDebugPso?.Dispose(); debugPso?.Dispose();
     }
 }

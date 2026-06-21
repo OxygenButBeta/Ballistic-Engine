@@ -88,4 +88,26 @@ Her ağır parça (A3/A4/B3) half-res trace + bilateral upsample default. Toplam
 `bal perf` / .stats.json ile ölç; 60 FPS'i kıran her şey door arkası default-OFF.
 
 ## İlerleme
-- (boş — A1'den başla)
+- **A1 ✓** Multi-scatter BRDF (Belcour) deferred'a girdi. `d39d7c8b`. Door BALLISTIC_DX12_MS_BRDF
+  (default ON). Det byte-id (ON_A==ON_B), OFF!=ON (CarDemo meanErr 0.0017/max 0.039 rough-metal
+  lokalize). Sun+punctual+ambient-IBL lobe'ları reflMult + transFraction split + metalness boost.
+  Not: DDGI relight diffuse-only olduğu için MS-BRDF orada gereksiz (dokunulmadı). VsmPad0→MsBrdfEnabled.
+- **A2 ✓** Blue-noise R2 (plastic) ray dithering DDGI relight. `5bbf10c7`. 2D Cranley-Patterson
+  (azimut+z-stratum), spatial+temporal decorrelation. Det fixed per-probe offset (byte-stable). A==B.
+- **A3 ✓** Variance/validity-driven SPATIAL GI denoise (kajiya rtdgi/spatial_filter). `72407896`.
+  Yeni DdgiSpatialDenoise.hlsl compute, Sample→Combine arası. Sample alpha'ya validity yazar; düşük-
+  validity (seam/corner) pixeller adaptif golden-spiral blur + depth/normal/SSAO edge-stop + crunch
+  firefly. Door BALLISTIC_DX12_DDGI_DENOISE (default ON, =0 byte-id). Feedback YOK → felsefe-güvenli.
+  Det A==B, OFF==pre-A3, ON!=OFF (seam-lokalize). indirectFiltered 2. target.
+- **[bug-hunt #1 ✓]** 3 adversarial agent (BRDF/denoise/blue-noise). A1,A2 temiz. A3'te 2 gerçek bug:
+  denoise compute SRV'leri pixel-state (indirect t0 + GTAO t3) → non-pixel olmalı. FİX `1c877c81`.
+  ctx.AoToNonPixelShaderResource action eklendi. Görsel byte-id (sadece hazard kapatıldı).
+- **A4 İN PROGRESS — SSGI near-field complement** (DDGI coarse-probe zayıflığı: ~2m probe → contact
+  GI/crevice yok). MİMARİ KARAR: kajiya SSGI'yi prev-frame radiance + reprojection ile DEĞİL, mevcut
+  SceneColor'ı (event 500, direct+sky çoktan var) okuyan kendi pass'ıyla yapıyorum → temporal-history/
+  motion-vector altyapısı GEREKMEZ, lag yok, deterministic-friendly, felsefe-güvenli (screen-temporal
+  GI feedback YOK). Mevcut Gtao.hlsl'in KANITLANMIŞ horizon-march slice integrali genişletilir: aynı
+  ufuk taramasında görünür sample'larda near-field radyans (SceneColor) toplanır (kajiya fetch_lighting).
+  Sample/Combine arası blend: yakın=SSGI, uzak=DDGI mesafeyle (smoothstep). Door-gated, realtime (half-
+  res march mümkün). Bu en büyük görsel-gap parçası, kolay yol YOK.
+- (A4 implement ediliyor)
