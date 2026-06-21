@@ -70,7 +70,7 @@ public sealed class Dx12TaaPass : IRenderPass, IDisposable {
     public unsafe Dx12TaaPass(Dx12Device device, int width, int height) {
         dev = device;
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 3, baseShaderRegister: 0);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 4, baseShaderRegister: 0);  // C5: +t3 depth (velocity dilation)
         var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
         var samp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp,
@@ -94,7 +94,7 @@ public sealed class Dx12TaaPass : IRenderPass, IDisposable {
 
         taaCb = new Dx12FrameCb<TaaConstants>(dev);
         taaSrvVisible = new Dx12DescriptorHeap(dev,
-            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 3, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4, shaderVisible: true, framesInFlight: dev.FramesInFlight);
         AllocTargets(width, height);
     }
 
@@ -134,11 +134,15 @@ public sealed class Dx12TaaPass : IRenderPass, IDisposable {
         if (!ctx.BarriersDerived) target.ColorToShaderResource();
         history.ColorToShaderResource();
         // Motion RT is already PixelShaderResource (gbuffer.ToShaderResource transitioned all colors).
+        // C5: depth (t3) for closest-depth velocity dilation. The G-buffer depth is already a shader resource at
+        // this point (the deferred/post chain reads it); bind it for the 3x3 closest-depth motion search.
+        if (!ctx.BarriersDerived) gbuffer.DepthToShaderResource();
         taaSrvVisible.Reset();
-        int b = taaSrvVisible.AllocateRange(3);
+        int b = taaSrvVisible.AllocateRange(4);
         dev.Device.CopyDescriptorsSimple(1, taaSrvVisible.Cpu(b + 0), target.ColorSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, taaSrvVisible.Cpu(b + 1), history.ColorSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, taaSrvVisible.Cpu(b + 2), gbuffer.ColorSrvCpu(Dx12GBuffer.MotionRtIndex), heapType);
+        dev.Device.CopyDescriptorsSimple(1, taaSrvVisible.Cpu(b + 3), gbuffer.DepthSrvCpu, heapType);
         writeHist.RenderColorOnly(cl => {
             cl.SetGraphicsRootSignature(taaRootSig); cl.SetPipelineState(taaPso);
             cl.SetDescriptorHeaps(taaSrvVisible.Heap);

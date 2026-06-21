@@ -18,6 +18,7 @@ cbuffer TaaConstants : register(b0) {
 Texture2D CurrentTex : register(t0);
 Texture2D HistoryTex : register(t1);
 Texture2D MotionTex  : register(t2);   // RG = screen-space motion (prevUV - currUV)
+Texture2D DepthTex   : register(t3);   // C5: scene depth (R32F) for closest-depth velocity dilation
 SamplerState LinearClamp : register(s0);
 
 struct VSOut { float4 Position : SV_Position; float2 Uv : TEXCOORD0; };
@@ -77,8 +78,21 @@ float4 PSMain(VSOut i) : SV_Target {
     if (ValidHistory < 0.5)
         return float4(current, 1.0);
 
-    // Reproject this pixel into last frame's screen space using the motion vector (prevUV - currUV).
-    float2 motion = MotionTex.SampleLevel(LinearClamp, i.Uv, 0).rg;
+    // C5 — DILATED closest-depth velocity. Sampling motion at the pixel CENTRE makes AA'd silhouette edges pick
+    // the BACKGROUND motion (the edge pixel is a blend of fg+bg, its centre depth/motion may be either) → moving
+    // object edges ghost/smear. kajiya dilates: search the 3x3 neighbourhood for the CLOSEST-depth pixel and use
+    // ITS motion — the nearer surface (the foreground object) wins, so its edge reprojects correctly. Cheap (9
+    // depth taps), no history, deterministic.
+    float2 closestOff = 0.0.xx;
+    float closestDepth = DepthTex.SampleLevel(LinearClamp, i.Uv, 0).r;
+    [unroll] for (int dx = -1; dx <= 1; dx++)
+    [unroll] for (int dy = -1; dy <= 1; dy++) {
+        if (dx == 0 && dy == 0) continue;
+        float2 off = float2(dx, dy) * TexelSize;
+        float d = DepthTex.SampleLevel(LinearClamp, i.Uv + off, 0).r;
+        if (d < closestDepth) { closestDepth = d; closestOff = off; }   // smaller depth = nearer (DX z[0,1])
+    }
+    float2 motion = MotionTex.SampleLevel(LinearClamp, i.Uv + closestOff, 0).rg;
     float2 prevUV = i.Uv + motion;
     if (prevUV.x < 0.0 || prevUV.x > 1.0 || prevUV.y < 0.0 || prevUV.y > 1.0)
         return float4(current, 1.0);
