@@ -71,7 +71,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         // VSM (virtual shadow map) clipmap params. UseVsm > 0.5 selects the VsmSunShadow path. All zero by
         // default (UseVsm = 0) → the cascade path is taken, byte-identical to pre-VSM.
         public float UseVsm; public float VsmLevels; public float VsmTexel; public float VsmLevel0Extent;
-        public Vector3 VsmCamPos; public float VsmPad0;
+        public Vector3 VsmCamPos; public float MsBrdfEnabled;   // MsBrdfEnabled>0.5 = multi-scatter energy-preserving BRDF (kajiya/Belcour; was VsmPad0)
     }
 
     // VSM clipmap matrices (b2). A separate CB from FrameConstants (b1) so the cascade layout is untouched.
@@ -165,6 +165,11 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
         float specAaValue = 2f;
         if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_SPEC_AA"),
             System.Globalization.CultureInfo.InvariantCulture, out float sa)) specAaValue = sa;
+        // Multi-scatter energy-preserving BRDF (kajiya/Belcour). Restores the inter-reflection energy plain
+        // single-scatter GGX throws away (rough metals/dielectrics come out too dark). Multiplicative on the
+        // spec term + diffuse-transmission split → zero temporal-feedback risk. Default ON (fidelity-first);
+        // BALLISTIC_DX12_MS_BRDF=0 forces the legacy single-scatter path (byte-identical to pre-A1).
+        bool msBrdf = Environment.GetEnvironmentVariable("BALLISTIC_DX12_MS_BRDF") != "0";
         deferredCb.Write(new LightConstants {
             InvViewProj = Matrix4x4.Transpose(invVP),
             View = Matrix4x4.Transpose(ctx.View),
@@ -213,6 +218,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
             VsmTexel = ctx.Vsm != null ? 1f / ctx.Vsm.Resolution : 0f,
             VsmLevel0Extent = ctx.Vsm != null ? ctx.Vsm.Level0Extent : 0f,
             VsmCamPos = ctx.CamPos,
+            MsBrdfEnabled = msBrdf ? 1f : 0f,
         });
 
         // VSM clipmap matrices (b2) — uploaded transposed (HLSL muls row-vector × matrix). Filled only when VSM

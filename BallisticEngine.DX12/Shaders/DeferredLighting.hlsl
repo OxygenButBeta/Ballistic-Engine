@@ -28,7 +28,7 @@ cbuffer LightConstants : register(b0) {
     float    UseCapsuleShadows; float3 CapPad;      // >0.5 = multiply the capsule-shadow mask (t16) into the sun term
     float4x4 ViewProjFwd;                          // world → clip (transposed on upload); contact-shadow march reprojection
     float    UseVsm; float VsmLevels; float VsmTexel; float VsmLevel0Extent;  // VSM (virtual shadow map) clipmap params; UseVsm>0.5 selects the VSM path
-    float3   VsmCamPos; float VsmPad0;              // camera world pos (VSM level select by distance)
+    float3   VsmCamPos; float MsBrdfEnabled;        // camera world pos; MsBrdfEnabled>0.5 = multi-scatter energy-preserving BRDF (was VsmPad0)
 };
 
 // V2 specular firefly clamp (fixes D3): a normal-mapped surface lit by a sharp light produces single-pixel
@@ -132,6 +132,49 @@ float3 FresnelSchlick(float cosT, float3 F0) {
 float3 FresnelSchlickRoughness(float cosT, float3 F0, float rough) {
     float3 Fr = max((1.0 - rough).xxx, F0);
     return F0 + (Fr - F0) * pow(1.0 - cosT, 5.0);
+}
+
+// ===================== MULTI-SCATTER ENERGY-PRESERVING BRDF (kajiya/Belcour 2018) =====================
+// Plain Cook-Torrance GGX (single-scatter) throws away the energy that bounces more than once between
+// microfacets — rough metals/dielectrics come out visibly too dark and desaturated. kajiya's fix (a special
+// case of Belcour's "Atomic Decomposition" §5.1, matched to Heitz's Smith multi-scatter reference): use the
+// preintegrated split-sum FG-LUT (fg.x scale, fg.y bias — IDENTICAL to our existing BrdfLut) to get the
+// single-scatter directional albedo e_ss = fg.x+fg.y, then add back the lost (1-e_ss) energy as the closed
+// form of the infinite inter-reflection geometric series, with an ad-hoc shift toward F90 for grazing tail
+// bounces (desaturates successive bounces — counters metal over-saturation). Returns a MULTIPLICATIVE factor
+// on the specular term + the diffuse transmission fraction (the (1-F)-equivalent that survives the spec layer).
+// MsBrdfEnabled gates it (0 = byte-identical legacy). MULTIPLICATIVE only → zero temporal-feedback risk.
+struct MsEnergy {
+    float3 reflMult;        // multiply the single-scatter specular by this (>= 1) to restore multi-scatter energy
+    float3 transFraction;   // energy transmitted through the spec layer to the diffuse below (= 1 - preReflection)
+};
+MsEnergy MultiScatterEnergy(float3 specAlbedo, float roughness, float ndotv) {
+    // Preintegrated FG at (ndotv, roughness). Our BrdfLut is the same split-sum integral kajiya bakes.
+    float2 fg = BrdfLut.SampleLevel(LinearClamp, float2(saturate(ndotv), roughness), 0).rg;
+    float3 singleScatter = specAlbedo * fg.x + fg.y.xxx;
+    float  e_ss = fg.x + fg.y;
+    MsEnergy res;
+    // e_ss can be ~0 at extreme grazing+rough; guard the divisions (degenerate → no boost, no leak).
+    if (e_ss <= 1e-4) { res.reflMult = 1.0.xxx; res.transFraction = max(0.0.xxx, 1.0.xxx - singleScatter); return res; }
+    float3 f_ss = singleScatter / e_ss;
+    float3 f_ss_tail = lerp(f_ss, 1.0.xxx, 0.4);                 // grazing-tail desaturation (Belcour ad-hoc)
+    float3 bounce = (1.0 - e_ss) * f_ss_tail;
+    // Closed-form infinite geometric series of per-bounce lost energy. bounce < 1 by construction (e_ss in
+    // (0,1], f_ss_tail in [.,1]); clamp denom defensively so a pathological LUT texel can't divide by ~0.
+    float3 mult = 1.0.xxx + bounce / max(1.0.xxx - bounce, 1e-4.xxx);
+    float3 preReflection = singleScatter * mult;
+    res.reflMult = mult;
+    res.transFraction = max(0.0.xxx, 1.0.xxx - preReflection);
+    return res;
+}
+
+// Metalness in (0,1) loses energy because albedo is split between the spec and diffuse layers. kajiya's
+// polynomial fit (RMSE 0.0007691) scales both layers' albedo back up to recover it. Returns the boost factor.
+float3 MetalnessAlbedoBoost(float metalness, float3 albedo) {
+    const float a0 = 1.749, a1 = -1.61, e1 = 0.5555, e3 = 0.8244;
+    float x = metalness;
+    float3 y = albedo, y3 = y * y * y;
+    return 1.0.xxx + (0.25 - (x - 0.5) * (x - 0.5)) * (a0 + a1 * abs(x - 0.5)) * (e1 * y + e3 * y3);
 }
 
 float CascadeMatrixApply(int c, float3 worldPos, out float3 proj) {
@@ -452,9 +495,18 @@ float3 ShadePunctual(GpuLight L, float3 N, float3 V, float3 worldPos, float3 alb
     float3 F = FresnelSchlick(max(dot(H, V), 0.0), F0);
     float NdotV = max(dot(N, V), 0.0);
     float3 spec = (NDF * G * F) / max(4.0 * NdotV * NdotL, EPS);
-    float3 kD = (1.0 - F) * (1.0 - metallic);
-    float3 diffuseTerm = kD * albedo / PI * radiance * NdotL;
-    float3 specTerm = ClampSpecular(spec * radiance * NdotL, SpecClamp);   // V2: bound punctual specular fireflies
+    float3 specGain = 1.0.xxx, diffAlbedo = albedo, kD;
+    if (MsBrdfEnabled > 0.5) {
+        MsEnergy ms = MultiScatterEnergy(F0, roughness, NdotV);
+        float3 boost = MetalnessAlbedoBoost(metallic, albedo);
+        specGain = ms.reflMult;
+        diffAlbedo = albedo * (1.0 - metallic) * boost;
+        kD = ms.transFraction;
+    } else {
+        kD = (1.0 - F) * (1.0 - metallic);
+    }
+    float3 diffuseTerm = kD * diffAlbedo / PI * radiance * NdotL;
+    float3 specTerm = ClampSpecular(spec * specGain * radiance * NdotL, SpecClamp);   // V2: bound punctual specular fireflies
     return diffuseTerm + specTerm;
 }
 
@@ -531,9 +583,22 @@ float4 PSMain(VSOut i) : SV_Target {
         float3 F = FresnelSchlick(max(dot(H, V), 0.0), F0);
         float NdotV = max(dot(N, V), 0.0);
         float3 spec = (NDF * G * F) / max(4.0 * NdotV * NdotL, EPS);
-        float3 kD = (1.0 - F) * (1.0 - metallic);
-        diffuse = kD * albedo / PI * radiance * NdotL;
-        specular = ClampSpecular(spec * radiance * NdotL, SpecClamp);   // V2: bound sun specular fireflies
+        float3 specGain = 1.0.xxx, diffAlbedo = albedo;
+        float3 kD;
+        if (MsBrdfEnabled > 0.5) {
+            // Layered multi-scatter: boost spec by the inter-reflection energy, transmit the COMPLEMENT to the
+            // diffuse layer (transFraction replaces the crude (1-F)), and recover the split-energy via the
+            // metalness albedo boost. F0 for the spec layer = lerp(0.04*specRefl, albedo, metallic) (= our F0).
+            MsEnergy ms = MultiScatterEnergy(F0, roughness, NdotV);
+            float3 boost = MetalnessAlbedoBoost(metallic, albedo);
+            specGain = ms.reflMult;
+            diffAlbedo = albedo * (1.0 - metallic) * boost;            // metals lose diffuse; boost recovers mid-metalness
+            kD = ms.transFraction;                                     // diffuse masked by what passes the spec layer
+        } else {
+            kD = (1.0 - F) * (1.0 - metallic);
+        }
+        diffuse = kD * diffAlbedo / PI * radiance * NdotL;
+        specular = ClampSpecular(spec * specGain * radiance * NdotL, SpecClamp);   // V2: bound sun specular fireflies
     }
 
     // --- Clustered punctual lights (point/spot) ---
@@ -557,12 +622,25 @@ float4 PSMain(VSOut i) : SV_Target {
     float3 ambient;
     if (UseIBL > 0.5) {
         float3 Famb = FresnelSchlickRoughness(NdotVamb, F0, roughness);
-        float3 kD = (1.0 - Famb) * (1.0 - metallic);
+        // Multi-scatter on the ambient lobe: boost the prefiltered specular by the inter-reflection energy and
+        // transmit the complement to the diffuse irradiance (matches the analytic-light layering above).
+        MsEnergy msAmb;
+        float3 ambDiffBoost = albedo;
+        float3 kD;
+        if (MsBrdfEnabled > 0.5) {
+            msAmb = MultiScatterEnergy(F0, roughness, NdotVamb);
+            ambDiffBoost = albedo * MetalnessAlbedoBoost(metallic, albedo);
+            kD = msAmb.transFraction * (1.0 - metallic);
+        } else {
+            msAmb.reflMult = 1.0.xxx;
+            kD = (1.0 - Famb) * (1.0 - metallic);
+        }
         float3 irradiance = IrradianceMap.SampleLevel(LinearClamp, N, 0).rgb;
         // When Lumen V2 owns diffuse GI (UseIBLDiffuse=0), suppress the IBL diffuse-irradiance ambient here so
         // the Lumen GI combine (which ADDS its own sky-visibility-aware diffuse indirect) does not double-count.
         // Specular IBL below is untouched — Lumen P2 is diffuse-only; reflections stay on the IBL/RT path.
-        float3 ambientDiffuse = (UseIBLDiffuse > 0.5) ? kD * irradiance * albedo * ao : 0.0.xxx;
+        float3 ambDiffAlbedo = (MsBrdfEnabled > 0.5) ? ambDiffBoost : albedo;
+        float3 ambientDiffuse = (UseIBLDiffuse > 0.5) ? kD * irradiance * ambDiffAlbedo * ao : 0.0.xxx;
         float3 R = reflect(-V, N);
         float mip = clamp(roughness * PrefilterMaxMip, 0.0, PrefilterMaxMip);
         float3 prefiltered = PrefilterMap.SampleLevel(LinearClamp, R, mip).rgb;
@@ -579,7 +657,7 @@ float4 PSMain(VSOut i) : SV_Target {
         // exact diffuse leak fixed earlier, just on the specular lobe (user: orange tent on a roofed Bistro hall).
         // Reflections come from Lumen RT reflections / SSR (both sky-visibility-aware); IBL is the miss fallback.
         float3 ambientSpecular = (UseIBLSpecular > 0.5)
-            ? prefiltered * (Famb * brdf.x + brdf.y) * specOcc : 0.0.xxx;
+            ? prefiltered * (Famb * brdf.x + brdf.y) * specOcc * msAmb.reflMult : 0.0.xxx;
         ambient = ambientDiffuse + ambientSpecular;
     }
     else {
