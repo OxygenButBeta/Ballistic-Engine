@@ -17,7 +17,7 @@ cbuffer DdgiDebugConstants : register(b0) {
 
 StructuredBuffer<float4> Irradiance : register(t0);
 
-static const int OctRes = 6;
+static const int OctRes = 8;   // MUST match Dx12DdgiProbeGrid.OctRes + DdgiRelight.hlsl
 static const int OctTexels = OctRes * OctRes;
 
 float2 OctEncode(float3 n) {

@@ -57,7 +57,7 @@ StructuredBuffer<RtInstance>        RtInstances  : register(t8);
 StructuredBuffer<GpuLight>          Lights       : register(t9);
 StructuredBuffer<float4>            DdgiIrradiance : register(t11);   // D5: DDGI probe irradiance (rgb=E per oct texel)
 
-static const int DdgiOctRes = 6;
+static const int DdgiOctRes = 8;   // MUST match Dx12DdgiProbeGrid.OctRes (DDGI irradiance cell edge)
 static const int DdgiOctTexels = DdgiOctRes * DdgiOctRes;
 
 float2 DdgiOctEncode(float3 n) {
