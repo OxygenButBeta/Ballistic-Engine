@@ -513,9 +513,12 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             Projection = Matrix4x4.Transpose(ctx.Proj),
             View = Matrix4x4.Transpose(ctx.View),
             W = (uint)nearField.Width, H = (uint)nearField.Height,
-            Radius = EnvF("BALLISTIC_DX12_DDGI_NEARFIELD_RADIUS", 0.8f),   // world metres — contact/crevice scale
+            // P3: radius bridges the contact/crevice band UP toward the probe spacing so there's no GI gap between
+            // the near field and the probe interpolation (kajiya overlaps its near/far fields). ~1.5m covers most
+            // of a 2m probe cell; the additive coverage-weighted blend hands smoothly to the far field past it.
+            Radius = EnvF("BALLISTIC_DX12_DDGI_NEARFIELD_RADIUS", 1.5f),   // world metres — contact→probe-cell scale
             FrameIndex = det ? -1f : (frameCounter & 1023),
-            SliceCount = 3f, StepCount = 6f,                              // half-budget march (realtime); TAA integrates
+            SliceCount = 3f, StepCount = 8f,                              // longer march for the wider radius; TAA integrates
             Intensity = intensity, Thickness = 0.5f,
         });
 

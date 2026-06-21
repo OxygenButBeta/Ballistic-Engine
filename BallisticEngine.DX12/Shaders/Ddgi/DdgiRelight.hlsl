@@ -327,15 +327,14 @@ void CSMain(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
         // in (mostly) one step and then held, instead of ratcheting up frame after frame.
         float adaptAlpha = alpha;
         if (ValidateOn > 0.5 && HistoryValid > 0.5) {
-            float lp = dot(prev, float3(0.2126, 0.7152, 0.0722));
-            float le = dot(E,    float3(0.2126, 0.7152, 0.0722));
-            // Symmetric luminance ratio in [0,1]: 1 = identical, →0 = large jump (brighter OR darker).
-            float ratio = min(lp, le) / max(max(lp, le), 1e-5);
-            float staleness = 1.0 - ratio;                       // 0 = stable, 1 = total change
-            // Map staleness → an alpha boost. A small change (<~15%) keeps the base alpha; a large change ramps
-            // alpha up to a fast-converge cap so the stale texel snaps to the new value in a couple of frames.
-            float boost = smoothstep(0.15, 0.6, staleness);
-            adaptAlpha = lerp(alpha, max(alpha, 0.6), boost);
+            // P4: PER-CHANNEL relative-diff staleness (kajiya diffuse_validate metric), NOT a luma ratio. A luma
+            // ratio misses a HUE shift at equal brightness (a red light swapped for an equally-bright blue one →
+            // ratio≈1, no boost, the wrong colour crawls). The per-channel |prev-E|/(prev+E) catches it. Tighter
+            // thresholds (0.1,0.5, from kajiya) + a higher cap so a genuinely stale texel re-converges in ~1 frame.
+            float3 relDiff = abs(prev - E) / max(prev + E, 1e-3.xxx);
+            float staleness = length(relDiff) / length(1.0.xxx);  // normalize to [0,1]
+            float boost = smoothstep(0.1, 0.5, staleness);
+            adaptAlpha = lerp(alpha, max(alpha, 0.8), boost);
         }
         float3 blended = lerp(prev, E, adaptAlpha);
         // Firefly / runaway guard — an Inf/NaN + EMA-compounding catch, NOT a brightness cap. The OLD ceiling (32)

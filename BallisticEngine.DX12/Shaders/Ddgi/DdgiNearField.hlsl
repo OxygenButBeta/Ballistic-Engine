@@ -46,6 +46,21 @@ float Ign(float2 px, float frame) {
     float n = frac(52.9829189 * frac(dot(px, float2(0.06711056, 0.00583715))));
     return (frame >= 0.0) ? frac(n + 0.61803398875 * frame) : n;   // det: no temporal advance
 }
+// P1: kajiya decorrelates the slice AZIMUTH and the per-step RADIAL OFFSET with two INDEPENDENT noise fields
+// (ssgi.hlsl) — using one value for both correlates direction with offset → structured contact-GI banding a few
+// slices can't hide. Cheap interleaved lattices (kajiya's exact form) give the two decorrelated fields, plus a
+// 6-entry temporal rotation so successive frames cover different azimuths (TAA integrates them). Det: temporal off.
+static const float NF_TEMPORAL_ROT[6] = { 60.0, 300.0, 180.0, 240.0, 120.0, 0.0 };
+float DirNoise(int2 px, float frame) {
+    float spatial = (1.0 / 16.0) * (float)((((px.x + px.y) & 3) << 2) + (px.x & 3));
+    float temporal = (frame >= 0.0) ? (NF_TEMPORAL_ROT[((uint)frame) % 6] / 360.0) : 0.0;
+    return frac(spatial + temporal);
+}
+float OffsetNoise(int2 px, float frame) {
+    float spatial = (1.0 / 4.0) * (float)((px.y - px.x) & 3);
+    float temporal = (frame >= 0.0) ? frac(0.5 * (float)(((uint)frame / 6u) & 3u)) : 0.0;
+    return frac(spatial + temporal);
+}
 
 [numthreads(8, 8, 1)]
 void CSMain(uint3 tid : SV_DispatchThreadID) {
@@ -67,7 +82,9 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
     int slices = (int)SliceCount;
     int steps = (int)StepCount;
-    float noise = Ign(float2(px), FrameIndex);
+    // P1: two DECORRELATED noise fields — azimuth rotation vs radial step offset (was one shared IGN → banding).
+    float dirNoise = DirNoise(px, FrameIndex);
+    float offNoise = OffsetNoise(px, FrameIndex);
 
     float3 giAccum = 0.0.xxx;
     float coverage = 0.0;
@@ -75,7 +92,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
     [unroll] for (int s = 0; s < MAX_SLICES; s++) {
         if (s >= slices) break;
-        float phi = (s + noise) * PI / slices;
+        float phi = (s + dirNoise) * PI / slices;
         float2 dir = float2(cos(phi), sin(phi));
         float3 sliceDir = float3(dir, 0.0);
         float3 sliceNormal = normalize(cross(sliceDir, V));
@@ -92,7 +109,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
             float prevCHorizon = -1.0;
             [unroll] for (int t = 0; t < MAX_STEPS; t++) {
                 if (t >= steps) break;
-                float fr = (t + 0.5 + noise) / steps;
+                float fr = (t + 0.5 + offNoise) / steps;
                 float2 sampleUv = uv + sgn * dir * fr * radiusPx * texel;
                 if (any(sampleUv < 0.0) || any(sampleUv > 1.0)) continue;
                 float sDepth = Depth.SampleLevel(LinearClamp, sampleUv, 0).r;
