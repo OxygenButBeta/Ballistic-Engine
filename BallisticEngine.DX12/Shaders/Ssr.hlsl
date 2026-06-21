@@ -221,9 +221,16 @@ float4 PSTemporal(VSOut i) : SV_Target {
     }
     m1 /= 9.0; m2 /= 9.0;
     float3 sigma = sqrt(max(m2 - m1 * m1, 0.0.xxx));
-    float3 lo = m1 - sigma * 2.0 - 0.02.xxx;
-    float3 hi = m1 + sigma * 2.0 + 0.02.xxx;
-    float3 clamped = clamp(history.rgb, lo, hi);
+    float3 dev = sigma * 2.0 + 0.02.xxx;
+    // B4: SOFT colour clamp (kajiya inc/soft_color_clamp.hlsl) instead of a hard box clamp. A hard clamp does
+    // NOTHING when noise blows the variance box wide, then SNAPS when a sample crosses the edge → flicker. The
+    // soft form pulls history toward the box centre ONLY as it gets statistically far (1σ→3σ ramp), bleeding out
+    // disocclusion/ghosting smoothly without the hard-clamp pop — exactly what the newly-enabled rough VNDF
+    // reflections (which lean on history more) need to stay ghost-free.
+    float3 lo = m1 - dev, hi = m1 + dev;
+    float3 histDist = abs(history.rgb - m1) / max(abs(m1 * 0.1), dev);
+    float3 closest = clamp(history.rgb, lo, hi);
+    float3 clamped = lerp(history.rgb, closest, smoothstep(1.0.xxx, 3.0.xxx, histDist));
 
     // EMA toward the (clamped) history, faded out by motionTrust so a static mirror converges (smooth) while any
     // motion keeps the live reflection. alpha is the blend toward CURRENT, so low alpha = more history = smoother.
