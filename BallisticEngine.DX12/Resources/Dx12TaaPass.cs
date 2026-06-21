@@ -59,7 +59,7 @@ public sealed class Dx12TaaPass : IRenderPass, IDisposable {
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    struct TaaConstants { public float Feedback; public float ValidHistory; public Vector2 TexelSize; }
+    struct TaaConstants { public float Feedback; public float ValidHistory; public Vector2 TexelSize; public float Perceptual; public Vector3 Pad; }
 
     readonly Dx12Device dev;
     ID3D12RootSignature taaRootSig;     // TaaConstants CBV(b0) + 3-SRV table(current/history/motion) + sampler
@@ -129,9 +129,14 @@ public sealed class Dx12TaaPass : IRenderPass, IDisposable {
         Dx12OffscreenTarget history = taaWriteB ? taaHistoryA : taaHistoryB;   // read from the OTHER buffer
         Dx12OffscreenTarget writeHist = taaWriteB ? taaHistoryB : taaHistoryA;
 
+        // C2: perceptual (sqrt-luma crunched) accumulation space. Default OFF (the proven linear-YCoCg path);
+        // BALLISTIC_DX12_TAA_PERCEPTUAL=1 opts in (firefly/sun-bias suppression on the variance box, at the cost
+        // of a little chroma bias). A/B door — the sole AA stays on the byte-identical default unless asked.
+        bool perceptual = Environment.GetEnvironmentVariable("BALLISTIC_DX12_TAA_PERCEPTUAL") == "1";
         taaCb.Write(new TaaConstants {
             Feedback = ctx.PostFX.TaaFeedback, ValidHistory = taaHistoryValid ? 1f : 0f,
             TexelSize = new Vector2(1f / targetW, 1f / targetH),
+            Perceptual = perceptual ? 1f : 0f,
         });
 
         // PHASE-2 V3: skip the manual SceneColor head when derived barriers are active (the graph emitted

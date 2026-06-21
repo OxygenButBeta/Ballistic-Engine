@@ -13,6 +13,8 @@ cbuffer TaaConstants : register(b0) {
     float    Feedback;         // history weight (0..0.97)
     float    ValidHistory;     // >0.5 = blend, else passthrough (first frame / camera cut)
     float2   TexelSize;        // 1 / render size
+    float    Perceptual;       // C2: >0.5 = accumulate in crunched (sqrt-luma) YCoCg; 0 = linear (default)
+    float3   _TaaPad;
 };
 
 Texture2D CurrentTex : register(t0);
@@ -44,6 +46,21 @@ float3 RGBToYCoCg(float3 c) {
 }
 float3 YCoCgToRGB(float3 c) {
     return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+}
+
+// C2 — PERCEPTUAL (crunched luma-chroma) accumulation space (kajiya inc/working_color_space.hlsl). Accumulating
+// in linear YCoCg lets the bright sun/fireflies dominate the variance box and the EMA; compressing the luma to
+// sqrt(Y) (and scaling chroma by the same k=1/sqrt(Y)) makes the variance box behave uniformly across bright and
+// dark, suppressing firefly bias before the clamp/blend. Crunch maps YCoCg→(sqrt(Y), chroma/sqrt(Y)); Uncrunch
+// inverts it. Y can be huge (EXR sun) but finite (Sanitize scrubbed Inf/NaN upstream), so sqrt is safe and the
+// round-trip is exact. Door-gated (Perceptual>0.5); off → plain linear YCoCg (the proven path), byte-identical.
+float3 CrunchYCoCg(float3 c) {
+    float k = rsqrt(max(c.x, 1e-8));     // 1/sqrt(Y)
+    return float3(c.x * k, c.y * k, c.z * k);   // = (sqrt(Y), Co/sqrt(Y), Cg/sqrt(Y))
+}
+float3 UncrunchYCoCg(float3 c) {
+    float y = c.x;                        // crunched luma = sqrt(Y_orig)
+    return float3(y * y, c.y * y, c.z * y);     // restore Y=y², chroma×sqrt(Y)
 }
 
 // 9-tap Catmull-Rom (Karis/Jimenez): sharp history resample without ringing blowups.
@@ -97,15 +114,19 @@ float4 PSMain(VSOut i) : SV_Target {
     if (prevUV.x < 0.0 || prevUV.x > 1.0 || prevUV.y < 0.0 || prevUV.y > 1.0)
         return float4(current, 1.0);
 
+    bool crunch = Perceptual > 0.5;   // C2: accumulate in sqrt-luma space when on
     float2 texSize = 1.0 / TexelSize;
     float3 history = RGBToYCoCg(Sanitize(SampleHistoryCatmullRom(prevUV, texSize)));
+    if (crunch) history = CrunchYCoCg(history);
 
-    // 3x3 neighborhood moments in YCoCg + the neighborhood luma max (C6 firefly clamp source).
+    // 3x3 neighborhood moments in YCoCg + the neighborhood luma max (C6 firefly clamp source). In crunched space
+    // (C2) the moments/box behave uniformly across bright and dark, suppressing the sun/firefly bias on the box.
     float3 m1 = 0.0.xxx, m2 = 0.0.xxx;
     float neighMaxLuma = 0.0;
     [unroll] for (int x = -1; x <= 1; x++)
     [unroll] for (int y = -1; y <= 1; y++) {
         float3 c = RGBToYCoCg(Sanitize(CurrentTex.SampleLevel(LinearClamp, i.Uv + float2(x, y) * TexelSize, 0).rgb));
+        if (crunch) c = CrunchYCoCg(c);
         m1 += c; m2 += c * c;
         if (!(x == 0 && y == 0)) neighMaxLuma = max(neighMaxLuma, c.x);   // brightest NEIGHBOUR (exclude centre)
     }
@@ -113,6 +134,7 @@ float4 PSMain(VSOut i) : SV_Target {
     float3 sigma = sqrt(max(m2 / 9.0 - mean * mean, 0.0.xxx));
 
     float3 currYCoCg = RGBToYCoCg(current);
+    if (crunch) currYCoCg = CrunchYCoCg(currYCoCg);                       // C2: same space as history/moments
     float3 currRaw = currYCoCg;                                           // pre-firefly (for honest disagreement)
 
     // C6 — firefly-clamped TAA input. RT reflections + Lumen/DDGI card churn enter the HDR BEFORE TAA with no
@@ -157,6 +179,8 @@ float4 PSMain(VSOut i) : SV_Target {
     float agreement = 1.0 - lumaDiff;
     float feedback = lerp(0.5, clamp(Feedback, 0.0, 0.97), saturate(agreement * agreement));
 
-    float3 blended = YCoCgToRGB(lerp(currYCoCg, history, feedback));
+    float3 blendedYCoCg = lerp(currYCoCg, history, feedback);
+    if (crunch) blendedYCoCg = UncrunchYCoCg(blendedYCoCg);              // C2: back to linear YCoCg before RGB
+    float3 blended = YCoCgToRGB(blendedYCoCg);
     return float4(max(blended, 0.0.xxx), 1.0);
 }
