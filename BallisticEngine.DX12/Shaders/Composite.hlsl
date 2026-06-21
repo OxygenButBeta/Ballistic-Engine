@@ -172,7 +172,10 @@ float4 PSMain(VSOut i) : SV_Target {
         // Edge-aware weight: large neighbour luma spread = a strong edge → suppress sharpening (no halo ring).
         float edge = abs(lC - l0) + abs(lC - l1) + abs(lC - l2) + abs(lC - l3);
         float w = max(0.0, 1.0 - 6.0 * edge);
-        float lSharp = lC + (lC - lBlur) * Sharpen * w;          // sharpen in perceptual-luma space
+        float lSharp = max(lC + (lC - lBlur) * Sharpen * w, 0.0); // sharpen in perceptual-luma; clamp ≥0 so an
+                                                                  // overshoot UNDERSHOOT (bug-hunt F3) can't square
+                                                                  // a negative back to a brightening — it darkens
+                                                                  // toward black as intended.
         float lLin = lSharp * lSharp;                            // back to linear luma
         float lCur = max(dot(color, lw), 1e-5);
         color *= lLin / lCur;                                    // apply as a luma RATIO → hue/chroma preserved

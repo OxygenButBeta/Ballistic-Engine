@@ -143,7 +143,12 @@ float4 PSMain(VSOut i) : SV_Target {
     // Bug-hunt #4 F3: a SINGLE-pixel REAL highlight (star/glint) has dark neighbours too, so a tight cap would
     // crush it. Use a generous 4× headroom + a soft pull (only fireflies >> neighbours bite hard; a real glint
     // within a few× survives), preserving legitimate sub-pixel highlights TAA is meant to resolve.
-    float fireflyCap = neighMaxLuma * 4.0 + 0.05;
+    // The "4× headroom" is meant in LINEAR luma. In crunched space (C2) the luma is sqrt(Y), so a 4× linear ratio
+    // is a 2× crunched ratio — use sqrt(4)=2 there so the firefly threshold stays consistent (bug-hunt #7 F2),
+    // not 4× more permissive. The +0.05 additive likewise scales by sqrt in crunched space.
+    float ffMul = crunch ? 2.0 : 4.0;
+    float ffAdd = crunch ? 0.22 : 0.05;   // ≈ sqrt(0.05·…) — small floor either way, kept consistent
+    float fireflyCap = neighMaxLuma * ffMul + ffAdd;
     if (currYCoCg.x > fireflyCap) currYCoCg.x = lerp(currYCoCg.x, fireflyCap, 0.85);
 
     // C4 — confidence-WIDENED clamp box. A fixed Gamma over-clamps where current and history genuinely agree AND
