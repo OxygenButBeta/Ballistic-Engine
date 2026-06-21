@@ -77,14 +77,34 @@ float2 OctEncode(float3 n) {
     return e * 0.5 + 0.5;
 }
 
+// Chebyshev (variance-shadow) probe→point visibility — the SAME test the sample pass uses, so multi-bounce
+// honours walls too. Without it, GatherPrevIrradiance pulled a lit probe's radiance through a wall into a probe
+// on the other side (probe-to-probe leak): the report's "probes feed each other across a wall". Moments are the
+// probe's mean ray distance (+ mean²) in `dir`; if the point is farther than the mean occluder, it's behind a
+// wall → low weight.
+float2 SampleProbeVisR(uint probe, float3 dir) {
+    int2 t = clamp((int2)floor(OctEncode(dir) * float(VisRes)), 0, VisRes - 1);
+    return PrevVis[probe * VisTexels + t.y * VisRes + t.x];
+}
+float ChebyshevWeightR(uint probe, float3 dirProbeToPoint, float dist, float bias) {
+    float2 mom = SampleProbeVisR(probe, dirProbeToPoint);
+    float mean = mom.x;
+    if (dist - bias <= mean) return 1.0;
+    float variance = max(mom.y - mean * mean, 1e-4);
+    float d = (dist - bias) - mean;
+    float p = variance / (variance + d * d);
+    return max(p * p * p, 0.0);
+}
+
 // D4 multi-bounce: gather the PREVIOUS frame's probe irradiance at a world hit point in direction N (the 8
-// bracketing probes, trilinear). This is the cheap second bounce — no extra rays, the cache feeds itself.
+// bracketing probes, trilinear) WITH Chebyshev occlusion so a wall between probe and point blocks the bounce.
 float3 GatherPrevIrradiance(float3 P, float3 N) {
     float3 g = (P - GridOrigin) / max(ProbeSpacing, 1e-4);
     int3 baseC = clamp((int3)floor(g), int3(0,0,0), int3((int)CountX-2, (int)CountY-2, (int)CountZ-2));
     float3 frac = saturate(g - (float3)baseC);
     float2 oct = OctEncode(N);
     int2 ot = clamp((int2)floor(oct * float(OctRes)), 0, OctRes - 1);   // nearest oct texel (cheap)
+    float bias = 0.5 * length(ProbeSpacing);
     float3 sum = 0.0.xxx; float wsum = 0.0;
     [unroll] for (int i = 0; i < 8; i++) {
         int3 off = int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
@@ -92,6 +112,10 @@ float3 GatherPrevIrradiance(float3 P, float3 N) {
         float3 tw = float3(off.x==0?1.0-frac.x:frac.x, off.y==0?1.0-frac.y:frac.y, off.z==0?1.0-frac.z:frac.z);
         float w = tw.x * tw.y * tw.z;
         uint probe = c.z * (CountX*CountY) + c.y * CountX + c.x;
+        // Occlusion: reject probes whose view of P is blocked (probe→point distance > mean occluder depth).
+        float3 probePos = GridOrigin + (float3)c * ProbeSpacing;
+        float distPP = distance(probePos, P);
+        w *= ChebyshevWeightR(probe, normalize(P - probePos), distPP, bias);
         sum += PrevIrrad[probe * OctTexels + ot.y * OctRes + ot.x].rgb * w;
         wsum += w;
     }
