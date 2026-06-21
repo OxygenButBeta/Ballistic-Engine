@@ -66,7 +66,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         public Vector3 SunDir;       public float SunBias;
         public Vector3 SunColor;     public float LightCount;
         public float EmaAlpha;       public float HistoryValid; public float Intensity; public float FrameJitter;
-        public float MultiBounce;    public float BounceBoost;  public float Pad0;      public float Pad1;
+        public float MultiBounce;    public float BounceBoost;  public float UsePlacement; public float Pad1;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -304,6 +304,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             MultiBounce = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_NOBOUNCE") == "1" ? 0f
                           : (ctx.PostFX.DdgiMultiBounce ? 1f : 0f),
             BounceBoost = EnvF("BALLISTIC_DX12_DDGI_BOUNCE_BOOST", 1f),
+            UsePlacement = (placementEnabled && grid.StatePlaced) ? 1f : 0f,
         });
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
@@ -371,13 +372,14 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         });
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        // table: depth SRV (t0), normal SRV (t1), Indirect UAV (u0)
+        // table: depth SRV (t0), normal SRV (t1), Indirect UAV (u0), albedo SRV (t5)
         dev.Device.CopyDescriptorsSimple(1, sampleSrv.Cpu(0), gbuffer.DepthSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, sampleSrv.Cpu(1), gbuffer.ColorSrvCpu(1), heapType);
         // Indirect UAV — create into slot 2.
         dev.Device.CreateUnorderedAccessView(indirect.RenderTarget, null,
             new UnorderedAccessViewDescription { ViewDimension = UnorderedAccessViewDimension.Texture2D, Format = Dx12OffscreenTarget.HdrFormat },
             sampleSrv.Cpu(2));
+        dev.Device.CopyDescriptorsSimple(1, sampleSrv.Cpu(3), gbuffer.ColorSrvCpu(0), heapType);   // t5 albedo (G0)
 
         // Depth → NonPixel for the compute read. The G-buffer colors arrive in the combined ShaderRead state
         // (Pixel|NonPixel) from the deferred pass (event 300 < 500), so the normal SRV (G1) is already readable
@@ -405,19 +407,21 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         var target = ctx.SceneColor;
         bool debug = ctx.PostFX.DdgiDebugRawIndirect || Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_DEBUG") == "1";
 
+        // AO bite on the GI indirect — honour the user's DdgiAoStrength VERBATIM (do NOT force it up). Biting the
+        // GI indirect with AoResult is wrong here: in a sealed box every point reads ~0 sky-visibility, so a full
+        // bite crushes the indirect to black (the sphere's underside / the closed corners go pure black). AO belongs
+        // on the SKY/IBL ambient (deferred already applies it there), NOT on the probe bounce. Default DdgiAoStrength
+        // is 0 → indirect untouched; a user who wants probe-contact darkening dials it up explicitly.
         combineCb.Write(new CombineConstants
         {
             AoStrength = ctx.PostFX.DdgiAoStrength,
             Intensity = 1f,
         });
 
-        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
-        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(0), indirect.ColorSrvCpu, heapType);     // t0 E
-        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(1), ctx.GBuffer.ColorSrvCpu(0), heapType); // t1 albedo
-        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(2), ctx.AoResult, heapType);             // t2 AO
-
-        // Indirect → PS-readable; the G-buffer albedo (G0) is already in the combined ShaderRead state.
         indirect.ColorToShaderResource();
+
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(0), indirect.ColorSrvCpu, heapType);     // t0 finished indirect (E*albedo/π)
 
         target.RenderColorOnly(cl =>
         {
@@ -471,10 +475,15 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         var irrad = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(2, 0), ShaderVisibility.All);   // t2 Irradiance (root SRV)
         var visMom = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(3, 0), ShaderVisibility.All);  // t3 VisMoments (root SRV)
         var probeStateP = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(4, 0), ShaderVisibility.All); // t4 ProbeState (root SRV)
-        // table: t0 depth, t1 normal (SRV) + u0 Indirect (UAV)
-        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 0);
-        var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);
-        var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange), ShaderVisibility.All);
+        // table (heap slots in order): t0 depth, t1 normal (SRV), u0 Indirect (UAV), t5 albedo (SRV). Albedo is
+        // folded into the indirect HERE (compute) so the combine PS never touches the G-buffer.
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 0,
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 0);
+        var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0,
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 2);
+        var albedoRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 5,
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 3);
+        var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange, albedoRange), ShaderVisibility.All);
         var clamp = StaticClamp(0);
         sampleRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv0, irrad, visMom, probeStateP, table }, new[] { clamp })));
@@ -484,13 +493,20 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         samplePso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription { RootSignature = sampleRootSig, ComputeShader = cs });
         sampleCb = new Dx12FrameCb<SampleConstants>(dev);
         sampleSrv = new Dx12DescriptorHeap(dev, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
-            3, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+            4, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
     unsafe void BuildCombinePipeline()
     {
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Pixel);
-        var range = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 3, baseShaderRegister: 0);
+        // DataVolatile (not the default DataStaticWhileSetAtExecute) — SAME fix as the SSR combine (Dx12ReflectionsPass
+        // BuildSsr). t0 = `indirect` is a transient/aliasable target, so the DATA_STATIC "state won't change after
+        // SetDescriptorTable" promise is false → GBV raised InvalidSubresourceState "(assumed at first use)" on the
+        // bind (the G-buffer albedo at t1 reported as RENDER_TARGET) → the PS read zero albedo → E*albedo=0 → DDGI
+        // added NOTHING (GI on/off byte-identical). DataVolatile only RELAXES a driver caching assumption (pixel-
+        // neutral) and is the spec-correct flag for an aliasable resource; harmless for the committed G-buffer SRVs.
+        var range = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0,
+            registerSpace: 0, offsetInDescriptorsFromTableStart: 0, flags: DescriptorRangeFlags.DataVolatile);
         var table = new RootParameter1(new RootDescriptorTable1(range), ShaderVisibility.Pixel);
         var clamp = StaticClamp(0, ShaderVisibility.Pixel);
         combineRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
@@ -514,7 +530,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         combineDebugPso = dev.Device.CreateGraphicsPipelineState(Make(psDebug, BlendDescription.Opaque));
         combineCb = new Dx12FrameCb<CombineConstants>(dev);
         combineSrv = new Dx12DescriptorHeap(dev, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
-            3, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+            1, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
     unsafe void BuildDebugPipeline()

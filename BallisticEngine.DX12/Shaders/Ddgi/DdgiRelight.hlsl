@@ -43,7 +43,7 @@ cbuffer DdgiRelightConstants : register(b0) {
     float3 SunDir;       float SunBias;       // TO the sun (normalized)
     float3 SunColor;     float LightCount;
     float  EmaAlpha;     float HistoryValid;  float Intensity;  float FrameJitter;  // FrameJitter<0 → fixed (deterministic)
-    float  MultiBounce;  float BounceBoost;   float Pad0;       float Pad1;          // D4: 2nd-bounce from prev-frame irradiance
+    float  MultiBounce;  float BounceBoost;   float UsePlacement; float Pad1;         // D4: 2nd-bounce; UsePlacement: occupancy-aware probe state active
 };
 SamplerState LinearClamp : register(s0);
 
@@ -188,8 +188,11 @@ void CSMain(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
     if (probe >= probeCount) return;
 
     // Occupancy-aware placement: skip a probe marked inactive (sits in solid with nowhere to relocate). Leave its
-    // irradiance untouched so a stale value can't flash; the sample pass weights it 0 anyway.
-    float4 ps = ProbeState[probe];
+    // irradiance untouched so a stale value can't flash; the sample pass weights it 0 anyway. GATED on UsePlacement:
+    // when placement hasn't run (NOPLACEMENT door, or the first frames before the deferred PlaceProbes lands) the
+    // ProbeState buffer is all-zero (w=0), so an ungated read would skip EVERY probe → DDGI fully dead. Treat
+    // placement-off as all-active, no relocation.
+    float4 ps = (UsePlacement > 0.5) ? ProbeState[probe] : float4(0, 0, 0, 1);
     if (ps.w < 0.5) return;
 
     uint ix = probe % CountX;
@@ -232,7 +235,13 @@ void CSMain(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
             float w = max(dot(texelDir, gDir[r]), 0.0);
             sum += gRad[r] * w; wsum += w;
         }
-        float3 E = ((wsum > 1e-4) ? sum / wsum : 0.0.xxx) * Intensity;
+        // IRRADIANCE normalization (the missing π). sum/wsum is the cosine-WEIGHTED AVERAGE radiance L̄ over the
+        // texel's hemisphere; the true irradiance there is E = ∫L·cosθ dω = π·L̄ for that average. The old code
+        // stored the bare average (π× too dark), and the combine then divides by π again (the Lambert albedo/π) →
+        // the indirect came out ~π² too weak, so wall→object bounce was invisible. Multiply by π here so the cache
+        // holds real incident irradiance; the combine's /π is the receiver's BRDF and stays. (Matches the D4
+        // multi-bounce term, which already re-emits albedo·E/π — consistent units now.)
+        float3 E = ((wsum > 1e-4) ? sum / wsum : 0.0.xxx) * (PI * Intensity);
 
         uint idx = probe * OctTexels + texel;
         float3 prev = PrevIrrad[idx].rgb;

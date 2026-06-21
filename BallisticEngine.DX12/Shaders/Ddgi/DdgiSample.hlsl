@@ -19,8 +19,11 @@ Texture2D<float4> NormalTex  : register(t1);
 StructuredBuffer<float4> Irradiance : register(t2);
 StructuredBuffer<float2> VisMoments : register(t3);   // D3: per-probe visibility moments (mean dist, mean dist²)
 StructuredBuffer<float4> ProbeState : register(t4);   // xyz = relocation offset, w = active (occupancy-aware placement)
+Texture2D<float4> Albedo     : register(t5);   // G-buffer base color — folded in HERE (compute) so the combine PS
+                                               // never binds the G-buffer (it bound albedo as RENDER_TARGET → 0).
 RWTexture2D<float4> Indirect : register(u0);
 SamplerState LinearClamp : register(s0);
+static const float DDGI_PI = 3.14159265359;
 
 static const int OctRes = 8;   // MUST match Dx12DdgiProbeGrid.OctRes + DdgiRelight.hlsl (irradiance cell edge)
 static const int OctTexels = OctRes * OctRes;
@@ -150,5 +153,10 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     if (wsum > 1e-3) E = sum / wsum;                       // normal: visibility-weighted gather
     else if (wsumNoVis > 1e-4) E = sumNoVis / wsumNoVis;   // fallback: every probe was rejected → no-visibility gather
     else E = 0.0.xxx;
-    Indirect[px] = float4(E * Intensity, 1.0);
+    // Fold the receiver Lambert BRDF (albedo/π) HERE, in the compute pass, instead of in the combine PS. The combine
+    // then only does an additive blend of a finished diffuse-indirect color and never binds the G-buffer — which
+    // fixed the dead GI: the combine PS was binding G-buffer albedo while its real layout was RENDER_TARGET, so it
+    // read 0 and E*albedo=0. Compute reads the G-buffer cleanly (NonPixel SRV).
+    float3 albedo = Albedo.Load(int3(px, 0)).rgb;
+    Indirect[px] = float4(E * Intensity * albedo * (1.0 / DDGI_PI), 1.0);
 }
