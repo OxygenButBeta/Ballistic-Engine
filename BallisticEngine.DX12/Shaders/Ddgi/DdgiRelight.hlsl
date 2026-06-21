@@ -126,11 +126,27 @@ float3 GatherPrevIrradiance(float3 P, float3 N) {
     }
     return (wsum > 1e-4) ? sum / wsum : 0.0.xxx;
 }
-float3 SphereDir(uint i, uint n, float jitter) {
+// A2 — blue-noise (R2 low-discrepancy) ray dithering. Plain Fibonacci is a fixed deterministic lattice; over
+// frames the per-probe scalar rotation only decorrelated AZIMUTH and used the same formula for every probe, so
+// the sphere set stayed grid-aligned → residual banding + temporal crawl in the integrated irradiance. kajiya's
+// R2 plastic-constant sequence (Roberts) gives a 2D low-discrepancy (blue-noise-like) offset; we Cranley-
+// Patterson-rotate the Fibonacci sphere by BOTH components — jitter.x rotates the golden-angle azimuth, jitter.y
+// shifts the z-stratum within one ray's slice — so successive frames cover the hemisphere far more evenly and
+// the EMA converges cleaner with the SAME ray count. Deterministic-capture path passes a fixed per-probe offset.
+float2 R2Seq(uint i) {
+    // 1/plastic-number and its square (Roberts' optimal 2D low-discrepancy additive sequence).
+    const float a1 = 0.7548776662466927;   // 1 / 1.32471795724474602596
+    const float a2 = 0.5698402909980532;   // 1 / plastic²
+    return frac(float2(a1, a2) * (float)i + 0.5);
+}
+float3 SphereDir(uint i, uint n, float2 jitter) {
     float gold = 2.39996322973;
-    float z = 1.0 - (2.0 * float(i) + 1.0) / float(n);
+    // z-stratum jitter (jitter.y in [0,1)) spreads the i-th ray's polar slice — turns the rigid Fibonacci
+    // z-lattice into a stratified-jittered set without clumping (each ray keeps its own [i, i+1) stratum).
+    float z = 1.0 - (2.0 * (float(i) + jitter.y) ) / float(n);
+    z = clamp(z, -1.0, 1.0);
     float r = sqrt(saturate(1.0 - z * z));
-    float phi = float(i) * gold + jitter;
+    float phi = float(i) * gold + jitter.x * 6.2831853;   // azimuth Cranley-Patterson rotation
     return float3(r * cos(phi), r * sin(phi), z);
 }
 float Hash(uint s) {
@@ -238,9 +254,20 @@ void CSMain(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
 
     // Per-frame ROTATED ray set + low EMA = true Monte-Carlo convergence (no fixed-set bias) while staying
     // flicker-free on a static scene: each frame aims a different 64-ray Fibonacci rotation, the low-alpha EMA
-    // integrates them over time. FrameJitter<0 → deterministic capture path keeps a fixed rotation (byte-stable).
-    float jitter = FrameJitter < 0.0 ? Hash(probe * 2654435761u) * 6.2831853
-                                     : (Hash(probe * 2654435761u) + frac(FrameJitter * 0.61803399)) * 6.2831853;
+    // integrates them over time. A2: the rotation is a 2D R2 (plastic, blue-noise-like) offset, decorrelated
+    // both spatially (per-probe hash) and temporally (frame advance), so the sphere coverage is far more even
+    // than the old scalar-azimuth rotation. FrameJitter<0 → deterministic capture path keeps a FIXED per-probe
+    // 2D offset (byte-stable; no frame advance).
+    float2 probeBase = float2(Hash(probe * 2654435761u), Hash(probe * 40503u + 1u));   // per-probe spatial decorrelation
+    float2 jitter;
+    if (FrameJitter < 0.0) {
+        jitter = probeBase;                                            // deterministic: fixed per-probe offset
+    } else {
+        // Temporal advance: FrameJitter carries the running frame ordinal (0..1023, C# `frameCounter & 1023`).
+        // Step the R2 sequence by it and add the per-probe base (mod 1) → even, low-discrepancy coverage in time.
+        uint frameOrd = (uint)(FrameJitter + 0.5);
+        jitter = frac(probeBase + R2Seq(frameOrd));
+    }
 
     // Each thread traces ONE ray (gi in [0,RAYS)).
     float3 d = SphereDir(gi, RAYS, jitter);
