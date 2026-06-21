@@ -380,9 +380,10 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
-        // P5: sample the Lumen card cache at reflection hits when Lumen is active this frame + has a valid cache
-        // (so reflections see the same multi-bounce GI the diffuse does). Off → the hit re-shades direct+IBL.
-        bool useCards = ctx.LumenActiveThisFrame && ctx.LumenScene is { Valid: true } && ctx.PostFX.LumenReflections
+        // GI-shared reflections (D5): sample the DDGI probe grid at reflection hits when GI is active + the grid
+        // is valid, so rough reflections see the same GI the diffuse does. Wired in D5 — until then DdgiGrid is
+        // null so this is false and the hit re-shades direct+IBL (the no-GI reflection path).
+        bool useCards = ctx.GiActiveThisFrame && ctx.DdgiGrid is { Valid: true } && ctx.PostFX.LumenReflections
                         && ReflCardsAllowed;
         rtReflCb.Write(new RtReflConstants {
             InvViewProj = Matrix4x4.Transpose(invVP), CameraPos = camPos, Intensity = ForcedIntensity(ctx),
@@ -430,11 +431,11 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
             cl.SetComputeRootShaderResourceView(5, rtGeometry.InstancesGpuAddress);      // t8 RtInstance[]
             cl.SetComputeRootShaderResourceView(6, clusteredLights.LightBufGpuAddress);  // t9 punctual lights
             cl.SetComputeRootShaderResourceView(7, clusteredLights.LightBufGpuAddress);  // t10 (probe, unused → filler)
-            // P5: the Lumen card cache (this frame's lit + multi-bounce radiance, post-swap) + per-instance meta.
-            // When Lumen is off, bind valid filler (the light buffer) — UseCards=0 gates the shader read anyway.
-            ulong cardAddr = useCards ? ctx.LumenScene.CardRadianceReadGpu : clusteredLights.LightBufGpuAddress;
-            ulong metaAddr = useCards ? ctx.LumenScene.InstanceMetaGpuAddress : clusteredLights.LightBufGpuAddress;
-            ulong triClusAddr = useCards && ctx.LumenScene.TriToClusterGpuAddress != 0 ? ctx.LumenScene.TriToClusterGpuAddress : clusteredLights.LightBufGpuAddress;
+            // GI-shared reflections cache (D5): until the DDGI reflections bridge is wired, useCards is always
+            // false (DdgiGrid null) → bind valid filler (the light buffer); UseCards=0 gates the shader read.
+            ulong cardAddr = clusteredLights.LightBufGpuAddress;
+            ulong metaAddr = clusteredLights.LightBufGpuAddress;
+            ulong triClusAddr = clusteredLights.LightBufGpuAddress;
             cl.SetComputeRootShaderResourceView(8, cardAddr);                            // t11 CardRadiance
             cl.SetComputeRootShaderResourceView(9, metaAddr);                            // t12 LumenInstanceMeta
             cl.SetComputeRootShaderResourceView(10, triClusAddr);                         // t13 TriToCluster (#2A)
