@@ -11,6 +11,11 @@ public static class VolumeManager {
     static readonly List<Volume> sorted = new();
     static VolumeStack stack;
 
+    // The highest-priority active volume whose profile carries an enabled GiVolume — its box bounds drive the DDGI
+    // probe grid in Volume bounds mode. The blend stack can't carry geometry (it only blends component values), so
+    // we capture the dominant GI volume here, the one place that knows which volume contributed which component.
+    public static Volume DominantGiVolume { get; private set; }
+
     // Built lazily so ComponentRegistry.Build (bootstrap) has run and all component types exist.
     public static VolumeStack Stack =>
         stack ??= new VolumeStack(ComponentRegistry.VolumeMenu.Select(entry => entry.Type));
@@ -29,6 +34,7 @@ public static class VolumeManager {
     public static void Update(Vector3 cameraPosition) {
         VolumeStack target = Stack;
         target.Reset();
+        DominantGiVolume = null;
 
         if (volumes.Count == 0)
             return;
@@ -58,6 +64,10 @@ public static class VolumeManager {
             foreach (VolumeComponent component in volume.Profile.Components) {
                 if (component.Active)
                     target.Get(component.GetType())?.Override(component, interp);
+                // Track the dominant GI volume (sorted ascending by priority → the last match wins = highest
+                // priority active GI volume). Its box drives the probe grid in Volume bounds mode.
+                if (component.Active && component is GiVolume g && g.enabled.Value)
+                    DominantGiVolume = volume;
             }
         }
     }

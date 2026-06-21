@@ -137,6 +137,8 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     static bool placementEnabled = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_NOPLACEMENT") != "1";
 
     int gridX, gridY, gridZ;
+    bool useVolumeBounds;
+    Vector3 boundsMin, boundsMax;
     // Resolve the probe grid resolution: the GI volume (PostFX) drives it; BALLISTIC_DX12_DDGI_GRID="XxYxZ"
     // overrides for A/B. Read per-frame so a volume/quality-tier change takes effect live.
     void ReadGrid(Dx12FrameContext ctx)
@@ -152,6 +154,29 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
                 && x > 0 && y > 0 && z > 0)
             { gridX = x; gridY = y; gridZ = z; }
         }
+
+        // Volume bounds: confine the grid to the GI volume's box (mode 1) when it has a real box (extent > 0 on all
+        // axes — a global volume reports extent 0 → fall back to the scene AABB). BALLISTIC_DX12_DDGI_BOUNDS=0 forces
+        // the scene-AABB path for A/B. A static box → static grid → the cache converges (no per-frame re-fit).
+        Vector3 e = ctx.PostFX.DdgiBoundsExtent;
+        Vector3 c = ctx.PostFX.DdgiBoundsCenter;
+        useVolumeBounds = ctx.PostFX.DdgiBoundsMode == 1 && e.X > 1e-3f && e.Y > 1e-3f && e.Z > 1e-3f
+                          && Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_BOUNDS") != "0";
+        // Diagnostic / A-B override: BALLISTIC_DX12_DDGI_TESTBOX="cx,cy,cz,ex,ey,ez" forces a volume box without a
+        // scene Volume (lets the bounds path be verified on any scene). Real use drives it from the GI volume.
+        string tb = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_TESTBOX");
+        if (!string.IsNullOrEmpty(tb))
+        {
+            string[] p = tb.Split(',');
+            if (p.Length == 6 && float.TryParse(p[0], System.Globalization.CultureInfo.InvariantCulture, out float cx)
+                && float.TryParse(p[1], System.Globalization.CultureInfo.InvariantCulture, out float cy)
+                && float.TryParse(p[2], System.Globalization.CultureInfo.InvariantCulture, out float cz)
+                && float.TryParse(p[3], System.Globalization.CultureInfo.InvariantCulture, out float ex)
+                && float.TryParse(p[4], System.Globalization.CultureInfo.InvariantCulture, out float ey)
+                && float.TryParse(p[5], System.Globalization.CultureInfo.InvariantCulture, out float ez))
+            { c = new Vector3(cx, cy, cz); e = new Vector3(ex, ey, ez); useVolumeBounds = true; }
+        }
+        if (useVolumeBounds) { boundsMin = c - e; boundsMax = c + e; }
     }
 
     static float EnvF(string name, float fallback)
@@ -181,7 +206,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         var sceneAS = ctx.Dxr.SceneAS;
         sceneAS.Ensure(ctx.WholeMeshRenderers);
 
-        if (!grid.Ensure(ctx, gridX, gridY, gridZ)) return;
+        if (!grid.Ensure(ctx, gridX, gridY, gridZ, useVolumeBounds, boundsMin, boundsMax)) return;
 
         var rtGeo = ctx.Dxr.RtGeometry;
         // Ensure the bindless material table + per-instance geo SRVs are fresh (stamp-cached no-ops if a prior
@@ -292,7 +317,13 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         // fixed rotation (FrameJitter -1) + full replace for byte-stable goldens. Hysteresis still wins on a light
         // change. The probe count gives the rotation index (wraps; varies the rotation without an RNG).
         float frameJitter = det ? -1f : (frameCounter & 1023);
-        if (!det && !lightChanged) ema = MathF.Min(ema, 0.12f);   // settled + rotating → low alpha = clean convergence
+        // Settled + rotating-ray-set: the per-frame 64-ray estimate is noisy (a different Fibonacci rotation each
+        // frame), so the EMA must blend it in SLOWLY or the noise never averages out — it just slides across the
+        // surface frame to frame (the "perlin/sin-wave creeping darkness" the user saw). RTXGI's hysteresis is
+        // ~0.97 (alpha ~0.03); the old 0.12 cap let 12% of each noisy frame through → visible crawling noise. Drop
+        // to 0.03 so a static scene converges to a stable, smooth result. Hysteresis still snaps to 0.5 on a real
+        // lighting change (above), so responsiveness is unaffected.
+        if (!det && !lightChanged) ema = MathF.Min(ema, 0.03f);
 
         relightCb.Write(new RelightConstants
         {

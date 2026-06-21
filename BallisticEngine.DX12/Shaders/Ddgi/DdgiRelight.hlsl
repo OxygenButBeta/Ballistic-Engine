@@ -112,8 +112,13 @@ float3 GatherPrevIrradiance(float3 P, float3 N) {
         float3 tw = float3(off.x==0?1.0-frac.x:frac.x, off.y==0?1.0-frac.y:frac.y, off.z==0?1.0-frac.z:frac.z);
         float w = tw.x * tw.y * tw.z;
         uint probe = c.z * (CountX*CountY) + c.y * CountX + c.x;
-        // Occlusion: reject probes whose view of P is blocked (probe→point distance > mean occluder depth).
-        float3 probePos = GridOrigin + (float3)c * ProbeSpacing;
+        // Probe state: a relocated probe traced (and stored its visibility moments) from its MOVED position, so the
+        // occlusion test MUST use that same position — using the bare lattice position gave a wrong probe→point
+        // distance and the Chebyshev test misfired (occlusion "exploded": probes inside meshes leaking, or valid
+        // probes wrongly rejected). An inactive probe is skipped entirely so it can't feed garbage into the bounce.
+        float4 pst = (UsePlacement > 0.5) ? ProbeState[probe] : float4(0,0,0,1);
+        if (pst.w < 0.5) continue;
+        float3 probePos = GridOrigin + (float3)c * ProbeSpacing + pst.xyz;
         float distPP = distance(probePos, P);
         w *= ChebyshevWeightR(probe, normalize(P - probePos), distPP, bias);
         sum += PrevIrrad[probe * OctTexels + ot.y * OctRes + ot.x].rgb * w;

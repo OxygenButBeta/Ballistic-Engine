@@ -280,6 +280,12 @@ public sealed class PostProcessSettings {
     public int DdgiGridX { get; set; } = 16;                 // probe grid resolution (X×Y×Z over the scene AABB)
     public int DdgiGridY { get; set; } = 8;
     public int DdgiGridZ { get; set; } = 16;
+    // Probe-grid bounds source. 0 = SceneAuto (fit the whole scene AABB — default, byte-identical). 1 = Volume
+    // (confine the grid to the dominant GI volume's box; Center/Extent are the world-space box, half-extent).
+    // Extent == 0 (a global GI volume has no box) makes the backend fall back to SceneAuto.
+    public int DdgiBoundsMode { get; set; } = 0;
+    public Vector3 DdgiBoundsCenter { get; set; }
+    public Vector3 DdgiBoundsExtent { get; set; }
     public float DdgiEmaAlpha { get; set; } = 0.05f;         // probe irradiance temporal blend (the ONE feedback loop)
     public bool DdgiMultiBounce { get; set; } = true;        // feed prev-frame irradiance back at each hit (cheap multi-bounce)
     public bool DdgiVisibility { get; set; } = true;         // Chebyshev visibility test (light-leak rejection)

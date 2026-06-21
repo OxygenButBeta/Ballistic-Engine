@@ -15,6 +15,13 @@ namespace BallisticEngine;
 // cost is per-probe, so probe count is the dominant knob. Custom = author the three counts by hand.
 public enum GiQuality { High, Balanced, Performance, Custom }
 
+// Where the probe grid gets its bounds. SceneAuto fits the whole scene's world AABB (default — the
+// historical behaviour). Volume confines the grid to THIS GI volume's box, so a far stray object can't
+// inflate the AABB and starve the room of probes (the cause of visible probe blobs / corner stepping /
+// flickering buried probes in scenes with distant geometry). Volume mode needs a LOCAL volume (IsGlobal
+// off) with a box drawn around the lit area; a global volume has no box → falls back to SceneAuto.
+public enum GiBoundsMode { SceneAuto, Volume }
+
 public sealed class GiVolume : VolumeComponent {
     [Tooltip("Master switch for DDGI global illumination. Off → direct lighting + IBL + AO + shadows only. " +
              "Requires hardware ray tracing; without it GI is unavailable regardless of this toggle.")]
@@ -23,6 +30,11 @@ public sealed class GiVolume : VolumeComponent {
     [Tooltip("Probe-grid density preset. High = 24×12×24, Balanced = 16×8×16 (default), Performance = 10×6×10. " +
              "Custom = honour the explicit grid counts below.")]
     public readonly EnumParameter<GiQuality> quality = new(GiQuality.Balanced);
+
+    [Tooltip("Probe-grid bounds. SceneAuto = fit the whole scene AABB (default). Volume = confine the grid to " +
+             "THIS volume's box (set IsGlobal off + size the box around the lit area) so distant geometry can't " +
+             "starve the room of probes — fixes probe blobs / corner stepping / flickering buried probes.")]
+    public readonly EnumParameter<GiBoundsMode> boundsMode = new(GiBoundsMode.SceneAuto);
 
     [Tooltip("Overall strength of the indirect (diffuse GI) contribution. 1 = physical.")]
     public readonly ClampedFloatParameter intensity = new(1f, 0f, 4f);

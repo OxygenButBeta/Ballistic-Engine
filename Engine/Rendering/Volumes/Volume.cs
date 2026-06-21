@@ -58,6 +58,24 @@ public class Volume : Behaviour {
         return BlendDistance > 0f ? Math.Clamp(1f - distance / BlendDistance, 0f, 1f) : 0f;
     }
 
+    // World-space axis-aligned box of a LOCAL volume (center + half-extent), for systems that need the volume's
+    // geometry (the DDGI probe grid confines itself to the GI volume's box). Returns false for a global volume
+    // (no box). v1: the probe lattice is axis-aligned, so a rotated volume is treated as its AABB (rotation
+    // ignored). Math mirrors ComputeInterpFactor / OnDrawGizmosSelected exactly.
+    internal bool TryGetWorldBox(out Vector3 center, out Vector3 halfExtent) {
+        center = default;
+        halfExtent = default;
+        if (IsGlobal)
+            return false;
+        Vector3 scale = transform.WorldMatrix.ExtractScale();
+        center = transform.WorldPosition;
+        halfExtent = new Vector3(
+            MathF.Abs(BoxSize.X * scale.X),
+            MathF.Abs(BoxSize.Y * scale.Y),
+            MathF.Abs(BoxSize.Z * scale.Z)) * 0.5f;
+        return true;
+    }
+
     public override void OnDrawGizmosSelected(IGizmos gizmos) {
         if (IsGlobal)
             return;

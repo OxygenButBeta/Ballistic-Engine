@@ -70,38 +70,58 @@ public sealed class Dx12DdgiProbeGrid : IDisposable
     int dimStamp = -1;
     Vector3 lastMin, lastMax;
 
-    // Fit the grid to the scene world AABB (from the scene AS instances — exactly the traced geometry) and
-    // (re)allocate the irradiance buffers when the layout changes. Returns Valid.
-    public bool Ensure(Dx12FrameContext ctx, int reqX, int reqY, int reqZ)
+    // Fit the grid to the scene world AABB (from the scene AS instances — exactly the traced geometry), OR to an
+    // explicit volume box when useVolumeBounds is set, and (re)allocate the irradiance buffers when the layout
+    // changes. Returns Valid.
+    public bool Ensure(Dx12FrameContext ctx, int reqX, int reqY, int reqZ,
+                       bool useVolumeBounds = false, Vector3 volMin = default, Vector3 volMax = default)
     {
         Dx12SceneAS sceneAS = ctx.Dxr?.SceneAS;
         if (sceneAS == null || !sceneAS.Valid || sceneAS.InstanceCount == 0) { Valid = false; return false; }
 
-        // Scene world AABB: 8-corner transform of every instance's local mesh bounds.
-        var min = new Vector3(float.MaxValue);
-        var max = new Vector3(float.MinValue);
-        for (int i = 0; i < sceneAS.InstanceCount; i++)
+        Vector3 min, max;
+        if (useVolumeBounds)
         {
-            Mesh mesh = sceneAS.InstanceMesh(i);
-            if (mesh == null) continue;
-            mesh.GetLocalBounds(out Vector3 lo, out Vector3 hi);
-            Matrix4x4 world = sceneAS.InstanceWorld(i);
-            for (int c = 0; c < 8; c++)
+            // GI volume box drives the bounds — a static, authored box. Distant stray geometry can't inflate it
+            // (the probe-density fix) and it never shifts frame-to-frame (the flicker fix: a stable AABB → no
+            // per-frame re-fit → no placement re-run → buried probes don't blink active↔inactive).
+            min = Vector3.Min(volMin, volMax);
+            max = Vector3.Max(volMin, volMax);
+        }
+        else
+        {
+            // Scene world AABB: 8-corner transform of every instance's local mesh bounds.
+            min = new Vector3(float.MaxValue);
+            max = new Vector3(float.MinValue);
+            for (int i = 0; i < sceneAS.InstanceCount; i++)
             {
-                var corner = new Vector3(
-                    (c & 1) == 0 ? lo.X : hi.X,
-                    (c & 2) == 0 ? lo.Y : hi.Y,
-                    (c & 4) == 0 ? lo.Z : hi.Z);
-                Vector3 w = Vector3.Transform(corner, world);
-                min = Vector3.Min(min, w);
-                max = Vector3.Max(max, w);
+                Mesh mesh = sceneAS.InstanceMesh(i);
+                if (mesh == null) continue;
+                mesh.GetLocalBounds(out Vector3 lo, out Vector3 hi);
+                Matrix4x4 world = sceneAS.InstanceWorld(i);
+                for (int c = 0; c < 8; c++)
+                {
+                    var corner = new Vector3(
+                        (c & 1) == 0 ? lo.X : hi.X,
+                        (c & 2) == 0 ? lo.Y : hi.Y,
+                        (c & 4) == 0 ? lo.Z : hi.Z);
+                    Vector3 w = Vector3.Transform(corner, world);
+                    min = Vector3.Min(min, w);
+                    max = Vector3.Max(max, w);
+                }
             }
         }
         if (min.X > max.X) { Valid = false; return false; }   // no valid geometry
 
         // Layout change detector: grid dims OR a meaningful AABB shift → re-fit (and realloc if probe count grew).
+        // Bump the shift threshold to ~2% of the grid extent (min 0.05) instead of a fixed 1cm: a tiny AABB jitter
+        // (float drift in the 8-corner transform across frames) used to flip layoutChanged → StatePlaced=false →
+        // the next frame relit all probes as active before placement re-ran → buried probes flickered. A relative,
+        // larger threshold ignores that jitter; a real layout change still clears it. (Volume bounds are static, so
+        // this mostly matters for the scene-AABB path.)
         int dims = (reqX & 0x3ff) | ((reqY & 0x3ff) << 10) | ((reqZ & 0x3ff) << 20);
-        bool aabbMoved = Vector3.Distance(min, lastMin) > 0.01f || Vector3.Distance(max, lastMax) > 0.01f;
+        float moveEps = MathF.Max(0.05f, 0.02f * Vector3.Distance(min, max));
+        bool aabbMoved = Vector3.Distance(min, lastMin) > moveEps || Vector3.Distance(max, lastMax) > moveEps;
         bool layoutChanged = dims != dimStamp || aabbMoved || irradA == null;
 
         if (layoutChanged)
