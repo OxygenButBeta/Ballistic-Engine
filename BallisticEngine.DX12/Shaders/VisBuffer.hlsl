@@ -29,7 +29,12 @@ SamplerState PointClamp : register(s1);
 
 struct VOut {
     float4 Position : SV_Position;
-    nointerpolation uint MeshletIdx : TEXCOORD0;   // GLOBAL meshlet index (for the resolve to fetch verts)
+    nointerpolation uint MeshletIdx : TEXCOORD0;   // SUBMESH-LOCAL meshlet index (constant across the meshlet)
+};
+// Per-PRIMITIVE output: the local triangle index within the meshlet (SV_PrimitiveID, standard + widely supported —
+// avoids a custom per-primitive semantic, which the mesh-shader PSO rejected with E_INVALIDARG on this driver).
+struct POut {
+    uint LocalPrim : SV_PrimitiveID;
 };
 
 struct Payload { uint MeshletIndices[32]; };
@@ -68,8 +73,8 @@ void ASMain(uint dtid : SV_DispatchThreadID) {
 [numthreads(128, 1, 1)]
 [outputtopology("triangle")]
 void MSMain(uint gtid : SV_GroupThreadID, uint gid : SV_GroupID, in payload Payload pl,
-            out vertices VOut verts[64], out indices uint3 tris[124], out primitives uint primMeshlet[124] : MESHLETIDX) {
-    uint mi = pl.MeshletIndices[gid];
+            out vertices VOut verts[64], out indices uint3 tris[124], out primitives POut prims[124]) {
+    uint mi = pl.MeshletIndices[gid];   // submesh-local meshlet index (per-submesh buffers, base 0)
     Meshlet m = Meshlets[mi];
     SetMeshOutputCounts(m.VertCount, m.PrimCount);
     PerDraw pd = PerDraws[DrawIndex];
@@ -83,16 +88,18 @@ void MSMain(uint gtid : SV_GroupThreadID, uint gid : SV_GroupID, in payload Payl
     if (gtid < m.PrimCount) {
         uint packed = MeshletPrims[m.PrimOffset + gtid];
         tris[gtid] = uint3(packed & 0xFF, (packed >> 8) & 0xFF, (packed >> 16) & 0xFF);
-        // Pack { meshletIndex (24b) | localPrim (8b) } so the resolve can recover BOTH the meshlet (for VertOffset)
-        // and the local triangle (for the packed local-vert triple). localPrim < 124 fits in 8 bits.
-        primMeshlet[gtid] = (mi << 8) | (gtid & 0xFF);
+        POut po; po.LocalPrim = gtid;   // local triangle index within this meshlet (read in PS via SV_PrimitiveID)
+        prims[gtid] = po;
     }
 }
 
-// PS: write the visibility id. RG32_UINT = { DrawIndex, (meshletIndex<<8)|localPrim }.
+// PS: write the visibility id. RG32_UINT = { DrawIndex+1, (localMeshlet<<8)|localPrim }. The +1 makes the
+// cleared (0,0) the miss sentinel (the resolve un-biases): a real DrawIndex 0 hit would otherwise be
+// indistinguishable from a sky/cleared pixel. MeshletIdx is the SUBMESH-LOCAL meshlet (per-submesh buffers, base 0),
+// LocalPrim is the triangle within it — together they index that draw's own meshlet buffer directly in the resolve.
 struct VisOut { uint2 Id : SV_Target0; };
-VisOut PSMain(VOut i, uint primMeshlet : MESHLETIDX) {
+VisOut PSMain(VOut i, uint localPrim : SV_PrimitiveID) {
     VisOut o;
-    o.Id = uint2(DrawIndex, primMeshlet);
+    o.Id = uint2(DrawIndex + 1, (i.MeshletIdx << 8) | (localPrim & 0xFF));
     return o;
 }

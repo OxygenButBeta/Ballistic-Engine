@@ -331,6 +331,8 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         bindlessIds.Clear();
         materialCount = 0;
         hizBindlessIndex = -1;
+        bufferBindless.Clear();   // R5: the bindless heap was/will be Reset → the vis-buffer geometry SRVs are stale.
+        visResolveUavBase = -1;   // R5: re-reserve the resolve UAV-table slots after this rebuild's heap Reset.
         // Drop the Hi-Z pyramid too: a same-resolution scene swap leaves it holding the OLD scene's depth, so
         // the occlusion cull would reject the new scene behind stale occluders. Next BuildHiZ re-creates it
         // (recreated=true → bindless SRV re-pointed) and refills from the new depth.
@@ -349,6 +351,8 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         Dx12Backend.BindlessHeap.Reset();
         materialIds.Clear();
         bindlessIds.Clear();
+        bufferBindless.Clear();   // R5: vis-buffer geometry SRVs lived in the heap that was just reset — re-register
+        visResolveUavBase = -1;   // R5: the resolve UAV-table slots are gone too — re-reserve on next ReserveVisResolveUavs
         materialCount = 0;
         hizBindlessIndex = -1;   // the Hi-Z SRV lived in the bindless heap that was just reset — re-register
 
@@ -611,6 +615,63 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     public long MeshletTris => meshletTris;
     long meshletTris;
 
+    // ===================== R5 — visibility-buffer VisDraw table =====================
+    // One VisDraw per vis-buffer submesh draw: Mvp/Model/MaterialId + BINDLESS heap indices for this draw's OWN
+    // vertex streams + per-submesh meshlet buffers, so VisResolve.hlsl can fetch the right geometry per pixel
+    // (the engine has per-mesh / per-submesh buffers, not one global geometry buffer). Layout matches VisResolve's
+    // VisDraw. N-buffered like cpuPerDraws.
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct VisDraw {
+        public Matrix4x4 Mvp; public Matrix4x4 Model;
+        public uint MaterialId;
+        public uint PosIdx, NrmIdx, UvIdx, TanIdx;
+        public uint MeshletIdx, MeshletVertIdx, MeshletPrimIdx;
+    }
+    ID3D12Resource visDraws; unsafe byte* visDrawsMapped; int visDrawStride; long visDrawsFrameStride;
+    // Bindless SRV slot cache: each unique geometry buffer (vertex stream OR meshlet buffer) gets ONE structured-SRV
+    // bindless slot, registered on first use. Keyed by the buffer resource. Cleared on Invalidate (the bindless heap
+    // is Reset on a material rebuild, so the slots are gone — re-register lazily).
+    readonly Dictionary<ID3D12Resource, int> bufferBindless = new();
+    unsafe void EnsureVisDraws() {
+        if (visDraws != null) return;
+        visDrawStride = System.Runtime.InteropServices.Marshal.SizeOf<VisDraw>();
+        visDrawsFrameStride = (long)visDrawStride * MaxCpuDraws;
+        visDraws = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)(visDrawsFrameStride * dev.FramesInFlight)), ResourceStates.GenericRead);
+        visDrawsMapped = visDraws.Map<byte>(0);
+    }
+    public ulong VisDrawsAddress { get { EnsureVisDraws(); return visDraws.GPUVirtualAddress + (ulong)(dev.FrameSlot * visDrawsFrameStride); } }
+    // R5 — 5 CONTIGUOUS bindless-heap slots for the vis resolve's G-buffer color UAV table (u0..u4). DX12 allows
+    // one shader-visible CBV_SRV_UAV heap, so the UAV table must live in the SAME bindless heap the resolve indexes
+    // for geometry/material/VisId. Reserved here (gpuDriven owns the heap's Reset lifecycle) so a material rebuild /
+    // Invalidate that Resets the heap forces a re-reserve. Returns the first slot; the heap is bump-allocated so the
+    // 5 Allocate() calls are contiguous (no Free in between).
+    int visResolveUavBase = -1;
+    public int ReserveVisResolveUavs() {
+        if (visResolveUavBase >= 0) return visResolveUavBase;
+        int first = Dx12Backend.BindlessHeap.Allocate();
+        for (int i = 1; i < Dx12GBuffer.RtCount; i++) Dx12Backend.BindlessHeap.Allocate();   // 4 more (contiguous)
+        visResolveUavBase = first;
+        return first;
+    }
+    // Register (or reuse) a structured-buffer SRV in the shared bindless heap for `res` with `count` elements of
+    // `stride` bytes. Cached per resource. Returns the bindless index (ResourceDescriptorHeap[idx]).
+    int RegisterBufferBindless(ID3D12Resource res, int count, int stride) {
+        if (res is null) return 0;
+        if (bufferBindless.TryGetValue(res, out int idx)) return idx;
+        idx = Dx12Backend.BindlessHeap.Allocate();
+        dev.Device.CreateShaderResourceView(res, new ShaderResourceViewDescription {
+            Format = Vortice.DXGI.Format.Unknown, ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Buffer,
+            Shader4ComponentMapping = ShaderComponentMapping.Default,
+            Buffer = new BufferShaderResourceView {
+                FirstElement = 0, NumElements = (uint)count, StructureByteStride = (uint)stride,
+                Flags = BufferShaderResourceViewFlags.None,
+            },
+        }, Dx12Backend.BindlessHeap.Cpu(idx));
+        bufferBindless[res] = idx;
+        return idx;
+    }
+
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct MeshletDrawConst { public uint DrawIndex, MeshletBase, MeshletCount, Pad; }
 
@@ -642,22 +703,34 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         *(Vector4*)(cb + oo) = new Vector4(hiz.Width, hiz.Height, hiz.MipCount, near); oo += 16;
         *(Vector4*)(cb + oo) = new Vector4(far, hizOn ? 1f : 0f, Math.Max(hizBindlessIndex, 0), 0f);
 
+        EnsureVisDraws();
         cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);
         cl.SetGraphicsRootSignature(visRootSig);
         cl.SetPipelineState(visPso);
-        cl.SetGraphicsRootShaderResourceView(1, CpuPerDrawsAddress);   // t0 PerDraws
+        cl.SetGraphicsRootShaderResourceView(1, CpuPerDrawsAddress);   // t0 PerDraws (raster MSMain reads Mvp)
         cl.SetGraphicsRootConstantBufferView(12, meshletCullCb.GPUVirtualAddress + (ulong)cullOff); // b2 cull
+        long visSlot = (long)dev.FrameSlot * visDrawsFrameStride;
         int draws = 0;
         foreach (var r in renderers) {
             Mesh mesh = r.SharedMesh; if (mesh is null) continue;
             var pos = mesh.VertexBuffer as Dx12Buffer<GLVector3>;
-            if (pos?.Resource is null) continue;
+            var nrm = mesh.NormalBuffer as Dx12Buffer<GLVector3>;
+            var uv  = mesh.UvBuffer as Dx12Buffer<Vector2>;
+            var tan = mesh.TangentBuffer as Dx12Buffer<Vector4>;
+            // The vis resolve needs ALL four streams bindlessly; skip a renderer missing any (it can't be resolved).
+            if (pos?.Resource is null || nrm?.Resource is null || uv?.Resource is null || tan?.Resource is null) continue;
             Matrix4x4 model = ToNum(r.Transform.WorldMatrix);
             Matrix4x4 mvp = model * viewProj;
             int only = r.SubMeshIndex;
             int sFirst = only >= 0 ? only : 0;
             int sLast = only >= 0 ? only : mesh.SubMeshes.Length - 1;
-            cl.SetGraphicsRootShaderResourceView(7, pos.GpuAddress);   // t6 Positions
+            cl.SetGraphicsRootShaderResourceView(7, pos.GpuAddress);   // t6 Positions (raster MSMain)
+            // Per-mesh vertex stream bindless indices (cached; same for every submesh of this mesh).
+            int vcount = mesh.Vertices.Length;
+            int posIdx = RegisterBufferBindless(pos.Resource, vcount, 12);
+            int nrmIdx = RegisterBufferBindless(nrm.Resource, vcount, 12);
+            int uvIdx  = RegisterBufferBindless(uv.Resource, vcount, 8);
+            int tanIdx = RegisterBufferBindless(tan.Resource, vcount, 16);
             for (int s = sFirst; s <= sLast; s++) {
                 if ((uint)s >= (uint)mesh.SubMeshes.Length) break;
                 SubMeshData sub = mesh.SubMeshes[s];
@@ -672,6 +745,17 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
                     Mvp = Matrix4x4.Transpose(mvp), Model = Matrix4x4.Transpose(model), MaterialId = (uint)mid,
                 };
                 var ml = Dx12Meshlet.Build(dev, mesh, s);
+                // VisDraw record for the resolve: Mvp/Model (NON-transposed; HLSL mul(v, M) with row-major C# data
+                // matches the raster's Mvp use — the raster MSMain reads the TRANSPOSED PerDraw.Mvp, but the resolve
+                // reads VisDraw.Mvp; both must agree. The raster does mul(pos, PerDraw.Mvp) on the transposed matrix;
+                // to get the SAME clip pos the resolve must use the same transposed matrix). So store TRANSPOSED.
+                *(VisDraw*)(visDrawsMapped + visSlot + (long)cpuDrawIndex * visDrawStride) = new VisDraw {
+                    Mvp = Matrix4x4.Transpose(mvp), Model = Matrix4x4.Transpose(model), MaterialId = (uint)mid,
+                    PosIdx = (uint)posIdx, NrmIdx = (uint)nrmIdx, UvIdx = (uint)uvIdx, TanIdx = (uint)tanIdx,
+                    MeshletIdx = (uint)RegisterBufferBindless(ml.Meshlets, ml.MeshletCount, 16),
+                    MeshletVertIdx = (uint)RegisterBufferBindless(ml.Verts, ml.VertCount, 4),
+                    MeshletPrimIdx = (uint)RegisterBufferBindless(ml.Prims, ml.PrimCount, 4),
+                };
                 cl.SetGraphicsRootShaderResourceView(3, ml.Meshlets.GPUVirtualAddress);
                 cl.SetGraphicsRootShaderResourceView(4, ml.Bounds.GPUVirtualAddress);
                 cl.SetGraphicsRootShaderResourceView(5, ml.Verts.GPUVirtualAddress);

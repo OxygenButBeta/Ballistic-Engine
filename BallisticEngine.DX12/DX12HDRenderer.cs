@@ -718,6 +718,15 @@ public sealed class DX12HDRenderer : HDRenderer
             Console.WriteLine("[DX12] BARE-MINIMUM render: G-buffer + deferred (sun/punctual) + composite only. " +
                               "Re-enable per pass with BALLISTIC_DX12_{SHADOWS,SKY,IBL,SSAO,BLOOM,AP,VOLUMES}=1 / BALLISTIC_FX_VOLUMETRIC=1.");
         gpuDriven = new Dx12GpuDrivenRenderer(dev);
+        // R5 — vis-buffer pass (built only when opt-in + HW mesh shaders; Available gates everything downstream).
+        if (VisBufferOn && dev.HasMeshShaders)
+        {
+            visBuffer = new Dx12VisBufferPass(dev, gpuDriven);
+            if (visBuffer.Available)
+                Console.WriteLine("[DX12] VISIBILITY BUFFER geometry path ON (BALLISTIC_DX12_VISBUFFER=1) — " +
+                                  "vis-id raster + deferred-material resolve replaces the GPU-driven G-buffer fill for whole-mesh geometry.");
+            else { visBuffer.Dispose(); visBuffer = null; Console.WriteLine("[DX12] VISIBILITY BUFFER requested but pipeline build failed — falling back to the GPU-driven path."); }
+        }
         // Drop every per-scene CACHED cull/draw state on a scene swap. These caches are keyed by cheap change
         // stamps (not scene identity): the GPU-driven material table (renderer+submesh count), the Hi-Z prime,
         // the shadow-cascade cache. Two scenes with matching stamps would keep the first scene's table/cull
@@ -893,6 +902,12 @@ public sealed class DX12HDRenderer : HDRenderer
 
     Dx12GpuDrivenRenderer gpuDriven;
     bool gpuDrivenOn;
+    // R5 — visibility-buffer geometry path (opt-in, BALLISTIC_DX12_VISBUFFER=1 + HW mesh shaders). When active it
+    // replaces the GPU-driven meshlet/ExecuteIndirect G-buffer fill for whole-mesh/split renderers: raster a vis-id
+    // target → resolve the fat G-buffer in compute. Default null/off → byte-identical.
+    Dx12VisBufferPass visBuffer;
+    bool? visBufferOnCached;
+    bool VisBufferOn => visBufferOnCached ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_VISBUFFER") == "1";
 
     // Scene-swap cache reset (subscribed to SceneManager.RenderSetsCleared in the ctor). Forces the GPU-driven
     // material table to rebuild for the new scene (its count-stamp could coincide with the old scene's), drops
@@ -2236,7 +2251,10 @@ public sealed class DX12HDRenderer : HDRenderer
             // R3a: gpuDrivenGeometry = whole-mesh + split-import (split empty unless GPUDRIVEN_SPLIT=1 → byte-
             // identical to wholeMeshRenderers when off). RenderInto clamps each renderer's submesh range by its
             // SubMeshIndex, so split-import children draw only their one submesh.
-            if (gpuDrivenOn && gpuDrivenGeometry.Count > 0)
+            // R5: when the visibility-buffer path is active, whole-mesh/split geometry is drawn AFTER this pass
+            // (vis-id raster → deferred-material resolve, which needs its OWN RTV not the fat MRTs bound here). Skip
+            // the GPU-driven fill so it isn't drawn twice.
+            if (gpuDrivenOn && gpuDrivenGeometry.Count > 0 && visBuffer == null)
             {
                 // R4: draw whole-mesh geometry through the mesh-shader meshlet pipeline when enabled + supported.
                 // DispatchMesh needs ID3D12GraphicsCommandList6 (the frame list is a List4 — query the richer
@@ -2267,6 +2285,20 @@ public sealed class DX12HDRenderer : HDRenderer
                 }
             }
         });
+
+        // === R5 VISIBILITY-BUFFER GEOMETRY (opt-in). After the fat-G-buffer pass filled CPU-path geometry (skinned/
+        // custom), raster the whole-mesh/split geometry into a vis-id target sharing this G-buffer's depth, then a
+        // compute resolve writes the fat G-buffer colors for the vis-hit pixels (deferred material). The resolve
+        // leaves miss pixels untouched (CPU geometry + cleared sky survive). Leaves the 5 colors in shader-read
+        // (deferred expects it). Default off (visBuffer == null) → none of this runs → byte-identical. ===
+        if (visBuffer != null && gpuDrivenGeometry.Count > 0)
+        {
+            bool coneCull = Environment.GetEnvironmentVariable("BALLISTIC_DX12_MESHLET_CONE") != "0";
+            int visDraws = visBuffer.Render(gbuffer, gpuDrivenGeometry, viewProj, frustumPlanes,
+                new Vector3(camPos.X, camPos.Y, camPos.Z), coneCull, viewProjUnjittered, view,
+                CameraNear, CameraFar, viewProjUnjittered, viewProjPrevForMotion, 0f);
+            draws += visDraws;
+        }
 
         // Hi-Z debug door: how many whole-mesh submeshes survived the GPU cull (frustum + Hi-Z occlusion).
         if (gpuDrivenOn && wholeMeshRenderers.Count > 0 && hizDebugOn)

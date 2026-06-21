@@ -250,6 +250,9 @@ public sealed class Dx12GBuffer : IDisposable {
     public void ColorsToShaderRead(ID3D12GraphicsCommandList4 cl) {
         for (int i = 0; i < RtCount; i++) ColorTransition(cl, i, ShaderRead);
     }
+    // R5 (vis-buffer): the vis raster owns its own RTV but reuses THIS G-buffer's depth as the DSV — it needs to
+    // transition depth into the open frame command list (not a separate ExecuteSync). Public wrapper for that.
+    public void DepthTransitionPublic(ID3D12GraphicsCommandList4 cl, ResourceStates target) => DepthTransition(cl, target);
     void DepthTransition(ID3D12GraphicsCommandList4 cl, ResourceStates target) {
         if (depthState == target) return;
         cl.ResourceBarrierTransition(depth, depthState, target);
