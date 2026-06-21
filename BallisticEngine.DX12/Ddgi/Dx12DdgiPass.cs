@@ -9,20 +9,17 @@ using Vortice.DXGI;
 namespace BallisticEngine.DX12;
 
 // DDGI — the single product-facing GI pass (event GlobalIllumination = 500, the slot the legacy Lumen pass
-// held). World-space irradiance probe grid; the design replaces Lumen V2 with ONE predictable feedback loop:
+// held). World-space irradiance probe grid; replaces Lumen V2 with ONE predictable feedback loop:
 //
 //   1. Relight  (compute)  per-probe RT trace → shade hits (sun+shadow-ray + punctual + emissive) + sky on a
-//                          miss → integrate into the probe's octahedral irradiance cell, EMA-blended over the
-//                          previous frame. View-independent: no reprojection, no motion vectors.
-//   2. Sample   (compute)  per full-res pixel: gather the 8 probes around it (trilinear), → indirect E.
-//   3. Combine  (PS)       E*albedo*ao/PI added into the HDR color (One/One). The deferred pass already
-//                          suppressed its IBL diffuse ambient (ctx.GiActiveThisFrame) so no double count.
+//                          miss → integrate into the probe's octahedral irradiance cell, EMA over the previous
+//                          frame. View-independent: no reprojection, no motion vectors.
+//   2. Sample   (compute)  per full-res pixel: trilinear-gather the 8 bracketing probes → indirect E.
+//   3. Combine  (PS)       E*albedo*ao/PI added into the HDR color (One/One). Deferred already suppressed its
+//                          IBL diffuse ambient (ctx.GiActiveThisFrame) → no double count.
 //
-// No screen-space temporal / SVGF / async double-buffer / per-pixel trace — the entire ghosting/disocclusion
-// class is gone because the cache lives in world space. Gated behind the GlobalIllumination volume +
-// BALLISTIC_DX12_DDGI; HW-RT only (no hidden SSGI fallback). Default-off = no-op, byte-identical no-GI frame.
-//
-// D0: skeleton — grid is never Valid, Record is a no-op. D1 adds the probe grid + relight; D2 sample+combine.
+// No screen-space temporal / SVGF / async double-buffer / per-pixel trace — the ghosting/disocclusion class is
+// gone (the cache is world-space). HW-RT only. Default-off = no-op, byte-identical no-GI frame.
 public sealed class Dx12DdgiPass : IRenderPass, IDisposable
 {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.GlobalIllumination;
@@ -30,22 +27,62 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
 
     readonly Dx12Device dev;
     readonly Dx12DdgiProbeGrid grid;
-
-    // The probe grid the Reflections pass (event 600) will sample for rough reflections (D5). Exposed read-only;
-    // valid only after a successful Ensure this frame (reflections also gates on ctx.GiActiveThisFrame).
     public Dx12DdgiProbeGrid Grid => grid;
+
+    // ---- relight (per-probe RT trace) ----
+    ID3D12RootSignature relightRootSig;
+    ID3D12PipelineState relightPso;
+    Dx12FrameCb<RelightConstants> relightCb;
+    const int RelightSkyTableBase = Dx12BindlessTail.DdgiRelightTableBase;   // t5 sky cube
+    const int RelightRays = 64;   // must match DdgiRelight.hlsl RAYS
+
+    // ---- sample (full-res gather) ----
+    ID3D12RootSignature sampleRootSig;
+    ID3D12PipelineState samplePso;
+    Dx12FrameCb<SampleConstants> sampleCb;
+    Dx12DescriptorHeap sampleSrv;   // per pass: depth SRV + normal SRV + Indirect UAV (3)
+    Dx12OffscreenTarget indirect;   // full-res RGBA16F incoming irradiance E
+
+    // ---- combine (additive fullscreen) ----
+    ID3D12RootSignature combineRootSig;
+    ID3D12PipelineState combinePso, combineDebugPso;
+    Dx12FrameCb<CombineConstants> combineCb;
+    Dx12DescriptorHeap combineSrv;  // per pass: Indirect SRV + albedo SRV + AO SRV (3)
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct RelightConstants
+    {
+        public Vector3 GridOrigin;   public float RayCount;
+        public Vector3 ProbeSpacing; public float SkyIntensity;
+        public uint CountX, CountY, CountZ; public float UseSky;
+        public Vector3 SunDir;       public float SunBias;
+        public Vector3 SunColor;     public float LightCount;
+        public float EmaAlpha;       public float HistoryValid; public float Intensity; public float FrameJitter;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct SampleConstants
+    {
+        public Matrix4x4 InvViewProj;
+        public Vector3 GridOrigin;   public float Pad0;
+        public Vector3 ProbeSpacing; public float NormalBias;
+        public uint CountX, CountY, CountZ; public uint W;
+        public uint H; public float Intensity; public float Pad1; public float Pad2;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct CombineConstants { public float AoStrength; public float Intensity; public float Pad0; public float Pad1; }
 
     public Dx12DdgiPass(Dx12Device device, int width, int height)
     {
         dev = device;
         grid = new Dx12DdgiProbeGrid(device);
+        BuildPipelines();
         Resize(width, height);
     }
 
-    // The product door. DDGI is driven by the GlobalIllumination VOLUME (ctx.PostFX.LumenEnabled, default ON —
-    // the volume/asset field name is kept as "Lumen*" for serialization compatibility). The BALLISTIC_DX12_DDGI
-    // env door overrides for A/B: "1" forces on, "0" forces off, unset → follow the volume.
-    static int envDoor = -2;   // -2 unread, -1 unset(follow volume), 0 force-off, 1 force-on
+    // ---- product door ----
+    static int envDoor = -2;
     static bool Armed(Dx12FrameContext ctx)
     {
         if (envDoor == -2)
@@ -56,15 +93,11 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         return envDoor == 1 || (envDoor == -1 && ctx.PostFX.LumenEnabled);
     }
 
-    // The frame-level "GI runs" predicate, shared with the orchestrator (which mirrors it into
-    // ctx.GiActiveThisFrame so the deferred pass suppresses its IBL diffuse ambient before this pass adds its
-    // own diffuse indirect). HW-RT only — no hidden screen-space fallback.
     public static bool WouldRun(Dx12FrameContext ctx) =>
         !ctx.Doors.Minimal && Armed(ctx) && ctx.Dev.HasHardwareRayTracing && ctx.Dxr?.SceneAS != null;
 
     public bool Enabled(Dx12FrameContext ctx) => WouldRun(ctx);
 
-    // Requested grid dimensions (BALLISTIC_DX12_DDGI_GRID="X x Y x Z", default 16x8x16). Read once.
     static int gridX = -1, gridY, gridZ;
     static void ReadGrid()
     {
@@ -80,23 +113,276 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         }
     }
 
+    static float EnvF(string name, float fallback)
+    {
+        string v = Environment.GetEnvironmentVariable(name);
+        return !string.IsNullOrEmpty(v) && float.TryParse(v, System.Globalization.CultureInfo.InvariantCulture, out float f) ? f : fallback;
+    }
+
+    int frameCounter;
+
     public void Resize(int width, int height)
     {
-        // D2+: the full-res `indirect` E target + sample/combine descriptor heaps resize here.
+        indirect?.Dispose();
+        indirect = new Dx12OffscreenTarget(dev, width, height, colorFormat: Dx12OffscreenTarget.HdrFormat,
+            colorReadable: true, allowUav: true);
     }
 
-    public void Record(Dx12FrameContext ctx)
+    public unsafe void Record(Dx12FrameContext ctx)
     {
         ReadGrid();
-        // Fit/allocate the probe grid against this frame's scene. D0: Ensure is a stub → Valid stays false → no-op.
-        if (!grid.Ensure(ctx, gridX, gridY, gridZ))
-            return;
+        frameCounter++;
 
-        // D1: relight → D2: sample → combine. Nothing yet.
+        // Build/refresh the shared TLAS (DDGI may be the first RT effect in the frame — RT shadows/reflections
+        // can be off). Stamp-cached: a static scene builds once. Without this the AS is never Valid → no-op.
+        var sceneAS = ctx.Dxr.SceneAS;
+        sceneAS.Ensure(ctx.WholeMeshRenderers);
+
+        if (!grid.Ensure(ctx, gridX, gridY, gridZ)) return;
+
+        var rtGeo = ctx.Dxr.RtGeometry;
+        // Ensure the bindless material table + per-instance geo SRVs are fresh (stamp-cached no-ops if a prior
+        // RT pass already built them this frame).
+        ctx.GpuDriven.EnsureMaterialTable(ctx.WholeMeshRenderers);
+        rtGeo.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection, ctx.GpuDriven);
+        if (!rtGeo.Valid) return;
+
+        if (!logged) { logged = true; Console.WriteLine($"    DDGI [GlobalIllumination=500] {grid.CountX}x{grid.CountY}x{grid.CountZ}={grid.ProbeCount} probes"); }
+
+        Relight(ctx, sceneAS, rtGeo);
+        Sample(ctx);
+        Combine(ctx);
     }
+
+    bool logged;
+
+    // ---- Pass 1: per-probe relight ----
+    unsafe void Relight(Dx12FrameContext ctx, Dx12SceneAS sceneAS, Dx12RtGeometry rtGeo)
+    {
+        Vector3 sunDir = ctx.LightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(ctx.LightDir);
+        bool useSky = ctx.Ibl != null;
+        float intensity = EnvF("BALLISTIC_DX12_DDGI_INTENSITY", ctx.PostFX.LumenIntensity);
+        float ema = EnvF("BALLISTIC_DX12_DDGI_ALPHA", 0.05f);
+        // Under a deterministic capture the per-frame jitter must be fixed (golden byte-identical) AND the EMA
+        // history must not change frame-to-frame → full replace (HistoryValid 0).
+        bool det = ctx.DeterministicCapture;
+
+        relightCb.Write(new RelightConstants
+        {
+            GridOrigin = grid.GridOrigin, RayCount = RelightRays,
+            ProbeSpacing = grid.ProbeSpacing, SkyIntensity = EnvF("BALLISTIC_DX12_DDGI_SKY", ctx.PostFX.LumenSkyIntensity),
+            CountX = (uint)grid.CountX, CountY = (uint)grid.CountY, CountZ = (uint)grid.CountZ,
+            UseSky = useSky ? 1f : 0f,
+            SunDir = sunDir, SunBias = 0.05f,
+            SunColor = ctx.LightColor, LightCount = ctx.ClusteredLights.LightCount,
+            EmaAlpha = ema, HistoryValid = (grid.HistoryValid && !det) ? 1f : 0f,
+            Intensity = intensity, FrameJitter = det ? -1f : (frameCounter % 64),
+        });
+
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        Dx12DescriptorHeap bindless = Dx12Backend.BindlessHeap;
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(RelightSkyTableBase + 0), ctx.Ibl.IrradianceSrv, heapType);
+
+        var irradW = grid.IrradianceWrite;
+        var irradR = grid.IrradianceRead;
+        dev.ExecuteSync(cl =>
+        {
+            if (grid.StateOf(irradW) != ResourceStates.UnorderedAccess)
+                cl.ResourceBarrierTransition(irradW, grid.StateOf(irradW), ResourceStates.UnorderedAccess);
+            if (grid.StateOf(irradR) != ResourceStates.NonPixelShaderResource)
+                cl.ResourceBarrierTransition(irradR, grid.StateOf(irradR), ResourceStates.NonPixelShaderResource);
+
+            cl.SetDescriptorHeaps(bindless.Heap);
+            cl.SetComputeRootSignature(relightRootSig);
+            cl.SetPipelineState(relightPso);
+            cl.SetComputeRootConstantBufferView(0, relightCb.Gpu);
+            cl.SetComputeRootShaderResourceView(1, sceneAS.TlasAddress);                  // t0 TLAS
+            cl.SetComputeRootUnorderedAccessView(2, grid.IrradianceWriteGpu);             // u0 Irradiance
+            cl.SetComputeRootShaderResourceView(3, grid.IrradianceReadGpu);               // t1 PrevIrrad
+            cl.SetComputeRootShaderResourceView(4, rtGeo.InstancesGpuAddress);            // t2 RtInstance[]
+            cl.SetComputeRootShaderResourceView(5, ctx.GpuDriven.MaterialsGpuAddress);    // t3 GpuMaterials
+            cl.SetComputeRootShaderResourceView(6, ctx.ClusteredLights.LightBufGpuAddress); // t4 Lights
+            cl.SetComputeRootDescriptorTable(7, bindless.Gpu(RelightSkyTableBase));       // t5 sky cube
+            cl.Dispatch((uint)grid.ProbeCount, 1, 1);                                     // one GROUP per probe
+            cl.ResourceBarrierTransition(irradW, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+        });
+        grid.SetState(irradW, ResourceStates.NonPixelShaderResource);
+        grid.SetState(irradR, ResourceStates.NonPixelShaderResource);
+        grid.SwapAndMarkHistory();
+    }
+
+    // ---- Pass 2: full-res sample ----
+    unsafe void Sample(Dx12FrameContext ctx)
+    {
+        var gbuffer = ctx.GBuffer;
+        Matrix4x4.Invert(ctx.ViewProj, out Matrix4x4 invVP);
+        // NOTE: the relight just swapped the ping-pong, so the buffer we want to READ (this frame's freshly
+        // written irradiance) is now IrradianceRead.
+        var irrad = grid.IrradianceRead;
+
+        sampleCb.Write(new SampleConstants
+        {
+            InvViewProj = Matrix4x4.Transpose(invVP),
+            GridOrigin = grid.GridOrigin, ProbeSpacing = grid.ProbeSpacing,
+            NormalBias = EnvF("BALLISTIC_DX12_DDGI_NORMALBIAS", 0.2f),
+            CountX = (uint)grid.CountX, CountY = (uint)grid.CountY, CountZ = (uint)grid.CountZ,
+            W = (uint)indirect.Width, H = (uint)indirect.Height,
+            Intensity = 1f,
+        });
+
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        // table: depth SRV (t0), normal SRV (t1), Indirect UAV (u0)
+        dev.Device.CopyDescriptorsSimple(1, sampleSrv.Cpu(0), gbuffer.DepthSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, sampleSrv.Cpu(1), gbuffer.ColorSrvCpu(1), heapType);
+        // Indirect UAV — create into slot 2.
+        dev.Device.CreateUnorderedAccessView(indirect.RenderTarget, null,
+            new UnorderedAccessViewDescription { ViewDimension = UnorderedAccessViewDimension.Texture2D, Format = Dx12OffscreenTarget.HdrFormat },
+            sampleSrv.Cpu(2));
+
+        // Depth → NonPixel for the compute read. The G-buffer colors arrive in the combined ShaderRead state
+        // (Pixel|NonPixel) from the deferred pass (event 300 < 500), so the normal SRV (G1) is already readable
+        // from compute — no extra color transition needed.
+        gbuffer.DepthToNonPixelShaderResource();
+        indirect.ColorToUnorderedAccess();
+
+        dev.ExecuteSync(cl =>
+        {
+            cl.SetDescriptorHeaps(sampleSrv.Heap);
+            cl.SetComputeRootSignature(sampleRootSig);
+            cl.SetPipelineState(samplePso);
+            cl.SetComputeRootConstantBufferView(0, sampleCb.Gpu);
+            cl.SetComputeRootShaderResourceView(1, irrad.GPUVirtualAddress);              // t2 Irradiance (root SRV)
+            cl.SetComputeRootDescriptorTable(2, sampleSrv.Gpu(0));                        // t0 depth, t1 normal, u0 Indirect
+            cl.Dispatch((uint)((indirect.Width + 7) / 8), (uint)((indirect.Height + 7) / 8), 1);
+        });
+    }
+
+    // ---- Pass 3: combine (additive) ----
+    unsafe void Combine(Dx12FrameContext ctx)
+    {
+        var target = ctx.SceneColor;
+        bool debug = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_DEBUG") == "1";
+
+        combineCb.Write(new CombineConstants
+        {
+            AoStrength = ctx.PostFX.LumenAoStrength,
+            Intensity = 1f,
+        });
+
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(0), indirect.ColorSrvCpu, heapType);     // t0 E
+        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(1), ctx.GBuffer.ColorSrvCpu(0), heapType); // t1 albedo
+        dev.Device.CopyDescriptorsSimple(1, combineSrv.Cpu(2), ctx.AoResult, heapType);             // t2 AO
+
+        // Indirect → PS-readable; the G-buffer albedo (G0) is already in the combined ShaderRead state.
+        indirect.ColorToShaderResource();
+
+        target.RenderColorOnly(cl =>
+        {
+            cl.SetDescriptorHeaps(combineSrv.Heap);
+            cl.SetGraphicsRootSignature(combineRootSig);
+            cl.SetPipelineState(debug ? combineDebugPso : combinePso);
+            cl.SetGraphicsRootConstantBufferView(0, combineCb.Gpu);
+            cl.SetGraphicsRootDescriptorTable(1, combineSrv.Gpu(0));
+            cl.IASetPrimitiveTopology(Vortice.Direct3D.PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
+    }
+
+    unsafe void BuildPipelines()
+    {
+        BuildRelightPipeline();
+        BuildSamplePipeline();
+        BuildCombinePipeline();
+    }
+
+    unsafe void BuildRelightPipeline()
+    {
+        var cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var tlas = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.All);   // t0
+        var irradUav = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(0, 0), ShaderVisibility.All); // u0
+        var prevIrrad = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(1, 0), ShaderVisibility.All); // t1
+        var rtInst = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(2, 0), ShaderVisibility.All);   // t2
+        var mats = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(3, 0), ShaderVisibility.All);     // t3
+        var lights = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(4, 0), ShaderVisibility.All);   // t4
+        var skyRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 5);                    // t5 table
+        var skyTable = new RootParameter1(new RootDescriptorTable1(skyRange), ShaderVisibility.All);
+        var clamp = StaticClamp(0);
+        relightRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(
+                RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
+                new[] { cbv0, tlas, irradUav, prevIrrad, rtInst, mats, lights, skyTable }, new[] { clamp })));
+
+        string hlsl = EmbeddedShaderSource.ReadHlsl("DdgiRelight.hlsl");
+        byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSMain", "DdgiRelight.hlsl");
+        relightPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription { RootSignature = relightRootSig, ComputeShader = cs });
+        relightCb = new Dx12FrameCb<RelightConstants>(dev);
+    }
+
+    unsafe void BuildSamplePipeline()
+    {
+        var cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var irrad = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(2, 0), ShaderVisibility.All);   // t2 Irradiance (root SRV)
+        // table: t0 depth, t1 normal (SRV) + u0 Indirect (UAV)
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 0);
+        var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);
+        var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange), ShaderVisibility.All);
+        var clamp = StaticClamp(0);
+        sampleRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv0, irrad, table }, new[] { clamp })));
+
+        string hlsl = EmbeddedShaderSource.ReadHlsl("DdgiSample.hlsl");
+        byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSMain", "DdgiSample.hlsl");
+        samplePso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription { RootSignature = sampleRootSig, ComputeShader = cs });
+        sampleCb = new Dx12FrameCb<SampleConstants>(dev);
+        sampleSrv = new Dx12DescriptorHeap(dev, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
+            3, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+    }
+
+    unsafe void BuildCombinePipeline()
+    {
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Pixel);
+        var range = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 3, baseShaderRegister: 0);
+        var table = new RootParameter1(new RootDescriptorTable1(range), ShaderVisibility.Pixel);
+        var clamp = StaticClamp(0, ShaderVisibility.Pixel);
+        combineRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, table }, new[] { clamp })));
+
+        string hlsl = EmbeddedShaderSource.ReadHlsl("DdgiCombine.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSCombine", "DdgiCombine.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSCombine", "DdgiCombine.hlsl");
+        byte[] psDebug = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSDebugE", "DdgiCombine.hlsl");
+        var additive = new BlendDescription(Blend.One, Blend.One);
+        GraphicsPipelineStateDescription Make(byte[] pixel, BlendDescription blend) => new()
+        {
+            RootSignature = combineRootSig, VertexShader = vs, PixelShader = pixel, InputLayout = null,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = RasterizerDescription.CullNone, BlendState = blend,
+            DepthStencilState = DepthStencilDescription.None,
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
+            DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
+        };
+        combinePso = dev.Device.CreateGraphicsPipelineState(Make(ps, additive));
+        combineDebugPso = dev.Device.CreateGraphicsPipelineState(Make(psDebug, BlendDescription.Opaque));
+        combineCb = new Dx12FrameCb<CombineConstants>(dev);
+        combineSrv = new Dx12DescriptorHeap(dev, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
+            3, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+    }
+
+    static StaticSamplerDescription StaticClamp(int reg, ShaderVisibility vis = ShaderVisibility.All) => new(vis, (uint)reg, 0u)
+    {
+        Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
+        AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1, ComparisonFunction = ComparisonFunction.Never,
+        MinLOD = 0, MaxLOD = float.MaxValue,
+    };
 
     public void Dispose()
     {
         grid.Dispose();
+        indirect?.Dispose();
+        relightCb?.Dispose(); sampleCb?.Dispose(); combineCb?.Dispose();
+        sampleSrv?.Dispose(); combineSrv?.Dispose();
+        relightRootSig?.Dispose(); sampleRootSig?.Dispose(); combineRootSig?.Dispose();
+        relightPso?.Dispose(); samplePso?.Dispose(); combinePso?.Dispose(); combineDebugPso?.Dispose();
     }
 }
