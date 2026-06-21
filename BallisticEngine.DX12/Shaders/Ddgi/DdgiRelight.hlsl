@@ -35,6 +35,9 @@ StructuredBuffer<RtInstance>  RtInstances : register(t2);
 StructuredBuffer<GpuMaterial> GpuMaterials: register(t3);
 StructuredBuffer<GpuLight>    Lights      : register(t4);
 TextureCube SkyRadiance : register(t5);   // env RADIANCE cube (per-ray sky sample; cosine-integrated by the probe)
+// NEE — world-space emissive-triangle light list (kajiya inc/lights/triangle.hlsl form). v0 + two edges + radiance.
+struct EmissiveTri { float4 V0; float4 E0; float4 E1; float4 Radiance; };
+StructuredBuffer<EmissiveTri> EmissiveLights : register(t8);
 
 cbuffer DdgiRelightConstants : register(b0) {
     float3 GridOrigin;   float RayCount;
@@ -44,6 +47,7 @@ cbuffer DdgiRelightConstants : register(b0) {
     float3 SunColor;     float LightCount;
     float  EmaAlpha;     float HistoryValid;  float Intensity;  float FrameJitter;  // FrameJitter<0 → fixed (deterministic)
     float  MultiBounce;  float BounceBoost;   float UsePlacement; float ValidateOn;   // D4: 2nd-bounce; UsePlacement: occupancy-aware; A5: ValidateOn = per-texel luma-ratio EMA boost (was Pad1)
+    float  EmissiveCount; float NeePad0, NeePad1, NeePad2;   // NEE: emissive-triangle light count (0 = skip)
 };
 SamplerState LinearClamp : register(s0);
 
@@ -209,6 +213,48 @@ float3 ShadeHit(uint instId, uint prim, float2 bary, float3 Pw) {
         punctual += rad * nd * Visibility(Pw, Nw, Ld, dist);
     }
 
+    // NEE — emissive-triangle area lights (kajiya lighting/sample_lights). An emissive MESH (neon sign, glowing
+    // panel) lights nearby surfaces in the GI bounce. Sampling it only when a ray happens to hit it is noisy/slow;
+    // NEE samples a point on each emissive triangle, casts a shadow ray, and adds its area-light contribution
+    // (projected-solid-angle metric / pdf = area). Budget-capped (EmissiveCount ≤ 256) so the loop stays realtime.
+    float3 emitterLight = 0.0.xxx;
+    int ne = (int)min(EmissiveCount, 256.0);
+    if (ne > 0) {
+        // Per-hit deterministic random pair (hit position + a salt) for the triangle sample — stable per frame so
+        // the EMA integrates it (deterministic capture keeps a fixed seed via the position, no RNG state).
+        uint seed = asuint(Pw.x) ^ (asuint(Pw.y) * 2654435761u) ^ (asuint(Pw.z) * 40503u);
+        [loop] for (int li = 0; li < ne; li++) {
+            EmissiveTri et = EmissiveLights[li];
+            // Uniform point on the triangle (sqrt barycentric warp), per kajiya sample_point_on_triangle.
+            float2 u = float2(Hash(seed + (uint)li * 7919u), Hash(seed + (uint)li * 104729u + 1u));
+            float su0 = sqrt(u.x);
+            float b0 = 1.0 - su0, b1 = u.y * su0;
+            float3 lp = et.V0.xyz + b0 * et.E0.xyz + b1 * et.E1.xyz;
+            float3 ln = cross(et.E0.xyz, et.E1.xyz);
+            float lnLen = length(ln);
+            if (lnLen < 1e-8) continue;
+            float3 lnN = ln / lnLen;
+            float area = 0.5 * lnLen;
+            float3 toL = lp - Pw;
+            float d2 = dot(toL, toL);
+            if (d2 < 1e-6) continue;
+            float d = sqrt(d2);
+            float3 Ld = toL / d;
+            float ndl = dot(Nw, Ld);            // receiver cosine
+            // Emitter cosine — TWO-SIDED (abs): an authored emissive mesh's triangle winding is arbitrary, so its
+            // geometric normal may point either way. A one-sided test culls every interior receiver when the quad
+            // happens to wind outward (e.g. a Cornell-box ceiling light) → NEE silently does nothing. abs() makes
+            // the panel emit from both faces, the correct default for an area luminaire of unknown orientation.
+            float lndl = abs(dot(-Ld, lnN));
+            if (ndl <= 0.0 || lndl <= 0.0) continue;
+            // Projected-solid-angle metric × area (pdf = 1/area), kajiya to_psa_metric.
+            float psa = (ndl * lndl / d2) * area;
+            // Shadow ray to the sampled point (slightly short of the surface to avoid self-hit).
+            float vis = Visibility(Pw, Nw, Ld, d - 2e-3);
+            emitterLight += et.Radiance.xyz * (psa * vis * NeePad0);   // NeePad0 = NEE intensity (default 1)
+        }
+    }
+
     // D4 MULTI-BOUNCE: add the previous frame's indirect light arriving at this hit (gathered from the probe
     // grid) × albedo. The cache feeds itself → it converges to full multi-bounce GI over a few frames with NO
     // extra rays. HistoryValid gates it (the first frame has no usable prev cache). BounceBoost (≥1) lets dark
@@ -230,7 +276,8 @@ float3 ShadeHit(uint instId, uint prim, float2 bary, float3 Pw) {
     // pinned at the firefly clamp (32) and the gather went flat → GI carried no contrast/colour, just a DC wash
     // that vanished under exposure (the "GI does nothing / black sphere underside"). emissive is the surface's own
     // emitted radiance (NOT reflected), so it does NOT take the /π.
-    return albedo * (sun + punctual) * (1.0 / 3.14159265359) + emissive + bounce;
+    // emitterLight (NEE area lights) is incident radiance like sun/punctual → same albedo/π Lambert re-emission.
+    return albedo * (sun + punctual + emitterLight) * (1.0 / 3.14159265359) + emissive + bounce;
 }
 
 [numthreads(RAYS, 1, 1)]

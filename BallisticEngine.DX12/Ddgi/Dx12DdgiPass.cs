@@ -36,6 +36,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     GpuSceneQuery placementQuery;
     bool placementPending;
     Dx12SceneAS lastSceneAS;   // the TLAS DDGI built last Record — the deferred placement traces it
+    Dx12EmissiveLights emissiveLights;   // NEE: world-space emissive-triangle light list for GI-hit shading
 
     // ---- relight (per-probe RT trace) ----
     ID3D12RootSignature relightRootSig;
@@ -84,6 +85,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         public Vector3 SunColor;     public float LightCount;
         public float EmaAlpha;       public float HistoryValid; public float Intensity; public float FrameJitter;
         public float MultiBounce;    public float BounceBoost;  public float UsePlacement; public float ValidateOn;
+        public float EmissiveCount;  public float NeePad0, NeePad1, NeePad2;   // NEE: emissive-triangle light count
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -268,6 +270,13 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         // The TLAS this frame built (sceneAS, stamp-cached) stays valid then, so the deferred placement traces it.
         if (placementEnabled && !grid.StatePlaced) { placementPending = true; lastSceneAS = sceneAS; }
 
+        // NEE: refresh the emissive-triangle light list (stamp-cached → a static scene builds once). Door OFF or
+        // no emitters → empty list → the relight NEE loop is skipped (zero cost).
+        bool neeOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_EMISSIVE_NEE") != "0";
+        // Use the SAME full renderer set the TLAS/rtGeo trace (not just whole-mesh) so split-by-material imports —
+        // e.g. a Cornell box whose emissive ceiling light is a SubMeshIndex>=0 child — contribute their emitters.
+        if (neeOn) { emissiveLights ??= new Dx12EmissiveLights(dev); emissiveLights.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection); }
+
         Relight(ctx, sceneAS, rtGeo);
         Sample(ctx);
         NearField(ctx);   // A4: reads SceneColor (lit, pre-DDGI-combine) → near-field one-bounce GI
@@ -389,6 +398,9 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             // (byte-identical to pre-A5). Deterministic capture uses HistoryValid=0 (full replace) so it's inert
             // there → goldens unchanged regardless of this flag.
             ValidateOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DDGI_VALIDATE") == "0" ? 0f : 1f,
+            // NEE: emissive-triangle light count (0 → relight skips the NEE loop). The list is bound at t8.
+            EmissiveCount = (emissiveLights is { Valid: true }) ? emissiveLights.Count : 0f,
+            NeePad0 = EnvF("BALLISTIC_DX12_DDGI_NEE_INTENSITY", 1f),   // NEE area-light gain (default 1)
         });
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
@@ -425,6 +437,11 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
             cl.SetComputeRootUnorderedAccessView(8, grid.VisibilityWriteGpu);             // u1 Visibility
             cl.SetComputeRootShaderResourceView(9, grid.VisibilityReadGpu);               // t6 PrevVis
             cl.SetComputeRootShaderResourceView(10, grid.ProbeStateGpu);                  // t7 ProbeState
+            // NEE: emissive-triangle light list (t8). Bind the real list when present, else a harmless stand-in
+            // (the Lights buffer) — EmissiveCount=0 means the relight never reads it. A root SRV must be bound.
+            ulong neeAddr = (emissiveLights is { Valid: true }) ? emissiveLights.GpuAddress
+                                                               : ctx.ClusteredLights.LightBufGpuAddress;
+            cl.SetComputeRootShaderResourceView(11, neeAddr);                             // t8 EmissiveLights
             cl.Dispatch((uint)grid.ProbeCount, 1, 1);                                     // one GROUP per probe
             cl.ResourceBarrierTransition(irradW, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
             cl.ResourceBarrierTransition(visW, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
@@ -680,11 +697,12 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
         var visUav = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(1, 0), ShaderVisibility.All);  // u1 Visibility
         var prevVis = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(6, 0), ShaderVisibility.All);  // t6 PrevVis
         var probeStateP = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All); // t7 ProbeState
+        var emissiveP = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(8, 0), ShaderVisibility.All);   // t8 EmissiveLights (NEE)
         var clamp = StaticClamp(0);
         relightRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { cbv0, tlas, irradUav, prevIrrad, rtInst, mats, lights, skyTable, visUav, prevVis, probeStateP }, new[] { clamp })));
+                new[] { cbv0, tlas, irradUav, prevIrrad, rtInst, mats, lights, skyTable, visUav, prevVis, probeStateP, emissiveP }, new[] { clamp })));
 
         string hlsl = EmbeddedShaderSource.ReadHlsl("DdgiRelight.hlsl");
         byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSMain", "DdgiRelight.hlsl");
@@ -836,6 +854,7 @@ public sealed class Dx12DdgiPass : IRenderPass, IDisposable
     {
         grid.Dispose();
         placementQuery?.Dispose();
+        emissiveLights?.Dispose();
         indirect?.Dispose(); indirectFiltered?.Dispose(); nearField?.Dispose();
         relightCb?.Dispose(); sampleCb?.Dispose(); nearFieldCb?.Dispose(); denoiseCb?.Dispose(); combineCb?.Dispose(); debugCb?.Dispose();
         sampleSrv?.Dispose(); nearFieldSrv?.Dispose(); denoiseSrv?.Dispose(); combineSrv?.Dispose();
