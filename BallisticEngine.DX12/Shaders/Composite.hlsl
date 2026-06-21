@@ -153,13 +153,29 @@ float4 PSMain(VSOut i) : SV_Target {
         color = ToneMapAt(uv, exposure);
     }
 
-    // Sharpening: unsharp mask on TONEMAPPED neighbours (4-tap cross). Never on raw HDR (NaN around the sun).
+    // Sharpening (C7, kajiya post_combine): PERCEPTUAL, luma-only, edge-aware — replaces the old component-wise
+    // unsharp mask which shifts HUE (each channel sharpened independently) and rings on edges. Sharpen the LUMA in
+    // sqrt-perceptual space, apply the result back as a luma RATIO so colour is preserved exactly, and gate by an
+    // edge-aware weight that DISABLES sharpening across strong edges (anti-haloing). Still on TONEMAPPED neighbours
+    // (never raw HDR — NaN around the sun). Component-wise → perceptual is a correctness fix, not just cosmetic.
     if (Sharpen > 1e-4) {
         float2 px = 1.0 / max(ScreenSize, 1.0);
-        float3 blur = ToneMapAt(uv + float2(px.x, 0), exposure) + ToneMapAt(uv - float2(px.x, 0), exposure)
-                    + ToneMapAt(uv + float2(0, px.y), exposure) + ToneMapAt(uv - float2(0, px.y), exposure);
-        blur *= 0.25;
-        color = color + (color - blur) * Sharpen;
+        float3 cN0 = ToneMapAt(uv + float2(px.x, 0), exposure);
+        float3 cN1 = ToneMapAt(uv - float2(px.x, 0), exposure);
+        float3 cN2 = ToneMapAt(uv + float2(0, px.y), exposure);
+        float3 cN3 = ToneMapAt(uv - float2(0, px.y), exposure);
+        const float3 lw = float3(0.2126, 0.7152, 0.0722);
+        float lC = sqrt(max(dot(color, lw), 0.0));               // perceptual (sqrt) luma of the centre + 4 taps
+        float l0 = sqrt(max(dot(cN0, lw), 0.0)), l1 = sqrt(max(dot(cN1, lw), 0.0));
+        float l2 = sqrt(max(dot(cN2, lw), 0.0)), l3 = sqrt(max(dot(cN3, lw), 0.0));
+        float lBlur = 0.25 * (l0 + l1 + l2 + l3);
+        // Edge-aware weight: large neighbour luma spread = a strong edge → suppress sharpening (no halo ring).
+        float edge = abs(lC - l0) + abs(lC - l1) + abs(lC - l2) + abs(lC - l3);
+        float w = max(0.0, 1.0 - 6.0 * edge);
+        float lSharp = lC + (lC - lBlur) * Sharpen * w;          // sharpen in perceptual-luma space
+        float lLin = lSharp * lSharp;                            // back to linear luma
+        float lCur = max(dot(color, lw), 1e-5);
+        color *= lLin / lCur;                                    // apply as a luma RATIO → hue/chroma preserved
     }
 
     // Contrast around mid-grey (pivot 0.5, not a black-crushing power) + saturation around luma.

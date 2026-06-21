@@ -747,7 +747,9 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
             Tonemap = acesTonemap ? 1f : 0f,
             // Stylistic grade (all neutral by default → byte-identical when untouched); ported from the GL composite.
             Contrast = contrast, Saturation = saturation,
-            Sharpen = pf.Sharpen,
+            // C7: BALLISTIC_DX12_SHARPEN overrides the volume sharpen (A/B the perceptual sharpen; >=0 forces it).
+            Sharpen = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_SHARPEN"),
+                System.Globalization.CultureInfo.InvariantCulture, out float shp) ? shp : pf.Sharpen,
             VignetteStrength = vignette, VignetteRoundness = pf.VignetteRoundness,
             // pf.VignetteColor is System.Numerics.Vector3 (engine math = Numerics; the inline ToNumerics(Vector3)
             // was an identity copy) → assign direct.
