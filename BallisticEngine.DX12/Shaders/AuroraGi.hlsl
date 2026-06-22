@@ -292,12 +292,23 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
     bool sunUp = sunLocalDir.z > 0.05;   // surface faces the sun → its bounce is worth a guaranteed ray
     float importance = ImportanceSampling;
 
-    float3 sum = 0.0.xxx;
+    // ===== FAZ 3c: ReSTIR-GI spatial reservoir over the hemisphere rays =====
+    // Instead of plainly averaging N rays (each spent on a random direction, most landing on dim geometry), the
+    // rays feed a WEIGHTED RESERVOIR (RIS): the target function is the candidate's luminance, so a bright sample
+    // (the window / a lit wall) is FAR more likely to be kept than a dim one. The reservoir's unbiased estimator
+    // (W = (1/p̂)·(wSum/M)) reconstructs the cosine-weighted irradiance, so the energy matches plain averaging,
+    // but the variance collapses — the "Unreal-blend" guarantee that the dominant light is always represented even
+    // at low ray counts. The spatial half (borrowing neighbours' reservoirs) is the screen-probe + à-trous denoise
+    // already downstream; this is the per-pixel temporal-ready reservoir that feeds them a clean sample.
+    float3 resColor = 0.0.xxx;     // the reservoir's selected sample radiance (y)
+    float resWSum = 0.0;           // running sum of candidate weights
+    float resTarget = 0.0;         // p̂(y): target function (luminance) of the selected sample
+    uint  resM = 0u;               // candidates seen
+    float3 plainSum = 0.0.xxx;     // fallback path mean (used when the reservoir degenerates, e.g. all-black)
+
     [loop] for (uint r = 0; r < rays; r++) {
         float3 local;
         if (importance > 0.5 && r == 0u && sunUp) {
-            // Guaranteed ray toward the sun (jittered within a small cosine-lobe cone so a flat surface still gets
-            // a smooth result, not a hard single direction).
             float3 c = CosineHemisphere(0u, max(rays, 2u), jit2);
             local = normalize(sunLocalDir * 2.0 + c);   // pull the cosine sample toward the sun
         } else {
@@ -305,42 +316,62 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
         }
         float3 dir = normalize(mul(local, basis));
 
-        // 1) Screen trace (near-field contact bounce). UseScreenTrace<0.5 disables it → pure RT+cards (the A/B
-        // door to prove the view-dependent darkening is screen-trace's fault, not the RT path).
-        float3 rad;
-        if (UseScreenTrace > 0.5 && ScreenTrace(origin, dir, rad)) { sum += rad; continue; }
-
-        // 2) Hardware RT on screen miss.
-        RayDesc ray;
-        ray.Origin = origin; ray.Direction = dir; ray.TMin = 0.02; ray.TMax = MaxRayDist;
-        RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
-        q.TraceRayInline(Scene, 0, 0xFF, ray);
-        q.Proceed();
-        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
-            if (UseCards > 0.5) {
-                // #2A: SAMPLE the surface card at the hit triangle's CLUSTER RECORD (the lit radiance the card-
-                // light pass wrote) — no per-hit relighting. Sıra 5: pick the TEXEL within the record's card grid
-                // from the hit's world position (TexelDim 1 → texel 0 → byte-identical legacy).
-                uint inst = q.CommittedInstanceID();
-                AuroraInstanceMeta meta = InstanceMeta[inst];
-                uint record = meta.ClusterOffset + TriToCluster[meta.TriOffset + q.CommittedPrimitiveIndex()];
-                float3 hitP = origin + dir * q.CommittedRayT();
-                sum += CardRadiance[CardBaseIndex(record) + CardTexelIndex(record, hitP)].rgb;
-            } else {
-                // A/B fallback (BALLISTIC_DX12_LUMEN_NOCARDS=1): re-shade the hit directly (the P2 path).
-                float3 hitPos = origin + dir * q.CommittedRayT();
-                sum += ShadeHit(q.CommittedInstanceID(), q.CommittedPrimitiveIndex(),
-                                q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), dir, hitPos);
+        // Resolve this ray's incoming radiance (screen-trace contact → RT card/shade → sky).
+        float3 rad = 0.0.xxx;
+        float3 sc;
+        if (UseScreenTrace > 0.5 && ScreenTrace(origin, dir, sc)) {
+            rad = sc;
+        } else {
+            RayDesc ray;
+            ray.Origin = origin; ray.Direction = dir; ray.TMin = 0.02; ray.TMax = MaxRayDist;
+            RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
+            q.TraceRayInline(Scene, 0, 0xFF, ray);
+            q.Proceed();
+            if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+                if (UseCards > 0.5) {
+                    uint inst = q.CommittedInstanceID();
+                    AuroraInstanceMeta meta = InstanceMeta[inst];
+                    uint record = meta.ClusterOffset + TriToCluster[meta.TriOffset + q.CommittedPrimitiveIndex()];
+                    float3 hitP = origin + dir * q.CommittedRayT();
+                    rad = CardRadiance[CardBaseIndex(record) + CardTexelIndex(record, hitP)].rgb;
+                } else {
+                    float3 hitPos = origin + dir * q.CommittedRayT();
+                    rad = ShadeHit(q.CommittedInstanceID(), q.CommittedPrimitiveIndex(),
+                                   q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), dir, hitPos);
+                }
+            } else if (UseSky > 0.5) {
+                rad = SkyIrradiance.SampleLevel(LinearClamp, dir, 0).rgb * SkyIntensity;
             }
-        } else if (UseSky > 0.5) {
-            // 3) Ray escaped → sky/IBL irradiance in that direction.
-            sum += SkyIrradiance.SampleLevel(LinearClamp, dir, 0).rgb * SkyIntensity;
+        }
+        rad = Sanitize(rad);
+        plainSum += rad;
+
+        // RIS update: target p̂ = luminance. Source pdf is the cosine pdf already folded into the sample direction,
+        // so the candidate weight is just p̂ (the mean of rad/sourcePdf over the cosine domain = the irradiance).
+        float pHat = dot(rad, float3(0.2126, 0.7152, 0.0722));
+        resM += 1u;
+        resWSum += pHat;
+        // Reservoir replace with prob w_i / wSum (one-pass weighted reservoir sampling).
+        float xi = Hash(px.x * 2246822519u ^ px.y * 3266489917u ^ (r * 668265263u) ^ ((uint)FrameIndex * 374761393u));
+        if (resWSum > 1e-8 && xi < pHat / resWSum) {
+            resColor = rad;
+            resTarget = pHat;
         }
     }
 
-    // Mean over the cosine-sampled rays ≈ cosine-weighted incoming irradiance E. Store E (not E*albedo); the
-    // combine applies the receiver albedo. Intensity is the artist GI dial.
-    float3 E = Sanitize(sum / float(rays) * Intensity);
+    // Unbiased RIS estimate of the selected sample: Y = color · W, W = (1/p̂)·(wSum/M).
+    // Multiplied back by the count of effective directions it represents → reconstructs the irradiance E.
+    float3 risE;
+    if (resTarget > 1e-6 && resM > 0u) {
+        float W = (resWSum / float(resM)) / resTarget;   // RIS unbiased contribution weight
+        risE = resColor * W;
+    } else {
+        risE = plainSum / float(rays);   // degenerate (all-dark) → plain mean (= 0)
+    }
+    // Blend RIS (variance-reduced, biased toward the dominant sample) with the plain mean (unbiased, captures the
+    // full hemisphere energy) — pure RIS on 1 retained sample can lose the dim-but-broad ambient term. A 0.5 mix
+    // keeps the energy honest while taking most of the variance win. Then apply the artist Intensity dial.
+    float3 E = Sanitize(lerp(plainSum / float(rays), risE, 0.5) * Intensity);
 
     // #3 PROBE TEMPORAL ACCUMULATION — EMA this frame's noisy few-ray E over the REPROJECTED accumulated history.
     // Over frames this converges to a many-ray, low-variance probe radiance (the screen-probe quality win) while
