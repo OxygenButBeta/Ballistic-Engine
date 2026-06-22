@@ -34,6 +34,14 @@ Texture2D<float4> SceneColor: register(t4);   // the lit HDR color this frame (o
 TextureCube SkyIrradiance   : register(t5);   // sky/IBL diffuse irradiance (RT-miss diffuse term)
 TextureCube SkyPrefilter    : register(t6);   // sky/IBL radiance (unused in P2; reserved)
 RWTexture2D<float4> Indirect : register(u0);  // OUT: rgb = incoming diffuse irradiance E, a = 1
+#ifdef AURORA_NRD_MODE
+RWTexture2D<float4> NrdRadianceHitDist : register(u1);   // OUT: REBLUR-packed (YCoCg radiance, normHitDist) for NRD
+cbuffer AuroraNrdConstants : register(b2) {
+    float4x4 NrdViewMatrix;     // world → view (for linear viewZ at the trace point)
+    float3   NrdHitDistParams;  // REBLUR ReblurHitDistanceParameters {A,B,C} = {3, 0.1, 20}
+    float    _NrdPad0;
+};
+#endif
 
 cbuffer AuroraConstants : register(b0) {
     float4x4 InvViewProj;     // screen+depth → world (JITTERED, transposed)
@@ -215,6 +223,38 @@ float3 ShadeHit(uint instId, uint prim, float2 bary2, float3x4 o2w, float3 rayDi
 // false so the RT ray (view-INDEPENDENT) owns the mid/far light. This is the fix for the SSGI view-dependent
 // darkening: previously ANY on-screen hit (even a dark wall) vetoed RT, so turning the camera so the lit
 // corridor left the screen made walls go dark; now only short-range contacts win, RT handles the rest.
+// hit-distance-returning variant for NRD (rayHitDist = distance origin→contact). Same logic as ScreenTrace.
+bool ScreenTrace2(float3 origin, float3 dir, out float3 radiance, out float hitDist) {
+    radiance = 0.0.xxx; hitDist = MaxRayDist;
+    float range = min(ScreenRange, MaxRayDist);
+    int steps = max((int)ScreenSteps, 1);
+    float stepLen = range / (float)steps;
+    float3 p = origin + dir * stepLen;
+    [loop] for (int i = 0; i < steps; i++, p += dir * stepLen) {
+        float4 clip = mul(float4(p, 1.0), ViewProj);
+        if (clip.w <= 0.0) return false;
+        float3 ndc = clip.xyz / clip.w;
+        float2 uv = ndc.xy * float2(0.5, -0.5) + 0.5;
+        if (any(uv < 0.0) || any(uv > 1.0)) return false;
+        float sceneDepth = Depth.SampleLevel(LinearClamp, uv, 0).r;
+        if (sceneDepth >= 1.0) continue;
+        float3 rayWorld = WorldFromUvDepth(uv, ndc.z);
+        float3 sceneWorld = WorldFromUvDepth(uv, sceneDepth);
+        float rayZ = length(rayWorld - CameraPos);
+        float sceneZ = length(sceneWorld - CameraPos);
+        float diff = rayZ - sceneZ;
+        if (diff > 0.01 * rayZ && diff < stepLen * 2.0) {
+            float dHit = length(sceneWorld - origin);
+            if (dHit > range) return false;
+            radiance = SceneColor.SampleLevel(LinearClamp, uv, 0).rgb;
+            hitDist = dHit;
+            return true;
+        }
+        if (diff >= stepLen * 2.0) return false;
+    }
+    return false;
+}
+
 bool ScreenTrace(float3 origin, float3 dir, out float3 radiance) {
     radiance = 0.0.xxx;
     // Confident screen contact distance — short (contact bounce only). The dominant mid/far GI comes from RT.
@@ -305,6 +345,7 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
     float resTarget = 0.0;         // p̂(y): target function (luminance) of the selected sample
     uint  resM = 0u;               // candidates seen
     float3 plainSum = 0.0.xxx;     // fallback path mean (used when the reservoir degenerates, e.g. all-black)
+    float hitDistSum = 0.0;        // NRD: accumulate per-ray primary hit distance (sky miss = MaxRayDist)
 
     [loop] for (uint r = 0; r < rays; r++) {
         float3 local;
@@ -318,9 +359,10 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
 
         // Resolve this ray's incoming radiance (screen-trace contact → RT card/shade → sky).
         float3 rad = 0.0.xxx;
-        float3 sc;
-        if (UseScreenTrace > 0.5 && ScreenTrace(origin, dir, sc)) {
-            rad = sc;
+        float rayHitDist = MaxRayDist;   // default: miss → far (NRD treats far as "well-lit / converges fast")
+        float3 sc; float scT;
+        if (UseScreenTrace > 0.5 && ScreenTrace2(origin, dir, sc, scT)) {
+            rad = sc; rayHitDist = scT;
         } else {
             RayDesc ray;
             ray.Origin = origin; ray.Direction = dir; ray.TMin = 0.02; ray.TMax = MaxRayDist;
@@ -328,6 +370,7 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
             q.TraceRayInline(Scene, 0, 0xFF, ray);
             q.Proceed();
             if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+                rayHitDist = q.CommittedRayT();
                 if (UseCards > 0.5) {
                     uint inst = q.CommittedInstanceID();
                     AuroraInstanceMeta meta = InstanceMeta[inst];
@@ -344,6 +387,7 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
             }
         }
         rad = Sanitize(rad);
+        hitDistSum += rayHitDist;
         plainSum += rad;
 
         // RIS update: target p̂ = luminance. Source pdf is the cosine pdf already folded into the sample direction,
@@ -372,6 +416,20 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
     // full hemisphere energy) — pure RIS on 1 retained sample can lose the dim-but-broad ambient term. A 0.5 mix
     // keeps the energy honest while taking most of the variance win. Then apply the artist Intensity dial.
     float3 E = Sanitize(lerp(plainSum / float(rays), risE, 0.5) * Intensity);
+
+    // FAZ 4.4b — when NRD owns the temporal/denoise (NrdMode), write this frame's RAW (un-accumulated, un-denoised)
+    // E + mean primary hit distance into the NRD diffuse-radiance buffer, packed exactly as REBLUR expects, then
+    // RETURN: NRD does the spatiotemporal accumulation downstream, so Aurora's own probe-EMA + à-trous are skipped.
+#ifdef AURORA_NRD_MODE
+    {
+        float meanHitDist = hitDistSum / float(rays);
+        float viewZ = abs(mul(float4(worldPos, 1.0), NrdViewMatrix).z);
+        float normHitDist = REBLUR_FrontEnd_GetNormHitDist(meanHitDist, viewZ, NrdHitDistParams, 1.0);
+        NrdRadianceHitDist[px] = REBLUR_FrontEnd_PackRadianceAndNormHitDist(E, normHitDist, true);
+        Indirect[px] = float4(E, depth);   // keep raw E too (debug / non-NRD readers)
+        return;
+    }
+#endif
 
     // #3 PROBE TEMPORAL ACCUMULATION — EMA this frame's noisy few-ray E over the REPROJECTED accumulated history.
     // Over frames this converges to a many-ray, low-variance probe radiance (the screen-probe quality win) while
