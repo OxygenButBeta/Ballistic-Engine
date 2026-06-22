@@ -31,6 +31,8 @@ public sealed class ModelImporter : IAssetImporter {
         ["lodMinTris"] = 64,
         ["generateSdf"] = true,
         ["sdfResolution"] = 64,
+        ["generateCards"] = true,
+        ["maxCards"] = 12,
     };
 
     public void Import(AssetImportContext context) {
@@ -42,6 +44,7 @@ public sealed class ModelImporter : IAssetImporter {
         if (meshIndex >= 0) {
             MeshData single = AssimpMeshDecoder.Decode(context.SourceAbsolutePath, flipUVs, meshIndex);
             single = GenerateSdf(context, single);
+            single = GenerateCards(context, single);
             MeshArtifact.Write(context.ArtifactAbsolutePath, in single);
             return;
         }
@@ -68,6 +71,7 @@ public sealed class ModelImporter : IAssetImporter {
         MeshData data = generateMaterials ? GenerateMaterials(context, model) : model.Mesh;
         data = BuildLods(context, data);
         data = GenerateSdf(context, data);
+        data = GenerateCards(context, data);
         MeshArtifact.Write(context.ArtifactAbsolutePath, in data);
     }
 
@@ -108,6 +112,45 @@ public sealed class ModelImporter : IAssetImporter {
         }
         catch (Exception exception) {
             Debugging.LogWarning($"[SDF] '{context.AssetPath}': generation failed: {exception.Message}");
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// Generates the offline mesh-card representation (Lumen FAZ 3a) from the per-mesh SDF and attaches
+    /// it. Gated by the importer "generateCards" setting (default true) AND the BALLISTIC_CARDS env var
+    /// (set to "0" to disable globally). REQUIRES a valid SDF (cards are built from its surfels) — skips
+    /// when absent. Skinned meshes are skipped (no SDF/cards, like GenerateSdf).
+    /// </summary>
+    static MeshData GenerateCards(AssetImportContext context, in MeshData data) {
+        if (Environment.GetEnvironmentVariable("BALLISTIC_CARDS") == "0")
+            return data;
+        bool enabled = context.Settings?["generateCards"]?.GetValue<bool>() ?? true;
+        if (!enabled)
+            return data;
+        if (data.IsSkinned)
+            return data;
+        if (data.Sdf is not { IsValid: true }) {
+            Debugging.Log($"[Cards] '{context.AssetPath}': no SDF — cards skipped (cards require an SDF).");
+            return data;
+        }
+
+        int maxCards = context.Settings?["maxCards"]?.GetValue<int>() ?? 12;
+        maxCards = Math.Clamp(maxCards, 1, Sdf.MeshCardBuilder.MaxCardsPerMesh);
+
+        try {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            MeshCards cards = Sdf.MeshCardBuilder.Generate(in data, maxCards);
+            sw.Stop();
+            if (cards is null || !cards.IsValid) {
+                Debugging.Log($"[Cards] '{context.AssetPath}': no valid cards generated.");
+                return data;
+            }
+            Debugging.Log($"[Cards] '{context.AssetPath}': {cards.Count} cards, {sw.ElapsedMilliseconds} ms");
+            return data.WithCards(cards);
+        }
+        catch (Exception exception) {
+            Debugging.LogWarning($"[Cards] '{context.AssetPath}': generation failed: {exception.Message}");
             return data;
         }
     }

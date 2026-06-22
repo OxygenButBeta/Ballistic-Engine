@@ -24,6 +24,11 @@ public class Mesh : BObject
     // GPU 3D texture per unique mesh and composites it into a camera-centered clipmap. Null for meshes imported
     // before v8 or with SDF disabled — the global SDF skips those instances gracefully.
     public readonly MeshSdf Sdf;
+
+    // Per-mesh card representation (offline, FAZ 3a; persisted in artifact v9). A small set of oriented
+    // bounding-box cards a later surface cache will capture/light. MESH-LOCAL space. Built from Sdf, so
+    // null whenever Sdf is null (skinned, disabled, or v8-and-earlier artifacts).
+    public readonly MeshCards Cards;
     public bool IsSkinned { get; }
     public int BoneCount => Skeleton.BoneCount;
 
@@ -81,6 +86,7 @@ public class Mesh : BObject
         BoneIndices = data.BoneIndices;
         BoneWeights = data.BoneWeights;
         Sdf = data.Sdf;
+        Cards = data.Cards;
         if (IsSkinned) {
             boneIndexBuffer = GraphicAPI.CreateBoneIndexBuffer(renderContext);
             boneWeightBuffer = GraphicAPI.CreateBoneWeightBuffer(renderContext);

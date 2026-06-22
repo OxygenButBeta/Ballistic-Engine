@@ -4,7 +4,7 @@ namespace BallisticEngine.AssetPipeline;
 
 public static class MeshArtifact {
     const uint Magic = 0x48534D42;
-    const uint FormatVersion = 8;
+    const uint FormatVersion = 9;
 
     public static void Write(string path, in MeshData data) {
         using FileStream stream = File.Create(path);
@@ -13,9 +13,11 @@ public static class MeshArtifact {
         bool hasLods = false;
         foreach (SubMeshData sm in data.SubMeshes) if (sm.Lods is { Length: > 1 }) { hasLods = true; break; }
         bool hasSdf = data.Sdf is { IsValid: true };
-        // v8 = v7 payload + trailing SDF block. We only stamp v8 when an SDF is actually present,
-        // so SDF-less meshes stay at the v6/v7 byte layout (existing readers + diffs unchanged).
-        uint writeVersion = hasSdf ? 8u : hasLods ? 7u : 6u;
+        bool hasCards = data.Cards is { IsValid: true };
+        // v8 = v7 payload + trailing SDF block; v9 = v8 + trailing CARD block. We only stamp the higher
+        // version when that block is actually present, so SDF/card-less meshes keep the v6/v7/v8 byte
+        // layout (existing readers + diffs unchanged). Cards imply an SDF, so v9 always writes the v8 block.
+        uint writeVersion = hasCards ? 9u : hasSdf ? 8u : hasLods ? 7u : 6u;
 
         writer.Write(Magic);
         writer.Write(writeVersion);
@@ -83,6 +85,25 @@ public static class MeshArtifact {
                 writer.Write(sdf.ResY);
                 writer.Write(sdf.ResZ);
                 writer.Write(MemoryMarshal.AsBytes<float>(sdf.Distances));
+            }
+            else {
+                writer.Write((byte)0);
+            }
+        }
+
+        if (writeVersion >= 9) {
+            MeshCards cards = data.Cards;
+            if (cards is { IsValid: true }) {
+                writer.Write((byte)1);
+                writer.Write(cards.Count);
+                foreach (MeshCard card in cards.Cards) {
+                    WriteVector3(writer, card.Origin);
+                    WriteVector3(writer, card.AxisX);
+                    WriteVector3(writer, card.AxisY);
+                    WriteVector3(writer, card.AxisZ);
+                    WriteVector3(writer, card.Extent);
+                    writer.Write(card.DirectionIndex);
+                }
             }
             else {
                 writer.Write((byte)0);
@@ -212,12 +233,30 @@ public static class MeshArtifact {
             sdf = new MeshSdf(gridOrigin, gridExtent, resX, resY, resZ, distances);
         }
 
+        MeshCards cards = null;
+        if (version >= 9 && reader.ReadByte() == 1) {
+            int cardCount = reader.ReadInt32();
+            var arr = new MeshCard[cardCount];
+            for (var i = 0; i < cardCount; i++) {
+                Vector3 origin = ReadVector3(reader);
+                Vector3 axisX = ReadVector3(reader);
+                Vector3 axisY = ReadVector3(reader);
+                Vector3 axisZ = ReadVector3(reader);
+                Vector3 extent = ReadVector3(reader);
+                int directionIndex = reader.ReadInt32();
+                arr[i] = new MeshCard(origin, axisX, axisY, axisZ, extent, directionIndex);
+            }
+            cards = new MeshCards(arr);
+        }
+
         if (skinned)
             return new MeshData(vertices, indices, uvs, normals, tangents, subMeshes, nodes,
-                boneIndices, boneWeights, skeleton, sdf);
+                boneIndices, boneWeights, skeleton, sdf, cards);
 
         MeshData result = new(vertices, indices, uvs, normals, tangents, subMeshes, nodes);
-        return sdf is null ? result : result.WithSdf(sdf);
+        if (sdf is not null) result = result.WithSdf(sdf);
+        if (cards is not null) result = result.WithCards(cards);
+        return result;
     }
 
     static T[] ReadArray<T>(BinaryReader reader, int count) where T : unmanaged {

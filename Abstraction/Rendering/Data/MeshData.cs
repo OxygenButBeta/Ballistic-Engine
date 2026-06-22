@@ -23,6 +23,13 @@ public readonly struct MeshData {
     /// </summary>
     public readonly MeshSdf Sdf;
 
+    /// <summary>
+    /// Optional offline mesh-card representation (Lumen FAZ 3a; built from <see cref="Sdf"/>). Null for
+    /// skinned meshes, when card generation is disabled, when the SDF is absent, and for v8-and-earlier
+    /// artifacts. Every constructor defaults this to null, so existing code paths are unaffected.
+    /// </summary>
+    public readonly MeshCards Cards;
+
     public MeshData(Vector3[] vertices, uint[] indices, Vector2[] uvs, Vector3[] normals, Vector4[] tangents)
         : this(vertices, indices, uvs, normals, tangents,
             [new SubMeshData(null, 0, indices?.Length ?? 0, null)]) {
@@ -43,22 +50,30 @@ public readonly struct MeshData {
         BoneWeights = null;
         Skeleton = default;
         Sdf = null;
+        Cards = null;
     }
 
     public MeshData(Vector3[] vertices, uint[] indices, Vector2[] uvs, Vector3[] normals, Vector4[] tangents,
         SubMeshData[] subMeshes, MeshNodeData[] nodes,
-        Vector4i[] boneIndices, Vector4[] boneWeights, SkeletonData skeleton, MeshSdf sdf = null)
+        Vector4i[] boneIndices, Vector4[] boneWeights, SkeletonData skeleton, MeshSdf sdf = null,
+        MeshCards cards = null)
         : this(vertices, indices, uvs, normals, tangents, subMeshes, nodes) {
         BoneIndices = boneIndices;
         BoneWeights = boneWeights;
         Skeleton = skeleton;
         Sdf = sdf;
+        Cards = cards;
     }
 
-    /// <summary>Returns a copy carrying the given SDF (all other arrays shared by reference).</summary>
+    /// <summary>Returns a copy carrying the given SDF (all other arrays/cards shared by reference).</summary>
     public MeshData WithSdf(MeshSdf sdf) =>
         new(Vertices, Indices, UVs, Normals, Tangents, SubMeshes, Nodes,
-            BoneIndices, BoneWeights, Skeleton, sdf);
+            BoneIndices, BoneWeights, Skeleton, sdf, Cards);
+
+    /// <summary>Returns a copy carrying the given mesh cards (all other arrays/SDF shared by reference).</summary>
+    public MeshData WithCards(MeshCards cards) =>
+        new(Vertices, Indices, UVs, Normals, Tangents, SubMeshes, Nodes,
+            BoneIndices, BoneWeights, Skeleton, Sdf, cards);
 
     public bool IsValid => Vertices is { Length: > 0 } && Indices is { Length: > 0 };
 
