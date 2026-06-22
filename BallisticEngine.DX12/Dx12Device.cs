@@ -210,6 +210,7 @@ public sealed class Dx12Device : IDisposable {
                     Console.WriteLine($"[NRD selftest] DenoiseSelfTest → {(d ? "PASS (all dispatches executed on GPU)" : "FAIL")}");
                 }
                 nrd.Dispose();
+                Dx12NrdDenoiser.PackCompileSelfTest();
             } catch (Exception e) { Console.WriteLine($"[NRD selftest] threw: {e.GetType().Name}: {e.Message}\n{e.StackTrace}"); }
         }
     }

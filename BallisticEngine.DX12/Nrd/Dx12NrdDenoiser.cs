@@ -332,6 +332,30 @@ internal sealed unsafe class Dx12NrdDenoiser : IDisposable {
 
     public void ResetFrameRings() { srvUavHeapCursor = 0; }
 
+    // Compile a shader that #includes NRD's packing functions by PREPENDING NRDConfig + NRD.hlsli (a pure function
+    // library — no resource binds leak). Proves NRD.hlsli is DXC-SM6.6-compatible and our pack source builds.
+    public static byte[] CompileWithNrd(Vortice.Dxc.DxcShaderStage stage, string shaderFile, string entry) {
+        string cfg = EmbeddedShaderSource.ReadHlsl("Nrd/NRDConfig.hlsli");
+        string lib = EmbeddedShaderSource.ReadHlsl("Nrd/NRD.hlsli");
+        string body = EmbeddedShaderSource.ReadHlsl(shaderFile);
+        // NRD.hlsli #includes "NRDConfig.hlsli" itself — but we prepend cfg manually (no DXC include handler), so
+        // strip that line to avoid a "file not found". Same for any other relative #include in the library.
+        lib = System.Text.RegularExpressions.Regex.Replace(lib, "(?m)^\\s*#include\\s+\"NRDConfig\\.hlsli\".*$", "");
+        string combined = cfg + "\n" + lib + "\n" + body;
+        return Dx12ShaderCompiler.Compile(stage, combined, entry, shaderFile);
+    }
+
+    public static bool PackCompileSelfTest() {
+        try {
+            byte[] dxil = CompileWithNrd(Vortice.Dxc.DxcShaderStage.Compute, "Nrd/AuroraNrdPack.hlsl", "CSMain");
+            Console.WriteLine($"[NRD selftest] AuroraNrdPack compiled with NRD.hlsli prepended: {dxil.Length} bytes DXIL — PASS");
+            return true;
+        } catch (Exception e) {
+            Console.WriteLine($"[NRD selftest] AuroraNrdPack compile FAIL: {e.Message}");
+            return false;
+        }
+    }
+
     // Synthetic smoke test: allocate dummy inputs/output, run ONE full Denoise on the GPU, prove all dispatches
     // execute with no D3D12 validation error. Does NOT check output correctness — just that the graph runs.
     public bool DenoiseSelfTest(int w, int h) {

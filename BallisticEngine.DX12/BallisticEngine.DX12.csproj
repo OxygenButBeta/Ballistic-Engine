@@ -22,6 +22,7 @@
     <!-- HLSL shaders for the DX12 backend (embedded, mirroring OpenGL\Shader\Embedded\*.glsl). -->
     <ItemGroup>
       <EmbeddedResource Include="Shaders\**\*.hlsl" />
+      <EmbeddedResource Include="Shaders\**\*.hlsli" />
     </ItemGroup>
 
     <!-- FSR upscaler runtime DLLs: the loader dispatches to the upscaler provider (and uses AGS on AMD).
