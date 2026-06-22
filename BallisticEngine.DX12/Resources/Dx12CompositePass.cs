@@ -10,7 +10,21 @@ public sealed class Dx12CompositePass : IRenderPass, IDisposable {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.Composite;
     public string Name => "Composite";
 
-    public bool Enabled(Dx12FrameContext ctx) => true;
+    // FAZ -1c — when render-graph v2 owns composite (BALLISTIC_DX12_RG=1) the v1 graph SKIPS this
+    // pass; v2 drives Record() itself. Door off (default) => RgV2OwnsComposite is false => unchanged.
+    public bool Enabled(Dx12FrameContext ctx) => !ctx.RgV2OwnsComposite;
+
+    // FAZ -1c — render-graph v2 entry point: v2 imports SceneColor/Ldr + declares the access, then
+    // calls this to run the SAME composite record body (byte-identical output to the v1 path).
+    // The v1 graph normally derives the SceneColor->PixelShaderResource transition for composite when
+    // ctx.BarriersDerived is on (the body then skips its own). Under v2 the v1 deriver is bypassed
+    // (the pass is skipped in v1) AND v2 emits no barrier for the imports (by design — equal states),
+    // so the body MUST own that transition. Force it here so Record() never reads SceneColor in the
+    // wrong state regardless of ctx.BarriersDerived.
+    public void RecordV2(Dx12FrameContext ctx) {
+        ctx.SceneColor.ColorToShaderResource();
+        Record(ctx);
+    }
 
     public void Declare(Dx12PassBuilder b) {
         b.Read(b.Resource("SceneColor"));

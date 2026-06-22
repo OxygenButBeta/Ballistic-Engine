@@ -76,6 +76,11 @@ public sealed class Dx12FrameContext {
 
     public bool BarriersDerived { get; init; }
 
+    // FAZ -1c — render-graph v2 (BALLISTIC_DX12_RG=1) drives the Composite pass this frame, so the
+    // v1 composite pass's Enabled() returns false (skip) to avoid compositing twice. Default false →
+    // door-off behaviour is byte-identical (v1 owns composite).
+    public bool RgV2OwnsComposite { get; init; }
+
     public Dx12RenderDoors      Doors    { get; init; }
     public PostProcessSettings  PostFX   { get; init; }
     public RenderStats          Stats    { get; init; }

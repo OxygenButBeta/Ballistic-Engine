@@ -567,9 +567,66 @@ public sealed class DX12HDRenderer : HDRenderer
             Console.Error.WriteLine(rtPool.PlanReport);
         }
 
+        // FAZ -1c — render-graph v2 PATH (experimental, alongside v1). Default OFF. When armed, a v2
+        // graph instance is reset+compiled+executed inside each BeginFrame/EndFrame window; Phase B
+        // drives the Composite pass through it. Any v2 failure logs + falls back to v1 for that frame.
+        rgV2Path = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RG") == "1";
+        if (rgV2Path)
+        {
+            rg2 = new Dx12RgGraph(dev);
+            Console.Error.WriteLine(
+                "[DX12] Render-graph v2 PATH ARMED (BALLISTIC_DX12_RG=1) — experimental, alongside v1.");
+        }
+
         featureBlitter = new Dx12FeatureBlitter(dev, targetW, targetH);
         featureRecorder = new Dx12FeaturePassRecorder(featureBlitter);
         featureBridge = new Dx12RenderFeatureBridge(graph, featureRecorder);
+    }
+
+    // FAZ -1c — render-graph v2 frame orchestration (Phase B: the Composite pass).
+    //
+    // Proves the full v2 flow (Reset -> AddPass -> Compile -> Execute) runs INSIDE the open
+    // BeginFrame/EndFrame window. The v2 Composite pass IMPORTS the same SceneColor (read) and Ldr
+    // (write) ID3D12Resources the v1 pass uses and DECLARES the matching access, so the v2 DAG keeps
+    // the pass alive (an imported write is observable) and the import/Compile/Resolve/per-pass-record
+    // plumbing is exercised end-to-end. The execute callback runs the SAME composite record body, so
+    // the output is byte-identical to v1 (same shader / inputs / constants).
+    //
+    // BARRIER SAFETY: the imported states are passed EXACTLY equal to each declared access's D3D12
+    // mapping (SceneColor=PixelShaderResource for PixelShaderRead, Ldr=RenderTarget for RenderTarget),
+    // so EmitBarriers sees CurrentState == want and emits NOTHING — the composite record body retains
+    // FULL ownership of the real resource transitions (via Dx12OffscreenTarget's own state tracking,
+    // exactly as in v1). v2 thus adds no GPU work of its own here beyond the record body it drives.
+    //
+    // FALLBACK: any exception logs and runs the v1 composite inline so the frame is never lost.
+    void RunRenderGraphV2(Dx12FrameContext ctx)
+    {
+        try
+        {
+            rg2.Reset();
+            Dx12RgHandle sceneColorH = default, ldrH = default;
+            rg2.AddPass("Composite", b =>
+            {
+                sceneColorH = b.ImportTexture("rg2.SceneColor", ctx.SceneColor.RenderTarget,
+                    Vortice.Direct3D12.ResourceStates.PixelShaderResource);
+                ldrH = b.ImportTexture("rg2.Ldr", ctx.Ldr.RenderTarget,
+                    Vortice.Direct3D12.ResourceStates.RenderTarget);
+                b.Read(sceneColorH, Dx12RgResourceState.PixelShaderRead);
+                b.Write(ldrH, Dx12RgResourceState.RenderTarget);
+            }, ec =>
+            {
+                // Run the SAME composite record body (byte-identical output to v1). The pass body
+                // manages its own resource states internally, so v2 emitted no barrier for the imports.
+                compositePass.RecordV2(ctx);
+            });
+            rg2.Compile();
+            rg2.Execute(ctx);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[DX12] Render-graph v2 Composite FAILED — falling back to v1 composite this frame: {ex.GetType().Name}: {ex.Message}");
+            try { compositePass.Record(ctx); } catch { /* v1 fallback already best-effort */ }
+        }
     }
 
     Dx12GpuDrivenRenderer gpuDriven;
@@ -621,6 +678,12 @@ public sealed class DX12HDRenderer : HDRenderer
     bool aliasPath;
 
     bool barriersPath;
+
+    // FAZ -1c — render-graph v2 shadow path (BALLISTIC_DX12_RG=1), experimental, runs ALONGSIDE the
+    // v1 graph. Default OFF => v1 owns the whole frame, byte-identical. When armed, v2 drives the
+    // Composite pass (Phase B) and the v1 composite pass is skipped (see Dx12FrameContext.RgV2OwnsComposite).
+    bool rgV2Path;
+    Dx12RgGraph rg2;
 
     bool skyTlutOn;
     float exposureOverride;
@@ -1630,6 +1693,8 @@ public sealed class DX12HDRenderer : HDRenderer
             Doors = doors, PostFX = PostFX, Stats = RenderStats.Scene,
             FrameCounter = DeterministicCapture ? 0 : frameCounter,
             BarriersDerived = barriersPath,
+            // FAZ -1c — when the v2 path is armed, v2 drives Composite; v1 composite pass skips itself.
+            RgV2OwnsComposite = rgV2Path && rg2 != null,
             DeterministicCapture = DeterministicCapture,
             AoResult = gtaoPass.ResultSrvCpu,
             AoToNonPixelShaderResource = () => gtaoPass.AoTarget.ColorToNonPixelShaderResource(),
@@ -1657,6 +1722,15 @@ public sealed class DX12HDRenderer : HDRenderer
         if (graphPath) graph.ExecuteGraph(ctx);
         else graph.Execute(ctx);
         FP("graph.Execute(all passes)");
+
+        // FAZ -1c — render-graph v2: when armed, drive the Composite pass through the v2 graph
+        // (v1 already skipped composite via ctx.RgV2OwnsComposite). Any v2 failure logs + falls back
+        // to running the v1 composite inline so the frame is never lost.
+        if (ctx.RgV2OwnsComposite)
+        {
+            RunRenderGraphV2(ctx);
+            FP("rgV2.Execute(Composite)");
+        }
 
         if (!PresentToScreen)
             ldr.ColorToShaderResource();
