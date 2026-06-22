@@ -334,14 +334,14 @@ internal sealed unsafe class Dx12NrdDenoiser : IDisposable {
 
     // Compile a shader that #includes NRD's packing functions by PREPENDING NRDConfig + NRD.hlsli (a pure function
     // library — no resource binds leak). Proves NRD.hlsli is DXC-SM6.6-compatible and our pack source builds.
-    public static byte[] CompileWithNrd(Vortice.Dxc.DxcShaderStage stage, string shaderFile, string entry) {
+    public static byte[] CompileWithNrd(Vortice.Dxc.DxcShaderStage stage, string shaderFile, string entry, string defines = null) {
         string cfg = EmbeddedShaderSource.ReadHlsl("Nrd/NRDConfig.hlsli");
         string lib = EmbeddedShaderSource.ReadHlsl("Nrd/NRD.hlsli");
         string body = EmbeddedShaderSource.ReadHlsl(shaderFile);
         // NRD.hlsli #includes "NRDConfig.hlsli" itself — but we prepend cfg manually (no DXC include handler), so
         // strip that line to avoid a "file not found". Same for any other relative #include in the library.
         lib = System.Text.RegularExpressions.Regex.Replace(lib, "(?m)^\\s*#include\\s+\"NRDConfig\\.hlsli\".*$", "");
-        string combined = cfg + "\n" + lib + "\n" + body;
+        string combined = (defines ?? "") + cfg + "\n" + lib + "\n" + body;
         return Dx12ShaderCompiler.Compile(stage, combined, entry, shaderFile);
     }
 

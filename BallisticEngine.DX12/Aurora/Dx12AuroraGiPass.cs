@@ -34,6 +34,32 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
     readonly Dx12AuroraScene scene;
     readonly Dx12EmissiveLights emissiveLights;   // FAZ 3d: world-space emissive-triangle area-light list (NEE)
 
+    // FAZ 4: NVIDIA NRD (ReBLUR) temporal denoiser. When BALLISTIC_DX12_AURORA_NRD=1 and NRD.dll is present, NRD
+    // owns the spatiotemporal accumulation (replacing Aurora's probe-EMA + à-trous): the trace writes raw E +
+    // hit-dist (NRD-packed), a guide-pack pass produces viewZ/normal/motion, NRD denoises, an unpack writes the
+    // clean E into indirectFiltered. Lazy-init on first NRD-mode frame; self-disables to Aurora temporal on failure.
+    Dx12NrdDenoiser nrd;
+    bool nrdTried, nrdReady;
+    static int nrdDoor = -2;
+    static bool NrdMode() {
+        if (nrdDoor == -2) nrdDoor = Environment.GetEnvironmentVariable("BALLISTIC_DX12_AURORA_NRD") == "1" ? 1 : 0;
+        return nrdDoor == 1;
+    }
+    // NRD-mode resources (lazy-built in EnsureNrd; all behind the NRD door so NRD-off is byte-identical).
+    ID3D12RootSignature nrdTraceRootSig, nrdPackRootSig, nrdUnpackRootSig;
+    ID3D12PipelineState nrdTracePso, nrdPackPso, nrdUnpackPso;
+    Dx12FrameCb<AuroraNrdConstants> nrdConstCb;
+    Dx12FrameCb<NrdPackConstants> nrdPackCb;
+    ID3D12Resource nrdRadianceHitDist, nrdViewZ, nrdNormalRough, nrdMotion, nrdOut;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct AuroraNrdConstants { public Matrix4x4 NrdViewMatrix; public Vector3 NrdHitDistParams; public float Pad; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct NrdPackConstants {
+        public Matrix4x4 InvViewProj; public Matrix4x4 PrevViewProj; public Matrix4x4 ViewMatrix;
+        public Vector2 InvResolution; public Vector2 Pad;
+    }
+
     // The card radiance cache (+ per-instance meta) the Reflections pass (event 600, after this) samples so
     // rough reflections read the SAME multi-bounce GI the diffuse sees (plan P5). Exposed read-only; valid only
     // after a successful Ensure this frame (the reflections pass also gates on ctx.AuroraActiveThisFrame).
@@ -1422,8 +1448,100 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
         spHistoryValid = false;   // a resized atlas history is stale → first frame takes the raw trace (alpha=1)
     }
 
+    // ===== FAZ 4: NRD (ReBLUR) integration =====
+    // Lazy-build the NRD denoiser + NRD-mode trace PSO + guide-pack + unpack pipelines + the packed-signal buffers.
+    // Returns false (and self-disables) on any failure → Record falls back to Aurora's own temporal accumulator.
+    bool EnsureNrd()
+    {
+        if (nrdReady) return true;
+        if (nrdTried) return false;
+        nrdTried = true;
+        try {
+            nrd = new Dx12NrdDenoiser(dev);
+            if (!nrd.Initialize(fullW, fullH)) { nrd.Dispose(); nrd = null; return false; }
+
+            // --- NRD-mode trace root sig = the normal trace layout + u1 (NrdRadianceHitDist, root UAV) + b2 (cbv2).
+            var cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+            var cbv1 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.All);
+            var cbv2 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(2, 0), ShaderVisibility.All);   // b2 NRD const
+            var tlasSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+            var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 6, baseShaderRegister: 1);
+            var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);
+            var probeRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 14, registerSpace: 0, offsetInDescriptorsFromTableStart: 7);
+            var motionRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 15, registerSpace: 0, offsetInDescriptorsFromTableStart: 8);
+            var table = new RootParameter1(new RootDescriptorTable1(srvRange, uavRange, probeRange, motionRange), ShaderVisibility.All);
+            var matSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All);
+            var instSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(8, 0), ShaderVisibility.All);
+            var lightSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(9, 0), ShaderVisibility.All);
+            var cardSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(10, 0), ShaderVisibility.All);
+            var metaSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(11, 0), ShaderVisibility.All);
+            var triClusterSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(12, 0), ShaderVisibility.All);
+            var cardsSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(13, 0), ShaderVisibility.All);
+            var nrdUav = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(1, 0), ShaderVisibility.All);   // u1 NrdRadianceHitDist (root)
+            var cs = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) { Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1, ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue };
+            var ws = new StaticSamplerDescription(ShaderVisibility.All, 1, 0) { Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap, AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 1, ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue };
+            nrdTraceRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+                new RootSignatureDescription1(RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
+                    new[] { cbv0, cbv1, cbv2, tlasSrv, table, matSrv, instSrv, lightSrv, cardSrv, metaSrv, triClusterSrv, cardsSrv, nrdUav }, new[] { cs, ws })));
+
+            byte[] traceCs = Dx12NrdDenoiser.CompileWithNrd(DxcShaderStage.Compute, "AuroraGi.hlsl", "CSTrace", "#define AURORA_NRD_MODE 1\n");
+            nrdTracePso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription { RootSignature = nrdTraceRootSig, ComputeShader = traceCs });
+            nrdConstCb = new Dx12FrameCb<AuroraNrdConstants>(dev);
+
+            // --- guide-pack pipeline (CBV b0 + table{Depth t0, Normal t1 SRV; OutMv u0, OutNR u1, OutViewZ u2}).
+            var pCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+            var pSrv = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 0);
+            var pUav = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 3, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 2);
+            var pTable = new RootParameter1(new RootDescriptorTable1(pSrv, pUav), ShaderVisibility.All);
+            nrdPackRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(new RootSignatureDescription1(RootSignatureFlags.None, new[] { pCbv, pTable }, new[] { cs })));
+            byte[] packCs = Dx12NrdDenoiser.CompileWithNrd(DxcShaderStage.Compute, "Nrd/AuroraNrdPack.hlsl", "CSMain");
+            nrdPackPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription { RootSignature = nrdPackRootSig, ComputeShader = packCs });
+            nrdPackCb = new Dx12FrameCb<NrdPackConstants>(dev);
+
+            // --- unpack pipeline (table{NrdOut t0, Depth t1 SRV; OutE u0}).
+            var uSrv = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 0);
+            var uUav = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 2);
+            var uTable = new RootParameter1(new RootDescriptorTable1(uSrv, uUav), ShaderVisibility.All);
+            nrdUnpackRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(new RootSignatureDescription1(RootSignatureFlags.None, new[] { uTable }, new[] { cs })));
+            byte[] unpackCs = Dx12NrdDenoiser.CompileWithNrd(DxcShaderStage.Compute, "Nrd/AuroraNrdUnpack.hlsl", "CSMain");
+            nrdUnpackPso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription { RootSignature = nrdUnpackRootSig, ComputeShader = unpackCs });
+
+            // --- packed-signal buffers (NRD ABI formats). All UAV+SRV, full-res.
+            nrdRadianceHitDist = MakeTex(Format.R16G16B16A16_Float);
+            nrdViewZ = MakeTex(Format.R16_Float);
+            nrdNormalRough = MakeTex(Format.R10G10B10A2_UNorm);
+            nrdMotion = MakeTex(Format.R16G16B16A16_Float);
+            nrdOut = MakeTex(Format.R16G16B16A16_Float);
+
+            nrdReady = true;
+            Console.WriteLine("[Aurora] NRD (ReBLUR) temporal denoiser ENGAGED — replacing probe-EMA + à-trous.");
+            return true;
+        } catch (Exception e) {
+            Console.WriteLine($"[Aurora] NRD enable failed → Aurora temporal fallback: {e.Message}");
+            DisposeNrd(); nrd?.Dispose(); nrd = null;
+            return false;
+        }
+    }
+
+    ID3D12Resource MakeTex(Format f) {
+        var rd = ResourceDescription.Texture2D(f, (uint)fullW, (uint)fullH, 1, 1);
+        rd.Flags = ResourceFlags.AllowUnorderedAccess;
+        return dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None, rd, ResourceStates.UnorderedAccess);
+    }
+
+    void DisposeNrd() {
+        nrdTracePso?.Dispose(); nrdTraceRootSig?.Dispose(); nrdConstCb?.Dispose();
+        nrdPackPso?.Dispose(); nrdPackRootSig?.Dispose(); nrdPackCb?.Dispose();
+        nrdUnpackPso?.Dispose(); nrdUnpackRootSig?.Dispose();
+        nrdRadianceHitDist?.Dispose(); nrdViewZ?.Dispose(); nrdNormalRough?.Dispose(); nrdMotion?.Dispose(); nrdOut?.Dispose();
+        nrdTracePso = null; nrdPackPso = null; nrdUnpackPso = null;
+        nrdRadianceHitDist = nrdViewZ = nrdNormalRough = nrdMotion = nrdOut = null;
+        nrdReady = false;
+    }
+
     public void Dispose()
     {
+        nrd?.Dispose();
         scene.Dispose();
         emissiveLights.Dispose();
         tracePso?.Dispose(); traceRootSig?.Dispose(); traceCb?.Dispose(); sunCb?.Dispose();
