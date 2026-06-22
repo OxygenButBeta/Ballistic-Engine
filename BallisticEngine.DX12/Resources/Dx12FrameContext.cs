@@ -81,6 +81,11 @@ public sealed class Dx12FrameContext {
     // door-off behaviour is byte-identical (v1 owns composite).
     public bool RgV2OwnsComposite { get; init; }
 
+    // FAZ -1d — render-graph v2 (BALLISTIC_DX12_RG=1) drives the TAA pass this frame, so the v1 TAA
+    // pass's Enabled() returns false (skip) to avoid resolving TAA twice. Default false → door-off
+    // behaviour is byte-identical (v1 owns TAA). Only set when TAA would run at all (!FsrActive).
+    public bool RgV2OwnsTaa { get; init; }
+
     public Dx12RenderDoors      Doors    { get; init; }
     public PostProcessSettings  PostFX   { get; init; }
     public RenderStats          Stats    { get; init; }

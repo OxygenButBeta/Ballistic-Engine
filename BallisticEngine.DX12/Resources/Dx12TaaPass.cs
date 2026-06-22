@@ -10,7 +10,29 @@ public sealed class Dx12TaaPass : IRenderPass, IDisposable {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.PostProcess;
     public string Name => "TAA";
 
-    public bool Enabled(Dx12FrameContext ctx) => !ctx.FsrActive;
+    // FAZ -1d — when render-graph v2 owns TAA (BALLISTIC_DX12_RG=1) the v1 graph SKIPS this pass; v2
+    // drives Record() itself. v1 still skips under FSR (TAA never runs then). Door off (default) =>
+    // RgV2OwnsTaa is false => Enabled == !FsrActive, unchanged.
+    public bool Enabled(Dx12FrameContext ctx) => !ctx.FsrActive && !ctx.RgV2OwnsTaa;
+
+    // FAZ -1d — render-graph v2 entry point: v2 imports SceneColor (ReadWrite) + GBuffer (depth/motion
+    // read) and declares the access, then calls this to run the SAME TAA record body (byte-identical
+    // output to the v1 path). The v1 graph normally derives the SceneColor->PixelShaderResource and the
+    // GBuffer depth->PixelShaderResource transitions for TAA when ctx.BarriersDerived is on (the body
+    // then skips its own — see the `if (!ctx.BarriersDerived)` guards in Record). Under v2 the v1 deriver
+    // is bypassed (the pass is skipped in v1) AND v2 emits no barrier for the imports (by design — equal
+    // states), so the body MUST own those transitions. Force them here so Record() never reads SceneColor
+    // or the GBuffer depth/motion in the wrong state regardless of ctx.BarriersDerived. (Motion is RT
+    // index MotionRtIndex of the GBuffer; Dx12GBuffer.ToShaderResource() transitions the WHOLE G-buffer
+    // color set AND depth into a shader-readable state — covering both the motion SRV and the depth SRV
+    // the Record body samples in one barrier batch.) ctx.SceneColor == ctx.Target here (TAA only runs
+    // when !FsrActive, where SceneColor aliases the main target), so forcing SceneColor matches the
+    // body's own guarded `target.ColorToShaderResource()`.
+    public void RecordV2(Dx12FrameContext ctx) {
+        ctx.SceneColor.ColorToShaderResource();
+        ctx.GBuffer.ToShaderResource();
+        Record(ctx);
+    }
 
     public void Declare(Dx12PassBuilder b) {
         b.Read(b.Resource("GBuffer"));

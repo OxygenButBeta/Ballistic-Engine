@@ -589,34 +589,64 @@ public sealed class DX12HDRenderer : HDRenderer
         featureBridge = new Dx12RenderFeatureBridge(graph, featureRecorder);
     }
 
-    // FAZ -1c — render-graph v2 frame orchestration (Phase B: the Composite pass).
+    // FAZ -1c/-1d — render-graph v2 frame orchestration (Phase B: TAA -> Composite).
     //
     // Proves the full v2 flow (Reset -> AddPass -> Compile -> Execute) runs INSIDE the open
     // BeginFrame/EndFrame window. The v2 Composite pass IMPORTS the same SceneColor (read) and Ldr
     // (write) ID3D12Resources the v1 pass uses and DECLARES the matching access, so the v2 DAG keeps
     // the pass alive (an imported write is observable) and the import/Compile/Resolve/per-pass-record
-    // plumbing is exercised end-to-end. The execute callback runs the SAME composite record body, so
-    // the output is byte-identical to v1 (same shader / inputs / constants).
+    // plumbing is exercised end-to-end. The execute callbacks run the SAME record bodies, so the output
+    // is byte-identical to v1 (same shaders / inputs / constants).
+    //
+    // FAZ -1d — TAA joins the v2 graph BEFORE Composite (TAA's PostProcess event runs earlier than
+    // Composite). SceneColor is IMPORTED ONCE here and the SAME handle is shared by both passes: TAA
+    // ReadWrites it (it resolves TAA into scene color using history), Composite Reads it. Because the
+    // DAG keys edges on the resource HANDLE id (not the import name — ImportTexture does NOT dedup by
+    // name, so importing twice would create two unrelated entries and lose the dependency), sharing the
+    // one handle makes the compiler emit a RAW edge TAA -> Composite and ALWAYS order TAA first. TAA is
+    // only added when ctx.RgV2OwnsTaa (i.e. !FsrActive); under FSR there is no TAA pass and Composite
+    // runs alone, exactly as v1 would skip TAA.
     //
     // BARRIER SAFETY: the imported states are passed EXACTLY equal to each declared access's D3D12
     // mapping (SceneColor=PixelShaderResource for PixelShaderRead, Ldr=RenderTarget for RenderTarget),
-    // so EmitBarriers sees CurrentState == want and emits NOTHING — the composite record body retains
-    // FULL ownership of the real resource transitions (via Dx12OffscreenTarget's own state tracking,
-    // exactly as in v1). v2 thus adds no GPU work of its own here beyond the record body it drives.
+    // so EmitBarriers sees CurrentState == want and emits NOTHING — the record bodies retain FULL
+    // ownership of the real resource transitions (via Dx12OffscreenTarget / Dx12GBuffer state tracking,
+    // exactly as in v1). v2 thus adds no GPU work of its own here beyond the record bodies it drives.
+    // (TAA briefly transitions SceneColor RT<->SRV internally; the post-TAA state it leaves is the same
+    // PixelShaderResource Composite's RecordV2 re-asserts, so the shared handle stays consistent.)
     //
-    // FALLBACK: any exception logs and runs the v1 composite inline so the frame is never lost.
+    // FALLBACK: any exception logs and runs the v1 bodies inline so the frame is never lost.
     void RunRenderGraphV2(Dx12FrameContext ctx)
     {
         try
         {
             rg2.Reset();
-            Dx12RgHandle sceneColorH = default, ldrH = default;
+            // Import the shared resources ONCE, capture the handles, then have both passes Read/Write
+            // the captured handles (the clean shape — avoids double-import and gives the DAG the
+            // TAA->Composite dependency through one SceneColor entry).
+            Dx12RgHandle sceneColorH = rg2.ImportTexture("rg2.SceneColor", ctx.SceneColor.RenderTarget,
+                Vortice.Direct3D12.ResourceStates.PixelShaderResource);
+            Dx12RgHandle ldrH = rg2.ImportTexture("rg2.Ldr", ctx.Ldr.RenderTarget,
+                Vortice.Direct3D12.ResourceStates.RenderTarget);
+
+            if (ctx.RgV2OwnsTaa)
+            {
+                rg2.AddPass("TAA", b =>
+                {
+                    // TAA reads SceneColor as SRV and writes it as RT -> declare it ReadWrite so the DAG
+                    // marks TAA as SceneColor's last writer (Composite's Read then depends on TAA).
+                    b.Read(sceneColorH, Dx12RgResourceState.PixelShaderRead);
+                    b.Write(sceneColorH, Dx12RgResourceState.RenderTarget);
+                }, ec =>
+                {
+                    // Run the SAME TAA record body (byte-identical to v1). The body manages its own
+                    // resource states internally, so v2 emitted no barrier for the import.
+                    taaPass.RecordV2(ctx);
+                });
+            }
+
             rg2.AddPass("Composite", b =>
             {
-                sceneColorH = b.ImportTexture("rg2.SceneColor", ctx.SceneColor.RenderTarget,
-                    Vortice.Direct3D12.ResourceStates.PixelShaderResource);
-                ldrH = b.ImportTexture("rg2.Ldr", ctx.Ldr.RenderTarget,
-                    Vortice.Direct3D12.ResourceStates.RenderTarget);
                 b.Read(sceneColorH, Dx12RgResourceState.PixelShaderRead);
                 b.Write(ldrH, Dx12RgResourceState.RenderTarget);
             }, ec =>
@@ -630,7 +660,8 @@ public sealed class DX12HDRenderer : HDRenderer
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[DX12] Render-graph v2 Composite FAILED — falling back to v1 composite this frame: {ex.GetType().Name}: {ex.Message}");
+            Console.Error.WriteLine($"[DX12] Render-graph v2 (TAA/Composite) FAILED — falling back to v1 inline this frame: {ex.GetType().Name}: {ex.Message}");
+            try { if (ctx.RgV2OwnsTaa) taaPass.Record(ctx); } catch { /* v1 fallback already best-effort */ }
             try { compositePass.Record(ctx); } catch { /* v1 fallback already best-effort */ }
         }
     }
@@ -1701,6 +1732,9 @@ public sealed class DX12HDRenderer : HDRenderer
             BarriersDerived = barriersPath,
             // FAZ -1c — when the v2 path is armed, v2 drives Composite; v1 composite pass skips itself.
             RgV2OwnsComposite = rgV2Path && rg2 != null,
+            // FAZ -1d — v2 also drives TAA, but ONLY when TAA would run at all (TAA never runs under
+            // FSR, so v1 keeps ownership there and just skips like today). v1 TAA pass skips itself.
+            RgV2OwnsTaa = rgV2Path && rg2 != null && !fsrActive,
             DeterministicCapture = DeterministicCapture,
             AoResult = gtaoPass.ResultSrvCpu,
             AoToNonPixelShaderResource = () => gtaoPass.AoTarget.ColorToNonPixelShaderResource(),
