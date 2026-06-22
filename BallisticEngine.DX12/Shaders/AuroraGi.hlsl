@@ -103,14 +103,29 @@ float Hash(uint s) {
     return float(s & 0x7fffffffu) / float(0x7fffffff);
 }
 
+// FAZ 3b (A2) — R2 (Roberts) low-discrepancy 2D sequence. Stepping the per-frame temporal offset through R2
+// instead of a scalar hash makes successive frames' samples interleave EVENLY over the hemisphere (a blue-noise-
+// like coverage), so the temporal EMA converges to a clean estimate far faster than independent per-frame hashes
+// (which clump). a1/a2 are the inverse of the plastic constant's powers (the canonical R2 generator).
+float2 R2Seq(uint n) {
+    const float a1 = 0.7548776662466927;   // 1/φ₂
+    const float a2 = 0.5698402909980532;   // 1/φ₂²
+    return frac(0.5 + float2(a1, a2) * float(n));
+}
+
 // Cosine-weighted hemisphere sample around +Z (local). Folding the cosine into the sampling means a plain mean
-// of per-ray radiance ≈ the cosine-weighted irradiance.
-float3 CosineHemisphere(uint i, uint n, float jitter) {
-    float u1 = (float(i) + jitter) / float(n);
-    float u2 = frac(jitter * 1.61803398875 + float(i) * 0.7548776662);
+// of per-ray radiance ≈ the cosine-weighted irradiance. `jit2` is a per-pixel + per-frame R2 offset (A2): it
+// decorrelates pixels spatially and advances each pixel's stratified set every frame for clean EMA convergence.
+float3 CosineHemisphere(uint i, uint n, float2 jit2) {
+    float u1 = frac((float(i) + jit2.x) / float(n) + jit2.y);   // stratified radius slot + R2 temporal advance
+    float u2 = frac(jit2.y * 1.61803398875 + float(i) * 0.7548776662 + jit2.x);
     float r = sqrt(saturate(u1));
     float phi = 6.28318530718 * u2;
     return float3(r * cos(phi), r * sin(phi), sqrt(saturate(1.0 - u1)));
+}
+// Back-compat scalar overload (probe/card paths still pass a scalar jitter).
+float3 CosineHemisphere(uint i, uint n, float jitter) {
+    return CosineHemisphere(i, n, float2(jitter, frac(jitter * 1.61803398875)));
 }
 float3x3 BuildBasis(float3 n) {
     float3 up = abs(n.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
@@ -257,7 +272,13 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
     float3 origin = worldPos + N * NormalBias;
 
     uint rays = (uint)clamp(RayCount, 1.0, 16.0);
+    // A2 — per-pixel spatial decorrelation (hash) + per-frame R2 temporal advance. The pixel hash seeds a unique
+    // R2 phase per pixel (no grid-aligned banding); the frame index walks the R2 sequence so each frame's stratified
+    // set interleaves with the last → blue-noise-like temporal coverage the EMA cleans fast. Deterministic capture
+    // (FrameIndex < 0) pins frame 0 → byte-stable.
     float jitter = Hash(px.x * 73856093u ^ px.y * 19349663u ^ (uint)FrameIndex * 2654435761u);
+    uint frameOrd = FrameIndex < 0.0 ? 0u : (uint)FrameIndex;
+    float2 jit2 = frac(jitter.xx + R2Seq(frameOrd));
     float3x3 basis = BuildBasis(N);
 
     // #4 IMPORTANCE SAMPLING — the dominant indirect contributor in a sun-lit scene is the SUN-facing hemisphere
@@ -277,10 +298,10 @@ void CSTrace(uint3 dtid : SV_DispatchThreadID) {
         if (importance > 0.5 && r == 0u && sunUp) {
             // Guaranteed ray toward the sun (jittered within a small cosine-lobe cone so a flat surface still gets
             // a smooth result, not a hard single direction).
-            float3 c = CosineHemisphere(0u, max(rays, 2u), jitter);
+            float3 c = CosineHemisphere(0u, max(rays, 2u), jit2);
             local = normalize(sunLocalDir * 2.0 + c);   // pull the cosine sample toward the sun
         } else {
-            local = CosineHemisphere(r, rays, jitter);
+            local = CosineHemisphere(r, rays, jit2);
         }
         float3 dir = normalize(mul(local, basis));
 
