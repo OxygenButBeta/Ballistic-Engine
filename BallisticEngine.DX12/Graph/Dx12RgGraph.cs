@@ -315,8 +315,11 @@ public sealed class Dx12RgGraph : IDisposable {
             e.Resource = dev.Device.CreatePlacedResource<ID3D12Resource>(
                 heaps[e.HeapCategory], e.HeapOffset, d, ResourceStates.Common, clear);
             e.CurrentState = ResourceStates.Common;
-            // RT/DS/UAV transients sharing memory need init-after-alias on first use (MS rule).
-            e.NeedsAliasInit = e.IsRtDs || e.Desc.AllowUav;
+            // Init-after-alias (MS docs "Using placed resources"): only RT/DS/UAV *textures* carry
+            // vendor compression metadata that is garbage after aliasing and MUST be cleared/discarded
+            // before first read. BUFFERS have no such metadata — DiscardResource is undefined for
+            // buffers (texture/RT/DS only), so never request it for a buffer transient.
+            e.NeedsAliasInit = !e.Desc.IsBuffer && (e.IsRtDs || e.Desc.AllowUav);
             placedResources.Add(e.Resource);
         }
     }

@@ -46,6 +46,11 @@ public sealed class DirectXRenderAsset : RenderAsset {
             string report;
             try { report = DX12.Dx12RgSelfTest.Run(device); }
             catch (Exception ex) { report = "FAILED:\n" + ex; }
+            // Also drive the REAL GPU-execute path (barriers + transient aliasing + readback verify).
+            string executeReport;
+            try { executeReport = DX12.Dx12RgExecuteSelfTest.RunExecute(device); }
+            catch (Exception ex) { executeReport = "[Dx12RgExecuteSelfTest] FAILED (outer):\n" + ex; }
+            report = report + "\n" + executeReport;
             Console.Error.WriteLine("[DX12] Render-graph v2 (Dx12RgGraph) SELF-TEST:\n" + report);
             string outPath = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RG_SELFTEST_OUT");
             if (!string.IsNullOrEmpty(outPath)) System.IO.File.WriteAllText(outPath, report);

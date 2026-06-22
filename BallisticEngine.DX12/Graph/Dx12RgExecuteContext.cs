@@ -73,7 +73,7 @@ public sealed class Dx12RgDescriptorCache : IDisposable {
 
     public void Reset() {
         rtvCursor = 0; dsvCursor = 0;
-        rtvByEntry.Clear(); dsvByEntry.Clear(); dsvByEntry.Clear();
+        rtvByEntry.Clear(); dsvByEntry.Clear();
         srvByEntry.Clear(); uavByEntry.Clear();
         foreach (int i in srvIndices) Dx12Backend.SrvStore?.Free(i);
         srvIndices.Clear();
