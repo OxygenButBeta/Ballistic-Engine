@@ -1,0 +1,4 @@
+# Vendor upscaler SDK extracts (DLLs already covered; ignore the bulky trees, re-fetch via README)
+dlss/sl/
+xess/lib/
+*.zip

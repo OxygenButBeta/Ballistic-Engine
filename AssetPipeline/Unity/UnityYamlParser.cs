@@ -2,14 +2,6 @@ using System.Globalization;
 
 namespace BallisticEngine.AssetPipeline.Unity;
 
-// Parses Unity .unity / .prefab YAML into a UnityYamlScene. Unity's format is multi-document YAML
-// with custom headers: each object is "--- !u!<classID> &<fileID>" followed by an indented block
-// keyed by the object type ("GameObject:", "Transform:", ...). The body is regular-enough YAML that
-// a focused line parser is far more robust here than a general YAML lib choking on the !u! tags.
-//
-// We only decode the four object kinds we can map (GameObject / Transform / RectTransform /
-// MeshFilter / MeshRenderer); other documents are skipped. Class IDs:
-//   1 GameObject, 4 Transform, 224 RectTransform, 33 MeshFilter, 23 MeshRenderer.
 public static class UnityYamlParser {
     public static UnityYamlScene Parse(string text) {
         var scene = new UnityYamlScene();
@@ -23,11 +15,9 @@ public static class UnityYamlParser {
                 continue;
             }
 
-            // "--- !u!<classID> &<fileID>" (fileID may have a trailing " stripped" flag we ignore).
             (int classId, long fileId) = ParseHeader(line);
             i++;
 
-            // Collect the document body: every following line until the next "--- " or EOF.
             var start = i;
             while (i < lines.Length && !lines[i].StartsWith("--- ", StringComparison.Ordinal))
                 i++;
@@ -47,8 +37,6 @@ public static class UnityYamlParser {
         return scene;
     }
 
-    // ---- Object parsers -----------------------------------------------------
-
     static void ParseGameObject(UnityYamlScene scene, long fileId, ArraySegment<string> body) {
         var go = new UnityGameObject { FileId = fileId };
         var inComponents = false;
@@ -64,13 +52,12 @@ public static class UnityYamlParser {
             else if (trimmed.StartsWith("m_Component:", StringComparison.Ordinal))
                 inComponents = true;
             else if (inComponents && trimmed.Contains("component:", StringComparison.Ordinal)) {
-                // "- component: {fileID: 123456}"
                 UnityRef comp = ParseRef(trimmed);
                 if (comp.FileId != 0)
                     go.ComponentIds.Add(comp.FileId);
             }
             else if (inComponents && line.Length > 0 && !char.IsWhiteSpace(line[0]))
-                inComponents = false; // dedented out of the component list
+                inComponents = false;
         }
 
         scene.GameObjects[fileId] = go;
@@ -141,10 +128,6 @@ public static class UnityYamlParser {
         scene.MeshRenderers[fileId] = mr;
     }
 
-    // PrefabInstance (1001): a nested prefab placement. m_SourcePrefab is the prefab guid;
-    // m_Modification.m_TransformParent is the parent transform; m_Modifications is a flat list of
-    // {target, propertyPath, value} we scan for the instance's name/active/local TRS. Unity splits the
-    // local rotation into m_LocalRotation.{x,y,z,w} and position/scale into .{x,y,z} property paths.
     static void ParsePrefabInstance(UnityYamlScene scene, long fileId, ArraySegment<string> body) {
         var pi = new UnityPrefabInstance { FileId = fileId };
         float px = 0, py = 0, pz = 0;
@@ -152,7 +135,7 @@ public static class UnityYamlParser {
         float sx = 1, sy = 1, sz = 1;
         var sawPos = false; var sawRot = false; var sawScale = false;
 
-        string pendingPath = null; // a "propertyPath:" awaiting its "value:" on a later line
+        string pendingPath = null;
 
         foreach (var raw in body) {
             var trimmed = raw.Trim();
@@ -191,15 +174,9 @@ public static class UnityYamlParser {
             scene.PrefabInstances[fileId] = pi;
     }
 
-    // LODGroup (205) exists in these prefabs but we don't need its body: LOD1+ skipping is done by
-    // GameObject name suffix ("_LOD1".."_LOD9") in the converter, which is parse-order-independent
-    // (a LODGroup document can precede the renderers it points at). Kept as a no-op for clarity.
     static void ParseLodGroup(UnityYamlScene scene, long fileId, ArraySegment<string> body) { }
 
-    // ---- Primitive parsing --------------------------------------------------
-
     static (int classId, long fileId) ParseHeader(string line) {
-        // "--- !u!4 &123456789" -> classId 4, fileId 123456789
         var tagStart = line.IndexOf("!u!", StringComparison.Ordinal) + 3;
         var amp = line.IndexOf('&', tagStart);
         var classStr = amp > 0 ? line[tagStart..amp].Trim() : line[tagStart..].Trim();
@@ -209,13 +186,12 @@ public static class UnityYamlParser {
         if (amp > 0) {
             var idStr = line[(amp + 1)..].Trim();
             var space = idStr.IndexOf(' ');
-            if (space > 0) idStr = idStr[..space]; // drop "stripped" / flags
+            if (space > 0) idStr = idStr[..space];
             long.TryParse(idStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out fileId);
         }
         return (classId, fileId);
     }
 
-    // Parses "{fileID: 123}" or "{fileID: 123, guid: abc..., type: 2}" (possibly after a "key:").
     static UnityRef ParseRef(string text) {
         var brace = text.IndexOf('{');
         if (brace < 0) return default;
@@ -236,7 +212,6 @@ public static class UnityYamlParser {
         return new UnityRef(fileId, guid);
     }
 
-    // Parses "m_LocalPosition: {x: 1, y: 2, z: 3}".
     static Vector3 ParseVector3(string line) {
         (float x, float y, float z, float _) = ParseFloatBraces(line);
         return new Vector3(x, y, z);
@@ -274,8 +249,6 @@ public static class UnityYamlParser {
         return idx < 0 ? "" : line[(idx + key.Length)..];
     }
 
-    // A .prefab's root is the transform with no father; record its GameObject so the converter can
-    // treat the whole file as a single instantiable tree.
     static void ResolvePrefabRoot(UnityYamlScene scene) {
         foreach (UnityTransform t in scene.Transforms.Values) {
             if (t.FatherId == 0) {

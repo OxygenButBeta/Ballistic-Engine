@@ -3,13 +3,10 @@ using System.Text.RegularExpressions;
 
 namespace BallisticEngine.AssetPipeline;
 
-// A parsed, engine-agnostic view of a Falcor .pyscene. We do NOT evaluate the Python; we scan for
-// the common declarative scene-builder calls (camera, directional lights, env map, model imports).
-// This covers most hand-authored .pyscene files; exotic procedural scripts are partially imported.
 public sealed class FalcorSceneData {
     public FalcorCamera Camera { get; set; }
     public List<FalcorLight> Lights { get; } = new();
-    public List<string> ModelPaths { get; } = new(); // relative to the .pyscene
+    public List<string> ModelPaths { get; } = new();
     public string EnvMapPath { get; set; }
 }
 
@@ -29,7 +26,6 @@ public static class FalcorSceneParser {
     public static FalcorSceneData Parse(string source) {
         var data = new FalcorSceneData();
 
-        // Strip line comments to avoid matching commented-out calls.
         source = Regex.Replace(source, @"#.*", "");
 
         ParseCamera(source, data);
@@ -41,7 +37,6 @@ public static class FalcorSceneParser {
     }
 
     static void ParseCamera(string source, FalcorSceneData data) {
-        // camera.position = float3(x, y, z) ; camera.target = float3(...) ; camera.focalLength / fov
         Vector3? pos = FindFloat3(source, @"\.position\s*=\s*float3\(([^)]*)\)");
         Vector3? target = FindFloat3(source, @"\.target\s*=\s*float3\(([^)]*)\)");
         if (pos is null && target is null && !source.Contains("Camera("))
@@ -59,9 +54,7 @@ public static class FalcorSceneParser {
     }
 
     static void ParseLights(string source, FalcorSceneData data) {
-        // DirectionalLight: .direction = float3(...), .intensity = float3(...) or scalar
         foreach (Match m in Regex.Matches(source, @"DirectionalLight\s*\(", RegexOptions.IgnoreCase)) {
-            // Look at a window of text after the constructor for its property assignments.
             int start = m.Index;
             int end = Math.Min(source.Length, start + 400);
             string window = source[start..end];
@@ -86,9 +79,6 @@ public static class FalcorSceneParser {
     }
 
     static void ParseModels(string source, FalcorSceneData data) {
-        // sceneBuilder.importScene("path") (Falcor 4.x+, e.g. ORCA scenes like Bistro),
-        // .importGLTF("path"), .importOBJ("path"), import("path"), addModel("path").
-        // Longer alternatives must precede "import" or "importScene(" never matches.
         foreach (Match m in Regex.Matches(source,
                      @"(?:importScene|importGLTF|importOBJ|addModel|loadMesh|import)\s*\(\s*[""']([^""']+)[""']",
                      RegexOptions.IgnoreCase)) {

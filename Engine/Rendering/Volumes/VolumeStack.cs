@@ -1,9 +1,5 @@
 namespace BallisticEngine;
 
-// The per-frame evaluated state of every VolumeComponent type (Unity's VolumeStack): one live
-// instance per type, reset to engine defaults at the start of each blend pass, then pulled
-// toward each contributing volume's overrides. Consumers (the renderer bridge) read the final
-// values with GetComponent<T>().
 public sealed class VolumeStack {
     readonly Dictionary<Type, VolumeComponent> lookup = new();
     readonly List<(VolumeComponent Live, VolumeComponent Defaults)> entries = new();

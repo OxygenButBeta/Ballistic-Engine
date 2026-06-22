@@ -4,8 +4,6 @@ public static class Debugging
 {
     public static ILogger Logger { get; internal set; }
 
-    // Mirror of every log call, for tooling (the editor console subscribes).
-    // Levels: 0 = info, 1 = warning, 2 = error.
     public static event Action<string, int> OnMessage;
 
     public static void Log(object message, BObject source = null)

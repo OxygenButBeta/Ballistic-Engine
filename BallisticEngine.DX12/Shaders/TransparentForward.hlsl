@@ -37,10 +37,11 @@ Texture2DArray ShadowCascades : register(t9);   // sun cascade depth (R32_Float)
 
 // Clustered punctual lights (faithful to the GL / deferred clustered path).
 struct GpuLight {
-    float4 PosRange;     // xyz world pos, w range
-    float4 Color;        // xyz radiance (HDR), w type (0 point / 1 spot)
-    float4 DirCosOuter;  // xyz spot dir, w cosOuter
-    float4 Extra;        // x cosInner, y shadowSlot, z sourceRadius, w pad
+    float4 PosRange;        // xyz world pos, w range
+    float4 Color;           // xyz radiance (HDR), w type (0 point / 1 spot / 2 rect)
+    float4 DirCosOuter;     // xyz spot dir, w cosOuter
+    float4 Extra;           // x cosInner, y shadowSlot, z sourceRadius, w pad
+    float4 RightAxisHalfW;  // 80B: rect right-axis (0 for point/spot) — must match Dx12ClusteredLights.GpuLight stride
 };
 StructuredBuffer<GpuLight> ClusterLights : register(t10);
 Buffer<int2>               ClusterGrid   : register(t11);  // per-cluster {offset, count}
@@ -54,6 +55,14 @@ cbuffer FrameConstants : register(b1) {
     float4x4 Cascade0, Cascade1, Cascade2, Cascade3;
     float4   CascadeBias;
     float    CascadeCountF; float ShadowsEnabled; float ShadowMapTexel; float CascadeBlend;
+    // Shadows-volume tail — must match DX12HDRenderer.FrameConstants. Contact-shadow fields unused here.
+    float    ShadowFiltering;     // 0 = hard, 1 = soft PCF, 2 = PCSS
+    float    ShadowSoftness;      // PCSS / PCF penumbra scale
+    float    ContactShadowsOn;
+    float    ContactShadowLength;
+    float    ContactShadowSteps;
+    float    ContactShadowThickness;
+    float    FramePad0, FramePad1;
 };
 
 // Froxel grid dims — must match Dx12ClusteredLights (16x9x24, log-Z).
@@ -130,30 +139,55 @@ float CascadeMatrixApply(int c, float3 worldPos, out float3 proj) {
     return max(abs(clip.x), abs(clip.y));
 }
 
+// Volume-driven sun shadow (hard / soft PCF / PCSS), shared logic with the deferred + opaque paths.
+float ShadowTapHard(int c, float2 uv, float z, float bias) {
+    float d = ShadowCascades.SampleLevel(LinearClamp, float3(uv, (float)c), 0).r;
+    return (z - bias) <= d ? 1.0 : 0.0;
+}
+float ShadowPcf(int c, float2 base, float z, float bias, float radiusTexels) {
+    float lit = 0.0;
+    [unroll] for (int dy = -2; dy <= 2; dy++)
+    [unroll] for (int dx = -2; dx <= 2; dx++)
+        lit += ShadowTapHard(c, base + float2(dx, dy) * ShadowMapTexel * radiusTexels, z, bias);
+    return lit / 25.0;
+}
+float ShadowPcss(int c, float2 base, float z, float bias) {
+    float searchTexels = 2.0 + ShadowSoftness * 2.0;
+    float blockerSum = 0.0; float blockerCount = 0.0;
+    [unroll] for (int sy = -2; sy <= 2; sy++)
+    [unroll] for (int sx = -2; sx <= 2; sx++) {
+        float d = ShadowCascades.SampleLevel(LinearClamp, float3(base + float2(sx, sy) * ShadowMapTexel * searchTexels, (float)c), 0).r;
+        if (d < z - bias) { blockerSum += d; blockerCount += 1.0; }
+    }
+    if (blockerCount < 0.5) return 1.0;
+    float avgBlocker = blockerSum / blockerCount;
+    float penumbra = max(z - avgBlocker, 0.0) / max(avgBlocker, 1e-4);
+    float radiusTexels = clamp(penumbra * ShadowSoftness * 64.0, 0.75, 12.0);
+    return ShadowPcf(c, base, z, bias, radiusTexels);
+}
 float SunShadow(float3 N, float3 L, float3 worldPos) {
     if (ShadowsEnabled < 0.5) return 1.0;
     float ndl = saturate(dot(N, L));
     int count = (int)CascadeCountF;
+    int mode = (int)(ShadowFiltering + 0.5);
     for (int c = 0; c < count; c++) {
         float3 proj;
         float edge = CascadeMatrixApply(c, worldPos, proj);
         if (edge > 1.0 || proj.z > 1.0 || proj.z < 0.0) continue;
         float bias = max(CascadeBias[c] * (1.0 - ndl), CascadeBias[c] * 0.1);
-        float lit = 0.0;
-        [unroll] for (int dy = -1; dy <= 1; dy++)
-        [unroll] for (int dx = -1; dx <= 1; dx++) {
-            float2 uv = proj.xy + float2(dx, dy) * ShadowMapTexel;
-            float d = ShadowCascades.SampleLevel(LinearClamp, float3(uv, (float)c), 0).r;
-            lit += (proj.z - bias) <= d ? 1.0 : 0.0;
-        }
-        return lit / 9.0;
+        if (mode == 0) return ShadowTapHard(c, proj.xy, proj.z, bias);
+        if (mode == 2) return ShadowPcss(c, proj.xy, proj.z, bias);
+        return ShadowPcf(c, proj.xy, proj.z, bias, clamp(ShadowSoftness * 0.75, 0.5, 4.0));
     }
     return 1.0;
 }
 
-float DistanceAttenuation(float dist, float range) {
-    float d2 = dist * dist;
-    float inv = 1.0 / max(d2, 1e-4);
+// V2 (fixes D3): spherical-source window `1/(d² + r²)` — finite near-field, no 1/max(d²,1e-4) firefly spike;
+// identical to 1/d² once d ≫ r. Matches DeferredLighting.hlsl so opaque + transparent punctuals shade alike.
+float DistanceAttenuation(float dist, float range, float sourceRadius) {
+    const float rMin = 0.05;                                  // 5 cm floor so a delta light can't singularly spike
+    float r = max(sourceRadius, rMin);
+    float inv = 1.0 / (dist * dist + r * r);
     float t = saturate(1.0 - pow(dist / range, 4.0));
     return inv * t * t;
 }
@@ -164,7 +198,7 @@ float3 ShadePunctual(GpuLight L, float3 N, float3 V, float3 worldPos, float3 alb
     float dist = length(toLight);
     if (dist > L.PosRange.w) return 0.0.xxx;
     float3 Ld = toLight / max(dist, 1e-4);
-    float atten = DistanceAttenuation(dist, L.PosRange.w);
+    float atten = DistanceAttenuation(dist, L.PosRange.w, L.Extra.z);   // Extra.z = SourceRadius (V2 near-field window)
     if (atten <= 0.0) return 0.0.xxx;
 
     float3 radiance = L.Color.rgb * atten;
@@ -239,7 +273,11 @@ float4 PSMain(VSOutput i) : SV_Target {
         int2 range = ClusterGrid[cluster];   // {offset, count}
         for (int k = 0; k < range.y; k++) {
             uint li = ClusterIndex[range.x + k];
-            punctual += ShadePunctual(ClusterLights[li], N, V, i.PosW, albedo, metallic, roughness, F0);
+            GpuLight gl = ClusterLights[li];
+            // Area/rect lights (type 2) are LTC and shaded on the DEFERRED (opaque) path only — skip them here
+            // so a rect doesn't get mis-shaded as a spot. Transparent area-light support is a v1 follow-up.
+            if (gl.Color.w >= 1.5) continue;
+            punctual += ShadePunctual(gl, N, V, i.PosW, albedo, metallic, roughness, F0);
         }
     }
 

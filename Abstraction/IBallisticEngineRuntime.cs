@@ -10,4 +10,6 @@ public interface IBallisticEngineRuntime
     IWindow Window { get; }
     RenderAsset RenderAsset { get; }
     ILogger Logger { get; }
+
+    void PresentFromRenderThread() { }
 }

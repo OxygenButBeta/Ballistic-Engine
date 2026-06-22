@@ -1,6 +1,3 @@
-using System;
-using System.IO;
-
 namespace Facebook.Yoga
 {
     public delegate int YogaLoggerDelegate(Config? config, Node? node, LogLevel level, string message);

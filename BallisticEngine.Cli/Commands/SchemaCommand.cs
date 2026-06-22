@@ -3,13 +3,6 @@ using BallisticEngine.Serialization;
 
 namespace BallisticEngine.Cli.Commands;
 
-// `bal schema` — emits the JSON component catalog: every component type an agent can put in a scene,
-// with its registry name (what goes in the .scene file), menu category, and editable members (name +
-// type + range/tooltip). This is the agent's "what can I author" reference, generated from reflection
-// so it's never out of date. Roadmap layer 1, verb 1.
-//
-// Categories: "component" (Behaviour — entity components), "scene" (SceneBehaviour — scene-wide),
-// "volume" (VolumeComponent — post-process overrides), "data" (DataAsset — .asset types).
 internal sealed class SchemaCommand : ICommand {
     public string Name => "schema";
     public string Summary => "Print the JSON catalog of all components and their members.";
@@ -29,8 +22,6 @@ internal sealed class SchemaCommand : ICommand {
             }
         }
 
-        // Discover every component type from the ENGINE assembly (no game scripts — schema is the
-        // engine catalog). GL-free: ComponentRegistry.Build only reflects, never touches OpenGL.
         ComponentRegistry.Build(typeof(SceneManager).Assembly);
 
         var components = new List<ComponentSchema>();
@@ -67,7 +58,6 @@ internal sealed class SchemaCommand : ICommand {
         var members = new List<MemberSchema>();
 
         if (category is "volume") {
-            // VolumeComponents expose VolumeParameter fields, not the usual serializable members.
             foreach (VolumeComponent.ParameterSlot slot in VolumeParameters(entry.Type))
                 members.Add(new MemberSchema(slot.Name, slot.Parameter.GetType().Name.Replace("Parameter", ""), null, null, null));
         }
@@ -90,15 +80,11 @@ internal sealed class SchemaCommand : ICommand {
             string.IsNullOrEmpty(entry.Menu) ? null : entry.Menu, members);
     }
 
-    // Builds a throwaway instance to read its parameter slots (VolumeComponent discovers them by
-    // reflection in its constructor). Every registered VolumeComponent has a public parameterless ctor.
     static IReadOnlyList<VolumeComponent.ParameterSlot> VolumeParameters(Type type) {
         var instance = (VolumeComponent)Activator.CreateInstance(type)!;
         return instance.Parameters;
     }
 
-    // A short, agent-friendly type label (the names agents write in YAML thinking): "Vector3",
-    // "float", "AssetRef:Texture2D" for asset members, "Enum:LightType" for enums.
     static string FriendlyType(Type t) {
         if (t == typeof(float)) return "float";
         if (t == typeof(int)) return "int";
@@ -117,7 +103,6 @@ internal sealed class SchemaCommand : ICommand {
         return args[++i];
     }
 
-    // ---- JSON shapes ----
     record SchemaResult(int count, List<ComponentSchema> components);
     record ComponentSchema(string name, string category, string? menu, List<MemberSchema> members);
     record MemberSchema(string name, string type, float? min, float? max, string? tooltip);

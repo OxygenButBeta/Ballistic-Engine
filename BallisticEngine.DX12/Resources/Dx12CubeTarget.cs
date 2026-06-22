@@ -3,15 +3,6 @@ using Vortice.DXGI;
 
 namespace BallisticEngine.DX12;
 
-// A render-target cubemap: an RGBA16F TextureCube with an RTV per (face, mip) and a shader-visible-ready
-// SRV, used to BAKE an environment (procedural sky) and to hold IBL convolution outputs (irradiance /
-// prefiltered specular). DX12's render-to-cube equivalent of the GL FBO-per-face bake. Renders via a
-// fullscreen triangle into one face at a time on the shared command list.
-//
-// The SRV is created in the persistent CPU SRV store (Dx12Backend.SrvStore) so the renderer copies it
-// into a shader-visible heap like any texture. Mips are allocated but only written if you render into
-// them (prefilter does; the env bake writes mip 0 then can GenerateMips-equivalent by rendering, or the
-// caller downsamples). For Phase-1 use we render mip 0 only.
 public sealed class Dx12CubeTarget : IDisposable {
     public const Format Fmt = Format.R16G16B16A16_Float;
     public int Resolution { get; }
@@ -19,7 +10,7 @@ public sealed class Dx12CubeTarget : IDisposable {
     public ID3D12Resource Resource { get; }
 
     readonly Dx12Device dev;
-    readonly ID3D12DescriptorHeap rtvHeap;   // 6*mips RTVs
+    readonly ID3D12DescriptorHeap rtvHeap;
     readonly uint rtvInc;
     int srvIndex = -1;
     ResourceStates state;
@@ -55,7 +46,6 @@ public sealed class Dx12CubeTarget : IDisposable {
             }
         }
 
-        // Persistent cube SRV (full mip chain).
         srvIndex = Dx12Backend.SrvStore.Allocate();
         var srvDesc = new ShaderResourceViewDescription {
             Format = Fmt,
@@ -71,9 +61,6 @@ public sealed class Dx12CubeTarget : IDisposable {
     CpuDescriptorHandle RtvHandle(int mip, int face) =>
         new(rtvHeap.GetCPUDescriptorHandleForHeapStart(), mip * 6 + face, rtvInc);
 
-    // Record a render into one (face, mip): transitions to RenderTarget, binds the face RTV + a viewport
-    // sized to that mip, runs `record`, leaves the cube in RenderTarget (call ToShaderResource after the
-    // last face). `record` issues the fullscreen-triangle draw.
     public void RenderFace(ID3D12GraphicsCommandList4 cl, int face, int mip,
         System.Action<ID3D12GraphicsCommandList4> record) {
         TransitionTo(cl, ResourceStates.RenderTarget);

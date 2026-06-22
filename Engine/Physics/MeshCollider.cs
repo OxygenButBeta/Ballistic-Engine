@@ -1,10 +1,6 @@
 
 namespace BallisticEngine;
 
-// Triangle-accurate collision from a mesh asset. STATIC ONLY: concave triangle soups cannot
-// ride on a Rigidbody (the body logs and ignores it). With no mesh assigned it falls back to
-// the entity's StaticMeshRenderer, including its SubMeshIndex — a split-by-nodes child entity
-// collides with just its own part, un-baking the node transform exactly like the renderer.
 [Component("Mesh Collider", "Physics")]
 public class MeshCollider : Collider {
     [Tooltip("Mesh to collide with. Empty = the entity's StaticMeshRenderer mesh.")]
@@ -29,9 +25,6 @@ public class MeshCollider : Collider {
         if (subMeshIndex < 0 || subMeshIndex >= mesh.SubMeshes.Length)
             return new MeshShape(mesh.Vertices, mesh.Indices, worldScale);
 
-        // One submesh: slice its index range and remap to a compact vertex array, applying the
-        // inverse node transform so the triangles live in entity-local space (the entity carries
-        // the node's pivot; the renderer un-bakes it the same way).
         SubMeshData subMesh = mesh.SubMeshes[subMeshIndex];
         Matrix4 inverseNode = mesh.InverseNodeTransforms[subMeshIndex];
 
@@ -52,15 +45,11 @@ public class MeshCollider : Collider {
         return new MeshShape(vertices.ToArray(), indices, worldScale);
     }
 
-    // ---- Selection gizmo: wireframe of the collision mesh ----------------------
-
-    // Huge meshes would drown the ImGui draw list, so triangles are strided to a budget —
-    // the wireframe thins out instead of disappearing or tanking the editor.
     const int MaxGizmoEdges = 4000;
 
     Mesh edgeCacheMesh;
     int edgeCacheSubMesh = -2;
-    Vector3[] edgeCache; // flat endpoint pairs: [a0, b0, a1, b1, ...]
+    Vector3[] edgeCache;
 
     public override void OnDrawGizmosSelected(IGizmos gizmos) {
         Mesh mesh = SharedMesh;
@@ -77,8 +66,6 @@ public class MeshCollider : Collider {
         if (edgeCache.Length == 0)
             return;
 
-        // Mirror the physics pose: position + rotation with the world scale baked into the
-        // local point (matches how the static body is built from this collider).
         Vector3 position = transform.WorldPosition;
         Quaternion rotation = transform.WorldRotation;
         Vector3 scale = transform.WorldMatrix.ExtractScale();

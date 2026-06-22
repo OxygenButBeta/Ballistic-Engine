@@ -1,30 +1,20 @@
 using Hexa.NET.ImGui;
 using SysVec2 = System.Numerics.Vector2;
-using SysVec4 = System.Numerics.Vector4;
 
 namespace BallisticEngine.Editor;
 
-// Statistics overlay pinned to the active view's top-right corner (toggled from the toolbar),
-// drawn over both the Scene and Game views. Submission counters and per-pass GPU times come
-// straight from the renderer via RenderStats (timestamp queries, a few frames of latency).
 internal sealed class StatsPanel {
-    // anchorMin/anchorSize = the view image's screen rect; topOffset leaves room for anything
-    // already living in that corner (the Scene view's orientation cube).
-    // Returns false when the user clicked the overlay's close button (the caller untoggles).
     public unsafe bool Draw(float fps, float editorCpuMs, SysVec2 viewSize, float scale,
-        SysVec2 anchorMin, SysVec2 anchorSize, float topOffset, RenderStats rs) {
+        SysVec2 anchorMin, SysVec2 anchorSize, float topOffset, RenderStats rs, bool showTiming) {
         ImGui.SetNextWindowPos(
             new SysVec2(anchorMin.X + anchorSize.X - 10 * scale, anchorMin.Y + topOffset),
-            ImGuiCond.Always, new SysVec2(1, 0));   // pivot top-right: grows leftward/downward
-        // Cap the window height to the space below the anchor so it can't spill past the bottom of the
-        // view (it was overflowing onto the asset browser). AlwaysAutoResize still auto-fits width and
-        // height UP TO this cap; past it, the inner content scrolls (see the BeginChild below).
+            ImGuiCond.Always, new SysVec2(1, 0));
         float maxH = Math.Max(140 * scale, viewSize.Y - topOffset - 12 * scale);
         ImGui.SetNextWindowSizeConstraints(new SysVec2(0, 0), new SysVec2(float.MaxValue, maxH));
         ImGui.SetNextWindowBgAlpha(0.88f);
         ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 8f);
         ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new SysVec2(12 * scale, 9 * scale));
-        ImGui.PushStyleColor(ImGuiCol.Border, new SysVec4(1, 1, 1, 0.07f));
+        ImGui.PushStyleColor(ImGuiCol.Border, EditorTheme.Hairline);
         const ImGuiWindowFlags flags = ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.NoMove |
             ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.AlwaysAutoResize |
             ImGuiWindowFlags.NoFocusOnAppearing | ImGuiWindowFlags.NoNav;
@@ -44,7 +34,6 @@ internal sealed class StatsPanel {
         foreach (IStaticMeshRenderer _ in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection)
             totalRenderers++;
 
-        // Title row: bold "Statistics" + a close button at the right edge (Unity-style).
         ImGui.GetWindowDrawList().AddText(ImGuiController.Bold, ImGui.GetFontSize(),
             ImGui.GetCursorScreenPos(), ImGui.GetColorU32(ImGuiCol.Text), "Statistics");
         ImGui.Dummy(new SysVec2(80 * scale, ImGui.GetTextLineHeight()));
@@ -55,19 +44,17 @@ internal sealed class StatsPanel {
             open = false;
         ImGui.PopStyleColor();
 
-        // The stats body in a height-capped, scrollable child so a long list (every GPU pass + scene
-        // counts) scrolls instead of pushing the window off the bottom of the view. Fixed height = the
-        // space below the title; if the content is shorter it just leaves a little room, if longer it
-        // scrolls. Width 0 = fill the auto-sized window.
         float bodyH = maxH - 38 * scale;
         ImGui.BeginChild("##statsbody", new SysVec2(300 * scale, bodyH), ImGuiChildFlags.None,
             ImGuiWindowFlags.NoBackground);
 
-        ImGui.SeparatorText("Timing");
-        Line("FPS", $"{fps:0}", scale);
-        Line("Frame", $"{(fps > 0 ? 1000f / fps : 0):0.00} ms", scale);
-        Line("Editor CPU", $"{editorCpuMs:0.00} ms", scale);
-        ImGui.SeparatorText("Rendering");
+        if (showTiming) {
+            EditorDecoration.DrawSectionHeader("Timing");
+            Line("FPS", $"{fps:0}", scale);
+            Line("Frame", $"{(fps > 0 ? 1000f / fps : 0):0.00} ms", scale);
+            Line("Editor CPU", $"{editorCpuMs:0.00} ms", scale);
+        }
+        EditorDecoration.DrawSectionHeader("Rendering");
         Line("Draw calls", rs.DrawCalls.ToString(), scale);
         Line("Depth draws", rs.DepthOnlyDrawCalls.ToString(), scale);
         if (rs.DrawsSavedByInstancing > 0)
@@ -78,34 +65,14 @@ internal sealed class StatsPanel {
             Line("Submeshes culled", rs.SubMeshesCulled.ToString(), scale);
         Line("View", $"{(int)viewSize.X} x {(int)viewSize.Y}", scale);
         if (rs.GpuPasses.Count > 0) {
-            ImGui.SeparatorText("GPU");
+            EditorDecoration.DrawSectionHeader("GPU");
             Line("GPU frame", $"{rs.GpuFrameMs:0.00} ms", scale);
             foreach ((string name, double ms) in rs.GpuPasses)
                 if (ms >= 0.005)
                     Line(name, $"{ms:0.00} ms", scale);
         }
 
-        // Global Illumination readout — "what is the data / how is it affecting the scene": which GI
-        // systems are live, their strengths, the probe grid + occupancy, and bake progress.
-        ImGui.SeparatorText("Global Illumination");
-        int pGx = ProbeRenderState.ProbeGridX, pGy = ProbeRenderState.ProbeGridY, pGz = ProbeRenderState.ProbeGridZ;
-        int pOcc = ProbeRenderState.ProbeOccupiedCount, pTot = ProbeRenderState.ProbeTotalCount;
-        Line("Light probes",
-            ProbeRenderState.ProbesEnabled ? $"on  x{ProbeRenderState.ProbeIntensity:0.0#}" : "OFF", scale);
-        if (pGx > 0)
-            Line("  probe grid", $"{pGx}x{pGy}x{pGz} = {pGx * pGy * pGz}", scale);
-        if (pTot > 0)
-            Line("  occupied / air", $"{pOcc} / {pTot - pOcc}", scale);
-        if (ProbeRenderState.IsBaking)
-            Line("  baking", $"{ProbeRenderState.BakeProgress * 100:0}%", scale);
-        Line("Reflection probes",
-            ProbeRenderState.ReflectionsEnabled ? $"on  x{ProbeRenderState.ReflectionIntensity:0.0#}" : "OFF", scale);
-        if (ProbeRenderState.ReflectionTotalCount > 0)
-            Line("  local / total", $"{ProbeRenderState.ReflectionCapturedCount} / {ProbeRenderState.ReflectionTotalCount}", scale);
-        Line("Lumen (SDF-GI)",
-            ProbeRenderState.LumenEnabled ? $"on  x{ProbeRenderState.LumenIntensity:0.0#}" : "OFF", scale);
-
-        ImGui.SeparatorText("Scene");
+        EditorDecoration.DrawSectionHeader("Scene");
         Line("Entities", scene.Entities.Count.ToString(), scale);
         Line("Scene components", scene.SceneBehaviours.Count.ToString(), scale);
         Line("Managed mem", $"{GC.GetTotalMemory(false) / (1024.0 * 1024.0):0.0} MB", scale);
@@ -117,7 +84,6 @@ internal sealed class StatsPanel {
         return open;
     }
 
-    // Right-aligned values in a fixed column read like a proper profiler readout.
     static void Line(string label, string value, float scale) {
         ImGui.TextDisabled(label);
         ImGui.SameLine(140 * scale);

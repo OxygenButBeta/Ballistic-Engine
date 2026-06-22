@@ -45,6 +45,15 @@ cbuffer FrameConstants : register(b1) {
     float4x4 Cascade0, Cascade1, Cascade2, Cascade3;
     float4   CascadeBias;
     float    CascadeCountF; float ShadowsEnabled; float ShadowMapTexel; float CascadeBlend;
+    // Shadows-volume tail — must match DX12HDRenderer.FrameConstants. Contact-shadow fields are present for
+    // layout parity but unused in the forward path (contact shadows are a deferred screen-space effect).
+    float    ShadowFiltering;     // 0 = hard, 1 = soft PCF, 2 = PCSS
+    float    ShadowSoftness;      // PCSS / PCF penumbra scale
+    float    ContactShadowsOn;
+    float    ContactShadowLength;
+    float    ContactShadowSteps;
+    float    ContactShadowThickness;
+    float    FramePad0, FramePad1;
 };
 
 struct VSInput {
@@ -123,24 +132,47 @@ float CascadeMatrixApply(int c, float3 worldPos, out float3 proj) {
     return max(abs(clip.x), abs(clip.y));           // edge for cascade-fit test
 }
 
-// 3×3 PCF sun shadow: first cascade the pixel falls in, manual compare against the R32 depth.
+// Volume-driven sun shadow (hard / soft PCF / PCSS), shared logic with the deferred path. First cascade the
+// pixel falls in, manual compare against the R32 depth. ShadowFiltering picks the filter; ShadowSoftness the
+// kernel width / penumbra scale.
+float ShadowTapHard(int c, float2 uv, float z, float bias) {
+    float d = ShadowCascades.SampleLevel(LinearClamp, float3(uv, (float)c), 0).r;
+    return (z - bias) <= d ? 1.0 : 0.0;
+}
+float ShadowPcf(int c, float2 base, float z, float bias, float radiusTexels) {
+    float lit = 0.0;
+    [unroll] for (int dy = -2; dy <= 2; dy++)
+    [unroll] for (int dx = -2; dx <= 2; dx++)
+        lit += ShadowTapHard(c, base + float2(dx, dy) * ShadowMapTexel * radiusTexels, z, bias);
+    return lit / 25.0;
+}
+float ShadowPcss(int c, float2 base, float z, float bias) {
+    float searchTexels = 2.0 + ShadowSoftness * 2.0;
+    float blockerSum = 0.0; float blockerCount = 0.0;
+    [unroll] for (int sy = -2; sy <= 2; sy++)
+    [unroll] for (int sx = -2; sx <= 2; sx++) {
+        float d = ShadowCascades.SampleLevel(LinearClamp, float3(base + float2(sx, sy) * ShadowMapTexel * searchTexels, (float)c), 0).r;
+        if (d < z - bias) { blockerSum += d; blockerCount += 1.0; }
+    }
+    if (blockerCount < 0.5) return 1.0;
+    float avgBlocker = blockerSum / blockerCount;
+    float penumbra = max(z - avgBlocker, 0.0) / max(avgBlocker, 1e-4);
+    float radiusTexels = clamp(penumbra * ShadowSoftness * 64.0, 0.75, 12.0);
+    return ShadowPcf(c, base, z, bias, radiusTexels);
+}
 float SunShadow(float3 N, float3 L, float3 worldPos) {
     if (ShadowsEnabled < 0.5) return 1.0;
     float ndl = saturate(dot(N, L));
     int count = (int)CascadeCountF;
+    int mode = (int)(ShadowFiltering + 0.5);
     for (int c = 0; c < count; c++) {
         float3 proj;
         float edge = CascadeMatrixApply(c, worldPos, proj);
         if (edge > 1.0 || proj.z > 1.0 || proj.z < 0.0) continue;
         float bias = max(CascadeBias[c] * (1.0 - ndl), CascadeBias[c] * 0.1);
-        float lit = 0.0;
-        [unroll] for (int dy = -1; dy <= 1; dy++)
-        [unroll] for (int dx = -1; dx <= 1; dx++) {
-            float2 uv = proj.xy + float2(dx, dy) * ShadowMapTexel;
-            float d = ShadowCascades.SampleLevel(LinearClamp, float3(uv, (float)c), 0).r;
-            lit += (proj.z - bias) <= d ? 1.0 : 0.0;
-        }
-        return lit / 9.0;
+        if (mode == 0) return ShadowTapHard(c, proj.xy, proj.z, bias);
+        if (mode == 2) return ShadowPcss(c, proj.xy, proj.z, bias);
+        return ShadowPcf(c, proj.xy, proj.z, bias, clamp(ShadowSoftness * 0.75, 0.5, 4.0));
     }
     return 1.0;   // beyond all cascades: lit
 }
@@ -188,8 +220,10 @@ float4 PSMain(VSOutput i) : SV_Target {
         // so multiply by albedo*kD directly (no /PI here).
         float3 Famb = FresnelSchlickRoughness(NdotVamb, F0, roughness);
         float3 kD = (1.0 - Famb) * (1.0 - metallic);
-        float3 irradiance = IrradianceMap.SampleLevel(LinearClamp, N, 0).rgb;
-        float3 ambientDiffuse = kD * irradiance * albedo * ao;
+        // Diffuse sky-IBL DISABLED (parity with the deferred path): the env-irradiance cube has no sky-visibility
+        // term, so a closed interior wrongly ate the procedural sky's full ambient — and the Skybox path never
+        // baked IBL at all. Diffuse indirect now comes from Lumen GI alone (TLAS-occluded). Specular IBL stays.
+        float3 ambientDiffuse = 0.0.xxx;
         // Specular: prefiltered env (roughness→mip) × split-sum BRDF (scale,bias) on F0.
         float3 R = reflect(-V, N);
         float mip = clamp(roughness * PrefilterMaxMip, 0.0, PrefilterMaxMip);

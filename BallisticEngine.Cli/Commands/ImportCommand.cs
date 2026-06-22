@@ -2,12 +2,6 @@ using BallisticEngine.AssetPipeline;
 
 namespace BallisticEngine.Cli.Commands;
 
-// `bal import <project>` — headless, idempotent asset import: the engine's own Refresh pipeline
-// without an editor or window. Walks Assets\, mints .meta sidecars for new files, (re)imports
-// sources whose content/settings/importer version changed, writes Library artifacts. A second run
-// with no changes reports everything up-to-date and is near-instant — agents run this after adding
-// files externally, before loading scenes. Exit 0 = clean (even if nothing to do); exit 1 = any
-// asset FAILED to import (each failure is logged with its path on stderr).
 internal sealed class ImportCommand : ICommand {
     public string Name => "import";
     public string Summary => "Import a project's assets headlessly (idempotent).";
@@ -33,11 +27,8 @@ internal sealed class ImportCommand : ICommand {
         }
         if (pathArg is null) throw new CliUsageException("expected a project path");
 
-        // Accept the project root or any path inside it (a scene path, Assets\, ...).
         string root = SceneFile.ResolveProjectRoot(pathArg);
 
-        // Mirror engine logs to stderr so import failures are visible (stdout stays JSON-clean).
-        // Warnings/errors always; info only when not --quiet.
         Debugging.OnMessage += (message, level) => {
             if (level > 0 || !quiet) Console.Error.WriteLine(message);
         };

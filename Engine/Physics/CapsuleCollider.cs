@@ -1,8 +1,6 @@
 
 namespace BallisticEngine;
 
-// Capsule along the entity's local Y axis (character-shaped). Height is the TOTAL height
-// including both hemispherical caps, Unity-style; it clamps to at least 2 * Radius.
 [Component("Capsule Collider", "Physics")]
 public class CapsuleCollider : Collider {
     [Range(0.001f, 100f)]

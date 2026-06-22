@@ -13,8 +13,6 @@ public abstract class RenderAsset
 
     public abstract GPUBuffer<Vector4> CreateTangentBuffer(RenderContext renderContext);
 
-    // Skinning vertex attributes (location 8 = bone indices, 9 = weights); only skinned meshes
-    // create them. Both are Vector4 float buffers (indices are rounded to ints in the shader).
     public abstract GPUBuffer<Vector4> CreateBoneIndexBuffer(RenderContext renderContext);
     public abstract GPUBuffer<Vector4> CreateBoneWeightBuffer(RenderContext renderContext);
 
@@ -24,8 +22,5 @@ public abstract class RenderAsset
     public abstract Texture3D CreateCubemap(TextureData[] faces);
     public abstract GPUBuffer<Vector2> CreateVertexBuffer2(RenderContext renderContext);
 
-    // Backend-created shader program. The factory lives here (not hardcoded in GraphicAPI) so the
-    // active backend decides the concrete type — GL builds a GLSL program, a DX12 backend would build
-    // an HLSL one — exactly like the buffer/texture factories above.
-    public abstract StandardShader CreateStandardShader(string vertexCode, string fragmentCode);
+    public abstract StandardShader CreateStandardShader(string vertexCode, string fragmentCode, string identityExtra = null);
 }

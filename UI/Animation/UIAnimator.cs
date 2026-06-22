@@ -1,26 +1,14 @@
-using System;
-using System.Collections.Generic;
-
 namespace BallisticEngine.UI;
 
-// A small per-document tween engine. The UIDocument ticks it each frame; ported controllers drive it
-// to animate selection slides, color fades, blood-seep fills, pulses — the "feel" of the menu. It is
-// API-driven (not a USS `transition` parser) because the port's interaction logic already lives in a
-// C# controller, so animating from there is natural and matches the JS→C# model.
-//
-// Two animation kinds:
-//  * Tween — eases a float from its current value to a target over a duration. Re-targeting the same
-//    (owner, channel) key retargets the existing tween (so flipping selection mid-slide is smooth).
-//  * Loop — a continuous 0..1 phase (sine/linear) for pulses and ambient motion; runs until removed.
 public sealed class UIAnimator
 {
     public sealed class Tween
     {
-        public object Owner;            // identity for retargeting (usually the VisualElement)
-        public string Channel;          // which property, for retargeting ("tx", "opacity", ...)
+        public object Owner;
+        public string Channel;
         public float From, To, Elapsed, Duration;
         public Easing Ease;
-        public Action<float> Apply;     // writes the eased value somewhere (e.g. el.Style.TranslateX)
+        public Action<float> Apply;
         public bool Done => Elapsed >= Duration;
     }
 
@@ -28,24 +16,21 @@ public sealed class UIAnimator
     {
         public object Owner;
         public string Channel;
-        public float Period;            // seconds per cycle
-        public float Phase;             // current 0..1
-        public bool PingPong;           // true = 0→1→0 (pulse); false = 0→1 sawtooth
-        public Action<float> Apply;     // receives the 0..1 (ping-ponged) value each frame
+        public float Period;
+        public float Phase;
+        public bool PingPong;
+        public Action<float> Apply;
     }
 
     readonly List<Tween> _tweens = new();
     readonly List<Loop> _loops = new();
 
-    // Starts (or retargets) a tween on (owner, channel). `current` is the starting value (usually the
-    // property's present value); `to` the target. Re-calling with the same key smoothly retargets.
     public void TweenTo(object owner, string channel, float current, float to, float duration,
         Action<float> apply, Easing ease = Easing.EaseOut)
     {
         var existing = _tweens.Find(t => ReferenceEquals(t.Owner, owner) && t.Channel == channel);
         if (existing != null)
         {
-            // Retarget from wherever we are now, keeping motion continuous.
             existing.From = Sample(existing);
             existing.To = to;
             existing.Elapsed = 0f;
@@ -71,8 +56,6 @@ public sealed class UIAnimator
     public void StopLoops(object owner) => _loops.RemoveAll(l => ReferenceEquals(l.Owner, owner));
     public void Clear() { _tweens.Clear(); _loops.Clear(); }
 
-    // Advances every active animation by dt seconds and applies the results. Finished tweens snap to
-    // their target and are removed.
     public void Tick(float dt)
     {
         for (int i = _tweens.Count - 1; i >= 0; i--)
@@ -87,8 +70,8 @@ public sealed class UIAnimator
         foreach (var l in _loops)
         {
             l.Phase += dt / l.Period;
-            l.Phase -= MathF.Floor(l.Phase); // wrap 0..1
-            float v = l.PingPong ? 1f - MathF.Abs(l.Phase * 2f - 1f) : l.Phase; // triangle vs sawtooth
+            l.Phase -= MathF.Floor(l.Phase);
+            float v = l.PingPong ? 1f - MathF.Abs(l.Phase * 2f - 1f) : l.Phase;
             l.Apply?.Invoke(v);
         }
     }

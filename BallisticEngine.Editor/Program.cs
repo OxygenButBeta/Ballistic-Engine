@@ -7,21 +7,16 @@ internal class Program {
             ? Path.GetFullPath(args[0])
             : DefaultProjectPath();
 
-        // Load persisted editor settings before the UI/theme is built so the saved accent applies.
         EditorPrefs.Load();
 
         BallisticEngine.Profiling.TracyProfiler.TryInstall("Ballistic Editor");
 
-        // DX12-only host (GL deleted — DX12Migration.md ENDGAME 3): the windowed DX12 host (swapchain +
-        // ImGui DX12 backend) is GameWindow + IBallisticEngineRuntime + IWindow.
         OpenTK.Windowing.Desktop.GameWindow window = new Dx12BallisticEngineWindow(1600, 900);
         _ = new EditorApplication(window, projectPath);
         try {
             window.Run();
         }
         catch (Exception ex) {
-            // On a DX12 device-removal, surface the real cause (debug-layer messages + removed reason) instead
-            // of the opaque HRESULT, so a GPU fault is diagnosable without a driver reset (run BALLISTIC_DX12_DEBUG=1).
             Console.Error.WriteLine("[DX12] FATAL: " + ex);
             try {
                 BallisticEngine.DX12.Dx12Device d = BallisticEngine.DX12.Dx12Backend.Device;
@@ -31,18 +26,16 @@ internal class Program {
                     Console.Error.WriteLine("[DX12] DebugMessages:\n" + d.DrainDebugMessages());
                 }
             }
-            catch { /* best-effort diagnostics */ }
+            catch {
+            }
             throw;
         }
 
-        // JobSystem workers are foreground threads; without this the process never exits.
         JobSystem.Shutdown();
 
-        // Close the OpenAL device/context cleanly on shutdown.
         Audio.Shutdown();
     }
 
-    // BallisticEngine.Editor\bin\Debug\net9.0 -> repo root -> SampleProject
     static string DefaultProjectPath() =>
         Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "SampleProject"));
 }

@@ -1,17 +1,6 @@
 
 namespace BallisticEngine;
 
-// A simple animation STATE MACHINE on top of Animator/CrossFade (Unity's AnimatorController, trimmed
-// to the essentials). Instead of a script hand-calling Play/CrossFade, you declare named STATES (each
-// wrapping a clip) and TRANSITIONS between them gated on PARAMETERS (bool / trigger / float / int).
-// Gameplay code just pokes parameters — SetBool("Walking", true), SetTrigger("Jump") — and the graph
-// crossfades to the matching state automatically. This is the layer that makes skeletal animation
-// gameplay-usable: an idle/walk/run/jump graph instead of manual clip juggling.
-//
-// Requires an Animator on the same entity (it drives the actual sampling/skinning via CrossFade).
-// Runtime/script-driven graph in v1 (states & transitions are built by script in OnBegin, like the
-// programmatic half of Unity's API) — the scene serializer doesn't round-trip the nested lists yet;
-// the editor exposes a live view + parameter pokers so you can drive and watch the graph without code.
 [Component("Animator Controller", "Animation")]
 public sealed class AnimatorController : Behaviour {
     [Tooltip("Default crossfade time (seconds) for transitions that don't override it.")]
@@ -21,13 +10,9 @@ public sealed class AnimatorController : Behaviour {
     [Tooltip("Start playing the entry state automatically when the scene begins.")]
     public bool PlayOnAwake { get; set; } = true;
 
-    // ---- Parameter kinds -----------------------------------------------------
-
     public enum ParamKind { Bool, Trigger, Float, Int }
 
     public enum Compare { Greater, Less, Equals, NotEquals, True, False, IfTrigger }
-
-    // ---- States --------------------------------------------------------------
 
     public sealed class State {
         public string Name;
@@ -38,8 +23,6 @@ public sealed class AnimatorController : Behaviour {
 
         public State(string name, AnimationClip clip) { Name = name; Clip = clip; }
 
-        // Adds an outgoing transition from this state to `target` when `condition` holds. Returns the
-        // transition so AddCondition can chain more conditions (all must hold — AND).
         public Transition To(State target, string parameter, Compare compare, float threshold = 0f, float duration = -1f) {
             var t = new Transition(target, duration);
             t.AddCondition(parameter, compare, threshold);
@@ -47,8 +30,6 @@ public sealed class AnimatorController : Behaviour {
             return t;
         }
 
-        // A transition that fires purely on the clip ending (no parameter) — for one-shots like Jump
-        // that fall back to a loop state. Only meaningful for non-looping states.
         public Transition OnFinished(State target, float duration = -1f) {
             var t = new Transition(target, duration) { OnClipEnd = true };
             transitions.Add(t);
@@ -64,8 +45,8 @@ public sealed class AnimatorController : Behaviour {
 
     public sealed class Transition {
         public State Target;
-        public float Duration; // -1 = use controller default
-        public bool OnClipEnd;  // fire when the source clip finishes (one-shots)
+        public float Duration;
+        public bool OnClipEnd;
         public readonly List<Condition> Conditions = new();
 
         public Transition(State target, float duration) { Target = target; Duration = duration; }
@@ -76,10 +57,8 @@ public sealed class AnimatorController : Behaviour {
         }
     }
 
-    // ---- Graph storage -------------------------------------------------------
-
     readonly List<State> states = new();
-    readonly Dictionary<string, float> floats = new();   // also holds bool (0/1) and int (rounded)
+    readonly Dictionary<string, float> floats = new();
     readonly Dictionary<string, ParamKind> paramKinds = new();
     readonly HashSet<string> triggers = new();
 
@@ -93,9 +72,6 @@ public sealed class AnimatorController : Behaviour {
     public int StateCount => states.Count;
     public IReadOnlyList<State> States => states;
 
-    // ---- Graph construction (script-facing, called in OnBegin) ----------------
-
-    // Adds a state. The FIRST state added becomes the entry state unless SetEntry overrides it.
     public State AddState(string name, AnimationClip clip, bool loop = true, float speed = 1f) {
         var s = new State(name, clip) { Loop = loop, Speed = speed };
         states.Add(s);
@@ -111,8 +87,6 @@ public sealed class AnimatorController : Behaviour {
         return null;
     }
 
-    // ---- Parameters (Unity's AnimatorController.SetBool/SetFloat/...) ---------
-
     public void SetBool(string name, bool value) { floats[name] = value ? 1f : 0f; paramKinds[name] = ParamKind.Bool; }
     public void SetFloat(string name, float value) { floats[name] = value; paramKinds[name] = ParamKind.Float; }
     public void SetInt(string name, int value) { floats[name] = value; paramKinds[name] = ParamKind.Int; }
@@ -124,17 +98,12 @@ public sealed class AnimatorController : Behaviour {
     public int GetInt(string name) => floats.TryGetValue(name, out float v) ? (int)MathF.Round(v) : 0;
     public bool GetTrigger(string name) => triggers.Contains(name);
 
-    // Editor-facing: the declared parameters (name + kind) so the inspector can render the right poker.
     public IReadOnlyDictionary<string, ParamKind> Parameters => paramKinds;
 
-    // Declares a parameter up front (so the editor shows a poker even before it's been set). Optional —
-    // Set* also auto-declares.
     public void DeclareParameter(string name, ParamKind kind) {
         paramKinds[name] = kind;
         if (kind != ParamKind.Trigger && !floats.ContainsKey(name)) floats[name] = 0f;
     }
-
-    // ---- Lifecycle -----------------------------------------------------------
 
     protected internal override void OnBegin() {
         animator = GetComponent<Animator>();
@@ -142,7 +111,6 @@ public sealed class AnimatorController : Behaviour {
             EnterState(entryState, instant: true);
     }
 
-    // Switches the active state and tells the Animator to (cross)fade to its clip.
     public void Play(string stateName, float duration = -1f) {
         State s = FindState(stateName);
         if (s is not null) EnterState(s, instant: duration == 0f, durationOverride: duration);
@@ -171,7 +139,6 @@ public sealed class AnimatorController : Behaviour {
             return;
         }
 
-        // Evaluate this state's outgoing transitions in declared order; first satisfied one wins.
         foreach (Transition t in currentState.transitions) {
             if (Satisfied(t)) {
                 ConsumeTriggers(t);
@@ -183,14 +150,12 @@ public sealed class AnimatorController : Behaviour {
 
     bool Satisfied(Transition t) {
         if (t.OnClipEnd) {
-            // Fire when the (non-looping) clip has reached its end.
             if (animator is null || currentState?.Clip is null) return false;
-            if (currentState.Loop) return false; // a looping clip never "finishes"
+            if (currentState.Loop) return false;
             if (animator.Time < currentState.Clip.DurationSeconds) return false;
-            // OnClipEnd may also carry parameter conditions — they must hold too.
         }
         else if (t.Conditions.Count == 0) {
-            return false; // a non-OnClipEnd transition with no conditions never fires (avoids instant loops)
+            return false;
         }
 
         foreach (Condition c in t.Conditions)
@@ -211,7 +176,6 @@ public sealed class AnimatorController : Behaviour {
         }
     }
 
-    // A trigger is one-shot: consumed when a transition that tests it fires.
     void ConsumeTriggers(Transition t) {
         foreach (Condition c in t.Conditions)
             if (c.Compare == Compare.IfTrigger)

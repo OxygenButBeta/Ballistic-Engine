@@ -2,9 +2,6 @@ using System.Runtime.CompilerServices;
 
 namespace BallisticEngine;
 
-// Engine-wide profiling facade. Engine layers only ever talk to this BCL-only static class;
-// a host exe may install a backend (Tracy) at startup. With no backend installed every call
-// is a near-zero no-op, so instrumentation can stay in shipping code paths.
 public interface IProfilerBackend {
     ulong ZoneBegin(string name, uint color, uint line, string file, string member);
     void ZoneEnd(ulong handle);
@@ -16,7 +13,6 @@ public interface IProfilerBackend {
 public static class Profiler {
     public static IProfilerBackend Backend;
 
-    // Time a scope: using (Profiler.Zone("Name")) { ... } or `using var _ = Profiler.Zone("Name");`
     public static ProfileZone Zone(
         string name = null,
         uint color = 0,

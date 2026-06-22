@@ -1,13 +1,22 @@
 ﻿namespace BallisticEngine;
 
-public abstract class StandardShader(string vertexCode, string fragmentCode) : Shader {
-    public override ResourceIdentity Identity { get; } = ResourceIdentity.Combine(vertexCode, fragmentCode);
+public abstract class StandardShader(string vertexCode, string fragmentCode, string identityExtra = null) : Shader {
+    public override ResourceIdentity Identity { get; } = identityExtra is null
+        ? ResourceIdentity.Combine(vertexCode, fragmentCode)
+        : ResourceIdentity.Combine(vertexCode, fragmentCode, identityExtra);
 
-    // Retained so the renderer can derive depth-only companions (z-prepass) that rasterize
-    // with this shader's exact vertex math, AND GPU-driven companions (MDI + bindless) that
-    // reuse the exact same shading math with the data source swapped to SSBOs.
     public string VertexCode { get; } = vertexCode;
     public string FragmentCode { get; } = fragmentCode;
+
+    ShaderProperties properties = StandardShaderProperties.Build();
+    public override ShaderProperties Properties => properties;
+    public void SetProperties(ShaderProperties value) => properties = value ?? StandardShaderProperties.Build();
+
+    public string SurfaceSource { get; set; }
+    public string SurfaceKey { get; set; }
+
+    public string SurfaceSourcePath { get; set; }
+    public bool HasCustomSurface => SurfaceSource is not null;
 
     protected abstract void Compile(string vertexCode, string fragmentCode);
 }

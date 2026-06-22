@@ -3,17 +3,6 @@ using System.Text;
 
 namespace BallisticEngine;
 
-// A color-over-parameter gradient (Unity's Gradient — named ColorGradient here because the game-UI
-// system already owns a CSS-style `BallisticEngine.UI.Gradient`). The sibling of [[AnimationCurve]]:
-// where a curve is one scalar over time, this is an RGBA color over a normalized parameter (0..1). RGB
-// and ALPHA keys are independent lists (Unity's layout) so you can fade alpha without re-placing color
-// stops. Any system that needs "a color that changes over a parameter" uses one — particle color over
-// lifetime, health-bar tint, sky tint over time-of-day, heatmaps.
-//
-// Like AnimationCurve it's a reference type the editor mutates in place, it serializes as a single
-// COMPACT STRING scalar (sidesteps the nested-list serializer), and the reflection inspector draws an
-// interactive gradient bar for ANY ColorGradient member with zero per-component wiring. Evaluation is a
-// linear blend between adjacent keys (Unity's "Blend" mode; per-key "Fixed" stepping is a follow-up).
 public sealed class ColorGradient {
     public struct ColorKey {
         public float Time;
@@ -35,20 +24,16 @@ public sealed class ColorGradient {
     public int ColorKeyCount => colorKeys.Count;
     public int AlphaKeyCount => alphaKeys.Count;
 
-    // A gradient with no keys at all is treated as "unauthored" by adopters (use their own color).
     public bool IsEmpty => colorKeys.Count == 0 && alphaKeys.Count == 0;
 
     public ColorGradient() { }
 
-    // Convenience: a two-stop RGB gradient (alpha solid). The common particle case.
     public ColorGradient(Vector3 start, Vector3 end) {
         AddColorKey(0f, start);
         AddColorKey(1f, end);
         AddAlphaKey(0f, 1f);
         AddAlphaKey(1f, 1f);
     }
-
-    // ---- Editing -------------------------------------------------------------
 
     public int AddColorKey(float time, Vector3 color) {
         var k = new ColorKey(Math.Clamp(time, 0f, 1f), color);
@@ -83,9 +68,6 @@ public sealed class ColorGradient {
 
     public void Clear() { colorKeys.Clear(); alphaKeys.Clear(); }
 
-    // ---- Evaluation ----------------------------------------------------------
-
-    // RGB at t (clamped 0..1, linear blend between adjacent color keys). White if no color keys.
     public Vector3 EvaluateColor(float t) {
         int n = colorKeys.Count;
         if (n == 0) return Vector3.One;
@@ -100,7 +82,6 @@ public sealed class ColorGradient {
         return Vector3.Lerp(a.Color, b.Color, f);
     }
 
-    // Alpha at t (clamped 0..1, linear blend). 1 if no alpha keys.
     public float EvaluateAlpha(float t) {
         int n = alphaKeys.Count;
         if (n == 0) return 1f;
@@ -115,7 +96,6 @@ public sealed class ColorGradient {
         return a.Alpha + (b.Alpha - a.Alpha) * f;
     }
 
-    // RGBA at t.
     public Vector4 Evaluate(float t) {
         Vector3 rgb = EvaluateColor(t);
         return new Vector4(rgb, EvaluateAlpha(t));
@@ -133,16 +113,14 @@ public sealed class ColorGradient {
         return lo;
     }
 
-    // ---- Presets -------------------------------------------------------------
-
     public static ColorGradient Fire() {
         var g = new ColorGradient();
-        g.AddColorKey(0f, new Vector3(1f, 0.95f, 0.6f));   // hot core (white-yellow)
-        g.AddColorKey(0.4f, new Vector3(1f, 0.45f, 0.1f)); // orange
-        g.AddColorKey(1f, new Vector3(0.3f, 0.05f, 0.02f)); // dark smoke-red
+        g.AddColorKey(0f, new Vector3(1f, 0.95f, 0.6f));
+        g.AddColorKey(0.4f, new Vector3(1f, 0.45f, 0.1f));
+        g.AddColorKey(1f, new Vector3(0.3f, 0.05f, 0.02f));
         g.AddAlphaKey(0f, 1f);
         g.AddAlphaKey(0.8f, 1f);
-        g.AddAlphaKey(1f, 0f);                              // fade out
+        g.AddAlphaKey(1f, 0f);
         return g;
     }
 
@@ -154,9 +132,6 @@ public sealed class ColorGradient {
         g.AddAlphaKey(1f, 0f);
         return g;
     }
-
-    // ---- Compact string serialization (one scalar) ----------------------------
-    // Format: "c:t,r,g,b;t,r,g,b|a:t,a;t,a"  (color keys block | alpha keys block).
 
     public string ToCompactString() {
         var sb = new StringBuilder();

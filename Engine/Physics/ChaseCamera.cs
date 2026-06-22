@@ -1,24 +1,6 @@
 
 namespace BallisticEngine;
 
-// An arcade chase camera (GTA / Need-for-Speed / Unreal vehicle template): rides behind and above a
-// target vehicle, smoothly following its position and HEADING, looking slightly ahead of it. Put it on
-// the camera entity (next to the HDCamera). By default it auto-targets the scene's VehicleController, so
-// the demo needs zero wiring; set TargetName to follow a specific entity instead.
-//
-// It runs in Tick (the render frame), NOT FixedTick, so the follow is as smooth as the framerate —
-// physics steps at 60 Hz but the camera glides between them. All smoothing is exponential damping
-// (framerate-correct: the same value feels identical at 60 fps or 240 fps), so there's no stutter and
-// no overshoot. The camera writes its own transform; it must NOT be a child of the car.
-//
-// Design choices that make it feel good:
-//   * "Behind" follows the car's HEADING (its facing), not its velocity, so the camera never whips around
-//     when the velocity briefly reverses (drift, reverse, a kerb hit). It settles squarely behind the nose.
-//   * LOOK-AHEAD aims the camera a little ahead in the travel direction and into the steer, so you see
-//     where you're going — especially into a corner — instead of staring at the boot.
-//   * SPEED PULLBACK eases the camera back and the aim further ahead as you go faster (a sense of speed
-//     without a settable FOV, which the renderer camera doesn't expose).
-//   * Position and look are damped SEPARATELY (the look a touch snappier) so the car stays framed.
 [Component("Chase Camera", "Physics")]
 public class ChaseCamera : Behaviour {
     [Header("Target")]
@@ -78,12 +60,12 @@ public class ChaseCamera : Behaviour {
     [Range(1f, 120f)]
     public float ReferenceSpeed { get; set; } = 38f;
 
-    Transform target;            // the vehicle's transform
-    Rigidbody targetBody;        // for speed-based effects (optional)
-    VehicleController targetCar; // for the steer lead (optional)
-    Vector3 smoothedPosition;    // exponentially-damped camera position
-    Vector3 smoothedLookAt;      // exponentially-damped look target
-    float followYaw;             // the camera's TRAILING heading (radians), eased toward the car's heading
+    Transform target;
+    Rigidbody targetBody;
+    VehicleController targetCar;
+    Vector3 smoothedPosition;
+    Vector3 smoothedLookAt;
+    float followYaw;
     bool initialised;
 
     protected internal override void OnAttach() => ResolveTarget();
@@ -105,7 +87,7 @@ public class ChaseCamera : Behaviour {
             targetBody = vc.Entity.GetComponent<Rigidbody>();
             targetCar = vc;
         }
-        initialised = false; // snap to the new target on the next Tick instead of sweeping across the map
+        initialised = false;
     }
 
     protected internal override void Tick(in float delta) {
@@ -119,25 +101,19 @@ public class ChaseCamera : Behaviour {
 
         Vector3 targetPos = target.WorldPosition;
         Vector3 fwd = target.Forward;
-        // The car's heading yaw (flattened to the ground so the camera doesn't dip over bumps).
         Vector3 flatFwd = new Vector3(fwd.X, 0f, fwd.Z);
         flatFwd = flatFwd.LengthSquared() > 1e-6f ? flatFwd.Normalized() : Vector3.UnitZ;
         float carYaw = MathF.Atan2(flatFwd.X, flatFwd.Z);
 
-        // TRAILING follow-yaw: the camera's own heading eases toward the car's, so the camera SWINGS
-        // around behind the car instead of rigidly snapping behind it. This is the fix for "the camera
-        // turns weirdly" — a sharp turn now shows the car from the side for a beat, then the camera eases
-        // in behind. Eased on the shortest arc (LerpAngle in degrees) so it never spins the long way.
         if (!initialised) {
             followYaw = carYaw;
         } else {
             float t = 1f - MathF.Exp(-OrbitSmooth * delta);
             followYaw = Mathf.LerpAngle(followYaw * Mathf.Rad2Deg, carYaw * Mathf.Rad2Deg, t) * Mathf.Deg2Rad;
         }
-        Vector3 camFwd = new Vector3(MathF.Sin(followYaw), 0f, MathF.Cos(followYaw)); // trailing heading
+        Vector3 camFwd = new Vector3(MathF.Sin(followYaw), 0f, MathF.Cos(followYaw));
         Vector3 flatBack = -camFwd;
 
-        // Speed-driven framing: pull back and lead the aim further the faster the car is going.
         float speedFraction = 0f;
         if (targetBody is not null && ReferenceSpeed > 0f) {
             var v = targetBody.Velocity;
@@ -147,9 +123,6 @@ public class ChaseCamera : Behaviour {
         float pullback = SpeedPullback * speedFraction;
         float lookAhead = LookAhead + SpeedLookAhead * speedFraction;
 
-        // Steer lead: bias the aim toward the inside of the turn so corners open up on-screen. SCALED BY
-        // SPEED so it's gone at a crawl — at low speed a sharp A/D shouldn't whip the camera sideways
-        // (the user's "düşük hızda keskin dönüş mantıksız"); it only leads once you're actually moving.
         Vector3 steerLead = Vector3.Zero;
         if (targetCar is not null && SteerLookAhead > 0f && targetCar.MaxSteerAngle > 0f && speedFraction > 0.01f) {
             Vector3 right = target.Right;
@@ -161,7 +134,6 @@ public class ChaseCamera : Behaviour {
             }
         }
 
-        // The aim leads along the camera's trailing heading too (so it doesn't jump when the car flicks).
         Vector3 aimFwd = camFwd;
         Vector3 desiredPos = targetPos + flatBack * (Distance + pullback) + Vector3.UnitY * Height;
         Vector3 desiredLook = targetPos + aimFwd * lookAhead + steerLead + Vector3.UnitY * LookHeight;
@@ -171,7 +143,6 @@ public class ChaseCamera : Behaviour {
             smoothedLookAt = desiredLook;
             initialised = true;
         } else {
-            // Exponential damping: t = 1 - exp(-k*dt) is framerate-correct (same feel at any fps).
             float posT = 1f - MathF.Exp(-PositionSmooth * delta);
             float rotT = 1f - MathF.Exp(-RotationSmooth * delta);
             smoothedPosition = Vector3.Lerp(smoothedPosition, desiredPos, posT);
@@ -182,9 +153,6 @@ public class ChaseCamera : Behaviour {
         transform.WorldRotation = LookRotation(smoothedLookAt - smoothedPosition, Vector3.UnitY);
     }
 
-    // A rotation whose +Z (Transform.Forward) points along `forward` and whose +Y leans toward `up`.
-    // Built from an orthonormal basis directly — Matrix4.LookAt uses OpenGL's look-down-(-Z) view
-    // convention and would invert the engine's +Z-forward, so it can't be used here.
     static Quaternion LookRotation(Vector3 forward, Vector3 up) {
         if (forward.LengthSquared() < 1e-12f)
             return Quaternion.Identity;
@@ -196,8 +164,6 @@ public class ChaseCamera : Behaviour {
         Vector3 right = Vector3.Cross(up, forward).Normalized();
         Vector3 trueUp = Vector3.Cross(forward, right);
 
-        // Row-vector (OpenTK) convention: the rotation mapping UnitX->right, UnitY->trueUp,
-        // UnitZ->forward has those vectors as its ROWS.
         var m = new Matrix4(
             right.X, right.Y, right.Z, 0,
             trueUp.X, trueUp.Y, trueUp.Z, 0,

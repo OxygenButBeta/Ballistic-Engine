@@ -2,11 +2,10 @@ using System.Reflection;
 
 namespace BallisticEngine.Serialization;
 
-// Shared rule for "which members of a component are user-editable state": public read/write
-// properties and public mutable fields, excluding framework plumbing declared on the base
-// classes. Used by both the scene serializer and the editor inspector so they agree.
 public static class ComponentReflection {
     const BindingFlags Flags = BindingFlags.Public | BindingFlags.Instance;
+
+    const BindingFlags FieldFlags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
 
     static bool IsFrameworkType(Type declaringType) =>
         declaringType == typeof(BObject) ||
@@ -23,23 +22,18 @@ public static class ComponentReflection {
                 prop.GetCustomAttribute<NotSerializedAttribute>() is null)
                 yield return prop;
         }
-        foreach (FieldInfo field in type.GetFields(Flags)) {
+        foreach (FieldInfo field in type.GetFields(FieldFlags)) {
             if (field.IsLiteral || IsFrameworkType(field.DeclaringType) ||
                 field.GetCustomAttribute<NotSerializedAttribute>() is not null)
                 continue;
-            // `readonly` fields are normally skipped (their value can't change), EXCEPT BEvents: they're
-            // declared `public readonly BEvent OnX = new();` and populated IN PLACE (listeners added to
-            // the existing instance, never reassigned), so they must still serialize + show in the
-            // inspector. Without this carve-out a readonly BEvent field is invisible.
+            if (!field.IsPublic && field.GetCustomAttribute<SerializeFieldAttribute>() is null)
+                continue;
             if (field.IsInitOnly && !typeof(BEvent).IsAssignableFrom(field.FieldType))
                 continue;
             yield return field;
         }
     }
 
-    // The members the editor inspector should show: the serializable set minus anything marked
-    // [HideInInspector]. Kept SEPARATE from SerializableMembers on purpose — hiding a member from
-    // the inspector must not drop it from save/load.
     public static IEnumerable<MemberInfo> InspectorMembers(Type type) {
         foreach (MemberInfo member in SerializableMembers(type)) {
             if (member.GetCustomAttribute<HideInInspectorAttribute>() is null)
@@ -47,8 +41,6 @@ public static class ComponentReflection {
         }
     }
 
-    // Parameterless methods marked [Button]: the inspector renders each as a clickable button
-    // that invokes the method on the component (bake triggers, one-shot actions).
     public static IEnumerable<MethodInfo> InspectorButtons(Type type) {
         foreach (MethodInfo method in type.GetMethods(Flags)) {
             if (method.GetParameters().Length == 0 &&
@@ -58,8 +50,6 @@ public static class ComponentReflection {
         }
     }
 
-    // Parameterless methods marked [ContextMenu]: the inspector lists each in the component's "..."
-    // context menu and invokes it on click (Unity's [ContextMenu]).
     public static IEnumerable<MethodInfo> InspectorContextMenus(Type type) {
         foreach (MethodInfo method in type.GetMethods(Flags)) {
             if (method.GetParameters().Length == 0 &&
@@ -69,8 +59,6 @@ public static class ComponentReflection {
         }
     }
 
-    // Parameterless methods marked [EditorWindowExecutionPoint]: the inspector renders a window-open
-    // button that invokes the method and opens a dedicated EditorWindow for the component.
     public static IEnumerable<MethodInfo> InspectorWindowPoints(Type type) {
         foreach (MethodInfo method in type.GetMethods(Flags)) {
             if (method.GetParameters().Length == 0 &&

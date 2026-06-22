@@ -2,17 +2,13 @@ using System.Diagnostics;
 
 namespace BallisticEngine.Editor;
 
-// Editor-side IProfilerBackend: records every main-thread zone into a fixed ring of frames
-// for the Profiler panel, then forwards everything to an inner backend (Tracy) when one was
-// installed first. Recording is a few array writes per zone, so it stays on for the whole
-// session; Pause freezes the visible history without stopping the forwarding.
 internal sealed class EditorProfilerBackend : IProfilerBackend {
     public const int HistorySize = 240;
 
     public struct ZoneRecord {
         public string Name;
         public int Depth;
-        public double OffsetMs;    // from frame start
+        public double OffsetMs;
         public double DurationMs;
     }
 
@@ -22,8 +18,6 @@ internal sealed class EditorProfilerBackend : IProfilerBackend {
         public int ZoneCount;
     }
 
-    // While true the ring stops advancing (the panel shows a frozen history); the scratch
-    // frame keeps being rewritten so resuming is seamless.
     public bool Paused;
 
     readonly IProfilerBackend chained;
@@ -31,12 +25,12 @@ internal sealed class EditorProfilerBackend : IProfilerBackend {
     readonly Stopwatch clock = Stopwatch.StartNew();
 
     readonly Frame[] history = new Frame[HistorySize];
-    int head;          // the frame currently being recorded (scratch); completed frames sit behind it
+    int head;
     long completed;
 
-    readonly int[] openZones = new int[64];   // indices into the scratch frame's zone array
+    readonly int[] openZones = new int[64];
     int openCount;
-    int skipped;       // begins ignored because the stack was full — keeps end/begin balanced
+    int skipped;
     double frameStartMs;
 
     public EditorProfilerBackend(IProfilerBackend chained) {
@@ -45,7 +39,6 @@ internal sealed class EditorProfilerBackend : IProfilerBackend {
             history[i] = new Frame();
     }
 
-    // Completed frames, age 0 = most recent. Valid ages: [0, AvailableFrames).
     public Frame CompletedFrame(int age) {
         var index = (head - 1 - age) % HistorySize;
         if (index < 0)
@@ -53,7 +46,6 @@ internal sealed class EditorProfilerBackend : IProfilerBackend {
         return history[index];
     }
 
-    // The head slot is scratch, so at most HistorySize-1 completed frames are retrievable.
     public int AvailableFrames => (int)Math.Min(completed, HistorySize - 1);
 
     public ulong ZoneBegin(string name, uint color, uint line, string file, string member) {
@@ -104,7 +96,6 @@ internal sealed class EditorProfilerBackend : IProfilerBackend {
         Frame frame = history[head];
         frame.TotalMs = now - frameStartMs;
 
-        // Force-close anything still open so a completed frame never shows a -1 duration.
         while (openCount > 0) {
             ref ZoneRecord zone = ref frame.Zones[openZones[--openCount]];
             zone.DurationMs = now - frameStartMs - zone.OffsetMs;

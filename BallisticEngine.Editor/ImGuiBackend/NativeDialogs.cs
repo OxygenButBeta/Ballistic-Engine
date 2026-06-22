@@ -2,22 +2,7 @@ using System.Runtime.InteropServices;
 
 namespace BallisticEngine.Editor;
 
-// Native Windows file/folder dialogs via the modern IFileOpenDialog COM API (no WinForms / NuGet
-// dependency). Used by panels that need an OS browse dialog — e.g. the Build window's output folder.
-// Windows-only; returns null on any failure or cancel (the caller keeps the typed-in value).
-//
-// COM vtable layout is UNFORGIVING: IFileOpenDialog inherits IFileDialog inherits IModalWindow, and
-// every inherited method must be redeclared, in order, with the EXACT marshaled signature — a wrong
-// slot or argument size corrupts the call stack and crashes the process. The declarations below match
-// the Windows SDK (shobjidl_core.h) precisely; unused methods keep correct signatures, not empty stubs.
 internal static class NativeDialogs {
-    // Opens a native "select folder" dialog. initialDir seeds the starting location if it exists.
-    // Returns the chosen absolute path, or null if the user cancelled / the dialog couldn't open.
-    //
-    // The common-item dialog requires a Single-Threaded-Apartment thread, but the editor's main loop
-    // runs on the OpenTK/GLFW thread (MTA) — calling Show there crashes. So we marshal the whole
-    // dialog onto a dedicated STA thread and block until it returns. The editor briefly stops painting
-    // while the modal dialog is up, which is the expected behaviour for a native folder picker.
     public static string PickFolder(string title = "Select Folder", string initialDir = null) {
         if (!OperatingSystem.IsWindows())
             return null;
@@ -31,9 +16,6 @@ internal static class NativeDialogs {
         return result;
     }
 
-    // Opens a native "open file" dialog filtered to the given extensions. `filterName` labels the
-    // filter (e.g. "Unity Package"); `extensions` are bare extensions WITH the dot (".unitypackage").
-    // Returns the chosen absolute file path, or null on cancel / failure.
     public static string PickFile(string title, string filterName, string[] extensions, string initialDir = null) {
         if (!OperatingSystem.IsWindows())
             return null;
@@ -115,7 +97,6 @@ internal static class NativeDialogs {
                 Marshal.ReleaseComObject(seed);
             }
 
-            // S_OK = 0; anything else (incl. user cancel, ERROR_CANCELLED 0x800704C7) means "no selection".
             if (dialog.Show(GetActiveWindow()) != 0)
                 return null;
 
@@ -133,8 +114,6 @@ internal static class NativeDialogs {
                 Marshal.ReleaseComObject(dialog);
         }
     }
-
-    // ---- COM interop ---------------------------------------------------------
 
     const uint FOS_PICKFOLDERS = 0x20;
     const uint FOS_FORCEFILESYSTEM = 0x40;
@@ -159,16 +138,11 @@ internal static class NativeDialogs {
     [ComImport, Guid("DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7")]
     class FileOpenDialogRcw { }
 
-    // IModalWindow (b4db1657-70d7-485e-8e3e-6fcb5a5c1802) → IFileDialog (42f85136-db7e-439c-85f1-e4075d135fc8)
-    // → IFileOpenDialog (d57c7288-d4ad-4768-be02-9d969532d960). Single interface, full inherited chain.
-    // All methods PreserveSig so HRESULTs come back as ints (no exception on a non-fatal failure).
     [ComImport, Guid("d57c7288-d4ad-4768-be02-9d969532d960"),
      InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     interface IFileOpenDialog {
-        // --- IModalWindow ---
         [PreserveSig] int Show(IntPtr parent);
 
-        // --- IFileDialog ---
         [PreserveSig] uint SetFileTypes(uint cFileTypes,
             [MarshalAs(UnmanagedType.LPArray)] ComdlgFilterSpec[] rgFilterSpec);
         [PreserveSig] uint SetFileTypeIndex(uint iFileType);
@@ -194,7 +168,6 @@ internal static class NativeDialogs {
         [PreserveSig] uint ClearClientData();
         [PreserveSig] uint SetFilter(IntPtr pFilter);
 
-        // --- IFileOpenDialog ---
         [PreserveSig] uint GetResults(out IntPtr ppenum);
         [PreserveSig] uint GetSelectedItems(out IntPtr ppsai);
     }

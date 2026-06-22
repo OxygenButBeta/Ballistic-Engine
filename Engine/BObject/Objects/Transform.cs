@@ -5,12 +5,9 @@ public class Transform : Component {
     Quaternion rotation = Quaternion.Identity;
     Vector3 scale = Vector3.One;
 
-    // Matrix caching: the renderer reads WorldMatrix several times per frame per renderer
-    // (cull AABB, prepass, shadow casters, main pass) — recomputing 3 matrix products plus the
-    // whole parent chain each read was pure waste for static entities. `localVersion` bumps on
-    // every setter; `worldVersion` bumps when the cached world matrix actually recomputes, so
-    // children key their cache on (own local version, parent's world version) and any change
-    // anywhere up the chain invalidates lazily on next read.
+    Vector3 eulerAngles = Vector3.Zero;
+    bool eulerDirty;
+
     int localVersion = 1;
     int worldVersion;
     int cachedLocalVersion = -1;
@@ -26,7 +23,7 @@ public class Transform : Component {
 
     public Quaternion Rotation {
         get => rotation;
-        set { rotation = value; localVersion++; }
+        set { rotation = value; eulerDirty = true; localVersion++; }
     }
 
     public Vector3 Scale {
@@ -38,13 +35,21 @@ public class Transform : Component {
     public Vector3 Up => Vector3.Transform(Vector3.UnitY, Rotation);
     public Vector3 Right => Vector3.Transform(Vector3.UnitX, Rotation);
     public Vector3 EulerAngles {
-        get => RadiansToDegrees(Rotation.ToEulerAngles());
-        set => Rotation = BQuaternion.FromEulerAngles(DegreesToRadians(value));
+        get {
+            if (eulerDirty) {
+                eulerAngles = RadiansToDegrees(rotation.ToEulerAngles());
+                eulerDirty = false;
+            }
+            return eulerAngles;
+        }
+        set {
+            eulerAngles = value;
+            eulerDirty = false;
+            rotation = BQuaternion.FromEulerAngles(DegreesToRadians(value));
+            localVersion++;
+        }
     }
 
-    // Row-vector (OpenTK) convention: points are transformed as v * M, so composition is
-    // left-to-right (child-local FIRST, then up through the parents). Hence LocalMatrix * Parent,
-    // NOT Parent * Local — the latter (column-major order) is what broke child follow/rotate/scale.
     public Matrix4 WorldMatrix {
         get {
             if (Parent == null) {
@@ -56,7 +61,6 @@ public class Transform : Component {
                 return cachedWorld;
             }
 
-            // Read the parent FIRST: it recomputes (and bumps its worldVersion) if stale.
             Matrix4 parentWorld = Parent.WorldMatrix;
             if (cachedWorldLocalVersion != localVersion ||
                 cachedParentWorldVersion != Parent.worldVersion) {
@@ -81,15 +85,23 @@ public class Transform : Component {
         }
     }
 
+    Matrix4 publishedWorld;
+    bool hasPublished;
+
+    public void PublishWorldForRender() {
+        publishedWorld = WorldMatrix;
+        hasPublished = true;
+    }
+
+    public Matrix4 RenderMatrix => hasPublished ? publishedWorld : WorldMatrix;
+
+    public Vector3 RenderWorldPosition => RenderMatrix.ExtractTranslation();
+    public Quaternion RenderWorldRotation => RenderMatrix.ExtractRotation();
+
     public Transform? Parent { get; private set; }
 
-    // The entity this transform belongs to. Lets hierarchy walks (e.g. Entity.IsActiveInHierarchy)
-    // hop from a parent Transform back to its Entity, since Children are derived from Parent links.
     public Entity Entity => entity;
 
-    // World-space accessors: read/write the transform in world space, converting through the parent
-    // chain. The editor gizmo edits in world space, so parented objects move/rotate/scale relative to
-    // their parent correctly (setting local Position by a world delta would be wrong under a parent).
     public Vector3 WorldPosition {
         get => WorldMatrix.ExtractTranslation();
         set => Position = Parent is null
@@ -104,13 +116,10 @@ public class Transform : Component {
 
     public void SetParent(Transform? parent) {
         Parent = parent;
-        cachedWorldLocalVersion = -1; // new chain: recompute world on next read
+        cachedWorldLocalVersion = -1;
         cachedParentWorldVersion = -1;
     }
 
-    // Reparents while keeping the same world transform: recomputes local Position/Rotation/Scale so
-    // that Parent.WorldMatrix * newLocal reproduces the current WorldMatrix (no visual jump). Used by
-    // the editor's drag-to-parent. Pass null to unparent to world space.
     public void SetParentKeepingWorld(Transform? parent) {
         Matrix4 world = WorldMatrix;
         Parent = parent;
@@ -123,7 +132,6 @@ public class Transform : Component {
         Position = local.ExtractTranslation();
     }
 
-    // True if `potentialAncestor` is this transform or one of its parents (cycle guard for reparenting).
     public bool IsDescendantOf(Transform potentialAncestor) {
         for (Transform? t = this; t is not null; t = t.Parent)
             if (ReferenceEquals(t, potentialAncestor))

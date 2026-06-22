@@ -2,16 +2,6 @@ using System.Diagnostics;
 
 namespace BallisticEngine.Editor;
 
-// Runs AssetDatabase.Refresh() off the render thread so dropping a big model doesn't freeze the
-// editor window (Windows "Not Responding"). The import pipeline is pure CPU + file I/O (no GL),
-// so it's safe to run on a Task; the GPU upload still happens lazily on the main thread later in
-// AssetDatabase.Load. While a refresh is in flight IsBusy is true and the editor draws a modal
-// busy overlay instead of accepting input.
-//
-// Completion work that must touch GL or the asset DB (thumbnail invalidation, Invalidate(guid))
-// is handed in as an onFinished callback and run on the main thread from PumpCompletion(), which
-// the editor calls once per frame. Refresh requests that arrive while one is running are coalesced
-// into a single trailing re-run so rapid drops/edits don't stack up.
 internal static class AsyncAssetImport {
     static readonly object gate = new();
     static Task running;
@@ -22,21 +12,15 @@ internal static class AsyncAssetImport {
     static volatile bool busy;
     static volatile string status = "Importing...";
     static volatile string currentFile;
-    static int completed, total;   // import-stage counts, for a determinate progress bar
+    static int completed, total;
 
-    // Fires on the MAIN thread after EVERY completed refresh (after the per-request onFinished), so
-    // global post-import work — prefab propagation to live instances — runs without each caller wiring
-    // it. Kept separate from onFinished, which is per-request.
     public static event Action AfterRefresh;
 
     public static bool IsBusy => busy;
     public static string Status => status;
 
-    // The asset currently being processed (null between assets / before the first), for the overlay.
     public static string CurrentFile => currentFile;
 
-    // 0..1 import progress, or -1 when the total isn't known yet (the scan stage before importing).
-    // The overlay draws a determinate bar when this is >= 0, an indeterminate sweep otherwise.
     public static float Fraction {
         get {
             int t = Volatile.Read(ref total);
@@ -44,16 +28,10 @@ internal static class AsyncAssetImport {
         }
     }
 
-    // Kicks off (or queues) a background refresh. onFinished, if supplied, runs ON THE MAIN THREAD
-    // after the refresh completes — use it for thumbnail invalidation, Invalidate(guid), etc.
-    // statusText is shown in the busy overlay. forceAll reimports everything (slow), ignoring
-    // the pipeline's up-to-date checks.
     public static void Request(string statusText = "Importing assets...", Action onFinished = null,
         bool forceAll = false) {
         lock (gate) {
             if (running is not null) {
-                // A refresh is already running; remember that we need another pass afterward and
-                // chain the callbacks so none are lost. A queued force request keeps its force.
                 rerunQueued = true;
                 rerunForceAll |= forceAll;
                 queuedOnFinished = Combine(queuedOnFinished, onFinished);
@@ -70,7 +48,7 @@ internal static class AsyncAssetImport {
         status = statusText;
         currentFile = null;
         Volatile.Write(ref completed, 0);
-        Volatile.Write(ref total, 0); // unknown until the import stage reports its job count
+        Volatile.Write(ref total, 0);
         running = Task.Run(() => {
             var stopwatch = Stopwatch.StartNew();
             try {
@@ -82,13 +60,9 @@ internal static class AsyncAssetImport {
                 AssetDatabase.Refresh(forceAll);
             }
             catch (Exception exception) {
-                // The pipeline itself logs per-asset failures and never throws, but guard anyway so
-                // a background exception can't take the editor down silently.
                 Debugging.LogError($"Asset refresh failed: {exception.Message}");
             }
             finally {
-                // Re-baseline the external-change fingerprint AFTER the refresh so files the
-                // import generated don't look like outside edits on the next focus regain.
                 AssetChangeWatch.Snapshot();
                 AssetDatabase.ImportProgress = null;
                 AssetDatabase.ImportProgressCount = null;
@@ -101,7 +75,6 @@ internal static class AsyncAssetImport {
     static void OnRefreshComplete(Action onFinished, long elapsedMs) {
         lock (gate) {
             running = null;
-            // Defer the user callback to the main thread; the import ran on a worker.
             pendingMainThreadCallback = Combine(pendingMainThreadCallback, onFinished);
 
             if (rerunQueued) {
@@ -118,8 +91,6 @@ internal static class AsyncAssetImport {
         }
     }
 
-    // Called once per frame on the render thread. Runs any completion callbacks produced by a
-    // finished background refresh (thumbnail invalidation, asset cache invalidation, etc.).
     public static void PumpCompletion() {
         Action callback;
         lock (gate) {
@@ -137,8 +108,6 @@ internal static class AsyncAssetImport {
             Debugging.LogError($"Post-import refresh step failed: {exception.Message}");
         }
 
-        // A refresh just completed and its per-request callback ran — fire the global AfterRefresh so
-        // prefab propagation (and any future global post-import work) runs once per refresh.
         try {
             AfterRefresh?.Invoke();
         }

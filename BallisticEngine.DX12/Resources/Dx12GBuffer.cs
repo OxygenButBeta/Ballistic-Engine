@@ -1,45 +1,42 @@
-using System;
 using Vortice.Direct3D12;
 using Vortice.DXGI;
 
 namespace BallisticEngine.DX12;
 
-// The fat G-buffer for the DX12 clustered-deferred renderer. The geometry pass writes 4 color MRTs +
-// depth; the deferred lighting pass reads them back as SRVs to shade one screen-space pass. This is the
-// DX12 equivalent of a deferred G-buffer FBO — a multi-RTV target where the depth is the SAME typeless
-// resource the lighting/SSAO/fog passes read (D32 DSV + R32_Float SRV), so world position reconstructs
-// from depth with no separate position target.
-//
-// Layout (matches GBuffer.hlsl's GBufferOut):
-//   RT0 R8G8B8A8_UNorm_SRGB  : albedo.rgb  (a = specularReflectance for F0)
-//   RT1 R16G16B16A16_Float   : world normal.xyz packed [0,1] (a = unused)
-//   RT2 R8G8B8A8_UNorm       : metallic, roughness, ao, (a = cutout flag)
-//   RT3 R16G16B16A16_Float   : emissive radiance.rgb (HDR, added directly in lighting)
-//   RT4 R16G16_Float         : screen-space motion vectors (prevUV - currUV, UNJITTERED) — TAA + FSR
-// RT0 is sRGB so the SRGB albedo round-trips like a sampled diffuse map; normal/emissive are float so the
-// normal keeps precision and emissive stays HDR. The metallic/roughness/ao pack is linear UNORM. Motion is
-// linear RG (UV-space delta, top-left origin); FSR consumes it with motionVectorScale = (renderW, renderH).
 public sealed class Dx12GBuffer : IDisposable {
-    public const int RtCount = 5;          // total MRTs (4 shaded + 1 motion)
-    public const int ShadedRtCount = 4;    // G0..G3 — the surface attributes the deferred lighting pass reads
-    public const int MotionRtIndex = 4;    // RG16F screen-space motion (TAA reprojection + FSR upscaler)
+    public const int RtCount = 5;
+    public const int ShadedRtCount = 4;
+
+    public const int MotionRtIndex = 4;
+
+    static readonly bool Pack = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GBUFFER_PACK") == "1";
     public static readonly Format[] ColorFormats = {
-        Format.R8G8B8A8_UNorm_SRgb,     // albedo + specF0
-        Format.R16G16B16A16_Float,      // world normal
-        Format.R8G8B8A8_UNorm,          // metallic/roughness/ao/flags
-        Format.R16G16B16A16_Float,      // emissive (HDR)
-        Format.R16G16_Float,            // motion vectors (prevUV - currUV)
+        Format.R8G8B8A8_UNorm_SRgb, Pack ? Format.R10G10B10A2_UNorm : Format.R16G16B16A16_Float, Format.R8G8B8A8_UNorm, Pack ? Format.R11G11B10_Float   : Format.R16G16B16A16_Float, Format.R16G16_Float,
     };
     public const Format DepthFormat = Format.D32_Float;
+
+    static Format TypelessOf(Format shaded) => shaded switch {
+        Format.R8G8B8A8_UNorm_SRgb => Format.R8G8B8A8_Typeless,
+        Format.R8G8B8A8_UNorm      => Format.R8G8B8A8_Typeless,
+        Format.R16G16B16A16_Float  => Format.R16G16B16A16_Typeless,
+        Format.R16G16_Float        => Format.R16G16_Typeless,
+        Format.R10G10B10A2_UNorm   => Format.R10G10B10A2_Typeless,
+        _ => shaded,
+    };
+
+    public static Format UavFormatOf(Format shaded) => shaded switch {
+        Format.R8G8B8A8_UNorm_SRgb => Format.R8G8B8A8_UNorm,
+        _ => shaded,
+    };
 
     public int Width { get; }
     public int Height { get; }
 
     readonly Dx12Device dev;
     readonly ID3D12Resource[] colors = new ID3D12Resource[RtCount];
-    readonly ID3D12DescriptorHeap rtvHeap;     // RtCount contiguous RTVs
+    readonly ID3D12DescriptorHeap rtvHeap;
     readonly uint rtvInc;
-    readonly int[] colorSrv = new int[RtCount]; // persistent SRV indices in Dx12Backend.SrvStore
+    readonly int[] colorSrv = new int[RtCount];
     readonly ResourceStates[] colorState = new ResourceStates[RtCount];
 
     readonly ID3D12Resource depth;
@@ -59,27 +56,29 @@ public sealed class Dx12GBuffer : IDisposable {
         CpuDescriptorHandle rtvStart = rtvHeap.GetCPUDescriptorHandleForHeapStart();
 
         for (int i = 0; i < RtCount; i++) {
-            Format f = ColorFormats[i];
-            var rtDesc = ResourceDescription.Texture2D(f, (uint)width, (uint)height, mipLevels: 1, arraySize: 1);
-            rtDesc.Flags = ResourceFlags.AllowRenderTarget;
-            var clearVal = new ClearValue(f, new Vortice.Mathematics.Color4(0, 0, 0, 0));
+            Format shaded = ColorFormats[i];
+            Format typeless = TypelessOf(shaded);
+            var rtDesc = ResourceDescription.Texture2D(typeless, (uint)width, (uint)height, mipLevels: 1, arraySize: 1);
+            rtDesc.Flags = ResourceFlags.AllowRenderTarget | ResourceFlags.AllowUnorderedAccess;
+            var clearVal = new ClearValue(shaded, new Vortice.Mathematics.Color4(0, 0, 0, 0));
             colors[i] = dev.Device.CreateCommittedResource(
                 HeapProperties.DefaultHeapProperties, HeapFlags.None, rtDesc,
                 ResourceStates.RenderTarget, clearVal);
             colors[i].Name = $"GBuffer{i}";
             colorState[i] = ResourceStates.RenderTarget;
-            dev.Device.CreateRenderTargetView(colors[i], null, RtvHandle(i));
+            dev.Device.CreateRenderTargetView(colors[i], new RenderTargetViewDescription {
+                Format = shaded, ViewDimension = RenderTargetViewDimension.Texture2D,
+            }, RtvHandle(i));
 
             colorSrv[i] = Dx12Backend.SrvStore.Allocate();
             dev.Device.CreateShaderResourceView(colors[i], new ShaderResourceViewDescription {
-                Format = f,
+                Format = shaded,
                 ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
                 Shader4ComponentMapping = ShaderComponentMapping.Default,
                 Texture2D = new Texture2DShaderResourceView { MipLevels = 1, MostDetailedMip = 0 },
             }, Dx12Backend.SrvStore.Cpu(colorSrv[i]));
         }
 
-        // Depth: typeless so it serves a D32 DSV (geometry write) and an R32_Float SRV (lighting/SSAO/fog).
         var dDesc = ResourceDescription.Texture2D(Format.R32_Typeless, (uint)width, (uint)height,
             mipLevels: 1, arraySize: 1);
         dDesc.Flags = ResourceFlags.AllowDepthStencil;
@@ -108,12 +107,10 @@ public sealed class Dx12GBuffer : IDisposable {
     public CpuDescriptorHandle DepthSrvCpu => Dx12Backend.SrvStore.Cpu(depthSrv);
     public CpuDescriptorHandle DsvHandle => dsvHandle;
     public ID3D12Resource DepthResource => depth;
-    public ID3D12Resource MotionResource => colors[MotionRtIndex];   // RG16F motion (FSR input)
+    public ID3D12Resource MotionResource => colors[MotionRtIndex];
 
     CpuDescriptorHandle RtvHandle(int i) => new(rtvHeap.GetCPUDescriptorHandleForHeapStart(), i, rtvInc);
 
-    // Geometry pass: transition all 4 RTs + depth to write state, bind them, clear, run the draws. One
-    // ExecuteSync — the whole G-buffer fill in a single command-list submission (mirrors RenderIntoCleared).
     public void RenderGeometry(Action<ID3D12GraphicsCommandList4> record) {
         dev.ExecuteSync(cl => {
             for (int i = 0; i < RtCount; i++) ColorTransition(cl, i, ResourceStates.RenderTarget);
@@ -131,10 +128,6 @@ public sealed class Dx12GBuffer : IDisposable {
         });
     }
 
-    // Transition every G-buffer color + depth to a combined PIXEL|NON_PIXEL shader-resource state so BOTH
-    // the deferred/SSAO/SSR pixel passes AND the DXR (compute-stage) ray passes can sample them — RT shaders
-    // require NON_PIXEL_SHADER_RESOURCE. The combined state is a superset, so pixel reads stay valid and the
-    // output is unchanged (a barrier never affects pixels). Single ExecuteSync.
     const ResourceStates ShaderRead = ResourceStates.PixelShaderResource | ResourceStates.NonPixelShaderResource;
     public void ToShaderResource() {
         dev.ExecuteSync(cl => {
@@ -143,20 +136,11 @@ public sealed class Dx12GBuffer : IDisposable {
         });
     }
 
-    // After the deferred lighting pass, the sky draws at the far plane and must depth-test against the
-    // G-buffer depth. Transition depth back to a readable-for-DSV-bind state. The sky binds the HDR color
-    // RTV + this depth (read-only via LessEqual + no-write); leave colors as SRVs (they're done being read
-    // by then for normal use, but keep transitions explicit). Returns depth to DepthRead for the sky test.
     public void DepthToReadOnly() => dev.ExecuteSync(cl => DepthTransition(cl, ResourceStates.DepthRead));
     public void DepthToWrite() => dev.ExecuteSync(cl => DepthTransition(cl, ResourceStates.DepthWrite));
     public void DepthToShaderResource() => dev.ExecuteSync(cl => DepthTransition(cl, ResourceStates.PixelShaderResource));
-    // Compute-readable (for the Hi-Z pyramid build, which reads the previous frame's depth in a CS).
     public void DepthToNonPixelShaderResource() => dev.ExecuteSync(cl => DepthTransition(cl, ResourceStates.NonPixelShaderResource));
 
-    // Raw G-buffer readback for the agent's "raw perception" (`bal gbuffer`). Copies a G-buffer subresource
-    // to a CPU byte array (tightly packed, row-pitch padding removed). Transitions the resource to CopySource
-    // and back to its prior state, so it's safe to call after a frame (resources are in ShaderRead state).
-    // `which`: -1 = depth (R32_Float, 4 B/px), 0..RtCount-1 = a color MRT (its ColorFormats[which]).
     public unsafe byte[] ReadbackRaw(int which, out int bytesPerPixel) {
         ID3D12Resource res = which < 0 ? depth : colors[which];
         ResourceDescription resDesc = res.Description;
@@ -170,14 +154,12 @@ public sealed class Dx12GBuffer : IDisposable {
             HeapProperties.ReadbackHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
 
-        // Depth's SRV format is R32_Float but the resource is typeless — the copy uses the resource as-is.
         ResourceStates prior = which < 0 ? depthState : colorState[which];
         dev.ExecuteSync(cl => {
             Transition(cl, res, ref prior, ResourceStates.CopySource, which);
             cl.CopyTextureRegion(new TextureCopyLocation(readback, fps[0]), 0, 0, 0,
                 new TextureCopyLocation(res, 0), null);
         });
-        // Restore the resource's tracked state (prior was mutated by Transition; put it back).
         ResourceStates restoreTo = which < 0 ? ResourceStates.NonPixelShaderResource
                                              : (ResourceStates.PixelShaderResource | ResourceStates.NonPixelShaderResource);
         dev.ExecuteSync(cl => Transition(cl, res, ref prior, restoreTo, which));
@@ -204,6 +186,20 @@ public sealed class Dx12GBuffer : IDisposable {
         cl.ResourceBarrierTransition(colors[i], colorState[i], target);
         colorState[i] = target;
     }
+
+    public void ColorsToUav(ID3D12GraphicsCommandList4 cl) {
+        for (int i = 0; i < RtCount; i++) ColorTransition(cl, i, ResourceStates.UnorderedAccess);
+    }
+    public void CreateColorUav(int i, CpuDescriptorHandle dst) {
+        dev.Device.CreateUnorderedAccessView(colors[i], null, new UnorderedAccessViewDescription {
+            Format = UavFormatOf(ColorFormats[i]), ViewDimension = UnorderedAccessViewDimension.Texture2D,
+        }, dst);
+    }
+    public void ColorsToShaderRead(ID3D12GraphicsCommandList4 cl) {
+        for (int i = 0; i < RtCount; i++) ColorTransition(cl, i, ShaderRead);
+    }
+
+    public void DepthTransitionPublic(ID3D12GraphicsCommandList4 cl, ResourceStates target) => DepthTransition(cl, target);
     void DepthTransition(ID3D12GraphicsCommandList4 cl, ResourceStates target) {
         if (depthState == target) return;
         cl.ResourceBarrierTransition(depth, depthState, target);

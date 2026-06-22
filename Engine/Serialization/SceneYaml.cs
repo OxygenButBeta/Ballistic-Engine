@@ -4,7 +4,6 @@ using YamlDotNet.Serialization.NamingConventions;
 
 namespace BallisticEngine;
 
-// Shared YamlDotNet serializer/deserializer for .scene files, configured with the OpenTK converters.
 public static class SceneYaml {
     public static readonly ISerializer Serializer = new SerializerBuilder()
         .WithNamingConvention(CamelCaseNamingConvention.Instance)

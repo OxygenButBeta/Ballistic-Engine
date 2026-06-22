@@ -1,0 +1,1530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ballistic Engine — Documentation &amp; API Reference</title>
+<style>
+  :root {
+    --bg:        #0d1017;
+    --bg-soft:   #141922;
+    --bg-card:   #171d28;
+    --bg-code:   #0a0d13;
+    --border:    #232b38;
+    --border-soft:#1c232f;
+    --text:      #d4dae3;
+    --text-dim:  #8b95a5;
+    --text-faint:#5a6473;
+    --accent:    #f4623a;   /* ballistic orange */
+    --accent-soft:#ff7d57;
+    --accent-bg: rgba(244,98,58,0.10);
+    --blue:      #6cb6ff;
+    --green:     #7ee787;
+    --purple:    #d2a8ff;
+    --yellow:    #f0c674;
+    --pink:      #ff9ec4;
+    --cyan:      #76e3ea;
+    --mono: "JetBrains Mono", "Cascadia Code", "SF Mono", "Consolas", ui-monospace, monospace;
+    --sans: "Inter", -apple-system, "Segoe UI", Roboto, system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent-soft); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* ---------- Layout ---------- */
+  .layout { display: grid; grid-template-columns: 300px 1fr; min-height: 100vh; }
+
+  /* ---------- Sidebar ---------- */
+  aside {
+    position: sticky; top: 0; align-self: start;
+    height: 100vh; overflow-y: auto;
+    background: var(--bg-soft);
+    border-right: 1px solid var(--border);
+    padding: 0 0 60px;
+  }
+  aside::-webkit-scrollbar { width: 8px; }
+  aside::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  .brand {
+    display: flex; align-items: center; gap: 12px;
+    padding: 22px 24px 18px;
+    position: sticky; top: 0; background: var(--bg-soft);
+    border-bottom: 1px solid var(--border-soft); z-index: 5;
+  }
+  .brand .logo {
+    width: 36px; height: 36px; border-radius: 9px; flex: none;
+    background: linear-gradient(135deg, var(--accent), #b8341a);
+    display: grid; place-items: center;
+    font-weight: 800; color: #fff; font-size: 19px;
+    box-shadow: 0 4px 14px rgba(244,98,58,0.35);
+  }
+  .brand .title { font-weight: 700; font-size: 15px; letter-spacing: .2px; }
+  .brand .sub { font-size: 11px; color: var(--text-faint); letter-spacing: .4px; text-transform: uppercase; }
+
+  .search-wrap { padding: 16px 18px 8px; position: sticky; top: 77px; background: var(--bg-soft); z-index: 4; }
+  #search {
+    width: 100%; padding: 9px 12px;
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    font-family: var(--sans); font-size: 13.5px;
+  }
+  #search:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
+
+  nav { padding: 6px 12px; }
+  nav .group-label {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--text-faint); font-weight: 700;
+    padding: 16px 12px 6px;
+  }
+  nav a {
+    display: block; padding: 5px 12px; border-radius: 6px;
+    color: var(--text-dim); font-size: 13.5px; line-height: 1.4;
+    border-left: 2px solid transparent;
+  }
+  nav a:hover { background: var(--bg-card); color: var(--text); text-decoration: none; }
+  nav a.active { color: var(--accent-soft); border-left-color: var(--accent); background: var(--accent-bg); }
+  nav a.sub { padding-left: 24px; font-size: 12.5px; color: var(--text-faint); }
+
+  /* ---------- Main ---------- */
+  main { padding: 0; max-width: 100%; overflow-x: hidden; }
+  .content { max-width: 940px; margin: 0 auto; padding: 50px 56px 120px; }
+  section { scroll-margin-top: 20px; padding-top: 30px; }
+  section.hidden-by-search { display: none; }
+
+  h1 { font-size: 33px; font-weight: 800; letter-spacing: -.5px; margin-bottom: 6px; line-height: 1.2; }
+  h2 {
+    font-size: 23px; font-weight: 700; letter-spacing: -.3px;
+    margin: 46px 0 14px; padding-bottom: 9px;
+    border-bottom: 1px solid var(--border); scroll-margin-top: 20px;
+  }
+  h3 { font-size: 17.5px; font-weight: 650; margin: 30px 0 10px; color: #e8edf4; scroll-margin-top: 20px; }
+  h4 { font-size: 14.5px; font-weight: 650; margin: 20px 0 8px; color: var(--blue); text-transform: uppercase; letter-spacing: .5px; }
+  p { margin: 11px 0; color: var(--text); }
+  ul, ol { margin: 11px 0 11px 22px; }
+  li { margin: 5px 0; }
+  strong { color: #eef2f7; font-weight: 650; }
+  em { color: var(--text-dim); }
+
+  .lead { font-size: 17px; color: var(--text-dim); margin: 14px 0 8px; line-height: 1.6; }
+
+  /* ---------- Code ---------- */
+  code {
+    font-family: var(--mono); font-size: 12.8px;
+    background: var(--bg-code); color: var(--accent-soft);
+    padding: 1.5px 6px; border-radius: 5px; border: 1px solid var(--border-soft);
+    white-space: nowrap;
+  }
+  pre {
+    background: var(--bg-code); border: 1px solid var(--border);
+    border-radius: 11px; padding: 18px 20px; margin: 16px 0;
+    overflow-x: auto; position: relative;
+  }
+  pre code {
+    background: none; border: none; padding: 0; color: var(--text);
+    font-size: 12.9px; line-height: 1.7; white-space: pre;
+  }
+  pre::-webkit-scrollbar { height: 9px; }
+  pre::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
+  .lang-tag {
+    position: absolute; top: 9px; right: 12px;
+    font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--text-faint); font-family: var(--mono);
+  }
+  /* syntax-ish */
+  .k { color: var(--pink); }     /* keyword */
+  .t { color: var(--cyan); }     /* type */
+  .s { color: var(--green); }    /* string */
+  .c { color: var(--text-faint); font-style: italic; } /* comment */
+  .n { color: var(--yellow); }   /* number */
+  .m { color: var(--blue); }     /* member/method */
+  .at { color: var(--purple); }  /* attribute */
+
+  /* ---------- Tables ---------- */
+  .table-wrap { overflow-x: auto; margin: 16px 0; border: 1px solid var(--border); border-radius: 11px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.3px; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
+  th {
+    background: var(--bg-card); color: var(--text-dim);
+    font-weight: 650; font-size: 11.5px; text-transform: uppercase; letter-spacing: .5px;
+    position: sticky; top: 0;
+  }
+  tr:last-child td { border-bottom: none; }
+  td code { font-size: 12px; white-space: normal; }
+  td:first-child code { white-space: nowrap; }
+  tbody tr:hover { background: rgba(255,255,255,0.015); }
+
+  /* ---------- Callouts ---------- */
+  .note {
+    border-radius: 10px; padding: 13px 17px 13px 16px; margin: 18px 0;
+    border-left: 3px solid var(--blue); background: rgba(108,182,255,0.06);
+    font-size: 13.8px; color: var(--text);
+  }
+  .note.warn { border-left-color: var(--yellow); background: rgba(240,198,116,0.06); }
+  .note.danger { border-left-color: var(--accent); background: var(--accent-bg); }
+  .note.tip { border-left-color: var(--green); background: rgba(126,231,135,0.06); }
+  .note .label { font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; display: block; margin-bottom: 3px; }
+  .note.warn .label { color: var(--yellow); }
+  .note.danger .label { color: var(--accent-soft); }
+  .note.tip .label { color: var(--green); }
+  .note:not(.warn):not(.danger):not(.tip) .label { color: var(--blue); }
+
+  /* ---------- Cards / grids ---------- */
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px,1fr)); gap: 14px; margin: 20px 0; }
+  .card {
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 18px 18px 16px; transition: border-color .15s;
+  }
+  .card:hover { border-color: var(--accent); }
+  .card h3 { margin: 0 0 6px; font-size: 15.5px; }
+  .card h3 a { color: #e8edf4; }
+  .card p { margin: 0; font-size: 13px; color: var(--text-dim); line-height: 1.5; }
+  .card .ico { font-size: 20px; margin-bottom: 8px; display: block; }
+
+  /* ---------- Pills / badges ---------- */
+  .pill {
+    display: inline-block; font-size: 10.5px; font-weight: 650;
+    padding: 2px 9px; border-radius: 20px; letter-spacing: .3px;
+    vertical-align: middle; margin-left: 7px;
+  }
+  .pill.stable { background: rgba(126,231,135,0.13); color: var(--green); }
+  .pill.beta { background: rgba(240,198,116,0.13); color: var(--yellow); }
+  .pill.exp { background: rgba(210,168,255,0.13); color: var(--purple); }
+  .pill.new { background: var(--accent-bg); color: var(--accent-soft); }
+
+  /* signature block */
+  .sig {
+    font-family: var(--mono); font-size: 12.6px; background: var(--bg-code);
+    border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 11px 15px; margin: 14px 0 6px; color: var(--text);
+    overflow-x: auto; white-space: pre;
+  }
+
+  /* hero */
+  .hero {
+    background:
+      radial-gradient(900px 360px at 12% -8%, rgba(244,98,58,0.14), transparent 60%),
+      radial-gradient(700px 320px at 90% 0%, rgba(108,182,255,0.08), transparent 55%);
+    border: 1px solid var(--border); border-radius: 18px;
+    padding: 38px 40px; margin: 8px 0 18px;
+  }
+  .hero h1 { font-size: 38px; }
+  .hero .lead { font-size: 18px; margin-top: 12px; }
+  .hero .meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 22px; }
+  .hero .meta span {
+    font-size: 12px; font-family: var(--mono); color: var(--text-dim);
+    background: var(--bg); border: 1px solid var(--border); border-radius: 7px; padding: 6px 11px;
+  }
+  .hero .meta span b { color: var(--accent-soft); font-weight: 600; }
+
+  .kbd {
+    font-family: var(--mono); font-size: 11.5px; background: var(--bg-card);
+    border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 5px;
+    padding: 1px 6px; color: var(--text);
+  }
+  hr { border: none; border-top: 1px solid var(--border); margin: 40px 0; }
+  .muted { color: var(--text-faint); font-size: 13px; }
+  .anchor-h { color: var(--text-faint); font-weight: 400; opacity: 0; transition: opacity .1s; font-size: .8em; }
+  h2:hover .anchor-h, h3:hover .anchor-h { opacity: 1; }
+
+  footer { border-top: 1px solid var(--border); margin-top: 60px; padding-top: 24px; color: var(--text-faint); font-size: 12.5px; }
+
+  @media (max-width: 980px) {
+    .layout { grid-template-columns: 1fr; }
+    aside { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--border); }
+    .content { padding: 30px 22px 80px; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<!-- ===================== SIDEBAR ===================== -->
+<aside>
+  <div class="brand">
+    <div class="logo">B</div>
+    <div>
+      <div class="title">Ballistic Engine</div>
+      <div class="sub">Docs &amp; API Reference</div>
+    </div>
+  </div>
+  <div class="search-wrap">
+    <input id="search" type="text" placeholder="Search the docs…  (press /)" autocomplete="off" spellcheck="false">
+  </div>
+  <nav id="nav">
+    <div class="group-label">Introduction</div>
+    <a href="#overview">Overview</a>
+    <a href="#what-is-what">What Is What</a>
+    <a href="#getting-started">Getting Started</a>
+    <a href="#general-flow">The General Flow</a>
+    <a href="#architecture">Architecture &amp; Layers</a>
+    <a href="#features">Feature List</a>
+
+    <div class="group-label">Core Concepts</div>
+    <a href="#object-model">Object Model</a>
+    <a href="#lifecycle">Component Lifecycle</a>
+    <a href="#scenes">Scenes &amp; Serialization</a>
+    <a href="#scripting">Game Scripting</a>
+    <a href="#assets">Asset Pipeline</a>
+    <a href="#prefabs">Prefabs</a>
+
+    <div class="group-label">Systems</div>
+    <a href="#input">Input</a>
+    <a href="#physics">Physics</a>
+    <a href="#animation">Animation</a>
+    <a href="#rendering">Rendering &amp; Volumes</a>
+    <a href="#lighting">Lights &amp; Materials</a>
+    <a href="#sky">Sky &amp; Atmosphere</a>
+    <a href="#audio">Audio</a>
+    <a href="#ui">UI Toolkit</a>
+    <a href="#networking">Networking</a>
+    <a href="#gameplay">Gameplay Framework</a>
+    <a href="#jobs">Jobs &amp; Threading</a>
+    <a href="#coroutines">Coroutines &amp; Async</a>
+    <a href="#persistence">Save System</a>
+
+    <div class="group-label">API Reference</div>
+    <a href="#api-entity">Entity</a>
+    <a href="#api-behaviour">Behaviour</a>
+    <a href="#api-transform">Transform</a>
+    <a href="#api-scenemanager">SceneManager</a>
+    <a href="#api-input">Input</a>
+    <a href="#api-physics">Physics</a>
+    <a href="#api-rigidbody">Rigidbody &amp; Colliders</a>
+    <a href="#api-math">Mathf &amp; Random</a>
+    <a href="#api-debug">Debug &amp; Gizmos</a>
+    <a href="#api-assetdb">AssetDatabase</a>
+    <a href="#api-events">BEvent</a>
+    <a href="#api-attributes">Inspector Attributes</a>
+
+    <div class="group-label">Tooling</div>
+    <a href="#editor">Using the Editor</a>
+    <a href="#cli">The <code>bal</code> CLI</a>
+    <a href="#mcp">MCP &amp; Live Control</a>
+    <a href="#envvars">Environment Variables</a>
+    <a href="#profiling">Profiling</a>
+    <a href="#building">Building a Player</a>
+  </nav>
+</aside>
+
+<!-- ===================== MAIN ===================== -->
+<main>
+<div class="content">
+
+<!-- ============================================================ OVERVIEW -->
+<section id="overview">
+  <div class="hero">
+    <h1>Ballistic Engine</h1>
+    <p class="lead">A custom, AI-native game engine written in modern C# / .NET&nbsp;9. Unity-familiar idioms, a from-scratch DX12 + DXR renderer with real-time Lumen-class global illumination, and a complete headless agent surface so the whole engine is operable from the command line.</p>
+    <div class="meta">
+      <span><b>Language</b> C# / .NET 9</span>
+      <span><b>Renderer</b> DirectX 12 + DXR</span>
+      <span><b>Editor</b> ImGui</span>
+      <span><b>Physics</b> BepuPhysics 2</span>
+      <span><b>Platform</b> Windows / PC</span>
+    </div>
+  </div>
+
+  <p>Ballistic Engine deliberately mirrors Unity's mental model — <code>Entity</code> + <code>Behaviour</code>, an <code>AssetDatabase</code> with <code>.meta</code> sidecars, an edit/play split, attribute-driven inspectors — so anyone who has used Unity is immediately productive. Under the hood it is its own thing: a clustered-deferred DX12 renderer with ray-traced GI and reflections, a server-authoritative networking stack, a code-driven animation system, and a first-class <strong>headless operability layer</strong> (the <code>bal</code> CLI, an MCP server, and a live editor pipe) that lets both humans and AI agents drive every part of the engine without a GUI.</p>
+
+  <div class="cards">
+    <div class="card"><span class="ico">🎮</span><h3><a href="#getting-started">Get Started</a></h3><p>Build, run the editor, and write your first script in five minutes.</p></div>
+    <div class="card"><span class="ico">🧭</span><h3><a href="#general-flow">The Flow</a></h3><p>How a project boots, plays, and renders — the loop end to end.</p></div>
+    <div class="card"><span class="ico">⚙️</span><h3><a href="#features">Features</a></h3><p>Everything the engine ships with, system by system.</p></div>
+    <div class="card"><span class="ico">📖</span><h3><a href="#api-entity">API Reference</a></h3><p>Exact signatures for every type a game scripter touches.</p></div>
+    <div class="card"><span class="ico">🖥️</span><h3><a href="#editor">The Editor</a></h3><p>Panels, gizmos, hot-reload and the play/stop workflow.</p></div>
+    <div class="card"><span class="ico">🤖</span><h3><a href="#cli">Headless CLI</a></h3><p>Drive scenes, render, simulate and query — all from <code>bal</code>.</p></div>
+  </div>
+
+  <div class="note tip"><span class="label">Tip</span>Press <span class="kbd">/</span> anywhere to focus the search box, then type a class name, a keyword, or a feature. Sections that don't match are hidden until you clear it (<span class="kbd">Esc</span>).</div>
+</section>
+
+<!-- ============================================================ WHAT IS WHAT -->
+<section id="what-is-what">
+  <h2>What Is What <a class="anchor-h" href="#what-is-what">#</a></h2>
+  <p class="lead">The engine is a set of cooperating projects. Here's the map so you know where each thing lives before diving in.</p>
+
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Project</th><th>What it is</th></tr></thead>
+    <tbody>
+      <tr><td><code>BallisticEngine</code> <span class="muted">(root)</span></td><td>The <strong>engine library</strong>. Globs every engine folder (<code>Engine/</code>, <code>Abstraction/</code>, <code>Physics/</code>, <code>AssetPipeline/</code>, <code>UI/</code>, <code>Audio/</code>, <code>Networking/</code>…) and excludes the executable subfolders. This is what your game references.</td></tr>
+      <tr><td><code>BallisticEngine.Runtime</code></td><td>The thin standalone <strong>player executable</strong> — boots the engine, loads a project, runs the game loop. No editor.</td></tr>
+      <tr><td><code>BallisticEngine.Editor</code></td><td>The <strong>ImGui editor</strong>: Hierarchy, Inspector, Asset Browser, Console, Profiler, Build panel, scene gizmos, and a named-pipe remote-control server.</td></tr>
+      <tr><td><code>BallisticEngine.DX12</code></td><td>The <strong>DirectX 12 + DXR rendering backend</strong>: clustered deferred shading, Lumen-class GI, RT reflections/shadows, SSGI/SSR/TAA, FSR upscaling, OIDN denoise, GPU scene queries.</td></tr>
+      <tr><td><code>BallisticEngine.Cli</code> (<code>bal</code>)</td><td>The headless <strong>agent CLI</strong>. Every verb prints JSON and returns an honest exit code — scene CRUD, import, render, simulate, spatial query, perf.</td></tr>
+      <tr><td><code>BallisticEngine.Mcp</code></td><td>A stdio <strong>MCP server</strong> bridging an AI agent to the editor's live command port.</td></tr>
+      <tr><td><code>BallisticEngine.SourceGen</code></td><td>Roslyn <strong>source generators</strong> (e.g. zero-reflection network state replication).</td></tr>
+      <tr><td><code>BallisticEngine.Profiling.Tracy</code></td><td>The optional <strong>Tracy</strong> profiler backend (kept out of the engine library so it never takes the native dependency).</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>The vocabulary</h3>
+  <p>A handful of nouns appear everywhere. Learn these and the rest of the docs read easily:</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Term</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>Entity</code></td><td>A game object: a transform plus a list of components. Unity's <em>GameObject</em>.</td></tr>
+      <tr><td><code>Behaviour</code></td><td>A component you attach to an entity. Subclass it to write gameplay logic. Unity's <em>MonoBehaviour</em>.</td></tr>
+      <tr><td><code>SceneBehaviour</code></td><td>A scene-wide component that lives on the scene itself, not an entity (Skybox, lighting, GameMode).</td></tr>
+      <tr><td><code>Transform</code></td><td>Position / rotation / scale + parent-child hierarchy. Every entity has exactly one.</td></tr>
+      <tr><td><code>Scene</code></td><td>A YAML file (<code>.scene</code>) holding entities, their components, and scene-wide components.</td></tr>
+      <tr><td><code>Asset</code></td><td>Anything under <code>Assets/</code> — a model, texture, material, scene, or script. Identified by a GUID in a <code>.meta</code> sidecar.</td></tr>
+      <tr><td><code>Project</code></td><td>A folder with <code>project.json</code> + <code>Assets/</code> + a regenerable <code>Library/</code> cache.</td></tr>
+      <tr><td><code>Volume</code></td><td>A post-processing overlay (bloom, exposure, GI, fog…) — Unity HDRP-style stacked profiles.</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- ============================================================ GETTING STARTED -->
+<section id="getting-started">
+  <h2>Getting Started <a class="anchor-h" href="#getting-started">#</a></h2>
+
+  <h3>Build &amp; run</h3>
+  <p>The solution is <code>BallisticEngine.slnx</code> (five projects). From the repo root:</p>
+  <pre><span class="lang-tag">shell</span><code><span class="c"># Build everything</span>
+dotnet build BallisticEngine.slnx
+
+<span class="c"># Launch the ImGui editor on the bundled sample project</span>
+dotnet run --project BallisticEngine.Editor
+
+<span class="c"># Launch the standalone player (no editor)</span>
+dotnet run --project BallisticEngine.Runtime
+
+<span class="c"># Point either at a different project folder:</span>
+dotnet run --project BallisticEngine.Editor  C:\path\to\MyProject</code></pre>
+  <p class="muted">If no project path is given, both default to the repo's <code>SampleProject</code>.</p>
+
+  <div class="note warn"><span class="label">Gotcha</span>After changing engine code, rebuild the <strong>root</strong> <code>BallisticEngine</code> library (not just the exe project) or the executable links a stale DLL.</p></div>
+
+  <h3>Your first script</h3>
+  <p>Game code is just <code>.cs</code> files anywhere under your project's <code>Assets/</code> folder — exactly like Unity. The file name must match the class name. Create <code>Assets/Spinner.cs</code>:</p>
+  <pre><span class="lang-tag">csharp</span><code><span class="k">using</span> BallisticEngine;
+
+<span class="c">// File: Spinner.cs  →  class name MUST be Spinner</span>
+<span class="k">public class</span> <span class="t">Spinner</span> : <span class="t">Behaviour</span> {
+    [<span class="at">Header</span>(<span class="s">"Rotation"</span>)]
+    [<span class="at">Range</span>(<span class="n">0f</span>, <span class="n">360f</span>)]
+    <span class="k">public float</span> <span class="m">DegreesPerSecond</span> = <span class="n">90f</span>;
+
+    <span class="c">// In a GAME assembly, lifecycle overrides must be `protected` (not protected internal).</span>
+    <span class="k">protected override void</span> <span class="m">Tick</span>(<span class="k">in float</span> delta) {
+        transform.<span class="m">Rotation</span> *= <span class="t">Quaternion</span>.<span class="m">FromAxisAngle</span>(
+            <span class="t">Vector3</span>.UnitY, <span class="t">Mathf</span>.<span class="m">Deg2Rad</span> * DegreesPerSecond * delta);
+    }
+}</code></pre>
+
+  <p>Alt-tab back to the editor (or press <span class="kbd">Ctrl</span>+<span class="kbd">R</span>) and it compiles automatically. <code>Spinner</code> now appears in the <em>Add Component</em> menu and the <code>DegreesPerSecond</code> slider shows in the Inspector — <strong>zero wiring</strong>. Drag the <code>.cs</code> tile onto an entity row to attach it. Press <span class="kbd">Space</span> to play and watch it spin.</p>
+
+  <div class="note danger"><span class="label">The one rule that bites everyone</span>In <strong>game</strong> assemblies, lifecycle overrides (<code>Tick</code>, <code>OnBegin</code>, <code>FixedTick</code>, …) must be declared <code>protected</code>, never <code>protected internal</code>. That's a C# cross-assembly override rule — the engine declares them <code>protected internal</code>, but your code can only widen to <code>protected</code>.</div>
+
+  <h3>Where to go next</h3>
+  <ul>
+    <li>Understand the runtime — <a href="#general-flow">The General Flow</a>.</li>
+    <li>Learn the object model — <a href="#object-model">Entity / Component</a> and the <a href="#lifecycle">lifecycle</a>.</li>
+    <li>Drive it without a GUI — the <a href="#cli"><code>bal</code> CLI</a>.</li>
+  </ul>
+</section>
+
+<!-- ============================================================ GENERAL FLOW -->
+<section id="general-flow">
+  <h2>The General Flow <a class="anchor-h" href="#general-flow">#</a></h2>
+  <p class="lead">From process launch to a rendered frame — the path data takes through the engine.</p>
+
+  <h3>1 · Boot</h3>
+  <p>A host (the player or the editor) hands its window and graphics device to <code>EngineBootstrap</code>, which wires the singletons: the <a href="#physics">physics world</a>, the renderer, the <a href="#assets">AssetDatabase</a>, audio, and networking are all <strong>injected</strong> behind interfaces so layers stay decoupled. Game scripts are compiled into <code>Library/ScriptAssemblies/GameScripts.dll</code> and loaded into a collectible context <em>before</em> the component registry is built, so your <code>Behaviour</code> types are known to the deserializer.</p>
+
+  <h3>2 · Load the scene</h3>
+  <p>The project's startup scene (<code>ScenesInBuild[0]</code>) is read from YAML. <a href="#scenes">SceneSerializer</a> reflects each component's members back from text, resolves asset references (<code>guid:…</code> → real <code>Mesh</code>/<code>Material</code> via the AssetDatabase), and rebuilds the transform hierarchy. <code>OnAttach</code> fires on every component in <strong>both</strong> edit and play mode — this is where rendering and audio register themselves.</p>
+
+  <h3>3 · Edit vs. Play</h3>
+  <p>The engine has a hard <strong>edit/play split</strong>, just like Unity:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Mode</th><th>What runs</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Edit</strong></td><td>Only <code>OnAttach</code>/<code>OnDetach</code> and gizmo drawing. No scripts tick, no physics. You arrange the scene.</td></tr>
+      <tr><td><strong>Play</strong> <span class="muted">(<span class="kbd">Space</span> in editor)</span></td><td><code>StartPlay()</code> snapshots the scene to YAML, then fires the full lifecycle: <code>OnEnabled</code> → <code>OnBegin</code> → per-frame <code>Tick</code> / fixed-step <code>FixedTick</code>. <code>StopPlay()</code> restores the snapshot so play never mutates your edit scene.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>4 · The frame loop</h3>
+  <p>Each frame, in order:</p>
+  <ol>
+    <li><strong>Fixed steps</strong> — the physics accumulator runs zero-or-more 60&nbsp;Hz steps; <code>FixedTick</code> fires before each, then Bepu solves, then poses are written back and contact events (<code>OnCollisionEnter</code>…) dispatch.</li>
+    <li><strong>Tick</strong> — every enabled <code>Behaviour.Tick(delta)</code> runs (gameplay, input handling, animation drive).</li>
+    <li><strong>Coroutines &amp; jobs</strong> — scheduled <a href="#jobs">jobs</a> flush, <a href="#coroutines">coroutines</a> resume.</li>
+    <li><strong>Render</strong> — the renderer reads <code>SceneManager.RenderCamera</code>, culls, and draws the frame (see below).</li>
+    <li><strong>Present</strong> — the swapchain flips. The editor's order is UI-build → scene-render → present so gizmo drags don't lag a frame.</li>
+  </ol>
+
+  <h3>5 · The render pipeline</h3>
+  <p>The DX12 backend runs a fixed, well-defined frame shape (TAA is the anti-aliasing — there is no MSAA path):</p>
+  <pre><span class="lang-tag">frame shape</span><code>cull → cascaded shadows (cached) → z-prepass → SSAO
+   → opaque (clustered deferred) → sky → transparent
+   → SSGI → SSR → volumetric fog → TAA / FSR
+   → auto-exposure meter → bloom → color grade → composite</code></pre>
+  <p>Off-screen geometry is culled on the GPU (compute frustum + Hi-Z occlusion), whole-mesh scenes are drawn with <em>ExecuteIndirect</em>, and global illumination is traced against the scene's ray-tracing acceleration structure (DXR), falling back to screen-space GI on hardware without RT. See <a href="#rendering">Rendering &amp; Volumes</a> for the full feature set.</p>
+
+  <div class="note"><span class="label">Headless too</span>Every step above runs <strong>without a window</strong> via the <a href="#cli"><code>bal</code> CLI</a>: <code>bal simulate</code> runs the real fixed-step + script loop, and <code>bal render</code> runs the real render pipeline to a deterministic image. The agent surface is not a mock — it's the engine.</div>
+</section>
+
+<!-- ============================================================ ARCHITECTURE -->
+<section id="architecture">
+  <h2>Architecture &amp; Layers <a class="anchor-h" href="#architecture">#</a></h2>
+  <p class="lead">The engine enforces strict, grep-auditable layering. Each layer may only reference the ones above it — this keeps the renderer swappable and the core portable.</p>
+
+  <div class="table-wrap"><table>
+    <thead><tr><th>Layer</th><th>May use</th><th>Must NOT use</th></tr></thead>
+    <tbody>
+      <tr><td><code>Shared/</code>, <code>ToolKit/</code></td><td>BCL only</td><td>everything else</td></tr>
+      <tr><td><code>Abstraction/</code></td><td>Shared, OpenTK.Mathematics</td><td>GPU calls, file formats</td></tr>
+      <tr><td><code>Engine/</code></td><td>Abstraction, Shared</td><td>Assimp/Stb/Magick, asset file I/O</td></tr>
+      <tr><td><code>Physics/</code></td><td>Abstraction, BepuPhysics</td><td>GPU, asset libs, Engine internals</td></tr>
+      <tr><td><code>AssetPipeline/</code></td><td>everything + import libs</td><td>direct GPU upload (goes via <code>RenderAsset</code>)</td></tr>
+      <tr><td><code>BallisticEngine.DX12/</code></td><td>Abstraction, Engine types</td><td>asset import libraries</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Dependency injection at the seams</h3>
+  <p>The big subsystems are interfaces resolved once at bootstrap, never reached for directly from gameplay:</p>
+  <ul>
+    <li><code>IPhysicsWorld</code> — only <code>Physics/Bepu/</code> references BepuPhysics; the rest of the engine talks to the interface. The static <code>Physics</code> facade is the public face.</li>
+    <li><code>IRenderer</code> / the DX12 backend — engine code emits render data; the backend consumes it.</li>
+    <li>Asset libraries (Assimp, StbImage, Magick) live <strong>only</strong> in <code>AssetPipeline/</code>.</li>
+    <li>BCL-only facades like <code>Profiler</code> and <code>JobSystem</code> are no-ops until a backend is installed.</li>
+  </ul>
+
+  <div class="note tip"><span class="label">Why this matters to you</span>You never <code>new</code> a physics world or a renderer. You call the static facades (<code>Physics.Raycast</code>, <code>Input.IsKeyDown</code>, <code>AssetDatabase.Load&lt;T&gt;</code>) and write <code>Behaviour</code> subclasses. The wiring is the engine's job.</div>
+</section>
+
+<!-- ============================================================ FEATURES -->
+<section id="features">
+  <h2>Feature List <a class="anchor-h" href="#features">#</a></h2>
+  <p class="lead">A bird's-eye inventory of what ships in the box, grouped by system. Each links to its reference section.</p>
+
+  <h3>Rendering <span class="pill new">DX12 + DXR</span></h3>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><strong>Clustered deferred shading</strong></td><td>4-MRT G-buffer, per-cluster light lists, full PBR sun + IBL + punctual lights.</td></tr>
+    <tr><td><strong>Lumen-class GI</strong></td><td>Real-time ray-traced global illumination over a DDGI world-radiance cache + screen radiance probes, multi-bounce, emissive-as-area-light.</td></tr>
+    <tr><td><strong>RT reflections &amp; shadows</strong></td><td>Mirror rays and sun-shadow rays against the scene TLAS; deterministic, contact-accurate.</td></tr>
+    <tr><td><strong>SSGI / SSR</strong></td><td>Horizon-bitmask screen-space GI and half-res reflections — the no-RT fallback path.</td></tr>
+    <tr><td><strong>Cascaded shadows</strong></td><td>1–4 cached cascades, PCF/PCSS contact-hardening, optional contact shadows.</td></tr>
+    <tr><td><strong>GPU-driven culling</strong></td><td>Compute frustum cull + Hi-Z occlusion + ExecuteIndirect — thousands of submeshes in a handful of draws.</td></tr>
+    <tr><td><strong>TAA + FSR</strong></td><td>Temporal anti-aliasing and FidelityFX Super-Resolution upscaling (Quality→UltraPerformance).</td></tr>
+    <tr><td><strong>Volumetric fog</strong></td><td>Physical height fog with sun in-scattering and god-rays.</td></tr>
+    <tr><td><strong>OIDN denoise</strong></td><td>Intel Open Image Denoise on the GI signal, zero-copy GPU path where available.</td></tr>
+    <tr><td><strong>Procedural sky</strong></td><td>Hillaire atmosphere, volumetric clouds, cirrus, stars, aerial perspective.</td></tr>
+    <tr><td><strong>Auto-exposure</strong></td><td>EV100 physical camera, histogram metering, eye-adaptation EMA.</td></tr>
+  </tbody></table></div>
+
+  <h3>Gameplay &amp; simulation</h3>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><strong>Entity / Behaviour model</strong></td><td>Unity-style components with the full lifecycle, edit/play split, and reflection-driven serialization.</td></tr>
+    <tr><td><strong>Physics</strong> <a href="#physics">↗</a></td><td>BepuPhysics 2 — rigidbodies, box/sphere/capsule/mesh colliders, raycasts &amp; sweeps, triggers, joints, an arcade vehicle controller.</td></tr>
+    <tr><td><strong>Animation</strong> <a href="#animation">↗</a></td><td>GPU skinning, clip playback with crossfade, code-driven Animancer-style mixers, 2D blend spaces, root motion, Mixamo retargeting.</td></tr>
+    <tr><td><strong>Networking</strong> <a href="#networking">↗</a></td><td>Server-authoritative replication, prediction &amp; reconciliation, lag compensation, interest management, source-gen state — LiteNetLib transport.</td></tr>
+    <tr><td><strong>Gameplay framework</strong> <a href="#gameplay">↗</a></td><td>Opt-in Unreal-style GameMode / Pawn / PlayerController / HUD / GameState with ordered init.</td></tr>
+    <tr><td><strong>Input</strong> <a href="#input">↗</a></td><td>Keyboard, mouse, and Xbox-style gamepad with a master gate so editor edits don't leak into play.</td></tr>
+    <tr><td><strong>Audio</strong> <a href="#audio">↗</a></td><td>OpenAL 3D spatial + 2D playback, AudioSource components, Doppler.</td></tr>
+    <tr><td><strong>UI Toolkit</strong> <a href="#ui">↗</a></td><td>Retained-mode flexbox UI (UXML + USS + C#) with a Yoga layout engine and a tween animator.</td></tr>
+    <tr><td><strong>Jobs</strong> <a href="#jobs">↗</a></td><td>Frame-scoped parallel-for over a foreground worker pool.</td></tr>
+    <tr><td><strong>Coroutines</strong> <a href="#coroutines">↗</a></td><td>Both <code>async/await</code> awaiters and classic <code>IEnumerator</code> yields.</td></tr>
+    <tr><td><strong>Save system</strong> <a href="#persistence">↗</a></td><td>Typed JSON save slots under per-project AppData.</td></tr>
+  </tbody></table></div>
+
+  <h3>Content &amp; tooling</h3>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><strong>Asset pipeline</strong> <a href="#assets">↗</a></td><td>GUID-based AssetDatabase, <code>.meta</code> sidecars, model/texture importers with BC compression, convention texture auto-bind, FBX unit fix.</td></tr>
+    <tr><td><strong>Unity import</strong></td><td>Import <code>.unitypackage</code> files or unpacked Unity <code>Assets/</code> folders (prefabs/scenes → <code>.scene</code>, LH→RH fix).</td></tr>
+    <tr><td><strong>Prefabs</strong> <a href="#prefabs">↗</a></td><td>Reusable entity blueprints with instance overrides, apply &amp; revert.</td></tr>
+    <tr><td><strong>The editor</strong> <a href="#editor">↗</a></td><td>Hierarchy, attribute-driven Inspector, Asset Browser, Console, Profiler, Build panel, scene gizmos, hot reload.</td></tr>
+    <tr><td><strong>Headless CLI</strong> <a href="#cli">↗</a></td><td>The <code>bal</code> verb set: scene CRUD, import, render, simulate, spatial query, gbuffer, perf — all JSON.</td></tr>
+    <tr><td><strong>Live control</strong> <a href="#mcp">↗</a></td><td>An MCP server + named-pipe protocol so agents drive the running editor (undoable, like human edits).</td></tr>
+    <tr><td><strong>Profiling</strong> <a href="#profiling">↗</a></td><td>In-editor realtime profiler + Tracy 0.11.1 backend + per-pass GPU timers.</td></tr>
+    <tr><td><strong>Build pipeline</strong> <a href="#building">↗</a></td><td>One-click self-contained Windows player with player settings (icon, window mode, version).</td></tr>
+  </tbody></table></div>
+</section>
+
+<!-- ============================================================ OBJECT MODEL -->
+<section id="object-model">
+  <h2>Object Model <a class="anchor-h" href="#object-model">#</a></h2>
+  <p class="lead">Everything in a scene is an <code>Entity</code> with a <code>Transform</code> and a list of <code>Behaviour</code> components. If you've used Unity, this is the GameObject / MonoBehaviour pattern.</p>
+
+  <h3>The hierarchy of types</h3>
+  <pre><span class="lang-tag">type tree</span><code><span class="t">BObject</span>              <span class="c">// identity (InstanceId) + Name; base of everything</span>
+ ├─ <span class="t">Entity</span>           <span class="c">// transform + components (the "GameObject")</span>
+ └─ <span class="t">Component</span>
+     └─ <span class="t">Behaviour</span>     <span class="c">// attachable, has the full lifecycle — you subclass this</span>
+         ├─ <span class="t">Transform</span>          <span class="c">// always present on every entity</span>
+         ├─ <span class="t">StaticMeshRenderer</span>
+         ├─ <span class="t">Rigidbody</span>, <span class="t">BoxCollider</span>, …
+         └─ <span class="t">YourScript</span>          <span class="c">// your gameplay code</span>
+
+<span class="t">SceneBehaviour</span>      <span class="c">// scene-wide component (Skybox, lighting, GameMode)</span></code></pre>
+
+  <h3>Working with entities &amp; components</h3>
+  <pre><span class="lang-tag">csharp</span><code><span class="c">// Create an entity and build it up</span>
+<span class="k">var</span> player = <span class="t">Entity</span>.<span class="m">Instantiate</span>(<span class="s">"Player"</span>);
+<span class="k">var</span> rb     = player.<span class="m">AddComponent</span>&lt;<span class="t">Rigidbody</span>&gt;();
+<span class="k">var</span> col    = player.<span class="m">AddComponent</span>&lt;<span class="t">CapsuleCollider</span>&gt;();
+
+<span class="c">// Look components up (the lookups also exist directly on Behaviour)</span>
+<span class="k">var</span> renderer = player.<span class="m">GetComponent</span>&lt;<span class="t">StaticMeshRenderer</span>&gt;();
+<span class="k">if</span> (player.<span class="m">TryGetComponent</span>&lt;<span class="t">Rigidbody</span>&gt;(<span class="k">out var</span> body)) body.<span class="m">AddForce</span>(<span class="t">Vector3</span>.UnitY * <span class="n">10</span>);
+
+<span class="k">var</span> gun  = player.<span class="m">GetComponentInChildren</span>&lt;<span class="t">Weapon</span>&gt;();
+<span class="k">var</span> root = player.<span class="m">GetComponentInParent</span>&lt;<span class="t">CharacterRoot</span>&gt;();
+
+<span class="c">// Tags, layers, activation</span>
+player.<span class="m">Tag</span> = <span class="s">"Player"</span>;
+<span class="k">if</span> (other.<span class="m">CompareTag</span>(<span class="s">"Enemy"</span>)) { … }
+player.<span class="m">SetActive</span>(<span class="k">false</span>);  <span class="c">// fires OnDisabled in play mode</span></code></pre>
+
+  <p>See the full <a href="#api-entity">Entity</a>, <a href="#api-behaviour">Behaviour</a> and <a href="#api-transform">Transform</a> reference tables for every member.</p>
+</section>
+
+<!-- ============================================================ LIFECYCLE -->
+<section id="lifecycle">
+  <h2>Component Lifecycle <a class="anchor-h" href="#lifecycle">#</a></h2>
+  <p class="lead">Override these on your <code>Behaviour</code> to hook into the engine. The split between "both modes" and "play only" is the thing to internalize.</p>
+
+  <div class="table-wrap"><table>
+    <thead><tr><th>Method</th><th>When</th><th>Use it for</th></tr></thead>
+    <tbody>
+      <tr><td><code>OnAttach()</code></td><td><strong>Both</strong> edit &amp; play — when added to an entity / scene loads</td><td>Register with the renderer or audio. Anything that must show in the edit viewport.</td></tr>
+      <tr><td><code>OnDetach()</code></td><td><strong>Both</strong> — when removed / scene clears</td><td>Unregister; mirror of <code>OnAttach</code>.</td></tr>
+      <tr><td><code>OnBegin()</code></td><td>Play, <strong>once</strong>, first time active</td><td>One-time init (Unity's <code>Start</code>). Cache components here.</td></tr>
+      <tr><td><code>OnEnabled()</code> / <code>OnDisabled()</code></td><td>Play, each (de)activation</td><td>Paired enable/disable logic.</td></tr>
+      <tr><td><code>Tick(in float delta)</code></td><td>Play, <strong>every frame</strong></td><td>Per-frame gameplay, input polling, animation drive.</td></tr>
+      <tr><td><code>FixedTick(in float delta)</code></td><td>Play, fixed 60&nbsp;Hz</td><td>Physics input — forces, velocities, impulses.</td></tr>
+      <tr><td><code>OnCollisionEnter/Stay/Exit(Collision)</code></td><td>Play, after each fixed step</td><td>React to solid contacts.</td></tr>
+      <tr><td><code>OnTriggerEnter/Stay/Exit(Collider)</code></td><td>Play, after each fixed step</td><td>React to trigger overlaps.</td></tr>
+      <tr><td><code>OnDrawGizmos(IGizmos)</code></td><td>Editor scene view, every frame</td><td>Always-on debug visualization.</td></tr>
+      <tr><td><code>OnDrawGizmosSelected(IGizmos)</code></td><td>Editor, when selected</td><td>Selection-only handles &amp; ranges.</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note danger"><span class="label">Register in OnAttach, not OnEnabled</span><code>OnEnabled</code> is play-only. If you register your renderer there, the editor viewport goes black in edit mode. Render and audio registration <strong>must</strong> live in <code>OnAttach</code>.</div>
+
+  <div class="note warn"><span class="label">Fault isolation</span>A script exception never crashes the engine — every dispatch site is guarded, logs an <code>Assets/…cs:line</code> stack, and a callback that throws 3× in a row auto-disables that component. Spawning and destroying entities from inside <code>Tick</code> is legal (iteration is snapshotted).</div>
+
+  <h3>A complete component</h3>
+  <pre><span class="lang-tag">csharp</span><code><span class="k">using</span> BallisticEngine;
+
+<span class="k">public class</span> <span class="t">PlayerController</span> : <span class="t">Behaviour</span> {
+    [<span class="at">Header</span>(<span class="s">"Movement"</span>)] [<span class="at">Range</span>(<span class="n">0f</span>, <span class="n">15f</span>)]
+    <span class="k">public float</span> <span class="m">MoveSpeed</span> = <span class="n">5f</span>;
+    [<span class="at">Range</span>(<span class="n">0f</span>, <span class="n">10f</span>)]
+    <span class="k">public float</span> <span class="m">JumpImpulse</span> = <span class="n">5f</span>;
+
+    <span class="t">Rigidbody</span> rb;
+
+    <span class="k">protected override void</span> <span class="m">OnBegin</span>() {
+        rb = <span class="m">GetComponent</span>&lt;<span class="t">Rigidbody</span>&gt;() ?? entity.<span class="m">AddComponent</span>&lt;<span class="t">Rigidbody</span>&gt;();
+    }
+
+    <span class="k">protected override void</span> <span class="m">FixedTick</span>(<span class="k">in float</span> dt) {
+        <span class="k">float</span> x = (<span class="t">Input</span>.<span class="m">IsKeyDown</span>(<span class="t">Keys</span>.D) ? <span class="n">1</span> : <span class="n">0</span>) - (<span class="t">Input</span>.<span class="m">IsKeyDown</span>(<span class="t">Keys</span>.A) ? <span class="n">1</span> : <span class="n">0</span>);
+        rb.<span class="m">Velocity</span> = <span class="k">new</span> <span class="t">Vector3</span>(x * MoveSpeed, rb.<span class="m">Velocity</span>.Y, <span class="n">0</span>);
+
+        <span class="k">if</span> (<span class="t">Input</span>.<span class="m">IsKeyPressed</span>(<span class="t">Keys</span>.Space) &amp;&amp; <span class="m">IsGrounded</span>())
+            rb.<span class="m">AddImpulse</span>(<span class="t">Vector3</span>.UnitY * JumpImpulse);
+    }
+
+    <span class="k">protected override void</span> <span class="m">OnCollisionEnter</span>(<span class="t">Collision</span> c) {
+        <span class="k">if</span> (c.Entity.<span class="m">CompareTag</span>(<span class="s">"Hazard"</span>)) <span class="t">Debug</span>.<span class="m">Log</span>(<span class="s">"Ouch!"</span>);
+    }
+
+    <span class="k">bool</span> <span class="m">IsGrounded</span>() =&gt; <span class="t">Physics</span>.<span class="m">Raycast</span>(transform.WorldPosition, <span class="t">Vector3</span>.Down, <span class="k">out</span> _, <span class="n">1.1f</span>);
+}</code></pre>
+</section>
+
+<!-- ============================================================ SCENES -->
+<section id="scenes">
+  <h2>Scenes &amp; Serialization <a class="anchor-h" href="#scenes">#</a></h2>
+  <p class="lead">A <code>.scene</code> is a human-readable YAML file. Components serialize by reflection — every public read/write property and public field round-trips, no boilerplate.</p>
+
+  <h3>The format</h3>
+  <pre><span class="lang-tag">yaml</span><code><span class="m">version</span>: <span class="n">1</span>
+<span class="m">name</span>: MainScene
+<span class="m">sceneComponents</span>:           <span class="c"># scene-wide SceneBehaviours</span>
+  - <span class="m">type</span>: ProceduralSky
+    <span class="m">id</span>: 6fa759e0556a44a0bdaa7400837a3a76
+    <span class="m">enabled</span>: <span class="k">true</span>
+    <span class="m">members</span>: { <span class="m">exposure</span>: <span class="n">1</span>, <span class="m">airDensity</span>: <span class="n">1</span> }
+<span class="m">entities</span>:
+  - <span class="m">id</span>: 362ce5ee44d943e586b4cd730433ffa5   <span class="c"># file-local; wires parents</span>
+    <span class="m">name</span>: Player
+    <span class="m">tag</span>: Player
+    <span class="m">transform</span>:
+      <span class="m">position</span>: { <span class="m">x</span>: <span class="n">0</span>, <span class="m">y</span>: <span class="n">1</span>, <span class="m">z</span>: <span class="n">0</span> }
+      <span class="m">rotation</span>: { <span class="m">x</span>: <span class="n">0</span>, <span class="m">y</span>: <span class="n">0</span>, <span class="m">z</span>: <span class="n">0</span>, <span class="m">w</span>: <span class="n">1</span> }
+      <span class="m">scale</span>:    { <span class="m">x</span>: <span class="n">1</span>, <span class="m">y</span>: <span class="n">1</span>, <span class="m">z</span>: <span class="n">1</span> }
+    <span class="m">components</span>:
+      - <span class="m">type</span>: StaticMeshRenderer
+        <span class="m">members</span>:
+          <span class="m">sharedMesh</span>: guid:1373de82334d41269f8bb0028d678db9
+          <span class="m">sharedMaterial</span>: guid:c13c6e1f320940ce81adcdcbda99e5b7
+      - <span class="m">type</span>: BoxCollider
+        <span class="m">members</span>: { <span class="m">size</span>: { <span class="m">x</span>: <span class="n">2</span>, <span class="m">y</span>: <span class="n">2</span>, <span class="m">z</span>: <span class="n">2</span> } }</code></pre>
+
+  <p>Defaults are omitted for clean diffs (<code>isActive: true</code>, <code>layer: 0</code>, <code>tag: Untagged</code>, <code>parent: null</code> never appear). Asset members serialize as <code>guid:…</code> (rename-proof) or as an <code>Assets/…</code> path. Component <code>id</code>s are preserved across save/load so editor selection and event listeners survive a reload.</p>
+
+  <h3>Loading &amp; querying in code</h3>
+  <pre><span class="lang-tag">csharp</span><code><span class="t">SceneSerializer</span>.<span class="m">Load</span>(<span class="s">"Assets/Scenes/Main.scene"</span>);
+<span class="t">Scene</span> scene = <span class="t">SceneManager</span>.<span class="m">GetCurrentScene</span>();
+
+<span class="k">foreach</span> (<span class="t">Entity</span> e <span class="k">in</span> scene.<span class="m">Entities</span>)
+    <span class="k">if</span> (e.<span class="m">TryGetComponent</span>&lt;<span class="t">StaticMeshRenderer</span>&gt;(<span class="k">out var</span> r))
+        <span class="t">Debug</span>.<span class="m">Log</span>($<span class="s">"{e.Name} → {r.SharedMesh?.Name}"</span>);</code></pre>
+
+  <div class="note"><span class="label">Two members opt out</span><code>[NotSerialized]</code> hides a public member from <strong>both</strong> YAML and the inspector (runtime-only state like <code>Rigidbody.Velocity</code>). <code>[HideInInspector]</code> hides it from the inspector only — it still serializes.</div>
+</section>
+
+<!-- ============================================================ SCRIPTING -->
+<section id="scripting">
+  <h2>Game Scripting <a class="anchor-h" href="#scripting">#</a></h2>
+  <p class="lead">Drop <code>.cs</code> files under <code>Assets/</code>. The engine compiles them into a hot-reloadable assembly and discovers your components by reflection — no registration, no manifest.</p>
+
+  <h3>How it compiles</h3>
+  <p>All game <code>.cs</code> files under <code>Assets/</code> build (via <code>dotnet build</code>) into <code>Library/ScriptAssemblies/GameScripts.dll</code>, loaded into a <strong>collectible</strong> <code>AssemblyLoadContext</code>. A <code>Scripts.csproj</code> is generated at the project root so your IDE opens game code as a real project with engine references. While its <em>"Generated by Ballistic Engine"</em> marker comment is present the engine manages it; delete the marker to take ownership (add NuGet packages, change settings) and the engine builds it as-is.</p>
+
+  <h3>Hot reload <span class="pill new">live, even during play</span></h3>
+  <ul>
+    <li><strong>Editor:</strong> automatic when you alt-tab back to the editor after editing in your IDE, plus manual <span class="kbd">Ctrl</span>+<span class="kbd">R</span> / File ▸ Rebuild Scripts.</li>
+    <li><strong>Compile-first:</strong> on errors <em>nothing</em> changes — they appear in the Console as <code>Assets/…(line,col): error CSxxxx</code>. On success the scene snapshots to YAML → unloads the old DLL → loads the new one → re-deserializes.</li>
+    <li><strong>Reload does not stop play.</strong> The live scene (play-mode spawns and mutated values) round-trips through YAML and the lifecycle restarts on the new types. The pre-play snapshot is untouched, so <em>Stop</em> still returns to the edit scene.</li>
+    <li><strong>Compile errors block running, not editing</strong> — the Play button disables with the reason in its tooltip; the standalone player exits code 1.</li>
+  </ul>
+
+  <h3>Discovery rules</h3>
+  <ul>
+    <li><strong>File name == class name</strong> (Unity's rule). <code>Spinner.cs</code> must contain <code>class Spinner</code>. Dragging the <code>.cs</code> tile onto an entity adds that component; onto empty hierarchy space creates an entity with it.</li>
+    <li>Public read/write properties and public fields serialize and appear in the inspector.</li>
+    <li>Lifecycle overrides must be <code>protected</code> in game code (see the <a href="#getting-started">getting-started gotcha</a>).</li>
+  </ul>
+</section>
+
+<!-- ============================================================ ASSETS -->
+<section id="assets">
+  <h2>Asset Pipeline <a class="anchor-h" href="#assets">#</a></h2>
+  <p class="lead">A Unity-style, GUID-based asset system. Sources live in <code>Assets/</code> with <code>.meta</code> sidecars; the importer bakes binary artifacts into a regenerable <code>Library/</code> cache.</p>
+
+  <h3>Project layout</h3>
+  <pre><span class="lang-tag">folders</span><code>MyProject/
+ ├─ project.json              <span class="c"># identity, scenes-in-build, player settings</span>
+ ├─ Scripts.csproj            <span class="c"># engine-generated; your game code project</span>
+ ├─ Assets/                   <span class="c"># SOURCES + .meta GUID sidecars</span>
+ │   ├─ Models/Car.fbx  +  Car.fbx.meta
+ │   ├─ Models/Car_Materials/*.mat      <span class="c"># auto-generated on import</span>
+ │   ├─ Scenes/Main.scene
+ │   └─ Spinner.cs            <span class="c"># game scripts live anywhere under Assets/</span>
+ └─ Library/                  <span class="c"># gitignored, regenerable</span>
+     ├─ Artifacts/*.bmesh,*.btex   <span class="c"># compiled binary assets</span>
+     ├─ ArtifactDB.json  +  guidmap.json
+     └─ ScriptAssemblies/GameScripts.dll</code></pre>
+
+  <h3>Loading assets</h3>
+  <pre><span class="lang-tag">csharp</span><code><span class="t">Mesh</span>     mesh = <span class="t">AssetDatabase</span>.<span class="m">Load</span>&lt;<span class="t">Mesh</span>&gt;(<span class="s">"Assets/Models/Car.fbx"</span>);
+<span class="t">Material</span> mat  = <span class="t">AssetDatabase</span>.<span class="m">Load</span>&lt;<span class="t">Material</span>&gt;(<span class="s">"Assets/Materials/Paint.mat"</span>);
+
+<span class="c">// Either reference form works (path is human-readable; guid is rename-proof):</span>
+<span class="k">var</span> a = <span class="t">AssetDatabase</span>.<span class="m">LoadRef</span>&lt;<span class="t">Material</span>&gt;(<span class="s">"Assets/Materials/Paint.mat"</span>);
+<span class="k">var</span> b = <span class="t">AssetDatabase</span>.<span class="m">LoadRef</span>&lt;<span class="t">Material</span>&gt;(<span class="s">"guid:c13c6e1f320940ce81adcdcbda99e5b7"</span>);</code></pre>
+  <p><code>Load&lt;T&gt;</code> caches by GUID (never loads twice) and <strong>never throws</strong> — on a missing or broken asset it logs and returns <code>null</code> (materials substitute fallback textures). See the <a href="#api-assetdb">AssetDatabase reference</a>.</p>
+
+  <h3>Importers &amp; native formats</h3>
+  <p>Source models/textures import to binary artifacts; several asset types are plain text and ship directly:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Format</th><th>What it is</th></tr></thead>
+    <tbody>
+      <tr><td><code>.mat</code></td><td>Material — shader ref + texture slots (Diffuse/Normal/Metallic/Roughness/AO/Emissive) + PBR factors. JSON.</td></tr>
+      <tr><td><code>.shader</code> / <code>.glsl</code></td><td>Shader program (vertex + fragment refs) and raw GLSL source.</td></tr>
+      <tr><td><code>.cubemap</code></td><td>Skybox — six faces or an equirect panorama. JSON.</td></tr>
+      <tr><td><code>.volume</code></td><td>A post-processing VolumeProfile — a list of VolumeComponent overrides. JSON.</td></tr>
+      <tr><td><code>.prefab</code></td><td>A captured entity subtree (same shape as a scene's <code>entities:</code> block). YAML.</td></tr>
+      <tr><td><code>.scene</code></td><td>A scene (see <a href="#scenes">Scenes</a>). YAML.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The <strong>ModelImporter</strong> merges a model into one submesh per material, generates a sibling <code>_Materials/</code> folder, auto-binds textures by filename convention (Megascans/Substance packs), and fixes FBX cm→m units. The <strong>TextureImporter</strong> BC-compresses with mips (BC1/BC3/BC5). Loading any image <em>as</em> a <code>Texture3D</code> builds an equirect cubemap. There's also a full <strong>Unity package importer</strong> (<code>.unitypackage</code> → <code>.scene</code>).</p>
+</section>
+
+<!-- ============================================================ PREFABS -->
+<section id="prefabs">
+  <h2>Prefabs <a class="anchor-h" href="#prefabs">#</a></h2>
+  <p class="lead">A prefab is a reusable entity blueprint — a captured subtree stored as a <code>.prefab</code> asset. Instances stay linked to the asset and track per-member overrides.</p>
+
+  <h3>Workflow in the editor</h3>
+  <ul>
+    <li><strong>Create</strong> — build an entity, select it, right-click ▸ <em>Create Prefab</em>. It saves a <code>.prefab</code> next to the current Asset Browser folder; the instance gets a prefab-root badge.</li>
+    <li><strong>Instantiate</strong> — drag the <code>.prefab</code> tile onto the Hierarchy.</li>
+    <li><strong>Override</strong> — edit any member on an instance; overridden members are marked. Right-click ▸ <em>Apply to Prefab</em> pushes it to the asset, or <em>Revert</em> discards it.</li>
+    <li><strong>Break / Apply All / Revert All</strong> — unlink the instance, or push/discard every override at once.</li>
+  </ul>
+
+  <h3>From code</h3>
+  <pre><span class="lang-tag">csharp</span><code><span class="t">PrefabAsset</span> prefab = <span class="t">AssetDatabase</span>.<span class="m">Load</span>&lt;<span class="t">PrefabAsset</span>&gt;(<span class="s">"Assets/Props/Crate.prefab"</span>);
+
+<span class="t">Entity</span> a = prefab.<span class="m">Instantiate</span>();                                    <span class="c">// at origin</span>
+<span class="t">Entity</span> b = prefab.<span class="m">Instantiate</span>(<span class="k">new</span> <span class="t">Vector3</span>(<span class="n">0</span>,<span class="n">1</span>,<span class="n">0</span>), <span class="t">Quaternion</span>.Identity);
+<span class="t">Entity</span> c = prefab.<span class="m">Instantiate</span>(parentTransform);                     <span class="c">// as a child</span></code></pre>
+</section>
+<!-- ============================================================ INPUT -->
+<section id="input">
+  <h2>Input <a class="anchor-h" href="#input">#</a></h2>
+  <p class="lead">A static facade for keyboard, mouse, and Xbox-style gamepads. A master gate keeps editor edits from leaking into play.</p>
+
+  <pre><span class="lang-tag">csharp</span><code><span class="k">protected override void</span> <span class="m">Tick</span>(<span class="k">in float</span> dt) {
+    <span class="c">// Keyboard</span>
+    <span class="k">if</span> (<span class="t">Input</span>.<span class="m">IsKeyDown</span>(<span class="t">Keys</span>.W))    transform.<span class="m">Position</span> += transform.<span class="m">Forward</span> * <span class="n">5</span> * dt;
+    <span class="k">if</span> (<span class="t">Input</span>.<span class="m">IsKeyPressed</span>(<span class="t">Keys</span>.Space)) <span class="m">Jump</span>();          <span class="c">// true for one frame</span>
+
+    <span class="c">// Mouse</span>
+    <span class="t">Vector2</span> look = <span class="t">Input</span>.<span class="m">MouseDelta</span>;
+    <span class="k">if</span> (<span class="t">Input</span>.<span class="m">IsMouseButtonPressed</span>(<span class="t">MouseButton</span>.Left)) <span class="m">Fire</span>();
+
+    <span class="c">// Gamepad (player 0)</span>
+    <span class="t">Vector2</span> move = <span class="t">Input</span>.<span class="m">GetLeftStick</span>();
+    <span class="k">if</span> (<span class="t">Input</span>.<span class="m">IsGamepadButtonPressed</span>(<span class="t">GamepadButton</span>.A)) <span class="m">Jump</span>();
+}</code></pre>
+
+  <div class="table-wrap"><table>
+    <thead><tr><th>Member</th><th>Returns</th></tr></thead>
+    <tbody>
+      <tr><td><code>IsKeyDown(Keys) / IsKeyPressed(Keys)</code></td><td>Held this frame / newly pressed this frame.</td></tr>
+      <tr><td><code>IsMouseButtonDown / IsMouseButtonPressed(MouseButton)</code></td><td>Held / newly pressed.</td></tr>
+      <tr><td><code>MousePosition / MouseDelta / ScrollDelta</code></td><td><code>Vector2</code> screen pos, per-frame motion, wheel.</td></tr>
+      <tr><td><code>GetLeftStick / GetRightStick(player)</code></td><td>Normalized <code>Vector2</code> stick value.</td></tr>
+      <tr><td><code>GetGamepadAxis(GamepadAxis, player)</code></td><td>Single axis (sticks / triggers), <code>float</code>.</td></tr>
+      <tr><td><code>IsGamepadButtonDown / Pressed(GamepadButton, player)</code></td><td>Gamepad button state.</td></tr>
+      <tr><td><code>Input.Enabled</code></td><td>Master gate — the editor sets it false unless the Game view is focused in play.</td></tr>
+    </tbody>
+  </table></div>
+  <p class="muted">Enums: <code>Keys</code>, <code>MouseButton</code>, <code>GamepadButton</code> (A/B/X/Y, bumpers, D-pad, stick presses…), <code>GamepadAxis</code> (LeftX/Y, RightX/Y, triggers).</p>
+  <div class="note"><span class="label">Gameplay framework note</span>The <a href="#gameplay">opt-in gameplay framework</a> adds a richer <strong>event-based, owner-routed</strong> input layer (<code>InputComponent</code> + bindable <code>InputAction</code>s) for networked games. The static <code>Input</code> facade above is the direct path most games use.</div>
+</section>
+
+<!-- ============================================================ PHYSICS -->
+<section id="physics">
+  <h2>Physics <a class="anchor-h" href="#physics">#</a></h2>
+  <p class="lead">BepuPhysics 2 behind the <code>IPhysicsWorld</code> interface. Add a <code>Rigidbody</code> + a collider, then drive it with forces in <code>FixedTick</code>. Runs in play mode at a fixed 60&nbsp;Hz.</p>
+
+  <h3>Bodies &amp; colliders</h3>
+  <p>A collider on an entity <strong>with</strong> a <code>Rigidbody</code> compounds into that body; a collider <strong>without</strong> one becomes static level geometry. Primitive colliders auto-fit to the render mesh on add.</p>
+  <pre><span class="lang-tag">csharp</span><code><span class="k">var</span> rb  = entity.<span class="m">AddComponent</span>&lt;<span class="t">Rigidbody</span>&gt;();
+rb.<span class="m">Mass</span> = <span class="n">2f</span>;  rb.<span class="m">UseGravity</span> = <span class="k">true</span>;
+<span class="k">var</span> col = entity.<span class="m">AddComponent</span>&lt;<span class="t">CapsuleCollider</span>&gt;();
+col.<span class="m">Radius</span> = <span class="n">0.3f</span>;  col.<span class="m">Height</span> = <span class="n">1.8f</span>;
+
+<span class="k">protected override void</span> <span class="m">FixedTick</span>(<span class="k">in float</span> dt) {
+    rb.<span class="m">AddForce</span>(<span class="t">Vector3</span>.UnitY * <span class="n">50</span>);            <span class="c">// continuous force (N)</span>
+    rb.<span class="m">AddImpulse</span>(dir * <span class="n">5</span>);                     <span class="c">// instantaneous (kg·m/s)</span>
+    rb.<span class="m">Velocity</span> = <span class="k">new</span> <span class="t">Vector3</span>(vx, rb.<span class="m">Velocity</span>.Y, vz);
+}</code></pre>
+  <p>Collider types: <code>BoxCollider</code> (Size), <code>SphereCollider</code> (Radius), <code>CapsuleCollider</code> (Radius, Height), <code>MeshCollider</code> (concave, <strong>static-only</strong>, uses the entity's mesh by default). All share <code>Center</code>, <code>Friction</code>, <code>Bounciness</code>, <code>IsTrigger</code>.</p>
+
+  <h3>Raycasts &amp; queries</h3>
+  <pre><span class="lang-tag">csharp</span><code><span class="k">if</span> (<span class="t">Physics</span>.<span class="m">Raycast</span>(origin, <span class="t">Vector3</span>.Down, <span class="k">out</span> <span class="t">RaycastHit</span> hit, <span class="n">100f</span>)) {
+    <span class="t">Debug</span>.<span class="m">Log</span>($<span class="s">"Hit {hit.Entity.Name} at {hit.Point}, n={hit.Normal}"</span>);
+}
+<span class="t">Physics</span>.<span class="m">SphereCast</span>(origin, <span class="n">0.5f</span>, dir, <span class="k">out</span> hit);
+<span class="t">List</span>&lt;<span class="t">Collider</span>&gt; near = <span class="t">Physics</span>.<span class="m">OverlapSphere</span>(center, <span class="n">3f</span>);</code></pre>
+
+  <h3>Triggers &amp; collisions</h3>
+  <pre><span class="lang-tag">csharp</span><code><span class="k">protected override void</span> <span class="m">OnCollisionEnter</span>(<span class="t">Collision</span> c) { <span class="c">/* c.Entity, c.Point, c.Normal, c.Rigidbody */</span> }
+<span class="k">protected override void</span> <span class="m">OnTriggerEnter</span>(<span class="t">Collider</span> other) { <span class="c">/* other.IsTrigger overlap */</span> }</code></pre>
+
+  <h3>Joints &amp; vehicles</h3>
+  <p>Constraints: <code>BallSocketJoint</code>, <code>HingeJoint</code> (Axis), <code>FixedJoint</code>, <code>SpringJoint</code> (TargetDistance), <code>SliderJoint</code> (Axis) — set <code>ConnectedBody</code> (null = world anchor), <code>Anchor</code>, <code>Frequency</code>, <code>DampingRatio</code>. An arcade <code>VehicleController</code> + <code>WheelCollider</code> drive a chassis rigidbody with suspension, gearbox, steering, downforce and anti-roll.</p>
+
+  <div class="note warn"><span class="label">Gotchas</span>Mesh collision is <strong>one-sided</strong> (solid from the rendered front face). Bepu has no restitution — bounce is modelled with soft contact springs. World scale is baked into shapes at body creation; scaling during play won't resize. See the <a href="#api-rigidbody">Rigidbody &amp; Colliders reference</a> for every member.</div>
+</section>
+
+<!-- ============================================================ ANIMATION -->
+<section id="animation">
+  <h2>Animation <a class="anchor-h" href="#animation">#</a></h2>
+  <p class="lead">GPU-skinned skeletal animation with two playback styles: a simple <code>Animator</code> (one clip + crossfade) and a code-driven <code>AnimancerComponent</code> (mixers, blend spaces, root motion, retargeting).</p>
+
+  <h3>Simple clip playback</h3>
+  <pre><span class="lang-tag">csharp</span><code><span class="k">var</span> anim = entity.<span class="m">AddComponent</span>&lt;<span class="t">Animator</span>&gt;();
+anim.<span class="m">Clip</span> = idleClip;  anim.<span class="m">Loop</span> = <span class="k">true</span>;
+anim.<span class="m">Play</span>(walkClip);
+anim.<span class="m">CrossFade</span>(runClip, <span class="n">0.3f</span>);   <span class="c">// blend over 0.3s</span>
+anim.<span class="m">AddEvent</span>(<span class="n">0.4f</span>, <span class="s">"footstep"</span>);  anim.<span class="m">OnEvent</span> += n =&gt; <span class="m">PlaySound</span>(n);</code></pre>
+
+  <h3>Code-driven (Animancer-style) <span class="pill new">no state-machine asset</span></h3>
+  <pre><span class="lang-tag">csharp</span><code><span class="k">var</span> a = <span class="m">GetComponent</span>&lt;<span class="t">AnimancerComponent</span>&gt;();
+a.<span class="m">Play</span>(walkClip, fade: <span class="n">0.2f</span>);
+
+<span class="c">// Blend N clips by weight, set per frame</span>
+<span class="k">var</span> mixer = <span class="k">new</span> <span class="t">AnimationMixer</span>();
+<span class="k">var</span> idle = mixer.<span class="m">Add</span>(idleClip, weight: <span class="n">1</span>);
+<span class="k">var</span> walk = mixer.<span class="m">Add</span>(walkClip, weight: <span class="n">0</span>);
+a.<span class="m">PlayMixer</span>(mixer);
+<span class="c">// in Tick: idle.Weight = 1 - speed; walk.Weight = speed; mixer.AdvanceTime(dt);</span>
+
+<span class="c">// 8-directional locomotion + root motion + Mixamo retarget</span>
+a.<span class="m">PlayBlendSpace</span>(blendSpace);  blendSpace.<span class="m">SetParameter</span>(inputVec);
+a.<span class="m">ApplyRootMotion</span> = <span class="k">true</span>;
+clip = a.<span class="m">Retarget</span>(mixamoClip);   <span class="c">// remap a clip onto this skeleton</span></code></pre>
+  <p>The <code>SkinnedMeshRenderer</code> is fed bone matrices each frame and GPU-skins in the vertex stage. <code>AnimationClip</code> is allocation-free CPU sampling; <code>RootMotion.Extract</code> pulls the per-frame root delta.</p>
+</section>
+
+<!-- ============================================================ RENDERING -->
+<section id="rendering">
+  <h2>Rendering &amp; Volumes <a class="anchor-h" href="#rendering">#</a></h2>
+  <p class="lead">The DX12 + DXR backend is feature-complete with Lumen-class GI. You don't talk to it directly — you place lights, assign materials, and tune the look through <strong>Volumes</strong> (Unity HDRP-style stacked post-processing).</p>
+
+  <h3>The Volume framework</h3>
+  <p>A <code>Volume</code> is a Behaviour (global, or a local box with <code>Priority</code> / <code>Weight</code> / <code>BlendDistance</code>) that points at a <code>VolumeProfile</code> (<code>.volume</code> asset). Each profile holds <code>VolumeComponent</code>s whose parameters override the engine defaults. The <code>VolumeManager</code> blends every active volume each frame by distance and priority; the renderer reads the blended stack.</p>
+  <pre><span class="lang-tag">workflow</span><code>Volume (entity)  →  VolumeProfile (.volume asset)  →  VolumeComponents
+                                                         (Bloom, Exposure,
+                                                          GlobalIllumination, …)</code></pre>
+  <p>In the editor: add a <code>Volume</code> component, assign or create a profile, then toggle component overrides inline. Defaults mirror the engine's so a no-volume scene looks identical.</p>
+
+  <h3>The post-FX you can tune</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>VolumeComponent</th><th>Key parameters</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Exposure</strong></td><td>mode (Fixed / Automatic / Histogram), EV100, compensation, metering, auto limits &amp; adaptation speed.</td></tr>
+      <tr><td><strong>GlobalIllumination</strong></td><td>GI mode (Off / ScreenSpace / RayTraced), reflections mode, intensity, DDGI &amp; screen-probe toggles, ray length, GI-isolate debug.</td></tr>
+      <tr><td><strong>Bloom</strong></td><td>intensity, threshold, soft knee.</td></tr>
+      <tr><td><strong>VolumetricFog</strong></td><td>density, height falloff, scattering, anisotropy, sun glow, step count, tint.</td></tr>
+      <tr><td><strong>AntiAliasing</strong></td><td>TAA enabled + feedback (MSAA is inert — TAA is the AA).</td></tr>
+      <tr><td><strong>Upscaling</strong> (FSR)</td><td>mode (Off / NativeAA / Quality / Balanced / Performance / UltraPerformance), sharpness.</td></tr>
+      <tr><td><strong>AmbientOcclusion</strong></td><td>radius, intensity.</td></tr>
+      <tr><td><strong>Shadows</strong></td><td>max distance, cascade count, split, blend, resolution, filtering (hard/PCF/PCSS), contact shadows, RT shadows.</td></tr>
+      <tr><td><strong>DepthOfField</strong></td><td>focus distance, focal length, aperture (f-number), max blur.</td></tr>
+      <tr><td><strong>ColorAdjustments / Vignette / LensEffects / FilmGrain / Sharpening</strong></td><td>contrast, saturation, vignette, chromatic aberration, distortion, grain, unsharp mask.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Stats</h3>
+  <p><code>RenderStats</code> (per Scene / Game view) exposes <code>DrawCalls</code>, <code>Triangles</code>, <code>RenderersVisible/Culled</code>, <code>PunctualLights</code>, per-pass GPU milliseconds, and <code>CpuFrameMs</code> — shown in the editor Stats overlay and written to a <code>.stats.json</code> sidecar next to every screenshot. See <a href="#envvars">environment variables</a> for the per-feature debug toggles.</p>
+</section>
+
+<!-- ============================================================ LIGHTING -->
+<section id="lighting">
+  <h2>Lights &amp; Materials <a class="anchor-h" href="#lighting">#</a></h2>
+
+  <h3>Lights</h3>
+  <p>All lights register in <code>OnAttach</code> (visible in edit mode). Units are physical.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Component</th><th>Key properties</th></tr></thead>
+    <tbody>
+      <tr><td><code>DirectionalLight</code> <span class="muted">(the sun, singleton)</span></td><td><code>Illuminance</code> (lux, ~80000 midday), <code>ColorTemperature</code> (K), <code>AngularDiameter</code> (°, drives highlight &amp; shadow softness), <code>AmbientColor</code>/<code>ambientIntensity</code>. Read the active one via <code>DirectionalLight.Instance</code>.</td></tr>
+      <tr><td><code>PointLight</code></td><td><code>Color</code>, <code>Lumens</code> (0–20000), <code>Intensity</code>, <code>ColorTemperature</code>, <code>Range</code>, <code>SourceRadius</code> (soft area specular), <code>CastShadows</code>.</td></tr>
+      <tr><td><code>SpotLight</code></td><td>Same as PointLight + <code>InnerAngle</code> / <code>OuterAngle</code> (the cone). Points along the entity's forward.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Materials (PBR)</h3>
+  <p>A <code>Material</code> binds a shader + textures and PBR factors. Texture slots: <strong>Diffuse, Normal, Metallic, Roughness, AO, Emissive</strong>. Factors follow glTF semantics: <code>BaseColorFactor</code>, <code>MetallicFactor</code>, <code>RoughnessFactor</code>, <code>SpecularReflectance</code>, optional <code>Clearcoat</code>. Flags: <code>Transparent</code>/<code>Opacity</code>, <code>Cutout</code> (alpha-discard foliage), <code>PackedOrm</code> (occlusion-roughness-metallic packed), <code>NormalStrength</code>/<code>NormalFlipY</code>.</p>
+  <pre><span class="lang-tag">csharp</span><code><span class="c">// Per-renderer runtime override (cloned on first access, NOT serialized):</span>
+renderer.<span class="m">Material</span>.<span class="m">RoughnessFactor</span> = <span class="n">0.2f</span>;
+<span class="c">// Shared asset (affects every renderer using it):</span>
+renderer.<span class="m">SharedMaterial</span> = <span class="t">AssetDatabase</span>.<span class="m">Load</span>&lt;<span class="t">Material</span>&gt;(<span class="s">"Assets/Mat/Chrome.mat"</span>);</code></pre>
+</section>
+
+<!-- ============================================================ SKY -->
+<section id="sky">
+  <h2>Sky &amp; Atmosphere <a class="anchor-h" href="#sky">#</a></h2>
+  <p class="lead">A physically-based <code>ProceduralSky</code> SceneBehaviour (Rayleigh + Mie + ozone, Hillaire-style) or a simple HDRI <code>Skybox</code>. The active sky feeds the sky draw, IBL bake, and GI sky fallback.</p>
+
+  <div class="table-wrap"><table>
+    <thead><tr><th>ProceduralSky property</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>AirDensity</code> / <code>Haze</code> / <code>OzoneDensity</code></td><td>Rayleigh blueness, Mie aerosol haze, twilight absorption.</td></tr>
+      <tr><td><code>HazeAnisotropy</code> / <code>SunDiskIntensity</code></td><td>Mie phase tightness toward the sun; visible disk brightness.</td></tr>
+      <tr><td><code>MultipleScattering</code> / <code>GroundColor</code></td><td>Multi-bounce approximation; ground-bounce ambient hemisphere.</td></tr>
+      <tr><td><code>CloudsEnabled</code> + coverage/density/altitude/thickness/wind</td><td>Raymarched volumetric cumulus baked into the sky cubemap.</td></tr>
+      <tr><td><code>CirrusCoverage</code> / <code>StarIntensity</code></td><td>Thin ice-cloud sheet; procedural starfield at night.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The simpler <code>Skybox</code> takes a <code>Cubemap</code> (Texture3D — an equirect <code>.hdr</code>/<code>.exr</code> auto-converts), an <code>Exposure</code> multiplier, and <code>RotationEuler</code>.</p>
+</section>
+
+<!-- ============================================================ AUDIO -->
+<section id="audio">
+  <h2>Audio <a class="anchor-h" href="#audio">#</a></h2>
+  <p class="lead">3D spatial + 2D audio over OpenAL. Attach an <code>AudioSource</code> for inspector-driven sounds, or fire one-shots through the static <code>Audio</code> facade.</p>
+
+  <pre><span class="lang-tag">csharp</span><code><span class="c">// Component: assign Clip in the inspector, PlayOnAwake/Loop/Volume/Pitch/Spatial</span>
+<span class="k">var</span> src = entity.<span class="m">AddComponent</span>&lt;<span class="t">AudioSource</span>&gt;();
+src.<span class="m">Clip</span> = AssetDatabase.<span class="m">Load</span>&lt;<span class="t">AudioClip</span>&gt;(<span class="s">"Assets/Sfx/Engine.wav"</span>);
+src.<span class="m">Spatial</span> = <span class="k">true</span>;  src.<span class="m">MinDistance</span> = <span class="n">1</span>;  src.<span class="m">MaxDistance</span> = <span class="n">100</span>;
+src.<span class="m">Play</span>();  <span class="c">// also: Stop / Pause / Resume; IsPlaying</span>
+
+<span class="c">// One-shots via the facade</span>
+<span class="t">Audio</span>.<span class="m">PlayAtPoint</span>(hitClip, impact.Position, volume: <span class="n">0.8f</span>);  <span class="c">// 3D</span>
+<span class="t">Audio</span>.<span class="m">Play</span>(uiClick, volume: <span class="n">1f</span>);                          <span class="c">// 2D</span>
+<span class="t">Audio</span>.<span class="m">MasterVolume</span> = <span class="n">0.7f</span>;</code></pre>
+  <p>An <code>AudioListener</code> (the ears) is usually on the camera. Voices (<code>IAudioVoice</code>) expose <code>Volume</code>, <code>Pitch</code>, <code>Position</code>, <code>Velocity</code> (Doppler) and <code>TimeSeconds</code> (seek).</p>
+</section>
+
+<!-- ============================================================ UI -->
+<section id="ui">
+  <h2>UI Toolkit <a class="anchor-h" href="#ui">#</a></h2>
+  <p class="lead">A retained-mode UI inspired by Unity's UI Toolkit: <strong>UXML</strong> for structure, <strong>USS</strong> for style, C# for logic — laid out with a Yoga (CSS Flexbox) engine.</p>
+
+  <pre><span class="lang-tag">uxml</span><code><span class="c">&lt;!-- Assets/UI/MainMenu.uxml --&gt;</span>
+&lt;<span class="t">UIDocument</span>&gt;
+  &lt;<span class="t">Panel</span> name=<span class="s">"root"</span> class=<span class="s">"menu"</span>&gt;
+    &lt;<span class="t">Label</span> text=<span class="s">"My Game"</span> /&gt;
+    &lt;<span class="t">Button</span> text=<span class="s">"Play"</span> name=<span class="s">"playBtn"</span> /&gt;
+    &lt;<span class="t">Button</span> text=<span class="s">"Quit"</span> name=<span class="s">"quitBtn"</span> /&gt;
+  &lt;/<span class="t">Panel</span>&gt;
+&lt;/<span class="t">UIDocument</span>&gt;</code></pre>
+  <pre><span class="lang-tag">uss</span><code><span class="m">.menu</span> { flex-direction: column; justify-content: center; align-items: center; }
+<span class="t">Button</span> { width: <span class="n">200px</span>; height: <span class="n">60px</span>; margin: <span class="n">10px</span>; }
+<span class="t">Button</span>:hover { background-color: <span class="m">#4a4a4a</span>; }</code></pre>
+  <pre><span class="lang-tag">csharp</span><code><span class="k">public class</span> <span class="t">MainMenu</span> : <span class="t">Behaviour</span> {
+    <span class="k">protected override void</span> <span class="m">OnBegin</span>() {
+        <span class="k">var</span> doc = <span class="m">GetComponent</span>&lt;<span class="t">UIDocument</span>&gt;();
+        doc.<span class="m">Root</span>.<span class="m">Q</span>&lt;<span class="t">Button</span>&gt;(<span class="s">"playBtn"</span>).<span class="m">Clicked</span> += <span class="m">StartGame</span>;
+
+        <span class="c">// Build UI in code too:</span>
+        <span class="k">var</span> btn = <span class="k">new</span> <span class="t">Button</span>(<span class="s">"+"</span>);
+        btn.<span class="m">Style</span>.<span class="m">FlexDirection</span> = <span class="t">FlexDirection</span>.Row;
+        doc.<span class="m">Root</span>.<span class="m">Add</span>(btn);  doc.<span class="m">ApplyStyles</span>();
+    }
+}</code></pre>
+  <p>Elements: <code>VisualElement</code> (base), <code>Panel</code>, <code>Label</code>, <code>Button</code>, <code>Image</code>. <code>UIDocument</code> mounts a tree on screen (ScreenSpaceOverlay or WorldSpace, with reference-resolution scaling). A <code>UIAnimator</code> tweens any style float (<code>TweenTo</code>, <code>StartLoop</code>) with easing. Pointer events (<code>PointerEnter/Down/Up/Click</code>) are C# events you subscribe to directly.</p>
+  <div class="note"><span class="label">Heads-up</span>The UI system mirrors Unity UI Toolkit closely (UXML/USS/flexbox) but is a young subsystem — the element library is the core set above rather than the full Unity control gallery.</div>
+</section>
+
+<!-- ============================================================ NETWORKING -->
+<section id="networking">
+  <h2>Networking <a class="anchor-h" href="#networking">#</a></h2>
+  <p class="lead">A server-authoritative replication framework: prediction &amp; reconciliation, lag compensation, interest management, and zero-reflection state replication via source generation. LiteNetLib transport, loopback for single-player.</p>
+
+  <h3>Networked components</h3>
+  <p>Subclass <code>NetworkBehaviour</code>, mark replicated state with <code>[Networked]</code>, and expose RPCs with <code>[Rpc]</code>. The source generator writes the (de)serialization — no reflection in the hot path.</p>
+  <pre><span class="lang-tag">csharp</span><code><span class="k">public class</span> <span class="t">PlayerPawn</span> : <span class="t">NetworkBehaviour</span> {
+    [<span class="at">Networked</span>] <span class="k">public</span> <span class="t">Vector3</span> <span class="m">Position</span> { <span class="k">get; set;</span> }
+    [<span class="at">Networked</span>] <span class="k">public float</span> <span class="m">Health</span> { <span class="k">get; set;</span> }
+
+    [<span class="at">Rpc</span>(<span class="t">RpcTarget</span>.Server)]
+    <span class="k">public void</span> <span class="m">Fire</span>(<span class="t">Vector3</span> dir) {
+        <span class="k">if</span> (!IsOwner) <span class="k">return</span>;                      <span class="c">// owner-gated</span>
+        <span class="t">Network</span>.<span class="m">LagCompensatedRaycast</span>(origin, dir, <span class="t">Network</span>.<span class="m">RenderTick</span>, <span class="k">this</span>, <span class="k">out var</span> hit);
+    }
+
+    <span class="k">protected override void</span> <span class="m">NetworkTick</span>() {
+        <span class="k">if</span> (HasInputAuthority) Position += <span class="m">Input</span>() * speed;  <span class="c">// predicted</span>
+    }
+    <span class="k">protected override void</span> <span class="m">OnStateApplied</span>() => transform.<span class="m">WorldPosition</span> = Position;
+
+    [<span class="at">OnChanged</span>(nameof(Health))] <span class="k">void</span> <span class="m">HpChanged</span>() => bar.<span class="m">Set</span>(Health);
+}</code></pre>
+
+  <h3>Roles &amp; bring-up</h3>
+  <p>Role queries on every networked component: <code>IsOwner</code>, <code>HasStateAuthority</code>, <code>HasInputAuthority</code>, <code>IsProxy</code>, <code>IsAutonomousProxy</code>, <code>IsSimulatedProxy</code>. Net-strand callbacks: <code>OnSpawned</code>, <code>OnStartServer/Client/LocalPlayer</code>, <code>OnOwnershipChanged</code>, <code>OnInterestLost/Gained</code>.</p>
+  <pre><span class="lang-tag">csharp</span><code><span class="t">Network</span>.<span class="m">StartHost</span>();                              <span class="c">// single-player = loopback, same code path</span>
+<span class="t">Network</span>.<span class="m">StartServer</span>(<span class="k">new</span> <span class="t">LiteNetLibTransport</span>());
+<span class="t">Network</span>.<span class="m">StartClient</span>(<span class="k">new</span> <span class="t">LiteNetLibTransport</span>());
+<span class="t">NetworkObject</span> obj = <span class="t">Network</span>.<span class="m">Spawn</span>(entity, owner);</code></pre>
+  <p>RPC targets: <code>Server</code>, <code>Clients</code>, <code>All</code>, <code>Owner</code>. State <code>[Networked]</code> supports opt-in quantization (<code>Min</code>/<code>Max</code>/<code>Bits</code>).</p>
+</section>
+
+<!-- ============================================================ GAMEPLAY -->
+<section id="gameplay">
+  <h2>Gameplay Framework <a class="anchor-h" href="#gameplay">#</a></h2>
+  <p class="lead">An <strong>opt-in</strong>, Unreal-style layer on top of Entity/Behaviour. It activates only when a scene declares a <code>GameMode</code> — otherwise the engine behaves exactly as before, byte-identical.</p>
+
+  <div class="table-wrap"><table>
+    <thead><tr><th>Class</th><th>Role</th><th>Override</th></tr></thead>
+    <tbody>
+      <tr><td><code>GameMode</code> <span class="muted">(SceneBehaviour)</span></td><td>Server-only rules &amp; spawn authority.</td><td><code>InitGame()</code>, <code>ResolvePawn(conn)</code>, <code>SpawnPosition(conn)</code>, <code>OnPlayerJoined/Left</code>.</td></tr>
+      <tr><td><code>Pawn</code> <span class="muted">(NetworkBehaviour)</span></td><td>The possessable body.</td><td><code>OnPossessed(pc)</code>, <code>OnUnpossessed()</code>.</td></tr>
+      <tr><td><code>PlayerController</code> <span class="muted">(NetworkBehaviour)</span></td><td>Input authority; operates a pawn.</td><td><code>SetupInput(input)</code> (owner-only), <code>Possess/Unpossess</code>.</td></tr>
+      <tr><td><code>HUD</code> <span class="muted">(SceneBehaviour)</span></td><td>Client-only presentation.</td><td><code>Init()</code> — bind to <code>Controller</code> / <code>PlayerState</code>.</td></tr>
+      <tr><td><code>GameState</code> / <code>PlayerState</code></td><td>Replicated match-wide / per-player data.</td><td><code>[Networked]</code> fields.</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>Init runs in a fixed order via the phase runner: <strong>0</strong> <code>GameMode.InitGame</code> → <strong>1</strong> per controller: spawn → <code>ResolvePawn</code> → spawn pawn → <code>Possess</code> → <strong>2</strong> <code>HUD.Init</code> → <strong>3</strong> the normal <code>OnBegin</code> for everything else. Input binding in <code>SetupInput</code> fires <strong>only</strong> on the owning machine, so no proxy-gate code is needed.</p>
+</section>
+
+<!-- ============================================================ JOBS -->
+<section id="jobs">
+  <h2>Jobs &amp; Threading <a class="anchor-h" href="#jobs">#</a></h2>
+  <p class="lead">A frame-scoped parallel-for facade for per-frame CPU bulk work (animation, culling, particles). Not for background I/O, not for GPU calls.</p>
+  <pre><span class="lang-tag">csharp</span><code><span class="k">public struct</span> <span class="t">PoseJob</span> : <span class="t">IJobParallelFor</span> {
+    <span class="k">public int</span> <span class="m">BatchSize</span> => <span class="n">64</span>;
+    <span class="k">public void</span> <span class="m">Execute</span>(<span class="k">int</span> i) { poses[i] = <span class="m">Evaluate</span>(anims[i]); }
+    <span class="k">public void</span> <span class="m">Finish</span>() { }
+}
+
+<span class="t">JobHandle</span> h = <span class="t">JobSystem</span>.<span class="m">Schedule</span>(<span class="k">new</span> <span class="t">PoseJob</span>(), bones.Length);
+<span class="c">// … other work …</span>
+h.<span class="m">Complete</span>();                       <span class="c">// block until done</span>
+<span class="t">JobSystem</span>.<span class="m">For</span>(count, i => <span class="m">Work</span>(i));    <span class="c">// immediate-mode parallel-for</span></code></pre>
+  <div class="note warn"><span class="label">Two rules</span>No GL/GPU calls from a job. And because workers are <strong>foreground</strong> threads, a host must call <code>JobSystem.Shutdown()</code> after its window loop returns or the process never exits (the engine hosts already do this).</div>
+</section>
+
+<!-- ============================================================ COROUTINES -->
+<section id="coroutines">
+  <h2>Coroutines &amp; Async <a class="anchor-h" href="#coroutines">#</a></h2>
+  <p class="lead">Two interoperating styles — modern <code>async/await</code> awaiters (preferred) and classic Unity-style <code>IEnumerator</code> yields. Both resume on the main thread.</p>
+  <pre><span class="lang-tag">csharp</span><code><span class="c">// async / await — preferred</span>
+<span class="k">async void</span> <span class="m">Spawn</span>() {
+    <span class="k">await</span> <span class="t">Coroutine</span>.<span class="m">DelaySeconds</span>(<span class="n">2f</span>);
+    <span class="k">await</span> <span class="t">Coroutine</span>.<span class="m">WaitUntil</span>(() => player.IsReady);
+    <span class="m">SpawnEnemy</span>();
+}
+
+<span class="c">// classic IEnumerator</span>
+<span class="t">IEnumerator</span>&lt;<span class="t">IYieldInstruction</span>&gt; <span class="m">Blink</span>() {
+    <span class="k">while</span> (<span class="k">true</span>) { <span class="m">Flash</span>(); <span class="k">yield return new</span> <span class="t">WaitForSeconds</span>(<span class="n">0.5f</span>); }
+}
+<span class="m">StartCoroutine</span>(<span class="m">Blink</span>());
+
+<span class="c">// one-liners</span>
+<span class="t">Coroutine</span>.<span class="m">RunAfter</span>(<span class="n">1.5f</span>, () => <span class="t">Debug</span>.<span class="m">Log</span>(<span class="s">"done"</span>));
+<span class="t">Coroutine</span>.<span class="m">RunWhen</span>(() => hp &lt;= <span class="n">0</span>, <span class="m">Die</span>);</code></pre>
+  <p>Awaiters: <code>NextFrame</code>, <code>WaitForFixedTick</code>, <code>EndOfFrame</code>, <code>DelaySeconds</code>, <code>WaitUntil</code>, <code>WaitWhile</code>. Yield types: <code>WaitForSeconds</code>, <code>WaitForFixedUpdate</code>, <code>WaitForNextFrame</code>, <code>WaitUntil</code>, <code>WaitWhile</code>.</p>
+</section>
+
+<!-- ============================================================ PERSISTENCE -->
+<section id="persistence">
+  <h2>Save System <a class="anchor-h" href="#persistence">#</a></h2>
+  <p class="lead">Typed JSON save slots under per-project AppData. Serialize any plain class.</p>
+  <pre><span class="lang-tag">csharp</span><code><span class="k">class</span> <span class="t">SaveGame</span> { <span class="k">public int</span> <span class="m">Score</span>; <span class="k">public string</span> <span class="m">Level</span>; }
+
+<span class="t">SaveData</span>.<span class="m">Save</span>(<span class="s">"slot1"</span>, <span class="k">new</span> <span class="t">SaveGame</span> { Score = <span class="n">100</span>, Level = <span class="s">"Forest"</span> });
+<span class="t">SaveGame</span> g = <span class="t">SaveData</span>.<span class="m">Load</span>&lt;<span class="t">SaveGame</span>&gt;(<span class="s">"slot1"</span>, fallback: <span class="k">new</span>());
+<span class="k">bool</span> exists = <span class="t">SaveData</span>.<span class="m">Exists</span>(<span class="s">"slot1"</span>);
+<span class="t">SaveData</span>.<span class="m">Delete</span>(<span class="s">"slot1"</span>);</code></pre>
+  <p class="muted">Slots are JSON files under <code>%AppData%/Ballistic/&lt;ProjectName&gt;/Saves</code>.</p>
+</section>
+<!-- ============================================================ API: ENTITY -->
+<section id="api-entity">
+  <h2>API · Entity <a class="anchor-h" href="#api-entity">#</a></h2>
+  <p class="muted">Namespace <code>BallisticEngine</code>. The game object — a transform plus a list of behaviours.</p>
+  <h4>Methods</h4>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><code>static Entity Instantiate(string name = "Entity", bool isActive = true)</code></td><td>Create a new entity.</td></tr>
+    <tr><td><code>T AddComponent&lt;T&gt;()</code> / <code>Behaviour AddComponent(Type)</code></td><td>Attach a component (typed or by runtime type).</td></tr>
+    <tr><td><code>void RemoveComponent(Behaviour)</code></td><td>Remove and tear down a component.</td></tr>
+    <tr><td><code>T GetComponent&lt;T&gt;()</code></td><td>First component of type, or <code>null</code>.</td></tr>
+    <tr><td><code>bool TryGetComponent&lt;T&gt;(out T)</code></td><td>Safe lookup returning a bool.</td></tr>
+    <tr><td><code>List&lt;T&gt; GetComponents&lt;T&gt;()</code></td><td>All components of type T.</td></tr>
+    <tr><td><code>T GetComponentInChildren&lt;T&gt;(bool includeInactive = false)</code></td><td>First match in the subtree.</td></tr>
+    <tr><td><code>T GetComponentInParent&lt;T&gt;(bool includeInactive = false)</code></td><td>First match in the ancestor chain.</td></tr>
+    <tr><td><code>IEnumerable&lt;Entity&gt; DirectChildren()</code></td><td>Direct children only.</td></tr>
+    <tr><td><code>void SetActive(bool)</code></td><td>Toggle active; fires enable/disable in play mode.</td></tr>
+    <tr><td><code>bool CompareTag(string)</code></td><td>Safe tag comparison.</td></tr>
+  </tbody></table></div>
+  <h4>Properties</h4>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><code>Transform transform</code></td><td>Always present.</td></tr>
+    <tr><td><code>List&lt;Behaviour&gt; Behaviours</code></td><td>All attached components.</td></tr>
+    <tr><td><code>bool IsActive / IsActiveInHierarchy</code></td><td>Own flag / true only if all ancestors active too.</td></tr>
+    <tr><td><code>bool IsDestroyed</code></td><td>Marked for teardown.</td></tr>
+    <tr><td><code>string Tag</code> · <code>int Layer</code></td><td>Gameplay grouping; physics/render layer 0–31.</td></tr>
+    <tr><td><code>Guid PrefabSource</code> · <code>bool IsPrefabInstance</code></td><td>Link to a <code>.prefab</code> asset, if any.</td></tr>
+  </tbody></table></div>
+</section>
+
+<!-- ============================================================ API: BEHAVIOUR -->
+<section id="api-behaviour">
+  <h2>API · Behaviour <a class="anchor-h" href="#api-behaviour">#</a></h2>
+  <p class="muted">Namespace <code>BallisticEngine</code>. Base for all attachable components — you subclass this.</p>
+  <h4>Lifecycle (override these)</h4>
+  <p>See the <a href="#lifecycle">Lifecycle</a> section for the full table and the <code>protected</code>-in-game-code rule. In brief: <code>OnAttach</code> / <code>OnDetach</code> (both modes), <code>OnBegin</code>, <code>OnEnabled</code> / <code>OnDisabled</code>, <code>Tick(in float)</code>, <code>FixedTick(in float)</code>, the six contact callbacks, and <code>OnDrawGizmos[Selected](IGizmos)</code>.</p>
+  <h4>Properties &amp; forwarders</h4>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><code>bool IsEnabled { get; set; }</code></td><td>Own enabled flag; fires lifecycle in play mode.</td></tr>
+    <tr><td><code>bool IsActive</code></td><td><code>IsEnabled</code> &amp;&amp; entity active in hierarchy.</td></tr>
+    <tr><td><code>Entity entity</code> · <code>Transform transform</code></td><td>The owner and its transform.</td></tr>
+    <tr><td><code>GetComponent / TryGetComponent / GetComponents / …</code></td><td>Same lookup set as Entity, forwarded.</td></tr>
+    <tr><td><code>CoroutineHandle StartCoroutine(IEnumerator&lt;IYieldInstruction&gt;)</code></td><td>Start a classic coroutine; <code>StopCoroutine(handle)</code> to cancel.</td></tr>
+  </tbody></table></div>
+</section>
+
+<!-- ============================================================ API: TRANSFORM -->
+<section id="api-transform">
+  <h2>API · Transform <a class="anchor-h" href="#api-transform">#</a></h2>
+  <p class="muted">Namespace <code>BallisticEngine</code>. Position / rotation / scale with hierarchy. Local and world are cached with version stamps — use the setters, don't bypass them.</p>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><code>Vector3 Position / WorldPosition</code></td><td>Local / world position (get &amp; set).</td></tr>
+    <tr><td><code>Quaternion Rotation / WorldRotation</code></td><td>Local / world rotation.</td></tr>
+    <tr><td><code>Vector3 Scale</code> · <code>Vector3 EulerAngles</code></td><td>Local scale; rotation as degrees.</td></tr>
+    <tr><td><code>Vector3 Forward / Up / Right</code></td><td>Basis vectors from the rotation.</td></tr>
+    <tr><td><code>Matrix4 LocalMatrix / WorldMatrix</code></td><td>Cached SRT matrices.</td></tr>
+    <tr><td><code>Transform Parent</code></td><td>The parent (set via the methods below).</td></tr>
+    <tr><td><code>void SetParent(Transform)</code></td><td>Reparent (world transform may jump).</td></tr>
+    <tr><td><code>void SetParentKeepingWorld(Transform)</code></td><td>Reparent, preserving world transform.</td></tr>
+    <tr><td><code>bool IsDescendantOf(Transform)</code></td><td>Cycle guard for reparenting.</td></tr>
+  </tbody></table></div>
+</section>
+
+<!-- ============================================================ API: SCENEMANAGER -->
+<section id="api-scenemanager">
+  <h2>API · SceneManager &amp; Scene <a class="anchor-h" href="#api-scenemanager">#</a></h2>
+  <h4>SceneManager <span class="muted">(static)</span></h4>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><code>static HDCamera RenderCamera { get; set; }</code></td><td>The active camera the renderer reads.</td></tr>
+    <tr><td><code>static bool IsPlaying / IsPaused</code></td><td>Play-mode state.</td></tr>
+    <tr><td><code>static void StartPlay() / StopPlay() / StepFrame()</code></td><td>Enter / exit play; advance one frame while paused.</td></tr>
+    <tr><td><code>static void LoadScene(string name) / LoadScene(int index)</code></td><td>Load by file name or build index.</td></tr>
+    <tr><td><code>static Scene GetCurrentScene()</code></td><td>The active scene.</td></tr>
+    <tr><td><code>static BObject FindByInstanceId(Guid)</code></td><td>Resolve an entity/behaviour by id.</td></tr>
+  </tbody></table></div>
+  <h4>Scene</h4>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><code>IReadOnlyList&lt;Entity&gt; Entities</code></td><td>All entities.</td></tr>
+    <tr><td><code>IReadOnlyList&lt;SceneBehaviour&gt; SceneBehaviours</code></td><td>Scene-wide components.</td></tr>
+    <tr><td><code>Entity CreateEntity(string)</code> · <code>void DestroyEntity(Entity)</code></td><td>Add / remove entities.</td></tr>
+    <tr><td><code>T AddSceneBehaviour&lt;T&gt;()</code> · <code>T GetSceneBehaviour&lt;T&gt;()</code></td><td>Scene-wide component management.</td></tr>
+  </tbody></table></div>
+</section>
+
+<!-- ============================================================ API: INPUT -->
+<section id="api-input">
+  <h2>API · Input <a class="anchor-h" href="#api-input">#</a></h2>
+  <p class="muted">Full table is in the <a href="#input">Input</a> system section. Namespace <code>BallisticEngine</code>, static facade. Keyboard/mouse/gamepad, all gated by <code>Input.Enabled</code>.</p>
+</section>
+
+<!-- ============================================================ API: PHYSICS -->
+<section id="api-physics">
+  <h2>API · Physics <a class="anchor-h" href="#api-physics">#</a></h2>
+  <p class="muted">Namespace <code>BallisticEngine</code>, static facade.</p>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><code>static Vector3 Gravity</code> · <code>static float FixedTimestep</code></td><td>World gravity; fixed step (1/60).</td></tr>
+    <tr><td><code>static bool Raycast(origin, dir, out RaycastHit, maxDist, layerMask)</code></td><td>Cast a ray; overloads without the out-hit exist.</td></tr>
+    <tr><td><code>static bool SphereCast / BoxCast / CapsuleCast(…, out RaycastHit, …)</code></td><td>Sweep a shape.</td></tr>
+    <tr><td><code>static List&lt;Collider&gt; OverlapSphere / OverlapBox(…)</code></td><td>Broad-phase overlap (AABB).</td></tr>
+    <tr><td><code>static List&lt;Collider&gt; OverlapSpherePrecise / OverlapBoxPrecise(…)</code></td><td>Exact narrow-phase overlap.</td></tr>
+  </tbody></table></div>
+  <h4>RaycastHit</h4>
+  <p><code>Vector3 Point</code>, <code>Vector3 Normal</code>, <code>float Distance</code>, <code>Collider Collider</code>, <code>Rigidbody Rigidbody</code>, <code>Entity Entity</code>.</p>
+</section>
+
+<!-- ============================================================ API: RIGIDBODY -->
+<section id="api-rigidbody">
+  <h2>API · Rigidbody &amp; Colliders <a class="anchor-h" href="#api-rigidbody">#</a></h2>
+  <h4>Rigidbody — authored</h4>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><code>float Mass</code></td><td>kg (0.001–10000), default 1.</td></tr>
+    <tr><td><code>bool IsKinematic</code></td><td>Moved by transform, immune to forces, pushes dynamics.</td></tr>
+    <tr><td><code>bool FreezeRotation</code> · <code>bool UseGravity</code></td><td>Lock rotation; apply gravity.</td></tr>
+    <tr><td><code>float LinearDamping / AngularDamping</code></td><td>Drag per second.</td></tr>
+  </tbody></table></div>
+  <h4>Rigidbody — runtime (play mode)</h4>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><code>Vector3 Velocity / AngularVelocity</code></td><td>Get &amp; set (not serialized).</td></tr>
+    <tr><td><code>void AddForce / AddTorque(Vector3)</code></td><td>Continuous, integrated next step.</td></tr>
+    <tr><td><code>void AddImpulse / AddAngularImpulse(Vector3)</code></td><td>Instantaneous.</td></tr>
+    <tr><td><code>void AddForceAtPosition / AddImpulseAtPosition(Vector3 f, Vector3 worldPoint)</code></td><td>Off-centre → produces torque.</td></tr>
+    <tr><td><code>void Teleport(Vector3 pos, Quaternion rot)</code></td><td>Instant snap, wakes the body.</td></tr>
+  </tbody></table></div>
+  <h4>Colliders</h4>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><code>Collider</code> (base)</td><td><code>Center</code>, <code>Friction</code>, <code>Bounciness</code>, <code>IsTrigger</code>, <code>AttachedRigidbody</code>.</td></tr>
+    <tr><td><code>BoxCollider</code></td><td><code>Vector3 Size</code>. Auto-fits to render mesh.</td></tr>
+    <tr><td><code>SphereCollider</code></td><td><code>float Radius</code>.</td></tr>
+    <tr><td><code>CapsuleCollider</code></td><td><code>float Radius, Height</code> (local-Y axis).</td></tr>
+    <tr><td><code>MeshCollider</code></td><td><code>Mesh SharedMesh</code> (null = entity's mesh). Static-only, concave, one-sided.</td></tr>
+  </tbody></table></div>
+  <h4>Collision struct</h4>
+  <p><code>Collider Collider</code>, <code>Rigidbody Rigidbody</code>, <code>Entity Entity</code>, <code>Vector3 Point</code>, <code>Vector3 Normal</code>.</p>
+</section>
+
+<!-- ============================================================ API: MATH -->
+<section id="api-math">
+  <h2>API · Mathf &amp; Random <a class="anchor-h" href="#api-math">#</a></h2>
+  <p class="muted">Namespace <code>BallisticEngine</code>. Single-precision helpers mirroring Unity's <code>Mathf</code> / <code>Random</code>.</p>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><code>Mathf</code> constants</td><td><code>PI, Tau, Deg2Rad, Rad2Deg, Epsilon, Infinity</code>.</td></tr>
+    <tr><td><code>Mathf</code> functions</td><td><code>Sin/Cos/Tan/Atan2, Sqrt/Pow/Exp/Log, Abs/Sign/Floor/Ceil/Round, Min/Max, Clamp, Clamp01</code>.</td></tr>
+    <tr><td><code>Mathf.Lerp / LerpUnclamped(a,b,t)</code></td><td>Linear interpolation.</td></tr>
+    <tr><td><code>Mathf.SmoothDamp(cur, target, ref vel, smoothTime, …)</code></td><td>Critically-damped spring.</td></tr>
+    <tr><td><code>Random.Value / Signed / Bool</code></td><td><code>[0,1]</code> / <code>[-1,1]</code> / 50-50.</td></tr>
+    <tr><td><code>Random.Range(min,max)</code></td><td>Float (inclusive) or int (exclusive max).</td></tr>
+    <tr><td><code>Random.InsideUnitSphere / OnUnitSphere / InsideUnitCircle</code></td><td>Uniform random vectors.</td></tr>
+    <tr><td><code>Random.Seed = n</code></td><td>Re-seed for reproducible runs.</td></tr>
+  </tbody></table></div>
+</section>
+
+<!-- ============================================================ API: DEBUG -->
+<section id="api-debug">
+  <h2>API · Debug &amp; Gizmos <a class="anchor-h" href="#api-debug">#</a></h2>
+  <h4>Debug <span class="muted">(static logging)</span></h4>
+  <p><code>Debug.Log(msg)</code>, <code>Debug.LogWarning(msg)</code>, <code>Debug.LogError(msg)</code>, <code>Debug.Assert(cond, msg)</code>. Logs mirror to the editor Console and to <code>Library/Logs/engine.jsonl</code>.</p>
+  <h4>IGizmos <span class="muted">(passed to OnDrawGizmos)</span></h4>
+  <p>Set <code>gizmos.Color</code> (a <code>Vector3</code>, linear RGB), then draw. This is the exact interface:</p>
+  <div class="sig"><span class="t">Vector3</span> Color { get; set; }
+<span class="k">void</span> DrawLine(<span class="t">Vector3</span> from, <span class="t">Vector3</span> to);
+<span class="k">void</span> DrawRay(<span class="t">Vector3</span> origin, <span class="t">Vector3</span> direction);
+<span class="k">void</span> DrawWireSphere(<span class="t">Vector3</span> center, <span class="k">float</span> radius);
+<span class="k">void</span> DrawWireCone(<span class="t">Vector3</span> apex, <span class="t">Vector3</span> direction, <span class="k">float</span> halfAngleDegrees);
+<span class="k">void</span> DrawWireCube(<span class="t">Vector3</span> center, <span class="t">Vector3</span> size, <span class="t">Quaternion</span> rotation);
+<span class="k">void</span> DrawIcon(<span class="t">Vector3</span> center, <span class="t">GizmoIcon</span> icon);</div>
+  <pre><span class="lang-tag">csharp</span><code><span class="k">public override void</span> <span class="m">OnDrawGizmosSelected</span>(<span class="t">IGizmos</span> g) {
+    g.<span class="m">Color</span> = <span class="k">new</span> <span class="t">Vector3</span>(<span class="n">1</span>,<span class="n">0</span>,<span class="n">0</span>);
+    g.<span class="m">DrawWireSphere</span>(transform.WorldPosition, attackRadius);
+}</code></pre>
+</section>
+
+<!-- ============================================================ API: ASSETDB -->
+<section id="api-assetdb">
+  <h2>API · AssetDatabase <a class="anchor-h" href="#api-assetdb">#</a></h2>
+  <p class="muted">Namespace <code>BallisticEngine</code>, static. GUID-cached, never throws.</p>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><code>T Load&lt;T&gt;(string assetPath)</code></td><td>Load by <code>Assets/…</code> path. Cached; logs + returns null on failure.</td></tr>
+    <tr><td><code>T Load&lt;T&gt;(Guid)</code></td><td>Load by GUID.</td></tr>
+    <tr><td><code>T LoadRef&lt;T&gt;(string)</code></td><td>Accepts <strong>either</strong> <code>"Assets/…"</code> or <code>"guid:…"</code>.</td></tr>
+    <tr><td><code>void Initialize(BallisticProject)</code> · <code>RefreshResult Refresh(bool forceAll)</code></td><td>Bootstrap; re-import sources (editor).</td></tr>
+    <tr><td><code>void Invalidate(Guid)</code></td><td>Drop from cache; re-read on next load.</td></tr>
+    <tr><td><code>bool TryGetGuid(path, out Guid)</code> · <code>string GuidToAssetPath(Guid)</code></td><td>Path ↔ GUID.</td></tr>
+    <tr><td><code>IEnumerable&lt;KeyValuePair&lt;string,Guid&gt;&gt; EnumerateAssets()</code></td><td>All known assets (for browsers).</td></tr>
+  </tbody></table></div>
+</section>
+
+<!-- ============================================================ API: EVENTS -->
+<section id="api-events">
+  <h2>API · BEvent <a class="anchor-h" href="#api-events">#</a></h2>
+  <p class="muted">The serialized event type — Ballistic's <code>UnityEvent</code>. Wire persistent listeners in the editor; add runtime listeners in code.</p>
+  <pre><span class="lang-tag">csharp</span><code><span class="k">public class</span> <span class="t">Button</span> : <span class="t">Behaviour</span> {
+    <span class="k">public</span> <span class="t">BEvent</span> <span class="m">OnClicked</span> = <span class="k">new</span>();        <span class="c">// shows wirable in the inspector</span>
+    <span class="k">void</span> <span class="m">Press</span>() => OnClicked.<span class="m">Invoke</span>();
+}
+button.<span class="m">OnClicked</span>.<span class="m">AddListener</span>(() => <span class="t">Debug</span>.<span class="m">Log</span>(<span class="s">"clicked"</span>));
+
+<span class="c">// Typed payload:</span>
+<span class="k">public</span> <span class="t">BEvent</span>&lt;<span class="k">int</span>&gt; <span class="m">OnScored</span> = <span class="k">new</span>();
+OnScored.<span class="m">AddListener</span>(s => ui.<span class="m">SetScore</span>(s));
+OnScored.<span class="m">Invoke</span>(<span class="n">10</span>);</code></pre>
+  <p><code>AddListener</code> / <code>RemoveListener</code> / <code>RemoveAllListeners</code> / <code>Invoke</code>. Authored listeners are <code>PersistentListener</code>s saved into the scene.</p>
+</section>
+
+<!-- ============================================================ API: ATTRIBUTES -->
+<section id="api-attributes">
+  <h2>API · Inspector Attributes <a class="anchor-h" href="#api-attributes">#</a></h2>
+  <p class="lead">Decorate your component members to control how they draw. These live in the engine assembly (plain <code>System.Attribute</code>, zero ImGui) and are interpreted by the editor's drawer pipeline. Defaults are byte-identical, so adding one is always opt-in.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Attribute</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>[Header("text")]</code></td><td>Bold section label above the member.</td></tr>
+      <tr><td><code>[Tooltip("text")]</code></td><td>Hover tooltip.</td></tr>
+      <tr><td><code>[Space(8f)]</code></td><td>Vertical spacing.</td></tr>
+      <tr><td><code>[LabelText("text")]</code> · <code>[PropertyOrder(int)]</code></td><td>Rename the label; reorder members.</td></tr>
+      <tr><td><code>[Range(min, max)]</code></td><td>Slider with clamp (float/int).</td></tr>
+      <tr><td><code>[ColorUsage(hdr: true)]</code></td><td>Color picker for a Vector3 (HDR optional).</td></tr>
+      <tr><td><code>[FoldoutGroup("name", defaultOpen: true)]</code></td><td>Collapsible group.</td></tr>
+      <tr><td><code>[ReadOnly]</code> · <code>[HideInInspector]</code></td><td>Show greyed-out; hide (still serializes).</td></tr>
+      <tr><td><code>[NotSerialized]</code></td><td>Hide from inspector <strong>and</strong> YAML — runtime-only state.</td></tr>
+      <tr><td><code>[ShowIf("m")]</code> · <code>[HideIf("m", value)]</code></td><td>Conditional visibility on a sibling member (optional <code>== value</code>).</td></tr>
+      <tr><td><code>[EnableIf(…)]</code> · <code>[DisableIf(…)]</code></td><td>Conditional enable/disable.</td></tr>
+      <tr><td><code>[Button("Label")]</code> · <code>[ContextMenu("Label")]</code></td><td>Invoke a parameterless method from the inspector.</td></tr>
+    </tbody>
+  </table></div>
+  <div class="note tip"><span class="label">Designing editor windows</span>When building any inspector or editor window, author with these attributes — do <strong>not</strong> hand-roll widgets or a type-switch. A new value type registers one <code>ITypeDrawer</code>; a new cross-cutting behaviour is one <code>IPropertyDecorator</code>. Component members and volume parameters share the same drawer pipeline.</div>
+</section>
+
+<!-- ============================================================ EDITOR -->
+<section id="editor">
+  <h2>Using the Editor <a class="anchor-h" href="#editor">#</a></h2>
+  <p class="lead">An ImGui-based editor running on the DX12 backend. Docked panels, a Scene view with gizmos, and live script hot-reload.</p>
+
+  <h3>The panels</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Panel</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Hierarchy</strong></td><td>Entity tree (Entities tab) + scene-wide components (Scene tab). Searchable, inline rename, drag-to-reparent, drag a <code>.cs</code> tile here to add a component.</td></tr>
+      <tr><td><strong>Inspector</strong></td><td>Attribute-driven member editor with per-widget undo, asset-slot drag-drop, and an Add Component search.</td></tr>
+      <tr><td><strong>Asset Browser</strong></td><td>Folder tree + thumbnail grid, type filters, search, right-click create/import, OS drag-drop import.</td></tr>
+      <tr><td><strong>Console</strong></td><td>Severity-filtered log; double-click an <code>Assets/…cs(line,col)</code> message to jump to source in your IDE.</td></tr>
+      <tr><td><strong>Stats</strong></td><td>Draw/triangle/cull counts and per-pass GPU ms. (<code>Window ▸ Stats</code>)</td></tr>
+      <tr><td><strong>Profiler</strong></td><td>Frame-time graph + per-zone CPU breakdown; chains to Tracy. (<code>Window ▸ Profiler</code>)</td></tr>
+      <tr><td><strong>Build</strong></td><td>Player settings (name, icon, window mode, version) and one-click build.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Key shortcuts</h3>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><span class="kbd">Space</span></td><td>Play / Stop</td></tr>
+    <tr><td><span class="kbd">Ctrl</span>+<span class="kbd">R</span></td><td>Rebuild &amp; hot-reload scripts</td></tr>
+    <tr><td><span class="kbd">Ctrl</span>+<span class="kbd">Z</span> / <span class="kbd">Ctrl</span>+<span class="kbd">Y</span></td><td>Undo / Redo (whole-scene snapshots)</td></tr>
+    <tr><td><span class="kbd">W</span> / <span class="kbd">E</span> / <span class="kbd">R</span></td><td>Move / Rotate / Scale gizmo</td></tr>
+    <tr><td><span class="kbd">F2</span> · <span class="kbd">Del</span></td><td>Rename · Delete selection</td></tr>
+    <tr><td>RMB-drag · wheel · <span class="kbd">Alt</span>+LMB</td><td>Scene view orbit · zoom · pan</td></tr>
+  </tbody></table></div>
+
+  <div class="note tip"><span class="label">Live reload during play</span>Edit a script in your IDE, alt-tab back, and it recompiles — <em>without stopping play</em>. The live scene round-trips through YAML and the lifecycle restarts on the new types. The pre-play snapshot is untouched, so Stop still returns you to the edit scene. Colliders draw green wireframes when selected; handles let you drag-resize them.</div>
+</section>
+
+<!-- ============================================================ CLI -->
+<section id="cli">
+  <h2>The <code>bal</code> CLI <a class="anchor-h" href="#cli">#</a></h2>
+  <p class="lead">The headless agent surface. Every verb prints JSON to stdout and returns an honest exit code (<code>0</code> ok, <code>1</code> handled error as JSON, <code>2</code> usage). Diagnostics go to stderr so stdout stays machine-parseable.</p>
+
+  <div class="note"><span class="label">Orient first</span>Run <code>bal map &lt;project&gt;</code> to see scenes, scripts and asset inventory, then <code>bal schema</code> so you never guess a component's members.</div>
+
+  <div class="table-wrap"><table>
+    <thead><tr><th>Verb</th><th>What it does</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>map</code></td><td>Project overview: scenes, script components, asset inventory.</td><td><code>bal map SampleProject</code></td></tr>
+      <tr><td><code>schema</code></td><td>Component catalog from reflection (members, ranges, tooltips).</td><td><code>bal schema --type Rigidbody</code></td></tr>
+      <tr><td><code>describe</code></td><td>Scene summary: entity tree + component counts.</td><td><code>bal describe Assets/Main.scene</code></td></tr>
+      <tr><td><code>validate</code></td><td>Static checks: types, members, parent &amp; asset refs (GL-free).</td><td><code>bal validate Assets/Main.scene</code></td></tr>
+      <tr><td><code>scene get/set</code></td><td>Read an entity, or one-member typed edit (one-line diff).</td><td><code>bal scene set …  Player Rigidbody.Mass 10</code></td></tr>
+      <tr><td><code>scene add-entity / add-component</code></td><td>Create entity (transform flags) / add a component (<code>--set m=v</code>).</td><td><code>bal scene add-component … Player Rigidbody</code></td></tr>
+      <tr><td><code>scene remove-* / find</code></td><td>Delete entity/component; search by <code>--type</code> or <code>--name</code>.</td><td><code>bal scene find … --type PointLight</code></td></tr>
+      <tr><td><code>import</code></td><td>Idempotent asset import (mints <code>.meta</code>, bakes <code>Library/</code>).</td><td><code>bal import SampleProject --force</code></td></tr>
+      <tr><td><code>assets resolve / refs / list</code></td><td>Path↔GUID lookup; reverse references; asset listing.</td><td><code>bal assets refs … Assets/Icon.png</code></td></tr>
+      <tr><td><code>simulate</code></td><td><strong>Real</strong> headless play: scripts + physics, watch values over time + final snapshots, scripted input.</td><td><code>bal simulate … --steps 120 --watch Player:Rigidbody.Velocity</code></td></tr>
+      <tr><td><code>render</code></td><td>Deterministic screenshots; single shot or <code>--orbit N</code> multi-view; optional id-segmentation map.</td><td><code>bal render … --orbit 4 --center 0,1,0</code></td></tr>
+      <tr><td><code>imgdiff</code></td><td>Perceptual diff (mean + 32×32 hotspot budgets), optional heatmap.</td><td><code>bal imgdiff a.bmp b.bmp --out diff.bmp</code></td></tr>
+      <tr><td><code>query</code></td><td><strong>Spatial perception</strong> via DXR ray queries over the TLAS: occupancy / classify / nudge / rooms / visibility.</td><td><code>bal query occupancy … --points "0,1,0; 5,1,5"</code></td></tr>
+      <tr><td><code>gbuffer</code></td><td>Dump raw G-buffer (depth/normal/albedo bins + manifest) — read geometry directly.</td><td><code>bal gbuffer … --out Library/GBuffer</code></td></tr>
+      <tr><td><code>perf</code></td><td>Render-perf stats: draws, triangles, culled, lights, CPU ms.</td><td><code>bal perf Assets/Main.scene</code></td></tr>
+      <tr><td><code>agents</code></td><td>Regenerate the project's <code>AGENTS.md</code> from reflection + meta.</td><td><code>bal agents SampleProject</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>A typical agent loop</h3>
+  <pre><span class="lang-tag">shell</span><code>bal map MyProject                               <span class="c"># orient</span>
+bal schema --type PointLight                    <span class="c"># learn the members</span>
+bal scene add-component Assets/Main.scene Lamp PointLight --set Lumens=8000
+bal validate Assets/Main.scene                  <span class="c"># verify before render</span>
+bal render Assets/Main.scene --orbit 4          <span class="c"># multi-view screenshots</span>
+bal query visibility Assets/Main.scene --pairs "0,1,0 &gt; 5,1,5"
+bal simulate Assets/Main.scene --steps 120 --watch Lamp:PointLight.Intensity</code></pre>
+</section>
+
+<!-- ============================================================ MCP -->
+<section id="mcp">
+  <h2>MCP &amp; Live Control <a class="anchor-h" href="#mcp">#</a></h2>
+  <p class="lead">Beyond the one-shot CLI, the engine exposes the <strong>running editor</strong> to agents two ways: a Model-Context-Protocol server and a raw named pipe. Every mutation pushes undo first and marks the viewport dirty — remote edits behave exactly like human edits.</p>
+
+  <h3>The named pipe</h3>
+  <p>The editor listens on <code>\\.\pipe\BallisticEditor</code>, newline-delimited JSON: <code>{id, method, params}</code> → <code>{id, result|error}</code>. The pipe thread is engine-owned and survives script hot-reload. Methods (also <code>help</code> lists them):</p>
+  <p class="muted"><code>editor.status</code>, <code>scene.describe / save / open</code>, <code>entity.get / create / delete</code>, <code>component.add / remove / set</code>, <code>scene.component.add / set</code>, <code>select</code>, <code>play.start / stop / pause / step</code>, <code>undo / redo</code>, <code>screenshot</code>, <code>console.tail</code>, <code>scripts.rebuild</code>, <code>editor.frame</code>, <code>editor.refresh</code>, <code>unity.import</code>.</p>
+
+  <h3>The MCP server</h3>
+  <p><code>BallisticEngine.Mcp</code> is a stdio MCP server wrapping the pipe in ~16 task-level tools an agent can call directly — <code>editor_status</code>, <code>scene_describe</code>, <code>entity_create</code>, <code>component_set</code>, <code>play_control</code>, <code>scene_open</code>, <code>editor_screenshot</code>, <code>scripts_rebuild</code>, <code>scene_query</code>, <code>scene_gbuffer</code>, and more. It connects lazily and auto-reconnects, so you can start it before or after the editor.</p>
+  <div class="note"><span class="label">Three layers, by preference</span><strong>CLI</strong> (headless, no editor, most flexible) → <strong>MCP</strong> (lightweight tools, editor keeps the scene hot) → <strong>pipe</strong> (lowest-level, stateful multi-step workflows). They share the same underlying verb set.</div>
+</section>
+
+<!-- ============================================================ ENVVARS -->
+<section id="envvars">
+  <h2>Environment Variables <a class="anchor-h" href="#envvars">#</a></h2>
+  <p class="lead">Set these on the player exe for headless harnessing and renderer debugging. The deterministic + screenshot doors make builds diffable across commits.</p>
+
+  <h4>Harness &amp; capture</h4>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><code>BALLISTIC_SCENE=Assets/…/X.scene</code></td><td>Load this scene instead of the startup scene.</td></tr>
+    <tr><td><code>BALLISTIC_SCREENSHOT=out.bmp</code></td><td>Save frame <code>BALLISTIC_SCREENSHOT_FRAME</code> (default 180) and exit, printing <code>[PerfStats]</code>.</td></tr>
+    <tr><td><code>BALLISTIC_SCREENSHOT_PAUSED=1</code></td><td>Load but never StartPlay — no scripts/physics, serialized camera → bit-exact frames.</td></tr>
+    <tr><td><code>BALLISTIC_DETERMINISTIC=1</code></td><td>Kill all temporal variance (TAA/SSGI/exposure) → frame 60 == frame 240 byte-identical.</td></tr>
+    <tr><td><code>BALLISTIC_IDMAP=path</code></td><td>Write a per-entity segmentation map (<code>.json</code> bboxes + <code>.bmp</code>).</td></tr>
+    <tr><td><code>BALLISTIC_GBUFFER_DUMP=dir</code></td><td>Dump depth/normal/albedo bins + manifest.</td></tr>
+    <tr><td><code>BALLISTIC_STATS_OUT=stats.json</code></td><td>Write render-perf stats.</td></tr>
+  </tbody></table></div>
+
+  <h4>Renderer feature toggles (force on/off after the volume stack applies)</h4>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><code>BALLISTIC_FX_SSGI / SSR / SSAO / VOLUMETRIC = 0|1</code></td><td>A/B individual post-FX.</td></tr>
+    <tr><td><code>BALLISTIC_DX12_RT_GI / RT_REFLECTIONS / RT_SHADOWS = 0</code></td><td>Force the screen-space fallback path.</td></tr>
+    <tr><td><code>BALLISTIC_DX12_GPUDRIVEN / _HIZ = 0</code></td><td>Disable GPU-driven culling / Hi-Z occlusion.</td></tr>
+    <tr><td><code>BALLISTIC_DX12_DDGI / SCREENPROBE / GI_EMISSIVE = 0|1</code></td><td>GI internals.</td></tr>
+    <tr><td><code>BALLISTIC_DX12_VOLUMES=0</code></td><td>Ignore all volumes, use engine defaults.</td></tr>
+    <tr><td><code>BALLISTIC_DX12_GI_ISOLATE=1</code></td><td>Show GI bounce only (debug).</td></tr>
+  </tbody></table></div>
+
+  <h4>Profiling</h4>
+  <div class="table-wrap"><table><tbody>
+    <tr><td><code>BALLISTIC_TRACY=1</code></td><td>Enable the Tracy client (attach the matching viewer).</td></tr>
+    <tr><td><code>BALLISTIC_PROFILER=1</code></td><td>Auto-open the in-editor realtime profiler.</td></tr>
+  </tbody></table></div>
+  <p class="muted">Logs always mirror to <code>&lt;project&gt;/Library/Logs/engine.jsonl</code>, and every screenshot writes a <code>.stats.json</code> sidecar.</p>
+</section>
+
+<!-- ============================================================ PROFILING -->
+<section id="profiling">
+  <h2>Profiling <a class="anchor-h" href="#profiling">#</a></h2>
+  <p class="lead">A BCL-only <code>Profiler</code> facade (no-op without a backend), an in-editor realtime view, and a Tracy 0.11.1 backend for deep CPU analysis.</p>
+  <pre><span class="lang-tag">csharp</span><code><span class="k">using</span> (<span class="t">Profiler</span>.<span class="m">Zone</span>(<span class="s">"AnimUpdate"</span>)) {
+    <span class="k">foreach</span> (<span class="k">var</span> p <span class="k">in</span> pawns) p.<span class="m">UpdateAnim</span>();
+}
+<span class="t">Profiler</span>.<span class="m">FrameMark</span>();
+<span class="t">Profiler</span>.<span class="m">Plot</span>(<span class="s">"FrameMs"</span>, dt * <span class="n">1000</span>);</code></pre>
+  <ul>
+    <li><strong>In-editor</strong>: <code>Window ▸ Profiler</code> — frame-time graph + per-zone breakdown (last 240 frames; pause to scrub).</li>
+    <li><strong>Tracy</strong>: set <code>BALLISTIC_TRACY=1</code>, attach <code>Tools/Tracy/tracy-profiler.exe</code> (live) or capture headlessly with <code>tracy-capture.exe</code> → <code>tracy-csvexport.exe</code>.</li>
+    <li><strong>Per-pass GPU timers</strong> publish into <code>RenderStats</code> and the editor Stats overlay.</li>
+  </ul>
+  <p class="muted">Zones are CPU submit cost. For GPU frame analysis use RenderDoc.</p>
+</section>
+
+<!-- ============================================================ BUILDING -->
+<section id="building">
+  <h2>Building a Player <a class="anchor-h" href="#building">#</a></h2>
+  <p class="lead">The Build panel (or <code>BuildPipeline</code> in code) produces a single self-contained Windows executable with your data baked in.</p>
+  <p>It compiles scripts (error-checked), refreshes &amp; writes the asset GUID map, publishes the Runtime exe, renames it to the product name, and copies only the shippable data into <code>Data/</code> — text assets (<code>.scene</code>, <code>.mat</code>, <code>.shader</code>, <code>.volume</code>, <code>.prefab</code>) plus the binary <code>Library/</code> artifacts. Source models/textures/scripts are <strong>not</strong> shipped.</p>
+  <pre><span class="lang-tag">csharp</span><code><span class="k">var</span> result = <span class="t">BuildPipeline</span>.<span class="m">Build</span>(<span class="k">new</span> <span class="t">BuildPipeline</span>.<span class="t">Options</span> {
+    Project          = project,
+    OutputDir        = <span class="s">@"C:\Build"</span>,
+    ScenesInBuild    = <span class="k">new</span>[] { <span class="s">"Assets/Scenes/Main.scene"</span> },
+    Configuration    = <span class="s">"Release"</span>,
+    RuntimeIdentifier= <span class="s">"win-x64"</span>,
+    SelfContained    = <span class="k">true</span>,
+});
+<span class="k">if</span> (result.Success) <span class="t">Console</span>.<span class="m">WriteLine</span>(result.ExePath);</code></pre>
+  <p>Player settings (product/company/version, <code>.ico</code> icon, window mode &amp; resolution) live in <code>project.json</code> under <code>player</code> and become the exe's metadata.</p>
+
+  <footer>
+    <p>Ballistic Engine — custom C# / .NET 9 game engine. This documentation is generated from the engine's real public API surface.</p>
+    <p>For the deeper hard-won engineering notes (renderer invariants, physics gotchas, layering rules), see <code>CLAUDE.md</code> at the repo root. For a per-project agent manual, run <code>bal agents &lt;project&gt;</code>.</p>
+  </footer>
+</section>
+</div>
+</main>
+</div>
+
+<script>
+  // Active-link highlight on scroll
+  const navLinks = [...document.querySelectorAll('#nav a')];
+  const linkFor = id => navLinks.find(a => a.getAttribute('href') === '#' + id);
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        const id = e.target.id;
+        navLinks.forEach(a => a.classList.remove('active'));
+        const l = linkFor(id); if (l) l.classList.add('active');
+      }
+    });
+  }, { rootMargin: '-10% 0px -80% 0px', threshold: 0 });
+  document.querySelectorAll('section[id]').forEach(s => observer.observe(s));
+
+  // Search: filter sections by keyword
+  const search = document.getElementById('search');
+  const sections = [...document.querySelectorAll('section[id]')];
+  search.addEventListener('input', () => {
+    const q = search.value.trim().toLowerCase();
+    if (!q) { sections.forEach(s => s.classList.remove('hidden-by-search')); return; }
+    sections.forEach(s => {
+      const hit = s.textContent.toLowerCase().includes(q);
+      s.classList.toggle('hidden-by-search', !hit);
+    });
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === '/' && document.activeElement !== search) { e.preventDefault(); search.focus(); }
+    if (e.key === 'Escape') { search.value=''; search.dispatchEvent(new Event('input')); search.blur(); }
+  });
+</script>
+</body>
+</html>

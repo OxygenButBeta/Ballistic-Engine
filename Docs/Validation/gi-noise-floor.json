@@ -1,0 +1,55 @@
+{
+  "Note": "GI Pragmatic Revival — R0.3 PER-PASS PERCEPTUAL NOISE-FLOOR for the diffuse-GI (SSGI/screen-probe/DDGI) output. This is the imgdiff tolerance the plan's §4 perceptual gate keys off: how much the GI-ISOLATE output (indirect bounce only, BALLISTIC_DX12_GI_ISOLATE=1) drifts frame-to-frame on this substrate. It is DISTINCT from Docs/Validation/dx12-noise-floor.json (that is the pass-graph W3 COMPOSITE noise-floor for a DIFFERENT plan). PIN to substrate: a driver/GPU bump shifts HDR float output and invalidates these numbers — regenerate then. ‼ PRE-R1.0: both this floor AND the R0.2 GI budget X are measured BEFORE R1.0 (MaterialId move). R1.0 changes which surfaces bounce (color-only meshes get lit hits) → temporal-noise characteristics may shift → RE-MEASURE this floor after R1.0 and re-freeze the §4 gate against the post-R1.0 numbers. See Docs/Plans/gi-pragmatic-revival-plan.md §R0.3 + rev7-crack-2.",
+  "Substrate": {
+    "Commit": "928d3fe2 (R0.2 head, dx12-renderer) + 8-file uncommitted post-FX/contact-shadow/GTAO WIP in tree (NOT GI, left untouched). The GI choke point is the committed R0.1 flip (d8ee45a7).",
+    "MeasuredOnTree": "2026-06-18. Diffuse-GI ON via the SHIPPING path (volume PostFX.GiMode=ScreenSpace default from R0.1) — NOT the env door. GI-isolate via BALLISTIC_DX12_GI_ISOLATE=1 (Dx12GiPass.cs:926, the combine outputs ONLY the indirect bounce). Specular reflections stay OFF (user's separate WIP) — this is the diffuse-GI floor only.",
+    "Gpu": "AMD Radeon RX 9070 XT",
+    "Resolution": "1920x1080",
+    "CapturedUtc": "2026-06-18T00:00:00Z",
+    "PreR1_0": false,
+    "R1_0_ReFreeze": "DISCHARGED 2026-06-18 (HEAD ab84015e + 8-file post-FX WIP). The R1.0 MaterialId fix (ResolveOrRegisterMaterialId @ Dx12GpuDrivenRenderer.cs:303 -> BuildTriMaterials @ Dx12RtGeometry.cs:128) is RAYTRACED-PATH ONLY (feeds the DXR closest-hit shaders) and is DEAD CODE on this ScreenSpace SSGI shipping path. RE-MEASURED CornellBox static motion-dump post-R1.0 = mean boiling 0.0270, perPair [0.026,0.027,0.027,0.026,0.027,0.027,0.028] -> IDENTICAL to the pre-flag 0.027 (byte-for-byte). The floor did not shift because the fix never touches the SSGI temporal chain that this floor measures. Also note (ancestry): the R0.3 substrate 928d3fe2 ALREADY contained the fix (3f3406e9 is an ancestor of 928d3fe2), so 'PreR1_0' was always a plan-phase label, not a code state. The Gate_ImgDiff <= 0.3 below is RE-FROZEN against this post-R1.0 measurement (unchanged). Raw: e:/tmp/gi-r1validate/motion_cornell/."
+  },
+
+  "DeterminismCharacterization": {
+    "Description": "DoD part 1 — which passes are deterministic vs not, so byte-identical is a valid SMOKE-CHECK only where it holds (§4) and explicitly BLIND elsewhere. RE-MEASURED 2026-06-18 against the working tree (not assumed).",
+    "RunToRun_SameFrame_Paused": "BYTE-IDENTICAL. CornellBox f60 GI-ON shipping = cc80835d72f5 across 2 independent runs; BistroInterior f60 = 290f54982066 across 2 runs. The SSGI temporal chain + GI/screen-probe/DDGI passes are deterministic run-to-run in PAUSED (edit) mode.",
+    "RunToRun_SameFrame_Play": "BYTE-IDENTICAL. MovingLight (LightMover.cs sweep script + physics ACTIVE, NOT paused) f120 = 86052bd20dcc across 2 runs. The headless path is deterministic even with scripted motion + temporal active (scripted input is deterministic; matches dx12-noise-floor.json's sigma~0 finding). NOTE: dx12-noise-floor.json records a tiny BistroExterior play+temporal sigma=3e-6 — sub-ULP, not run-to-run-meaningful.",
+    "AcrossFrames_Paused": "f60 != f240 (CornellBox: cc80835d72f5 vs 91f2ad42eeb2). EXPECTED — SSGI temporal accumulation (SsgiMaxHistory) is still converging across frames; so the VALID determinism test is 'same-frame, two independent runs', NOT 'f24==f240'. f24==f240 is NOT a correct oracle on the temporal-GI path.",
+    "MotionDump_RunToRun": "BYTE-IDENTICAL even with temporal ACTIVE (no DETERMINISTIC). CornellBox GI-isolate motion-dump frame_07 = 4e672f068b2ab024 across 2 runs. So the noise-floor measurement itself is reproducible.",
+    "Verdict": "GI passes (SSGI/screen-probe/DDGI combine + OIDN) are DETERMINISTIC run-to-run on this substrate (paused AND play). byte-identical (SHA-256, same frame, two runs) is therefore a VALID smoke-check for the GI passes. It is NOT a hard gate across-frames (temporal still converging) and remains BLIND for passes on the DeterministicCapture denylist per §4 (TAA/grain/GTAO/SSGI-history/DDGI under bal render --DETERMINISTIC, which makes temporal a pass-through). Real oracle stays GBV + GI-isolate visual A/B + R1.0 'explain any nonzero diff'."
+  },
+
+  "PerPassNoiseFloor_GiIsolate": {
+    "Description": "DoD part 2 — per-pass perceptual noise-floor of the GI-ISOLATE output. Metric = mean ABS per-channel pixel delta (0..255) over 7 consecutive frame pairs of the last-8-frame motion-dump window (BALLISTIC_DX12_GI_MOTION_DUMP, BALLISTIC_DX12_GI_MOTION_FRAMES=8, GI-isolate ON, frame 180 total so the temporal field is converged before the window). STATIC = resting floor (camera fixed, temporal converged). ORBIT = under camera motion (BALLISTIC_DX12_GI_ORBIT=2 deg/frame, disocclusion-driven — characterizes converge-rate, NOT the floor).",
+    "Method": "Run BallisticEngine.Runtime.exe DIRECTLY (bal render forces DETERMINISTIC = temporal pass-through, can't show boiling). GI-isolate via BALLISTIC_DX12_GI_ISOLATE=1.",
+    "RestingFloor_Static": {
+      "CornellBox": { "meanBoiling": 0.027, "perPair": [0.026, 0.027, 0.027, 0.026, 0.027, 0.027, 0.028] },
+      "BistroInterior_Wine": { "meanBoiling": 0.084, "perPair": [0.076, 0.089, 0.098, 0.08, 0.069, 0.092, 0.084] }
+    },
+    "UnderMotion_Orbit2": {
+      "CornellBox": { "meanBoiling": 5.802, "perPair": [5.273, 5.253, 5.337, 5.698, 6.037, 6.353, 6.659], "note": "disocclusion converge-cost, NOT a floor — feeds R2.2 on-screen latency budget" },
+      "BistroInterior_Wine": { "meanBoiling": 17.207, "perPair": [8.884, 11.129, 17.396, 23.888, 20.096, 18.977, 20.077], "note": "richest interior GI temporal chain; high transient under orbit = expected, R2.2 budgets this as few-frame latency" }
+    }
+  },
+
+  "Gate_ImgDiff": {
+    "Description": "§4 perceptual-diff gate for the diffuse-GI passes. Floor = resting (static, converged) boiling. The gate is floor + margin.",
+    "RestingFloorMax": 0.10,
+    "Formula": "GI-isolate frame-to-frame boiling (static, converged) must stay within max(restingFloor * 3, restingFloor + 0.2) of the frozen baseline — i.e. on this substrate, effectively 'GI-isolate boiling <= ~0.3 mean per-channel delta' for a converged static capture. A real temporal-feedback regression (history boiling, NaN-grow, leak) pushes this UP by orders of magnitude (the documented NaN-grow black-noise field, or a stuck/garbage history), far beyond 0.3 — so the loose band catches it while tolerating sub-ULP substrate noise.",
+    "Margin": "3x or +0.2 (whichever looser). The resting floor is so small (0.027-0.084) that a literal k*sigma band would false-fail on any benign driver float reorder; the relative+absolute floor is the operational gate.",
+    "BLIND_Note": "This gate is VALID only for the GI-isolate output under a static converged camera. Under-motion boiling (5.8-17.2) is NOT a regression signal — it is the temporal converge-cost; gate the under-motion case against the frozen ORBIT baseline (re-measure post-R1.0) only, never against the resting floor.",
+    "PreR1_0_ReMeasure": "DISCHARGED 2026-06-18 — re-measured post-R1.0, floor UNCHANGED (CornellBox 0.0270 == 0.027). The rev7-crack-2 premise ('R1.0 lights color-only surfaces -> temporal-noise shifts') does NOT apply on this path: the R1.0 MaterialId fix is RAYTRACED-PATH ONLY and is dead code on the ScreenSpace SSGI shipping path that this floor is measured on, so the temporal-noise characteristics are unchanged. The gate (<=0.3) is RE-FROZEN against the post-R1.0 floor and is now VALID to rely on (see Substrate.R1_0_ReFreeze)."
+  },
+
+  "ScenarioFindings": {
+    "Description": "GI-isolate A/B per scenario — composite mean luminance GI-ON vs GI-OFF + the GI-isolate (indirect-bounce-only) luminance. 'GI active' = comp_gion SHA != comp_gioff SHA AND isolate shows bounce. Judged on the GI-isolate, NOT the composite mean (§4).",
+    "Outdoor": { "result": "GI NO-OP — scene renders fully BLACK (comp_gion == comp_gioff == isolate SHA 8b5d941948e8; lum 0.00). SCENE-DATA black (grazing/underground sun, like SunTemple/LightTest), NOT a GI regression. GI pass still RUNS (3.46ms). OPEN: re-light the Outdoor fixture so cascaded-shadow + GI bounce is visible." },
+    "MultiLightInterior": { "result": "GI ACTIVE. comp lum 184.6->193.1, isolate 115.3. SHA differs. (>=8 punctual fixture; punctualLights stat reads 0 in paused mode — edit-mode stat artifact, lights still light)." },
+    "ColorOnly": { "result": "GI WEAK — comp lum 102.7->104.5, isolate 2.30 (near-black bounce). ‼ MISLABEL CORRECTED (R1.0 re-validate 2026-06-18): this 2.30 is the ScreenSpace SSGI indirect bounce off a small/oblique color-only emitter (screen-space coverage limited), NOT the RT MaterialId bug. The R1.0 MaterialId fix is RAYTRACED-PATH ONLY (Dx12RtGeometry -> DXR closest-hit) and is DEAD CODE on this ScreenSpace path, so re-capturing post-R1.0 gives the SAME 2.288 (UNCHANGED, correct). The MaterialId degenerate buffer (R0.0b assert / CPU harness CASE 2) only manifests on the RayTraced path, which is NOT exercised here (device-remove safety). So ColorOnly's isolate is NOT a pre/post-R1.0 oracle on the ScreenSpace path." },
+    "ThinWall": { "result": "LEAK-TEST PASS direction — isolate is fully BLACK (SHA 8b5d941948e8, lum 0.00 = no indirect light through the wall); comp lum identical 25.43 both. composite SHA differs slightly (SSGI direct-occlusion). No bleed-through bounce. (Re-confirm with culling ON at R2.4.)" },
+    "MovingLight": { "result": "GI ACTIVE. comp lum 165.2->174.1, isolate 65.1. SHA differs. Two-rate latency fixture (LightMover.cs sweep) — full two-rate latency budget is R2.2." },
+    "CornellBox": { "result": "GI STRONG (best signal). comp lum 37.9->66.3, isolate 43.1 — classic color-bleed. SHA differs." },
+    "BistroInterior_Wine": { "result": "GI STRONG. comp lum 20.4->41.5, isolate 24.4. SHA differs. Heavy real-content (797k tris)." },
+    "BistroExterior": { "result": "GI STRONG. comp lum 12.5->25.0, isolate 12.3. SHA differs. Heaviest (2.83M tris)." }
+  }
+}

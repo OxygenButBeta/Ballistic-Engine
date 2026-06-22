@@ -1,21 +1,13 @@
-using System;
 using Vortice.Direct3D12;
 using Vortice.Dxc;
 
 namespace BallisticEngine.DX12;
 
-// Self-test for the DX12 compute foundation (run with BALLISTIC_DX12_COMPUTE_TEST=1): builds a compute
-// PSO from ComputeProbe.hlsl, dispatches it over two UAV buffers (a per-element write + an InterlockedAdd
-// counter), reads the results back, and asserts they're byte-exact. This proves the exact primitives the
-// GPU-driven compute frustum cull needs — compute PSO (SM6.6), root UAVs, atomic compaction, Dispatch,
-// UAV->readback — in isolation BEFORE the much larger cull/ExecuteIndirect integration (the engine's
-// "isolated correctness harness before GPU integration" rule). Kept as a permanent test door.
 public static class Dx12ComputeProbe {
     public static bool SelfTest(Dx12Device dev) {
         const int Count = 256;
         bool ok = true;
         try {
-            // Compute root sig: b0 = 1x uint (Count, root constant), u0 + u1 = root UAVs (raw buffers).
             var countConst = new RootParameter1(new RootConstants(0, 0, 1), ShaderVisibility.All);
             var uav0 = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(0, 0), ShaderVisibility.All);
             var uav1 = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(1, 0), ShaderVisibility.All);
@@ -27,7 +19,6 @@ public static class Dx12ComputeProbe {
             using ID3D12PipelineState pso = dev.Device.CreateComputePipelineState(
                 new ComputePipelineStateDescription { RootSignature = rootSig, ComputeShader = cs });
 
-            // Two UAV buffers (seeded zero), two readback buffers.
             var zerosOut = new uint[Count];
             var zerosCounter = new uint[1];
             using ID3D12Resource output = dev.CreateUavBuffer<uint>(zerosOut, ResourceStates.UnorderedAccess);
@@ -58,7 +49,7 @@ public static class Dx12ComputeProbe {
             uint counterVal = cc[0];
             counterRb.Unmap(0);
 
-            uint expectedEven = (Count + 1) / 2;   // even indices in [0,Count)
+            uint expectedEven = (Count + 1) / 2;
             if (bad != 0) { ok = false; Console.WriteLine($"[Dx12ComputeProbe] FAIL: {bad}/{Count} output elements wrong."); }
             if (counterVal != expectedEven) { ok = false; Console.WriteLine($"[Dx12ComputeProbe] FAIL: counter={counterVal}, expected {expectedEven}."); }
         } catch (Exception e) {

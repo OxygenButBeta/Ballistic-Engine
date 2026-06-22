@@ -1,11 +1,6 @@
 
 namespace BallisticEngine;
 
-// An entity component that contributes a VolumeProfile to the blended post-process stack
-// (Unity's Volume). Global volumes apply everywhere; local volumes apply inside an oriented
-// box around the entity (BoxSize scaled by the transform), fading in over BlendDistance
-// metres outside it. Higher Priority wins where volumes overlap; Weight scales the whole
-// contribution. The renderer evaluates the result through VolumeManager every frame.
 [Component("Volume")]
 public class Volume : Behaviour {
     [Tooltip("Global volumes affect rendering everywhere; local volumes only within their box.")]
@@ -27,12 +22,10 @@ public class Volume : Behaviour {
     [Tooltip("The shared .volume asset holding this volume's overrides.")]
     public VolumeProfile Profile { get; set; }
 
-    // OnAttach/OnDetach (not OnEnabled) so volumes work in the editor outside play mode.
     protected internal override void OnAttach() => VolumeManager.Register(this);
 
     protected internal override void OnDetach() => VolumeManager.Unregister(this);
 
-    // 1 inside the box (or always, when global), 0 beyond BlendDistance outside it.
     internal float ComputeInterpFactor(Vector3 cameraPosition) {
         if (IsGlobal)
             return 1f;
@@ -58,6 +51,20 @@ public class Volume : Behaviour {
         return BlendDistance > 0f ? Math.Clamp(1f - distance / BlendDistance, 0f, 1f) : 0f;
     }
 
+    internal bool TryGetWorldBox(out Vector3 center, out Vector3 halfExtent) {
+        center = default;
+        halfExtent = default;
+        if (IsGlobal)
+            return false;
+        Vector3 scale = transform.WorldMatrix.ExtractScale();
+        center = transform.WorldPosition;
+        halfExtent = new Vector3(
+            MathF.Abs(BoxSize.X * scale.X),
+            MathF.Abs(BoxSize.Y * scale.Y),
+            MathF.Abs(BoxSize.Z * scale.Z)) * 0.5f;
+        return true;
+    }
+
     public override void OnDrawGizmosSelected(IGizmos gizmos) {
         if (IsGlobal)
             return;
@@ -75,4 +82,5 @@ public class Volume : Behaviour {
             gizmos.DrawWireCube(center, size + new Vector3(BlendDistance * 2f), rotation);
         }
     }
+
 }

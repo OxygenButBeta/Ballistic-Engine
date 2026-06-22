@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "shader": "Assets/Default/Shaders/Standard.shader",
+  "textures": {
+    "Diffuse": "Assets/Default/Checker.bmp"
+  },
+  "transparent": false,
+  "opacity": 1,
+  "emissiveIntensity": 0.05,
+  "metallic": 0,
+  "roughness": 0.9
+}

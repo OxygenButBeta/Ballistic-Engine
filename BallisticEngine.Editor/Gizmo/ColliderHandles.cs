@@ -4,19 +4,13 @@ using SysVec4 = System.Numerics.Vector4;
 
 namespace BallisticEngine.Editor;
 
-// Scene-view resize handles for the selected entity's colliders (Unity's "Edit Collider",
-// always on while selected). Box: one square per face â€” dragging moves that face along its
-// axis, the opposite face stays put (Size + Center update together). Sphere/Capsule: squares
-// on the radius/height extents â€” dragging resizes symmetrically around Center. All edits are
-// in COLLIDER-LOCAL units (the entity's world scale is divided back out), so the dragged
-// values match what the inspector shows. Undo snapshots on grab, VolumeBoundsHandles-style.
 internal static class ColliderHandles {
     static Collider activeCollider;
     static int activeHandle = -1;
     static Vector3 grabAnchor, grabDir;
     static float grabParam;
-    static Vector3 grabSize, grabCenter; // box snapshot
-    static float grabScalar;             // sphere radius / capsule radius / capsule height
+    static Vector3 grabSize, grabCenter;
+    static float grabScalar;
 
     public static bool IsInteracting => activeCollider is not null;
 
@@ -26,7 +20,6 @@ internal static class ColliderHandles {
         Vector3.UnitZ, -Vector3.UnitZ,
     };
 
-    // Returns true when the collider changed this frame (caller marks the scene dirty).
     public static bool Draw(Collider collider, IViewProjectionProvider camera,
         SysVec2 viewMin, SysVec2 viewSize, ImDrawListPtr draw, bool viewHovered) {
         if (!ImGui.IsMouseDown(ImGuiMouseButton.Left)) {
@@ -44,7 +37,7 @@ internal static class ColliderHandles {
             BoxCollider box => DrawBox(box, shapeCenter, rotation, scale, vp, viewMin, viewSize, draw, viewHovered),
             SphereCollider sphere => DrawSphere(sphere, shapeCenter, rotation, scale, vp, viewMin, viewSize, draw, viewHovered),
             CapsuleCollider capsule => DrawCapsule(capsule, shapeCenter, rotation, scale, vp, viewMin, viewSize, draw, viewHovered),
-            _ => false, // mesh colliders are not hand-resizable
+            _ => false,
         };
     }
 
@@ -67,7 +60,7 @@ internal static class ColliderHandles {
 
             float localDelta = worldDelta / axisScale;
             float newExtent = MathF.Max(grabSize[axisIndex] + localDelta, 0.01f);
-            localDelta = newExtent - grabSize[axisIndex]; // re-derive after the clamp
+            localDelta = newExtent - grabSize[axisIndex];
 
             Vector3 size = box.Size;
             Vector3 center = box.Center;
@@ -109,7 +102,7 @@ internal static class ColliderHandles {
         var changed = false;
         for (var f = 0; f < 6; f++) {
             Vector3 worldDir = Vector3.Transform(Axes[f], rotation);
-            bool isHeightHandle = f is 2 or 3; // Â±Y tips; Â±X/Â±Z rim handles edit the radius
+            bool isHeightHandle = f is 2 or 3;
             Vector3 handlePos = shapeCenter + worldDir * (isHeightHandle
                 ? capsule.Height * 0.5f * heightScale
                 : capsule.Radius * radiusScale);
@@ -119,7 +112,7 @@ internal static class ColliderHandles {
             if (!ReferenceEquals(activeCollider, capsule) || activeHandle != f || worldDelta == 0f)
                 continue;
 
-            if (isHeightHandle) // tip follows the mouse; height grows by twice the tip offset
+            if (isHeightHandle)
                 capsule.Height = MathF.Max(grabScalar + 2f * (worldDelta / heightScale), 0.01f);
             else
                 capsule.Radius = MathF.Max(grabScalar + worldDelta / radiusScale, 0.01f);
@@ -128,10 +121,6 @@ internal static class ColliderHandles {
         return changed;
     }
 
-    // Draws one square handle; starts a drag (undo push + grab snapshot) when clicked. While
-    // this handle is the active one, outputs the world-space distance dragged along the axis
-    // since grab, measured against the anchor captured at grab time so the mapping is stable.
-    // Returns true on the grab frame so the caller can snapshot its own state.
     static bool HandleSquare(Collider collider, int index, Vector3 worldPos, Vector3 worldDir,
         Matrix4 vp, SysVec2 viewMin, SysVec2 viewSize, ImDrawListPtr draw, bool viewHovered,
         out float worldDelta) {
@@ -162,7 +151,7 @@ internal static class ColliderHandles {
             grabDir = worldDir;
             GizmoMath.MouseRay(vp, viewMin, viewSize, mouse, out Vector3 rayO, out Vector3 rayD);
             grabParam = ClosestParamOnAxis(worldPos, worldDir, rayO, rayD);
-            EditorUndo.Push("Resize Collider");
+            EditorCommands.EditEntity(collider.Entity, "Resize Collider", () => { });
             grabbed = true;
         }
 
@@ -174,7 +163,6 @@ internal static class ColliderHandles {
         return grabbed;
     }
 
-    // Parameter t along the axis (origin + axis*t) closest to the mouse ray.
     static float ClosestParamOnAxis(Vector3 axisOrigin, Vector3 axisDir, Vector3 rayO, Vector3 rayD) {
         Vector3 w0 = axisOrigin - rayO;
         float a = Vector3.Dot(axisDir, axisDir);

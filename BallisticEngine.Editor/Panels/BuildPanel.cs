@@ -1,94 +1,67 @@
 using System.Diagnostics;
 using BallisticEngine.AssetPipeline;
-using Hexa.NET.ImGui;
-using SysVec2 = System.Numerics.Vector2;
-using SysVec4 = System.Numerics.Vector4;
 
 namespace BallisticEngine.Editor;
 
-// Build window (Window > Build) — Unity-style "Build Settings" + "Player Settings" in one panel:
-//   • Player Settings  — product/company/version, icon, window mode + resolution (baked into the exe)
-//   • Scenes In Build  — ordered list (first = startup scene)
-//   • Output           — folder, self-contained toggle, configuration + target RID
-//   • Build            — runs BuildPipeline on a worker thread behind a live log; optional run-after
-//                        and open-folder-after.
-// The build runs on a worker thread behind a live log so the editor stays responsive during the
-// minutes a self-contained publish takes.
-internal sealed class BuildPanel {
-    public bool Open;
-
+internal sealed class BuildPanel : EditorWindow {
     readonly BallisticProject project;
 
-    // Ordered build scenes (project-relative "Assets/...scene"). Seeded from the manifest; edits here
-    // are saved into project.json by the build (and by an explicit Save button).
     readonly List<string> scenes = new();
     bool initialized;
 
-    // ---- player settings (edited in-panel, saved into project.json) ----
     string productName = "";
     string companyName = "";
     string version = "1.0.0";
     string iconPath = "";
-    int windowModeIndex;          // 0 Fullscreen, 1 Windowed, 2 Borderless
+    int windowModeIndex;
     int resWidth = 1920, resHeight = 1080;
 
-    // ---- output / toolchain ----
     string outputDir = "";
     bool selfContained = true;
-    int configIndex;              // 0 Release, 1 Debug
-    int ridIndex;                 // 0 win-x64, 1 win-arm64
+    int configIndex;
+    int ridIndex;
     static readonly string[] Configurations = { "Release", "Debug" };
     static readonly string[] Rids = { "win-x64", "win-arm64" };
     static readonly string[] WindowModes = { "Fullscreen", "Windowed", "Borderless" };
 
-    // ---- post-build actions ----
     bool runAfterBuild;
     bool openFolderAfterBuild = true;
 
-    // ---- worker state (touched from the build thread, read on the UI thread under `gate`) ----
     readonly object gate = new();
     readonly List<string> log = new();
     bool building;
     bool? lastSucceeded;
     string lastSummary;
-    string lastExePath;                 // set by the worker on success; drives Run / Open Folder
-    volatile bool runWhenDone;          // snapshot of runAfterBuild for the worker's completion
+    string lastExePath;
+    volatile bool runWhenDone;
     volatile bool openWhenDone;
-    string pendingLaunchExe;            // worker → UI handoff: launch this exe on the next Draw
+    string pendingLaunchExe;
 
     public BuildPanel(BallisticProject project) {
         this.project = project;
+        DockKey = "win.build";
+        Title = "Build";
+        Icon = EditorIcons.Package;
+        DesiredSize = new Vector2(580, 640);
     }
 
-    public void Draw(float scale) {
-        if (!Open)
-            return;
-
+    protected override void OnGui(IEditorGui gui) {
         EnsureInitialized();
 
-        ImGui.SetNextWindowSize(new SysVec2(580 * scale, 640 * scale), ImGuiCond.FirstUseEver);
-        if (!ImGui.Begin($"{EditorIcons.Package}  Build", ref Open)) {
-            ImGui.End();
-            return;
-        }
-
-        // Worker-requested launch runs here on the UI thread (Process.Start off the worker is fine too,
-        // but doing it here keeps all process spawning on one thread and lets us clear the flag safely).
         if (pendingLaunchExe is not null) {
             LaunchBuiltExe(pendingLaunchExe);
             pendingLaunchExe = null;
         }
 
-        DrawPlayerSettings(scale);
-        ImGui.Dummy(new SysVec2(0, 4 * scale));
-        DrawScenesInBuild(scale);
-        ImGui.Dummy(new SysVec2(0, 4 * scale));
-        DrawOutputSection(scale);
-        ImGui.Dummy(new SysVec2(0, 6 * scale));
-        DrawBuildButton(scale);
-        DrawLog(scale);
-
-        ImGui.End();
+        float scale = gui.Scale;
+        DrawPlayerSettings(gui);
+        gui.Dummy(new Vector2(0, 4 * scale));
+        DrawScenesInBuild(gui);
+        gui.Dummy(new Vector2(0, 4 * scale));
+        DrawOutputSection(gui);
+        gui.Dummy(new Vector2(0, 6 * scale));
+        DrawBuildButton(gui);
+        DrawLog(gui);
     }
 
     void EnsureInitialized() {
@@ -116,69 +89,66 @@ internal sealed class BuildPanel {
         outputDir = Path.Combine(project.RootPath, "Build", Sanitize(productName));
     }
 
-    // ---- Player Settings ----------------------------------------------------
-
-    void DrawPlayerSettings(float scale) {
-        if (!ImGui.CollapsingHeader($"{EditorIcons.Wrench}  Player Settings", ImGuiTreeNodeFlags.DefaultOpen))
+    void DrawPlayerSettings(IEditorGui gui) {
+        float scale = gui.Scale;
+        if (!gui.CollapsingHeader($"{EditorIcons.Wrench}  Player Settings", defaultOpen: true))
             return;
 
-        ImGui.Indent(8 * scale);
+        gui.Indent(8 * scale);
 
-        LabeledInput("Product Name", "##product", ref productName, 128, scale,
+        LabeledInput(gui, "Product Name", "##product", ref productName, 128,
             "The shipped game's name: the window title AND the published <Name>.exe.");
-        LabeledInput("Company", "##company", ref companyName, 128, scale,
+        LabeledInput(gui, "Company", "##company", ref companyName, 128,
             "Embedded in the exe's file details (optional).");
-        LabeledInput("Version", "##version", ref version, 32, scale,
+        LabeledInput(gui, "Version", "##version", ref version, 32,
             "Version baked into the exe (e.g. 1.0.0). Free-form text also allowed.");
 
-        // Icon: read-only path + Browse / Clear.
-        ImGui.TextDisabled("Icon (.ico)");
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("A .ico embedded into the exe for its taskbar/file icon. Optional.");
-        float btns = (EditorIcons.SmallButtonWidth(EditorIcons.Folder) + ImGui.GetStyle().ItemSpacing.X) * 2;
+        gui.TextDisabled("Icon (.ico)");
+        if (gui.IsItemHovered())
+            gui.Tooltip("A .ico embedded into the exe for its taskbar/file icon. Optional.");
+        float btns = (EditorIcons.SmallButtonWidth(EditorIcons.Folder) + gui.ItemSpacing.X) * 2;
         var iconDisplay = string.IsNullOrEmpty(iconPath) ? "(engine default)" : iconPath;
-        ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X - btns);
-        ImGui.BeginDisabled(true);
-        ImGui.InputText("##icon", ref iconDisplay, 512);
-        ImGui.EndDisabled();
-        ImGui.SameLine();
+        gui.SetNextItemWidth(gui.ContentRegionAvail.X - btns);
+        gui.BeginDisabled(true);
+        gui.InputText("##icon", ref iconDisplay, 512);
+        gui.EndDisabled();
+        gui.SameLine();
         if (EditorIcons.GhostButtonSmall("pickicon", EditorIcons.Folder, "Pick a .ico file")) BrowseForIcon();
-        ImGui.SameLine();
-        ImGui.BeginDisabled(string.IsNullOrEmpty(iconPath));
+        gui.SameLine();
+        gui.BeginDisabled(string.IsNullOrEmpty(iconPath));
         if (EditorIcons.GhostButtonSmall("clearicon", EditorIcons.Delete, "Use the engine default icon")) iconPath = "";
-        ImGui.EndDisabled();
+        gui.EndDisabled();
 
-        // Window mode + resolution.
-        ImGui.TextDisabled("Window");
-        ImGui.SetNextItemWidth(160 * scale);
-        ImGui.Combo("Mode##winmode", ref windowModeIndex, WindowModes, WindowModes.Length);
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Fullscreen = borderless at the monitor's resolution.\n" +
-                             "Windowed/Borderless use the resolution below.");
+        gui.TextDisabled("Window");
+        gui.SetNextItemWidth(160 * scale);
+        gui.Combo("Mode##winmode", ref windowModeIndex, WindowModes);
+        if (gui.IsItemHovered())
+            gui.Tooltip("Fullscreen = borderless at the monitor's resolution.\n" +
+                        "Windowed/Borderless use the resolution below.");
 
-        ImGui.BeginDisabled(windowModeIndex == 0); // resolution is irrelevant for monitor-sized fullscreen
-        ImGui.SetNextItemWidth(90 * scale);
-        ImGui.InputInt("##resw", ref resWidth, 0);
-        ImGui.SameLine();
-        ImGui.TextDisabled("x");
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(90 * scale);
-        ImGui.InputInt("##resh", ref resHeight, 0);
-        ImGui.SameLine();
-        ImGui.TextDisabled("default window size");
-        ImGui.EndDisabled();
+        gui.BeginDisabled(windowModeIndex == 0);
+        gui.SetNextItemWidth(90 * scale);
+        gui.InputInt("##resw", ref resWidth, 0);
+        gui.SameLine();
+        gui.TextDisabled("x");
+        gui.SameLine();
+        gui.SetNextItemWidth(90 * scale);
+        gui.InputInt("##resh", ref resHeight, 0);
+        gui.SameLine();
+        gui.TextDisabled("default window size");
+        gui.EndDisabled();
         resWidth = Math.Clamp(resWidth, 320, 16384);
         resHeight = Math.Clamp(resHeight, 240, 16384);
 
-        ImGui.Unindent(8 * scale);
+        gui.Unindent(8 * scale);
     }
 
-    void LabeledInput(string label, string id, ref string value, int max, float scale, string tip) {
-        ImGui.TextDisabled(label);
-        if (tip is not null && ImGui.IsItemHovered())
-            ImGui.SetTooltip(tip);
-        ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X);
-        ImGui.InputText(id, ref value, (uint)max);
+    static void LabeledInput(IEditorGui gui, string label, string id, ref string value, int max, string tip) {
+        gui.TextDisabled(label);
+        if (tip is not null && gui.IsItemHovered())
+            gui.Tooltip(tip);
+        gui.SetNextItemWidth(gui.ContentRegionAvail.X);
+        gui.InputText(id, ref value, max);
     }
 
     void BrowseForIcon() {
@@ -186,142 +156,135 @@ internal sealed class BuildPanel {
             project.AssetsPath);
         if (string.IsNullOrEmpty(picked))
             return;
-        // Store project-relative when the icon lives under the project; else keep the absolute path.
         if (picked.StartsWith(project.RootPath, StringComparison.OrdinalIgnoreCase))
             iconPath = Path.GetRelativePath(project.RootPath, picked).Replace('\\', '/');
         else
             iconPath = picked;
     }
 
-    // ---- Scenes In Build ----------------------------------------------------
-
-    void DrawScenesInBuild(float scale) {
-        if (!ImGui.CollapsingHeader($"{EditorIcons.Document}  Scenes In Build", ImGuiTreeNodeFlags.DefaultOpen))
+    void DrawScenesInBuild(IEditorGui gui) {
+        float scale = gui.Scale;
+        if (!gui.CollapsingHeader($"{EditorIcons.Document}  Scenes In Build", defaultOpen: true))
             return;
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Scenes shipped with the build. The first one loads on startup.\n" +
-                             "Load others at runtime with SceneManager.LoadScene(\"Name\").");
+        if (gui.IsItemHovered())
+            gui.Tooltip("Scenes shipped with the build. The first one loads on startup.\n" +
+                        "Load others at runtime with SceneManager.LoadScene(\"Name\").");
 
-        ImGui.BeginChild("##scenes", new SysVec2(0, 150 * scale), ImGuiChildFlags.Borders);
+        gui.BeginChild("##scenes", new Vector2(0, 150 * scale), border: true);
         if (scenes.Count == 0)
-            ImGui.TextDisabled("No scenes added. Use \"Add Open Scene\" or the + below.");
+            gui.TextDisabled("No scenes added. Use \"Add Open Scene\" or the + below.");
 
         int moveFrom = -1, moveTo = -1, remove = -1;
         for (int i = 0; i < scenes.Count; i++) {
-            ImGui.PushID(i);
+            gui.PushId(i);
 
             if (i == 0) {
-                ImGui.TextColored(EditorIcons.TintLight, EditorIcons.Home);
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip("Startup scene");
-                ImGui.SameLine();
+                gui.TextColored(EditorIcons.TintLight, EditorIcons.Home);
+                if (gui.IsItemHovered()) gui.Tooltip("Startup scene");
+                gui.SameLine();
             }
             else {
-                ImGui.Dummy(new SysVec2(ImGui.CalcTextSize(EditorIcons.Home).X, 0));
-                ImGui.SameLine();
+                gui.Dummy(new Vector2(gui.CalcTextSize(EditorIcons.Home).X, 0));
+                gui.SameLine();
             }
 
-            ImGui.TextDisabled($"{i}");
-            ImGui.SameLine();
-            ImGui.TextUnformatted(SceneName(scenes[i]));
-            ImGui.SameLine();
-            ImGui.TextDisabled($"  {scenes[i]}");
+            gui.TextDisabled($"{i}");
+            gui.SameLine();
+            gui.TextUnformatted(SceneName(scenes[i]));
+            gui.SameLine();
+            gui.TextDisabled($"  {scenes[i]}");
 
-            // Row actions, right-aligned: up / down / remove (same idiom as InspectorPanel's row eye).
-            ImGui.SameLine();
+            gui.SameLine();
             float bw = EditorIcons.SmallButtonWidth(EditorIcons.ChevronDown);
-            float gap = ImGui.GetStyle().ItemSpacing.X;
-            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - bw * 3 - gap * 2);
-            ImGui.BeginDisabled(i == 0);
+            float gap = gui.ItemSpacing.X;
+            gui.CursorPosX += gui.ContentRegionAvail.X - bw * 3 - gap * 2;
+            gui.BeginDisabled(i == 0);
             if (EditorIcons.GhostButtonSmall("up", EditorIcons.ChevronRight, "Move up")) { moveFrom = i; moveTo = i - 1; }
-            ImGui.EndDisabled();
-            ImGui.SameLine();
-            ImGui.BeginDisabled(i == scenes.Count - 1);
+            gui.EndDisabled();
+            gui.SameLine();
+            gui.BeginDisabled(i == scenes.Count - 1);
             if (EditorIcons.GhostButtonSmall("down", EditorIcons.ChevronDown, "Move down")) { moveFrom = i; moveTo = i + 1; }
-            ImGui.EndDisabled();
-            ImGui.SameLine();
+            gui.EndDisabled();
+            gui.SameLine();
             if (EditorIcons.GhostButtonSmall("rm", EditorIcons.Delete, "Remove")) remove = i;
 
-            ImGui.PopID();
+            gui.PopId();
         }
-        ImGui.EndChild();
+        gui.EndChild();
 
         if (remove >= 0) scenes.RemoveAt(remove);
-        // Guard BOTH indices against the (possibly just-shrunk) list — a remove in the same pass can
-        // leave moveFrom dangling past the end.
         if (moveFrom >= 0 && moveTo >= 0 && moveFrom < scenes.Count && moveTo < scenes.Count)
             (scenes[moveFrom], scenes[moveTo]) = (scenes[moveTo], scenes[moveFrom]);
 
-        if (ImGui.Button($"{EditorIcons.Add}  Add Open Scene")) AddOpenScene();
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Add the currently loaded scene");
-        ImGui.SameLine();
-        if (ImGui.Button($"{EditorIcons.Folder}  Add Scene...")) ImGui.OpenPopup("##addscene");
-        ImGui.SameLine();
-        if (ImGui.Button($"{EditorIcons.Save}  Save Settings")) SaveManifest();
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Write scenes + player settings into project.json without building");
+        if (gui.Button($"{EditorIcons.Add}  Add Open Scene")) AddOpenScene(gui);
+        if (gui.IsItemHovered()) gui.Tooltip("Add the currently loaded scene");
+        gui.SameLine();
+        if (gui.Button($"{EditorIcons.Folder}  Add Scene...")) gui.OpenPopup("##addscene");
+        gui.SameLine();
+        if (gui.Button($"{EditorIcons.Save}  Save Settings")) SaveManifest();
+        if (gui.IsItemHovered()) gui.Tooltip("Write scenes + player settings into project.json without building");
 
-        DrawAddScenePopup(scale);
+        DrawAddScenePopup(gui);
     }
 
-    void DrawAddScenePopup(float scale) {
-        ImGui.SetNextWindowSize(new SysVec2(360 * scale, 360 * scale), ImGuiCond.Appearing);
-        if (!ImGui.BeginPopup("##addscene"))
+    void DrawAddScenePopup(IEditorGui gui) {
+        float scale = gui.Scale;
+        gui.SetNextWindowSizeAppearing(new Vector2(360 * scale, 360 * scale));
+        if (!gui.BeginPopup("##addscene"))
             return;
 
-        ImGui.TextDisabled("Add a scene to the build");
-        ImGui.Separator();
-        ImGui.BeginChild("##scenelist");
+        gui.TextDisabled("Add a scene to the build");
+        gui.Separator();
+        gui.BeginChild("##scenelist", default, border: false);
         foreach (string path in AllScenePaths()) {
             bool already = scenes.Contains(path, StringComparer.OrdinalIgnoreCase);
-            ImGui.BeginDisabled(already);
+            gui.BeginDisabled(already);
             var (icon, tint) = EditorIcons.ForAssetExtension(".scene");
-            ImGui.TextColored(tint, icon);
-            ImGui.SameLine();
-            if (ImGui.Selectable($"{SceneName(path)}##{path}", false)) {
+            gui.TextColored(tint, icon);
+            gui.SameLine();
+            if (gui.Selectable($"{SceneName(path)}##{path}", false)) {
                 scenes.Add(path);
-                ImGui.CloseCurrentPopup();
+                gui.CloseCurrentPopup();
             }
-            ImGui.SameLine();
-            ImGui.TextDisabled(already ? "  (in build)" : $"  {path}");
-            ImGui.EndDisabled();
+            gui.SameLine();
+            gui.TextDisabled(already ? "  (in build)" : $"  {path}");
+            gui.EndDisabled();
         }
-        ImGui.EndChild();
-        ImGui.EndPopup();
+        gui.EndChild();
+        gui.EndPopup();
     }
 
-    // ---- Output + toolchain --------------------------------------------------
-
-    void DrawOutputSection(float scale) {
-        if (!ImGui.CollapsingHeader($"{EditorIcons.Folder}  Output", ImGuiTreeNodeFlags.DefaultOpen))
+    void DrawOutputSection(IEditorGui gui) {
+        float scale = gui.Scale;
+        if (!gui.CollapsingHeader($"{EditorIcons.Folder}  Output", defaultOpen: true))
             return;
 
-        ImGui.Indent(8 * scale);
-        ImGui.TextDisabled("Output Folder");
+        gui.Indent(8 * scale);
+        gui.TextDisabled("Output Folder");
 
-        // Field + Browse button on one row: shrink the field to leave room for the button.
-        float browseW = ImGui.CalcTextSize($"{EditorIcons.Folder}  Browse...").X + ImGui.GetStyle().FramePadding.X * 2;
-        ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X - browseW - ImGui.GetStyle().ItemSpacing.X);
-        ImGui.InputText("##out", ref outputDir, 512);
-        ImGui.SameLine();
-        ImGui.BeginDisabled(building);
-        if (ImGui.Button($"{EditorIcons.Folder}  Browse..."))
+        float browseW = gui.CalcTextSize($"{EditorIcons.Folder}  Browse...").X + gui.FramePadding.X * 2;
+        gui.SetNextItemWidth(gui.ContentRegionAvail.X - browseW - gui.ItemSpacing.X);
+        gui.InputText("##out", ref outputDir, 512);
+        gui.SameLine();
+        gui.BeginDisabled(building);
+        if (gui.Button($"{EditorIcons.Folder}  Browse..."))
             BrowseForOutput();
-        ImGui.EndDisabled();
+        gui.EndDisabled();
 
-        ImGui.Checkbox("Self-contained (bundle .NET 9 — target needs no runtime installed)", ref selfContained);
+        gui.Checkbox("Self-contained (bundle .NET 9 — target needs no runtime installed)", ref selfContained);
 
-        ImGui.SetNextItemWidth(140 * scale);
-        ImGui.Combo("Configuration", ref configIndex, Configurations, Configurations.Length);
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(140 * scale);
-        ImGui.Combo("Platform", ref ridIndex, Rids, Rids.Length);
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Target runtime. win-x64 for most PCs; win-arm64 for ARM Windows.");
+        gui.SetNextItemWidth(140 * scale);
+        gui.Combo("Configuration", ref configIndex, Configurations);
+        gui.SameLine();
+        gui.SetNextItemWidth(140 * scale);
+        gui.Combo("Platform", ref ridIndex, Rids);
+        if (gui.IsItemHovered())
+            gui.Tooltip("Target runtime. win-x64 for most PCs; win-arm64 for ARM Windows.");
 
-        ImGui.Unindent(8 * scale);
+        gui.Unindent(8 * scale);
     }
 
     void BrowseForOutput() {
-        // Seed the dialog at the current path (or its nearest existing parent, or the project root).
         string seed = outputDir;
         while (!string.IsNullOrEmpty(seed) && !Directory.Exists(seed))
             seed = Path.GetDirectoryName(seed);
@@ -333,44 +296,46 @@ internal sealed class BuildPanel {
             outputDir = picked;
     }
 
-    void DrawBuildButton(float scale) {
-        ImGui.Separator();
-        ImGui.Checkbox("Run after build", ref runAfterBuild);
-        ImGui.SameLine(0, 24 * scale);
-        ImGui.Checkbox("Open output folder when done", ref openFolderAfterBuild);
+    void DrawBuildButton(IEditorGui gui) {
+        float scale = gui.Scale;
+        gui.Separator();
+        gui.Checkbox("Run after build", ref runAfterBuild);
+        gui.SameLine(0, 24 * scale);
+        gui.Checkbox("Open output folder when done", ref openFolderAfterBuild);
 
         bool canBuild = !building && scenes.Count > 0 && !string.IsNullOrWhiteSpace(outputDir)
                         && !string.IsNullOrWhiteSpace(productName);
 
-        ImGui.BeginDisabled(!canBuild);
-        if (ImGui.Button(building ? "Building..." : $"{EditorIcons.Package}  Build",
-                         new SysVec2(160 * scale, 32 * scale)))
+        gui.BeginDisabled(!canBuild);
+        if (gui.Button(building ? "Building..." : $"{EditorIcons.Package}  Build",
+                       new Vector2(160 * scale, 32 * scale)))
             StartBuild();
-        ImGui.EndDisabled();
+        gui.EndDisabled();
 
         if (scenes.Count == 0) {
-            ImGui.SameLine();
-            ImGui.TextColored(EditorIcons.TintLight, "Add at least one scene to build.");
+            gui.SameLine();
+            gui.TextColored(EditorIcons.TintLight, "Add at least one scene to build.");
         }
         else if (string.IsNullOrWhiteSpace(productName)) {
-            ImGui.SameLine();
-            ImGui.TextColored(EditorIcons.TintLight, "Set a Product Name.");
+            gui.SameLine();
+            gui.TextColored(EditorIcons.TintLight, "Set a Product Name.");
         }
         else if (lastSucceeded == true) {
-            ImGui.SameLine();
-            if (ImGui.Button($"{EditorIcons.FolderOpen}  Open Folder", new SysVec2(0, 32 * scale)))
+            gui.SameLine();
+            if (gui.Button($"{EditorIcons.FolderOpen}  Open Folder", new Vector2(0, 32 * scale)))
                 OpenOutputFolder();
             if (lastExePath is not null && File.Exists(lastExePath)) {
-                ImGui.SameLine();
-                if (ImGui.Button($"{EditorIcons.Play}  Run", new SysVec2(0, 32 * scale)))
+                gui.SameLine();
+                if (gui.Button($"{EditorIcons.Play}  Run", new Vector2(0, 32 * scale)))
                     LaunchBuiltExe(lastExePath);
             }
         }
     }
 
-    void DrawLog(float scale) {
-        ImGui.Dummy(new SysVec2(0, 6 * scale));
-        ImGui.Separator();
+    void DrawLog(IEditorGui gui) {
+        float scale = gui.Scale;
+        gui.Dummy(new Vector2(0, 6 * scale));
+        gui.Separator();
 
         bool? ok;
         string summary;
@@ -382,22 +347,19 @@ internal sealed class BuildPanel {
         }
 
         if (summary is not null) {
-            SysVec4 color = ok == true ? new SysVec4(0.5f, 0.85f, 0.5f, 1f)
-                          : ok == false ? new SysVec4(0.9f, 0.45f, 0.45f, 1f)
+            Vector4 color = ok == true ? EditorTheme.Success
+                          : ok == false ? EditorTheme.Error
                           : EditorIcons.TintGeneric;
-            ImGui.TextColored(color, summary);
+            gui.TextColored(color, summary);
         }
 
-        ImGui.BeginChild("##buildlog", new SysVec2(0, 0), ImGuiChildFlags.Borders,
-            ImGuiWindowFlags.HorizontalScrollbar);
+        gui.BeginChild("##buildlog", new Vector2(0, 0), border: true, horizontalScroll: true);
         foreach (string line in lines)
-            ImGui.TextUnformatted(line);
-        if (building && ImGui.GetScrollY() >= ImGui.GetScrollMaxY() - 4)
-            ImGui.SetScrollHereY(1f);
-        ImGui.EndChild();
+            gui.TextUnformatted(line);
+        if (building && gui.ScrollY >= gui.ScrollMaxY - 4)
+            gui.SetScrollHereY(1f);
+        gui.EndChild();
     }
-
-    // ---- actions ------------------------------------------------------------
 
     void StartBuild() {
         PlayerSettings player = CollectPlayerSettings();
@@ -411,7 +373,6 @@ internal sealed class BuildPanel {
             Player = player,
         };
 
-        // Persist scenes + player settings immediately so they survive even if the build later fails.
         SaveManifest();
 
         runWhenDone = runAfterBuild;
@@ -424,7 +385,7 @@ internal sealed class BuildPanel {
             lastSummary = "Building...";
             lastExePath = null;
         }
-        BuildProgress.Begin();   // drives the full-window BusyOverlay card
+        BuildProgress.Begin();
 
         var thread = new Thread(() => {
             BuildPipeline.Result result = BuildPipeline.Build(options, Append);
@@ -440,8 +401,6 @@ internal sealed class BuildPanel {
             }
             BuildProgress.End();
 
-            // Post-build actions (off the worker — folder open is safe anywhere; the exe launch is
-            // handed to the UI thread via pendingLaunchExe so all process spawning happens in Draw).
             if (result.Success) {
                 if (openWhenDone)
                     OpenFolder(result.OutputDir);
@@ -465,9 +424,6 @@ internal sealed class BuildPanel {
         SelfContained = selfContained,
     };
 
-    // Each pipeline message is appended to the in-window log. Top-level phase headlines (the pipeline
-    // emits one per phase, in order) advance the overlay's determinate bar; indented sub-messages
-    // ("  copying Assets...") only update the card's detail line so the bar doesn't race ahead.
     void Append(string message) {
         lock (gate) log.Add(message);
 
@@ -477,14 +433,12 @@ internal sealed class BuildPanel {
             BuildProgress.Step(message);
     }
 
-    void AddOpenScene() {
-        // The loaded scene's source path isn't tracked on the Scene object; offer the manifest's
-        // current startup scene as the closest "open scene" proxy, else nudge the user to the picker.
+    void AddOpenScene(IEditorGui gui) {
         var current = scenes.Count == 0 ? project.Manifest.StartupScene : null;
         if (!string.IsNullOrEmpty(current) && !scenes.Contains(current, StringComparer.OrdinalIgnoreCase))
             scenes.Add(current);
         else if (scenes.Count > 0 || string.IsNullOrEmpty(current))
-            ImGui.OpenPopup("##addscene");
+            gui.OpenPopup("##addscene");
     }
 
     void SaveManifest() {
@@ -499,12 +453,12 @@ internal sealed class BuildPanel {
 
     static void OpenFolder(string dir) {
         if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir))
-            try { Process.Start("explorer.exe", $"\"{dir}\""); } catch { /* best effort */ }
+            try { Process.Start("explorer.exe", $"\"{dir}\""); } catch {
+            }
     }
 
     void LaunchBuiltExe(string exePath) {
         try {
-            // Launch with its own directory as the working dir so it finds Data\ next to the exe.
             Process.Start(new ProcessStartInfo(exePath) {
                 WorkingDirectory = Path.GetDirectoryName(exePath),
                 UseShellExecute = true,
@@ -515,8 +469,6 @@ internal sealed class BuildPanel {
             Append($"Could not launch {Path.GetFileName(exePath)}: {e.Message}");
         }
     }
-
-    // ---- helpers ------------------------------------------------------------
 
     IEnumerable<string> AllScenePaths() =>
         AssetDatabase.EnumerateAssets()

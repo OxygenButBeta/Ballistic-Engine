@@ -2,21 +2,17 @@ using BepuPhysics;
 using BepuPhysics.Collidables;
 using static BallisticEngine.Bepu.BepuMath;
 using NumVector3 = System.Numerics.Vector3;
-using TkQuaternion = System.Numerics.Quaternion;   // engine math is System.Numerics now (was OpenTK)
+using TkQuaternion = System.Numerics.Quaternion;
 using TkVector3 = System.Numerics.Vector3;
 
 namespace BallisticEngine.Bepu;
 
-// Wraps one Bepu body or static. Holds the compound recentering offset so the engine-facing
-// Position is always the ENTITY origin, not the center of mass. After Invalidate() (body
-// removed / world reset) every member degrades to a harmless no-op/default.
 sealed class BepuBody : IPhysicsBody {
     readonly BepuPhysicsWorld world;
     internal readonly BodyHandle BodyHandle;
     internal readonly StaticHandle StaticHandle;
     internal readonly TypedIndex ShapeIndex;
 
-    // Center of mass in body-local space (zero for non-recentered shapes).
     readonly NumVector3 centerOffset;
 
     public bool IsStatic { get; }
@@ -81,8 +77,6 @@ sealed class BepuBody : IPhysicsBody {
         set {
             if (!Valid)
                 return;
-            // Preserve the entity origin while rotating: the center-of-mass position moves
-            // when the orientation changes.
             TkVector3 origin = Position;
             if (IsStatic) {
                 StaticReference staticRef = world.Simulation.Statics[StaticHandle];
@@ -148,11 +142,6 @@ sealed class BepuBody : IPhysicsBody {
             body.Awake = true;
     }
 
-    // ---- Restitution support (velocity-level bounce on contact Enter) --------
-    // Statics report inverse mass 0 (immovable) and zero velocity. These read straight from the
-    // live Bepu body, used by BepuContactTracker to apply a measured coefficient-of-restitution
-    // impulse the instant two bodies start touching.
-
     internal float InverseMass => Valid && !IsStatic ? Body.LocalInertia.InverseMass : 0f;
 
     internal NumVector3 CenterOfMass =>
@@ -160,7 +149,6 @@ sealed class BepuBody : IPhysicsBody {
         : IsStatic ? world.Simulation.Statics[StaticHandle].Pose.Position
         : Body.Pose.Position;
 
-    // Velocity of the body at a given world point (linear + angular contribution). Zero for statics.
     internal NumVector3 VelocityAt(in NumVector3 worldPoint) {
         if (!Valid || IsStatic)
             return default;
@@ -169,8 +157,6 @@ sealed class BepuBody : IPhysicsBody {
         return body.Velocity.Linear + NumVector3.Cross(body.Velocity.Angular, r);
     }
 
-    // Apply a world-space impulse at a world point straight to the live body (no wake gating change
-    // beyond the standard wake) — used for the restitution velocity flip.
     internal void ApplyRestitutionImpulse(in NumVector3 impulse, in NumVector3 worldPoint) {
         if (!Valid || IsStatic)
             return;

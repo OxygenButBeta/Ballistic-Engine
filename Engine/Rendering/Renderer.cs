@@ -5,26 +5,18 @@ public abstract class Renderer : Behaviour, IStaticMeshRenderer {
     public abstract Mesh SharedMesh { get; set; }
     public abstract Material SharedMaterial { get; set; }
 
-    // -1 = whole mesh. Concrete renderers override to serialize it (members declared on this
-    // base class are excluded from serialization by ComponentReflection).
     public virtual int SubMeshIndex { get; set; } = -1;
+
+    public virtual float LodBias { get; set; } = 1f;
+
     public Transform Transform => transform;
     public bool RenderedThisFrame { get; set; }
 
-    // Skinning hooks (IStaticMeshRenderer). Static renderers are never skinned; SkinnedMeshRenderer
-    // overrides both so the draw path uploads its per-bone matrices to the bone SSBO.
     public virtual bool IsSkinned => false;
     public virtual Matrix4[] SkinningMatrices => null;
 
     Material materialInstance;
 
-    // Unity's renderer.material: returns a per-renderer CLONE of the shared material that you can
-    // mutate (material.MetallicFactor = ..., material.BaseColorFactor = ...) without affecting the
-    // .mat asset or other renderers using it. The clone is created on first access and reused; it
-    // replaces SharedMaterial for this renderer so rendering picks it up. Because the instance isn't
-    // an asset, it serializes as null — a runtime-only override, exactly like Unity's instanced mats.
-    //
-    // Use SharedMaterial instead when you WANT to edit the asset (affecting every user of it).
     public Material Material {
         get {
             if (materialInstance is not null)
@@ -32,10 +24,10 @@ public abstract class Renderer : Behaviour, IStaticMeshRenderer {
 
             Material source = SharedMaterial ?? MaterialFor(0);
             if (source is null)
-                return null; // nothing to instance yet (no mesh/material assigned)
+                return null;
 
             materialInstance = source.Clone();
-            SharedMaterial = materialInstance; // route this renderer's draws through the instance
+            SharedMaterial = materialInstance;
             return materialInstance;
         }
         set {
@@ -44,11 +36,37 @@ public abstract class Renderer : Behaviour, IStaticMeshRenderer {
         }
     }
 
-    // Materials resolved from the mesh's baked submesh refs (the .mat assets the model importer
-    // generated). Rebuilt lazily whenever the mesh instance changes; entries can be null.
     Mesh autoMaterialMesh;
     Material[] autoMaterials;
     bool hasAnyAutoMaterial;
+
+    Material[] materialOverrides;
+
+    protected Material[] MaterialOverrides {
+        get => materialOverrides;
+        set => materialOverrides = value;
+    }
+
+    Material OverrideFor(int submeshIndex) =>
+        materialOverrides is not null && (uint)submeshIndex < (uint)materialOverrides.Length
+            ? materialOverrides[submeshIndex]
+            : null;
+
+    public void SetMaterialOverride(int submeshIndex, Material material) {
+        if (submeshIndex < 0)
+            return;
+        int meshCount = SharedMesh?.SubMeshes?.Length ?? 0;
+        int needed = Math.Max(meshCount, submeshIndex + 1);
+        if (materialOverrides is null || materialOverrides.Length < needed) {
+            var grown = new Material[needed];
+            if (materialOverrides is not null)
+                Array.Copy(materialOverrides, grown, materialOverrides.Length);
+            materialOverrides = grown;
+        }
+        materialOverrides[submeshIndex] = material;
+    }
+
+    public Material GetMaterialOverride(int submeshIndex) => OverrideFor(submeshIndex);
 
     public bool IsRenderable {
         get {
@@ -61,15 +79,14 @@ public abstract class Renderer : Behaviour, IStaticMeshRenderer {
         }
     }
 
-    // The material a given submesh renders with. Single-submesh meshes honor an explicitly
-    // assigned SharedMaterial first; multi-submesh meshes use their baked refs and fall back
-    // to SharedMaterial for slots without one. When NOTHING resolves, substitutes the magenta/black
-    // MissingMaterial so the gap is visible (Unity's missing-material pink) instead of silently
-    // skipping the submesh — set ShowMissingMaterial = false to opt out (e.g. intentional holes).
     public static bool ShowMissingMaterial = true;
 
     public Material MaterialFor(int submeshIndex) {
         EnsureAutoMaterials();
+
+        Material over = OverrideFor(submeshIndex);
+        if (over is not null)
+            return over;
 
         Material auto = autoMaterials is not null && (uint)submeshIndex < (uint)autoMaterials.Length
             ? autoMaterials[submeshIndex]

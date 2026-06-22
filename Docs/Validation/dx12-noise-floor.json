@@ -1,0 +1,55 @@
+{
+  "Note": "DX12 determinism NOISE-FLOOR (W3 of the pass-graph migration). These are the phase-2 imgdiff tolerances: how much two renders of the SAME scene with ZERO code change differ on this substrate. Regime (a) = the deterministic golden gate (bal render, BALLISTIC_DETERMINISTIC=1: TAA/FSR/temporal pass-through, frame 180). Regime (b) = the non-deterministic temporal-stability oracle (motion-dump harness, temporal ACTIVE, no DETERMINISTIC). PIN to Substrate (R-NEW-6): a driver/GPU bump shifts HDR float output and invalidates these numbers — regenerate then. See C:\\Users\\suley\\.claude\\plans\\silly-leaping-fog.md W3 and memory dx12-passgraph-plan-2026-06-17.",
+  "Substrate": {
+    "Commit": "the chunk-2 commit on dx12-renderer (subject: '[dx12-passgraph] chunk2: W3 noise-floor + regime-(b) boiling band')",
+    "MeasuredOnTree": "chunk-2 tree: W3 HDR-dump tooling added (DumpHdrColor / BALLISTIC_DX12_HDR_DUMP); render path unchanged, LDR byte-identical to the chunk-1 tree b8b2dcea. Substrate that actually invalidates these numbers = GPU+driver below, not the exact commit.",
+    "Gpu": "AMD Radeon RX 9070 XT",
+    "DriverVersion": "32.0.31019.2002",
+    "GraphicsToolsInstalled": true,
+    "D3D12SDKLayersVersion": "10.0.26100.8521 (WinBuild.160101.0800)",
+    "OsVersion": "10.0.26200.0",
+    "Resolution": "1920x1080",
+    "CapturedUtc": "2026-06-17T01:00:00Z"
+  },
+
+  "RegimeA_DeterministicFloor": {
+    "Description": "bal render (BALLISTIC_DETERMINISTIC=1, paused, frame 180). The deterministic golden gate. Measured by rendering each scene 3x (LDR) / 3x (HDR) with zero code change and comparing.",
+    "Method": "LDR = SaveFrame -> ldr R8 composite BMP, compared by SHA-256 + bal imgdiff --no-blur. HDR = DumpHdrColor -> target R16F readback as raw R32F-triple .bin (BALLISTIC_DX12_HDR_DUMP), compared by SHA-256. Both in LINEAR/HDR and tonemapped/LDR space so a tonemap-compressed sub-floor HDR diff cannot hide.",
+    "Result": "FLOOR IS EXACTLY ZERO in BOTH spaces. All 4 scenes are byte-identical (SHA-256) across 3 deterministic renders in LDR, and byte-identical across 2-3 renders in HDR/linear. The GPU is fully deterministic run-to-run; the plan's worried-about 'HDR float reorders accumulate sub-ULP through bloom/tonemap' does NOT manifest on this substrate.",
+    "Gate": {
+      "PerPixel": "maxError == 0 (literal). bal imgdiff reports identical:true / meanError 0 / maxError 0 on a re-render.",
+      "SpatialCluster": "N/A as a tolerance band — floor is 0, so ANY nonzero coherent region in a phase-2 move is a real diff, not noise. The cluster rule degenerates to 'any nonzero region is a regression until explained' (which is exactly the phase-2 hard-fail posture).",
+      "HdrLinear": "maxError == 0 on the R32F .bin (SHA-256 match). Use BALLISTIC_DX12_HDR_DUMP for the HDR-space check where a tonemap could mask an LDR-invisible HDR diff.",
+      "Recommendation": "Phase-2 deterministic gate = literal byte-identity (SHA-256) of both the LDR BMP and the HDR .bin vs the frozen golden set. No tolerance epsilon is needed on THIS substrate. If a future driver introduces nondeterminism, re-measure and switch to per-pixel<=floor + same-sign-cluster."
+    },
+    "PerScene": {
+      "SkyTest": { "ldrSha256": "fb51654739802db307403d842bbdb4785e730357f8b6d32ebc2945c94d1a83ba", "hdrSha256": "c6de584b8721b553a88d7b030d8b6f63992a03ac90f723da0908299b7b265f35", "ldrIdenticalRuns": 4, "hdrIdenticalRuns": 2 },
+      "CornellBox": { "ldrSha256": "6e3ee554009ce9f0520a8c6a124fb6dff3cb03fc2b92bd5e8b3650c1eb4d7fa1", "hdrSha256": "a3118108866e324349f81ff529826b3c8fd139a2e37b590d35af3726f366f131", "ldrIdenticalRuns": 3, "hdrIdenticalRuns": 2 },
+      "BistroInterior_Wine": { "ldrSha256": "40a68b28de4aa294fb61712c7c4307231db58770d8cb7b63fed9763ddb50ccfe", "hdrSha256": "fe7aafc34f173475cca603aa26fa915334cceb3dd409db096e0dc14cdd017ec2", "ldrIdenticalRuns": 3, "hdrIdenticalRuns": 3 },
+      "BistroExterior": { "ldrSha256": "02d61b2b140758828841a51c4c4932941f0b3bdc1c39419ad890382720d3b853", "hdrSha256": "f288d785d6a88c66ac7eaad81d764aa6c152665406075543e9482f05a097fa3d", "ldrIdenticalRuns": 3, "hdrIdenticalRuns": 2 }
+    },
+    "HdrDumpFormat": "R32_Float little-endian, 3 floats/pixel (RGB, raw HDR pre-tonemap from the R16F `target`), top-down rows, 1920*1080*3*4 = 24883200 bytes.",
+    "NoteA": {
+      "Question": "The deterministic capture runs to frame 180 but temporal is pass-through (TAA off, SSGI HasHistory=0), so every history buffer is effectively first-frame. Does that mean V2 aliasing garbage is always-visible-or-never in the deterministic gate?",
+      "Answer": "The history/temporal targets (taaHistoryA/B, ssgiHistoryA/B, lumHistory) are read THROUGH the temporal path, which is inert under DETERMINISTIC — so an aliasing bug that only manifests via the temporal-accumulation read is INVISIBLE to regime (a). BUT the plan already imports (never aliases) those history targets, so V2 won't alias them anyway. The TRANSIENT targets V2 DOES alias (ssrTarget/ssrScene, ssgiTarget/ssgiDenoised/ssgiScene, bloomA/B, ssaoA/B, taaResolved, lumTarget) are each fully written-then-read within the single deterministic frame at 180 — so a read-before-write / partial-coverage garbage bug in ANY of those IS visible in regime (a) (floor is 0, so leftover-tenant garbage shows as a nonzero diff). COVERAGE GAP: edge-aware/partial-coverage reads that only trigger on specific content, and anything gated on HasHistory (inert here) — those need regime (b) (motion-dump) and the V2 manual read-before-write audit. So regime (a) covers the bulk of transient aliasing; regime (b) + the manual audit cover the temporal/partial-coverage tail."
+    }
+  },
+
+  "RegimeB_BoilingBand": {
+    "Description": "Motion-dump harness (BALLISTIC_DX12_GI_MOTION_DUMP, BALLISTIC_DX12_GI_MOTION_FRAMES=8): temporal ACTIVE (NO BALLISTIC_DETERMINISTIC), play-mode camera motion, runs to frame 180 then dumps the last 8 frames. Boiling metric = mean over the 7 consecutive-frame pairs of (mean abs per-channel pixel delta, 0..255). This is the SECOND oracle required for any phase-2 V-layer touching TAA/FSR/history (V2 history aliasing especially) — the deterministic golden gate does NOT exercise those code paths.",
+    "Invocation": "Run BallisticEngine.Runtime.exe DIRECTLY (bal render forces DETERMINISTIC which makes temporal a pass-through). Camera motion comes from play mode running the scene's controller; an explicit scripted yaw is BALLISTIC_DX12_GI_ORBIT=<deg/frame> (the documented reprojection/disocclusion driver). Measured both with orbit OFF (default play-mode motion) and ON.",
+    "KeyFinding": "The boiling metric is NEAR-DETERMINISTIC run-to-run on this substrate: BistroInterior is BIT-EXACT (sigma=0 over 4 runs); BistroExterior has a tiny real nondeterminism (sigma=3e-6 over 5 runs, min 21.100917 / max 21.100925). So the metric IS run-to-run variable (the plan was right) but the variance is minuscule. The DX12 renderer is essentially deterministic even with temporal active.",
+    "Bands": {
+      "BistroInterior_Wine_noOrbit": { "runs": 4, "mean": 29.961352, "sigma": 0.0, "min": 29.961352, "max": 29.961352, "perPair": [19.8871, 36.5709, 33.7540, 8.9743, 55.5448, 10.3023, 44.6960], "maxPairDelta": 559 },
+      "BistroInterior_Wine_orbit2": { "runs": 3, "mean": 43.284, "sigma": 0.0, "perPair": [25.010, 26.169, 89.699, 36.179, 57.398, 32.089, 36.444], "maxPairDelta": 604, "note": "BALLISTIC_DX12_GI_ORBIT=2" },
+      "BistroExterior_noOrbit": { "runs": 5, "mean": 21.100923, "sigma": 0.0000028, "min": 21.100917, "max": 21.100925, "perPair": [11.8892, 16.4890, 36.9826, 10.9511, 39.7979, 6.8605, 24.7362], "maxPairDelta": 614 }
+    },
+    "Gate": {
+      "Formula": "phase-1 boiling mean + k*sigma, per the plan. With the measured sigma so tiny, a literal k*sigma band (width ~1e-5) would false-fail on any legitimate future driver-level float reorder.",
+      "Recommendation": "Operational regime-(b) gate = boiling within max(mean + 3*sigma, mean * 1.005) of the frozen phase-1 value, i.e. a 0.5% relative tolerance OR 3-sigma, whichever is LOOSER. On THIS substrate that is effectively 'boiling unchanged to ~4 significant figures'. A real history-aliasing / temporal-barrier bug pushes boiling UP by a visible margin (new boiling, stuck/garbage history) — far beyond 0.5% — so the loose band still catches it while tolerating sub-ULP driver noise. Record per-scene means at phase-1 GOLDEN FREEZE and gate against THOSE (frozen), not a fresh re-measure.",
+      "Scenes": "Run regime (b) on BistroInterior (richest interior GI/SSGI temporal chain) at minimum; BistroExterior for the noisier-but-still-near-deterministic case. SkyTest/CornellBox have little temporal content."
+    }
+  },
+
+  "SunTempleCoverageNote": "SunTemple (Assets/Temple/SunTemple_v4/SunTemple/SunTemple.scene) renders BLACK headless (pre-existing, same as the W2 baseline note). It is EXCLUDED from both regimes' coverage — a black frame has a trivially-zero floor and zero boiling, so it adds no signal. The 4 measured scenes (SkyTest, CornellBox, BistroInterior_Wine, BistroExterior) are the coverage set."
+}

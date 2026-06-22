@@ -2,8 +2,6 @@ using System.IO.Compression;
 
 namespace BallisticEngine.AssetPipeline;
 
-// Packs a float[] height field to/from the base64 Deflate blob stored in TerrainDefinition.Heights.
-// Shared by TerrainImporter (read on import) and the editor save path (write on sculpt).
 public static class TerrainHeightCodec {
     public static string Encode(float[] heights) {
         if (heights is null || heights.Length == 0)
@@ -19,8 +17,6 @@ public static class TerrainHeightCodec {
         return Convert.ToBase64String(output.ToArray());
     }
 
-    // Returns false (heights = null) on empty/blank input or any decode failure — the caller then
-    // falls back to a flat field, never throwing on a corrupt asset.
     public static bool TryDecode(string blob, int expectedCount, out float[] heights) {
         heights = null;
         if (string.IsNullOrWhiteSpace(blob))

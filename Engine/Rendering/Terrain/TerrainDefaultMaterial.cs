@@ -1,9 +1,5 @@
 namespace BallisticEngine;
 
-// Supplies a lit material for terrain that has none assigned. A generated terrain mesh carries no
-// baked submesh material refs (unlike imported models), so without this the renderer treats it as
-// non-renderable (Renderer.IsRenderable needs a material). Mirrors the editor's Primitives default:
-// prefer the project's Default.mat asset, fall back to a code-built grey StandardShader material.
 public static class TerrainDefaultMaterial {
     public const string DefaultMaterialPath = "Assets/Default/Materials/Default.mat";
     public const string StandardShaderPath = "Assets/Default/Shaders/Standard.shader";

@@ -5,27 +5,16 @@ public class Mesh : BObject
 {
     public readonly Vector3[] Vertices;
     public readonly Vector3[] Normals;
-    public readonly Vector4[] Tangents; // w = bitangent handedness
+    public readonly Vector4[] Tangents;
     public readonly uint[] Indices;
     public readonly Vector2[] UVs;
 
-    // Index-buffer ranges per source material (always at least one, spanning everything).
-    // SubMeshData.MaterialRef carries the .mat the importer generated for that range.
     public readonly SubMeshData[] SubMeshes;
 
-    // Per-submesh inverse of SubMeshData.NodeTransform, precomputed for the renderer: when a
-    // renderer draws a single submesh (SubMeshIndex >= 0), its entity carries the node's
-    // transform, so the baked-in node placement must be undone (model = inverse * world).
-    // Identity for merged imports and pre-v4 artifacts.
     public readonly Matrix4[] InverseNodeTransforms;
 
-    // The source model's node hierarchy (split-by-nodes imports; empty otherwise) — the editor
-    // instantiates one entity per node so the authored tree survives.
     public readonly MeshNodeData[] Nodes;
 
-    // ---- Skinning (null/default for static meshes) --------------------------
-    // The skeleton these vertices are bound to, and per-vertex influences (CPU copies; the GPU
-    // index/weight buffers are at locations 8/9). IsSkinned gates the skinned render path.
     public readonly SkeletonData Skeleton;
     public readonly Vector4i[] BoneIndices;
     public readonly Vector4[] BoneWeights;
@@ -36,17 +25,13 @@ public class Mesh : BObject
     readonly GPUBuffer<Vector2> UVBuffer;
     readonly GPUBuffer<Vector3> normalBuffer;
     readonly GPUBuffer<Vector4> tangentBuffer;
-    readonly GPUBuffer<Vector4> boneIndexBuffer;   // skinned only
-    readonly GPUBuffer<Vector4> boneWeightBuffer;  // skinned only
+    readonly GPUBuffer<Vector4> boneIndexBuffer;
+    readonly GPUBuffer<Vector4> boneWeightBuffer;
     public readonly InstancedBuffer InstanceBuffer;
 
     readonly GPUBuffer<uint> indexBuffer;
     readonly RenderContext renderContext;
 
-    // Buffer accessors for backends that bind buffers per-draw rather than via a bound VAO. The GL
-    // backend draws off the VAO state set up in Activate() and never touches these; the DX12 backend
-    // casts them to its concrete buffer type to read GPU addresses and build vertex/index buffer views
-    // at draw time. Read-only — the buffers are filled once at construction.
     public GPUBuffer<Vector3> VertexBuffer => vertexBuffer;
     public GPUBuffer<Vector3> NormalBuffer => normalBuffer;
     public GPUBuffer<Vector2> UvBuffer => UVBuffer;
@@ -54,6 +39,19 @@ public class Mesh : BObject
     public GPUBuffer<uint> IndexBuffer => indexBuffer;
     public GPUBuffer<Vector4> BoneIndexBuffer => boneIndexBuffer;
     public GPUBuffer<Vector4> BoneWeightBuffer => boneWeightBuffer;
+
+    [ThreadStatic] public static bool DeferUpload;
+
+    public bool IsUploaded { get; private set; }
+
+    public void EnsureUploaded()
+    {
+        if (IsUploaded) return;
+        renderContext.Activate();
+        FillBuffers();
+        renderContext.Deactivate();
+        IsUploaded = true;
+    }
 
     Mesh(in MeshData data)
     {
@@ -72,8 +70,6 @@ public class Mesh : BObject
         UVs = data.UVs;
         Normals = data.Normals;
 
-        // Skinning data: keep CPU copies (the Animator walks the skeleton) and, on a skinned mesh,
-        // create the bone-index/weight vertex buffers into THIS mesh's VAO (locations 8/9).
         IsSkinned = data.IsSkinned;
         Skeleton = data.Skeleton;
         BoneIndices = data.BoneIndices;
@@ -90,7 +86,6 @@ public class Mesh : BObject
         InverseNodeTransforms = new Matrix4[SubMeshes.Length];
         for (var i = 0; i < SubMeshes.Length; i++) {
             Matrix4 node = SubMeshes[i].NodeTransform;
-            // Guard degenerate matrices (default-constructed SubMeshData is all zeros).
             InverseNodeTransforms[i] = Math.Abs(node.GetDeterminant()) > 1e-12f
                 ? node.Inverted()
                 : Matrix4.Identity;
@@ -98,7 +93,11 @@ public class Mesh : BObject
 
         InstanceBuffer = GraphicAPI.CreateInstancedBuffer(renderContext);
         InstanceBuffer.Create();
-        FillBuffers();
+
+        if (DeferUpload)
+            MeshUploadQueue.Enqueue(this);
+        else
+            FillBuffers();
 
         renderContext.Deactivate();
     }
@@ -115,8 +114,6 @@ public class Mesh : BObject
     bool hasBounds;
     Vector3[] subBoundsMin, subBoundsMax;
 
-    // Local-space AABB, computed lazily from the CPU vertex copy. Used by the probe-bake
-    // occupancy grid, the irradiance volume's fit-to-scene, and frustum culling.
     public void GetLocalBounds(out Vector3 min, out Vector3 max)
     {
         if (!hasBounds) {
@@ -134,10 +131,6 @@ public class Mesh : BObject
         max = boundsMax;
     }
 
-    // Per-submesh local AABB (baked model space, same space as Vertices). Split-by-nodes
-    // imports share one huge mesh across many entities; culling each entity with the WHOLE
-    // mesh's bounds would make every part as big as the building — these make culling real.
-    // All ranges are computed in one pass over the index buffer on first use.
     public void GetSubMeshBounds(int index, out Vector3 min, out Vector3 max)
     {
         if ((uint)index >= (uint)SubMeshes.Length) {
@@ -157,7 +150,7 @@ public class Mesh : BObject
                     lo = Vector3.Min(lo, v);
                     hi = Vector3.Max(hi, v);
                 }
-                // Degenerate (empty) ranges collapse to a point so they cull away cleanly.
+
                 subBoundsMin[s] = SubMeshes[s].IndexCount > 0 ? lo : Vector3.Zero;
                 subBoundsMax[s] = SubMeshes[s].IndexCount > 0 ? hi : Vector3.Zero;
             }
@@ -195,7 +188,6 @@ public class Mesh : BObject
         tangentBuffer.SetBufferData(in Tangents, BufferUsage.StaticDraw);
 
         if (IsSkinned) {
-            // Bone indices upload as floats (location 8); exact for any bone count (< 2^24).
             var indicesAsFloat = new Vector4[BoneIndices.Length];
             for (var i = 0; i < BoneIndices.Length; i++) {
                 Vector4i b = BoneIndices[i];

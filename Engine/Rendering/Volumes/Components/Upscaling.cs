@@ -1,8 +1,5 @@
 namespace BallisticEngine;
 
-// Temporal upscaling (AMD FidelityFX FSR, DX12 backend). When the mode is anything but Off the renderer
-// draws the scene at a lower internal resolution and reconstructs the display resolution from jittered
-// frames + motion vectors — and FSR's temporal pass REPLACES TAA. Off = native-resolution render.
 public sealed class Upscaling : VolumeComponent {
     [Tooltip("FSR upscaling quality. Off = native render. NativeAA = temporal AA at native res. " +
              "Quality/Balanced/Performance/UltraPerformance trade internal resolution for speed " +

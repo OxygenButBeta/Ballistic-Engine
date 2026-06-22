@@ -1,13 +1,8 @@
-using System;
-using System.Collections.Generic;
 using System.Reflection;
 using System.Text;
 
 namespace BallisticEngine.Editor.Inspector;
 
-// Small shared helpers: label prettify, the logical value of a (possibly VolumeParameter) member, and a
-// cached sibling-member accessor so conditional attributes don't reflect every frame (honours the
-// engine's "no reflection in the hot path" rule — resolve once, read the field thereafter).
 public static class InspectorReflection {
     const BindingFlags Flags = BindingFlags.Public | BindingFlags.Instance;
 
@@ -22,8 +17,6 @@ public static class InspectorReflection {
         return sb.ToString();
     }
 
-    // VolumeParameter<T> -> its .Value; anything else returned as-is. Lets sibling conditions on a volume
-    // override compare against the unwrapped value (e.g. a BoolParameter sibling reads as a bool).
     public static object LogicalValue(object raw) {
         if (raw is null) return null;
         if (valueProp.TryGetValue(raw.GetType(), out PropertyInfo cached))
@@ -44,8 +37,6 @@ public static class InspectorReflection {
     static readonly Dictionary<Type, PropertyInfo> valueProp = new();
     static readonly Dictionary<(Type, string), MemberInfo> siblingCache = new();
 
-    // Resolves a sibling member on `owner` by name (case-sensitive, public instance field/property),
-    // caches the MemberInfo, and returns its LOGICAL value. Returns false if no such member exists.
     public static bool TryGetSibling(object owner, string name, out object value) {
         value = null;
         if (owner is null || string.IsNullOrEmpty(name)) return false;

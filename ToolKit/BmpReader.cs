@@ -1,16 +1,12 @@
 namespace BallisticEngine;
 
-// Minimal 24bpp BMP decoder — the inverse of BmpWriter, for tools that compare the engine's own
-// screenshots (bal imgdiff). Returns rows bottom-up in BGR byte order (BmpWriter's layout).
-// Handles top-down files (negative height) by flipping; rejects anything not 24bpp uncompressed.
-// BCL-only on purpose (ToolKit layer).
 public static class BmpReader {
     public static (int Width, int Height, byte[] BgrPixels) Read(string path) {
         using var br = new BinaryReader(File.OpenRead(path));
         if (br.ReadByte() != 'B' || br.ReadByte() != 'M')
             throw new InvalidDataException($"'{path}' is not a BMP file");
-        br.ReadInt32();                    // file size
-        br.ReadInt32();                    // reserved
+        br.ReadInt32();
+        br.ReadInt32();
         int dataOffset = br.ReadInt32();
         int headerSize = br.ReadInt32();
         if (headerSize < 40)
@@ -19,7 +15,7 @@ public static class BmpReader {
         int rawHeight = br.ReadInt32();
         bool topDown = rawHeight < 0;
         int height = Math.Abs(rawHeight);
-        br.ReadInt16();                    // planes
+        br.ReadInt16();
         int bpp = br.ReadInt16();
         int compression = br.ReadInt32();
         if (bpp != 24 || compression != 0)
@@ -33,7 +29,7 @@ public static class BmpReader {
         for (int y = 0; y < height; y++) {
             if (br.Read(row, 0, padded) != padded)
                 throw new InvalidDataException($"'{path}': truncated pixel data");
-            int destRow = topDown ? height - 1 - y : y; // normalize to bottom-up
+            int destRow = topDown ? height - 1 - y : y;
             Array.Copy(row, 0, pixels, destRow * rowBytes, rowBytes);
         }
         return (width, height, pixels);

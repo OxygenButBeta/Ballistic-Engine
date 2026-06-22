@@ -1,6 +1,3 @@
-using System;
-using System.Collections.Generic;
-
 namespace Facebook.Yoga
 {
     public class SmallValueBuffer<BufferSize> where BufferSize : struct, IConstant

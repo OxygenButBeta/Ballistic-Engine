@@ -5,6 +5,9 @@ public abstract class Shader : BObject, IDisposable, ISharedResource
 {
     public abstract ResourceIdentity Identity { get; }
     public abstract int UID { get; }
+
+    public virtual ShaderProperties Properties => ShaderProperties.Empty;
+
     static Shader ActiveShader;
     protected Shader() => SharedResources<Shader>.AddResource(this);
 

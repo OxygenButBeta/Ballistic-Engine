@@ -2,24 +2,12 @@ using BallisticEngine.Serialization;
 
 namespace BallisticEngine.Editor;
 
-// Computes which members of a prefab-instance entity DIFFER from its source .prefab — Unity's
-// "override" tracking, the blue-bar markers in the inspector. The instance and the prefab root are
-// both captured as EntityDocuments and compared member-by-member; a member whose serialized value
-// differs is an override. The result is cached per (entity, prefab) and recomputed when the inspector
-// asks for a fresh selection, so the diff cost is paid once per selection, not per frame.
-//
-// Comparison is by SERIALIZED value (each member re-serialized to a YAML scalar/string), so it's
-// type-agnostic: floats, vectors, enums, and asset refs all compare correctly without bespoke logic.
 internal static class PrefabOverrides {
-    // Keys that are intrinsically per-instance and must NEVER show as overrides (Unity excludes the
-    // root transform position/rotation from the "modifications" list conceptually, but we DO track
-    // them — they're the most common legit override. We only exclude identity/bookkeeping fields).
     static Entity cachedEntity;
     static Guid cachedPrefab;
-    static HashSet<string> overrides = new();   // "Transform.Position", "Type#index.MemberName"
+    static HashSet<string> overrides = new();
     static bool valid;
 
-    // The override key for a component member. index disambiguates multiple components of one type.
     public static string Key(string componentType, int typeIndex, string member) =>
         $"{componentType}#{typeIndex}.{member}";
 
@@ -27,8 +15,6 @@ internal static class PrefabOverrides {
     public const string TransformRotationKey = "Transform.Rotation";
     public const string TransformScaleKey = "Transform.Scale";
 
-    // Recompute the override set for `entity` if it changed selection. Safe to call every inspector
-    // build; it no-ops when the cache is still valid for this entity+prefab.
     public static void Refresh(Entity entity) {
         if (entity is null || !entity.IsPrefabInstance) { Clear(); return; }
         if (valid && ReferenceEquals(cachedEntity, entity) && cachedPrefab == entity.PrefabSource)
@@ -52,7 +38,6 @@ internal static class PrefabOverrides {
 
     public static bool IsOverridden(string key) => overrides.Contains(key);
 
-    // True if ANY member of the given component (registry type name + type index) is overridden.
     public static bool ComponentHasOverride(string componentType, int typeIndex) {
         string prefix = $"{componentType}#{typeIndex}.";
         foreach (string k in overrides)
@@ -62,11 +47,8 @@ internal static class PrefabOverrides {
 
     public static bool HasAnyOverride => overrides.Count > 0;
 
-    // Marks a key as no-longer-overridden after a per-member revert (so the marker clears without a
-    // full recompute). The next selection change recomputes from scratch anyway.
     public static void ClearKey(string key) => overrides.Remove(key);
 
-    // Invalidates the cache (e.g. after Apply/Revert mutated the prefab or the instance).
     public static void Invalidate() => valid = false;
 
     static void Clear() {
@@ -82,8 +64,6 @@ internal static class PrefabOverrides {
         if (!Equal(a.Scale, b.Scale)) overrides.Add(TransformScaleKey);
     }
 
-    // Pair components by type, in order, so two BoxColliders compare 0-to-0 and 1-to-1. A component
-    // present on the instance but not the prefab (added override) marks ALL its members overridden.
     static void DiffComponents(List<ComponentDocument> instance, List<ComponentDocument> prefab) {
         var prefabByType = new Dictionary<string, List<ComponentDocument>>();
         foreach (ComponentDocument c in prefab) {
@@ -100,7 +80,6 @@ internal static class PrefabOverrides {
                 ? list[idx] : null;
 
             if (match is null) {
-                // Whole component is an addition — every member counts as an override.
                 foreach (var kv in inst.Members)
                     overrides.Add(Key(inst.Type, idx, kv.Key));
                 continue;
@@ -119,8 +98,6 @@ internal static class PrefabOverrides {
         MathF.Abs(a.X - b.X) < 1e-5f && MathF.Abs(a.Y - b.Y) < 1e-5f &&
         MathF.Abs(a.Z - b.Z) < 1e-5f && MathF.Abs(a.W - b.W) < 1e-5f;
 
-    // Serialized-value equality: compare the two members' YAML projections. Robust for any member
-    // type the scene serializer already handles (scalars, vectors, enums, asset-ref guids, lists).
     static bool ValueEqual(object a, object b) {
         if (a is null && b is null) return true;
         if (a is null || b is null) return false;

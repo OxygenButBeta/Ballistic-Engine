@@ -3,24 +3,7 @@ using BallisticEngine.AssetPipeline;
 
 namespace BallisticEngine.Serialization;
 
-// BEvent <-> plain dictionaries/lists, the form the scene serializer drops into a component's member
-// map (YamlDotNet then renders it as nested YAML, no bespoke type converter needed). A BEvent
-// serializes to a LIST of persistent-listener maps:
-//
-//   onClick:
-//     - target: 3f2a...      # InstanceId of the target Entity/Behaviour (32 hex)
-//       method: TakeDamage
-//       mode: Static         # Void | Static | Dynamic
-//       argType: System.Single
-//       arg: 10              # static argument (Static mode only); BObject args are "guid:..."
-//
-// Runtime (code-added) listeners are NOT serialized — only the authored persistent ones, matching
-// Unity. Deserialize fills an EXISTING BEvent (the component owns the instance) rather than building
-// a new one; the caller passes the live event in.
 public static class BEventYaml {
-
-    // Returns the listener list, or null when there are no persistent listeners (keeps the YAML
-    // clean — the serializer skips null member values).
     public static object Serialize(BEvent evt) {
         if (evt is null || evt.PersistentListeners.Count == 0)
             return null;
@@ -76,8 +59,6 @@ public static class BEventYaml {
         }
     }
 
-    // ---- static argument (de)serialization ---------------------------------
-
     static object SerializeArg(object arg) {
         if (arg is null)
             return null;
@@ -85,7 +66,7 @@ public static class BEventYaml {
             return AssetDatabase.TryGetAssetGuid(asset, out Guid g) ? AssetRef.FromGuid(g) : null;
         if (arg is Enum e)
             return e.ToString();
-        return arg; // float/int/bool/string pass through to YAML scalars
+        return arg;
     }
 
     static object DeserializeArg(object raw, Type argType) {
@@ -98,7 +79,7 @@ public static class BEventYaml {
         if (argType.IsInstanceOfType(raw))
             return raw;
         try { return Convert.ChangeType(raw, argType, CultureInfo.InvariantCulture); }
-        catch { return Activator.CreateInstance(argType); } // never null for a value type
+        catch { return Activator.CreateInstance(argType); }
     }
 
     static object TryParseEnum(object raw, Type enumType) {
@@ -112,8 +93,6 @@ public static class BEventYaml {
         return loadRef.Invoke(null, [reference]);
     }
 
-    // Resolve a stored type name to a Type. Tries the engine assembly first (where the supported arg
-    // types live), then game assemblies via the AppDomain (custom enums in scripts).
     static Type ResolveArgType(string fullName) {
         if (string.IsNullOrEmpty(fullName))
             return null;
@@ -127,10 +106,6 @@ public static class BEventYaml {
         }
         return null;
     }
-
-    // ---- YAML shape helpers ------------------------------------------------
-    // YamlDotNet deserializes an `object` map as Dictionary<object,object> and a sequence as
-    // List<object>; the serializer's own dictionaries are <string,object>. Handle both.
 
     static Dictionary<string, object> ToStringKeyedMap(object item) {
         if (item is Dictionary<string, object> s)

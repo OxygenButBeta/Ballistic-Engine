@@ -8,9 +8,12 @@ cbuffer DrawIndexCB : register(b0) { uint DrawIndex; uint3 _pad0; };   // set pe
 
 // Per-pass motion constants (b1): UNJITTERED current + previous frame view*proj (transposed). Identical
 // to GBuffer.hlsl — the PS reprojects PosW through both for a jitter-free motion vector (TAA + FSR).
+// V2: NormalLodBias rides along here (a per-pass render parameter) — the normal-AA LOD bias for D3.
 cbuffer MotionConstants : register(b1) {
     float4x4 ViewProjCur;    // current frame, UNJITTERED (transposed)
     float4x4 ViewProjPrev;   // previous frame, UNJITTERED (transposed)
+    float    NormalLodBias;  // V2: positive = sample normal maps coarser (kills normal-map aliasing sparkle)
+    float3   _padMotion;
 };
 
 struct PerDraw { float4x4 Mvp; float4x4 Model; uint MaterialId; uint3 _pad; };
@@ -68,7 +71,12 @@ VSOutput VSMain(VSInput v) {
 
 float3 NormalFromMap(Texture2D normalMap, float normalFlipY, float normalStrength,
                      float2 uv, float3 Ngeom, float3 T, float bitangentSign) {
-    float2 nxy = normalMap.Sample(LinearWrap, uv).rg;
+    // V2 (fixes D3 — normal-map aliasing sparkle): sample the normal map one notch COARSER (positive LOD bias)
+    // so heavily-tiled high-frequency normals (Bistro brick/stone) average across the under-sampled texels
+    // instead of feeding per-pixel noise into the G-buffer normal (which drove the diffuse-shading speckle).
+    // NormalLodBias=0 restores the pre-V2 exact mip (kill-switch); the bias only smooths the normal, never the
+    // albedo, so surface colour detail is untouched. SampleBias respects the hardware's UV-derivative LOD.
+    float2 nxy = normalMap.SampleBias(LinearWrap, uv, NormalLodBias).rg;
     if (normalFlipY > 0.5) nxy.y = 1.0 - nxy.y;
     float2 xy = (nxy * 2.0 - 1.0) * max(normalStrength, 0.0);
     float z = sqrt(max(1.0 - dot(xy, xy), 0.0));

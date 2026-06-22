@@ -1,6 +1,4 @@
-﻿using OpenTK.Windowing.Desktop;
-
-namespace BallisticEngine.Core.GL;
+﻿namespace BallisticEngine.Core.GL;
 
 public class GLTime : IEngineTimer
 {

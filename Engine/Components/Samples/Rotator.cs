@@ -2,9 +2,8 @@ using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine;
 
-// Sample behaviour: spins its entity about Z. With Alpha enabled, K/J adjust the speed at play time.
 public class Rotator : Behaviour {
-    public float RotationSpeed { get; set; } = 45.0f; // degrees per second
+    public float RotationSpeed { get; set; } = 45.0f;
     public bool Alpha { get; set; }
 
     protected internal override void Tick(in float delta) {

@@ -73,6 +73,12 @@ float4 PSMarch(VSOut i) : SV_Target {
     float hit = 0.0;
     float2 hitUV = 0.0.xx;
 
+    // STABILITY: scale the depth-compare bias by the surface view depth. A fixed +0.01 is too tight for
+    // distant/thin geometry (the refine bisection lands on a different sub-texel each frame → the hit UV
+    // jitters); a depth-proportional bias keeps the comparison consistent across distance, so the resolved
+    // hit point is stable frame to frame on thin/grazing surfaces.
+    float zBias = max(0.01, abs(P.z) * 0.0025);
+
     [loop] for (int s = 0; s < MARCH_STEPS; s++) {
         prevPos = rayPos;
         rayPos += R * stepLength;
@@ -82,12 +88,12 @@ float4 PSMarch(VSOut i) : SV_Target {
         float sceneZ = ViewPos(uv).z;
         float thickness = stepLength * 2.0 + 0.3;
         // View Z is negative ahead; a hit is where the scene surface is in front of the ray within thickness.
-        if (sceneZ > rayPos.z + 0.01 && sceneZ - rayPos.z < thickness) {
+        if (sceneZ > rayPos.z + zBias && sceneZ - rayPos.z < thickness) {
             float3 lo = prevPos, hi = rayPos;
             [loop] for (int r = 0; r < REFINE_STEPS; r++) {
                 float3 mid = (lo + hi) * 0.5;
                 float wm; float2 midUV = ToUV(mid, wm);
-                if (ViewPos(midUV).z > mid.z + 0.01) hi = mid; else lo = mid;
+                if (ViewPos(midUV).z > mid.z + zBias) hi = mid; else lo = mid;
             }
             float wd; hitUV = ToUV(hi, wd);
             hit = 1.0; break;
@@ -95,8 +101,10 @@ float4 PSMarch(VSOut i) : SV_Target {
     }
     if (hit < 0.5) return 0.0.xxxx;
 
+    // Wider screen-edge fade (0.12 vs 0.08): thin surfaces whose reflection ray exits the screen pop in/out
+    // binarily right at the border, reading as edge jitter. A softer ramp dissolves that flicker.
     float2 edge = min(hitUV, 1.0 - hitUV);
-    float edgeFade = smoothstep(0.0, 0.08, min(edge.x, edge.y));
+    float edgeFade = smoothstep(0.0, 0.12, min(edge.x, edge.y));
     float roughFade = 1.0 - smoothstep(0.3, MAX_ROUGHNESS, roughness);
 
     bool isMetal = metallic >= 0.5;
@@ -108,11 +116,27 @@ float4 PSMarch(VSOut i) : SV_Target {
     float grazeKeep = 1.0 - smoothstep(0.05, 0.45, roughness);
     fresnel = F0 + grazing * grazeKeep;
 
-    float3 reflected = ColorTex.SampleLevel(LinearClamp, hitUV, 0).rgb;
+    // GRAZING STABILITY: at extreme grazing angles (NdotV→0) the Fresnel term explodes and a sub-pixel normal
+    // wobble on a thin/edge-on surface swings the reflection violently — the dominant SSR shimmer on thin
+    // geometry. Fade strength out below ~25° grazing so the most unstable angles contribute softly, not as a
+    // razor-sharp mirror. The mid-range and head-on reflections (where SSR is stable) are untouched.
+    float grazeStable = smoothstep(0.05, 0.35, NdotV);
+
+    // The scene-color texture has no mip chain, so a single point tap on thin/high-contrast reflected geometry
+    // aliases (the dominant SSR shimmer source besides grazing). A small fixed 4-tap box around the hit UV,
+    // widened with roughness, pre-filters that aliasing in-shader — a cheap stand-in for a roughness mip
+    // (physically correct too: rougher = blurrier reflection). Head-on sharp metals (roughness≈0) get a tight
+    // 1-texel kernel; rougher surfaces blur more.
+    float blurR = (0.75 + roughness * 3.0);
+    float2 t = TexelSize * blurR;
+    float3 reflected = (ColorTex.SampleLevel(LinearClamp, hitUV + float2( t.x,  t.y), 0).rgb
+                      + ColorTex.SampleLevel(LinearClamp, hitUV + float2(-t.x,  t.y), 0).rgb
+                      + ColorTex.SampleLevel(LinearClamp, hitUV + float2( t.x, -t.y), 0).rgb
+                      + ColorTex.SampleLevel(LinearClamp, hitUV + float2(-t.x, -t.y), 0).rgb) * 0.25;
     float surfaceLum = dot(ColorTex.SampleLevel(LinearClamp, i.Uv, 0).rgb, float3(0.2126, 0.7152, 0.0722));
     float lowLightDamp = smoothstep(0.0, 0.08, surfaceLum);
 
-    float strength = saturate(fresnel * Intensity) * edgeFade * roughFade * lowLightDamp;
+    float strength = saturate(fresnel * Intensity) * edgeFade * roughFade * lowLightDamp * grazeStable;
     return float4(reflected, strength);
 }
 
@@ -156,4 +180,61 @@ float4 PSCombine(VSOut i) : SV_Target {
     float4 ssr = acc / wSum;
     // Lerp (not add) — the SSR hit replaces the sky-IBL reflection baked into the scene color.
     return float4(lerp(scene, ssr.rgb, ssr.a), 1.0);
+}
+
+// --- TEMPORAL pass (SSR + RT): motion-reprojected EMA over the half-res reflection target. RT mirror rays read
+// the Lumen card cache, which churns frame to frame; SSR's half-res march + Fresnel edges flicker on a static
+// view the same way — and reflections run BEFORE TAA with no other denoiser — so both feed this pass. Reproject
+// last frame's
+// reflection via the motion buffer and EMA-blend with this frame's, with a neighbourhood clamp + a disocclusion
+// reset so a moving mirror / uncovered surface doesn't smear. The .a channel is the reflection STRENGTH (carried
+// straight through, not accumulated). For this pass: ColorTex(t0)=current reflection, DepthTex(t1)=history,
+// NormalTex(t2)=motion (G-buffer RG). Params: Intensity.x reused as hasHistory (0 on first frame / resize).
+float4 PSTemporal(VSOut i) : SV_Target {
+    float2 uv = i.Uv;
+    float4 current = SanitizeSsr(ColorTex.SampleLevel(LinearClamp, uv, 0));
+
+    float hasHistory = Intensity;   // SsrConstants.Intensity is repurposed as the hasHistory flag for this pass
+    float2 motion = NormalTex.SampleLevel(LinearClamp, uv, 0).rg;   // prevUV - currUV (G-buffer motion)
+    float2 prevUV = uv + motion;
+    bool valid = hasHistory > 0.5 && all(prevUV >= 0.0) && all(prevUV <= 1.0);
+    if (!valid) return current;
+
+    // CRITICAL for mirrors: the G-buffer motion buffer tracks the REFLECTIVE SURFACE, NOT the reflected image
+    // (the mirrored content moves at a DIFFERENT screen velocity than the surface). So surface-motion
+    // reprojection is only valid when the surface is (nearly) STATIC on screen — under any real motion it pulls
+    // the wrong reflected pixel and the temporal blend smears/erases the reflection (the "reflections vanished"
+    // bug). Gate the temporal HARD on screen motion: ~0 motion → full denoise (kills the static-camera DDGI
+    // churn, the actual goal); any real motion → pass the current reflection straight through (sharp, no erase).
+    float motionPx = length(motion / max(TexelSize, 1e-6.xx));
+    float motionTrust = saturate(1.0 - motionPx * 0.5);   // >~2 texels of motion → 0 (pure current frame)
+    if (motionTrust < 0.01) return current;
+
+    float4 history = SanitizeSsr(DepthTex.SampleLevel(LinearClamp, prevUV, 0));
+
+    // Neighbourhood clamp (variance) on the RGB so a disoccluded mirror flushes instead of smearing.
+    float3 m1 = 0.0.xxx, m2 = 0.0.xxx;
+    [unroll] for (int x = -1; x <= 1; x++)
+    [unroll] for (int y = -1; y <= 1; y++) {
+        float3 c = SanitizeSsr(ColorTex.SampleLevel(LinearClamp, uv + float2(x, y) * TexelSize, 0)).rgb;
+        m1 += c; m2 += c * c;
+    }
+    m1 /= 9.0; m2 /= 9.0;
+    float3 sigma = sqrt(max(m2 - m1 * m1, 0.0.xxx));
+    float3 dev = sigma * 2.0 + 0.02.xxx;
+    // B4: SOFT colour clamp (kajiya inc/soft_color_clamp.hlsl) instead of a hard box clamp. A hard clamp does
+    // NOTHING when noise blows the variance box wide, then SNAPS when a sample crosses the edge → flicker. The
+    // soft form pulls history toward the box centre ONLY as it gets statistically far (1σ→3σ ramp), bleeding out
+    // disocclusion/ghosting smoothly without the hard-clamp pop — exactly what the newly-enabled rough VNDF
+    // reflections (which lean on history more) need to stay ghost-free.
+    float3 lo = m1 - dev, hi = m1 + dev;
+    float3 histDist = abs(history.rgb - m1) / max(abs(m1 * 0.1), dev);
+    float3 closest = clamp(history.rgb, lo, hi);
+    float3 clamped = lerp(history.rgb, closest, smoothstep(1.0.xxx, 3.0.xxx, histDist));
+
+    // EMA toward the (clamped) history, faded out by motionTrust so a static mirror converges (smooth) while any
+    // motion keeps the live reflection. alpha is the blend toward CURRENT, so low alpha = more history = smoother.
+    float alpha = lerp(1.0, 0.15, motionTrust);   // static → 0.15 (heavy smoothing); moving → 1.0 (current only)
+    float3 outRgb = lerp(clamped, current.rgb, alpha);
+    return float4(outRgb, current.a);   // strength = current (not accumulated)
 }

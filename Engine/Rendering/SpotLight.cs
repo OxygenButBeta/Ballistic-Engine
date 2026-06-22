@@ -1,21 +1,14 @@
 
 namespace BallisticEngine;
 
-// Spot light pointing along the entity's forward axis, forward-shaded. Registers on
-// attach so the editor viewport is lit without entering play mode.
 public class SpotLight : Behaviour {
     [Header("Light")]
     [ColorUsage(hdr: true)]
     public Vector3 Color { get; set; } = Vector3.One;
 
-    // PHYSICAL: luminous power in lumens. A spot concentrates its flux into the cone, so candela
-    // = lumens / (2pi*(1-cos(outer))) - the solid angle of the cone. Scaled into HDR radiance by
-    // the shared lux factor so it balances with the sun, point lights and IBL under EV exposure.
     [Range(0f, 20000f)]
     public float Lumens { get; set; } = 3000f;
 
-    // Artist multiplier on top of the physical lumens (see PointLight.Intensity). 1 = a believable
-    // spot under the sun's exposure; PunctualIntensityScale handles the lumens-vs-lux unit balance.
     [Range(0f, 100f)]
     public float Intensity { get; set; } = 1f;
 
@@ -42,7 +35,6 @@ public class SpotLight : Behaviour {
     [Range(0f, 5f)]
     public float SourceRadius { get; set; }
 
-    // Cone angles in degrees; full brightness inside Inner, fades to zero at Outer.
     [Header("Cone")]
     [Range(0f, 90f)]
     public float InnerAngle { get; set; } = 25f;
@@ -50,8 +42,6 @@ public class SpotLight : Behaviour {
     [Range(0f, 90f)]
     public float OuterAngle { get; set; } = 35f;
 
-    // Shadowed spots render the scene once into the punctual shadow array; the renderer
-    // shadows the first few CastShadows lights (slots are limited).
     [FoldoutGroup("Shadows", defaultOpen: false)]
     public bool CastShadows { get; set; } = true;
 

@@ -1,9 +1,5 @@
 namespace BallisticEngine;
 
-// Physical exposure (EV100): the scene is lit in real luminance units, so brightness is a
-// camera-style EV dial. Higher EV = darker. Compensation nudges it in stops.
-// Automatic modes meter the rendered frame instead and ease the EV toward it (eye adaptation);
-// the fixed EV dial is ignored while one of them is active.
 public sealed class Exposure : VolumeComponent {
     [Tooltip("Fixed: use the EV dial. Automatic: meter the scene. Automatic Histogram: meter " +
              "with the darkest/brightest pixels rejected (steadier around the sun or black voids).")]
@@ -21,10 +17,10 @@ public sealed class Exposure : VolumeComponent {
     public readonly EnumParameter<MeteringMode> metering = new(MeteringMode.CenterWeighted);
 
     [Tooltip("Lowest EV auto exposure may adapt to (how far it opens up in the dark).")]
-    public readonly ClampedFloatParameter limitMin = new(8f, 0f, 20f);
+    public readonly ClampedFloatParameter limitMin = new(13f, 0f, 22f);
 
     [Tooltip("Highest EV auto exposure may adapt to (how far it stops down in bright light).")]
-    public readonly ClampedFloatParameter limitMax = new(17f, 0f, 20f);
+    public readonly ClampedFloatParameter limitMax = new(19f, 0f, 22f);
 
     [Tooltip("Adaptation speed in stops/second when the scene gets brighter (eyes adjust fast).")]
     public readonly ClampedFloatParameter speedDarkToLight = new(3f, 0.1f, 20f);

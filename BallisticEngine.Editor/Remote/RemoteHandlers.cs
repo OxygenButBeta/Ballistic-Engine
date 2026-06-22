@@ -5,17 +5,10 @@ using BallisticEngine.Serialization;
 
 namespace BallisticEngine.Editor;
 
-// The command port's method surface — a small, task-level set (token-lean by design: the scene
-// SUMMARY is the default query response; full detail is per-entity on request). Every handler runs
-// on the EDITOR MAIN THREAD (via RemoteCommandQueue), every mutation pushes EditorUndo first and
-// marks the viewport dirty — remote edits behave exactly like human edits (undoable, repainted).
 internal static class RemoteHandlers {
     static EditorState editorState = null!;
     static EngineBootstrap bootstrap = null!;
 
-    // Set by EditorApplication: frame the Scene-view camera on a world point + radius, looking along
-    // an optional direction (zero = keep current). Lets the command port / agents frame a shot — the
-    // screenshot captures the Scene view, which uses the editor's own fly camera, NOT an HDCamera.
     public static Action<Vector3, float, Vector3> FocusCamera;
 
     static readonly object logGate = new();
@@ -31,41 +24,48 @@ internal static class RemoteHandlers {
                     logTail.RemoveRange(0, 100);
             }
         };
+        if (RemoteSchema.CoverageError(handlers.Keys) is { } drift)
+            throw new InvalidOperationException(drift);
     }
 
-    public static object Dispatch(string method, JsonElement p) => method switch {
-        "editor.status" => Status(),
-        "scene.describe" => Describe(),
-        "scene.save" => SceneSave(),
-        "scene.open" => SceneOpen(RequireString(p, "path")),
-        "entity.get" => EntityJson(Resolve(RequireString(p, "entity"))),
-        "entity.create" => EntityCreate(p),
-        "entity.delete" => EntityDelete(RequireString(p, "entity")),
-        "component.add" => ComponentAdd(p),
-        "component.remove" => ComponentRemove(p),
-        "component.set" => ComponentSet(p),
-        "select" => Select(RequireString(p, "entity")),
-        "play.start" => PlayStart(),
-        "play.stop" => Run(() => SceneManager.StopPlay()),
-        "play.pause" => PlayPause(p),
-        "play.step" => PlayStep(),
-        "undo" => Run(EditorUndo.Undo),
-        "redo" => Run(EditorUndo.Redo),
-        "screenshot" => Screenshot(p),
-        "console.tail" => ConsoleTail(p),
-        "scripts.rebuild" => new { ok = bootstrap.ReloadGameScripts() },
-        "unity.import" => UnityImport(p),
-        "editor.frame" => EditorFrame(p),
-        "editor.refresh" => EditorRefresh(),
-        "scene.component.add" => SceneComponentAdd(p),
-        "scene.component.set" => SceneComponentSet(p),
-        "help" => Help(),
-        _ => throw new Exception($"unknown method '{method}' — methods: editor.status, scene.describe, " +
-                                 "scene.save, scene.open, entity.get/create/delete, component.add/remove/set, " +
-                                 "select, play.start/stop/pause/step, undo, redo, screenshot, console.tail, scripts.rebuild"),
-    };
+    static readonly IReadOnlyDictionary<string, Func<JsonElement, object>> handlers =
+        new Dictionary<string, Func<JsonElement, object>>(StringComparer.Ordinal) {
+            ["editor.status"]       = _ => Status(),
+            ["scene.describe"]      = _ => Describe(),
+            ["scene.save"]          = _ => SceneSave(),
+            ["scene.open"]          = p => SceneOpen(RequireString(p, "path")),
+            ["entity.get"]          = p => EntityJson(Resolve(RequireString(p, "entity"))),
+            ["entity.create"]       = p => EntityCreate(p),
+            ["entity.delete"]       = p => EntityDelete(RequireString(p, "entity")),
+            ["component.add"]       = p => ComponentAdd(p),
+            ["component.remove"]    = p => ComponentRemove(p),
+            ["component.set"]       = p => ComponentSet(p),
+            ["select"]              = p => Select(RequireString(p, "entity")),
+            ["play.start"]          = _ => PlayStart(),
+            ["play.stop"]           = _ => Run(() => SceneManager.StopPlay()),
+            ["play.pause"]          = p => PlayPause(p),
+            ["play.step"]           = _ => PlayStep(),
+            ["undo"]                = _ => Run(EditorUndo.Undo),
+            ["redo"]                = _ => Run(EditorUndo.Redo),
+            ["screenshot"]          = p => Screenshot(p),
+            ["console.tail"]        = p => ConsoleTail(p),
+            ["scripts.rebuild"]     = _ => new { ok = bootstrap.ReloadGameScripts() },
+            ["unity.import"]        = p => UnityImport(p),
+            ["editor.frame"]        = p => EditorFrame(p),
+            ["editor.refresh"]      = _ => EditorRefresh(),
+            ["editor.reimport"]     = _ => EditorReimport(),
+            ["scene.component.add"] = p => SceneComponentAdd(p),
+            ["scene.component.set"] = p => SceneComponentSet(p),
+            ["help"]                = _ => Help(),
+        };
 
-    // ---- queries -------------------------------------------------------------
+    public static object Dispatch(string method, JsonElement p) {
+        if (RemoteSchema.Validate(method, p) is { } error)
+            throw new Exception(error);
+        if (!handlers.TryGetValue(method, out Func<JsonElement, object> handler))
+            throw new Exception($"unknown method '{method}' -- methods: {string.Join(", ", RemoteSchema.Methods.Select(s => s.Method))}");
+        return handler(p);
+    }
 
     static object Status() {
         Scene scene = SceneManager.GetCurrentScene();
@@ -132,29 +132,35 @@ internal static class RemoteHandlers {
         }
     }
 
-    // Force a full asset reimport (registers newly-written assets like converted .scene/.volume).
     public static Action RequestRefresh;
     static object EditorRefresh() {
         if (RequestRefresh is null)
             throw new Exception("refresh not wired");
         RequestRefresh();
-        return new { refreshing = true, note = "poll editor.status; assets reimport on a worker" };
+        return new { refreshing = true, note = "incremental — poll editor.status; only changed assets import on a worker" };
     }
 
-    // Add a scene-wide component (SceneBehaviour: Skybox, ProceduralSky, SceneLighting, IrradianceVolume...).
+    public static Action RequestReimport;
+    static object EditorReimport() {
+        if (RequestReimport is null)
+            throw new Exception("reimport not wired");
+        RequestReimport();
+        return new { reimporting = true, note = "FULL reimport — poll editor.status; all assets reimport on a worker" };
+    }
+
     static object SceneComponentAdd(JsonElement p) {
         string typeName = RequireString(p, "type");
         Type type = ComponentRegistry.ResolveScene(typeName)
             ?? throw new Exception($"unknown scene component '{typeName}'" + Hint(typeName,
                 ComponentRegistry.SceneMenu.Select(e => e.Type.Name)));
-        EditorUndo.Push($"Add scene {type.Name} (remote)");
-        SceneBehaviour added = SceneManager.GetCurrentScene().AddSceneBehaviour(type);
-        Mutated();
+        SceneBehaviour added = null!;
+        EditorCommands.EditScene($"Add scene {type.Name} (remote)", () => {
+            added = SceneManager.GetCurrentScene().AddSceneBehaviour(type);
+            Mutated();
+        });
         return new { sceneComponent = added.GetType().Name };
     }
 
-    // Set a member on a scene-wide component, e.g. {type:"ProceduralSky", member:"exposure", value:2}.
-    // This is the lever for sky/fog/lighting tuning that previously needed hand-edited scene YAML.
     static object SceneComponentSet(JsonElement p) {
         string typeName = RequireString(p, "type");
         string memberName = RequireString(p, "member");
@@ -165,38 +171,22 @@ internal static class RemoteHandlers {
             .FirstOrDefault(b => b.GetType().Name.Equals(typeName, StringComparison.OrdinalIgnoreCase))
             ?? throw new Exception($"scene has no '{typeName}' component (add it with scene.component.add)");
 
-        EditorUndo.Push($"Set scene {typeName}.{memberName} (remote)");
-        object written = SetBehaviourMember(behaviour, memberName, value);
-        Mutated();
+        object written = null!;
+        EditorCommands.EditScene($"Set scene {typeName}.{memberName} (remote)", () => {
+            written = SetBehaviourMember(behaviour, memberName, value);
+            Mutated();
+        });
         return new { sceneComponent = typeName, member = memberName, value = written };
     }
 
-    // Lists every remote method (self-describing API so an agent can discover the control surface).
-    static object Help() => new {
-        methods = new[] {
-            "editor.status", "scene.describe", "scene.save", "scene.open {path}",
-            "entity.get {entity}", "entity.create {name,...}", "entity.delete {entity}",
-            "component.add {entity,type}", "component.remove {entity,type}",
-            "component.set {entity,target,value}",
-            "scene.component.add {type}", "scene.component.set {type,member,value}",
-            "select {entity}", "play.start/stop/pause/step",
-            "undo", "redo", "screenshot {path,settle}", "console.tail {count}",
-            "scripts.rebuild", "unity.import {path,subfolder}",
-            "editor.frame {entity?,dir?,fit?}", "editor.refresh", "help",
-        },
-    };
+    static object Help() => new { methods = RemoteSchema.Signatures };
 
-    // Frames the Scene-view camera on an entity's geometry, or the WHOLE scene when no entity is
-    // given (aggregates every renderable's world bounds). This is what makes a remote screenshot
-    // useful — the capture is the Scene view, driven by the editor fly camera. Returns the framed
-    // center/radius so a caller can reason about scale.
     static object EditorFrame(JsonElement p) {
         if (FocusCamera is null)
             throw new Exception("camera framing not wired");
 
         var obj = p.ValueKind == JsonValueKind.Object;
         string entityName = obj && p.TryGetProperty("entity", out JsonElement e) ? e.GetString() : null;
-        // Optional "dir":"x,y,z" look direction (e.g. "0,-1,-1" for a 3/4 top view); default keeps current.
         Vector3 dir = default;
         if (obj && p.TryGetProperty("dir", out JsonElement d) && d.GetString() is { } ds) {
             var parts = ds.Split(',');
@@ -206,7 +196,7 @@ internal static class RemoteHandlers {
                 float.TryParse(parts[2], System.Globalization.CultureInfo.InvariantCulture, out var dz))
                 dir = new Vector3(dx, dy, dz);
         }
-        // Optional "fit" multiplier on the framed radius (1 = default, <1 = closer, >1 = wider).
+
         float fit = obj && p.TryGetProperty("fit", out JsonElement f) ? (float)f.GetDouble() : 1f;
 
         Vector3 center;
@@ -232,7 +222,6 @@ internal static class RemoteHandlers {
         };
     }
 
-    // Aggregate world bounds of every entity with renderable geometry in the current scene.
     static bool TryGetSceneBounds(out Vector3 center, out float radius) {
         center = default;
         radius = 0f;
@@ -255,8 +244,6 @@ internal static class RemoteHandlers {
         return true;
     }
 
-    // Headless trigger for the Unity package importer (the GUI uses a native file dialog we can't
-    // drive remotely). Kicks off the same worker; poll editor.status / console.tail for progress.
     static object UnityImport(JsonElement p) {
         string path = RequireString(p, "path");
         string sub = p.ValueKind == JsonValueKind.Object && p.TryGetProperty("subfolder", out JsonElement s)
@@ -264,8 +251,6 @@ internal static class RemoteHandlers {
         UnityImportWindow.ImportPackage(path, sub);
         return new { started = true, note = "poll editor.status / console.tail; result in console" };
     }
-
-    // ---- scene / play ----------------------------------------------------------
 
     static object SceneSave() {
         bool saved = SceneCommands.Save();
@@ -281,7 +266,6 @@ internal static class RemoteHandlers {
         string blocked = SceneManager.PlayBlocked?.Invoke();
         if (blocked is not null)
             throw new Exception($"play blocked: {blocked}");
-        // Toolbar semantics: persist edits before play so a crash mid-play can't lose them.
         if (EditorUndo.IsDirty && !string.IsNullOrEmpty(SceneCommands.CurrentScenePath))
             SceneCommands.Save();
         SceneManager.StartPlay();
@@ -316,30 +300,31 @@ internal static class RemoteHandlers {
         string path = RequireString(p, "path");
         int settle = p.TryGetProperty("settleFrames", out JsonElement s) ? s.GetInt32() : 3;
         Screenshots.Capture(path, settle);
-        editorState.MarkViewportDirty(); // make sure frames actually present for the capture
+        editorState.MarkViewportDirty();
         return new { queued = true, path, note = "captures the editor window backbuffer" };
     }
 
-    // ---- mutations -------------------------------------------------------------
-
     static object EntityCreate(JsonElement p) {
         string name = RequireString(p, "name");
-        EditorUndo.Push($"Create {name} (remote)");
-        Scene scene = SceneManager.GetCurrentScene();
-        Entity entity = scene.CreateEntity(name);
-        if (p.TryGetProperty("position", out JsonElement pos) && pos.ValueKind != JsonValueKind.Null)
-            entity.transform.Position = (Vector3)ConvertValue(typeof(Vector3), pos);
-        if (p.TryGetProperty("parent", out JsonElement parent) && parent.ValueKind == JsonValueKind.String)
-            entity.transform.SetParent(Resolve(parent.GetString()!).transform);
-        Mutated();
+        Entity entity = null!;
+        EditorCommands.Structural($"Create {name} (remote)", () => {
+            Scene scene = SceneManager.GetCurrentScene();
+            entity = scene.CreateEntity(name);
+            if (p.TryGetProperty("position", out JsonElement pos) && pos.ValueKind != JsonValueKind.Null)
+                entity.transform.Position = (Vector3)ConvertValue(typeof(Vector3), pos);
+            if (p.TryGetProperty("parent", out JsonElement parent) && parent.ValueKind == JsonValueKind.String)
+                entity.transform.SetParent(Resolve(parent.GetString()!).transform);
+            Mutated();
+        });
         return new { id = entity.InstanceId.ToString("N"), name = entity.Name };
     }
 
     static object EntityDelete(string query) {
         Entity entity = Resolve(query);
-        EditorUndo.Push($"Delete {entity.Name} (remote)");
-        SceneManager.GetCurrentScene().DestroyEntity(entity);
-        Mutated();
+        EditorCommands.Structural($"Delete {entity.Name} (remote)", () => {
+            SceneManager.GetCurrentScene().DestroyEntity(entity);
+            Mutated();
+        });
         return new { deleted = entity.Name };
     }
 
@@ -349,61 +334,60 @@ internal static class RemoteHandlers {
         Type type = ComponentRegistry.Resolve(typeName)
             ?? throw new Exception($"unknown component type '{typeName}'" + Hint(typeName,
                 ComponentRegistry.Menu.Select(e => e.Type.Name)));
-        EditorUndo.Push($"Add {type.Name} (remote)");
-        Behaviour behaviour = entity.AddComponent(type);
-        Mutated();
+        Behaviour behaviour = null!;
+        EditorCommands.Structural($"Add {type.Name} (remote)", () => {
+            behaviour = entity.AddComponent(type);
+            Mutated();
+        });
         return new { entity = entity.Name, component = behaviour.GetType().Name };
     }
 
     static object ComponentRemove(JsonElement p) {
         Entity entity = Resolve(RequireString(p, "entity"));
         Behaviour behaviour = FindComponent(entity, RequireString(p, "type"));
-        EditorUndo.Push($"Remove {behaviour.GetType().Name} (remote)");
-        entity.RemoveComponent(behaviour);
-        Mutated();
+        EditorCommands.Structural($"Remove {behaviour.GetType().Name} (remote)", () => {
+            entity.RemoveComponent(behaviour);
+            Mutated();
+        });
         return new { entity = entity.Name, removed = behaviour.GetType().Name };
     }
 
-    // component.set {entity, target, value} — target: name|active|tag|layer|transform.position|
-    // transform.rotation (Euler degrees)|transform.scale|<Component>.<Member>, like `bal scene set`
-    // but against the LIVE scene (typed conversion incl. asset loads through AssetDatabase).
     static object ComponentSet(JsonElement p) {
         Entity entity = Resolve(RequireString(p, "entity"));
         string target = RequireString(p, "target");
         JsonElement value = p.TryGetProperty("value", out JsonElement v)
             ? v : throw new Exception("missing 'value'");
 
-        EditorUndo.Push($"Set {target} (remote)");
-        object? written;
-        switch (target.ToLowerInvariant()) {
-            case "name": entity.Name = value.GetString() ?? ""; written = entity.Name; break;
-            case "active": entity.SetActive(value.GetBoolean()); written = entity.IsActive; break;
-            case "tag": entity.Tag = value.GetString(); written = entity.Tag; break;
-            case "layer": entity.Layer = value.GetInt32(); written = entity.Layer; break;
-            case "transform.position":
-                entity.transform.Position = (Vector3)ConvertValue(typeof(Vector3), value);
-                written = LiveJson(entity.transform.Position); break;
-            case "transform.rotation":
-                entity.transform.EulerAngles = (Vector3)ConvertValue(typeof(Vector3), value);
-                written = LiveJson(entity.transform.EulerAngles); break;
-            case "transform.scale":
-                entity.transform.Scale = (Vector3)ConvertValue(typeof(Vector3), value);
-                written = LiveJson(entity.transform.Scale); break;
-            default: {
-                int dot = target.IndexOf('.');
-                if (dot <= 0 || dot == target.Length - 1)
-                    throw new Exception($"unknown target '{target}' — name|active|tag|layer|transform.*|<Component>.<Member>");
-                Behaviour behaviour = FindComponent(entity, target[..dot]);
-                written = SetBehaviourMember(behaviour, target[(dot + 1)..], value);
-                break;
+        object? written = null;
+        EditorCommands.EditEntity(entity, $"Set {target} (remote)", () => {
+            switch (target.ToLowerInvariant()) {
+                case "name": entity.Name = value.GetString() ?? ""; written = entity.Name; break;
+                case "active": entity.SetActive(value.GetBoolean()); written = entity.IsActive; break;
+                case "tag": entity.Tag = value.GetString(); written = entity.Tag; break;
+                case "layer": entity.Layer = value.GetInt32(); written = entity.Layer; break;
+                case "transform.position":
+                    entity.transform.Position = (Vector3)ConvertValue(typeof(Vector3), value);
+                    written = LiveJson(entity.transform.Position); break;
+                case "transform.rotation":
+                    entity.transform.EulerAngles = (Vector3)ConvertValue(typeof(Vector3), value);
+                    written = LiveJson(entity.transform.EulerAngles); break;
+                case "transform.scale":
+                    entity.transform.Scale = (Vector3)ConvertValue(typeof(Vector3), value);
+                    written = LiveJson(entity.transform.Scale); break;
+                default: {
+                    int dot = target.IndexOf('.');
+                    if (dot <= 0 || dot == target.Length - 1)
+                        throw new Exception($"unknown target '{target}' — name|active|tag|layer|transform.*|<Component>.<Member>");
+                    Behaviour behaviour = FindComponent(entity, target[..dot]);
+                    written = SetBehaviourMember(behaviour, target[(dot + 1)..], value);
+                    break;
+                }
             }
-        }
-        Mutated();
+            Mutated();
+        });
         return new { entity = entity.Name, target, value = written };
     }
 
-    // Reflection member-set shared by entity components AND scene-wide components (both have
-    // serializable members discovered the same way). Returns the live value after the set.
     static object SetBehaviourMember(object behaviour, string memberName, JsonElement value) {
         var members = ComponentReflection.SerializableMembers(behaviour.GetType()).ToList();
         MemberInfo member = members.FirstOrDefault(m =>
@@ -422,15 +406,11 @@ internal static class RemoteHandlers {
         return new { selected = entity.Name, id = entity.InstanceId.ToString("N") };
     }
 
-    // ---- shared ----------------------------------------------------------------
-
     static void Mutated() {
         EditorUndo.MarkDirty();
         editorState.MarkViewportDirty();
     }
 
-    // Same addressing rules as the bal CLI: exact id, unique id prefix, exact name, unique
-    // name substring (case-insensitive).
     static Entity Resolve(string query) {
         var entities = SceneManager.GetCurrentScene().Entities.Where(e => !e.IsDestroyed).ToList();
 
@@ -472,8 +452,6 @@ internal static class RemoteHandlers {
         return matches[index ?? 0];
     }
 
-    // JSON value -> live typed value. Accepts the natural JSON shape per type plus the CLI's
-    // string forms ("1,2,3" vectors, Euler-degree rotations, "Assets/..." or "guid:" asset refs).
     static object ConvertValue(Type memberType, JsonElement value) {
         Type t = Nullable.GetUnderlyingType(memberType) ?? memberType;
 
@@ -499,7 +477,7 @@ internal static class RemoteHandlers {
         }
         if (t == typeof(Vector2)) { float[] c = Components(value, 2); return new Vector2(c[0], c[1]); }
         if (t == typeof(Vector3)) { float[] c = Components(value, 3); return new Vector3(c[0], c[1], c[2]); }
-        if (t == typeof(Quaternion)) { // Euler degrees in, engine convention
+        if (t == typeof(Quaternion)) {
             float[] c = Components(value, 3);
             return BQuaternion.FromEulerAngles(
                 MathHelper.DegreesToRadians(c[0]), MathHelper.DegreesToRadians(c[1]), MathHelper.DegreesToRadians(c[2]));
@@ -515,7 +493,6 @@ internal static class RemoteHandlers {
         throw new Exception($"members of type {t.Name} can't be set remotely yet");
     }
 
-    // "x,y,z" string, [x,y,z] array, or {x:..,y:..,z:..} object.
     static float[] Components(JsonElement value, int count) {
         var result = new float[count];
         switch (value.ValueKind) {
@@ -548,7 +525,6 @@ internal static class RemoteHandlers {
         catch (Exception ex) { return $"<threw: {ex.InnerException?.Message ?? ex.Message}>"; }
     }
 
-    // Live value -> JSON-friendly (asset refs become their project paths — names over guids).
     static object? LiveJson(object? value) => value switch {
         null => null,
         Vector2 v => new { x = v.X, y = v.Y },

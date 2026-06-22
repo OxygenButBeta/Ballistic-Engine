@@ -3,38 +3,18 @@ using System.Text.Json.Nodes;
 
 namespace BallisticEngine.AssetPipeline;
 
-// Imports Blender .blend files. Assimp can't extract cameras or lights from .blend (and its mesh
-// reader breaks on modern Blender versions), so this drives Blender's OWN Python headlessly to:
-//   1. export the meshes to a sibling "<name>.fbx" — picked up by ModelImporter on the next pass,
-//      which generates materials and the node tree exactly as for any other model; and
-//   2. write a JSON sidecar of cameras + lights, which the injected Converter turns into a sibling
-//      "<name>.scene" with HDCamera / DirectionalLight / PointLight / SpotLight entities plus a
-//      StaticMeshRenderer pointing at the .fbx.
-//
-// FBX (not glTF) is the mesh carrier because AssimpNet 4.1.0's bundled native Assimp parses
-// Blender's modern .glb as zero meshes but reads Blender FBX cleanly.
-//
-// Like the Falcor importer, this produces project ASSETS (.fbx + .scene), not a Library artifact,
-// so the refresh sweeps again to register them. If Blender isn't installed it logs a one-line hint
-// (set BLENDER_PATH) and skips — the .blend stays inert rather than failing the whole refresh.
-//
-// The actual JSON -> SceneDocument conversion lives in the Engine layer (it builds scene documents),
-// so it's injected via Converter — set once at startup by EngineBootstrap, same pattern as Falcor.
 public sealed class BlendImporter : IAssetImporter {
-    // (blendAbsolutePath, fbxAbsolutePath, jsonAbsolutePath, outputSceneAbsolutePath) -> writes .scene.
     public static Action<string, string, string, string> Converter { get; set; }
 
     public string Name => "BlendImporter";
     public int Version => 1;
-    public string ArtifactExtension => null;          // produces project assets, not a Library artifact
+    public string ArtifactExtension => null;
     public bool RunsWithoutArtifact => true;
-    public bool GeneratesSourceAssets => true;        // writes a sibling .glb and .scene
+    public bool GeneratesSourceAssets => true;
 
     public bool CanImport(string extension) => extension == ".blend";
 
     public JsonObject CreateDefaultSettings(string assetPath) => new() {
-        // Reimport whenever the importer version bumps; nothing user-tunable yet. Mesh import of
-        // the generated .glb is governed by that .glb's own ModelImporter meta (splitByNodes, etc.).
         ["importScene"] = true,
     };
 
@@ -51,8 +31,6 @@ public sealed class BlendImporter : IAssetImporter {
         var fbxAbsolute = Path.ChangeExtension(blendAbsolute, ".fbx");
         var sceneAbsolute = Path.ChangeExtension(blendAbsolute, ".scene");
 
-        // Per-import temp files (script + JSON sidecar) keyed by the asset GUID so parallel imports
-        // of different .blend files never collide on the same temp path.
         var tempScript = Path.Combine(Path.GetTempPath(), $"ballistic_blend_export_{context.Guid:N}.py");
         var tempJson = Path.Combine(Path.GetTempPath(), $"ballistic_blend_scene_{context.Guid:N}.json");
 
@@ -72,7 +50,6 @@ public sealed class BlendImporter : IAssetImporter {
                 return;
             }
 
-            // Converter reads the JSON + decides whether the .fbx exists; writes the .scene.
             Converter(blendAbsolute, fbxAbsolute, tempJson, sceneAbsolute);
             Debugging.Log(
                 $"Blend: imported '{context.AssetPath}' -> '{Path.GetFileName(fbxAbsolute)}' + '{Path.GetFileName(sceneAbsolute)}'.");
@@ -83,9 +60,6 @@ public sealed class BlendImporter : IAssetImporter {
         }
     }
 
-    // Runs `blender --background <file>.blend --python <script> -- <out.fbx> <out.json>` and returns
-    // whether it completed without a reported error. Blender is chatty on stdout; we only fail on a
-    // non-zero exit or our script's BLEND_EXPORT_ERROR marker.
     static bool RunBlender(string blender, string blendAbsolute, string scriptPath,
         string fbxAbsolute, string jsonAbsolute, string assetPath) {
         var info = new ProcessStartInfo {
@@ -97,7 +71,7 @@ public sealed class BlendImporter : IAssetImporter {
         };
         info.ArgumentList.Add("--background");
         info.ArgumentList.Add(blendAbsolute);
-        info.ArgumentList.Add("--factory-startup");   // ignore user add-ons/prefs for a deterministic export
+        info.ArgumentList.Add("--factory-startup");
         info.ArgumentList.Add("--python");
         info.ArgumentList.Add(scriptPath);
         info.ArgumentList.Add("--");
@@ -143,7 +117,6 @@ public sealed class BlendImporter : IAssetImporter {
                 File.Delete(path);
         }
         catch {
-            // Temp cleanup is best-effort.
         }
     }
 }

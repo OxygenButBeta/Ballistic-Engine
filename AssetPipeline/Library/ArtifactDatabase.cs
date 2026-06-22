@@ -8,11 +8,9 @@ public sealed class ArtifactRecord {
     public long FileSize { get; set; }
     public DateTime MtimeUtc { get; set; }
 
-    // Relative to Library\, e.g. "Artifacts/<guid>.btex".
     public string Artifact { get; set; }
 }
 
-// Library\ArtifactDB.json — the import pipeline's record of what has been imported from which source state.
 public sealed class ArtifactDatabase {
     public int Version { get; set; } = 1;
     public Dictionary<Guid, ArtifactRecord> Entries { get; set; } = new();

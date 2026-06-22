@@ -1,23 +1,10 @@
-using System;
 using Vortice.Direct3D12;
 using Vortice.DXGI;
 using static Vortice.DXGI.DXGI;
 
 namespace BallisticEngine.DX12;
 
-// A windowed DX12 present surface: an HWND swapchain (flip-model) the EDITOR draws its ImGui UI into.
-// The runtime was offscreen-only (Dx12HeadlessRuntime renders to an RTV and reads it back); this is the
-// net-new piece the windowed editor host needs. It REUSES the existing Dx12Device + its single command
-// queue (DX12 swapchains are created on the QUEUE, not the device) and slots into the device's fully
-// synchronous model: BeginFrame opens a UI command list (the ImGui backend records into it), Present
-// closes/executes/flips and blocks on the GPU — exactly like every per-pass ExecuteSync already does, so
-// no new frame-in-flight / fence plumbing is introduced (a pipelined ring is a later perf follow-up).
-//
-// Owns its OWN command allocator + list (separate from the device's render + upload lists) because the UI
-// frame spans clear -> ImGui draws -> present, which the device's record-a-lambda ExecuteSync can't model.
 public sealed class Dx12SwapChain : IDisposable {
-    // Flip-model swapchains require R8G8B8A8_UNORM (NOT _SRGB) and FlipDiscard. The composite already
-    // outputs encoded sRGB into a _UNorm ldr, so a straight blit/sample is correct. Matches the ldr format.
     public const Format BackbufferFormat = Format.R8G8B8A8_UNorm;
 
     readonly Dx12Device dev;
@@ -30,14 +17,20 @@ public sealed class Dx12SwapChain : IDisposable {
     CpuDescriptorHandle[] rtvHandles;
     readonly uint rtvIncrement;
 
-    // The UI present command list (clear -> ImGui draws -> backbuffer transitions). Open between
-    // BeginFrame and Present; the ImGui DX12 backend records its draws into it.
-    readonly ID3D12CommandAllocator uiAllocator;
-    readonly ID3D12GraphicsCommandList4 uiList;
+    readonly ID3D12CommandAllocator[] uiAllocators;
+    readonly ID3D12GraphicsCommandList4[] uiLists;
+    readonly ID3D12Fence presentFence;
+    readonly System.Threading.AutoResetEvent presentFenceEvent = new(false);
+    ulong presentFenceValue;
+    readonly ulong[] presentFenceTargets;
+
+    int uiSlot;
+
+    ID3D12CommandAllocator uiAllocator => uiAllocators[0];
+    ID3D12GraphicsCommandList4 uiList => uiLists[0];
 
     public int Width { get; private set; }
     public int Height { get; private set; }
-    // The command list the ImGui backend records into (valid only between BeginFrame and Present).
     public ID3D12GraphicsCommandList4 CommandList => uiList;
 
     int currentIndex;
@@ -48,8 +41,6 @@ public sealed class Dx12SwapChain : IDisposable {
         Width = Math.Max(1, width);
         Height = Math.Max(1, height);
 
-        // A retained factory (the device's was scoped/disposed in its ctor). Debug flag false — the swapchain
-        // path doesn't need it and the device gates its own debug layer.
         factory = CreateDXGIFactory2<IDXGIFactory4>(false);
 
         var desc = new SwapChainDescription1 {
@@ -57,7 +48,7 @@ public sealed class Dx12SwapChain : IDisposable {
             Height = (uint)Height,
             Format = BackbufferFormat,
             Stereo = false,
-            SampleDescription = new SampleDescription(1, 0),   // no MSAA on a flip-model swapchain (TAA is the AA)
+            SampleDescription = new SampleDescription(1, 0),
             BufferUsage = Usage.RenderTargetOutput,
             BufferCount = (uint)bufferCount,
             Scaling = Scaling.Stretch,
@@ -66,7 +57,6 @@ public sealed class Dx12SwapChain : IDisposable {
             Flags = SwapChainFlags.None,
         };
         using IDXGISwapChain1 sc1 = factory.CreateSwapChainForHwnd(dev.Queue, hwnd, desc, null, null);
-        // We do our own windowing; disable DXGI's Alt+Enter fullscreen so it never surprise-toggles mode.
         factory.MakeWindowAssociation(hwnd, WindowAssociationFlags.IgnoreAltEnter);
         swapChain = sc1.QueryInterface<IDXGISwapChain3>();
 
@@ -75,10 +65,16 @@ public sealed class Dx12SwapChain : IDisposable {
         rtvIncrement = dev.Device.GetDescriptorHandleIncrementSize(DescriptorHeapType.RenderTargetView);
         CreateBackBufferRtvs();
 
-        uiAllocator = dev.Device.CreateCommandAllocator(CommandListType.Direct);
-        uiList = dev.Device.CreateCommandList<ID3D12GraphicsCommandList4>(
-            CommandListType.Direct, uiAllocator, null);
-        uiList.Close();   // created open; close so the first Reset is uniform (matches Dx12Device).
+        uiAllocators = new ID3D12CommandAllocator[bufferCount];
+        uiLists = new ID3D12GraphicsCommandList4[bufferCount];
+        for (int i = 0; i < bufferCount; i++) {
+            uiAllocators[i] = dev.Device.CreateCommandAllocator(CommandListType.Direct);
+            uiLists[i] = dev.Device.CreateCommandList<ID3D12GraphicsCommandList4>(
+                CommandListType.Direct, uiAllocators[i], null);
+            uiLists[i].Close();
+        }
+        presentFence = dev.Device.CreateFence(0, FenceFlags.None);
+        presentFenceTargets = new ulong[bufferCount];
     }
 
     void CreateBackBufferRtvs() {
@@ -93,13 +89,10 @@ public sealed class Dx12SwapChain : IDisposable {
         }
     }
 
-    // Open the UI command list, take the current backbuffer to RENDER_TARGET, bind + clear it, and set a
-    // full-window viewport/scissor. The ImGui backend then records draws into CommandList; Present finishes.
     public void BeginFrame(float r, float g, float b, float a = 1f) {
         currentIndex = (int)swapChain.CurrentBackBufferIndex;
         uiAllocator.Reset();
         uiList.Reset(uiAllocator, null);
-        // Flip-model backbuffers rest in PRESENT (== COMMON) between frames; promote to RENDER_TARGET.
         uiList.ResourceBarrierTransition(backBuffers[currentIndex], ResourceStates.Present, ResourceStates.RenderTarget);
         uiList.OMSetRenderTargets(rtvHandles[currentIndex]);
         uiList.ClearRenderTargetView(rtvHandles[currentIndex], new Vortice.Mathematics.Color4(r, g, b, a));
@@ -107,9 +100,6 @@ public sealed class Dx12SwapChain : IDisposable {
         uiList.RSSetScissorRect(Width, Height);
     }
 
-    // Close + execute the UI list (so the backbuffer holds the rendered UI) and BLOCK on the GPU, leaving
-    // the backbuffer in PRESENT state — ready for an optional readback, then Present(). Synchronous: the
-    // device's model already stalls per submit, so this just mirrors it.
     public void EndFrame() {
         uiList.ResourceBarrierTransition(backBuffers[currentIndex], ResourceStates.RenderTarget, ResourceStates.Present);
         uiList.Close();
@@ -117,53 +107,57 @@ public sealed class Dx12SwapChain : IDisposable {
         dev.Flush();
     }
 
-    // Flip the presented backbuffer to the screen. syncInterval 1 = vsync, 0 = uncapped (the host's idle
-    // throttle paces it via the window's UpdateFrequency, like the GL path).
     public void Present(bool vsync) {
         CheckPresent(swapChain.Present(vsync ? 1u : 0u, PresentFlags.None));
     }
 
-    // Present returns an HRESULT (PreserveSig) — DON'T swallow it. On a device-removal/reset (e.g. a TDR
-    // after a cross-monitor resize) surface the real reason + DRED page-fault instead of letting the next
-    // call cascade into a full desktop lock-up. Throws so Program.cs's handler prints the diagnosis.
     void CheckPresent(SharpGen.Runtime.Result r) {
         if (r.Success) return;
         if (r.Code == Vortice.DXGI.ResultCode.DeviceRemoved.Code ||
             r.Code == Vortice.DXGI.ResultCode.DeviceReset.Code) {
             Debugging.LogError($"[DX12] Present device-removed: reason={dev.Device.DeviceRemovedReason} " +
                                $"DRED={dev.DrainDredReport()}");
-            r.CheckError();   // throw the device-removed HRESULT
+            r.CheckError();
         }
-        // Non-fatal (e.g. OCCLUDED when minimised) — ignore; the next frame re-presents.
     }
 
-    // The PLAYER present (no ImGui): blit the renderer's final LDR color straight into the backbuffer, then
-    // flip. `source` must be R8G8B8A8_UNORM at the SAME size as the backbuffer (the windowed host resizes the
-    // renderer to the window) and IN RENDER_TARGET state (the player path leaves ldr there) — it's restored
-    // to RenderTarget after, keeping the Dx12OffscreenTarget's own state tracking consistent. One command
-    // list + GPU flush (the synchronous model), then Present.
     public void PresentTexture(ID3D12Resource source, bool vsync) {
+        int slot = uiSlot;
+        uiSlot = (uiSlot + 1) % bufferCount;
+        WaitPresentSlot(slot);
         currentIndex = (int)swapChain.CurrentBackBufferIndex;
-        uiAllocator.Reset();
-        uiList.Reset(uiAllocator, null);
+        ID3D12CommandAllocator alloc = uiAllocators[slot];
+        ID3D12GraphicsCommandList4 list = uiLists[slot];
+        alloc.Reset();
+        list.Reset(alloc, null);
         ID3D12Resource bb = backBuffers[currentIndex];
-        uiList.ResourceBarrierTransition(bb, ResourceStates.Present, ResourceStates.CopyDest);
-        uiList.ResourceBarrierTransition(source, ResourceStates.RenderTarget, ResourceStates.CopySource);
-        uiList.CopyResource(bb, source);
-        uiList.ResourceBarrierTransition(source, ResourceStates.CopySource, ResourceStates.RenderTarget);
-        uiList.ResourceBarrierTransition(bb, ResourceStates.CopyDest, ResourceStates.Present);
-        uiList.Close();
-        dev.Queue.ExecuteCommandList(uiList);
-        dev.Flush();
+        list.ResourceBarrierTransition(bb, ResourceStates.Present, ResourceStates.CopyDest);
+        list.ResourceBarrierTransition(source, ResourceStates.RenderTarget, ResourceStates.CopySource);
+        list.CopyResource(bb, source);
+        list.ResourceBarrierTransition(source, ResourceStates.CopySource, ResourceStates.RenderTarget);
+        list.ResourceBarrierTransition(bb, ResourceStates.CopyDest, ResourceStates.Present);
+        list.Close();
+        dev.Queue.ExecuteCommandList(list);
+        ulong target = ++presentFenceValue;
+        dev.Queue.Signal(presentFence, target);
+        presentFenceTargets[slot] = target;
         CheckPresent(swapChain.Present(vsync ? 1u : 0u, PresentFlags.None));
     }
 
-    // Flush the GPU, release backbuffer references (required by ResizeBuffers), resize, recreate RTVs.
+    void WaitPresentSlot(int slot) {
+        ulong target = presentFenceTargets[slot];
+        if (target == 0 || presentFence.CompletedValue >= target) return;
+        presentFence.SetEventOnCompletion(target, presentFenceEvent.SafeWaitHandle.DangerousGetHandle());
+        presentFenceEvent.WaitOne();
+    }
+
     public void Resize(int width, int height) {
         width = Math.Max(1, width); height = Math.Max(1, height);
         if (width == Width && height == Height) return;
-        dev.Flush();   // drains render + worker uploads — ResizeBuffers needs the GPU fully idle
+        dev.Flush();
+        WaitPresentSlot((uiSlot + bufferCount - 1) % bufferCount);
         for (int i = 0; i < bufferCount; i++) { backBuffers[i]?.Dispose(); backBuffers[i] = null; }
+
         try {
             swapChain.ResizeBuffers((uint)bufferCount, (uint)width, (uint)height, BackbufferFormat, SwapChainFlags.None);
         }
@@ -174,11 +168,9 @@ public sealed class Dx12SwapChain : IDisposable {
         }
         Width = width; Height = height;
         CreateBackBufferRtvs();
+        currentIndex = (int)swapChain.CurrentBackBufferIndex;
     }
 
-    // Read the CURRENT backbuffer (must be in PRESENT state — call after EndFrame, before Present) back to
-    // CPU and write a 24-bit bottom-up BGR BMP, the SAME format the GL editor's glReadPixels harness emits,
-    // so the editor's headless screenshot path works identically on DX12. Restores PRESENT after.
     public unsafe void SaveBackbufferBmp(string path) {
         ID3D12Resource bb = backBuffers[currentIndex];
         var footprints = new PlacedSubresourceFootPrint[1];
@@ -205,8 +197,6 @@ public sealed class Dx12SwapChain : IDisposable {
         finally { readback.Unmap(0); }
     }
 
-    // 24-bit BMP, bottom-up BGR, from a top-down RGBA8 source (row pitch 256-aligned). Same emitter as
-    // Dx12OffscreenTarget.WriteBmp so cross-backend `bal imgdiff` / rgbstat.py compare directly.
     unsafe void WriteBmp(string path, byte* src, int rowPitch) {
         int w = Width, h = Height;
         int padded = (w * 3 + 3) & ~3;
@@ -225,9 +215,9 @@ public sealed class Dx12SwapChain : IDisposable {
             byte* srcRow = src + (long)(h - 1 - y) * rowPitch;
             int dstRow = 54 + y * padded;
             for (int x = 0; x < w; x++) {
-                file[dstRow + x * 3 + 0] = srcRow[x * 4 + 2];   // B
-                file[dstRow + x * 3 + 1] = srcRow[x * 4 + 1];   // G
-                file[dstRow + x * 3 + 2] = srcRow[x * 4 + 0];   // R
+                file[dstRow + x * 3 + 0] = srcRow[x * 4 + 2];
+                file[dstRow + x * 3 + 1] = srcRow[x * 4 + 1];
+                file[dstRow + x * 3 + 2] = srcRow[x * 4 + 0];
             }
         }
         System.IO.File.WriteAllBytes(path, file);
@@ -235,8 +225,11 @@ public sealed class Dx12SwapChain : IDisposable {
 
     public void Dispose() {
         dev.Flush();
-        uiList.Dispose();
-        uiAllocator.Dispose();
+        WaitPresentSlot((uiSlot + bufferCount - 1) % bufferCount);
+        presentFence?.Dispose();
+        presentFenceEvent.Dispose();
+        if (uiLists != null) foreach (var l in uiLists) l?.Dispose();
+        if (uiAllocators != null) foreach (var a in uiAllocators) a?.Dispose();
         if (backBuffers != null)
             foreach (ID3D12Resource b in backBuffers) b?.Dispose();
         rtvHeap?.Dispose();

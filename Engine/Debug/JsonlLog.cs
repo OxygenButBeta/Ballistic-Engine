@@ -2,11 +2,6 @@ using System.Text;
 
 namespace BallisticEngine;
 
-// Machine-readable log mirror: every Debugging message also lands in a JSONL file (one
-// {"t","level","msg"} object per line, truncated per session) so an external agent can tail
-// structured logs instead of scraping console formats. Wired by EngineBootstrap to
-// Library/Logs/engine.jsonl for editable projects (a shipped player must not write into its
-// install folder). Thread-safe: import workers and script threads log too.
 public static class JsonlLog {
     static readonly object gate = new();
     static StreamWriter writer;
@@ -14,13 +9,13 @@ public static class JsonlLog {
     public static void Start(string path) {
         lock (gate) {
             if (writer is not null)
-                return; // one sink per process
+                return;
             try {
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!);
                 writer = new StreamWriter(path, append: false, new UTF8Encoding(false)) { AutoFlush = true };
             }
             catch {
-                return; // logging must never take the engine down
+                return;
             }
         }
         Debugging.OnMessage += Write;

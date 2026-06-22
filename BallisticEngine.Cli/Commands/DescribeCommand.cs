@@ -2,13 +2,6 @@ using BallisticEngine.Serialization;
 
 namespace BallisticEngine.Cli.Commands;
 
-// `bal describe <scene.scene>` — the scene SUMMARY an agent reads to understand a scene WITHOUT
-// loading it (GL-free, parses the YAML to a SceneDocument). The roadmap's "default query response":
-// a compact entity tree (name, active, components-by-type, child nesting) + scene-wide components +
-// counts. Paths/ids over GUIDs; this is read-only.
-//
-// --flat lists entities in file order without nesting (easier to scan for a flat scene). Default is
-// the parent->child tree.
 internal sealed class DescribeCommand : ICommand {
     public string Name => "describe";
     public string Summary => "Summarize a .scene: entity tree, components, counts.";
@@ -49,8 +42,6 @@ internal sealed class DescribeCommand : ICommand {
         return 0;
     }
 
-    // Nests entities under their transform.parent (root-first). Entities whose parent id isn't in the
-    // file are treated as roots (the validator flags dangling parents separately).
     static List<Node> BuildTree(List<EntityDocument> entities) {
         var byId = new Dictionary<string, EntityDocument>(StringComparer.Ordinal);
         foreach (EntityDocument e in entities)
@@ -82,8 +73,7 @@ internal sealed class DescribeCommand : ICommand {
             comps.Add(c.Type);
         return new Node(
             e.Name,
-            e.IsActive ? null : false,                 // omit "active":true (the common case)
-            comps.Count > 0 ? comps : null,
+            e.IsActive ? null : false, comps.Count > 0 ? comps : null,
             null);
     }
 

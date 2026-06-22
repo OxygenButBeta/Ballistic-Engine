@@ -6,9 +6,6 @@ public class GLInput : IInputProvider {
     MouseState mouseState;
     KeyboardState keyboardState;
 
-    // Live joystick states from the window (index = GLFW joystick slot). Empty/null entries mean no
-    // controller in that slot. OpenTK keeps SDL_GameControllerDB mappings, so a recognized gamepad's
-    // button/axis indices follow the standard Xbox layout the facade's enums assume.
     readonly System.Func<System.Collections.Generic.IReadOnlyList<JoystickState>> joysticks;
 
     public GLInput(KeyboardState keyboardState, MouseState mouseState,
@@ -37,8 +34,6 @@ public class GLInput : IInputProvider {
     public Vector2 ScrollDelta => new Vector2(mouseState.ScrollDelta.X, mouseState.ScrollDelta.Y);
     public Vector2 MousePosition => new Vector2(mouseState.Position.X, mouseState.Position.Y);
     public Vector2 MouseDelta => new Vector2(mouseState.Delta.X, mouseState.Delta.Y);
-
-    // ---- Gamepad ----
 
     JoystickState Pad(int playerIndex) {
         var list = joysticks?.Invoke();

@@ -1,23 +1,15 @@
 
 namespace BallisticEngine;
 
-// What a Physics.Raycast hit, mapped back to scene objects (Unity's RaycastHit).
 public struct RaycastHit {
     public Vector3 Point;
     public Vector3 Normal;
     public float Distance;
-    public Collider Collider;     // null when the body is a collider-less Rigidbody
-    public Rigidbody Rigidbody;   // null when the hit body is a static collider
+    public Collider Collider;
+    public Rigidbody Rigidbody;
     public Entity Entity;
 }
 
-// Static facade over the physics backend (Unity's `Physics` class). The world implementation
-// is injected by EngineBootstrap (the Physics/Bepu module); components talk ONLY through
-// IPhysicsWorld/IPhysicsBody so the Engine layer stays free of BepuPhysics references.
-//
-// Simulation runs at a fixed timestep, in play mode only, driven by SceneManager.Update:
-// behaviours' FixedTick fires, rigidbodies push pending forces/kinematic targets into the
-// world, the world steps, and simulated poses write back to transforms.
 public static class Physics {
     public static IPhysicsWorld World { get; set; }
 
@@ -31,8 +23,6 @@ public static class Physics {
         }
     }
 
-    // The "Ignore Raycast" builtin layer (index 2, Unity parity) is excluded from the default mask
-    // so a collider on it is invisible to unmasked raycasts.
     public const int DefaultRaycastLayers = ~(1 << 2);
 
     public static bool Raycast(Vector3 origin, Vector3 direction, out RaycastHit hit,
@@ -48,15 +38,9 @@ public static class Physics {
         return true;
     }
 
-    // Convenience overload: no out-hit, just "did it hit anything".
     public static bool Raycast(Vector3 origin, Vector3 direction,
         float maxDistance = float.MaxValue, int layerMask = DefaultRaycastLayers) =>
         Raycast(origin, direction, out _, maxDistance, layerMask);
-
-    // ---- Shape casts (sweeps) ------------------------------------------------
-    // Like a ray, but with thickness: slides a convex shape and returns the first body it touches.
-    // Used for robust ground-finding (vehicle wheels), character step/ledge probing, and any "what's
-    // in front of this shape" query a zero-width ray would miss. Unity's SphereCast/BoxCast/CapsuleCast.
 
     public static bool SphereCast(Vector3 origin, float radius, Vector3 direction, out RaycastHit hit,
         float maxDistance = float.MaxValue, int layerMask = DefaultRaycastLayers) =>
@@ -84,14 +68,12 @@ public static class Physics {
         return true;
     }
 
-    // Every body intersecting a sphere, layer-filtered (Unity's OverlapSphere). Returns colliders.
     public static List<Collider> OverlapSphere(Vector3 center, float radius, int layerMask = ~0) {
         var bodies = new List<IPhysicsBody>();
         World?.OverlapSphere(center, radius, layerMask, bodies);
         return ToColliders(bodies);
     }
 
-    // Every body intersecting an oriented box (Unity's OverlapBox). halfExtents = box size / 2.
     public static List<Collider> OverlapBox(Vector3 center, Vector3 halfExtents,
         Quaternion orientation, int layerMask = ~0) {
         var bodies = new List<IPhysicsBody>();
@@ -99,9 +81,6 @@ public static class Physics {
         return ToColliders(bodies);
     }
 
-    // PRECISE overlap: only colliders whose SHAPE truly intersects the convex query shape (Bepu's
-    // narrowphase, no AABB/rotation false positives). Costlier than OverlapSphere/OverlapBox above —
-    // reach for it when correctness matters (a tight fit test, a melee hitbox). Convex query only.
     public static List<Collider> OverlapSpherePrecise(Vector3 center, float radius, int layerMask = ~0) =>
         OverlapShape(new SphereShape(radius), center, Quaternion.Identity, layerMask);
 
@@ -140,10 +119,6 @@ public static class Physics {
         return hit;
     }
 
-    // ---- Stepping (engine-internal) -----------------------------------------
-
-    // After a long stall (asset import hitch, breakpoint) the accumulator could demand dozens
-    // of catch-up steps; cap them and drop the remaining debt instead of freezing the frame.
     const int MaxCatchUpSteps = 4;
     const float MaxFrameDelta = 0.25f;
 
@@ -156,9 +131,6 @@ public static class Physics {
 
     internal static void EndPlay() => World?.Reset();
 
-    // Runs zero or more fixed steps for this frame. fixedTick fans FixedTick out to the
-    // scene's behaviours BEFORE each physics step, so gameplay code sees pre-step state and
-    // its forces apply in the same step (Unity's FixedUpdate ordering).
     internal static void Advance(float delta, Action<float> fixedTick) {
         if (World is null)
             return;
@@ -171,8 +143,6 @@ public static class Physics {
                 break;
             }
 
-            // Resume WaitForFixedTick awaiters before behaviour FixedTick + the physics step, so an
-            // awaited fixed-step resume sees the same pre-step state FixedTick does.
             Coroutine.FixedTick(FixedTimestep);
 
             fixedTick?.Invoke(FixedTimestep);
@@ -180,9 +150,6 @@ public static class Physics {
             foreach (Rigidbody rigidbody in RuntimeSet<Rigidbody>.ReadOnlyCollection)
                 rigidbody.PrePhysicsStep(FixedTimestep);
 
-            // Standalone (Rigidbody-less) colliders teleport their static body to follow any runtime
-            // transform edit (gizmo/inspector/script) so moving level geometry at play time actually
-            // moves its collision. No-op for colliders that are part of a Rigidbody compound.
             foreach (Collider collider in RuntimeSet<Collider>.ReadOnlyCollection)
                 collider.SyncStaticBodyToTransform();
 
@@ -197,11 +164,6 @@ public static class Physics {
         }
     }
 
-    // ---- Contact event dispatch ----------------------------------------------
-
-    // Fans the backend's per-step contact events out to OnCollision*/OnTrigger* on every
-    // enabled behaviour of BOTH entities involved. Runs after PostPhysicsStep so callbacks
-    // see post-step transforms (and may safely add forces, destroy entities, etc.).
     static void DispatchContactEvents() {
         IReadOnlyList<PhysicsContactEvent> events = World.ContactEvents;
         if (events is null || events.Count == 0)
@@ -211,7 +173,6 @@ public static class Physics {
             PhysicsContactEvent contactEvent = events[i];
             var ownerA = contactEvent.A?.UserData as Behaviour;
             var ownerB = contactEvent.B?.UserData as Behaviour;
-            // The OTHER collider for A's callbacks is B's struck child (ChildB), and vice versa.
             DispatchToEntity(ownerA, ownerB, in contactEvent, contactEvent.Normal, contactEvent.ChildB);
             DispatchToEntity(ownerB, ownerA, in contactEvent, -contactEvent.Normal, contactEvent.ChildA);
         }
@@ -223,10 +184,8 @@ public static class Physics {
         if (entity is null)
             return;
 
-        // Resolve the exact child collider that was struck (P5) when the other side is a Rigidbody;
-        // a standalone Collider is itself the other collider.
         Collider otherCollider = other as Collider
-            ?? (other as Rigidbody)?.ColliderForChild(otherChildIndex);
+                                 ?? (other as Rigidbody)?.ColliderForChild(otherChildIndex);
         var collision = new Collision(
             otherCollider,
             other as Rigidbody ?? otherCollider?.AttachedRigidbody,
@@ -234,9 +193,6 @@ public static class Physics {
             contactEvent.Point,
             normalTowardReceiver);
 
-        // Index loop: a callback may AddComponent (appends are picked up; removals at worst
-        // skip one entry this step). Exceptions are contained per behaviour — one broken
-        // script must not kill the physics loop (engine never-throw convention).
         List<Behaviour> behaviours = entity.Behaviours;
         for (var i = 0; i < behaviours.Count; i++) {
             Behaviour behaviour = behaviours[i];

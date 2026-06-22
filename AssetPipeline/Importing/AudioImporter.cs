@@ -2,14 +2,10 @@ using System.Text.Json.Nodes;
 
 namespace BallisticEngine.AssetPipeline;
 
-// Imports audio source files (.wav for now; .ogg/.mp3 are recognized but need a Vorbis/MP3 decoder
-// to be wired into AudioDecode) into a .baud artifact of interleaved 16-bit PCM. Same shape as
-// TextureImporter: decode at import time, write the engine-native artifact, load reads it back fast.
 public sealed class AudioImporter : IAssetImporter {
     static readonly string[] Extensions = [".wav", ".wave", ".ogg"];
 
     public string Name => "AudioImporter";
-    // v2: Ogg Vorbis (.ogg) decode via NVorbis.
     public int Version => 2;
     public string ArtifactExtension => ".baud";
 
@@ -22,16 +18,12 @@ public sealed class AudioImporter : IAssetImporter {
     public void Import(AssetImportContext context) {
         AudioData data = Decode(context.SourceAbsolutePath);
         if (!data.IsValid) {
-            // Write an empty artifact so the asset still resolves (silent clip) instead of erroring
-            // every load — mirrors the renderer substituting fallback textures.
             AudioArtifact.Write(context.ArtifactAbsolutePath, in data);
             return;
         }
         AudioArtifact.Write(context.ArtifactAbsolutePath, in data);
     }
 
-    // Decodes a source audio file to canonical PCM by extension. Returns empty AudioData on an
-    // unsupported/unparseable file (logged).
     public static AudioData Decode(string sourcePath) {
         var extension = Path.GetExtension(sourcePath).ToLowerInvariant();
         return extension switch {

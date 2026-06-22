@@ -1,13 +1,4 @@
-﻿// Copyright (c) Meta Platforms, Inc. and affiliates.
-//
-// This source code is licensed under the MIT license found in the
-// LICENSE file in the root directory of this source tree.
-
-using System;
-using System.Collections.Generic;
-using System.Threading;
-
-namespace Facebook.Yoga
+﻿namespace Facebook.Yoga
 {
     public static partial class LayoutAlgorithm
     {
@@ -996,7 +987,6 @@ namespace Facebook.Yoga
             node.SetLayoutHadOverflow(false);
             CleanupContentsNodesRecursively(node);
 
-            // STEP 1
             FlexDirection mainAxis = node.Style.FlexDirection.ResolveDirection(direction);
             FlexDirection crossAxis = mainAxis.ResolveCrossDirection(direction);
             bool isMainAxisRow = mainAxis.IsRow();
@@ -1016,7 +1006,6 @@ namespace Facebook.Yoga
             float paddingAndBorderAxisRow = isMainAxisRow ? paddingAndBorderAxisMain : paddingAndBorderAxisCross;
             float paddingAndBorderAxisColumn = isMainAxisRow ? paddingAndBorderAxisCross : paddingAndBorderAxisMain;
 
-            // STEP 2
             float availableInnerWidth = CalculateAvailableInnerDimension(
                 node, direction, Dimension.Width, availableWidth - marginAxisRow,
                 paddingAndBorderAxisRow, ownerWidth, ownerWidth);
@@ -1027,7 +1016,6 @@ namespace Facebook.Yoga
             float availableInnerMainDim = isMainAxisRow ? availableInnerWidth : availableInnerHeight;
             float availableInnerCrossDim = isMainAxisRow ? availableInnerHeight : availableInnerWidth;
 
-            // STEP 3
             float ownerWidthForChildren = availableInnerWidth;
             float ownerHeightForChildren = availableInnerHeight;
 
@@ -1072,7 +1060,6 @@ namespace Facebook.Yoga
             if (isNodeFlexWrap && mainAxisOverflows && sizingModeMainDim == SizingMode.FitContent)
                 sizingModeMainDim = SizingMode.StretchFit;
 
-            // STEP 4: COLLECT FLEX ITEMS INTO FLEX LINES
             var layoutChildren = new List<Node>(node.GetLayoutChildren());
             int startOfLineIndex = 0;
             int lineCount = 0;
@@ -1090,7 +1077,6 @@ namespace Facebook.Yoga
 
                 bool canSkipFlex = !performLayout && sizingModeCrossDim == SizingMode.StretchFit;
 
-                // STEP 5
                 bool sizeBasedOnContent = false;
                 if (sizingModeMainDim != SizingMode.StretchFit)
                 {
@@ -1149,7 +1135,6 @@ namespace Facebook.Yoga
                 node.SetLayoutHadOverflow(
                     node.Layout.HadOverflow() || (flexLine.Layout.RemainingFreeSpace < 0));
 
-                // STEP 6
                 JustifyMainAxis(node, flexLine, mainAxis, crossAxis, direction,
                     sizingModeMainDim, sizingModeCrossDim, mainAxisOwnerSize, ownerWidth,
                     availableInnerMainDim, availableInnerCrossDim, availableInnerWidth, performLayout);
@@ -1174,7 +1159,6 @@ namespace Facebook.Yoga
                         crossAxisOwnerSize, ownerWidth) - paddingAndBorderAxisCross;
                 }
 
-                // STEP 7: CROSS-AXIS ALIGNMENT
                 if (performLayout)
                 {
                     for (int i = 0; i < flexLine.ItemsInFlow.Count; i++)
@@ -1240,7 +1224,6 @@ namespace Facebook.Yoga
                             }
                             else if (child.Style.FlexEndMarginIsAuto(crossAxis, direction))
                             {
-                                // No-Op
                             }
                             else if (child.Style.FlexStartMarginIsAuto(crossAxis, direction))
                             {
@@ -1248,7 +1231,6 @@ namespace Facebook.Yoga
                             }
                             else if (alignItem == Align.FlexStart)
                             {
-                                // No-Op
                             }
                             else if (alignItem == Align.Center)
                             {
@@ -1272,7 +1254,6 @@ namespace Facebook.Yoga
                 lineCount++;
             }
 
-            // STEP 8: MULTI-LINE CONTENT ALIGNMENT
             if (performLayout && (isNodeFlexWrap || Baseline.IsBaselineLayout(node)))
             {
                 float leadPerLine = 0;
@@ -1420,7 +1401,6 @@ namespace Facebook.Yoga
                 }
             }
 
-            // STEP 9: COMPUTING FINAL DIMENSIONS
             node.SetLayoutMeasuredDimension(
                 BoundAxis.ComputeBoundAxis(node, FlexDirection.Row, direction,
                     availableWidth - marginAxisRow, ownerWidth, ownerWidth), Dimension.Width);
@@ -1466,7 +1446,6 @@ namespace Facebook.Yoga
                         paddingAndBorderAxisCross), crossAxis.Dimension());
             }
 
-            // wrap-reverse
             if (performLayout && node.Style.FlexWrap == Wrap.WrapReverse)
             {
                 foreach (var child in node.GetLayoutChildren())
@@ -1484,7 +1463,6 @@ namespace Facebook.Yoga
 
             if (performLayout)
             {
-                // STEP 10: SETTING TRAILING POSITIONS FOR CHILDREN
                 bool needsMainTrailingPos = TrailingPosition.NeedsTrailingPosition(mainAxis);
                 bool needsCrossTrailingPos = TrailingPosition.NeedsTrailingPosition(crossAxis);
                 if (needsMainTrailingPos || needsCrossTrailingPos)
@@ -1500,7 +1478,6 @@ namespace Facebook.Yoga
                     }
                 }
 
-                // STEP 11: SIZING AND POSITIONING ABSOLUTE CHILDREN
                 if (node.Style.PositionType != PositionType.Static ||
                     node.AlwaysFormsContainingBlock || depth == 1)
                 {

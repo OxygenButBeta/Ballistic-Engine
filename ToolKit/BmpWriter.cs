@@ -1,8 +1,5 @@
 namespace BallisticEngine;
 
-// Minimal 24bpp BMP encoder. Rows are stored bottom-up in BGR byte order — exactly what
-// GL.ReadPixels(..., Bgr, UnsignedByte) produces, so the engine's screenshot path writes the
-// readback buffer verbatim with no flips or swizzles. BCL-only on purpose (ToolKit layer).
 public static class BmpWriter {
     public static void Write(string path, int width, int height, byte[] bgrPixels) {
         var rowBytes = width * 3;
@@ -10,13 +7,11 @@ public static class BmpWriter {
         var dataSize = padded * height;
 
         using var bw = new BinaryWriter(File.Create(path));
-        // BITMAPFILEHEADER
         bw.Write((byte)'B');
         bw.Write((byte)'M');
         bw.Write(54 + dataSize);
         bw.Write(0);
         bw.Write(54);
-        // BITMAPINFOHEADER
         bw.Write(40);
         bw.Write(width);
         bw.Write(height);
@@ -24,7 +19,7 @@ public static class BmpWriter {
         bw.Write((short)24);
         bw.Write(0);
         bw.Write(dataSize);
-        bw.Write(2835); // 72 dpi
+        bw.Write(2835);
         bw.Write(2835);
         bw.Write(0);
         bw.Write(0);

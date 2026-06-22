@@ -3,34 +3,22 @@ using SysVec2 = System.Numerics.Vector2;
 
 namespace BallisticEngine.Editor;
 
-// Unity-style terrain sculpting in the Scene view. Active only while ARMED (the Inspector's terrain
-// brush palette toggles Armed, like selecting Unity's terrain paint tab) so a selected terrain
-// doesn't hijack normal click-to-select. While armed it raycasts the mouse against the terrain
-// heightfield, draws a brush ring on the surface, and on left-drag applies the current brush via the
-// engine-layer TerrainSculpt math, rebuilds the mesh live, and persists the asset on stroke end.
-//
-// State is static (one active stroke at a time, like ColliderHandles). The brush math, raycast, and
-// save all live in the engine/asset layers — this file is purely the editor interaction + drawing.
 internal static class TerrainTool {
-    // ---- Brush settings (edited by the Inspector palette) ----------------------
     public static bool Armed;
     public static TerrainSculpt.Brush Brush = TerrainSculpt.Brush.Raise;
-    public static float Radius = 8f;       // world units
-    public static float Strength = 0.4f;   // world height delta per dab at full falloff (Raise/Lower)
-    public static float TargetHeight = 0.3f; // normalized [0,1], for Flatten/Set
+    public static float Radius = 8f;
+    public static float Strength = 0.4f;
+    public static float TargetHeight = 0.3f;
 
-    // ---- Stroke state ----------------------------------------------------------
     static bool sculpting;
     static Terrain activeTerrain;
     static bool hadHit;
     static Vector3 lastHitLocal;
 
-    // True while a sculpt stroke is in progress — joins the editor's gizmoBusy check so a stroke
-    // never also fires click-to-select or starts the transform gizmo.
+    static float[] strokeBeforeHeights;
+
     public static bool IsInteracting => sculpting;
 
-    // Draws the brush + handles a stroke for the given terrain. Returns true if the terrain changed
-    // this frame (caller marks the scene dirty). viewHovered should already exclude gizmo interaction.
     public static bool Draw(Terrain terrain, IViewProjectionProvider camera,
         SysVec2 viewMin, SysVec2 viewSize, ImDrawListPtr draw, bool viewHovered) {
         if (terrain is null || terrain.Terrain3D is null) {
@@ -45,7 +33,6 @@ internal static class TerrainTool {
         TerrainAsset asset = terrain.Terrain3D;
         Matrix4 vp = camera.GetViewMatrix() * camera.GetProjectionMatrix();
 
-        // Mouse ray -> terrain-local space (sculpt + raycast math is all local; matches the mesh).
         Matrix4 world = terrain.transform.WorldMatrix;
         if (!TryInvert(world, out Matrix4 invWorld)) {
             EndStrokeIfActive();
@@ -65,21 +52,18 @@ internal static class TerrainTool {
             }
         }
 
-        // Draw the brush ring at the surface (world-space, follows the relief under the cursor).
         if (hadHit)
             DrawBrushRing(asset, world, vp, viewMin, viewSize, draw, lastHitLocal);
 
         bool changed = false;
 
-        // Begin a stroke on left-press over a hit (and not while flying / over a popup).
         if (!sculpting && hadHit && viewHovered &&
             ImGui.IsMouseClicked(ImGuiMouseButton.Left) && !ImGui.GetIO().WantTextInput) {
-            EditorUndo.Push($"Sculpt Terrain ({Brush})");
+            strokeBeforeHeights = (float[])asset.Heights.Clone();
             sculpting = true;
             activeTerrain = terrain;
         }
 
-        // Apply the brush each frame the stroke is held and the ray still hits the surface.
         if (sculpting && ImGui.IsMouseDown(ImGuiMouseButton.Left)) {
             if (hadHit && ReferenceEquals(activeTerrain, terrain)) {
                 bool dabbed = TerrainSculpt.Apply(asset, Brush, lastHitLocal, Radius, Strength, TargetHeight);
@@ -91,7 +75,6 @@ internal static class TerrainTool {
             }
         }
         else if (sculpting) {
-            // Released (or mouse up): finalize the stroke and persist the sculpted heights.
             EndStroke();
         }
 
@@ -99,10 +82,40 @@ internal static class TerrainTool {
     }
 
     static void EndStroke() {
-        if (activeTerrain?.Terrain3D is { } asset)
+        Terrain terrain = activeTerrain;
+        if (terrain?.Terrain3D is { } asset) {
             AssetDatabase.SaveTerrain(asset);
+
+            float[] before = strokeBeforeHeights;
+            if (before is not null && before.Length == asset.Heights.Length &&
+                !HeightsEqual(before, asset.Heights)) {
+                float[] after = (float[])asset.Heights.Clone();
+                EditorCommands.EditAsset($"Sculpt Terrain ({Brush})",
+                    applyOld: () => RestoreHeights(terrain, asset, before),
+                    applyNew: () => RestoreHeights(terrain, asset, after),
+                    mutate: () => { });
+            }
+        }
+        strokeBeforeHeights = null;
         sculpting = false;
         activeTerrain = null;
+    }
+
+    static void RestoreHeights(Terrain terrain, TerrainAsset asset, float[] heights) {
+        Array.Copy(heights, asset.Heights, asset.Heights.Length);
+        asset.BumpRevision();
+        terrain?.Rebuild();
+        AssetDatabase.SaveTerrain(asset);
+    }
+
+    static bool HeightsEqual(float[] a, float[] b) {
+        if (a.Length != b.Length)
+            return false;
+        for (int i = 0; i < a.Length; i++) {
+            if (a[i] != b[i])
+                return false;
+        }
+        return true;
     }
 
     static void EndStrokeIfActive() {
@@ -110,8 +123,6 @@ internal static class TerrainTool {
             EndStroke();
     }
 
-    // A ring of segments around the brush, each point lifted to the terrain surface so it hugs the
-    // relief (and a small center cross). Projected through the same vp as every other gizmo.
     static void DrawBrushRing(TerrainAsset asset, Matrix4 world, Matrix4 vp,
         SysVec2 viewMin, SysVec2 viewSize, ImDrawListPtr draw, Vector3 centerLocal) {
         const int segments = 48;
@@ -138,7 +149,6 @@ internal static class TerrainTool {
             }
         }
 
-        // Center marker.
         Vector3 cWorld = Vector3.Transform(
             new Vector3(centerLocal.X,
                 TerrainSculpt.SurfaceHeight(asset, centerLocal.X, centerLocal.Z, halfX, halfZ) + 0.05f,
@@ -152,7 +162,7 @@ internal static class TerrainTool {
         TerrainSculpt.Brush.Smooth => new System.Numerics.Vector4(0.45f, 0.80f, 0.95f, 0.95f),
         TerrainSculpt.Brush.Flatten => new System.Numerics.Vector4(0.85f, 0.80f, 0.40f, 0.95f),
         TerrainSculpt.Brush.Set => new System.Numerics.Vector4(0.80f, 0.55f, 0.95f, 0.95f),
-        _ => new System.Numerics.Vector4(0.45f, 0.95f, 0.55f, 0.95f), // Raise
+        _ => new System.Numerics.Vector4(0.45f, 0.95f, 0.55f, 0.95f),
     };
 
     static bool TryInvert(Matrix4 m, out Matrix4 inverse) {

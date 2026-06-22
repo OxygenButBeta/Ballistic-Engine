@@ -1,12 +1,6 @@
 
 namespace BallisticEngine;
 
-// Plays an AudioClip from this entity (Unity's AudioSource). In 3D mode the sound is positioned at
-// the entity's transform and attenuates with listener distance; in 2D mode it plays flat (UI/music).
-//
-// Playback is PLAY-MODE ONLY — like physics, a sound should not fire while you're editing the scene.
-// PlayOnAwake starts it at OnBegin; otherwise call Play() from a script. A looping source follows the
-// transform every Tick so a moving emitter pans correctly.
 [Component("Audio Source", "Audio")]
 public class AudioSource : Behaviour {
     [Tooltip("The sound to play. Drag a .wav/.ogg audio asset here.")]
@@ -38,7 +32,6 @@ public class AudioSource : Behaviour {
     [Range(1f, 5000f)]
     public float MaxDistance { get; set; } = 500f;
 
-    // The currently-playing voice (null when stopped). Runtime-only — never serialized.
     [NotSerialized]
     public bool IsPlaying => voice is { IsPlaying: true };
 
@@ -52,12 +45,11 @@ public class AudioSource : Behaviour {
     protected internal override void OnDisabled() => Stop();
     protected internal override void OnDetach() => Stop();
 
-    // Starts (or restarts) playback. No-op in edit mode / without a clip or backend.
     public void Play() {
         if (!SceneManager.IsPlaying || Clip is null)
             return;
 
-        Stop();   // restart semantics — one voice per source
+        Stop();
 
         var p = AudioVoiceParams.Default;
         p.Spatial = Spatial;
@@ -89,13 +81,10 @@ public class AudioSource : Behaviour {
         if (voice is null || !voice.IsPlaying)
             return;
 
-        // Live-track mix changes so an inspector tweak / script change is heard immediately.
         voice.Volume = Volume;
         voice.Pitch = Pitch;
         voice.Looping = Loop;
 
-        // A moving 3D emitter must follow its transform; derive velocity for Doppler from the
-        // frame delta (no need to store a Rigidbody reference).
         if (Spatial) {
             Vector3 now = transform.WorldPosition;
             voice.Velocity = delta > 0f ? (now - voice.Position) / delta : Vector3.Zero;
@@ -103,15 +92,11 @@ public class AudioSource : Behaviour {
         }
     }
 
-    // Always-on marker so an audio emitter is findable in the scene view.
     public override void OnDrawGizmos(IGizmos gizmos) {
         gizmos.Color = new Vector3(0.4f, 0.8f, 1f);
         gizmos.DrawIcon(transform.WorldPosition, GizmoIcon.Light);
     }
 
-    // Selected: the 3D falloff range — inner sphere (full volume within MinDistance) and outer sphere
-    // (silent beyond MaxDistance), Unity-style, so you can see where the sound is audible. 2D sources
-    // ignore distance, so only the marker shows.
     public override void OnDrawGizmosSelected(IGizmos gizmos) {
         if (!Spatial)
             return;

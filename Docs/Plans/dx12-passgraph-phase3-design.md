@@ -1,0 +1,425 @@
+# DX12 Pass-Graph — PHASE 3 DESIGN: the authored `[RenderFeature]` layer
+
+**This is a DESIGN doc (chunk 18), not an implementation.** Phase 1 (pluggable pass list) and phase 2
+(true frame graph — DAG/cull/aliasing/auto-barriers) are DONE (see `dx12-passgraph-phase2-done.md`).
+The graph is now solid: a thin orchestrator + `Dx12RenderGraph` of `IRenderPass`. Phase 3 is the LAST
+piece the user asked for — **"a render-feature / custom-pass system like Unity"** — and per the master
+plan (`silly-leaping-fog.md` §Architecture intro lines 22-23) it is a **FEATURE**, not a refactor, so the
+first deliverable is this design + a chunk-by-chunk sub-plan, NOT a big-bang implementation.
+
+> Plan of record (method): `C:\Users\suley\.claude\plans\silly-leaping-fog.md`. Memory:
+> `dx12-passgraph-plan-2026-06-17.md`. Branch `dx12-renderer`. Substrate pinned (golden): AMD RX 9070 XT,
+> driver 32.0.31019.2002, Win 10.0.26200, golden tree the phase-1 freeze (`Docs/Validation/dx12-golden-set.json`).
+
+---
+
+## 1. Goal (what "a render-feature system like Unity" means here)
+
+Unity URP's `ScriptableRendererFeature` / `ScriptableRenderPass`: a game/project authors a feature class,
+the feature is **discovered + serialized + editor-reorderable**, it declares an injection point
+(`renderPassEvent`) and resource reads/writes, and the renderer slots it into the frame at that event with
+the rest of the built-in passes. **No engine recompile, no renderer edit** to add a custom pass.
+
+Phase 3 delivers the same on this engine's now-solid DX12 graph: an authored `RenderFeature` (engine-side,
+zero-backend-reference) that the DX12 backend adapts into an `IRenderPass` and `graph.Add`s alongside the
+14 built-ins — declaring its event + reads/writes so the existing V1/V2/V3 compiler schedules, culls,
+aliases and auto-barriers it exactly like a built-in. Authored features carry overridable parameters that
+render through the existing attribute-driven inspector and serialize by type-name — **a direct mirror of
+the Volume framework** (the precedent the plan names).
+
+**The pixel-neutral gate (the whole-phase invariant): with NO feature registered, today's pipeline is
+byte-identical to the frozen golden set, under all 4 graph door states + GBV 0-NEW.** Every phase-3 chunk
+must hold this — phase 3 ADDS an opt-in authoring surface; it must not perturb the proven default frame.
+
+---
+
+## 2. The two precedents this mirrors (verified in code, chunk 18)
+
+### 2a. The Volume framework — the AUTHORING + DISCOVERY + SERIALIZATION + EDITOR shape to copy
+
+| Volume framework piece | File | Role | Phase-3 analogue |
+|---|---|---|---|
+| `Volume : Behaviour` (`[Component]`) | `Engine/Rendering/Volumes/Volume.cs` | entity component, `Profile` guid ref, registers in `OnAttach`/`OnDetach` | `RenderFeatureSet : Behaviour` OR a `SceneBehaviour` holding the ordered feature list (see §5 decision D2) |
+| `VolumeProfile : BObject` | `Engine/Rendering/Volumes/VolumeProfile.cs` | shareable `.volume` JSON asset, list of components, ≤1 per type | feature list = ordered, MULTIPLE-of-a-type allowed (URP lets you add the same feature twice) — a list, not a set |
+| `VolumeComponent` (abstract) | `Engine/Rendering/Volumes/VolumeComponent.cs` | reflection-discovers `public readonly VolumeParameter` fields by `MetadataToken`; `Active` master switch | `RenderFeature` (abstract, engine-side) — reflection-discovered overridable params; `Active`/`Enabled` switch + `Event` + declared reads/writes |
+| `VolumeParameter<T>` (+ Clamped/Color/Enum) | `Engine/Rendering/Volumes/VolumeParameter.cs` | typed overridable value (`Overridden` flag, `Interp`) | feature params are PLAIN members with `[Range]`/`[Tooltip]` — NO blending needed (a feature is on or off; it does not cross-fade like a post-fx grade). **This is the key divergence** — features don't blend, so they DON'T need the `VolumeParameter` wrapper; they use plain decorated members like a normal Behaviour. |
+| `VolumeManager` (static) | `Engine/Rendering/Volumes/VolumeManager.cs` | blends all active volumes → one `VolumeStack` per frame, stable insertion sort by priority | `RenderFeatureManager` (engine-side) — gathers active features in authored order; NO blend, just the ordered active set the backend consumes |
+| `VolumePostProcessing.Apply` | `Engine/Rendering/Volumes/VolumePostProcessing.cs` | the ONE stack→`PostFX` bridge (engine→backend boundary) | `Dx12RenderFeatureBridge` (backend-side) — the ONE place that turns engine-side features into `IRenderPass`es and `graph.Add`s them. The Volume framework's bridge proves the pattern: engine produces config, backend consumes it through one method. |
+| `ComponentRegistry.Build` | `ToolKit/.../ComponentRegistry.cs` | reflection-discovers `VolumeComponent` subtypes → `VolumeMenu`, `ResolveVolume`, `VolumeNameOf` | add a parallel `RenderFeatureMenu` / `ResolveFeature` / `FeatureNameOf` (one more branch in `Build`'s type loop — exact same code shape as the volume branch) |
+| `VolumeProfileLoader` | `AssetPipeline/Loaders/VolumeProfileLoader.cs` | `.volume` JSON ⟷ profile by TYPE-NAME + per-param name, legacy remaps, unknown→warn-skip | feature-list serialization by type-name + decorated members (reuse `ComponentReflection`, the scene serializer already does this for Behaviours — see §5 D3) |
+| `[Range]`/`[Tooltip]`/`[ShowIf]`… | `Engine/Attributes/EditorAttributes.cs` (+ `ConditionalAttributes.cs`) | plain `System.Attribute`, ZERO ImGui/GL/DX12, editor-only interpretation | features decorate params with the SAME attributes — they render through the existing `DrawerPipeline` for free |
+| `DrawerRegistry` / `IInspectorGui` / decorator chain | `BallisticEngine.Editor/Panels/Inspector/` | ONE attribute-driven drawer pipeline; new value type = one `ITypeDrawer` | feature params draw through it unchanged; the feature-LIST editor adds a reorderable-list wrapper (URP's feature list UI) — the only new editor widget |
+
+**The load-bearing lesson from the Volume framework: engine-side config is plain reflectable C# with
+zero-ImGui attributes; exactly ONE bridge method crosses to the backend; the editor interprets attributes
+but the engine never references the editor.** Phase 3 copies this seam verbatim.
+
+### 2b. The DX12 graph seam — the MOUNT POINT an authored feature plugs into (verified in code)
+
+- `Dx12RenderPassEvent` (`BallisticEngine.DX12/Resources/Dx12RenderPassEvent.cs`) — enum spaced by 50,
+  **explicitly designed** (its own comment) so "a feature/custom pass can slot at `Event + 1`". An authored
+  feature's injection point maps 1:1 onto this enum. This is THE reason the spacing exists.
+- `IRenderPass` (Event/Name/Enabled/Resize/Record/`Declare`) — the contract the backend adapter implements
+  on behalf of an authored feature. `Declare(builder)` is the phase-2 bridge a feature uses to participate
+  in cull/alias/auto-barrier.
+- `Dx12FrameContext` (by-ref mutable; `SceneColor` mutable mid-frame) — the per-frame state a feature reads.
+  **R8 already protects it**: read-only fields are `init`-only, only `SceneColor`/`GiMode`/etc. are settable
+  — so an authored feature physically cannot reassign `ctx.View`. This was designed FOR phase 3.
+- `Dx12RenderGraph.Add(pass)` — registration-order = stable tiebreak. Built-ins are added in
+  `DX12HDRenderer` ctor (lines 558-620: deferred, ssao, sky, ap, fog, transparents, gi, reflections, taa,
+  fsr, composite, cullProbe). A feature is just one more `graph.Add` BEFORE `graph.Build()` — the compiler
+  treats it identically.
+- `Dx12PassBuilder` — `Read/Write/ReadWrite/Touch/AllowCulling/DeriveBarriers/Use`. An authored feature
+  declares against CANONICAL named handles (`Resource("SceneColor")`) so a DAG edge forms with the built-ins.
+
+**Conclusion: the graph needs ZERO new plumbing to host a feature.** Phase 3 is purely (1) an engine-side
+authoring layer and (2) one backend bridge that builds an `IRenderPass` adapter from each authored feature
+and `graph.Add`s it. The hard 80% (the graph) is already done.
+
+---
+
+## 3. The engine-vs-backend seam (DECISION — the load-bearing architecture call)
+
+**Decision: the `[RenderFeature]` attribute + the `RenderFeature` base class + its param/event/declared-IO
+model live ENGINE-SIDE (a new `Engine/Rendering/RenderFeatures/` folder + the attribute in
+`Engine/Attributes/`), with ZERO reference to `BallisticEngine.DX12`. The DX12 backend INTERPRETS them.**
+
+Rationale (mirrors the Volume + EditorAttributes + HDRenderer precedents exactly):
+- `Engine/Attributes/*.cs` are plain `System.Attribute` with primitive args, zero ImGui/GL/DX12 — "so the
+  engine source stays free of editor/renderer dependencies" (file header). `[RenderFeature]` joins them.
+- The Volume framework is entirely engine-side; only `VolumePostProcessing.Apply` knows the renderer's
+  `PostProcessSettings`. The HDRenderer abstraction (`Abstraction/Rendering/Renderer/HDRenderer.cs`) is the
+  engine↔backend contract; DX12HDRenderer is the backend impl. Phase 3's bridge is the analogue.
+- A GAME must be able to author a render feature **without referencing `BallisticEngine.DX12`** (game
+  scripts compile into `GameScripts.dll` against the engine library only — see CLAUDE.md "Game scripting").
+  So the authoring surface CANNOT live in the DX12 assembly.
+
+**The seam, concretely:**
+```
+Engine (BallisticEngine.csproj — what a game references):
+  Engine/Attributes/RenderFeatureAttribute.cs        [RenderFeature("Name", Menu=…)]  — plain System.Attribute
+  Engine/Rendering/RenderFeatures/RenderFeature.cs    abstract base: Active, Event(enum), declared reads/writes
+  Engine/Rendering/RenderFeatures/RenderPassEvent.cs  ENGINE-SIDE event enum (mirrors Dx12RenderPassEvent values/order)
+  Engine/Rendering/RenderFeatures/RenderFeatureManager.cs  gathers the active authored set per frame (no blend)
+  Engine/Rendering/RenderFeatures/IFeaturePassRecorder.cs  the abstract recording surface a feature's Record() calls
+        — backend-agnostic command verbs (Blit/SetRenderTarget/DrawFullscreen/Dispatch…); the engine never
+          sees a DX12 type. (URP's CommandBuffer analogue; the abstraction that keeps the feature portable.)
+
+Backend (BallisticEngine.DX12 — interprets the engine config):
+  Resources/Dx12RenderFeatureBridge.cs   the ONE bridge: for each active RenderFeature, build a
+        Dx12FeaturePassAdapter : IRenderPass and graph.Add it (mirrors VolumePostProcessing.Apply).
+  Resources/Dx12FeaturePassAdapter.cs     IRenderPass impl: maps RenderFeature.Event→Dx12RenderPassEvent,
+        Enabled→feature.Active, Declare→feature's declared reads/writes against canonical handles, and
+        Record→drives the feature.Record(IFeaturePassRecorder) through a Dx12 impl of IFeaturePassRecorder.
+
+Editor (BallisticEngine.Editor — interprets the attributes, never referenced by engine):
+  the existing DrawerPipeline draws feature params; ONE new reorderable-list widget for the feature list.
+```
+
+**Why an abstract `IFeaturePassRecorder` and not "the feature gets the Dx12FrameContext":** if a feature
+received `Dx12FrameContext` it would have to reference `BallisticEngine.DX12` → a game couldn't author one,
+defeating the whole point. The recorder is the backend-agnostic verb surface (the URP `CommandBuffer`
+role). The first chunks ship a DELIBERATELY MINIMAL recorder (just enough for a "blit/tint SceneColor"
+proof feature); the verb set GROWS per concrete feature need, never speculatively (subtract-complexity
+doctrine). This is the single biggest design risk and is sequenced FIRST (chunk 19) precisely so the seam
+is proven on a trivial feature before any real one is built.
+
+---
+
+## 4. The whole-phase invariant (the gate every chunk inherits from phases 1+2)
+
+**PIXEL-NEUTRAL DEFAULT = "no `[RenderFeature]` registered ⇒ today's pipeline byte-identical to the frozen
+golden set."** This is the same posture phase 2 used (phase 2 flipped from "free to change the look" to
+"pure architecture, must not move a pixel"). Phase 3 adds an opt-in surface; the default frame must not
+change. Verification per chunk that lands renderer/engine code:
+
+- **(a) Deterministic golden gate** — `bash e:/tmp/chunk15/matrix.sh "<door env>" <tag>` → 15 rows
+  SHA==golden, run under ALL 4 door states (default-off, `GRAPH=1`, `GRAPH+GRAPH_BARRIERS`, `+GRAPH_ALIAS`).
+  `bal render` is the golden oracle (forces DETERMINISTIC; the deterministic HALF only — R-NEW-9).
+- **(b) GBV 0-NEW** — Runtime.exe direct, `BALLISTIC_DX12_DEBUG=1 BALLISTIC_DX12_GBV=1
+  BALLISTIC_DX12_BREAK_ON_ERROR=1`, CornellBox + BistroInterior, alias off+on → exit 0 + "0 NEW
+  (0 error-class)" vs `Docs/Validation/dx12-gbv-baseline.json`. (NEVER GBV+FSR together — 18GB hang.
+  NEVER set `ID3D12Resource.Name` — changes GBV signature.)
+- **(c) regime-(b) boiling** — ONLY for a chunk that touches history/TAA/FSR (no phase-3 chunk should, until
+  a feature explicitly injects a temporal pass): motion-dump + `Docs/Validation/dx12-boiling-metric.py`,
+  BistroInt frozen band 29.961352 within 0.5%.
+- **Once a real feature exists**, ADD a positive test: register a trivial feature (the proof "tint" feature)
+  and assert (i) it visibly changed the frame in the expected region (the feature WORKS), and (ii) removing
+  it returns byte-identical to golden (the feature is CLEANLY removable / pixel-neutral when off). This is
+  the phase-3-specific oracle the golden set alone can't give (golden = no-feature only).
+
+**One commit = one intent** (move vs visual fix separate); GPU-hang safety absolute (never relaunch-loop;
+RT_GI/RT_SHADOWS off — pre-existing device-removal, not phase-3's to fix). Build/DLL dance if code lands:
+`dotnet build DX12 → Runtime → Cli`, copy `BallisticEngine.DX12.dll` into BOTH Cli AND Runtime bins.
+
+---
+
+## 5. Open design decisions (resolved here so the sub-chunks are unambiguous)
+
+- **D1 — feature LIST vs set.** URP allows the same feature type added MULTIPLE times (e.g. two blur passes
+  at different events). So the authored container is an ORDERED LIST, not a ≤1-per-type set like
+  `VolumeProfile`. Serialize as an ordered array of `{type-name, members, enabled}`.
+- **D2 — where the feature list lives.** **Decision: a `SceneBehaviour` (`RenderFeatures`/the scene's
+  "Renderer" config), not an entity component.** Rationale: render features are a renderer/scene-wide
+  concern (like `SceneLighting`/`Skybox`), not per-entity; `SceneBehaviour` already has its own registry
+  (`ComponentRegistry.SceneMenu`) + the editor's "Scene" tab + `static Active` read-per-frame pattern (the
+  same pattern the renderer uses today). The feature list is read once per frame by the manager, exactly
+  like the renderer reads `Skybox.Active`. (URP keeps features on the Renderer asset; a `SceneBehaviour` is
+  this engine's closest analogue. Revisit only if per-camera feature sets become a need.)
+- **D3 — feature param serialization.** **Reuse `ComponentReflection` + the scene YAML path** (it already
+  serializes Behaviour public props/fields, asset refs as guids — CLAUDE.md "Scenes & components"). A
+  feature is reflection-shaped just like a Behaviour, so its members serialize for free; the feature-LIST
+  is an ordered list of `{type-name (via `FeatureNameOf`), members}`. Do NOT invent a parallel JSON loader
+  unless a feature needs the asset-sharing the `.volume` path gives (it doesn't — features are scene-local
+  per D2). Legacy-rename map kept available for future renames (the Volume loader's pattern).
+  - **SHIPPED (chunk 21) — the polymorphic-list seam lives INLINE in `SceneSerializer`.** The
+    `List<RenderFeature>` member is special-cased in `SerializeValue`/`DeserializeValue` by ELEMENT TYPE
+    (`IsRenderFeatureList`), exactly alongside the existing `BObject`/`BEvent`/`AnimationCurve` cases — NOT a
+    new loader and NOT a member-name special-case. On-disk shape:
+    `{type: <FeatureNameOf>, active: <bool>, members: {<reflected>}}` per entry, ordered; `active` is a
+    top-level key (excluded from `members`), `members` omitted when empty; nested members reuse `ApplyMembers`
+    (asset refs as guids included); unknown type → warn+skip with order preserved. The generic
+    `ComponentReflection` member-writer CAN'T do this (a `List<abstractType>` has no type discriminator) — so
+    the scene serializer owns it, the same as every other non-primitive member type. (Full status: §6
+    chunk-21.) Caveat learned: a SceneBehaviour's own `id:` is not restored on load (pre-existing, all
+    SceneBehaviours); the feature LIST is byte-stable regardless.
+- **D4 — what the FIRST verb set is.** Minimal: `BlitFullscreen(sourceHandle, destHandle, materialOrShader)`
+  + `SetRenderTarget(handle)` + read access to `SceneColor`. Just enough for the chunk-19 proof feature
+  (tint/invert SceneColor). Every later verb is added on a concrete feature's demand, logged in this doc.
+  - **SHIPPED (chunk 19) — split into TWO backend-agnostic surfaces** (the declare side is NOT the same as
+    the record side): `IFeaturePassRecorder` = { `string SceneColor {get;}`, `SetRenderTarget(string)`,
+    `BlitFullscreen(string src, string dst, string shaderOrMaterial=null)` } (the RECORD-time verbs); and a
+    NEW `IFeatureIOBuilder` = { `Read(string)`, `Write(string)`, `ReadWrite(string)`,
+    `RequestScratch(string roleName)→string`, `AllowCulling(bool)` } (the DECLARE-time verbs `RenderFeature.Declare`
+    uses). Reason for the split: the design (§3) said `Declare` must be engine-agnostic too (string handle
+    names, NOT `Dx12PassBuilder`) — so it needs its own backend-neutral builder interface, parallel to the
+    recorder. Both are string-handle-keyed; the chunk-20 DX12 adapter implements both and maps names→graph
+    handles / `Dx12PassBuilder` reads-writes.
+  - **CHUNK 20 — NO verb growth needed.** The chunk-19 D4 verb set drove the full SceneColorTint proof
+    end-to-end with NOTHING added. The DX12 backend handle map currently resolves ONLY `"SceneColor"`
+    (unknown→throw) and the only `BlitFullscreen` shader implemented is `"SceneColorTint"` (in-place RMW; a
+    plain copy when shader==null) — both grow on a concrete feature's demand, logged here. The recorder
+    ping-pongs through a private HDR scratch (Dx12FeatureBlitter) so src==dst==SceneColor is legal without the
+    feature minting scratch.
+- **D5 — default `Active`/removability.** A feature defaults `Active=true` when added (URP parity), but the
+  WHOLE layer is inert until a `RenderFeatures` SceneBehaviour with ≥1 feature exists in the scene — so the
+  golden scenes (which have none) are untouched. The manager early-outs on empty exactly like
+  `VolumeManager.Update` early-outs on `volumes.Count == 0`.
+- **D6 — culling/aliasing/barriers for an authored feature.** A feature's adapter declares reads/writes →
+  it participates in V1 cull (only if it opts in via `AllowCulling`, default OFF — same safety default), V2
+  aliasing (its scratch targets can be pooled if it requests transient ones), V3 auto-barriers (it can opt
+  into `DeriveBarriers`/`Use`, else its adapter emits manual head transitions). DEFAULT: opaque-ish — a
+  feature that declares nothing is an opaque node (never culled, manual barriers) — the safe escape hatch,
+  identical to an un-migrated built-in. Aggressive participation is opt-in per feature.
+
+---
+
+## 6. Sub-chunk plan (chunk 19 onward — one chat each, same handoff discipline)
+
+Each sub-chunk = ONE intent, ends with a handoff prompt, gated by §4. Ordered safest→riskiest; the seam is
+proven on a trivial feature BEFORE any real feature is built (the chunk-18 risk call).
+
+- **Chunk 19 — engine-side scaffold (PIXEL-NEUTRAL, no backend wiring yet). ✅ DONE.** Add the engine-side
+  authoring surface ONLY: `[RenderFeature]` attribute (`Engine/Attributes/`), `RenderFeature` abstract base +
+  `RenderPassEvent` enum + `RenderFeatureManager` + `IFeaturePassRecorder` (`Engine/Rendering/RenderFeatures/`),
+  the `RenderFeatures` SceneBehaviour (D2), and the `ComponentRegistry` branch (`RenderFeatureMenu`/
+  `ResolveFeature`/`FeatureNameOf`). NOTHING calls into the backend yet; no `IRenderPass` is built. Gate:
+  the engine compiles, `ComponentRegistry.Build` discovers a sample feature type, the slnx builds 0-err,
+  editor 0-err, and **golden 15/15 + GBV 0-NEW are untouched** (no renderer code changed → trivially holds,
+  but RUN it to prove the new types didn't perturb bootstrap). Commit. (Pure additive engine scaffold — the
+  Volume-framework analogue of "the classes exist, nothing renders yet".)
+  - **WHAT SHIPPED (8 new files + 2 edits):** `Engine/Attributes/RenderFeatureAttribute.cs`
+    (`[RenderFeature("Name", "Menu")]`, `HideFromAddMenu`; mirrors `ComponentAttribute` — `Menu` is a ctor
+    POSITIONAL arg, NOT a named arg: getter-only props can't be named attr args → CS0617, the design's
+    `Menu=…` shorthand was illustrative). `Engine/Rendering/RenderFeatures/`: `RenderPassEvent.cs`
+    (16 members, 0..750, **textually identical** to `Dx12RenderPassEvent` — verified by diff; INVARIANT to
+    keep in lock-step), `RenderFeature.cs` (abstract: `Active` def-true, `virtual Event`=PostProcess,
+    `virtual Declare(IFeatureIOBuilder)` default-empty=opaque escape hatch, abstract `Record(IFeaturePassRecorder)`;
+    params are PLAIN decorated members — NO VolumeParameter, the §2a divergence), `IFeaturePassRecorder.cs`
+    (D4 minimal verbs: `string SceneColor {get;}` + `SetRenderTarget(name)` + `BlitFullscreen(src,dst,shaderOrMaterial?)`),
+    `IFeatureIOBuilder.cs` (engine-agnostic declare surface — `Read/Write/ReadWrite/RequestScratch/AllowCulling`,
+    string handle names, NOT `Dx12PassBuilder`; the backend adapter translates these → `Dx12PassBuilder` in
+    chunk 20), `RenderFeatureManager.cs` (static; `Gather()` returns the active-in-order count, early-outs on
+    no/empty/inactive `RenderFeatures.Active`; `Reset()` ALC-reload hook), `RenderFeatures.cs` (SceneBehaviour,
+    `static Active`, `List<RenderFeature> Features`), `Builtin/SceneColorTintFeature.cs` (the discoverable sample
+    — Tint/Strength plain members, NOT placed in any scene). **Edits:** `ComponentRegistry.cs` (parallel
+    `featureByName`/`featureMenu` + `RenderFeatureMenu`/`ResolveFeature`/`FeatureNameOf` + `RegisterFeature`
+    reading `[RenderFeature]`/`HideFromAddMenu`), `EngineBootstrap.ReloadGameScripts` (`RenderFeatureManager.Reset()`
+    next to `VolumeManager.ResetStack()`).
+  - **D4 verb set as of chunk 19** (grow per concrete feature, log here): RECORDER = { `SceneColor` (read
+    accessor), `SetRenderTarget(handleName)`, `BlitFullscreen(src,dst,shaderOrMaterial?)` }; IO-DECLARE =
+    { `Read`, `Write`, `ReadWrite`, `RequestScratch(roleName)→name`, `AllowCulling(bool)` }. (NEW DESIGN FACT:
+    the engine-agnostic DECLARE surface is split into its own `IFeatureIOBuilder` so `RenderFeature.Declare`
+    never names `Dx12PassBuilder` — the §3 seam needs a backend-neutral declare verb just as it needs a
+    backend-neutral record verb.)
+  - **VERIFIED:** slnx 0-err (editor incl.); scratch harness `bal-feature-test` 16/16 PASS (menu entry +
+    DisplayName/Menu, `ResolveFeature` round-trip + unknown/null→null, `FeatureNameOf` round-trip, abstract base
+    excluded, `Active` def-true, `Event`=PostProcess, enum 16@0..750, `Gather()`==0 with no host); enum diff
+    vs `Dx12RenderPassEvent` empty; golden 15/15 × {default, GRAPH=1, GRAPH+BARRIERS}; GBV CornellBox
+    `8 known, 0 NEW (0 error-class)`.
+
+- **Chunk 20 — the backend BRIDGE + adapter + the PROOF feature (the seam test). ✅ DONE (commits c58ef059
+  backend + f4c8474f proof door).** Shipped (5 new DX12 files + 1 shader + 2 edits, all in BallisticEngine.DX12,
+  + 1 engine test-door):
+  - `Resources/Dx12FeaturePassAdapter.cs` — `IRenderPass` wrapping ONE `RenderFeature`:
+    `Event=(Dx12RenderPassEvent)(int)feature.Event`, `Name=GetType().Name`, `Enabled=feature.Active`,
+    `Declare`→runs `feature.Declare` through `Dx12FeatureIOBuilder`, `Record`→binds the shared recorder to
+    `ctx`+feature then drives `feature.Record`. A feature that declares nothing = opaque node.
+  - `Resources/Dx12FeatureIOBuilder.cs` — `IFeatureIOBuilder` impl: string handle names →
+    `Dx12PassBuilder.Read/Write/ReadWrite` against the canonical graph handle of the same name (so
+    `"SceneColor"` shares identity with the built-ins → a real DAG edge). `RequestScratch` namespaced
+    `Feature.<type>#<idx>.<role>.<n>` (imported:false); `AllowCulling`→builder opt-in.
+  - `Resources/Dx12FeaturePassRecorder.cs` — `IFeaturePassRecorder` impl: `SceneColor` name accessor;
+    `Resolve(name)` maps `"SceneColor"`→`ctx.SceneColor` (only handle mapped today, D4 — unknown→throw);
+    `BlitFullscreen(src,dst,"SceneColorTint")`→routes to the blitter; `SetRenderTarget`→validate-only.
+  - `Resources/Dx12FeatureBlitter.cs` — the proof feature's GPU work: rootsig/PSO/CB/heap + an HDR scratch.
+    Tints SceneColor IN PLACE by `CopyColorFrom(SceneColor)→scratch` then a full-screen tint pass samples the
+    scratch and writes back (a RT can't be sampled+rendered at once). `Strength=0`→passthrough.
+  - `Resources/Dx12RenderFeatureBridge.cs` — the ONE bridge (mirrors `VolumePostProcessing.Apply`):
+    `RenderFeatureManager.Gather()`; rebuild the graph's feature segment ONLY when the active set changes
+    (`graph.SetFeaturePasses`→re-Build+Compile); no-op for feature-free scenes. Called once in `BeginRender`
+    after the volume bridge, BEFORE `graph.Execute`.
+  - `Shaders/SceneColorTint.hlsl` — `lerp(c, c*Tint, Strength)` in HDR-linear before composite.
+  - **Edits:** `Dx12RenderGraph` (`MarkCoreBoundary()` snapshots the built-in count; `SetFeaturePasses(features)`
+    truncates to the boundary, appends adapters, re-Build+Compile — empty list = exact built-in graph);
+    `DX12HDRenderer` (MarkCoreBoundary after the built-in Add's; create blitter/recorder/bridge at Initialize;
+    `featureBridge.Apply()` per frame before Execute; `featureBlitter.Resize` fan-out).
+  - **Proof door (engine-side, default OFF):** `RenderFeatureManager.Gather` injects ONE `SceneColorTintFeature`
+    (magenta 1.0/0.25/0.6) when `BALLISTIC_DX12_FEATURE_TINT_TEST=1` and no host exists — so the seam is
+    exercised end-to-end WITHOUT chunk-21 YAML round-trip. Inert when unset.
+  - **WHERE the bridge mounts (the chunk-20 decision):** built-ins are added + `graph.MarkCoreBoundary()` + Build
+    + Compile ONCE at Initialize; the bridge re-`SetFeaturePasses` (re-Build+Compile) ONLY when the active-feature
+    SET changes (compare by instance ref + order — a param-only edit does NOT rebuild). Cheap CPU recompile, rare.
+  - **VERIFIED:** slnx 0-err (editor incl.); SceneColorTint.hlsl embedded in DX12+Runtime+Cli bins. (i) PIXEL-NEUTRAL
+    DEFAULT — golden 15/15 SHA==golden under default / GRAPH=1 / GRAPH+GRAPH_BARRIERS; GBV CornellBox+BistroInterior
+    alias off+on = exit 0, 0 NEW (0 error-class). (ii) POSITIVE+REMOVABILITY — BistroInterior tint-door ON tints
+    magenta (per-channel R x1.0 / G x0.25 / B x0.6; meanAbsDiff 10.50/255); tint-door OFF byte-identical to golden
+    (40a68b28de4aa294fb); GBV with the feature ACTIVE on BistroInterior+CornellBox = exit 0, 0 NEW.
+
+- **Chunk 21 — serialization round-trip (D3). ✅ DONE.** The `RenderFeatures` SceneBehaviour's feature
+  list now serializes/deserializes through the scene YAML.
+  - **WHERE it lives (the decision):** INLINE in `SceneSerializer` (NOT a parallel JSON loader, NOT a per-
+    member special-case keyed by name). The polymorphic `List<RenderFeature>` is handled generically by the
+    ELEMENT TYPE in `SerializeValue`/`DeserializeValue` — exactly alongside the existing `BObject`/`BEvent`/
+    `AnimationCurve`/`ColorGradient` inline special cases. This fits the architecture: the generic
+    `ComponentReflection` member-writer can't round-trip a `List<abstractType>` (no type discriminator), so
+    the scene serializer special-cases it the same way it already special-cases every other non-trivial
+    member type. Any future `List<RenderFeature>` member round-trips for free (it's keyed on the type, not
+    the member name).
+  - **SHAPE (a NEW serialization fact for §5 D3):** the list serializes as an ORDERED YAML list of
+    `{type: <FeatureNameOf>, active: <bool>, members: {<reflected props/fields>}}`. `Active` is a TOP-LEVEL
+    key (mirrors `ComponentDocument.Enabled`) and is EXCLUDED from the reflected `members` set so it isn't
+    duplicated. `members` is omitted when empty. The nested map/list is the same `Dictionary<string,object>`
+    shape `ComponentDocument.Members` already uses, so YamlDotNet serializes it natively + the OpenTK/
+    System.Numerics converters fire for Vector3 members. Deserialize resolves each `type` via
+    `ResolveFeature`, `Activator.CreateInstance`s it, applies `active`, and runs the nested `members` through
+    the SAME `ApplyMembers` path a Behaviour uses (so a feature's params deserialize identically to a
+    component's, asset refs included). UNKNOWN type-name → `Debugging.LogWarning` + SKIP, order of the
+    survivors preserved (Volume-loader parity — a scene authored with a since-deleted feature still loads).
+  - **PRE-EXISTING (not chunk-21's): a SceneBehaviour's own `id:` is NOT restored on deserialize**
+    (`DeserializeCore`'s SceneComponents path never sets `behaviour.InstanceId`; only ENTITY components do,
+    via `ApplyComponent`). So a save→load→save churns the `RenderFeatures` host's `id:` line — but this is
+    orthogonal to the feature list and affects EVERY SceneBehaviour equally. The feature list itself
+    (type/active/members/order) is byte-stable across the round-trip. (Fixing the SceneBehaviour-id
+    restoration is out of scope here; flagged for a future chore if it ever matters.)
+  - **The proof door is RETAINED (the call documented):** `BALLISTIC_DX12_FEATURE_TINT_TEST` stays in
+    `RenderFeatureManager.Gather` (default-OFF, pixel-neutral). It's a useful no-scene seam smoke-test and
+    golden held 15/15 either way, so keeping it is the lower-risk choice. The serialized path is now the
+    PRIMARY proof (a real authored scene reproduces the feature without the door).
+  - **VERIFIED:** slnx 0-err (editor incl.); engine root + Runtime + Cli bins refreshed (no .hlsl touched).
+    (i) ROUND-TRIP — in-process harness `bal-feature-rt-test` 18/18 PASS: a 2-feature `RenderFeatures` host
+    saves as the `{type,active,members}` list; save→load→save reproduces the feature list byte-for-byte
+    (order + Vector3 + float + Active=false all preserved); an unknown type between two real ones warns+skips
+    without throwing (2 of 3 survive, order kept); a feature-free scene has NO `features:` key (golden
+    untouched). (ii) PIXEL-NEUTRAL DEFAULT — golden 15/15 SHA==golden under default AND `GRAPH=1`; golden
+    BistroInterior_Wine still `40a68b28de4aa294fb`. GBV CornellBox+BistroInterior alias off+on = exit 0, 0
+    NEW (0 error-class). (iii) POSITIVE (serialized, no door) — a throwaway `BistroInterior_FeatureTest`
+    scene authoring `RenderFeatures`→`SceneColorTintFeature` (tint 1/0.25/0.6, strength 0.6) rendered a
+    DIFFERENT SHA (`b21a042db0ed320164`) from golden with the expected magenta direction (R x1.006 / G x0.777
+    / B x0.888 post-tonemap, meanAbsDiff 5.22) — the seam now runs from a SERIALIZED feature, env door unused;
+    GBV on that scene = exit 0, 0 NEW. (Throwaway scene deleted after the proof — kept OUT of golden.) Commit.
+
+- **Chunk 22 — editor: the reorderable feature-list UI. ✅ DONE.** The ONE new editor widget on the
+  `RenderFeatures` SceneBehaviour inspector (add/remove/reorder/enable-toggle), all mutations through the
+  existing `EditorUndo` + `MarkViewportDirty` path. The feature params draw through the SAME
+  attribute-driven `DrawMemberList`/`DrawerPipeline` a component uses (attributes free — no per-feature
+  widget code).
+  - **WHERE it lives (2 edits, NO new files):**
+    - `Engine/Rendering/RenderFeatures/RenderFeatures.cs` — `Features` gains `[HideInInspector]` so the
+      GENERIC reflected member list skips it (a `List<abstractType>` has no sensible default drawer); the
+      dedicated widget renders it instead. **Serialization is UNAFFECTED** — the scene serializer drives off
+      `SerializableMembers` (which IGNORES `[HideInInspector]`) + the chunk-21 `IsRenderFeatureList`
+      element-type path, NOT `InspectorMembers`. (Re-ran the chunk-21 round-trip harness `bal-feature-rt-test`
+      18/18 PASS to prove it: the `features:` list still byte-stable, feature-free scene still has no
+      `features:` key.)
+    - `BallisticEngine.Editor/Panels/InspectorPanel.cs` — `DrawSceneBehaviourInspector` calls the new
+      `DrawRenderFeatureList(RenderFeatures)` when the selected SceneBehaviour is a `RenderFeatures`, after
+      the generic member list. The widget: a `SeparatorText("Render Features")` then one collapsible card
+      per feature (Active checkbox → `feature.Active`/Enabled→graph rebuild via the chunk-20 bridge; display
+      name from `RenderFeatureMenu`; ^/v reorder small-buttons bounds-disabled at the edges; a red trash
+      remove). Structural changes (remove/reorder) are DEFERRED to after the per-feature loop (no
+      mid-iteration list mutation) and tuple-swap/RemoveAt with `EditorUndo`. The open card draws the
+      feature's params via `DrawMemberList(feature.GetType(), feature)` (shared DrawerPipeline). Below: an
+      "Add Feature" button → a search popup mirroring `DrawAddComponentPopup` over
+      `ComponentRegistry.RenderFeatureMenu`, `Activator.CreateInstance`→`RenderFeature`, appended (DUPLICATES
+      ALLOWED — URP parity, §5 D1, no "already present" filter). `PushID(i)` per feature namespaces ids so
+      two same-type features don't collide.
+  - **GOTCHA (Hexa.NET.ImGui binding):** `ImGui.GetWindowContentRegionMax()` does NOT exist in this binding —
+    right-align via `SetCursorPosX(GetCursorPosX() + GetContentRegionAvail().X - btnW*3 - 8)` after a
+    `SameLine` (the same idiom `DrawLockBar` uses), not the content-region-max API.
+  - **VERIFIED (editor-only → golden unaffected):** slnx 0-err (editor included). The ONLY engine-side change
+    is the inert `[HideInInspector]` attribute, which the renderer never reads → the deterministic frame is
+    untouched. Golden **30/30** SHA==golden (the full 15-row matrix under BOTH `default` AND `GRAPH=1` doors).
+    Serialization round-trip 18/18 (above). No `.hlsl`/DX12-backend touched, so GBV is unchanged by
+    construction (no renderer/barrier code in this chunk). Per gpu-hang-safety the live editor was NOT
+    launched in a loop; the widget compiles clean and follows the proven `DrawAddComponentPopup` idiom
+    verbatim. Commit.
+
+- **Chunk 23 — phase-3 DoD + acceptance doc + (optionally) one REAL example feature. ✅ DONE.** Wrote
+  `dx12-passgraph-phase3-done.md`: the seam is proven, a feature is authorable without referencing DX12,
+  discovered/serialized/editor-reorderable, participates in the graph (declare→cull/alias/barriers), and the
+  no-feature default is byte-identical to golden under all gates.
+  - **ACCEPTANCE (the doc, §1):** all FIVE §7 DoD items met with delivering commits + oracle —
+    1 discovered (chunk 19 `6c25ce6e`), 2 authored (chunk 19 + 22 `fc4be698`), 3 serialized (chunk 21
+    `0c30b259`), 4 scheduled (chunk 20 `c58ef059`/`f4c8474f`), 5 pixel-neutral-default (all chunks; the
+    proof feature supplies the positive+removability test the golden set can't).
+  - **OPTIONAL example feature — CONSCIOUSLY DECLINED (doc §2):** the §6 example's only job ("validate the
+    verb set on real work, golden-neutral when absent") is ALREADY met by the shipped `SceneColorTintFeature`
+    (a real `RenderFeature` driving a real DX12 PSO, proven env-door + serialized, inert/golden-neutral when
+    absent). A NEW always-on example would be either pixel-changing (breaks this chunk's golden gate) or inert
+    (redundant with the proof feature) → adds maintained surface for zero proven need (subtract-complexity
+    doctrine). Declined; golden preserved. The authoring path is open + proven for a real game's first custom
+    pass (that feature's verification is its own concern).
+  - **VERIFIED (chunk 23, fresh on the pinned substrate):** build DX12→Runtime (0-err) + DLL→Cli+Runtime bins;
+    `bal render` CornellBox + BistroInterior_Wine under default AND `GRAPH=1` = **4/4 SHA==golden**
+    (`6e3ee554…` / `40a68b28…`); GBV CornellBox (Runtime.exe, `DEBUG=1 GBV=1 BREAK_ON_ERROR=1`) = exit 0,
+    **`8 known, 0 NEW (0 error-class)`**, no device-removal. Doc-only chunk → golden byte-identical by
+    construction. **Phase 3 — and the whole pass-graph migration (phases 1+2+3) — is DONE + ACCEPTED.** Commit.
+
+A sub-chunk that runs long stops, commits what's clean, and the handoff carries the partial state — the
+chat boundary is the rollback boundary. Verb-set growth (D4) and any new design fact are recorded in THIS
+doc + the memory file as discovered.
+
+---
+
+## 7. Definition of done (phase 3)
+
+A game/project can author a `RenderFeature` subclass in `GameScripts.dll` (engine reference ONLY — no
+`BallisticEngine.DX12`), decorate its params with the existing `[Range]/[Tooltip]/[ShowIf]…` attributes,
+and have it:
+1. **Discovered** by `ComponentRegistry.Build` (a `RenderFeatureMenu` entry, resolvable by type-name).
+2. **Authored** into a scene via the `RenderFeatures` SceneBehaviour's reorderable list (add/remove/reorder/
+   enable), edited through the existing attribute-driven `DrawerPipeline`, with `EditorUndo`.
+3. **Serialized** by type-name + members through the scene YAML (`ComponentReflection`), ordered, unknown→
+   warn-skip, round-trip stable.
+4. **Scheduled** by the DX12 graph: the backend bridge builds an `IRenderPass` adapter that maps the
+   feature's event→`Dx12RenderPassEvent`, `Active`→`Enabled`, declared reads/writes→`Declare`, and drives
+   `Record` through a backend-agnostic `IFeaturePassRecorder` — so V1 cull / V2 aliasing / V3 auto-barriers
+   apply to it exactly like a built-in (opt-in, opaque-by-default escape hatch).
+5. **Pixel-neutral by default**: with no `RenderFeatures`/feature present, the pipeline is byte-identical to
+   the frozen golden set across all 4 graph door states + GBV 0-NEW + regime-(b) where applicable. Adding a
+   feature changes pixels ONLY where the feature acts; removing it returns to golden.
+
+The engine↔backend↔editor seam is the Volume-framework seam (engine-side config + zero-ImGui attributes +
+ONE backend bridge + editor interprets attributes), now applied to the render graph instead of post-fx.
+Lumen untouched; GPU-hang safety + one-intent-commits + golden-set + GBV gates carried from phases 1+2.

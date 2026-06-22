@@ -20,8 +20,11 @@
       <Compile Remove="BallisticEngine.Profiling.Tracy\**\*.cs" />
       <Compile Remove="BallisticEngine.DX12\**\*.cs" />
       <Compile Remove="BallisticEngine.SourceGen\**\*.cs" />
+      <Compile Remove="BallisticEngine.Tests.Reflection\**\*.cs" />
       <Compile Remove="Tools\**\*.cs" />
       <Compile Remove="SampleProject\**\*.cs" />
+      <Compile Remove="Docs\**\*.cs" />   <!-- validation harnesses (e.g. dx12-resize-harness) are standalone exes, not engine sources -->
+      <Compile Include="SampleProject\Assets\Test.cs" />
     </ItemGroup>
 
     <ItemGroup>

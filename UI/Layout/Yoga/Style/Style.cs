@@ -1,5 +1,3 @@
-using System;
-using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 
 namespace Facebook.Yoga
@@ -39,7 +37,6 @@ namespace Facebook.Yoga
         private readonly StyleValueHandle[] _maxDimensions = new StyleValueHandle[2];
         private StyleValueHandle _aspectRatio;
 
-        // Grid properties
         private GridTrackList _gridTemplateColumns = new GridTrackList();
         private GridTrackList _gridTemplateRows = new GridTrackList();
         private GridTrackList _gridAutoColumns = new GridTrackList();
@@ -254,7 +251,6 @@ namespace Facebook.Yoga
             _pool.Store(ref _minDimensions[YogaEnums.ToUnderlying(axis)], value);
         }
 
-        // Grid Container Properties
         public GridTrackList GridTemplateColumns
         {
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -327,7 +323,6 @@ namespace Facebook.Yoga
             _gridAutoRows[index] = value;
         }
 
-        // Grid Item Properties
         public GridLine GridColumnStart
         {
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -411,8 +406,6 @@ namespace Facebook.Yoga
             get => _pool.GetNumber(_aspectRatio);
             set
             {
-                // degenerate aspect ratios act as auto.
-                // see https://drafts.csswg.org/css-sizing-4/#valdef-aspect-ratio-ratio
                 _pool.Store(ref _aspectRatio,
                     value == 0.0f || float.IsInfinity(value.Unwrap()) ? FloatOptional.Undefined : value);
             }
@@ -650,8 +643,6 @@ namespace Facebook.Yoga
 
         public float ComputeMarginForAxis(FlexDirection axis, float widthSize)
         {
-            // The total margin for a given axis does not depend on the direction
-            // so hardcoding LTR here to avoid piping direction to this function
             return ComputeInlineStartMargin(axis, Direction.LTR, widthSize) +
                    ComputeInlineEndMargin(axis, Direction.LTR, widthSize);
         }
@@ -729,7 +720,6 @@ namespace Facebook.Yoga
             clone._gridRowStart = _gridRowStart;
             clone._gridRowEnd = _gridRowEnd;
 
-            // Deep clone the pool - handles reference indices into the pool
             clone._pool = _pool.Clone();
 
             return clone;

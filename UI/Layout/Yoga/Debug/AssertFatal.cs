@@ -1,5 +1,3 @@
-using System;
-
 namespace Facebook.Yoga.Debug
 {
     public static class AssertFatal

@@ -1,14 +1,7 @@
-using System;
-using System.Collections.Generic;
 using System.Reflection;
 
 namespace BallisticEngine.Editor.Inspector;
 
-// IProperty over a VolumeComponent.ParameterSlot (the volume profile path). The logical ValueType is the
-// parameter's `Value` property type (a VolumeParameter<T> unwrapped to T), so a ClampedFloatParameter
-// routes to the SAME FloatDrawer as a `[Range] float` component member, and an EnumParameter<GiMode> to
-// the same EnumDrawer as a `GiMode` field. Range comes from the Clamped* bounds; the override checkbox
-// and the disabled-unless-overridden gate are the volume GUI adapter's job (HasOverrideToggle = true).
 public sealed class VolumeParamProperty : IProperty {
     readonly VolumeComponent.ParameterSlot slot;
     readonly VolumeComponent owner;
@@ -21,6 +14,8 @@ public sealed class VolumeParamProperty : IProperty {
         valueProp = ValuePropFor(slot.Parameter.GetType());
         ValueType = valueProp.PropertyType;
     }
+
+    public MemberInfo Field => slot.Field;
 
     public string Name => slot.Name;
     public string Label => Attributes.LabelText?.Text ?? InspectorReflection.Prettify(slot.Name);

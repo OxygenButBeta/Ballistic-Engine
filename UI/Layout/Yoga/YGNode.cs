@@ -1,13 +1,3 @@
-// Copyright (c) Meta Platforms, Inc. and affiliates.
-//
-// This source code is licensed under the MIT license found in the
-// LICENSE file in the root directory of this source tree.
-//
-// Original: yoga/YGNode.h, yoga/YGNode.cpp
-
-using System;
-using System.Collections.Generic;
-
 namespace Facebook.Yoga
 {
     /// <summary>
@@ -85,7 +75,6 @@ namespace Facebook.Yoga
 
         public static void YGNodeFinalize(Node node)
         {
-            // In C#, GC handles deallocation. No-op beyond event publishing.
         }
 
         public static void YGNodeReset(Node node)

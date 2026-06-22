@@ -2,18 +2,8 @@ using System.IO.Compression;
 
 namespace BallisticEngine.AssetPipeline;
 
-// Engine-native binary texture, Library\Artifacts\<guid>.btex:
-//   u32 magic 'BTEX' | u32 version | i32 width | i32 height | u8 format | u8 compression
-//   [v2+] i32 mipCount
-//   i64 payloadByteCount | payload
-//
-// Payload is the texel data: raw RGBA8/RGBA32F for uncompressed formats (one level), or the full
-// block-compressed mip chain (largest first) for BC formats. Deflate-compressed when compression == 1.
-//
-// v1 had no mipCount field (always one level, RGBA8/RGBA32F). It is still readable; the importer's
-// version bump regenerates old artifacts to v2 on the next refresh anyway.
 public static class TextureArtifact {
-    const uint Magic = 0x58455442; // "BTEX"
+    const uint Magic = 0x58455442;
     const uint FormatVersion = 2;
 
     public static void Write(string path, in TextureData data, bool compress = true) {
@@ -43,8 +33,6 @@ public static class TextureArtifact {
         return Read(stream, path);
     }
 
-    // Decodes from an already-open stream (e.g. bytes from a mounted content pack). `name` is for
-    // error messages only.
     public static TextureData Read(Stream stream, string name = "<stream>") {
         using BinaryReader reader = new(stream);
 

@@ -1,9 +1,5 @@
 namespace BallisticEngine.AssetPipeline.Loaders;
 
-// .cubemap asset, two forms:
-//   { "version": 1, "faces": { "right": "<ref>", "left": ..., "top": ..., "bottom": ..., "front": ..., "back": ... } }
-//   { "version": 1, "equirect": "<ref to .hdr/.exr/image>", "faceSize": 512 }
-// Face order fed to the GPU: +X (right), -X (left), +Y (top), -Y (bottom), +Z (front), -Z (back).
 public sealed class CubemapDefinition {
     public int Version { get; set; } = 1;
     public Dictionary<string, string> Faces { get; set; } = new();

@@ -4,14 +4,6 @@ using OpenTKMouse = OpenTK.Windowing.GraphicsLibraryFramework.MouseButton;
 
 namespace BallisticEngine.Gameplay.Input;
 
-// The default IInputSource: bridges OUR device enums to the existing Input facade (OpenTK today). The
-// ONE place the OpenTK enum mapping lives (plan §7.2 "wire the backend later") — the DX12 endgame
-// replaces THIS file, not a single action definition. Lives at the Engine layer because it touches both
-// our enums (Abstraction/Input) and the OpenTK-based Input facade (Abstraction/API Bindings); the
-// abstraction seam (IInputSource) stays OpenTK-free.
-//
-// Honors Input.Enabled: Enabled forwards it, and the Input facade methods are themselves gated, so
-// events never fire while the editor has input off (no debug-key leak — §7.2).
 public sealed class EngineInputSource : IInputSource {
     public static readonly EngineInputSource Instance = new();
 
@@ -41,8 +33,6 @@ public sealed class EngineInputSource : IInputSource {
     public float ScrollY => global::Input.ScrollDelta.Y;
 
     public System.Numerics.Vector2 PadStick(PadAxis stick, int player = 0) {
-        // Input.GetLeftStick/GetRightStick return the engine's Vector2; read components so we don't
-        // depend on which Vector2 type the global alias resolves to (System.Numerics vs OpenTK).
         var v = stick switch {
             PadAxis.LeftStick => global::Input.GetLeftStick(player),
             PadAxis.RightStick => global::Input.GetRightStick(player),
@@ -57,7 +47,6 @@ public sealed class EngineInputSource : IInputSource {
         _ => 0f,
     };
 
-    // ---- the mapping tables (the only OpenTK-coupled code in the input system) ---------------------
     static OpenTKKeys MapKey(Key key) => key switch {
         Key.A => OpenTKKeys.A, Key.B => OpenTKKeys.B, Key.C => OpenTKKeys.C, Key.D => OpenTKKeys.D,
         Key.E => OpenTKKeys.E, Key.F => OpenTKKeys.F, Key.G => OpenTKKeys.G, Key.H => OpenTKKeys.H,

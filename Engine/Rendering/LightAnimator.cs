@@ -1,21 +1,12 @@
 
 namespace BallisticEngine;
 
-// Animates a light's intensity (and optionally color) over time — torches/fire (Flicker), neon/alarm
-// pulses (Pulse), or a fully authored loop (Curve). Drives whichever light component sits on the same
-// entity (PointLight or SpotLight). The third adopter of the reusable [[AnimationCurve]] +
-// [[ColorGradient]] primitives, demonstrating they compose anywhere with zero new wiring.
-//
-// The light's authored Intensity/Color are the BASE: the animator multiplies intensity by a 0..1-ish
-// factor and (optionally) tints the color from a gradient. On stop / detach the base is restored, so
-// toggling the animator never corrupts the saved light values (Unity-style). Self-clocked (accumulates
-// its own time) so it's pausable and deterministic.
 [Component("Light Animator", "Rendering")]
 public sealed class LightAnimator : Behaviour {
     public enum Mode {
-        Flicker, // smooth pseudo-random noise — fire, torches, faulty bulbs
-        Pulse,   // sine wave — neon, alarms, breathing glow
-        Curve,   // an authored AnimationCurve looped over Period
+        Flicker,
+        Pulse,
+        Curve,
     }
 
     [Tooltip("How the intensity is animated over time.")]
@@ -43,7 +34,6 @@ public sealed class LightAnimator : Behaviour {
     [Tooltip("Optional color over one normalized Period (tints the light's base color). Empty = base color.")]
     public ColorGradient ColorOverTime { get; set; } = new();
 
-    // The captured base values (the light's authored Intensity/Color), restored on stop.
     float baseIntensity;
     Vector3 baseColor;
     bool captured;
@@ -65,14 +55,12 @@ public sealed class LightAnimator : Behaviour {
         spot = point is null ? GetComponent<SpotLight>() : null;
     }
 
-    // Grabs the light's authored values once, so the animation multiplies a stable base.
     void Capture() {
         if (captured) return;
         if (point is not null) { baseIntensity = point.Intensity; baseColor = point.Color; captured = true; }
         else if (spot is not null) { baseIntensity = spot.Intensity; baseColor = spot.Color; captured = true; }
     }
 
-    // Puts the light back to its authored base (so disabling the animator doesn't strand a dimmed value).
     void Restore() {
         if (!captured) return;
         if (point is not null) { point.Intensity = baseIntensity; point.Color = baseColor; }
@@ -80,8 +68,6 @@ public sealed class LightAnimator : Behaviour {
         captured = false;
     }
 
-    // Public for the editor preview: restore the light to its authored base when preview stops, so the
-    // light isn't stranded at a dimmed/animated value in edit mode.
     public void RestoreBase() => Restore();
 
     protected internal override void Tick(in float delta) {
@@ -89,8 +75,6 @@ public sealed class LightAnimator : Behaviour {
         Apply(clock);
     }
 
-    // Computes + writes the animated intensity/color at absolute time `t`. Public so the editor can
-    // drive a live preview in edit mode (same path as play-mode Tick).
     public void Apply(float t) {
         if (point is null && spot is null) Resolve();
         Capture();
@@ -100,17 +84,15 @@ public sealed class LightAnimator : Behaviour {
         float phase = (t / period) % 1f;
         if (phase < 0f) phase += 1f;
 
-        // 0..1 factor by mode.
         float factor;
         switch (Animation) {
             case Mode.Pulse:
-                // Sine 0..1 (one full cycle per Period).
                 factor = 0.5f + 0.5f * MathF.Sin(phase * MathF.Tau - MathF.PI * 0.5f);
                 break;
             case Mode.Curve:
                 factor = IntensityCurve is { Count: > 0 } ? Math.Clamp(IntensityCurve.Evaluate(phase), 0f, 1f) : 1f;
                 break;
-            default: // Flicker
+            default:
                 factor = FlickerNoise(t * FlickerSpeed / period);
                 break;
         }
@@ -124,8 +106,6 @@ public sealed class LightAnimator : Behaviour {
         else if (spot is not null) { spot.Intensity = baseIntensity * mul; spot.Color = tint; }
     }
 
-    // Smooth value-noise in [0,1] from interpolated hashed lattice points — deterministic (no RNG), so
-    // flicker is reproducible and testable. Two octaves for a natural, non-uniform fire flicker.
     static float FlickerNoise(float x) {
         float n = ValueNoise(x) * 0.65f + ValueNoise(x * 2.37f + 11.3f) * 0.35f;
         return Math.Clamp(n, 0f, 1f);
@@ -135,11 +115,10 @@ public sealed class LightAnimator : Behaviour {
         int i = (int)MathF.Floor(x);
         float f = x - i;
         float a = Hash01(i), b = Hash01(i + 1);
-        float u = f * f * (3f - 2f * f); // smoothstep
+        float u = f * f * (3f - 2f * f);
         return a + (b - a) * u;
     }
 
-    // Deterministic hash of an int -> [0,1).
     static float Hash01(int n) {
         uint h = (uint)n * 2654435761u;
         h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;

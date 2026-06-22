@@ -1,21 +1,11 @@
 
 namespace BallisticEngine;
 
-// One sample along a trail: a world position and the age (seconds) since it was laid down. The GL
-// ribbon pass reads these to build a camera-facing strip that narrows + fades toward the tail.
 public struct TrailPoint {
     public Vector3 Position;
     public float Age;
 }
 
-// A ribbon trail that follows the entity (Unity's TrailRenderer) — bullet tracers, sword swings,
-// rocket/vehicle wakes, light streaks. Each frame it samples the transform position; once it has
-// moved past MinVertexDistance a new point is laid down, points age out after Time seconds, and the
-// component exposes the point history for the GL pass to ribbonize. CPU point management lives here
-// (Engine layer); the camera-facing ribbon mesh is built in OpenGL/GLTrailPass.
-//
-// Driven from the renderer (TrailRenderer.AdvanceAll), like ParticleSystem — so it also previews in
-// the editor and steps exactly once per frame.
 [Component("Trail Renderer", "Effects")]
 public class TrailRenderer : Behaviour, IRibbonSource {
     [Tooltip("Seconds a trail point survives before it fades out of the tail.")]
@@ -58,10 +48,6 @@ public class TrailRenderer : Behaviour, IRibbonSource {
     [Tooltip("Stop laying new points (the existing tail still ages out). For one-shot streaks.")]
     public bool Emitting { get; set; } = true;
 
-    // ---- Point history (runtime-only) ---------------------------------------
-
-    // Newest point is at index 0 (head); the oldest is at the end (tail). A small ring would be
-    // faster, but a list is simple and trails are short; revisit if profiling demands.
     readonly List<TrailPoint> points = new(64);
     bool hasLastSample;
     Vector3 lastSample;
@@ -71,9 +57,9 @@ public class TrailRenderer : Behaviour, IRibbonSource {
 
     protected internal override void OnAttach() {
         if (!RuntimeSet<TrailRenderer>.Contains(this))
-            RuntimeSet<TrailRenderer>.Add(this);   // AdvanceAll iterates trails specifically
+            RuntimeSet<TrailRenderer>.Add(this);
         if (!RuntimeSet<IRibbonSource>.Contains(this))
-            RuntimeSet<IRibbonSource>.Add(this);   // the GL ribbon pass iterates all ribbon sources
+            RuntimeSet<IRibbonSource>.Add(this);
     }
 
     protected internal override void OnDetach() {
@@ -81,15 +67,11 @@ public class TrailRenderer : Behaviour, IRibbonSource {
         RuntimeSet<IRibbonSource>.Remove(this);
     }
 
-    // A trail is renderable once it has at least a segment (2 points).
     public bool IsRenderable => points.Count >= 2;
 
-    // IRibbonSource: the GL ribbon pass reads these.
     bool IRibbonSource.RibbonRenderable => points.Count >= 2;
     RibbonBlendMode IRibbonSource.BlendMode => BlendMode;
     Texture2D IRibbonSource.RibbonTexture => Texture;
-
-    // ---- Per-frame advance --------------------------------------------------
 
     public static void AdvanceAll(float dt) {
         dt = MathHelper.Clamp(dt, 0f, 0.1f);
@@ -101,7 +83,6 @@ public class TrailRenderer : Behaviour, IRibbonSource {
     }
 
     void Advance(float dt) {
-        // Age every point; drop the ones past their lifetime (from the tail).
         for (var i = 0; i < points.Count; i++) {
             TrailPoint p = points[i];
             p.Age += dt;
@@ -121,8 +102,6 @@ public class TrailRenderer : Behaviour, IRibbonSource {
             return;
         }
 
-        // Lay a new head point only once the emitter has moved far enough (keeps the ribbon smooth
-        // and bounded). The newest point always tracks the current position so the head stays attached.
         if (points.Count > 0) {
             TrailPoint head = points[0];
             head.Position = pos;
@@ -134,23 +113,16 @@ public class TrailRenderer : Behaviour, IRibbonSource {
         }
     }
 
-    // Clears the trail (e.g. on teleport, so it doesn't streak across the jump).
     public void Clear() {
         points.Clear();
         hasLastSample = false;
     }
 
-    // ---- Render snapshot ----------------------------------------------------
-
-    // Exposes the point history for the GL ribbon pass (newest first). Width/color are evaluated by
-    // the pass from the normalized tail position; this just hands over positions + ages.
     public IReadOnlyList<TrailPoint> Points => points;
 
     RibbonVertex[] ribbonScratch;
     readonly List<Vector3> positionScratch = new(64);
 
-    // Builds a camera-facing ribbon from the point history (newest = head). Delegates the strip math
-    // to the shared RibbonBuilder; we only flatten our points to positions + pass our width/color.
     public int BuildRibbon(Vector3 cameraPos, out RibbonVertex[] vertices) {
         positionScratch.Clear();
         for (var i = 0; i < points.Count; i++)

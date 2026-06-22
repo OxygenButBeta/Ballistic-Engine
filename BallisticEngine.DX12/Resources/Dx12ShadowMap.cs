@@ -3,11 +3,8 @@ using Vortice.DXGI;
 
 namespace BallisticEngine.DX12;
 
-// Cascaded sun shadow map: a D32_Float depth TEXTURE ARRAY (one layer per cascade) with a DSV per
-// layer (render each cascade's light-space depth) and a single array SRV (sampled with PCF in the
-// opaque shader). DX12's equivalent of the GL GLShadowMap depth-array FBO.
 public sealed class Dx12ShadowMap : IDisposable {
-    public const Format DepthFormat = Format.D32_Float;   // typeless-free path: DSV D32, SRV R32_Float
+    public const Format DepthFormat = Format.D32_Float;
     public int Size { get; }
     public int Cascades { get; }
     public ID3D12Resource Resource { get; }
@@ -23,7 +20,6 @@ public sealed class Dx12ShadowMap : IDisposable {
         Size = size;
         Cascades = cascades;
 
-        // Typeless so the same resource serves a D32 DSV and an R32_Float SRV.
         var desc = ResourceDescription.Texture2D(Format.R32_Typeless, (uint)size, (uint)size,
             arraySize: (ushort)cascades, mipLevels: 1);
         desc.Flags = ResourceFlags.AllowDepthStencil;
@@ -48,7 +44,6 @@ public sealed class Dx12ShadowMap : IDisposable {
             dev.Device.CreateDepthStencilView(Resource, dsvDesc, DsvHandle(c));
         }
 
-        // Array SRV (R32_Float) — the opaque shader samples it as a Texture2DArray with manual PCF.
         srvIndex = Dx12Backend.SrvStore.Allocate();
         var srvDesc = new ShaderResourceViewDescription {
             Format = Format.R32_Float,
@@ -66,14 +61,12 @@ public sealed class Dx12ShadowMap : IDisposable {
     CpuDescriptorHandle DsvHandle(int cascade) =>
         new(dsvHeap.GetCPUDescriptorHandleForHeapStart(), cascade, dsvInc);
 
-    // Bind + clear one cascade's depth layer and record depth-only draws. `record` issues the draws.
     public void RenderCascade(ID3D12GraphicsCommandList4 cl, int cascade,
         System.Action<ID3D12GraphicsCommandList4> record) {
         TransitionTo(cl, ResourceStates.DepthWrite);
         cl.RSSetViewport(0, 0, Size, Size);
         cl.RSSetScissorRect(Size, Size);
         CpuDescriptorHandle dsv = DsvHandle(cascade);
-        // Depth-only: empty render-target span + the DSV.
         cl.OMSetRenderTargets(System.ReadOnlySpan<CpuDescriptorHandle>.Empty, dsv);
         cl.ClearDepthStencilView(dsv, ClearFlags.Depth, 1.0f, 0);
         record(cl);

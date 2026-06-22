@@ -3,15 +3,16 @@ using BallisticEngine;
 
 public static class GraphicAPI
 {
-    public static StandardShader CreateStandardShader(string vertexCode, string fragmentCode)
+    public static StandardShader CreateStandardShader(string vertexCode, string fragmentCode,
+        string identityExtra = null)
     {
-        if (SharedResources<Shader>.TryGetResource(ResourceIdentity.Combine(vertexCode, fragmentCode),
-                out Shader cachedShader))
+        var identity = identityExtra is null
+            ? ResourceIdentity.Combine(vertexCode, fragmentCode)
+            : ResourceIdentity.Combine(vertexCode, fragmentCode, identityExtra);
+        if (SharedResources<Shader>.TryGetResource(identity, out Shader cachedShader))
             return cachedShader as StandardShader;
 
-        // The active backend builds the concrete shader (GL -> GLSL program, DX12 -> HLSL) — no
-        // hardcoded GL type here, so GraphicAPI is backend-agnostic.
-        return RenderAsset.Current.CreateStandardShader(vertexCode, fragmentCode);
+        return RenderAsset.Current.CreateStandardShader(vertexCode, fragmentCode, identityExtra);
     }
     public static HDRenderer Renderer => RenderAsset.Current.Renderer;
 

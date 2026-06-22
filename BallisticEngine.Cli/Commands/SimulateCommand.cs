@@ -5,16 +5,6 @@ using BallisticEngine.Serialization;
 
 namespace BallisticEngine.Cli.Commands;
 
-// `bal simulate <scene> --steps N [--watch ...]` — headless play-mode probe: boots the REAL engine
-// (HeadlessRuntime: scripts compile + load, physics, contact events — everything but rendering),
-// loads the scene, enters play, steps the fixed 60 Hz loop, and samples watched values into a JSON
-// time series. This is the agent's numeric verification channel: assert "the crate lands by step
-// 120" from data instead of staring at screenshots.
-//
-// Watch grammar (repeatable):
-//   --watch Player                          entity world position (the common case)
-//   --watch Player:Rigidbody.Velocity       a component member (any public property/field —
-//                                           runtime-only members like Velocity included)
 internal sealed class SimulateCommand : ICommand {
     public string Name => "simulate";
     public string Summary => "Headless play-mode run with numeric probes.";
@@ -62,7 +52,6 @@ internal sealed class SimulateCommand : ICommand {
         string root = SceneFile.ResolveProjectRoot(sceneAbs);
         int sampleEvery = every ?? Math.Max(1, steps / 100);
 
-        // Engine logs -> stderr (stdout stays JSON); errors are also counted for the report.
         int errorCount = 0;
         var firstErrors = new List<string>();
         Debugging.OnMessage += (message, level) => {
@@ -75,7 +64,6 @@ internal sealed class SimulateCommand : ICommand {
 
         ScriptedInput? scripted = inputPath is null ? null : LoadInputScript(inputPath);
 
-        // Full engine bring-up, no window: scripts compile + load, assets import, physics binds.
         var bootstrap = new EngineBootstrap(new HeadlessRuntime(scripted), root);
         try {
             Scene scene = SceneManager.GetCurrentScene();
@@ -92,19 +80,16 @@ internal sealed class SimulateCommand : ICommand {
 
             const double dt = 1.0 / 60.0;
             foreach (Watch w in watches)
-                w.Sample(0); // initial state before the first step
+                w.Sample(0);
             for (int step = 1; step <= steps; step++) {
                 if (scripted is not null)
-                    scripted.CurrentStep = step - 1; // script steps are 0-based
+                    scripted.CurrentStep = step - 1;
                 bootstrap.UpdateFrame(dt);
                 if (step % sampleEvery == 0 || step == steps)
                     foreach (Watch w in watches)
                         w.Sample(step);
             }
 
-            // Live runtime introspection: a FULL snapshot of each named entity's live component state at the
-            // final step (every public member of every component, not just pre-declared watches) — captured
-            // while still in play so runtime-only values (velocities, script state) are live.
             var snapshots = snapshotSpecs.Count > 0
                 ? snapshotSpecs.Select(spec => SnapshotEntity(scene, spec, steps)).ToList()
                 : null;
@@ -128,7 +113,7 @@ internal sealed class SimulateCommand : ICommand {
             return errorCount == 0 ? 0 : 1;
         }
         finally {
-            JobSystem.Shutdown(); // scheduler workers are foreground threads — without this we hang
+            JobSystem.Shutdown();
         }
     }
 
@@ -139,8 +124,6 @@ internal sealed class SimulateCommand : ICommand {
         int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out int v)
             ? v : throw new CliUsageException($"{flag} expects an integer (got '{s}')");
 
-    // Parses the JSON input script (see Usage) into a ScriptedInput timeline. Key/button names are
-    // the OpenTK enum names ("W", "Space", "LeftShift", "Left"/"Right" for mouse), case-insensitive.
     static ScriptedInput LoadInputScript(string path) {
         if (!File.Exists(path))
             throw new Exception($"input script not found: '{path}'");
@@ -182,12 +165,6 @@ internal sealed class SimulateCommand : ICommand {
         static int To(JsonElement e) => e.TryGetProperty("to", out JsonElement v) ? v.GetInt32() : int.MaxValue;
     }
 
-    // One watched value: an entity's world position, or any public property/field on one of its
-    // components (NOT limited to serializable members — runtime-only state like Velocity is the
-    // whole point of probing).
-    // Full live-state snapshot of one entity at the current step: transform + every public member of every
-    // component, read by reflection (the introspection surface — "read any component's live values during
-    // play"). Reuses SceneFile.ToJsonValue so vectors/enums/asset refs serialize consistently with watches.
     static object SnapshotEntity(Scene scene, string entityName, int step) {
         Entity? entity = scene.Entities.FirstOrDefault(e =>
             string.Equals(e.Name, entityName, StringComparison.OrdinalIgnoreCase));
@@ -198,14 +175,10 @@ internal sealed class SimulateCommand : ICommand {
         }
 
         const BindingFlags flags = BindingFlags.Public | BindingFlags.Instance;
-        // Only flatten values ToJsonValue can render to a scalar/vector — primitives/enums/strings + the
-        // Vector*/Quaternion types. Engine REFERENCE values (Entity/Transform/Behaviour back-pointers, asset
-        // handles) would recurse into a cycle (Entity.transform.Entity.transform...), so they're surfaced as a
-        // short "<Type>" marker, not expanded. This is the introspection equivalent of the scene serializer's
-        // "serializable members only" rule.
+
         static bool IsScalar(object? v) => v is null or string or bool or Enum or decimal
-            || (v is not null && v.GetType() is { IsPrimitive: true })
-            || v is Vector2 or Vector3 or Vector4 or Quaternion;
+                                           || (v is not null && v.GetType() is { IsPrimitive: true })
+                                           || v is Vector2 or Vector3 or Vector4 or Quaternion;
 
         object ReadMember(object obj, MemberInfo m) {
             try {
@@ -214,8 +187,6 @@ internal sealed class SimulateCommand : ICommand {
             } catch (Exception ex) { return $"<threw: {ex.InnerException?.Message ?? ex.Message}>"; }
         }
 
-        // Skip the noisy engine base-class plumbing every Behaviour exposes (transform/entity/lifecycle flags
-        // already covered by the entity-level fields) so the snapshot is the COMPONENT's own state.
         var skip = new HashSet<string> { "transform", "Entity", "IsActive", "IsEnabled", "gameObject", "tag", "name" };
 
         var components = entity.Behaviours.Select(b => {
@@ -265,7 +236,7 @@ internal sealed class SimulateCommand : ICommand {
 
             var watch = new Watch { Spec = spec, entity = entity };
             if (colon < 0)
-                return watch; // position watch
+                return watch;
 
             string memberPath = spec[(colon + 1)..];
             int dot = memberPath.IndexOf('.');

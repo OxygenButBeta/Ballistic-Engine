@@ -2,14 +2,6 @@ using BallisticEngine.Serialization;
 
 namespace BallisticEngine.Cli.Commands;
 
-// `bal scene <action>` — block-level scene CRUD keyed by stable entity ids (GL-free, document
-// level: parse YAML -> mutate -> validated re-serialize). Agents use this instead of hand-editing
-// scene YAML: every write is validated at parse time (typed member values, registry-resolved
-// component types, did-you-mean errors) and the file only changes after the whole edit succeeded.
-//
-// Entities are addressed by name, unique name substring, id, or id prefix. Components repeated on
-// one entity are addressed as Type@0, Type@1, ... New ids are MINTED HERE (agents never invent
-// identifiers); asset refs are written path-form by policy.
 internal sealed class SceneCommand : ICommand {
     public string Name => "scene";
     public string Summary => "Read and edit a .scene: get/set/add/remove/find.";
@@ -49,11 +41,9 @@ internal sealed class SceneCommand : ICommand {
         };
     }
 
-    // ---- get ----------------------------------------------------------------
-
     static int Get(SceneDocument doc, string[] args) {
         if (args.Length > 1) throw new CliUsageException("get takes at most one entity");
-        SceneFile.NormalizeDocument(doc); // numbers as numbers in the JSON output
+        SceneFile.NormalizeDocument(doc);
 
         if (args.Length == 0) {
             var byId = EntitiesById(doc);
@@ -98,13 +88,11 @@ internal sealed class SceneCommand : ICommand {
         };
     }
 
-    // ---- set ----------------------------------------------------------------
-
     static int Set(string scenePath, SceneDocument doc, string[] args) {
         if (args.Length < 3) throw new CliUsageException("set needs <entity> <target> <value>");
         EntityDocument entity = SceneFile.ResolveEntity(doc, args[0]);
         string target = args[1];
-        string value = string.Join(" ", args[2..]); // vectors may arrive as "1, 2, 3"
+        string value = string.Join(" ", args[2..]);
 
         object? written;
         switch (target.ToLowerInvariant()) {
@@ -146,7 +134,6 @@ internal sealed class SceneCommand : ICommand {
         EntityDocument parent = SceneFile.ResolveEntity(doc, value);
         if (ReferenceEquals(parent, entity))
             throw new Exception("an entity can't be its own parent");
-        // Reparenting under one's own descendant would orphan the subtree into a cycle.
         var byId = EntitiesById(doc);
         for (string? p = parent.Id; p is not null; p = byId.TryGetValue(p, out EntityDocument? up) ? up.Transform?.Parent : null)
             if (p == entity.Id)
@@ -179,8 +166,6 @@ internal sealed class SceneCommand : ICommand {
             key = SceneFile.CamelCase(member.Name);
         }
         else {
-            // Game component without a loadable script dll: write a best-effort scalar (the engine
-            // coerces on load) and say so.
             Console.Error.WriteLine(
                 $"bal scene: '{comp.Type}' is not in the component registry (game scripts not compiled?) — writing the value untyped");
             parsed = SceneFile.ParseLoose(value);
@@ -192,8 +177,6 @@ internal sealed class SceneCommand : ICommand {
         else comp.Members[key] = parsed;
         return SceneFile.ToJsonValue(parsed);
     }
-
-    // ---- add ----------------------------------------------------------------
 
     static int AddEntity(string scenePath, SceneDocument doc, string[] args) {
         string? name = null, parent = null, position = null, rotation = null, scale = null;
@@ -212,7 +195,7 @@ internal sealed class SceneCommand : ICommand {
         if (string.IsNullOrWhiteSpace(name)) throw new CliUsageException("add-entity needs a name");
 
         var entity = new EntityDocument {
-            Id = Guid.NewGuid().ToString("N"), // ids are minted by the tool, never by the agent
+            Id = Guid.NewGuid().ToString("N"),
             Name = name,
             Transform = new TransformDocument {
                 Position = position is null ? Vector3.Zero : SceneFile.ParseVec3(position),
@@ -289,14 +272,10 @@ internal sealed class SceneCommand : ICommand {
         return 0;
     }
 
-    // ---- remove -------------------------------------------------------------
-
     static int RemoveEntity(string scenePath, SceneDocument doc, string[] args) {
         if (args.Length != 1) throw new CliUsageException("remove-entity needs exactly one entity");
         EntityDocument entity = SceneFile.ResolveEntity(doc, args[0]);
 
-        // Editor semantics: deleting an entity deletes its subtree (a dangling parent id would
-        // silently flatten the hierarchy on load).
         var doomedIds = new HashSet<string>(StringComparer.Ordinal) { entity.Id! };
         bool grew = true;
         while (grew) {
@@ -327,8 +306,6 @@ internal sealed class SceneCommand : ICommand {
         return 0;
     }
 
-    // ---- find ---------------------------------------------------------------
-
     static int Find(SceneDocument doc, string[] args) {
         string? byType = null, byName = null;
         for (int i = 0; i < args.Length; i++) {
@@ -355,9 +332,6 @@ internal sealed class SceneCommand : ICommand {
         return 0;
     }
 
-    // ---- shared -------------------------------------------------------------
-
-    // Components repeated on one entity (e.g. two BoxColliders) are addressed as Type@0, Type@1...
     static (ComponentDocument comp, Type? type) FindComponent(EntityDocument entity, string spec) {
         string typeName = spec;
         int? index = null;

@@ -1,11 +1,7 @@
 
 namespace BallisticEngine;
 
-// Volumetric height fog + sun scattering (god-rays). Off by default — it's an atmospheric,
-// scene-dependent look. The medium is physical: exponential height fog whose extinction
-// hides the scene behind it, in-scattering the atmosphere-attenuated sun (golden at dusk,
-// gone at night when a ProceduralSky drives the scene) and the baked sky's average
-// radiance as skylight — so the fog always matches the sky and clouds above it.
+[Component(HideFromAddMenu = true)]
 public sealed class VolumetricFog : VolumeComponent {
     public readonly BoolParameter enabled = new(false);
 

@@ -1,4 +1,3 @@
-using System;
 using Vortice.Direct3D;
 using Vortice.Direct3D12;
 using Vortice.Direct3D12.Debug;
@@ -8,74 +7,123 @@ using static Vortice.DXGI.DXGI;
 
 namespace BallisticEngine.DX12;
 
-// Core DX12 device + a single graphics command queue/allocator/list + a fence for synchronous
-// submit-and-wait. Offscreen-first (no swapchain yet): the screenshot harness renders to an RTV and
-// reads it back, which needs no window — the highest-value, lowest-risk first deliverable per
-// DX12Migration.md Phase 1. A windowed swapchain layers on top later.
-//
-// Verbose by nature (this is DX12); kept minimal and heavily commented. All COM objects are owned here
-// and released in Dispose.
 public sealed class Dx12Device : IDisposable {
     public ID3D12Device2 Device { get; }
     public ID3D12CommandQueue Queue { get; }
-    // The 8-byte LUID of the adapter the device was created on (DXGI AdapterDesc1.AdapterLuid as raw bytes).
-    // Lets OIDN create a HIP device on the SAME physical GPU (oidnNewDeviceByLUID) for zero-copy buffer sharing.
+
     public byte[] AdapterLuidBytes { get; }
 
-    // Hardware ray-tracing (DXR Tier 1.0+) support, queried ONCE at device creation. The renderer reads this
-    // eagerly to AUTO-DOWNGRADE RayTraced GI/reflections/shadows to their screen-space fallbacks on a no-RT GPU
-    // (the audience floor — GTX-1660-class cards often lack RT). A FORCED RT path on a non-DXR device is exactly
-    // the device-removal/PC-crash hazard the downgrade prevents ([[gpu-hang-launch-safety]]). The old per-effect
-    // lazy CheckFeatureSupport checks now read this flag. BALLISTIC_DX12_FORCE_NORT=1 reports false even on an
-    // RT-capable GPU — the dev-machine A/B door for the no-RT fallback (the dev card has RT, so it won't crash).
+    public string AdapterDescription { get; }
+    public string AdapterDriverVersion { get; }
+
+    public ulong DedicatedVideoMemoryBytes { get; }
+
     public bool HasHardwareRayTracing { get; }
+    public bool HasMeshShaders { get; }
+
+    Dx12PsoCache psoCache;
+    public static string PsoCacheDirectory { get; set; }
+    Dx12PsoCache PsoCache => psoCache ??= new Dx12PsoCache(Device, PsoCacheDirectory);
+
+    public ID3D12PipelineState CreateGraphicsPso(in GraphicsPipelineStateDescription desc, string name)
+        => PsoCache.CreateGraphics(desc, name);
+    public ID3D12PipelineState CreateComputePso(in ComputePipelineStateDescription desc, string name)
+        => PsoCache.CreateCompute(desc, name);
+
+    public void SavePsoCache() => psoCache?.SaveToDisk();
 
     readonly ID3D12CommandAllocator allocator;
-    readonly ID3D12GraphicsCommandList4 commandList; // 4 = supports DXR DispatchRays later
+    readonly ID3D12GraphicsCommandList4 commandList;
     readonly ID3D12Fence fence;
     ulong fenceValue;
     readonly System.Threading.AutoResetEvent fenceEvent = new(false);
 
-    // SEPARATE upload allocator/list/fence so asset uploads (textures, buffers) never share command-list
-    // state with the per-frame render path. Sharing one list between BeginRender's ExecuteSync and the
-    // interleaved asset uploads was the suspected cause of the texture CopyTextureRegion E_FAILs.
+    const int MaxFramesInFlight = 3;
+    readonly ID3D12CommandAllocator[] frameAllocators;
+
+    readonly ID3D12GraphicsCommandList4[] frameLists;
+    ID3D12GraphicsCommandList4 frameList;
+    readonly ID3D12Fence frameFence;
+    ulong frameFenceValue;
+    readonly ulong[] frameFenceTargets;
+    readonly System.Threading.AutoResetEvent frameFenceEvent = new(false);
+    int frameSlot;
+    bool frameOpen;
+    int frameThreadId;
+    readonly bool pipelinedFrames;
+
+    public int FramesInFlight { get; }
+
+    public int FrameSlot => frameSlot;
+
     readonly ID3D12CommandAllocator uploadAllocator;
     readonly ID3D12GraphicsCommandList4 uploadList;
     readonly ID3D12Fence uploadFence;
     ulong uploadFenceValue;
     readonly System.Threading.AutoResetEvent uploadEvent = new(false);
 
+    public bool AsyncComputeEnabled { get; }
+    ID3D12CommandQueue computeQueue;
+
+    const int MaxAsyncHandoffs = 4;
+    ID3D12CommandAllocator[,] computeAllocators;
+    ID3D12GraphicsCommandList4[,] computeLists;
+
+    ulong[] computeFenceTargets;
+
+    ID3D12CommandAllocator[,] framePostAllocators;
+
+    int frameHandoffCount;
+
+    ID3D12Fence asyncFence;
+    ulong asyncFenceValue;
+
     public Dx12Device(bool enableDebugLayer = true) {
-        // Debug layer first (must precede device creation) — catches the silent device-removals that
-        // are the classic DX12 crash. On by default in Debug; harmless if the SDK layer is absent.
+        gbvEnabled = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GBV") == "1";
+
         if (enableDebugLayer && D3D12GetDebugInterface(out ID3D12Debug debug).Success) {
             debug.EnableDebugLayer();
+            if (gbvEnabled) {
+                try {
+                    using var debug1 = debug.QueryInterfaceOrNull<ID3D12Debug1>();
+                    if (debug1 is not null) {
+                        debug1.SetEnableGPUBasedValidation(true);
+                        debug1.SetEnableSynchronizedCommandQueueValidation(true);
+                        Console.WriteLine("[DX12] GPU-Based Validation: ENABLED (BALLISTIC_DX12_GBV=1) — slow; opt-in verification only.");
+                    } else {
+                        Console.WriteLine("[DX12] GPU-Based Validation requested but ID3D12Debug1 is unavailable on this runtime — skipped.");
+                    }
+                } catch (Exception e) {
+                    Console.WriteLine("[DX12] GPU-Based Validation setup failed (continuing without it): " + e.Message);
+                }
+            }
             debug.Dispose();
+        } else if (gbvEnabled) {
+            Console.WriteLine("[DX12] BALLISTIC_DX12_GBV=1 but the debug layer is not enabled/available — GBV is a no-op. Run with the debug layer (DirectXRenderAsset forces it when GBV is set).");
         }
-        // (D3D12GetDebugInterface<T>(out T) is the Result overload — checked above.)
 
-        // DRED (Device Removed Extended Data) — diagnoses GPU HANGS/device-removals WITHOUT the debug-layer
-        // SDK (which isn't installed here): on a removal, DrainDredReport() reports the GPU PAGE-FAULT VA
-        // (non-zero = the GPU accessed freed/invalid memory — use-after-free or a bad descriptor). Auto-
-        // breadcrumbs have a per-command GPU cost, so it's OFF unless BALLISTIC_DX12_DRED=1. Must precede
-        // device creation. See [[gpu-hang-launch-safety]] (the DX12 thumbnail hang this is for).
-        dredEnabled = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DRED") == "1";
-        if (dredEnabled && D3D12GetDebugInterface(out ID3D12DeviceRemovedExtendedDataSettings dred).Success) {
-            dred.SetAutoBreadcrumbsEnablement(DredEnablement.ForcedOn);
+        bool breadcrumbs = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DRED") == "1";
+        if (D3D12GetDebugInterface(out ID3D12DeviceRemovedExtendedDataSettings dred).Success) {
             dred.SetPageFaultEnablement(DredEnablement.ForcedOn);
+            if (breadcrumbs) dred.SetAutoBreadcrumbsEnablement(DredEnablement.ForcedOn);
             dred.Dispose();
+            dredEnabled = true;
         }
 
         using IDXGIFactory4 factory = CreateDXGIFactory1<IDXGIFactory4>();
         IDXGIAdapter1 adapter = PickHardwareAdapter(factory);
         Device = D3D12CreateDevice<ID3D12Device2>(adapter, FeatureLevel.Level_12_0);
+        try { AdapterDescription = adapter.Description1.Description?.Trim() ?? ""; } catch { AdapterDescription = ""; }
+        try { DedicatedVideoMemoryBytes = (ulong)adapter.Description1.DedicatedVideoMemory; } catch { DedicatedVideoMemoryBytes = 0; }
+        try {
+            if (adapter.CheckInterfaceSupport<IDXGIDevice>(out long umd)) {
+                AdapterDriverVersion = string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                    $"{(umd >> 48) & 0xFFFF}.{(umd >> 32) & 0xFFFF}.{(umd >> 16) & 0xFFFF}.{umd & 0xFFFF}");
+            } else AdapterDriverVersion = "";
+        } catch { AdapterDriverVersion = ""; }
         adapter.Dispose();
-        // The adapter LUID as raw 8 bytes (little-endian) for OIDN HIP device matching (oidnNewDeviceByLUID).
-        // ID3D12Device.AdapterLuid is the 64-bit LUID; its byte layout IS the native LUID struct.
         AdapterLuidBytes = BitConverter.GetBytes(Device.AdapterLuid);
 
-        // Query DXR support ONCE (Options5.RaytracingTier >= Tier1_0). FORCE_NORT pins it false for the no-RT
-        // fallback A/B on the (RT-capable) dev card. Wrapped — CheckFeatureSupport can throw on old runtimes.
         bool rt = false;
         if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_FORCE_NORT") != "1") {
             try {
@@ -87,12 +135,20 @@ public sealed class Dx12Device : IDisposable {
         Console.WriteLine(rt ? "[DX12] Hardware ray tracing: AVAILABLE (DXR Tier 1.0+)"
                              : "[DX12] Hardware ray tracing: NOT available — RayTraced GI/reflections/shadows will use screen-space fallbacks.");
 
+        bool ms = false;
+        try {
+            var opt7 = Device.CheckFeatureSupport<FeatureDataD3D12Options7>(Vortice.Direct3D12.Feature.Options7);
+            ms = opt7.MeshShaderTier >= MeshShaderTier.Tier1;
+        } catch { ms = false; }
+        HasMeshShaders = ms;
+        Console.WriteLine(ms ? "[DX12] Mesh shaders: AVAILABLE (Tier 1+)"
+                             : "[DX12] Mesh shaders: NOT available — the meshlet pipeline (R4) is disabled.");
+
         Queue = Device.CreateCommandQueue(new CommandQueueDescription(CommandListType.Direct));
         allocator = Device.CreateCommandAllocator(CommandListType.Direct);
-        // Generic CreateCommandList<T>; List4 supports DXR DispatchRays in the later phases.
         commandList = Device.CreateCommandList<ID3D12GraphicsCommandList4>(
             CommandListType.Direct, allocator, null);
-        commandList.Close(); // lists are created OPEN; close so the first Reset is uniform.
+        commandList.Close();
         fence = Device.CreateFence(0, FenceFlags.None);
 
         uploadAllocator = Device.CreateCommandAllocator(CommandListType.Direct);
@@ -101,16 +157,54 @@ public sealed class Dx12Device : IDisposable {
         uploadList.Close();
         uploadFence = Device.CreateFence(0, FenceFlags.None);
 
-        // Debug info queue (if the debug layer loaded): lets us print the REAL D3D12 message text on an
-        // E_FAIL instead of the opaque HRESULT. Stored-message log only; no break-on-error.
+        pipelinedFrames = Environment.GetEnvironmentVariable("BALLISTIC_DX12_PIPELINED") != "0";
+        string overlapEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_OVERLAP");
+        bool overlap = pipelinedFrames && overlapEnv != "0";
+        FramesInFlight = !overlap ? 1 : (overlapEnv == "3" ? Math.Min(3, MaxFramesInFlight) : 2);
+        frameAllocators = new ID3D12CommandAllocator[FramesInFlight];
+        frameLists = new ID3D12GraphicsCommandList4[FramesInFlight];
+        for (int i = 0; i < FramesInFlight; i++) {
+            frameAllocators[i] = Device.CreateCommandAllocator(CommandListType.Direct);
+            frameLists[i] = Device.CreateCommandList<ID3D12GraphicsCommandList4>(
+                CommandListType.Direct, frameAllocators[i], null);
+            frameLists[i].Close();
+        }
+        frameList = frameLists[0];
+        frameFence = Device.CreateFence(0, FenceFlags.None);
+        frameFenceTargets = new ulong[FramesInFlight];
+
+        AsyncComputeEnabled = Environment.GetEnvironmentVariable("BALLISTIC_DX12_ASYNC_COMPUTE") == "1";
+        if (AsyncComputeEnabled) {
+            computeQueue = Device.CreateCommandQueue(new CommandQueueDescription(CommandListType.Compute));
+            computeAllocators = new ID3D12CommandAllocator[FramesInFlight, MaxAsyncHandoffs];
+            computeLists = new ID3D12GraphicsCommandList4[FramesInFlight, MaxAsyncHandoffs];
+            framePostAllocators = new ID3D12CommandAllocator[FramesInFlight, MaxAsyncHandoffs];
+            for (int i = 0; i < FramesInFlight; i++) {
+                for (int h = 0; h < MaxAsyncHandoffs; h++) {
+                    computeAllocators[i, h] = Device.CreateCommandAllocator(CommandListType.Compute);
+                    computeLists[i, h] = Device.CreateCommandList<ID3D12GraphicsCommandList4>(
+                        CommandListType.Compute, computeAllocators[i, h], null);
+                    computeLists[i, h].Close();
+                    framePostAllocators[i, h] = Device.CreateCommandAllocator(CommandListType.Direct);
+                }
+            }
+            asyncFence = Device.CreateFence(0, FenceFlags.None);
+            computeFenceTargets = new ulong[FramesInFlight];
+        }
+
         if (enableDebugLayer)
             infoQueue = Device.QueryInterfaceOrNull<ID3D12InfoQueue>();
+
+        breakOnError = Environment.GetEnvironmentVariable("BALLISTIC_DX12_BREAK_ON_ERROR") == "1";
+        if (breakOnError && infoQueue is not null)
+            Console.WriteLine("[DX12] Info-queue break-on-error: ENABLED (BALLISTIC_DX12_BREAK_ON_ERROR=1) — baseline-aware: the end-of-frame drain fails loud on NEW (non-baseline) Corruption/Error messages only.");
     }
 
+    readonly bool gbvEnabled;
+    readonly bool breakOnError;
+
     readonly bool dredEnabled;
-    // On a device-removal, report the GPU page-fault from DRED: a non-zero PageFaultVA means a GPU command
-    // dereferenced freed/invalid memory (use-after-free / bad descriptor) — the decisive clue for a hang.
-    // Best-effort + fully guarded so the crash handler never throws over the real exception.
+
     public string DrainDredReport() {
         if (!dredEnabled) return "(DRED off — run with BALLISTIC_DX12_DRED=1)";
         try {
@@ -119,13 +213,13 @@ public sealed class Dx12Device : IDisposable {
             dred.GetPageFaultAllocationOutput(out DredPageFaultOutput pf);
             return $"PageFaultVA=0x{pf.PageFaultVA:X} " +
                    "(VA!=0 => GPU touched freed/invalid memory: use-after-free or bad descriptor; " +
-                   "auto-breadcrumbs are in the Watson dump / debugger)";
+                   "VA==0 => bad bind / GPU HANG, not a memory fault)";
         }
         catch (Exception e) { return "DRED read failed: " + e.Message; }
     }
 
     ID3D12InfoQueue infoQueue;
-    // Drain and return the stored D3D12 debug messages (newest batch). Empty when the debug layer is off.
+
     public string DrainDebugMessages() {
         if (infoQueue is null) return "(no info queue — run with BALLISTIC_DX12_DEBUG=1)";
         ulong n = infoQueue.NumStoredMessages;
@@ -139,6 +233,22 @@ public sealed class Dx12Device : IDisposable {
         return sb.ToString();
     }
 
+    public bool HasInfoQueue => infoQueue is not null;
+    public bool GbvEnabled => gbvEnabled;
+
+    public System.Collections.Generic.IReadOnlyList<DebugMessage> DrainDebugMessagesStructured() {
+        if (infoQueue is null) return System.Array.Empty<DebugMessage>();
+        ulong n = infoQueue.NumStoredMessages;
+        if (n == 0) return System.Array.Empty<DebugMessage>();
+        var list = new System.Collections.Generic.List<DebugMessage>((int)n);
+        for (ulong i = 0; i < n; i++) {
+            Message m = infoQueue.GetMessage(i);
+            list.Add(new DebugMessage(m.Category, m.Severity, m.Id, m.Description));
+        }
+        infoQueue.ClearStoredMessages();
+        return list;
+    }
+
     static IDXGIAdapter1 PickHardwareAdapter(IDXGIFactory4 factory) {
         for (uint i = 0; factory.EnumAdapters1(i, out IDXGIAdapter1 adapter).Success; i++) {
             if ((adapter.Description1.Flags & AdapterFlags.Software) == 0 &&
@@ -149,18 +259,12 @@ public sealed class Dx12Device : IDisposable {
         throw new InvalidOperationException("No DX12-capable hardware adapter found.");
     }
 
-    // Record into a fresh command list, then submit and BLOCK until the GPU finishes. Synchronous is
-    // exactly right for the offscreen screenshot path (deterministic, simple); the real per-frame loop
-    // will pipeline with multiple allocators + fences later.
-    //
-    // THREAD-SAFE via a lock: asset loading (textures, mesh buffers) runs on JobSystem WORKER THREADS,
-    // so multiple threads call ExecuteSync concurrently. There is ONE shared allocator/command list/fence,
-    // and command-list recording is NOT thread-safe in D3D12 — concurrent Reset/record/Close corrupts the
-    // list and the GPU rejects it (E_FAIL / device removal). The lock serializes the whole submit-and-wait;
-    // since each call already blocks on the GPU, this just queues concurrent uploads (correct, not the
-    // fastest — the per-frame render path is single-threaded on the main thread and pays nothing extra).
     readonly object submitGate = new();
     public void ExecuteSync(Action<ID3D12GraphicsCommandList4> record) {
+        if (frameOpen && Environment.CurrentManagedThreadId == frameThreadId) {
+            record(frameList);
+            return;
+        }
         lock (submitGate) {
             allocator.Reset();
             commandList.Reset(allocator, null);
@@ -171,18 +275,193 @@ public sealed class Dx12Device : IDisposable {
         }
     }
 
-    // Run `body` holding the SAME gate ExecuteSync uses, so an entire create+map+copy upload sequence is
-    // atomic w.r.t. other uploads. Asset loading creates resources (textures, buffers) on worker threads;
-    // serializing the whole sequence (not just the command submit) avoids the concurrent-create E_FAILs the
-    // driver throws under heavy parallel CreateCommittedResource load. C# `lock` is reentrant per-thread,
-    // so `body` may freely call ExecuteUpload (it re-acquires the same gate on the same thread).
+    ID3D12QueryHeap tsHeap;
+    ID3D12Resource tsReadback;
+    ulong tsFrequency;
+    bool tsInit, tsAvail;
+    const int TsSlots = 2;
+
+    void EnsureTimestampHeap() {
+        if (tsInit) return;
+        tsInit = true;
+        try {
+            Queue.GetTimestampFrequency(out tsFrequency);
+            tsHeap = Device.CreateQueryHeap<ID3D12QueryHeap>(new QueryHeapDescription(QueryHeapType.Timestamp, TsSlots));
+            tsReadback = Device.CreateCommittedResource(HeapProperties.ReadbackHeapProperties, HeapFlags.None,
+                ResourceDescription.Buffer((ulong)(TsSlots * sizeof(ulong))), ResourceStates.CopyDest);
+            tsAvail = tsFrequency > 0;
+        } catch { tsAvail = false; }
+    }
+    void WriteTimestampMarker(int slot) {
+        lock (submitGate) {
+            allocator.Reset();
+            commandList.Reset(allocator, null);
+            commandList.EndQuery(tsHeap, QueryType.Timestamp, (uint)slot);
+            commandList.Close();
+            Queue.ExecuteCommandList(commandList);
+            WaitForGpu();
+        }
+    }
+
+    public bool GpuTimerAvailable { get { EnsureTimestampHeap(); return tsAvail; } }
+    public void GpuTimerBegin() { if (GpuTimerAvailable) WriteTimestampMarker(0); }
+
+    public unsafe double GpuTimerEnd() {
+        if (!tsAvail) return -1.0;
+        WriteTimestampMarker(1);
+        lock (submitGate) {
+            allocator.Reset();
+            commandList.Reset(allocator, null);
+            commandList.ResolveQueryData(tsHeap, QueryType.Timestamp, 0, (uint)TsSlots, tsReadback, 0);
+            commandList.Close();
+            Queue.ExecuteCommandList(commandList);
+            WaitForGpu();
+            ulong* t = tsReadback.Map<ulong>(0);
+            ulong begin = t[0], end = t[1];
+            tsReadback.Unmap(0);
+            return end > begin ? (end - begin) * 1000.0 / tsFrequency : 0.0;
+        }
+    }
+
+    Dx12GpuProfiler gpuProfiler;
+    public Dx12GpuProfiler GpuProfiler => gpuProfiler ??= new Dx12GpuProfiler(this);
+    int profileFrameCounter;
+
+    public ID3D12GraphicsCommandList4 FrameList => frameList;
+
+    public void BeginFrame() {
+        if (!pipelinedFrames || frameOpen) return;
+        frameSlot = (frameSlot + 1) % FramesInFlight;
+        WaitFrameFence(frameFenceTargets[frameSlot]);
+        DrainDeferredReleases();
+        frameList = frameLists[frameSlot];
+        frameAllocators[frameSlot].Reset();
+        frameList.Reset(frameAllocators[frameSlot], null);
+        if (AsyncComputeEnabled)
+            for (int h = 0; h < MaxAsyncHandoffs; h++) framePostAllocators[frameSlot, h].Reset();
+        frameHandoffCount = 0;
+        frameThreadId = Environment.CurrentManagedThreadId;
+        frameOpen = true;
+        if (gpuProfiler is { Enabled: true }) gpuProfiler.BeginFrame(profileFrameCounter++);
+    }
+
+    readonly System.Collections.Generic.Queue<(ulong target, IDisposable res)> deferredReleases = new();
+    public void DeferredRelease(IDisposable resource) {
+        if (resource is null) return;
+        if (FramesInFlight == 1) { resource.Dispose(); return; }
+
+        deferredReleases.Enqueue((frameFenceValue + 1, resource));
+    }
+    void DrainDeferredReleases() {
+        ulong done = frameFence.CompletedValue;
+        while (deferredReleases.Count > 0 && deferredReleases.Peek().target <= done) {
+            deferredReleases.Dequeue().res.Dispose();
+        }
+    }
+
+    public bool EndFrame() {
+        if (!frameOpen) return false;
+        frameOpen = false;
+        ulong profTarget = frameFenceValue + 1;
+        if (gpuProfiler is { Enabled: true }) gpuProfiler.ResolveInto(frameList, profTarget);
+        frameList.Close();
+        Queue.ExecuteCommandList(frameList);
+        ulong target = ++frameFenceValue;
+        Queue.Signal(frameFence, target);
+        frameFenceTargets[frameSlot] = target;
+        if (gpuProfiler is { Enabled: true }) {
+            string line = gpuProfiler.Drain(frameFence.CompletedValue);
+            if (line is not null) Console.WriteLine(line);
+        }
+
+        if (FramesInFlight == 1 || syncThisFrame) WaitFrameFence(target);
+        syncThisFrame = false;
+        return true;
+    }
+
+    bool syncThisFrame;
+    public void RequestFrameSync() => syncThisFrame = true;
+
+    void WaitFrameFence(ulong target) {
+        if (target == 0 || frameFence.CompletedValue >= target) return;
+        frameFence.SetEventOnCompletion(target, frameFenceEvent.SafeWaitHandle.DangerousGetHandle());
+        frameFenceEvent.WaitOne();
+        if (dredTrap) {
+            var rr = Device.DeviceRemovedReason;
+            if (!rr.Success) {
+                Console.Error.WriteLine($"[DRED-TRAP] DEVICE REMOVED after frame submit (WaitFrameFence): reason={rr} DRED={DrainDredReport()}");
+                if (HasInfoQueue) Console.Error.WriteLine($"[DRED-TRAP] debug-msgs:\n{DrainDebugMessages()}");
+                Environment.Exit(7);
+            }
+        }
+    }
+
+    public ulong LastFrameFenceTarget => frameFenceValue;
+    public void WaitForFrame(ulong target) => WaitFrameFence(target);
+
+    public void RecordAsyncCompute(Action<ID3D12GraphicsCommandList4> record) {
+        if (!AsyncComputeEnabled || !(frameOpen && Environment.CurrentManagedThreadId == frameThreadId)) {
+            ExecuteSync(record);
+            return;
+        }
+        if (frameHandoffCount >= MaxAsyncHandoffs) {
+            ExecuteSync(record);
+            return;
+        }
+        int handoff = frameHandoffCount++;
+        frameList.Close();
+        Queue.ExecuteCommandList(frameList);
+        ulong a = ++asyncFenceValue;
+        Queue.Signal(asyncFence, a);
+        computeQueue.Wait(asyncFence, a);
+        var cAlloc = computeAllocators[frameSlot, handoff];
+        var cList = computeLists[frameSlot, handoff];
+        cAlloc.Reset();
+        cList.Reset(cAlloc, null);
+        record(cList);
+        try { cList.Close(); }
+        catch (Exception ex) {
+            if (HasInfoQueue) Console.Error.WriteLine($"[ASYNC-CLOSE-FAIL] {ex.Message}\n{DrainDebugMessages()}");
+            throw;
+        }
+        computeQueue.ExecuteCommandList(cList);
+        ulong b = ++asyncFenceValue;
+        computeQueue.Signal(asyncFence, b);
+        computeFenceTargets[frameSlot] = b;
+        frameList.Reset(framePostAllocators[frameSlot, handoff], null);
+        Queue.Wait(asyncFence, b);
+    }
+
+    public bool FrameOpen => frameOpen && Environment.CurrentManagedThreadId == frameThreadId;
+
+    public void ExecuteSyncImmediate(Action<ID3D12GraphicsCommandList4> record) {
+        bool reopen = false;
+        if (frameOpen && Environment.CurrentManagedThreadId == frameThreadId) {
+            frameOpen = false;
+            frameList.Close();
+            Queue.ExecuteCommandList(frameList);
+            WaitForGpu();
+            reopen = true;
+        }
+        lock (submitGate) {
+            allocator.Reset();
+            commandList.Reset(allocator, null);
+            record(commandList);
+            commandList.Close();
+            Queue.ExecuteCommandList(commandList);
+            WaitForGpu();
+        }
+        if (reopen) {
+            frameAllocators[frameSlot].Reset();
+            frameList.Reset(frameAllocators[frameSlot], null);
+            frameOpen = true;
+        }
+    }
+
     public void RunExclusive(Action body) {
         lock (uploadGate) body();
     }
 
-    // Record + submit + wait on the dedicated UPLOAD command list (separate from the render path's list,
-    // so an asset upload interleaved with BeginRender never corrupts the render command list and vice
-    // versa). Used by all texture/buffer uploads. Serialized by uploadGate.
     readonly object uploadGate = new();
     public void ExecuteUpload(Action<ID3D12GraphicsCommandList4> record) {
         lock (uploadGate) {
@@ -200,23 +479,11 @@ public sealed class Dx12Device : IDisposable {
         }
     }
 
-    // Block until the GPU has finished ALL previously-submitted queue work. Public for the swapchain:
-    // ResizeBuffers requires every backbuffer reference released AND the GPU idle, and Present in the
-    // synchronous editor model waits here so the next frame's backbuffer is safe to reuse. Takes the
-    // submit gate so it never races ExecuteSync's fenceValue increment.
-    //
-    // Waits on BOTH the render fence AND the upload fence: asset uploads run on JobSystem WORKER threads
-    // via ExecuteUpload (its own fence) and submit to the SAME queue. A resize/ResizeBuffers that only
-    // waited the render fence would proceed while a worker's CopyTextureRegion is still in flight on the
-    // GPU — freeing backbuffers/targets under an active GPU read → device removal (the 4K->1080p hang).
     public void Flush() {
-        // Hold uploadGate too so no worker ExecuteUpload starts between the two waits, then drain BOTH the
-        // render queue and any in-flight worker uploads (they share this queue). The upload drain lives here
-        // (not in WaitForGpu) so ExecuteSync/Dispose — which call WaitForGpu under submitGate only — never
-        // touch uploadFenceValue unguarded and race a concurrent ExecuteUpload.
         lock (submitGate)
             lock (uploadGate) {
                 WaitForGpu();
+                WaitFrameFence(frameFenceValue);
                 ulong uTarget = ++uploadFenceValue;
                 Queue.Signal(uploadFence, uTarget);
                 if (uploadFence.CompletedValue < uTarget) {
@@ -233,16 +500,20 @@ public sealed class Dx12Device : IDisposable {
             fence.SetEventOnCompletion(target, fenceEvent.SafeWaitHandle.DangerousGetHandle());
             fenceEvent.WaitOne();
         }
-    }
 
-    // Create a DEFAULT-heap buffer of `byteSize` seeded with `data`, via a temporary upload heap +
-    // CopyBufferRegion (the GPU-local path the real renderer wants — vs the cube test's upload-heap
-    // shortcut). Synchronous: blocks until the copy completes, then the upload heap is freed. The
-    // returned resource is left in `finalState` (e.g. VertexAndConstantBuffer / IndexBuffer).
+        if (dredTrap) {
+            var rr = Device.DeviceRemovedReason;
+            if (!rr.Success) {
+                Console.Error.WriteLine($"[DRED-TRAP] DEVICE REMOVED right after a GPU submit: reason={rr} DRED={DrainDredReport()}");
+                if (HasInfoQueue) Console.Error.WriteLine($"[DRED-TRAP] debug-msgs:\n{DrainDebugMessages()}");
+                Environment.Exit(7);
+            }
+        }
+    }
+    readonly bool dredTrap = Environment.GetEnvironmentVariable("BALLISTIC_DX12_DRED_TRAP") == "1";
+
     public unsafe ID3D12Resource CreateDefaultBuffer<T>(ReadOnlySpan<T> data, ResourceStates finalState)
         where T : unmanaged {
-        // Serialize the whole create+map+copy (mesh buffers also upload from worker threads). The gate is
-        // reentrant so the inner ExecuteSync re-acquires it on the same thread.
         ID3D12Resource result = null;
         int byteSize = data.Length * sizeof(T);
         lock (uploadGate) {
@@ -264,15 +535,11 @@ public sealed class Dx12Device : IDisposable {
             cl.ResourceBarrierTransition(dest, ResourceStates.CopyDest, finalState);
         });
         result = dest;
-        }   // submitGate
+        }
+
         return result;
     }
 
-    // Create a DEFAULT-heap buffer with UNORDERED-ACCESS allowed (the GPU-driven cull writes its indirect
-    // draw commands + atomic counter into these), seeded with `data`, left in `finalState`
-    // (UnorderedAccess for compute writes, or IndirectArgument when fed straight to ExecuteIndirect).
-    // Same upload-heap copy path as CreateDefaultBuffer; the only difference is ResourceFlags + that the
-    // resource can later be transitioned to UnorderedAccess / IndirectArgument.
     public unsafe ID3D12Resource CreateUavBuffer<T>(ReadOnlySpan<T> data, ResourceStates finalState)
         where T : unmanaged {
         ID3D12Resource result = null;
@@ -300,22 +567,37 @@ public sealed class Dx12Device : IDisposable {
         return result;
     }
 
-    // A READBACK-heap buffer (CPU-mappable, always CopyDest) for reading GPU results back — used by the
-    // compute self-test and any GPU->CPU buffer readback.
     public ID3D12Resource CreateReadbackBuffer(int byteSize) =>
         Device.CreateCommittedResource(HeapProperties.ReadbackHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)byteSize), ResourceStates.CopyDest);
 
     public void Dispose() {
         WaitForGpu();
+        WaitFrameFence(frameFenceValue);
+        if (asyncFence is not null && asyncFenceValue > 0 && asyncFence.CompletedValue < asyncFenceValue) {
+            asyncFence.SetEventOnCompletion(asyncFenceValue, frameFenceEvent.SafeWaitHandle.DangerousGetHandle());
+            frameFenceEvent.WaitOne();
+        }
+        while (deferredReleases.Count > 0) deferredReleases.Dequeue().res.Dispose();
         fenceEvent.Dispose();
         fence.Dispose();
+        frameFenceEvent.Dispose();
+        frameFence.Dispose();
+        foreach (var l in frameLists) l.Dispose();
+        foreach (var a in frameAllocators) a.Dispose();
         commandList.Dispose();
         allocator.Dispose();
         uploadEvent.Dispose();
         uploadFence.Dispose();
         uploadList.Dispose();
         uploadAllocator.Dispose();
+        if (computeLists is not null) foreach (var l in computeLists) l.Dispose();
+        if (computeAllocators is not null) foreach (var a in computeAllocators) a.Dispose();
+        if (framePostAllocators is not null) foreach (var a in framePostAllocators) a.Dispose();
+        asyncFence?.Dispose();
+        computeQueue?.Dispose();
+        psoCache?.SaveToDisk();
+        psoCache?.Dispose();
         infoQueue?.Dispose();
         Queue.Dispose();
         Device.Dispose();

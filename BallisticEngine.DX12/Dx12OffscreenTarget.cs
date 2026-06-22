@@ -1,21 +1,13 @@
-using System;
-using System.Runtime.InteropServices;
 using Vortice.Direct3D12;
 using Vortice.DXGI;
 
 namespace BallisticEngine.DX12;
 
-// An offscreen RGBA8 render target + RTV, with GPU->CPU readback to a BMP. This is the DX12 equivalent
-// of the GL screenshot path (glReadPixels) the whole verification harness depends on — DX12 has no
-// ReadPixels, so readback is a CopyTextureRegion into a readback heap, Map, memcpy (DX12Migration.md
-// Phase 1, the single highest-leverage thing to get right). No window needed.
 public sealed class Dx12OffscreenTarget : IDisposable {
-    // Default LDR backbuffer format (final composite / readback). The HDR scene target overrides it with
-    // R16G16B16A16_Float via the ctor `colorFormat` arg.
     public const Format ColorFormat = Format.R8G8B8A8_UNorm;
     public const Format HdrFormat = Format.R16G16B16A16_Float;
     public const Format DepthFormat = Format.D32_Float;
-    public Format Format { get; }          // this target's actual color format
+    public Format Format { get; }
     public int Width { get; }
     public int Height { get; }
     public ID3D12Resource RenderTarget { get; }
@@ -23,26 +15,27 @@ public sealed class Dx12OffscreenTarget : IDisposable {
     readonly Dx12Device dev;
     readonly ID3D12DescriptorHeap rtvHeap;
     readonly CpuDescriptorHandle rtvHandle;
-    // Color as a shader resource — for the composite pass that reads the HDR scene color. -1 until first
-    // ColorToShaderResource()/SrvCpu use; lazily created. Lives in Dx12Backend.SrvStore.
+
     int colorSrvIndex = -1;
     public CpuDescriptorHandle ColorSrvCpu => Dx12Backend.SrvStore.Cpu(colorSrvIndex);
-    // Optional depth buffer (created when withDepth) — needed for any 3D pass.
     readonly ID3D12Resource depthTarget;
     readonly ID3D12DescriptorHeap dsvHeap;
     readonly CpuDescriptorHandle dsvHandle;
     public bool HasDepth => depthTarget != null;
-    // Depth as a shader resource (R32_Float SRV over the typeless depth) — for post passes that read
-    // scene depth (volumetric fog). Allocated in Dx12Backend.SrvStore; -1 until withDepth.
+
     int depthSrvIndex = -1;
     public CpuDescriptorHandle DepthSrvCpu => Dx12Backend.SrvStore.Cpu(depthSrvIndex);
     public ID3D12Resource DepthResource => depthTarget;
     ResourceStates depthState = ResourceStates.DepthWrite;
-    // Current resource state of the RT, tracked so transitions are correct.
     ResourceStates state = ResourceStates.RenderTarget;
 
+    public ID3D12Heap PlacedHeap { get; }
+    public ulong PlacedOffset { get; }
+    public bool IsPlaced => PlacedHeap != null;
+
     public Dx12OffscreenTarget(Dx12Device device, int width, int height, bool withDepth = false,
-        Format? colorFormat = null, bool colorReadable = false, bool allowUav = false) {
+        Format? colorFormat = null, bool colorReadable = false, bool allowUav = false,
+        ID3D12Heap placedHeap = null, ulong placedOffset = 0) {
         dev = device;
         Width = width;
         Height = height;
@@ -50,19 +43,25 @@ public sealed class Dx12OffscreenTarget : IDisposable {
 
         var rtDesc = ResourceDescription.Texture2D(Format, (uint)width, (uint)height,
             mipLevels: 1, arraySize: 1);
-        // AllowUnorderedAccess for targets a compute pass (e.g. the FSR upscaler) writes via UAV.
         rtDesc.Flags = ResourceFlags.AllowRenderTarget | (allowUav ? ResourceFlags.AllowUnorderedAccess : ResourceFlags.None);
         var clearVal = new ClearValue(Format, new Vortice.Mathematics.Color4(0, 0, 0, 1));
-        RenderTarget = dev.Device.CreateCommittedResource(
-            HeapProperties.DefaultHeapProperties, HeapFlags.None, rtDesc,
-            ResourceStates.RenderTarget, clearVal);
+        if (placedHeap != null) {
+            PlacedHeap = placedHeap;
+            PlacedOffset = placedOffset;
+            ClearValue? cv = clearVal;
+            RenderTarget = dev.Device.CreatePlacedResource<ID3D12Resource>(
+                placedHeap, placedOffset, rtDesc, ResourceStates.RenderTarget, cv);
+        } else {
+            RenderTarget = dev.Device.CreateCommittedResource(
+                HeapProperties.DefaultHeapProperties, HeapFlags.None, rtDesc,
+                ResourceStates.RenderTarget, clearVal);
+        }
 
         rtvHeap = dev.Device.CreateDescriptorHeap(new DescriptorHeapDescription(
             DescriptorHeapType.RenderTargetView, 1));
         rtvHandle = rtvHeap.GetCPUDescriptorHandleForHeapStart();
         dev.Device.CreateRenderTargetView(RenderTarget, null, rtvHandle);
 
-        // The HDR scene target is sampled by the composite pass — give it a color SRV.
         if (colorReadable) {
             colorSrvIndex = Dx12Backend.SrvStore.Allocate();
             dev.Device.CreateShaderResourceView(RenderTarget, new ShaderResourceViewDescription {
@@ -74,7 +73,6 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         }
 
         if (withDepth) {
-            // Typeless so the SAME resource is both a D32 DSV and an R32_Float SRV (post passes read depth).
             var dDesc = ResourceDescription.Texture2D(Format.R32_Typeless, (uint)width, (uint)height,
                 mipLevels: 1, arraySize: 1);
             dDesc.Flags = ResourceFlags.AllowDepthStencil;
@@ -100,7 +98,6 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         }
     }
 
-    // Clear to a color (linear-ish RGBA 0..1), and the depth buffer to far (1.0) when present.
     public void Clear(float r, float g, float b, float a = 1f) {
         dev.ExecuteSync(cl => {
             TransitionTo(cl, ResourceStates.RenderTarget);
@@ -111,8 +108,6 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         });
     }
 
-    // Record arbitrary draw commands against this RTV (+DSV) (viewport/scissor set up here). `record`
-    // runs with the targets bound and the RT in RenderTarget state.
     public void RenderInto(Action<ID3D12GraphicsCommandList4> record) {
         dev.ExecuteSync(cl => {
             TransitionTo(cl, ResourceStates.RenderTarget);
@@ -123,21 +118,16 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         });
     }
 
-    // Post pass: bind ONLY the color RTV (no depth) + the viewport, run `record` (a fullscreen draw
-    // that reads depth/shadows as SRVs and blends over color). Depth must already be in
-    // PixelShaderResource (call DepthToShaderResource first). Separate ExecuteSync.
     public void RenderColorOnly(Action<ID3D12GraphicsCommandList4> record) {
         dev.ExecuteSync(cl => {
             TransitionTo(cl, ResourceStates.RenderTarget);
             cl.RSSetViewport(0, 0, Width, Height);
             cl.RSSetScissorRect(Width, Height);
-            cl.OMSetRenderTargets(rtvHandle);   // no DSV — post pass doesn't test/write depth
+            cl.OMSetRenderTargets(rtvHandle);
             record(cl);
         });
     }
 
-    // Like RenderColorOnly but clears the color to black first — the deferred lighting pass discards sky
-    // pixels (depth==far), so they must be a known black for the subsequent sky pass to overwrite.
     public void RenderColorOnlyCleared(Action<ID3D12GraphicsCommandList4> record) {
         dev.ExecuteSync(cl => {
             TransitionTo(cl, ResourceStates.RenderTarget);
@@ -149,9 +139,6 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         });
     }
 
-    // Like RenderColorOnly but also binds an EXTERNAL depth-stencil view (the deferred sky pass draws
-    // into the HDR color while depth-testing against the G-buffer depth, which this target doesn't own).
-    // The external depth must already be in a DSV-bindable state (DepthRead for a no-write LEqual test).
     public void RenderColorWithExternalDepth(CpuDescriptorHandle dsv, Action<ID3D12GraphicsCommandList4> record) {
         dev.ExecuteSync(cl => {
             TransitionTo(cl, ResourceStates.RenderTarget);
@@ -162,8 +149,6 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         });
     }
 
-    // Copy another same-size/format target's color into THIS target's color (e.g. SSR combine wrote to a
-    // scratch, copy it back so the rest of the pipeline keeps reading this target). Handles transitions.
     public void CopyColorFrom(Dx12OffscreenTarget src) {
         dev.ExecuteSync(cl => {
             TransitionTo(cl, ResourceStates.CopyDest);
@@ -174,23 +159,31 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         });
     }
 
-    // Color state transitions: the composite reads the HDR scene color as an SRV.
+    public void CopyColorFromInList(ID3D12GraphicsCommandList4 cl, Dx12OffscreenTarget src) {
+        TransitionTo(cl, ResourceStates.CopyDest);
+        src.TransitionTo(cl, ResourceStates.CopySource);
+        cl.CopyResource(RenderTarget, src.RenderTarget);
+        TransitionTo(cl, ResourceStates.NonPixelShaderResource);
+        src.TransitionTo(cl, ResourceStates.NonPixelShaderResource);
+    }
+
     public void ColorToShaderResource() {
         dev.ExecuteSync(cl => TransitionTo(cl, ResourceStates.PixelShaderResource));
     }
     public void ColorToRenderTarget() {
         dev.ExecuteSync(cl => TransitionTo(cl, ResourceStates.RenderTarget));
     }
-    // For a COMPUTE shader to read the color as an SRV (e.g. the OIDN GPU pack reads the GI texture).
+
     public void ColorToNonPixelShaderResource() {
         dev.ExecuteSync(cl => TransitionTo(cl, ResourceStates.NonPixelShaderResource));
     }
-    // For a UAV-capable target a compute pass writes (FSR output). Created with allowUav.
+
     public void ColorToUnorderedAccess() {
         dev.ExecuteSync(cl => TransitionTo(cl, ResourceStates.UnorderedAccess));
     }
 
-    // Depth state transitions for post passes that read scene depth as an SRV.
+    public void ColorTransitionInList(ID3D12GraphicsCommandList4 cl, ResourceStates target) => TransitionTo(cl, target);
+
     public void DepthToShaderResource() {
         if (!HasDepth || depthState == ResourceStates.PixelShaderResource) return;
         dev.ExecuteSync(cl => {
@@ -206,8 +199,6 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         });
     }
 
-    // Clear color+depth, then record draws — the whole frame in ONE command-list submission (one
-    // ExecuteSync), which the per-frame renderer wants (vs Clear() + RenderInto() = two submits).
     public void RenderIntoCleared(float r, float g, float b, Action<ID3D12GraphicsCommandList4> record) {
         dev.ExecuteSync(cl => {
             TransitionTo(cl, ResourceStates.RenderTarget);
@@ -219,6 +210,11 @@ public sealed class Dx12OffscreenTarget : IDisposable {
                 cl.ClearDepthStencilView(dsvHandle, ClearFlags.Depth, 1.0f, 0);
             record(cl);
         });
+    }
+
+    public void DiscardForAlias(ID3D12GraphicsCommandList4 cl) {
+        TransitionTo(cl, ResourceStates.RenderTarget);
+        cl.DiscardResource(RenderTarget);
     }
 
     void BindTargets(ID3D12GraphicsCommandList4 cl) {
@@ -234,10 +230,7 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         state = target;
     }
 
-    // Read the RT back to CPU and write a 24-bit BMP (bottom-up, BGR) — the SAME format the GL harness
-    // emits, so bal imgdiff / rgbstat.py compare cross-backend frames directly.
     public unsafe void SaveBmp(string path) {
-        // Placed-footprint of subresource 0 (row pitch is 256-byte aligned per the D3D12 copy rule).
         var footprints = new PlacedSubresourceFootPrint[1];
         var rowCounts = new uint[1];
         var rowSizes = new ulong[1];
@@ -250,7 +243,7 @@ public sealed class Dx12OffscreenTarget : IDisposable {
             HeapProperties.ReadbackHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
 
-        dev.ExecuteSync(cl => {
+        dev.ExecuteSyncImmediate(cl => {
             TransitionTo(cl, ResourceStates.CopySource);
             var dst = new TextureCopyLocation(readback, footprint);
             var src = new TextureCopyLocation(RenderTarget, 0);
@@ -266,12 +259,6 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         }
     }
 
-    // Read the RGB channels of this RGBA16F target back to a CPU float array (length >= Width*Height*3),
-    // converting half->float. For the OIDN denoise round-trip (D3D12 texture -> host -> OIDN). Restores the
-    // target to RenderTarget after. Slow (blocking readback) — the zero-copy D3D12<->HIP path is the perf
-    // follow-up. Assumes the R16G16B16A16_Float format (8 bytes/pixel).
-    // Cached readback/upload heaps — CreateCommittedResource on a readback/upload heap every frame was a
-    // dominant cost of the OIDN host round-trip; reuse one buffer of each per target (recreated on resize).
     ID3D12Resource cachedReadback, cachedUpload;
     ulong cachedReadbackBytes, cachedUploadBytes;
 
@@ -290,7 +277,7 @@ public sealed class Dx12OffscreenTarget : IDisposable {
             cachedReadbackBytes = totalBytes;
         }
         ID3D12Resource readback = cachedReadback;
-        dev.ExecuteSync(cl => {
+        dev.ExecuteSyncImmediate(cl => {
             TransitionTo(cl, ResourceStates.CopySource);
             cl.CopyTextureRegion(new TextureCopyLocation(readback, fp), 0, 0, 0,
                 new TextureCopyLocation(RenderTarget, 0), null);
@@ -311,9 +298,6 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         } finally { readback.Unmap(0); }
     }
 
-    // Upload a CPU float RGB array (length >= Width*Height*3) into this RGBA16F target (alpha = 1),
-    // converting float->half. Leaves the target in PixelShaderResource (ready to sample). Pairs with
-    // ReadColorRgb for the OIDN round-trip.
     public unsafe void WriteColorRgb(float[] src) {
         var footprints = new PlacedSubresourceFootPrint[1];
         var rowCounts = new uint[1]; var rowSizes = new ulong[1];
@@ -343,7 +327,7 @@ public sealed class Dx12OffscreenTarget : IDisposable {
             }
         }
         upload.Unmap(0);
-        dev.ExecuteSync(cl => {
+        dev.ExecuteSyncImmediate(cl => {
             TransitionTo(cl, ResourceStates.CopyDest);
             cl.CopyTextureRegion(new TextureCopyLocation(RenderTarget, 0), 0, 0, 0,
                 new TextureCopyLocation(upload, fp), null);
@@ -351,9 +335,6 @@ public sealed class Dx12OffscreenTarget : IDisposable {
         });
     }
 
-    // Read an RGBA8 (R8G8B8A8_UNorm) color target back to a tightly-packed CPU byte[] (w*h*4), TOP-DOWN
-    // (row 0 = top). For the editor's mesh/material thumbnail previews (render to this target, read back).
-    // Restores RenderTarget after. Assumes the default ColorFormat (4 bytes/pixel).
     public unsafe byte[] ReadColorRgba8() {
         var footprints = new PlacedSubresourceFootPrint[1];
         var rowCounts = new uint[1]; var rowSizes = new ulong[1];
@@ -366,7 +347,7 @@ public sealed class Dx12OffscreenTarget : IDisposable {
             HeapProperties.ReadbackHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer(totalBytes), ResourceStates.CopyDest);
 
-        dev.ExecuteSync(cl => {
+        dev.ExecuteSyncImmediate(cl => {
             TransitionTo(cl, ResourceStates.CopySource);
             cl.CopyTextureRegion(new TextureCopyLocation(readback, fp), 0, 0, 0,
                 new TextureCopyLocation(RenderTarget, 0), null);
@@ -386,23 +367,21 @@ public sealed class Dx12OffscreenTarget : IDisposable {
     unsafe void WriteBmp(string path, byte* src, int rowPitch) {
         int w = Width, h = Height;
         int rowBytes = w * 3;
-        int padded = (rowBytes + 3) & ~3;          // BMP rows are 4-byte aligned
+        int padded = (rowBytes + 3) & ~3;
         int imageSize = padded * h;
         int fileSize = 54 + imageSize;
         var file = new byte[fileSize];
 
-        // BITMAPFILEHEADER + BITMAPINFOHEADER (24-bit, bottom-up).
         file[0] = (byte)'B'; file[1] = (byte)'M';
         BitConverter.GetBytes(fileSize).CopyTo(file, 2);
-        BitConverter.GetBytes(54).CopyTo(file, 10);   // pixel data offset
-        BitConverter.GetBytes(40).CopyTo(file, 14);   // info header size
+        BitConverter.GetBytes(54).CopyTo(file, 10);
+        BitConverter.GetBytes(40).CopyTo(file, 14);
         BitConverter.GetBytes(w).CopyTo(file, 18);
-        BitConverter.GetBytes(h).CopyTo(file, 22);    // positive => bottom-up
-        file[26] = 1;                                  // planes
-        file[28] = 24;                                 // bpp
+        BitConverter.GetBytes(h).CopyTo(file, 22);
+        file[26] = 1;
+        file[28] = 24;
         BitConverter.GetBytes(imageSize).CopyTo(file, 34);
 
-        // Source is RGBA8 row-major top-down (row pitch aligned); BMP is bottom-up BGR.
         for (int y = 0; y < h; y++) {
             byte* srcRow = src + (long)(h - 1 - y) * rowPitch;
             int dstRow = 54 + y * padded;

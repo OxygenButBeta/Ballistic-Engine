@@ -28,11 +28,8 @@ public class HDCamera : Behaviour, IViewProjectionProvider
 
     public Matrix4 GetViewMatrix()
     {
-        // World-space, not local: the camera may be PARENTED (e.g. under a player controller), so it
-        // must render from where it actually is in the world, not from its local offset near the
-        // parent's origin. WorldRotation drives the basis so look direction follows the parent too.
-        Vector3 eye = transform.WorldPosition;
-        Quaternion worldRotation = transform.WorldRotation;
+        Vector3 eye = transform.RenderWorldPosition;
+        Quaternion worldRotation = transform.RenderWorldRotation;
         Vector3 forward = Vector3.Transform(Vector3.UnitZ, worldRotation);
         Vector3 up = Vector3.Transform(Vector3.UnitY, worldRotation);
         return BMatrix.LookAt(eye, eye + forward, up);
@@ -69,8 +66,6 @@ public class HDCamera : Behaviour, IViewProjectionProvider
 
     internal void RenderCamera()
     {
-        // Lazy init: OnBegin only fires in play mode, but a paused/headless host (screenshot
-        // verification) registers this camera and renders without ever entering play.
         window ??= Window.Current;
         renderer ??= RenderAsset.Current.Renderer;
         renderer.BeginRender(new RendererArgs(viewProjectionProvider: this));
@@ -85,14 +80,11 @@ public class HDCamera : Behaviour, IViewProjectionProvider
 
     public override void OnDrawGizmosSelected(IGizmos gizmos)
     {
-        // A view-frustum wireframe reconstructed from the camera's fov/near/far. The real aspect
-        // depends on the game window at runtime; 16:9 is a representative preview shape (do NOT call
-        // GetProjectionMatrix here — it reads the live OS window size, not the editor viewport).
         gizmos.Color = new Vector3(0.5f, 0.8f, 1f);
 
         const float aspect = 16f / 9f;
         float tanV = MathF.Tan(MathHelper.DegreesToRadians(45f) * 0.5f);
-        float gizmoFar = MathF.Min(farPlane, 30f); // cap so the frustum stays a usable size
+        float gizmoFar = MathF.Min(farPlane, 30f);
 
         Vector3 pos = transform.Position;
         Vector3 fwd = transform.Forward, up = transform.Up, right = transform.Right;
@@ -105,9 +97,9 @@ public class HDCamera : Behaviour, IViewProjectionProvider
         for (var i = 0; i < 4; i++)
         {
             int n = (i + 1) % 4;
-            gizmos.DrawLine(near[i], near[n]); // near rectangle
-            gizmos.DrawLine(far[i], far[n]);   // far rectangle
-            gizmos.DrawLine(near[i], far[i]);  // connecting edge
+            gizmos.DrawLine(near[i], near[n]);
+            gizmos.DrawLine(far[i], far[n]);
+            gizmos.DrawLine(near[i], far[i]);
         }
     }
 
@@ -117,9 +109,9 @@ public class HDCamera : Behaviour, IViewProjectionProvider
         float h = tanV * dist;
         float w = h * aspect;
         Vector3 c = pos + fwd * dist;
-        outCorners[0] = c + up * h - right * w; // top-left
-        outCorners[1] = c + up * h + right * w; // top-right
-        outCorners[2] = c - up * h + right * w; // bottom-right
-        outCorners[3] = c - up * h - right * w; // bottom-left
+        outCorners[0] = c + up * h - right * w;
+        outCorners[1] = c + up * h + right * w;
+        outCorners[2] = c - up * h + right * w;
+        outCorners[3] = c - up * h - right * w;
     }
 }

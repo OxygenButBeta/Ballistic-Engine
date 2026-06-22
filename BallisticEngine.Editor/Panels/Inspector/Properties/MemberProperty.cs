@@ -1,13 +1,8 @@
-using System;
 using System.Reflection;
 using SysVec3 = System.Numerics.Vector3;
 
 namespace BallisticEngine.Editor.Inspector;
 
-// IProperty over a reflected component member (the component-inspector path). Mirrors the old DrawMember
-// value access (ComponentReflection.Get/SetValue). The host passes an `apply` delegate that routes
-// through InspectorPanel.ApplyMember (multi-select) + MarkViewportDirty; the headless test uses the
-// default reflection set so the pipeline logic is exercised without the editor.
 public sealed class MemberProperty : IProperty {
     readonly MemberInfo member;
     readonly object owner;
@@ -21,8 +16,6 @@ public sealed class MemberProperty : IProperty {
         ValueType = member is PropertyInfo p ? p.PropertyType : ((FieldInfo)member).FieldType;
     }
 
-    // Exposed so the component GUI adapter can reuse the existing InspectorPanel helpers
-    // (DrawMixedMarker / DrawAssetSlot) that need the raw member + target.
     public MemberInfo Member => member;
     public object Owner => owner;
 

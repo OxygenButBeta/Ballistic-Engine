@@ -16,14 +16,8 @@ public interface IInputProvider
     Vector2 ScrollDelta { get; }
     Vector2 MousePosition { get; }
 
-    // Per-frame mouse movement in pixels. Unlike (MousePosition - lastMousePosition) tracking, this
-    // keeps working while the cursor is GRABBED (locked to the window centre), which is exactly when
-    // first-person look needs it.
     Vector2 MouseDelta { get; }
 
-    // ---- Gamepad (raw, by 0-based player index + raw button/axis index) ----
-    // The facade maps Xbox-style enums onto these raw indices. All return safe defaults (false / 0 /
-    // not-connected) when no controller is plugged into that slot, so game code never special-cases it.
     bool IsGamepadConnected(int playerIndex);
     bool IsGamepadButtonDown(int playerIndex, int button);
     bool IsGamepadButtonPressed(int playerIndex, int button);

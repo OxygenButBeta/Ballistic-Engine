@@ -1,5 +1,3 @@
-using System;
-
 namespace Facebook.Yoga
 {
     public struct YGValue : IEquatable<YGValue>

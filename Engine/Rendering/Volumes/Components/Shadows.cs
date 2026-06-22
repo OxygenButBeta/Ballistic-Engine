@@ -1,9 +1,5 @@
 namespace BallisticEngine;
 
-// Cascaded sun-shadow settings as a volume override (HDRP-style "Shadows"): max distance,
-// cascade count and split shape blend per volume, so an interior can pull the budget close
-// (short distance, near-loaded splits) while a vista volume pushes it out. Per-light acne
-// bias stays on DirectionalLight; this component owns the cascade LAYOUT.
 public sealed class Shadows : VolumeComponent {
     [Tooltip("How far from the camera sun shadows reach, in world units. The cascades " +
              "subdivide this distance, so shorter = sharper shadows everywhere.")]

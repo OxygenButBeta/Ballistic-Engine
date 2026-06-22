@@ -1,19 +1,12 @@
-using BallisticEngine.Core.GL;            // GLTime, GLInput (OpenTK input/timer — not GL-API-coupled)
-using BallisticEngine.DX12;               // Dx12Backend, Dx12SwapChain
-using BallisticEngine.GLImplementation;   // GLLogger (console logger — not GL-API-coupled)
+using BallisticEngine.Core.GL;
+using BallisticEngine.DX12;
+using BallisticEngine.GLImplementation;
 using OpenTK.Windowing.Common;
 using OpenTK.Windowing.Desktop;
 using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine.Editor;
 
-// The EDITOR's windowed DX12 host: an OpenTK GameWindow created with ContextAPI.NoAPI (NO GL context) whose
-// Win32 HWND drives a DX12 swapchain. Mirrors GLBallisticEngineWindow but presents through Dx12SwapChain
-// instead of Context.SwapBuffers — input, events, cursor, DPI, monitor and frame pacing are all GLFW and
-// context-independent, so they're reused unchanged (the runtime DirectXRenderAsset renders the scene into
-// offscreen targets exactly as headless; only the present surface is new). Selected by Program.cs when
-// BALLISTIC_BACKEND=dx12. The DX12 ImGui backend records into swapChain.CommandList between BeginFrame and
-// Present (see ImGuiDx12Renderer / ImGuiController).
 public sealed class Dx12BallisticEngineWindow : GameWindow, IBallisticEngineRuntime, IWindow {
     public event Action<double> WindowUpdateCallback;
     public event Action<double> WindowRenderCallback;
@@ -34,13 +27,10 @@ public sealed class Dx12BallisticEngineWindow : GameWindow, IBallisticEngineRunt
     public float FrameRate => currentFps;
     public event Action<int, int> OnResizeCallback;
 
-    // The DX12 present surface (flip-model swapchain). Created in OnLoad (device + HWND both ready by then);
-    // the ImGui backend resolves its open UI command list through this.
     Dx12SwapChain swapChain;
     public Dx12SwapChain SwapChain => swapChain;
 
     public void SetFrequency(int frequency) => UpdateFrequency = frequency;
-    // Present is driven by OnRenderFrame; the engine's IWindow.SwapFrameBuffers seam is unused by the editor.
     public void SwapFrameBuffers() { }
 
     public CursorMode CursorMode {
@@ -58,8 +48,6 @@ public sealed class Dx12BallisticEngineWindow : GameWindow, IBallisticEngineRunt
 
     public Dx12BallisticEngineWindow(int width, int height) : base(GameWindowSettings.Default,
         new NativeWindowSettings {
-            // NO OpenGL context — DX12 owns the surface via the HWND. With ContextAPI.NoAPI, GLFW creates the
-            // window without a client API and NativeWindow.Context is null (so we never call Context.*).
             API = ContextAPI.NoAPI,
             WindowBorder = WindowBorder.Resizable,
             StartFocused = true,
@@ -77,8 +65,6 @@ public sealed class Dx12BallisticEngineWindow : GameWindow, IBallisticEngineRunt
         base.OnLoad();
         IsVisible = true;
         Focus();
-        // The DX12 device is up (DirectXRenderAsset.Initialize ran during the EditorApplication ctor, before
-        // Run()); the HWND exists. Create the swapchain at the current (already-maximized) client size.
         width = ClientSize.X; height = ClientSize.Y;
         swapChain = new Dx12SwapChain(Dx12Backend.Device, GetHwnd(), width, height);
     }
@@ -89,20 +75,18 @@ public sealed class Dx12BallisticEngineWindow : GameWindow, IBallisticEngineRunt
         base.OnResize(e);
         width = e.Width;
         height = e.Height;
-        swapChain?.Resize(e.Width, e.Height);   // null before OnLoad — created at current size there
+        swapChain?.Resize(e.Width, e.Height);
         OnResizeCallback?.Invoke(e.Width, e.Height);
     }
 
     protected override void OnRenderFrame(FrameEventArgs args) {
-        if (swapChain == null) { base.OnRenderFrame(args); return; }   // before OnLoad (shouldn't happen)
+        if (swapChain == null) { base.OnRenderFrame(args); return; }
 
-        // Open the UI command list + clear the backbuffer (graphite editor base), run the editor frame (the
-        // ImGui DX12 backend records into swapChain.CommandList), then execute, optionally read back, present.
         swapChain.BeginFrame(0.05f, 0.05f, 0.06f);
         using (Profiler.Zone("RenderFrame"))
             WindowRenderCallback?.Invoke(args.Time);
-        swapChain.EndFrame();              // execute the UI list + GPU flush — backbuffer now holds the UI
-        DrainScreenshotRequests();         // reads the backbuffer, so it must run BEFORE the present flip
+        swapChain.EndFrame();
+        DrainScreenshotRequests();
         using (Profiler.Zone("Present"))
             swapChain.Present(vsync: true);
         base.OnRenderFrame(args);
@@ -122,11 +106,6 @@ public sealed class Dx12BallisticEngineWindow : GameWindow, IBallisticEngineRunt
         base.OnUnload();
     }
 
-    // ---- Headless screenshot harness (same env contract as the GL window) ---------------------------
-    // BALLISTIC_SCREENSHOT=<path.bmp> captures the editor frame BALLISTIC_SCREENSHOT_FRAME and exits — the
-    // primary way to verify the DX12 editor headlessly. Also drains the Screenshots queue (MCP editor_screenshot
-    // / scripts). Reads the swapchain backbuffer (which holds the full UI after EndFrame). IdMaps is GL-only,
-    // skipped here.
     static readonly string ScreenshotPath = Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT");
     static readonly int ScreenshotFrame = int.TryParse(
         Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT_FRAME"), out var f) ? f : 180;

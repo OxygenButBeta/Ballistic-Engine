@@ -4,7 +4,6 @@ using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine.Editor;
 
-// Feeds OpenTK keyboard/mouse/text into ImGuiIO each frame.
 internal static class ImGuiInput {
     public static void Update(GameWindow window) {
         ImGuiIOPtr io = ImGui.GetIO();
@@ -17,9 +16,6 @@ internal static class ImGuiInput {
         io.AddMouseWheelEvent(mouse.ScrollDelta.X, mouse.ScrollDelta.Y);
 
         KeyboardState kb = window.KeyboardState;
-        // Hexa exposes io.KeyCtrl/Shift/Alt as read-only — feed the modifier state through the event
-        // queue instead (AddKeyEvent on the Mod* keys is the supported path; ImGui keeps io.KeyCtrl
-        // etc. in sync internally).
         io.AddKeyEvent(ImGuiKey.ModCtrl, kb.IsKeyDown(Keys.LeftControl) || kb.IsKeyDown(Keys.RightControl));
         io.AddKeyEvent(ImGuiKey.ModShift, kb.IsKeyDown(Keys.LeftShift) || kb.IsKeyDown(Keys.RightShift));
         io.AddKeyEvent(ImGuiKey.ModAlt, kb.IsKeyDown(Keys.LeftAlt) || kb.IsKeyDown(Keys.RightAlt));
@@ -28,7 +24,6 @@ internal static class ImGuiInput {
             io.AddKeyEvent(imguiKey, kb.IsKeyDown(key));
     }
 
-    // Wire once: window.TextInput -> ImGui character input.
     public static void OnTextInput(uint unicode) => ImGui.GetIO().AddInputCharacter(unicode);
 
     static readonly (Keys, ImGuiKey)[] KeyMap = BuildKeyMap();

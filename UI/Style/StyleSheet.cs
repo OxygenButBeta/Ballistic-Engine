@@ -1,28 +1,21 @@
-using System;
-using System.Collections.Generic;
 using System.Text;
 
 namespace BallisticEngine.UI;
 
-// A parsed .uss stylesheet: an ordered list of rules (selector + declaration block). Apply() runs the
-// cascade over a VisualElement tree — for each element, every matching rule's declarations are applied
-// in specificity order (low to high) so the most specific rule wins, then inline style="" (applied at
-// load time, highest precedence) sits on top. This is the styling half of a ported design.
-//
-// Supported selectors (Selector.cs): type (Button), .class, #name, :pseudo (hover/active/disabled/
-// focus), descendant combinator (space), and comma-separated selector lists. Comments (/* ... */) and
-// :root-style blocks are tolerated. Unsupported at-rules are skipped, not fatal.
 public sealed class StyleSheet
 {
     public sealed class Rule
     {
         public Selector Selector;
-        public string Declarations;          // raw "prop: val; ..." applied via StyleApplier
-        public int Order;                    // source order, tiebreaker for equal specificity
+        public string Declarations;
+        public int Order;
     }
 
     readonly List<Rule> _rules = new();
     public IReadOnlyList<Rule> Rules => _rules;
+
+    readonly Dictionary<string, string> _vars = new(StringComparer.Ordinal);
+    public IReadOnlyDictionary<string, string> Variables => _vars;
 
     public static StyleSheet Parse(string uss)
     {
@@ -46,11 +39,12 @@ public sealed class StyleSheet
 
             if (selectorPart.Length == 0) continue;
 
-            // A selector list "a, b, c { ... }" produces one rule per selector sharing the body.
+            sheet.CollectVars(body);
+
             foreach (var sel in selectorPart.Split(',', StringSplitOptions.RemoveEmptyEntries))
             {
                 var parsed = ParseSelector(sel.Trim());
-                if (parsed == null) continue; // unsupported (e.g. an at-rule) — skip quietly
+                if (parsed == null) continue;
                 sheet._rules.Add(new Rule { Selector = parsed, Declarations = body, Order = order++ });
             }
         }
@@ -58,7 +52,6 @@ public sealed class StyleSheet
         return sheet;
     }
 
-    // Runs the cascade over the whole subtree rooted at `root` (inclusive).
     public void Apply(VisualElement root)
     {
         ApplyToElement(root);
@@ -68,24 +61,39 @@ public sealed class StyleSheet
 
     void ApplyToElement(VisualElement el)
     {
-        // Collect matching rules, then apply in ascending specificity (then source order) so higher
-        // specificity / later rules override earlier ones — the CSS cascade.
-        List<Rule> matched = null;
+        var matched = CollectMatched(el, null);
+        if (matched == null) return;
+        foreach (var rule in matched)
+            StyleApplier.ApplyInline(el.Style, rule.Declarations);
+    }
+
+    public List<Rule> CollectMatched(VisualElement el, List<Rule> into)
+    {
+        List<Rule> matched = into;
         foreach (var rule in _rules)
         {
             if (rule.Selector.Matches(el))
                 (matched ??= new List<Rule>()).Add(rule);
         }
-        if (matched == null) return;
+        if (matched != null && matched.Count > 1)
+            matched.Sort(static (x, y) =>
+            {
+                int cmp = CompareSpecificity(x.Selector.Specificity(), y.Selector.Specificity());
+                return cmp != 0 ? cmp : x.Order.CompareTo(y.Order);
+            });
+        return matched;
+    }
 
-        matched.Sort(static (x, y) =>
+    void CollectVars(string body)
+    {
+        foreach (var decl in body.Split(';', StringSplitOptions.RemoveEmptyEntries))
         {
-            int cmp = CompareSpecificity(x.Selector.Specificity(), y.Selector.Specificity());
-            return cmp != 0 ? cmp : x.Order.CompareTo(y.Order);
-        });
-
-        foreach (var rule in matched)
-            StyleApplier.ApplyInline(el.Style, rule.Declarations);
+            int colon = decl.IndexOf(':');
+            if (colon <= 0) continue;
+            string name = decl[..colon].Trim();
+            if (!name.StartsWith("--")) continue;
+            _vars[name] = decl[(colon + 1)..].Trim();
+        }
     }
 
     static int CompareSpecificity((int a, int b, int c) x, (int a, int b, int c) y)
@@ -95,32 +103,48 @@ public sealed class StyleSheet
         return x.c.CompareTo(y.c);
     }
 
-    // ---------------------------------------------------------------- parsing helpers
-
-    // Parses "Button.primary#buy:hover descendant" into a Selector. Returns null for unsupported
-    // input (an at-rule like @media, or an empty token) so the caller can skip it.
     static Selector ParseSelector(string text)
     {
         if (text.Length == 0 || text[0] == '@') return null;
 
         var selector = new Selector();
-        foreach (var compoundText in text.Split(new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries))
+        var tokens = text.Split(new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+        Combinator pending = Combinator.Descendant;
+        bool first = true;
+
+        foreach (var tok in tokens)
         {
-            // Ignore child/sibling combinator tokens (>, +, ~) for v1 — treat them as descendant.
-            if (compoundText is ">" or "+" or "~") continue;
-            var compound = ParseCompound(compoundText);
-            if (compound != null) selector.Chain.Add(compound);
+            if (tok == ">") { pending = Combinator.Child; continue; }
+            if (tok == "+") { pending = Combinator.AdjacentSibling; continue; }
+            if (tok == "~") { pending = Combinator.GeneralSibling; continue; }
+
+            var compound = ParseCompound(tok);
+            if (compound == null) continue;
+            compound.CombinatorToPrev = first ? Combinator.Descendant : pending;
+            selector.Chain.Add(compound);
+            pending = Combinator.Descendant;
+            first = false;
         }
         return selector.Chain.Count > 0 ? selector : null;
     }
 
-    // Parses one compound like "Button.primary#buy:hover" or ".chip" or "*".
     static SimpleSelector ParseCompound(string text)
     {
         var s = new SimpleSelector();
+
+        int notIdx;
+        while ((notIdx = text.IndexOf(":not(", StringComparison.OrdinalIgnoreCase)) >= 0)
+        {
+            int close = text.IndexOf(')', notIdx + 5);
+            if (close < 0) break;
+            string inner = text[(notIdx + 5)..close].Trim();
+            if (inner.StartsWith(".")) s.NotClasses.Add(inner[1..]);
+            text = text[..notIdx] + text[(close + 1)..];
+        }
+
         int idx = 0;
         var token = new StringBuilder();
-        char kind = ' '; // ' ' = type, '.' = class, '#' = name, ':' = pseudo
+        char kind = ' ';
 
         void Flush()
         {
@@ -130,8 +154,8 @@ public sealed class StyleSheet
             {
                 case '.': s.Classes.Add(t); break;
                 case '#': s.Name = t; break;
-                case ':': s.PseudoState = MapPseudo(t); break;
-                default: if (t != "*") s.TypeName = t; break; // '*' = universal -> null type
+                case ':': s.PseudoStates.Add(MapPseudo(t)); break;
+                default: if (t != "*") s.TypeName = t; break;
             }
             token.Clear();
         }
@@ -154,8 +178,6 @@ public sealed class StyleSheet
         return s;
     }
 
-    // Maps CSS pseudo-class names to the state-class names the input module/elements set. Unknown
-    // pseudos pass through as-is (so a custom state class still matches).
     static string MapPseudo(string pseudo) => pseudo.ToLowerInvariant() switch
     {
         "hover" => "hover",
@@ -168,7 +190,6 @@ public sealed class StyleSheet
 
     static string StripComments(string s)
     {
-        // Remove /* ... */ blocks. Cheap single-pass; USS has no // line comments.
         var sb = new StringBuilder(s.Length);
         for (int i = 0; i < s.Length; i++)
         {

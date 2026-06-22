@@ -1,9 +1,6 @@
 
 namespace BallisticEngine.Editor;
 
-// A free-fly camera the editor uses to view the scene, independent of any HDCamera in the scene.
-// Drives the renderer as an IViewProjectionProvider. RMB-look + WASDQE move, scroll adjusts speed.
-// Aspect comes from the viewport panel, not the OS window.
 internal sealed class EditorCamera : IViewProjectionProvider {
     readonly Transform transform = new();
 
@@ -24,21 +21,15 @@ internal sealed class EditorCamera : IViewProjectionProvider {
     public Transform Transform => transform;
     public Vector3 AmbientColor => Vector3.One * 0.1f;
 
-    // Move so the target fills a comfortable portion of the view, keeping the current look direction.
     public void Focus(Vector3 target, float radius) {
         transform.Position = target - transform.Forward * Math.Max(2f, radius * 3f);
     }
 
-    // Snap the camera to look along `direction` (e.g. the orientation gizmo's front/top/side axes),
-    // orbiting around the point it currently looks at so the framed content stays put. Derives
-    // yaw/pitch as the inverse of the Update() convention (Forward = qYaw * qPitch * UnitZ, i.e.
-    // Forward = (cosP*sinY, -sinP, cosP*cosY)).
     public void LookDirection(Vector3 direction) {
         if (direction.LengthSquared() < 1e-6f)
             return;
         direction = direction.Normalized();
 
-        // Keep looking at the same focus point (a fixed distance ahead) after re-orienting.
         const float orbitDistance = 12f;
         Vector3 focus = transform.Position + transform.Forward * orbitDistance;
 
@@ -66,8 +57,6 @@ internal sealed class EditorCamera : IViewProjectionProvider {
 
     bool flying;
 
-    // Unity-style fly-cam: hold RMB over the Scene view to look around and move with WASDQE.
-    // Once flying, control persists while RMB stays held, even if the cursor leaves the panel.
     public void Update(float dt, bool hovered, EditorInput input) {
         flying = input.RightMouseDown && (flying || hovered);
         if (!flying)
@@ -97,14 +86,12 @@ internal sealed class EditorCamera : IViewProjectionProvider {
             transform.Position += direction.Normalized() * speed * dt;
     }
 
-    // "px,py,pz,pitch,yaw" — persisted per project so the Scene-view camera reopens where it was.
     public string SerializePose() {
         Vector3 p = transform.Position;
         return string.Format(System.Globalization.CultureInfo.InvariantCulture,
             "{0},{1},{2},{3},{4}", p.X, p.Y, p.Z, pitch, yaw);
     }
 
-    // Applies a pose string produced by SerializePose. No-ops on malformed input.
     public void RestorePose(string pose) {
         if (string.IsNullOrEmpty(pose))
             return;

@@ -4,14 +4,7 @@ using BallisticEngine.Serialization;
 
 namespace BallisticEngine.Cli;
 
-// Document-level .scene plumbing shared by CLI verbs (GL-free, no engine boot). The YAML round-trip
-// through the object-typed member maps erases value types (numbers/bools come back as strings,
-// vectors as generic maps); Save() restores them — type-aware via the component registry where the
-// type is known — so a CLI edit re-serializes in the engine's own output shape and the git diff
-// stays local to the edit instead of churning every scalar in the file.
 internal static class SceneFile {
-    // ---- load / save --------------------------------------------------------
-
     public static SceneDocument Load(string path) {
         if (!File.Exists(path))
             throw new Exception($"scene file not found: '{path}'");
@@ -30,8 +23,6 @@ internal static class SceneFile {
         File.WriteAllText(path, SceneYaml.Serializer.Serialize(doc));
     }
 
-    // Restores member-value types erased by the object-typed round-trip (see class comment).
-    // Safe to call on a document that is only being read (used by `get` so JSON shows numbers).
     public static void NormalizeDocument(SceneDocument doc) {
         foreach (ComponentDocument c in doc.SceneComponents ?? [])
             NormalizeMembers(c, c.Type is null ? null : ComponentRegistry.ResolveScene(c.Type));
@@ -59,8 +50,6 @@ internal static class SceneFile {
         if (raw is null) return null;
         if (memberType is not null) {
             Type t = Nullable.GetUnderlyingType(memberType) ?? memberType;
-            // String-shaped on disk already: keep verbatim (a numeric-looking string member must
-            // not silently become a number).
             if (t == typeof(string) || t.IsEnum || typeof(BObject).IsAssignableFrom(t) ||
                 t == typeof(AnimationCurve) || t == typeof(ColorGradient))
                 return raw;
@@ -78,9 +67,6 @@ internal static class SceneFile {
         return NormalizeLoose(raw);
     }
 
-    // Best-effort restore for values without a known member type (game components when the script
-    // dll isn't available, BEvent internals): scalars regain bool/number-ness, vector-shaped maps
-    // regain flow-map emission, keys become strings.
     static object NormalizeLoose(object raw) {
         switch (raw) {
             case string s:
@@ -109,7 +95,6 @@ internal static class SceneFile {
 
     static bool IsFloatType(Type t) => t == typeof(float) || t == typeof(double) || t == typeof(decimal);
 
-    // {x: .., y: ..[, z: ..[, w: ..]]} with exactly `count` numeric components, in xyzw order.
     static bool TryVec(Dictionary<object, object> map, int count, out float[] values) {
         values = new float[count];
         if (map.Count != count) return false;
@@ -124,11 +109,6 @@ internal static class SceneFile {
         return true;
     }
 
-    // ---- registry -----------------------------------------------------------
-
-    // Builds the component registry from the engine assembly PLUS the project's precompiled game
-    // scripts (Library/ScriptAssemblies/GameScripts.dll, byte-loaded so the file never locks) so
-    // game-script components resolve for typing and validation. Falls back to engine-only.
     public static void BuildRegistry(string scenePath) => BuildRegistryForRoot(FindProjectRoot(scenePath));
 
     public static void BuildRegistryForRoot(string? root) {
@@ -141,7 +121,6 @@ internal static class SceneFile {
         ComponentRegistry.Build(assemblies.ToArray());
     }
 
-    // Nearest ancestor directory of `path` containing project.json, or null.
     public static string? FindProjectRoot(string path) {
         DirectoryInfo? dir = new FileInfo(Path.GetFullPath(path)).Directory;
         for (int i = 0; dir is not null && i < 16; i++, dir = dir.Parent)
@@ -150,17 +129,12 @@ internal static class SceneFile {
         return null;
     }
 
-    // Project root from a CLI argument that may be the root itself or any path inside it.
     public static string ResolveProjectRoot(string pathArg) =>
         Directory.Exists(pathArg) && File.Exists(Path.Combine(pathArg, "project.json"))
             ? Path.GetFullPath(pathArg)
             : FindProjectRoot(pathArg)
               ?? throw new Exception($"no project.json found at or above '{pathArg}'");
 
-    // ---- entity addressing --------------------------------------------------
-
-    // Resolves an entity by exact id, unique id prefix (>= 6 hex chars), exact name, or unique
-    // name substring (all case-insensitive). Ambiguity and misses produce actionable errors.
     public static EntityDocument ResolveEntity(SceneDocument doc, string query) {
         List<EntityDocument> entities = doc.Entities ?? [];
 
@@ -190,11 +164,6 @@ internal static class SceneFile {
             + (hint is null ? "" : $" — did you mean '{hint}'?"));
     }
 
-    // ---- value parsing ------------------------------------------------------
-
-    // Parses a CLI string into the typed value a member of `memberType` stores in the YAML members
-    // map. Returns null to mean "remove the member" (asset refs set to none). Throws with an
-    // actionable message on mismatch — this is the agent's set-time validation.
     public static object? ParseMemberValue(Type memberType, string input, string scenePath) {
         Type t = Nullable.GetUnderlyingType(memberType) ?? memberType;
 
@@ -227,8 +196,6 @@ internal static class SceneFile {
         throw new Exception($"members of type {t.Name} can't be set from the CLI yet (use the editor or an editor script)");
     }
 
-    // Best-effort scalar parse when the component type isn't in the registry (game dll missing):
-    // the engine coerces on load, so bool/number/string is enough.
     public static object ParseLoose(string input) {
         if (bool.TryParse(input, out bool b)) return b;
         if (long.TryParse(input, NumberStyles.Integer, CultureInfo.InvariantCulture, out long l)) return l;
@@ -263,7 +230,6 @@ internal static class SceneFile {
         return values;
     }
 
-    // Engine convention (Transform.EulerAngles): degrees in, Quaternion.FromEulerAngles(radians).
     public static Quaternion EulerDegreesToQuaternion(Vector3 degrees) =>
         BQuaternion.FromEulerAngles(
             MathHelper.DegreesToRadians(degrees.X),
@@ -278,8 +244,6 @@ internal static class SceneFile {
             MathHelper.RadiansToDegrees(radians.Z));
     }
 
-    // Asset refs are written PATH-FORM by policy (agents can verify a path against the file system;
-    // they can't verify 32 hex chars). guid: form is accepted verbatim. "none" removes the member.
     static string? ParseAssetRef(string input, string scenePath) {
         if (input is "none" or "null") return null;
         if (input.StartsWith("guid:", StringComparison.OrdinalIgnoreCase)) {
@@ -297,13 +261,9 @@ internal static class SceneFile {
         return norm;
     }
 
-    // ---- output -------------------------------------------------------------
-
-    // Member-name casing as the serializer writes it (SceneSerializer camelCases member names).
     public static string CamelCase(string name) =>
         name.Length == 0 ? name : char.ToLowerInvariant(name[0]) + name[1..];
 
-    // Projects a (normalized) member value to a System.Text.Json-friendly shape.
     public static object? ToJsonValue(object? value) => value switch {
         null => null,
         Vector2 v => new { x = v.X, y = v.Y },

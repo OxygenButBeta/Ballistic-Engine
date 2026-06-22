@@ -1,25 +1,19 @@
-using System;
-using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 
 namespace Facebook.Yoga
 {
-    // Structs
     public struct YGSize
     {
         public float Width;
         public float Height;
     }
 
-    // Delegates
     public delegate YGSize YGMeasureFunc(Node node, float availableWidth, MeasureMode widthMode, float availableHeight, MeasureMode heightMode);
     public delegate float YGBaselineFunc(Node node, float width, float height);
     public delegate void YGDirtiedFunc(Node node);
 
     public class Node
     {
-
-        // Members
         private bool _hasNewLayout = true;
         private bool _isReferenceBaseline = false;
         private bool _isDirty = true;
@@ -43,7 +37,6 @@ namespace Facebook.Yoga
         private Config? _config;
         private StyleSizeLength[] _processedDimensions = new StyleSizeLength[] { StyleSizeLength.Undefined(), StyleSizeLength.Undefined() };
 
-        // Public properties for external access
         public Config Config => _config!;
         public LayoutResults Layout { get => _layout; set => _layout = value; }
         public Style Style => _style;
@@ -53,7 +46,6 @@ namespace Facebook.Yoga
         
         public LayoutableChildren<Node> LayoutChildren => GetLayoutChildren();
 
-        // Constructors
         public Node() : this(Config.Default) { }
 
         public Node(Config? config)
@@ -66,9 +58,6 @@ namespace Facebook.Yoga
             }
         }
 
-        // Copy constructor equivalent in C# - creates a deep copy of the node's own data
-        // but a shallow copy of child pointers (same as C++ default copy constructor).
-        // Does NOT change children's owner - that's the key difference from C++ move constructor.
         public void MoveFrom(Node other)
         {
             _hasNewLayout = other._hasNewLayout;
@@ -90,7 +79,6 @@ namespace Facebook.Yoga
             _processedDimensions = (StyleSizeLength[])other._processedDimensions.Clone();
         }
 
-        // Getters
         public object? GetContext() => _context;
         public bool GetHasNewLayout() => _hasNewLayout;
         public NodeType GetNodeType() => _nodeType;
@@ -106,7 +94,6 @@ namespace Facebook.Yoga
             if (float.IsNaN(size.Height) || size.Height < 0 ||
                 float.IsNaN(size.Width) || size.Width < 0)
             {
-                // yoga::log(...)
                 size.Width = Math.Max(0.0f, size.Width);
                 size.Height = Math.Max(0.0f, size.Height);
             }
@@ -145,7 +132,6 @@ namespace Facebook.Yoga
 
         public YGDirtiedFunc? GetDirtiedFunc() => _dirtiedFunc;
 
-        // Layout accessors
         public LayoutResults GetLayout() => _layout;
 
         public nuint GetLineIndex() => _lineIndex;
@@ -156,7 +142,6 @@ namespace Facebook.Yoga
         public Node? GetChild(nuint index) => _children[(int)index];
         public nuint GetChildCount() => (nuint)_children.Count;
 
-        // Layout Children (Iterator)
         public LayoutableChildren<Node> GetLayoutChildren()
         {
             return new LayoutableChildren<Node>(this);
@@ -194,7 +179,6 @@ namespace Facebook.Yoga
             return value + (dimensionPaddingAndBorder.IsDefined() ? dimensionPaddingAndBorder : FloatOptional.Zero);
         }
 
-        // Setters
         public void SetContext(object? context) => _context = context;
         public void SetAlwaysFormsContainingBlock(bool value) => _alwaysFormsContainingBlock = value;
         public void SetHasNewLayout(bool value) => _hasNewLayout = value;
@@ -208,7 +192,6 @@ namespace Facebook.Yoga
             }
             else
             {
-                // Assert: children_.empty()
                 SetNodeType(NodeType.Text);
             }
             _measureFunc = measureFunc;
@@ -224,7 +207,6 @@ namespace Facebook.Yoga
 
         public void SetConfig(Config? config)
         {
-            // Asserts would go here
             if (config == null) throw new ArgumentNullException(nameof(config));
 
             if (ConfigExtensions.ConfigUpdateInvalidatesLayout(_config!, config))
@@ -280,7 +262,6 @@ namespace Facebook.Yoga
         
         public void MarkChildrenWithDisplayNone()
         {
-            // Mark children that should not participate in layout
             foreach (var child in _children)
             {
                 if (child.Style.Display == Display.None)
@@ -307,7 +288,6 @@ namespace Facebook.Yoga
 
         public void SetPosition(Direction direction, float ownerWidth, float ownerHeight)
         {
-            // Root nodes should be always layouted as LTR, so we don't return negative values.
             var directionRespectingRoot = _owner != null ? direction : Direction.LTR;
             var mainAxis = _style.FlexDirection.ResolveDirection(directionRespectingRoot);
             var crossAxis = mainAxis.ResolveCrossDirection(directionRespectingRoot);
@@ -361,7 +341,7 @@ namespace Facebook.Yoga
 
         public FloatOptional ResolveFlexBasis(Direction direction, FlexDirection flexDirection, float referenceLength, float ownerWidth)
         {
-            var value = ProcessFlexBasis().Resolve(referenceLength); // returns FloatOptional
+            var value = ProcessFlexBasis().Resolve(referenceLength);
             if (_style.BoxSizing == BoxSizing.BorderBox)
             {
                 return value;
@@ -405,7 +385,6 @@ namespace Facebook.Yoga
         public void ClearChildren()
         {
             _children.Clear();
-            // _children.shrink_to_fit(); // Not available in standard C#
         }
 
         public void ReplaceChild(Node child, nuint index)
@@ -479,8 +458,6 @@ namespace Facebook.Yoga
                 Node child = _children[j];
                 if (child.GetOwner() != this)
                 {
-                    // var newChild = resolveRef(config_->cloneNode(child, this, i));
-                    // The Config.CloneNode method needs to be implemented
                     var newChild = _config!.CloneNode(child, this, (int)i);
                     newChild.SetOwner(this);
 
@@ -547,9 +524,6 @@ namespace Facebook.Yoga
 
         public void Reset()
         {
-            // Asserts: children empty, owner null
-            // Mimic the C++ assignment *this = Node{getConfig()};
-            
             _hasNewLayout = true;
             _isReferenceBaseline = false;
             _isDirty = true;

@@ -2,32 +2,14 @@ using BallisticEngine.Networking;
 
 namespace BallisticEngine;
 
-// The one networked base (plan §2/§4): is-a Behaviour, so single-player code is unchanged and the
-// editor/serializer/CLI discover it free. Carries the NET strand (OnSpawned -> OnStartX ->
-// NetworkTick -> OnDespawned) alongside the inherited Unity strand (OnBegin/OnEnabled/Tick/...).
-//
-// The §8.5 contract, enforced by the drivers below (not by FireEnable):
-//   net-logic lives ONLY in OnSpawned/OnDespawned; OnBegin/OnEnabled/OnDisabled are LOCAL cosmetic.
-// The §5 phase runner / Network.Spawn calls DriveNetSpawn FIRST (net strand, marks NetBegun), then the
-// Unity strand fires OnBegin/OnEnabled exactly once (the HasEnabled guard prevents the double-fire).
-//
-// P0 = the skeleton (§14 0b): identity/role via the entity's NetworkObject, the callbacks, and
-// trivially-true loopback ownership. NetworkTick, [Networked], RPCs, prediction are later phases.
 public abstract class NetworkBehaviour : Behaviour {
-    // The identity holder on this entity. Resolved lazily (the NetworkObject may be added after this
-    // component, or by Network.Spawn). Cached once found — no per-frame reflection (the standing rule).
     NetworkObject netObject;
 
     public NetworkObject NetworkObject =>
         netObject ??= Entity?.GetComponent<NetworkObject>();
 
-    // The net strand already ran (OnSpawned fired). The §5 mark so Phase 3's FireBegin knows to fire
-    // only the Unity strand, and so a double DriveNetSpawn is a no-op.
     internal bool NetBegun;
 
-    // ---- role queries (forward to the NetworkObject; the ONE place authority is decided) ----------
-    // Before spawn (no NetworkObject, or unspawned) these read as a non-authority proxy — safe defaults
-    // so a stray pre-spawn check never claims authority.
     public bool IsSpawned        => NetworkObject?.IsSpawned ?? false;
     public bool IsOwner          => NetworkObject?.IsOwner ?? false;
     public bool HasStateAuthority => NetworkObject?.HasStateAuthority ?? false;
@@ -37,104 +19,40 @@ public abstract class NetworkBehaviour : Behaviour {
     public bool IsSimulatedProxy => NetworkObject is null || NetworkObject.IsSimulatedProxy;
     public Connection Owner      => NetworkObject?.Owner ?? Connection.None;
 
-    // ---- net-strand callbacks (virtual; subclasses override) --------------------------------------
-    // Networked state is valid here; init visuals/subscriptions, spawn predicted children. NOT a place
-    // to assume REFERENCED objects exist (§8.5.2 — runtime spawn order is arbitrary).
     protected internal virtual void OnSpawned() { }
 
-    // Symmetric teardown — unsubscribe everything from OnSpawned (§8.5.3 exit matrix: fires for every
-    // graceful exit). Best-effort only on hard process kill.
     protected internal virtual void OnDespawned() { }
 
-    // Role-gated start hooks (plan §4e) — the framework targets each on the right machine, so the body
-    // has zero `if (IsServer)` / `if (IsOwner)`. P0 fires OnStartLocalPlayer on the input authority only
-    // (the owner-routed gate that SetupInput rides). OnStartServer/Client land with the transport (P3).
     protected internal virtual void OnStartServer() { }
     protected internal virtual void OnStartClient() { }
     protected internal virtual void OnStartLocalPlayer() { }
 
-    // Ownership transitions (plan §4e) — fires on the server + affected peers when input authority moves
-    // (TransferOwnership: pick-up, vehicle-enter, reconnect). prev/next are the old/new owner. By the
-    // time this fires, IsOwner/HasInputAuthority already reflect `next`, so the body reads the new role
-    // directly. Use it to (de)activate owner-only systems — e.g. wire input when you BECOME the owner.
     protected internal virtual void OnOwnershipChanged(Connection previous, Connection next) { }
 
-    // The single simulation step (plan §4c) — the only place [Networked] state mutates, once prediction
-    // lands (P5). P0 declares it so the contract is stable; the network tick wires it in P2+.
     protected internal virtual void NetworkTick() { }
 
-    // ---- interest management (P8b, plan §14 item 14) ----------------------------------------------
-    // Fired when this object leaves / re-enters a particular CLIENT's area of interest (AOI culling). The
-    // APPROVED decision (§14 item 14 (b)): an AOI transition is NOT a despawn — the object STAYS spawned,
-    // its lifecycle + OnSpawned subscriptions intact; only its replication to that one client pauses.
-    // Relevancy != disconnect, so these are SEPARATE from OnSpawned/OnDespawned (which would tear down the
-    // subscriptions). Server-side, per affected client. A game uses them to pause/resume per-client cosmetic
-    // work (e.g. stop streaming a distant prop's animation to a client that can't see it). The base is a
-    // no-op so an object that doesn't care pays nothing.
     protected internal virtual void OnInterestLost() { }
     protected internal virtual void OnInterestGained() { }
 
-    // Called right after a received snapshot applied [Networked] state (DeserializeState) — the seam to
-    // map replicated logical state onto PRESENTATION (e.g. write a [Networked] position onto the
-    // transform). Runs on EVERY machine that receives state (proxies + the autonomous owner pre-replay),
-    // so a SimulatedProxy's transform reflects the new state and the P5c interpolator can buffer it. The
-    // base is a no-op; a pawn that keeps its renderable pose in [Networked] fields overrides this. Distinct
-    // from NetworkTick (which SIMULATES) — this only PRESENTS already-applied state.
     protected internal virtual void OnStateApplied() { }
 
-    // ---- replication surface (plan §11 — the source generator OVERRIDES these) ---------------------
-    // A NetworkBehaviour subtype carrying [Networked] fields gets a generated PARTIAL that overrides
-    // these to a concrete, reflection-free body (changemask + delta vs the captured baseline). The base
-    // is a no-op so a NetworkBehaviour with NO [Networked] fields pays nothing and ships nothing — the
-    // generator only touches types that declare replicated state (§11's scoping). The network tick calls
-    // these polymorphically, so dispatch is a virtual call, never reflection.
-    //
-    // HasNetworkedState lets the tick skip non-replicating components without a type test; the generator
-    // sets it true in the override. TypeId/LayoutHash are 0 on the base (only generated types carry them).
     public virtual bool HasNetworkedState => false;
     public virtual int NetworkTypeId => 0;
     public virtual int NetworkLayoutHash => 0;
 
-    // Write the changemask + only-changed [Networked] fields vs the captured baseline (delta, §11). No-op
-    // on the base. Use SerializeFullState for a spawn/late-join baseline (every field, no diff).
     public virtual void SerializeState(BitWriter writer) { }
 
-    // Write EVERY [Networked] field unconditionally (a full snapshot, all changemask bits set) — the
-    // spawn / late-join baseline (§8.5: "OnSpawned = baseline delivered atomically"). A delta serialize
-    // here would be wrong: right after spawn the baseline already equals the live state, so the delta
-    // changemask is empty and the mirror would start at field defaults. DeserializeState reads it back
-    // identically (the mask is just all-set). No-op on the base.
     public virtual void SerializeFullState(BitWriter writer) { }
 
-    // Read a changemask + apply only the changed fields (clear bits keep the current value). No-op base.
     public virtual void DeserializeState(ref BitReader reader) { }
 
-    // Capture the current [Networked] values as this object's delta baseline (the last-ACK snapshot the
-    // next SerializeState diffs against). Called by the network tick after a successful send. No-op base.
     public virtual void CaptureNetworkBaseline() { }
 
-    // P6 PER-CLIENT BASELINE swap (plan §13 late-join). The component holds ONE delta baseline; per-client
-    // replication needs SerializeState to diff against each CLIENT's last-acked values. The manager swaps
-    // the active baseline around a per-client serialize: __SetNetBaseline(C's saved baseline) ->
-    // SerializeState (the bytes are C's delta) -> __GetNetBaseline() to record what C now has pending.
-    // The token is the generated baseline struct, BOXED — on the 20 Hz send path (per client/object), NOT
-    // the per-tick hot path, so the box is acceptable and there is NO reflection. The generator overrides
-    // these; the base returns/accepts null (a no-[Networked] component carries no baseline). The token is
-    // OPAQUE to the manager — it only round-trips it, never inspects fields.
     public virtual object __GetNetBaseline() => null;
     public virtual void __SetNetBaseline(object token) { }
 
-    // P6: true when the live [Networked] values equal the given baseline TOKEN — lets the per-client flush
-    // SKIP a quiescent object entirely (0 bytes) without a probe-and-rewind. A reflection-free typed compare
-    // the generator emits (it knows the fields); the base (no [Networked]) is trivially equal. Token is the
-    // boxed __NetBaseline struct from __GetNetBaseline; a mismatched/null token compares not-equal (safe —
-    // it just sends the delta).
     public virtual bool __NetStateEquals(object token) => true;
 
-    // ---- net-strand drivers (called by the phase runner / Network.Spawn, NOT by FireEnable) --------
-    // Drive OnSpawned + role hooks IN ORDER, before the Unity strand. Idempotent: a second call (the
-    // object touched by both Phase 1 and a later path) is a no-op via NetBegun. ScriptGuard-firewalled
-    // exactly like the Unity dispatch sites — a throwing OnSpawned can't crash play-start.
     internal void DriveNetSpawn() {
         if (NetBegun)
             return;
@@ -143,8 +61,6 @@ public abstract class NetworkBehaviour : Behaviour {
         try { OnSpawned(); }
         catch (Exception e) { ScriptGuard.Report(this, "OnSpawned", e); }
 
-        // Topology role hooks (P0: server/client fire on a host since it is both; refined in P3 when
-        // the transport distinguishes the local machine's role per object).
         if (Network.IsServer) {
             try { OnStartServer(); }
             catch (Exception e) { ScriptGuard.Report(this, "OnStartServer", e); }
@@ -153,15 +69,13 @@ public abstract class NetworkBehaviour : Behaviour {
             try { OnStartClient(); }
             catch (Exception e) { ScriptGuard.Report(this, "OnStartClient", e); }
         }
-        // Owner-gated: fires ONLY on the input authority. On a proxy this is never reached — the
-        // Grade-1 unrepresentable non-owner path (§3): there is no else, nothing to misuse.
+
         if (IsOwner) {
             try { OnStartLocalPlayer(); }
             catch (Exception e) { ScriptGuard.Report(this, "OnStartLocalPlayer", e); }
         }
     }
 
-    // Drive OnDespawned (graceful exit). Clears NetBegun so a pooled reuse re-runs OnSpawned (§8.5.4).
     internal void DriveNetDespawn() {
         if (!NetBegun)
             return;
@@ -171,8 +85,6 @@ public abstract class NetworkBehaviour : Behaviour {
         catch (Exception e) { ScriptGuard.Report(this, "OnDespawned", e); }
     }
 
-    // Drive OnOwnershipChanged (TransferOwnership). The NetworkObject's Authority/Owner are already
-    // updated, so the callback observes the NEW role. Only fires on a spawned object (NetBegun).
     internal void DriveOwnershipChanged(Connection previous, Connection next) {
         if (!NetBegun)
             return;
@@ -180,8 +92,6 @@ public abstract class NetworkBehaviour : Behaviour {
         catch (Exception e) { ScriptGuard.Report(this, "OnOwnershipChanged", e); }
     }
 
-    // Drive the P8b AOI transitions (a client's interest in this object changed). Firewalled like the other
-    // dispatch sites. Only on a spawned object (an interest change is meaningless before spawn / after despawn).
     internal void DriveInterestLost() {
         if (!NetBegun) return;
         try { OnInterestLost(); }
@@ -193,15 +103,8 @@ public abstract class NetworkBehaviour : Behaviour {
         catch (Exception e) { ScriptGuard.Report(this, "OnInterestGained", e); }
     }
 
-    // The connection the CURRENTLY-EXECUTING RPC was attributed to (plan §4b, P4) — valid ONLY inside an
-    // RPC impl body (the framework sets it right before invoking, the generated Invoke_<Name>). For a
-    // To.Server RPC this is the owning client that fired it (the owner-check already passed), so the server
-    // can attribute the action ("who shot"). For To.Owner/To.All it is the server. Connection.None outside
-    // an RPC. A property, not an impl parameter, so RPC impl signatures stay identical to the public method.
     public Connection RpcCaller { get; internal set; } = Connection.None;
 
-    // A generational handle to this component's object (§8.4) — store this, not a raw reference, for a
-    // cross-object link that must null out when the target despawns.
     public NetworkRef<TSelf> AsRef<TSelf>() where TSelf : NetworkBehaviour =>
         NetworkObject is { IsSpawned: true } no ? new NetworkRef<TSelf>(no.NetId) : default;
 }

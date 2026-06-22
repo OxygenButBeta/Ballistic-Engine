@@ -2,14 +2,6 @@ using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine;
 
-// A windowless DX12 host for the headless screenshot path (BALLISTIC_SCREENSHOT). Implements
-// IBallisticEngineRuntime with the REAL DirectXRenderAsset (a true DX12 device + offscreen render
-// target) but a fake window/timer/input — no OS window, no swapchain. Its Run() drives the engine
-// loop for a fixed number of frames, then reads the DX12 render target back to a BMP and exits,
-// exactly like GLBallisticEngineWindow's screenshot harness but with DX12 readback instead of
-// glReadPixels. A windowed DX12 host (swapchain + present + Windows input) comes later.
-//
-// Lives in the DX12 project (references Vortice); the Runtime exe selects it when BALLISTIC_BACKEND=dx12.
 public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
     public event Action<double> WindowUpdateCallback;
     public event Action<double> WindowRenderCallback;
@@ -19,58 +11,73 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
     public IInputProvider InputProvider { get; } = new NullInput();
     public IWindow Window { get; }
     public RenderAsset RenderAsset { get; } = new DirectXRenderAsset();
-    public ILogger Logger => null;   // hosts subscribe Debugging.OnMessage
+    public ILogger Logger => null;
 
     readonly HeadlessWindow window;
 
-    // Screenshot harness env vars (same contract as the GL window host).
     static readonly string ScreenshotPath = Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT");
     static readonly int ScreenshotFrame = int.TryParse(
         Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT_FRAME"), out int f) ? f : 180;
     static readonly bool ScreenshotExit = Environment.GetEnvironmentVariable("BALLISTIC_SCREENSHOT_EXIT") != "0";
 
-    // GI Phase-6 MOTION-stability harness (BALLISTIC_DX12_GI_MOTION_DUMP=<dir>): instead of one capture, save a
-    // SEQUENCE of the last K consecutive frames (frame_00.bmp … frame_{K-1}.bmp) so a python helper can measure
-    // frame-to-frame "boiling" (mean abs delta of consecutive GI-isolate frames). The point of Phase 6 is
-    // "stable under motion / no boiling", which a single PAUSED capture cannot show. Run this with a STATIC
-    // serialized camera + temporal ACTIVE (i.e. NOT BALLISTIC_DETERMINISTIC, which makes the temporal pass a
-    // pass-through) + GI-isolate on + exposure pinned: a STABLE temporal chain → consecutive deltas decay toward
-    // 0; a BOILING chain → deltas stay high. The total frame count runs to ScreenshotFrame so the field is
-    // converged before the dumped window; the last K frames are written. K = BALLISTIC_DX12_GI_MOTION_FRAMES (8).
-    static readonly string MotionDumpDir = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_MOTION_DUMP");
-    static readonly int MotionDumpFrames = int.TryParse(
-        Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_MOTION_FRAMES"), out int mf) && mf > 0 ? mf : 8;
-
     public Dx12HeadlessRuntime(int width = 1920, int height = 1080) {
+        RenderThread.HeadlessSuppressed = true;
         window = new HeadlessWindow(width, height, this);
         Window = window;
     }
 
-    // Drive the engine loop headlessly. EngineLoop subscribed WindowUpdateCallback/WindowRenderCallback;
-    // we fire them per frame at a fixed dt (deterministic), capture on the screenshot frame, then exit.
     void RunLoop() {
         OnWindowShow?.Invoke();
-        const double dt = 1.0 / 60.0;   // fixed step — deterministic frames for verification
+        const double dt = 1.0 / 60.0;
 
-        // Run until the screenshot frame, render it, save, exit. With no screenshot requested, run a few
-        // frames then stop (nothing to present without a swapchain). Query mode also needs a frame or two so
-        // the AS-feeding RuntimeSet<IStaticMeshRenderer> is populated before the query runs.
+        if ((window.Width != 1920 || window.Height != 1080)
+            && RenderAsset.Current.Renderer is DX12HDRenderer rr)
+            rr.ResizeSceneTarget(window.Width, window.Height);
+
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_RESIZE_STRESS") == "1") {
+            ResizeStress(dt);
+            return;
+        }
+
+        string fpsBenchEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_FPSBENCH");
+        if (int.TryParse(fpsBenchEnv, out int benchFrames) && benchFrames > 0) {
+            int warm = Math.Min(30, benchFrames / 4);
+            for (int f = 0; f < warm; f++) { WindowUpdateCallback?.Invoke(dt); WindowRenderCallback?.Invoke(dt); }
+
+            long gcBytes0 = GC.GetTotalAllocatedBytes(precise: false);
+            int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int f = 0; f < benchFrames; f++) { WindowUpdateCallback?.Invoke(dt); WindowRenderCallback?.Invoke(dt); }
+            sw.Stop();
+            long gcBytes = GC.GetTotalAllocatedBytes(precise: false) - gcBytes0;
+            int dg0 = GC.CollectionCount(0) - g0, dg1 = GC.CollectionCount(1) - g1, dg2 = GC.CollectionCount(2) - g2;
+            double msPerFrame = sw.Elapsed.TotalMilliseconds / benchFrames;
+            int fif = RenderAsset.Current.Renderer is DX12HDRenderer rb ? rb.Device.FramesInFlight : 1;
+            Console.WriteLine($"[FpsBench] frames={benchFrames} warmup={warm} avgFrameMs={msPerFrame:0.000} fps={1000.0 / msPerFrame:0.0} framesInFlight={fif} overlap={(fif > 1 ? "ON" : "off")}");
+            Console.WriteLine($"[FpsBench] gcAllocKB={gcBytes / 1024.0:0.0} bytesPerFrame={(double)gcBytes / benchFrames:0} gen0={dg0} gen1={dg1} gen2={dg2}");
+            return;
+        }
+
         bool queryMode = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("BALLISTIC_QUERY"));
-        bool motionMode = !string.IsNullOrWhiteSpace(MotionDumpDir);
-        // Motion harness runs to ScreenshotFrame total (field converged), dumping the LAST MotionDumpFrames.
-        int motionTotal = motionMode ? Math.Max(ScreenshotFrame, MotionDumpFrames) : 0;
-        int lastFrame = motionMode ? motionTotal
-            : ScreenshotPath is not null ? ScreenshotFrame
+        int lastFrame = ScreenshotPath is not null ? ScreenshotFrame
             : queryMode ? 3 : 5;
+        string motionDir = Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI_MOTION_DUMP");
+        if (!string.IsNullOrWhiteSpace(motionDir)) {
+            System.IO.Directory.CreateDirectory(motionDir);
+            int total = ScreenshotFrame > 0 ? ScreenshotFrame : 60;
+            int dumpTail = 8;
+            for (int frame = 1; frame <= total; frame++) {
+                WindowUpdateCallback?.Invoke(dt);
+                WindowRenderCallback?.Invoke(dt);
+                if (frame > total - dumpTail)
+                    SaveScreenshotTo(System.IO.Path.Combine(motionDir, $"frame{frame:D3}.bmp"));
+            }
+            return;
+        }
+
         for (int frame = 1; frame <= lastFrame; frame++) {
             WindowUpdateCallback?.Invoke(dt);
             WindowRenderCallback?.Invoke(dt);
-
-            if (motionMode && frame > motionTotal - MotionDumpFrames) {
-                SaveMotionFrame(frame - (motionTotal - MotionDumpFrames) - 1);   // 0-based index in the window
-                if (frame == motionTotal) { Console.WriteLine($"[GI-Motion] dumped {MotionDumpFrames} frames to {MotionDumpDir}"); return; }
-                continue;   // skip the single-shot screenshot logic while dumping the sequence
-            }
 
             if (ScreenshotPath is not null && frame == ScreenshotFrame) {
                 SaveScreenshot();
@@ -78,18 +85,44 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
             }
         }
 
-        // Scene-query mode for `bal query` (BALLISTIC_QUERY=<spec.json> -> BALLISTIC_QUERY_OUT): run the query
-        // against the live scene TLAS and write the result JSON, then exit. Same subprocess pattern as render.
         if (queryMode && RenderAsset.Current.Renderer is DX12HDRenderer qr) {
             DX12.Dx12QueryMode.Run(qr);
             return;
         }
 
-        // GpuSceneQuery real-scene smoke probe (BALLISTIC_DX12_SCENEQUERY_SMOKE="x,y,z;x,y,z;..."): after the
-        // scene has rendered (the AS-feeding RuntimeSet<IStaticMeshRenderer> is populated), build a
-        // GpuSceneQuery over the REAL scene TLAS and print occupancy + classify for each given world point.
-        // Validates the production AS-from-renderers path that the self-test door (synthetic box) can't.
         SceneQuerySmoke();
+    }
+
+    void ResizeStress(double dt) {
+        if (RenderAsset.Current.Renderer is not DX12HDRenderer r) {
+            Console.Error.WriteLine("[ResizeStress] DX12 renderer not active."); return;
+        }
+
+        for (int i = 0; i < 3; i++) { WindowUpdateCallback?.Invoke(dt); WindowRenderCallback?.Invoke(dt); }
+
+        (int w, int h)[] sizes = {
+            (1920,1080),(1600,900),(800,600),(1,1),(2,2),(7,3),(64,64),(1280,720),(3840,2160),
+            (1920,1080),(1281,721),(33,1080),(1920,17),(640,360),(2560,1440),(1200,800),(1920,1080),
+        };
+        foreach (var (w, h) in sizes) {
+            r.ResizeSceneTarget(w, h);
+            r.Device.Flush();
+            var afterResize = r.Device.Device.DeviceRemovedReason;
+            if (!afterResize.Success) {
+                Console.Error.WriteLine($"[ResizeStress] DEVICE REMOVED by REALLOC at {w}x{h}: reason={afterResize} DRED={r.Device.DrainDredReport()}");
+                Environment.Exit(3);
+            }
+            WindowUpdateCallback?.Invoke(dt);
+            WindowRenderCallback?.Invoke(dt);
+            var reason = r.Device.Device.DeviceRemovedReason;
+            if (!reason.Success) {
+                Console.Error.WriteLine($"[ResizeStress] DEVICE REMOVED by RENDER at {w}x{h}: reason={reason} DRED={r.Device.DrainDredReport()}");
+                if (r.Device.HasInfoQueue) Console.Error.WriteLine($"[ResizeStress] debug-msgs:\n{r.Device.DrainDebugMessages()}");
+                Environment.Exit(3);
+            }
+            Console.WriteLine($"[ResizeStress] ok {w}x{h}");
+        }
+        Console.WriteLine("[ResizeStress] PASS (no device removal across the size sequence)");
     }
 
     static void SceneQuerySmoke() {
@@ -130,26 +163,39 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
             Console.WriteLine($"[Screenshot] saved {r.Width}x{r.Height} to {ScreenshotPath} (DX12)");
             PrintPerfStats();
             GBufferDump(r);
+            HdrDump(r);
+            DrainValidation(r);
+            r.Device.SavePsoCache();
         }
         else {
             Console.Error.WriteLine("[Screenshot] DX12 renderer not active; nothing saved.");
         }
     }
 
-    // P6.0 motion harness: save one frame of the consecutive-frame sequence as frame_NN.bmp into MotionDumpDir.
-    void SaveMotionFrame(int index) {
-        if (RenderAsset.Current.Renderer is not DX12HDRenderer r) {
-            Console.Error.WriteLine("[GI-Motion] DX12 renderer not active; nothing saved.");
-            return;
-        }
-        System.IO.Directory.CreateDirectory(MotionDumpDir);
-        string path = System.IO.Path.Combine(MotionDumpDir,
-            string.Create(System.Globalization.CultureInfo.InvariantCulture, $"frame_{index:00}.bmp"));
-        r.SaveFrame(path);
+    void SaveScreenshotTo(string path) {
+        if (RenderAsset.Current.Renderer is DX12HDRenderer r)
+            r.SaveFrame(path);
     }
 
-    // Raw G-buffer dump for `bal gbuffer` (BALLISTIC_GBUFFER_DUMP=<dir>): after the frame, write depth/normal/
-    // albedo as raw .bin + a manifest.json the agent decodes. Runs in the screenshot path (a frame is rendered).
+    static void DrainValidation(DX12HDRenderer r) {
+        int newErrors = DX12.Dx12ValidationBaseline.DrainReportAndGate(r.Device);
+        if (newErrors > 0) {
+            Console.Error.WriteLine($"[DX12-Validation] exiting non-zero ({newErrors} NEW error-class message(s)).");
+            Environment.Exit(2);
+        }
+    }
+
+    static void HdrDump(DX12HDRenderer r) {
+        string file = Environment.GetEnvironmentVariable("BALLISTIC_DX12_HDR_DUMP");
+        if (string.IsNullOrWhiteSpace(file)) return;
+        string? d = System.IO.Path.GetDirectoryName(file);
+        if (!string.IsNullOrEmpty(d)) System.IO.Directory.CreateDirectory(d);
+        object manifest = r.DumpHdrColor(file);
+        System.IO.File.WriteAllText(file + ".manifest.json",
+            System.Text.Json.JsonSerializer.Serialize(manifest));
+        Console.WriteLine($"[HdrDump] wrote HDR scene color to {file} (DX12)");
+    }
+
     static void GBufferDump(DX12HDRenderer r) {
         string dir = Environment.GetEnvironmentVariable("BALLISTIC_GBUFFER_DUMP");
         if (string.IsNullOrWhiteSpace(dir)) return;
@@ -164,9 +210,6 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
         Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
             $"[PerfStats] draws={rs.DrawCalls} tris={rs.Triangles} (DX12)"));
 
-        // Structured perf surface for `bal perf` (BALLISTIC_STATS_OUT=<json>): emit RenderStats as JSON so the
-        // agent does autonomous perf work from numbers, not screenshots. (Per-pass GPU timestamp queries are a
-        // renderer-track follow-up; CPU frame ms + draw/tri/cull/light counters are wired today.)
         string statsOut = Environment.GetEnvironmentVariable("BALLISTIC_STATS_OUT");
         if (!string.IsNullOrWhiteSpace(statsOut)) {
             var payload = new {
@@ -182,7 +225,7 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
                 cpuFrameMs = rs.CpuFrameMs,
                 gpuFrameMs = rs.GpuFrameMs,
                 gpuPasses = rs.GpuPasses.Select(p => new { name = p.Name, ms = p.Ms }).ToArray(),
-                note = rs.GpuPasses.Count == 0 ? "per-pass GPU timestamp queries not yet wired on DX12 (renderer follow-up); cpuFrameMs + counters are live" : null,
+                note = rs.GpuPasses.Count == 0 ? "per-pass GPU timing off (set BALLISTIC_DX12_PASS_TIMING=1); cpuFrameMs + counters are live" : null,
             };
             System.IO.File.WriteAllText(statsOut,
                 System.Text.Json.JsonSerializer.Serialize(payload,
@@ -193,7 +236,6 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
         }
     }
 
-    // Host-driven clock (mirrors HeadlessRuntime.ManualTimer).
     sealed class ManualTimer : IEngineTimer {
         public double DeltaTime { get; private set; }
         public double TotalTime { get; private set; }
@@ -214,8 +256,6 @@ public sealed class Dx12HeadlessRuntime : IBallisticEngineRuntime {
         public float GetGamepadAxis(int playerIndex, int axis) => 0f;
     }
 
-    // A fake window: carries the render resolution and drives the loop in Run(). The renderer's offscreen
-    // target is sized to (Width, Height) at Initialize; resizing isn't needed headless.
     sealed class HeadlessWindow : IWindow {
         readonly Dx12HeadlessRuntime owner;
         public HeadlessWindow(int w, int h, Dx12HeadlessRuntime o) { Width = w; Height = h; owner = o; }

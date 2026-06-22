@@ -1,14 +1,6 @@
 
 namespace BallisticEngine;
 
-// Spawns instances of a prefab over time within a spawn area (Unity's typical spawner pattern) — the
-// gameplay workhorse for bullets, enemies, pickups, debris, ambient props. Optional OBJECT POOLING
-// reuses expired instances instead of destroying/re-instantiating them (the big perf win for things
-// that spawn constantly, like projectiles), via SetActive toggling rather than alloc churn.
-//
-// Spawns only in PLAY MODE (Tick). MaxAlive caps concurrent instances; Lifetime auto-expires them
-// (0 = never). The spawn area is Point/Box/Sphere centered on the entity. Self-clocked accumulator
-// drives the rate so fractional rates and frame-rate independence both work.
 [Component("Spawner", "Gameplay")]
 public sealed class Spawner : Behaviour {
     public enum Shape { Point, Box, Sphere }
@@ -44,10 +36,8 @@ public sealed class Spawner : Behaviour {
     [Tooltip("Give each spawned instance a random Y rotation.")]
     public bool RandomYaw { get; set; }
 
-    // Live instances and their remaining lifetime (parallel lists). Runtime-only.
     readonly List<Entity> alive = new();
     readonly List<float> ages = new();
-    // Pooled (inactive) instances available for reuse.
     readonly List<Entity> pool = new();
 
     float accumulator;
@@ -67,7 +57,6 @@ public sealed class Spawner : Behaviour {
     protected internal override void OnDetach() => Clear();
 
     protected internal override void Tick(in float delta) {
-        // Age + expire live instances.
         for (var i = alive.Count - 1; i >= 0; i--) {
             Entity e = alive[i];
             if (e is null || e.IsDestroyed) { RemoveAt(i); continue; }
@@ -77,7 +66,6 @@ public sealed class Spawner : Behaviour {
             }
         }
 
-        // Spawn at the configured rate, up to MaxAlive.
         if (SpawnRate > 0f && Prefab is not null) {
             accumulator += delta * SpawnRate;
             while (accumulator >= 1f && alive.Count < MaxAlive) {
@@ -85,11 +73,10 @@ public sealed class Spawner : Behaviour {
                 Spawn();
             }
             if (alive.Count >= MaxAlive)
-                accumulator = 0f; // don't bank spawns while capped
+                accumulator = 0f;
         }
     }
 
-    // Spawns one instance now (manual/burst). Respects MaxAlive. Returns the instance (or null).
     public Entity Spawn() {
         if (Prefab is null || alive.Count >= MaxAlive)
             return null;
@@ -115,19 +102,15 @@ public sealed class Spawner : Behaviour {
         return e;
     }
 
-    // Removes/recycles every instance this spawner owns (called on disable/detach, or manually).
     public void Clear() {
         for (var i = alive.Count - 1; i >= 0; i--)
             Despawn(i);
-        // Destroy any pooled instances too (we own them).
         foreach (Entity e in pool)
             if (e is not null && !e.IsDestroyed)
                 BObjects.Destroy(e);
         pool.Clear();
         accumulator = 0f;
     }
-
-    // ---- internals -----------------------------------------------------------
 
     void Despawn(int i) {
         Entity e = alive[i];
@@ -173,7 +156,6 @@ public sealed class Spawner : Behaviour {
         }
     }
 
-    // Editor: draw the spawn area so it's visible/tweakable.
     public override void OnDrawGizmosSelected(IGizmos gizmos) {
         gizmos.Color = new Vector3(0.3f, 1f, 0.5f);
         Vector3 c = transform.WorldPosition;

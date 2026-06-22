@@ -1,28 +1,17 @@
 
 namespace BallisticEngine;
 
-// Engine-side buffer of debug line segments requested by game code (Debug.DrawLine/DrawRay) and
-// engine systems. The engine layer is GL-free, so this just ACCUMULATES world-space colored
-// segments; a host renderer drains them each frame and paints them (the editor reuses its gizmo
-// line projection — see EditorApplication.DrawComponentGizmos). In a headless run nothing drains
-// the buffer, so Expire keeps it from growing without bound.
-//
-// Segments may carry a duration: 0 = this frame only (cleared after the drain), >0 = persist for
-// that many seconds (Unity's Debug.DrawLine duration). Persisted segments survive across frames so
-// you can draw a hit marker in a callback and still see it.
 public static class DebugDraw {
     public struct Segment {
         public Vector3 From;
         public Vector3 To;
-        public Vector3 Color;     // linear RGB, 0..1 (matches IGizmos.Color)
-        public float ExpiresAt;   // Time.TotalTime when it should drop; <=0 means single-frame
+        public Vector3 Color;
+        public float ExpiresAt;
     }
 
     static readonly List<Segment> segments = new(capacity: 256);
     static readonly Vector3 DefaultColor = new(1f, 1f, 1f);
 
-    // Whether ANY consumer wants debug lines. The editor sets this true; a shipped player leaves it
-    // false so Draw* calls early-out to nothing (no buffer growth, no overhead in release play).
     public static bool Enabled { get; set; }
 
     public static IReadOnlyList<Segment> Segments => segments;
@@ -46,7 +35,6 @@ public static class DebugDraw {
     public static void DrawRay(Vector3 origin, Vector3 direction) =>
         DrawLine(origin, origin + direction, DefaultColor);
 
-    // Axis-aligned (rotation-applied) wire box from center+size, as 12 segments.
     public static void DrawWireCube(Vector3 center, Vector3 size, Vector3 color,
         Quaternion rotation, float duration = 0f) {
         if (!Enabled)
@@ -85,8 +73,6 @@ public static class DebugDraw {
         }
     }
 
-    // Called by the host AFTER draining (editor) or once per frame (headless): drop single-frame
-    // segments and any timed segment that has expired. Persisted segments stay.
     public static void Expire() {
         float now = (float)Time.TotalTime;
         for (int i = segments.Count - 1; i >= 0; i--) {
@@ -96,7 +82,5 @@ public static class DebugDraw {
         }
     }
 
-    // Single-frame segments must clear even when no host drains them (headless/shipping): the host
-    // calls this each frame. Equivalent to Expire here, kept as a named entry for clarity.
     public static void Clear() => segments.Clear();
 }

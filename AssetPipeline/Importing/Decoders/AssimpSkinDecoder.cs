@@ -2,14 +2,6 @@ using Assimp;
 
 namespace BallisticEngine.AssetPipeline;
 
-// The skinned-mesh half of the Assimp decode (kept apart from AssimpMeshDecoder's STATIC path
-// because skinning needs the OPPOSITE of what static import does: static bakes each node's world
-// transform into the vertices, skinned must KEEP vertices in their authored bind/mesh space — the
-// bone matrices already place them). Only the AssetPipeline layer touches Assimp.
-//
-// Produces a single merged skinned MeshData (one submesh per source material, like the static merge)
-// plus the model's AnimationClipData[]. The skeleton is built from the union of every bone the
-// meshes reference, ordered pre-order so parent < child.
 public static class AssimpSkinDecoder {
     const int MaxInfluences = 4;
 
@@ -19,18 +11,14 @@ public static class AssimpSkinDecoder {
         public AnimationClipData[] Animations;
     }
 
-    // True if any mesh in the scene has bones — the importer routes such models here instead of the
-    // static DecodeScene path. Does a lightweight probe import (no post-processing) so the decision
-    // is cheap; the real Decode re-imports with full post-processing only when this returns true.
     public static bool SceneHasSkin(string path, bool flipUVs = true) {
         try {
             AssimpContext context = new();
-            // No post-processing for the probe — bones are present pre-process, and we only read flags.
             Assimp.Scene scene = context.ImportFile(path, PostProcessSteps.None);
             return SceneHasSkin(scene);
         }
         catch {
-            return false;   // unreadable here surfaces as a real error in the static decode path
+            return false;
         }
     }
 
@@ -48,7 +36,7 @@ public static class AssimpSkinDecoder {
         PostProcessSteps steps = PostProcessSteps.Triangulate
                                  | PostProcessSteps.GenerateSmoothNormals
                                  | PostProcessSteps.CalculateTangentSpace
-                                 | PostProcessSteps.LimitBoneWeights;   // caps influences at 4 per vertex
+                                 | PostProcessSteps.LimitBoneWeights;
         if (flipUVs)
             steps |= PostProcessSteps.FlipUVs;
 
@@ -56,24 +44,16 @@ public static class AssimpSkinDecoder {
         if (scene is null || scene.MeshCount == 0)
             throw new IOException($"Skinned mesh import failed or no meshes found in '{path}'.");
 
-        // 1. Build the skeleton: every bone name any mesh references, plus the ancestor chain up to
-        //    a shared root, ordered pre-order via a node walk.
         SkeletonData skeleton = BuildSkeleton(scene, out Dictionary<string, int> boneIndexByName);
 
-        // 2. Merge geometry by material (NOT baking node transforms — bind space), accumulating
-        //    per-vertex influences mapped through boneIndexByName.
         DecodedSkinnedModel model = MergeSkinned(scene, skeleton, boneIndexByName, out DecodedMaterial[] materials);
         model.SubMeshMaterials = materials;
 
-        // 3. Animation clips: per-bone keyframe channels, names resolved to skeleton indices.
         model.Animations = DecodeAnimations(scene, boneIndexByName);
         return model;
     }
 
-    // ---- Skeleton ----------------------------------------------------------
-
     static SkeletonData BuildSkeleton(Assimp.Scene scene, out Dictionary<string, int> indexByName) {
-        // Collect every bone name referenced + its offset matrix (inverse bind).
         var offsetByName = new Dictionary<string, Matrix4>();
         foreach (Assimp.Mesh mesh in scene.Meshes) {
             if (!mesh.HasBones) continue;
@@ -81,9 +61,6 @@ public static class AssimpSkinDecoder {
                 offsetByName[bone.Name] = AssimpMeshDecoder.ToOpenTKMatrix(bone.OffsetMatrix);
         }
 
-        // Walk the node tree pre-order; a node is a skeleton bone if it (or any descendant we keep)
-        // is referenced. Simplest correct v1: include every node that is a referenced bone OR an
-        // ancestor of one, so parent links are always present.
         var keep = new HashSet<string>();
         void MarkAncestors(Node node) {
             if (node is null) return;
@@ -99,7 +76,7 @@ public static class AssimpSkinDecoder {
         var names = new List<string>();
         var parents = new List<int>();
         var bindLocal = new List<Matrix4>();
-        var index = new Dictionary<string, int>();   // local: out params can't be captured by Visit
+        var index = new Dictionary<string, int>();
 
         void Visit(Node node, int parentIndex) {
             int myIndex = parentIndex;
@@ -123,8 +100,6 @@ public static class AssimpSkinDecoder {
         return new SkeletonData(names.ToArray(), parents.ToArray(), inverseBind, bindLocal.ToArray());
     }
 
-    // ---- Geometry merge (bind space) ---------------------------------------
-
     sealed class Accum {
         public readonly List<Vector3> Positions = new();
         public readonly List<Vector3> Normals = new();
@@ -138,10 +113,8 @@ public static class AssimpSkinDecoder {
     static DecodedSkinnedModel MergeSkinned(Assimp.Scene scene, SkeletonData skeleton,
         Dictionary<string, int> boneIndexByName, out DecodedMaterial[] materials) {
         var accumByMaterial = new Dictionary<int, Accum>();
-        var order = new List<int>();   // material indices in first-use order
+        var order = new List<int>();
 
-        // Walk nodes only to find which meshes exist; geometry stays in mesh space (no world bake),
-        // so we ignore node transforms entirely here.
         foreach (Assimp.Mesh mesh in scene.Meshes) {
             if (mesh.VertexCount == 0 || mesh.FaceCount == 0)
                 continue;
@@ -154,7 +127,6 @@ public static class AssimpSkinDecoder {
             AppendMesh(mesh, accum, boneIndexByName);
         }
 
-        // Flatten accumulators into arrays + submeshes.
         var positions = new List<Vector3>();
         var normals = new List<Vector3>();
         var tangents = new List<Vector4>();
@@ -198,7 +170,6 @@ public static class AssimpSkinDecoder {
         bool hasUVs = mesh.TextureCoordinateChannelCount > 0 && mesh.HasTextureCoords(0);
         bool hasTangents = mesh.HasTangentBasis;
 
-        // Gather per-vertex influences for THIS mesh's vertices.
         int vertexCount = mesh.VertexCount;
         var influences = new List<(int bone, float weight)>[vertexCount];
         for (var i = 0; i < vertexCount; i++)
@@ -249,8 +220,6 @@ public static class AssimpSkinDecoder {
         }
     }
 
-    // Keeps the top-4 influences by weight, normalizes them to sum 1. Empty -> bound fully to bone 0
-    // (a vertex with no weights would otherwise collapse to the origin under skinning).
     static void PackInfluences(List<(int bone, float weight)> list, out Vector4i indices, out Vector4 weights) {
         list.Sort((a, b) => b.weight.CompareTo(a.weight));
         Span<int> idx = stackalloc int[MaxInfluences];
@@ -269,8 +238,6 @@ public static class AssimpSkinDecoder {
         weights = new Vector4(wt[0] * inv, wt[1] * inv, wt[2] * inv, wt[3] * inv);
     }
 
-    // ---- Animations --------------------------------------------------------
-
     static AnimationClipData[] DecodeAnimations(Assimp.Scene scene, Dictionary<string, int> boneIndexByName) {
         if (!scene.HasAnimations)
             return System.Array.Empty<AnimationClipData>();
@@ -283,7 +250,7 @@ public static class AssimpSkinDecoder {
             var channels = new List<BoneChannel>();
             foreach (NodeAnimationChannel channel in anim.NodeAnimationChannels) {
                 if (!boneIndexByName.TryGetValue(channel.NodeName, out int boneIndex))
-                    continue;   // a channel for a node that isn't part of the skeleton
+                    continue;
 
                 var posKeys = new VectorKey[channel.PositionKeyCount];
                 for (var i = 0; i < posKeys.Length; i++)
@@ -309,8 +276,6 @@ public static class AssimpSkinDecoder {
         }
         return clips.ToArray();
     }
-
-    // ---- Conversions -------------------------------------------------------
 
     static Vector3 ToVec3(in Vector3D v) => new(v.X, v.Y, v.Z);
     static System.Numerics.Quaternion ToQuat(in Assimp.Quaternion q) => new(q.X, q.Y, q.Z, q.W);

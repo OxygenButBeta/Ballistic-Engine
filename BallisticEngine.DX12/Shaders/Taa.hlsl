@@ -13,11 +13,14 @@ cbuffer TaaConstants : register(b0) {
     float    Feedback;         // history weight (0..0.97)
     float    ValidHistory;     // >0.5 = blend, else passthrough (first frame / camera cut)
     float2   TexelSize;        // 1 / render size
+    float    Perceptual;       // C2: >0.5 = accumulate in crunched (sqrt-luma) YCoCg; 0 = linear (default)
+    float3   _TaaPad;
 };
 
 Texture2D CurrentTex : register(t0);
 Texture2D HistoryTex : register(t1);
 Texture2D MotionTex  : register(t2);   // RG = screen-space motion (prevUV - currUV)
+Texture2D DepthTex   : register(t3);   // C5: scene depth (R32F) for closest-depth velocity dilation
 SamplerState LinearClamp : register(s0);
 
 struct VSOut { float4 Position : SV_Position; float2 Uv : TEXCOORD0; };
@@ -43,6 +46,21 @@ float3 RGBToYCoCg(float3 c) {
 }
 float3 YCoCgToRGB(float3 c) {
     return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+}
+
+// C2 — PERCEPTUAL (crunched luma-chroma) accumulation space (kajiya inc/working_color_space.hlsl). Accumulating
+// in linear YCoCg lets the bright sun/fireflies dominate the variance box and the EMA; compressing the luma to
+// sqrt(Y) (and scaling chroma by the same k=1/sqrt(Y)) makes the variance box behave uniformly across bright and
+// dark, suppressing firefly bias before the clamp/blend. Crunch maps YCoCg→(sqrt(Y), chroma/sqrt(Y)); Uncrunch
+// inverts it. Y can be huge (EXR sun) but finite (Sanitize scrubbed Inf/NaN upstream), so sqrt is safe and the
+// round-trip is exact. Door-gated (Perceptual>0.5); off → plain linear YCoCg (the proven path), byte-identical.
+float3 CrunchYCoCg(float3 c) {
+    float k = rsqrt(max(c.x, 1e-8));     // 1/sqrt(Y)
+    return float3(c.x * k, c.y * k, c.z * k);   // = (sqrt(Y), Co/sqrt(Y), Cg/sqrt(Y))
+}
+float3 UncrunchYCoCg(float3 c) {
+    float y = c.x;                        // crunched luma = sqrt(Y_orig)
+    return float3(y * y, c.y * y, c.z * y);     // restore Y=y², chroma×sqrt(Y)
 }
 
 // 9-tap Catmull-Rom (Karis/Jimenez): sharp history resample without ringing blowups.
@@ -77,38 +95,97 @@ float4 PSMain(VSOut i) : SV_Target {
     if (ValidHistory < 0.5)
         return float4(current, 1.0);
 
-    // Reproject this pixel into last frame's screen space using the motion vector (prevUV - currUV).
-    float2 motion = MotionTex.SampleLevel(LinearClamp, i.Uv, 0).rg;
+    // C5 — DILATED closest-depth velocity. Sampling motion at the pixel CENTRE makes AA'd silhouette edges pick
+    // the BACKGROUND motion (the edge pixel is a blend of fg+bg, its centre depth/motion may be either) → moving
+    // object edges ghost/smear. kajiya dilates: search the 3x3 neighbourhood for the CLOSEST-depth pixel and use
+    // ITS motion — the nearer surface (the foreground object) wins, so its edge reprojects correctly. Cheap (9
+    // depth taps), no history, deterministic.
+    float2 closestOff = 0.0.xx;
+    float closestDepth = DepthTex.SampleLevel(LinearClamp, i.Uv, 0).r;
+    [unroll] for (int dx = -1; dx <= 1; dx++)
+    [unroll] for (int dy = -1; dy <= 1; dy++) {
+        if (dx == 0 && dy == 0) continue;
+        float2 off = float2(dx, dy) * TexelSize;
+        float d = DepthTex.SampleLevel(LinearClamp, i.Uv + off, 0).r;
+        if (d < closestDepth) { closestDepth = d; closestOff = off; }   // smaller depth = nearer (DX z[0,1])
+    }
+    float2 motion = MotionTex.SampleLevel(LinearClamp, i.Uv + closestOff, 0).rg;
     float2 prevUV = i.Uv + motion;
     if (prevUV.x < 0.0 || prevUV.x > 1.0 || prevUV.y < 0.0 || prevUV.y > 1.0)
         return float4(current, 1.0);
 
+    bool crunch = Perceptual > 0.5;   // C2: accumulate in sqrt-luma space when on
     float2 texSize = 1.0 / TexelSize;
     float3 history = RGBToYCoCg(Sanitize(SampleHistoryCatmullRom(prevUV, texSize)));
+    if (crunch) history = CrunchYCoCg(history);
 
-    // 3x3 neighborhood moments in YCoCg.
+    // 3x3 neighborhood moments in YCoCg + the neighborhood luma max (C6 firefly clamp source). In crunched space
+    // (C2) the moments/box behave uniformly across bright and dark, suppressing the sun/firefly bias on the box.
     float3 m1 = 0.0.xxx, m2 = 0.0.xxx;
+    float neighMaxLuma = 0.0;
     [unroll] for (int x = -1; x <= 1; x++)
     [unroll] for (int y = -1; y <= 1; y++) {
         float3 c = RGBToYCoCg(Sanitize(CurrentTex.SampleLevel(LinearClamp, i.Uv + float2(x, y) * TexelSize, 0).rgb));
+        if (crunch) c = CrunchYCoCg(c);
         m1 += c; m2 += c * c;
+        if (!(x == 0 && y == 0)) neighMaxLuma = max(neighMaxLuma, c.x);   // brightest NEIGHBOUR (exclude centre)
     }
     float3 mean = m1 / 9.0;
     float3 sigma = sqrt(max(m2 / 9.0 - mean * mean, 0.0.xxx));
 
-    // Clip (not clamp) the history toward the neighborhood mean (preserves color direction).
-    const float Gamma = 1.0;
-    float3 extents = Gamma * sigma + 1e-5;
+    float3 currYCoCg = RGBToYCoCg(current);
+    if (crunch) currYCoCg = CrunchYCoCg(currYCoCg);                       // C2: same space as history/moments
+    float3 currRaw = currYCoCg;                                           // pre-firefly (for honest disagreement)
+
+    // C6 — firefly-clamped TAA input. RT reflections + Lumen/DDGI card churn enter the HDR BEFORE TAA with no
+    // other denoiser, so a lone bright pixel (finite but huge) would poison the feedback loop and crawl. If the
+    // centre luma far exceeds its brightest neighbour, it's likely a firefly — pull its luma down (chroma kept).
+    // Bug-hunt #4 F3: a SINGLE-pixel REAL highlight (star/glint) has dark neighbours too, so a tight cap would
+    // crush it. Use a generous 4× headroom + a soft pull (only fireflies >> neighbours bite hard; a real glint
+    // within a few× survives), preserving legitimate sub-pixel highlights TAA is meant to resolve.
+    // The "4× headroom" is meant in LINEAR luma. In crunched space (C2) the luma is sqrt(Y), so a 4× linear ratio
+    // is a 2× crunched ratio — use sqrt(4)=2 there so the firefly threshold stays consistent (bug-hunt #7 F2),
+    // not 4× more permissive. The +0.05 additive likewise scales by sqrt in crunched space.
+    float ffMul = crunch ? 2.0 : 4.0;
+    float ffAdd = crunch ? 0.22 : 0.05;   // ≈ sqrt(0.05·…) — small floor either way, kept consistent
+    float fireflyCap = neighMaxLuma * ffMul + ffAdd;
+    if (currYCoCg.x > fireflyCap) currYCoCg.x = lerp(currYCoCg.x, fireflyCap, 0.85);
+
+    // C4 — confidence-WIDENED clamp box. A fixed Gamma over-clamps where current and history genuinely agree AND
+    // the pixel is static (eroding accumulated detail → blur). Bug-hunt #4 F1/F2 fixes:
+    //  - confidence is gated by MOTION (a moving pixel never widens the box → no slow bright-trail smear), and
+    //    measured from the FULL YCoCg vector on the PRE-firefly current (so a firefly can't fake high confidence,
+    //    F3 second-order), not luma-only.
+    //  - the box only widens the LUMA extent; CHROMA stays at a fixed tight Gamma (F2: a luma-only confidence must
+    //    not loosen the chroma box → no equal-luma coloured ghosts).
+    //  - Gamma cap pulled in to 1.6 and the soft knee tightened to smoothstep(1,2) so full clip arrives by ~2·box
+    //    (F1: history is fully rejected by ~3.2σ, not ~7.2σ).
+    float2 motionPx = motion * texSize;
+    float motionMag = length(motionPx);
+    float still = saturate(1.0 - motionMag * 0.75);                      // 0 once the pixel moves ~1.3px
+    float3 vdiff = abs(currRaw - history);
+    float chromaDisagree = (vdiff.y + vdiff.z) / max(max(currRaw.x, history.x), 0.2);
+    float lumaDiffPre = abs(currRaw.x - history.x) / max(max(currRaw.x, history.x), 0.2);
+    float confidence = saturate(1.0 - max(lumaDiffPre, chromaDisagree)) * still;
+    float lumaGamma = lerp(0.9, 1.6, confidence);
+    float chromaGamma = 0.9;                                             // chroma box never widens
+
+    // C1 — SOFT colour clamp (kajiya inc/soft_color_clamp), replacing the hard YCoCg clip. The hard clip snaps the
+    // moment maxUnit crosses 1; the soft form pulls history toward the box as it gets statistically far (1→2 unit
+    // ramp), so ghosting bleeds out smoothly without the hard-knee shimmer. Direction-preserving.
+    float3 extents = float3(lumaGamma, chromaGamma, chromaGamma) * sigma + 1e-5;
     float3 delta = history - mean;
     float maxUnit = max(abs(delta.x / extents.x), max(abs(delta.y / extents.y), abs(delta.z / extents.z)));
-    if (maxUnit > 1.0) history = mean + delta / maxUnit;
+    float3 clipped = mean + delta / max(maxUnit, 1.0);                    // the hard-clip target
+    history = lerp(history, clipped, smoothstep(1.0, 2.0, maxUnit));      // soft ramp into it
 
     // Luma-adaptive feedback: agreement keeps full history; disagreement drops it (re-converge fast).
-    float3 currYCoCg = RGBToYCoCg(current);
     float lumaDiff = abs(currYCoCg.x - history.x) / max(max(currYCoCg.x, history.x), 0.2);
     float agreement = 1.0 - lumaDiff;
     float feedback = lerp(0.5, clamp(Feedback, 0.0, 0.97), saturate(agreement * agreement));
 
-    float3 blended = YCoCgToRGB(lerp(currYCoCg, history, feedback));
+    float3 blendedYCoCg = lerp(currYCoCg, history, feedback);
+    if (crunch) blendedYCoCg = UncrunchYCoCg(blendedYCoCg);              // C2: back to linear YCoCg before RGB
+    float3 blended = YCoCgToRGB(blendedYCoCg);
     return float4(max(blended, 0.0.xxx), 1.0);
 }

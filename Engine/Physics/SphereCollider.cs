@@ -6,7 +6,6 @@ public class SphereCollider : Collider {
     [Range(0.001f, 100f)]
     public float Radius { get; set; } = 0.5f;
 
-    // Spheres can't scale non-uniformly; take the largest axis like Unity does.
     static float MaxAxis(Vector3 scale) =>
         MathF.Max(MathF.Abs(scale.X), MathF.Max(MathF.Abs(scale.Y), MathF.Abs(scale.Z)));
 

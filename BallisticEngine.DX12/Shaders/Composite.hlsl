@@ -16,7 +16,7 @@ cbuffer CompositeConstants : register(b0) {
     float LegacyMul;      // PostProcessSettings.Exposure (raw manual multiplier on top of EV; 1 = untouched)
     // row 1
     float Compensation;   // exposure compensation in stops (Automatic mode applies it on top of the metered EV)
-    float UseAo;          // > 0.5 = multiply by the SSAO texture
+    float _padAo;         // (was UseAo) AO now multiplies the IBL ambient in deferred lighting, not the final HDR
     float Tonemap;        // 0 = AgX (default), 1 = ACES (BALLISTIC_DX12_TONEMAP=aces A/B door)
     float Contrast;       // 1 = neutral; midtone contrast around 0.5
     // row 2
@@ -40,7 +40,6 @@ cbuffer CompositeConstants : register(b0) {
 Texture2D HdrColor : register(t0);
 Texture2D BloomTex : register(t1);
 Texture2D MeteredEv : register(t2);  // 1×1 metered EV100 (auto-exposure); Automatic mode only
-Texture2D AoTex    : register(t3);   // screen-space AO (1 = unoccluded); UseAo gates it
 SamplerState LinearClamp : register(s0);
 
 struct VSOut { float4 Position : SV_Position; float2 Uv : TEXCOORD0; };
@@ -120,8 +119,8 @@ float ResolveExposure() {
 // NEIGHBOUR pixels so every grade sample is post-tonemap — never mix raw HDR with tonemapped (NaN gotcha).
 float3 ToneMapAt(float2 uv, float exposure) {
     float3 hdr = HdrColor.SampleLevel(LinearClamp, uv, 0).rgb;
-    if (UseAo > 0.5)
-        hdr *= AoTex.SampleLevel(LinearClamp, uv, 0).r;   // forward AO approximation (before bloom glow)
+    // AO is no longer applied here — GTAO multiplies into the IBL ambient term in deferred lighting (the
+    // physically-correct, ambient-only layer), not into the final HDR colour (which darkened direct light too).
     if (BloomIntensity > 0.0)
         hdr += BloomTex.SampleLevel(LinearClamp, uv, 0).rgb * BloomIntensity;
     float3 exposed = max(hdr * exposure, 0.0);            // tonemappers want non-negative input
@@ -154,13 +153,32 @@ float4 PSMain(VSOut i) : SV_Target {
         color = ToneMapAt(uv, exposure);
     }
 
-    // Sharpening: unsharp mask on TONEMAPPED neighbours (4-tap cross). Never on raw HDR (NaN around the sun).
+    // Sharpening (C7, kajiya post_combine): PERCEPTUAL, luma-only, edge-aware — replaces the old component-wise
+    // unsharp mask which shifts HUE (each channel sharpened independently) and rings on edges. Sharpen the LUMA in
+    // sqrt-perceptual space, apply the result back as a luma RATIO so colour is preserved exactly, and gate by an
+    // edge-aware weight that DISABLES sharpening across strong edges (anti-haloing). Still on TONEMAPPED neighbours
+    // (never raw HDR — NaN around the sun). Component-wise → perceptual is a correctness fix, not just cosmetic.
     if (Sharpen > 1e-4) {
         float2 px = 1.0 / max(ScreenSize, 1.0);
-        float3 blur = ToneMapAt(uv + float2(px.x, 0), exposure) + ToneMapAt(uv - float2(px.x, 0), exposure)
-                    + ToneMapAt(uv + float2(0, px.y), exposure) + ToneMapAt(uv - float2(0, px.y), exposure);
-        blur *= 0.25;
-        color = color + (color - blur) * Sharpen;
+        float3 cN0 = ToneMapAt(uv + float2(px.x, 0), exposure);
+        float3 cN1 = ToneMapAt(uv - float2(px.x, 0), exposure);
+        float3 cN2 = ToneMapAt(uv + float2(0, px.y), exposure);
+        float3 cN3 = ToneMapAt(uv - float2(0, px.y), exposure);
+        const float3 lw = float3(0.2126, 0.7152, 0.0722);
+        float lC = sqrt(max(dot(color, lw), 0.0));               // perceptual (sqrt) luma of the centre + 4 taps
+        float l0 = sqrt(max(dot(cN0, lw), 0.0)), l1 = sqrt(max(dot(cN1, lw), 0.0));
+        float l2 = sqrt(max(dot(cN2, lw), 0.0)), l3 = sqrt(max(dot(cN3, lw), 0.0));
+        float lBlur = 0.25 * (l0 + l1 + l2 + l3);
+        // Edge-aware weight: large neighbour luma spread = a strong edge → suppress sharpening (no halo ring).
+        float edge = abs(lC - l0) + abs(lC - l1) + abs(lC - l2) + abs(lC - l3);
+        float w = max(0.0, 1.0 - 6.0 * edge);
+        float lSharp = max(lC + (lC - lBlur) * Sharpen * w, 0.0); // sharpen in perceptual-luma; clamp ≥0 so an
+                                                                  // overshoot UNDERSHOOT (bug-hunt F3) can't square
+                                                                  // a negative back to a brightening — it darkens
+                                                                  // toward black as intended.
+        float lLin = lSharp * lSharp;                            // back to linear luma
+        float lCur = max(dot(color, lw), 1e-5);
+        color *= lLin / lCur;                                    // apply as a luma RATIO → hue/chroma preserved
     }
 
     // Contrast around mid-grey (pivot 0.5, not a black-crushing power) + saturation around luma.
@@ -189,5 +207,17 @@ float4 PSMain(VSOut i) : SV_Target {
         float n = Hash(i.Uv * ScreenSize + GrainTime) - 0.5;
         srgb += n * FilmGrain;
     }
+
+    // C7 — TPDF (triangular-PDF) output dither (kajiya post_combine). 8-bit quantization of a smooth gradient
+    // (the Hillaire sky especially) bands visibly; a triangular-PDF dither of ±1 LSB decorrelates the quantization
+    // error so the banding dissolves into imperceptible noise — cleaner than the rectangular/ordered dither most
+    // engines ship, and far cheaper than more bits. TPDF = difference of two independent uniforms. Deterministic
+    // (per-pixel hash, no time term) so golden captures stay byte-stable; it's a quantization-correctness step,
+    // applied to ALL frames (not gated like grain). Scale = 1 LSB at 8-bit.
+    float2 px = i.Uv * ScreenSize;
+    float r1 = Hash(px + 0.5);
+    float r2 = Hash(px * 1.37 + 11.7);
+    float tpdf = (r1 - r2) * (1.0 / 255.0);                 // triangular PDF in [-1/255, +1/255]
+    srgb += tpdf;
     return float4(saturate(srgb), 1.0);
 }

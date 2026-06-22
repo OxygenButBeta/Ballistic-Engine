@@ -4,14 +4,6 @@ using System.Text.Json;
 
 namespace BallisticEngine.Mcp;
 
-// MCP stdio server -> editor named pipe bridge. Each MCP tool maps onto one command-port method;
-// the editor does the real work on its main thread (undoable, viewport-repainting — see
-// BallisticEngine.Editor/Remote/). Tools are TASK-LEVEL and few on purpose: tool definitions live
-// in the agent's context window, so a small multiplexed surface beats one-tool-per-verb.
-//
-// Stdio transport: one JSON-RPC 2.0 message per line. Handles initialize / notifications/* /
-// tools/list / tools/call / ping. The pipe connects lazily and reconnects per failure, so the
-// server can start before the editor does.
 internal static class Program {
     static readonly JsonSerializerOptions Indented = new() { WriteIndented = true };
 
@@ -29,7 +21,7 @@ internal static class Program {
                 string method = root.TryGetProperty("method", out JsonElement m) ? m.GetString() ?? "" : "";
                 bool hasId = root.TryGetProperty("id", out JsonElement idEl);
                 if (!hasId)
-                    continue; // notifications need no response
+                    continue;
 
                 object response = method switch {
                     "initialize" => Result(idEl, new {
@@ -56,15 +48,10 @@ internal static class Program {
     static object Error(JsonElement id, int code, string message) =>
         new { jsonrpc = "2.0", id, error = new { code, message } };
 
-    // ---- tools/call -> pipe ----------------------------------------------------
-
     static object ToolCall(JsonElement id, JsonElement p) {
         string tool = p.GetProperty("name").GetString() ?? "";
         JsonElement args = p.TryGetProperty("arguments", out JsonElement a) ? a : default;
 
-        // CLI-backed tools (scene_query / scene_gbuffer): run the `bal` CLI headlessly (no editor needed) —
-        // GpuSceneQuery + raw G-buffer. The editor's LIVE query surface is deferred (it touches the GPU
-        // surface that hung before), so these shell out to the proven device-free CLI subprocess path.
         if (tool is "scene_query" or "scene_gbuffer")
             return RunCliTool(id, tool, args);
 
@@ -74,6 +61,12 @@ internal static class Program {
         catch (Exception ex) { return Result(id, ToolText(ex.Message, isError: true)); }
         if (method.Length == 0)
             return Result(id, ToolText($"unknown tool '{tool}'", isError: true));
+
+        ToolBinding binding = Array.Find(ToolBindings, b => b.Tool == tool);
+        if (binding.Tool is not null && Array.IndexOf(binding.Methods, method) < 0)
+            return Result(id, ToolText(
+                $"internal: tool '{tool}' produced method '{method}' not in its declared binding "
+                + $"[{string.Join(", ", binding.Methods)}]", isError: true));
 
         try {
             JsonElement reply = CallPipe(method, pipeParams);
@@ -90,8 +83,6 @@ internal static class Program {
     static object ToolText(string text, bool isError) =>
         new { content = new[] { new { type = "text", text } }, isError };
 
-    // ---- CLI-backed tools (scene_query / scene_gbuffer) -> `bal` subprocess ---------
-
     static object RunCliTool(JsonElement id, string tool, JsonElement a) {
         try {
             string scene = Str(a, "scene");
@@ -104,7 +95,7 @@ internal static class Program {
                 string? pairs = OptStr(a, "pairs");
                 if (points is not null) { args.Add("--points"); args.Add(points); }
                 if (pairs is not null) { args.Add("--pairs"); args.Add(pairs); }
-            } else { // scene_gbuffer
+            } else {
                 args.Add("gbuffer");
                 args.Add(scene);
                 string? outDir = OptStr(a, "out");
@@ -132,7 +123,6 @@ internal static class Program {
         return (proc.ExitCode, stdout, stderr);
     }
 
-    // bal.exe sits next to this MCP server's build output, or in the engine repo build tree.
     static string FindBalExe() {
         string local = Path.Combine(AppContext.BaseDirectory, "bal.exe");
         if (File.Exists(local)) return local;
@@ -152,7 +142,29 @@ internal static class Program {
         throw new Exception("bal.exe not found (build BallisticEngine.Cli or set BALLISTIC_ENGINE_ROOT)");
     }
 
-    // Tool name + MCP arguments -> command-port method + params (mostly pass-through).
+    internal readonly record struct ToolBinding(string Tool, string[] Methods, string[] RequiredArgs, string[] DefaultedArgs);
+    internal static readonly ToolBinding[] ToolBindings = [
+        new("editor_status",       ["editor.status"],        [],                  []),
+        new("scene_describe",      ["scene.describe"],       [],                  []),
+        new("entity_get",          ["entity.get"],           ["entity"],          []),
+        new("entity_create",       ["entity.create"],        ["name"],            []),
+        new("entity_delete",       ["entity.delete"],        ["entity"],          []),
+        new("component_add",       ["component.add"],         ["entity", "type"], []),
+        new("component_remove",    ["component.remove"],      ["entity", "type"], []),
+        new("component_set",       ["component.set"],         ["entity", "target"], []),
+        new("editor_select",       ["select"],               ["entity"],          []),
+        new("play_control",        ["play.start", "play.stop", "play.pause", "play.step"], ["action"], []),
+        new("scene_save",          ["scene.save"],           [],                  []),
+        new("scene_open",          ["scene.open"],           ["path"],            []),
+        new("editor_undo",         ["undo", "redo"],         [],                  []),
+        new("editor_screenshot",   ["screenshot"],           [],                  ["path"]), new("console_tail",        ["console.tail"],         [],                  []),
+        new("scripts_rebuild",     ["scripts.rebuild"],      [],                  []),
+        new("editor_frame",        ["editor.frame"],         [],                  []),
+        new("editor_refresh",      ["editor.refresh"],       [],                  []),
+        new("editor_reimport",     ["editor.reimport"],      [],                  []),
+        new("scene_component_set", ["scene.component.set"],  ["type", "member"],  []),
+    ];
+
     static (string method, object? p) MapTool(string tool, JsonElement a) => tool switch {
         "editor_status" => ("editor.status", null),
         "scene_describe" => ("scene.describe", null),
@@ -193,6 +205,7 @@ internal static class Program {
             fit = a.ValueKind == JsonValueKind.Object && a.TryGetProperty("fit", out JsonElement f) ? (object)f.GetDouble() : 1.0,
         }),
         "editor_refresh" => ("editor.refresh", null),
+        "editor_reimport" => ("editor.reimport", null),
         "scene_component_set" => ("scene.component.set", new {
             type = Str(a, "type"),
             member = Str(a, "member"),
@@ -211,15 +224,11 @@ internal static class Program {
             ? v.GetString()
             : null;
 
-    // ---- pipe client -------------------------------------------------------------
-
     static NamedPipeClientStream? pipe;
     static StreamReader? pipeReader;
     static StreamWriter? pipeWriter;
     static long pipeSeq;
 
-    // Optional args must VANISH from the pipe request, not arrive as null (the editor treats a
-    // present-but-null param as a value).
     static readonly JsonSerializerOptions SkipNulls = new() {
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
     };
@@ -236,7 +245,7 @@ internal static class Program {
                 return JsonDocument.Parse(reply).RootElement.Clone();
             }
             catch (Exception) when (attempt == 0) {
-                Disconnect(); // stale pipe from an earlier editor session — reconnect once
+                Disconnect();
             }
         }
         throw new IOException("pipe call failed");
@@ -258,8 +267,6 @@ internal static class Program {
         try { pipe?.Dispose(); } catch { }
         pipe = null;
     }
-
-    // ---- tool definitions ----------------------------------------------------------
 
     static object Schema(params (string Name, string Type, string Description, bool Required)[] props) => new {
         type = "object",
@@ -300,7 +307,8 @@ internal static class Program {
             ("entity", "string", "Entity to frame; omit to frame the whole scene", false),
             ("dir", "string", "Look direction 'x,y,z' e.g. '0.3,-0.5,1' for a 3/4 top view; omit to keep current", false),
             ("fit", "number", "Zoom multiplier on the framed radius (1=default, <1 closer, >1 wider)", false)) },
-        new { name = "editor_refresh", description = "Force a full asset reimport (registers newly written .scene/.volume/.mat assets).", inputSchema = Schema() },
+        new { name = "editor_refresh", description = "Incremental asset refresh: scans Assets/ and imports only changed/new files (registers newly written .scene/.volume/.mat). Does NOT reimport everything.", inputSchema = Schema() },
+        new { name = "editor_reimport", description = "FULL force reimport: re-imports every asset ignoring up-to-date checks (slow). Use only when an importer changed or an artifact is stale.", inputSchema = Schema() },
         new { name = "scene_component_set", description = "Set a member on a scene-wide component (Skybox/ProceduralSky/SceneLighting), e.g. tune sky exposure. Undoable.", inputSchema = Schema(
             ("type", "string", "Scene component type, e.g. ProceduralSky", true),
             ("member", "string", "Member name, e.g. exposure", true),

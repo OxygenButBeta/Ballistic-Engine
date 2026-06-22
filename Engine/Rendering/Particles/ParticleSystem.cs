@@ -1,40 +1,26 @@
 
 namespace BallisticEngine;
 
-// How particle billboards composite (the GL pass picks the GL blend func from this).
 public enum ParticleBlendMode {
-    Additive,   // fire, sparks, magic — order-independent, brightens
-    Alpha,      // smoke, dust — needs back-to-front sorting
+    Additive,
+    Alpha,
 }
 
-// Shapes the over-lifetime interpolation of a particle property (size, color). Linear = the raw
-// start->end lerp; the eased variants soften the motion (a real VFX usually wants size to ease out,
-// alpha to ease in/out). Engine-local (no UI dependency).
 public enum ParticleEase {
     Linear,
-    EaseIn,     // slow start
-    EaseOut,    // slow end (the common "fade/shrink gently" curve)
+    EaseIn,
+    EaseOut,
     EaseInOut,
 }
 
-// Where particles spawn and which way they head (all relative to the emitter's transform).
 public enum EmissionShape {
-    Cone,        // from a point, within a cone around local +Y (fire, fountains)
-    Sphere,      // from the center, outward in every direction (explosions, bursts)
-    Hemisphere,  // from the center, outward over the upper half (ground impacts)
-    Box,         // from a random point in a box, heading up (rain, area fog)
-    Circle,      // from a random point on a flat disc (XZ plane), heading up (smoke ring, portals)
+    Cone,
+    Sphere,
+    Hemisphere,
+    Box,
+    Circle,
 }
 
-// CPU-simulated, GPU-instanced billboard particle emitter (Unity's ParticleSystem, simplified). Spawns
-// particles at EmissionRate, integrates velocity + gravity, lerps color/size over each particle's
-// lifetime, and exposes a per-frame instance snapshot the GL particle pass renders as camera-facing
-// billboards. This component (Engine layer) owns only the CPU sim + authored params; rendering lives
-// in OpenGL/GLParticlePass.
-//
-// Simulation is driven from the renderer (ParticleSystem.AdvanceAll), NOT Tick — so particles also
-// preview in the editor (Tick is play-only) and step exactly once per real frame regardless of how
-// many times the editor renders. Registers in OnAttach/OnDetach (both modes) like a renderer.
 [Component("Particle System", "Effects")]
 public class ParticleSystem : Behaviour {
     [Header("Emission")]
@@ -150,29 +136,23 @@ public class ParticleSystem : Behaviour {
     [Range(0.1f, 20f)]
     public float SheetCycles { get; set; } = 1f;
 
-    // ---- Simulation state (runtime-only) ------------------------------------
-
     Particle[] pool;
     int liveCount;
     float emitAccumulator;
-    float emitterAge;       // for non-looping one-shots
-    float cycleTime;        // time within the current burst cycle
+    float emitterAge;
+    float cycleTime;
     bool burstFiredThisCycle;
     ParticleInstance[] instanceScratch;
 
     [NotSerialized]
     public int LiveCount => liveCount;
 
-    // Emits `count` particles immediately from the emitter (Unity's ParticleSystem.Emit). For
-    // scripted one-off effects — muzzle flashes, hit sparks, footstep dust. Respects MaxParticles.
     public void Emit(int count) {
         EnsurePool();
         for (var i = 0; i < count && liveCount < MaxParticles; i++)
             Spawn();
     }
 
-    // Kills all live particles and resets emission timing (Unity's ParticleSystem.Clear). Used by the
-    // editor's restart button and by scripts that want a clean slate (e.g. on respawn).
     public void Clear() {
         liveCount = 0;
         emitAccumulator = 0f;
@@ -190,10 +170,6 @@ public class ParticleSystem : Behaviour {
         RuntimeSet<ParticleSystem>.Remove(this);
     }
 
-    // ---- Per-frame advance --------------------------------------------------
-
-    // Steps every active particle system once. Called by the renderer with a once-per-frame guard so
-    // the editor's double BeginRender doesn't double-step. dt is clamped to avoid first-frame spikes.
     public static void AdvanceAll(float dt) {
         dt = MathHelper.Clamp(dt, 0f, 0.1f);
         if (dt <= 0f)
@@ -206,7 +182,6 @@ public class ParticleSystem : Behaviour {
     void Advance(float dt) {
         EnsurePool();
 
-        // Integrate + age existing particles; swap-remove the dead.
         for (var i = 0; i < liveCount; i++) {
             ref Particle p = ref pool[i];
             p.Velocity += Gravity * dt;
@@ -214,7 +189,7 @@ public class ParticleSystem : Behaviour {
             p.Rotation += p.RotationSpeed * dt;
             p.Age += dt;
             if (p.IsDead) {
-                pool[i] = pool[liveCount - 1];   // swap-remove
+                pool[i] = pool[liveCount - 1];
                 liveCount--;
                 i--;
             }
@@ -223,8 +198,6 @@ public class ParticleSystem : Behaviour {
         emitterAge += dt;
         bool emitting = Looping || emitterAge <= StartLifetime;
 
-        // Burst: fire BurstCount particles once per cycle when BurstTime is crossed. The cycle is
-        // StartLifetime long (looping) or the whole one-shot; resets so a looping emitter re-bursts.
         if (BurstCount > 0 && emitting) {
             float cycleLength = Looping ? MathF.Max(StartLifetime, 0.001f) : float.MaxValue;
             cycleTime += dt;
@@ -238,7 +211,6 @@ public class ParticleSystem : Behaviour {
             }
         }
 
-        // Continuous emission from the accumulator (unless a finished one-shot).
         if (emitting && EmissionRate > 0f) {
             emitAccumulator += EmissionRate * dt;
             while (emitAccumulator >= 1f && liveCount < MaxParticles) {
@@ -246,7 +218,7 @@ public class ParticleSystem : Behaviour {
                 Spawn();
             }
             if (liveCount >= MaxParticles)
-                emitAccumulator = 0f; // don't bank emissions we couldn't fulfill
+                emitAccumulator = 0f;
         }
     }
 
@@ -257,7 +229,6 @@ public class ParticleSystem : Behaviour {
         Vector3 worldOrigin = transform.WorldPosition;
         Quaternion worldRot = transform.WorldRotation;
 
-        // Pick a LOCAL spawn offset + emission direction per shape (around local +Y), then world it.
         ShapeSample(out Vector3 localPos, out Vector3 localDir);
         Vector3 position = worldOrigin + Vector3.Transform(localPos, worldRot);
         Vector3 dir = Vector3.Transform(localDir, worldRot);
@@ -275,11 +246,9 @@ public class ParticleSystem : Behaviour {
         };
     }
 
-    // Local-space spawn position + unit emission direction for the current shape (emitter +Y is "up").
     void ShapeSample(out Vector3 position, out Vector3 direction) {
         switch (Shape) {
             case EmissionShape.Sphere: {
-                // From the center, outward in every direction.
                 position = Vector3.Zero;
                 direction = Random.OnUnitSphere;
                 break;
@@ -287,7 +256,7 @@ public class ParticleSystem : Behaviour {
             case EmissionShape.Hemisphere: {
                 position = Vector3.Zero;
                 Vector3 d = Random.OnUnitSphere;
-                direction = new Vector3(d.X, MathF.Abs(d.Y), d.Z); // upper half
+                direction = new Vector3(d.X, MathF.Abs(d.Y), d.Z);
                 break;
             }
             case EmissionShape.Box: {
@@ -299,14 +268,13 @@ public class ParticleSystem : Behaviour {
                 break;
             }
             case EmissionShape.Circle: {
-                // Random point on a flat disc in the XZ plane (uniform by sqrt-radius).
                 float r = ShapeRadius * MathF.Sqrt(Random.Value);
                 float a = Random.Value * MathHelper.TwoPi;
                 position = new Vector3(r * MathF.Cos(a), 0f, r * MathF.Sin(a));
                 direction = Vector3.UnitY;
                 break;
             }
-            default: { // Cone
+            default: {
                 position = Vector3.Zero;
                 direction = RandomConeDirection(SpreadAngle);
                 break;
@@ -314,10 +282,9 @@ public class ParticleSystem : Behaviour {
         }
     }
 
-    // Uniformly-distributed direction within a cone of half-angle `degrees` around +Y.
     static Vector3 RandomConeDirection(float degrees) {
         float cosMax = MathF.Cos(MathHelper.DegreesToRadians(degrees));
-        float cosTheta = 1f - Random.Value * (1f - cosMax);   // uniform over the spherical cap
+        float cosTheta = 1f - Random.Value * (1f - cosMax);
         float sinTheta = MathF.Sqrt(MathF.Max(0f, 1f - cosTheta * cosTheta));
         float phi = Random.Value * MathHelper.TwoPi;
         return new Vector3(sinTheta * MathF.Cos(phi), cosTheta, sinTheta * MathF.Sin(phi));
@@ -334,10 +301,6 @@ public class ParticleSystem : Behaviour {
         }
     }
 
-    // ---- Render snapshot ----------------------------------------------------
-
-    // Fills a per-frame instance snapshot (position, lerped size, lerped RGBA, rotation) for the GL
-    // pass. Returns the live count; the array is the system's reused scratch (valid until next call).
     public int BuildInstances(out ParticleInstance[] instances) {
         if (instanceScratch is null || instanceScratch.Length < liveCount)
             instanceScratch = new ParticleInstance[Math.Max(liveCount, 16)];
@@ -353,8 +316,6 @@ public class ParticleSystem : Behaviour {
             float u = p.NormalizedAge;
             float uc = ApplyEase(ColorEase, u);
             float us = ApplyEase(SizeEase, u);
-            // A gradient (when authored) drives color+alpha over the normalized age; otherwise fall
-            // back to the simple Start->End color/alpha lerp with its ease.
             Vector3 rgb;
             float a;
             if (ColorOverLifetime is { IsEmpty: false }) {
@@ -366,16 +327,13 @@ public class ParticleSystem : Behaviour {
                 rgb = Vector3.Lerp(StartColor, EndColor, uc);
                 a = MathHelper.Lerp(StartAlpha, EndAlpha, uc);
             }
-            // A curve (when authored) drives size as a MULTIPLIER on the spawn size over the
-            // normalized age; otherwise fall back to the simple Start->End lerp with its ease.
+
             float size = SizeCurve is { Count: > 0 }
                 ? p.StartSize * SizeCurve.Evaluate(u)
                 : MathHelper.Lerp(p.StartSize, p.StartSize * SafeRatio(EndSize, StartSize), us);
 
             Vector4 uvRect = new(0f, 0f, 1f, 1f);
             if (animated) {
-                // Frame index marches through the grid over the lifetime, SheetCycles times. Top-left
-                // origin (V flipped) so frame 0 is the sheet's top-left cell.
                 int frame = (int)(u * SheetCycles * tileCount) % tileCount;
                 int col = frame % tilesX;
                 int row = frame / tilesX;
@@ -396,8 +354,6 @@ public class ParticleSystem : Behaviour {
 
     static float SafeRatio(float end, float start) => start > 1e-6f ? end / start : 1f;
 
-    // Maps a 0..1 lerp parameter through the ease curve (cubic, closed-form — no per-frame solve).
-    // Endpoints are preserved (0->0, 1->1) so Start/End values always hit exactly.
     static float ApplyEase(ParticleEase ease, float t) {
         t = Math.Clamp(t, 0f, 1f);
         return ease switch {
@@ -408,9 +364,6 @@ public class ParticleSystem : Behaviour {
         };
     }
 
-    // Selected: draw the emission shape so you can see where particles spawn + which way they head,
-    // in world space (emitter transform). Cone = apex + cone along +Y; Sphere/Hemisphere = a sphere;
-    // Box = a wire box; Circle = a flat ring (approximated by a thin box on the XZ plane).
     public override void OnDrawGizmosSelected(IGizmos gizmos) {
         gizmos.Color = new Vector3(1f, 0.7f, 0.2f);
         Vector3 origin = transform.WorldPosition;

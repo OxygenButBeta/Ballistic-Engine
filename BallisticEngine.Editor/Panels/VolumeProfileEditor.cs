@@ -1,24 +1,32 @@
-using System.Reflection;
 using BallisticEngine.AssetPipeline.Loaders;
 using BallisticEngine.Editor.Inspector;
-using Hexa.NET.ImGui;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec4 = System.Numerics.Vector4;
 
 namespace BallisticEngine.Editor;
 
-// Unity-style volume profile editor: one collapsible header per override component (with its
-// Active checkbox and a right-click Remove), an override checkbox + value widget per parameter,
-// and an Add Override menu of the remaining VolumeComponent types. Drawn both inline under a
-// Volume component and as the asset view of a selected .volume file. Draw() returns true when
-// anything changed; SaveToAsset persists the live (AssetDatabase-cached) instance to its JSON.
 internal static class VolumeProfileEditor {
+    static IEditorGui gui => EditorGui.Shared;
+
+    static readonly Dictionary<string, float> bandHeights = new();
+
     public static bool Draw(VolumeProfile profile) {
         var changed = false;
         VolumeComponent remove = null;
 
+        var componentOrdinal = 0;
         foreach (VolumeComponent component in profile.Components) {
-            ImGui.PushID(component.GetType().Name);
+            gui.PushId(component.GetType().Name);
+
+            var draw = gui.WindowDrawList;
+            SysVec2 bandStart = gui.CursorScreenPos;
+            string bandKey = component.GetType().FullName ?? component.GetType().Name;
+            if ((componentOrdinal & 1) == 1 && bandHeights.TryGetValue(bandKey, out float prevH) && prevH > 0) {
+                float wx0 = gui.WindowPos.X;
+                float wx1 = wx0 + gui.WindowSize.X;
+                draw.AddRectFilled(new SysVec2(wx0, bandStart.Y - 2), new SysVec2(wx1, bandStart.Y + prevH + 4),
+                                   gui.ColorU32(new SysVec4(0f, 0f, 0f, 0.06f)), 6f);
+            }
 
             bool active = component.Active;
             bool open = OverrideHeader(Prettify(component.GetType().Name), ref active, out bool removeRequested);
@@ -30,26 +38,26 @@ internal static class VolumeProfileEditor {
                 remove = component;
 
             if (open) {
-                // A disabled component contributes NOTHING to the stack (VolumeManager skips it),
-                // even if its parameters are overridden — a common "I changed it and nothing happens"
-                // trap. Warn clearly, and offer a one-click Enable.
                 if (!component.Active && HasOverrides(component)) {
-                    ImGui.PushStyleColor(ImGuiCol.Text, new SysVec4(1f, 0.72f, 0.25f, 1f));
-                    ImGui.TextWrapped($"{EditorIcons.Warning} This override is DISABLED — its parameters have no effect. " +
-                                      "Tick the checkbox by the name to enable it.");
-                    ImGui.PopStyleColor();
-                    if (ImGui.SmallButton("Enable")) {
+                    gui.PushColor(EditorStyleColor.Text, EditorTheme.Warning);
+                    gui.TextWrapped($"{EditorIcons.Warning} This override is DISABLED — its parameters have no effect. " +
+                                    "Tick the checkbox by the name to enable it.");
+                    gui.PopColor();
+                    if (gui.SmallButton("Enable")) {
                         component.Active = true;
                         changed = true;
                     }
-                    ImGui.Spacing();
+                    gui.Spacing();
                 }
 
                 changed |= DrawAllNoneRow(component);
                 changed |= DrawParameters(component);
             }
 
-            ImGui.PopID();
+            bandHeights[bandKey] = gui.CursorScreenPos.Y - bandStart.Y;
+
+            componentOrdinal++;
+            gui.PopId();
         }
 
         if (remove is not null) {
@@ -57,26 +65,24 @@ internal static class VolumeProfileEditor {
             changed = true;
         }
 
-        ImGui.Spacing();
-        if (ImGui.Button($"{EditorIcons.Add}  Add Override", new SysVec2(-1, 0))) {
+        gui.Spacing();
+        if (gui.Button($"{EditorIcons.Add}  Add Override", new SysVec2(-1, 0))) {
             addOverrideSearch = "";
-            ImGui.OpenPopup("##addoverride");
+            gui.OpenPopup("##addoverride");
         }
 
-        if (ImGui.BeginPopup("##addoverride")) {
-            // Search field (Unity's Add Override is searchable). Auto-focus on open; Enter adds the
-            // first match.
-            if (ImGui.IsWindowAppearing())
-                ImGui.SetKeyboardFocusHere();
-            ImGui.SetNextItemWidth(220);
-            ImGui.InputTextWithHint("##search", "Search...", ref addOverrideSearch, 64);
-            bool enter = ImGui.IsItemFocused() && ImGui.IsKeyPressed(ImGuiKey.Enter);
-            ImGui.Separator();
+        if (gui.BeginPopup("##addoverride")) {
+            if (gui.IsWindowAppearing())
+                gui.SetKeyboardFocusHere();
+            gui.SetNextItemWidth(220);
+            gui.InputTextWithHint("##search", "Search...", ref addOverrideSearch, 64);
+            bool enter = gui.IsItemFocused() && gui.KeyPressed(EditorGuiKey.Enter);
+            gui.Separator();
 
             bool searching = addOverrideSearch.Length > 0;
             bool any = false;
             ComponentEntry? firstMatch = null;
-            ImGui.BeginChild("##addlist", new SysVec2(220, 240));
+            gui.BeginChild("##addlist", new SysVec2(220, 240), border: false);
             foreach (ComponentEntry entry in ComponentRegistry.VolumeMenu) {
                 if (profile.Has(entry.Type))
                     continue;
@@ -84,22 +90,22 @@ internal static class VolumeProfileEditor {
                     continue;
                 any = true;
                 firstMatch ??= entry;
-                if (ImGui.MenuItem(entry.DisplayName)) {
+                if (gui.MenuItem(entry.DisplayName)) {
                     profile.Add(entry.Type);
                     changed = true;
-                    ImGui.CloseCurrentPopup();
+                    gui.CloseCurrentPopup();
                 }
             }
             if (!any)
-                ImGui.TextDisabled(searching ? "No match." : "All overrides added.");
-            ImGui.EndChild();
+                gui.TextDisabled(searching ? "No match." : "All overrides added.");
+            gui.EndChild();
 
             if (enter && firstMatch is { } hit) {
                 profile.Add(hit.Type);
                 changed = true;
-                ImGui.CloseCurrentPopup();
+                gui.CloseCurrentPopup();
             }
-            ImGui.EndPopup();
+            gui.EndPopup();
         }
 
         return changed;
@@ -107,8 +113,6 @@ internal static class VolumeProfileEditor {
 
     static string addOverrideSearch = "";
 
-    // Writes the profile back to its .volume source. Profile edits are asset edits (like the
-    // material editor), so they save immediately and sit outside the scene-snapshot undo.
     public static void SaveToAsset(VolumeProfile profile) {
         if (!AssetDatabase.TryGetAssetGuid(profile, out Guid guid))
             return;
@@ -120,24 +124,21 @@ internal static class VolumeProfileEditor {
         VolumeProfileLoader.Save(profile, AssetDatabase.Project.ResolveAbsolute(assetPath));
     }
 
-    // Unity's "ALL / NONE" row: flips every parameter's override checkbox in one click.
     static bool DrawAllNoneRow(VolumeComponent component) {
         var changed = false;
 
-        ImGui.AlignTextToFramePadding();
-        ImGui.TextDisabled("Override:");
-        ImGui.SameLine();
-        if (ImGui.SmallButton("All"))
+        gui.AlignTextToFramePadding();
+        gui.TextDisabled("Override:");
+        gui.SameLine();
+        if (gui.SmallButton("All"))
             changed = SetAllOverrides(component, true);
-        ImGui.SameLine();
-        if (ImGui.SmallButton("None"))
+        gui.SameLine();
+        if (gui.SmallButton("None"))
             changed = SetAllOverrides(component, false);
 
         return changed;
     }
 
-    // True if any parameter is overridden — used to warn when those overrides are inert because the
-    // component itself is disabled.
     static bool HasOverrides(VolumeComponent component) {
         foreach (VolumeComponent.ParameterSlot slot in component.Parameters)
             if (slot.Parameter.Overridden)
@@ -156,29 +157,24 @@ internal static class VolumeProfileEditor {
         return changed;
     }
 
-    // The shared inspector drawer pipeline (Odin-style): the SAME value drawers + conditional/ordering
-    // attributes the component inspector uses, so the two paths can't drift. ImGuiVolumeGui draws the
-    // per-parameter override checkbox + label and disables the value cell when not overridden;
-    // [ShowIf]/[HideIf] on a parameter field hide its row.
-    static readonly DrawerPipeline pipeline = DrawerPipeline.CreateDefault();
+    static readonly DrawerStack pipeline = DrawerStack.CreateDefault();
     static readonly ImGuiVolumeGui volumeGui = new();
 
     static bool DrawParameters(VolumeComponent component) {
-        if (!ImGui.BeginTable("##params", 2, ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.PadOuterX))
+        if (!gui.BeginTable("##params", 2, EditorTableFlags.SizingStretchProp | EditorTableFlags.PadOuterX))
             return false;
-        ImGui.TableSetupColumn("label", ImGuiTableColumnFlags.WidthStretch, 0.45f);
-        ImGui.TableSetupColumn("value", ImGuiTableColumnFlags.WidthStretch, 0.55f);
+        gui.TableSetupColumn("label", EditorColumnFlags.WidthStretch, 0.45f);
+        gui.TableSetupColumn("value", EditorColumnFlags.WidthStretch, 0.55f);
 
         var changed = false;
-        // [PropertyOrder] sorts (stable: default 0 keeps declaration order).
-        foreach (VolumeComponent.ParameterSlot slot in System.Linq.Enumerable.OrderBy(
-                     component.Parameters, s => MemberAttributes.For(s.Field).Order)) {
+        foreach (VolumeComponent.ParameterSlot slot in
+                 PropertyOrdering.Sort(component.Parameters, s => PropertyOrdering.OrderOf(s.Field))) {
             changed |= pipeline.Draw(new VolumeParamProperty(slot, component), volumeGui);
-            changed |= volumeGui.TakeOverrideChanged();   // toggling the override checkbox is also a change
+            changed |= volumeGui.TakeOverrideChanged();
         }
 
-        ImGui.EndTable();
-        ImGui.Spacing();
+        gui.EndTable();
+        gui.Spacing();
 
         if (changed)
             EnforceParametermnvariants(component);
@@ -186,10 +182,6 @@ internal static class VolumeProfileEditor {
         return changed;
     }
 
-    // Cross-parameter constraints the per-slot sliders can't express on their own. Auto exposure
-    // exposes its EV floor/ceiling as two independent dials, so they can be dragged past each other
-    // into an inverted range - which later makes Math.Clamp in the metering pass throw. Keep min <=
-    // max here by pushing whichever the user just moved, so the saved profile is always valid.
     static void EnforceParametermnvariants(VolumeComponent component) {
         if (component is not Exposure exposure)
             return;
@@ -197,50 +189,42 @@ internal static class VolumeProfileEditor {
             exposure.limitMax.Value = exposure.limitMin.Value;
     }
 
-    // (The per-parameter value switch is gone — DrawParameters now runs every slot through the shared
-    // DrawerPipeline + ImGuiVolumeGui, the same value drawers the component inspector uses.)
-
-    // Compact framed header with an Active checkbox overlaid after the arrow (the inline version
-    // of InspectorPanel's component header) and a "..." menu button on the right edge. Remove
-    // Override is reachable from both that menu and a right-click on the header.
     static bool OverrideHeader(string label, ref bool active, out bool removeRequested) {
         removeRequested = false;
 
-        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new SysVec2(8, 5));
-        bool open = ImGui.TreeNodeEx($"     {label}###ovr_{label}",
-            ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.AllowOverlap | ImGuiTreeNodeFlags.Framed |
-            ImGuiTreeNodeFlags.SpanAvailWidth | ImGuiTreeNodeFlags.NoTreePushOnOpen);
-        ImGui.PopStyleVar();
+        gui.PushFramePadding(new SysVec2(8, 5));
+        bool open = gui.FramedHeader($"     {label}###ovr_{label}");
+        gui.PopStyleVar();
 
-        if (ImGui.BeginPopupContextItem("##overridectx")) {
-            if (ImGui.MenuItem("Remove Override"))
+        if (gui.BeginPopupContextItem("##overridectx")) {
+            if (gui.MenuItem("Remove Override"))
                 removeRequested = true;
-            ImGui.EndPopup();
+            gui.EndPopup();
         }
 
-        SysVec2 min = ImGui.GetItemRectMin();
-        SysVec2 max = ImGui.GetItemRectMax();
-        SysVec2 cursor = ImGui.GetCursorScreenPos();
-        float rowCenterY = min.Y + (max.Y - min.Y - ImGui.GetFrameHeight()) * 0.5f + 1;
+        SysVec2 min = gui.ItemRectMin;
+        SysVec2 max = gui.ItemRectMax;
+        SysVec2 cursor = gui.CursorScreenPos;
+        float rowCenterY = min.Y + (max.Y - min.Y - gui.FrameHeight) * 0.5f + 1;
 
-        ImGui.SetCursorScreenPos(new SysVec2(min.X + 24, rowCenterY));
-        ImGui.Checkbox($"##active_{label}", ref active);
+        gui.SetCursorScreenPos(new SysVec2(min.X + 24, rowCenterY));
+        gui.Checkbox($"##active_{label}", ref active);
 
-        float menuW = ImGui.GetFrameHeight() + 8;
-        ImGui.SetCursorScreenPos(new SysVec2(max.X - menuW - 4, rowCenterY));
-        ImGui.PushStyleColor(ImGuiCol.Button, new SysVec4(0, 0, 0, 0));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new SysVec4(1, 1, 1, 0.08f));
-        var menuClicked = ImGui.Button($"{EditorIcons.More}##menu_{label}", new SysVec2(menuW, 0));
-        ImGui.PopStyleColor(2);
+        float menuW = gui.FrameHeight + 8;
+        gui.SetCursorScreenPos(new SysVec2(max.X - menuW - 4, rowCenterY));
+        gui.PushColor(EditorStyleColor.Button, new SysVec4(0, 0, 0, 0));
+        gui.PushColor(EditorStyleColor.ButtonHovered, new SysVec4(1, 1, 1, 0.08f));
+        var menuClicked = gui.Button($"{EditorIcons.More}##menu_{label}", new SysVec2(menuW, 0));
+        gui.PopColor(2);
         if (menuClicked)
-            ImGui.OpenPopup("##overridemenu");
-        if (ImGui.BeginPopup("##overridemenu")) {
-            if (ImGui.MenuItem("Remove Override"))
+            gui.OpenPopup("##overridemenu");
+        if (gui.BeginPopup("##overridemenu")) {
+            if (gui.MenuItem("Remove Override"))
                 removeRequested = true;
-            ImGui.EndPopup();
+            gui.EndPopup();
         }
 
-        ImGui.SetCursorScreenPos(cursor);
+        gui.SetCursorScreenPos(cursor);
         return open;
     }
 
@@ -257,12 +241,6 @@ internal static class VolumeProfileEditor {
         }
         return result.ToString();
     }
-
-    // ---- In-memory snapshot/restore for undo (bug 2b) ------------------------------------------
-    // A volume profile is a .volume ASSET, not scene data, so the scene-snapshot undo doesn't cover
-    // it. These capture/restore the profile's component set + each parameter's (Overridden, Value) so
-    // an edit can be pushed as a callback undo step. Value is read/written via the parameter's public
-    // `Value` property by reflection (the type is generic VolumeParameter<T>).
 
     internal sealed class ProfileSnapshot {
         public List<CompSnap> Components = new();
@@ -288,7 +266,6 @@ internal static class VolumeProfileEditor {
     public static void Restore(VolumeProfile profile, object snapshotObj) {
         if (snapshotObj is not ProfileSnapshot snap)
             return;
-        // Remove components no longer in the snapshot; add ones that are missing.
         foreach (VolumeComponent c in profile.Components.ToArray())
             if (!snap.Components.Exists(cs => cs.Type == c.GetType()))
                 profile.Remove(c);

@@ -7,38 +7,22 @@ public readonly record struct RefreshResult(int Scanned, int Imported, int UpToD
         $"Asset refresh: {Scanned} scanned, {Imported} imported, {UpToDate} up to date, {Failed} failed ({ElapsedMs} ms)";
 }
 
-// Walks Assets\, ensures every asset has a .meta (stable GUID), and (re)imports
-// sources whose content, settings, or importer version changed since the last run.
 public sealed class AssetImportPipeline {
     readonly BallisticProject project;
     readonly List<IAssetImporter> importers;
 
-    // Published maps the render thread reads every frame (asset browser, scene/inspector lookups).
-    // Refresh() builds fresh copies on its worker thread and swaps them in atomically at the end, so
-    // a reader on another thread always sees a complete, self-consistent snapshot — never a map
-    // that's being cleared/repopulated mid-pass. The fields are replaced by reference, never mutated
-    // in place once published; the in-progress build dictionaries are separate locals.
     volatile Dictionary<Guid, string> guidToPath = new();
     volatile Dictionary<string, Guid> pathToGuid = new(StringComparer.OrdinalIgnoreCase);
     volatile Dictionary<Guid, MetaFile> metaByGuid = new();
 
-    // Same atomic-publish discipline as the maps above: Refresh builds into a local ArtifactDatabase
-    // and swaps it in at the end, so render-thread reads (TryGetArtifactPath for thumbnails) always
-    // see a consistent database, never one whose Entries are being added/removed mid-refresh.
     volatile ArtifactDatabase database = new();
 
     public IReadOnlyDictionary<Guid, string> GuidToPath => guidToPath;
     public IReadOnlyDictionary<string, Guid> PathToGuid => pathToGuid;
     public BallisticProject Project => project;
 
-    // Raised with the file name just before each asset is import-checked, so a UI (the editor's
-    // busy overlay) can show what's currently being processed. Called on whatever thread Refresh
-    // runs on — the editor marshals it to the render thread itself.
     public Action<string> Progress { get; set; }
 
-    // Numeric counterpart to Progress: (completed, total) for the import stage, so the editor can
-    // draw a DETERMINATE progress bar instead of an endless indeterminate sweep. Best-effort
-    // (last-writer-wins under parallel import), same threading contract as Progress.
     public Action<int, int> ProgressCount { get; set; }
 
     public AssetImportPipeline(BallisticProject project, IReadOnlyList<IAssetImporter> customImporters = null) {
@@ -63,16 +47,11 @@ public sealed class AssetImportPipeline {
         return File.Exists(absolutePath);
     }
 
-    // The artifact's logical pack path (forward-slash, project-root-relative), e.g.
-    // "Library/Artifacts/<guid>.bmesh". Null when the guid has no artifact record.
     public string ArtifactLogicalPath(Guid guid) =>
         database.Entries.TryGetValue(guid, out ArtifactRecord record) && record.Artifact is not null
             ? "Library/" + record.Artifact.Replace('\\', '/')
             : null;
 
-    // Pack-aware artifact read: returns the artifact's raw bytes from a mounted content pack if one
-    // has it (shipped player), else from the loose Library file (editor/dev). False when the guid has
-    // no artifact, or neither source has the bytes. The loaders decode these via *Artifact.Read(Stream).
     public bool TryReadArtifactBytes(Guid guid, out byte[] bytes) {
         bytes = null;
 
@@ -90,25 +69,14 @@ public sealed class AssetImportPipeline {
         return false;
     }
 
-    // forceAll = true reimports every asset regardless of the up-to-date checks (Unity's
-    // "Reimport All"): use after importer bugfixes or a corrupted Library.
     public RefreshResult Refresh(bool forceAll = false) {
         var stopwatch = Stopwatch.StartNew();
 
-        // Build into fresh LOCAL maps + database; the live fields keep serving the old snapshot until
-        // we swap the finished ones in at the end. Refresh can run on a worker thread while the render
-        // thread reads the published state every frame, so we must never mutate what's being read.
         var workingDb = ArtifactDatabase.Load(project.ArtifactDatabasePath);
         var buildGuidToPath = new Dictionary<Guid, string>();
         var buildPathToGuid = new Dictionary<string, Guid>(StringComparer.OrdinalIgnoreCase);
         var buildMetaByGuid = new Dictionary<Guid, MetaFile>();
 
-        // Importers can write new source assets during a pass (the model importer generates .mat
-        // files, the Falcor importer a sibling .scene). We sweep again ONLY when such an importer
-        // actually ran, so those generated files get registered. A refresh that imported only leaf
-        // assets (textures, meshes) finishes in one pass. Crucially, later passes do NOT re-scan or
-        // re-parse the metas of files already mapped — they only pick up files that newly appeared,
-        // so a second pass is cheap even with thousands of assets.
         const int maxPasses = 4;
         var scanned = 0;
         var imported = 0;
@@ -116,8 +84,6 @@ public sealed class AssetImportPipeline {
         var failed = 0;
 
         for (var pass = 0; pass < maxPasses; pass++) {
-            // Only the first pass force-reimports; later passes just register the source assets
-            // pass 1's importers generated (those are freshly imported anyway).
             (var passScanned, var passImported, var passUpToDate, var passFailed, var generatedSources) =
                 RefreshPass(workingDb, buildGuidToPath, buildPathToGuid, buildMetaByGuid, forceAll && pass == 0);
             scanned += passScanned;
@@ -125,15 +91,12 @@ public sealed class AssetImportPipeline {
             upToDate += passUpToDate;
             failed += passFailed;
 
-            // Nothing new to register unless an importer wrote sibling source assets this pass.
             if (!generatedSources)
                 break;
         }
 
         PruneOrphans(workingDb, buildGuidToPath);
 
-        // Publish the finished snapshot atomically (single reference assignment each). Readers on
-        // other threads see either the previous complete snapshot or this one — never a torn one.
         guidToPath = buildGuidToPath;
         pathToGuid = buildPathToGuid;
         metaByGuid = buildMetaByGuid;
@@ -147,14 +110,6 @@ public sealed class AssetImportPipeline {
         return result;
     }
 
-    // Shipped-player load: populate the GUID maps + artifact database from BAKED build data, WITHOUT
-    // running any importer (no Assimp/Stb/Magick, no source re-read, no writes). The build bakes every
-    // artifact plus the lookup tables; the player just reads them so AssetDatabase.Load can resolve
-    // "Assets/..." -> guid -> artifact.
-    //
-    // Preferred source is Library\guidmap.json (written at build time) — it lets the build SHIP NO
-    // SOURCE FILES OR METAS at all (sources stay private; the folder stays clean). If absent (older
-    // builds), falls back to scanning the .meta sidecars under Assets\.
     public void LoadFromArtifacts() {
         var stopwatch = Stopwatch.StartNew();
 
@@ -175,8 +130,7 @@ public sealed class AssetImportPipeline {
                 buildPathToGuid[assetPath] = guid;
                 loaded++;
             }
-            // Reconstruct the runtime metas (texture type etc.) the build baked into the guidmap, so
-            // TryGetMeta works without shipped .meta files — else every texture loads as Diffuse.
+
             foreach ((var guidText, GuidMap.MetaInfo info) in map.Meta) {
                 if (!Guid.TryParse(guidText, out Guid guid) || guid == Guid.Empty)
                     continue;
@@ -201,8 +155,6 @@ public sealed class AssetImportPipeline {
                       $"({stopwatch.ElapsedMilliseconds} ms).");
     }
 
-    // Fallback path: rebuild the maps by reading every .meta sidecar under Assets\ (older builds that
-    // still ship sources + metas). Read-only — never creates or rewrites a meta, unlike EnsureMeta.
     void LoadMapsFromMetas(Dictionary<Guid, string> buildGuidToPath, Dictionary<string, Guid> buildPathToGuid,
                            Dictionary<Guid, MetaFile> buildMetaByGuid, ref int loaded) {
         if (!Directory.Exists(project.AssetsPath))
@@ -236,16 +188,11 @@ public sealed class AssetImportPipeline {
         }
     }
 
-    // Writes the complete path -> guid table to Library\guidmap.json (build time). Call after a
-    // Refresh so the live maps are fully populated; the player reads this instead of the metas.
     public void WriteGuidMap() {
         var map = new GuidMap();
         foreach ((var path, var guid) in pathToGuid)
             map.Entries[path] = guid.ToString();
 
-        // Ship the runtime-relevant import settings (e.g. texture type) per asset, since the build
-        // strips the .meta sidecars — without this the player has no way to know a texture is a
-        // normal/spec map and binds it through the wrong sampler.
         foreach ((var guid, var meta) in metaByGuid) {
             if (meta?.Settings is null || meta.Settings.Count == 0)
                 continue;
@@ -259,33 +206,20 @@ public sealed class AssetImportPipeline {
         Debugging.Log($"Wrote guidmap with {map.Entries.Count} entries ({map.Meta.Count} with settings).");
     }
 
-    // One sweep over Assets\. Files already mapped this refresh (by an earlier pass) are skipped
-    // entirely — no FileInfo, no meta read, no import check — so re-passes only cost the walk plus
-    // work on genuinely-new files. Returns whether any source-generating importer ran (the only
-    // reason to sweep again).
-    // A dirty asset queued for the parallel import phase. Everything it needs is precomputed in the
-    // sequential scan so the parallel work touches no shared pipeline state.
     sealed class ImportJob {
         public Guid Guid;
         public MetaFile Meta;
         public IAssetImporter Importer;
         public string SourceAbsolute;
         public string AssetPath;
-        public string ArtifactRelative;     // null when the importer has no Library artifact
+        public string ArtifactRelative;
         public string ArtifactAbsolute;
         public string SettingsHash;
         public long FileSize;
         public DateTime MtimeUtc;
-        public string KnownContentHash;     // set when the scan already hashed the file
+        public string KnownContentHash;
     }
 
-    // A single sweep over Assets\ in three stages:
-    //   1. Scan (sequential)   — walk files, ensure metas, fill the path/guid maps, and decide which
-    //                            assets are dirty. Touches all shared pipeline state; cheap per file.
-    //   2. Import (PARALLEL)   — decode + write each dirty asset's own artifact across all cores.
-    //                            Pure CPU/file work on disjoint outputs; no shared state.
-    //   3. Commit (sequential) — fold the produced ArtifactRecords back into the database.
-    // Files already mapped by an earlier pass this refresh are skipped entirely.
     (int Scanned, int Imported, int UpToDate, int Failed, bool GeneratedSources) RefreshPass(
         ArtifactDatabase workingDb,
         Dictionary<Guid, string> buildGuidToPath,
@@ -296,14 +230,12 @@ public sealed class AssetImportPipeline {
         var upToDate = 0;
         var jobs = new List<ImportJob>();
 
-        // ---- Stage 1: scan (sequential) ----
         foreach (var sourceAbsolute in Directory.EnumerateFiles(project.AssetsPath, "*", SearchOption.AllDirectories)) {
             if (sourceAbsolute.EndsWith(".meta", StringComparison.OrdinalIgnoreCase))
                 continue;
 
             var assetPath = project.ToAssetPath(sourceAbsolute);
 
-            // Already handled by an earlier pass this refresh — don't touch it again.
             if (buildPathToGuid.ContainsKey(assetPath))
                 continue;
 
@@ -316,8 +248,6 @@ public sealed class AssetImportPipeline {
 
             IAssetImporter importer = ResolveImporter(meta, sourceAbsolute);
 
-            // Heal stale .meta settings (e.g. a normal map left tagged Diffuse by an old importer).
-            // Persist the corrected meta so the fix sticks and the next load reads the right type.
             if (meta.Settings is not null && importer.UpgradeSettings(assetPath, meta.Settings)) {
                 meta.Save(MetaFile.PathFor(sourceAbsolute));
                 Debugging.Log($"Upgraded import settings for '{assetPath}'.");
@@ -338,7 +268,6 @@ public sealed class AssetImportPipeline {
         if (jobs.Count == 0)
             return (scanned, 0, upToDate, 0, false);
 
-        // ---- Stage 2: import (parallel) ----
         var results = new ArtifactRecord[jobs.Count];
         var failedFlags = new bool[jobs.Count];
         var generatedSources = 0;
@@ -350,7 +279,6 @@ public sealed class AssetImportPipeline {
 
         Parallel.For(0, jobs.Count, options, i => {
             ImportJob job = jobs[i];
-            // Progress is best-effort (last writer wins) — fine for a "currently importing X" label.
             int completed = Interlocked.Increment(ref done);
             Progress?.Invoke($"{Path.GetFileName(job.AssetPath)} ({completed}/{jobs.Count})");
             ProgressCount?.Invoke(completed, jobs.Count);
@@ -371,7 +299,6 @@ public sealed class AssetImportPipeline {
             }
         });
 
-        // ---- Stage 3: commit (sequential) ----
         var imported = 0;
         var failed = 0;
         for (var i = 0; i < jobs.Count; i++) {
@@ -436,10 +363,6 @@ public sealed class AssetImportPipeline {
         return importers.First(candidate => candidate.CanImport(extension));
     }
 
-    // Sequential dirty-check. Returns null when the asset's artifact is already current (and
-    // refreshes its fast-path stamp in the DB as a side effect), or an ImportJob describing the
-    // work when it must be (re)imported. Reads/updates database.Entries, so it runs in the scan
-    // stage — never in parallel.
     ImportJob EvaluateDirty(ArtifactDatabase workingDb, MetaFile meta, IAssetImporter importer,
         string sourceAbsolute, string assetPath, bool force = false) {
         var settingsHash = meta.SettingsHash();
@@ -465,7 +388,6 @@ public sealed class AssetImportPipeline {
 
             contentHash = ContentHash.HashFile(sourceAbsolute);
             if (contentHash == record.ContentHash) {
-                // Touched but unchanged; remember the new stamp so the next run takes the fast path.
                 record.SourcePath = assetPath;
                 record.FileSize = sourceInfo.Length;
                 record.MtimeUtc = sourceInfo.LastWriteTimeUtc;
@@ -484,13 +406,10 @@ public sealed class AssetImportPipeline {
             SettingsHash = settingsHash,
             FileSize = sourceInfo.Length,
             MtimeUtc = sourceInfo.LastWriteTimeUtc,
-            KnownContentHash = contentHash, // null = scan didn't hash; RunImport hashes off-thread
+            KnownContentHash = contentHash,
         };
     }
 
-    // Parallel-safe import: decodes the source and writes its OWN artifact file, then returns the
-    // record to commit. Touches no shared pipeline state (the importer writes to a guid-named output
-    // and, for source-generating importers, distinct sibling files), so it runs across cores.
     static ArtifactRecord RunImport(ImportJob job) {
         job.Importer.Import(new AssetImportContext {
             SourceAbsolutePath = job.SourceAbsolute,
@@ -511,7 +430,6 @@ public sealed class AssetImportPipeline {
         };
     }
 
-    // Runs before publish, on the unpublished workingDb — safe to mutate its Entries here.
     void PruneOrphans(ArtifactDatabase workingDb, Dictionary<Guid, string> buildGuidToPath) {
         List<Guid> orphans = workingDb.Entries.Keys.Where(guid => !buildGuidToPath.ContainsKey(guid)).ToList();
         foreach (Guid orphan in orphans) {
@@ -525,9 +443,6 @@ public sealed class AssetImportPipeline {
         }
     }
 
-    // A .meta is a sidecar for exactly one file (folders get none — the scan walks files only),
-    // so a meta whose source file is gone was stranded by an EXTERNAL delete (Explorer/IDE; the
-    // in-editor delete removes both together). Clean it up like Unity does on refresh.
     void DeleteOrphanedMetaFiles() {
         foreach (var metaAbsolute in Directory.EnumerateFiles(project.AssetsPath, "*.meta", SearchOption.AllDirectories)) {
             var sourceAbsolute = metaAbsolute[..^".meta".Length];

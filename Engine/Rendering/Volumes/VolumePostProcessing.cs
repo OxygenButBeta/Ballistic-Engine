@@ -1,8 +1,5 @@
 namespace BallisticEngine;
 
-// Maps the blended VolumeStack onto the renderer's live PostProcessSettings each frame.
-// This is the ONLY seam between the generic volume framework and the GL pipeline's flat
-// settings object — new VolumeComponents extend this mapping, nothing else.
 public static class VolumePostProcessing {
     public static void Apply(VolumeStack stack, PostProcessSettings fx) {
         if (stack.GetComponent<Exposure>() is { } exposure) {
@@ -23,12 +20,18 @@ public static class VolumePostProcessing {
             fx.BloomEnabled = bloom.enabled.Value;
             fx.BloomIntensity = bloom.intensity.Value;
             fx.BloomThreshold = bloom.threshold.Value;
+            fx.BloomKnee = bloom.knee.Value;
         }
 
         if (stack.GetComponent<AmbientOcclusion>() is { } ao) {
             fx.SSAOEnabled = ao.enabled.Value;
+            fx.SSAOQuality = ao.quality.Value;
+            fx.SSAOResolution = ao.resolution.Value;
             fx.SSAORadius = ao.radius.Value;
             fx.SSAOIntensity = ao.intensity.Value;
+            fx.SSAOPower = ao.power.Value;
+            fx.SSAOThickness = ao.thickness.Value;
+            fx.SSAOMultiBounce = ao.multiBounce.Value;
         }
 
         if (stack.GetComponent<AntiAliasing>() is { } aa) {
@@ -40,44 +43,6 @@ public static class VolumePostProcessing {
         if (stack.GetComponent<Upscaling>() is { } upscale) {
             fx.UpscaleMode = upscale.mode.Value;
             fx.UpscaleSharpness = upscale.sharpness.Value;
-        }
-
-        // THE unified Global Illumination volume — indirect light only (diffuse GI + reflections).
-        // Replaced the old ScreenSpaceGlobalIllumination + ScreenSpaceReflections + the dead GL
-        // probe/Lumen split overrides (P0.5 consolidation). The two Mode dropdowns each carry their own
-        // Off, so the enable bool is derived from the mode (no separate enable param to keep in sync).
-        if (stack.GetComponent<GlobalIllumination>() is { } gi) {
-            // MASTER SWITCH: enabled=false is a HARD STOP for the whole Lumen stack. We force every GI/
-            // reflection mode to Off here (overriding the dropdowns) so EVERY downstream reader — SSGI,
-            // RT-GI, SSR, RT-reflections, DDGI, screen probes, emissive-as-GI — sees "off" with no extra
-            // wiring. The renderer also hard-gates DDGI/screen-probe allocation on these same fields.
-            bool on = gi.enabled.Value;
-
-            // Diffuse GI.
-            fx.GiMode = on ? gi.giMode.Value : GiMode.Off;
-            fx.SsgiEnabled = on && gi.giMode.Value != GiMode.Off;
-            fx.SsgiIntensity = gi.intensity.Value;
-            fx.SsgiDebugView = on && gi.giIsolate.Value;
-            fx.GiEmissive = on && gi.emissiveAsGi.Value;   // emissive surfaces as area lights in the bounce
-            // Ray-Traced GI quality (DDGI world cache + screen probes). Part of the hard kill: off when the
-            // master switch is off, so the whole Lumen world/screen-probe machinery stops too.
-            fx.Ddgi = on && gi.worldRadianceCache.Value;
-            fx.ScreenProbes = on && gi.screenProbes.Value;
-            // Reflections (Off maps to SsrEnabled=false; the renderer's SSR-vs-RT gate keeps working).
-            fx.ReflectionMode = on ? gi.reflectionsMode.Value : ReflectionMode.Off;
-            fx.SsrEnabled = on && gi.reflectionsMode.Value != ReflectionMode.Off;
-            fx.SsrIntensity = gi.reflectionsIntensity.Value;
-            // Advanced bounce / temporal / look dials (every one is consumed by the DX12 SSGI/RT-GI path).
-            fx.SsgiRayLength = gi.rayLength.Value;
-            fx.SsgiFalloff = gi.falloff.Value;
-            fx.SsgiThickness = gi.thickness.Value;
-            fx.SsgiBounceBoost = gi.bounceBoost.Value;   // shader Params1.x (was hardcoded 0)
-            fx.SsgiOcclusionPower = gi.occlusionPower.Value;
-            fx.SsgiRayCount = gi.rayCount.Value;
-            fx.SsgiMaxHistory = gi.maxHistory.Value;
-            fx.SsgiLook = gi.look.Value;
-            fx.SsgiTint = gi.tint.Value;
-            fx.SsgiSaturation = gi.saturation.Value;
         }
 
         if (stack.GetComponent<Shadows>() is { } shadows) {
@@ -110,6 +75,84 @@ public static class VolumePostProcessing {
             fx.VolumetricMaxDistance = volumetric.maxDistance.Value;
             fx.VolumetricFeedback = volumetric.feedback.Value;
             fx.VolumetricTint = volumetric.tint.Value;
+        }
+
+        if (stack.GetComponent<VolumetricLighting>() is { } vlit) {
+            fx.VolumetricEnabled = vlit.enabled.Value;
+            fx.VolumetricIntensity = vlit.intensity.Value;
+            fx.VolumetricDensity = vlit.density.Value;
+            fx.VolumetricHeightFalloff = vlit.heightFalloff.Value;
+            fx.VolumetricBaseHeight = vlit.baseHeight.Value;
+            fx.VolumetricScattering = vlit.scattering.Value;
+            fx.VolumetricAmbientScatter = vlit.ambientScatter.Value;
+            fx.VolumetricAnisotropy = vlit.anisotropy.Value;
+            fx.VolumetricSunGlow = vlit.sunGlow.Value;
+            fx.VolumetricSunGlowSharpness = vlit.sunGlowSharpness.Value;
+            fx.VolumetricStepCount = vlit.stepCount.Value;
+            fx.VolumetricMaxDistance = vlit.maxDistance.Value;
+            fx.VolumetricTint = vlit.tint.Value;
+
+            fx.ShaftsEnabled = vlit.shaftsEnabled.Value;
+            fx.ShaftIntensity = vlit.shaftIntensity.Value;
+            fx.ShaftDensity = vlit.shaftDensity.Value;
+            fx.ShaftDecay = vlit.shaftDecay.Value;
+            fx.ShaftSharpness = vlit.shaftSharpness.Value;
+            fx.ShaftTint = vlit.shaftTint.Value;
+
+            fx.DustEnabled = vlit.dustEnabled.Value;
+            fx.DustIntensity = vlit.dustIntensity.Value;
+            fx.DustSize = vlit.dustSize.Value;
+            fx.DustDrift = vlit.dustDrift.Value;
+            fx.DustSparkle = vlit.dustSparkle.Value;
+        }
+
+        if (stack.GetComponent<GiVolume>() is { } gi) {
+            fx.DdgiEnabled = gi.enabled.Value;
+            fx.DdgiIntensity = gi.intensity.Value;
+            fx.DdgiSkyIntensity = gi.skyIntensity.Value;
+            fx.DdgiEmaAlpha = gi.emaAlpha.Value;
+            fx.DdgiMultiBounce = gi.multiBounce.Value;
+            fx.DdgiVisibility = gi.visibility.Value;
+            fx.DdgiNormalBias = gi.normalBias.Value;
+            fx.DdgiAoStrength = gi.aoStrength.Value;
+            fx.DdgiDebugProbes = gi.debugProbes.Value;
+            fx.DdgiDebugRawIndirect = gi.debugRawIndirect.Value;
+            fx.DdgiBoundsMode = (int)gi.boundsMode.Value;
+            fx.DdgiBoundsCenter = default;
+            fx.DdgiBoundsExtent = default;
+            if (gi.boundsMode.Value == GiBoundsMode.Volume
+                && VolumeManager.DominantGiVolume is { } gv
+                && gv.TryGetWorldBox(out Vector3 boxCenter, out Vector3 boxHalf)) {
+                fx.DdgiBoundsCenter = boxCenter;
+                fx.DdgiBoundsExtent = boxHalf;
+            }
+
+            switch (gi.quality.Value) {
+                case GiQuality.High:        fx.DdgiGridX = 24; fx.DdgiGridY = 12; fx.DdgiGridZ = 24; break;
+                case GiQuality.Balanced:    fx.DdgiGridX = 16; fx.DdgiGridY = 8;  fx.DdgiGridZ = 16; break;
+                case GiQuality.Performance: fx.DdgiGridX = 10; fx.DdgiGridY = 6;  fx.DdgiGridZ = 10; break;
+                default:
+                    fx.DdgiGridX = gi.gridX.Value;
+                    fx.DdgiGridY = gi.gridY.Value;
+                    fx.DdgiGridZ = gi.gridZ.Value;
+                    break;
+            }
+        }
+
+        if (stack.GetComponent<Reflections>() is { } refl) {
+            fx.ReflectionMode = refl.mode.Value;
+            fx.SsrEnabled = refl.mode.Value != ReflectionMode.Off;
+            fx.SsrIntensity = refl.intensity.Value;
+            fx.DdgiReflections = refl.sampleRadianceCache.Value;
+        }
+
+        if (stack.GetComponent<AerialPerspective>() is { } aerial) {
+            fx.AerialPerspectiveEnabled = aerial.enabled.Value;
+            fx.AerialPerspectiveIntensity = aerial.intensity.Value;
+            fx.AerialPerspectiveStartDistance = aerial.startDistance.Value;
+            fx.AerialPerspectiveMaxDistance = aerial.maxDistance.Value;
+            fx.AerialPerspectiveDensityScale = aerial.densityScale.Value;
+            fx.AerialPerspectiveTint = aerial.tint.Value;
         }
 
         if (stack.GetComponent<ColorAdjustments>() is { } grade) {

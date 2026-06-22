@@ -1,12 +1,5 @@
 namespace BallisticEngine.UI;
 
-// The per-element computed style — Ballistic's analogue of Unity's IStyle (`element.style.*`).
-// Two kinds of property live here:
-//   * LAYOUT props (width, flex, margin, padding, position, ...) write straight through to the
-//     element's LayoutNode (the Yoga facade) so the next solve picks them up.
-//   * VISUAL props (background color, border, radius, text color, font size, opacity) are stored
-//     as fields here; the (deferred) IUIRenderer reads them when it walks the tree to draw.
-// CSS-style naming throughout so a ported design assigns them the way the source stylesheet did.
 public sealed class Style
 {
     readonly VisualElement _el;
@@ -14,9 +7,18 @@ public sealed class Style
 
     internal Style(VisualElement el) => _el = el;
 
-    // ---------------------------------------------------------------- layout: flex container
+    string _imperativeOverrides;
+    bool _capturedOverrides;
 
-    FlexDirection _flexDirection = FlexDirection.Row; // web default (matches HTML <div>)
+    internal string CaptureImperativeOverrides()
+    {
+        if (_capturedOverrides) return _imperativeOverrides;
+        _capturedOverrides = true;
+        _imperativeOverrides = StyleSerialize.DiffFromDefaults(this);
+        return _imperativeOverrides;
+    }
+
+    FlexDirection _flexDirection = FlexDirection.Row;
     public FlexDirection FlexDirection { get => _flexDirection; set { _flexDirection = value; L.FlexDirection = value; } }
 
     FlexWrap _flexWrap = FlexWrap.NoWrap;
@@ -34,12 +36,10 @@ public sealed class Style
     Align _alignSelf = Align.Auto;
     public Align AlignSelf { get => _alignSelf; set { _alignSelf = value; L.AlignSelf = value; } }
 
-    // ---------------------------------------------------------------- layout: flex item
-
     float _flexGrow;
     public float FlexGrow { get => _flexGrow; set { _flexGrow = value; L.FlexGrow = value; } }
 
-    float _flexShrink = 1f; // web default
+    float _flexShrink = 1f;
     public float FlexShrink { get => _flexShrink; set { _flexShrink = value; L.FlexShrink = value; } }
 
     Length _flexBasis = Length.Auto;
@@ -54,7 +54,8 @@ public sealed class Style
     Overflow _overflow = Overflow.Visible;
     public Overflow Overflow { get => _overflow; set { _overflow = value; L.Overflow = value; } }
 
-    // ---------------------------------------------------------------- layout: box size
+    LayoutDirection _direction = LayoutDirection.LTR;
+    public LayoutDirection Direction { get => _direction; set { _direction = value; L.Direction = value; } }
 
     Length _width = Length.Auto;
     public Length Width { get => _width; set { _width = value; ApplyLength(value, L.SetWidthPoints, L.SetWidthPercent, L.SetWidthAuto); } }
@@ -68,46 +69,62 @@ public sealed class Style
     public float MaxWidth { get => _maxWidth; set { _maxWidth = value; L.SetMaxWidthPoints(value); } }
     public float MaxHeight { get => _maxHeight; set { _maxHeight = value; L.SetMaxHeightPoints(value); } }
 
-    // ---------------------------------------------------------------- layout: inset / margin / padding
+    readonly float[] _inset = { float.NaN, float.NaN, float.NaN, float.NaN };
+    readonly float[] _margin = { float.NaN, float.NaN, float.NaN, float.NaN };
+    readonly float[] _padding = { float.NaN, float.NaN, float.NaN, float.NaN };
+    readonly float[] _border = { 0f, 0f, 0f, 0f };
 
-    // Position offsets when Position is Absolute/Relative — CSS top/right/bottom/left.
-    public void SetInset(Edge edge, Length len) => ApplyLengthEdge(edge, len, L.SetPositionPoints, L.SetPositionPercent);
-    public float Left { set => L.SetPositionPoints(Edge.Left, value); }
-    public float Top { set => L.SetPositionPoints(Edge.Top, value); }
-    public float Right { set => L.SetPositionPoints(Edge.Right, value); }
-    public float Bottom { set => L.SetPositionPoints(Edge.Bottom, value); }
+    static int EdgeIndex(Edge e) => e switch { Edge.Left => 0, Edge.Top => 1, Edge.Right => 2, Edge.Bottom => 3, _ => -1 };
 
-    public void SetMargin(Edge edge, float points) => L.SetMarginPoints(edge, points);
-    public void SetPadding(Edge edge, float points) => L.SetPaddingPoints(edge, points);
+    public void SetInset(Edge edge, Length len)
+    {
+        ApplyLengthEdge(edge, len, L.SetPositionPoints, L.SetPositionPercent);
+        Cache(_inset, edge, len.Unit == Length.Kind.Auto ? float.NaN : len.Value);
+    }
+    public float GetInset(Edge edge) { int i = EdgeIndex(edge); return i < 0 ? float.NaN : _inset[i]; }
+    public float Left   { get => _inset[0]; set { L.SetPositionPoints(Edge.Left, value);   _inset[0] = value; } }
+    public float Top    { get => _inset[1]; set { L.SetPositionPoints(Edge.Top, value);    _inset[1] = value; } }
+    public float Right  { get => _inset[2]; set { L.SetPositionPoints(Edge.Right, value);  _inset[2] = value; } }
+    public float Bottom { get => _inset[3]; set { L.SetPositionPoints(Edge.Bottom, value); _inset[3] = value; } }
 
-    // Border width feeds BOTH the layout (Yoga insets content by the border) AND the renderer (it
-    // draws a stroke of this width). Yoga has no readback for it, so we also keep a visual copy.
-    // v1 draws a uniform border, so the visual width tracks the last non-zero edge written (Edge.All
-    // is the common path via the StyleApplier).
+    public void SetMargin(Edge edge, float points) { L.SetMarginPoints(edge, points); Cache(_margin, edge, points); }
+    public void SetPadding(Edge edge, float points) { L.SetPaddingPoints(edge, points); Cache(_padding, edge, points); }
+    public float GetMargin(Edge edge) { int i = EdgeIndex(edge); return i < 0 ? float.NaN : _margin[i]; }
+    public float GetPadding(Edge edge) { int i = EdgeIndex(edge); return i < 0 ? float.NaN : _padding[i]; }
+    public float GetBorderWidth(Edge edge) { int i = EdgeIndex(edge); return i < 0 ? 0f : _border[i]; }
+
+    static void Cache(float[] arr, Edge edge, float v)
+    {
+        if (edge == Edge.All) { arr[0] = arr[1] = arr[2] = arr[3] = v; return; }
+        int i = EdgeIndex(edge);
+        if (i >= 0) arr[i] = v;
+    }
+
     public float BorderWidthVisual { get; private set; }
     public void SetBorderWidth(Edge edge, float points)
     {
         L.SetBorderPoints(edge, points);
+        Cache(_border, edge, points);
         BorderWidthVisual = points;
     }
 
-    // Shorthand: same value on all four edges (CSS `margin: 8px` / `padding: 12px`).
-    public float Margin { set => L.SetMarginPoints(Edge.All, value); }
-    public float Padding { set => L.SetPaddingPoints(Edge.All, value); }
+    public float Margin { set => SetMargin(Edge.All, value); }
+    public float Padding { set => SetPadding(Edge.All, value); }
 
-    // ---------------------------------------------------------------- visual (renderer reads these)
+    float _gap, _rowGap, _columnGap;
+    public float Gap { get => _gap; set { _gap = value; L.SetGap(Gutter.All, value); } }
+    public float RowGap { get => _rowGap; set { _rowGap = value; L.SetGap(Gutter.Row, value); } }
+    public float ColumnGap { get => _columnGap; set { _columnGap = value; L.SetGap(Gutter.Column, value); } }
+
+    float _aspectRatio = float.NaN;
+    public float AspectRatio { get => _aspectRatio; set { _aspectRatio = value; L.AspectRatio = value; } }
 
     public Color BackgroundColor = Color.Transparent;
 
-    // When set, the background is painted as this gradient INSTEAD of BackgroundColor (CSS `background:
-    // linear-gradient(...)`). The renderer evaluates it inside the (rounded) box. Null = use the solid
-    // BackgroundColor.
     public Gradient BackgroundGradient;
 
     public Color BorderColor = Color.Transparent;
-    // Per-corner radius in pixels (top-left, top-right, bottom-right, bottom-left). The renderer
-    // clamps each to half the box's min(width,height) so `border-radius: 999px` produces a pill, not
-    // an over-arced oval — eliminating the port skill's "pills render as ovals" gotcha.
+
     public float BorderRadiusTopLeft, BorderRadiusTopRight, BorderRadiusBottomRight, BorderRadiusBottomLeft;
     public float BorderRadius
     {
@@ -118,30 +135,94 @@ public sealed class Style
     public float FontSize = 14f;
     public float Opacity = 1f;
 
-    // A post-layout pixel translation applied at render time (CSS transform: translate(x,y)). Does NOT
-    // affect layout — it shifts the element and its subtree visually only, like CSS transforms. Used
-    // for selection slides and entrance motion. Rotation is degrees (for the small rotated gems).
     public float TranslateX, TranslateY;
     public float RotationDegrees;
     public float Scale = 1f;
 
-    // CSS font-family — the registered UI font name to render text with (null/empty = default font).
-    // Inherits down the tree at apply time isn't modeled; set it where text lives (or on a parent the
-    // USS targets). Letter spacing is in pixels (CSS letter-spacing converted), added between glyphs.
     public string FontFamily;
     public float LetterSpacing;
 
-    // Text alignment within the element's box (CSS text-align × vertical). Null = use the Label's own
-    // default (MiddleLeft). Set via USS `text-align` / `-unity-text-align`; the Label reads it.
     public TextAlign? TextAlign;
 
-    // CSS text-shadow: an offset + blur radius + color drawn behind the glyphs. Used both for
-    // legibility (dark drop shadow) and glow (large blur, colored). HasTextShadow gates it.
     public bool HasTextShadow;
     public float TextShadowOffsetX, TextShadowOffsetY, TextShadowBlur;
     public Color TextShadowColor = Color.Transparent;
 
-    // ---------------------------------------------------------------- helpers
+    public WhiteSpace WhiteSpace = WhiteSpace.NoWrap;
+    public TextOverflow TextOverflow = TextOverflow.Clip;
+
+    public bool HasBoxShadow;
+    public float BoxShadowOffsetX, BoxShadowOffsetY, BoxShadowBlur, BoxShadowSpread;
+    public Color BoxShadowColor = Color.Transparent;
+
+    public float BackdropBlur;
+
+    public bool Bold;
+    public bool Italic;
+
+    public void ResetToDefaults()
+    {
+        FlexDirection = FlexDirection.Row;
+        FlexWrap = FlexWrap.NoWrap;
+        JustifyContent = Justify.FlexStart;
+        AlignItems = Align.Stretch;
+        AlignContent = Align.FlexStart;
+        AlignSelf = Align.Auto;
+        FlexGrow = 0f;
+        FlexShrink = 1f;
+        FlexBasis = Length.Auto;
+        Position = PositionType.Relative;
+        Display = DisplayStyle.Flex;
+        Overflow = Overflow.Visible;
+        Direction = LayoutDirection.LTR;
+        Width = Length.Auto;
+        Height = Length.Auto;
+        MinWidth = 0f; MinHeight = 0f; MaxWidth = float.NaN; MaxHeight = float.NaN;
+        Gap = 0f; RowGap = 0f; ColumnGap = 0f;
+        AspectRatio = float.NaN;
+        SetMargin(Edge.All, 0f);
+        SetPadding(Edge.All, 0f);
+        SetBorderWidth(Edge.All, 0f);
+        _inset[0] = _inset[1] = _inset[2] = _inset[3] = float.NaN;
+        L.SetPositionPoints(Edge.Left, 0f); L.SetPositionPoints(Edge.Top, 0f);
+        L.SetPositionPoints(Edge.Right, 0f); L.SetPositionPoints(Edge.Bottom, 0f);
+        BackgroundColor = Color.Transparent;
+        BackgroundGradient = null;
+        BorderColor = Color.Transparent;
+        BorderRadius = 0f;
+        TextColor = Color.White;
+        FontSize = 14f;
+        Opacity = 1f;
+        TranslateX = 0f; TranslateY = 0f; RotationDegrees = 0f; Scale = 1f;
+        FontFamily = null;
+        LetterSpacing = 0f;
+        TextAlign = null;
+        HasTextShadow = false;
+        TextShadowOffsetX = 0f; TextShadowOffsetY = 0f; TextShadowBlur = 0f;
+        TextShadowColor = Color.Transparent;
+        WhiteSpace = WhiteSpace.NoWrap;
+        TextOverflow = TextOverflow.Clip;
+        HasBoxShadow = false;
+        BoxShadowOffsetX = 0f; BoxShadowOffsetY = 0f; BoxShadowBlur = 0f; BoxShadowSpread = 0f;
+        BoxShadowColor = Color.Transparent;
+        BackdropBlur = 0f;
+        Bold = false; Italic = false;
+    }
+
+    public void InheritFrom(Style parent)
+    {
+        if (parent == null) return;
+        TextColor = parent.TextColor;
+        FontSize = parent.FontSize;
+        FontFamily = parent.FontFamily;
+        LetterSpacing = parent.LetterSpacing;
+        TextAlign = parent.TextAlign;
+        WhiteSpace = parent.WhiteSpace;
+        TextOverflow = parent.TextOverflow;
+        Bold = parent.Bold;
+        Italic = parent.Italic;
+        Direction = parent.Direction;
+    }
 
     static void ApplyLength(Length len, System.Action<float> points, System.Action<float> percent, System.Action auto)
     {
@@ -156,6 +237,6 @@ public sealed class Style
     static void ApplyLengthEdge(Edge edge, Length len, System.Action<Edge, float> points, System.Action<Edge, float> percent)
     {
         if (len.Unit == Length.Kind.Percent) percent(edge, len.Value);
-        else points(edge, len.Value); // auto inset is rare; treat as 0 points
+        else points(edge, len.Value);
     }
 }

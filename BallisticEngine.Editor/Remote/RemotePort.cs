@@ -4,17 +4,9 @@ using System.Text.Json;
 
 namespace BallisticEngine.Editor;
 
-// The editor's remote-control surface: a named-pipe server speaking newline-delimited JSON —
-//   request:  {"id": 1, "method": "entity.create", "params": {"name": "Lamp"}}
-//   response: {"id": 1, "result": {...}}  or  {"id": 1, "error": "..."}
-// MULTIPLE clients at once (the persistent MCP server process AND ad-hoc clients/agents) — each gets
-// its own server instance + handler thread; commands still serialize through the editor main thread
-// (RemoteCommandQueue), so concurrent clients can't corrupt state. The server thread lives in ENGINE
-// code outside the script ALC, so it survives script hot-reloads and play-mode transitions — the
-// documented failure mode of every in-editor bridge in other engines.
 internal static class RemotePort {
     public const string PipeName = "BallisticEditor";
-    const int MaxConcurrentClients = 8;     // MCP holds one persistently; leave room for agents/tools
+    const int MaxConcurrentClients = 8;
 
     static CancellationTokenSource? cancel;
 
@@ -28,9 +20,6 @@ internal static class RemotePort {
 
     public static void Stop() => cancel?.Cancel();
 
-    // Accept connections forever; hand each client to its own thread so one long-lived client (MCP)
-    // never blocks another from connecting. NamedPipeServerStream needs the same maxInstances on every
-    // instance, so all share MaxConcurrentClients.
     static void AcceptLoop(CancellationToken token) {
         while (!token.IsCancellationRequested) {
             NamedPipeServerStream? pipe = null;
@@ -44,14 +33,14 @@ internal static class RemotePort {
                 return;
             }
             catch (Exception) {
-                pipe?.Dispose();   // a failed WaitForConnection still leaked the OS pipe handle
-                continue; // transient accept failure — try again
+                pipe?.Dispose();
+                continue;
             }
 
-            // Serve this client on its own thread; the accept loop immediately waits for the next.
             var clientThread = new Thread(() => {
                 try { Serve(pipe); }
-                catch { /* client dropped */ }
+                catch {
+                }
                 finally { pipe.Dispose(); }
             }) { IsBackground = true, Name = "RemotePort.Client" };
             clientThread.Start();
@@ -81,8 +70,6 @@ internal static class RemotePort {
                     ? m.GetString() ?? "" : throw new Exception("missing 'method'");
                 JsonElement parameters = root.TryGetProperty("params", out JsonElement p) ? p : default;
 
-                // Blocks until the editor main thread executed the handler (JsonDocument stays
-                // alive through the call because Execute is synchronous).
                 object result = RemoteCommandQueue.Execute(() => RemoteHandlers.Dispatch(method, parameters));
                 response = new { id, result };
             }

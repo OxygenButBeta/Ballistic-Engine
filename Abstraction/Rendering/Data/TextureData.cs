@@ -1,11 +1,5 @@
 namespace BallisticEngine;
 
-// CPU-side decoded image. Carries no GPU state, so it can be produced off the GL thread.
-//
-// For block-compressed formats (BC1/BC3/BC5), Pixels holds the full mip chain concatenated
-// largest-first and MipCount says how many levels are present; each level's dimensions and byte
-// length are derived from Width/Height/Format (see TextureMipLayout). Uncompressed RGBA8/RGBA32F
-// is a single level (MipCount 1) — the GPU generates its mips on upload as before.
 public readonly struct TextureData {
     public readonly int Width;
     public readonly int Height;
@@ -24,17 +18,13 @@ public readonly struct TextureData {
     public bool IsValid => Pixels is not null && Width > 0 && Height > 0;
 }
 
-// Computes the byte layout of a (possibly mipped, possibly block-compressed) texture. Shared by the
-// artifact writer/reader and the GL upload so they agree on offsets without storing a table.
 public static class TextureMipLayout {
-    // Dimensions of mip `level` (0 = base), floored to a minimum of 1.
     public static (int w, int h) LevelSize(int width, int height, int level) {
         int w = Math.Max(1, width >> level);
         int h = Math.Max(1, height >> level);
         return (w, h);
     }
 
-    // Byte length of one mip level for the given format.
     public static long LevelBytes(int width, int height, int level, TextureFormat format) {
         var (w, h) = LevelSize(width, height, level);
         if (format.IsBlockCompressed()) {
@@ -46,7 +36,6 @@ public static class TextureMipLayout {
         return (long)w * h * bpp;
     }
 
-    // Total bytes for `mipCount` levels starting at the base size.
     public static long ChainBytes(int width, int height, int mipCount, TextureFormat format) {
         long total = 0;
         for (int level = 0; level < mipCount; level++)
@@ -54,7 +43,6 @@ public static class TextureMipLayout {
         return total;
     }
 
-    // Byte offset of mip `level` within a chain laid out largest-first.
     public static long LevelOffset(int width, int height, int level, TextureFormat format) {
         long offset = 0;
         for (int l = 0; l < level; l++)

@@ -1,10 +1,8 @@
 namespace BallisticEngine.InputSystem;
 
-// A bound device control (plan §7.2). Names a control by ENUM (never a string/OpenTK enum) plus the
-// per-binding modifiers that compose scalars into an axis (WASD → Vector2 via Negate/Swizzle).
 public readonly struct Binding {
     public readonly DeviceKind Device;
-    public readonly int Control;       // the enum value (Key/MouseCtrl/PadButton/PadAxis), kept as int
+    public readonly int Control;
     public readonly Modifier Modifiers;
 
     internal Binding(DeviceKind device, int control, Modifier modifiers) {
@@ -21,11 +19,9 @@ public readonly struct Binding {
 
 public enum DeviceKind { Keyboard, Mouse, GamepadButton, GamepadAxis }
 
-// The trigger condition + its parameter, declared WITH the action (plan §7.6) so the callback stays
-// bare. Press by default; Hold(0.5f) etc. via the factory helpers.
 public readonly struct Trigger {
     public readonly TriggerKind Kind;
-    public readonly float Param;   // seconds for Hold/Tap/DoubleTap; rate for Pulse
+    public readonly float Param;
     public Trigger(TriggerKind kind, float param = 0f) { Kind = kind; Param = param; }
 
     public static readonly Trigger Press = new(TriggerKind.Press);
@@ -36,15 +32,6 @@ public readonly struct Trigger {
     public static Trigger Pulse(float rate) => new(TriggerKind.Pulse, rate);
 }
 
-// ONE action class (plan §7.2): the value type is a FIELD, bindings are a SEPARATE list, the trigger
-// lives in the definition. No per-shape subclasses, no string paths, no OpenTK. The constructor
-// SELF-REGISTERS into InputRegistry (§7.3.1) so there's no central InstallDefaults to edit and forget.
-//
-// Authoring (code-first):
-//   public static readonly InputAction Move = new InputAction("Move", InputValueType.Axis2D)
-//       .Bind(Key.W, Modifier.Swizzle).Bind(Key.S, Modifier.Swizzle | Modifier.Negate)
-//       .Bind(Key.A, Modifier.Negate).Bind(Key.D)
-//       .Bind(PadAxis.LeftStick);
 public sealed class InputAction {
     public string Name { get; }
     public InputValueType Value { get; }
@@ -56,10 +43,9 @@ public sealed class InputAction {
     public InputAction(string name, InputValueType value) {
         Name = name ?? throw new ArgumentNullException(nameof(name));
         Value = value;
-        InputRegistry.Register(this);   // self-register on construction (§7.3.1)
+        InputRegistry.Register(this);
     }
 
-    // Fluent Bind overloads — one per OUR device enum, so each call is fully type-checked.
     public InputAction Bind(Key key, Modifier modifiers = Modifier.None) {
         bindings.Add(new Binding(DeviceKind.Keyboard, (int)key, modifiers));
         return this;
@@ -80,7 +66,6 @@ public sealed class InputAction {
         return this;
     }
 
-    // Set the trigger in the definition (the §7.6 "resolved once" comfort — the callback stays bare).
     public InputAction WithTrigger(Trigger trigger) {
         Trigger = trigger;
         return this;

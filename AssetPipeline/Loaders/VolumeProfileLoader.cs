@@ -2,39 +2,12 @@ using System.Text.Json;
 
 namespace BallisticEngine.AssetPipeline.Loaders;
 
-// .volume <-> VolumeProfile. Load builds the runtime profile from the JSON definition
-// (unknown components warn and are skipped; unknown/missing parameters keep defaults).
-// Save is the editor's write-back path: because AssetDatabase caches the loaded instance,
-// the inspector edits the live profile and persists it here in one step.
 public static class VolumeProfileLoader {
-    // Renamed volume components: profiles saved under the old name keep loading (and write
-    // back the new name on the next editor save).
     static readonly Dictionary<string, string> LegacyTypeNames = new() {
-        ["VolumetricLight"] = "VolumetricFog",
-        // P0.5 GI consolidation: the old ScreenSpaceGlobalIllumination + ScreenSpaceReflections folded
-        // into ONE unified GlobalIllumination volume. Both old type names remap to it; if a profile has
-        // BOTH, they merge into the one instance (profile.Add returns the existing instance). The dead
-        // GL probe overrides (the old monolithic GlobalIllumination's probe/SDF params, LightProbes,
-        // ReflectionProbes, Lumen) are NOT remapped — they warn-and-skip (those settings were GL-only).
-        ["ScreenSpaceGlobalIllumination"] = "GlobalIllumination",
-        ["ScreenSpaceReflections"] = "GlobalIllumination",
+        ["VolumetricLight"] = "VolumetricFog", ["GlobalIllumination"] = "GiVolume",
     };
 
-    // Per-old-type parameter renames for the GI consolidation: a parameter stored under its old name in
-    // an old-typed component binds to the new field name on the unified GlobalIllumination. Keyed by the
-    // ORIGINAL on-disk type name (before the LegacyTypeNames remap) so the two sources stay disambiguated.
-    // Names not listed bind unchanged (most carried over with identical names); names with no new field
-    // are dropped (e.g. the old `enabled` — the new volume derives enable from the Mode dropdowns).
-    static readonly Dictionary<string, Dictionary<string, string>> LegacyParameterNames = new() {
-        ["ScreenSpaceGlobalIllumination"] = new() {
-            ["mode"] = "giMode",
-            ["debugView"] = "giIsolate",
-        },
-        ["ScreenSpaceReflections"] = new() {
-            ["mode"] = "reflectionsMode",
-            ["intensity"] = "reflectionsIntensity",
-        },
-    };
+    static readonly Dictionary<string, Dictionary<string, string>> LegacyParameterNames = new();
 
     public static VolumeProfile Load(BallisticProject project, string assetPath) {
         var definition = ContentText.ReadJson<VolumeProfileDefinition>(project, assetPath);
@@ -44,7 +17,19 @@ public static class VolumeProfileLoader {
         }
         var profile = new VolumeProfile { Name = Path.GetFileNameWithoutExtension(assetPath) };
 
+        ReflectionMode? legacyReflMode = null;
+        float? legacyReflIntensity = null;
+
         foreach (VolumeComponentDefinition componentDef in definition.Components ?? []) {
+            if (componentDef.Type == "GlobalIllumination" && componentDef.Parameters is { } giParams) {
+                if (giParams.TryGetValue("reflectionsMode", out VolumeParameterDefinition rm)
+                    && rm.Value.ValueKind is JsonValueKind.String
+                    && Enum.TryParse(rm.Value.GetString(), out ReflectionMode parsedMode))
+                    legacyReflMode = parsedMode;
+                if (giParams.TryGetValue("reflectionsIntensity", out VolumeParameterDefinition ri)
+                    && ri.Value.ValueKind is JsonValueKind.Number)
+                    legacyReflIntensity = ri.Value.GetSingle();
+            }
             var typeName = LegacyTypeNames.GetValueOrDefault(componentDef.Type, componentDef.Type);
             Type type = ComponentRegistry.ResolveVolume(typeName);
             if (type is null) {
@@ -54,19 +39,14 @@ public static class VolumeProfileLoader {
 
             bool alreadyPresent = profile.Has(type);
             VolumeComponent component = profile.Add(type);
-            // A merge target (two old types → one new, e.g. SSGI + SSR → GlobalIllumination) stays active
-            // if EITHER source was active; a fresh component takes its source's Active straight.
             component.Active = alreadyPresent ? component.Active || componentDef.Active : componentDef.Active;
 
             if (componentDef.Parameters is null)
                 continue;
 
-            // Old-name → new-field renames for this on-disk type (GI consolidation); empty for the rest.
             LegacyParameterNames.TryGetValue(componentDef.Type, out Dictionary<string, string> paramRenames);
 
             foreach (VolumeComponent.ParameterSlot slot in component.Parameters) {
-                // Find the file key that feeds this slot: the renamed old name if one maps here, else the
-                // slot's own name. (A merge skips slots a source doesn't carry — its keys stay default.)
                 string fileKey = slot.Name;
                 if (paramRenames is not null)
                     foreach (var (oldName, newName) in paramRenames)
@@ -78,6 +58,12 @@ public static class VolumeProfileLoader {
                 slot.Parameter.Overridden = parameterDef.Overridden;
                 ApplyValue(slot.Parameter, parameterDef.Value, assetPath, slot.Name);
             }
+        }
+
+        if ((legacyReflMode is not null || legacyReflIntensity is not null) && !profile.Has(typeof(Reflections))) {
+            var refl = (Reflections)profile.Add(typeof(Reflections));
+            if (legacyReflMode is { } m) { refl.mode.Value = m; refl.mode.Overridden = true; }
+            if (legacyReflIntensity is { } i) { refl.intensity.Value = i; refl.intensity.Overridden = true; }
         }
 
         return profile;
@@ -105,8 +91,6 @@ public static class VolumeProfileLoader {
         PipelineJson.Write(absolutePath, definition);
     }
 
-    // Subtype order matters: Clamped* derive from their base parameters, Color from Vector3 —
-    // matching the base class catches the whole family.
     static void ApplyValue(VolumeParameter parameter, JsonElement value, string assetPath, string name) {
         try {
             switch (parameter) {

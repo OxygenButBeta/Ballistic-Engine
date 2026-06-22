@@ -1,10 +1,3 @@
-// Copyright (c) Meta Platforms, Inc. and affiliates.
-//
-// This source code is licensed under the MIT license found in the
-// LICENSE file in the root directory of this source tree.
-
-using System;
-
 namespace Facebook.Yoga
 {
     internal static class AbsoluteLayout
@@ -20,9 +13,6 @@ namespace Facebook.Yoga
                 axis, direction, containingBlockWidth) +
                 parent.Layout.Border(axis.FlexStartEdge());
 
-            // https://www.w3.org/TR/css-grid-1/#abspos
-            // absolute positioned grid items are positioned relative to the padding edge
-            // of the grid container
             if (!child.HasErrata(Errata.AbsolutePositionWithoutInsetsExcludesPadding) &&
                 parent.Style.Display != Display.Grid)
             {
@@ -43,9 +33,6 @@ namespace Facebook.Yoga
                 child.Style.ComputeFlexEndMargin(
                     axis, direction, containingBlockWidth);
 
-            // https://www.w3.org/TR/css-grid-1/#abspos
-            // absolute positioned grid items are positioned relative to the padding edge
-            // of the grid container
             if (!child.HasErrata(Errata.AbsolutePositionWithoutInsetsExcludesPadding) &&
                 parent.Style.Display != Display.Grid)
             {
@@ -69,9 +56,6 @@ namespace Facebook.Yoga
                 parent.Layout.Border(axis.FlexStartEdge()) -
                 parent.Layout.Border(axis.FlexEndEdge());
 
-            // https://www.w3.org/TR/css-grid-1/#abspos
-            // absolute positioned grid items are positioned relative to the padding edge
-            // of the grid container
             if (!child.HasErrata(Errata.AbsolutePositionWithoutInsetsExcludesPadding) &&
                 parent.Style.Display != Display.Grid)
             {
@@ -88,9 +72,6 @@ namespace Facebook.Yoga
                 child.Style.ComputeFlexStartMargin(
                     axis, direction, containingBlockWidth);
 
-            // https://www.w3.org/TR/css-grid-1/#abspos
-            // absolute positioned grid items are positioned relative to the padding edge
-            // of the grid container
             if (!child.HasErrata(Errata.AbsolutePositionWithoutInsetsExcludesPadding) &&
                 parent.Style.Display != Display.Grid)
             {
@@ -181,22 +162,6 @@ namespace Facebook.Yoga
             }
         }
 
-        /*
-         * Absolutely positioned nodes do not participate in flex layout and thus their
-         * positions can be determined independently from the rest of their siblings.
-         * For each axis there are essentially two cases:
-         *
-         * 1) The node has insets defined. In this case we can just use these to
-         *    determine the position of the node.
-         * 2) The node does not have insets defined. In this case we look at the style
-         *    of the parent to position the node. Things like justify content and
-         *    align content will move absolute children around. If none of these
-         *    special properties are defined, the child is positioned at the start
-         *    (defined by flex direction) of the leading flex line.
-         *
-         * This function does that positioning for the given axis. The spec has more
-         * information on this topic: https://www.w3.org/TR/css-flexbox-1/#abspos-items
-         */
         private static void PositionAbsoluteChild(
             Node containingNode,
             Node parent,
@@ -454,7 +419,7 @@ namespace Facebook.Yoga
                 child,
                 direction,
                 mainAxis,
-                true /*isMainAxis*/,
+                true,
                 containingBlockWidth,
                 containingBlockHeight);
             PositionAbsoluteChild(
@@ -463,7 +428,7 @@ namespace Facebook.Yoga
                 child,
                 direction,
                 crossAxis,
-                false /*isMainAxis*/,
+                false,
                 containingBlockWidth,
                 containingBlockHeight);
         }
