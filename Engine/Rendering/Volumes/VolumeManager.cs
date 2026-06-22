@@ -6,8 +6,6 @@ public static class VolumeManager {
     static readonly List<Volume> sorted = new();
     static VolumeStack stack;
 
-    public static Volume DominantGiVolume { get; private set; }
-
     public static VolumeStack Stack =>
         stack ??= new VolumeStack(ComponentRegistry.VolumeMenu.Select(entry => entry.Type));
 
@@ -23,7 +21,6 @@ public static class VolumeManager {
     public static void Update(Vector3 cameraPosition) {
         VolumeStack target = Stack;
         target.Reset();
-        DominantGiVolume = null;
 
         if (volumes.Count == 0)
             return;
@@ -51,8 +48,6 @@ public static class VolumeManager {
             foreach (VolumeComponent component in volume.Profile.Components) {
                 if (component.Active)
                     target.Get(component.GetType())?.Override(component, interp);
-                if (component.Active && component is GiVolume g && g.enabled.Value)
-                    DominantGiVolume = volume;
             }
         }
     }

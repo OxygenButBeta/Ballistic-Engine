@@ -280,8 +280,8 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
-        bool useCards = ctx.GiActiveThisFrame && ctx.DdgiGrid is { Valid: true } && ctx.PostFX.DdgiReflections
-                        && ReflCardsAllowed;
+        // FAZ 1: GI sökülü → reflections IBL prefilter fallback. FAZ 2'de Aurora radiance cache'i buraya bağlanacak.
+        bool useCards = false;
         float reflFrameIndex = ctx.DeterministicCapture ? -1f : (ctx.FrameCounter & 1023);
         rtReflCb.Write(new RtReflConstants {
             InvViewProj = Matrix4x4.Transpose(invVP), CameraPos = camPos, Intensity = ForcedIntensity(ctx),
@@ -293,12 +293,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
         rtReflSunCb.Write(new RtGiSun {
             SunDir = sunDir, NormalBias = 0.03f, SunColor = lightColor, LightCount = clusteredLights.LightCount,
         });
-        rtReflGridCb.Write(useCards
-            ? new RtReflGridConstants {
-                Origin = ctx.DdgiGrid.GridOrigin, Spacing = ctx.DdgiGrid.ProbeSpacing,
-                CountX = (uint)ctx.DdgiGrid.CountX, CountY = (uint)ctx.DdgiGrid.CountY, CountZ = (uint)ctx.DdgiGrid.CountZ,
-              }
-            : default);
+        rtReflGridCb.Write(default);
 
         target.ColorToShaderResource();
         gbuffer.DepthToNonPixelShaderResource();
@@ -329,8 +324,7 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
             cl.SetComputeRootShaderResourceView(5, rtGeometry.InstancesGpuAddress);
             cl.SetComputeRootShaderResourceView(6, clusteredLights.LightBufGpuAddress);
             cl.SetComputeRootShaderResourceView(7, clusteredLights.LightBufGpuAddress);
-            ulong giAddr = useCards ? ctx.DdgiGrid.IrradianceReadGpu : clusteredLights.LightBufGpuAddress;
-            cl.SetComputeRootShaderResourceView(8, giAddr);
+            cl.SetComputeRootShaderResourceView(8, clusteredLights.LightBufGpuAddress);
             cl.SetComputeRootShaderResourceView(9, clusteredLights.LightBufGpuAddress);
             cl.SetComputeRootShaderResourceView(10, clusteredLights.LightBufGpuAddress);
             cl.DispatchRays(new DispatchRaysDescription {

@@ -106,35 +106,26 @@ public static class VolumePostProcessing {
             fx.DustSparkle = vlit.dustSparkle.Value;
         }
 
-        if (stack.GetComponent<GiVolume>() is { } gi) {
-            fx.DdgiEnabled = gi.enabled.Value;
-            fx.DdgiIntensity = gi.intensity.Value;
-            fx.DdgiSkyIntensity = gi.skyIntensity.Value;
-            fx.DdgiEmaAlpha = gi.emaAlpha.Value;
-            fx.DdgiMultiBounce = gi.multiBounce.Value;
-            fx.DdgiVisibility = gi.visibility.Value;
-            fx.DdgiNormalBias = gi.normalBias.Value;
-            fx.DdgiAoStrength = gi.aoStrength.Value;
-            fx.DdgiDebugProbes = gi.debugProbes.Value;
-            fx.DdgiDebugRawIndirect = gi.debugRawIndirect.Value;
-            fx.DdgiBoundsMode = (int)gi.boundsMode.Value;
-            fx.DdgiBoundsCenter = default;
-            fx.DdgiBoundsExtent = default;
-            if (gi.boundsMode.Value == GiBoundsMode.Volume
-                && VolumeManager.DominantGiVolume is { } gv
-                && gv.TryGetWorldBox(out Vector3 boxCenter, out Vector3 boxHalf)) {
-                fx.DdgiBoundsCenter = boxCenter;
-                fx.DdgiBoundsExtent = boxHalf;
-            }
+        if (stack.GetComponent<AuroraVolume>() is { } aurora) {
+            fx.AuroraEnabled = aurora.enabled.Value;
+            fx.AuroraIntensity = aurora.intensity.Value;
+            fx.AuroraSkyIntensity = aurora.skyIntensity.Value;
+            fx.AuroraMultiBounce = aurora.multiBounce.Value;
+            fx.AuroraAoStrength = aurora.aoStrength.Value;
+            fx.AuroraDebugRawIndirect = aurora.debugRawIndirect.Value;
 
-            switch (gi.quality.Value) {
-                case GiQuality.High:        fx.DdgiGridX = 24; fx.DdgiGridY = 12; fx.DdgiGridZ = 24; break;
-                case GiQuality.Balanced:    fx.DdgiGridX = 16; fx.DdgiGridY = 8;  fx.DdgiGridZ = 16; break;
-                case GiQuality.Performance: fx.DdgiGridX = 10; fx.DdgiGridY = 6;  fx.DdgiGridZ = 10; break;
+            switch (aurora.quality.Value) {
+                case AuroraQuality.High:
+                    fx.AuroraRayCount = 24; fx.AuroraProbeOct = 8; fx.AuroraCardBudget = 0;     fx.AuroraDenoisePasses = 2; break;
+                case AuroraQuality.Balanced:
+                    fx.AuroraRayCount = 16; fx.AuroraProbeOct = 6; fx.AuroraCardBudget = 50000; fx.AuroraDenoisePasses = 1; break;
+                case AuroraQuality.Performance:
+                    fx.AuroraRayCount = 8;  fx.AuroraProbeOct = 6; fx.AuroraCardBudget = 25000; fx.AuroraDenoisePasses = 1; break;
                 default:
-                    fx.DdgiGridX = gi.gridX.Value;
-                    fx.DdgiGridY = gi.gridY.Value;
-                    fx.DdgiGridZ = gi.gridZ.Value;
+                    fx.AuroraRayCount = aurora.rayCount.Value;
+                    fx.AuroraProbeOct = aurora.probeOct.Value;
+                    fx.AuroraCardBudget = aurora.cardBudget.Value;
+                    fx.AuroraDenoisePasses = aurora.denoisePasses.Value;
                     break;
             }
         }
@@ -143,7 +134,7 @@ public static class VolumePostProcessing {
             fx.ReflectionMode = refl.mode.Value;
             fx.SsrEnabled = refl.mode.Value != ReflectionMode.Off;
             fx.SsrIntensity = refl.intensity.Value;
-            fx.DdgiReflections = refl.sampleRadianceCache.Value;
+            fx.AuroraReflections = refl.sampleRadianceCache.Value;
         }
 
         if (stack.GetComponent<AerialPerspective>() is { } aerial) {

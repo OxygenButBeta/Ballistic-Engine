@@ -69,8 +69,6 @@ public sealed class Dx12FrameContext {
 
     public Dx12DxrShared Dxr { get; init; }
 
-    public Dx12DdgiProbeGrid DdgiGrid { get; init; }
-
     public bool BarriersDerived { get; init; }
 
     public Dx12RenderDoors      Doors    { get; init; }

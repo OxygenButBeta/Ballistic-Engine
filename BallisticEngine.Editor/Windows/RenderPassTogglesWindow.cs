@@ -43,12 +43,11 @@ internal sealed class RenderPassTogglesWindow : EditorWindow {
         if (gui.CollapsingHeader("Shadows / GI / Reflections", defaultOpen: true)) {
             DoorRow(gui, r, "Shadows (sun cascades)", "Shadows", d.Shadows);
 
-            PostBool(gui, "Global Illumination (DDGI)", () => pfx.DdgiEnabled, v => pfx.DdgiEnabled = v);
-            if (pfx.DdgiEnabled) {
+            PostBool(gui, "Global Illumination (Aurora)", () => pfx.AuroraEnabled, v => pfx.AuroraEnabled = v);
+            if (pfx.AuroraEnabled) {
                 gui.Indent();
-                PostBool(gui, "  Multi-bounce", () => pfx.DdgiMultiBounce, v => pfx.DdgiMultiBounce = v);
-                PostBool(gui, "  Visibility (leak reject)", () => pfx.DdgiVisibility, v => pfx.DdgiVisibility = v);
-                PostBool(gui, "  GI-driven reflections", () => pfx.DdgiReflections, v => pfx.DdgiReflections = v);
+                PostBool(gui, "  Multi-bounce", () => pfx.AuroraMultiBounce, v => pfx.AuroraMultiBounce = v);
+                PostBool(gui, "  GI-driven reflections", () => pfx.AuroraReflections, v => pfx.AuroraReflections = v);
                 gui.Unindent();
             }
 
@@ -115,7 +114,7 @@ internal sealed class RenderPassTogglesWindow : EditorWindow {
         r.SetDoor("Shafts", on);
         r.SetDoor("Dust", on);
         pfx.SSAOEnabled = on;
-        pfx.DdgiEnabled = on;
+        pfx.AuroraEnabled = on;
         pfx.TaaEnabled = on;
         pfx.VolumetricEnabled = on;
         pfx.AerialPerspectiveEnabled = on;

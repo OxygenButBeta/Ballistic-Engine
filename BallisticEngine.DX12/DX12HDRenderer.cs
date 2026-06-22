@@ -140,8 +140,6 @@ public sealed class DX12HDRenderer : HDRenderer
 
     Dx12SkyPass skyPass;
 
-    Dx12DdgiPass ddgiPass;
-
     Dx12ReflectionsPass reflectionsPass;
 
     ID3D12Resource cbRing;
@@ -518,8 +516,6 @@ public sealed class DX12HDRenderer : HDRenderer
         graph.Add(fogPass);
         transparentsPass = new Dx12TransparentsPass(dev);
         graph.Add(transparentsPass);
-        ddgiPass = new Dx12DdgiPass(dev, targetW, targetH);
-        graph.Add(ddgiPass);
         reflectionsPass = new Dx12ReflectionsPass(dev, targetW, targetH);
         graph.Add(reflectionsPass);
         taaPass = new Dx12TaaPass(dev, targetW, targetH);
@@ -1175,8 +1171,6 @@ public sealed class DX12HDRenderer : HDRenderer
         }
         FP("IBL bake");
 
-        ddgiPass?.RunPendingPlacement();
-
         dev.BeginFrame();
 
         GpuMark("Shadows");
@@ -1624,7 +1618,6 @@ public sealed class DX12HDRenderer : HDRenderer
             Vsm = vsm, VsmActiveThisFrame = vsmActiveThisFrame,
             RtShadowMask = rtShadowMask,
             Dxr = dxr,
-            DdgiGrid = ddgiPass.Grid,
             FrameCbAddress =
                 frameCb.Gpu,
             Doors = doors, PostFX = PostFX, Stats = RenderStats.Scene,
@@ -1643,7 +1636,7 @@ public sealed class DX12HDRenderer : HDRenderer
             RtShadowsThisFrame = rtShadowsThisFrame,
         };
 
-        ctx.GiActiveThisFrame = Dx12DdgiPass.WouldRun(ctx);
+        ctx.GiActiveThisFrame = false; // FAZ 1: GI sökülü; FAZ 2'de Aurora geri bağlanacak.
 
         ctx.GrainFrame = DeterministicCapture ? 0 : frameCounter;
 

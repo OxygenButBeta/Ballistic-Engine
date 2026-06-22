@@ -129,26 +129,16 @@ public sealed class PostProcessSettings {
     public int MotionBlurSamples { get; set; } = 12;
     public float MotionBlurMaxVelocity { get; set; } = 0.05f;
 
-    public bool DdgiEnabled { get; set; } = true;
-    public float DdgiIntensity { get; set; } = 1f;
-
-    public float DdgiSkyIntensity { get; set; } = 1.5f;
-
-    public int DdgiGridX { get; set; } = 16;
-    public int DdgiGridY { get; set; } = 8;
-    public int DdgiGridZ { get; set; } = 16;
-
-    public int DdgiBoundsMode { get; set; } = 0;
-    public Vector3 DdgiBoundsCenter { get; set; }
-    public Vector3 DdgiBoundsExtent { get; set; }
-    public float DdgiEmaAlpha { get; set; } = 0.05f;
-    public bool DdgiMultiBounce { get; set; } = true;
-    public bool DdgiVisibility { get; set; } = true;
-    public float DdgiNormalBias { get; set; } = 0.2f;
-
-    public bool DdgiReflections { get; set; } = true;
-
-    public float DdgiAoStrength { get; set; } = 0f;
-    public bool DdgiDebugProbes { get; set; } = false;
-    public bool DdgiDebugRawIndirect { get; set; } = false;
+    // Aurora GI (HW-RT diffuse, per-triangle radiance cache + screen probes). Replaces the deleted DDGI dials.
+    public bool AuroraEnabled { get; set; } = true;
+    public float AuroraIntensity { get; set; } = 2f;          // master GI strength (tuned: visible indirect without washing out)
+    public float AuroraSkyIntensity { get; set; } = 1.5f;     // skylight let in through open sky-visibility
+    public int AuroraRayCount { get; set; } = 16;             // hemisphere rays per pixel (temporal accumulation cleans the rest)
+    public int AuroraDenoisePasses { get; set; } = 1;         // à-trous spatial denoise iterations (0 = raw); adaptive bumps it on disocclusion
+    public bool AuroraMultiBounce { get; set; } = true;       // accumulate multi-bounce in the radiance cache
+    public int AuroraProbeOct { get; set; } = 6;              // octahedral tile resolution per probe (oct × oct cells)
+    public int AuroraCardBudget { get; set; } = 50000;        // card-light records relit per frame (round-robin; 0 = unlimited)
+    public bool AuroraReflections { get; set; } = true;       // feed RT reflections from the radiance cache
+    public float AuroraAoStrength { get; set; } = 0f;         // GTAO darkening of the GI contact term (0 = none)
+    public bool AuroraDebugRawIndirect { get; set; } = false; // debug: show raw indirect irradiance E
 }
