@@ -330,13 +330,13 @@ loop returns or the process never exits.
 > Live backend = **DX12/DXR** (`BallisticEngine.DX12/`, `.hlsl` embedded there). The GL backend is gone;
 > the OLD GL-era detail (GLSL paths, `GL.*`/MDI, GLHiZPass, GLSLShaderUtilities) was removed from this
 > doc — it no longer existed. DX12 mirrors the SAME frame shape + invariants below. Deep DX12-specific
-> notes (pass-graph, Lumen GI, exposure, P0a pipelined frame, GPU-driven ExecuteIndirect) live in the
+> notes (pass-graph, Aurora GI, exposure, P0a pipelined frame, GPU-driven ExecuteIndirect) live in the
 > `Docs/Plans/dx12-*` plans + the agent-memory topic files — read those before touching a DX12 pass.
 
 Invariants the DX12 passes still honour (the conceptual contract — names below are the DX12 equivalents):
 
 - **Frame shape (single path, no MSAA, TAA is the AA)**: cull → cascaded shadows (cached) → z-prepass →
-  AO (GTAO) → opaque (LEqual, no depth writes) → sky → transparent → **Lumen GI (event 500)** → SSR/RT
+  AO (GTAO) → opaque (LEqual, no depth writes) → sky → transparent → **Aurora GI (event 500)** → SSR/RT
   reflections → volumetric/fog → TAA → exposure meter → bloom → composite. Event-sorted pass list (see
   pass-graph plan); the MSAA path was deleted (the AntiAliasing volume's MSAA setting is inert).
 - **GPU-driven (ExecuteIndirect)**: the whole-mesh renderer (Bistro, ~1600 submeshes, `SubMeshIndex < 0`,
@@ -353,18 +353,22 @@ Invariants the DX12 passes still honour (the conceptual contract — names below
 - **Cascade caching**: sun cascades re-render only when the texel-snapped fit matrix OR the caster-AABB
   geometry stamp changes. Static camera = all four free.
 - **Transient RT pool**: post passes acquire per-frame scratch (released wholesale at EndFrame); ONLY
-  cross-frame history (TAA/volumetric, the Lumen radiance cache) is pass-owned. NEVER pool history.
-- **GI = Lumen V2** (`BallisticEngine.DX12/Lumen/`, the legacy SSGI/DDGI/screen-probe/OIDN stack was DELETED).
-  HW-RT diffuse GI: per-pixel screen trace → inline-RayQuery TLAS on a screen miss → sky on an RT miss; RT
-  hits SAMPLE a per-triangle surface-card radiance cache (`Dx12LumenScene`) that a card-light compute fills
-  with lit first-bounce + multi-bounce radiance (the cache is double-buffered for a cache-space temporal EMA —
-  no screen-space history). An à-trous spatial denoise cleans the per-pixel indirect. The diffuse indirect is
-  added into the HDR color (deferred suppresses its IBL diffuse ambient when Lumen is active → no double-
-  count). HW-RT ONLY — no hidden screen-space fallback (no HW RT = GI off). Driven by the `GlobalIllumination`
-  VOLUME (default ON); the `BALLISTIC_DX12_LUMEN[...]` env doors override for A/B. Plan: `Docs/Plans/
-  lumen-v2-replacement.md`; memory `lumen-v2-replacement-progress`.
-- **SSR half-res** (depth-aware upsample); **RT reflections** re-shade hits — when Lumen is on they sample the
-  SAME radiance cache the diffuse uses (rough + sharp), IBL only the miss/far fallback.
+  cross-frame history (TAA/volumetric, the Aurora radiance cache) is pass-owned. NEVER pool history.
+- **GI = Aurora** (`BallisticEngine.DX12/Aurora/`; the probe-grid DDGI it replaced — and the older Lumen V2 it
+  is descended from — were both DELETED). HW-RT diffuse GI: per-pixel screen trace → inline-RayQuery TLAS on a
+  screen miss → sky on an RT miss; RT hits SAMPLE a per-triangle surface-card radiance cache (`Dx12AuroraScene`)
+  that a card-light compute fills with lit first-bounce + multi-bounce + **emissive-triangle area-light NEE**
+  (`Dx12EmissiveLights`, t10) radiance (cache double-buffered for a cache-space temporal EMA — no screen-space
+  history). The per-pixel hemisphere rays feed a **ReSTIR weighted reservoir (RIS, luminance target)** mixed
+  0.5 with the plain mean (variance win + honest energy), dithered by an **R2 blue-noise** sequence; a
+  **variance-driven à-trous denoise** (firefly clamp at mean+3σ) cleans the result. ENERGY: the trace stores
+  cosine-sampled OUTGOING radiance, so the combine is `E·albedo` (NO extra /π — the cosine-sampling π cancels
+  the Lambert π; dividing again was the old "dark GI" bug). Deferred suppresses its IBL diffuse ambient when
+  Aurora is active → no double-count. HW-RT ONLY — no hidden screen-space fallback (no HW RT = GI off). Driven
+  by the `AuroraVolume` (default ON); `BALLISTIC_DX12_AURORA[...]` env doors override (`=0/1`, `_DEBUG`,
+  `_RAYS`, `_DENOISE_PASSES`, `_NEE[_INTENSITY]`, `_NOCARDS/_NOBOUNCE/_NODENOISE/_NOSCREEN/_NOSKY` A/B).
+- **SSR half-res** (depth-aware upsample); **RT reflections** re-shade hits — when Aurora is on they sample the
+  SAME radiance cache the diffuse uses (`AuroraCardGather` per-hit record lookup), IBL only the miss/far fallback.
 - **Per-pass GPU timers** publish into `RenderStats.Scene/Game` (real draw/triangle/cull counters; editor
   Stats overlay). `Transform` caches Local/World with version stamps — don't bypass the setters.
 
@@ -376,10 +380,10 @@ Invariants the DX12 passes still honour (the conceptual contract — names below
   serialized camera → **bit-exact deterministic frames**, diffable across builds. Play-mode
   frames are NOT diffable (sim time at a fixed frame varies run to run).
 - `BALLISTIC_FX_SSR/VOLUMETRIC/SSAO=0|1` — force post-FX toggles after the volume stack applies, for A/B runs.
-- **Lumen GI** (default ON, HW-RT-gated): `BALLISTIC_DX12_LUMEN=0` off / `=1` force-on; `_LUMEN_DEBUG=1` shows
-  the raw indirect irradiance E; `_LUMEN_RAYS` / `_LUMEN_DENOISE_PASSES` / `_LUMEN_INTENSITY` / `_LUMEN_SKY` /
-  `_LUMEN_EMA` tune; `_LUMEN_NOCARDS` / `_LUMEN_NOBOUNCE` / `_LUMEN_NODENOISE` / `_REFL_NOCARDS` A/B isolate.
-  The env doors OVERRIDE the `GlobalIllumination` volume.
+- **Aurora GI** (default ON, HW-RT-gated): `BALLISTIC_DX12_AURORA=0` off / `=1` force-on; `_AURORA_DEBUG=1`
+  shows the raw indirect irradiance E; `_AURORA_RAYS` / `_AURORA_DENOISE_PASSES` / `_AURORA_INTENSITY` /
+  `_AURORA_SKY` / `_AURORA_NEE[_INTENSITY]` tune; `_AURORA_NOCARDS` / `_NOBOUNCE` / `_NODENOISE` / `_NOSCREEN` /
+  `_NEE=0` / `_REFL_NOCARDS` A/B isolate. The env doors OVERRIDE the `AuroraVolume`.
 
 ## Hard-won gotchas (do not relearn these)
 
