@@ -11,11 +11,14 @@ cbuffer NrdPackConstants : register(b0) {
     float4x4 PrevViewProj;     // previous world → NDC (unjittered)
     float4x4 ViewMatrix;       // world → view (for linear viewZ)
     float2   InvResolution;    // 1 / (w,h)
-    float2   _Pad0;
+    float    PrevViewZValid;   // 1 once the prev-viewZ buffer holds a real frame (else .z motion = 0)
+    float    _Pad0;
 };
 
-Texture2D<float>  Depth   : register(t0);   // NDC depth (R32F / depth SRV)
-Texture2D<float4> Normal  : register(t1);   // world normal packed [0,1] (RT2)
+Texture2D<float>  Depth      : register(t0);   // NDC depth (R32F / depth SRV)
+Texture2D<float4> Normal     : register(t1);   // world normal packed [0,1] (RT2)
+Texture2D<float>  PrevViewZ  : register(t2);   // last frame's linear viewZ (this pass's OutViewZ, ping-ponged)
+SamplerState      LinearClamp : register(s0);  // for the reprojected prev-viewZ fetch
 RWTexture2D<float4> OutMv            : register(u0);   // RGBA16F 2.5D motion
 RWTexture2D<float4> OutNormalRough   : register(u1);   // R10G10B10A2 packed normal+roughness
 RWTexture2D<float>  OutViewZ         : register(u2);   // R16F linear viewZ
@@ -56,7 +59,15 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
     // viewZ delta (2.5D). Static camera + static scene → mv ≈ 0 (the convergence case we care about).
     float4 prevClip = mul(float4(worldPos, 1.0), PrevViewProj);
     float2 prevUv = (prevClip.w > 1e-6) ? (prevClip.xy / prevClip.w) * float2(0.5, -0.5) + 0.5 : uv;
-    // (We can't know viewZprev without the previous depth buffer; for a static-scene convergence test the world
-    // point is the same, so viewZprev == viewZ → .z = 0. A moving object would need prev viewZ; deferred.)
-    OutMv[px] = float4((prevUv - uv), 0.0, 0.0);
+    // 2.5D .z = viewZprev - viewZ. We DON'T have last frame's depth/world point, but we have last frame's linear
+    // viewZ buffer (this pass's own OutViewZ from the previous frame, ping-ponged in). Sampling it at the
+    // reprojected prevUv gives the surface that was at this UV last frame; for a static surface under camera
+    // motion prevUv tracks the same point so the delta is the true Z motion. Guard the off-screen reprojection
+    // (prevUv outside [0,1] → no valid history) and the first frame (PrevViewZValid 0).
+    float dz = 0.0;
+    if (PrevViewZValid > 0.5 && all(prevUv >= 0.0) && all(prevUv <= 1.0)) {
+        float viewZprev = PrevViewZ.SampleLevel(LinearClamp, prevUv, 0);
+        dz = viewZprev - viewZ;
+    }
+    OutMv[px] = float4((prevUv - uv), dz, 0.0);
 }

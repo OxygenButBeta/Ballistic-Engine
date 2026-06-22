@@ -51,6 +51,8 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
     Dx12FrameCb<AuroraNrdConstants> nrdConstCb;
     Dx12FrameCb<NrdPackConstants> nrdPackCb;
     ID3D12Resource nrdRadianceHitDist, nrdViewZ, nrdNormalRough, nrdMotion, nrdOut;
+    ID3D12Resource nrdViewZPrev;   // last frame's linear viewZ (ping-ponged with nrdViewZ) → true 2.5D motion .z
+    bool nrdViewZPrevValid;
     Dx12DescriptorHeap nrdScratch;   // pack (2 SRV+3 UAV) + unpack (2 SRV+1 UAV) tables, per frame
 
     [StructLayout(LayoutKind.Sequential)]
@@ -58,7 +60,7 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
     [StructLayout(LayoutKind.Sequential)]
     struct NrdPackConstants {
         public Matrix4x4 InvViewProj; public Matrix4x4 PrevViewProj; public Matrix4x4 ViewMatrix;
-        public Vector2 InvResolution; public Vector2 Pad;
+        public Vector2 InvResolution; public float PrevViewZValid; public float Pad;
     }
 
     // The card radiance cache (+ per-instance meta) the Reflections pass (event 600, after this) samples so
@@ -1505,10 +1507,10 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
             Step("trace rootsig OK"); nrdTracePso = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription { RootSignature = nrdTraceRootSig, ComputeShader = traceCs });
             nrdConstCb = new Dx12FrameCb<AuroraNrdConstants>(dev);
 
-            // --- guide-pack pipeline (CBV b0 + table{Depth t0, Normal t1 SRV; OutMv u0, OutNR u1, OutViewZ u2}).
+            // --- guide-pack pipeline (CBV b0 + table{Depth t0, Normal t1, PrevViewZ t2 SRV; OutMv u0, OutNR u1, OutViewZ u2}).
             var pCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
-            var pSrv = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 0);
-            var pUav = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 3, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 2);
+            var pSrv = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 3, baseShaderRegister: 0);
+            var pUav = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 3, baseShaderRegister: 0, registerSpace: 0, offsetInDescriptorsFromTableStart: 3);
             var pTable = new RootParameter1(new RootDescriptorTable1(pSrv, pUav), ShaderVisibility.All);
             Step("trace pso OK"); nrdPackRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(new RootSignatureDescription1(RootSignatureFlags.None, new[] { pCbv, pTable }, new[] { cs })));
             byte[] packCs = Dx12NrdDenoiser.CompileWithNrd(DxcShaderStage.Compute, "Nrd/AuroraNrdPack.hlsl", "CSMain");
@@ -1526,6 +1528,8 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
             // --- packed-signal buffers (NRD ABI formats). All UAV+SRV, full-res.
             Step("unpack OK; making buffers"); nrdRadianceHitDist = MakeTex(Format.R16G16B16A16_Float);
             nrdViewZ = MakeTex(Format.R16_Float);
+            nrdViewZPrev = MakeTex(Format.R16_Float);
+            nrdViewZPrevValid = false;
             nrdNormalRough = MakeTex(Format.R10G10B10A2_UNorm);
             nrdMotion = MakeTex(Format.R16G16B16A16_Float);
             nrdOut = MakeTex(Format.R16G16B16A16_Float);
@@ -1590,16 +1594,24 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
         nrdPackCb.Write(new NrdPackConstants {
             InvViewProj = Matrix4x4.Transpose(invVP), PrevViewProj = ctx.PrevViewProjUnjittered,
             ViewMatrix = Matrix4x4.Transpose(ctx.View), InvResolution = new Vector2(1f / fullW, 1f / fullH),
+            PrevViewZValid = nrdViewZPrevValid ? 1f : 0f,
         });
-        int pb = nrdScratch.AllocateRange(5);
+        // SRV view for last frame's viewZ (nrdViewZPrev) at t2 — reprojected fetch gives the 2.5D motion .z.
+        var viewZSrvDesc = new ShaderResourceViewDescription {
+            Format = Format.R16_Float, ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
+            Shader4ComponentMapping = ShaderComponentMapping.Default, Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
+        };
+        int pb = nrdScratch.AllocateRange(6);
         dev.Device.CopyDescriptorsSimple(1, nrdScratch.Cpu(pb + 0), gbuffer.DepthSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, nrdScratch.Cpu(pb + 1), gbuffer.ColorSrvCpu(1), heapType);   // normal
-        UavInto(nrdScratch.Cpu(pb + 2), nrdMotion, Format.R16G16B16A16_Float);
-        UavInto(nrdScratch.Cpu(pb + 3), nrdNormalRough, Format.R10G10B10A2_UNorm);
-        UavInto(nrdScratch.Cpu(pb + 4), nrdViewZ, Format.R16_Float);
+        dev.Device.CreateShaderResourceView(nrdViewZPrev, viewZSrvDesc, nrdScratch.Cpu(pb + 2));         // t2 prev viewZ
+        UavInto(nrdScratch.Cpu(pb + 3), nrdMotion, Format.R16G16B16A16_Float);
+        UavInto(nrdScratch.Cpu(pb + 4), nrdNormalRough, Format.R10G10B10A2_UNorm);
+        UavInto(nrdScratch.Cpu(pb + 5), nrdViewZ, Format.R16_Float);
         dev.ExecuteSync(cl => {
             foreach (var t in new[] { nrdMotion, nrdNormalRough, nrdViewZ })
                 cl.ResourceBarrierTransition(t, ResourceStates.Common, ResourceStates.UnorderedAccess);
+            cl.ResourceBarrierTransition(nrdViewZPrev, ResourceStates.Common, ResourceStates.NonPixelShaderResource);
             gbuffer.DepthToNonPixelShaderResource();
             cl.SetDescriptorHeaps(nrdScratch.Heap);
             cl.SetComputeRootSignature(nrdPackRootSig);
@@ -1610,6 +1622,8 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
             // All NRD inputs to NonPixel SRV for the denoiser; radiance buffer too.
             foreach (var t in new[] { nrdMotion, nrdNormalRough, nrdViewZ, nrdRadUav })
                 cl.ResourceBarrierTransition(t, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            // prev-viewZ is consumed (pack already read it) — back to Common for the end-of-frame ping-pong swap.
+            cl.ResourceBarrierTransition(nrdViewZPrev, ResourceStates.NonPixelShaderResource, ResourceStates.Common);
             cl.ResourceBarrierTransition(nrdOut, ResourceStates.Common, ResourceStates.UnorderedAccess);
         });
 
@@ -1651,6 +1665,11 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
             cl.ResourceBarrierTransition(nrdOut, ResourceStates.NonPixelShaderResource, ResourceStates.Common);
         });
         ToShaderRead(indirectFiltered);
+
+        // Ping-pong: this frame's viewZ becomes next frame's prev-viewZ (both rest in Common). After the first
+        // successful pack the prev buffer holds a real frame → enable the 2.5D .z reprojection next frame.
+        (nrdViewZ, nrdViewZPrev) = (nrdViewZPrev, nrdViewZ);
+        nrdViewZPrevValid = true;
     }
 
     void UavInto(CpuDescriptorHandle h, ID3D12Resource res, Format f) {
@@ -1660,18 +1679,26 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
 
     // Fill NRD common settings from the frame context. NRD wants column-major (vector-is-column), NON-jittered
     // matrices; System.Numerics is row-major row-vector, so the column-major store is the transpose: dst[col*4+row].
+    // ColMajor() does that store for one matrix into a fixed float[16].
+    static unsafe void ColMajor(float* dst, in Matrix4x4 m) {
+        dst[0]=m.M11; dst[1]=m.M21; dst[2]=m.M31;  dst[3]=m.M41;
+        dst[4]=m.M12; dst[5]=m.M22; dst[6]=m.M32;  dst[7]=m.M42;
+        dst[8]=m.M13; dst[9]=m.M23; dst[10]=m.M33; dst[11]=m.M43;
+        dst[12]=m.M14;dst[13]=m.M24;dst[14]=m.M34; dst[15]=m.M44;
+    }
     unsafe void FillNrdCommon(ref NrdSettings.NrdCommonSettings c, Dx12FrameContext ctx) {
         Matrix4x4 proj = ctx.ProjUnjittered, view = ctx.View;
-        c.ViewToClipMatrix[0]=proj.M11;  c.ViewToClipMatrix[1]=proj.M21;  c.ViewToClipMatrix[2]=proj.M31;  c.ViewToClipMatrix[3]=proj.M41;
-        c.ViewToClipMatrix[4]=proj.M12;  c.ViewToClipMatrix[5]=proj.M22;  c.ViewToClipMatrix[6]=proj.M32;  c.ViewToClipMatrix[7]=proj.M42;
-        c.ViewToClipMatrix[8]=proj.M13;  c.ViewToClipMatrix[9]=proj.M23;  c.ViewToClipMatrix[10]=proj.M33; c.ViewToClipMatrix[11]=proj.M43;
-        c.ViewToClipMatrix[12]=proj.M14; c.ViewToClipMatrix[13]=proj.M24; c.ViewToClipMatrix[14]=proj.M34; c.ViewToClipMatrix[15]=proj.M44;
-        for (int i = 0; i < 16; i++) c.ViewToClipMatrixPrev[i] = c.ViewToClipMatrix[i];
-        c.WorldToViewMatrix[0]=view.M11;  c.WorldToViewMatrix[1]=view.M21;  c.WorldToViewMatrix[2]=view.M31;  c.WorldToViewMatrix[3]=view.M41;
-        c.WorldToViewMatrix[4]=view.M12;  c.WorldToViewMatrix[5]=view.M22;  c.WorldToViewMatrix[6]=view.M32;  c.WorldToViewMatrix[7]=view.M42;
-        c.WorldToViewMatrix[8]=view.M13;  c.WorldToViewMatrix[9]=view.M23;  c.WorldToViewMatrix[10]=view.M33; c.WorldToViewMatrix[11]=view.M43;
-        c.WorldToViewMatrix[12]=view.M14; c.WorldToViewMatrix[13]=view.M24; c.WorldToViewMatrix[14]=view.M34; c.WorldToViewMatrix[15]=view.M44;
-        for (int i = 0; i < 16; i++) c.WorldToViewMatrixPrev[i] = c.WorldToViewMatrix[i];
+        // Real previous-frame view: proj is static frame-to-frame (FOV/aspect constant), so
+        // prevView = PrevViewProjUnjittered · inv(proj). This gives NRD true camera motion (ghosting reject)
+        // without threading a separate prev-view field through the frame context. On the very first frame
+        // PrevViewProjUnjittered == current (renderer seeds it), so prevView == view → no spurious motion.
+        Matrix4x4 prevView = view;
+        if (Matrix4x4.Invert(proj, out Matrix4x4 invProj))
+            prevView = ctx.PrevViewProjUnjittered * invProj;
+        fixed (float* p = c.ViewToClipMatrix)     ColMajor(p, proj);
+        fixed (float* p = c.ViewToClipMatrixPrev) ColMajor(p, proj);   // proj static frame-to-frame
+        fixed (float* p = c.WorldToViewMatrix)     ColMajor(p, view);
+        fixed (float* p = c.WorldToViewMatrixPrev) ColMajor(p, prevView);
         c.ResourceSize[0] = (ushort)fullW; c.ResourceSize[1] = (ushort)fullH;
         c.ResourceSizePrev[0] = (ushort)fullW; c.ResourceSizePrev[1] = (ushort)fullH;
         c.RectSize[0] = (ushort)fullW; c.RectSize[1] = (ushort)fullH;
@@ -1691,10 +1718,11 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
         nrdTracePso?.Dispose(); nrdTraceRootSig?.Dispose(); nrdConstCb?.Dispose();
         nrdPackPso?.Dispose(); nrdPackRootSig?.Dispose(); nrdPackCb?.Dispose();
         nrdUnpackPso?.Dispose(); nrdUnpackRootSig?.Dispose();
-        nrdRadianceHitDist?.Dispose(); nrdViewZ?.Dispose(); nrdNormalRough?.Dispose(); nrdMotion?.Dispose(); nrdOut?.Dispose();
+        nrdRadianceHitDist?.Dispose(); nrdViewZ?.Dispose(); nrdViewZPrev?.Dispose(); nrdNormalRough?.Dispose(); nrdMotion?.Dispose(); nrdOut?.Dispose();
         nrdScratch?.Dispose();
         nrdTracePso = null; nrdPackPso = null; nrdUnpackPso = null; nrdScratch = null;
-        nrdRadianceHitDist = nrdViewZ = nrdNormalRough = nrdMotion = nrdOut = null;
+        nrdRadianceHitDist = nrdViewZ = nrdViewZPrev = nrdNormalRough = nrdMotion = nrdOut = null;
+        nrdViewZPrevValid = false;
         nrdReady = false;
     }
 
