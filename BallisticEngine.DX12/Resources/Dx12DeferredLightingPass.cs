@@ -10,7 +10,28 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.OpaqueLighting;
     public string Name => "Deferred";
 
-    public bool Enabled(Dx12FrameContext ctx) => true;
+    // FAZ -1d-FINAL — when render-graph v2 owns the whole frame (v1 bypassed) it drives Deferred itself; the
+    // v1 graph then SKIPS this pass via RgV2OwnsDeferred. Door off (and door-on-while-plumbing) =>
+    // RgV2OwnsDeferred is false => Enabled unchanged (always true). See Dx12FrameContext.RgV2OwnsDeferred.
+    public bool Enabled(Dx12FrameContext ctx) => !ctx.RgV2OwnsDeferred;
+
+    // FAZ -1d-FINAL — render-graph v2 entry point (mirrors Dx12ReflectionsPass.RecordV2). v2 imports GBuffer
+    // (shader read), ShadowMap (read), RtShadowMask (read) + SceneColor (write), declares the access, then
+    // calls this to run the SAME record body (byte-identical to the v1 path). Under v2 the v1 barrier deriver
+    // is bypassed (pass skipped in v1) AND v2 emits no barrier for the imports (equal states by design), so
+    // the body MUST own its input transitions. The Record body samples ALL gbuffer color RTs + depth as SRVs
+    // (it guards only that behind `!ctx.BarriersDerived` via gbuffer.ToShaderResource()), and samples the
+    // shadow map + the RT-shadow mask as SRVs WITHOUT transitioning them itself (it assumes their producer
+    // passes left them in shader-read). Force all three input states here so Record() reads them in the right
+    // state regardless of ctx.BarriersDerived: GBuffer color+depth shader-read (matches Declare's
+    // GBufferShaderRead), the shadow map shader-read, and the RT-shadow mask color shader-read (when present).
+    // SceneColor is written via target.RenderColorOnlyCleared (its own RT transition), so no force needed.
+    public void RecordV2(Dx12FrameContext ctx) {
+        ctx.GBuffer.ToShaderResource();
+        if (ctx.ShadowMap != null) ctx.Dev.ExecuteSync(cl => ctx.ShadowMap.ToShaderResource(cl));
+        ctx.RtShadowMask?.ColorToShaderResource();
+        Record(ctx);
+    }
 
     public void Declare(Dx12PassBuilder b) {
         b.Read(b.Resource("GBuffer"));

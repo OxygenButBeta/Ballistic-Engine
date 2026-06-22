@@ -9,7 +9,25 @@ public sealed class Dx12CapsuleShadowPass : IRenderPass, IDisposable {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.BeforeOpaqueLighting;
     public string Name => "CapsuleShadows";
 
-    public bool Enabled(Dx12FrameContext ctx) => ActiveCasterCount() > 0;
+    // FAZ -1d-FINAL — when render-graph v2 owns the whole frame (v1 bypassed) it drives CapsuleShadows itself;
+    // the v1 graph then SKIPS this pass via RgV2OwnsCapsuleShadow. Door off (and door-on-while-plumbing) =>
+    // RgV2OwnsCapsuleShadow is false => Enabled unchanged. See Dx12FrameContext.RgV2OwnsCapsuleShadow.
+    public bool Enabled(Dx12FrameContext ctx) => ActiveCasterCount() > 0 && !ctx.RgV2OwnsCapsuleShadow;
+
+    // FAZ -1d-FINAL — render-graph v2 entry point (mirrors Dx12ReflectionsPass.RecordV2). v2 imports GBuffer
+    // (shader read) + the capsule-shadow mask (write), declares the access, then calls this to run the SAME
+    // record body (byte-identical to the v1 path). Under v2 the v1 barrier deriver is bypassed (pass skipped
+    // in v1) AND v2 emits no barrier for the imports (equal states by design), so the body MUST own its input
+    // transitions — and it DOES, unconditionally (it is not BarriersDerived-aware): the Record body samples
+    // gbuffer depth + normal SRVs, calls `gbuffer.ToShaderResource()` UNCONDITIONALLY (full color + depth),
+    // and drives the maskOut UAV->PixelShaderResource transition with explicit in-list barriers. So no
+    // pre-forced state is strictly required; we force `gbuffer.ToShaderResource()` here for symmetry with the
+    // established pattern and as an explicit guarantee (idempotent — state-tracked, so the body's repeat is a
+    // no-op). maskOut is a self-owned committed resource transitioned in-list by Record.
+    public void RecordV2(Dx12FrameContext ctx) {
+        ctx.GBuffer.ToShaderResource();
+        Record(ctx);
+    }
 
     static int ActiveCasterCount() {
         int n = 0;

@@ -130,6 +130,23 @@ public sealed class Dx12FrameContext {
     public bool RgV2OwnsAuroraGi { get; init; }
     public bool RgV2OwnsLumenGi { get; init; }
 
+    // FAZ -1d-FINAL (lighting group) — when render-graph v2 owns the WHOLE frame (v1 bypassed) it will drive
+    // the lighting/AO passes too, in event order: GTAO(200) -> RTAO(250) / CapsuleShadows(250) ->
+    // Deferred OpaqueLighting(300). The matching v1 pass's Enabled() returns false (skip) when its flag is
+    // set, so the pass runs exactly once. These mirror RgV2OwnsSky/Reflections.
+    //
+    // STAY FALSE FOR NOW (plumbing only): the current v2 block (RunRenderGraphV2) runs at the END of the
+    // frame, AFTER v1's whole graph. These passes sit MID-frame (200-300, before the still-v1 GI(500) /
+    // Reflections(600)); appending them to the end-of-frame block would REORDER them after GI/Reflections ->
+    // wrong output. They are only enabled once v1 is bypassed and the v2 graph owns the frame in event order.
+    // Default false => door-off byte-identical AND door-on unchanged (no v1 pass skips, RunRenderGraphV2 does
+    // not run them). The RecordV2 bodies + the v1 Enabled() `&& !RgV2Owns*` guards are in place, ready for
+    // that final wiring.
+    public bool RgV2OwnsDeferred { get; init; }
+    public bool RgV2OwnsGtao { get; init; }
+    public bool RgV2OwnsRtao { get; init; }
+    public bool RgV2OwnsCapsuleShadow { get; init; }
+
     public Dx12RenderDoors      Doors    { get; init; }
     public PostProcessSettings  PostFX   { get; init; }
     public RenderStats          Stats    { get; init; }

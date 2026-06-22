@@ -15,8 +15,27 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
 
     int? envCached;
     float? intensityCached, rayLenCached, rayCountCached, skyFloorCached;
+    // FAZ -1d-FINAL — when render-graph v2 owns the whole frame (v1 bypassed) it drives RTAO itself; the v1
+    // graph then SKIPS this pass via RgV2OwnsRtao. Door off (and door-on-while-plumbing) => RgV2OwnsRtao is
+    // false => Enabled unchanged. See Dx12FrameContext.RgV2OwnsRtao.
     public bool Enabled(Dx12FrameContext ctx) =>
-        WillRun(ctx.Doors, ctx.PostFX, ctx.Dxr, ctx.Dev);
+        WillRun(ctx.Doors, ctx.PostFX, ctx.Dxr, ctx.Dev) && !ctx.RgV2OwnsRtao;
+
+    // FAZ -1d-FINAL — render-graph v2 entry point (mirrors Dx12ReflectionsPass.RecordV2). v2 imports GBuffer
+    // (shader read) + the Ao target (read/write) + the scene TLAS, declares the access, then calls this to run
+    // the SAME record body (byte-identical to the v1 path). Under v2 the v1 barrier deriver is bypassed (pass
+    // skipped in v1) AND v2 emits no barrier for the imports (equal states by design), so the body MUST own
+    // its input transitions — and it DOES, unconditionally (it is not BarriersDerived-aware): the Record body
+    // ensures the TLAS via sceneAS.Ensure, calls `gbuffer.ToShaderResource()` UNCONDITIONALLY (full color +
+    // depth), and drives every UAV/copy transition for rtaoOut / the history textures / the AO target with
+    // explicit in-list ResourceBarrierTransition + ColorTransitionInList calls. So no pre-forced state is
+    // strictly required; we force `gbuffer.ToShaderResource()` here too for symmetry with the established
+    // pattern and as an explicit guarantee (idempotent — the transition is state-tracked, so the body's repeat
+    // is a no-op). The AO target it reads (gtao.AoTarget) is transitioned in-list by Record itself.
+    public void RecordV2(Dx12FrameContext ctx) {
+        ctx.GBuffer.ToShaderResource();
+        Record(ctx);
+    }
 
     public bool WillRun(Dx12RenderDoors doors, PostProcessSettings postFx, Dx12DxrShared dxr, Dx12Device device) {
         if (!doors.Ssao || !postFx.SSAOEnabled) return false;

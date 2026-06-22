@@ -10,7 +10,24 @@ public sealed class Dx12GtaoPass : IRenderPass, IDisposable {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.AfterGBuffer;
     public string Name => "GTAO";
 
-    public bool Enabled(Dx12FrameContext ctx) => ctx.Doors.Ssao && ctx.PostFX.SSAOEnabled;
+    // FAZ -1d-FINAL — when render-graph v2 owns the whole frame (v1 bypassed) it drives GTAO itself; the v1
+    // graph then SKIPS this pass via RgV2OwnsGtao. Door off (and door-on-while-plumbing) => RgV2OwnsGtao is
+    // false => Enabled unchanged. See Dx12FrameContext.RgV2OwnsGtao.
+    public bool Enabled(Dx12FrameContext ctx) => ctx.Doors.Ssao && ctx.PostFX.SSAOEnabled && !ctx.RgV2OwnsGtao;
+
+    // FAZ -1d-FINAL — render-graph v2 entry point (mirrors Dx12ReflectionsPass.RecordV2). v2 imports GBuffer
+    // (depth read) + the Ao target (write), declares the access, then calls this to run the SAME record body
+    // (byte-identical to the v1 path). Under v2 the v1 barrier deriver is bypassed (pass skipped in v1) AND v2
+    // emits no barrier for the imports (equal states by design), so the body MUST own its input transition.
+    // The Record body guards its only at-entry input transition — `gbuffer.DepthToShaderResource()` — behind
+    // `!ctx.BarriersDerived` (matches Declare's GBufferDepthShaderRead). It also samples gbuffer color(0)/(1)
+    // as SRVs, but (like the Reflections SSR body) assumes those are already shader-read from the upstream
+    // G-buffer pass — only the depth is force-transitioned here. The Ao targets (gtaoA/gtaoB) are written via
+    // RenderColorOnly / PoolBarrier (their own RT transitions inside Record), so no force is needed for them.
+    public void RecordV2(Dx12FrameContext ctx) {
+        ctx.GBuffer.DepthToShaderResource();
+        Record(ctx);
+    }
 
     public void Declare(Dx12PassBuilder b) {
         b.Read(b.Resource("GBuffer"));
