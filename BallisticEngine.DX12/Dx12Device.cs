@@ -135,16 +135,6 @@ public sealed class Dx12Device : IDisposable {
         Console.WriteLine(rt ? "[DX12] Hardware ray tracing: AVAILABLE (DXR Tier 1.0+)"
                              : "[DX12] Hardware ray tracing: NOT available — RayTraced GI/reflections/shadows will use screen-space fallbacks.");
 
-        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_NRD_SELFTEST") == "1") {
-            NrdApi.SelfTest();
-            try {
-                var nrd = new Dx12NrdDenoiser(this);
-                bool ok = nrd.Initialize(1920, 1080);
-                Console.WriteLine($"[NRD selftest] Initialize(1920x1080) → {(ok ? "PASS (PSOs+pool+rootsig+heap+cb built)" : "FAIL")}");
-                nrd.Dispose();
-            } catch (Exception e) { Console.WriteLine($"[NRD selftest] Initialize threw: {e.GetType().Name}: {e.Message}"); }
-        }
-
         bool ms = false;
         try {
             var opt7 = Device.CheckFeatureSupport<FeatureDataD3D12Options7>(Vortice.Direct3D12.Feature.Options7);
@@ -208,6 +198,20 @@ public sealed class Dx12Device : IDisposable {
         breakOnError = Environment.GetEnvironmentVariable("BALLISTIC_DX12_BREAK_ON_ERROR") == "1";
         if (breakOnError && infoQueue is not null)
             Console.WriteLine("[DX12] Info-queue break-on-error: ENABLED (BALLISTIC_DX12_BREAK_ON_ERROR=1) — baseline-aware: the end-of-frame drain fails loud on NEW (non-baseline) Corruption/Error messages only.");
+
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_NRD_SELFTEST") == "1") {
+            NrdApi.SelfTest();
+            try {
+                var nrd = new Dx12NrdDenoiser(this);
+                bool ok = nrd.Initialize(1920, 1080);
+                Console.WriteLine($"[NRD selftest] Initialize(1920x1080) → {(ok ? "PASS (PSOs+pool+rootsig+heap+cb built)" : "FAIL")}");
+                if (ok) {
+                    bool d = nrd.DenoiseSelfTest(1920, 1080);
+                    Console.WriteLine($"[NRD selftest] DenoiseSelfTest → {(d ? "PASS (all dispatches executed on GPU)" : "FAIL")}");
+                }
+                nrd.Dispose();
+            } catch (Exception e) { Console.WriteLine($"[NRD selftest] threw: {e.GetType().Name}: {e.Message}\n{e.StackTrace}"); }
+        }
     }
 
     readonly bool gbvEnabled;

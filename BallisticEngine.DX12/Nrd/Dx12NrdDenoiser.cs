@@ -21,9 +21,13 @@ internal sealed unsafe class Dx12NrdDenoiser : IDisposable {
     IntPtr instance;
     ID3D12RootSignature rootSig;
     ID3D12PipelineState[] pipelines;       // one per NRD pipeline
+    PipelineLayout[] pipelineLayouts;      // per-pipeline resource-range layout (cached from PipelineDesc)
     PoolTex[] pool;                        // permanent pool first, then transient
     int permanentPoolSize;
     NrdApi.InstanceDesc instDesc;
+
+    // A pipeline's resource ranges: how many TEXTURE (SRV) then STORAGE_TEXTURE (UAV) descriptors it binds, in order.
+    struct PipelineLayout { public NrdApi.ResourceRangeDesc[] Ranges; }
 
     // GPU-visible descriptor heap for NRD's per-dispatch resource tables (SRV+UAV), bump-allocated per frame.
     ID3D12DescriptorHeap srvUavHeap;
@@ -122,6 +126,7 @@ internal sealed unsafe class Dx12NrdDenoiser : IDisposable {
     void BuildPipelines() {
         var pipePtr = (NrdApi.PipelineDesc*)instDesc.Pipelines;
         pipelines = new ID3D12PipelineState[instDesc.PipelinesNum];
+        pipelineLayouts = new PipelineLayout[instDesc.PipelinesNum];
         for (uint i = 0; i < instDesc.PipelinesNum; i++) {
             NrdApi.PipelineDesc pd = pipePtr[i];
             var dxil = pd.ComputeShaderDXIL;   // bytecode + size; embedded in NRD.dll
@@ -132,6 +137,11 @@ internal sealed unsafe class Dx12NrdDenoiser : IDisposable {
             pipelines[i] = dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription {
                 RootSignature = rootSig, ComputeShader = bytes,
             });
+            // Cache the resource ranges (the dispatch's resources[] are concatenated in this order).
+            var ranges = new NrdApi.ResourceRangeDesc[pd.ResourceRangesNum];
+            var rangePtr = (NrdApi.ResourceRangeDesc*)pd.ResourceRanges;
+            for (uint j = 0; j < pd.ResourceRangesNum; j++) ranges[j] = rangePtr[j];
+            pipelineLayouts[i] = new PipelineLayout { Ranges = ranges };
         }
     }
 
@@ -198,6 +208,171 @@ internal sealed unsafe class Dx12NrdDenoiser : IDisposable {
         NrdApi.Format.R11_G11_B10_UFLOAT => Format.R11G11B10_Float,
         _ => throw new NotSupportedException($"NRD format {f} not mapped to DXGI"),
     };
+
+    // ---- per-frame denoise ----
+    // The caller supplies the input/output textures NRD references by ResourceType (IN_MV, IN_NORMAL_ROUGHNESS,
+    // IN_VIEWZ, IN_DIFF_RADIANCE_HITDIST, OUT_DIFF_RADIANCE_HITDIST). We set common+denoiser settings, ask NRD for
+    // the dispatch list, then for each dispatch: resolve resources (snapshot or pool), barrier them to SRV/UAV,
+    // write CPU descriptors into the GPU heap, upload constants, bind and dispatch. All recorded onto `cl`.
+    public sealed class Resource {
+        public ID3D12Resource Tex; public Format Format; public ResourceStates State;
+        public Resource(ID3D12Resource t, Format f, ResourceStates s) { Tex = t; Format = f; State = s; }
+    }
+
+    public unsafe void Denoise(ID3D12GraphicsCommandList cl, in NrdSettings.NrdCommonSettings common,
+                               in NrdSettings.ReblurSettings reblur, Resource[] snapshot) {
+        if (!Available) return;
+
+        NrdApi.SetCommonSettings(instance, in common);
+        fixed (NrdSettings.ReblurSettings* rp = &reblur)
+            NrdApi.SetDenoiserSettings(instance, Identifier, (IntPtr)rp);
+
+        uint id = Identifier;
+        if (NrdApi.GetComputeDispatches(instance, (IntPtr)(&id), 1, out IntPtr ddPtr, out uint ddNum) != NrdApi.Result.Success)
+            return;
+
+        cl.SetDescriptorHeaps(srvUavHeap);
+        cl.SetComputeRootSignature(rootSig);
+
+        var dispatches = (NrdApi.DispatchDesc*)ddPtr;
+        for (uint d = 0; d < ddNum; d++) {
+            NrdApi.DispatchDesc dd = dispatches[d];
+            PipelineLayout layout = pipelineLayouts[dd.PipelineIndex];
+            var resPtr = (NrdApi.ResourceDesc*)dd.Resources;
+
+            // The table layout is fixed: SRV slots [0, perSetTexturesMax) then UAV slots [perSetTexturesMax, +perSetStorageMax).
+            // We bump-allocate a contiguous block in the heap for THIS dispatch's table and write each descriptor at
+            // its computed slot. NRD's resources[] are concatenated per range (TEXTURE range first, then STORAGE).
+            int srvMax = (int)instDesc.DescriptorPoolDesc.PerSetTexturesMaxNum;
+            int uavMax = (int)instDesc.DescriptorPoolDesc.PerSetStorageTexturesMaxNum;
+            int tableSize = srvMax + uavMax;
+            if (srvUavHeapCursor + tableSize > srvUavHeapCapacity) srvUavHeapCursor = 0;   // ring (within-frame headroom)
+            int tableBase = srvUavHeapCursor;
+            srvUavHeapCursor += tableSize;
+
+            int n = 0, srvSlot = 0, uavSlot = 0;
+            var preBarriers = new List<ResourceBarrier>();
+            foreach (var range in layout.Ranges) {
+                bool isStorage = range.DescriptorType == NrdApi.DescriptorType.STORAGE_TEXTURE;
+                for (uint j = 0; j < range.DescriptorsNum; j++) {
+                    NrdApi.ResourceDesc rd = resPtr[n++];
+                    Resource res = Resolve(rd, snapshot);
+
+                    ResourceStates want = isStorage ? ResourceStates.UnorderedAccess : ResourceStates.NonPixelShaderResource;
+                    if (res.State != want) {
+                        preBarriers.Add(ResourceBarrier.BarrierTransition(res.Tex, res.State, want));
+                        res.State = want;
+                    } else if (isStorage) {
+                        preBarriers.Add(ResourceBarrier.BarrierUnorderedAccessView(res.Tex));   // UAV→UAV hazard
+                    }
+
+                    int slot = isStorage ? (srvMax + uavSlot++) : srvSlot++;
+                    CpuDescriptorHandle h = srvUavHeap.GetCPUDescriptorHandleForHeapStart();
+                    h.Ptr += (nuint)((tableBase + slot) * srvUavInc);
+                    if (isStorage)
+                        dev.Device.CreateUnorderedAccessView(res.Tex, null,
+                            new UnorderedAccessViewDescription { Format = res.Format, ViewDimension = UnorderedAccessViewDimension.Texture2D }, h);
+                    else
+                        dev.Device.CreateShaderResourceView(res.Tex,
+                            new ShaderResourceViewDescription {
+                                Format = res.Format, ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
+                                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                                Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
+                            }, h);
+                }
+            }
+            if (preBarriers.Count > 0) cl.ResourceBarrier(preBarriers.ToArray());
+
+            // Upload constants into the ring (NRD says when it differs from the previous dispatch).
+            ulong cbGpu = cbLastGpu;
+            if (dd.ConstantBufferDataSize > 0 && !dd.ConstantBufferDataMatchesPreviousDispatch) {
+                if (cbCursor + cbViewSize > cbRingSize) cbCursor = 0;
+                Buffer.MemoryCopy((void*)dd.ConstantBufferData, cbMapped + cbCursor, dd.ConstantBufferDataSize, dd.ConstantBufferDataSize);
+                cbGpu = cb.GPUVirtualAddress + (ulong)cbCursor;
+                cbCursor += cbViewSize;
+                cbLastGpu = cbGpu;
+            }
+
+            cl.SetPipelineState(pipelines[dd.PipelineIndex]);
+            cl.SetComputeRootConstantBufferView(0, cbGpu);
+            GpuDescriptorHandle gpu = srvUavHeap.GetGPUDescriptorHandleForHeapStart();
+            gpu.Ptr += (ulong)(tableBase * srvUavInc);
+            cl.SetComputeRootDescriptorTable(1, gpu);
+            cl.Dispatch(dd.GridWidth, dd.GridHeight, 1);
+        }
+    }
+
+    ulong cbLastGpu;
+
+    Resource Resolve(NrdApi.ResourceDesc rd, Resource[] snapshot) {
+        if (rd.Type == NrdApi.ResourceType.TRANSIENT_POOL) return PoolResource(permanentPoolSize + rd.IndexInPool);
+        if (rd.Type == NrdApi.ResourceType.PERMANENT_POOL) return PoolResource(rd.IndexInPool);
+        Resource r = snapshot[(int)rd.Type];
+        if (r == null) throw new InvalidOperationException($"NRD requested unbound resource {rd.Type}");
+        return r;
+    }
+
+    // Wrap a pool texture as a Resource view (state lives in the PoolTex; mirror it back after).
+    Resource[] poolResourceCache;
+    Resource PoolResource(int idx) {
+        poolResourceCache ??= new Resource[pool.Length];
+        if (poolResourceCache[idx] == null)
+            poolResourceCache[idx] = new Resource(pool[idx].Resource, pool[idx].Format, pool[idx].State);
+        else
+            poolResourceCache[idx].State = pool[idx].State;   // sync in
+        return poolResourceCache[idx];
+    }
+
+    // After Denoise, pool states changed on the wrapper — mirror them back so next frame's barriers are correct.
+    public void SyncPoolStates() {
+        if (poolResourceCache == null) return;
+        for (int i = 0; i < pool.Length; i++)
+            if (poolResourceCache[i] != null) pool[i].State = poolResourceCache[i].State;
+    }
+
+    public void ResetFrameRings() { srvUavHeapCursor = 0; }
+
+    // Synthetic smoke test: allocate dummy inputs/output, run ONE full Denoise on the GPU, prove all dispatches
+    // execute with no D3D12 validation error. Does NOT check output correctness — just that the graph runs.
+    public bool DenoiseSelfTest(int w, int h) {
+        Resource Mk(Format f, ResourceStates st) {
+            var rd = ResourceDescription.Texture2D(f, (uint)w, (uint)h, 1, 1);
+            rd.Flags = ResourceFlags.AllowUnorderedAccess;
+            var t = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None, rd, st);
+            return new Resource(t, f, st);
+        }
+        var snapshot = new Resource[(int)NrdApi.ResourceType.MAX_NUM];
+        snapshot[(int)NrdApi.ResourceType.IN_MV] = Mk(Format.R16G16B16A16_Float, ResourceStates.NonPixelShaderResource);
+        snapshot[(int)NrdApi.ResourceType.IN_NORMAL_ROUGHNESS] = Mk(Format.R10G10B10A2_UNorm, ResourceStates.NonPixelShaderResource);
+        snapshot[(int)NrdApi.ResourceType.IN_VIEWZ] = Mk(Format.R16_Float, ResourceStates.NonPixelShaderResource);
+        snapshot[(int)NrdApi.ResourceType.IN_DIFF_RADIANCE_HITDIST] = Mk(Format.R16G16B16A16_Float, ResourceStates.NonPixelShaderResource);
+        snapshot[(int)NrdApi.ResourceType.OUT_DIFF_RADIANCE_HITDIST] = Mk(Format.R16G16B16A16_Float, ResourceStates.UnorderedAccess);
+
+        var common = NrdSettings.NrdCommonSettings.Default();
+        // Minimal sane matrices: identity view/clip (NRD needs them non-degenerate). Resolution = rect = full.
+        unsafe {
+            common.ViewToClipMatrix[0] = 1f; common.ViewToClipMatrix[5] = 1f; common.ViewToClipMatrix[10] = 1f; common.ViewToClipMatrix[15] = 1f;
+            common.ViewToClipMatrixPrev[0] = 1f; common.ViewToClipMatrixPrev[5] = 1f; common.ViewToClipMatrixPrev[10] = 1f; common.ViewToClipMatrixPrev[15] = 1f;
+            common.WorldToViewMatrix[0] = 1f; common.WorldToViewMatrix[5] = 1f; common.WorldToViewMatrix[10] = 1f; common.WorldToViewMatrix[15] = 1f;
+            common.WorldToViewMatrixPrev[0] = 1f; common.WorldToViewMatrixPrev[5] = 1f; common.WorldToViewMatrixPrev[10] = 1f; common.WorldToViewMatrixPrev[15] = 1f;
+            common.ResourceSize[0] = (ushort)w; common.ResourceSize[1] = (ushort)h;
+            common.ResourceSizePrev[0] = (ushort)w; common.ResourceSizePrev[1] = (ushort)h;
+            common.RectSize[0] = (ushort)w; common.RectSize[1] = (ushort)h;
+            common.RectSizePrev[0] = (ushort)w; common.RectSizePrev[1] = (ushort)h;
+        }
+        common.AccumulationMode = NrdApi.AccumulationMode.CLEAR_AND_RESTART;   // first frame, no history
+        var reblur = NrdSettings.ReblurSettings.Default();
+
+        try {
+            ResetFrameRings();
+            var c = common; var rb = reblur;   // copy out of `in`/locals so the lambda can capture by value
+            dev.ExecuteSync(cl => Denoise(cl, c, rb, snapshot));
+            SyncPoolStates();
+            return true;
+        } finally {
+            foreach (var r in snapshot) r?.Tex?.Dispose();
+        }
+    }
 
     public void Dispose() {
         Available = false;
