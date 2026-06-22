@@ -127,7 +127,7 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
             SpecClamp = specClampValue,
             SpecAaStrength = specAaValue,
             UseSsao = ctx.Doors.Ssao && ctx.PostFX.SSAOEnabled ? 1f : 0f,
-            UseIBLDiffuse = (Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_FIX") != "0" && !ctx.GiActiveThisFrame) ? 1f : 0f,
+            UseIBLDiffuse = (Environment.GetEnvironmentVariable("BALLISTIC_DX12_AURORA_FIX") != "0" && !ctx.AuroraActiveThisFrame) ? 1f : 0f,
             UseIBLSpecular = 0f,
             UseCapsuleShadows = ctx.CapsuleShadowsThisFrame ? 1f : 0f,
             ViewProjFwd = Matrix4x4.Transpose(ctx.ViewProj),

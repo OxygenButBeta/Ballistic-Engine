@@ -26,13 +26,14 @@ RWTexture2D<float4> Output  : register(u0);
 cbuffer ReflConstants : register(b0) {
     float4x4 InvViewProj;    // screen+depth → world (JITTERED, transposed)
     float3 CameraPos; float Intensity;
-    float PrefilterMaxMip; float NormalBias; float UseCards; float FrameIndex;   // UseCards: D5 DDGI GI at hit; FrameIndex: VNDF temporal jitter (<0 = det fixed)
+    float PrefilterMaxMip; float NormalBias; float UseCards; float FrameIndex;   // UseCards: sample the Aurora card cache at hits; FrameIndex: VNDF temporal jitter (<0 = det fixed)
 };
-// D5: the DDGI probe grid, so a reflection hit gets the SAME diffuse GI the primary view does.
-cbuffer ReflDdgiGrid : register(b2) {
-    float3 DdgiOrigin;   float DdgiPad0;
-    float3 DdgiSpacing;  float DdgiPad1;
-    uint   DdgiCountX, DdgiCountY, DdgiCountZ;  uint DdgiPad2;
+// Reserved cbuffer slot (b2) — kept so the root signature layout matches C# (rtReflGridCb). Unused by the
+// Aurora card path (card lookup is per-hit InstanceID/PrimitiveIndex, no world-grid params needed).
+cbuffer ReflGiReserved : register(b2) {
+    float4 _ReflGiReserved0;
+    float4 _ReflGiReserved1;
+    uint4  _ReflGiReserved2;
 };
 cbuffer RtReflectionLights : register(b1) {
     float3 SunDir;     float SunNormalBias;   // TO the sun (normalized), world; bias = shadow-ray origin offset
@@ -52,38 +53,21 @@ struct GpuMaterial {
     float Cutout, HasEmissive, Pad2, Pad3;
 };
 struct GpuLight { float4 PosRange; float4 Color; float4 DirCosOuter; float4 Extra; float4 RightAxisHalfW; }; // 80B (RightAxisHalfW = rect right-axis; 0 for point/spot — must match Dx12ClusteredLights.GpuLight stride)
-StructuredBuffer<GpuMaterial>       GpuMaterials : register(t7);
-StructuredBuffer<RtInstance>        RtInstances  : register(t8);
-StructuredBuffer<GpuLight>          Lights       : register(t9);
-StructuredBuffer<float4>            DdgiIrradiance : register(t11);   // D5: DDGI probe irradiance (rgb=E per oct texel)
+struct AuroraInstanceMeta { uint TriOffset, TriCount, ClusterOffset, ClusterCount; float4x4 World; };
+StructuredBuffer<GpuMaterial>        GpuMaterials : register(t7);
+StructuredBuffer<RtInstance>         RtInstances  : register(t8);
+StructuredBuffer<GpuLight>           Lights       : register(t9);
+StructuredBuffer<float4>             CardRadiance : register(t11);   // Aurora per-CLUSTER lit + multibounce radiance
+StructuredBuffer<AuroraInstanceMeta> InstanceMeta : register(t12);   // per-instance {triOffset, clusterOffset, world}
+StructuredBuffer<uint>               TriToCluster : register(t13);   // global tri index → LOCAL cluster index
 
-static const int DdgiOctRes = 8;   // MUST match Dx12DdgiProbeGrid.OctRes (DDGI irradiance cell edge)
-static const int DdgiOctTexels = DdgiOctRes * DdgiOctRes;
-
-float2 DdgiOctEncode(float3 n) {
-    n /= (abs(n.x) + abs(n.y) + abs(n.z));
-    float2 e = n.xy;
-    if (n.z < 0.0) e = (1.0 - abs(e.yx)) * float2(e.x >= 0.0 ? 1.0 : -1.0, e.y >= 0.0 ? 1.0 : -1.0);
-    return e * 0.5 + 0.5;
-}
-// Trilinear gather of the DDGI probe irradiance at a world point in direction N (the diffuse GI a surface there
-// receives). Mirrors DdgiSample.hlsl (no Chebyshev here — reflection hits are a secondary effect, keep it cheap).
-float3 DdgiGather(float3 P, float3 N) {
-    float3 g = (P - DdgiOrigin) / max(DdgiSpacing, 1e-4);
-    int3 baseC = clamp((int3)floor(g), int3(0,0,0), int3((int)DdgiCountX-2, (int)DdgiCountY-2, (int)DdgiCountZ-2));
-    float3 frac = saturate(g - (float3)baseC);
-    int2 ot = clamp((int2)floor(DdgiOctEncode(N) * float(DdgiOctRes)), 0, DdgiOctRes - 1);
-    float3 sum = 0.0.xxx; float wsum = 0.0;
-    [unroll] for (int i = 0; i < 8; i++) {
-        int3 off = int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
-        uint3 c = (uint3)clamp(baseC + off, int3(0,0,0), int3((int)DdgiCountX-1, (int)DdgiCountY-1, (int)DdgiCountZ-1));
-        float3 tw = float3(off.x==0?1.0-frac.x:frac.x, off.y==0?1.0-frac.y:frac.y, off.z==0?1.0-frac.z:frac.z);
-        float w = tw.x*tw.y*tw.z;
-        uint probe = c.z*(DdgiCountX*DdgiCountY) + c.y*DdgiCountX + c.x;
-        sum += DdgiIrradiance[probe*DdgiOctTexels + ot.y*DdgiOctRes + ot.x].rgb * w;
-        wsum += w;
-    }
-    return (wsum > 1e-4) ? sum / wsum : 0.0.xxx;
+// A reflection hit reads the SAME radiance cache the primary GI fills: record = instance.ClusterOffset +
+// TriToCluster[instance.TriOffset + prim]. CardRadiance[record] is that surface's lit + multi-bounce radiance,
+// so the reflection shares the exact diffuse GI the diffuse view sees (no separate probe gather).
+float3 AuroraCardGather(uint instanceId, uint prim) {
+    AuroraInstanceMeta meta = InstanceMeta[instanceId];
+    uint record = meta.ClusterOffset + TriToCluster[meta.TriOffset + prim];
+    return min(CardRadiance[record].rgb, 60000.0.xxx);
 }
 
 // B1/B2: MAX_ROUGHNESS raised from 0.6 → 1.0 so ROUGH surfaces also get ray-traced reflections (previously hard-
@@ -257,10 +241,10 @@ void Miss(inout ReflPayload p) {
 
 [shader("closesthit")]
 void ClosestHit(inout ReflPayload p, in BuiltInTriangleIntersectionAttributes attr) {
-    // D5: a reflection hit is shaded in full world space (sun + punctual + GI), so the reflection sees the SAME
-    // diffuse GI the primary view does. When the DDGI grid is live (UseCards) the indirect term is gathered from
-    // the probe grid; otherwise it falls back to the IBL irradiance cube. Fetch the hit triangle's interpolated
-    // normal + UV from the bindless per-instance geometry buffers.
+    // A reflection hit is shaded in full world space (sun + punctual + GI), so the reflection sees the SAME
+    // diffuse GI the primary view does. When the Aurora radiance cache is live (UseCards) the indirect term is
+    // read from the per-triangle card record; otherwise it falls back to the IBL irradiance cube. Fetch the hit
+    // triangle's interpolated normal + UV from the bindless per-instance geometry buffers.
     RtInstance inst = RtInstances[InstanceID()];
     Buffer<uint>             indices = ResourceDescriptorHeap[inst.IndexIdx];
     StructuredBuffer<float3> normals = ResourceDescriptorHeap[inst.NormalIdx];
@@ -289,9 +273,13 @@ void ClosestHit(inout ReflPayload p, in BuiltInTriangleIntersectionAttributes at
     float3 sun = SunColor * ndl * (ndl > 0.0 ? Visibility(hit, Ng, normalize(SunDir), 1e4) : 0.0);
     float3 punctual = PunctualDiffuse(hit, Ng);
 
-    // Indirect/ambient: DDGI probe GI when live (the reflection shares the primary GI), else the IBL cube.
-    float3 ambient = (UseCards > 0.5) ? DdgiGather(hit, Ng) : Irradiance.SampleLevel(LinearClamp, Ng, 0).rgb;
-    float3 radiance = albedo * (sun + punctual + ambient);
+    // Indirect/ambient: the Aurora card cache when live (the reflection shares the primary multi-bounce GI),
+    // else the IBL cube. The card already holds lit+multibounce radiance for that surface, so it is added
+    // directly (not multiplied by albedo again — albedo only scales the direct sun+punctual terms).
+    bool useCard = (UseCards > 0.5);
+    float3 ambient = useCard ? 0.0.xxx : Irradiance.SampleLevel(LinearClamp, Ng, 0).rgb;
+    float3 radiance = albedo * (sun + punctual + ambient)
+                    + (useCard ? AuroraCardGather(InstanceID(), prim) : 0.0.xxx);
 
     // Soft luminance clamp (NOT saturate — that crushes the ~1e5 HDR). Tame fireflies, then ternary Sanitize.
     // Per-channel cap below the fp16 ceiling (~65504) BEFORE Sanitize: the +emissive term is UNBOUNDED

@@ -280,8 +280,9 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         Matrix4x4.Invert(viewProj, out Matrix4x4 invVP);
-        // FAZ 1: GI sökülü → reflections IBL prefilter fallback. FAZ 2'de Aurora radiance cache'i buraya bağlanacak.
-        bool useCards = false;
+        // Aurora radiance cache at reflection hits when Aurora is active this frame + has a valid cache.
+        bool useCards = ctx.AuroraActiveThisFrame && ctx.AuroraScene is { Valid: true } && ctx.PostFX.AuroraReflections
+                        && ReflCardsAllowed;
         float reflFrameIndex = ctx.DeterministicCapture ? -1f : (ctx.FrameCounter & 1023);
         rtReflCb.Write(new RtReflConstants {
             InvViewProj = Matrix4x4.Transpose(invVP), CameraPos = camPos, Intensity = ForcedIntensity(ctx),
@@ -323,10 +324,16 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
             cl.SetComputeRootShaderResourceView(4, gpuDriven.MaterialsGpuAddress);
             cl.SetComputeRootShaderResourceView(5, rtGeometry.InstancesGpuAddress);
             cl.SetComputeRootShaderResourceView(6, clusteredLights.LightBufGpuAddress);
-            cl.SetComputeRootShaderResourceView(7, clusteredLights.LightBufGpuAddress);
-            cl.SetComputeRootShaderResourceView(8, clusteredLights.LightBufGpuAddress);
-            cl.SetComputeRootShaderResourceView(9, clusteredLights.LightBufGpuAddress);
-            cl.SetComputeRootShaderResourceView(10, clusteredLights.LightBufGpuAddress);
+            cl.SetComputeRootShaderResourceView(7, clusteredLights.LightBufGpuAddress);   // t10 probe (unused by Aurora; valid filler)
+            // Aurora card cache (this frame's lit + multi-bounce radiance, post-swap) + per-instance meta + tri→cluster map.
+            // When Aurora is off, bind valid filler (the light buffer) — UseCards=0 gates the shader read anyway.
+            ulong cardAddr = useCards ? ctx.AuroraScene.CardRadianceReadGpu : clusteredLights.LightBufGpuAddress;
+            ulong metaAddr = useCards ? ctx.AuroraScene.InstanceMetaGpuAddress : clusteredLights.LightBufGpuAddress;
+            ulong triClusAddr = useCards && ctx.AuroraScene.TriToClusterGpuAddress != 0
+                ? ctx.AuroraScene.TriToClusterGpuAddress : clusteredLights.LightBufGpuAddress;
+            cl.SetComputeRootShaderResourceView(8, cardAddr);       // t11 CardRadiance
+            cl.SetComputeRootShaderResourceView(9, metaAddr);       // t12 InstanceMeta
+            cl.SetComputeRootShaderResourceView(10, triClusAddr);   // t13 TriToCluster
             cl.DispatchRays(new DispatchRaysDescription {
                 Width = (uint)ssrTarget.Width, Height = (uint)ssrTarget.Height, Depth = 1,
                 RayGenerationShaderRecord = new GpuVirtualAddressRange { StartAddress = rtReflSbt.GPUVirtualAddress, SizeInBytes = idSize },

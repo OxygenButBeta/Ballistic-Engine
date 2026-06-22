@@ -69,6 +69,11 @@ public sealed class Dx12FrameContext {
 
     public Dx12DxrShared Dxr { get; init; }
 
+    // Aurora GI scene substrate (per-triangle radiance cache + per-instance meta). The Reflections pass
+    // (after the Aurora GI pass at event 500) reads it so rough reflections sample the SAME multi-bounce GI
+    // the diffuse uses. Null when Aurora is off; reflections gates on AuroraActiveThisFrame too.
+    public Dx12AuroraScene AuroraScene { get; init; }
+
     public bool BarriersDerived { get; init; }
 
     public Dx12RenderDoors      Doors    { get; init; }
@@ -81,7 +86,7 @@ public sealed class Dx12FrameContext {
     public bool   ShadowsThisFrame   { get; set; }
     public bool   RtShadowsThisFrame { get; set; }
 
-    public bool   GiActiveThisFrame { get; set; }
+    public bool   AuroraActiveThisFrame { get; set; }
 
     public int GrainFrame { get; set; }
 

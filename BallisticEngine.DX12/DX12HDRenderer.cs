@@ -140,6 +140,8 @@ public sealed class DX12HDRenderer : HDRenderer
 
     Dx12SkyPass skyPass;
 
+    Dx12AuroraGiPass auroraGiPass;
+
     Dx12ReflectionsPass reflectionsPass;
 
     ID3D12Resource cbRing;
@@ -516,6 +518,10 @@ public sealed class DX12HDRenderer : HDRenderer
         graph.Add(fogPass);
         transparentsPass = new Dx12TransparentsPass(dev);
         graph.Add(transparentsPass);
+        // Aurora GI (event 500 — after Transparents, before Fog). Owns the radiance-cache scene substrate +
+        // the screen-trace / HW-RT diffuse pipeline. The single product GI pass.
+        auroraGiPass = new Dx12AuroraGiPass(dev, targetW, targetH);
+        graph.Add(auroraGiPass);
         reflectionsPass = new Dx12ReflectionsPass(dev, targetW, targetH);
         graph.Add(reflectionsPass);
         taaPass = new Dx12TaaPass(dev, targetW, targetH);
@@ -1618,6 +1624,7 @@ public sealed class DX12HDRenderer : HDRenderer
             Vsm = vsm, VsmActiveThisFrame = vsmActiveThisFrame,
             RtShadowMask = rtShadowMask,
             Dxr = dxr,
+            AuroraScene = auroraGiPass.Scene,
             FrameCbAddress =
                 frameCb.Gpu,
             Doors = doors, PostFX = PostFX, Stats = RenderStats.Scene,
@@ -1636,7 +1643,10 @@ public sealed class DX12HDRenderer : HDRenderer
             RtShadowsThisFrame = rtShadowsThisFrame,
         };
 
-        ctx.GiActiveThisFrame = false; // FAZ 1: GI sökülü; FAZ 2'de Aurora geri bağlanacak.
+        // Aurora GI active this frame — resolved from the SAME predicate the Aurora pass's Enabled() uses, so the
+        // deferred pass (event 300) suppresses its IBL diffuse ambient iff the Aurora pass (event 500) will add
+        // its own diffuse indirect — the two must agree to avoid double-counting.
+        ctx.AuroraActiveThisFrame = Dx12AuroraGiPass.WouldRun(ctx);
 
         ctx.GrainFrame = DeterministicCapture ? 0 : frameCounter;
 
