@@ -58,19 +58,45 @@ public sealed class Dx12SceneAS : IDisposable {
             if (blasByMesh.ContainsKey(mesh)) continue;
             var vb = (Dx12Buffer<GLVector3>)mesh.VertexBuffer;
             var ib = (Dx12IndexBuffer)mesh.IndexBuffer;
-            var geom = new RaytracingGeometryDescription {
-                Type = RaytracingGeometryType.Triangles, Flags = RaytracingGeometryFlags.Opaque,
-                Triangles = new RaytracingGeometryTrianglesDescription {
-                    VertexBuffer = new GpuVirtualAddressAndStride(vb.GpuAddress, (ulong)vb.Stride),
-                    VertexFormat = Format.R32G32B32_Float, VertexCount = (uint)vb.ElementCount,
-                    IndexBuffer = ib.GpuAddress, IndexFormat = Format.R32_UInt, IndexCount = (uint)ib.ElementCount,
-                    Transform3x4 = 0,
-                },
-            };
+            var vbAddr = new GpuVirtualAddressAndStride(vb.GpuAddress, (ulong)vb.Stride);
+
+            // Build the BLAS from the LOD0 index range of each submesh ONLY. The mesh's index buffer packs every
+            // LOD level back-to-back (LodChainBuilder appends the decimated chains after the full-res indices), so
+            // feeding the WHOLE buffer (ib.ElementCount) put the coarse, volume-inflated LOD meshes into the ray-
+            // tracing scene on top of LOD0 — a phantom solid hovering over the real surface. Screen-space render
+            // draws LOD0 (looks fine), but RTAO/GI rays hit the invisible coarse hull and report skyVis≈0, painting
+            // hard black blotches on open ground. SubMeshData.IndexStart/IndexCount is the LOD0 slice; coarse LODs
+            // live only in sub.Lods[1..] and are deliberately excluded here. No LODs → one geom over the full range
+            // (byte-identical to before).
+            var geoms = new List<RaytracingGeometryDescription>(Math.Max(mesh.SubMeshes.Length, 1));
+            foreach (SubMeshData sub in mesh.SubMeshes) {
+                if (sub.IndexCount <= 0) continue;
+                geoms.Add(new RaytracingGeometryDescription {
+                    Type = RaytracingGeometryType.Triangles, Flags = RaytracingGeometryFlags.Opaque,
+                    Triangles = new RaytracingGeometryTrianglesDescription {
+                        VertexBuffer = vbAddr,
+                        VertexFormat = Format.R32G32B32_Float, VertexCount = (uint)vb.ElementCount,
+                        IndexBuffer = ib.GpuAddress + (ulong)sub.IndexStart * sizeof(uint),
+                        IndexFormat = Format.R32_UInt, IndexCount = (uint)sub.IndexCount,
+                        Transform3x4 = 0,
+                    },
+                });
+            }
+            if (geoms.Count == 0) {
+                geoms.Add(new RaytracingGeometryDescription {
+                    Type = RaytracingGeometryType.Triangles, Flags = RaytracingGeometryFlags.Opaque,
+                    Triangles = new RaytracingGeometryTrianglesDescription {
+                        VertexBuffer = vbAddr,
+                        VertexFormat = Format.R32G32B32_Float, VertexCount = (uint)vb.ElementCount,
+                        IndexBuffer = ib.GpuAddress, IndexFormat = Format.R32_UInt, IndexCount = (uint)ib.ElementCount,
+                        Transform3x4 = 0,
+                    },
+                });
+            }
             var inputs = new BuildRaytracingAccelerationStructureInputs {
                 Type = RaytracingAccelerationStructureType.BottomLevel, Layout = ElementsLayout.Array,
                 Flags = RaytracingAccelerationStructureBuildFlags.PreferFastTrace,
-                DescriptorsCount = 1, GeometryDescriptions = new[] { geom },
+                DescriptorsCount = (uint)geoms.Count, GeometryDescriptions = geoms.ToArray(),
             };
             var pre = device5.GetRaytracingAccelerationStructurePrebuildInfo(inputs);
             ID3D12Resource result = AsBuffer(pre.ResultDataMaxSizeInBytes, ResourceStates.RaytracingAccelerationStructure);

@@ -1,26 +1,6 @@
 
 namespace BallisticEngine;
 
-public enum ParticleBlendMode {
-    Additive,
-    Alpha,
-}
-
-public enum ParticleEase {
-    Linear,
-    EaseIn,
-    EaseOut,
-    EaseInOut,
-}
-
-public enum EmissionShape {
-    Cone,
-    Sphere,
-    Hemisphere,
-    Box,
-    Circle,
-}
-
 [Component("Particle System", "Effects")]
 public class ParticleSystem : Behaviour {
     [Header("Emission")]

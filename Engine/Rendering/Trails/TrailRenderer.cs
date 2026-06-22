@@ -1,11 +1,6 @@
 
 namespace BallisticEngine;
 
-public struct TrailPoint {
-    public Vector3 Position;
-    public float Age;
-}
-
 [Component("Trail Renderer", "Effects")]
 public class TrailRenderer : Behaviour, IRibbonSource {
     [Tooltip("Seconds a trail point survives before it fades out of the tail.")]

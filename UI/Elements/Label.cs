@@ -55,10 +55,3 @@ public class Label : VisualElement
         });
     }
 }
-
-public enum TextAlign
-{
-    UpperLeft, UpperCenter, UpperRight,
-    MiddleLeft, MiddleCenter, MiddleRight,
-    LowerLeft, LowerCenter, LowerRight,
-}

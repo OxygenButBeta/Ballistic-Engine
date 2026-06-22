@@ -1,12 +1,6 @@
 
 namespace BallisticEngine;
 
-public readonly struct LodRange {
-    public readonly int FirstIndex;
-    public readonly int IndexCount;
-    public LodRange(int firstIndex, int indexCount) { FirstIndex = firstIndex; IndexCount = indexCount; }
-}
-
 public readonly struct SubMeshData {
     public readonly string Name;
     public readonly int IndexStart;

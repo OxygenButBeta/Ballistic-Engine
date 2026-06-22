@@ -99,11 +99,3 @@ public sealed class DrawerStack {
         return new Staged(vis, chrome, enable);
     }
 }
-
-internal static class StackMemberLookup {
-    public static MemberInfo MemberOf(IProperty property) => property switch {
-        MemberProperty mp => mp.Member,
-        VolumeParamProperty vp => vp.Field,
-        _ => null,
-    };
-}

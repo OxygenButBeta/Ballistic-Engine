@@ -3,8 +3,6 @@ using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine.Editor;
 
-internal enum EditorKey { W, A, S, D, Q, E, Shift }
-
 internal sealed class EditorInput {
     GameWindow window;
     Vector2 lastMouse;

@@ -30,6 +30,8 @@ cbuffer RtaoConstants : register(b0) {
     float  Intensity;       // 0 = no effect (AO unchanged), 1 = full sky-vis gate
     float  FrameIndex;      // per-pixel rotation seed (frozen under deterministic capture)
     float  HistoryValid;    // 1 = blend with HistIn (temporal denoise); 0 = first frame / det capture
+    float3 CameraPos;       // world-space camera position — the history disocclusion key is distance TO THE CAMERA
+    float  _pad1;
 };
 
 float Hash(uint s) {
@@ -75,7 +77,13 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
     uint rays = (uint)clamp(RayCount, 1.0, 16.0);
     float jitter = Hash(px.x * 73856093u ^ px.y * 19349663u ^ (uint)FrameIndex * 2654435761u);
     float3x3 basis = BuildBasis(N);
-    float3 origin = worldPos + N * NormalBias;
+    // Self-intersection guard. A flat open floor must read skyVis≈1, but with the origin sitting ON the surface
+    // and TMin=0 the hemisphere rays graze the floor's OWN triangles (worse on thick/double-sided ground meshes)
+    // and report a false hit → the hard black blotches on open ground. Push the origin off the surface along the
+    // normal AND off along the ray direction, and start TMin past the bias so the originating triangle is skipped.
+    // Scale the bias with camera distance so it stays ~1 texel of geometry at any range (no acne, no peter-panning).
+    float biasScale = 0.10 + 0.0015 * distance(worldPos, CameraPos);
+    float3 origin = worldPos + N * (NormalBias + biasScale);
 
     float open = 0.0;
     [loop] for (uint i = 0; i < rays; i++) {
@@ -83,7 +91,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
         float3 dir = normalize(mul(local, basis));
 
         RayDesc rd;
-        rd.Origin = origin; rd.Direction = dir; rd.TMin = 0.0; rd.TMax = max(RayLength, 0.1);
+        rd.Origin = origin; rd.Direction = dir; rd.TMin = biasScale; rd.TMax = max(RayLength, 0.1);
         RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
         q.TraceRayInline(Scene, 0, 0xFF, rd);
         q.Proceed();
@@ -97,7 +105,10 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
     // things that aren't there"). Reproject this pixel's worldPos through last frame's ViewProj to find where it
     // was on screen, sample the history there, and reject it by WORLD-SPACE distance (depth alone can't tell a
     // panning wall from a real disocclusion). Off on the first frame / under deterministic capture.
-    float curDist = length(worldPos);   // camera-relative distance; stored as the history's geometry key
+    // Disocclusion key = distance from THIS pixel's surface to the CAMERA (not to the world origin — a panning
+    // camera leaves a roof edge and a far wall equidistant from the origin, so an origin key would wrongly fuse
+    // their histories; the camera-distance separates near foreground from far background).
+    float curDist = distance(worldPos, CameraPos);
     if (HistoryValid > 0.5) {
         float4 prevClip = mul(float4(worldPos, 1.0), PrevViewProj);
         if (prevClip.w > 1e-5) {
@@ -105,10 +116,15 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
             float2 prevUv = float2(prevNdc.x * 0.5 + 0.5, 0.5 - prevNdc.y * 0.5);
             // On-screen last frame? Off-screen history doesn't exist → keep this frame's noisy estimate.
             if (all(prevUv >= 0.0) && all(prevUv <= 1.0)) {
-                float2 h = HistIn.SampleLevel(LinearClamp, prevUv, 0);
+                // POINT-sample the history (nearest texel), not bilinear: a 4-tap bilinear read straddling a
+                // depth discontinuity blends a foreground texel's skyVis into the background and the EMA then
+                // smears that wrong value across frames (the slow-drifting translucent blobs). Snap to the
+                // nearest history texel so each surface only ever reuses its OWN past estimate.
+                int2 prevPx = (int2)floor(prevUv / TexelSize);
+                float2 h = HistIn[clamp(prevPx, int2(0,0), int2(W-1, H-1))];
                 float prevVis = h.x, prevDist = h.y;
-                // World-space disocclusion reject: if the reprojected pixel's surface sat at a very different
-                // distance, the history is different geometry (a foreground edge now uncovers a far wall) → drop it.
+                // Relative camera-distance reject: history from a surface at a very different camera distance is
+                // a different occluder (a foreground edge now uncovers a far wall) → drop it, use this frame's value.
                 bool reuse = abs(prevDist - curDist) <= 0.05 * max(curDist, 1e-3);
                 if (reuse) skyVis = lerp(prevVis, skyVis, 0.1);   // 10% new per frame → stable in a few frames
             }

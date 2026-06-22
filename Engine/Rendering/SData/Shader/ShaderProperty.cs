@@ -1,13 +1,5 @@
 namespace BallisticEngine;
 
-public enum ShaderPropertyType {
-    Float,
-    Range,
-    Color,
-    Vector,
-    Texture2D,
-}
-
 public sealed class ShaderProperty {
     public string Name { get; }
 
