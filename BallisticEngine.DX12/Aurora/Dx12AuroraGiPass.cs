@@ -32,6 +32,7 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
 
     readonly Dx12Device dev;
     readonly Dx12AuroraScene scene;
+    readonly Dx12EmissiveLights emissiveLights;   // FAZ 3d: world-space emissive-triangle area-light list (NEE)
 
     // The card radiance cache (+ per-instance meta) the Reflections pass (event 600, after this) samples so
     // rough reflections read the SAME multi-bounce GI the diffuse sees (plan P5). Exposed read-only; valid only
@@ -42,6 +43,7 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
     {
         dev = device;
         scene = new Dx12AuroraScene(device);
+        emissiveLights = new Dx12EmissiveLights(device);
         BuildPipelines();
         Resize(width, height);
     }
@@ -185,7 +187,7 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
         public float SkyVisRays; public float EmaAlpha; public float BounceRays; public float HistoryValid;
         public uint FrameIndex; public uint UpdateStride; public uint ForceFull; public uint TexelDim;   // P7 #1; Sıra 5 mesh-card grid edge
         public Vector3 CameraPos; public float PriorityScale;   // P7 #1b priority budget
-        public float PriorityNearDist; public float UsePriority; public float Pad7a; public float Pad7b;
+        public float PriorityNearDist; public float UsePriority; public float EmissiveCount; public float NeeIntensity;   // FAZ 3d NEE
     }
 
     // ---- Sıra 1: SCREEN-SPACE RADIANCE PROBES (AuroraScreenProbe.hlsl) ----
@@ -741,6 +743,13 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
                           && Environment.GetEnvironmentVariable("BALLISTIC_DX12_AURORA_PRIORITY") != "0";
         float priorityScale = priorityOn ? Math.Max(1f, (float)tris / budget * 0.85f) : 1f;
 
+        // FAZ 3d — build the emissive-triangle area-light list (NEE). Cached by an instance+emissive stamp, so a
+        // static scene builds it once. Door BALLISTIC_DX12_AURORA_NEE (default ON); empty list → NEE inert.
+        bool neeOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_AURORA_NEE") != "0";
+        if (neeOn) emissiveLights.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection);
+        float neeCount = (neeOn && emissiveLights.Valid) ? emissiveLights.Count : 0f;
+        float neeIntensity = EnvF("BALLISTIC_DX12_AURORA_NEE_INTENSITY", 1f);
+
         cardCb.Write(new AuroraCardConstants
         {
             SunDir = sunDir, SunBias = 0.03f, SunColor = ctx.LightColor, LightCount = clusteredLights.LightCount,
@@ -752,6 +761,7 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
             TexelDim = (uint)scene.TexelDim,
             CameraPos = ctx.CamPos, PriorityScale = priorityScale,
             PriorityNearDist = EnvF("BALLISTIC_DX12_AURORA_PRIORITY_NEAR", 12f), UsePriority = priorityOn ? 1f : 0f,
+            EmissiveCount = neeCount, NeeIntensity = neeIntensity,
         });
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
@@ -788,6 +798,7 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
             cl.SetComputeRootShaderResourceView(10, scene.TriToClusterGpuAddress);       // t7 TriToCluster
             cl.SetComputeRootShaderResourceView(11, scene.ClusterToTriGpuAddress);       // t8 ClusterToTri
             cl.SetComputeRootShaderResourceView(12, scene.ClusterCardsGpuAddress);       // t9 ClusterCards (Sıra 5)
+            cl.SetComputeRootShaderResourceView(13, neeCount > 0f ? emissiveLights.GpuAddress : clusteredLights.LightBufGpuAddress);  // t10 EmissiveLights (valid filler when empty)
             cl.Dispatch((uint)((scene.RecordCount + 63) / 64), 1, 1);                     // #2A: one thread per record
             cl.ResourceBarrierTransition(cardW, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
         });
@@ -1129,6 +1140,7 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
         var triClus = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(7, 0), ShaderVisibility.All);  // t7 TriToCluster
         var clusTri = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(8, 0), ShaderVisibility.All);  // t8 ClusterToTri
         var clusCards = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(9, 0), ShaderVisibility.All);  // t9 ClusterCards (Sıra 5)
+        var emissive = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(10, 0), ShaderVisibility.All);  // t10 EmissiveLights (FAZ 3d NEE)
         var clamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0)
         {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
@@ -1142,7 +1154,7 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
         cardRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
-                new[] { cbv0, tlasSrv, uavRoot, skyTable, instMeta, rtInst, mats, lights, prevCard, ageUav, triClus, clusTri, clusCards }, new[] { clamp, wrap })));
+                new[] { cbv0, tlasSrv, uavRoot, skyTable, instMeta, rtInst, mats, lights, prevCard, ageUav, triClus, clusTri, clusCards, emissive }, new[] { clamp, wrap })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("AuroraCardLight.hlsl");
         byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSMain", "AuroraCardLight.hlsl");
@@ -1413,6 +1425,7 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
     public void Dispose()
     {
         scene.Dispose();
+        emissiveLights.Dispose();
         tracePso?.Dispose(); traceRootSig?.Dispose(); traceCb?.Dispose(); sunCb?.Dispose();
         cardPso?.Dispose(); cardRootSig?.Dispose(); cardCb?.Dispose();
         denoisePso?.Dispose(); denoiseRootSig?.Dispose(); denoiseSrv?.Dispose();

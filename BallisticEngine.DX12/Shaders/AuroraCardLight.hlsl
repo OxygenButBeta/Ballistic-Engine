@@ -44,6 +44,9 @@ StructuredBuffer<uint>              ClusterToTri : register(t8);   // #2A: recor
 // card plane → lit independently → cluster-interior detail. Cache index = record*TexelsPerRecord + ty*TexelDim+tx.
 struct ClusterCard { float3 Origin; float InvExtentU; float3 U; float InvExtentV; float3 V; float Pad0; float3 Normal; float Pad1; };
 StructuredBuffer<ClusterCard>       ClusterCards : register(t9);   // [recordCount]
+// FAZ 3d NEE — world-space emissive-triangle area lights (kajiya inc/lights/triangle.hlsl form): v0 + two edges + radiance.
+struct EmissiveTri { float4 V0; float4 E0; float4 E1; float4 Radiance; };
+StructuredBuffer<EmissiveTri>       EmissiveLights : register(t10);
 
 cbuffer AuroraCardConstants : register(b0) {
     float3 SunDir;   float SunBias;      // TO the sun (normalized), world; shadow-ray origin offset
@@ -52,7 +55,7 @@ cbuffer AuroraCardConstants : register(b0) {
     float SkyVisRays; float EmaAlpha; float BounceRays; float HistoryValid;   // P4: temporal blend + 2nd-bounce gather
     uint FrameIndex; uint UpdateStride; uint ForceFull; uint TexelDim;   // P7 #1 round-robin; Sıra 5 TexelDim (1=legacy)
     float3 CameraPos; float PriorityScale;   // P7 #1b PRIORITY budget: per-record due prob = saturate(priority/scale)
-    float PriorityNearDist; float UsePriority; float Pad7a; float Pad7b;   // near falloff (m); UsePriority 1=priority,0=legacy stride
+    float PriorityNearDist; float UsePriority; float EmissiveCount; float NeeIntensity;   // FAZ 3d NEE: emissive-tri count (0=skip) + dial
 };
 SamplerState LinearClamp : register(s0);
 SamplerState LinearWrap  : register(s1);
@@ -234,6 +237,33 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
             punctual += rad * nd * Visibility(P, Ntex, Ld, dist);
         }
 
+        // FAZ 3d NEE — emissive-triangle area lights. An emissive MESH (neon sign, glowing panel, light fixture)
+        // lights this texel directly; sampling it only when a hemisphere ray happens to hit it is noisy/slow. Sample
+        // a point on each emissive triangle, shadow-ray it, add its area-light contribution (projected-solid-angle
+        // metric, pdf = 1/area). Budget-capped (≤256). Two-sided emitter (abs cosine): authored mesh winding is
+        // arbitrary, so a one-sided test would silently cull every interior receiver of an outward-wound quad.
+        float3 emitterLight = 0.0.xxx;
+        int ne = (int)min(EmissiveCount, 256.0);
+        [loop] for (int li = 0; li < ne; li++) {
+            EmissiveTri et = EmissiveLights[li];
+            uint eseed = (record * 2654435761u) ^ (texel * 40503u) ^ ((uint)li * 7919u);
+            float2 eu = float2(Hash(eseed), Hash(eseed + 1u));
+            float su0 = sqrt(eu.x);
+            float3 lp = et.V0.xyz + (1.0 - su0) * et.E0.xyz + (eu.y * su0) * et.E1.xyz;
+            float3 ln = cross(et.E0.xyz, et.E1.xyz);
+            float lnLen = length(ln);
+            if (lnLen < 1e-8) continue;
+            float area = 0.5 * lnLen;
+            float3 toL = lp - P; float d2 = dot(toL, toL);
+            if (d2 < 1e-6) continue;
+            float d = sqrt(d2); float3 Ld = toL / d;
+            float ndl2 = dot(Ntex, Ld);
+            float lndl = abs(dot(-Ld, ln / lnLen));   // two-sided emitter
+            if (ndl2 <= 0.0 || lndl <= 0.0) continue;
+            float psa = (ndl2 * lndl / d2) * area;     // projected-solid-angle metric × area (pdf = 1/area)
+            emitterLight += et.Radiance.xyz * (psa * Visibility(P, Ntex, Ld, d - 2e-3) * NeeIntensity);
+        }
+
         // Sky-visibility + 2nd-bounce hemisphere gather at this texel.
         float3 indirect = 0.0.xxx;
         uint sr = (uint)clamp(max(SkyVisRays, BounceRays), 1.0, 8.0);
@@ -256,7 +286,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
         }
         indirect /= float(sr);
 
-        float3 lit = albedo * (sun + punctual + indirect) + emissive;
+        float3 lit = albedo * (sun + punctual + indirect + emitterLight) + emissive;
         uint cacheIdx = record * tpr + texel;
         float3 prev = PrevCard[cacheIdx].rgb;
         float3 radiance = lerp(prev, lit, alpha);
