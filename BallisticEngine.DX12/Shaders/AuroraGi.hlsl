@@ -437,8 +437,28 @@ void CSDenoise(uint3 dtid : SV_DispatchThreadID) {
     if (dC >= 1.0) { DnOut[px] = float4(c, 1); return; }   // sky — nothing to filter
     float3 nC = DnNormal.SampleLevel(DnLinearClamp, uvC, 0).rgb * 2.0 - 1.0;
 
+    // A3 — variance/luminance-driven adaptive blur. A first pass over the 5x5 window measures local luminance
+    // mean/variance; the LUMINANCE RANGE then (1) sets a firefly clamp so one bright Monte-Carlo spike can't
+    // smear into the blur, and (2) scales the colour-similarity weight so a CONVERGED region (low variance) keeps
+    // its detail while a NOISY region (high variance) blurs wide. This is the kajiya rtdgi philosophy: filter
+    // proportionally to how unconverged the pixel is, no separate temporal feedback.
+    float stride = max(DnStep, 1.0);
+    float lumC = dot(c, float3(0.2126, 0.7152, 0.0722));
+    float lMean = 0.0, lM2 = 0.0; int cnt = 0;
+    [unroll] for (int sy = -2; sy <= 2; sy++)
+    [unroll] for (int sx = -2; sx <= 2; sx++) {
+        int2 q = int2(px) + int2(sx, sy) * (int)stride;
+        if (q.x < 0 || q.y < 0 || q.x >= (int)W || q.y >= (int)H) continue;
+        float lq = dot(DnIn[q].rgb, float3(0.2126, 0.7152, 0.0722));
+        lMean += lq; lM2 += lq * lq; cnt++;
+    }
+    lMean /= max(cnt, 1); float lVar = max(lM2 / max(cnt, 1) - lMean * lMean, 0.0);
+    float lStd = sqrt(lVar);
+    float fireflyCap = lMean + lStd * 3.0 + 1e-3;   // clamp taps above mean+3σ — kills single-sample spikes
+    // Colour-sigma: tight when converged (lStd small → preserve detail), wide when noisy (blur through variance).
+    float colSigma = lStd * 2.0 + lMean * 0.25 + 1e-3;
+
     float3 sum = 0.0.xxx; float wsum = 0.0;
-    int r = 2; float stride = max(DnStep, 1.0);
     [unroll] for (int dy = -2; dy <= 2; dy++)
     [unroll] for (int dx = -2; dx <= 2; dx++) {
         int2 q = int2(px) + int2(dx, dy) * (int)stride;
@@ -447,12 +467,16 @@ void CSDenoise(uint3 dtid : SV_DispatchThreadID) {
         float dq = DnDepth.SampleLevel(DnLinearClamp, uvQ, 0).r;
         if (dq >= 1.0) continue;
         float3 nq = DnNormal.SampleLevel(DnLinearClamp, uvQ, 0).rgb * 2.0 - 1.0;
-        // Bilateral weights: gaussian spatial * normal similarity * depth similarity (linear-ish window depth).
+        float3 cq = DnIn[q].rgb;
+        float lq = dot(cq, float3(0.2126, 0.7152, 0.0722));
+        if (lq > fireflyCap) cq *= fireflyCap / max(lq, 1e-4);   // firefly suppression (scale, not crush)
+        // Bilateral weights: gaussian spatial * normal similarity * depth similarity * luminance similarity.
         float wSpatial = exp(-float(dx * dx + dy * dy) / 4.0);
         float wNormal = pow(saturate(dot(nC, nq)), 32.0);
         float wDepth = exp(-abs(dq - dC) * 600.0);
-        float w = wSpatial * wNormal * wDepth;
-        sum += DnIn[q].rgb * w; wsum += w;
+        float wLum = exp(-abs(lq - lumC) / colSigma);   // variance-adaptive: wide colSigma when noisy → blurs more
+        float w = wSpatial * wNormal * wDepth * wLum;
+        sum += cq * w; wsum += w;
     }
     DnOut[px] = float4(wsum > 1e-4 ? sum / wsum : c, 1);
 }
